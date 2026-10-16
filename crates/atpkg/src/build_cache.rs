@@ -15,7 +15,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-/// When a workspace is gone: the rule the window's disk watch and `xtask gate cells` use,
+/// When a workspace is gone: the rule the window's disk watch uses,
 /// compiled here from its one source. It never looks into a privacy-guarded folder or a
 /// mounted volume.
 #[path = "../../aterm-agent/src/harness/disk_checkout.rs"]
@@ -49,9 +49,8 @@ pub const BUILD_VERBS: &[&str] = &[
 /// A build directory whose workspace is seen gone goes once unwritten this long.
 pub const RECLAIM_GONE: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// Any build directory goes once unwritten this long, whatever its workspace's state
-/// (one aterm may not look at, one moved with its parent folder, one simply idle): it is
-/// a cache, and a month on the compiler has usually moved and cargo would rebuild anyway.
+/// Any build directory goes once unwritten this long, whatever its workspace's state: it
+/// is a cache, and a month on the compiler has usually moved and cargo would rebuild anyway.
 pub const RECLAIM_IDLE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 /// `$HOME/Library/Caches/aterm/cargo-build.noindex`.

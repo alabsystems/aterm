@@ -422,6 +422,12 @@ pub(crate) fn post(spec: &HwKeySpec, window_number: i64) -> Result<u32, String> 
         if i > 0 && spec.interval_ms > 0 {
             std::thread::sleep(std::time::Duration::from_millis(spec.interval_ms));
         }
+        // The permit spans only this event pair, never the target's main-thread
+        // round trip or pacing sleep. Sheet reservation waits for the pair, then
+        // refuses every later post before attaching the secure field.
+        let _posting = crate::askpass::PROMPT_INPUT
+            .posting_permit()
+            .map_err(|()| "ERR hwkey: a sudo password sheet is up\n".to_string())?;
         // One pool PER KEY, not one around the loop: `count=5000` would otherwise
         // hold five thousand autoreleased NSEvents alive for the whole run, and a
         // control thread with no pool at all makes Cocoa log-and-leak every one of
@@ -451,11 +457,12 @@ pub(crate) fn post(spec: &HwKeySpec, window_number: i64) -> Result<u32, String> 
             //
             // SAFETY: the AppKit event factory with a non-nil characters pair
             // (winit dereferences both unconditionally) and a nil graphics
-            // context, exactly as winit's own `replace_event` builds a
-            // synthetic key event. The returned event is AUTORELEASED into this
-            // per-key pool. `postEvent:atStart:` is documented thread-safe — it
-            // is AppKit's sanctioned way for a secondary thread to hand work to
-            // the main run loop — and posting from this thread is the POINT: it
+            // context, exactly as upstream winit's `replace_event` builds a
+            // synthetic key event (aterm-window no longer carries it). The
+            // returned event is AUTORELEASED into this per-key pool.
+            // `postEvent:atStart:` is documented thread-safe — it is AppKit's
+            // sanctioned way for a secondary thread to hand work to the main
+            // run loop — and posting from this thread is the POINT: it
             // lets the event arrive, and wait, while the main thread is parked
             // (in whatever parks it — `nextDrawable` was the motivating case and
             // is off the shipped macOS path since `ea581e158`; see the header).

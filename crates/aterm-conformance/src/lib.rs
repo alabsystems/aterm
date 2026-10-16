@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Conformance + integration test harness, built on the engine's read API.
+//! Conformance harness: feed input, read the screen, assert, with the engine's
+//! introspection API (`visible_content` / `row_text` / `cursor`) as the oracle
+//! (ATERM_DESIGN §6.5).
 //!
-//! A test is feed input → read the screen → assert, using the same machinery
-//! the introspection API exposes (`visible_content` / `row_text` / `cursor`)
-//! as the oracle (ATERM_DESIGN §6.5, the self-proving harness).
+//! [`measure`] holds the `measure` check's instruments: the paint scanner, the
+//! starvation account and the drivers of the release binary's matrices.
+
+#[cfg(unix)]
+pub mod measure;
 
 use aterm_core::grid::cell_flags::CellFlags;
 use aterm_core::terminal::Terminal;
@@ -52,36 +56,27 @@ impl Screen {
         self.term.visible_content().trim_end().to_string()
     }
 
-    /// Fingerprint of the current SGR style as `(fg_packed, bg_packed, flags)`.
-    ///
-    /// This is the exact (foreground, background, attribute-flag) state that the
-    /// next written cell will be styled with, so two SGR sequences that should
-    /// render identically must produce the same fingerprint. Used to pin the
-    /// flags-only / colour-only SGR fast paths against the generic path.
+    /// The current SGR style as `(fg_packed, bg_packed, flags)`: what the next
+    /// written cell gets. Pins the flags-only and colour-only SGR fast paths
+    /// against the generic path.
     pub fn style_fingerprint(&self) -> (u32, u32, u16) {
         let st = self.term.style();
         (st.fg_packed(), st.bg_packed(), st.flags_bits())
     }
 
-    /// Resolved attribute flags of the visible cell at `(r, c)` (0-based),
-    /// as raw [`CellFlags`] bits.
+    /// Resolved attribute flags of the visible cell at `(r, c)` (0-based), as
+    /// raw [`CellFlags`] bits; `0` out of range.
     ///
-    /// Read-only accessor for per-cell attribute assertions (DECCARA/DECFRA/
-    /// DECSERA rect-op tests). Mirrors the resolution path used by the GUI
-    /// control channel (`cell_attrs` in aterm-gui/src/control_query.rs): inline
-    /// flags are returned directly; cells whose style is interned in the
-    /// grid's `StyleTable` (`USES_STYLE_ID`) are rehydrated from the table —
-    /// the same path `Terminal::render_row` uses for colors. Out-of-range or
-    /// never-written cells yield `0`.
+    /// Resolves as `cell_attrs` in aterm-gui/src/control_query.rs does: inline
+    /// flags directly, a `USES_STYLE_ID` cell from the grid's `StyleTable`.
     pub fn cell_flags_bits(&self, r: u16, c: u16) -> u16 {
         let grid = self.term.grid();
         let Some(cell) = grid.cell(r, c) else {
             return 0;
         };
-        // Nothing in production sets `USES_STYLE_ID` (every writer is
-        // test-gated) and the SGR path interns no `StyleId`, so the
-        // rehydration below is unreachable; the assert makes the suite prove
-        // that premise.
+        // Nothing in production sets `USES_STYLE_ID` and the SGR path interns
+        // no `StyleId`, so the rehydration below is unreachable; the assert
+        // makes the suite prove it.
         debug_assert!(
             !cell.uses_style_id(),
             "cell_flags_bits: a live cell carries USES_STYLE_ID, but nothing interns styles"
@@ -98,21 +93,16 @@ impl Screen {
 
     /// Hyperlink URL attached to the visible cell at `(r, c)` (0-based), if any.
     ///
-    /// OSC 8 oracle: a URI is only observable here if it survived the
-    /// scheme allowlist + length/control-char/BiDi guards in the OSC 8
-    /// handler and a glyph was printed while the link was open (the URI
-    /// is attached per-cell at write time). Rejected URIs leave no trace.
+    /// A URI shows here only if it passed the OSC 8 handler's scheme allowlist
+    /// and length/control-char/BiDi guards and a glyph was printed while the
+    /// link was open.
     pub fn hyperlink_at(&self, r: u16, c: u16) -> Option<String> {
         self.term.hyperlink_at(r, c).map(str::to_string)
     }
 
-    /// Drain pending terminal responses (DSR/DA/DECRQSS/... replies).
-    ///
-    /// The engine only *accumulates* response bytes in its internal buffer —
-    /// `feed()`/`process()` never auto-drain it (only `Terminal::take_response`
-    /// and a full reset clear it), so replies to several queries fed in one or
-    /// many `feed()` calls concatenate until drained here. Returns `None` when
-    /// no response is pending.
+    /// Drain pending terminal responses (DSR/DA/DECRQSS/... replies); `None`
+    /// when none is pending. `feed()` never drains, so replies concatenate
+    /// until taken here.
     pub fn take_response(&mut self) -> Option<Vec<u8>> {
         self.term.take_response()
     }
@@ -127,11 +117,8 @@ impl Screen {
     /// Inline-image references placed on visible row `r` (0-based), as
     /// `(col, ImageRef)` pairs in column order.
     ///
-    /// The image observability oracle: an inline image (iTerm2 OSC 1337 `File=`
-    /// or a decoded sixel) lives in per-cell image extras, not in glyph cells,
-    /// so `row()`/`screen()` stay empty for it. This surfaces the same
-    /// `ImageRef`s the renderer blits, exposing `ImageData.{format, bytes, cols,
-    /// rows}` for placement + pixel assertions.
+    /// An inline image (OSC 1337 `File=` or a decoded sixel) lives in per-cell
+    /// image extras, not glyph cells, so `row()`/`screen()` do not show it.
     pub fn images_row(&self, r: usize) -> Vec<(usize, aterm_core::grid::extra::ImageRef)> {
         self.term.images_row(r)
     }

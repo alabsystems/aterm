@@ -54,12 +54,9 @@ fn the_fork_lane_waits_while_the_policy_read_runs_and_parks_under_its_answer() {
             "as routine activity, never a failure: {wait}"
         );
     }
-    // A PERSON'S APPLY WAITS TOO (round eight, U35): parked first, it ran
-    // the Full capture under a policy nobody had read, then refused itself
-    // once the worker read it. RED before the fix: `None`, and the park.
-    // HELD, NOT DEFERRED (U35's review): nothing comes back for a person's
-    // deferral with `[update] auto_apply = false`, and its record said it
-    // would. The hold names this target and ends within the read's ceiling.
+    // A person's apply waits too, so it never runs the Full capture under an unread policy. It
+    // is held, not deferred (a person's deferral never comes back under
+    // `[update] auto_apply = false`), naming this target and ending within the read's ceiling.
     let before = Instant::now();
     let wait = app
         .fork_lane_policy_wait(ApplyMode::Immediate, target, unread(&app, &ticket))
@@ -151,7 +148,7 @@ fn a_read_that_ended_is_absent_or_outran_its_ceiling_is_not_waited_for() {
             .is_none(),
         "the wait is bounded: past its ceiling the fork lane parks"
     );
-    // …and a read for ANOTHER target is not this target's.
+    // …and a read for another target is not this target's.
     let other = running.saturating_add(4);
     assert!(
         app.fork_lane_policy_wait(ApplyMode::Automatic, other, true)
@@ -160,13 +157,9 @@ fn a_read_that_ended_is_absent_or_outran_its_ceiling_is_not_waited_for() {
     );
 }
 
-/// The ceiling is a bound: a pre-verification of the target holds or queues for
-/// the staged apply lock, so the fork lane must not park while a same-key read
-/// can still hold it. `aterm-update` bounds that by the lock wait plus the
-/// verification budget (`HANDOFF_PREVERIFY_BOUND`, pinned by
-/// `a_pre_verification_holds_the_lock_and_runs_under_the_verification_budget`).
-/// The ceiling is derived from and exceeds that bound, so at the last instant a
-/// read can hold the lock the lane still defers.
+/// A pre-verification holds or queues for the staged apply lock, so the fork lane must not park
+/// while a same-key read can still hold it: the ceiling exceeds aterm-update's
+/// `HANDOFF_PREVERIFY_BOUND` (the lock wait plus the verification budget) and is derived from it.
 #[test]
 fn the_ceiling_outlasts_every_instant_a_read_can_hold_the_lock() {
     assert_eq!(
@@ -304,8 +297,8 @@ fn a_read_in_flight_is_not_started_twice() {
     assert!(body.contains("if !preverify_read_needed("));
     assert!(body.contains("let _ends = RaiseOnDrop(done);"));
     assert!(body.contains("Ok(_) => self.handoff_preverify_in_flight = Some(flight),"));
-    // A read that ends without a verdict keeps its moment on the flight, never
-    // in the verdict cache, and before it raises the flag (S1's second review).
+    // A read that ends without a verdict keeps its moment on the flight, never in the verdict
+    // cache, and before it raises the flag.
     let passing = body
         .find("if aterm_update::is_passing_refusal(error) {")
         .expect("the passing branch");

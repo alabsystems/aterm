@@ -1,11 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The ONLY unsafe-FFI file of the Windows ConPTY backend: direct
-//! `extern "system"` declarations against kernel32 (std already links it), in
-//! the same direct-libc style the Unix seam uses. Handles cross this boundary
-//! as plain `isize` (pointer-sized, so the session registry stays `Send + Sync`
-//! without unsafe impls); struct layouts are transcribed from the Windows SDK.
+//! The ConPTY backend's kernel32 FFI: direct `extern "system"` declarations (std already
+//! links kernel32). Handles are plain `isize`, so the session registry is `Send + Sync`
+//! without unsafe impls; struct layouts are transcribed from the Windows SDK.
 
 // Win32 ABI names are kept verbatim (PascalCase fields, SCREAMING struct names)
 // so they can be checked against the SDK headers line by line.
@@ -25,11 +23,11 @@ pub(crate) const PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE: usize = 0x0002_0016;
 pub(crate) const EXTENDED_STARTUPINFO_PRESENT: u32 = 0x0008_0000;
 /// `CreateProcessW` flag: the environment block is UTF-16.
 pub(crate) const CREATE_UNICODE_ENVIRONMENT: u32 = 0x400;
-/// `CreateProcessW` flag: create the primary thread suspended (the confinement
-/// window — zero child instructions run until `ResumeThread`).
+/// `CreateProcessW` flag: create the primary thread suspended, so no child instruction
+/// runs before confinement and `ResumeThread`.
 pub(crate) const CREATE_SUSPENDED: u32 = 0x4;
-/// `STARTUPINFOW.dwFlags`: honor the `hStd*` fields. Set with NULL handles to
-/// SUPPRESS the Win8+ std-handle auto-duplication (see the spawn's comment).
+/// `STARTUPINFOW.dwFlags`: honor the `hStd*` fields. Set with NULL handles to suppress
+/// the Win8+ std-handle auto-duplication (see the spawn).
 pub(crate) const STARTF_USESTDHANDLES: u32 = 0x100;
 /// `GetLastError` after `ReadFile` when the pipe's write side is gone (EOF).
 pub(crate) const ERROR_BROKEN_PIPE: u32 = 109;
@@ -43,11 +41,10 @@ pub(crate) const INFINITE: u32 = 0xFFFF_FFFF;
 pub(crate) const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x2000;
 /// `JOBOBJECTINFOCLASS::JobObjectExtendedLimitInformation`.
 pub(crate) const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS: i32 = 9;
-/// `ABOVE_NORMAL_PRIORITY_CLASS` — the focus-boost scheduling class: the
-/// shell's line editor preempts NORMAL background load (a compile storm), but
-/// children the shell spawns still start at NORMAL (Win32 rule: a child
-/// inherits the parent's class only from IDLE/BELOW_NORMAL parents), so a
-/// build launched from a boosted shell cannot starve the terminal itself.
+/// `ABOVE_NORMAL_PRIORITY_CLASS`, the focus-boost class: the shell's line editor
+/// preempts NORMAL background load, while its children still start at NORMAL (a child
+/// inherits only an IDLE/BELOW_NORMAL class), so a build it launches cannot starve the
+/// terminal.
 pub(crate) const ABOVE_NORMAL_PRIORITY_CLASS: u32 = 0x8000;
 /// `NORMAL_PRIORITY_CLASS` — the blur restore class.
 pub(crate) const NORMAL_PRIORITY_CLASS: u32 = 0x20;
@@ -55,9 +52,8 @@ pub(crate) const NORMAL_PRIORITY_CLASS: u32 = 0x20;
 pub(crate) const PROCESS_POWER_THROTTLING_CLASS: i32 = 4;
 /// `PROCESS_POWER_THROTTLING_STATE.Version` — current (only) version.
 pub(crate) const PROCESS_POWER_THROTTLING_CURRENT_VERSION: u32 = 1;
-/// Power-throttling control/state bit: the OS may throttle execution speed
-/// (EcoQoS / efficiency cores). Set in `ControlMask` with a CLEAR `StateMask`
-/// bit to force throttling OFF; `ControlMask = 0` returns to system-managed.
+/// Power-throttling bit (EcoQoS / efficiency cores): set in `ControlMask` with a clear
+/// `StateMask` bit to force throttling off; `ControlMask = 0` is system-managed.
 pub(crate) const PROCESS_POWER_THROTTLING_EXECUTION_SPEED: u32 = 0x1;
 /// `OpenProcess` access right: change priority/QoS only (least privilege for
 /// the conhost focus-boost handle).
@@ -73,8 +69,8 @@ pub(crate) struct COORD {
     pub y: i16,
 }
 
-/// `STARTUPINFOW` (64-bit layout; only `cb` is ever non-zero here — the ConPTY
-/// pipes travel via the attribute list, not `hStd*`).
+/// `STARTUPINFOW` (64-bit layout). Only `cb` and `dwFlags` are set: the ConPTY pipes
+/// travel in the attribute list, not `hStd*`.
 #[repr(C)]
 pub(crate) struct STARTUPINFOW {
     pub cb: u32,
@@ -139,8 +135,7 @@ pub(crate) struct IO_COUNTERS {
     pub OtherTransferCount: u64,
 }
 
-/// `JOBOBJECT_EXTENDED_LIMIT_INFORMATION` — only `LimitFlags` is set here
-/// (KILL_ON_JOB_CLOSE); the resource fields are the future Job resource lane.
+/// `JOBOBJECT_EXTENDED_LIMIT_INFORMATION`; only `LimitFlags` is set here.
 #[repr(C)]
 pub(crate) struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
     pub BasicLimitInformation: JOBOBJECT_BASIC_LIMIT_INFORMATION,
@@ -160,8 +155,7 @@ pub(crate) struct PROCESS_POWER_THROTTLING_STATE {
     pub StateMask: u32,
 }
 
-/// `PROCESSENTRY32W` (Toolhelp) — used only by the spawn-time conhost
-/// discovery walk (parent-pid + exe-name match).
+/// `PROCESSENTRY32W` (Toolhelp), for the spawn-time conhost discovery walk.
 #[repr(C)]
 pub(crate) struct PROCESSENTRY32W {
     pub dwSize: u32,
@@ -276,15 +270,12 @@ unsafe extern "system" {
         dwProcessId: u32,
     ) -> HANDLE;
     pub(crate) fn GetCurrentProcessId() -> u32;
-    /// `SetConsoleCtrlHandler(NULL, FALSE)` restores normal CTRL+C processing
-    /// for THIS process — the state a child inherits at `CreateProcessW`. It
-    /// is the only public switch for the inherited "Ctrl+C ignored" flag that
-    /// `CREATE_NEW_PROCESS_GROUP` sets on a launched process (see the spawn's
-    /// comment). `HandlerRoutine` is `PHANDLER_ROUTINE`; passed as NULL here.
+    /// `SetConsoleCtrlHandler(NULL, FALSE)` restores normal CTRL+C processing for this
+    /// process, the state a child inherits at `CreateProcessW`: the only public switch
+    /// for the "Ctrl+C ignored" flag `CREATE_NEW_PROCESS_GROUP` sets.
     pub(crate) fn SetConsoleCtrlHandler(HandlerRoutine: *const c_void, Add: i32) -> i32;
-    /// The pid behind a process HANDLE — the DefTerm adoption path's only way to
-    /// learn the client's pid, since a handoff hands over a handle and never a
-    /// pid. Returns 0 on failure (documented as a tolerated miss by the caller).
+    /// The pid behind a process HANDLE: the DefTerm adoption path's only way to learn
+    /// the client's pid, since a handoff carries a handle, not a pid. 0 on failure.
     pub(crate) fn GetProcessId(hProcess: HANDLE) -> u32;
     pub(crate) fn CreateToolhelp32Snapshot(dwFlags: u32, th32ProcessID: u32) -> HANDLE;
     pub(crate) fn Process32FirstW(hSnapshot: HANDLE, lppe: *mut PROCESSENTRY32W) -> i32;
@@ -300,9 +291,8 @@ unsafe extern "system" {
 }
 
 /// RAII guard around a raw kernel HANDLE: closes on drop unless released via
-/// [`Handle::into_raw`]. Used through the spawn sequence so every early-return
-/// error path closes exactly the handles it created (the Windows analog of the
-/// Unix status-pipe cleanup ladders).
+/// [`Handle::into_raw`], so every early return in the spawn closes exactly the handles
+/// it created.
 pub(crate) struct Handle(HANDLE);
 
 impl Handle {
@@ -317,7 +307,7 @@ impl Handle {
         self.0
     }
 
-    /// Release ownership WITHOUT closing (the success path hands the handle to
+    /// Release ownership without closing (the success path hands the handle to
     /// the session registry, whose `Drop` then owns the close).
     pub(crate) fn into_raw(mut self) -> HANDLE {
         std::mem::replace(&mut self.0, 0)

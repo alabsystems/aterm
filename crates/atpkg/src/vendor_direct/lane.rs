@@ -15,7 +15,7 @@ use std::path::Path;
 use super::decide::{
     Decision, HeadView, InstallReason, Installed, InstalledView, KeepReason, decide,
 };
-use super::digests::{DigestSeen, record_or_conflict};
+use super::digests::{AuthenticatedDigest, DigestSeen, record_or_conflict};
 use super::policy::Policy;
 use super::record::{RECORD_SCHEMA, VendorRecord, complete_record};
 use super::resolve::{self, Candidate, Head, Resolution};
@@ -69,6 +69,11 @@ pub(crate) struct Lane<'a> {
     pub asked: bool,
     /// The clock (Unix seconds).
     pub now: i64,
+    /// This landing's place in line for the link among lanes landing side by side
+    /// ([`crate::flow::DownloadTurns`]), waited for by its payload's download alone: the
+    /// program taken first has the whole link, however slow, while another lane verifies,
+    /// unpacks and activates what it already has. `None`: no turn to wait for.
+    pub download_turn: Option<&'a crate::flow::DownloadTicket<'a>>,
 }
 
 /// What the lane came to for one program.
@@ -153,6 +158,12 @@ pub(crate) enum Verdict {
     },
     /// The program is dev-linked: managed from its checkout.
     Linked,
+    /// The vendor publishes no build the lane can verify for this machine
+    /// ([`VendorSpec::serves`]): nothing was asked of any host.
+    Unavailable {
+        /// The canonical `unavailable on <target>: <hint>` state.
+        state: String,
+    },
 }
 
 /// One program's lane result.
@@ -230,7 +241,8 @@ impl Outcome {
     }
 
     /// The install flow's answer for this outcome: a report when a build is active and
-    /// was installed or kept on purpose, else the verdict as [`FlowError::Vendor`].
+    /// was installed or kept on purpose, the state where nothing is served
+    /// ([`FlowError::VendorUnavailable`]), else the verdict as [`FlowError::Vendor`].
     ///
     /// # Errors
     /// The lane installed nothing it could stand behind: its line says why.
@@ -290,6 +302,7 @@ impl Outcome {
             Verdict::Unreachable { .. } => Err(FlowError::VendorUnreachable(
                 line.strip_prefix("atpkg: ").unwrap_or(&line).to_string(),
             )),
+            Verdict::Unavailable { state } => Err(FlowError::VendorUnavailable(state.clone())),
             _ => Err(FlowError::Vendor(
                 line.strip_prefix("atpkg: ").unwrap_or(&line).to_string(),
             )),
@@ -307,7 +320,7 @@ impl Outcome {
             | Verdict::Deferred { keeping, .. }
             | Verdict::Refused { keeping, .. }
             | Verdict::Failed { keeping, .. } => keeping.version(),
-            Verdict::Tombstoned { .. } | Verdict::Linked => None,
+            Verdict::Tombstoned { .. } | Verdict::Linked | Verdict::Unavailable { .. } => None,
         }
     }
 }
@@ -345,6 +358,13 @@ impl Pending {
     pub(crate) fn disk_bytes(&self) -> Option<u64> {
         let a = self.candidate.artifact.artifact();
         (a.payload == "raw-binary").then_some(a.size)
+    }
+
+    /// What its landing's disk gate checks: the download and the tree it unpacks to, an
+    /// archive's at its unpack bound.
+    #[must_use]
+    pub(crate) fn landing_bytes(&self) -> crate::flow::LandingBytes {
+        crate::flow::LandingBytes::of(self.candidate.artifact.artifact())
     }
 }
 
@@ -385,6 +405,19 @@ pub(crate) fn plan_one(lane: &Lane<'_>, spec: &'static VendorSpec, held: bool) -
         return Step::Done(Outcome {
             spec,
             verdict: Verdict::Linked,
+            asset: None,
+        });
+    }
+    if !spec.serves(lane.triple) {
+        let hint = format!(
+            "{} publishes no {} build aterm can verify for this target",
+            spec.vendor, spec.product
+        );
+        return Step::Done(Outcome {
+            spec,
+            verdict: Verdict::Unavailable {
+                state: crate::state::unavailable(lane.triple, &hint),
+            },
             asset: None,
         });
     }
@@ -655,20 +688,24 @@ fn admit_candidate(lane: &Lane<'_>, pending: Pending, inputs: &super::decide::In
         why,
         keeping: pending.installed,
     };
-    match record_or_conflict(lane.layout, spec.program, c.version, lane.triple, &c.digest) {
+    // An anchor that vouches only once the bytes are in records nothing yet ([`land`]).
+    let record = c.anchor.vouches_before_download();
+    match record_or_conflict(
+        lane.layout,
+        spec.program,
+        c.version,
+        lane.triple,
+        &c.digest,
+        record,
+    ) {
         Ok(DigestSeen::Conflict { first }) => {
-            let why = format!(
-                "its sha256 differs from the one first seen for {} ({first}) — a re-cut release \
-                 is never an update",
-                c.version
-            );
-            let v = refuse(why);
+            let v = refuse(recut(c, &first));
             let _ = ProgramStamp::record_refusal(
                 lane.layout,
                 spec.program,
                 &verdict_line(spec, &v),
                 c.version,
-                c.digest.as_str(),
+                &c.digest,
             );
             return fall_back(v, true);
         }
@@ -683,7 +720,7 @@ fn admit_candidate(lane: &Lane<'_>, pending: Pending, inputs: &super::decide::In
             return fall_back(v, false);
         }
     }
-    if pending.stamp.is_refused(c.version, c.digest.as_str()) {
+    if pending.stamp.is_refused(c.version, &c.digest) {
         return fall_back(
             refuse(String::from(
                 "an earlier pass refused these exact bytes; they are not fetched again until \
@@ -696,6 +733,17 @@ fn admit_candidate(lane: &Lane<'_>, pending: Pending, inputs: &super::decide::In
         return fall_back(refuse(e.to_string()), true);
     }
     Step::Land(Box::new(pending))
+}
+
+/// Why `c` is refused when `first` was seen first for its version.
+fn recut(c: &Candidate, first: &AuthenticatedDigest) -> String {
+    format!(
+        "its {} differs from the one first seen for {} ({}) — a re-cut release is never an \
+         update",
+        c.digest.alg(),
+        c.version,
+        first.as_str()
+    )
 }
 
 /// Download, verify, stage (the darwin Developer ID gate inside), activate and shim a
@@ -716,7 +764,7 @@ pub(crate) fn land_one(lane: &Lane<'_>, pending: &Pending) -> Outcome {
         Err(e) => {
             let refused = matches!(
                 &e,
-                FlowError::Stage(StageError::Sha256Mismatch { .. } | StageError::SignerRefused(_))
+                FlowError::Stage(StageError::DigestMismatch { .. } | StageError::SignerRefused(_))
                     | FlowError::StageRefused(_)
                     | FlowError::VendorRefused(_)
             );
@@ -750,7 +798,7 @@ pub(crate) fn land_one(lane: &Lane<'_>, pending: &Pending) -> Outcome {
                     spec.program,
                     &verdict_line(spec, &v),
                     c.version,
-                    c.digest.as_str(),
+                    &c.digest,
                 );
             }
             let inputs = super::decide::Inputs {
@@ -795,6 +843,7 @@ fn land(
         vendor: spec.vendor.to_string(),
         source_url: art.url.clone(),
         sha256: art.sha256.clone(),
+        sha512: art.sha512.clone(),
         size: art.size,
         tree_root: "0".repeat(64),
         apple_team: cfg!(target_os = "macos").then(|| spec.apple_team.to_string()),
@@ -814,6 +863,22 @@ fn land(
     let pre_swap = |tree: &Path| -> Result<(), StageError> {
         let demoted = crate::macho::demote_foreign_executables(tree)?;
         gate(tree)?;
+        // An anchor that vouches only now, by the team pin on these bytes, is logged now —
+        // before the swap, so nothing lands whose first sighting went unrecorded.
+        if !c.anchor.vouches_before_download() {
+            let seen = record_or_conflict(
+                lane.layout,
+                program,
+                c.version,
+                lane.triple,
+                &c.digest,
+                true,
+            )
+            .map_err(StageError::Io)?;
+            if let DigestSeen::Conflict { first } = seen {
+                return Err(StageError::SignerRefused(recut(c, &first)));
+            }
+        }
         if demoted {
             *final_root.borrow_mut() = Some(crate::tree::tree_root(tree).map_err(StageError::Io)?);
         }
@@ -848,6 +913,7 @@ fn land(
             installed: pending.active,
             strategy: crate::dispatch::ApplyStrategy::Shim,
             hooks: &hooks,
+            download_turn: lane.download_turn,
         },
         &|dl| {
             lane.fetcher
@@ -1149,17 +1215,16 @@ pub(crate) fn roll_back_by_hand(
 
 /// A legacy index build's version, and the tree root for this lane's triple when it names
 /// one, from its signed manifest under the caller's verified index; `None` without one.
+/// The manifest is on the repo the index's `[programs.<p>]` block names, else on the index
+/// repo, where every legacy agent build was published: an index that no longer names the
+/// program still vouches for its manifest through the roster that signs both.
 fn legacy_facts(lane: &Lane<'_>, program: &str, build: u64) -> Option<(Version, Option<String>)> {
     let index = lane.legacy_index?;
-    let repo = index.program(program)?.repo.clone();
-    let (version, root) = crate::flow::legacy_facts_of_build(
-        lane.fetcher,
-        index,
-        &repo,
-        program,
-        build,
-        lane.triple,
-    )?;
+    let repo = index
+        .program(program)
+        .map_or(crate::manifest::INDEX_REPO, |p| p.repo.as_str());
+    let (version, root) =
+        crate::flow::legacy_facts_of_build(lane.fetcher, index, repo, program, build, lane.triple)?;
     Some((Version::parse(&version)?, root))
 }
 
@@ -1336,6 +1401,7 @@ fn verdict_line(spec: &VendorSpec, verdict: &Verdict) -> String {
             keeping(*k)
         ),
         Verdict::Linked => format!("atpkg: {p} dev-linked — skipped"),
+        Verdict::Unavailable { state } => format!("atpkg: {p}: {state}"),
     }
 }
 
@@ -1344,7 +1410,6 @@ fn verdict_line(spec: &VendorSpec, verdict: &Verdict) -> String {
 /// with every fetch recorded, and a codesign stand-in that passes every Mach-O.
 #[cfg(test)]
 pub(crate) mod world {
-    use std::cell::{Cell, RefCell};
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
 
@@ -1469,32 +1534,62 @@ pub(crate) mod world {
     /// A signed document: `(bytes, signature)`.
     type SignedDoc = (Vec<u8>, Vec<u8>);
 
+    /// One of [`Fake`]'s fields: a lock with `RefCell`'s and `Cell`'s calls, because a pass
+    /// works its fetcher from several threads at once ([`Fetcher::shared`]) and the tests
+    /// read the fields as they always have.
+    #[derive(Default)]
+    pub(crate) struct Shared<T>(std::sync::RwLock<T>);
+
+    impl<T> Shared<T> {
+        pub(crate) fn borrow(&self) -> std::sync::RwLockReadGuard<'_, T> {
+            self.0
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        }
+
+        pub(crate) fn borrow_mut(&self) -> std::sync::RwLockWriteGuard<'_, T> {
+            self.0
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        }
+    }
+
+    impl<T: Copy> Shared<T> {
+        pub(crate) fn get(&self) -> T {
+            *self.borrow()
+        }
+
+        pub(crate) fn set(&self, value: T) {
+            *self.borrow_mut() = value;
+        }
+    }
+
     /// The fake fetcher.
     #[derive(Default)]
     pub(crate) struct Fake {
-        docs: RefCell<BTreeMap<String, Doc>>,
-        payloads: RefCell<BTreeMap<String, Vec<u8>>>,
+        docs: Shared<BTreeMap<String, Doc>>,
+        payloads: Shared<BTreeMap<String, Vec<u8>>>,
         /// Every `vendor_get`, `(url, if-none-match)`.
-        pub gets: RefCell<Vec<(String, Option<String>)>>,
+        pub gets: Shared<Vec<(String, Option<String>)>>,
         /// Every payload download's URL.
-        pub downloads: RefCell<Vec<String>>,
+        pub downloads: Shared<Vec<String>>,
         /// Every vendor host unreachable.
-        pub offline: Cell<bool>,
+        pub offline: Shared<bool>,
         /// Payload downloads unreachable (the documents still answer).
-        pub downloads_fail: Cell<bool>,
+        pub downloads_fail: Shared<bool>,
         /// A signed index (bytes, signature) the index lane may resolve.
-        pub index: RefCell<Option<(Vec<u8>, Vec<u8>)>>,
+        pub index: Shared<Option<(Vec<u8>, Vec<u8>)>>,
         /// With no index published, its host ANSWERS with a refusal (a 403) rather than not
         /// at all — a rate-limited or revoked-token machine, never an offline one.
-        pub index_refused: Cell<bool>,
+        pub index_refused: Shared<bool>,
         /// How many times the index was asked for.
-        pub index_reads: Cell<u32>,
+        pub index_reads: Shared<u32>,
         /// Every head read as a hint (`vendor_head`), by URL; each is also in `gets`.
-        pub head_reads: RefCell<Vec<String>>,
+        pub head_reads: Shared<Vec<String>>,
         /// Signed legacy pkg manifests.
-        pkgs: RefCell<BTreeMap<LegacyPkgKey, SignedDoc>>,
-        /// How many times a pkg manifest was asked for.
-        pub pkg_reads: Cell<u32>,
+        pkgs: Shared<BTreeMap<LegacyPkgKey, SignedDoc>>,
+        /// The repo of every pkg manifest asked for.
+        pub pkg_reads: Shared<Vec<String>>,
     }
 
     impl Fake {
@@ -1758,7 +1853,7 @@ pub(crate) mod world {
 
     impl Fetcher for Fake {
         fn index_candidates(&self) -> Result<Vec<crate::select::Candidate>, String> {
-            self.index_reads.set(self.index_reads.get() + 1);
+            *self.index_reads.borrow_mut() += 1;
             let Some((index_bytes, sig)) = self.index.borrow().clone() else {
                 return Err(String::from(if self.index_refused.get() {
                     "HTTP 403 for the index listing: API rate limit exceeded"
@@ -1778,13 +1873,16 @@ pub(crate) mod world {
         fn index_link_down(&self) -> bool {
             !self.index_refused.get()
         }
+        fn shared(&self) -> Option<&(dyn Fetcher + Sync)> {
+            Some(self)
+        }
         fn pkg_manifest(
             &self,
-            _: &str,
+            repo: &str,
             program: &str,
             build: u64,
         ) -> Result<(Vec<u8>, Vec<u8>), String> {
-            self.pkg_reads.set(self.pkg_reads.get() + 1);
+            self.pkg_reads.borrow_mut().push(repo.to_string());
             self.pkgs
                 .borrow()
                 .get(&(program.to_string(), build))
@@ -1890,16 +1988,32 @@ pub(crate) mod world {
         valid_until: &str,
         yanked: &[&str],
     ) -> (Vec<u8>, Vec<u8>) {
+        signed_index_naming(index_build, valid_until, yanked, &["claude", "codex"])
+    }
+
+    /// [`signed_index`], naming and pinning of the vendor programs only `vendors`.
+    pub(crate) fn signed_index_naming(
+        index_build: u64,
+        valid_until: &str,
+        yanked: &[&str],
+        vendors: &[&str],
+    ) -> (Vec<u8>, Vec<u8>) {
         let yanked: Vec<String> = yanked.iter().map(|y| format!("\"{y}\"")).collect();
+        let blocks: String = vendors
+            .iter()
+            .map(|p| format!("[programs.{p}]\nrepo = \"aterm\"\n"))
+            .collect();
+        let pins: String = vendors
+            .iter()
+            .map(|p| format!(", {p} = 2026091901"))
+            .collect();
         let body = format!(
             "schema = 2\nindex_build = {index_build}\nvalid_until = \"{valid_until}\"\n\
              machine_id = \"{}\"\nroster_seq = {}\n\
-             [programs.ay]\nrepo = \"ay\"\n\
-             [programs.claude]\nrepo = \"aterm\"\n\
-             [programs.codex]\nrepo = \"aterm\"\n\
+             [programs.ay]\nrepo = \"ay\"\n{blocks}\
              [[channels]]\nname = \"stable\"\nchannel_build = 1\nmin_build = 0\n\
              yanked = [{}]\n\
-             pin = {{ ay = 18, claude = 2026091901, codex = 2026091901 }}\n",
+             pin = {{ ay = 18{pins} }}\n",
             crate::sig::testkit::MACHINE_ID,
             crate::sig::testkit::SEQ,
             yanked.join(", ")
@@ -1972,6 +2086,7 @@ mod tests {
             legacy_index,
             asked: false,
             now: NOW,
+            download_turn: None,
         };
         install_one(&lane, spec, held)
     }
@@ -1987,6 +2102,7 @@ mod tests {
             legacy_index: None,
             asked: true,
             now: NOW,
+            download_turn: None,
         };
         install_one(&lane, spec, false)
     }
@@ -2077,6 +2193,153 @@ mod tests {
             f.downloads.borrow().as_slice(),
             [Fake::claude_payload_url("2.1.281")]
         );
+    }
+
+    fn sha512_hex(bytes: &[u8]) -> String {
+        ring::digest::digest(&ring::digest::SHA512, bytes)
+            .as_ref()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    fn agy() -> &'static VendorSpec {
+        super::super::spec("agy").unwrap()
+    }
+
+    fn muse() -> &'static VendorSpec {
+        super::super::spec("muse").unwrap()
+    }
+
+    /// Publish agy `version` holding `exe`: the Run manifest and the bucket's copy agreeing
+    /// on the tarball's sha512. Its URL.
+    fn publish_agy(f: &Fake, version: &str, exe: &[u8]) -> String {
+        let tarball = world::tarball(&[("antigravity", exe, 0o755)]);
+        let (_, dir, file) = resolve::agy_platform(world::triple()).unwrap();
+        let release = format!(
+            "https://storage.googleapis.com/antigravity-public/antigravity-cli/{version}-42/{dir}/"
+        );
+        let url = format!("{release}{file}");
+        let manifest = format!(
+            "{{\"version\":\"{version}\",\"url\":\"{url}\",\"sha512\":\"{}\"}}",
+            sha512_hex(&tarball)
+        );
+        f.doc(agy().head_url, manifest.as_bytes());
+        f.doc(&format!("{release}manifest.json"), manifest.as_bytes());
+        f.payload(&url, &tarball);
+        url
+    }
+
+    /// Publish muse `version` as `exe` on Meta's channel, the release manifest at the
+    /// client-built URL naming its sha256 and size; `false` where muse is not served.
+    fn publish_muse(f: &Fake, version: &str, exe: &[u8]) -> bool {
+        let Some((key, file)) = resolve::muse_platform(world::triple()) else {
+            return false;
+        };
+        let version = v(version);
+        let url = resolve::muse_url(version, file);
+        let manifest_url = resolve::muse_url(version, "manifest.json");
+        let channel = format!(
+            "{{\"channel\":\"muse-stable\",\"version\":\"{version}\",\"manifest_url\":\
+             \"{manifest_url}\",\"urgency\":\"none\",\"min_version\":null}}"
+        );
+        let manifest = format!(
+            "{{\"version\":\"{version}\",\"checksum_algorithm\":\"sha256\",\"artifacts\":\
+             {{\"{key}\":{{\"url\":\"{}\",\"checksum\":\"{}\",\"size\":{}}}}}}}",
+            url.replace('/', "\\/"),
+            world::sha(exe),
+            exe.len()
+        );
+        f.doc(muse().head_url, channel.as_bytes());
+        f.doc(&manifest_url, manifest.as_bytes());
+        f.payload(&url, exe);
+        true
+    }
+
+    /// AGY END TO END: Google's Run manifest and the bucket's copy beside the payload
+    /// agree, so the one file of the gzip tar lands at `bin/agy` under the sha512 they
+    /// name — recorded under its own key — and every shim exports the one value that turns
+    /// agy's own updater off.
+    #[test]
+    fn a_fresh_agy_lands_its_one_file_under_the_sha512_both_google_hosts_name() {
+        let l = world::layout("fresh-agy");
+        let f = Fake::default();
+        let exe = native_exe("agy 1.3.7");
+        let url = publish_agy(&f, "1.3.7", &exe);
+        let sha512 = sha512_hex(&world::tarball(&[("antigravity", &exe, 0o755)]));
+        let o = run(&l, &f, &Policy::default(), agy());
+        assert!(
+            matches!(
+                o.verdict,
+                Verdict::Installed {
+                    reason: InstallReason::Fresh,
+                    ..
+                }
+            ),
+            "{o:?}"
+        );
+        assert_eq!(o.line(), "atpkg: agy 1.3.7 installed (Google latest)");
+        let build = world::build_dir(&l, "agy", "1.3.7");
+        assert_eq!(std::fs::read(build.join("bin/agy")).unwrap(), exe);
+        let record = complete_record(&build).expect("a complete record");
+        assert_eq!(
+            (record.sha256.as_str(), record.sha512.as_str()),
+            ("", sha512.as_str())
+        );
+        assert_eq!(record.source_url, url);
+        let env = crate::shim_env::read_sidecar(&build);
+        assert_eq!(env.spelled(), "AGY_CLI_DISABLE_AUTO_UPDATE=true");
+        let shim =
+            std::fs::read_to_string(l.shim(&crate::store::ToolName::new("agy").unwrap())).unwrap();
+        assert!(shim.contains("AGY_CLI_DISABLE_AUTO_UPDATE"), "{shim}");
+        assert_eq!(f.downloads.borrow().as_slice(), [url]);
+    }
+
+    /// MUSE, WHERE IT IS SERVED: the channel names a revision-form version, the release
+    /// manifest at the client-built URL its sha256 and size, and the raw binary lands at
+    /// `bin/muse`. Where it is not served, the lane is the canonical `unavailable on`
+    /// state: no host is asked, no stamp written, and it is no failure.
+    #[test]
+    fn muse_lands_where_it_is_served_and_is_unavailable_elsewhere() {
+        let elsewhere = "x86_64-unknown-linux-gnu";
+        let l = world::layout("muse");
+        let f = Fake::default();
+        let lane = Lane {
+            layout: &l,
+            fetcher: &f,
+            triple: elsewhere,
+            policy: &Policy::default(),
+            trust: &world::trust(),
+            legacy_index: None,
+            asked: true,
+            now: NOW,
+            download_turn: None,
+        };
+        let o = install_one(&lane, muse(), false);
+        assert_eq!(
+            o.line(),
+            format!(
+                "atpkg: muse: {}",
+                crate::state::unavailable(
+                    elsewhere,
+                    "Meta publishes no Muse Code build aterm can verify for this target"
+                )
+            )
+        );
+        assert!(matches!(o.verdict, Verdict::Unavailable { .. }));
+        assert!(!o.is_failure());
+        assert!(f.gets.borrow().is_empty(), "no host was asked");
+        assert!(ProgramStamp::read(&l, "muse").is_none(), "nothing recorded");
+        let exe = native_exe("muse 1.4.9-R6298");
+        if !publish_muse(&f, "1.4.9-R6298", &exe) {
+            return;
+        }
+        let o = run(&l, &f, &Policy::default(), muse());
+        assert_eq!(o.line(), "atpkg: muse 1.4.9-R6298 installed (Meta latest)");
+        let build = world::build_dir(&l, "muse", "1.4.9-R6298");
+        assert_eq!(std::fs::read(build.join("bin/muse")).unwrap(), exe);
+        assert_eq!(complete_record(&build).unwrap().sha256, world::sha(&exe));
+        assert!(crate::shim_env::read_sidecar(&build).is_empty());
     }
 
     #[test]
@@ -2372,7 +2635,7 @@ mod tests {
         let l = world::layout("digest-log");
         let f = Fake::default();
         f.publish_claude("2.1.281", &native_exe("a"));
-        let log = super::super::digests::digests_path(&l);
+        let log = super::super::digests::digests_path(&l, "claude");
         std::fs::create_dir_all(log.parent().unwrap()).unwrap();
         std::fs::write(&log, "not toml {{{").unwrap();
         let o = run(&l, &f, &Policy::default(), claude());
@@ -2815,7 +3078,7 @@ mod tests {
         assert!(matches!(o.verdict, Verdict::Installed { .. }), "{o:?}");
         let vendor = Some(v("2.1.282").build_id());
         assert_eq!(legacy_root_owed(&l, "claude", vendor), Some(legacy));
-        assert_eq!(f.pkg_reads.get(), 0, "no index, no read");
+        assert_eq!(f.pkg_reads.borrow().len(), 0, "no index, no read");
         *f.index.borrow_mut() = Some(world::signed_index(44, "2099-01-01T00:00:00Z", &[]));
         f.publish_legacy_pkg_rooted("claude", legacy, "2.1.281", world::triple(), &root);
         let index = crate::resolve_verified_index(
@@ -2843,10 +3106,10 @@ mod tests {
         assert!(matches!(indexed().verdict, Verdict::Current(_)));
         let kept = ProgramStamp::read(&l, "claude").unwrap();
         assert_eq!(kept.legacy_root_of(legacy), Some(root.as_str()));
-        assert_eq!(f.pkg_reads.get(), 1);
+        assert_eq!(f.pkg_reads.borrow().len(), 1);
         assert_eq!(legacy_root_owed(&l, "claude", vendor), None);
         indexed();
-        assert_eq!(f.pkg_reads.get(), 1, "kept: no pass asks again");
+        assert_eq!(f.pkg_reads.borrow().len(), 1, "kept: no pass asks again");
         // An older client rewrites the stamp from its own fields: owed again, read again.
         let path = crate::vendor_direct::stamp_path(&l, "claude").unwrap();
         let older: String = std::fs::read_to_string(&path)
@@ -2860,7 +3123,7 @@ mod tests {
         std::fs::write(&path, older).unwrap();
         assert_eq!(legacy_root_owed(&l, "claude", vendor), Some(legacy));
         indexed();
-        assert_eq!(f.pkg_reads.get(), 2);
+        assert_eq!(f.pkg_reads.borrow().len(), 2);
         assert_eq!(
             ProgramStamp::read(&l, "claude")
                 .unwrap()
@@ -2956,6 +3219,63 @@ mod tests {
             ),
             "{o:?}"
         );
+        assert_eq!(shim_build(&l, "claude"), Some(v("2.1.282").build_id()));
+    }
+
+    /// AN INDEX THAT NO LONGER NAMES THE PROGRAM still vouches for its legacy builds: the
+    /// roster signs the manifest, and the index repo holds it. A legacy build above the
+    /// ceiling is read and moves to the head, never kept unread for want of a
+    /// `[programs.claude]` block.
+    #[test]
+    fn a_legacy_build_is_read_under_an_index_that_no_longer_names_its_program() {
+        let above = claude().legacy_ceiling + 1;
+        let l = world::layout("legacy-unnamed");
+        legacy_claude(&l, above);
+        let f = Fake::default();
+        *f.index.borrow_mut() = Some(world::signed_index_naming(
+            45,
+            "2099-01-01T00:00:00Z",
+            &[],
+            &[],
+        ));
+        f.publish_legacy_pkg("claude", above, "2.1.281");
+        f.publish_claude("2.1.282", &native_exe("vendor"));
+        let index = crate::resolve_verified_index(
+            &f,
+            &l,
+            &crate::sig::testkit::anchor(),
+            crate::sig::BuildFloor {
+                index_build: 0,
+                roster_seq: crate::sig::testkit::SEQ,
+            },
+            NOW,
+        )
+        .expect("the index verifies");
+        assert!(index.program("claude").is_none());
+        let o = run_indexed(
+            &l,
+            &f,
+            &Policy::default(),
+            &world::trust(),
+            claude(),
+            false,
+            Some(&index),
+        );
+        assert!(
+            matches!(
+                o.verdict,
+                Verdict::Installed {
+                    reason: InstallReason::Newer,
+                    ..
+                }
+            ),
+            "{o:?}"
+        );
+        assert_eq!(
+            o.line(),
+            "atpkg: claude 2.1.281 → 2.1.282 (Anthropic latest)"
+        );
+        assert_eq!(*f.pkg_reads.borrow(), [crate::manifest::INDEX_REPO]);
         assert_eq!(shim_build(&l, "claude"), Some(v("2.1.282").build_id()));
     }
 
@@ -3057,23 +3377,77 @@ mod tests {
     }
 
     /// A vendor re-cutting a published version is a supply-chain signal, never an update:
-    /// the first authenticated digest seen for a version binds it.
+    /// the first authenticated digest seen for a version binds it — logged before a byte
+    /// moves wherever the documents alone vouch for it, so a download that failed still
+    /// binds it.
     #[test]
     fn a_same_version_digest_change_is_refused() {
-        let l = world::layout("recut");
+        for (spec, version) in [
+            (claude(), "2.1.282"),
+            (codex(), "0.157.0"),
+            (agy(), "1.3.7"),
+        ] {
+            let publish = |f: &Fake, cut: &str| {
+                let exe = native_exe(cut);
+                match spec.program {
+                    "claude" => f.publish_claude(version, &exe),
+                    "codex" => f.publish_codex(version, &[("bin/codex", &exe, 0o755)]),
+                    _ => drop(publish_agy(f, version, &exe)),
+                }
+            };
+            let l = world::layout(&format!("recut-{}", spec.program));
+            let f = Fake::default();
+            publish(&f, "first cut");
+            f.downloads_fail.set(true);
+            let o = run(&l, &f, &Policy::default(), spec);
+            assert!(matches!(o.verdict, Verdict::Failed { .. }), "{o:?}");
+            f.downloads_fail.set(false);
+            publish(&f, "second cut");
+            let downloads = f.downloads.borrow().len();
+            let o = run(&l, &f, &Policy::default(), spec);
+            assert!(matches!(o.verdict, Verdict::Refused { .. }), "{o:?}");
+            assert!(
+                o.line().contains(&format!("first seen for {version}")),
+                "{}",
+                o.line()
+            );
+            assert_eq!(f.downloads.borrow().len(), downloads, "nothing downloaded");
+            assert_eq!(shim_build(&l, spec.program), None);
+        }
+    }
+
+    /// muse's digest comes from the host that serves its bytes, so only the Developer ID
+    /// team pin vouches for it: bytes the pin refuses log nothing, and Meta's genuine build
+    /// of that version lands after them. A re-cut once the genuine one was seen is still
+    /// refused before a byte moves.
+    #[test]
+    fn a_muse_digest_is_logged_only_once_the_team_pin_passed_its_bytes() {
+        let l = world::layout("muse-pin");
         let f = Fake::default();
-        f.publish_claude("2.1.282", &native_exe("first cut"));
-        f.downloads_fail.set(true);
-        let o = run(&l, &f, &Policy::default(), claude());
-        assert!(matches!(o.verdict, Verdict::Failed { .. }), "{o:?}");
-        f.downloads_fail.set(false);
-        f.publish_claude("2.1.282", &native_exe("second cut"));
+        if !publish_muse(&f, "1.4.9-R6298", &native_exe("not Meta's")) {
+            return;
+        }
+        let refusing = world::trust_refusing_signers();
+        let o = run_with(&l, &f, &Policy::default(), &refusing, muse(), false);
+        assert!(o.line().contains("signer refused"), "{}", o.line());
+        let log = super::super::digests::digests_path(&l, "muse");
+        assert!(!log.exists(), "nothing the pin refused is logged");
+        let genuine = native_exe("Meta's");
+        publish_muse(&f, "1.4.9-R6298", &genuine);
+        let o = run(&l, &f, &Policy::default(), muse());
+        assert_eq!(o.line(), "atpkg: muse 1.4.9-R6298 installed (Meta latest)");
+        let logged = std::fs::read_to_string(&log).unwrap();
+        assert!(logged.contains(&world::sha(&genuine)), "{logged}");
+        crate::ops::uninstall(&l, "muse").unwrap();
+        publish_muse(&f, "1.4.9-R6298", &native_exe("re-cut"));
         let downloads = f.downloads.borrow().len();
-        let o = run(&l, &f, &Policy::default(), claude());
-        assert!(matches!(o.verdict, Verdict::Refused { .. }), "{o:?}");
-        assert!(o.line().contains("first seen for 2.1.282"), "{}", o.line());
+        let o = run(&l, &f, &Policy::default(), muse());
+        assert!(
+            o.line().contains("first seen for 1.4.9-R6298"),
+            "{}",
+            o.line()
+        );
         assert_eq!(f.downloads.borrow().len(), downloads, "nothing downloaded");
-        assert_eq!(shim_build(&l, "claude"), None);
     }
 
     #[test]

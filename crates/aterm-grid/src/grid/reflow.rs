@@ -426,7 +426,7 @@ impl Grid {
             // caller's lock, so it must stay bounded by the viewport, not by
             // history. The offloaded path (`resize_offloading_scrollback`)
             // drives it to zero.
-            #[cfg(any(test, feature = "testing"))]
+            #[cfg(any(test, debug_assertions))]
             super::count_scrollback_reflow_sync_lines(old.len());
             let lines = super::scrollback_reflow::reflow_scrollback_lines(&old, new_cols);
             Some(lines)
@@ -800,7 +800,7 @@ impl Grid {
             // `tests/reflow/rows_only_cost_bound.rs`). Unreachable while the
             // early return above stands; a regression routing rows-only work
             // through the whole-ring migration shows a history-sized number.
-            #[cfg(any(test, feature = "testing"))]
+            #[cfg(any(test, debug_assertions))]
             if new_cols == self.storage.cols {
                 super::count_rows_only_resize_migrated_rows(self.storage.rows.len() - target);
             }
@@ -1080,7 +1080,7 @@ impl Grid {
             if excess > 0 {
                 // Bounded-cost counter, rows-only half: must stay O(height
                 // delta), never O(history) (`tests/reflow/rows_only_cost_bound.rs`).
-                #[cfg(any(test, feature = "testing"))]
+                #[cfg(any(test, debug_assertions))]
                 super::count_rows_only_resize_migrated_rows(excess);
                 // A tiered store (or one detached for an off-thread reflow)
                 // keeps retention past the ring, so evicted rows are staged into
@@ -1562,7 +1562,7 @@ impl Grid {
 
         let mut i = 0;
         while i < visible_count {
-            #[cfg(any(test, feature = "testing"))]
+            #[cfg(any(test, debug_assertions))]
             super::count_reflow_row_op();
 
             let row = match self.row(row_u16(i)) {
@@ -1766,7 +1766,7 @@ impl Grid {
             // Each merged continuation row is O(cols) work; count it so the
             // `reflow_linear_time*` cost check sees per-row cost even when the
             // screen is one logical line.
-            #[cfg(any(test, feature = "testing"))]
+            #[cfg(any(test, debug_assertions))]
             super::count_reflow_row_op();
             // The row just appended is continued by this one: it contributes
             // its full old width less a recorded hole. Pad up to that, or cut

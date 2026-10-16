@@ -5,21 +5,7 @@
 // frame above burning cells, derived from the `cursor_glow_add` stream the
 // bloom uses. Like the bloom it is outside the CPU/GPU byte differentials
 // (they call `set_shimmer(false)`) and inside everything introspection reads.
-//
-//   * No-op: flag off, an empty glow stream, or a region-less stream (fire on
-//     the top row) presents identical pixels on the readback and present
-//     paths.
-//   * Bounded displacement: every shimmered pixel stays within the min/max
-//     envelope of its small source neighbourhood.
-//   * Scoped: outside the derived region rect the frame is byte-identical,
-//     and inside it the shimmer is present.
-//   * Introspection: the offscreen readback (`render_input`, the `image`
-//     source), the swapchain video tap and the virtual present all carry it;
-//     the two taps agree byte-for-byte with the phase pinned.
-//   * Scissor: a scissored present source equals a fresh full render at the
-//     same pinned phase.
-//
-// The pass's one wall-clock term (the rising phase) is pinned via
+// Its one wall-clock term (the rising phase) is pinned via
 // `set_shimmer_phase_for_test` wherever bytes are compared.
 //
 // No GPU or no system font: no-op.
@@ -30,10 +16,10 @@ use aterm_render::{FirePatch, GlowQuad, RenderInput, Theme, premul_rgb};
 
 use crate::common;
 
-fn gpu_or_skip() -> Option<aterm_gpu::GpuRenderer> {
-    let mut g = common::gpu_or_skip(16.0, Theme::default())?;
+fn gpu() -> aterm_gpu::GpuRenderer {
+    let mut g = common::gpu(16.0, Theme::default());
     g.debug_block_on_lazy_fallbacks();
-    Some(g)
+    g
 }
 
 /// A warm ember comet: one row of premultiplied fire-orange glow quads over
@@ -46,7 +32,7 @@ fn fire_comet(row: usize, cols: std::ops::Range<usize>, cw: usize, ch: usize) ->
         w: cw as u16,
         h: ch as u16,
         color: premul_rgb(0x00FF_6A00, 230),
-        // ADDITIVE light (see `GlowQuad::alpha`).
+        // Additive light (see `GlowQuad::alpha`).
         alpha: 0,
         color2: premul_rgb(0x00FF_6A00, 230),
         alpha2: 0,
@@ -77,7 +63,7 @@ fn lanes(p: u32) -> [i32; 4] {
 /// wall clock live, so agreement shows no time-dependent pass ran.
 #[test]
 fn shimmer_no_op_law_flag_off_and_empty_region() {
-    let Some(mut gpu) = gpu_or_skip() else { return };
+    let mut gpu = gpu();
     gpu.set_bloom(false); // isolate the shimmer layer
     let (rows, cols) = (10usize, 30usize);
     let (cw, ch) = gpu.cell_size();
@@ -93,8 +79,8 @@ fn shimmer_no_op_law_flag_off_and_empty_region() {
 
     let mut win = aterm_gpu::WindowGpu::new();
 
-    // Flag OFF with a live stream, wall clock UNPINNED: byte-stable across
-    // renders — proof no time-dependent pass ran.
+    // Flag off with a live stream and the wall clock unpinned: byte-stable
+    // across renders, so no time-dependent pass ran.
     gpu.set_shimmer(false);
     let off_a = gpu.render_input(&mut win, &fire, None).pixels;
     let off_b = gpu.render_input(&mut win, &fire, None).pixels;
@@ -103,7 +89,7 @@ fn shimmer_no_op_law_flag_off_and_empty_region() {
         "flag off must run NO pass (wall-clock leak)"
     );
 
-    // Empty stream, shimmer ON: identical to the shimmer-off render.
+    // Empty stream, shimmer on: identical to the shimmer-off render.
     let off_plain = gpu.render_input(&mut win, &plain, None).pixels;
     gpu.set_shimmer(true);
     gpu.set_shimmer_phase_for_test(Some(0.31));
@@ -113,7 +99,7 @@ fn shimmer_no_op_law_flag_off_and_empty_region() {
         "empty glow stream must be a byte-identical no-op"
     );
 
-    // Region-less stream (fire on the TOP row — no air above it): the derived
+    // Region-less stream (fire on the top row, no air above it): the derived
     // region is None and the pass must not run.
     assert!(
         gpu.shimmer_region_for_test(&top_fire).is_none(),
@@ -128,7 +114,7 @@ fn shimmer_no_op_law_flag_off_and_empty_region() {
         "a region-less stream must be a byte-identical no-op"
     );
 
-    // The PRESENT path (the compose-present-offscreen route): same laws.
+    // The present path (compose-present-offscreen): same laws.
     let mut win_off = aterm_gpu::WindowGpu::new();
     gpu.set_shimmer(false);
     let p_off = gpu.present_input_readback(&mut win_off, &top_fire).pixels;
@@ -140,8 +126,8 @@ fn shimmer_no_op_law_flag_off_and_empty_region() {
         "present path: a region-less stream must present byte-identical pixels"
     );
 
-    // Non-vacuity for the whole suite: with a REAL region the shimmer alters
-    // the readback (the visibility law proper is in the bounded test below).
+    // Non-vacuity: a real region alters the readback (the visibility law proper
+    // is in the bounded test below).
     let on_fire = gpu.render_input(&mut win, &fire, None).pixels;
     assert!(
         on_fire != off_a,
@@ -156,7 +142,7 @@ fn shimmer_no_op_law_flag_off_and_empty_region() {
 /// region does shimmer.
 #[test]
 fn shimmer_bounded_displacement_and_scoped_to_region() {
-    let Some(mut gpu) = gpu_or_skip() else { return };
+    let mut gpu = gpu();
     gpu.set_bloom(false); // isolate the shimmer layer
     let (rows, cols) = (12usize, 30usize);
     let (cw, ch) = gpu.cell_size();
@@ -201,7 +187,8 @@ fn shimmer_bounded_displacement_and_scoped_to_region() {
             }
             let ol = lanes(o);
             let sl = lanes(s);
-            // Alpha lane (transmittance byte): COLOR-only write mask.
+            // Alpha lane (transmittance byte): the shimmer writes all channels, but
+            // this frame is opaque, so a displaced sample carries the same alpha.
             assert_eq!(ol[0], sl[0], "alpha lane perturbed at ({x},{y})");
             if o != s {
                 inside_diffs += 1;
@@ -251,7 +238,7 @@ fn opts() -> CaptureOpts {
     }
 }
 
-/// Present `input` once through the copyable-SWAPCHAIN stand-in with the video
+/// Present `input` once through the copyable-swapchain stand-in with the video
 /// tap armed, returning the single harvested frame's bytes.
 fn tap_swapchain(gpu: &mut aterm_gpu::GpuRenderer, input: &RenderInput, w: u32, h: u32) -> Vec<u8> {
     let mut win = aterm_gpu::WindowGpu::new();
@@ -264,8 +251,8 @@ fn tap_swapchain(gpu: &mut aterm_gpu::GpuRenderer, input: &RenderInput, w: u32, 
     take.frames[0].rgba.clone()
 }
 
-/// Present `input` once through the VIRTUAL present (81cbf35c) with the video
-/// tap armed, returning the single harvested frame's bytes.
+/// Present `input` once through the virtual present with the video tap armed,
+/// returning the single harvested frame's bytes.
 fn tap_virtual(gpu: &mut aterm_gpu::GpuRenderer, input: &RenderInput, w: u32, h: u32) -> Vec<u8> {
     let mut win = aterm_gpu::WindowGpu::new();
     gpu.virtual_begin(&mut win, w, h, opts())
@@ -284,7 +271,7 @@ fn tap_virtual(gpu: &mut aterm_gpu::GpuRenderer, input: &RenderInput, w: u32, h:
 /// identically.
 #[test]
 fn shimmer_reaches_all_three_introspection_paths() {
-    let Some(mut gpu) = gpu_or_skip() else { return };
+    let mut gpu = gpu();
     // These taps are the wgpu stand-in harness (the wgpu oracle arm). The
     // armed tap ring has its own differential
     // (`armed_present_tap_ring_captures_the_submit_b_destination_byte_for_byte`).
@@ -306,7 +293,7 @@ fn shimmer_reaches_all_three_introspection_paths() {
     let (fw, fh) = gpu.frame_size(rows, cols);
     let (fw, fh) = (fw as u32, fh as u32);
 
-    // Shimmer ON: the two tap arms must agree byte-for-byte.
+    // Shimmer on: the two tap arms agree byte-for-byte.
     gpu.set_shimmer(true);
     let swap_on = tap_swapchain(&mut gpu, &input, fw, fh);
     let virt_on = tap_virtual(&mut gpu, &input, fw, fh);
@@ -315,7 +302,7 @@ fn shimmer_reaches_all_three_introspection_paths() {
         "swapchain and virtual presents must harvest byte-identical shimmer frames"
     );
 
-    // Shimmer OFF twins: the difference is the shimmer, scoped to the region.
+    // Shimmer-off twins: the difference is the shimmer, scoped to the region.
     gpu.set_shimmer(false);
     let swap_off = tap_swapchain(&mut gpu, &input, fw, fh);
     assert!(
@@ -345,7 +332,7 @@ fn shimmer_reaches_all_three_introspection_paths() {
         "the tapped shimmer must land inside the region"
     );
 
-    // The offscreen READBACK (the `image` introspection source) shimmers too.
+    // The offscreen readback (the `image` introspection source) shimmers too.
     let mut win = aterm_gpu::WindowGpu::new();
     gpu.set_shimmer(true);
     let rb_on = gpu.render_input(&mut win, &input, None).pixels;
@@ -361,7 +348,7 @@ fn shimmer_reaches_all_three_introspection_paths() {
 /// keystroke, the comet moves) equals a fresh full render of the same input.
 #[test]
 fn shimmer_scissored_present_matches_fresh_render() {
-    let Some(mut gpu) = gpu_or_skip() else { return };
+    let mut gpu = gpu();
     assert!(gpu.shimmer_enabled(), "shimmer must be ON by default");
     assert!(gpu.bloom_enabled(), "bloom must be ON by default");
     gpu.set_shimmer_phase_for_test(Some(0.27));
@@ -375,7 +362,7 @@ fn shimmer_scissored_present_matches_fresh_render() {
     term.process(b"\x1b[1;9H");
     let mut win = aterm_gpu::WindowGpu::new();
 
-    // Frame A: first paint (FULL) with the comet on row 6.
+    // Frame A: first (full) paint with the comet on row 6.
     let mut in_a = term.cell_frame(rows, cols);
     in_a.cursor_glow_add = fire_comet(6, 4..12, cw, ch);
     in_a.fire_patch = fire_marker();
@@ -401,12 +388,11 @@ fn shimmer_scissored_present_matches_fresh_render() {
     );
 }
 
-/// Region-derivation sanity: the rect sits strictly ABOVE the hot band,
-/// spans the quads (plus the rolloff margin), and dark/empty streams derive
-/// nothing.
+/// Region-derivation sanity: the rect sits above the hot band, spans the quads
+/// (plus the rolloff margin), and dark/empty streams derive nothing.
 #[test]
 fn shimmer_region_derivation_sanity() {
-    let Some(gpu) = gpu_or_skip() else { return };
+    let gpu = gpu();
     let (rows, cols) = (10usize, 30usize);
     let (cw, ch) = gpu.cell_size();
     let mut term = Terminal::new(rows as u16, cols as u16);
@@ -435,7 +421,7 @@ fn shimmer_region_derivation_sanity() {
             w: cw as u16,
             h: ch as u16,
             color: 0,
-            // ADDITIVE light (see `GlowQuad::alpha`).
+            // Additive light (see `GlowQuad::alpha`).
             alpha: 0,
             color2: 0,
             alpha2: 0,

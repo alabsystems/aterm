@@ -20,10 +20,9 @@ enum Disposition {
     Local,
 }
 
-/// Ghost fields that remain observable at the protocol boundary after the
-/// real owner-map entry has been removed. All live-hold fields are projected
-/// directly from `App::physical_press_owners`; only completed-episode history
-/// (which the shipping map intentionally forgets) is retained here.
+/// Ghost fields still observable after the real owner-map entry is removed.
+/// Live-hold state is projected from `App::physical_press_owners`; this keeps
+/// only the completed-episode history the shipping map forgets.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ProjectionWitness {
     phase: i64,
@@ -645,14 +644,12 @@ pub(crate) fn run_conformance() {
         "NEGATIVE CONTROL: orphan untracked repeat must be rejected\n{out}"
     );
 
-    // A release-time chord re-lookup, replayed on the real tables. Bind the
-    // literal press's bytes to `ctrl+c` in a real `[key_sequences]` table:
-    // with Ctrl let go mid-hold, re-asking the table with the release's
-    // modifiers misses and falls through to the encoder, which owes a Kitty
-    // release report for a press the PTY never saw. The local-repeat half
-    // is the zoom hold's `ctrl+=` re-looked-up in `[keybindings]` with Ctrl
-    // let go. Each real miss, applied to the real released state, is the
-    // `Buggy=1` release, and the healthy model refuses it.
+    // A release-time chord re-lookup, replayed on the real tables: with Ctrl
+    // let go mid-hold, re-asking `[key_sequences]` (`ctrl+c`) misses and falls
+    // through to the encoder, which owes a Kitty release for a press the PTY
+    // never saw; `[keybindings]` (`ctrl+=` zoom) misses the same way. Each real
+    // miss, applied to the real released state, is the `Buggy=1` release, and
+    // the healthy model refuses it.
     let ctrl = winit::keyboard::ModifiersState::CONTROL;
     let none = winit::keyboard::ModifiersState::empty();
     let sequences = crate::keybinding::KeySequences::from_config(Some(
@@ -791,9 +788,8 @@ pub(crate) fn run_conformance() {
     );
 }
 
-// The active machine has 21 actions. Twelve ownership/routing seams above carry
-// real `#[refines]` anchors. These nine actions are explicit scope boundaries,
-// not silent coverage holes.
+// The machine has 21 actions: twelve carry `#[refines]` anchors on their
+// `app_input.rs` seams, and these nine are explicit scope boundaries.
 #[aterm_spec::spec_unmodeled(
     machine = "input_release_pairing",
     action = "TransferFocusWhileHeld",

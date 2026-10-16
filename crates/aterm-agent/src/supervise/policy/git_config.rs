@@ -4,11 +4,11 @@
 //! What a git read would load that can run a program: the check behind the
 //! read-only rule's git reads ([`super::approval::RULE_READ_ONLY`]).
 //!
-//! Git reads under `approve = "safe"` are approved only when no configuration
-//! they would load can execute a program. The classifier
+//! Under `approve = "safe"` a git read is approved only when no configuration
+//! it would load can execute a program. The classifier
 //! ([`crate::supervise::classify`]) judges the line; this module judges the
 //! machine: an accept-edits worker can write `.git/config`, and `git status`
-//! then runs whatever `core.fsmonitor` names (owner, 2026-09-25).
+//! then runs whatever `core.fsmonitor` names.
 //!
 //! **Where** ([`git_reads`]): each segment's command is found as
 //! [`crate::supervise::classify::runs`] finds it, and runs in the session's cwd
@@ -29,21 +29,20 @@
 //! * an executable `post-index-change` hook where the read would run it.
 //!
 //! A read that contacts a remote escalates outright. `core.pager`/`pager.*`
-//! are exempt (decided 2026-09-26 under the owner's standing direction):
-//! Claude Code's Bash tool gives git no terminal, and the classifier refuses
-//! the reads that start a pager or viewer without one (`git grep -O`,
-//! `git <cmd> --help`).
+//! are exempt: Claude Code's Bash tool gives git no terminal, and the
+//! classifier refuses the reads that start a pager or viewer without one
+//! (`git grep -O`, `git <cmd> --help`).
 //!
 //! **As the worker reads it** ([`WorkerEnv`]): every probe runs the git the
 //! worker's `PATH` finds with the worker process's environment, read from the
-//! kernel (`Session::worker_env`), never aterm's own. Escalated instead: an
-//! unreadable environment; a `PATH` entry ahead of git the worker could write
-//! ([`WorkerEnv::view`]); a git-relevant variable Claude Code's settings give
-//! the Bash tool but not the process ([`WorkerEnv::settings_env`]).
+//! kernel, never aterm's own. Escalated instead: an unreadable environment; a
+//! `PATH` entry ahead of git the worker could write ([`WorkerEnv::view`]); a
+//! git-relevant variable Claude Code's settings give the Bash tool but not the
+//! process ([`WorkerEnv::settings_env`]).
 //!
-//! Not covered: a box that runs on another machine (escalated), and the shell
+//! Not covered: a box that runs on another machine (escalated). The shell
 //! snapshot, `CLAUDE_ENV_FILE` and rc files Claude Code sources before each
-//! command, which come from the person's own configuration.
+//! command are [`super::shell_startup`]'s.
 
 use aterm_uds::spawnfd::{Command, Stdio};
 use std::path::{Component, Path, PathBuf};
@@ -361,11 +360,9 @@ impl WorkerEnv {
         )
     }
 
-    /// A test's worker: this process's `PATH`, no system configuration, and
-    /// `global` (none: empty) as its global one — what the repository alone
-    /// contributes, whatever the developer's own config says — and a Claude
-    /// Code directory that is not there, so none of the developer's own
-    /// Claude Code settings are read either.
+    /// A test's worker: this process's `PATH`, no system configuration,
+    /// `global` (none: empty) as its global one, and no Claude Code directory,
+    /// so nothing of the developer's own configuration is read.
     #[cfg(test)]
     pub(crate) fn hermetic(global: Option<&Path>) -> Self {
         let global = global.unwrap_or(Path::new("/dev/null"));
@@ -395,12 +392,10 @@ impl WorkerEnv {
 
     /// The git the worker's shell runs: the first executable `git` on its
     /// `PATH`. Refused when an entry at or ahead of it is one the worker could
-    /// have put a `git` in: a relative entry, which the shell resolves against
-    /// whatever directory the command runs in, and an entry `worker_writes`
-    /// (a directory the worker writes without anyone approving it: its
-    /// project, a virtualenv's or `node_modules`' `bin` in it, a scratch
-    /// directory). A git planted there would run — here, in the supervisor,
-    /// before anything is approved, and again as the approved command.
+    /// have put a `git` in: a relative entry (resolved against wherever the
+    /// command runs), or one `worker_writes` (its project, a virtualenv's or
+    /// `node_modules`' `bin` in it, a scratch directory). A git planted there
+    /// would run here, in the supervisor, before anything is approved.
     fn git_program(&self, worker_writes: &dyn Fn(&Path) -> bool) -> Result<PathBuf, String> {
         let path = self
             .var("PATH")
@@ -434,12 +429,10 @@ impl WorkerEnv {
     /// git's own repository discovery would start.
     ///
     /// Only commands that run no configured program read it: `git config
-    /// --list`, `rev-parse`, and — once the configuration names no
-    /// `core.fsmonitor` program, which reading the index would run —
-    /// `ls-files` and `check-attr`, for the populated submodules (each viewed
-    /// in turn, recursively) and the filter drivers the attributes select.
-    /// The git is the worker's ([`Self::git_program`]), found on a `PATH`
-    /// with no entry `worker_writes` ahead of it.
+    /// --list`, `rev-parse`, and, once the configuration names no
+    /// `core.fsmonitor` program (which reading the index would run),
+    /// `ls-files` and `check-attr` for the populated submodules and the filter
+    /// drivers the attributes select. The git is [`Self::git_program`]'s.
     pub fn view(
         &self,
         dir: &Path,
@@ -454,17 +447,14 @@ impl WorkerEnv {
 
     /// `Err` naming the file and the variable when Claude Code's settings
     /// would give the worker's Bash tool a variable that changes what a git
-    /// read loads or which git runs ([`git_relevant`]) with a value other
-    /// than the worker process's own: an `env` block anywhere along the
-    /// worker's settings chain for an agent launched in `launch`
-    /// ([`super::claude_settings::sources`]: the managed documents, a
-    /// `--settings`, the project's files — repository content an accept-edits
-    /// worker writes — and the user's). Claude Code applies those to the
-    /// commands its Bash tool runs, not to the process environment this check
-    /// reads, so where one would change a git read the read escalates instead
-    /// — and so it does where a settings file is there but cannot be read
-    /// whole or does not parse, since its `env` could say anything. A file
-    /// that is not there sets nothing.
+    /// read loads or which git runs ([`git_relevant`]) with a value other than
+    /// the worker process's own: an `env` block anywhere along the settings
+    /// chain for an agent launched in `launch`
+    /// ([`super::claude_settings::sources`]; the project's files are content an
+    /// accept-edits worker writes). Claude Code applies those to its Bash
+    /// tool's commands, not to the process environment this check reads, so
+    /// such a read escalates, as it does where a settings file cannot be read
+    /// whole or does not parse (its `env` could say anything).
     pub fn settings_env(&self, launch: &Path) -> Result<(), String> {
         self.settings_env_where(launch, git_relevant, "a git read")
     }
@@ -511,15 +501,13 @@ impl WorkerEnv {
 
 /// The Claude Code directory of a process whose `CLAUDE_CONFIG_DIR` is
 /// `config_dir` and whose `HOME` is `home`, standing in `cwd`, as Claude Code
-/// (2.1.295, 2.1.299) resolves it: `path.resolve(CLAUDE_CONFIG_DIR ??
-/// join(os.homedir(), ".claude"))`. A `CLAUDE_CONFIG_DIR` that is set at all
-/// counts, even an empty one (`??`); otherwise `os.homedir()` is the
-/// non-empty `HOME`, else the account's home from the passwd database
-/// (`account_home`: the worker's account is this process's, since
-/// [`atpkg::caller_shell::process_args`] reads only this uid's processes). A
-/// relative result is taken against `cwd`, lexically as `path.resolve` does.
-/// `Err` says what is missing where the account names no home either:
-/// nothing is skipped for want of a directory.
+/// resolves it: `path.resolve(CLAUDE_CONFIG_DIR ?? join(os.homedir(),
+/// ".claude"))`. A `CLAUDE_CONFIG_DIR` that is set at all counts, even an
+/// empty one (`??`); otherwise `os.homedir()` is the non-empty `HOME`, else
+/// the account's home from the passwd database (the worker's account is this
+/// process's: [`atpkg::caller_shell::process_args`] reads only this uid's
+/// processes). A relative result is taken against `cwd`, lexically. `Err`
+/// says what is missing where the account names no home either.
 pub(crate) fn claude_dir_at(
     config_dir: Option<&str>,
     home: Option<&str>,
@@ -554,9 +542,8 @@ struct Probe<'a> {
 impl Probe<'_> {
     /// `git --no-pager` in `dir`, with the worker's environment and nothing
     /// of this process's ([`withheld_from_probe`] aside), stdin closed. Built
-    /// through `aterm_uds::spawnfd::command`, so from a process with no console (the
-    /// window's harness host) `git.exe` gets a windowless console on Windows,
-    /// not a visible one.
+    /// by `spawnfd::command`, so from a process with no console `git.exe` gets
+    /// a windowless one on Windows, not a visible one.
     fn git(&self, dir: &Path) -> Command {
         let mut cmd = aterm_uds::spawnfd::command(&self.program);
         cmd.arg("--no-pager")
@@ -725,7 +712,7 @@ impl Probe<'_> {
     }
 }
 
-/// Whether `view`'s configuration names an fsmonitor PROGRAM (a boolean is
+/// Whether `view`'s configuration names an fsmonitor program (a boolean is
 /// git's own daemon).
 fn fsmonitor_program(view: &GitView) -> bool {
     view.config

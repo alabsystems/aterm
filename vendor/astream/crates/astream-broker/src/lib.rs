@@ -41,7 +41,15 @@
 //!   streaming verb — leaves the connection usable.
 //! - **A LAST WILL**: `Will{..}` is the record the broker appends when your
 //!   connection ends, deduped by your own producer key and fenced by any later
-//!   record of yours; every will the log still holds is re-fired on open.
+//!   record of yours; every will the log still holds is re-fired on open. A TCP
+//!   client that keeps alive ([`Client::keepalive_if_idle`]) is held to
+//!   [`KEEPALIVE_DEADLINE`], so one that vanishes without a FIN ends — and its will
+//!   fires — instead of holding its connection until the broker restarts.
+//! - **LOG IDENTITY**: the answer to `Hello` names the log served — a
+//!   [`LogIdentity`], a random id and a generation that moves whenever an offset may
+//!   have come to name a different record (a repair's cut, an older copy restored) —
+//!   so a client that persisted offsets checks them first ([`Client::log_identity`]);
+//!   a replica reports its leader's.
 //! - **FORK-DELIVERY and cognition routing** build on the same SUBSCRIBE primitive.
 //! - **The durability dial**: Strict (fsync per batch), Relaxed (page cache), and
 //!   Replicated ([`Broker::open_replicated`]: an ack waits for a follower quorum).
@@ -58,6 +66,7 @@
 pub mod brecord;
 pub mod broker;
 pub mod client;
+pub mod logid;
 pub mod proto;
 /// cfg(unix): sharding binds one Unix-domain socket per shard, and std has no
 /// Unix-domain sockets on Windows (where the broker serves TCP only).
@@ -66,10 +75,14 @@ pub mod sharded;
 pub mod store;
 
 pub use brecord::{BrokerRecord, BREC_VERSION, MAX_RECORD_PAYLOAD};
-pub use broker::{Broker, BrokerHandle};
+pub use broker::{
+    Broker, BrokerHandle, IDLE_MARK, IDLE_MARK_DEADLINE, KEEPALIVE_DEADLINE, KEEPALIVE_INTERVAL,
+};
 pub use client::{
-    ack, connect, drain, take, AnyClient, AnyStream, AnySubscription, Client, Closer, Event, Page,
-    Record, Subscription, SubscriptionCloser, Transport, Walk, ACK_SEQ_BASE, LAST_WALK_PAGES_MAX,
+    ack, broker_refusal, connect, drain, protocol_mismatch, take, AnyClient, AnyStream,
+    AnySubscription, BrokerRefusal, Client, Closer, Event, Page, ProtocolMismatch, Record,
+    SubjectBudget, Subscription, SubscriptionCloser, Transport, Walk, ACK_SEQ_BASE,
+    LAST_WALK_PAGES_MAX,
 };
 
 /// Static public-key identity types (Rung 8), re-exported so callers of
@@ -77,6 +90,7 @@ pub use client::{
 /// identity without depending on `astream-aead` directly.
 #[cfg(feature = "identity")]
 pub use astream_aead::{IdentityKeypair, ID_PUB_LEN};
+pub use logid::LogIdentity;
 pub use proto::{Request, Response};
 #[cfg(unix)]
 pub use sharded::{ShardedBroker, ShardedClient, ShardedHandle, ShardedSubscription};

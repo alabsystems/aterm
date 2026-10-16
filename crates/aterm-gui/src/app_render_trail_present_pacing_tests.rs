@@ -34,9 +34,9 @@ fn a_decoration_latch_is_a_bounded_level_on_the_shared_phase_locked_lane() {
         "a resting decoration holds the lane open for nothing: the loop parks"
     );
 
-    // One animating frame. The hold is `DECO_ANIM_LEVEL_FRAMES` periods of
-    // the window's LONGEST lane (`deco_anim_hold`), long enough to cover
-    // arm -> fire -> next redraw even if a park stretches the lane meanwhile.
+    // One animating frame. The hold is `DECO_ANIM_LEVEL_FRAMES` periods of the window's
+    // longest lane (`deco_anim_hold`): it covers arm -> fire -> next redraw even if a park
+    // stretches the lane meanwhile.
     let grace = ws.deco_anim_hold();
     ws.note_deco_animating(t0);
     assert!(ws.deco_anim_frame_active(t0));
@@ -78,13 +78,10 @@ fn a_decoration_latch_is_a_bounded_level_on_the_shared_phase_locked_lane() {
     );
 }
 
-/// An event-loop turn that redraws some other window, or none, between the
-/// arm and the fire keeps the armed decoration tick. The park arm calls
-/// `park_terminal_effect_scheduler`, which drops `next_trail_tick`, and
-/// `new_events` services deadlines only under `ResumeTimeReached`, so an
-/// edge-triggered input would freeze Robi mid-stride (he has no focus-gated
-/// or blink wake to revive him). Park repeatedly with nothing else live:
-/// the armed slot stays, unmoved, and reaches the fold.
+/// An event-loop turn that redraws some other window, or none, between the arm and the
+/// fire keeps the armed decoration tick. A park that dropped it
+/// (`park_terminal_effect_scheduler`) would freeze Robi mid-stride: he has no
+/// focus-gated or blink wake to revive him.
 #[test]
 fn an_unrelated_wake_between_arm_and_fire_keeps_the_decoration_tick() {
     let mut app = App::headless_for_test();
@@ -115,9 +112,8 @@ fn an_unrelated_wake_between_arm_and_fire_keeps_the_decoration_tick() {
     assert!(armed > t0, "the armed slot is strictly in the future");
     assert_eq!(ws.next_trail_tick, Some(armed));
 
-    // Now the blocker. Five event-loop turns before the slot is due, none of
-    // them a redraw of this window and none of them `ResumeTimeReached`, so
-    // nothing refreshes the latch and nothing consumes the tick.
+    // Five event-loop turns before the slot is due, none a redraw of this window: nothing
+    // refreshes the latch or consumes the tick.
     let interval = ws.effect_present_interval();
     for step in 1..=5_u32 {
         let woke = t0 + interval / 8 * step;
@@ -134,8 +130,8 @@ fn an_unrelated_wake_between_arm_and_fire_keeps_the_decoration_tick() {
         assert_eq!(ws.next_trail_tick, Some(armed));
     }
 
-    // And it is bounded, not a train: the walk ends, no redraw refreshes the
-    // latch, and the lane parks back to pure `Wait` within the grace.
+    // Bounded, not a train: with no redraw refreshing the latch, the lane parks within
+    // the grace.
     let grace = ws.deco_anim_hold();
     assert_eq!(
         ws.plan_terminal_effect_lane(t0 + grace, false, true),
@@ -272,12 +268,11 @@ fn a_hidden_output_streak_route_cannot_pin_the_scheduler() {
     );
 }
 
-/// The frame-cadence arm clamps an inherited `next_trail_tick` to its own
-/// cadence. The else-if arm can leave a slot bounded only by the
-/// reduced-motion cat's `discovery_until` (seconds out), which would pace the
-/// decoration at seconds and outlive `deco_anim_until`, so a later park would
-/// drop it and freeze the lane. Clamped, the tick that refreshes the latch
-/// is always due inside it.
+/// The frame-cadence arm takes the earlier of an inherited `next_trail_tick` and its own
+/// slot. The one-shot arm can leave a slot seconds out (the reduced-motion cat's
+/// `static_cursor_cat_deadline`), which would outlive `deco_anim_until`, so a later park
+/// would drop it and freeze the lane; clamped, the tick that refreshes the latch is
+/// always due inside it.
 #[test]
 fn a_decoration_arm_never_inherits_a_slot_that_outlives_its_own_latch() {
     let mut app = App::headless_for_test();
@@ -288,8 +283,8 @@ fn a_decoration_arm_never_inherits_a_slot_that_outlives_its_own_latch() {
     let t0 = Instant::now();
     let interval = ws.effect_present_interval();
 
-    // Stand in for the reduced-motion cat's one-shot erase, armed by the
-    // else-if on an earlier park and still pending when a decoration moves.
+    // Stand in for the reduced-motion cat's one-shot erase, armed by the one-shot arm on an
+    // earlier park and still pending when a decoration moves.
     let far = t0 + Duration::from_secs(3);
     ws.next_trail_tick = Some(far);
     ws.note_deco_animating(t0);
@@ -591,8 +586,7 @@ fn content_present_rebase_conforms_to_derived_model() {
     let mut next = None;
     let mut anchor = None;
 
-    // Reach the pending state through the model's real Arm transition;
-    // the former test started at pending=1,steps=0, which is unreachable.
+    // Reach the pending state through the model's real Arm transition.
     let initial = state(0, 0, 0, 0);
     assert_eq!(model.init_state(), initial);
     assert_eq!((next, anchor), (None, None));

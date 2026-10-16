@@ -179,9 +179,7 @@ pub(crate) type BandColors = aterm_messages::ink::BandInks;
 // The chrome colour helpers live in the engine (one implementation for band, tab
 // strip, find bar, notices, Settings and presence), re-exported under local paths.
 #[cfg(test)]
-pub(crate) use aterm_messages::ink::{
-    HOVER_RISE, PRIMARY_HOVER_LIFT, TRACK_TINT, ensure_contrast_either, hover_ink,
-};
+pub(crate) use aterm_messages::ink::{HOVER_RISE, PRIMARY_HOVER_LIFT, TRACK_TINT, hover_ink};
 pub(crate) use aterm_messages::ink::{contrast, ensure_contrast, forced_ink, mix3, warn_mark};
 
 /// A packed `0x00RRGGBB` theme colour as sRGB bytes.
@@ -239,30 +237,37 @@ pub(crate) fn band_colors(theme: Theme) -> BandColors {
     band_colors_with(theme, None)
 }
 
-/// The theme's ANSI blue and cyan (slots 4 and 6), which a band meter
-/// borrows when the cursor is near-grey (ruling 250).
+/// The theme's ANSI hues the band borrows: blue and cyan (slots 4 and 6) for
+/// a meter when the cursor is near-grey (ruling 250), red and yellow (slots 1
+/// and 3) as the seeds of its error and warn inks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct MeterAnsi {
+    pub red: [u8; 3],
+    pub yellow: [u8; 3],
     pub blue: [u8; 3],
     pub cyan: [u8; 3],
 }
 
 impl MeterAnsi {
-    /// A scheme's blue and cyan (the tests' builtin grounds; the app reads
+    /// A scheme's borrowed hues (the tests' builtin grounds; the app reads
     /// its configured palette, [`Self::of_palette`]).
     #[cfg(test)]
     pub(crate) fn of_scheme(s: &aterm_types::ColorScheme) -> Self {
         let rgb = |c: aterm_types::Rgb| [c.r, c.g, c.b];
         Self {
+            red: rgb(s.ansi[1]),
+            yellow: rgb(s.ansi[3]),
             blue: rgb(s.ansi[4]),
             cyan: rgb(s.ansi[6]),
         }
     }
 
-    /// A terminal palette's blue and cyan.
+    /// A terminal palette's borrowed hues.
     pub(crate) fn of_palette(p: &aterm_types::ColorPalette) -> Self {
         let rgb = |c: aterm_types::Rgb| [c.r, c.g, c.b];
         Self {
+            red: rgb(p.get(1)),
+            yellow: rgb(p.get(3)),
             blue: rgb(p.get(4)),
             cyan: rgb(p.get(6)),
         }
@@ -303,18 +308,38 @@ pub(crate) fn band_colors_with(theme: Theme, ansi: Option<MeterAnsi>) -> BandCol
     if let Some(hc) = forced_chrome() {
         return BandColors::forced(hc);
     }
-    BandColors::derive(
-        ThemeInks {
-            bg: rgb(theme.bg),
-            fg: rgb(theme.fg),
-            cursor: rgb(theme.cursor),
-        },
-        ansi.map(|a| AnsiHues {
-            blue: a.blue,
-            cyan: a.cyan,
-        }),
-        PLATFORM_BAR_BASE,
-    )
+    let inks = ThemeInks {
+        bg: rgb(theme.bg),
+        fg: rgb(theme.fg),
+        cursor: rgb(theme.cursor),
+    };
+    let hues = ansi.map(|a| AnsiHues {
+        red: a.red,
+        yellow: a.yellow,
+        blue: a.blue,
+        cyan: a.cyan,
+    });
+    // The tones are a pure function of these two and the platform's base, and
+    // the paint paths ask for them again every frame — the Claude Code
+    // footer's splice and its lights' block each frame a pane shows one —
+    // while each derivation floors a dozen inks by WCAG contrast (`powf`
+    // per channel): the last answer is kept for the same inks and hues, per
+    // thread (owner, 2026-10-15: "the user experince must be extremely
+    // smooth and zero latency!").
+    std::thread_local! {
+        static LAST: std::cell::Cell<Option<(ThemeInks, Option<AnsiHues>, BandColors)>> =
+            const { std::cell::Cell::new(None) };
+    }
+    LAST.with(|last| match last.get() {
+        Some((was, was_hues, colors)) if was == inks && was_hues == hues => colors,
+        _ => {
+            #[cfg(test)]
+            crate::work_counts::band_derived();
+            let colors = BandColors::derive(inks, hues, PLATFORM_BAR_BASE);
+            last.set(Some((inks, hues, colors)));
+            colors
+        }
+    })
 }
 
 /// Where this platform's band ground comes from: on Linux the CSD headerbar grey
@@ -661,13 +686,7 @@ mod tests {
         );
         for name in aterm_types::scheme::builtin_names() {
             let scheme = aterm_types::scheme::builtin(name).expect("listed scheme exists");
-            let parts = scheme.to_theme_parts();
-            let theme = Theme {
-                fg: parts.fg,
-                bg: parts.bg,
-                cursor: parts.cursor,
-                selection: parts.selection,
-            };
+            let theme = Theme::from(&scheme);
             let expected = if crate::tab_bar::bg_is_light(rgb(theme.bg)) {
                 CSD_HEADERBAR_LIGHT
             } else {
@@ -700,9 +719,9 @@ mod tests {
                 "{name}"
             );
             // One of black and white always clears AA on the fill, so the
-            // floor that may cross to the far one always meets it.
+            // floor, which crosses to the far pole when it must, always meets it.
             assert!(
-                contrast(ensure_contrast_either(colors.label, fill, 4.5), fill) >= 4.5,
+                contrast(ensure_contrast(colors.label, fill, 4.5), fill) >= 4.5,
                 "{name}: no ink reaches AA on {fill:?}"
             );
             assert!(
@@ -723,6 +742,73 @@ mod tests {
         }
     }
 
+    /// THE TONES ARE KEPT FOR THE SAME THEME (`band_colors_with`): asked again
+    /// for the theme last asked for, nothing is derived and the tones are the
+    /// derivation's exactly; every other theme, the same theme with the
+    /// meter's hues, and the first theme again each derive anew, their tones
+    /// their own. NEGATIVE CONTROLS: the counter sees each derivation, and the
+    /// themes' tones differ, so a tone kept for the wrong theme would show.
+    #[test]
+    fn band_tones_are_derived_once_per_theme() {
+        let derive = |theme: Theme, ansi: Option<MeterAnsi>| {
+            BandColors::derive(
+                ThemeInks {
+                    bg: rgb(theme.bg),
+                    fg: rgb(theme.fg),
+                    cursor: rgb(theme.cursor),
+                },
+                ansi.map(|a| AnsiHues {
+                    red: a.red,
+                    yellow: a.yellow,
+                    blue: a.blue,
+                    cyan: a.cyan,
+                }),
+                PLATFORM_BAR_BASE,
+            )
+        };
+        let themes: Vec<Theme> = aterm_types::scheme::builtin_names()
+            .iter()
+            .map(|name| Theme::from(&aterm_types::scheme::builtin(name).expect("a scheme")))
+            .collect();
+        assert!(themes.len() > 2, "CONTROL: themes to tell apart");
+        let ansi = MeterAnsi {
+            red: [200, 40, 40],
+            yellow: [200, 200, 40],
+            blue: [40, 40, 200],
+            cyan: [40, 200, 200],
+        };
+        let _ = crate::work_counts::take_band_derives();
+        for &theme in themes.iter().chain(&themes[..1]) {
+            let colors = band_colors(theme);
+            assert_eq!(colors, derive(theme, None), "the derivation's own tones");
+            assert_eq!(
+                crate::work_counts::take_band_derives(),
+                1,
+                "CONTROL: derived"
+            );
+            for _ in 0..3 {
+                assert_eq!(band_colors(theme), colors, "kept");
+            }
+            assert_eq!(
+                crate::work_counts::take_band_derives(),
+                0,
+                "kept, not derived"
+            );
+            let hued = band_colors_with(theme, Some(ansi));
+            assert_eq!(
+                hued,
+                derive(theme, Some(ansi)),
+                "the hues are the key's too"
+            );
+            assert_eq!(crate::work_counts::take_band_derives(), 1);
+        }
+        assert_ne!(
+            band_colors(themes[0]),
+            band_colors(themes[1]),
+            "CONTROL: two themes' tones differ"
+        );
+    }
+
     #[test]
     fn band_colors_meet_wcag_aa_on_every_builtin_scheme() {
         // This test measures the theme-derived tones, which exist only with no OS
@@ -734,13 +820,7 @@ mod tests {
         );
         for name in aterm_types::scheme::builtin_names() {
             let scheme = aterm_types::scheme::builtin(name).expect("listed scheme exists");
-            let parts = scheme.to_theme_parts();
-            let theme = Theme {
-                fg: parts.fg,
-                bg: parts.bg,
-                cursor: parts.cursor,
-                selection: parts.selection,
-            };
+            let theme = Theme::from(&scheme);
             let colors = band_colors(theme);
             for (role, value) in [
                 ("value", colors.value),
@@ -871,13 +951,7 @@ mod tests {
         };
         for name in aterm_types::scheme::builtin_names() {
             let scheme = aterm_types::scheme::builtin(name).expect("listed scheme exists");
-            let parts = scheme.to_theme_parts();
-            let theme = Theme {
-                fg: parts.fg,
-                bg: parts.bg,
-                cursor: parts.cursor,
-                selection: parts.selection,
-            };
+            let theme = Theme::from(&scheme);
             check(name, &band_colors(theme));
         }
         for (name, palette) in hc_fixtures::STOCK {

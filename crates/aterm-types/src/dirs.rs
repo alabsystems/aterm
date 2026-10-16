@@ -138,15 +138,43 @@ pub fn resolve_aterm_config_path(
     appdata: Option<&OsStr>,
     home: Option<&OsStr>,
 ) -> Option<PathBuf> {
+    resolve_aterm_config_dir(xdg_config_home, appdata, home).map(|dir| dir.join("aterm.toml"))
+}
+
+/// THE aterm config directory: the folder that holds `aterm.toml`, and so the
+/// one everything that must sit beside it (the `themes` folder) is named from.
+/// Resolved, never created. [`resolve_aterm_config_dir`] is the rule; this
+/// reads the three variables it consults.
+#[must_use]
+pub fn aterm_config_dir() -> Option<PathBuf> {
+    resolve_aterm_config_dir(
+        std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+        std::env::var_os("APPDATA").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
+}
+
+/// The rule behind [`aterm_config_dir`] and [`resolve_aterm_config_path`]
+/// (which is this directory joined with `aterm.toml`): `$XDG_CONFIG_HOME/aterm`
+/// when set and non-empty on every platform, else `%APPDATA%\aterm` on Windows
+/// when set and non-empty, else `$HOME/.config/aterm`. One rule for the file
+/// and its folder, so a sibling of `aterm.toml` can never be looked for in a
+/// different tree than the config it belongs to.
+#[must_use]
+pub fn resolve_aterm_config_dir(
+    xdg_config_home: Option<&OsStr>,
+    appdata: Option<&OsStr>,
+    home: Option<&OsStr>,
+) -> Option<PathBuf> {
     if let Some(x) = xdg_config_home.filter(|x| !x.is_empty()) {
-        return Some(PathBuf::from(x).join("aterm").join("aterm.toml"));
+        return Some(PathBuf::from(x).join("aterm"));
     }
     if cfg!(windows)
         && let Some(appdata) = appdata.filter(|a| !a.is_empty())
     {
-        return Some(PathBuf::from(appdata).join("aterm").join("aterm.toml"));
+        return Some(PathBuf::from(appdata).join("aterm"));
     }
-    home.map(|h| PathBuf::from(h).join(".config/aterm/aterm.toml"))
+    home.map(|h| PathBuf::from(h).join(".config").join("aterm"))
 }
 
 /// Return the user's data directory.
@@ -495,6 +523,86 @@ mod tests {
         );
     }
 
+    /// THE CONFIG DIRECTORY RULE: across the XDG / APPDATA-only / HOME-only /
+    /// none matrix, the directory is exactly the folder that holds `aterm.toml`
+    /// and the themes folder is `<that directory>/themes`, so the themes always
+    /// sit beside the config the window loads. The APPDATA-only row is the
+    /// Windows case that used to have no themes folder at all (the old rule
+    /// read only XDG_CONFIG_HOME and HOME).
+    #[test]
+    fn the_themes_folder_sits_beside_aterm_toml_on_every_row_of_the_matrix() {
+        let xdg = OsStr::new("/xdg");
+        let appdata = OsStr::new(r"C:\Users\who\AppData\Roaming");
+        let home = OsStr::new("/Users//who");
+        let empty = OsStr::new("");
+        type Row<'a> = (
+            &'a str,
+            Option<&'a OsStr>,
+            Option<&'a OsStr>,
+            Option<&'a OsStr>,
+        );
+        let rows: [Row<'_>; 6] = [
+            ("all three set", Some(xdg), Some(appdata), Some(home)),
+            ("XDG only", Some(xdg), None, None),
+            ("APPDATA only", None, Some(appdata), None),
+            ("HOME only", None, None, Some(home)),
+            (
+                "empty XDG and APPDATA",
+                Some(empty),
+                Some(empty),
+                Some(home),
+            ),
+            ("none", None, None, None),
+        ];
+        for (row, x, a, h) in rows {
+            let dir = resolve_aterm_config_dir(x, a, h);
+            let file = resolve_aterm_config_path(x, a, h);
+            assert_eq!(
+                file.as_deref().and_then(std::path::Path::parent),
+                dir.as_deref(),
+                "{row}: the config dir is the folder aterm.toml is in"
+            );
+            assert_eq!(
+                file.as_ref().map(|f| f.with_file_name("themes")),
+                dir.as_ref().map(|d| d.join("themes")),
+                "{row}: themes == config_dir/themes, beside aterm.toml"
+            );
+        }
+
+        let appdata_only = resolve_aterm_config_dir(None, Some(appdata), None);
+        if cfg!(windows) {
+            assert_eq!(
+                appdata_only,
+                Some(PathBuf::from(appdata).join("aterm")),
+                "Windows with only %APPDATA%: the config dir (and its themes) is there"
+            );
+        } else {
+            assert_eq!(appdata_only, None, "APPDATA means nothing off Windows");
+        }
+        assert_eq!(
+            resolve_aterm_config_dir(None, None, Some(home)),
+            Some(PathBuf::from(home).join(".config").join("aterm"))
+        );
+        assert_eq!(
+            resolve_aterm_config_dir(Some(xdg), Some(appdata), Some(home)),
+            Some(PathBuf::from(xdg).join("aterm")),
+            "a set XDG_CONFIG_HOME wins everywhere"
+        );
+
+        // The live resolvers ARE the rule over the live environment, and the
+        // live themes folder is the live config dir's `themes`.
+        let live = resolve_aterm_config_dir(
+            std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+            std::env::var_os("APPDATA").as_deref(),
+            std::env::var_os("HOME").as_deref(),
+        );
+        assert_eq!(aterm_config_dir(), live);
+        assert_eq!(
+            crate::scheme::user_theme_dir(),
+            live.map(|d| d.join("themes"))
+        );
+    }
+
     /// THE STATE ROOT RULE, pure: the
     /// override wins when absolute and is refused when relative; without it the
     /// platform default applies; and `identities_dir` is one segment below.
@@ -679,37 +787,6 @@ mod tests {
         assert_eq!(data_dir(), resolve_data_dir(data_platform()));
         if crate::dev_seam!("ATERM_STATE_HOME").is_none() {
             assert_eq!(aterm_data_dir(), data_dir().map(|data| data.join("aterm")));
-        }
-    }
-
-    /// A PRIVATE STATE ROOT IS THE SEAM BEING SET, and nothing else (ruling 409): the
-    /// helper reads the same seam `aterm_data_dir` and `state_dir` read, so a process
-    /// they place in its own root is one that leaves the machine's `[machine]` settings
-    /// alone. The environment is not mutated here, so this checks agreement with what
-    /// the runner inherited (with the seam unset, an always-`false` helper passes); the
-    /// real pin is atpkg's `tests/machine_edge.rs`.
-    #[test]
-    fn a_private_state_root_is_the_state_home_seam_set() {
-        let seam = crate::dev_seam!("ATERM_STATE_HOME");
-        assert_eq!(runs_under_private_state_root(), seam.is_some());
-        // A relative or empty value resolves no root, and still counts as a private one.
-        if seam
-            .as_deref()
-            .is_some_and(|v| !std::path::Path::new(v).is_absolute())
-        {
-            assert_eq!(aterm_data_dir(), None);
-            assert!(runs_under_private_state_root());
-        }
-    }
-
-    #[test]
-    fn identities_dir_is_one_segment_below_the_state_root() {
-        if let (Some(state), Some(identities)) = (state_dir(), identities_dir()) {
-            assert_eq!(identities, state.join("identities"));
-            assert_eq!(
-                identities.file_name().and_then(|n| n.to_str()),
-                Some("identities")
-            );
         }
     }
 

@@ -1,13 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// FREE-floating sprite layer (`free_sprites` + `free_atlas`) on the GPU: the
-// real CatBaker atlas geometry uploads (its row pitch is not wgpu's 256-byte
-// copy alignment), and a real `EffectsPipeline` cat survives the GPU present
-// path. The multi-row-rect-vs-legacy-slices and damaged-path no-ghosting laws
-// are held on both backends by `free_parity.rs`.
+// Free-floating sprite layer (`free_sprites` + `free_atlas`) on the GPU: the real CatBaker atlas
+// geometry uploads (its row pitch is not wgpu's 256-byte copy alignment), and a real
+// `EffectsPipeline` cat survives the GPU present path. `free_parity.rs` holds the cross-backend
+// laws.
 //
-// Gated: no GPU or no font -> the test no-ops (returns), like the other parity gates.
+// No GPU or no font: the tests no-op.
 
 use crate::common;
 use std::sync::Arc;
@@ -48,9 +47,7 @@ fn free_1to1(x: i32, y: i32, w: u16, h: u16, src_xy: [u16; 2]) -> FreeSprite {
 #[test]
 fn free_sprite_upload_accepts_real_catbaker_row_pitch() {
     let theme = Theme::default();
-    let Some((_, mut gpu)) = backends(18.0, theme) else {
-        return;
-    };
+    let (_, mut gpu) = backends(18.0, theme);
     let mut win = aterm_gpu::WindowGpu::new();
     let (rows, cols) = (4usize, 12usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
@@ -81,18 +78,16 @@ fn free_sprite_upload_accepts_real_catbaker_row_pitch() {
     );
 }
 
-/// A real `EffectsPipeline` bakes its sparse CatBaker atlas, emits the
-/// arbitrary-rect `FreeSprite`, and the art survives the GPU present path
-/// (the channel native sparkle-word and companion cats share). Synthetic
-/// atlases cannot catch a UV window landing in CatBaker's transparent area.
+/// A real `EffectsPipeline` bakes its sparse CatBaker atlas and emits the arbitrary-rect
+/// `FreeSprite` (the channel sparkle-word and companion cats share), and the art survives the
+/// GPU present path. A synthetic atlas cannot catch a UV window landing in CatBaker's
+/// transparent area.
 #[test]
 fn real_catbaker_free_sprite_is_visible_on_gpu_present_path() {
     let theme = Theme::default();
-    let Some((mut cpu, mut gpu)) = backends(18.0, theme) else {
-        return;
-    };
-    // Native windows use a padded grid; exercise the same signed-origin
-    // translation and padded offscreen/scissor dimensions as the GUI path.
+    let (mut cpu, mut gpu) = backends(18.0, theme);
+    // Native windows use a padded grid: the same signed-origin translation and padded
+    // offscreen/scissor dimensions as the GUI path.
     cpu.set_pad(14);
     gpu.set_pad(14);
     let mut win = aterm_gpu::WindowGpu::new();
@@ -145,10 +140,9 @@ fn real_catbaker_free_sprite_is_visible_on_gpu_present_path() {
         "real CatBaker CPU/GPU parity exceeded the cat bar: {delta} > 2"
     );
 
-    // Production composes both sprite atlases in one frame: phosphor rain,
-    // then the feline free sprite. The rain-only frame primes a resident
-    // offscreen; the next frame adds only the CatBaker sprite and must differ
-    // on the incremental present path.
+    // Production composes both sprite atlases in one frame: phosphor rain, then the feline
+    // free sprite. A rain-only frame primes the resident offscreen; the next adds only the
+    // CatBaker sprite and must differ on the incremental present path.
     let mut rain_term = Terminal::new(rows as u16, cols as u16);
     rain_term.process("\x1b[?25l████████".as_bytes());
     let rain_base = rain_term.cell_frame(rows, cols);

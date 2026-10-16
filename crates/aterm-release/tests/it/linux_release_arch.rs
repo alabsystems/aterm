@@ -1,11 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Native Linux architecture claims exercise the shipping shared contract.
-//! Names, manifest fields, and ELF machine identity must agree; authenticity
-//! additionally requires the appcast/roster signatures and full digest checked
-//! by the worker/installer. Manual tar downloads are covered by
-//! `release_steps::release_shape` (`ship release`'s after-cut step).
+//! Native Linux architecture claims: asset names, manifest fields and ELF machine identity must
+//! agree. Authenticity (appcast/roster signatures, full digest) is checked by the worker and
+//! installer; the manual tar downloads by `release_steps::release_shape`.
 
 use aterm_update_core::Manifest;
 use aterm_update_core::linux::{LINUX_BINARY_MAX_BYTES, LinuxTarget};

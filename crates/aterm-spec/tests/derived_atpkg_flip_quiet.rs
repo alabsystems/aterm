@@ -9,12 +9,6 @@ use aterm_spec::{derive::atpkg_flip_quiet_model, interp, verify};
 #[test]
 fn a_busy_toolchain_holds_its_flip_up_to_the_ceiling_and_a_revoked_one_never_waits() {
     let model = atpkg_flip_quiet_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name),
-        "the flip gate must stay enrolled in the spec-link registry"
-    );
     verify::prove_and_catch_scalar(&model, "atpkg flip when quiet");
 
     // The healthy path: in use for three looks, then the ceiling flips it anyway.
@@ -36,7 +30,7 @@ fn a_busy_toolchain_holds_its_flip_up_to_the_ceiling_and_a_revoked_one_never_wai
     assert!(!model.action_enabled("Hold", &revoked));
     assert!(model.fire("Flip", &mut revoked));
 
-    // NEGATIVE CONTROLS, one per claim, under the buggy decision.
+    // Negative controls, one per claim, under the buggy decision.
     let buggy = interp::with_buggy(&model, 1);
     let mut unsure = buggy.init_state();
     for action in ["Unsure", "Flip"] {

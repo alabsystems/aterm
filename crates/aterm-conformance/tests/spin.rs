@@ -1,58 +1,75 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Spin conformance: an idle instance must stay idle.
+//! The spin matrix: an idle release instance must stay idle. What each row
+//! measures is `aterm_conformance::measure::spin`.
 //!
-//! The freeze-safety gate watches for loops that block; this suite watches for
-//! a loop that runs too much. The shape: a client emitting output without grid
-//! movement (a spinner repainting in place) must not make the event loop
-//! re-arm a deadline that is already behind its own observation gate.
-//!
-//! The witness is `past_deadline_arms` from `ctl metrics`: a wake armed at an
-//! instant its gate has already passed. Healthy idle banks zero.
-//!
-//! The matrix:
-//!   1. a steady repainter arriving on the instance, 10 s → ~0
-//!      past_deadline_arms and at most 12 timer wakes
-//!   2. a bare /bin/sh prompt, nothing running, 6 s → ~0 past_deadline_arms
-//!
-//! Row 1's fixture, `tools/spin-conformance/idle_repainter.py`, warms with one
-//! second of real writes (so `classify` reaches phase=Running), then writes
-//! ~6x/s bytes that mark no cell (a DEC-2026 bracket around a bare cursor
-//! position): output keeps `Running` alive while `owed_wake`'s movement clock
-//! goes stale. Content marks count as movement even when bytes are identical,
-//! so the fixture must not rewrite text. The probe checks `ctl status` reads
-//! `output_activity` at the end of the window.
-//!
-//! The counter is zeroed before the client starts and the window opens with
-//! its arrival: headless, the episode is a burst in the ~2 s after the client
-//! reaches the alt screen, after which Running ages out.
-//!
-//! Row 1 also bounds timer wakes: the clamp in `StatusObserver::next_wake`
-//! turns a stale `owed_wake` into a poll at the observation rate, which arms
-//! nothing in the past, so `past_deadline_arms` alone cannot see that
-//! regression. Row 2 is the floor, not the regression's shape.
-//!
-//! Observer rule (docs/RELEASE-PROOF-DISCIPLINE.md): the probe issues no
-//! control verbs inside the window; `ctl metrics reset` and `ctl metrics`
-//! bracket it. No `ctl video`, whose present loop would break the idleness
-//! under test. The ceiling is 100 arms per window, far above a healthy zero
-//! and far below the regression.
-//!
-//! The merge gate's test run skips every `measuring::…` test
-//! (`aterm_verify::stages::MEASURING_TESTS`); they are the MEASURE tier
-//! (`tools/verify.sh --measure <APP>`, `--full <APP>`), run alone in the
-//! exclusive `measuring tests` stage over the release bundle the release built
-//! once, and a release signs only bytes they measured green. A probe
-//! that decides nothing (exit 2) is recorded as COULD NOT RUN. The binary is
-//! the release bundle's, from `ATERM_SPIN_BIN` (or `ATERM_PAINT_BIN`); without
-//! either a row says `not measured` (`support::release_bin`).
-//!
-//! Unix only: the probe drives a POSIX shell sandbox (`mktemp -d`, `/bin/sh`,
-//! a unix-socket control path).
+//! The rows are ignored in an ordinary test run; the `measure` check runs them
+//! with `-- --ignored` and the release binary in `ATERM_SPIN_BIN` (or
+//! `ATERM_PAINT_BIN`). Without it a row is red, never "not measured".
 #![cfg(unix)]
 
-mod support;
+mod measuring {
+    use std::time::Duration;
 
-#[path = "spin/measuring.rs"]
-mod measuring;
+    use aterm_conformance::measure::Rig;
+    use aterm_conformance::measure::spin::{SpinRow, SpinScene, measure};
+    use aterm_conformance::measure::starvation::ShapeVerdict;
+
+    /// The ceiling: far above a healthy zero, far below a spin.
+    const MAX_ARMS: u64 = 100;
+
+    /// Opens every take that decided nothing, so the verify gate records the
+    /// machine (COULD NOT RUN), not a spin finding.
+    const COULD_NOT_RUN: &str = "aterm-gate: COULD NOT RUN";
+
+    fn run(row: SpinRow) {
+        let rig = Rig::release(
+            &["ATERM_SPIN_BIN", "ATERM_PAINT_BIN"],
+            env!("CARGO_BIN_EXE_fake-tui"),
+        );
+        let report = match measure(&rig, &row) {
+            Ok(report) => report,
+            Err(why) => panic!(
+                "{COULD_NOT_RUN} — SPIN COULD NOT RUN [{:?}]: the probe decided nothing, which is not a pass: {why}",
+                row.scene
+            ),
+        };
+        assert_eq!(
+            report.verdict,
+            ShapeVerdict::Pass,
+            "SPIN CONFORMANCE FAILED [{:?}]: an idle instance armed wakes past its own \
+             observation gate, or woke for timers far past its quiet rate.\n  {report}",
+            row.scene
+        );
+        eprintln!("{report}");
+    }
+
+    /// Row 1, claude-shaped: the steady repainter arrives inside the window.
+    /// The window is 10 s because the movement clock goes stale `quiet_after`
+    /// (5 s) after the last real write. Timer wakes are bounded too: 12 is 2.4x
+    /// a healthy window and under the clamped poll's 21.
+    #[test]
+    #[ignore = "measures a release aterm: --ignored with ATERM_SPIN_BIN"]
+    fn an_idle_claude_shaped_client_banks_no_past_deadline_arms() {
+        run(SpinRow {
+            scene: SpinScene::ClaudeShaped,
+            window: Duration::from_secs(10),
+            max_arms: MAX_ARMS,
+            max_timer_wakes: Some(12),
+        });
+    }
+
+    /// Row 2, the floor: a bare `/bin/sh` prompt with nothing running. Red
+    /// here is a spin that is not client-shaped, a different finding.
+    #[test]
+    #[ignore = "measures a release aterm: --ignored with ATERM_SPIN_BIN"]
+    fn a_bare_idle_instance_banks_no_past_deadline_arms() {
+        run(SpinRow {
+            scene: SpinScene::Idle,
+            window: Duration::from_secs(6),
+            max_arms: MAX_ARMS,
+            max_timer_wakes: None,
+        });
+    }
+}

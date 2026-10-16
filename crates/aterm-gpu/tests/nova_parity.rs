@@ -13,8 +13,8 @@
 // damaged path equals a fresh render on both backends; a settled frame after
 // the super nova, with its frozen rainbow ink, takes the dirty gate.
 //
-// Skips without a GPU or system font; byte-exact checks also gate on
-// `additive_is_byte_exact`.
+// A host without a GPU could not run it (`common::gpu`); byte-exact checks
+// also gate on `additive_is_byte_exact`.
 
 use crate::common;
 use aterm_core::render::InkCell;
@@ -38,7 +38,7 @@ fn push_nova(input: &mut aterm_core::render::RenderInput, cw: usize, ch: usize) 
             w: (cw * 2) as u16,
             h: ch as u16,
             color: premul_rgb(core, 200),
-            // ADDITIVE light (see `GlowQuad::alpha`).
+            // Additive light (see `GlowQuad::alpha`).
             alpha: 0,
             color2: premul_rgb(core, 200),
             alpha2: 0,
@@ -55,7 +55,7 @@ fn push_nova(input: &mut aterm_core::render::RenderInput, cw: usize, ch: usize) 
                 w: cw as u16,
                 h: (ch / 2) as u16,
                 color: premul_rgb(fringe, 120),
-                // ADDITIVE light (see `GlowQuad::alpha`).
+                // Additive light (see `GlowQuad::alpha`).
                 alpha: 0,
                 color2: premul_rgb(fringe, 120),
                 alpha2: 0,
@@ -64,15 +64,13 @@ fn push_nova(input: &mut aterm_core::render::RenderInput, cw: usize, ch: usize) 
     }
 }
 
-/// (a) Premultiplied nova light over pure background is byte-exact CPU==GPU and
+/// Premultiplied nova light over pure background is byte-exact CPU==GPU and
 /// equals `min(255, bg + premul)` per channel.
 #[test]
 fn nova_additive_is_byte_exact_over_background() {
     let theme = Theme::default();
     let px = 18.0;
-    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(px, theme);
     let mut win = aterm_gpu::WindowGpu::new();
     let (rows, cols) = (5usize, 16usize);
     let mut term = Terminal::new(rows as u16, cols as u16); // all background
@@ -91,7 +89,7 @@ fn nova_additive_is_byte_exact_over_background() {
             w: cw as u16,
             h: ch as u16,
             color: premul_rgb(base, *a),
-            // ADDITIVE light (see `GlowQuad::alpha`).
+            // Additive light (see `GlowQuad::alpha`).
             alpha: 0,
             color2: premul_rgb(base, *a),
             alpha2: 0,
@@ -130,14 +128,12 @@ fn nova_additive_is_byte_exact_over_background() {
     );
 }
 
-/// (b) Crown and ring over glyphs stay within the glyph tolerance (<=8).
+/// Crown and ring over glyphs stay within the glyph tolerance (<=8).
 #[test]
 fn nova_over_text_matches_within_tolerance() {
     let theme = Theme::default();
     let px = 18.0;
-    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(px, theme);
     let mut win = aterm_gpu::WindowGpu::new();
     let (rows, cols) = (5usize, 24usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
@@ -157,17 +153,15 @@ fn nova_over_text_matches_within_tolerance() {
     }
 }
 
-/// (d) Cached-path nova parity with a multi-row shape: frame A places the crown
-/// and ring; frame B moves the ring down, and the shared dirty set must cover
+/// Cached-path nova parity with a multi-row shape: frame A places the crown and
+/// ring; frame B moves the ring down, and the shared dirty set must cover
 /// previous and current rows on both backends with no stale light. Over a
 /// glyph-free background frame B is byte-exact CPU vs GPU.
 #[test]
 fn damaged_path_multi_row_nova_parity_cpu_matches_gpu() {
     let theme = Theme::default();
     let px = 18.0;
-    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(px, theme);
     let mut win_cpu = WindowCpu::new();
     let mut win_gpu = aterm_gpu::WindowGpu::new();
     let (rows, cols) = (8usize, 16usize);
@@ -187,7 +181,7 @@ fn damaged_path_multi_row_nova_parity_cpu_matches_gpu() {
                 w: (3 * cw) as u16,
                 h: ch as u16,
                 color,
-                // ADDITIVE light (see `GlowQuad::alpha`).
+                // Additive light (see `GlowQuad::alpha`).
                 alpha: 0,
                 color2: color,
                 alpha2: 0,
@@ -293,14 +287,12 @@ fn frozen_rainbow_ink() -> Vec<InkCell> {
     .collect()
 }
 
-/// (e) Detonation peak (t=500 ms) over a flat background: premultiplied One/One
+/// Detonation peak (t=500 ms) over a flat background: premultiplied One/One
 /// quads, byte-exact CPU==GPU (gated on `additive_is_byte_exact`).
 #[test]
 fn supernova_detonation_peak_is_byte_exact_over_background() {
     let theme = Theme::default();
-    let Some((mut cpu, mut gpu)) = backends(18.0, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(18.0, theme);
     let mut win = aterm_gpu::WindowGpu::new();
     let (rows, cols) = (8usize, 16usize);
     let mut term = Terminal::new(rows as u16, cols as u16); // all background
@@ -331,14 +323,12 @@ fn supernova_detonation_peak_is_byte_exact_over_background() {
     }
 }
 
-/// (f) Detonation peak over text: the wash over glyphs stays within the glyph
+/// Detonation peak over text: the wash over glyphs stays within the glyph
 /// tolerance (<=8).
 #[test]
 fn supernova_detonation_peak_over_text_matches_within_tolerance() {
     let theme = Theme::default();
-    let Some((mut cpu, mut gpu)) = backends(18.0, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(18.0, theme);
     let mut win = aterm_gpu::WindowGpu::new();
     let (rows, cols) = (8usize, 24usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
@@ -361,16 +351,14 @@ fn supernova_detonation_peak_over_text_matches_within_tolerance() {
     }
 }
 
-/// (g) Damaged path, wash frame to shockwave frame: the wash lights every row,
-/// the shockwave only the ring's, so most rows are vacated and must be rebuilt.
+/// Damaged path, wash frame to shockwave frame: the wash lights every row, the
+/// shockwave only the ring's, so most rows are vacated and must be rebuilt.
 /// Cached equals fresh byte for byte on the CPU damaged path and the GPU
 /// scissored path.
 #[test]
 fn supernova_damaged_path_wash_to_shockwave_cached_equals_fresh() {
     let theme = Theme::default();
-    let Some((mut cpu, mut gpu)) = backends(18.0, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(18.0, theme);
     let mut win_cpu = WindowCpu::new();
     let mut win_gpu = aterm_gpu::WindowGpu::new();
     let (rows, cols) = (8usize, 16usize);
@@ -430,29 +418,21 @@ fn supernova_damaged_path_wash_to_shockwave_cached_equals_fresh() {
     );
 }
 
-/// (h) Settled after the super nova, with the frozen rainbow ink: once the
-/// window closes (empty `nova_add` and decos) a byte-equal settled frame takes
-/// the dirty gate on both backends.
-///
-/// With a pixel oracle, since counters alone would pass a wrong image:
-///   * the word `fuck` is printed at the episode's cells so the ink is visible;
-///   * against a no-ink twin exactly the four lead cells differ, each carrying
-///     its own ink colour;
-///   * the pixels the gate hit returns equal a fresh full render on both
-///     backends.
+/// Settled after the super nova, with the frozen rainbow ink: once the window
+/// closes (empty `nova_add` and decos) a byte-equal settled frame takes the
+/// dirty gate on both backends. Counters alone would pass a wrong image, so a
+/// pixel oracle also checks the ink lands on exactly the word's four lead cells
+/// and the gate hit hands back a fresh render's pixels.
 #[test]
 fn settled_after_supernova_gate_hits_with_frozen_rainbow_ink() {
     let theme = Theme::default();
-    let Some((mut cpu, mut gpu)) = backends(18.0, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(18.0, theme);
     let mut win_cpu = WindowCpu::new();
     let mut win_gpu = aterm_gpu::WindowGpu::new();
     let (rows, cols) = (8usize, 16usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
     term.process(b"\x1b[?25l");
-    // The word at row 2 col 4 (CUP is 1-based: `\x1b[3;5H`), so the ink is
-    // visible.
+    // The word at row 2 col 4 (CUP is 1-based), so the ink is visible.
     term.process(b"\x1b[3;5Hfuck");
     let (cw, ch) = cpu.cell_size();
     let env = super_env(&cpu, rows, cols);
@@ -477,10 +457,8 @@ fn settled_after_supernova_gate_hits_with_frozen_rainbow_ink() {
         "the frozen rainbow ink must be present"
     );
 
-    // ---- Pixel oracle 1: the settled frame is the inked word ---------------
-    //
-    // Against the same input without ink, only the four lead cells change and
-    // each carries its own colour. Fresh renders on throwaway windows.
+    // Pixel oracle 1: against a no-ink twin only the four lead cells change, each
+    // to its own colour. Fresh renders on throwaway windows.
     let mut settled_bare = settled.clone();
     settled_bare.ink.clear();
     let mut win_fresh = aterm_gpu::WindowGpu::new();
@@ -501,7 +479,7 @@ fn settled_after_supernova_gate_hits_with_frozen_rainbow_ink() {
         ("CPU", &cpu_settled, &cpu_bare),
         ("GPU", &gpu_settled, &gpu_bare),
     ] {
-        // Every pixel OUTSIDE the four lead cells is untouched by the ink.
+        // Every pixel outside the four lead cells is untouched by the ink.
         for (i, (&a, &b)) in inked.iter().zip(bare.iter()).enumerate() {
             let (row, col) = ((i / width) / ch, (i % width) / cw);
             let is_lead = row == 2 && (4..=7).contains(&col);
@@ -511,7 +489,7 @@ fn settled_after_supernova_gate_hits_with_frozen_rainbow_ink() {
                  pixel {i} (row {row}, col {col}) changed {b:#08x} -> {a:#08x}"
             );
         }
-        // ... and each lead cell IS inked, with its own exact colour.
+        // ... and each lead cell is inked, with its own exact colour.
         for cell in frozen_rainbow_ink() {
             let (r, c) = (cell.row as usize, cell.col as usize);
             let want = (u32::from(cell.color[0]) << 16)
@@ -538,7 +516,7 @@ fn settled_after_supernova_gate_hits_with_frozen_rainbow_ink() {
         }
     }
 
-    // ---- The gate decisions (counters), unchanged ---------------------------
+    // The gate decisions (counters).
     let cpu_debris = cpu
         .render_input_cached(&mut win_cpu, &in_debris)
         .pixels()
@@ -554,7 +532,7 @@ fn settled_after_supernova_gate_hits_with_frozen_rainbow_ink() {
         DamageOutcome::GateHit,
         "debris → settled is a real change (decos vanish)"
     );
-    // The same claim in PIXELS, not just in the damage outcome.
+    // The same claim in pixels, not just in the damage outcome.
     assert_ne!(
         max_channel_delta(&cpu_debris, &cpu_settled_cached),
         0,
@@ -567,7 +545,7 @@ fn settled_after_supernova_gate_hits_with_frozen_rainbow_ink() {
         "debris → settled must miss the GPU gate"
     );
 
-    // Settled → settled (byte-equal ink, empty overlays): the gate must HIT.
+    // Settled → settled (byte-equal ink, empty overlays): the gate must hit.
     let settled_again = settled.clone();
     let cpu_hit = cpu
         .render_input_cached(&mut win_cpu, &settled_again)
@@ -588,14 +566,12 @@ fn settled_after_supernova_gate_hits_with_frozen_rainbow_ink() {
         "a settled post-supernova frame with frozen rainbow ink must take the GPU dirty gate"
     );
 
-    // ---- Pixel oracle 2: the gate hit returns the settled image ------------
-    //
-    // Cached pixels must equal a fresh full render on both backends.
+    // Pixel oracle 2: the gate hit's pixels equal a fresh full render.
     same_image("CPU", &cpu_settled, &cpu_hit, width);
     same_image("GPU", &gpu_settled, &gpu_hit, width);
 }
 
-/// Byte-for-byte frame equality that names the FIRST divergent pixel (and its
+/// Byte-for-byte frame equality that names the first divergent pixel (and its
 /// cell) instead of dumping two whole frames into the log.
 fn same_image(backend: &str, want: &[u32], got: &[u32], width: usize) {
     assert_eq!(

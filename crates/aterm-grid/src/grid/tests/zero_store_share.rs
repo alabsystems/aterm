@@ -79,10 +79,7 @@ fn assert_contiguous_suffix(grid: &Grid, newest: usize, limit: usize, ctx: &str)
 }
 
 /// A width shrink that also takes rows away pushes the screen's top rows into
-/// history. With a zero store share they belong in the ring, under its cap;
-/// staged for a store that keeps nothing, they outlived the ring rows that
-/// later scrolls evicted, leaving a hole in the middle of history (and under
-/// a limit of 0, a stale line as the newest history line).
+/// history; with a zero store share they go to the ring, under its cap.
 #[test]
 fn zero_share_width_shrink_keeps_history_a_contiguous_suffix() {
     for limit in [0, 1, 4, RING_CAP] {
@@ -118,15 +115,10 @@ enum Step {
     Write(usize),
 }
 
-/// A tiered grid whose store share is zero IS a ring-only grid of cap = total:
-/// across width shrinks and grows (with and without rows), rewrap-free width
-/// changes and rows-only resizes, it shows the same history and screen as its
-/// ring-only twin, and that transcript is a contiguous suffix of what was
-/// written. Both resize drivers: the synchronous one embedders call, and the
-/// offloaded one the window and the wasm hosts use (detach, rewrap, re-attach).
-/// Routed through a store that keeps nothing, a synchronous width change wiped
-/// the ring history the total allows, and a rewrap-free one staged the whole
-/// ring for that store, where it outlived the newer rows later scrolls drop.
+/// A zero-share tiered grid reads as a ring-only grid of cap = total through
+/// width shrinks and grows (with and without rows), rewrap-free width changes
+/// and rows-only resizes, under both resize drivers: the synchronous one and
+/// the offloaded one (detach, rewrap, re-attach).
 #[test]
 fn zero_share_grid_matches_its_ring_only_twin_through_resizes() {
     use Step::{Resize, ResizeNoReflow, Write};
@@ -192,12 +184,10 @@ fn zero_share_grid_matches_its_ring_only_twin_through_resizes() {
     }
 }
 
-/// A reset racing an off-thread reflow attaches a replacement store while the
-/// original is out with the worker; under a total at or below the ring cap the
-/// replacement's share is zero. A synchronous width change inside that window
-/// keeps what the ring's cap allows and drops the older rest. Routed to that
-/// store, every line went (the ring's history with it); staged for it, the
-/// older rest outlived the ring rows later scrolls dropped.
+/// A reset racing an off-thread reflow attaches a replacement store whose share
+/// is zero (total at or below the ring cap). A synchronous width change inside
+/// that window keeps what the ring's cap allows and stages nothing for the
+/// store.
 #[test]
 fn zero_share_replacement_store_in_an_offload_window_stages_nothing() {
     let limit = 4;
@@ -240,18 +230,12 @@ fn zero_share_replacement_store_in_an_offload_window_stages_nothing() {
     assert_contiguous_suffix(&grid, newest, limit, "after re-attach");
 }
 
-/// A drag step lands while the offloaded rewrap is out (the window's resize
-/// path: the step finds no store to detach and resizes in place), so the job
-/// comes back rewrapped for a width the grid has left. A store that keeps
-/// nothing is no seat for the job's ring history at any width: the ring is
-/// the whole retention, so the history goes back into it at the current width,
-/// newest first into the room the window's own output left. Routed to that
-/// store, the user's whole scrollback went: the ring-only twin kept `limit`
-/// lines and the tiered grid none. Both re-attach entry points; output
-/// streamed during the window both short of the ring's cap and past it (where
-/// the window staged its oldest rows); and a step that also takes rows away,
-/// pushing screen rows into history inside the window (staged for re-attach,
-/// newer than the job's lines).
+/// A drag step that lands while the offloaded rewrap is out resizes in place,
+/// so the job comes back rewrapped for a width the grid has left. With a zero
+/// store share its ring history goes back into the ring at the current width,
+/// newest first, keeping what the ring-only twin keeps. Covers both re-attach
+/// entry points, window output short of and past the ring's cap, and a step
+/// that also takes rows away.
 #[test]
 fn zero_share_drag_step_during_the_offloaded_rewrap_keeps_the_rings_history() {
     let cases = [
@@ -336,11 +320,9 @@ fn zero_share_drag_step_during_the_offloaded_rewrap_keeps_the_rings_history() {
 }
 
 /// A rewrap-free width change that also takes rows away drains the screen's
-/// bottom rows. On a ring-only grid they go; staged for a store that keeps
-/// nothing, they outlived the newer ring rows and read as history ahead of the
-/// older screen rows ([28, 29, 24, 25, 26, 27] under a total of 0). Judged
-/// against the ring-only twin, not by the contiguous-suffix oracle: this
-/// shrink drops the cursor's line on both grids.
+/// bottom rows; a zero-share grid drops them as its ring-only twin does. Judged
+/// against the twin, not the contiguous-suffix oracle: this shrink drops the
+/// cursor's line on both grids.
 #[test]
 fn zero_share_rows_shrinking_rewrap_free_width_change_reads_as_its_twin() {
     for limit in [0, 1, 4, RING_CAP] {

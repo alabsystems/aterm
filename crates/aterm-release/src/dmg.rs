@@ -1,66 +1,30 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Bundle packaging (release spec §6 `dmg.rs`). Two containers carry the SAME
-//! signed, lean `aterm.app`:
+//! Bundle packaging: two containers carry the same signed, lean `aterm.app`.
 //!
-//! * the **DMG** — `hdiutil create` UDZO with the `/Applications` symlink (the
-//!   pretty create-dmg layout was deliberately dropped — spec decision 20). This
-//!   is the human download, under the fleet-pinned bare `aterm-<v>.dmg` name.
-//! * the **zip** — `ditto -c -k` with no metadata ([`ARCHIVE_NO_METADATA`]). This is
-//!   what the in-app updater stages from, because `hdiutil attach` needs a live bootstrap
-//!   context (DiskImages registers with the `com.apple.hdiejectd` XPC service)
-//!   and the survivor of a seamless overlap update is an orphan whose launchd
-//!   job has exited — every attach from there fails ENXIO. `ditto` speaks to no
-//!   XPC service, so it works from any process context.
+//! * the DMG (`hdiutil create` UDZO with an `/Applications` symlink), the human download,
+//!   under the fleet-pinned name `aterm-<v>.dmg`;
+//! * the zip (`ditto -c -k` [`ARCHIVE_NO_METADATA`]), what the in-app updater stages from.
+//!   `hdiutil attach` needs a live bootstrap context (the `com.apple.hdiejectd` XPC
+//!   service), and the survivor of a seamless overlap update is an orphan whose launchd job
+//!   has exited, so every attach there fails ENXIO; `ditto` speaks to no XPC service. (An
+//!   operator shell that outlived its aterm can still `hdiutil create` and `attach`.)
 //!
-//! Both digests are computed in-process via `aterm-digest`, so the digest written into
-//! the manifest is provably the digest of the file we just produced.
+//! Run after `sign::sign_app` and before `sign::sign_and_notarize_dmg`. Digests are computed
+//! in-process (`aterm-digest`), so the manifest's digest is that of the file just produced.
 //!
-//! Port of the retired `apps/aterm-mac/make-dmg.sh` (deleted with the shell
-//! pipeline; not in this tree), hdiutil branch only. The signed .app
-//! goes in AS-IS: run this AFTER `sign::sign_app` (both containers freeze the
-//! app's bytes), and hand the DMG to `sign::sign_and_notarize_dmg` next.
+//! Neither container stores file metadata: the Mach-O carries its signature,
+//! `_CodeSignature/CodeResources` seals the rest, and the self-check's `codesign --verify
+//! --deep --strict` on the extracted zip proves it. The DMG stage is a `cp -RX` copy: a
+//! `ditto --norsrc --noextattr` copy still clones attributes, and a default `ditto -c -k`
+//! stores them as `._` entries.
 //!
-//! ONE lean self-provisioning macOS download: the bundle carries no toolchain
-//! seed, so both containers image it exactly as signed, with nothing subtracted.
-//!
-//! BYTES ONLY, as far as a writer decides it. The bundle needs no file metadata: its
-//! one executable is a Mach-O whose signature is inside it, the rest is sealed by
-//! `_CodeSignature/CodeResources`, and the self-check's `codesign --verify --deep
-//! --strict` on the extracted zip proves it. So no writer here copies any:
-//! [`ARCHIVE_NO_METADATA`] stores no extended attribute, resource fork, ACL or
-//! quarantine bit in the zip, and the DMG stage is a `cp -RX` copy. MEASURED on macOS
-//! 26 (APFS): `ditto -c -k --keepParent` stores each attribute as a `._` AppleDouble
-//! entry and `--sequesterRsrc` as `__MACOSX/`, while [`ARCHIVE_NO_METADATA`] stores
-//! neither; and a `ditto --norsrc --noextattr` COPY of a tagged bundle still carries
-//! its attributes (it clones), where `cp -RX` carries none.
-//!
-//! What no writer decides: macOS stamps `com.apple.provenance` on every file a
-//! provenance-TRACKED process creates (one whose executable, or an ancestor's, or a
-//! library it loads, carries the tag — a tracked shell, or a tagged toolchain: `targo`
-//! is the cutter's parent and `trustc` writes its binary, and atpkg no longer clears a
-//! tag a tracked writer laid in the store). The zip is unaffected — an archive entry is
-//! bytes. The DMG is not: a tracked cutter's stage, and every file its `hdiutil` writes
-//! into the image, carry the tag. MEASURED 2026-10-09 from a tracked parent: 23 of 23
-//! files of a Developer ID `aterm.app` in the image; the same from a clean stage, from
-//! a `ditto --noextattr` stage and through `diskutil image create`, while `hdiutil
-//! makehybrid` drops the tag but stamps `com.apple.FinderInfo`, which `codesign
-//! --strict` refuses. The tagged app passes `codesign --verify --deep --strict` and
-//! `spctl -a -t exec`, and the updater installs from the zip. Apple's notary accepts
-//! such a DMG as it does an untagged one: MEASURED 2026-10-09, a DMG whose app's files
-//! all carried the tag, signed, packed and stapled from a tracked process, was Accepted
-//! (`Ready for distribution`, no issues), stapled, and passed `spctl` as `Notarized
-//! Developer ID`, the DMG and the app inside alike (docs/RELEASING.md names the
-//! submissions). Nothing here reads the attribute: the cut ships the DMG it made.
-//!
-//! `hdiutil create` runs in the operator's shell, which may have outlived the aterm
-//! that forked it (a seamless update) and so hold the bootstrap context of a launchd
-//! job that is gone — the context in which the updater's survivor saw `hdiutil attach`
-//! fail ENXIO. MEASURED 2026-10-09 on m3 from such a shell (its login shell's parent
-//! exited at an update; no application job of that aterm remained in `gui/501`):
-//! `hdiutil create -srcfolder` and `hdiutil attach -readonly -nobrowse` both
-//! succeeded.
+//! macOS stamps `com.apple.provenance` on every file a provenance-tracked process creates,
+//! so the DMG's files carry it (every stage method tried tags; `hdiutil makehybrid` does not
+//! but stamps `com.apple.FinderInfo`, which `codesign --strict` refuses). The tagged app
+//! passes `codesign` and `spctl` and the notary accepts it (docs/RELEASING.md names the
+//! submissions), so nothing here reads the attribute.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -70,22 +34,18 @@ use std::process::Command;
 /// stands for, spelled out so nothing in the environment can turn one back on).
 pub const ARCHIVE_NO_METADATA: [&str; 4] = ["--norsrc", "--noextattr", "--noacl", "--noqtn"];
 
-/// A packaged artifact (DMG or zip): the release asset path, its exact byte
-/// digest (→ manifest `sha256`/`zip_sha256`, publish self-check) and size
-/// (transcript).
+/// A packaged artifact (DMG or zip): the release asset path, its byte digest (manifest
+/// `sha256`/`zip_sha256`, publish self-check) and size.
 pub struct Packaged {
     pub path: PathBuf,
     pub sha256: String,
     pub size_bytes: u64,
 }
 
-/// Package `<app>` into `<out_dir>/aterm-<short>.dmg` — the app exactly as it
-/// stands.
+/// Package `<app>`, exactly as it stands, into `<out_dir>/aterm-<short>.dmg`.
 ///
-/// The artifact name MUST stay `aterm-{short}.dmg` — it is the exact asset
-/// name written into the manifest's `dmg`/`url` fields, and every installed
-/// client resolves its download by that name (a mismatch 404s the whole
-/// fleet's update). The BYTES under the name are the lean app.
+/// The name must stay `aterm-{short}.dmg`: it is the manifest's `dmg`/`url` asset, and
+/// every installed client resolves its download by it (a mismatch 404s the fleet's update).
 pub fn create(app: &Path, out_dir: &Path, short_version: &str) -> Result<Packaged, String> {
     if !app.is_dir() {
         return Err(format!(
@@ -94,17 +54,14 @@ pub fn create(app: &Path, out_dir: &Path, short_version: &str) -> Result<Package
         ));
     }
     let dmg = out_dir.join(format!("aterm-{short_version}.dmg"));
-    // Volume name matches make-dmg.sh ("aterm 0.2.0") — what Finder shows when
-    // the image is mounted.
+    // What Finder shows when the image is mounted ("aterm 0.2.0").
     let volname = format!("aterm {short_version}");
     let _ = std::fs::remove_file(&dmg);
 
-    // Stage the .app + an /Applications symlink in a scratch dir, so the
-    // mounted image offers the standard drag-to-install gesture even without
-    // create-dmg's decorated window. The stage lives under dist/ (same
-    // filesystem, so the moves below are renames) and is removed on every exit
-    // path. Its NAME begins with a dot, which is what keeps it out of Spotlight
-    // (MEASURED: a `.metadata_never_index` marker is inert; crates/atpkg/src/noindex.rs).
+    // Stage the app and an /Applications symlink (the drag-to-install gesture) under
+    // dist/, on the same filesystem, removed on every exit path. The dot-name keeps the
+    // stage out of Spotlight (a `.metadata_never_index` marker is inert;
+    // crates/atpkg/src/noindex.rs).
     let stage = out_dir.join(format!(".dmg-stage-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&stage);
     std::fs::create_dir_all(&stage).map_err(|e| format!("create {}: {e}", stage.display()))?;
@@ -115,8 +72,7 @@ pub fn create(app: &Path, out_dir: &Path, short_version: &str) -> Result<Package
     let size_bytes = std::fs::metadata(&dmg)
         .map_err(|e| format!("stat {}: {e}", dmg.display()))?
         .len();
-    // In-process digest of the final bytes (spec §6): this exact string feeds
-    // the manifest and the post-publish byte-identity check.
+    // This exact string feeds the manifest and the post-publish byte-identity check.
     let sha256 = sha256_file(&dmg)?;
     println!(
         "==> done: {} ({:.1} MB)",
@@ -131,21 +87,16 @@ pub fn create(app: &Path, out_dir: &Path, short_version: &str) -> Result<Package
     })
 }
 
-/// Package `<app>` into `<out_dir>/aterm-<short>-mac.zip` — the container the
-/// in-app updater downloads and extracts.
+/// Package `<app>` into `<out_dir>/aterm-<short>-mac.zip`, the container the in-app
+/// updater downloads and extracts.
 ///
-/// `ditto -c -k` [`ARCHIVE_NO_METADATA`] `--keepParent` archives the signed bundle
-/// as bytes: the `_CodeSignature` layout and every symlink survive (so the extracted
-/// app still verifies), `--keepParent` puts `aterm.app` at the archive root (the
-/// client extracts and expects exactly that name), and no `._` or `__MACOSX/` entry
-/// is written ([`assert_zip_has_no_metadata`] holds the archive to that).
+/// `ditto -c -k` [`ARCHIVE_NO_METADATA`] `--keepParent` archives the bundle as signed
+/// (and stapled, on the active Apple tier): the `_CodeSignature` layout and every symlink
+/// survive, `aterm.app` sits at the archive root (the client expects exactly that name),
+/// and no `._` or `__MACOSX/` entry is written ([`assert_zip_has_no_metadata`]).
 ///
-/// The artifact name MUST stay `aterm-{short}-mac.zip`: it is the exact asset
-/// name written into the manifest's `zip` field, and the client re-derives that
-/// same string from the release tag and refuses anything else.
-///
-/// Archives the bundle AS SIGNED (and, on the active Apple tier, as stapled), so
-/// the bytes `ditto` reads are exactly the bytes the DMG carries.
+/// The name must stay `aterm-{short}-mac.zip`: it is the manifest's `zip` field, and the
+/// client re-derives it from the release tag and refuses anything else.
 pub fn create_zip(app: &Path, out_dir: &Path, short_version: &str) -> Result<Packaged, String> {
     if !app.is_dir() {
         return Err(format!(
@@ -154,9 +105,8 @@ pub fn create_zip(app: &Path, out_dir: &Path, short_version: &str) -> Result<Pac
         ));
     }
     let zip = out_dir.join(format!("aterm-{short_version}-mac.zip"));
-    // `ditto -c -k` would overwrite an existing archive, but a stale one from an
-    // earlier attempt must not survive a FAILED run and get hashed as this cut's
-    // artifact — remove it first, exactly as `create` does for the DMG.
+    // A stale archive from an earlier attempt must not survive a failed run and be hashed
+    // as this cut's artifact.
     let _ = std::fs::remove_file(&zip);
 
     println!("==> ditto -c -k {} (updater container)", zip.display());
@@ -251,10 +201,9 @@ fn archive_app(_app: &Path, _zip: &Path) -> Result<(), String> {
     Err("bundle zip creation requires macOS (ditto); build releases on a Mac".into())
 }
 
-/// Copy the signed `app` into `stage` as bytes: `cp -RX` keeps every file's bytes,
-/// mode and symlink (so the codesign seal holds) and copies no extended attribute or
-/// resource fork. (What a tracked cutter writes carries `com.apple.provenance` all the
-/// same — the kernel stamps it, not the copy; see the module docs.)
+/// Copy the signed `app` into `stage` as bytes: `cp -RX` keeps every file's bytes, mode
+/// and symlink (so the seal holds) and copies no extended attribute or resource fork. A
+/// tracked cutter's copy still carries `com.apple.provenance` (see the module docs).
 #[cfg(unix)]
 fn copy_into_stage(app: &Path, stage: &Path) -> Result<(), String> {
     run_quiet(
@@ -269,10 +218,9 @@ fn build_in_stage(app: &Path, stage: &Path, volname: &str, dmg: &Path) -> Result
     std::os::unix::fs::symlink("/Applications", stage.join("Applications"))
         .map_err(|e| format!("symlink /Applications: {e}"))?;
 
-    // THE PLAIN IMAGE, AND ONLY IT. A decorated Finder window (AppleScript against
-    // the mounted disk) failed on every launcher cut (`Finder got an error: Can't
-    // get disk … (-1728)`). The drag gesture is still offered: the stage carries
-    // the /Applications symlink beside the app.
+    // A plain image: a decorated Finder window (AppleScript against the mounted disk)
+    // fails with `Finder got an error: Can't get disk … (-1728)`. The /Applications
+    // symlink beside the app still offers the drag gesture.
     println!("==> hdiutil create {} (UDZO)", dmg.display());
     run_quiet(
         Command::new("hdiutil")
@@ -390,9 +338,9 @@ mod tests {
         archive_app(&app, &zip).unwrap();
         assert_zip_has_no_metadata(&zip).unwrap();
 
-        // What this process stamps on every file it writes: `com.apple.provenance` when
-        // it is provenance-tracked (a gate run from under a tagged app), else nothing. No
-        // copy can avoid that floor; anything above it came from the source.
+        // What this process stamps on every file it writes (`com.apple.provenance` when it
+        // is provenance-tracked, else nothing): no copy avoids that floor, so anything
+        // above it came from the source.
         let control = dir.path().join("control");
         std::fs::write(&control, b"").unwrap();
         let stamped = attribute_names(&control);
@@ -413,8 +361,8 @@ mod tests {
             Path::new("aterm")
         );
 
-        // Negative control: the archive the cutter used to make keeps the attributes
-        // in `__MACOSX/`, and the check refuses it, naming the entries.
+        // Negative control: `--sequesterRsrc` keeps the attributes in `__MACOSX/`, and the
+        // check refuses it, naming the entries.
         let sequestered = dir.path().join("sequestered.zip");
         let out = Command::new("/usr/bin/ditto")
             .args(["-c", "-k", "--sequesterRsrc", "--keepParent"])

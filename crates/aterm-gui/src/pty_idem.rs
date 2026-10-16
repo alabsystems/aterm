@@ -1,51 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! **A6 — the idempotency key at the PTY seam** (design §6.5's last open row,
-//! spelled out in §11.2's "The idempotency key at the PTY seam").
+//! The idempotency key at the PTY seam. Input verbs are not idempotent, so a driver
+//! that crashed between "wrote the bytes" and "recorded that it wrote them" must
+//! choose between a duplicate keystroke and a lost one. Instead it stamps the verb
+//! with `id=<epoch>:<producer>:<seq>`; the endpoint keeps a per-session,
+//! per-producer high-water mark and answers an already-consumed sequence
+//! `OK dup=1` without writing, so the retry's answer says which side of the window
+//! the crash fell on.
 //!
-//! §6.5's table had one hop marked DESIGNED: `bus → PTY (term/in)`. `feed-bin`
-//! is not idempotent, so a bridge that crashed between "wrote the bytes" and
-//! "recorded that it wrote them" had two bad options — replay, and the keystroke
-//! is typed twice; do not replay, and it is lost. **A silent duplicate and a
-//! silent loss are both failures**, and the design asked for neither.
-//!
-//! THAT HOP NO LONGER EXISTS. `aterm-link` round 21 cut the `term/in` drive
-//! face: no bus record reaches a PTY by any path, and the bridge subscribes no
-//! such subscription to resume from anywhere. What is below is unaffected —
-//! `feed-bin`'s `id=` is the LOCAL seam, used by `aterm-ctl feed-bin` and
-//! `send --stdin`, and it is `Realm::Bridge` that lost its writer.
-//!
-//! This module is the missing half. A driver stamps an input verb with
-//! `id=<epoch>:<producer>:<seq>`; the endpoint keeps a per-session, per-producer
-//! HIGH-WATER mark and answers an already-consumed sequence `OK dup=1` **without
-//! writing**. A crash inside the window is then no longer in doubt from the
-//! outside: the retry's answer says which side of the window it fell on.
-//!
-//! ## The three fields, and why each one is load-bearing
-//!
-//! * `<epoch>` — the session's launch nonce (`LaunchNonce`, 32 lowercase hex),
-//!   the same public anti-spoof value the Owner-only `sessions` roster carries as
-//!   `nonce=` and §6.6 requires on a `term/in` body. A high-water mark is only
-//!   meaningful inside one incarnation of one shell: a relaunched session is a
-//!   FRESH mark, or an id minted for a dead shell would suppress a live
-//!   keystroke. Rather than leave that to the fact that a fresh session gets a
-//!   fresh [`SessionCtx`], the epoch is carried IN the key and checked, so a key
-//!   from a dead session is REFUSED (`ERR epoch`) instead of quietly doing
-//!   something. Refused is visible; either silent outcome is not.
-//! * `<producer>` — the u64 the marks are keyed by, WITHIN the caller's
-//!   authority namespace ([`Realm`]). It is the bridge's astream `producer_id` on
-//!   the fabric path; anything stable per driver otherwise. The namespace is the
-//!   important half and it is NOT the caller's to choose: the producer NUMBER is
-//!   a string the caller types, so a number alone made every producer's whole
-//!   sequence space claimable by anyone the dispatch had already authorized. See
-//!   [`Realm`] for what is enforced and what deliberately is not.
-//! * `<seq>` — the driver's own monotone sequence, exactly the
-//!   `(producer_id, producer_seq)` shape the broker already dedups ingest with
-//!   (§6.5's first row). A monotone sequence is what makes the mark O(1): at or
-//!   below the mark is consumed, above it is new.
-//!
-//! ## What an attempt can end as, and why there are five answers
+//! * `<epoch>`: the session's launch nonce (`LaunchNonce`, 32 lowercase hex, the
+//!   `sessions` roster's `nonce=`). A mark means something only inside one
+//!   incarnation of one shell, so a key from another launch is refused
+//!   (`ERR epoch`) rather than suppressing a live keystroke.
+//! * `<producer>`: the u64 the marks are keyed by, within the caller's authority
+//!   namespace ([`Realm`]), which the caller does not choose.
+//! * `<seq>`: the driver's own monotone sequence, so the mark is O(1): at or below
+//!   it is consumed, above it is new.
 //!
 //! | Outcome | Answer | Meaning |
 //! |---|---|---|
@@ -53,49 +24,27 @@
 //! | above the mark, an attempt in flight | `ERR busy idem=<running seq>` | one attempt per producer; nothing consumed |
 //! | at/below the mark, applied | `OK dup=1` | already typed; nothing written |
 //! | at the mark, still running | `ERR busy idem=<seq>` | another connection holds it; transient |
-//! | at the mark, outcome unknown | `ERR in-doubt seq=<seq>` | it may have typed; DO NOT replay |
+//! | at the mark, outcome unknown | `ERR in-doubt seq=<seq>` | it may have typed; do not replay |
 //! | above the mark, guard missed | `OK skipped` | nothing written; the sequence is given back |
 //!
-//! Six rows, five answers: `ERR busy idem=` is given twice, and the SECOND row
-//! is a bound rather than an outcome. A producer may have only ONE attempt in
-//! flight, because a claim that displaced a still-`Running` mark left the
-//! displaced attempt unable to settle its own outcome and, on release, could
-//! reinstate a `Running` tip no live claim stood behind. The refusal names the
-//! sequence actually running rather than the caller's, and consumes nothing, so
-//! the retry a transient `ERR busy` invites is a FIRST attempt — see
-//! [`PtyIdem::claim`], which carries the whole argument. (A realm whose
-//! [`PRODUCER_CAP`] producers are ALL in flight answers the same string naming
-//! the caller's own sequence, for the same reason.)
+//! A realm whose [`PRODUCER_CAP`] producers are all in flight answers `ERR busy
+//! idem=` naming the caller's own sequence. A reply other than `OK` may still have
+//! reached the PTY (`cmd_turn` can type its text and then fail to submit), so its
+//! mark is kept with the outcome unknown: a retry is told `ERR in-doubt`, and the
+//! session's `timeline` gets an `in-doubt` row.
 //!
-//! The LAST row is the point of the rung. An attempt whose reply was not `OK`
-//! may still have reached the PTY — `cmd_turn` can type its text and then fail to
-//! submit — so the mark is kept and the outcome is recorded as UNKNOWN. A retry
-//! of that exact sequence is told so, in those words, and the session's
-//! `timeline` carries an `in-doubt` row a human can read. The alternative — free
-//! the mark and let the retry type again — is the silent duplicate.
-//!
-//! **The carve-outs.** `ERR busy` (the drive lease — and, for a guarded press,
-//! `ERR busy sink`, a sink that accepted ZERO bytes) and `ERR denied`
-//! (authority) release the mark instead of clouding it — and so does `OK
-//! skipped`, a guarded (`if=<re>`) attempt whose guard matched no row: it is an
-//! `OK` that wrote nothing, so a retry of the same sequence is a FIRST attempt,
-//! re-evaluated against the live screen, rather than a `dup=1` the driver could
-//! not tell from a press. The same rule keeps a crash inside the window
-//! resolvable: a replay of an attempt that PRESSED is `dup=1`; a replay of one
-//! that skipped asks the screen again. For all four verbs both
-//! are decided before the first byte: the dispatch fast-fail and op-scope gate,
-//! the `turn` arm's read-authority check and `cmd_turn`'s authoritative lease
-//! acquire (after its option parsing and `settle=` compile, before any paste),
-//! and `run_feed_bin_routed`'s edge check and lease mirror, both of which
-//! precede its write. `ERR busy sink` alone is decided AT a write — one that
-//! moved nothing, which is why it is carved out and a PARTIAL write is answered
-//! `ERR write failed`, not `ERR busy` (`control_input::guarded_input_reply`).
-//! `ERR busy` is also the reply a well-behaved driver retries most, so making
-//! it sticky would be a nuisance for no safety. NOTHING ELSE is carved out — in
-//! particular NOT `ERR usage`,
-//! because `cmd_turn_guarded` answers its own USAGE string when a submit press
-//! fails, which happens AFTER the text has been typed (`control_session.rs`, the
-//! `io.press` arm). A reply string is not evidence about the PTY.
+//! Three replies release the mark instead, because each provably wrote nothing:
+//! `ERR busy` (the drive lease, or `ERR busy sink`: a sink that accepted zero
+//! bytes), `ERR denied` (authority), and `OK skipped` (a guard that matched no row,
+//! so the retry is re-evaluated against the live screen, not answered `dup=1`). For
+//! every keyed verb the busy and denied decisions precede the first byte (the
+//! dispatch fast-fail and op-scope gate, `turn`'s read-authority check and
+//! `cmd_turn`'s lease acquire, `run_feed_bin_routed`'s edge check and lease mirror),
+//! except `ERR busy sink`, decided at a write that moved nothing; a partial write
+//! answers `ERR write failed` (`control_input::guarded_input_reply`). Nothing else
+//! is carved out, not even `ERR usage`: `cmd_turn_guarded` answers its usage string
+//! when a submit press fails after the text was typed. A reply string is not
+//! evidence about the PTY.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -105,64 +54,36 @@ use aterm_session::LaunchNonce;
 
 use crate::SessionCtx;
 
-/// The verbs that accept `id=<key>` — §11.2's set, exactly. Every one of them can
-/// put bytes on the PTY and no other verb may claim a mark, so a mark can only
-/// ever be consumed by something that CAN type — and, through
-/// [`empty_payload_refusal`], only by an attempt that carries bytes to type.
+/// The verbs that accept `id=<key>`. Each can put bytes on the PTY, so a mark is
+/// consumed only by something that can type and, through
+/// [`empty_payload_refusal`], only by an attempt that carries bytes.
 pub(crate) const KEYED_VERBS: &[&str] = &["send", "key", "feed-bin", "turn"];
 
-/// THE NAMESPACE A MARK LIVES IN — the authority half of the key, and the half
-/// the caller does not get to type.
+/// The namespace a mark lives in: the authority half of the key, which the caller
+/// does not type.
 ///
-/// WHY THIS EXISTS. A mark is a claim on a sequence, and naming a producer's next
-/// sequence is what suppresses the write. Keyed only by the caller's `<producer>`
-/// STRING, every mark was claimable by every authorized caller: an in-session
-/// agent (Owner, which every `aterm-ctl @self` holds) could run one
-/// `send id=<epoch>:<the bridge's producer id>:18446744073709551615`, settle the
-/// mark `Applied` with an empty tail, and from then on every `Bridge::feed` —
-/// whose key is `{epoch}:{producer_id}:{off+1}` and therefore always lower — was
-/// answered `OK dup=1` with NOTHING written, while the bridge published
-/// `ev applied dup=1` on the fleet log. §6.6's structural "human always wins"
-/// drive path would have been silently dead with §10's causal record asserting
-/// the opposite. The epoch is no defence: it is public anti-spoof state, on the
-/// Owner-readable roster as `nonce=` and in every session's
-/// `$ATERM_LAUNCH_NONCE`.
+/// Naming a producer's next sequence suppresses a write, so marks keyed only by the
+/// caller's `<producer>` would let any authorized caller (an in-session agent holds
+/// Owner) settle another driver's producer at `u64::MAX` and silence it. The epoch
+/// is no defence: it is public (`nonce=` on the roster, `$ATERM_LAUNCH_NONCE`).
 ///
-/// EXACTLY TWO, AND THE SPLIT IS THE DOCTRINE. `Scope::Bridge` is a CONNECTION —
-/// the socketpair end this instance handed its own child — so it is the one
-/// authority no token opens, and it gets a namespace nothing else can CLAIM in.
-/// Everything else shares [`Realm::Local`], which is where it already was.
+/// Exactly two. `Scope::Bridge` (the socketpair end this instance handed its own
+/// child) is the one authority no token opens, so it gets a namespace nothing else
+/// can claim in; everything else shares [`Realm::Local`]. Nothing claims in
+/// [`Realm::Bridge`] today (the bridge drives no PTY), but `Scope::Bridge` still
+/// holds every op, the keyed verbs included, so the fence stays. Not one realm per
+/// connection or edge token: an Owner caller can mint edge tokens, so the map would
+/// grow without bound. A session holds at most `2 * PRODUCER_CAP` marks.
 ///
-/// ANSWERING IS NOT CLAIMING, and only claiming is fenced. A `Local` caller that
-/// names a sequence the BRIDGE has already consumed is still answered from the
-/// bridge's mark — `OK dup=1`, `ERR busy`, `ERR in-doubt` — because every one of
-/// those answers writes NOTHING, and "a consumed sequence is answered without
-/// writing, however it is asked" is the property `control.rs`'s
-/// `feed_idempotent_a_producer_is_namespaced_by_the_callers_authority` asserts
-/// and an operator debugging a stuck driver depends on. What a `Local` caller may
-/// never do is INSTALL a high-water in the bridge's namespace, which is the act
-/// that suppresses a write. The fallback is one-way: a `Bridge` claim never
-/// consults `Local`, or a local driver could suppress the human's keystroke by
-/// the same trick from the other side.
+/// Only claiming is fenced: a `Local` caller naming a sequence the bridge consumed
+/// is answered from the bridge's mark (every such answer writes nothing; pinned by
+/// `control_tests.rs`'s `feed_idempotent_a_producer_is_namespaced_by_the_callers_authority`)
+/// but never installs a mark there, and a `Bridge` claim never consults `Local`. So a
+/// `Local` caller can probe the bridge's high-water for a guessed producer id and have
+/// its own low sequences answered as duplicates; neither writes or silences the bridge.
 ///
-/// The costs of the one-way fallback, said out loud: a `Local` caller can PROBE
-/// the bridge's high-water for a producer id it guesses (it already holds the
-/// instance's god token and can read the fleet log), and a local driver that
-/// picks the bridge's producer id can have its own low sequences answered as
-/// duplicates. Neither writes anything, and neither can silence the bridge.
-///
-/// NOT ONE REALM PER CONNECTION OR PER EDGE TOKEN, and this is a bound, not an
-/// oversight: an Owner caller can mint edge tokens, so a realm per token would
-/// let it grow this map without limit, and [`PRODUCER_CAP`] is enforced PER REALM
-/// precisely so a local driver churning producer ids cannot evict the bridge's
-/// settled mark and turn its next replay into a second keystroke. Two realms,
-/// each capped: at most `2 * PRODUCER_CAP` marks per session, and the bridge's
-/// half is unreachable from any token.
-///
-/// WHAT IS THEREFORE NOT ENFORCED, said out loud: two `Local` drivers still share
-/// a namespace, so one can still burn the other's sequence. Inside one authority
-/// class there is nothing to tell them apart, and inventing a distinction here
-/// would be inventing an authority the connection does not carry.
+/// Two `Local` drivers share a namespace, so one can burn the other's sequence:
+/// within one authority class nothing tells them apart.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum Realm {
     /// The fabric bridge's own connection.
@@ -187,22 +108,13 @@ pub(crate) fn is_keyed_verb(verb: &str) -> bool {
     KEYED_VERBS.contains(&verb)
 }
 
-/// How many producers one session remembers marks for, PER [`Realm`].
-///
-/// A session realistically sees one driver, or a handful; 64 is headroom, not a
-/// budget. Past it the LEAST-RECENTLY-USED settled producer IN THE SAME REALM is
-/// evicted, and an evicted producer's next replay is applied again rather than
-/// recognized — the at-least-once fallback. That is stated rather than hidden
-/// because it is the one way this seam can still duplicate; it takes 64 distinct
-/// drivers on ONE session to reach it. A producer whose attempt is still RUNNING
-/// is never evicted (its guard would settle a mark that no longer exists), so a
-/// session with 64 concurrent in-flight producers in one realm answers
-/// `ERR busy idem=` instead.
-///
-/// PER REALM and not per session: eviction that crossed realms would let a local
-/// driver churning 64 producer ids push out the BRIDGE's settled mark, which
-/// turns the bridge's next replay into a second keystroke — the silent duplicate
-/// this whole module exists to remove.
+/// How many producers one session remembers marks for, per [`Realm`]; headroom
+/// over the handful of drivers a session sees. Past it the least-recently-used
+/// settled producer in the same realm is evicted, and its next replay is applied
+/// again: the one way this seam can still duplicate. A running producer is never
+/// evicted (its guard would settle a mark that no longer exists), so 64 in-flight
+/// producers in one realm answer `ERR busy idem=`. Per realm so a local driver
+/// churning producer ids cannot evict the bridge's settled mark.
 const PRODUCER_CAP: usize = 64;
 
 /// The state of the sequence AT a producer's high-water mark.
@@ -226,15 +138,14 @@ struct Mark {
     used: u64,
 }
 
-/// The per-session marks. A LEAF lock: taken to claim and taken to settle, never
-/// held across the verb it guards (the verb blocks on the event loop, the turn
-/// lease, and the PTY) and never held while recording a timeline row.
+/// The per-session marks. A leaf lock: taken to claim and to settle, never held
+/// across the verb it guards (which blocks on the event loop, the turn lease and
+/// the PTY) and never held while recording a timeline row.
 #[derive(Default)]
 pub(crate) struct PtyIdem {
     marks: Mutex<HashMap<(Realm, u64), Mark>>,
-    /// Feeds `Mark::used`. Only the ORDER matters (it picks the LRU victim), so
-    /// an atomic counter outside the marks lock is enough and keeps this a
-    /// single-lock type.
+    /// Feeds `Mark::used`. Only the order matters (it picks the LRU victim), so an
+    /// atomic outside the marks lock keeps this a single-lock type.
     clock: AtomicU64,
 }
 
@@ -255,12 +166,8 @@ pub(crate) const EPOCH_REFUSAL: &str =
     "ERR epoch: id= is from another launch; use this session's nonce= from sessions\n";
 
 /// Parse `<epoch>:<producer>:<seq>` and check the epoch against the live
-/// session's launch nonce.
-///
-/// `Err` is the caller's whole reply. An unparseable key is `ERR usage`; a
-/// well-formed key minted for a DIFFERENT incarnation of this session is
-/// `ERR epoch` — §6.6's `reason=epoch` refusal, applied to the socket seam the
-/// bridge drives through rather than to the record it drives from.
+/// session's launch nonce. `Err` is the caller's whole reply: `ERR usage` for an
+/// unparseable key, `ERR epoch` for a well-formed key minted for another launch.
 pub(crate) fn parse_key(value: &str, live: LaunchNonce) -> Result<Key, String> {
     let mut parts = value.split(':');
     let (Some(epoch), Some(producer), Some(seq), None) =
@@ -287,9 +194,8 @@ pub(crate) fn parse_key(value: &str, live: LaunchNonce) -> Result<Key, String> {
 }
 
 /// The claim one attempt holds while it runs. Settled by [`guarded`]; a drop
-/// without a settle (an unwind out of the guarded verb) leaves the mark UNKNOWN,
-/// which is the fail-visible direction — the same reasoning as A2's
-/// `BridgeLostGuard`: a mark that a panic frees is not a mark.
+/// without a settle (an unwind out of the guarded verb) leaves the mark unknown,
+/// the fail-visible direction: a mark that a panic frees is not a mark.
 struct Claim<'a> {
     idem: &'a PtyIdem,
     realm: Realm,
@@ -336,12 +242,8 @@ impl PtyIdem {
         self.clock.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Reserve `key`'s sequence in `realm`, or answer for it.
-    ///
-    /// `dup` is the duplicate reply in the CALLING VERB's framing — see
-    /// [`dup_reply`]; a `Lines`-framed verb cannot be answered a bare
-    /// `OK dup=1`, because its client reads the header's second token as a row
-    /// count.
+    /// Reserve `key`'s sequence in `realm`, or answer for it. `dup` is the
+    /// duplicate reply in the calling verb's framing ([`dup_reply`]).
     fn claim(&self, realm: Realm, key: Key, dup: &str) -> Claimed<'_> {
         let used = self.tick();
         let slot = (realm, key.producer);
@@ -352,10 +254,9 @@ impl PtyIdem {
         {
             return Claimed::Answer(answer);
         }
-        // ANSWER-ONLY FALLBACK into the bridge's namespace. Every branch of
-        // `consumed_answer` writes nothing, so this can refuse a write and never
-        // cause one; installing below happens only in the caller's OWN realm.
-        // One-way on purpose — see [`Realm`].
+        // Answer-only fallback into the bridge's namespace: every answer of
+        // `consumed_answer` writes nothing, and installing below happens only in
+        // the caller's own realm. One-way on purpose; see [`Realm`].
         if realm != Realm::Bridge
             && let Some(mark) = marks.get(&(Realm::Bridge, key.producer)).copied()
             && let Some(answer) = consumed_answer(mark, key, dup)
@@ -363,45 +264,12 @@ impl PtyIdem {
             return Claimed::Answer(answer);
         }
         if let Some(mark) = own {
-            // ONE IN-FLIGHT ATTEMPT PER PRODUCER, and the reason is that a
-            // displaced RUNNING mark has no way back.
-            //
-            // This branch used to overwrite ANY existing mark whose sequence the
-            // key was above, `Tip::Running` included — another connection's
-            // attempt still inside the seam — and stash it in `Claim::prior`. Two
-            // things then went wrong at once, and the second has no exit:
-            //
-            // * the displaced claim's own [`PtyIdem::settle`] is a no-op, because
-            //   `settle` writes only while `high_water == key.seq`. Its `Applied`
-            //   was discarded, so a replay of a keystroke that DID type answered
-            //   as if it had not.
-            // * if the displacing attempt was then refused before any write
-            //   (`ERR busy` from the drive lease), [`PtyIdem::release`] reinstated
-            //   that mark BYTE FOR BYTE — a `Running` tip for an attempt that had
-            //   already finished. Nothing can leave that state: `consumed_answer`
-            //   answers `ERR busy idem=<seq>` for it forever (a TRANSIENT class,
-            //   so a well-behaved driver retries indefinitely), `settle` and
-            //   `release` both need a live claim that no longer exists, and the
-            //   LRU eviction at [`PRODUCER_CAP`] explicitly skips `Running`, so
-            //   the slot is not even collectable. Repeat on 64 producer ids and
-            //   the whole `Realm::Local` namespace is wedged for the life of the
-            //   process.
-            //
-            // So a producer with an attempt in flight is REFUSED rather than
-            // displaced — the same rule the eviction already applies one branch
-            // down ("a producer whose attempt is still RUNNING is never evicted"),
-            // and the invariant the single-slot bridge journal already assumes.
-            // The refusal names the sequence that is actually running, not the
-            // caller's, so a driver can see which attempt it is waiting behind.
-            // Nothing is written and no sequence is consumed, so the retry a
-            // transient `ERR busy` invites is a FIRST attempt; the displaced
-            // claim settles its own mark, because with this branch closed nothing
-            // can move `high_water` out from under a `Running` tip.
-            //
-            // The `Realm` doc's stated residual — "two `Local` drivers still
-            // share a namespace, so one can still burn the other's sequence" —
-            // survives and is unchanged: burning a sequence is recoverable by
-            // advancing past it. Wedging the slot was not.
+            // One in-flight attempt per producer. A displaced `Running` mark could
+            // not settle its own outcome (`settle` writes only while
+            // `high_water == key.seq`), and a later `release` of the displacing
+            // claim would reinstate a `Running` tip no live claim stands behind:
+            // answered `ERR busy` forever and never evicted. The refusal names the
+            // running sequence and consumes nothing, so the retry is a first attempt.
             if mark.tip == Tip::Running {
                 return Claimed::Answer(format!("ERR busy idem={}\n", mark.high_water));
             }
@@ -421,13 +289,10 @@ impl PtyIdem {
                 done: false,
             });
         }
-        // The cap is counted, and the victim chosen, WITHIN this realm: see
-        // [`PRODUCER_CAP`]. A local driver churning producer ids must not be able
-        // to evict the bridge's settled mark.
+        // Counted, and the victim chosen, within this realm ([`PRODUCER_CAP`]).
         if marks.keys().filter(|(r, _)| *r == realm).count() >= PRODUCER_CAP {
-            // Evict the least-recently-used SETTLED producer. A running one is
-            // never evicted: its guard would settle a mark that is gone, and a
-            // later replay of it would type a second time.
+            // Evict the least-recently-used settled producer, never a running one
+            // (its replay would type a second time).
             let victim = marks
                 .iter()
                 .filter(|((r, _), m)| *r == realm && m.tip != Tip::Running)
@@ -457,19 +322,9 @@ impl PtyIdem {
         })
     }
 
-    /// Move this claim's tip, but ONLY while the claim still owns the mark.
-    ///
-    /// A LIVE CLAIM ALWAYS OWNS ITS MARK NOW, so this guard cannot fire: a
-    /// `Tip::Running` mark is never displaced ([`PtyIdem::claim`]'s in-flight
-    /// refusal), never evicted ([`PRODUCER_CAP`]) and never written by any
-    /// [`PtyIdem::release`] but its own claim's. The guard is kept as the second
-    /// lock on that invariant, not because a case reaches it.
-    ///
-    /// IT USED TO FIRE, AND THAT WAS THE WOUND. A second claim from the same
-    /// producer at a HIGHER sequence displaced this one; this settle then wrote
-    /// nothing, so a keystroke that DID type answered its replay as if it had
-    /// not. Closing the displacement is what makes the sentence above true; this
-    /// check alone only stopped the laggard from clobbering the newer mark.
+    /// Move this claim's tip, only while the claim still owns the mark. A live claim
+    /// always does (a `Running` mark is never displaced, evicted, or released by
+    /// another claim); the check is a second lock on that invariant.
     fn settle(&self, realm: Realm, key: Key, tip: Tip) {
         let used = self.tick();
         let mut marks = self.marks.lock().unwrap_or_else(|p| p.into_inner());
@@ -494,14 +349,10 @@ impl PtyIdem {
             return;
         }
         match prior {
-            // A RESTORED MARK IS NEVER `Running`, and this is the second lock on
-            // that rather than a second policy. `claim` refuses to displace a
-            // running attempt, so a `prior` is always already settled; if one ever
-            // reached here it would be an attempt whose owner can no longer settle
-            // it, and reinstating it verbatim would pin the slot at `ERR busy`
-            // forever. `Tip::Unknown` is the honest restoration: fail-visible,
-            // evictable, and it answers a replay `ERR in-doubt` — "ask, then
-            // decide" — instead of a transient class that never clears.
+            // A restored mark is never `Running` (`claim` refuses to displace a
+            // running attempt). Should one reach here, `Tip::Unknown` is the
+            // fail-visible restoration: evictable, and a replay is answered
+            // `ERR in-doubt` rather than a busy that never clears.
             Some(prior) => {
                 debug_assert!(
                     prior.tip != Tip::Running,
@@ -526,20 +377,14 @@ impl PtyIdem {
     }
 }
 
-/// The answer `mark` gives for `key`, or `None` when `key` is ABOVE the mark and
-/// this mark has nothing to say about it. Every answer this returns is a refusal
-/// to write.
-///
-/// ABOVE THE MARK IS NOT THE SAME AS FRESH, and this doc used to say it was:
-/// [`PtyIdem::claim`] refuses an above-the-mark key anyway while the producer
-/// has an attempt in flight. `None` means only that the DECISION is the
-/// caller's.
+/// The answer `mark` gives for `key`, or `None` when `key` is above the mark and
+/// the decision is the caller's ([`PtyIdem::claim`] still refuses one while the
+/// producer has an attempt in flight). Every answer is a refusal to write.
 fn consumed_answer(mark: Mark, key: Key, dup: &str) -> Option<String> {
     if key.seq < mark.high_water {
-        // The producer has moved past this sequence, so it was consumed. Its
-        // individual outcome is no longer remembered — only the tip is — which is
-        // honest: a driver that has advanced its sequence is not the one asking to
-        // resolve an old in-doubt.
+        // The producer has moved past this sequence, so it was consumed. Only the
+        // tip's outcome is remembered: a driver that advanced is not the one asking
+        // to resolve an old in-doubt.
         return Some(dup.to_string());
     }
     if key.seq == mark.high_water {
@@ -553,8 +398,7 @@ fn consumed_answer(mark: Mark, key: Key, dup: &str) -> Option<String> {
 }
 
 impl Drop for Claim<'_> {
-    /// An unwind out of the guarded verb settles UNKNOWN. Only a settle that ran
-    /// can say more than that.
+    /// An unwind out of the guarded verb settles `Tip::Unknown`.
     fn drop(&mut self) {
         if !self.done {
             self.idem.settle(self.realm, self.key, Tip::Unknown);
@@ -562,64 +406,45 @@ impl Drop for Claim<'_> {
     }
 }
 
-/// Whether `reply` is a refusal that CANNOT have followed a write. See the
-/// module header: this is two prefixes, deliberately, and widening it further is
-/// how a silent duplicate gets in.
+/// Whether `reply` is a refusal that cannot have followed a write. Two prefixes,
+/// deliberately: widening it is how a silent duplicate gets in.
 fn refused_before_any_write(reply: &str) -> bool {
-    // `ERR busy` — the drive lease, and a guarded press's `ERR busy sink` (a
-    // sink that accepted ZERO bytes). `ERR denied` — authority. For all four
-    // keyed verbs both are decided before the first byte: the dispatch fast-fail
-    // and op-scope gate, `turn`'s own read-authority check at the top of its arm
-    // and its authoritative lease acquire, and `run_feed_bin_routed`'s edge check
-    // and lease mirror, which both precede its write — or, for `ERR busy sink`,
-    // at a write that moved nothing. Neither can be reached again once a verb
-    // has started typing.
+    // `ERR busy` (the drive lease, or a sink that accepted zero bytes) and
+    // `ERR denied` (authority) are decided before any byte moves; see the module doc.
     reply.starts_with("ERR busy") || reply.starts_with("ERR denied")
 }
 
-/// `OK skipped` — a guarded attempt (`key if=<re>`, `send if=<re>`) whose guard
-/// matched no visible row, and its fenced twins: `reason=changed` (`if-gen=`,
+/// `OK skipped`: a guarded attempt (`key if=<re>`, `send if=<re>`) whose guard
+/// matched no visible row, or its fenced twins `reason=changed` (`if-gen=`,
 /// `if-fp=`: the screen moved) and `reason=person` (`if-human=`: a person keyed
-/// since the read). It is an `OK` (a skipped guard is an answer, not an
-/// error) that WROTE NOTHING, decided under the terminal lock before any byte
-/// could move, so the sequence is given back: the driver's retry is re-evaluated
-/// against the live screen instead of being told `dup=1` for a press that never
-/// happened. Checked before the plain `OK` arm, which would settle it.
+/// since the read). An `OK` that wrote nothing, decided under the terminal lock,
+/// so the sequence is given back and the retry is re-evaluated against the live
+/// screen. Checked before the plain `OK` arm, which would settle it.
 fn skipped_by_guard(reply: &str) -> bool {
     reply.starts_with("OK skipped")
 }
 
-/// The `OK` a duplicate is answered with, in the FRAMING the verb declares.
-///
-/// A duplicate must be a well-formed reply for the verb it duplicates, not merely
-/// a well-formed line. `turn` is `Framing::Lines` — `OK <n>` then n rows — so a
-/// bare `OK dup=1` makes a Lines client read `dup=1` as a row count: `aterm-ctl`
-/// answers `malformed response header: "OK dup=1"` and exits 1, which a driver
-/// retrying after a crash cannot tell from a broken server. `OK 0 dup=1` says the
-/// same thing inside the verb's own grammar — a zero-row listing whose tail
-/// carries the marker, which `stream_count` already parses.
-///
-/// A1 added `framing_of`'s `inbox get`/`inbox seen`/`outbox sent` flips for
-/// exactly this hazard ("a client that read `OK seen=42` as a row count hangs
-/// waiting for 42 rows"); the dup reply is runtime state that `framing_of` cannot
-/// express, so it is honoured here instead.
+/// The `OK` a duplicate is answered with, in the framing the verb declares. A
+/// `Lines` client (`turn`) reads a bare `OK dup=1`'s `dup=1` as a row count and
+/// `aterm-ctl` answers `malformed response header`, so `OK <n>` framings get
+/// `OK 0 dup=1`: a zero-row reply whose tail carries the marker, which
+/// `stream_count` parses. The dup reply is runtime state `framing_of` cannot
+/// express, so it is framed here.
 fn dup_reply(verb: &str) -> String {
     use aterm_types::control_verbs::Framing;
     match aterm_types::control_verbs::framing_of(verb, verb) {
-        // `OK <n>` header framings: a zero-length body, with the marker in the
-        // tail. (`Bytes` is `OK <nbytes>` + that many bytes, so zero bytes is the
-        // same shape. No keyed verb is `Bytes` or `Push` today; the arm exists so
-        // one that becomes so is framed rather than malformed.)
+        // `OK <n>` header framings: a zero-length body, the marker in the tail. No
+        // keyed verb is `Bytes` or `Push` today; the arm frames one that becomes so.
         Framing::Lines | Framing::Bytes | Framing::Push => "OK 0 dup=1\n".to_string(),
         Framing::Status => "OK dup=1\n".to_string(),
     }
 }
 
-/// A KEYED attempt that carries no payload (`send id=<k>` with an empty tail,
+/// A keyed attempt that carries no payload (`send id=<k>` with an empty tail,
 /// `feed-bin 0 id=<k>`) would answer `OK` with nothing typed and settle its claim
-/// `Applied` — consuming a sequence no byte ever moved under. Refuse it as a usage
-/// error BEFORE [`guarded`], so the mark stays unclaimed and a retry with the real
-/// payload is still a first attempt. An unkeyed empty write keeps its old `OK`.
+/// `Applied`, consuming a sequence no byte moved under. Refuse it as a usage error
+/// before [`guarded`], so a retry with the real payload is still a first attempt.
+/// An unkeyed empty write still answers `OK`.
 pub(crate) fn empty_payload_refusal(key: Option<&str>, payload_is_empty: bool) -> Option<String> {
     (key.is_some() && payload_is_empty)
         .then(|| "ERR usage: id= needs a non-empty payload\n".to_string())
@@ -627,12 +452,9 @@ pub(crate) fn empty_payload_refusal(key: Option<&str>, payload_is_empty: bool) -
 
 /// Run `attempt` under the session's mark for `key`, or answer for it.
 ///
-/// `key` is the RAW `id=` value (`None` when the caller passed none, in which
-/// case `attempt` runs unguarded and the seam behaves exactly as it did before
-/// this rung — the whole feature is opt-in per request).
-///
-/// `scope` picks the mark's [`Realm`]: the producer NUMBER is the caller's to
-/// type, the NAMESPACE is not. `verb` picks the duplicate reply's framing.
+/// `key` is the raw `id=` value; `None` runs `attempt` unguarded (the key is
+/// opt-in per request). `scope` picks the mark's [`Realm`]; `verb` picks the
+/// duplicate reply's framing.
 pub(crate) fn guarded<F>(
     ctx: &SessionCtx,
     scope: crate::control::Scope,
@@ -664,22 +486,19 @@ where
         claim.released();
     } else {
         claim.unknown();
-        // VISIBLE, not silent. The reply already tells THIS caller; the timeline
-        // row is what a human (or the next `timeline since=`) reads afterwards,
-        // and it is why the loss the bridge takes today stops being invisible.
-        // Recorded after the mark is settled, so the marks lock is never held
-        // across the timeline lock.
+        // Visible, not silent: the reply tells this caller; the timeline row is
+        // what a human (or the next `timeline since=`) reads afterwards. Recorded
+        // after the mark is settled, so the marks lock is never held across the
+        // timeline lock.
         record_in_doubt(ctx, key, &reply);
     }
     reply
 }
 
-/// Append the `in-doubt` row. Deliberately NOT a fabric event kind: the five
-/// `EVENT` names of §11.2 are pinned, and this is a per-session record of an
-/// input whose fate is unknown, not a fabric message. It carries the producer,
-/// the sequence and the refusal's first TWO tokens only, joined with `-`
-/// (`ERR-write` for `ERR write failed`) — never the input bytes, and never the
-/// reply's tail (a `turn` reply is a whole screen).
+/// Append the `in-doubt` row: a per-session record, not a fabric event kind. It
+/// carries the producer, the sequence and the reply's first two tokens joined with
+/// `-` (`ERR-write` for `ERR write failed`), never the input bytes or the reply's
+/// tail (a `turn` reply is a whole screen).
 fn record_in_doubt(ctx: &SessionCtx, key: Key, reply: &str) {
     let why = reply
         .trim_end_matches(['\r', '\n'])
@@ -704,7 +523,7 @@ fn record_in_doubt(ctx: &SessionCtx, key: Key, reply: &str) {
 #[cfg(test)]
 mod tests {
 
-    /// Only a KEYED attempt with nothing to type is refused; an unkeyed empty
+    /// Only a keyed attempt with nothing to type is refused; an unkeyed empty
     /// write and a keyed non-empty one both pass through to the claim.
     #[test]
     fn only_a_keyed_empty_payload_is_refused_before_the_claim() {
@@ -717,16 +536,10 @@ mod tests {
         assert_eq!(empty_payload_refusal(None, false), None);
     }
 
-    /// `turn`'s help states WHO takes the idempotency key, and the statement is
-    /// bound to [`KEYED_VERBS`] — because the previous wording, "the key, which
-    /// every input verb shares", was FALSE in the dangerous direction: a driver
-    /// that believed it and stamped `id=` on a `paste` had the key delivered as
-    /// LITERAL TEXT into the terminal (pinned by `control.rs`'s
-    /// `unkeyed_verbs_deliver_a_leading_id_as_content`, which pastes one through
-    /// a pipe-backed session and reads the key back off the PTY), with no
-    /// exactly-once protection at all. The entry must name every keyed verb,
-    /// must not use the "every input verb" wording, and must state that the
-    /// others take no key.
+    /// `turn`'s help names every keyed verb ([`KEYED_VERBS`]), says the others take
+    /// no key, and never says "every input verb" shares it: an unkeyed verb delivers
+    /// a leading `id=` as literal text (`control_tests.rs`'s
+    /// `unkeyed_verbs_deliver_a_leading_id_as_content`).
     #[test]
     fn the_turn_help_names_exactly_the_keyed_verbs() {
         let detail = aterm_types::control_verbs::spec("turn")
@@ -750,28 +563,14 @@ mod tests {
         );
     }
 
-    /// `send`'s help SPLITS the keyed verbs by framing, and the split is derived
-    /// from the table — so the roster in the prose must agree with it.
-    ///
-    /// It did not. The sentence filed `feed-bin` under "`OK 0 dup=1` for a
-    /// `Lines`/`Bytes` one", but `feed-bin` is declared `Status`
-    /// (`control_verbs.rs`, the `v("feed-bin", Write, Status, …)` row), so
-    /// `dup_reply` answers `OK dup=1` for it — as this crate's own test at
-    /// `control.rs` already asserted. The code and its test agreed with each
-    /// other and disagreed with the help.
-    ///
-    /// The prior catalog check asserted only that both PHRASES appear, which is
-    /// why a verb on the wrong side of the split survived it. This derives each
-    /// verb's side from `framing_of` and requires the prose to name it there.
+    /// `send`'s help files each keyed verb in the reply roster its framing
+    /// (`framing_of`) puts it in, and in no other.
     #[test]
     fn the_send_help_files_every_keyed_verb_on_the_side_its_framing_puts_it() {
         use aterm_types::control_verbs::{Framing, framing_of, spec};
         let detail = spec("send").expect("`send` is a catalog verb").detail;
-        // The two PARENTHESISED rosters, not "everything before/after the split
-        // point". A first draft split the detail on `` `OK 0 dup=1` `` and looked
-        // for each verb in the prefix — and passed the plant, because `feed-bin`
-        // is also named two sentences earlier ("`key`, `feed-bin` and `turn` take
-        // the same key"). A roster check must read the roster.
+        // Read the two parenthesised rosters, not everything around the split
+        // point: `feed-bin` is also named earlier in the detail.
         let roster = |after: &str| -> String {
             let tail = detail
                 .split_once(after)
@@ -808,24 +607,10 @@ mod tests {
         LaunchNonce::generate()
     }
 
-    /// A PRODUCER WITH AN ATTEMPT IN FLIGHT IS REFUSED, NOT DISPLACED — and the
-    /// displaced attempt's own outcome is therefore never lost.
-    ///
-    /// `claim` used to overwrite any mark the incoming sequence was above,
-    /// `Tip::Running` included. The lower attempt's `settle` then found a
-    /// high-water that had moved and did nothing, so a keystroke that DID type
-    /// answered a replay as if it had not; and if the displacing attempt was
-    /// refused before any write (`ERR busy` from the drive lease), `release`
-    /// reinstated the `Running` mark byte for byte — a tip whose owner had
-    /// already finished, which `consumed_answer` answers `ERR busy` for FOREVER,
-    /// which `settle`/`release` cannot reach without a live claim, and which the
-    /// LRU eviction skips because it is `Running`. Sixty-four of those and the
-    /// whole `Realm::Local` namespace is wedged for the life of the process.
-    ///
-    /// Two connections sharing one producer number is not exotic: `Realm`'s own
-    /// doc names it as the residual ("two `Local` drivers still share a
-    /// namespace"), and a driver that shells out to `aterm-ctl` per request makes
-    /// every request its own connection.
+    /// A producer with an attempt in flight is refused, not displaced, so the running
+    /// attempt's outcome survives and a later release cannot reinstate an
+    /// unsettleable `Running` tip. Two connections sharing a producer number is
+    /// ordinary: a driver that runs `aterm-ctl` per request opens one per request.
     #[test]
     fn a_running_producer_is_refused_rather_than_displaced() {
         const DUP: &str = "OK dup=1\n";
@@ -843,7 +628,7 @@ mod tests {
             Claimed::Fresh(claim) => claim,
             Claimed::Answer(reply) => panic!("a fresh sequence must claim: {reply}"),
         };
-        // B arrives at a HIGHER sequence while A is still inside the seam.
+        // B arrives at a higher sequence while A is still inside the seam.
         match idem.claim(Realm::Local, b, DUP) {
             Claimed::Answer(reply) => assert_eq!(
                 reply, "ERR busy idem=5\n",
@@ -854,7 +639,7 @@ mod tests {
             }
         }
 
-        // A's outcome survives, which is the half a displacement discarded.
+        // A's outcome survives.
         running.applied();
         match idem.claim(Realm::Local, a, DUP) {
             Claimed::Answer(reply) => {
@@ -876,8 +661,7 @@ mod tests {
                 panic!("a released sequence is a FIRST attempt, not a duplicate: {reply}")
             }
         }
-        // The restored mark is A's settled one, so A still answers a duplicate
-        // rather than the permanent `ERR busy` a reinstated `Running` tip gave.
+        // The restored mark is A's settled one, so A still answers a duplicate.
         match idem.claim(Realm::Local, a, DUP) {
             Claimed::Answer(reply) => assert_eq!(reply, DUP),
             Claimed::Fresh(_) => panic!("A's sequence is consumed"),
@@ -895,7 +679,7 @@ mod tests {
                 seq: 1
             })
         );
-        // A key minted for another incarnation is refused by NAME, not silently
+        // A key minted for another incarnation is refused by name, not silently
         // applied and not silently suppressed.
         let dead = nonce();
         assert_eq!(

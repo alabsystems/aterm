@@ -46,9 +46,8 @@
 //! $ grep -rn 'use objc2\|objc2::\|objc2_app_kit::\|objc2_foundation::\|block2::' crates/aterm-gui/src
 //! ```
 //!
-//! It answers nothing outside prose. `crates/aterm-objc/tests/objc2_exit_condition.rs`
-//! is the same rule as a TEST, over a scope derived by subtraction rather than
-//! remembered, and its `GUI_FILES` count is 0.
+//! It answers nothing outside prose. The rule itself is the manifest's: no
+//! objc2-family crate is a dependency here, so no file can name one.
 //!
 //! The list as it stood, and where each entry went:
 //!
@@ -159,7 +158,7 @@ pub(crate) fn test_witness() -> MainThread {
 /// `toolbar.rs`'s 268 among them — is unchanged by the move and still says
 /// `appkit::send_v_id`.
 ///
-/// WHY THEY LEFT: `vendor/winit`'s `window_delegate.rs` and `view.rs` need the
+/// WHY THEY LEFT: `crates/aterm-window`'s `window_delegate.rs` and `view.rs` need the
 /// same shapes and CANNOT import this module, which is `pub(crate)` to
 /// `aterm-gui`. The two honest options were a second copy inside the fork or
 /// one copy somewhere both can reach. A second copy would have cost the
@@ -313,7 +312,7 @@ pub(crate) mod consts {
     /// ```
     ///
     /// Inverting either assertion fails to compile, so the check is
-    /// load-bearing rather than vacuous. `gate cells` has no
+    /// load-bearing rather than vacuous. `verify cells` has no
     /// `x86_64-apple-darwin` cell — its `win` cell is x86_64 but not Apple — so
     /// this is the only thing standing behind the `= 2` arm.
     #[cfg(target_arch = "x86_64")]
@@ -459,6 +458,65 @@ pub(crate) mod consts {
     /// unsigned on every Apple target this compiles for (the
     /// `NS_EVENT_MASK_KEY_DOWN` precedent above).
     pub(crate) const NS_ACTIVITY_USER_INITIATED_ALLOWING_IDLE_SYSTEM_SLEEP: usize = 0x00EF_FFFF;
+
+    // ---- the Developer Tools helper panel (`devtools_helper.rs`, 2026-10-15) ----
+
+    /// `NSWindow.h:56,57,64,66` — `NSWindowStyleMaskTitled` (`1 << 0`)
+    /// `| NSWindowStyleMaskClosable` (`1 << 1`) `| NSWindowStyleMaskUtilityWindow`
+    /// (`1 << 4`) `| NSWindowStyleMaskNonactivatingPanel` (`1 << 7`)
+    /// (`NSUInteger`). The helper panel's mask, set at init: a non-activating
+    /// panel's mask set after init is not one AppKit honours.
+    pub(crate) const NS_WINDOW_STYLE_MASK_UTILITY_PANEL: usize = 0x01 | 0x02 | 0x10 | 0x80;
+
+    /// `NSGraphics.h:99` — `NSBackingStoreBuffered = 2` (`NSUInteger`).
+    pub(crate) const NS_BACKING_STORE_BUFFERED: usize = 2;
+
+    /// `NSWindow.h:194` — `static const NSWindowLevel NSFloatingWindowLevel =
+    /// kCGFloatingWindowLevel;`, and `CGWindowLevel.h:68` —
+    /// `#define kCGFloatingWindowLevel ((CGWindowLevel)3)` (`NSInteger`).
+    pub(crate) const NS_FLOATING_WINDOW_LEVEL: isize = 3;
+
+    /// `NSWindow.h:130,141` — `NSWindowCollectionBehaviorCanJoinAllSpaces`
+    /// (`1 << 0`) `| NSWindowCollectionBehaviorFullScreenAuxiliary` (`1 << 8`)
+    /// (`NSUInteger`): the panel follows System Settings to its Space, full
+    /// screen included.
+    pub(crate) const NS_WINDOW_COLLECTION_BEHAVIOR_ALL_SPACES_AUXILIARY: usize = 0x01 | 0x100;
+
+    /// `NSDragging.h:26` — `NSDragOperationNone = 0` (`NSUInteger`): the drop
+    /// was not taken.
+    pub(crate) const NS_DRAG_OPERATION_NONE: usize = 0;
+
+    /// `NSDragging.h:27` — `NSDragOperationCopy = 1` (`NSUInteger`). The ONLY
+    /// operation the helper's tile offers, in every context: a `Generic` or
+    /// `Move` lets Finder move the running `/Applications/aterm.app` out of its
+    /// install path.
+    pub(crate) const NS_DRAG_OPERATION_COPY: usize = 1;
+
+    /// `NSButtonCell.h:34` — `NSBezelStylePush = 1` (`NSUInteger`).
+    pub(crate) const NS_BEZEL_STYLE_PUSH: usize = 1;
+
+    /// `NSRunningApplication.h:23,27` — `NSApplicationActivateAllWindows`
+    /// (`1 << 0`) `| NSApplicationActivateIgnoringOtherApps` (`1 << 1`)
+    /// (`NSUInteger`). Both, for the reason `platform.rs`'s `activate_instance`
+    /// gives: the second is inert on macOS 14 and later and required before it
+    /// whenever another app is frontmost.
+    pub(crate) const NS_APPLICATION_ACTIVATE_ALL_WINDOWS_IGNORING_OTHER_APPS: usize = 0x01 | 0x02;
+
+    /// `NSRunningApplication.h:42` — `NSApplicationActivationPolicyProhibited`,
+    /// the third enumerator of an implicit enum (`NSInteger`), so 2: a process
+    /// that may not show a window or be activated. System Settings runs helper
+    /// processes under its bundle id with this policy; the panel looks for the
+    /// one that is not one of them.
+    pub(crate) const NS_APPLICATION_ACTIVATION_POLICY_PROHIBITED: isize = 2;
+
+    /// `CGWindow.h:145,160` — `kCGWindowListOptionOnScreenOnly` (`1 << 0`)
+    /// `| kCGWindowListExcludeDesktopElements` (`1 << 4`) (`CGWindowListOption`,
+    /// `uint32_t`): the on-screen windows the panel looks for System Settings'
+    /// frame among.
+    pub(crate) const CG_WINDOW_LIST_ON_SCREEN_NON_DESKTOP: u32 = 0x01 | 0x10;
+
+    /// `CGWindow.h:42` — `#define kCGNullWindowID ((CGWindowID)0)`.
+    pub(crate) const CG_NULL_WINDOW_ID: u32 = 0;
 }
 
 // The two `NSAppearanceName` constants — the EXCEPTION the [`consts`] note
@@ -478,6 +536,10 @@ pub(crate) mod consts {
 // each read is one dereference of a live framework global — not a call.
 #[link(name = "AppKit", kind = "framework")]
 unsafe extern "C" {
+    /// `NSApplication.h:196` — nil until AppKit has created the application.
+    #[link_name = "NSApp"]
+    static mut NS_APP: Id;
+
     /// `NSAppearance.h:63` — the light system appearance's name.
     #[link_name = "NSAppearanceNameAqua"]
     static NS_APPEARANCE_NAME_AQUA: Id;
@@ -495,6 +557,16 @@ unsafe extern "C" {
     /// reason: writing it as anything else does not link.
     #[link_name = "NSBeep"]
     fn ns_beep();
+}
+
+/// The already-created application, borrowed, or `None` before its creation.
+/// Reading AppKit's global never initializes an application or contacts WindowServer.
+#[must_use]
+pub(crate) fn existing_application(_main_thread: MainThread) -> Option<Id> {
+    // SAFETY: NSApp is AppKit's exported, nullable application pointer. AppKit
+    // initializes it on the main thread; the witness keeps this load on that thread.
+    let app = unsafe { NS_APP };
+    (!app.is_null()).then_some(app)
 }
 
 /// Play the user's configured macOS alert sound (the BEL bell).

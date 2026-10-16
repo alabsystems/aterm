@@ -15,10 +15,9 @@ const CTL: Source = Source::Controller;
 
 /// An App whose session writes into a pipe, and the pipe's read end.
 ///
-/// The sink owns the write end (`new_owned`), as a shipping session owns
-/// its PTY master: a paste egresses on the `paste_order` writer thread,
-/// whose queued job holds an `Arc<SinkWriter>`, so the fd closes only after
-/// that write. A borrowed fd closed at the test's end could send the write
+/// The sink owns the write end (`new_owned`), as a session owns its PTY master:
+/// a queued `paste_order` job holds an `Arc<SinkWriter>`, so the fd closes only
+/// after that write. A borrowed fd closed at the test's end could send the write
 /// into a parallel test's pipe on the recycled number.
 pub(super) fn observing_app() -> (App, OwnedFd) {
     let mut pipe = [-1; 2];
@@ -48,21 +47,13 @@ fn observed(app: &App) -> (u64, Option<PetInputKind>) {
 /// lowers to, and whether that arms `cursor_fx_focus`'s stamp.
 type WakeCase = (&'static str, fn() -> InputEvent, bool);
 
-/// The typed wake is armed by what the hand did, proven through
-/// `App::input_to_session` (the claims `App::cursor_fx_focus`'s doc makes).
-///
-/// Cursor effects are zeroed on a window without OS key focus, but a window
-/// being typed into is being driven: control-socket typing never grants key
-/// focus, and a handoff-adopted window may never see `Focused(true)`. So:
-///
-/// 1. a `Source::Controller` key arms it;
-/// 2. a paste arms it (`ctl paste`, the text phase of `ctl turn`, Cmd-V and
-///    the X11 async paste worker all lower to `InputEvent::Paste`);
-/// 3. a bare modifier does not: the Cmd-Tab away from a window would
-///    otherwise re-arm 60 fps effects on the window being left.
-///
-/// Dropping the stamp from the `Paste` arm fails (2); moving it above the
-/// `inert_modifier` guard fails (3).
+/// The typed wake (`App::cursor_fx_focus`), stamped in `App::input_to_session`:
+/// a `Source::Controller` key arms it, and so does a paste (`ctl paste`, `ctl
+/// turn`'s text phase, Cmd-V and the X11 paste worker all lower to
+/// `InputEvent::Paste`); a bare modifier does not, or the Cmd-Tab away from a
+/// window would re-arm 60 fps effects on the window being left. Dropping the
+/// stamp from the `Paste` arm, or moving it above the `inert_modifier` guard,
+/// fails this.
 #[test]
 fn the_typed_wake_is_armed_by_a_controller_key_and_a_paste_but_not_a_bare_modifier() {
     use std::time::Duration;
@@ -89,9 +80,8 @@ fn the_typed_wake_is_armed_by_a_controller_key_and_a_paste_but_not_a_bare_modifi
     for (what, build, arms) in cases {
         let (mut app, _reader) = observing_app();
         let wid = WindowId(0);
-        // Unfocused: the only state in which the wake decides anything.
-        // With OS focus held `cursor_fx_focus` is true whatever the stamp
-        // says.
+        // Unfocused: with OS focus held `cursor_fx_focus` is true whatever the
+        // stamp says.
         app.windows.get_mut(&wid).expect("window").focused = false;
         let before = std::time::Instant::now();
         assert!(
@@ -107,8 +97,7 @@ fn the_typed_wake_is_armed_by_a_controller_key_and_a_paste_but_not_a_bare_modifi
             arms,
             "{what}: the typed wake"
         );
-        // …and when it is armed it expires, so an idle unfocused window
-        // still demotes — the wake is a hold on typing, not a pin.
+        // …and an armed wake expires, so an idle unfocused window still demotes.
         if arms {
             assert!(
                 !app.cursor_fx_focus(
@@ -180,8 +169,7 @@ fn an_ime_composition_is_a_person_typing() {
     app.on_ime_preedit(wid, String::new(), None);
     assert_eq!(human(&app), None, "an empty preedit is nobody");
     app.on_ime_preedit(wid, "にほ".into(), Some((0, 0)));
-    // Stamped now; the minute is a hang detector's, as for the other
-    // `human_ms=` stamps, so a stall of this thread cannot fail it.
+    // Stamped now; the minute is a hang detector, not a latency budget.
     assert!(
         human(&app).is_some_and(|ms| ms < 60_000),
         "{:?}",

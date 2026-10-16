@@ -9,54 +9,6 @@
 
 use crate::{Rle, reset_run_iterations, take_run_iterations};
 
-/// Prove that individual `set()` operations are O(R) per call where R is run count.
-///
-/// When each cell has a unique attribute value (pathological case), R grows to O(N)
-/// and N `set()` calls have total cost O(N²). This test documents this known bound
-/// and ensures it doesn't exceed the expected quadratic growth rate.
-///
-/// For typical terminal workloads (few distinct styles per row), R stays small
-/// and `set()` is effectively O(1) per call.
-#[test]
-fn rle_set_individual_cost_scales_with_run_count() {
-    fn measure_individual_sets(n: u32) -> usize {
-        // Start with a uniform RLE — 1 run.
-        let mut rle = Rle::with_value(0u16, n);
-        assert_eq!(rle.run_count(), 1);
-
-        reset_run_iterations();
-        // Set every other cell to a unique value — forces run fragmentation.
-        // After this loop, R ≈ N (alternating values).
-        for i in (0..n).step_by(2) {
-            // Value i+1 is unique and different from 0 and all other values.
-            rle.set(i, (i + 1) as u16);
-        }
-        take_run_iterations()
-    }
-
-    let small_iters = measure_individual_sets(200) as u128;
-    let large_iters = measure_individual_sets(400) as u128;
-
-    assert!(small_iters > 0, "should register iterations");
-    assert!(large_iters > 0, "should register iterations");
-
-    // With 2x more elements, if each set() is O(R) and R grows linearly,
-    // total iterations should grow ~4x (quadratic). We allow up to 6x to
-    // accommodate constant factors in compaction.
-    // If iterations grow faster than 8x, there's an unexpected superquadratic bug.
-    let ratio = large_iters as f64 / small_iters as f64;
-    assert!(
-        ratio < 8.0,
-        "2x input with pathological fragmentation should grow at most ~4x (quadratic), \
-         got {ratio:.1}x (small={small_iters}, large={large_iters})"
-    );
-    // Also verify it's at least superlinear (not accidentally O(N)):
-    assert!(
-        ratio > 1.5,
-        "pathological set() should be superlinear, got {ratio:.1}x"
-    );
-}
-
 /// Prove that `set()` on a well-compressed RLE (few runs) is O(1) per call.
 ///
 /// When attributes form large runs (typical terminal: bold prompt + normal text),

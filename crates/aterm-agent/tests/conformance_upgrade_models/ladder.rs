@@ -1,16 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! HarnessModelLadder, Tier-1: when the live upgrade takes a due model move
-//! (`aterm_agent::harness::upgrade_models::model_moves_now`), driven over every
-//! reachable state of the derived model and projected back onto it.
-//!
-//! At every reachable readable state the real decision agrees with the model's
-//! guards (`VisitMoves` exactly where `model_moves_now` answers a move,
-//! `VisitWaits` exactly where it waits), and each observed transition is
-//! validated on every installed tier. Negative controls: forged successors the
-//! model must refuse, and a cold-cache-only rule, which must disagree with the
-//! model somewhere reachable.
+//! HarnessModelLadder, Tier-1: `upgrade_models::model_moves_now` (when the live upgrade
+//! takes a due model move) agrees with the model's guards at every reachable readable
+//! state: `VisitMoves` exactly where it answers a move, `VisitWaits` exactly where it
+//! waits. Negative controls: forged successors, and a cold-cache-only rule the bind
+//! must catch.
 
 use std::collections::{BTreeSet, VecDeque};
 
@@ -136,9 +131,8 @@ fn the_real_ladder_is_the_models_ladder_at_every_reachable_state() {
     assert!(decided > 0);
 }
 
-/// The caught negative control: a due move taken only on a cold cache must
-/// disagree with the model at a reachable state, and the disagreement must be
-/// the case it misses (warm, a build restart in hand).
+/// Negative control: a due move taken only on a cold cache disagrees with the model
+/// at a reachable state, including the case it misses (warm, a build restart in hand).
 #[test]
 fn the_incidents_cold_only_rule_is_caught_by_the_bind() {
     let model = harness_model_ladder_model();

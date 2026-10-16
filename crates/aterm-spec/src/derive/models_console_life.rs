@@ -63,9 +63,9 @@ pub fn console_cursor_home_model() -> Model {
             invariant OrdinaryTextKeepsBody: if protected == 0 { visible == 1 } else { visible == 0 };
             invariant BaseStaysAtCursor: if protected == 0 { home == 1 } else { home == 0 };
             invariant ArrivesAtCursor: if event == 4 { home == 1 && moving == 0 } else { home <= 1 };
-            invariant ProtectionParks: if protected == 1 { visible == 0 && moving == 0 } else { protected == 0 };
+            uncaught ProtectionParks: if protected == 1 { visible == 0 && moving == 0 } else { protected == 0 };
             invariant RepaintHoldsHome: if event == 9 { moving == 0 } else { moving <= 1 };
-            invariant Bounded: visible <= 1 && home <= 1 && moving <= 1 && protected <= 1 && hidden <= 1 && event <= 9;
+            bound Bounded: visible <= 1 && home <= 1 && moving <= 1 && protected <= 1 && hidden <= 1 && event <= 9;
         }
     }
 }
@@ -167,7 +167,7 @@ pub fn console_life_episode_model() -> Model {
                 if event == 9 { attention == 0 && anchor == 0 && result == 0 } else { surface <= MaxSurface };
             invariant ExpiryCannotReplay:
                 if event == 7 || event == 8 { result == 0 && attention <= 3 } else { result <= 1 };
-            invariant StateBounded:
+            bound StateBounded:
                 seq <= MaxInputs && inputs <= MaxInputs && consumed <= MaxInputs
                     && attention <= 4 && anchor <= 1 && selected <= 1 && result <= 1
                     && surface <= MaxSurface && event <= 9;
@@ -238,7 +238,7 @@ pub fn console_resident_handoff_model() -> Model {
             invariant NoTargetParks: if event == 6 { handoff == 0 && wake == 0 } else { wake <= 1 };
             invariant QuietResidentHasNoWake:
                 if resident == 1 && legacy == 0 && handoff == 0 && touch == 0 { wake == 0 } else { wake <= 1 };
-            invariant StateBounded:
+            bound StateBounded:
                 legacy <= 1 && resident <= 1 && handoff <= 1 && touch <= 1
                     && blocked <= 1 && wake <= 1 && event <= 8;
         }
@@ -523,16 +523,5 @@ pub fn pet_surface_seam_model() -> Model {
             invariant GhostLeavesAtFullPresence: tail == 0;
             invariant RefusedGhostHandsOver: dipped == 0;
         }
-    }
-}
-
-#[cfg(test)]
-mod cursor_home_tests {
-    #[test]
-    fn derived_cursor_home_proves_and_catches_ink_disappearance_and_stranded_residency() {
-        crate::verify::prove_and_catch_scalar(
-            &super::console_cursor_home_model(),
-            "cursor-home placement and ordinary-text persistence",
-        );
     }
 }

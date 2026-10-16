@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Tests for tiered storage (hot/warm/cold) — extracted from `tier.rs` (#2100).
+//! Tests for tiered storage (hot/warm/cold).
 
 use super::*;
 use crate::HotTier;
@@ -29,7 +29,7 @@ impl WarmTier {
         }
     }
 
-    /// Mutable access to the underlying block deque for test corruption. (#5947)
+    /// Mutable access to the underlying block deque for test corruption.
     pub(crate) fn blocks_mut(&mut self) -> &mut std::collections::VecDeque<WarmBlock> {
         &mut self.blocks
     }
@@ -50,10 +50,9 @@ fn hot_tier_push_get() {
     assert!(hot.get(3).is_none());
 }
 
-/// A configured block_size above the disk-decode line-count cap must be clamped,
-/// so a promoted warm/cold/disk block never holds more lines than the decoder will
-/// reconstruct (else a legitimate oversized block decodes short and fails its
-/// count validation — codex round-4 finding 2).
+/// A configured block_size above the disk-decode line-count cap is clamped, so
+/// no promoted block holds more lines than the decoder will reconstruct (a
+/// legitimate oversized block would decode short and fail its count check).
 #[test]
 fn block_size_clamped_to_decode_page_cap() {
     let cap = crate::line::MAX_DECODE_PAGE_LINES;
@@ -207,10 +206,7 @@ fn warm_tier_pop_front() {
     );
 }
 
-/// Regression test for W1-576: `memory_used()` must include the
-/// decompression cache (`last_block_cache`). Without the cache term,
-/// `memory_used()` under-reports when lines have been accessed via
-/// `get_line()`.
+/// `memory_used()` includes the decompression cache (`last_block_cache`).
 #[test]
 fn warm_tier_memory_used_includes_cache() {
     let mut warm = WarmTier::new();
@@ -235,7 +231,7 @@ fn warm_tier_memory_used_includes_cache() {
     );
 }
 
-/// Verify warm-tier block lookup scales logarithmically with block count.
+/// Warm-tier block lookup scales logarithmically with block count.
 #[test]
 fn warm_tier_find_block_logarithmic_scaling() {
     fn measure_find_block_steps(block_count: usize) -> usize {
@@ -273,7 +269,7 @@ fn warm_tier_find_block_logarithmic_scaling() {
     );
 }
 
-/// Regression test: push_front restores a popped block to the front.
+/// push_front restores a popped block to the front.
 #[test]
 fn warm_tier_push_front_restores_popped_block() {
     let mut warm = WarmTier::new();
@@ -330,62 +326,105 @@ fn warm_tier_push_front_restores_popped_block() {
     );
 }
 
-/// Exact rebuild-work proof for the high-block warm tiers used in budget tests.
-///
-/// Fills a `Scrollback` with `block_size=5`, isolates the resulting
-/// `WarmTier`, and proves that repeated `pop_front()` calls perform exactly
-/// `B * (B - 1) / 2` cumulative index rebuild steps for the warm-block counts
-/// this high-block test shape creates.
+/// WarmTier's amortized cumulative index (`cum_start` + `cumulative_base`)
+/// answers `line_count()`, `get_line`, `locate` and `segment_len_at` exactly as
+/// a fresh `rebuild_cumulative()` across mixed `push_block`, `push_front`,
+/// `pop_front` and `truncate_front_lines`, including across the 64-block
+/// compaction threshold.
 #[test]
-fn warm_tier_pop_front_rebuild_steps_match_quadratic_bound() {
-    fn measure_rebuild_steps(warm_limit: usize) -> (usize, usize) {
-        let mut sb = Scrollback::with_block_size(5, warm_limit, 500_000_000, 5);
-        let fill = warm_limit + 200;
-        for i in 0..fill {
-            sb.push_str(&format!("Warm-step-line-{i}"));
+fn warm_tier_cumulative_index_matches_rebuild_across_front_and_back_ops() {
+    fn assert_matches_rebuilt(warm: &WarmTier) {
+        assert_eq!(warm.live_cumulative().len(), warm.block_count());
+        assert_eq!(warm.memory_used(), warm.recompute_memory_used());
+
+        // Clone the live blocks and front_offset into a reference tier that
+        // rebuilds its cumulative index from scratch.
+        let mut rebuilt = WarmTier::new();
+        for block in &warm.blocks {
+            rebuilt.push_front(WarmBlock {
+                compressed: block.compressed.clone(),
+                line_count: block.line_count,
+                decompress_failures: Cell::new(block.decompress_failures.get()),
+            });
         }
+        // `push_front` in loop order reversed `blocks`; restore exact order.
+        rebuilt.blocks.make_contiguous().reverse();
+        rebuilt.front_offset = warm.front_offset;
+        rebuilt.line_count = warm.line_count;
+        rebuilt.rebuild_cumulative();
 
-        let warm_blocks = sb.warm.block_count();
-        assert!(warm_blocks > 0, "need warm blocks for rebuild-step proof");
-        assert!(
-            sb.cold_line_count() > 0,
-            "fill pattern should match the end-to-end memory-pressure setup"
-        );
-
-        let mut rebuild_steps = 0usize;
-        while sb.warm.pop_front().is_some() {
-            rebuild_steps += sb.warm.cumulative_lines.len();
+        assert_eq!(warm.line_count(), rebuilt.line_count());
+        let physical_total = warm.line_count() + warm.front_offset;
+        for phys in 0..=physical_total {
+            assert_eq!(
+                warm.locate(phys),
+                rebuilt.locate(phys),
+                "locate({phys}) mismatch (cum_start={}, base={})",
+                warm.cum_start,
+                warm.cumulative_base
+            );
         }
-
-        assert_eq!(
-            sb.warm.block_count(),
-            0,
-            "all warm blocks should be evicted"
-        );
-        (warm_blocks, rebuild_steps)
+        for idx in 0..=warm.line_count() {
+            assert_eq!(
+                warm.segment_len_at(idx),
+                rebuilt.segment_len_at(idx),
+                "segment_len_at({idx}) mismatch"
+            );
+            let a = warm.get_line(idx).expect("warm decode");
+            let b = rebuilt.get_line(idx).expect("rebuilt decode");
+            assert_eq!(
+                a.as_ref().map(ToString::to_string),
+                b.as_ref().map(ToString::to_string),
+                "get_line({idx}) mismatch"
+            );
+        }
     }
 
-    let (small_blocks, small_steps) = measure_rebuild_steps(200);
-    let (large_blocks, large_steps) = measure_rebuild_steps(2000);
+    let mut warm = WarmTier::new();
+    // 1. Push 90 variable-sized blocks (crosses the 64-block compaction floor).
+    for b in 0..90usize {
+        let count = (b % 5) + 1;
+        let lines: Vec<Line> = (0..count)
+            .map(|j| Line::from(&*format!("B{b}-L{j}")))
+            .collect();
+        warm.push_block(&lines);
+    }
+    assert_matches_rebuilt(&warm);
 
-    let small_expected = small_blocks.saturating_mul(small_blocks.saturating_sub(1)) / 2;
-    let large_expected = large_blocks.saturating_mul(large_blocks.saturating_sub(1)) / 2;
+    // 2. Pop 70 blocks from the front (triggers amortized dead-prefix compaction
+    //    once `cum_start >= 64` and `cum_start > live`).
+    for step in 0..70usize {
+        let popped = warm.pop_front().expect("block present");
+        if step % 17 == 0 {
+            // Interleave push_front restoration and re-pop.
+            warm.push_front(popped);
+            assert_matches_rebuilt(&warm);
+            let _ = warm.pop_front().expect("restored block present");
+        }
+        if step % 10 == 0 || step >= 60 {
+            assert_matches_rebuilt(&warm);
+        }
+    }
 
-    assert_eq!(
-        small_steps, small_expected,
-        "small warm eviction should rebuild cumulative index exactly B*(B-1)/2 times"
-    );
-    assert_eq!(
-        large_steps, large_expected,
-        "large warm eviction should rebuild cumulative index exactly B*(B-1)/2 times"
-    );
-    assert!(
-        large_steps > small_steps,
-        "larger warm tier should perform more rebuild steps"
-    );
+    // 3. Interleave partial and multi-block front truncations with new pushes.
+    warm.truncate_front_lines(2).expect("partial truncate");
+    assert_matches_rebuilt(&warm);
+
+    let extra: Vec<Line> = (0..6).map(|j| Line::from(&*format!("Extra-{j}"))).collect();
+    warm.push_block(&extra);
+    assert_matches_rebuilt(&warm);
+
+    warm.truncate_front_lines(11).expect("multi-block truncate");
+    assert_matches_rebuilt(&warm);
+
+    // 4. Pop after partial front_offset (materializes front_offset first).
+    let popped = warm.pop_front().expect("pop after partial offset");
+    assert_matches_rebuilt(&warm);
+    warm.push_front(popped);
+    assert_matches_rebuilt(&warm);
 }
 
-/// Verify that WarmBlock rejects LZ4 data with a forged oversized size prefix (#3598).
+/// WarmBlock rejects LZ4 data with a forged oversized size prefix.
 #[test]
 fn warm_block_decompress_rejects_oversized_lz4_prefix() {
     // Forge LZ4 data with a size prefix claiming 128MB output
@@ -409,7 +448,7 @@ fn warm_block_decompress_rejects_oversized_lz4_prefix() {
     );
 }
 
-/// Verify that to_cold_compressed rejects forged LZ4 data (#3598).
+/// to_cold_compressed rejects forged LZ4 data.
 #[test]
 fn warm_block_to_cold_rejects_oversized_lz4_prefix() {
     let mut forged = Vec::new();

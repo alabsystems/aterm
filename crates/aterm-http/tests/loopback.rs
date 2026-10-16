@@ -3,8 +3,7 @@
 
 //! END-TO-END evidence over a real loopback socket.
 //!
-//! The endpoint this client was written for is a loopback Ollama, so a stub
-//! server on `127.0.0.1` exercises the truth: these tests assert the exact
+//! A stub server on `127.0.0.1` exercises the truth: these tests assert the exact
 //! BYTES that reach a server and the exact body that comes back, through real
 //! TCP, real timeouts and the real authority guard.
 
@@ -115,8 +114,8 @@ fn a_chunk_size_at_the_top_of_usize_is_an_error_not_a_panic() {
     // size > limit` panicked outright under debug-assertions and WRAPPED in
     // release — where the wrap passed the limit check, resize truncated instead
     // of grew, and read_exact panicked on the slice range. A panic here unwinds
-    // the single named worker thread, which has no catch_unwind, so smart
-    // titles would stay dead for the rest of the process's life.
+    // the calling worker thread, which has no catch_unwind, and it stays dead
+    // for the rest of the process's life.
     let (endpoint, _rx) = stub(
         b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nA\r\nffffffffffffffff\r\n",
     );
@@ -142,8 +141,8 @@ impl Guard for Revocable {
 
 #[test]
 fn authority_revoked_before_the_write_stops_the_body_leaving_the_process() {
-    // The UI thread can revoke while the worker is mid-request. Terminal
-    // context must not reach the socket after that.
+    // Another thread can revoke while the request is in flight. The request
+    // body must not reach the socket after that.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (tx, rx) = mpsc::channel();
@@ -233,8 +232,8 @@ fn capturing_stub() -> (u16, mpsc::Receiver<Vec<u8>>) {
 fn an_https_endpoint_puts_a_client_hello_on_the_wire_and_never_the_body() {
     // The trust model is this crate's headline claim, and the regression that
     // would hurt most is the silent one: `Client::open` stops running the
-    // handshake and the worker's prompt — terminal context, and a bearer token
-    // in the headers — goes out in the clear. This peer speaks no TLS at all,
+    // handshake and the request body, and a bearer token in the headers, go
+    // out in the clear. This peer speaks no TLS at all,
     // so the handshake cannot finish; what is asserted is what reached the
     // socket BEFORE it failed.
     //
@@ -244,9 +243,9 @@ fn an_https_endpoint_puts_a_client_hello_on_the_wire_and_never_the_body() {
     //
     // NOT covered here, deliberately: that a server certificate is actually
     // VERIFIED, and an invalid one refused. That needs a peer holding a real
-    // certificate, which needs a private key — and a key fixture cannot be
-    // tracked (tools/grep_guard.sh B6/B8), while generating one at test time
-    // means either an `openssl s_server` child (LibreSSL here, OpenSSL on CI —
+    // certificate, which needs a private key — and a key fixture would trip
+    // the export's secret scan, while generating one at test time means
+    // either an `openssl s_server` child (LibreSSL here, OpenSSL on CI —
     // different flags, a bound port, and a process to reap) or hand-rolled
     // X.509 DER against a new dev-dependency. In a change whose whole purpose
     // is retiring dependencies, neither is the right trade to make silently.
@@ -486,8 +485,8 @@ fn an_unusable_endpoint_fails_before_any_socket_is_opened() {
             .send(b"{}")
             .expect_err("must reject the endpoint");
         assert!(matches!(error, Error::Invalid(_)), "{bad}: {error:?}");
-        // The refusal must not echo what it refused. This message reaches
-        // stderr through the title-summary worker, and the userinfo shape above
+        // The refusal must not echo what it refused. A caller may print this
+        // message to stderr, and the userinfo shape above
         // is refused precisely because it carries a credential; printing the
         // raw endpoint back would put that password on the terminal.
         for rendered in [error.to_string(), format!("{error:?}")] {

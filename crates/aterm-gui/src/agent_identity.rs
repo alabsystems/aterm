@@ -33,7 +33,8 @@
 //! (`docs/AGENT-EXPERIENCE-2026-08-26.md` §7.3).
 //!
 //! `spawn identity=<name>` is the only create path ([`ensure`] with
-//! `create = true`, Owner-only). The spawn seam and a cold restore pass
+//! `create = true`, Owner-only, on the verb's control thread). The event loop's
+//! half of that spawn ([`check_for_spawn`]), the spawn seam and a cold restore pass
 //! `create = false`: a missing identity falls back to a default shell with one
 //! stderr line ([`restorable`]). A downgrade to a build without the field keeps
 //! the shell's env and drops the label (`sessions` says `identity=-`).
@@ -135,6 +136,111 @@ pub(crate) fn ensure_in(root: &Path, name: &str, create: bool) -> io::Result<Pat
         aterm_log::warn!("identity {name}: primer: {agent}: {err}");
     }
     Ok(dir)
+}
+
+/// The event loop's half of a spawn under `name`: the identity must exist
+/// (`create = false`), and its required directories must be private before a
+/// child receives them. `spawn identity=<name>` created and primed it on the
+/// control thread before the spawn was posted, and an INHERITED one (an aimed
+/// spawn's default) exists by construction. The private-dir gate uses a fresh
+/// metadata fast path when no hardening is needed. An inherited identity is
+/// also re-primed, off this thread ([`reprime_detached`]), so its files stay as
+/// current as a named one's without deferring admission to the primer's writes.
+pub(crate) fn check_for_spawn(name: &str, inherited: bool) -> io::Result<PathBuf> {
+    let root = aterm_types::dirs::identities_dir().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "no state root resolves (HOME is unset)",
+        )
+    })?;
+    check_for_spawn_in(&root, name, inherited, reprime_detached)
+}
+
+/// The spawn admission with its state root and background-primer handoff
+/// injected. Tests observe the handoff without racing a detached writer.
+fn check_for_spawn_in(
+    root: &Path,
+    name: &str,
+    inherited: bool,
+    reprime: impl FnOnce(&Path),
+) -> io::Result<PathBuf> {
+    let dir = ensure_in(root, name, false)?;
+    // Directory safety is an admission condition, not a best-effort primer
+    // outcome. Reuse the control dir's fresh-stat fast path and hardening gate:
+    // valid private directories incur no writes, while damage must be repaired
+    // or refused before the background handoff and the child's spawn.
+    crate::control_auth::ensure_private_dir(root)?;
+    crate::control_auth::ensure_private_dir(&dir)?;
+    for row in aterm_primer::agent_homes() {
+        crate::control_auth::ensure_private_dir(&dir.join(row.sub))?;
+    }
+    if inherited {
+        reprime(&dir);
+    }
+    Ok(dir)
+}
+
+/// How often one process re-primes the same inherited identity, at most: a
+/// fleet's burst of aimed spawns costs one pass, and the primer's text is this
+/// build's, so a later pass only repairs a file edited or removed since. The
+/// human home's throttle (`spawn::AGENT_PRIME_INTERVAL`) has the same width.
+const REPRIME_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// When each identity was last re-primed in this process, by name.
+static REPRIMED: std::sync::Mutex<std::collections::BTreeMap<String, std::time::Instant>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Whether `name` is due a re-prime at `now`, recording it when it is: never
+/// re-primed, or not for [`REPRIME_INTERVAL`]. A clock that stepped back is
+/// not due.
+fn reprime_due(
+    last: &mut std::collections::BTreeMap<String, std::time::Instant>,
+    name: &str,
+    now: std::time::Instant,
+) -> bool {
+    let due = last
+        .get(name)
+        .is_none_or(|at| now.saturating_duration_since(*at) >= REPRIME_INTERVAL);
+    if due {
+        last.insert(name.to_string(), now);
+    }
+    due
+}
+
+/// Provision and prime the existing identity at `dir` again (`ensure_in` with
+/// `create`: the agent subdirs and the primer's files) on a detached
+/// `aterm-agent-prime` thread, throttled per name. An inherited spawn ran this
+/// on the event loop every time until 2026-10-15. The root is taken from `dir`,
+/// resolved by the caller, so the pass writes where the check looked. It never
+/// creates an identity: the thread first checks that `dir` is still one, so an
+/// `identities forget` that won the race stays forgotten, as far as that check
+/// can see (the verb's own in-use check and removal are two steps the same way).
+fn reprime_detached(dir: &Path) {
+    let (Some(root), Some(name)) = (dir.parent(), dir.file_name().and_then(|n| n.to_str())) else {
+        return;
+    };
+    {
+        let mut last = REPRIMED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !reprime_due(&mut last, name, std::time::Instant::now()) {
+            return;
+        }
+    }
+    let (root, name) = (root.to_path_buf(), name.to_string());
+    let spawned = std::thread::Builder::new()
+        .name("aterm-agent-prime".to_string())
+        .spawn(move || {
+            if identity_dir(&root, &name).is_none() {
+                return;
+            }
+            if let Err(e) = ensure_in(&root, &name, true) {
+                aterm_log::warn!("identity {name}: re-prime: {e}");
+            }
+        });
+    if let Err(e) = spawned {
+        aterm_log::warn!("identity primer: could not start the re-prime thread: {e}");
+    }
 }
 
 /// The env additions for a session under the identity at `dir`: one pair per
@@ -404,6 +510,132 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// The inherited re-prime's throttle is per name: the first spawn under a
+    /// name is due, a burst under it is not until the interval has passed (the
+    /// edge inclusive), another name is due on its own, and a clock that stepped
+    /// back is not due.
+    #[test]
+    fn an_inherited_identity_is_re_primed_once_per_interval_per_name() {
+        let mut last = std::collections::BTreeMap::new();
+        let t0 = std::time::Instant::now();
+        let ms = std::time::Duration::from_millis;
+        assert!(reprime_due(&mut last, "worker", t0), "never re-primed");
+        assert!(!reprime_due(&mut last, "worker", t0 + ms(5)), "a burst");
+        assert!(reprime_due(&mut last, "reviewer", t0 + ms(5)), "per name");
+        assert!(!reprime_due(
+            &mut last,
+            "worker",
+            t0 + REPRIME_INTERVAL - ms(1)
+        ));
+        assert!(reprime_due(&mut last, "worker", t0 + REPRIME_INTERVAL));
+        assert!(
+            !reprime_due(&mut last, "worker", t0),
+            "a clock that stepped back is not due, never a panic"
+        );
+    }
+
+    /// Admission must finish the directory gate before it hands off a primer
+    /// or returns a path a child will receive. The primer is deliberately an
+    /// inert observation here: scheduling a writer is not evidence that its
+    /// hardening happened before the child was admitted.
+    #[cfg(unix)]
+    #[test]
+    fn an_inherited_spawn_hardens_its_identity_directories_before_admission() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let scratch = aterm_tempfile::tempdir().expect("scratch");
+        let root = scratch.path().join("identities");
+        let dir = root.join("worker");
+        let dirs: Vec<PathBuf> = std::iter::once(root.clone())
+            .chain(std::iter::once(dir.clone()))
+            .chain(aterm_primer::agent_homes().map(|row| dir.join(row.sub)))
+            .collect();
+        for path in &dirs {
+            aterm_types::fs_restricted::ensure_private_dir(path).expect("private fixture");
+        }
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        let stamp = |p: &Path| {
+            let m = std::fs::metadata(p).unwrap();
+            (m.ctime(), m.ctime_nsec(), m.mode())
+        };
+        let before: Vec<_> = dirs.iter().map(|p| stamp(p)).collect();
+        let mut handed_off = 0;
+        assert_eq!(
+            check_for_spawn_in(&root, "worker", true, |got| {
+                assert_eq!(got, dir.as_path());
+                handed_off += 1;
+            })
+            .expect("valid identity"),
+            dir
+        );
+        assert_eq!(handed_off, 1);
+        assert_eq!(
+            dirs.iter().map(|p| stamp(p)).collect::<Vec<_>>(),
+            before,
+            "valid private directories need no writes"
+        );
+        for drifted in &dirs {
+            std::fs::set_permissions(drifted, std::fs::Permissions::from_mode(0o777))
+                .expect("mode drift");
+            let mut handed_off = false;
+            assert_eq!(
+                check_for_spawn_in(&root, "worker", true, |got| {
+                    assert_eq!(got, dir.as_path());
+                    for path in &dirs {
+                        assert_eq!(mode(path), 0o700, "{} before handoff", path.display());
+                    }
+                    handed_off = true;
+                })
+                .expect("our drifted directory can be hardened"),
+                dir
+            );
+            assert!(handed_off);
+            for path in &dirs {
+                assert_eq!(mode(path), 0o700, "{} before return", path.display());
+            }
+        }
+    }
+
+    /// An unreadable/damaged agent home cannot be deferred to a logging-only
+    /// background failure. A regular file gives the same deterministic refusal
+    /// without changing owners or depending on the executing user's privileges.
+    #[cfg(unix)]
+    #[test]
+    fn an_inherited_spawn_refuses_damaged_agent_directories_before_admission() {
+        for row in aterm_primer::agent_homes() {
+            let scratch = aterm_tempfile::tempdir().expect("scratch");
+            let root = scratch.path().join("identities");
+            let dir = root.join("worker");
+            for agent in aterm_primer::agent_homes() {
+                aterm_types::fs_restricted::ensure_private_dir(&dir.join(agent.sub))
+                    .expect("private fixture");
+            }
+            let broken = dir.join(row.sub);
+            std::fs::remove_dir(&broken).expect("empty agent home");
+            std::fs::write(&broken, b"not a directory").expect("damaged agent home");
+            let mut handed_off = false;
+            let result = check_for_spawn_in(&root, "worker", true, |_| handed_off = true);
+            assert!(
+                result.is_err(),
+                "{} must refuse admission",
+                broken.display()
+            );
+            assert!(!handed_off, "a refusal must not hand off a primer");
+            assert_eq!(std::fs::read(&broken).unwrap(), b"not a directory");
+        }
+    }
+
+    #[test]
+    fn spawn_admission_never_creates_a_missing_identity() {
+        let scratch = aterm_tempfile::tempdir().expect("scratch");
+        let root = scratch.path().join("identities");
+        let mut handed_off = false;
+        let result = check_for_spawn_in(&root, "missing", true, |_| handed_off = true);
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::NotFound);
+        assert!(!handed_off);
+        assert!(!root.exists(), "admission creates no identity tree");
     }
 
     #[test]

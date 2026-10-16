@@ -24,6 +24,38 @@ fn apply_negotiated_mode(live: &mut bool, seed: &mut bool, configured: bool) -> 
     moved
 }
 
+/// The live colours `apply_config` judges a change on, before and after: the
+/// cursor ([`ConfigChange::CursorColor`]) and the rest
+/// ([`ConfigChange::Colors`]).
+///
+/// [`ConfigChange::CursorColor`]: crate::config::ConfigChange::CursorColor
+/// [`ConfigChange::Colors`]: crate::config::ConfigChange::Colors
+struct LiveColors {
+    cursor: Option<aterm_types::Rgb>,
+    rest: (
+        aterm_types::Rgb,
+        aterm_types::Rgb,
+        Option<aterm_types::Rgb>,
+        Option<aterm_types::Rgb>,
+        aterm_types::ColorPalette,
+    ),
+}
+
+impl LiveColors {
+    fn of(c: &super::grouped_state::ColorState) -> Self {
+        Self {
+            cursor: c.cursor_color,
+            rest: (
+                c.default_foreground,
+                c.default_background,
+                c.selection_background,
+                c.selection_foreground,
+                c.palette().clone(),
+            ),
+        }
+    }
+}
+
 impl Terminal {
     // =========================================================================
     // Configuration Hot-Reload API
@@ -105,15 +137,36 @@ impl Terminal {
             changes.push(ConfigChange::CursorBlink);
         }
 
-        // Cursor color. Always retain the host baseline so OSC 112/RIS restore
-        // the configured theme cursor instead of silently falling back to fg.
-        if self.color.cursor_color != config.cursor_color {
-            self.color.cursor_color = config.cursor_color;
+        // Colours: the theme is the BASELINE, and a program's colours ride over
+        // it. Take the program's diff from the old baseline (OSC 4/10/11/12/17/
+        // 19/21 sets — what `capture_color_repr` carries across a handoff),
+        // move every baseline and set live = baseline, then replay the diff.
+        // So OSC 104/110-119 and RIS reset to the new theme, slots the program
+        // never touched follow it, and a reload (any key, a theme-folder edit,
+        // an OS appearance flip) no longer wipes a base16 palette or an editor's
+        // OSC 11 background. The kitty stack holds diffs too, so it needs no
+        // rebase. Change and damage are judged on the live colours.
+        let before = LiveColors::of(&self.color);
+        let overrides = self.color.capture_overrides();
+        self.color.configured_cursor = config.cursor_color;
+        self.color.configured_foreground = config.default_foreground;
+        self.color.configured_background = config.default_background;
+        self.color.configured_selection_background = config.selection_background;
+        self.color.configured_selection_foreground = config.selection_foreground;
+        self.color
+            .configured_palette
+            .clone_from(&config.custom_palette);
+        self.color.restore_baseline(true);
+        self.apply_color_overrides(&overrides);
+        self.color.frame_cursor_authoritative = true;
+        self.color.frame_foreground_authoritative = true;
+        self.color.frame_background_authoritative = true;
+        let after = LiveColors::of(&self.color);
+
+        if before.cursor != after.cursor {
             changes.push(ConfigChange::CursorColor);
             visual_repaint = true;
         }
-        self.color.configured_cursor = config.cursor_color;
-        self.color.frame_cursor_authoritative = true;
 
         // Cursor visibility
         if self.modes.cursor_visible != config.cursor_visible {
@@ -121,63 +174,7 @@ impl Terminal {
             changes.push(ConfigChange::CursorVisible);
         }
 
-        // Default foreground
-        let fg_changed = self.color.default_foreground != config.default_foreground;
-        if fg_changed {
-            self.color.default_foreground = config.default_foreground;
-        }
-        // Always update configured defaults so OSC 110/111 reset to theme
-        // colors, not hardcoded constants.
-        self.color.configured_foreground = config.default_foreground;
-        self.color.frame_foreground_authoritative = true;
-
-        // Default background
-        let bg_changed = self.color.default_background != config.default_background;
-        if bg_changed {
-            self.color.default_background = config.default_background;
-        }
-        // Always update configured defaults so OSC 110/111 reset to theme
-        // colors, not hardcoded constants.
-        self.color.configured_background = config.default_background;
-        self.color.frame_background_authoritative = true;
-
-        // Selection background
-        let sel_bg_changed = self.color.selection_background != config.selection_background;
-        if sel_bg_changed {
-            self.color.selection_background = config.selection_background;
-        }
-        // OSC 117/RIS reset selection highlighting to the host theme, not an
-        // unrelated hardcoded/default-background color.
-        self.color.configured_selection_background = config.selection_background;
-        let sel_fg_changed = self.color.selection_foreground != config.selection_foreground;
-        if sel_fg_changed {
-            self.color.selection_foreground = config.selection_foreground;
-        }
-        self.color.configured_selection_foreground = config.selection_foreground;
-
-        // Custom palette. Always update configured_palette so OSC 104 resets
-        // to the theme's colors, not xterm defaults.
-        self.color
-            .configured_palette
-            .clone_from(&config.custom_palette);
-
-        let palette_changed = if let Some(ref palette) = config.custom_palette {
-            if self.color.palette == *palette {
-                false
-            } else {
-                self.color.palette = palette.clone();
-                true
-            }
-        } else if self.color.palette.overrides_count() > 0 {
-            // config.custom_palette is None — reset any active overrides
-            // back to built-in defaults so the palette can be reverted.
-            self.color.palette.reset();
-            true
-        } else {
-            false
-        };
-
-        if fg_changed || bg_changed || sel_bg_changed || sel_fg_changed || palette_changed {
+        if before.rest != after.rest {
             changes.push(ConfigChange::Colors);
             visual_repaint = true;
         }

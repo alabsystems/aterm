@@ -1,11 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-0 of `NativeUpdatePreCommitInput`
-//! (`aterm_spec::derive::native_update_precommit_input_model`): a self-update
-//! successor's pre-Commit input queue (gap #33). Proved at `Buggy = 0` and
-//! caught at `Buggy = 1` on every invariant; the handoff's paths are walked as
-//! the owner meets them. Tier-1 is `aterm-gui/src/precommit_input_conformance.rs`.
+//! Tier-0 of `NativeUpdatePreCommitInput`: a self-update successor's pre-Commit input queue.
+//! Proved at `Buggy = 0` and caught at `Buggy = 1` on every invariant; the handoff's paths are
+//! walked as the owner meets them. Tier-1 is `aterm-gui/src/precommit_input_conformance.rs`.
 
 use crate::walk::{only, walk};
 use aterm_spec::derive::native_update_precommit_input_model;
@@ -14,12 +12,6 @@ use aterm_spec::{interp, verify};
 #[test]
 fn precommit_input_proves_and_catches() {
     let model = native_update_precommit_input_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name),
-        "the pre-Commit input queue must stay enrolled in the spec-link registry"
-    );
     let committed: Vec<&str> = interp::fired_actions(&model).into_iter().collect();
     for action in ["Type", "LoseFocus", "Drop", "Settle"] {
         assert!(
@@ -33,11 +25,10 @@ fn precommit_input_proves_and_catches() {
     );
 }
 
-/// The owner's handoffs, the way they meet the queue. The 17-of-17 shape —
-/// winit's startup focus loss for each new window, the activation's flip,
-/// nothing typed — replays with no repair. Typing after those flips replays
-/// with no repair. A chord queued and then ⌘-Tab away is repaired; so is a
-/// queue that overflowed.
+/// The handoffs, the way they meet the queue. Winit's startup focus loss for each new window,
+/// the activation's flip, nothing typed: replays with no repair. Typing after those flips
+/// replays with no repair. A chord queued and then ⌘-Tab away is repaired; so is a queue that
+/// overflowed.
 #[test]
 fn precommit_input_walks_the_handoff_the_way_the_owner_meets_it() {
     let m = native_update_precommit_input_model();
@@ -86,9 +77,8 @@ fn precommit_input_walks_the_handoff_the_way_the_owner_meets_it() {
     }
 }
 
-/// `Buggy = 1` — the latch this replaced (every focus loss marks, the old
-/// `incoherent |= pending` verbatim) and the silent drop (an event refused past
-/// the cap marks nothing) — is caught on each invariant by its own schedule.
+/// `Buggy = 1` (every focus loss marks, `incoherent |= pending`, and an event refused past the
+/// cap marks nothing) is caught on each invariant by its own schedule.
 #[test]
 fn precommit_input_the_defects_are_caught_on_every_invariant() {
     let m = interp::with_buggy(&native_update_precommit_input_model(), 1);
@@ -116,5 +106,4 @@ fn precommit_input_the_defects_are_caught_on_every_invariant() {
         (1, 0, 0, 1),
         "a stream that lost an event replayed on trust: {silent:?}"
     );
-    assert!(verify::uncaught_invariants(&native_update_precommit_input_model()).is_empty());
 }

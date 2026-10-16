@@ -40,29 +40,20 @@ fn run_script(cfg: &GlowConfig, g: Geom) -> u64 {
     acc
 }
 
-/// Built-in styles are byte-identical with `pack: None`: the whole-frame
-/// fingerprint fold over a fixed script is deterministic and equals a committed
-/// golden. Since `emit_custom` emits different quads, matching the golden shows
-/// no built-in entered the custom interpreter. (The positive "custom path runs"
-/// check lives in the pack tests via `CUSTOM_EMIT_CALLS`, kept off this
-/// assertion because that global counter races under the parallel runner.)
+/// Built-in styles are byte-identical with `pack: None`: the whole-frame fingerprint fold over a
+/// fixed script is deterministic and equals a committed golden, so no built-in entered the custom
+/// interpreter. The positive `CUSTOM_EMIT_CALLS` check lives in
+/// `trail_pack_ticks_capped_gridclamped_and_settles_to_idle_zero`, off this assertion, because
+/// that global counter races under the parallel runner.
 #[test]
 fn builtins_are_byte_identical_and_never_touch_the_custom_path() {
     let g = geom();
-    // Golden whole-frame folds for Lumen/Phaser/rainbow kitty/Sparkle/Fire/Laser/
-    // Beam/Water/Comet/Classic, captured from this script.
+    // Golden whole-frame folds, one per style below, captured from this script. A deliberate
+    // visual change to one style must move only its own index; recapture only the intended
+    // indices after checking no other drifted.
     //
-    // A deliberate visual change to one style must move exactly the index (or
-    // indices) whose style it meant to change. If a change to style A shifts
-    // style B's fold, that is the bug this pin catches; recapture only the
-    // intended indices after checking no other drifted. `git log -L` on this
-    // table records each recapture and its controls.
-    //
-    // Rainbow Kitty alone gets no candidate, so its scripted relocation is
-    // program output and stays dark. Its star arms ride the momentum spine,
-    // which this script leaves at zero (no `note_typed`). Every positive arm
-    // gets an explicit synthetic candidate; none relies on a classifier
-    // timestamp or cursor geometry as causal provenance.
+    // Rainbow Kitty alone gets no candidate, so its scripted relocation is program output and
+    // stays dark (its star arms ride the momentum spine, which no `note_typed` charges here).
     const GOLDEN: [u64; 10] = [
         10_825_902_740_968_678_692,
         7_284_969_456_844_567_239,
@@ -73,7 +64,6 @@ fn builtins_are_byte_identical_and_never_touch_the_custom_path() {
         11_179_281_213_543_892_930,
         18_232_718_546_775_126_099,
         8_446_969_558_599_158_774,
-        // Classic: captured from this script against the classic engine.
         16_670_463_046_324_493_866,
     ];
     let styles = [
@@ -86,9 +76,7 @@ fn builtins_are_byte_identical_and_never_touch_the_custom_path() {
         GlowStyle::Beam,
         GlowStyle::Water,
         GlowStyle::Comet,
-        // The classic wake, pinned like the rest: it exists to reproduce a
-        // fixed look exactly, so silent drift would destroy its one property.
-        // Appended at index 9 so no other index moved.
+        // The classic wake exists to reproduce a fixed look exactly, so it is pinned too.
         GlowStyle::Classic,
     ];
     let mut actual = [0u64; 10];
@@ -241,8 +229,8 @@ fn each_wired_pack_param_changes_the_custom_fold() {
     // post-jump crown/ring windows (the +1400 ms frame sits 700 ms after the
     // jump).
     let fold = |src: &str| run_script(&pack_cfg(compile_pack(src)), g);
-    // A short type-then-HOLD script: a static frame 420ms after a single typed
-    // key, so the crown's TYPING window is the deciding factor.
+    // A type-then-hold script: a static frame 420 ms after a single typed key, so the crown's
+    // typing window decides.
     let fold_hold = |src: &str| -> u64 {
         let c = pack_cfg(compile_pack(src));
         let mut glow = CursorGlow::default();
@@ -294,8 +282,8 @@ glow_add = true
 halo = "add"
 bed = false
 "#;
-    // Chaining ON with a TINY base life so the chain floor dominates —
-    // isolating chain_keys/chain_gap_max/chain_life_max.
+    // Chaining on with a tiny base life so the chain floor dominates, isolating
+    // chain_keys/chain_gap_max/chain_life_max.
     const CHAIN_BASE: &str = r#"
 pack = 1
 id = "probe"
@@ -315,7 +303,7 @@ halo = "add"
     let heat_base = fold(HEAT_BASE);
     let chain_base = fold(CHAIN_BASE);
 
-    // (label, base, from→to, comparator). Each swap must move ITS fold.
+    // (label, from, to): each swap must move its fold.
     let heat_cases = [
         ("heat.gain", "gain = 0.10", "gain = 0.95"),
         ("heat.tau", "tau = 0.90", "tau = 0.10"),
@@ -421,7 +409,7 @@ fn theme_arm_changes_the_light_theme_custom_fold() {
         "darken_tints differs from auto on a light theme"
     );
 
-    // The arm must NOT change the dark-theme render (additive beam either way).
+    // The arm does not change the dark-theme render (additive beam either way).
     let dfold = |src: &str| run_script(&pack_cfg(compile_pack(src)), g);
     assert_eq!(
         dfold(&with("auto")),

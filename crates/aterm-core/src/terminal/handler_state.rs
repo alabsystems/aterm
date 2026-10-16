@@ -2,15 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Terminal state transition methods for `TerminalHandler`: parsed operations
-//! applied to the grid and mode state, using `grid`, `bidi`, `config` and
-//! `vt_level` but never platform services, callbacks or I/O.
-//!
-//! Layers:
-//!
-//! - Parser actions (`handler_actions.rs`): `ActionSink` dispatch from parser events
-//! - State transitions (this file): grid/mode mutations from typed operations
-//! - Side effects: callbacks and external services (inline in handler files)
+//! State transitions for `TerminalHandler`: parsed operations applied to the
+//! grid and mode state, never platform services, callbacks or I/O. Parser
+//! dispatch is in `handler_actions.rs`.
 
 use super::handler::CursorStateHandler;
 use super::types::CurrentStyle;
@@ -19,9 +13,8 @@ use crate::vt_level::VtLevel;
 use aterm_types::CharacterSetState;
 
 impl CursorStateHandler<'_> {
-    /// Save cursor state (DECSC).
-    ///
-    /// Saves cursor position, style, origin mode, auto-wrap mode, and charset state.
+    /// Save cursor state (DECSC) for the current screen: position, pending
+    /// wrap, SGR and underline colour, origin mode, auto-wrap and charsets.
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
         aterm_spec::spec_unmodeled(
@@ -64,21 +57,17 @@ impl CursorStateHandler<'_> {
             &mut self.cursor_save.main
         };
         if let Some(state) = *saved_cursor {
-            // Restore modes first so origin mode is known for clamping. DECAWM is
-            // not restored (xterm's CursorRestoreFlags applies only
-            // ATTRIBUTES|ORIGIN|PROTECTED, cursor.c). The VT510 "wrap flag" DECSC
-            // saves is the pending-wrap state, restored below.
+            // Modes first, so origin mode is known for clamping. DECAWM is not
+            // restored (xterm's CursorRestoreFlags is ATTRIBUTES|ORIGIN|PROTECTED);
+            // the VT510 "wrap flag" DECSC saves is the pending wrap, restored below.
             self.modes.origin_mode = state.origin_mode;
             *self.style = state.style;
             *self.charset = state.charset;
             *self.underline_color = state.underline_color;
-            // Refresh the cached extras flag — the restored underline_color
-            // may differ from the pre-restore value.
             *self.has_transient_extras = self.has_hyperlink || self.underline_color.is_some();
 
-            // Clamp cursor position to scroll region if origin mode is enabled.
-            // Per VT510: when DECOM is active, cursor is clamped to the scroll
-            // region vertically and to horizontal margins when DECLRMM is active.
+            // Under DECOM, clamp to the scroll region, and to the horizontal
+            // margins under DECLRMM (VT510).
             let (row, col) = if state.origin_mode {
                 let region = self.grid.scroll_region();
                 let clamped_row = state.cursor.row.clamp(region.top, region.bottom);
@@ -107,25 +96,22 @@ impl CursorStateHandler<'_> {
                 self.style.bce_bg_rgb(),
             );
         } else {
-            // With nothing saved, DECRC homes the cursor, resets origin mode and
-            // clears character attributes (DEC STD 070). DECAWM is unchanged:
-            // wraparound is not part of the DECSC/DECRC state in xterm.
+            // Nothing saved: home, origin mode off, attributes cleared (DEC STD
+            // 070).
             self.modes.origin_mode = false;
             *self.style = CurrentStyle::default();
             *self.charset = CharacterSetState::default();
             *self.underline_color = None;
             *self.has_transient_extras = self.has_hyperlink;
             self.grid.set_cursor(0, 0);
-            // Reset BCE cursor template to default.
             self.grid
                 .set_cursor_template(crate::grid::Cell::EMPTY, None);
         }
     }
 
-    /// Handle cursor movement CSI sequences.
-    ///
-    /// CUU (A), CUD (B), VPR (e), CNL (E), CPL (F): Per VT510, these respect scroll region margins.
-    /// The cursor stops at the margin if within the scroll region, otherwise at screen edge.
+    /// Handle cursor movement CSI sequences. CUU, CUD, CNL and CPL stop at the
+    /// scroll-region margin when the cursor is inside the region, else at the
+    /// screen edge (VT510); VPR always clamps to the screen edge.
     #[inline]
     pub(super) fn handle_cursor_movement(&mut self, params: &[u16], final_byte: u8) {
         let n = params.first().copied().unwrap_or(1).max(1);
@@ -163,9 +149,8 @@ impl CursorStateHandler<'_> {
                 self.grid.set_cursor(self.grid.cursor_row(), col);
             }
             b'`' => {
-                // Horizontal Position Absolute (HPA).
-                // Per VT510: When DECOM is set and DECLRMM is active,
-                // the column is relative to the left margin.
+                // HPA: relative to the left margin when DECOM and DECLRMM are both
+                // set (VT510).
                 let col = params.first().copied().unwrap_or(1).saturating_sub(1);
                 let actual_col = if self.modes.origin_mode && self.modes.left_right_margin_mode {
                     let margins = self.grid.horizontal_margins();
@@ -176,20 +161,18 @@ impl CursorStateHandler<'_> {
                 self.grid.set_cursor(self.grid.cursor_row(), actual_col);
             }
             b'd' => {
-                // Line Position Absolute (VPA)
-                // Per VT510: Affected by origin mode (DECOM)
+                // VPA: relative to the scroll region under DECOM (VT510).
                 let row = params.first().copied().unwrap_or(1).saturating_sub(1);
                 let actual_row = if self.modes.origin_mode {
                     let region = self.grid.scroll_region();
-                    // Clamp row to scroll region bounds (saturating to prevent u16 overflow)
                     region.top.saturating_add(row).min(region.bottom)
                 } else {
                     row
                 };
                 self.grid.set_cursor(actual_row, self.grid.cursor_col());
             }
-            // Note: b'H' | b'f' (CUP) is handled inline in handler_csi.rs
-            // csi_dispatch_no_intermediates for performance. Not dispatched here.
+            // CUP (H/f) is handled inline in handler_actions.rs
+            // (`csi_dispatch_no_intermediates`).
             _ => {}
         }
     }
@@ -200,7 +183,6 @@ impl CursorStateHandler<'_> {
     pub(super) fn handle_erase(&mut self, params: &[u16], final_byte: u8) {
         let mode = params.first().copied().unwrap_or(0);
 
-        // Set BCE template so erased cells inherit the current SGR background.
         self.grid.set_cursor_template(
             crate::grid::Cell::bce_blank(self.style.cached_colors()),
             self.style.bce_bg_rgb(),
@@ -238,7 +220,6 @@ impl CursorStateHandler<'_> {
     pub(super) fn handle_scroll(&mut self, params: &[u16], final_byte: u8) {
         let n = params.first().copied().unwrap_or(1).max(1) as usize;
 
-        // Set BCE template so blank lines inherit the current SGR background.
         self.grid.set_cursor_template(
             crate::grid::Cell::bce_blank(self.style.cached_colors()),
             self.style.bce_bg_rgb(),
@@ -267,14 +248,13 @@ impl CursorStateHandler<'_> {
         }
     }
 
-    /// Handle insert/delete operations. ICH/DCH respect horizontal margins when
-    /// DECLRMM is active. Updates the BCE cursor template first.
+    /// Handle ICH (`@`), DCH (`P`), IL (`L`) and DL (`M`), each held to the
+    /// horizontal margins under DECLRMM. Updates the BCE cursor template first.
     #[inline]
     pub(super) fn handle_insert_delete(&mut self, params: &[u16], final_byte: u8) {
         let n = params.first().copied().unwrap_or(1).max(1);
         let lrmm = self.modes.left_right_margin_mode;
 
-        // Set BCE template so blank cells inherit the current SGR background.
         self.grid.set_cursor_template(
             crate::grid::Cell::bce_blank(self.style.cached_colors()),
             self.style.bce_bg_rgb(),
@@ -282,19 +262,15 @@ impl CursorStateHandler<'_> {
 
         match final_byte {
             b'@' => {
-                // Insert characters (ICH) — margin-aware
                 self.grid.insert_chars_margin(n, lrmm);
             }
             b'P' => {
-                // Delete characters (DCH) — margin-aware
                 self.grid.delete_chars_margin(n, lrmm);
             }
             b'L' => {
-                // Insert lines (IL) — margin-aware
                 self.grid.insert_lines_margined(n as usize, lrmm);
             }
             b'M' => {
-                // Delete lines (DL) — margin-aware
                 self.grid.delete_lines_margined(n as usize, lrmm);
             }
             _ => {}
@@ -308,7 +284,6 @@ impl CursorStateHandler<'_> {
     pub(super) fn handle_decic(&mut self, params: &[u16]) {
         let n = params.first().copied().unwrap_or(1).max(1);
 
-        // Set BCE template so blank cells inherit the current SGR background.
         self.grid.set_cursor_template(
             crate::grid::Cell::bce_blank(self.style.cached_colors()),
             self.style.bce_bg_rgb(),
@@ -324,7 +299,6 @@ impl CursorStateHandler<'_> {
     pub(super) fn handle_decdc(&mut self, params: &[u16]) {
         let n = params.first().copied().unwrap_or(1).max(1);
 
-        // Set BCE template so blank cells inherit the current SGR background.
         self.grid.set_cursor_template(
             crate::grid::Cell::bce_blank(self.style.cached_colors()),
             self.style.bce_bg_rgb(),
@@ -355,11 +329,8 @@ impl CursorStateHandler<'_> {
         self.grid.scroll_right(n);
     }
 
-    /// Handle DECSCA (Select Character Protection Attribute).
-    ///
-    /// CSI Ps " q
-    /// - Ps = 0 or 2: Characters can be erased by DECSED/DECSEL (default)
-    /// - Ps = 1: Characters cannot be erased by DECSED/DECSEL (protected)
+    /// Handle DECSCA (`CSI Ps " q`): Ps 1 protects the characters written next
+    /// from DECSED/DECSEL; any other value (default 0) does not.
     pub(super) fn handle_decsca(&mut self, params: &[u16]) {
         let mode = params.first().copied().unwrap_or(0);
         self.style.protected = mode == 1;
@@ -389,12 +360,8 @@ impl CursorStateHandler<'_> {
         // says the same (DECSCL_C1_TRANSMISSION_7BIT in handler_decrqss.rs).
     }
 
-    /// Handle DECSED (Selective Erase in Display).
-    ///
-    /// CSI ? Ps J
-    /// - Ps = 0: Erase from cursor to end of screen (only unprotected cells)
-    /// - Ps = 1: Erase from start of screen to cursor (only unprotected cells)
-    /// - Ps = 2: Erase entire screen (only unprotected cells)
+    /// Handle DECSED (`CSI ? Ps J`): ED over unprotected cells only (Ps 0 to the
+    /// end of the screen, 1 from its start, 2 all of it).
     pub(super) fn handle_selective_erase_display(&mut self, params: &[u16]) {
         let mode = params.first().copied().unwrap_or(0);
         match mode {
@@ -405,12 +372,8 @@ impl CursorStateHandler<'_> {
         }
     }
 
-    /// Handle DECSEL (Selective Erase in Line).
-    ///
-    /// CSI ? Ps K
-    /// - Ps = 0: Erase from cursor to end of line (only unprotected cells)
-    /// - Ps = 1: Erase from start of line to cursor (only unprotected cells)
-    /// - Ps = 2: Erase entire line (only unprotected cells)
+    /// Handle DECSEL (`CSI ? Ps K`): EL over unprotected cells only (Ps 0 to the
+    /// end of the line, 1 from its start, 2 all of it).
     pub(super) fn handle_selective_erase_line(&mut self, params: &[u16]) {
         let mode = params.first().copied().unwrap_or(0);
         match mode {
@@ -421,9 +384,7 @@ impl CursorStateHandler<'_> {
         }
     }
 
-    /// Handle DECSCUSR (Set Cursor Style).
-    ///
-    /// CSI Ps SP q
+    /// Handle DECSCUSR (`CSI Ps SP q`).
     // The parameter decides which: a shape other than the host's is
     // `SetCursorStyle`, the host's own shape `RestoreCursorStyle`.
     #[cfg_attr(
@@ -451,27 +412,18 @@ impl CursorStateHandler<'_> {
             // moves DEC mode 12 with it and `CSI ? 12 $ p` stays accurate.
             self.modes.cursor_blink = style.blinks();
             if changed {
-                // A shape change repaints only the cursor cell: mark that cell's
-                // damage so `damage_epoch` advances and the change is presented
-                // (steady<->blinking transitions are also covered by the blink
-                // timer; this covers e.g. steady block -> steady bar).
+                // A shape change repaints only the cursor cell: mark it so
+                // `damage_epoch` advances (the blink timer misses e.g. steady
+                // block -> steady bar).
                 self.grid.mark_cursor_damage();
             }
         }
     }
 
-    /// Handle SCP - Set Character Path (BiDi direction control).
-    ///
-    /// CSI Ps SP k
-    ///
-    /// Terminal WG BiDi escape sequence for setting paragraph direction.
-    /// See: <https://terminal-wg.pages.freedesktop.org/bidi/recommendation/escape-sequences.html>
-    ///
-    /// Parameters:
-    /// - 0: the terminal's default character direction (`Auto`: LTR; first-strong
-    ///   detection applies only while DECSET 2501 is set)
-    /// - 1: Set LTR (left-to-right) character direction
-    /// - 2: Set RTL (right-to-left) character direction
+    /// Handle SCP (`CSI Ps SP k`), the Terminal WG BiDi paragraph direction
+    /// (<https://terminal-wg.pages.freedesktop.org/bidi/recommendation/escape-sequences.html>):
+    /// 0 the default (`Auto`: LTR, with first-strong detection only while DECSET
+    /// 2501 is set), 1 LTR, 2 RTL.
     pub(super) fn handle_scp(&mut self, params: &[u16]) {
         use aterm_types::ParagraphDirection;
 
@@ -492,13 +444,11 @@ impl CursorStateHandler<'_> {
     }
 }
 
-/// Terminal-level goldens for the deferred wrap at an erase, fed as real bytes
-/// through the CSI / VT52 / DECSET dispatch to the grid rule
-/// (`aterm-grid` `grid/erase.rs`). Expected screens are xterm's: `ClearRight`,
-/// `ClearInLine2` and `ClearScreen` (util.c) call `ResetWrap`, so the glyph
-/// after the erase overwrites the parked last column instead of wrapping.
-/// Several are Ghostty's goldens (`Terminal.zig` "eraseLine resets pending
-/// wrap", "eraseLine left resets wrap").
+/// The deferred wrap at an erase, fed as bytes through the CSI / VT52 / DECSET
+/// dispatch to the grid rule (`aterm-grid` `grid/erase.rs`). Expected screens are
+/// xterm's: `ClearRight`, `ClearInLine2` and `ClearScreen` (util.c) call
+/// `ResetWrap`, so the next glyph overwrites the parked last column. Several are
+/// Ghostty's goldens (`Terminal.zig`).
 #[cfg(test)]
 mod erase_pending_wrap_tests {
     use crate::terminal::Terminal;
@@ -589,8 +539,8 @@ mod erase_pending_wrap_tests {
 
     #[test]
     fn ed0_without_a_print_clears_the_parked_glyph() {
-        // The differential seed's shape: the parked glyph is erased (alacritty
-        // agrees on the cells; only the wrap differs).
+        // The parked glyph is erased (alacritty agrees on the cells; only the
+        // wrap differs).
         let mut term = Terminal::new(24, 80);
         term.process(b"\x1b[1;80H!\x1b[0J");
         assert_eq!(glyph(&term, 0, 79), ' ');
@@ -700,13 +650,9 @@ mod erase_pending_wrap_tests {
     }
 
     /// A second `CSI ?1049h` clears the screen it finds: xterm runs
-    /// `CursorSave; ToAlternate; ClearScreen` (charproc.c
-    /// `srm_OPT_ALTBUF_CURSOR`) and only `ToAlternate` stands down when alt is
-    /// already up.
-    ///
-    /// The exit assertion: `CursorSave` writes the current (alt) buffer's slot,
-    /// so the main cursor 1049 reset restores is the one the first enter
-    /// recorded.
+    /// `CursorSave; ToAlternate; ClearScreen` (`srm_OPT_ALTBUF_CURSOR`), only
+    /// `ToAlternate` standing down when alt is up. Its `CursorSave` writes the alt
+    /// slot, so the 1049 reset restores the main cursor the first enter saved.
     #[test]
     fn a_second_1049_enter_clears_the_alt_screen_it_finds() {
         let mut term = Terminal::new(24, 80);
@@ -749,17 +695,15 @@ mod erase_pending_wrap_tests {
 }
 
 /// CUF, CUB, HPR and BS count columns, never grapheme clusters, whatever mode
-/// 2027 says. The mode's definition (contour's terminal-unicode-core) leaves
-/// "cursor movement semantics of the terminal ... unchanged", and Ghostty's
-/// `cursorRight`/`cursorLeft` never read it. Neovim 0.11+ moves along a row
-/// with `cuf1`/`cub1` (BS) and `CSI n C`/`CSI n D`, counting cells.
+/// 2027 says: its definition (contour's terminal-unicode-core) leaves cursor
+/// movement unchanged, Ghostty's `cursorRight`/`cursorLeft` never read it, and
+/// Neovim 0.11+ moves along a row counting cells.
 #[cfg(test)]
 mod motion_counts_columns_tests {
     use crate::terminal::Terminal;
 
-    /// Three ways a terminal can come to hold mode 2027: never asked, asked
-    /// over the wire (`CSI ? 2027 h`), or a mode flag carried in from a
-    /// checkpoint an older build wrote while the mode was on.
+    /// Three ways a terminal can hold mode 2027: never asked, asked over the wire
+    /// (`CSI ? 2027 h`), or the flag carried in from a checkpoint.
     fn terminals() -> [(&'static str, Terminal); 3] {
         let plain = Terminal::new(2, 20);
         let mut asked = Terminal::new(2, 20);

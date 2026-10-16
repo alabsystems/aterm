@@ -254,6 +254,10 @@ pub(crate) fn install_tools_env(
         }
     }
     files.iter().try_for_each(crate::lay::write_in_process)?;
+    #[cfg(test)]
+    for tool in tools {
+        agents_checkpoint::at(layout, agents_checkpoint::Event::Written(tool.as_str()));
+    }
     prune_stale_shims(layout, build_dir, tools, aliases);
     // The front-of-PATH twin of an agent program's shim,
     // laid from the `bin/` shim just written so the two can never disagree.
@@ -262,7 +266,9 @@ pub(crate) fn install_tools_env(
 }
 
 /// Bring `<prefix>/agents/` ([`Layout::agents_dir`]) in line with `bin/`: for every AGENT
-/// PROGRAM ([`crate::stub::AGENT_PROGRAMS`]) whose `bin/` shim resolves into the store,
+/// PROGRAM ([`crate::stub::AGENT_PROGRAMS`]) whose `bin/` shim resolves into the store — or
+/// into its recorded dev-link checkout, whose twin then carries no self-update block and
+/// leaves the link's `bin/` shim as the link laid it ([`agent_primary`]) —
 /// lay — or refresh — the twin `agents/<tool>` with the SAME target and the SAME exported
 /// environment (read off the `bin/` shim as laid, never re-derived, for the reason
 /// [`reconcile_aliases`] gives) plus the self-update block ([`crate::selfupdate`]),
@@ -292,19 +298,33 @@ pub(crate) fn install_tools_env(
 /// The keep-predicate is [`sweep_agents_dir`]'s: the primary must resolve into an AGENT
 /// PROGRAM's store tree — a `bin/claude` into some other program's tree earns no twin,
 /// which is what the sweep would have removed again anyway.
+///
+/// One at a time in a process, with every sweep ([`AGENTS_TURN`]).
 pub fn reconcile_agents(layout: &Layout) {
+    let _turn = AGENTS_TURN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Reading a primary and publishing the bytes selected from it are one turn with
+    // every executable writer. Serializing reconciles alone lets a concurrent rollback,
+    // tombstone or first landing replace the primary after this read, then be overwritten
+    // by this read's stale target (including a dangling target from an emptied store).
+    let publication = crate::lay::PUBLICATION_TURN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     for name in crate::stub::AGENT_PROGRAMS {
         let Some(tool) = ToolName::new(name) else {
             continue;
         };
         let primary = layout.shim(&tool);
-        let Some(target) = platform::resolve_shim(&primary).filter(|t| {
-            crate::ops::store_build_of(&layout.prefix, t)
-                .is_some_and(|(program, _)| crate::stub::is_agent_program(&program))
-        }) else {
-            continue; // not installed here (a pending stub, a tombstone, a dev link): the sweep answers
+        let Some((target, primary_is)) = platform::resolve_shim(&primary)
+            .and_then(|t| agent_primary(layout, name, &t).map(|is| (t, is)))
+        else {
+            continue; // not installed here (a pending stub, a tombstone): the sweep answers
         };
+        let dev_link = primary_is == AgentPrimary::DevLink;
         let env = platform::shim_env_of(&primary);
+        #[cfg(test)]
+        agents_checkpoint::at(layout, agents_checkpoint::Event::Read(name));
         let twin = layout.agent_shim(&tool);
         // THE TWIN'S PRELUDE, rendered here, the one place the twin is laid
         // ([`platform::twin_prelude`]): the self-update block ([`crate::selfupdate`]) —
@@ -327,12 +347,18 @@ pub fn reconcile_agents(layout: &Layout) {
         };
         let standing = named(&twin).or_else(|| named(&primary));
         let atpkg = crate::stub::Embedder::this_process().embed(standing.as_deref());
-        let prelude = platform::twin_prelude(
-            name,
-            &layout.prefix,
-            atpkg.as_deref(),
-            crate::selfupdate::verbs_of(name),
-        );
+        // A DEV LINK'S TWIN carries no self-update block: the checkout is the
+        // developer's, and atpkg updates no build of it.
+        let prelude = if dev_link {
+            String::new()
+        } else {
+            platform::twin_prelude(
+                name,
+                &layout.prefix,
+                atpkg.as_deref(),
+                crate::selfupdate::verbs_of(name),
+            )
+        };
         // THE `bin/` SHIM ANSWERS THE SAME VERBS. Outside an aterm session
         // the rc hook takes `agents/` off PATH and APPENDS `bin/` (`crate::hooks`), so in
         // Terminal, iTerm, an editor's terminal or over ssh — wherever the person keeps no
@@ -346,9 +372,12 @@ pub fn reconcile_agents(layout: &Layout) {
         // `bin/` again; the block's re-entry guard ([`crate::selfupdate::REENTRY_VAR`]) lets
         // that through to the store build. Its own target and environment, read off it above,
         // so nothing a reader keys on moves; Windows renders no block and nothing is laid.
-        if !prelude.is_empty()
+        // A dev link's `bin/` shim is the link itself (`linkmode::link`), never rewritten here.
+        if !dev_link
+            && !prelude.is_empty()
             && !twin_is_rendered(&primary, &target, &env, &prelude)
-            && let Err(e) = platform::install_twin_to_env(&primary, &target, &env, &prelude)
+            && let Err(e) = platform::twin_executable_to_env(&primary, &target, &env, &prelude)
+                .and_then(|file| crate::lay::write_in_publication_turn(&file, &publication))
         {
             eprintln!(
                 "atpkg: {name}: bin/{name} lacks the self-update block ({e}); runs the store \
@@ -369,7 +398,8 @@ pub fn reconcile_agents(layout: &Layout) {
         }
         let laid = layout
             .ensure_dir(&layout.agents_dir())
-            .and_then(|()| platform::install_twin_to_env(&twin, &target, &env, &prelude));
+            .and_then(|()| platform::twin_executable_to_env(&twin, &target, &env, &prelude))
+            .and_then(|file| crate::lay::write_in_publication_turn(&file, &publication));
         if let Err(e) = laid {
             eprintln!(
                 "atpkg: {name}: agents/ twin {} not laid ({e}); bin/{name} is in place; \
@@ -378,7 +408,112 @@ pub fn reconcile_agents(layout: &Layout) {
             );
         }
     }
-    sweep_agents_dir(layout);
+    sweep_agents(layout);
+}
+
+/// What an agent program's `bin/` shim forwards to, as `agents/` may name it
+/// ([`agent_primary`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AgentPrimary {
+    /// A build in an agent program's store tree.
+    Store,
+    /// A file in the program's recorded dev-link checkout (`aterm pkg link`).
+    DevLink,
+}
+
+/// Whether `target`, what `program`'s `bin/` shim forwards to, is one an `agents/` twin may
+/// name: a build in an agent program's store tree, or — for a program dev-linked here
+/// ([`crate::linkmode::linked_checkout`]) — a file inside its recorded checkout, so a dev
+/// link wins at the front of PATH as it does on `bin/` (`aterm pkg link codex <pkgdir>
+/// bin/codex` inside aterm runs the linked build). `None` for anything else: a twin is never
+/// laid, and never kept, for a target nothing vouches for. Lexical, like the link's own
+/// record: the marker holds the absolute checkout, the shim its absolute target.
+fn agent_primary(layout: &Layout, program: &str, target: &Path) -> Option<AgentPrimary> {
+    if crate::ops::store_build_of(&layout.prefix, target)
+        .is_some_and(|(owner, _)| crate::stub::is_agent_program(&owner))
+    {
+        return Some(AgentPrimary::Store);
+    }
+    (crate::stub::is_agent_program(program)
+        && crate::linkmode::linked_checkout(layout, program)
+            .is_some_and(|checkout| target.starts_with(checkout)))
+    .then_some(AgentPrimary::DevLink)
+}
+
+/// The turn every reconcile and sweep of `agents/` takes. A first run's set completion lays
+/// its members' shims while the vendor lane lays the agents' on a thread of its own, and
+/// each ends in a reconcile: two walks interleaved would sweep a twin the other had just
+/// judged, or lay one name twice at once. Taken at each site (`AGENTS_TURN.lock()`), so the
+/// lock-order census sees every holder.
+static AGENTS_TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// A fixture may park a real agent-shim read or write for its own prefix only. Callbacks
+/// run outside the registry lock, and removing the guard unregisters the fixture.
+#[cfg(test)]
+pub(crate) mod agents_checkpoint {
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+
+    use crate::store::Layout;
+
+    pub(crate) enum Event<'a> {
+        Read(&'a str),
+        Written(&'a str),
+        Waiting(&'a str),
+    }
+
+    type Hook = Arc<dyn Fn(Event<'_>) + Send + Sync>;
+    static HOOKS: Mutex<BTreeMap<PathBuf, Hook>> = Mutex::new(BTreeMap::new());
+
+    pub(crate) fn at(layout: &Layout, event: Event<'_>) {
+        let hook = HOOKS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&layout.prefix)
+            .cloned();
+        if let Some(hook) = hook {
+            hook(event);
+        }
+    }
+
+    pub(crate) fn watch(layout: &Layout, hook: Hook) -> Watch {
+        assert!(
+            HOOKS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(layout.prefix.clone(), hook)
+                .is_none()
+        );
+        Watch(layout.prefix.clone())
+    }
+
+    pub(crate) fn waiting(path: &std::path::Path) {
+        let Some(name) = path.file_name().and_then(std::ffi::OsStr::to_str) else {
+            return;
+        };
+        let hooks: Vec<Hook> = HOOKS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|(prefix, _)| path.parent() == Some(prefix.join("bin").as_path()))
+            .map(|(_, hook)| hook.clone())
+            .collect();
+        for hook in hooks {
+            hook(Event::Waiting(name));
+        }
+    }
+
+    pub(crate) struct Watch(PathBuf);
+
+    impl Drop for Watch {
+        fn drop(&mut self) {
+            HOOKS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&self.0);
+        }
+    }
 }
 
 /// [`shim_is_rendered`] for an `agents/` twin: the bytes the TWIN renderer lays for
@@ -427,13 +562,24 @@ fn shim_is_rendered(shim: &Path, target: &Path, env: &crate::shim_env::ShimEnv) 
 }
 
 /// Keep `agents/` holding ONLY live agent shims: an entry stays iff its name is an agent
-/// program's, it resolves into that program's store tree, and the `bin/` shim of the same
-/// name resolves to the SAME target. Everything else — a name that is not an agent
+/// program's, it resolves into that program's store tree or its recorded dev-link checkout
+/// ([`agent_primary`]), and the `bin/` shim of the same name resolves to the SAME target. Everything else — a name that is not an agent
 /// program's, a twin of a build the primary has moved off (rolled back, updated), a twin
 /// whose primary is now a tombstone or gone (uninstalled), a hand-dropped file — is
 /// removed: this directory is FIRST on every `PATH`, so nothing may sit in it that
 /// `bin/` does not vouch for. Best-effort and silent, like every sweep here.
 pub fn sweep_agents_dir(layout: &Layout) {
+    let _turn = AGENTS_TURN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _publication = crate::lay::PUBLICATION_TURN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    sweep_agents(layout);
+}
+
+/// [`sweep_agents_dir`] inside a turn already taken.
+fn sweep_agents(layout: &Layout) {
     let Ok(entries) = std::fs::read_dir(layout.agents_dir()) else {
         return;
     };
@@ -446,8 +592,7 @@ pub fn sweep_agents_dir(layout: &Layout) {
             .is_some_and(|tool| {
                 crate::stub::is_agent_program(tool.as_str())
                     && (platform::resolve_shim(&entry.path()).is_some_and(|t| {
-                        crate::ops::store_build_of(&layout.prefix, &t)
-                            .is_some_and(|(p, _)| crate::stub::is_agent_program(&p))
+                        agent_primary(layout, tool.as_str(), &t).is_some()
                             && platform::resolve_shim(&layout.shim(&tool)).is_some_and(|b| b == t)
                     })
                         // An agent program's PENDING stub stands here too,
@@ -602,6 +747,9 @@ pub(crate) fn shim_env_drift(
 /// which both copy the primary's exports — so the alias and the twin carry the healed
 /// environment in the same pass.
 pub(crate) fn reassert_shim_env(layout: &Layout, builds: &[(&Path, &[ToolName])]) {
+    let publication = crate::lay::PUBLICATION_TURN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut files = Vec::new();
     let mut said = Vec::new();
     for (build_dir, tools) in builds {
@@ -627,7 +775,10 @@ pub(crate) fn reassert_shim_env(layout: &Layout, builds: &[(&Path, &[ToolName])]
         return;
     }
     let paths: Vec<std::path::PathBuf> = files.iter().map(|f| f.path.clone()).collect();
-    match files.iter().try_for_each(crate::lay::write_in_process) {
+    match files
+        .iter()
+        .try_for_each(|file| crate::lay::write_in_publication_turn(file, &publication))
+    {
         Ok(()) => {
             for (path, env) in paths.iter().zip(&said) {
                 println!(
@@ -667,6 +818,9 @@ pub(crate) fn reassert_shim_env(layout: &Layout, builds: &[(&Path, &[ToolName])]
 /// for a dev-link into `~/src/store/ay/18/bin/ay`, i.e. it would have deleted a link into a
 /// tree this manager does not own.
 fn prune_stale_shims(layout: &Layout, build_dir: &Path, installed: &[ToolName], aliases: Aliases) {
+    let _publication = crate::lay::PUBLICATION_TURN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some((program, build)) = crate::ops::store_build_of(&layout.prefix, build_dir) else {
         return; // not a store build dir of ours — nothing to prune
     };
@@ -749,10 +903,17 @@ pub(crate) fn undo_activation(layout: &Layout, build_dir: &Path) {
             platform::remove_link(&own);
         }
     }
-    if let Ok(entries) = crate::ops::read_bin_dir(layout) {
-        for e in entries.flatten() {
-            if crate::platform::resolve_shim(&e.path()).is_some_and(|t| t.starts_with(build_dir)) {
-                let _ = std::fs::remove_file(e.path());
+    {
+        let _publication = crate::lay::PUBLICATION_TURN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Ok(entries) = crate::ops::read_bin_dir(layout) {
+            for e in entries.flatten() {
+                if crate::platform::resolve_shim(&e.path())
+                    .is_some_and(|t| t.starts_with(build_dir))
+                {
+                    let _ = std::fs::remove_file(e.path());
+                }
             }
         }
     }
@@ -788,6 +949,8 @@ pub fn install_tombstone_shim(layout: &Layout, tool: &ToolName) -> io::Result<()
     // Atomic install through the platform backend (Unix: an executable `sh` script
     // temp+rename; Windows: a `.cmd` batch wrapper), replacing whatever shim was there.
     platform::install_tombstone_shim(&shim, &message)?;
+    #[cfg(test)]
+    agents_checkpoint::at(layout, agents_checkpoint::Event::Written(tool.as_str()));
     // A revoked agent program must not stay runnable through its front-of-PATH twin:
     // the tombstone resolves to no target, so the sweep drops the twin.
     sweep_agents_dir(layout);
@@ -1817,7 +1980,7 @@ mod tests {
         let primary = layout.shim(&claude);
         let twin_body = std::fs::read_to_string(&twin).unwrap();
         let primary_body = std::fs::read_to_string(&primary).unwrap();
-        let marker = layout.landing_marker(&claude);
+        let marker = layout.landing_dir().join(claude.as_str());
         assert!(
             !twin_body.contains("__landing") && !twin_body.contains("if [ -f "),
             "no landing prelude: {twin_body}"
@@ -1971,7 +2134,7 @@ mod tests {
     fn the_twin_prelude_runs_the_store_build_when_the_embedded_atpkg_is_gone() {
         let layout = temp_prefix("agents-twin-strand");
         let claude = tool("claude");
-        let marker = layout.landing_marker(&claude);
+        let marker = layout.landing_dir().join(claude.as_str());
         let exe = |path: &Path, body: &str| {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, body).unwrap();

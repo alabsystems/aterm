@@ -1,0 +1,26 @@
+# claude-code 2.1.301 · MEASURED 2026-10-15, `aterm ctl text` of a private headless aterm (144x50, aterm 0.104.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake claude.ai OAuth token (`claude --subscriber`) and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, tools/real-claude-lab) · a /resume back into conversation B after its armed five-hour limit's countdown was dropped by a /resume of A
+ ▐▛███▛█   Claude Code v2.1.301
+▝▜██████▀  Sonnet 5.5 · Claude API
+ ▝▝   ▝▝   /private/tmp/at.ZKnP/proj
+
+
+❯ /clear
+
+❯ conversation B hello
+
+⏺ Hi! I am the local lab stub, not a model. (reply 2)
+
+✻ Churned for 0s · done 12:49 PM
+
+❯ carry on in B
+  ⎿  You've hit your session limit · resets 12:59pm (America/Los_Angeles)
+     /upgrade to increase your usage limit.
+
+⏺ Usage limit reached · continuing automatically at 12:59pm · esc to cancel
+
+✻ Churned for 0s · done 12:49 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                                                                       ◐ medium · /effort

@@ -14,7 +14,7 @@
 //!
 //! A wrong ABI number neither fails to compile nor panics; it passes the wrong
 //! flag to a syscall or hands the kernel an undersized out-parameter. So each
-//! cell is generated per triple (`libc-oracle/gen/regen.sh`) from:
+//! cell is generated per triple (`aterm-libc-oracle regen`) from:
 //!
 //! * `rustdoc --output-format json` of the reference libc built for that
 //!   triple: constant values, signatures, `link_name`s, field names and types,
@@ -33,11 +33,11 @@
 //! helpers on the native cell.
 //!
 //! Shim and oracle are emitted from ONE name set: the harvested items
-//! (`libc-oracle/gen/union.json`) plus the transitive closure of the types they
-//! reference (`libc-oracle/gen/closure.py`). Emitting the oracle from the union
-//! alone once left closure-only types (`cmsghdr`, `vm_statistics64`, …)
-//! declared but unchecked. `build.py` fails if any EMITTED name or public field
-//! ends without an assertion.
+//! (`libc-oracle/union.json`) plus the transitive closure of the types they
+//! reference. Emitting the oracle from the union alone once left closure-only
+//! types (`cmsghdr`, `vm_statistics64`, …) declared but unchecked. The
+//! regeneration fails if any DECLARED name or public field ends without an
+//! assertion.
 //!
 //! ## Divergences from the crates.io package
 //!
@@ -50,7 +50,7 @@
 //! * **`vm_statistics64` is upstream's Mach rev1** (24 fields, 152 bytes), not
 //!   the SDK's rev3 (36, 248), matching the replaced crate byte-for-byte. The
 //!   reasoning is on the struct in the Darwin cells (from
-//!   `libc-oracle/gen/emit.py`).
+//!   `crates/aterm-libc-oracle/src/regen/handwritten.rs`).
 //! * `std`, `align`, `const-extern-fn`, `use_std` and `rustc-dep-of-std` are
 //!   accepted and ignored; nothing in aterm's graph varies on them.
 
@@ -92,9 +92,8 @@ pub use crate::linux_gnu_aarch64::*;
 // brings a generated cell.
 //
 // Rows are per (os, env, arch): each Windows arch and env is listed on its own.
-// A missing row kills a lane before any aterm code is type-checked, so
-// `tests/target_gate.rs` reads this list against every configured build lane, and
-// atpkg's `tests/shipped_triples_have_a_compile_cell.rs` holds each shipped triple to one.
+// A missing row kills a lane before any aterm code is type-checked: `verify
+// cells` compiles every forge cell through this gate.
 #[cfg(not(any(
     all(target_os = "macos", target_arch = "aarch64"),
     all(target_os = "macos", target_arch = "x86_64"),

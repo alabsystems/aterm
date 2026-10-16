@@ -17,7 +17,7 @@ pub struct Bundle {
 
 /// The `Info.plist` key marking a bundle as a LOCAL DEV BUILD the updater must not
 /// replace. `<string>true</string>`; any other value, or absence, is a normal
-/// install. Stamped by `tools/dev-app.sh` (its `--no-pin` omits it).
+/// install. Stamped by `targo --unverified ship dev-app` (its `--no-pin` omits it).
 ///
 /// Layout alone cannot tell a dev build from a release, and the update gate is a
 /// BUILD NUMBER comparison (`github.rs`) against a dev build's HEAD-committer-epoch
@@ -380,7 +380,7 @@ mod tests {
         assert!(plist_marks_dev_build(&plist(
             "<key>ATermDevBuild</key><string>true</string>"
         )));
-        // The shape `tools/dev-app.sh` actually emits (newline + tab), and case.
+        // The shape `ship dev-app` actually emits (newline + tab), and case.
         assert!(plist_marks_dev_build(&plist(
             "<key>ATermDevBuild</key>\n\t<string>TRUE</string>"
         )));

@@ -97,12 +97,14 @@ const SCRIPT_SHELLS: &[&str] = &["sh", "bash", "dash", "zsh", "ksh"];
 /// The published program of a process whose argv begins `argv0 [argv1]`:
 /// [`program_from_argv0`], except that a shell interpreter
 /// ([`SCRIPT_SHELLS`]) running a SCRIPT (`argv1` is not an option) whose
-/// name is an agent's (`claude`, `codex` — `aterm_phase::program_of`) AND
-/// that `is_shim` says is atpkg's own shim ([`atpkg_shim`] in production) is
-/// that agent: atpkg's shim before its `exec` (module header, "THE SHIM
-/// WINDOW"). Any other script keeps the interpreter's name (`sh build.sh` is
-/// `sh`, and so is `sh ~/bin/claude`, a user's own wrapper), so nothing else
-/// changes name. `is_shim` is asked only for an agent-named script.
+/// name is an agent program's (`atpkg::stub::AGENT_PROGRAMS`, the names atpkg
+/// lays twins for) AND that `is_shim` says is atpkg's own shim
+/// ([`atpkg_shim`] in production) is that agent: atpkg's shim before its
+/// `exec` (module header, "THE SHIM WINDOW"), named as the store binary it
+/// execs is named. Any other script keeps the interpreter's name (`sh
+/// build.sh` is `sh`, and so is `sh ~/bin/claude`, a user's own wrapper), so
+/// nothing else changes name. `is_shim` is asked only for an agent-named
+/// script.
 pub(crate) fn program_from_argv(
     argv0: &str,
     argv1: Option<&str>,
@@ -112,7 +114,7 @@ pub(crate) fn program_from_argv(
     if SCRIPT_SHELLS.contains(&name.as_str())
         && let Some(script) = argv1.filter(|a| !a.starts_with('-'))
         && let Some(agent) = program_from_argv0(script)
-        && aterm_phase::program_of(&agent).is_some()
+        && atpkg::stub::is_agent_program(&agent)
         && is_shim(script)
     {
         return Some(agent);
@@ -264,12 +266,13 @@ fn argv0_from_procargs2(buf: &[u8]) -> Option<String> {
 
 // ---------------------------------------------------------------- the leader's facts
 
-/// What the shell's exported PATH does with `claude` and `codex`, read from a
-/// child's environment at exec ([`path_verdict`]).
+/// What the shell's exported PATH does with the agent programs
+/// (`atpkg::stub::AGENT_PROGRAMS`), read from a child's environment at exec
+/// ([`path_verdict`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PathVerdict {
-    /// aterm's managed `agents/` comes before every other directory holding a
-    /// `claude` or `codex`.
+    /// aterm's managed `agents/` comes before every other directory holding an
+    /// agent program.
     Live,
     /// No `agents/` ahead of a foreign copy, but the session's `reroute/`
     /// stubs are, with `ATERM_CHILD` set: typed `claude`/`codex` still reach
@@ -330,15 +333,18 @@ pub(crate) fn path_verdict(
 /// path — measured 2026-09-23: `…/store/claude/2026092201/bin/claude`) or it
 /// is atpkg's own shim before its `exec` (`shim`); `foreign` for anything
 /// else (the native installer's `~/.local/share/claude/versions/<v>`, a brew
-/// cask). `None` for a program that is not an agent, or with no managed
-/// prefix to compare against.
+/// cask). `None` for a program that is not an agent program atpkg manages
+/// (`atpkg::stub::AGENT_PROGRAMS`), or with no managed prefix to compare
+/// against.
 pub(crate) fn copy_of(
     program: Option<&str>,
     exec_path: &str,
     store: Option<&std::path::Path>,
     shim: bool,
 ) -> Option<&'static str> {
-    aterm_phase::program_of(program?)?;
+    if !atpkg::stub::is_agent_program(program?) {
+        return None;
+    }
     let store = store?;
     Some(
         if shim || std::path::Path::new(exec_path).starts_with(store) {
@@ -356,7 +362,8 @@ pub(crate) fn copy_of(
 pub(crate) struct LeaderFacts {
     /// [`program_from_argv`].
     pub(crate) program: Option<String>,
-    /// [`copy_of`].
+    /// [`copy_of`] the program, or the agent script a runtime runs
+    /// (`node /usr/local/bin/claude`).
     pub(crate) copy: Option<&'static str>,
     /// [`path_verdict`] of the leader's PATH at exec.
     pub(crate) path: Option<PathVerdict>,
@@ -382,7 +389,24 @@ pub(crate) fn facts_from(
         .as_deref()
         .is_some_and(|p| program_from_argv0(argv0).as_deref() != Some(p));
     let store = managed.map(|layout| layout.prefix.join("store"));
-    let copy = copy_of(program.as_deref(), &args.exec_path, store.as_deref(), shim);
+    // A script runtime running an agent's script (an npm install of Claude
+    // Code: `node /usr/local/bin/claude`) keeps the runtime's name, as any
+    // script does, but the copy it runs is that agent's, and no store build
+    // is a script, so it reads `foreign`. The script's name decides the copy
+    // only, never the program: `node ~/bin/claude` stays `program=node`.
+    let script_agent = program
+        .as_deref()
+        .filter(|p| aterm_phase::may_host_agent(p))
+        .and(argv1)
+        .filter(|script| !script.starts_with('-'))
+        .and_then(program_from_argv0)
+        .filter(|script| atpkg::stub::is_agent_program(script));
+    let copy = copy_of(
+        script_agent.as_deref().or(program.as_deref()),
+        &args.exec_path,
+        store.as_deref(),
+        shim,
+    );
     let path = (shell > 0 && ppid == Some(shell))
         .then(|| args.env_var("PATH"))
         .flatten()
@@ -413,13 +437,14 @@ pub(crate) fn facts_from(
     }
 }
 
-/// Whether `dir` holds a `claude` or a `codex` — what makes a directory ahead
-/// of `agents/` on PATH decide which copy a typed name runs.
-fn holds_agent(dir: &str) -> bool {
+/// Whether `dir` holds one of `laid`, the agent programs whose managed twin
+/// stands (`atpkg::reroute::agents_routes`) — what makes a directory ahead of
+/// `agents/` on PATH decide which copy a typed name runs. A program atpkg lays
+/// no twin for here (muse off darwin, an excluded agy) has no managed copy for
+/// that directory to shadow.
+fn holds_agent(dir: &str, laid: &[&str]) -> bool {
     let dir = std::path::Path::new(dir);
-    ["claude", "codex"]
-        .iter()
-        .any(|name| dir.join(name).is_file())
+    laid.iter().any(|name| dir.join(name).is_file())
 }
 
 /// `pid`'s parent, or `None` (gone, another user's, a platform without the call).
@@ -466,13 +491,17 @@ pub(crate) fn leader_facts(pgid: i32, shell: i32) -> LeaderFacts {
         };
     };
     let managed = atpkg::store::resolve_configured();
+    let laid = managed
+        .as_ref()
+        .map(atpkg::reroute::agents_routes)
+        .unwrap_or_default();
     facts_from(
         &args,
         parent_of(pgid),
         shell,
         managed.as_ref(),
         &atpkg_shim,
-        &holds_agent,
+        &|dir| holds_agent(dir, &laid),
     )
 }
 
@@ -871,12 +900,13 @@ fn publish_if_current(
         return (false, false, false);
     }
     let mut timeline = job.timeline.lock().unwrap_or_else(|p| p.into_inner());
-    let was_claude = timeline.agent().program.as_deref() == Some("claude");
+    let was_claude = crate::claude_footer::drawn_for(timeline.agent().program.as_deref());
     let changed = timeline.set_program(job.pgid, facts.program);
     // The copy and the PATH verdict ride the same answer, under the same
     // currency check: a departed group's read never reaches the timeline.
     timeline.set_leader(job.pgid, facts.copy, facts.path);
-    let became_claude = changed && timeline.agent().program.as_deref() == Some("claude");
+    let became_claude =
+        changed && crate::claude_footer::drawn_for(timeline.agent().program.as_deref());
     (changed, became_claude, changed && was_claude)
 }
 
@@ -1127,6 +1157,41 @@ mod tests {
         assert!(jobs.take(7).is_none());
         assert!(model.fire("DropCancelled", &mut cancelled_state));
         assert!(jobs.by_session.is_empty());
+    }
+
+    /// The resolver's two footer transitions, for each name the host
+    /// supervises as Claude Code: a `claude-code` argv0 entering the front
+    /// asks for the footer's facts and leaving it stops the watch, as
+    /// `claude` does. NEGATIVE CONTROL: a Codex leader starts no watch.
+    #[test]
+    fn a_claude_code_argv0_starts_and_stops_the_footer_watch_like_claude() {
+        let named = |p: &str| LeaderFacts {
+            program: Some(p.into()),
+            ..LeaderFacts::default()
+        };
+        for (name, draws) in [("claude", true), ("claude-code", true), ("codex", false)] {
+            let timeline = Arc::new(Mutex::new(SessionTimeline::default()));
+            timeline.lock().unwrap().note_foreground_group(42);
+            let pending = Mutex::new(PendingJobs::default());
+            let job = Job {
+                session: 7,
+                timeline: Arc::clone(&timeline),
+                pgid: 42,
+                shell: 0,
+            };
+            pending.lock().unwrap().offer(job.clone());
+            let (_, _, incarnation) = pending.lock().unwrap().take(7).unwrap();
+            assert_eq!(
+                publish_if_current(&pending, &job, incarnation, named(name)),
+                (true, draws, false),
+                "{name}: entering"
+            );
+            assert_eq!(
+                publish_if_current(&pending, &job, incarnation, named("zsh")),
+                (true, false, draws),
+                "{name}: leaving"
+            );
+        }
     }
 
     /// A blocked old-group lookup cannot create an unbounded queue of retries
@@ -1510,6 +1575,11 @@ mod tests {
             p("/bin/bash", Some("/opt/pkg/agents/codex")).as_deref(),
             Some("codex")
         );
+        // Every program atpkg lays a twin for, not only the two a screen reader knows.
+        for agent in atpkg::stub::AGENT_PROGRAMS {
+            let shim = format!("/opt/pkg/agents/{agent}");
+            assert_eq!(p("/bin/sh", Some(&shim)).as_deref(), Some(*agent));
+        }
         assert_eq!(
             p(
                 "/Users//x/Library/Application Support/aterm/pkg/store/claude/2026092201/bin/claude",
@@ -1780,6 +1850,54 @@ mod tests {
             None,
             "no prefix"
         );
+    }
+
+    /// AN NPM CLAUDE IS A FOREIGN COPY: `node /usr/local/bin/claude` keeps
+    /// the runtime's name (`program=node`), and its copy was asked of that
+    /// name, which is no agent, so `copy=-` hid exactly the build `copy=`
+    /// exists to show. The copy now asks the agent script a runtime runs.
+    /// NEGATIVE CONTROLS: a runtime's own script has no copy, and a shell
+    /// running a user's wrapper named `claude` (not atpkg's shim) keeps the
+    /// shell's name and no copy, as before.
+    #[test]
+    fn a_runtime_running_an_agents_script_runs_a_foreign_copy() {
+        let layout = atpkg::store::Layout {
+            prefix: std::path::PathBuf::from(PREFIX),
+        };
+        let facts = |exec: &str, argv: &[&str]| {
+            let args = atpkg::caller_shell::ProcArgs {
+                exec_path: exec.to_string(),
+                argv: argv.iter().map(|a| (*a).to_string()).collect(),
+                env: Vec::new(),
+            };
+            facts_from(&args, None, 0, Some(&layout), &|_| false, &|_| false)
+        };
+        let npm = facts(
+            "/usr/local/bin/node",
+            &["node", "/usr/local/bin/claude", "--resume", "03396a15"],
+        );
+        assert_eq!(npm.program.as_deref(), Some("node"), "the process's name");
+        assert_eq!(npm.copy, Some("foreign"), "an npm Claude is foreign");
+        let server = facts("/usr/local/bin/node", &["node", "server.js"]);
+        assert_eq!(server.program.as_deref(), Some("node"));
+        assert_eq!(server.copy, None, "a runtime's own script is no agent");
+        let flag = facts("/usr/local/bin/node", &["node", "--inspect"]);
+        assert_eq!(flag.copy, None, "an option names no script");
+        let wrapper = facts("/bin/sh", &["sh", "/home/u/bin/claude"]);
+        assert_eq!(wrapper.program.as_deref(), Some("sh"));
+        assert_eq!(wrapper.copy, None, "a user's wrapper, not a runtime");
+    }
+
+    /// Only an agent whose managed twin stands is shadowed: a PATH directory
+    /// holding a program atpkg lays no twin for here decides nothing, and the
+    /// same directory decides where that program is laid.
+    #[test]
+    fn only_a_laid_agent_can_be_shadowed() {
+        let scratch = aterm_tempfile::TempDir::new().expect("a scratch dir");
+        std::fs::write(scratch.path().join("muse"), b"").expect("a foreign muse");
+        let dir = scratch.path().to_str().expect("utf-8");
+        assert!(!holds_agent(dir, &["claude"]), "muse has no twin here");
+        assert!(holds_agent(dir, &["claude", "muse"]));
     }
 
     /// Names the file that releases [`park_for_a_read`]: set only on that

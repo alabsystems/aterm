@@ -6,11 +6,11 @@
 //! Reads every full-body pose asset TOML under `crates/aterm-effects/art/pet/` and
 //! writes `crates/aterm-effects/src/pet_glyphs_gen.rs`. Run it after touching any pose;
 //! the `pet_glyphs_gen_matches_assets` drift test fails until the checked-in file
-//! matches. The cat twin of this generator is `gen_cat_glyphs` — same parser, separate
-//! roster (the pet must never land in the collectible `GLYPHS` table).
+//! matches. Same parser as `gen_cat_glyphs`, separate roster: the pet must never land
+//! in the collectible `GLYPHS` table.
 //!
 //! ```text
-//! cargo run -p aterm-effects --example gen_pet_glyphs
+//! targo --unverified run -p aterm-effects --example gen_pet_glyphs
 //! ```
 
 use std::path::Path;

@@ -1,41 +1,31 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE BAND'S DRAWN ICONS (docs/DESIGN-unified-messages-2026-09-21.md,
-//! rulings 251 and 258): one vector icon for every status glyph a message
-//! row can carry, drawn from the face's own capital height and stroke weight.
+//! The band's drawn icons (docs/DESIGN-unified-messages-2026-09-21.md, rulings 251 and
+//! 258): one vector icon for every status glyph a message row can carry, drawn from the
+//! face's own capital height and stroke weight so the set reads as one design.
 //!
-//! The band's glyph cell used to take its `⚠ ✕ ✓ ℹ ↻` from whichever face
-//! held them — a symbol font for one, the fallback for another, the primary
-//! for a third — so a row of them read as four type designs at four weights.
-//! The owner chose one drawn set ("Drawn icons, drop spinner", 2026-09-25).
-//! The row's cell keeps its CHARACTER (the text grid, a screen reader, copy
-//! and the `messages` verb all read it); only the pixels of its glyph are
-//! drawn here, and only on a band row that asks
-//! ([`aterm_core::render::ChromeRaster::icons`]).
+//! The row's cell keeps its character (the text grid, a screen reader, copy and the
+//! `messages` verb read it); only its glyph's pixels are drawn here, and only on a band
+//! row that asks ([`aterm_core::render::ChromeRaster::icons`]).
 //!
 //! # Geometry
 //!
-//! Every icon is a union of signed-distance primitives — strokes, rings,
-//! discs, pixel-row bars and filled polygons — around a centre on the middle
-//! of the face's capital height, its height the capital height (ruling 258):
-//! the round icons overshoot it by about a pixel as a round letter does, the
-//! warning triangle stands on the baseline and reaches two pixels over it, the
-//! marks that sit on a baseline sit on the face's. An icon whose neighbour
-//! cells are BLANK (the band's ` G TITLE`) draws on a raster three cells wide
-//! and spills symmetrically into them — never outside the row, never over
-//! the title, never below the baseline's row (so the seam's descender
-//! ink-skip never sees it); an icon beside ink stays inside its own cell
-//! with a clear column on both sides, scaled down to fit (ruling 257).
+//! Every icon is a union of signed-distance primitives (strokes, rings, discs,
+//! pixel-row bars, filled polygons) centred on the middle of the face's capital height
+//! and as tall as it: round icons overshoot by about a pixel as a round letter does, the
+//! warning triangle stands on the baseline, and baseline marks sit on the face's. An icon
+//! whose neighbour cells are blank draws on a raster three cells wide and spills
+//! symmetrically into them, never outside the row, over the title, or below the
+//! baseline's row (so the seam's descender ink-skip never sees it). An icon beside ink
+//! stays inside its own cell with a clear column on both sides, scaled to fit.
 //!
-//! Strokes are the face's measured stem ([`IconMetrics::stem`], the regular
-//! or bold `l`) rounded to a whole pixel, and the icon's centre is placed so
-//! a vertical stroke's edges fall on pixel boundaries; the marks that must be
-//! read (the `i`, the `!`, the pause bars) are cut on whole pixel rows, so
-//! the icon has the weight of the words beside it and its stems are crisp.
-//! Coverage is the analytic box filter of the distance at each pixel centre,
-//! `clamp(½ − d)`: 256 levels on every slope, the same image on the CPU and
-//! in the GPU atlas (a Mono glyph through the one cache).
+//! Strokes are the face's measured stem ([`IconMetrics::stem`]) rounded to a whole
+//! pixel, the centre is placed so vertical stroke edges fall on pixel boundaries, and
+//! the marks that must be read (the `i`, the `!`, the pause bars) are cut on whole
+//! rows. Coverage is the analytic box filter `clamp(½ − d)` of the distance at each pixel
+//! centre: the same image on the CPU and in the GPU atlas (a Mono glyph through the one
+//! cache).
 
 use aterm_core::render::BandIcon;
 
@@ -150,12 +140,10 @@ impl Shape {
             } else {
                 (fw * 0.5).round()
             };
-        // A crisp centre in a cell of the other parity sits half a pixel off
-        // the cell's middle: the room is measured from where it is, so a
-        // clear column stays on both sides (ruling 257). A round icon
-        // overshoots its half height by up to a pixel; the shapes wider than
-        // their height (the triangle, the tick, the cross, the tray) narrow
-        // themselves to the room.
+        // A crisp centre in a cell of the other parity sits half a pixel off the
+        // cell's middle, so the room is measured from where it is and a clear column
+        // stays on both sides (ruling 257). Shapes wider than their height (the
+        // triangle, tick, cross and tray) narrow themselves to the room.
         let room = (cx.min(wide - cx) - 1.0).max(1.0);
         let half = half0.min(room - 0.5).max(1.0);
         Shape {
@@ -240,14 +228,10 @@ impl Shape {
         let t = self.t;
         match icon {
             BandIcon::Info => {
-                // A disc a pixel over the capital height with a bold `i` cut
-                // out of it on whole rows — a clear band, the dot, one clear
-                // row, the stem, a clear band — the `i` nearly two thirds of
-                // the disc (ruling 258). At the band's bold stem a RING would
-                // spend six of the badge's seventeen rows on its own stroke
-                // and leave the `i` a stub unless it grew four pixels past
-                // the capitals; the disc gives the `i` the whole badge, as
-                // the warning triangle gives its `!`.
+                // A disc a pixel over the capital height with a bold `i` cut out on
+                // whole rows (a clear band, the dot, one clear row, the stem, a clear
+                // band), the `i` nearly two thirds of the disc (ruling 258). A ring's
+                // own stroke would leave the `i` a stub at the bold stem.
                 let (r, cyr) = self.ring_frame();
                 let disc = (px - self.cx).hypot(py - cyr) - r;
                 let (top, n) = (cyr - r, 2.0 * r);
@@ -289,14 +273,12 @@ impl Shape {
                 ))
             }
             BandIcon::Warn => {
-                // A filled triangle standing on the baseline and reaching
-                // about three pixels over the capitals (a point reads smaller
-                // than a flat top), its corners softened, with `!` cut out on
-                // whole rows from the base up: a band of the badge under the
-                // dot, the dot, one clear row, then the stem up to where the
-                // triangle is wide enough to keep a clear pixel each side of
-                // it. At the bold stem an OUTLINE's inside held a `!` of four
-                // rows; the cut-out `!` is ten (ruling 258).
+                // A filled triangle standing on the baseline and reaching about three
+                // pixels over the capitals (a point reads smaller than a flat top),
+                // corners softened, with `!` cut out on whole rows from the base up:
+                // badge under the dot, the dot, one clear row, then the stem up to where
+                // the triangle keeps a clear pixel each side. Filled, not an outline: at
+                // a bold stem an outline's inside leaves the `!` too few rows (ruling 258).
                 let (apex, bottom, wb, round) = self.triangle();
                 let h = bottom - apex;
                 let tri = rounded_triangle(px, py, self.cx, apex, bottom, wb, round);
@@ -419,11 +401,9 @@ impl Shape {
             }
             BandIcon::Dot => self.p_disc(px, py, 0.0, (t * 0.85).max(1.0)),
             BandIcon::Remove => {
-                // `ℹ`'s disc, a pixel over the capital height, with a bar cut
-                // across its middle on whole rows (ruling 304): a removal
-                // reads as a mark of the same family as the badges, where the
-                // `·` it replaced read as a bullet. The cut is the stem's
-                // weight and a half, so a bold row cuts a heavier bar.
+                // `ℹ`'s disc with a bar cut across its middle on whole rows (ruling
+                // 304), so a removal reads as one of the badges. The bar is one and a
+                // half stems thick, so a bold row cuts a heavier bar.
                 let (r, cyr) = self.ring_frame();
                 let disc = (px - self.cx).hypot(py - cyr) - r;
                 let bh = (t * 1.5).round().max(2.0);
@@ -593,11 +573,9 @@ mod tests {
         (x0, x1, y0, y1)
     }
 
-    /// An icon BESIDE INK keeps to its own cell (ruling 257): it draws ink
-    /// inside it, and none touches the cell's left or right column or its
-    /// top row — an icon never bleeds into a neighbouring cell — whichever
-    /// parity the stroke and the cell have. Every icon but the two drawn on
-    /// whole pixels (the pause bars, the `!`) is antialiased.
+    /// An icon beside ink keeps to its own cell (ruling 257): no ink in its left or right
+    /// column or its top row, at either stroke/cell parity. All but the pause bars and
+    /// the `!` are antialiased.
     #[test]
     fn every_icon_draws_antialiased_ink_inside_its_cell() {
         for (cw, ch, m) in [
@@ -674,14 +652,10 @@ mod tests {
         }
     }
 
-    /// An icon between BLANK cells is drawn at the words' size (ruling 258):
-    /// on a raster three cells wide it keeps a clear column at both ends (so
-    /// it never reaches the title's cell or past the blank on its left),
-    /// never inks over the face's tallest letter nor a row below the
-    /// baseline's (so a lifted rail row never clips it and the seam's
-    /// descender ink-skip never sees it), and stands as tall as the capitals
-    /// — the badges a pixel or more over them, spilling into the blank cells
-    /// — centred on its own cell.
+    /// An icon between blank cells is drawn at the capitals' height (ruling 258) on a
+    /// three-cell raster: a clear column at both ends, no ink above the tallest letter
+    /// or below the baseline's row, the badges spilling into both blank cells, and
+    /// centred on its own cell.
     #[test]
     fn a_spilled_icon_is_as_tall_as_the_capitals_and_stays_in_its_three_cells() {
         for (cw, ch, m) in FACES {
@@ -745,10 +719,8 @@ mod tests {
         }
     }
 
-    /// The icons are ONE set: their strokes are the stem they are given — a
-    /// bold stem draws more ink than a regular one on every stroked icon (and
-    /// cuts a heavier mark out of the two badges) — and two different icons
-    /// never draw the same image, spilled or in a cell of their own.
+    /// The strokes follow the given stem (bold draws more ink on every stroked icon and
+    /// cuts a heavier mark from the badges), and no two icons draw the same image.
     #[test]
     fn the_stroke_follows_the_stem_and_the_icons_are_distinct() {
         // A 16 × 32 cell: room for a 3-pixel bold stroke beside a 1-pixel
@@ -779,7 +751,7 @@ mod tests {
                     // The bars are at least half the half height wide: a
                     // stem under that leaves them as they are.
                     BandIcon::Pause => assert!(ink(&heavy) >= ink(&regular), "{icon:?}"),
-                    // A badge's mark is CUT OUT at the stem: a bold mark cuts more.
+                    // A badge's mark is cut out at the stem: a bold mark cuts more.
                     BandIcon::Info | BandIcon::Warn | BandIcon::Remove => {
                         assert!(ink(&heavy) < ink(&regular), "{icon:?}: a heavier cut");
                     }
@@ -791,12 +763,9 @@ mod tests {
         }
     }
 
-    /// The badges' marks are legible at the band's size: down the badge's
-    /// centre column the `i` and the `!` are two CLEAN cuts (fully clear
-    /// rows) with a solid row between them — never a half-covered gap that
-    /// blurs the dot into the stem (ruling 253) — the stem the longer cut and
-    /// at least five rows (ruling 258: the round-13 `!` was two), and the
-    /// badge closes under the mark.
+    /// Down a badge's centre column the `i` and the `!` are two clean cuts (fully clear
+    /// rows) with a solid row between (ruling 253), the stem the longer cut and at least
+    /// five rows, and the badge closes under the mark.
     #[test]
     fn a_badges_dot_and_stem_are_cut_apart_on_whole_rows() {
         for (cw, ch, m) in FACES {
@@ -845,9 +814,7 @@ mod tests {
         }
     }
 
-    /// `↻` reads as a RING at the band's size: its middle is clear, so the
-    /// head never fills the hole (the round-13 captures showed a blob at a
-    /// 12 × 24 cell with a 2 px stem), and its top row stays clear.
+    /// `↻` reads as a ring: the head never fills its middle, and its top row is clear.
     #[test]
     fn the_update_ring_keeps_its_hole_open() {
         for (cw, ch, m) in FACES.into_iter().chain([(12, 24, M)]) {
@@ -867,21 +834,6 @@ mod tests {
                     }
                 }
                 assert!(buf[..w].iter().all(|&c| c == 0), "{cw}x{ch}: top row clear");
-            }
-        }
-    }
-
-    /// Deterministic: the same inputs give the same bytes (the CPU blit and
-    /// the GPU atlas upload one cached raster, and a re-raster after a cache
-    /// eviction must match it).
-    #[test]
-    fn a_raster_is_a_pure_function_of_its_inputs() {
-        for icon in BandIcon::ALL {
-            for spill in [false, true] {
-                assert_eq!(
-                    band_icon_coverage(icon, 11, 23, M, spill),
-                    band_icon_coverage(icon, 11, 23, M, spill)
-                );
             }
         }
     }

@@ -121,7 +121,7 @@
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static FRAMES_PRESENTED: AtomicU64 = AtomicU64::new(0);
 static LAST_PRESENT_LATENCY_NS: AtomicU64 = AtomicU64::new(0);
@@ -448,7 +448,7 @@ static SLOW_EPISODE_RESET: AtomicBool = AtomicBool::new(false);
 // fold with, `past_arms` the subset already in the past when it was armed. The
 // cost is one extra relaxed `fetch_add` (two on a past arm) per event-loop
 // turn, on a line only this thread writes.
-const DEADLINE_OWNER_SLOTS: usize = 49;
+const DEADLINE_OWNER_SLOTS: usize = 55;
 static DEADLINE_ARMS_BY_OWNER: [AtomicU64; DEADLINE_OWNER_SLOTS] =
     [const { AtomicU64::new(0) }; DEADLINE_OWNER_SLOTS];
 static PAST_DEADLINE_ARMS_BY_OWNER: [AtomicU64; DEADLINE_OWNER_SLOTS] =
@@ -482,7 +482,7 @@ static GPU_SCROLL_RESCUES_BASE: AtomicU64 = AtomicU64::new(0);
 // THE MAIN-LOOP TURN DISTRIBUTION PER ROOT (responsiveness audit item 3): the
 // watchdog's census keeps last/max/count only, so a p95 key-queue tail could not
 // be attributed to a main-thread root. Indexed by `watchdog::Breadcrumb as u8`.
-pub(crate) const TURN_ROOT_SLOTS: usize = 8;
+pub(crate) const TURN_ROOT_SLOTS: usize = 9;
 static H_TURN_BY_ROOT: [Histogram; TURN_ROOT_SLOTS] = [const { Histogram::new() }; TURN_ROOT_SLOTS];
 
 // STALE-ARM HEAL (busy-rearm audit, item 3): the SAME owner arming a deadline
@@ -510,7 +510,7 @@ const STALE_ARM_HEAL_FLOOR: Duration = Duration::from_nanos(STALE_ARM_HEAL_FLOOR
 // PER-OWNER PAST-ARM STREAK HEAL (follow-ups items 18/19): the detector the
 // 250 ms floor above is structurally blind to. That heal only *considers* arms
 // with `late > 250 ms`, so a producer arming `Instant::now()` every turn — the
-// exact pre-fix `next_title_summary_retry` shape — spins at full event-loop
+// exact pre-fix shape of the since-retired Smart Titles retry — spins at full event-loop
 // rate with `late ≈ 0` and takes the branch that RESETS its streak; and its
 // single global streak slot is defeated outright by two owners alternating
 // stale arms. This detector is DECOUPLED from the floor and PER OWNER: each
@@ -723,7 +723,11 @@ pub(crate) enum DeadlineOwner {
     UpgradeRealized = 27,
     WakeHeal = 28,
     Video = 29,
-    TitleSummary = 30,
+    /// Retired Smart Titles observation-retry slot (the `title_summary` module
+    /// was removed on 2026-10-15). The numeric tombstone is retained because
+    /// deadline-owner discriminants are an append-only diagnostics wire
+    /// contract.
+    Retired30 = 30,
     SessionChrome = 31,
     TitleDrift = 32,
     /// The program cat's tenure gate (`aterm_effects::companion_look::KittyTenure`): one wake at
@@ -743,10 +747,11 @@ pub(crate) enum DeadlineOwner {
     MessageBand = 34,
     /// The per-session STATUS observer (`SessionStatus::next_wake`): a candidate
     /// serving its dwell, or a Running session aging into Quiet. Split out of
-    /// `TitleSummary` (item 8) because the two fold at the same seam in
-    /// `about_to_wait` and used to share one label — so the 2026-08 event-loop
-    /// spin, whose producer was THIS observer, was reported as `title_summary`
-    /// and cost the investigation its first hour on the wrong module.
+    /// slot 30 (item 8; the retired `title_summary` owner, now `Retired30`)
+    /// because the two folded at the same seam in `about_to_wait` and used to
+    /// share one label — so the 2026-08 event-loop spin, whose producer was
+    /// THIS observer, was reported as `title_summary` and cost the
+    /// investigation its first hour on the wrong module.
     SessionStatus = 35,
     /// PRESENCE (`crate::presence`): the band's `since` text tick (once a
     /// second while it prints seconds, once a minute after) and the nine steps
@@ -841,6 +846,45 @@ pub(crate) enum DeadlineOwner {
     /// drift re-read). An idle lane arms nothing. 48 and not 47:
     /// main's `RenderEpoch` reached 47 first, and the table is append-only.
     DebuggerChange = 48,
+    /// The Developer Tools hand-over (`crate::devtools_helper`, owner ask
+    /// 2026-10-15): a waiting hand-over's next look for its quiet moment, every
+    /// `RECHECK_EVERY` and only while an aterm window is focused; the helper
+    /// panel's turn every `PANEL_TICK` while it is up (placement, System
+    /// Settings still running, one list read); and a worker's slot re-read
+    /// while one is out. Nothing waiting and no panel arm nothing.
+    DevToolsHandOver = 49,
+    /// THE HARNESS CARD (`crate::claude_card`, design
+    /// `docs/DESIGN-harness-autopilot-2026-10-15.md` §3): a frame ahead while
+    /// a card on show plays its episode, then one wake for the settled frame
+    /// it owes. A settled card, and a window off screen, arm nothing. 50 and
+    /// not 49: main's `DevToolsHandOver` reached 49 first, and the table is
+    /// append-only.
+    ClaudeCard = 50,
+    /// A transient theme preview's TTL (`theme preview … ttl=`,
+    /// `crate::control_theme`): one wake at the instant the preview reverts to
+    /// the configured theme by itself. No preview arms nothing. 51 and not 50:
+    /// main's `ClaudeCard` reached 50 first, and the table is append-only.
+    ThemePreview = 51,
+    /// THE SESSION LOG's settle tick (`crate::session_log::Wakes`): one wake at
+    /// the instant a session's turn tracker has waited out the settle on a
+    /// resting word (`aterm_slog::SETTLE_MS` after it first held), so the turn
+    /// closes with no screen change to say so. Armed only while some tracker
+    /// has a settle pending; an idle machine folds nothing here. Its own slot,
+    /// never slot 30's tombstone (`Retired30`), which no owner reuses. 52 and
+    /// not 50: main's `ClaudeCard` and `ThemePreview` reached 50 and 51
+    /// first, and the table is append-only.
+    SessionLog = 52,
+    /// THE HARNESS'S GLASS (`crate::harness_glass`, design
+    /// `docs/DESIGN-harness-autopilot-2026-10-15.md` §9.2.3): one wake at the
+    /// end of an act's label on an Autopilot chip, or at a re-read of WHAT
+    /// THE HARNESS DID that Settings ▸ Harness owes. No label up and no read
+    /// owed arms nothing. 53: the next free slot after `SessionLog`, and the
+    /// table is append-only.
+    HarnessActs = 53,
+    /// AUTOPILOT'S TIMER (`crate::autopilot_timers`, design §9.3.6): one wake
+    /// at the earliest instant a timed Cruise lands. No timer armed arms
+    /// nothing. 54: the next free slot after `HarnessActs`.
+    AutopilotTimer = 54,
 }
 
 impl DeadlineOwner {
@@ -875,7 +919,7 @@ impl DeadlineOwner {
             27 => Self::UpgradeRealized,
             28 => Self::WakeHeal,
             29 => Self::Video,
-            30 => Self::TitleSummary,
+            30 => Self::Retired30,
             31 => Self::SessionChrome,
             32 => Self::TitleDrift,
             33 => Self::KittyTenure,
@@ -894,6 +938,12 @@ impl DeadlineOwner {
             46 => Self::KittyAnimation,
             47 => Self::RenderEpoch,
             48 => Self::DebuggerChange,
+            49 => Self::DevToolsHandOver,
+            50 => Self::ClaudeCard,
+            51 => Self::ThemePreview,
+            52 => Self::SessionLog,
+            53 => Self::HarnessActs,
+            54 => Self::AutopilotTimer,
             _ => Self::None,
         }
     }
@@ -931,7 +981,7 @@ impl DeadlineOwner {
             Self::UpgradeRealized => "upgrade_realized",
             Self::WakeHeal => "wake_heal",
             Self::Video => "video",
-            Self::TitleSummary => "title_summary",
+            Self::Retired30 => "retired-30",
             Self::SessionChrome => "session_chrome",
             Self::TitleDrift => "title_drift",
             Self::KittyTenure => "kitty_tenure",
@@ -950,6 +1000,12 @@ impl DeadlineOwner {
             Self::KittyAnimation => "kitty_animation",
             Self::RenderEpoch => "render_epoch",
             Self::DebuggerChange => "debugger_change",
+            Self::DevToolsHandOver => "devtools_hand_over",
+            Self::ClaudeCard => "claude_card",
+            Self::ThemePreview => "theme_preview",
+            Self::SessionLog => "session_log",
+            Self::HarnessActs => "harness_acts",
+            Self::AutopilotTimer => "autopilot_timer",
         }
     }
 }
@@ -1068,16 +1124,45 @@ pub(crate) fn mark_process_start() {
 /// separate from [`mark_process_start`] so the long-standing
 /// `first_present_ns` boundary stays comparable across versions and thin GUI
 /// binaries. Dyld/process-loader work precedes this stamp and remains outside
-/// both metrics.
+/// both metrics; [`process_birth_to_rust_main_ns`] measures it instead, from
+/// the wall-clock twin taken here.
 pub fn mark_rust_main_start() {
     let _ = RUST_MAIN_START.set(Instant::now());
+    let _ = RUST_MAIN_WALL.set(SystemTime::now());
 }
 
 static RUST_MAIN_START: OnceLock<Instant> = OnceLock::new();
+/// Rust `main` on the wall clock: the kernel records a process's birth only
+/// there (`pbi_start`), so this is the one clock the two can be subtracted on.
+static RUST_MAIN_WALL: OnceLock<SystemTime> = OnceLock::new();
+
 static GUI_READY_FOR_WINIT: OnceLock<Instant> = OnceLock::new();
 static FIRST_WINIT_RESUMED: OnceLock<Instant> = OnceLock::new();
 static INITIAL_SURFACE_READY: OnceLock<Instant> = OnceLock::new();
 static INITIAL_ATTACH_MILESTONES: OnceLock<StartupAttachMilestones> = OnceLock::new();
+
+/// The kernel's birth of this process → Rust `main`, in ns: everything before
+/// the first Rust instruction — the launcher's spawn (LaunchServices'
+/// `xpcproxy`, a shell's fork), a Gatekeeper hold on the exec (a quarantine
+/// prompt waits here for the person's click), dyld and page-in. An image that
+/// re-exec'd itself (the boot apply's swap) counts the image before it too:
+/// `execve` keeps the birth. `None` where the kernel keeps no wall-clock birth
+/// (off Apple), on the thin dev GUI binary (no Rust-main stamp), or when the
+/// wall clock stepped back between the two. Read at snapshot time, so the
+/// startup path pays only the one clock read in [`mark_rust_main_start`].
+pub(crate) fn process_birth_to_rust_main_ns() -> Option<u64> {
+    let main = *RUST_MAIN_WALL.get()?;
+    let birth = aterm_uds::process::read_process_birth(i32::try_from(std::process::id()).ok()?)?;
+    birth_to_main_ns(birth, main)
+}
+
+/// [`process_birth_to_rust_main_ns`]'s subtraction, on given readings.
+fn birth_to_main_ns(birth: aterm_uds::process::ProcessBirth, main: SystemTime) -> Option<u64> {
+    let born = UNIX_EPOCH
+        .checked_add(Duration::from_secs(birth.seconds))?
+        .checked_add(Duration::from_micros(birth.microseconds))?;
+    u64::try_from(main.duration_since(born).ok()?.as_nanos()).ok()
+}
 
 /// Mark the end of synchronous GUI preparation immediately before entering
 /// winit. First-write wins because a process has one startup timeline.
@@ -1543,16 +1628,18 @@ pub(crate) fn mark_backend_worker_done() {
 // each boundary a measurement, relative to the claim instant.
 //
 // OBSERVATION ONLY. Every stamp is a first-write-wins `OnceLock` set that
-// nothing reads back to decide anything, and every one is a no-op until a claim
-// is recorded — so an ordinary launch, and every launch off macOS, records
-// nothing here. The boundaries the startup ledger already stamps (`run_app`,
-// the first `resumed`, the seven attach points, the backend worker's spawn and
-// done, the first reveal) are READ from that ledger, never stamped twice.
+// nothing reads back to decide anything. Every launch records them (a cold one
+// too: its GUI preparation is split at the same boundaries, see
+// [`startup_prepare_fields_text`]), but this timeline is published only on a
+// launch that recorded a claim — `none` on an ordinary launch and off macOS.
+// The boundaries the startup ledger already stamps (`run_app`, the first
+// `resumed`, the seven attach points, the backend worker's spawn and done, the
+// first reveal) are READ from that ledger, never stamped twice.
 
-/// The boundaries only a handoff boot stamps for itself: the ones the startup
-/// ledger above has no stamp for.
+/// The boundaries the boot stamps for itself: the ones the startup ledger above
+/// has no stamp for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(not(unix), allow(dead_code))] // `Proof` is stamped on the unix lane only
+#[cfg_attr(not(unix), allow(dead_code))] // `Proof` and `Commit` are stamped on the unix lane only
 pub(crate) enum ClaimStamp {
     /// `seamless::take_incoming` returned: the intake's authentication is done.
     Intake,
@@ -1568,10 +1655,30 @@ pub(crate) enum ClaimStamp {
     RestoreDrained,
     /// The adoption proof is about to be written to the parent.
     Proof,
+    /// The winit `EventLoop`'s build began: the warm prologue has returned (or
+    /// was joined), and the launch font and grid are resolved.
+    LoopBuild,
+    /// The background services are started: the config watcher and the update
+    /// checker have returned. The package lane is not among them: it starts at
+    /// config load, before [`ClaimStamp::LoopBuild`] (`spawn_pkg_update_check`).
+    Services,
+    /// The restore take and the crash-journal claim returned, and the journal
+    /// writer exists.
+    Journal,
+    /// The control socket is planned and `control::spawn` returned.
+    Control,
+    /// The Commit arrived (the successor's commit waiter): with [`Self::Proof`]
+    /// the freeze's last segment, proof→commit, on this process's clock — the
+    /// one that outlives the outgoing process's `_exit`.
+    Commit,
+    /// The config-runtime worker was joined and its path feeds installed.
+    ConfigJoined,
+    /// The `App` was built.
+    AppBuilt,
 }
 
 impl ClaimStamp {
-    const COUNT: usize = 7;
+    const COUNT: usize = 14;
 }
 
 /// The earliest in-process instant this process stamped: the shipped binary's
@@ -1609,12 +1716,11 @@ pub(crate) fn mark_handoff_claimed(
     let _ = CLAIM_AT.set(claimed_at);
 }
 
-/// Offer one claim-relative boundary. A no-op on a launch that claimed nothing,
-/// and after the first write.
+/// Offer one boot boundary: claim-relative in the claim timeline, and the cuts
+/// of the GUI-preparation split on every launch. A no-op after the first write.
 pub(crate) fn stamp_claim(stamp: ClaimStamp) {
-    if CLAIM_AT.get().is_some() {
-        let _ = CLAIM_STAMPS[stamp as usize].set(Instant::now());
-    }
+    // `get_or_init`: a repeat offer reads no clock.
+    let _ = CLAIM_STAMPS[stamp as usize].get_or_init(Instant::now);
 }
 
 /// Everything the claim timeline is derived from, gathered so the derivation is
@@ -1658,7 +1764,7 @@ fn claim_timeline_points(inputs: &ClaimTimelineInputs) -> Vec<ClaimPoint> {
     let own = |stamp: ClaimStamp| inputs.own[stamp as usize];
     let attach = inputs.attach.map(|milestones| milestones.points);
     let attach_point = |index: usize| attach.map(|points| points[index]);
-    let ordered: [(&'static str, Option<Instant>); 23] = [
+    let ordered: [(&'static str, Option<Instant>); 30] = [
         ("main", inputs.exec),
         // Before the dial on the launched lane (P2): the worker's spawn below
         // then reads negative too, which is the point.
@@ -1666,8 +1772,14 @@ fn claim_timeline_points(inputs: &ClaimTimelineInputs) -> Vec<ClaimPoint> {
         ("dial", inputs.dial),
         ("intake", own(ClaimStamp::Intake)),
         ("worker_spawn", inputs.worker_spawn),
+        ("loop_build", own(ClaimStamp::LoopBuild)),
         ("event_loop", own(ClaimStamp::EventLoopBuilt)),
+        ("services", own(ClaimStamp::Services)),
+        ("journal", own(ClaimStamp::Journal)),
         ("adopt0", own(ClaimStamp::Adopt0)),
+        ("control", own(ClaimStamp::Control)),
+        ("config_joined", own(ClaimStamp::ConfigJoined)),
+        ("app_built", own(ClaimStamp::AppBuilt)),
         ("run_app", inputs.run_app),
         ("resumed", inputs.resumed),
         ("attach", attach_point(0)),
@@ -1686,6 +1798,9 @@ fn claim_timeline_points(inputs: &ClaimTimelineInputs) -> Vec<ClaimPoint> {
         ("restore", own(ClaimStamp::RestoreStart)),
         ("drained", own(ClaimStamp::RestoreDrained)),
         ("proof", own(ClaimStamp::Proof)),
+        // On the commit waiter's thread, after the proof's write: published
+        // from the successor, the process that is still running afterwards.
+        ("commit", own(ClaimStamp::Commit)),
     ];
     ordered
         .into_iter()
@@ -1821,6 +1936,153 @@ pub(crate) fn handoff_claim_fields_json() -> String {
         |warm| format!("{:.2}", warm.as_secs_f64() * 1000.0),
     );
     format!(",\"handoff_claim_stamps\":{stamps},\"handoff_warm_pre_dial_ms\":{warm}")
+}
+
+// ---------------------------------------------------------------------------
+// GUI PREPARATION, SPLIT (CS-2 of the 2026-10-15 launch audit).
+//
+// `startup_gui_prepare_ns` (GUI entry → ready for winit) was one number: on the
+// owner's first launch 127.69 ms, about 57 ms of it between the event loop's
+// build and the control socket with no stamp inside. The boot's own
+// [`ClaimStamp`]s cut it into ten exclusive phases on every launch — headless
+// too, whose preparation is the same code up to the event loop's run — read
+// live like the first reveal, so a launch that never presents still answers.
+// Valid only when every cut exists in boot order; the ten then sum to the
+// parent exactly, which `verify perf start` reconciles.
+
+/// Wire schema for the exclusive split of GUI entry → ready for winit.
+pub(crate) const STARTUP_PREPARE_SCHEMA: u64 = 1;
+
+/// The phases in boot order, as their `startup_prepare_<name>_ms` fields:
+///
+/// * `boot`: GUI entry → the intake. The CLI, the logger, the boot apply,
+///   containment; on a handoff, the claim's hold and the intake's checks.
+/// * `warm`: → the event loop's build. The warm prologue or its join, the
+///   launch font and grid.
+/// * `event_loop`: → built. On a macOS window, `NSApplication` and its
+///   WindowServer connection; headless, the display-free loop.
+/// * `services`: → the config watcher, update checker and package update check
+///   started.
+/// * `journal`: → the restore take and the crash-journal claim.
+/// * `session0`: → session 0 spawned or adopted.
+/// * `control`: → the control socket planned and spawned.
+/// * `config_join`: → the config-runtime worker joined. The supervisor host,
+///   the first window's state, and the join's wait.
+/// * `app`: → the `App` built. The config notices, the native lanes.
+/// * `arm`: → ready for winit. The `App`'s last wiring and the watchdog.
+pub(crate) const STARTUP_PREPARE_PHASES: [&str; PREPARE_PHASES] = [
+    "boot",
+    "warm",
+    "event_loop",
+    "services",
+    "journal",
+    "session0",
+    "control",
+    "config_join",
+    "app",
+    "arm",
+];
+
+const PREPARE_PHASES: usize = 10;
+
+/// The cuts between GUI entry and ready for winit, in boot order.
+const STARTUP_PREPARE_CUTS: [ClaimStamp; PREPARE_PHASES - 1] = [
+    ClaimStamp::Intake,
+    ClaimStamp::LoopBuild,
+    ClaimStamp::EventLoopBuilt,
+    ClaimStamp::Services,
+    ClaimStamp::Journal,
+    ClaimStamp::Adopt0,
+    ClaimStamp::Control,
+    ClaimStamp::ConfigJoined,
+    ClaimStamp::AppBuilt,
+];
+
+/// The phases between `entry`, the `cuts` and `ready`, in ns, or `None`
+/// unless every boundary exists in that order.
+fn derive_startup_prepare(
+    entry: Option<Instant>,
+    cuts: [Option<Instant>; PREPARE_PHASES - 1],
+    ready: Option<Instant>,
+) -> Option<[u64; PREPARE_PHASES]> {
+    let mut bounds = [entry?; PREPARE_PHASES + 1];
+    for (bound, cut) in bounds[1..PREPARE_PHASES].iter_mut().zip(cuts) {
+        *bound = cut?;
+    }
+    bounds[PREPARE_PHASES] = ready?;
+    let mut phases = [0u64; PREPARE_PHASES];
+    for (phase, pair) in phases.iter_mut().zip(bounds.windows(2)) {
+        *phase = duration_ns(pair[0], pair[1])?;
+    }
+    let sum = phases
+        .iter()
+        .try_fold(0u64, |total, phase| total.checked_add(*phase));
+    (sum == duration_ns(bounds[0], bounds[PREPARE_PHASES])).then_some(phases)
+}
+
+fn startup_prepare_sample(gui_prepare_ns: u64) -> Option<[u64; PREPARE_PHASES]> {
+    derive_startup_prepare(
+        PROCESS_START.get().copied(),
+        STARTUP_PREPARE_CUTS.map(|cut| CLAIM_STAMPS[cut as usize].get().copied()),
+        GUI_READY_FOR_WINIT.get().copied(),
+    )
+    // The control thread can read the parent just before readiness is
+    // published and this split just after. Only publish a valid split when
+    // it belongs to the same parent captured for this metrics reply.
+    .filter(|phases| {
+        phases.iter().try_fold(0u64, |sum, ns| sum.checked_add(*ns)) == Some(gui_prepare_ns)
+    })
+}
+
+fn ns_as_ms(ns: u64) -> f64 {
+    ns as f64 / 1_000_000.0
+}
+
+/// The `metrics` summary's fragment for everything before winit runs:
+/// ` process_birth_to_rust_main_ms=<ms|none> startup_prepare_schema=1
+/// startup_prepare_valid=<0|1> startup_prepare_boot_ms=… …`, every phase 0
+/// while the split is invalid (as the other startup partitions publish).
+#[must_use]
+pub(crate) fn startup_prepare_fields_text(gui_prepare_ns: u64) -> String {
+    use std::fmt::Write as _;
+    let birth = process_birth_to_rust_main_ns()
+        .map_or_else(|| "none".to_string(), |ns| format!("{:.2}", ns_as_ms(ns)));
+    let sample = startup_prepare_sample(gui_prepare_ns);
+    let mut out = format!(
+        " process_birth_to_rust_main_ms={birth} startup_prepare_schema={STARTUP_PREPARE_SCHEMA} \
+         startup_prepare_valid={}",
+        u8::from(sample.is_some())
+    );
+    for (name, ns) in STARTUP_PREPARE_PHASES
+        .iter()
+        .zip(sample.unwrap_or_default())
+    {
+        let _ = write!(out, " startup_prepare_{name}_ms={:.2}", ns_as_ms(ns));
+    }
+    out
+}
+
+/// Field-for-field JSON twin of [`startup_prepare_fields_text`], with a leading
+/// comma; the birth is `null` where the text says `none`.
+#[must_use]
+pub(crate) fn startup_prepare_fields_json(gui_prepare_ns: u64) -> String {
+    use std::fmt::Write as _;
+    let birth = process_birth_to_rust_main_ns()
+        .map_or_else(|| "null".to_string(), |ns| format!("{:.2}", ns_as_ms(ns)));
+    let sample = startup_prepare_sample(gui_prepare_ns);
+    let mut out = format!(
+        ",\"process_birth_to_rust_main_ms\":{birth},\
+         \"startup_prepare_schema\":{STARTUP_PREPARE_SCHEMA},\
+         \"startup_prepare_valid\":{}",
+        sample.is_some()
+    );
+    for (name, ns) in STARTUP_PREPARE_PHASES
+        .iter()
+        .zip(sample.unwrap_or_default())
+    {
+        let _ = write!(out, ",\"startup_prepare_{name}_ms\":{:.2}", ns_as_ms(ns));
+    }
+    out
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -4775,6 +5037,9 @@ pub(crate) struct Snapshot {
     pub startup_phase_schema: u64,
     pub startup_phase_valid: bool,
     pub startup_router_ns: u64,
+    /// GUI entry → ready for winit, read live from its immutable stamps even
+    /// before a first present. This one completed phase does not validate the
+    /// full present-anchored startup partition.
     pub startup_gui_prepare_ns: u64,
     pub startup_winit_dispatch_ns: u64,
     pub startup_initial_surface_attach_ns: u64,
@@ -4999,7 +5264,12 @@ pub(crate) fn snapshot() -> Snapshot {
         startup_phase_schema: STARTUP_PHASE_SCHEMA,
         startup_phase_valid: startup.phases.valid,
         startup_router_ns: startup.phases.router_ns,
-        startup_gui_prepare_ns: startup.phases.gui_prepare_ns,
+        startup_gui_prepare_ns: PROCESS_START
+            .get()
+            .copied()
+            .zip(GUI_READY_FOR_WINIT.get().copied())
+            .and_then(|(entry, ready)| duration_ns(entry, ready))
+            .unwrap_or(0),
         startup_winit_dispatch_ns: startup.phases.winit_dispatch_ns,
         startup_initial_surface_attach_ns: startup.phases.initial_surface_attach_ns,
         startup_surface_to_successful_redraw_ns: startup.phases.surface_to_successful_redraw_ns,
@@ -5104,12 +5374,19 @@ mod claim_timeline_tests {
         let claim = dial + ms(5);
         let mut own = [None; ClaimStamp::COUNT];
         own[ClaimStamp::Intake as usize] = Some(claim + ms(12));
+        own[ClaimStamp::LoopBuild as usize] = Some(claim + ms(48));
         own[ClaimStamp::Adopt0 as usize] = Some(claim + ms(99));
         own[ClaimStamp::EventLoopBuilt as usize] = Some(claim + ms(60));
+        own[ClaimStamp::Services as usize] = Some(claim + ms(66));
+        own[ClaimStamp::Journal as usize] = Some(claim + ms(80));
+        own[ClaimStamp::Control as usize] = Some(claim + ms(103));
+        own[ClaimStamp::ConfigJoined as usize] = Some(claim + ms(104));
+        own[ClaimStamp::AppBuilt as usize] = Some(claim + ms(105));
         own[ClaimStamp::FirstPresent as usize] = Some(claim + ms(203));
         own[ClaimStamp::RestoreStart as usize] = Some(claim + ms(204));
         own[ClaimStamp::RestoreDrained as usize] = Some(claim + ms(219));
         own[ClaimStamp::Proof as usize] = Some(claim + ms(223));
+        own[ClaimStamp::Commit as usize] = Some(claim + ms(256));
         let attach = [110, 115, 135, 140, 141, 160, 170].map(|n| claim + ms(n));
         ClaimTimelineInputs {
             claim,
@@ -5138,8 +5415,14 @@ mod claim_timeline_tests {
                 "dial",
                 "intake",
                 "worker_spawn",
+                "loop_build",
                 "event_loop",
+                "services",
+                "journal",
                 "adopt0",
+                "control",
+                "config_joined",
+                "app_built",
                 "run_app",
                 "resumed",
                 "attach",
@@ -5156,6 +5439,7 @@ mod claim_timeline_tests {
                 "restore",
                 "drained",
                 "proof",
+                "commit",
             ]
         );
         let at = |label: &str| points.iter().find(|(l, _)| *l == label).unwrap().1;
@@ -5167,6 +5451,8 @@ mod claim_timeline_tests {
         assert_eq!(at("surface_create"), 160_000);
         assert_eq!(at("surface_created"), 170_000);
         assert_eq!(at("proof"), 223_000);
+        // The successor's own reading of the freeze's last segment.
+        assert_eq!(at("commit") - at("proof"), 33_000);
     }
 
     #[test]
@@ -5228,6 +5514,84 @@ mod claim_timeline_tests {
         late.worker_done = Some(boot.claim + ms(141));
         let line = render_claim_timeline_log(&late);
         assert!(line.ends_with("the worker done 1.0 ms after it"), "{line}");
+    }
+}
+
+#[cfg(test)]
+mod startup_prepare_tests {
+    use super::{STARTUP_PREPARE_PHASES, birth_to_main_ns, derive_startup_prepare};
+    use std::time::{Duration, Instant, UNIX_EPOCH};
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    /// The nine cuts of a cold launch, in boot order, `entry`-relative.
+    fn cuts(entry: Instant) -> [Option<Instant>; 9] {
+        [4, 14, 34, 36, 41, 52, 60, 75, 90].map(|n| Some(entry + ms(n)))
+    }
+
+    #[test]
+    fn the_preparation_is_exclusive_phases_that_sum_to_it() {
+        let entry = Instant::now();
+        let ready = entry + ms(110);
+        let phases =
+            derive_startup_prepare(Some(entry), cuts(entry), Some(ready)).expect("every cut");
+        assert_eq!(STARTUP_PREPARE_PHASES.len(), phases.len());
+        assert_eq!(
+            phases,
+            [4, 10, 20, 2, 5, 11, 8, 15, 15, 20].map(|n| n * 1_000_000)
+        );
+        assert_eq!(
+            phases.iter().sum::<u64>(),
+            110_000_000,
+            "the parent, exactly"
+        );
+    }
+
+    #[test]
+    fn a_missing_or_out_of_order_boundary_leaves_the_split_invalid() {
+        let entry = Instant::now();
+        let ready = Some(entry + ms(110));
+        for missing in 0..9 {
+            let mut gone = cuts(entry);
+            gone[missing] = None;
+            assert_eq!(derive_startup_prepare(Some(entry), gone, ready), None);
+        }
+        assert_eq!(derive_startup_prepare(None, cuts(entry), ready), None);
+        assert_eq!(derive_startup_prepare(Some(entry), cuts(entry), None), None);
+        // The control socket stamped before session 0: not this boot's order.
+        let mut swapped = cuts(entry);
+        swapped.swap(5, 6);
+        assert_eq!(derive_startup_prepare(Some(entry), swapped, ready), None);
+        // Ready for winit before the last cut.
+        assert_eq!(
+            derive_startup_prepare(Some(entry), cuts(entry), Some(entry + ms(80))),
+            None
+        );
+    }
+
+    #[test]
+    fn birth_to_main_is_the_kernel_birth_to_the_microsecond() {
+        let birth = aterm_uds::process::ProcessBirth {
+            seconds: 1_792_118_934,
+            microseconds: 927_250,
+        };
+        let main = UNIX_EPOCH + Duration::from_secs(1_792_118_936) + Duration::from_micros(857_000);
+        assert_eq!(birth_to_main_ns(birth, main), Some(1_929_750_000));
+        // A wall clock stepped back between the two is no reading at all.
+        let before = UNIX_EPOCH + Duration::from_secs(1_792_118_934);
+        assert_eq!(birth_to_main_ns(birth, before), None);
+    }
+
+    /// The kernel's record of this very process reads on the clock it is
+    /// subtracted from: born before now.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn this_process_was_born_before_now_on_the_wall_clock() {
+        let pid = i32::try_from(std::process::id()).expect("a pid");
+        let birth = aterm_uds::process::read_process_birth(pid).expect("our own birth record");
+        assert!(birth_to_main_ns(birth, std::time::SystemTime::now()).is_some());
     }
 }
 
@@ -5448,47 +5812,6 @@ mod startup_phase_tests {
     }
 
     #[test]
-    fn initial_attach_milestones_are_parallel_first_write_wins() {
-        let slot = std::sync::Arc::new(OnceLock::new());
-        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
-        let base = Instant::now();
-        let mut workers = Vec::new();
-        for offset in [1_u64, 2] {
-            let slot = std::sync::Arc::clone(&slot);
-            let barrier = std::sync::Arc::clone(&barrier);
-            workers.push(std::thread::spawn(move || {
-                let point = base + std::time::Duration::from_millis(offset);
-                barrier.wait();
-                record_initial_attach_milestones_once(
-                    &slot,
-                    StartupAttachMilestones::new([point; 7]),
-                )
-            }));
-        }
-        barrier.wait();
-        let winners = workers
-            .into_iter()
-            .map(|worker| worker.join().expect("milestone writer"))
-            .filter(|won| *won)
-            .count();
-        assert_eq!(winners, 1, "exactly one concurrent candidate may publish");
-
-        let stored = slot.get().expect("one candidate published");
-        let replacement = base + std::time::Duration::from_millis(3);
-        assert!(
-            !record_initial_attach_milestones_once(
-                &slot,
-                StartupAttachMilestones::new([replacement; 7]),
-            ),
-            "negative control: a later window cannot replace startup milestones"
-        );
-        assert_ne!(
-            stored.points[0], replacement,
-            "the rejected candidate must not mutate the admitted timeline"
-        );
-    }
-
-    #[test]
     fn startup_phases_are_an_exact_exclusive_partition() {
         let (milestones, timing, published_at) = timeline();
         let phases = derive_startup_phases(milestones, timing, published_at);
@@ -5621,34 +5944,6 @@ mod startup_phase_tests {
         );
     }
 
-    #[test]
-    fn release_published_frame_exposes_the_same_immutable_phase_sample() {
-        let sample = std::sync::Arc::new(OnceLock::new());
-        let frames = std::sync::Arc::new(AtomicU64::new(0));
-        let expected = StartupPresentSample {
-            gui_entry_ns: 35,
-            rust_main_ns: 36,
-            phases: StartupPhaseSample {
-                valid: true,
-                router_ns: 1,
-                successful_finalize_ns: 35,
-                ..StartupPhaseSample::default()
-            },
-            attach: StartupAttachSample::default(),
-        };
-        let writer_sample = std::sync::Arc::clone(&sample);
-        let writer_frames = std::sync::Arc::clone(&frames);
-        let writer = std::thread::spawn(move || {
-            writer_sample.set(expected).unwrap();
-            writer_frames.store(1, Ordering::Release);
-        });
-        while frames.load(Ordering::Acquire) == 0 {
-            std::thread::yield_now();
-        }
-        assert_eq!(sample.get().copied(), Some(expected));
-        writer.join().unwrap();
-    }
-
     /// `input_dropped=` / `input_incoherent=` are CUMULATIVE (gap #33): they
     /// describe the one handoff this process adopted, at its birth, so a
     /// `metrics reset` taken afterwards must not erase a lost keystroke.
@@ -5670,30 +5965,6 @@ mod startup_phase_tests {
             counts,
             "a reset erased a lost keystroke"
         );
-    }
-
-    #[test]
-    fn reset_preserves_the_immutable_startup_fact() {
-        // `reset()` zeroes the per-owner arm tables the serialized
-        // `record_deadline` drivers increment-and-read, so an unserialized
-        // reset lands mid-test and (pre-existing flake) erased the arms
-        // `arms_are_attributed_to_the_owner_that_armed_them` had just booked.
-        let _serial = SCHEDULER_STATE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let before = *STARTUP_PRESENT.get_or_init(|| StartupPresentSample {
-            gui_entry_ns: 35,
-            rust_main_ns: 36,
-            phases: StartupPhaseSample {
-                valid: true,
-                router_ns: 1,
-                successful_finalize_ns: 35,
-                ..StartupPhaseSample::default()
-            },
-            attach: StartupAttachSample::default(),
-        });
-        reset();
-        assert_eq!(STARTUP_PRESENT.get().copied(), Some(before));
     }
 
     #[test]
@@ -5920,9 +6191,10 @@ mod histogram_tests {
         );
         assert_eq!(STALE_ARM_HEALS.load(Ordering::Relaxed), heals_before + 1);
 
-        // A DIFFERENT owner does not inherit the streak.
+        // A DIFFERENT owner does not inherit the streak. A tombstone: no
+        // production fold arms it, so no concurrent test shares its window.
         assert_eq!(
-            record_deadline(DeadlineOwner::TitleSummary, Some(stale), now),
+            record_deadline(DeadlineOwner::Retired30, Some(stale), now),
             Some(stale)
         );
 
@@ -6125,7 +6397,7 @@ mod histogram_tests {
     }
 
     /// ITEM 8, and the append-only wire contract that protects it. `SessionStatus`
-    /// exists so the status observer stops reporting as `title_summary`; the slot
+    /// exists so the status observer stopped reporting as `title_summary`; the slot
     /// table behind the per-owner attribution must cover it and every future
     /// sibling, or `note_owner_arm` silently drops that owner's arms on the floor.
     #[test]
@@ -6187,15 +6459,41 @@ mod histogram_tests {
         // Slot 48 is the debugger-access change's result re-read.
         assert_eq!(DeadlineOwner::from_raw(48), DeadlineOwner::DebuggerChange);
         assert_eq!(DeadlineOwner::DebuggerChange.as_str(), "debugger_change");
+        // Slot 49 is the Developer Tools hand-over: its quiet-moment look and the
+        // helper panel's turn are never charged to the debugger change.
+        assert_eq!(DeadlineOwner::from_raw(49), DeadlineOwner::DevToolsHandOver);
+        assert_eq!(
+            DeadlineOwner::DevToolsHandOver.as_str(),
+            "devtools_hand_over"
+        );
+        // Slot 50 is the harness card's episode frames and its settled frame.
+        assert_eq!(DeadlineOwner::from_raw(50), DeadlineOwner::ClaudeCard);
+        assert_eq!(DeadlineOwner::ClaudeCard.as_str(), "claude_card");
+        // Slot 52 is the session log's settle tick: a resting turn's close is
+        // never charged to the status observer whose sweep published the word.
+        assert_eq!(DeadlineOwner::from_raw(52), DeadlineOwner::SessionLog);
+        assert_eq!(DeadlineOwner::SessionLog.as_str(), "session_log");
+        // Slots 53 and 54 are the harness's glass and Autopilot's timer
+        // (design §9.2.3, §9.3.6): a label's end and a timed landing are
+        // never charged to the harness card or the session log.
+        assert_eq!(DeadlineOwner::from_raw(53), DeadlineOwner::HarnessActs);
+        assert_eq!(DeadlineOwner::HarnessActs.as_str(), "harness_acts");
+        assert_eq!(DeadlineOwner::from_raw(54), DeadlineOwner::AutopilotTimer);
+        assert_eq!(DeadlineOwner::AutopilotTimer.as_str(), "autopilot_timer");
         // Slot 22 is a tombstone (2026-09-22): the config banner's owner
         // retired with `config_notice.rs`, and the number stays taken under a
         // label no live owner wears, so an older wire reader never attributes
         // a later owner's arms to the banner.
         assert_eq!(DeadlineOwner::from_raw(22), DeadlineOwner::Retired22);
         assert_eq!(DeadlineOwner::Retired22.as_str(), "retired-22");
+        // Slot 30 is a tombstone too (2026-10-15): the Smart Titles retry lane
+        // retired with `title_summary.rs`, and the status observer that once
+        // shared its label keeps its own.
+        assert_eq!(DeadlineOwner::from_raw(30), DeadlineOwner::Retired30);
+        assert_eq!(DeadlineOwner::Retired30.as_str(), "retired-30");
         assert_ne!(
             DeadlineOwner::SessionStatus.as_str(),
-            DeadlineOwner::TitleSummary.as_str(),
+            DeadlineOwner::Retired30.as_str(),
             "the two folds that shared a label must not share one again"
         );
         // Every slot below the count decodes to a DISTINCT owner whose own
@@ -6650,13 +6948,13 @@ mod lateness_attribution_tests {
         let after: u64 = deadline_fire_attribution().iter().map(|(_, n)| n).sum();
         assert_eq!(before, after, "an interrupted deadline did not fire");
 
-        note_user_wake(&crate::Wake::TitleSummaryReady);
-        note_user_wake(&crate::Wake::TitleSummaryReady);
+        note_user_wake(&crate::Wake::WarmupResult);
+        note_user_wake(&crate::Wake::WarmupResult);
         let wakes = user_wake_attribution();
         assert!(
             wakes
                 .iter()
-                .any(|(name, n)| *name == "TitleSummaryReady" && *n >= 2),
+                .any(|(name, n)| *name == "WarmupResult" && *n >= 2),
             "{wakes:?}"
         );
 

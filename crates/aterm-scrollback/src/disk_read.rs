@@ -10,12 +10,10 @@ use crate::line::Line;
 use std::io;
 
 impl DiskColdTier {
-    /// Get a line by index (0 = oldest available line, accounting for front_offset).
+    /// Get a line by index (0 = oldest available line, after front_offset).
     ///
-    /// Takes `&self` despite updating the LRU cache internally, because the
-    /// cache fields use interior mutability (`RefCell`/`Cell`).
-    ///
-    /// Returns `Ok(None)` for out-of-bounds, `Err` for I/O or decompression failures.
+    /// Takes `&self`: the LRU cache uses interior mutability (`RefCell`/`Cell`).
+    /// Returns `Ok(None)` out of bounds, `Err` for I/O or decompression failures.
     pub(crate) fn get_line(&self, idx: usize) -> Result<Option<Line>, ScrollbackError> {
         if idx >= self.line_count {
             return Ok(None);
@@ -40,14 +38,11 @@ impl DiskColdTier {
         Ok(Some(line))
     }
 
-    /// Resolve a PHYSICAL line index to `(page_idx, line_in_page)`.
+    /// Resolve a physical line index to `(page_idx, line_in_page)`.
     ///
-    /// The single home for the cumulative-index geometry, shared by the
-    /// random-access read path (`get_line`) and the block-streaming bulk
-    /// path (`take_lines_from`/`segment_len_at`) so the two cannot drift.
-    /// Errors carry the same corruption semantics the inline math had:
-    /// a missing page for an in-range index, or a page start exceeding the
-    /// physical index (desynchronized index), are bad on-disk data.
+    /// Shared by `get_line` and the bulk path (`take_lines_from`/`segment_len_at`)
+    /// so the two cannot drift. A missing page for an in-range index, or a page
+    /// start past the physical index, is bad on-disk data.
     fn locate(&self, physical_idx: usize) -> Result<(usize, usize), ScrollbackError> {
         let Some(page_idx) = self.find_page(physical_idx) else {
             return Err(ScrollbackError::Io(io::Error::new(
@@ -73,9 +68,8 @@ impl DiskColdTier {
             .checked_add(self.cumulative_base)
             .and_then(|abs| abs.checked_sub(page_start))
         else {
-            // find_page returned a page whose start exceeds the physical index.
-            // This can only happen if the index/cumulative_lines are corrupt or
-            // desynchronized; treat it as bad on-disk data rather than wrapping.
+            // Only a corrupt or desynchronized index puts the page start past the
+            // physical index: bad on-disk data, not a wrap.
             return Err(ScrollbackError::Io(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
@@ -86,12 +80,10 @@ impl DiskColdTier {
         Ok((page_idx, line_in_page))
     }
 
-    /// Decode the page containing logical line `idx` and return OWNED lines
-    /// from `idx` through the end of that page — the bulk-walk primitive
-    /// (ST-6). One decode per page, splitting only a partial prefix: no
-    /// per-line binary search or `Line` clone, and NO insertion into the LRU page
-    /// cache (a full-history walk must not evict the pages the viewport is
-    /// reading; `decompress_page` alone does not cache).
+    /// Decode the page containing logical line `idx` and return owned lines from
+    /// `idx` to the page end: the bulk-walk primitive. One decode per page, no
+    /// per-line search or clone, and no insertion into the LRU cache (a full-history
+    /// walk must not evict the pages the viewport is reading).
     ///
     /// Returns an empty vec for an out-of-bounds `idx`.
     pub(crate) fn take_lines_from(&self, idx: usize) -> Result<Vec<Line>, ScrollbackError> {
@@ -101,8 +93,7 @@ impl DiskColdTier {
         let physical_idx = idx + self.front_offset;
         let (page_idx, line_in_page) = self.locate(physical_idx)?;
         let mut lines = self.decompress_page(page_idx)?;
-        // Full pages already own exactly the segment the iterator needs.
-        // Avoid split_off(0)'s spare allocation for a source Vec we discard.
+        // A full page is already the segment; skip split_off(0)'s spare allocation.
         if line_in_page == 0 {
             return Ok(lines);
         }
@@ -113,10 +104,8 @@ impl DiskColdTier {
         Ok(lines.split_off(split_at))
     }
 
-    /// Logical lines from `idx` through the end of its containing page —
-    /// how far a bulk walk skips when that page fails to decode (its whole
-    /// remaining span, matching the per-line skip total of the old
-    /// line-at-a-time walk). Zero when out of bounds. Never decodes.
+    /// Logical lines from `idx` through the end of its page: how far a bulk walk
+    /// skips when that page fails to decode. Zero when out of bounds. Never decodes.
     pub(crate) fn segment_len_at(&self, idx: usize) -> usize {
         if idx >= self.line_count {
             return 0;
@@ -125,9 +114,8 @@ impl DiskColdTier {
         let Ok((page_idx, _)) = self.locate(physical_idx) else {
             return 0;
         };
-        // ABSOLUTE live entry minus the dropped-prefix base (ST-3 base-offset
-        // index): yields the physical end relative to the live front, exactly
-        // what the pre-ST-3 relative entry held.
+        // Live entries are absolute; minus the dropped-prefix base, this is the
+        // physical page end relative to the live front.
         let page_end = self
             .live_cumulative()
             .get(page_idx)
@@ -135,7 +123,7 @@ impl DiskColdTier {
             .unwrap_or(self.cumulative_base)
             .saturating_sub(self.cumulative_base);
         // Physical page end -> logical, clamped by the tier's logical count
-        // (the last page's physical end IS the logical end), minus `idx`.
+        // (the last page's physical end is the logical end), minus `idx`.
         page_end
             .saturating_sub(self.front_offset)
             .min(self.line_count)
@@ -144,10 +132,9 @@ impl DiskColdTier {
 
     /// Find the page containing the given line index.
     pub(super) fn find_page(&self, line_idx: usize) -> Option<usize> {
-        // Binary search through the LIVE cumulative entries for the ABSOLUTE
-        // target: stored values are never rebased on front drops, so the
-        // dropped-prefix base is added to the query instead. Live indices
-        // are exactly the live page indices.
+        // Search the live cumulative entries for the absolute target: stored values
+        // are never rebased on front drops, so the dropped-prefix base is added to
+        // the query. Live indices are live page indices.
         let live = self.live_cumulative();
         let target = line_idx
             .saturating_add(self.cumulative_base)
@@ -164,16 +151,13 @@ impl DiskColdTier {
         }
     }
 
-    /// Load a single line from a page (from cache or disk).
-    ///
-    /// Extracts one line without cloning the entire page Vec on cache hits.
-    /// Uses interior mutability to update the LRU cache while taking `&self`.
+    /// Load one line from a page, from cache or disk.
     fn load_line(
         &self,
         page_idx: usize,
         line_in_page: usize,
     ) -> Result<Option<Line>, ScrollbackError> {
-        // Check cache first — borrow and extract single line
+        // Cache hit: clone just the one line.
         {
             let mut cache = self.cache.borrow_mut();
             if let Some(entry) = cache.get_mut(&page_idx) {
@@ -184,8 +168,7 @@ impl DiskColdTier {
             }
         }
 
-        // Cache miss: decompress, extract line, then cache (no extra clone)
-        // decompress_page and cache_page are in disk_memory.rs
+        // Cache miss: decompress, extract the line, then cache the page.
         let lines = self.decompress_page(page_idx)?;
         let line = lines.get(line_in_page).cloned();
         self.cache_page(page_idx, lines);

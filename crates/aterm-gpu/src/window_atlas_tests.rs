@@ -183,6 +183,7 @@ impl Handles {
                             .get()
                             .expect("native sprite upload")
                             .tex
+                            .metal()
                             .clone_handle()
                     })
                     .chain(std::iter::once(
@@ -193,6 +194,7 @@ impl Handles {
                             .as_ref()
                             .expect("native image upload")
                             .tex
+                            .metal()
                             .clone_handle(),
                     ))
                     .collect()
@@ -242,13 +244,8 @@ fn observed(model_state: &State, windows: &[WindowGpu; 2]) -> State {
 }
 
 fn run_ownership_replay(native: bool) {
-    let mut gpu = match GpuRenderer::new(18.0, aterm_render::Theme::default()) {
-        Ok(gpu) => gpu,
-        Err(e) => {
-            crate::stderr_line!("SKIP: window atlas GPU fixture unavailable: {e}");
-            return;
-        }
-    };
+    let mut gpu =
+        crate::renderer::gpu_renderer_for_test(None, 18.0, aterm_render::Theme::default());
     #[cfg(target_os = "macos")]
     if !native {
         gpu.disarm_metal_for_test();
@@ -478,13 +475,8 @@ fn shared_observation(model_state: &State, windows: &[WindowGpu; 2]) -> State {
 }
 
 fn run_sharing_replay(native: bool) {
-    let mut gpu = match GpuRenderer::new(18.0, aterm_render::Theme::default()) {
-        Ok(gpu) => gpu,
-        Err(e) => {
-            crate::stderr_line!("SKIP: shared artwork GPU fixture unavailable: {e}");
-            return;
-        }
-    };
+    let mut gpu =
+        crate::renderer::gpu_renderer_for_test(None, 18.0, aterm_render::Theme::default());
     #[cfg(target_os = "macos")]
     if !native {
         gpu.disarm_metal_for_test();

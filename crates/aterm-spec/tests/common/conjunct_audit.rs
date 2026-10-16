@@ -1,18 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-//! THE GUARD-CONJUNCT AUDIT, measured — shared by every Tier-0 test that pins what
-//! each conjunct of a model's guards carries (`derived_trail_sound_ty.rs`,
-//! `derived_release_publish_once.rs`).
+//! The guard-conjunct audit, shared by the Tier-0 tests that pin what each conjunct of a model's
+//! guards carries (`derived_trail_sound_ty.rs`, `derived_release_publish_once.rs`).
 //!
-//! The recorded gap it exists for: a green run missed a real race because a guard
-//! CONJUNCT made the racing state unreachable and the invariant naming it was
-//! vacuously true. For every top-level conjunct of every guard the audit reports WHAT
-//! DROPPING IT DOES on the committed machine (`Buggy = 0`): which invariants fail,
-//! each checked ALONE, and whether it changes a NON-STUTTER reachable transition (a
-//! self-loop is not behaviour). Each test declares the answer it expects, so a new
-//! guard, or a guard that starts or stops carrying an invariant, fails until it is
-//! declared.
+//! A guard conjunct can make a racing state unreachable and leave the invariant naming it
+//! vacuously true. For each top-level conjunct of each guard, the audit reports what dropping it
+//! does on the committed machine (`Buggy = 0`): which invariants fail, each checked alone, and
+//! whether a non-stutter reachable transition changes. Each test declares the answers it expects,
+//! so a new guard, or one that starts or stops carrying an invariant, fails until declared.
 
 use std::collections::{BTreeSet, VecDeque};
 
@@ -41,9 +37,8 @@ fn conjoin(parts: Vec<Expr>) -> Option<Expr> {
 /// A state as an ordered, comparable key.
 type StateKey = Vec<(&'static str, i64)>;
 
-/// Every reachable NON-STUTTER `(pre, action, post)` edge of `m`. A self-loop
-/// changes no state, so a guard that only suppresses self-loops is not
-/// load-bearing behaviour, and must not read as such.
+/// Every reachable non-stutter `(pre, action, post)` edge of `m`. A self-loop changes no state, so
+/// a guard that only suppresses self-loops does not change behaviour.
 fn edges(m: &Model) -> BTreeSet<(StateKey, &'static str, StateKey)> {
     let key = |s: &State| s.iter().map(|(k, v)| (*k, *v)).collect::<Vec<_>>();
     let mut seen = BTreeSet::new();
@@ -72,7 +67,7 @@ fn edges(m: &Model) -> BTreeSet<(StateKey, &'static str, StateKey)> {
 pub struct ConjunctReport {
     pub action: &'static str,
     pub index: usize,
-    /// The invariants that FAIL once it is dropped, each checked alone.
+    /// The invariants that fail once it is dropped, each checked alone.
     pub carries: Vec<&'static str>,
     /// Whether it changes a non-stutter reachable transition.
     pub changes_behaviour: bool,

@@ -8,19 +8,6 @@ use std::fmt::Write as _;
 #[cfg(any(unix, windows))]
 use std::process::Command;
 
-const APP_ZSH_RESOURCE: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../apps/aterm-mac/Sources/ATermMac/Resources/ShellIntegration/aterm_shell_integration.zsh"
-));
-const APP_BASH_RESOURCE: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../apps/aterm-mac/Sources/ATermMac/Resources/ShellIntegration/aterm_shell_integration.bash"
-));
-const APP_FISH_RESOURCE: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../apps/aterm-mac/Sources/ATermMac/Resources/ShellIntegration/aterm_shell_integration.fish"
-));
-
 #[cfg(unix)]
 fn run_urlencode_via_shell(
     shell: &str,
@@ -31,7 +18,7 @@ fn run_urlencode_via_shell(
 ) -> String {
     let script = format!("{}/src/scripts/{script_name}", env!("CARGO_MANIFEST_DIR"));
     let command = format!(
-        "source \"$ATERM_TEST_SCRIPT\" >/dev/null 2>&1; {cleanup}; printf '%s' \"$(__aterm_urlencode \"$ATERM_TEST_CWD\")\""
+        "source \"$ATERM_TEST_SCRIPT\" >/dev/null 2>&1; {cleanup}; __aterm_urlencode \"$ATERM_TEST_CWD\"; printf '%s' \"$REPLY\""
     );
     let output = shell_command(shell)
         .args(args)
@@ -368,15 +355,6 @@ fn create_special_cwd() -> (aterm_tempfile::TempDir, std::path::PathBuf) {
     let cwd = dir.path().join("résumé @[test]!");
     std::fs::create_dir(&cwd).expect("create special-character cwd for OSC 7 test");
     (dir, cwd)
-}
-
-#[test]
-fn test_app_zsh_resource_matches_embedded_script() {
-    assert_eq!(
-        scripts::ZSH,
-        APP_ZSH_RESOURCE,
-        "app zsh resource must stay byte-identical to the embedded canonical script"
-    );
 }
 
 /// Static guard (host-portable): the `shell.d` hook globs MUST carry zsh's `(N)`
@@ -766,24 +744,6 @@ fn test_powershell_moves_the_agents_dir_to_the_front_before_the_reroute_block() 
     assert!(ps.contains("$env:PATH = (@($env:ATPKG_AGENTS) + $__aterm_rest) -join $__aterm_sep"));
 }
 
-#[test]
-fn test_app_bash_resource_matches_embedded_script() {
-    assert_eq!(
-        scripts::BASH,
-        APP_BASH_RESOURCE,
-        "app bash resource must stay byte-identical to the embedded canonical script"
-    );
-}
-
-#[test]
-fn test_app_fish_resource_matches_embedded_script() {
-    assert_eq!(
-        scripts::FISH,
-        APP_FISH_RESOURCE,
-        "app fish resource must stay byte-identical to the embedded canonical script"
-    );
-}
-
 #[cfg(unix)]
 #[test]
 fn test_bash_urlencode_handles_special_and_unicode_paths() {
@@ -810,6 +770,119 @@ fn test_zsh_urlencode_handles_special_and_unicode_paths() {
         "add-zsh-hook -d precmd __aterm_precmd 2>/dev/null || true; add-zsh-hook -d preexec __aterm_preexec 2>/dev/null || true; setopt ksh_arrays",
         "aterm_shell_integration.zsh",
     );
+}
+
+/// The 633;E encoding of `line`, byte for byte: backslash, semicolon and space
+/// spelled as escapes, every control byte as `\xNN`, every other byte as it is.
+#[cfg(unix)]
+fn osc633_encode(line: &str) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(line.len());
+    for &byte in line.as_bytes() {
+        match byte {
+            b'\\' => encoded.extend_from_slice(br"\\"),
+            b';' => encoded.extend_from_slice(br"\x3b"),
+            b' ' => encoded.extend_from_slice(br"\x20"),
+            0x00..=0x1f | 0x7f => encoded.extend_from_slice(format!(r"\x{byte:02x}").as_bytes()),
+            _ => encoded.push(byte),
+        }
+    }
+    encoded
+}
+
+/// THE ENCODERS ANSWER IN `REPLY`, FORK-FREE, WITH THE BYTES THEY PRINTED: over
+/// spaces, `%`, Unicode, a newline, a tab, ESC/BEL, DEL, `;` and `\\`, the empty
+/// string and a path needing nothing, bash's and zsh's `__aterm_urlencode` and
+/// `__aterm_encode_cmd` leave in `REPLY` the percent- and 633;E-encodings
+/// spelled out above — zsh under a user's KSH_ARRAYS too. And a user's own
+/// `REPLY` survives the prompt's OSC 7 (and zsh's preexec), whose callers keep
+/// theirs local.
+#[cfg(unix)]
+#[test]
+fn test_encoders_answer_in_reply_and_keep_the_users() {
+    let corpus = [
+        "/tmp/a b",
+        "/tmp/100%",
+        "/tmp/résumé 🦀",
+        "/tmp/a\nb",
+        "/tmp/tab\there",
+        "/tmp/\u{1b}]52;c;x\u{7}",
+        "/tmp/del\u{7f}",
+        "/x/;\\y",
+        "",
+        "plain/path-1_2.~",
+    ];
+    let mut command = String::new();
+    for i in 0..corpus.len() {
+        write!(
+            command,
+            "__aterm_urlencode \"$ATERM_TEST_IN_{i}\"; printf '%s\\0' \"$REPLY\"; \
+             __aterm_encode_cmd \"$ATERM_TEST_IN_{i}\"; printf '%s\\0' \"$REPLY\"; "
+        )
+        .expect("write to String");
+    }
+    let mut want = Vec::new();
+    for line in corpus {
+        want.extend_from_slice(osc7_percent_encode(line).as_bytes());
+        want.push(0);
+        want.extend(osc633_encode(line));
+        want.push(0);
+    }
+    let zsh_quiet = "add-zsh-hook -d precmd __aterm_precmd 2>/dev/null || true; \
+                     add-zsh-hook -d preexec __aterm_preexec 2>/dev/null || true";
+    let bash_quiet = "__aterm_in_prompt_cmd=1; trap - DEBUG 2>/dev/null || true; PROMPT_COMMAND=";
+    let mut runs: Vec<(&str, &[&str], String, &str, &str)> = vec![(
+        bash_shell(),
+        &["--noprofile", "--norc", "-i"],
+        bash_quiet.to_owned(),
+        "aterm_shell_integration.bash",
+        "",
+    )];
+    if let Some(zsh) = zsh_shell() {
+        for options in ["", "setopt ksh_arrays"] {
+            runs.push((
+                zsh,
+                &["-f", "-i"],
+                format!("{zsh_quiet}; {options}"),
+                "aterm_shell_integration.zsh",
+                "__aterm_preexec 'echo hi' >/dev/null; ",
+            ));
+        }
+    }
+    for (shell, args, quiet, script_name, preexec) in runs {
+        let script = format!("{}/src/scripts/{script_name}", env!("CARGO_MANIFEST_DIR"));
+        let line = format!(
+            "source \"$ATERM_TEST_SCRIPT\" >/dev/null 2>&1; {quiet}; {command}\
+             REPLY=mine; __aterm_report_cwd >/dev/null; {preexec}printf 'KEPT=%s' \"$REPLY\""
+        );
+        let mut cmd = shell_command(shell);
+        cmd.args(args)
+            .arg("-c")
+            .arg(&line)
+            .env("ATERM_TEST_SCRIPT", script);
+        for (i, input) in corpus.iter().enumerate() {
+            cmd.env(format!("ATERM_TEST_IN_{i}"), input);
+        }
+        let output = cmd
+            .output()
+            .unwrap_or_else(|error| panic!("spawn {shell} for the encoder corpus: {error}"));
+        assert!(
+            output.status.success(),
+            "{shell} {quiet}: stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let mut got = output.stdout;
+        // An interactive bash may lead with its readline meta-mode probe.
+        if let Some(start) = got.len().checked_sub(want.len() + b"KEPT=mine".len()) {
+            got.drain(..start);
+        }
+        let (encoded, kept) = got.split_at(got.len().saturating_sub(b"KEPT=mine".len()));
+        assert_eq!(
+            String::from_utf8_lossy(encoded),
+            String::from_utf8_lossy(&want),
+            "{shell} {quiet}: encodings"
+        );
+        assert_eq!(kept, b"KEPT=mine", "{shell} {quiet}: the user's REPLY");
+    }
 }
 
 #[cfg(unix)]
@@ -942,15 +1015,19 @@ fn test_bash_preexec_skips_prompt_command_array_siblings() {
         env!("CARGO_MANIFEST_DIR")
     );
     // One prompt cycle exactly as bash runs an array PROMPT_COMMAND: each element
-    // is a top-level DEBUG-trapped command, ours first, the sibling after ours
-    // returned. The marker rides an `__aterm_`-prefixed function so the guard
-    // skips it identically before and after the fix.
+    // is a top-level DEBUG-trapped command, ours first, the siblings after ours
+    // returned. Two siblings, so the array is taken as one (an array with
+    // nothing at index 1 runs the scalar way — the next test). The marker rides
+    // an `__aterm_`-prefixed function so the guard skips it identically before
+    // and after the fix.
     let command = "\
 __fake_vte_precmd() { :; }\n\
-PROMPT_COMMAND=(__fake_vte_precmd)\n\
+__fake_starship_precmd() { :; }\n\
+PROMPT_COMMAND=(__fake_vte_precmd __fake_starship_precmd)\n\
 source \"$ATERM_TEST_SCRIPT\"\n\
 __aterm_prompt_command\n\
 __fake_vte_precmd\n\
+__fake_starship_precmd\n\
 __aterm_test_marker() { printf '===CYCLE-DONE==='; }\n\
 __aterm_test_marker\n\
 echo real-command\n";
@@ -984,6 +1061,49 @@ echo real-command\n";
     assert!(
         after.contains("\u{1b}]133;C\u{7}"),
         "the real command must emit the 133;C command start: {after:?}"
+    );
+}
+
+/// An array PROMPT_COMMAND with nothing at index 1 is taken the scalar way, read
+/// without a fork: ours takes element 0 and evals what it held, so the user's
+/// element runs once a prompt on every bash. Taken as an array (what the forked
+/// `declare -p` read made of it), ours went first and the user's after — which
+/// bash before 5.1, running element 0 alone, never ran. A bash runs element 0 of
+/// a one-element array on every version, so `eval "$PROMPT_COMMAND"` is the
+/// prompt here.
+#[cfg(unix)]
+#[test]
+fn test_bash_prompt_command_array_of_one_runs_its_element_once_a_prompt() {
+    let script = format!(
+        "{}/src/scripts/aterm_shell_integration.bash",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let command = "\
+__user_precmd() { printf '[user-precmd]'; }\n\
+PROMPT_COMMAND=(__user_precmd)\n\
+source \"$ATERM_TEST_SCRIPT\"\n\
+printf '[n=%s first=%s]' \"${#PROMPT_COMMAND[@]}\" \"${PROMPT_COMMAND[0]}\"\n\
+eval \"$PROMPT_COMMAND\"\n\
+eval \"$PROMPT_COMMAND\"\n";
+    let output = shell_command(bash_shell())
+        .args(["--noprofile", "--norc", "-i", "-c", command])
+        .env("ATERM_TEST_SCRIPT", &script)
+        .output()
+        .unwrap_or_else(|error| panic!("spawn bash for the one-element array test: {error}"));
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(
+        output.status.success(),
+        "stdout: {stdout:?}; stderr: {:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("[n=1 first=__aterm_prompt_command]"),
+        "ours takes element 0 and adds none: {stdout:?}"
+    );
+    assert_eq!(
+        stdout.matches("[user-precmd]").count(),
+        2,
+        "the user's element runs once a prompt, two prompts: {stdout:?}"
     );
 }
 
@@ -1097,13 +1217,6 @@ fn test_detect_posix_shells() {
 }
 
 #[test]
-fn test_scripts_contain_prompt_override() {
-    assert!(scripts::ZSH.contains("ATERM_PROMPT_STYLE"));
-    assert!(scripts::BASH.contains("ATERM_PROMPT_STYLE"));
-    assert!(scripts::FISH.contains("ATERM_PROMPT_STYLE"));
-}
-
-#[test]
 fn test_cwd_tab_title_strips_control_chars() {
     // A directory name may contain any byte except '/' and NUL, so a crafted
     // name could embed BEL/ESC and smuggle a nested OSC (e.g. a clipboard
@@ -1150,14 +1263,6 @@ fn test_fish_encode_cmd_escapes_all_control_bytes() {
         scripts::FISH.contains(r#"string match -qr '[\x00-\x1f\x7f]' -- "$i""#),
         "fish __aterm_encode_cmd must hex-escape all C0/DEL control bytes \
          rather than passing them through verbatim"
-    );
-    // The app-bundle copy is the fish script actually shipped to macOS users,
-    // so it must carry the identical guard. (Byte-for-byte identity with the
-    // canonical script is separately enforced by
-    // test_app_fish_resource_matches_embedded_script.)
-    assert!(
-        APP_FISH_RESOURCE.contains(r#"string match -qr '[\x00-\x1f\x7f]' -- "$i""#),
-        "shipped fish resource must also hex-escape all C0/DEL control bytes"
     );
 }
 
@@ -1264,15 +1369,15 @@ const OSC_PROBE_EXPECTED_TITLE: &str =
 /// Drive the two emissions `preexec` performs, through the real
 /// `__aterm_osc` frame writer, and return the raw stdout bytes.
 ///
-/// The snippet is spelled identically for bash and zsh — both write command
-/// substitution as `$(…)` and control-stripping as `${v//[[:cntrl:]]/}` — so
+/// The snippet is spelled identically for bash and zsh — both encoders answer
+/// in `REPLY` and both write control-stripping as `${v//[[:cntrl:]]/}` — so
 /// the same source line is exercised in both shells.
 #[cfg(unix)]
 fn run_osc_wire_probe(shell: &str, args: &[&str], cleanup: &str, script_name: &str) -> Vec<u8> {
     let script = format!("{}/src/scripts/{script_name}", env!("CARGO_MANIFEST_DIR"));
     let command = format!(
         "source \"$ATERM_TEST_SCRIPT\" >/dev/null 2>&1; {cleanup}; \
-         __aterm_osc \"633;E;$(__aterm_encode_cmd \"$ATERM_TEST_INPUT\")\"; \
+         __aterm_encode_cmd \"$ATERM_TEST_INPUT\"; __aterm_osc \"633;E;$REPLY\"; \
          __aterm_osc \"0;${{ATERM_TEST_INPUT//[[:cntrl:]]/}}\""
     );
     let output = shell_command(shell)
@@ -1434,7 +1539,7 @@ fn test_prepare_cached_skips_rewrite_and_self_heals() {
     let zsh = base
         .join(script_set_address())
         .join("aterm_shell_integration.zsh");
-    assert_eq!(std::fs::read_to_string(&zsh).unwrap(), scripts::ZSH);
+    assert_eq!(std::fs::read_to_string(&zsh).unwrap(), installed_zsh());
 
     // Second call with the same base must skip the writes: clobber the
     // script with a sentinel and verify it is NOT restored.
@@ -1456,7 +1561,7 @@ fn test_prepare_cached_skips_rewrite_and_self_heals() {
         .unwrap();
     assert_eq!(
         std::fs::read_to_string(&zsh).unwrap(),
-        scripts::ZSH,
+        installed_zsh(),
         "prepare must rewrite scripts when the cache dir was deleted mid-run"
     );
 }
@@ -1491,7 +1596,7 @@ fn test_prepare_cached_rewrites_on_base_change() {
     prepare_cached(ShellType::Bash, base_a.clone(), &written)
         .unwrap()
         .unwrap();
-    assert_eq!(std::fs::read_to_string(&a_zsh).unwrap(), scripts::ZSH);
+    assert_eq!(std::fs::read_to_string(&a_zsh).unwrap(), installed_zsh());
 }
 
 #[test]
@@ -1614,23 +1719,6 @@ fn test_bash_default_mode_embeds_133b_in_ps1() {
 }
 
 #[test]
-fn test_bash_prompt_command_guard_prevents_spurious_capture() {
-    let script = scripts::BASH;
-    assert!(
-        script.contains("__aterm_in_prompt_cmd=1"),
-        "bash must set guard flag at start of PROMPT_COMMAND"
-    );
-    assert!(
-        script.contains("__aterm_in_prompt_cmd=0"),
-        "bash must clear guard flag at end of PROMPT_COMMAND"
-    );
-    assert!(
-        script.contains("(( __aterm_in_prompt_cmd )) && return"),
-        "bash preexec must check guard flag to skip PROMPT_COMMAND commands"
-    );
-}
-
-#[test]
 fn test_fish_powerline_sep_uses_separator_color() {
     let script = scripts::FISH;
     // The separator is now built from the ALREADY-RESOLVED `$s` / `$r` locals
@@ -1716,7 +1804,7 @@ fn test_bash_mark_functions_invoke_id_suffix() {
     }
     // OSC 633;E must also carry the nonce.
     assert!(
-        script.contains(r#""633;E;$(__aterm_encode_cmd "$BASH_COMMAND")${__aterm_id_suffix_str}""#),
+        script.contains(r#""633;E;${REPLY}${__aterm_id_suffix_str}""#),
         "bash script must emit OSC 633;E with id suffix"
     );
     // ...and the precomputed suffix must actually be derived from the captured
@@ -1746,7 +1834,7 @@ fn test_zsh_mark_functions_invoke_id_suffix() {
         );
     }
     assert!(
-        script.contains(r#""633;E;$(__aterm_encode_cmd "$1")${__aterm_id_suffix_str}""#),
+        script.contains(r#""633;E;${REPLY}${__aterm_id_suffix_str}""#),
         "zsh script must emit OSC 633;E with id suffix"
     );
     assert!(
@@ -1828,23 +1916,19 @@ fn test_fish_mark_functions_invoke_id_suffix() {
 /// `test_fish_integration_loads_under_an_empty_guard_override`.
 #[test]
 fn test_fish_loaded_guard_survives_an_empty_override() {
-    for (label, script) in [
-        ("embedded", scripts::FISH),
-        ("app-bundle", APP_FISH_RESOURCE),
-    ] {
-        assert!(
-            script.contains(r#"if test -n "$ATERM_SHELL_INTEGRATION_INSTALLED""#),
-            "{label} fish script must guard on NON-EMPTINESS, matching the \
-             bash/zsh `[[ -n … ]]` spelling that aterm's empty-string spawn \
-             override is built to defuse"
-        );
-        assert!(
-            !script.contains("if set -q ATERM_SHELL_INTEGRATION_INSTALLED"),
-            "{label} fish script re-introduced the `set -q` loader guard: \
-             `set -q` is true for an empty-but-SET variable, so aterm's \
-             nested-launch override kills the integration outright"
-        );
-    }
+    let (label, script) = ("embedded", scripts::FISH);
+    assert!(
+        script.contains(r#"if test -n "$ATERM_SHELL_INTEGRATION_INSTALLED""#),
+        "{label} fish script must guard on NON-EMPTINESS, matching the \
+         bash/zsh `[[ -n … ]]` spelling that aterm's empty-string spawn \
+         override is built to defuse"
+    );
+    assert!(
+        !script.contains("if set -q ATERM_SHELL_INTEGRATION_INSTALLED"),
+        "{label} fish script re-introduced the `set -q` loader guard: \
+         `set -q` is true for an empty-but-SET variable, so aterm's \
+         nested-launch override kills the integration outright"
+    );
 }
 
 /// Source the fish integration in an interactive fish and return the whole
@@ -2040,26 +2124,22 @@ fn test_fish_marks_carry_the_nonce_when_set() {
 /// `ATERM_SHELL_NONCE` from being inherited by every child process.
 #[test]
 fn test_fish_never_tests_definedness_of_an_aterm_variable() {
-    for (label, script) in [
-        ("embedded", scripts::FISH),
-        ("app-bundle", APP_FISH_RESOURCE),
-    ] {
-        let offenders: Vec<&str> = script
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.starts_with('#'))
-            .filter(|line| line.contains("set -q ATERM_"))
-            .filter(|line| !line.contains("set -q ATERM_SHELL_NONCE"))
-            .collect();
-        assert!(
-            offenders.is_empty(),
-            "{label} fish script tests DEFINEDNESS of an ATERM_* variable: {offenders:?}. \
-             Use `test -n \"$VAR\"` / `test -z \"$VAR\"` — `set -q` is true for an \
-             empty-but-SET variable, and empty is the value aterm's spawn seam and \
-             the user's environment actually deliver (see the loader-guard note at \
-             the top of the script)."
-        );
-    }
+    let (label, script) = ("embedded", scripts::FISH);
+    let offenders: Vec<&str> = script
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with('#'))
+        .filter(|line| line.contains("set -q ATERM_"))
+        .filter(|line| !line.contains("set -q ATERM_SHELL_NONCE"))
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "{label} fish script tests DEFINEDNESS of an ATERM_* variable: {offenders:?}. \
+         Use `test -n \"$VAR\"` / `test -z \"$VAR\"` — `set -q` is true for an \
+         empty-but-SET variable, and empty is the value aterm's spawn seam and \
+         the user's environment actually deliver (see the loader-guard note at \
+         the top of the script)."
+    );
 }
 
 /// An EMPTY `ATERM_PROMPT_STYLE` must fall through to the user's own prompt.
@@ -2202,63 +2282,6 @@ fn test_fish_empty_prompt_colors_fall_back_to_defaults() {
         "\u{1b}[38;5;5m~/x\u{1b}[0m \u{1b}[38;5;8m$\u{1b}[0m ",
         "a non-empty ATERM_PROMPT_PATH_COLOR must still reach the prompt"
     );
-}
-
-/// Hygiene pin: no shell this suite spawns may read the developer's `$HOME`.
-///
-/// [`shell_command`] is the single seam for every bash/zsh/fish spawn here, and
-/// several of those spawns are interactive (`-i`) and assert on byte-exact
-/// stdout. Before this, `HOME` was left alone: `fish -i` sourced the developer's
-/// `~/.config/fish/config.fish`, `conf.d/` and universal variables, `zsh -i`
-/// sourced their `~/.zshrc`, and all three integration scripts sourced
-/// `$HOME/.aterm/shell.d/*` — bash included, `--noprofile --norc`
-/// notwithstanding, because the script does that sourcing itself. Anything
-/// those files print lands in the asserted stream, so the suite could be
-/// broken — or quietly steered — by files that are none of its business.
-#[cfg(unix)]
-#[test]
-fn test_spawned_shells_never_read_the_developers_home() {
-    // `echo $VAR` is spelled identically in bash, zsh and fish.
-    let probe = "echo $HOME; echo $XDG_CONFIG_HOME; echo $XDG_DATA_HOME; echo $XDG_DATA_DIRS";
-    let mut shells: Vec<(&str, Vec<&str>)> =
-        vec![(bash_shell(), vec!["--noprofile", "--norc", "-i"])];
-    if let Some(zsh) = zsh_shell() {
-        shells.push((zsh, vec!["-i"]));
-    }
-    if let Some(fish) = fish_shell() {
-        shells.push((fish, vec!["-i"]));
-    }
-    for (shell, args) in shells {
-        let mut cmd = shell_command(shell);
-        let hermetic = cmd.home().to_string_lossy().into_owned();
-        if let Ok(developer_home) = std::env::var("HOME") {
-            assert_ne!(
-                hermetic, developer_home,
-                "the test HOME must not be the developer's own"
-            );
-        }
-        let output = cmd
-            .args(&args)
-            .arg("-c")
-            .arg(probe)
-            .output()
-            .unwrap_or_else(|error| panic!("spawn {shell} for the HOME hygiene probe: {error}"));
-        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-        let reported: Vec<&str> = stdout.lines().filter(|l| !l.is_empty()).collect();
-        assert_eq!(
-            reported.len(),
-            4,
-            "{shell} should report HOME + three XDG dirs; stdout: {stdout:?}; stderr: {:?}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        for value in reported {
-            assert!(
-                value.starts_with(&hermetic),
-                "{shell} was handed {value:?}, which is outside the hermetic home \
-                 {hermetic:?} — the suite would read the developer's own dotfiles"
-            );
-        }
-    }
 }
 
 #[test]
@@ -2698,42 +2721,6 @@ fn test_fish_unsets_shell_nonce_env_after_source() {
     );
 }
 
-#[cfg(unix)]
-#[test]
-fn test_bash_fallback_unnonced_when_env_missing() {
-    // #8015 fallback: if ATERM_SHELL_NONCE is unset at source time,
-    // __aterm_id_suffix must emit the empty string (NOT a literal
-    // ";id="). Hosts with require_shell_integration_nonce=true will drop
-    // those unnonced emissions; hosts with the enforcement off (current
-    // default per #7960) will accept them — correct pre-nonce behavior.
-    let script = format!(
-        "{}/src/scripts/aterm_shell_integration.bash",
-        env!("CARGO_MANIFEST_DIR")
-    );
-    // Guard definedness: empty "suffix=[]" must come from a defined function
-    // returning nothing, NOT from an undefined __aterm_id_suffix (which would
-    // also print "suffix=[]"). `command -v` forces a hard exit if it never loaded.
-    let command = "source \"$ATERM_TEST_SCRIPT\" >/dev/null 2>&1; \
-                   __aterm_in_prompt_cmd=1; trap - DEBUG 2>/dev/null || true; PROMPT_COMMAND=; \
-                   command -v __aterm_id_suffix >/dev/null || exit 97; \
-                   printf 'suffix=[%s]' \"$(__aterm_id_suffix)\"";
-    let output = shell_command(bash_shell())
-        .args(["--noprofile", "--norc", "-i"])
-        .arg("-c")
-        .arg(command)
-        .env("ATERM_TEST_SCRIPT", &script)
-        .env_remove("ATERM_SHELL_NONCE")
-        .output()
-        .expect("spawn bash for fallback test");
-    assert!(output.status.success());
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    assert_eq!(
-        stdout, "suffix=[]",
-        "bash must fall through to empty suffix when nonce is unset \
-         — not emit a literal `id=` that would fail enforcement"
-    );
-}
-
 // ─── PowerShell / pwsh integration (Windows' default shells) ─────────────
 //
 // Static shape tests run everywhere; functional tests spawn powershell.exe
@@ -2790,15 +2777,6 @@ fn test_powershell_script_is_ascii() {
     assert!(
         scripts::POWERSHELL.is_ascii(),
         "aterm_shell_integration.ps1 must stay ASCII-only (written without a BOM)"
-    );
-}
-
-#[test]
-fn test_powershell_script_references_shell_nonce_env() {
-    assert!(
-        scripts::POWERSHELL.contains("ATERM_SHELL_NONCE"),
-        "PowerShell script must reference ATERM_SHELL_NONCE to honor \
-         the #7960/#7987 capability-nonce defense"
     );
 }
 
@@ -3642,29 +3620,25 @@ fn fish_strip_string_contents(line: &str) -> String {
 #[cfg(unix)]
 #[test]
 fn test_fish_never_glues_a_command_substitution() {
-    for (label, script) in [
-        ("embedded", scripts::FISH),
-        ("app-bundle", APP_FISH_RESOURCE),
-    ] {
-        let offenders: Vec<(usize, &str)> = script
-            .lines()
-            .enumerate()
-            .filter(|(_, line)| !line.trim_start().starts_with('#'))
-            .filter(|(_, line)| {
-                let stripped = fish_strip_string_contents(line);
-                ["\"(", "'(", ")\"", ")'"]
-                    .iter()
-                    .any(|glue| stripped.contains(glue))
-            })
-            .map(|(i, line)| (i + 1, line.trim()))
-            .collect();
-        assert!(
-            offenders.is_empty(),
-            "{label} fish script glues a string to a command substitution: {offenders:?}. \
-             That is a CARTESIAN PRODUCT — a substitution printing nothing takes the \
-             whole argument with it. Capture with `set -l` and interpolate \"$var\"."
-        );
-    }
+    let (label, script) = ("embedded", scripts::FISH);
+    let offenders: Vec<(usize, &str)> = script
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| !line.trim_start().starts_with('#'))
+        .filter(|(_, line)| {
+            let stripped = fish_strip_string_contents(line);
+            ["\"(", "'(", ")\"", ")'"]
+                .iter()
+                .any(|glue| stripped.contains(glue))
+        })
+        .map(|(i, line)| (i + 1, line.trim()))
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "{label} fish script glues a string to a command substitution: {offenders:?}. \
+         That is a CARTESIAN PRODUCT — a substitution printing nothing takes the \
+         whole argument with it. Capture with `set -l` and interpolate \"$var\"."
+    );
 }
 
 /// OSC 7 carries a resolved host, never a live command substitution.
@@ -3677,38 +3651,34 @@ fn test_fish_never_glues_a_command_substitution() {
 /// which is also the canonical RFC 8089 `file://` authority.
 #[test]
 fn test_fish_osc7_resolves_the_host_without_a_substitution() {
-    for (label, script) in [
-        ("embedded", scripts::FISH),
-        ("app-bundle", APP_FISH_RESOURCE),
-    ] {
-        assert!(
-            script.contains(r#"__aterm_osc "7;file://$__aterm_report_host$cwd""#),
-            "{label} fish OSC 7 must be ONE interpolated argument"
-        );
-        // CODE only: the script quotes the broken spelling in a comment so the
-        // next reader knows why it cannot come back, and that explanation must
-        // not itself trip the guard.
-        let code: String = script
-            .lines()
-            .filter(|line| !line.trim_start().starts_with('#'))
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            !code.contains(r#""7;file://"(hostname)"#),
-            "{label} fish re-introduced the glued `(hostname)` OSC 7 payload"
-        );
-        assert!(
-            script.contains("set -g __aterm_report_host localhost"),
-            "{label} fish must seed the OSC 7 authority with a non-empty default, \
-             mirroring zsh's `${{HOST:-${{HOSTNAME:-localhost}}}}`"
-        );
-        assert!(
-            script.contains("command -sq hostname"),
-            "{label} fish must probe for the `hostname` COMMAND before running it — \
-             an unguarded call on a host without it aborts __aterm_report_cwd and \
-             prints an error block on every directory change"
-        );
-    }
+    let (label, script) = ("embedded", scripts::FISH);
+    assert!(
+        script.contains(r#"__aterm_osc "7;file://$__aterm_report_host$cwd""#),
+        "{label} fish OSC 7 must be ONE interpolated argument"
+    );
+    // CODE only: the script quotes the broken spelling in a comment so the
+    // next reader knows why it cannot come back, and that explanation must
+    // not itself trip the guard.
+    let code: String = script
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !code.contains(r#""7;file://"(hostname)"#),
+        "{label} fish re-introduced the glued `(hostname)` OSC 7 payload"
+    );
+    assert!(
+        script.contains("set -g __aterm_report_host localhost"),
+        "{label} fish must seed the OSC 7 authority with a non-empty default, \
+         mirroring zsh's `${{HOST:-${{HOSTNAME:-localhost}}}}`"
+    );
+    assert!(
+        script.contains("command -sq hostname"),
+        "{label} fish must probe for the `hostname` COMMAND before running it — \
+         an unguarded call on a host without it aborts __aterm_report_cwd and \
+         prints an error block on every directory change"
+    );
 }
 
 /// The fish prompt renders palette indices as SGR escapes, never through
@@ -3724,41 +3694,37 @@ fn test_fish_osc7_resolves_the_host_without_a_substitution() {
 /// operands.
 #[test]
 fn test_fish_prompt_never_passes_a_palette_index_to_set_color() {
-    for (label, script) in [
-        ("embedded", scripts::FISH),
-        ("app-bundle", APP_FISH_RESOURCE),
+    let (label, script) = ("embedded", scripts::FISH);
+    assert!(
+        script.contains(r#"printf '\e[38;5;%sm' "$argv[1]""#),
+        "{label} fish must format the SGR 256-colour escape itself — the same \
+         bytes bash writes as `\\[\\033[38;5;${{hc}}m\\]`"
+    );
+    assert!(
+        script.contains(r#"printf '\e[0m'"#),
+        "{label} fish must reset with bash's and zsh's `\\033[0m`, not \
+         `set_color normal` (terminfo sgr0)"
+    );
+    let code: String = script
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for banned in [
+        "set_color $hc",
+        "set_color $pc",
+        "set_color $gc",
+        "set_color $sc",
+        "set_color $ec",
+        "set_color $prompt_color",
+        "set_color normal",
     ] {
         assert!(
-            script.contains(r#"printf '\e[38;5;%sm' "$argv[1]""#),
-            "{label} fish must format the SGR 256-colour escape itself — the same \
-             bytes bash writes as `\\[\\033[38;5;${{hc}}m\\]`"
+            !code.contains(banned),
+            "{label} fish prompt re-introduced `{banned}`: fish's set_color \
+             rejects a palette index, prints an error to the user's terminal, \
+             and emits nothing"
         );
-        assert!(
-            script.contains(r#"printf '\e[0m'"#),
-            "{label} fish must reset with bash's and zsh's `\\033[0m`, not \
-             `set_color normal` (terminfo sgr0)"
-        );
-        let code: String = script
-            .lines()
-            .filter(|line| !line.trim_start().starts_with('#'))
-            .collect::<Vec<_>>()
-            .join("\n");
-        for banned in [
-            "set_color $hc",
-            "set_color $pc",
-            "set_color $gc",
-            "set_color $sc",
-            "set_color $ec",
-            "set_color $prompt_color",
-            "set_color normal",
-        ] {
-            assert!(
-                !code.contains(banned),
-                "{label} fish prompt re-introduced `{banned}`: fish's set_color \
-                 rejects a palette index, prints an error to the user's terminal, \
-                 and emits nothing"
-            );
-        }
     }
 }
 
@@ -4093,21 +4059,6 @@ fn test_scripts_mark_the_multiplexer_boundary_before_the_loader_guard() {
         (
             "fish",
             scripts::FISH,
-            "if test -n \"$ATERM_SHELL_INTEGRATION_INSTALLED\"",
-        ),
-        (
-            "app-bash",
-            APP_BASH_RESOURCE,
-            "if [[ -n \"${ATERM_SHELL_INTEGRATION_INSTALLED:-}\" ]]; then",
-        ),
-        (
-            "app-zsh",
-            APP_ZSH_RESOURCE,
-            "if [[ -n \"${ATERM_SHELL_INTEGRATION_INSTALLED:-}\" ]]; then",
-        ),
-        (
-            "app-fish",
-            APP_FISH_RESOURCE,
             "if test -n \"$ATERM_SHELL_INTEGRATION_INSTALLED\"",
         ),
     ] {
@@ -5418,6 +5369,58 @@ fn test_zsh_hook_naming_an_agents_dir_that_appears_later_is_fronted_live() {
     sh.finish();
 }
 
+/// zsh/stat is loaded at the first stamp of a hook that exists, never for an
+/// absent one: a session shell with no hook to stamp loads nothing, at load or
+/// at a prompt — the first tab of a fresh machine, which opens before atpkg lays
+/// the hook — and the same shell loads it, and sources the hook, at the first
+/// prompt after one is laid. A zsh whose module will not load (a `zmodload`
+/// that refuses it stands in) sources that hook at the same prompt, through the
+/// `-f` fallback.
+#[cfg(unix)]
+#[test]
+fn test_zsh_loads_zstat_only_once_there_is_a_hook_to_stamp() {
+    let Some(zsh) = zsh_shell() else {
+        eprintln!("zsh not installed; skipping the zstat load scenario");
+        return;
+    };
+    let script = format!(
+        "{}/src/scripts/aterm_shell_integration.zsh",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let scenario = "\
+source \"$ATERM_TEST_SCRIPT\"\n\
+print -rn -- \"[at-load=${+builtins[zstat]}]\"\n\
+__aterm_managed_path_live\n\
+print -rn -- \"[no-hook=${+builtins[zstat]}]\"\n\
+mkdir -p \"$HOME/.aterm/shell.d\"\n\
+print -r -- 'export ATERM_TEST_HOOK_RAN=1' >\"$HOME/.aterm/shell.d/00-atpkg.zsh\"\n\
+__aterm_managed_path_live\n\
+print -rn -- \"[hook=${+builtins[zstat]} ran=${ATERM_TEST_HOOK_RAN:-0}]\"\n";
+    let refuse =
+        "zmodload() { [[ \"$*\" == *zsh/stat* ]] && return 1; builtin zmodload \"$@\"; }\n";
+    for (label, prefix, expected) in [
+        ("loads", "", "[at-load=0][no-hook=0][hook=1 ran=1]"),
+        ("refused", refuse, "[at-load=0][no-hook=0][hook=0 ran=1]"),
+    ] {
+        let output = shell_command(zsh)
+            .args(["-f", "-i", "-c", &format!("{prefix}{scenario}")])
+            .env("ATERM_TEST_SCRIPT", &script)
+            .env("ATERM_CHILD", "1")
+            .output()
+            .unwrap_or_else(|error| panic!("spawn zsh for the zstat load scenario: {error}"));
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert!(
+            output.status.success(),
+            "{label}: stdout: {stdout:?}; stderr: {:?}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.contains(expected),
+            "{label}: zsh/stat loads with the first hook, and that hook is sourced: {stdout:?}"
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn test_bash_twin_landing_in_an_agents_dir_already_leading_path_is_run_live() {
@@ -5802,7 +5805,7 @@ fn test_live_reassert_is_wired_into_every_prompt_and_preexec_hook_and_gated_on_t
     // The twin watch: zsh and bash hash a command's
     // path on first use, so a twin landing in an agents/ that already leads PATH
     // needs the hash forgotten — zsh by watching the directory's listing, bash by
-    // forgetting the two managed names every call. fish keeps no hash.
+    // forgetting the managed agent names every call. fish keeps no hash.
     let zsh_hot = shell_function_body(scripts::ZSH, "__aterm_managed_path_live", false);
     assert!(
         zsh_hot.contains("__aterm_managed_agents_listing") && zsh_hot.contains("rehash"),
@@ -5810,8 +5813,8 @@ fn test_live_reassert_is_wired_into_every_prompt_and_preexec_hook_and_gated_on_t
     );
     let bash_hot = shell_function_body(scripts::BASH, "__aterm_managed_path_live", false);
     assert!(
-        bash_hot.contains("hash -d claude codex 2>/dev/null"),
-        "bash: the hot path forgets the two managed names every call:\n{bash_hot}"
+        bash_hot.contains("hash -d claude codex agy muse 2>/dev/null"),
+        "bash: the hot path forgets the managed agent names every call:\n{bash_hot}"
     );
     // zsh: every function of the block runs under `emulate -L zsh`, so a user's
     // ksh_arrays / sh_word_split / glob_subst / warn_create_global cannot change
@@ -6365,7 +6368,7 @@ fn a_foreign_build_cannot_change_what_this_builds_tabs_source() {
         assert_eq!(injected_dir(&again), ours);
         assert_eq!(
             std::fs::read_to_string(ours.join("aterm_shell_integration.zsh")).unwrap(),
-            lf_only(scripts::ZSH)
+            installed_zsh()
         );
         assert!(script_set_matches(&ours));
     }

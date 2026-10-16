@@ -6,10 +6,10 @@
 //!
 //! `sbix`/`CBDT` color emoji are bitmaps (handled via `glyph_raster_image`); COLR
 //! glyphs are VECTOR — a stack of outline layers, each filled with a palette color
-//! (COLRv0) or a gradient (COLRv1), under affine transforms. ttf-parser drives the
-//! paint graph through its [`Painter`](ttf_parser::colr::Painter) trait; this module
+//! (COLRv0) or a gradient (COLRv1), under affine transforms. aterm-font drives the
+//! paint graph through its [`Painter`](aterm_font::colr::Painter) trait; this module
 //! implements that trait with a small self-contained scanline rasterizer (no extra
-//! deps — outlines come from ttf-parser, the fill is ours), compositing each layer
+//! deps — outlines come from aterm-font, the fill is ours), compositing each layer
 //! into an RGBA8 buffer the renderer blits like any other color glyph.
 //!
 //! Scope: solid layers (COLRv0 + COLRv1 solid) render exactly, with full affine
@@ -27,10 +27,10 @@
 //! the PaintGlyph appears: transforms pushed in its subtree reposition the
 //! child paint's gradient geometry only, never the outline itself.
 
-use ttf_parser::colr::{ColorStop, CompositeMode, GradientExtend, Paint, Painter};
-use ttf_parser::{Face, GlyphId, RgbaColor, Transform};
+use aterm_font::colr::{ColorStop, CompositeMode, GradientExtend, Paint, Painter};
+use aterm_font::{Face, GlyphId, RgbaColor, Transform};
 
-/// A 2×3 affine: `(x,y) -> (a·x + c·y + e, b·x + d·y + f)` (ttf-parser convention).
+/// A 2×3 affine: `(x,y) -> (a·x + c·y + e, b·x + d·y + f)` (aterm-font convention).
 #[derive(Clone, Copy)]
 struct Affine {
     a: f32,
@@ -114,7 +114,7 @@ impl OutlineCollector {
     }
 }
 
-impl ttf_parser::OutlineBuilder for OutlineCollector {
+impl aterm_font::OutlineSink for OutlineCollector {
     fn move_to(&mut self, x: f32, y: f32) {
         self.flush();
         self.push(x, y);
@@ -153,8 +153,8 @@ impl ttf_parser::OutlineBuilder for OutlineCollector {
     }
 }
 
-/// Component equality (kept explicit rather than leaning on ttf-parser's derive
-/// surface, which has shifted between versions).
+/// Component equality (kept explicit rather than leaning on the colour type's
+/// derive surface, which shifted between ttf-parser versions).
 fn rgba_eq(a: RgbaColor, b: RgbaColor) -> bool {
     (a.red, a.green, a.blue, a.alpha) == (b.red, b.green, b.blue, b.alpha)
 }
@@ -185,7 +185,7 @@ fn lerp_premul(c0: RgbaColor, c1: RgbaColor, u: f32) -> RgbaColor {
 }
 
 /// Collect a gradient color line into (offset, color) pairs sorted by offset
-/// (the spec allows unsorted stops; ttf-parser hands them through raw).
+/// (the spec allows unsorted stops; aterm-font hands them through raw).
 fn collect_stops(iter: impl Iterator<Item = ColorStop>) -> Vec<(f32, RgbaColor)> {
     let mut v: Vec<(f32, RgbaColor)> = iter.map(|s| (s.stop_offset, s.color)).collect();
     v.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -379,7 +379,7 @@ enum FillSource {
     Gradient(GradientFill),
 }
 
-/// RGBA8 accumulator + the ttf-parser COLR painter state.
+/// RGBA8 accumulator + the aterm-font COLR painter state.
 struct ColrCanvas<'a> {
     face: &'a Face<'a>,
     w: usize,
@@ -646,7 +646,7 @@ impl<'a> Painter<'a> for ColrCanvas<'a> {
     // Clip + layer composition beyond src-over are not modeled; the layer outlines
     // self-clip, so ignoring these renders solid-layer COLR correctly.
     fn push_clip(&mut self) {}
-    fn push_clip_box(&mut self, _clipbox: ttf_parser::colr::ClipBox) {}
+    fn push_clip_box(&mut self, _clipbox: aterm_font::colr::ClipBox) {}
     fn pop_clip(&mut self) {}
     fn push_layer(&mut self, _mode: CompositeMode) {}
     fn pop_layer(&mut self) {}
@@ -769,45 +769,17 @@ mod tests {
         assert_eq!(m.apply(0.0, 0.0), (6.0, 8.0));
     }
 
-    /// Locate ttf-parser's bundled COLR test font in the cargo registry cache, if
-    /// present (it ships `tests/fonts/colr_1.ttf`). Returns the bytes or `None`.
-    fn colr_test_font() -> Option<Vec<u8>> {
-        let home = std::env::var_os("CARGO_HOME")
-            .map(std::path::PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cargo"))
-            })?;
-        let reg = home.join("registry/src");
-        let entries = std::fs::read_dir(&reg).ok()?;
-        for idx in entries.flatten() {
-            let mut p = idx.path();
-            // newest ttf-parser-* dir wins (any works for the COLR font)
-            if let Ok(rd) = std::fs::read_dir(&p) {
-                let mut best: Option<std::path::PathBuf> = None;
-                for e in rd.flatten() {
-                    let name = e.file_name();
-                    if name.to_string_lossy().starts_with("ttf-parser-") {
-                        best = Some(e.path());
-                    }
-                }
-                if let Some(b) = best {
-                    p = b.join("tests/fonts/colr_1.ttf");
-                    if let Ok(bytes) = std::fs::read(&p) {
-                        return Some(bytes);
-                    }
-                }
-            }
-        }
-        None
+    /// The COLRv1 test font, checked in (`tests/fixtures/colr_1.ttf`, the
+    /// googlefonts/color-fonts one ttf-parser 0.25.1 ships in its
+    /// `tests/fonts`, Apache-2.0), so the COLR tests run on every host.
+    fn colr_test_font() -> &'static [u8] {
+        include_bytes!("../tests/fixtures/colr_1.ttf")
     }
 
     #[test]
     fn colr_glyph_rasterizes_straight_alpha() {
-        let Some(bytes) = colr_test_font() else {
-            eprintln!("SKIP: ttf-parser colr_1.ttf not in the cargo cache");
-            return;
-        };
-        let face = Face::parse(&bytes, 0).expect("valid font");
+        let bytes = colr_test_font();
+        let face = Face::parse(bytes, 0).expect("valid font");
         // The blend accumulator stores PREMULTIPLIED rgb but `GlyphImage::Rgba`
         // is blitted as STRAIGHT alpha, so `rasterize_colr` un-premultiplies
         // before returning. The exact arithmetic is pinned by the synthetic
@@ -1049,7 +1021,7 @@ mod tests {
         fn push_transform(&mut self, _: Transform) {}
         fn pop_transform(&mut self) {}
         fn push_clip(&mut self) {}
-        fn push_clip_box(&mut self, _: ttf_parser::colr::ClipBox) {}
+        fn push_clip_box(&mut self, _: aterm_font::colr::ClipBox) {}
         fn pop_clip(&mut self) {}
         fn push_layer(&mut self, _: CompositeMode) {}
         fn pop_layer(&mut self) {}
@@ -1088,7 +1060,7 @@ mod tests {
             self.inner.pop_transform();
         }
         fn push_clip(&mut self) {}
-        fn push_clip_box(&mut self, _: ttf_parser::colr::ClipBox) {}
+        fn push_clip_box(&mut self, _: aterm_font::colr::ClipBox) {}
         fn pop_clip(&mut self) {}
         fn push_layer(&mut self, _: CompositeMode) {}
         fn pop_layer(&mut self) {}
@@ -1192,11 +1164,8 @@ mod tests {
     /// The per-pixel fill must produce a genuine spread.
     #[test]
     fn colr_gradient_renders_a_colour_spread() {
-        let Some(bytes) = colr_test_font() else {
-            eprintln!("SKIP: ttf-parser colr_1.ttf not in the cargo cache");
-            return;
-        };
-        let face = Face::parse(&bytes, 0).expect("valid font");
+        let bytes = colr_test_font();
+        let face = Face::parse(bytes, 0).expect("valid font");
         let fg = RgbaColor::new(0, 0, 0, 255);
         let mut best = 0usize;
         for gid in (0..face.number_of_glyphs()).map(GlyphId) {
@@ -1230,14 +1199,13 @@ mod tests {
     /// The font Windows actually ships: Fluent's entire emoji design is
     /// gradient fills, and the old first-stop flattening read as poster paint
     /// next to every other app on the OS. Guard the per-pixel gradient path on
-    /// seguiemj itself. Skips when the font is absent or carries no COLRv1
-    /// gradients (pre-Win11 builds are COLRv0).
+    /// seguiemj itself. Could not run where the font is absent or carries no
+    /// COLRv1 gradients (pre-Win11 builds are COLRv0).
     #[cfg(windows)]
     #[test]
     fn seguiemj_fluent_emoji_are_not_flat() {
         let Ok(bytes) = std::fs::read("C:\\Windows\\Fonts\\seguiemj.ttf") else {
-            eprintln!("SKIP: no seguiemj.ttf on this host");
-            return;
+            aterm_spec::host::could_not_run("no seguiemj.ttf on this host");
         };
         let face = Face::parse(&bytes, 0).expect("seguiemj parses");
         let fg = RgbaColor::new(0, 0, 0, 255);
@@ -1324,7 +1292,9 @@ mod tests {
             checked += 1;
         }
         if checked == 0 {
-            eprintln!("SKIP: seguiemj here has no COLRv1 gradient emoji");
+            aterm_spec::host::could_not_run(
+                "this host's seguiemj has no COLRv1 gradient emoji (a pre-Windows 11 build)",
+            );
         }
     }
 }

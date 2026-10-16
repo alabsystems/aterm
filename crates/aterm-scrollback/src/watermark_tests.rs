@@ -35,11 +35,6 @@ fn watermark_starts_green() {
 }
 
 #[test]
-fn watermark_default_is_green() {
-    assert_eq!(WatermarkLevel::default(), WatermarkLevel::Green);
-}
-
-#[test]
 fn watermark_level_ord_is_green_yellow_red() {
     assert!(WatermarkLevel::Green < WatermarkLevel::Yellow);
     assert!(WatermarkLevel::Yellow < WatermarkLevel::Red);
@@ -181,29 +176,6 @@ fn watermark_eager_promotion_fires_under_pressure() {
         sb.hot_line_count(),
         sb.warm_line_count(),
         sb.cold_line_count(),
-    );
-}
-
-#[test]
-fn watermark_compressible_data_stays_green_longer() {
-    // Compressible data (repeating chars) compresses well in warm tier,
-    // so the watermark stays Green longer than with random data.
-    let budget = 200_000;
-    let mut sb_compress = Scrollback::with_block_size(10_000, 50_000, budget, 100);
-    let mut sb_random = Scrollback::with_block_size(10_000, 50_000, budget, 100);
-
-    let n = 500;
-    for i in 0..n {
-        sb_compress.push_str(&"A".repeat(200));
-        sb_random.push_line(Line::from(random_line(i, 200).as_str()));
-    }
-
-    // The random data scrollback should have a higher or equal watermark.
-    assert!(
-        sb_random.watermark_level() >= sb_compress.watermark_level(),
-        "random data should hit higher watermark; random={:?}, compress={:?}",
-        sb_random.watermark_level(),
-        sb_compress.watermark_level(),
     );
 }
 

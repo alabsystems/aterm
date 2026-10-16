@@ -66,9 +66,21 @@
 //!   the "contributing" block, usage credits, the enrich-error line,
 //!   `Refreshing…`, and LAST the hint row. The `…` is an escape in the
 //!   bundle, so the anchors carry the words without it.
-//! * NOT MEASURED: the loading and error states, any enrich error, the
-//!   other three tabs (never opened: the Status tab names the login), two
-//!   accounts. A fixture of one of those states is COMPOSED and says so.
+//! * MEASURED on Claude Code 2.1.301, 2026-10-15, in the real-Claude lab
+//!   (crates/aterm-lab; `prompt::fixtures::USAGE_*_2_1_301`, 120x50, both
+//!   renderers): AN ENRICH ERROR. Behind the lab's base URL the tab's read
+//!   of the usage body is refused, and the tab draws the session block, the
+//!   windows the answer headers carried (`Current session`, `Current week
+//!   (all models)`), `Could not refresh usage data`, and `r to retry · Esc
+//!   to cancel` as its last row — the retry hint on the cancel hint's row,
+//!   so no tail. With no profile scope on the login no read is made and the
+//!   tab is the session block alone, `Esc to cancel` last. Enter on a typed
+//!   `/usage` opens this tab though the menu lists `/usage-credits` right
+//!   under it; the fullscreen panel's `▔` rule carries the effort tag.
+//! * NOT MEASURED: the loading state, a failed load (`Error: …`), the other
+//!   enrich errors, the other three tabs (never opened: the Status tab names
+//!   the login), two accounts. A fixture of one of those states is COMPOSED
+//!   and says so.
 
 use crate::anchors::{anchor, guard_regex};
 use crate::phase::{has_composer_frame, is_rule};
@@ -79,10 +91,9 @@ use crate::prompt::is_panel_rule;
 /// fourth tab (MEASURED) and is not asked for: the three before it place the
 /// row, and a tab added after them changes nothing here.
 ///
-/// NOT ROWS OF [`crate::anchors::ANCHORS`], on purpose. `grep_guard`'s V1
-/// fences a ONE-WORD anchor as a quoted literal anywhere in shipped Rust, and
-/// aterm's own Settings surface spells its title so in half a dozen files:
-/// the word as an anchor would fail the guard on aterm's own UI. Nothing
+/// NOT ROWS OF [`crate::anchors::ANCHORS`], on purpose: a one-word anchor is
+/// a word aterm's own Settings surface spells in half a dozen files, so it
+/// would name aterm's UI as much as the vendor's. Nothing
 /// outside this module needs the words — a caller that guards on the header
 /// row asks [`SettingsPanel::header_guard`].
 const TITLE: &str = "Settings";
@@ -554,6 +565,69 @@ mod tests {
         // The fold's arrow, as measured: ending a row of the block, or alone.
         assert!(last(&fx::screen(fx::USAGE_FOLD)).ends_with('↓'));
         assert_eq!(last(&fx::screen(fx::USAGE_SHORT)).trim(), "↓");
+    }
+
+    /// THE 2.1.301 TABS MEASURED IN THE LAB (crates/aterm-lab, 2026-10-15),
+    /// on both renderers: the tab that drew the stub's header readings and
+    /// the enrich error is a panel, a Usage tab and NOT SETTLED, and its last
+    /// row (`r to retry · Esc to cancel`) is no tail; the session block alone
+    /// (no read made) is settled and ends on the tail. NEGATIVE CONTROLS: the
+    /// command menu before the Enter and the screen after one Escape are no
+    /// panel.
+    #[test]
+    fn the_2_1_301_lab_tabs_read_as_measured() {
+        use crate::prompt::fixtures as fx;
+        for (what, text, renderer, unsettled, tail) in [
+            (
+                "header readings, inline",
+                fx::USAGE_HEADER_READINGS_INLINE_2_1_301,
+                PanelRenderer::Inline,
+                true,
+                false,
+            ),
+            (
+                "header readings, fullscreen",
+                fx::USAGE_HEADER_READINGS_FULLSCREEN_2_1_301,
+                PanelRenderer::Fullscreen,
+                true,
+                false,
+            ),
+            (
+                "session only",
+                fx::USAGE_SESSION_ONLY_2_1_301,
+                PanelRenderer::Inline,
+                false,
+                true,
+            ),
+        ] {
+            let screen = fx::screen(text);
+            let panel = settings_panel(&screen).unwrap_or_else(|| panic!("{what}: a panel"));
+            assert_eq!(panel.renderer, renderer, "{what}");
+            let under = &screen[panel.header + 1..];
+            assert!(under.iter().any(|row| usage_tab_mark(row)), "{what}");
+            assert_eq!(
+                under.iter().any(|row| usage_unsettled(row)),
+                unsettled,
+                "{what}"
+            );
+            let last = under
+                .iter()
+                .rev()
+                .find(|row| !row.trim().is_empty())
+                .expect("a row");
+            assert_eq!(panel_tail(last), tail, "{what}: {last:?}");
+        }
+        for (what, text) in [
+            ("menu, inline", fx::USAGE_MENU_INLINE_2_1_301),
+            ("menu, fullscreen", fx::USAGE_MENU_FULLSCREEN_2_1_301),
+            ("dismissed, inline", fx::USAGE_DISMISSED_INLINE_2_1_301),
+            (
+                "dismissed, fullscreen",
+                fx::USAGE_DISMISSED_FULLSCREEN_2_1_301,
+            ),
+        ] {
+            assert_eq!(settings_panel(&fx::screen(text)), None, "{what}");
+        }
     }
 
     /// The lowest rule is the panel's: a panel quoted in the transcript

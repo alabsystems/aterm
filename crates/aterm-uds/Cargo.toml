@@ -13,11 +13,5 @@ description = "aterm — the portable control-socket stream: pure type aliases t
 # whole transport stays auditable in one small crate.
 [dependencies]
 
-[features]
-# `deadline::{trust_service_silent, notice_once}`: how a TEST that needs macOS's
-# trustd to answer skips, with one line, when it does not. Enabled only from
-# dev-dependencies, so no shipped build carries it.
-test-support = []
-
 [lints]
 workspace = true

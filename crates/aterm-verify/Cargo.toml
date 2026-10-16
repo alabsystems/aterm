@@ -5,45 +5,60 @@
 name = "aterm-verify"
 version.workspace = true
 edition = "2024"
-license = "Apache-2.0"
+# src/wasm_glue/templates.rs and src/wasm_glue/js.rs are derived from
+# wasm-bindgen-cli-support 0.2.108 (MIT OR Apache-2.0); see LICENSE-MIT. The
+# rest is aterm's own.
+license = "Apache-2.0 AND (MIT OR Apache-2.0)"
 publish = false
-# ONE integration-test binary (2026-09-28): tests/contract.rs mounts every
-# tests/*.rs suite as a module. Listed explicitly because autotests is off, so
-# a new suite compiles once it is a `mod` line of tests/contract.rs.
+# One integration-test binary: tests/contract.rs mounts every suite as a module.
 autotests = false
-description = "aterm's merge gate — the ok/FAIL/skip ladder, its scheduler, and the verdict discipline, as a testable Rust driver"
+description = "Every aterm check as one CLI: targo --unverified verify [CHECK|SET ...]"
 
 [[bin]]
 name = "aterm-verify"
 path = "src/main.rs"
-# No test lives in main.rs (no #[test], no cfg(test), no `mod`); its libtest
-# harness ran 0 tests in every gate. Integration tests still get the binary.
 test = false
 
 [lib]
 name = "aterm_verify"
 path = "src/lib.rs"
 
-# The gate's own suites in one binary — one link and one process start where
-# there were nine. It measured no wall-time gain (tests/contract.rs says what
-# was measured, and what to watch in the gate's pool). The files keep their
-# paths (docs and comments cite them); each is a module of tests/contract.rs.
 [[test]]
 name = "contract"
 path = "tests/contract.rs"
 
-# NO DEPENDENCIES, AND THIS IS LOAD-BEARING — not taste.
-#
-# This crate IS the merge gate. It has to build and run when the thing it is
-# gating does not: a workspace crate that fails to compile must produce a FAIL
-# line from a working gate, never a gate that cannot start. A single
-# `{ workspace = true }` path dependency would put an aterm crate between a
-# developer and the diagnostic that tells them which aterm crate broke.
-#
-# std also covers everything the ported stages need: process spawn with an
-# explicit environment, unix permissions/file types, threads for the stage
-# scheduler, and exit-status signal decoding.
+# First-party crates (and the workspace's libc, which is crates/aterm-libc),
+# each serving a check the CLI runs in-process. Every one is also a workspace
+# member that `lint` and `test` compile, so a compile break in any of them
+# stops this CLI from building until it is fixed: the price of running the
+# walks in-process rather than as children of a second build.
 [dependencies]
+# `verify census` and `verify guards`: the walks themselves.
+aterm-census = { workspace = true }
+# `verify forge` (the third-party surface policy) and `verify cells` (forge's
+# cell list and its resolver). A path dep: the root [workspace.dependencies]
+# table has no `aterm-forge` row.
+aterm-forge = { path = "../aterm-forge" }
+# cargo's `--message-format=json` (`cells`) and the perf lanes' reports.
+aterm-json = { workspace = true }
+# `perf`: the box fingerprint (FNV-1a), the arena pins (SHA-256, the typed
+# manifest through serde's derive) and the children the arena lanes launch.
+aterm-hash = { workspace = true }
+aterm-digest = { workspace = true }
+aterm-toml = { workspace = true }
+aterm-uds = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+# `glue` and `wasm-glue` read the descriptor aterm-wasm-abi's `#[export]`
+# writes, with that crate's own decoder and lowering table.
+aterm-wasm-abi = { workspace = true }
+
+# Scratch output captures (and test directories) removed on drop.
+aterm-tempfile = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+# The arena lanes' interrupt guard: block SIGINT/SIGTERM/SIGHUP, take them on
+# one thread with `sigwait`, and `killpg` the terminals under test.
+libc = { workspace = true }
 
 [lints]
 workspace = true

@@ -3,11 +3,9 @@
 
 //! Shared grammar for native tab-app control and semantic inspection.
 //!
-//! This module deliberately contains no GUI or terminal types. The control
-//! dispatcher can therefore classify and parse an app request before attempting
-//! to resolve a PTY session, which is required for native-only windows and an
-//! empty session pool. The first protocol version is explicitly negotiated as
-//! [`APP_INSPECTION_V1`]; unknown versions fail closed.
+//! No GUI or terminal types live here, so the control dispatcher can parse an app request
+//! before resolving a PTY session (native-only windows, an empty session pool). The protocol
+//! version is [`APP_INSPECTION_V1`]; unknown versions fail closed.
 
 use std::fmt;
 
@@ -20,11 +18,8 @@ const MAX_ACTION_BYTES: usize = 64;
 const MAX_VALUE_BYTES: usize = 16 * 1024;
 const MAX_URI_BYTES: usize = 16 * 1024;
 
-/// An opaque, stable view identifier as represented on the control wire.
-///
-/// The host owns the concrete ID type. Keeping the parser opaque prevents this
-/// shared protocol crate from coupling stable IDs to a process-local integer
-/// representation.
+/// An opaque, stable view identifier as represented on the control wire. The host owns the
+/// concrete ID type, so the wire form is not tied to a process-local integer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WireViewId<'a>(&'a str);
 
@@ -82,11 +77,9 @@ pub enum InspectionSubject<'a> {
     },
 }
 
-/// Metadata that prefixes every successful `app/v1` semantic response.
-///
-/// The host's monotone `revision` lets a driver detect that topology or app
-/// state changed between reads. The header is counted as the first line in the
-/// control protocol's ordinary `Lines` framing.
+/// Metadata that prefixes every successful `app/v1` semantic response, counted as the first
+/// line of the response's `Lines` framing. The monotone `revision` lets a driver detect that
+/// topology or app state changed between reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InspectionEnvelope<'a> {
     /// Monotone host inspection revision.
@@ -286,12 +279,9 @@ pub fn parse_act(rest: &str) -> Result<ActRequest<'_>, ParseError> {
     })
 }
 
-/// Parse the arguments following the existing `open` verb when its first token
-/// is `app`.
-///
-/// Accepted forms are `app settings [route]`, `app markdown <uri>`, and
-/// `app editor <uri>`. Parsing never grants file authority: the returned URI is
-/// still an untrusted request for the host to canonicalize and authorize.
+/// Parse the arguments following the `open` verb when its first token is `app`:
+/// `app settings [route]`, `app markdown <uri>`, or `app editor <uri>`. Parsing grants no file
+/// authority: the host must still canonicalize and authorize the URI.
 pub fn parse_open_app(rest: &str) -> Result<OpenAppRequest<'_>, ParseError> {
     reject_line_break(rest, "open payload")?;
     let mut input = rest;

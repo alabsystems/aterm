@@ -32,7 +32,7 @@ wgpu-oracle = ["dep:wgpu"]
 spec-anchors = ["dep:aterm-spec", "aterm-render/spec-anchors"]
 
 [dependencies]
-# default-features = false: the engine's `disk-tier` (libc mmap + zstd-sys C)
+# default-features = false: the engine's `disk-tier` (libc mmap)
 # cannot target wasm32, and a renderer needs no disk tier. aterm-gui re-enables
 # it natively through feature unification.
 aterm-core = { path = "../aterm-core", default-features = false }
@@ -44,11 +44,6 @@ aterm-hash = { workspace = true }
 aterm-time = { workspace = true }
 # `aterm_types::dev_seam!`, the one reader of the `ATERM_GPU_*` development seams.
 aterm-types = { workspace = true }
-# wgpu is declared per target below. Named directly because
-# `renderer::WindowTarget` (`HasWindowHandle + HasDisplayHandle`) bounds the
-# public `create_window_surface`; it adds no package (wgpu and winit already
-# resolve this one version on every cell).
-raw-window-handle = "0.6"
 # This workspace's own `Pod`/`Zeroable` with no derive: the `#[repr(C)]`
 # uniform/instance structs in `renderer.rs` carry hand-written `unsafe impl`s
 # (`impl_pod_zeroable!`), which keeps `bytemuck_derive` out of the mac graph.
@@ -69,6 +64,16 @@ aterm-objc = { workspace = true }
 # Optional: the first-party Metal renderer is the macOS backend; wgpu compiles
 # here only as the differential oracle (`wgpu-oracle`).
 wgpu = { version = "29", optional = true, default-features = false, features = ["metal", "wgsl"] }
+
+# Every cell but macOS: named directly because `renderer::WindowTarget`
+# (`HasWindowHandle + HasDisplayHandle`) bounds the public
+# `create_window_surface`; it adds no package (wgpu already resolves this one
+# version there). macOS's `WindowTarget` is first-party `aterm_objc::HasNsView`,
+# so the shipped mac graph has no raw-window-handle; its wgpu oracle reaches the
+# crate through `wgpu::rwh` (docs/AUDIT-third-party-2026-10-15.md, winit-core
+# step 6).
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+raw-window-handle = "0.6"
 
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 wgpu = { version = "29", default-features = false, features = ["vulkan", "wgsl"] }

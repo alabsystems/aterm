@@ -5,6 +5,9 @@
 //! OSC shell-integration handlers:
 //! - OSC 133: FinalTerm/Terminal shell integration
 //! - OSC 633: VS Code shell integration
+// Zero tolerance: the shell marks are stamped with the injected instant (a
+// clock read here was an incident), so no `#[expect]` may excuse one.
+#![forbid(clippy::disallowed_methods)]
 
 use super::handler::TerminalHandler;
 use super::shell::{
@@ -22,11 +25,12 @@ impl TerminalHandler<'_> {
         Some((cmd, row, cursor.col))
     }
 
-    /// Shell mark A: Prompt starting — create mark, finalize previous block, start new block.
+    /// Mark A (prompt start): open a mark, close the previous block, open a new
+    /// one.
     fn shell_prompt_start(&mut self, row: u64, col: u16) {
-        // Every mark time comes from the batch's pipeline clock (`process_at`),
-        // like B/C/D below, not a wall-clock read: a replayed or re-chunked
-        // byte log must stamp the same times.
+        // Mark times (here and in B/C/D) come from the batch's pipeline clock
+        // (`process_at`), never a wall-clock read, so a replayed or re-chunked
+        // byte log stamps the same times.
         let mut mark = CommandMark::new(row, col);
         mark.prompt_time_ms = self.transient.process_wall_ms;
         if let Some(ref cwd) = *self.current_working_directory {
@@ -35,7 +39,6 @@ impl TerminalHandler<'_> {
         self.shell.current_mark = Some(mark);
         self.shell.state = ShellState::ReceivingPrompt;
 
-        // Finalize any in-progress block
         if let Some(mut prev_block) = self.shell.current_block.take() {
             prev_block.end_row = Some(row);
             if self.shell.output_blocks.len() >= OUTPUT_BLOCKS_MAX {
@@ -45,7 +48,6 @@ impl TerminalHandler<'_> {
             self.shell.output_blocks.make_contiguous();
         }
 
-        // Start new block
         let mut block = OutputBlock::new(self.shell.next_block_id, row, col);
         block.prompt_time_ms = self.transient.process_wall_ms;
         self.shell.next_block_id += 1;
@@ -72,8 +74,10 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// Shell mark C: Command execution starting.
+    /// Shell mark C: Command execution starting. Counted
+    /// (`started_seq`) whether or not a block holds it.
     fn shell_execution_start(&mut self, row: u64) {
+        self.shell.started_seq = self.shell.started_seq.saturating_add(1);
         if let Some(ref mut mark) = self.shell.current_mark {
             mark.output_start_row = Some(row);
             mark.command_exec_start_time_ms = self.transient.process_wall_ms;
@@ -118,31 +122,20 @@ impl TerminalHandler<'_> {
             .unwrap_or(0)
     }
 
-    /// Dispatch shared A/B/C/D shell integration marks (common to OSC 133 and 633).
+    /// Dispatch the A/B/C/D marks OSC 133 and 633 share, enforcing A→B→C→D: A
+    /// from any phase, B only after A, C after B, D after C; an out-of-order mark
+    /// is ignored. Returns whether `cmd` is one of A/B/C/D, accepted or not.
     ///
-    /// Enforces the valid A→B→C→D state machine. Out-of-order markers are
-    /// silently ignored, matching Terminal behavior. Valid transitions:
-    /// - `None`/`CommandFinished` → A (prompt start)
-    /// - `PromptStart` → B (command input start)
-    /// - `CommandStart` → C (command execution start)
-    /// - `CommandExec` → D (command finished)
-    ///
-    /// Returns `true` if the command character was recognized (A/B/C/D),
-    /// regardless of whether the transition was accepted.
-    ///
-    /// A prompt start (A) and an accepted command start (C) end any kitty
-    /// chunked load in flight: the program that began it has ended, or is not
-    /// the one about to run, so no chunk of it can follow. Kept, it would take
-    /// the next program's first kitty command as its continuation and lose
-    /// it.
+    /// A and an accepted C end any kitty chunked load in flight: its program has
+    /// ended or is not the one about to run, and a kept load would swallow the
+    /// next program's first kitty command as its continuation.
     fn dispatch_shell_mark(&mut self, cmd: char, row: u64, col: u16, params: &[&[u8]]) -> bool {
         use super::grouped_state::ShellIntegrationPhase;
 
         match cmd {
             'A' => {
-                // Accept A from any phase — Terminal treats A as a hard reset
-                // to prompt-start. Common when user presses Enter on an empty
-                // line or Ctrl-C during typing (shell emits A→B→A).
+                // A is a hard reset to prompt start from any phase (Enter on an
+                // empty line or Ctrl-C while typing emits A→B→A).
                 self.shell.phase = ShellIntegrationPhase::PromptStart;
                 self.shell_prompt_start(row, col);
                 self.transient.kitty_pending = None;
@@ -174,15 +167,12 @@ impl TerminalHandler<'_> {
         true
     }
 
-    /// Gate OSC 133/633 on the capability nonce.
-    ///
-    /// When [`super::types::TerminalModes::require_shell_integration_nonce`] is
-    /// set, every OSC 133 A/B/C/D and OSC 633 A–H/P must carry an
-    /// `id=<64-hex>` matching the host-authorized nonce; others are dropped
-    /// silently and counted in `ShellIntegrationAuth::dropped_count`. When the
-    /// bit is clear (default) every mark passes. With a policy engine attached,
-    /// its Deny drops the sequence first; Allow/Fallback defer to the nonce
-    /// check. Returns whether dispatch should proceed.
+    /// Gate OSC 133/633 on the capability nonce. With
+    /// [`super::types::TerminalModes::require_shell_integration_nonce`] set, a
+    /// mark passes only with an `id=<64-hex>` matching the host-authorized nonce
+    /// (others are dropped and counted); an attached policy engine's Deny drops it
+    /// first. With the bit clear (default) every mark passes. Returns whether to
+    /// dispatch.
     fn shell_nonce_gate_ok(&mut self, command: u32, params: &[&[u8]]) -> bool {
         if !self.modes.require_shell_integration_nonce {
             return true;
@@ -192,21 +182,18 @@ impl TerminalHandler<'_> {
             .verify_nonce_with_engine(gate, params)
     }
 
-    /// A shell prompt (OSC 133/633 `A`) on the alternate screen: the full-screen
-    /// app the shell ran is dead and its `?1049l` never came, so leave the screen
-    /// before the prompt is placed. After a pager is killed, the only bytes are
-    /// the shell's `133;D;-1`, `133;A`, prompt and `133;B`; conhost never sends
-    /// the `l` for a client it outlived, and the same holds for a SIGKILLed pager
-    /// on unix.
+    /// A shell prompt (OSC 133/633 `A`) on the alternate screen means the
+    /// full-screen app the shell ran died without its `?1049l` (conhost never
+    /// sends it for a client it outlived; neither does a SIGKILLed pager on
+    /// unix), so leave the alt screen, archiving its content, before the prompt
+    /// is placed.
     ///
-    /// Only `A` triggers (it is the one mark that means the shell is drawing its
-    /// prompt), and only past the nonce gate, so a forged `133;A` cannot yank a
-    /// running app off its screen when the host demands the nonce. The phase
-    /// before the `A` is not consulted: shells arrive from CommandFinished,
-    /// CommandExec, or PromptStart/CommandStart (an app launched by a key
-    /// binding) alike. Runs before `parse_shell_osc` reads the cursor, so the
-    /// mark's row is the main-grid row the prompt paints on. The alt screen's
-    /// content is flushed to the archive first.
+    /// Only `A` triggers, and only past the nonce gate, so a forged `133;A`
+    /// cannot yank a running app off its screen when the host demands the nonce.
+    /// The prior phase is not consulted: the `A` can follow any phase
+    /// (PromptStart or CommandStart when a key binding launched the app). Runs
+    /// before `parse_shell_osc` reads the cursor, so the mark's row is the
+    /// main-grid row the prompt paints on.
     fn prompt_leaves_orphaned_alt_screen(&mut self, params: &[&[u8]]) {
         if !self.modes.alternate_screen {
             return;
@@ -217,12 +204,8 @@ impl TerminalHandler<'_> {
         self.leave_orphaned_alternate_screen();
     }
 
-    /// Handle OSC 133 - Shell integration (FinalTerm/Terminal protocol).
-    ///
-    /// Marks: A (prompt start), B (command input), C (execution start), D (finished).
-    ///
-    /// When `modes.require_shell_integration_nonce` is set, requires every
-    /// sequence to carry a valid `id=<64-hex>` nonce.
+    /// Handle OSC 133 (FinalTerm) shell integration: A prompt start, B command
+    /// input, C execution start, D finished. Gated by `shell_nonce_gate_ok`.
     pub(super) fn handle_osc_133(&mut self, params: &[&[u8]]) {
         if !self.shell_nonce_gate_ok(133, params) {
             return;
@@ -231,9 +214,7 @@ impl TerminalHandler<'_> {
         let Some((cmd, row, col)) = self.parse_shell_osc(params) else {
             return;
         };
-        // Queue a compact real mark for poll-based hosts, but only for a
-        // recognized A/B/C/D char (dispatch returns true) so out-of-band chars
-        // don't surface as bogus events. row/col come from the live cursor.
+        // Queue an event for poll-based hosts, only for a recognized A/B/C/D.
         if self.dispatch_shell_mark(cmd, row, col, params) {
             let payload = match cmd {
                 'D' => format!("D;exit={}", Self::parse_exit_code(params)),
@@ -243,13 +224,10 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// Handle OSC 633 - VS Code shell integration protocol.
-    ///
-    /// Extends OSC 133 with E/F/G/H (payload/progress) and P (property settings).
-    /// See: <https://code.visualstudio.com/docs/terminal/shell-integration>
-    ///
-    /// When `modes.require_shell_integration_nonce` is set, requires every
-    /// sequence to carry a valid `id=<64-hex>` nonce.
+    /// Handle OSC 633, VS Code shell integration
+    /// (<https://code.visualstudio.com/docs/terminal/shell-integration>): the
+    /// OSC 133 marks plus E (explicit command line) and P (`Cwd=`,
+    /// `AtermIntegration=`). Nonce-gated like OSC 133.
     pub(super) fn handle_osc_633(&mut self, params: &[&[u8]]) {
         if !self.shell_nonce_gate_ok(633, params) {
             return;
@@ -265,17 +243,14 @@ impl TerminalHandler<'_> {
 
         match cmd {
             'E' => {
-                // Explicit command text (VS Code extension)
                 let Some(escaped_cmd) = params.get(2).and_then(|p| std::str::from_utf8(p).ok())
                 else {
                     return;
                 };
-                // Reject an absurd command line before unescaping/retaining it,
-                // mirroring the Cwd cap: it lands in the count-capped (but not
-                // byte-capped) shell mark/block `commandline` fields and the parser
-                // admits up to MAX_OSC_DATA (8 MiB). unescape only shrinks, so
-                // bounding the escaped input bounds both the stored string and the
-                // unescape work.
+                // Capped before unescaping: the mark and block `commandline`
+                // fields are count-capped, not byte-capped, and the parser admits
+                // up to MAX_OSC_DATA (8 MiB). Unescaping only shrinks, so this
+                // bounds both the stored string and the work.
                 if escaped_cmd.len() > MAX_COMMANDLINE_BYTES {
                     return;
                 }
@@ -293,7 +268,6 @@ impl TerminalHandler<'_> {
             // 'F'/'G'/'H' (progress) retain nothing and no host consumes them:
             // they fall through to the ignored arm below.
             'P' => {
-                // Property setting (VS Code extension)
                 let Some(prop) = params.get(2).and_then(|p| std::str::from_utf8(p).ok()) else {
                     return;
                 };
@@ -307,11 +281,8 @@ impl TerminalHandler<'_> {
                 if key != "Cwd" || value.is_empty() {
                     return;
                 }
-                // Reject absurd cwd paths before they reach the count-capped
-                // (but not byte-capped) current_working_directory / mark / block
-                // working-directory fields, mirroring the OSC 7 cap. The parser
-                // admits up to MAX_OSC_DATA (8 MiB); 4 KiB (PATH_MAX) is generous
-                // for any real directory.
+                // The OSC 7 cap, applied before the count-capped (not byte-capped)
+                // mark and block fields.
                 if value.len() > MAX_CWD_PATH_BYTES {
                     return;
                 }
@@ -321,8 +292,8 @@ impl TerminalHandler<'_> {
                 if let Some(ref mut block) = self.shell.current_block {
                     block.working_directory = Some(value.into());
                 }
-                // Store last, bumping the shared tab-label epoch on a real
-                // change like the OSC 7 path.
+                // Stored last; bumps the tab-label epoch on a real change, as
+                // OSC 7 does.
                 self.store_reported_cwd(Some(value));
             }
             _ => {}
@@ -330,11 +301,9 @@ impl TerminalHandler<'_> {
     }
 
     /// OSC 633 `P;AtermIntegration=<rev>`: which integration body the shell runs
-    /// (`status integration_rev=`).
-    ///
-    /// Recorded only when the nonce gate is on, so the value is the shell's word
-    /// rather than a program's output. The value must be exactly 16 lowercase hex
-    /// digits (a script folder's address) or it is ignored.
+    /// (`status integration_rev=`). Recorded only under the nonce gate, so the
+    /// value is the shell's word, not a program's output; anything but 16
+    /// lowercase hex digits (a script folder's address) is ignored.
     fn record_integration_rev(&mut self, value: &str) {
         if !self.modes.require_shell_integration_nonce
             || !crate::shell_integration::is_integration_rev(value)
@@ -346,15 +315,10 @@ impl TerminalHandler<'_> {
         self.shell.integration_rev = Some(rev);
     }
 
-    /// Unescape VS Code's command line escape format.
-    ///
-    /// VS Code shell integration uses backslash escapes:
-    /// - `\\` → `\` (literal backslash)
-    /// - `\xAB` → byte with hex value AB
-    ///
-    /// Shells must escape:
-    /// - `;` as `\x3b`
-    /// - All bytes <= 0x20 (control chars, space)
+    /// Unescape VS Code's command-line format: `\\` is a backslash and `\xAB`
+    /// the byte 0xAB (shells escape `;` and every byte <= 0x20 this way). A
+    /// non-ASCII byte becomes U+FFFD; an unknown or malformed escape stays
+    /// literal.
     fn unescape_vscode_string(s: &str) -> String {
         let mut result = String::with_capacity(s.len());
         let mut chars = s.chars().peekable();
@@ -363,12 +327,10 @@ impl TerminalHandler<'_> {
             if c == '\\' {
                 match chars.peek() {
                     Some('\\') => {
-                        // \\ → literal backslash
                         chars.next();
                         result.push('\\');
                     }
                     Some('x') => {
-                        // \xAB → hex-encoded byte
                         chars.next(); // consume 'x'
                         let hex: String = chars.by_ref().take(2).collect();
                         if hex.len() == 2 {
@@ -386,7 +348,6 @@ impl TerminalHandler<'_> {
                         }
                     }
                     _ => {
-                        // Unknown escape, output literally
                         result.push('\\');
                     }
                 }
@@ -421,7 +382,7 @@ mod prompt_on_alt_screen_tests {
         term
     }
 
-    /// What pwsh sent after `Stop-Process`, byte for byte in shape.
+    /// The shell's bytes after its pager is killed (pwsh after `Stop-Process`).
     const PROMPT_AFTER_KILL: &[u8] = b"\r\n\x1b]133;D;-1\x07\x1b]133;A\x07PS> \x1b]133;B\x07";
 
     /// The visible rows, trailing blanks trimmed (a prompt's `PS> ` reads `PS>`).

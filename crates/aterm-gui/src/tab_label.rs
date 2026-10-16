@@ -13,7 +13,7 @@
 //! characters a tab has least room for.
 //!
 //! Measured on this machine at 0.61.0: two tabs in `~/aterm` both labelled
-//! `user@m17-tower: ~/aterm · Ready`. Byte-identical, so [`crate::tab_bar`]'s
+//! `user@host: ~/aterm · Ready`. Byte-identical, so [`crate::tab_bar`]'s
 //! distinctness pass correctly concluded there was nothing to tell apart and fell
 //! back to painting the bare tab ordinals `1` and `2`. With seven tabs open the
 //! whole strip was numbers. The strip was not wrong — its input carried no
@@ -66,11 +66,17 @@ fn local_host_names() -> &'static (String, String) {
     })
 }
 
-/// Read the host's own name without spawning anything on the platforms that can
-/// answer from the filesystem or an API. `$HOSTNAME` is consulted first because a
-/// user who overrides it is describing the same machine the prompt will name.
+/// Read the host's own name without spawning anything: the filesystem or an API
+/// answers on every platform (it once ran `hostname`, a process on the UI thread at
+/// the first tab label). `$HOSTNAME` is consulted first because a user who overrides
+/// it is describing the same machine the prompt will name.
 fn resolve_hostname() -> Option<String> {
-    if let Some(name) = std::env::var_os("HOSTNAME")
+    resolve_hostname_over(std::env::var_os("HOSTNAME"))
+}
+
+/// [`resolve_hostname`] with `$HOSTNAME` passed in: no test may set it.
+fn resolve_hostname_over(env: Option<std::ffi::OsString>) -> Option<String> {
+    if let Some(name) = env
         && let Some(name) = name.to_str()
         && !name.trim().is_empty()
     {
@@ -86,12 +92,30 @@ fn resolve_hostname() -> Option<String> {
     {
         windows_host_name()
     }
-    #[cfg(not(windows))]
+    #[cfg(unix)]
     {
-        let out = aterm_uds::spawnfd::command("hostname").output().ok()?;
-        let name = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-        (!name.is_empty()).then_some(name)
+        unix_host_name()
     }
+    #[cfg(not(any(unix, windows)))]
+    {
+        None
+    }
+}
+
+/// The name `hostname` prints, read the way it reads it: `gethostname(3)`.
+#[cfg(unix)]
+fn unix_host_name() -> Option<String> {
+    unsafe extern "C" {
+        fn gethostname(name: *mut libc::c_char, len: libc::size_t) -> libc::c_int;
+    }
+    let mut buf = [0u8; 256];
+    // SAFETY: `buf` is writable for its whole length, which is what is passed.
+    if unsafe { gethostname(buf.as_mut_ptr().cast(), buf.len()) } != 0 {
+        return None;
+    }
+    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    let name = String::from_utf8_lossy(&buf[..len]).trim().to_owned();
+    (!name.is_empty()).then_some(name)
 }
 
 /// Windows: the DNS host name, as `hostname.exe` prints it
@@ -220,7 +244,7 @@ fn without_identity_of<'a>(title: &'a str, local_full: &str, local_short: &str) 
     };
     // No default prompt puts whitespace in either token, and requiring that is
     // what stops a sentence that merely CONTAINS an address — `sent to
-    // user@m17-tower: ok` — from being read as a prompt's identity.
+    // user@host: ok` — from being read as a prompt's identity.
     if user.is_empty()
         || host.is_empty()
         || head.contains(char::is_whitespace)
@@ -245,13 +269,41 @@ fn host_is_local(host: &str, local_full: &str, local_short: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{host_is_local, informative, without_console_program_path, without_identity_of};
+    use super::{
+        host_is_local, informative, resolve_hostname_over, without_console_program_path,
+        without_identity_of,
+    };
 
     const FULL: &str = "m17-tower.local";
     const SHORT: &str = "m17-tower";
 
     fn strip(title: &str) -> &str {
         without_identity_of(title, FULL, SHORT)
+    }
+
+    /// A `$HOSTNAME` a person set names the machine; with none, the name is
+    /// read in-process and is the one `hostname` prints.
+    #[test]
+    fn the_hostname_override_wins_and_the_machine_s_own_name_is_hostname_s() {
+        assert_eq!(
+            resolve_hostname_over(Some(" my-override.local ".into())).as_deref(),
+            Some("my-override.local")
+        );
+        #[cfg(target_os = "macos")]
+        {
+            let printed = aterm_uds::spawnfd::command("hostname")
+                .output()
+                .expect("`hostname` runs");
+            let printed = String::from_utf8_lossy(&printed.stdout).trim().to_owned();
+            assert_eq!(
+                resolve_hostname_over(None),
+                Some(printed).filter(|p| !p.is_empty())
+            );
+            assert_eq!(
+                resolve_hostname_over(Some("  ".into())),
+                resolve_hostname_over(None)
+            );
+        }
     }
 
     #[test]

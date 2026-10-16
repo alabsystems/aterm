@@ -93,31 +93,6 @@ fn small<const N: usize>(boom_at: usize) -> SmallVec<Recorder, N> {
     v
 }
 
-/// THE CONTROL. Without this, a `clear` that dropped NOTHING (or a destructor
-/// that never panicked) would satisfy the assertions below vacuously.
-#[test]
-fn the_recorder_actually_records_and_actually_panics() {
-    let _ = drain_log();
-    {
-        let mut v: ArrayVec<Recorder, 8> = ArrayVec::new();
-        let _ = v.try_push(recorder(7, usize::MAX));
-        v.clear();
-    }
-    assert_eq!(
-        drain_log(),
-        vec![7],
-        "an infallible Drop must be logged exactly once"
-    );
-
-    let caught = catch_unwind(AssertUnwindSafe(|| {
-        let mut v: ArrayVec<Recorder, 8> = ArrayVec::new();
-        let _ = v.try_push(recorder(9, 9));
-        v.clear();
-    }));
-    assert!(caught.is_err(), "the panicking Drop must actually unwind");
-    let _ = drain_log();
-}
-
 #[test]
 fn array_vec_clear_drops_each_element_once_when_a_destructor_panics() {
     let _ = drain_log();

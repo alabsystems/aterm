@@ -89,8 +89,7 @@ fn synchronized_hold_preserves_license_and_anchors_until_glass_release() {
 /// in flight, one torn present parks the hidden cursor eight rows up and
 /// neither engine's anchor moves. The key's licence survives until the
 /// shown caret returns and lays its cell. Negative control: the same hidden
-/// cursor on a frame whose bracket has closed is handed over and taken as
-/// the anchor (owner, 2026-09-28).
+/// cursor on a frame whose bracket has closed is taken as the anchor.
 #[test]
 fn a_torn_presents_hidden_cursor_moves_no_engine_and_spends_no_key() {
     let run = |hidden_withheld: bool| {
@@ -263,8 +262,8 @@ fn sync_opening_between_preflight_and_exact_capture_advances_nothing_off_glass()
         )
     };
 
-    // Deterministic A/B interleave: a partial synchronized episode begins
-    // after preflight but before the exact snapshot/effect authorization.
+    // A synchronized episode opens after the preflight but before the exact
+    // snapshot authorizes effects.
     {
         let mut terminal = term_lock(&terminal);
         terminal.process(b"\x1b[?2026hpartial");
@@ -323,9 +322,8 @@ fn sync_opening_between_preflight_and_exact_capture_advances_nothing_off_glass()
         "the rejected off-glass candidate cannot reach the sound host"
     );
 
-    // Non-vacuity: after the episode closes, the same prepared move really
-    // does advance and speak. The hold test would not pass merely because
-    // the fixture was incapable of producing cursor state.
+    // Non-vacuity: once the episode closes the same prepared move advances
+    // and speaks.
     {
         let mut terminal = term_lock(&terminal);
         terminal.process(b"\x1b[?2026l");

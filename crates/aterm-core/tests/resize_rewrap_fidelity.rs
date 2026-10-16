@@ -114,9 +114,24 @@ fn spaces_between_emoji_clusters_survive_a_screen_round_trip() {
 /// the early wrap.
 #[test]
 fn a_real_early_wrap_hole_is_dropped_on_rejoin() {
-    for text in ["abcdefghi中xyz", "\x1b[41mabcdefghi中\x1b[0mxyz"] {
+    let hole_bg = |frame: &aterm_core::render::RenderInput| {
+        frame.cells[0].get(9).map_or_else(
+            || {
+                let [_, r, g, b] = frame.default_bg.to_be_bytes();
+                [r, g, b]
+            },
+            |cell| cell.bg,
+        )
+    };
+    for text in [
+        "abcdefghi中xyz",
+        "\x1b[41mabcdefghi中\x1b[0mxyz",
+        "\x1b[48;2;17;34;51mabcdefghi中\x1b[0mxyz",
+    ] {
         let mut term = Terminal::new(6, 10);
         term.process(text.as_bytes());
+        let before = term.cell_frame(6, 10);
+        let before_bg = hole_bg(&before);
         assert!(
             term.grid().row(1).is_some_and(|r| r.is_wrapped()),
             "fixture: the wide glyph early-wrapped ({text:?})"
@@ -128,11 +143,61 @@ fn a_real_early_wrap_hole_is_dropped_on_rejoin() {
             "{text:?}"
         );
         term.resize(6, 10);
+        let after = screen(&term);
         assert_eq!(
-            screen(&term)[..2],
-            ["abcdefghi".to_string(), "中xyz".to_string()],
-            "{text:?}: the early wrap comes back"
+            after[0].trim_end(),
+            "abcdefghi",
+            "{text:?}: the hole is blank"
         );
+        assert_eq!(after[1], "中xyz", "{text:?}: the early wrap comes back");
+        let after = term.cell_frame(6, 10);
+        assert_eq!(
+            hole_bg(&after),
+            before_bg,
+            "{text:?}: the regenerated hole uses the wrapping glyph's background"
+        );
+    }
+}
+
+/// A rectangle moves the provenance of its last cell as well as its pixels.
+/// A copied printed blank must not inherit the destination's old hole marker:
+/// reflow would delete that real space when the next row continues it.
+#[test]
+fn margined_vertical_moves_keep_printed_blanks_and_wrap_holes_distinct() {
+    for (name, op, source, destination) in [
+        ("IL", "\x1b[L", 0, 1),
+        ("DL", "\x1b[M", 1, 0),
+        ("SU", "\x1b[S", 1, 0),
+        ("SD", "\x1b[T", 0, 1),
+    ] {
+        let mut term = Terminal::new(6, 4);
+        term.process(format!("\x1b[{};1Habc中", destination + 1).as_bytes());
+        assert!(term.grid().row(destination).unwrap().has_early_wrap_hole());
+        term.process(format!("\x1b[{};1Hdef ", source + 1).as_bytes());
+        term.process(b"\x1b[3;1Hgh");
+        term.process(format!("\x1b[?69h\x1b[2;4s\x1b[1;2H{op}").as_bytes());
+        assert!(
+            !term.grid().row(destination).unwrap().has_early_wrap_hole(),
+            "{name}: the incoming printed blank is content"
+        );
+        term.resize(6, 8);
+        let lines = logical_lines(&term);
+        assert!(
+            lines.iter().any(|line| line.contains("aef ")),
+            "{name}: reflow deleted the copied printed space: {lines:?}"
+        );
+
+        // Conversely, a copied hole remains unwritten. A rectangle ending
+        // before the last column leaves a destination hole where it stood.
+        for (right, expected_row) in [(4, destination), (3, source)] {
+            let mut term = Terminal::new(6, 4);
+            term.process(format!("\x1b[{};1Habc中", source + 1).as_bytes());
+            term.process(format!("\x1b[?69h\x1b[2;{right}s\x1b[1;2H{op}").as_bytes());
+            assert!(
+                term.grid().row(expected_row).unwrap().has_early_wrap_hole(),
+                "{name}: right={right}, hole belongs to row {expected_row}"
+            );
+        }
     }
 }
 

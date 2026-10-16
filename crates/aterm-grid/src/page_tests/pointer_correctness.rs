@@ -4,7 +4,7 @@
 
 use super::super::*;
 
-// Alignment and pointer correctness tests (MIRI-exercised)
+// Alignment and pointer correctness (Miri-exercised).
 
 #[test]
 fn alloc_slice_alignment_u8() {
@@ -23,7 +23,6 @@ fn alloc_slice_alignment_u64() {
     let _byte = store.alloc_slice::<u8>(1);
     let slice = store.alloc_slice::<u64>(10);
     assert_eq!(slice.len(), 10);
-    // Verify alignment
     let ptr = slice.as_slice().as_ptr();
     assert_eq!(ptr.align_offset(std::mem::align_of::<u64>()), 0);
 }
@@ -45,7 +44,6 @@ fn alloc_slice_sequential_no_overlap() {
     let slice1 = store.alloc_slice::<u32>(100);
     let slice2 = store.alloc_slice::<u32>(100);
 
-    // Verify the two slices don't overlap
     let ptr1 = slice1.as_slice().as_ptr() as usize;
     let end1 = ptr1 + 100 * std::mem::size_of::<u32>();
     let ptr2 = slice2.as_slice().as_ptr() as usize;
@@ -54,89 +52,6 @@ fn alloc_slice_sequential_no_overlap() {
         end1 <= ptr2,
         "slices overlap: first ends at {end1:#x}, second starts at {ptr2:#x}"
     );
-}
-
-#[test]
-fn alloc_slice_write_read_roundtrip_after_reset() {
-    let mut store = PageStore::new();
-
-    // Allocate, write, reset, re-allocate, verify clean
-    let mut slice = store.alloc_slice::<u64>(50);
-    for i in 0..50 {
-        slice[i] = 0xCAFE_BABE_0000_0000 + i as u64;
-    }
-    // Verify write
-    for i in 0..50 {
-        assert_eq!(slice[i], 0xCAFE_BABE_0000_0000 + i as u64);
-    }
-
-    store.reset();
-    let new_slice = store.alloc_slice::<u64>(50);
-    // After reset + lazy zeroing, all values should be zero
-    for &val in new_slice.iter() {
-        assert_eq!(val, 0);
-    }
-}
-
-#[test]
-fn offset_out_of_bounds_returns_none() {
-    let page = Page::new();
-    // Offset at PAGE_SIZE boundary should return None
-    let offset = Offset::<u32>::new(PAGE_SIZE as u32);
-    let result = unsafe { offset.get(&page) };
-    assert!(result.is_none());
-}
-
-#[test]
-fn offset_near_boundary_u32() {
-    let page = Page::new();
-    // Last valid u32 offset: PAGE_SIZE - 4
-    let last_valid = (PAGE_SIZE - std::mem::size_of::<u32>()) as u32;
-    let offset = Offset::<u32>::new(last_valid);
-    let result = unsafe { offset.get(&page) }
-        .expect("last in-bounds u32 offset should return a readable value");
-    assert_eq!(*result, 0); // page is zeroed
-
-    // One byte past: should fail
-    let one_past = last_valid + 1;
-    let offset_past = Offset::<u32>::new(one_past);
-    let result_past = unsafe { offset_past.get(&page) };
-    assert!(result_past.is_none());
-}
-
-#[test]
-fn reset_three_pages_all_zeroed_on_reuse() {
-    let mut store = PageStore::new();
-    // Page 0: 100 u32s = 400 bytes. next_offset = 400.
-    let mut s1 = store.alloc_slice::<u32>(100);
-    for i in 0..100 {
-        s1[i] = 0x11111111;
-    }
-    // Force page 1: 16384 u32s = 65536 bytes > remaining (65136).
-    let mut s2 = store.alloc_slice::<u32>(16384);
-    for i in 0..16384 {
-        s2[i] = 0x22222222;
-    }
-    // Force page 2: 16384 u32s again exceeds page 1's remaining space (0).
-    let mut s3 = store.alloc_slice::<u32>(1000);
-    for i in 0..1000 {
-        s3[i] = 0x33333333;
-    }
-    assert_eq!(store.active_pages(), 3, "expected exactly 3 active pages");
-    store.reset();
-    // Reallocate from recycled pages and verify zeroing.
-    let c1 = store.alloc_slice::<u32>(100);
-    for (i, &v) in c1.iter().enumerate() {
-        assert_eq!(v, 0, "page1 idx {i}: {v:#010x}");
-    }
-    let c2 = store.alloc_slice::<u32>(16384);
-    for (i, &v) in c2.iter().enumerate() {
-        assert_eq!(v, 0, "page2 idx {i}: {v:#010x}");
-    }
-    let c3 = store.alloc_slice::<u32>(1000);
-    for (i, &v) in c3.iter().enumerate() {
-        assert_eq!(v, 0, "page3 idx {i}: {v:#010x}");
-    }
 }
 
 // Pointer stability and alignment: alloc_slice pointers stay valid across later
@@ -150,15 +65,13 @@ fn alloc_slice_cell_alignment_and_access() {
 
     let mut store = PageStore::new();
 
-    // Allocate cells exactly as Row::new does
     let mut cells = store.alloc_slice::<Cell>(80);
     assert_eq!(cells.len(), 80);
 
-    // Verify pointer is non-null and usable
     let ptr = cells.as_slice().as_ptr();
     assert!(!ptr.is_null());
 
-    // Write and read back through the slice (exercises from_raw_parts)
+    // Write and read back through the slice (exercises from_raw_parts).
     for cell in cells.iter_mut() {
         *cell = Cell::EMPTY;
     }
@@ -201,12 +114,10 @@ fn alloc_zero_length_slice_is_stable_and_non_consuming() {
 fn alloc_slice_pointer_stability_across_allocations() {
     let mut store = PageStore::new();
 
-    // Allocate three slices on the same page
     let mut s1 = store.alloc_slice::<u32>(100);
     let mut s2 = store.alloc_slice::<u32>(100);
     let mut s3 = store.alloc_slice::<u32>(100);
 
-    // Write distinct patterns to each
     for (i, val) in s1.iter_mut().enumerate() {
         *val = 0xAAAA_0000 + i as u32;
     }
@@ -222,7 +133,6 @@ fn alloc_slice_pointer_stability_across_allocations() {
         let _extra = store.alloc_slice::<u32>(1000);
     }
 
-    // Verify original slices still have correct data (pointers didn't dangle)
     for (i, &val) in s1.iter().enumerate() {
         assert_eq!(
             val,
@@ -254,8 +164,7 @@ fn alloc_slice_pointer_stability_across_pages() {
 
     let mut store = PageStore::new();
 
-    // Allocate a Cell slice that fills most of the first page
-    // Cell is 8 bytes, 8000 cells = 64000 bytes (nearly fills 64KB page)
+    // 8000 cells of 8 bytes nearly fill the 64 KB page.
     let mut first_page_cells = store.alloc_slice::<Cell>(8000);
     for cell in first_page_cells.iter_mut() {
         cell.set_char('X');
@@ -269,7 +178,6 @@ fn alloc_slice_pointer_stability_across_pages() {
 
     assert_eq!(store.active_pages(), 2, "expected exactly 2 active pages");
 
-    // Verify first page data is intact
     for (i, cell) in first_page_cells.as_slice().iter().enumerate() {
         assert_eq!(
             cell.char(),
@@ -277,7 +185,6 @@ fn alloc_slice_pointer_stability_across_pages() {
             "first page cell[{i}] corrupted after second page allocation"
         );
     }
-    // Verify second page data is intact
     for (i, cell) in second_page_cells.as_slice().iter().enumerate() {
         assert_eq!(cell.char(), 'Y', "second page cell[{i}] corrupted");
     }

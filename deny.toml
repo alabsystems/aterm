@@ -15,8 +15,10 @@
 #
 #     cargo deny --offline check
 #
-# cargo-deny is OPTIONAL tooling, not required to build or test aterm.
-# aterm-forge's attest (OB-9) reads `[licenses] allow` from this file.
+# cargo-deny is OPTIONAL tooling, not required to build or test aterm. The
+# policy itself is enforced by `targo --unverified forge check`: `[licenses]
+# allow` by [OB-9], and `[bans] deny` plus `[sources]` by [OB-18], over every
+# cell's resolved graph.
 #
 # Schema: cargo-deny v2 (the current `[graph]`/`[advisories]`/`[licenses]`/
 # `[bans]`/`[sources]` layout; no `version` keys, no removed fields such as
@@ -150,8 +152,24 @@ allow-wildcard-paths = true
 # To outright ban a crate, add e.g.
 #   { name = "openssl", reason = "atpkg's crypto root is ring (pure-Rust); do not add a second C TLS/crypto stack" }
 # with a reason string.
+#
+# THIRD-PARTY RANDOMNESS. Entropy in the shipped tree comes from `aterm_uds::rand`
+# (the OS CSPRNG, and on wasm32 a counter the module docs justify), so no
+# first-party crate depends on an RNG crate. Resolution sees a crate whatever a
+# manifest calls it, so a rename or a dotted key cannot hide one. `getrandom`
+# 0.2 IS aterm_uds::rand: crates/aterm-getrandom, through its [patch.crates-io]
+# row, and ring is the one crate admitted to take it. That ring's getrandom is
+# that path package is [OB-12]'s half of the rule: a registry copy beside it,
+# or a row that replaces nothing, fails `forge check`. `fastrand` arrives inside
+# third-party crates, admitted under the parents named.
 deny = [
     { name = "ring", version = "<0.17.14", reason = "atpkg's load-bearing Ed25519 and OpenPGP RSA verify root (TOOLCHAIN-PACKAGE-MANAGER.md S8/S13): never allow it to drift below the audited, vendored floor on the verify path" },
+    { name = "getrandom", wrappers = ["ring"], reason = "entropy comes from aterm_uds::rand; getrandom is its first-party facade (crates/aterm-getrandom), admitted only as ring's seed source" },
+    { name = "fastrand", wrappers = ["async-executor", "futures-lite", "phf_generator", "piper", "softbuffer"], reason = "entropy comes from aterm_uds::rand; the Linux stack's own uses (phf's table generator, the wayland async helpers, softbuffer) are the admitted parents" },
+    { name = "rand", reason = "entropy comes from aterm_uds::rand" },
+    { name = "rand_core", reason = "entropy comes from aterm_uds::rand" },
+    { name = "rand_chacha", reason = "entropy comes from aterm_uds::rand" },
+    { name = "aterm-phase", wrappers = ["aterm-gui", "aterm-agent"], reason = "the vendor screen reader runs in the server: the fabric (aterm-link) and every other crate reach it only through aterm-gui or aterm-agent" },
 ]
 # Crates explicitly allowed to appear more than once (none pinned yet — the
 # warn-level policy above already keeps duplicates non-fatal).

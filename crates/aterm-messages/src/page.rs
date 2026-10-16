@@ -18,8 +18,8 @@
 //! It also holds the page's chrome words ([`HEADING`], [`SUBTITLE`],
 //! [`severity_segment_words`], [`ALL_TAGS`], [`Chip::label`],
 //! [`tag_menu_label`], [`tag_menu_name`], [`COPY_ALL`], [`copy_all_text`],
-//! [`EMPTY`], [`MessageView::meta_words`], [`TECHNICAL`], [`button_label`],
-//! [`COPY`]). A host's own affordances keep their words
+//! [`EMPTY`], [`NO_MATCH`], [`SHOW_ALL`], [`MessageView::meta_words`],
+//! [`TECHNICAL`], [`button_label`], [`COPY`]). A host's own affordances keep their words
 //! there (the macOS page's `Open Log Folder` and its `Explain heavy load`
 //! switch).
 //!
@@ -105,6 +105,13 @@ pub const SUBTITLE: &str = "What aterm reported, newest first.";
 /// its list.
 pub const EMPTY: &str = "Nothing yet.";
 
+/// The page's line where the log has messages but the filters admit none, in
+/// place of the list.
+pub const NO_MATCH: &str = "No messages match these filters.";
+
+/// The button beside [`NO_MATCH`]: it lifts both filters.
+pub const SHOW_ALL: &str = "Show All";
+
 /// The first tag chip, which lets every tag through.
 pub const ALL_TAGS: &str = "All tags";
 
@@ -163,9 +170,8 @@ fn tag_menu_current(tag: Option<&str>) -> Cow<'_, str> {
 #[must_use]
 pub fn button_label(label: &str) -> String {
     match label {
-        "Packages" | "Software Update" | "Manual" | "Appearance" | "Messages" | "Settings" => {
-            format!("Open {label}")
-        }
+        "Packages" | "Software Update" | "Manual" | "Appearance" | "Messages" | "Security"
+        | "Settings" => format!("Open {label}"),
         other => other.to_string(),
     }
 }
@@ -1191,11 +1197,11 @@ impl MessagesState {
 ///   tag chip's words ([`ALL_TAGS`]) and whether it is down (no tag filter);
 ///   the tag pop-up's painted words and spoken name ([`tag_menu_label`],
 ///   [`tag_menu_name`]); the count line's report button and its spoken name
-///   ([`COPY_ALL`], [`COPY_ALL_NAME`]), pressable while `total` is above 0 (a
-///   filter that admits nothing leaves it pressable, and it copies the build
-///   information alone); the empty log's line ([`EMPTY`], shown while
-///   `total=0`); the caption over an entry's technical lines ([`TECHNICAL`])
-///   and every entry's Copy button ([`COPY`]).
+///   ([`COPY_ALL`], [`COPY_ALL_NAME`]), pressable while `shown` is above 0 (a
+///   filter that admits nothing has nothing to copy); the empty log's line
+///   ([`EMPTY`], shown while `total=0`); the caption over an entry's
+///   technical lines ([`TECHNICAL`]) and every entry's Copy button
+///   ([`COPY`]).
 /// - `chip tag= words= count= on= label=`, one per chip in the chips' order
 ///   ([`MessagesState::chips`] under the severity filter), `on=1` on the one
 ///   the tag filter selects; `label=` the chip's painted words
@@ -1228,7 +1234,8 @@ impl MessagesState {
 ///   in list order, `\n\n` and its `copy=` ([`copy_all_text`]); the lines
 ///   carry every part but the build's.
 /// - A host's own affordances: the macOS page's `Open Log Folder` and its
-///   `Explain heavy load` switch.
+///   `Explain heavy load` switch, and the line it shows where messages exist
+///   but `shown=0` ([`NO_MATCH`], with its [`SHOW_ALL`] button).
 /// - The layout's words and choices: its groups' names (`Severity`, `Tags`,
 ///   `Message actions`), a bounded card's `… (N more lines)`, and whether the
 ///   tag filter takes the chips' form or the pop-up's.

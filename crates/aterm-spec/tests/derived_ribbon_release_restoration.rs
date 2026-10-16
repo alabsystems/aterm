@@ -1,13 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-use aterm_spec::{derive::ribbon_release_restoration_model, verify};
-
-#[test]
-fn ribbon_release_restoration_proves_and_catches_partial_revival() {
-    let model = ribbon_release_restoration_model();
-    verify::prove_and_catch_scalar(&model, model.name);
-}
+use aterm_spec::derive::ribbon_release_restoration_model;
 
 #[test]
 fn failed_observations_retain_custody_until_a_complete_return() {

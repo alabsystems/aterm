@@ -6,11 +6,6 @@ use aterm_spec::{derive::atpkg_contention_release_park_model, interp, verify};
 #[test]
 fn a_contended_lane_retries_on_the_first_slice_after_release() {
     let model = atpkg_contention_release_park_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name)
-    );
     verify::prove_and_catch_scalar(&model, "atpkg contention release park");
 
     let mut held = model.init_state();

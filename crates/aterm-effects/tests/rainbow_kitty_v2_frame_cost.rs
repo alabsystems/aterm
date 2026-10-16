@@ -24,37 +24,34 @@
 //!   nothing, reporting when each pool (stars, ribbon cells, meteors) and each
 //!   idle law reached zero;
 //! * the **stream caps** (`MAX_QUADS 16 384`, `MAX_HALOS 512`) on every tick;
-//! * in the `--release --ignored` twin, the §18 **CPU budget** (p50 and p90)
-//!   for the engine alone and through the seam.
+//! * in the release bench (`benches/rainbow_kitty_v2_frame_cost.rs`, which
+//!   mounts this file), the §18 **CPU budget** (p50 and p90) for the engine
+//!   alone and through the seam.
 //!
 //! ```sh
 //! # the deterministic laws (zero-alloc, idle → zero, caps) — every run:
 //! targo --unverified test -p aterm-effects --test rainbow_kitty_v2_frame_cost -- --nocapture
-//! # the CPU budget gate — release only, like tests/cursor_bench.rs:
-//! targo --unverified test -p aterm-effects --release --test rainbow_kitty_v2_frame_cost \
-//!     -- --ignored --nocapture --test-threads=1
+//! # the CPU budget gate — release only, like benches/cursor_bench.rs:
+//! targo --unverified bench -p aterm-effects --bench rainbow_kitty_v2_frame_cost
 //! # the same gate on a host with no §18 measurement on record — scales §18's
 //! # two ABSOLUTE budgets (the engine alone and through the seam) and nothing
 //! # else; zero-alloc, idle → zero and the caps are never scaled (the knob is
-//! # shared with tests/cursor_bench.rs; see `common::budget_scale`):
-//! RK_FRAME_COST_BUDGET_SCALE=2 targo --unverified test -p aterm-effects --release \
-//!     --test rainbow_kitty_v2_frame_cost -- --ignored --nocapture --test-threads=1
+//! # shared with benches/cursor_bench.rs; see `common::budget_scale`):
+//! RK_FRAME_COST_BUDGET_SCALE=2 targo --unverified bench -p aterm-effects \
+//!     --bench rainbow_kitty_v2_frame_cost
 //! ```
 //!
 //! The allocator counts only the thread that switched it on, while a driver call
 //! is on its stack, and keeps its tally on that thread too, so the laws' twelve
-//! (scenario x engine) cells run on [`common::par_map`]'s pool. The budget twin
-//! reads the wall clock and must not share cores with that pool, so the two
-//! tests still serialize on one mutex. Use `--test-threads=1` with
-//! `--include-ignored`.
+//! (scenario x engine) cells run on [`common::par_map`]'s pool.
 
-mod common;
+pub(crate) mod common;
 
 use std::{
     alloc::{GlobalAlloc, Layout, System},
     cell::Cell,
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
@@ -65,7 +62,7 @@ use aterm_effects::rainbow_kitty::{
     CaretSeam, Config, Dir, Engine, Event, Frame, Licence, TypedClass, witness::WITNESS_ROWS,
 };
 use aterm_render::{BeamVertex, GlowQuad, RainHalo};
-use common::{BUDGET_SCALE_VAR, budget_scale, par_map, scaled_budget_us};
+use common::par_map;
 
 // ===========================================================================
 // The counting allocator
@@ -145,11 +142,6 @@ unsafe impl GlobalAlloc for CountingAllocator {
 
 #[global_allocator]
 static ALLOCATOR: CountingAllocator = CountingAllocator;
-
-/// The budget twin's p50/p90 are wall-clock numbers, so neither test runs while
-/// the other does: the laws' pool must not take the cores the budget measures
-/// on.
-static SERIAL: Mutex<()> = Mutex::new(());
 
 /// Count the allocations `f` makes on this thread. Returns the count and the
 /// first sizes.
@@ -306,8 +298,8 @@ struct Step {
 }
 
 /// One §21 scenario.
-struct Scenario {
-    name: &'static str,
+pub(crate) struct Scenario {
+    pub(crate) name: &'static str,
     /// Where the caret starts.
     start: (u16, u16),
     /// Total ticks the script runs.
@@ -527,7 +519,7 @@ fn sing_along_bars() -> Scenario {
     }
 }
 
-fn scenarios() -> Vec<Scenario> {
+pub(crate) fn scenarios() -> Vec<Scenario> {
     let only = std::env::var("RK_FRAME_COST_ONLY").unwrap_or_default();
     let needle = only.split(':').nth(1).unwrap_or("").to_string();
     vec![
@@ -549,7 +541,7 @@ fn scenarios() -> Vec<Scenario> {
 /// `RK_FRAME_COST_REPEAT=n` repeats each measurement so a sampler can attach.
 /// Neither changes what is asserted (`RK_FRAME_COST_BUDGET_SCALE` does; see
 /// `common::budget_scale`).
-fn engine_selected(tag: &str) -> bool {
+pub(crate) fn engine_selected(tag: &str) -> bool {
     let only = std::env::var("RK_FRAME_COST_ONLY").unwrap_or_default();
     let engines = only.split(':').next().unwrap_or("");
     engines.is_empty() || engines.split('+').any(|e| e == tag)
@@ -987,7 +979,7 @@ struct IdleTimes {
 
 /// What one measured pass produced.
 #[derive(Clone, Debug, Default)]
-struct Report {
+pub(crate) struct Report {
     us: Vec<u64>,
     /// The replica fingerprint fold's own µs per measured tick.
     fp_us: Vec<u64>,
@@ -1023,10 +1015,10 @@ impl Report {
         }
         self.us[(n * p / 100).min(n - 1)]
     }
-    fn p50(&self) -> u64 {
+    pub(crate) fn p50(&self) -> u64 {
         self.pct(50)
     }
-    fn p90(&self) -> u64 {
+    pub(crate) fn p90(&self) -> u64 {
         self.pct(90)
     }
     fn max(&self) -> u64 {
@@ -1201,42 +1193,18 @@ fn measure(d: &mut dyn Driver, sc: &Scenario) -> Report {
 /// One cell of the table: `tag`'s engine (`"v2"` alone, else `"v2s"` through
 /// the seam) driven through `sc` on this thread, driver built here, so its
 /// warm-up and its measured pass see one thread's allocator tally.
-fn measure_cell(tag: &str, sc: &Scenario) -> Report {
+pub(crate) fn measure_cell(tag: &str, sc: &Scenario) -> Report {
     match tag {
         "v2" => measure(&mut V2::new(), sc),
         _ => measure(&mut Host::seam(), sc),
     }
 }
 
-/// One row set: the engine alone and v2 through the seam. An engine
-/// `RK_FRAME_COST_ONLY` leaves out reports empty, which the gates treat as
-/// nothing to hold.
-fn measure_all(sc: &Scenario) -> (Report, Report) {
-    let r2 = if engine_selected("v2") {
-        let r = measure_cell("v2", sc);
-        print_row("v2 ", sc, &r);
-        r
-    } else {
-        Report::default()
-    };
-    let rs = if engine_selected("v2s") {
-        let r = measure_cell("v2s", sc);
-        print_row("v2s", sc, &r);
-        r
-    } else {
-        Report::default()
-    };
-    if engine_selected("v2") {
-        print_idle(sc, &r2);
-    }
-    (r2, rs)
-}
-
 fn fmt_ms(t: Option<u64>) -> String {
     t.map_or_else(|| "NEVER".to_string(), |ms| format!("{ms} ms"))
 }
 
-fn print_row(engine: &str, sc: &Scenario, r: &Report) {
+pub(crate) fn print_row(engine: &str, sc: &Scenario, r: &Report) {
     println!(
         "| {:<44} | {engine} | {:>5} | {:>5} | {:>6} | {:>4} | {:>6} ({:>5} mean; under {:>5} / out {:>4}, out px {:>6}) | {:>3} | {:>3} | {:?} |",
         sc.name,
@@ -1255,7 +1223,7 @@ fn print_row(engine: &str, sc: &Scenario, r: &Report) {
     );
 }
 
-fn print_header(mode: &str) {
+pub(crate) fn print_header(mode: &str) {
     println!();
     println!(
         "rainbow kitty v2 frame cost — {mode} — {HZ} Hz tick, geometry 18×40 px, 190×26 cells"
@@ -1266,7 +1234,7 @@ fn print_header(mode: &str) {
     );
 }
 
-fn print_idle(sc: &Scenario, r: &Report) {
+pub(crate) fn print_idle(sc: &Scenario, r: &Report) {
     let i = &r.idle;
     println!(
         "  idle after last key [{}]: stars→0 {}, cells→0 {}, meteors→0 {}, fp→0 {}, cadence→false {}, deadline→None {}; ALL ZERO at {}; tick after wrote nothing: {}",
@@ -1308,12 +1276,9 @@ fn print_allocs(sc: &Scenario, r: &Report) {
 /// §18's deterministic laws, every run: zero allocation on every steady and
 /// idle frame, idle → exactly zero within the longest life, the stream caps,
 /// and a live fixture. Timing is printed for information only (debug numbers
-/// are not the budget's; see the release twin).
+/// are not the budget's; see `benches/rainbow_kitty_v2_frame_cost.rs`).
 #[test]
 fn rainbow_kitty_v2_steady_frames_allocate_nothing_and_idle_to_exactly_zero() {
-    let _serial = SERIAL
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     assert_counter_is_per_thread();
     let mode = if cfg!(debug_assertions) {
         "DEBUG build (timing informational)"
@@ -1431,81 +1396,6 @@ fn rainbow_kitty_v2_steady_frames_allocate_nothing_and_idle_to_exactly_zero() {
     assert!(
         reds.is_empty(),
         "rainbow kitty v2 frame-cost laws RED:\n  {}",
-        reds.join("\n  ")
-    );
-}
-
-/// §18's CPU budget — release only, like tests/cursor_bench.rs: p50 ≤ 400 µs,
-/// p90 ≤ 600 µs per tick including the ribbon, on every §21 scenario, for
-/// the engine alone and through the seam, measured in the same harness on
-/// the same script.
-///
-/// The two numbers are the reference machine's (§18 of
-/// docs/design/RAINBOW-KITTY-V2.md); every v2 run the doc records is at most
-/// p50 137 / p90 151 µs. `RK_FRAME_COST_BUDGET_SCALE` (`common::budget_scale`) scales the two
-/// reference numbers, for the engine alone and through the seam, on a host
-/// with no measurement on record, and nothing else: the zero-alloc,
-/// idle → zero and cap laws the non-ignored twin holds are allocation counts
-/// and a scripted clock, never the wall clock, and never read it.
-#[test]
-#[ignore = "perf gate: run manually in --release with --ignored --nocapture --test-threads=1"]
-fn bench_rainbow_kitty_v2_frame_cost_budget() {
-    let _serial = SERIAL
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if cfg!(debug_assertions) {
-        panic!("the CPU budget is a release-build number; run with --release");
-    }
-    // The reference machine's numbers (§18); the host's thresholds are these
-    // times `RK_FRAME_COST_BUDGET_SCALE`, and the header and the red print
-    // both, so a red names the budget it was measured against.
-    const P50_BUDGET_US: u64 = 400;
-    const P90_BUDGET_US: u64 = 600;
-    let scale = budget_scale();
-    let p50_budget_us = scaled_budget_us(P50_BUDGET_US, scale);
-    let p90_budget_us = scaled_budget_us(P90_BUDGET_US, scale);
-    let budget = format!(
-        "p50 ≤ {p50_budget_us} µs / p90 ≤ {p90_budget_us} µs \
-         (reference {P50_BUDGET_US}/{P90_BUDGET_US} × {BUDGET_SCALE_VAR} {scale})"
-    );
-    print_header(&format!("release build — §18 budget {budget}"));
-    let mut reds: Vec<String> = Vec::new();
-    for sc in scenarios() {
-        let (r2, rs) = measure_all(&sc);
-        if engine_selected("v2") && r2.p50() > p50_budget_us {
-            reds.push(format!(
-                "[{}] v2 p50 {} µs > {p50_budget_us} µs",
-                sc.name,
-                r2.p50()
-            ));
-        }
-        if engine_selected("v2") && r2.p90() > p90_budget_us {
-            reds.push(format!(
-                "[{}] v2 p90 {} µs > {p90_budget_us} µs",
-                sc.name,
-                r2.p90()
-            ));
-        }
-        // The shipping path: v2 THROUGH `CursorGlow`'s seam is held to the
-        // same absolute budget as the engine alone.
-        if engine_selected("v2s") && rs.p50() > p50_budget_us {
-            reds.push(format!(
-                "[{}] v2-via-seam p50 {} µs > {p50_budget_us} µs",
-                sc.name,
-                rs.p50()
-            ));
-        }
-        if engine_selected("v2s") && rs.p90() > p90_budget_us {
-            reds.push(format!(
-                "[{}] v2-via-seam p90 {} µs > {p90_budget_us} µs",
-                sc.name,
-                rs.p90()
-            ));
-        }
-    }
-    assert!(
-        reds.is_empty(),
-        "rainbow kitty v2 CPU budget RED ({budget}):\n  {}",
         reds.join("\n  ")
     );
 }

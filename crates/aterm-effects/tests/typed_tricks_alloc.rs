@@ -7,9 +7,10 @@
 //! Enter in every window goes through it, feature on or off. Its law is one
 //! inline push per letter and one fold + one hash probe per closed token, and,
 //! once the fold scratch has grown to the widest token the window can hold, no
-//! allocation at all (not for a fire, a borrowed event word, the boundary
-//! snapshot, a held address word, a parked fire, an IME commit or a session
-//! switch).
+//! allocation at all (not for a fire, a borrowed event word or the command
+//! surfaces beside it, the boundary snapshot, a held address word, a parked
+//! fire, an IME commit, a session switch, or the glued reading of a no-space
+//! run, which probes borrowed halves of the inline token, hit or miss).
 //!
 //! One `#[test]` in its own binary: the counter is a process-global allocator
 //! switched by a global flag, so a parallel test would bleed into the count.
@@ -85,8 +86,15 @@ cjk   = true
 
 [[vocative]]
 lang  = "ja"
-words = ["ねこ"]
+words = ["ねこ", "こねこ"]
 cjk   = true
+
+[[trick]]
+id      = "scold"
+lang    = "ja"
+words   = ["わるいこ"]
+address = ["わるい"]
+cjk     = true
 
 [[trick]]
 id    = "sit"
@@ -106,14 +114,20 @@ struct Heard {
     pet_only_submits: usize,
     /// Bytes of fired words, read THROUGH the borrowed `&str`.
     word_bytes: usize,
+    /// Bytes of their command surfaces, walked as a host's ignore list walks
+    /// them: fewer than `word_bytes` once a glued run has fired.
+    command_bytes: usize,
+    /// Fires of the glued lane alone.
+    glued_fires: usize,
 }
 
 impl Heard {
     fn hear(&mut self, feed: aterm_effects::typed_tricks::TrickFeed<'_>) {
         match feed.event {
-            Some(TrickEvent::Fire { word, .. }) => {
+            Some(TrickEvent::Fire { word, commands, .. }) => {
                 self.fires += 1;
                 self.word_bytes += word.len();
+                self.command_bytes += commands.iter().map(str::len).sum::<usize>();
             }
             Some(TrickEvent::Confirm { .. }) => self.confirms += 1,
             Some(TrickEvent::Revoke) => self.revokes += 1,
@@ -204,6 +218,27 @@ fn one_pass(
     let lexicon = listener.ime_needs_lexicon(sentence).then_some(lanes);
     heard.hear(listener.note_ime(*now, sentence, lexicon));
     type_script(listener, lanes, now, "⏎", &mut heard);
+    // A name glued to its command either way round, a run read at two cuts,
+    // and the glued reading's costliest miss: a run filling the window, no
+    // name and command at any of its 31 cuts.
+    const FULL_WINDOW_MISS: &str =
+        "ねこかわいいねこかわいいねこかわいいねこかわいいねこかわいいねこ";
+    assert_eq!(
+        FULL_WINDOW_MISS.chars().count(),
+        TrickLexicon::MAX_SURFACE_CHARS
+    );
+    let fires_before = heard.fires;
+    for run in [
+        "ねこおすわり",
+        "おすわりねこ",
+        "わるいこねこ",
+        FULL_WINDOW_MISS,
+    ] {
+        let lexicon = listener.ime_needs_lexicon(run).then_some(lanes);
+        heard.hear(listener.note_ime(*now, run, lexicon));
+        type_script(listener, lanes, now, "␣⏎", &mut heard);
+    }
+    heard.glued_fires = heard.fires - fires_before;
     // Session switches: a dirty line left behind and come back to.
     listener.rekey(1);
     type_script(listener, english, now, "si", &mut heard);
@@ -235,11 +270,14 @@ fn a_warmed_listener_is_allocation_free_on_every_lane() {
     type_script(&mut listener, english, &mut now, "␣⏎", &mut warmup);
     let expected = one_pass(&mut listener, english, &lanes, &mut now);
     assert!(
-        expected.fires >= 12
+        expected.fires >= 15
+            && expected.glued_fires == 3
             && expected.confirms >= 2
             && expected.revokes >= 2
-            && expected.pet_only_submits >= 8
-            && expected.word_bytes > expected.fires,
+            && expected.pet_only_submits >= 11
+            && expected.word_bytes > expected.fires
+            && expected.command_bytes > expected.fires
+            && expected.command_bytes < expected.word_bytes,
         "the script must exercise every lane: {expected:?}"
     );
 

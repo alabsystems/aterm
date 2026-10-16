@@ -9,7 +9,7 @@
 //! paints. The echo latency the Adaptive gate measures is injected through the
 //! frame instant handed to the present, never slept.
 //!
-//! Each scenario first shows the rig CAN paint a ghost (an echoing line on a
+//! Each scenario first shows the rig can paint a ghost (an echoing line on a
 //! slow link), so "the secret is not on glass" is not vacuous.
 
 use crate::input::{InputEvent, Source};
@@ -41,7 +41,7 @@ fn glyph(c: char) -> InputEvent {
 }
 
 /// A focused headless split in `mode`; the caret sits on the focused pane's
-/// BOTTOM row (a terminal in use is scrolled to the bottom), after `$ `.
+/// bottom row (a terminal in use is scrolled to the bottom), after `$ `.
 struct Rig {
     app: App,
     wid: WindowId,
@@ -130,7 +130,7 @@ impl Rig {
         );
     }
 
-    /// The glyph the PRESENTED composite carries at a focused-pane cell.
+    /// The glyph the presented composite carries at a focused-pane cell.
     fn on_glass(&self, row: usize, col: usize) -> char {
         let ws = self.app.windows.get(&self.wid).expect("window");
         let tree = &ws.layouts[ws.tabs.active];
@@ -160,7 +160,7 @@ impl Rig {
     }
 
     /// Type a command on the slow link until Adaptive paints, and show it does:
-    /// the last glyph is on glass BEFORE its echo (the rig's positive control).
+    /// the last glyph is on glass before its echo (the rig's positive control).
     fn type_command_on_a_slow_link(&mut self, cmd: &str) {
         let (head, last) = cmd.split_at(cmd.len() - 1);
         for c in head.chars() {
@@ -191,10 +191,9 @@ impl Rig {
     }
 }
 
-/// A line the PROGRAM ended — `read -n1`'s answer needs no Enter — scrolls the
-/// next prompt onto the same physical bottom row. The echo proof belongs to
-/// the line that scrolled away: the password typed at the new prompt must not
-/// be painted.
+/// A line the program ended (`read -n1`'s answer needs no Enter) scrolls the
+/// next prompt onto the same physical bottom row. The echo proof belongs to the
+/// line that scrolled away: the password typed at the new prompt is not painted.
 #[test]
 fn a_prompt_scrolled_onto_the_echoing_row_does_not_inherit_its_proof() {
     let mut rig = Rig::new("adaptive");
@@ -273,14 +272,11 @@ fn a_password_typed_ahead_after_any_submit_key_is_not_painted() {
     }
 }
 
-/// A word typed ahead of its echo on a slow link (`echo foo`) is on glass when a
-/// key the predictor did not model goes to the program. A line terminator cannot
-/// erase or move it, so it keeps painting until its echo instead of blinking out
-/// at Enter. Any other key may erase it: Ctrl+W, Ctrl+H (BS, readline's and zle's
-/// backward-delete-char), or a `[key_sequences]` remap of either, none of which
-/// the host can list. Once the erase echoes, the real cursor sits on one of the
-/// erased guesses over a blank cell, which nothing in the reconcile can tell from
-/// "not echoed yet", so the guesses must not stay on glass as a ghost.
+/// A word typed ahead of its echo on a slow link (`echo foo`) keeps painting
+/// across an unmodelled line terminator, which cannot erase or move it. Any other
+/// unmodelled key may erase it (Ctrl+W, Ctrl+H, or a `[key_sequences]` remap the
+/// host cannot list); once the erase echoes, the cursor sits over a blank cell
+/// the reconcile cannot tell from "not echoed yet", so the guesses must go.
 #[test]
 fn a_typed_ahead_word_outlives_only_a_line_terminator() {
     fn typed_ahead_foo(rig: &mut Rig) -> (usize, usize) {

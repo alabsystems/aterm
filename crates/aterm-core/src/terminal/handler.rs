@@ -16,6 +16,9 @@
 //!   routing from parser actions to state transitions or side effects.
 //! - Side effects (inline in protocol handlers): callbacks and external
 //!   services (bell, notifications, clipboard, window ops).
+// Zero tolerance: the bell's rate limit judges only the injected instant (a
+// clock read here was an incident), so no `#[expect]` may excuse one.
+#![forbid(clippy::disallowed_methods)]
 
 use crate::grid::Grid;
 
@@ -160,6 +163,7 @@ define_terminal_handler! {
     iterm2: super::Iterm2State => iterm2,
     window_callback: Option<WindowCallback> => window_callback,
     taskbar_progress: Option<super::TaskbarProgress> => taskbar_progress,
+    program_state: super::program_state::ProgramStateReport => program_state,
     // Host-side OSC 52 clipboard authorization. Its `try_mint_*_capability`
     // methods are the only way to a ClipboardWriteCapability /
     // ClipboardQueryCapability, and require `Terminal::authorize_clipboard_access`

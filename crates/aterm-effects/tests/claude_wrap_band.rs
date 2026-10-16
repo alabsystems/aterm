@@ -1,65 +1,46 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A word carried down by a soft-wrapped caret keeps its band, and only its
-//! band: in Claude Code's composer, words typed into a line at the fold must be
-//! lit from their first letter on the continuation row, with nothing in the
-//! blank indent.
+//! A word carried down by a soft-wrapped caret keeps its band, and only its band: in Claude
+//! Code's composer, words typed into a line at the fold are lit from their first letter on the
+//! continuation row, with nothing in the blank indent.
 //!
-//! Every take is real Claude Code (v2.1.280, fullscreen composer on the
-//! alternate screen) recorded with `docs/design/repro/ptyrec.py` in a headless
-//! aterm at 40×120 (7×14 px cells), keys via `aterm ctl key`, nothing submitted.
-//! The line is typed, the caret walked back (Left, or Alt+Left/Alt+Right word
-//! hops), and ` already been runnignin` typed at 8–12 cps:
+//! Every take is real Claude Code (v2.1.280, fullscreen composer on the alternate screen)
+//! recorded with `docs/design/repro/ptyrec.py` in a headless aterm at 40×120 (7×14 px cells),
+//! keys via `aterm ctl key`, nothing submitted. The line is typed, the caret walked back (Left,
+//! or Alt+Left/Alt+Right word hops), and ` already been runnignin` typed at 8–12 cps:
 //!
-//! * `row1-end`, the main shape: the caret after `have`, row 1's last word. The
-//!   Space moves the caret to column 117, the last text column. The `a` is
-//!   written at (36,117) and the caret alone soft-wraps to the continuation
-//!   indent: `ESC[H CR ESC[117C ESC[36B a … ESC[38;3H`, caret (37,2). The `l`
-//!   erases the `a` from row 1 and writes `al` from the indent: `ESC[117C
-//!   ESC[36B ESC[K CR ESC[2C ESC[1B al [image #1]… ESC[38;5H`, caret (37,4).
-//! * `row1-end-six`: nine columns of room; `alread` is typed on row 1, its `d`
-//!   soft-wraps the caret to (37,2), and `y` moves the whole word to
-//!   (37,2..8), caret (37,9).
-//! * `hops`, `hops-fast`: `row1-end` reached by Alt+Left hops to the start of
-//!   row 1 and Alt+Right hops back to `have` (250 and 140 ms apart; the fast
-//!   take types while the hops' wake still stands).
-//! * `eol-caret`: the caret before `[image` at the end of row 1 (36,112); the
-//!   first key erases row 1 from 112 and writes `a[image #1]` from (37,2),
-//!   caret (37,3): a one-row-down typed move judged at once
-//!   (`CursorGlow::key_pushed_text_down`).
-//! * `row2-start` (control): the caret before `[image` at the start of row 2;
-//!   an in-place insert, no row change.
-//! * `end` (control): typing at the end of the text; the box grows a row on the
-//!   Space after `[image` (the shape `composer_box_growth_wrap.rs` models).
+//! * `row1-end`, the main shape: the caret after `have`, row 1's last word. The Space moves the
+//!   caret to column 117, the last text column; the `a` is written at (36,117) while the caret
+//!   alone soft-wraps to the indent (37,2); the `l` erases the `a` from row 1 and writes `al`
+//!   from the indent, caret (37,4).
+//! * `row1-end-six`: nine columns of room; `alread` is typed on row 1, its `d` soft-wraps the
+//!   caret to (37,2), and `y` moves the whole word to (37,2..8), caret (37,9).
+//! * `hops`, `hops-fast`: `row1-end` reached by word hops 250 and 140 ms apart; the fast take
+//!   types while the hops' wake still stands.
+//! * `eol-caret`: the caret before `[image` at the end of row 1 (36,112); the first key erases
+//!   row 1 from 112 and writes `a[image #1]` from (37,2), caret (37,3).
+//! * `row2-start` (control): the caret before `[image` at the start of row 2; an in-place
+//!   insert.
+//! * `end` (control): typing at the end of the text; the box grows a row on the Space after
+//!   `[image` (the shape `composer_box_growth_wrap.rs` models).
 //!
-//! The mechanism: a composer wrap where the text moves with the caret puts the
-//! wrap key's glyph at `landing − 1` on the new row, but for a soft-wrapped
-//! caret that cell is the blank indent and the glyph is at the origin. The
-//! seam reads the probes (`CursorGlow::soft_wrapped_caret`: the landing row
-//! blank up to the landing, the origin cell blank in the last probe and a glyph
-//! now) and lays the key's one cell at the origin. The ribbon keeps the word
-//! the key ends (`Ribbon::settle_carry`) and, when the next key's echo advances
-//! past it, relays its lit cells from row 1 to the indent on their walk, with
-//! the reflowing key's glyph. A typeahead key's `Typed` replayed at the frame's
-//! caret is held at the landing (`Engine::replay_events`) and laid by the
-//! reflow.
+//! The mechanism: a composer wrap that moves the text with the caret puts the wrap key's glyph
+//! at `landing − 1`, but for a soft-wrapped caret that cell is the blank indent and the glyph is
+//! at the origin. The seam reads the probes (`CursorGlow::soft_wrapped_caret`) and lays the
+//! key's one cell at the origin. The ribbon keeps the word the key ends (`Ribbon::settle_carry`)
+//! and, when the next echo advances past it, relays its lit cells to the indent. A typeahead
+//! key's `Typed` replayed at the frame's caret is held at the landing (`Engine::replay_events`)
+//! and laid by the reflow.
 //!
-//! The replay is `codex_particle_replay.rs`'s: one real `Terminal`, sampled as
-//! `app_render.rs`'s lock A does (content scroll, repaint blink, the caret row
-//! probe with its trust class and neighbours, the print anchor, every ribbon
-//! row), `CursorGlow` ticked on an 8 ms train that holds while a `?2026` bracket
-//! is open, with the app's hints per key (`note_typed_expected` per printable
-//! byte; an arrow clears the typed bank and stamps `note_motion`). Each main
-//! take runs under every [`Present`] mode; the controls under the first two.
-//! The census reads the ribbon's own cells per column of the two text rows (the
+//! The replay is `codex_particle_replay.rs`'s: one real `Terminal` sampled in `app_render.rs`'s
+//! order, `CursorGlow` ticked on an 8 ms train that holds while a `?2026` bracket is open, with
+//! the app's hints per key. Each main take runs under every [`Present`] mode, the controls under
+//! the first two. The census reads the ribbon's own cells per column of the two text rows (the
 //! plan's coverage feathers over a one-cell hole).
 //!
-//! Diagnostics: `targo --unverified test -p aterm-effects --test
-//! effects_suite claude_wrap_band::census -- --ignored --nocapture` prints every take's
-//! verdict; `CLAUDE_WRAP_ONLY=<take>` narrows it, `CLAUDE_WRAP_DUMP=1` prints
-//! the two rows frame by frame, and `CLAUDE_WRAP_RING=<ms>:<ms>` prints every
-//! admission verdict and every ribbon cell in that window.
+//! Diagnostics: `CLAUDE_WRAP_DUMP=1` prints the two rows frame by frame, and
+//! `CLAUDE_WRAP_RING=<ms>:<ms>` prints every admission verdict and ribbon cell in that window.
 
 use crate::common::{
     LIT_COV, Rec, caret_sample, coverage, is_arrow, is_key, note_blink, observe_neighbor_rows,
@@ -179,7 +160,7 @@ fn fixture(name: &str) -> &'static str {
         .expect("a fixture")
 }
 
-/// The owner's config: rainbow kitty, tall body, default intensity, dark.
+/// Rainbow kitty, tall body, dark, full intensity.
 fn cfg() -> GlowConfig {
     GlowConfig {
         duration: Duration::from_millis(260),
@@ -385,8 +366,8 @@ impl Host {
         });
     }
 
-    /// The frame train up to `ms`; the host WITHHOLDS the present while a
-    /// `?2026` bracket is open (SYNC-1), so LOCK A never samples a torn frame.
+    /// The frame train up to `ms`; the host withholds the present while a `?2026` bracket is
+    /// open, so no frame samples a torn screen.
     fn run_to(&mut self, ms: u64) {
         let t = self.t0 + Duration::from_millis(ms);
         while self.now + Duration::from_millis(FRAME_MS) <= t {
@@ -600,8 +581,8 @@ struct Verdict {
     ahead: Vec<(u64, u16, Vec<u16>)>,
     /// Row-1 cells and lit columns still there long after the last key.
     stranded: Vec<(u64, Vec<u16>, Vec<usize>)>,
-    /// Frames from a retract fade after the landing to the last key with a
-    /// LIVE row-1 cell right of the cell after row 1's text: `(ms, columns)`.
+    /// Frames from a retract fade after the landing to the last key with a live row-1 cell
+    /// right of the cell after row 1's text: `(ms, columns)`.
     tail: Vec<(u64, Vec<u16>)>,
 }
 
@@ -706,29 +687,25 @@ impl Verdict {
             // Precondition: the take reached the shape at all.
             Some("the insert never reached the wrapped row")
         } else if !self.stub.is_empty() {
-            // (1) Nothing on the indent: the continuation row writes from
-            // column 2; columns 0-1 hold no typed glyph.
+            // Nothing on the indent: columns 0-1 of the continuation row hold no glyph.
             Some("a band cell stands in the wrapped row's indent")
         } else if !self.gaps.is_empty() {
-            // (2) Every typed glyph of the word that came down is lit, its
-            // first letter included: from the frame the word landed on row 2
-            // to the last key, every column from the indent to the caret owns
+            // Every typed glyph of the word that came down is lit, its first letter included:
+            // from the landing to the last key, every column from the indent to the caret owns
             // a live cell.
             Some("typed text on the wrapped row has no band under it")
         } else if !self.ahead.is_empty() {
-            // (3) Only what was typed: the `[image #1] in the` moved down with
-            // the word, right of the caret, is the app's text and stays dark.
+            // Only what was typed: the `[image #1] in the` moved down with the word, right of
+            // the caret, is the app's text and stays dark.
             Some("a band cell stands at or right of the caret")
         } else if !self.stranded.is_empty() {
-            // (4) Nothing stranded on the row the word left: long after the last
-            // key (the fold flow is gone by FLOW_TOTAL_S) row 1 owns no cell and
-            // no lit column.
+            // Nothing stranded on the row the word left: long after the last key row 1 owns no
+            // cell and no lit column.
             Some("band left stranded on row 1")
         } else if !self.tail.is_empty() {
-            // (5) The word's old light leaves row 1 with it: from a retract fade
-            // after the landing to the last key, no live row-1 cell stands past
-            // the cell after row 1's text. Cells, not coverage: the typed
-            // Space's cell right after the text lights the column past it.
+            // The word's old light leaves row 1 with it: from a retract fade after the landing
+            // to the last key, no live row-1 cell stands past the cell after row 1's text.
+            // Cells, not coverage: the typed Space's cell lights the column past it.
             Some("the moved word's old light stayed on row 1's blank tail")
         } else {
             None
@@ -736,19 +713,14 @@ impl Verdict {
     }
 }
 
-/// Assert the laws on one take under each of `modes`, naming every mode
-/// that broke one. Each mode replays on its own host and clock, so the modes
-/// run on the binary's threads (`par_map`) and are judged in order after.
+/// Assert the laws on one take under each of `modes`, naming every mode that broke one.
 fn assert_laws(name: &'static str, modes: &[Present]) {
     assert_laws_of(&[name], modes);
 }
 
-/// [`assert_laws`] on each of `names` in turn, every take under every mode
-/// replayed on one pool first, so the takes of a later name need not wait
-/// for an earlier one's. Each replay is caught in its pool thread, so a
-/// later name's panic waits for the earlier names' judgement, and a name's
-/// first panic in mode order is raised before its verdicts, as when each
-/// name had its own pool.
+/// [`assert_laws`] on each of `names`, every take under every mode replayed on one pool first.
+/// Names are judged in turn; a replay's panic, caught in its thread, is re-raised in mode order
+/// before its name's verdicts.
 fn assert_laws_of(names: &[&'static str], modes: &[Present]) {
     let takes: Vec<(&'static str, Present)> = names
         .iter()
@@ -788,8 +760,8 @@ fn a_six_letter_word_carried_down_keeps_every_letter_and_no_indent_stub() {
     assert_laws("row1-end-six", &Present::ALL);
 }
 
-/// The owner's navigation: Alt+Left to the start of row 1, Alt+Right word
-/// by word back to the end of it, then the same insert.
+/// Word hops: Alt+Left to the start of row 1, Alt+Right word by word back to the end of it,
+/// then the same insert.
 #[test]
 fn the_reflowed_word_after_word_hops_keeps_its_first_letter() {
     assert_laws("hops", &Present::ALL);
@@ -807,40 +779,17 @@ fn the_reflowed_word_after_fast_word_hops_keeps_its_first_letter() {
 /// `#1]` wraps with the box's growth.
 #[test]
 fn controls_an_insert_on_the_wrapped_row_and_an_end_of_text_wrap() {
-    // Both takes' four replays run on one pool (2026-10-05: 3.5 s alone, two
-    // pools one after the other); each take is still judged in turn.
     assert_laws_of(
         &["row2-start", "end"],
         &[Present::EchoInFrame, Present::FrameBeforeEcho],
     );
 }
 
-/// The caret before `[image` at the end of row 1: the first key erases row 1
-/// from the caret, writes `a[image #1]` at the indent and moves the caret down
-/// to column 3; no caret soft-wraps, the text moved with it. The key's glyph
-/// left of the landing and row 1's erased tail judge the move at once
-/// (`CursorGlow::key_pushed_text_down`) instead of a footer park
-/// (`wrap_code_reflow.rs` pins the footer's custody beside it).
+/// The caret before `[image` at the end of row 1: the first key erases row 1 from the caret,
+/// writes `a[image #1]` at the indent and moves the caret down to column 3, the text with it.
+/// The key's glyph left of the landing and row 1's erased tail judge the move at once
+/// (`CursorGlow::key_pushed_text_down`) instead of a footer park (`wrap_code_reflow.rs`).
 #[test]
 fn an_insert_whose_first_key_carries_the_caret_down_is_lit() {
     assert_laws("eol-caret", &Present::ALL);
-}
-
-/// The diagnostic: every take's verdict with the echo in the frame and with
-/// a frame before it, printed (see the module doc for the variables that
-/// narrow and deepen it).
-#[test]
-#[ignore = "diagnostic; run with --test effects_suite -- claude_wrap_band:: --ignored --nocapture"]
-fn census() {
-    let only = std::env::var("CLAUDE_WRAP_ONLY").ok();
-    for (name, _) in FIXTURES {
-        if only.as_deref().is_some_and(|o| o != name) {
-            continue;
-        }
-        for present in [Present::EchoInFrame, Present::FrameBeforeEcho] {
-            let t = replay(name, present);
-            let v = Verdict::of(&t);
-            eprintln!("{:?}\n{}", v.broken(), v.report(&t));
-        }
-    }
 }

@@ -1,24 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE WINDOW'S SIDE OF AKP1: [`KeeperClient`], one blocking connection, and
-//! [`KeeperLink`], the worker thread with a bounded queue a window drives it
-//! through (§5.3 step 1: the main thread makes no socket call; the queue holds
-//! DUPLICATES, never descriptor numbers, so recycling cannot misroute a PTY).
+//! The window's side of AKP1: [`KeeperClient`], one blocking connection, and [`KeeperLink`], the
+//! worker thread with a bounded queue a window drives it through (§5.3 step 1: the main thread
+//! makes no socket call; the queue holds duplicates, never descriptor numbers, so recycling
+//! cannot misroute a PTY). `aterm-gui`'s `keeper_link` says the boot HELLO on a
+//! [`KeeperClient`], then starts a [`KeeperLink`] on that connection.
 //!
-//! The client checks the KEEPER too before it sends a single master (§5.7):
-//! the same uid, and under [`IdentityPolicy::Designated`] the same code — a
-//! same-uid process that bound the socket first would otherwise receive a
-//! live duplicate of every terminal. Code alone is not enough: every signed
-//! build meets the Developer ID requirement, and a genuine keeper started
-//! under `--identity uid` (or an older one, which states no policy) offers a
-//! crashed window's masters to any same-uid process. So a window that checks
-//! code also reads the policy the keeper states in its WELCOME, and registers
-//! nothing with a keeper that does not require code too.
-//!
-//! The window drives it through `aterm-gui`'s `keeper_link` (opt-in): the
-//! boot HELLO on a [`KeeperClient`], then a [`KeeperLink`] started on that same
-//! connection.
+//! The client checks the keeper too before it sends a master (§5.7): the same uid, and under
+//! [`IdentityPolicy::Designated`] the same code, or a same-uid process that bound the socket
+//! first would receive a live duplicate of every terminal. Code alone is not enough (a genuine
+//! keeper under `--identity uid` offers a crashed window's masters to any same-uid process), so
+//! such a window also registers nothing with a keeper whose WELCOME does not state it requires
+//! code too.
 //!
 //! [`IdentityPolicy::Designated`]: crate::identity::IdentityPolicy::Designated
 
@@ -107,12 +101,9 @@ impl KeeperClient {
         })
     }
 
-    /// Whether a keeper whose WELCOME stated `served` may be handed this
-    /// window's masters: under [`IdentityPolicy::Designated`], only one that
-    /// states it requires the same of its own peers (§5.7). A keeper at the
-    /// same-uid floor, or one too old to say, is refused like a keeper of
-    /// another build (a [`NotThisBuild`]): its code passed, and it would
-    /// still offer an orphaned master to any same-uid process.
+    /// Whether a keeper whose WELCOME stated `served` may be handed this window's masters: under
+    /// [`IdentityPolicy::Designated`], only one that requires the same of its peers (§5.7). The
+    /// same-uid floor, or a keeper too old to say, is refused as a [`NotThisBuild`].
     fn served(&self, served: Option<IdentityPolicy>) -> io::Result<()> {
         match (self.policy, served) {
             (IdentityPolicy::SameUid, _) | (_, Some(IdentityPolicy::Designated)) => Ok(()),
@@ -305,7 +296,7 @@ fn protocol(why: String) -> io::Error {
 /// One message to the keeper, queued by the window.
 #[derive(Debug)]
 pub enum LinkOp {
-    /// A fresh or adopted master: the queue owns this DUPLICATE.
+    /// A fresh or adopted master: the queue owns this duplicate.
     Register {
         master: OwnedFd,
         header: MasterHeader,
@@ -397,10 +388,9 @@ impl KeeperLink {
         }
     }
 
-    /// Queue `op` and wait at most `within` for the worker to have WRITTEN it
-    /// to a keeper: `true` only then. Every op queued before it is written
-    /// first. `false` — no keeper answered, the queue was full, or the wait ran
-    /// out — never blocks the caller past `within`.
+    /// Queue `op` and wait at most `within` for the worker to have written it to a keeper:
+    /// `true` only then. Every op queued before it is written first. `false` (no keeper, a full
+    /// queue, the wait ran out) never blocks the caller past `within`.
     pub fn send_and_wait(&self, op: LinkOp, within: Duration) -> bool {
         let (ack_tx, ack_rx) = mpsc::sync_channel(1);
         if self.tx.try_send((op, Some(ack_tx))).is_err() {
@@ -421,14 +411,11 @@ impl KeeperLink {
 
 type Held = std::collections::BTreeMap<u64, (OwnedFd, MasterHeader, Vec<u8>)>;
 
-/// The registered masters whose RELEASE the link could not write, by rdev. A
-/// LIVE keeper that saw only this window's link drop still holds the records
-/// the dropped connection claimed, and the reconnect registers only what the
-/// window still holds: a RELEASE lost with the connection left a closed tab's
-/// shell in custody until the whole window ended. Told to the next connection
-/// after its registrations; a keeper that never held the master (it
-/// restarted) refuses it as NotClaimant, which the link drains. Bounded by
-/// [`LINK_QUEUE`]: a window never grows without limit on the keeper's behalf.
+/// The registered masters whose RELEASE the link could not write, by rdev. A live keeper that
+/// saw only the link drop still holds what the dropped connection claimed, and a reconnect
+/// registers only what the window holds, so these are told to the next connection after its
+/// registrations; a keeper that restarted refuses them as NotClaimant (drained). Bounded by
+/// [`LINK_QUEUE`].
 type Owed = std::collections::BTreeSet<u64>;
 
 /// What one queued op sends once connected.
@@ -437,11 +424,9 @@ enum Send {
     Frame(Frame),
 }
 
-/// How often an idle link looks at its connection: it drains what the keeper
-/// sent (ORPHANS, REFUSED — a link reads nothing else, and an unread socket
-/// would stall the keeper's writes) and notices a keeper that went away, so a
-/// restarted keeper is told what this window holds without waiting for the
-/// window's next op (§5.3 step 9).
+/// How often an idle link looks at its connection: it drains what the keeper sent (an unread
+/// socket would stall the keeper's writes) and notices a keeper that went away, so a restarted
+/// keeper is told what this window holds without waiting for its next op (§5.3 step 9).
 pub const LINK_POLL: Duration = Duration::from_millis(500);
 
 fn link_worker(
@@ -485,15 +470,11 @@ fn link_worker(
                 held.insert(header.rdev, (master, header, tag));
                 Some(Send::Register(header.rdev))
             }
-            // A master this link never registered may still be one the keeper
-            // OFFERED on this connection — the boot HELLO's, which this worker
-            // runs on (`start_on`) — and the keeper honours a RELEASE from the
-            // connection an offer was made to: a recovering window releases an
-            // offer it could not place (`aterm-gui`'s `keeper_link::Claim`).
-            // Dropped here, the keeper kept its copy, the shell ran on unseen,
-            // and the window's end returned it to Orphaned for the next launch.
-            // Sent only on a live connection: an offer does not survive its
-            // connection, and on any other the keeper refuses it (drained).
+            // A master this link never registered may be one the keeper offered on this
+            // connection (the boot HELLO's, `start_on`), and the keeper honours a RELEASE from the
+            // connection an offer was made to: a recovering window releases an offer it could not
+            // place (`aterm-gui`'s `keeper_link::Claim`). Sent only on a live connection: an offer
+            // does not survive its connection, and on any other the keeper refuses it (drained).
             LinkOp::Release { rdev } => {
                 metas.remove(&rdev);
                 let registered = held.remove(&rdev).is_some();
@@ -531,9 +512,8 @@ fn link_worker(
             }
         }
         let (Some(c), Some(send)) = (client.as_ref(), send) else {
-            // No keeper (the op is dropped, and what is held, and every owed
-            // RELEASE, is told to the next keeper at the reconnect), or an
-            // idle turn.
+            // No keeper (the op is dropped; what is held and every owed RELEASE is told at the
+            // reconnect), or an idle turn.
             owe(&mut owed, must_reach);
             if let Some(ack) = ack {
                 let _ = ack.try_send(false);
@@ -650,11 +630,9 @@ mod tests {
         }
     }
 
-    /// A listener that is not this build's code — Apple's `nc` — answers on
-    /// the socket: the designated check refuses it, and the error says so
-    /// ([`refused_identity`]). NEGATIVE CONTROLS: no socket at all, and a
-    /// socket of ours this process may not open (also `PermissionDenied`),
-    /// are not read as that refusal.
+    /// Apple's `nc` listening on the socket fails the designated check ([`refused_identity`]).
+    /// Negative controls: no socket, and a socket this process may not open (also
+    /// `PermissionDenied`), are not read as that refusal.
     #[test]
     fn a_listener_of_other_code_is_refused_as_not_this_build() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -675,8 +653,7 @@ mod tests {
             .stderr(aterm_uds::spawnfd::Stdio::null())
             .spawn()
             .expect("spawn nc");
-        // A hang detector: `nc` binds, then listens; a dial between the two is
-        // refused, so the dial is retried until it reaches the listener.
+        // `nc` binds, then listens: a dial between the two is refused, so retry until it listens.
         let started = Instant::now();
         let refused = loop {
             // The check's own deadline is a hang detector too, not a budget.
@@ -716,12 +693,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// §5.7: a window that checks code hands nothing to a keeper at the
-    /// same-uid floor, though that keeper's code passes (it is this very
-    /// build): such a keeper offers a crashed window's masters to any same-uid
-    /// process. Both HELLOs — the link's, which then registers, and the boot
-    /// one — are refused as not this build's. CONTROL: the same build serving
-    /// under its designated requirement is accepted by both.
+    /// §5.7: though the keeper's code (this very build) passes, the link and the boot HELLO are
+    /// both refused. Control: the same build serving under its designated requirement is accepted.
     #[test]
     fn a_keeper_at_the_uid_floor_is_refused_by_a_window_that_checks_code() {
         if aterm_uds::deadline::trust_service_silent() {
@@ -752,8 +725,8 @@ mod tests {
                 let boot = dial()?.hello_app("t").map(|_| ());
                 Ok::<_, io::Error>((link, boot))
             });
-            // The window's own deadlines (the check's, then each exchange's
-            // read timeout) are the hang detectors; no second timer races them.
+            // The window's own deadlines (the check's, then each read timeout) are the hang
+            // detectors.
             while !window.is_finished() {
                 server.step(20).expect("step");
             }
@@ -764,9 +737,8 @@ mod tests {
                 .iter()
                 .any(|why| trustd_silent(why));
             let joined = window.join().expect("the window thread");
-            // A check of either side that `trustd` did not answer — the
-            // window's of the keeper, or the designated keeper's of the window
-            // — is COULD NOT RUN, never a verdict on the code.
+            // A check of either side that `trustd` did not answer is COULD NOT RUN, never a
+            // verdict on the code.
             let silent = |e: &io::Error| trustd_silent(&e.to_string()) || keeper_gate_silent;
             if let Err(e) = &joined
                 && silent(e)
@@ -792,9 +764,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Only a peer the check refused is [`NotThisBuild`]; a check that could
-    /// not run (no audit token, the peer's code not found) keeps its words
-    /// and is not read as that refusal.
+    /// A check that could not run (no audit token, the peer's code not found) keeps its words.
     #[test]
     fn only_a_refused_check_is_not_this_build() {
         let refused = check_failed(CheckError::Refused("OSStatus -67050".into()));
@@ -815,10 +785,8 @@ mod tests {
         assert_eq!(unanswered.kind(), io::ErrorKind::Other, "{unanswered}");
     }
 
-    /// §5.3 step 9: a keeper that restarts is told again what the window
-    /// holds, WITHOUT waiting for the window's next op — a window that crashes
-    /// in a quiet stretch after a keeper restart must still find its masters
-    /// in custody.
+    /// §5.3 step 9: a restarted keeper is told again what the window holds without waiting for
+    /// the window's next op.
     #[test]
     fn a_restarted_keeper_is_told_again_without_a_new_op() {
         let base = std::env::temp_dir();
@@ -850,12 +818,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A LIVE keeper drops this window's link (a failed write, a malformed
-    /// frame) while the window lives, and a tab closes while no reconnect can
-    /// succeed: that RELEASE must still reach the keeper once one does. The
-    /// reconnect registers only what the window still holds, so dropped here
-    /// the closed tab's record stayed claimed by the dead connection and its
-    /// shell lived on in the keeper until the whole window ended.
+    /// A live keeper drops the link and a tab closes while no reconnect can succeed: the RELEASE
+    /// still reaches the keeper once one does (the reconnect registers only what is held).
     #[test]
     fn a_release_the_link_could_not_write_is_told_to_the_next_connection() {
         let base = std::env::temp_dir();
@@ -905,10 +869,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// PENDING and BYE are WAITED for: the window's update worker gates the
-    /// grant on the PENDING having been written, and the final exit writes the
-    /// BYE before `exit(0)`. Both come back `true` only once written to a live
-    /// keeper, the keeper reads them in order, and nothing follows a BYE.
+    /// PENDING (the update worker gates the grant on it) and BYE (written before `exit(0)`) are
+    /// acknowledged only once written to a live keeper, arrive in order, and nothing follows a BYE.
     #[test]
     fn pending_and_bye_are_acknowledged_once_written() {
         let base = std::env::temp_dir();
@@ -979,9 +941,8 @@ mod tests {
             },
             tag: Vec::new(),
         }));
-        // The op is given five minutes, so a link that waited them out is told
-        // from a refusal by a minute's hang detector (AGENTS.md), never a
-        // latency budget.
+        // Given five minutes, so the one-minute hang detector tells a refusal from a link that
+        // waited them out.
         let started = Instant::now();
         assert!(!link.send_and_wait(LinkOp::Pending { pid: 1 }, Duration::from_secs(300)));
         assert!(

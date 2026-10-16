@@ -553,7 +553,6 @@ fn group_change_after_unchanged_read_gets_immediate_followup() {
         activity: super::ActivitySample {
             alt_screen: false,
             content_seq: 1,
-            last_input: None,
             last_output: None,
         },
     };
@@ -622,6 +621,218 @@ fn group_change_after_unchanged_read_gets_immediate_followup() {
     assert_eq!(handback.publish.map(|p| p.0), Some("-"));
 }
 
+/// A BLOCK READ CUT AT ITS CAP OWES ONE MORE LOOK WITHOUT DELAYING A
+/// HANDBACK'S: the session log's block read stopped at its cap in the same
+/// sweep that saw the foreground group hand an exited agent back to the
+/// shell. [`super::StatusObserver::owe_look`] keeps the handback's one
+/// immediate follow-up immediate (the sweep-level owed look is
+/// `a_burst_past_the_block_reads_cap_is_read_at_the_next_owed_look`).
+/// NEGATIVE CONTROL: owing it as output
+/// ([`super::StatusObserver::note_output`]) pushes the handback's look one
+/// interval on.
+#[test]
+fn a_capped_block_read_owes_a_look_without_delaying_a_handback() {
+    let interval = Duration::from_millis(50);
+    // The sweep that saw the group move after an unchanged read (as in
+    // `group_change_after_unchanged_read_gets_immediate_followup`), then
+    // `owe`; the wait until the follow-up it leaves.
+    let handback_wait = |owe: &dyn Fn(&mut super::StatusObserver, Instant)| {
+        let g = |seq| crate::control::ScreenGen { epoch: 0, seq };
+        let frame = aterm_phase::prompt::fixtures::screen(aterm_phase::prompt::fixtures::END_OFFER);
+        let claude = Some("claude".to_string());
+        let mut obs = super::StatusObserver::new(super::StatusPolicy::default(), interval);
+        let evidence = super::Evidence {
+            shell: None,
+            completed_block: None,
+            lifecycle: None,
+            foreground_job: None,
+            activity: super::ActivitySample {
+                alt_screen: false,
+                content_seq: 1,
+                last_output: None,
+            },
+        };
+        let t0 = Instant::now();
+        let _ = obs.observe(1, &evidence, t0);
+        assert!(obs.agent_zone_wanted(1, g(1), Cursor::Unknown, &claude, t0));
+        let _ = obs.agent_observe(
+            1,
+            g(1),
+            Some(frame.clone()),
+            Cursor::Unknown,
+            claude.clone(),
+            100,
+            false,
+            t0,
+        );
+        let redrawn_at = t0 + super::AGENT_MIN_INTERVAL;
+        let _ = obs.observe(1, &evidence, redrawn_at);
+        assert!(obs.agent_zone_wanted(1, g(2), Cursor::Unknown, &claude, redrawn_at));
+        let _ = obs.agent_observe(
+            1,
+            g(2),
+            Some(frame),
+            Cursor::Unknown,
+            claude.clone(),
+            100,
+            false,
+            redrawn_at,
+        );
+        let moved_at = redrawn_at + interval;
+        let _ = obs.observe(1, &evidence, moved_at);
+        let _ = obs.agent_zone_wanted(1, g(3), Cursor::Unknown, &claude, moved_at);
+        let _ = obs.agent_observe(1, g(3), None, Cursor::Unknown, claude, 200, false, moved_at);
+        owe(&mut obs, moved_at);
+        obs.next_wake()
+            .map(|w| w.saturating_duration_since(moved_at))
+    };
+    assert_eq!(
+        handback_wait(&|_, _| {}),
+        Some(Duration::ZERO),
+        "PRECONDITION: the handback's follow-up is immediate"
+    );
+    assert_eq!(
+        handback_wait(&|obs, _| obs.owe_look(1)),
+        Some(Duration::ZERO),
+        "the capped read's look leaves the handback's immediate"
+    );
+    assert_eq!(
+        handback_wait(&|obs, at| obs.note_output(1, at)),
+        Some(interval),
+        "NEGATIVE CONTROL: owed as output, it waits an interval"
+    );
+}
+
+/// A BURST PAST THE BLOCK READ'S CAP IS READ AT THE NEXT OWED LOOK, THROUGH
+/// THE REAL SWEEP: fifty commands finished between two sweeps; the first
+/// logs the oldest [`super::BLOCK_READ_MAX`] and owes the session a look no
+/// later than one observation interval on, at which the second logs the
+/// rest. Every command is a run, in order.
+#[test]
+fn a_burst_past_the_block_reads_cap_is_read_at_the_next_owed_look() {
+    let prompt = b"\x1b]133;A\x1b\\\x1b]133;B\x1b\\";
+    let mut app = App::headless_for_test();
+    let front = app.front_terminal(WindowId(0)).expect("a front terminal");
+    let (session, term) = (front.session, std::sync::Arc::clone(&front.term));
+    crate::term_lock(&term).process(prompt);
+    let t0 = Instant::now();
+    let _ = app.observe_session_statuses(t0);
+    let mut burst = Vec::new();
+    for i in 0..50 {
+        burst.extend_from_slice(
+            format!("true {i}\r\n\x1b]133;C\x1b\\\x1b]133;D;0\x1b\\").as_bytes(),
+        );
+        burst.extend_from_slice(prompt);
+    }
+    crate::term_lock(&term).process(&burst);
+    let runs = |app: &App| {
+        let timeline = std::sync::Arc::clone(&app.pool.get(session).expect("pooled").ctx.timeline);
+        let g = timeline.lock().unwrap();
+        g.slog()
+            .log()
+            .window()
+            .filter(|r| r.op == aterm_slog::Op::Close && r.k == aterm_slog::Kind::Cmd)
+            .count()
+    };
+    let t1 = t0 + Duration::from_secs(1);
+    let _ = app.observe_session_statuses(t1);
+    assert_eq!(runs(&app), super::BLOCK_READ_MAX, "the cap's worth");
+    let wake = app
+        .session_status
+        .next_wake()
+        .expect("the rest owes a look");
+    assert!(
+        wake <= t1 + app.session_status.min_interval,
+        "owed within one interval: {:?}",
+        wake.saturating_duration_since(t1)
+    );
+    let _ = app.observe_session_statuses(wake);
+    assert_eq!(runs(&app), 50, "every command is a run");
+}
+
+/// THE SWEEP'S CAPPED BLOCK READ OWES ITS LOOK WITHOUT DELAYING A GROUP
+/// MOVE'S, THROUGH THE REAL SWEEP, with no process and no PTY: the group in
+/// front is the injected probe's (`SessionFactory::fg_probe`), asked about a
+/// master no file holds. Seventy commands finished between two sweeps, so
+/// each of the next two block reads stops at [`super::BLOCK_READ_MAX`] with
+/// commands left. The second of those sweeps also sees the group move over an
+/// unchanged screen, which owes ONE immediate look
+/// ([`super::StatusObserver::agent_observe`]'s handback); the capped read's
+/// owed look ([`super::StatusObserver::owe_look`] at the sweep's call site)
+/// leaves it immediate. NEGATIVE CONTROL (the call site, by mutation): owing
+/// the capped read as output (`note_output(id, now)` in its place) pushes
+/// that look an observation interval on, and this test fails.
+#[test]
+fn the_sweeps_capped_read_leaves_a_group_moves_look_immediate() {
+    thread_local! {
+        static FRONT: std::cell::Cell<i32> = const { std::cell::Cell::new(-1) };
+    }
+    /// The injected probe: the group this test put in front.
+    fn front(_master: i32) -> i32 {
+        FRONT.with(std::cell::Cell::get)
+    }
+    // Groups no process holds: past every pid the kernel issues.
+    const SHELL: i32 = 2_000_000_001;
+    const JOB: i32 = 2_000_000_002;
+    let prompt = b"\x1b]133;A\x1b\\\x1b]133;B\x1b\\";
+    let mut app = App::headless_for_test();
+    app.session_factory.fg_probe = front;
+    let shown = app.front_terminal(WindowId(0)).expect("a front terminal");
+    let (session, term) = (shown.session, std::sync::Arc::clone(&shown.term));
+    // The sweep asks the probe only for a session with a master: an fd
+    // number no file holds (its shell pid stays the stub's, so teardown
+    // signals nothing).
+    app.pool
+        .sessions
+        .get_mut(&session)
+        .expect("pooled")
+        .session
+        .master = i32::MAX;
+    FRONT.with(|f| f.set(SHELL));
+    let step = app
+        .session_status
+        .min_interval
+        .max(super::AGENT_MIN_INTERVAL);
+    crate::term_lock(&term).process(prompt);
+    let t0 = Instant::now();
+    let _ = app.observe_session_statuses(t0);
+    let mut burst = Vec::new();
+    for i in 0..70 {
+        burst.extend_from_slice(
+            format!("true {i}\r\n\x1b]133;C\x1b\\\x1b]133;D;0\x1b\\").as_bytes(),
+        );
+        burst.extend_from_slice(prompt);
+    }
+    crate::term_lock(&term).process(&burst);
+    // The look that reads the new screen and the first cap's worth of blocks.
+    let t1 = t0 + step;
+    let _ = app.observe_session_statuses(t1);
+    // The shell hands its terminal to a job; the screen does not move.
+    FRONT.with(|f| f.set(JOB));
+    let t2 = t1 + step;
+    let _ = app.observe_session_statuses(t2);
+    let wake = app.session_status.next_wake().expect("a look is owed");
+    let timeline = std::sync::Arc::clone(&app.pool.get(session).expect("pooled").ctx.timeline);
+    let closed = timeline
+        .lock()
+        .unwrap()
+        .slog()
+        .log()
+        .window()
+        .filter(|r| r.op == aterm_slog::Op::Close && r.k == aterm_slog::Kind::Cmd)
+        .count();
+    assert_eq!(
+        closed,
+        2 * super::BLOCK_READ_MAX,
+        "PRECONDITION: both reads were cut at the cap"
+    );
+    assert!(
+        wake <= t2,
+        "the group move's look is immediate: owed {:?} after the sweep",
+        wake.saturating_duration_since(t2)
+    );
+}
+
 /// THE FINAL FRAME OF A BURST THAT LANDED BETWEEN LOOKS (2026-09-24,
 /// live: a box answered and a static busy screen drawn still read
 /// `agent=prompt` after the host had cleared its badge; an exited agent's
@@ -645,7 +856,6 @@ fn output_between_looks_is_owed_a_look_within_one_interval_of_it() {
         activity: super::ActivitySample {
             alt_screen: false,
             content_seq: 1,
-            last_input: None,
             last_output: None,
         },
     };
@@ -698,8 +908,8 @@ fn output_between_looks_is_owed_a_look_within_one_interval_of_it() {
     assert_eq!(obs.next_wake(), Some(obs.sessions[&1].next_due));
 }
 
-/// OUTPUT THAT KEEPS ARRIVING IS NOT A POLL (the spin gate's claude row,
-/// `tools/spin-conformance/spin_probe.sh`, after 2026-09-24's owed look
+/// OUTPUT THAT KEEPS ARRIVING IS NOT A POLL (the spin matrix's claude row,
+/// aterm-conformance `tests/spin.rs`, after 2026-09-24's owed look
 /// landed: 39 timer wakes in 10 s against a quiet loop's 5). A program
 /// that repaints without moving the grid ~6x/s — a Claude Code spinner —
 /// wakes the loop by its own output, and each output wake's sweep looks
@@ -722,7 +932,6 @@ fn output_that_keeps_arriving_owes_no_look_before_it_pauses() {
         activity: super::ActivitySample {
             alt_screen: false,
             content_seq: 1,
-            last_input: None,
             last_output: None,
         },
     };
@@ -1156,7 +1365,10 @@ fn the_status_record_counts_the_history_an_update_could_not_carry() {
     let (mut app, sid) = app_with_stub();
     let record = app.session_status_record(sid).expect("live");
     assert!(
-        record.contains(" history_lost=0 integration_rev=- render=ok resizes=0 flaps=0 gen="),
+        record.contains(
+            " history_lost=0 integration_rev=- render=ok resizes=0 flaps=0 land_at=- task=- \
+             reset_at=- gen="
+        ),
         "{record}"
     );
     let whole = [ImportReport {
@@ -1195,7 +1407,10 @@ fn the_status_record_counts_the_history_an_update_could_not_carry() {
     app.settle_handoff_history(&failed);
     let record = app.session_status_record(sid).expect("live");
     assert!(
-        record.contains(" history_lost=1234 integration_rev=- render=ok resizes=0 flaps=0 gen="),
+        record.contains(
+            " history_lost=1234 integration_rev=- render=ok resizes=0 flaps=0 land_at=- task=- \
+             reset_at=- gen="
+        ),
         "{record}"
     );
     assert!(app.has_live_message("Couldn't carry all scrollback"));
@@ -1872,8 +2087,8 @@ fn a_box_the_zone_cuts_is_read_whole_and_a_hosted_agent_raises_no_row() {
         let store = app.store.read().unwrap();
         let handle = store.by_local(sid).expect("the session");
         (
-            App::status_session_row(handle, true, &Default::default()),
-            App::status_session_row(handle, false, &Default::default()),
+            App::status_session_row(handle, |_| true, &Default::default()),
+            App::status_session_row(handle, |_| false, &Default::default()),
         )
     };
     assert!(hosted.supervised, "{hosted:?}");
@@ -2009,9 +2224,9 @@ fn a_lapsed_supervisor_claim_hands_its_box_to_the_human() {
     looking_at(&app, &[]);
     // Long enough that the negative controls below — a presence refresh,
     // two debug-build paints and sweeps — finish inside it on a loaded
-    // gate: at 120 ms they could outlast the claim and read a correct lapse
-    // as a notice posted while supervised (the load-sensitive test audit
-    // of 2026-09-27). The lapse is then waited for, not slept for.
+    // machine: at 120 ms they could outlast the claim and read a correct
+    // lapse as a notice posted while supervised. The lapse is then waited
+    // for, not slept for.
     let ttl = Duration::from_secs(2);
     let now_us = crate::metrics::now_us();
     assert_eq!(

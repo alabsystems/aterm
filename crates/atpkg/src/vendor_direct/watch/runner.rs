@@ -1,37 +1,34 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! THE HEAD WATCH'S OWN LOOP, for a host that has none. The window rides the watch on its
-//! package loop's parks; a terminal session has no such loop. [`Runner`] is the same watch
-//! driven alone, one [`SLICE`] at a time, on the window's rules: the
-//! [`HeadWatch::slice`] every host runs (the minute's cadence, the unreachable retry, the
-//! wake grace and the re-offer leases are all the watch's own), no wait while a head is
-//! due, one targeted `update <program> --head-watch` pass at a time and no head asked while
-//! it runs, its end reported to the watch ([`HeadWatch::pass_ended`]), and `[packages]`
-//! read live before every look. Its clocks, its park, its settings and its passes are
+//! The head watch's own loop, for a host that has none. The window rides the watch on its
+//! package loop's parks; a terminal session has no such loop, so [`Runner`] drives the
+//! same watch alone, one [`SLICE`] at a time, on the window's rules: [`HeadWatch::slice`]
+//! (cadence, unreachable retry, wake grace and re-offer leases are the watch's own), no
+//! wait while a head is due, one targeted `update <program> --head-watch` pass at a time
+//! with no head asked while it runs, its end reported ([`HeadWatch::pass_ended`]), and
+//! `[packages]` read live before every look. Clocks, park, settings and passes are
 //! injected ([`Clock`], [`Settings`], [`PassLauncher`]), so a test steps it without
 //! sleeping.
 //!
-//! THE HELD TOOLCHAIN MOVE, re-checked here too: the seated session — the one that holds
-//! the watch while no window does — looks at a Trust toolchain update held for quiet, or a
-//! rustup view a flip left behind, every [`crate::quiet::RECHECK`] by the window's own rule
+//! The seated session (the one that holds the watch while no window does) also re-checks a
+//! held toolchain move — a Trust toolchain update held for quiet, or a rustup view a flip
+//! left behind — every [`crate::quiet::RECHECK`] by the window's rule
 //! ([`crate::quiet::Recheck`]), and starts the whole unattended pass (`update
-//! --defer-busy-flip`, the window's) once it is due, so the doctor's "by <time> at the
-//! latest" holds with no window open. Each look re-admits the seat itself
+//! --defer-busy-flip`) once it is due, so the doctor's "by <time> at the latest" holds with
+//! no window open. Each look re-admits the seat
 //! ([`HeadWatch::begin_session_update_look`]), so a store with no vendor program to watch
 //! still seats a session.
 //!
-//! THE INDEX HEAD HINT also runs here while a window is absent: one seated session
-//! starts one detached near/far HEAD worker, using the store's shared lock and cooldown.
-//! Its near positive wakes this loop before the far HEAD finishes, but this loop
-//! re-admits its host claim and checks the verified floor and pass stamps before it
-//! launches a whole update. A window that opened meanwhile owns that decision.
+//! The index head hint runs here too while no window is open: one detached near/far HEAD
+//! worker under the store's shared lock and cooldown. Its near positive wakes the loop
+//! early, but the loop re-admits its claim and checks the verified floor and pass stamps
+//! before it launches a whole update; a window that opened meanwhile owns that decision.
 //!
 //! [`run_host`] starts it on its own thread for a terminal session ([`Host::Session`]):
-//! every interactive session starts one, the store's seat lets one of them watch, and each
-//! thread ends with its process. That is the session's clean exit: the kernel releases the
-//! claim, the next host takes the watch within a minute, and a pass the runner started —
-//! detached, never its child — finishes on its own.
+//! every interactive session starts one, the seat lets one of them watch, and each thread
+//! ends with its process — the kernel releases the claim, the next host takes the watch
+//! within a minute, and a detached pass finishes on its own.
 
 use std::collections::VecDeque;
 use std::ffi::OsString;
@@ -196,7 +193,7 @@ pub trait PassLauncher: Send {
     /// Start the whole unattended pass — `update` holding a busy toolchain's flip for quiet
     /// ([`crate::cli::DEFER_BUSY_FLIP_FLAG`]), the window's own — that a held toolchain move
     /// asks for once it is due ([`crate::quiet::due`]). A launcher that cannot start one
-    /// says so, and the move waits for the next pass as it did before.
+    /// says so, and the move waits for the next pass.
     ///
     /// # Errors
     /// The pass could not be started.
@@ -219,7 +216,7 @@ pub trait PassLauncher: Send {
 }
 
 /// A terminal session's passes: `exe lead… update <program>`, argv for argv the window's
-/// targeted pass, started DETACHED and followed by pid.
+/// targeted pass, started detached and followed by pid.
 #[derive(Clone, Debug)]
 pub struct DetachedPasses {
     exe: PathBuf,
@@ -299,18 +296,28 @@ impl PassLauncher for DetachedPasses {
     }
 }
 
-/// Start `exe args` DETACHED — stdio on `/dev/null`, its own process group, and never
+/// Start `exe args` detached — stdio on `/dev/null`, its own process group, and never
 /// this process's child — and follow it by its pid. The session reaps its shell by pid,
 /// never `waitpid(-1)`, but a pass must also outlive the session that started it: so, as
 /// the router's detached pass does, a `/bin/sh` middle process backgrounds it, prints its
 /// pid and exits at once, and reaping that shell here re-parents the pass to launchd/init.
 /// It names no spawner ([`crate::cli::SPAWNER_DETACHED`]): a waiter that read the
-/// detaching shell's exit as its window going would stand aside instead of queueing.
+/// detaching shell's exit as its window going would stand aside instead of queueing. It
+/// runs at utility QoS ([`crate::platform::utility_clamped`]), as the window's passes do.
 #[cfg(unix)]
 fn spawn_detached(exe: &Path, args: &[OsString]) -> io::Result<Box<dyn RunningPass>> {
+    Ok(Box::new(Detached {
+        pid: detach(exe, args)?,
+    }))
+}
+
+/// [`spawn_detached`]'s detaching shell. The pid it reports is the pass's own: the
+/// clamp's launcher execs the pass in place.
+#[cfg(unix)]
+fn detach(exe: &Path, args: &[OsString]) -> io::Result<u32> {
     let out = aterm_uds::spawnfd::command("/bin/sh")
         .args(["-c", "\"$@\" </dev/null >/dev/null 2>&1 & echo $!", "sh"])
-        .arg(exe)
+        .args(crate::platform::utility_clamped(exe.as_os_str()))
         .args(args)
         .env(crate::cli::SPAWNER_PID_ENV, crate::cli::SPAWNER_DETACHED)
         .stdin(aterm_uds::spawnfd::Stdio::null())
@@ -324,17 +331,16 @@ fn spawn_detached(exe: &Path, args: &[OsString]) -> io::Result<Box<dyn RunningPa
             out.status
         )));
     }
-    let pid = String::from_utf8_lossy(&out.stdout)
+    String::from_utf8_lossy(&out.stdout)
         .trim()
         .parse::<u32>()
-        .map_err(|_| io::Error::other("the detaching shell named no pid"))?;
-    Ok(Box::new(Detached { pid }))
+        .map_err(|_| io::Error::other("the detaching shell named no pid"))
 }
 
 /// Windows has no zombie to fear and no re-parenting: the pass is an ordinary child, and
-/// its exit is read. Built through `aterm_uds::spawnfd::command` (`Console::Quiet`): the session
-/// lane's pass shares its console, as a bare child did, and a host with no console would
-/// give it a windowless one, not a visible console window for the whole pass.
+/// its exit is read. Built through `aterm_uds::spawnfd::command` (`Console::Quiet`): the
+/// pass shares the session's console, and a host with no console gives it a windowless
+/// one, never a visible console window.
 #[cfg(not(unix))]
 fn spawn_detached(exe: &Path, args: &[OsString]) -> io::Result<Box<dyn RunningPass>> {
     let child = aterm_uds::spawnfd::command(exe)
@@ -711,12 +717,11 @@ impl Runner {
         Ok(HostHandle { stop, thread })
     }
 
-    /// ONE LOOK: park until the next useful admission (or one window-sized slice
-    /// while seated), read `[packages]`, follow the pass in flight — no head is asked
-    /// meanwhile, as none is while the window's lane runs a pass, though a round the
-    /// pass interrupted is harvested as its answers land — or start the next one a
-    /// moved head queued, else the watch's own [`HeadWatch::slice`] over the park's
-    /// two clocks.
+    /// One look: park until the next useful admission (or one window-sized slice while
+    /// seated), read `[packages]`, follow the pass in flight — no head is asked meanwhile,
+    /// though a round the pass interrupted is harvested as its answers land — or start the
+    /// next one a moved head queued, else run the watch's own [`HeadWatch::slice`] over the
+    /// park's two clocks.
     pub fn step(&mut self) {
         let wall_before = self.clock.wall();
         let mono_before = self.clock.mono();
@@ -738,14 +743,11 @@ impl Runner {
             && self.index.pending.is_none()
             && self.index.ready == 0
         {
-            // A second session denied the seat cannot ask any vendor, inspect a held
-            // flip, or launch a signed index pass before `admit_after`: every path
-            // re-admits through that same claim, so a five-second config stat would
-            // wake every denied session for no work. Sleep to the claim's
-            // existing deadline (at most a minute), then re-read the live gate
-            // BEFORE admitting or asking a head. A seated session, an in-flight
-            // worker, or an enabled session with no denial keeps the five-second
-            // config response; `HostHandle::stop` still unparks this wait.
+            // A session denied the seat can do no work before `admit_after` (every path
+            // re-admits through that claim), so it sleeps to the claim's deadline (at most
+            // a minute) instead of waking every slice for a config stat, then re-reads the
+            // live gate before admitting or asking a head. `HostHandle::stop` still unparks
+            // this wait.
             admission_wait.min(CADENCE)
         } else {
             SLICE
@@ -766,12 +768,12 @@ impl Runner {
             self.admit_after = Duration::ZERO;
         }
         self.watch.set_exclude(&gate.exclude);
-        // THE ROUND A PASS INTERRUPTED is harvested as it lands: the watch hands back a
-        // moved head while its peer's GET is still in flight, and the pass starts at once.
-        // Left unharvested, that GET would keep the session's round — the rendezvous
-        // EXCLUSIVE, a window refused for the whole pass — and its completion would cut
-        // every park short, spinning a core until the pass ended. With a head
-        // in flight the watch starts no round, so this asks nothing.
+        // A round a pass interrupted is harvested as it lands: the watch hands back a moved
+        // head while its peer's GET is still in flight, and the pass starts at once. Left
+        // unharvested, that GET would keep the session's exclusive rendezvous (a window
+        // refused for the whole pass) and its completion would cut every park short,
+        // spinning a core. With a head in flight the watch starts no round, so this asks
+        // nothing.
         if self.following.is_some() && self.watch.has_pending() {
             self.harvest(wall);
         }
@@ -782,7 +784,7 @@ impl Runner {
             self.launch(program, wall);
             return;
         }
-        // A HELD TOOLCHAIN MOVE, looked at as the window's park looks at it — by the seated
+        // A held toolchain move, looked at as the window's park looks at it — by the seated
         // session only, and never with a pass in flight or queued.
         if self.check_held_move(wall) {
             return;
@@ -1105,12 +1107,12 @@ impl HostHandle {
     }
 }
 
-/// THE HEAD WATCH FOR A HOST WITH NO LOOP OF ITS OWN — a terminal session (gap #28): the
-/// watch a session may run ([`super::for_host`] as [`Host::Session`]) on the real clocks,
-/// reading `aterm.toml`'s `[packages]` live from `gate` (the table the host read at
-/// launch), starting detached passes as `exe lead… update <program> …`, and saying its
-/// notes through `log`. `None` where the lane would reach no vendor (the manager off, a
-/// `dir:` registry). The thread runs until [`HostHandle::stop`] or the process exits.
+/// The head watch for a terminal session: the watch a session may run ([`super::for_host`]
+/// as [`Host::Session`]) on the real clocks, reading `aterm.toml`'s `[packages]` live from
+/// `gate` (the table the host read at launch), starting detached passes as `exe lead…
+/// update <program> …`, and saying its notes through `log`. `None` where the lane would
+/// reach no vendor (the manager off, a `dir:` registry). The thread runs until
+/// [`HostHandle::stop`] or the process exits.
 #[must_use]
 pub fn run_host(
     layout: &Layout,
@@ -1339,12 +1341,11 @@ mod tests {
         assert!(moved.is_none(), "the head in these scenes has not moved");
     }
 
-    /// GAP #28, THE HEADLINE: with no window open a terminal session watches the heads at
-    /// the window's cadence; a window that opens takes the watch over — the session asks
-    /// nothing while it is up — and when it closes the session watches again within a
-    /// minute. The NEGATIVE CONTROL runs the same scene with a watch no host runs in the
-    /// session's place: it goes on asking beside the window, so the claim, not the shared
-    /// per-vendor schedule, is what keeps the session out.
+    /// With no window open a terminal session watches the heads at the window's cadence; a
+    /// window that opens takes the watch over (the session asks nothing while it is up), and
+    /// when it closes the session watches again within a minute. Negative control: a watch
+    /// no host runs, in the session's place, goes on asking beside the window — the claim,
+    /// not the shared per-vendor schedule, keeps the session out.
     #[test]
     fn a_session_watches_only_while_no_window_does() {
         for hosted in [true, false] {
@@ -1410,9 +1411,9 @@ mod tests {
         }
     }
 
-    /// A WINDOW THAT OPENS MID-ROUND waits for the session's round, not for good: its
-    /// check is refused while the session's GET is in flight — no GET of its own — and
-    /// asked again a slice later, when it takes the watch and the session stands by.
+    /// A window that opens mid-round waits for the session's round, not for good: its check
+    /// is refused while the session's GET is in flight, with no GET of its own, and asked
+    /// again a slice later, when it takes the watch and the session stands by.
     #[test]
     fn a_window_opening_mid_round_waits_one_round_then_watches() {
         let l = layout("mid-round");
@@ -1457,10 +1458,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// EXACTLY ONE SESSION WATCHES: two sessions on one store share the seat — only one
-    /// ever asks — and when the watcher's process goes (its runner dropped: the kernel
-    /// releases a dead process's locks the same way) the other takes the seat within a
-    /// minute and asks.
+    /// Two sessions on one store share the seat and only one ever asks; when the watcher
+    /// goes (its runner dropped, as the kernel releases a dead process's locks) the other
+    /// takes the seat within a minute and asks.
     #[test]
     fn one_session_watches_and_the_next_takes_the_seat_when_it_goes() {
         let l = layout("two-sessions");
@@ -1470,11 +1470,9 @@ mod tests {
         let passes = Passes::default();
         let mut first = session(&l, &time, &vendors, "first", &passes, &on());
         let mut second = session(&l, &time, &vendors, "second", &passes, &on());
-        // Give the first session the seat before the second asks. The fake
-        // clocks share one wall clock, so stepping the denied host's minute
-        // park alongside the seated host would skip the latter's scheduled
-        // five-second looks. Check the seated GET cadence on its own clock;
-        // the denied host still proves the claim excludes its GET below.
+        // Give the first session the seat before the second asks. The fake clocks share one
+        // wall clock, and stepping the denied host's minute park would skip the seated
+        // host's five-second looks, so only the first steps through the cadence check.
         first.step();
         second.step();
         assert_eq!(vendors.count("second"), 0, "the other stood by");
@@ -1511,11 +1509,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// A denied session cannot do update work before its next admission. It
-    /// therefore needs one park, not twelve config stats and wakeups, during
-    /// that minute. A changed live gate is read on the admission wake BEFORE
-    /// any claim or GET; while the gate is off, five-second looks resume so
-    /// turning it back on is still observed promptly.
+    /// A denied session can do no update work before its next admission, so it takes one
+    /// park for that minute, not twelve. The live gate is read on the admission wake before
+    /// any claim or GET; while the gate is off, five-second looks resume.
     #[test]
     fn a_denied_idle_session_parks_to_admission_and_reads_the_gate_first() {
         let l = layout("denied-idle-park");
@@ -1562,10 +1558,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// A MOVED HEAD, THE WINDOW'S WAY: one targeted pass, no head asked while it runs (not
-    /// for minutes), its end reported — a pass that reached the head is not offered again;
-    /// one that ended short gets the one short retry five minutes on, then the hourly
-    /// lease.
+    /// A moved head gets one targeted pass, no head asked while it runs, its end reported:
+    /// a pass that reached the head is not offered again; one that ended short gets the one
+    /// short retry five minutes on, then the hourly lease.
     #[test]
     fn a_moved_head_runs_one_pass_and_its_end_is_reported() {
         let l = layout("moved");
@@ -1625,8 +1620,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// THE WAKE, THE WINDOW'S RULE: a sleep that carries the wall clock an hour past a due
-    /// head asks it after the network's grace, not in the slice the machine woke in.
+    /// A sleep that carries the wall clock an hour past a due head asks it after the
+    /// network's grace, not in the slice the machine woke in.
     #[test]
     fn a_wake_asks_the_heads_after_the_grace() {
         let l = layout("runner-wake");
@@ -1656,8 +1651,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// AUTOMATIC UPDATES, LIVE: off, the session asks nothing and lets the seat go — a
-    /// report says nobody watches; on again, it watches at once.
+    /// Automatic updates off: the session asks nothing and lets the seat go (the report says
+    /// nobody watches); on again, it watches at once.
     #[test]
     fn the_switch_stands_the_session_down_and_frees_the_seat() {
         let l = layout("switch");
@@ -1690,8 +1685,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// THE CLEAN EXIT: a runner on its own thread, on the real clocks, watches at once —
-    /// the report names this process — and stopped, it returns and frees the watch.
+    /// A runner on its own thread, on the real clocks, watches at once (the report names
+    /// this process), and stopped, it returns and frees the watch.
     #[test]
     fn a_stopped_host_frees_the_watch() {
         let l = layout("stop");
@@ -1728,12 +1723,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// The stop signal uses `thread::unpark`, so even a denied session's
-    /// minute-long admission park must end immediately on process shutdown.
-    /// The clock here stretches that park to ten minutes, so a stop that ends
-    /// it is told from one that waits it out by a minute's hang detector,
-    /// whatever the machine's load — never by a budget of seconds against the
-    /// real park's one minute.
+    /// The stop signal unparks, so even a denied session's minute-long admission park ends
+    /// at once on shutdown. The clock stretches that park to ten minutes, so a minute's
+    /// hang detector tells a stop that ends it from one that waits it out.
     #[test]
     fn stop_unparks_a_denied_minute_wait() {
         struct NotifyingClock {
@@ -1798,17 +1790,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// A PASS STARTED MID-ROUND. One round asks both vendors, and the
-    /// one whose head moved is handed back while its peer's GET is still in flight — the
-    /// watch's own rule, so a slow host never delays an install — and the runner starts its
-    /// pass at once. The peer's answer must still be harvested when it lands, pass or no
-    /// pass: until the round is harvested the session holds the rendezvous EXCLUSIVE, which
-    /// would refuse a window for the whole pass, and the unharvested completion would cut
-    /// every park short (`watch.rs`'s `a_stale_completion_never_cuts_a_park_short` pins
-    /// that a stale one cannot). The peer's own moved head is not lost either: its pass
-    /// runs when the first one ends. Real clocks with a short park (the runner notices the
-    /// pass ending within a look, not a five-second [`SLICE`]), a real thread, a pass the
-    /// test ends.
+    /// A pass started mid-round: the vendor whose head moved is handed back while its peer's
+    /// GET is in flight and its pass starts at once; the peer's answer is still harvested
+    /// when it lands (else the session would keep the exclusive rendezvous, refusing a
+    /// window, and the completion would cut every park short), and the peer's own moved
+    /// head runs when the first pass ends. Real clocks with a short park, a real thread, a
+    /// pass the test ends.
     #[test]
     fn a_pass_started_mid_round_still_harvests_the_round() {
         use super::super::BUSY_RETRY;
@@ -2000,11 +1987,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// THE HELD TOOLCHAIN MOVE WITH NO WINDOW OPEN: the seated session looks
-    /// at it by the window's rule — two quiet looks a minute apart — and starts the whole
-    /// pass once, following it to its end with no head asked meanwhile. The NEGATIVE
-    /// CONTROL: with a window watching, the session never wakes it — the window's park
-    /// does — however long it steps.
+    /// With no window open the seated session looks at a held toolchain move by the
+    /// window's rule — two quiet looks a minute apart — and starts the whole pass once,
+    /// following it to its end with no head asked meanwhile. Negative control: with a
+    /// window watching, the session never wakes it, however long it steps.
     #[test]
     fn the_seated_session_wakes_a_held_toolchain_move_and_a_standing_one_does_not() {
         use crate::quiet::{Due, DueFlip};
@@ -2600,13 +2586,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// A HELD TOOLCHAIN MOVE ON A STORE WITH NO VENDOR PROGRAM TO WATCH: nothing asks a head
-    /// there, so the session's look takes the seat itself
-    /// ([`HeadWatch::begin_session_update_look`]) — while the move is still busy, so doctor
-    /// names the session that will wake it — and wakes the whole pass once it is due, with
-    /// no head asked. The NEGATIVE CONTROL: a window holding
-    /// its claim (its park takes it every slice, a head asked or not) keeps the session
-    /// standing by.
+    /// On a store with no vendor program to watch, the session's held-move look takes the
+    /// seat itself ([`HeadWatch::begin_session_update_look`]) — while the move is still
+    /// busy, so doctor names the session that will wake it — and wakes the whole pass once
+    /// it is due, with no head asked. Negative control: a window holding its claim keeps
+    /// the session standing by.
     #[test]
     fn a_held_move_takes_the_seat_on_a_store_with_no_vendor_program() {
         use crate::quiet::{Due, DueFlip};
@@ -2680,11 +2664,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// Ends a fake pass and removes its prefix on EVERY way out of a test that unwinds, a
-    /// failed assertion included. The pass is detached — launchd's child, not ours — and
-    /// loops until `go` stands or its directory is gone, so a failure that skipped writing
-    /// `go` would orphan an `sh` forking `sleep` 20 times a second. A test
-    /// process KILLED runs no drop: the fake's own loop ends that way ([`fake_pass`]).
+    /// Ends a fake pass and removes its prefix on every way out of a test that unwinds, a
+    /// failed assertion included: the pass is detached and loops until `go` stands or its
+    /// directory is gone. A killed test runs no drop; the fake's own loop covers that
+    /// ([`fake_pass`]).
     struct Release {
         go: PathBuf,
         prefix: PathBuf,
@@ -2698,18 +2681,15 @@ mod tests {
     }
 
     /// The most turns a fake pass's wait takes, 50 ms apart: ten minutes, far past any
-    /// test that follows it (a minute's [`HANG`]), so no wait of a test is ever cut short
-    /// by it.
+    /// test's [`HANG`].
     const FAKE_PASS_TURNS: u32 = 12_000;
 
-    /// A FAKE `aterm` PASS for the detached launch: `warm` exits at once (its first exec is
+    /// A fake `aterm` pass for the detached launch: `warm` exits at once (its first exec is
     /// paid unbounded, [`warm`]); anything else writes `<pid> <spawner> <argv>` to `said`
-    /// beside it and waits for `go` there. The wait ALSO ENDS when the process `owner`
-    /// (the test) is gone, and after [`FAKE_PASS_TURNS`] turns at most: a test killed
-    /// outright (SIGKILL from a harness ceiling, SIGTERM or SIGINT — no drop runs, and the
-    /// detached fake sits in a process group of its own that no signal to the test's
-    /// reaches) would otherwise leave a ppid-1 `sh` forking `sleep` 20 times a second, and
-    /// nothing but the drop removes the prefix under TMPDIR.
+    /// beside it and waits for `go` there. The wait also ends when the process `owner` (the
+    /// test) is gone, and after [`FAKE_PASS_TURNS`] turns at most: a test killed outright
+    /// runs no drop, and the fake's own process group gets no signal sent to the test's, so
+    /// it would otherwise leave a ppid-1 `sh` forking `sleep` 20 times a second.
     fn fake_pass(owner: u32) -> String {
         format!(
             "#!/bin/sh\n[ \"$1\" = warm ] && exit 0\nd=$(dirname \"$0\")\nprintf '%s %s %s\\n' \
@@ -2720,12 +2700,10 @@ mod tests {
         )
     }
 
-    /// Write [`fake_pass`] for `owner` as `dir/aterm`, and PAY ITS FIRST EXEC HERE,
-    /// UNBOUNDED. The first exec of a new file waits, at 0% CPU, until macOS `syspolicyd`
-    /// has assessed it, one file at a time behind every test binary the gate links: this
-    /// script measured 40 s from being written to its first line running. A later exec of
-    /// the same file costs nothing (the manual.rs `run_once` rule), and the detaching
-    /// `/bin/sh` in between is the system's own.
+    /// Write [`fake_pass`] for `owner` as `dir/aterm`, and pay its first exec here,
+    /// unbounded: the first exec of a new file waits, at 0% CPU, until macOS `syspolicyd`
+    /// has assessed it (40 s measured for this script); a later exec of the same file costs
+    /// nothing (the manual.rs `run_once` rule).
     #[cfg(unix)]
     fn warm(dir: &Path, owner: u32) -> PathBuf {
         use std::os::unix::fs::PermissionsExt as _;
@@ -2742,9 +2720,9 @@ mod tests {
         exe
     }
 
-    /// A DETACHED PASS IS NOT THIS PROCESS'S CHILD — a session reaping its shell can never
-    /// take the pass's exit for the shell's, and the pass outlives the session — it names
-    /// no spawner, and it is followed to its end by pid.
+    /// A detached pass is not this process's child (a session reaping its shell never takes
+    /// the pass's exit for the shell's, and the pass outlives the session), names no
+    /// spawner, and is followed to its end by pid.
     #[cfg(unix)]
     #[test]
     fn a_detached_pass_is_nobodys_child_and_is_followed_to_its_end() {
@@ -2788,5 +2766,60 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         };
         assert!(ended, "a detached pass's end is the store's to judge");
+    }
+
+    /// The pid a runner follows is the pass's own behind the utility clamp: the launcher
+    /// execs the pass in place, so the detaching shell's `$!` is the pass's `$$`, in the
+    /// group the shell made and still marked detached. On macOS the pass runs at utility
+    /// (`ps` pri 20 or below), not the default band (31).
+    #[cfg(unix)]
+    #[test]
+    fn the_followed_pid_is_the_clamped_passs_own() {
+        struct Kill(libc::pid_t);
+        impl Drop for Kill {
+            fn drop(&mut self) {
+                // SAFETY: a signal to one pid this test started; touches no memory.
+                unsafe { libc::kill(self.0, libc::SIGKILL) };
+            }
+        }
+        let dir = crate::testdir::dir("atpkg-detached-pid-");
+        let said = dir.join("said");
+        let script = format!(
+            "printf '%s %s %s\\n' \"$$\" \"${}\" \"$(/bin/ps -o pri= -p $$)\" > '{1}.tmp' \
+             && mv '{1}.tmp' '{1}' && exec /bin/sleep 60",
+            crate::cli::SPAWNER_PID_ENV,
+            said.display()
+        );
+        let pid = detach(Path::new("/bin/sh"), &["-c".into(), script.into()]).unwrap();
+        let pid = libc::pid_t::try_from(pid).unwrap();
+        let _kill = Kill(pid);
+        let deadline = Instant::now() + HANG;
+        let said = loop {
+            if let Ok(text) = std::fs::read_to_string(&said) {
+                break text;
+            }
+            assert!(Instant::now() < deadline, "the pass started");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let fields: Vec<&str> = said.split_whitespace().collect();
+        let [own, spawner, ref pri @ ..] = fields[..] else {
+            panic!("{said:?}");
+        };
+        assert_eq!(own, pid.to_string(), "the followed pid is the pass's own");
+        assert_eq!(spawner, crate::cli::SPAWNER_DETACHED);
+        // SAFETY: `getpgid` only asks the kernel about one pid, or this process.
+        let (group, ours) = unsafe { (libc::getpgid(pid), libc::getpgid(0)) };
+        assert_ne!(group, ours, "the pass shares this process's group");
+        // SAFETY: `waitpid` with WNOHANG on one pid only asks the kernel about that pid.
+        let reaped = unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
+        assert_eq!(
+            (reaped, std::io::Error::last_os_error().raw_os_error()),
+            (-1, Some(libc::ECHILD)),
+            "the pass is not this process's child"
+        );
+        if cfg!(target_os = "macos") {
+            let pri: i32 = pri.concat().parse().unwrap();
+            assert!(pri <= 20, "the pass ran at pri {pri}, not utility (20)");
+        }
     }
 }

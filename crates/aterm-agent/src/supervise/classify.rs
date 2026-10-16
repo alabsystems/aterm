@@ -2755,6 +2755,8 @@ const ATERM_CTL_READ: &[&str] = &[
     "blocktext",
     "metrics",
     "timeline",
+    "log",
+    "brief",
     "resizes",
     "history",
     "panes",

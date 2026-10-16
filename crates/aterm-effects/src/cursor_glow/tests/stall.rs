@@ -68,11 +68,9 @@ fn a_fifty_key_batch_after_a_five_second_stall_is_one_sweep() {
     );
 }
 
-/// A batch whose last key is three seconds old when the row echoes (the
-/// matrix's hold-N12-D3): licensed, and lit in the echoing frame and the
-/// frame after; the sweep's cells are born no earlier than one stamp window
-/// before the echo, not into a cohort that has already faded
-/// (`held_lit_late`).
+/// A batch whose last key is three seconds old when the row echoes is licensed and lit in the
+/// echoing frame and the frame after: the sweep's cells are born no earlier than one stamp
+/// window before the echo, not into a cohort that has already faded.
 #[test]
 fn a_batch_whose_last_key_is_three_seconds_old_is_lit_in_the_echoing_frame() {
     let g = wide_geom();
@@ -111,10 +109,9 @@ fn a_batch_whose_last_key_is_three_seconds_old_is_lit_in_the_echoing_frame() {
     );
 }
 
-/// One key stalled three seconds (S9): its own +1 echo is licensed by the
-/// press in flight (`licence=inflight`), its cell is lit on the echoing frame
-/// and one beat later, and the press is spent, so the next key echoed on time
-/// has nothing to bridge.
+/// One key stalled three seconds: its own +1 echo is licensed by the press in flight
+/// (`licence=inflight`), its cell is lit on the echoing frame and one beat later, and the press
+/// is spent, so the next key echoed on time has nothing to bridge.
 #[test]
 fn one_key_stalled_three_seconds_lights_its_own_cell_on_the_late_echo() {
     let g = wide_geom();
@@ -320,7 +317,7 @@ fn a_hidden_caret_single_key_stall_relights_on_its_own_anchored_echo() {
         v2_cols(&glow, 5)
     );
 
-    // CONTROL: a row no licensed anchored echo has established is silent.
+    // Control: a row no licensed anchored echo has established is silent.
     let mut cold = CursorGlow::default();
     cold.tick(Some((5, 2)), t0, &c, g, &mut out);
     cold.observe_print_anchor(Some((7, 10, 1)));

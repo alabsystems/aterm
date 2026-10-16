@@ -9,7 +9,7 @@
 //   3. the semantic properties of the CPU visual-regression test (red cell is
 //      red, blue-bg cell is blue, CJK cell non-blank, blank cell background).
 //
-// Skips when there is no GPU or no system font.
+// A host without a GPU could not run it (`common::gpu`).
 
 use crate::common;
 use aterm_core::{grid::LineSize, render::LineSizeSpan, terminal::Terminal};
@@ -74,9 +74,7 @@ fn gpu_matches_cpu() {
     let theme = Theme::default();
     let px = 18.0;
 
-    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(px, theme);
 
     let mut win = aterm_gpu::WindowGpu::new();
     let (mut term, rows, cols) = demo_term();
@@ -141,39 +139,6 @@ fn gpu_matches_cpu() {
     );
 }
 
-/// `backends` returns a font-settled pair: neither renderer holds an unstarted
-/// lazy fallback chain. Otherwise the CJK row can race (one backend's chain
-/// landed, the other's not). Checked white-box: `Renderer::ensure_fallback`
-/// takes its candidate-path list when it starts the parse, so an empty list
-/// means the chain is no longer pending, on any machine load.
-#[test]
-fn backends_hand_back_a_font_settled_pair() {
-    // Non-vacuity: a raw renderer on THIS host really does start with candidates
-    // to take, so the emptiness asserted below has teeth here.
-    let Some(raw) = Renderer::from_system(18.0, Theme::default()) else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
-    if raw.debug_fallback_candidate_paths().is_empty() {
-        eprintln!("SKIP: no lazy fallback candidates on this host");
-        return;
-    }
-    let Some((cpu, gpu)) = backends(18.0, Theme::default()) else {
-        return;
-    };
-    assert!(
-        cpu.debug_fallback_candidate_paths().is_empty(),
-        "the CPU renderer still holds an unstarted fallback chain: its first \
-         renders will draw `.notdef` where the chain would draw a glyph, and a \
-         parity comparison that straddles the arrival reads it as a divergence"
-    );
-    assert!(
-        gpu.debug_fallback_candidate_paths().is_empty(),
-        "the GPU renderer still holds an unstarted fallback chain (the pair has \
-         two chains, and each races its own parse)"
-    );
-}
-
 /// Interior padding keeps GPU/CPU parity: with the same `pad`, frames have the
 /// same grown dimensions, the grid lands on the same pixels within tolerance,
 /// and the theme-bg border matches exactly.
@@ -183,9 +148,7 @@ fn gpu_matches_cpu_with_padding() {
     let px = 18.0;
     const P: usize = 10;
 
-    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(px, theme);
     gpu.set_pad(P);
     cpu.set_pad(P);
 
@@ -248,9 +211,7 @@ fn gpu_matches_cpu_with_padding() {
 fn gpu_matches_cpu_with_pane_local_mixed_dec_widths() {
     let theme = Theme::default();
     let px = 18.0;
-    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(px, theme);
 
     let (rows, cols) = (2usize, 17usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
@@ -335,9 +296,7 @@ fn gpu_matches_cpu_with_pane_local_mixed_dec_widths() {
 fn gpu_matches_cpu_for_glyph_enlargement_inside_its_own_dec_run() {
     let theme = Theme::default();
     let px = 18.0;
-    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(px, theme);
 
     let (rows, cols) = (2usize, 17usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
@@ -407,9 +366,7 @@ fn gpu_matches_cpu_for_glyph_enlargement_inside_its_own_dec_run() {
 fn gpu_matches_cpu_for_partial_double_width_pane_undercurl() {
     let theme = Theme::default();
     let px = 18.0;
-    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(px, theme);
 
     let (rows, cols) = (1usize, 15usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
@@ -453,9 +410,7 @@ fn gpu_matches_cpu_for_partial_double_width_pane_undercurl() {
 fn gpu_matches_cpu_and_clips_italic_ink_at_pane_edge() {
     let theme = Theme::default();
     let px = 18.0;
-    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(px, theme);
 
     let (rows, cols) = (1usize, 17usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
@@ -518,9 +473,7 @@ fn gpu_matches_cpu_mixed_dpi_activate_px() {
     let px_a = 18.0; // a 1× (laptop) window
     let px_b = 36.0; // a 2× (external Retina) window
 
-    let Some((mut cpu, mut gpu)) = backends(px_a, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(px_a, theme);
 
     let mut win = aterm_gpu::WindowGpu::new();
     let (mut term, rows, cols) = demo_term();
@@ -582,9 +535,7 @@ fn gpu_matches_cpu_mixed_dpi_activate_px() {
 
     // The activated A frame must be byte-identical to a FRESH CPU renderer taken
     // straight to A — proving the light switch changed only cache lifetimes.
-    let Some(mut fresh_a) = Renderer::from_system(px_a, theme) else {
-        return;
-    };
+    let mut fresh_a = common::cpu(px_a, theme);
     fresh_a.debug_block_on_lazy_fallbacks();
     cpu.activate_px(px_a);
     let activated_a = cpu.render_input(&input);
@@ -606,9 +557,7 @@ fn gpu_matches_cpu_after_dynamic_osc_colors() {
     let theme = Theme::default();
     let px = 18.0;
 
-    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(px, theme);
 
     let mut win = aterm_gpu::WindowGpu::new();
     let (rows, cols) = (3usize, 8usize);
@@ -706,9 +655,7 @@ fn gpu_matches_cpu_with_named_theme() {
     let theme = Theme::default();
     let px = 18.0;
 
-    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(px, theme);
 
     let mut win = aterm_gpu::WindowGpu::new();
     // Apply Dracula exactly as the GUI does: engine default fg/bg + the 16-slot palette.
@@ -774,9 +721,7 @@ fn procedural_cells_match_cpu_exactly() {
     let theme = Theme::default();
     let px = 18.0;
 
-    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(px, theme);
 
     let (rows, cols) = (5usize, 16usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
@@ -834,9 +779,7 @@ fn aa_procedural_cells_match_cpu_within_tolerance() {
     let theme = Theme::default();
     let px = 18.0;
 
-    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(px, theme);
 
     let (rows, cols) = (2usize, 16usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
@@ -888,9 +831,7 @@ fn shade_phase_matches_cpu_exactly_with_odd_pad() {
     let theme = Theme::default();
     let px = 18.0;
 
-    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(px, theme);
     gpu.set_pad(3);
     cpu.set_pad(3);
 
@@ -937,9 +878,7 @@ fn linear_mode_matches_cpu_and_keeps_procedural_exact() {
     let theme = Theme::default();
     let px = 18.0;
 
-    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(px, theme);
 
     let mut win = aterm_gpu::WindowGpu::new();
     let (mut term, rows, cols) = demo_term();
@@ -986,16 +925,15 @@ fn linear_mode_matches_cpu_and_keeps_procedural_exact() {
 }
 
 /// Colour emoji: the GPU reproduces the CPU's RGBA emoji blit. Emoji cells are
-/// drawn and match within tolerance. Skips without a GPU, font, or colour-emoji
-/// font.
+/// drawn and match within tolerance. A host without a GPU or a colour-emoji
+/// face could not run it.
 #[test]
 fn colour_emoji_gpu_matches_cpu() {
+    common::require_host_colour_emoji();
     let theme = Theme::default();
     let px = 18.0;
 
-    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(px, theme);
 
     let (rows, cols) = (2usize, 12usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
@@ -1014,13 +952,9 @@ fn colour_emoji_gpu_matches_cpu() {
         "dimensions differ"
     );
 
-    // Gate on colour-emoji availability: if the CPU drew nothing in the first
-    // emoji's lead cell, this host has no colour-emoji font — nothing to test.
+    // The CPU, the reference, drew the first emoji's lead cell.
     let cpu_lead = non_bg_count(&cell_pixels(&cpu_frame, cw, ch, 0, 0));
-    if cpu_lead < 12 {
-        eprintln!("SKIP: no colour-emoji font on this host (CPU emoji cell is blank)");
-        return;
-    }
+    assert!(cpu_lead >= 12, "the CPU emoji cell is blank ({cpu_lead})");
 
     // (a) the GPU actually drew the emoji — every emoji lead cell is non-blank.
     for (i, col) in [0usize, 2, 4, 6].iter().enumerate() {
@@ -1061,15 +995,14 @@ fn colour_emoji_gpu_matches_cpu() {
 
 /// VS16 parity: `❤️` (U+2764 + VS16) has a mono glyph in text fonts, so both
 /// renderers must honour `RenderCell::emoji_presentation` and draw a red heart
-/// from the colour face. Skips without a colour-emoji font.
+/// from the colour face. A host without a colour-emoji face could not run it.
 #[test]
 fn vs16_emoji_gpu_matches_cpu() {
+    common::require_host_colour_emoji();
     let theme = Theme::default();
     let px = 18.0;
 
-    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(px, theme);
 
     let (rows, cols) = (2usize, 8usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
@@ -1094,10 +1027,7 @@ fn vs16_emoji_gpu_matches_cpu() {
             .filter(|&&p| rr(p) > 120 && rr(p) > gg(p) + 40 && rr(p) > bb(p) + 40)
             .count()
     };
-    if red(&cpu_frame) == 0 {
-        eprintln!("SKIP: no colour ❤ on this host (CPU heart is not red)");
-        return;
-    }
+    assert!(red(&cpu_frame) > 0, "the CPU drew the VS16 ❤️ in colour");
     assert!(
         red(&gpu_frame) > 0,
         "GPU did not render the VS16 ❤️ in colour (emoji_presentation ignored)"
@@ -1113,23 +1043,23 @@ fn vs16_emoji_gpu_matches_cpu() {
 
 /// VS15 text presentation: 😀 narrowed to one cell with X in the next column.
 /// Both backends draw a text glyph and leave the X cell identical to a
-/// blank+X control. VS16 and CJK stay wide.
+/// blank+X control. VS16 and CJK stay wide. Not on Windows: its Segoe UI
+/// Symbol maps a monochrome 😀, which outranks the colour face by design.
+#[cfg(not(windows))]
 #[test]
 fn vs15_text_emoji_is_one_cell_on_cpu_and_gpu_without_adjacent_overpaint() {
+    common::require_host_colour_emoji();
     let theme = Theme::default();
     let px = 18.0;
-    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(px, theme);
 
     let grin = '\u{1F600}';
     let default_key = cpu.glyph_key(grin);
-    if default_key.source != aterm_render::FaceId::ColorEmoji
-        || default_key.glyph_class != aterm_render::GlyphClass::Rgba
-    {
-        eprintln!("SKIP: no ordinary colour 😀 path on this host: {default_key:?}");
-        return;
-    }
+    assert!(
+        default_key.source == aterm_render::FaceId::ColorEmoji
+            && default_key.glyph_class == aterm_render::GlyphClass::Rgba,
+        "😀 takes the colour path: {default_key:?}"
+    );
 
     let (rows, cols) = (1usize, 5usize);
     let (cw, ch) = cpu.cell_size();
@@ -1196,7 +1126,8 @@ fn vs15_text_emoji_is_one_cell_on_cpu_and_gpu_without_adjacent_overpaint() {
 
 /// Emoji grapheme-CLUSTER parity end-to-end: a ZWJ family (👨‍👩‍👧), a skin-tone
 /// thumbs-up (👍🏽), and a keycap (1️⃣) are multi-codepoint clusters the renderer
-/// SHAPES (rustybuzz) to a single colour glyph, and 🚀 ZWJ 🍕 one no face ligates,
+/// SHAPES (CoreText on macOS, aterm-font's shaper elsewhere) to a single colour
+/// glyph, and 🚀 ZWJ 🍕 one no face ligates,
 /// which it composites from its two glyphs. Both paths must draw that glyph or
 /// composite, not just the base codepoint. Proves the GPU resolves cluster keys
 /// via the shared `resolve_cell_key` and atlases them identically to the CPU.
@@ -1207,12 +1138,11 @@ fn vs15_text_emoji_is_one_cell_on_cpu_and_gpu_without_adjacent_overpaint() {
 /// correct emoji.
 #[test]
 fn cluster_emoji_gpu_matches_cpu() {
+    common::require_host_colour_emoji();
     let theme = Theme::default();
     let px = 18.0;
 
-    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(px, theme);
 
     let (rows, cols) = (2usize, 16usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
@@ -1233,13 +1163,12 @@ fn cluster_emoji_gpu_matches_cpu() {
         "dimensions differ"
     );
 
-    // Gate: the family cluster (lead col 0) must be a non-blank colour glyph on
-    // the CPU; if not, this host lacks a colour-emoji font -> skip.
+    // The CPU, the reference, drew the family cluster (lead col 0).
     let cpu_family = non_bg_count(&cell_pixels(&cpu_frame, cw, ch, 0, 0));
-    if cpu_family < 12 {
-        eprintln!("SKIP: no colour-emoji font on this host (CPU family cluster is blank)");
-        return;
-    }
+    assert!(
+        cpu_family >= 12,
+        "the CPU family cluster is blank ({cpu_family})"
+    );
 
     // The GPU drew each cluster (family col 0, skin col 3, keycap col 6,
     // regional-indicator flag col 8, and both cells of the composite).
@@ -1274,9 +1203,7 @@ fn decorations_gpu_match_cpu() {
     let theme = Theme::default();
     let px = 18.0;
 
-    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(px, theme);
 
     let dims = (3usize, 8usize);
     let mut win = aterm_gpu::WindowGpu::new();
@@ -1327,9 +1254,7 @@ fn underlines_gpu_match_cpu() {
     let theme = Theme::default();
     let px = 18.0;
 
-    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(px, theme);
 
     let dims = (4usize, 10usize);
     let mut win = aterm_gpu::WindowGpu::new();
@@ -1394,9 +1319,7 @@ fn bold_italic_gpu_match_cpu() {
     let theme = Theme::default();
     let px = 18.0;
 
-    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(px, theme);
 
     let dims = (3usize, 8usize);
     let mut win = aterm_gpu::WindowGpu::new();
@@ -1447,9 +1370,7 @@ fn bold_italic_gpu_match_cpu() {
 fn sub_script_gpu_matches_cpu() {
     use aterm_core::terminal::Script;
     let theme = Theme::default();
-    let Some((mut cpu, mut gpu)) = backends(18.0, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(18.0, theme);
     let (rows, cols) = (3usize, 4usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
     term.process("H\u{2500}(H\r\nH\u{2500}(H\r\n H".as_bytes());
@@ -1537,9 +1458,7 @@ fn decdwl_double_width_gpu_matches_cpu() {
     let theme = Theme::default();
     let px = 18.0;
 
-    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(px, theme);
 
     let dims = (1usize, 16usize);
     let mut win = aterm_gpu::WindowGpu::new();
@@ -1579,9 +1498,7 @@ fn decdhl_double_height_gpu_matches_cpu() {
     let theme = Theme::default();
     let px = 18.0;
 
-    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(px, theme);
 
     let dims = (2usize, 16usize);
     let mut win = aterm_gpu::WindowGpu::new();
@@ -1621,9 +1538,7 @@ fn powerline_cells_match_cpu_within_tolerance() {
     let theme = Theme::default();
     let px = 18.0;
 
-    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(px, theme);
 
     let (rows, cols) = (1usize, 8usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
@@ -1666,9 +1581,7 @@ fn synthetic_symbol_cells_match_cpu_within_tolerance() {
     let theme = Theme::default();
     let px = 18.0;
 
-    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(px, theme);
 
     let glyphs = [
         '\u{23F5}', '\u{23F4}', '\u{23F6}', '\u{23F7}', '\u{2B58}', '\u{23BF}',
@@ -1711,13 +1624,8 @@ fn synthetic_symbol_cells_match_cpu_within_tolerance() {
 fn wide_synthetic_symbol_cells_match_cpu_within_tolerance() {
     let theme = Theme::default();
     let px = 18.0;
-    let ctx = match aterm_gpu::GpuContext::new() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("SKIP: no GPU available: {e}");
-            return;
-        }
-    };
+    let ctx = aterm_gpu::GpuContext::new()
+        .unwrap_or_else(|e| aterm_spec::host::could_not_run(format!("no GPU available: {e}")));
     // aterm-gpu builds aterm-render without `embedded-font`, so read the
     // bundled asset directly (the same bytes `embedded_font()` would return).
     let face: &[u8] = include_bytes!("../../aterm-render/assets/DejaVuSansMono.ttf");
@@ -1786,9 +1694,7 @@ fn wide_synthetic_symbol_cells_match_cpu_within_tolerance() {
 /// entries beyond the viewport or the materialized row have no base to paint.
 #[test]
 fn sparse_combining_columns_and_duplicates_match_cpu() {
-    let Some((mut cpu, mut gpu)) = backends(18.0, Theme::default()) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(18.0, Theme::default());
     let (rows, cols) = (2usize, 96usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
     term.process("\x1b[?25le\u{0301}\x1b[1;49Hn\u{0303}\x1b[1;95Ha\u{030a}".as_bytes());
@@ -1827,14 +1733,20 @@ fn sparse_combining_columns_and_duplicates_match_cpu() {
 /// symbol fallback and are condensed at raster time to one cell. The GPU
 /// inherits it through the shared cache and `glyph_quad`; this test keeps the
 /// backends together. Spill is checked against the same row drawn with
-/// spaces, since a blank cell is not literally `Theme::bg`.
+/// spaces, since a blank cell is not literally `Theme::bg`. The primary is the
+/// checked-in Cascadia Mono PL, which maps none of these arrows, so every one
+/// reaches the symbol tier. (The JetBrains Mono fixture maps U+27F5..27F7
+/// itself, and its own U+27F5 overhangs its cell by 2 px on the CPU path: a
+/// primary-face overhang, an open question this test does not judge.)
 #[test]
 fn condensed_symbol_fallback_gpu_matches_cpu() {
     let theme = Theme::default();
     let px = 18.0;
-    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
-        return;
-    };
+    let primary = std::path::Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../aterm-render/assets/bundled/CascadiaMonoPL-Regular.ttf"
+    ));
+    let (mut cpu, mut gpu) = common::backends_with_font(primary, px, theme);
 
     // One arrow every third column, so the two columns to its right — exactly
     // the ones the pre-fix raster buried — are known-blank cells.
@@ -1905,9 +1817,7 @@ fn combining_mark_on_space_base_gpu_matches_cpu() {
     let theme = Theme::default();
     let px = 18.0;
 
-    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(px, theme);
 
     let (rows, cols) = (1usize, 8usize);
     let frame_for = |cpu: &mut Renderer,
@@ -1975,9 +1885,7 @@ fn stacked_combining_marks_gpu_matches_cpu() {
     let theme = Theme::default();
     let px = 18.0;
 
-    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(px, theme);
 
     let (rows, cols) = (2usize, 4usize);
     let mut win = aterm_gpu::WindowGpu::new();
@@ -2140,9 +2048,7 @@ fn stacked_combining_marks_gpu_matches_cpu() {
 fn reused_renderer_across_dims_matches_fresh_render() {
     let theme = Theme::default();
     let px = 16.0;
-    let Some(mut reused) = common::gpu_or_skip(px, theme) else {
-        return;
-    };
+    let mut reused = common::gpu(px, theme);
     // Deterministic pixels: block on the lazy fallback parses so the reused
     // renderer and every fresh oracle rasterize the CJK/emoji identically.
     reused.debug_block_on_lazy_fallbacks();
@@ -2163,8 +2069,7 @@ fn reused_renderer_across_dims_matches_fresh_render() {
 
         // A fresh renderer is the oracle: it has no resident resources, so its
         // frame is the canonical full render for these exact dimensions.
-        let mut fresh = aterm_gpu::GpuRenderer::new(px, theme)
-            .expect("fresh GPU renderer (device already proven above)");
+        let mut fresh = common::gpu(px, theme);
         fresh.debug_block_on_lazy_fallbacks();
         let mut win_fresh = aterm_gpu::WindowGpu::new();
 
@@ -2192,9 +2097,7 @@ fn reused_renderer_across_dims_matches_fresh_render() {
 fn cursor_trail_gpu_matches_cpu() {
     let theme = Theme::default();
     let px = 18.0;
-    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(px, theme);
     let mut win = aterm_gpu::WindowGpu::new();
     let (mut term, rows, cols) = demo_term();
     let (cw, ch) = cpu.cell_size();
@@ -2293,9 +2196,7 @@ fn word_decorations_gpu_match_cpu() {
     use aterm_render::{DecoBlend, DecoGlyph, WordDecoration};
     let theme = Theme::default();
     let px = 18.0;
-    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(px, theme);
     let mut win = aterm_gpu::WindowGpu::new();
     let (mut term, rows, cols) = demo_term();
     let (cw, ch) = cpu.cell_size();
@@ -2416,9 +2317,7 @@ fn word_decorations_wide_row_and_selection_gpu_match_cpu() {
     use aterm_render::{DecoBlend, DecoGlyph, WordDecoration};
     let theme = Theme::default();
     let px = 18.0;
-    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(px, theme);
     let mut win = aterm_gpu::WindowGpu::new();
     let (rows, cols) = (3usize, 16usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
@@ -2499,9 +2398,7 @@ fn word_decorations_wide_row_and_selection_gpu_match_cpu() {
 fn minimum_contrast_floored_cells_gpu_match_cpu() {
     let theme = Theme::default();
     let px = 18.0;
-    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(px, theme);
     let mut win = aterm_gpu::WindowGpu::new();
     let (rows, cols) = (2usize, 8usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
@@ -2597,9 +2494,7 @@ fn minimum_contrast_floored_cells_gpu_match_cpu() {
 fn background_and_cursor_opacity_gpu_match_cpu() {
     let theme = Theme::default();
     let px = 18.0;
-    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(px, theme);
     let mut win = aterm_gpu::WindowGpu::new();
     let (rows, cols) = (2usize, 8usize);
     // Frame A: block cursor on a blank default cell, for the baseline and the
@@ -2767,9 +2662,7 @@ fn ink_gpu_matches_cpu() {
     use aterm_core::render::InkCell;
     let theme = Theme::default();
     let px = 18.0;
-    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(px, theme);
     let mut win = aterm_gpu::WindowGpu::new();
     let (rows, cols) = (3usize, 16usize);
     let ink: [u8; 3] = [0x7C, 0xC8, 0xFF];
@@ -2879,9 +2772,7 @@ fn ink_selection_and_decdwl_gpu_match_cpu() {
     use aterm_core::selection::{SelectionSide, SelectionType};
     let theme = Theme::default();
     let px = 18.0;
-    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(px, theme);
     let mut win = aterm_gpu::WindowGpu::new();
     let (rows, cols) = (2usize, 16usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
@@ -2965,9 +2856,7 @@ fn per_pane_selection_colours_gpu_match_cpu() {
 
     let theme = Theme::default();
     let px = 18.0;
-    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(px, theme);
     let mut win = aterm_gpu::WindowGpu::new();
 
     let (rows, cols) = (2usize, 17usize);
@@ -3082,9 +2971,7 @@ fn sub_row_scroll_translate_gpu_matches_cpu_at_asymmetric_origin() {
     let px = 18.0;
     let (rows, cols) = (8usize, 20usize);
 
-    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(px, theme);
     const PAD: usize = 12;
     const PAD_TOP: usize = 3;
     const HEAD: usize = 17;
@@ -3203,9 +3090,7 @@ fn sub_row_scroll_translate_gpu_matches_cpu_at_asymmetric_origin() {
 fn incoming_row_apron_gpu_matches_cpu() {
     let theme = Theme::default();
     let (rows, cols) = (8usize, 20usize);
-    let Some((mut cpu, mut gpu)) = backends(18.0, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(18.0, theme);
     let (_cw, ch) = cpu.cell_size();
     let grid_top = cpu.grid_top();
     let frac = (ch / 2).max(1) as i32;
@@ -3332,9 +3217,7 @@ fn band_depth(f: &Frame, cw: usize, ch: usize, col: usize, ink: u32) -> usize {
 #[test]
 fn the_overline_colour_channel_paints_the_same_seam_on_both_backends() {
     let theme = Theme::default();
-    let Some((mut cpu, mut gpu)) = backends(18.0, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(18.0, theme);
     let mut win = aterm_gpu::WindowGpu::new();
     let (cw, ch) = cpu.cell_size();
     let (rows, cols) = (1usize, 8usize);
@@ -3427,9 +3310,7 @@ fn gpu_matches_cpu_with_a_metered_chrome_bleed() {
     const SEAM: u32 = 0x0060_6164;
     const FILL: u32 = 0x0050_FA7B;
     const TRACK: u32 = 0x0044_4750;
-    let Some((mut cpu, mut gpu)) = backends(18.0, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(18.0, theme);
     gpu.set_pad(P);
     cpu.set_pad(P);
     let bleed = aterm_render::ChromeBleed {
@@ -3505,9 +3386,7 @@ fn gpu_matches_cpu_with_a_seamed_bleed_under_an_edge_to_edge_rail() {
     const BAND: u32 = 0x0030_3135;
     const SEAM: u32 = 0x0060_6164;
     const RAIL: u32 = 0x00F1_FA8C;
-    let Some((mut cpu, mut gpu)) = backends(18.0, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(18.0, theme);
     cpu.debug_block_on_lazy_fallbacks();
     gpu.debug_block_on_lazy_fallbacks();
     gpu.set_pad(P);
@@ -3589,9 +3468,7 @@ fn gpu_matches_cpu_with_a_chrome_raster() {
     const FILL: u32 = 0x0050_FA7B;
     const TRACK: u32 = 0x0044_4750;
     const RAIL: u32 = 0x00F1_FA8C;
-    let Some((mut cpu, mut gpu)) = backends(18.0, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(18.0, theme);
     gpu.set_pad(P);
     cpu.set_pad(P);
     let mut win = aterm_gpu::WindowGpu::new();
@@ -3681,9 +3558,7 @@ fn gpu_matches_cpu_with_a_clear_rail_row() {
     let theme = Theme::default();
     const P: usize = 10;
     const RAIL: u32 = 0x00F2_FD4A;
-    let Some((mut cpu, mut gpu)) = backends(18.0, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(18.0, theme);
     gpu.set_pad(P);
     cpu.set_pad(P);
     let mut win = aterm_gpu::WindowGpu::new();
@@ -3753,9 +3628,7 @@ fn gpu_matches_cpu_with_band_icons_and_an_outlined_capsule() {
     const P: usize = 10;
     const RING: u32 = 0x00BD_93F9;
     const INNER: u32 = 0x0030_3135;
-    let Some((mut cpu, mut gpu)) = backends(18.0, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(18.0, theme);
     gpu.set_pad(P);
     cpu.set_pad(P);
     let mut win = aterm_gpu::WindowGpu::new();

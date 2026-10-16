@@ -1,0 +1,2041 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+//! `aterm fabric on|off|doctor` end to end — the real `aterm fabric on`
+//! command line against a real broker, a real headless `aterm` and the real
+//! bridge it launches, every one of them in a scratch world of its own.
+//!
+//! SEALED OFF FROM THE MACHINE: its own `$HOME` (so the default root, the
+//! LaunchAgents dir and the config path all land in scratch), its own
+//! `$XDG_CONFIG_HOME` and `$XDG_RUNTIME_DIR` (so no live instance is dialed and
+//! the rendezvous file is scratch), its own `$ATERM_FABRIC_HOME` (so the derived
+//! launchd label can never be the live one — `enable::Paths::label`), and
+//! `--service none` everywhere except the one test that drives a FAKE
+//! `launchctl` on `$PATH`. No test here can reach the real launchd, the real
+//! broker, or a real session. Full-App fixtures explicitly opt out of reroute,
+//! automatic primer installation, updates, and machine-setting writes; scratch
+//! HOME alone does not isolate macOS preferences.
+#![allow(
+    clippy::disallowed_types,
+    reason = "test code: a stand-in child may inherit descriptors"
+)]
+
+use crate::harness;
+use harness::{mode_of, prepare_gui_environment};
+
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Output, Stdio};
+
+use aterm_link::ctl::Ctl;
+use aterm_link::fabric::kv;
+
+const BIN: &str = harness::ATERM;
+
+/// The scratch world. Short, under `/tmp`: the broker's socket path has to fit
+/// `sun_path`, and a per-user `$TMPDIR` does not.
+struct Scratch {
+    dir: PathBuf,
+}
+
+impl Scratch {
+    fn new(tag: &str) -> Self {
+        let dir = PathBuf::from(format!("/tmp/atfo-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for sub in ["home", "cfg/aterm", "run", "root", "bin"] {
+            std::fs::create_dir_all(dir.join(sub)).expect("scratch dir");
+        }
+        Self { dir }
+    }
+
+    fn path(&self, rel: &str) -> String {
+        self.dir.join(rel).to_string_lossy().into_owned()
+    }
+
+    fn root(&self) -> PathBuf {
+        self.dir.join("root")
+    }
+
+    fn sock(&self) -> String {
+        self.path("root/bus.sock")
+    }
+
+    fn config(&self) -> PathBuf {
+        self.dir.join("cfg/aterm/aterm.toml")
+    }
+
+    fn rendezvous(&self) -> PathBuf {
+        self.dir.join("run/aterm/fabric.toml")
+    }
+
+    fn ctl_sock(&self) -> String {
+        self.path("run/aterm/aterm.sock")
+    }
+
+    /// `aterm fabric <args>` in the sealed environment.
+    fn fabric_cmd(&self, args: &[&str]) -> Command {
+        let mut cmd = Command::new(harness::aterm_to_launch());
+        prepare_gui_environment(&mut cmd);
+        cmd.arg("fabric")
+            .args(args)
+            .env("HOME", self.path("home"))
+            .env("XDG_CONFIG_HOME", self.path("cfg"))
+            .env("XDG_RUNTIME_DIR", self.path("run"))
+            .env("ATERM_FABRIC_HOME", self.path("root"))
+            .env("ATERM_BIN", BIN)
+            .stdin(Stdio::null());
+        cmd
+    }
+
+    fn fabric(&self, args: &[&str]) -> (i32, String, String) {
+        run(&mut self.fabric_cmd(args))
+    }
+
+    /// `aterm link <verb> <args>` in the same environment (the read-side verbs,
+    /// whose flags the rendezvous file defaults).
+    fn link(&self, args: &[&str]) -> (i32, String, String) {
+        let mut cmd = Command::new(harness::aterm_to_launch());
+        prepare_gui_environment(&mut cmd);
+        cmd.arg("link")
+            .args(args)
+            .env("HOME", self.path("home"))
+            .env("XDG_CONFIG_HOME", self.path("cfg"))
+            .env("XDG_RUNTIME_DIR", self.path("run"))
+            .stdin(Stdio::null());
+        run(&mut cmd)
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        if std::env::var_os("ATERM_LINK_KEEP").is_none() {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+}
+
+fn run(cmd: &mut Command) -> (i32, String, String) {
+    let Output {
+        status,
+        stdout,
+        stderr,
+    } = harness::output_within(cmd, "aterm");
+    (
+        status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&stdout).into_owned(),
+        String::from_utf8_lossy(&stderr).into_owned(),
+    )
+}
+
+fn chmod(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+}
+
+/// `<root>/mint.secret` holding `bytes` at `mode`.
+fn write_secret(s: &Scratch, bytes: &[u8], mode: u32) {
+    let path = s.root().join("mint.secret");
+    std::fs::write(&path, bytes).expect("secret");
+    chmod(&path, mode);
+}
+
+/// `aterm link broker <sock> <log> --secret-file <root>/mint.secret` — the
+/// GUARDED bus `on` deploys under launchd, started here instead; killed on
+/// drop. A root with no secret yet gets one first (32 bytes, 0600), which
+/// `on` then keeps: the broker cannot be guarded by a secret that does not
+/// exist.
+struct Broker {
+    child: Child,
+}
+
+impl Broker {
+    fn spawn(s: &Scratch) -> Self {
+        use aterm_uds::spawnfd::InheritNothing as _;
+        let secret = s.root().join("mint.secret");
+        if !secret.exists() {
+            write_secret(s, &[0x6b; 32], 0o600);
+        }
+        // std's, for `harness::first_line_within`, with the strip: the broker
+        // holds its stdio and nothing else of this process while it serves.
+        let mut child = Command::new(harness::aterm_to_launch())
+            .inherit_nothing()
+            .args([
+                "link",
+                "broker",
+                &s.sock(),
+                &s.path("root/bus.log"),
+                "--secret-file",
+                &secret.to_string_lossy(),
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn the broker");
+        let first = harness::first_line_within(&mut child, "the broker's readiness line");
+        assert_eq!(first.trim(), format!("listening {}", s.sock()));
+        Self { child }
+    }
+}
+
+impl Drop for Broker {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// The caps `on` minted, checked by the broker `on` DEPLOYS — the one on the
+/// root's socket, guarded by the root's secret: every grant attaches (the tags
+/// are real HMACs over that secret) and a `Last` walk under the ring answers,
+/// while a cap minted under another secret AND a halt published with no cap
+/// at all are refused — so the check tells a guarded broker from one that
+/// checks nothing (revert the guard in `broker_argv` and the halt lands).
+fn deployed_broker_checks_the_minted_caps(s: &Scratch, node: &str) {
+    let caps = aterm_link::bridge::read_cap_file(&s.path("root/node.cap")).expect("cap file");
+    assert_eq!(caps.len(), 8);
+    let mut c = harness::broker_client(s.sock());
+    c.attach_all(
+        caps.iter()
+            .map(|cap| (cap.grant.as_str(), cap.tag.as_slice())),
+    )
+    .unwrap_or_else(|e| panic!("the deployed broker refused the ring: {e}"));
+    c.last("/f/local/pub/*/*/presence", "", 8)
+        .expect("a Last walk under the node ring's `ro:/f/local/pub/>`");
+    let forged = astream_cap::mint(
+        b"not-the-secret-not-the-secret-00",
+        &format!("ro:/f/local/in/{node}/>"),
+    )
+    .expect("mint under another secret");
+    let mut d = harness::broker_client(s.sock());
+    assert!(
+        d.attach(&forged.filter, &forged.tag).is_err(),
+        "a cap minted under another secret must be refused, or this check proves nothing"
+    );
+    let mut e = harness::broker_client(s.sock());
+    assert!(
+        e.publish(
+            astream_cap::producer_id_of("h-anyone"),
+            1,
+            "/f/local/fleet/h-anyone/halt",
+            b"v=1 t=1 state=on",
+        )
+        .is_err(),
+        "a halt from a connection with no cap must be refused: the deployed broker is guarded"
+    );
+}
+
+/// A headless aterm with NO fabric command — the instance `on` has to arm.
+struct Gui {
+    child: Child,
+    ctl_sock: String,
+    token: String,
+    state: PathBuf,
+}
+
+impl Gui {
+    fn boot(s: &Scratch) -> Self {
+        let _permit = harness::boot_permit();
+        harness::prepare_fixture_config(&s.dir);
+        let log = std::fs::File::create(s.dir.join("gui.log")).expect("gui log");
+        let err = log.try_clone().expect("gui log clone");
+        let mut cmd = Command::new(harness::aterm_to_launch());
+        prepare_gui_environment(&mut cmd);
+        cmd.arg("--headless")
+            .env("HOME", s.path("home"))
+            .env("XDG_RUNTIME_DIR", s.path("run"))
+            .env("XDG_CONFIG_HOME", s.path("cfg"))
+            .env("SHELL", "/bin/sh")
+            .args(["--lines", "40", "--columns", "120"])
+            .stdin(Stdio::null())
+            .stdout(log)
+            .stderr(err);
+        harness::arm_lifeline(&mut cmd, &s.dir);
+        let mut child = cmd.spawn().expect("launch aterm --headless");
+        let ctl_sock = s.ctl_sock();
+        let token =
+            harness::World::wait_for_token_of(&ctl_sock, &mut child, &s.dir.join("gui.log"));
+        Self {
+            child,
+            ctl_sock,
+            token,
+            state: s.root().join("link-state"),
+        }
+    }
+
+    fn ctl(&self) -> Ctl {
+        harness::connect(&self.ctl_sock, &self.token).expect("connect to aterm")
+    }
+
+    fn verb(&self, line: &str) -> aterm_link::ctl::Reply {
+        self.ctl()
+            .request(line)
+            .unwrap_or_else(|e| panic!("{line}: {e}"))
+    }
+
+    fn boot_session(&self) -> String {
+        harness::until("aterm's boot session", || {
+            self.verb("sessions")
+                .rows()
+                .first()
+                .and_then(|r| r.split_whitespace().nth(1).map(str::to_string))
+        })
+    }
+}
+
+impl Drop for Gui {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        // The bridge aterm launched: its supervisor is gone with the gui, but
+        // the child sees its fds close a moment later — kill it so no test
+        // leaves a `serve` behind.
+        if let Some(pid) = std::fs::read_to_string(self.state.join("pid"))
+            .ok()
+            .and_then(|p| p.trim().parse::<i32>().ok())
+        {
+            harness::kill(pid, 9);
+        }
+    }
+}
+
+/// The step lines named `<name>`, e.g. `node       already   n-…` — from the
+/// STEPS block only: the `aterm fabric` status that follows a real run has a
+/// `node` row of its own.
+fn step<'a>(out: &'a str, name: &str) -> Vec<&'a str> {
+    let steps = out
+        .find("\naterm fabric — fleet")
+        .map_or(out, |at| &out[..at]);
+    steps
+        .lines()
+        .filter(|l| l.trim_start().starts_with(name) && l.len() > name.len() + 2)
+        .filter(|l| {
+            l.trim_start()[name.len()..]
+                .chars()
+                .next()
+                .is_some_and(char::is_whitespace)
+        })
+        .collect()
+}
+
+/// **THE WHOLE THING, END TO END, TWICE.** A headless aterm with no fabric
+/// command and no broker: the first `on` provisions the root, the node id, the
+/// secret and the cap, then FAILS at the broker — `--service none` starts none
+/// — naming the GUARDED broker to run. With that broker up, `on` writes the
+/// config and the rendezvous file, ARMS the instance, and PROVES the round
+/// trip; a second `on` changes nothing and says so; the read-side verbs then
+/// need no flags; `off` removes what changes behaviour and keeps the identity.
+#[test]
+fn on_provisions_arms_proves_and_a_second_on_changes_nothing() {
+    let s = Scratch::new("on");
+    let gui = Gui::boot(&s);
+    let sid = gui.boot_session();
+    let status = gui.verb("fabric status");
+    assert!(
+        kv(status.header(), "supervised") == Some("0"),
+        "the instance starts unarmed: {}",
+        status.header()
+    );
+
+    // ---- `on` with no broker: identity provisioned, the broker named
+    let (code, out, err) = s.fabric(&["on", "--service", "none"]);
+    assert_eq!(code, 1, "stdout:\n{out}\nstderr:\n{err}");
+    for (name, verdict) in [
+        ("binary", "ok"),
+        ("root", "done"),
+        ("node", "done"),
+        ("secret", "done"),
+        ("cap", "done"),
+        ("broker", "FAILED"),
+    ] {
+        let lines = step(&out, name);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.split_whitespace().nth(1) == Some(verdict)),
+            "step `{name}` should read `{verdict}`:\n{out}"
+        );
+    }
+    assert!(
+        step(&out, "broker").iter().any(|l| l.contains(&format!(
+            "{BIN} link broker {} {} --secret-file {}",
+            s.sock(),
+            s.path("root/bus.log"),
+            s.path("root/mint.secret")
+        ))),
+        "the broker to run is the GUARDED one:\n{out}"
+    );
+    assert!(step(&out, "config").is_empty(), "{out}");
+    assert_eq!(mode_of(&s.root().join("mint.secret")), 0o600);
+    let secret = std::fs::read(s.root().join("mint.secret")).expect("the minted secret");
+    assert_eq!(secret.len(), 32);
+    let broker = Broker::spawn(&s);
+    assert_eq!(
+        std::fs::read(s.root().join("mint.secret")).expect("secret"),
+        secret,
+        "the broker is guarded by the secret `on` minted"
+    );
+
+    // ---- `on` with the broker up
+    let (code, out, err) = s.fabric(&["on", "--service", "none"]);
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(err.is_empty(), "nothing on stderr: {err}");
+    for (name, verdict) in [
+        ("binary", "ok"),
+        ("root", "already"),
+        ("node", "already"),
+        ("secret", "already"),
+        ("cap", "already"),
+        ("broker", "already"),
+        ("config", "done"),
+        ("rendezvous", "done"),
+        ("instance", "done"),
+        ("proof", "ok"),
+    ] {
+        let lines = step(&out, name);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.split_whitespace().nth(1) == Some(verdict)),
+            "step `{name}` should read `{verdict}`:\n{out}"
+        );
+    }
+    assert!(
+        step(&out, "broker").iter().all(|l| !l.contains("WARNING")),
+        "a guarded broker is no warning:\n{out}"
+    );
+    assert!(
+        out.lines()
+            .any(|l| l.trim_start().starts_with("guard ") && l.contains(" yes — ")),
+        "BROKER measures the guard:\n{out}"
+    );
+    // The node id was provisioned into the state dir, and the cap minted FOR IT
+    // with the root's secret — which the deployed broker verified when the
+    // bridge attached (the proof could not have landed otherwise).
+    let node = std::fs::read_to_string(s.root().join("link-state/node")).expect("node");
+    let node = node.trim().to_string();
+    assert!(node.starts_with("n-") && node.len() == 18, "{node}");
+    let cap = std::fs::read_to_string(s.root().join("node.cap")).expect("cap");
+    assert_eq!(cap.lines().count(), 8, "{cap}");
+    assert_eq!(
+        cap.lines()
+            .filter(|l| l.contains(&format!("p={node}:")))
+            .count(),
+        4,
+        "{cap}"
+    );
+    assert_eq!(mode_of(&s.root().join("node.cap")), 0o600);
+    assert_eq!(mode_of(&s.root()), 0o700);
+    deployed_broker_checks_the_minted_caps(&s, &node);
+    // The config carries the bridge command, in the shim's spelling, with
+    // --accept-from.
+    let config = std::fs::read_to_string(s.config()).expect("config");
+    let command = aterm_link::fabric::command_in_toml(&config)
+        .expect("valid TOML")
+        .expect("a [fabric] command");
+    assert_eq!(
+        command,
+        format!(
+            "{BIN} link serve --fleet local --broker {} --cap-file {} --state {} --accept-from {node}",
+            s.sock(),
+            s.path("root/node.cap"),
+            s.path("root/link-state")
+        )
+    );
+    assert!(
+        config.contains("# Written by `aterm fabric on`"),
+        "{config}"
+    );
+    let baseline_backup = std::fs::read_to_string(s.dir.join("cfg/aterm/aterm.toml.bak"))
+        .expect("the initial isolation config was backed up");
+    assert_eq!(baseline_backup, harness::FIXTURE_GUI_CONFIG);
+    // The rendezvous file, 0600, beside the control socket.
+    let r = std::fs::read_to_string(s.rendezvous()).expect("fabric.toml");
+    assert_eq!(mode_of(&s.rendezvous()), 0o600);
+    let r = aterm_link::enable::Rendezvous::parse(&r).expect("parses");
+    assert_eq!(r.fleet, "local");
+    assert_eq!(r.broker, s.sock());
+    assert_eq!(r.node, node);
+    assert_eq!(r.cap_file, s.path("root/node.cap"));
+    assert_eq!(r.state, s.path("root/link-state"));
+    assert_eq!(r.command, command);
+    // The instance is ARMED with exactly that command, and connected.
+    let status = gui.verb("fabric status");
+    let h = status.header();
+    assert_eq!(kv(h, "supervised"), Some("1"), "{h}");
+    assert_eq!(kv(h, "state"), Some("connected"), "{h}");
+    assert_eq!(
+        kv(h, "command").map(aterm_link::pct::decode).as_deref(),
+        Some(command.as_str()),
+        "{h}"
+    );
+    // The proof's note is in the session's inbox, delivered THROUGH the broker
+    // (it carries a bus offset) — and the report line names the round trip.
+    let proof = step(&out, "proof")
+        .into_iter()
+        .next()
+        .expect("a proof line");
+    assert!(
+        proof.contains(&format!("a note from @{sid} to itself landed at @"))
+            && proof.contains("came back through the broker in")
+            && proof.contains(" ms"),
+        "{proof}"
+    );
+    let inbox = gui.verb(&format!("@{sid} inbox --peek"));
+    let notes: Vec<&String> = inbox
+        .rows()
+        .iter()
+        .filter(|r| r.starts_with("msg ") && kv(r, "kind") == Some("note"))
+        .collect();
+    assert_eq!(notes.len(), 1, "{:#?}", inbox.rows());
+    assert!(
+        notes[0].contains("text=aterm%20fabric%20on:%20proof%20"),
+        "{}",
+        notes[0]
+    );
+    assert!(kv(notes[0], "off").is_some_and(|o| o.parse::<u64>().is_ok()));
+    // The undo is spelled WITH the environment that scoped this run — the
+    // scratch root and config — so running it as printed reaches this
+    // scratch install and never the machine's.
+    let undo = step(&out, "undo");
+    assert_eq!(undo.len(), 1, "{out}");
+    assert!(
+        undo[0].contains(&format!(
+            "ATERM_FABRIC_HOME={} XDG_CONFIG_HOME={} XDG_RUNTIME_DIR={} ATERM_BIN={BIN} HOME={} \
+             aterm fabric off",
+            s.path("root"),
+            s.path("cfg"),
+            s.path("run"),
+            s.path("home")
+        )),
+        "{}",
+        undo[0]
+    );
+    // And the status report followed, with the instance on it.
+    assert!(
+        out.contains("\nCONFIG\n") && out.contains("\nBRIDGES"),
+        "{out}"
+    );
+    // The FABRIC cell carries the bridge's own link report: the last acked round trip and its age, then the SUPERVISED column.
+    assert!(
+        out.contains(&format!("{}  connected (rtt ", gui.child.id())) && out.contains(" ago)  yes"),
+        "{out}"
+    );
+
+    // ---- the second `on`: idempotent, says so, proves again
+    let before = std::fs::read(s.config()).expect("config bytes");
+    let rendezvous_before = std::fs::read(s.rendezvous()).expect("fabric.toml bytes");
+    let (code, out2, err) = s.fabric(&["on", "--service", "none"]);
+    assert_eq!(code, 0, "stdout:\n{out2}\nstderr:\n{err}");
+    for name in [
+        "root",
+        "node",
+        "secret",
+        "cap",
+        "broker",
+        "config",
+        "rendezvous",
+        "instance",
+    ] {
+        let lines = step(&out2, name);
+        assert!(
+            lines
+                .iter()
+                .all(|l| l.split_whitespace().nth(1) == Some("already")),
+            "step `{name}` must read `already` on the second run:\n{out2}"
+        );
+    }
+    assert!(
+        out2.contains("nothing changed: the fabric was already on, and the proof ran again."),
+        "{out2}"
+    );
+    assert!(
+        step(&out2, "proof")[0].contains("came back through the broker"),
+        "{out2}"
+    );
+    assert_eq!(
+        std::fs::read(s.config()).expect("config"),
+        before,
+        "the config was rewritten"
+    );
+    assert_eq!(
+        std::fs::read(s.rendezvous()).expect("fabric.toml"),
+        rendezvous_before
+    );
+    assert_eq!(
+        std::fs::read_to_string(s.dir.join("cfg/aterm/aterm.toml.bak")).expect("baseline backup"),
+        baseline_backup,
+        "an idempotent on must not overwrite the previous backup"
+    );
+    assert_eq!(
+        std::fs::read_to_string(s.root().join("node.cap")).expect("cap"),
+        cap,
+        "the cap was re-minted"
+    );
+
+    // ---- the read-side verbs need no flags now
+    let (code, ls, err) = s.link(&["ls"]);
+    assert_eq!(code, 0, "{ls}\n{err}");
+    assert!(
+        ls.lines()
+            .any(|l| l.starts_with(&format!("{node} ")) && l.contains("state=live")),
+        "`ls` with no flags reads the rendezvous file and finds this node:\n{ls}"
+    );
+    assert!(
+        ls.lines().any(|l| l.contains(&format!(" {sid} "))),
+        "and the session's presence row:\n{ls}"
+    );
+    // The rendezvous file supplying flags is carried by the `ls` assertions above.
+    // A flag on the command line still wins: a wrong broker is a wrong broker.
+    let (code, _, err) = s.link(&["ls", "--broker", "/tmp/atfo-nowhere.sock"]);
+    assert_ne!(code, 0, "{err}");
+    // `aterm fabric` (status) without [fabric] reads the rendezvous file.
+    std::fs::write(
+        s.config(),
+        format!("font_px = 12.0\n{}", harness::FIXTURE_GUI_CONFIG),
+    )
+    .expect("drop only the Fabric table, retaining fixture opt-outs");
+    let (code, status, _) = s.fabric(&["status"]);
+    assert!(
+        status.contains("source     the rendezvous file") && status.contains("\nCONFIG\n"),
+        "exit {code}:\n{status}"
+    );
+    let (code, doctor, _) = s.fabric(&["doctor"]);
+    assert!(
+        doctor.contains("aterm fabric doctor — fleet local"),
+        "exit {code}:\n{doctor}"
+    );
+
+    // ---- off
+    let (code, out, err) = s.fabric(&["off", "--service", "none", "--dry-run"]);
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(s.rendezvous().exists(), "a dry run removes nothing");
+    let (code, out, err) = s.fabric(&["off", "--service", "none"]);
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(!s.rendezvous().exists(), "off removes the rendezvous file");
+    assert!(
+        step(&out, "config")
+            .iter()
+            .any(|l| l.contains("no [fabric] table")),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!("{} stays", s.path("root/bus.log"))),
+        "{out}"
+    );
+    assert!(out.contains(&format!("node id {node}")), "{out}");
+    for kept in ["link-state/node", "mint.secret", "node.cap"] {
+        assert!(s.root().join(kept).exists(), "off keeps {kept}");
+    }
+    // `off` on a config that HAS the table: the table goes, the rest stays, a
+    // .bak holds the previous file.
+    std::fs::write(
+        s.config(),
+        format!(
+            "font_px = 12.0\n{}\n[fabric]\ncommand = \"{command}\"\n\n[keys]\nx = 1\n",
+            harness::FIXTURE_GUI_CONFIG
+        ),
+    )
+    .expect("config");
+    let (code, out, _) = s.fabric(&["off", "--service", "none"]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(
+        std::fs::read_to_string(s.config()).expect("config"),
+        format!(
+            "font_px = 12.0\n{}\n[keys]\nx = 1\n",
+            harness::FIXTURE_GUI_CONFIG
+        )
+    );
+    assert!(s.dir.join("cfg/aterm/aterm.toml.bak").exists());
+    // `doctor` after `off`, with the instance still armed (a supervisor has no
+    // stop handle): the report reads that running bridge, and warns that the
+    // Fabric config and the rendezvous file are gone — each with `on` as the fix.
+    let (code, doctor, _) = s.fabric(&["doctor"]);
+    assert_eq!(code, 1, "{doctor}");
+    assert!(
+        doctor.contains("no [fabric] command in")
+            && doctor.contains("fix: `aterm fabric on` writes [fabric] command")
+            && doctor.contains("no rendezvous file at")
+            && doctor.contains("fix: `aterm fabric on` writes it"),
+        "{doctor}"
+    );
+
+    drop(gui);
+    drop(broker);
+}
+
+/// **`--dry-run` PRINTS EVERY STEP AND TOUCHES NOTHING**: on a bare world with
+/// no broker, every step is `would`, and afterwards there is no root, no
+/// config, no rendezvous file.
+#[test]
+fn dry_run_names_every_step_and_creates_nothing() {
+    let s = Scratch::new("dry");
+    std::fs::remove_dir_all(s.root()).expect("no root yet");
+    let (code, out, err) = s.fabric(&["on", "--dry-run", "--service", "none"]);
+    assert_eq!(
+        code, 1,
+        "a dry run that would fail says so with its exit:\n{out}\n{err}"
+    );
+    assert!(
+        out.contains("A step FAILED above, and would fail for real."),
+        "{out}"
+    );
+    assert!(
+        out.contains("DRY RUN: every step printed, nothing touched"),
+        "{out}"
+    );
+    for name in ["root", "node", "secret", "cap", "config", "rendezvous"] {
+        assert!(
+            step(&out, name)
+                .iter()
+                .any(|l| l.split_whitespace().nth(1) == Some("would")),
+            "step `{name}` should read `would`:\n{out}"
+        );
+    }
+    // With --service none the broker is not started by anybody, so the dry run
+    // reports the socket nobody answers on — and still creates nothing.
+    assert!(
+        step(&out, "broker")
+            .iter()
+            .any(|l| l.contains("no broker answers on")),
+        "{out}"
+    );
+    assert!(!s.root().exists(), "a dry run created the root");
+    assert!(!s.config().exists(), "a dry run wrote the config");
+    assert!(
+        !s.rendezvous().exists(),
+        "a dry run wrote the rendezvous file"
+    );
+    assert!(
+        !s.dir.join("home/Library").exists(),
+        "a dry run wrote under $HOME"
+    );
+}
+
+/// **A REJECTED MINT PUBLISHES NOTHING AND SUPERVISES NOTHING** — the shell
+/// fixture's containment check, on the Rust command, with its effect trace run
+/// through `aterm-spec`'s capability-publication model (Tier-1 of
+/// `fabric_capability_publication_model`, eight grants).
+///
+/// A refusal at grant 1, 3 and 8, over an absent cap, a STALE one (a cap for
+/// another node id) and a FOREIGN one (this node's ring under another secret,
+/// which the guarded broker refuses): the previous cap is byte-identical or still
+/// absent, no staging file is left, the config and the rendezvous file are not
+/// written, exit 1. A short secret is refused before any mint and never
+/// replaced. A cap already minted for this node is reused without a mint. And
+/// the good case: eight `Mint`s, one `Publish`, then `Supervise`.
+#[test]
+fn a_rejected_mint_publishes_nothing_and_the_trace_satisfies_the_model() {
+    let mut model = aterm_spec::derive::fabric_capability_publication_model();
+    model
+        .consts
+        .iter_mut()
+        .find(|(key, _)| *key == "Grants")
+        .expect("the model has Grants")
+        .1 = 8;
+    let stale = |s: &Scratch, node: &str| {
+        std::fs::write(
+            s.root().join("node.cap"),
+            format!("rw,p={node}:/f/local/pub/{node}/> {}\n", "00".repeat(32)),
+        )
+        .expect("stale cap");
+    };
+    // THIS node's whole ring, minted under ANOTHER secret than the root's — a
+    // secret moved aside and minted afresh, or a ring another host minted:
+    // the guarded broker would refuse every grant, so `on` re-mints it.
+    let foreign = |s: &Scratch, node: &str| {
+        let lines: String = aterm_link::enable::node_grants("local", node)
+            .iter()
+            .map(|g| {
+                let c = astream_cap::mint(&[0x42; 32], g).expect("mint under another secret");
+                astream_cap::capfile::format_line(&c.filter, &c.tag) + "\n"
+            })
+            .collect();
+        std::fs::write(s.root().join("node.cap"), lines).expect("foreign cap");
+    };
+    let node_of = |s: &Scratch| -> String {
+        std::fs::create_dir_all(s.root().join("link-state")).expect("state");
+        std::fs::write(s.root().join("link-state/node"), "n-00000000000000aa\n").expect("node");
+        "n-00000000000000aa".to_string()
+    };
+    let seed_secret = |s: &Scratch| {
+        write_secret(
+            s,
+            &(0..32u8).map(|i| i.wrapping_mul(7)).collect::<Vec<u8>>(),
+            0o600,
+        );
+    };
+    let secret_bytes = |s: &Scratch| std::fs::read(s.root().join("mint.secret")).ok();
+    let cap_bytes = |s: &Scratch| std::fs::read(s.root().join("node.cap")).ok();
+    let staging = |s: &Scratch| -> Vec<PathBuf> {
+        std::fs::read_dir(s.root())
+            .expect("root")
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with(".node.cap."))
+            })
+            .collect()
+    };
+    let trace_of = |s: &Scratch| -> Vec<String> {
+        std::fs::read_to_string(s.dir.join("effects.trace"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    };
+    // Run the trace through the model; answers (rejected by the model, state).
+    let check = |trace: &[String]| {
+        let mut state = model.init_state();
+        for event in trace {
+            assert!(
+                model.fire(event, &mut state),
+                "the real command performed `{event}` from {state:?}, which the model disables"
+            );
+        }
+        state
+    };
+
+    for existing in ["absent", "stale", "foreign"] {
+        for fail_at in ["1", "3", "8"] {
+            let s = Scratch::new(&format!("mint-{existing}-{fail_at}"));
+            let node = node_of(&s);
+            seed_secret(&s);
+            if existing == "stale" {
+                stale(&s, "n-previous");
+            }
+            if existing == "foreign" {
+                foreign(&s, &node);
+            }
+            let secret_before = secret_bytes(&s);
+            let cap_before = cap_bytes(&s);
+            let (code, out, _) = run(s
+                .fabric_cmd(&["on", "--service", "none"])
+                .env("ATERM_FABRIC_TRACE", s.path("effects.trace"))
+                .env("ATERM_FABRIC_FAIL_MINT_AT", fail_at));
+            assert_eq!(code, 1, "{existing}/{fail_at}:\n{out}");
+            assert!(
+                out.contains("injected mint refusal") && out.contains("was left unchanged"),
+                "{out}"
+            );
+            assert_eq!(secret_bytes(&s), secret_before, "the secret was replaced");
+            assert_eq!(
+                cap_bytes(&s),
+                cap_before,
+                "the cap was touched ({existing})"
+            );
+            assert!(staging(&s).is_empty(), "staging debris: {:?}", staging(&s));
+            assert!(
+                !s.config().exists(),
+                "the config was written after a refused mint"
+            );
+            assert!(!s.rendezvous().exists());
+            assert!(
+                step(&out, "broker").is_empty(),
+                "supervision was reached:\n{out}"
+            );
+            let trace = trace_of(&s);
+            let n: usize = fail_at.parse().expect("n");
+            let mut expect = vec!["Mint".to_string(); n - 1];
+            expect.push("Reject".to_string());
+            assert_eq!(trace, expect, "{existing}/{fail_at}");
+            let state = check(&trace);
+            assert_eq!(state["refused"], 1);
+            assert_eq!(state["published"], 0);
+            assert_eq!(state["supervised"], 0);
+        }
+    }
+
+    // A short secret, and a full-length one other users can read: each
+    // refused at the secret step, before the first mint, and never replaced
+    // or chmodded behind the operator's back (a secret that sat readable may
+    // have been read).
+    for (tag, bytes, mode, why) in [
+        (
+            "short",
+            b"short\n".to_vec(),
+            0o600,
+            "holds 6 bytes; a mint secret is at least 32",
+        ),
+        (
+            "wide",
+            vec![9u8; 32],
+            0o644,
+            "is mode 0644, not owner-only; run `chmod 600",
+        ),
+    ] {
+        let s = Scratch::new(&format!("mint-{tag}"));
+        node_of(&s);
+        write_secret(&s, &bytes, mode);
+        stale(&s, "n-previous");
+        let cap_before = cap_bytes(&s);
+        let (code, out, _) = run(s
+            .fabric_cmd(&["on", "--service", "none"])
+            .env("ATERM_FABRIC_TRACE", s.path("effects.trace")));
+        assert_eq!(code, 2, "{tag}: {out}");
+        assert!(
+            step(&out, "secret")
+                .iter()
+                .any(|l| l.contains("FAILED") && l.contains(why)),
+            "{tag}: {out}"
+        );
+        assert!(
+            step(&out, "secret").iter().all(|l| !l.contains("already")),
+            "{tag}: {out}"
+        );
+        assert_eq!(
+            std::fs::read(s.root().join("mint.secret")).expect("secret"),
+            bytes
+        );
+        assert_eq!(mode_of(&s.root().join("mint.secret")), mode, "{tag}");
+        assert_eq!(cap_bytes(&s), cap_before);
+        assert!(trace_of(&s).is_empty(), "{:?}", trace_of(&s));
+    }
+
+    // The good case, over an absent cap, a stale one and this node's ring
+    // minted under another secret: eight mints, one publish, then supervision
+    // — with a real broker answering, and no instance to arm, exit 0 and the
+    // proof skipped by name.
+    for existing in ["absent", "stale", "foreign"] {
+        let s = Scratch::new(&format!("mint-good-{existing}"));
+        let node = node_of(&s);
+        seed_secret(&s);
+        for d in [s.root(), s.root().join("link-state")] {
+            chmod(&d, 0o755);
+        }
+        if existing == "stale" {
+            stale(&s, "n-previous");
+        }
+        if existing == "foreign" {
+            foreign(&s, &node);
+        }
+        let secret_before = secret_bytes(&s);
+        let broker = Broker::spawn(&s);
+        let (code, out, err) = run(s
+            .fabric_cmd(&["on", "--service", "none"])
+            .env("ATERM_FABRIC_TRACE", s.path("effects.trace")));
+        assert_eq!(code, 0, "{out}\n{err}");
+        assert_eq!(secret_bytes(&s), secret_before, "the secret is preserved");
+        let trace = trace_of(&s);
+        assert_eq!(
+            trace,
+            ["Mint"; 8]
+                .iter()
+                .map(|s| (*s).to_string())
+                .chain(["Publish".to_string(), "Supervise".to_string()])
+                .collect::<Vec<_>>(),
+            "{existing}"
+        );
+        let state = check(&trace);
+        assert_eq!(state["completed"], 8);
+        assert_eq!(state["published"], 1);
+        assert_eq!(state["supervised"], 1);
+        let cap = std::fs::read_to_string(s.root().join("node.cap")).expect("cap");
+        assert_eq!(cap.lines().count(), 8);
+        assert!(cap.lines().all(|l| l.contains("/f/local/")), "{cap}");
+        assert!(cap.contains(&format!("p={node}:")));
+        assert!(!cap.contains("n-previous"), "the stale cap survived: {cap}");
+        assert!(staging(&s).is_empty());
+        assert_eq!(mode_of(&s.root().join("node.cap")), 0o600);
+        // A root another user could reach was made 0700, and the line says
+        // what it was — never `(0700)` for a mode nobody read.
+        assert_eq!(mode_of(&s.root()), 0o700);
+        assert_eq!(mode_of(&s.root().join("link-state")), 0o700);
+        assert!(
+            step(&out, "root")
+                .iter()
+                .any(|l| l.contains("made 0700") && l.contains("was 0755")),
+            "{out}"
+        );
+        assert!(
+            step(&out, "proof")
+                .iter()
+                .any(|l| l.contains("skipped: no aterm is running")),
+            "{out}"
+        );
+        assert!(
+            step(&out, "instances")
+                .iter()
+                .any(|l| l.contains("none running")),
+            "{out}"
+        );
+        // No aterm.toml before this run: added, and no `.bak` promised or made.
+        let config = step(&out, "config");
+        assert!(
+            config.iter().any(|l| l.contains("add [fabric] command"))
+                && config.iter().all(|l| !l.contains("previous saved as")),
+            "{out}"
+        );
+        assert!(!s.dir.join("cfg/aterm/aterm.toml.bak").exists());
+        // A cap already minted for this node is reused: no mint at all.
+        std::fs::remove_file(s.dir.join("effects.trace")).expect("reset");
+        let cap_before = cap_bytes(&s);
+        let (code, out, _) = run(s
+            .fabric_cmd(&["on", "--service", "none"])
+            .env("ATERM_FABRIC_TRACE", s.path("effects.trace")));
+        assert_eq!(code, 0, "{out}");
+        assert_eq!(trace_of(&s), vec!["Supervise".to_string()]);
+        assert_eq!(cap_bytes(&s), cap_before);
+        assert!(
+            step(&out, "cap")
+                .iter()
+                .any(|l| l.contains("already") && l.contains("8 grants for")),
+            "{out}"
+        );
+        // No instance, so no proof: the summary says it was skipped.
+        assert!(!out.contains("the proof ran again"), "{out}");
+        assert!(out.contains("and the proof was skipped."), "{out}");
+        deployed_broker_checks_the_minted_caps(&s, &node);
+        drop(broker);
+    }
+}
+/// **LAUNCHD IS ASKED THROUGH A DERIVED LABEL, THE PLIST IS THE SCRIPT'S, AND
+/// A BROKER LAUNCHD DOES NOT MANAGE IS NEVER BOOTSTRAPPED OVER.** A FAKE
+/// `launchctl` on `$PATH` that behaves like the real one where it matters:
+/// `bootstrap` starts the broker the plist names and `print gui/<uid>/<label>`
+/// shows it with its pid until `bootout` kills it, while the legacy `list`
+/// shows nothing — the CALLER's domain, as an SSH session's reads, so a run
+/// that still asked `list` would miss launchd's own job (and a domain that
+/// does not exist, no GUI login, is `print`'s exit 112). First: with a
+/// hand-run broker answering on the socket and no job by the label, `on
+/// --service launchd` names the unmanaged broker's pid and stops, rather than
+/// bootstrap a second broker on the same socket and log; with no GUI login it
+/// is refused by naming the domain, before a plist is written. Then the
+/// install proper: the label is
+/// derived from the root (never the live one), the plist lives INSIDE that
+/// root (not in `$HOME/Library/LaunchAgents`: the root is not the default
+/// one) and runs the broker directly, a second `on` reads `already` from
+/// launchd's own pid, and `off` boots the job out.
+#[test]
+fn launchd_is_asked_through_a_derived_label_and_the_plist_is_the_scripts() {
+    let s = Scratch::new("launchd");
+    let calls = s.path("launchctl.calls");
+    let pidfile = s.path("launchd.pid");
+    // Every path is the scratch dir's, read off `$0` (`<dir>/bin/launchctl`), so
+    // the body is the same on every run and `stand_in` hands back an inode the
+    // system has already assessed: a fresh script's first exec can stall for
+    // over a minute on a loaded Mac.
+    aterm_tempfile::stand_in(
+        &s.dir.join("bin/launchctl"),
+        &format!(
+            "#!/bin/sh\n\
+             d=${{0%/bin/launchctl}}\n\
+             printf '%s\\n' \"$*\" >> \"$d/launchctl.calls\"\n\
+             case \"$1\" in\n\
+               print)\n\
+                 [ -f \"$d/no-gui\" ] && exit 112\n\
+                 if [ -f \"$d/launchd.pid\" ] && kill -0 \"$(cat \"$d/launchd.pid\")\" 2>/dev/null \
+                    && [ \"${{2##*/}}\" = \"$(cat \"$d/launchd.label\")\" ]; then\n\
+                   printf '\\tstate = running\\n\\tpid = %s\\n' \"$(cat \"$d/launchd.pid\")\"\n\
+                   exit 0\n\
+                 fi\n\
+                 exit 113 ;;\n\
+               bootstrap)\n\
+                 [ -f \"$d/no-gui\" ] && exit 125\n\
+                 basename \"$3\" .plist > \"$d/launchd.label\"\n\
+                 rm -f \"$d/root/bus.sock\"\n\
+                 nohup '{BIN}' link broker \"$d/root/bus.sock\" \"$d/root/bus.log\" --secret-file \"$d/root/mint.secret\" >/dev/null 2>&1 &\n\
+                 printf '%s' \"$!\" > \"$d/launchd.pid\"\n\
+                 exit 0 ;;\n\
+               bootout)\n\
+                 if [ -f \"$d/launchd.pid\" ]; then kill \"$(cat \"$d/launchd.pid\")\" 2>/dev/null; rm -f \"$d/launchd.pid\"; exit 0; fi\n\
+                 exit 3 ;;\n\
+             esac\n\
+             exit 0\n"
+        ),
+    )
+    .expect("fake launchctl");
+    let path = format!("{}:/usr/bin:/bin", s.path("bin"));
+    // Whatever happens below, the broker the fake launchd started dies with
+    // the test.
+    struct Reap(String);
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            if let Some(pid) = std::fs::read_to_string(&self.0)
+                .ok()
+                .and_then(|p| p.trim().parse::<i32>().ok())
+            {
+                harness::kill(pid, 9);
+            }
+        }
+    }
+    let _reap = Reap(pidfile.clone());
+    let root = s.path("root");
+    let label = format!(
+        "systems.alab.astream-broker.{}",
+        aterm_link::enable::cksum(root.as_bytes())
+    );
+    let plist = s.root().join(format!("{label}.plist"));
+    let launch_agents = s.dir.join("home/Library/LaunchAgents");
+    let uid = String::from_utf8_lossy(&Command::new("id").arg("-u").output().expect("id").stdout)
+        .trim()
+        .to_string();
+
+    // ---- an UNMANAGED broker answers on the socket: refused, not bootstrapped over
+    let unmanaged = Broker::spawn(&s);
+    let unmanaged_pid = unmanaged.child.id();
+    let (code, out, err) = run(s
+        .fabric_cmd(&["on", "--service", "launchd"])
+        .env("PATH", &path));
+    assert_eq!(code, 1, "{out}\n{err}");
+    let broker_lines = step(&out, "broker");
+    assert!(
+        broker_lines.iter().any(|l| l.contains("FAILED")
+            && l.contains(&format!("an unmanaged broker (pid {unmanaged_pid})"))
+            && l.contains("on --service none")),
+        "the unmanaged broker must be named by pid, and the step must fail:\n{out}"
+    );
+    assert!(
+        !out.contains("pid 0"),
+        "no broker is ever claimed as pid 0:\n{out}"
+    );
+    let recorded = std::fs::read_to_string(&calls).unwrap_or_default();
+    assert!(
+        !recorded.contains("bootstrap") && !recorded.contains("bootout"),
+        "launchd must not be asked to start or stop anything over an unmanaged broker: {recorded}"
+    );
+    assert!(
+        !plist.exists(),
+        "no plist is written for a job that is not started"
+    );
+    assert!(!s.config().exists(), "the run stopped before the config");
+    // The same run, dry: the step is named as a failure and nothing is touched.
+    let (code, dry, _) = run(s
+        .fabric_cmd(&["on", "--service", "launchd", "--dry-run"])
+        .env("PATH", &path));
+    assert_eq!(code, 1, "{dry}");
+    assert!(
+        step(&dry, "broker")
+            .iter()
+            .any(|l| l.contains("FAILED") && l.contains("an unmanaged broker")),
+        "{dry}"
+    );
+    assert!(!plist.exists());
+    // The systemd arm refuses the same broker the same way: a fake `systemctl`
+    // that runs no such unit (`MainPID` 0) is asked only that (and whether a
+    // user manager answers), and no unit is written or (re)started over the
+    // broker that answers.
+    aterm_tempfile::stand_in(
+        &s.dir.join("bin/systemctl"),
+        "#!/bin/sh\n\
+         d=${0%/bin/systemctl}\n\
+         printf '%s\\n' \"$*\" >> \"$d/systemctl.calls\"\n\
+         case \"$*\" in\n\
+           '--user show-environment')\n\
+             if [ -f \"$d/no-manager\" ]; then\n\
+               echo 'Failed to connect to bus: No medium found' >&2\n\
+               exit 1\n\
+             fi ;;\n\
+           *' show '*) echo 0 ;;\n\
+         esac\n\
+         exit 0\n",
+    )
+    .expect("fake systemctl");
+    let systemd_calls = s.path("systemctl.calls");
+    let asked_only = |asked: &str| {
+        !asked.is_empty()
+            && asked
+                .lines()
+                .all(|l| l.starts_with("--user show ") || l == "--user show-environment")
+    };
+    let (code, out, err) = run(s
+        .fabric_cmd(&["on", "--service", "systemd"])
+        .env("PATH", &path));
+    assert_eq!(code, 1, "{out}\n{err}");
+    assert!(
+        step(&out, "broker").iter().any(|l| l.contains("FAILED")
+            && l.contains(&format!("an unmanaged broker (pid {unmanaged_pid})"))),
+        "systemd must refuse the unmanaged broker as launchd does:\n{out}"
+    );
+    let asked = std::fs::read_to_string(&systemd_calls).unwrap_or_default();
+    assert!(
+        asked_only(&asked),
+        "systemd must not be asked to start anything over an unmanaged broker: {asked}"
+    );
+    // With NO user manager (`su`, `sudo -u`): `MainPID` cannot be read, so a
+    // broker that answers may be the unit's own — the refusal names the
+    // missing manager, as launchd's names the missing domain, never
+    // "unmanaged".
+    let no_manager = s.dir.join("no-manager");
+    std::fs::write(&no_manager, "").expect("no-manager");
+    let _ = std::fs::remove_file(&systemd_calls);
+    let (code, out, err) = run(s
+        .fabric_cmd(&["on", "--service", "systemd"])
+        .env("PATH", &path));
+    assert_eq!(code, 1, "{out}\n{err}");
+    let broker = step(&out, "broker");
+    assert!(
+        broker
+            .iter()
+            .any(|l| l.contains("FAILED") && l.contains("no systemd user manager"))
+            && !broker.iter().any(|l| l.contains("an unmanaged broker")),
+        "a login with no user manager is refused by naming it:\n{out}"
+    );
+    let asked = std::fs::read_to_string(&systemd_calls).unwrap_or_default();
+    assert!(asked_only(&asked), "{asked}");
+    std::fs::remove_file(&no_manager).expect("no-manager");
+    assert!(
+        !s.dir
+            .join(format!("cfg/systemd/user/{label}.service"))
+            .exists(),
+        "no unit is written for a broker that is not started"
+    );
+    drop(unmanaged);
+    let _ = std::fs::remove_file(&calls);
+
+    // ---- NO SYSTEMD USER MANAGER: a readable MainPID result alone is not
+    // enough. With no broker answering and show-environment refused, both
+    // real and dry runs stop before writing a unit or asking it to start.
+    let no_manager = s.dir.join("no-manager");
+    std::fs::write(&no_manager, "").expect("no-manager");
+    for dry in [false, true] {
+        let _ = std::fs::remove_file(s.path("systemctl.calls"));
+        let mut args = vec!["on", "--service", "systemd"];
+        if dry {
+            args.push("--dry-run");
+        }
+        let (code, out, err) = run(s.fabric_cmd(&args).env("PATH", &path));
+        assert_eq!(code, 1, "{out}\n{err}");
+        assert!(
+            step(&out, "broker")
+                .iter()
+                .any(|l| l.contains("FAILED") && l.contains("no systemd user manager")),
+            "{out}"
+        );
+        assert!(
+            !s.dir
+                .join(format!("cfg/systemd/user/{label}.service"))
+                .exists(),
+            "a refused run wrote the unit"
+        );
+        assert!(!s.config().exists(), "a refused run wrote the config");
+        assert!(!s.rendezvous().exists(), "a refused run wrote rendezvous");
+        let asked = std::fs::read_to_string(s.path("systemctl.calls")).expect("systemctl calls");
+        assert!(
+            asked.lines().any(|l| l == "--user show-environment")
+                && asked
+                    .lines()
+                    .all(|l| l == "--user show-environment" || l.starts_with("--user show ")),
+            "systemd must only be probed, never reloaded, enabled or started: {asked}"
+        );
+    }
+    std::fs::remove_file(&no_manager).expect("no-manager");
+
+    // ---- NO GUI LOGIN (an SSH session with nobody at the console): launchd
+    // has no gui/<uid> domain, so the run is refused by naming it, before a
+    // plist is written.
+    let no_gui = s.dir.join("no-gui");
+    std::fs::write(&no_gui, "").expect("no-gui");
+    for dry in [false, true] {
+        let mut args = vec!["on", "--service", "launchd"];
+        if dry {
+            args.push("--dry-run");
+        }
+        let (code, out, err) = run(s.fabric_cmd(&args).env("PATH", &path));
+        assert_eq!(code, 1, "{out}\n{err}");
+        assert!(
+            step(&out, "broker")
+                .iter()
+                .any(|l| l.contains("FAILED") && l.contains(&format!("gui/{uid}"))),
+            "{out}"
+        );
+        assert!(!plist.exists(), "a refused run wrote the plist");
+        let recorded = std::fs::read_to_string(&calls).unwrap_or_default();
+        assert!(
+            !recorded.contains("bootstrap") && !recorded.contains("bootout"),
+            "{recorded}"
+        );
+    }
+    std::fs::remove_file(&no_gui).expect("no-gui");
+    let _ = std::fs::remove_file(&calls);
+
+    // ---- the install: bootstrap starts the broker, and `on` reads its pid
+    let (code, out, err) = run(s
+        .fabric_cmd(&["on", "--service", "launchd"])
+        .env("PATH", &path));
+    assert_eq!(code, 0, "{out}\n{err}");
+    let text = std::fs::read_to_string(&plist).expect("the plist was written inside the root");
+    assert!(
+        !launch_agents.exists(),
+        "a redirected root leaves nothing in $HOME/Library/LaunchAgents: {}",
+        launch_agents.display()
+    );
+    assert!(
+        text.contains(&format!("<key>Label</key><string>{label}</string>")),
+        "{text}"
+    );
+    // The broker's words, one <string> each — no shell, no quoting — and
+    // GUARDED by the root's secret.
+    assert!(
+        text.contains(&format!(
+            "<string>{BIN}</string>\n    <string>link</string>\n    <string>broker</string>\n    <string>{sock}</string>\n    \
+             <string>{root}/bus.log</string>\n    <string>--secret-file</string>\n    \
+             <string>{root}/mint.secret</string>",
+            sock = s.sock()
+        )),
+        "{text}"
+    );
+    assert!(
+        !text.contains("/bin/sh") && !text.contains("rm -f"),
+        "{text}"
+    );
+    assert!(text.contains("<key>KeepAlive</key><true/>"), "{text}");
+    let recorded = std::fs::read_to_string(&calls).expect("launchctl was called");
+    assert!(
+        recorded.contains(&format!("bootout gui/{uid}/{label}\n"))
+            && recorded.contains(&format!("bootstrap gui/{uid} {}\n", plist.display())),
+        "{recorded}"
+    );
+    assert!(
+        !recorded.contains("systems.alab.astream-broker\n")
+            && !recorded.contains("systems.alab.astream-broker.plist"),
+        "the live label must never be named: {recorded}"
+    );
+    let managed_pid = std::fs::read_to_string(&pidfile)
+        .expect("the fake launchd started the broker")
+        .trim()
+        .to_string();
+    assert!(
+        step(&out, "broker")
+            .iter()
+            .any(|l| l.contains("(not loaded)")),
+        "{out}"
+    );
+    assert!(
+        step(&out, "broker")
+            .iter()
+            .any(|l| l.contains(&format!("launchd {label} pid {managed_pid} answers on"))),
+        "the pid printed is launchd's own, never 0:\n{out}"
+    );
+
+    // ---- a second `on`: the plist is `already`, and so is the job, by its pid
+    std::fs::remove_file(&calls).expect("reset");
+    let (code, out, _) = run(s
+        .fabric_cmd(&["on", "--service", "launchd"])
+        .env("PATH", &path));
+    assert_eq!(code, 0, "{out}");
+    assert!(
+        step(&out, "plist").iter().any(|l| l.contains("already")),
+        "{out}"
+    );
+    assert!(
+        step(&out, "broker").iter().any(|l| l.contains("already")
+            && l.contains(&format!("launchd {label} pid {managed_pid} answers on"))),
+        "{out}"
+    );
+    let recorded = std::fs::read_to_string(&calls).expect("launchctl was called");
+    assert!(
+        !recorded.contains("bootstrap") && !recorded.contains("bootout"),
+        "a job that answers is left alone: {recorded}"
+    );
+
+    // ---- `off`: bootout and remove the plist; the broker is gone
+    std::fs::remove_file(&calls).expect("reset");
+    let (code, out, _) = run(s
+        .fabric_cmd(&["off", "--service", "launchd"])
+        .env("PATH", &path));
+    assert_eq!(code, 0, "{out}");
+    assert!(!plist.exists(), "off removes the plist");
+    assert!(
+        step(&out, "broker").iter().any(|l| l.contains("removed")),
+        "{out}"
+    );
+    let recorded = std::fs::read_to_string(&calls).expect("launchctl was called");
+    assert!(
+        recorded.contains(&format!("bootout gui/{uid}/{label}\n")),
+        "{recorded}"
+    );
+    assert!(
+        !Path::new(&pidfile).exists(),
+        "the fake launchd reaped the broker"
+    );
+    let pid: i32 = managed_pid.parse().expect("pid");
+    // A hang detector for the killed broker to go: it ends the moment it has.
+    let gone_by = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let gone = loop {
+        if !harness::alive(pid) {
+            break true;
+        }
+        if std::time::Instant::now() >= gone_by {
+            break false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    };
+    assert!(gone, "the managed broker {pid} must be dead after off");
+}
+
+/// **REFUSALS**: `--tcp --key-file` is refused by name BEFORE anything is
+/// written — in a default build naming the `sealed` feature, in a sealed one
+/// for a non-loopback bind without `--allow-remote` and for an ephemeral
+/// port — and a bad `--service` is a usage error.
+#[test]
+fn tcp_is_refused_by_name() {
+    let s = Scratch::new("usage");
+    let key = s.path("fleet.key");
+    if cfg!(feature = "sealed") {
+        let (code, _, err) = s.fabric(&["on", "--tcp", "0.0.0.0:7000", "--key-file", &key]);
+        assert_eq!(code, 2, "{err}");
+        assert!(
+            err.contains("not a loopback address") && err.contains("--allow-remote"),
+            "{err}"
+        );
+        let (code, _, err) = s.fabric(&["on", "--tcp", "127.0.0.1:0", "--key-file", &key]);
+        assert_eq!(code, 2, "{err}");
+        assert!(err.contains("fixed port, not 0"), "{err}");
+    } else {
+        let (code, _, err) = s.fabric(&["on", "--tcp", "127.0.0.1:7000", "--key-file", &key]);
+        assert_eq!(code, 2, "{err}");
+        assert!(
+            err.contains("the sealed TCP transport is not in this build")
+                && err.contains("`sealed` cargo feature"),
+            "{err}"
+        );
+    }
+    let (code, _, err) = s.fabric(&["on", "--tcp", "127.0.0.1:7000"]);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("--tcp needs --key-file"), "{err}");
+    assert!(
+        !s.root().join("link-state").exists() && !Path::new(&key).exists(),
+        "a refused flag provisioned something"
+    );
+    let (code, _, err) = s.fabric(&["on", "--service", "cron"]);
+    assert_eq!(code, 2);
+    assert!(
+        err.contains("--service cron: launchd, systemd or none"),
+        "{err}"
+    );
+    // `doctor` on a world with no fabric: exit 2 and the fix.
+    let (code, out, _) = s.fabric(&["doctor"]);
+    assert_eq!(code, 2, "{out}");
+    assert!(
+        out.contains("fabric is off") && out.contains("fix: `aterm fabric on`"),
+        "{out}"
+    );
+}
+
+/// An unreadable or invalid role is not a new one-host fabric. Even without
+/// the login's rendezvous file, the refusing command must leave the previous
+/// node and remotely issued cap untouched and mint no secret of its own.
+#[test]
+fn role_identity_unreadable_state_never_writes() {
+    let mut outcomes = Vec::new();
+    for bad in [
+        "config-toml",
+        "config-directory",
+        "bridge-flags",
+        "rendezvous",
+        "job",
+    ] {
+        let s = Scratch::new(&format!("role-bad-{bad}"));
+        std::fs::create_dir_all(s.root().join("link-state")).expect("state");
+        let node = b"n-00000000000000aa\n";
+        let cap = b"the cap issued by the other host\n";
+        std::fs::write(s.root().join("link-state/node"), node).expect("node");
+        std::fs::write(s.root().join("node.cap"), cap).expect("cap");
+        match bad {
+            "config-toml" => std::fs::write(s.config(), "[fabric]\ncommand = [\n").unwrap(),
+            "config-directory" => std::fs::create_dir(s.config()).unwrap(),
+            "bridge-flags" => std::fs::write(
+                s.config(),
+                format!("[fabric]\ncommand = \"{BIN} link serve --fleet work --tcp\"\n"),
+            )
+            .unwrap(),
+            "rendezvous" => {
+                std::fs::create_dir_all(s.rendezvous().parent().unwrap()).unwrap();
+                std::fs::write(s.rendezvous(), "fleet = [\n").unwrap();
+            }
+            "job" => {
+                let label = format!(
+                    "systems.alab.astream-broker.{}",
+                    aterm_link::enable::cksum(s.path("root").as_bytes())
+                );
+                std::fs::write(
+                    s.root().join(format!("{label}.plist")),
+                    "<plist><dict></dict></plist>",
+                )
+                .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let (dry, dry_out, dry_err) = s.fabric(&["on", "--service", "none", "--dry-run"]);
+        let (real, out, err) = s.fabric(&["on", "--service", "none"]);
+        let unchanged = std::fs::read(s.root().join("node.cap")).unwrap() == cap
+            && std::fs::read(s.root().join("link-state/node")).unwrap() == node
+            && !s.root().join("mint.secret").exists();
+        outcomes.push((
+            bad,
+            dry,
+            real,
+            unchanged,
+            format!("{dry_out}{dry_err}{out}{err}"),
+        ));
+    }
+    for (bad, dry, real, unchanged, output) in outcomes {
+        assert!(
+            unchanged,
+            "{bad}: uncertain role changed the identity:\n{output}"
+        );
+        assert_eq!(
+            (dry, real),
+            (2, 2),
+            "{bad}: uncertain role was not refused before writes:\n{output}"
+        );
+    }
+}
+
+/// Repairing a missing cap must keep the fleet named by the existing bridge
+/// command. The broker is real: it checks the newly minted grants before the
+/// command and rendezvous are replaced. No GUI or session is needed.
+#[test]
+fn role_identity_reapplication_preserves_the_nondefault_fleet() {
+    let s = Scratch::new("role-fleet");
+    let _broker = Broker::spawn(&s);
+    let (code, out, err) = s.fabric(&["on", "--fleet", "work", "--service", "none"]);
+    assert_eq!(code, 0, "initial fleet:\n{out}{err}");
+    let node = std::fs::read(s.root().join("link-state/node")).unwrap();
+    let secret = std::fs::read(s.root().join("mint.secret")).unwrap();
+    std::fs::remove_file(s.root().join("node.cap")).expect("simulate a missing cap");
+    let (_, report, _) = s.fabric(&["doctor"]);
+    let remedies: Vec<_> = report
+        .split('`')
+        .filter(|c| c.starts_with("aterm fabric on"))
+        .collect();
+    let (code, out, err) = s.fabric(&["on", "--service", "none"]);
+    assert_eq!(code, 0, "reapply fleet:\n{out}{err}");
+    let command =
+        aterm_link::fabric::command_in_toml(&std::fs::read_to_string(s.config()).unwrap())
+            .unwrap()
+            .unwrap();
+    let flags = aterm_link::fabric::serve_flags(&command).unwrap();
+    assert!(
+        flags.windows(2).any(|w| w == ["--fleet", "work"]),
+        "{command}"
+    );
+    let rendezvous =
+        aterm_link::enable::Rendezvous::parse(&std::fs::read_to_string(s.rendezvous()).unwrap())
+            .unwrap();
+    assert_eq!(rendezvous.fleet, "work");
+    let caps = aterm_link::bridge::read_cap_file(&s.path("root/node.cap")).unwrap();
+    assert_eq!(caps.len(), 8);
+    assert!(
+        caps.iter().all(|c| c.grant.contains(":/f/work/")),
+        "{caps:?}"
+    );
+    assert_eq!(
+        std::fs::read(s.root().join("link-state/node")).unwrap(),
+        node
+    );
+    assert_eq!(std::fs::read(s.root().join("mint.secret")).unwrap(), secret);
+    assert!(!remedies.is_empty(), "missing-cap remedy:\n{report}");
+    for remedy in remedies {
+        assert!(
+            remedy
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .windows(2)
+                .any(|w| w == ["--fleet", "work"]),
+            "the repair changes fleet: {remedy}"
+        );
+    }
+}
+
+/// Naming a different fleet is a deliberate departure, so `off` must precede
+/// it. The old root's identity and configured command remain byte-identical.
+#[test]
+fn role_identity_conflicting_fleet_is_refused_before_writes() {
+    let s = Scratch::new("role-conflict");
+    let _broker = Broker::spawn(&s);
+    let (code, out, err) = s.fabric(&["on", "--fleet", "work", "--service", "none"]);
+    assert_eq!(code, 0, "initial fleet:\n{out}{err}");
+    let paths = [
+        s.config(),
+        s.rendezvous(),
+        s.root().join("node.cap"),
+        s.root().join("link-state/node"),
+        s.root().join("mint.secret"),
+    ];
+    let before: Vec<_> = paths
+        .iter()
+        .map(std::fs::read)
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let (code, out, err) = s.fabric(&["on", "--fleet", "other", "--service", "none"]);
+    let after: Vec<_> = paths
+        .iter()
+        .map(std::fs::read)
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        after, before,
+        "a conflicting fleet changed the root:\n{out}{err}"
+    );
+    assert_eq!(
+        code, 2,
+        "the conflicting fleet was not refused up front:\n{out}{err}"
+    );
+}
+
+/// **A BARE `on` RE-APPLIES THE ROOT AS IT IS** — doctor's remedy for a
+/// broker that does not answer, so it must not change which fleet the host is
+/// on. On a root whose installed job serves the sealed wire, a bare `on` keeps
+/// it (the broker it would run still serves `--tcp`; a default build refuses
+/// it by name rather than drop the listener every joined host dials), and a
+/// Unix job is the control: no `--tcp`. On a root whose `[fabric] command`
+/// JOINED another host's broker, `on` is refused before anything is written.
+#[test]
+fn a_bare_on_keeps_the_served_wire_and_refuses_a_joined_root() {
+    let s = Scratch::new("role");
+    let root = s.path("root");
+    let label = format!(
+        "systems.alab.astream-broker.{}",
+        aterm_link::enable::cksum(root.as_bytes())
+    );
+    let plist = s.root().join(format!("{label}.plist"));
+    let key = s.path("fleet.key");
+    let job = |argv: &[&str]| {
+        let words: String = argv
+            .iter()
+            .map(|w| format!("<string>{w}</string>"))
+            .collect();
+        std::fs::write(
+            &plist,
+            format!(
+                "<plist version=\"1.0\"><dict><key>Label</key><string>{label}</string>\
+                 <key>ProgramArguments</key><array>{words}</array></dict></plist>\n"
+            ),
+        )
+        .expect("plist");
+    };
+    let secret = s.path("root/mint.secret");
+    let log = s.path("root/bus.log");
+    // ---- the control: a Unix job, and the bare `on` runs the Unix broker
+    job(&[
+        BIN,
+        "link",
+        "broker",
+        &s.sock(),
+        &log,
+        "--secret-file",
+        &secret,
+    ]);
+    let (code, out, err) = s.fabric(&["on", "--service", "none", "--dry-run"]);
+    assert_eq!(code, 1, "no broker answers:\n{out}{err}");
+    let unix = format!("{BIN} link broker {} {log}", s.sock());
+    assert!(
+        step(&out, "broker").iter().any(|l| l.contains(&unix)) && !out.contains("--tcp"),
+        "{out}"
+    );
+    // ---- a job that serves the sealed wire: kept
+    job(&[
+        BIN,
+        "link",
+        "broker",
+        "--tcp",
+        "127.0.0.1:7999",
+        "--key-file",
+        &key,
+        "--secret-file",
+        &secret,
+        "--unix",
+        &s.sock(),
+        &log,
+    ]);
+    let (code, out, err) = s.fabric(&["on", "--service", "none", "--dry-run"]);
+    if cfg!(feature = "sealed") {
+        assert_eq!(code, 1, "no broker answers:\n{out}{err}");
+        let sealed = format!("{BIN} link broker --tcp 127.0.0.1:7999 --key-file {key} ");
+        assert!(
+            step(&out, "broker").iter().any(|l| l.contains(&sealed)),
+            "a bare `on` dropped the job's sealed wire:\n{out}"
+        );
+    } else {
+        assert_eq!(code, 2, "{out}{err}");
+        assert!(
+            err.contains("`sealed` cargo feature") && err.contains(&plist.display().to_string()),
+            "{err}"
+        );
+        assert!(!s.root().join("link-state").exists(), "{out}");
+    }
+    std::fs::remove_file(&plist).expect("plist");
+
+    // ---- a JOINED root: refused, nothing written
+    let joined = format!(
+        "[fabric]\ncommand = \"{BIN} link serve --fleet local --broker 127.0.0.1:7999 --tcp \
+         --key-file {root}/fleet.key --cap-file {root}/node.cap --state {root}/link-state \
+         --accept-from n-00000000000000bb,n-00000000000000aa\"\n"
+    );
+    std::fs::write(s.config(), &joined).expect("config");
+    for args in [
+        &["on", "--service", "none"][..],
+        &["on", "--service", "none", "--dry-run"][..],
+    ] {
+        let (code, out, err) = s.fabric(args);
+        assert_eq!(code, 2, "{args:?}: a joined root ran `on`:\n{out}{err}");
+        assert!(err.contains("127.0.0.1:7999"), "{err}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(s.config()).expect("config"),
+        joined,
+        "the joined host's command was rewritten"
+    );
+    for absent in ["link-state", "mint.secret", "node.cap"] {
+        assert!(
+            !s.root().join(absent).exists(),
+            "a refused `on` wrote {absent}"
+        );
+    }
+    assert!(
+        !s.rendezvous().exists(),
+        "a refused `on` wrote the rendezvous file"
+    );
+}
+
+/// **`doctor` NAMES THE FIX** for each warning: a config pointing at a socket
+/// nobody serves is a warning with the broker fix under it, and the missing
+/// rendezvous file is the one check `status` does not make.
+#[test]
+fn doctor_puts_a_fix_under_every_warning() {
+    let s = Scratch::new("doctor");
+    std::fs::create_dir_all(s.root().join("link-state")).expect("state");
+    std::fs::write(s.root().join("link-state/node"), "n-00000000000000aa\n").expect("node");
+    std::fs::write(
+        s.root().join("node.cap"),
+        format!("ro:/f/local/> {}\n", "ab".repeat(32)),
+    )
+    .expect("cap");
+    std::fs::write(
+        s.config(),
+        format!(
+            "[fabric]\ncommand = \"{BIN} link serve --fleet local --broker {} --cap-file {} --state {}\"\n",
+            s.sock(),
+            s.path("root/node.cap"),
+            s.path("root/link-state")
+        ),
+    )
+    .expect("config");
+    let (code, out, _) = s.fabric(&["doctor"]);
+    assert_eq!(code, 1, "{out}");
+    let lines: Vec<&str> = out.lines().collect();
+    let broker = lines
+        .iter()
+        .position(|l| l.contains("does not answer"))
+        .expect("the dead broker is a warning");
+    assert!(
+        lines[broker + 1]
+            .trim_start()
+            .starts_with("fix: start the broker: `aterm fabric on`"),
+        "{out}"
+    );
+    let rendezvous = lines
+        .iter()
+        .position(|l| l.contains("no rendezvous file"))
+        .expect("the missing rendezvous file is a warning");
+    assert!(
+        lines[rendezvous + 1]
+            .trim_start()
+            .starts_with("fix: `aterm fabric on` writes it"),
+        "{out}"
+    );
+    // Every `!` line has a `fix:` under it.
+    for (i, l) in lines.iter().enumerate() {
+        if l.trim_start().starts_with("! ") {
+            assert!(
+                lines
+                    .get(i + 1)
+                    .is_some_and(|f| f.trim_start().starts_with("fix: ")),
+                "no fix under: {l}\n{out}"
+            );
+        }
+    }
+}
+
+/// Wait for `@<sid> status` to read `hold=<want>`. A hang detector (the
+/// latency is printed as a measurement, never bounded), so the harness's minute.
+fn until_hold(gui: &Gui, sid: &str, want: u8) -> std::time::Duration {
+    let started = std::time::Instant::now();
+    loop {
+        let status = gui.verb(&format!("@{sid} status"));
+        if status.header().contains(&format!(" hold={want} ")) {
+            return started.elapsed();
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(60),
+            "the bridge never made the session hold={want}: {}",
+            status.header()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// **A PERSON HALTS THE FLEET AND WITHDRAWS IT, AND `off` NAMES EVERY SESSION
+/// THE FLEET HOLDS.** On the guarded broker `on` deploys, with the commands a
+/// person runs: `mint-for h-review` (a default build), `halt`, and `halt off`.
+/// The bridge holds the session; the Owner's `hold <sid> off` is `ERR denied:
+/// only the fleet sets or lifts a fleet hold`; node.cap is no person's and
+/// cannot halt; `off` — dry and real — stops the one thing that could ever lift
+/// it, so it names the session, says it is held, and says what lifts it; and
+/// the person's `halt off` is what does.
+#[test]
+fn review_off_names_a_session_the_fleet_holds() {
+    let s = Scratch::new("held");
+    let broker = Broker::spawn(&s);
+    let gui = Gui::boot(&s);
+    let sid = gui.boot_session();
+    let (code, out, err) = s.fabric(&["on", "--service", "none"]);
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+
+    // THE PERSON'S CAP, minted on this host (it holds the mint secret).
+    let cap = s.path("h-review.cap");
+    let (code, out, err) = s.fabric(&["mint-for", "h-review", "--out", &cap]);
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert_eq!(harness::mode_of(Path::new(&cap)), 0o600);
+    assert!(
+        out.contains(&format!("aterm fabric halt --cap-file {cap} off")),
+        "mint-for names the commands the person runs:\n{out}"
+    );
+    // node.cap is the NODE's: it names no person, so it halts nothing.
+    let (code, _, err) = s.fabric(&["halt", "--cap-file", &s.path("root/node.cap"), "nope"]);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("holds no person's grant"), "{err}");
+    // An `a-` service's cap is a person's but no human's: every bridge
+    // applies a human's halt row alone, so it is refused one, not told the
+    // fleet is held.
+    let svc = s.path("a-svc.cap");
+    let (code, out, err) = s.fabric(&["mint-for", "a-svc", "--out", &svc]);
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(!out.contains("aterm fabric halt"), "{out}");
+    let (code, out, err) = s.fabric(&["halt", "--cap-file", &svc, "nope"]);
+    assert_eq!(code, 2, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(!out.contains("halt is ON"), "{out}");
+
+    // A PERSON HALTS THE FLEET.
+    let (code, out, err) = s.fabric(&["halt", "--cap-file", &cap, "review", "halt"]);
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(out.contains("h-review's halt is ON at @"), "{out}");
+    eprintln!(
+        "MEASURED fleet halt -> status hold=1: {} ms",
+        until_hold(&gui, &sid, 1).as_millis()
+    );
+    let denied = gui.verb(&format!("hold {sid} off"));
+    assert_eq!(
+        denied.header().trim(),
+        "ERR denied: only the fleet sets or lifts a fleet hold",
+        "a fleet hold is not the Owner's to lift"
+    );
+    let named_held = |args: &[&str]| {
+        let (code, out, err) = s.fabric(args);
+        assert_eq!(code, 0, "{args:?}:\n{out}\n{err}");
+        let held = step(&out, "held");
+        assert!(
+            held.iter().any(|l| l.contains("WARNING")
+                && l.contains(&format!("@{sid}"))
+                && l.contains("HELD")
+                && l.contains("hold=1")
+                && l.contains("origin=fleet")
+                && l.contains("off does not lift it")
+                && l.contains("relaunch instance")
+                && l.contains("aterm fabric halt --cap-file")
+                && !l.contains("aterm link")
+                && !l.contains(&format!("@{sid} hold off"))),
+            "{args:?} must name the held session and what lifts it:\n{out}"
+        );
+    };
+    named_held(&["off", "--service", "none", "--dry-run"]);
+
+    // THE PERSON WITHDRAWS IT, and that is the lift.
+    let (code, out, err) = s.fabric(&["halt", "--cap-file", &cap, "off"]);
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(out.contains("h-review's halt is OFF at @"), "{out}");
+    until_hold(&gui, &sid, 0);
+
+    // Halted again, `off` for real names it — and lifts nothing.
+    let (code, out, err) = s.fabric(&["halt", "--cap-file", &cap, "review", "halt"]);
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    until_hold(&gui, &sid, 1);
+    named_held(&["off", "--service", "none"]);
+    let status = gui.verb(&format!("@{sid} status"));
+    assert!(status.header().contains(" hold=1 "), "{}", status.header());
+    drop(gui);
+    drop(broker);
+}
+
+/// **A PERSON READS AN ASK AND ANSWERS IT, AS A HUMAN.** An agent's `post
+/// to=h-review kind=ask` lands on the person's mail lane; `inbox` with the
+/// person's cap prints it with its answer spelled out and marks it read (a
+/// second `inbox` has nothing new); the `post … kind=answer re=<off>` it names
+/// reaches the asking session as an ANSWER from `h-review`, `trust=human` —
+/// the reply is from the principal the ask went to.
+#[test]
+fn a_person_reads_an_ask_and_answers_it_as_a_human() {
+    let s = Scratch::new("person");
+    let broker = Broker::spawn(&s);
+    let gui = Gui::boot(&s);
+    let sid = gui.boot_session();
+    let (code, out, err) = s.fabric(&["on", "--service", "none"]);
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    let node = std::fs::read_to_string(s.root().join("link-state/node"))
+        .expect("node")
+        .trim()
+        .to_string();
+    let cap = s.path("h-review.cap");
+    let (code, out, err) = s.fabric(&["mint-for", "h-review", "--out", &cap]);
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+
+    let asked = gui.verb(&format!(
+        "@{sid} post to=h-review kind=ask dl=600000 is main green?"
+    ));
+    assert!(asked.ok(), "{}", asked.header());
+    let off = kv(asked.header(), "off")
+        .expect("an ask answers its offset")
+        .to_string();
+
+    let (code, out, err) = s.fabric(&["inbox", "--cap-file", &cap]);
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    let row = out
+        .lines()
+        .find(|l| l.starts_with(&format!("@{off} ")))
+        .unwrap_or_else(|| panic!("the ask @{off} is not in the person's inbox:\n{out}\n{err}"));
+    assert!(
+        row.contains(" ask ") && row.contains(&format!("from={sid}@{node}")),
+        "{row}"
+    );
+    let answer =
+        format!("aterm fabric post --cap-file {cap} to=@{sid}@{node} kind=answer re={off} <text>");
+    assert!(out.contains(&answer), "inbox spells the answer:\n{out}");
+    let (code, out, err) = s.fabric(&["inbox", "--cap-file", &cap]);
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        !out.contains(&format!("@{off} ")) && err.contains("no new mail"),
+        "the first inbox marked it read:\n{out}\n{err}"
+    );
+
+    let to = format!("to=@{sid}@{node}");
+    let re = format!("re={off}");
+    let (code, out, err) = s.fabric(&[
+        "post",
+        "--cap-file",
+        &cap,
+        &to,
+        "kind=answer",
+        &re,
+        "yes,",
+        "green",
+    ]);
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    let got = harness::until("the person's answer in the asker's inbox", || {
+        gui.verb(&format!("@{sid} inbox --peek"))
+            .rows()
+            .iter()
+            .find(|r| kv(r, "kind") == Some("answer") && kv(r, "re") == Some(off.as_str()))
+            .cloned()
+    });
+    assert!(
+        kv(&got, "trust") == Some("human") && got.contains("from=h-review"),
+        "{got}"
+    );
+    drop(gui);
+    drop(broker);
+}
+
+/// **A LOCAL HOLD IS NAMED WITH THE VERB THAT LIFTS IT.** The Owner's own
+/// `hold <sid> on` is `origin=local`, and the Owner's `hold <sid> off` lifts
+/// it: `off` says exactly that, in the spelling the catalog accepts.
+#[test]
+fn off_names_the_verb_that_lifts_a_local_hold() {
+    let s = Scratch::new("held-local");
+    let gui = Gui::boot(&s);
+    let sid = gui.boot_session();
+    let pid = gui.child.id();
+    let on = gui.verb(&format!("hold {sid} on reason=local%20test"));
+    assert!(on.ok(), "{}", on.header());
+    let (code, out, err) = s.fabric(&["off", "--service", "none", "--dry-run"]);
+    assert_eq!(code, 0, "{out}\n{err}");
+    let held = step(&out, "held");
+    assert!(
+        held.iter().any(|l| l.contains("WARNING")
+            && l.contains(&format!("@{sid} (instance {pid}) is HELD"))
+            && l.contains("origin=local")
+            && l.contains(&format!("`aterm ctl --pid {pid} hold {sid} off` does"))
+            && !l.contains("relaunch")),
+        "{out}"
+    );
+    // The verb it names is the one that lifts it.
+    let off = gui.verb(&format!("hold {sid} off"));
+    assert!(off.ok(), "{}", off.header());
+    let status = gui.verb(&format!("@{sid} status"));
+    assert!(status.header().contains(" hold=0 "), "{}", status.header());
+}
+
+/// **`off` ACTS ON THE ROOT THE FABRIC IS ON.** `on` under root A writes
+/// `[fabric] command` dialing A's socket; `off` under a different
+/// `$ATERM_FABRIC_HOME` (or none) must not resolve root B from the environment
+/// and leave A's `KeepAlive` broker running. `off` follows the config's
+/// `--broker` to A, says so in its header,
+/// and every line names A; with the config gone, the rendezvous file; with
+/// both gone, the environment.
+#[test]
+fn review_off_acts_on_the_root_the_config_names() {
+    let s = Scratch::new("offroot");
+    let broker = Broker::spawn(&s);
+    let (code, out, err) = s.fabric(&["on", "--service", "none"]);
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    let root_a = s.path("root");
+    let root_b = s.path("rootB");
+    std::fs::create_dir_all(&root_b).expect("root B");
+    let node = std::fs::read_to_string(s.root().join("link-state/node"))
+        .expect("node id")
+        .trim()
+        .to_string();
+
+    // Under B's environment, and under none: the config's root, A.
+    for env in [Some(root_b.as_str()), None] {
+        let mut cmd = s.fabric_cmd(&["off", "--service", "none", "--dry-run"]);
+        match env {
+            Some(b) => {
+                cmd.env("ATERM_FABRIC_HOME", b);
+            }
+            None => {
+                cmd.env_remove("ATERM_FABRIC_HOME");
+            }
+        }
+        let (code, out, err) = run(&mut cmd);
+        assert_eq!(code, 0, "{env:?}:\n{out}\n{err}");
+        assert!(
+            out.starts_with(&format!(
+                "aterm fabric off — root {root_a} (from [fabric] command)"
+            )),
+            "{env:?}: the header names the config's root:\n{out}"
+        );
+        assert!(
+            out.contains(&format!("{root_a}/bus.log stays"))
+                && out.contains(&format!("{root_a}: node id {node}")),
+            "{env:?}: every line names A:\n{out}"
+        );
+        assert!(!out.contains(&root_b), "{env:?}: B is never named:\n{out}");
+    }
+    // The config's table gone: the rendezvous file's root, still A.
+    std::fs::write(s.config(), "font_px = 12.0\n").expect("drop the table");
+    let (code, out, _) = run(s
+        .fabric_cmd(&["off", "--service", "none", "--dry-run"])
+        .env("ATERM_FABRIC_HOME", &root_b));
+    assert_eq!(code, 0, "{out}");
+    assert!(
+        out.starts_with(&format!(
+            "aterm fabric off — root {root_a} (from the rendezvous file)"
+        )),
+        "{out}"
+    );
+    // Both gone: the environment decides, and the header says so.
+    std::fs::remove_file(s.rendezvous()).expect("drop the rendezvous file");
+    let (code, out, _) = run(s
+        .fabric_cmd(&["off", "--service", "none", "--dry-run"])
+        .env("ATERM_FABRIC_HOME", &root_b));
+    assert_eq!(code, 0, "{out}");
+    assert!(
+        out.starts_with(&format!(
+            "aterm fabric off — root {root_b} (from the environment)"
+        )),
+        "{out}"
+    );
+    drop(broker);
+}

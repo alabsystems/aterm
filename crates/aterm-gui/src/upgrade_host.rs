@@ -1,53 +1,35 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE WINDOW'S SIDE OF THE LIVE AGENT UPGRADE — what the owner SEES of it
-//! (gap audit 2026-09-24). The harness host's thread (`harness_host`, whose
-//! per-session workers take the upgrade's steps, over the harness's
-//! `upgrade_drive::View`) hands the window the upgrade rows of this
-//! instance's tabs whenever they change (`Wake::AgentUpgrade`); this module
-//! turns them into what the owner reads:
+//! The window's side of the live agent upgrade: what the owner sees of it. The harness
+//! host's thread (`harness_host`, whose per-session workers take the upgrade's steps over
+//! `upgrade_drive::View`) hands the window the upgrade rows of this instance's tabs when
+//! they change (`Wake::AgentUpgrade`); this module turns them into:
 //!
-//! * each tab's `upgrade=` column on `status` and `sessions`/`ls` (the rows go
-//!   on the session timelines, which both verbs read);
-//! * ONE RECORD while sessions wait — "Codex 0.158.0 installs itself in tab
-//!   1" · worded by what holds it: "nothing to do: it starts on its own at a
-//!   quiet moment in the tab, and from 2:15 PM as soon as it is idle and
-//!   nobody has typed there for 20 seconds" where only the ladder's comfort
-//!   does, else the floor that stands and when it moves (one session; "…
-//!   installs itself in 2 tabs" for several) — on Settings ▸ Messages and
-//!   `appstatus`, never a row and never a tab mark: waiting for its moment is
-//!   the upgrade working, the longer the less it waits (the ladder, the
-//!   owner's decision of 2026-09-28, ruling 380), and the band carries only
-//!   what the person acts on (ruling e83d7d233);
-//! * a ROW per STALLED tab (it was refused, stopped the same way round after
-//!   round, runs where typing into the tab cannot reach, waits on what no
-//!   rung passes — `blocked:*` — or is six hours behind: four past the
-//!   ladder's last rung), which leaves when the stall ends — the tab itself
-//!   carries `meta attention owner=upgrade`, raised by the host thread
-//!   through the control socket; ONE ROW FOR AN AGENT'S OVERDUE TABS once
-//!   two or more would each take one (ruling 363: three were the band's
-//!   whole height), each tab's own entry then a record;
-//! * a RECORD per finished move, with the model the resumed session answered
-//!   on (`restart_outcome`), which until that day only the ledger's JSONL held;
-//! * THE OWNER'S WORD without a shell (gap #21): the stalled row's capsules,
-//!   the waiting record's (one session), and the tab menu's AGENT UPGRADE
-//!   section press `Upgrade now` / `Not today` / `Skip version`, written off
-//!   the winit thread through `upgrade_drive::ask_for` — the CLI's path, for
-//!   the build the row or item named ([`WordWriter`], [`App::apply_upgrade_word`]);
-//! * the managed-current record's counts ([`App::tabs_behind`]): "installed",
-//!   not "up to date", while sessions lag, and never the hook to type into a
-//!   tab whose foreground is an agent.
+//! * each tab's `upgrade=` column on `status` and `sessions`/`ls` (via the session
+//!   timelines both verbs read);
+//! * one record while sessions wait ("Codex 0.158.0 installs itself in tab 1", worded by
+//!   what holds it) on Settings ▸ Messages and `appstatus`, never a row or a tab mark:
+//!   waiting for its moment is the upgrade working;
+//! * one entry per stalled tab (refused, stopped the same way round after round, out of
+//!   typing's reach, `blocked:*` on what no rung passes, or hours behind): a record,
+//!   except for the one interrupt, an agent the upgrade ended and could not bring back,
+//!   which takes a band row and the tab's `meta attention owner=upgrade` mark (raised by
+//!   the host thread) until the stall ends. Waits only the owner can end are also lines
+//!   of the exceptions digest;
+//! * a record per finished move, with the model the resumed session answered on
+//!   (`restart_outcome`);
+//! * the owner's word without a shell: the stalled row's capsules, the waiting record's
+//!   (one session) and the tab menu's agent-upgrade section press `Upgrade now` /
+//!   `Not today` / `Skip version`, written off the winit thread through
+//!   `upgrade_drive::ask_for`, the CLI's path ([`WordWriter`], [`App::apply_upgrade_word`]);
+//! * the managed-current record's counts ([`App::tabs_behind`]): "installed", not "up to
+//!   date", while sessions lag, and never the hook to type into a tab whose foreground is
+//!   an agent.
 //!
-//! Every row here is one the host VETTED (review of 2026-09-25,
-//! `upgrade_drive::Row::standing`): a conversation still live, in its tab, on
-//! a build older than its target. A state file for a conversation that ended
-//! or was moved by hand is not handed over, so nothing here shows or counts it.
-//!
-//! Measured that day, before any of it: two sessions one and two releases
-//! behind for 8h22m, `aterm ctl messages` with no harness record, both tabs
-//! `attention=-`, and the one related record saying "Claude Code 2.1.282 …
-//! up to date" and naming the atpkg hook for a tab whose foreground was Claude.
+//! Every row here is one the host vetted (`upgrade_drive::Row::standing`): a conversation
+//! still live, in its tab, on a build older than its target. A conversation that ended or
+//! was moved by hand is not handed over, so nothing here shows or counts it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -70,9 +52,9 @@ pub(crate) fn now_s() -> u64 {
 /// its own, and an upgrade still behind is shown again when it does.
 pub(crate) const NOT_TODAY_S: u64 = 24 * 3_600;
 
-/// ONE WORD THE OWNER PRESSED on a tab's agent upgrade — a band capsule, a
-/// Settings ▸ Messages button, a tab-menu item ([`Intent::AgentUpgrade`]):
-/// the tab, the build the row or item was drawn for, and the word.
+/// One word the owner pressed on a tab's agent upgrade (a band capsule, a Settings ▸
+/// Messages button, a tab-menu item: [`Intent::AgentUpgrade`]): the tab, the build the row
+/// or item was drawn for, and the word.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct WordAsk {
     /// The tab the agent runs in (`s-<hex>`).
@@ -95,13 +77,11 @@ impl WordAsk {
     }
 }
 
-/// WHAT WRITES THE OWNER'S WORD: `upgrade_drive::ask_for` over the harness
-/// state under the user's home — the CLI's own path, under the sweep lock
-/// it takes — in production ([`live_word_writer`]); a refusal where this
-/// window has no harness state, and in a test's `App` unless the test gives
-/// it another (the injected-field shape AGENTS.md asks of every probe a
-/// headless `App` can reach). It can wait on the lock (a step restarting a
-/// session holds it), so it is only ever called off the winit thread
+/// What writes the owner's word: in production `upgrade_drive::ask_for` over the harness
+/// state under the user's home, the CLI's own path under its sweep lock
+/// ([`live_word_writer`]); a refusal where this window has no harness state, and in a
+/// test's `App` unless the test injects another. It can wait on the lock (a step
+/// restarting a session holds it), so it is only called off the winit thread
 /// ([`App::send_upgrade_word`]).
 #[derive(Clone)]
 pub(crate) struct WordWriter(Arc<WriteFn>);
@@ -135,14 +115,12 @@ impl std::fmt::Debug for WordWriter {
     }
 }
 
-/// THE OWNER'S WORDS, WRITTEN OFF THE WINIT THREAD ONE AT A TIME, IN THE
-/// ORDER PRESSED ([`App::send_upgrade_word`]): one thread, started at the
-/// first press, takes them from a channel. A word can wait up to 10 s on the
-/// sweep lock, and the row gives no sign meanwhile, so a second press comes
-/// while the first waits; each word replaces the last, so the last pressed
-/// must be the last written — a thread per press raced them for the lock.
-/// The thread ends when the view drops its sender; one that died (a panic
-/// in the writer) is started again at the next press.
+/// The owner's words, written off the winit thread one at a time in the order pressed
+/// ([`App::send_upgrade_word`]): one thread, started at the first press, takes them from a
+/// channel. A word can wait up to 10 s on the sweep lock with no sign on the row, so a
+/// second press can come while the first waits; each word replaces the last, so the last
+/// pressed must be the last written. The thread ends when the view drops its sender; one
+/// that died (a panic in the writer) is started again at the next press.
 #[derive(Debug, Default)]
 pub(crate) struct WordQueue {
     /// The writing thread's inbox, once it is started.
@@ -218,21 +196,20 @@ pub(crate) fn word_writer_at(home: PathBuf, state: PathBuf, sock: Option<String>
             // are (`Row::quiet`): `[harness] upgrade_ask` as parsed.
             ask: crate::harness_host::upgrade_ask(),
             several_logins: crate::harness_host::several_logins(),
+            // A word is written: no line is typed.
+            usage_tap: None,
             instances: upgrade_drive::Instances::Machine,
+            agents_off: Vec::new(),
         };
         upgrade_drive::ask_for(&opts, &ask.tab, ask.ask(), &ask.to)
     })
 }
 
-/// The host's last rows `shown` with a pressed word's answer `row` laid in
-/// over its tab's, each judged again at `now` (`Row::reread`: the awake clock
-/// as it stands, the host's own grace kept) — `None` when the tab has no row
-/// there (only in place: the host's own rows may have landed first). The rows
-/// the host read are served late here, at a press: judged with the clock they
-/// were read with, rows carried over a night's sleep read `unwatched`, and
-/// every other owed tab was posted "aterm itself has stopped checking it" at
-/// the owner's first press after the wake, before the host's first look (the
-/// review of 2026-09-30).
+/// The host's last rows `shown` with a pressed word's answer `row` laid in over its tab's,
+/// each judged again at `now` (`Row::reread`: the awake clock as it stands, the host's
+/// grace kept); `None` when the tab has no row there (the host's own rows may have landed
+/// first). The rows are served late, at a press: judged with the clock they were read
+/// with, rows carried over a night's sleep would read `unwatched`.
 fn laid_in(shown: &[Row], row: Row, now: u64) -> Option<Vec<Row>> {
     let mut rows = shown.to_vec();
     let at = rows.iter().position(|r| r.tab == row.tab)?;
@@ -247,7 +224,7 @@ fn laid_in(shown: &[Row], row: Row, now: u64) -> Option<Vec<Row>> {
     Some(rows)
 }
 
-/// One stalled tab's band row.
+/// One stalled tab's entry: a band row, or a record.
 #[derive(Debug)]
 struct StallRow {
     /// The row.
@@ -268,15 +245,13 @@ struct StallRow {
     /// Whether its words name a person at the tab (`Row::person_seen`): a
     /// flip is restated in place, the stall and its buttons unchanged.
     person: bool,
-    /// How long its tab has been behind, in the words it last said
-    /// (`Row::age_said`: `6 h`, `7 h`; `None` for every stall whose words
-    /// carry no age — only an `overdue` row's do): a standing row says the
-    /// new age in place as it grows, never a new row.
+    /// How long its tab has been behind, in the words it last said (`Row::age_said`, e.g.
+    /// `6 h`; only an `overdue` row's words carry one): a standing row restates a grown age
+    /// in place, never as a new row.
     behind: Option<String>,
     /// Where its words last said its tab is ([`message_reporters::UpgradeSpot`]'s
-    /// `place`: `in tab 2`, `in window 2, tab 1`): the look after its tab
-    /// moved, or a window opened or closed beside it, restates the row that
-    /// stands in place (ruling 440).
+    /// `place`: `in tab 2`, `in window 2, tab 1`): when the tab moves, or a window opens or
+    /// closes beside it, the standing row is restated in place.
     place: String,
 }
 
@@ -290,11 +265,10 @@ fn stuck(said: &str) -> bool {
 /// it offers.
 type WaitingSaid = (String, Vec<String>, Vec<Intent>);
 
-/// A stalled tab's own entry, at `spot`
-/// ([`message_reporters::agent_upgrade_stalled_at`]: the row that stands
-/// takes the owner to its tab): its row — or, where it stands in its agent's
-/// one row (`said` ends [`GROUPED`]), a RECORD with the same words and
-/// buttons, which Settings ▸ Messages keeps and the band does not show twice.
+/// A stalled tab's own entry, at `spot` ([`message_reporters::agent_upgrade_stalled_at`]):
+/// its row, or, where it stands in its agent's one row (`said` ends [`GROUPED`]), a record
+/// with the same words and buttons, which Settings ▸ Messages keeps and the band does not
+/// show twice.
 fn stall_entry(
     row: &Row,
     said: &str,
@@ -309,9 +283,9 @@ fn stall_entry(
     }
 }
 
-/// A stall's `said` shape for a tab that stands in its agent's ONE ROW
-/// ([`App::post_upgrade_groups`]): its own entry is then a record, and the row
-/// is the agent's.
+/// A stall's `said` shape for a tab that stands in its agent's one row
+/// ([`App::post_upgrade_groups`]): its own entry is then a record, and the row is the
+/// agent's.
 const GROUPED: &str = "/grouped";
 
 /// A stall's `said` shape for a tab a word pressed on its agent's one row is
@@ -324,13 +298,10 @@ fn in_agents_row(said: &str) -> bool {
     said.ends_with(GROUPED) || said.ends_with(PRESSED)
 }
 
-/// Whether `fresh` is `posted`'s SAME STALL, only moved into its agent's one
-/// row or between that row's shapes (`/row` → [`GROUPED`], [`GROUPED`] ⇄
-/// [`PRESSED`]) — never out of it (round 35, D2: each such move withdrew the
-/// tab's entry and recorded the same `⚠ Claude upgrade waits in tab N` again,
-/// 8 copies a tab in 13 minutes and `Problems · 24 of 33` for two upgrades).
-/// The entry is kept: a row leaves the band, withdrawn, its record the tab's
-/// one entry; a record stays as it is.
+/// Whether `fresh` is `posted`'s same stall, only moved into its agent's one row or between
+/// that row's shapes (`/row` → [`GROUPED`], [`GROUPED`] ⇄ [`PRESSED`]), never out of it.
+/// The entry is kept rather than withdrawn and recorded again: a row leaves the band,
+/// withdrawn, its record the tab's one entry; a record stays as it is.
 fn regrouped(posted: &str, fresh: &str) -> bool {
     let bare = |said: &str| -> Option<String> {
         [GROUPED, PRESSED, "/row"]
@@ -341,25 +312,20 @@ fn regrouped(posted: &str, fresh: &str) -> bool {
     fresh != posted && in_agents_row(fresh) && bare(fresh).is_some() && bare(fresh) == bare(posted)
 }
 
-/// Which way a stall's entry changed SHAPE ([`reshaped`]).
+/// Which way a stall's entry changed shape ([`reshaped`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Reshape {
-    /// A row whose upgrade asks on its own again: a record from here.
+    /// A row whose stall no longer needs the glass: a record from here.
     ToRecord,
-    /// A record whose upgrade needs the glass: the move clock ran out, or a
-    /// person's hold stood a whole re-ask — on a row of its own, or on its
-    /// agent's one row ([`GROUPED`], round 44).
+    /// A record whose stall now needs the glass (an interrupt): on a row of its own, or on
+    /// its agent's one row ([`GROUPED`]).
     ToRow,
 }
 
-/// Whether `fresh` is `posted`'s SAME STALL AND TARGET in the other shape —
-/// `/row` ⇄ `/record` (ruling 279: the shape is part of what was said) — and
-/// which way (review of 8899c91b4: each flip withdrew the entry and posted
-/// another, so one waiting upgrade was several entries: its record kept
-/// `behind for 23 h` for good beside the row the move clock raised at 24 h,
-/// and a draft that stood, passed and stood again made four). One entry:
-/// [`App::post_upgrade_stalls`] turns a row into its own record in place,
-/// and replaces a record by the row it posts.
+/// Whether `fresh` is `posted`'s same stall and target in the other shape (`/row` ⇄
+/// `/record`; the shape is part of what was said), and which way. One entry, not a new one
+/// per flip: [`App::post_upgrade_stalls`] turns a row into its own record in place, and
+/// replaces a record by the row it posts.
 fn reshaped(posted: &str, fresh: &str) -> Option<Reshape> {
     let flip = |from: &str, to: &str, way: Reshape| {
         let (was, is) = (posted.strip_suffix(from)?, fresh.strip_suffix(to)?);
@@ -367,9 +333,8 @@ fn reshaped(posted: &str, fresh: &str) -> Option<Reshape> {
     };
     flip("/row", "/record", Reshape::ToRecord)
         .or_else(|| flip("/record", "/row", Reshape::ToRow))
-        // A record whose move clock ran out straight into its agent's row
-        // (round 44): replaced by the tab's entry there, as by its own row —
-        // it kept `behind for 23 h` for good beside a second entry.
+        // A record straight into its agent's row: replaced by the tab's entry there, as
+        // by its own row.
         .or_else(|| flip("/record", GROUPED, Reshape::ToRow))
 }
 
@@ -384,7 +349,7 @@ fn aged(line: &str, age: &str) -> Option<String> {
     })
 }
 
-/// AN AGENT'S ONE ROW FOR ITS STALLED TABS ([`App::post_upgrade_groups`]).
+/// An agent's one row for its stalled tabs ([`App::post_upgrade_groups`]).
 #[derive(Debug)]
 struct GroupRow {
     /// The row — or, when the owner put it down before this process, its
@@ -399,14 +364,12 @@ struct GroupRow {
     /// The tabs it stands for now, each with the build it is stalled on its
     /// way to.
     members: BTreeMap<String, String>,
-    /// The STALLS ([`message_reporters::agent_upgrade_group_member`]: a tab
-    /// and its target) of a row the owner read or dismissed — in this
-    /// process, or before it, read back from the row's record, or from each
-    /// tab's own row seen through (`seen_through`): nothing is posted again
-    /// while every stall is among them. A stall that is not — a tab that
-    /// joins, a tab whose target moved on (the review of 2026-09-28: tabs
-    /// alone let a dismissed row for 2.1.284 hide the same tabs stalled on
-    /// 2.1.285 for good) — is news, and posts.
+    /// The stalls (each a tab and its target,
+    /// [`message_reporters::agent_upgrade_group_member`]) of a row the owner read or
+    /// dismissed, in this process or before it (read back from the row's record, or from
+    /// each tab's own row seen through, `seen_through`): nothing is posted again while
+    /// every stall is among them. A stall that is not (a tab that joins, or one whose
+    /// target moved on) is news, and posts.
     seen: Option<BTreeSet<String>>,
 }
 
@@ -426,14 +389,12 @@ fn stalls_of(members: &BTreeMap<String, String>) -> BTreeSet<String> {
         .collect()
 }
 
-/// A WORD PRESSED ON AN AGENT'S ONE ROW, on its way to each tab it was sent
-/// for ([`App::send_upgrade_group_word`]). The entry pressed is answered once
-/// every word has landed and at least one was written — never before (the
-/// review of 2026-09-28: the row was answered first, and a lock another sweep
-/// held refused each tab's word in turn, an error row each, under a row
-/// answered as if it had worked) — and the refusals are said on it, never a
-/// row per tab. Meanwhile the row stands as pressed ([`App::post_upgrade_groups`]
-/// leaves it alone).
+/// A word pressed on an agent's one row, on its way to each tab it was sent for
+/// ([`App::send_upgrade_group_word`]). The entry pressed is answered once every word has
+/// landed and at least one was written, never before (a lock held by another sweep can
+/// refuse each tab's word in turn under a row already answered as if it had worked), and
+/// the refusals are said on it, never a row per tab. Meanwhile the row stands as pressed
+/// ([`App::post_upgrade_groups`] leaves it alone).
 #[derive(Debug)]
 struct GroupPress {
     /// The entry pressed: the agent's row, or a record of one (Settings ▸
@@ -473,11 +434,10 @@ const PRESS_BOUND: std::time::Duration = std::time::Duration::from_secs(300);
 /// still not read the word by then is believed.
 const WORD_LAG: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// One word written ([`UpgradeView::worded`]): the row it came back with,
-/// when it landed, and the phase it was pressed on when the word itself
-/// moved the phase — a Defer or Skip ends an announcement (`Pending`), and
-/// `--now` re-arms a round that gave up — which a host row read before the
-/// word still carries (round 44).
+/// One word written ([`UpgradeView::worded`]): the row it came back with, when it landed,
+/// and the phase it was pressed on when the word itself moved the phase (a Defer or Skip
+/// ends an announcement, `--now` re-arms a round that gave up), which a host row read
+/// before the word still carries.
 type Worded = (Row, std::time::Instant, Option<Phase>);
 
 /// What the window last did with the host's rows.
@@ -485,19 +445,17 @@ type Worded = (Row, std::time::Instant, Option<Phase>);
 pub(crate) struct UpgradeView {
     /// The rows the host last handed over (this instance's live tabs).
     rows: Vec<Row>,
-    /// The waiting records written for what waits now — each (title,
-    /// detail, words), and whether a FLOOR held it rather than the ladder's
-    /// comfort ([`Row::waits_for_comfort`]) — so a wait is one record per
-    /// sentence, not one per change of some other row, and not one per flip
-    /// of what holds it between looks. Cleared once nothing waits.
+    /// The waiting records written for what waits now (title, detail, words), and whether a
+    /// floor held it rather than the ladder's comfort ([`Row::waits_for_comfort`]), so a
+    /// wait is one record per sentence, not one per change of some other row or per flip of
+    /// what holds it between looks. Cleared once nothing waits.
     waiting_said: Vec<(WaitingSaid, bool)>,
     /// Each stalled tab's row, and what it was posted for: a new reason or
     /// target is a new row, the same one is never posted again — not after
     /// the person read it either.
     stalled: BTreeMap<String, StallRow>,
-    /// Each agent's ONE ROW for its stalled tabs, by its key
-    /// ([`message_reporters::agent_upgrade_group_key`],
-    /// [`App::post_upgrade_groups`]).
+    /// Each agent's one row for its stalled tabs, by its key
+    /// ([`message_reporters::agent_upgrade_group_key`], [`App::post_upgrade_groups`]).
     groups: BTreeMap<String, GroupRow>,
     /// The tabs a word pressed on an agent's one row was sent for, until that
     /// tab's word lands ([`App::send_upgrade_group_word`]): their stall is a
@@ -507,11 +465,9 @@ pub(crate) struct UpgradeView {
     /// The words pressed on agents' rows that are still landing
     /// ([`GroupPress`]).
     presses: Vec<GroupPress>,
-    /// THE OWNER'S WORDS WRITTEN, by tab: the row each word came back with,
-    /// when, and the phase the word was pressed on where the word itself
-    /// moved it ([`UpgradeView::words_landed`]). The host's rows that were
-    /// read before a word was written take its request, so they never
-    /// undo it on the glass for a moment (round 35, D1).
+    /// The owner's words written, by tab: the row each came back with, when, and the phase
+    /// it was pressed on where the word moved it ([`UpgradeView::words_landed`]), so host
+    /// rows read before a word was written never undo it on the glass.
     worded: BTreeMap<String, Worded>,
     /// The finished moves already recorded, by (conversation, when).
     done_said: BTreeSet<(String, u64)>,
@@ -534,16 +490,15 @@ pub(crate) struct UpgradeView {
     /// changes.
     menus: Vec<(String, crate::session_chrome::UpgradeMenu)>,
     revision: u64,
-    /// How many times THIS view asked the host to look again
-    /// ([`UpgradeView::look_again`]): the host's own count is process-wide,
-    /// and parallel tests bump it too.
+    /// How many times this view asked the host to look again ([`UpgradeView::look_again`]):
+    /// the host's own count is process-wide, and parallel tests bump it too.
     #[cfg(test)]
     looks_asked: u64,
 }
 
 impl UpgradeView {
-    /// What the view shows is stale (a press refused because its round
-    /// stopped, D22): ask the host to look again at its next wake.
+    /// What the view shows is stale (a press refused because its round stopped): ask the
+    /// host to look again at its next wake.
     fn look_again(&mut self) {
         #[cfg(test)]
         {
@@ -552,9 +507,9 @@ impl UpgradeView {
         crate::harness_host::look_at_upgrades_soon();
     }
 
-    /// A WORD WRITTEN, FROM ITS OWN ROW ([`Self::worded`]), and the phase
-    /// the view's row for its tab had when it was pressed, where the word
-    /// moved it: the view's rows take the word's only after this.
+    /// A word written, from its own row ([`Self::worded`]), and the phase the view's row
+    /// for its tab had when it was pressed, where the word moved it: the view's rows take
+    /// the word's only after this.
     fn word_landed(&mut self, row: &Row) {
         if row.request_at != 0 {
             let pressed_on = self
@@ -570,30 +525,18 @@ impl UpgradeView {
         }
     }
 
-    /// THE HOST'S ROWS, WITH THE OWNER'S WORDS THEY WERE READ TOO SOON TO
-    /// CARRY (round 35, D1). The host reads the upgrades off the winit thread
-    /// and hands them over as `Wake::AgentUpgrade`; a word is written off it
-    /// too, one tab at a time. A summary read after one tab's word and before
-    /// the next reached the window after every word had landed and the row
-    /// pressed was answered, and read the later tabs overdue again: their
-    /// agent's row was posted afresh — `Claude upgrade waits in 2 tabs`,
-    /// drawn for about 60 ms, withdrawn at the next summary (2 presses of 2).
-    /// A host row for the same conversation, target and phase whose word is
-    /// OLDER than the one written (`request_at`) takes the written word, and
-    /// only that: every other fact is the host's, fresher than the word's
-    /// row. The phase the word was PRESSED ON counts as the word's own
-    /// (round 44): a `Not today` on an announced round is written `Pending`,
-    /// and a summary read before it still says `Announced` — with the phase
-    /// alone, the entry was dropped and the agent's row came back, with an
-    /// `asks again` right after `Not today`. A row that carries the word or
-    /// a newer one, moved on (another target, another phase, another
-    /// conversation), or a tab gone, ends the
-    /// entry — the host hands its rows over in the order it read them, so
-    /// none after one that carries the word is older than it (a deferral
-    /// that runs out is the host's to say); so does [`WORD_LAG`], past which
-    /// the host is trusted as it reads. Only the host's rows
-    /// ([`App::apply_host_upgrades`]): the window's own re-application of its
-    /// rows as each word lands carries the words already.
+    /// The host's rows, with the owner's words they were read too soon to carry. The host
+    /// reads the upgrades and a word is written, both off the winit thread, so a summary
+    /// read between two tabs' words can arrive after every word landed and read the later
+    /// tabs overdue again. A host row for the same conversation, target and phase (or the
+    /// phase the word was pressed on, which counts as the word's own: a `Not today` on an
+    /// announced round is written `Pending`) whose word is older than the one written
+    /// (`request_at`) takes the written word, and only that; every other fact is the host's.
+    /// A row that carries the word or a newer one, has moved on (another target, phase or
+    /// conversation), or a tab gone, ends the entry: the host hands rows over in the order it
+    /// read them, so none after one carrying the word is older. So does [`WORD_LAG`]. Only
+    /// for the host's rows ([`App::apply_host_upgrades`]): the window's own re-application
+    /// as each word lands carries the words already.
     fn words_landed(&mut self, rows: &mut [Row]) {
         self.worded.retain(|tab, (word, at, pressed_on)| {
             at.elapsed() < WORD_LAG
@@ -645,10 +588,9 @@ impl UpgradeView {
         self.rows.iter().find(|r| r.tab == tab)
     }
 
-    /// Tab `tab`'s AGENT UPGRADE menu section (gap #21): what the upgrade
-    /// moves and every word that does something for it
-    /// ([`message_reporters::agent_upgrade_words`]); `None` with no row or
-    /// no such word.
+    /// Tab `tab`'s agent-upgrade menu section: what the upgrade moves and every word that
+    /// does something for it ([`message_reporters::agent_upgrade_words`]); `None` with no
+    /// row or no such word.
     pub(crate) fn menu_for(
         &self,
         tab: &str,
@@ -674,10 +616,9 @@ fn menu_of(row: &Row, now: u64) -> Option<crate::session_chrome::UpgradeMenu> {
     })
 }
 
-/// Whether the owner SAW a stalled row THROUGH (`upgrade_host`'s
-/// once-only rule, the owner's report of 2026-09-27): read — its hold folded
-/// — or dismissed. Any other end (resolved, withdrawn, answered, unseen,
-/// evicted, recorded) is not.
+/// Whether the owner saw a stalled row through (the once-only rule): read (its hold
+/// folded) or dismissed. Any other end (resolved, withdrawn, answered, unseen, evicted,
+/// recorded) is not.
 fn seen_through(record: &aterm_messages::LogRecord) -> bool {
     matches!(
         record.retired(),
@@ -700,12 +641,10 @@ impl App {
     pub(crate) fn apply_agent_upgrades(&mut self, rows: Vec<Row>) {
         let now = now_s();
         let before = self.tabs_behind();
-        // Each tab's `upgrade=`, on the timeline both verbs read — and its
-        // note for the person there, which the Claude Code footer leads with
-        // while the move waits only on them (`Row::pause_note`; the owner,
-        // 2026-09-30). A note that moved is a frame owed: the row changes at
-        // every look of an attended wait, its note only when what it says
-        // does.
+        // Each tab's `upgrade=`, on the timeline both verbs read, and its note for the
+        // person there, which the Claude Code footer leads with while the move waits only
+        // on them (`Row::pause_note`). A changed note owes a frame: the row changes at
+        // every look of an attended wait, its note only when what it says does.
         let snapshot = self
             .store
             .read()
@@ -740,9 +679,8 @@ impl App {
             let place = self.upgrade_place(&row.tab);
             self.record_message(message_reporters::agent_upgrade_done(row, &place));
         }
-        // Each tab's AGENT UPGRADE menu section: a change re-keys the tab
-        // chrome's cache and hands every window's strip its menus again, so
-        // a right-click offers the words for the build the band names.
+        // Each tab's agent-upgrade menu section: a change re-keys the tab chrome's cache
+        // and hands every window's strip its menus again.
         let menus: Vec<(String, crate::session_chrome::UpgradeMenu)> = rows
             .iter()
             .filter_map(|r| Some((r.tab.clone(), menu_of(r, now)?)))
@@ -761,18 +699,14 @@ impl App {
         }
     }
 
-    /// A TAB-MENU UPGRADE ROW WAS CHOSEN (gap #21) — the in-grid card's
-    /// activation, or the macOS strip's `NSMenu` relay
-    /// (`Wake::TabMenuUpgrade`): the word, for the session `sid` and the
-    /// build `to` the menu showed. The tab the menu popped on is re-resolved
-    /// by its STABLE id and must still run `sid` in one of its panes (the
-    /// `TabMenuAction` rule: a tab that closed meanwhile drops the word,
-    /// never lands it on whatever sits in the slot now) — and the word is
-    /// for `sid` itself, never the pane focused NOW: a split tab's menu is
-    /// composed for the focused pane, the focus can move before the choice
-    /// lands, and two panes' agents commonly move to the same build, where
-    /// the harness's target check cannot tell them apart. Written as a band
-    /// capsule's is ([`Self::send_upgrade_word`]); what it did is recorded.
+    /// A tab-menu upgrade row was chosen (the in-grid card's activation, or the macOS
+    /// strip's `NSMenu` relay, `Wake::TabMenuUpgrade`): the word, for session `sid` and the
+    /// build `to` the menu showed. The tab is re-resolved by its stable id and must still
+    /// run `sid` in one of its panes (the `TabMenuAction` rule: a tab that closed meanwhile
+    /// drops the word). The word is for `sid` itself, never the pane focused now: focus can
+    /// move before the choice lands, and two panes' agents often move to the same build,
+    /// which the harness's target check cannot tell apart. Written as a band capsule's is
+    /// ([`Self::send_upgrade_word`]).
     pub(crate) fn dispatch_tab_menu_upgrade(
         &mut self,
         window: crate::WindowId,
@@ -807,16 +741,12 @@ impl App {
         let _ = self.send_upgrade_word(WordAsk { tab: sid, to, word });
     }
 
-    /// The waiting record: recorded when its words change, never a row — and
-    /// STABLE ACROSS LOOKS (the second review of 2026-09-28): a sentence
-    /// already said is never recorded again, and once a floor's sentence is
-    /// said for an upgrade (a goal, a draft, a turn it cannot place …), the
-    /// ladder's comfort (`nothing to do: …`) does not replace it — for as
-    /// long as anything waits: the memory clears once nothing does (the move,
-    /// or a stall, of the one tab waiting). A person near
-    /// a goal-mode tab reads `attended` at one look and `goal` at the next
-    /// (the gate asks the person first): each flip was a new, contradicting
-    /// record.
+    /// The waiting record: recorded when its words change, never a row, and stable across
+    /// looks. A sentence already said is never recorded again, and once a floor's sentence
+    /// is said for an upgrade (a goal, a draft, a turn it cannot place …), the ladder's
+    /// comfort (`nothing to do: …`) does not replace it while anything waits (a person near
+    /// a goal-mode tab can read `attended` at one look and `goal` at the next). The memory
+    /// clears once nothing waits.
     fn record_upgrade_waiting(&mut self, rows: &[Row], now: u64) {
         let waiting: Vec<&Row> = rows
             .iter()
@@ -824,22 +754,20 @@ impl App {
                 matches!(r.phase, Phase::Pending | Phase::Announced { .. })
                     && r.moving(now)
                     && r.stall(now).is_none()
-                    // A session the owner hurried is its word's record
-                    // already (`Claude moves at its next pause`, the row the
-                    // press answered): round 18, day four, D7 — one `Upgrade
-                    // now` press logged a second record (`… ready for 1
-                    // session` then) that named no tab.
+                    // A session the owner hurried is its word's record already
+                    // (`Claude moves at its next pause`, the row the press answered).
                     && r.request != Request::Now
             })
             .collect();
         let versions: Vec<&str> = waiting.iter().map(|r| r.to.as_str()).collect();
-        // One agent's sessions are named by it; a mix names both products.
-        let product = match waiting.first() {
-            Some(first) if waiting.iter().all(|r| r.agent == first.agent) => first.agent.product(),
-            _ => "Claude Code and Codex",
-        };
-        // ONE session: titled by its tab, with the clock time the ladder
-        // stops waiting for comfort (the owner's decision of 2026-09-28).
+        // One agent's sessions are named by it; a mix names each product, in
+        // name order.
+        let mut products: Vec<&str> = waiting.iter().map(|r| r.agent.product()).collect();
+        products.sort_unstable();
+        products.dedup();
+        let product = products.join(" and ");
+        // One session: titled by its tab, with the clock time the ladder stops waiting for
+        // comfort.
         let one = match waiting.as_slice() {
             [only] if !only.tab.is_empty() => {
                 let place = self.upgrade_place(&only.tab);
@@ -848,15 +776,14 @@ impl App {
             _ => None,
         };
         let Some(mut msg) =
-            one.or_else(|| message_reporters::agent_upgrade_waiting(product, &versions))
+            one.or_else(|| message_reporters::agent_upgrade_waiting(&product, &versions))
         else {
             self.upgrade_view.waiting_said.clear();
             return;
         };
-        // ONE session waiting: the record carries the owner's words for it
-        // (`Upgrade now`, `Not today`), which Settings ▸ Messages offers for
-        // as long as that upgrade stands ([`UpgradeView::offers`]). Several:
-        // no one tab is the record's, so none — each tab's menu has its own.
+        // One session waiting: the record carries the owner's words for it (`Upgrade now`,
+        // `Not today`), offered on Settings ▸ Messages while that upgrade stands
+        // ([`UpgradeView::offers`]). Several: no one tab is the record's, so none.
         if let [only] = waiting.as_slice() {
             for intent in message_reporters::agent_upgrade_capsules(only, now) {
                 msg = msg.action(intent);
@@ -879,28 +806,19 @@ impl App {
         self.record_message(msg);
     }
 
-    /// THE ROW THIS STALL ALREADY HAS, from before this process (the owner's
-    /// report of 2026-09-27: after an update the window posted the stalls of
-    /// two tabs afresh, the owner's view of them gone with the process that
-    /// had kept it): a row under the stall's key still on the band — carried
-    /// across the handoff — or, off it, the latest record under that key, when
-    /// it is THE SAME STALL ([`message_reporters::same_stall`]) and the
-    /// owner saw it through: read (its hold folded) or dismissed.
-    /// A RECORD (a stall that asks again on its own, rulings 279 and 283, or
-    /// a tab in its agent's row: never on the band, so never read through,
-    /// and recorded whenever its entry changes) is the earlier process's
-    /// record of the same stall, if any ([`Self::stall_already_recorded`]).
-    /// `None`: nothing of the kind; a stall that ENDED since — its row resolved, or, down already,
-    /// its end recorded ([`Self::record_stall_over`]) — so the same words
-    /// coming back are news; one whose row was withdrawn (its shape or words
-    /// changed, ruling 279); one the owner ANSWERED with a word (`Upgrade
-    /// now`, `Not today`: [`Self::apply_upgrade_word`]), which moves or holds
-    /// the upgrade, so the same stall back is the word having not moved it —
-    /// news too; or one the owner never finished with: never shown (unseen,
-    /// evicted), or still up, unread, when the last process stopped, quit or
-    /// handed off (review of 2026-09-27: a Standing row "stays until the stall
-    /// ends … or the person reads it", so such a row comes back to the band
-    /// once — a carry this process seeded is live, and kept by the first arm).
+    /// The row this stall already has from before this process (whose view of it went with
+    /// the process that kept it): a row under the stall's key still on the band (carried
+    /// across the handoff), or, off it, the latest record under that key when it is the
+    /// same stall ([`message_reporters::same_stall`]) and the owner saw it through (read or
+    /// dismissed). A record-shaped entry (a stall that asks again on its own, or a tab in
+    /// its agent's row) is matched by [`Self::stall_already_recorded`] instead.
+    ///
+    /// `None` for nothing of the kind, and for an earlier entry that does not count: a stall
+    /// that ended since (its row resolved, or its end recorded, [`Self::record_stall_over`]),
+    /// so the same words back are news; a row withdrawn (its shape or words changed); one
+    /// the owner answered with a word ([`Self::apply_upgrade_word`]), so the same stall back
+    /// is the word not having moved it; or one the owner never finished with (unseen,
+    /// evicted, or still up unread when the last process ended), which comes back once.
     fn stall_already_shown(&self, msg: &aterm_messages::Message) -> Option<MessageId> {
         let key = msg.key.as_deref()?;
         if msg.hold == aterm_messages::Hold::LogOnly {
@@ -919,16 +837,13 @@ impl App {
             .then_some(record.id)
     }
 
-    /// THE RECORD THIS STALL ALREADY HAS FROM BEFORE THIS PROCESS (round 44):
-    /// a tab standing in its agent's row, or one whose upgrade asks on its
-    /// own, has a RECORD for its entry, and every restart or update handoff
-    /// recorded it again — one more `⚠` in Problems per grouped tab per
-    /// process, the churn ruling 375 removed within one. The latest record
-    /// under the stall's key is adopted when an earlier process wrote it
-    /// (this one retired nothing of it), it is a record still, in the same
-    /// mark — the entry's shape (ruling 279) — and it is THE SAME STALL
-    /// ([`message_reporters::same_stall`]). This process's own records are
-    /// never adopted: within it a changed entry is recorded anew, as before.
+    /// The record this stall already has from before this process: a tab in its agent's
+    /// row, or one whose upgrade asks on its own, has a record for its entry, which each
+    /// restart or update handoff would otherwise record again. The latest record under the
+    /// stall's key is adopted when an earlier process wrote it (this one retired nothing of
+    /// it), it is still a record of the same severity (the entry's shape), and it is the
+    /// same stall ([`message_reporters::same_stall`]). This process's own records are never
+    /// adopted: within it a changed entry is recorded anew.
     fn stall_already_recorded(
         &self,
         key: &str,
@@ -947,28 +862,20 @@ impl App {
         .then_some(record.id)
     }
 
-    /// THE END OF A STALL WHOSE ROW IS DOWN ALREADY (review of 2026-09-27):
-    /// `posted`'s row was read or dismissed before the stall ended, so there
-    /// is no live row to resolve, and the log's last word under its key would
-    /// stay the person's read — and the same stall, back, would be taken for
-    /// the row already seen ([`Self::stall_already_shown`]) and never shown.
-    /// A record under the row's key says the stall ended
-    /// ([`message_reporters::agent_upgrade_stall_over`]). Nothing when the
-    /// log no longer holds the row (nothing there to take it for), nor for
-    /// an entry the owner did not see through — a record, a row withdrawn,
-    /// unseen or evicted — which nothing takes a returning stall for.
+    /// The end of a stall whose row is down already: `posted`'s row was read or dismissed
+    /// before the stall ended, so there is no live row to resolve, and the same stall back
+    /// would be taken for the row already seen ([`Self::stall_already_shown`]) and never
+    /// shown. A record under the row's key says the stall ended
+    /// ([`message_reporters::agent_upgrade_stall_over`]). Nothing when the log no longer
+    /// holds the row, for an entry the owner did not see through (withdrawn, unseen,
+    /// evicted, or a record outside its agent's row), or when a record came under the key
+    /// after the row (the owner's tab-menu word, which a returning stall is read against).
+    /// `end`: what became of the upgrade (its round asks again, its stuck restart moves
+    /// again, or its tab left), and so what the record says.
     ///
-    /// Nor when a record came under the key after the row (ruling 307): the
-    /// owner's word from the tab menu is recorded there already, and it — not
-    /// the stall — is what a returning stall is read against. `end`: what
-    /// became of the upgrade — its round asks again, its stuck restart moves
-    /// again (ruling 327), or its tab left — and so what the record says.
-    ///
-    /// A TAB THAT STOOD IN ITS AGENT'S ONE ROW (round 35, D3): its entry is a
-    /// record ([`in_agents_row`]), never on the band to be seen through, and
-    /// the row's own end is the agent's — so without its end here the tab's
-    /// `⚠ Claude upgrade waits in tab N` stood in the log with nothing after
-    /// it, of a tab that had moved or whose conversation had ended.
+    /// A tab that stood in its agent's one row has a record for its entry
+    /// ([`in_agents_row`]), never on the band to be seen through, so it ends here too, or
+    /// its `⚠ Claude upgrade waits in tab N` would stand in the log with nothing after it.
     fn record_stall_over(
         &mut self,
         posted: &StallRow,
@@ -1003,14 +910,12 @@ impl App {
         ));
     }
 
-    /// ATERM'S OWN FAULTS IN THE UPGRADE, told once each (owner rules,
-    /// 2026-09-28): a wait aterm does not classify, a notice its screen keeps
-    /// refusing, a record no look has visited, a relaunched agent that never
-    /// idles, a record with no progress in a day. ONE Warn record and ONE
-    /// `aterm.log` line per fault, for the owner to read later as the developer
-    /// — the Problems filter of the messages page — and nothing on the glass, on
-    /// the tab or in the digest: there is nothing to do about them. A fault that
-    /// ends is forgotten, so its return is news.
+    /// Aterm's own faults in the upgrade, told once each: a wait aterm does not classify, a
+    /// notice its screen keeps refusing, a record no look has visited, a relaunched agent
+    /// that never idles, a record with no progress in a day. One Warn record (the messages
+    /// page's Problems filter) and one `aterm.log` line per fault, and nothing on the glass,
+    /// the tab or the digest: there is nothing to do about them. A fault that ends is
+    /// forgotten, so its return is news.
     fn note_upgrade_faults(&mut self, rows: &[Row], now: u64) {
         use aterm_agent::harness::upgrade_drive::Attention;
         let faults: BTreeMap<String, (&Row, aterm_agent::harness::upgrade_drive::Need)> = rows
@@ -1034,17 +939,14 @@ impl App {
         }
     }
 
-    /// THE UPGRADE'S EXCEPTIONS (owner rules, 2026-09-28): the rows the
-    /// classifier calls a `Digest` ([`upgrade_drive::Row::attention`]) reach
-    /// the exceptions digest — "To look at" — as ONE dismissable line per kind
-    /// of wait, never a band row, a tab mark, a menu-bar row or a
-    /// notification. The family's WHOLE answer at every look this host takes
-    /// (the rows change, or a horizon passes and the host is handed them
-    /// again — [`upgrade_drive::Row::next_attention_at`]): a wait that ended,
-    /// or a tab that left, ends its line ten minutes after the look that
-    /// stopped naming it, at the digest's own clock, so no second look is
-    /// needed ([`App::except_replace`]). The upgrade's host fact — it cannot
-    /// use its state folder — is an EVENT of [`Family::UpgradeHost`], never
+    /// The upgrade's exceptions: rows the classifier calls a `Digest`
+    /// ([`upgrade_drive::Row::attention`]) reach the exceptions digest ("To look at") as one
+    /// dismissable line per kind of wait, never a band row, tab mark, menu-bar row or
+    /// notification. This is the family's whole answer at every look the host takes (the
+    /// rows change, or a horizon passes, [`upgrade_drive::Row::next_attention_at`]): a wait
+    /// that ended, or a tab that left, ends its line ten minutes after the look that stopped
+    /// naming it, at the digest's own clock ([`App::except_replace`]). The upgrade's host
+    /// fact (it cannot use its state folder) is an event of [`Family::UpgradeHost`], never
     /// part of this pass.
     ///
     /// [`Family::UpgradeHost`]: aterm_messages::exceptions::Family::UpgradeHost
@@ -1057,14 +959,12 @@ impl App {
         self.except_replace(aterm_messages::exceptions::Family::Upgrade, &entries);
     }
 
-    /// Whether the stall `posted` stands for is now `fresh`, the same stall
-    /// and target IN THE OTHER SHAPE ([`reshaped`]) — only while its entry
-    /// is what that shape turns: a row still on the glass (one the owner put
-    /// down is not raised for it, and changes as any stall said otherwise
-    /// does), a record still a record; and never under a stuck restart's
-    /// words. A stall that asks on its own while the owner's `Upgrade now`
-    /// stands keeps its answer on the glass (`agent_upgrade_stalled`: calm,
-    /// but a row), so it turns no row into a record.
+    /// Whether the stall `posted` stands for is now `fresh`, the same stall and target in
+    /// the other shape ([`reshaped`]), only while its entry is what that shape turns: a row
+    /// still on the glass (one the owner put down is not raised for it), a record still a
+    /// record, and never under a stuck restart's words. A stall that asks on its own while
+    /// the owner's `Upgrade now` stands keeps its answer on the glass
+    /// (`agent_upgrade_stalled`: calm, but a row), so it turns no row into a record.
     fn entry_reshaped(
         &self,
         posted: &StallRow,
@@ -1092,16 +992,10 @@ impl App {
         fits.then_some(way)
     }
 
-    /// A stall's RECORD re-worded in place ([`App::reword_record`]) — in
-    /// `msg`'s words where they were drawn for the capsules the record
-    /// keeps; otherwise ONLY ITS AGE moves (review of 8899c91b4: a record
-    /// written while its own work held it, `Not today` and `Skip version`,
-    /// re-worded at its round's give-up to `Upgrade now asks it at its next
-    /// pause; Skip This Version in the tab's menu …` — a button it does not
-    /// have, and the menu for one it has; the day-five D21 class). The rest
-    /// of its words stay as written, true of the capsules it offers, until
-    /// the stall or its target changes. `behind`: the age its words say now
-    /// (`Row::age_said`).
+    /// A stall's record re-worded in place ([`App::reword_record`]): in `msg`'s words where
+    /// they were drawn for the capsules the record keeps; otherwise only its age moves, so
+    /// its words never offer a button it does not have. `behind`: the age its words say
+    /// now (`Row::age_said`).
     fn reword_stall_record(
         &mut self,
         id: MessageId,
@@ -1132,66 +1026,29 @@ impl App {
         let _ = self.reword_record(id, &msg);
     }
 
-    /// One row per stalled tab; a tab that recovered has its row resolved.
-    /// A stall the owner already has from before this process is not posted
-    /// again ([`Self::stall_already_shown`]).
+    /// One entry per stalled tab (a row only for an interrupt); a tab that recovered has
+    /// its entry resolved, and a stall the owner already has from before this process is
+    /// not posted again ([`Self::stall_already_shown`]).
     ///
-    /// A ROW AN EARLIER PROCESS LEFT UP — carried across the handoff, live
-    /// when the old process handed off — that no stall of this pass adopts is
-    /// WITHDRAWN (the owner's two `Couldn't upgrade Claude · no READY answer
-    /// after 4 notices` rows, 2026-09-27: a new process's view holds none of
-    /// the rows the old one posted, so a stall that ended across the update,
-    /// a give-up being no stall since the rest-and-re-arm, stood on the band
-    /// until dismissed). Its tab no longer stalls; its tab is gone, or runs
-    /// no upgrade the host hands over (a tab closed, a conversation ended or
-    /// moved, a move finished before this process looked); or it stalls in
-    /// another shape (ruling 279: a record's, so the row is no longer
-    /// earned). NEVER RESOLVED `✓`: this process never saw that stall end,
-    /// and a stall that stops standing is not a problem fixed (ruling 266,
-    /// "changed is not fixed"; ruling 290's `✓` is for a move the process
-    /// that kept the row saw go through). Withdrawn, the row is no record the
-    /// owner saw through, so the same stall coming back is news
-    /// ([`Self::stall_already_shown`]).
+    /// A row an earlier process left up that no stall of this pass adopts is withdrawn,
+    /// never resolved `✓` (this process never saw that stall end), so the same stall back
+    /// is news. Rows reach the window only after a whole look
+    /// (`upgrade_drive::View::refresh`), and a successor's host starts only after the carry
+    /// is seeded (`harness_host`), so nothing flickers.
     ///
-    /// ONLY ONCE THE HOST HAS SEEN EVERY TAB, so nothing flickers: rows reach
-    /// the window only after a whole look — the roster read, every
-    /// conversation's holder vetted (`upgrade_drive::View::refresh`), and the
-    /// first one is always handed over — and a successor's host starts only
-    /// at Commit, after the carry is seeded (`harness_host`), so the first
-    /// call here is that first full look; a row whose tab still stalls the
-    /// same way was adopted above, never posted again. A tab whose restart
-    /// is in flight keeps its row until the move ends one way or the other
-    /// (ruling 283: no recovery yet).
-    ///
-    /// A RESTART IN FLIGHT THAT STICKS (S2, `stuck:<what>` past `STALE_S`)
-    /// says so on the tab's row IN PLACE (ruling 327; the merge review of
-    /// 2026-09-27: it withdrew a repeating stop's row for a new one at every
-    /// change of what it waited on, the same stop next posted yet another,
-    /// and the stuck row the in-flight guard then kept read "has not exited"
-    /// of an agent that had exited and relaunched). The row's own stall stays
-    /// what it was posted for, so the same stop next is that row again
-    /// (ruling 283), and once the restart moves the row tells what it told
-    /// before it stuck. A row only a stuck restart earned is resolved once
-    /// the restart moves: that stall is over — and put down already, its end
-    /// is recorded as the upgrade moving again, never asking again
-    /// ([`Self::record_stall_over`]). A row the person put down is
-    /// not raised again for it: a stuck restart there is news, and posts, as
-    /// any stall said otherwise does.
+    /// A restart in flight keeps its tab's row until the move ends. One that sticks
+    /// (`stuck:<what>` past `STALE_S`) says so on the row in place, the row's own stall
+    /// kept, so once the restart moves the row tells what it told before; a row only a
+    /// stuck restart earned is resolved then (put down already, its end is recorded:
+    /// [`Self::record_stall_over`]).
     fn post_upgrade_stalls(&mut self, rows: &[Row], now: u64) {
         let stalled: BTreeMap<String, (&Row, String)> = rows
             .iter()
             .filter_map(|r| {
                 let stall = r.stall(now)?;
-                // THE ENTRY'S SHAPE IS PART OF WHAT WAS SAID (ruling 279): a
-                // stall still asking on its own is a record, any other a
-                // row ([`message_reporters::agent_upgrade_stalled`]). Keyed
-                // on the kind alone, a record that turned movable (its turn
-                // still running) stayed a record — never live, so never
-                // restated — while the tab took its mark, and a row that
-                // turned into the asking stood on the glass.
-                //
-                // The class decides it (owner rules, 2026-09-28): a row only for
-                // the agent the upgrade ended, anything else a record.
+                // The entry's shape is part of what was said: an interrupt (the agent the
+                // upgrade ended) is a row, any other stall a record
+                // ([`message_reporters::agent_upgrade_stalled`]).
                 let shape = if r.interrupt(now).is_some() {
                     "row"
                 } else {
@@ -1200,21 +1057,10 @@ impl App {
                 Some((r.tab.clone(), (r, format!("{stall}/{}/{shape}", r.to))))
             })
             .collect();
-        // AN AGENT'S OVERDUE TABS ARE ONE ROW (2026-09-28, the owner: "also
-        // fix this stacking failures of claude upgrades!" — three overdue
-        // tabs were three rows, the band's whole height): once two or more
-        // tabs of one agent would each take an OVERDUE row — a move that will
-        // come, waiting on its turn end, its own work or a word of the
-        // owner's — they stand in ONE row of the agent's
-        // ([`Self::post_upgrade_groups`]), and each tab's own entry is a
-        // record: its mark, its `upgrade=` column and its menu's words are its
-        // own as ever. The row stays the agent's until its last tab leaves; a
-        // tab alone from the start keeps its own row. A stop, a refusal, a
-        // restart that sticks or an agent typing cannot reach keeps its own
-        // row: each has its own remedy in its own tab (rulings 283, 307, 327).
-        // A record NOTHING HAS CHECKED (`unwatched`, design record C10) is
-        // aterm's own fault: a line in the log ([`Row::attention`]), never a
-        // row, so it joins no group either.
+        // Grouping: two or more overdue row-shaped tabs of one agent would stand in one row
+        // of the agent's ([`Self::post_upgrade_groups`]), each tab's own entry then a record
+        // (its mark, `upgrade=` column and menu words its own), until the last tab leaves.
+        // Under the shape rule above no tab qualifies (see below).
         let mut stalled = stalled;
         // A word pressed on the agent's row is on its way to these tabs: a
         // record each until it lands.
@@ -1227,15 +1073,10 @@ impl App {
         }
         let mut rowish: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for (tab, (row, said)) in &stalled {
-            // NEVER AN INTERRUPT (owner rules, 2026-09-28): the one row that
-            // stands is the agent the upgrade ended, in ITS tab, with its own
-            // action. Only that shape is a "row" here, and it is never an
-            // overdue wait but for a give-up that came after the agent was
-            // gone — which must not be folded into "Couldn't upgrade Claude in
-            // N tabs yet", a warn row with snoozes. So nothing joins an
-            // agent's group: the code stays until its deletion (C6b) and
-            // cannot raise a loud row
-            // (`no_tab_joins_an_agents_group_row`).
+            // Only an overdue row that is not an interrupt could join its agent's group,
+            // and only an interrupt (the agent the upgrade ended, in its tab, with its own
+            // action) is a row, so nothing joins (`no_tab_joins_an_agents_group_row`): a
+            // give-up must not fold into a "Couldn't upgrade Claude in N tabs yet" warn row.
             if row.interrupt(now).is_none()
                 && said.starts_with("overdue/")
                 && said.ends_with("/row")
@@ -1246,10 +1087,9 @@ impl App {
                     .push(tab.clone());
             }
         }
-        // A tab stays in its agent's row across a restart or a handoff too
-        // (the review of 2026-09-28): one the row still on the band names, or
-        // the row the owner saw through before this process — never the
-        // tab's own row again, alone, beside or after its agent's.
+        // A tab stays in its agent's row across a restart or a handoff too (one the row on
+        // the band names, or the row the owner saw through before this process), never
+        // back on its own row beside or after its agent's.
         for (key, tabs) in &rowish {
             let all = tabs.len() >= 2 || self.upgrade_view.groups.contains_key(key);
             let named = self.group_named(key);
@@ -1261,11 +1101,10 @@ impl App {
                 }
             }
         }
-        // The grouped tabs whose OWN row the owner saw through, the same stall
-        // (the review of 2026-09-28): read before their entries turn records
-        // below, so an agent's row that forms fresh — this build's first
-        // process, a second tab joining one the owner put down — does not
-        // show again the stalls the owner already saw.
+        // The grouped tabs whose own row the owner saw through, the same stall: read
+        // before their entries turn records below, so an agent's row that forms fresh (a
+        // build's first process, a second tab joining one the owner put down) does not show
+        // again the stalls the owner already saw.
         let own_seen: BTreeSet<String> =
             stalled
                 .iter()
@@ -1283,30 +1122,23 @@ impl App {
                 })
                 .map(|(tab, _)| tab.clone())
                 .collect();
-        // A RESTART IN FLIGHT is no recovery yet (ruling 283): a stop that
-        // repeats keeps its entry through the re-armed round, and the story
-        // ends at Done (resolved) or at the next stop (the same entry, when
-        // it stops the same way) — never a `✓` as the agent is signalled and
-        // a new row a minute later.
+        // A restart in flight is no recovery yet: a stop that repeats keeps its entry
+        // through the re-armed round, and the story ends at Done (resolved) or at the next
+        // stop (the same entry, when it stops the same way), never a `✓` as the agent is
+        // signalled and a new row a minute later.
         let in_flight: Vec<&str> = rows
             .iter()
             .filter(|r| matches!(r.phase, Phase::Exiting { .. } | Phase::Relaunched { .. }))
             .map(|r| r.tab.as_str())
             .collect();
-        // A REFUSAL A RE-ARMED ROUND MEETS AGAIN IS ONE STALL (ruling 307,
-        // as ruling 283 for a repeating stop): the round re-arms for the same
-        // build, reads not stalled after its first look, and meets the same
-        // refusal again. Counted as recovered, a dismissed row came back at
-        // every round with a false `no longer stalled` in the log each time.
-        // Its entry stands through the re-armed round; it ends when the tab
-        // leaves the rows, a restart begins, the move is done, or the target
-        // changes. A round the OWNER'S WORD holds (`Not today`, `Skip`) is
-        // no re-arm (review of round 21): kept, the entry swallowed the
-        // same refusal when the deferral ran out, and `Not today` read as
-        // never again. Ended, the owner's word is what the returning stall
-        // is read against ([`Self::record_stall_over`]), and it is news.
-        // (`moving` is exactly "not held" here: a tab not in `stalled`
-        // reads no stall.)
+        // A refusal a re-armed round meets again is one stall, as a repeating stop is: the
+        // round re-arms for the same build, reads not stalled after its first look, and
+        // meets the same refusal again. Its entry stands through the re-armed round; it
+        // ends when the tab leaves the rows, a restart begins, the move is done, or the
+        // target changes. A round the owner's word holds (`Not today`, `Skip`) is no
+        // re-arm: ended, the owner's word is what the returning stall is read against
+        // ([`Self::record_stall_over`]), so it is news. (`moving` is exactly "not held"
+        // here: a tab not in `stalled` reads no stall.)
         let rearmed = |tab: &str, posted: &StallRow| {
             posted.said.starts_with("refused:")
                 && rows.iter().any(|r| {
@@ -1358,12 +1190,9 @@ impl App {
                 continue;
             };
             let id = posted.id;
-            // A tab that recovered is fixed; one still stalled, said
-            // otherwise, is withdrawn for its new words — never a `✓` for
-            // an upgrade that has not moved. One that MOVED (Done) is fixed
-            // in words that say so (day five, D26: its record kept `⚠
-            // Couldn't upgrade Claude in tab 1` beside the success record):
-            // the finished words the log files it under, `✓`.
+            // A tab that recovered is fixed; one still stalled, said otherwise, is
+            // withdrawn for its new words, never a `✓` for an upgrade that has not moved.
+            // One that moved (Done) is fixed in finished words that say so, `✓`.
             let done = rows
                 .iter()
                 .find(|r| recovered && r.tab == tab && r.phase == Phase::Done);
@@ -1384,12 +1213,10 @@ impl App {
             } else {
                 self.withdraw_message(id)
             };
-            // Down already, and the tab stalls no more: its end on the
-            // record, so the same stall back is news (a stall that changed
-            // is another stall, and posts; one that moved is its done
-            // record's). Worded by what happened (ruling 307(d)): a stuck
-            // restart that moved and is still in flight (the filter's first
-            // arm) carries on, and asks nothing again (ruling 327).
+            // Down already, and the tab stalls no more: its end on the record, so the same
+            // stall back is news (a stall that changed is another stall, and posts; one that
+            // moved is its done record's). Worded by what happened: a stuck restart that
+            // moved and is still in flight carries on, and asks nothing again.
             if recovered && !live && done.is_none() {
                 use message_reporters::StallEnd;
                 let place = self.upgrade_place(&tab);
@@ -1403,10 +1230,9 @@ impl App {
                 self.record_stall_over(&posted, &place, end);
             }
         }
-        // THE SAME STALL, MOVED INTO ITS AGENT'S ROW or between that row's
-        // shapes ([`regrouped`], round 35, D2): one entry. A row leaves the
-        // band — the agent's row stands for it — withdrawn, its record the
-        // tab's entry from here; a record stays as it is.
+        // The same stall, moved into its agent's row or between that row's shapes
+        // ([`regrouped`]): one entry. A row leaves the band, withdrawn (the agent's row
+        // stands for it), its record the tab's entry from here; a record stays as it is.
         let moved_in: Vec<(String, String)> = stalled
             .iter()
             .filter_map(|(tab, (_, fresh))| {
@@ -1424,14 +1250,11 @@ impl App {
             posted.said = fresh;
             let _ = self.withdraw_message(id);
         }
-        // THE SAME STALL IN THE OTHER SHAPE ([`reshaped`], review of
-        // 8899c91b4): one entry. A row whose upgrade asks on its own again
-        // leaves the glass as its own record, in place — the same id, which
-        // the arm below keeps re-wording. A record that needs the glass
-        // cannot come back to it: its tab's entry is dropped here, the loop
-        // below posts the row (or adopts one the owner already saw), and the
-        // record is replaced by it — `replaced` on Settings ▸ Messages, never
-        // a second `Couldn't upgrade …` standing beside the row for good.
+        // The same stall in the other shape ([`reshaped`]): one entry. A row whose upgrade
+        // asks on its own again leaves the glass as its own record, in place (the same id,
+        // which the arm below keeps re-wording). A record that needs the glass cannot come
+        // back to it: its tab's entry is dropped here, the loop below posts the row (or
+        // adopts one the owner already saw), and the record is superseded by it.
         let flips: Vec<(String, String, Reshape)> = stalled
             .iter()
             .filter_map(|(tab, (row, fresh))| {
@@ -1498,9 +1321,9 @@ impl App {
         for (tab, (row, said)) in stalled {
             if let Some(posted) = self.upgrade_view.stalled.get(&tab) {
                 let id = posted.id;
-                // ANOTHER STALL'S WORDS ON THE ROW: a stuck restart's laid
-                // over it (the words they replace kept beneath, once), or
-                // its own stall back over a stuck restart's — told afresh.
+                // Another stall's words on the row: a stuck restart's laid over it (the
+                // words they replace kept beneath, once), or its own stall back over a
+                // stuck restart's, told afresh.
                 if said != posted.shows {
                     let beneath = (said != posted.said
                         && posted.shows == posted.said
@@ -1527,47 +1350,24 @@ impl App {
                     }
                     continue;
                 }
-                // The same stall, never posted again — but an OVERDUE one's
-                // remedy moves with its wait (at work, `--now` moves it;
-                // waiting on the READY answer, a draft or a box, it does
-                // not), and a capsule drawn for the old wait would press a
-                // word that no longer does what it says. Restated in place
-                // when its words change; a row the person already read is
-                // left down. So is one whose words stop naming a person at
-                // the tab (no look has seen them lately: the session works,
-                // and the move waits for its next turn end) or start again —
-                // its stall and its buttons stay the same, and until
-                // 2026-09-28 the band said "someone is using its tab" for as
-                // long as the stall stood.
+                // The same stall, never posted again, but restated in place when its
+                // words change: an overdue one's remedy moves with its wait (at work
+                // `--now` moves it; waiting on the READY answer, a draft or a box, it does
+                // not), and a capsule drawn for the old wait would press a word that no
+                // longer does what it says. So does a flip of whether its words name a
+                // person at the tab, and its age (`Row::age_said`: only an `overdue`
+                // stall's words carry one, by the hour or day), so a look that changes
+                // nothing else restates nothing. A record says it in place too
+                // ([`App::reword_record`]; nothing for a row the owner put down, whose
+                // words are what it said when it left).
                 //
-                // ITS AGE, TOO (2026-09-29, the owner's log: one waiting
-                // upgrade is one message that says how long in place): a
-                // standing row read `behind for 6 h` for as long as it stood.
-                // Only the words its entry says move it (`Row::age_said`: an
-                // `overdue` stall's age, by the hour or day it counts in; no
-                // other stall's words carry one), so a look that changes
-                // nothing else restates nothing.
-                //
-                // A RECORD SAYS IT IN PLACE TOO (second review of 2026-09-29):
-                // an upgrade its agent's own work holds asks again on its own,
-                // so its one entry is a record — written once, it said
-                // `behind for 6 h` from the stall's start to the move clock.
-                // Re-worded in place ([`App::reword_record`]: no new entry, and
-                // nothing for a row the owner put down, whose words are what
-                // it said when it left).
-                //
-                // ITS PLACE AND ITS `Show tab N` TOO (ruling 440): the row that
-                // stands follows its tab. A tab moved to another window or
-                // index changes both its words and its button; a window opened
-                // or closed beside it changes only its words (`in tab 1` ↔ `in
-                // window 1, tab 1`) — the button carries the window's id, not
-                // its number. Either restates the row in place, so its words
-                // and its button never name two places. The place is compared
-                // as it was last said, never by the row's title, which a
-                // refused press lays its own words over
-                // ([`App::apply_upgrade_word`]) until something moves. A record
-                // is never re-worded for its place alone (ruling 300: a window
-                // opened later does not restate it).
+                // A standing row follows its tab: a tab moved to another window or index
+                // changes its words and its `Show tab N` button; a window opened or closed
+                // beside it changes only its words (`in tab 1` ↔ `in window 1, tab 1`; the
+                // button carries the window's id). Either restates the row in place. The
+                // place is compared as last said, never by the row's title, which a
+                // refused press lays its own words over ([`App::apply_upgrade_word`]). A
+                // record is never re-worded for its place alone.
                 let person = row.person_seen(now);
                 let behind = row.age_said(now);
                 let spot = self.upgrade_spot(&row.tab);
@@ -1643,10 +1443,9 @@ impl App {
             );
         }
         self.post_upgrade_groups(&stalled_now, rows, &own_seen, now);
-        // THE ROWS NO ENTRY OF THIS VIEW OWNS — an earlier process's, carried
-        // across the handoff and not adopted above: withdrawn, whatever became
-        // of their tab ([`Self::post_upgrade_stalls`]) — an agent's one row
-        // too, once no tab of it stalls as a row.
+        // Rows no entry of this view owns (an earlier process's, carried across the
+        // handoff and not adopted above) are withdrawn, whatever became of their tab; an
+        // agent's one row too, once no tab of it stalls as a row.
         let owned: BTreeSet<MessageId> = self
             .upgrade_view
             .stalled
@@ -1677,20 +1476,18 @@ impl App {
         }
     }
 
-    /// EACH AGENT'S ONE ROW FOR ITS STALLED TABS
-    /// ([`message_reporters::agent_upgrade_stalled_group`]), from this pass's
-    /// stalls (`stalled`: each stalled tab's row and what it was said for —
-    /// those ending [`GROUPED`] stand in their agent's row), the host's rows
-    /// (`rows`: what became of a tab no longer stalling) and the grouped tabs
-    /// whose own row the owner saw through (`own_seen`). Restated in place
-    /// when its words or buttons change — its tabs, their words, each tab's
-    /// age as the look read it (`Row::behind_for`) — and never posted twice: a row carried across a
-    /// handoff is adopted; one the owner read or dismissed, in this process or
-    /// before it, is not posted again while every STALL it would name — a tab
-    /// and its target ([`message_reporters::agent_upgrade_group_members`]) —
-    /// is among those the owner saw, and a stall that is not is news. A row a
-    /// press is landing on is left as it stands ([`GroupPress`]). Once no tab
-    /// of its agent stands in it the row ends ([`Self::end_upgrade_group`]).
+    /// Each agent's one row for its stalled tabs
+    /// ([`message_reporters::agent_upgrade_stalled_group`]), from this pass's stalls
+    /// (`stalled`: each stalled tab's row and what it was said for; those ending
+    /// [`GROUPED`] stand in their agent's row), the host's rows (`rows`: what became of a
+    /// tab no longer stalling) and the grouped tabs whose own row the owner saw through
+    /// (`own_seen`). Restated in place when its words or buttons change (its tabs, their
+    /// words, each tab's age, `Row::behind_for`), and never posted twice: a row carried
+    /// across a handoff is adopted, and one the owner read or dismissed is not posted
+    /// again while every stall it would name (a tab and its target,
+    /// [`message_reporters::agent_upgrade_group_members`]) is among those the owner saw. A
+    /// row a press is landing on is left as it stands ([`GroupPress`]). Once no tab of its
+    /// agent stands in it the row ends ([`Self::end_upgrade_group`]).
     fn post_upgrade_groups(
         &mut self,
         stalled: &BTreeMap<String, (Row, String)>,
@@ -1858,15 +1655,11 @@ impl App {
         }
     }
 
-    /// The tabs an agent's row from before this pass still NAMES
-    /// ([`message_reporters::agent_upgrade_group_members`]): the row under
-    /// `key` on the band — this process's, or one carried across a handoff —
-    /// or, off it, the latest record under `key` when the owner saw it
-    /// through. Such a tab stands in its agent's row even alone (the review of
-    /// 2026-09-28: after a restart the one tab still stalling of a row the
-    /// owner had dismissed came back as a row of its own, and a carried
-    /// one-tab row was withdrawn for a fresh row of the tab's). Empty when
-    /// neither.
+    /// The tabs an agent's row from before this pass still names
+    /// ([`message_reporters::agent_upgrade_group_members`]): the row under `key` on the band
+    /// (this process's, or one carried across a handoff), or, off it, the latest record
+    /// under `key` when the owner saw it through. Such a tab stands in its agent's row even
+    /// alone, never back on a row of its own. Empty when neither.
     fn group_named(&self, key: &str) -> BTreeSet<String> {
         let detail = match self.messages.live_by_key(key) {
             Some(live) => live.msg.detail.clone(),
@@ -1887,25 +1680,20 @@ impl App {
             .collect()
     }
 
-    /// AN AGENT'S ROW WHOSE TABS NO LONGER STAND IN IT (the review of
-    /// 2026-09-28: it was resolved `✓` whatever became of them, with the
-    /// words it stalled with), by what became of them, from the host's rows:
+    /// An agent's row whose tabs no longer stand in it, ended by what became of them, from
+    /// the host's rows:
     ///
-    /// * DOWN ALREADY (the owner read or dismissed it): its end is recorded
-    ///   under its key ([`message_reporters::agent_upgrade_group_over`]), so
-    ///   the same stalls back are news, in this process and after a restart
-    ///   — never taken for the row already seen. Nothing for a row never
-    ///   posted (each stall seen on its tab's own row: each tab's own end is
-    ///   its entry's).
-    /// * A RESTART IN FLIGHT is no recovery yet (ruling 283): the row is kept
-    ///   as it stands until the move ends one way or the other.
-    /// * A TAB STILL STALLING in another shape (a stop, a refusal, a stuck
-    ///   restart: its own row), or ONE THE OWNER'S WORD HOLDS OR HURRIES (the
-    ///   word's own record says what it did): withdrawn, never a `✓` — the
-    ///   upgrade has not moved.
-    /// * Otherwise resolved `✓` — in finished words where tabs MOVED (day
-    ///   five's D26, for the row: `Claude upgraded in 3 tabs`, never the
-    ///   row's `Couldn't upgrade …` beside the success records).
+    /// * Down already (the owner read or dismissed it): its end is recorded under its key
+    ///   ([`message_reporters::agent_upgrade_group_over`]), so the same stalls back are
+    ///   news, in this process and after a restart. Nothing for a row never posted (each
+    ///   tab's own end is its entry's).
+    /// * A restart in flight is no recovery yet: the row is kept as it stands until the
+    ///   move ends one way or the other.
+    /// * A tab still stalling in another shape (a stop, a refusal, a stuck restart: its own
+    ///   entry), or one the owner's word holds or hurries (the word's own record says what it
+    ///   did): withdrawn, never a `✓`, since the upgrade has not moved.
+    /// * Otherwise resolved `✓`, in finished words where tabs moved (`Claude upgraded in 3
+    ///   tabs`).
     fn end_upgrade_group(
         &mut self,
         key: String,
@@ -1968,11 +1756,10 @@ impl App {
         let _ = self.resolve_message(id, Outcome::Ok);
     }
 
-    /// THE END OF AN AGENT'S ROW THAT IS DOWN ALREADY
-    /// ([`Self::end_upgrade_group`]; [`Self::record_stall_over`] for a tab's
-    /// row): recorded under its key while the log's last word there is the
-    /// owner's read or dismissal of `id`, and nothing when a newer record
-    /// came under the key after it (the owner's word, already said there).
+    /// The end of an agent's row that is down already ([`Self::end_upgrade_group`];
+    /// [`Self::record_stall_over`] for a tab's row): recorded under its key while the log's
+    /// last word there is the owner's read or dismissal of `id`, and nothing when a newer
+    /// record came under the key after it (the owner's word, already said there).
     fn record_group_over(
         &mut self,
         key: &str,
@@ -2003,19 +1790,16 @@ impl App {
         ));
     }
 
-    /// THE OWNER'S WORD ON AN AGENT'S ONE ROW ([`Intent::AgentUpgradeTabs`]):
-    /// the word written for each listed tab that still takes it, for the build
-    /// the row named it with, exactly as each tab's own press would be
-    /// ([`Self::send_upgrade_word`]). The entry pressed is ANSWERED once every
-    /// word has landed and one was written, in words that say what was asked
-    /// of how many tabs ([`GroupPress`]) — never before (the review of
-    /// 2026-09-28) — and each tab's own answer is recorded under its own key
-    /// as its word lands. Refusals are said on the entry pressed: every word
-    /// refused, the row says why and keeps its buttons, as one tab's row does;
-    /// some, the answer names them — never a row per tab. The tabs still
-    /// stalling after the words stand in a new row. `false` when no listed tab
-    /// takes the word now (a tab whose word from an earlier press is still
-    /// landing takes none).
+    /// The owner's word on an agent's one row ([`Intent::AgentUpgradeTabs`]): written for
+    /// each listed tab that still takes it, for the build the row named it with, exactly as
+    /// each tab's own press would be ([`Self::send_upgrade_word`]). The entry pressed is
+    /// answered once every word has landed and one was written, in words that say what was
+    /// asked of how many tabs ([`GroupPress`]), never before; each tab's own answer is
+    /// recorded under its own key as its word lands. Refusals are said on the entry
+    /// pressed: all refused, the row says why and keeps its buttons; some, the answer names
+    /// them; never a row per tab. Tabs still stalling after the words stand in a new row.
+    /// `false` when no listed tab takes the word now (a tab whose word from an earlier
+    /// press is still landing takes none).
     pub(crate) fn send_upgrade_group_word(
         &mut self,
         id: MessageId,
@@ -2066,11 +1850,10 @@ impl App {
         sent
     }
 
-    /// ONE TAB'S WORD OF A PRESS ON ITS AGENT'S ROW LANDED
-    /// ([`GroupPress`]): written, its own answer is recorded under its key and
-    /// its row the word left taken at once, as a tab's own press is
-    /// ([`Self::apply_upgrade_word`]); refused, the refusal is kept for the
-    /// press's answer. The last to land ends the press
+    /// One tab's word of a press on its agent's row landed ([`GroupPress`]): written, its
+    /// own answer is recorded under its key and the row the word left is taken at once, as
+    /// for a tab's own press ([`Self::apply_upgrade_word`]); refused, the refusal is kept
+    /// for the press's answer. The last to land ends the press
     /// ([`Self::finish_group_press`]).
     fn land_group_word(&mut self, at: usize, ask: &WordAsk, result: Result<Row, String>) {
         let place = self.upgrade_place(&ask.tab);
@@ -2125,12 +1908,11 @@ impl App {
         }
     }
 
-    /// A PRESS ON AN AGENT'S ROW WHOSE WORDS HAVE ALL LANDED ([`GroupPress`]):
-    /// some written — the entry pressed is ANSWERED with the word's label, in
-    /// words that count the tabs that took it and name the ones that did not
-    /// (a record of those words when the entry is not on the band); none
-    /// written — the row says why, above what it said, and keeps its buttons
-    /// (a row of its own, one for the press, when the entry is not on the
+    /// A press on an agent's row whose words have all landed ([`GroupPress`]). Some
+    /// written: the entry pressed is answered with the word's label, in words that count
+    /// the tabs that took it and name the ones that did not (a record of those words when
+    /// the entry is not on the band). None written: the row says why, above what it said,
+    /// and keeps its buttons (a row of its own for the press when the entry is not on the
     /// band).
     fn finish_group_press(&mut self, press: GroupPress) {
         let live = self.messages.live(press.id).is_some();
@@ -2185,9 +1967,8 @@ impl App {
         );
         match self.messages.live(press.id).map(|l| l.msg.clone()) {
             Some(shown) if ours => {
-                // Above what the row SAYS — its own words, never a refusal an
-                // earlier press laid over them (round 44: each refused press
-                // stacked another copy, until the cap cut the stalls' line).
+                // Above what the row says: its own words, never a refusal an earlier
+                // press laid over them (each refused press would stack another copy).
                 let said = self
                     .upgrade_view
                     .groups
@@ -2202,11 +1983,10 @@ impl App {
                     self.restate_message(press.id, crate::messages_host::restatement_of(&refused));
             }
             _ => {
-                // A press from an OLDER entry of the agent's row (a record on
-                // Settings ▸ Messages) while a newer row stands under its key:
-                // the refusal is its own row, never that row's replacement —
-                // under the key it superseded the live row, whose stalls then
-                // read as put down (round 44).
+                // A press from an older entry of the agent's row (a record on Settings ▸
+                // Messages) while a newer row stands under its key: the refusal is its own
+                // row, unkeyed, never that row's replacement (under the key it would
+                // supersede the live row, whose stalls would then read as put down).
                 if self
                     .messages
                     .live_by_key(&press.key)
@@ -2237,13 +2017,12 @@ impl App {
         }
     }
 
-    /// A PRESS OF THE OWNER'S WORD ([`Intent::AgentUpgrade`]) — a band
-    /// capsule, a Settings ▸ Messages button, a tab-menu item: written off
-    /// the winit thread by the view's [`WordWriter`] (which may wait on the
-    /// sweep lock), behind every word pressed before it ([`WordQueue`]), its
-    /// result handed back as `Wake::AgentUpgradeWord`. A test's `App` has no
-    /// event loop to hand it to, and writes it here. `false` only when no
-    /// thread could be started (said on the row).
+    /// A press of the owner's word ([`Intent::AgentUpgrade`]: a band capsule, a Settings ▸
+    /// Messages button, a tab-menu item): written off the winit thread by the view's
+    /// [`WordWriter`] (which may wait on the sweep lock), behind every word pressed before
+    /// it ([`WordQueue`]), its result handed back as `Wake::AgentUpgradeWord`. A test's
+    /// `App` has no event loop, and writes it here. `false` only when no thread could be
+    /// started (said on the row).
     pub(crate) fn send_upgrade_word(&mut self, ask: WordAsk) -> bool {
         let writer = self.upgrade_view.writer.clone();
         let Some(proxy) = self.proxy.clone() else {
@@ -2266,23 +2045,19 @@ impl App {
         }
     }
 
-    /// WHAT THE OWNER'S WORD DID, SHOWN WHERE IT WAS PRESSED
-    /// (`Wake::AgentUpgradeWord`). Written: the tab's stalled row — the one
-    /// for this build — takes the word's words ("Claude stays on 2.1.281
-    /// until tomorrow", `ℹ`, its stall title below) and leaves the band
-    /// ANSWERED with the word's label (ruling 270: a choice is not delivered
-    /// work — never `✓` nor `took` — and `Upgrade now` has moved nothing yet;
-    /// the `✓` is `agent_upgrade_done`'s, when it moves). Its record never
-    /// offers the word it was answered with again (`LogRecord::still_offers`).
-    /// With no such row (a record's button, the tab menu) the same words are
-    /// a record. The tab's `upgrade=`, the waiting record and the counts take
-    /// the row the word left at once, in place of the view's — never one the
-    /// host has since dropped — and the host's next rows, which the word's
-    /// own announcement asks for, say the same. Refused (another step held
-    /// the lock, the upgrade moved on, it stopped for good): the row says
-    /// why, above what it said, and keeps its capsules; with no row, the
-    /// refusal is a row of its own in the gesture-failure shape (the
-    /// person's press failed, H11), never only a record.
+    /// What the owner's word did, shown where it was pressed (`Wake::AgentUpgradeWord`).
+    /// Written: the tab's stalled row for this build takes the word's words ("Claude stays
+    /// on 2.1.281 until tomorrow", `ℹ`, its stall title below) and leaves the band answered
+    /// with the word's label (a choice is not delivered work: never `✓` nor `took`; the `✓`
+    /// is `agent_upgrade_done`'s, when it moves). Its record never offers the word it was
+    /// answered with again (`LogRecord::still_offers`). With no such row (a record's
+    /// button, the tab menu) the same words are a record. The tab's `upgrade=`, the waiting
+    /// record and the counts take the row the word left at once, never one the host has
+    /// since dropped, and the host's next rows (which the word's own announcement asks for)
+    /// say the same. Refused (another step held the lock, the upgrade moved on, it stopped
+    /// for good): the row says why, above what it said, and keeps its capsules; with no
+    /// row, the refusal is a row of its own in the gesture-failure shape, never only a
+    /// record.
     pub(crate) fn apply_upgrade_word(&mut self, ask: &WordAsk, result: Result<Row, String>) {
         let now = now_s();
         // A word pressed on its agent's one row has landed for this tab: its
@@ -2313,9 +2088,8 @@ impl App {
                     ask.word.as_str(),
                     row.request.word()
                 );
-                // The row pressed waited on its question unread (ruling 307),
-                // or its round gave up: `Upgrade now` asked it once more, and
-                // says so.
+                // The row pressed waited on its question unread, or its round gave up:
+                // `Upgrade now` asked it once more, and says so.
                 let asked_again = self
                     .upgrade_view
                     .row_for(&ask.tab)
@@ -2340,13 +2114,10 @@ impl App {
                     ) && app.answer_message(id, ask.word.label())
                 };
                 let answered = posted.is_some_and(|id| answer(self, id));
-                // THE TAB STANDS ALONE IN ITS AGENT'S ROW (the review of
-                // 2026-09-28: its own entry is a record, so the word — its tab
-                // menu's, its record's button — answered nothing, and the row
-                // it pressed went `✓` at the next look, with the words it
-                // stalled with): that row is answered with the word's words,
-                // ruling 270's `answered`. A row of several tabs counts down
-                // at the next look, the word the tab's own record.
+                // The tab stands alone in its agent's row: its own entry is a record, so
+                // the word answered nothing on it, and that row is answered with the word's
+                // words instead. A row of several tabs counts down at the next look, the
+                // word the tab's own record.
                 let alone = (!answered).then(|| self.alone_in_group(&ask.tab)).flatten();
                 let grouped = alone.is_some_and(|(key, id)| {
                     let done = answer(self, id);
@@ -2355,11 +2126,8 @@ impl App {
                     }
                     done
                 });
-                // Answered either way, the word is the tab's stall's end
-                // (round 35 review, ruling 376): its entry leaves the view, so
-                // the look below records no `… asks again …` over it — the
-                // tab's entry being a record in its agent's row, D3's end
-                // would otherwise follow `Not today` at once.
+                // Answered either way, the word is the tab's stall's end: its entry leaves
+                // the view, so the look below records no `… asks again …` over it.
                 if answered || grouped {
                     self.upgrade_view.stalled.remove(&ask.tab);
                 } else {
@@ -2388,23 +2156,20 @@ impl App {
                     &why,
                     &place,
                 );
-                // A ROUND THAT STOPPED under the press (day five, D22): what
-                // the view shows is stale, so the host is asked to look again
-                // now — its next rows restate or retire the entry — and until
-                // then the entry keeps neither the refused word's capsule nor
-                // the lines about the round that is gone (`its turn is still
-                // running`, `Upgrade now moves it…`), only the move itself.
+                // A round that stopped under the press: what the view shows is stale, so
+                // the host is asked to look again now (its next rows restate or retire the
+                // entry), and until then the entry keeps neither the refused word's capsule
+                // nor the lines about the round that is gone, only the move itself.
                 let stopped = upgrade_drive::refused_stopped(&why).is_some();
                 if stopped {
                     self.upgrade_view.look_again();
                 }
                 let restated = match (posted, shown.as_ref()) {
                     (Some(id), Some(row)) => {
-                        // The row's own buttons where it stands, `Show tab N`
-                        // on an interrupt's among them (ruling 440): the next
-                        // look compares them with its fresh entry's, and a
-                        // refusal drawn without that capsule was restated away
-                        // at it, though nothing had moved.
+                        // The row's own buttons where it stands (`Show tab N` on an
+                        // interrupt's among them): the next look compares them with its
+                        // fresh entry's, so a refusal drawn without them would be
+                        // restated away though nothing moved.
                         let stalled = message_reporters::agent_upgrade_stalled_at(row, now, &spot);
                         let mut words = refused.clone();
                         if stopped {
@@ -2445,8 +2210,7 @@ impl App {
                         let Some(shown) = self.messages.live(id).map(|l| l.msg.clone()) else {
                             return false;
                         };
-                        // Above the row's own words, never an earlier
-                        // refusal's (round 44).
+                        // Above the row's own words, never an earlier refusal's.
                         let said = self
                             .upgrade_view
                             .groups
@@ -2467,9 +2231,8 @@ impl App {
         }
     }
 
-    /// The agent's row tab `tab` stands in ALONE, if one is on the band: its
-    /// key and id ([`Self::apply_upgrade_word`]: a word on that tab is the
-    /// row's word).
+    /// The agent's row tab `tab` stands in alone, if one is on the band: its key and id
+    /// ([`Self::apply_upgrade_word`]: a word on that tab is the row's word).
     fn alone_in_group(&self, tab: &str) -> Option<(String, MessageId)> {
         self.upgrade_view.groups.iter().find_map(|(key, group)| {
             let id = group.id?;
@@ -2481,18 +2244,16 @@ impl App {
         })
     }
 
-    /// Where tab `sid` is, in the person's words (ruling 270): `in tab 2` by
-    /// its place in its window's strip, `in its tab` when no window shows it
-    /// now. Never the raw `s-<hex>` a person never sees. EVERY terminal leaf
-    /// of a tab counts, not only its focused one (round 17 review, V5): an
-    /// agent in a split pane the keyboard is not in is still in that tab.
+    /// Where tab `sid` is, in the person's words: `in tab 2` by its place in its window's
+    /// strip, `in its tab` when no window shows it now; never the raw `s-<hex>`. Every
+    /// terminal leaf of a tab counts, not only its focused one: an agent in a split pane
+    /// the keyboard is not in is still in that tab.
     ///
-    /// WITH MORE THAN ONE WINDOW the window is named too, `in window 2, tab
-    /// 1`: tabs are counted per window, and the band is every window's, so two
-    /// agents first in their own windows both read `in tab 1` — the same
-    /// line twice, and a word pressed on the wrong one. Windows are counted
-    /// in the order they were opened (their ids), as the connection map's
-    /// `Window 2` counts them; one window keeps the short words.
+    /// With more than one window the window is named too (`in window 2, tab 1`): tabs are
+    /// counted per window and the band is every window's, so two agents first in their own
+    /// windows would both read `in tab 1`. Windows are counted in id order (the order they
+    /// were opened), as the connection map's `Window 2` counts them; one window keeps the
+    /// short words.
     pub(crate) fn upgrade_place(&self, sid: &str) -> String {
         self.upgrade_spot(sid).place
     }
@@ -2532,11 +2293,10 @@ impl App {
         }
     }
 
-    /// The session ids some tab of this instance shows: the set
-    /// [`Self::upgrade_spot`] searches, taken whole. A caller that must decide
-    /// whether a digest line's tab is still there asks THIS (and computes the
-    /// line's key from each id), never parses an id back out of the key: a key
-    /// shortens a subject that does not fit its cap, so it does not round-trip.
+    /// The session ids some tab of this instance shows: the set [`Self::upgrade_spot`]
+    /// searches, taken whole. A caller deciding whether a digest line's tab is still there
+    /// asks this (and computes the line's key from each id), never parses an id out of the
+    /// key: a key shortens a subject that does not fit its cap, so it does not round-trip.
     pub(crate) fn shown_session_sids(&self) -> std::collections::HashSet<String> {
         let store = self.store.read().unwrap_or_else(|p| p.into_inner());
         let mut sids = std::collections::HashSet::new();
@@ -2559,38 +2319,25 @@ impl App {
         sids
     }
 
-    /// HOW THE LIVE TABS STAND for the managed-current record
-    /// ([`TabsBehind`]): every registered tab carrying the adoption mark
-    /// (lowered, never raised, by measurement —
-    /// `SessionTimeline::take_path_lowered`) split by what runs in front — an
-    /// agent tab is never handed the hook to type, and one the live upgrade is
-    /// moving heals with the move (its relaunch line sources the hook) — plus
-    /// the shells still waiting to be adopted; the unmarked tabs whose PATH
-    /// was measured, two jobs in a row, to put a foreign copy first; and the
-    /// Claude sessions RUNNING A BUILD OLDER THAN THE VERSION THE RECORD NAMES
-    /// (its wire text, remembered by `post_managed_current`), split into those
-    /// the upgrade moves on its own and those it will not move —
-    /// stalled, or held by the owner's word (review of 2026-09-25: an overdue
-    /// session was said to move at its next turn end while the band showed it
-    /// stalled). The build a session RUNS, whatever its row's target (audit
-    /// 2026-10-09: at the install the rows still targeted the previous build
-    /// for the two seconds before their retarget, so counting only rows onto
-    /// the new one recorded "are current" nine times in a week while two tabs
-    /// ran days-old builds). The version, not the copy: a session on the native
-    /// install of an older version lags it just the same — measured
-    /// 2026-09-25, one of the owner's two lagging sessions was the native
-    /// 2.1.281, the session the gap audit's false "up to date" was said over.
+    /// How the live tabs stand for the managed-current record ([`TabsBehind`]): every
+    /// registered tab carrying the adoption mark (lowered, never raised, by measurement:
+    /// `SessionTimeline::take_path_lowered`), split by what runs in front (an agent tab is
+    /// never handed the hook to type, and one the live upgrade is moving heals with the
+    /// move), plus the shells still waiting to be adopted; the unmarked tabs whose PATH was
+    /// measured, two jobs in a row, to put a foreign copy first; and the agent sessions
+    /// running a build older than the version the record names for their own program (its
+    /// wire text, remembered by `post_managed_current`: a Codex session against the managed
+    /// codex), split by agent into those the upgrade moves on its own and those it will
+    /// not (stalled, or held by the owner's word). Counted by the build a session
+    /// runs, whatever its row's target (at an install the rows still target the previous
+    /// build for a moment), and by version, not copy: a native install of an older version
+    /// lags just the same.
     ///
-    /// KNOWN LIMITS (review of 2026-10-09): a session is counted only while
-    /// the live upgrade hands the window a row for it. A finished move whose
-    /// model is still unconfirmed leaves the rows once its confirm-by and
-    /// `DONE_SHOWN_S` pass (`upgrade_status::View::refresh_with`) while the
-    /// harness starts no next round for it, so such a session goes uncounted
-    /// whatever build it runs; and at an install, a session that was current
-    /// on the previous build has no row until the harness mints the new
-    /// round, two or three seconds later, so the first record can still say
-    /// "current" — re-worded in place once those rows land
-    /// (`post_managed_current`), though the message log keeps the first line.
+    /// Known limits: a session is counted only while the live upgrade hands the window a
+    /// row for it, so a finished move whose model is still unconfirmed goes uncounted once
+    /// its confirm-by and `DONE_SHOWN_S` pass (`upgrade_status::View::refresh_with`); and at
+    /// an install the first record can still say "current" for the seconds before the new
+    /// round's rows land (then re-worded in place, though the log keeps the first line).
     pub(crate) fn tabs_behind(&self) -> TabsBehind {
         let now = now_s();
         let store = self.store.read().unwrap_or_else(|p| p.into_inner());
@@ -2611,12 +2358,15 @@ impl App {
                 tabs.shadowed += usize::from(timeline.path_settled_frozen());
                 continue;
             }
-            let agent = timeline
-                .agent()
-                .program
-                .as_deref()
-                .and_then(aterm_phase::program_of)
-                .is_some();
+            // An agent in front, including a read-only one: by its name, or
+            // a runtime like `node` by its current screen reader. A managed
+            // agent the reader does not know owns its prompt too.
+            let agent = crate::harness_host::identified_agent(timeline.agent()).is_some()
+                || timeline
+                    .agent()
+                    .program
+                    .as_deref()
+                    .is_some_and(atpkg::stub::is_agent_program);
             let moving = timeline.upgrade().is_some_and(|row| row.moving(now));
             match (agent, moving) {
                 (false, _) => tabs.frozen_shells += 1,
@@ -2624,19 +2374,13 @@ impl App {
                 (true, true) => {}
             }
         }
-        let managed = self
-            .upgrade_view
-            .managed_text
-            .as_deref()
-            .and_then(|text| crate::toolchain_words::managed_version(text, "claude"));
-        // The managed-current record names Claude Code's build: a Codex
-        // row is behind another build altogether.
-        for row in self
-            .upgrade_view
-            .rows
-            .iter()
-            .filter(|r| r.agent == aterm_agent::harness::upgrade::Agent::Claude)
-        {
+        let text = self.upgrade_view.managed_text.as_deref();
+        for row in &self.upgrade_view.rows {
+            // Each row against its own program's build: the record names each
+            // managed program's version (`claude 2.1.282 …; codex 0.157.0 …`).
+            let managed = text.and_then(|text| {
+                crate::toolchain_words::managed_version(text, row.agent.program().name())
+            });
             if !managed.as_deref().is_some_and(|v| runs_older(row, v)) {
                 continue;
             }
@@ -2645,22 +2389,20 @@ impl App {
             // Every other session behind will not move on its own: stalled
             // (a restart stuck in flight among them), or held by the owner.
             if row.phase == Phase::Done || (row.moving(now) && row.stall(now).is_none()) {
-                tabs.agents_behind += 1;
+                tabs.agents_behind.count(row.agent);
             } else {
-                tabs.agents_held += 1;
+                tabs.agents_held.count(row.agent);
             }
         }
         tabs
     }
 }
 
-/// Whether the session `row` moves RUNS a build older than `managed`: the
-/// build it is moving from, or — once relaunched, its relaunch line having
-/// typed the target, or its move done — the one it moved onto, whatever its
-/// row targets next. A relaunch still waiting for the idle point that carries
-/// its conversation on (stuck there, even) runs the target already (review
-/// of 2026-10-09). Where either does not parse as a version, any build but
-/// `managed` itself is counted: an unreadable build is never called current.
+/// Whether the session `row` moves runs a build older than `managed`: the build it is
+/// moving from, or, once relaunched (its relaunch line typed the target, even while it
+/// waits for the idle point) or done, the one it moved onto, whatever its row targets
+/// next. Where either does not parse as a version, any build but `managed` itself counts:
+/// an unreadable build is never called current.
 fn runs_older(row: &Row, managed: &str) -> bool {
     use aterm_agent::harness::upgrade::Version;
     let runs = if matches!(row.phase, Phase::Done | Phase::Relaunched { .. }) {
@@ -2687,13 +2429,11 @@ fn same_build(a: &str, b: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::toolchain_words::PerAgent;
     use aterm_agent::harness::upgrade::Request;
 
-    /// A pending upgrade `behind_for` behind, waiting on a notice behind a
-    /// full queue — the wait `Upgrade now` still moves once it is overdue
-    /// (ruling 380: on a turn still running, hours on the ladder's last rung,
-    /// it moves nothing `--now` does not; until the owner's decision of
-    /// 2026-09-28 this rig waited `not-idle:busy`).
+    /// A pending upgrade `behind_for` behind, waiting on a notice behind a full queue: a
+    /// wait `Upgrade now` still moves once it is overdue.
     fn row(tab: &str, behind_for: u64) -> Row {
         let now = now_s();
         Row {
@@ -2710,9 +2450,9 @@ mod tests {
         }
     }
 
-    /// An agent the upgrade ENDED and could not bring back, ten minutes ago:
-    /// the one state that takes a band row (`Row::attention`,
-    /// `Interrupt`, kind `agent-down`), whose action is the resume command.
+    /// An agent the upgrade ended and could not bring back: the one state that takes a band
+    /// row (`Row::attention`, `Interrupt`, kind `agent-down`), whose action is the resume
+    /// command.
     fn gone(tab: &str) -> Row {
         Row {
             behind_since: now_s() - 7 * 3_600,
@@ -2737,12 +2477,8 @@ mod tests {
             .collect()
     }
 
-    /// ONE SESSION WAITING (ruling 380, the owner, 2026-09-28): its record is
-    /// titled by its build — `… installs itself`, the tab in its move line
-    /// where the place would break the title rule — says there is nothing to
-    /// do where only the ladder's comfort holds it, and is written ONCE across
-    /// looks, past the ladder's Land rung too (its clock time is that rung's,
-    /// never the look's). No row, no mark.
+    /// One waiting session is one record (`… installs itself`), written once across looks;
+    /// no row, no mark.
     #[test]
     fn one_waiting_session_is_one_record_written_once() {
         let mut app = App::headless_for_test();
@@ -2764,15 +2500,8 @@ mod tests {
         assert!(records[0].1[1].contains("Claude Code 2.1.281 \u{2192} 2.1.282"));
     }
 
-    /// THE WAITING RECORD IS STABLE ACROSS LOOKS (the second review of
-    /// 2026-09-28): a person near a goal-mode Codex tab reads `attended` at
-    /// one look and `goal` at the next — the gate asks the person first — and
-    /// each flip wrote a new record contradicting the last. Now the ladder's
-    /// promise is said once, the goal's floor once, and no flip after that
-    /// writes anything: the floor's sentence stands. A floor said first is
-    /// never followed by the comfort at all. NEGATIVE CONTROLS: another floor
-    /// (a draft) is news, said once; and once nothing waits, the same wait
-    /// back is news again.
+    /// A wait flipping between the ladder's comfort and a floor is recorded once each; a
+    /// new floor is news, and after nothing waits, the same wait is news again.
     #[test]
     fn a_wait_flipping_between_comfort_and_a_floor_is_recorded_once_each() {
         let codex = |tab: &str, wait: &str| Row {
@@ -2819,12 +2548,8 @@ mod tests {
         assert_eq!(lines(&app).len(), 3, "{:?}", lines(&app));
     }
 
-    /// WAITING IS A RECORD, NEVER A ROW, and an unchanged wait is recorded
-    /// once. A tab six hours behind is a record too (the owner, 2026-09-28: an
-    /// alert persists only where they can act); the ONE row is an agent the
-    /// upgrade ended and could not bring back — one per tab, resolved when the
-    /// owner's word holds it. NEGATIVE CONTROL: a session merely waiting for
-    /// its turn end, and one six hours behind, put nothing on the glass.
+    /// Waiting, even six hours behind, is a record written once, never a row; the one row
+    /// is an agent the upgrade ended, one per tab, resolved when the owner's word holds it.
     #[test]
     fn waiting_is_recorded_once_and_only_an_agent_the_upgrade_ended_takes_a_row() {
         let mut app = App::headless_for_test();
@@ -2844,8 +2569,8 @@ mod tests {
         app.apply_agent_upgrades(waiting);
         assert_eq!(harness_records(&app).len(), 1, "the same wait: not again");
 
-        // One tab is six hours behind: a RECORD, never a row, and a wait never
-        // says `Couldn't`.
+        // One tab is six hours behind: a record, never a row, and a wait never says
+        // `Couldn't`.
         let stalled = vec![row("s-a", 7 * 3_600), row("s-b", 60)];
         app.apply_agent_upgrades(stalled.clone());
         assert_eq!(app.messages.live_rows().count(), 0, "a wait is no row");
@@ -2891,14 +2616,8 @@ mod tests {
         assert_eq!(app.messages.live_rows().count(), 0, "resolved");
     }
 
-    /// A PERSON NO LOOK HAS SEEN LATELY NEVER REACHES THE BAND (the review of
-    /// 2026-09-28; messages.log of 2026-09-27: a row said "someone is typing in
-    /// its tab" for 5 h 50 min of a turn the harness itself had continued).
-    /// The words still follow the person (`Row::person_seen`, on the record and
-    /// `--status`), but a person at the tab is not the owner needed: no look at
-    /// them, or at their absence, is ever a row, and the record is written
-    /// once. NEGATIVE CONTROL: a later look that still sees them restates
-    /// nothing.
+    /// A person at the tab is never a row: the words follow them (`Row::person_seen`) and
+    /// the record is written once.
     #[test]
     fn a_person_no_look_has_seen_lately_never_reaches_the_band() {
         let mut app = App::headless_for_test();
@@ -2935,10 +2654,8 @@ mod tests {
         ids
     }
 
-    /// RULING 270's place words, for an agent in a split pane the keyboard
-    /// is NOT in (round 17 review, V5): still `in tab 1` — every terminal
-    /// leaf of the tab is read, not only the focused one. NEGATIVE CONTROL: a
-    /// session no window shows is `in its tab`.
+    /// An agent in a split pane the keyboard is not in is still `in tab 1`. Negative
+    /// control: a session no window shows is `in its tab`.
     #[test]
     fn an_agent_in_an_unfocused_split_is_placed_in_its_tab() {
         let mut app = App::headless_for_test();
@@ -2967,13 +2684,8 @@ mod tests {
         assert_eq!(app.upgrade_place("s-0000000000000000"), "in its tab");
     }
 
-    /// TWO WINDOWS, EACH WITH AN AGENT IN ITS FIRST TAB: the band is every
-    /// window's, and tabs are counted per window, so both stalls read `in tab
-    /// 1` — the same line twice, a capsule pressed on the wrong one. Once the
-    /// owner has more than one window the place names the window too (`in
-    /// window 1, tab 1`, `in window 2, tab 1`), in the order the windows
-    /// opened; never a session id (ruling 270). NEGATIVE CONTROL: one window
-    /// keeps the short words, tab by tab.
+    /// With two windows the place names the window (`in window 2, tab 1`); one window keeps
+    /// the short words.
     #[test]
     fn two_windows_first_tabs_are_told_apart_by_their_window() {
         let mut app = App::headless_for_test();
@@ -2992,7 +2704,7 @@ mod tests {
             store.by_local(local).unwrap().sid.as_str().to_string()
         };
         let (a, b) = (sid_of(&app, first), sid_of(&app, second));
-        // NEGATIVE CONTROL: one window, two tabs.
+        // Negative control: one window, two tabs.
         assert_eq!(app.upgrade_place(&a), "in tab 1");
         assert_eq!(app.upgrade_place(&b), "in tab 2");
         let moved = app
@@ -3028,15 +2740,8 @@ mod tests {
         }
     }
 
-    /// RULING 440 — THE ROW THAT STANDS TAKES THE OWNER TO ITS TAB: an agent
-    /// the upgrade ended asks for a hand in its tab, so its row offers `Show
-    /// tab N` for that tab, as the digest's lines do; and at the look after
-    /// the tab moves — here into a second window, where its words become `in
-    /// window 2, tab 1` — the row's place and its button are restated
-    /// together, and a press shows the tab. At the look after the first
-    /// window closes, its words lose the window while its button stays: the
-    /// place alone restates it. NEGATIVE CONTROL: a session no tab shows (`in
-    /// its tab`) offers nothing, since there is nowhere to go.
+    /// An ended agent's row offers `Show tab N`, restated with its place when the tab moves
+    /// windows; a session no tab shows offers nothing.
     #[test]
     fn an_ended_agents_row_takes_the_owner_to_its_tab() {
         let mut app = App::headless_for_test();
@@ -3103,9 +2808,8 @@ mod tests {
             "its press shows the tab"
         );
 
-        // The first window closed: one window is left, so the words lose
-        // their `window 2,` while the button — the window's id, not its
-        // number — stays as it is. The place alone restates the row, in place.
+        // The first window closed: the words lose their `window 2,` while the button (the
+        // window's id, not its number) stays, so the place alone restates the row.
         assert!(matches!(
             app.close_window_logical(wid),
             crate::CloseOutcome::Stay
@@ -3116,7 +2820,7 @@ mod tests {
         assert_eq!(alone.title, "Claude stopped in tab 1");
         assert_eq!(alone.actions, [show], "the button already named the tab");
 
-        // NEGATIVE CONTROL: no tab of this instance shows the session.
+        // Negative control: no tab of this instance shows the session.
         let mut app = App::headless_for_test();
         app.apply_agent_upgrades(vec![ended("s-0000000000000000")]);
         let (_, nowhere) = row_of(&app, "s-0000000000000000").expect("its row");
@@ -3124,12 +2828,8 @@ mod tests {
         assert!(nowhere.actions.is_empty(), "{:?}", nowhere.actions);
     }
 
-    /// RULING 440 — A REFUSED PRESS ON THE ROW THAT STANDS: the refusal is laid
-    /// over the interrupt's row with the row's own buttons, `Show tab N` among
-    /// them, and the look after it, which moves nothing, leaves it as it is —
-    /// the refusal's title is not the stall's, and only the place and the
-    /// buttons are compared. NEGATIVE CONTROL: once the tab moves, the look
-    /// does restate the row, where its tab is now.
+    /// A refused press on an interrupt's row keeps the row's buttons and stands through a
+    /// look that moves nothing; once the tab moves, the look restates it.
     #[test]
     fn a_refused_press_on_an_interrupts_row_stands_until_its_tab_moves() {
         let (mut app, [_, _, c]) = three_tabs();
@@ -3167,7 +2867,7 @@ mod tests {
             "a look that moves nothing leaves the refusal"
         );
 
-        // NEGATIVE CONTROL: the tab moved; the look restates the row there.
+        // Negative control: the tab moved; the look restates the row there.
         let moved = app.detach_active_tab_logical().expect("c moves");
         app.apply_agent_upgrades(vec![ended]);
         let (_, there) = row_of(&app, &c).expect("c's row, restated");
@@ -3220,14 +2920,8 @@ mod tests {
             .map(|l| (l.id, l.msg.clone()))
     }
 
-    /// A NOTICE ATERM COULD NOT TYPE, UNDER THE OWNER'S `Upgrade now` (the
-    /// review of 2026-09-28): the row offered `Upgrade now`, and pressed, the
-    /// same row came back at once — the refusal count the stall is told by
-    /// stood through the word. The word starts it over (`St::new_round`, the
-    /// row the writer hands back), so the answered row stays answered. And a
-    /// refusal still standing ninety minutes after the word says aterm's
-    /// fence is what fails, offering what the owner can still do — never
-    /// `Upgrade now` again.
+    /// `Upgrade now` on a notice aterm could not type starts the refusal count over, so the
+    /// row stays answered; ninety minutes on, the refusal no longer offers `Upgrade now`.
     #[test]
     fn upgrade_now_on_a_notice_aterm_could_not_type_is_not_put_back() {
         use aterm_messages::UpgradeWord;
@@ -3317,8 +3011,8 @@ mod tests {
         cols.rsplit(' ').next().unwrap_or_default().to_string()
     }
 
-    /// Each tab's `upgrade=` column is ITS row; a tab with none reads `-`, and
-    /// a row that leaves the summary leaves the column.
+    /// Each tab's `upgrade=` column is its own row; a tab with none reads `-`, and a row
+    /// that leaves the summary leaves the column.
     #[test]
     fn each_tab_carries_its_own_upgrade_column() {
         let mut app = App::headless_for_test();
@@ -3330,11 +3024,11 @@ mod tests {
         assert_eq!(upgrade_column(&app, a), "upgrade=-", "gone with its row");
     }
 
-    /// THE MANAGED RECORD'S COUNTS (gap audit 2026-09-24): a frozen tab with
-    /// an agent in front is never counted for the hook to type — it is an
-    /// agent tab, or healed by the move when the upgrade is moving it — and
-    /// the sessions the upgrade moves are counted. NEGATIVE CONTROL: the same
-    /// frozen tab at its shell is counted for the hook.
+    /// A frozen tab with an agent in front is never counted for the hook to type; the same
+    /// tab at its shell is. The agent is the one the host supervises: a Claude Code started
+    /// as `node`, identified by its screen, takes prompts too (it was counted as a shell,
+    /// and the record told the person to type the hook into it). NEGATIVE CONTROL: a `node`
+    /// whose screen named no agent is a shell's job.
     #[test]
     fn a_frozen_tab_running_an_agent_is_never_counted_for_the_hook() {
         let mut app = App::headless_for_test();
@@ -3360,15 +3054,46 @@ mod tests {
             },
             "two shells: the hook, twice"
         );
-        front(&app, a, "claude");
+        for program in atpkg::stub::AGENT_PROGRAMS
+            .iter()
+            .copied()
+            .chain(["claude-code"])
+        {
+            front(&app, a, program);
+            assert_eq!(
+                app.tabs_behind(),
+                TabsBehind {
+                    frozen_shells: 1,
+                    frozen_agents: 1,
+                    ..TabsBehind::default()
+                },
+                "{program} takes prompts, never the shell's hook command"
+            );
+        }
+        front(&app, a, "node");
+        assert_eq!(
+            app.tabs_behind(),
+            TabsBehind {
+                frozen_shells: 2,
+                ..TabsBehind::default()
+            },
+            "a node whose screen named no agent"
+        );
+        {
+            let store = app.store.read().unwrap();
+            let mut tl = store.by_local(a).unwrap().ctx.timeline.lock().unwrap();
+            tl.set_agent_reader_for_test(true);
+        }
         assert_eq!(
             app.tabs_behind(),
             TabsBehind {
                 frozen_shells: 1,
                 frozen_agents: 1,
                 ..TabsBehind::default()
-            }
+            },
+            "a node-hosted Claude Code takes prompts, never the shell's hook command"
         );
+        front(&app, a, "claude");
         let text = "claude 2.1.282 (Anthropic latest)";
         app.upgrade_view.note_managed_text(text);
         app.apply_agent_upgrades(vec![row(&sid_a, 60)]);
@@ -3376,7 +3101,10 @@ mod tests {
             app.tabs_behind(),
             TabsBehind {
                 frozen_shells: 1,
-                agents_behind: 1,
+                agents_behind: PerAgent {
+                    claude: 1,
+                    ..PerAgent::default()
+                },
                 ..TabsBehind::default()
             },
             "the move heals it: counted as moving, not as a tab to type into"
@@ -3402,16 +3130,83 @@ mod tests {
         );
     }
 
-    /// ONLY A SESSION THAT WILL MOVE ON ITS OWN IS SAID TO MOVE (review of
-    /// 2026-09-25: an overdue session was counted so while the band showed it
-    /// stalled). An overdue, gave-up or skipped session is counted as staying
-    /// behind — the title still says "installed". Every session RUNNING a
-    /// build older than the record's is counted, whatever its row targets: one
-    /// moving to another version lags it just the same, and so does one moving
-    /// onto the NATIVE copy (the measured 2.1.281 session was native). One
-    /// already on the record's build is not behind, wherever it moves next.
-    /// NEGATIVE CONTROL: a healthy pending row onto the named version is
-    /// counted as moving.
+    /// A read-only agent still owns its prompt: the installed-agents advice
+    /// must defer its shell hook until that agent exits. The reader is the
+    /// measured Muse composer under node, published through the real timeline.
+    /// Controls run first: node without a reader and a same-group shell exec
+    /// that leaves Muse's reader stale both retain ordinary shell advice.
+    #[test]
+    fn a_read_only_node_hosted_agent_keeps_its_prompt_out_of_the_shell_hook_advice() {
+        use aterm_phase::Program;
+        let rows = aterm_phase::prompt::fixtures::screen(aterm_phase::muse::fixtures::IDLE);
+        let muse = aterm_phase::identify(Some("node"), &rows).program();
+        assert_eq!(muse, Program::Muse, "the measured runtime-hosted composer");
+        assert!(!muse.supervisable(), "reading grants no supervision");
+        for (program, reader, owns_prompt) in [
+            ("node", None, false),
+            ("zsh", Some(muse), false),
+            ("node", Some(muse), true),
+        ] {
+            let mut app = App::headless_for_test();
+            app.session_factory.shell_override = Some("/bin/zsh".into());
+            let [(id, _), _] = two_tabs(&app);
+            let ctx = {
+                let mut store = app.store.write().unwrap();
+                store.mark_frozen_path(id);
+                store.by_local(id).unwrap().ctx.clone()
+            };
+            {
+                let mut timeline = ctx.timeline.lock().unwrap();
+                timeline.note_foreground_group(42);
+                timeline.set_program(42, Some("node".into()));
+                timeline.publish_agent(
+                    "idle",
+                    None,
+                    None,
+                    reader,
+                    crate::session_timeline::AgentStamp {
+                        generation: crate::control::ScreenGen { epoch: 0, seq: 1 },
+                        fp: 1,
+                    },
+                );
+                if program != "node" {
+                    timeline.set_program(42, Some(program.into()));
+                    assert_eq!(timeline.agent().reader, Some(muse), "the stale reader");
+                }
+                assert_eq!(crate::harness_host::agent_of(timeline.agent()), None);
+            }
+            let expected = if owns_prompt {
+                TabsBehind {
+                    frozen_agents: 1,
+                    ..TabsBehind::default()
+                }
+            } else {
+                TabsBehind {
+                    frozen_shells: 1,
+                    ..TabsBehind::default()
+                }
+            };
+            assert_eq!(app.tabs_behind(), expected, "{program}, reader={reader:?}");
+            app.post_managed_current("muse 1.4.9-R6297.1 (latest)");
+            let advice = app
+                .messages
+                .log()
+                .records()
+                .rfind(|r| r.key.as_deref() == Some(crate::toolchain_words::KEY_MANAGED))
+                .map(|r| r.detail.join(" "))
+                .expect("the installed-agents record");
+            let hook = app.hook_dialect().remedy().expect("the selected zsh hook");
+            assert!(advice.contains(&hook), "the actual hook advice: {advice}");
+            assert_eq!(
+                advice.contains("once the agent exits"),
+                owns_prompt,
+                "{program}, reader={reader:?}: {advice}"
+            );
+        }
+    }
+
+    /// Only a session that will move on its own is said to move; overdue, gave-up or
+    /// skipped ones stay behind, counted by the build they run, native copies included.
     #[test]
     fn only_a_session_running_an_older_build_that_moves_on_its_own_is_said_to_move() {
         let mut app = App::headless_for_test();
@@ -3450,8 +3245,14 @@ mod tests {
         assert_eq!(
             app.tabs_behind(),
             TabsBehind {
-                agents_behind: 3,
-                agents_held: 3,
+                agents_behind: PerAgent {
+                    claude: 3,
+                    ..PerAgent::default()
+                },
+                agents_held: PerAgent {
+                    claude: 3,
+                    ..PerAgent::default()
+                },
                 ..TabsBehind::default()
             },
             "healthy, native and 2.1.283-bound move; overdue, gave-up, skipped stay; one \
@@ -3480,22 +3281,88 @@ mod tests {
         assert_eq!(fresh.tabs_behind(), TabsBehind::default());
     }
 
-    /// "ARE CURRENT" IS NEVER SAID WHILE A SESSION RUNS AN OLDER BUILD (audit
-    /// 2026-10-09: nine `… are current · ready in every aterm tab` records in
-    /// a week while two tabs ran days-old builds). At the install the marker
-    /// lands while the rows still target the PREVIOUS build — their retarget
-    /// comes two seconds later — so a count of rows onto the new build alone
-    /// was zero and the record said "current". The sessions are counted by the
-    /// build they run, a finished move onto an older build among them, and a
-    /// relaunch onto an older build.
-    /// NEGATIVE CONTROL: sessions that run the installed build leave the
-    /// record "current" — one moving past it, one whose move onto it is done,
-    /// and one RELAUNCHED onto it, fresh or stuck past `STALE_S` waiting for
-    /// the idle point that carries its conversation on (review of
-    /// 2026-10-09: the relaunch line typed the managed copy, so such a
-    /// session runs it; read by the build it moves from, a stuck one was
-    /// recorded "still on the old build" while the band's own stuck row said
-    /// the new one had started).
+    /// A CODEX SESSION IS BEHIND THE MANAGED CODEX: the count read only Claude Code's
+    /// version and dropped every Codex row, so a Codex tab on an older build than the
+    /// managed codex left the record "current" and was named nowhere. Each row is counted
+    /// against its own program's version, per agent, and each product is said with its
+    /// own count. NEGATIVE CONTROL: a Codex row already on the managed codex is not
+    /// behind, though its version is older than Claude Code's.
+    #[test]
+    fn a_codex_session_behind_the_managed_codex_is_counted_and_named() {
+        use aterm_agent::harness::upgrade::Agent;
+        let mut app = App::headless_for_test();
+        let text = "claude 2.1.282 (Anthropic latest); codex 0.157.0 (OpenAI latest)";
+        app.upgrade_view.note_managed_text(text);
+        let codex = |tab: &str, from: &str, behind_for: u64| Row {
+            agent: Agent::Codex,
+            from: from.to_string(),
+            to: "0.157.0".to_string(),
+            ..row(tab, behind_for)
+        };
+        app.apply_agent_upgrades(vec![
+            row("s-claude", 60),
+            codex("s-codex", "0.156.0", 60),
+            codex("s-codex-overdue", "0.156.0", 7 * 3_600),
+            Row {
+                to: "0.158.0".to_string(),
+                ..codex("s-codex-on-it", "0.157.0", 60)
+            },
+        ]);
+        assert_eq!(
+            app.tabs_behind(),
+            TabsBehind {
+                agents_behind: PerAgent {
+                    claude: 1,
+                    codex: 1
+                },
+                agents_held: PerAgent {
+                    codex: 1,
+                    ..PerAgent::default()
+                },
+                ..TabsBehind::default()
+            },
+            "each agent against its own build; one already on 0.157.0 is not behind"
+        );
+        assert!(!app.post_managed_current(text), "re-derived by the rows");
+        let record = |app: &App| {
+            app.messages
+                .log()
+                .records()
+                .rfind(|r| r.key.as_deref() == Some(crate::toolchain_words::KEY_MANAGED))
+                .map(|r| (r.title.clone(), r.detail.join(" ")))
+                .expect("the record")
+        };
+        let (title, detail) = record(&app);
+        assert_eq!(title, "Claude Code 2.1.282 and Codex CLI 0.157.0 installed");
+        assert!(
+            detail.contains("1 running Claude Code session moves onto it on its own"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("1 running Codex session moves onto it on its own"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("1 running Codex session is still on the old build"),
+            "{detail}"
+        );
+        // A Codex session alone behind keeps the record from saying "current".
+        let mut alone = App::headless_for_test();
+        alone.upgrade_view.note_managed_text(text);
+        alone.apply_agent_upgrades(vec![codex("s-codex", "0.156.0", 60)]);
+        assert!(!alone.post_managed_current(text), "re-derived by the rows");
+        let (title, detail) = record(&alone);
+        assert_eq!(title, "Claude Code 2.1.282 and Codex CLI 0.157.0 installed");
+        assert!(
+            detail.contains("1 running Codex session moves onto it on its own")
+                && !detail.contains("Claude Code session"),
+            "{detail}"
+        );
+    }
+
+    /// "Are current" is never said while a session runs an older build (counted by the
+    /// build it runs); sessions moved, done or relaunched onto the installed build (even
+    /// stuck past `STALE_S`) leave it "current".
     #[test]
     fn the_install_is_not_current_while_a_session_runs_an_older_build() {
         let title = |rows: Vec<Row>| {
@@ -3573,13 +3440,8 @@ mod tests {
         );
     }
 
-    /// ONE INSTALL IS ONE RECORD (audit 2026-10-09: 28 `toolchain.managed`
-    /// records for 11 updates, one install recorded at 12:48:46, :49 and :51
-    /// as its rows retargeted and moved): the record is written when the SET
-    /// OF VERSIONS changes, and the tab counts that move after it re-word that
-    /// record in place — its words follow the sessions, the log keeps one
-    /// entry. A new version is a new record. NEGATIVE CONTROL: the record's
-    /// words did move, from "installed" to "current".
+    /// One install is one record, its tab counts re-worded in place; a new version is a new
+    /// record.
     #[test]
     fn one_install_is_one_record_whose_counts_move_in_place() {
         let mut app = App::headless_for_test();
@@ -3617,12 +3479,8 @@ mod tests {
         assert_eq!(managed(&app).len(), 2, "a new version is a new record");
     }
 
-    /// A RECORD GONE FROM THE RING IS WRITTEN AGAIN when its words move
-    /// (review of 2026-10-09): the in-place re-word needs the record still
-    /// there, and once the shared ring (`LOG_CAP`) has evicted it the new
-    /// counts are a new record — never silence until the versions move.
-    /// NEGATIVE CONTROL: that new record is the one re-worded after it, and
-    /// the same words again write nothing.
+    /// A managed record evicted from the ring (`LOG_CAP`) is written again when its words
+    /// move; the same words again write nothing.
     #[test]
     fn a_managed_record_gone_from_the_ring_is_written_again() {
         let mut app = App::headless_for_test();
@@ -3673,11 +3531,8 @@ mod tests {
         );
     }
 
-    /// A TAB MEASURED TO PUT A FOREIGN COPY FIRST, two jobs in a row, with no
-    /// adoption mark, is counted as shadowed — never as "from before this
-    /// update" (review of 2026-09-25: one job's `PATH=` override raised the
-    /// mark and the band said so). NEGATIVE CONTROL: one job's frozen reading
-    /// counts nothing.
+    /// A tab measured two jobs running to put a foreign copy first counts as shadowed,
+    /// never "from before this update"; one job's reading counts nothing.
     #[test]
     fn a_tab_measured_frozen_is_shadowed_not_from_before_this_update() {
         use crate::session_status::program::PathVerdict;
@@ -3703,8 +3558,8 @@ mod tests {
         assert!(!app.store.read().unwrap().has_frozen_path(a), "no mark");
     }
 
-    /// A FINISHED MOVE is one record, with the model its first answer named;
-    /// the same finish handed over again is not recorded twice.
+    /// A finished move is one record, with the model its first answer named; the same
+    /// finish handed over again is not recorded twice.
     #[test]
     fn a_finished_move_is_recorded_once_with_its_model() {
         let mut app = App::headless_for_test();
@@ -3730,14 +3585,8 @@ mod tests {
         assert_eq!(app.messages.live_rows().count(), 0, "a record, never a row");
     }
 
-    /// A MOVE THAT FINISHED DAYS AFTER IT HAPPENED SAYS WHEN IT HAPPENED (audit
-    /// 2026-10-09: `Claude Code moved onto 2.1.287` was recorded seven days
-    /// after the move, at the session's next idle turn end, dated as if it
-    /// had just happened). The relaunch's instant rides the row
-    /// (`Row::moved_at`) to the finished move's record, which names it on the
-    /// reader's clock against the day the record is written. NEGATIVE CONTROL:
-    /// a move finished minutes after its relaunch says nothing more — its
-    /// record's own instant is the move's.
+    /// A move recorded days after its relaunch names when it happened (`Row::moved_at`);
+    /// one recorded minutes after says nothing more.
     #[test]
     fn a_move_finished_days_later_names_when_it_happened() {
         use crate::message_reporters::moved_line;
@@ -3795,7 +3644,7 @@ mod tests {
             detail.last().map(String::as_str),
             Some("model claude-opus-5-5")
         );
-        // NEGATIVE CONTROL: moved two minutes before it finished.
+        // Negative control: moved two minutes before it finished.
         let mut app = App::headless_for_test();
         let prompt = Row {
             phase: Phase::Done,
@@ -3815,7 +3664,7 @@ mod tests {
         );
     }
 
-    // ------------------------------------------------ the owner's word (gap #21)
+    // ---------------------------------------------------------------------- the owner's word
 
     /// A [`WordWriter`] that answers `answer` and hands every word it is
     /// asked to write to the returned receiver.
@@ -3851,16 +3700,8 @@ mod tests {
             .map(|l| (l.id, l.msg.clone()))
     }
 
-    /// RULING 283 — ONE ENTRY PER STOPPED STORY, NOW A RECORD (ruling 423:
-    /// the owner's rule of 2026-09-28, an alert persists only where they can
-    /// act). A round that stops once and will ask again on its own is a
-    /// RECORD saying when; the same stop again is a digest line, until the
-    /// digest exists one calm record under the same key, which stands through
-    /// the re-armed round, its notice and its restart in flight and the next
-    /// identical stop - never a row on the band, never a mark, and never
-    /// withdrawn at a re-arm and posted anew a round later. It ends at Done.
-    /// NEGATIVE CONTROL: before ruling 423 the second stop raised a standing
-    /// row.
+    /// A stop that repeats is one calm record through its re-armed rounds, never a row,
+    /// mark or re-post, ending at Done.
     #[test]
     fn a_stop_that_repeats_is_one_record_across_its_rearms_and_ends_at_done() {
         let mut app = App::headless_for_test();
@@ -3935,16 +3776,8 @@ mod tests {
         );
     }
 
-    /// A SHUTDOWN THAT HUNG (S2 of the in-flight review; ruling 327) takes one
-    /// row - the upgrade asked the agent to end and it has not, so only the
-    /// owner can (`Press Ctrl-C in that tab`), after [`HUNG_EXIT_AFTER_S`]
-    /// (15 minutes, three times the restart's own bound; nothing harder is
-    /// ever sent) - which follows what the restart waits on while it is stuck
-    /// (`exiting`, then `exited`: one row, restated in place) and is resolved
-    /// once the restart moves again - never left up by the host's in-flight
-    /// guard saying "has not exited" of an agent that exited and relaunched.
-    /// NEGATIVE CONTROL: within the bound the restart is no stall and takes no
-    /// row.
+    /// A shutdown hung past `upgrade_drive::HUNG_EXIT_AFTER_S` takes one row (`Press
+    /// Ctrl-C in that tab`), restated in place while stuck and resolved once it moves.
     #[test]
     fn a_restart_that_sticks_keeps_one_row_while_stuck_and_resolves_once_it_moves() {
         let mut app = App::headless_for_test();
@@ -3985,17 +3818,8 @@ mod tests {
         );
     }
 
-    /// A STUCK ROW PUT DOWN ENDS ON THE RECORD AS WHAT HAPPENED (ruling 327
-    /// with ruling 307(d); the merge review of 2026-09-28). The person
-    /// dismissed the row a stuck restart alone earned, and the restart then
-    /// moved again, still in flight: the row is down, so the stall's end is
-    /// a record under its key — `Claude upgrade moves again in its tab`, the
-    /// stuck words as `was: …`. Before the fix it read `Claude upgrade asks
-    /// again in its tab`, ruling 307's words for a tab whose round goes on,
-    /// of a restart that asks nothing again: it carries on to Done, which
-    /// adds nothing under the key. NEGATIVE CONTROL: the same stuck row left
-    /// up (`s-b`) is resolved when its restart moves, and nothing is
-    /// recorded under its key.
+    /// A stuck restart's row put down, whose restart then moves again, ends on the record
+    /// as `… moves again in its tab`, never as asking again; one left up is resolved.
     #[test]
     fn a_stuck_row_put_down_ends_on_the_record_as_moving_again_never_asking() {
         let mut app = App::headless_for_test();
@@ -4072,17 +3896,9 @@ mod tests {
         );
     }
 
-    /// THE OWNER STEERS THE UPGRADE FROM ITS RECORD (gap #21: until now only
-    /// `aterm harness upgrade <tab> --now|--defer|--skip`, typed into some
-    /// other shell, could). A press of a stalled row's capsule reaches the
-    /// writer — `upgrade_drive::ask_for` in production — with THAT row's tab,
-    /// THAT row's target build and the word pressed, once; and the row
-    /// leaves the band FIXED, its record re-titled with what the word did
-    /// under ✓, its stall title kept below — a confirmation earns no row of
-    /// its own (ruling 76) — and the host's next rows (the word landed, the
-    /// stall is over) post no stall row again. NEGATIVE
-    /// CONTROLS: the other tab's row is untouched and keeps its capsules, and
-    /// its `Not today` reaches the writer as that tab's own deferral of a day.
+    /// A press of an overdue tab's record button writes that tab's word for that build once,
+    /// answered by a record of its own (`ℹ`, never `✓`); the other tab's `Not today`
+    /// reaches the writer as its own deferral of a day.
     #[test]
     fn a_capsule_press_writes_that_tabs_word_for_that_build_and_its_row_says_so() {
         use aterm_messages::{Severity, UpgradeWord};
@@ -4101,7 +3917,7 @@ mod tests {
             })
         });
         app.upgrade_view.writer = writer;
-        // An overdue tab is a RECORD (Settings ▸ Messages), which carries the
+        // An overdue tab is a record (Settings ▸ Messages), which carries the
         // owner's words as its buttons; the band holds no row for it.
         app.apply_agent_upgrades(vec![a.clone()]);
         assert!(row_of(&app, "s-a").is_none(), "a record, never a row");
@@ -4129,11 +3945,10 @@ mod tests {
             })
         );
         assert!(asked.try_recv().is_err(), "one press, one word");
-        // A record has no row to restate: the answer is a record of its own,
-        // in the word's words. The rig's tab waits on a notice behind a full
-        // queue (ruling 380): `Upgrade now` types it once more (ruling 307
-        // (c)). Ruling 270: a word is a choice, not delivered work or a fix -
-        // `ℹ`, never `✓` and `took`.
+        // A record has no row to restate: the answer is a record of its own, in the word's
+        // words. The rig's tab waits on a notice behind a full queue, so `Upgrade now`
+        // types it once more. A word is a choice, not delivered work: `ℹ`, never `✓` or
+        // `took`.
         let answered = records_titled(&app, "Claude is asked again in its tab");
         assert_eq!(answered.len(), 1, "{:?}", harness_records(&app));
         assert!(
@@ -4158,9 +3973,7 @@ mod tests {
         app.apply_agent_upgrades(vec![hurried, b.clone()]);
         assert!(row_of(&app, "s-a").is_none());
         assert_eq!(app.messages.live_rows().count(), 0);
-        // Round 18, day four (D7): the press is its row's answer, never a
-        // second record `… installs itself` (`… ready for 1 session` until
-        // ruling 380).
+        // The press is its record's answer, never a second `… installs itself` record.
         assert!(
             harness_records(&app)
                 .iter()
@@ -4169,7 +3982,7 @@ mod tests {
             harness_records(&app)
         );
 
-        // The other tab's row is its own.
+        // The other tab's record is its own.
         let id_b = record_id_of(&app, "s-b").expect("s-b's record");
         assert_eq!(record_of(&app, id_b).0, "Claude upgrade waits in its tab");
         assert_eq!(buttons(&app, id_b).len(), 2);
@@ -4199,15 +4012,8 @@ mod tests {
         (rec.title.clone(), rec.severity, rec.detail.clone())
     }
 
-    /// AN OVERDUE TAB'S MENU FOLLOWS WHAT MOVES IT NOW (review of gap #21): the
-    /// tab's menu offers the owner's words for a stall that is now a RECORD
-    /// (the band holds a row only for an agent the upgrade ended), and an
-    /// overdue stall's remedy moves with its wait. Waiting on a notice behind
-    /// a full queue, `Upgrade now` types it once more and is offered; the same
-    /// stall waiting on the agent's READY answer — which `--now` does not
-    /// waive, and where a press would only arm a new notice round — stops
-    /// offering it. No capsule is on the record either way (a decline is no
-    /// action). NEGATIVE CONTROL: the host's same rows again change nothing.
+    /// An overdue tab's menu offers `Upgrade now` while a full queue holds the notice and
+    /// stops once it waits on the READY answer, which `--now` does not waive.
     #[test]
     fn an_overdue_tabs_menu_follows_what_moves_it_now() {
         use aterm_messages::UpgradeWord::{NotToday, Now, Skip};
@@ -4238,13 +4044,8 @@ mod tests {
         assert_eq!(app.messages.revision(), revision, "nothing to restate");
     }
 
-    /// A STALL'S ROW FOLLOWS ITS SHAPE, NOT ONLY ITS KIND (ruling 279): an
-    /// announced move on the agent's own work asks again on its own and is a
-    /// record (D5); the agent then ended and not brought back is the one
-    /// state that takes a row — at once, the tab's mark and the glass
-    /// agreeing — with no snooze capsule (a decline is no action there). Back
-    /// to asking on its own, the row leaves the glass, withdrawn (never a `✓`:
-    /// nothing moved). NEGATIVE CONTROLS: the same rows again change nothing.
+    /// A record whose agent then ended takes a row at once (no snooze capsule); back to
+    /// asking on its own, the row is withdrawn, never `✓`.
     #[test]
     fn a_stall_that_turns_into_an_ended_agent_takes_a_row_and_one_asking_on_its_own_leaves_the_glass()
      {
@@ -4303,14 +4104,8 @@ mod tests {
         assert_eq!(waiting.len(), 2, "the wait's record, then its record again");
     }
 
-    /// A WORD'S ANSWER NEVER BRINGS BACK A ROW THE HOST HAS SINCE DROPPED
-    /// (review of gap #21): the word is written off this thread, and the
-    /// host's own rows can land first — the tab closed, its conversation
-    /// ended. The host hands over only a CHANGE, so a row the answer put
-    /// back would stand in the view — the waiting record, Settings ▸
-    /// Messages' buttons — until something else moved. What the word did is
-    /// still recorded. NEGATIVE CONTROL: with the row still in the view, the
-    /// answer's row takes its place at once.
+    /// A word's answer never brings back a row the host has since dropped; with the row
+    /// still in the view, the answer's row takes its place.
     #[test]
     fn a_words_answer_never_brings_back_a_row_the_host_dropped() {
         let mut app = App::headless_for_test();
@@ -4348,14 +4143,8 @@ mod tests {
         );
     }
 
-    /// A TAB-MENU WORD IS FOR THE SESSION ITS MENU NAMED (review of gap #21):
-    /// a split tab runs a session per pane, and its menu is composed for the
-    /// FOCUSED one. Focus can move while the menu is open or its click is
-    /// queued (the `pane` control verb, a script), and both panes' agents
-    /// commonly move to the SAME managed build, so the harness's target
-    /// check cannot catch a word re-resolved to the pane focused at dispatch
-    /// time. The word goes to the session the owner saw. NEGATIVE CONTROL:
-    /// a session no longer in that tab drops the word.
+    /// A tab-menu word goes to the session its menu named, not the pane focused at
+    /// dispatch; a session no longer in that tab drops the word.
     #[test]
     fn a_tab_menu_word_is_for_the_session_its_menu_named() {
         use aterm_messages::UpgradeWord::Skip;
@@ -4410,17 +4199,8 @@ mod tests {
         assert!(asked.try_recv().is_err(), "dropped");
     }
 
-    /// THE OWNER'S WORDS ARE WRITTEN ONE AT A TIME, IN THE ORDER PRESSED
-    /// (review of gap #21). The writer can wait up to 10 s on the sweep lock
-    /// (a step restarting some session holds it), and a row gives no sign
-    /// meanwhile, so a second press — the same word again, or the owner's
-    /// changed mind — comes while the first waits. Each word replaces the
-    /// last, so the last pressed must be the last written: a thread per
-    /// press raced the two for the lock, and the earlier word could land
-    /// last. Here the first word waits as on a held lock while the second
-    /// is pressed. The pass does not depend on timing (the second never
-    /// enters the writer before the first leaves); a thread per press is
-    /// caught whenever its second thread runs within the 200 ms.
+    /// Words are written one at a time in press order ([`WordQueue`]): the second never
+    /// enters the writer before the first leaves.
     #[test]
     fn the_owners_words_are_written_one_at_a_time_in_the_order_pressed() {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -4469,11 +4249,8 @@ mod tests {
         assert_eq!(order, [UpgradeWord::Now, UpgradeWord::NotToday]);
     }
 
-    /// A WORD THE HARNESS REFUSED, PRESSED ON A WAIT'S RECORD: nothing was
-    /// written (here another step held the sweep lock). A wait is a record,
-    /// never a row, so there is no stalled row to restate: the refusal is a ROW
-    /// in the gesture-failure shape (ruling 270) that names the press to try
-    /// again, and the host's same rows do not post the wait a row.
+    /// A word refused on a wait's record is a gesture-failure row, and the host's same rows
+    /// post the wait no row.
     #[test]
     fn a_refused_word_on_a_waits_record_is_a_gesture_failure_row() {
         use aterm_messages::Hold;
@@ -4508,9 +4285,8 @@ mod tests {
             "a wait is never posted as a failure"
         );
 
-        // Ruling 270: with no stalled row to restate (a tab-menu press, a
-        // Settings record's button), the refused press is a ROW in the
-        // gesture-failure shape — never only a quiet record.
+        // With no stalled row to restate (a tab-menu press, a Settings record's button),
+        // the refused press is a row in the gesture-failure shape, never only a record.
         let mut app = App::headless_for_test();
         app.apply_upgrade_word(
             &WordAsk {
@@ -4523,7 +4299,7 @@ mod tests {
         let refused: Vec<_> = app.messages.live_rows().map(|l| l.msg.clone()).collect();
         assert_eq!(refused.len(), 1, "{refused:?}");
         assert_eq!(refused[0].title, "Couldn't postpone the upgrade in its tab");
-        // The press itself is the remedy (ruling 307): the row carries it.
+        // The press itself is the remedy: the row carries it.
         assert_eq!(
             refused[0].actions,
             [aterm_messages::Intent::AgentUpgrade {
@@ -4540,14 +4316,8 @@ mod tests {
         );
     }
 
-    /// DAY FIVE, D22 — A PRESS ON A ROUND THAT STOPPED UNDER IT: the writer
-    /// refuses `Upgrade now` typed `stopped:` (the round is not the owner's
-    /// word to re-arm). The refusal says so naming its tab and when it retries
-    /// (a gesture-failure row of its own, carrying no button of the refused
-    /// word), and the host is asked to look again at once - before, the view
-    /// stayed stale for 60+ s and a second press changed nothing. NEGATIVE
-    /// CONTROL: a lock-busy refusal asks for no look
-    /// (`a_refused_word_on_a_waits_record_is_a_gesture_failure_row`).
+    /// A press refused with `stopped:` is a gesture-failure row naming when it retries, and
+    /// asks the host to look again; a lock-busy refusal does not.
     #[test]
     fn a_press_refused_because_its_round_stopped_says_so_and_looks_again() {
         let mut app = App::headless_for_test();
@@ -4583,13 +4353,8 @@ mod tests {
         );
     }
 
-    /// A PRESS ON A RECORD WHOSE UPGRADE MOVED ON LANDS ON NOTHING, through the
-    /// production writer and the harness's real `ask_for` over a state
-    /// directory: the window still shows the row for 2.1.282 while the tab's
-    /// upgrade now moves to 2.1.283, and its `Skip version` must not skip a
-    /// build the owner never saw — the state file is left byte for byte and
-    /// the row says the upgrade moved on. NEGATIVE CONTROL: the row the host
-    /// hands over next, for 2.1.283, writes the skip of 2.1.283.
+    /// Through the real `ask_for`, `Skip version` for a build the upgrade moved past leaves
+    /// the state file untouched and says so; the next row's skip is written.
     #[test]
     fn a_press_on_a_record_whose_upgrade_moved_on_lands_on_nothing() {
         let dir = std::env::temp_dir().join(format!(
@@ -4609,8 +4374,8 @@ mod tests {
         let before = std::fs::read_to_string(&file).expect("state file");
         let mut app = App::headless_for_test();
         app.upgrade_view.writer = word_writer_at(home, state, None);
-        // Stopped the same way twice (a record since ruling 423, with `Not
-        // today` and `Skip version` as its buttons).
+        // Stopped the same way twice: a record, with `Not today` and `Skip version` as its
+        // buttons.
         let shown = Row {
             phase: Phase::Failed("no-resume".to_string()),
             stop_streak: 2,
@@ -4652,12 +4417,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// ONE SESSION WAITING: its record carries `Upgrade now` and `Not today`
-    /// for its tab and build, and Settings ▸ Messages offers them only while
-    /// that upgrade still takes them — a newer target disables them, the
-    /// session gone drops them; a press from the page reaches the writer, and what the
-    /// word did is recorded. Two waiting: no one tab is the record's, so no
-    /// capsule.
+    /// One waiting session's record offers `Upgrade now` and `Not today` only while that
+    /// upgrade takes them; two waiting offer none.
     #[test]
     fn one_waiting_session_offers_its_words_while_its_upgrade_stands() {
         use aterm_messages::UpgradeWord;
@@ -4735,10 +4496,8 @@ mod tests {
             offered(&app),
             [("Upgrade now", false), ("Not today", false)]
         );
-        // Ruling 315 (day eight E3): the tab's session is gone — no row for
-        // it — so its words are not offered at all, where they stood drawn,
-        // disabled, three relaunches later. Another tab's row does not keep
-        // them.
+        // The tab's session is gone (no row for it), so its words are not offered at all;
+        // another tab's row does not keep them.
         app.apply_agent_upgrades(vec![row("s-b", 60)]);
         assert!(
             offered(&app).is_empty(),
@@ -4746,15 +4505,8 @@ mod tests {
         );
     }
 
-    /// A PRESS OF A WORD THE UPGRADE NO LONGER TAKES WRITES NOTHING (review
-    /// of gap #21). Settings ▸ Messages disables a record's button by
-    /// [`UpgradeView::offers`], but the page presses from the model it last
-    /// drew, and the harness re-checks only the build: an `Upgrade now` from
-    /// a record drawn before the owner's `--now` landed would arm a second
-    /// round for a move already hurried — the very press 2d93d2f9b took off
-    /// the menu. The host re-checks the word as it performs, as it does a
-    /// stop or a tab. NEGATIVE CONTROL: the same record's `Not today`, still
-    /// taken, is written.
+    /// A record's `Upgrade now` drawn before an earlier `--now` landed writes nothing (the
+    /// host re-checks [`UpgradeView::offers`]); its `Not today`, still taken, is written.
     #[test]
     fn a_press_of_a_word_the_upgrade_no_longer_takes_writes_nothing() {
         use aterm_messages::UpgradeWord;
@@ -4823,14 +4575,8 @@ mod tests {
             .collect()
     }
 
-    /// A TAB WHOSE AGENT HAS AN UPGRADE PENDING OFFERS EVERY WORD ON IT IN
-    /// ITS CONTEXT MENU (gap #21), for the build the band names; choosing one
-    /// writes it for THAT tab — resolved from the menu's pop-time tab — and
-    /// the build the card SHOWED, even when the upgrade moved on while the
-    /// card was open (the harness refuses that one: `ask_for`), and what it
-    /// did is recorded. NEGATIVE CONTROLS: the menu before any row has no
-    /// section, and when the row leaves the section leaves with it — the
-    /// rows re-key the tab chrome's cache.
+    /// A tab's context menu offers its upgrade's words, and a choice writes that tab's word
+    /// for the build the card showed; no row, no section.
     #[test]
     fn a_tabs_menu_offers_its_upgrades_words_and_a_choice_writes_that_tabs_word() {
         use aterm_messages::UpgradeWord::{NotToday, Now, Skip};
@@ -4905,13 +4651,11 @@ mod tests {
         );
     }
 
-    // ------------------------------------------ once, across a restart (2026-09-27)
+    // ------------------------------------------------------------ once, across a restart
 
-    /// `tab`'s upgrade as a stall that STANDS AS A ROW: the agent the upgrade
-    /// ended and could not bring back (`Interrupt`, `agent-down`) - the only
-    /// state that takes the band (ruling 423). The lifecycle tests below
-    /// (once across a restart, withdrawn and never `✓`, news when it
-    /// returns) keep their laws on it; a refusal or a give-up is a record.
+    /// `tab`'s upgrade as a stall that stands as a row: the agent the upgrade ended and
+    /// could not bring back (`Interrupt`, `agent-down`), the only state that takes the
+    /// band. A refusal or a give-up is a record.
     fn refused(tab: &str) -> Row {
         Row {
             phase: Phase::Failed("stale-exit".to_string()),
@@ -4922,12 +4666,8 @@ mod tests {
         }
     }
 
-    /// A STALL THE OWNER ANSWERED WITH A WORD IS QUIET FOR THE DAY: the row is
-    /// answered with the word pressed (ruling 270), and the word holds or moves
-    /// the upgrade, so the same stall is never a row the owner already saw
-    /// through. `Not today` on a refusal; while the deferral holds, nothing;
-    /// the engine's once-only rule (`STANDING_QUIET`, the deferral's own day)
-    /// keeps the same key down after it, and another tab's stall is news.
+    /// A stall answered with a word is quiet for the day (`STANDING_QUIET`); another tab's
+    /// stall is news.
     #[test]
     fn a_stall_answered_with_a_word_is_quiet_for_the_day() {
         let mut app = App::headless_for_test();
@@ -4956,10 +4696,9 @@ mod tests {
         };
         app.apply_agent_upgrades(vec![deferred]);
         assert!(row_of(&app, "s-a").is_none(), "held: no stall");
-        // THE ENGINE'S ONCE-ONLY RULE HOLDS IT (`STANDING_QUIET`, a day, the
-        // deferral's own span): a stall the owner answered is not raised again
-        // by the same key inside it, however the host rebuilds its view. NEGATIVE
-        // CONTROL: another tab's stall is news.
+        // The engine's once-only rule (`STANDING_QUIET`, a day, the deferral's own span):
+        // a stall the owner answered is not raised again by the same key inside it, however
+        // the host rebuilds its view. Negative control: another tab's stall is news.
         app.apply_agent_upgrades(vec![refused("s-a")]);
         assert!(
             row_of(&app, "s-a").is_none(),
@@ -4969,16 +4708,8 @@ mod tests {
         assert!(row_of(&app, "s-b").is_some(), "another tab: a row");
     }
 
-    /// A REFUSAL THE OWNER PUT OFF IS NEWS WHEN IT RETURNS, EVEN ACROSS A
-    /// RE-ARM (review of round 21, against ruling 307(e)): the owner
-    /// dismissed a refused row; the round re-armed for the same build and
-    /// met the refusal again (one stall: its row stays down); then `Not
-    /// today` came from the TAB MENU — no live row to answer, so the word is
-    /// a record. While it holds, nothing; once it has run out and the same
-    /// refusal stands, a row again. Before the fix the held round counted as
-    /// a re-arm, the entry stood, and the returning refusal matched it:
-    /// nothing was posted, and `Not today` meant never. NEGATIVE CONTROL:
-    /// the same re-arm with no word keeps the row down (the one stall).
+    /// A refusal put off with `Not today` from the tab menu, across a re-arm, is a row again
+    /// once the deferral runs out; with no word the re-arm keeps the row down.
     #[test]
     fn a_refusal_the_owner_put_off_from_the_tab_menu_is_news_when_it_returns() {
         use aterm_messages::UpgradeWord;
@@ -5006,7 +4737,7 @@ mod tests {
             row_of(&app, "s-a").is_none(),
             "one stall: its row stays down"
         );
-        // NEGATIVE CONTROL: an unheld re-arm keeps the entry.
+        // Negative control: an unheld re-arm keeps the entry.
         assert!(app.upgrade_view.stalled.contains_key("s-a"));
         // `Not today` from the tab menu: no live row, so a record.
         assert!(app.send_upgrade_word(WordAsk {
@@ -5024,20 +4755,8 @@ mod tests {
         assert!(row_of(&app, "s-a").is_some(), "back: a row");
     }
 
-    /// A STALL THE OWNER ALREADY SAW IS NOT POSTED AGAIN WHEN ATERM RESTARTS
-    /// (the owner's report of 2026-09-27: the updated window posted its tabs'
-    /// give-ups afresh, the view that had kept them gone with the process).
-    /// The next process reads the message log back, as a launch does: a row
-    /// the owner dismissed stays down; one carried across the handoff — on
-    /// the band when this process starts — is kept, never a second row.
-    /// NEGATIVE CONTROLS: a row still up, UNREAD, when the last process
-    /// stopped comes back to the band — once (review of 2026-09-27: a
-    /// Standing row stays until the stall ends or the person reads it); a
-    /// stall that ENDED since (its row resolved) is news when it comes back;
-    /// one the owner dismissed stays quiet for the day, whatever its target
-    /// (the engine's once-only rule, `STANDING_QUIET`). (The row
-    /// layouts of earlier builds are not carried for it: the one row that
-    /// stands is an ended agent's, which no earlier build worded so.)
+    /// After a restart a dismissed row stays down and a carried one is kept; a row left up
+    /// unread comes back once, an ended stall back is news, a dismissed one quiet a day.
     #[test]
     fn a_stall_the_owner_saw_is_not_posted_again_after_a_restart() {
         let dir = std::env::temp_dir().join(format!("aterm-upgrade-rows-{}", std::process::id()));
@@ -5059,7 +4778,7 @@ mod tests {
         first.flush_messages_log();
         drop(first.messages_log.take());
 
-        // THE NEXT PROCESS: the log read back, the stalls as they stand.
+        // The next process: the log read back, the stalls as they stand.
         let relaunched = || {
             let mut next = App::headless_for_test();
             next.messages = aterm_messages::MessageCenter::new(
@@ -5078,7 +4797,7 @@ mod tests {
             Some(again_b),
             "once: the same row, not another"
         );
-        // NEGATIVE CONTROLS: an ended stall back, and another stall.
+        // Negative controls: an ended stall back, and another stall.
         assert!(row_of(&next, c).is_some(), "it ended, and is back: news");
         let newer = Row {
             to: "2.1.283".to_string(),
@@ -5090,7 +4809,7 @@ mod tests {
             "a's tab is quiet for the day the owner put it away, whatever its target"
         );
 
-        // THE HANDOFF: b's row carried, on the band as the successor starts.
+        // The handoff: b's row carried, on the band as the successor starts.
         let mut successor = relaunched();
         let now = now_s();
         let carried = successor.post_message(message_reporters::agent_upgrade_stalled(
@@ -5135,8 +4854,8 @@ mod tests {
         (successor, ids)
     }
 
-    /// A ROW 0.94.0 POSTED: `Couldn't upgrade Claude · no READY answer after
-    /// 4 notices`, keyed on its tab (the owner's two, 2026-09-27).
+    /// A give-up row as an earlier build posted it: `Couldn't upgrade Claude · no READY
+    /// answer after 4 notices`, keyed on its tab.
     fn gave_up_row(tab: &str) -> aterm_messages::Message {
         aterm_messages::Message::new(
             aterm_messages::tags::HARNESS,
@@ -5150,30 +4869,9 @@ mod tests {
         .key(&message_reporters::agent_upgrade_key(tab))
     }
 
-    /// CARRIED ROWS ARE WITHDRAWN ONCE THE NEW PROCESS HAS SEEN EVERY TAB,
-    /// NEVER RESOLVED AS FIXED (the owner's two `Couldn't upgrade Claude · no
-    /// READY answer after 4 notices` rows, 2026-09-27: live when 0.94.0 handed
-    /// off, and nothing in the next build retired them — a give-up is no stall
-    /// since the rest-and-re-arm, and the new process's view held neither
-    /// row). The old process left up six upgrade rows, carried by the real
-    /// handoff seam: `a` and `b` (0.94.0's words; both tabs now rest after their
-    /// give-ups), `gone` (a tab the host no longer hands over: closed, or its
-    /// conversation ended), `stopped` (its stall now a record's shape, ruling
-    /// 283), `still` (still refused the same way) and `moving` (its restart
-    /// in flight). Until the host's first look, every one stands: nothing is
-    /// withdrawn on a guess, so nothing flickers. At the first look — every
-    /// tab seen — `a`, `b`, `gone` and `stopped` are WITHDRAWN (never `✓`:
-    /// this process never saw a stall end), `stopped`'s record is kept,
-    /// `still`'s row is kept in its slot, never posted again, and nothing new
-    /// is posted. NEGATIVE CONTROLS: `moving` keeps its row while its restart
-    /// is in flight and loses it — withdrawn, not `✓` — once the move is
-    /// over; a row THIS process posted and saw end is resolved as before
-    /// (ruling 290); `a`'s stall coming back later is news, a row again (a
-    /// withdrawn row is none the owner saw through); and the sweep takes
-    /// only rows under ONE TAB'S upgrade key (review of 2026-09-27): carried
-    /// rows under another family's key, a key that only begins like one, the
-    /// waiting record's bare key and the finished moves' `done` key all
-    /// stand through every look.
+    /// Rows carried across a handoff stand until the host's first look, then are withdrawn
+    /// (never `✓`) unless a stall still stands the same way or a restart is in flight; only
+    /// rows under one tab's upgrade key are swept.
     #[test]
     fn carried_rows_are_withdrawn_once_every_tab_is_seen_never_fixed() {
         let now = now_s();
@@ -5271,10 +4969,9 @@ mod tests {
             phase: Phase::Exiting { at_s: now },
             ..row(moving, 60)
         };
-        // Tab `mine`, stalled in this process's own time: OVERDUE, a stall
-        // whose end is plain (it catches up). Not a refusal: a refusal the
-        // re-armed round meets again is one stall through that round
-        // (ruling 307(e)), so a Pending row of the same build is no end.
+        // Tab `mine`, stalled in this process's own time: overdue, a stall whose end is
+        // plain (it catches up). Not a refusal: one the re-armed round meets again is one
+        // stall through that round, so a Pending row of the same build is no end.
         let mine = "s-mine";
         app.apply_agent_upgrades(vec![
             rested(a),
@@ -5293,10 +4990,9 @@ mod tests {
                 "{tab}: withdrawn, never fixed"
             );
         }
-        // `stopped` is a family that changed class: its record, classified and
-        // under the carried row's key, is the newer build saying the row is
-        // no longer its answer, so the engine retires the row as superseded
-        // by it (never `✓`, never fixed).
+        // `stopped` changed class: its record, under the carried row's key, is the newer
+        // build saying the row is no longer its answer, so the engine retires the row as
+        // superseded by it (never `✓`).
         assert!(row_of(&app, stopped).is_none(), "{stopped}: down");
         assert!(
             matches!(
@@ -5318,10 +5014,10 @@ mod tests {
             Some(ids[4]),
             "still stalled: kept in its slot"
         );
-        // NEGATIVE CONTROL: a restart in flight keeps its row.
+        // Negative control: a restart in flight keeps its row.
         assert_eq!(row_of(&app, moving).map(|(id, _)| id), Some(ids[5]));
         let (own, _) = row_of(&app, mine).expect("this process's own stall");
-        // NEGATIVE CONTROL: no other key is a tab's upgrade key.
+        // Negative control: no other key is a tab's upgrade key.
         others_stand(&app, "the first look");
         assert_eq!(
             app.messages.live_rows().count(),
@@ -5365,15 +5061,8 @@ mod tests {
         others_stand(&app, "a's stall back");
     }
 
-    /// A STALL THAT ENDED WHILE ITS ROW WAS DOWN IS NEWS WHEN IT RETURNS
-    /// (review of 2026-09-27) — and a refusal a RE-ARMED ROUND meets again is
-    /// no end at all (ruling 307, as ruling 283 for a repeating stop). The
-    /// owner dismissed two refusals' rows. `a`'s round re-armed for the same
-    /// build and met the same refusal: one stall throughout, nothing recorded
-    /// as over, and its row stays down — until ruling 307 it came back at
-    /// every round with `no longer stalled` in the log each time. `b`'s tab
-    /// left the rows (closed): its end is on the record, named by its tab,
-    /// so its return is a row again, in this process and in the next one.
+    /// A re-armed round meeting the same refusal is one stall (its dismissed row stays
+    /// down); a tab that left has its end recorded, so its return is a row again.
     #[test]
     fn a_stall_that_ended_while_its_row_was_down_is_news_when_it_returns() {
         let dir = std::env::temp_dir().join(format!("aterm-upgrade-over-{}", std::process::id()));
@@ -5416,12 +5105,12 @@ mod tests {
         // It comes back, refused again: news.
         app.apply_agent_upgrades(vec![refused(a), refused(b)]);
         assert!(row_of(&app, b).is_some(), "the stall is back: a row");
-        // NEGATIVE CONTROL: a never ended, and stays down.
+        // Negative control: a never ended, and stays down.
         assert!(row_of(&app, a).is_none(), "dismissed, and never over");
         app.flush_messages_log();
         drop(app.messages_log.take());
 
-        // THE NEXT PROCESS: the log read back.
+        // The next process: the log read back.
         let mut next = App::headless_for_test();
         next.messages = aterm_messages::MessageCenter::new(
             crate::messages_store::load_tail(&path, u64::MAX).log,
@@ -5443,13 +5132,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// OVERDUE TABS FORM NO ROW, GROUPED OR SINGLE (the owner, 2026-09-28: "don't
-    /// continue to persist alerts to the user that are not actionable"). Three
-    /// tabs a day behind on the same Claude upgrade were one standing row, the
-    /// agent's (ruling 363); they are three records now, each a calm line in the
-    /// log that never says `Couldn't`, and the band holds nothing for them.
-    /// NEGATIVE CONTROL: the agents the upgrade ended stand one row each, in
-    /// their own words — never grouped.
+    /// Overdue tabs are calm records, never a row or a group; ended agents stand one row
+    /// each.
     #[test]
     fn overdue_tabs_form_no_row_and_no_group() {
         let (mut app, [a, b, c]) = three_tabs();
@@ -5490,17 +5174,8 @@ mod tests {
             .collect()
     }
 
-    /// A WAIT ONLY THE OWNER CAN END IS ONE LINE OF "To look at", NEVER A ROW
-    /// (the owner, 2026-09-28: "batch these exceptions in a single dismissable
-    /// alert"; "don't continue to persist alerts to the user that are not
-    /// actionable"). Two tabs suspended for an hour are two lines of the digest —
-    /// each naming its tab and the one thing to do, each with `Show tab` — and
-    /// the band, the tabs' marks and the record's rows stay as they were: no
-    /// row, no mark. The same look again changes nothing; the owner's one
-    /// dismissal files both in the log, and the same waits, looked at again, are
-    /// not raised for the span the dismissal earned. NEGATIVE CONTROL: the agent
-    /// the upgrade ended still stands its ONE row, in its own tab, and takes no
-    /// line of the digest.
+    /// A wait only the owner can end is a digest line per tab (with `Show tab`), never a
+    /// row or mark; one dismissal files both. The ended agent still takes its one row.
     #[test]
     fn a_wait_only_the_owner_ends_is_a_line_of_the_digest_and_no_row() {
         let (mut app, [a, b, c]) = three_tabs();
@@ -5552,7 +5227,7 @@ mod tests {
             2,
             "b's line stands; a's ends in ten minutes"
         );
-        // ONE DISMISSAL files them; the same waits looked at again stay filed.
+        // One dismissal files them; the same waits looked at again stay filed.
         app.apply_agent_upgrades(vec![suspended(&a), suspended(&b), row(&c, 60)]);
         assert_eq!(app.dismiss_exceptions(), 2);
         assert!(to_look_at(&app).is_empty());
@@ -5563,12 +5238,8 @@ mod tests {
         );
     }
 
-    /// A LINE ENDS WHEN THE WAIT DOES, WITH NO SECOND LOOK: the upgrade sends its
-    /// rows when they change, so a tab that moved (or left) is one look that no
-    /// longer names its line — which stays ten minutes, then goes at the
-    /// digest's own clock (`settle_messages`) and is `Resolved` in the log, not
-    /// a dismissal. Three tabs waiting on their own work are ONE line naming
-    /// all three, and it goes on standing while any of them does.
+    /// A digest line ends ten minutes after the look that stops naming it, `Resolved` at
+    /// the digest's clock (`settle_messages`); three tabs on their own work are one line.
     #[test]
     fn a_line_ends_when_the_wait_ends_and_many_tabs_are_one_line() {
         let (mut app, [a, b, c]) = three_tabs();
@@ -5625,12 +5296,8 @@ mod tests {
         );
     }
 
-    /// NO TAB EVER JOINS AN AGENT'S GROUP ROW (C6b will delete the group's code;
-    /// until it does, nothing may reach it): two agents the upgrade ended whose
-    /// give-up is a day old are BOTH an interrupt and `overdue`, the one
-    /// shape that used to be folded into "Couldn't upgrade Claude in 2 tabs yet"
-    /// — a warn row with snoozes. They stand as their own rows, each with its
-    /// own action, and no group row is ever posted.
+    /// Two ended agents whose give-up is a day old (interrupt and `overdue`) stand as their
+    /// own rows; no group row is posted.
     #[test]
     fn no_tab_joins_an_agents_group_row() {
         let (mut app, [a, b, c]) = three_tabs();
@@ -5663,18 +5330,15 @@ mod tests {
         }
     }
 
-    /// WORDS (round 35, D5): a round re-armed after a give-up that its own work
-    /// holds (ruling 364) neither promises nor offers `Upgrade now`, which
-    /// moved nothing sooner there — and still not a day on (the fact, not the
-    /// age: `Row::will_ask_again`). NEGATIVE CONTROL: the same wait in a round
-    /// that did not give up keeps `Upgrade now`.
+    /// A round re-armed after a give-up its own work holds neither promises nor offers
+    /// `Upgrade now` (`Row::will_ask_again`); one held by a full queue keeps it.
     #[test]
     fn a_rearmed_own_work_round_promises_no_upgrade_now() {
         use aterm_messages::UpgradeWord;
         let a = "s-a";
         let now = now_s();
-        // Its own work holds it (ruling 364's round): a turn running. (This
-        // module's rows wait on a full queue, which `Upgrade now` moves.)
+        // Its own work holds it: a turn running. (This module's rows wait on a full queue,
+        // which `Upgrade now` moves.)
         let rearmed = Row {
             last_stop: aterm_agent::harness::upgrade::GAVE_UP.to_string(),
             wait: "not-idle:busy".to_string(),
@@ -5697,9 +5361,8 @@ mod tests {
             "{:?}",
             said.actions
         );
-        // NEGATIVE CONTROL: a re-armed round held by what `Upgrade now` does
-        // move (a full queue) is no record, and offers it. (A turn still
-        // running offers it on no round since ruling 380 (b), give-up or not.)
+        // Negative control: a re-armed round held by what `Upgrade now` does move (a full
+        // queue) is no record, and offers it.
         let queued = Row {
             last_stop: aterm_agent::harness::upgrade::GAVE_UP.to_string(),
             ..row(a, 8 * 3_600)
@@ -5708,11 +5371,8 @@ mod tests {
         assert!(message_reporters::agent_upgrade_words(&queued, now).contains(&UpgradeWord::Now));
     }
 
-    /// A WAIT NEVER SAYS `Couldn't` (ruling 423; the owner, 2026-09-28: "Couldn't
-    /// upgrade Claude in tab 1 yet" read as a failure with nothing to do). Every
-    /// wait the agent's own work, a person or the ladder makes - at an hour, a
-    /// day and nine days behind - is a record under a title that says the upgrade
-    /// waits, and none is a row. NEGATIVE CONTROL: a stop that did fail says so.
+    /// No wait, an hour, a day or nine days behind, says `Couldn't` or takes a row; a stop
+    /// that did fail says so.
     #[test]
     fn a_wait_never_says_couldnt() {
         let mut app = App::headless_for_test();
@@ -5747,7 +5407,7 @@ mod tests {
                 "a wait is not a failure: {title}"
             );
         }
-        // NEGATIVE CONTROL: a stop that repeats did not work, and says so.
+        // Negative control: a stop that repeats did not work, and says so.
         app.apply_agent_upgrades(vec![Row {
             phase: Phase::Failed("no-resume".to_string()),
             stop_streak: 2,
@@ -5762,10 +5422,8 @@ mod tests {
         );
     }
 
-    /// ATERM'S OWN FAULT IS TOLD ONCE, AND A FAULT THAT RETURNS IS NEWS (ruling
-    /// 383): a wait this build does not classify, two hours on, is one Warn record
-    /// under its own key and one `aterm.log` line - never a row - however many
-    /// looks see it; once it ends it is forgotten, so its return is a new record.
+    /// Aterm's own fault is one Warn record and one log line however many looks see it;
+    /// once it ends, its return is a new record.
     #[test]
     fn a_fault_is_recorded_once_and_a_returning_one_is_news() {
         let mut app = App::headless_for_test();
@@ -5800,28 +5458,8 @@ mod tests {
         assert_eq!(told(&app), 2, "its return is news");
     }
 
-    /// ONE WAITING UPGRADE IS ONE ENTRY THROUGH ITS ROUNDS (2026-09-29, the
-    /// owner's `messages.log`, ids 51-56 over four hours and tab 2 again):
-    /// the same upgrade, hours behind on its agent's own work, recorded
-    /// "Couldn't upgrade Claude in tab 1 yet", then posted as a warn row,
-    /// withdrawn a minute or two later and recorded afresh, every round.
-    /// Replayed here as the host hands the rows over: a round asking on its
-    /// own (each re-ask clears the recorded wait, the next look finds the
-    /// work again), its give-up and rest, and the re-armed round's first
-    /// looks (nothing recorded yet, a person at the tab, a draft typed at an
-    /// idle point), three rounds of it. ONE entry under the tab's key, a
-    /// record, never withdrawn; nothing on the glass. NEGATIVE CONTROL (run by
-    /// reverting `Row::rest_carries_on`): each re-armed round posted a warn
-    /// row and withdrew it at the next look, two more entries a round. And the
-    /// escalation still reaches the band: a person's hold that stands a whole
-    /// re-ask takes a row.
-    ///
-    /// ITS AGE MOVES IN PLACE (second review of 2026-09-29): the rounds run
-    /// an hour apart, 7 h, 8 h and 9 h behind, and the one record's first
-    /// detail line says each — still one entry, nothing on the glass.
-    /// NEGATIVE CONTROL (run by reverting the record arm in
-    /// `post_upgrade_stalls`): the record was written once and said `behind
-    /// for 7 h` at 9 h.
+    /// Three rounds of asking, give-up, rest and re-armed looks (a person, a draft, a hold
+    /// that stood) leave one record under the tab's key, its age moving, nothing on glass.
     #[test]
     fn a_waiting_upgrade_is_one_entry_through_its_rounds() {
         use aterm_agent::harness::upgrade::{GAVE_UP, REASK_S};
@@ -5938,15 +5576,12 @@ mod tests {
             "a record, never withdrawn"
         );
         let (title, severity, _) = record_of(&app, id);
-        // A wait never says `Couldn't` (ruling 423).
+        // A wait never says `Couldn't`.
         assert_eq!(title, "Claude upgrade waits in its tab");
         assert_eq!(severity, aterm_messages::Severity::Info);
 
-        // A draft that has stood a whole re-ask is a person's hold. Main's
-        // design raised a row for it; under the owner's rule of 2026-09-28 it
-        // is a wait like any other (nothing the owner can do about a person's
-        // hold that is not their own typing): still one record, in place,
-        // nothing on the glass.
+        // A draft that has stood a whole re-ask is a person's hold, a wait like any other:
+        // still one record, in place, nothing on the glass.
         app.apply_agent_upgrades(vec![Row {
             wait_since: now - REASK_S,
             ..rearmed(&at_round(2), "draft")
@@ -5957,14 +5592,8 @@ mod tests {
         assert!(detail[0].starts_with("behind for 9 h"), "{detail:?}");
     }
 
-    /// A WAITING UPGRADE'S ENTRY SAYS HOW LONG IN PLACE (2026-09-29, the
-    /// owner's log: one waiting upgrade is one message that updates its
-    /// `behind for` until it resolves). Under the owner's rule of 2026-09-28 a
-    /// wait is a record, never a row: an hour on, the same stall's record
-    /// reads `behind for 8 h`, re-worded in place, no new entry, and nothing on
-    /// the glass. NEGATIVE CONTROLS: the same age restates nothing (the
-    /// revision stands); before the fix the entry kept `behind for 7 h` for as
-    /// long as it stood.
+    /// An hour on, a waiting upgrade's record reads `behind for 8 h`, re-worded in place;
+    /// the same age restates nothing.
     #[test]
     fn a_waiting_upgrades_age_moves_in_place() {
         let mut app = App::headless_for_test();
@@ -5997,15 +5626,8 @@ mod tests {
         assert_eq!(app.messages.live_rows().count(), 0, "still no row");
     }
 
-    /// AN ENTRY WHOSE WORDS CARRY NO AGE IS NOT RESTATED AS IT AGES (2026-09-29
-    /// review): `posted.behind` held `Row::behind_for` for every stall, so a
-    /// held-back entry — `it runs inside vim …`, no age in it — was rebuilt
-    /// and restated with the same words at every minute the host looked (the
-    /// store absorbs an identical restatement, so the band's revision alone
-    /// cannot see it: the posted age is what decides). NEGATIVE CONTROL:
-    /// `a_waiting_upgrades_age_moves_in_place` (an overdue entry's age moves
-    /// in place). Without `Row::age_said` here the posted age reads `5 min`,
-    /// then `6 min`: a restatement at every look.
+    /// An entry whose words carry no age is not restated as it ages: the posted age is
+    /// `Row::age_said`, not `Row::behind_for`.
     #[test]
     fn a_held_back_entrys_age_restates_nothing() {
         let mut app = App::headless_for_test();
@@ -6050,11 +5672,10 @@ mod tests {
         assert_eq!(same.id, id);
     }
 
-    /// The stall rows of the reshape and re-word tests: tab `s-a`, `h` hours
-    /// (and a minute) behind, 2.1.283 → 2.1.284 — asking on its own at its
-    /// own work (announced, `background`, a shell under it), given up and
-    /// resting, re-armed at its own work, and re-armed with a draft typed
-    /// (`stood`: for a whole re-ask, a person's hold, a row).
+    /// The stall rows of the reshape and re-word tests: tab `s-a`, `h` hours (and a minute)
+    /// behind, 2.1.283 → 2.1.284: asking on its own at its own work (announced,
+    /// `background`, a shell under it), given up and resting, re-armed at its own work, and
+    /// re-armed with a draft typed (`stood`: for a whole re-ask, a person's hold).
     struct Shapes {
         now: u64,
     }
@@ -6136,10 +5757,9 @@ mod tests {
     }
 
     /// Whether a stall entry's remedy line names only buttons it has
-    /// (`message_reporters::agent_upgrade_stalled`, day five, D21): `Skip
-    /// version keeps it` only beside its `Skip version`, `Skip This Version in
-    /// the tab's menu` only where it has none, and `Upgrade now` offered as a
-    /// remedy (`asks it`, `tries it`) only beside its `Upgrade now`.
+    /// (`message_reporters::agent_upgrade_stalled`): `Skip version keeps it` only beside
+    /// its `Skip version`, `Skip This Version in the tab's menu` only where it has none,
+    /// and `Upgrade now` as a remedy (`asks it`, `tries it`) only beside its `Upgrade now`.
     fn names_only_its_capsules(rec: &aterm_messages::LogRecord) -> Result<(), String> {
         let has = |word: UpgradeWord| {
             rec.actions
@@ -6163,21 +5783,8 @@ mod tests {
         Err(format!("{wrong}: {remedy:?} with {labels:?}"))
     }
 
-    /// A RE-WORDED RECORD NAMES ONLY THE BUTTONS IT HAS (review of
-    /// 8899c91b4, the day-five D21 class back on Settings ▸ Messages): the
-    /// record of one waiting upgrade, re-worded in place as it ages, took the
-    /// title and detail of each look but kept the capsules it was written
-    /// with. Written at an announced round its own work holds (`Not today`,
-    /// `Skip version`), at the give-up an hour on it read `Upgrade now asks
-    /// it at its next pause; Skip This Version in the tab's menu …`; written
-    /// at the give-up (`Upgrade now`, `Not today`), an hour on it read `…
-    /// Skip version keeps it on 2.1.283`. Now, through Announced →
-    /// Failed(GAVE_UP) → Pending and the reverse, the one record's age moves
-    /// every hour and every button its remedy names is its own. NEGATIVE
-    /// CONTROL (run by reverting `reword_stall_record` to pass the fresh
-    /// message whole, and the center's capsule guard): `written at its own
-    /// work, look 1: sends Skip to the tab's menu beside its own Skip
-    /// version` at the give-up.
+    /// Through Announced → Failed(GAVE_UP) → Pending and back, a record re-worded as it ages
+    /// names only the buttons it has.
     #[test]
     fn a_reworded_records_words_name_only_the_capsules_it_has() {
         let shapes = Shapes { now: now_s() };
@@ -6219,15 +5826,8 @@ mod tests {
         }
     }
 
-    /// ONE WAITING UPGRADE IS ONE ENTRY ACROSS ITS SHAPES (review of
-    /// 8899c91b4, under the owner's rule of 2026-09-28): the entry's shape was
-    /// part of what was said, so a record that needed the glass and a row
-    /// whose upgrade asked on its own again each withdrew one entry and posted
-    /// another. A wait is now a record at every age (a move clock's 24 h and a
-    /// person's draft that stood a whole re-ask included: nothing the owner
-    /// can do about a timer or a hold), so the one entry stays THE ONE ENTRY
-    /// through every shape the stall takes: the same id, re-worded as it ages,
-    /// never withdrawn, nothing on the glass, and `✓` only at Done.
+    /// A wait is a record at every age, so one waiting upgrade is one entry through every
+    /// shape: the same id, re-worded as it ages, never withdrawn, `✓` only at Done.
     #[test]
     fn a_waiting_upgrade_is_one_entry_across_its_shapes() {
         use aterm_messages::{LogState, Retired};

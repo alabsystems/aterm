@@ -1,53 +1,38 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A HEALTH WARNING THAT CROSSES A SELF-UPDATE (round-seven update audit,
-//! findings 206 and 207; round eight, findings 15 and 301). The successor keeps
-//! each warning its landing does not answer — its words remembered, so the
-//! proof that heals it here records the healing — and hands it to the producer
-//! here whose own proof heals it (`App::take_up_carried_update_health`). Kept
-//! with no healer, it stood for the launch: the successor's updater had
-//! announced nothing, so its first healthy check sent no recovery, and the
-//! stall heal waited for a stall this watchdog had said.
+//! A health warning that crosses a self-update. The successor keeps each warning its
+//! landing does not answer and hands it to the producer whose own proof heals it
+//! (`App::take_up_carried_update_health`); kept with no healer, it would stand for the
+//! whole launch.
 //!
-//! A WRITER/READER pair (the shape of `NativeUpdateFailedMarkSuppression`).
-//! The writers are the producers that owe the heal: the updater's announced
-//! word (`aterm_update::adopt_announced_health`) and the window's watchdog
-//! (`CheckerWatchState::adopt_carried_stall`). The reader is the window's one
-//! door (`App::note_update_health`, `App::heal_update_health_where`), which
-//! ends a warning only on the proof that answers it, and with it the warning's
-//! "To look at" line.
+//! A writer/reader pair (the shape of `NativeUpdateFailedMarkSuppression`). The writers
+//! are the producers that owe the heal: the updater's announced word
+//! (`aterm_update::adopt_announced_health`) and the watchdog
+//! (`CheckerWatchState::adopt_carried_stall`). The reader is the window's one door
+//! (`App::note_update_health`, `App::heal_update_health_where`), which ends a warning, and
+//! its "To look at" line, only on the proof that answers it.
 
 use super::Model;
 
-/// `NativeUpdateCarriedHealth`: a carried check warning and a carried stall
-/// warning, through the successor's seed, the ledger's episodes and this
-/// process's own checks (`aterm-gui/src/messages_host.rs`
-/// `App::seed_carried_messages`).
+/// `NativeUpdateCarriedHealth`: a carried check warning and a carried stall warning,
+/// through the successor's seed (`App::seed_carried_messages`), the ledger's episodes and
+/// this process's own checks.
 ///
-/// `phase`: 0 the parent has said both warnings, 1 the successor is seeded.
-/// `ledger`: the machine's check streak is failing (a sibling's good check
-/// heals it as well as this process's). `owed`: this process's updater owes
-/// the check's recovery. `up`: the check warning stands (its words remembered
-/// for the record of its healing). `entry`: its "To look at" line is claimed or
-/// open. `checked`: a check of THIS process has completed since the stall
-/// warning. `armed`: the watchdog owes the stall's heal. `stall`, `sentry`: the
-/// stall warning stands, and its line.
+/// `phase`: 0 the parent said both warnings, 1 the successor is seeded. `ledger`: the
+/// machine's check streak is failing (any process's good check heals it). `owed`: this
+/// process's updater owes the check's recovery. `up`/`entry`: the check warning stands /
+/// its "To look at" line is claimed. `checked`: a check of this process completed since
+/// the stall warning. `armed`: the watchdog owes the stall's heal. `stall`/`sentry`: the
+/// stall warning and its line.
 ///
-/// Invariants, each broken alone by its own `Buggy = 1` action:
-///
-/// * `WarningHasHealer` — a standing check warning has a producer that will
-///   send its recovery. `SeedRemembersOnly` keeps it without handing the class
-///   over (finding 206).
-/// * `StallHasHealer` — the same for the stall. `SeedStallRemembersOnly`.
-/// * `StallStandsUntilACheckHere` — the ledger's healing never ends the stall:
-///   only a check of this process's own does. `RecoverHealsStall` (a
-///   replacement blocked behind a stalled generation sends the ledger's
-///   recovery while nothing can check here).
-/// * `CheckLineFollowsWarning` — the check's digest line is owed exactly while
-///   the warning stands. `SeedForgetsEntry` drops the parent's pending claim.
-/// * `StallLineFollowsWarning` — the same for the stall. `StallHealKeepsEntry`
-///   heals the stall but leaves its claim ripening.
+/// Each invariant is broken alone by one `Buggy = 1` action:
+/// * `WarningHasHealer` — by `SeedRemembersOnly`; `StallHasHealer` — by
+///   `SeedStallRemembersOnly`.
+/// * `StallStandsUntilACheckHere` — only a check of this process ends the stall, never the
+///   ledger's healing; by `RecoverHealsStall`.
+/// * `CheckLineFollowsWarning` — by `SeedForgetsEntry`; `StallLineFollowsWarning` — by
+///   `StallHealKeepsEntry`.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_update_carried_health_model() -> Model {

@@ -273,9 +273,8 @@ fn opts(journal: Option<std::path::PathBuf>) -> LedgerOpts {
     }
 }
 
-/// The whole path: every source read, every request made once, the turns
-/// placed on the wall clock with their reply sizes, the journal filtered to
-/// this worker, the mail in both directions, and the summary's numbers.
+/// The whole path: every source read once, the turns placed on the wall clock with their reply
+/// sizes, the journal filtered to this worker, mail both ways, and the summary's numbers.
 #[test]
 fn the_ledger_joins_the_four_sources() {
     let (dir, path) = journal_file("whole", &journal_lines());
@@ -385,9 +384,8 @@ fn the_ledger_joins_the_four_sources() {
     let _ = std::fs::remove_dir(dir);
 }
 
-/// The text form: the header, the sources, the summary and the timeline's
-/// rows — the turn's first 100 characters, the EVENT lines verbatim, the
-/// reply sizes, and the latency on the EVENT that was answered.
+/// The text form: header, sources, summary and timeline rows (a turn's first 100 characters,
+/// EVENT lines verbatim, reply sizes, the latency on an answered EVENT).
 #[test]
 fn the_text_form_reads_as_one_timeline() {
     let (dir, path) = journal_file("text", &journal_lines());
@@ -455,10 +453,9 @@ fn the_md_form_is_tables() {
     let _ = std::fs::remove_dir(dir);
 }
 
-/// The HTML form is one file: no URL it would fetch, a policy that forbids
-/// one, every tag closed, and everything a worker said escaped (as text in the
-/// page and as `\u` escapes in the embedded data), so neither a `</script>`
-/// in a transcript nor a tag in a command can close one.
+/// The HTML form is one file: no URL it would fetch, a policy that forbids one, every tag
+/// closed, and everything a worker said escaped, so neither a `</script>` in a transcript nor
+/// a tag in a command can close one.
 #[test]
 fn the_html_form_is_one_self_contained_page() {
     let (dir, path) = journal_file("html", &journal_lines());
@@ -488,9 +485,8 @@ fn the_html_form_is_one_self_contained_page() {
     let _ = std::fs::remove_dir(dir);
 }
 
-/// Every tag in `html` closes, in order, outside `<script>`/`<style>`; void
-/// elements close themselves. (A small check, not a browser: it catches an
-/// unbalanced or unescaped tag, which is what a generator gets wrong.)
+/// Every tag in `html` closes, in order, outside `<script>`/`<style>`; void elements close
+/// themselves. A small check, not a browser: it catches an unbalanced or unescaped tag.
 fn well_formed(html: &str) -> Result<(), String> {
     const VOID: &[&str] = &[
         "meta", "br", "hr", "img", "input", "link", "source", "!doctype",
@@ -547,9 +543,8 @@ fn well_formed(html: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// A missing source is NAMED and the rest still prints: a host that knows
-/// none of the verbs, with a journal, gives the watcher's lane and four
-/// misses.
+/// A missing source is named and the rest still prints: a host that knows none of the verbs,
+/// with a journal, gives the watcher's lane and four misses.
 #[test]
 fn a_missing_source_is_named_and_the_rest_prints() {
     let (dir, path) = journal_file("missing", &journal_lines());
@@ -624,10 +619,8 @@ fn without_a_clock_the_times_are_marked_and_no_latency_is_claimed() {
     let _ = std::fs::remove_dir(dir);
 }
 
-/// Without a clock, no working time is claimed: an unanchored `turn.t` is a
-/// process-clock stamp on a fallback epoch, while a journal record's `t` is
-/// wall-clock time, so their difference is not a duration. What cannot be
-/// placed is marked `~` and claims no latency or working span.
+/// Without a clock no working time is claimed: an unanchored `turn.t` and a journal record's
+/// wall-clock `t` do not subtract to a duration.
 #[test]
 fn without_a_clock_no_working_time_is_claimed() {
     let (dir, path) = journal_file("clockless-spans", &journal_lines());
@@ -659,9 +652,8 @@ fn without_a_clock_no_working_time_is_claimed() {
     let _ = std::fs::remove_dir(dir);
 }
 
-/// A `--journal` that could not be read is not a journal of zero events: the
-/// watcher's lane is not printed as measured zeroes under the `✗ journal`
-/// line that says it could not be opened.
+/// An unreadable `--journal` is not a journal of zero events: the watcher's numbers are not
+/// printed as zeroes under its `✗ journal` line.
 #[test]
 fn an_unreadable_journal_is_not_counted_as_zero() {
     let mut host = whole_host();
@@ -703,8 +695,7 @@ fn an_unreadable_journal_is_not_counted_as_zero() {
     );
 }
 
-/// A turn whose rows the archive no longer holds, and one from another
-/// archive, say so instead of claiming a size.
+/// A turn older than the archive, or from another archive, says so instead of claiming a size.
 #[test]
 fn a_reply_the_archive_lost_says_so() {
     let mut host = whole_host();
@@ -734,7 +725,7 @@ fn a_reply_the_archive_lost_says_so() {
             "another archive (aterm restarted since)"
         ]
     );
-    // A host with no `offscreen` at all: the same honest answer.
+    // A host with no `offscreen` at all says so too.
     let mut host = Host::default()
         .on("whoami", ok(&format!("OK {MANAGER} deadbeef owner\n")))
         .on("history", history());
@@ -761,10 +752,8 @@ fn a_reply_the_archive_lost_says_so() {
     );
 }
 
-/// A worker whose ledger an aterm update could not
-/// carry answers `history` with ` unheld_below=` on its header (on stderr,
-/// as `aterm ctl` prints it). The ledger then says the turns were lost to
-/// the update, not that nobody drove the session.
+/// A `history` header carrying ` unheld_below=` (on stderr, as `aterm ctl` prints it) makes the
+/// ledger say the turns were lost to an update, not that nobody drove the session.
 #[test]
 fn a_ledger_an_update_could_not_carry_is_not_blamed_on_the_person() {
     let lost = CtlReply {
@@ -821,12 +810,9 @@ fn since_drops_what_came_before_it() {
     let _ = std::fs::remove_dir(dir);
 }
 
-/// `--since` takes Unix milliseconds or a time word: a date (local midnight),
-/// a date and time (local, or the zone it names). Anything else is refused
-/// rather than read as zero.
-/// A malformed `--since` is refused (`None`, so the CLI says why), never a
-/// panic: a year too large for the millisecond arithmetic, and a four-BYTE
-/// zone suffix whose byte 2 is inside a character.
+/// `--since` takes Unix milliseconds, a date (local midnight) or a date and time (local, or the
+/// zone it names). Anything else is `None`, never zero or a panic: a year too large for the
+/// millisecond arithmetic, a 4-byte zone suffix whose byte 2 is inside a character.
 #[test]
 fn a_malformed_since_is_refused_not_a_panic() {
     assert_eq!(parse_since("4294967295-01-01", 0), None);
@@ -890,8 +876,8 @@ fn the_clock_prints_what_a_human_reads() {
     assert_eq!(zone(0), "UTC+00:00");
 }
 
-/// A `history` record's every field, `carried=1` and a pct-encoded text
-/// included; a turn a self-update carried has no time here.
+/// A `history` record's every field, `carried=1` and a pct-encoded text included; a carried
+/// turn has no time.
 #[test]
 fn a_history_record_is_read_whole() {
     let body = "OK 2\n\
@@ -945,9 +931,7 @@ fn a_history_record_is_read_whole() {
     );
 }
 
-/// The report views are the blocks module's, reached through `ReportOpts`:
-/// the default renders exactly as before, and a view adds `view=` and
-/// `kept=` to the same header.
+/// `View::All` renders as `render`; another view adds `view=` and `kept=` to the same header.
 #[test]
 fn a_report_renders_its_view() {
     let report = Report {
@@ -965,6 +949,7 @@ fn a_report_renders_its_view() {
         archived: 3,
         screen: 3,
         last: None,
+        program: aterm_phase::Program::Claude,
     };
     assert_eq!(report.render_view(View::All), report.render());
     assert_eq!(
@@ -983,10 +968,8 @@ fn a_report_renders_its_view() {
     );
 }
 
-/// A turn whose own `❯` row is nowhere in the rows read — it was queued while
-/// the worker was busy, or a restart took the row — has its reply inside the
-/// previous turn's count, and the row that carries it says so rather than
-/// claiming the count is one reply.
+/// A turn whose `❯` row is nowhere (queued while the worker was busy, or a restart took it) has
+/// its reply inside the previous turn's count, and that row names it.
 #[test]
 fn a_turn_whose_row_is_missing_is_named_in_the_span_that_holds_it() {
     let mut host = whole_host();

@@ -1,0 +1,8 @@
+# muse 1.4.9-R6297.1 · MEASURED 2026-10-16, `aterm ctl text --json` of a private headless aterm 120x40 (aterm 0.105.0 098c216c7), the atpkg-managed muse (Meta latest) launched through its shim with a scratch HOME, `--provider echo --echo-delay-ms 8000` (Meta's offline echo provider: no login, no model), harness off · a typed, unsent draft `hello there` behind `❯ `; ctrl+u clears it; an Enter sent in the same burst as the text is taken as a newline, an Enter after a pause submits · cursor=4,13 (visible) · account and scratch path redacted at equal length
+
+  Muse Code 1.4.9
+
+── Voice input (⌥ + v to start) ────────────────────────────────────────────────────────────────────────────────────────
+❯ hello there
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  echo · /private/tmp/at.XXXXXX/mwork · Auto-review

@@ -1,32 +1,27 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `kitty_gallery`: cat-art v4 authored-character contact sheets (design §6).
+//! `kitty_gallery`: cat-art v4 contact sheets (design §6).
 //!
 //! Bakes every roster glyph through the real v4 bake path
-//! ([`aterm_effects::cat_baker::bake_variant_with`], the same fill resolver,
-//! catch-light patch strip and ramps `CatBaker::get_v4` uses) and composites
-//! labelled montages for human / visual-LLM QA against the reference sheets.
-//! Each page is rendered on a light and a dark ground, so the dark-bg outline
-//! lift is judged:
+//! ([`aterm_effects::cat_baker::bake_variant_with`], as `CatBaker::get_v4` does) into
+//! labelled montages for visual QA, each on a light and a dark ground:
 //!
 //!   * `heads_{light,dark}.png` — all 25 [`HEADS`] at the reference art height.
-//!   * `heads_small_{light,dark}.png` — the same 25 at 16 px and 26 px art
-//!     height side by side (the terminal-legibility check: eyes read small).
+//!   * `heads_small_{light,dark}.png` — the same 25 at 16 px and 26 px art height
+//!     side by side (the terminal-legibility check).
 //!   * `specials_accessories_{light,dark}.png` — the 8 authored specials, then
 //!     each of the 3 overlay accessories bare and seated on a plain head.
-//!   * `coats_{light,dark}.png` — one recolorable silhouette (S100) swept
-//!     across the 16-stop `COAT_RAMP`, then across the reachable `EYE_RAMP`
-//!     iris stops (the genome recolor space on one glyph).
-//!   * `context_{light,dark}.png` — the hero head + cursor companion across
-//!     all 12 local-text hue families and the neutral context key.
+//!   * `coats_{light,dark}.png` — one recolorable silhouette (S100) across the
+//!     16-stop `COAT_RAMP`, then the reachable `EYE_RAMP` iris stops.
+//!   * `context_{light,dark}.png` — the hero head + cursor companion across all
+//!     12 local-text hue families and the neutral context key.
 //!
-//! Glyph proportions come from the asset viewbox aspect (the const drawlists
-//! are normalized to a unit square), so a wide stretch-cat is not squished to
-//! a head's box.
+//! Widths come from the asset viewbox aspect (the const drawlists are normalized
+//! to a unit square), so a wide stretch-cat is not squished to a head's box.
 //!
 //! ```text
-//! cargo run -q -p aterm-effects --example kitty_gallery -- [out_dir]
+//! targo --unverified run -q -p aterm-effects --example kitty_gallery -- [out_dir]
 //! (default out_dir: target/kitty_gallery)
 //! ```
 
@@ -40,7 +35,7 @@ use aterm_scene::Tile;
 
 // ─────────────────────────── grounds & ink ───────────────────────────
 
-/// Tokyo-Night-ish dark ground (the `capture_kitties.sh` dark theme bg).
+/// Tokyo-Night-ish dark ground.
 const DARK_BG: [u8; 3] = [0x1A, 0x1B, 0x26];
 /// Warm paper light ground (the light theme bg).
 const LIGHT_BG: [u8; 3] = [0xFA, 0xFA, 0xF4];
@@ -141,7 +136,7 @@ fn page_specials_accessories(dir: &str, tag: &str, bg: [u8; 3], fg: [u8; 3], dar
             tile: bake(acc, None, 8, 4, dark, H),
             label: short(acc),
         });
-        // Seated on a plain head (S100), the emit-path overlay.
+        // Seated on a plain head (S100), as the emit path overlays it.
         items.push(Cell {
             tile: bake(CatGlyphId::S100, Some(acc), 8, 4, dark, H),
             label: format!("{}+S100", short(acc)),
@@ -185,8 +180,8 @@ fn page_coats(dir: &str, tag: &str, bg: [u8; 3], fg: [u8; 3], dark: bool) {
     .save(&format!("{dir}/coats_{tag}.png"));
 }
 
-/// Hero art across every bounded local-text hue family plus neutral. This is
-/// the visual counterpart to the CatColorKey contrast/quantization tests.
+/// Hero art across every bounded local-text hue family plus neutral: the visual
+/// counterpart to the `CatColorKey` contrast/quantization tests.
 fn page_context(dir: &str, tag: &str, bg: [u8; 3], fg: [u8; 3], dark: bool) {
     const H: u32 = 64;
     let items: Vec<Cell> = (0..=12u8)
@@ -400,7 +395,7 @@ fn hstack(tiles: &[&Tile], bg: [u8; 3], _dark: bool) -> Tile {
     let total_w: u32 = art_ws.iter().sum::<u32>() + GAP * (tiles.len() as u32).saturating_sub(1);
     let max_h = tiles.iter().map(|t| t.height()).max().unwrap_or(1);
     let mut out = Tile::new(total_w + u32::from(PATCH_STRIP), max_h);
-    // Prefill opaque bg so the paired glyphs share a ground inside the cell.
+    // Opaque bg, so the paired glyphs share a ground inside the cell.
     {
         let px = out.pixels_mut();
         for p in px.as_chunks_mut::<4>().0 {

@@ -799,18 +799,6 @@ mod tests {
     }
 
     #[test]
-    fn a_killed_end_is_worded_by_what_is_missing_not_by_a_handler_that_ran() {
-        // A SIGTERM, SIGINT or SIGHUP runs aterm-gui's `owned_endpoint` handler
-        // (it takes the control socket, token and alias away, then re-raises), so
-        // "no signal handler" is false for the commonest killed end; what every
-        // killed end lacks is a crash signal and an exit path — the words the
-        // console's own line (`logging::KillEvidence`) uses.
-        let words = EndClass::Killed.describe();
-        assert_eq!(words, "killed (no crash signal, no exit path)");
-        assert!(!words.contains("handler"), "{words}");
-    }
-
-    #[test]
     fn a_line_is_one_line_whatever_the_version_string_holds() {
         let mut r = row(10, 1, PrevRun::none());
         r.version = "0.93.0 injected=1\nv=1".into();

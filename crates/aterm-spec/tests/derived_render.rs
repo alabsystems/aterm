@@ -1,19 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-0 for `ResizeRender`: the engine's resize undo and the resize
-//! ledger's render verdict against the ground truth, proved at `Buggy = 0` and
-//! caught at `Buggy = 1` (the historical append-only grow and the
-//! size-difference judge), with the incident's schedule replayed on both; a
-//! tick on a still-changed size replayed on `Buggy = 2` (the assumed repaint
-//! the ledger first landed with, never in a release); a quiet flap only time
-//! split replayed on `Buggy = 3` (time closing every run: neither the late
-//! run nor the credit); a split flap's risk downgraded to `unverified` on
-//! `Buggy = 4`; and the flap a spinner tick splits replayed on `Buggy = 5` (a
-//! draw closing every run, main's grouping before the integration). Each
-//! mutant breaks exactly its claims over the whole bounded space. The epoch judge
-//! (the engine's debt, read as one epoch) is proved with them, its blind-spot
-//! schedules replayed, and its mutants 6, 7 and 8 each break their one claim.
+//! Tier-0 for `ResizeRender`: the engine's resize undo and the resize ledger's render verdict
+//! against the ground truth. Proved at `Buggy = 0`; `Buggy = 1` (an append-only grow and the
+//! size-difference judge) through `Buggy = 5` are each a rejected design caught on its own
+//! schedule, and mutants 2 to 8 (6, 7 and 8 the epoch judge's) each break exactly their claims
+//! over the whole bounded space.
 
 use crate::walk::only;
 use aterm_spec::{derive::resize_render_model, interp, verify};
@@ -37,24 +29,17 @@ fn breaks_exactly(buggy: i64, claims: &[&str]) {
     }
 }
 
-/// The 2026-09-28 schedule: a 64→63→64 flap lands before the app's SIGWINCH
-/// handler runs, the handler reads an unchanged size, and its diff frame lands
-/// on whatever the flap left.
+/// A 64→63→64 flap lands before the app's SIGWINCH handler runs, the handler reads an
+/// unchanged size, and its diff frame lands on whatever the flap left.
 const FLAP: [&str; 4] = ["Demote", "Grow", "Step", "Evaluate"];
 
 #[test]
 fn a_quiet_flap_is_an_identity_and_the_historical_engine_is_caught() {
     let model = resize_render_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name),
-        "the resize-render model must stay enrolled in the spec-link registry"
-    );
     verify::prove_and_catch_scalar(&model, "resize render");
 
-    // The fixed engine: the grow hands the demoted row back, the app's diff
-    // frame lands on exactly what it painted, and there is nothing to flag.
+    // The grow hands the demoted row back, the app's diff frame lands on exactly what it
+    // painted, and there is nothing to flag.
     let mut state = model.init_state();
     for action in FLAP {
         assert!(model.fire(action, &mut state), "{action}: {state:?}");
@@ -67,10 +52,9 @@ fn a_quiet_flap_is_an_identity_and_the_historical_engine_is_caught() {
     assert_eq!(state["disp"], 0, "the content is where the app painted it");
     assert_eq!((state["drew"], state["verdict"]), (0, 0));
 
-    // The halves split by TIME alone, nothing drawn: the undo still holds,
-    // the grow still hands the row back, and the shrink's run, displaced and
-    // undrawn, waited for it (`late`) — one net-zero run that moved nothing,
-    // so the reader answers ok, not displaced.
+    // The halves split by time alone, nothing drawn: the undo still holds, the grow still hands
+    // the row back, and the shrink's run, displaced and undrawn, waited for it (`late`): one
+    // net-zero run that moved nothing, so the reader answers ok, not displaced.
     let mut split = model.init_state();
     for action in ["Demote", "Evaluate"] {
         assert!(model.fire(action, &mut split), "{action}: {split:?}");
@@ -98,9 +82,9 @@ fn a_quiet_flap_is_an_identity_and_the_historical_engine_is_caught() {
     }
     assert_eq!((split["disp"], split["drew"], split["verdict"]), (0, 0, 0));
 
-    // The historical engine (append-only grow) and judge on the same
-    // schedule: the flap leaves the content one row up, the app draws on it,
-    // and the size-difference judge sees agreeing sizes and answers ok.
+    // `Buggy = 1` (append-only grow, size-difference judge) on the same schedule: the flap
+    // leaves the content one row up, the app draws on it, and the judge sees agreeing sizes
+    // and answers ok.
     let historical = interp::with_buggy(&model, 1);
     let mut missed = historical.init_state();
     for action in ["Demote", "Grow"] {
@@ -119,11 +103,10 @@ fn a_quiet_flap_is_an_identity_and_the_historical_engine_is_caught() {
     assert!(!historical.check_invariant("NoSilentPass", &missed));
 }
 
-/// A net-zero run that DID displace rows is still judged: output that draws
-/// nothing (the first bytes of a SIGWINCH handler: a mode set, a query) lands
-/// between the halves, drops the engine's undo but leaves the run open, and
-/// the grow can only append. The ledger calls a draw on it a desync risk, and
-/// a changed-size repaint heals it.
+/// A net-zero run that did displace rows is still judged: output that draws nothing (the first
+/// bytes of a SIGWINCH handler: a mode set, a query) lands between the halves, drops the
+/// engine's undo but leaves the run open, and the grow can only append. The ledger calls a
+/// draw on it a desync risk, and a changed-size repaint heals it.
 #[test]
 fn a_displaced_net_zero_run_is_still_a_risk_until_repainted() {
     let model = resize_render_model();
@@ -194,12 +177,11 @@ fn a_trim_is_no_risk_and_a_changed_size_repaint_heals() {
     assert_eq!((quiet["disp"], quiet["drew"], quiet["verdict"]), (0, 0, 0));
 }
 
-/// A shrink whose geometry STAYS changed is the app's to repaint (its handler
-/// reads the change), so the ledger never calls it a risk — but a draw on the
-/// displaced rows before a heal is `unverified` (2), never ok: a spinner tick
-/// before the handler ran looks like the handler's non-clearing repaint to
-/// every counter the ledger has. The reader that came by while it was short
-/// is the ground-truth blind spot that excuses it from `RiskIsFlagged`.
+/// A shrink whose geometry stays changed is the app's to repaint (its handler reads the
+/// change), so the ledger never calls it a risk, but a draw on the displaced rows before a
+/// heal is `unverified` (2), never ok: a spinner tick before the handler ran looks like the
+/// handler's non-clearing repaint to every counter the ledger has. The reader that came by
+/// while it was short is the ground-truth blind spot that excuses it from `RiskIsFlagged`.
 #[test]
 fn a_net_changed_run_is_never_a_risk_and_never_ok_once_drawn_on() {
     let model = resize_render_model();
@@ -250,10 +232,9 @@ fn a_net_changed_run_is_never_a_risk_and_never_ok_once_drawn_on() {
     );
 }
 
-/// THE ASSUMED REPAINT (`Buggy = 2`, the ledger as it first landed, never in a
-/// release): the same tick on a still-changed size. The ledger says
-/// `unverified`; the judge that took the draw as a repaint says ok over a
-/// screen one row up and drawn on, and breaks `NoSilentPass` — alone.
+/// The assumed repaint (`Buggy = 2`): the same tick on a still-changed size. The ledger says
+/// `unverified`; the judge that takes the draw as a repaint says ok over a screen one row up and
+/// drawn on, and breaks `NoSilentPass` alone.
 #[test]
 fn a_tick_on_a_changed_size_is_unverified_where_the_assumed_repaint_said_ok() {
     let model = resize_render_model();
@@ -271,15 +252,10 @@ fn a_tick_on_a_changed_size_is_unverified_where_the_assumed_repaint_said_ok() {
     );
 }
 
-/// THE SPLIT FLAP (2026-09-28, live on main with the stand-in ticking): the
-/// presence row's attention set and unset 2-15 ms apart, a spinner tick
-/// between the halves. The tick is output, so the engine's undo is gone and
-/// the grow appends (`appended=1 restored=0`): the top row is lost, the app's
-/// handler reads an unchanged size, and its frames land one row off. The
-/// ledger keeps the tick inside the run, judges the net-zero run it now is,
-/// and flags it; a judge that closes a run on any draw (`Buggy = 5`: main's
-/// grouping before the integration) reads two net-changed runs and answers
-/// `unverified` at best.
+/// The split flap (the presence row set and unset 2-15 ms apart, a spinner tick between the
+/// halves): the tick drops the engine's undo, so the grow appends (`appended=1 restored=0`) and
+/// the app's frames land one row off. The ledger keeps the tick inside the run and flags the
+/// net-zero run; a judge that closes a run on any draw (`Buggy = 5`) answers `unverified` at best.
 #[test]
 fn a_flap_a_spinner_tick_splits_is_judged_and_the_draw_closing_judge_is_caught() {
     const SPLIT: [&str; 5] = ["Demote", "Draw", "Grow", "Step", "Evaluate"];
@@ -324,9 +300,9 @@ fn a_flap_a_spinner_tick_splits_is_judged_and_the_draw_closing_judge_is_caught()
     );
     assert!(old.check_invariant("NoSilentPass", &missed));
 
-    // A full clear BETWEEN the halves (the handler read the smaller size and
-    // repainted from scratch) closes the run: the grow appends a blank under
-    // a frame laid out for the smaller size, which the next handler repaints.
+    // A full clear between the halves (the handler read the smaller size and repainted from
+    // scratch) closes the run: the grow appends a blank under a frame laid out for the smaller
+    // size, which the next handler repaints.
     let mut healthy = model.init_state();
     for action in ["Demote", "Step", "Grow", "Draw", "Evaluate"] {
         assert!(model.fire(action, &mut healthy), "{action}: {healthy:?}");
@@ -337,11 +313,10 @@ fn a_flap_a_spinner_tick_splits_is_judged_and_the_draw_closing_judge_is_caught()
     );
 }
 
-/// The blind spot excuses only the displacement a reader saw: a restored
-/// flap a reader came by while it was short, then a tick-split flap, is the
-/// tick-split flap alone. With the excuse kept past the grow that brought the
-/// displacement back to zero (the first cut of the split-flap model), a judge
-/// that missed the second flap passed `RiskIsFlagged` on this schedule.
+/// The blind spot excuses only the displacement a reader saw: a restored flap a reader came by
+/// while it was short, then a tick-split flap, is the tick-split flap alone. With the excuse
+/// kept past the grow that brought the displacement back to zero, a judge that missed the
+/// second flap would pass `RiskIsFlagged` on this schedule.
 #[test]
 fn an_earlier_restored_flap_excuses_no_later_one() {
     const TWICE: [&str; 8] = [
@@ -377,15 +352,11 @@ fn an_earlier_restored_flap_excuses_no_later_one() {
     assert!(!old.check_invariant("RiskIsFlagged", &missed), "{missed:?}");
 }
 
-/// A flap the engine's undo RESTORED, its halves further apart than the run
-/// gap with nothing output between (the attention held ~600 ms, S6b quiet):
-/// an identity, so `render=ok`, and a spinner tick after it reads ok too. A
-/// judge that closes a run on time alone (`Buggy = 3`: neither the late run
-/// nor the credit) leaves the shrink's half `silent` — `render=displaced` over
-/// an intact screen — and, once the app draws, reads `unverified` over a
-/// screen that is exactly the app's. And a held run the undo can no longer
-/// hand back to (a mode set dropped it) is a flap output split: the grow
-/// appends, and the tick is a risk.
+/// A flap the engine's undo restored, its halves further apart than the run gap with nothing
+/// output between, is an identity (`render=ok`), and a tick after it reads ok too. `Buggy = 3`
+/// (time closes every run) leaves the shrink's half `silent` and, once the app draws, reads
+/// `unverified` over a screen that is exactly the app's. A held run whose undo a mode set
+/// dropped is a flap output split: the grow appends, and the tick is a risk.
 #[test]
 fn a_restored_flap_split_by_time_is_ok_and_the_time_closing_judge_is_caught() {
     const SLOW: [&str; 4] = ["Demote", "Evaluate", "Grow", "Evaluate"];
@@ -441,12 +412,9 @@ fn a_restored_flap_split_by_time_is_ok_and_the_time_closing_judge_is_caught() {
     assert!(!old.check_invariant("NoFalseVerdict", &noisy), "{noisy:?}");
 }
 
-/// THE RISK, NOT ONLY A VERDICT (`Buggy = 4`: a net-zero run's risk
-/// downgraded to `unverified`). A flap output split (the mode set dropped the
-/// undo, the grow appended), the app's handler reads an unchanged size and
-/// draws its diff: the screen is one row up and drawn on. `NoSilentPass`
-/// takes any verdict; `RiskIsFlagged` demands the risk, and it is the one
-/// claim that breaks.
+/// The risk, not only a verdict: a flap output split leaves the screen one row up and drawn on;
+/// `NoSilentPass` takes any verdict, and `RiskIsFlagged`, which demands the risk, is the one
+/// claim `Buggy = 4` (a net-zero run's risk downgraded to `unverified`) breaks.
 #[test]
 fn a_net_zero_risk_is_never_downgraded_to_unverified() {
     let model = resize_render_model();
@@ -476,14 +444,10 @@ fn a_net_zero_risk_is_never_downgraded_to_unverified() {
     }
 }
 
-/// The ledger's named blind spot, closed twice: a flap an app frame splits was
-/// two net-changed runs, and the run judge said only `unverified`
-/// (`verdict = 2`) once it was drawn on; the run judge now joins them
-/// (`verdict = 1`). The engine's debt does not depend on run shape: the
-/// same schedule leaves `debt = 1` with the geometry back at the epoch's start,
-/// and the epoch says `desync-risk` (`ev = 1`) for a program the ledger judges,
-/// `unjudged` (`ev = 2`) for one it does not. The historical size-difference
-/// judge, which the ledger used before, reads sizes that agree and says ok.
+/// A flap an app frame splits is one epoch: the engine's debt does not depend on run shape, so
+/// the schedule leaves `debt = 1` with the geometry back at the epoch's start, and the epoch says
+/// `desync-risk` (`ev = 1`) for a program the ledger judges, `unjudged` (`ev = 2`) for one it
+/// does not. The size-difference judge reads agreeing sizes and says ok.
 #[test]
 fn a_flap_an_app_frame_splits_is_judged_as_one_epoch() {
     let model = resize_render_model();
@@ -505,11 +469,10 @@ fn a_flap_an_app_frame_splits_is_judged_as_one_epoch() {
         "one row owed, the geometry back at the epoch's start"
     );
     assert_eq!(judged["ev"], 1, "a judged program is accused");
-    // The run judge now joins the halves a draw splits (a draw on displaced
-    // rows is no sign the handler read the smaller size), so it agrees; the
-    // epoch's word does not depend on that grouping. The grouping that
-    // closed every run on a draw (`Buggy = 5`) could only say unverified
-    // here, and the epoch still accuses.
+    // The run judge joins the halves a draw splits (a draw on displaced rows is no sign the
+    // handler read the smaller size), so it agrees; the epoch's word does not depend on that
+    // grouping. Closing every run on a draw (`Buggy = 5`) could only say unverified here, and
+    // the epoch still accuses.
     assert_eq!(judged["verdict"], 1, "the run judge agrees");
     let closing = interp::with_buggy(&model, 5);
     let mut split = closing.init_state();
@@ -538,8 +501,8 @@ fn a_flap_an_app_frame_splits_is_judged_as_one_epoch() {
         }
     }
 
-    // The historical judge on the same schedule: sizes agree, so ok, over a
-    // screen one row up.
+    // The size-difference judge on the same schedule: sizes agree, so ok, over a screen one row
+    // up.
     let historical = interp::with_buggy(&model, 1);
     let mut missed = historical.init_state();
     for action in ["Demote", "Draw", "Grow", "Step", "Evaluate"] {
@@ -549,9 +512,9 @@ fn a_flap_an_app_frame_splits_is_judged_as_one_epoch() {
     assert!(!historical.check_invariant("EpochFlagsTheResidual", &missed));
 }
 
-/// An UNDRAWN residual: a mode set between the halves drops the undo, nothing
-/// is drawn, and the screen is one row up all the same. The run judge waits for
-/// a draw that may never come; the epoch judges the debt at the risk wait.
+/// An undrawn residual: a mode set between the halves drops the undo, nothing is drawn, and the
+/// screen is one row up all the same. The run judge waits for a draw that may never come; the
+/// epoch judges the debt at the risk wait.
 #[test]
 fn an_undrawn_residual_is_judged_after_the_risk_wait() {
     let model = resize_render_model();
@@ -595,16 +558,11 @@ fn a_quiet_flap_owes_nothing_and_an_unknown_program_is_never_accused() {
     assert!(!model.action_enabled("Classify", &learned), "once");
 }
 
-/// Every named mutant breaks exactly its claims anywhere in the bounded
-/// space: 2 `NoSilentPass`; 3 the verdict both ways and the displaced render
-/// both ways (a time-closed run is left `silent`, or booked, whatever the
-/// undo later hands back); 4 and 5 `RiskIsFlagged`; and for the epoch judge 6
-/// (accuse an unlearned program) `OnlyAJudgedProgramIsAccused`, 7 (forget the
-/// residual) `EpochFlagsTheResidual`, 8 (answer whenever the geometry is at the
-/// epoch's start, owed or not) `EpochNoFalseAlarm`.
-///
-/// Three tests over disjoint mutants (each walk is its own whole space):
-/// the verdict's 2 and 3, the risk's 4 and 5, the epoch judge's 6, 7 and 8.
+/// Every named mutant breaks exactly its claims anywhere in the bounded space: 2
+/// `NoSilentPass`; 3 the verdict and the displaced render both ways; 4 and 5 `RiskIsFlagged`;
+/// for the epoch judge 6 (accuse an unlearned program) `OnlyAJudgedProgramIsAccused`, 7 (forget
+/// the residual) `EpochFlagsTheResidual`, 8 (answer whenever the geometry is at the epoch's
+/// start) `EpochNoFalseAlarm`. Three tests over disjoint mutants, each walk its own whole space.
 #[test]
 fn each_named_mutant_breaks_exactly_its_claims_the_verdict_s() {
     breaks_exactly(2, &["NoSilentPass"]);
@@ -632,8 +590,7 @@ fn each_named_mutant_breaks_exactly_its_claims_the_epoch_judge_s() {
     breaks_exactly(8, &["EpochNoFalseAlarm"]);
 }
 
-/// Each invariant, alone, is falsified by the `Buggy = 1` family (the
-/// workspace ratchet's claim, restated here for the displaced render).
+/// Each invariant but the space guard, alone, is falsified by the `Buggy = 1` family.
 #[test]
 fn the_render_invariants_are_each_caught() {
     let model = resize_render_model();

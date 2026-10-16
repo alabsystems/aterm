@@ -183,10 +183,10 @@ fn every_root_kind_is_found_and_each_build_directory_once() {
             .join("scratchpad/1/2/3/4/target"),
     ); // deeper than the scratch walk
     // A cells cache. Its marker holds the checkout's path byte for byte, as
-    // `xtask gate cells` writes it: a live checkout whose folder name ends in
-    // a space is read as that folder (a trimmed read named the missing `live`
+    // the cache was written: a live checkout whose folder name ends in a
+    // space is read as that folder (a trimmed read named the missing `live`
     // beside it, seen gone, and the cache went whole). A marker ending in a
-    // line break (no marker the gate writes) names no checkout.
+    // line break (none was written so) names no checkout.
     let live = mkdirs(&t.join("live "));
     std::fs::write(live.join("Cargo.toml"), b"[workspace]\n").expect("manifest");
     let cell = lay_target(&t.join("cells/wt-0123/linux"));

@@ -1,0 +1,19 @@
+[package]
+name = "astream-digest"
+description = "astream SHA-256: FIPS 180-4 transcribed line by line, zero dependencies, forbid(unsafe). The one hash under astream-cap's HMAC capabilities and producer ids, astream-aead's handshake HKDF, and astream-evidence's output pins."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+# No dependencies, on purpose: the `sha2` crate it replaces brought six more
+# packages (digest, block-buffer, crypto-common, generic-array, typenum,
+# cpufeatures; 48,869 lines with sha2) into every graph that capabilities reach,
+# for one streaming hash. astream hashes grants, nonces and test output, not bulk
+# traffic, so the reference algorithm is the whole requirement.
+#
+# It was held to sha2 by a differential while sha2 was a dev-dependency here;
+# tests/lengths_and_splits.rs keeps the answers sha2 gave, not sha2.
+[dependencies]

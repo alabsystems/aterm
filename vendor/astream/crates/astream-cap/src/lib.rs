@@ -8,7 +8,8 @@
 //! "SSH" for untrusted-network use (the doctrine's "sound, unforgeable capability
 //! mint") — WHO may attach where. The confidentiality/authentication half is the
 //! sibling crate `astream-aead` (an XChaCha20-Poly1305 sealed wire), deliberately
-//! a separate crate so each vetted crypto dependency stays isolated.
+//! a separate crate so its vetted cipher dependency stays isolated: this crate
+//! takes no third-party dependency at all.
 //!
 //! A **capability is a signed grant**. A grant is an [`astream_wire::Filter`] —
 //! the subject subtree its bearer may attach/observe/drive — optionally prefixed
@@ -50,16 +51,20 @@
 //! line `asb mint` prints and every `--cap-file` reads — and the one reader for it,
 //! so a face that presents a ring reads it by these rules instead of its own.
 //!
-//! Crypto honesty: the MAC is **HMAC-SHA256 per RFC 2104** over the workspace's
-//! already-vetted `sha2` primitive — a standard construction, NOT a hand-rolled
-//! cipher or MAC. Encrypting the wire is intentionally NOT done here: that is
+//! Crypto honesty: the MAC is **HMAC-SHA256 per RFC 2104** — a standard
+//! construction, not an invented MAC — over the workspace's own SHA-256,
+//! `astream-digest`: FIPS 180-4 transcribed line by line, pinned to the FIPS
+//! vectors, and held byte-for-byte to the `sha2` crate it replaced over every
+//! length 0..=1024. The MAC is pinned to all seven RFC 4231 cases, and the tags,
+//! attach proof and producer ids this crate answered over `sha2` are pinned as
+//! recorded answers. No cipher is built here: encrypting the wire is
 //! `astream-aead`'s job (over the vetted RustCrypto AEAD), wired into the broker
 //! as `serve_tcp_sealed`; a guarded broker (`open_guarded`) composes the two.
 
 pub mod capfile;
 
+use astream_digest::Sha256;
 use astream_wire::{Filter, Subject};
-use sha2::{Digest, Sha256};
 
 const BLOCK: usize = 64; // SHA-256 block size
 const TAG: usize = 32; // SHA-256 output size
@@ -311,14 +316,22 @@ pub fn producer_id_of(principal: &str) -> u64 {
     let mut h = Sha256::new();
     h.update(PID_DOMAIN);
     h.update(principal.as_bytes());
-    let digest = h.finalize();
+    // A fixed `[u8; 32]`, so the first 8 bytes are a static, in-bounds slice.
+    let digest: [u8; TAG] = h.finalize();
     let mut head = [0u8; 8];
     head.copy_from_slice(&digest[..8]);
     u64::from_le_bytes(head)
 }
 
-/// HMAC-SHA256(key, msg) per RFC 2104, over the vetted `sha2` primitive.
+/// HMAC-SHA256(key, msg) per RFC 2104, over `astream-digest`'s SHA-256.
 fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; TAG] {
+    hmac_sha256_parts(key, &[msg])
+}
+
+/// HMAC-SHA256 of the CONCATENATION of `parts`, streamed into the inner hash one
+/// part at a time — the same tag as [`hmac_sha256`] over the joined bytes, without
+/// materialising the join.
+fn hmac_sha256_parts(key: &[u8], parts: &[&[u8]]) -> [u8; TAG] {
     let mut k = [0u8; BLOCK];
     if key.len() > BLOCK {
         k[..TAG].copy_from_slice(&Sha256::digest(key));
@@ -333,14 +346,14 @@ fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; TAG] {
     }
     let mut inner = Sha256::new();
     inner.update(ipad);
-    inner.update(msg);
+    for part in parts {
+        inner.update(part);
+    }
     let ih = inner.finalize();
     let mut outer = Sha256::new();
     outer.update(opad);
     outer.update(ih);
-    let mut out = [0u8; TAG];
-    out.copy_from_slice(&outer.finalize());
-    out
+    outer.finalize()
 }
 
 /// The folded difference between two tags: the OR of all 32 byte-wise XORs. Zero
@@ -403,10 +416,7 @@ pub fn verify(secret: &[u8], cap: &Capability) -> bool {
 /// grant (so a proof for one grant cannot be presented for another).
 #[must_use]
 pub fn attach_proof(tag: &[u8; TAG], nonce: &[u8], grant: &str) -> [u8; TAG] {
-    let mut msg = Vec::with_capacity(nonce.len() + grant.len());
-    msg.extend_from_slice(nonce);
-    msg.extend_from_slice(grant.as_bytes());
-    hmac_sha256(tag, &msg)
+    hmac_sha256_parts(tag, &[nonce, grant.as_bytes()])
 }
 
 /// The fold [`verify_attach`] decides on: [`ct_diff`] between the proof `secret`
@@ -569,15 +579,160 @@ mod tests {
         assert!(!grants_filter(secret, &forged, "/a/x", T0));
     }
 
+    /// `attach_proof` streams nonce and grant into the MAC instead of joining them
+    /// first: the proof must be the HMAC of the concatenation, byte for byte —
+    /// including the empty-nonce and empty-grant edges.
     #[test]
-    fn rfc2104_test_vector() {
-        // RFC 4231 Test Case 2: key="Jefe", data="what do ya want for nothing?".
-        let mac = hmac_sha256(b"Jefe", b"what do ya want for nothing?");
-        let hex: String = mac.iter().map(|b| format!("{b:02x}")).collect();
+    fn attach_proof_is_the_hmac_of_nonce_then_grant() {
+        let tag = [7u8; TAG];
+        for (nonce, grant) in [
+            (&b"\x01\x02\x03nonce"[..], "ro:/a/>"),
+            (&b""[..], "ro:/a/>"),
+            (&b"only-nonce"[..], ""),
+            (&[0u8; 200][..], "rw:/a/b/c"),
+        ] {
+            let mut joined = nonce.to_vec();
+            joined.extend_from_slice(grant.as_bytes());
+            assert_eq!(attach_proof(&tag, nonce, grant), hmac_sha256(&tag, &joined));
+        }
+        // The split point is not part of the MAC: only the joined bytes are.
         assert_eq!(
-            hex,
-            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+            attach_proof(&tag, b"ab", "cd"),
+            attach_proof(&tag, b"abc", "d")
         );
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// RFC 4231 §4.2–4.8, every HMAC-SHA-256 case: `(case, key, data, tag)`. Case 5
+    /// is published truncated to 128 bits; cases 6 and 7 carry a 131-byte key, so
+    /// they pin the hash-the-key-first path a short key never reaches.
+    #[test]
+    fn rfc4231_test_vectors() {
+        let case4_key: Vec<u8> = (0x01u8..=0x19).collect();
+        let case7_data: &[u8] = b"This is a test using a larger than block-size key and a \
+            larger than block-size data. The key needs to be hashed before being used by the \
+            HMAC algorithm.";
+        assert_eq!(case7_data.len(), 152);
+        for (case, key, data, tag) in [
+            (
+                1,
+                &[0x0b; 20][..],
+                &b"Hi There"[..],
+                "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7",
+            ),
+            (
+                2,
+                b"Jefe",
+                b"what do ya want for nothing?",
+                "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843",
+            ),
+            (
+                3,
+                &[0xaa; 20],
+                &[0xdd; 50],
+                "773ea91e36800e46854db8ebd09181a72959098b3ef8c122d9635514ced565fe",
+            ),
+            (
+                4,
+                &case4_key,
+                &[0xcd; 50],
+                "82558a389a443c0ea4cc819899f2083a85f0faa3e578f8077a2e3ff46729665b",
+            ),
+            (
+                5,
+                &[0x0c; 20],
+                b"Test With Truncation",
+                "a3b6167473100ee06e0c796c2955552b",
+            ),
+            (
+                6,
+                &[0xaa; 131],
+                b"Test Using Larger Than Block-Size Key - Hash Key First",
+                "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54",
+            ),
+            (
+                7,
+                &[0xaa; 131],
+                case7_data,
+                "9b09ffa71b942fcb27635fbcd5b0e944bfdc63644f0713938a7f51535c3a35e2",
+            ),
+        ] {
+            let mac = hmac_sha256(key, data);
+            assert_eq!(hex(&mac[..tag.len() / 2]), tag, "RFC 4231 case {case}");
+        }
+    }
+
+    /// Recorded answers: the tags, the attach proof and the producer ids below were
+    /// computed by this crate over the `sha2` crate (0.10.9) on 2026-10-15, before
+    /// it moved to `astream-digest`, and pass unchanged over it. They are the wire contract a broker and every
+    /// bridge must keep agreeing on, so the hash under them can change only if they
+    /// do not. The secrets straddle the 64-byte HMAC block (shorter, exactly 64 —
+    /// padded, never hashed — 65, and RFC 4231's 131); the principals put
+    /// `"astream-pid\0" ‖ principal` on each side of SHA-256's 55/56-byte padding
+    /// split and its 64-byte block.
+    #[test]
+    fn tags_proofs_and_producer_ids_are_the_recorded_answers() {
+        let grants = [
+            "/a/stream/>",
+            "ro:/f/F/fleet/>",
+            "rw,p=n-a1b2c3d4,exp=1700000000000:/f/F/in/*/*/n-a1b2c3d4/*",
+        ];
+        let secrets: [&[u8]; 4] = [b"broker-secret-key", &[0x5a; 64], &[0xa5; 65], &[0xaa; 131]];
+        let tags: [[&str; 3]; 4] = [
+            [
+                "1084b08e4e2ade86386403d8b518566857c31a730cf5f206a0293204c88aa5f2",
+                "d2912c76afb62dfdd09cc6c2cd61140fa78f7a070b5eabd7ee259b0590403992",
+                "25bf205ebb67e38337023dcf053f5fbff510e21bd9a64d6c9b6e6147427ce874",
+            ],
+            [
+                "6d65ca9c6b82a619e92e4ecc49c093ce6371985455de7797d565b3adbe47fb14",
+                "06ab1bde29031443dc420ec1fd7e54364b1b889dcb57f521811b3ab31008b17b",
+                "4204cff3f16ee46f60255c99388156b0af55c2b993de7455e014017b9f9bb2b0",
+            ],
+            [
+                "a486eed296b74d68f41b89e01096bf00a67b182786929dd797bf27ce1cdbf603",
+                "0a85c062f9ae099f7ccc1a7f9c25aaf9e7f16a05a29df59135b5d0e42d134d30",
+                "2c989afc991446f3cf71331eff1ee37bbbc49e9c12f2e49b443145a55622dd39",
+            ],
+            [
+                "3b90019bbd326c6552db863aa21f13f32d406407f39b982fae1beb6767f23bbb",
+                "c7ee0fde0e03cd8af75e87429c93322d568f4fa59869cbe29af1fe5f08b76d0a",
+                "fd0ef1d480345f6f3f3e1bda84de96c910558bef25e16646d26fc92898570443",
+            ],
+        ];
+        for (secret, row) in secrets.iter().zip(tags) {
+            for (grant, want) in grants.iter().zip(row) {
+                let cap = mint(secret, grant).unwrap();
+                assert_eq!(hex(&cap.tag), want, "{}-byte secret, {grant}", secret.len());
+                assert!(verify(secret, &cap));
+            }
+        }
+
+        let cap = mint(b"broker-secret-key", "ro:/f/F/fleet/>").unwrap();
+        let nonce: Vec<u8> = (0u8..32).collect();
+        assert_eq!(
+            hex(&attach_proof(&cap.tag, &nonce, "ro:/f/F/fleet/>")),
+            "3f2e19fba0a70e487bce61a44ee2b173ec273bdd6f444a988d921e4c0e1a315b"
+        );
+
+        for (principal, want) in [
+            (String::new(), 17_935_985_926_779_910_026),
+            ("x".repeat(43), 18_257_435_040_005_927_146),
+            ("y".repeat(44), 14_590_640_223_644_302_360),
+            ("z".repeat(52), 10_940_676_290_768_544_027),
+            ("w".repeat(53), 11_676_937_174_542_836_057),
+            ("q".repeat(200), 1_749_860_932_688_955_062),
+        ] {
+            assert_eq!(
+                producer_id_of(&principal),
+                want,
+                "{} bytes",
+                principal.len()
+            );
+        }
     }
 
     #[test]

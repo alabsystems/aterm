@@ -2,18 +2,13 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! 24-bit colour across a resize that does not reflow columns (R14).
+//! 24-bit colour across a resize that does not reflow columns (same size, rows only, every
+//! alternate-screen resize). The renderer reads ring-stored truecolor from the dense RGB ring,
+//! which `invalidate_rings` drops; `migrate_rgb_ring_to_extras` must harvest it first, or the
+//! cell keeps its RGB-overflow flag but falls to the theme default.
 //!
-//! The dense RGB ring is what the renderer reads for every ring-stored truecolor
-//! cell. A resize that does not rebuild the extras by column reflow (same size,
-//! rows only, every alternate-screen resize) drops the ring in
-//! `invalidate_rings`; unless `migrate_rgb_ring_to_extras` harvests it first, the
-//! cell keeps its "RGB overflow" flag but loses its value and falls to the theme
-//! default until the program redraws it.
-//!
-//! Each row `n` is labelled `R<n>` and painted in a colour that names `n`, so a
-//! row keeps its colour if and only if its own colour follows it wherever the
-//! resize moved it.
+//! Row `n` is labelled `R<n>` and painted in a colour that names `n`, so a row keeps its colour
+//! only if its own colour follows it wherever the resize moved it.
 
 use crate::test_counters::take_rgb_harvest_cells;
 use crate::{Cell, CellFlags, Grid, PackedColor};
@@ -28,9 +23,8 @@ fn bg_of(n: u16) -> [u8; 3] {
     [10, (n + 1) as u8, 30]
 }
 
-/// `rows` rows labelled `R0`, `R1`, ... every cell truecolor, written into the
-/// dense ring the way a screen full of 24-bit text is. `max_scrollback` 0 is the
-/// alternate screen's shape.
+/// `rows` rows labelled `R0`, `R1`, ..., every cell truecolor in the dense ring.
+/// `max_scrollback` 0 is the alternate screen's shape.
 fn painted(rows: u16, cols: u16, cursor_row: u16, max_scrollback: usize) -> Grid {
     let mut grid = Grid::with_scrollback(rows, cols, max_scrollback);
     for r in 0..rows {
@@ -126,8 +120,7 @@ fn alt_width_change_keeps_truecolor() {
 
 #[test]
 fn two_resizes_keep_truecolor() {
-    // The first resize harvests the ring into the map and drops the ring; the
-    // second finds the colour in the map and must not lose it either.
+    // The first resize harvests the ring into the map and drops it; the second reads the map.
     for max_scrollback in [0, 100] {
         let mut grid = painted(6, 10, 5, max_scrollback);
         grid.resize_no_reflow(5, 10);
@@ -154,7 +147,7 @@ fn alt_quiet_flap_keeps_truecolor() {
 
 #[test]
 fn main_width_change_keeps_truecolor() {
-    // The control: the column-reflow path always read the ring itself.
+    // The control: the column-reflow path reads the ring itself.
     let mut grid = painted(6, 10, 5, 100);
     grid.resize(6, 8);
     let mut seen = 0;

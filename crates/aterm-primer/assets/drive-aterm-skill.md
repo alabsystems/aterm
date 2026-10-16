@@ -69,7 +69,7 @@ aterm ctl "@$SID" image shot.png        # OK <w> <h> <path>
 aterm ctl "@$SID" blocks                # shell-integration command blocks (OSC-133)
 ```
 
-- `screen` is about 400 KB of JSON on a 24x80 grid; `text` is almost always enough.
+- `screen` is the whole styled grid as JSON; `text` is almost always enough.
 - `image` takes a bare filename and captures only a tab a window shows. The reply path
   contains spaces on macOS: take the rest of the line, not `$4`. A remote driver uses
   `image --bytes`.
@@ -92,7 +92,7 @@ cat script.py | aterm ctl "@$SID" paste --stdin                  # with paste se
   visible row matched and nothing was written: the box is gone or a different one is up,
   so read the screen again. `if-gen=<gen>` and `if-fp=<hash>` fence a press to the read
   you decided on.
-- **A pattern is ONE whitespace-free token.** The wire splits on whitespace and nothing
+- **A pattern is one whitespace-free token.** The wire splits on whitespace and nothing
   quotes: write `esc.to.interrupt`, not `'esc to interrupt'`, which arms `esc` and, in a
   `turn`, types the rest as the message.
 - `send` writes raw bytes; `key` carries "a human typed this" provenance.
@@ -119,13 +119,14 @@ may question instead of acting on.
   `await gone esc.to.interrupt timeout=600000` (level-triggered, so arm it only while the
   footer is up) or `turn settle=gone:…`, which waits for the footer to appear first.
   `await agent idle,prompt,question,wall` waits on the server's own verdict.
-- `await seq <n> timeout 0` is the cheap "did anything change?" check. `seq` is per grid
-  and misses alt-screen flips.
+- `await seq <n> timeout=0` is the cheap "did anything change?" check. `seq` is per grid
+  and repeats after an alternate-screen re-entry.
 - `wait`, `await block` and `blocks` need OSC-133 shell integration. On a plain shell,
   type `<cmd>; echo SENTINEL` and `await match SENTINEL`.
 - Each parked wait holds a slot every tab shares: park one, and no sleep loops.
-- Exit 75 is a lost instance (a self-update): find the session with `ls`, and read the
-  screen before re-sending a cut `turn` or `post`, which may already have taken effect.
+- Exit 75: the instance went away mid-exchange (a crash, a quit, or a self-update a `turn`
+  or `post` cannot cross). Either may already have taken effect: find the session with
+  `ls`, read the screen before re-sending a `turn`, and re-post only under the same `key=`.
 
 ## Lease, close
 
@@ -140,9 +141,9 @@ may question instead of acting on.
 
 What a driver meets:
 
-- Every Claude Code and Codex session in an aterm window is already supervised by the
-  window's host (`supervisor=aterm-harness@<pid>`). A `watch` you start there only
-  watches; hold a `lease` to drive the session yourself.
+- A `watch` you start on a session the window's host supervises
+  (`supervisor=aterm-harness@<pid>`, every Claude Code, Codex and agy session in an
+  aterm window) only watches; hold a `lease` to drive the session yourself.
 - A rating survey (`● How is Claude doing this session?` over `1: Bad 2: Fine 3: Good
   0: Dismiss`) takes a first character of 1, 2 or 3 as the human's rating. `phase` ends
   `survey 0` while one is open: dismiss it first with `aterm ctl "@$SID" key

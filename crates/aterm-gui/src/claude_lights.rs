@@ -1,40 +1,75 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE CLAUDE CODE LIGHTS, host side: a light in the rule under Claude Code's
-//! input box, left of aterm's footer facts (`crate::claude_footer`) — the
-//! permission mode (owner directions, 2026-09-24 and 2026-09-28). What it
-//! means, where it is read from and which of Claude's own inputs flips it are
-//! decided in `aterm_agent::harness::lights`; this module puts it on the
-//! glass and carries the gestures. Fast mode has no chip of aterm's (owner,
-//! 2026-09-30): Claude Code draws its own `↯` in its top rule.
+//! THE CLAUDE CODE LIGHTS, host side: aterm's chips in the rule under Claude
+//! Code's input box, left of aterm's footer facts (`crate::claude_footer`) —
+//! the permission mode's light (owner directions, 2026-09-24 and 2026-09-28)
+//! and the harness's own two marks, Autopilot and `⚙` (owner, 2026-10-15;
+//! `docs/DESIGN-harness-autopilot-2026-10-15.md` §2.3). What the light means,
+//! where it is read from and which of Claude's own inputs flips it are
+//! decided in `aterm_agent::harness::lights`; this module puts the chips on
+//! the glass and carries the gestures. Fast mode has no chip of aterm's
+//! (owner, 2026-09-30): Claude Code draws its own `↯` in its top rule.
 //!
-//! * DEVIATIONS ONLY: the light is drawn — as a labelled chip, `⏸ plan` —
-//!   only while it shows what the owner does not expect
+//! * DEVIATIONS ONLY, for the light: it is drawn — as a labelled chip, `⏸
+//!   plan` — only while it shows what the owner does not expect
 //!   (`lights::deviates`), while a toggle of it is in flight, a refusal or a
 //!   just-switched notice for it is on show, or the pointer or the keyboard
-//!   selection is on it. At rest, everything as expected, nothing is drawn:
-//!   `claude_lights_block` is `None` and the rule carries the facts alone.
-//!   The chip never replaces or covers Claude's own mode pill, which stays
-//!   on Claude's row under the rule, whole: the mode chip is aterm's own
-//!   click and keyboard target, in aterm's span of the rule. A rule too
-//!   narrow for the chip beside the model draws none (the model gives way
-//!   last, `footer::fit_rule`).
-//! * HOVER the chip: its title and state replace nothing — they appear just
-//!   right of the chip, where the rule has room: a hover's, a selection's or
-//!   a toggle's title is the first thing a narrow rule gives up, short then
-//!   gone, before any of the facts, while a REASON — where a mode return
+//!   selection is on it. At rest, everything as expected, no light is drawn,
+//!   and with no harness host `claude_lights_block` is `None`: the rule
+//!   carries the facts alone. The chip never replaces or covers Claude's own
+//!   mode pill, which stays on Claude's row under the rule, whole: the mode
+//!   chip is aterm's own click and keyboard target, in aterm's span of the
+//!   rule. A rule too narrow for the chip beside the model draws none (the
+//!   model gives way last, `footer::fit_rule`).
+//! * THE HARNESS'S TWO, ALWAYS — the owner's override of "deviations only"
+//!   for these two marks alone (2026-10-15: "i want a small icon that allows
+//!   me to toggle it on and off and another icon that takes me to the
+//!   settings page for the claude code harness", "I need some visual
+//!   indicator that the claude code session is being wrapped and a way to
+//!   toggle on and off to show the improvement"). Left of the light, in that
+//!   order, [`Chip::Autopilot`] says the session's Autopilot
+//!   ([`crate::autopilot::AutopilotView`]: `∞` cruise alone, `⤓ land`, `○
+//!   off`, `⊘ off` with the master switch off) and [`Chip::Settings`] is a
+//!   `⚙`: both drawn wherever the footer is and the window has a harness
+//!   host, at rest included; with no host, neither. They are not lights —
+//!   nothing on Claude's screen says them — and the LIGHT STAYS DEVIATIONS
+//!   ONLY. A click on Autopilot steps the session's own word (Cruise → Land
+//!   → Off → Cruise, [`App::cycle_session_autopilot`]): written in-process,
+//!   nothing sent to the PTY, never a person's keystroke, the chip `◐` until
+//!   a frame reads the word back. With the master switch off a click on it,
+//!   and any click on `⚙`, opens Settings ▸ Harness in that window. Their
+//!   repaint key is the footer's (`App::claude_footer_fp`), never
+//!   [`WindowLights::fingerprint`], which stays 0 at rest. A narrow rule
+//!   gives up the keyboard's reveal first, then `⚙`, then the light, and
+//!   Autopilot last — the mark that says the session is wrapped, where the
+//!   light only repeats Claude's own pill under the rule ([`Keep`]): one
+//!   order, so a chip a rule gave up never comes back in a narrower one,
+//!   and nor does a fact. Every chip goes before the model
+//!   (`footer::fit_rule`).
+//! * THE CHIPS' OWN GLASS: the blank between two chips is theirs too — a
+//!   press there does nothing, and neither it, nor a press of any button on
+//!   a chip, nor the pointer's motion over either reaches the pane (no
+//!   selection, no paste, no mouse report); the pointer is a hand only where
+//!   a press acts. A left press on either is a click away from an in-grid
+//!   rename field, and commits it as a click on the grid does.
+//! * HOVER a chip: its title and state replace nothing — they appear just
+//!   right of the chips, where the rule has room: a hover's, a selection's
+//!   or a toggle's title is the first thing a narrow rule gives up, short
+//!   then gone, before any of the facts, while a REASON — where a mode return
 //!   stopped — outranks the branch and the path, never the model or the
-//!   effort (`footer::fit_rule`). CLICK it: it toggles.
+//!   effort (`footer::fit_rule`). CLICK it: the light toggles, Autopilot
+//!   steps, `⚙` opens Settings ▸ Harness.
 //! * `ctrl+shift+tab` (macOS; elsewhere it is aterm's `prev_tab`) REVEALS
-//!   the known light of the focused pane and selects it (Claude keeps its
-//!   own shift+tab); while it is selected, Return or Space toggles it (in
-//!   bypass or auto it does nothing), and Escape — or any other key, which
-//!   then goes on to Claude as usual — lets go, and the light at rest goes
-//!   with the selection. Only a chip the pane has ROOM for is ever selected
-//!   (the reveal gives way first), and a selection whose chip is not on the
-//!   glass is let go by the next key: a light nobody can see never takes a
-//!   Return meant for Claude.
+//!   the known light of the focused pane and selects the next chip — the
+//!   harness's two included, always revealable where drawn (Claude keeps
+//!   its own shift+tab); while one is selected, Return or Space acts as its
+//!   click (the light in bypass or auto does nothing), and Escape — or any
+//!   other key, which then goes on to Claude as usual — lets go, and the
+//!   light at rest goes with the selection. Only a chip the pane has ROOM
+//!   for is ever selected (the reveal gives way first), and a selection
+//!   whose chip is not on the glass is let go by the next key: a chip nobody
+//!   can see never takes a Return meant for Claude.
 //! * A toggle is Claude's own input, and it is READ BACK: the light shows
 //!   `◐` until Claude's screen says it switched, and says in its title where
 //!   it stopped if Claude did not within `harness::lights::SETTLE_MS` of a
@@ -70,15 +105,322 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
+use aterm_agent::harness::acts::{Act, TaskFace};
 use aterm_agent::harness::lights::{self, Light, LightState, Mode, Reading, Screen};
+use aterm_agent::supervise::Autopilot;
 use aterm_core::terminal::{RenderCell, UnderlineStyle};
 use winit::event::KeyEvent;
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 
+use crate::autopilot::{AutopilotView, ChipTone, PENDING_GLYPH, SETTINGS_GLYPH, SETTINGS_TITLE};
 use crate::{App, WindowId};
 
 /// How long a toggle that did not take keeps saying so.
 const REFUSAL_SHOWN: Duration = Duration::from_secs(4);
+
+/// One chip of aterm's span in the rule (design §2.3): a LIGHT, read from
+/// what Claude Code draws ([`Light`]), or one of the harness's own two marks
+/// — aterm's state, not Claude's, so they are chips and never lights, and
+/// `harness::lights::Light` keeps its meaning. The painter's hits, the hover,
+/// the keyboard selection and a block's columns are kept per chip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum Chip {
+    /// A light of Claude Code's (today the permission mode): drawn as a
+    /// deviation only; a click toggles it with Claude's own input.
+    Light(Light),
+    /// The session's Autopilot ([`AutopilotView`]): drawn always while a
+    /// harness host exists; a click steps its word, or opens Settings ▸
+    /// Harness with the master switch off.
+    Autopilot,
+    /// `⚙`: drawn beside Autopilot; a click opens Settings ▸ Harness.
+    Settings,
+}
+
+impl Chip {
+    /// Every chip in the row's order, left to right: Autopilot, Settings,
+    /// then the lights.
+    fn row() -> impl Iterator<Item = Chip> {
+        [Chip::Autopilot, Chip::Settings]
+            .into_iter()
+            .chain(Light::ALL.into_iter().map(Chip::Light))
+    }
+}
+
+impl From<Light> for Chip {
+    fn from(light: Light) -> Self {
+        Chip::Light(light)
+    }
+}
+
+/// Land's ink (§2.3): the amber of Claude Code's own auto-mode pill
+/// (`lights::Mode::Auto`'s hue) — the work is being wrapped up.
+const AMBER: [u8; 3] = [0xE8, 0xB0, 0x3C];
+
+/// A LOCAL CLOCK TIME, `HH:MM` in 24-hour time, as the tab's wait already
+/// writes it (`→ 14:05`): what the harness's glass shows of an instant —
+/// never an age, which would freeze at rest
+/// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §9.0). Formatted ONCE,
+/// where its instant is learned (an act's arrival, a face's move, a timer's
+/// arming), then copied: a frame formats nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct Clock([u8; 5]);
+
+impl Clock {
+    /// The clock at `minute` of the day (`0..1440`; a larger one wraps).
+    #[must_use]
+    pub(crate) const fn of_minute(minute: u16) -> Self {
+        /// The ASCII digit of `n`'s ones.
+        const fn digit(n: u16) -> u8 {
+            b'0' + (n % 10) as u8
+        }
+        let m = minute % 1440;
+        let (h, mm) = (m / 60, m % 60);
+        Self([digit(h / 10), digit(h), b':', digit(mm / 10), digit(mm)])
+    }
+
+    /// The local clock at unix second `at_unix`, in the zone's offset at that
+    /// instant (`presence::local_offset_at`, as the tab's retry plan reads
+    /// it); `None` where the platform cannot say.
+    #[must_use]
+    pub(crate) fn at(at_unix: i64) -> Option<Self> {
+        let offset = crate::presence::local_offset_at(at_unix)?;
+        let minute = (at_unix + offset).rem_euclid(86_400) / 60;
+        Some(Self::of_minute(u16::try_from(minute).unwrap_or(0)))
+    }
+
+    /// The minute of the day it names (`0..1440`).
+    #[must_use]
+    pub(crate) const fn minute(self) -> u16 {
+        /// The value of ASCII digit `b`.
+        const fn value(b: u8) -> u16 {
+            (b.wrapping_sub(b'0') % 10) as u16
+        }
+        let [h1, h2, _, m1, m2] = self.0;
+        ((value(h1) * 10 + value(h2)) * 60 + value(m1) * 10 + value(m2)) % 1440
+    }
+
+    /// `HH:MM`.
+    #[must_use]
+    pub(crate) fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.0).unwrap_or("--:--")
+    }
+}
+
+/// A DAY OF THE WEEK, named where a timer lands on another local date than
+/// the one it was set on (§9.3.2): a weekday, never "tomorrow", which would
+/// go stale at midnight with nothing to repaint it.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "Autopilot's timer (design §9.6.2) arms the weekday; until then only the face \
+                  table's tests do"
+    )
+)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum Weekday {
+    Mon,
+    Tue,
+    Wed,
+    Thu,
+    Fri,
+    Sat,
+    Sun,
+}
+
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "Autopilot's timer (design §9.6.2) arms the weekday; until then only the face \
+                  table's tests do"
+    )
+)]
+impl Weekday {
+    /// Every day, Monday first.
+    pub(crate) const ALL: [Weekday; 7] = [
+        Weekday::Mon,
+        Weekday::Tue,
+        Weekday::Wed,
+        Weekday::Thu,
+        Weekday::Fri,
+        Weekday::Sat,
+        Weekday::Sun,
+    ];
+
+    /// The weekday of the local date `days` days after 1970-01-01, a
+    /// Thursday.
+    #[must_use]
+    pub(crate) const fn of_days(days: i64) -> Self {
+        Self::ALL[(days + 3).rem_euclid(7) as usize]
+    }
+
+    /// Its short name, as the title and the page write it (`Sat 16:00`).
+    #[must_use]
+    pub(crate) const fn short(self) -> &'static str {
+        match self {
+            Weekday::Mon => "Mon",
+            Weekday::Tue => "Tue",
+            Weekday::Wed => "Wed",
+            Weekday::Thu => "Thu",
+            Weekday::Fri => "Fri",
+            Weekday::Sat => "Sat",
+            Weekday::Sun => "Sun",
+        }
+    }
+
+    /// Its whole name, as a screen reader says it.
+    #[must_use]
+    pub(crate) const fn long(self) -> &'static str {
+        match self {
+            Weekday::Mon => "Monday",
+            Weekday::Tue => "Tuesday",
+            Weekday::Wed => "Wednesday",
+            Weekday::Thu => "Thursday",
+            Weekday::Fri => "Friday",
+            Weekday::Sat => "Saturday",
+            Weekday::Sun => "Sunday",
+        }
+    }
+}
+
+/// AN ARMED TIMER as the chip shows it (§9.3.2): the local time a timed
+/// Cruise lands, formatted when the timer was indexed, and its weekday where
+/// that instant falls on another local date than the one it was set on.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "Autopilot's timer (design §9.6.2) indexes it; until then nothing is armed"
+    )
+)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct LandAtGlass {
+    /// When it lands, local `HH:MM`.
+    pub(crate) clock: Clock,
+    /// The day it lands on, where that is not the day it was set on.
+    pub(crate) other_day: Option<Weekday>,
+}
+
+/// THE HARNESS'S GLASS FOR ONE AUTOPILOT CHIP (§9.2.3, item 5): what the
+/// frame reads beside the session's word, once a frame
+/// ([`App::chip_glass`]) — a `Copy` value, so a frame allocates nothing,
+/// takes no lock and reads no clock for it: every time in it was formatted
+/// where its fact arrived. [`ChipGlass::default`] is v1's chip: no act lit,
+/// no face told, no timer armed, no goal held — and the face table
+/// ([`ChipFace`]) gives v1's face, ink and title for it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub(crate) struct ChipGlass {
+    /// The act lit for its dwell (§9.2.1), drawn right of the chips in the
+    /// chip's ink ([`act_label`]); `None` at rest.
+    pub(crate) lit: Option<Act>,
+    /// The task's face (§9.4.2); `None` while unknown, drawn as open.
+    pub(crate) task: Option<TaskFace>,
+    /// The local clock time the task's face moved there, for the spoken
+    /// label and the page (`landed 17:42`); `None` where the zone could not
+    /// be read.
+    pub(crate) task_at: Option<Clock>,
+    /// The armed timer (§9.3.2): a timed Cruise reads `∞ ⤓18:00`.
+    pub(crate) land_at: Option<LandAtGlass>,
+    /// Codex is pursuing its `/goal` (§9.5.4): under Land the chip reads
+    /// `⤓ held`.
+    pub(crate) held: bool,
+    /// The trail's newest act and the clock time it arrived: the chip's
+    /// spoken description and the page's `last:` line.
+    pub(crate) last: Option<(Act, Clock)>,
+    /// The trail's generation: moves with each act the trail takes, so a
+    /// title someone is reading is built again — folded into the repaint key
+    /// only while the chip is hovered or selected
+    /// ([`WindowLights::autopilot_term`]).
+    pub(crate) trail: u8,
+}
+
+/// WHICH FACE THE AUTOPILOT CHIP WEARS: its view (§2.3) and its glass
+/// (§§9.2–9.5) folded into one of eleven, of which THE FACE TABLE gives the
+/// glyph, the word, the inks, the titles and the spoken label — pure
+/// functions of it and the glass's clocks. Under Cruise an armed timer shows;
+/// under Land a running Codex goal, then the task's face; under Off, the
+/// master switch and no host, v1's face alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum ChipFace {
+    /// `∞`: Cruise.
+    Cruise,
+    /// `∞ ⤓18:00`: Cruise until a time, then Land (§9.3.2).
+    CruiseUntil,
+    /// `⤓ land`: Land, its task open or unknown.
+    Land,
+    /// `✓ landed`: the agent finished after the land instruction (§9.4.1).
+    Landed,
+    /// `✓ done`: the agent said it was finished before a landing was asked.
+    Done,
+    /// `⤓ quiet`: the landing is spent, no done reply after its nudges.
+    Spent,
+    /// `⤓ quiet`: a person's own exchange.
+    Theirs,
+    /// `⤓ held`: Codex is pursuing its `/goal`, and Land types nothing while
+    /// it runs (§9.5.4).
+    Held,
+    /// `○ off`.
+    Off,
+    /// `⊘ off`: the master switch is off.
+    MasterOff,
+    /// `⊘ off`: no host.
+    Unhosted,
+}
+
+/// How a block gives way in a rule short of room: what
+/// [`WindowLights::fitted`] gives up, rung by rung, until the chips fit.
+/// Each rung keeps a part of the one before it, so a chip leaves only as
+/// the rule narrows: never given up at one width and drawn again at a
+/// narrower one. Past [`Keep::Drawn`] the block HOLDS all the room it was
+/// fitted to ([`Block::holds`]): the room a given-up chip leaves stays the
+/// rule's, and no fact the facts gave up before the chips comes back
+/// beside fewer of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Keep {
+    /// Every chip, the keyboard's reveal of the lights at rest included.
+    Revealed,
+    /// Every chip drawn without the reveal.
+    Drawn,
+    /// `⚙` given up as well (Settings ▸ Harness is in the View menu too).
+    NoSettings,
+    /// The light given up as well — it only repeats Claude's own pill on
+    /// the row under the rule — and Autopilot alone, the mark that says the
+    /// session is wrapped: the last chip a narrow rule keeps.
+    AutopilotOnly,
+    /// Autopilot's GLYPH alone (§9.3.2): `∞`, `⤓`, `✓` — the timer's time,
+    /// a face's word and the act's label all go before the chip does. The
+    /// ladder's last rung, taken only by a STANDING FACE of v2's
+    /// ([`ChipFace::standing`]: `∞ ⤓18:00`, `✓ landed`, `✓ done`, `⤓ quiet`,
+    /// `⤓ held`): v1's faces keep v1's ladder, which ends at
+    /// [`Keep::AutopilotOnly`] — a rule too narrow for `⤓ land` or `○ off`
+    /// draws no chip, as it did — so nothing a person sees moves until a
+    /// slice draws such a face, and no slice need touch the ladder to draw
+    /// one ([`WindowLights::fit_into`]).
+    GlyphOnly,
+}
+
+impl Keep {
+    /// Every rung, in the order a rule short of room tries them.
+    /// [`Keep::GlyphOnly`] is tried only for a standing face of v2's.
+    const LADDER: [Keep; 5] = [
+        Keep::Revealed,
+        Keep::Drawn,
+        Keep::NoSettings,
+        Keep::AutopilotOnly,
+        Keep::GlyphOnly,
+    ];
+
+    /// Whether this rung keeps `chip`, where it is drawn at all (the
+    /// reveal is [`Keep::Revealed`]'s alone).
+    fn keeps(self, chip: Chip) -> bool {
+        match chip {
+            Chip::Autopilot => true,
+            Chip::Settings => matches!(self, Keep::Revealed | Keep::Drawn),
+            Chip::Light(_) => !matches!(self, Keep::AutopilotOnly | Keep::GlyphOnly),
+        }
+    }
+}
 
 /// Why a toggle did not happen, as its light's title says it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -191,20 +533,83 @@ struct SessionLights {
     /// A toggle that took: its light stays drawn, titled with its new state,
     /// until this instant — then, back as expected, it goes.
     notice: Option<(Light, Instant)>,
+    /// The session's Autopilot as the last frame that drew its footer read
+    /// it ([`App::session_autopilot`], once per frame,
+    /// [`App::note_claude_autopilot`]): `None` before one did. Under
+    /// [`AutopilotView::Unhosted`] neither harness chip is drawn.
+    autopilot: Option<AutopilotView>,
+    /// An Autopilot click in flight: the word it wrote, and the instant it is
+    /// let go if no frame has read that word back by then. The chip shows
+    /// `◐` meanwhile.
+    autopilot_pending: Option<(Autopilot, Instant)>,
+    /// The harness's glass on the Autopilot chip as the same frame read it
+    /// ([`App::chip_glass`]): its act, its task's face, its timer, its goal
+    /// hold. The default — v1's chip — until a fact is told.
+    glass: ChipGlass,
 }
 
-/// One painted light, in frame cells — recorded by the painter, read by the
-/// pointer, so a click can only land on a light the glass shows.
+impl SessionLights {
+    /// Whether the harness's two chips are drawn for this session: a footer
+    /// read its Autopilot, and the window has a harness host.
+    fn harness_chips(&self) -> bool {
+        self.autopilot
+            .is_some_and(|view| view != AutopilotView::Unhosted)
+    }
+
+    /// Whether a rule short of room for the Autopilot chip's face may keep
+    /// its glyph alone ([`Keep::GlyphOnly`]): only while it wears a standing
+    /// face of v2's ([`ChipFace::standing`]) and no click of it is in flight
+    /// (whose `◐` is a glyph alone already). v1's faces give the chip up
+    /// whole, as v1 did.
+    fn glyph_rung(&self) -> bool {
+        self.autopilot_pending.is_none()
+            && self
+                .autopilot
+                .is_some_and(|view| ChipFace::of(view, &self.glass).standing())
+    }
+}
+
+/// One painted cell of the chips, in frame cells — recorded by the painter,
+/// read by the pointer, so a click can only land on a chip the glass shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LightHit {
     frame_row: usize,
     /// The same row as a window grid row, for the chrome register: a band
-    /// that later claims the row (the link caption) hides the light, and a
-    /// hidden light is not a light.
+    /// that later claims the row (the link caption) hides the chip, and a
+    /// hidden chip is not a chip.
     term_row: usize,
     col: usize,
     session: u64,
-    light: Light,
+    /// The chip painted there — or `None` for the blank between two chips:
+    /// the chips' own glass, where a press does nothing and nothing reaches
+    /// the pane under it (no selection, no mouse report).
+    chip: Option<Chip>,
+}
+
+/// What of the chips' glass the pointer is over
+/// ([`App::track_claude_light_hover`]): over either part the motion is the
+/// chips', never the pane's, and the pointer is a hand only where a press
+/// acts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OverChips {
+    /// Not the chips': the motion is the pane's.
+    No,
+    /// A chip: a press acts on it — the hand.
+    Chip,
+    /// The blank between two chips: theirs, and a press there does nothing
+    /// — the arrow.
+    Gap,
+}
+
+impl OverChips {
+    /// What [`App::claude_chips_at`] found.
+    pub(crate) fn of(at: Option<(u64, Option<Chip>)>) -> Self {
+        match at {
+            None => Self::No,
+            Some((_, Some(_))) => Self::Chip,
+            Some((_, None)) => Self::Gap,
+        }
+    }
 }
 
 /// The lights' state for one window (`WindowState::claude_lights`).
@@ -217,20 +622,53 @@ pub(crate) struct WindowLights {
     /// keyboard's way to a light at rest needs the rule on the glass AND room
     /// in it for the chip it selects.
     footers: Vec<(u64, usize)>,
-    hover: Option<(u64, Light)>,
-    selected: Option<(u64, Light)>,
+    hover: Option<(u64, Chip)>,
+    selected: Option<(u64, Chip)>,
     /// A frame has been painted since the selection last moved: from then
     /// on, a selection whose chip is not among the hits is not on the glass,
     /// and is let go rather than left to swallow a Return.
     selection_painted: bool,
     sessions: HashMap<u64, SessionLights>,
+    /// Painted blocks handed back, their buffers the next frame's
+    /// (`App::claude_lights_block`).
+    spare_blocks: Vec<Block>,
+}
+
+/// How many painted blocks a window keeps for reuse
+/// (`App::recycle_claude_lights_block`).
+const SPARE_BLOCKS: usize = 8;
+
+/// The lights' clock on the footer's per-frame paths — the repaint key's
+/// term ([`WindowLights::fingerprint`], read only while something timed is
+/// held) and the block the rule draws: the wall clock, each read counted
+/// (`work_counts::footer_clock_read`), the floor the harness's per-frame
+/// cost is measured against.
+pub(crate) fn lights_now() -> Instant {
+    #[cfg(test)]
+    crate::work_counts::footer_clock_read();
+    Instant::now()
 }
 
 impl WindowLights {
     /// Everything about the lights that is GUI state rather than grid
     /// content, for the repaint key: a hover, a selection, a toggle in flight
-    /// or a refusal on show changes the row with no grid damage at all.
-    pub(crate) fn fingerprint(&self, now: Instant) -> u64 {
+    /// or a refusal on show changes the row with no grid damage at all. The
+    /// harness chips' own state — the session's Autopilot, a click of it in
+    /// flight — is keyed per pane by the footer
+    /// ([`Self::autopilot_term`]), so this stays 0 at rest. `now` is read
+    /// once, and only where a refusal or a notice is held — whose showing it
+    /// bounds — so a window with neither, every window at rest, reads no
+    /// clock for it.
+    pub(crate) fn fingerprint(&self, now: impl Fn() -> Instant) -> u64 {
+        let read = std::cell::Cell::new(None);
+        let shows = |until: Instant| {
+            let now = read.get().unwrap_or_else(|| {
+                let at = now();
+                read.set(Some(at));
+                at
+            });
+            until > now
+        };
         // Among session entries, only a pending toggle or a refusal still on
         // screen can change the row. `sessions` also remembers light states for
         // hidden panes, so a long-lived window can hold many inert entries.
@@ -239,8 +677,8 @@ impl WindowLights {
             .iter()
             .filter(|(_, s)| {
                 s.pending.is_some()
-                    || s.refused.is_some_and(|(_, _, until)| until > now)
-                    || s.notice.is_some_and(|(_, until)| until > now)
+                    || s.refused.is_some_and(|(_, _, until)| shows(until))
+                    || s.notice.is_some_and(|(_, until)| shows(until))
             })
             .collect();
         if self.hover.is_none() && self.selected.is_none() && active.is_empty() {
@@ -256,12 +694,12 @@ impl WindowLights {
                 (p.light, p.presses).hash(&mut h);
             }
             if let Some((light, why, until)) = s.refused
-                && until > now
+                && shows(until)
             {
                 (light, why).hash(&mut h);
             }
             if let Some((light, until)) = s.notice
-                && until > now
+                && shows(until)
             {
                 (light, "notice").hash(&mut h);
             }
@@ -292,61 +730,145 @@ impl WindowLights {
         self.selection_painted = true;
     }
 
-    /// The lights the keyboard walks in `session` while a selection lasts:
-    /// every one whose state is known, in the row's order.
-    fn revealable(&self, session: u64) -> Vec<Light> {
-        let shown = self
-            .sessions
-            .get(&session)
-            .map(|s| s.shown)
-            .unwrap_or_default();
-        Light::ALL
-            .into_iter()
-            .filter(|l| revealed(*l, &shown))
+    /// The chips the keyboard walks in `session` while a selection lasts, in
+    /// the row's order: the harness's two wherever they are drawn, and every
+    /// light whose state is known.
+    fn revealable(&self, session: u64) -> Vec<Chip> {
+        let s = self.sessions.get(&session);
+        let shown = s.map(|s| s.shown).unwrap_or_default();
+        let harness = s.is_some_and(SessionLights::harness_chips);
+        Chip::row()
+            .filter(|chip| match chip {
+                Chip::Light(light) => revealed(*light, &shown),
+                Chip::Autopilot | Chip::Settings => harness,
+            })
             .collect()
     }
 
     /// Move the keyboard selection (a frame must paint it before it counts
     /// as off the glass).
-    fn select(&mut self, selected: Option<(u64, Light)>) {
+    fn select(&mut self, selected: Option<(u64, Chip)>) {
         self.selected = selected;
         self.selection_painted = false;
     }
 
+    /// Fold in `session`'s Autopilot as this frame's footer read it — its
+    /// own `word`, its `view` ([`App::session_autopilot`]) and its harness
+    /// glass ([`App::chip_glass`]) — and let an Autopilot click in flight go
+    /// once the word reads back as the one it wrote, or once its time is up.
+    /// The clock (`now`) is read only for a click in flight that has not read
+    /// back: a frame at rest reads none.
+    fn note_autopilot_at(
+        &mut self,
+        session: u64,
+        word: Option<Autopilot>,
+        view: AutopilotView,
+        glass: ChipGlass,
+        now: impl FnOnce() -> Instant,
+    ) {
+        let s = self.sessions.entry(session).or_default();
+        s.autopilot = Some(view);
+        s.glass = glass;
+        if s.autopilot_pending
+            .is_some_and(|(want, until)| word == Some(want) || until <= now())
+        {
+            s.autopilot_pending = None;
+        }
+    }
+
+    /// [`Self::note_autopilot_at`] at `now`.
+    #[cfg(test)]
+    fn note_autopilot(
+        &mut self,
+        session: u64,
+        word: Option<Autopilot>,
+        view: AutopilotView,
+        now: Instant,
+    ) {
+        self.note_autopilot_at(session, word, view, ChipGlass::default(), || now);
+    }
+
+    /// The harness chips' repaint term for `session`'s footer in this
+    /// window: its own Autopilot `word` and its `view`, as the footer's key
+    /// read them (once a frame, [`App::session_autopilot`]), an Autopilot
+    /// click of it in flight here, and its harness `glass`
+    /// ([`App::chip_glass`]) — glass that moves with no grid damage. Folded
+    /// into the footer's key (`App::claude_footer_fp`) for every pane whose
+    /// footer shows, never into [`Self::fingerprint`], which stays 0 at rest.
+    /// A packing of small fields, distinct for every combination the chip
+    /// draws differently (§9.2.3's bit table): no hasher, no lock, no clock.
+    ///
+    /// | Bits | Term |
+    /// |---|---|
+    /// | 0–23 | v1's word, view and click in flight |
+    /// | 24–31 | the lit act (0: none) |
+    /// | 32–34 | the task's face (0: open or unknown) |
+    /// | 35 | the Codex goal hold |
+    /// | 36–46 | the timer's minute of the day + 1 (0: none) |
+    /// | 47 | the timer lands on another local date than it was set on |
+    /// | 48–55 | the trail's generation, ONLY while this chip is hovered or selected: an act that lights nothing repaints nothing unless someone is reading the title |
+    ///
+    /// With the default glass it is v1's term, bit for bit.
+    pub(crate) fn autopilot_term(
+        &self,
+        session: u64,
+        word: Option<Autopilot>,
+        view: AutopilotView,
+        glass: ChipGlass,
+    ) -> u64 {
+        let pending = self
+            .sessions
+            .get(&session)
+            .and_then(|s| s.autopilot_pending)
+            .map(|(want, _)| want);
+        let reading = [self.hover, self.selected].contains(&Some((session, Chip::Autopilot)));
+        let word_bits = |w: Option<Autopilot>| w.map_or(0, |w| 1 + w as u64);
+        word_bits(word) | (view as u64) << 8 | word_bits(pending) << 16 | glass_bits(glass, reading)
+    }
+
     /// Read `rows` (`read`, inside the reader's panic fence) and fold the
-    /// reading in ([`Self::observe`]). A reader panic folds NOTHING in: the
-    /// lights keep what they last showed, a toggle in flight takes no step
-    /// (its deadline still expires it), and nothing to send or show.
+    /// reading in ([`Self::observe_read`]).
+    #[cfg(test)]
     fn observe_rows(
         &mut self,
         session: u64,
         rows: &[String],
-        read: impl FnOnce(&[String]) -> Option<Screen>,
+        read: impl FnOnce(&[String]) -> Option<Reading>,
     ) -> Step {
-        let Some(screen) =
-            crate::reader_guard::read_or_none(session, "Claude Code lights", rows, || read(rows))
-        else {
-            return Step::default();
-        };
-        self.observe(session, screen.as_ref())
+        let read =
+            crate::reader_guard::read_or_none(session, "Claude Code lights", rows, || read(rows));
+        self.observe_read(session, read)
     }
 
-    /// Fold one frame's reading of `session`'s screen in: remember what each
-    /// light shows. A toggle is NEVER stepped here: a frame that shows
-    /// Claude's answer — the pill moved on — only wakes the loop, which reads
-    /// the ENGINE and decides ([`App::advance_claude_mode_returns`]) — the
-    /// same decision whether or not a frame is painted. What the caller must
-    /// do: wake the loop.
-    fn observe(&mut self, session: u64, screen: Option<&Screen>) -> Step {
+    /// Fold a frame's reading of `session`'s rows in ([`Self::observe`]),
+    /// as its reader's panic fence left it (`crate::claude_footer`'s
+    /// readings, kept with the rows). A reader panic (`None`) folds NOTHING
+    /// in: the lights keep what they last showed, a toggle in flight takes no
+    /// step (its deadline still expires it), and nothing to send or show.
+    fn observe_read(&mut self, session: u64, read: crate::claude_footer::LightsRead) -> Step {
+        match read {
+            Some(reading) => self.observe(session, reading),
+            None => Step::default(),
+        }
+    }
+
+    /// Fold one frame's reading of `session`'s screen in (`lights::read_lights`:
+    /// `None` without a composer): remember what each light shows. A toggle
+    /// is NEVER stepped here: a frame that shows Claude's answer — the pill
+    /// moved on — only wakes the loop, which reads the ENGINE and decides
+    /// ([`App::advance_claude_mode_returns`]) — the same decision whether or
+    /// not a frame is painted, and the turn is read there, never here. What
+    /// the caller must do: wake the loop.
+    fn observe(&mut self, session: u64, reading: Option<Reading>) -> Step {
         let s = self.sessions.entry(session).or_default();
-        s.shown.fold(&lights::read(screen));
+        s.shown.fold(&reading.unwrap_or(Reading::UNKNOWN));
         let Some(p) = s.pending.as_ref() else {
             return Step::default();
         };
         // Claude answered the last press (or the pill moved on its own): the
         // loop reads the engine and decides.
         Step {
-            wake: screen.is_some_and(|screen| screen.mode.is_some_and(|m| m != p.mode_at_press)),
+            wake: reading.is_some_and(|r| r.mode.is_some_and(|m| m != p.mode_at_press)),
         }
     }
 
@@ -410,9 +932,10 @@ impl WindowLights {
     /// Give up on every toggle past its deadline — a mode return past its
     /// LAST press's, naming the mode it stopped in (the session did switch,
     /// just not all the way) — and end every refusal and notice past its
-    /// time: whether anything changed, and the sessions whose refusal starts
-    /// now (the caller times its end — a refusal no frame ends would stay on
-    /// an idle screen).
+    /// time, and let go of every Autopilot click no frame read back in its
+    /// time (the chip then says the word as it reads): whether anything
+    /// changed, and the sessions whose refusal starts now (the caller times
+    /// its end — a refusal no frame ends would stay on an idle screen).
     #[cfg_attr(
         test,
         aterm_spec::refines(
@@ -459,128 +982,255 @@ impl WindowLights {
                 s.notice = None;
                 any = true;
             }
+            if s.autopilot_pending.is_some_and(|(_, until)| until <= now) {
+                s.autopilot_pending = None;
+                any = true;
+            }
         }
         (any, refused)
     }
 
-    /// `session`'s light block: its TITLE (when a light is selected, hovered,
-    /// switching, refused or just switched — empty otherwise) and its CHIPS,
-    /// then one cell of margin, with the columns each chip spans. Apart,
-    /// because only the chips must fit: a pane too narrow for the title keeps
-    /// its chips and drops the title.
-    ///
-    /// DEVIATION ONLY (owner, 2026-09-27: "I don't want to show the state of
-    /// parameters that I always expect to be on"). A chip is drawn only while
-    /// its light shows what the owner does not expect
-    /// (`lights::deviates`), while a toggle of it is in flight, while a
-    /// refusal or a just-switched notice for it is on show, while the pointer
-    /// or the keyboard selection is on it, and — the keyboard's way to a
-    /// light at rest — for every known light while a selection lasts
-    /// (`ctrl+shift+tab`, [`App::on_key_claude_lights`]) — the reveal, which
-    /// a caller short of room drops first (`reveal: false`,
-    /// [`App::claude_lights_block`]). With everything as expected the block
-    /// is EMPTY: no chip, no title, nothing to hit.
-    fn block(&self, session: u64, blank: RenderCell, now: Instant, reveal: bool) -> Block {
+    /// [`Self::block_into`] with the window's own selection and hover: what
+    /// the painter draws at `keep`, as the tests read it.
+    #[cfg(test)]
+    fn block(
+        &self,
+        session: u64,
+        blank: RenderCell,
+        now: Instant,
+        accent: [u8; 3],
+        keep: Keep,
+    ) -> Block {
+        let mine = |at: Option<(u64, Chip)>| at.filter(|(id, _)| *id == session).map(|(_, c)| c);
         self.block_with(
             session,
             blank,
             now,
-            self.selected
-                .filter(|(id, _)| *id == session)
-                .map(|(_, l)| l),
-            self.hover.filter(|(id, _)| *id == session).map(|(_, l)| l),
-            reveal,
+            accent,
+            mine(self.selected),
+            mine(self.hover),
+            keep,
         )
     }
 
-    /// [`Self::block`] with the selection and the hover given — so the
-    /// keyboard can ask whether a selection would FIT before making it.
+    /// The block ([`Self::block_into`]) `room` cells hold, down
+    /// [`Keep::LADDER`] — the reveal given up first, then `⚙`, then the
+    /// light, then a standing face's word down to its glyph, Autopilot
+    /// last — until its chips fit; the selection and the
+    /// hover given, so the keyboard can ask whether a selection would FIT
+    /// before making it. `None` where no chip fits or none is drawn. Each
+    /// rung is MEASURED ([`chips_width_at`], no cell built) and the block is
+    /// built once, at the rung that fits: the painter asks this for every
+    /// footer it draws, every frame. Without a selection the reveal draws
+    /// nothing [`Keep::Drawn`] does not, and is not measured. A block that
+    /// gave up a drawn chip holds all of `room` ([`Block::holds`]).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the block's inputs: the session, its ground, the clock, the accent, the \
+                  pointer's and the keyboard's chips and the room"
+    )]
+    fn fitted(
+        &self,
+        session: u64,
+        blank: RenderCell,
+        now: Instant,
+        accent: [u8; 3],
+        selected: Option<Chip>,
+        hover: Option<Chip>,
+        room: usize,
+    ) -> Option<Block> {
+        let mut block = Block::default();
+        self.fit_into(
+            session, blank, now, accent, selected, hover, room, &mut block,
+        )
+        .then_some(block)
+    }
+
+    /// [`Self::fitted`] laid into `block` (its buffers reused, cleared
+    /// first): whether a block is drawn.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "fitted's own inputs and the block it lays into"
+    )]
+    fn fit_into(
+        &self,
+        session: u64,
+        blank: RenderCell,
+        now: Instant,
+        accent: [u8; 3],
+        selected: Option<Chip>,
+        hover: Option<Chip>,
+        room: usize,
+        block: &mut Block,
+    ) -> bool {
+        let at_rest = SessionLights::default();
+        let s = self.sessions.get(&session).unwrap_or(&at_rest);
+        let (ink, dim) = (blank.fg, dim_of(blank));
+        let glyph_rung = s.glyph_rung();
+        let Some(keep) = Keep::LADDER
+            .into_iter()
+            .filter(|keep| *keep != Keep::Revealed || selected.is_some())
+            .filter(|keep| *keep != Keep::GlyphOnly || glyph_rung)
+            .find(|keep| {
+                let drawn = drawn_at(s, now, selected, hover, *keep);
+                let width = chips_width_at(
+                    s,
+                    Chip::row().filter(|c| drawn(*c)),
+                    *keep,
+                    accent,
+                    ink,
+                    dim,
+                );
+                (1..=room).contains(&width)
+            })
+        else {
+            return false;
+        };
+        self.block_into(session, blank, now, accent, selected, hover, keep, block);
+        if !matches!(keep, Keep::Revealed | Keep::Drawn) {
+            block.holds = room;
+        }
+        true
+    }
+
+    /// [`Self::block_into`] into a fresh block, as the tests read it.
+    #[cfg(test)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "block_into's own inputs, less the block it lays into"
+    )]
     fn block_with(
         &self,
         session: u64,
         blank: RenderCell,
         now: Instant,
-        selected: Option<Light>,
-        hover: Option<Light>,
-        reveal: bool,
+        accent: [u8; 3],
+        selected: Option<Chip>,
+        hover: Option<Chip>,
+        keep: Keep,
     ) -> Block {
+        let mut block = Block::default();
+        self.block_into(
+            session, blank, now, accent, selected, hover, keep, &mut block,
+        );
+        block
+    }
+
+    /// `session`'s chip block: its TITLE (when a chip is selected or hovered,
+    /// or a light is switching, refused or just switched — empty otherwise)
+    /// and its CHIPS, then one cell of margin, with the columns each chip
+    /// spans. Apart, because only the chips must fit: a pane too narrow for
+    /// the title keeps its chips and drops the title. `accent` is the
+    /// footer's mark ink, which Cruise's `∞` wears; `selected` and `hover`
+    /// the keyboard's and the pointer's chips in this session.
+    ///
+    /// THE LIGHT, DEVIATION ONLY (owner, 2026-09-27: "I don't want to show
+    /// the state of parameters that I always expect to be on"). Its chip is
+    /// drawn only while it shows what the owner does not expect
+    /// (`lights::deviates`), while a toggle of it is in flight, while a
+    /// refusal or a just-switched notice for it is on show, while the pointer
+    /// or the keyboard selection is on it, and — the keyboard's way to a
+    /// light at rest — for every known light while a selection lasts
+    /// (`ctrl+shift+tab`, [`App::on_key_claude_lights`]): the reveal, which a
+    /// rule short of room gives up first ([`Keep`]).
+    ///
+    /// THE HARNESS'S TWO, ALWAYS (owner, 2026-10-15, for these two marks
+    /// alone: the module header): Autopilot, then `⚙`, left of the light,
+    /// wherever the session's footer read a harness host — until `keep` gives
+    /// them up ([`Keep::keeps`]). With no host and everything as expected the
+    /// block is EMPTY: no chip, no title, nothing to hit.
+    ///
+    /// THE TITLE is the first DRAWN of: the chip in focus, the light's toggle
+    /// in flight, its refusal, its notice — so a hover or a selection left on
+    /// a chip this rung gives up never hides why the light says what it says.
+    ///
+    /// It is laid into `out`, its buffers reused (each cleared first): the
+    /// painter's spare ([`App::claude_lights_block`]), so a frame at rest
+    /// allocates nothing for its chips.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the block's inputs: the session, its ground, the clock, the accent, the \
+                  pointer's and the keyboard's chips, how much of the row is kept, and the \
+                  block it lays into"
+    )]
+    fn block_into(
+        &self,
+        session: u64,
+        blank: RenderCell,
+        now: Instant,
+        accent: [u8; 3],
+        selected: Option<Chip>,
+        hover: Option<Chip>,
+        keep: Keep,
+        out: &mut Block,
+    ) {
         let at_rest = SessionLights::default();
         let s = self.sessions.get(&session).unwrap_or(&at_rest);
-        // The keyboard selection outranks a resting pointer: Return toggles
-        // the SELECTED light, so the row must mark that one.
-        let focus = selected.or(hover).map(|l| (session, l));
+        // The keyboard selection outranks a resting pointer: Return acts on
+        // the SELECTED chip, so the row must mark that one.
+        let focus = selected.or(hover);
         let refused = s.refused.filter(|(_, _, until)| *until > now);
         let noticed = s
             .notice
             .filter(|(_, until)| *until > now)
             .map(|(light, _)| light);
         let pending = s.pending.as_ref().map(|p| p.light);
-        let drawn = |light: Light| {
-            lights::deviates(light, &s.shown)
-                || pending == Some(light)
-                || refused.is_some_and(|(l, _, _)| l == light)
-                || noticed == Some(light)
-                || focus.is_some_and(|(_, l)| l == light)
-                || (reveal && selected.is_some() && revealed(light, &s.shown))
-        };
-        let titled = focus
-            .map(|(_, l)| l)
-            .or(pending)
-            .or(refused.map(|(l, _, _)| l))
-            .or(noticed)
-            .filter(|light| drawn(*light));
+        let drawn = drawn_at(s, now, selected, hover, keep);
+        let titled = [
+            focus,
+            pending.map(Chip::Light),
+            refused.map(|(l, _, _)| Chip::Light(l)),
+            noticed.map(Chip::Light),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|chip| drawn(*chip));
         let dim = dim_of(blank);
-        let mut title = Vec::new();
-        let mut short_title = Vec::new();
-        let mut reason = false;
-        if let Some(light) = titled {
-            let (what, why) = what_of(s, light, refused, focus.is_some_and(|(_, l)| l == light));
-            reason = why;
-            let cells = |text: String| -> Vec<RenderCell> {
-                text.chars()
-                    .map(|ch| {
-                        let mut c = blank;
-                        c.ch = ch;
-                        c.fg = dim;
-                        c
-                    })
-                    .collect()
-            };
-            title = cells(format!("{}: {what}  ", light.title()));
-            short_title = cells(format!("{what}  "));
-        }
-        let mut cells = Vec::new();
-        let mut cols = Vec::new();
-        for light in Light::ALL.into_iter().filter(|l| drawn(*l)) {
-            if !cells.is_empty() {
-                cells.push(blank);
-            }
-            let start = cells.len();
-            let switching = pending == Some(light);
-            let (glyph, word, ink) = chip(light, &s.shown, switching, blank.fg, dim);
-            for ch in glyph
-                .chars()
-                .chain(std::iter::once(' '))
-                .chain(word.chars())
-            {
-                let mut c = blank;
-                c.ch = ch;
-                c.fg = ink;
-                if focus.is_some_and(|(_, l)| l == light) {
-                    c.bold = true;
-                    c.underline = UnderlineStyle::Single;
-                }
-                cells.push(c);
-            }
-            cols.push((start..cells.len(), light));
-        }
-        Block {
+        let Block {
             title,
             short_title,
             reason,
             lights: cells,
             cols,
+            holds,
+        } = out;
+        title.clear();
+        short_title.clear();
+        cells.clear();
+        cols.clear();
+        *reason = false;
+        if let Some(chip) = titled {
+            let (whole, short, why) = title_of(s, chip, refused, focus == Some(chip));
+            *reason = why;
+            let lay = |text: &str, out: &mut Vec<RenderCell>| {
+                out.extend(text.chars().chain("  ".chars()).map(|ch| {
+                    let mut c = blank;
+                    c.ch = ch;
+                    c.fg = dim;
+                    c
+                }));
+            };
+            lay(&whole, title);
+            lay(&short, short_title);
         }
+        for chip in Chip::row().filter(|c| drawn(*c)) {
+            if !cells.is_empty() {
+                cells.push(blank);
+            }
+            let start = cells.len();
+            for (ch, ink) in face_of(chip, s, keep, accent, blank.fg, dim).cells() {
+                let mut c = blank;
+                c.ch = ch;
+                c.fg = ink;
+                if focus == Some(chip) {
+                    c.bold = true;
+                    c.underline = UnderlineStyle::Single;
+                }
+                cells.push(c);
+            }
+            cols.push((start..cells.len(), chip));
+        }
+        *holds = cells.len();
     }
 }
 
@@ -588,6 +1238,66 @@ impl WindowLights {
 /// shows `shown`: every light whose state is known.
 fn revealed(light: Light, shown: &Reading) -> bool {
     shown.state(light) != LightState::Unknown
+}
+
+/// Whether `s`'s block draws a chip at `keep`, the keyboard on `selected`
+/// and the pointer on `hover` — the one rule [`WindowLights::block_into`]
+/// lays out and [`WindowLights::fitted`] measures (its terms are
+/// `block_into`'s: the light a deviation, in flight, refused, just
+/// switched, in focus or revealed; the harness's two wherever a host is).
+fn drawn_at(
+    s: &SessionLights,
+    now: Instant,
+    selected: Option<Chip>,
+    hover: Option<Chip>,
+    keep: Keep,
+) -> impl Fn(Chip) -> bool + '_ {
+    let focus = selected.or(hover);
+    let refused = s
+        .refused
+        .filter(|(_, _, until)| *until > now)
+        .map(|(light, _, _)| light);
+    let noticed = s
+        .notice
+        .filter(|(_, until)| *until > now)
+        .map(|(light, _)| light);
+    let pending = s.pending.as_ref().map(|p| p.light);
+    let harness = s.harness_chips();
+    move |chip: Chip| {
+        keep.keeps(chip)
+            && match chip {
+                Chip::Autopilot | Chip::Settings => harness,
+                Chip::Light(light) => {
+                    lights::deviates(light, &s.shown)
+                        || pending == Some(light)
+                        || refused == Some(light)
+                        || noticed == Some(light)
+                        || focus == Some(chip)
+                        || (keep == Keep::Revealed
+                            && selected.is_some()
+                            && revealed(light, &s.shown))
+                }
+            }
+    }
+}
+
+/// The cells `chips` take in the row at `keep`, one blank apart, each its
+/// face ([`face_of`]: the glyph, and a space and the word where it has one)
+/// — what [`WindowLights::block_into`] lays out, counted without laying it.
+fn chips_width_at(
+    s: &SessionLights,
+    chips: impl Iterator<Item = Chip>,
+    keep: Keep,
+    accent: [u8; 3],
+    ink: [u8; 3],
+    dim: [u8; 3],
+) -> usize {
+    chips
+        .map(|chip| face_of(chip, s, keep, accent, ink, dim).width())
+        .fold(None, |row: Option<usize>, face| {
+            Some(row.map_or(face, |row| row + 1 + face))
+        })
+        .unwrap_or(0)
 }
 
 /// What `light`'s title says after its name: the refusal on show, the toggle
@@ -618,22 +1328,568 @@ fn what_of(
     (what.to_owned(), false)
 }
 
-/// A chip's glyph, word and ink. The mode by its own pill glyph and word, in
-/// its hue where Claude gives it one (bypass, auto) and the row's ink
+/// What `chip`'s title says, whole and short (each without its trailing
+/// gap), and whether it says WHY ([`what_of`]: only a light's refusal does).
+/// A light's is its name and [`what_of`]; Autopilot's is the face table's
+/// ([`autopilot_title`]: its mode phrase, what the mode does, then what a
+/// click does), short to its mode phrase; `⚙`'s is [`SETTINGS_TITLE`],
+/// short to `harness settings` alike.
+fn title_of(
+    s: &SessionLights,
+    chip: Chip,
+    refused: Option<(Light, Refusal, Instant)>,
+    focused: bool,
+) -> (String, String, bool) {
+    match chip {
+        Chip::Light(light) => {
+            let (what, why) = what_of(s, light, refused, focused);
+            (format!("{}: {what}", light.title()), what, why)
+        }
+        Chip::Autopilot if s.autopilot_pending.is_some() => (
+            "autopilot: switching\u{2026}".to_owned(),
+            "switching\u{2026}".to_owned(),
+            false,
+        ),
+        Chip::Autopilot => {
+            let view = s.autopilot.unwrap_or(AutopilotView::Unhosted);
+            let (whole, short) = autopilot_title(view, &s.glass, "", crate::autopilot_menu::OPENS);
+            (whole, short, false)
+        }
+        Chip::Settings => (
+            SETTINGS_TITLE.to_owned(),
+            short_title(SETTINGS_TITLE).to_owned(),
+            false,
+        ),
+    }
+}
+
+/// A harness chip's title cut to what it names, for a rule with no room for
+/// what a click does: up to its first ` — ` or ` · ` (`autopilot: cruise`,
+/// `harness off in Settings`), else whole.
+fn short_title(title: &str) -> &str {
+    [" \u{2014} ", " \u{b7} "]
+        .iter()
+        .filter_map(|cut| title.find(cut))
+        .min()
+        .map_or(title, |at| &title[..at])
+}
+
+/// A chip's FACE as the painter lays it: its glyph in one ink, then — a
+/// space apart, where it has one — its word and the clock it carries in
+/// another (one ink for every face but the armed timer's `∞ ⤓18:00`, whose
+/// `∞` is Cruise's and whose `⤓18:00` is Land's). A word-less chip has no
+/// trailing space. Static text and a copied clock: a frame allocates no face.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Face {
+    glyph: &'static str,
+    glyph_ink: [u8; 3],
+    word: Option<&'static str>,
+    clock: Option<Clock>,
+    word_ink: [u8; 3],
+}
+
+impl Face {
+    /// A face of one ink.
+    const fn plain(glyph: &'static str, word: Option<&'static str>, ink: [u8; 3]) -> Self {
+        Self {
+            glyph,
+            glyph_ink: ink,
+            word,
+            clock: None,
+            word_ink: ink,
+        }
+    }
+
+    /// Whether anything follows the glyph.
+    fn worded(&self) -> bool {
+        self.word.is_some() || self.clock.is_some()
+    }
+
+    /// The cells it takes.
+    fn width(&self) -> usize {
+        self.glyph.chars().count()
+            + if self.worded() {
+                1 + self.word.map_or(0, |w| w.chars().count()) + self.clock.map_or(0, |_| 5)
+            } else {
+                0
+            }
+    }
+
+    /// Its characters, each with its ink, in the order they are laid.
+    fn cells(self) -> impl Iterator<Item = (char, [u8; 3])> {
+        let worded = self.worded();
+        let word_ink = self.word_ink;
+        let clock = self.clock.map(|c| c.0);
+        self.glyph
+            .chars()
+            .map(move |ch| (ch, self.glyph_ink))
+            .chain(
+                worded
+                    .then_some(' ')
+                    .into_iter()
+                    .chain(self.word.into_iter().flat_map(str::chars))
+                    .chain(clock.into_iter().flatten().map(char::from))
+                    .map(move |ch| (ch, word_ink)),
+            )
+    }
+}
+
+/// A chip's FACE at `keep` ([`Face`]). The light by its mode's pill
+/// ([`light_face`]); Autopilot by THE FACE TABLE ([`ChipFace`] of its view
+/// and its glass: `∞` alone, `⤓ land`, `○ off`, `⊘ off` at rest — as the
+/// tests' `AutopilotView::label` spells them — and `∞ ⤓18:00`, `✓ landed`,
+/// `✓ done`, `⤓ quiet`, `⤓ held` as its glass says) in its tones — Cruise
+/// the footer's mark `accent`, Land [`AMBER`], the rest `dim` — its glyph
+/// alone at [`Keep::GlyphOnly`], or [`PENDING_GLYPH`] alone in its view's
+/// tone while a click of it is in flight; `⚙` alone in the row's `ink`.
+fn face_of(
+    chip: Chip,
+    s: &SessionLights,
+    keep: Keep,
+    accent: [u8; 3],
+    ink: [u8; 3],
+    dim: [u8; 3],
+) -> Face {
+    let ink_of = |tone: ChipTone| match tone {
+        ChipTone::Accent => accent,
+        ChipTone::Amber => AMBER,
+        ChipTone::Dim => dim,
+    };
+    match chip {
+        Chip::Light(light) => {
+            let switching = s.pending.as_ref().is_some_and(|p| p.light == light);
+            let (glyph, word, ink) = light_face(light, &s.shown, switching, ink, dim);
+            Face::plain(glyph, Some(word), ink)
+        }
+        Chip::Autopilot => {
+            let view = s.autopilot.unwrap_or(AutopilotView::Unhosted);
+            if s.autopilot_pending.is_some() {
+                return Face::plain(PENDING_GLYPH, None, ink_of(view.tone()));
+            }
+            let face = ChipFace::of(view, &s.glass);
+            let (glyph_tone, word_tone) = face.tones();
+            let glyph = Face::plain(face.glyph(), None, ink_of(glyph_tone));
+            if keep == Keep::GlyphOnly {
+                return glyph;
+            }
+            Face {
+                word: face.word(),
+                clock: face.clock(&s.glass),
+                word_ink: ink_of(word_tone),
+                ..glyph
+            }
+        }
+        Chip::Settings => Face::plain(SETTINGS_GLYPH, None, ink),
+    }
+}
+
+/// A light's glyph, word and ink. The mode by its own pill glyph and word,
+/// in its hue where Claude gives it one (bypass, auto) and the row's ink
 /// otherwise; a light whose mode is not known as a dim `◌` and its word. A
 /// toggle in flight shows `◐`.
-fn chip(
+fn light_face(
     light: Light,
     shown: &Reading,
     switching: bool,
     ink: [u8; 3],
     dim: [u8; 3],
 ) -> (&'static str, &'static str, [u8; 3]) {
-    let glyph = |own: &'static str| if switching { "\u{25D0}" } else { own };
+    let glyph = |own: &'static str| if switching { PENDING_GLYPH } else { own };
     match shown.mode {
         Some(mode) => (glyph(mode.glyph()), mode.word(), mode.hue().unwrap_or(ink)),
         None => (glyph("\u{25CC}"), light.word(), dim),
     }
+}
+
+// ---------------------------------------------------------------------------
+// THE FACE TABLE (`docs/DESIGN-harness-autopilot-2026-10-15.md` §§9.2–9.5)
+// ---------------------------------------------------------------------------
+
+impl ChipFace {
+    /// Every face, in §9.6.0's order.
+    #[cfg(test)]
+    pub(crate) const ALL: [ChipFace; 11] = [
+        ChipFace::Cruise,
+        ChipFace::CruiseUntil,
+        ChipFace::Land,
+        ChipFace::Landed,
+        ChipFace::Done,
+        ChipFace::Spent,
+        ChipFace::Theirs,
+        ChipFace::Held,
+        ChipFace::Off,
+        ChipFace::MasterOff,
+        ChipFace::Unhosted,
+    ];
+
+    /// The face a chip under `view` wears with `glass`: an armed timer under
+    /// Cruise; under Land a running Codex goal first, then the task's face
+    /// (open and unknown read as Land's own); v1's face everywhere else. A
+    /// timer shows only under Cruise (it exists only beside that word, and
+    /// the master switch outranks it), a face only under Land (§9.4.1:
+    /// Cruise and Off keep v1's face).
+    #[must_use]
+    pub(crate) const fn of(view: AutopilotView, glass: &ChipGlass) -> Self {
+        match view {
+            AutopilotView::Cruise if glass.land_at.is_some() => ChipFace::CruiseUntil,
+            AutopilotView::Cruise => ChipFace::Cruise,
+            AutopilotView::Land if glass.held => ChipFace::Held,
+            AutopilotView::Land => match glass.task {
+                Some(TaskFace::Landed) => ChipFace::Landed,
+                Some(TaskFace::Done) => ChipFace::Done,
+                Some(TaskFace::Spent) => ChipFace::Spent,
+                Some(TaskFace::Theirs) => ChipFace::Theirs,
+                Some(TaskFace::Open) | None => ChipFace::Land,
+            },
+            AutopilotView::Off => ChipFace::Off,
+            AutopilotView::MasterOff => ChipFace::MasterOff,
+            AutopilotView::Unhosted => ChipFace::Unhosted,
+        }
+    }
+
+    /// Whether it is a STANDING FACE of v2's — wider than v1's at rest for
+    /// as long as its fact stands (an armed timer, a task's end, a held
+    /// goal) — which a rule too narrow for it gives down to its glyph
+    /// ([`Keep::GlyphOnly`], §9.3.2) rather than giving the chip up.
+    #[must_use]
+    pub(crate) const fn standing(self) -> bool {
+        matches!(
+            self,
+            ChipFace::CruiseUntil
+                | ChipFace::Landed
+                | ChipFace::Done
+                | ChipFace::Spent
+                | ChipFace::Theirs
+                | ChipFace::Held
+        )
+    }
+
+    /// The chip's glyph, and its [`Keep::GlyphOnly`] rung: `∞`, `⤓`, `✓`,
+    /// `○` or `⊘`.
+    #[must_use]
+    pub(crate) const fn glyph(self) -> &'static str {
+        match self {
+            ChipFace::Cruise | ChipFace::CruiseUntil => AutopilotView::Cruise.glyph(),
+            ChipFace::Land | ChipFace::Spent | ChipFace::Theirs | ChipFace::Held => {
+                AutopilotView::Land.glyph()
+            }
+            ChipFace::Landed | ChipFace::Done => "\u{2713}",
+            ChipFace::Off => AutopilotView::Off.glyph(),
+            ChipFace::MasterOff => AutopilotView::MasterOff.glyph(),
+            ChipFace::Unhosted => AutopilotView::Unhosted.glyph(),
+        }
+    }
+
+    /// The word drawn a space after the glyph: none for Cruise (its `∞`
+    /// alone), the timer's `⤓` (its clock follows it, [`Self::clock`]), and
+    /// each face's word.
+    #[must_use]
+    pub(crate) const fn word(self) -> Option<&'static str> {
+        match self {
+            ChipFace::Cruise => AutopilotView::Cruise.word(),
+            ChipFace::CruiseUntil => Some(AutopilotView::Land.glyph()),
+            ChipFace::Land => AutopilotView::Land.word(),
+            ChipFace::Landed => Some("landed"),
+            ChipFace::Done => Some("done"),
+            ChipFace::Spent | ChipFace::Theirs => Some("quiet"),
+            ChipFace::Held => Some("held"),
+            ChipFace::Off => AutopilotView::Off.word(),
+            ChipFace::MasterOff => AutopilotView::MasterOff.word(),
+            ChipFace::Unhosted => AutopilotView::Unhosted.word(),
+        }
+    }
+
+    /// The clock drawn right after the word, with no space (`⤓18:00`): the
+    /// armed timer's alone. Never a countdown, so nothing ticks.
+    #[must_use]
+    pub(crate) fn clock(self, glass: &ChipGlass) -> Option<Clock> {
+        match self {
+            ChipFace::CruiseUntil => glass.land_at.map(|at| at.clock),
+            _ => None,
+        }
+    }
+
+    /// The glyph's tone and the word's: Cruise's accent, Land's amber — the
+    /// timer's `∞` Cruise's and its `⤓18:00` Land's — and dim where the
+    /// harness types nothing (a quiet landing, a held goal) or runs nothing.
+    #[must_use]
+    pub(crate) const fn tones(self) -> (ChipTone, ChipTone) {
+        match self {
+            ChipFace::Cruise => (ChipTone::Accent, ChipTone::Accent),
+            ChipFace::CruiseUntil => (ChipTone::Accent, ChipTone::Amber),
+            ChipFace::Land | ChipFace::Landed | ChipFace::Done => {
+                (ChipTone::Amber, ChipTone::Amber)
+            }
+            ChipFace::Spent
+            | ChipFace::Theirs
+            | ChipFace::Held
+            | ChipFace::Off
+            | ChipFace::MasterOff
+            | ChipFace::Unhosted => (ChipTone::Dim, ChipTone::Dim),
+        }
+    }
+
+    /// The MODE PHRASE: the title's head and the whole short title, written
+    /// with neither of [`short_title`]'s cut marks (` — `, ` · `), so a
+    /// narrow rule shows it whole. The timer's names its time, and its
+    /// weekday where it lands on another local date.
+    #[must_use]
+    pub(crate) fn phrase(self, glass: &ChipGlass) -> std::borrow::Cow<'static, str> {
+        let fixed = match self {
+            ChipFace::Cruise => "autopilot: cruise",
+            ChipFace::CruiseUntil => {
+                let Some(at) = glass.land_at else {
+                    return "autopilot: cruise".into();
+                };
+                let day = at
+                    .other_day
+                    .map_or(String::new(), |d| format!("{} ", d.short()));
+                return format!(
+                    "autopilot: cruise until {day}{}, then land",
+                    at.clock.as_str()
+                )
+                .into();
+            }
+            ChipFace::Land => "autopilot: land",
+            ChipFace::Landed => "autopilot: land, landed",
+            ChipFace::Done => "autopilot: land, done",
+            ChipFace::Spent | ChipFace::Theirs => "autopilot: land, quiet",
+            ChipFace::Held => "autopilot: land, held",
+            ChipFace::Off => "autopilot: off",
+            ChipFace::MasterOff => "harness off in Settings",
+            ChipFace::Unhosted => "no harness: this aterm has no control socket",
+        };
+        fixed.into()
+    }
+
+    /// What the mode does, after the phrase and ` — ` in the whole title:
+    /// none where the phrase says it all (no harness runs).
+    #[must_use]
+    pub(crate) fn explanation(self) -> Option<std::borrow::Cow<'static, str>> {
+        use aterm_agent::supervise::policy::turn_end::LAND_NUDGES;
+        let fixed = match self {
+            ChipFace::Cruise | ChipFace::CruiseUntil => "keeps the work moving",
+            ChipFace::Land => "wrapping up",
+            ChipFace::Landed => {
+                "the agent finished after the land instruction; the harness types nothing more \
+                 until someone else's turn"
+            }
+            ChipFace::Done => {
+                "the agent said it was finished before a landing was asked; the harness types \
+                 nothing more until someone else's turn"
+            }
+            ChipFace::Spent => {
+                return Some(
+                    format!(
+                        "no done reply after the instruction and {LAND_NUDGES} nudges; the \
+                         harness types nothing more but a land answer to a question"
+                    )
+                    .into(),
+                );
+            }
+            ChipFace::Theirs => {
+                "a person's own exchange; the harness types nothing until someone else's turn ends"
+            }
+            ChipFace::Held => "Codex is pursuing its /goal, and Land types nothing while it runs",
+            ChipFace::Off => "hands off",
+            ChipFace::MasterOff | ChipFace::Unhosted => return None,
+        };
+        Some(fixed.into())
+    }
+
+    /// What a click does (`click: …`): the next mode, `land now` from a
+    /// timed Cruise (which also drops the timer), and Settings ▸ Harness where
+    /// no harness runs.
+    #[must_use]
+    pub(crate) const fn click(self) -> &'static str {
+        match self {
+            ChipFace::Cruise => "land",
+            ChipFace::CruiseUntil => "land now",
+            ChipFace::Land
+            | ChipFace::Landed
+            | ChipFace::Done
+            | ChipFace::Spent
+            | ChipFace::Theirs
+            | ChipFace::Held => "off",
+            ChipFace::Off => "cruise",
+            ChipFace::MasterOff | ChipFace::Unhosted => "open Settings \u{25b8} Harness",
+        }
+    }
+
+    /// The chip's ACCESSIBILITY LABEL (§9.2.1): the mode and its state in
+    /// words, never a glyph — letters, digits, spaces and `.:,` alone, so a
+    /// screen reader says nothing it cannot pronounce (`Autopilot: cruise.
+    /// Lands at 18:00.`, `Autopilot: land. Landed at 17:42.`).
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "the chips' accessibility nodes speak it (design §9.6.1); until then the \
+                      face table's tests do"
+        )
+    )]
+    #[must_use]
+    pub(crate) fn spoken(self, glass: &ChipGlass) -> String {
+        use aterm_agent::supervise::policy::turn_end::LAND_NUDGES;
+        let at = |what: &str| match glass.task_at {
+            Some(clock) => format!("Autopilot: land. {what} at {}.", clock.as_str()),
+            None => format!("Autopilot: land. {what}."),
+        };
+        match self {
+            ChipFace::Cruise => "Autopilot: cruise.".to_owned(),
+            ChipFace::CruiseUntil => match glass.land_at {
+                Some(LandAtGlass {
+                    clock,
+                    other_day: Some(day),
+                }) => format!(
+                    "Autopilot: cruise. Lands {} at {}.",
+                    day.long(),
+                    clock.as_str()
+                ),
+                Some(LandAtGlass { clock, .. }) => {
+                    format!("Autopilot: cruise. Lands at {}.", clock.as_str())
+                }
+                None => "Autopilot: cruise.".to_owned(),
+            },
+            ChipFace::Land => "Autopilot: land.".to_owned(),
+            ChipFace::Landed => at("Landed"),
+            ChipFace::Done => at("Done"),
+            ChipFace::Spent => {
+                format!("Autopilot: land. Quiet: no done reply after {LAND_NUDGES} nudges.")
+            }
+            ChipFace::Theirs => {
+                "Autopilot: land. Quiet: a person is driving the session.".to_owned()
+            }
+            ChipFace::Held => "Autopilot: land. Held while Codex pursues its goal.".to_owned(),
+            ChipFace::Off => "Autopilot: off.".to_owned(),
+            ChipFace::MasterOff => "Autopilot: off. The harness is off in Settings.".to_owned(),
+            ChipFace::Unhosted => "Autopilot: off. This aterm has no control socket.".to_owned(),
+        }
+    }
+}
+
+/// THE AUTOPILOT CHIP'S TITLE under `view` with `glass`, whole and short
+/// (§9.2.1, §9.3.2, §9.4.1, §9.5.4), as hover, the keyboard's selection
+/// and the page read it. WHOLE: the mode phrase; ` — ` and what the mode
+/// does; ` · last: ` and the `trail` where acts were taken (`""`: none — the
+/// trail is the act ticker's to write, newest first with each act's clock
+/// time); ` · click: ` and what a click does; and ` · right-click: more`
+/// where the chip's menu opens (`menu`). SHORT: the mode phrase alone, which
+/// holds neither cut mark: [`short_title`] cuts the whole to it. With
+/// the default glass, no trail and no menu it is v1's title
+/// (`AutopilotView::title`). Built when a hover or a selection asks, never
+/// at rest — but on EVERY frame one is up (`WindowLights::block_into`), so
+/// the whole title is sized once from its parts: two allocations for a
+/// face of v1's, the whole and the short, as v1's copies of its static
+/// titles made — never one regrowth per part.
+#[must_use]
+pub(crate) fn autopilot_title(
+    view: AutopilotView,
+    glass: &ChipGlass,
+    trail: &str,
+    menu: bool,
+) -> (String, String) {
+    const EXPLAINS: &str = " \u{2014} ";
+    const LAST: &str = " \u{b7} last: ";
+    const CLICK: &str = " \u{b7} click: ";
+    const MORE: &str = " \u{b7} right-click: more";
+    let face = ChipFace::of(view, glass);
+    let phrase = face.phrase(glass);
+    let explanation = face.explanation();
+    let click = face.click();
+    let mut whole = String::with_capacity(
+        phrase.len()
+            + explanation.as_ref().map_or(0, |e| EXPLAINS.len() + e.len())
+            + if trail.is_empty() {
+                0
+            } else {
+                LAST.len() + trail.len()
+            }
+            + CLICK.len()
+            + click.len()
+            + if menu { MORE.len() } else { 0 },
+    );
+    whole.push_str(&phrase);
+    if let Some(explanation) = explanation {
+        whole.push_str(EXPLAINS);
+        whole.push_str(&explanation);
+    }
+    if !trail.is_empty() {
+        whole.push_str(LAST);
+        whole.push_str(trail);
+    }
+    whole.push_str(CLICK);
+    whole.push_str(click);
+    if menu {
+        whole.push_str(MORE);
+    }
+    let short = short_title(&whole).to_owned();
+    (whole, short)
+}
+
+/// THE ACT'S LABEL (§9.2.1): its glyph and its word a space apart
+/// (`✓ approved`), drawn right of the chips for its dwell in the CHIP'S ink —
+/// Cruise's accent, Land's amber, dim where no harness carries the work.
+/// Static text: no short form (a lone glyph in the rule reads as a stray
+/// mark), and nothing to format.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "the act ticker (design §9.6.1) draws it; until then the face table's tests do"
+    )
+)]
+#[must_use]
+pub(crate) const fn act_label(
+    view: AutopilotView,
+    act: Act,
+) -> (&'static str, &'static str, ChipTone) {
+    (act.glyph(), act.word(), view.tone())
+}
+
+/// The chip's ACCESSIBILITY DESCRIPTION (§9.2.1): the trail's newest act in
+/// words and the clock time it arrived (`Last: approved at 14:05.`) —
+/// a description, never a live region, so a reader is not interrupted by
+/// every act. `None` before any act.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "the chips' accessibility nodes describe it (design §9.6.1); until then the \
+                  face table's tests do"
+    )
+)]
+#[must_use]
+pub(crate) fn spoken_last(glass: &ChipGlass) -> Option<String> {
+    glass
+        .last
+        .map(|(act, clock)| format!("Last: {} at {}.", act.spoken(), clock.as_str()))
+}
+
+/// The glass's part of [`WindowLights::autopilot_term`]: bits 24–55 of
+/// §9.2.3's table, `reading` whether someone is reading the chip's title
+/// (hover or selection), the only time the trail's generation counts. The
+/// default glass packs to 0, so the term is v1's.
+fn glass_bits(glass: ChipGlass, reading: bool) -> u64 {
+    let act = glass.lit.map_or(0, |act| 1 + act as u64);
+    let face = match glass.task {
+        None | Some(TaskFace::Open) => 0,
+        Some(TaskFace::Landed) => 1,
+        Some(TaskFace::Done) => 2,
+        Some(TaskFace::Spent) => 3,
+        Some(TaskFace::Theirs) => 4,
+    };
+    let timer = glass
+        .land_at
+        .map_or(0, |at| 1 + u64::from(at.clock.minute()));
+    let other_day = glass.land_at.is_some_and(|at| at.other_day.is_some());
+    let trail = if reading { u64::from(glass.trail) } else { 0 };
+    act << 24
+        | face << 32
+        | u64::from(glass.held) << 35
+        | timer << 36
+        | u64::from(other_day) << 47
+        | trail << 48
 }
 
 /// What one frame's reading of a pane asks of the host.
@@ -699,8 +1955,9 @@ fn wake_after(session: u64, delay: Duration) {
 
 /// What the painter needs for one pane: the title and the chips (see
 /// [`WindowLights::block`]) and the columns each chip spans in them.
+#[derive(Debug, Default)]
 pub(crate) struct Block {
-    /// `Light: what` — or empty.
+    /// `Light: what`, or a harness chip's title — or empty.
     pub(crate) title: Vec<RenderCell>,
     /// `what` alone, for a pane with no room for the whole title.
     pub(crate) short_title: Vec<RenderCell>,
@@ -709,16 +1966,26 @@ pub(crate) struct Block {
     pub(crate) reason: bool,
     /// The chips, one blank apart (the rule's layout pads the block).
     pub(crate) lights: Vec<RenderCell>,
-    cols: Vec<(std::ops::Range<usize>, Light)>,
+    /// The cells the block holds in the rule (`footer::LightsWidth`'s
+    /// chips): its chips' — or, where a rule short of room gave up a drawn
+    /// chip ([`Keep`] past [`Keep::Drawn`]), all the room it was fitted to.
+    /// The facts give way before the chips (`footer::fit_rule`), so the
+    /// room a given-up chip leaves stays the rule's: no fact a wider rule
+    /// gave up comes back beside fewer chips.
+    pub(crate) holds: usize,
+    cols: Vec<(std::ops::Range<usize>, Chip)>,
+}
+
+impl Block {
+    /// Whether `chip` is drawn.
+    pub(crate) fn shows(&self, chip: impl Into<Chip>) -> bool {
+        let chip = chip.into();
+        self.cols.iter().any(|(_, c)| *c == chip)
+    }
 }
 
 #[cfg(test)]
 impl Block {
-    /// Whether `light`'s chip is drawn.
-    pub(crate) fn shows(&self, light: Light) -> bool {
-        self.cols.iter().any(|(_, l)| *l == light)
-    }
-
     /// A block of `lights` (the chips' cells, as one chip) and its titles,
     /// for the rule's layout tests (`claude_footer`).
     pub(crate) fn of_chips(
@@ -728,51 +1995,162 @@ impl Block {
         reason: bool,
     ) -> Block {
         Block {
-            cols: vec![(0..lights.len(), Light::Mode)],
+            cols: vec![(0..lights.len(), Chip::Light(Light::Mode))],
             title,
             short_title,
             reason,
+            holds: lights.len(),
             lights,
         }
+    }
+
+    /// The block a session at rest draws under `view` — the harness's two
+    /// chips alone, as the painter builds them — for the rule's layout tests
+    /// (`claude_footer`).
+    pub(crate) fn of_autopilot(view: AutopilotView, blank: RenderCell, accent: [u8; 3]) -> Block {
+        let mut w = WindowLights::default();
+        let now = Instant::now();
+        w.note_autopilot(0, view.mode(), view, now);
+        w.block(0, blank, now, accent, Keep::Drawn)
     }
 }
 
 impl App {
-    /// Read one Claude Code pane's screen for its lights: remember what each
-    /// shows, and wake the loop when a toggle in flight was answered. Called
-    /// for EVERY Claude Code pane each frame, painted footer or not.
-    pub(crate) fn observe_claude_lights(&mut self, wid: WindowId, session: u64, rows: &[String]) {
+    /// Fold one Claude Code pane's reading of its screen into its lights
+    /// (`read`: `lights::read_lights` behind its panic fence, taken with the
+    /// pane's rows and kept with them — `crate::claude_footer`'s readings):
+    /// remember what each shows, and wake the loop when a toggle in flight
+    /// was answered. Called for EVERY Claude Code pane each frame, painted
+    /// footer or not.
+    pub(crate) fn observe_claude_lights(
+        &mut self,
+        wid: WindowId,
+        session: u64,
+        read: crate::claude_footer::LightsRead,
+    ) {
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
-        let step = ws
-            .claude_lights
-            .observe_rows(session, rows, lights::read_screen);
+        let step = ws.claude_lights.observe_read(session, read);
         if step.wake {
             crate::claude_footer::post_changed(session);
         }
     }
 
-    /// The light block to paint in `session`'s composer rule, its chips in
+    /// THE HARNESS'S GLASS on session `local_id`'s Autopilot chip
+    /// ([`ChipGlass`]): its act, its task's face, its timer, a Codex goal's
+    /// hold. Read beside the session's Autopilot once a frame (the footer's
+    /// repaint key and its splice) — so it takes no lock, reads no clock and
+    /// allocates nothing: one lookup in the App's glass
+    /// (`crate::harness_glass`), none at all while no session has any, none
+    /// in the timers' index while no timer is armed and none in the goal
+    /// holds while no Codex goal runs. The default glass, v1's chip, for a
+    /// session with none.
+    #[must_use]
+    pub(crate) fn chip_glass(&self, local_id: u64) -> ChipGlass {
+        let mut glass = self
+            .harness_glass
+            .get(&local_id)
+            .map_or_else(ChipGlass::default, crate::harness_glass::SessionGlass::chip);
+        if !self.autopilot_timers.is_empty() {
+            glass.land_at = self.autopilot_timers.glass(local_id);
+        }
+        if !self.codex_goal_holds.is_empty() {
+            glass.held = self.codex_goal_holds.contains(&local_id);
+        }
+        glass
+    }
+
+    /// THE SEAM FOR A CODEX GOAL'S HOLD (design §9.5.4): Codex session
+    /// `local_id`'s `/goal` runs (`held`) or no longer does, as the Codex
+    /// splice reads it off Codex's status row (`aterm_phase::codex::
+    /// goal_state`) — so under Land its chip reads `⤓ held`
+    /// ([`Self::chip_glass`]). Whether the hold moved: a move changes the
+    /// glass, so the footer's repaint key moves with it, and the caller posts
+    /// the footer. Nothing holds one until the Codex chips (§9.6.4); a
+    /// retired session's hold goes with it (`retire_session_registration`).
+    pub(crate) fn note_codex_goal_hold(&mut self, local_id: u64, held: bool) -> bool {
+        if held {
+            self.codex_goal_holds.insert(local_id)
+        } else {
+            self.codex_goal_holds.remove(&local_id)
+        }
+    }
+
+    /// Fold in `session`'s Autopilot for the footer this frame draws: its
+    /// own word and its view, read ONCE per frame by the painter
+    /// ([`App::session_autopilot`], before any lock the host must not be
+    /// taken under), and its harness glass ([`Self::chip_glass`]) — what the
+    /// harness's two chips say, and the read-back that lets an Autopilot click
+    /// in flight go.
+    pub(crate) fn note_claude_autopilot(
+        &mut self,
+        wid: WindowId,
+        session: u64,
+        word: Option<Autopilot>,
+        view: AutopilotView,
+    ) {
+        let glass = self.chip_glass(session);
+        if let Some(ws) = self.windows.get_mut(&wid) {
+            ws.claude_lights
+                .note_autopilot_at(session, word, view, glass, || {
+                    #[cfg(test)]
+                    crate::work_counts::harness_clock_read();
+                    Instant::now()
+                });
+        }
+    }
+
+    /// The chip block to paint in `session`'s composer rule, its chips in
     /// `room` cells (`footer::chips_room`) — `None` when no chip is drawn:
-    /// at rest the rule carries the facts alone. Short of room, the
-    /// keyboard's reveal goes first, so a chip drawn at rest (a deviation,
-    /// the selection itself) stays; a rule too narrow even for those draws
-    /// none.
+    /// with no harness host and everything as expected, the rule carries the
+    /// facts alone. Short of room, the keyboard's reveal goes first, then
+    /// `⚙`, then the light (a deviation, the selection itself), then a
+    /// standing face's word ([`Keep::GlyphOnly`]), Autopilot last
+    /// ([`Keep`]); a rule too narrow even for `∞` draws none. The block
+    /// is laid into a spare of the window's (the harness's two are drawn at
+    /// rest, every frame): the painter hands it back once its hits are
+    /// noted ([`Self::recycle_claude_lights_block`]), so a frame allocates
+    /// nothing for it once the spares are grown.
     pub(crate) fn claude_lights_block(
-        &self,
+        &mut self,
         wid: WindowId,
         session: u64,
         blank: RenderCell,
         room: usize,
     ) -> Option<Block> {
-        let ws = self.windows.get(&wid)?;
-        let now = Instant::now();
-        [true, false]
-            .into_iter()
-            .map(|reveal| ws.claude_lights.block(session, blank, now, reveal))
-            .find(|block| block.lights.len() <= room)
-            .filter(|block| !block.cols.is_empty())
+        let accent = crate::chrome_band::band_colors(self.theme).accent;
+        let lights = &mut self.windows.get_mut(&wid)?.claude_lights;
+        let mine = |at: Option<(u64, Chip)>| at.filter(|(id, _)| *id == session).map(|(_, c)| c);
+        let (selected, hover) = (mine(lights.selected), mine(lights.hover));
+        let mut block = lights.spare_blocks.pop().unwrap_or_default();
+        let drawn = lights.fit_into(
+            session,
+            blank,
+            lights_now(),
+            accent,
+            selected,
+            hover,
+            room,
+            &mut block,
+        );
+        if drawn {
+            Some(block)
+        } else {
+            lights.spare_blocks.push(block);
+            None
+        }
+    }
+
+    /// Hand a painted block back to window `wid`'s spares
+    /// ([`Self::claude_lights_block`]). At most a few are kept — one per
+    /// footer a frame paints is all a window uses.
+    pub(crate) fn recycle_claude_lights_block(&mut self, wid: WindowId, block: Block) {
+        if let Some(ws) = self.windows.get_mut(&wid)
+            && ws.claude_lights.spare_blocks.len() < SPARE_BLOCKS
+        {
+            ws.claude_lights.spare_blocks.push(block);
+        }
     }
 
     /// Every window repaints: a `[claude_footer]` switch changed what their
@@ -796,7 +2174,8 @@ impl App {
 
     /// Record where `block`'s chips landed: frame row `frame_row` (window
     /// grid row `term_row`), the CHIPS starting at frame column `col` — one
-    /// hit per cell, so the whole chip is the target.
+    /// hit per cell, so the whole chip is the target — and the blank between
+    /// each two, theirs too: a target that does nothing.
     pub(crate) fn note_claude_light_hits(
         &mut self,
         wid: WindowId,
@@ -807,25 +2186,38 @@ impl App {
         block: &Block,
     ) {
         if let Some(ws) = self.windows.get_mut(&wid) {
+            let chips = block
+                .cols
+                .iter()
+                .map(|(span, chip)| (span.clone(), Some(*chip)));
+            let gaps = block
+                .cols
+                .windows(2)
+                .map(|pair| (pair[0].0.end..pair[1].0.start, None));
             ws.claude_lights
                 .hits
-                .extend(block.cols.iter().flat_map(|(span, light)| {
-                    span.clone().map(move |at| LightHit {
+                .extend(chips.chain(gaps).flat_map(|(span, chip)| {
+                    span.map(move |at| LightHit {
                         frame_row,
                         term_row,
                         col: col + at,
                         session,
-                        light: *light,
+                        chip,
                     })
                 }));
         }
     }
 
-    /// The light under window pixel `(x, y)`, if the glass shows one there —
-    /// never one a later band painted over (the link caption yields to no
-    /// light: it claims the row in the chrome register, and the light under
-    /// it is gone from the glass).
-    pub(crate) fn claude_light_at(&self, wid: WindowId, x: f64, y: f64) -> Option<(u64, Light)> {
+    /// What of the chips' glass is under window pixel `(x, y)`: a chip, or
+    /// `None` for the blank between two — never what a later band painted
+    /// over (the link caption yields to no chip: it claims the row in the
+    /// chrome register, and the chip under it is gone from the glass).
+    pub(crate) fn claude_chips_at(
+        &self,
+        wid: WindowId,
+        x: f64,
+        y: f64,
+    ) -> Option<(u64, Option<Chip>)> {
         let ws = self.windows.get(&wid)?;
         if ws.claude_lights.hits.is_empty() {
             return None;
@@ -836,10 +2228,10 @@ impl App {
             .hits
             .iter()
             .find(|h| h.frame_row == row && h.col == col)?;
-        (!self.chrome_owns_terminal_row(wid, hit.term_row)).then_some((hit.session, hit.light))
+        (!self.chrome_owns_terminal_row(wid, hit.term_row)).then_some((hit.session, hit.chip))
     }
 
-    /// The pointer left the window: no light is hovered any more.
+    /// The pointer left the window: no chip is hovered any more.
     pub(crate) fn clear_claude_light_hover(&mut self, wid: WindowId) {
         if let Some(ws) = self.windows.get_mut(&wid)
             && ws.claude_lights.hover.take().is_some()
@@ -848,9 +2240,19 @@ impl App {
         }
     }
 
+    /// The pointer on `at` — a session's chip, or none — in window `wid`,
+    /// as a motion over it leaves it ([`Self::track_claude_light_hover`]),
+    /// for a test that reads what a hovered frame costs.
+    #[cfg(test)]
+    pub(crate) fn hover_claude_chip(&mut self, wid: WindowId, at: Option<(u64, Chip)>) {
+        if let Some(ws) = self.windows.get_mut(&wid) {
+            ws.claude_lights.hover = at;
+        }
+    }
+
     /// A mouse press anywhere lets a keyboard selection go: the person has
     /// moved on (a click to another pane and back must not leave a selected
-    /// light waiting to swallow the next Return).
+    /// chip waiting to swallow the next Return).
     pub(crate) fn clear_claude_light_selection(&mut self, wid: WindowId) {
         if let Some(ws) = self.windows.get_mut(&wid)
             && ws.claude_lights.selected.take().is_some()
@@ -860,34 +2262,114 @@ impl App {
     }
 
     /// Pointer motion: move the hover (repainting only on a change) and say
-    /// whether the pointer is over a light — the caller then keeps the motion
-    /// from the grid, so neither a selection nor a PTY motion report starts.
-    pub(crate) fn track_claude_light_hover(&mut self, wid: WindowId, x: f64, y: f64) -> bool {
-        let over = self.claude_light_at(wid, x, y);
+    /// what of the chips the pointer is over — a chip, or the blank between
+    /// two, which hovers none ([`OverChips`]). Over either the caller keeps
+    /// the motion from the grid, so neither a selection nor a PTY motion
+    /// report starts.
+    pub(crate) fn track_claude_light_hover(&mut self, wid: WindowId, x: f64, y: f64) -> OverChips {
+        let at = self.claude_chips_at(wid, x, y);
+        let over = at.and_then(|(session, chip)| Some((session, chip?)));
         let Some(ws) = self.windows.get_mut(&wid) else {
-            return false;
+            return OverChips::No;
         };
         if ws.selecting {
-            return false;
+            return OverChips::No;
         }
         if ws.claude_lights.hover != over {
             ws.claude_lights.hover = over;
             redraw(ws);
         }
-        over.is_some()
+        OverChips::of(at)
     }
 
-    /// A left press on a light toggles it; whether the press was one.
+    /// A left press on a chip acts on it ([`Self::press_claude_chip`]), and
+    /// one on the blank between two is taken and does nothing; whether the
+    /// press was the chips'. Either is a click away from an open in-grid
+    /// rename field ([`App::inline_rename_edit`]) and commits it first, the
+    /// rule a click on the grid keeps (`App::on_mouse_input`): `⚙` — and
+    /// Autopilot with the master switch off — bring Settings ▸ Harness to the
+    /// front, and a field left open there would take the keys meant for it
+    /// into the tab's name.
     pub(crate) fn press_claude_light(&mut self, wid: WindowId) -> bool {
         let (x, y) = self
             .windows
             .get(&wid)
             .map_or((0.0, 0.0), |ws| ws.last_cursor_px);
-        let Some((session, light)) = self.claude_light_at(wid, x, y) else {
+        let Some((session, chip)) = self.claude_chips_at(wid, x, y) else {
             return false;
         };
-        self.toggle_claude_light(wid, session, light);
+        if self.inline_rename_edit(wid).is_some() {
+            self.clear_strip_press(wid);
+            self.settle_rename_edit(wid);
+        }
+        if let Some(chip) = chip {
+            self.press_claude_chip(wid, session, chip);
+        }
         true
+    }
+
+    /// What a click on `chip` of `session` does — and Return or Space on it
+    /// selected: the light toggles with Claude's own input
+    /// ([`Self::toggle_claude_light`], unchanged); Autopilot steps the
+    /// session's word ([`Self::press_autopilot_chip`]); `⚙` opens Settings ▸
+    /// Harness in `wid` ([`App::open_harness_settings`]). Neither harness
+    /// chip sends anything to the PTY.
+    fn press_claude_chip(&mut self, wid: WindowId, session: u64, chip: Chip) {
+        match chip {
+            Chip::Light(light) => self.toggle_claude_light(wid, session, light),
+            Chip::Autopilot => self.press_autopilot_chip(wid, session),
+            Chip::Settings => {
+                self.open_harness_settings(wid);
+            }
+        }
+    }
+
+    /// The Autopilot chip's click (design §2.3): the session's EFFECTIVE
+    /// mode steps to the next — Cruise → Land → Off → Cruise — written as its
+    /// own word ([`App::cycle_session_autopilot`]): in-process, the same
+    /// store `meta set autopilot` writes, ringing the host, nothing sent to
+    /// the PTY and never a person's keystroke. The write is the window's own
+    /// and reads back at once, so the chip takes its new face on the next
+    /// frame and a second click right after it steps again (Cruise → Land →
+    /// Off as fast as a person clicks). Only a word that did NOT read back
+    /// shows `◐` until a frame reads it ([`WindowLights::note_autopilot`]),
+    /// let go at its deadline (one like a mode press's, `lights::SETTLE_MS`)
+    /// if none does; a click meanwhile does nothing. Where the harness runs
+    /// no mode — the master switch off — nothing is written and Settings ▸
+    /// Harness opens in `wid` instead.
+    fn press_autopilot_chip(&mut self, wid: WindowId, session: u64) {
+        let now = Instant::now();
+        let in_flight = self
+            .windows
+            .get(&wid)
+            .and_then(|ws| ws.claude_lights.sessions.get(&session))
+            .and_then(|s| s.autopilot_pending)
+            .is_some_and(|(_, until)| until > now);
+        if in_flight {
+            return;
+        }
+        let (_, view, _) = self.session_autopilot(session);
+        let Some(want) = view.next() else {
+            self.open_harness_settings(wid);
+            return;
+        };
+        let shown = self.cycle_session_autopilot(session);
+        let Some(ws) = self.windows.get_mut(&wid) else {
+            return;
+        };
+        let lights = ws.claude_lights.sessions.entry(session).or_default();
+        if shown.mode() == Some(want) {
+            // Read back already: nothing is in flight.
+            lights.autopilot = Some(shown);
+            lights.autopilot_pending = None;
+            redraw(ws);
+            return;
+        }
+        let settle = Duration::from_millis(lights::SETTLE_MS);
+        lights.autopilot_pending = Some((want, now + settle));
+        redraw(ws);
+        // A word that never reads back is let go on this wake.
+        wake_after(session, settle);
     }
 
     /// Flip `light` of `session` with Claude's own input (see the module
@@ -1175,9 +2657,9 @@ impl App {
     }
 
     /// The keyboard half (see the module header): `ctrl+shift+tab` selects
-    /// the focused pane's next light; with one selected, Return/Space toggle
-    /// and Escape lets go. Any other key lets go and is NOT consumed.
-    /// Whether the key was the lights'.
+    /// the focused pane's next chip; with one selected, Return/Space act as
+    /// its click ([`Self::press_claude_chip`]) and Escape lets go. Any other
+    /// key lets go and is NOT consumed. Whether the key was the lights'.
     pub(crate) fn on_key_claude_lights(
         &mut self,
         wid: WindowId,
@@ -1205,7 +2687,7 @@ impl App {
         }
         // Ordinary typing cannot change the lights when nothing is selected.
         // Avoid resolving the focused pane and scanning the painted hits on
-        // every key in that common case. A selected light still needs the full
+        // every key in that common case. A selected chip still needs the full
         // path so a key can dismiss it, even if its pane has since moved.
         let select_chord = cfg!(target_os = "macos")
             && mods.control_key()
@@ -1229,7 +2711,7 @@ impl App {
             return false;
         };
         // The pane's footer rule is on the glass, with this much room for its
-        // chips: its lights can be revealed there, drawn at rest or not.
+        // chips: they can be selected there, drawn at rest or not.
         let room = ws
             .claude_lights
             .footers
@@ -1240,14 +2722,14 @@ impl App {
         // painted it — whose chip is not on the glass (a box covers the
         // composer, the pane narrowed, the chip did not fit), is let go
         // rather than left armed to swallow a later Return.
-        let stale = ws.claude_lights.selected.is_some_and(|(id, light)| {
+        let stale = ws.claude_lights.selected.is_some_and(|(id, chip)| {
             id != session
                 || (ws.claude_lights.selection_painted
                     && !ws
                         .claude_lights
                         .hits
                         .iter()
-                        .any(|h| h.session == id && h.light == light))
+                        .any(|h| h.session == id && h.chip == Some(chip)))
         });
         if stale {
             ws.claude_lights.select(None);
@@ -1256,29 +2738,29 @@ impl App {
         // macOS only: everywhere else `ctrl+shift+tab` is aterm's default
         // `prev_tab` (`keybinding::PLATFORM_DEFAULT_PAIRS`), and this gate runs
         // before the keybindings. The lights stay clickable on every platform.
-        // The selection walks every revealable light — the reveal draws them
-        // while it lasts, the ones at rest included — but only onto one whose
-        // chip FITS the pane's row (the reveal is dropped first): a selection
+        // The selection walks every revealable chip — the harness's two, and
+        // the lights the reveal draws while it lasts, the ones at rest
+        // included — but only onto one the pane's row has ROOM for (the
+        // reveal, `⚙` and the light given up first, `Keep`): a selection
         // nobody can see must never take the next Return.
         let order = ws.claude_lights.revealable(session);
         let lights_ = &ws.claude_lights;
-        let fits = |light: Light| {
+        let fits = |chip: Chip| {
             room.is_some_and(|room| {
                 lights_
-                    .block_with(
+                    .fitted(
                         session,
                         RenderCell::default(),
                         now,
-                        Some(light),
+                        [0; 3],
+                        Some(chip),
                         None,
-                        false,
+                        room,
                     )
-                    .lights
-                    .len()
-                    <= room
+                    .is_some_and(|block| block.shows(chip))
             })
         };
-        let step = |from: Option<Light>| -> Option<Light> {
+        let step = |from: Option<Chip>| -> Option<Chip> {
             let n = order.len();
             let at = from
                 .and_then(|l| order.iter().position(|o| *o == l))
@@ -1300,7 +2782,7 @@ impl App {
             }
             return true;
         }
-        let Some(light) = selected else {
+        let Some(chip) = selected else {
             return false;
         };
         let plain = !mods.control_key() && !mods.alt_key() && !mods.super_key();
@@ -1308,7 +2790,7 @@ impl App {
             Key::Named(NamedKey::Enter | NamedKey::Space) if plain => {
                 ws.claude_lights.select(None);
                 redraw(ws);
-                self.toggle_claude_light(wid, session, light);
+                self.press_claude_chip(wid, session, chip);
                 true
             }
             Key::Named(NamedKey::Escape) => {
@@ -1329,29 +2811,35 @@ impl App {
 mod tests {
     use super::*;
 
+    /// The mode light's chip.
+    const MODE: Chip = Chip::Light(Light::Mode);
+
+    /// The footer's mark accent, as a theme gives it: Cruise's ink.
+    const ACCENT: [u8; 3] = [0, 128, 255];
+
     #[test]
     fn inert_session_history_does_not_change_the_lights_repaint_key() {
         let now = Instant::now();
         let mut w = WindowLights {
-            hover: Some((7, Light::Mode)),
+            hover: Some((7, MODE)),
             ..WindowLights::default()
         };
         w.sessions.insert(7, SessionLights::default());
-        let hovered = w.fingerprint(now);
+        let hovered = w.fingerprint(|| now);
         assert_ne!(hovered, 0);
 
         for session in 100..1_100 {
             w.sessions.insert(session, SessionLights::default());
         }
-        assert_eq!(w.fingerprint(now), hovered);
+        assert_eq!(w.fingerprint(|| now), hovered);
 
         w.sessions.get_mut(&1_000).unwrap().refused =
             Some((Light::Mode, Refusal::NotShown, now + Duration::from_secs(1)));
-        assert_ne!(w.fingerprint(now), hovered);
-        assert_eq!(w.fingerprint(now + Duration::from_secs(2)), hovered);
+        assert_ne!(w.fingerprint(|| now), hovered);
+        assert_eq!(w.fingerprint(|| now + Duration::from_secs(2)), hovered);
 
         w.hover = None;
-        assert_eq!(w.fingerprint(now + Duration::from_secs(2)), 0);
+        assert_eq!(w.fingerprint(|| now + Duration::from_secs(2)), 0);
     }
 
     fn blank() -> RenderCell {
@@ -1380,7 +2868,7 @@ mod tests {
     const ACCEPT: &str = "  \u{23F5}\u{23F5} accept edits on (shift+tab to cycle)";
 
     fn observe(w: &mut WindowLights, rows: &[String]) -> Step {
-        w.observe_rows(7, rows, lights::read_screen)
+        w.observe_rows(7, rows, lights::read_lights)
     }
 
     /// The lights read behind the reader's panic fence: a panicking reader
@@ -1397,7 +2885,7 @@ mod tests {
         observe(&mut w, &screen(&rule, MANUAL, ""));
         start(&mut w, Light::Mode, Mode::Manual, now);
         let shown = w.sessions[&7].shown;
-        let boom = |_: &[String]| -> Option<Screen> { panic!("stand-in reader panic") };
+        let boom = |_: &[String]| -> Option<Reading> { panic!("stand-in reader panic") };
         let plan = screen(&rule, PLAN, "");
         assert_eq!(w.observe_rows(7, &plan, boom), Step::default());
         let s = &w.sessions[&7];
@@ -1547,7 +3035,7 @@ mod tests {
             Some((Light::Mode, Refusal::StoppedMidTurn(Mode::AcceptEdits), _))
         ));
         let title: String = w
-            .block(7, blank(), due, true)
+            .block(7, blank(), due, ACCENT, Keep::Revealed)
             .title
             .iter()
             .map(|c| c.ch)
@@ -1596,7 +3084,7 @@ mod tests {
             Some((Light::Mode, Refusal::StoppedIn(Mode::AcceptEdits), _))
         ));
         let title: String = w
-            .block(7, blank(), two, true)
+            .block(7, blank(), two, ACCENT, Keep::Revealed)
             .title
             .iter()
             .map(|c| c.ch)
@@ -1657,10 +3145,15 @@ mod tests {
         assert!(arrived.sessions[&7].pending.is_none());
     }
 
-    /// DEVIATIONS ONLY: at rest — bypass or auto — the block is EMPTY. Plan
-    /// mode draws a labelled chip, a cell of margin after; the title comes
-    /// APART from the chip (only the chip must fit); a box over the composer
-    /// keeps the last reading rather than dropping the row.
+    /// THE LIGHT, DEVIATIONS ONLY: at rest — bypass or auto — no light is
+    /// drawn, and with no harness host the block is EMPTY. Plan mode draws a
+    /// labelled chip, a cell of margin after; the title comes APART from the
+    /// chip (only the chip must fit); a box over the composer keeps the last
+    /// reading rather than dropping the row. THE HARNESS'S TWO, ALWAYS
+    /// (owner, 2026-10-15): with a host, at rest the block is Autopilot and
+    /// `⚙` alone — `∞` in the footer's accent, `⚙` in the row's ink, no
+    /// title — and the light, a deviation, follows them. NEGATIVE CONTROL:
+    /// with no host (`Unhosted`), neither.
     #[test]
     fn only_deviations_are_drawn_and_the_block_keeps_what_it_saw() {
         let now = Instant::now();
@@ -1668,7 +3161,7 @@ mod tests {
         let mut w = WindowLights::default();
         for mode in [BYPASS, AUTO] {
             observe(&mut w, &screen(&bare, mode, ""));
-            let rest = w.block(7, blank(), now, true);
+            let rest = w.block(7, blank(), now, ACCENT, Keep::Revealed);
             assert!(
                 rest.lights.is_empty() && rest.cols.is_empty() && rest.title.is_empty(),
                 "nothing at rest: {mode:?}"
@@ -1676,20 +3169,20 @@ mod tests {
         }
         // Control: plan mode.
         observe(&mut w, &screen(&bare, PLAN, ""));
-        let block = w.block(7, blank(), now, true);
+        let block = w.block(7, blank(), now, ACCENT, Keep::Revealed);
         let text: String = block.lights.iter().map(|c| c.ch).collect();
         assert_eq!(text, "\u{23F8} plan");
-        assert_eq!(block.cols, vec![(0..6, Light::Mode)]);
+        assert_eq!(block.cols, vec![(0..6, MODE)]);
         assert!(block.title.is_empty(), "nothing asked for a title");
         assert_eq!(block.lights[0].fg, blank().fg, "plan, in the row's ink");
         w.observe(7, None);
         assert_eq!(
-            w.block(7, blank(), now, true).lights,
+            w.block(7, blank(), now, ACCENT, Keep::Revealed).lights,
             block.lights,
             "a covered composer keeps the last reading"
         );
-        w.hover = Some((7, Light::Mode));
-        let hovered = w.block(7, blank(), now, true);
+        w.hover = Some((7, MODE));
+        let hovered = w.block(7, blank(), now, ACCENT, Keep::Revealed);
         let title: String = hovered.title.iter().map(|c| c.ch).collect();
         assert_eq!(title, "Permission mode: click for bypass or auto  ");
         assert_eq!(
@@ -1701,6 +3194,325 @@ mod tests {
             hovered.lights.iter().all(|c| c.bold),
             "the whole hovered chip is marked"
         );
+
+        // The harness's two, at rest, before the light.
+        let mut w = WindowLights::default();
+        observe(&mut w, &screen(&bare, BYPASS, ""));
+        w.note_autopilot(7, None, AutopilotView::Unhosted, now);
+        assert!(
+            w.block(7, blank(), now, ACCENT, Keep::Revealed)
+                .cols
+                .is_empty(),
+            "no host: no chip"
+        );
+        w.note_autopilot(7, None, AutopilotView::Cruise, now);
+        let rest = w.block(7, blank(), now, ACCENT, Keep::Revealed);
+        let text: String = rest.lights.iter().map(|c| c.ch).collect();
+        assert_eq!(text, "\u{221e} \u{2699}", "at rest: Autopilot and the gear");
+        assert_eq!(
+            rest.cols,
+            vec![(0..1, Chip::Autopilot), (2..3, Chip::Settings)]
+        );
+        assert_eq!(
+            (rest.lights[0].fg, rest.lights[2].fg),
+            (ACCENT, blank().fg),
+            "cruise in the accent, the gear in the row's ink"
+        );
+        assert!(rest.title.is_empty(), "nothing asked for a title");
+        observe(&mut w, &screen(&bare, PLAN, ""));
+        let text: String = w
+            .block(7, blank(), now, ACCENT, Keep::Revealed)
+            .lights
+            .iter()
+            .map(|c| c.ch)
+            .collect();
+        assert_eq!(text, "\u{221e} \u{2699} \u{23F8} plan", "the light follows");
+    }
+
+    /// THE AUTOPILOT CHIP SAYS ITS VIEW (design §2.3): `∞` alone in the
+    /// footer's accent, `⤓ land` amber (the auto pill's hue), `○ off` and,
+    /// with the master switch off, `⊘ off` dim — a word-less chip with no
+    /// trailing space — each titled as the design's table says, short to
+    /// what it names; `⚙` titled as the settings. A click in flight shows
+    /// `◐` alone until the word it wrote reads back, or its deadline lets it
+    /// go.
+    #[test]
+    fn the_autopilot_chip_says_its_view_in_its_ink() {
+        let now = Instant::now();
+        let dim = dim_of(blank());
+        let mut w = WindowLights::default();
+        let rows = [
+            (
+                AutopilotView::Cruise,
+                "\u{221e}",
+                ACCENT,
+                "autopilot: cruise \u{2014} keeps the work moving \u{b7} click: land",
+                "autopilot: cruise",
+            ),
+            (
+                AutopilotView::Land,
+                "\u{2913} land",
+                AMBER,
+                "autopilot: land \u{2014} wrapping up \u{b7} click: off",
+                "autopilot: land",
+            ),
+            (
+                AutopilotView::Off,
+                "\u{25cb} off",
+                dim,
+                "autopilot: off \u{2014} hands off \u{b7} click: cruise",
+                "autopilot: off",
+            ),
+            (
+                AutopilotView::MasterOff,
+                "\u{2298} off",
+                dim,
+                "harness off in Settings \u{b7} click: open Settings \u{25b8} Harness",
+                "harness off in Settings",
+            ),
+        ];
+        let text = |cells: &[RenderCell]| -> String { cells.iter().map(|c| c.ch).collect() };
+        for (view, face, ink, title, short) in rows {
+            w.note_autopilot(7, view.mode(), view, now);
+            w.hover = Some((7, Chip::Autopilot));
+            let block = w.block(7, blank(), now, ACCENT, Keep::Drawn);
+            let n = face.chars().count();
+            assert_eq!(text(&block.lights), format!("{face} \u{2699}"), "{view:?}");
+            assert_eq!(block.cols[0], (0..n, Chip::Autopilot), "{view:?}");
+            assert_eq!(
+                text(&block.lights[..n]),
+                view.label(),
+                "{view:?}: its label"
+            );
+            assert!(
+                block.lights[..n].iter().all(|c| c.fg == ink && c.bold),
+                "{view:?}: its ink, marked under the pointer"
+            );
+            assert_eq!(block.lights[n + 1].fg, blank().fg, "{view:?}: the gear");
+            assert_eq!(text(&block.title), format!("{title}  "), "{view:?}");
+            assert_eq!(text(&block.short_title), format!("{short}  "), "{view:?}");
+            assert!(!block.reason, "a hover's title gives way first");
+        }
+        w.hover = Some((7, Chip::Settings));
+        let block = w.block(7, blank(), now, ACCENT, Keep::Drawn);
+        assert_eq!(text(&block.title), format!("{SETTINGS_TITLE}  "));
+        assert_eq!(
+            text(&block.short_title),
+            format!("{}  ", short_title(SETTINGS_TITLE)),
+            "a narrow rule keeps what the gear is"
+        );
+        assert_eq!(
+            Some(AMBER),
+            Mode::Auto.hue(),
+            "land wears the auto pill's amber"
+        );
+
+        // A click in flight: `◐` alone, held until the word it wrote reads
+        // back — not by a frame that still reads the old one.
+        w.hover = None;
+        w.note_autopilot(7, None, AutopilotView::Cruise, now);
+        w.sessions.get_mut(&7).unwrap().autopilot_pending =
+            Some((Autopilot::Land, now + Duration::from_secs(1)));
+        let block = w.block(7, blank(), now, ACCENT, Keep::Drawn);
+        assert_eq!(text(&block.lights), "\u{25d0} \u{2699}");
+        w.note_autopilot(7, None, AutopilotView::Cruise, now);
+        assert!(
+            w.sessions[&7].autopilot_pending.is_some(),
+            "not read back yet"
+        );
+        w.note_autopilot(7, Some(Autopilot::Land), AutopilotView::Land, now);
+        assert!(w.sessions[&7].autopilot_pending.is_none(), "read back");
+        assert_eq!(
+            text(&w.block(7, blank(), now, ACCENT, Keep::Drawn).lights),
+            "\u{2913} land \u{2699}"
+        );
+        // Never read back: its deadline lets it go, and says so to the loop.
+        w.sessions.get_mut(&7).unwrap().autopilot_pending =
+            Some((Autopilot::Off, now + Duration::from_secs(1)));
+        assert_eq!(w.expire(now), (false, Vec::new()), "still in time");
+        assert_eq!(w.expire(now + Duration::from_secs(1)), (true, Vec::new()));
+        assert!(w.sessions[&7].autopilot_pending.is_none());
+        assert_eq!(
+            w.fingerprint(|| now),
+            0,
+            "the lights' own key stays 0 at rest"
+        );
+    }
+
+    /// A RULE SHORT OF ROOM gives up the keyboard's reveal first, then `⚙`,
+    /// then the light, and Autopilot — the mark that says the session is
+    /// wrapped — last, and nothing where not even `∞` fits. ONE ORDER: for
+    /// every pill, selection and room from 24 cells down, the chips drawn
+    /// are a part of those one cell more drew — a chip a rule gave up never
+    /// comes back in a narrower one (the review of 2026-10-15: under accept
+    /// edits `⚙` was drawn in 19 cells, gone in 17 and back from 14 down to
+    /// 3, and under plan Autopilot was gone in 6 and 7 cells and back in 5).
+    /// The keyboard's fit asks the same ladder: a selected chip the room
+    /// cannot hold is no fit. And what `fitted` MEASURES of a rung is what
+    /// the painter lays out of it, so the one block it builds fits. CONTROL:
+    /// the walk is no constant — every chip is drawn in the widest room and
+    /// none in the narrowest.
+    #[test]
+    fn a_narrow_rule_gives_up_the_reveal_the_gear_the_light_then_autopilot() {
+        let now = Instant::now();
+        let bare = "\u{2500}".repeat(60);
+        let mut w = WindowLights::default();
+        observe(&mut w, &screen(&bare, PLAN, ""));
+        w.note_autopilot(7, None, AutopilotView::Cruise, now);
+        let fitted = |w: &WindowLights, selected: Option<Chip>, room: usize| {
+            w.fitted(7, blank(), now, ACCENT, selected, None, room)
+                .map(|b| b.lights.iter().map(|c| c.ch).collect::<String>())
+        };
+        // `∞ ⚙ ⏸ plan`: 10 cells.
+        assert_eq!(
+            fitted(&w, None, 10).as_deref(),
+            Some("\u{221e} \u{2699} \u{23F8} plan")
+        );
+        for room in 8..=9 {
+            assert_eq!(
+                fitted(&w, None, room).as_deref(),
+                Some("\u{221e} \u{23F8} plan"),
+                "{room}: the gear first"
+            );
+        }
+        for room in 1..=7 {
+            assert_eq!(
+                fitted(&w, None, room).as_deref(),
+                Some("\u{221e}"),
+                "{room}: then the light, Autopilot last"
+            );
+        }
+        assert_eq!(fitted(&w, None, 0), None, "then every chip");
+        let fits = |w: &WindowLights, chip: Chip, room: usize| {
+            w.fitted(7, blank(), now, ACCENT, Some(chip), None, room)
+                .is_some_and(|b| b.shows(chip))
+        };
+        assert!(fits(&w, Chip::Settings, 10) && !fits(&w, Chip::Settings, 9));
+        assert!((1..=9).all(|room| !fits(&w, Chip::Settings, room)));
+        assert!(fits(&w, MODE, 8) && !fits(&w, MODE, 7));
+        assert!((1..=10).all(|room| fits(&w, Chip::Autopilot, room)));
+        assert!(!fits(&w, Chip::Autopilot, 0));
+        // Accept edits: the light alone is 15 cells.
+        observe(&mut w, &screen(&bare, ACCEPT, ""));
+        assert_eq!(
+            fitted(&w, None, 19).as_deref(),
+            Some("\u{221e} \u{2699} \u{23F5}\u{23F5} accept edits")
+        );
+        assert_eq!(
+            fitted(&w, None, 17).as_deref(),
+            Some("\u{221e} \u{23F5}\u{23F5} accept edits"),
+            "the gear first"
+        );
+        for room in 1..=16 {
+            assert_eq!(
+                fitted(&w, None, room).as_deref(),
+                Some("\u{221e}"),
+                "{room}: then the light, and never the gear back"
+            );
+        }
+        // In bypass the light is the reveal's: given up before the gear.
+        observe(&mut w, &screen(&bare, BYPASS, ""));
+        assert_eq!(
+            fitted(&w, Some(Chip::Autopilot), 13).as_deref(),
+            Some("\u{221e} \u{2699} \u{23F5}\u{23F5} bypass"),
+            "revealed"
+        );
+        assert_eq!(
+            fitted(&w, Some(Chip::Autopilot), 12).as_deref(),
+            Some("\u{221e} \u{2699}"),
+            "the reveal first"
+        );
+        // One order, whatever the pill, the selection and Autopilot's face.
+        let drawn = |w: &WindowLights, selected: Option<Chip>, room: usize| -> Vec<Chip> {
+            w.fitted(7, blank(), now, ACCENT, selected, None, room)
+                .map(|b| b.cols.iter().map(|(_, chip)| *chip).collect())
+                .unwrap_or_default()
+        };
+        for view in [AutopilotView::Cruise, AutopilotView::Land] {
+            w.note_autopilot(7, view.mode(), view, now);
+            for mode_row in [PLAN, ACCEPT, MANUAL, BYPASS] {
+                observe(&mut w, &screen(&bare, mode_row, ""));
+                for selected in [
+                    None,
+                    Some(Chip::Autopilot),
+                    Some(Chip::Settings),
+                    Some(MODE),
+                ] {
+                    let mut wider = drawn(&w, selected, 24);
+                    assert!(
+                        wider.contains(&Chip::Autopilot) && wider.contains(&Chip::Settings),
+                        "{view:?} {mode_row:?} {selected:?}: control, every chip in 24 cells"
+                    );
+                    for room in (0..24).rev() {
+                        let narrower = drawn(&w, selected, room);
+                        assert!(
+                            narrower.iter().all(|chip| wider.contains(chip)),
+                            "{view:?} {mode_row:?} {selected:?} {room}: {narrower:?} after \
+                             {wider:?}"
+                        );
+                        wider = narrower;
+                    }
+                    assert!(wider.is_empty(), "control: no chip in no room");
+                    // Measured as laid out, rung by rung.
+                    let s = &w.sessions[&7];
+                    for keep in Keep::LADDER {
+                        let block = w.block_with(7, blank(), now, ACCENT, selected, None, keep);
+                        let on = drawn_at(s, now, selected, None, keep);
+                        assert_eq!(
+                            chips_width_at(
+                                s,
+                                Chip::row().filter(|chip| on(*chip)),
+                                keep,
+                                ACCENT,
+                                blank().fg,
+                                dim_of(blank())
+                            ),
+                            block.lights.len(),
+                            "{view:?} {mode_row:?} {selected:?} {keep:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A FOCUS LEFT ON A CHIP THE RULE GAVE UP never hides the light's
+    /// title: a hover — or a selection — still on `⚙` once a narrower rule
+    /// dropped it, while the light says where its return stopped, leaves
+    /// the light's REASON the title (a reason, which outranks the branch and
+    /// the path). CONTROL: with `⚙` on the glass, the focus is the title.
+    #[test]
+    fn a_focus_on_a_chip_the_rule_gave_up_leaves_the_lights_title() {
+        let now = Instant::now();
+        let mut w = WindowLights::default();
+        observe(&mut w, &screen(&"\u{2500}".repeat(60), PLAN, ""));
+        w.note_autopilot(7, None, AutopilotView::Cruise, now);
+        w.sessions.get_mut(&7).unwrap().refused = Some((
+            Light::Mode,
+            Refusal::StoppedIn(Mode::Plan),
+            now + REFUSAL_SHOWN,
+        ));
+        let text = |cells: &[RenderCell]| -> String { cells.iter().map(|c| c.ch).collect() };
+        for (selected, hover) in [(None, Some(Chip::Settings)), (Some(Chip::Settings), None)] {
+            // `∞ ⏸ plan`: the gear given up.
+            let block = w
+                .fitted(7, blank(), now, ACCENT, selected, hover, 9)
+                .expect("a block");
+            assert_eq!(text(&block.lights), "\u{221e} \u{23F8} plan");
+            assert_eq!(
+                text(&block.title),
+                "Permission mode: stopped in plan mode  ",
+                "{selected:?} {hover:?}"
+            );
+            assert!(block.reason, "{selected:?} {hover:?}: a reason");
+            // Control: the gear drawn, its title.
+            let block = w
+                .fitted(7, blank(), now, ACCENT, selected, hover, 10)
+                .expect("a block");
+            assert!(block.shows(Chip::Settings));
+            assert_eq!(text(&block.title), format!("{SETTINGS_TITLE}  "));
+            assert!(!block.reason);
+        }
     }
 
     /// The keyboard selection reveals the light at rest and marks it: in
@@ -1710,9 +3522,14 @@ mod tests {
         let now = Instant::now();
         let mut w = WindowLights::default();
         observe(&mut w, &screen(&"\u{2500}".repeat(60), BYPASS, ""));
-        assert!(w.block(7, blank(), now, true).cols.is_empty(), "at rest");
-        w.selected = Some((7, Light::Mode));
-        let block = w.block(7, blank(), now, true);
+        assert!(
+            w.block(7, blank(), now, ACCENT, Keep::Revealed)
+                .cols
+                .is_empty(),
+            "at rest"
+        );
+        w.selected = Some((7, MODE));
+        let block = w.block(7, blank(), now, ACCENT, Keep::Revealed);
         let title: String = block.title.iter().map(|c| c.ch).collect();
         assert_eq!(title, "Permission mode: bypass  ");
         assert_eq!(
@@ -1721,7 +3538,8 @@ mod tests {
         );
         assert!(block.lights[0].bold);
         assert!(
-            w.block(7, blank(), now, false).shows(Light::Mode),
+            w.block(7, blank(), now, ACCENT, Keep::Drawn)
+                .shows(Light::Mode),
             "the selection itself is drawn without the reveal"
         );
     }
@@ -1730,12 +3548,12 @@ mod tests {
     fn a_quiet_row_keys_as_zero() {
         let now = Instant::now();
         let mut w = WindowLights::default();
-        assert_eq!(w.fingerprint(now), 0);
-        w.hover = Some((7, Light::Mode));
-        let a = w.fingerprint(now);
-        w.selected = Some((7, Light::Mode));
+        assert_eq!(w.fingerprint(|| now), 0);
+        w.hover = Some((7, MODE));
+        let a = w.fingerprint(|| now);
+        w.selected = Some((7, MODE));
         assert_ne!(a, 0);
-        assert_ne!(a, w.fingerprint(now));
+        assert_ne!(a, w.fingerprint(|| now));
     }
 }
 
@@ -1758,11 +3576,17 @@ mod gesture_tests {
 
     use aterm_agent::harness::footer::FooterFacts;
     use aterm_agent::harness::lights::{self, Light, Mode};
+    use aterm_agent::supervise::Autopilot;
     use aterm_core::terminal::RenderCell;
     use aterm_session::sink::SinkWriter;
     use winit::event::{ElementState, MouseButton};
 
+    use super::Chip;
+    use crate::autopilot::AutopilotView;
     use crate::{App, WindowId, term_lock};
+
+    /// The mode light's chip.
+    const MODE: Chip = Chip::Light(Light::Mode);
 
     /// One synthetic key press and release, as a person taps it.
     #[cfg(target_os = "macos")]
@@ -1801,9 +3625,9 @@ mod gesture_tests {
     /// session's sink genuinely fails. Dropping `reader` closes only this
     /// process's descriptor: while another test is forking, the child holds a
     /// copy until it execs — longer on a loaded machine — and meanwhile a
-    /// write to the socket still succeeds (measured 2026-09-27 on the gate:
-    /// `FollowRejected` read a failed-write fixture's Enter as accepted, only
-    /// under load with sibling tests running). So wait for the sink's own end
+    /// write to the socket still succeeds (on a loaded machine with sibling
+    /// tests running, `FollowRejected` read a failed-write fixture's Enter as
+    /// accepted). So wait for the sink's own end
     /// to see the hang-up, which it reports only once every copy is gone
     /// (`POLLHUP`; a `shutdown` does not help — a send to a shut-down Unix
     /// socket peer still succeeds on macOS). Bounded, so a copy that never
@@ -1841,6 +3665,39 @@ mod gesture_tests {
         let wid = WindowId(0);
         let session = app.focused_session_id(wid).expect("the front session");
         (app, wid, session, reader)
+    }
+
+    /// The window's harness host in a test: one that supervises nothing
+    /// (`Acts` inert, no sessions) — what the harness's chips are drawn for —
+    /// shut down when the guard drops, a failing test's included.
+    struct Hosted(crate::harness_host::HostHandle);
+
+    impl Drop for Hosted {
+        fn drop(&mut self) {
+            self.0.shutdown_and_join();
+        }
+    }
+
+    /// Give `app` a harness host ([`Hosted`]): its posture reads `On`, the
+    /// table's default Autopilot (cruise).
+    fn host(app: &mut App) -> Hosted {
+        let host = crate::harness_host::HostHandle::for_supervised_test(
+            Vec::new(),
+            Arc::new(|_| crate::harness_host::BodyEnd::Stopped),
+        );
+        app.harness = Some(host.clone());
+        Hosted(host)
+    }
+
+    /// `ctrl+shift+tab`, as a person presses it (macOS: elsewhere the chord
+    /// is aterm's `prev_tab`).
+    #[cfg(target_os = "macos")]
+    fn chord(app: &mut App, wid: WindowId) {
+        use winit::keyboard::{KeyCode, ModifiersState, NamedKey};
+        app.windows.get_mut(&wid).expect("window").mods =
+            ModifiersState::CONTROL | ModifiersState::SHIFT;
+        tap(app, wid, NamedKey::Tab, KeyCode::Tab, "\t");
+        app.windows.get_mut(&wid).expect("window").mods = ModifiersState::empty();
     }
 
     /// [`app`] in a 120-column pane: room for a light's WHOLE title beside
@@ -1942,15 +3799,27 @@ mod gesture_tests {
         );
     }
 
-    /// Where the painter put `light` this frame: (frame row, frame column).
-    fn hit(app: &App, wid: WindowId, light: Light) -> (usize, usize) {
+    /// Where the painter put `chip` this frame: (frame row, frame column) of
+    /// its first cell.
+    fn hit(app: &App, wid: WindowId, chip: impl Into<Chip>) -> (usize, usize) {
+        let chip = chip.into();
         let h = app.windows[&wid]
             .claude_lights
             .hits
             .iter()
-            .find(|h| h.light == light)
-            .unwrap_or_else(|| panic!("{light:?} is painted"));
+            .find(|h| h.chip == Some(chip))
+            .unwrap_or_else(|| panic!("{chip:?} is painted"));
         (h.frame_row, h.col)
+    }
+
+    /// Whether the painter put `chip` on the glass this frame.
+    fn painted(app: &App, wid: WindowId, chip: impl Into<Chip>) -> bool {
+        let chip = chip.into();
+        app.windows[&wid]
+            .claude_lights
+            .hits
+            .iter()
+            .any(|h| h.chip == Some(chip))
     }
 
     fn cell_at(app: &App, wid: WindowId, (row, col): (usize, usize)) -> RenderCell {
@@ -2013,8 +3882,9 @@ mod gesture_tests {
     /// Claude's row stays Claude's — so the MEASURED screen, drawn at its own
     /// 144 columns, keeps the tail exactly where Claude put it, and the chip
     /// in the rule has a blank cell on each side: never glued to a rule
-    /// glyph, a title or a fact. CONTROL: the rule's own glyphs are ink a
-    /// chip must not touch, and they are there.
+    /// glyph, a title or a fact — every chip of the row, the harness's two
+    /// beside the light included (a host draws them). CONTROL: the rule's
+    /// own glyphs are ink a chip must not touch, and they are there.
     #[test]
     fn the_effort_tail_stays_on_claudes_row_and_every_chip_stands_clear_in_the_rule() {
         use aterm_phase::prompt::fixtures::{FOOTER_AUTO_EFFORT_HINT_MEASURED, screen};
@@ -2025,6 +3895,7 @@ mod gesture_tests {
         let measured = measured.trim_end().to_string();
         for mode in [measured.as_str(), MANUAL] {
             let (mut app, wid, session, _reader) = app();
+            let _host = host(&mut app);
             assert!(app.apply_term_resize(wid, 24, 144));
             publish_facts(&app, session);
             draw_claude(&app, session, mode);
@@ -2033,8 +3904,7 @@ mod gesture_tests {
             assert_eq!(claude.trim_end(), mode, "Claude's row is whole");
             if mode == measured {
                 // Auto mode is as expected: no chip at rest. Reveal it.
-                app.windows.get_mut(&wid).unwrap().claude_lights.selected =
-                    Some((session, Light::Mode));
+                app.windows.get_mut(&wid).unwrap().claude_lights.selected = Some((session, MODE));
                 frame(&mut app, wid);
             }
             let hits = &app.windows[&wid].claude_lights.hits;
@@ -2045,21 +3915,21 @@ mod gesture_tests {
                 .map(|c| c.ch)
                 .collect();
             assert!(text.contains(&'\u{2500}'), "control: the rule's glyphs");
-            for light in Light::ALL {
+            for chip in Chip::row() {
                 let cols: Vec<usize> = hits
                     .iter()
-                    .filter(|h| h.light == light)
+                    .filter(|h| h.chip == Some(chip))
                     .map(|h| {
                         assert_eq!(h.frame_row, rule, "the chip is in the rule");
                         h.col
                     })
                     .collect();
                 let (Some(&first), Some(&last)) = (cols.iter().min(), cols.iter().max()) else {
-                    continue;
+                    panic!("{mode:?}: {chip:?} is drawn");
                 };
                 let row: String = text.iter().collect();
-                assert_eq!(text[first - 1], ' ', "{light:?} before: {row:?}");
-                assert_eq!(text[last + 1], ' ', "{light:?} after: {row:?}");
+                assert_eq!(text[first - 1], ' ', "{chip:?} before: {row:?}");
+                assert_eq!(text[last + 1], ' ', "{chip:?} after: {row:?}");
             }
         }
     }
@@ -2070,8 +3940,8 @@ mod gesture_tests {
     /// WAKE (never from the frame); and the bypass pill resolves it — and no
     /// press ever goes on from there. Run with the mouse untracked and
     /// tracked (SGR 1000/1006): a press the light takes is not a mouse
-    /// report, and neither is its release. Controls: the gap between two
-    /// lights is not a light, and a second click while one toggle is in
+    /// report, and neither is its release. Controls: the blank before the
+    /// light is not a light, and a second click while one toggle is in
     /// flight types nothing.
     #[test]
     fn a_click_on_the_mode_light_presses_forward_to_bypass_and_reads_each_answer_back() {
@@ -2104,10 +3974,7 @@ mod gesture_tests {
             assert_eq!(app.windows[&wid].claude_lights.hover, None);
             let (x, y) = px_of(&app, wid, mode);
             app.on_cursor_moved(wid, x, y);
-            assert_eq!(
-                app.windows[&wid].claude_lights.hover,
-                Some((session, Light::Mode))
-            );
+            assert_eq!(app.windows[&wid].claude_lights.hover, Some((session, MODE)));
             assert!(pty(&mut reader, 0).is_empty(), "hover types nothing");
 
             // The click: one shift+tab, and no press or release report.
@@ -2141,10 +4008,7 @@ mod gesture_tests {
                 text.contains("switching\u{2026}") && text.contains(WHOLE_FACTS),
                 "the title, short in an 80-column pane, beside the whole facts: {text:?}"
             );
-            assert_ne!(
-                app.windows[&wid].claude_lights.fingerprint(Instant::now()),
-                0
-            );
+            assert_ne!(app.windows[&wid].claude_lights.fingerprint(Instant::now), 0);
             app.on_claude_footer_changed(session);
             assert!(pty(&mut reader, 0).is_empty(), "no answer, no second press");
 
@@ -2215,7 +4079,7 @@ mod gesture_tests {
                 .claude_lights
                 .hits
                 .iter()
-                .any(|h| h.light == Light::Mode),
+                .any(|h| h.chip == Some(MODE)),
             "auto is expected: no chip"
         );
         app.toggle_claude_light(wid, session, Light::Mode);
@@ -2229,75 +4093,134 @@ mod gesture_tests {
         assert_eq!(pty(&mut reader, 3), lights::SHIFT_TAB, "plan: one press");
     }
 
-    /// AT REST NOTHING IS DRAWN (owner, 2026-09-27: "I don't want to show the
-    /// state of parameters that I always expect to be on"): bypass or auto —
-    /// the rule carries the facts alone, no chip, nothing
-    /// to hit, while the rule is still known to be on the glass (the
+    /// AT REST NO LIGHT IS DRAWN (owner, 2026-09-27: "I don't want to show
+    /// the state of parameters that I always expect to be on") — ONLY THE
+    /// HARNESS'S TWO (owner, 2026-10-15: "I need some visual indicator that
+    /// the claude code session is being wrapped"): bypass or auto, a host —
+    /// the rule carries `∞` (cruise, the table's default, in the footer's
+    /// accent) and `⚙` (the row's ink) at its left and the facts at its
+    /// right, nothing else to hit, the rule known to be on the glass (the
     /// keyboard's way to the lights); and Claude's own row under it, its pill
-    /// and hint, is exactly as Claude drew it (owner, 2026-09-28).
+    /// and hint, is exactly as Claude drew it (owner, 2026-09-28). NEGATIVE
+    /// CONTROL: with no host the rule carries the facts alone.
     #[test]
-    fn at_rest_the_rule_carries_the_facts_alone() {
-        for mode in [BYPASS, AUTO] {
-            let (mut app, wid, session, _reader) = app();
-            publish_facts(&app, session);
-            draw_claude(&app, session, mode);
-            frame(&mut app, wid);
-            let lights = &app.windows[&wid].claude_lights;
-            assert!(lights.hits.is_empty(), "{mode:?}");
-            assert_eq!(
-                lights.footers.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
-                vec![session],
-                "{mode:?}"
-            );
-            let text = row_text(&app, wid, footer_row(&app, wid));
-            assert!(text.contains("\u{25C6} Opus 5.5 xhigh"), "{text:?}");
-            for gone in ["\u{25CB}", "\u{25CF}", "\u{23F5}"] {
-                assert!(!text.contains(gone), "{gone:?} in {text:?}");
+    fn at_rest_the_rule_carries_the_facts_and_the_harness_chips_alone() {
+        for hosted in [true, false] {
+            for mode in [BYPASS, AUTO] {
+                let (mut app, wid, session, _reader) = app();
+                let _host = hosted.then(|| host(&mut app));
+                publish_facts(&app, session);
+                draw_claude(&app, session, mode);
+                frame(&mut app, wid);
+                let lights = &app.windows[&wid].claude_lights;
+                let mut chips: Vec<Chip> = lights.hits.iter().filter_map(|h| h.chip).collect();
+                chips.dedup();
+                let want = if hosted {
+                    vec![Chip::Autopilot, Chip::Settings]
+                } else {
+                    Vec::new()
+                };
+                assert_eq!(chips, want, "{mode:?} hosted={hosted}");
+                assert_eq!(
+                    lights.footers.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+                    vec![session],
+                    "{mode:?}"
+                );
+                let text = row_text(&app, wid, footer_row(&app, wid));
+                assert!(text.contains(WHOLE_FACTS), "{text:?}");
+                for gone in [
+                    "\u{25CB}",
+                    "\u{25CF}",
+                    "\u{23F5}",
+                    "autopilot",
+                    "Permission mode",
+                ] {
+                    assert!(
+                        !text.contains(gone),
+                        "{gone:?} in {text:?}: no light, no title"
+                    );
+                }
+                assert_eq!(
+                    text.contains("\u{221e} \u{2699}"),
+                    hosted,
+                    "the harness's two: {text:?}"
+                );
+                if hosted {
+                    let blank = app.windows[&wid].input_scratch.implicit_blank;
+                    let accent = crate::chrome_band::band_colors(app.theme).accent;
+                    let ink = |chip| cell_at(&app, wid, hit(&app, wid, chip)).fg;
+                    assert_eq!(ink(Chip::Autopilot), accent, "cruise: the accent");
+                    assert_eq!(ink(Chip::Settings), blank.fg, "the gear: the row's ink");
+                }
+                // Claude's own row is whole: its pill, its hint.
+                let claude = row_text(&app, wid, mode_row(&app, wid));
+                assert_eq!(claude.trim_end(), mode, "Claude's row, as drawn");
             }
-            // Claude's own row is whole: its pill, its hint.
-            let claude = row_text(&app, wid, mode_row(&app, wid));
-            assert_eq!(claude.trim_end(), mode, "Claude's row, as drawn");
         }
     }
 
-    /// THE KEYBOARD REACHES A LIGHT AT REST (macOS): with nothing drawn,
-    /// `ctrl+shift+tab` reveals the known light — the expected mode,
-    /// `⏵⏵ bypass` — and Return on the expected mode presses nothing; the
-    /// reveal goes with the selection.
+    /// THE KEYBOARD REACHES EVERY CHIP AT REST (macOS): with no light drawn,
+    /// `ctrl+shift+tab` walks the row in its order — Autopilot and `⚙`,
+    /// always revealable where a host draws them, then the known light, the
+    /// expected mode `⏵⏵ bypass`, revealed — each selection painted on the
+    /// glass and typing nothing; Return on the expected mode presses
+    /// nothing; the reveal goes with the selection, and the harness's two
+    /// stay. NEGATIVE CONTROL: with no host the chord reaches the light
+    /// alone, and after the Return nothing is drawn at all.
     #[cfg(target_os = "macos")]
     #[test]
     fn ctrl_shift_tab_reveals_the_lights_at_rest() {
-        use winit::keyboard::{KeyCode, ModifiersState, NamedKey};
+        use winit::keyboard::{KeyCode, NamedKey};
 
-        let (mut app, wid, session, mut reader) = app();
-        publish_facts(&app, session);
-        draw_claude(&app, session, BYPASS);
-        frame(&mut app, wid);
-        assert!(app.windows[&wid].claude_lights.hits.is_empty(), "at rest");
-        app.windows.get_mut(&wid).unwrap().mods = ModifiersState::CONTROL | ModifiersState::SHIFT;
-        tap(&mut app, wid, NamedKey::Tab, KeyCode::Tab, "\t");
-        app.windows.get_mut(&wid).unwrap().mods = ModifiersState::empty();
-        assert_eq!(
-            app.windows[&wid].claude_lights.selected,
-            Some((session, Light::Mode))
-        );
-        assert!(pty(&mut reader, 0).is_empty(), "the chord is the lights'");
-        frame(&mut app, wid);
-        let text = row_text(&app, wid, footer_row(&app, wid));
-        assert!(
-            text.contains("\u{23F5}\u{23F5} bypass"),
-            "the known light, revealed: {text:?}"
-        );
-        tap(&mut app, wid, NamedKey::Enter, KeyCode::Enter, "\r");
-        assert!(
-            pty(&mut reader, 0).is_empty(),
-            "Return on the expected mode presses nothing"
-        );
-        frame(&mut app, wid);
-        assert!(
-            app.windows[&wid].claude_lights.hits.is_empty(),
-            "the reveal went with the selection"
-        );
+        for hosted in [true, false] {
+            let (mut app, wid, session, mut reader) = app();
+            let _host = hosted.then(|| host(&mut app));
+            publish_facts(&app, session);
+            draw_claude(&app, session, BYPASS);
+            frame(&mut app, wid);
+            assert!(!painted(&app, wid, MODE), "at rest");
+            let walk: &[Chip] = if hosted {
+                &[Chip::Autopilot, Chip::Settings, MODE]
+            } else {
+                &[MODE]
+            };
+            for want in walk {
+                chord(&mut app, wid);
+                assert_eq!(
+                    app.windows[&wid].claude_lights.selected,
+                    Some((session, *want)),
+                    "hosted={hosted}"
+                );
+                frame(&mut app, wid);
+                let at = hit(&app, wid, *want);
+                assert_eq!(
+                    cell_at(&app, wid, at).underline,
+                    super::UnderlineStyle::Single,
+                    "{want:?}: the selection is on the glass"
+                );
+            }
+            assert!(pty(&mut reader, 0).is_empty(), "the chord is the lights'");
+            let text = row_text(&app, wid, footer_row(&app, wid));
+            assert!(
+                text.contains("\u{23F5}\u{23F5} bypass"),
+                "the known light, revealed: {text:?}"
+            );
+            tap(&mut app, wid, NamedKey::Enter, KeyCode::Enter, "\r");
+            assert!(
+                pty(&mut reader, 0).is_empty(),
+                "Return on the expected mode presses nothing"
+            );
+            frame(&mut app, wid);
+            assert!(
+                !painted(&app, wid, MODE),
+                "the reveal went with the selection"
+            );
+            assert_eq!(
+                painted(&app, wid, Chip::Autopilot) && painted(&app, wid, Chip::Settings),
+                hosted,
+                "the harness's two stay"
+            );
+        }
     }
 
     /// THE KEYBOARD ROUTE (macOS: elsewhere `ctrl+shift+tab` is `prev_tab`):
@@ -2327,12 +4250,12 @@ mod gesture_tests {
         tap(&mut app, wid, NamedKey::Tab, KeyCode::Tab, "\t");
         assert_eq!(
             app.windows[&wid].claude_lights.selected,
-            Some((session, Light::Mode))
+            Some((session, MODE))
         );
         tap(&mut app, wid, NamedKey::Tab, KeyCode::Tab, "\t");
         assert_eq!(
             app.windows[&wid].claude_lights.selected,
-            Some((session, Light::Mode)),
+            Some((session, MODE)),
             "the one light stays selected"
         );
         assert!(pty(&mut reader, 0).is_empty(), "the chord is the lights'");
@@ -2394,7 +4317,7 @@ mod gesture_tests {
                 .claude_lights
                 .hits
                 .iter()
-                .any(|h| h.light == Light::Mode),
+                .any(|h| h.chip == Some(MODE)),
             "back at rest, no mode chip"
         );
 
@@ -2593,7 +4516,7 @@ mod gesture_tests {
         // the model: the mode's light is selected.
         assert_eq!(
             app.windows[&wid].claude_lights.selected,
-            Some((session, Light::Mode))
+            Some((session, MODE))
         );
         click(&mut app, wid, (strip + 5, other_col));
         assert_eq!(app.focused_session_id(wid), Some(other));
@@ -2604,8 +4527,8 @@ mod gesture_tests {
         assert_eq!(pty(&mut reader, 1), b"\r", "Return submits Claude's prompt");
     }
 
-    fn click(app: &mut App, wid: WindowId, light: Light) {
-        let (x, y) = px_of(app, wid, hit(app, wid, light));
+    fn click(app: &mut App, wid: WindowId, chip: impl Into<Chip>) {
+        let (x, y) = px_of(app, wid, hit(app, wid, chip));
         app.on_cursor_moved(wid, x, y);
         app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);
         app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
@@ -3153,17 +5076,17 @@ mod gesture_tests {
     /// selection is let go by the next key, and that Return is CLAUDE'S —
     /// never swallowed by a light off the glass. Control: at 30 columns a
     /// fresh chord selects nothing (and reaches Claude as no shift+tab), and
-    /// Return is Claude's again.
+    /// Return is Claude's again. WITH A HOST the walk takes in the harness's
+    /// two, but only what the row holds (`Keep`): at 40 columns Autopilot,
+    /// `⚙` and the light, round again; at 36 `⚙` is given up, and the walk
+    /// is Autopilot and the light; at 30 the light is given up too — and
+    /// `⚙` stays given up, never drawn again in a narrower rule — so the
+    /// walk is Autopilot alone; and once Escape lets go, the Return is
+    /// Claude's.
     #[cfg(target_os = "macos")]
     #[test]
     fn the_keyboard_never_selects_a_chip_the_pane_has_no_room_for() {
-        use winit::keyboard::{KeyCode, ModifiersState, NamedKey};
-        fn chord(app: &mut App, wid: WindowId) {
-            app.windows.get_mut(&wid).unwrap().mods =
-                ModifiersState::CONTROL | ModifiersState::SHIFT;
-            tap(app, wid, NamedKey::Tab, KeyCode::Tab, "\t");
-            app.windows.get_mut(&wid).unwrap().mods = ModifiersState::empty();
-        }
+        use winit::keyboard::{KeyCode, NamedKey};
         const ACCEPT_SHORT: &str = "  \u{23F5}\u{23F5} accept edits on";
         let (mut app, wid, session, mut reader) = app();
         publish_facts(&app, session);
@@ -3174,7 +5097,7 @@ mod gesture_tests {
         chord(&mut app, wid);
         assert_eq!(
             app.windows[&wid].claude_lights.selected,
-            Some((session, Light::Mode))
+            Some((session, MODE))
         );
         frame(&mut app, wid);
         let text = row_text(&app, wid, at_rest.0);
@@ -3207,6 +5130,785 @@ mod gesture_tests {
         );
         tap(&mut app, wid, NamedKey::Enter, KeyCode::Enter, "\r");
         assert_eq!(pty(&mut reader, 1), b"\r");
+
+        // With a host: the walk visits only the chips the row holds, each on
+        // the glass once selected.
+        let (mut app, wid, session, mut reader) = self::app();
+        let _host = host(&mut app);
+        publish_facts(&app, session);
+        for (cols, walk) in [
+            (
+                40_u16,
+                &[Chip::Autopilot, Chip::Settings, MODE, Chip::Autopilot][..],
+            ),
+            (36, &[Chip::Autopilot, MODE, Chip::Autopilot][..]),
+            (30, &[Chip::Autopilot, Chip::Autopilot][..]),
+        ] {
+            assert!(app.apply_term_resize(wid, 24, cols));
+            draw_claude_cols(&app, session, ACCEPT_SHORT, usize::from(cols));
+            frame(&mut app, wid);
+            for want in walk {
+                chord(&mut app, wid);
+                assert_eq!(
+                    app.windows[&wid].claude_lights.selected,
+                    Some((session, *want)),
+                    "{cols} columns"
+                );
+                frame(&mut app, wid);
+                assert!(painted(&app, wid, *want), "{cols}: {want:?} on the glass");
+            }
+            assert_eq!(painted(&app, wid, Chip::Settings), cols == 40, "{cols}");
+            assert_eq!(painted(&app, wid, MODE), cols != 30, "{cols}");
+            tap(&mut app, wid, NamedKey::Escape, KeyCode::Escape, "\u{1b}");
+            assert_eq!(app.windows[&wid].claude_lights.selected, None);
+        }
+        assert!(pty(&mut reader, 0).is_empty(), "the walk types nothing");
+        tap(&mut app, wid, NamedKey::Enter, KeyCode::Enter, "\r");
+        assert_eq!(pty(&mut reader, 1), b"\r", "the Return is Claude's");
+    }
+
+    /// The session's own Autopilot word and the posture it is read under.
+    fn autopilot(app: &App, session: u64) -> (Option<Autopilot>, AutopilotView) {
+        let (word, view, _) = app.session_autopilot(session);
+        (word, view)
+    }
+
+    /// How many person gestures reached `session` (`status human_seq=`).
+    fn human_seq(app: &App, session: u64) -> u64 {
+        app.pool
+            .get(session)
+            .expect("session")
+            .ctx
+            .human_input
+            .seq()
+    }
+
+    /// The footer's repaint key for the window's visible plan.
+    fn footer_fp(app: &App, wid: WindowId) -> u64 {
+        let plan = app.active_visible_leaf_plan(wid).expect("a visible plan");
+        app.claude_footer_fp(wid, &plan)
+    }
+
+    /// THE AUTOPILOT CHIP, CLICKED (design §2.3): cruise → land → off →
+    /// cruise, each click writing the session's own word in-process — the
+    /// word `meta set autopilot` writes — and the next frame's chip saying
+    /// it, read back (no `◐` left standing): `∞` in the footer's accent,
+    /// `⤓ land` amber, `○ off` dim — an Off session's chip drawn like any
+    /// other. A click sends NOTHING to the PTY — no key, and no mouse report
+    /// though the pane tracks the mouse — and is not a person's keystroke
+    /// (`status human_seq=` holds). The hover's title says what a click
+    /// does, and the footer's repaint key follows the word. CONTROL: the
+    /// light beside it, clicked, does press — the click was a click.
+    #[test]
+    fn a_click_on_autopilot_cycles_its_word_and_types_nothing() {
+        let (mut app, wid, session, mut reader) = wide_app();
+        let _host = host(&mut app);
+        publish_facts(&app, session);
+        draw_claude(&app, session, BYPASS);
+        feed(&app, session, b"\x1b[?1000h\x1b[?1006h");
+        frame(&mut app, wid);
+        let accent = crate::chrome_band::band_colors(app.theme).accent;
+        let dim = super::dim_of(app.windows[&wid].input_scratch.implicit_blank);
+        let human = human_seq(&app, session);
+        assert_eq!(
+            autopilot(&app, session),
+            (None, AutopilotView::Cruise),
+            "the table's default"
+        );
+        let chip = hit(&app, wid, Chip::Autopilot);
+        assert_eq!(
+            (cell_at(&app, wid, chip).ch, cell_at(&app, wid, chip).fg),
+            ('\u{221e}', accent)
+        );
+        let (x, y) = px_of(&app, wid, chip);
+        app.on_cursor_moved(wid, x, y);
+        frame(&mut app, wid);
+        let text = row_text(&app, wid, chip.0);
+        assert!(
+            text.contains("autopilot: cruise \u{2014} keeps the work moving \u{b7} click: land"),
+            "the hover's title: {text:?}"
+        );
+        for (want, face, ink) in [
+            (Autopilot::Land, "\u{2913} land", super::AMBER),
+            (Autopilot::Off, "\u{25cb} off", dim),
+            (Autopilot::Cruise, "\u{221e}", accent),
+        ] {
+            let before = footer_fp(&app, wid);
+            click(&mut app, wid, Chip::Autopilot);
+            assert_eq!(autopilot(&app, session).0, Some(want), "the word");
+            assert_ne!(footer_fp(&app, wid), before, "{want:?}: the click repaints");
+            frame(&mut app, wid);
+            let at = hit(&app, wid, Chip::Autopilot);
+            let text = row_text(&app, wid, at.0);
+            assert!(
+                text.contains(&format!("{face} \u{2699}")),
+                "{want:?}: {text:?}"
+            );
+            assert_eq!(cell_at(&app, wid, at).fg, ink, "{want:?}");
+            assert!(
+                app.windows[&wid].claude_lights.sessions[&session]
+                    .autopilot_pending
+                    .is_none(),
+                "{want:?}: read back"
+            );
+            let settled = footer_fp(&app, wid);
+            frame(&mut app, wid);
+            assert_eq!(footer_fp(&app, wid), settled, "{want:?}: still at rest");
+        }
+        assert!(
+            pty(&mut reader, 0).is_empty(),
+            "nothing to the PTY: no key, no mouse report"
+        );
+        assert_eq!(
+            human_seq(&app, session),
+            human,
+            "never a person's keystroke"
+        );
+        // Control: the light is a click away, and it presses.
+        redraw_mode_row(&app, session, PLAN);
+        frame(&mut app, wid);
+        click(&mut app, wid, Light::Mode);
+        assert_eq!(pty(&mut reader, 3), lights::SHIFT_TAB, "the light presses");
+    }
+
+    /// QUICK CLICKS COUNT: the window's own write reads back at once, so a
+    /// second click before any frame has drawn the first steps again — a
+    /// person clicking Cruise → Land → Off gets Off. FAILS when a click's
+    /// read-back waits for a frame (the second click was dropped while `◐`
+    /// stood, seen on a real aterm, 2026-10-15).
+    #[test]
+    fn two_quick_clicks_on_the_autopilot_chip_each_step() {
+        let (mut app, wid, session, mut reader) = app();
+        let _host = host(&mut app);
+        publish_facts(&app, session);
+        draw_claude(&app, session, BYPASS);
+        feed(&app, session, b"\x1b[?1000h\x1b[?1006h");
+        frame(&mut app, wid);
+        let human = human_seq(&app, session);
+        click(&mut app, wid, Chip::Autopilot);
+        click(&mut app, wid, Chip::Autopilot);
+        assert_eq!(
+            autopilot(&app, session),
+            (Some(Autopilot::Off), AutopilotView::Off),
+            "both clicks stepped"
+        );
+        assert!(
+            app.windows[&wid].claude_lights.sessions[&session]
+                .autopilot_pending
+                .is_none(),
+            "nothing in flight"
+        );
+        frame(&mut app, wid);
+        let at = hit(&app, wid, Chip::Autopilot);
+        assert!(
+            row_text(&app, wid, at.0).contains("\u{25cb} off \u{2699}"),
+            "the chip reads off"
+        );
+        assert!(pty(&mut reader, 0).is_empty(), "nothing to the PTY");
+        assert_eq!(
+            human_seq(&app, session),
+            human,
+            "never a person's keystroke"
+        );
+    }
+
+    /// THE GEAR (design §2.3): a click on `⚙` opens Settings ▸ Harness — a
+    /// Settings tab at `/harness`, in the window clicked — and sends nothing
+    /// to the PTY, writes no word and stamps no person.
+    #[test]
+    fn a_click_on_the_gear_opens_settings_harness() {
+        use crate::native_settings::SettingsRoute;
+        let (mut app, wid, session, mut reader) = app();
+        let _host = host(&mut app);
+        publish_facts(&app, session);
+        draw_claude(&app, session, BYPASS);
+        frame(&mut app, wid);
+        let human = human_seq(&app, session);
+        assert!(
+            app.native_settings_route_view_target(SettingsRoute::Harness)
+                .is_none()
+        );
+        click(&mut app, wid, Chip::Settings);
+        let (at, ..) = app
+            .native_settings_route_view_target(SettingsRoute::Harness)
+            .expect("Settings ▸ Harness is open");
+        assert_eq!(at, wid, "in the window clicked");
+        assert!(pty(&mut reader, 0).is_empty(), "nothing to the PTY");
+        assert_eq!(autopilot(&app, session).0, None, "no word written");
+        assert_eq!(human_seq(&app, session), human);
+    }
+
+    /// THE BLANK BETWEEN TWO CHIPS IS THEIRS (the review of 97e5ad4f2): in
+    /// `∞ ⚙ ⏸ plan` a click on the blank cell between two chips, in a pane
+    /// that tracks the mouse, sends NOTHING to the PTY — no press or release
+    /// report — writes no word, opens no Settings and toggles no light, and
+    /// the pointer there hovers no chip. CONTROL: the cell left of the first
+    /// chip is the pane's, and the same click there is the program's.
+    #[test]
+    fn a_click_between_two_chips_does_nothing_and_reaches_no_program() {
+        use crate::native_settings::SettingsRoute;
+        let (mut app, wid, session, mut reader) = app();
+        let _host = host(&mut app);
+        publish_facts(&app, session);
+        draw_claude(&app, session, PLAN);
+        feed(&app, session, b"\x1b[?1000h\x1b[?1006h");
+        frame(&mut app, wid);
+        let first = hit(&app, wid, Chip::Autopilot);
+        let gear = hit(&app, wid, Chip::Settings);
+        let light = hit(&app, wid, MODE);
+        assert_eq!(gear, (first.0, first.1 + 2), "`∞`, a blank, `⚙`");
+        assert_eq!(light, (gear.0, gear.1 + 2), "`⚙`, a blank, the light");
+        let press = |app: &mut App, cell: (usize, usize)| {
+            let (x, y) = px_of(app, wid, cell);
+            app.on_cursor_moved(wid, x, y);
+            app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);
+            app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
+        };
+        for gap in [(gear.0, gear.1 - 1), (light.0, light.1 - 1)] {
+            press(&mut app, gap);
+            assert_eq!(
+                app.windows[&wid].claude_lights.hover, None,
+                "{gap:?}: no chip hovered"
+            );
+            assert!(pty(&mut reader, 0).is_empty(), "{gap:?}: no mouse report");
+        }
+        assert_eq!(autopilot(&app, session).0, None, "no word written");
+        assert!(
+            app.native_settings_route_view_target(SettingsRoute::Harness)
+                .is_none(),
+            "no Settings opened"
+        );
+        assert!(
+            app.windows[&wid].claude_lights.sessions[&session]
+                .pending
+                .is_none(),
+            "no light toggled"
+        );
+        // Control: left of the chips, the pane's own cell.
+        press(&mut app, (first.0, first.1 - 1));
+        assert!(
+            pty(&mut reader, 1).starts_with(b"\x1b[<0;"),
+            "the pane's cell is the program's"
+        );
+    }
+
+    /// THE HAND ONLY WHERE A PRESS ACTS (the review of 2026-10-15): over a
+    /// chip the pointer is a hand; over the blank between two — the chips'
+    /// own glass, where a press does nothing — the arrow, never the hand
+    /// that promised a click, nor the grid's I-beam; on the motion path and
+    /// on the re-resolve a modifier asks for (`App::update_hover_cursor`)
+    /// alike. CONTROL: the pane's own cell beside the chips is the grid's,
+    /// an I-beam.
+    #[test]
+    fn the_pointer_is_a_hand_over_a_chip_and_the_arrow_between_two() {
+        let (mut app, wid, session, mut reader) = app();
+        let _host = host(&mut app);
+        publish_facts(&app, session);
+        draw_claude(&app, session, PLAN);
+        frame(&mut app, wid);
+        let first = hit(&app, wid, Chip::Autopilot);
+        let gear = hit(&app, wid, Chip::Settings);
+        let gap = (gear.0, gear.1 - 1);
+        let pane = (first.0, first.1 - 1);
+        // (a hand, an I-beam), as the window's cursor state says them.
+        let cursor = |app: &App| {
+            let ws = &app.windows[&wid];
+            (ws.hover_pointer, ws.native_text_cursor)
+        };
+        let (hand, arrow, beam) = ((true, false), (false, false), (false, true));
+        for (cell, want, what) in [
+            (pane, beam, "control: the pane's cell"),
+            (gear, hand, "the gear"),
+            (gap, arrow, "the blank"),
+            (first, hand, "Autopilot"),
+            (gap, arrow, "the blank again"),
+            (pane, beam, "control: the pane's cell again"),
+        ] {
+            let (x, y) = px_of(&app, wid, cell);
+            app.on_cursor_moved(wid, x, y);
+            assert_eq!(cursor(&app), want, "{what}: on motion");
+            app.update_hover_cursor(wid);
+            assert_eq!(cursor(&app), want, "{what}: re-resolved");
+        }
+        assert!(pty(&mut reader, 0).is_empty(), "the motion types nothing");
+    }
+
+    /// EVERY BUTTON ON THE CHIPS' GLASS IS THEIRS (the review of 2026-10-15):
+    /// a middle or a right press on a chip, or on the blank between two,
+    /// reaches no program — in a pane that tracks the mouse no press or
+    /// release report, and under `right_click = "copy_paste"` with nothing
+    /// tracking no paste — and acts on no chip: a left press is the chips'
+    /// click. CONTROL: the same presses on the pane's own cell beside the
+    /// chips are the program's — each reported, and the right one pasted.
+    #[test]
+    fn a_middle_or_right_press_on_the_chips_reaches_no_program() {
+        use crate::native_settings::SettingsRoute;
+        let (mut app, wid, session, mut reader) = app();
+        let _host = host(&mut app);
+        publish_facts(&app, session);
+        draw_claude(&app, session, PLAN);
+        feed(&app, session, b"\x1b[?1000h\x1b[?1006h");
+        frame(&mut app, wid);
+        let first = hit(&app, wid, Chip::Autopilot);
+        let gear = hit(&app, wid, Chip::Settings);
+        let chips = [first, gear, (gear.0, gear.1 - 1), hit(&app, wid, MODE)];
+        let pane = (first.0, first.1 - 1);
+        let press = |app: &mut App, cell: (usize, usize), button: MouseButton| {
+            let (x, y) = px_of(app, wid, cell);
+            app.on_cursor_moved(wid, x, y);
+            app.on_mouse_input(wid, ElementState::Pressed, button);
+            app.on_mouse_input(wid, ElementState::Released, button);
+        };
+        for (button, code) in [(MouseButton::Middle, "1"), (MouseButton::Right, "2")] {
+            for cell in chips {
+                press(&mut app, cell, button);
+                assert!(
+                    pty(&mut reader, 0).is_empty(),
+                    "{button:?} {cell:?}: no report"
+                );
+            }
+            // Control: the pane's own cell reports the press.
+            press(&mut app, pane, button);
+            let got = String::from_utf8_lossy(&pty(&mut reader, 1)).into_owned();
+            assert!(
+                got.starts_with(&format!("\x1b[<{code};")),
+                "control: {button:?} on the pane's cell is the program's: {got:?}"
+            );
+        }
+        // Nothing tracking, right-click copy/paste: no paste from the chips.
+        feed(&app, session, b"\x1b[?1000l\x1b[?1006l");
+        app.config.right_click = Some("copy_paste".to_owned());
+        crate::control::PBPASTE_STUB.with(|board| *board.borrow_mut() = Some("PROBE-CLIP".into()));
+        for cell in chips {
+            press(&mut app, cell, MouseButton::Right);
+            assert!(pty(&mut reader, 0).is_empty(), "{cell:?}: no paste");
+        }
+        press(&mut app, pane, MouseButton::Right);
+        let got = String::from_utf8_lossy(&pty(&mut reader, "PROBE-CLIP".len())).into_owned();
+        crate::control::PBPASTE_STUB.with(|board| *board.borrow_mut() = None);
+        assert!(
+            got.contains("PROBE-CLIP"),
+            "control: the pane's cell pastes: {got:?}"
+        );
+        assert_eq!(autopilot(&app, session).0, None, "no word written");
+        assert!(
+            app.native_settings_route_view_target(SettingsRoute::Harness)
+                .is_none(),
+            "no Settings opened"
+        );
+        assert!(
+            app.windows[&wid].claude_lights.sessions[&session]
+                .pending
+                .is_none(),
+            "no light toggled"
+        );
+    }
+
+    /// A CLICK ON THE CHIPS IS A CLICK AWAY FROM AN OPEN RENAME (the review
+    /// of 2026-10-15): with the in-grid strip's rename field open on
+    /// Claude's tab and a name typed into it, a click on `⚙` commits the name
+    /// — as View ▸ Coding Agent Harness… and a click on the grid do — before
+    /// Settings ▸ Harness comes to the front, so the keys meant for the page
+    /// never land in the tab's name. So does a click on Autopilot, which
+    /// still steps its word, and one on the blank between two chips.
+    /// NEGATIVE CONTROL: Settings ▸ Harness brought to the front by no click
+    /// — a tab switch, which settles nothing by design — leaves the field
+    /// open, taking keys.
+    #[test]
+    fn a_click_on_the_chips_commits_an_open_in_grid_rename() {
+        use crate::app_rename::RenameSurface;
+        use crate::app_search::SearchEdit;
+        use crate::native_settings::SettingsRoute;
+        use crate::session_timeline::MetaField;
+        let (mut app, wid, session, mut reader) = app();
+        let _host = host(&mut app);
+        app.tab_strip_rows = 1;
+        publish_facts(&app, session);
+        draw_claude(&app, session, PLAN);
+        frame(&mut app, wid);
+        let tab = app.windows[&wid].tab_set.active_id().expect("Claude's tab");
+        let pinned = |app: &App| {
+            app.pool
+                .get(session)
+                .expect("session")
+                .ctx
+                .meta
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .presentation_value(MetaField::Title.wire_name())
+        };
+        let rename = |app: &mut App, name: &str| {
+            assert!(app.begin_session_rename(wid, tab), "the field opens");
+            assert_eq!(
+                app.inline_rename_edit(wid).map(|edit| edit.surface),
+                Some(RenameSurface::InGrid)
+            );
+            // The field is seeded with the pin, the caret at its end.
+            assert!(app.rename_field_edit(wid, SearchEdit::KillToStart));
+            assert!(app.rename_field_edit(wid, SearchEdit::Insert(name.to_owned())));
+        };
+        // Negative control: the page brought to the front by no click.
+        rename(&mut app, "left open");
+        assert!(app.open_harness_settings(wid));
+        assert!(
+            app.inline_rename_edit(wid).is_some(),
+            "control: a tab switch settles nothing"
+        );
+        app.end_session_rename_editor(wid);
+        assert_eq!(pinned(&app), None, "control: nothing committed");
+        app.switch_tab_in(wid, 0);
+        frame(&mut app, wid);
+        // The gear.
+        rename(&mut app, "gear");
+        click(&mut app, wid, Chip::Settings);
+        assert!(app.inline_rename_edit(wid).is_none(), "the gear: closed");
+        assert_eq!(pinned(&app).as_deref(), Some("gear"), "and committed");
+        let (at, ..) = app
+            .native_settings_route_view_target(SettingsRoute::Harness)
+            .expect("Settings ▸ Harness is open");
+        assert_eq!(at, wid);
+        app.switch_tab_in(wid, 0);
+        frame(&mut app, wid);
+        // Autopilot.
+        rename(&mut app, "autopilot");
+        click(&mut app, wid, Chip::Autopilot);
+        assert!(app.inline_rename_edit(wid).is_none(), "Autopilot: closed");
+        assert_eq!(pinned(&app).as_deref(), Some("autopilot"));
+        assert_eq!(
+            autopilot(&app, session).0,
+            Some(Autopilot::Land),
+            "the click still steps the word"
+        );
+        frame(&mut app, wid);
+        // The blank between two.
+        rename(&mut app, "gap");
+        let gear = hit(&app, wid, Chip::Settings);
+        let (x, y) = px_of(&app, wid, (gear.0, gear.1 - 1));
+        app.on_cursor_moved(wid, x, y);
+        app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);
+        app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
+        assert!(app.inline_rename_edit(wid).is_none(), "the blank: closed");
+        assert_eq!(pinned(&app).as_deref(), Some("gap"));
+        assert!(
+            pty(&mut reader, 0).is_empty(),
+            "nothing reached the program"
+        );
+    }
+
+    /// THE MASTER SWITCH OFF (`[harness] enabled = false`, design §2.1): the
+    /// chip says `⊘ off`, dim, titled with where it is switched, and a click
+    /// opens Settings ▸ Harness instead of cycling — no word is written (a
+    /// session ON never lifts a global off), nothing reaches the PTY. The
+    /// gear stays beside it. NEGATIVE CONTROL: with the switch on again the
+    /// same click writes the word.
+    #[test]
+    fn under_the_master_switch_off_the_autopilot_chip_opens_settings() {
+        use crate::native_settings::SettingsRoute;
+        let (mut app, wid, session, mut reader) = wide_app();
+        let _host = host(&mut app);
+        let policy = |text: &str| {
+            crate::harness_policy_cell::HarnessPolicyCell::new(
+                crate::app_config::HarnessPolicy::read(text),
+            )
+        };
+        app.harness_policy = policy("[harness]\nenabled = false\n");
+        publish_facts(&app, session);
+        draw_claude(&app, session, BYPASS);
+        frame(&mut app, wid);
+        let dim = super::dim_of(app.windows[&wid].input_scratch.implicit_blank);
+        let chip = hit(&app, wid, Chip::Autopilot);
+        assert_eq!(
+            (cell_at(&app, wid, chip).ch, cell_at(&app, wid, chip).fg),
+            ('\u{2298}', dim)
+        );
+        let (x, y) = px_of(&app, wid, chip);
+        app.on_cursor_moved(wid, x, y);
+        frame(&mut app, wid);
+        let text = row_text(&app, wid, chip.0);
+        assert!(
+            text.contains("\u{2298} off \u{2699}")
+                && text.contains(
+                    "harness off in Settings \u{b7} click: open Settings \u{25b8} Harness"
+                ),
+            "{text:?}"
+        );
+        click(&mut app, wid, Chip::Autopilot);
+        assert!(
+            app.native_settings_route_view_target(SettingsRoute::Harness)
+                .is_some(),
+            "Settings ▸ Harness is open"
+        );
+        assert_eq!(
+            autopilot(&app, session),
+            (None, AutopilotView::MasterOff),
+            "nothing written"
+        );
+        assert!(pty(&mut reader, 0).is_empty());
+        // Negative control: the switch on, the same click — the press path,
+        // back on Claude's tab — cycles, and opens nothing.
+        app.harness_policy = policy("[harness]\n");
+        app.switch_tab_in(wid, 0);
+        frame(&mut app, wid);
+        let tabs = app.windows[&wid].tab_set.len();
+        click(&mut app, wid, Chip::Autopilot);
+        assert_eq!(
+            autopilot(&app, session),
+            (Some(Autopilot::Land), AutopilotView::Land),
+            "the click wrote the word"
+        );
+        assert_eq!(app.windows[&wid].tab_set.len(), tabs, "no tab opened");
+        assert_eq!(
+            app.focused_session_id(wid),
+            Some(session),
+            "Claude's tab stays in front"
+        );
+        assert!(pty(&mut reader, 0).is_empty());
+    }
+
+    /// AN OFF SESSION STILL SAYS SO (design §2.3): Off is the harness's
+    /// hands off, not its chip gone — `○ off`, dim, drawn at rest whether
+    /// the session's own word says it or the table's default does
+    /// (`[harness] autopilot = "off"`), the gear beside it.
+    #[test]
+    fn an_off_session_still_draws_its_chip() {
+        for own in [true, false] {
+            let (mut app, wid, session, _reader) = app();
+            let _host = host(&mut app);
+            if own {
+                assert!(app.set_session_autopilot(session, Some(Autopilot::Off)));
+            } else {
+                app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
+                    crate::app_config::HarnessPolicy::read("[harness]\nautopilot = \"off\"\n"),
+                );
+            }
+            assert_eq!(autopilot(&app, session).1, AutopilotView::Off);
+            publish_facts(&app, session);
+            draw_claude(&app, session, BYPASS);
+            frame(&mut app, wid);
+            let chip = hit(&app, wid, Chip::Autopilot);
+            let text = row_text(&app, wid, chip.0);
+            assert!(
+                text.contains("\u{25cb} off \u{2699}"),
+                "own={own}: {text:?}"
+            );
+            assert_eq!(
+                cell_at(&app, wid, chip).fg,
+                super::dim_of(app.windows[&wid].input_scratch.implicit_blank),
+                "own={own}: dim"
+            );
+        }
+    }
+
+    /// A NARROW RULE GIVES THE CHIPS UP BEFORE THE MODEL (design §2.3: "a
+    /// narrow rule gives them up after every fact but the model"; no row is
+    /// added): narrowing the pane column by column from 80, the path and
+    /// the branch go while every chip stays — no width shows either without
+    /// them — and the chips then go down the ladder (`Keep`), never back up
+    /// it while the model is drawn, the model still drawn where no chip is.
+    /// With no pill under the composer (default mode) the harness's two
+    /// alone: `⚙` goes, then Autopilot. Under a pill the light, a deviation,
+    /// joins them: `⚙` goes, then the light, Autopilot last — a pill too
+    /// wide for the rule never takes the mark that says the session is
+    /// wrapped. And while a chip stands NOTHING COMES BACK: no fact either —
+    /// the effort, the path, the branch — once a wider rule gave it up, for
+    /// the room a given-up chip leaves stays the rule's (`Block::holds`; the
+    /// review of 2026-10-15: under accept edits the light's 15 cells, given
+    /// up at 35 columns, brought the effort and the path back beside `∞`
+    /// alone). Claude's composer keeps its rows throughout: the chips take
+    /// the rule's cells, never a row.
+    #[test]
+    fn a_narrow_rule_gives_the_chips_up_before_the_model() {
+        /// What the rule showed at one width.
+        #[derive(Debug)]
+        struct Seen {
+            cols: u16,
+            /// The model's fact.
+            model: bool,
+            /// The path's or the branch's.
+            rest: bool,
+            /// The effort's, the path's and the branch's.
+            facts: [bool; 3],
+            /// Autopilot's chip, the gear's and the light's.
+            chips: (bool, bool, bool),
+            text: String,
+        }
+        /// The chips a narrowing rule draws, rung by rung (`Keep::LADDER`
+        /// past the reveal), the light where a pill shows: every chip, the
+        /// gear given up, then the light, then Autopilot.
+        const LADDER: [(bool, bool, bool); 4] = [
+            (true, true, true),
+            (true, false, true),
+            (true, false, false),
+            (false, false, false),
+        ];
+        // Pills short enough not to wrap, each scanned only where it fits.
+        const PLAN_SHORT: &str = "  \u{23F8} plan mode on";
+        const ACCEPT_SHORT: &str = "  \u{23F5}\u{23F5} accept edits on";
+        for pill in [None, Some(PLAN_SHORT), Some(ACCEPT_SHORT)] {
+            let (mut app, wid, session, _reader) = app();
+            let _host = host(&mut app);
+            publish_facts(&app, session);
+            let narrowest = pill.map_or(18, |p| p.chars().count().max(18));
+            let mut seen = Vec::new();
+            for cols in (u16::try_from(narrowest).unwrap()..=80).rev() {
+                if cols != 80 {
+                    assert!(app.apply_term_resize(wid, 24, cols));
+                }
+                let rule = "\u{2500}".repeat(usize::from(cols));
+                let pill_row = pill.map_or(String::new(), |p| format!("\x1b[24;1H{p}"));
+                feed(
+                    &app,
+                    session,
+                    format!(
+                        "\x1b[2J\x1b[19;1H\u{25CF} done\x1b[21;1H{rule}\x1b[22;1H\u{276F} \
+                         \x1b[23;1H{rule}{pill_row}\x1b[22;3H"
+                    )
+                    .as_bytes(),
+                );
+                frame(&mut app, wid);
+                let text = row_text(&app, wid, footer_row(&app, wid));
+                let model = text.contains("\u{25C6} Opus 5.5");
+                let facts = ["xhigh", "\u{2302}", "\u{2387}"].map(|fact| text.contains(fact));
+                let rest = facts[1] || facts[2];
+                let chips = (
+                    painted(&app, wid, Chip::Autopilot),
+                    painted(&app, wid, Chip::Settings),
+                    painted(&app, wid, MODE),
+                );
+                if rest {
+                    assert_eq!(
+                        chips,
+                        (true, true, pill.is_some()),
+                        "{pill:?} {cols}: a fact outlived a chip: {text:?}"
+                    );
+                }
+                seen.push(Seen {
+                    cols,
+                    model,
+                    rest,
+                    facts,
+                    chips,
+                    text,
+                });
+            }
+            let widest = &seen[0];
+            assert!(
+                widest.cols == 80
+                    && widest.model
+                    && widest.facts == [true; 3]
+                    && widest.chips == (true, true, pill.is_some()),
+                "{pill:?} 80: everything: {:?}",
+                widest.text
+            );
+            // With no chip left the rule is the facts' alone, their own
+            // ladder's (`footer::fit_rule`): the scan's last widths.
+            let chipped: Vec<&Seen> = seen
+                .iter()
+                .filter(|s| s.chips != (false, false, false))
+                .collect();
+            for (fact, name) in ["the effort", "the path", "the branch"].iter().enumerate() {
+                assert!(
+                    chipped
+                        .windows(2)
+                        .all(|pair| pair[0].facts[fact] || !pair[1].facts[fact]),
+                    "{pill:?}: {name} came back beside the chips: {seen:#?}"
+                );
+                assert!(
+                    chipped.iter().any(|s| s.model && !s.facts[fact]),
+                    "{pill:?}: control, {name} given up beside the chips: {seen:#?}"
+                );
+            }
+            let rungs: Vec<usize> = seen
+                .iter()
+                .filter(|s| s.model)
+                .map(|s| {
+                    LADDER
+                        .iter()
+                        .position(|&(autopilot, gear, light)| {
+                            (autopilot, gear, light && pill.is_some()) == s.chips
+                        })
+                        .unwrap_or_else(|| panic!("{pill:?}: off the ladder: {s:?}"))
+                })
+                .collect();
+            assert!(
+                rungs.windows(2).all(|pair| pair[0] <= pair[1]),
+                "{pill:?}: never back up the ladder: {seen:#?}"
+            );
+            let shows =
+                |chips: (bool, bool, bool)| seen.iter().any(|s| s.model && s.chips == chips);
+            assert!(
+                seen.iter()
+                    .any(|s| s.model && !s.rest && s.chips == widest.chips),
+                "{pill:?}: every chip beside the model alone: {seen:#?}"
+            );
+            if pill.is_some() {
+                assert!(
+                    shows((true, false, true)),
+                    "{pill:?}: the gear first: {seen:#?}"
+                );
+            }
+            assert!(
+                shows((true, false, false)),
+                "{pill:?}: the gear given up, then the light: {seen:#?}"
+            );
+            if pill.is_none() {
+                assert!(
+                    shows((false, false, false)),
+                    "the chips given up, the model kept: {seen:#?}"
+                );
+            }
+        }
+    }
+
+    /// RETURN ACTS ON A SELECTED HARNESS CHIP (macOS): `ctrl+shift+tab`
+    /// selects Autopilot, and Return steps its word — cruise to land — with
+    /// NOTHING sent to the PTY (the Return is the chip's, not Claude's) and
+    /// no person stamped; the selection lets go. CONTROL: with nothing
+    /// selected, Return is Claude's again. Space on a selected `⚙` opens
+    /// Settings ▸ Harness, and is not Claude's either.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn return_on_a_selected_autopilot_chip_cycles_it() {
+        use winit::keyboard::{KeyCode, NamedKey};
+        let (mut app, wid, session, mut reader) = app();
+        let _host = host(&mut app);
+        publish_facts(&app, session);
+        draw_claude(&app, session, BYPASS);
+        frame(&mut app, wid);
+        let human = human_seq(&app, session);
+        chord(&mut app, wid);
+        assert_eq!(
+            app.windows[&wid].claude_lights.selected,
+            Some((session, Chip::Autopilot))
+        );
+        frame(&mut app, wid);
+        tap(&mut app, wid, NamedKey::Enter, KeyCode::Enter, "\r");
+        assert_eq!(autopilot(&app, session).0, Some(Autopilot::Land));
+        assert!(pty(&mut reader, 0).is_empty(), "the Return is the chip's");
+        assert_eq!(app.windows[&wid].claude_lights.selected, None);
+        frame(&mut app, wid);
+        let text = row_text(&app, wid, footer_row(&app, wid));
+        assert!(text.contains("\u{2913} land \u{2699}"), "{text:?}");
+        assert_eq!(human_seq(&app, session), human, "no person stamped");
+        // Control: nothing selected, the Return is Claude's.
+        tap(&mut app, wid, NamedKey::Enter, KeyCode::Enter, "\r");
+        assert_eq!(pty(&mut reader, 1), b"\r");
+        // Space on the gear.
+        chord(&mut app, wid);
+        frame(&mut app, wid);
+        chord(&mut app, wid);
+        assert_eq!(
+            app.windows[&wid].claude_lights.selected,
+            Some((session, Chip::Settings))
+        );
+        frame(&mut app, wid);
+        tap(&mut app, wid, NamedKey::Space, KeyCode::Space, " ");
+        assert!(
+            app.native_settings_route_view_target(crate::native_settings::SettingsRoute::Harness)
+                .is_some(),
+            "Settings \u{25b8} Harness is open"
+        );
+        assert!(pty(&mut reader, 0).is_empty(), "the Space is the chip's");
     }
 
     // The mode-return machine's actions that are not aterm's: Claude's own
@@ -3270,3 +5972,7 @@ mod gesture_tests {
     )]
     fn mode_return_environment_waivers() {}
 }
+
+#[cfg(test)]
+#[path = "claude_lights_face_tests.rs"]
+mod face_tests;

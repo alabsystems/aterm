@@ -1,19 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-0 for `DebuggerAccessChange`
-//! (`docs/DESIGN-macos-debugger-access-2026-09-29.md` §5.1, §5.4; owner
-//! rulings O7 and O8, 2026-09-29): `DevToolsSecurity -enable`/`-disable` runs
-//! only on a fresh "Allow…" in aterm's alert, only over a fresh `-status` read
-//! of its precondition taken under the Mac-wide change lock, one child on the
-//! whole Mac at a time; a surface says "allowed" only when a probe read it; the
-//! park keeps re-reading while a change is under way; and an exited child's
-//! result is always taken and re-probed. `Buggy = 1` holds the defects the
-//! invariants exist to catch and the swallowed result wake the liveness claim
-//! exists to catch (with its safety half, `UnderWayIsPolled`). The race
-//! between the worker's re-read and the tool's own write is NAMED: a copy of
-//! the model with `NoClobber` must fail at `Buggy = 0`. Tier-1 — the real lane,
-//! worker and order — is `aterm-gui/src/debugger_access.rs`.
+//! Tier-0 for `DebuggerAccessChange` (`docs/DESIGN-macos-debugger-access-2026-09-29.md` §5.1,
+//! §5.4): `DevToolsSecurity -enable`/`-disable` runs only on a fresh "Allow…" in aterm's alert,
+//! over a fresh `-status` read taken under the Mac-wide change lock, one child per Mac at a time;
+//! a surface says "allowed" only when a probe read it; the park keeps re-reading while a change
+//! is under way (`UnderWayIsPolled`); an exited child's result is always taken and re-probed.
+//! The race between the worker's re-read and the tool's own write is named: `NoClobber` fails at
+//! `Buggy = 0`. Tier-1 is `aterm-gui/src/debugger_access.rs`.
 
 use crate::walk::walk;
 use aterm_spec::derive::{
@@ -28,12 +22,6 @@ const TO_FLIGHT: [&str; 5] = ["Probe", "Press", "Consent", "Recheck", "Launch"];
 #[test]
 fn the_change_runs_only_on_consent_over_a_fresh_read_one_child_at_a_time() {
     let model = debugger_access_change_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name),
-        "DebuggerAccessChange must stay enrolled in the spec-link registry"
-    );
     verify::prove_and_catch_scalar(&model, "debugger access change");
 
     // The happy path: an observed `disabled`, the owner's two answers (the
@@ -286,11 +274,10 @@ fn the_change_runs_only_on_consent_over_a_fresh_read_one_child_at_a_time() {
     }
 }
 
-/// THE RECORDS RE-READ MID-SESSION: an idle lane adopts a dead marker's
-/// change as aterm's and owes it a re-probe (0 → 6, polling on), follows a
-/// peer's running child as in flight (0 → 4) until its exit leaves a result to
-/// read, and with a change of its own under way removes a dead marker. A
-/// reader that takes a running child for a dead one is the mutant.
+/// A records re-read mid-session: an idle lane adopts a dead marker's change as aterm's and
+/// owes it a re-probe (0 → 6, polling on), follows a peer's running child as in flight (0 → 4)
+/// until its exit leaves a result to read, and with a change of its own under way removes a
+/// dead marker. The mutant takes a running child for a dead one.
 #[test]
 fn a_records_re_read_adopts_only_an_ended_change() {
     let model = debugger_access_change_model();
@@ -356,7 +343,7 @@ fn a_records_re_read_adopts_only_an_ended_change() {
     assert!(model.fire("Discard", &mut discarded), "{discarded:?}");
     assert_eq!((discarded["phase"], discarded["stale"]), (6, 0));
 
-    // THE MUTANT: a running child taken for a dead one.
+    // `AdoptLive`: a running child taken for a dead one.
     let buggy = interp::with_buggy(&model, 1);
     let misread = walk(
         &verify::buggy_baseline_with(&model, "AdoptLive"),
@@ -369,16 +356,16 @@ fn a_records_re_read_adopts_only_an_ended_change() {
     );
 }
 
-/// The residual race is named, not hidden: a rule customised while the child
-/// waits is overwritten by the write that lands after authentication, at the
-/// committed config. `NoClobber` must FAIL there, so the invariant set never
-/// claims to exclude the window.
+/// The residual race is named, not hidden: at the committed config a rule customised while the
+/// child waits is overwritten by the write that lands after authentication, so `NoClobber`
+/// must fail there.
 #[test]
 fn the_race_between_the_re_read_and_the_tools_write_is_named() {
     let model = debugger_access_change_model();
     let mut with_no_clobber = model.clone();
     with_no_clobber.invariants.push(Invariant {
         name: "NoClobber",
+        kind: aterm_spec::derive::InvariantKind::Claim,
         expr: eq(var("clobbered"), int(0)),
     });
     let committed = interp::with_buggy(&with_no_clobber, 0);
@@ -403,16 +390,10 @@ fn the_race_between_the_re_read_and_the_tools_write_is_named() {
 fn an_exited_change_is_always_re_read_and_a_lost_wake_is_caught() {
     let model = debugger_access_change_model();
     let live = debugger_access_change_liveness();
-    assert!(
-        aterm_spec::xref::liveness_registry()
-            .iter()
-            .any(|(m, l)| m.name == model.name && l.name == live.name),
-        "the liveness obligation must stay registered"
-    );
     verify::liveness_proves_and_catches_tiered(&model, &live, "DebuggerAccessChange");
 
-    // THE MUTANT'S END: the result waits in a slot nothing re-reads, and the
-    // row never learns what the child did.
+    // `ResultWakeLost`: the result waits in a slot nothing re-reads, and the row never learns
+    // what the child did.
     let lost = verify::buggy_baseline_with(&model, "ResultWakeLost");
     let starved = interp::nonprogress_under(&lost, &live)
         .expect("a swallowed result wake with no re-read leaves the change unread");

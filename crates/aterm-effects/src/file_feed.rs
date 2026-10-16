@@ -16,14 +16,14 @@ use std::path::Path;
 
 use aterm_hash::Fnv1a64;
 
-#[cfg(feature = "test-open-probe")]
+#[cfg(debug_assertions)]
 #[derive(Clone)]
 struct OpenProbeState {
     path: std::path::PathBuf,
     attempts: std::rc::Rc<std::cell::Cell<usize>>,
 }
 
-#[cfg(feature = "test-open-probe")]
+#[cfg(debug_assertions)]
 thread_local! {
     static OPEN_PROBE: std::cell::RefCell<Option<OpenProbeState>> =
         const { std::cell::RefCell::new(None) };
@@ -32,14 +32,14 @@ thread_local! {
 /// Test-only RAII observation of actual open attempts for one exact absolute
 /// path. Thread-local scope prevents parallel test cases from contaminating
 /// one another; `Rc` deliberately keeps the guard on its installing thread.
-#[cfg(feature = "test-open-probe")]
+#[cfg(debug_assertions)]
 #[doc(hidden)]
 pub struct OpenProbeGuard {
     previous: Option<OpenProbeState>,
     attempts: std::rc::Rc<std::cell::Cell<usize>>,
 }
 
-#[cfg(feature = "test-open-probe")]
+#[cfg(debug_assertions)]
 impl OpenProbeGuard {
     #[must_use]
     pub fn attempts(&self) -> usize {
@@ -47,7 +47,7 @@ impl OpenProbeGuard {
     }
 }
 
-#[cfg(feature = "test-open-probe")]
+#[cfg(debug_assertions)]
 impl Drop for OpenProbeGuard {
     fn drop(&mut self) {
         let previous = self.previous.take();
@@ -58,7 +58,7 @@ impl Drop for OpenProbeGuard {
 }
 
 /// Install a test-only counter at the platform `open` seam for `path`.
-#[cfg(feature = "test-open-probe")]
+#[cfg(debug_assertions)]
 #[doc(hidden)]
 #[must_use]
 pub fn probe_open_attempts(path: &Path) -> OpenProbeGuard {
@@ -77,9 +77,9 @@ pub fn probe_open_attempts(path: &Path) -> OpenProbeGuard {
 
 #[inline]
 fn note_open_attempt(path: &Path) {
-    #[cfg(not(feature = "test-open-probe"))]
+    #[cfg(not(debug_assertions))]
     let _ = path;
-    #[cfg(feature = "test-open-probe")]
+    #[cfg(debug_assertions)]
     OPEN_PROBE.with(|probe| {
         if let Some(probe) = probe.borrow().as_ref()
             && probe.path == path

@@ -1,40 +1,22 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The signature anchor: detached Ed25519 verification over the **exact raw bytes**
-//! of a manifest asset, with verification enforced *before any parse* by
-//! construction.
+//! Detached Ed25519 verification over the exact raw bytes of a manifest asset, enforced
+//! before any parse by construction.
 //!
 //! # Raw bytes, verified before parse
 //!
-//! Ed25519 verifies over the exact asset bytes as downloaded — no lossy UTF-8
-//! conversion, no re-serialization, no newline/BOM/whitespace normalization, no
-//! "canonical TOML" (TOML has no canonical form; re-serializing would open a
-//! parser-differential gap). The verifier reads the raw asset into a `Vec<u8>`,
-//! verifies the detached signature over *those* bytes, and only on success hands the
-//! *same* bytes — wrapped in a [`VerifiedBytes`] — to the parser. The TOML parser is
-//! itself attack surface and must never touch unverified input; the reused
-//! `String::from_utf8_lossy` step (which substitutes U+FFFD and so changes the bytes)
-//! is therefore **never** used on the signed path.
+//! The signature covers the asset bytes as downloaded: no lossy UTF-8 conversion, no
+//! re-serialization, no newline/BOM/whitespace normalization (TOML has no canonical form,
+//! and re-serializing would open a parser-differential gap). Only on success are the same
+//! bytes handed to the parser, as [`VerifiedBytes`], which only a verify can mint: the TOML
+//! parser is attack surface and never sees unverified input.
 //!
-//! **Enforced by construction.** [`VerifiedBytes`] has a private field and no public
-//! constructor: the only way to mint one is through [`TrustedRoster::authorize_bytes`]
-//! (and the two wrappers over it, [`TrustedRoster::authorize_index`] and
-//! [`TrustedIndex::verify_pkg`]), every one of which runs the signature check first. The
-//! post-verify parse entry points ([`crate::manifest::parse_index`] /
-//! [`crate::manifest::parse_pkg`]) consume `&VerifiedBytes`, so calling them on unverified
-//! bytes does not even type-check. A runtime test in `crate::manifest` additionally proves
-//! the parser never runs after a failed verification.
+//! # One root: the paper master's roster
 //!
-//! # ONE ROOT: the paper master's roster authorizes atpkg too
-//!
-//! There used to be a SECOND trust root here — a `PKG_ROOT_PUBKEY` living in
-//! `~/.config/atpkg/root.key` that signed `index.toml`, which in turn delegated a
-//! rotatable release key to sign each `pkg-*.toml`. It is gone. atpkg's index is now
-//! authorized by the SAME master-signed machine roster that authorizes an aterm release
-//! (`aterm_update_core::roster`): one thing written on paper, one revocation story.
-//!
-//! The chain, in the order it runs:
+//! atpkg's index is authorized by the same master-signed machine roster that authorizes an
+//! aterm release (`aterm_update_core::roster`): one thing written on paper, one revocation
+//! story.
 //!
 //! ```text
 //!   PAPER MASTER  --signs-->  aterm-machines.toml  --names-->  m3, m11, …
@@ -43,50 +25,40 @@
 //!                                          m3 --signs--> pkg-<program>-<build>.toml
 //! ```
 //!
-//! Why MACHINE-signed rather than master-signed: the whole custody argument is that the
-//! master exists on no computer and is typed in only to mint or revoke. An index re-cut
-//! every time a pin moves would put the paper phrase on the publishing laptop on every
-//! publish, which is the property that made the retired "offline root" worthless. The
-//! cost is one extra indirection and one extra fetched pair per candidate — paid for by
-//! revocation that takes minutes (bump the roster) instead of an index re-publish.
+//! Machine-signed rather than master-signed because the master exists on no computer and is
+//! typed in only to mint or revoke; an index re-cut whenever a pin moves would put the paper
+//! phrase on the publishing laptop at every publish. Revocation takes a roster bump.
 //!
-//! # Empty means unpinned means INERT — and inert installs NOTHING
+//! # Empty means unpinned means inert
 //!
-//! An empty [`Anchor`] — the fail-closed state a fork starts from, and what shipped
-//! before v0.21.0; THIS build is ARMED, `pins::PAPER_MASTER_PUBKEYS` carrying one
-//! master key since 2026-08-15 (pinned by
-//! `this_build_ships_armed_and_the_pinned_anchor_is_live`) — authorizes no machine at
-//! all: [`admit_roster`] returns [`Reject::Disabled`]
-//! before any crypto, [`crate::select_index`] returns `None`, and every install path
-//! ends in `FlowError::NoIndex`. It never means "accept anything". This is the single
-//! most dangerous property in the module and it is asserted from both directions in the
-//! tests below.
+//! An empty [`Anchor`] (a fork's fail-closed starting point; this build is armed)
+//! authorizes no machine: [`admit_roster`] returns [`Reject::Disabled`] before any crypto,
+//! [`crate::select_index`] selects nothing, and every install path ends in
+//! `FlowError::NoIndex`. It never means "accept anything", and the tests assert it from
+//! both directions.
 //!
 //! # Cheapest-first reject ordering
 //!
-//! Every gate fails CLOSED; any error is a [`Reject`], and the expensive crypto runs as
-//! late as it can:
+//! Every gate fails closed with a [`Reject`], and the expensive crypto runs as late as it
+//! can:
 //!
-//! 1. anchor empty ⇒ [`Reject::Disabled`]. Free.
-//! 2. roster signature length (exactly 64 bytes). Cheap, local.
-//! 3. verify the roster under the pinned master keyset. **CRYPTO #1.**
-//! 4. parse the roster — only from `VerifiedRoster`, which has no public constructor.
-//! 5. roster `schema` newer than we understand ⇒ refuse rather than misread.
-//! 6. `roster_seq` below the durable floor ⇒ [`Reject::Rollback`]. THE replay ratchet.
-//! 7. roster `valid_until` lapsed ⇒ [`Reject::Stale`]. Still enforced, but every
-//!    roster this tooling mints stamps 9999-12-31 by owner decision
-//!    (`crates/atpkg-keys/src/roster_ops.rs`), so it never lapses: a brand-new
-//!    install, which carries no floor, has no replay defence at first contact, and
-//!    revocation is the answer to a stolen key.
-//! 8. revoked and expired machines leave the candidate set — BEFORE any artifact
-//!    crypto, so a revoked machine's valid signature is never checked.
-//! 9. verify `index.toml` under the survivors. **CRYPTO #2.**
-//! 10. parse it — only from [`VerifiedBytes`] — then bind its self-declared
-//!     `machine_id`/`roster_seq` to what actually verified ([`Attribution::bind`]).
+//! 1. anchor empty ⇒ [`Reject::Disabled`].
+//! 2. roster signature length (exactly 64 bytes).
+//! 3. verify the roster under the pinned master keyset (crypto #1).
+//! 4. parse the roster, only from `VerifiedRoster`.
+//! 5. roster `schema` newer than this build understands ⇒ refuse rather than misread.
+//! 6. `roster_seq` below the durable floor ⇒ [`Reject::Rollback`], the replay ratchet.
+//! 7. roster `valid_until` lapsed ⇒ [`Reject::Stale`]. Every roster this tooling mints
+//!    stamps 9999-12-31 (`crates/atpkg-keys/src/roster_ops.rs`), so a brand-new install,
+//!    which carries no floor, has no replay defence at first contact; revocation answers
+//!    a stolen key.
+//! 8. revoked and expired machines leave the candidate set, before any artifact crypto.
+//! 9. verify `index.toml` under the survivors (crypto #2).
+//! 10. parse it, only from [`VerifiedBytes`], then bind its self-declared
+//!     `machine_id`/`roster_seq` to what verified ([`Attribution::bind`]).
 //!
 //! [`check_freshness`] (the index's own window, gate 2, §8) and the [`Floor`] high-water
-//! mark over `index_build` (gate 3, §8) are pure/durable functions the caller sequences
-//! after all of the above; they are unchanged by the single-root move.
+//! over `index_build` (gate 3, §8) are sequenced by the caller after all of the above.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -96,17 +68,12 @@ use aterm_update_core::roster::{Attribution, Roster, RosterReject, VerifiedRoste
 
 const MAX_FLOOR_BYTES: usize = 128;
 
-/// A blob of bytes that has **passed signature verification** under a machine the pinned
-/// master's roster authorizes. The inner `Vec<u8>` is private and there is no public
-/// constructor, so the only way to obtain a `VerifiedBytes` is via
-/// [`TrustedRoster::authorize_bytes`], [`TrustedRoster::authorize_index`], or
-/// [`TrustedIndex::verify_pkg`]. Parsers take `&VerifiedBytes`, which makes "parse only
-/// after verify" a *compile-time* guarantee rather than a convention.
-///
-/// The derives add no constructor — the field stays private and the only way to mint a
-/// `VerifiedBytes` remains the verify functions; `Debug`/`PartialEq` exist purely so
-/// tests can assert over `Result<VerifiedBytes, Reject>` (the verified bytes are public
-/// manifest content, not a secret).
+/// Bytes that passed signature verification under a machine the pinned master's roster
+/// authorizes. The field is private and there is no public constructor, so the only way to
+/// get one is [`TrustedRoster::authorize_bytes`] (or [`TrustedRoster::authorize_index`],
+/// [`TrustedIndex::verify_pkg`]); parsers take `&VerifiedBytes`, making "parse only after
+/// verify" a compile-time guarantee. The derives add no constructor; the bytes are public
+/// manifest content, not a secret.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedBytes(Vec<u8>);
 
@@ -124,8 +91,8 @@ impl VerifiedBytes {
 /// variant to "refuse, fail closed".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reject {
-    /// No master anchor is pinned (an unarmed build). Fail-closed default, returned
-    /// *before* any crypto — and it authorizes NOTHING, ever.
+    /// No master is pinned (an unarmed build): the fail-closed default, returned before any
+    /// crypto.
     Disabled,
     /// The public key did not base64-decode, or was not exactly 32 bytes.
     BadKey,
@@ -136,11 +103,9 @@ pub enum Reject {
     /// The signing machine is on the roster's deny-list. Checked before any artifact
     /// crypto, so a revoked machine's mathematically valid signature is never verified.
     Revoked,
-    /// The roster authorizes no machine that could have signed this: it names none that
-    /// is still live, or the document's own `machine_id` names a machine the roster does
-    /// not list (or a DIFFERENT machine than the key that actually verified — a
-    /// relabelling attempt). Was `NotDelegated`, when the index carried its own
-    /// delegation; the roster carries the authority now, so the name follows.
+    /// The roster authorizes no machine that could have signed this: none is still live, or
+    /// the document's own `machine_id` names a machine the roster does not list, or one other
+    /// than the key that verified (a relabelling attempt).
     NotAuthorized,
     /// The signing machine's own `not_after` has lapsed — defence in depth, so a machine
     /// key ages out and is re-minted from paper even when nothing went wrong.
@@ -148,10 +113,9 @@ pub enum Reject {
     /// The document carries no `machine_id`, so it cannot be attributed. Under an armed
     /// anchor an unattributed index is refused: attribution is a requirement.
     Unattributed,
-    /// The document's `roster_seq` is NEWER than the authorizing roster's (or absent) —
-    /// an attempt to pair an old roster with a new index. A newer roster with an older
-    /// index is admitted (`aterm_update_core::roster::Attribution::bind`, 2026-08-18: the
-    /// roster travels on the channel head, and a join re-dresses published releases).
+    /// The document's `roster_seq` is newer than the authorizing roster's, or absent: an old
+    /// roster paired with a new index. A newer roster with an older index is admitted
+    /// (`aterm_update_core::roster::Attribution::bind`).
     SeqMismatch,
     /// The index's freshness window has lapsed (`now >= valid_until`), or the roster's
     /// has.
@@ -160,35 +124,28 @@ pub enum Reject {
     /// once-valid, still-validly-signed roster (`roster_seq`) or index (`index_build`).
     /// Signatures do not expire; documents do, which is why both ratchets exist.
     Rollback,
-    /// A document that passed signature verification but is not valid UTF-8, not valid
-    /// TOML, or is missing a required field / has a duplicate key. Distinct from the
-    /// crypto rejects above and **not** a verification oracle — it is a *post-verify*
-    /// parse failure over already-authenticated bytes (`crate::manifest`). Fail closed.
+    /// Bytes that passed signature verification but are not valid UTF-8 or TOML, or miss a
+    /// required field or repeat a key: a post-verify parse failure over authenticated bytes
+    /// (`crate::manifest`), so not a verification oracle.
     Malformed,
     /// A document whose `schema` is newer than this build understands
     /// ([`crate::manifest::SUPPORTED_SCHEMA`]); refused rather than misread. Also
     /// post-verify, not a crypto oracle.
     Schema,
-    /// A `pkg-*.toml` row spelled with a RETIRED `kind` — today only `vendor-fetch`, which
-    /// was never published and was split into `kind` (the payload/apply shape) and
-    /// `protocol` (how the bytes are obtained) before any client saw it. Post-verify, like
-    /// [`Reject::Malformed`], but it carries the split's spelling so the authoring machine's
-    /// own `atpkg install` names the fix instead of a bare "malformed".
+    /// A `pkg-*.toml` row spelled with a retired `kind` (today only `vendor-fetch`, split into
+    /// `kind` and `protocol` before any client saw it). Post-verify, like [`Reject::Malformed`];
+    /// it carries the new spelling so the authoring machine's own `atpkg install` names the
+    /// fix.
     RetiredKind(&'static str),
-    /// A `pkg-*.toml` whose `shim_env` list breaks the rule a shim can honour
-    /// ([`crate::shim_env::ShimEnv::admit`]: too many entries, not `NAME=VALUE`, a name
-    /// outside `[A-Z0-9_]+` or one the shim never sets, an empty or un-embeddable
-    /// value, a duplicate). Post-verify, like [`Reject::Malformed`]; it carries the
-    /// entry and the reason so the publisher's own `atpkg verify-pkg` names the fix.
-    /// SIGNED metadata, so only ever an authoring mistake — and the whole manifest is
-    /// refused rather than a shim laid with half an environment.
+    /// A `pkg-*.toml` whose `shim_env` list breaks a rule a shim can honour
+    /// ([`crate::shim_env::ShimEnv::admit`]). Post-verify, like [`Reject::Malformed`]; it
+    /// carries the entry and the reason so the publisher's own `atpkg verify-pkg` names the
+    /// fix. Signed metadata, so only ever an authoring mistake; the whole manifest is refused.
     ShimEnv(String),
 }
 
-/// Translate the roster tier's verdict into atpkg's. One-to-one and total, deliberately:
-/// a `match` with no catch-all means a new [`RosterReject`] variant is a COMPILE error
-/// here rather than a silently-mapped one, and the mapping never collapses a refusal
-/// into an acceptance.
+/// Translate the roster tier's verdict into atpkg's: one-to-one and total, with no catch-all,
+/// so a new [`RosterReject`] variant is a compile error here.
 fn from_roster(e: RosterReject) -> Reject {
     match e {
         RosterReject::Disabled => Reject::Disabled,
@@ -207,21 +164,16 @@ fn from_roster(e: RosterReject) -> Reject {
     }
 }
 
-/// What this build trusts, and how far its replay ratchet has already turned.
+/// What this build trusts, and how far its replay ratchet has turned.
 ///
-/// The keyset is the paper master's — [`crate::PKG_TRUST_ANCHORS`], i.e.
-/// `pins::PAPER_MASTER_PUBKEYS` — and NOT a package-specific root: that is the whole
-/// point of folding atpkg under the master. `roster_floor` is the highest `roster_seq`
-/// this store has ever durably recorded (`<prefix>/roster.floor`).
+/// The keyset is the paper master's ([`crate::PKG_TRUST_ANCHORS`], i.e.
+/// `pins::PAPER_MASTER_PUBKEYS`), not a package-specific root. `roster_floor` is the highest
+/// `roster_seq` this store has durably recorded (`<prefix>/roster.floor`).
 ///
-/// # An empty keyset is INERT, and inert grants nothing
-///
-/// [`Anchor::is_armed`] is false, [`admit_roster`] refuses before any crypto, and
-/// `select_index` refuses to consider a single candidate. There is deliberately no
-/// constructor that can produce an anchor which accepts an arbitrary index: the only
-/// ways to build one are [`Anchor::pinned`] (the committed keyset) and [`Anchor::of`]
-/// (an explicit keyset — the seam a fork with its OWN paper master uses, and what the
-/// tests drive so they need neither the compiled pin nor any environment).
+/// An empty keyset is inert: [`Anchor::is_armed`] is false, [`admit_roster`] refuses before
+/// any crypto, and `select_index` considers no candidate. No constructor yields an anchor
+/// that accepts an arbitrary index: [`Anchor::pinned`] takes the committed keyset and
+/// [`Anchor::of`] an explicit one (a fork's own master, or the tests').
 #[derive(Debug, Clone)]
 pub struct Anchor {
     masters: Vec<String>,
@@ -230,11 +182,9 @@ pub struct Anchor {
 }
 
 impl Anchor {
-    /// The anchor this binary ships with: the committed paper-master keyset, plus the
-    /// caller's durable roster floor. In THIS tree the keyset is ARMED (one master,
-    /// 2026-08-15), so the anchor this returns verifies for real; an empty keyset — a
-    /// fork's starting point — makes it inert and atpkg installs nothing until an
-    /// operator arms it in a reviewed commit.
+    /// The anchor this binary ships with: the committed paper-master keyset plus the caller's
+    /// durable roster floor. This tree's keyset is armed; an empty one (a fork's starting
+    /// point) is inert until an operator arms it in a reviewed commit.
     #[must_use]
     pub fn pinned(roster_floor: u64) -> Self {
         Self::of(
@@ -255,12 +205,10 @@ impl Anchor {
         }
     }
 
-    /// Whether any master is pinned at all. FALSE is the fail-closed state — see the
-    /// type docs. A member that is empty or malformed can neither grant nor deny (it is
-    /// skipped by `verify_roster`, which reports `BadKey` if NONE was usable), so
-    /// armedness is decided by the slice being non-empty and nothing else — exactly the
-    /// rule `aterm-update`'s `RosterPolicy` uses, so the two tiers cannot drift on what
-    /// "armed" means.
+    /// Whether any master is pinned. False is the fail-closed state. An empty or malformed
+    /// member is skipped by `verify_roster` (which reports `BadKey` if none was usable), so
+    /// armedness is the slice being non-empty, the same rule as `aterm-update`'s
+    /// `RosterPolicy`.
     #[must_use]
     pub fn is_armed(&self) -> bool {
         !self.masters.is_empty()
@@ -272,56 +220,42 @@ impl Anchor {
     }
 }
 
-/// A roster generation that verified under the pinned master AND passed admission (the
-/// replay ratchet and the freshness window). Holding one is proof steps 1–7 ran.
+/// A roster generation that verified under the pinned master and passed admission: proof
+/// steps 1–7 ran.
 ///
-/// `now_unix` is captured at admission so every later authorization under this roster
-/// sees ONE clock reading: a whole channel apply must not have a machine expire out from
-/// under it halfway through, which would leave a coherence group split across two
-/// authorization states.
-///
-/// # THE FREEZE IS A CONTRACT: valid for ONE apply — do not cache
-///
-/// The captured clock is deliberate for a single select/install pass and WRONG for
-/// anything longer: a `TrustedRoster` held past its roster's `valid_until` (or past a
-/// machine's `not_after`) keeps authorizing under the frozen reading forever, because
-/// nothing here re-reads a clock. Every current caller mints one, uses it within a
-/// single CLI command, and drops it. A future long-lived holder (a daemonized atpkg, a
-/// cache) MUST re-admit from the published roster with a current clock before each
-/// authorization batch.
+/// `now_unix` is captured at admission so a whole channel apply sees one clock reading and
+/// no machine expires halfway through a coherence group. That makes it valid for one apply
+/// only: nothing here re-reads a clock, so a holder kept past the roster's `valid_until` or
+/// a machine's `not_after` would keep authorizing. Every caller uses one within a single CLI
+/// command; a long-lived holder must re-admit with a current clock.
 #[derive(Debug, Clone)]
 pub struct TrustedRoster {
     roster: Roster,
     now_unix: i64,
 }
 
-/// **Steps 1–7.** Verify the roster's exact bytes under the pinned master, parse it only
-/// from `VerifiedRoster`, and admit it against the replay floor and its freshness window.
-///
-/// Every arm is a refusal. There is no path through here that returns "accept anyway",
-/// and in particular an unarmed anchor short-circuits at the top, before any crypto.
+/// Steps 1–7: verify the roster's exact bytes under the pinned master, parse it only from
+/// `VerifiedRoster`, and admit it against the replay floor and its freshness window. Every
+/// failure is a refusal; an unarmed anchor refuses before any crypto.
 pub fn admit_roster(
     anchor: &Anchor,
     raw: Vec<u8>,
     sig: &[u8],
     now_unix: i64,
 ) -> Result<TrustedRoster, Reject> {
-    // STEP 1 — free, and the direction that must never invert: no anchor, no authority.
-    // `verify_roster` would refuse an empty keyset by itself; this is stated here as well
-    // because "the loop skipped every candidate" and "the loop accepted every candidate"
-    // are one negated condition apart, and only one of them is survivable.
+    // Step 1, the direction that must never invert. `verify_roster` refuses an empty keyset
+    // too; stated here because skipping and accepting every candidate are one negated
+    // condition apart.
     if !anchor.is_armed() {
         return Err(Reject::Disabled);
     }
-    // STEPS 2–3 — signature length, then the master crypto.
+    // Steps 2–3: signature length, then the master crypto.
     #[cfg(test)]
     MASTER_VERIFIES.with(|c| c.set(c.get() + 1));
     let verified: VerifiedRoster = verify_roster(&anchor.keys(), raw, sig).map_err(from_roster)?;
-    // STEPS 4–5 — parse ONLY from the verified wrapper (no public constructor), which
-    // also applies the reject-newer schema gate.
+    // Steps 4–5: parse only from the verified wrapper, with the reject-newer schema gate.
     let roster = Roster::parse(&verified).map_err(from_roster)?;
-    // STEPS 6–7 — the ratchet, then freshness. Both cheap, both before any artifact
-    // crypto, and a `valid_until` we cannot read counts as LAPSED, never as absent.
+    // Steps 6–7: the ratchet, then freshness; an unreadable `valid_until` counts as lapsed.
     roster
         .admit(anchor.roster_floor, now_unix)
         .map_err(from_roster)?;
@@ -330,11 +264,8 @@ pub fn admit_roster(
 
 #[cfg(test)]
 thread_local! {
-    /// Test-only counter behind `select`'s "one admission per distinct roster" tests:
-    /// incremented where [`admit_roster`] commits to the master Ed25519 check — the cost
-    /// a candidate carrying an already-weighed roster used to pay all over again.
-    /// Thread-local so libtest's per-test threads don't race a shared global;
-    /// `#[cfg(test)]` so it never ships.
+    /// Test-only count of master Ed25519 checks in [`admit_roster`], behind `select`'s "one
+    /// admission per distinct roster" tests. Thread-local so parallel tests don't race.
     static MASTER_VERIFIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -345,55 +276,42 @@ impl TrustedRoster {
         self.roster.roster_seq
     }
 
-    /// **Steps 8–9.** Verify one artifact's exact bytes under this roster's LIVE machines.
-    ///
-    /// Revoked and expired machines leave the candidate set before any crypto runs, so a
-    /// revoked machine's perfectly valid signature is never checked. The underlying
-    /// primitive is `Roster::authorize_appcast` — named for the release manifest it was
-    /// written for, but it is a signature check over opaque bytes under the authorized
-    /// set, and reusing it verbatim is the point: atpkg and the updater must not grow two
-    /// dialects of one gate.
+    /// Steps 8–9: verify one artifact's exact bytes under this roster's live machines;
+    /// revoked and expired ones leave the set before any crypto. Reuses
+    /// `Roster::authorize_appcast` (a signature check over opaque bytes) so atpkg and the
+    /// updater share one gate.
     fn authorize(&self, bytes: &[u8], sig: &[u8]) -> Result<Attribution, Reject> {
         self.roster
             .authorize_appcast(bytes, sig, self.now_unix)
             .map_err(from_roster)
     }
 
-    /// [`Self::authorize`], minting the [`VerifiedBytes`] the post-verify parsers consume.
-    ///
-    /// This is THE place bytes become parseable under the single root, and it is one
-    /// function rather than one per document type on purpose: `index.toml` and every
-    /// `pkg-*.toml` are authorized by the identical rule (any listed, unrevoked,
-    /// unexpired machine on this generation), so two spellings of it would be two things
-    /// to keep right.
+    /// [`Self::authorize`], minting the [`VerifiedBytes`] the post-verify parsers consume:
+    /// the one place bytes become parseable, since `index.toml` and every `pkg-*.toml` are
+    /// authorized by the same rule.
     pub fn authorize_bytes(
         &self,
         raw: Vec<u8>,
         sig: &[u8],
     ) -> Result<(VerifiedBytes, Attribution), Reject> {
         let who = self.authorize(&raw, sig)?;
-        // Minting VerifiedBytes here — inside the one module that can — is what keeps
-        // "parse only after verify" a compile-time fact rather than a habit.
+        // The one place `VerifiedBytes` is minted.
         Ok((VerifiedBytes(raw), who))
     }
 
-    /// **Steps 8–10 for `index.toml`:** verify under the live machines, parse only from
-    /// the resulting [`VerifiedBytes`], then bind the index's own `machine_id` /
-    /// `roster_seq` to what actually verified.
-    ///
-    /// The bind is two string/integer compares over already-authenticated bytes and it
-    /// closes both directions at once: `machine_id` sits INSIDE the signed bytes, so a
-    /// genuine m3 signature cannot be relabelled m11, and a thief holding m11's key
-    /// cannot claim to be m3 because the roster maps m3 to m3's key.
+    /// Steps 8–10 for `index.toml`: verify under the live machines, parse only from the
+    /// resulting [`VerifiedBytes`], then bind the index's own `machine_id` / `roster_seq` to
+    /// what verified. `machine_id` is inside the signed bytes, so a genuine m3 signature
+    /// cannot be relabelled m11, and m11's key cannot claim m3, whose key the roster names.
     pub fn authorize_index(
         &self,
         raw: Vec<u8>,
         sig: &[u8],
     ) -> Result<(TrustedIndex, VerifiedBytes), Reject> {
-        // (9) THE ARTIFACT CRYPTO, under survivors only.
+        // (9) The artifact crypto, under survivors only.
         let (verified, who) = self.authorize_bytes(raw, sig)?;
         let index = crate::manifest::parse_index(&verified)?;
-        // (10) THE ID BIND, over bytes that are authenticated by the time it runs.
+        // (10) The id bind, over authenticated bytes.
         who.bind(index.machine_id.as_deref(), index.roster_seq)
             .map_err(from_roster)?;
         Ok((
@@ -407,14 +325,9 @@ impl TrustedRoster {
     }
 }
 
-/// An `index.toml` that a master-signed roster generation authorized — and the authority
-/// every `pkg-*.toml` under it is verified against.
-///
-/// Carrying the roster with the index is not bookkeeping: under the retired design the
-/// index CARRIED its own delegation, so "who may sign this program's manifest" was a
-/// property of the index document. It is now a property of the roster generation that
-/// authorized the index, and this type is that pairing. It derefs to [`crate::Index`], so
-/// every existing read of `programs` / `channels` / `index_build` is unchanged.
+/// An `index.toml` a master-signed roster generation authorized, paired with that
+/// generation: the authority every `pkg-*.toml` under it is verified against. Derefs to
+/// [`crate::Index`].
 #[derive(Debug, Clone)]
 pub struct TrustedIndex {
     index: crate::manifest::Index,
@@ -430,7 +343,7 @@ impl std::ops::Deref for TrustedIndex {
 }
 
 impl TrustedIndex {
-    /// WHICH machine signed this index, proved by its key rather than claimed by a label.
+    /// Which machine signed this index, proved by its key rather than claimed by a label.
     #[must_use]
     pub fn attribution(&self) -> &Attribution {
         &self.attribution
@@ -443,53 +356,33 @@ impl TrustedIndex {
         self.roster.seq()
     }
 
-    /// The generation THIS INDEX ITSELF DECLARES, from inside its own signed bytes.
+    /// The generation this index declares inside its own signed bytes.
     ///
-    /// Not the same question as [`Self::roster_seq`], which reports the generation of
-    /// the roster blob the candidate was SERVED WITH. `Attribution::bind` deliberately
-    /// admits `index.roster_seq <= roster.roster_seq`, so an old index verifies
-    /// perfectly well beside a newer roster — and whoever assembles a candidate
-    /// chooses which pair to publish. Anything that WAIVES a durable floor has to ask
-    /// this one: pairing the owner's own unmodified older index with the owner's own
-    /// unmodified newer roster otherwise re-based the anti-rollback floor downward
-    /// without forging anything (2026-08-20 round-8 audit).
-    ///
-    /// The master's rescue lever is unaffected: minting a generation and PUBLISHING AN
-    /// INDEX THAT DECLARES IT is still the master's alone, and that index waives the
-    /// floor exactly as designed.
+    /// Not [`Self::roster_seq`], the generation of the roster it was served with:
+    /// `Attribution::bind` admits `index.roster_seq <= roster.roster_seq`, so an old index
+    /// verifies beside a newer roster, and whoever assembles a candidate picks the pair.
+    /// Anything that waives a durable floor must ask this one, or re-pairing the owner's own
+    /// old index with the owner's new roster re-bases the floor downward without forging
+    /// anything. An index can declare only a generation the master has minted, so the
+    /// master's rescue lever is unaffected.
     #[must_use]
     pub fn authorizing_seq(&self) -> u64 {
-        // An index that declares NO generation cannot waive a generation floor. Zero
-        // is never strictly greater than a recorded floor, so such a candidate falls
-        // through to the plain anti-rollback comparison — which is exactly the
-        // pre-roster behaviour.
+        // An index that declares no generation cannot waive a generation floor: 0 is never
+        // strictly greater than a recorded floor.
         self.index.roster_seq.unwrap_or(0)
     }
 
-    /// Verify a `pkg-<program>-<build>.toml`'s raw bytes under the SAME roster generation
-    /// that authorized this index — i.e. under any machine that is listed, not revoked and
-    /// not expired. A manifest signed by a revoked machine is refused without its
-    /// signature ever being checked; a manifest signed by a key nobody on the roster holds
-    /// fails the Ed25519 check.
-    ///
-    /// This replaces `verify_pkg(raw, sig, &index.delegation())`. The delegation tier is
-    /// retired: the roster supplies both the grant and the deny, and supplies the deny
-    /// faster than an index re-publish ever could.
+    /// Verify a `pkg-<program>-<build>.toml`'s raw bytes under the roster generation that
+    /// authorized this index: any listed, unrevoked, unexpired machine. A revoked machine's
+    /// manifest is refused without its signature being checked.
     pub fn verify_pkg(&self, raw: Vec<u8>, sig: &[u8]) -> Result<VerifiedBytes, Reject> {
         self.roster.authorize_bytes(raw, sig).map(|(v, _)| v)
     }
 }
 
-/// Genuinely-signed [`VerifiedBytes`] for OTHER modules' tests.
-///
-/// `VerifiedBytes` has no public constructor, which is the point — so a test that needs
-/// one must produce it the way production does. Before the single-root move that meant
-/// `verify_index_with(&root_pk, raw, &sig)`; it now means a synthetic paper master, a
-/// synthetic roster, and a real machine signature through the real chain. Doing that by
-/// hand in every module would be forty lines of fixture per module and an invitation to
-/// add a `pub(crate) fn new()` instead — which would quietly retire the guarantee.
-///
-/// `#[cfg(test)]` throughout: this cannot exist in a shipped build.
+/// Genuinely signed [`VerifiedBytes`] for other modules' tests: a synthetic paper master and
+/// roster and a real machine signature through the real chain, so no test needs a
+/// `pub(crate)` constructor that would retire the guarantee. Test-only.
 #[cfg(test)]
 pub(crate) mod testkit {
     use super::{Anchor, TrustedRoster, VerifiedBytes, admit_roster};
@@ -527,10 +420,8 @@ pub(crate) mod testkit {
         Roster {
             schema: 1,
             roster_seq: SEQ,
-            // Far out on purpose: this fixture exists so OTHER gates can be the thing
-            // under test. A roster that lapsed mid-suite would turn every unrelated
-            // failure into "Stale", which is the least informative refusal there is.
-            // Roster staleness itself is tested directly, with an explicit clock.
+            // Far out, so a lapsed roster never masks the gate under test; staleness is
+            // tested with an explicit clock.
             valid_until: "2099-01-01T00:00:00Z".into(),
             machines: vec![Machine {
                 id: MACHINE_ID.into(),
@@ -557,11 +448,8 @@ pub(crate) mod testkit {
         Anchor::of(vec![pubkey_b64(&MASTER_SEED)], 0)
     }
 
-    /// How many master Ed25519 verifies [`admit_roster`] has run on THIS thread.
-    ///
-    /// Read it as a DELTA around the call under test: libtest may run several tests on
-    /// one thread, so the absolute number means nothing and the difference means
-    /// everything.
+    /// How many master Ed25519 verifies [`admit_roster`] has run on this thread; read it as
+    /// a delta around the call under test.
     pub(crate) fn master_verifies() -> usize {
         super::MASTER_VERIFIES.with(|c| c.get())
     }
@@ -592,8 +480,8 @@ pub(crate) mod testkit {
             .0
     }
 
-    /// `raw`, machine-signed and taken through the REAL authorization path. Panics if the
-    /// chain refuses — a test fixture that cannot be signed is a broken fixture.
+    /// `raw`, machine-signed and taken through the real authorization path. Panics if the
+    /// chain refuses.
     pub(crate) fn machine_signed(raw: Vec<u8>) -> VerifiedBytes {
         let sig = sign(&MACHINE_SEED, &raw);
         trusted_roster()
@@ -603,37 +491,18 @@ pub(crate) mod testkit {
     }
 }
 
-/// The durable anti-rollback floor over `index.toml`, **and the roster generation that set
-/// it** — the two are one value, because `index_build` is a number a MACHINE chooses.
+/// The durable anti-rollback floor over `index.toml`, and the roster generation that set it.
 ///
-/// # Why the generation travels with the number
+/// `index_build` is a number a machine chooses, so one rostered machine (a stolen key) could
+/// publish `index_build = 9223372036854775807` and raise a monotonic floor above anything
+/// the owner will publish, filtering out every later index, including the one carrying its
+/// revocation. So the floor binds only within the generation that set it, and a strictly
+/// newer master-signed generation re-bases it ([`Floor::rebase`]): the paper master's rescue
+/// lever, since only the master mints a generation.
 ///
-/// Folding index signing down to the machine tier means every rostered machine can now
-/// write this floor. `index_build` is an arbitrary u64 inside machine-signed bytes, so one
-/// machine — a stolen key, the exact case revocation exists for — can publish
-/// `index_build = 9223372036854775807` (the TOML integer ceiling) and permanently raise a
-/// monotonic high-water above anything the owner will ever publish. Every later index,
-/// **including the one carrying the revocation**, is then filtered out before its roster is
-/// even consulted: the store is bricked AND the revocation can never be delivered by any
-/// republish. That is the "unrecoverable by re-publish" property the retired design
-/// reserved for compromise of the *offline* index root, and it must not be reachable from a
-/// tier the roster exists to be able to revoke.
-///
-/// So the floor binds only against the generation that set it. A strictly NEWER
-/// master-signed roster generation re-bases it ([`Floor::rebase`]) — which is the paper
-/// master's rescue lever and nobody else's, since only the master can mint a generation.
-/// Within one generation the ratchet is exactly the monotonic high-water it always was.
-///
-/// # It still fails CLOSED in the direction that matters
-///
-/// [`Self::admits`] waives the floor **only** for a strictly-newer generation. An equal or
-/// (impossible, but) older generation is still floored, so a corrupt or missing
-/// `floor.gen` — which reads as `0` — never waives anything it should not: it makes the
-/// floor bind at generation 0, which no real roster carries, and the first genuine
-/// generation re-bases it. A store carrying a floor from BEFORE the single-root move is in
-/// exactly that position, and re-basing it is right: no index that floor ever admitted can
-/// verify under the new chain at all (schema 1, no `machine_id` ⇒ `Unattributed`), so the
-/// number refers to a lineage that no longer exists.
+/// An equal or older generation is still floored, so a missing or corrupt `floor.gen`
+/// (reading `0`) waives nothing: the floor binds at generation 0, which no real roster
+/// carries, and the first genuine generation re-bases it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BuildFloor {
     /// The highest `index_build` durably recorded (`<prefix>/floor`).
@@ -650,11 +519,8 @@ impl BuildFloor {
     }
 
     /// Whether an index at `index_build`, authorized by roster generation `roster_seq`,
-    /// clears this floor.
-    ///
-    /// The `>` is deliberate and is the whole gate: only a STRICTLY newer generation waives
-    /// the floor. Making it `!=` would waive it for an older generation too, which is the
-    /// one direction that would let a replayed index in.
+    /// clears this floor. Only a strictly newer generation waives it: `!=` would waive it for
+    /// an older one too, letting a replayed index in.
     #[must_use]
     pub fn admits(&self, roster_seq: u64, index_build: u64) -> bool {
         if roster_seq > self.roster_seq {
@@ -664,11 +530,9 @@ impl BuildFloor {
     }
 }
 
-/// Freshness gate (gate 2, §8): an index is fresh iff `now_unix < valid_until_unix`.
-/// `now` is **injected** so the logic is pure and deterministic — the real clock and
-/// the RFC3339 → unix conversion of `valid_until` are wired by the (post-verify) caller,
-/// never read inside this function. A lapsed window is refused fail-closed
-/// ([`Reject::Stale`]), closing the offline-window / stale-proxy replay gap.
+/// Freshness gate (gate 2, §8): an index is fresh iff `now_unix < valid_until_unix`. Pure:
+/// the caller supplies the clock and the converted `valid_until`. A lapsed window is
+/// [`Reject::Stale`].
 pub fn check_freshness(now_unix: i64, valid_until_unix: i64) -> Result<(), Reject> {
     if now_unix >= valid_until_unix {
         Err(Reject::Stale)
@@ -687,33 +551,27 @@ pub struct Floor {
 }
 
 impl Floor {
-    /// A floor backed by `path`. The parent directory must be private (0700,
-    /// owned-by-uid) at write time; the file itself is published `0644` via temp+rename
-    /// — readable by design, since a reader who cannot read the floor cannot enforce it.
+    /// A floor backed by `path`. Its parent directory must be private (owned by this uid,
+    /// not group/other-writable) at write time; the file is published `0644`.
     #[must_use]
     pub fn new(path: PathBuf) -> Self {
         Self { path }
     }
 
-    /// The recorded high-water floor (`0` if none/unreadable). For a caller that needs the
-    /// current floor as a SELECT filter (§5) *before* advancing it via
-    /// [`Self::check_and_record`].
+    /// The recorded high-water floor (`0` if none or unreadable), for a caller that filters
+    /// on it (§5) before advancing it with [`Self::check_and_record`].
     #[must_use]
     pub fn current(&self) -> u64 {
         self.read_floor()
     }
 
-    /// Reject any `index_build` below the recorded floor ([`Reject::Rollback`]); on
-    /// accept, durably advance the floor to `max(index_build, recorded)`.
+    /// Reject any `index_build` below the recorded floor ([`Reject::Rollback`]); on accept,
+    /// durably advance the floor to `max(index_build, recorded)`.
     ///
-    /// First contact (no recorded floor) reads as `0` and accepts — the genuine
-    /// residual the §8 freshness gate bounds. Persisting the advance is best-effort: a
-    /// write failure never turns an already-passed check into a reject (the rollback
-    /// decision was made against the value read *before* the write) — refusing there
-    /// would trade a bounded replay residual for a permanently wedged store. But
-    /// best-effort is not SILENT: a failed persist is a standing replay window (the
-    /// next run re-reads the old floor and accepts the same generation again), so the
-    /// failure is said out loud on stderr rather than discarded.
+    /// First contact (no recorded floor) reads as `0` and accepts, the residual the §8
+    /// freshness gate bounds. A failed persist never turns a passed check into a reject (that
+    /// would wedge the store), but it is reported on stderr: until a later run persists, the
+    /// same generation is accepted again.
     pub fn check_and_record(&self, index_build: u64) -> Result<(), Reject> {
         let (decision, persist_failure) = self.check_and_record_classified(index_build);
         if let Some(error) = persist_failure {
@@ -727,59 +585,34 @@ impl Floor {
         decision
     }
 
-    /// [`Self::check_and_record`] with the persist failure returned instead of printed —
-    /// the accept/refuse DECISION and the durability of the advance are two different
-    /// claims, and tests must be able to observe the second without scraping stderr.
+    /// [`Self::check_and_record`] with the persist failure returned instead of printed, so
+    /// tests can observe durability apart from the decision.
     pub(crate) fn check_and_record_classified(
         &self,
         index_build: u64,
     ) -> (Result<(), Reject>, Option<String>) {
-        // Serialize the whole read -> compare -> write across concurrent atpkg
-        // processes (CWE-362). Without this, two processes that both `read_floor()` floor F
-        // before either `write()`s can regress the durable floor BELOW the higher of
-        // their builds (A=50 and B=45 both read 41; if B writes last it stores 45,
-        // clobbering 50) — after which a later, older-but-once-valid signed index in
-        // the lost interval would be ACCEPTED instead of refused, weakening the
-        // anti-rollback guarantee. The lock makes the advance monotonic. If the lock
-        // cannot be taken it degrades to best-effort (never a false reject — the
-        // rollback decision is still made against the value `read_floor()` returns).
+        // Serialize read -> compare -> write across processes (CWE-362): two processes that
+        // both read floor F before either writes could otherwise regress the floor below the
+        // higher of their builds. If the lock cannot be taken this degrades to best-effort,
+        // never a false reject.
         let _lock = self.acquire_file_lock();
         let (recorded, corrupt) = self.read_floor_reported();
         if index_build < recorded {
             return (Err(Reject::Rollback), None);
         }
-        // NOTHING TO PERSIST is not the same thing as "persist it anyway". A touch that
-        // advances nothing is the overwhelmingly common case — every
-        // `resolve_verified_index` observes the roster generation it just admitted, so a
-        // 6-hour tick over an UNCHANGED index takes this path five times — and it would
-        // otherwise re-publish bytes already on disk: a `0600` temp file, `sync_all` on
-        // it, a `rename`, and a `sync_all` on the parent directory. On Apple targets both
-        // syncs are `fcntl(F_FULLFSYNC)`, a full drive flush each, so an idle store paid
-        // ten drive flushes and five atomic replaces per pass to write down a number it
-        // already held — including on the GUI-adjacent seed lane, which resolves the
-        // signed index before it asks whether there is any work to do.
-        //
-        // The skip is taken ONLY when the file already carries a value at or above the
-        // one being recorded, so the durable floor afterwards is exactly what the write
-        // would have left: the monotonic guarantee, the lock, and the `Ok(())` decision
-        // are untouched. Two cases deliberately fall through to the write:
-        //   * `corrupt` — the file exists but does not read as a floor, so `recorded` is
-        //     the fail-open `0` and the ratchet must RE-ARM by rewriting it (the heal
-        //     `a_corrupt_floor_file_is_detected_and_still_reads_as_first_contact` pins),
-        //     at `index_build == 0` as much as above it;
-        //   * a floor not yet published `0644` — a store written before the
-        //     world-readable move (docs/AUDIT-nux-first-open-toolchain-2026-08-31.md)
-        //     must still be migrated, or a non-root reader under a SYSTEM prefix goes on
-        //     reading it as "first contact" forever.
-        // What the skip gives up is re-trying the BEST-EFFORT directory sync of an
-        // earlier rename. The floor value itself is already durable either way (its own
-        // `sync_all` is not best-effort), and a directory sync that failed once is not
-        // repaired by a rename that no longer happens.
+        // Nothing to persist: skip the rewrite (temp, two syncs, rename; on Apple targets
+        // each sync is a full drive flush), the common case on every pass over an unchanged
+        // index. Taken only when the file already holds a value at or above this one, so the
+        // durable floor is what the write would have left; the skip gives up only a retry of
+        // an earlier rename's best-effort directory sync. Two cases still write: a `corrupt`
+        // file (it read as the fail-open `0`, and the ratchet must re-arm), and a floor not
+        // yet `0644`, which a non-root reader under a system prefix reads as first contact
+        // (docs/AUDIT-nux-first-open-toolchain-2026-08-31.md).
         if !corrupt && index_build <= recorded && self.is_published() {
             return (Ok(()), None);
         }
-        // Durable advance under the lock; never downgrades the recorded value, and a
-        // failure is REPORTED (never a reject — see `check_and_record`'s doc).
+        // Durable advance under the lock, never downward; a failure is reported, never a
+        // reject.
         let persist_failure = self
             .write(index_build.max(recorded))
             .err()
@@ -787,25 +620,19 @@ impl Floor {
         (Ok(()), persist_failure)
     }
 
-    /// Write `value` unconditionally, **including downward** — the one operation on this
-    /// type that is not monotonic.
+    /// Write `value` unconditionally, including downward: the one non-monotonic operation.
     ///
-    /// The ONLY legitimate caller is the build-floor re-base a strictly newer, master-signed
-    /// roster generation earns (see [`BuildFloor`]): a floor set by a machine that is now
-    /// revoked must not outlive the generation that revoked it, or the revocation can never
-    /// be delivered. It is deliberately NOT reachable from anything an index or a machine
-    /// says — the caller must already hold proof that `admit_roster` accepted a generation
-    /// above the one that recorded the floor, and only the paper master can mint one.
-    ///
-    /// Best-effort, like [`Self::check_and_record`]'s write: a failed re-base leaves the old
-    /// floor, which is the fail-closed direction (the store stays refusing rather than
-    /// silently opening).
+    /// Only the build-floor re-base a strictly newer master-signed generation earns may call
+    /// it ([`BuildFloor`]): a floor set by a now-revoked machine must not outlive the
+    /// generation that revoked it. The caller must already hold `admit_roster`'s acceptance of
+    /// a generation above the one that recorded the floor; nothing an index or a machine says
+    /// reaches it. Best-effort; a failed re-base leaves the old floor, the fail-closed
+    /// direction.
     pub fn rebase(&self, value: u64) {
         let _lock = self.acquire_file_lock();
         if let Err(error) = self.write(value) {
-            // Fail-closed direction (the store keeps refusing under the old, higher
-            // floor), but the master's rescue lever silently not landing would read as
-            // "the re-base did nothing" — say so.
+            // Fail-closed (the old, higher floor keeps refusing), but a rescue that did not
+            // land is said.
             eprintln!(
                 "atpkg: could not re-base the floor at {} to {value}: {error}",
                 self.path.display()
@@ -813,11 +640,10 @@ impl Floor {
         }
     }
 
-    /// Acquire the advisory lock guarding [`Self::check_and_record`]'s critical
-    /// section: `LOCK_EX` on a sibling `<floor>.lock` file (created `0600`), released
-    /// on drop. `None` if it cannot be taken (e.g. the directory does not exist yet) —
-    /// callers then proceed best-effort, which is still rollback-safe, only not
-    /// strictly monotonic under concurrency.
+    /// The advisory lock over [`Self::check_and_record`]'s critical section: `LOCK_EX` on a
+    /// sibling `<floor>.lock` (created `0600`), released on drop. `None` when it cannot be
+    /// taken; callers then go on best-effort, still rollback-safe but not strictly monotonic
+    /// under concurrency.
     fn acquire_file_lock(&self) -> Option<FileLock> {
         let name = self
             .path
@@ -828,24 +654,16 @@ impl Floor {
         FileLock::acquire(&lockpath).ok()
     }
 
-    /// The recorded floor, or `0` if the file is missing or unparseable (fail-open
-    /// only for first contact, per §8).
-    ///
-    /// A file that EXISTS but will not read as a floor is reported on stderr before the
-    /// `0` is returned. The value must still be `0` — refusing outright would let anyone
-    /// who can scribble on the file wedge the store permanently (a trivial local DoS,
-    /// and the system itself never produces a malformed floor: writes are temp+rename
-    /// atomic) — but corruption reading silently as "first contact" is how a rollback
-    /// window reopens with nobody told. The classification is separated so a test can
-    /// pin "corrupt is detected AND still reads 0" without scraping stderr.
+    /// The recorded floor, or `0` if the file is missing or unparseable (fail-open only for
+    /// first contact, per §8). A file that exists but will not read as a floor is reported
+    /// on stderr and still reads `0`: refusing would let anyone who can scribble on it wedge
+    /// the store, and the system never writes a malformed floor (temp+rename is atomic).
     fn read_floor(&self) -> u64 {
         self.read_floor_reported().0
     }
 
-    /// [`Self::read_floor`]'s value AND its corruption verdict — the same read, the same
-    /// stderr report, for the one caller that must branch on `corrupt` as well: a file
-    /// that will not read as a floor has to be REWRITTEN even when the value being
-    /// recorded advances nothing, because `recorded` came back as the fail-open `0`.
+    /// [`Self::read_floor`]'s value and its corruption verdict, for the caller that must
+    /// rewrite a corrupt file even when the value recorded advances nothing.
     fn read_floor_reported(&self) -> (u64, bool) {
         let (value, corrupt) = self.read_floor_classified();
         if corrupt {
@@ -873,9 +691,8 @@ impl Floor {
         }
     }
 
-    /// `(recorded floor, corrupt)`: `corrupt` is true iff the file EXISTS but did not
-    /// yield a `u64` — indistinguishable from first contact by value alone, which is
-    /// exactly why it is worth distinguishing here.
+    /// `(recorded floor, corrupt)`: `corrupt` is true iff the file exists but did not yield a
+    /// `u64`, which the value alone cannot tell from first contact.
     pub(crate) fn read_floor_classified(&self) -> (u64, bool) {
         match crate::metadata_io::read_bounded_regular_utf8(&self.path, MAX_FLOOR_BYTES) {
             Ok(text) => match text.trim().parse::<u64>() {
@@ -888,11 +705,9 @@ impl Floor {
         }
     }
 
-    /// Atomically publish `value` to the floor file: refuse a non-private parent dir
-    /// (CWE-379 — a foreign-owned or group/other-writable dir lets another local user
-    /// pre-create or swap the file), then write a sibling `0600` temp, publish it `0644`
-    /// and `rename` it
-    /// over the target so a reader never sees a half-written floor.
+    /// Atomically publish `value` to the floor file: refuse a parent dir that is not private
+    /// (CWE-379: another local user could pre-create or swap the file), then write a sibling
+    /// `0600` temp, publish it `0644` and `rename` it over the target.
     fn write(&self, value: u64) -> io::Result<()> {
         let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
         let meta = std::fs::metadata(parent)?;
@@ -916,17 +731,11 @@ impl Floor {
                 .unwrap_or("floor"),
             std::process::id()
         ));
-        // ONE exit for the whole staged sequence, so no failure can walk out past the
-        // cleanup below.
+        // One exit for the whole staged sequence, so no failure skips the cleanup below.
         if let Err(error) = self.stage_and_publish(&tmp, value) {
-            // A persist failure is REPORTED, never fatal, and `check_and_record` runs on
-            // every accepted pass — so a condition that keeps failing (ENOSPC on the
-            // store volume, the case the freespace preflight exists for) would otherwise
-            // leave one `<floor>.<pid>.tmp` per pid beside each of the three floors,
-            // forever: nothing else sweeps this name (atpkg's other sweeps match `.tmp-`
-            // and `atpkg-*.tmp`, and `gc` has never heard of it). The removal is itself
-            // best-effort — the error worth propagating is the failed persist, not a
-            // failed tidy-up.
+            // Reported, never fatal, and run on every accepted pass: a persist that keeps
+            // failing (ENOSPC) would otherwise leave a `<floor>.<pid>.tmp` per pid beside each
+            // floor, a name no other sweep matches. The removal itself is best-effort.
             let _ = std::fs::remove_file(&tmp);
             return Err(error);
         }
@@ -936,38 +745,23 @@ impl Floor {
         Ok(())
     }
 
-    /// Stage `value` into `tmp` (`0600`, durably synced), publish it `0644`, and
-    /// `rename` it over the floor.
-    ///
-    /// Split out of [`Self::write`] so the sequence has a SINGLE failure exit: every
-    /// `?` here returns to one caller, which removes the temp before propagating, so
-    /// a failed persist never leaves a `<floor>.<pid>.tmp` sibling behind (the same
-    /// discipline `atpkg-keys`' staged writer keeps).
+    /// Stage `value` into `tmp` (`0600`, durably synced), publish it `0644`, and `rename` it
+    /// over the floor. Split out of [`Self::write`] so the sequence has one failure exit,
+    /// where the temp is removed.
     fn stage_and_publish(&self, tmp: &Path, value: u64) -> io::Result<()> {
         use std::io::Write as _;
 
         {
             let mut f = crate::platform::open_create_write(tmp, 0o600)?;
             f.write_all(value.to_string().as_bytes())?;
-            // The advance must be DURABLE, not merely renamed: a rename of bytes still
-            // in the page cache can, after a power loss, expose a correctly-named empty
-            // file — which reads as first contact and silently reopens the rollback
-            // window the write existed to close.
+            // Durable, not merely renamed: after a power loss a rename of unsynced bytes can
+            // expose an empty file, which reads as first contact.
             crate::platform::sync_durable(&f)?;
         }
-        // Publish the floor WORLD-READABLE (0644), not 0600.
-        //
-        // This value is an anti-rollback high-water mark, not a secret — it says
-        // which index build was last trusted. Every reader must be able to check it,
-        // and under a SYSTEM prefix the file is owned by root: at 0600 no ordinary
-        // user could read it, so `read_floor` took the unreadable branch and
-        // downgraded to "first contact (0)" on every single non-root invocation,
-        // silently reopening the window the floor exists to close
-        // (docs/AUDIT-nux-first-open-toolchain-2026-08-31.md). A ratchet that
-        // disengages for every normal user is not a ratchet.
-        //
-        // WRITE authority is unchanged: it rests on ownership of this file and on the
-        // `dir_meta_is_private` check above, neither of which 0644 touches.
+        // Published world-readable (0644): the value is a high-water mark, not a secret, and
+        // under a root-owned system prefix a 0600 floor reads as "first contact (0)" for
+        // every non-root user (docs/AUDIT-nux-first-open-toolchain-2026-08-31.md). Write
+        // authority rests on ownership and the `dir_meta_is_private` check.
         crate::platform::set_mode(tmp, 0o644)?;
         std::fs::rename(tmp, &self.path)
     }
@@ -1047,25 +841,20 @@ mod tests {
         admit_roster(anchor, bytes, &sig, NOW)
     }
 
-    /// An `index.toml` body naming `machine_id` / `roster_seq` — the attribution the
-    /// bind (step 10) checks against the key that actually verified.
-    /// Waiving the anti-rollback floor must require an index that DECLARES the newer
-    /// generation, not merely one served beside a newer roster. `Attribution::bind`
-    /// admits `index.roster_seq <= roster.roster_seq`, so re-pairing the owner's own
-    /// unmodified old index with the owner's own unmodified new roster forged nothing
-    /// and still re-based the floor downward (2026-08-20 round-8 audit).
+    /// Waiving the floor needs an index that declares the newer generation, not one merely
+    /// served beside a newer roster (`Attribution::bind` admits an older `roster_seq`).
     #[test]
     fn only_the_generation_an_index_declares_waives_the_floor() {
         let floor = BuildFloor {
             index_build: 100,
             roster_seq: 4,
         };
-        // The master's rescue: a NEW index that declares generation 5.
+        // The master's rescue: a new index that declares generation 5.
         assert!(
             floor.admits(5, 1),
             "a genuinely newer generation re-bases the floor"
         );
-        // The replay: an OLD index (declaring 4) served beside a generation-5 roster.
+        // The replay: an old index (declaring 4) served beside a generation-5 roster.
         assert!(
             !floor.admits(4, 99),
             "an index below the floor must not be admitted by its neighbour's roster"
@@ -1075,6 +864,7 @@ mod tests {
         assert!(!floor.admits(0, 99));
     }
 
+    /// An `index.toml` body naming `machine_id` / `roster_seq`, the attribution step 10 binds.
     fn index_body(machine_id: &str, roster_seq: u64, index_build: u64) -> Vec<u8> {
         let mut s = String::from("schema = 2\nindex_build = ");
         s.push_str(&index_build.to_string());
@@ -1092,19 +882,11 @@ mod tests {
         crate::testdir::dir(&format!("atpkg-{label}-"))
     }
 
-    // ---------------------------------------------------------------------------------
-    // THE DANGEROUS DIRECTION FIRST.
-    // ---------------------------------------------------------------------------------
+    // The dangerous direction first.
 
-    /// EMPTY MEANS UNPINNED MEANS INERT. An unarmed anchor authorizes NOTHING — not even
-    /// a roster genuinely signed by a real paper master, and not even one whose signature
-    /// would verify under a key that IS in the document. There is no "accept anything"
-    /// path, and the refusal happens before any crypto.
-    ///
-    /// This is the mutation that matters: flip `!anchor.is_armed()` to `anchor.is_armed()`
-    /// in `admit_roster` and this test fails on the FIRST assertion, because an unpinned
-    /// build would then hand `verify_roster` an empty keyset and — were that to change
-    /// too — trust whatever index it was handed.
+    /// An unarmed anchor authorizes nothing, not even a roster genuinely signed by a real
+    /// paper master, and refuses before any crypto. Flip `!anchor.is_armed()` in
+    /// `admit_roster` and the first assertion fails.
     #[test]
     fn an_unarmed_anchor_is_inert_and_authorizes_nothing() {
         let unarmed = Anchor::of(vec![], 0);
@@ -1118,18 +900,15 @@ mod tests {
             Some(Reject::Disabled),
             "an unpinned anchor must REFUSE, never wave through"
         );
-        // NON-VACUITY: the very same bytes and signature are accepted the moment a master
-        // is pinned, so the refusal above is about the anchor and not about the fixture.
+        // The same bytes and signature are accepted once a master is pinned, so the
+        // refusal above is the anchor, not the fixture.
         assert!(admit_roster(&armed(0), bytes, &sig, NOW).is_ok());
     }
 
-    /// The SHIPPED anchor is ARMED (2026-08-15) and the manager is live because of it.
-    /// If this ever fails, the anchor was emptied or broken in a commit — a deliberate
-    /// act that must be reviewed, not a surprise discovered by a test.
+    /// The shipped anchor is armed and the manager live because of it; emptying it is a
+    /// deliberate act to review.
     #[test]
     fn this_build_ships_armed_and_the_pinned_anchor_is_live() {
-        // Flipped 2026-08-15 with the arming commit (this was the unset-anchor
-        // tripwire the arming initially missed — atpkg's fifth).
         assert!(
             !crate::PKG_TRUST_ANCHORS.is_empty(),
             "atpkg's anchor is pins::PAPER_MASTER_PUBKEYS, armed 2026-08-15"
@@ -1144,12 +923,9 @@ mod tests {
         );
     }
 
-    // ---------------------------------------------------------------------------------
-    // THE HAPPY PATH, AND THE THREE WAYS IT IS NOT.
-    // ---------------------------------------------------------------------------------
+    // The happy path, and the ways it is not.
 
-    /// ARMED: an index signed by a machine the roster names is ACCEPTED, and the verifier
-    /// can say WHICH machine signed it.
+    /// An index signed by a machine the roster names is accepted, attributed to that machine.
     #[test]
     fn an_index_signed_by_a_roster_named_machine_is_accepted() {
         let anchor = armed(0);
@@ -1180,8 +956,8 @@ mod tests {
         );
     }
 
-    /// ARMED: an index signed by a machine that is NOT on the roster is REFUSED, though
-    /// the roster is genuine and the signature is mathematically perfect.
+    /// An index signed by a machine not on the roster is refused, though the roster is
+    /// genuine and the signature valid.
     #[test]
     fn an_index_signed_by_a_machine_outside_the_roster_is_refused() {
         let anchor = armed(0);
@@ -1192,7 +968,7 @@ mod tests {
             roster.authorize_index(raw.clone(), &thief).err(),
             Some(Reject::Verify)
         );
-        // NON-VACUITY: the same bytes signed by a listed machine are accepted.
+        // The same bytes signed by a listed machine are accepted.
         assert!(
             roster
                 .authorize_index(raw, &sign(&M3_SEED, &index_body("m3", 3, 41)))
@@ -1200,15 +976,9 @@ mod tests {
         );
     }
 
-    /// REVOCATION, and the ORDERING that makes it worth having: m11's key is genuine, was
-    /// once legitimately authorized, and still signs perfectly — and it is refused, with
-    /// its signature never checked, because the roster that names it also revokes it.
-    ///
-    /// The proof that the signature was never checked is the VERDICT: a revoked machine
-    /// leaves the candidate set in `live()`, so the failure is `Verify` ("nobody
-    /// authorized signed this") and not `Revoked` ("we checked, then noticed"). The
-    /// negative control below shows the very same bytes and signature verifying under a
-    /// roster that does not revoke it, so the refusal is the deny-list and nothing else.
+    /// A revoked machine is refused with its signature never checked: it leaves the candidate
+    /// set in `live()`, so the verdict is `Verify`, not `Revoked`. The control verifies the
+    /// same bytes under a roster that does not revoke it.
     #[test]
     fn a_revoked_machine_is_refused_and_its_signature_is_never_verified() {
         let anchor = armed(0);
@@ -1232,14 +1002,14 @@ mod tests {
             Some(Reject::Verify)
         );
 
-        // NEGATIVE CONTROL: identical bytes, identical signature, one roster generation
-        // that does not revoke m11 — accepted. So the refusal above is the revocation.
+        // Control: identical bytes and signature under a generation that does not revoke
+        // m11 are accepted, so the refusal above is the revocation.
         let mut same_but_live = roster();
         same_but_live.roster_seq = 4;
         let permissive = admit(&anchor, &same_but_live).unwrap();
         assert!(permissive.authorize_index(raw, &sig).is_ok());
 
-        // TARGETED, not a channel-wide brick: m3 on the revoking roster still works.
+        // Targeted, not a channel-wide brick: m3 on the revoking roster still works.
         let m3_raw = index_body("m3", 4, 41);
         assert!(
             revoking
@@ -1265,12 +1035,10 @@ mod tests {
         );
     }
 
-    // ---------------------------------------------------------------------------------
-    // THE ROSTER ITSELF: missing, unverifiable, stale, rolled back — all REFUSED, and
-    // never with a fallback to any older root.
-    // ---------------------------------------------------------------------------------
+    // The roster itself: missing, unverifiable, stale or rolled back is refused, with no
+    // fallback to any other root.
 
-    /// A roster signed by a DIFFERENT master is refused under the pinned one, and the
+    /// A roster signed by a different master is refused under the pinned one, and the
     /// chain never reaches a parse.
     #[test]
     fn a_roster_signed_by_the_wrong_master_is_refused() {
@@ -1281,8 +1049,8 @@ mod tests {
         );
     }
 
-    /// A ONE-BYTE EDIT anywhere in the roster is refused: adding a machine to a genuine
-    /// roster without the paper master cannot work.
+    /// A one-byte edit anywhere in the roster is refused: no machine is added without the
+    /// paper master.
     #[test]
     fn a_tampered_roster_is_refused_byte_by_byte() {
         let (bytes, sig) = published(&roster(), &MASTER_SEED);
@@ -1295,13 +1063,12 @@ mod tests {
                 "a flip at roster byte {i} must reject"
             );
         }
-        // NON-VACUITY: unflipped, the same pair verifies.
+        // Unflipped, the same pair verifies.
         assert!(admit_roster(&armed(0), bytes, &sig, NOW).is_ok());
     }
 
-    /// A ROLLED-BACK roster is refused permanently once a newer generation has been
-    /// durably seen — its master signature still verifies, which is exactly why the
-    /// ratchet exists. Signatures do not expire; documents do.
+    /// A rolled-back roster is refused once a newer generation is durably seen, though its
+    /// master signature still verifies.
     #[test]
     fn a_rolled_back_roster_is_refused_by_the_durable_floor() {
         let old = roster(); // seq 3
@@ -1314,9 +1081,8 @@ mod tests {
         assert!(admit(&armed(3), &old).is_ok());
     }
 
-    /// A LAPSED roster is refused, and an unreadable `valid_until` counts as lapsed
-    /// rather than absent — freshness is the ONLY defence a brand-new install has,
-    /// because it carries no floor.
+    /// A lapsed roster is refused, and an unreadable `valid_until` counts as lapsed, not
+    /// absent.
     #[test]
     fn a_lapsed_or_unreadable_roster_window_is_refused() {
         let mut r = roster();
@@ -1330,7 +1096,7 @@ mod tests {
         );
     }
 
-    /// A roster from a format this build does not understand is REFUSED rather than
+    /// A roster from a format this build does not understand is refused rather than
     /// misread, and the refusal is post-verify (so it is not a crypto oracle).
     #[test]
     fn a_newer_roster_schema_is_refused_not_misread() {
@@ -1356,12 +1122,10 @@ mod tests {
         );
     }
 
-    // ---------------------------------------------------------------------------------
-    // THE ARTIFACT AND THE BIND.
-    // ---------------------------------------------------------------------------------
+    // The artifact and the bind.
 
-    /// A ONE-BYTE EDIT anywhere in the index is refused — over the exact raw bytes, with
-    /// no normalization: a trailing newline or a stray space is a different document.
+    /// A one-byte edit anywhere in the index is refused, over the exact raw bytes with no
+    /// normalization: a trailing newline is a different document.
     #[test]
     fn a_tampered_index_is_refused_byte_by_byte() {
         let roster = admit(&armed(0), &roster()).unwrap();
@@ -1386,16 +1150,14 @@ mod tests {
         assert!(roster.authorize_index(raw, &sig).is_ok());
     }
 
-    /// THE ID BIND, both directions. A genuine signature by one machine cannot be
-    /// relabelled as another (the id is inside the signed bytes), a machine cannot claim
-    /// someone else's id (the roster maps id to key), an unattributed index is refused
-    /// outright, and an index cannot be paired with a roster generation that is not its
-    /// own.
+    /// The id bind, both directions: a signature cannot be relabelled as another machine, an
+    /// unattributed index is refused, and an index cannot claim a generation ahead of its
+    /// roster.
     #[test]
     fn the_index_must_name_the_machine_and_generation_that_actually_signed_it() {
         let roster = admit(&armed(0), &roster()).unwrap();
 
-        // m11 signs bytes that CLAIM m3. The key decides who signed; the claim disagrees.
+        // m11 signs bytes that claim m3. The key decides who signed; the claim disagrees.
         let raw = index_body("m3", 3, 41);
         assert_eq!(
             roster
@@ -1435,9 +1197,9 @@ mod tests {
         );
     }
 
-    /// A signature of the wrong LENGTH is refused cheaply, before the crypto, and an
-    /// index whose bytes verify but whose TOML is malformed or from a newer schema is a
-    /// post-verify refusal — not an oracle, since it is decided from authenticated bytes.
+    /// A signature of the wrong length is refused before the crypto, and an index whose
+    /// bytes verify but whose TOML is malformed or from a newer schema is a post-verify
+    /// refusal, not an oracle, since it is decided from authenticated bytes.
     #[test]
     fn cheap_local_gates_and_post_verify_parse_failures_both_fail_closed() {
         let roster = admit(&armed(0), &roster()).unwrap();
@@ -1464,11 +1226,9 @@ mod tests {
         );
     }
 
-    /// The raw-bytes property, on the signed path: a genuine signature over bytes that
-    /// contain 0xFF verifies (a verifier that ran `from_utf8_lossy` first would substitute
-    /// U+FFFD, change the bytes, and wrongly reject), and flipping that byte still fails.
-    /// The parse afterwards is what refuses non-UTF-8 — and it refuses it as `Malformed`,
-    /// AFTER the signature, never before.
+    /// A genuine signature over bytes holding 0xFF verifies (a `from_utf8_lossy` first would
+    /// change the bytes), flipping that byte fails, and the parse refuses non-UTF-8 as
+    /// `Malformed` after the signature.
     #[test]
     fn raw_non_utf8_bytes_are_verified_without_lossy_conversion() {
         let roster = admit(&armed(0), &roster()).unwrap();
@@ -1476,7 +1236,7 @@ mod tests {
         let bad_idx = raw.len();
         raw.push(0xFF);
         let sig = sign(&M3_SEED, &raw);
-        // The signature is over the exact bytes, so the failure is the PARSE, not Verify.
+        // The signature is over the exact bytes, so the failure is the parse, not Verify.
         assert_eq!(
             roster.authorize_index(raw.clone(), &sig).err(),
             Some(Reject::Malformed),
@@ -1490,10 +1250,7 @@ mod tests {
         );
     }
 
-    // ---------------------------------------------------------------------------------
-    // THE STORE'S OTHER GATES — unchanged by the single-root move, and re-proved here so
-    // a regression in them shows up in this file rather than in the field.
-    // ---------------------------------------------------------------------------------
+    // The store's other gates: freshness and the durable floors.
 
     /// now >= valid_until ⇒ Stale; now < valid_until ⇒ Ok.
     #[test]
@@ -1513,30 +1270,21 @@ mod tests {
         let floor = Floor::new(path.clone());
         // First contact: no recorded floor ⇒ accepted and recorded.
         assert_eq!(floor.check_and_record(41), Ok(()));
-        // A LOWER build is a rollback.
+        // A lower build is a rollback.
         assert_eq!(floor.check_and_record(40), Err(Reject::Rollback));
         // Equal is allowed (the gate is index_build >= floor).
         assert_eq!(floor.check_and_record(41), Ok(()));
         // A higher build advances the durable floor...
         assert_eq!(floor.check_and_record(50), Ok(()));
-        // ...so a build below the NEW floor is now rejected even though it beat the
-        // first floor — proving the advance was persisted across calls.
+        // ...so a build below the new floor is now rejected even though it beat the
+        // first floor: the advance persisted across calls.
         assert_eq!(floor.check_and_record(45), Err(Reject::Rollback));
         // A fresh Floor over the same path sees the durable value.
         assert_eq!(
             Floor::new(path.clone()).check_and_record(49),
             Err(Reject::Rollback)
         );
-        // The floor file is 0644 — Unix-only mode check.
-        //
-        // READABLE on purpose, and this assertion is the contract. The value is an
-        // anti-rollback high-water mark, not a secret. At 0600 under a root-owned
-        // SYSTEM prefix no ordinary user could read it, so every non-root invocation
-        // took `read_floor`'s unreadable branch and downgraded to "first contact (0)",
-        // silently reopening the very window the floor closes
-        // (docs/AUDIT-nux-first-open-toolchain-2026-08-31.md). Write authority is
-        // unchanged: it rests on ownership and on the owned-by-uid parent-directory
-        // check in `write`, neither of which the read bit touches.
+        // The floor file is 0644, readable by every user (see `stage_and_publish`).
         #[cfg(unix)]
         {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode();
@@ -1545,23 +1293,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A RATCHET TOUCH THAT ADVANCES NOTHING DOES NOT REWRITE THE FILE.
-    ///
-    /// `check_and_record` used to re-publish the floor on every accept, equal values
-    /// included — a temp file, `sync_all` on it, a `rename`, and a `sync_all` on the
-    /// parent directory, both syncs being `fcntl(F_FULLFSYNC)` (a full drive flush) on
-    /// Apple targets. An unchanged store takes this path five times per update pass, so
-    /// the steady state cost ten drive flushes and five atomic replaces to write down a
-    /// number the file already held.
-    ///
-    /// The witness is a HARD LINK taken before the touch: `write` publishes by
-    /// temp+`rename`, so a rewrite leaves the link on the old inode while the path gets a
-    /// new one. Comparing the two live inodes (never a remembered number) can be fooled
-    /// by inode reuse in neither direction.
-    ///
-    /// MUTATION: drop the `index_build <= recorded` early return in
-    /// `check_and_record_classified` and the first inode assertion fails; drop the
-    /// `!corrupt` or the `is_published()` conjunct and the heal/migrate assertions fail.
+    /// A ratchet touch that advances nothing does not rewrite the file (on Apple targets a
+    /// rewrite costs two full drive flushes). The witness is a hard link taken before the
+    /// touch: a temp+`rename` rewrite moves the path to a new inode. A not-yet-0644 or corrupt
+    /// floor is still rewritten.
     #[cfg(unix)]
     #[test]
     fn an_unchanged_floor_is_not_rewritten() {
@@ -1580,8 +1315,7 @@ mod tests {
             "precondition: the witness is the same file"
         );
 
-        // The every-6-hours no-op tick: the recorded value is already 4, so there is
-        // nothing to make durable and no atomic replace happens.
+        // A no-op tick: the recorded value is already 4.
         assert_eq!(floor.check_and_record(4), Ok(()));
         assert_eq!(
             ino(&path),
@@ -1597,14 +1331,12 @@ mod tests {
         assert_eq!(floor.check_and_record_classified(4), (Ok(()), None));
         assert_eq!(ino(&path), ino(&witness));
 
-        // NON-VACUITY: a genuine advance is still published durably...
+        // A genuine advance is still published durably...
         assert_eq!(floor.check_and_record(5), Ok(()));
         assert_ne!(ino(&path), ino(&witness), "an advance must reach the disk");
         assert_eq!(Floor::new(path.clone()).current(), 5);
 
-        // ...and so is a floor that is not yet `0644`. A store written before the
-        // world-readable move must be migrated even on a touch that records nothing new,
-        // or a non-root reader under a SYSTEM prefix goes on seeing "first contact"
+        // ...and so is a floor not yet `0644`, even at an unchanged value
         // (docs/AUDIT-nux-first-open-toolchain-2026-08-31.md).
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(floor.check_and_record(5), Ok(()));
@@ -1614,7 +1346,7 @@ mod tests {
             "a legacy 0600 floor is re-published readable even at an unchanged value"
         );
 
-        // ...and so is a CORRUPT file: it reads as the fail-open 0, so the ratchet has to
+        // ...and so is a corrupt file: it reads as the fail-open 0, so the ratchet has to
         // re-arm by rewriting it even at `index_build` 0, where nothing "advances".
         std::fs::write(&path, b"not-a-floor").unwrap();
         assert_eq!(floor.read_floor_classified(), (0, true));
@@ -1627,9 +1359,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The SAME `Floor` primitive now also carries the roster's `roster_seq` ratchet
-    /// (`<prefix>/roster.floor`), so the replay defence a roster generation gets is the
-    /// one the index has been getting all along — one implementation, one set of teeth.
+    /// The roster's `roster_seq` ratchet (`<prefix>/roster.floor`) is the same `Floor`.
     #[test]
     fn the_roster_floor_uses_the_same_durable_ratchet() {
         let dir = private_tmp_dir("roster-floor");
@@ -1651,17 +1381,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// THE BUILD FLOOR IS SCOPED TO THE GENERATION THAT SET IT, because `index_build` is a
-    /// number a MACHINE chooses and the roster tier must stay able to overrule a machine.
-    ///
-    /// Within one generation it is the monotonic ratchet it always was. A strictly NEWER
-    /// generation — which only the paper master can mint — re-bases it, so one machine
-    /// publishing `index_build = u64::MAX` cannot put the store beyond the reach of the very
-    /// index that revokes it.
-    ///
-    /// MUTATION: weaken `>` to `>=` (or to `!=`) in `BuildFloor::admits` and the last two
-    /// assertions fail — an equal or older generation would start waiving the floor, which
-    /// is the direction that lets a replayed index in.
+    /// The build floor binds within its generation and a strictly newer one re-bases it, so
+    /// one machine publishing `index_build = u64::MAX` cannot put the store beyond the index
+    /// that revokes it. An equal or older generation still binds.
     #[test]
     fn the_build_floor_binds_within_its_generation_and_is_rebased_by_a_newer_one() {
         let floor = BuildFloor {
@@ -1675,7 +1397,7 @@ mod tests {
             !floor.admits(7, 49),
             "below the floor, same generation ⇒ refused"
         );
-        // A STRICTLY newer generation re-bases it — the master's rescue lever.
+        // A strictly newer generation re-bases it: the master's rescue lever.
         assert!(
             floor.admits(8, 1),
             "a newer master-signed generation is not bound by a floor an older one set"
@@ -1713,22 +1435,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A FLOOR FILE THAT EXISTS BUT WILL NOT READ AS A FLOOR is detected as corruption —
-    /// and still reads as `0`. Both halves matter: the `0` because a same-uid scribbler
-    /// must not be able to wedge the store permanently (and the system never produces a
-    /// malformed floor itself — writes are temp+rename atomic), the detection because
-    /// corruption silently indistinguishable from first contact is a rollback window
-    /// reopening with nobody told.
-    ///
-    /// MUTATION: collapse the corrupt class into "absent" in `read_floor_classified`
-    /// (return `(0, false)` for unparseable content) and the three `corrupt` assertions
-    /// fail; make corruption REFUSE instead of reading 0 and the value assertions fail.
+    /// A floor file that exists but will not read as a floor is detected as corrupt and still
+    /// reads as `0`: refusing would let a same-uid scribbler wedge the store, and silent
+    /// first contact would reopen a rollback window unannounced.
     #[test]
     fn a_corrupt_floor_file_is_detected_and_still_reads_as_first_contact() {
         let dir = private_tmp_dir("floor-corrupt");
         let path = dir.join("roster.floor");
         let floor = Floor::new(path.clone());
-        // Absent is GENUINE first contact — not corruption.
+        // Absent is genuine first contact, not corruption.
         assert_eq!(floor.read_floor_classified(), (0, false));
         assert_eq!(floor.check_and_record(7), Ok(()));
         assert_eq!(floor.read_floor_classified(), (7, false));
@@ -1757,14 +1472,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A FLOOR ADVANCE THAT CANNOT PERSIST keeps the accept (refusing would trade a
-    /// bounded replay residual for a permanently wedged store) but must SURFACE the lost
-    /// advance — a silent persist failure is a standing replay window: the next run
-    /// re-reads the old floor and accepts the same generation again, which this test
-    /// demonstrates before asserting the failure is reported.
-    ///
-    /// MUTATION: restore the discarded `let _ = self.write(..)` (report nothing) and the
-    /// `Some` assertion fails.
+    /// An advance that cannot persist keeps the accept but reports the lost advance: the next
+    /// run re-reads the old floor and accepts the same generation again.
     #[cfg(unix)]
     #[test]
     fn a_failed_floor_persist_keeps_the_accept_and_reports_the_lost_advance() {
@@ -1793,8 +1502,8 @@ mod tests {
         assert_eq!(Floor::new(path.clone()).current(), 7);
         assert_eq!(floor.check_and_record(7), Ok(()));
 
-        // NEGATIVE CONTROL: with the directory healthy the same advance persists and
-        // reports nothing.
+        // Control: with the directory healthy the same advance persists and reports
+        // nothing.
         let (decision, persist_failure) = floor.check_and_record_classified(8);
         assert_eq!(decision, Ok(()));
         assert_eq!(persist_failure, None);
@@ -1802,23 +1511,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A persist that fails AFTER the temp exists must not leave the temp behind.
-    ///
-    /// The sibling `<floor>.<pid>.tmp` is named for the writing process, so a store
-    /// volume that keeps refusing the write — ENOSPC on the prefix, the exact condition
-    /// the freespace preflight exists for — otherwise accumulates one file per pid
-    /// beside each of the three floors (`floor`, `floor.gen`, `roster.floor`), written
-    /// by a `check_and_record` that runs on EVERY pass and only ever reports the lost
-    /// advance. Nothing sweeps them: atpkg's temp sweeps match `.tmp-` and
-    /// `atpkg-*.tmp`, and `gc` has never heard of this name.
+    /// A persist that fails after the temp exists removes the temp: nothing else sweeps
+    /// `<floor>.<pid>.tmp`, so a store that keeps refusing writes would collect one per pid.
     #[test]
     fn a_failed_floor_persist_removes_its_temp_file() {
         let dir = private_tmp_dir("floor-temp-litter");
         let path = dir.join("index_build.floor");
-        // A DIRECTORY standing where the floor file goes: the temp is created, written,
-        // synced and published 0644, and only the final `rename` fails. That is the
-        // shape of every post-create failure (a short `write_all`, a failed `sync_all`,
-        // a failed `set_mode`), reached without having to fill a disk.
+        // A directory where the floor file goes: only the final `rename` fails, the shape of
+        // every post-create failure, reached without filling a disk.
         std::fs::create_dir(&path).unwrap();
         let floor = Floor::new(path.clone());
         let (decision, persist_failure) = floor.check_and_record_classified(9);
@@ -1873,7 +1573,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // The post-verify parsers live in `crate::manifest`; the "parser never runs on
-    // unverified bytes" guarantee, the table-scoping/duplicate-key cases, and the
-    // attribution fields are tested there against genuine `VerifiedBytes`.
+    // The post-verify parsers are tested in `crate::manifest`, against genuine
+    // `VerifiedBytes`.
 }

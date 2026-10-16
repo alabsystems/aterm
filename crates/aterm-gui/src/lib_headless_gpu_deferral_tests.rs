@@ -12,91 +12,19 @@ fn only_a_headless_launch_that_may_use_a_gpu_defers_the_device() {
     assert!(!super::defer_gpu_build(false, false), "windowed --cpu");
 }
 
-/// The redemption's log line says what each leg cost and how the device
-/// question settled, for every shape the redemption can take.
+/// A headless boot's warm claims no first-frame Metal warm: no warm thread
+/// exists, and its first pixel demand mints without waiting on one.
+#[cfg(target_os = "macos")]
 #[test]
-fn the_redemption_line_names_every_leg_and_the_device_verdict() {
-    use super::{PixelBackendRedemptionLegs, pixel_backend_redemption_line};
-    // Illustrative legs, not a measurement: here the device leg's time is in
-    // the font thread, which is what the split exists to show.
-    let built = PixelBackendRedemptionLegs {
-        seal_ms: Some(91.4),
-        chrome_sync_ms: Some(40.0),
-        fork_ms: Some(12.0),
-        device: Some((9012.0, Ok("Intel(R) HD Graphics 630 (Metal)".into()))),
-        font_thread_ms: Some(8990.4),
-        font_join_ms: Some(8980.0),
-        install_ms: Some(8.2),
-    };
-    assert_eq!(
-        pixel_backend_redemption_line(&built, 9163.6),
-        "headless pixel backend redeemed on the main thread in 9164 ms: font seal 91 ms, \
-         chrome re-sync 40 ms, face fork 12 ms, GPU device 9012 ms (font thread 8990 ms, \
-         join wait 8980 ms; \
-         Intel(R) HD Graphics 630 (Metal)), install 8 ms — the first pixel demand of a \
-         headless run pays this once"
-    );
-    // A build that was not the process's first leaves the split unread:
-    // the device clause is the adapter alone.
-    let unsplit = PixelBackendRedemptionLegs {
-        font_thread_ms: None,
-        font_join_ms: None,
-        ..built.clone()
-    };
-    let line = pixel_backend_redemption_line(&unsplit, 9163.6);
+fn a_headless_boot_claims_no_first_frame_warm() {
+    let dir = aterm_tempfile::tempdir().expect("scratch dir");
+    crate::test_env::scoped("XDG_CONFIG_HOME", dir.path(), || {
+        let warm = super::warm_config(true, (None, None));
+        let _ = warm.backend_handle.join().expect("the backend worker");
+    });
     assert!(
-        line.contains("GPU device 9012 ms (Intel(R) HD Graphics 630 (Metal)), install"),
-        "{line}"
-    );
-    // The context failed before the join: the font thread ran (and may
-    // have landed its slot) but was never joined, so only its half prints.
-    let unavailable = PixelBackendRedemptionLegs {
-        seal_ms: Some(90.0),
-        chrome_sync_ms: Some(30.0),
-        fork_ms: Some(11.0),
-        device: Some((5.0, Err("no Metal device on this machine".into()))),
-        font_thread_ms: Some(4.0),
-        font_join_ms: None,
-        install_ms: None,
-    };
-    let line = pixel_backend_redemption_line(&unavailable, 136.0);
-    assert!(
-        line.contains(
-            "GPU device 5 ms (font thread 4 ms; unavailable: no Metal device on this \
-             machine; the CPU renderer keeps serving)"
-        ),
-        "{line}"
-    );
-    assert!(!line.contains("install"), "{line}");
-    let fork_failed = PixelBackendRedemptionLegs {
-        seal_ms: None,
-        chrome_sync_ms: None,
-        fork_ms: Some(3.0),
-        device: None,
-        font_thread_ms: None,
-        font_join_ms: None,
-        install_ms: None,
-    };
-    let line = pixel_backend_redemption_line(&fork_failed, 3.0);
-    assert!(
-        line.contains("no device built (the face fork failed"),
-        "{line}"
-    );
-    assert!(
-        !line.contains("font seal") && !line.contains("chrome re-sync"),
-        "no seal owed, neither half printed: {line}"
-    );
-    // A `--cpu` headless run: the seal and the chrome re-sync after it are
-    // two legs, never one `font seal` figure that hides the re-sync.
-    let cpu_only = PixelBackendRedemptionLegs {
-        seal_ms: Some(80.0),
-        chrome_sync_ms: Some(38.0),
-        ..PixelBackendRedemptionLegs::default()
-    };
-    let line = pixel_backend_redemption_line(&cpu_only, 118.0);
-    assert!(
-        line.contains("font seal 80 ms, chrome re-sync 38 ms, no GPU intent"),
-        "{line}"
+        !aterm_gpu::first_frame_warm_began(),
+        "a headless boot claimed the first-frame Metal warm"
     );
 }
 

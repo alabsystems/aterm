@@ -1,37 +1,24 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! THE SUCCESSOR'S HANDOFF POLICY (plan P0-5): a small, signed TOML file inside a
-//! release's `.app` that lets the NEWER build tell the OLDER one handing its sessions
-//! over to be more conservative.
+//! The successor's handoff policy: a small, signed TOML file inside a release's `.app` that
+//! lets the newer build tell the older one handing its sessions over to be more conservative.
 //!
-//! WHY IT EXISTS. An in-session update is decided by the OUTGOING build's code — the
-//! park, the screen capture, the quiet gate — and the outgoing build is the older
-//! one, so a producer bug cannot be fixed into the release that suffers it. The
-//! capture ladder (`aterm-gui`'s `seamless::carry_for_wire`) makes the producer total
-//! over the screen content it can SEE; this file is the escape hatch for the bugs it
-//! cannot see: a capture path that is slow or panics, a proof that mismatches
-//! itself, a park gate that never opens. From the release that seals it, the
-//! successor can ask every affected producer to carry less — and only while later
-//! releases keep it: a producer reads the policy of the release it hands over to
-//! alone, so one that skipped the rescuing release is covered only if the newest
+//! An in-session update is decided by the outgoing (older) build's code, so a producer bug
+//! cannot be fixed in the release that suffers it. The capture ladder (`aterm-gui`'s
+//! `seamless::carry_for_wire`) covers the screen content the producer can see; this file is
+//! the escape hatch for what it cannot: a slow or panicking capture path, a self-mismatching
+//! proof, a park gate that never opens. A producer reads only the policy of the release it
+//! hands over to, so one that skipped the rescuing release is covered only while the newest
 //! release still names it (`docs/RELEASING.md`).
 //!
-//! WHERE IT LIVES. The release cutter copies the checked-in [`SOURCE_PATH`]
-//! (`publish/handoff-policy.toml`) into the bundle at [`BUNDLE_PATH`] BEFORE it
-//! signs the bundle, so the code signature seals it with everything else under
-//! `Contents/`. The outgoing build reads it from the CANDIDATE bundle — the staged
-//! update, or the installed bundle an activation execs — only AFTER that bundle has
-//! passed the same codesign policy and sealed-identity check that authorizes it as
-//! the successor, and over the same bytes.
-//!
-//! WHY THAT IS ENOUGH TRUST. The candidate bundle is about to be exec'd as the
-//! successor with every right this process has: it will own the terminal, the PTYs
-//! and the user's files. A file sealed by that same signature can say nothing that
-//! code could not do anyway, and every knob below can only LOWER what the producer
-//! carries or relax a gate only the producer applies. None can touch a consumer
-//! check, raise a cap, change the adoption proof, or skip the verification that
-//! admitted the bundle.
+//! The cutter copies [`SOURCE_PATH`] into the bundle at [`BUNDLE_PATH`] before signing, so
+//! the code signature seals it. The outgoing build reads it from the candidate bundle only
+//! after that bundle passed the codesign policy and sealed-identity check that authorize it
+//! as the successor, over the same bytes. That is enough trust: the candidate is about to run
+//! with every right this process has, and every knob can only lower what the producer
+//! carries or relax a gate only the producer applies, never a consumer check, a cap, the
+//! adoption proof or the verification that admitted the bundle.
 //!
 //! # Schema v1
 //!
@@ -57,68 +44,47 @@
 //! date = "YYYY-MM-DD"
 //! ```
 //!
-//! SEVERAL RESCUES (r8c finding 504). A release
-//! may have to rescue more than one range of older builds, each with its own
-//! knobs, and every one of them stays while its builds may still be installed.
-//! Each rescue is a `[[ranges]]` table. The TOP-LEVEL keys stay the one range
-//! v0.97.0 and every build up to this reader's first follows ALONE (it ignores
-//! `ranges` as a key it does not know), so beside `[[ranges]]` they are written as
-//! the HULL of the list ([`PolicyFile::hull`]): the lowest `min` to the highest
-//! `max`, the highest `carry`, and the `Land` gate relaxed if any rescue relaxes
-//! it. Such a build therefore gets at least what its own rescue asks; a build in a
-//! gap between two ranges carries less than it needs to, and a degrade is never a
-//! refusal. A producer that reads `ranges` ([`PolicyFile::for_build`]) follows
-//! every rescue whose range names its build, combined the same way, and nothing
-//! when none names it; a list it cannot read (a value it does not know) leaves it
-//! on the hull, as an older build.
+//! Each rescue of a range of older builds is a `[[ranges]]` table, kept while its builds may
+//! still be installed. Producers from v0.97.0 up to the first that reads `ranges` follow the
+//! top-level keys alone, so beside `[[ranges]]` those are written as the hull of the list
+//! ([`PolicyFile::hull`]): the lowest `min` to the highest `max`, the highest `carry`, and
+//! `Land` relaxed if any rescue relaxes it. An older build gets at least what its rescue asks,
+//! one in a gap between ranges carries less than it needs, and a degrade is never a refusal.
+//! A producer that reads `ranges` ([`PolicyFile::for_build`]) combines every rescue naming its
+//! build the same way, follows nothing when none does, and stays on the hull when it cannot
+//! read the list.
 //!
-//! * `carry = "visible"` carries no scrollback; `"repaint"` carries every session
-//!   as a blank canonical screen that its program redraws, and no scrollback
-//!   either. "No scrollback" covers both ways a producer carries it — the newest
-//!   lines inside the screen carry and the whole history in a sidecar beside it
-//!   ([`CarryCeiling::carries_scrollback`]) — and the lines left behind are counted
-//!   and said like any scrollback an update cannot carry. `"full"` is the
-//!   producer's own ladder, as it ships. A producer still takes a LOWER rung than
-//!   the ceiling whenever its own ladder needs one.
-//! * `park_quiet_gate_at_land = "relaxed"` lets the automatic lane's `Land` phase
-//!   park over output still queued on a master at once, instead of after the
-//!   producer's own bounded wait. `"strict"` is the producer's gate as it ships (the
-//!   same as leaving the key out). It never relaxes the session-death check or the
-//!   capture's mid-sequence check.
-//! * `seamless` is RESERVED. It would route an update to a relaunch offer instead
-//!   of the in-session handover, and the owner's rulings on update wording forbid
-//!   asking a person to do that, so no reader implements it; the cutter refuses a
-//!   policy that sets it.
+//! * `carry = "visible"` carries no scrollback; `"repaint"` carries a blank canonical screen
+//!   its program redraws, and no scrollback. "No scrollback" covers both the screen carry and
+//!   the history sidecar ([`CarryCeiling::carries_scrollback`]), and the lines left behind
+//!   are reported like any scrollback an update cannot carry. `"full"` is the producer's own
+//!   ladder, which may still take a lower rung.
+//! * `park_quiet_gate_at_land = "relaxed"` lets the automatic lane's `Land` phase park over
+//!   output still queued on a master at once instead of after the producer's bounded wait;
+//!   `"strict"` is the shipped gate. It never relaxes the session-death or mid-sequence
+//!   checks.
+//! * `seamless` is reserved: it would route an update to a relaunch offer, which update
+//!   wording forbids asking a person for, so no reader implements it and the cutter refuses
+//!   it.
 //!
-//! READING RULES — a producer that cannot follow a file falls back to today's
-//! behaviour, never to something stricter:
+//! A producer that cannot follow a file falls back to shipped behaviour, never something
+//! stricter:
 //!
 //! * No file: no policy.
-//! * Unknown keys are ignored, so a later release can ADD a key without a schema
-//!   bump (`[[ranges]]` and `[[retired]]` were added so, and a `[[ranges]]` table's
-//!   unknown keys are ignored the same way). Bump `schema` only when an existing
-//!   key changes meaning; a producer ignores a schema it does not know rather than
-//!   guessing.
-//! * A file that is unreadable, larger than [`MAX_POLICY_BYTES`], not TOML, or that
-//!   gives a known top-level key a value this reader does not know, is ignored
-//!   whole — the caller logs one WARN naming why. A `ranges` list it cannot read
-//!   is not: the producer follows the top-level keys, the hull every older build
-//!   follows, and the caller logs one WARN naming why.
-//! * A policy that names no range holding the running build is not for it and is
-//!   ignored.
+//! * Unknown keys are ignored, so a later release can add one without a schema bump (as
+//!   `[[ranges]]` and `[[retired]]` were); bump `schema` only when a key changes meaning. An
+//!   unknown schema is ignored.
+//! * A file that is unreadable, over [`MAX_POLICY_BYTES`], not TOML, or gives a known
+//!   top-level key an unknown value is ignored whole, with one WARN. An unreadable `ranges`
+//!   list leaves the producer on the hull, with one WARN.
+//! * A policy whose range does not hold the running build is ignored.
 //!
-//! The CUTTER reads the checked-in file strictly ([`PolicyFile::parse_for_cut`]):
-//! an unknown key there is a typo that would ship as a policy nobody follows, a
-//! knob outside `[[ranges]]` has no reason and no range of its own, a rescue with
-//! no reason cannot be judged for retirement later, and top-level keys that are
-//! not the hull of the list would leave some older build less protected than its
-//! rescue asks, so each refuses the cut before a build number is claimed. It
-//! refuses a range that names no build able to hand over to the release and
-//! follow a policy ([`FIRST_POLICY_FOLLOWING_BUILD`] on), or reaches past the
-//! newest one ([`PolicyFile::names_producers`]), and a file that
-//! drops a rescue the previous release sealed ([`PolicyFile::keeps`]), unless a
-//! `[[retired]]` entry names that rescue's range with a reason and a date
-//! ([`Retired`], cutter-only: producers ignore the key).
+//! The cutter reads the checked-in file strictly ([`PolicyFile::parse_for_cut`]) and refuses
+//! the cut, before a build number is claimed, for an unknown key, a knob outside
+//! `[[ranges]]`, a rescue with no reason, top-level keys that are not the hull, a range that
+//! names no build able to follow a policy ([`FIRST_POLICY_FOLLOWING_BUILD`] on) or reaches
+//! past the newest ([`PolicyFile::names_producers`]), and a dropped rescue the previous release
+//! sealed ([`PolicyFile::keeps`]) unless a `[[retired]]` entry retires it ([`Retired`]).
 
 use std::path::Path;
 
@@ -132,20 +98,14 @@ pub const BUNDLE_PATH: &str = "Contents/Resources/aterm-handoff-policy.toml";
 /// The checked-in source the release cutter copies, relative to the workspace root.
 pub const SOURCE_PATH: &str = "publish/handoff-policy.toml";
 
-/// The largest policy file a reader admits. Schema v1 is a few keys and a short
-/// list of rescues and retirements; the bound only keeps a hostile or corrupt file
-/// from costing a read of arbitrary size.
+/// The largest policy file a reader admits; it keeps a hostile or corrupt file from costing a
+/// read of arbitrary size.
 pub const MAX_POLICY_BYTES: u64 = 16 * 1024;
 
-/// v0.97.0's build (`RELEASES.ledger`): the first release whose producer reads
-/// and FOLLOWS a successor's policy (75f60b08c, which every release since
-/// holds; v0.95.0, the release before it, was cut from a commit without it).
-/// Every later cut holds it too: that commit also added [`SOURCE_PATH`], and the
-/// cutter refuses a tree without the file. A producer older than this build
-/// hands its sessions over without looking for the file: the successor reads a
-/// loss such a producer reports as its own, whatever a policy asked, and the
-/// cutter refuses a rescue that names only such builds, which no producer would
-/// follow ([`HandoffPolicy::names_producers`]).
+/// v0.97.0's build (`RELEASES.ledger`): the first release whose producer reads and follows a
+/// successor's policy, and every later cut carries [`SOURCE_PATH`]. An older producer hands
+/// over without looking for the file, so the cutter refuses a rescue that names only such
+/// builds ([`HandoffPolicy::names_producers`]).
 pub const FIRST_POLICY_FOLLOWING_BUILD: u64 = 1_790_585_188;
 
 /// `[[ranges]]`: the rescues, one table each ([`Rescue`]).
@@ -178,10 +138,8 @@ const RESERVED_KEYS: [&str; 1] = ["seamless"];
 /// the cutter with the spelling that replaced it.
 const RETIRE_KEY: &str = "retire";
 
-/// The highest rung a producer may carry a session's screen at, from most faithful
-/// to least. Ordered in that direction — `Full < Visible < Repaint` — so the `max`
-/// of two ceilings is the more conservative one, and a ceiling GREATER than the one
-/// a capture was taken under asks for less than that capture carried.
+/// The highest rung a producer may carry a session's screen at, ordered from most faithful to
+/// least (`Full < Visible < Repaint`), so the `max` of two ceilings is the more conservative.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CarryCeiling {
     /// The producer's own ladder, scrollback included.
@@ -212,12 +170,9 @@ impl CarryCeiling {
         }
     }
 
-    /// Whether a park under this ceiling carries ANY of a session's scrollback —
-    /// `Full` only. `"visible"` and `"repaint"` promise "never scrollback", and the
-    /// producer carries scrollback two ways: inside the screen carry (its bounded
-    /// newest lines) and beside it (`aterm-gui`'s history carry, the whole history
-    /// in a sidecar file). Both read this one answer, so neither can carry what the
-    /// other withholds.
+    /// Whether a park under this ceiling carries any scrollback (`Full` only). Both the screen
+    /// carry (its bounded newest lines) and `aterm-gui`'s history sidecar read this one
+    /// answer, so neither carries what the other withholds.
     #[must_use]
     pub const fn carries_scrollback(self) -> bool {
         matches!(self, Self::Full)
@@ -252,7 +207,7 @@ impl LandQuietGate {
     }
 }
 
-/// `applies_to_producers`: the OUTGOING builds a policy is for, both ends inclusive.
+/// `applies_to_producers`: the outgoing builds a policy is for, both ends inclusive.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ProducerRange {
     pub min_build: u64,
@@ -267,10 +222,10 @@ impl ProducerRange {
     }
 }
 
-/// One schema-v1 policy as ONE producer follows it: the builds it is for and its
-/// knobs. Every field is optional; the default is no policy. A file's top-level
-/// keys read as one ([`Self::parse`]), and so do each of its `[[ranges]]` tables
-/// ([`Rescue`]) and what a producer resolves from them ([`PolicyFile::for_build`]).
+/// One schema-v1 policy as one producer follows it: the builds it is for and its knobs, all
+/// optional (the default is no policy). A file's top-level keys read as one
+/// ([`Self::parse`]), as do each `[[ranges]]` table ([`Rescue`]) and what a producer
+/// resolves from them ([`PolicyFile::for_build`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct HandoffPolicy {
     pub applies_to_producers: Option<ProducerRange>,
@@ -279,11 +234,10 @@ pub struct HandoffPolicy {
 }
 
 impl HandoffPolicy {
-    /// Parse a file's TOP-LEVEL keys the way every producer from v0.97.0 up to the
-    /// first that reads `[[ranges]]` reads the whole file — this is that code, and
-    /// beside `[[ranges]]` it answers the list's hull. Unknown keys are ignored (a
-    /// later release may add keys), and anything this reader cannot interpret is an
-    /// `Err` naming why — which the caller treats as no policy at all.
+    /// Parse a file's top-level keys as every producer from v0.97.0 up to the first that reads
+    /// `[[ranges]]` reads the whole file (this is that code); beside `[[ranges]]` it answers
+    /// the hull. Unknown keys are ignored; anything else this reader cannot interpret is an
+    /// `Err` naming why, which the caller treats as no policy.
     pub fn parse(text: &str) -> Result<Self, String> {
         Self::of_table(&table_of(text)?, false)
     }
@@ -344,8 +298,7 @@ impl HandoffPolicy {
             .is_none_or(|range| range.contains(build))
     }
 
-    /// Whether the policy asks a producer for anything at all. The checked-in file
-    /// is empty by default, and an empty policy is no policy.
+    /// Whether the policy asks a producer for anything; an empty policy is no policy.
     #[must_use]
     pub fn asks_anything(&self) -> bool {
         self.carry.is_some_and(|carry| carry != CarryCeiling::Full) || self.relaxes_land_gate()
@@ -389,20 +342,13 @@ impl HandoffPolicy {
         out
     }
 
-    /// Whether a policy that asks anything names producers that will follow it,
-    /// judged by the producer's own rule ([`Self::applies_to`]). `handing_over` is
-    /// every build that can hand its sessions to the release sealing this policy:
-    /// the builds claimed up to the newest release that shipped before it. The
-    /// policy must apply to one of them that follows a policy at all
-    /// ([`FIRST_POLICY_FOLLOWING_BUILD`] on) — a range holding none (a digit
-    /// dropped from a ten-digit build, or only builds of releases cut before the
-    /// reader) ships a rescue no producer follows, the silent no-op the strict key
-    /// read exists to prevent — and to none after the newest of them: every later
-    /// release must keep what this one seals ([`PolicyFile::keeps`]), so a range
-    /// reaching past the builds that exist would bind the producers of releases
-    /// cut later, which never had the bug. Builds only grow and a ledger only
-    /// appends, so a range that passes here passes again at every later cut that
-    /// keeps it.
+    /// Whether a policy that asks anything names producers that will follow it, by
+    /// [`Self::applies_to`]. `handing_over` is every build that can hand its sessions to the
+    /// release sealing this policy. The policy must apply to one of them that follows policies
+    /// ([`FIRST_POLICY_FOLLOWING_BUILD`] on), or it is a silent no-op (a digit dropped from a
+    /// build number), and to none after the newest: every later release must keep it
+    /// ([`PolicyFile::keeps`]), so it would bind later producers that never had the bug.
+    /// Builds only grow, so a range that passes here passes at every later cut that keeps it.
     ///
     /// # Errors
     /// What the range misses, in words for the cutter's refusal.
@@ -489,8 +435,7 @@ impl std::fmt::Display for HandoffPolicy {
 pub struct Rescue {
     /// The builds and their knobs.
     pub policy: HandoffPolicy,
-    /// What it routes around. The cutter requires one; a producer keeps whatever
-    /// the file says, or nothing.
+    /// What it routes around; the cutter requires one.
     pub reason: String,
 }
 
@@ -570,9 +515,8 @@ pub enum Ranges {
     Unreadable(String),
 }
 
-/// What one policy file says: the top-level keys every producer before
-/// `[[ranges]]` reads alone, and the rescues a producer from then on reads
-/// instead (the module doc's SEVERAL RESCUES).
+/// What one policy file says: the top-level keys every producer before `[[ranges]]` reads
+/// alone, and the rescues later producers read instead.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PolicyFile {
     /// The top-level keys ([`HandoffPolicy::parse`]): the whole policy without
@@ -583,11 +527,10 @@ pub struct PolicyFile {
 }
 
 impl PolicyFile {
-    /// Parse a file the way a PRODUCER from `[[ranges]]` on reads one: the
-    /// top-level keys by [`HandoffPolicy::parse`]'s rules (an `Err` is the whole
-    /// file ignored), and the list leniently — unknown keys in a table ignored, and
-    /// a list this build cannot read kept as [`Ranges::Unreadable`], so the
-    /// producer follows the hull.
+    /// Parse a file as a producer from `[[ranges]]` on reads it: the top-level keys by
+    /// [`HandoffPolicy::parse`]'s rules (an `Err` ignores the whole file), and the list
+    /// leniently (unknown table keys ignored; an unreadable list kept as
+    /// [`Ranges::Unreadable`], so the producer follows the hull).
     pub fn parse(text: &str) -> Result<Self, String> {
         let table = table_of(text)?;
         let legacy = HandoffPolicy::of_table(&table, false)?;
@@ -601,12 +544,11 @@ impl PolicyFile {
         Ok(Self { legacy, ranges })
     }
 
-    /// Parse the checked-in file the way the RELEASE CUTTER reads it: everything
-    /// [`Self::parse`] refuses, plus any key schema v1 does not define (a typo such
-    /// as `cary = "repaint"` would otherwise ship as a policy no producer follows),
-    /// a malformed `[[ranges]]` or `[[retired]]` table, a knob outside
-    /// `[[ranges]]`, top-level keys that are not the list's hull ([`Self::hull`]),
-    /// and a range both rescued and retired.
+    /// Parse the checked-in file as the release cutter reads it: everything [`Self::parse`]
+    /// refuses, plus any key schema v1 does not define (a typo such as `cary = "repaint"`
+    /// would ship as a policy nobody follows), a malformed `[[ranges]]` or `[[retired]]`
+    /// table, a knob outside `[[ranges]]`, top-level keys that are not the hull, and a range
+    /// both rescued and retired.
     ///
     /// # Errors
     /// Why, in words for the cutter's refusal.
@@ -666,9 +608,8 @@ impl PolicyFile {
         })
     }
 
-    /// The HULL of `rescues` — what a file's top-level keys say beside them, and
-    /// so all a build before `[[ranges]]` follows: the lowest `min` to the highest
-    /// `max`, the highest carry ceiling, and the `Land` gate relaxed when any
+    /// The hull of `rescues`, which the top-level keys must say beside them: the lowest `min`
+    /// to the highest `max`, the highest carry ceiling, and the `Land` gate relaxed when any
     /// rescue relaxes it. `None` for no rescue.
     #[must_use]
     pub fn hull(rescues: &[Rescue]) -> Option<HandoffPolicy> {
@@ -685,10 +626,8 @@ impl PolicyFile {
         ))
     }
 
-    /// What a producer running `build` follows, if anything is for it: with
-    /// `[[ranges]]`, every rescue whose range names `build`, combined
-    /// ([`HandoffPolicy::combined`], over the range they share), and `None` when
-    /// none names it; without the list, or with one this build cannot read, the
+    /// What a producer running `build` follows: with `[[ranges]]`, every rescue naming `build`
+    /// combined over the range they share, `None` when none does; without a readable list, the
     /// top-level keys, as every older build reads them.
     #[must_use]
     pub fn for_build(&self, build: u64) -> Option<HandoffPolicy> {
@@ -714,9 +653,8 @@ impl PolicyFile {
         }
     }
 
-    /// The rescues the file holds, each with its range and reason: the
-    /// `[[ranges]]` tables, or without them the top-level keys as one rescue when
-    /// they ask anything (every policy sealed before `[[ranges]]`).
+    /// The rescues the file holds: the `[[ranges]]` tables, or without them the top-level keys
+    /// as one rescue when they ask anything.
     ///
     /// # Errors
     /// A list this build cannot read, and why.
@@ -758,16 +696,12 @@ impl PolicyFile {
         Ok(())
     }
 
-    /// Whether this file KEEPS `sealed`, one rescue an earlier release sealed, as a
-    /// producer that reads `[[ranges]]` follows it ([`Self::for_build`]): every
-    /// build `sealed` names is still named, at a carry ceiling at least as
-    /// conservative, with the `Land` gate relaxed wherever `sealed` relaxed it. A
-    /// wider range, another rescue covering part of it, or a more conservative knob
-    /// all keep it; the hull an older build reads is at least the list (the cutter
-    /// holds the top-level keys to it), so it keeps it too. A producer reads only
-    /// the release it hands over to, so a rescue a later release drops stops
-    /// protecting a build that skipped the rescuing one. A `sealed` that asks
-    /// nothing is kept by anything.
+    /// Whether this file keeps `sealed`, a rescue an earlier release sealed, as a `[[ranges]]`
+    /// reader follows it ([`Self::for_build`]): every build `sealed` names is still named, at a
+    /// carry ceiling at least as conservative, with the `Land` gate relaxed wherever `sealed`
+    /// relaxed it. The hull an older build reads is at least the list, so it keeps it too. A
+    /// producer reads only the release it hands over to, so a dropped rescue stops protecting
+    /// a build that skipped the rescuing one. A `sealed` that asks nothing is always kept.
     ///
     /// # Errors
     /// The first build it drops, and how, in words for the cutter's refusal.
@@ -854,14 +788,11 @@ impl std::fmt::Display for PolicyFile {
     }
 }
 
-/// One `[[retired]]` table: the cutter's record that the rescue an earlier
-/// release sealed for exactly `producers` was dropped on purpose, why, and when,
-/// so the cut may drop what [`PolicyFile::keeps`] would otherwise hold it to (the
-/// cutter prints the reason in its transcript). Only the cutter reads the list;
-/// a producer ignores it like any key it does not know. It is a RECORD, kept in
-/// later releases: the cutter refuses an entry naming a range the file still
-/// rescues, or one the previous release sealed and this file keeps, so no entry
-/// can license a later drop of a rescue sealed again.
+/// One `[[retired]]` table: the cutter's record that the rescue an earlier release sealed for
+/// exactly `producers` was dropped on purpose, why, and when, so the cut may drop what
+/// [`PolicyFile::keeps`] would otherwise hold it to. Only the cutter reads it. It is a record
+/// kept in later releases; the cutter refuses an entry for a range the file still rescues or
+/// keeps, so no entry can license a later drop of a rescue sealed again.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Retired {
     /// The sealed rescue's range, spelled exactly.
@@ -1017,33 +948,26 @@ fn parse_range(key: &str, value: &aterm_toml::Value) -> Result<ProducerRange, St
 /// What reading a candidate bundle's policy file found.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PolicyRead {
-    /// The bundle carries no policy file — every release before this one.
+    /// The bundle carries no policy file.
     Absent,
     /// A schema-v1 policy file, as a producer reads it ([`PolicyFile::parse`]).
     Parsed(PolicyFile),
     /// A file that is there but cannot be followed, and why. Ignored: the producer
     /// behaves exactly as with no file.
     Ignored(String),
-    /// The read never reached the file's bytes — the system refused it FOR NOW (no
-    /// descriptor left, no memory, an I/O error, an interrupted call) — and why.
-    ///
-    /// NOT A VERDICT ON THE FILE (round seven, H1 finding 57). Filed as
-    /// [`Self::Ignored`], a moment of descriptor exhaustion was cached with the
-    /// candidate's verified pass as "the successor asks nothing", and for the pass's
-    /// freshness window every park ran the very capture the release had sealed a
-    /// policy to route around. A reader treats this as "unknown": the pre-verify
-    /// refuses as a passing condition, and the next attempt reads the file again.
+    /// The read never reached the file's bytes: the system refused it for now (no
+    /// descriptor, no memory, an I/O error, an interrupted call), and why. Not a verdict on
+    /// the file: filed as [`Self::Ignored`] it would be cached with the candidate's verified
+    /// pass as "the successor asks nothing". A reader treats it as unknown: the
+    /// pre-verification refuses as a passing condition and the next attempt reads again.
     Unread(String),
 }
 
-/// Read the policy of the bundle rooted at `app_root`.
+/// Read the policy of the bundle rooted at `app_root`: a regular file (a symlink is never
+/// followed) of at most [`MAX_POLICY_BYTES`] of UTF-8 TOML.
 ///
-/// ONLY EVER CALLED ON A BUNDLE THAT HAS PASSED ITS CODESIGN CHECK — see the module
-/// doc for why that is the whole trust argument; `aterm-update`'s pre-verification
-/// is the one caller, and it reads after the check and never on a refusal.
-///
-/// The file must be a regular file (a symlink is never followed) no larger than
-/// [`MAX_POLICY_BYTES`], holding UTF-8 TOML.
+/// Only ever called on a bundle that passed its codesign check, which is the whole trust
+/// argument (module doc); `aterm-update`'s pre-verification is the one caller.
 #[must_use]
 pub fn read_from_bundle(app_root: &Path) -> PolicyRead {
     let path = app_root.join(BUNDLE_PATH);
@@ -1065,10 +989,10 @@ fn judge(path: &Path, read: Result<Option<String>, ReadFailure>) -> PolicyRead {
 
 /// Why [`read_bounded`] could not hand back the file's text.
 enum ReadFailure {
-    /// A fact about the FILE: not a regular file, too large, not UTF-8, or an error
-    /// the same file would give again.
+    /// A fact about the file: not a regular file, too large, not UTF-8, or an error the same
+    /// file would give again.
     File(String),
-    /// A fact about this MOMENT ([`is_momentary`]): the bytes were never reached.
+    /// A fact about this moment ([`is_momentary`]): the bytes were never reached.
     Moment(String),
 }
 
@@ -1097,12 +1021,9 @@ fn is_momentary(error: &std::io::Error) -> bool {
     }
 }
 
-/// [`is_momentary`] for the OTHER facts a pre-verification reads off the same
-/// verified bundle at the same instant (round eight of the update audit, U19: the
-/// candidate's `Info.plist`, whose chunked-grant declaration is cached beside this
-/// policy): one sorting of a read error into "the system refused it for now" and
-/// "a fact about the file", so a moment can never be filed as a verdict on one
-/// fact while the policy beside it is refused as unread.
+/// [`is_momentary`] for the other facts a pre-verification reads off the same verified bundle
+/// (the candidate's `Info.plist`, cached beside this policy), so a moment is never filed as a
+/// verdict on one fact while the policy beside it is refused as unread.
 #[must_use]
 pub fn is_momentary_read_error(error: &std::io::Error) -> bool {
     is_momentary(error)
@@ -1118,17 +1039,15 @@ fn unreadable(error: &std::io::Error) -> ReadFailure {
     }
 }
 
-/// `Ok(None)` when there is no file at all; `Err` for one that cannot be read as a
-/// small regular UTF-8 file.
+/// `Ok(None)` when there is no file at all; `Err` for one that cannot be read as a small
+/// regular UTF-8 file.
 ///
-/// OPENED FIRST, JUDGED BY WHAT WAS OPENED. The path is opened without following a
-/// link and WITHOUT BLOCKING, and the descriptor itself must be a regular file
-/// within [`MAX_POLICY_BYTES`] before a byte is read. A check of the path followed
-/// by an open leaves a window in which a same-user process can rename a FIFO onto
-/// it, and a blocking `open(2)` of a FIFO waits for a writer that may never come —
-/// with the apply lock held on the staged lane, and every PTY reader parked on the
-/// fork lane (the same race `aterm-gui`'s seamless reader closes the same way).
-/// A FIFO opened non-blocking returns at once and is refused as not a regular file.
+/// Opened first, judged by what was opened: the path is opened without following a link and
+/// without blocking, and the descriptor must be a regular file within [`MAX_POLICY_BYTES`]
+/// before a byte is read. A check-then-open lets a same-user process rename a FIFO onto the
+/// path, and a blocking `open(2)` of a FIFO waits for a writer that may never come, with the
+/// apply lock held (staged lane) or every PTY reader parked (fork lane). Non-blocking, a FIFO
+/// opens at once and is refused as not a regular file.
 fn read_bounded(path: &Path) -> Result<Option<String>, ReadFailure> {
     use std::io::Read as _;
     let mut options = std::fs::OpenOptions::new();
@@ -1195,9 +1114,8 @@ impl Adoption {
         match read {
             PolicyRead::Absent => Self::None,
             PolicyRead::Ignored(why) => Self::Ignored(why.clone()),
-            // Never reached through `aterm-update`'s pre-verifications, which refuse
-            // an unread policy as a passing condition before any caller adopts it;
-            // total here, and read as the one thing it can be: nothing to follow.
+            // Never reached through `aterm-update`'s pre-verifications, which refuse an
+            // unread policy first; total here, and read as nothing to follow.
             PolicyRead::Unread(why) => Self::Ignored(format!("not read just then: {why}")),
             PolicyRead::Parsed(file) => match file.for_build(producer_build) {
                 None => Self::NotForThisBuild(file.clone()),
@@ -1217,10 +1135,9 @@ impl Adoption {
     }
 }
 
-/// [`Adoption::of`], plus the ONE log line it deserves: a WARN for a file that
-/// cannot be followed, an INFO for a policy that is followed or is not for this
-/// build, nothing when there is nothing to say. `candidate` names the bundle for
-/// the log ("staged update build 1790…").
+/// [`Adoption::of`], plus its one log line: a WARN for a file that cannot be followed, an
+/// INFO for a policy followed or not for this build. `candidate` names the bundle for the log
+/// ("staged update build 1790…").
 #[must_use]
 pub fn adopt(read: &PolicyRead, producer_build: u64, candidate: &str) -> Option<HandoffPolicy> {
     if let PolicyRead::Parsed(PolicyFile {
@@ -1257,6 +1174,7 @@ mod tests {
     use super::*;
 
     /// A wait for something that must happen is a hang detector, never a latency budget.
+    #[cfg(unix)]
     const HANG_DETECTOR: std::time::Duration = std::time::Duration::from_secs(60);
 
     fn policy(text: &str) -> HandoffPolicy {
@@ -1296,10 +1214,7 @@ mod tests {
         );
     }
 
-    /// "visible" and "repaint" carry NO scrollback — the one reading both of the
-    /// producer's scrollback carries take — and the order runs from most faithful
-    /// to least, so a greater ceiling asks for less (what the fork lane's check of
-    /// a capture against a policy read after it compares).
+    /// Only `Full` carries scrollback, and a greater ceiling asks for less.
     #[test]
     fn only_a_full_ceiling_carries_scrollback_and_greater_is_more_conservative() {
         assert!(CarryCeiling::Full.carries_scrollback());
@@ -1314,10 +1229,8 @@ mod tests {
         );
     }
 
-    /// A later release may ADD keys without a schema bump, so a producer ignores
-    /// what it does not know — including the reserved `seamless`, which no build
-    /// implements, and an unknown key inside a `[[ranges]]` table. The cutter,
-    /// reading our own file, refuses all three.
+    /// A producer ignores unknown keys (a reserved `seamless`, an unknown key in a
+    /// `[[ranges]]` table); the cutter refuses all of them.
     #[test]
     fn unknown_keys_are_ignored_by_a_producer_and_refused_by_the_cutter() {
         let text = "schema = 1\ncarry = \"visible\"\nsome_future_knob = 3\n[future]\nx = 1\n";
@@ -1350,12 +1263,8 @@ mod tests {
         );
     }
 
-    /// Every knob the cutter seals is a rescue with its own range and reason, so a
-    /// later release can tell what each one is for and when to retire it: a knob
-    /// outside `[[ranges]]` is refused, and so is a table with no range, no
-    /// reason, or nothing asked. A producer still reads an unranged top-level knob
-    /// as "every build" (the schema's reading rule), since refusing it there would
-    /// only drop a rescue.
+    /// The cutter refuses a knob outside `[[ranges]]` and a table with no range, no reason or
+    /// nothing asked; a producer still reads an unranged top-level knob as every build.
     #[test]
     fn the_cutter_refuses_a_knob_that_is_not_a_rescue_with_its_builds_and_reason() {
         for loose in [
@@ -1413,9 +1322,8 @@ mod tests {
         }
     }
 
-    /// Builds 100-199 panic in their capture (blank screens), builds 250-299 never
-    /// open their `Land` gate (relaxed): two rescues with different knobs, under
-    /// their hull.
+    /// Builds 100-199 panic in their capture (repaint), builds 250-299 never open their `Land`
+    /// gate (relaxed): two rescues under their hull.
     const RESCUE_A: &str =
         "[[ranges]]\nproducers = [100, 199]\ncarry = \"repaint\"\nreason = \"capture panics\"\n";
     const RESCUE_B: &str = "[[ranges]]\nproducers = [250, 299]\npark_quiet_gate_at_land = \
@@ -1431,11 +1339,9 @@ mod tests {
         PolicyFile::parse(text).unwrap_or_else(|why| panic!("{text:?}: {why}"))
     }
 
-    /// THE HULL (r8c finding 504): the lowest `min` to the highest `max`, the
-    /// highest carry ceiling, the `Land` gate relaxed when any rescue relaxes it —
-    /// so a build that reads only the top-level keys gets at least its own
-    /// rescue. The cutter holds the top-level keys to it exactly, and says what to
-    /// write when they are not.
+    /// The hull: lowest `min` to highest `max`, highest ceiling, the gate relaxed if any
+    /// rescue relaxes it. The cutter holds the top-level keys to it exactly and says what to
+    /// write.
     #[test]
     fn the_top_level_keys_beside_ranges_are_the_hull_of_the_rescues() {
         let Ranges::Listed(rescues) = file(&two_rescues()).ranges else {
@@ -1453,8 +1359,7 @@ mod tests {
             })
         );
         assert_eq!(PolicyFile::hull(&[]), None);
-        // A visible rescue and a repaint one: the hull carries the more
-        // conservative; neither relaxes the gate, so the hull does not either.
+        // Visible and repaint: the hull carries the more conservative, and no gate relaxed.
         let visible = "[[ranges]]\nproducers = [300, 310]\ncarry = \"visible\"\nreason = \"x\"\n";
         let Ranges::Listed(rescues) = file(&format!("schema = 1\n{RESCUE_A}\n{visible}")).ranges
         else {
@@ -1483,11 +1388,9 @@ mod tests {
         }
     }
 
-    /// A PRODUCER THAT READS `[[ranges]]` follows the rescues naming its own build
-    /// alone: a build in one range follows that rescue's knobs and no other's, a
-    /// build two overlapping rescues name follows the more conservative of each
-    /// knob, and a build in a gap between ranges, or outside them all, follows
-    /// nothing — though the hull covers it.
+    /// A `[[ranges]]` reader follows only the rescues naming its build: one range's knobs
+    /// alone, the more conservative of each knob under an overlap, and nothing in a gap or
+    /// outside them all.
     #[test]
     fn a_producer_that_reads_ranges_follows_only_the_rescues_naming_its_build() {
         let overlap = "[[ranges]]\nproducers = [180, 260]\ncarry = \"visible\"\nreason = \"x\"\n";
@@ -1514,8 +1417,7 @@ mod tests {
             "B and the overlap"
         );
         assert_eq!(at(280), Some((CarryCeiling::Full, true)), "B alone");
-        // The resolved policy names a range holding the build: the rescues' shared
-        // stretch, so a check of `applies_to` on it agrees.
+        // The resolved policy's range is the rescues' shared stretch, holding the build.
         assert_eq!(
             follows(190).and_then(|policy| policy.applies_to_producers),
             Some(ProducerRange {
@@ -1536,12 +1438,9 @@ mod tests {
         );
     }
 
-    /// AN OLDER PRODUCER SEES THE HULL. v0.97.0 through v0.100.0 read the file
-    /// with [`HandoffPolicy::parse`] — this very code: their top-level read and
-    /// `aterm-toml`'s parser are unchanged since v0.97.0 but for comments — and
-    /// ignore `ranges` and `retired` as keys they do not know. So each of them
-    /// in a rescued range carries at least what its own rescue asks, and one in a
-    /// gap carries less than it needs to: a degrade, never a refusal (L1).
+    /// Producers from v0.97.0 to v0.100.0 read the file with [`HandoffPolicy::parse`] (this
+    /// code) and ignore `ranges` and `retired`, so each in a rescued range carries at least
+    /// what its rescue asks, and one in a gap carries less: a degrade, never a refusal.
     #[test]
     fn a_producer_before_ranges_reads_the_hull_and_is_never_refused() {
         let text = format!(
@@ -1555,7 +1454,7 @@ mod tests {
             HandoffPolicy::parse(HULL_AB).expect("the top-level keys alone"),
             "the lists change nothing an older build reads"
         );
-        // How such a build adopts: its own policy, with no list.
+        // Such a build adopts the top-level keys, with no list.
         let older = PolicyRead::Parsed(PolicyFile {
             legacy: hull,
             ranges: Ranges::Absent,
@@ -1579,9 +1478,7 @@ mod tests {
         ));
     }
 
-    /// A list this build cannot read — a value it does not know, a table with no
-    /// range — leaves it on the hull, as an older build: never less than what the
-    /// release asked of it, and never the whole file ignored.
+    /// A list this build cannot read leaves it on the hull, never the whole file ignored.
     #[test]
     fn a_ranges_list_this_build_cannot_read_leaves_it_on_the_hull() {
         for unreadable in [
@@ -1602,10 +1499,9 @@ mod tests {
         }
     }
 
-    /// `[[retired]]` is the cutter's record: it reads it strictly — a range, a
-    /// reason and a date, nothing else — and a producer ignores it like any key it
-    /// does not know. The one-cut `retire` key it replaced is refused with the new
-    /// spelling, and a range both rescued and retired is refused.
+    /// The cutter reads `[[retired]]` strictly (a range, a reason and a date, nothing else); a
+    /// producer ignores it. The old `retire` key and a range both rescued and retired are
+    /// refused.
     #[test]
     fn a_retirement_is_read_strictly_by_the_cutter_and_ignored_by_a_producer() {
         let entry = "[[retired]]\nproducers = [10, 20]\nreason = \"all past EOL\"\ndate = \
@@ -1667,8 +1563,7 @@ mod tests {
         );
     }
 
-    /// Anything a v1 reader cannot interpret is the whole file ignored — never a
-    /// guess, and never a stricter park than the build ships with.
+    /// Anything a v1 reader cannot interpret ignores the whole file, saying why.
     #[test]
     fn a_malformed_policy_is_refused_whole_and_says_why() {
         for (text, why) in [
@@ -1708,10 +1603,9 @@ mod tests {
         }
     }
 
-    /// A later release keeps what an earlier one sealed: the same or a wider
-    /// range, a ceiling no less conservative, the Land gate still relaxed. Each
-    /// way of dropping a knob is refused by name, and a sealed policy that asks
-    /// nothing binds nothing.
+    /// A later policy keeps what an earlier one sealed (the same or a wider range, a ceiling
+    /// no less conservative, the gate still relaxed); each drop is refused by name, and a
+    /// sealed policy that asks nothing binds nothing.
     #[test]
     fn a_later_policy_keeps_every_knob_an_earlier_one_sealed() {
         let sealed = policy("schema = 1\napplies_to_producers = [10, 20]\ncarry = \"visible\"\n");
@@ -1769,11 +1663,9 @@ mod tests {
         }
     }
 
-    /// A sealed rescue is kept by the RANGES a producer reads, build by build:
-    /// split across two tables, inside a wider one, or under an overlap that
-    /// asks more. A gap opened inside it, a weaker knob on part of it, or the
-    /// relaxed gate dropped for one stretch is refused, naming the first build
-    /// it drops.
+    /// A sealed rescue is kept build by build by the ranges a producer reads: split, inside a
+    /// wider one, or under an overlap asking more. A gap, a weaker knob on part of it, or the
+    /// relaxed gate dropped for a stretch is refused, naming the first build it drops.
     #[test]
     fn a_sealed_rescue_is_kept_build_by_build_through_any_ranges_that_cover_it() {
         let sealed = policy(
@@ -1878,8 +1770,8 @@ mod tests {
             Adoption::NotForThisBuild(_)
         ));
         assert_eq!(Adoption::of(&repaint, 9).policy(), None);
-        // An empty policy — the checked-in default — and a policy that asks for
-        // the build's own behaviour are nothing to follow.
+        // An empty policy (the checked-in default) and one asking for the shipped behaviour
+        // are nothing to follow.
         for nothing in [
             "schema = 1\n",
             "schema = 1\ncarry = \"full\"\npark_quiet_gate_at_land = \"strict\"\n",
@@ -1987,13 +1879,9 @@ mod tests {
         }
     }
 
-    /// A READ THE SYSTEM REFUSED FOR NOW IS UNREAD, NOT IGNORED (round seven, H1
-    /// finding 57). Out of descriptors (a launchd-started window's soft limit of 256
-    /// on a large desk), out of memory, an I/O error: the file's bytes were never
-    /// reached, so nothing is known about what it asks. Filed as `Ignored` — the
-    /// verdict for a malformed file — it was cached as "the successor asks nothing"
-    /// and every park for ten minutes ran the capture the policy was sealed to avoid.
-    /// An error the same file would give again stays a verdict on the file.
+    /// A read the system refused for now (out of descriptors or memory, an I/O error) is
+    /// `Unread`, not `Ignored`: nothing is known about what the file asks. An error the same
+    /// file would give again stays a verdict on the file.
     #[cfg(unix)]
     #[test]
     fn a_read_the_system_refused_for_now_is_unread_and_a_file_error_is_ignored() {
@@ -2011,7 +1899,7 @@ mod tests {
                 matches!(unreadable(&error), ReadFailure::Moment(why) if why.contains("unreadable")),
                 "errno {errno} ({error}) is a moment"
             );
-            // The one sorting the Info.plist read beside it shares (U19).
+            // The same sorting the Info.plist read uses.
             assert!(is_momentary_read_error(&error), "errno {errno}");
         }
         for errno in [libc::EACCES, libc::EPERM, libc::EISDIR, libc::ENOTDIR] {
@@ -2022,7 +1910,7 @@ mod tests {
             );
             assert!(!is_momentary_read_error(&error), "errno {errno}");
         }
-        // And what each becomes, read off a bundle.
+        // What each becomes, read off a bundle.
         let at = std::path::Path::new("/x/Contents/Resources/aterm-handoff-policy.toml");
         let unread = judge(
             at,
@@ -2040,13 +1928,8 @@ mod tests {
         assert_eq!(Adoption::of(&unread, 1).policy(), None);
     }
 
-    /// A FIFO WHERE THE POLICY SHOULD BE IS REFUSED AT ONCE, NEVER WAITED ON. The
-    /// reader runs with the apply lock held (the staged lane) or with every PTY
-    /// reader parked (the fork lane), and a blocking `open(2)` of a FIFO waits for
-    /// a writer that never comes. The file is opened first and judged by what was
-    /// opened, so this is exactly the open a FIFO renamed onto the path between a
-    /// check and an open would meet. RED with a blocking open: the reader parks in
-    /// `open` and the hang detector's `recv_timeout` below gives up.
+    /// A FIFO where the policy should be is refused at once, never waited on (the open a FIFO
+    /// renamed onto the path would meet). Red with a blocking open: the hang detector fires.
     #[cfg(unix)]
     #[test]
     fn a_fifo_in_place_of_the_policy_is_refused_without_waiting_for_a_writer() {

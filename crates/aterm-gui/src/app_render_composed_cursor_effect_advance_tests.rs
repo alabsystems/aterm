@@ -38,6 +38,23 @@ fn output_streak_inert_gate_covers_every_zero_work_policy() {
     assert!(output_streak_inert(true, true, 1.0, true));
 }
 
+/// SERIOUS MODE TAKES THE COMET: Prism wake is decoration, so the gate every
+/// streak seam reads (`App::output_streak_shows`, the composed path's config
+/// included) is closed while Serious Mode is on, whatever the switch says;
+/// NEGATIVE CONTROL: without Serious Mode the same switch opens it.
+#[test]
+fn serious_mode_takes_the_output_streak() {
+    let now = Instant::now();
+    let mut app = App::headless_for_test();
+    enable_output_streak(&mut app);
+    assert!(app.output_streak_shows(), "the switch alone opens it");
+    assert!(app.composed_output_streak_config(now, true, true).enabled);
+    app.serious_mode = true;
+    assert!(!app.output_streak_shows(), "Serious Mode closes it");
+    assert!(!app.composed_output_streak_config(now, true, true).enabled);
+    assert!(app.composed_output_streak_config(now, true, true).inert());
+}
+
 #[test]
 fn composed_output_streak_inert_policy_builds_no_pane_engines() {
     let t0 = Instant::now();
@@ -75,11 +92,8 @@ fn composed_output_streak_inert_policy_builds_no_pane_engines() {
     assert!(pure.windows[&pure_wid].fx.streak_panes().next().is_none());
 }
 
-/// The streak takes the cursor trail's focus: `motion.animate(OutputStreak)`
-/// resolves on `cursor_fx_focus`, so an unfocused window spawns no streak
-/// unless it is typed into (the typed wake) or recorded (the recording pin),
-/// and does spawn during either. Each arm is a fresh split driven by real
-/// output.
+/// The streak resolves on `cursor_fx_focus`, so an unfocused window streaks only while typed
+/// into (the typed wake) or recorded (the recording pin).
 #[test]
 fn an_unfocused_window_streaks_only_while_typed_into_or_recorded() {
     #[derive(Clone, Copy, Debug)]
@@ -511,11 +525,8 @@ fn arm_synthetic_typed(app: &mut App, wid: WindowId, now: Instant) {
     window.fx.cursor_mut().trail.note_synthetic_typed(now);
 }
 
-/// Type one printable character through the same seam the input host
-/// uses: the press stamps the typed LICENSE, then the byte reaches the
-/// terminal. The composed tick that follows observes the caret advance
-/// and — because a human touched the keyboard inside the freshness
-/// window — mints its cat pulse.
+/// Type one character through the input host's seam: the press stamps the typed license, then
+/// the byte reaches the terminal, so the next composed tick mints its cat pulse.
 fn type_one_licensed_echo(
     app: &mut App,
     wid: WindowId,
@@ -561,10 +572,8 @@ fn bind_extracted_cat_pulse_route(
     replay_changed_cat: bool,
 ) {
     let model = aterm_spec::derive::cursor_cat_motion_pulse_routing_model();
-    // PROVENANCE, classifier-fed: the pulse exists because a licensed spawn
-    // classified this move as a typed advance/fold. `licensed` is read off
-    // the engine's own admission ring, so a route bound here is bound to a
-    // pulse the licence seam let through.
+    // Provenance: the pulse exists because a licensed spawn classified this move as a typed
+    // advance or fold (`licensed` is read off the engine's own admission ring).
     let licensed_state = model.successors("LicenseMove", &model.init_state())[0].clone();
     let classified_state = model.successors("ClassifyPulse", &licensed_state)[0].clone();
     assert_eq!(
@@ -667,9 +676,8 @@ fn bind_ordinary_cat_pulse_route(
     );
     assert!(ok, "ordinary runtime pulse route rejected: {why}");
 
-    // Field-sensitive/non-vacuous control: leave every real projection
-    // intact except the delivery count. An ordinary take without its
-    // same-frame cat delivery must not satisfy the healthy action.
+    // Negative control: only the delivery count differs. A take without its same-frame cat
+    // delivery must not satisfy the healthy action.
     let mut forged_undelivered = observed.clone();
     forged_undelivered.insert("deliveries", 0);
     let (ok, _) = aterm_spec::verify::validate_transition_tiered(
@@ -827,14 +835,9 @@ fn mixed_advance_drains_muted_cues_and_retain_does_not_advance() {
     );
 }
 
-/// A history retain arms no hide the next live frame would take.
-///
-/// `rk::Engine::hide_next_frame` is taken by the tick, and the `Retain` arm
-/// never ticks, so a hide armed from
-/// [`App::retire_composed_cursor_effects_for_history`] would blank the band
-/// on the next live frame. `TornBand::Keep` reads
-/// `CursorGlow::v2_owns_frame` instead. Pinned: nothing is armed over
-/// history, the band is kept, and the following live frame draws it.
+/// The `Retain` arm never ticks, so a hide armed over history (`rk::Engine::hide_next_frame`)
+/// would blank the band on the next live frame. Pinned: nothing is armed over history, the band
+/// is kept (`TornBand::Keep`), and the next live frame draws it.
 #[test]
 fn a_history_retain_keeps_the_band_and_arms_no_hide_the_next_live_frame_would_take() {
     let (mut app, wid, session) = mixed_fixture("rainbow kitty");
@@ -849,9 +852,8 @@ fn a_history_retain_keeps_the_band_and_arms_no_hide_the_next_live_frame_would_ta
             .is_some()
         );
     };
-    // The scrollback to scroll INTO is written before the band is laid:
-    // forty fresh lines afterwards would scroll the band's own rows off
-    // the grid, and the frame it did not draw would be honest.
+    // Scrollback is written before the band is laid: forty lines written after it would scroll
+    // the band's rows off the grid, and a missing band would then be correct.
     {
         let mut terminal = term_lock(&term);
         terminal.process(&b"history\r\n".repeat(40));
@@ -1031,11 +1033,9 @@ fn run_alt_reanchor(with_repaint_blink: bool) -> (Vec<aterm_render::TrailCell>, 
     let t0 = Instant::now();
     term_lock(&term).process(b"\x1b[?1049h\x1b[6;3H");
     assert!(app.composed_cursor_frame(wid, ComposedCursorFxClock::Advance(t0)));
-    // A real press, so the relocation that follows is licensed. What the
-    // repaint blink then decides is the MORPHOLOGY: a Claude-Code-style
-    // hide-inside-sync redraw is a re-anchor (no comet across cells the
-    // caret never swept), while an unblinked alt move — vim's own one-row
-    // motions — keeps its comet, exactly as v0.43.0 had it.
+    // A real press licenses the relocation. The repaint blink then decides the morphology: a
+    // hide-inside-sync redraw (Claude Code's) re-anchors with no comet, while an unblinked alt
+    // move (vim's one-row motions) keeps its comet.
     {
         let window = app.windows.get_mut(&wid).expect("test window");
         window
@@ -1374,9 +1374,8 @@ fn composed_idle(app: &mut App, wid: WindowId, mut t: Instant, ms: u64) -> Insta
     t
 }
 
-/// The composed shapes the witness is fed under. All of them route through
-/// `composed_cursor_frame_sampled`; what
-/// differs is where the focused pane sits in the window.
+/// The composed shapes the witness is fed under. All route through
+/// `composed_cursor_frame_sampled`; they differ in where the focused pane sits.
 #[derive(Clone, Copy, Debug)]
 enum ComposedShape {
     /// One split beside the native sibling: a column offset (Horizontal)
@@ -1433,8 +1432,8 @@ fn composed_hello(
     };
     let term = app.pool.get(session).expect("terminal leaf").term.clone();
     let (row_off, col_off) = focused_pane_origin(&mut app, wid);
-    // The shape is what it claims: a three-pane focused leaf is offset on
-    // Both axes, and a zoomed tab plans as zoomed.
+    // The shape is what it claims: a three-pane focused leaf is offset on both axes, and a
+    // zoomed tab plans as zoomed.
     match shape {
         ComposedShape::ThreePane => assert!(
             row_off > 0 && col_off > 0,
@@ -1464,13 +1463,11 @@ fn composed_hello(
     (app, wid, term, t, win_row, win_col)
 }
 
-/// A program re-lays its input box two rows down with no key behind it: the
-/// move is declined, and the band follows its text (`rk::witness`'s follow
-/// pass, `Engine::follow_rows`) to the glyphs standing two rows down, with
-/// every clock intact: nothing on the old row, nothing retired,
-/// `ribbon_followed=11`. That count proves the composed path feeds the
-/// witness. Single-pane twin: `abandoned_ribbon.rs`'s
-/// `a_relocated_input_box_carries_the_band_with_its_text_and_stamps_nothing`.
+/// A program re-lays its input box two rows down with no key behind it: the move is declined
+/// and the band follows its text (`Engine::follow_rows`) with nothing retired;
+/// `ribbon_followed=11` proves the composed path feeds the witness. Single-pane twin:
+/// `a_relocated_input_box_carries_the_band_with_its_text_and_stamps_nothing` in
+/// `abandoned_ribbon.rs`.
 #[test]
 fn a_relocated_input_box_carries_its_band_with_its_text_on_a_composed_frame() {
     for shape in [
@@ -1508,13 +1505,9 @@ fn a_relocated_input_box_carries_its_band_with_its_text_on_a_composed_frame() {
     }
 }
 
-/// The witness reads the focused pane's own cells, with the pane's column
-/// rotation and row offset; otherwise it compares ribbon cells against
-/// another pane's glyphs. Covered: both splits (one offset each), a
-/// three-pane layout (both offsets) and a zoomed leaf, with the band on a
-/// row the caret has left (read into a resident witness slot). Also the
-/// shape law: a lone glyph changed strictly inside the band is not
-/// evidence, the same change at the band's last cell retires.
+/// The witness reads the focused pane's own cells, with its row and column offsets, on every
+/// composed shape, for a band on a row the caret has left. Also the shape law: a lone glyph
+/// changed strictly inside the band is not evidence; the same change at its last cell retires.
 #[test]
 fn the_composed_witness_reads_the_focused_pane_s_own_rows_and_columns() {
     for axis in [
@@ -1534,10 +1527,8 @@ fn the_composed_witness_reads_the_focused_pane_s_own_rows_and_columns() {
             "{axis:?}: a redraw of the same text retired the caret's row"
         );
 
-        // Return: the caret LEAVES the band's row on a licensed move, so
-        // the band stays where it was typed and row-scoped renewal no
-        // longer touches it. From here on row `win_row` is sampled into
-        // its pane-local resident witness slot — the read this test is about.
+        // Return: the caret leaves the band's row on a licensed move, so the band stays where
+        // it was typed and row `win_row` is read from its pane-local resident witness slot.
         let t = t + Duration::from_millis(90);
         app.windows
             .get_mut(&wid)
@@ -1580,11 +1571,8 @@ fn the_composed_witness_reads_the_focused_pane_s_own_rows_and_columns() {
             "{axis:?}: a lone interior glyph change retired a standing run"
         );
 
-        // One changed glyph at the end of the same run, caret undisturbed,
-        // is a suffix and retires: the non-vacuity arm (a starved witness
-        // passes the interior arm and fails here). Exactly one cell retires,
-        // since the interior record already took the glyph standing there;
-        // a witness that did not would retire two.
+        // The same change at the run's last cell is a suffix and retires (the non-vacuity arm).
+        // Exactly one cell retires: the interior record already took the glyph standing there.
         term_lock(&term).process(b"\x1b7\x1b[6;11HX\x1b8");
         let _ = composed_idle(&mut app, wid, t, 32);
         assert_eq!(
@@ -1877,7 +1865,7 @@ fn composed_neighbor_witness_uses_its_captured_change_after_later_pty_output() {
         assert!(app.composed_cursor_frame(wid, ComposedCursorFxClock::Advance(t)));
         let plan = app.active_visible_leaf_plan(wid).unwrap();
         let session = app.windows[&wid].composed_cursor_effect_session.unwrap();
-        // The changed last glyph is IN the exact extracted neighbor row.
+        // The changed last glyph is in the extracted neighbor row itself.
         term_lock(&term).process(b"\x1b7\x1b[6;11HX\x1b8");
         let sample = focused_composed_cursor_fx_sample(
             session,
@@ -1966,7 +1954,7 @@ fn composed_witness_generation_model_matches_real_terminal_mutations() {
             captured.is_some(),
             model.action_enabled("ReadCaptured", &state)
         );
-        // The generation fence rejects all of these unrelated generations.
+        // Identity and display offset are unchanged: only the generation fences these writes.
         assert_eq!(stamp.terminal_id, term_lock(&term).render_identity());
         assert_eq!(term_lock(&term).grid().display_offset(), 0);
     }
@@ -1990,10 +1978,8 @@ fn set_coherence_state(
     color: &str,
     style: &str,
 ) {
-    // Deliberately avoid ED2 here: erase-display is a content-coordinate
-    // invalidation and correctly resets both cursor engines. This fixture
-    // tests coherent sampling across an ordinary authored cursor move, so
-    // overwrite its marker in place and preserve the seeded source anchor.
+    // Not ED2: erase-display invalidates content coordinates and resets both cursor engines.
+    // This fixture is an ordinary authored move, so it overwrites the marker in place.
     let sequence = format!(
         "\x1b[H{marker}\x1b[{};{}H\x1b]12;#{color}\x07{style}",
         cursor.0 + 1,
@@ -2085,15 +2071,13 @@ fn visible_terminal_handles(
         .collect()
 }
 
-/// The DEC 2026 close/reopen scripts on every present route, one row per
-/// (route, script). Each route writes each step to every visible terminal
-/// (a pure split formats the pane index into its bytes) and then presents;
-/// the row's `(ms, present?)` sequence is the law.
+/// DEC 2026 close/reopen on every present route, one row per (route, script): each step is
+/// written to every visible terminal, then presented; the `(ms, present?)` sequence is the law.
 ///
-/// * CLEAN close+reopen: the completed bracket keeps exactly one present
-///   license, and the newly armed episode holds on the following frame.
-/// * DIRTY reopen: writes in the reopened episode replaced the close boundary,
-///   so the partial next frame stays off glass until that episode closes.
+/// * Clean close+reopen: the completed bracket keeps exactly one present license, and the newly
+///   armed episode holds on the following frame.
+/// * Dirty reopen: writes in the reopened episode replace the close boundary, so the partial
+///   frame stays off glass until that episode closes.
 #[test]
 fn close_reopen_presents_once_and_a_dirty_reopen_never_presents_partial() {
     #[derive(Clone, Copy, Debug)]
@@ -2994,11 +2978,8 @@ fn headless_composed_capture_keeps_effects_and_cells_on_one_focused_sample() {
     );
 }
 
-/// A pane's snapshot retires with its route. `unfocused_pane_scratch` is
-/// pruned only inside the composed route and keyed by pane index, so no
-/// teardown can address it; a window that unsplit or switched to a
-/// single-pane, native or mixed tab would otherwise keep every background
-/// pane's snapshot, including sole ownership of inline image payloads.
+/// `unfocused_pane_scratch` is pruned only inside the composed route; every other route clears
+/// it (rationale on `App::retire_unfocused_pane_snapshots`).
 #[test]
 fn only_the_composed_route_keeps_the_unfocused_pane_snapshots() {
     let mut app = App::headless_for_test();
@@ -3015,8 +2996,8 @@ fn only_the_composed_route_keeps_the_unfocused_pane_snapshots() {
             .entry(0)
             .or_default();
     };
-    // Control: the composed route keeps them (it prunes to the live pane
-    // set), so a fix that cleared unconditionally fails here.
+    // Control: the composed route keeps them (it prunes to the live pane set), so clearing
+    // unconditionally fails here.
     park(&mut app);
     App::retire_unfocused_pane_snapshots(
         app.windows.get_mut(&wid).expect("test window"),

@@ -667,7 +667,7 @@ pub struct UniformExtras<'a> {
 /// - Combining Diacritical Marks Supplement (U+1DC0-U+1DFF)
 /// - Combining Diacritical Marks for Symbols (U+20D0-U+20FF)
 /// - Combining Half Marks (U+FE20-U+FE2F)
-#[cfg(any(test, feature = "testing"))]
+#[cfg(any(test, debug_assertions))]
 #[must_use]
 #[inline]
 pub fn is_combining_mark(c: char) -> bool {

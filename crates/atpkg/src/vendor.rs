@@ -3,37 +3,24 @@
 
 //! Per-protocol row admission, the system-satisfaction probe, and the PATH-shadow probe.
 //!
-//! A `protocol = "https"` artifact row is a roster-signed manifest row that pins a
-//! VENDOR's own download (`url`) by `sha256` + `size` + `tree_root`. The client downloads
-//! straight from the vendor, verifies against the signed digests, and shims the result
-//! like a plain binary ([`crate::dispatch::ApplyStrategy::Shim`]) or lays its `.app`
-//! ([`crate::dispatch::ApplyStrategy::VendorApp`]). Nothing third-party is ever mirrored
-//! onto the index owner's hosting — that is the whole point of the lane (Claude Code's
-//! license forbids redistribution; Codex's does not need it).
+//! A `protocol = "https"` row is a roster-signed manifest row pinning a vendor's own download
+//! (`url`) by `sha256`, `size` and `tree_root`: the client downloads straight from the
+//! vendor, verifies against the signed digests, and shims the result
+//! ([`crate::dispatch::ApplyStrategy::Shim`]) or lays its `.app`
+//! ([`crate::dispatch::ApplyStrategy::VendorApp`]). Nothing third-party is mirrored onto the
+//! index owner's hosting (Claude Code's license forbids redistribution). The vendor host is
+//! only a transport; [`check_row`] narrows where a signed row may point and refuses shapes
+//! the stage lanes could mis-stage, before any byte moves.
 //!
-//! The OS-installer protocols (`pkg`, `system-pm`, `softwareupdate`) were deleted
-//! 2026-09-24 (design 2026-09-22 §5.3(b)); [`check_row`] refuses a row naming one by name.
+//! [`system_satisfied`] holds a default-set member declaring `system = "<bin>"` satisfied by
+//! a binary of that name already on `PATH` outside the managed `bin/` and the store.
+//! [`shadowing_binary_on_path`] is its mirror for managed members: a binary of an exposed
+//! name ahead of the managed `bin/` is what runs, and the state says so
+//! (`managed <build> — SHADOWED by <path>`: a warning, never a fault; the user owns `PATH`).
 //!
-//! Trust stays where it is today: the signed row is the authority, and the vendor host is
-//! a transport exactly as `alabsystems` is (§8 "the host is never an authenticity input").
-//! [`check_row`] is DEFENSE IN DEPTH over that signed data — it narrows where a signed row
-//! may point ([`VENDOR_HOSTS`]) and refuses shapes the stage lanes could mis-stage — so a
-//! compromised publisher key still cannot aim clients at an arbitrary host, and a
-//! malformed row fails BEFORE any byte moves rather than after a multi-hundred-MB download.
-//!
-//! [`system_satisfied`] is the other half of the owner's decision for `gh`/`emacs`: a
-//! default-set member declaring `system = "<bin>"` is SATISFIED by a binary of that name
-//! already on the user's `PATH` — outside the managed `bin/` and the store — and is
-//! fetched only when no such install exists. [`shadowing_binary_on_path`] is its mirror
-//! for MANAGED members: a binary of an exposed name that precedes the managed `bin/` on
-//! `PATH` is what actually runs, and the canonical `managed <build> — SHADOWED by <path>`
-//! state says so (a warning, never a fault, never "fixed" — the user owns `PATH`).
-//!
-//! The walk is CROSS-PLATFORM: `PATH` splits on the platform separator
-//! (`std::env::split_paths` — `:` on Unix, `;` on Windows), only ABSOLUTE entries count
-//! (a Windows entry needs its drive), and on Windows a bare name resolves through
-//! `PATHEXT` exactly as `cmd.exe` resolves it ([`windows_lookup_names`]: `gh` tries
-//! `gh.COM`, `gh.EXE`, `gh.BAT`, `gh.CMD`, …; `gh.exe` is tried as spelled).
+//! The walk is cross-platform: `PATH` splits on the platform separator, only absolute
+//! entries count, and on Windows a bare name resolves through `PATHEXT` as `cmd.exe` does
+//! ([`windows_lookup_names`]).
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -43,8 +30,8 @@ use crate::flow::FlowError;
 use crate::manifest::{Artifact, Program};
 use crate::store::ToolName;
 
-/// The hosts a signed `https` row may download from. EXACT host match — no ports,
-/// no userinfo, no subdomain wildcards — over an `https://` URL.
+/// The hosts a signed `https` row may download from: exact host match over an `https://`
+/// URL, no ports, no userinfo, no subdomain wildcards.
 ///
 /// Defense in depth, not the trust root: the signed row is the authority; this list only
 /// narrows where a signed row may point, so a publisher-key compromise cannot redirect
@@ -58,44 +45,53 @@ pub const VENDOR_HOSTS: &[&str] = &[
 ];
 
 /// Whether `url` may be fetched on the vendor-direct lane for `program`: an admissible
-/// `https` URL ([`https_host`]) whose path carries no `.`/`..` segment in any spelling
-/// (percent-encoded included — curl collapses them), and which starts with one of THAT
-/// program's compiled prefixes ([`crate::vendor_direct::VendorSpec::url_prefixes`]) with a
-/// remainder of non-empty `/`-separated segments of `[A-Za-z0-9._-]`. No query, fragment,
-/// percent-escape, backslash or empty segment: none of the pinned documents or payloads
-/// needs one, and each is a way to re-point the path.
+/// `https` URL ([`https_host`]) that starts with one of that program's compiled prefixes
+/// ([`crate::vendor_direct::VendorSpec::url_prefixes`]) and goes on with either `/`-separated
+/// segments or, for a program that declares a query
+/// ([`crate::vendor_direct::VendorSpec::url_query`]), a `?` and exactly those keys, in order,
+/// each `=` a value. Every segment and value is non-empty `[A-Za-z0-9._-]` and never
+/// `.`/`..`. No other query, fragment, percent-escape (curl collapses an encoded dot
+/// segment), backslash or empty segment: none of the pinned URLs needs one, and each is a way
+/// to re-point the request.
 #[must_use]
 pub fn vendor_direct_url_allowed(program: &str, url: &str) -> bool {
-    let Some(host) = https_host(url) else {
-        return false;
-    };
-    let Some(spec) = crate::vendor_direct::spec(program) else {
-        return false;
-    };
-    let path = &url["https://".len() + host.len()..];
-    if path.split('/').any(is_dot_segment) {
-        return false;
-    }
-    spec.url_prefixes.iter().any(|prefix| {
-        url.strip_prefix(prefix).is_some_and(|rest| {
-            !rest.is_empty()
-                && rest.split('/').all(|seg| {
-                    !seg.is_empty()
-                        && seg
-                            .bytes()
-                            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    crate::vendor_direct::spec(program).is_some_and(|spec| pinned_by(spec, url))
+}
+
+/// [`vendor_direct_url_allowed`] under one table row.
+fn pinned_by(spec: &crate::vendor_direct::VendorSpec, url: &str) -> bool {
+    https_host(url).is_some()
+        && spec.url_prefixes.iter().any(|prefix| {
+            url.strip_prefix(prefix)
+                .is_some_and(|rest| match rest.strip_prefix('?') {
+                    Some(query) => query_is(spec.url_query, query),
+                    None => !rest.is_empty() && rest.split('/').all(plain_component),
                 })
         })
-    })
 }
 
-/// `.` or `..`, spelled plainly or with any `%2e`/`%2E` in place of a dot.
-fn is_dot_segment(seg: &str) -> bool {
-    let decoded = seg.to_ascii_lowercase().replace("%2e", ".");
-    decoded == "." || decoded == ".."
+/// Whether `query` is exactly `keys`, in order, each `<key>=<plain value>` — so an empty
+/// `keys` admits no query at all.
+fn query_is(keys: &[&str], query: &str) -> bool {
+    let mut pairs = query.split('&');
+    keys.iter().all(|key| {
+        pairs
+            .next()
+            .and_then(|pair| pair.split_once('='))
+            .is_some_and(|(k, v)| k == *key && plain_component(v))
+    }) && pairs.next().is_none()
 }
 
-/// Whether `program`'s vendor-direct DIGEST document requested at `requested` may be
+/// One path segment or query value: non-empty `[A-Za-z0-9._-]`, never `.` or `..`.
+fn plain_component(s: &str) -> bool {
+    !s.is_empty()
+        && s != "."
+        && s != ".."
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// Whether `program`'s vendor-direct digest document requested at `requested` may be
 /// trusted having ended at `effective` (curl's effective URL): `requested` passes
 /// [`vendor_direct_url_allowed`] for `program`, and the compiled table admits the landing
 /// ([`crate::vendor_direct::VendorSpec::digest_doc_admitted`]).
@@ -108,12 +104,31 @@ pub fn digest_effective_url_ok(program: &str, requested: &str, effective: &str) 
 
 /// The staging lanes an `https` row may name in `payload`. The stage side
 /// (`install::verify_and_stage`) implements each; a row naming anything else is refused
-/// here, before download. `dmg` is the `kind = "app-bundle"` lane; the other four are
+/// here, before download. `dmg` is the `kind = "app-bundle"` lane; the others are
 /// `kind = "binary"`.
-pub const PAYLOADS: &[&str] = &["raw-binary", "tar-gz", "tar-zst", "zip", "dmg"];
+pub const PAYLOADS: &[&str] = &[
+    "raw-binary",
+    "tar-gz-binary",
+    "tar-gz",
+    "tar-zst",
+    "zip",
+    "dmg",
+];
 
-/// The archive payloads — the only ones `strip_components` applies to.
+/// The single-binary payloads, the only ones an `entry` applies to: the download is the
+/// executable (`raw-binary`), or a gzip tar of exactly one regular file at its root
+/// (`tar-gz-binary`); either way it is laid at `bin/<entry>`, mode `0755`.
+const BINARY_PAYLOADS: &[&str] = &["raw-binary", "tar-gz-binary"];
+
+/// The archive payloads — the only ones `strip_components` applies to. A `tar-gz-binary`
+/// is a gzip tar too, but of one file the stage names itself: there is no tree to strip.
 const ARCHIVE_PAYLOADS: &[&str] = &["tar-gz", "tar-zst", "zip"];
+
+/// Whether `payload` names a single-binary lane (see [`BINARY_PAYLOADS`]).
+#[must_use]
+pub fn is_binary_payload(payload: &str) -> bool {
+    BINARY_PAYLOADS.contains(&payload)
+}
 
 /// Whether `payload` names an archive lane (see [`ARCHIVE_PAYLOADS`]).
 #[must_use]
@@ -144,12 +159,12 @@ pub fn https_host(url: &str) -> Option<&str> {
     Some(host)
 }
 
-/// Whether `s` is ONE bare file-name component: non-empty, not `.`/`..`, no `/`, no `\`
-/// (the Windows separator), no control byte (NUL, newline, DEL, …). The row's `asset` is
-/// joined onto the program's staging directory as the download's local name, so it must
-/// never be a path, and never carry a byte a later consumer of the path could misread.
-/// Refused here, before any byte moves.
-fn bare_file_name(s: &str) -> bool {
+/// Whether `s` is one bare file-name component: non-empty, not `.`/`..`, no `/`, no `\`, no
+/// control byte. The row's `asset` is joined onto the program's staging directory as the
+/// download's local name, so it must never be a path or carry a byte a later consumer could
+/// misread. Also the name a `tar-gz-binary` archive's one member must have
+/// (`extract::stage_tar_gz_member`).
+pub(crate) fn bare_file_name(s: &str) -> bool {
     !s.is_empty()
         && s != "."
         && s != ".."
@@ -158,10 +173,9 @@ fn bare_file_name(s: &str) -> bool {
         && !s.bytes().any(|b| b < b' ' || b == 0x7f)
 }
 
-/// Whether a `links` TARGET is admissible: a relative path inside the staged tree —
-/// non-empty, no leading `/`, no `..`, no `.`/empty components, no NUL, no `\` (the
-/// Windows separator would let `..\` dodge the component check), only `Normal`
-/// components.
+/// Whether a `links` target is admissible: a relative path inside the staged tree (non-empty,
+/// no leading `/`, no `..`, no `.`/empty components, no NUL, no `\`, which would let `..\`
+/// dodge the component check).
 fn link_target_ok(target: &str) -> bool {
     if target.is_empty()
         || target.starts_with('/')
@@ -171,9 +185,9 @@ fn link_target_ok(target: &str) -> bool {
     {
         return false;
     }
-    // Segment by segment on the RAW string, not `Path::components()`: that iterator
+    // Segment by segment on the raw string, not `Path::components()`: that iterator
     // normalizes an interior `.` away (`a/./b` reads as `a/b`), and a target the client
-    // would create verbatim must be judged verbatim.
+    // creates verbatim must be judged verbatim.
     target
         .split('/')
         .all(|seg| !seg.is_empty() && seg != "." && seg != "..")
@@ -192,29 +206,25 @@ fn refuse2(head: &str, detail: &str) -> FlowError {
     FlowError::VendorRefused(format!("{head}{detail}"))
 }
 
-/// Admit an artifact row BEFORE any byte moves, by its `protocol`:
+/// Admit an artifact row before any byte moves, by its `protocol`:
 ///
-/// * `github-release` — [`check_release_row`]: only a bare `asset` name (the release
-///   lane's other gates are the signed `sha256`/`tree_root` at stage time, exactly as
-///   before the split);
-/// * `https` — every refusal the vendor lane has always had: https on an allow-listed
-///   bare host, a known `payload` that matches the `kind` (`dmg` ⇔ `app-bundle`), a
-///   shimmable exposed `entry` for `raw-binary`, `strip_components` on archives only,
-///   `links` keys exposed and targets in-tree, a bare `asset` name, `size > 0`, a 64-hex
-///   `sha256`, a non-empty `tree_root`;
-/// * anything else — the deleted OS-installer protocols (`pkg`, `system-pm`,
-///   `softwareupdate`, §5.3(b)) included — refused by name (dispatch would call it
-///   Unknown anyway; this names the field).
+/// * `github-release` ([`check_release_row`]): only a bare `asset` name; the release lane's
+///   other gates are the signed `sha256`/`tree_root` at stage time;
+/// * `https`: an allow-listed bare host, a known `payload` matching the `kind`
+///   (`dmg` ⇔ `app-bundle`), a shimmable exposed `entry` for the single-binary lanes,
+///   `strip_components` on archives only, `links` keys exposed and targets in-tree (none on
+///   `tar-gz-binary`), a bare `asset` name, `size > 0`, a 64-hex `sha256`, a non-empty
+///   `tree_root`;
+/// * anything else (the removed OS-installer protocols included) is refused by name.
 ///
-/// `exposes` is the manifest's signed `exposes` list — the raw-binary `entry` and every
-/// `links` key must be in it, because those are the names the stage will put under
-/// `bin/` and the shims will resolve.
+/// `exposes` is the manifest's signed `exposes` list: the single-binary `entry` and every
+/// `links` key must be in it, as those are the names the stage puts under `bin/`.
 ///
 /// Every refusal is a [`FlowError::VendorRefused`] naming the field, so a mis-authored row
-/// fails fast on the authoring machine's own `atpkg install` and never on a user's pass.
+/// fails on the authoring machine's own `atpkg install`, never on a user's pass.
 ///
 /// # Errors
-/// The first field that fails admission, in the order listed on the struct.
+/// The first field that fails admission.
 pub fn check_row(artifact: &Artifact, exposes: &[String]) -> Result<(), FlowError> {
     match artifact.protocol.as_str() {
         "github-release" => check_release_row(artifact),
@@ -227,11 +237,10 @@ pub fn check_row(artifact: &Artifact, exposes: &[String]) -> Result<(), FlowErro
 }
 
 /// The `github-release` half of [`check_row`]: the `asset` is joined onto the program's
-/// staging directory as the download's local name, so it must be one bare file name —
-/// the rule the `https` lane carries. Until 2026-09-12 release rows skipped
-/// admission, and an absolute or `..` asset named a file outside staging that install
-/// unlinked, sweeping that directory's `*.part` files, before any download (audit K3).
-/// The flow refuses an escaping staged path a second time.
+/// staging directory as the download's local name, so it must be one bare file name, or an
+/// absolute or `..` asset would name a file outside staging that install unlinks (sweeping
+/// that directory's `*.part` files) before any download. The flow refuses an escaping staged
+/// path a second time.
 fn check_release_row(artifact: &Artifact) -> Result<(), FlowError> {
     if !artifact.asset.is_empty() && !bare_file_name(&artifact.asset) {
         return Err(refuse2(
@@ -242,9 +251,9 @@ fn check_release_row(artifact: &Artifact) -> Result<(), FlowError> {
     Ok(())
 }
 
-/// The `https` half of [`check_row`] — every refusal the vendor lane has always carried.
+/// The `https` half of [`check_row`].
 fn check_https_row(artifact: &Artifact, exposes: &[String]) -> Result<(), FlowError> {
-    // 0. The kind this protocol can carry: a binary (four payload lanes) or a vendor
+    // 0. The kind this protocol can carry: a binary (five payload lanes) or a vendor
     //    `.app` (the dmg lane). Anything else is a shape the stage cannot lay down.
     match artifact.kind.as_str() {
         "binary" | "app-bundle" => {}
@@ -271,10 +280,11 @@ fn check_https_row(artifact: &Artifact, exposes: &[String]) -> Result<(), FlowEr
     // 2. Payload lane, and it must agree with the kind: `dmg` is how an app-bundle
     //    arrives and the only way one may; a binary never arrives as a disk image.
     if !PAYLOADS.contains(&artifact.payload.as_str()) {
-        return Err(refuse2(
-            "payload must be raw-binary | tar-gz | tar-zst | zip | dmg, got ",
-            &artifact.payload,
-        ));
+        return Err(FlowError::VendorRefused(format!(
+            "payload must be {}, got {}",
+            PAYLOADS.join(" | "),
+            artifact.payload
+        )));
     }
     if artifact.kind == "app-bundle" && artifact.payload != "dmg" {
         return Err(refuse2(
@@ -287,7 +297,7 @@ fn check_https_row(artifact: &Artifact, exposes: &[String]) -> Result<(), FlowEr
             "payload = dmg is the app-bundle lane; a binary row cannot name it",
         ));
     }
-    // 2b. `asset` is the LOCAL staging file name the download lands under
+    // 2b. `asset` is the local staging file name the download lands under
     //     (`staging_dir(program).join(asset)`), never a release asset and never a path.
     if !bare_file_name(&artifact.asset) {
         return Err(refuse2(
@@ -295,11 +305,14 @@ fn check_https_row(artifact: &Artifact, exposes: &[String]) -> Result<(), FlowEr
             &artifact.asset,
         ));
     }
-    // 3. raw-binary needs an entry that is a shimmable name AND an exposed one; the
-    //    other lanes must not carry one (a stray entry would be a silent authoring slip).
-    if artifact.payload == "raw-binary" {
+    // 3. A single-binary lane needs an entry that is a shimmable name and an exposed one;
+    //    the other lanes must not carry one (a stray entry would be a silent authoring slip).
+    if is_binary_payload(&artifact.payload) {
         if artifact.entry.is_empty() {
-            return Err(refuse("raw-binary payload needs a non-empty entry"));
+            return Err(refuse2(
+                "a non-empty entry is required by payload ",
+                &artifact.payload,
+            ));
         }
         if ToolName::new(&artifact.entry).is_none() {
             return Err(refuse2(
@@ -312,7 +325,7 @@ fn check_https_row(artifact: &Artifact, exposes: &[String]) -> Result<(), FlowEr
         }
     } else if !artifact.entry.is_empty() {
         return Err(refuse2(
-            "entry is only meaningful for raw-binary, but payload is ",
+            "entry is only meaningful for raw-binary | tar-gz-binary, but payload is ",
             &artifact.payload,
         ));
     }
@@ -323,11 +336,15 @@ fn check_https_row(artifact: &Artifact, exposes: &[String]) -> Result<(), FlowEr
             &artifact.payload,
         ));
     }
-    // 5. links: every key exposed + shimmable, every target relative and `..`-free.
+    // 5. links: every key exposed + shimmable, every target relative and `..`-free; none
+    //    on a `tar-gz-binary`, whose stage lays its one file and nothing else.
+    if artifact.payload == "tar-gz-binary" && !artifact.links.is_empty() {
+        return Err(refuse("links do not apply to payload tar-gz-binary"));
+    }
     check_links(&artifact.links, exposes)?;
-    // 6. The signed digests must be present and well-formed — the extracted tree is the
+    // 6. The signed digests must be present and well-formed: the extracted tree is the
     //    only thing the client can re-verify at apply time, so an empty root is a refusal
-    //    for THIS protocol even though a loose release manifest tolerates one.
+    //    for this protocol even though a loose release manifest tolerates one.
     if artifact.size == 0 {
         return Err(refuse("size must be > 0 (it is the exact download cap)"));
     }
@@ -362,11 +379,10 @@ fn check_links(links: &BTreeMap<String, String>, exposes: &[String]) -> Result<(
     Ok(())
 }
 
-/// Whether `path` lies under the managed `prefix` — spelled as given OR as the
-/// filesystem resolves it (`prefix_real`, the canonical prefix: on macOS a temp prefix
-/// under `/var/folders` resolves to `/private/var/folders`, and a symlinked prefix
-/// resolves elsewhere entirely). Anything under the prefix is atpkg's own — the `bin/`
-/// shims, the store trees — never a SYSTEM install.
+/// Whether `path` lies under the managed `prefix`, spelled as given or as the filesystem
+/// resolves it (`prefix_real`: on macOS a temp prefix under `/var/folders` resolves to
+/// `/private/var/folders`, and a symlinked prefix elsewhere entirely). Anything under the
+/// prefix is atpkg's own, never a system install.
 fn under_prefix(prefix: &Path, prefix_real: &Path, path: &Path) -> bool {
     path.starts_with(prefix) || path.starts_with(prefix_real)
 }
@@ -406,14 +422,12 @@ enum AtManaged {
 #[cfg(any(windows, test))]
 pub const DEFAULT_PATHEXT: &str = ".COM;.EXE;.BAT;.CMD";
 
-/// The file names a Windows `PATH` lookup of `name` tries in ONE directory, in order —
-/// `cmd.exe`'s rule: a name that already ends in an extension `pathext` lists (`gh.exe`,
-/// `scoop.cmd`, compared case-insensitively) is tried as spelled and nothing else; a bare
-/// name (`gh`) tries `name` + each `pathext` entry in `pathext`'s order (`gh.COM`,
-/// `gh.EXE`, `gh.BAT`, `gh.CMD`). An empty `pathext` reads as [`DEFAULT_PATHEXT`];
-/// entries that do not start with `.` are ignored. A bare file with NO extension never
-/// matches on Windows — it is not executable there. Pure, so the rule is unit-tested on
-/// every platform; the Windows walk feeds it the process's `PATHEXT`.
+/// The file names a Windows `PATH` lookup of `name` tries in one directory, in order
+/// (`cmd.exe`'s rule): a name already ending in an extension `pathext` lists (`gh.exe`,
+/// `scoop.cmd`, case-insensitively) is tried as spelled and nothing else; a bare name (`gh`)
+/// tries `name` + each `pathext` entry in order (`gh.COM`, `gh.EXE`, …). An empty `pathext`
+/// reads as [`DEFAULT_PATHEXT`]; entries not starting with `.` are ignored. A file with no
+/// extension never matches on Windows. Pure, so the rule is tested on every platform.
 #[must_use]
 #[cfg(any(windows, test))]
 pub fn windows_lookup_names(name: &str, pathext: &str) -> Vec<String> {
@@ -459,11 +473,10 @@ fn lookup_candidates(dir: &Path, bin: &str) -> Vec<PathBuf> {
     }
 }
 
-/// The shared `PATH` walk behind [`system_binary_on_path`] and
-/// [`shadowing_binary_on_path`]: the first executable named `bin` in an ABSOLUTE `PATH`
-/// entry outside the managed `prefix`, whose resolved path is also outside it. `at_managed`
-/// decides what a prefix-owned entry does to the walk. `bin` must be ONE bare file name
-/// (no separator, not `.`/`..`) — it is joined onto every entry.
+/// The shared `PATH` walk behind [`system_binary_on_path`] and [`shadowing_binary_on_path`]:
+/// the first executable named `bin` in an absolute `PATH` entry outside the managed `prefix`,
+/// whose resolved path is also outside it. `at_managed` decides what a prefix-owned entry
+/// does to the walk. `bin` must be one bare file name: it is joined onto every entry.
 fn first_foreign_on_path(
     prefix: &Path,
     bin: &str,
@@ -478,14 +491,14 @@ fn first_foreign_on_path(
     // `split_paths` is the platform's own rule: `:` on Unix, `;` on Windows (where a
     // quoted entry is unquoted too).
     for dir in std::env::split_paths(path_var) {
-        // A RELATIVE entry (`.`, `bin`, the empty string) resolves against whatever the
-        // current directory happens to be: a `gh` dropped into a project checkout must
-        // never read as a system install — and never retire the managed copy. Absolute
-        // directories only (on Windows that means a drive-rooted one).
+        // A relative entry (`.`, `bin`, the empty string) resolves against the current
+        // directory: a `gh` dropped into a project checkout must never read as a system
+        // install, nor retire the managed copy. Absolute directories only (on Windows,
+        // drive-rooted).
         if dir.as_os_str().is_empty() || !dir.is_absolute() {
             continue;
         }
-        // The entry as spelled OR as it resolves (`~/bin → <prefix>/bin` is the managed
+        // The entry as spelled or as it resolves (`~/bin → <prefix>/bin` is the managed
         // bin/ under another name): atpkg's own directory either way.
         let managed_dir = under_prefix(prefix, &prefix_real, &dir)
             || std::fs::canonicalize(&dir)
@@ -493,19 +506,13 @@ fn first_foreign_on_path(
         if managed_dir {
             match at_managed {
                 AtManaged::Skip => continue,
-                // Only the managed `bin/` ends the shadow walk unconditionally ("the
-                // managed copy — or its stub — answers from here; everything after
-                // loses"). Every OTHER prefix-owned entry — `reroute/`, which an aterm
-                // session puts FIRST and which carries the `cargo`/`rustc`/… stubs;
-                // `agents/`, first too and carrying only `claude`/`codex`; a store dir
-                // someone put on PATH — is TRANSPARENT unless it actually holds the
-                // name: then the managed copy runs (Stop), else the walk goes on. Before
-                // this (2026-09-10 audit) the reroute dir at PATH[0] made every
-                // `which`/doctor/reconcile run inside a session blind to the foreign
-                // `~/.local/bin/claude` that was what really ran. Since 2026-09-23
-                // `reroute/` holds `claude`/`codex` stubs too, which decide at exec time
-                // and may pass through: the surfaces that name what runs ask
-                // `cli::shadow_in_shell`, which walks the stub's own PATH when it does.
+                // Only the managed `bin/` ends the shadow walk unconditionally: the managed
+                // copy (or its stub) answers from there and everything after loses. Every
+                // other prefix-owned entry (`reroute/`, which an aterm session puts first;
+                // `agents/`, first too; a store dir on PATH) is transparent unless it holds
+                // the name: then the managed copy runs (Stop), else the walk goes on. A
+                // `reroute/` stub may pass through at exec time, so the surfaces that name
+                // what runs ask `cli::shadow_in_shell`, which walks the stub's own PATH.
                 AtManaged::Stop => {
                     if is_managed_bin_dir(prefix, &prefix_real, &dir)
                         || lookup_candidates(&dir, bin)
@@ -522,9 +529,9 @@ fn first_foreign_on_path(
             if !is_executable_file(&candidate) {
                 continue;
             }
-            // Follow the hit to where it really lives: a user's own symlink to a store
-            // copy is still atpkg's copy — it never satisfies (Skip), and for the shadow
-            // probe it is the managed copy RUNNING, so nothing after it shadows (Stop).
+            // Follow the hit to where it really lives: a user's own symlink to a store copy
+            // is still atpkg's copy; it never satisfies (Skip), and for the shadow probe it
+            // is the managed copy running, so nothing after it shadows (Stop).
             if std::fs::canonicalize(&candidate)
                 .is_ok_and(|real| under_prefix(prefix, &prefix_real, &real))
             {
@@ -539,7 +546,7 @@ fn first_foreign_on_path(
     None
 }
 
-/// Whether `dir` (as spelled, or as it resolves) IS the managed `<prefix>/bin` — the one
+/// Whether `dir` (as spelled, or as it resolves) is the managed `<prefix>/bin`: the one
 /// prefix-owned `PATH` entry that ends a shadow walk unconditionally.
 fn is_managed_bin_dir(prefix: &Path, prefix_real: &Path, dir: &Path) -> bool {
     let bin = prefix.join("bin");
@@ -549,14 +556,11 @@ fn is_managed_bin_dir(prefix: &Path, prefix_real: &Path, dir: &Path) -> bool {
         || std::fs::canonicalize(dir).is_ok_and(|real| real == bin || real == bin_real)
 }
 
-/// EVERY foreign executable named `bin` on `path_var`, in `PATH` order — the same walk
-/// as [`system_binary_on_path`] (absolute entries only; the managed prefix and any hit
-/// resolving into it skipped; `PATHEXT` on Windows) continued past the first hit, and
-/// de-duplicated by where each hit really lives (a `~/.local/bin/claude` symlinked to
-/// `/opt/homebrew/bin/claude` is one copy, not two). What `which` prints after the
-/// managed line for an agent program as `foreign copies out-ranked: …`, so the user can
-/// see the native install and the brew cask the front-of-PATH shim beat. Empty for a
-/// name the [`ToolName`] gate refuses, or with no `PATH` at all.
+/// Every foreign executable named `bin` on `path_var`, in `PATH` order: the walk of
+/// [`system_binary_on_path`] continued past the first hit, de-duplicated by where each hit
+/// really lives (a `~/.local/bin/claude` symlinked to `/opt/homebrew/bin/claude` is one
+/// copy). `which` prints it after an agent program's managed line as `foreign copies
+/// out-ranked: …`. Empty for a name the [`ToolName`] gate refuses, or with no `PATH`.
 #[must_use]
 pub fn foreign_copies_on_path(prefix: &Path, bin: &str, path_var: Option<&OsStr>) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
@@ -594,10 +598,9 @@ pub fn foreign_copies_on_path(prefix: &Path, bin: &str, path_var: Option<&OsStr>
 }
 
 /// Whether the managed `agents/` directory ([`crate::store::Layout::agents_dir`]) is on
-/// `path_var` at all — as spelled or as an entry resolves; absolute entries only, like
-/// every walk here. The AGENT PROGRAMS' shadow wording (2026-09-16) tells the two
-/// shell-local truths apart with it: a `PATH` with no `agents/` (a shell from before the
-/// install) and one that has it BEHIND the foreign copy.
+/// `path_var` at all, as spelled or as an entry resolves (absolute entries only). The agent
+/// programs' shadow wording uses it to tell a `PATH` with no `agents/` (a shell from before
+/// the install) from one that has it behind the foreign copy.
 #[must_use]
 pub fn agents_dir_on_path(prefix: &Path, path_var: Option<&OsStr>) -> bool {
     let Some(path_var) = path_var else {
@@ -615,15 +618,14 @@ pub fn agents_dir_on_path(prefix: &Path, path_var: Option<&OsStr>) -> bool {
     })
 }
 
-/// Probe `path_var` (a `PATH` value) for an executable named `bin`, skipping every
-/// RELATIVE entry (it names the current directory, not a system) and every directory the
-/// managed `prefix` owns (its `bin/` shims, its store) — and skipping a hit whose RESOLVED
-/// path lands inside the prefix (a user's own symlink to a store copy is still atpkg's
-/// copy). The first remaining hit wins, in `PATH` order.
+/// Probe `path_var` (a `PATH` value) for an executable named `bin`, skipping relative entries
+/// (they name the current directory, not a system), every directory the managed `prefix`
+/// owns, and any hit that resolves into the prefix (a user's symlink to a store copy is still
+/// atpkg's). The first remaining hit wins, in `PATH` order.
 ///
-/// The name must be a single admissible component ([`ToolName`]): a `system` value with a
-/// separator is refused outright rather than joined onto every `PATH` entry, and a name
-/// the shim deny-list refuses (`git`, `cargo`, …) never satisfies a member.
+/// The name must be one admissible component ([`ToolName`]): a `system` value with a
+/// separator is refused, and a name the shim deny-list refuses (`git`, `cargo`, …) never
+/// satisfies a member.
 #[must_use]
 pub fn system_binary_on_path(
     prefix: &Path,
@@ -634,12 +636,11 @@ pub fn system_binary_on_path(
     first_foreign_on_path(prefix, bin, path_var, AtManaged::Skip)
 }
 
-/// The binary that SHADOWS a managed tool named `bin`: the first executable of that name
-/// in an absolute `PATH` entry BEFORE the managed `bin/` (or anywhere, when the managed
-/// `bin/` is not on `PATH` at all — inside an aterm session it is appended LAST, so every
-/// foreign hit precedes it), resolving outside the prefix. `None` when the managed copy is
-/// the one that runs. Same relative-entry and resolve-into-store rules as
-/// [`system_binary_on_path`].
+/// The binary that shadows a managed tool named `bin`: the first executable of that name in
+/// an absolute `PATH` entry before the managed `bin/` (or anywhere, when the managed `bin/` is
+/// not on `PATH`; an aterm session appends it last), resolving outside the prefix. `None`
+/// when the managed copy is the one that runs. Same relative-entry and resolve-into-store
+/// rules as [`system_binary_on_path`].
 #[must_use]
 pub fn shadowing_binary_on_path(
     prefix: &Path,
@@ -682,10 +683,9 @@ pub(crate) fn with_path_var<R>(path: Option<&OsStr>, f: impl FnOnce() -> R) -> R
     out
 }
 
-/// Whether `program` is SATISFIED by a system install: it declares `system = "<bin>"`
-/// and that binary is on this process's `PATH` ([`path_var`]) outside the managed
-/// `prefix`. `Some(path)` names the install; `None` means the program is managed here (no
-/// `system` key, or nothing on `PATH`).
+/// Whether `program` is satisfied by a system install: it declares `system = "<bin>"` and
+/// that binary is on this process's `PATH` ([`path_var`]) outside the managed `prefix`.
+/// `Some(path)` names the install; `None` means the program is managed here.
 #[must_use]
 pub fn system_satisfied(prefix: &Path, program: &Program) -> Option<PathBuf> {
     let bin = program.system.as_deref()?;
@@ -708,6 +708,7 @@ pub(crate) mod testkit {
             protocol: "https".into(),
             asset: "claude-2.1.231-darwin-arm64".into(),
             sha256: "7b09f01c".repeat(8),
+            sha512: String::new(),
             tree_root: "abc".into(),
             size: 230_824_016,
             reloc: "self-contained".into(),
@@ -740,9 +741,8 @@ mod tests {
         }
     }
 
-    /// A `github-release` row with a bare `asset` is admitted UNCHANGED — no vendor
-    /// checks beyond the asset name apply to the release lane, whatever its other keys
-    /// hold (they are ignored there, as before).
+    /// A `github-release` row with a bare `asset` is admitted whatever its other keys hold:
+    /// the release lane has no vendor checks beyond the asset name.
     #[test]
     fn a_github_release_row_is_unchanged_by_admission() {
         let mut a = row();
@@ -759,12 +759,8 @@ mod tests {
         check_row(&a, &[]).expect("release rows ignore url");
     }
 
-    /// A `github-release` row's `asset` is joined onto the program's staging directory as
-    /// the download's local name, so admission holds it to the same bare-name rule the
-    /// `https` lane carries. Until 2026-09-12 release rows skipped admission
-    /// entirely, and an absolute or `..` asset named a file OUTSIDE staging that install
-    /// unlinked (and whose directory's `*.part` files it swept) before any download
-    /// (audit K3; flow.rs refuses the escaping path a second time at stage).
+    /// A `github-release` row's `asset` is the download's local name in the staging
+    /// directory, so admission holds it to the `https` lane's bare-name rule.
     #[test]
     fn a_github_release_row_with_a_path_asset_is_refused() {
         let mut a = row();
@@ -798,7 +794,7 @@ mod tests {
         assert!(refused(&a, &exposes()).contains("protocol must be"));
         a.protocol = "HTTPS".into();
         assert!(refused(&a, &exposes()).contains("protocol must be"));
-        // The deleted OS-installer protocols (§5.3(b)) are unknown here, refused by name.
+        // The removed OS-installer protocols are unknown here, refused by name.
         for deleted in ["pkg", "system-pm", "softwareupdate"] {
             a.protocol = deleted.into();
             let m = refused(&a, &exposes());
@@ -831,8 +827,8 @@ mod tests {
         check_row(&d, &["emacs".to_string(), "emacsclient".to_string()]).expect("dmg row admits");
     }
 
-    /// The kind ⇔ payload pairing over https: an app-bundle arrives ONLY as a dmg, a
-    /// binary never does, and no other kind rides this protocol.
+    /// The kind ⇔ payload pairing over https: an app-bundle arrives only as a dmg, a binary
+    /// never does, and no other kind rides this protocol.
     #[test]
     fn https_kind_and_payload_must_agree() {
         let mut app_as_zip = row();
@@ -859,7 +855,7 @@ mod tests {
                 "{other:?}"
             );
         }
-        // The old payload spelling is gone with the kind it belonged to.
+        // `dmg-app` is no payload.
         let mut old = row();
         old.kind = "app-bundle".into();
         old.payload = "dmg-app".into();
@@ -977,6 +973,38 @@ mod tests {
         assert!(refused(&unexposed, &["codex".to_string()]).contains("not in exposes"));
     }
 
+    /// `tar-gz-binary` is a single-binary lane: a `binary` row with an exposed shimmable
+    /// entry admits; no entry, an unexposed one, the app-bundle kind, a strip or a link
+    /// is refused. The control: the same link admits on a `raw-binary`.
+    #[test]
+    fn a_tar_gz_binary_row_is_one_exposed_entry_and_nothing_else() {
+        let exposes = ["agy".to_string(), "agy-alias".to_string()];
+        let agy = || {
+            let mut a = row();
+            a.payload = "tar-gz-binary".into();
+            a.entry = "agy".into();
+            a
+        };
+        check_row(&agy(), &exposes).expect("one exposed entry admits");
+        let mut a = agy();
+        a.entry = String::new();
+        assert!(refused(&a, &exposes).contains("non-empty entry is required by payload"));
+        let mut a = agy();
+        a.entry = "codex".into();
+        assert!(refused(&a, &exposes).contains("entry is not in exposes"));
+        let mut a = agy();
+        a.kind = "app-bundle".into();
+        assert!(refused(&a, &exposes).contains("needs payload = dmg"));
+        let mut a = agy();
+        a.strip_components = 1;
+        assert!(refused(&a, &exposes).contains("strip_components applies to archive"));
+        let mut a = agy();
+        a.links.insert("agy-alias".into(), "bin/agy".into());
+        assert!(refused(&a, &exposes).contains("links do not apply"));
+        a.payload = "raw-binary".into();
+        check_row(&a, &exposes).expect("a raw-binary may carry the same link");
+    }
+
     #[test]
     fn entry_is_refused_on_non_raw_payloads() {
         let mut a = row();
@@ -1073,10 +1101,7 @@ mod tests {
         assert!(refused(&root, &exposes()).contains("tree_root is required"));
     }
 
-    /// `cmd.exe`'s PATHEXT rule, pinned on every platform: a bare name tries each
-    /// extension in PATHEXT order, a name already carrying a listed extension is tried
-    /// as spelled (case-insensitively), an unset PATHEXT is the default, junk entries
-    /// are ignored.
+    /// `cmd.exe`'s PATHEXT rule, on every platform.
     #[test]
     fn windows_lookup_names_follow_pathext() {
         assert_eq!(
@@ -1124,8 +1149,7 @@ mod tests {
 
     // ---- the vendor-direct URL pins ----
 
-    /// The documents and payloads the vendor-direct lane really fetches (design §1.1),
-    /// by program.
+    /// The documents and payloads the vendor-direct lane fetches, by program.
     const VENDOR_DIRECT_URLS: &[(&str, &str)] = &[
         (
             "claude",
@@ -1161,6 +1185,32 @@ mod tests {
             "https://github.com/openai/codex/releases/download/rust-v0.156.0/\
              codex-package-aarch64-apple-darwin.tar.gz",
         ),
+        (
+            "agy",
+            "https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/\
+             darwin_arm64.json",
+        ),
+        (
+            "agy",
+            "https://storage.googleapis.com/antigravity-public/antigravity-cli/\
+             1.3.6-5068262057312256/darwin-arm/manifest.json",
+        ),
+        (
+            "agy",
+            "https://storage.googleapis.com/antigravity-public/antigravity-cli/\
+             1.3.6-5068262057312256/darwin-arm/cli_mac_arm64.tar.gz",
+        ),
+        ("muse", "https://api.meta.ai/muse-code/channels/muse-stable"),
+        (
+            "muse",
+            "https://lookaside.facebook.com/lookaside/muse/download/?channel=muse\
+             &version=1.4.9-R6297.1&file=manifest.json",
+        ),
+        (
+            "muse",
+            "https://lookaside.facebook.com/lookaside/muse/download/?channel=muse\
+             &version=1.4.9-R6297.1&file=muse-aarch64-macos",
+        ),
     ];
 
     #[test]
@@ -1170,12 +1220,13 @@ mod tests {
         }
     }
 
-    /// The pin is per program: neither vendor's URLs are admitted for the other's
+    /// The pin is per program: no vendor's URLs are admitted for another's
     /// program, and a program with no row is admitted nowhere.
     #[test]
     fn a_vendor_direct_url_is_admitted_only_for_its_own_program() {
+        let programs = crate::vendor_direct::VENDORS.iter().map(|s| s.program);
         for (program, url) in VENDOR_DIRECT_URLS {
-            for other in ["claude", "codex", "ay", "", "CLAUDE"] {
+            for other in programs.clone().chain(["ay", "", "CLAUDE"]) {
                 if other != *program {
                     assert!(
                         !vendor_direct_url_allowed(other, url),
@@ -1186,22 +1237,8 @@ mod tests {
         }
     }
 
-    /// The pins are the compiled table's, so the programs admitted anywhere are exactly
-    /// the agent programs, in the same order.
-    #[test]
-    fn the_vendor_direct_programs_are_the_agent_programs() {
-        let pinned: Vec<&str> = crate::vendor_direct::VENDORS
-            .iter()
-            .map(|s| s.program)
-            .collect();
-        assert_eq!(pinned, crate::stub::AGENT_PROGRAMS);
-        for (_, url) in VENDOR_DIRECT_URLS {
-            assert!(!vendor_direct_url_allowed("ay", url), "{url}");
-        }
-    }
-
     /// Lookalike hosts, other schemes, userinfo, ports, case and trailing-dot spellings,
-    /// traversal and escapes, queries and fragments, and anything off the three prefixes.
+    /// traversal and escapes, queries and fragments, and anything off the pinned prefixes.
     #[test]
     fn the_vendor_direct_pins_refuse_everything_else() {
         for bad in [
@@ -1259,40 +1296,88 @@ mod tests {
             "https://downloads.claude.ai/claude-code-releases/latest\n",
             "",
         ] {
-            for program in ["claude", "codex"] {
+            for program in crate::vendor_direct::VENDORS.iter().map(|s| s.program) {
                 assert!(!vendor_direct_url_allowed(program, bad), "{bad:?}");
             }
         }
     }
 
-    /// Each pinned prefix's host, and each host a digest document may land on, is a
-    /// first-hop host the `download_url` lane (`check_https_row`) already admits.
+    /// A row that declares a query grammar admits exactly that query right after a prefix
+    /// (Meta's lookaside URLs) and nothing near it; the same row with no grammar admits none.
     #[test]
-    fn every_vendor_direct_host_is_an_allow_listed_vendor_host() {
-        for spec in crate::vendor_direct::VENDORS {
-            for prefix in spec.url_prefixes {
-                let host = https_host(prefix).expect("a prefix is an admissible https URL");
-                assert!(VENDOR_HOSTS.contains(&host), "{host}");
-            }
-            for pin in spec.digest_docs {
-                for to in pin.redirect_hosts {
-                    assert!(VENDOR_HOSTS.contains(to), "{to}");
-                }
-            }
+    fn a_declared_query_is_admitted_exactly() {
+        const DOWNLOAD: &str = "https://lookaside.facebook.com/lookaside/muse/download/";
+        let row = crate::vendor_direct::VendorSpec {
+            url_prefixes: &[DOWNLOAD, "https://api.meta.ai/muse-code/channels/"],
+            url_query: &["channel", "version", "file"],
+            ..*crate::vendor_direct::spec("claude").unwrap()
+        };
+        let q = |query: &str| format!("{DOWNLOAD}?{query}");
+        let real = [
+            q("channel=muse&version=1.4.9-R6297.1&file=manifest.json"),
+            q("channel=muse&version=1.4.9-R6297.1&file=muse-aarch64-macos"),
+            q("channel=muse&version=1.4.9-R6297&file=muse-x86-macos"),
+        ];
+        for url in &real {
+            assert!(pinned_by(&row, url), "{url}");
+        }
+        assert!(pinned_by(
+            &row,
+            "https://api.meta.ai/muse-code/channels/muse-stable"
+        ));
+        for bad in [
+            // an extra, missing, reordered or repeated key
+            q("channel=muse&version=1.4.9-R6297.1&file=manifest.json&x=1"),
+            q("channel=muse&version=1.4.9-R6297.1"),
+            q("version=1.4.9-R6297.1&channel=muse&file=manifest.json"),
+            q("channel=muse&channel=muse&version=1.4.9-R6297.1&file=manifest.json"),
+            q("channel=muse&version=1.4.9-R6297.1&version=1.4.9-R6297.1&file=manifest.json"),
+            q("Channel=muse&version=1.4.9-R6297.1&file=manifest.json"),
+            // an empty, missing, dotted, escaped or structured value
+            q("channel=&version=1.4.9-R6297.1&file=manifest.json"),
+            q("channel&version=1.4.9-R6297.1&file=manifest.json"),
+            q("channel=muse&version=1.4.9-R6297.1&file=.."),
+            q("channel=muse&version=1.4.9-R6297.1&file=%2e%2e"),
+            q("channel=muse&version=1.4.9-R6297.1&file=manifest%2ejson"),
+            q("channel=muse&version=1.4.9-R6297.1&file=../manifest.json"),
+            q("channel=muse&version=1.4.9-R6297.1&file=a=b"),
+            q("channel=muse&version=1.4.9-R6297.1&file=manifest json"),
+            // empty pairs, a fragment, an empty query
+            q("channel=muse&&version=1.4.9-R6297.1&file=manifest.json"),
+            q("channel=muse&version=1.4.9-R6297.1&file=manifest.json&"),
+            q("channel=muse&version=1.4.9-R6297.1&file=manifest.json#frag"),
+            q(""),
+            // a path remainder before the query, or none of the prefix
+            format!("{DOWNLOAD}x?channel=muse&version=1.4.9-R6297.1&file=manifest.json"),
+            "https://lookaside.facebook.com/lookaside/muse/download?channel=muse\
+             &version=1.4.9-R6297.1&file=manifest.json"
+                .to_string(),
+            "https://lookaside.facebook.com/lookaside/other/download/?channel=muse\
+             &version=1.4.9-R6297.1&file=manifest.json"
+                .to_string(),
+            "https://api.meta.ai/muse-code/channels/muse-stable?channel=muse".to_string(),
+        ] {
+            assert!(!pinned_by(&row, &bad), "{bad}");
+        }
+        let no_query = crate::vendor_direct::VendorSpec {
+            url_query: &[],
+            ..row
+        };
+        for url in &real {
+            assert!(!pinned_by(&no_query, url), "{url}");
         }
     }
 
     /// OpenAI's release JSON and Anthropic's documents are taken only unredirected (the
-    /// compiled table's rule, measured 2026-09-22); a GitHub release download may end on
-    /// GitHub's release-asset storage and nowhere else; and the request must be pinned
-    /// for the program it serves.
+    /// compiled table's rule); a GitHub release download may end on GitHub's release-asset
+    /// storage and nowhere else; and the request must be pinned for the program it serves.
     #[test]
     fn a_digest_document_lands_only_where_its_host_allows() {
         const CLAUDE: &str =
             "https://downloads.claude.ai/claude-code-releases/2.1.280/manifest.json";
         const OPENAI: &str = "https://releases.openai.com/codex/channels/latest";
         const SUMS: &str = "https://github.com/openai/codex/releases/download/rust-v0.156.0/codex-package_SHA256SUMS";
-        // Measured final hop for SUMS (2026-09-22), signed query and all.
+        // SUMS's measured final hop, signed query and all.
         const STORAGE: &str = "https://release-assets.githubusercontent.com/\
                                github-production-release-asset/965415649/ce906d71?sp=r&sig=x%3D";
         assert!(digest_effective_url_ok("claude", CLAUDE, CLAUDE));
@@ -1415,13 +1500,13 @@ mod tests {
             system_binary_on_path(&prefix, "gh", Some(&managed_only)),
             None
         );
-        // A symlink elsewhere that RESOLVES into the store is still the managed copy.
+        // A symlink elsewhere that resolves into the store is still the managed copy.
         let link_dir = root.join("home-bin");
         std::fs::create_dir_all(&link_dir).unwrap();
         std::os::unix::fs::symlink(prefix.join("store/gh/1/bin/gh"), link_dir.join("gh")).unwrap();
         let via_link = std::env::join_paths([link_dir.clone()]).unwrap();
         assert_eq!(system_binary_on_path(&prefix, "gh", Some(&via_link)), None);
-        // A symlink to a genuine system copy (Homebrew's shape) IS a system install.
+        // A symlink to a genuine system copy (Homebrew's shape) is a system install.
         let brew = root.join("brew-bin");
         std::fs::create_dir_all(&brew).unwrap();
         std::os::unix::fs::symlink(&exe, brew.join("gh")).unwrap();
@@ -1430,9 +1515,9 @@ mod tests {
             system_binary_on_path(&prefix, "gh", Some(&via_brew)),
             Some(brew.join("gh"))
         );
-        // A RELATIVE PATH entry never counts, even one that resolves (from this
-        // process's cwd) to the very directory holding the system copy: `cwd/../..`
-        // up to `/`, then the system dir's own components.
+        // A relative PATH entry never counts, even one that resolves (from this process's
+        // cwd) to the directory holding the system copy: `cwd/../..` up to `/`, then the
+        // system dir's own components.
         let cwd = std::env::current_dir().unwrap();
         let ups: PathBuf =
             std::iter::repeat_n("..", cwd.components().count().saturating_sub(1)).collect();
@@ -1464,7 +1549,7 @@ mod tests {
         assert_eq!(system_binary_on_path(&prefix, "gh", None), None);
         assert_eq!(system_binary_on_path(&prefix, "../gh", Some(&path)), None);
         assert_eq!(system_binary_on_path(&prefix, "", Some(&path)), None);
-        // A name the shim deny-list refuses never SATISFIES, even on PATH.
+        // A name the shim deny-list refuses never satisfies, even on PATH.
         lay_exe(&sys, "cargo");
         assert_eq!(system_binary_on_path(&prefix, "cargo", Some(&path)), None);
         // The Program-level wrapper: no `system` key ⇒ never satisfied, whatever PATH holds.
@@ -1482,10 +1567,8 @@ mod tests {
 
     // ---- the shadow probe ----
 
-    /// SHADOWED means "a foreign copy runs before the managed one": a hit BEFORE the
-    /// managed `bin/` (or with the managed `bin/` absent) is a shadow; a hit AFTER it is
-    /// not; the managed dirs themselves and links into the store never are; relative
-    /// entries never count.
+    /// A hit before the managed `bin/` (or with it absent) is a shadow; a hit after it is
+    /// not; the managed dirs and links into the store never are; relative entries never count.
     #[cfg(unix)]
     #[test]
     fn the_shadow_probe_reports_only_what_precedes_the_managed_bin() {
@@ -1508,7 +1591,7 @@ mod tests {
             None
         );
         // Managed bin/ not on PATH at all (a doctor run outside an aterm shell): inside
-        // aterm it would be appended LAST, so the foreign copy still precedes it.
+        // aterm it is appended last, so the foreign copy still precedes it.
         let absent = std::env::join_paths([local.clone()]).unwrap();
         assert_eq!(
             shadowing_binary_on_path(&prefix, "trust", Some(&absent)),
@@ -1522,9 +1605,8 @@ mod tests {
             shadowing_binary_on_path(&prefix, "trust", Some(&store_first)),
             None
         );
-        // THE TRANSPARENT MANAGED DIRS (2026-09-10 audit): `reroute/` at PATH[0] — where
-        // every aterm session puts it — carries only the upstream-Rust stubs, so it must
-        // NOT hide a foreign `trust` behind it; the walk goes on and reports the shadow.
+        // `reroute/` at PATH[0], where every aterm session puts it, carries only stubs, so
+        // it must not hide a foreign `trust` behind it: the walk goes on.
         let reroute = prefix.join("reroute");
         lay_exe(&reroute, "cargo");
         let reroute_first =
@@ -1534,9 +1616,8 @@ mod tests {
             Some(exe.clone()),
             "the reroute dir is transparent for a name it does not carry"
         );
-        // `agents/` at PATH[0] carrying the name IS the managed copy running: nothing
-        // after it shadows (this is what makes the managed claude win) — and for a name
-        // it does not carry it is transparent like the reroute dir.
+        // `agents/` at PATH[0] carrying the name is the managed copy running: nothing after
+        // it shadows; for a name it does not carry it is transparent like `reroute/`.
         let agents = prefix.join("agents");
         lay_exe(&agents, "claude");
         lay_exe(&prefix.join("store/claude/2026091001/bin"), "claude");
@@ -1588,7 +1669,7 @@ mod tests {
             shadowing_binary_on_path(&prefix, "trust", Some(&via_link)),
             None
         );
-        // A user's `~/bin` that IS the managed bin/ through a symlink, ahead of a foreign
+        // A user's `~/bin` that is the managed bin/ through a symlink, ahead of a foreign
         // copy: the managed copy runs, so the foreign one behind it is no shadow.
         let alias = root.join("alias-bin");
         std::os::unix::fs::symlink(prefix.join("bin"), &alias).unwrap();
@@ -1605,8 +1686,8 @@ mod tests {
             None,
             "a link into the store ahead is the managed copy running"
         );
-        // …but for the SYSTEM probe the same aliases are skipped, and the foreign copy
-        // behind them still satisfies.
+        // …but the system probe skips the same aliases, and the foreign copy behind them
+        // still satisfies.
         assert_eq!(
             system_binary_on_path(&prefix, "trust", Some(&via_alias)),
             Some(exe.clone())
@@ -1615,7 +1696,7 @@ mod tests {
             system_binary_on_path(&prefix, "trust", Some(&link_then_local)),
             Some(exe.clone())
         );
-        // A DIRECTORY wearing the tool's name is never a hit (the Windows `gh.exe`
+        // A directory wearing the tool's name is never a hit (the Windows `gh.exe`
         // directory trick reads the same way: `is_file` decides, not the name).
         let dir_named = root.join("dir-named");
         std::fs::create_dir_all(dir_named.join("trust")).unwrap();
@@ -1643,9 +1724,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// `agents/` on PATH or not (2026-09-16): as spelled, as it resolves, absolute
-    /// entries only — the fact the agent programs' shadow wording tells one shell's two
-    /// truths apart with.
+    /// `agents/` on PATH or not, as spelled or as it resolves, absolute entries only.
     #[test]
     fn agents_dir_on_path_sees_the_dir_as_spelled_or_resolved_and_absolute_only() {
         let prefix = crate::testdir::dir("atpkg-vendor-agents-");

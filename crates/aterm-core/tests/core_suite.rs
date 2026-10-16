@@ -5,13 +5,14 @@
 //!
 //! Each file keeps its path (so citations of `aterm-core/tests/<file>.rs` still
 //! resolve) and becomes a module here, instead of linking and exec'ing its own
-//! binary per gate run. None of them sets the environment, installs a hook or
+//! binary per test run. None of them sets the environment, installs a hook or
 //! an allocator, re-executes itself or keeps a process global. The one direct
-//! `ty` spawn (`conformance_altscreen`, one test) writes into a scratch
-//! directory of its own file's name and goes through
-//! `aterm_spec::verify::ty_output`, which fails it closed on a stopped search; every
-//! other `ty` check goes through `aterm_spec::verify`'s drivers, which also give
-//! each call a scratch directory of its own.
+//! `ty` spawn (`conformance_altscreen`, one `#[ignore]`d `_under_ty` test, run
+//! by `-- --ignored _under_ty` only) writes into a scratch directory of its
+//! own file's name and goes through `aterm_spec::verify::TyCommand`, which fails
+//! it closed on a stopped search; every other `ty` check goes through
+//! `aterm_spec::verify`'s drivers, which also give each call a scratch
+//! directory of its own.
 //!
 //! The crate sets `autotests = false`, so a new `tests/*.rs` file compiles ONLY
 //! once it is listed here, in `core_fuzz.rs`, or as its own `[[test]]` in
@@ -21,7 +22,6 @@
 //! `targo --unverified test -p aterm-core --test core_suite -- <file>::`.
 
 mod alt_archive_claude_like;
-mod capability_ceremony;
 mod chunked_process_equivalence;
 mod codex_insert_history_scrollback;
 mod conformance_altscreen;
@@ -45,6 +45,8 @@ mod image_survives_scrollback;
 mod kitty_chunked_load;
 mod kitty_graphics_delete;
 mod osc_param_tail;
+mod palette_refusal_told_once;
+mod reload_keeps_program_colours;
 mod replay_corpus_probe;
 mod replay_offset_determinism;
 mod resize_preserves_non_bmp;

@@ -172,6 +172,10 @@ pub(super) const LIGHT_INK_MAX_CHANNEL: f32 = 150.0;
 /// `(255−cap)/255` of the glyph, so near-black ink stays near-black and a white
 /// counter stays light grey. Pinned by `light_ink_cap_keeps_glyphs_legible`.
 pub(super) const LIGHT_INK_ALPHA_CAP: f32 = 190.0;
+/// Ceiling on the opacity of a beam-family body drawn under the letters on a
+/// light ground (`CursorGlow::emit_comet_light`): bold ink at this alpha
+/// keeps near-black glyphs on top of it far past a readable contrast.
+pub(super) const LIGHT_BODY_ALPHA_CAP: f32 = 200.0;
 
 /// Rec. 709 luma of a `0x00RRGGBB` colour, 0..255. The one luminance the light
 /// arms measure with.
@@ -979,7 +983,7 @@ pub fn style_particle_color(style: GlowStyle, color: u32, hue: f32, fade: f32) -
     clippy::too_many_arguments,
     reason = "centre + per-axis radii + colour + peak; a param struct would obscure the geometry at the many emitter call sites"
 )]
-pub(super) fn push_halo_over(
+pub(crate) fn push_halo_over(
     out: &mut Vec<RainHalo>,
     geom: Geom,
     cx: f32,

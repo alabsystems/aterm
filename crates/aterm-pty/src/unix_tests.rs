@@ -311,7 +311,7 @@ fn drain_more_nonblocking_hot_bridges_a_busy_parser_gap_with_the_idle_wait() {
     // test's writer thread); the BEST of nine gathers is the property — the
     // old code parked a busy-parser gap on the 1 ms bridge poll, and its
     // gather cannot beat that however many times it runs. Nine, not three:
-    // under the workspace gate's load (loadavg 8-18) the best of three once
+    // on a loaded machine (loadavg 8-18) the best of three once
     // read 943 µs against the 1 ms bound — every one of three ~80 µs gathers
     // had been stretched tenfold by scheduling — and a gather costs ~100 µs,
     // so nine samples buy the margin for nothing.

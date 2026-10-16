@@ -1,31 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-// THE SEAMLESSNESS INVARIANT, PROVED BY THE COMPILER.
+// The seamlessness invariant: no update handoff step leaves a live session without an owner.
+// The Clean kernel checks it during the build, even under -Ztrust-verify=off (the
+// `targo --unverified` lane), because an island carries its own authority.
 //
-// Everything else in this file argues that a user cannot lose a terminal session
-// across a process replacement. This states it, and the Clean CIC kernel checks
-// it during the build (two-language design E10) -- so the argument stops being
-// prose the moment somebody edits the protocol out from under it.
+// This is a theorem about the model below, not about the Rust. The code-bound half is the
+// derived twin `aterm_spec::derive::native_update_seamless_handoff_ownership_model`, whose
+// bind (`ownership_conformance` in app_update_handoff.rs) drives the real Commit admission
+// over its bounded input space and checks the model admits exactly what the code decides.
 //
-// It is checked even under -Ztrust-verify=off, the switch the `targo
-// --unverified` lane puts on every unit, because an island carries its own
-// authority.
-//
-// WHAT IT PROVES, and what it does not: this is a theorem about the model below,
-// not about the Rust in this file. The code-bound half is the derived twin,
-// aterm_spec::derive::native_update_seamless_handoff_ownership_model (Tier-0:
-// derived_seamless_handoff_ownership_* in aterm-spec), whose Tier-1 conformance
-// -- `ownership_conformance` in app_update_handoff.rs -- drives the real Commit
-// admission over its bounded input space and checks the model admits exactly
-// what the code decides. A green island with no bind proves a property of a
-// description. Both halves are load bearing, and AGENTS.md says so.
-//
-// The lost phase is deliberately REPRESENTABLE. Without it in the type the
-// theorem would hold by construction and be worth nothing; with it, the theorem
-// is exactly the claim that the transition relation never reaches it. Deleting
-// the rollback edge on any pre-Commit failure -- the shape every refusal in this
-// file is careful to preserve -- makes this file stop compiling.
+// `lost` is representable on purpose: without it the theorem would hold by construction.
+// Routing any pre-Commit failure to `lost` instead of `rolledBack` stops this file compiling.
 clean {
     -- WHO holds the live PTY masters. nobody is a lost session: the state the
     -- overlap protocol exists to make unreachable.
@@ -49,8 +35,9 @@ clean {
       | lost : Phase
 
     -- warm is the successor's warm prologue (warm successor P2): config,
-    -- fonts and the backend worker, run BEFORE its dial while the outgoing
-    -- process still owns and reads every session.
+    -- fonts, the backend worker and the first window's Metal shader warm
+    -- (which fills the per-user compiler cache), run BEFORE its dial while
+    -- the outgoing process still owns and reads every session.
     inductive Event where
       | launch : Event
       | warm : Event

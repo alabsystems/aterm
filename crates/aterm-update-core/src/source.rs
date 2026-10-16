@@ -1,80 +1,36 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Resolving the GitHub release source (`github.com/<owner>/<repo>`): the compiled
-//! default, which a DEVELOPMENT build may repoint through `[update]` owner/repo in
-//! aterm.toml, with a URL-safety allowlist on every candidate so a configured value can
-//! never redirect the updater at a different host/path. Artifact-agnostic: the owner/repo only decide *where the
-//! bytes come from*, never *whether they are trusted* (the authenticity anchor
-//! lives in the consuming crate, e.g. the pinned Team ID + Apple notarization).
+//! The GitHub release source (`github.com/<owner>/<repo>`): the compiled default, which a
+//! development build may repoint through `[update]` owner/repo, with a URL-safety allowlist
+//! so a configured value cannot redirect the updater to another host or path. The source
+//! decides where bytes come from, never whether they are trusted.
 
-/// Default GitHub owner of the release repository (the `OWNER` in
-/// `github.com/OWNER/REPO`) — THE channel of every shipped binary. A development build
-/// may repoint it through the GUI's `[update] owner` config ([`REPOINT_IS_A_DEV_SEAM`]).
-///
-/// NOT a hand-maintained literal: `build.rs` derives it from the single tracked
-/// source of truth — `[workspace.metadata.aterm] update_channel` in the workspace
-/// `Cargo.toml`, falling back to `[workspace.package] repository` when no separate
-/// channel is declared — so the binary's default channel can never drift from the
-/// channel the release pipeline actually mirrors to.
-///
-/// That channel is the PUBLIC mirror, not the private publish repo: it can be read
-/// with no credential, which is what lets a freshly installed machine update before
-/// anyone has provisioned it a token.
-pub const DEFAULT_OWNER: &str = env!("ATERM_DEFAULT_OWNER");
+/// Default GitHub owner of the release repository: the channel of every shipped binary
+/// (`[update] owner` repoints it in a development build). aterm-release's channel tests hold
+/// `[workspace.metadata.aterm] update_channel` equal to `DEFAULT_OWNER/DEFAULT_REPO`. It is
+/// the public mirror, readable with no credential, so a fresh install updates before anyone
+/// provisions it a token.
+pub const DEFAULT_OWNER: &str = "alabsystems";
 
-/// Default GitHub repository name the updater pulls releases from. Repointable in a
-/// development build exactly like [`DEFAULT_OWNER`] (`[update] repo` config), and
-/// likewise derived from the workspace manifest by `build.rs`.
-pub const DEFAULT_REPO: &str = env!("ATERM_DEFAULT_REPO");
+/// Default GitHub repository name the updater pulls releases from (`[update] repo`).
+pub const DEFAULT_REPO: &str = "aterm";
 
-/// GitHub account this project is PUBLISHED under — derived by `build.rs` from
-/// `[workspace.package] repository` ALONE, never from `update_channel`.
-///
-/// Deliberately separate from [`DEFAULT_OWNER`]. The two were the same string until
-/// the update channel was repointed at a public mirror, and code that means "the
-/// account this project belongs to" must not drift with the channel. (The package
-/// index reads its own key — [`ATPKG_INDEX_OWNER`] — because binding it here
-/// pointed default installs at the private staging repo; this constant remains
-/// that key's absent-key fallback.)
-pub const PUBLISH_OWNER: &str = env!("ATERM_PUBLISH_OWNER");
+/// GitHub account the atpkg signed package index is published under. Its own constant: the
+/// index's trust is account-bound, so it must not move when [`DEFAULT_OWNER`] (the app
+/// channel) is repointed, and the workspace `repository` owner is private, so a tokenless
+/// install 404s there.
+pub const ATPKG_INDEX_OWNER: &str = "alabsystems";
 
-/// Repository name this project is published under, the companion to
-/// [`PUBLISH_OWNER`] and derived the same way.
-pub const PUBLISH_REPO: &str = env!("ATERM_PUBLISH_REPO");
-
-/// GitHub account the atpkg SIGNED PACKAGE INDEX is published under — stamped by
-/// `build.rs` from its own tracked key, `[workspace.metadata.atpkg] account`,
-/// falling back to [`PUBLISH_OWNER`] only when that key is absent.
-///
-/// A third knob on purpose. [`DEFAULT_OWNER`] is the APP update channel: the
-/// index's trust is ACCOUNT-BOUND (§8), so it must not move when the channel is
-/// repointed at a mirror. [`PUBLISH_OWNER`] is the PRIVATE staging repo: a
-/// default-configured (tokenless) install 404s there, so defaulting the index to
-/// it orphaned every such install from the published registry. The account only
-/// decides where the index BYTES come from; authenticity is the pinned root key
-/// (`pins`), which verifies the same signed index wherever it is hosted.
-pub const ATPKG_INDEX_OWNER: &str = env!("ATERM_ATPKG_INDEX_OWNER");
-
-/// Whether this build honours a REPOINTED update source (`[update]` owner/repo in
-/// aterm.toml): only a development build does — `debug_assertions`, or this crate's
-/// `dev-seams` feature, which the release cutter never enables: one true path;
-/// alternatives are for development. A shipped binary
-/// reads its compiled channel and names a configured repoint once in the log.
+/// Whether this build honours a repointed update source (`[update]` owner/repo): only a
+/// development build does (`debug_assertions` or the `dev-seams` feature, which the release
+/// cutter never enables). A shipped binary reads its compiled channel and logs the repoint.
 pub const REPOINT_IS_A_DEV_SEAM: bool = cfg!(any(debug_assertions, feature = "dev-seams"));
 
-/// The resolved GitHub release source: `github.com/<owner>/<repo>`. Construct it
-/// with [`Source::resolve`]:
-///
-/// 1. in a DEVELOPMENT build ([`REPOINT_IS_A_DEV_SEAM`]), the values the caller threads
-///    in from the GUI's `[update]` config table;
-/// 2. [`DEFAULT_OWNER`] / [`DEFAULT_REPO`] — the only source of a shipped binary.
-///
-/// Repointing the source is **not** an authenticity downgrade: the real anchor is
-/// the compiled-in pinned Team ID (plus Apple notarization), so even a source
-/// that serves attacker-chosen bytes cannot get an untrusted bundle installed — it
-/// just fails verification and nothing is staged. The owner/repo only decide *where
-/// the bytes come from*, never *whether they are trusted*.
+/// The resolved GitHub release source, `github.com/<owner>/<repo>` ([`Source::resolve`]).
+/// Repointing it is no authenticity downgrade: the anchors in [`crate::pins`] still decide
+/// whether bytes are trusted, so a source serving attacker-chosen bytes only fails
+/// verification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Source {
     /// GitHub owner (user/org) the releases live under.
@@ -84,11 +40,9 @@ pub struct Source {
 }
 
 impl Source {
-    /// Resolve the update source. `cfg_owner`/`cfg_repo` are the values the caller
-    /// read from the GUI config (`None` when unset). A development build honours them
-    /// ([`REPOINT_IS_A_DEV_SEAM`]); a shipped binary names them once in the log and
-    /// reads its compiled channel. An unset/blank/syntactically-invalid value falls
-    /// through to the compiled default.
+    /// Resolve the update source from the GUI config's `[update]` owner/repo (`None` when
+    /// unset). Only a development build honours them; a blank or invalid value falls through
+    /// to the compiled default.
     #[must_use]
     pub fn resolve(cfg_owner: Option<&str>, cfg_repo: Option<&str>) -> Self {
         Self::resolve_with(REPOINT_IS_A_DEV_SEAM, cfg_owner, cfg_repo)
@@ -114,8 +68,7 @@ impl Source {
     }
 }
 
-/// The one log line a shipped binary gives a configured `[update]` repoint it will not
-/// use — once per process, however often the source is resolved.
+/// Log, once per process, that a shipped binary ignores a configured `[update]` repoint.
 fn note_ignored_repoint() {
     static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -126,10 +79,8 @@ fn note_ignored_repoint() {
     }
 }
 
-/// Validation for one slug: `value` wins when it is present, non-blank AND a valid
-/// GitHub owner/repo name; a present-but-invalid value is skipped with a warning that
-/// names `origin` (the config key it came from); otherwise the (trusted, compiled-in)
-/// `default` is used. Side-effect-free apart from the warning, so it is unit-testable.
+/// `value` when it is present, non-blank and a valid slug; otherwise the compiled `default`,
+/// with a warning naming `origin` (the config key) for a present but invalid value.
 #[must_use]
 pub fn pick_slug(origin: &str, value: Option<&str>, default: &str) -> String {
     if let Some(v) = value.map(str::trim).filter(|s| !s.is_empty()) {
@@ -141,28 +92,21 @@ pub fn pick_slug(origin: &str, value: Option<&str>, default: &str) -> String {
     default.to_string()
 }
 
-/// Whether `s` is safe to interpolate into the Releases API URL as one path segment.
-/// This is a **URL-safety allowlist**, deliberately a *superset* of the names GitHub
-/// actually accepts (`A–Z a–z 0–9 . _ -`, non-empty, length-capped, excluding the bare
-/// `.`/`..` traversal segments) — NOT a faithful GitHub-name validator. Its only job is
-/// to forbid the metacharacters (`/`, whitespace, `?`, `#`, `@`, …) that could redirect
-/// the updater at a different host/path; a value that is URL-safe but not a real repo
-/// simply 404s, which is GitHub's authoritative existence check. Fail closed — anything
-/// outside the set is rejected and the next source in precedence is used.
+/// Whether `s` is safe to interpolate into a GitHub URL as one path segment: non-empty, at
+/// most 100 bytes, not `.`/`..`, and only `A–Z a–z 0–9 . _ -`. A URL-safety allowlist, not a
+/// GitHub-name validator: a URL-safe name that is no real repo simply 404s.
 #[must_use]
 pub fn is_valid_slug(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 100
-        // `.` / `..` are valid characters mid-name (e.g. `repo.name`) but the bare
-        // path segments are reserved and would traverse the API URL — reject them.
+        // Bare `.`/`..` would traverse the URL.
         && s != "."
         && s != ".."
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
 }
 
-/// Warn that the setting `origin` was ignored because `value` isn't a valid GitHub
-/// name, and say which `default` is used instead. The setting names its component.
+/// Warn that `origin` was ignored because `value` is not a valid GitHub name.
 fn warn_invalid(origin: &str, value: &str, default: &str) {
     aterm_log::warn!("ignoring {origin} = {value:?}: not a valid GitHub name; using {default}");
 }
@@ -173,7 +117,6 @@ mod tests {
 
     #[test]
     fn slug_validation_accepts_real_names_rejects_url_metacharacters() {
-        // GitHub owner/repo names: alphanumerics plus . _ -
         for ok in [
             "alabsystems",
             "aterm",
@@ -200,7 +143,6 @@ mod tests {
         ] {
             assert!(!is_valid_slug(bad), "{bad:?} should be rejected");
         }
-        // Over-long is rejected (DoS / absurd-value guard).
         assert!(!is_valid_slug(&"a".repeat(101)));
         assert!(is_valid_slug(&"a".repeat(100)));
     }
@@ -235,26 +177,13 @@ mod tests {
 
     #[test]
     fn source_resolve_defaults_when_nothing_configured() {
-        // The documented default channel is the PUBLIC mirror,
-        // github.com/alabsystems/aterm — deliberately NOT the private publish
-        // repo named by `[workspace.package] repository`. These constants are
-        // DERIVED by build.rs from `[workspace.metadata.aterm] update_channel`,
-        // so this also end-to-end checks that the build-time parse read that key
-        // (a fall-through to `repository` would spell "alabsystems" here).
-        // The release cutter's `mirror` step targets the same slug; the binding
-        // is asserted publisher-side in aterm-release's `mirror` module.
-        assert_eq!(DEFAULT_OWNER, "alabsystems");
-        assert_eq!(DEFAULT_REPO, "aterm");
-        // No environment is read any more, so this holds on every machine.
         let s = Source::resolve(None, None);
         assert_eq!(s.owner, DEFAULT_OWNER);
         assert_eq!(s.repo, DEFAULT_REPO);
     }
 
-    /// THE REPOINT IS A DEVELOPMENT SEAM. A development build honours a
-    /// configured `[update]` owner/repo; a shipped binary reads its compiled channel
-    /// whatever the file says — and a test build is a development build, so the
-    /// shipped posture is pinned through [`Source::resolve_with`].
+    /// A development build honours a configured repoint; a shipped one never does. A test
+    /// build is a development build, so the shipped posture goes through `resolve_with`.
     #[test]
     fn a_config_repoint_is_honoured_only_by_a_development_build() {
         let dev = Source::resolve_with(true, Some("fork-owner"), Some("fork-repo"));
@@ -271,35 +200,5 @@ mod tests {
         // Half a repoint in a dev build keeps the other half compiled.
         let half = Source::resolve_with(true, Some("fork-owner"), None);
         assert_eq!(half.repo, DEFAULT_REPO);
-    }
-
-    #[test]
-    fn atpkg_index_owner_is_the_public_package_org() {
-        // Stamped from `[workspace.metadata.atpkg] account` — NOT from
-        // `repository` (a fall-through would spell the private staging owner
-        // here: the repo no tokenless install can read, so this assert also
-        // tripwires DELETION of the metadata key) and NOT from
-        // `update_channel` (the app knob). The literal holds in BOTH trees:
-        // the publish/ export rewrites the staging owner into the public org
-        // and leaves this value untouched.
-        assert_eq!(ATPKG_INDEX_OWNER, "alabsystems");
-        assert!(is_valid_slug(ATPKG_INDEX_OWNER));
-        // In the private staging tree the index account and the publish owner
-        // MUST differ — binding the index default to the publish owner is the
-        // exact regression that pointed every default-configured install at a
-        // 404 (private) index host. The guard is scoped by SHAPE (publish
-        // owner differs from the compiled update-channel owner — exactly the
-        // split private-staging/public-channel configuration), never by
-        // spelling the staging owner as a literal: the publish/ export
-        // blanket-rewrites that literal into the public org, so a spelled
-        // guard flips to always-true in the exported tree and deterministically
-        // fails there, where publish == channel == index owner is the
-        // documented single-public-repo configuration, not a regression.
-        if PUBLISH_OWNER != DEFAULT_OWNER {
-            assert_ne!(
-                ATPKG_INDEX_OWNER, PUBLISH_OWNER,
-                "the package index must default to a publicly readable account"
-            );
-        }
     }
 }

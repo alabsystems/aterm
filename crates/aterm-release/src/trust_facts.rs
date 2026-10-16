@@ -5,13 +5,13 @@
 //! `docs/design/2026-09-29-incremental-deterministic-trust-results.md` §4.8 and
 //! §5; no flag bypasses a check).
 //!
-//! The whole-tree Trust lane (`tools/trust-gate-all.sh`) records what it
+//! The whole-tree Trust lane ([`crate::trust_lane`]) records what it
 //! MEASURED — per library, the Summary, the exit status, what trustd refused,
 //! what lapsed, what ran out of memory ([`Measured`]) — and every verdict is
 //! JUDGED AT ASSEMBLY ([`judge`]) from those facts and the ratchet of the tree
 //! being judged. A filed verdict would key on the floors too, so a floors-only
 //! commit would need a whole new run. One judge: the lane prints its own
-//! verdict with it (`aterm-release trust conclude`), the cutter and `ship
+//! verdict with it ([`conclude`]), the cutter and `ship
 //! check` call it in-process ([`trust_report`]), `ship release` asks it
 //! in-process ([`verdict_for`], [`pending_for`]), and `targo --unverified ship
 //! trust verdict` prints it.
@@ -21,9 +21,9 @@
 //! that hold the floors, which no verification reads:
 //!
 //! * the tree with the entries of the ratchet and the memory record removed
-//!   ([`tree_sans_floors`]) — the code, the lane script, the scope list, the
-//!   fork roster, the gate-list derivation and this judge are all in it. The
-//!   memory record (`tools/trust-gate-memory.tsv`) IS an input to the run: it
+//!   ([`tree_sans_floors`]) — the code, the lane, its queued forks, the
+//!   gate-list derivation and this judge are all in it. The
+//!   memory record ([`MEMORY`]) IS an input to the run: it
 //!   decides which libraries a host refuses up front. So the facts carry, per
 //!   library, the memory row the run used ([`Crate::memory`]) and the decision
 //!   it made, and the judge reads those rows, never the judged commit's: a
@@ -54,11 +54,10 @@
 //! the commit it judges and opens that file, and a record whose own lines name
 //! another key is refused. A floors-only commit has the same key, so its
 //! verdict needs no new run; a change to any other file, or another prover, is
-//! another key. What a floors-only commit may do to the floors is the merge
-//! contract's up-only rule, held here against the floors of the commit the
-//! facts were measured on ([`floors_lowered`]): reused facts never judge a
-//! floor lowered, or re-labelled to another prover, that the merge contract
-//! would refuse.
+//! another key. What a floors-only commit may do to the floors is the ratchet's
+//! up-only rule, held here against the floors of the commit the facts were
+//! measured on ([`floors_lowered`]): reused facts never judge a floor lowered,
+//! or re-labelled to another prover, that the rule would refuse.
 //!
 //! NO FLOOR EXCUSES (the owner's ruling: no report-only path). A
 //! library below its floor is a finding or it is undecided — never a pass:
@@ -71,7 +70,7 @@
 //! * a shortfall the run's lapsed wall-clock budgets (`timed_out=`) could
 //!   cover is UNDECIDED — `NOT-VERIFIED(clock)`, COULD NOT RUN, no pass — as a
 //!   shortfall trustd's refusals could cover is. It is resolved by measuring
-//!   again, not by an excuse: `tools/trust-gate-all.sh --remeasure` runs only
+//!   again, not by an excuse: `ship trust run --remeasure` runs only
 //!   the libraries the stored facts leave undecided, on the same key, and
 //!   [`remeasured`] folds their new facts into the record ([`conclude`]). The
 //!   proof checks ay's caller cancelled ([`CHECK_CANCELLED`]) are credited the
@@ -105,6 +104,7 @@ use std::path::{Path, PathBuf};
 use aterm_digest::Sha256;
 
 use crate::ledger::{Error, GitRunner, Result, git_ok, rev_parse};
+use crate::release::shell_word;
 use crate::trust_closure::{
     ClosureKey, Sources, Subject, closure_keys, file_closures, read_closures,
 };
@@ -125,19 +125,17 @@ pub const FACTS_END: &str = "end";
 /// `<store>/trust-facts-<key>`.
 pub const FACTS_PREFIX: &str = "trust-facts-";
 
-/// The first line of the plan the lane hands `trust conclude`.
+/// The first line of the plan a lane run writes in its log directory.
 pub const PLAN_MAGIC: &str = "aterm-trust plan 1";
 
 /// The floors file, relative to the repository root — one of the two paths the
 /// key leaves out.
-pub const RATCHET: &str = "tools/trust-gate-ratchet.tsv";
+pub const RATCHET: &str = "crates/aterm-release/trust/floors.tsv";
 
 /// The key's schema line. A change to what the key covers bumps it, and every
-/// record filed before misses. Schema 2: the lane builds every compile's
-/// environment itself (schema 1 inherited the caller's, screened by name, and
-/// `TRUSTFLAGS` went through). Schema 3: the memory record is left out beside the
-/// ratchet (the facts carry each library's row instead).
-const KEY_SCHEMA: &str = "aterm-trust facts key 3";
+/// record filed before misses: the floors' two files are left out by path
+/// ([`RATCHET`], [`MEMORY`]).
+const KEY_SCHEMA: &str = "aterm-trust facts key 4";
 
 /// The lane mode a filed record measured: the whole tree, the scope list's
 /// `never` rows its only exclusions. The only mode that files, and the only
@@ -191,8 +189,7 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 pub const CHECK_CANCELLED: &str = "proof validation cancelled by the caller";
 
 /// What one `targo trust check` left in its log, and nothing that depends on a
-/// floor. Every field is read the way `tools/trust-gate-all.sh` read it before
-/// the judge moved here; the comments name the shell expression each replaces.
+/// floor.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Measured {
     /// The exit status the lane recorded (`<log>.rc`), `?` when there is none.
@@ -775,22 +772,20 @@ impl Measured {
 // ceiling can read as a regression on a smaller host (the owner's rule: a
 // machine too small to verify something gets a warning and a refusal, never a
 // failure). The memory record
-// (`tools/trust-gate-memory.tsv`) holds, per library, the ceiling its floor
+// ([`MEMORY`]) holds, per library, the ceiling its floor
 // was SET at and the verifier's measured NEED, one row per RAM it was measured
 // on (MemRow, "THE NEED IS THE HOST'S"); this host's own observations
-// (`<git common dir>/aterm-verify/trust-memory-host.tsv`, never committed) add
-// refusals learned here. Every rule below is the lane's, ported from
-// `tools/trust-gate-all.sh` (`memory_refusal`, `census_of`, `mem_learn`), with
-// its figures compared as the lane compared them: GiB, four decimals from a
-// log, one decimal as printed.
+// (`<git common dir>/aterm-release/trust-memory-host.tsv`, never committed) add
+// refusals learned here. Figures are compared in GiB: four decimals from a log,
+// one decimal as printed.
 
 const GIB: f64 = 1_073_741_824.0;
 
 /// The memory record, relative to the repository root.
-pub const MEMORY: &str = "tools/trust-gate-memory.tsv";
+pub const MEMORY: &str = "crates/aterm-release/trust/memory.tsv";
 
 /// The header of this host's memory observations, as the lane writes it.
-const HOST_OBS_HEADER: &str = "# tools/trust-gate-all.sh host memory observations: <name@version> <held|cap-bound> <run ceiling GiB> <verifier peak GiB> <proved> <floor> <prover> <when>, one row per library whose last check here ran out of the verifier's memory ceiling. While its version, floor and prover stand, a cap-bound row is refused up front on this host and a held one is gated; --try-refused runs a refused one again. Local to this machine, never committed.";
+const HOST_OBS_HEADER: &str = "# trust lane host memory observations: <name@version> <held|cap-bound> <run ceiling GiB> <verifier peak GiB> <proved> <floor> <prover> <when>, one row per library whose last check here ran out of the verifier's memory ceiling. While its version, floor and prover stand, a cap-bound row is refused up front on this host and a held one is gated; --try-refused runs a refused one again. Local to this machine, never committed.";
 
 /// Four decimals, as the lane's `to_gib … 4` printed a figure it compared.
 fn four(x: f64) -> f64 {
@@ -1599,9 +1594,9 @@ pub fn memory_rewritten(text: &str, rows: &[(String, MemRow)]) -> String {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Decision {
     Gate(Measured),
-    /// The scope list's `never`.
+    /// A library the lane did not verify by policy (a record of an earlier lane).
     Excluded,
-    /// The scope list's `full-only`, skipped by a `--per-commit` run.
+    /// A library a per-commit run skipped (a record of an earlier lane).
     FullOnly,
     /// A bin-only member: nothing the library lane verifies.
     NoLib,
@@ -1618,7 +1613,9 @@ pub enum Decision {
 }
 
 impl Decision {
-    fn word(&self) -> String {
+    /// How a plan's `crate` line says it.
+    #[must_use]
+    pub fn word(&self) -> String {
         match self {
             Decision::Gate(_) => "gate".into(),
             Decision::Excluded => "excluded".into(),
@@ -1707,7 +1704,7 @@ pub struct Facts {
     /// What the keeper found holding the socket instead of this build's trustd
     /// (the lane's `.trustd-seen`), empty when it found nothing else.
     pub trustd_seen: String,
-    /// `ATERM_GATE_ONLY`, empty when the run was not narrowed by name.
+    /// The libraries a narrowed run named (`-p`), empty for the whole tree.
     pub only: String,
     pub per_commit: bool,
     /// The scope list the run read, as the run named it.
@@ -2024,9 +2021,8 @@ pub struct Verdict {
 /// runs too, so counting them every time would leave a real drop they could
 /// cover undecided on every run; credited once, the `--remeasure` that
 /// completes the record decides it — met, or a regression the lapses it stamps
-/// cannot cover. A run that files nothing (the merge contract's `--per-commit`,
-/// an `ATERM_GATE_ONLY` pre-flight) has no re-measure to resolve it, so it is
-/// judged on `timed_out=` alone.
+/// cannot cover. A run that files nothing (a `-p` run) has no re-measure to
+/// resolve it, so it is judged on `timed_out=` alone.
 fn clock_credit(facts: &Facts, name: &str, m: &Measured) -> u64 {
     let first = facts.provenance.as_ref().is_some_and(|p| {
         !p.remeasured
@@ -2038,35 +2034,50 @@ fn clock_credit(facts: &Facts, name: &str, m: &Measured) -> u64 {
 
 /// How to measure AGAIN the libraries a run left undecided, in the words of a
 /// lane that can: a run whose facts were filed (they carry a provenance) is
-/// completed on its own key by `--remeasure`; a narrowed run — the merge
-/// contract's `--per-commit` stage, an `ATERM_GATE_ONLY` pre-flight — or one
-/// that could not file has no record for `--remeasure` to complete (the lane
-/// refuses it there), so its own scope runs again.
+/// completed on its own key by `--remeasure`; a narrowed run, or one that could
+/// not file, has no record for `--remeasure` to complete, so its own scope runs
+/// again.
 fn measure_again(facts: &Facts, names: &[&str]) -> String {
     if facts.provenance.is_some() {
-        return "tools/trust-gate-all.sh --remeasure".into();
+        return "targo --unverified ship trust run --remeasure".into();
     }
-    let scoped = format!(
-        "ATERM_GATE_ONLY=\"{}\" tools/trust-gate-all.sh",
-        names.join(" ")
-    );
-    if facts.per_commit {
-        format!("{scoped} --per-commit, or the merge contract again (targo --unverified verify)")
+    format!(
+        "targo --unverified ship trust run -p {}",
+        names.join(" -p ")
+    )
+}
+
+/// Options for the host's process-name probe, or no recipe on an unknown host.
+/// macOS excludes ancestors unless `-a` is given; procps on Linux includes
+/// them unless its separate `-A` option is given. Neither probe uses `-f`:
+/// these patterns match process names, not argv[0] or full arguments.
+fn trustd_probe_options() -> Option<&'static str> {
+    if cfg!(target_os = "macos") {
+        Some("-alx")
+    } else if cfg!(target_os = "linux") {
+        Some("-lx")
     } else {
-        scoped
+        None
     }
 }
 
 fn trustd_remedy(verdict: &str, sock: &str, exe: &str) -> String {
-    let never = "never signal it: a killed trustd records DIRTY and blocks every check until an operator attests no solver survives";
+    let never = "never signal it: a killed trustd records DIRTY and blocks every check until `--recover-after-crash` attests no solver survives";
     match verdict {
         "foreign" => {
             format!("re-run once it retires (it exits 300 s after its last grant); {never}")
         }
         "silent" => format!("re-run when the machine is quieter; {never}"),
-        "dirty" => format!(
-            "trustd's crash epoch at {sock} is DIRTY, and targo starts no trustd until an operator attests that no solver of the prior daemon survives: establish that (reboot if unsure), then run `{exe} --recover-after-crash --confirm-no-solvers --socket {sock}` — an attestation, never a way to take a live socket — and re-run"
-        ),
+        "dirty" => match trustd_probe_options() {
+            Some(options) => format!(
+                "trustd's crash epoch at {sock} is DIRTY, and targo starts no trustd until someone attests that no solver of the prior daemon survives: from a shell that sees every process on this host (pgrep sees only its own PID namespace, so never from inside a PID-namespaced sandbox), `pgrep {options} 'trustc|rustc|ay|trust-wp.*|targo.*'` checks the standard Trust process names. Only exit 1 means none of those names matched; an error is not a clear probe. Account for any other or renamed solvers this toolchain runs too. Once no prior solver survives, run `{} --recover-after-crash --confirm-no-solvers --socket {}` and re-run; while a process remains, wait for it to exit, and never kill another's build to get there. It is an attestation, never a way to take a live socket",
+                shell_word(exe),
+                shell_word(sock)
+            ),
+            None => format!(
+                "trustd's crash epoch at {sock} is DIRTY; this host has no vetted process-listing recipe, so no recovery command is offered. Establish a complete host view and that no solver of the prior daemon survives before attesting; never signal trustd or kill another's build"
+            ),
+        },
         _ => "re-run once trustd admits it".into(),
     }
 }
@@ -2552,7 +2563,7 @@ pub fn judge(
                 status = "NO-FLOOR".into();
                 bad = true;
                 notes.push(format!(
-                    "NO FLOOR: {name}: gated with no floor in {ratchet_name} — record it: ATERM_GATE_ONLY={name} tools/trust-gate-all.sh --update-ratchet, and commit the row"
+                    "NO FLOOR: {name}: gated with no floor in {ratchet_name} — record it: targo --unverified ship trust run -p {name} --update-ratchet, and commit the row"
                 ));
             }
             Some(f) if proved < f => {
@@ -2588,7 +2599,7 @@ pub fn judge(
                         !cen.exhausted && !cen.atceil && cen.peak.is_some() && cen.ceil.is_some();
                     let mem_why = if mem.f == "-" {
                         format!(
-                            "{memory_name} records no ceiling for its floor, so the drop cannot be called the host's; it still fails; record it on a host that holds the floor: ATERM_GATE_ONLY={name} tools/trust-gate-all.sh --update-ratchet"
+                            "{memory_name} records no ceiling for its floor, so the drop cannot be called the host's; it still fails; record it on a host that holds the floor: targo --unverified ship trust run -p {name} --update-ratchet"
                         )
                     } else if !own_floor {
                         "its floor is another prover's, and a new prover's shortfall is not called the host's; it still fails".to_string()
@@ -2661,7 +2672,7 @@ pub fn judge(
                         )
                     } else {
                         format!(
-                            " — re-measure it: ATERM_GATE_ONLY={name} tools/trust-gate-all.sh --update-ratchet, and commit the row"
+                            " — re-measure it: targo --unverified ship trust run -p {name} --update-ratchet, and commit the row"
                         )
                     };
                     notes.push(format!(
@@ -2876,7 +2887,7 @@ pub fn judge(
             out.push_str("         WHOLE-TREE run, and this run was narrower:\n");
             if narrowed {
                 out.push_str(&format!(
-                    "     - ATERM_GATE_ONLY restricted the run to: {}\n",
+                    "     - -p restricted the run to: {}\n",
                     facts.only
                 ));
             }
@@ -2890,11 +2901,11 @@ pub fn judge(
                 out.push_str(&format!(
                     "     - {queued} vendored fork(s) QUEUED (not converted), nothing is claimed about them:{queued_what}\n"
                 ));
-                out.push_str("       Roster: tools/trust-gate-forks.tsv\n");
+                out.push_str("       Queued: aterm-release trust_lane.rs QUEUED_FORKS\n");
             }
             if roster_missing > 0 {
                 out.push_str(&format!(
-                    "     - {roster_missing} roster fork(s) are NOT in the resolved graph (FORK-VANISHED)\n"
+                    "     - {roster_missing} librar(ies) a floor or QUEUED_FORKS names are NOT in the resolved graph (FORK-VANISHED): a floor row goes with its library\n"
                 ));
             }
             if fail {
@@ -3011,12 +3022,10 @@ pub fn judge(
 // ---------------------------------------------------------------------------
 
 /// THE UP-ONLY FLOOR ON REUSE. Facts measured on commit A
-/// judge commit B when B differs from A only in `tools/trust-gate-ratchet.tsv`
+/// judge commit B when B differs from A only in [`RATCHET`]
 /// — so the floors are the ONE input that differs, and B's floors are held
-/// here to the rule the merge contract holds every ratchet change to (aterm-verify
-/// `stages::lowered_floors`, mirrored because this crate has no edge on the
-/// gate): every row of `measured` (A's floors) whose floor `judged` (B's)
-/// lowers — or whose prover column it rewrites — named. `driver` is the
+/// here to the ratchet's up-only rule: every row of `measured` (A's floors) whose
+/// floor `judged` (B's) lowers — or whose prover column it rewrites — named. `driver` is the
 /// `--version` line of the prover that MEASURED the facts; `gated(name)` says
 /// the facts verified that library.
 ///
@@ -3030,8 +3039,8 @@ pub fn judge(
 /// only onto `driver`: the facts measured that prover and no other, and the
 /// judge holds some checks (CAP-BOUND, the hand-lowered total) to a floor's own
 /// prover alone. For the same reason a floor that APPEARS after the measured
-/// commit for a library the facts verify names `driver`: the merge contract
-/// admits a new row under any prover (a branch recorded before a seal changed),
+/// commit for a library the facts verify names `driver`: a ratchet edit may add
+/// a new row under any prover (a branch recorded before a seal changed),
 /// but here the facts' prover is known exactly. A row removed while the facts
 /// still verify its library lowers it to nothing. A floor or total that is not
 /// a count is named too. With no `driver` (the facts' prover gave no
@@ -3221,12 +3230,12 @@ pub fn facts_key(tree_sans_floors: &str, prover: &str, lane: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// THE LANE'S END: `aterm-release trust conclude`
+// THE LANE'S END: [`conclude`]
 // ---------------------------------------------------------------------------
 
-/// What the lane hands `trust conclude` (`tools/trust-gate-all.sh`, "PASS 3"):
-/// the run's decisions and where its logs are, and — when the run is one that
-/// files — what the record is filed from.
+/// What a lane run wrote in its log directory (`.plan`, read by [`conclude`] and
+/// by the candidate gate's comparison): the run's decisions and where its logs are,
+/// and — when the run is one that files — what the record is filed from.
 #[derive(Clone, Debug, Default)]
 pub struct Plan {
     pub facts: Facts,
@@ -3411,7 +3420,7 @@ impl Plan {
         if files {
             p.file = Some(file);
         }
-        // What `trust admit` decided before the run: each library's memory row,
+        // What [`Plan::admit`] decided before the run: each library's memory row,
         // and the libraries this host refused up front.
         for (name, row) in mem_rows {
             if let Some(c) = p.facts.crates.iter_mut().find(|c| c.name == name) {
@@ -3429,7 +3438,7 @@ impl Plan {
         Ok(p)
     }
 
-    /// REFUSE UP FRONT (MEMORY; `trust admit`, before the run): read the memory
+    /// REFUSE UP FRONT (MEMORY, before the run): read the memory
     /// record — held to its shape — this host's observations and the ratchet,
     /// and decide which gated libraries this host cannot reproduce the floor
     /// of. Returns the plan lines that record it (the row this host reads of
@@ -3757,12 +3766,14 @@ fn outside_config(root: &Path, cargo_home: Option<&Path>) -> Vec<PathBuf> {
     out
 }
 
-/// What `trust conclude` printed and decided.
+/// What the lane's end decided, and what it has to say before the verdict.
 #[derive(Debug)]
 pub struct Concluded {
     pub verdict: Verdict,
     /// The FACTS line: where the record was filed, or why none was.
     pub facts_line: Option<String>,
+    /// Notes ahead of the report: a record not written, a closure key that moved.
+    pub said: Vec<String>,
 }
 
 /// MEASURED AGAIN, ON THE SAME KEY. `base` is the record a
@@ -3961,7 +3972,7 @@ fn closure_moves(
             let moved = old.moved(new.is_known().then_some(new)?);
             (!moved.is_empty()).then(|| {
                 format!(
-                    "trust-gate-all: {name}'s closure key differs from the stored run's on the same facts key ({} moved) — recorded for measuring, judged by nothing",
+                    "trust: {name}'s closure key differs from the stored run's on the same facts key ({} moved) — recorded for measuring, judged by nothing",
                     moved.join(", ")
                 )
             })
@@ -4078,7 +4089,7 @@ pub fn conclude(
         if written.is_err() {
             for (name, _) in &verdict.memory_rows {
                 said.push(format!(
-                    "trust-gate-all: {} NOT updated for {name} — the next --update-ratchet run writes it",
+                    "trust: {} NOT updated for {name} — the next --update-ratchet run writes it",
                     plan.memory.display()
                 ));
             }
@@ -4091,12 +4102,9 @@ pub fn conclude(
         && let Err(e) = write_host_obs(path, plan, &verdict)
     {
         said.push(format!(
-            "trust-gate-all: host memory observations NOT written ({}: {e}) — the next run refuses only by what it already holds; nothing was decided by it",
+            "trust: host memory observations NOT written ({}: {e}) — the next run refuses only by what it already holds; nothing was decided by it",
             path.display()
         ));
-    }
-    for line in &said {
-        println!("{line}");
     }
     let none = |why: &str| {
         Some(format!(
@@ -4138,13 +4146,14 @@ pub fn conclude(
     if let (true, Some(Ok(prov)), Some(file)) = (record_filed, &filed, &plan.file)
         && let Err(e) = file_closures(&file.store, &prov.key, &closures)
     {
-        println!(
-            "trust-gate-all: closure keys NOT recorded ({e}) — they were for measuring; nothing is judged by them"
-        );
+        said.push(format!(
+            "trust: closure keys NOT recorded ({e}) — they were for measuring; nothing is judged by them"
+        ));
     }
     Ok(Concluded {
         verdict,
         facts_line,
+        said,
     })
 }
 
@@ -4442,7 +4451,7 @@ pub fn trust_report(
         if !lowered.is_empty() {
             return unverified(format!(
                 "its facts (`{shown}`) were measured on {run}, and {} differs from it only in \
-                 its floors — which lowers floors the merge contract's up-only rule refuses: {}. \
+                 its floors — which lowers floors the ratchet's up-only rule refuses: {}. \
                  A floor goes down only with a new reason in its row's fifth column: re-based \
                  onto the prover that measured the facts, or under the same prover with its \
                  total down at least as far",
@@ -4474,10 +4483,10 @@ pub fn trust_report(
         // Facts read from another checkout's store are completed only there: a
         // remeasure reads and files its own clone's record alone.
         let remeasure = from.as_deref().map_or_else(
-            || "`tools/trust-gate-all.sh --remeasure`".to_string(),
+            || "`targo --unverified ship trust run --remeasure`".to_string(),
             |store| {
                 format!(
-                    "`tools/trust-gate-all.sh --remeasure` in the checkout whose receipt store \
+                    "`targo --unverified ship trust run --remeasure` in the checkout whose receipt store \
                      is {} (a remeasure completes only its own clone's record)",
                     store.display()
                 )
@@ -4693,26 +4702,6 @@ pub fn verified_line(head: &str, prover: &Prover, report: &TrustReport) -> Strin
     )
 }
 
-/// The cutter's refusal of a tree the lane did not verify. A NARROWED
-/// verdict's `why` names its one action (a machine with more memory): a rerun
-/// here only narrows again, so it is not offered.
-#[must_use]
-pub fn refusal(head: &str, why: &str, narrowed: bool) -> String {
-    let verify = if narrowed {
-        String::new()
-    } else {
-        format!(
-            " Verify it: `git worktree add --detach <dir> {head}`, then \
-             `tools/trust-gate-all.sh` there; `targo --unverified ship trust judge --commit \
-             {head}` prints every library against its floor."
-        )
-    };
-    format!(
-        "the tree this cut releases ({head}) has no passing whole-tree Trust advisory run: \
-         {why}.{verify} Nothing was claimed."
-    )
-}
-
 /// `trust-facts-<9 hex>` for a record's file name.
 fn short_name(name: &str) -> String {
     name.strip_prefix(FACTS_PREFIX).map_or_else(
@@ -4728,13 +4717,12 @@ fn short_name(name: &str) -> String {
 /// A `trust` verb ([`parse_cmd`], run by [`run_cmd`]).
 #[derive(Debug, PartialEq, Eq)]
 pub enum TrustCmd {
-    /// `prover --driver <targo>`: the identity of the toolchain the driver runs from.
-    Prover { driver: PathBuf },
-    /// `admit --plan <file>`: before the run, the libraries this host refuses
-    /// for memory, recorded in the plan (MEMORY).
-    Admit { plan: PathBuf },
-    /// `conclude --plan <file> [--update-ratchet]`: the lane's end.
-    Conclude { plan: PathBuf, update: bool },
+    /// `run (-p <crate>… | --whole-tree | --remeasure) [flags]`: the lane
+    /// ([`crate::trust_lane`]).
+    Run(crate::trust_lane::Config),
+    /// `candidate (--candidate <dir> | --admits <dir>) [flags]`: the candidate gate
+    /// ([`crate::trust_candidate`]).
+    Candidate(crate::trust_candidate::Args),
     /// `verdict [--commit REV] [--prover BIN]`: the cutter's answer, one line.
     Verdict {
         commit: String,
@@ -4758,14 +4746,8 @@ pub enum TrustCmd {
     },
     /// `compare --base <plan> --candidate <plan> [--base-logdir DIR]
     /// [--candidate-logdir DIR] [--tsv FILE] [--base-prover ID] [--ratchet FILE]`: the
-    /// candidate gate (D27, [`crate::trust_compare`]) — what a candidate
-    /// toolchain's whole-tree run measured, library by library, against the
-    /// published seal's run of the same tree on the same machine.
+    /// candidate gate's comparison (D27, [`crate::trust_compare`]) of two runs' plans.
     Compare(crate::trust_compare::Args),
-    /// `obligations --report <report.ndjson> --package <name> --repo <dir>
-    /// [--manifest <path>] --out <file>`: the lane's reduction of one check's
-    /// report to its per-obligation record ([`crate::trust_oblig::reduce`]).
-    Obligations(crate::trust_oblig::ReduceArgs),
 }
 
 /// Parse `trust <verb> …`.
@@ -4777,17 +4759,19 @@ pub fn parse_cmd<'a>(
 ) -> std::result::Result<TrustCmd, String> {
     let verb = it
         .next()
-        .ok_or(
-            "trust needs a verb: verdict, judge, pending, prover, admit, conclude, compare or obligations",
-        )?;
+        .ok_or("trust needs a verb: run, candidate, verdict, judge, pending or compare")?;
+    if verb == "run" {
+        return crate::trust_lane::parse(it).map(TrustCmd::Run);
+    }
+    if verb == "candidate" {
+        return crate::trust_candidate::parse(it).map(TrustCmd::Candidate);
+    }
     let mut flags: BTreeMap<&str, Option<&str>> = BTreeMap::new();
     while let Some(flag) = it.next() {
         let takes_value = matches!(
             flag,
             "--commit"
                 | "--prover"
-                | "--driver"
-                | "--plan"
                 | "--reason"
                 | "--base"
                 | "--candidate"
@@ -4801,11 +4785,6 @@ pub fn parse_cmd<'a>(
                 | "--candidate-trust-commit"
                 | "--base-trust-commit"
                 | "--obligations-tsv"
-                | "--report"
-                | "--package"
-                | "--repo"
-                | "--manifest"
-                | "--out"
         );
         let value = if takes_value {
             let v = it.next().ok_or_else(|| format!("{flag} needs a value"))?;
@@ -4823,9 +4802,6 @@ pub fn parse_cmd<'a>(
         }
     }
     let allowed: &[&str] = match verb {
-        "prover" => &["--driver"],
-        "admit" => &["--plan"],
-        "conclude" => &["--plan", "--update-ratchet"],
         "verdict" | "pending" => &["--commit", "--prover"],
         "judge" => &["--commit", "--prover", "--update-ratchet", "--reason"],
         "compare" => &[
@@ -4842,7 +4818,6 @@ pub fn parse_cmd<'a>(
             "--base-trust-commit",
             "--obligations-tsv",
         ],
-        "obligations" => &["--report", "--package", "--repo", "--manifest", "--out"],
         other => return Err(format!("unknown trust verb {other:?}")),
     };
     if let Some(bad) = flags.keys().find(|f| !allowed.contains(f)) {
@@ -4859,16 +4834,6 @@ pub fn parse_cmd<'a>(
         );
     }
     Ok(match verb {
-        "prover" => TrustCmd::Prover {
-            driver: path("--driver").ok_or("trust prover needs --driver <targo>")?,
-        },
-        "admit" => TrustCmd::Admit {
-            plan: path("--plan").ok_or("trust admit needs --plan <file>")?,
-        },
-        "conclude" => TrustCmd::Conclude {
-            plan: path("--plan").ok_or("trust conclude needs --plan <file>")?,
-            update,
-        },
         "verdict" => TrustCmd::Verdict {
             commit,
             prover: path("--prover"),
@@ -4891,16 +4856,6 @@ pub fn parse_cmd<'a>(
             candidate_trust_commit: value("--candidate-trust-commit").map(str::to_string),
             base_trust_commit: value("--base-trust-commit").map(str::to_string),
             obligations_tsv: path("--obligations-tsv"),
-        }),
-        "obligations" => TrustCmd::Obligations(crate::trust_oblig::ReduceArgs {
-            report: path("--report")
-                .ok_or("trust obligations needs --report <the check's report.ndjson>")?,
-            package: value("--package")
-                .ok_or("trust obligations needs --package <the library>")?
-                .to_string(),
-            repo: path("--repo").ok_or("trust obligations needs --repo <the checkout>")?,
-            manifest: value("--manifest").map(str::to_string),
-            out: path("--out").ok_or("trust obligations needs --out <the record>")?,
         }),
         _ => TrustCmd::Judge {
             commit,
@@ -4938,7 +4893,7 @@ pub fn verdict_for(git: &dyn GitRunner, prover: &Prover, rev: &str) -> Result<(b
 }
 
 /// What `rev`'s stored facts from `prover` leave UNDECIDED — the libraries
-/// `tools/trust-gate-all.sh --remeasure` measures again — or `Err(why)` when there
+/// `ship trust run --remeasure` measures again — or `Err(why)` when there
 /// are no facts to complete: what `trust pending` prints.
 ///
 /// # Errors
@@ -4965,77 +4920,12 @@ pub fn run_cmd(repo: &Path, cmd: TrustCmd) -> i32 {
     let git = crate::ledger::GitCli::new(repo);
     match cmd {
         TrustCmd::Compare(args) => crate::trust_compare::run(&args),
-        TrustCmd::Obligations(args) => crate::trust_oblig::run_reduce(&args),
-        TrustCmd::Prover { driver } => {
-            let bin = driver.parent().unwrap_or(Path::new("."));
-            match prover_identity(bin) {
-                Ok((id, root)) => {
-                    println!("{id} {}", root.display());
-                    0
-                }
-                Err(why) => {
-                    eprintln!("aterm-release trust prover: {why}");
-                    2
-                }
-            }
+        TrustCmd::Run(mut cfg) => {
+            cfg.repo = repo.to_path_buf();
+            crate::trust_lane::run(&cfg, &mut std::io::stdout()).exit()
         }
-        TrustCmd::Admit { plan } => {
-            let answer = fs::read_to_string(&plan)
-                .map_err(|e| format!("{}: {e}", plan.display()))
-                .and_then(|text| Plan::parse(&text))
-                .and_then(|parsed| parsed.admit());
-            let (lines, refused) = match answer {
-                Ok(a) => a,
-                Err(why) => {
-                    eprintln!("{why}");
-                    return 2;
-                }
-            };
-            let appended = fs::OpenOptions::new()
-                .append(true)
-                .open(&plan)
-                .and_then(|mut f| std::io::Write::write_all(&mut f, lines.as_bytes()));
-            if let Err(e) = appended {
-                eprintln!("{}: {e}", plan.display());
-                return 2;
-            }
-            for (name, line) in refused {
-                println!("refuse {name}\t{line}");
-            }
-            0
-        }
-        TrustCmd::Conclude { plan, update } => {
-            let text = match fs::read_to_string(&plan) {
-                Ok(t) => t,
-                Err(e) => {
-                    eprintln!("aterm-release trust conclude: {}: {e}", plan.display());
-                    return 2;
-                }
-            };
-            let mut parsed = match Plan::parse(&text) {
-                Ok(p) => p,
-                Err(why) => {
-                    eprintln!("aterm-release trust conclude: {}: {why}", plan.display());
-                    return 2;
-                }
-            };
-            let update = if update { Update::RAISE } else { Update::NONE };
-            match conclude(&git, repo, &mut parsed, update) {
-                Ok(done) => {
-                    print!("{}", done.verdict.report);
-                    if let Some(line) = &done.facts_line {
-                        println!("{line}");
-                    }
-                    if !done.verdict.tail.is_empty() {
-                        println!("{}", done.verdict.tail);
-                    }
-                    done.verdict.exit
-                }
-                Err(e) => {
-                    eprintln!("aterm-release trust conclude: {e}");
-                    2
-                }
-            }
+        TrustCmd::Candidate(args) => {
+            crate::trust_candidate::run(repo, &args, &mut std::io::stdout())
         }
         TrustCmd::Verdict { commit, prover } => {
             let prover = match asked_prover(prover) {
@@ -5172,7 +5062,7 @@ pub fn run_cmd(repo: &Path, cmd: TrustCmd) -> i32 {
             }
             if !lowered.is_empty() {
                 println!(
-                    "VERDICT: FAIL — the working floors lower {} floor(s) the merge contract's up-only rule refuses (LOWERED above), against those of {}, which the facts were measured on",
+                    "VERDICT: FAIL — the working floors lower {} floor(s) the ratchet's up-only rule refuses (LOWERED above), against those of {}, which the facts were measured on",
                     lowered.len(),
                     short(&p.head)
                 );
@@ -5241,7 +5131,6 @@ pub(crate) mod testing {
             driver_id: driver_id.into(),
             trustd: "/tmp/t.sock".into(),
             grants: "1".into(),
-            scope_file: "tools/trust-gate-scope.tsv".into(),
             crates,
             provenance: Some(Provenance {
                 key: facts_key(&tsr, &id, LANE_WHOLE_TREE),
@@ -5658,7 +5547,6 @@ mod tests {
             driver_id: "targo 1.99.0-dev (aaaaaaaaa 2026-09-17) (targo 0.1.0)".into(),
             trustd: "/tmp/t.sock".into(),
             grants: "1".into(),
-            scope_file: "tools/trust-gate-scope.tsv".into(),
             crates: crates.into_iter().map(|(n, d)| Crate::new(n, d)).collect(),
             ..Facts::default()
         }
@@ -5712,7 +5600,7 @@ mod tests {
         let plan = |extra: &str| {
             format!(
                 "{PLAN_MAGIC}\ndriver {}/targo\ndriver-id {DRV}\ntrustd /tmp/t.sock\nonly \nper-commit 0\n\
-                 scope-file tools/trust-gate-scope.tsv\nlogdir {}\nratchet {}\ncrate alpha\talpha@1.0.0\tgate\n\
+                 logdir {}\nratchet {}\ncrate alpha\talpha@1.0.0\tgate\n\
                  store {}\ncommit {head}\ntree x\nprover {}\nprover-bin {}\ntarget-root {}\nsince 0\n\
                  lane-pin SOURCE_DATE_EPOCH=0\nlane-passed PATH\nlane-passed HOME\nfile \n{extra}",
                 a.bin.display(),
@@ -6068,12 +5956,12 @@ mod tests {
             "{r:?}"
         );
         // A floor lowered by hand, under the same prover and with no reason:
-        // the facts are found, and the lowering is refused, named — the merge
-        // contract's rule, which no gate on this path otherwise applies.
+        // the facts are found, and the lowering is refused, named — the
+        // ratchet's rule, which no gate on this path otherwise applies.
         let lowered = w.commit(&[(RATCHET, &floor(5))]);
         let r = w.report(&a, &lowered);
         assert!(
-            why(&r).contains("lowers floors the merge contract's up-only rule refuses")
+            why(&r).contains("lowers floors the ratchet's up-only rule refuses")
                 && why(&r).contains(
                     "alpha: floor 6 -> 5 under the same prover (targo 1.99.0-dev (aaaaaaaaa"
                 )
@@ -6210,16 +6098,15 @@ mod tests {
         file_record(&w.store(), &f).unwrap();
         let r = w.report(&a, "HEAD");
         assert!(
-            why(&r).contains("git cannot read tools/trust-gate-ratchet.tsv of 012345678"),
+            why(&r).contains(&format!("git cannot read {RATCHET} of 012345678")),
             "{r:?}"
         );
     }
 
-    /// The up-only rule, row by row, as the merge contract's `lowered_floors`
-    /// holds it — and, for reused facts, a first floor under another prover's
-    /// name too.
+    /// The ratchet's up-only rule, row by row — and, for reused facts, a first
+    /// floor under another prover's name too.
     #[test]
-    fn the_up_only_rule_is_the_merge_contracts() {
+    fn the_up_only_rule_holds_row_by_row() {
         let d = "targo 1.99.0-dev (aaaaaaaaa 2026-09-17) (targo 0.1.0)";
         let base = format!("alpha\t987\t3806\t{d}\nbeta\t5\t9\t{d}\nold\t3\t3\tolder prover\n");
         let all = |_: &str| true;
@@ -6484,7 +6371,7 @@ mod tests {
         let plan = |extra: &str| {
             format!(
                 "{PLAN_MAGIC}\ndriver {}/targo\ndriver-id {DRV}\ntrustd /tmp/t.sock\nonly \nper-commit 0\n\
-                 scope-file tools/trust-gate-scope.tsv\nlogdir {}\nratchet {}\ncrate alpha\talpha@1.0.0\tgate\n\
+                 logdir {}\nratchet {}\ncrate alpha\talpha@1.0.0\tgate\n\
                  store {}\ncommit {head}\ntree x\nprover {}\nprover-bin {}\ntarget-root {}\nsince 0\n{LANE}{extra}",
                 a.bin.display(),
                 logs.display(),
@@ -6522,13 +6409,13 @@ mod tests {
             format!("alpha.rmeta: crates/alpha/src/lib.rs {RATCHET}\n"),
         )
         .unwrap();
-        assert!(facts_line("file \n").contains("names tools/trust-gate-ratchet.tsv"));
+        assert!(facts_line("file \n").contains(&format!("names {RATCHET}")));
         fs::write(
             &dep,
             format!("alpha.rmeta: crates/alpha/src/lib.rs {MEMORY}\n"),
         )
         .unwrap();
-        assert!(facts_line("file \n").contains("names tools/trust-gate-memory.tsv"));
+        assert!(facts_line("file \n").contains(&format!("names {MEMORY}")));
         // THE COMPILES' OWN RECORD OF WHAT THEY READ (`# env-dep:`, the plan's
         // §4.2 env-deps): a value the key does not determine files nothing,
         // named — never its value.
@@ -6759,78 +6646,12 @@ mod tests {
                 ..crate::trust_compare::Args::default()
             }))
         );
-        assert_eq!(
-            parse(&[
-                "obligations",
-                "--report",
-                "/l/a.log.report/report.ndjson",
-                "--package",
-                "astream-cap",
-                "--repo",
-                "/r",
-                "--manifest",
-                "vendor/astream/crates/astream-cap/Cargo.toml",
-                "--out",
-                "/l/a.log.oblig.tsv",
-            ]),
-            Ok(TrustCmd::Obligations(crate::trust_oblig::ReduceArgs {
-                report: "/l/a.log.report/report.ndjson".into(),
-                package: "astream-cap".into(),
-                repo: "/r".into(),
-                manifest: Some("vendor/astream/crates/astream-cap/Cargo.toml".into()),
-                out: "/l/a.log.oblig.tsv".into(),
-            }))
-        );
+        assert!(matches!(
+            parse(&["run", "-p", "alpha"]),
+            Ok(TrustCmd::Run(c)) if c.scope == crate::trust_lane::Scope::Packages(vec!["alpha".into()])
+        ));
         for bad in [
-            &[
-                "obligations",
-                "--report",
-                "/r",
-                "--package",
-                "p",
-                "--repo",
-                "/x",
-            ][..],
-            &[
-                "obligations",
-                "--report",
-                "/r",
-                "--package",
-                "p",
-                "--out",
-                "/o",
-            ][..],
-            &[
-                "obligations",
-                "--report",
-                "/r",
-                "--repo",
-                "/x",
-                "--out",
-                "/o",
-            ][..],
-            &[
-                "obligations",
-                "--package",
-                "p",
-                "--repo",
-                "/x",
-                "--out",
-                "/o",
-            ][..],
-            &[
-                "obligations",
-                "--report",
-                "/r",
-                "--package",
-                "p",
-                "--repo",
-                "/x",
-                "--out",
-                "/o",
-                "--tsv",
-                "/t",
-            ][..],
+            &["run"][..],
             &[
                 "compare",
                 "--base",
@@ -6857,6 +6678,7 @@ mod tests {
             &["pending", "--update-ratchet"][..],
             &["prover"][..],
             &["conclude", "--plan"][..],
+            &["obligations", "--report", "/r"][..],
             &["verdict", "--commit", "a", "--commit", "b"][..],
             &["nope"][..],
             &[][..],
@@ -6933,11 +6755,11 @@ mod tests {
         let two = w.commit(&[(RATCHET, "alpha\t2\t2\n")]);
         // what --update-ratchet writes beside the floors: the memory record
         let mem = w.commit(&[(MEMORY, "alpha\t16.0\t1.6\t=\t2026-09-30 at 16.0 GiB\n")]);
-        let three = w.commit(&[("tools/trust-gate-scope.tsv", "x\tnever\t-\n")]);
+        let three = w.commit(&[("crates/alpha/src/lib.rs", "pub fn f() {}\n")]);
         let t = |c: &str| tree_sans_floors(&w.cli(), c).unwrap();
         assert_eq!(t(&one), t(&two), "the floors alone move nothing");
         assert_eq!(t(&two), t(&mem), "nor does the memory record");
-        assert_ne!(t(&mem), t(&three), "the scope list is an input");
+        assert_ne!(t(&mem), t(&three), "any other file is an input");
         // a ratchet or memory record deleted, or added, is still only the floors
         w.git(&["rm", "-q", RATCHET, MEMORY]);
         let four = w.commit(&[]);
@@ -7150,9 +6972,7 @@ mod tests {
     /// COULD NOT RUN, and named for a re-measure — never a pass; a drop larger
     /// than every lapse is a regression; lapses beside a floor met change nothing.
     /// The re-measure named is one the lane runs: `--remeasure` completes FILED
-    /// facts; a narrowed run (the merge contract's `--per-commit` stage, an
-    /// `ATERM_GATE_ONLY` pre-flight) files none, and the lane refuses
-    /// `--remeasure` there, so it names its own scope again.
+    /// facts; a `-p` run files none, so it names its own scope again.
     #[test]
     fn a_lapsed_shortfall_is_undecided_never_a_pass() {
         let lapsed = |proved: u64, n: u64| {
@@ -7176,23 +6996,8 @@ mod tests {
         assert!(
             v.report.contains("NOT-VERIFIED(clock,<3,1)")
                 && v.report.contains("BUDGET LAPSED: alpha")
-                && v.tail.contains("tools/trust-gate-all.sh --remeasure"),
+                && v.tail.contains("ship trust run --remeasure"),
             "{}\n{}",
-            v.report,
-            v.tail
-        );
-        let mut per_commit = lapsed(2, 1);
-        per_commit.provenance = None;
-        per_commit.per_commit = true;
-        let v = judge(&per_commit, Some(&floor3), "R", "M", Update::NONE);
-        assert_eq!(v.word, "COULD-NOT-RUN");
-        assert!(
-            !v.report.contains("--remeasure")
-                && !v.tail.contains("--remeasure")
-                && v.tail.contains(
-                    "ATERM_GATE_ONLY=\"alpha\" tools/trust-gate-all.sh --per-commit, or the merge contract again"
-                ),
-            "the per-commit lane cannot --remeasure:\n{}\n{}",
             v.report,
             v.tail
         );
@@ -7201,9 +7006,7 @@ mod tests {
         scoped.only = "alpha".into();
         let v = judge(&scoped, Some(&floor3), "R", "M", Update::NONE);
         assert!(
-            !v.tail.contains("--remeasure")
-                && v.tail
-                    .ends_with("ATERM_GATE_ONLY=\"alpha\" tools/trust-gate-all.sh"),
+            !v.tail.contains("--remeasure") && v.tail.ends_with("ship trust run -p alpha"),
             "{}",
             v.tail
         );
@@ -7258,7 +7061,7 @@ mod tests {
         assert!(
             v.report.contains("NOT-VERIFIED(clock,<383,131)")
                 && v.report.contains("BUDGET LAPSED: aterm-codec")
-                && v.tail.contains("tools/trust-gate-all.sh --remeasure"),
+                && v.tail.contains("ship trust run --remeasure"),
             "{}\n{}",
             v.report,
             v.tail
@@ -7358,13 +7161,100 @@ mod tests {
             v.tail
         );
         let v = judge(&refused("dirty", ""), Some(""), "R", "M", Update::NONE);
+        if trustd_probe_options().is_some() {
+            assert!(
+                v.tail
+                    .contains("--recover-after-crash --confirm-no-solvers --socket /tmp/t.sock")
+                    && v.tail.contains("/store/trust/9192/bin/trustd"),
+                "{}",
+                v.tail
+            );
+        } else {
+            assert!(!v.tail.contains("--recover-after-crash"), "{}", v.tail);
+        }
+    }
+
+    /// The recovery command is pasted into a shell, and atpkg's store lives under
+    /// `Application Support`: the path stays one word.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn the_recovery_command_survives_a_store_path_with_a_space() {
+        let r = trustd_remedy("dirty", "/tmp/t.sock", "/a b/bin/trustd");
         assert!(
-            v.tail
-                .contains("--recover-after-crash --confirm-no-solvers --socket /tmp/t.sock")
-                && v.tail.contains("/store/trust/9192/bin/trustd"),
-            "{}",
-            v.tail
+            r.contains("`'/a b/bin/trustd' --recover-after-crash --confirm-no-solvers --socket /tmp/t.sock`"),
+            "{r}"
         );
+    }
+
+    /// The absence of matches must include a matching ancestor, not just
+    /// siblings. A uniquely named owned libtest child is the ancestor here;
+    /// no actual compiler, solver, daemon or recovery is involved.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_recovery_probe_observes_a_matching_owned_ancestor() {
+        use std::os::unix::fs::MetadataExt as _;
+        use std::time::{Duration, Instant};
+
+        const CHILD: &str = "ATERM_TEST_PGREP_ANCESTOR";
+        if let Some(path) = std::env::var_os(CHILD) {
+            let path = PathBuf::from(path);
+            let own = std::fs::metadata(std::env::current_exe().unwrap()).unwrap();
+            let linked = std::fs::metadata(&path).unwrap();
+            assert_eq!((own.dev(), own.ino()), (linked.dev(), linked.ino()));
+            let name = path.file_name().unwrap().to_str().unwrap();
+            let probe = |options: &str| {
+                aterm_uds::spawnfd::command("/usr/bin/pgrep")
+                    .args([options, name])
+                    .output()
+                    .expect("owned process-name probe")
+            };
+            let matches_self = |out: &std::process::Output| {
+                out.status.success()
+                    && String::from_utf8_lossy(&out.stdout).lines().any(|line| {
+                        line.split_whitespace()
+                            .next()
+                            .and_then(|pid| pid.parse::<u32>().ok())
+                            == Some(std::process::id())
+                    })
+            };
+            // First establish that the real actor has its unique process
+            // name; the old options then demonstrate the omission.
+            assert!(matches_self(&probe("-alx")), "owned ancestor is observable");
+            let old = probe("-lx");
+            assert_eq!(old.status.code(), Some(1));
+            assert!(old.stdout.is_empty());
+            let current = probe(trustd_probe_options().expect("macOS probe"));
+            println!(
+                "OWNED_ANCESTOR_PID={} PROBE={}",
+                std::process::id(),
+                String::from_utf8_lossy(&current.stdout).trim()
+            );
+            assert!(
+                matches_self(&current),
+                "the declared probe must see its matching ancestor"
+            );
+            return;
+        }
+
+        let scratch = aterm_tempfile::Builder::new()
+            .prefix("trustd-probe-ancestor-")
+            .tempdir()
+            .unwrap();
+        let named = scratch.path().join(format!("atpa{}", std::process::id()));
+        std::fs::hard_link(std::env::current_exe().unwrap(), &named).unwrap();
+        let test = "trust_facts::tests::the_recovery_probe_observes_a_matching_owned_ancestor";
+        let mut child = aterm_uds::spawnfd::command(&named);
+        child
+            .args(["--exact", test, "--nocapture"])
+            .env(CHILD, &named);
+        // The parent owns the child's whole process group, including its
+        // synchronous pgrep children, through a one-minute hang detector.
+        let out =
+            aterm_uds::deadline::output_until(&mut child, Instant::now() + Duration::from_secs(60))
+                .expect("owned ancestor fixture finishes and is reaped");
+        println!("{}", String::from_utf8_lossy(&out.stdout));
+        assert!(out.status.success(), "{out:?}");
+        assert!(String::from_utf8_lossy(&out.stdout).contains("OWNED_ANCESTOR_PID="));
     }
 
     /// MEASURED AGAIN ON THE SAME KEY: the fold replaces the libraries the new
@@ -7578,7 +7468,7 @@ mod tests {
         let ok = "# c\nalpha\t16.0\t24\t4.0\t3.0\t=\tm101\nalpha\t16.0\t8\t4.0\t2.1\t=\tA18\nbeta\t16.0\t-\t-\t-\t-\t-\n";
         let rec = parse_memory(ok, "R").unwrap();
         assert_eq!(rec["alpha"].len(), 2);
-        if let Err(e) = parse_memory(include_str!("../../../tools/trust-gate-memory.tsv"), MEMORY) {
+        if let Err(e) = parse_memory(include_str!("../trust/memory.tsv"), MEMORY) {
             panic!("the committed record does not parse: {e}");
         }
         assert_eq!(

@@ -1,19 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 for `SupervisorDoneCheck` (aterm-spec `supervisor_done_check_model`):
-//! the real turn-end decider (`decide_turn_end`, with its `TurnEndState`)
-//! driven along every reachable state of the model.
-//!
-//! Someone else's turn is a point observed with real work (its last words a
-//! done report, progress, or a `529 Overloaded` wall); the policy's `Continue`,
-//! `Check` and `WallAct` are the decider's own acts on the real ladder's
-//! clock, recorded with `acted`; a yield is the next point observed. At every
-//! state the decider types the continuation, the check and the wall's retry
-//! exactly where the model enables them and nothing on a done task, and its
-//! done reports are the model's `done`. Negative controls: the `Buggy = 1`
-//! model continues at a done report where the real decider checks, and does
-//! nothing at a wall after the task was done where the real decider retries.
+//! Tier-1 for `SupervisorDoneCheck` (aterm-spec `supervisor_done_check_model`): the
+//! real turn-end decider (`decide_turn_end`, with its `TurnEndState`) driven along
+//! every reachable state of the model. Someone else's turn is a point observed with
+//! real work (its last words a done report, progress, a FINISHED report that leaves
+//! nothing or one that names open work, or a `529 Overloaded` wall); `Continue`,
+//! `Check`, `Challenge` and `WallAct` are the decider's own acts, recorded with
+//! `acted`. At every state the decider types exactly what the model enables and
+//! nothing on a done task, and its done reports, owed challenge and the job's
+//! challenge are the model's `done`, `open` and `challenged`. Negative controls: the
+//! `Buggy = 1` model continues at a done report where the real decider checks, does
+//! nothing at a wall after the task was done where the real decider retries, ends the
+//! task on an open FINISHED where the real decider challenges, and owes a second
+//! challenge where the real decider's challenged job ends.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
@@ -21,8 +21,8 @@ use std::time::{Duration, Instant};
 use aterm_agent::supervise::SupervisorConfig;
 use aterm_agent::supervise::phase::Phase;
 use aterm_agent::supervise::policy::turn_end::{
-    Composer, DONE_CHECK, RULE_API_RETRY, RULE_CONTINUE, RULE_DONE_CHECK, TurnEndAction,
-    TurnEndReading, TurnEndState, decide_turn_end,
+    Composer, DONE_CHECK, RULE_API_RETRY, RULE_CONTINUE, RULE_DONE_CHECK, RULE_OPEN_ITEMS,
+    TurnEndAction, TurnEndReading, TurnEndState, decide_turn_end, open_items_text,
 };
 use aterm_phase::wall::WallKind;
 use aterm_spec::derive::{Model, supervisor_done_check_model};
@@ -36,6 +36,11 @@ const LONG: Duration = Duration::from_secs(4 * 60);
 const PROGRESS: &str = "Stage 2 landed; the parser is next.";
 const REPORT: &str = "Everything is already done; nothing left to do.";
 const REPLY: &str = "DONE";
+/// The worker's own FINISHED, over a report that leaves nothing, and over one
+/// whose words still name open work.
+const FINISHED: &str = "Built, tested and landed the parser. Nothing left.\nATERM-TASK-DONE";
+const FINISHED_OPEN: &str =
+    "Landed the parser.\nStill open: the lexer's e2e suite (not run).\nATERM-TASK-DONE";
 
 /// An authoritative idle point whose turn worked `worked`, ending on `said`
 /// — or on a `529 Overloaded` wall.
@@ -78,6 +83,10 @@ fn point(said: &str, walled: bool, worked: Option<Duration>) -> TurnEndReading {
         thread_model: None,
         upgrade_goal: false,
         account: None,
+        autopilot: aterm_agent::supervise::Autopilot::Cruise,
+        login_label: None,
+        login_superseded: false,
+        login_notice: None,
     }
 }
 
@@ -86,6 +95,7 @@ fn point(said: &str, walled: bool, worked: Option<Duration>) -> TurnEndReading {
 enum Verdict {
     Continue,
     Check,
+    Challenge,
     WallAct,
     Nothing,
 }
@@ -96,6 +106,10 @@ fn verdict(a: &TurnEndAction) -> Verdict {
         TurnEndAction::Type { text, rule_id } if *rule_id == RULE_DONE_CHECK => {
             assert_eq!(text, DONE_CHECK, "the check's words");
             Verdict::Check
+        }
+        TurnEndAction::Type { text, rule_id } if *rule_id == RULE_OPEN_ITEMS => {
+            assert_eq!(text, &open_items_text(&["still open"], None), "its words");
+            Verdict::Challenge
         }
         TurnEndAction::Type { rule_id, .. } if *rule_id == RULE_API_RETRY => Verdict::WallAct,
         TurnEndAction::Nothing => Verdict::Nothing,
@@ -108,6 +122,8 @@ fn expected(m: &Model, st: &State) -> Verdict {
         Verdict::Continue
     } else if m.action_enabled("Check", st) {
         Verdict::Check
+    } else if m.action_enabled("Challenge", st) {
+        Verdict::Challenge
     } else if m.action_enabled("WallAct", st) {
         Verdict::WallAct
     } else {
@@ -156,7 +172,9 @@ fn mirror(action: &str, before: &State, real: &mut Real) {
         "OtherTurnDone" => real.turn(REPORT, false),
         "OtherTurnWork" => real.turn(PROGRESS, false),
         "OtherTurnWall" | "YieldWall" => real.turn(PROGRESS, true),
-        "Continue" | "Check" | "WallAct" => {
+        "OtherTurnFinished" | "YieldFinished" => real.turn(FINISHED, false),
+        "OtherTurnOpenFinished" | "YieldOpenFinished" => real.turn(FINISHED_OPEN, false),
+        "Continue" | "Check" | "Challenge" | "WallAct" => {
             let a = real.decide();
             assert_ne!(verdict(&a), Verdict::Nothing, "{action} at {before:?}");
             let r = point(real.said, real.walled, None);
@@ -205,6 +223,17 @@ fn tier1_the_real_decider_checks_a_done_report_and_leaves_a_done_task() {
                 "the done reports at {st:?}"
             );
             assert_eq!(real.st.task_done(), st["done"] == 2, "{st:?}");
+            let (open, challenged) = real.st.open_items();
+            assert_eq!(
+                !open.is_empty(),
+                st["open"] == 1,
+                "the owed challenge at {st:?}"
+            );
+            assert_eq!(
+                challenged,
+                st["challenged"] == 1,
+                "the job's challenge at {st:?}"
+            );
             let got = verdict(&real.clone().decide());
             assert_eq!(
                 got,
@@ -224,9 +253,11 @@ fn tier1_the_real_decider_checks_a_done_report_and_leaves_a_done_task() {
         }
     }
     // done 0, 1 and 2 at a clean point, 0 and 1 at a wall, and a
-    // continuation's, the check's and the wall's act's turn (from done 0 or 1).
-    assert_eq!(seen.len(), 9, "the reachable space changed: {seen:?}");
-    for word in ["Continue", "Check", "WallAct", "Nothing"] {
+    // continuation's, the check's and the wall's act's turn (from done 0 or
+    // 1); an open FINISHED's point; and, once the job was challenged, the
+    // challenge's turn and every state short of done again (19).
+    assert_eq!(seen.len(), 19, "the reachable space changed: {seen:?}");
+    for word in ["Continue", "Check", "Challenge", "WallAct", "Nothing"] {
         assert!(
             verdicts.contains_key(word),
             "{word} never occurred: {verdicts:?}"
@@ -276,4 +307,38 @@ fn tier1_the_real_decider_checks_a_done_report_and_leaves_a_done_task() {
     mirror("OtherTurnWall", &before, &mut real);
     assert!(!real.st.task_done());
     assert_eq!(verdict(&real.clone().decide()), Verdict::WallAct);
+
+    // At an open FINISHED the Buggy model ends the task at once (the harness
+    // before DONE-1); the real decider types the challenge…
+    let mut real = Real {
+        st: TurnEndState::default(),
+        now: base,
+        said: PROGRESS,
+        walled: false,
+    };
+    real.st
+        .observe(&point(PROGRESS, false, Some(LONG)), real.now);
+    let mut st = m.init_state();
+    let before = st.clone();
+    assert!(m.fire("OtherTurnOpenFinished", &mut st));
+    mirror("OtherTurnOpenFinished", &before, &mut real);
+    let mut b = st.clone();
+    assert!(buggy.fire("FinishOpenAtOnce", &mut b), "{b:?}");
+    assert!(!buggy.check_invariant("AnOpenFinishIsChallenged", &b));
+    assert!(!real.st.task_done());
+    assert_eq!(verdict(&real.clone().decide()), Verdict::Challenge);
+    // …and at the open FINISHED that answers it the Buggy model types a
+    // second challenge, where the real decider ends the job.
+    for action in ["Challenge", "YieldOpenFinished"] {
+        let before = st.clone();
+        if action == "YieldOpenFinished" {
+            let mut b = st.clone();
+            assert!(buggy.fire("ChallengeAgain", &mut b), "{b:?}");
+            assert!(!buggy.check_invariant("OneChallengeAJob", &b), "{b:?}");
+        }
+        assert!(m.fire(action, &mut st), "{action} at {st:?}");
+        mirror(action, &before, &mut real);
+    }
+    assert!(real.st.task_done() && real.st.finished_by_worker());
+    assert_eq!(verdict(&real.clone().decide()), Verdict::Nothing);
 }

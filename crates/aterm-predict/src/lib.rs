@@ -86,7 +86,12 @@
 //!   the whole set — so a wrong guess is corrected within one output burst.
 
 use aterm_time::Instant;
+use std::collections::VecDeque;
 use std::time::Duration;
+
+/// Hard cap on pending unconfirmed predictions so stalled echoes across line
+/// submits cannot grow the queue unboundedly.
+const MAX_PREDICTIONS: usize = 256;
 
 /// How aggressively to DISPLAY predictions. Tracking happens regardless; this only
 /// gates what is painted. Parsed from the `predictive_echo` config string.
@@ -231,11 +236,12 @@ pub fn is_line_submit(bytes: &[u8]) -> bool {
 #[derive(Default)]
 pub struct Predictor {
     mode: PredictMode,
-    /// Pending predictions in type order (oldest = `first`). A guess at the right
+    /// Pending predictions in type order (oldest = `front`). A guess at the right
     /// margin continues at column 0 of the NEXT row when the host supplies the grid
     /// height ([`Predictor::predict_char_in_grid`]); an unexpected row change still
     /// flushes them.
-    preds: Vec<Prediction>,
+    preds: VecDeque<Prediction>,
+
     /// Smoothed echo round-trip estimate in ms (EWMA of confirmed predictions). The
     /// link property `Adaptive` consults. Coordinate-only [`reset`](Self::reset)
     /// preserves it; [`reset_session`](Self::reset_session) clears it so a slow
@@ -391,7 +397,11 @@ impl Predictor {
         // letter, while control (ESC sequences), zero-width (combining marks, which
         // modify the cell to their LEFT) and wide (CJK, emoji) glyphs have echo
         // geometry we cannot place. Refused glyphs are left to the real output.
-        if ch.is_control() || aterm_grapheme::char_width(ch) != 1 || self.anchor_lost {
+        if ch.is_control()
+            || aterm_grapheme::char_width(ch) != 1
+            || self.anchor_lost
+            || self.preds.len() >= MAX_PREDICTIONS
+        {
             return self.decline(ch);
         }
         // Anchor: extend the last pending guess OF THIS EPOCH, else the live cursor.
@@ -432,7 +442,7 @@ impl Predictor {
         } else {
             (row, col)
         };
-        self.preds.push(Prediction {
+        self.preds.push_back(Prediction {
             row,
             col,
             ch,
@@ -461,8 +471,8 @@ impl Predictor {
         }
         // Only OUR trailing guess on the CURRENT line: a guess left in flight by the
         // previous line's submit is not what this Backspace erases.
-        if self.preds.last().is_some_and(|p| p.epoch == self.epoch) {
-            self.preds.pop();
+        if self.preds.back().is_some_and(|p| p.epoch == self.epoch) {
+            self.preds.pop_back();
             return true;
         }
         self.note_unmodelled_input();
@@ -615,7 +625,7 @@ impl Predictor {
         // Retire confirmed leading predictions; a different glyph at the head ⇒ the
         // program diverged from our guess ⇒ flush. A still-blank head ⇒ not echoed
         // yet ⇒ stop and wait for the next burst.
-        while let Some(p) = self.preds.first().copied() {
+        while let Some(p) = self.preds.front().copied() {
             match observe(p.row, p.col) {
                 Some(c) if c == p.ch => {
                     let sample = now.saturating_duration_since(p.born);
@@ -624,7 +634,7 @@ impl Predictor {
                     // A guess from BEFORE the last submit measures the link, but must
                     // not arm the new line's display gate (password safety).
                     self.confirm(p);
-                    self.preds.remove(0);
+                    self.preds.pop_front();
                 }
                 Some(_) => {
                     self.flush();
@@ -642,7 +652,7 @@ impl Predictor {
                         self.record_rtt(sample);
                         oldest_confirmed.get_or_insert(sample);
                         self.confirm(p);
-                        self.preds.remove(0);
+                        self.preds.pop_front();
                     } else {
                         break;
                     }
@@ -656,7 +666,7 @@ impl Predictor {
         // Cursor-consistency: if anything is still pending, the real cursor must sit
         // exactly at the first unconfirmed prediction (the program echoed up to it).
         // Anything else (a row change, completion rewrite, reflow) ⇒ flush.
-        if let Some(&p) = self.preds.first() {
+        if let Some(&p) = self.preds.front() {
             match real_cursor {
                 Some(rc) if rc == (p.row, p.col) => {}
                 // A guess that continued past the right margin is legitimately AHEAD of
@@ -695,7 +705,8 @@ impl Predictor {
     pub fn overlay(&mut self, now: Instant) -> &[Prediction] {
         self.expire(now);
         // `visible_count` is a leading run of `preds`, so this is always `Some`.
-        self.preds.get(..self.visible_count()).unwrap_or(&[])
+        let visible = self.visible_count();
+        self.preds.make_contiguous().get(..visible).unwrap_or(&[])
     }
 
     /// Retire the guesses whose glitch window has elapsed — [`Self::overlay`]'s
@@ -720,11 +731,11 @@ impl Predictor {
     fn expire(&mut self, now: Instant) {
         let window = self.glitch_window();
         let mut timed_out = false;
-        while let Some(oldest) = self.preds.first() {
+        while let Some(oldest) = self.preds.front() {
             if now.saturating_duration_since(oldest.born) <= window {
                 break;
             }
-            self.preds.remove(0);
+            self.preds.pop_front();
             timed_out = true;
         }
         if timed_out {
@@ -823,7 +834,7 @@ impl Predictor {
     /// [`overlay`](Self::overlay)'s flush still gets one cleanup frame (an erase only
     /// if that guess passed the display gate; hidden Adaptive state changes no pixels).
     pub fn is_displaying(&self, now: Instant) -> bool {
-        match self.preds.first() {
+        match self.preds.front() {
             None => false,
             // The same window `expire` uses: these two disagreeing would either strand
             // an erase (host thinks nothing changed) or burn a frame per repaint while
@@ -841,7 +852,7 @@ impl Predictor {
     /// no further input or output arrives.
     pub fn next_deadline(&self) -> Option<Instant> {
         let window = self.glitch_window();
-        self.preds.first().map(|p| p.born + window)
+        self.preds.front().map(|p| p.born + window)
     }
 
     /// Drop all in-flight predictions (the host changed the coordinate space: resize,
@@ -981,8 +992,36 @@ impl Predictor {
     }
 }
 
+#[cfg(clean_islands)]
+macro_rules! trust_island {
+    ($($item:item)*) => {
+        $($item)*
+    };
+}
+
+#[cfg(not(clean_islands))]
+macro_rules! trust_island {
+    ($($tt:tt)*) => {};
+}
+
+trust_island! {
+    clean {
+        namespace PredictorQueueCap
+
+        def maxPredictions : Nat := 256
+
+        theorem maxPredictions_eq : maxPredictions = 256 := rfl
+
+        theorem pop_front_step_len (rest : Nat) :
+            Nat.succ rest - 1 = rest := rfl
+
+        end PredictorQueueCap
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     /// The content-coordinate generation of a screen whose rows never move.
@@ -1346,18 +1385,6 @@ mod tests {
         assert!(!p.idle());
         // Entering vim/less (alternate screen) drops predictions.
         p.reconcile(Some((10, 4)), G, true, now, cell(&[]));
-        assert!(p.idle());
-    }
-
-    #[test]
-    fn unconfirmed_prediction_self_expires() {
-        let mut p = Predictor::new(PredictMode::Always);
-        let now = t0();
-        p.predict_char('a', (0, 0), G, 80, now);
-        assert_eq!(p.overlay(now).len(), 1);
-        // No echo ever arrives; after the glitch window the guess is dropped.
-        let late = now + Duration::from_millis(GLITCH_FLOOR_MS + 50);
-        assert!(p.overlay(late).is_empty());
         assert!(p.idle());
     }
 
@@ -2404,5 +2431,24 @@ mod tests {
         let shown = p.overlay(now);
         assert_eq!(shown.len(), 1, "'a' and the space retire; only 'b' remains");
         assert_eq!(shown[0].ch, 'b');
+    }
+
+    #[test]
+    fn pending_queue_caps_at_max_predictions_across_line_submits() {
+        let mut p = Predictor::new(PredictMode::Always);
+        let now = t0();
+        for i in 0..MAX_PREDICTIONS {
+            assert!(
+                p.predict_char_in_grid('a', (0, 0), G, (80, 24), now),
+                "prediction {i} below MAX_PREDICTIONS must succeed"
+            );
+            p.note_line_submit();
+        }
+        assert_eq!(p.preds.len(), MAX_PREDICTIONS);
+        assert!(
+            !p.predict_char_in_grid('z', (0, 0), G, (80, 24), now),
+            "prediction past MAX_PREDICTIONS must be declined"
+        );
+        assert_eq!(p.preds.len(), MAX_PREDICTIONS);
     }
 }

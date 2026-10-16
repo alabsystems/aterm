@@ -1,11 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `<prefix>/vendor/<program>.toml`: what the vendor lane remembers about one program —
-//! the head watch's last look (when, what, and the `ETag` that makes the next look a 304),
-//! the machine's high-water, the lane's last verdict, the last stage refusal, the
-//! version a legacy index build carries once it was read, and the signed root of the
-//! legacy build a vendor install replaced.
+//! `<prefix>/vendor/<program>.toml`: what the vendor lane remembers about one program
+//! ([`ProgramStamp`]).
 //!
 //! The head watch and the lane run in different processes and own different fields, so
 //! every write is a read-modify-write of its own fields under the file's lock: a writer
@@ -18,6 +15,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use super::digests::AuthenticatedDigest;
 use super::durable;
 use super::table::is_vendor;
 use super::version::Version;
@@ -57,8 +55,9 @@ pub struct ProgramStamp {
     pub high_water: Option<Version>,
     /// The lane's last verdict: one line, no control or bidi characters.
     pub verdict: String,
-    /// The last stage refusal, `(version, sha256)`: that pair is not downloaded again.
-    pub(crate) refused: Option<(Version, String)>,
+    /// The last stage refusal, `(version, payload digest)`: that pair is not downloaded
+    /// again.
+    pub(crate) refused: Option<(Version, AuthenticatedDigest)>,
     /// `(legacy index build, the version its signed manifest names)`, read once so no later
     /// pass needs an index to know it.
     pub(crate) legacy: Option<(u64, Version)>,
@@ -85,6 +84,8 @@ struct StampFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     refused_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    refused_sha512: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     legacy_build: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     legacy_version: Option<Version>,
@@ -92,9 +93,8 @@ struct StampFile {
     legacy_root_build: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     legacy_tree_root: Option<String>,
-    /// Every key this build does not know, carried verbatim through each rewrite: a build
-    /// that rewrote the file from its own fields erased what a newer one kept (the legacy
-    /// root, which the lane then had to read from the signed manifest again).
+    /// Every key this build does not know, carried verbatim through each rewrite so an
+    /// older build never erases what a newer one keeps.
     #[serde(flatten)]
     extra: BTreeMap<String, aterm_toml::Value>,
 }
@@ -123,10 +123,10 @@ impl ProgramStamp {
 
     /// The stamp `file` holds, and the keys this build does not know.
     fn from_file(file: StampFile) -> (Self, BTreeMap<String, aterm_toml::Value>) {
-        let refused = match (file.refused_version, file.refused_sha256) {
-            (Some(v), Some(sha)) if super::is_hex64(&sha) => Some((v, sha)),
-            _ => None,
-        };
+        let refused = file.refused_version.zip(AuthenticatedDigest::recorded(
+            file.refused_sha256.as_deref().unwrap_or_default(),
+            file.refused_sha512.as_deref().unwrap_or_default(),
+        ));
         // A vendor build id names its own version; only an index build number is legacy.
         let legacy = match (file.legacy_build, file.legacy_version) {
             (Some(b), Some(v)) if !super::is_vendor_build(b) => Some((b, v)),
@@ -278,29 +278,21 @@ impl ProgramStamp {
     }
 
     /// Record a stage refusal (a digest mismatch or a failed codesign check) of `version`
-    /// with `sha256`, so the lane does not download that pair again; a new head or a new
+    /// with `digest`, so the lane does not download that pair again; a new head or a new
     /// digest is a new pair.
     ///
     /// # Errors
-    /// `sha256` is not 64 hex digits, `program` is not vendor-direct, or the stamp could
-    /// not be locked or written.
+    /// `program` is not vendor-direct, or the stamp could not be locked or written.
     pub(crate) fn record_refusal(
         layout: &Layout,
         program: &str,
         verdict: &str,
         version: Version,
-        sha256: &str,
+        digest: &AuthenticatedDigest,
     ) -> io::Result<()> {
-        let sha256 = sha256.to_ascii_lowercase();
-        if !super::is_hex64(&sha256) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "refused digest is not a sha256",
-            ));
-        }
         update(layout, program, |s| {
             s.verdict = one_line(verdict);
-            s.refused = Some((version, sha256));
+            s.refused = Some((version, digest.clone()));
         })
     }
 
@@ -316,12 +308,12 @@ impl ProgramStamp {
         update(layout, program, |s| s.refused = None)
     }
 
-    /// Whether the lane refused `version` with `sha256` at stage.
+    /// Whether the lane refused `version` with `digest` at stage.
     #[must_use]
-    pub(crate) fn is_refused(&self, version: Version, sha256: &str) -> bool {
+    pub(crate) fn is_refused(&self, version: Version, digest: &AuthenticatedDigest) -> bool {
         self.refused
             .as_ref()
-            .is_some_and(|(v, sha)| *v == version && sha.eq_ignore_ascii_case(sha256))
+            .is_some_and(|(v, d)| *v == version && d == digest)
     }
 }
 
@@ -349,9 +341,12 @@ fn update(
         .map(ProgramStamp::from_file)
         .unwrap_or_default();
     change(&mut stamp);
-    let (refused_version, refused_sha256) = stamp
-        .refused
-        .map_or((None, None), |(v, sha)| (Some(v), Some(sha)));
+    let (refused_version, (refused_sha256, refused_sha512)) =
+        stamp.refused.map_or((None, (None, None)), |(v, digest)| {
+            let (sha256, sha512) = digest.keyed();
+            let set = |hex: String| (!hex.is_empty()).then_some(hex);
+            (Some(v), (set(sha256), set(sha512)))
+        });
     let (legacy_build, legacy_version) = stamp
         .legacy
         .map_or((None, None), |(b, v)| (Some(b), Some(v)));
@@ -367,6 +362,7 @@ fn update(
         verdict: one_line(&stamp.verdict),
         refused_version,
         refused_sha256,
+        refused_sha512,
         legacy_build,
         legacy_version,
         legacy_root_build,
@@ -374,8 +370,8 @@ fn update(
         extra,
     };
     let text = durable::to_toml(&file, MAX_STAMP_BYTES)?;
-    // An idle pass re-records the verdict it recorded last time: the same bytes are
-    // not written again (Phase 3 — no redundant write in an idle pass).
+    // An idle pass re-records the verdict it recorded last time: identical bytes are not
+    // written again.
     if std::fs::read(&path).is_ok_and(|have| have == text) {
         return Ok(());
     }
@@ -414,9 +410,14 @@ fn printable(c: char) -> bool {
         )
 }
 
+#[path = "stamp_corpus_tests.rs"]
+#[cfg(test)]
+mod corpus_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manifest::DigestAlg;
 
     fn layout(label: &str) -> crate::testdir::ScratchLayout {
         crate::testdir::layout(&format!("atpkg-vendor-stamp-{label}-"))
@@ -428,6 +429,12 @@ mod tests {
 
     fn sha(c: char) -> String {
         c.to_string().repeat(64)
+    }
+
+    /// A payload digest of `c`s, `alg`'s length, the anchor vouched for.
+    fn digest(alg: DigestAlg, c: char) -> AuthenticatedDigest {
+        let len = if alg == DigestAlg::Sha256 { 64 } else { 128 };
+        AuthenticatedDigest::authenticated(alg, &c.to_string().repeat(len)).unwrap()
     }
 
     #[test]
@@ -474,8 +481,8 @@ mod tests {
         );
     }
 
-    /// The finding this shape exists for: the head watch holds an old copy while the lane
-    /// raises the high-water; the watch's next write must not lower it.
+    /// The head watch holds an old copy while the lane raises the high-water; the watch's
+    /// next write must not lower it.
     #[test]
     fn a_check_never_lowers_the_high_water() {
         let l = layout("stale");
@@ -505,10 +512,8 @@ mod tests {
     }
 
     /// Writers in parallel (threads here; processes take the same `flock`) lose no update.
-    /// A writer the lock's bounded wait refuses writes again: 32 durable writes (each a
-    /// file and a directory flush) queue behind one lock, and on a loaded disk the queue
-    /// alone took 0.8–4.9 s against the 5 s bound — the claim is that
-    /// no write is lost, not how long the queue is, and a refusal is never a lost write.
+    /// A writer the lock's bounded wait refuses writes again: on a loaded disk the queue of
+    /// 32 durable writes can approach the 5 s bound, and a refusal is never a lost write.
     #[test]
     fn concurrent_writers_lose_no_update() {
         let l = layout("race");
@@ -545,28 +550,28 @@ mod tests {
     #[test]
     fn a_stage_refusal_is_memoized_per_version_and_digest() {
         let l = layout("refusal");
+        let a = digest(DigestAlg::Sha256, 'a');
         ProgramStamp::record_outcome(&l, "codex", "kept", Some(v("0.156.0"))).unwrap();
-        ProgramStamp::record_refusal(&l, "codex", "digest mismatch", v("0.157.0"), &sha('A'))
-            .unwrap();
+        ProgramStamp::record_refusal(&l, "codex", "digest mismatch", v("0.157.0"), &a).unwrap();
         let got = ProgramStamp::read(&l, "codex").unwrap();
-        assert!(got.is_refused(v("0.157.0"), &sha('a')));
+        assert!(got.is_refused(v("0.157.0"), &a));
         assert!(
-            !got.is_refused(v("0.157.0"), &sha('b')),
+            !got.is_refused(v("0.157.0"), &digest(DigestAlg::Sha256, 'b')),
             "a new digest is a new pair"
         );
         assert!(
-            !got.is_refused(v("0.157.1"), &sha('a')),
+            !got.is_refused(v("0.157.1"), &a),
             "a new head is a new pair"
         );
         assert_eq!(got.high_water, Some(v("0.156.0")));
         assert_eq!(got.verdict, "digest mismatch");
-        assert!(
-            ProgramStamp::record_refusal(&l, "codex", "x", v("0.157.0"), "abc").is_err(),
-            "not a sha256"
-        );
         // A torn pair on disk is no refusal.
         let path = stamp_path(&l, "codex").unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains(&format!("refused_sha256 = \"{}\"\n", sha('a'))),
+            "{text}"
+        );
         let torn: String = text
             .lines()
             .filter(|line| !line.starts_with("refused_sha256"))
@@ -576,14 +581,35 @@ mod tests {
         assert_eq!(ProgramStamp::read(&l, "codex").unwrap().refused, None);
     }
 
+    /// A sha512 refusal is kept under `refused_sha512`, never in the sha256 key, and is its
+    /// own pair; a stamp naming both digests is no refusal.
+    #[test]
+    fn a_sha512_refusal_is_kept_under_its_own_key() {
+        let l = layout("refusal-512");
+        let five = digest(DigestAlg::Sha512, '5');
+        ProgramStamp::record_refusal(&l, "codex", "signer refused", v("0.157.0"), &five).unwrap();
+        let path = stamp_path(&l, "codex").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains(&format!("refused_sha512 = \"{}\"\n", "5".repeat(128))),
+            "{text}"
+        );
+        assert!(!text.contains("refused_sha256"), "{text}");
+        let got = ProgramStamp::read(&l, "codex").unwrap();
+        assert!(got.is_refused(v("0.157.0"), &five));
+        assert!(!got.is_refused(v("0.157.0"), &digest(DigestAlg::Sha512, '6')));
+        std::fs::write(&path, format!("{text}refused_sha256 = \"{}\"\n", sha('5'))).unwrap();
+        assert_eq!(ProgramStamp::read(&l, "codex").unwrap().refused, None);
+    }
+
     #[test]
     fn the_explicit_door_forgets_a_refusal_and_nothing_else() {
         let l = layout("clear");
         ProgramStamp::clear_refusal(&l, "codex").unwrap();
         assert!(!vendor_dir(&l).exists(), "nothing to clear writes nothing");
         ProgramStamp::record_outcome(&l, "codex", "kept", Some(v("0.156.0"))).unwrap();
-        ProgramStamp::record_refusal(&l, "codex", "digest mismatch", v("0.157.0"), &sha('a'))
-            .unwrap();
+        let a = digest(DigestAlg::Sha256, 'a');
+        ProgramStamp::record_refusal(&l, "codex", "digest mismatch", v("0.157.0"), &a).unwrap();
         ProgramStamp::clear_refusal(&l, "codex").unwrap();
         let got = ProgramStamp::read(&l, "codex").unwrap();
         assert_eq!(got.refused, None);

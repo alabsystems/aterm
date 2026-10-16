@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The supervisor: what a manager agent needs to keep a worker (a Claude Code
-//! or Codex session in another aterm tab) moving without rubber-stamping it.
+//! The supervisor: what a manager agent needs to keep a worker (a Claude Code,
+//! Codex or agy session in another aterm tab) moving without rubber-stamping
+//! it. Each is read by its own grammar (`aterm_phase::Program::reader`); a
+//! Muse Code session is read but never supervised
+//! (`aterm_phase::Program::supervisable`), and no press or typed line ever
+//! answers an agent's sign-in menu, whose options open a browser.
 //!
 //! * [`classify::classify_command`] — is this shell line read-only? (The
 //!   corpus that shaped it is the test.)
@@ -46,8 +50,8 @@ pub mod classify;
 pub mod codex_usage;
 pub mod config;
 pub mod ladder;
-// The phase reader and the prompt parser live in `aterm-phase` (the fabric
-// bridge publishes `phase=` from the same reader), re-exported here.
+// The phase reader and the prompt parser live in `aterm-phase` (the server's
+// agent verdict is read by the same reader), re-exported here.
 pub use aterm_phase::{phase, prompt};
 pub mod journal;
 pub mod ledger;
@@ -63,7 +67,7 @@ pub mod transport;
 
 pub use blocks::View;
 pub use classify::{DEFAULT_PYTHON_ALLOW, classify_command_with};
-pub use config::SupervisorConfig;
+pub use config::{Autopilot, SupervisorConfig};
 pub use journal::{Journal, read_journal};
 pub use ledger::{
     ClockAnchor, Format as LedgerFormat, LedgerHost, LedgerOpts, gather, parse_since,
@@ -80,7 +84,7 @@ pub use run::{
     ATTENTION_OWNER, AnswerOpts, ApprovalEnv, CLAIM_HELD, CLAIM_RENEW, Caps, Ctl, CtlReply,
     EXIT_NO_BOX, EXIT_NOT_SERVED, EXIT_REFUSED, EXIT_TIMEOUT, Fold, Guard, HostStep, IdleHost,
     Interrupter, NoLane, ProbeMiss, ReportBrief, Session, StuckSurvey, SuperviseOpts, Turn,
-    UNBOUNDED, WaitPlan, WorkerSource, event_line, exit_reason, render_phase,
+    UNBOUNDED, UsageSeen, WaitPlan, WorkerSource, event_line, exit_reason, render_phase,
     render_phase_and_survey, render_result, render_result_mail, reported_event_line,
 };
 pub use transport::{Endpoint, RelayCtl, Transport};
@@ -142,48 +146,5 @@ impl std::ops::Deref for ScratchDir {
 impl AsRef<std::path::Path> for ScratchDir {
     fn as_ref(&self) -> &std::path::Path {
         self.0.path()
-    }
-}
-
-#[cfg(test)]
-mod scratch_tests {
-    /// Two tests hand one helper the same tag; the second one's set-up
-    /// (`remove_dir_all` + `create_dir_all`) runs while the first holds rows
-    /// in its file, then the first cleans up while the second still runs.
-    /// Each keeps what it wrote. Negative control: a per-tag name
-    /// (`aterm-<kind>-<tag>-<pid>`) loses both.
-    #[test]
-    fn two_callers_of_one_tag_never_share_a_scratch_path() {
-        let set_up = |dir: &std::path::Path| {
-            let _ = std::fs::remove_dir_all(dir);
-            std::fs::create_dir_all(dir).expect("tmp dir");
-            dir.join("s-1.jsonl")
-        };
-        let lost = |first: &std::path::Path, second: &std::path::Path| {
-            let a = set_up(first);
-            std::fs::write(&a, "{\"decision\":\"approved\"}\n").expect("write");
-            let b = set_up(second);
-            let a_kept = std::fs::read_to_string(&a).is_ok_and(|t| t.contains("approved"));
-            let _ = std::fs::remove_dir_all(first);
-            let b_kept = b.parent().is_some_and(std::path::Path::is_dir);
-            let _ = std::fs::remove_dir_all(second);
-            (!a_kept, !b_kept)
-        };
-        let first = super::test_scratch_path("scratch-race", "same");
-        let second = super::test_scratch_path("scratch-race", "same");
-        assert_ne!(first, second, "one tag, two callers, two paths");
-        assert_eq!(
-            lost(&first, &second),
-            (false, false),
-            "{first:?} {second:?}"
-        );
-
-        let per_tag =
-            std::env::temp_dir().join(format!("aterm-scratch-race-per-tag-{}", std::process::id()));
-        assert_eq!(
-            lost(&per_tag, &per_tag),
-            (true, true),
-            "the per-tag name is shared, and the race is lost both ways"
-        );
     }
 }

@@ -39,7 +39,7 @@
 //!
 //! The folders arrive as already-resolved `(Folder, PathBuf)` pairs from
 //! `aterm_containment::consent::folder_paths`. This module writes none of its
-//! own — that is the B13 rule (`tools/grep_guard.sh`), which reads every
+//! own — that is the aterm-census guard `protected-folder`, which reads every
 //! shipping line of this file.
 //!
 //! # Not reachable from a control verb
@@ -821,10 +821,10 @@ mod tests {
     /// session could flip would be a consent surface an agent controls — design
     /// §4). The observer's enable decision arrives as a resolved `bool` from the
     /// config layer. The scan reads everything above each module's top-level
-    /// `mod tests`, comment lines dropped, as grep_guard's `np_strip` does. It is
-    /// cut at the MODULE boundary, not at the first `#[cfg(test)]`: both files
-    /// gate single test-only methods with an indented one, and cutting there
-    /// would leave the rest of the shipping code unread.
+    /// `mod tests`, comment lines dropped. It is cut at the MODULE boundary,
+    /// not at the first `#[cfg(test)]`: both files gate single test-only
+    /// methods with an indented one, and cutting there would leave the rest of
+    /// the shipping code unread.
     #[test]
     fn neither_consent_worker_owns_a_process_global_or_reads_an_environment_knob() {
         for (name, source, last_shipping_fn) in [

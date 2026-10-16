@@ -25,7 +25,7 @@ use std::time::Instant;
 use aterm_core::terminal::Terminal;
 
 /// Per-corpus size. Half the mixed lane's 32 MiB: five corpora × (2 warmup + 7
-/// timed) iterations must stay a sub-minute gate stage even at pathological
+/// timed) iterations must stay under a minute even at pathological
 /// (slow) throughputs, while one iteration still dwarfs timer granularity.
 const CORPUS_BYTES: usize = 16 << 20;
 
@@ -145,7 +145,7 @@ fn median(samples: &[f64]) -> f64 {
 }
 
 fn main() {
-    // The corpus name list is mirrored by `xtask::perf::PATHOLOGICAL_LANE`'s keys
+    // The corpus name list is mirrored by `aterm_verify::perf`'s `PATHOLOGICAL_LANE`'s keys
     // (the gate reads `<name>_median_mbps` for each); keep the two in sync.
     let corpora: [(&str, Vec<u8>); 5] = [
         ("yes_flood", yes_flood()),

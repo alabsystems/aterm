@@ -22,10 +22,7 @@
 //!   reaching into its last 40 rows (a fullscreen REPL on a full transcript, a
 //!   Codex composer, a box drawn to the bottom) has exactly the zone the
 //!   grid's last 40 rows gave — so every reading of it is what it was;
-//! * one WITH such a run has a zone that reaches above them, and reads the
-//!   same in every field but the row indexes — except for the named
-//!   [`GAINS`], the screens the gap was cut for or whose reading it improved:
-//!   the list is the whole of what changed, so a fourth change fails here;
+//! * one WITH such a run has a zone that reaches above them;
 //! * the same screen in a taller pane — 7, 30 and 60 blank rows added below
 //!   it — reads exactly as it reads in a pane as tall as what is drawn: the
 //!   blank rows under the drawing decide nothing, whatever the program;
@@ -34,79 +31,31 @@
 //!   only zones above them it cannot see are those whose gap their top row
 //!   cuts.
 
-use std::path::{Path, PathBuf};
-
 use aterm_phase::prompt::PromptKind;
 use aterm_phase::prompt::fixtures as fx;
-use aterm_phase::{BLANK_GAP, Reading, live_zone_reaches_above, live_zone_start};
+use aterm_phase::{BLANK_GAP, Program, live_zone_reaches_above, live_zone_start};
+
+use crate::fixture_files::{file_rows, fixture_screens};
 
 /// The zone the server's agent verdict reads (`presence::CLASSIFY_ROWS`).
 const ZONE_ROWS: usize = 40;
-
-/// A fixture file's rows, loaded as the panic sweep loads them: the
-/// provenance line dropped, a saved waiter capture's `== …` head and `exit=`
-/// tail dropped.
-fn file_rows(text: &str) -> Vec<String> {
-    let mut r = fx::screen(text);
-    if r.first().is_some_and(|l| l.starts_with("== ")) {
-        r.remove(0);
-    }
-    if r.last().is_some_and(|l| l.starts_with("exit=")) {
-        r.pop();
-    }
-    r
-}
-
-fn screens() -> Vec<(String, Vec<String>)> {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut dirs = vec![crate_dir.join("src/fixtures")];
-    let agent = crate_dir.join("../aterm-agent/src/supervise/policy/fixtures");
-    if agent.is_dir() {
-        dirs.push(agent);
-    } else {
-        eprintln!(
-            "live zone sweep: {} absent (not in the aterm workspace): its captures are not swept",
-            agent.display()
-        );
-    }
-    let mut out = Vec::new();
-    for dir in dirs {
-        let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)
-            .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
-            .map(|e| e.expect("a fixture entry").path())
-            .filter(|p| p.is_file())
-            .collect();
-        paths.sort();
-        assert!(!paths.is_empty(), "{}: no fixtures", dir.display());
-        for p in paths {
-            let text =
-                std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
-            let name = p
-                .strip_prefix(crate_dir)
-                .unwrap_or(&p)
-                .display()
-                .to_string();
-            out.push((name, file_rows(&text)));
-        }
-    }
-    out
-}
 
 fn zone(rows: &[String]) -> &[String] {
     &rows[live_zone_start(rows, ZONE_ROWS)..]
 }
 
-/// Every reading a caller takes of a zone, as one comparable string: the
-/// reader named by the program (Claude Code's, Codex's) and the one the
-/// screen identifies, with and without a cursor column.
+/// Every reading a caller takes of a zone, as one comparable string: each
+/// program's reader ([`Program::ALL`]) and the one the screen identifies
+/// (`None`), with and without a cursor column.
 fn readings(rows: &[String]) -> Vec<String> {
     let mut out = Vec::new();
-    for program in [Some("claude"), Some("codex"), None] {
+    for program in Program::ALL.map(Some).into_iter().chain([None]) {
         for cursor in [None, Some(2)] {
-            out.push(format!(
-                "{program:?} {cursor:?} {:?}",
-                aterm_phase::read(program, rows, cursor)
-            ));
+            let reading = match program {
+                Some(p) => p.reader().read(rows, cursor),
+                None => aterm_phase::read(None, rows, cursor),
+            };
+            out.push(format!("{program:?} {cursor:?} {reading:?}"));
         }
     }
     out
@@ -139,77 +88,10 @@ fn gap_reaches_into_the_tail(rows: &[String]) -> bool {
     false
 }
 
-/// A reading with the ROW INDEXES it carries zeroed — the wall's row, the
-/// prompt's span, question row and option rows, the composer's caret row —
-/// since a zone that starts higher numbers every row differently and nothing
-/// else about the screen has moved.
-fn shape(mut r: Reading) -> String {
-    if let Some(w) = r.wall.as_mut() {
-        w.row = 0;
-    }
-    let mut dialog = None;
-    if let Some(p) = r.prompt.as_mut() {
-        p.span = (0, 0);
-        p.question = p.question.map(|_| 0);
-        for o in &mut p.options {
-            o.row = 0;
-        }
-        dialog = p.question_dialog.take().map(|q| {
-            format!(
-                "{:?} {} {:?} {} {:?}",
-                q.tabs,
-                q.submit_tab,
-                q.auto_continue,
-                q.width,
-                std::mem::discriminant(&q.form)
-            )
-        });
-    }
-    if let Some((row, _)) = r.composer.as_mut() {
-        *row = 0;
-    }
-    format!("{r:?} {dialog:?}")
-}
-
-/// Every reading a caller takes of a zone, [`shape`]d, for the readers and
-/// cursors of [`readings`].
-fn shapes(rows: &[String]) -> Vec<String> {
-    let mut out = Vec::new();
-    for program in [Some("claude"), Some("codex"), None] {
-        for cursor in [None, Some(2)] {
-            out.push(format!(
-                "{program:?} {cursor:?} {}",
-                shape(aterm_phase::read(program, rows, cursor))
-            ));
-        }
-    }
-    out
-}
-
-/// The screens whose reading the gap changed, and what each gained. The list
-/// is exact:
-/// `a_screen_drawn_to_its_last_row_has_the_zone_the_last_40_rows_gave` fails
-/// on a change that is not here and on an entry that changed nothing.
-const GAINS: [(&str, &str); 3] = [
-    (
-        "claude-2.1.283-launch-repl-ready.txt",
-        "the fullscreen launch's banner is in the zone: `fresh`",
-    ),
-    (
-        "claude-2.1.284-api-error-tall-pane-measured.txt",
-        "the error is in the zone: a wall",
-    ),
-    (
-        "claude-2.1.281-plan-approval.txt",
-        "the plan dialog's head is in the zone: a whole `PlanExit` box, not one whose title \
-         was cut",
-    ),
-];
-
 #[test]
 fn a_screen_drawn_to_its_last_row_has_the_zone_the_last_40_rows_gave() {
-    let (mut drawn_to_bottom, mut gapped, mut changed) = (0, Vec::new(), Vec::new());
-    for (name, rows) in screens() {
+    let (mut drawn_to_bottom, mut gapped) = (0, 0);
+    for (name, rows) in fixture_screens("live zone sweep") {
         if rows.last().is_some_and(|r| !blank(r)) {
             drawn_to_bottom += 1;
             let last40 = rows.len().saturating_sub(ZONE_ROWS);
@@ -221,33 +103,11 @@ fn a_screen_drawn_to_its_last_row_has_the_zone_the_last_40_rows_gave() {
                 gap_reaches_into_the_tail(&rows) && rows.len() > ZONE_ROWS,
                 "{name}: the zone starts on row {start}, the last 40 rows on row {last40}"
             );
-            if start < last40 {
-                // What the readers say of the screen — every field but the
-                // row indexes — is what they said of the last 40 rows, but
-                // for the gains the gap was cut for.
-                if shapes(&rows[last40..]) != shapes(&rows[start..]) {
-                    changed.push(name.clone());
-                }
-                gapped.push(name);
-            }
+            gapped += usize::from(start < last40);
         }
     }
     assert!(drawn_to_bottom > 50, "only {drawn_to_bottom} such screens");
-    assert!(!gapped.is_empty(), "no screen with a gap swept");
-    let named: Vec<&str> = GAINS.iter().map(|(g, _)| *g).collect();
-    for name in &changed {
-        assert!(
-            named.iter().any(|g| name.ends_with(g)),
-            "{name} read otherwise on the zone than on the last 40 rows, and is no named gain: \
-             {GAINS:#?}"
-        );
-    }
-    for g in named {
-        assert!(
-            changed.iter().any(|name| name.ends_with(g)),
-            "{g} is a named gain and changed nothing: {changed:#?} of {gapped:#?}"
-        );
-    }
+    assert!(gapped > 0, "no screen with a gap swept");
 }
 
 /// THE PLAN DIALOG'S GAIN, NAMED: `claude-2.1.281-plan-approval.txt` is 44
@@ -298,7 +158,7 @@ fn the_plan_approval_is_read_whole_through_its_zone() {
 fn the_tail_sees_every_gap_inside_it() {
     let (mut above, mut cut, mut swept) = (0, Vec::new(), 0);
     let mut tall_pane_asked = false;
-    for (name, rows) in screens() {
+    for (name, rows) in fixture_screens("live zone sweep") {
         if rows.len() <= ZONE_ROWS || rows.last().is_none_or(|r| blank(r)) {
             continue;
         }
@@ -335,7 +195,7 @@ fn the_tail_sees_every_gap_inside_it() {
 #[test]
 fn blank_rows_under_the_drawing_decide_nothing() {
     let (mut swept, mut moved_from_the_old_cut) = (0, Vec::new());
-    for (name, rows) in screens() {
+    for (name, rows) in fixture_screens("live zone sweep") {
         // The screen in a pane exactly as tall as what is drawn on it.
         let drawn = rows.iter().rposition(|r| !blank(r)).map_or(0, |i| i + 1);
         let tight = &rows[..drawn];

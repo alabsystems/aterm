@@ -25,15 +25,10 @@ impl Grid {
     /// Estimate total memory used by the grid and attached scrollback.
     ///
     /// Exact whenever the true sum fits in `usize`, pinned at `usize::MAX`
-    /// otherwise: every sum and every product that could exceed `usize` is
-    /// spelled `saturating_*`, here and in each accounting function it adds
-    /// up. An estimate has no use for a panic or a wrap. On 3f93665e8, checked
-    /// sums carried around two walks (the ring rows' walk, which 6bfc88a82
-    /// later replaced with a running sum, and the undo rows' below) used up
-    /// the verifier's 120 s budget, and 48 of this function's 57 obligations
-    /// timed out; with one such walk left the function is decided. Saturating
-    /// sums keep it decided whatever walks it gains
-    /// (docs/AUDIT-control-2026-10-08.md F3).
+    /// otherwise: every sum and product that could exceed `usize` is
+    /// `saturating_*`, here and in each accounting function it adds up. Checked
+    /// sums carried around a walk exhaust the verifier's per-function budget;
+    /// saturating ones keep it decided (docs/AUDIT-control-2026-10-08.md F3).
     #[must_use]
     pub fn memory_used(&self) -> usize {
         let mut total = self.storage.pages.total_memory();
@@ -178,7 +173,6 @@ impl Grid {
         let mut s = String::with_capacity(r.len() as usize * 2);
         let extras_empty = self.storage.extras.is_empty();
 
-        // Current SGR state tracking.
         let mut cur_bold = false;
         let mut cur_dim = false;
         let mut cur_italic = false;
@@ -208,7 +202,6 @@ impl Grid {
             let flags = cell.flags();
             let colors = cell.colors();
 
-            // Compute desired SGR state from this cell.
             let want_bold = flags.contains(CellFlags::BOLD);
             let want_dim = flags.contains(CellFlags::DIM);
             let want_italic = flags.contains(CellFlags::ITALIC);
@@ -240,7 +233,6 @@ impl Grid {
                 None
             };
 
-            // Check if anything changed.
             let changed = want_bold != cur_bold
                 || want_dim != cur_dim
                 || want_italic != cur_italic
@@ -256,8 +248,8 @@ impl Grid {
                 || want_bg_rgb != cur_bg_rgb;
 
             if changed {
-                // Emit a reset + new state to keep things simple.
-                // For cells with no attributes, emit reset only if we had attributes.
+                // Reset, then the new state; a cell with no attributes emits
+                // only the reset, and only if attributes were active.
                 let has_attrs = want_bold
                     || want_dim
                     || want_italic
@@ -273,7 +265,6 @@ impl Grid {
                     || want_bg_rgb.is_some();
 
                 if has_attrs {
-                    // Build SGR params.
                     let mut params: Vec<String> = vec!["0".to_string()];
                     if want_bold {
                         params.push("1".to_string());
@@ -302,7 +293,6 @@ impl Grid {
                     if want_overline {
                         params.push("53".to_string());
                     }
-                    // Foreground color.
                     if let Some(rgb) = want_fg_rgb {
                         params.push(format!("38;2;{};{};{}", rgb[0], rgb[1], rgb[2]));
                     } else if let Some(idx) = want_fg_indexed {
@@ -314,7 +304,6 @@ impl Grid {
                             params.push(format!("38;5;{idx}"));
                         }
                     }
-                    // Background color.
                     if let Some(rgb) = want_bg_rgb {
                         params.push(format!("48;2;{};{};{}", rgb[0], rgb[1], rgb[2]));
                     } else if let Some(idx) = want_bg_indexed {
@@ -348,7 +337,6 @@ impl Grid {
                 cur_bg_rgb = want_bg_rgb;
             }
 
-            // Emit the character.
             if cell.is_complex() {
                 if let Some(cs) = self.complex_char_str_at(row, col) {
                     s.push_str(&cs);
@@ -480,8 +468,7 @@ mod tests {
     fn test_row_text_empty_row() {
         let grid = Grid::new(4, 20);
         let text = grid.row_text(0).unwrap();
-        // Row::len() tracks actual written content; an untouched row has
-        // len=0, so row_text iterates zero cells and returns empty string.
+        // An untouched row has len 0, so row_text yields "".
         assert_eq!(text, "", "untouched row should produce empty string");
     }
 
@@ -586,8 +573,8 @@ mod tests {
         grid.write_char('B'); // col 3
         let mut cols = Vec::new();
         let fill = grid.row_cols_into(0, &mut cols);
-        // One char per COLUMN: lead char at its own column, '\0' at the wide
-        // continuation, ' ' for blanks — column math survives CJK.
+        // One char per column: lead char at its own column, '\0' at the wide
+        // continuation, ' ' for blanks, so column math survives CJK.
         assert_eq!(cols.len() as u16, grid.row(0).unwrap().len());
         assert_eq!(&cols[..4], &['A', '\u{4E2D}', '\0', 'B']);
         assert!(cols[4..].iter().all(|&c| c == ' '));
@@ -661,7 +648,6 @@ mod tests {
         let mut grid = Grid::new(4, 20);
         grid.write_char('e');
 
-        // Set up combining mark via extras
         let row = 0u16;
         let col = 0u16;
         if let Some(r) = grid.row_mut(row) {
@@ -689,7 +675,6 @@ mod tests {
         let row = 0u16;
         let col = 0u16;
 
-        // Now convert that cell to a complex character.
         grid.set_cell_complex_char(row, col, "\u{1F44B}"); // 👋
 
         let text = grid.row_text(row).unwrap();
@@ -882,7 +867,6 @@ mod tests {
 
     #[test]
     fn test_row_text_minimum_grid() {
-        // 1x1 grid edge case
         let mut grid = Grid::new(1, 1);
         grid.write_char('Z');
         let text = grid.row_text(0).unwrap();

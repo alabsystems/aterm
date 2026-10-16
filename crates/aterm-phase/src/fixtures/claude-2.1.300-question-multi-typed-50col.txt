@@ -1,0 +1,49 @@
+# claude-code 2.1.300 · MEASURED 2026-10-15, `aterm ctl text` of a private headless aterm (50x50, aterm 0.103.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, tools/real-claude-lab) · multi-select at 50 columns after the harness acted
+⏺ User declined to answer questions
+  ⎿  · Which language for the tool? (Rust /
+     Python)
+     · Which platforms to support? (macOS / Linux)
+
+✻ Cogitated for 0s · done 6:52 AM
+
+❯ toolstart
+
+⏺ User declined to answer questions
+  ⎿  · Which checks should run before merge? (Unit
+     tests (Recommended) / Lint / Fuzz)
+
+✻ Cooked for 0s · done 6:53 AM
+
+❯ toolstart
+
+⏺ User declined to answer questions
+  ⎿  · Which checks should run before merge? (Unit
+     tests (Recommended) / Lint / Fuzz)
+
+✻ Cogitated for 0s · done 6:56 AM
+
+❯ toolstart
+──────────────────────────────────────────────────
+←  ☒ Checks  ✔ Submit  →
+
+Which checks should run at width 50?
+
+  1. [ ] Unit tests (Recommended)
+         Fast
+  2. [ ] Lint
+         Style
+  3. [ ] Fuzz
+         Slow
+  4. [✔]Decide yourself: choose the option that
+        best serves long term correctness and
+        total value even at the cost of short term
+        deliverables. Say which you chose and why
+        in one line and continue without asking
+        again. (Answered by the aterm harness by
+        policy. The user was not asked.)
+❯    Submit
+──────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · ↑/↓ to navigate · ctrl+g to edit
+in Vim · Esc to cancel

@@ -1,15 +1,9 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Notices queued behind the weekly limit, replayed from a recorded session
-//! (Claude Code 2.1.280) through the real driver over the login wall's
-//! apparatus. The rules pinned: no notice is typed behind one the limit holds,
-//! nor a pending first notice behind another round's; a notice whose limit is
-//! over is typed again as the same ask while at most `upgrade::REQUEUE_MAX`
-//! more wait untaken, past that once the full queue has rested or on the
-//! owner's `--now`; and a give-up rests and re-arms (`upgrade::RETRY_S`). The
-//! Tier-1 bind of `harness_upgrade_limit_queue_model` (aterm-spec) closes the
-//! file.
+//! Upgrade notices queued behind a usage limit, replayed from a recorded Claude Code 2.1.280
+//! session through the real driver over the login wall tests' apparatus, and the Tier-1 bind
+//! of `harness_upgrade_limit_queue_model` (aterm-spec).
 
 use super::*;
 
@@ -28,15 +22,11 @@ const MARKERS: [&str; 4] = [
 /// The round's salt, from the owner's state file.
 const OWNERS_SALT: u64 = 1_790_373_039;
 
-/// The recorded state file as 0.94.0 rewrote it after 0.93.0's give-up, every
-/// byte but the tab kept.
+/// The recorded state file after a give-up behind the limit, every byte but the tab kept.
 const OWNERS_STATE: &str = r#"{"agent":"","asks":0,"at":0,"cause":"","codex_home":"","confirm_by":0,"cwd":"","done_at":0,"exited_at":0,"from":"2.1.280","hold_seen":1790539070,"hold_since":1790539070,"last_seq":4735,"launch_model":"","left_at":0,"left_typed":"","line":"","mark":0,"marker":"ATERM-UPGRADE-READY-6a57ff7a","mode":"","model_before":"","model_list":"","noted":"","notice_pid":6099,"notice_start":"Thu Sep 24 02:03:13 2026","outcome":"","pending_since":0,"phase":"failed","pid":0,"prompt":"","ready_since":0,"release":"","request":"-","request_at":0,"request_tab":"","resumed_on":"","resumed_pid":0,"salt":1790373039,"seq_since":1790539070,"shell":0,"source":"managed","tab":"s-c543f4e0edd3439e5791","thread":"","to":"2.1.283","twin":"","wait":"failed","wait_since":1790539070,"why":"unanswered"}"#;
 
-/// Claude Code's answer at the weekly limit as the recorded transcript holds
-/// it (the first notice's own turn; ids cut, every key the readers look at
-/// kept), its reset the recorded one (`1791046800`) while that is a day ahead
-/// or more, else a day from now. A passed reset is another case
-/// ([`a_queued_notice_whose_limit_is_over_is_typed_again_as_the_same_ask`]).
+/// Claude Code's weekly-limit row as recorded (ids cut), its reset the recorded one while that
+/// is a day ahead or more, else a day from now.
 fn limit_row(ts: &str, session: &str) -> String {
     limit_row_until(ts, session, 1_791_046_800_u64.max(now_s() + 86_400))
 }
@@ -48,9 +38,8 @@ fn limit_row_until(ts: &str, session: &str, resets: u64) -> String {
     )
 }
 
-/// An API rate limit's row at `at` (unix seconds): no `quotaLimits` and no
-/// `error` key, the API's text; a limit that names no reset, read by the wall
-/// table's words alone.
+/// An API rate limit's row at `at` (unix seconds): no `quotaLimits` or `error` key, so it names
+/// no reset and is read by the wall table's words alone.
 fn api_limit_row(at: u64) -> String {
     limit_row_until(&ts(at), OWNERS_SESSION, 0)
         .replace(
@@ -85,10 +74,9 @@ fn tasked_at(now: u64) -> String {
     )
 }
 
-/// The owner's rows from the notices on, each `at` seconds before `now`:
-/// every notice of `asked` answered by the limit, then — `went_on` — the
-/// owner's `first, continue` and the model's first row after it, saying
-/// `said`.
+/// The owner's rows: the task, each notice of `asked` answered by the limit, then with
+/// `went_on = (ago, said)` the owner's `first, continue` and the model's row `ago` seconds
+/// before `now`, saying `said`.
 fn owners_rows(now: u64, asked: &[&str], went_on: Option<(u64, &str)>) -> String {
     let mut rows = vec![tasked_at(now)];
     let first = now - 4 * 3_600;
@@ -137,11 +125,8 @@ fn announced(asks: usize) -> impl FnOnce(&SessionFile, u64) -> St {
     }
 }
 
-/// The owner's state with the stand-in's pid, start and tab where 0.93.0's
-/// notice named the owner's (6099, `Thu Sep 24 02:03:13 2026`,
-/// `s-c543f4e0edd3439e5791`), and the build the stand-in runs (1.0.0: a
-/// record an older build wrote names its process by the build it was found
-/// behind): every other byte as read.
+/// [`OWNERS_STATE`] with the stand-in's pid, start and tab, and `from` the stand-in's build
+/// (1.0.0: an older build's record names its process by the build it was found on).
 fn owners_state_for(sf: &SessionFile) -> St {
     let text = OWNERS_STATE
         .replace(r#""from":"2.1.280""#, r#""from":"1.0.0""#)
@@ -155,13 +140,10 @@ fn owners_state_for(sf: &SessionFile) -> St {
     St::from_json(&text).expect("the owner's state reads")
 }
 
-/// A notice is never typed again behind the first: the latest notice's own
-/// turn was the limit's and the model has written nothing since, so though the
-/// screen shows no limit (the banner dismissed, or missed) and its window ran
-/// out long ago, the visit waits `limited`, types nothing, and holds its
-/// window. Once the model takes it (a person's `first, continue`), its window
-/// opens then and the visit waits for the READY. Negative control: the same
-/// notice read by the model as it came, its window run out, is asked again.
+/// A notice the limit answered, with no model row since, is never typed again behind itself,
+/// however long ago its window ran out and whatever the screen shows: the visit waits
+/// `limited` and holds the window. Once the model takes it, the window opens then. Negative
+/// control: a notice the model read is asked again.
 #[cfg(unix)]
 #[test]
 fn a_notice_queued_behind_the_limit_is_never_asked_again_behind_it() {
@@ -235,11 +217,8 @@ fn a_notice_queued_behind_the_limit_is_never_asked_again_behind_it() {
     assert_eq!(again.typed.len(), 1);
 }
 
-/// An agent that says it cannot stop yet is never given up on for good: the
-/// last ask's notice answered so and its window ran out, so the round gives up
-/// and the agent is released for this round only, with no stall shown to the
-/// owner. It rests one round's worth of asking (`RETRY_S`), and a new round
-/// asks again with a notice of its own.
+/// An agent that declines the last ask is released for this round only, with no stall shown:
+/// it rests [`upgrade::RETRY_S`] and a new round asks with a notice of its own.
 #[cfg(unix)]
 #[test]
 fn a_declined_last_ask_rests_and_is_asked_again() {
@@ -273,8 +252,7 @@ fn a_declined_last_ask_rests_and_is_asked_again() {
     );
     let rested = declined.saved.expect("state");
     assert_eq!(rested.phase, Phase::Failed(GAVE_UP.to_string()));
-    // It rests from this look (the owner's view: `next_round=2h`, no stall —
-    // `a_stopped_round_says_when_its_next_round_starts`).
+    // It rests from this look (`a_stopped_round_says_when_its_next_round_starts`).
     assert!(rested.failed_at + 60 >= now, "{}", rested.failed_at);
     assert!(!upgrade::retry_due(
         &rested.phase,
@@ -285,8 +263,8 @@ fn a_declined_last_ask_rests_and_is_asked_again() {
     let rearmed = visit_at(
         "lim-dr",
         OWNERS_SESSION,
-        // The same session, a new stand-in process each visit: the record
-        // names the process it is about, as the first visit stamps it.
+        // A new stand-in process each visit: the record names the process the first visit
+        // stamped.
         move |sf, now| St {
             failed_at: now - upgrade::RETRY_S,
             proc_start: squash(&sf.proc_start),
@@ -316,12 +294,9 @@ fn a_declined_last_ask_rests_and_is_asked_again() {
     );
 }
 
-/// The recorded give-up is no permanent stall: the state gave up on four
-/// notices each answered by the limit, with no stamp of when, so its first
-/// look re-arms it, typing nothing. Still at the limit by the transcript's
-/// word (the screen shows none), the new round's first notice waits `limited`:
-/// nothing is typed behind the four still queued. Once the model took them,
-/// the new round asks with a marker of its own: one notice, not a fifth.
+/// The recorded give-up (four notices queued behind the limit, no stamp of when) re-arms on
+/// its first look. While the transcript says the limit holds, the new round's first notice
+/// waits `limited`; once the model took the four, it asks with a marker of its own.
 #[cfg(unix)]
 #[test]
 fn the_give_up_0_93_0_spent_behind_the_limit_rests_then_waits_out_the_limit() {
@@ -375,10 +350,8 @@ fn the_give_up_0_93_0_spent_behind_the_limit_rests_then_waits_out_the_limit() {
     }
 }
 
-/// Not even a first notice at the limit, whatever the screen shows: the
-/// session's last word is Claude Code's limit row, its reset an hour off, its
-/// banner gone, so the pending upgrade waits `limited`. Negative control: the
-/// reset the row names has passed, and the notice is typed.
+/// A pending upgrade whose session's last word is the limit row waits `limited` however the
+/// screen looks. Negative control: the named reset has passed, and the notice is typed.
 #[cfg(unix)]
 #[test]
 fn a_session_whose_last_word_is_the_limit_is_not_asked_until_its_reset() {
@@ -437,17 +410,11 @@ fn a_session_whose_last_word_is_the_limit_is_not_asked_until_its_reset() {
     assert_eq!(asked.typed.len(), 1);
 }
 
-/// The quiet upgrade moves a tab its limit's notice was left
-/// on, treating it as idle [`LIMIT_GRACE_S`] after the reset. The session's
-/// last word is Claude Code's weekly limit row, its notice still on screen. A
-/// grace and a minute past the reset the row names (`quotaLimits.resetsAt`,
-/// [`upgrade::transcript_limit_reset`]), the quiet upgrade steps as at any
-/// idle point: the restart is reached with nothing typed (the stand-in
-/// backgrounded under it: `wait:changed-before-signal`). Negative controls,
-/// each waiting `limited` with nothing typed: a minute short of the grace; a
-/// limit row naming no reset (an API rate limit, its `REASK_S` long run out),
-/// where no reset is guessed; and the ask flow past the grace, where typing
-/// over a standing notice stays `HarnessUpgradeLimitQueue`'s decision.
+/// The quiet upgrade moves a tab whose weekly-limit notice is still on screen as any idle
+/// point once [`LIMIT_GRACE_S`] past the row's named reset: the restart is reached with
+/// nothing typed. Negative controls, each `limited` with nothing typed: a minute short of the
+/// grace; a row naming no reset (none is guessed); and the ask flow, where typing over a
+/// standing notice stays `HarnessUpgradeLimitQueue`'s decision.
 #[cfg(unix)]
 #[test]
 fn a_limit_notice_a_grace_past_its_named_reset_is_moved_as_any_idle_point() {
@@ -540,17 +507,11 @@ fn a_limit_notice_a_grace_past_its_named_reset_is_moved_as_any_idle_point() {
     }
 }
 
-/// A queued notice whose limit is over is typed again as the same ask (a
-/// weekly limit continues only after `/rate-limit-options`, and a limit row
-/// may name no reset, so an unbounded hold would wait for a person). The limit
-/// that answered the notice is over by the transcript's word and the screen
-/// shows none: the notice never reached the model, so it is typed again with
-/// its own marker, no ask spent, the ledger saying why. Over means: the named
-/// reset has passed; a row naming no reset (an API rate limit) was written
-/// [`REASK_S`] ago; or a `/login` finished after it (an account switched; the
-/// same `/login` ends a first notice's hold with the reset still days off).
-/// Negative controls: the API limit a minute old, and a passed reset while the
-/// screen still shows a limit, wait `limited` and type nothing.
+/// A queued notice whose limit is over is typed again as the same ask, its own marker, no ask
+/// spent: an unbounded hold would wait for a person (a weekly limit continues only after
+/// `/rate-limit-options`). Over means the named reset passed, a no-reset row is [`REASK_S`]
+/// old, or a `/login` finished after it. Negative controls: the API limit a minute old, and a
+/// passed reset while the screen still shows a limit, wait `limited`.
 #[cfg(unix)]
 #[test]
 fn a_queued_notice_whose_limit_is_over_is_typed_again_as_the_same_ask() {
@@ -673,11 +634,9 @@ fn a_queued_notice_whose_limit_is_over_is_typed_again_as_the_same_ask() {
     );
 }
 
-/// The recorded rows with `copies` copies of the notice `marker`, each answered
-/// by an API rate limit naming no reset, the last row written `last_ago`
-/// seconds before `now`, earlier ones half an hour apart; then, with
-/// `went_on`, a person's `first, continue` and the model's first row after it,
-/// `ago` seconds back.
+/// The rows with `copies` copies of the notice `marker`, each answered by an API rate limit,
+/// the last row `last_ago` seconds before `now` and earlier ones a re-ask and a minute apart;
+/// then, with `went_on`, a person's `first, continue` and the model's row, `ago` seconds back.
 fn copies_rows(now: u64, marker: &str, copies: u64, last_ago: u64, went_on: Option<u64>) -> String {
     let mut rows = vec![tasked_at(now)];
     for k in 1..=copies {
@@ -702,18 +661,11 @@ fn copies_rows(now: u64, marker: &str, copies: u64, last_ago: u64, went_on: Opti
     rows.join("\n") + "\n"
 }
 
-/// A notice a limit answered is typed again straight away at most
-/// [`upgrade::REQUEUE_MAX`] times before the model takes one (a limit row
-/// naming no reset is over by the transcript's word every [`REASK_S`] however
-/// long it stands, so re-typing alone would pile a copy up every half hour).
-/// With `1 + REQUEUE_MAX` copies in the conversation the queue is full, and
-/// the visit waits `queued`, nothing typed, its window held, for the model to
-/// write a row or for the queue's rest
-/// ([`a_full_queue_rests_and_the_owners_word_types_one_more`]). When the
-/// session goes on, every copy is taken at once and the window opens at the
-/// model's row. Negative controls: one copy, and `REQUEUE_MAX`, are typed again
-/// as the same ask (the ledger's `a usage limit that is over`); the full
-/// count's last row a minute old waits `limited` as any fresh limit does.
+/// A notice a limit answered is typed again straight away at most [`upgrade::REQUEUE_MAX`]
+/// times before the model takes one (a no-reset limit is over every [`REASK_S`], so re-typing
+/// alone would pile up a copy every half hour). Past that the visit waits `queued`, its window
+/// held, until the model writes a row, which takes every copy and opens the window. Negative
+/// control: the full count's last row a minute old waits `limited`.
 #[cfg(unix)]
 #[test]
 fn a_queued_notice_is_typed_again_at_most_requeue_max_times() {
@@ -809,19 +761,10 @@ fn a_queued_notice_is_typed_again_at_most_requeue_max_times() {
     );
 }
 
-/// A full queue is never held for good: `1 + REQUEUE_MAX` copies wait untaken,
-/// each met by an API rate limit naming no reset, the screen clear:
-///
-/// * the last limit row [`REASK_S`] + [`upgrade::RETRY_S`] old: the queue has
-///   rested, and one copy more is typed (same marker, same ask);
-/// * the owner's `--now` given after the latest copy was typed: one copy more
-///   at once;
-/// * that word given before the latest copy (already spent), the queue
-///   unrested: `wait:queued`, nothing typed.
-///
-/// Negative controls: the owner's word with the latest copy's limit a minute
-/// old waits `limited` (it never types into a standing limit), as does a
-/// rested queue whose screen still shows the limit.
+/// A full queue is never held for good: one more copy (same marker, same ask) goes once the
+/// last limit row is [`REASK_S`] + [`upgrade::RETRY_S`] old, or at once on the owner's `--now`
+/// given after the latest copy; a word given before it is spent. Negative controls: a limit
+/// a minute old, or one still on screen, waits `limited` either way.
 #[cfg(unix)]
 #[test]
 fn a_full_queue_rests_and_the_owners_word_types_one_more() {
@@ -913,13 +856,8 @@ fn a_full_queue_rests_and_the_owners_word_types_one_more() {
     );
 }
 
-/// No first notice behind another round's queued one while its limit holds
-/// (after a retarget or a new round the state names none of the queued
-/// notice's markers). An earlier round's notice was answered by an API rate
-/// limit ten minutes ago, the screen clear: the pending upgrade waits
-/// `limited`. Half an hour on, the limit is over and the queue has room, so
-/// the first notice goes. With `1 + REQUEUE_MAX` such notices untaken the queue
-/// is full: `wait:queued`.
+/// No first notice behind another round's queued one while its limit holds (`limited`); once
+/// over, the first notice goes; with `1 + REQUEUE_MAX` untaken the queue is full (`queued`).
 #[cfg(unix)]
 #[test]
 fn a_pending_upgrade_waits_behind_another_rounds_queued_notice() {
@@ -974,13 +912,9 @@ fn a_pending_upgrade_waits_behind_another_rounds_queued_notice() {
     }
 }
 
-/// A limit row naming no reset is kept as none for the owner's view: through
-/// the real visit, a pending upgrade whose conversation ends in an API rate
-/// limit's row ([`api_limit_row`], ten minutes old) waits `limited` (the row
-/// holds the session for a re-ask's wait, [`upgrade::transcript_limit_until`]),
-/// but the record keeps no reset (`St::limit_until` `0`), so the view never
-/// says a reset passed. Negative control: the weekly row names its reset,
-/// which the record keeps and the view tells [`LIMIT_GRACE_S`] past it.
+/// A limit row naming no reset holds the session (`limited`) but leaves the record no reset
+/// (`St::limit_until` `0`), so the view never says a reset passed. Negative control: the
+/// weekly row's reset is kept and told [`LIMIT_GRACE_S`] past it.
 #[cfg(unix)]
 #[test]
 fn a_limit_row_naming_no_reset_leaves_the_view_no_reset() {
@@ -1031,10 +965,8 @@ fn a_limit_row_naming_no_reset_leaves_the_view_no_reset() {
         "{:?}",
         row.stall_words(later)
     );
-    // Negative control: the weekly row names its reset. ONE clock reading names it
-    // in the row and in the check below: the first visit above can take seconds on
-    // a loaded machine (3 s seen, 2026-10-09), and a reset read from `now` at the
-    // top of the test would then differ from the row's by that long.
+    // Negative control: the weekly row names its reset. One clock reading names it in the row
+    // and in the check: the visit above can take seconds on a loaded machine.
     let reset = 1_791_046_800_u64.max(now_s() + 86_400);
     let weekly = format!(
         "{}\n{}\n",
@@ -1054,9 +986,8 @@ fn a_limit_row_naming_no_reset_leaves_the_view_no_reset() {
     assert!(saved.limit_until.abs_diff(reset) <= 2, "{saved:?}");
     let row = view("lim-weekly-view", &saved);
     assert!(row.limit_passed(saved.limit_until + LIMIT_GRACE_S));
-    // A spend wall naming no reset (a monthly spend limit's row): kept as money
-    // (`St::limit_spend`), the owner's hold, which the view never bounds by the
-    // week nor tells as passed.
+    // A spend wall naming no reset: kept as money (`St::limit_spend`), the owner's hold, which
+    // the view never bounds by the week nor tells as passed.
     let spend = format!(
         "{}\n{}\n",
         tasked_at(now),
@@ -1082,7 +1013,7 @@ fn a_limit_row_naming_no_reset_leaves_the_view_no_reset() {
     assert_eq!(row.limit_ends_at(), None, "no usage window");
 }
 
-// ------------------------------------------- TIER-1: HarnessUpgradeLimitQueue
+// ------------------------------------------- Tier-1: HarnessUpgradeLimitQueue
 
 use aterm_spec::derive::Model;
 
@@ -1146,23 +1077,13 @@ impl Shape {
     }
 }
 
-/// The transcripts a model state stands for, each read the same by the real
-/// readers, so the bind is checked against every shape the state covers. Every
-/// ask before the latest: typed and read by the model as it came. The latest
-/// ask: with nothing `untaken`, typed and read as it came, or met by the limit
-/// and taken later (a person's `continue`, the model's row), its window on the
-/// record starting when it was typed so only the take opens it where `window`
-/// says; else `untaken` copies (the model's top, `RetypeMax + 1 + Daily`, as
-/// that many and one more), each met by a limit row: the last one's bound
-/// ahead where `held` (an API limit a minute old, a named reset an hour off),
-/// else over (the API limit half an hour old, a named reset just passed, or a
-/// named one followed by a `/login`, the first copy possibly an earlier
-/// round's), and past a full queue's rest where `rested` (a day and a minute on
-/// where a day's rest ran, `rested == 2`; all but three minutes of a day where
-/// a shorter one did). With nothing untaken, the session's last word: where
-/// `held`, the agent's own turn met a limit still holding; else nothing more,
-/// or a no-reset limit half an hour old, one whose reset passed, or one a
-/// `/login` ended.
+/// The transcripts a model state stands for, each read the same by the real readers. Earlier
+/// asks are typed and read as they came. The latest ask, with nothing `untaken`: read as it
+/// came, or met by the limit and taken later (its recorded window starting when typed, so
+/// only the take opens it), then the session's last word. Else `untaken` copies (at the top,
+/// also one more), each met by a limit row: its bound ahead where `held`, else over (API
+/// limit, passed reset, or a `/login`; the first copy possibly an earlier round's), and past a
+/// full queue's rest where `rested`.
 fn walk_transcripts(s: &S) -> Vec<Shape> {
     let asks = s["asks"];
     if asks == 0 || s["untaken"] > 0 {
@@ -1208,9 +1129,8 @@ fn walk_transcripts(s: &S) -> Vec<Shape> {
 /// [`walk_transcripts`] with the latest ask's rows `latest` (none: nothing
 /// asked, or its copies are `untaken`).
 fn walk_shapes(s: &S, latest: Option<Vec<String>>) -> Vec<Shape> {
-    // How long ago the rest began (the transcript's word ran out): a day
-    // and a minute for a day's rest, three minutes short of a day for one
-    // the model says is shorter.
+    // How long ago the rest began: a day and a minute for a day's rest, three minutes short of
+    // a day for a shorter one.
     let rest = if s["rested"] == 2 {
         DAY + 60
     } else {
@@ -1417,22 +1337,18 @@ fn walk_shapes_resting(s: &S, latest: Option<Vec<String>>, rest: u64) -> Vec<Sha
     ]
 }
 
-/// The rest probe for a full queue that has not rested (`s`): its renderings
-/// with the limit's word on the latest copy run out all but three minutes of a
-/// day ago ([`walk_shapes`]' renderings of the state the model's shorter rest
-/// leaves), when a rest shorter than a day has run and a day's has not.
+/// The rest probe for a full queue that has not rested: its renderings with the limit's word
+/// run out three minutes short of a day, where a shorter rest has run and a day's has not.
 fn walk_rest_probe(s: &S) -> Vec<Shape> {
     let mut probed = s.clone();
     probed.insert("rested", 1);
     walk_shapes(&probed, None)
 }
 
-/// The short rest's exact end for a full queue the model says rested less than
-/// a day (`s`, `rested == 1`): renderings with the limit's word run out a
-/// minute short of [`upgrade::queue_rest`] of its `untaken` copies ago (rest
-/// still running: `true`, the real code must wait `queued`) and a minute past
-/// it (`false`). This pins the real rest to the copies the real fold counts
-/// (every unread copy, whatever its round), which are the model's `untaken`.
+/// The short rest's end for a full queue the model says rested less than a day (`rested == 1`):
+/// renderings with the limit's word run out a minute either side of [`upgrade::queue_rest`] of
+/// its `untaken` (`true`: still resting, so the real code must wait `queued`). This pins the
+/// real rest to the copies the real fold counts (every unread copy, whatever its round).
 fn walk_short_rest_probe(s: &S) -> Vec<(Shape, bool)> {
     let untaken = u32::try_from(s["untaken"]).expect("untaken");
     let rest = upgrade::queue_rest(untaken);
@@ -1469,19 +1385,11 @@ struct Walked {
     requeued: bool,
 }
 
-/// THE REAL DECISION at the look a model state stands for, over one of its
-/// renderings, in the driver's order: the screen's limit
-/// ([`upgrade::limited`]) and the look's clock ([`upgrade::clock_held`]);
-/// the transcript's limit and queue ([`queue_facts`]), under the owner's
-/// `request` — `--now` given at this look, after every notice was typed; the
-/// step ([`upgrade::requested_step`], no READY in the tail, no round rested:
-/// the rest and the new round are the never-strands model's); the ask a
-/// notice goes as ([`upgrade::announce_asks`]); and whether the clock runs —
-/// a look a whole window on, the same facts, still finds the window where it
-/// was.
-///
-/// `s` is a state's [`DECIDE_VARS`] ([`Decisions`]): the decision reads
-/// nothing else of it.
+/// The real decision at the look a model state stands for, over one rendering, in the
+/// driver's order: the screen's limit and the clock, [`queue_facts`] under `request` (`--now`
+/// given at this look), [`upgrade::requested_step`] (no READY in the tail, no round rested:
+/// those are the never-strands model's), the ask count, and whether the clock runs (a look a
+/// window later, same facts, leaves the window where it was). `s` holds only [`DECIDE_VARS`].
 fn walk_decide(s: &S, shape: &Shape, request: &Request) -> Walked {
     let now = WALK_NOW;
     let asks = u32::try_from(s["asks"]).expect("asks");
@@ -1549,23 +1457,14 @@ fn walk_decide(s: &S, shape: &Shape, request: &Request) -> Walked {
     }
 }
 
-/// The variables of a model state [`walk_decide`] reads: the ask, the phase
-/// and its window, and the screen's limit ([`walk_screen`]) — none of the
-/// ones only the renderings are drawn from (`held`, `untaken`, `rested`), nor
-/// the model's own records (`took`, `stacked`, `burst`, …).
+/// The variables [`walk_decide`] reads; the rendering-only ones (`held`, `untaken`, `rested`)
+/// and the model's own records it never reads.
 const DECIDE_VARS: [&str; 4] = ["asks", "phase", "window", "shown"];
 
-/// [`walk_decide`] ONCE PER DISTINCT INPUT. It is a pure function of a
-/// state's [`DECIDE_VARS`], the rendering's tail and window start, and the
-/// request — a fresh `St` and `Facts`, the real fold at the fixed
-/// [`WALK_NOW`], nothing global read — and it is handed those variables
-/// alone, so a read of any other would panic rather than go unkeyed. The
-/// walk renders the same transcript for many states that differ only in
-/// what the decision never reads: measured 2026-09-30, 16,256 decisions over
-/// 2,864 distinct inputs, each parsing its tail four times over (the fold's
-/// readers), and the test went 15.7 s to 3.1 s alone. Every state and
-/// rendering is still asserted on, each over the decision its own inputs
-/// make.
+/// [`walk_decide`] memoised on its inputs: [`DECIDE_VARS`], the rendering's tail and window
+/// start, and the request. It is pure (fresh `St` and `Facts` at [`WALK_NOW`]) and is handed
+/// only those variables, so reading another panics rather than going unkeyed. About 16k
+/// decisions share under 3k inputs (15.7 s to 3.1 s).
 #[derive(Default)]
 struct Decisions(std::collections::BTreeMap<(S, String, Option<u64>, bool), Walked>);
 
@@ -1584,20 +1483,13 @@ impl Decisions {
     }
 }
 
-/// The variables of a model state [`walk_transcripts`] renders: the asks and
-/// the latest one's window, and the copies untaken with the limit's word on
-/// them (`held`, `rested`) — none of the ones only the decision reads
-/// (`phase`, `shown`), nor the model's own records.
+/// The variables [`walk_transcripts`] renders from; `phase`, `shown` and the model's own
+/// records it never reads.
 const RENDER_VARS: [&str; 5] = ["asks", "untaken", "window", "rested", "held"];
 
-/// [`walk_transcripts`] ONCE PER DISTINCT INPUT. It is a pure function of a
-/// state's [`RENDER_VARS`] — rows drawn at the fixed [`WALK_NOW`], nothing
-/// global read — and it is handed those variables alone, so a read of any
-/// other would panic rather than go unkeyed. Many states differ only in what
-/// no rendering reads, and the walk rendered the same transcripts afresh for
-/// each: measured 2026-10-05, rendering each once took the test from 59.4 G
-/// to 51.0 G instructions alone (a seventh). Every state is still walked
-/// over each of its own renderings.
+/// [`walk_transcripts`] memoised on [`RENDER_VARS`]: it is pure and is handed only those
+/// variables, so reading another panics rather than going unkeyed (a seventh of the test's
+/// instructions saved).
 #[derive(Default)]
 struct Renderings(std::collections::BTreeMap<S, Vec<Shape>>);
 
@@ -1608,13 +1500,9 @@ impl Renderings {
     }
 }
 
-/// Whether the model `m` agrees at `s` with what the real code decided: it
-/// takes exactly the step the real code took (`Announce`, `Retype`,
-/// `GiveUp`; under the owner's `--now`, the same ask typed again is `Retype`
-/// or the owner's `NowAsks`), to the ask the real code counts, and — the
-/// upgrade's own look — lets the window run out exactly where the real clock
-/// runs (under the owner's word a full queue's copy is typed at this very
-/// look, and its window starts from it).
+/// Whether `m` at `s` enables exactly the step the real code took (under the owner's `--now`,
+/// `NowAsks` stands in for `Retype`), to the same ask count, and lets the window run out
+/// (`Elapse`) exactly where the real clock runs.
 fn walk_agrees(m: &Model, s: &S, w: &Walked, owner: bool) -> bool {
     let enabled = |a: &str| {
         m.action_enabled(a, s) || (owner && a == "Retype" && m.action_enabled("NowAsks", s))
@@ -1664,19 +1552,10 @@ fn walk_const(m: &Model, name: &str) -> i64 {
         .expect("a constant")
 }
 
-/// Tier-1: on every reachable state of `harness_upgrade_limit_queue_model`
-/// (aterm-spec), over every rendering, the real code (screen limit reader,
-/// [`upgrade::notice_scan`], `transcript_limit_until`, [`queue_facts`], the
-/// clock, [`upgrade::requested_step`] and the ask count) reads what the state
-/// says and takes exactly the step the model's guards allow (`Retype`,
-/// `Announce`, `GiveUp`, `Elapse`, and `NowAsks` under the owner's `--now`).
-/// The model's bounds are the real ones (`MaxAsks` = [`MAX_ASKS`], `RetypeMax`
-/// = [`upgrade::REQUEUE_MAX`], `Daily` = [`upgrade::QUEUE_REST_DOUBLINGS`]),
-/// and the real queue rest matches the model's `Rests`
-/// ([`walk_short_rest_probe`]).
-///
-/// Negative controls: the model with any one defect switched on (`Buggy`, and
-/// each knob, `Flat` among them) disagrees with the real code somewhere.
+/// Tier-1: on every reachable state of `harness_upgrade_limit_queue_model`, over every
+/// rendering, the real readers, fold, clock and step take exactly the steps the model's guards
+/// allow, under the real bounds and queue rest ([`walk_short_rest_probe`]). Negative controls:
+/// `Buggy` and each defect knob disagree with the real code somewhere.
 #[test]
 fn the_real_queue_conforms_to_the_limit_queue_model() {
     use aterm_spec::derive::harness_upgrade_limit_queue_model;
@@ -1832,16 +1711,10 @@ fn the_real_queue_conforms_to_the_limit_queue_model() {
 
 // ------------------------------------------- a limit that lasts for days
 
-/// A limit that names no reset and lasts a week, through the real readers, fold
-/// and reducer: an announced upgrade's notice met by an API rate limit, the
-/// session looked at every five minutes for seven days, every copy met by the
-/// limit again. Copies go straight away twice (half an hour apart), then after
-/// rests of two, four, eight and sixteen hours, then a day each: six on the
-/// first day, one each later day, twelve in the week. Each is the same ask and
-/// none goes before its rest has run. Negative controls: the owner's `Upgrade
-/// now` mid-rest types one more at once; once the model takes the copies, the
-/// next limit's full queue rests two hours again (the rest grows with unread
-/// copies only).
+/// A limit naming no reset that lasts a week, looked at every five minutes: copies go twice
+/// straight away, then after rests of 2, 4, 8 and 16 hours, then one a day (six the first day,
+/// twelve in the week), each the same ask. Negative controls: the owner's `--now` mid-rest
+/// types one at once; once the model takes the copies, the next full queue rests two hours.
 #[test]
 fn a_limit_that_lasts_for_days_adds_a_handful_of_copies_then_one_a_day() {
     let marker = ask_marker(1);
@@ -1899,8 +1772,8 @@ fn a_limit_that_lasts_for_days_adds_a_handful_of_copies_then_one_a_day() {
             );
         }
     }
-    // Every gap is the limit's word (`REASK_S`) and, past the queue's room,
-    // the rest for the copies then unread — to the look.
+    // Each gap is `REASK_S` plus, past the queue's room, the rest for the copies then unread
+    // (to the five-minute look).
     let full = usize::try_from(upgrade::REQUEUE_MAX).expect("small");
     for (k, pair) in typed.windows(2).enumerate() {
         let unread = u32::try_from(k + 1).expect("small");
@@ -1928,8 +1801,7 @@ fn a_limit_that_lasts_for_days_adds_a_handful_of_copies_then_one_a_day() {
     assert_eq!(per_day, [6, 1, 1, 1, 1, 1, 1], "{typed:?}");
     assert_eq!(typed.len(), 12, "a week at the limit: twelve notices");
 
-    // Negative controls. The owner's word halfway through a day's rest: one
-    // more at once.
+    // Negative controls: the owner's word mid-rest types one more at once.
     let last = *typed.last().expect("typed");
     let halfway = last + REASK_S + DAY / 2;
     assert_eq!(

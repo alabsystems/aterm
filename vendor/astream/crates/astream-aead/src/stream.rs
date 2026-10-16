@@ -204,7 +204,7 @@ struct RecvState {
     /// The in-progress wire read — the 4-byte length prefix, then the body —
     /// accumulated across partial and timed-out transport reads so a socket
     /// timeout never desyncs the record boundary (the broker's liveness probe
-    /// reads with a 50 ms timeout).
+    /// reads with a 1 ms timeout, and a kept-alive connection under a deadline).
     hdr: [u8; LEN_PREFIX],
     hdr_filled: usize,
     /// The declared body length once the prefix is complete (0 = not yet).

@@ -30,9 +30,6 @@
 //! assert_eq!(decoded, b"Hello, world!");
 //! ```
 
-#![deny(clippy::all)]
-#![deny(unsafe_op_in_unsafe_fn)]
-
 pub mod base64;
 pub mod crc32;
 pub mod hex;

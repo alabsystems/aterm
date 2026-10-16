@@ -2,22 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Cell extras collection: HashMap-backed storage for grid-wide extras.
+//! Cell extras collection: HashMap-backed storage for grid-wide extras (the
+//! per-cell type is [`crate::extra::CellExtra`]).
 //!
-//! See [`crate::extra`] for the per-cell `CellExtra` type.
-//!
-//! ## Row-offset amortization
-//!
-//! Full-screen scroll (`shift_rows_up_by(0, n)`) is the dominant extras
-//! mutation. Instead of rebuilding the HashMap on every scroll (O(E) in the
-//! number of extras entries), a row offset makes it O(1):
-//!
-//! - External coordinates are translated to internal keys by adding
-//!   `row_offset`.
-//! - A full-screen scroll increments `row_offset`; no entries move.
-//! - Scrolled-off entries stay in the map temporarily.
-//! - Every `COMPACT_THRESHOLD` scrolls, one O(E) compaction removes stale
-//!   entries and resets the offset.
+//! Full-screen scroll (`shift_rows_up_by(0, n)`) is the dominant mutation, so
+//! it is O(1): external rows map to internal keys by adding `row_offset`, a
+//! scroll only bumps the offset and leaves scrolled-off entries in the map, and
+//! once the offset reaches `COMPACT_THRESHOLD` rows one O(E) compaction drops
+//! them and resets it.
 
 use std::sync::Arc;
 
@@ -26,15 +18,12 @@ use aterm_hash::FxHashMap;
 use crate::cell::Cell;
 use crate::extra::{CellCoord, CellExtra};
 
-/// Dense ring-buffer storage for non-BMP complex chars in the visible grid.
+/// Dense ring-buffer storage for non-BMP complex chars in the visible grid:
+/// flat indexing instead of a HashMap probe for cells (emoji and the like) whose
+/// only extra is `complex_char`.
 ///
-/// Flat array indexing instead of HashMap probing for the common case of
-/// emoji and other non-BMP characters that need only `complex_char` storage
-/// (no hyperlinks, combining marks, or RGB extras).
-///
-/// Sized to `visible_rows * cols`, with a row offset for O(1) full-screen
-/// scroll; scrolled-off entries are recycled. Stale entries are harmless:
-/// readers check `CellFlags::COMPLEX` first.
+/// Sized `visible_rows * cols`, with a row offset for O(1) full-screen scroll.
+/// Stale entries are harmless: readers check `CellFlags::COMPLEX` first.
 #[derive(Debug, Clone)]
 pub(crate) struct ComplexCharRing {
     /// Flat array: `entries[ring_row * stride + col]`, raw `char` codepoints,
@@ -61,10 +50,7 @@ impl ComplexCharRing {
         }
     }
 
-    /// Compute flat array index from (external_row, col).
-    ///
-    /// # Safety invariant
-    /// Caller must ensure `col < self.stride`; `get()` / `set()` validate it.
+    /// Flat index of (external row, col); callers ensure `col < stride`.
     #[inline(always)]
     fn index(&self, row: u16, col: u16) -> usize {
         debug_assert!(
@@ -75,9 +61,7 @@ impl ComplexCharRing {
         (self.ring_row(row) as usize) * (self.stride as usize) + (col as usize)
     }
 
-    /// Get the complex char codepoint at (row, col), if any.
-    ///
-    /// Returns `None` if `col >= stride` (stale dimensions after resize).
+    /// The complex char codepoint at (row, col); `None` if `col >= stride`.
     #[inline]
     pub(crate) fn get(&self, row: u16, col: u16) -> Option<char> {
         if col >= self.stride {
@@ -87,9 +71,8 @@ impl ComplexCharRing {
         self.entries.get(idx).copied().filter(|&c| c != '\0')
     }
 
-    /// Store a complex char codepoint at (row, col).
-    ///
-    /// No-op if `col >= stride` (stale dimensions after resize).
+    /// Store a complex char codepoint at (row, col); no-op if `col >= stride`
+    /// (stale dimensions after resize).
     #[inline]
     pub(crate) fn set(&mut self, row: u16, col: u16, value: char) {
         if col >= self.stride {
@@ -101,9 +84,7 @@ impl ComplexCharRing {
         }
     }
 
-    /// Store consecutive wide-char codepoints on the same row.
-    ///
-    /// Computes `ring_row` once and writes at col, col+2, col+4...
+    /// Store consecutive wide-char codepoints on one row, at col, col+2, ...
     #[inline]
     #[cfg(test)]
     pub(crate) fn set_wide_run(&mut self, row: u16, start_col: u16, chars: &[char]) {
@@ -113,8 +94,8 @@ impl ComplexCharRing {
         let base = (self.ring_row(row) as usize) * (self.stride as usize);
         let last_idx = base + (start_col as usize) + (chars.len() - 1) * 2;
         if last_idx < self.entries.len() {
-            // SAFETY: bounds verified above — last index is in range,
-            // so all prior indices are too (stride increases monotonically).
+            // SAFETY: the last index is in bounds and indices grow with `j`,
+            // so every earlier one is too.
             for (j, &c) in chars.iter().enumerate() {
                 let idx = base + (start_col as usize) + j * 2;
                 unsafe {
@@ -132,11 +113,8 @@ impl ComplexCharRing {
         }
     }
 
-    /// Clear a rectangular `[rows] x [cols]` region, one row at a time.
-    ///
-    /// Mirrors `RgbColorRing::clear_rect`. Used by `CellExtras::clear_rect` so
-    /// a rect overwrite (e.g. DECCRA) cannot read the prior destination
-    /// codepoint from this ring.
+    /// Clear a rectangular `[rows] x [cols]` region, so a rect overwrite (e.g.
+    /// DECCRA) cannot read the prior destination codepoint from this ring.
     pub(crate) fn clear_rect(&mut self, rows: core::ops::Range<u16>, cols: core::ops::Range<u16>) {
         for row in rows {
             self.clear_range(row, cols.start, cols.end);
@@ -144,18 +122,18 @@ impl ComplexCharRing {
     }
 
     /// Region shift up by `n` within rows `[top, bottom]` (full-width).
-    /// Mirrors `RgbColorRing::shift_region_up`.
+    /// Mirrors `CellExtras::shift_region_up_by`.
     pub(crate) fn shift_region_up(&mut self, top: u16, bottom: u16, n: u16) {
         self.shift_rect_up(top, bottom, 0, self.stride.saturating_sub(1), n);
     }
 
     /// Region shift down by `n` within rows `[top, bottom]` (full-width).
-    /// Mirrors `RgbColorRing::shift_region_down`.
+    /// Mirrors `CellExtras::shift_region_down_by`.
     pub(crate) fn shift_region_down(&mut self, top: u16, bottom: u16, n: u16) {
         self.shift_rect_down(top, bottom, 0, self.stride.saturating_sub(1), n);
     }
 
-    /// Column shift right (ICH) on one row. Mirrors `RgbColorRing::shift_cols_right`.
+    /// Column shift right (ICH) on one row. Mirrors `CellExtras::shift_cols_right`.
     pub(crate) fn shift_cols_right(&mut self, row: u16, start_col: u16, count: u16, max_col: u16) {
         if count == 0 {
             return;
@@ -168,7 +146,7 @@ impl ComplexCharRing {
         shift_right_in(&mut self.entries, base, start_col, count, hi, '\0');
     }
 
-    /// Column shift left (DCH) on one row. Mirrors `RgbColorRing::shift_cols_left`.
+    /// Column shift left (DCH) on one row. Mirrors `CellExtras::shift_cols_left`.
     pub(crate) fn shift_cols_left(&mut self, row: u16, start_col: u16, count: u16, max_col: u16) {
         if count == 0 {
             return;
@@ -224,13 +202,9 @@ impl RingSpans for ComplexCharRing {
         copy_span(&mut self.entries, src_base, dst_base, left, hi);
     }
 
-    /// Clear the `[left, right_excl)` column span of one external row.
-    ///
-    /// One row shares a single `ring_row`, so the indices are contiguous and one
-    /// `fill('\0')` clears them. `entries.len() == visible_rows * stride` (the
-    /// ring is never resized in place), so with `end <= stride` the
-    /// `<= entries.len()` guard passes for every in-range row and fails for an
-    /// out-of-range one; a partial clear cannot happen.
+    /// Clear the `[left, right_excl)` column span of one external row with one
+    /// `fill`. `entries.len()` is `visible_rows * stride` for the ring's life, so
+    /// the guard clears an in-range row whole and skips an out-of-range one.
     #[inline]
     fn clear_range(&mut self, row: u16, left: u16, right_excl: u16) {
         let end = right_excl.min(self.stride);
@@ -245,26 +219,19 @@ impl RingSpans for ComplexCharRing {
     }
 }
 
-/// Dense ring-buffer storage for RGB overflow colors in the visible grid.
+/// Dense ring-buffer storage for cells whose only extra is fg/bg RGB (no
+/// hyperlink, underline colour or extended flags), laid out like
+/// `ComplexCharRing`.
 ///
-/// Flat array indexing instead of HashMap probing for cells whose only extra
-/// is fg/bg RGB color (no hyperlinks, underline color, or extended flags).
-/// Same pattern as `ComplexCharRing`.
-///
-/// Encoding: `0` = no color, `0x01_RRGGBB` = has RGB (matches `PackedColor::rgb` format).
-/// Black is `0x01_000000`, not zero, so `0` is an unambiguous sentinel.
+/// Encoding: `0` = no colour, `0x01_RRGGBB` = RGB (as `PackedColor::rgb`), so
+/// black is nonzero and `0` is an unambiguous sentinel.
 #[derive(Debug, Clone)]
 pub(crate) struct RgbColorRing {
-    /// FG entries: `fg[ring_row * stride + col]`.
-    ///
-    /// Lazy: `None` until a true-colour fg is stored. An absent plane reads
-    /// like an all-zero plane, so screens without true-colour foregrounds skip
-    /// the `capacity * 4 B` allocation.
+    /// FG entries, `fg[ring_row * stride + col]`. `None` until a true-colour fg
+    /// is stored: an absent plane reads as all-zero, so screens without
+    /// true-colour foregrounds skip the `capacity * 4 B` allocation.
     fg: Option<Box<[u32]>>,
-    /// BG entries: `bg[ring_row * stride + col]`.
-    ///
-    /// Lazy, mirroring `fg`: syntax-highlighted output that only overrides the
-    /// foreground never allocates this plane.
+    /// BG entries, laid out and allocated like `fg`.
     bg: Option<Box<[u32]>>,
     /// Columns per row.
     stride: u16,
@@ -315,10 +282,7 @@ impl RgbColorRing {
         fg.saturating_add(bg)
     }
 
-    /// Compute flat array index from (external_row, col).
-    ///
-    /// # Safety invariant
-    /// Caller must ensure `col < self.stride`; the public accessors validate it.
+    /// Flat index of (external row, col); callers ensure `col < stride`.
     #[inline(always)]
     fn index(&self, row: u16, col: u16) -> usize {
         debug_assert!(
@@ -354,12 +318,10 @@ impl RgbColorRing {
         self.read(self.bg.as_deref(), row, col)
     }
 
-    /// Store fg RGB at (row, col). No-op if `col >= stride` (stale dimensions after
-    /// resize).
+    /// Store fg RGB at (row, col); no-op if `col >= stride`.
     ///
-    /// Test-only per-cell reference: production writes use [`Self::fill_runs`],
-    /// and tests check the two agree. It packs inline rather than via
-    /// `pack_rgb`, so the check compares independent code.
+    /// Test-only per-cell reference for [`Self::fill_runs`]. It packs inline
+    /// rather than via `pack_rgb`, so the comparison checks independent code.
     #[cfg(test)]
     #[inline]
     pub(crate) fn set_fg(&mut self, row: u16, col: u16, rgb: [u8; 3]) {
@@ -373,8 +335,7 @@ impl RgbColorRing {
         }
     }
 
-    /// Store bg RGB at (row, col). No-op if `col >= stride` (stale dimensions after
-    /// resize). Test-only per-cell reference; see [`Self::set_fg`].
+    /// Store bg RGB at (row, col); test-only, see [`Self::set_fg`].
     #[cfg(test)]
     #[inline]
     pub(crate) fn set_bg(&mut self, row: u16, col: u16, rgb: [u8; 3]) {
@@ -388,20 +349,16 @@ impl RgbColorRing {
         }
     }
 
-    /// Pack `rgb` the way `set_fg`/`set_bg` do: `0x01RRGGBB`, the `0x01` high byte
-    /// marking "true-colour override present" (so a stored pure black `0x00000000`
-    /// still reads back as set, distinct from the absent-entry 0).
+    /// Pack `rgb` as `0x01RRGGBB` (the struct's encoding).
     #[inline(always)]
     fn pack_rgb(rgb: [u8; 3]) -> u32 {
         0x01_000000 | ((rgb[0] as u32) << 16) | ((rgb[1] as u32) << 8) | (rgb[2] as u32)
     }
 
-    /// Store fg and/or bg RGB across the column run `[col_start, col_end)` of
-    /// `row` with one `fill` per present axis, equivalent to `set_fg`/`set_bg`
-    /// per column: same `0x01RRGGBB` packing, the run clamped to `stride`, and
-    /// a plane allocated only for a `Some` axis with an in-range run. One row
-    /// shares a single `ring_row`, so the indices are contiguous
-    /// (`fill_run_matches_per_cell_set`).
+    /// Store fg and/or bg RGB across `[col_start, col_end)` of `row` with one
+    /// `fill` per present plane, equivalent to `set_fg`/`set_bg` per column
+    /// (`fill_run_matches_per_cell_set`). A plane is allocated only for a `Some`
+    /// axis with an in-range run.
     #[inline]
     fn fill_runs(
         &mut self,
@@ -447,30 +404,18 @@ impl RgbColorRing {
     }
 
     /// Region shift up by `n` within rows `[top, bottom]` (full-width).
-    ///
-    /// Mirrors `CellExtras::shift_region_up_by`: rows `[top, top+n)` are
-    /// cleared, rows `[top+n, bottom]` move up by `n`, vacated bottom rows
-    /// `[bottom-n+1, bottom]` are cleared. Rows outside `[top, bottom]` keep
-    /// their truecolor.
+    /// Mirrors `CellExtras::shift_region_up_by`.
     pub(crate) fn shift_region_up(&mut self, top: u16, bottom: u16, n: u16) {
         self.shift_rect_up(top, bottom, 0, self.stride.saturating_sub(1), n);
     }
 
     /// Region shift down by `n` within rows `[top, bottom]` (full-width).
-    ///
-    /// Mirrors `CellExtras::shift_region_down_by`: rows `[top, bottom-n]` move
-    /// down by `n`, rows `[bottom-n+1, bottom]` are dropped, vacated top rows
-    /// `[top, top+n)` are cleared. Rows outside `[top, bottom]` are untouched.
+    /// Mirrors `CellExtras::shift_region_down_by`.
     pub(crate) fn shift_region_down(&mut self, top: u16, bottom: u16, n: u16) {
         self.shift_rect_down(top, bottom, 0, self.stride.saturating_sub(1), n);
     }
 
-    /// Shift columns right within a single row for ICH (Insert Character).
-    ///
-    /// Mirrors `CellExtras::shift_cols_right`: columns in
-    /// `[start_col, max_col-count)` move right by `count`; columns in
-    /// `[start_col, start_col+count)` are cleared; columns shifted past
-    /// `max_col` are dropped.
+    /// Column shift right (ICH) on one row. Mirrors `CellExtras::shift_cols_right`.
     pub(crate) fn shift_cols_right(&mut self, row: u16, start_col: u16, count: u16, max_col: u16) {
         if count == 0 {
             return;
@@ -480,8 +425,7 @@ impl RgbColorRing {
             return;
         }
         let base = (self.ring_row(row) as usize) * (self.stride as usize);
-        // Per-plane: an absent plane is all-zero, so both the move and the
-        // blank-fill are no-ops on it — skip absent planes entirely.
+        // An absent plane is all-zero, so skip it.
         if let Some(plane) = self.fg.as_deref_mut() {
             shift_right_in(plane, base, start_col, count, hi, 0);
         }
@@ -490,12 +434,7 @@ impl RgbColorRing {
         }
     }
 
-    /// Shift columns left within a single row for DCH (Delete Character).
-    ///
-    /// Mirrors `CellExtras::shift_cols_left`: columns in
-    /// `[start_col, start_col+count)` are deleted; columns in
-    /// `[start_col+count, max_col)` move left by `count`. Columns at/after
-    /// `max_col` are preserved in place.
+    /// Column shift left (DCH) on one row. Mirrors `CellExtras::shift_cols_left`.
     pub(crate) fn shift_cols_left(&mut self, row: u16, start_col: u16, count: u16, max_col: u16) {
         if count == 0 {
             return;
@@ -505,8 +444,6 @@ impl RgbColorRing {
             return;
         }
         let base = (self.ring_row(row) as usize) * (self.stride as usize);
-        // Per-plane: an absent plane is all-zero, so both the move and the
-        // blank-fill are no-ops on it — skip absent planes entirely.
         if let Some(plane) = self.fg.as_deref_mut() {
             shift_left_in(plane, base, start_col, count, hi, 0);
         }
@@ -543,8 +480,7 @@ impl RingSpans for RgbColorRing {
         self.ring_offset = 0;
     }
 
-    /// Clear RGB entries for an entire row with one `fill(0)` on the
-    /// contiguous slice.
+    /// Clear one external row's entries.
     #[inline]
     fn clear_row(&mut self, row: u16) {
         let ring_row = self.ring_row(row);
@@ -564,17 +500,13 @@ impl RingSpans for RgbColorRing {
         }
     }
 
-    /// Copy one external row's `[left, right]` column span from `src_row` into
-    /// `dst_row`, preserving the packed fg/bg values exactly. Source cells in
-    /// the span are NOT cleared (the caller handles vacated cells separately,
-    /// matching the HashMap drain-rebuild which only inserts moved entries).
+    /// Copy a `[left, right]` column span from `src_row` to `dst_row`; the
+    /// caller clears vacated rows.
     #[inline]
     fn copy_row_span(&mut self, src_row: u16, dst_row: u16, left: u16, right: u16) {
         let hi = right.min(self.stride.saturating_sub(1));
         let src_base = (self.ring_row(src_row) as usize) * (self.stride as usize);
         let dst_base = (self.ring_row(dst_row) as usize) * (self.stride as usize);
-        // Operate per-plane: an absent plane is all-zero, so copying it would be
-        // a no-op (dst stays absent/all-zero) — we simply skip it.
         if let Some(plane) = self.fg.as_deref_mut() {
             copy_span(plane, src_base, dst_base, left, hi);
         }
@@ -583,24 +515,17 @@ impl RingSpans for RgbColorRing {
         }
     }
 
-    /// Clear RGB entries for a column range on a single row.
-    ///
-    /// Used by erase operations: erased cells must not keep ring RGB values
-    /// that would shadow their actual (default) colors.
-    ///
-    /// One `fill(0)` per plane: a row shares a single `ring_row`, so the
-    /// indices are contiguous. `stride`/`visible_rows` are fixed for the ring's
-    /// life (resize drops it via `invalidate_rings`) and each plane has
-    /// `visible_rows * stride` entries, so with `end <= stride` the
-    /// `hi <= plane.len()` guard passes for every in-range row and fails for an
-    /// out-of-range one; a partial clear cannot happen.
+    /// Clear RGB entries for a column range on a single row, so erased cells do
+    /// not keep ring RGB that would shadow their default colors. Each plane holds
+    /// `visible_rows * stride` entries for the ring's life (resize drops it via
+    /// `invalidate_rings`), so the `hi <= plane.len()` guard admits an in-range
+    /// row whole and rejects an out-of-range one.
     #[inline]
     fn clear_range(&mut self, row: u16, start_col: u16, end_col: u16) {
         let end = end_col.min(self.stride);
         if start_col >= end {
             return;
         }
-        // Both computed BEFORE the plane borrow (they read `self`).
         let base = (self.ring_row(row) as usize) * (self.stride as usize);
         let (lo, hi) = (base + start_col as usize, base + end as usize);
         // Clearing an absent plane is a no-op: use `as_deref_mut`, never
@@ -720,12 +645,8 @@ trait RingSpans {
     }
 }
 
-/// Copy columns `[left, hi]` of the row at `src_base` onto the row at `dst_base`.
-///
-/// The span is contiguous within each row for both src and dst, so a single
-/// memmove (`copy_within`) replaces the per-cell loop. The runtime
-/// all-or-nothing bounds guard (matching `clear_row`/`clear_range`) makes
-/// degenerate dims silently skip rather than panic.
+/// Copy columns `[left, hi]` of the row at `src_base` onto the row at `dst_base`
+/// with one `copy_within`; out-of-range dimensions skip the copy, never panic.
 #[inline]
 fn copy_span<T: Copy>(plane: &mut [T], src_base: usize, dst_base: usize, left: u16, hi: u16) {
     if left > hi {
@@ -777,11 +698,9 @@ fn shift_left_in<T: Copy>(plane: &mut [T], base: usize, start: u16, count: u16, 
     plane[keep_end..h].fill(blank);
 }
 
-/// Compact after this many accumulated scroll rows.
-///
-/// Chosen to be large enough that compaction is rare (amortized O(1) per
-/// scroll) but small enough that stale entry memory waste is bounded and
-/// offset + max_screen_height never approaches u16 overflow.
+/// Compact after this many accumulated scroll rows: rare enough to amortize to
+/// O(1) per scroll, small enough to bound stale-entry memory and keep
+/// `row_offset` plus the screen height clear of u16 overflow.
 const COMPACT_THRESHOLD: u16 = 256;
 
 /// Maximum number of hyperlink-bearing entries allowed in `CellExtras`.
@@ -792,11 +711,8 @@ const COMPACT_THRESHOLD: u16 = 256;
 /// stale entries awaiting compaction.
 pub(crate) const MAX_HYPERLINK_ENTRIES: usize = 10_000;
 
-/// Unified per-cell extras snapshot for render/FFI hot paths.
-///
-/// Collapses ring-buffer and HashMap reads into a single accessor so callers
-/// do not re-probe the same storage layers for complex chars, RGB overflow,
-/// and `CellExtra`.
+/// Per-cell extras snapshot for render/FFI hot paths: one accessor over the
+/// rings and the map, so callers do not re-probe each layer.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CellRenderData<'a> {
     extra: Option<&'a CellExtra>,
@@ -842,62 +758,37 @@ impl<'a> CellRenderData<'a> {
 /// scroll amortization (see module docs).
 #[derive(Debug, Clone, Default)]
 pub struct CellExtras {
-    /// Map from cell coordinate to extra data.
-    ///
-    /// **Warning:** Keys use internal coordinates (shifted by `row_offset`).
-    /// Use the accessor methods (`get`, `set`, `iter`, etc.) for correct
-    /// external-to-internal translation. Direct `data` access requires
-    /// calling `compact()` first to reset `row_offset` to 0.
+    /// Map from cell coordinate to extra data. Keys are internal coordinates
+    /// (external row `r` is `r.wrapping_add(row_offset)`): go through the
+    /// accessors, or call `compact()` first so the offset is 0.
     pub(crate) data: FxHashMap<CellCoord, CellExtra>,
     /// Accumulated row offset for O(1) full-screen scroll.
-    ///
-    /// External row `r` maps to internal key `r.wrapping_add(row_offset)`.
     row_offset: u16,
-    /// Dense ring buffer for non-BMP complex chars.
-    ///
-    /// Allocated on first non-BMP write; flat-array indexing for the emoji
-    /// write path. Cells that also have style extras use the HashMap.
+    /// Dense ring for non-BMP complex chars, allocated on first non-BMP write.
+    /// Cells that also have other extras use the map.
     complex_ring: Option<Box<ComplexCharRing>>,
-    /// Dense ring buffer for RGB overflow colors.
-    ///
-    /// Allocated on first RGB-only extras write; bypasses the HashMap for
-    /// cells whose only extra is fg/bg RGB color.
+    /// Dense ring for cells whose only extra is fg/bg RGB, allocated on first
+    /// such write.
     rgb_ring: Option<Box<RgbColorRing>>,
-    /// Resident scratch for [`Self::enforce_hyperlink_limit_cold`]'s candidate
-    /// walk. Empty between calls; it only carries capacity, so the cold path
-    /// (run per written OSC 8 run and after row shifts) does not allocate.
-    ///
-    /// Capacity is kept, not shrunk: only grids holding >10,000 hyperlink
-    /// entries grow it large, and there the map dwarfs it, while shrinking
-    /// would reintroduce allocation on the eviction path.
+    /// Scratch for [`Self::enforce_hyperlink_limit_cold`]'s candidate walk:
+    /// empty between calls, it keeps its capacity so the cold path does not
+    /// allocate. Never shrunk: it grows large only where the map dwarfs it.
     hyperlink_scratch: Vec<CellCoord>,
-    /// Upper bound on the number of hyperlink-bearing entries in `data`.
-    ///
-    /// [`Self::enforce_hyperlink_limit`] bounds the hyperlink population, but
-    /// `data.len()` also counts combining marks, underline colours, extended
-    /// flags, kitty placeholders and inline-image refs, so guarding on it would
-    /// walk the whole map on every hyperlinked write once anything else filled
-    /// it, evicting nothing.
+    /// Upper bound on the number of hyperlink-bearing entries in `data`, which
+    /// guards [`Self::enforce_hyperlink_limit`]: `data.len()` also counts marks,
+    /// colours, flags and images, so guarding on it would walk the whole map on
+    /// every linked write once anything else filled it.
     ///
     /// Invariant: `hyperlink_upper_bound >= (entries whose hyperlink is Some)`.
-    ///
-    /// * every path that can raise the population charges it here
-    ///   (`get_or_create`, `set`, `set_range_uniform`); a missed charge would
-    ///   lose the memory bound;
-    /// * paths that lower it (row shifts, retain-based clears, compaction) need
-    ///   not report; the bound stays conservative, costs at most one cold walk,
-    ///   and that walk resets it to the exact count.
-    ///
-    /// `clear()` resets it to 0 because it replaces the whole map.
+    /// Every path that can raise the population charges it (`get_or_create`,
+    /// `fresh`, `set`, `set_range_uniform`); a missed charge loses the memory
+    /// bound. Paths that lower it need not report: the cold walk resets it to the
+    /// exact count.
     hyperlink_upper_bound: usize,
-    /// Sticky: an inline image has been placed here at some point. Reset only
-    /// by [`Self::clear`], which replaces the map.
-    ///
-    /// Scroll-off must look for image refs across the full row width, because
-    /// `place_image` writes no glyph (an image-only row has `Row::len() == 0`).
-    /// This gate keeps sessions that never place an image from paying that scan
-    /// per scrolled row under the PTY reader's `term_lock`, like the
-    /// `complex_ring`/`rgb_ring` gates.
+    /// Sticky: an inline image has been placed here at some point; reset only by
+    /// [`Self::clear`]. Scroll-off must scan the full row width for image refs
+    /// (an image-only row has `Row::len() == 0`), and this gate spares sessions
+    /// that never place an image that scan.
     any_image: bool,
 }
 
@@ -907,10 +798,8 @@ pub struct CellExtras {
 /// or link (the ring path writes no entry; see `set_range_uniform`).
 ///
 /// Returns the entry and whether the one it replaced carried a link, which the
-/// caller refunds. Only an occupied slot is reset: the common case, a vacant
-/// slot, is a plain insert, so an OSC 8 run costs what `or_default` did
-/// (r15 review, 2026-10-11: resetting every slot cost +8% instructions on
-/// densely linked text; this is back at the pre-C2 count).
+/// caller refunds. Only an occupied slot is reset; a vacant slot is a plain
+/// insert (resetting every slot cost +8% instructions on densely linked text).
 #[inline]
 fn fresh_slot(
     data: &mut FxHashMap<CellCoord, CellExtra>,
@@ -938,18 +827,14 @@ impl CellExtras {
             row_offset: 0,
             complex_ring: None,
             rgb_ring: None,
-            // Unallocated until the hyperlink cold path first runs; a grid that
-            // never sees an OSC 8 link never pays a byte for it.
             hyperlink_scratch: Vec::new(),
             hyperlink_upper_bound: 0,
             any_image: false,
         }
     }
 
-    /// Store a complex char codepoint in the dense ring buffer.
-    ///
-    /// Allocates the ring on first use. O(1) flat-array write of the raw
-    /// `char`, with no `Arc<str>` allocation or refcounting.
+    /// Store a complex char codepoint in the dense ring buffer, allocating the
+    /// ring on first use; no `Arc<str>` allocation or refcounting.
     #[inline]
     pub fn set_complex_char_ring(
         &mut self,
@@ -966,8 +851,6 @@ impl CellExtras {
     }
 
     /// Store a run of wide-char codepoints on the same row.
-    ///
-    /// Hoists the ring_row computation to avoid per-char overhead.
     #[inline]
     #[cfg(test)]
     pub fn set_complex_char_wide_run(
@@ -984,9 +867,7 @@ impl CellExtras {
         ring.set_wide_run(row, start_col, chars);
     }
 
-    /// Store non-BMP chars from a mixed BMP/non-BMP wide-char run.
-    ///
-    /// Hoists ring_row once. Only writes entries for chars > U+FFFF.
+    /// Store the non-BMP chars (> U+FFFF) of a mixed BMP/non-BMP wide-char run.
     #[inline]
     pub fn set_mixed_wide_ring(
         &mut self,
@@ -1012,10 +893,8 @@ impl CellExtras {
         }
     }
 
-    /// Look up a complex char codepoint: ring buffer first (O(1)), then HashMap.
-    ///
-    /// Returns the codepoint from the ring if present, otherwise falls back
-    /// to the HashMap for cells with combined extras (hyperlinks + complex char).
+    /// Look up a complex char codepoint: ring first, then the map (cells whose
+    /// complex char shares an entry with other extras).
     #[inline]
     pub fn complex_codepoint_for(&self, row: u16, col: u16) -> Option<char> {
         if let Some(ring) = &self.complex_ring
@@ -1029,10 +908,9 @@ impl CellExtras {
             .and_then(|s| s.chars().next())
     }
 
-    /// Look up a complex char as `Arc<str>`: HashMap only (ring stores codepoints).
-    ///
-    /// Used by scrollback materialization which needs the full `Arc<str>`.
-    /// For most callers that just need the codepoint, use `complex_codepoint_for`.
+    /// Look up a complex char as `Arc<str>`: map only (the ring stores
+    /// codepoints). Callers that need only the codepoint use
+    /// `complex_codepoint_for`.
     #[inline]
     pub fn complex_char_arc_for(&self, row: u16, col: u16) -> Option<&Arc<str>> {
         self.data
@@ -1040,10 +918,8 @@ impl CellExtras {
             .and_then(|e| e.complex_char())
     }
 
-    /// Look up a complex char as a full `String`: ring buffer or HashMap.
-    ///
-    /// Used by text extraction (row_text, content export) which needs the
-    /// complete string representation. More expensive than `complex_codepoint_for`.
+    /// Look up a complex char as a full `String` (ring or map), for text
+    /// extraction; it allocates, unlike `complex_codepoint_for`.
     pub fn complex_char_str_for(&self, row: u16, col: u16) -> Option<String> {
         if let Some(ring) = &self.complex_ring
             && let Some(c) = ring.get(row, col)
@@ -1056,10 +932,8 @@ impl CellExtras {
             .map(|s| s.to_string())
     }
 
-    /// Store RGB fg/bg in the dense ring buffer for a column range.
-    ///
-    /// Allocates the ring on first use. O(1) per cell. Used by
-    /// `set_range_uniform` for RGB-only extras (no hyperlinks, no underline).
+    /// Store RGB fg/bg in the dense ring buffer for a column range, allocating
+    /// the ring on first use. For RGB-only extras (no hyperlink, no underline).
     #[allow(
         clippy::too_many_arguments,
         reason = "all params are semantically distinct"
@@ -1077,20 +951,15 @@ impl CellExtras {
         let ring = self
             .rgb_ring
             .get_or_insert_with(|| Box::new(RgbColorRing::new(visible_rows, cols)));
-        // One contiguous slice fill per plane (the run shares a `ring_row`; see
-        // `fill_runs`), cheap on wide truecolor spans (bat, delta, vim tgc).
         ring.fill_runs(row, col_start, col_end, fg_rgb, bg_rgb);
     }
 
     /// Clear the dense RGB-ring fg/bg entries for a `width`-cell span starting
     /// at `(row, col)`, if a ring exists.
     ///
-    /// Used by the per-character write-split path, which applies the new
-    /// cell's RGB via the HashMap (`apply_cell_extras_preflagged`). Reads
-    /// consult the ring first (`bg_rgb_for`/`render_data_for_cell`), so a
-    /// leftover ring entry would shadow the new color; this keeps the two
-    /// truecolor stores consistent, like the stale-HashMap-entry drop on
-    /// overwrite.
+    /// The per-character write-split path stores the new cell's RGB in the map,
+    /// but reads consult the ring first, so a leftover ring entry would shadow
+    /// the new color.
     #[inline]
     pub(crate) fn clear_rgb_ring_cell(&mut self, row: u16, col: u16, width: u16) {
         if let Some(ring) = &mut self.rgb_ring {
@@ -1124,15 +993,11 @@ impl CellExtras {
             .and_then(|e| e.bg_rgb())
     }
 
-    /// Read all render-relevant extras for a cell in one coordinated pass.
+    /// Read all render-relevant extras for a cell in one pass.
     ///
-    /// Uses the cell's flags to decide which storage layers are relevant:
-    /// - `HAS_EXTRAS` requests the `CellExtra` reference.
-    /// - `COMPLEX` requests the complex-char ring/HashMap fallback.
-    /// - RGB overflow flags request fg/bg ring/HashMap fallback.
-    ///
-    /// This keeps ring-only cells on the flat-array fast path while ensuring
-    /// callers pay for at most one HashMap probe when fallback data is needed.
+    /// The cell's flags pick the layers: `HAS_EXTRAS` the `CellExtra`, `COMPLEX`
+    /// the complex char, the RGB overflow flags fg/bg. Ring hits stay on the
+    /// flat-array path; a fallback costs at most one map probe.
     #[must_use]
     #[inline]
     pub fn render_data_for_cell(&self, row: u16, col: u16, cell: Cell) -> CellRenderData<'_> {
@@ -1201,42 +1066,29 @@ impl CellExtras {
         CellCoord::new(self.internal_row(coord.row), coord.col)
     }
 
-    /// Returns `true` when no cell has extras data.
-    ///
-    /// Used by the FFI render path to skip per-cell hash probes when the
-    /// map is empty — the common case for plain-text terminal output.
-    ///
-    /// Note: may return `false` when only stale (scrolled-off) entries remain.
-    /// This is conservative — callers that skip work on `true` are correct.
-    ///
-    /// **Important:** This only checks the HashMap, not the ring buffers.
-    /// Use [`has_any_data`] when you need to know if *any* storage (HashMap
-    /// or ring buffers) contains entries.
+    /// Returns `true` when the map holds no entry, so the FFI render path can
+    /// skip per-cell probes. Conservative: stale (scrolled-off) entries make it
+    /// `false`. The rings are not checked; see [`Self::has_any_data`].
     #[must_use]
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.data.is_empty()
     }
 
-    /// Returns `true` when any storage layer (HashMap, complex ring, or RGB
-    /// ring) contains data.
-    ///
-    /// Unlike [`is_empty`], this accounts for ring-buffer-only entries that
-    /// bypass the HashMap on the write hot path.
+    /// Returns `true` when any storage layer (map, complex ring or RGB ring)
+    /// holds data, unlike [`Self::is_empty`], which sees only the map.
     #[must_use]
     #[inline]
     pub fn has_any_data(&self) -> bool {
         !self.data.is_empty() || self.complex_ring.is_some() || self.rgb_ring.is_some()
     }
 
-    /// Iterate over all valid (non-stale) (coord, extra) pairs.
-    ///
-    /// Coordinates are translated back to external (caller-visible) values.
-    /// Used by checkpoint serialization to persist extras.
+    /// Iterate over all valid (non-stale) (coord, extra) pairs, in external
+    /// coordinates.
     pub fn iter(&self) -> impl Iterator<Item = (CellCoord, &CellExtra)> + '_ {
         let offset = self.row_offset;
         self.data.iter().filter_map(move |(coord, extra)| {
-            // Stale entries have internal_row < offset (they scrolled off).
+            // Stale entries (scrolled off) have internal row < offset.
             if offset > 0 && coord.row < offset {
                 return None;
             }
@@ -1269,14 +1121,11 @@ impl CellExtras {
 
     /// Get mutable extras for a cell, creating if needed.
     ///
-    /// Charges the hyperlink budget when the entry does not already carry a
-    /// link: callers (`handler_write`'s per-cell OSC 8 path, checkpoint restore
-    /// in `scroll_fill`) may write a hyperlink through the returned
-    /// `&mut CellExtra`, which cannot report back. An entry that already has a
-    /// link can only keep or drop it, so the `is_none()` case is exactly the
-    /// set of handouts that can raise the population. Over-charging costs at
-    /// most one cold walk (which repairs the bound); under-charging would lose
-    /// the memory bound.
+    /// Charges the hyperlink budget unless the entry already carries a link: a
+    /// caller (checkpoint restore in `scroll_fill`, for one) may write a link
+    /// through the `&mut`, which cannot report back. Over-charging costs at most
+    /// one cold walk (which repairs the bound); under-charging loses the memory
+    /// bound.
     #[inline]
     pub fn get_or_create(&mut self, coord: CellCoord) -> &mut CellExtra {
         let key = self.internal_coord(coord);
@@ -1293,20 +1142,15 @@ impl CellExtras {
     /// A fresh entry for a cell a writer has just written, replacing whatever
     /// entry is keyed to the coordinate.
     ///
-    /// The writers drop the entry of every cell they overwrite that carries
-    /// HAS_EXTRAS (`grid::write::StaleExtras`), so an entry still keyed here
-    /// belongs to no cell: an orphan an operation left behind. Merging the new
-    /// cell's extras into it, as [`Self::get_or_create`] would, revives an old
-    /// combining mark, skin tone or link on the new glyph. Ruling 2026-10-10
-    /// (r15 C2, defence in depth): a fresh write never adopts an entry, whatever
-    /// left it there. That holds for every write that creates an entry (this
-    /// and [`Self::set_range_uniform`]'s map path); a truecolor-only run keeps
-    /// its colours in the ring and relies on orphans being closed at their
-    /// source (ruling 2026-10-11 in `set_range_uniform`).
+    /// Writers drop the entry of every HAS_EXTRAS cell they overwrite
+    /// (`grid::write::StaleExtras`), so an entry still keyed here is an orphan;
+    /// merging into it, as [`Self::get_or_create`] would, revives an old
+    /// combining mark, skin tone or link on the new glyph. Every write that
+    /// creates an entry (this and [`Self::set_range_uniform`]'s map path) starts
+    /// fresh.
     ///
-    /// Charges the hyperlink budget as `get_or_create` does (the handout may
-    /// receive a link) and refunds the replaced entry's link, as
-    /// [`Self::remove`] does. One hash lookup.
+    /// Charges the hyperlink budget as `get_or_create` does and refunds the
+    /// replaced entry's link, as [`Self::remove`] does.
     #[inline]
     pub fn fresh(&mut self, coord: CellCoord) -> &mut CellExtra {
         let key = self.internal_coord(coord);
@@ -1347,22 +1191,18 @@ impl CellExtras {
         self.get_or_create(coord).stack_image(image);
     }
 
-    /// Set extras for a cell.
-    ///
-    /// If the extra has no data, removes the entry to save memory.
+    /// Set extras for a cell; an extra with no data removes the entry.
     #[inline]
     pub fn set(&mut self, coord: CellCoord, extra: CellExtra) {
         let internal = self.internal_coord(coord);
         if extra.has_data() {
-            // Charge only for a value that actually carries a link: DECCRA's
-            // rect copy and the RGB-only seeding in `extras_shift` store
-            // link-free extras through here and must not inflate the bound.
+            // Charge only for a value that carries a link: reflow and DECCRA's
+            // rect copy also store link-free extras here.
             if extra.hyperlink().is_some() {
                 self.hyperlink_upper_bound += 1;
             }
-            // Arm the scroll-off image scan for the bulk path too: checkpoint
-            // restore and DECCRA's rect copy both re-enter whole `CellExtra`
-            // values here, and one of them may carry a picture.
+            // Arm the scroll-off image scan here too: reflow and DECCRA's rect
+            // copy re-enter whole `CellExtra` values, which may carry a picture.
             if extra.image().is_some() {
                 self.any_image = true;
             }
@@ -1372,20 +1212,16 @@ impl CellExtras {
         }
     }
 
-    /// Remove extras for a single cell.
-    ///
-    /// Returns `true` if an entry was present and removed. Used by the grid
-    /// write paths to drop stale entries when overwriting extras-bearing cells.
+    /// Remove extras for a single cell; `true` if an entry was removed.
     #[inline]
     pub(crate) fn remove(&mut self, coord: CellCoord) -> bool {
         let key = self.internal_coord(coord);
         let Some(extra) = self.data.remove(&key) else {
             return false;
         };
-        // Refund the charge: this is the OSC 8 overwrite path (`write_split`
-        // drops a cell's stale entry before rewriting it), so a screen repainting
-        // links in place does not inflate the bound. `saturating_sub` because the
-        // bound must never wrap.
+        // Refund the charge: on the OSC 8 overwrite path (`write_split` drops a
+        // cell's stale entry before rewriting it), a screen repainting links in
+        // place must not inflate the bound.
         if extra.hyperlink().is_some() {
             self.hyperlink_upper_bound = self.hyperlink_upper_bound.saturating_sub(1);
         }
@@ -1417,15 +1253,12 @@ impl CellExtras {
         self.data.remove(&key);
     }
 
-    /// Strip character-bearing fields (combining marks + complex-char string)
-    /// from a cell's extra, preserving SGR colors and every other overflow
-    /// field.
+    /// Strip a cell's combining marks and complex-char string, keeping SGR colors
+    /// and every other overflow field (DECSERA's selective wipe).
     ///
-    /// Returns `true` when, after scrubbing, the entry holds no data and the
-    /// caller should drop it (and clear the cell's HAS_EXTRAS flag to keep the
-    /// flag ⇔ entry-exists invariant). Returns `false` when there is no entry
-    /// or color-bearing data remains. Used by DECSERA's selective wipe to keep
-    /// truecolor/underline overflow while removing stale combining marks.
+    /// Returns `true` when the entry is left empty and the caller should drop it
+    /// (and clear the cell's HAS_EXTRAS flag, keeping flag ⇔ entry); `false` when
+    /// there is no entry or data remains.
     pub(crate) fn scrub_char_marks(&mut self, row: u16, col: u16) -> bool {
         let coord = self.internal_coord(CellCoord::new(row, col));
         let Some(extra) = self.data.get_mut(&coord) else {
@@ -1435,18 +1268,18 @@ impl CellExtras {
         !extra.has_data()
     }
 
-    /// Clear extras for a single row, including the RGB ring (so no stale
-    /// truecolor remains). Called when a row is cleared or scrolls off.
+    /// Clear extras for a single row (cleared or scrolled off), including the RGB
+    /// ring.
     pub(crate) fn clear_row(&mut self, row: u16) {
-        // Clear RGB ring unconditionally — it may have data even when the
-        // HashMap is empty (RGB-only writes bypass the HashMap).
+        // The RGB ring first: RGB-only writes bypass the map, so it may hold
+        // data even when the map is empty.
         if let Some(ring) = &mut self.rgb_ring {
             ring.clear_row(row);
         }
         if self.data.is_empty() {
             return;
         }
-        #[cfg(any(test, feature = "testing"))]
+        #[cfg(any(test, debug_assertions))]
         crate::test_counters::count_extras_clear_ops(self.data.len());
         let internal_row = self.internal_row(row);
         self.data.retain(|coord, _| coord.row != internal_row);
@@ -1455,22 +1288,19 @@ impl CellExtras {
 
     /// Clear extras for a range of columns in a row, including the RGB ring.
     pub fn clear_range(&mut self, row: u16, start_col: u16, end_col: u16) {
-        // Clear RGB ring unconditionally — it may have data even when the
-        // HashMap is empty (RGB-only writes bypass the HashMap).
         if let Some(ring) = &mut self.rgb_ring {
             ring.clear_range(row, start_col, end_col);
         }
         if self.data.is_empty() {
             return;
         }
-        #[cfg(any(test, feature = "testing"))]
+        #[cfg(any(test, debug_assertions))]
         crate::test_counters::count_extras_clear_ops(self.data.len());
         let internal_row = self.internal_row(row);
-        // The map is keyed by coordinate, so delete the range's keys directly
-        // (O(range) probes) instead of scanning every entry. When the map is
-        // smaller than the range, the scan is cheaper; both remove the same
-        // keys. `clear_row` keeps its retain: it has no column bound and must
-        // reach stale entries past the current width.
+        // Delete the range's keys directly (O(range) probes) unless the map is
+        // smaller than the range, where the scan is cheaper. `clear_row` keeps
+        // its retain: it has no column bound and must reach stale entries past
+        // the current width.
         let width = usize::from(end_col.saturating_sub(start_col));
         if width.saturating_mul(2) <= self.data.len() {
             for col in start_col..end_col {
@@ -1487,15 +1317,13 @@ impl CellExtras {
     /// Clear extras for a range of rows in a single pass, including the RGB
     /// ring.
     pub(crate) fn clear_rows(&mut self, rows: core::ops::Range<u16>) {
-        // Clear RGB ring unconditionally — it may have data even when the
-        // HashMap is empty (RGB-only writes bypass the HashMap).
         if let Some(ring) = &mut self.rgb_ring {
             ring.clear_rows(rows.clone());
         }
         if rows.is_empty() || self.data.is_empty() {
             return;
         }
-        #[cfg(any(test, feature = "testing"))]
+        #[cfg(any(test, debug_assertions))]
         crate::test_counters::count_extras_clear_ops(self.data.len());
         let offset = self.row_offset;
         self.data.retain(|coord, _| {
@@ -1505,26 +1333,20 @@ impl CellExtras {
         self.maybe_shrink();
     }
 
-    /// Clear extras inside a rectangular area in a single pass.
-    ///
-    /// Also clears the RGB and complex-char rings, which may hold data even
-    /// when the HashMap is empty (the fast write paths populate them
-    /// directly); a rect overwrite (e.g. DECCRA) must wipe them.
+    /// Clear extras inside a rectangular area in one pass, including both rings,
+    /// which the fast write paths fill directly (a DECCRA overwrite must wipe
+    /// them).
     pub(crate) fn clear_rect(&mut self, rows: core::ops::Range<u16>, cols: core::ops::Range<u16>) {
-        // Clear RGB ring unconditionally — it may have data even when the
-        // HashMap is empty (RGB-only writes bypass the HashMap).
         if let Some(ring) = &mut self.rgb_ring {
             ring.clear_rect(rows.clone(), cols.clone());
         }
-        // Clear the complex-char ring for the same reason: a complex cell's
-        // codepoint lives in the dense ring, not the HashMap.
         if let Some(ring) = &mut self.complex_ring {
             ring.clear_rect(rows.clone(), cols.clone());
         }
         if rows.is_empty() || cols.is_empty() || self.data.is_empty() {
             return;
         }
-        #[cfg(any(test, feature = "testing"))]
+        #[cfg(any(test, debug_assertions))]
         crate::test_counters::count_extras_clear_ops(self.data.len());
         let offset = self.row_offset;
         self.data.retain(|coord, _| {
@@ -1534,19 +1356,11 @@ impl CellExtras {
         self.maybe_shrink();
     }
 
-    /// Batch shift rows up by `n` (for multi-line scroll).
-    ///
-    /// Rows in `[start_row, start_row + n)` are deleted.
-    /// Rows >= `start_row + n` are shifted up by `n`.
-    /// Rows < `start_row` are preserved unchanged.
-    ///
-    /// When `start_row == 0` (full-screen scroll), uses O(1) offset
-    /// amortization: just bumps `row_offset` without touching entries.
-    /// Compacts every `COMPACT_THRESHOLD` accumulated scroll rows.
-    ///
-    /// When `start_row > 0`, compacts first then uses drain-rebuild.
+    /// Shift rows up by `n` (multi-line scroll): rows `[start_row, start_row + n)`
+    /// drop, rows below move up by `n`, rows above stay. A full-screen scroll
+    /// (`start_row == 0`) only bumps `row_offset` until it reaches
+    /// `COMPACT_THRESHOLD`; otherwise the map is compacted and rebuilt.
     pub fn shift_rows_up_by(&mut self, start_row: u16, n: u16) {
-        // Scroll the complex char ring buffer.
         if let Some(ring) = &mut self.complex_ring {
             if start_row == 0 {
                 ring.scroll_up(n);
@@ -1554,7 +1368,6 @@ impl CellExtras {
                 ring.clear();
             }
         }
-        // Scroll the RGB color ring buffer.
         if let Some(ring) = &mut self.rgb_ring {
             if start_row == 0 {
                 ring.scroll_up(n);
@@ -1570,7 +1383,7 @@ impl CellExtras {
             if let Some(new_offset) = self.row_offset.checked_add(n)
                 && new_offset < COMPACT_THRESHOLD
             {
-                #[cfg(any(test, feature = "testing"))]
+                #[cfg(any(test, debug_assertions))]
                 crate::test_counters::count_extras_shift_ops(0);
                 self.row_offset = new_offset;
                 return;
@@ -1579,9 +1392,9 @@ impl CellExtras {
             self.apply_offset_and_shift(n);
             return;
         }
-        // Non-zero start_row: compact first (sets offset=0), then drain-rebuild.
+        // Partial scroll: compact (offset to 0), then drain-rebuild.
         self.compact();
-        #[cfg(any(test, feature = "testing"))]
+        #[cfg(any(test, debug_assertions))]
         crate::test_counters::count_extras_shift_ops(self.data.len());
         let shift_start = start_row.checked_add(n);
         let mut new_data =
@@ -1599,7 +1412,6 @@ impl CellExtras {
                     extra,
                 );
             }
-            // Rows in [start_row, start_row + n) are deleted
         }
         self.data = new_data;
     }
@@ -1607,11 +1419,8 @@ impl CellExtras {
     // Region shifts (shift_region_up_by, shift_region_down_by) and column
     // shifts (shift_cols_right, shift_cols_left) are in extra_collection_shifts.rs.
 
-    /// Batch-set uniform extras for a contiguous column range on the same row.
-    ///
-    /// Faster than per-cell `get_or_create` when all cells share the same
-    /// extras (RGB-styled ASCII runs). RGB-only extras (no hyperlinks,
-    /// underline color, or extended flags) go to the dense ring buffer.
+    /// Set the same extras on a contiguous column range of one row (an RGB-styled
+    /// ASCII run) in one pass; RGB-only extras go to the dense ring.
     #[inline]
     pub(crate) fn set_range_uniform(
         &mut self,
@@ -1626,22 +1435,16 @@ impl CellExtras {
             return;
         }
 
-        // Fast path: RGB-only extras use the dense ring buffer (O(1) per cell).
+        // RGB-only extras go to the dense ring.
         let is_rgb_only =
             vals.hyperlink.is_none() && vals.underline_color.is_none() && vals.extended_flags == 0;
         if is_rgb_only && (vals.fg_rgb.is_some() || vals.bg_rgb.is_some()) {
             // The ring path writes no map entry, so it cannot start its cells
-            // fresh as the map path does: an orphan keyed under the run would
-            // be claimed as-is by the HAS_EXTRAS bit the writer set. Ruling
-            // 2026-10-11 (r15 C2 review): no sweep here. Dropping the run's
-            // keys costs a hash probe per cell whenever the map holds entries
-            // anywhere (measured: +10% instructions and cycles on truecolor
-            // text with an OSC 8 link every six lines, +6% under a linked
-            // header), so orphans are closed where they are made:
-            // every operation that blanks or moves cells drops what they no
-            // longer claim (`Grid::drop_unclaimed_extras`), and the process
-            // fuzzers and the read-boundary differential assert
-            // `Grid::assert_extras_claimed` after every step.
+            // fresh: an orphan keyed under the run would be claimed by the
+            // HAS_EXTRAS bit the writer set. No sweep here (a probe per cell cost
+            // +10% instructions on truecolor text with periodic OSC 8 links):
+            // orphans are closed where they are made (`Grid::drop_unclaimed_extras`),
+            // which `Grid::assert_extras_claimed` checks.
             self.set_rgb_ring_range(
                 row,
                 col_start,
@@ -1654,10 +1457,8 @@ impl CellExtras {
             return;
         }
 
-        // Build the shared (url, id) payload once for the run, so every cell
-        // holds the same `Arc` instead of allocating its own. The stored value
-        // equals `set_hyperlink(url)` then `set_hyperlink_id(id)`. Cells that
-        // later edit their link copy-on-write inside `CellExtra`.
+        // Build the shared (url, id) payload once, so every cell holds the same
+        // `Arc`; a cell that later edits its link copies on write.
         let hyperlink = vals.hyperlink.map(|url| {
             Arc::new(crate::extra::HyperlinkData {
                 url: Arc::clone(url),
@@ -1672,9 +1473,7 @@ impl CellExtras {
         let mut replaced_links = 0usize;
         for col in col_start..col_end {
             let coord = CellCoord::new(internal_row, col);
-            // The writer just wrote these cells and dropped the entries of those
-            // that carried HAS_EXTRAS, so an entry still keyed here is an orphan:
-            // start each cell fresh rather than merge into it (`Self::fresh`).
+            // An entry still keyed here is an orphan: start fresh (`Self::fresh`).
             let (extra, had_link) = fresh_slot(&mut self.data, coord);
             replaced_links += usize::from(had_link);
             if let Some(rgb) = vals.fg_rgb {
@@ -1695,27 +1494,20 @@ impl CellExtras {
         }
 
         self.hyperlink_upper_bound = self.hyperlink_upper_bound.saturating_sub(replaced_links);
-        // Enforce hyperlink limit after batch insertion.
         if vals.hyperlink.is_some() {
             self.hyperlink_upper_bound += usize::from(col_end - col_start);
             self.enforce_hyperlink_limit();
         }
     }
 
-    /// Clear all extras, releasing excess capacity.
-    ///
-    /// Unlike `HashMap::clear()` which retains capacity, this replaces the
-    /// map entirely so memory from peak usage is reclaimed. This matters
-    /// after hyperlink-heavy sessions where the map may have grown large.
+    /// Clear all extras, releasing capacity: a new map (unlike `HashMap::clear`)
+    /// reclaims the memory of a hyperlink-heavy peak.
     #[inline]
     pub fn clear(&mut self) {
         self.data = FxHashMap::default();
         self.row_offset = 0;
-        // Exact, not conservative: the map is gone, so the hyperlink population
-        // is zero. ESC[2J therefore hands the guard a clean slate.
+        // Exact: every link and image ref lived in the replaced map.
         self.hyperlink_upper_bound = 0;
-        // Same reasoning for the image gate: every image ref lived in the map
-        // that was just replaced, so there is provably none left to scan for.
         self.any_image = false;
         if let Some(ring) = &mut self.complex_ring {
             ring.clear();
@@ -1726,9 +1518,6 @@ impl CellExtras {
     }
 
     /// Region shift up by `n` within rows `[top, bottom]` on both rings.
-    ///
-    /// Cells outside `[top, bottom]` keep their truecolor and complex-char ring
-    /// data, and cells shifted within the region move with the row.
     #[inline]
     pub(crate) fn shift_rings_region_up(&mut self, top: u16, bottom: u16, n: u16) {
         if let Some(ring) = &mut self.complex_ring {
@@ -1739,7 +1528,7 @@ impl CellExtras {
         }
     }
 
-    /// Region shift down by `n` within rows `[top, bottom]` on BOTH rings.
+    /// Region shift down by `n` within rows `[top, bottom]` on both rings.
     #[inline]
     pub(crate) fn shift_rings_region_down(&mut self, top: u16, bottom: u16, n: u16) {
         if let Some(ring) = &mut self.complex_ring {
@@ -1750,7 +1539,7 @@ impl CellExtras {
         }
     }
 
-    /// Rect shift up within `[top, bottom]` × `[left, right]` on BOTH rings.
+    /// Rect shift up within `[top, bottom]` × `[left, right]` on both rings.
     #[inline]
     pub(crate) fn shift_rings_rect_up(
         &mut self,
@@ -1768,7 +1557,7 @@ impl CellExtras {
         }
     }
 
-    /// Rect shift down within `[top, bottom]` × `[left, right]` on BOTH rings.
+    /// Rect shift down within `[top, bottom]` × `[left, right]` on both rings.
     #[inline]
     pub(crate) fn shift_rings_rect_down(
         &mut self,
@@ -1786,7 +1575,7 @@ impl CellExtras {
         }
     }
 
-    /// Column shift right (ICH) on one row for BOTH rings.
+    /// Column shift right (ICH) on one row on both rings.
     #[inline]
     pub(crate) fn shift_rings_cols_right(
         &mut self,
@@ -1803,7 +1592,7 @@ impl CellExtras {
         }
     }
 
-    /// Column shift left (DCH) on one row for BOTH rings.
+    /// Column shift left (DCH) on one row on both rings.
     #[inline]
     pub(crate) fn shift_rings_cols_left(
         &mut self,
@@ -1820,20 +1609,15 @@ impl CellExtras {
         }
     }
 
-    /// Apply accumulated row offset, resetting internal keys to external coords.
-    ///
-    /// Must be called before any operation that directly accesses `self.data`
-    /// with external coordinates (reflow, direct `data.retain`, etc.).
-    ///
-    /// O(E) drain-rebuild — but only when `row_offset > 0`.
+    /// Apply the accumulated row offset, re-keying entries to external coords.
+    /// Call before touching `self.data` with external coordinates (reflow, a
+    /// direct `data.retain`). O(E), and only when `row_offset > 0`.
     pub(crate) fn compact(&mut self) {
         self.apply_offset_and_shift(0);
     }
 
-    /// Take the accumulated row offset, resetting it to 0.
-    ///
-    /// Returns the previous offset. Used by region shift operations to
-    /// combine offset compaction and key shifting into a single drain pass.
+    /// Take the accumulated row offset, resetting it to 0, so a region shift can
+    /// compact and shift keys in one drain pass.
     #[inline]
     pub(crate) fn take_row_offset(&mut self) -> u16 {
         let offset = self.row_offset;
@@ -1848,39 +1632,35 @@ impl CellExtras {
         self.row_offset
     }
 
-    /// Apply accumulated `row_offset` plus an additional `shift` in a single pass.
+    /// Apply the accumulated `row_offset` plus an additional `shift` in one pass:
+    /// drop stale entries and those scrolled off (external row < shift), re-key
+    /// survivors to offset 0, then enforce the hyperlink limit.
     ///
-    /// Discards stale entries (internal row < current offset) and entries that
-    /// are being scrolled off (external row < shift). Re-keys survivors to
-    /// offset 0, then enforces the hyperlink entry limit.
-    ///
-    /// `#[inline(never)]` is required: this sits on the scroll path, and under
-    /// `lto = true` + `codegen-units = 1` its body size decides an inlining
-    /// cascade that the mixed-VT workload is very sensitive to. Pinning this
-    /// caller (not `enforce_hyperlink_limit` itself) keeps edits to the
-    /// hyperlink-limit code from shifting that cascade.
+    /// `#[inline(never)]` (here and on `apply_offset_and_shift_only`): on the
+    /// scroll path under `lto = true` + `codegen-units = 1`, its body size decides
+    /// an inlining cascade the mixed-VT workload is sensitive to. Pinning these,
+    /// not `enforce_hyperlink_limit`, keeps hyperlink-limit edits from shifting it.
     #[inline(never)]
     fn apply_offset_and_shift(&mut self, shift: u16) {
         self.apply_offset_and_shift_only(shift);
         self.enforce_hyperlink_limit();
     }
 
-    /// The compaction core without the trailing hyperlink-limit enforcement, so
+    /// The compaction core without the hyperlink-limit enforcement, so
     /// [`Self::enforce_hyperlink_limit_cold`] can compact without recursing.
-    /// `#[inline(never)]` for the same reason as its caller above.
     #[inline(never)]
     fn apply_offset_and_shift_only(&mut self, shift: u16) {
         let total = match self.row_offset.checked_add(shift) {
             Some(0) => return,
             Some(t) => t,
             None => {
-                // Overflow: offset + shift > u16::MAX — all entries scrolled off.
+                // offset + shift > u16::MAX: every entry scrolled off.
                 self.data.clear();
                 self.row_offset = 0;
                 return;
             }
         };
-        #[cfg(any(test, feature = "testing"))]
+        #[cfg(any(test, debug_assertions))]
         crate::test_counters::count_extras_shift_ops(self.data.len());
         let mut new_data =
             FxHashMap::with_capacity_and_hasher(self.data.len(), aterm_hash::FxBuildHasher);
@@ -1888,17 +1668,13 @@ impl CellExtras {
             if coord.row >= total {
                 new_data.insert(CellCoord::new(coord.row - total, coord.col), extra);
             }
-            // Entries with internal row < total are stale or scrolled off
         }
         self.data = new_data;
         self.row_offset = 0;
     }
 
-    /// Shrink internal storage if capacity significantly exceeds usage.
-    ///
-    /// Called after retain-based operations that may have removed many entries.
-    /// Threshold: shrink when capacity > 4x len and capacity > 64 (avoid thrashing
-    /// on small maps).
+    /// Shrink the map after retain-style removals when capacity exceeds 4x len
+    /// (and 64, to avoid thrashing small maps).
     #[inline]
     pub(crate) fn maybe_shrink(&mut self) {
         let cap = self.data.capacity();
@@ -1926,10 +1702,8 @@ impl CellExtras {
         base.saturating_add(extras_mem).saturating_add(rgb_mem)
     }
 
-    /// Number of valid (non-stale) extras entries.
-    ///
-    /// Accounts for row offset: entries with internal row below the offset
-    /// are stale (scrolled off) and excluded from the count.
+    /// Number of valid extras entries (excluding those scrolled off under the
+    /// row offset).
     #[must_use]
     pub fn len(&self) -> usize {
         if self.row_offset == 0 {
@@ -1949,32 +1723,23 @@ impl CellExtras {
         self.data.capacity()
     }
 
-    /// Drop ring buffers so they are re-created with current dimensions
-    /// on the next write.
-    ///
-    /// Called when the grid dimensions change (resize) to prevent the ring
-    /// buffers from using stale `stride`/`visible_rows` values that would
-    /// produce incorrect flat-array indexing.
+    /// Drop the ring buffers on resize, so the next write re-creates them with
+    /// the current `stride`/`visible_rows` instead of indexing with stale ones.
     pub(crate) fn invalidate_rings(&mut self) {
         self.complex_ring = None;
         self.rgb_ring = None;
     }
 
-    /// Whether the dense RGB ring exists. The ring is created lazily by the
-    /// first ring-stored 24-bit write after each [`Self::invalidate_rings`], so
-    /// `false` means no truecolor was written since the last resize (or ever):
-    /// the resize's harvest of ring colours into the persistent map has nothing
-    /// to read.
+    /// Whether the dense RGB ring exists. It is created by the first ring-stored
+    /// truecolor write after each [`Self::invalidate_rings`], so `false` means
+    /// the resize's harvest of ring colours into the map has nothing to read.
     #[inline]
     pub(crate) fn has_rgb_ring(&self) -> bool {
         self.rgb_ring.is_some()
     }
 
-    /// Remove all extras in rows `>= max_row` (external coordinates).
-    ///
-    /// Compacts first so the retain operates on external coordinates,
-    /// then shrinks if the map became oversized. Used by the reflow path
-    /// to discard extras beyond the visible area.
+    /// Remove all extras in rows `>= max_row` (external coordinates), for the
+    /// reflow path.
     pub(crate) fn retain_rows_below(&mut self, max_row: u16) {
         if self.data.is_empty() {
             return;
@@ -1984,10 +1749,8 @@ impl CellExtras {
         self.maybe_shrink();
     }
 
-    /// Remove all extras in columns `>= max_col` (external coordinates).
-    ///
-    /// Compacts first so the retain operates on external coordinates, then
-    /// shrinks if the map became oversized. Used by the no-reflow resize path.
+    /// Remove all extras in columns `>= max_col` (external coordinates), for the
+    /// no-reflow resize path.
     pub(crate) fn retain_cols_below(&mut self, max_col: u16) {
         if self.data.is_empty() {
             return;
@@ -1997,9 +1760,7 @@ impl CellExtras {
         self.maybe_shrink();
     }
 
-    /// Check if any cell in a row has a hyperlink.
-    ///
-    /// O(E) linear scan over all extras entries.
+    /// Check if any cell in a row has a hyperlink (O(E) scan).
     #[must_use]
     #[cfg(test)]
     pub fn row_has_hyperlinks(&self, row: u16) -> bool {
@@ -2009,29 +1770,15 @@ impl CellExtras {
             .any(|(coord, extra)| coord.row == internal_row && extra.hyperlink().is_some())
     }
 
-    /// Enforce the hyperlink entry limit to prevent unbounded memory growth.
-    ///
-    /// When the number of hyperlink-bearing entries may exceed
-    /// [`MAX_HYPERLINK_ENTRIES`] (see `hyperlink_upper_bound`), evicts
-    /// hyperlink data from the oldest entries (lowest internal rows) until
-    /// within budget. Entries keep their other extras; an entry left empty is
-    /// deleted.
-    ///
-    /// Call after setting hyperlinks, to bound memory under OSC 8 spam.
+    /// Enforce the hyperlink entry limit (bounding memory under OSC 8 spam):
+    /// when the population may exceed [`MAX_HYPERLINK_ENTRIES`], drop the links
+    /// of the oldest entries (lowest internal rows). Entries keep their other
+    /// extras; one left empty is deleted.
     #[inline]
     pub fn enforce_hyperlink_limit(&mut self) {
         // Two sound upper bounds on the hyperlink population; either proving
-        // "under budget" skips the cold path, and `||` keeps the common case to
-        // one load and branch.
-        //
-        // `hyperlink_upper_bound` tracks links specifically, so a map full of
-        // other extras (inline images, underline colours) does not force a
-        // walk. `data.len()` is kept as well because the counter over-charges
-        // by design (`get_or_create` charges every handout to a link-free entry,
-        // including SGR 58 underlines, combining marks and RGB overflow), and a
-        // link-free workload would otherwise buy a futile walk every
-        // `MAX_HYPERLINK_ENTRIES` handouts even on a small map
-        // (`small_map_never_walks_however_inflated_the_counter`).
+        // "under budget" skips the cold walk. `data.len()` caps the counter's
+        // over-charge (`get_or_create` charges every link-free handout).
         if self.hyperlink_upper_bound <= MAX_HYPERLINK_ENTRIES
             || self.data.len() <= MAX_HYPERLINK_ENTRIES
         {
@@ -2044,13 +1791,12 @@ impl CellExtras {
     #[inline(never)]
     fn enforce_hyperlink_limit_cold(&mut self) {
         let mut compacted = false;
-        // Reached only when the conservative `hyperlink_upper_bound` says the
-        // population might be over budget. One walk into a resident buffer, no
-        // allocation; it decides and repairs the bound with the exact count.
+        // One walk into the resident scratch buffer; it decides with the exact
+        // count and repairs the bound.
         let mut coords = std::mem::take(&mut self.hyperlink_scratch);
         loop {
             coords.clear();
-            #[cfg(any(test, feature = "testing"))]
+            #[cfg(any(test, debug_assertions))]
             crate::test_counters::count_hyperlink_walk_ops(self.data.len());
             coords.extend(
                 self.data
@@ -2058,9 +1804,7 @@ impl CellExtras {
                     .filter(|(_, extra)| extra.hyperlink().is_some())
                     .map(|(coord, _)| *coord),
             );
-            // The bound must never be below the truth, or the limit stops being
-            // enforced; the walk knows the truth, so check it here. Fires in
-            // debug/test builds on an insertion path that forgets to charge.
+            // Catches an insertion path that forgets to charge the bound.
             debug_assert!(
                 self.hyperlink_upper_bound >= coords.len(),
                 "hyperlink_upper_bound {} under-counts the {} hyperlink entries \
@@ -2069,43 +1813,32 @@ impl CellExtras {
                 coords.len()
             );
 
-            // The map may hold non-hyperlink extras (RGB, combining, underline)
-            // that do not count toward the limit.
             if coords.len() <= MAX_HYPERLINK_ENTRIES {
-                // Repair: the walk established the exact population, erasing
-                // the conservative drift since the last walk.
+                // The walk counted exactly: repair the bound.
                 self.hyperlink_upper_bound = coords.len();
                 break;
             }
 
-            // Genuinely over. Entries already scrolled off under the row offset
-            // are unreachable but still counted, so compact first and retry,
-            // at most once (compaction zeroes `row_offset`).
+            // Over. Entries scrolled off under the row offset are unreachable but
+            // still counted, so compact and retry, at most once.
             if !compacted && self.row_offset != 0 {
                 compacted = true;
                 self.apply_offset_and_shift_only(0);
                 continue;
             }
 
-            // `coords.len() > MAX_HYPERLINK_ENTRIES > HYPERLINK_LOW_WATER`, so
-            // the `to_evict - 1` pivot below is always in range.
             // Evict to a low-water mark, not the ceiling: trimming to exactly
             // `MAX_HYPERLINK_ENTRIES` would make the next insert re-enter this
             // path, and checkpoint restore (`Grid::fill_row_from_line`) calls it
-            // once per row. Trimming to 75% buys `MAX_HYPERLINK_ENTRIES / 4`
-            // inserts of headroom; the map still never exceeds the maximum.
+            // once per row. `to_evict >= 1` since `coords.len() > MAX > LOW_WATER`.
             const HYPERLINK_LOW_WATER: usize = MAX_HYPERLINK_ENTRIES * 3 / 4;
             let to_evict = coords.len() - HYPERLINK_LOW_WATER;
 
-            // Only the `to_evict` smallest coords are needed, so partition
-            // instead of sorting (O(n)). The evicted set is identical: keys are
-            // unique and each is cleared independently.
+            // Only the `to_evict` smallest coords are needed: partition, not sort.
             coords.select_nth_unstable_by(to_evict - 1, |a, b| {
                 a.row.cmp(&b.row).then(a.col.cmp(&b.col))
             });
 
-            // `coords` is a local (moved out of `self`), so iterating it while
-            // mutating `self.data` is not a borrow conflict.
             for &coord in &coords[..to_evict] {
                 if let Some(extra) = self.data.get_mut(&coord) {
                     extra.set_hyperlink(None);
@@ -2115,15 +1848,12 @@ impl CellExtras {
                 }
             }
 
-            // Exactly `to_evict` links were dropped, so the population is now
-            // the low-water mark.
             self.hyperlink_upper_bound = HYPERLINK_LOW_WATER;
 
             self.maybe_shrink();
             break;
         }
-        // Hand the buffer back EMPTIED but with its capacity, on every exit —
-        // that capacity is the whole point of the field.
+        // Return the buffer empty but with its capacity, on every exit.
         coords.clear();
         self.hyperlink_scratch = coords;
     }
@@ -2150,43 +1880,34 @@ impl CellExtras {
 mod tests {
     use super::*;
 
-    // =========================================================================
-    // ComplexCharRing stride bounds-check tests
-    // =========================================================================
+    // ComplexCharRing stride bounds checks
 
-    /// Reading a column at or beyond the ring's stride must return None,
-    /// not bleed into the next ring row's data.
+    /// A column at or past the stride reads `None`, not the next ring row's data.
     #[test]
     fn test_complex_ring_get_col_at_stride_returns_none() {
         let mut ring = ComplexCharRing::new(4, 10);
-        // Place an emoji at row 0, col 0 and row 1, col 0.
         ring.set(0, 0, '\u{1F389}');
         ring.set(1, 0, '\u{1F680}');
         assert_eq!(ring.get(0, 0), Some('\u{1F389}'));
         assert_eq!(ring.get(1, 0), Some('\u{1F680}'));
 
-        // col == stride (10): without the bounds check this would alias to
-        // row 1, col 0 and return the rocket emoji.
+        // col == stride would alias to (1, 0), the rocket.
         assert_eq!(
             ring.get(0, 10),
             None,
             "col == stride should return None, not cross-row data"
         );
-        // col well beyond stride.
         assert_eq!(ring.get(0, 100), None, "col >> stride should return None");
     }
 
-    /// Writing to a column at or beyond stride must be a no-op — it must not
-    /// corrupt another row's slot.
+    /// A write at or past the stride is a no-op, never another row's slot.
     #[test]
     fn test_complex_ring_set_col_at_stride_is_noop() {
         let mut ring = ComplexCharRing::new(4, 10);
-        // Write beyond stride: would alias to row 1, col 0 without the guard.
+        // Without the guard these alias to (1, 0) and (1, 5).
         ring.set(0, 10, '\u{1F680}');
-        // Write beyond stride: would alias to row 1, col 5 without the guard.
         ring.set(0, 15, '\u{2764}');
 
-        // The aliased slots must remain empty.
         assert_eq!(
             ring.get(1, 0),
             None,
@@ -2199,19 +1920,15 @@ mod tests {
         );
     }
 
-    /// Scrolling the complex ring by `n >= visible_rows` (e.g. `CSI 65535 S`)
-    /// fully recycles it and resets `ring_offset` to 0; a freshly written
-    /// non-BMP char then reads back correctly.
+    /// `scroll_up(n >= visible_rows)` (e.g. `CSI 65535 S`) recycles the whole
+    /// ring and resets `ring_offset`; later writes read back.
     #[test]
     fn test_complex_ring_overscroll_resets_offset() {
         let mut ring = ComplexCharRing::new(24, 10);
         ring.set(0, 0, '\u{1F389}');
-        // Scroll the whole visible area (and more) off in one operation.
         ring.scroll_up(65535);
-        // Offset is back to a clean state and the old char is gone.
         assert_eq!(ring.ring_offset, 0, "over-scroll must reset ring_offset");
         assert_eq!(ring.get(0, 0), None, "scrolled-off char must be cleared");
-        // A subsequent write must land in a readable slot (no index corruption).
         ring.set(5, 3, '\u{1F680}');
         assert_eq!(
             ring.get(5, 3),
@@ -2220,8 +1937,7 @@ mod tests {
         );
     }
 
-    /// For the RGB ring, `scroll_up(n >= visible_rows)` resets `ring_offset`
-    /// and later truecolor writes stay readable.
+    /// The same for the RGB ring.
     #[test]
     fn test_rgb_ring_overscroll_resets_offset() {
         let mut ring = RgbColorRing::new(24, 10);
@@ -2245,10 +1961,9 @@ mod tests {
         );
     }
 
-    /// `fill_runs` (one slice `fill` per plane per run) leaves the ring exactly
-    /// as looping the per-cell `set_fg`/`set_bg` does, across geometries and
-    /// ranges: empty runs, runs overhanging `stride`, and fully out-of-range
-    /// runs (which must not allocate the plane).
+    /// `fill_runs` leaves the ring exactly as per-cell `set_fg`/`set_bg` does,
+    /// including empty, overhanging and fully out-of-range runs (which must not
+    /// allocate the plane).
     #[test]
     fn fill_run_matches_per_cell_set() {
         let rgb_f = [17u8, 34, 51];
@@ -2299,14 +2014,12 @@ mod tests {
         }
     }
 
-    /// `RgbColorRing::clear_range`'s slice fill leaves the planes exactly as a
-    /// per-column `get_mut` loop would, across geometries and ranges (empty,
-    /// inverted, overhanging `stride`, out of range, a stale `row >=
-    /// visible_rows`, non-zero ring offsets). Clearing never allocates an
-    /// absent plane.
+    /// `RgbColorRing::clear_range` leaves the planes exactly as a per-column loop
+    /// does, including a stale `row >= visible_rows` and non-zero ring offsets,
+    /// and never allocates an absent plane.
     #[test]
     fn clear_range_matches_per_cell_clear() {
-        // The pre-optimization body, kept verbatim as the reference oracle.
+        // Reference oracle: the per-column loop.
         fn clear_range_per_cell(ring: &mut RgbColorRing, row: u16, start_col: u16, end_col: u16) {
             for col in start_col..end_col {
                 if col >= ring.stride {
@@ -2372,8 +2085,7 @@ mod tests {
         }
     }
 
-    /// Exactly `n == visible_rows` is the boundary of the over-scroll guard and
-    /// must also fully clear and reset (the entire visible area scrolled off).
+    /// `n == visible_rows`, the over-scroll guard's boundary, also clears and resets.
     #[test]
     fn test_complex_ring_scroll_exactly_visible_rows() {
         let mut ring = ComplexCharRing::new(4, 10);
@@ -2385,8 +2097,8 @@ mod tests {
         assert_eq!(ring.get(0, 0), Some('\u{1F600}'));
     }
 
-    /// Same for `ComplexCharRing::clear_range` (DECERA/DECCRA path): one
-    /// `fill('\0')` equals a per-column `get_mut` store.
+    /// `ComplexCharRing::clear_range`'s one `fill('\0')` equals a per-column
+    /// store, across the same kinds of ranges.
     #[test]
     fn complex_clear_range_matches_per_cell_clear() {
         fn clear_range_per_cell(ring: &mut ComplexCharRing, row: u16, left: u16, right_excl: u16) {
@@ -2434,9 +2146,7 @@ mod tests {
         }
     }
 
-    // =========================================================================
-    // RgbColorRing stride bounds-check tests
-    // =========================================================================
+    // RgbColorRing stride bounds checks
 
     /// Reading fg/bg at a column at or beyond stride must return None.
     #[test]
@@ -2451,7 +2161,6 @@ mod tests {
         assert_eq!(ring.fg(0, 0), Some([255, 0, 0]));
         assert_eq!(ring.bg(0, 0), Some([0, 255, 0]));
 
-        // col == stride: must not bleed into row 1.
         assert_eq!(
             ring.fg(0, 10),
             None,
@@ -2462,7 +2171,6 @@ mod tests {
             None,
             "bg at col == stride should return None"
         );
-        // col well beyond stride.
         assert_eq!(
             ring.fg(0, 200),
             None,
@@ -2479,7 +2187,6 @@ mod tests {
     #[test]
     fn test_rgb_ring_set_col_at_stride_is_noop() {
         let mut ring = RgbColorRing::new(4, 10);
-        // Attempt writes beyond stride.
         ring.set_fg(0, 10, [255, 0, 0]);
         ring.set_bg(0, 10, [0, 255, 0]);
 
@@ -2496,12 +2203,10 @@ mod tests {
         );
     }
 
-    /// End-to-end: after writing data and then querying with an out-of-range
-    /// column, the ring buffer must not return stale cross-row entries.
+    /// After a scroll, an out-of-range column still reads `None`.
     #[test]
     fn test_complex_ring_scroll_then_oob_col_returns_none() {
         let mut ring = ComplexCharRing::new(4, 10);
-        // Fill row 0 fully.
         for col in 0..10 {
             ring.set(
                 0,
@@ -2509,10 +2214,9 @@ mod tests {
                 char::from_u32(0x1F600 + u32::from(col)).expect("valid char"),
             );
         }
-        // Scroll up by 1: row 0 is recycled, old row 1 becomes new row 0.
+        // Row 0 is recycled; old row 1 becomes row 0.
         ring.scroll_up(1);
 
-        // Query with col == stride on the new row 0 — must return None.
         assert_eq!(
             ring.get(0, 10),
             None,
@@ -2520,32 +2224,25 @@ mod tests {
         );
     }
 
-    // =========================================================================
-    // RgbColorRing erase clearing tests
-    // =========================================================================
+    // RgbColorRing erase clearing
 
     /// `RgbColorRing::clear_range` zeroes fg/bg for the specified column range.
     #[test]
     fn test_rgb_ring_clear_range_zeroes_entries() {
         let mut ring = RgbColorRing::new(4, 10);
-        // Populate cells 2..7 on row 1.
         for col in 2..7 {
             ring.set_fg(1, col, [255, 0, col as u8]);
             ring.set_bg(1, col, [0, 255, col as u8]);
         }
-        // Verify data is present.
         assert!(ring.fg(1, 3).is_some());
         assert!(ring.bg(1, 3).is_some());
 
-        // Clear range 3..6 on row 1.
         ring.clear_range(1, 3, 6);
 
-        // Cleared entries should be None.
         for col in 3..6 {
             assert_eq!(ring.fg(1, col), None, "fg at col {col} should be cleared");
             assert_eq!(ring.bg(1, col), None, "bg at col {col} should be cleared");
         }
-        // Entries outside the range should be preserved.
         assert!(ring.fg(1, 2).is_some(), "col 2 should be preserved");
         assert!(ring.fg(1, 6).is_some(), "col 6 should be preserved");
     }
@@ -2558,7 +2255,6 @@ mod tests {
             ring.set_fg(2, col, [col as u8, 0, 0]);
             ring.set_bg(2, col, [0, col as u8, 0]);
         }
-        // Also populate row 1 to verify it's not affected.
         ring.set_fg(1, 0, [42, 42, 42]);
 
         ring.clear_row(2);
@@ -2567,7 +2263,6 @@ mod tests {
             assert_eq!(ring.fg(2, col), None, "fg at col {col} should be cleared");
             assert_eq!(ring.bg(2, col), None, "bg at col {col} should be cleared");
         }
-        // Row 1 should be untouched.
         assert_eq!(
             ring.fg(1, 0),
             Some([42, 42, 42]),
@@ -2579,16 +2274,12 @@ mod tests {
     #[test]
     fn test_cell_extras_clear_range_clears_rgb_ring() {
         let mut extras = CellExtras::new();
-        // Write RGB-only data through the ring buffer path.
         extras.set_rgb_ring_range(0, 0, 5, Some([255, 0, 0]), Some([0, 0, 255]), 4, 10);
-        // Verify it's readable.
         assert_eq!(extras.fg_rgb_for(0, 2), Some([255, 0, 0]));
         assert_eq!(extras.bg_rgb_for(0, 2), Some([0, 0, 255]));
 
-        // Simulate erase: clear_range should remove ring data.
         extras.clear_range(0, 1, 4);
 
-        // Cleared cells should return None (no stale data).
         for col in 1..4 {
             assert_eq!(
                 extras.fg_rgb_for(0, col),
@@ -2601,7 +2292,6 @@ mod tests {
                 "bg_rgb at col {col} should be None after clear_range (#7697)"
             );
         }
-        // Cells outside the range should be preserved.
         assert_eq!(
             extras.fg_rgb_for(0, 0),
             Some([255, 0, 0]),
@@ -2707,10 +2397,8 @@ mod tests {
         }
         assert_eq!(extras.fg_rgb_for(2, 0), Some([2, 0, 0]));
 
-        // Clear rows 1..3.
         extras.clear_rows(1..3);
 
-        // Cleared rows should return None.
         for row in 1..3 {
             assert_eq!(
                 extras.fg_rgb_for(row, 0),
@@ -2718,7 +2406,6 @@ mod tests {
                 "row {row} should be cleared (#7697)"
             );
         }
-        // Rows 0 and 3 should be preserved.
         assert_eq!(extras.fg_rgb_for(0, 0), Some([0, 0, 0]));
         assert_eq!(extras.fg_rgb_for(3, 0), Some([3, 0, 0]));
     }
@@ -2732,10 +2419,8 @@ mod tests {
         }
         assert_eq!(extras.fg_rgb_for(1, 5), Some([255, 1, 0]));
 
-        // Clear rect rows 1..3, cols 3..7.
         extras.clear_rect(1..3, 3..7);
 
-        // Inside rect: should be cleared.
         for row in 1..3 {
             for col in 3..7 {
                 assert_eq!(
@@ -2745,7 +2430,6 @@ mod tests {
                 );
             }
         }
-        // Outside rect: should be preserved.
         assert_eq!(
             extras.fg_rgb_for(1, 2),
             Some([255, 1, 0]),
@@ -2861,8 +2545,7 @@ mod tests {
             assert_eq!(extra.hyperlink_id().map(|i| &**i), Some("run-1"));
         }
 
-        // Edit ONE cell's URL (which also clears that cell's stale id) and a
-        // DIFFERENT cell's id — the two single-cell mutators, one each.
+        // Edit one cell's URL (clearing its id) and another cell's id.
         let other: Arc<str> = Arc::from("https://example.com/other");
         extras
             .get_or_create(CellCoord::new(0, 1))
@@ -2883,7 +2566,7 @@ mod tests {
         assert_eq!(c2.hyperlink().map(|u| &**u), Some(RUN_URL));
         assert_eq!(c2.hyperlink_id().map(|i| &**i), Some("run-2"));
 
-        // The untouched cells of the run must still read the ORIGINAL pair.
+        // The untouched cells keep the original pair.
         for col in [0u16, 3] {
             let extra = extras.get(CellCoord::new(0, col)).expect("untouched entry");
             assert_eq!(

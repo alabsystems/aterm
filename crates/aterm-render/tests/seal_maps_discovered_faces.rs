@@ -1,55 +1,36 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-// macOS only, and deliberately narrower than `cfg(unix)`: the mapping rule is
-// the sealed system font volume (`font_file::maps_in_place` —
-// `/System/Library/Fonts`), which is where every discovered face lives on a
-// Mac and nowhere else. On Linux the discovered faces are copied by design
-// (their package roots are rewritten in place), so `copied == 0` cannot hold
-// there; on Windows `getrusage` does not exist and the binary would not link.
+// macOS only: the mapping rule is the sealed system font volume
+// (`font_file::maps_in_place`, `/System/Library/Fonts`), where every
+// discovered face lives on a Mac. On Linux discovered faces are copied by
+// design, so `copied == 0` cannot hold; Windows has no `getrusage`.
 #![cfg(target_os = "macos")]
 
-//! RESIDENCY PIN: THE SEAL MAPS ITS DISCOVERED FACES, IT DOES NOT COPY THEM.
+//! The seal maps its discovered faces; it does not copy them.
 //!
-//! `Renderer::seal_admitted_font_sources` is the windowed launch's font seal.
-//! It admits every path-backed face the generation will ever draw from — on a
-//! Mac: Hiragino Sans GB (23.5 MB) and Arial Unicode (23.3 MB) for the broad
-//! chain, STIX Two Math (0.8 MB) for the symbol slot, and Apple Color Emoji
-//! (192 MB) for colour — and it used to `read()` each one whole into an
-//! `Arc<Vec<u8>>` it then held for the process's life: ~240 MB of anonymous,
-//! per-process, non-evictable heap at every launch, ~80% of the measured
-//! 386 MB-vs-87 MB windowed/headless RSS gap, duplicated per window.
+//! `Renderer::seal_admitted_font_sources` admits every path-backed face the
+//! generation will draw from (on a Mac: Hiragino Sans GB and Arial Unicode,
+//! ~23 MB each, STIX Two Math, and Apple Color Emoji at 192 MB).
+//! `font_file::admit_font_file` maps a file on the system font volume
+//! (`PROT_READ`, `MAP_PRIVATE`): admission stays eager and inside the seal (the
+//! fd is opened, validated and mapped there, no pathname touched afterwards),
+//! but the pages are file-backed, shared through the page cache, evictable and
+//! faulted in only where touched. Copying them would be ~240 MB of
+//! non-evictable heap per process.
 //!
-//! Now `font_file::admit_font_file` MAPS a file on the system font volume
-//! (`PROT_READ`, `MAP_PRIVATE`) instead. Admission is still eager and still
-//! inside the seal — the fd is opened, validated and mapped there, and no
-//! pathname is touched afterwards — but the pages are file-backed: shared
-//! across processes through the page cache, evictable, and faulted in only
-//! for the tables and glyphs actually touched.
-//!
-//! Two observables, both in this test's own process:
-//!  * the generation's own report of how its discovered faces are held
-//!    (`AdmittedFontSources::discovered_residency`): every byte mapped, none
-//!    copied;
-//!  * the process's max RSS across the seal: the seal may not grow it by
-//!    anything like the size of the files it admitted. The old seal added the
-//!    whole ~240 MB; the bound here is 64 MiB, a quarter of that, with room for
-//!    the parse-time page faults and allocator noise of a debug build.
-//!
-//! Then a colour emoji and a CJK ideograph are drawn from the mapped faces,
-//! with real ink — the mapping is not a residency trick that lost the glyphs.
+//! Observables, in this process: `AdmittedFontSources::discovered_residency`
+//! reports every byte mapped and none copied; the seal grows max RSS by under
+//! 64 MiB (a quarter of the copy, with room for debug-build page faults); and a
+//! colour emoji and a CJK ideograph still draw real ink from the mapped faces.
 
 use aterm_render::{FaceId, Renderer, Theme};
 
 const MIB: u64 = 1024 * 1024;
 
-/// `struct rusage`, declared here because the workspace's first-party `libc`
-/// does not carry `getrusage` and is generated, not hand-edited. The layout is
-/// the same on macOS and Linux/glibc for the field this reads: two 16-byte
-/// `timeval`s (`ru_utime`, `ru_stime`) and then fourteen `c_long`s, the first
-/// of which is `ru_maxrss`. Only that field is read; the rest is padding to the
-/// kernel's write size (144 bytes on both), so an undersized out-parameter is
-/// impossible.
+/// `struct rusage`, declared here because the workspace's generated `libc`
+/// does not carry `getrusage`: two 16-byte `timeval`s, then fourteen `c_long`s,
+/// the first `ru_maxrss`, 144 bytes in all, the kernel's write size.
 #[repr(C)]
 struct Rusage {
     _times: [u8; 32],
@@ -93,6 +74,17 @@ fn ink(r: &mut Renderer, ch: char) -> (FaceId, usize) {
 fn the_seal_maps_every_discovered_face_and_does_not_grow_rss_by_their_size() {
     let mut r = Renderer::from_system(18.0, Theme::default())
         .expect("no font: build with aterm-render's default embedded-font feature");
+    // A host fact, from the files: a discovered face is a candidate file this
+    // host has (a bundled face is compiled in, not discovered).
+    let on_disk = |paths: &[String]| paths.iter().any(|p| std::path::Path::new(p).is_file());
+    if !(on_disk(r.debug_fallback_candidate_paths())
+        || on_disk(r.debug_symbol_candidate_paths())
+        || on_disk(r.debug_emoji_candidate_paths()))
+    {
+        aterm_spec::host::could_not_run(
+            "this host has none of the chain/symbol/emoji candidate files",
+        );
+    }
     let rss_before = max_rss_bytes();
     let started = std::time::Instant::now();
     let sources = r.seal_admitted_font_sources();
@@ -109,10 +101,10 @@ fn the_seal_maps_every_discovered_face_and_does_not_grow_rss_by_their_size() {
         rss_after / MIB,
         grew / MIB
     );
-    if mapped + copied == 0 {
-        eprintln!("SKIP: this host has no discovered chain/symbol/emoji face");
-        return;
-    }
+    assert!(
+        mapped + copied > 0,
+        "the seal admitted none of the candidate files this host has"
+    );
 
     assert_eq!(
         copied,
@@ -129,27 +121,18 @@ fn the_seal_maps_every_discovered_face_and_does_not_grow_rss_by_their_size() {
         mapped / MIB
     );
 
-    // The mapped faces must still DRAW. Emoji first (the biggest file, and the
-    // one whose eager admission `sealed_keeps_embedded_backstop` guards); then
-    // a CJK ideograph from the broad chain. Either may legitimately be absent
-    // on a host without that face, so each asserts only if it resolved there.
+    // The mapped faces still draw: emoji first (the biggest file, whose eager
+    // admission `sealed_keeps_embedded_backstop` guards), then a CJK ideograph
+    // from the broad chain. Each asserts only if it resolved on this host.
     let (emoji_source, emoji_ink) = ink(&mut r, '\u{1F680}');
     if emoji_source == FaceId::ColorEmoji {
         assert!(emoji_ink > 0, "the mapped colour-emoji face drew no ink");
     }
-    // The FIRST CJK draw is where the macOS raster path builds its CoreText
-    // font for the chain face. `CtFont::new` used to `CFDataCreate` — the
-    // COPYING constructor — over the whole 23.5 MB Hiragino collection: the
-    // copy faulted every mapped page in AND added 23.5 MB of anonymous heap,
-    // per (face, px). With `CFDataCreateWithBytesNoCopy` over the mapping
-    // CoreText reads the tables it needs and nothing else, so one glyph costs
-    // a few pages, not the file.
-    // Pay the process's FIRST CoreText raster before measuring: on macOS the
-    // first `CTFontDrawGlyphs`/`CGContextRelease` in a process allocates
-    // ~250 MiB of CoreText/CoreGraphics heap once, whatever the font (measured
-    // 2026-09-06: 1.0M CFStrings + 504k NSMutableArrays). A windowed process
-    // pays it at its post-seal prewarm; it is not the per-font cost this
-    // assertion is about.
+    // The first CJK draw builds the CoreText font for the chain face, over the
+    // mapping (`CFDataCreateWithBytesNoCopy`), so one glyph costs a few pages,
+    // not the 23.5 MB file. Pay the process's first CoreText raster before
+    // measuring: it allocates ~250 MiB of CoreText/CoreGraphics heap once,
+    // whatever the font, which a windowed process pays at its post-seal prewarm.
     let (ascii_source, _) = ink(&mut r, 'A');
     assert_eq!(ascii_source, FaceId::Primary);
     let rss_before_cjk = max_rss_bytes();

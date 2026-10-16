@@ -31,6 +31,12 @@ fn assert_rle_matches_model(rle: &Rle<u8>, model: &[u8], step: usize) {
         expected_start, rle.total_length,
         "run starts must accumulate to total_length at step {step}"
     );
+    let mut reference = rle.clone();
+    reference.compact();
+    assert_eq!(
+        rle.runs, reference.runs,
+        "local compact_around must match full compact() at step {step}"
+    );
 
     for (idx, expected) in model.iter().copied().enumerate() {
         let index = idx as u32;
@@ -138,6 +144,60 @@ fn rle_set_single_element() {
         assert_eq!(rle.get(index), Some(value), "{what}");
         assert_eq!(rle.run_count(), runs, "{what}: run count");
         assert_eq!(rle.len() as usize, start.len(), "{what}: length");
+    }
+}
+
+/// The public splice's observed run boundaries refine RleLocalCompactModel.
+/// Its negative control corrupts the captured topology as an omitted right
+/// merge would: the left boundary disappears but the equal right run stays.
+#[test]
+fn local_compaction_observations_refine_the_derived_model() {
+    let model = aterm_spec::derive::rle_local_compact_model();
+    for (splice, value) in [
+        (None, 2),
+        (Some("SpliceSameAsNeighbors"), 1),
+        (Some("SpliceDifferent"), 3),
+    ] {
+        let mut before = model.init_state();
+        if let Some(action) = splice {
+            assert!(model.fire(action, &mut before));
+        }
+        // Compact outer runs stay outside the splice's two boundaries.
+        let mut rle = Rle::from_iter([0u8, 1, 1, 2, 2, 2, 1, 1, 1, 1, 3]);
+        rle.set_range(3, 6, value);
+        let crosses =
+            |boundary| rle.find_run(boundary - 1).unwrap().0 == rle.find_run(boundary).unwrap().0;
+        let mut observed = before.clone();
+        observed.insert("left_val", i64::from(rle.get(2).unwrap()));
+        observed.insert("mid_val", i64::from(rle.get(3).unwrap()));
+        observed.insert("right_val", i64::from(rle.get(6).unwrap()));
+        observed.insert("merged_left", i64::from(crosses(3)));
+        observed.insert("merged_right", i64::from(crosses(6)));
+        observed.insert("compacted", 1);
+        assert!(
+            model
+                .successors("CompactAroundMid", &before)
+                .contains(&observed),
+            "set_range topology is not the compact transition: {before:?} -> {observed:?}"
+        );
+        assert!(model.check_invariant("NoAdjacentEqual", &observed));
+        assert_eq!((rle.get(0), rle.get(10), rle.len()), (Some(0), Some(3), 11));
+
+        if observed["merged_right"] == 1 {
+            let mut omitted_right = observed;
+            omitted_right.insert("merged_right", 0);
+            assert!(
+                !model
+                    .successors("CompactAroundMid", &before)
+                    .contains(&omitted_right)
+            );
+            assert!(!model.check_invariant("NoAdjacentEqual", &omitted_right));
+            assert!(
+                aterm_spec::interp::with_buggy(&model, 1)
+                    .successors("CompactAroundMid", &before)
+                    .contains(&omitted_right)
+            );
+        }
     }
 }
 

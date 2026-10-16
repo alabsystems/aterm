@@ -1,33 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The crash marker's lifecycle across REAL aterm processes sharing one log
-//! dir (`aterm-gui`'s `crash_signal::markers`).
+//! The crash marker's lifecycle across real aterm processes sharing one log dir
+//! (`aterm-gui`'s `crash_signal::markers`): a start sweeps only markers whose owner is gone,
+//! and a clean exit removes its own. One scratch `$HOME`, three headless instances:
 //!
-//! THE DEFECT: every GUI-mode start swept every empty crash marker in the log
-//! dir, owner alive or not, so a stray start unlinked the running daily
-//! driver's marker (a SIGSEGV of it would have left no artifact); and a clean
-//! run never removed its own marker, so a SIGKILL looked like a clean quit.
-//! What this pins, one scratch `$HOME`, three headless instances:
-//!
-//! 1. B starting does NOT remove A's marker (A is alive, holding its lock);
-//! 2. B SIGKILLed leaves its marker; C starting removes it (B is gone and B was
-//!    not the installed app, so its corpse is not news) — and still keeps A's;
+//! 1. B starting does not remove A's marker (A is alive, holding its lock);
+//! 2. B SIGKILLed leaves its marker; C starting removes it (B is gone and was not the
+//!    installed app) and still keeps A's;
 //! 3. A closing its last tab (a clean `exit(3)`) removes A's own marker.
 //!
-//! Headless starts arm as `other`: only the installed app's `app` markers are
-//! ever reported as "killed" (unit-tested in `crash_signal::marker_tests` and
-//! `logging::tests`), which is the scoping that keeps harness SIGKILLs like
-//! step 2 from being reported to the owner.
-//!
-//! ISOLATION: scratch HOME/XDG roots, private control sockets, a config with
-//! every automatic lane off, `--no-reroute`, `SHELL=/bin/sh`
-//! (`support/launch_isolation.rs`). A headless instance opens no window; one
-//! that cannot start FAILS the test (`support/headless_boot.rs` `await_ready`),
-//! SKIP only on an environment refusal named there (scratch, log, spawn, a
-//! refused bind).
+//! Headless starts arm as `other`: only the installed app's `app` markers are reported as
+//! "killed" (unit-tested in `crash_signal::marker_tests` and `logging::tests`), so harness
+//! SIGKILLs like step 2 never reach the owner. Isolation is `support/launch_isolation.rs`'s;
+//! an instance that cannot start fails the test (`support/headless_boot.rs` `await_ready`).
 
 #![cfg(unix)]
+#![allow(
+    clippy::disallowed_types,
+    reason = "test code: a stand-in child may inherit descriptors"
+)]
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -39,9 +31,8 @@ use crate::{headless_boot, launch_isolation};
 
 use headless_boot::MAX_SOCK_PATH;
 
-/// How long a wait for something that MUST happen — a reply, a marker going —
-/// may take before it is read as a hang (AGENTS.md: a hang detector is a
-/// minute, never a latency budget).
+/// How long a wait for something that must happen (a reply, a marker going) may take before it
+/// is read as a hang (AGENTS.md).
 const HANG: Duration = aterm_spec::wait::MUST_HAPPEN;
 
 /// One scratch world every instance of the test shares; removed on drop.
@@ -93,9 +84,8 @@ fn logs_dir(root: &Path) -> PathBuf {
     }
 }
 
-/// Boot one headless instance on its own socket in `root`. `None` = SKIP (a
-/// log or spawn refusal); an instance that exits or never listens PANICS
-/// (`headless_boot::await_ready`).
+/// Boot one headless instance on its own socket in `root`. `None` is a skip (a log or spawn
+/// refusal); an instance that exits or never listens panics (`headless_boot::await_ready`).
 fn boot(root: &Path, tag: &str) -> Option<Instance> {
     let sock = root.join(format!("run/aterm/{tag}.sock"));
     let log_path = root.join(format!("{tag}.log"));
@@ -174,7 +164,7 @@ fn first_sid(sock: &Path) -> String {
         .to_string()
 }
 
-/// Wait until `pred` holds (a bounded poll on an EVENT, not a sleep verdict).
+/// Wait until `pred` holds (a bounded poll on an event, not a sleep verdict).
 fn wait_until(what: &str, mut pred: impl FnMut() -> bool) {
     let seen = aterm_spec::wait::within(HANG, Duration::from_millis(25), || pred().then_some(()));
     assert!(seen.is_some(), "timed out waiting for {what}");

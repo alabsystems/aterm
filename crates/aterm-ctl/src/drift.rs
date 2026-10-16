@@ -22,18 +22,18 @@
 //! `fidelity=-`).
 //!
 //! The analyzer is injected, not linked: this crate is the dependency-free
-//! client (`aterm-types` and `aterm-uds` only), and the `aterm` binary, which
+//! client (workspace-only dependencies), and the `aterm` binary, which
 //! links the engine, passes a plain `fn` in
 //! ([`main_entry_with`](crate::main_entry_with)). The standalone dev
 //! `aterm-ctl` says by name that it cannot compute the report.
 
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufReader, Read, Write};
 use std::process::ExitCode;
 use std::time::Duration;
 
 use super::{
     StdoutSink, TargetOrigin, byte_count, converse, converse_served, drain_refusal_tail,
-    malformed_header_error, read_bounded_line, read_status_line, send_request, send_served,
+    malformed_header_error, read_reply_lines, read_status_line, send_request, send_served,
     stderr_line, stdout_handle, stream_count,
 };
 
@@ -435,7 +435,7 @@ fn fetch(
         match framing_of(verb, &framed) {
             Framing::Lines => {
                 let n = stream_count(tail).ok_or_else(|| malformed_header_error(&status))?;
-                Ok(Reply::Lines(read_lines(&mut reader, n)?))
+                Ok(Reply::Lines(read_reply_lines(&mut reader, n)?))
             }
             Framing::Bytes => {
                 let n = byte_count(tail).ok_or_else(|| malformed_header_error(&status))?;
@@ -452,23 +452,6 @@ fn fetch(
             _ => Ok(Reply::Status(status)),
         }
     })
-}
-
-/// `n` reply lines, each bounded, with the line ending stripped.
-pub(crate) fn read_lines<R: BufRead>(reader: &mut R, n: usize) -> io::Result<Vec<String>> {
-    let mut rows = Vec::with_capacity(n.min(4096));
-    for _ in 0..n {
-        let mut line = String::new();
-        if read_bounded_line(reader, &mut line)? == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "server hung up before the complete line-framed response",
-            ));
-        }
-        let line = line.strip_suffix('\n').unwrap_or(&line);
-        rows.push(line.strip_suffix('\r').unwrap_or(line).to_string());
-    }
-    Ok(rows)
 }
 
 /// The screen stamp a `status` line carries: its `seq=` and `hash=` values
@@ -620,7 +603,7 @@ fn probe(
         };
         if tail.split_whitespace().any(|t| t.starts_with("verdict=")) {
             let n = stream_count(tail).ok_or_else(|| malformed_header_error(status))?;
-            let rows = read_lines(&mut reader, n)?;
+            let rows = read_reply_lines(&mut reader, n)?;
             let stdout = stdout_handle();
             let mut out = StdoutSink::new(io::BufWriter::new(stdout.lock()));
             out.write_all(status.as_bytes())?;
@@ -738,6 +721,8 @@ fn live_with(
 
 #[cfg(test)]
 mod tests {
+    use std::io::BufRead as _;
+
     use super::*;
 
     fn strings(parts: &[&str]) -> Vec<String> {

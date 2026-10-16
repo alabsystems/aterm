@@ -1,0 +1,72 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0 AND (MIT OR Apache-2.0)
+#
+# aterm's font reader (TF.3 of docs/AUDIT-third-party-2026-10-15.md, the
+# text-fonts ruling's outline core). Its table readers are a modified subset
+# of the upstream `ttf-parser` crate, version 0.25.1
+# (https://github.com/harfbuzz/ttf-parser, by Yevhenii Reizner and
+# contributors, dual-licensed MIT OR Apache-2.0). See `LICENSE-MIT` and
+# `LICENSE-APACHE` in this directory for the upstream licenses. The derived
+# files keep upstream's layout (`src/parser.rs`, `src/tables/**`) and each
+# names the file it came from.
+#
+# aterm-render reads every font through it since TF.5; it answers the TF.1
+# reader corpus (tests/reader_oracle.rs) bit for bit, every query of it.
+#
+# Its text shaper, `src/shape/` (TF.6), is a modified subset of rustybuzz
+# 0.20.1 (https://github.com/harfbuzz/rustybuzz, by the HarfBuzz developers and
+# Yevhenii Reizner, MIT; see `LICENSE-RUSTYBUZZ`). aterm-render shapes every run
+# with it, and its replay of the TF.1 shaping corpus lives there
+# (tests/font_oracle.rs, `shaping_answers_hold`).
+#
+# Its automatic hinter, `src/autohint/` (TF.4, the `hint` feature), is a
+# modified subset of skrifa 0.46.2, read-fonts 0.43.2 and font-types 0.12.4
+# (https://github.com/googlefonts/fontations, by the Fontations developers,
+# MIT OR Apache-2.0, used under MIT; see `LICENSE-FONTATIONS`): FreeType's
+# autofit as skrifa ports it. aterm-render grid-fits its Linux and Windows
+# text with it, and tests/hint_oracle.rs holds it to the TF.1 hinting corpus
+# skrifa recorded, bit for bit.
+
+[package]
+name = "aterm-font"
+description = "aterm's font reader, shaper and hinter: the sfnt/TTC directory, cmap, glyf/gvar and CFF/CFF2 outlines, metrics and variations (fvar/avar/HVAR/VVAR/MVAR), OS/2, name, kern, COLR/CPAL, sbix and CBDT bitmaps, GSUB/GDEF, a GSUB text shaper and FreeType's automatic hinter. Derived from ttf-parser 0.25.1 (MIT OR Apache-2.0), rustybuzz 0.20.1 (MIT) and skrifa 0.46.2 (MIT OR Apache-2.0)."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "Apache-2.0 AND (MIT OR Apache-2.0) AND MIT"
+# Integration tests are declared below, not discovered. With autotests off a
+# `tests/*.rs` file listed nowhere never compiles.
+autotests = false
+
+[lib]
+name = "aterm_font"
+path = "src/lib.rs"
+
+[features]
+default = ["hint"]
+# The automatic hinter (`src/autohint/`, TF.4): FreeType's autofit as skrifa
+# 0.46.2 ports it, carved. On by default so this crate's own tests replay the
+# TF.1 hinting corpus on every host; the workspace row turns default features
+# off, and aterm-render asks for it only where it grid-fits (Linux and
+# Windows), so the shipped macOS and wasm builds compile none of it. A
+# `--workspace` build selects this crate with its defaults, and feature
+# unification turns `hint` on for aterm-render there too; only its
+# target-gated `src/hinted.rs` calls it.
+hint = []
+
+[dependencies]
+# The shaper's Unicode properties (TF.6): `Script` and `General_Category`,
+# and `Bidi_Mirroring_Glyph` (the `rtlm` mask of a backward run). Both are
+# first-party table crates with no third-party dependency: aterm-bidi has none
+# at all, and aterm-grapheme brings aterm-types and, through it, aterm-alloc,
+# aterm-hash, aterm-log and aterm-time.
+aterm-grapheme = { workspace = true }
+aterm-bidi = { workspace = true }
+
+[lints]
+workspace = true
+
+[[test]]
+name = "font_suite"
+path = "tests/font_suite.rs"

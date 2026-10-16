@@ -2,26 +2,27 @@
 // Copyright 2026 Andrew Yates
 
 //! Erase A/B: the audition bench for what a delete sounds like (as
-//! `typing_voice_ab` is for the keystroke). A delete is a keystroke bell plus
-//! the erase poof's own noise inside the same 45 ms, and whether that reads as
-//! one gesture or two keys takes an ear.
+//! `typing_voice_ab` is for the keystroke). A delete is a keystroke bell plus the
+//! erase poof's own noise inside the same 45 ms; whether that reads as one gesture
+//! or two keys takes an ear.
 //!
-//! It renders four delete shapes (plain Backspace, a held Backspace run,
-//! Ctrl-W, Ctrl-U) through the real synth in three arms:
+//! It renders five delete shapes (Backspace, a held Backspace run, Ctrl-W, Ctrl-U,
+//! a typed word then corrected) through the real synth in three arms:
 //!
 //! - `a-shipped-*`: a plain Backspace fires its bell and the full
-//!   [`SoundKind::Kill`] swoosh (a per-command, tier-3 gesture);
-//! - `b-puff-*`: the bell plus [`SoundKind::Poof`], the cloud's small breath
-//!   (the shipping voice). Kill chords are identical between the arms;
-//! - `c-bell-only`: the keystroke bell alone, the reference.
+//!   [`SoundKind::Kill`] swoosh (despite the name, not what ships);
+//! - `b-puff-*`: the bell plus [`SoundKind::Poof`], the cloud's small breath (the
+//!   shipping voice);
+//! - `c-bell-only-*`: the keystroke bell alone, the reference.
 //!
-//! Deterministic: fixed seed, fixed scripts, no rng of its own.
+//! Kill chords are identical in the first two arms. Deterministic: fixed seed,
+//! fixed scripts.
 //!
-//!   cargo run -p aterm-effects --example erase_ab [-- <out_dir>] [--voice <name>]
+//!   targo --unverified run -p aterm-effects --example erase_ab [-- <out_dir>] [--voice <name>]
 //!   afplay target/erase-ab/b-puff-backspace.wav
 //!
-//! Each render prints peak dBFS and the ms between the bell's onset and the
-//! delete voice's, as a sanity check; the WAVs are the deliverable.
+//! Each render prints its peak dBFS and the RMS of what it adds over the bell-only
+//! render; `iso-*.wav` hold the two delete voices alone.
 
 use std::path::PathBuf;
 
@@ -38,8 +39,8 @@ const SRF: f32 = 48_000.0;
 type Script = Vec<(f32, SoundKind)>;
 
 /// The keystroke bell a Backspace earns on its admitted cursor retreat, and the
-/// delete voice that lands behind it. `poof_delay` is the frame the erase echo
-/// takes to reach the probe (~16 ms — one frame at 60 Hz, measured live).
+/// delete voice that lands behind it: the erase echo takes a frame (~16 ms at
+/// 60 Hz) to reach the probe.
 fn backspace(at: f32, delete_voice: Option<SoundKind>) -> Script {
     let mut s = vec![(at, SoundKind::Backspace)];
     s.extend(delete_voice.map(|k| (at + 0.016, k)));
@@ -67,7 +68,6 @@ fn scripts(delete_voice: Option<SoundKind>) -> Vec<(&'static str, Script)> {
     vec![
         // One character, from a quiet screen.
         ("backspace", backspace(0.10, delete_voice)),
-        // Ten of them, held.
         ("backspace-held", held_backspace(delete_voice)),
         // A word kill: no keystroke of its own, so the swoosh is its whole
         // voice, identical in both delete arms. In the bell-only arm it is
@@ -83,8 +83,7 @@ fn scripts(delete_voice: Option<SoundKind>) -> Vec<(&'static str, Script)> {
                 vec![(0.10, SoundKind::Kill), (0.55, SoundKind::Kill)]
             }),
         ),
-        // …and the shape that matters most: a word TYPED, then corrected.
-        // If the delete fights the bell, this is where it shows.
+        // A word typed, then corrected: where a delete that fights the bell shows.
         ("typed-then-corrected", {
             let mut s: Script = (0..6)
                 .map(|k| (0.10 + k as f32 * 0.13, SoundKind::Typed))
@@ -186,20 +185,17 @@ fn main() {
     let out = out.unwrap_or_else(|| PathBuf::from("target/erase-ab"));
     std::fs::create_dir_all(&out).expect("out dir");
 
-    // A = Backspace fires the full kill swoosh; B = the puff. Kill chords are
-    // identical in both.
     let arms: [(&str, Option<SoundKind>); 3] = [
         ("a-shipped", Some(SoundKind::Kill)),
         ("b-puff", Some(SoundKind::Poof)),
-        // The reference: a delete with no delete voice, the bell alone.
-        // `a-shipped` is bit-identical to it on every plain-Backspace shape,
-        // since its swoosh lands ~16 ms behind the bell and the synth's
-        // `MIN_GAP` (45 ms) thins it; `b-puff` bypasses the min gap.
+        // `a-shipped` is bit-identical to this on every plain-Backspace shape: its
+        // swoosh lands ~16 ms behind the bell and the synth's `MIN_GAP` (45 ms)
+        // thins it. `b-puff` bypasses the min gap.
         ("c-bell-only", None),
     ];
-    // The bell-only reference first, so every other arm is reported as what
-    // it adds. Every arm of one shape renders to the same length (the
-    // longest script + 1.2 s of tail) so the difference is sample-aligned.
+    // The bell-only reference renders first so every arm reports what it adds;
+    // every arm of one shape has the same length (the longest script + 1.2 s of
+    // tail) so the difference is sample-aligned.
     let lens: Vec<f32> = scripts(Some(SoundKind::Kill))
         .into_iter()
         .map(|(_, s)| s.last().map_or(0.5, |e| e.0) + 1.2)
@@ -228,7 +224,7 @@ fn main() {
             );
         }
     }
-    // The two delete voices in ISOLATION, for a direct A/B of the sound itself.
+    // The two delete voices alone, for a direct A/B of the sound itself.
     for (name, kind) in [
         ("iso-swoosh", SoundKind::Kill),
         ("iso-puff", SoundKind::Poof),

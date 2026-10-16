@@ -7,10 +7,11 @@
 //!
 //! A [`Font`] is a parsed face: the cmap, the horizontal advances, the `hhea`
 //! line metrics and the legacy `kern` pairs, read once out of the file with
-//! `ttf-parser` (which this crate links anyway, for `rustybuzz`, `sbix`
-//! colour-emoji extraction and the FONT-2 variation path). Rasterization is
+//! `aterm-font`, the first-party reader carved from `ttf-parser` (TF.5 of
+//! docs/AUDIT-third-party-2026-10-15.md), which also serves `sbix` colour-emoji
+//! extraction and the FONT-2 variation path. Rasterization is
 //! [`crate::variation::varied_glyph_raster_with_face`] — the SAME
-//! ttf-parser-outline → [`crate::raster`] signed-area coverage fill the
+//! aterm-font-outline → [`crate::raster`] signed-area coverage fill the
 //! variation and `sbix` paths already used, which is why retiring fontdue added
 //! no rasterizer: the rasterizer was already here and already proven, glyph for
 //! glyph, against `ab_glyph_rasterizer` at f32 bit equality.
@@ -96,7 +97,8 @@
 //!   onto this face rather than kept.
 //! * **No GSUB pre-load, no `name`, no vertical metrics, no `chars()` map
 //!   handed out, no `file_hash`.** Nothing called them. Shaping substitutions
-//!   come from `rustybuzz` (`crate::ligature_shaping`), which reads GSUB itself.
+//!   come from `aterm_font::shape` (`crate::ligature_shaping`), which reads GSUB
+//!   itself.
 //!
 //!   One consequence, measured and pinned: fontdue builds geometry only for the
 //!   glyphs its cmap and GSUB reach and reports advance `0` for every other
@@ -132,7 +134,7 @@
 //! handle over. That distinction is worth 54 MB on one face (see the table
 //! above), which is why it exists rather than a single `&[u8]` constructor.
 //!
-//! The face is NOT retained between calls: `ttf_parser::Face<'a>` borrows its
+//! The face is NOT retained between calls: `aterm_font::Face<'a>` borrows its
 //! bytes, and a self-referential owner would need `unsafe` to express. Instead
 //! every field a hot path reads — the cmap map, the advance table, the line
 //! metrics, the `kern` bytes and (for `glyf` faces) the per-glyph ink box — is
@@ -150,7 +152,7 @@ use std::sync::Arc;
 /// One field, because one field was used. fontdue's `scale` (the parse-time
 /// flattening budget) has no counterpart here — outlines are flattened at the
 /// size they are drawn at — and `load_substitutions` (its GSUB pre-load) has no
-/// counterpart either, because substitution is `rustybuzz`'s job in this crate.
+/// counterpart either, because substitution is the run shaper's job in this crate.
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
 pub struct FontSettings {
     /// Which face to take out of a TrueType/OpenType COLLECTION (`.ttc`).
@@ -490,7 +492,7 @@ impl Font {
     /// The one parse all four constructors reach.
     fn parse(data: FaceBytes, settings: FontSettings) -> Result<Font, &'static str> {
         let index = settings.collection_index;
-        let face = ttf_parser::Face::parse(&data, index).map_err(describe)?;
+        let face = aterm_font::Face::parse(&data, index).map_err(describe)?;
         let upem = f32::from(face.units_per_em());
         // `units_per_em()` widens a `u16`, so this value is always finite and a
         // plain `<=` is the whole test — there is no NaN case to lose.
@@ -527,7 +529,7 @@ impl Font {
         // call — off the parse path entirely.
         let advances: Box<[u16]> = (0..glyph_count)
             .map(|gid| {
-                face.glyph_hor_advance(ttf_parser::GlyphId(gid))
+                face.glyph_hor_advance(aterm_font::GlyphId(gid))
                     .unwrap_or(0)
             })
             .collect();
@@ -536,7 +538,7 @@ impl Font {
         let bboxes: Option<Box<[[i16; 4]]>> = face.tables().glyf.map(|_| {
             (0..glyph_count)
                 .map(|gid| {
-                    face.glyph_bounding_box(ttf_parser::GlyphId(gid))
+                    face.glyph_bounding_box(aterm_font::GlyphId(gid))
                         .map_or([0, 0, 0, 0], |b| [b.x_min, b.y_min, b.x_max, b.y_max])
                 })
                 .collect()
@@ -553,7 +555,7 @@ impl Font {
 
         let kern = face
             .raw_face()
-            .table(ttf_parser::Tag::from_bytes(b"kern"))
+            .table(aterm_font::Tag::from_bytes(b"kern"))
             .map(Box::<[u8]>::from);
 
         Ok(Font {
@@ -571,7 +573,7 @@ impl Font {
 
     /// The glyph id `ch` maps to, or `0` (`.notdef`) when the face has no
     /// mapping. See the module docs for why this is the enumerated-cmap answer
-    /// and not `ttf_parser::Face::glyph_index`'s Unicode-only one.
+    /// and not `aterm_font::Face::glyph_index`'s Unicode-only one.
     #[inline]
     #[must_use]
     pub fn lookup_glyph_index(&self, ch: char) -> u16 {
@@ -594,10 +596,9 @@ impl Font {
     /// Legacy `kern`-table pair adjustment for `left`→`right` at `px`, or
     /// `None` when the face has no `kern` table or no value for the pair.
     ///
-    /// GPOS kerning is NOT read here — it was not read before either. A face
-    /// whose kerning lives only in GPOS shapes through
-    /// [`crate::ligature_shaping`], which runs `rustybuzz` over the real
-    /// feature set.
+    /// GPOS kerning is NOT read here — it was not read before either — nor by
+    /// the run shaper ([`crate::ligature_shaping`]), which places each glyph
+    /// on its cell and positions by advance alone (TF.6).
     #[must_use]
     pub fn horizontal_kern(&self, left: char, right: char, px: f32) -> Option<f32> {
         self.horizontal_kern_indexed(
@@ -610,8 +611,8 @@ impl Font {
     /// [`Font::horizontal_kern`] by glyph id.
     #[must_use]
     pub fn horizontal_kern_indexed(&self, left: u16, right: u16, px: f32) -> Option<f32> {
-        let table = ttf_parser::kern::Table::parse(self.kern.as_deref()?)?;
-        let (l, r) = (ttf_parser::GlyphId(left), ttf_parser::GlyphId(right));
+        let table = aterm_font::kern::Table::parse(self.kern.as_deref()?)?;
+        let (l, r) = (aterm_font::GlyphId(left), aterm_font::GlyphId(right));
         // First horizontal, non-variable subtable with an entry for THIS pair
         // wins (fontdue's "first usable horizontal subtable" rule, widened so
         // a subtable without the pair does not end the search).
@@ -674,7 +675,7 @@ impl Font {
         if px.is_nan() || px <= 0.0 || gid >= self.glyph_count {
             return (Metrics::default(), Vec::new());
         }
-        let Ok(face) = ttf_parser::Face::parse(&self.data, self.index) else {
+        let Ok(face) = aterm_font::Face::parse(&self.data, self.index) else {
             return (Metrics::default(), Vec::new());
         };
         match crate::variation::varied_glyph_raster_with_face(&face, gid, px) {
@@ -722,8 +723,8 @@ impl Font {
             // A blank glyph (space) has no entry, stored as the all-zero box.
             return (b != [0, 0, 0, 0]).then_some(b);
         }
-        let face = ttf_parser::Face::parse(&self.data, self.index).ok()?;
-        face.glyph_bounding_box(ttf_parser::GlyphId(gid))
+        let face = aterm_font::Face::parse(&self.data, self.index).ok()?;
+        face.glyph_bounding_box(aterm_font::GlyphId(gid))
             .map(|b| [b.x_min, b.y_min, b.x_max, b.y_max])
     }
 }
@@ -747,9 +748,10 @@ fn ink_box_px(bbox: [i16; 4], scale: f32) -> (i32, i32, usize, usize) {
     (x_min as i32, y_min as i32, w, h)
 }
 
-/// ttf-parser's parse failure, as the `&'static str` the call sites format.
-fn describe(error: ttf_parser::FaceParsingError) -> &'static str {
-    use ttf_parser::FaceParsingError::*;
+/// aterm-font's parse failure, as the `&'static str` the call sites format
+/// (ttf-parser's wording, which they always printed).
+fn describe(error: aterm_font::FaceParsingError) -> &'static str {
+    use aterm_font::FaceParsingError::*;
     match error {
         MalformedFont => "An attempt to read out of bounds detected.",
         UnknownMagic => {

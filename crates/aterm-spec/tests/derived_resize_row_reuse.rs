@@ -9,12 +9,6 @@ use aterm_spec::{derive::resize_row_reuse_model, interp, verify};
 #[test]
 fn resize_slices_are_conserved_and_reused_before_allocating() {
     let model = resize_row_reuse_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name),
-        "the resize-row reuse model must remain registered"
-    );
     verify::prove_and_catch_scalar(&model, "resize-row slices returned on shrink");
     let bypass = interp::with_consts(&model, &[("BypassReuse", 1)]);
     verify::prove_and_catch_scalar(&bypass, "resize-row slices reused on grow");

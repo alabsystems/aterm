@@ -48,9 +48,7 @@ pub fn package_dir(root: &Path, id: &PkgId, printed: Option<&Path>) -> Option<Pa
     // so a second, registry-sourced copy of the same name can resolve. A
     // name-only hit would bill that third-party package to the member and drop
     // it from the third-party totals.
-    if let Some((version, member)) = workspace_members(root).get(&id.name)
-        && version == &id.version
-    {
+    if let Some(member) = workspace_members(root).get(&(id.name.clone(), id.version.clone())) {
         return Some(member.clone());
     }
     // A patched package resolves to the path that compiles, before the
@@ -58,8 +56,7 @@ pub fn package_dir(root: &Path, id: &PkgId, printed: Option<&Path>) -> Option<Pa
     // they are readable from the repository alone on every machine. The patch
     // table is the authority, not the `vendor/` directory name. Name and
     // version here too, for the reason given in the member branch above.
-    if let Some((version, dir)) = patch_targets(root).get(&id.name)
-        && version == &id.version
+    if let Some(dir) = patch_targets(root).get(&(id.name.clone(), id.version.clone()))
         && dir.is_dir()
     {
         return Some(dir.clone());
@@ -80,12 +77,13 @@ pub fn package_dir(root: &Path, id: &PkgId, printed: Option<&Path>) -> Option<Pa
     printed.filter(|p| p.is_dir()).map(Path::to_path_buf)
 }
 
-/// Package name → (version, directory) for every `[patch.crates-io]` target.
+/// (package, version) → directory for every `[patch.crates-io]` target.
 ///
 /// The patch table, not the directory name, says where a patched package
 /// lives (first-party replacements point at `crates/aterm-*`, forks at
-/// `vendor/*`). Parsed with the same minimal TOML walk as
-/// `attest::patch_paths`, but as a lookup. Memoized per root.
+/// `vendor/*`). A renamed row names its package with `package = "…"`
+/// ([`crate::policy::patched_package`]), and two rows may patch two versions
+/// of one package, hence the version in the key. Memoized per root.
 fn patch_targets(root: &Path) -> &'static MemberIndex {
     static CACHE: OnceLock<Mutex<BTreeMap<PathBuf, &'static MemberIndex>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
@@ -96,33 +94,25 @@ fn patch_targets(root: &Path) -> &'static MemberIndex {
         return hit;
     }
     let mut table: MemberIndex = BTreeMap::new();
-    if let Ok(text) = std::fs::read_to_string(root.join("Cargo.toml")) {
-        let mut in_patch = false;
-        for line in text.lines() {
-            let t = line.trim();
-            if t.starts_with('[') {
-                in_patch = t == "[patch.crates-io]";
-                continue;
-            }
-            if !in_patch || t.is_empty() || t.starts_with('#') {
-                continue;
-            }
-            // `name = { path = "vendor/name" }`
-            let Some((name, rest)) = t.split_once('=') else {
+    let doc = std::fs::read_to_string(root.join("Cargo.toml"))
+        .ok()
+        .and_then(|text| text.parse::<aterm_toml::edit::DocumentMut>().ok());
+    if let Some(rows) = doc
+        .as_ref()
+        .and_then(|d| d.get("patch"))
+        .and_then(|p| p.get("crates-io"))
+        .and_then(aterm_toml::edit::Item::as_table_like)
+    {
+        for (key, row) in rows.iter() {
+            let Some(path) = row.get("path").and_then(aterm_toml::edit::Item::as_str) else {
                 continue;
             };
-            let Some(after) = rest.split_once("path") else {
+            let dir = root.join(path);
+            let Some(version) = manifest_version(&dir) else {
                 continue;
             };
-            let mut it = after.1.split('"');
-            let _ = it.next();
-            if let Some(path) = it.next().filter(|p| !p.is_empty()) {
-                let dir = root.join(path);
-                let Some(version) = manifest_version(&dir) else {
-                    continue;
-                };
-                table.insert(name.trim().trim_matches('"').to_string(), (version, dir));
-            }
+            let name = crate::policy::patched_package(key, row).to_string();
+            table.insert((name, version), dir);
         }
     }
     let leaked: &'static MemberIndex = Box::leak(Box::new(table));
@@ -131,7 +121,7 @@ fn patch_targets(root: &Path) -> &'static MemberIndex {
 }
 
 /// `[package] version` from a manifest directory, if it reads.
-fn manifest_version(dir: &Path) -> Option<String> {
+pub(crate) fn manifest_version(dir: &Path) -> Option<String> {
     let text = std::fs::read_to_string(dir.join("Cargo.toml")).ok()?;
     let mut in_package = false;
     for line in text.lines() {
@@ -154,13 +144,17 @@ fn manifest_version(dir: &Path) -> Option<String> {
     None
 }
 
-/// `[package] name` -> (version, directory) for every `crates/*` member.
-type MemberIndex = BTreeMap<String, (String, PathBuf)>;
+/// (`[package] name`, version) -> directory, for every `crates/*` member or
+/// patch target: two versions of one name may both be ours.
+type MemberIndex = BTreeMap<(String, String), PathBuf>;
 
-/// `[package] name` → directory, for every `crates/*` member of this root.
+/// (`[package] name`, version) → directory, for every `crates/*` member of
+/// this root.
 ///
 /// Keyed on the manifest name, since it may differ from the directory
-/// (`crates/aterm-tracing` is package `tracing`). Memoized per root.
+/// (`crates/aterm-tracing` is package `tracing`), and on the version, since two
+/// members may carry one name at two versions (`windows-sys` 0.52 and 0.61 for
+/// two `[patch]` rows). Memoized per root.
 fn workspace_members(root: &Path) -> &'static MemberIndex {
     static MEMBERS: OnceLock<Mutex<BTreeMap<PathBuf, &'static MemberIndex>>> = OnceLock::new();
     let cache = MEMBERS.get_or_init(|| Mutex::new(BTreeMap::new()));
@@ -185,7 +179,7 @@ fn workspace_members(root: &Path) -> &'static MemberIndex {
                 })
         })
         .unwrap_or_default();
-    let mut found: BTreeMap<String, (String, PathBuf)> = BTreeMap::new();
+    let mut found: MemberIndex = BTreeMap::new();
     if let Ok(entries) = std::fs::read_dir(root.join("crates")) {
         for entry in entries.flatten() {
             let dir = entry.path();
@@ -195,11 +189,11 @@ fn workspace_members(root: &Path) -> &'static MemberIndex {
             let name = package_name(&text);
             if !name.is_empty() {
                 let version = package_version(&text).unwrap_or_else(|| workspace_version.clone());
-                found.insert(name, (version, dir));
+                found.insert((name, version), dir);
             }
         }
     }
-    let leaked: &'static BTreeMap<String, (String, PathBuf)> = Box::leak(Box::new(found));
+    let leaked: &'static MemberIndex = Box::leak(Box::new(found));
     if let Ok(mut map) = cache.lock() {
         map.insert(root.to_path_buf(), leaked);
     }
@@ -340,10 +334,10 @@ fn cached_facts(root: &Path, id: &PkgId, printed: Option<&Path>) -> PkgFacts {
     fresh
 }
 
-/// Graph plus facts for one cell.
-pub fn survey_cell(root: &Path, cell: &Cell) -> Result<CellSurvey, String> {
+/// Graph plus facts for one cell, as `cargo` resolves it.
+pub fn survey_cell(cargo: &resolve::Cargo, root: &Path, cell: &Cell) -> Result<CellSurvey, String> {
     let mut log = String::new();
-    let out = survey_cell_logged(root, cell, &mut log);
+    let out = survey_cell_logged(cargo, root, cell, &mut log);
     if !log.is_empty() {
         eprint!("{log}");
     }
@@ -366,11 +360,12 @@ pub(crate) fn real_workspace_survey(cell: &Cell) -> Result<CellSurvey, String> {
 
 /// [`survey_cell`] with the resolver's notes captured instead of printed.
 pub fn survey_cell_logged(
+    cargo: &resolve::Cargo,
     root: &Path,
     cell: &Cell,
     log: &mut String,
 ) -> Result<CellSurvey, String> {
-    let (graph, paths) = resolve::graph_and_paths(root, cell, log)?;
+    let (graph, paths) = resolve::graph_and_paths(cargo, root, cell, log)?;
     let facts = facts_with_paths(root, &graph, &paths);
     Ok(CellSurvey {
         cell: cell.clone(),
@@ -535,16 +530,21 @@ mod tests {
             .expect("the patched `libc` resolves");
         assert_eq!(retired, root.join("crates").join("aterm-libc"));
 
-        // Patch arm: a vendored fork answers from the path that compiles.
-        let forked = package_dir(&root, &PkgId::new("winit", "0.30.13"), None)
+        // Absorbed arm: `winit` is patched to the member it was absorbed into.
+        let absorbed = package_dir(&root, &PkgId::new("winit", "0.30.13"), None)
             .expect("the patched winit resolves");
-        assert_eq!(forked, root.join("vendor").join("winit"));
+        assert_eq!(absorbed, root.join("crates").join("aterm-window"));
+
+        // Patch arm: a vendored fork answers from the path that compiles.
+        let forked = package_dir(&root, &PkgId::new("indexmap", "2.14.0"), None)
+            .expect("the patched indexmap resolves");
+        assert_eq!(forked, root.join("vendor").join("indexmap"));
 
         // Only at the fork's own version: another version of the same name is
         // someone else's package.
         assert_ne!(
-            package_dir(&root, &PkgId::new("winit", "0.0.0-not-published"), None),
-            Some(root.join("vendor").join("winit")),
+            package_dir(&root, &PkgId::new("indexmap", "0.0.0-not-published"), None),
+            Some(root.join("vendor").join("indexmap")),
             "the version guard must refuse a name-only match"
         );
 
@@ -580,11 +580,10 @@ mod tests {
     #[test]
     fn a_member_is_found_by_its_manifest_name_not_its_directory_name() {
         assert_eq!(
-            workspace_members(&repo_root()).get("tracing").cloned(),
-            Some((
-                "0.1.44".to_string(),
-                repo_root().join("crates").join("aterm-tracing")
-            ))
+            workspace_members(&repo_root())
+                .get(&("tracing".to_string(), "0.1.44".to_string()))
+                .cloned(),
+            Some(repo_root().join("crates").join("aterm-tracing"))
         );
         assert_eq!(package_name("[package]\nname = \"x\"\n"), "x");
         assert_eq!(package_name("[workspace]\nmembers = []\n"), "");
@@ -631,7 +630,7 @@ mod tests {
     /// ceilings in `tools/forge-budget.tsv`, and return the survey.
     ///
     /// Every ratcheted third-party metric is a ceiling: a cell may shrink, not
-    /// grow past either. Both are checked because `gate forge` is manual and
+    /// grow past either. Both are checked because `verify forge` runs when asked and
     /// `measured::ratchet_agreement` keeps the TSV at or under the measured
     /// row. `resolved` and `workspace` are not held (not surface). The mac-arm
     /// duplicate-name list below stays exact.
@@ -685,25 +684,6 @@ mod tests {
     }
 
     #[test]
-    fn mac_arm_duplicate_names_match_the_baseline() {
-        let s = survey(0);
-        let dups = s.duplicate_names();
-        let names: Vec<&str> = dups.keys().map(String::as_str).collect();
-        assert_eq!(names, measured::MAC_ARM_DUPLICATE_NAMES);
-        // Counted over the resolved graph (hashbrown has one version, so no key
-        // in `dups`). A second version means vendor/indexmap's
-        // `hashbrown = "0.16"` pin was undone or a new parent brought another
-        // major.
-        let versions = s.third_party().filter(|p| p.name == "hashbrown").count();
-        assert_eq!(
-            versions,
-            measured::MAC_ARM_HASHBROWN_VERSIONS,
-            "hashbrown resolves at {versions} version(s) on mac-arm; the dedup \
-             to a single 0.16.1 has regressed"
-        );
-    }
-
-    #[test]
     fn linux_stays_within_the_measured_baseline() {
         let s = assert_within_baseline(1);
         // AccessKit is an unconditional linux dependency
@@ -718,8 +698,10 @@ mod tests {
         }
     }
 
-    /// Every census-listed browser module fits inside a measured wasm cell,
-    /// and the CPU module's graph is a subset of the GPU module's.
+    /// Every census-listed browser module's third-party crates fit inside a
+    /// measured wasm cell, and the CPU module's graph is a subset of the GPU
+    /// module's. aterm's own crates (a workspace member such as
+    /// `aterm-wasm-abi-macros`) are no third-party surface.
     #[test]
     fn the_wasm_cells_cover_every_shipped_web_crate() {
         let contained = |inner: &str, outer_cell_index: usize| {
@@ -731,10 +713,12 @@ mod tests {
             };
             let (g, _) = crate::resolve::real_workspace_graph_and_paths(&cell)
                 .unwrap_or_else(|e| panic!("`{inner}` must resolve for wasm32 offline: {e}"));
+            let members = workspace_members(&repo_root());
             let escaped: Vec<String> = g
                 .nodes
                 .iter()
                 .filter(|id| id.name != inner && !outer.graph.nodes.contains(id))
+                .filter(|id| !members.contains_key(&(id.name.clone(), id.version.clone())))
                 .map(ToString::to_string)
                 .collect();
             assert!(
@@ -793,19 +777,26 @@ mod tests {
         );
     }
 
-    /// `vendor/` holds both aterm's own code (`astream-broker`, `astream-cap`)
-    /// and upstream forks (`winit`); `is_third_party` must tell them apart.
+    /// `vendor/` holds both aterm's own code (`astream-broker`, `astream-cap`,
+    /// `astream-digest`) and upstream forks (`indexmap`, in the linux graph);
+    /// `is_third_party` must tell them apart. An absorbed crate under
+    /// `crates/` (`winit`) is aterm's own lines too.
     #[test]
     fn a_first_party_vendored_crate_is_not_third_party_but_a_fork_still_is() {
-        let s = survey(0);
+        let s = survey(1);
         let by_name = |name: &str| {
             s.facts
                 .iter()
                 .find(|(id, _)| id.name == name)
-                .unwrap_or_else(|| panic!("`{name}` must be in the mac-arm graph"))
+                .unwrap_or_else(|| panic!("`{name}` must be in the linux graph"))
                 .1
         };
-        for own in ["astream-broker", "astream-cap", "astream-wire"] {
+        for own in [
+            "astream-broker",
+            "astream-cap",
+            "astream-digest",
+            "astream-wire",
+        ] {
             assert!(
                 !by_name(own).is_third_party,
                 "`{own}` is aterm's own code (provenance::FIRST_PARTY_VENDORED), vendored under \
@@ -813,16 +804,50 @@ mod tests {
             );
         }
         assert!(
-            by_name("winit").is_third_party,
-            "`vendor/winit` is a REDISTRIBUTED fork and must stay third-party — a provenance \
-             rule that exempts everything under vendor/ would hide the largest single \
-             dependency in this cell"
+            by_name("indexmap").is_third_party,
+            "`vendor/indexmap` is a REDISTRIBUTED fork and must stay third-party — a \
+             provenance rule that exempts everything under vendor/ would hide forks"
         );
-        // And the chain the first-party crate DRAGS IN is still billed: being
-        // aterm's own buys the crate's own lines, never its dependencies'.
         assert!(
-            by_name("sha2").is_third_party,
-            "sha2 is third-party no matter who reaches it"
+            !by_name("winit").is_third_party,
+            "`crates/aterm-window` (package winit) is absorbed: a workspace member, billed as \
+             aterm's own lines"
+        );
+    }
+
+    /// Being aterm's own buys a crate its own lines, never its dependencies':
+    /// a registry package that only a first-party vendored crate reaches is
+    /// still billed. Since astream-digest replaced sha2 no cell's graph has
+    /// such an edge by default (astream-aead's cipher comes in only under
+    /// aterm-link's `sealed`), so the edge is built here.
+    #[test]
+    fn a_package_a_first_party_vendored_crate_drags_in_is_still_third_party() {
+        let root = repo_root();
+        let own = PkgId::new("astream-aead", "0.2.0");
+        let dragged = PkgId::new("chacha20poly1305", "0.10.1");
+        let registry = aterm_tempfile::tempdir().expect("tempdir");
+        let unpacked = registry.path().join("chacha20poly1305-0.10.1");
+        std::fs::create_dir_all(unpacked.join("src")).expect("registry copy");
+        std::fs::write(unpacked.join("Cargo.toml"), "[package]\n").expect("manifest");
+        std::fs::write(unpacked.join("src/lib.rs"), "pub fn seal() {}\n").expect("source");
+        let graph = Graph {
+            root: own.clone(),
+            nodes: [own.clone(), dragged.clone()].into(),
+            edges: [(own.clone(), [dragged.clone()].into())].into(),
+        };
+        let printed = [
+            (own.clone(), root.join("vendor/astream/crates/astream-aead")),
+            (dragged.clone(), unpacked),
+        ]
+        .into();
+        let facts = facts_with_paths(&root, &graph, &printed);
+        assert!(
+            !facts[&own].is_third_party,
+            "astream-aead is first-party (the negative control)"
+        );
+        assert!(
+            facts[&dragged].is_third_party,
+            "chacha20poly1305 is third-party no matter who reaches it"
         );
     }
 
@@ -840,18 +865,21 @@ mod tests {
         );
     }
 
-    /// The unsafe-token instrument: the vendored `winit` fork counts far above
-    /// zero, and the absent `objc2` family reads zero.
+    /// The unsafe-token instrument: the absorbed `winit` (a member, measured
+    /// though not billed) counts far above zero, and the absent `objc2` family
+    /// reads zero.
     #[test]
     fn unsafe_tokens_are_measured_and_the_objc2_family_is_gone() {
         let s = survey(0);
         let winit: u64 = s
-            .third_party()
-            .filter(|id| id.name == "winit")
-            .map(|id| s.facts[id].unsafe_tokens)
+            .facts
+            .iter()
+            .filter(|(id, _)| id.name == "winit")
+            .map(|(_, f)| f.unsafe_tokens)
             .sum();
-        // A BLOCK count reads ~0 here; the token count is the honest one.
-        assert!(winit > 1000, "winit unsafe tokens = {winit}");
+        // A BLOCK count reads ~0 here; the token count is the honest one. (975
+        // after the Android/iOS/Orbital/Web backends were cut, 2026-10-15.)
+        assert!(winit > 500, "winit unsafe tokens = {winit}");
         let family: Vec<String> = s
             .third_party()
             .filter(|id| {

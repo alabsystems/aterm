@@ -403,8 +403,9 @@ impl Huffman {
     /// (every fixed literal/length code). Anything else, including a prefix
     /// running past end-of-input, falls through to
     /// [`decode_bitwise`](Self::decode_bitwise), so both paths return the same
-    /// symbol or the same error at the same point. An unarmed table misses and
-    /// falls through, which is also correct.
+    /// symbol or the same error. A failed decode need not leave the bit cursor
+    /// at the same position; callers abort or restore a checkpoint on error.
+    /// An unarmed table misses and falls through, which is also correct.
     fn decode(&self, br: &mut BitReader) -> Result<u16, InflateError> {
         #[cfg(test)]
         if oracle::force_bitwise() {

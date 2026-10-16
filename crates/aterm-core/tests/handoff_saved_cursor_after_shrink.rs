@@ -1,24 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A saved cursor survives a checkpoint where the engine holds it.
-//!
-//! An app that enters the alternate screen (1049 saves the cursor into the
-//! main DECSC slot) from a prompt on the last row, followed by a one-row
-//! shrink: the shrink demotes the saved primary screen's top row, and the slot
-//! follows the prompt up a row, as xterm (`AdjustSavedCursor`), Alacritty,
-//! kitty, Ghostty and WezTerm move it (`Grid::lend_saved_cursor`). A slot only
-//! moves with its text: one whose row a shrink trims away (a blank row below
-//! the cursor) names no text and stays past the grid, clamped only when DECRC
-//! or the 1049 exit reads it (`Grid::set_cursor`). So the checkpoint carries
-//! the slot as the engine holds it, unclamped, and the handoff wire bounds a
-//! DECSC slot by the engine's ceiling
+//! A saved cursor survives a checkpoint where the engine holds it. After 1049 from a prompt
+//! on the last row and a one-row shrink, the demote moves the saved slot up with the prompt,
+//! as xterm (`AdjustSavedCursor`), Alacritty, kitty, Ghostty and WezTerm do
+//! (`Grid::lend_saved_cursor`). A slot on a row the shrink trims stays past the grid,
+//! clamped only when DECRC or the 1049 exit reads it (`Grid::set_cursor`), so the
+//! checkpoint carries it unclamped and the handoff wire bounds it by the engine's ceiling
 //! (`seamless::checkpoint_meta_bound_violation`), not by the grid.
 //!
-//! The parity tests compare where the cursor lands by the text under it: a
-//! successor restored from the wire carries no history behind the saved
-//! primary, so a grow back appends a row where the live engine reveals the
-//! demoted one, and the same prompt sits one row higher there.
+//! The parity tests compare the text under the cursor: a successor restored from the wire
+//! has no history behind the saved primary, so a grow back appends a row where the live
+//! engine reveals the demoted one.
 
 use aterm_core::terminal::Terminal;
 
@@ -157,13 +150,11 @@ fn a_restored_terminal_leaves_the_alternate_screen_onto_the_same_cell_at_the_sam
     assert_eq!(under_cursor(&live), ("$ claude".to_string(), 8));
 }
 
-/// Grow-back parity — the production sequence. The outgoing process parks at
-/// 55 rows; the successor restores at 55, its "finishing" bar folds seconds
-/// later and every session grows back to 56; the user quits the full-screen
-/// app. On the live engine the grow reveals the demoted row and the prompt is
-/// back on row 55; the restored one has no history behind the saved primary,
-/// appends a row and keeps the prompt on row 54. Both slots followed their
-/// prompt, so both land after `$ claude`.
+/// Grow-back parity, the production sequence: the outgoing process parks at 55 rows, the
+/// successor restores at 55, grows back to 56, and the full-screen app quits. The live
+/// grow reveals the demoted row (prompt back on row 55); the restored engine has no
+/// history behind the saved primary, appends a row and keeps the prompt on row 54. Both
+/// slots followed their prompt, so both land after `$ claude`.
 #[test]
 fn a_restored_terminal_leaves_the_alternate_screen_onto_the_same_cell_after_growing_back() {
     let mut live = prompt_on_the_last_row();
@@ -213,10 +204,9 @@ fn a_restored_terminal_restores_a_bare_decrc_onto_the_same_cell_as_the_live_one(
     }
 }
 
-/// Pending-wrap parity: a slot saved at the last column with the wrap flag
-/// set, narrowed, carried, widened again, then restored — the next glyph
-/// lands on the same cell on both engines. A column clamped at capture would
-/// have lost the deferred wrap.
+/// Pending-wrap parity: a slot saved at the last column with the wrap flag set, narrowed,
+/// carried, widened again, then restored: the next glyph lands on the same cell on both
+/// engines (a column clamped at capture would lose the deferred wrap).
 #[test]
 fn a_restored_terminal_keeps_the_deferred_wrap_the_live_one_keeps() {
     let mut live = Terminal::new(ROWS, COLS);

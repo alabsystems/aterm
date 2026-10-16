@@ -15,9 +15,8 @@
 //! * The knote is one-shot: the read dequeues it, so the watch keeps what it
 //!   read and answers the same on every later call.
 //!
-//! The watch's descriptor is a kqueue, which `poll(2)` reports readable once an
-//! event is queued, so a single-threaded loop can wait on many watches beside
-//! its sockets ([`ExitWatch::as_raw_fd`]).
+//! `poll(2)` reports the watch's kqueue readable once the event is queued, so a
+//! single-threaded loop can wait on many watches beside its sockets ([`ExitWatch::as_raw_fd`]).
 //!
 //! Register while the target is alive; if it is already gone (`ESRCH`),
 //! [`ExitWatch::watch`] answers `None`. Other platforms also answer `None`
@@ -207,9 +206,8 @@ impl ExitWatch {
         self.kq.as_raw_fd()
     }
 
-    /// See the Darwin twin: no descriptor here (a watch is never built, since
-    /// [`ExitWatch::watch`] answers `None`). `-1` is the one value `poll(2)`
-    /// is defined to skip.
+    /// See the Darwin twin: never called, since [`ExitWatch::watch`] answers `None` here. `-1` is
+    /// the one value `poll(2)` skips.
     #[cfg(not(target_vendor = "apple"))]
     #[must_use]
     pub fn as_raw_fd(&self) -> i32 {
@@ -217,29 +215,22 @@ impl ExitWatch {
     }
 }
 
-/// The name of the thread an [`ExitMoment`] on `pid` waits on — what a test's
-/// stamp function checks to tell the kernel's report of that exit from its
-/// caller's own reads.
+/// The name of the thread an [`ExitMoment`] on `pid` waits on (a test's stamp checks it).
 #[must_use]
 pub fn exit_moment_thread(pid: u32) -> String {
     format!("aterm-exit-moment-{pid}")
 }
 
-/// When another process ended, read as close to the kernel's report as a
-/// reader can come: a thread that waits for nothing else calls `stamp` the
-/// moment the kernel reports the exit (Darwin: [`ExitWatch`]'s kqueue; Linux:
-/// a `pidfd`, which `poll(2)` reports readable once the process has exited).
-/// Neither event carries a time, so the stamp is the thread's own read on
-/// waking: after the exit, and before anything that must first learn of it.
+/// When another process ended: a thread that waits for nothing else calls `stamp` as the
+/// kernel reports the exit (Darwin: [`ExitWatch`]'s kqueue; Linux: a `pidfd`). Neither event
+/// carries a time, so the stamp is the thread's own read on waking: after the exit, and before
+/// anything that must first learn of it. If the pid was already reused, the stamp follows the
+/// later process's exit.
 ///
-/// Every stamp is at or after the exit of the process registered (of `pid`, or
-/// if the pid was already reused, of a later process). `None` for a pid
-/// already gone (`ESRCH`), a platform with no primitive (Windows, the BSDs), a
-/// thread that cannot be spawned, and on Linux a kernel without `pidfd_open`
-/// or an architecture whose syscall number is not wired.
-///
-/// Dropping the watch ends its thread (a pipe it also waits on is closed)
-/// without waiting for it.
+/// `None` for a pid already gone (`ESRCH`), a platform with no primitive (Windows, the BSDs), a
+/// thread that cannot be spawned, and on Linux a kernel without `pidfd_open` or an
+/// architecture whose syscall number is not wired. Dropping the watch ends its thread without
+/// waiting for it.
 #[derive(Debug)]
 pub struct ExitMoment<T> {
     stamped: std::sync::Arc<std::sync::OnceLock<T>>,
@@ -299,15 +290,13 @@ impl<T: Clone + Send + Sync + 'static> ExitMoment<T> {
     }
 }
 
-/// A descriptor that `poll(2)` reports readable once `pid` has exited — the
-/// one an [`ExitMoment`]'s thread waits on (Darwin: an [`ExitWatch`] kqueue;
-/// Linux: a `pidfd`), for a loop that waits on it beside its own descriptors.
-/// Nothing is read from it and nothing is reaped. `None`: see [`ExitMoment`].
+/// A descriptor `poll(2)` reports readable once `pid` has exited (Darwin: an [`ExitWatch`]
+/// kqueue; Linux: a `pidfd`), for a loop that waits on it beside its own. Nothing is read or
+/// reaped. `None`: see [`ExitMoment`].
 ///
-/// The watch is on the pid as it stands at the call. A caller whose pid may
-/// have been reissued proves it still names its process AFTER this returns:
-/// a process that ended before cannot come back under the same pid with the
-/// same start time.
+/// The watch is on the pid as it stands at the call: a caller whose pid may have been reissued
+/// proves it still names its process after this returns (a process that ended cannot come back
+/// under the same pid with the same start time).
 #[cfg(unix)]
 #[cfg(not(target_arch = "wasm32"))]
 #[must_use]
@@ -443,8 +432,7 @@ fn wait_readable(target: i32, cancel: i32) -> bool {
 #[cfg(all(test, unix))]
 mod moment_tests {
     use super::{ExitMoment, exit_moment_thread};
-    // `spawnfd`'s: a `sleep 600` here holds its stdio and nothing else of this
-    // process, not another test thread's pipe for as long as it lives.
+    // `spawnfd`'s, so a `sleep 600` does not hold another test thread's pipe.
     use crate::spawnfd::Command;
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
@@ -461,11 +449,8 @@ mod moment_tests {
         now
     }
 
-    /// The stamp comes with the exit, on the watch's own thread: nothing is
-    /// stamped while the child lives; once it is SIGKILLed the stamp lands
-    /// between the kill and a read after `wait` returns, without the owner
-    /// asking. A gone pid cannot be watched; a watch dropped before any exit
-    /// ends its thread without stamping.
+    /// The stamp lands after the kill, on the watch's own thread; a gone pid cannot be
+    /// watched; a watch dropped before the exit ends its thread without stamping.
     #[test]
     fn the_moment_is_stamped_when_the_kernel_reports_the_exit() {
         let mut child = Command::new("/bin/sleep")
@@ -521,8 +506,7 @@ mod moment_tests {
         let watch = ExitMoment::watch(idle.id(), stamp).expect("watch");
         let thread = watch.thread_alive();
         drop(watch);
-        // Bounded, as a hang detector: the thread holds its half of the stamp
-        // until it returns.
+        // The thread holds its half of the stamp until it returns.
         let deadline = Instant::now() + Duration::from_secs(60);
         while thread.upgrade().is_some() {
             assert!(
@@ -547,10 +531,8 @@ mod tests {
     // `spawnfd`'s, as in `moment_tests` above.
     use crate::spawnfd::{Command, Stdio};
 
-    /// A child that exits 7 reads `0x0700`, one SIGKILLed reads `0x9`, and the
-    /// second read answers the same as the first (the knote is one-shot; the
-    /// watch keeps it). The child is not reaped by the watch: `wait` still
-    /// answers afterwards.
+    /// Exit 7 reads `0x0700`, SIGKILL `0x9`; a second read answers the same, and the watch
+    /// does not reap.
     #[test]
     fn the_watch_reads_exit_and_signal_statuses() {
         let mut exits = Command::new("/bin/sh")
@@ -588,8 +570,8 @@ mod tests {
         assert!(ExitWatch::watch(1).is_none());
     }
 
-    /// Block on the watch's descriptor (poll), never on a clock: the kernel
-    /// queues the event inside `proc_exit`, which `wait` has already observed.
+    /// Block on the watch's descriptor, never on a clock: the event is queued inside
+    /// `proc_exit`, which `wait` has already observed.
     fn wait_for(watch: &ExitWatch) -> i32 {
         #[repr(C)]
         struct PollFd {

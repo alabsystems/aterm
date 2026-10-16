@@ -1,30 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 for `NativeUpdateCarriedHealth` (aterm-spec's
-//! `native_update_carried_health_model`; round-seven update audit, findings
-//! 206 and 207): a check warning and a stall warning a parent raised cross a
-//! self-update into a real successor `App`.
+//! Tier-1 for `NativeUpdateCarriedHealth` (aterm-spec's `native_update_carried_health_model`):
+//! a check warning and a stall warning a parent raised cross a self-update into a real
+//! successor `App`.
 //!
-//! Every transition of the committed model (`Buggy = 0`) is replayed against
-//! the shipping window code — the seed ([`App::seed_carried_messages`]), the
-//! one door ([`App::note_update_health`]) and the watchdog's look
-//! ([`App::look_at_update_checker`]) — and after each step the successor is
-//! PROJECTED onto the model's variables ([`project`]): the warnings that stand
-//! (their words kept for the record of their healing), the watchdog's armed
-//! heal and the digest lines owed. The updater is the
-//! writer half and stands in here as one flag, `owes`: the seed sets it from
-//! what the shipping seed handed the updater (`UPDATER_ADOPTED_HEALTH`), the
-//! recovery clears it and an announcement sets it; its own transitions are
-//! aterm-update's `persistent_notice_tests`. The ledger and this process's
-//! completed checks are the environment.
+//! Every transition of the committed model (`Buggy = 0`) is replayed against the shipping seed
+//! ([`App::seed_carried_messages`]), the one door ([`App::note_update_health`]) and the
+//! watchdog's look ([`App::look_at_update_checker`]); after each step the successor is
+//! projected onto the model's variables ([`project`]). The updater stands in as one flag,
+//! `owes`, set from what the seed handed it (`UPDATER_ADOPTED_HEALTH`); its own transitions are
+//! aterm-update's `persistent_notice_tests`. The ledger and this process's completed checks are
+//! the environment.
 //!
-//! NEGATIVE CONTROL: each `Buggy = 1` mutant's counterexample is replayed on
-//! the real successor — the code before the fix where one existed, the seed's
-//! own remember-only branch for `SeedRemembersOnly`, else the shipping seed
-//! with its one effect undone — and the real projection breaks the invariant
-//! the model says it breaks, while the shipping step at the same point keeps
-//! it.
+//! Negative control: each `Buggy = 1` mutant's counterexample, replayed on the real successor,
+//! breaks the invariant the model says it breaks, while the shipping step at the same point
+//! keeps it.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::Instant;
@@ -281,9 +272,8 @@ fn mutant_stand_in(rig: &mut Rig, action: &str) -> bool {
         rig.land();
     };
     match action {
-        // Keep the warning without handing its class to the updater (finding
-        // 206): what the shipping seed does with a check warning whose title
-        // names no ledger class, as the strand notice's does.
+        // Keep the warning without handing its class to the updater: what the shipping seed
+        // does with a check warning whose title names no ledger class (the strand notice).
         "SeedRemembersOnly" => {
             rig.carry = parent_carry(aterm_update::STRANDED_TITLE);
             seed(rig);
@@ -309,8 +299,7 @@ fn mutant_stand_in(rig: &mut Rig, action: &str) -> bool {
             rig.owes = false;
             true
         }
-        // The stall's heal before this change: latch, rows and record, but
-        // its digest claim left ripening.
+        // The stall's heal with its digest claim left ripening: latch, rows and record only.
         "StallHealKeepsEntry" => {
             let stalled = HealthKind::Stalled;
             let app = &mut rig.successor;
@@ -326,9 +315,8 @@ fn mutant_stand_in(rig: &mut Rig, action: &str) -> bool {
     }
 }
 
-/// THE NEGATIVE CONTROL: each mutant's counterexample on the real successor
-/// breaks the invariant it was written for, and the shipping step at the same
-/// point keeps it.
+/// Each mutant breaks its invariant on the real successor; the shipping step at the same point
+/// keeps it.
 #[test]
 fn negative_control_each_mutant_breaks_its_invariant_on_the_real_successor() {
     let buggy = interp::with_buggy(&native_update_carried_health_model(), 1);

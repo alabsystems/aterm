@@ -27,11 +27,8 @@ pub struct Frame {
 }
 
 impl Frame {
-    /// The framebuffer as tightly packed straight-alpha RGBA bytes (4 per
-    /// pixel, row-major).
-    ///
-    /// Packed frame pixels store transmittance in their top byte, so the output
-    /// alpha is `255 - transmittance`.
+    /// The framebuffer as tightly packed straight-alpha RGBA bytes (4 per pixel,
+    /// row-major), alpha `255 - transmittance`.
     #[must_use]
     pub fn rgba_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.pixels.len() * 4);
@@ -44,10 +41,8 @@ impl Frame {
         out
     }
 
-    /// Encode the rendered screen as a PNG — this is `read_image` (ATERM_DESIGN
-    /// §8): an intelligence reads the ACTUAL rendered pixels, not the engine's
-    /// idea of the grid. Translucent framebuffer pixels retain their converted
-    /// alpha in the RGBA output. Headless; no display needed.
+    /// Encode the rendered screen as an RGBA PNG (`read_image`, ATERM_DESIGN §8): the
+    /// actual rendered pixels, not the engine's idea of the grid. Headless.
     #[must_use]
     pub fn to_png(&self) -> Vec<u8> {
         let mut out = Vec::new();
@@ -55,9 +50,8 @@ impl Frame {
             let mut enc = aterm_png::Encoder::new(&mut out, self.width as u32, self.height as u32);
             enc.set_color(aterm_png::ColorType::Rgba);
             enc.set_depth(aterm_png::BitDepth::Eight);
-            // Frame RGB is canonical non-linear sRGB. Emit the sRGB chunk so
-            // wide-gamut/HDR viewers never have to guess how `image` bytes
-            // should be interpreted.
+            // Frame RGB is non-linear sRGB; the sRGB chunk says so, so wide-gamut
+            // viewers need not guess.
             enc.set_source_srgb(aterm_png::SrgbRenderingIntent::Perceptual);
             let mut w = enc.write_header().expect("png header");
             w.write_image_data(&self.rgba_bytes()).expect("png data");
@@ -66,21 +60,11 @@ impl Frame {
     }
 }
 
-/// A rendered frame's pixels WITHOUT necessarily owning them — the return of
-/// [`Rasterizer::render_input_cached`], the per-frame hot path that avoids
-/// cloning the whole framebuffer when the renderer can hand back a borrow.
-///
-/// The CPU [`crate::Frame`]-producing path clones its persistent damage cache
-/// into an owned `Frame` (an O(w·h) memcpy + allocation every frame). The
-/// windowed frontend then copies THAT into the presentation surface — two full
-/// framebuffer copies per frame. `RenderView` lets a renderer return a BORROW of
-/// its already-rendered cache instead, so the frontend's surface copy is the
-/// only one. Renderers with no borrowable cache (the GPU readback path) return
-/// the `Owned` variant via the trait's default `render_input_cached`, so the
-/// behavior there is unchanged.
-///
-/// Either way the bytes are byte-identical to [`Rasterizer::render_input`]; only
-/// the ownership (and thus the elided per-frame clone) differs.
+/// A rendered frame's pixels, borrowed or owned: the return of
+/// [`Rasterizer::render_input_cached`]. Borrowing the renderer's cache leaves the
+/// frontend's surface copy as the only per-frame framebuffer copy; renderers with no
+/// borrowable cache (the GPU readback path) return `Owned`. The bytes match
+/// [`Rasterizer::render_input`] either way.
 pub enum RenderView<'a> {
     /// A borrow of the renderer's own framebuffer (no per-frame clone/alloc):
     /// valid only until the renderer is next mutated.
@@ -125,14 +109,11 @@ impl RenderView<'_> {
     }
 }
 
-/// The injected rasterizer interface (ATERM_DESIGN WS-F). One trait, two
-/// implementations: `aterm_render::Renderer` (CPU, headless) and
-/// `aterm_gpu::GpuRenderer` (Metal/wgpu). A frontend depends on this trait, not
-/// on a concrete renderer, so the rasterizer is chosen by injection.
-///
-/// As of REARCH A-3 the trait is `&Terminal`-free: the engine produces the
-/// snapshot ([`aterm_core::terminal::Terminal::cell_frame_into`]) and a renderer
-/// consumes only [`RenderInput`]. The old `render(&Terminal, ...)` method is gone.
+/// The injected rasterizer interface, implemented by `aterm_render::Renderer` (CPU,
+/// headless) and `aterm_gpu::GpuRenderer`. A frontend depends on this trait, not on a
+/// concrete renderer. It never sees a `Terminal`: the engine produces the snapshot
+/// ([`aterm_core::terminal::Terminal::cell_frame_into`]) and a renderer consumes only
+/// [`RenderInput`].
 pub trait Rasterizer {
     /// Pixel size of one cell, `(width, height)`.
     fn cell_size(&self) -> (usize, usize);
@@ -140,16 +121,10 @@ pub trait Rasterizer {
     /// Render from a pre-extracted, owned snapshot — the lock-free frame path.
     fn render_input(&mut self, input: &RenderInput) -> Frame;
 
-    /// Render from a pre-extracted snapshot but return a [`RenderView`] — the
-    /// per-frame PRESENTATION hot path, which only needs to copy the pixels into
-    /// a surface, not own a `Frame`. A renderer that keeps its rendered pixels in
-    /// a persistent cache (the CPU damage cache) returns a BORROW of that cache,
-    /// eliding the per-frame `Frame` clone + allocation `render_input` would do.
-    ///
-    /// The default forwards to [`Self::render_input`] and wraps the owned `Frame`
-    /// (no borrow available, e.g. the GPU readback path) — so this is a strict
-    /// superset of `render_input` and is always safe to call. The bytes are
-    /// byte-identical to `render_input`.
+    /// Render from a pre-extracted snapshot into a [`RenderView`], the per-frame
+    /// presentation path: a renderer with a persistent pixel cache (the CPU damage
+    /// cache) returns a borrow of it and skips the `Frame` clone. The default wraps
+    /// [`Self::render_input`]'s owned `Frame`; the bytes are identical either way.
     fn render_input_cached(&mut self, input: &RenderInput) -> RenderView<'_> {
         RenderView::Owned(self.render_input(input))
     }
@@ -163,9 +138,7 @@ pub trait Rasterizer {
     fn set_cursor_style_override(&mut self, style: Option<CursorStyle>);
 }
 
-// The trait stays dyn-compatible: a frontend holds `Box<dyn Rasterizer>` and
-// picks the renderer by injection (the DI the design wants). Checked at compile
-// time; each renderer's `impl Rasterizer` is checked by its own crate's build.
+// The trait stays dyn-compatible: a frontend holds `Box<dyn Rasterizer>`.
 const _: Option<&dyn Rasterizer> = None;
 
 #[cfg(test)]

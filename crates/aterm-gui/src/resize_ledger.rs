@@ -168,6 +168,19 @@ pub(crate) const LEDGER_ROWS_CAP: usize = 128;
 pub(crate) const LEDGER_RUNS_CAP: usize = 64;
 /// The widest gap between two resizes of one run.
 pub(crate) const RUN_GAP_MS: u64 = 250;
+
+/// The run gap in force: [`RUN_GAP_MS`], or the development seam
+/// `ATERM_RESIZE_RUN_GAP_MS` (debug and dev-seams builds only), with which a
+/// live test joins a flap whose halves a stand-in's draw separates without
+/// racing the clock.
+fn run_gap_ms() -> u64 {
+    static GAP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *GAP.get_or_init(|| {
+        aterm_types::dev_seam!("ATERM_RESIZE_RUN_GAP_MS")
+            .and_then(|v| v.to_str()?.parse().ok())
+            .unwrap_or(RUN_GAP_MS)
+    })
+}
 /// How long after a run's last resize a draw is judged: time for a
 /// changed-size repaint that starts with a diff to finish (Claude Code's
 /// healthy repaint lands 5-30 ms after the flap).
@@ -1362,7 +1375,7 @@ impl ResizeLedger {
 fn joins_run(prev: &LedgerRow, report: &ResizeReport, now_ms: u64, run: &Run) -> bool {
     let silent = run.verdict == Verdict::Silent;
     let adjoins = report.adjoins(&prev.report);
-    let in_gap = now_ms.saturating_sub(prev.t_ms) <= RUN_GAP_MS;
+    let in_gap = now_ms.saturating_sub(prev.t_ms) <= run_gap_ms();
     let takes_back = silent && prev.timed && report.to == prev.report.from;
     (in_gap && (adjoins || takes_back)) || (silent && !run.drew && adjoins)
 }
@@ -3120,7 +3133,7 @@ mod tests {
     /// successor `fire` gave each action it enabled, and the states every
     /// invariant held at.
     ///
-    /// WHY (2026-10-05, gate speed): [`resize_render_conformance`] replays
+    /// WHY (test-run speed): [`resize_render_conformance`] replays
     /// each schedule from a fresh rig, so every prefix's states are asked
     /// about again for each of its extensions — and the interpreter's answers
     /// were 61% of the test's samples (`check_invariant` 48%, `fire` 9%,
@@ -3298,9 +3311,9 @@ mod tests {
     ///
     /// Each schedule is replayed on a fresh rig, so the subtrees below the
     /// schedules of length two are independent: they are walked side by side
-    /// (26 s walked in turn on the 6-core gate host, 2026-10-05), every
-    /// schedule still replayed exactly once, and the tallies are summed before
-    /// the assertions, which read the whole walk as before.
+    /// (26 s walked in turn on a 6-core host), every schedule still replayed
+    /// exactly once, and the tallies are summed before the assertions, which
+    /// read the whole walk as before.
     #[test]
     fn resize_render_conformance() {
         let model = resize_render_model();

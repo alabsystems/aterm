@@ -30,7 +30,7 @@
 //! classifies as `Other`, which the extractor refuses anyway.
 
 use std::cell::Cell;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::PathBuf;
 
 /// One entry, reduced to exactly what `atpkg::extract` reads out of it.
@@ -1427,10 +1427,10 @@ fn random_bytes_are_pinned() {
 #[test]
 fn streams_from_a_zstd_decoder_like_the_extractor() {
     let raw = handmade_archive();
-    let mut enc = zstd::Encoder::new(Vec::new(), 0).expect("encoder");
-    enc.write_all(&raw).expect("write");
-    let compressed = enc.finish().expect("finish");
-    let decoder = zstd::Decoder::new(&compressed[..]).expect("decoder");
+    let mut compressed = Vec::new();
+    aterm_zstd::frame::write_raw(&mut compressed, &raw, aterm_zstd::frame::Checksum::Xxh64)
+        .expect("frame");
+    let decoder = aterm_zstd::Decoder::new(&compressed[..]);
 
     use atpkg::tarread::Archive;
     let mut archive = Archive::new(decoder);

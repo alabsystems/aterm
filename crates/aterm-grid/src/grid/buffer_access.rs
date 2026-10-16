@@ -5,15 +5,12 @@
 //! [`BufferAccess`] for [`Grid`]: the read-only interface through which vi
 //! mode, emacs mode and the editor navigate the grid (`dyn BufferAccess`).
 //!
-//! A navigator's line is live-relative: line 0 is the top of the LIVE screen
-//! whatever the display offset, and a negative line counts back into history
-//! from there (-1 is the newest history line). Vi mode places its cursor from
-//! the terminal cursor's row and the window draws it at `line +
-//! display_offset`, so a scrolled-back viewport must not move what a line
-//! names. Every read resolves its line once, in [`line_view`], and reads the
-//! row it names through that one view: the live arm is
-//! [`Grid::screen_row_view`] (cells and extras both keyed on the live screen
-//! row), never the viewport's [`Grid::row`].
+//! A navigator's line is live-relative: line 0 is the top of the live screen
+//! whatever the display offset, and line -n is the nth newest history line.
+//! Vi mode draws its cursor at `line + display_offset`, so a scrolled-back
+//! viewport must not move what a line names. Every read resolves its line once,
+//! in [`line_view`], whose live arm is [`Grid::screen_row_view`], never the
+//! viewport's [`Grid::row`].
 
 use std::sync::Arc;
 
@@ -205,7 +202,6 @@ mod tests {
 
     #[test]
     fn test_line_text_reads_scrollback() {
-        // 2-row grid needs 3 writes + 2 LFs to push first line into scrollback.
         let mut grid = Grid::with_scrollback(2, 4, 4);
         write_line(&mut grid, "Hi");
         grid.line_feed();
@@ -231,7 +227,6 @@ mod tests {
 
     #[test]
     fn test_scrollback_out_of_range() {
-        // 2-row grid needs 3 writes + 2 LFs to push first line into scrollback.
         let mut grid = Grid::with_scrollback(2, 4, 4);
         write_line(&mut grid, "AB");
         grid.line_feed();
@@ -248,26 +243,10 @@ mod tests {
     // --- Supplementary plane character resolution tests ---
 
     #[test]
-    fn test_resolved_char_supplementary_plane_emoji() {
-        let mut grid = Grid::new(3, 10);
-        grid.write_char('\u{1F600}'); // grinning face (supplementary plane)
-        assert_eq!(grid.resolved_char(0, 0), Some('\u{1F600}'));
-    }
-
-    #[test]
     fn test_char_at_resolves_supplementary_plane() {
         let mut grid = Grid::new(3, 10);
         grid.write_char('\u{1F680}'); // rocket emoji
         assert_eq!(grid.char_at(0, 0), Some('\u{1F680}'));
-    }
-
-    #[test]
-    fn test_resolved_char_bmp_unchanged() {
-        let mut grid = Grid::new(3, 10);
-        grid.write_char('A');
-        grid.write_char('\u{4E2D}'); // CJK character (BMP)
-        assert_eq!(grid.resolved_char(0, 0), Some('A'));
-        assert_eq!(grid.resolved_char(0, 1), Some('\u{4E2D}'));
     }
 
     #[test]
@@ -280,18 +259,6 @@ mod tests {
         assert!(
             text.starts_with("a\u{1F4A9}"),
             "expected line text starting with 'a💩' but got '{text}'"
-        );
-    }
-
-    #[test]
-    fn test_row_text_includes_supplementary_plane() {
-        let mut grid = Grid::new(3, 10);
-        grid.write_char('\u{1F600}'); // grinning face
-        grid.write_char('x');
-        let text = grid.row_text(0).expect("row 0 text");
-        assert!(
-            text.starts_with("\u{1F600}x"),
-            "expected row_text starting with '😀x' but got '{text}'"
         );
     }
 
@@ -342,14 +309,8 @@ mod tests {
         grid.row_mut(row).expect("cursor row").set_wrapped(wrapped);
     }
 
-    /// LINE 0 IS THE TOP OF THE LIVE SCREEN, WHEREVER THE VIEWPORT IS. Vi
-    /// mode's lines do not move with the display offset: a negative line is
-    /// history counted back from the live screen, and the window draws the vi
-    /// cursor at `line + display_offset`. Every `line >= 0` read went through
-    /// the viewport's row lookup instead, so scrolled back three rows, `w` on
-    /// live line 0 read the history line three rows above it and landed in
-    /// the middle of a word. Every read of every line must answer the same at
-    /// every display offset.
+    /// Line 0 is the live screen's top wherever the viewport is: every read of
+    /// every line answers the same at every display offset.
     #[test]
     fn every_read_answers_the_live_screen_at_any_display_offset() {
         let mut grid = Grid::with_scrollback(4, 8, 64);

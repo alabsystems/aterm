@@ -3,13 +3,18 @@
 // Author: Andrew Yates
 
 //! aterm-spec-macros: Proc macros for TLA+ specification refinement attributes.
+//!
+//! The input is read with `aterm-macro-support`, on std `proc_macro` alone: no syn,
+//! proc-macro2 or quote (docs/AUDIT-third-party-2026-10-15.md, SP.8).
 
-#![deny(unsafe_op_in_unsafe_fn)]
-#![deny(clippy::all)]
+mod item;
+mod model;
+mod refusals;
 
-use proc_macro::TokenStream;
-use quote::{format_ident, quote};
-use syn::parse_macro_input;
+use aterm_macro_support::{Cursor, Error, lit, q};
+use proc_macro::{Ident, Literal, Span, TokenStream, TokenTree};
+
+use crate::item::FnItem;
 
 // ---------------------------------------------------------------------------
 // Source↔spec ANCHOR EMITTERS (TRUST_NATIVE_TLA, Phase 0).
@@ -17,15 +22,15 @@ use syn::parse_macro_input;
 // `#[refines]`, `#[spec_unmodeled]`, `#[spec_invariant]` were no-ops (parse the
 // args, discard, return the item). They are now ANCHOR EMITTERS: the annotated
 // item is left 100% unchanged at runtime, but each ALSO registers a compile-time-
-// collectable record into an `inventory` distributed slice (the records live in
+// collectable record into an `aterm_spec::registry` list (the records live in
 // `aterm_spec::xref`). The set of all bindings is then collectable at test time by
 // the `spec_xref_closure` gate, with NO source-text scanning.
 //
 // EMISSION SHAPE — these attributes sit on `&mut self` methods INSIDE `impl`
-// blocks. `inventory::submit!` expands to a module-level anonymous `const`, which
+// blocks. `registry::submit!` expands to a module-level anonymous `const`, which
 // is ILLEGAL as a bare impl item ("`const` items in this context need a name").
 // So each emitter wraps the submit inside a UNIQUELY-NAMED associated `const`
-// (`const __aterm_spec_<kind>_<fnident>: () = { inventory::submit!{…} };`), where
+// (`const __aterm_spec_<kind>_<fnident>: () = { registry::submit!{…} };`), where
 // the submit's anonymous const now lives inside a block expression (legal) and the
 // associated const name is unique within its impl (fn idents are unique per impl).
 // Verified to collect across crates from the host crate's unit-test build.
@@ -35,21 +40,11 @@ use syn::parse_macro_input;
 // DefId binding is Phase 3's `trust-ir` job, obligation 2).
 // ---------------------------------------------------------------------------
 
-/// Extract the annotated fn's identifier (for the unique const name + the
-/// `rust_method` diagnostic). Falls back to a generic name if the item is not a
-/// plain fn (defensive; all current usages are methods).
-fn item_fn_ident(item: &proc_macro2::TokenStream) -> proc_macro2::Ident {
-    // The attribute is applied to a fn; find the `fn <ident>` token pair.
-    let mut iter = item.clone().into_iter().peekable();
-    while let Some(tok) = iter.next() {
-        if let proc_macro2::TokenTree::Ident(id) = &tok
-            && id == "fn"
-            && let Some(proc_macro2::TokenTree::Ident(name)) = iter.peek()
-        {
-            return name.clone();
-        }
-    }
-    format_ident!("anon")
+/// The name the anchor's const and `rust_method` take from: the item's `fn` ident, or
+/// `anon` when the item is not a plain fn (defensive; all current usages are methods).
+fn item_fn_ident(item: &FnItem) -> Ident {
+    item.ident()
+        .unwrap_or_else(|| Ident::new("anon", Span::call_site()))
 }
 
 /// Map an arbitrary spec name (action/id) to a legal Rust identifier fragment for
@@ -62,6 +57,30 @@ fn sanitize_ident(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_alphanumeric() { c } else { '_' })
         .collect()
+}
+
+/// The anchor's const, `__aterm_spec_<kind>_<fn>[_<suffix>]`, at the fn ident's span.
+///
+/// A raw `r#name` contributes `name`. A name that still is not an identifier (an
+/// alphanumeric character Rust does not take in one) is an error, not a panic.
+fn anchor_const(kind: &str, suffix: Option<&str>, fn_ident: &Ident) -> Result<Ident, Error> {
+    let fn_name = fn_ident.to_string();
+    let fn_name = fn_name.strip_prefix("r#").unwrap_or(&fn_name);
+    let name = match suffix {
+        Some(suffix) => format!("__aterm_spec_{kind}_{fn_name}_{suffix}"),
+        None => format!("__aterm_spec_{kind}_{fn_name}"),
+    };
+    let lexed: Vec<TokenTree> = name
+        .parse::<TokenStream>()
+        .map(|s| s.into_iter().collect())
+        .unwrap_or_default();
+    match lexed.as_slice() {
+        [TokenTree::Ident(i)] if i.to_string() == name => Ok(Ident::new(&name, fn_ident.span())),
+        _ => Err(Error::new(
+            fn_ident.span(),
+            format!("`{name}` is not an identifier: name the action with letters, digits and `_`"),
+        )),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -106,264 +125,223 @@ fn entry_id_for(machine: &str, action: &str, rust_method: &str) -> String {
     format!("{machine}::{action} @ {rust_method}")
 }
 
-/// Prepend the entry probe to the annotated fn's body.
+/// The annotated fn with the entry probe as the first statement of its body.
 ///
 /// Returns `None` when the item is not an instrumentable fn (see the module note
 /// above); the caller then emits `entry_id: ""` so the gate can see the gap instead of
-/// mistaking an unprobed anchor for an entered one.
-fn inject_entry_probe(
-    item: &proc_macro2::TokenStream,
-    entry_id: &str,
-) -> Option<proc_macro2::TokenStream> {
-    let probe: syn::Stmt = syn::parse_quote! {
-        ::aterm_spec::xref::note_entered(#entry_id);
-    };
-    // `ImplItemFn` covers both the `impl`-block methods the anchors mostly sit on and
-    // free fns (same shape: attrs, vis, defaultness, sig, block); `ItemFn` is the
-    // belt-and-braces fallback. Inner attributes (`fn f() { #![allow(…)] … }`) are
-    // parsed onto the item by syn and re-printed inside the braces, so prepending at
-    // `stmts[0]` cannot displace them.
-    if let Ok(mut f) = syn::parse2::<syn::ImplItemFn>(item.clone()) {
-        if f.sig.constness.is_some() {
-            return None;
-        }
-        f.block.stmts.insert(0, probe);
-        return Some(quote! { #f });
-    }
-    if let Ok(mut f) = syn::parse2::<syn::ItemFn>(item.clone()) {
-        if f.sig.constness.is_some() {
-            return None;
-        }
-        f.block.stmts.insert(0, probe);
-        return Some(quote! { #f });
-    }
-    None
+/// mistaking an unprobed anchor for an entered one. Inner attributes
+/// (`fn f() { #![allow(…)] … }`) stay first in the body, so the probe cannot displace
+/// them.
+fn inject_entry_probe(item: &FnItem, entry_id: &str) -> Option<TokenStream> {
+    let probe = q!(
+        "::aterm_spec::xref::note_entered(#id);",
+        id = Literal::string(entry_id)
+    );
+    item.with_probe(&probe)
 }
 
+/// The `key = "value"` list an anchor attribute takes, each key one of `keys`. A key
+/// written twice keeps its last value.
+struct Keys(Vec<(&'static str, String)>);
+
+impl Keys {
+    fn parse(attr: TokenStream, keys: &[&'static str]) -> Result<Self, Error> {
+        let mut c = Cursor::new(attr, Span::call_site());
+        let mut found: Vec<(&'static str, String)> = Vec::new();
+        while !c.is_empty() {
+            let ident = model::expect_name(&mut c, "identifier")?;
+            c.expect_punct('=', "`=`")?;
+            let value = expect_str(&mut c)?;
+            let name = ident.to_string();
+            let Some(key) = keys.iter().find(|k| **k == name) else {
+                return Err(Error::new(ident.span(), format!("unknown key: {name}")));
+            };
+            found.retain(|(k, _)| k != key);
+            found.push((key, value));
+            if !c.is_empty() {
+                c.expect_punct(',', "`,`")?;
+            }
+        }
+        Ok(Keys(found))
+    }
+
+    fn get(&self, key: &str) -> Option<String> {
+        self.0
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| v.clone())
+    }
+
+    /// The value of a key the attribute must carry.
+    fn require(&self, key: &str) -> Result<String, Error> {
+        self.get(key)
+            .ok_or_else(|| Error::new(Span::call_site(), format!("missing `{key}` key")))
+    }
+}
+
+/// Takes a string literal's value (raw or escaped; a suffix is ignored).
+fn expect_str(c: &mut Cursor) -> Result<String, Error> {
+    let span = c.span();
+    match c.next() {
+        Some(TokenTree::Literal(l)) => lit::str_lit(&l)
+            .map(|s| s.value)
+            .ok_or_else(|| Error::new(l.span(), "expected string literal")),
+        _ => Err(Error::new(span, "expected string literal")),
+    }
+}
+
+/// Runs an expansion, turning its error into a `compile_error!`.
+fn emit(expansion: Result<TokenStream, Error>) -> TokenStream {
+    expansion.unwrap_or_else(|e| e.to_compile_error())
+}
+
+/// Bind a fn to the model action it performs: `machine`, `action` and the
+/// `project` fn Tier-1 reads the real state through, all required.
+///
+/// ```compile_fail
+/// #[aterm_spec_macros::refines(machine = "Ring", action = "Push")]
+/// fn push() {}
+/// ```
 #[proc_macro_attribute]
 pub fn refines(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let meta = syn::parse_macro_input!(attr as RefinesMeta);
-    let item2: proc_macro2::TokenStream = item.into();
-    let fn_ident = item_fn_ident(&item2);
+    emit(expand_refines(attr, item))
+}
+
+fn expand_refines(attr: TokenStream, item: TokenStream) -> Result<TokenStream, Error> {
+    let keys = Keys::parse(attr, &["machine", "action", "project"])?;
+    let machine = keys.require("machine")?;
+    let action = keys.require("action")?;
+    // The projection fn path (`project="…"`): names the &self -> abstract vars mapping
+    // Tier-1 conformance reads the real state through. Required and non-empty: an anchor
+    // with no projection binds a fn to an action with nothing to compare the real state
+    // against.
+    let project = keys
+        .get("project")
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| {
+            Error::new(
+                Span::call_site(),
+                "missing `project` key: name the fn that projects the real state onto the \
+             model's variables",
+            )
+        })?;
+    let item = FnItem::new(item);
+    let fn_ident = item_fn_ident(&item);
     // Disambiguate the anchor const by ACTION as well as fn name: a single method
     // may legitimately implement MORE THAN ONE spec action (e.g. the `write_all`
     // drain loop is both `Progress` and `Interrupted`), so two `#[refines]` on the
     // same fn must emit two DISTINCTLY-NAMED consts (a bare `__aterm_spec_refines_
     // <fn>` would collide). `sanitize_ident` keeps the suffix a legal identifier.
-    let const_name = format_ident!(
-        "__aterm_spec_refines_{}_{}",
-        fn_ident,
-        sanitize_ident(&meta.action)
-    );
+    let const_name = anchor_const("refines", Some(&sanitize_ident(&action)), &fn_ident)?;
     let rust_method = fn_ident.to_string();
-    let machine = meta.machine;
-    let action = meta.action;
-    let project = meta.project.unwrap_or_default();
     // Execution evidence: probe the annotated body and record the SAME id on the
     // anchor, so the gate can ask "did this fn actually run?" and not just "does this
     // string exist?". An un-probeable item keeps the old behaviour (item verbatim) and
     // says so with an empty `entry_id`.
     let candidate_id = entry_id_for(&machine, &action, &rust_method);
-    let (item_out, entry_id) = match inject_entry_probe(&item2, &candidate_id) {
+    let (item_out, entry_id) = match inject_entry_probe(&item, &candidate_id) {
         Some(probed) => (probed, candidate_id),
-        None => (item2, String::new()),
+        None => (item.stream(), String::new()),
     };
-    quote! {
-        #item_out
+    Ok(q!(
+        "#item_out
         #[allow(non_upper_case_globals)]
         const #const_name: () = {
-            ::aterm_spec::inventory::submit! {
-                ::aterm_spec::xref::RefinementAnchor {
+            ::aterm_spec::registry::submit! {
+                ::aterm_spec::xref::RefinementAnchor => ::aterm_spec::xref::RefinementAnchor {
                     machine: #machine,
                     action: #action,
                     rust_method: #rust_method,
-                    location: concat!(file!(), ":", line!()),
+                    location: concat!(file!(), \":\", line!()),
                     project: #project,
                     entry_id: #entry_id,
                 }
             }
-        };
-    }
-    .into()
+        };",
+        item_out,
+        const_name,
+        machine = Literal::string(&machine),
+        action = Literal::string(&action),
+        rust_method = Literal::string(&rust_method),
+        project = Literal::string(&project),
+        entry_id = Literal::string(&entry_id)
+    ))
 }
 
 #[proc_macro_attribute]
 pub fn spec_invariant(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let meta = syn::parse_macro_input!(attr as InvariantMeta);
-    let item2: proc_macro2::TokenStream = item.into();
-    let fn_ident = item_fn_ident(&item2);
-    let const_name = format_ident!("__aterm_spec_invariant_{}", fn_ident);
+    emit(expand_spec_invariant(attr, item))
+}
+
+fn expand_spec_invariant(attr: TokenStream, item: TokenStream) -> Result<TokenStream, Error> {
+    // `tla` is accepted and documents the claim; nothing reads it.
+    let keys = Keys::parse(attr, &["id", "machine", "tla"])?;
+    let id = keys.require("id")?;
+    let machine = keys.get("machine").unwrap_or_default();
+    let item = FnItem::new(item);
+    let fn_ident = item_fn_ident(&item);
+    let const_name = anchor_const("invariant", None, &fn_ident)?;
     let rust_method = fn_ident.to_string();
-    let id = meta.id;
-    let machine = meta.machine.unwrap_or_default();
-    quote! {
-        #item2
+    Ok(q!(
+        "#item
         #[allow(non_upper_case_globals)]
         const #const_name: () = {
-            ::aterm_spec::inventory::submit! {
-                ::aterm_spec::xref::InvariantAnchor {
+            ::aterm_spec::registry::submit! {
+                ::aterm_spec::xref::InvariantAnchor => ::aterm_spec::xref::InvariantAnchor {
                     machine: #machine,
                     id: #id,
                     rust_method: #rust_method,
-                    location: concat!(file!(), ":", line!()),
+                    location: concat!(file!(), \":\", line!()),
                 }
             }
-        };
-    }
-    .into()
+        };",
+        item = item.stream(),
+        const_name,
+        machine = Literal::string(&machine),
+        id = Literal::string(&id),
+        rust_method = Literal::string(&rust_method)
+    ))
 }
 
 #[proc_macro_attribute]
 pub fn spec_unmodeled(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let meta = syn::parse_macro_input!(attr as UnmodeledMeta);
-    let item2: proc_macro2::TokenStream = item.into();
-    let fn_ident = item_fn_ident(&item2);
+    emit(expand_spec_unmodeled(attr, item))
+}
+
+fn expand_spec_unmodeled(attr: TokenStream, item: TokenStream) -> Result<TokenStream, Error> {
+    // `machine` and `action` are optional: they tie the waiver to a specific machine
+    // action so it discharges that action for the coverage obligation (§2.2 (3)).
+    let keys = Keys::parse(attr, &["reason", "machine", "action"])?;
+    let reason = keys.require("reason")?;
+    let machine = keys.get("machine").unwrap_or_default();
+    let action = keys.get("action").unwrap_or_default();
+    let item = FnItem::new(item);
+    let fn_ident = item_fn_ident(&item);
     // Disambiguate by waived action (like `refines`): a fn may waive more than one
     // spec action, so two `#[spec_unmodeled]` on one fn need distinct const names.
-    let const_name = format_ident!(
-        "__aterm_spec_unmodeled_{}_{}",
-        fn_ident,
-        sanitize_ident(meta.action.as_deref().unwrap_or(""))
-    );
+    let const_name = anchor_const("unmodeled", Some(&sanitize_ident(&action)), &fn_ident)?;
     let rust_method = fn_ident.to_string();
-    let reason = meta.reason;
-    let machine = meta.machine.unwrap_or_default();
-    let action = meta.action.unwrap_or_default();
-    quote! {
-        #item2
+    Ok(q!(
+        "#item
         #[allow(non_upper_case_globals)]
         const #const_name: () = {
-            ::aterm_spec::inventory::submit! {
-                ::aterm_spec::xref::Waiver {
+            ::aterm_spec::registry::submit! {
+                ::aterm_spec::xref::Waiver => ::aterm_spec::xref::Waiver {
                     machine: #machine,
                     action: #action,
                     reason: #reason,
                     rust_method: #rust_method,
-                    location: concat!(file!(), ":", line!()),
+                    location: concat!(file!(), \":\", line!()),
                 }
             }
-        };
-    }
-    .into()
-}
-
-struct RefinesMeta {
-    machine: String,
-    action: String,
-    project: Option<String>,
-}
-
-impl syn::parse::Parse for RefinesMeta {
-    fn parse(input: syn::parse::ParseStream<'_>) -> syn::Result<Self> {
-        let mut machine = None;
-        let mut action = None;
-        let mut project = None;
-        while !input.is_empty() {
-            let ident: syn::Ident = input.parse()?;
-            let _: syn::Token![=] = input.parse()?;
-            let lit: syn::LitStr = input.parse()?;
-            match ident.to_string().as_str() {
-                "machine" => machine = Some(lit.value()),
-                "action" => action = Some(lit.value()),
-                // The projection fn path (`project="…"`): names the &self -> abstract
-                // vars mapping used by Tier-1 conformance. Optional in Phase 0.
-                "project" => project = Some(lit.value()),
-                other => {
-                    return Err(syn::Error::new(
-                        ident.span(),
-                        format!("unknown key: {other}"),
-                    ));
-                }
-            }
-            if !input.is_empty() {
-                let _: syn::Token![,] = input.parse()?;
-            }
-        }
-        Ok(RefinesMeta {
-            machine: machine
-                .ok_or_else(|| syn::Error::new(input.span(), "missing `machine` key"))?,
-            action: action.ok_or_else(|| syn::Error::new(input.span(), "missing `action` key"))?,
-            project,
-        })
-    }
-}
-
-struct InvariantMeta {
-    id: String,
-    machine: Option<String>,
-    _tla: Option<String>,
-}
-
-impl syn::parse::Parse for InvariantMeta {
-    fn parse(input: syn::parse::ParseStream<'_>) -> syn::Result<Self> {
-        let mut id = None;
-        let mut machine = None;
-        let mut tla = None;
-        while !input.is_empty() {
-            let ident: syn::Ident = input.parse()?;
-            let _: syn::Token![=] = input.parse()?;
-            let lit: syn::LitStr = input.parse()?;
-            match ident.to_string().as_str() {
-                "id" => id = Some(lit.value()),
-                "machine" => machine = Some(lit.value()),
-                "tla" => tla = Some(lit.value()),
-                other => {
-                    return Err(syn::Error::new(
-                        ident.span(),
-                        format!("unknown key: {other}"),
-                    ));
-                }
-            }
-            if !input.is_empty() {
-                let _: syn::Token![,] = input.parse()?;
-            }
-        }
-        Ok(InvariantMeta {
-            id: id.ok_or_else(|| syn::Error::new(input.span(), "missing `id` key"))?,
-            machine,
-            _tla: tla,
-        })
-    }
-}
-
-struct UnmodeledMeta {
-    reason: String,
-    machine: Option<String>,
-    action: Option<String>,
-}
-
-impl syn::parse::Parse for UnmodeledMeta {
-    fn parse(input: syn::parse::ParseStream<'_>) -> syn::Result<Self> {
-        let mut reason = None;
-        let mut machine = None;
-        let mut action = None;
-        while !input.is_empty() {
-            let ident: syn::Ident = input.parse()?;
-            let _: syn::Token![=] = input.parse()?;
-            let lit: syn::LitStr = input.parse()?;
-            match ident.to_string().as_str() {
-                "reason" => reason = Some(lit.value()),
-                // Optional: tie the waiver to a specific machine action so it
-                // discharges that action for the coverage obligation (§2.2 (3)).
-                "machine" => machine = Some(lit.value()),
-                "action" => action = Some(lit.value()),
-                other => {
-                    return Err(syn::Error::new(
-                        ident.span(),
-                        format!("unknown key: {other}"),
-                    ));
-                }
-            }
-            if !input.is_empty() {
-                let _: syn::Token![,] = input.parse()?;
-            }
-        }
-        Ok(UnmodeledMeta {
-            reason: reason.ok_or_else(|| syn::Error::new(input.span(), "missing `reason` key"))?,
-            machine,
-            action,
-        })
-    }
+        };",
+        item = item.stream(),
+        const_name,
+        machine = Literal::string(&machine),
+        action = Literal::string(&action),
+        reason = Literal::string(&reason),
+        rust_method = Literal::string(&rust_method)
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -384,12 +362,18 @@ impl syn::parse::Parse for UnmodeledMeta {
 //               lo = if (seq + 1) - lo + 1 > Cap { lo + 1 } else { lo };
 //           }
 //           invariant LenBounded: seq - lo + 1 <= Cap;
+//           bound SeqBounded: seq <= MaxSeq;
 //       }
 //   }
 //
 // Identifiers declared `const` become TLA+ CONSTANTS; everything else resolves to
-// a state variable. Supported operators: + - > <= == && and if/else (mapped to
-// the `Expr` builders in `aterm_spec::derive`: `==` -> `eq` = TLA+ `=`, `&&` ->
+// a state variable. `scenario Budget = 2;` declares a configuration the real code
+// also runs under (constant overrides, never `Buggy`): the sweeps hold the model
+// in it beside the committed one. `invariant` states a design claim, which some
+// mutant must break; `bound` states the box the checkers walk (a range over one
+// variable), which none is expected to; `uncaught` marks a claim no mutant breaks
+// yet. Supported operators: + - > <= == && || and if/else (mapped to the `Expr`
+// builders in `aterm_spec::derive`: `==` -> `eq` = TLA+ `=`, `&&` ->
 // `and_` = TLA+ `/\`). The `==`/`&&` forms support the `Buggy`-convention guards
 // (e.g. `Buggy == 1 && active == 1`) the proves-and-catches models use. The macro
 // emits absolute `::aterm_spec::derive::*` paths, so it works in any crate
@@ -399,249 +383,97 @@ impl syn::parse::Parse for UnmodeledMeta {
 /// See module-level note above. Expands to an `::aterm_spec::derive::Model`.
 #[proc_macro]
 pub fn ty_model(input: TokenStream) -> TokenStream {
-    let def = parse_macro_input!(input as ModelDef);
-    match def.expand() {
-        Ok(ts) => ts.into(),
-        Err(e) => e.to_compile_error().into(),
-    }
+    emit(model::expand(input))
 }
 
-struct ActionDef {
-    name: syn::Ident,
-    guard: Option<syn::Expr>,
-    updates: Vec<(syn::Ident, syn::Expr)>,
-}
-
-struct ModelDef {
-    name: syn::Ident,
-    consts: Vec<(syn::Ident, i64)>,
-    vars: Vec<(syn::Ident, i64)>,
-    actions: Vec<ActionDef>,
-    invariants: Vec<(syn::Ident, syn::Expr)>,
-}
-
-impl syn::parse::Parse for ModelDef {
-    fn parse(input: syn::parse::ParseStream<'_>) -> syn::Result<Self> {
-        let name: syn::Ident = input.parse()?;
-        let body;
-        syn::braced!(body in input);
-        let mut consts = Vec::new();
-        let mut vars = Vec::new();
-        let mut actions = Vec::new();
-        let mut invariants = Vec::new();
-        while !body.is_empty() {
-            if body.peek(syn::Token![const]) {
-                body.parse::<syn::Token![const]>()?;
-                let id: syn::Ident = body.parse()?;
-                body.parse::<syn::Token![=]>()?;
-                let lit: syn::LitInt = body.parse()?;
-                body.parse::<syn::Token![;]>()?;
-                consts.push((id, lit.base10_parse::<i64>()?));
-                continue;
-            }
-            let kw: syn::Ident = body.parse()?;
-            match kw.to_string().as_str() {
-                "var" => {
-                    let id: syn::Ident = body.parse()?;
-                    body.parse::<syn::Token![=]>()?;
-                    let lit: syn::LitInt = body.parse()?;
-                    body.parse::<syn::Token![;]>()?;
-                    vars.push((id, lit.base10_parse::<i64>()?));
-                }
-                "action" => {
-                    let aname: syn::Ident = body.parse()?;
-                    let guard = if body.peek(syn::Ident) {
-                        let w: syn::Ident = body.parse()?;
-                        if w != "when" {
-                            return Err(syn::Error::new(w.span(), "expected `when` or `{`"));
-                        }
-                        let g;
-                        syn::parenthesized!(g in body);
-                        Some(g.parse::<syn::Expr>()?)
-                    } else {
-                        None
-                    };
-                    let ab;
-                    syn::braced!(ab in body);
-                    let mut updates = Vec::new();
-                    while !ab.is_empty() {
-                        let lhs: syn::Ident = ab.parse()?;
-                        ab.parse::<syn::Token![=]>()?;
-                        let rhs: syn::Expr = ab.parse()?;
-                        ab.parse::<syn::Token![;]>()?;
-                        updates.push((lhs, rhs));
-                    }
-                    actions.push(ActionDef {
-                        name: aname,
-                        guard,
-                        updates,
-                    });
-                }
-                "invariant" => {
-                    let iname: syn::Ident = body.parse()?;
-                    body.parse::<syn::Token![:]>()?;
-                    let e: syn::Expr = body.parse()?;
-                    body.parse::<syn::Token![;]>()?;
-                    invariants.push((iname, e));
-                }
-                other => {
-                    return Err(syn::Error::new(
-                        kw.span(),
-                        format!("expected const/var/action/invariant, found `{other}`"),
-                    ));
-                }
-            }
-        }
-        Ok(ModelDef {
-            name,
-            consts,
-            vars,
-            actions,
-            invariants,
-        })
-    }
-}
-
-impl ModelDef {
-    fn expand(&self) -> syn::Result<proc_macro2::TokenStream> {
-        let const_names: std::collections::HashSet<String> =
-            self.consts.iter().map(|(id, _)| id.to_string()).collect();
-        let name_str = self.name.to_string();
-
-        let consts_toks = self.consts.iter().map(|(id, v)| {
-            let s = id.to_string();
-            quote! { (#s, #v) }
-        });
-        let vars_toks = self.vars.iter().map(|(id, v)| {
-            let s = id.to_string();
-            quote! { ::aterm_spec::derive::StateVar { name: #s, init: #v } }
-        });
-
-        let mut actions_toks = Vec::new();
-        for a in &self.actions {
-            let an = a.name.to_string();
-            let guard = match &a.guard {
-                Some(g) => {
-                    let t = tr_expr(g, &const_names)?;
-                    quote! { Some(#t) }
-                }
-                None => quote! { None },
-            };
-            let mut ups = Vec::new();
-            for (lhs, rhs) in &a.updates {
-                let s = lhs.to_string();
-                let t = tr_expr(rhs, &const_names)?;
-                ups.push(quote! { ::aterm_spec::derive::Update { var: #s, expr: #t } });
-            }
-            actions_toks.push(quote! {
-                ::aterm_spec::derive::Action { name: #an, guard: #guard, updates: vec![ #(#ups),* ] }
-            });
-        }
-
-        let mut invs_toks = Vec::new();
-        for (id, e) in &self.invariants {
-            let s = id.to_string();
-            let t = tr_expr(e, &const_names)?;
-            invs_toks.push(quote! { ::aterm_spec::derive::Invariant { name: #s, expr: #t } });
-        }
-
-        Ok(quote! {
-            ::aterm_spec::derive::Model {
-                name: #name_str,
-                consts: vec![ #(#consts_toks),* ],
-                vars: vec![ #(#vars_toks),* ],
-                fn_vars: vec![],
-                actions: vec![ #(#actions_toks),* ],
-                invariants: vec![ #(#invs_toks),* ],
-            }
-        })
-    }
-}
-
-/// The single tail expression of a one-expression block (`{ expr }`).
-fn block_tail(block: &syn::Block) -> syn::Result<&syn::Expr> {
-    if let [syn::Stmt::Expr(e, None)] = block.stmts.as_slice() {
-        Ok(e)
-    } else {
-        Err(syn::Error::new_spanned(
-            block,
-            "if/else branch must be a single expression",
-        ))
-    }
-}
-
-/// Translate the else branch (a `{ block }` or a nested `if`) to an `Expr`.
-fn tr_else(
-    e: &syn::Expr,
-    consts: &std::collections::HashSet<String>,
-) -> syn::Result<proc_macro2::TokenStream> {
-    match e {
-        syn::Expr::Block(b) => tr_expr(block_tail(&b.block)?, consts),
-        _ => tr_expr(e, consts),
-    }
-}
-
-/// Translate a restricted `syn::Expr` to `aterm_spec::derive::Expr` builder calls.
-fn tr_expr(
-    e: &syn::Expr,
-    consts: &std::collections::HashSet<String>,
-) -> syn::Result<proc_macro2::TokenStream> {
-    match e {
-        syn::Expr::Lit(syn::ExprLit {
-            lit: syn::Lit::Int(i),
-            ..
-        }) => {
-            let v: i64 = i.base10_parse()?;
-            Ok(quote! { ::aterm_spec::derive::int(#v) })
-        }
-        syn::Expr::Path(p) => {
-            if let Some(id) = p.path.get_ident() {
-                let id = id.to_string();
-                if consts.contains(&id) {
-                    Ok(quote! { ::aterm_spec::derive::cst(#id) })
-                } else {
-                    Ok(quote! { ::aterm_spec::derive::var(#id) })
-                }
-            } else {
-                Err(syn::Error::new_spanned(e, "expected a simple identifier"))
-            }
-        }
-        syn::Expr::Paren(p) => tr_expr(&p.expr, consts),
-        syn::Expr::Binary(b) => {
-            let l = tr_expr(&b.left, consts)?;
-            let r = tr_expr(&b.right, consts)?;
-            let f = match b.op {
-                syn::BinOp::Add(_) => quote! { ::aterm_spec::derive::add },
-                syn::BinOp::Sub(_) => quote! { ::aterm_spec::derive::sub },
-                syn::BinOp::Gt(_) => quote! { ::aterm_spec::derive::gt },
-                syn::BinOp::Le(_) => quote! { ::aterm_spec::derive::le },
-                syn::BinOp::Eq(_) => quote! { ::aterm_spec::derive::eq },
-                syn::BinOp::And(_) => quote! { ::aterm_spec::derive::and_ },
-                syn::BinOp::Or(_) => quote! { ::aterm_spec::derive::or_ },
-                _ => {
-                    return Err(syn::Error::new_spanned(
-                        e,
-                        "unsupported operator (use + - > <= == && ||)",
-                    ));
-                }
-            };
-            Ok(quote! { #f(#l, #r) })
-        }
-        syn::Expr::If(ifx) => {
-            let Some((_, else_expr)) = &ifx.else_branch else {
-                return Err(syn::Error::new_spanned(
-                    e,
-                    "`if` must have an `else` branch",
-                ));
-            };
-            let c = tr_expr(&ifx.cond, consts)?;
-            let t = tr_expr(block_tail(&ifx.then_branch)?, consts)?;
-            let f = tr_else(else_expr, consts)?;
-            Ok(quote! { ::aterm_spec::derive::if_(#c, #t, #f) })
-        }
-        other => Err(syn::Error::new_spanned(
-            other,
-            "unsupported expression in ty_model!",
+/// The fn a registering attribute sits on, and its name: a free `fn` with a body.
+fn registered_fn(item: TokenStream, attribute: &str) -> Result<(FnItem, Ident), Error> {
+    let item = FnItem::new(item);
+    match (item.fn_with_body(), item.ident()) {
+        (Some(_), Some(ident)) => Ok((item, ident)),
+        _ => Err(Error::new(
+            Span::call_site(),
+            format!("`#[{attribute}]` goes on a fn with a body"),
         )),
+    }
+}
+
+/// Register a hand-built model: `#[aterm_spec::model]` on a `fn() -> Model`.
+///
+/// `ty_model!` registers what it writes; this is the door for a model built as
+/// a `Model` literal or by a `derive::props` generator (function-valued state,
+/// shapes the macro cannot spell).
+#[proc_macro_attribute]
+pub fn model(attr: TokenStream, item: TokenStream) -> TokenStream {
+    emit(expand_model(attr, item))
+}
+
+fn expand_model(attr: TokenStream, item: TokenStream) -> Result<TokenStream, Error> {
+    if !attr.is_empty() {
+        return Err(Error::new(
+            Span::call_site(),
+            "`#[model]` takes no arguments",
+        ));
+    }
+    let (item, ident) = registered_fn(item, "model")?;
+    Ok(q!(
+        "#f
+        ::aterm_spec::registry::submit! {
+            ::aterm_spec::xref::RegisteredModel => ::aterm_spec::xref::RegisteredModel {
+                build: #ident,
+                scenarios: &[],
+                location: ::core::concat!(::core::file!(), \":\", ::core::line!()),
+            }
+        }",
+        f = item.stream(),
+        ident
+    ))
+}
+
+/// Register a liveness obligation with the model it is stated over:
+/// `#[aterm_spec::liveness(some_model)]` on a `fn() -> Liveness`, where
+/// `some_model` is the `fn() -> Model` it holds of.
+#[proc_macro_attribute]
+pub fn liveness(attr: TokenStream, item: TokenStream) -> TokenStream {
+    emit(expand_liveness(attr, item))
+}
+
+fn expand_liveness(attr: TokenStream, item: TokenStream) -> Result<TokenStream, Error> {
+    let over = model_path(attr)?;
+    let (item, ident) = registered_fn(item, "liveness")?;
+    Ok(q!(
+        "#f
+        ::aterm_spec::registry::submit! {
+            ::aterm_spec::xref::RegisteredLiveness => ::aterm_spec::xref::RegisteredLiveness {
+                model: #over,
+                liveness: #ident,
+                location: ::core::concat!(::core::file!(), \":\", ::core::line!()),
+            }
+        }",
+        f = item.stream(),
+        over,
+        ident
+    ))
+}
+
+/// The path `#[liveness(...)]` names its model's fn by: `name`, `a::b` or `::a::b`,
+/// passed through as written.
+fn model_path(attr: TokenStream) -> Result<TokenStream, Error> {
+    let tokens: Vec<TokenTree> = Cursor::new(attr, Span::call_site()).collect();
+    let mut c = Cursor::new(tokens.iter().cloned().collect(), Span::call_site());
+    c.eat_op("::");
+    loop {
+        if !matches!(c.next(), Some(TokenTree::Ident(_))) {
+            return Err(Error::spanned_by(
+                &tokens,
+                "expected the path of the model's `fn() -> Model`",
+            ));
+        }
+        if c.is_empty() {
+            return Ok(tokens.into_iter().collect());
+        }
+        if c.eat_op("::").is_none() {
+            return Err(Error::new(c.span(), "expected `::` or the end of the path"));
+        }
     }
 }

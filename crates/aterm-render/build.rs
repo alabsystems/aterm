@@ -20,8 +20,13 @@
 //! The sibling match is EXACT (`Cinzel-var.ttf` -> `Cinzel-var.LICENSE.txt`),
 //! not a prefix or a fuzzy stem, so a new asset can never inherit cover from a
 //! neighbour's notice by being named near it.
+//!
+//! It also asks the compiler for `cfg(clean_islands)`.
 
 use std::path::{Path, PathBuf};
+
+#[path = "../aterm-log/clean_islands.rs"]
+mod clean_islands;
 
 /// The directories holding gated bundled faces, relative to the manifest: the
 /// display faces (`assets/game/`) and the terminal font STACK
@@ -52,6 +57,7 @@ const GRANT_MARKERS: &[&str] = &[
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    clean_islands::emit();
     let manifest =
         PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("cargo sets the manifest dir"));
     let mut failures = Vec::new();

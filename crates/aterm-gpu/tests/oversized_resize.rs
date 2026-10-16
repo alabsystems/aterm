@@ -3,19 +3,15 @@
 //
 // An oversized grid must not abort the process.
 //
-// The control-socket `resize` verb allows up to 4096 rows/cols (aterm-core's
-// MAX_GRID_ROWS/COLS) but does not bound pixels. The padded framebuffer
-// (`cols·cell_w + 2·pad`) sizes both the swapchain and the offscreen, and wgpu
-// validates textures against `max_texture_dimension_2d`; with no uncaptured-error
-// handler a violation panics and aborts. Both sites clamp the framebuffer to the
-// device limit, so an extreme grid renders a clipped view.
+// The control-socket `resize` verb allows up to 4096 rows/cols (MAX_GRID_ROWS/
+// COLS) but does not bound pixels. The padded framebuffer (`cols·cell_w +
+// 2·pad`) sizes both the swapchain and the offscreen, and wgpu validates
+// textures against `max_texture_dimension_2d`; with no uncaptured-error handler
+// a violation panics and aborts. Both sites clamp the framebuffer to the device
+// limit, so an extreme grid renders a clipped view. These tests drive the
+// offscreen path (a swapchain needs a real window).
 //
-// This drives the offscreen path (`render_input` → `encode_frame` →
-// `offscreen_texture`; a swapchain needs a real window) with two different
-// oversized grids and checks that neither aborts and both clamp to the same
-// readback width, the device limit.
-//
-// Skips without a GPU or system font.
+// A host without a GPU cannot run them (`common::gpu`).
 
 use aterm_core::terminal::Terminal;
 use aterm_gpu::{GpuRenderer, PresentCrop, WindowGpu};
@@ -28,17 +24,14 @@ use crate::common;
 fn offscreen_width(gpu: &mut GpuRenderer, win: &mut WindowGpu, rows: usize, cols: usize) -> usize {
     let mut term = Terminal::new(rows as u16, cols as u16);
     let input = term.cell_frame(rows, cols);
-    // Returns a frame whose width is clamped to the device limit.
     gpu.render_input(win, &input, None).width
 }
 
 #[test]
 fn oversized_grid_clamps_offscreen_instead_of_aborting() {
-    // A LARGE font so a modest column count (well within MAX_GRID_COLS == 4096, so
-    // aterm-core doesn't clamp the grid) already blows past even a 32768-limit GPU.
-    let Some(mut gpu) = common::gpu_or_skip(40.0, Theme::default()) else {
-        return;
-    };
+    // A large font so a modest column count (within MAX_GRID_COLS == 4096, so
+    // aterm-core keeps the grid) already blows past even a 32768-limit GPU.
+    let mut gpu = common::gpu(40.0, Theme::default());
     let (cw, _ch) = gpu.cell_size();
     assert!(cw >= 1, "cell width must be positive");
 
@@ -86,9 +79,7 @@ fn oversized_grid_clamps_offscreen_instead_of_aborting() {
 /// crop is normalized to that prefix rather than rejected.
 #[test]
 fn oversized_tall_grid_normalizes_cropped_virtual_present() {
-    let Some(mut gpu) = common::gpu_or_skip(18.0, Theme::default()) else {
-        return;
-    };
+    let mut gpu = common::gpu(18.0, Theme::default());
     let (rows, cols) = (2048usize, 4usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
     let input = term.cell_frame(rows, cols);
@@ -99,10 +90,16 @@ fn oversized_tall_grid_normalizes_cropped_virtual_present() {
     let resident = gpu.render_input(&mut win, &input, None);
     let resident_h = u32::try_from(resident.height).expect("GPU extent fits u32");
     let resident_w = u32::try_from(resident.width).expect("GPU extent fits u32");
-    if resident_h >= logical_h {
-        eprintln!("SKIP: logical height {logical_h}px did not exceed this device's resident limit");
-        return;
+    let max = gpu.max_texture_dim();
+    if logical_h <= max {
+        aterm_spec::host::could_not_run(format!(
+            "this device's texture limit {max}px holds the {logical_h}px frame"
+        ));
     }
+    assert_eq!(
+        resident_h, max,
+        "the resident offscreen clamps to the device limit"
+    );
 
     // Three rows removed above and two below is a valid asymmetric logical crop
     // whose end lies below the resident prefix; the GPU trims its height to
@@ -165,17 +162,12 @@ fn oversized_tall_grid_normalizes_cropped_virtual_present() {
 }
 
 // Instance streams are bounded by the clamped framebuffer: `encode_frame` skips
-// cells whose pixel origin is off-screen (byte-identical, since they were
-// clipped anyway), so a dense MAX_GRID grid cannot request a vertex buffer past
-// `max_buffer_size`, which would abort.
-//
-// This renders a wide, short, width-clamped grid with every cell filled and
-// checks the total instance count stays well below the grid cell count.
+// cells whose pixel origin is off-screen (they were clipped anyway), so a dense
+// MAX_GRID grid cannot request a vertex buffer past `max_buffer_size`, which
+// would abort.
 #[test]
 fn densely_filled_oversized_grid_bounds_instances_no_abort() {
-    let Some(mut gpu) = common::gpu_or_skip(40.0, Theme::default()) else {
-        return;
-    };
+    let mut gpu = common::gpu(40.0, Theme::default());
     let (cw, _ch) = gpu.cell_size();
     let mut win = WindowGpu::new();
 
@@ -184,16 +176,15 @@ fn densely_filled_oversized_grid_bounds_instances_no_abort() {
     let rows = 8usize;
     let cols = 4096usize;
     let mut term = Terminal::new(rows as u16, cols as u16);
-    // Fill EVERY cell with a non-space glyph (autowrap tiles the whole grid) so the
-    // GlyphInstance stream is maximal.
+    // Fill every cell with a non-space glyph (autowrap tiles the whole grid) so
+    // the GlyphInstance stream is maximal.
     term.process(&vec![b'X'; rows * cols]);
     let input = term.cell_frame(rows, cols);
 
     let frame = gpu.render_input(&mut win, &input, None);
     let total = gpu.last_instances();
 
-    // Reaching here == no abort (an unbounded glyph/bg stream's `create_buffer`
-    // would exceed max_buffer_size and abort).
+    // Reaching here == no abort.
     assert!(total >= 1, "a densely-filled grid must emit some instances");
     // Streams are bounded by the on-screen area: unbounded code would build
     // about two instances per cell.
@@ -218,20 +209,14 @@ fn densely_filled_oversized_grid_bounds_instances_no_abort() {
     );
 }
 
-// The scissored dirty-row band clamps both its top and bottom to the clamped
-// framebuffer height. A change confined to a row below the clamp (the prompt on
-// the bottom row of a tall grid) would otherwise produce a scissor outside the
-// render target, which wgpu rejects with an abort; clamped, it is a zero-height
-// in-bounds rect.
-//
-// This presents a tall clamped grid, then changes only the bottom row (cursor
-// hidden) through the real scissored path; the scissor counter shows the
+// The scissored dirty-row band clamps its top and bottom to the clamped
+// framebuffer height: a change confined to a row below the clamp (the prompt on
+// the bottom row of a tall grid) would otherwise build a scissor outside the
+// render target, which wgpu rejects with an abort. The scissor counter shows the
 // dirty-row path ran.
 #[test]
 fn oversized_tall_grid_bottom_row_change_scissors_without_abort() {
-    let Some(mut gpu) = common::gpu_or_skip(18.0, Theme::default()) else {
-        return;
-    };
+    let mut gpu = common::gpu(18.0, Theme::default());
     let (_cw, ch) = gpu.cell_size();
     let mut win = WindowGpu::new();
     gpu.set_cursor_blink_phase(true);
@@ -253,16 +238,15 @@ fn oversized_tall_grid_bottom_row_change_scissors_without_abort() {
         frame.height
     );
 
-    // Frame 2: change ONLY the BOTTOM row — its pixel origin is far below the clamp.
-    // An unclamped scissor origin would exceed the attachment ⇒ validation abort.
+    // Frame 2: change only the bottom row, its pixel origin far below the clamp.
     term.process(format!("\x1b[{rows};1HZ").as_bytes());
     let mut input2 = term.cell_frame(rows, cols);
     input2.cursor_visible = false;
     let scissor_before = gpu.scissor_taken();
     let frame2 = gpu.present_input_readback(&mut win, &input2);
 
-    // Reaching here == no abort. The change was reusable (same dims/offset), so the
-    // SCISSOR path — the one that built the out-of-bounds rect — must have run.
+    // Reaching here == no abort. The change was reusable (same dims/offset), so
+    // the scissor path, the one that built the out-of-bounds rect, must have run.
     assert!(
         gpu.scissor_taken() > scissor_before,
         "a bottom-row-only change on a reusable frame must take the scissor path"
@@ -289,9 +273,7 @@ fn oversized_tall_grid_bottom_row_change_scissors_without_abort() {
 // band's `y0` collapses to a degenerate rect instead of an invalid one.
 #[test]
 fn oversized_tall_grid_below_fold_scissor_clamps_no_abort() {
-    let Some(mut gpu) = common::gpu_or_skip(40.0, Theme::default()) else {
-        return;
-    };
+    let mut gpu = common::gpu(40.0, Theme::default());
     let (cw, ch) = gpu.cell_size();
     assert!(cw >= 1 && ch >= 1, "cell size must be positive");
     let mut win = WindowGpu::new();
@@ -303,25 +285,28 @@ fn oversized_tall_grid_below_fold_scissor_clamps_no_abort() {
     let cols = 4usize;
     let mut term = Terminal::new(rows as u16, cols as u16);
 
-    // Frame 1 (FULL, first frame): paint the BOTTOM row so the only content lives
-    // below the fold and the cursor stays there (no above-fold dirty row in frame 2).
+    // Frame 1 (full, first frame): paint the bottom row so the only content and
+    // the cursor live below the fold (no above-fold dirty row in frame 2).
     term.process(format!("\x1b[{rows};1Ha").as_bytes());
     let in1 = term.cell_frame(rows, cols);
     let frame1 = gpu.present_input_readback(&mut win, &in1);
     assert_eq!(gpu.full_repaints(), 1, "first frame must be a full repaint");
     assert_eq!(gpu.scissor_taken(), 0);
 
-    // The height must have clamped for a below-fold dirty row to exist; skip on
-    // a GPU with a larger limit.
+    // The height must clamp for a below-fold dirty row to exist; a device
+    // whose limit holds the whole grid cannot run this.
     let requested_h = rows * ch;
-    if frame1.height >= requested_h {
-        eprintln!(
-            "SKIP: offscreen height {} not clamped below requested {requested_h}px \
-             (max_texture_dimension_2d too large to exercise the below-fold scissor)",
-            frame1.height
-        );
-        return;
+    let max = gpu.max_texture_dim() as usize;
+    if requested_h <= max {
+        aterm_spec::host::could_not_run(format!(
+            "this device's texture limit {max}px holds the {requested_h}px grid"
+        ));
     }
+    assert!(
+        frame1.height < requested_h,
+        "the offscreen height {} clamps below the requested {requested_h}px",
+        frame1.height
+    );
 
     // Frame 2: change only the bottom row; its `y0` is far past the clamped `h`
     // and clamps to it.
@@ -330,7 +315,7 @@ fn oversized_tall_grid_below_fold_scissor_clamps_no_abort() {
     let scissor_before = gpu.scissor_taken();
     let frame2 = gpu.present_input_readback(&mut win, &in2);
 
-    // Reaching here == the InvalidScissorRect abort is fixed.
+    // Reaching here == no InvalidScissorRect abort.
     assert!(
         gpu.scissor_taken() > scissor_before,
         "a single below-fold row change must take the scissor path (exercising the clamp)"
@@ -344,35 +329,4 @@ fn oversized_tall_grid_below_fold_scissor_clamps_no_abort() {
          {}x{} (requested height {requested_h}px, cell {cw}x{ch}) — no abort",
         frame2.width, frame2.height
     );
-}
-
-// `GpuContext::offscreen_texture` is public, so it bounds its own extent:
-// `clamp_tex_dim` floors to 1 and caps at `max_texture_dimension_2d`. Two
-// different oversized widths landing on one width shows the cap is the device
-// limit.
-#[test]
-fn offscreen_texture_clamps_zero_and_oversized_dims() {
-    let ctx = match aterm_gpu::GpuContext::new() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("SKIP: no GPU available: {e}");
-            return;
-        }
-    };
-    // Reaching each assert == `create_texture` did not abort.
-    let dims = |w, h| {
-        let t = ctx.offscreen_texture(w, h);
-        (t.width(), t.height())
-    };
-    assert_eq!(dims(0, 4), (1, 4), "width 0 clamps up to 1");
-    assert_eq!(dims(6, 0), (6, 1), "height 0 clamps up to 1");
-    assert_eq!(dims(0, 0), (1, 1), "0x0 clamps to 1x1");
-    let (a, h) = dims(40_000, 4);
-    let (b, _) = dims(80_000, 4);
-    assert_eq!(h, 4, "an in-range height passes through");
-    assert!(
-        a < 40_000,
-        "width {a} must be clamped below the 40000px request"
-    );
-    assert_eq!(a, b, "oversized widths must clamp to the SAME device limit");
 }

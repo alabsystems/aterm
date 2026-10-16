@@ -37,7 +37,7 @@ test = false
 
 [features]
 # Compile this crate's source↔spec anchors into the LIBRARY, for a
-# downstream test binary that collects them via `inventory` (aterm-gui's
+# downstream test binary that collects them via `aterm_spec::registry` (aterm-gui's
 # `spec_xref_closure` gate): `#[refines]` on the live upgrade's ladder (its
 # gate, its rung, the repaint-proof settle's look and the Codex daemon's pin,
 # machine `HarnessUpgradeLadder`), its goal pause (the pause's step, its
@@ -59,7 +59,7 @@ dev-seams = []
 
 [dependencies]
 # Optional: pulled into the LIBRARY only by the off-by-default `spec-anchors`
-# feature (the anchor macros emit `::aterm_spec::inventory::submit!`).
+# feature (the anchor macros emit `::aterm_spec::registry::submit!`).
 aterm-spec = { workspace = true, optional = true }
 # Predicate constructors (idle/seq/block/row-match). Agent knowledge lives HERE;
 # the engine core knows nothing of "a turn" or "a Claude prompt".
@@ -103,7 +103,7 @@ aterm-time = { workspace = true }
 aterm-json = { workspace = true }
 # Selective transcript deserialization validates discarded tool payloads without
 # constructing their Value trees. Already in aterm-json's shipped closure.
-serde = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 # The box escalation cuts the badge's line by terminal CELLS, not chars (a wide
 # character is two): the workspace's own width tables, `char_width`. Not a new
 # edge in the shipped graph — aterm-core already links it — and its one
@@ -140,6 +140,13 @@ aterm-toml = { workspace = true }
 # in the shipped graph — aterm-core links it into both binaries — and its own
 # dependencies (aterm-digest, aterm-uds) are already this crate's.
 aterm-shell-integration = { workspace = true }
+# The memory ceiling's thrash line IS the strain engine's warn enter line
+# (`supervise::memory::THRASH_SWAP_KIB_S` re-exports it), and the upgrade's
+# words tests hand every arm to the exceptions door
+# (`aterm_messages::exceptions::Entry::message`) the window's host hands them
+# to. Not a new edge in the shipped graph — aterm-gui already links it — and
+# its one dependency, aterm-time, is already this crate's.
+aterm-messages = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 # The disk reclaim (`harness::disk::target`) reaches every profile, lock and
@@ -172,18 +179,12 @@ aterm-session = { workspace = true }
 # channel-bound capability. Transport-only test deps; no cycle (aterm-net ⊄ aterm-agent).
 aterm-net = { workspace = true }
 # Test scratch directories removed on drop. First-party, zero dependencies.
-aterm-tempfile = { workspace = true, features = ["stand-in"] }
+aterm-tempfile = { workspace = true }
 # The upgrade tests' pseudo-terminals, both ends close-on-exec from birth
 # (`open_pty_pair`): an `openpty(3)` pair is inheritable, and the shell spawned
 # onto it kept a copy of its own master. Already in this test build through
 # aterm-session; no cycle (aterm-pty does not depend on aterm-agent).
 aterm-pty = { workspace = true }
-# The upgrade's owner-facing words are handed to the exceptions door
-# (`aterm_messages::exceptions::Entry::message`) by the window's host; the words
-# tests hand every arm to that same door, so a word it refuses fails here, not
-# as an entry never shown. Test-only; no cycle (aterm-messages depends only on
-# aterm-time).
-aterm-messages = { workspace = true }
 
 # ---- integration tests (autotests = false above) ----------------------------
 
@@ -200,3 +201,9 @@ path = "tests/footer_window_allocations.rs"
 [[test]]
 name = "transcript_allocations"
 path = "tests/transcript_allocations.rs"
+
+# Alone: counts large allocator requests while parsing composed profile secrets.
+# Never inspects allocation payloads or uninitialized spare capacity.
+[[test]]
+name = "profile_sentinels"
+path = "tests/profile_sentinels.rs"

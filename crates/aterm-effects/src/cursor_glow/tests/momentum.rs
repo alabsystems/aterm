@@ -9,7 +9,7 @@ use super::*;
 /// kitty consumer groups. The glow engine's and the cursor cat's instances
 /// evolve identically under one keystream, and each consumer keys off it:
 /// (1) the star envelope/density via the eased `rainbow.disp` spine,
-/// (2) the fresh-ink pop via the spine frozen at birth (`InkPop::mom`),
+/// (2) the fresh-ink pop via the spine frozen at birth,
 /// (3) the one-body cat wake via its band+dwell over the same value.
 #[test]
 fn momentum_unifies_glow_and_cat_metrics() {
@@ -20,8 +20,8 @@ fn momentum_unifies_glow_and_cat_metrics() {
     let mut out = Vec::new();
     let mut t = Instant::now();
     glow.tick(Some((3, 0)), t, &c, g, &mut out);
-    // Phase 1 — a casual word: the two instances read the SAME value at
-    // every stamp, and every consumer agrees it is unearned.
+    // Phase 1, a casual word: the two instances read the same value at every
+    // stamp.
     for col in 1..=10u16 {
         t += Duration::from_millis(60);
         cat.on_key(t, true);
@@ -34,16 +34,15 @@ fn momentum_unifies_glow_and_cat_metrics() {
             cat.momentum(t)
         );
     }
-    // Ten keys at human cadence is a word, enough for the star onset; this
-    // phase pins that both engines agree at every stamp and the cat (whose
-    // earn bar is higher) stays unearned.
+    // Ten keys is a word, enough for the star onset; the cat's higher earn bar
+    // keeps it unearned.
     assert!(!cat.is_active(), "cat wake: unearned ⇒ no cat");
     assert_eq!(
         cat.frame(t).alpha,
         0,
         "cat visibility: an unearned run has no live companion frame"
     );
-    // A delete drains BOTH instances identically (never builds).
+    // A delete drains both instances identically (never builds).
     t += Duration::from_millis(80);
     let before = glow.typing_momentum(t);
     cat.on_key(t, false);
@@ -58,9 +57,9 @@ fn momentum_unifies_glow_and_cat_metrics() {
         "deletes drain, never build"
     );
     // Phase 2, sustained flow (~6.6 s): the shared value crosses the star
-    // onset and then the cat band (0.90, dwell 3.0 s in kitty_cursor.rs), so
-    // the shower and the cat are earned together. Line ends continue via the
-    // wrap-shaped move, which classifies as typing.
+    // onset and then the cat band (`CAT_BAND` held for `CAT_DWELL` in
+    // kitty_cursor.rs), so the shower and the cat are earned together. Line
+    // ends continue via the wrap-shaped move, which classifies as typing.
     let (mut row, mut col) = (3u16, 9u16);
     for _ in 0..110 {
         t += Duration::from_millis(60);
@@ -140,9 +139,7 @@ fn program_output_alone_builds_no_momentum() {
 /// The classifier knows whether a licensed cursor move is a fold, and the
 /// cursor-cat channel preserves that verdict for the ordinary next-row shape,
 /// an explicit preview-only same-row reflow projection, and the exact
-/// Backspace inverse; a navigation-shaped relocation mints nothing. Real
-/// bottom-scroll reachability is covered by the real-App ContentScrollState
-/// test in `app_input`.
+/// Backspace inverse; a navigation-shaped relocation mints nothing.
 #[test]
 fn cursor_cat_motion_pulse_preserves_licensed_fold_shape() {
     let g = geom();

@@ -2,7 +2,7 @@
 name = "aterm-wasm"
 version.workspace = true
 edition = "2021"
-description = "wasm-bindgen binding: the aterm engine + CPU rasterizer (aterm-render) -> RGBA frames, for rendering a terminal on a <canvas> in the Electron renderer. The in-page replacement substrate for @xterm/xterm's rendering."
+description = "The aterm engine + CPU rasterizer (aterm-render) -> RGBA frames as a wasm module, for rendering a terminal on a <canvas> in the Electron renderer. The in-page replacement substrate for @xterm/xterm's rendering."
 license = "MIT"
 
 [lib]
@@ -10,9 +10,9 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 # aterm engine + pure-Rust CPU rasterizer (fonts via `aterm_render::font` over
-# ttf-parser, shaping via rustybuzz), all wasm32-safe.
-# default-features = false drops the disk-tier cold scrollback (libc mmap + zstd-sys
-# C), which cannot target wasm32; a renderer needs only the RAM/LZ4 tiers.
+# aterm-font, shaping via aterm-font's shaper), all wasm32-safe.
+# default-features = false drops the disk-tier cold scrollback (libc mmap), which
+# cannot target wasm32; a renderer needs only the RAM/LZ4 tiers.
 # "sixel" adds aterm-sixel (pure Rust, no libc/C) for Sixel DCS images.
 aterm-core = { path = "../aterm-core", default-features = false, features = ["sixel"] }
 aterm-render = { path = "../aterm-render", default-features = false }
@@ -35,15 +35,18 @@ aterm-time = { workspace = true }
 aterm-types = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-# Matches aterm-gpu-web's pin so both web crates share the one workspace lock.
-wasm-bindgen = "=0.2.108"
-console_error_panic_hook = "0.1"
+# The host boundary, with no dependency of its own: `#[export]` marks what JS
+# sees and `verify glue` writes the glue (no wasm-bindgen: wasm-platform
+# WP.7), and the panic hook reports `console.error` with the JS stack, in
+# console_error_panic_hook's format, through the `aterm_host` imports
+# src/host.rs names (docs/AUDIT-third-party-2026-10-15.md, WP.3).
+aterm-wasm-abi = { workspace = true, features = ["export"] }
 # No getrandom row: nothing needs it. Measured with `cargo tree -p aterm-wasm
 # --target wasm32-unknown-unknown -i getrandom`: aterm's own manifests were its
 # only parents, so a defensive row alone pulled getrandom + js-sys (2 packages /
 # 9,774 lines) into the shipped module. A transitive dep
 # that selects it on wasm32 fails loudly with getrandom's "unsupported target".
-# Guarded by tools/grep_guard.sh B18.
+# deny.toml bans it outside ring (`forge check` [OB-18]).
 
 # NOTE: no per-crate [profile.release] — profiles only take effect from the
 # workspace root, which already sets lto/codegen-units=1/strip for release. A wasm
@@ -52,8 +55,8 @@ console_error_panic_hook = "0.1"
 [dev-dependencies]
 # TEST-ONLY: the control socket's percent-encoder, which `messages_api`'s
 # `pct_encode` copies byte for byte (`aterm-control` takes the engine's disk
-# tier, whose zstd C library cannot target wasm32, so the shipped module keeps
-# the copy) — `pct_encode_is_the_control_wires` holds the two together.
+# tier, whose mmap store cannot target wasm32, so the shipped module keeps the
+# copy) — `pct_encode_is_the_control_wires` holds the two together.
 # Dev-dependencies never enter the shipped wasm32 graph (resolver 2), and the
 # wasm census's derived closure excludes them.
 aterm-control = { workspace = true }

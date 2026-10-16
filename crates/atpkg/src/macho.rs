@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The Mach-O files of a staged tree, found by MAGIC rather than by name, so a platform
+//! The Mach-O files of a staged tree, found by magic rather than by name, so a platform
 //! signature check reaches every binary the tree carries, whatever it is called.
 
 use std::path::{Path, PathBuf};
@@ -158,9 +158,8 @@ pub(crate) fn executable_files(root: &Path) -> Result<Vec<PathBuf>, StageError> 
 }
 
 /// Clear every execute bit on a regular file under `root` that is not this platform's
-/// native executable ([`is_native_executable`]): a vendor tree's data (codex 0.156.0 ships
-/// `codex-resources/voice/runtime.json` at 0755) must not be runnable through `/bin/sh`.
-/// Returns whether any mode changed.
+/// native executable ([`is_native_executable`]), so vendor data shipped at 0755 is not
+/// runnable through `/bin/sh`. Returns whether any mode changed.
 ///
 /// # Errors
 /// [`StageError::Io`] when the tree cannot be read or a mode cannot be set.
@@ -205,9 +204,7 @@ mod tests {
     }
 
     /// Every thin magic in either byte order is a Mach-O, and so is a universal header of
-    /// either width and either order with ANY nonzero arch count — 45 and 200 among them,
-    /// counts the kernel executes (measured: a 45-arch wrapper around a signed arm64 binary
-    /// runs), and the range a Java class file's version word falls in.
+    /// either width and order with any nonzero arch count, a Java class file's included.
     #[test]
     fn thin_and_fat_headers_are_recognised_at_any_arch_count() {
         for magic in THIN_MAGICS {
@@ -245,9 +242,8 @@ mod tests {
         assert!(!is_macho_header(b""));
     }
 
-    /// The walk finds thin and fat Mach-Os at any depth by content — whatever their
-    /// names, and whatever their arch count — and skips everything else; the list is
-    /// sorted.
+    /// The walk finds thin and fat Mach-Os at any depth by content, whatever their names or
+    /// arch counts, skips everything else, and sorts the list.
     #[test]
     fn the_walk_finds_thin_and_fat_files_by_content() {
         let d = tmp("walk");
@@ -276,8 +272,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// A tree with no Mach-O answers an empty list, not an error — requiring one is the
-    /// gate's decision, not the walk's.
+    /// A tree with no Mach-O is an empty list, not an error: requiring one is the gate's call.
     #[test]
     fn a_tree_without_macho_is_an_empty_list() {
         let d = tmp("none");

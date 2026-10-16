@@ -85,6 +85,7 @@ fn record() -> SessionRecord {
         role: None,
         attention: None,
         questions: None,
+        autopilot: None,
         control: None,
         frozen_path: false,
         identity: None,
@@ -97,6 +98,7 @@ fn record() -> SessionRecord {
         history_withheld: false,
         history_lost: 0,
         hold: None,
+        more_holds: Vec::new(),
         supervisor: None,
         claim_known: false,
         attention_owners: Vec::new(),
@@ -104,6 +106,7 @@ fn record() -> SessionRecord {
         render_debt: None,
         fabric: Default::default(),
         timeline_id: 0,
+        log_ids: None,
         journal_key: None,
     }
 }

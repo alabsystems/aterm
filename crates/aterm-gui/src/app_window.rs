@@ -461,7 +461,7 @@ impl App {
     ///
     /// Three consumers must agree: the Windows class brush
     /// (`window_set_background_color`), every unstyled cell of the first frame
-    /// (`applied_terminal_config_for_with_assets`), and the bands around the grid
+    /// (the engine projection `App::install_colors` installs), and the bands around the grid
     /// (`present_band_bg`, which uses the theme until OSC 11 sets one).
     /// `early_reveal_backdrop_is_the_colour_the_first_frame_paints` pins this;
     /// `attach_os_window` checks it per launch. It is not a persisted "last
@@ -504,35 +504,41 @@ impl App {
     /// The theme the window's chrome painters (tab band strip tones, native pages'
     /// role palette) draw from; the terminal grid always uses the terminal theme.
     ///
-    /// macOS/Windows return the terminal theme: their titlebar is painted by the
-    /// platform via [`crate::platform::AppRt::window_set_appearance`].
-    ///
-    /// On Linux:
-    ///
-    ///  * `Auto` — the terminal theme, matching what
-    ///    [`Self::chrome_theme_for_apprt`] resolves the CSD to;
+    ///  * `Auto` — the terminal theme (on Linux this matches what
+    ///    [`Self::chrome_theme_for_apprt`] resolves the CSD to);
     ///  * `Light`/`Dark` matching the terminal theme's darkness — the terminal
     ///    theme;
     ///  * `Light`/`Dark` against it — the authored forced palette
     ///    ([`crate::native_appearance::forced_chrome_theme`]), accent carried from
     ///    the terminal theme.
     ///
-    /// The CSD variant, strip and native pages classify the same background with
-    /// the same predicate ([`crate::tab_bar::theme_is_dark`], also used by the role
+    /// The same on every platform, so a forced Window appearance turns the
+    /// Settings pages and the in-window chrome along with the title bar the OS
+    /// paints ([`crate::platform::AppRt::window_set_appearance`]). The strip,
+    /// the native pages and the Linux CSD classify the background with one
+    /// predicate ([`crate::tab_bar::theme_is_dark`], also used by the role
     /// pipeline), so they always pick the same side.
     pub(crate) fn chrome_palette_theme(&self) -> aterm_render::Theme {
-        // The pixel-band platforms (Linux, Windows; `STRIP_IS_CHROME_BAND`)
-        // resolve a forced `window_theme` into an authored chrome palette so the
-        // whole chrome (tab band and native pages) flips, not just the OS caption
-        // (owner, 2026-08-25).
-        // `Auto` passes through. macOS paints tabs in the native toolbar and keeps
-        // the pass-through.
-        #[cfg(any(target_os = "linux", windows))]
-        {
-            crate::native_appearance::resolve_chrome_palette(self.window_theme, self.theme)
-        }
-        #[cfg(not(any(target_os = "linux", windows)))]
-        self.theme
+        crate::native_appearance::resolve_chrome_palette(self.window_theme, self.theme)
+    }
+
+    /// The palette native pages (Settings, documents) draw from: the chrome
+    /// palette of the color theme itself, before the per-key color overrides,
+    /// so a Foreground or Background picked for the terminal does not recolor
+    /// the app's own pages. The terminal theme still reaches the pages' live
+    /// previews.
+    pub(crate) fn native_page_palette_theme(&self) -> aterm_render::Theme {
+        let theme = self
+            .config
+            .theme_before_color_overrides(
+                self.os_appearance,
+                &self.config_assets.themes,
+                self.theme_preview
+                    .as_ref()
+                    .map(|preview| preview.id.as_str()),
+            )
+            .unwrap_or(self.theme);
+        crate::native_appearance::resolve_chrome_palette(self.window_theme, theme)
     }
 
     pub(crate) fn front_mut(&mut self) -> Option<&mut WindowState> {
@@ -544,7 +550,8 @@ impl App {
     /// Logical window creation (no winit): mint a fresh [`WindowId`], spawn a
     /// single-tab session at `rows`×`cols`, register it and install a fresh
     /// [`WindowState`] as frontmost. `None` if the spawn failed, in which case no
-    /// window is minted. `create_window_internal` wraps it with the surface attach.
+    /// window is minted. `create_window_internal_connected` wraps it with the
+    /// surface attach.
     #[allow(
         clippy::too_many_arguments,
         reason = "the window's birth facts — geometry, cwd, the seamless adoptee, the \
@@ -723,42 +730,19 @@ impl App {
         wid
     }
 
-    /// Full window creation: the logical seam plus, when not headless, the winit OS
-    /// window attach. The new window inherits the front window's grid (80×24 if no
-    /// window exists). Headless second windows are refused earlier, at
-    /// `Wake::CreateWindow`. `cwd_override` starts the first session in a given
-    /// directory; `None` for user-driven opens.
-    pub(crate) fn create_window_internal(
-        &mut self,
-        el: &ActiveEventLoop,
-        cwd_override: Option<&str>,
-        adopt: Option<crate::spawn::Adopted>,
-    ) -> Option<WindowId> {
-        self.create_window_internal_connected(el, cwd_override, adopt, None, None, None, None)
-    }
-
-    /// [`create_window_internal`] with the session-connection birth facts:
-    /// `lineage_parent` for a controlled window, `observe` for a controller
-    /// window's env hint. Ordinary opens use the `(None, None)` wrapper above.
+    /// Full window creation IN THE TURN, the restore's (one window per restore
+    /// slice): the logical seam, its first session spawned here, plus, when not
+    /// headless, the winit OS window attach. The new window inherits the front
+    /// window's grid (80×24 if no window exists). `cwd_override` starts the first
+    /// session in a given directory; `adopt` re-adopts a handed-off shell.
+    /// `lineage_parent` and `observe` are a connected window's birth facts
+    /// (`None` here: a connected window, like every window a person opens, is
+    /// spawned off the loop, `App::open_window_off_loop`).
     ///
     /// `carried` is a restored window's frame ([`CarriedFrame`], an update's or
     /// a cold restore's): the window is created at its grid instead of the
     /// front window's, and first attached at its raw inner size when that holds
     /// the grid. `None` for every other open.
-    ///
-    /// Refines `WindowRouting.ConnectedCreateWindow` (`spawn connected=
-    /// place=window`): the same minting as `CreateWindow`, with the hosted-origin
-    /// precondition enforced by [`App::connected_spawn_precheck`]. Tier-1 checks
-    /// the mint in `window_routing_conformance` through the shared logical seam,
-    /// since this fn needs an `ActiveEventLoop`.
-    #[cfg_attr(
-        test,
-        aterm_spec::refines(
-            machine = "window_routing",
-            action = "ConnectedCreateWindow",
-            project = "aterm_gui::App::project_window_routing"
-        )
-    )]
     #[allow(
         clippy::too_many_arguments,
         reason = "the window's birth facts — cwd, the seamless adoptee, the connection \
@@ -941,7 +925,7 @@ impl App {
             .windows
             .values()
             .any(|w| matches!(w.present, Some(PresentTarget::Gpu { .. })));
-        if aterm_gpu::surface_attach_fallback(aterm_gpu::dx12_visual_swapchain_active(), other_gpu)
+        if aterm_gpu::surface_attach_fallback(aterm_gpu::visual_swapchain_active(), other_gpu)
             != aterm_gpu::SurfaceAttachFallback::RebuildOpaque
         {
             return Err(first_error);
@@ -962,7 +946,7 @@ impl App {
         crate::platform_win::note_client_backdrop_declined(
             crate::platform_win::ClientBackdropDecline::DcompUnavailable,
         );
-        aterm_gpu::withdraw_dx12_visual_swapchain();
+        aterm_gpu::withdraw_visual_swapchain();
         let rebuilt = match self
             .backend
             .gpu_ref()
@@ -1088,7 +1072,7 @@ impl App {
     ) -> ((u16, u16), Option<PhysicalSize<u32>>) {
         match carried {
             Some(frame) => ((frame.rows, frame.cols), Some(frame.inner_px)),
-            None => (self.front().map_or((80, 24), |ws| (ws.rows, ws.cols)), None),
+            None => (self.front().map_or((24, 80), |ws| (ws.rows, ws.cols)), None),
         }
     }
 
@@ -1145,7 +1129,8 @@ impl App {
 
     /// Create the OS window and present surface for logical window `wid` and
     /// attach them to its [`WindowState`]; used for the first window (at `resumed`)
-    /// and every later one (`create_window_internal`). Sizes the OS window from the
+    /// and every later one (`create_window_internal_connected`, a window landing
+    /// off the loop, a detached tab's). Sizes the OS window from the
     /// stored grid, installs the macOS menu (first window only) and builds the GPU
     /// or CPU present target. Never called headless. A stale `wid` is a no-op.
     /// Returns `true` iff the OS window was created and a present target installed.
@@ -1214,7 +1199,7 @@ impl App {
             // backdrop. Keyed to the request latch because the GPU context may
             // still be building; the build thread's failure arm withdraws it.
             // Scoped to the backdrop opt-in so default windows are unchanged.
-            if aterm_gpu::dx12_visual_swapchain_requested() {
+            if aterm_gpu::visual_swapchain_requested() {
                 attrs.with_no_redirection_bitmap(true)
             } else {
                 attrs
@@ -1325,15 +1310,21 @@ impl App {
         // the window so every `text_input.enter` re-announces it. No-op on other
         // platforms.
         window.set_ime_purpose(winit::window::ImePurpose::Terminal);
-        // Seed every session of this window with the desktop light/dark appearance
-        // (`Window::theme()`), which the engine reports to apps (DEC 2031, DSR
-        // ?996n). Live changes arrive as `WindowEvent::ThemeChanged`; `None` maps to
-        // the engine's `Dark` default.
-        let os_appearance = crate::app_colorscheme::theme_to_appearance(window.theme());
-        self.apply_os_color_scheme(wid, os_appearance);
-        // Switch aterm's own theme to the matching side of a `dark:…,light:…`
-        // `theme` config.
-        self.sync_app_theme_to_appearance(os_appearance);
+        // The desktop light/dark appearance: start its observer once, then
+        // install what it reads now. It picks the side of a `dark:…,light:…`
+        // `theme`, and the engine reports that palette's appearance to apps (DEC
+        // 2031, DSR ?996n). Launch already built everything for the appearance
+        // it read (`warm_config`), so this is a no-op unless the desktop flipped
+        // since. Never the window's own theme off Windows: a forced
+        // `window_theme` pins it on macOS, and Linux reports aterm's decoration.
+        if self.os_appearance_observer.is_none()
+            && let Some(proxy) = self.proxy.as_ref()
+        {
+            self.os_appearance_observer = self.os_appearance_source.observe(proxy);
+        }
+        if let Some(os_appearance) = self.os_appearance_source.at_attach(|| window.theme()) {
+            self.sync_app_theme_to_appearance(os_appearance);
+        }
         // Warm-launch early reveal (Windows only). A hidden top-level HWND has no
         // window or taskbar button, and the backend join takes a noticeable part of
         // startup there. When a previous run persisted this scale's real cell
@@ -2121,6 +2112,8 @@ impl App {
         if !self.windows.contains_key(&wid) {
             return CloseOutcome::Stay; // stale/unknown id → no-op
         }
+        #[cfg(target_os = "macos")]
+        self.withdraw_askpass_window(wid);
         // A single-tab close is deferred, so the gesture's `CloseAttribution`
         // scope has dropped by now; re-enter the attribution stashed on the window
         // so `deregister_local_as` records `ctl-close`/`ui-close`. `enter` is
@@ -2898,13 +2891,13 @@ impl App {
     /// contention keeps the last cached title until the next redraw.
     ///
     /// Resolves in place into `slot` so the per-redraw [`Self::apply_title`] does
-    /// not allocate.
+    /// not allocate. Returns the focused session, the label cache's identity.
     fn window_title_identity(
         &self,
         id: WindowId,
         live_title: &str,
         slot: &mut String,
-    ) -> (Option<u64>, Option<String>) {
+    ) -> Option<u64> {
         let focused_session = self.focused_session_id(id);
         let presentation_fallback = self
             .windows
@@ -2921,25 +2914,20 @@ impl App {
             };
             slot.clear();
             slot.push_str(title);
-            return (None, None);
+            return None;
         };
         let Some(session) = self.pool.get(session_id) else {
             slot.clear();
             slot.push_str(presentation_fallback);
-            return (Some(session_id), None);
+            return Some(session_id);
         };
         slot.clear();
-        let (user_titled, authored_description) = {
-            let meta = session
-                .ctx
-                .meta
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            (
-                meta.presentation_value_into("title", slot),
-                meta.presentation_value("description"),
-            )
-        };
+        let user_titled = session
+            .ctx
+            .meta
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .presentation_value_into("title", slot);
         if user_titled {
             // The operator title is already in `slot`.
         } else if !live_title.is_empty() {
@@ -2978,7 +2966,7 @@ impl App {
                 slot.push_str(presentation_fallback);
             }
         }
-        (Some(session_id), authored_description)
+        Some(session_id)
     }
 
     /// Reflect the focused terminal's identity in the window chrome, falling back
@@ -3007,25 +2995,21 @@ impl App {
         // store write lock only when the per-window `(session, title)` cache says
         // the session or its title changed.
         self.publish_active_terminal_title(id, title);
-        // Resolve and compose through a resident buffer so the per-redraw path does
-        // not allocate. Taken out of `self` so `&self.config` and
-        // `&self.title_summaries` stay borrowable; put back before every exit.
-        let mut scratch = std::mem::take(&mut self.title_compose_scratch);
-        let (focused_session, authored_description) =
-            self.window_title_identity(id, title, &mut scratch);
-        // Composes in place: `scratch` holds the raw title in and the presented
-        // label out; a cache hit reuses its capacity.
-        self.title_summaries.compose_label_into(
+        // Resolve and present through a resident buffer so the per-redraw path does
+        // not allocate. Taken out of `self` so `&self.chrome_labels` stays
+        // borrowable; put back before every exit.
+        let mut scratch = std::mem::take(&mut self.window_title_scratch);
+        let focused_session = self.window_title_identity(id, title, &mut scratch);
+        // Presents in place: `scratch` holds the raw title in and the label out
+        // (sanitized and capped for the titlebar); a cache hit reuses its capacity.
+        self.chrome_labels.present_into(
             focused_session,
-            authored_description.as_deref(),
-            self.config.window_title_format_or_default(),
-            &self.config,
-            crate::title_summary::ChromeSurface::WindowTitle,
+            crate::chrome_label::ChromeSurface::WindowTitle,
             &mut scratch,
         );
         // No tab counter in the title; the tab strip shows the tabs. Temporary
         // title owners take precedence: close warning > find status > canonical
-        // Smart Title. `current_title` keeps tracking under either override, but
+        // title. `current_title` keeps tracking under either override, but
         // canonical writes are suppressed.
         let (warning_armed, search_active) = self.windows.get(&id).map_or((false, false), |ws| {
             (
@@ -3035,12 +3019,12 @@ impl App {
         });
         let title_authority = window_title_authority(warning_armed, search_active);
         let title_changed = {
-            // Compare against the composed scratch directly to avoid a per-frame
+            // Compare against the presented scratch directly to avoid a per-frame
             // allocation.
             let Some(ws) = self.windows.get_mut(&id) else {
                 // Disjoint field, so restoring the slot here is fine even though
                 // `self.windows` was just borrowed.
-                self.title_compose_scratch = scratch;
+                self.window_title_scratch = scratch;
                 return;
             };
             if ws.current_title != scratch
@@ -3057,8 +3041,8 @@ impl App {
             }
         };
         // Hand the warmed buffer back before any further `&mut self` work, so the
-        // next frame's resolve/compose reuses this capacity.
-        self.title_compose_scratch = scratch;
+        // next frame's resolve/present reuses this capacity.
+        self.window_title_scratch = scratch;
         // Refresh the native tab strip when the active tab's title changes (it
         // re-reads every tab), so labels track the live cwd/command; structural
         // changes are handled by `sync_window`. Gated on a semantic change; no-op
@@ -3904,12 +3888,12 @@ mod tests {
         );
     }
 
-    /// Linux `chrome_palette_theme`: Auto is the terminal theme; an explicit side
-    /// matching the terminal theme keeps it; an explicit side against it swaps in
-    /// the authored forced palette with the accent carried over.
-    #[cfg(target_os = "linux")]
+    /// `chrome_palette_theme`, on every platform: Auto is the terminal theme; an
+    /// explicit side matching the terminal theme keeps it; an explicit side
+    /// against it swaps in the authored forced palette with the accent carried
+    /// over, so a forced Window appearance turns the Settings pages too.
     #[test]
-    fn linux_chrome_painters_resolve_window_theme_to_a_real_palette() {
+    fn chrome_painters_resolve_window_theme_to_a_real_palette() {
         let mut app = App::headless_for_test();
         app.window_theme = crate::app_config::WindowTheme::Auto;
         let terminal = app.theme;
@@ -3963,11 +3947,114 @@ mod tests {
         );
     }
 
+    /// A Foreground or Background picked for the terminal colors the terminal,
+    /// not the app's own pages: native pages draw from the color theme as it
+    /// is before the per-key overrides, while forcing a side still turns them.
+    #[test]
+    fn native_pages_draw_from_the_theme_before_color_overrides() {
+        let mut app = App::headless_for_test();
+        let base = app.theme;
+        app.config.foreground = Some("#FFAA00".to_string());
+        app.config.background = Some("#202040".to_string());
+        app.theme = app
+            .config
+            .theme_for_with_assets(app.os_appearance, &app.config_assets.themes);
+        assert_eq!(app.theme.fg, 0x00FF_AA00, "the terminal takes the override");
+        let page = app.native_page_palette_theme();
+        assert_eq!(
+            (page.fg, page.bg),
+            (base.fg, base.bg),
+            "the pages keep the theme's own colors"
+        );
+        app.window_theme = crate::app_config::WindowTheme::Light;
+        assert_eq!(
+            app.native_page_palette_theme().bg,
+            crate::native_appearance::FORCED_LIGHT_CHROME_BG
+        );
+    }
+
+    /// A whole-app trial still colors Settings when the terminal has its own
+    /// foreground. Revert restores the saved page palette, and a forced window
+    /// appearance still takes precedence over the trial's side.
+    #[test]
+    fn native_pages_follow_the_theme_trial_with_terminal_color_overrides() {
+        for foreground in [None, Some("#FFAA00".to_string())] {
+            let mut app = App::headless_for_test();
+            app.config = crate::app_config::Config {
+                theme: Some("Default".to_string()),
+                foreground: foreground.clone(),
+                ..crate::app_config::Config::default()
+            };
+            app.install_resolved_colors(crate::app_colorscheme::ThemeChange::ConfigReload);
+            let saved_page = app.native_page_palette_theme();
+            let trial_page = crate::app_config::Config {
+                theme: Some("Nord".to_string()),
+                ..crate::app_config::Config::default()
+            }
+            .theme_for_with_assets(app.os_appearance, &app.config_assets.themes);
+            assert_ne!(saved_page.bg, trial_page.bg, "the trial changes the page");
+
+            app.begin_theme_preview(
+                "Nord",
+                crate::control_theme::PreviewHold::Settings { keeping: false },
+            )
+            .expect("the built-in trial is available");
+            let shown = app.native_page_palette_theme();
+            assert_eq!(
+                (shown.fg, shown.bg, shown.cursor, shown.selection),
+                (
+                    trial_page.fg,
+                    trial_page.bg,
+                    trial_page.cursor,
+                    trial_page.selection
+                ),
+                "the page draws the trial before terminal overrides: {foreground:?}"
+            );
+            if foreground.is_some() {
+                assert_eq!(app.theme.fg, 0x00FF_AA00, "the terminal keeps its override");
+                assert_ne!(
+                    shown.fg, app.theme.fg,
+                    "the page does not inherit that override"
+                );
+            }
+
+            app.window_theme = crate::app_config::WindowTheme::Light;
+            assert_eq!(
+                app.native_page_palette_theme().bg,
+                crate::native_appearance::FORCED_LIGHT_CHROME_BG,
+                "forcing the window light still overrides the trial's dark side"
+            );
+            app.window_theme = crate::app_config::WindowTheme::Auto;
+            app.revert_theme_preview(Instant::now());
+            let reverted = app.native_page_palette_theme();
+            assert_eq!(
+                (
+                    reverted.fg,
+                    reverted.bg,
+                    reverted.cursor,
+                    reverted.selection
+                ),
+                (
+                    saved_page.fg,
+                    saved_page.bg,
+                    saved_page.cursor,
+                    saved_page.selection
+                ),
+                "revert restores the saved page palette: {foreground:?}"
+            );
+            assert!(app.theme_preview.is_none());
+            assert_eq!(
+                app.config.foreground, foreground,
+                "a trial never writes config"
+            );
+            assert_eq!(app.config.theme.as_deref(), Some("Default"));
+        }
+    }
+
     /// Forcing a side always moves the chrome, including for neutral backgrounds
     /// (`#979797`..`#ADADAD`) where Rec.601 luma and WCAG relative luminance
     /// disagree: `chrome_palette_theme` and `native_appearance::roles` read the
     /// same predicate, so the pages build the side the operator asked for.
-    #[cfg(target_os = "linux")]
     #[test]
     fn forcing_a_side_moves_the_pages_across_the_former_classifier_band() {
         let mut app = App::headless_for_test();
@@ -4117,15 +4204,12 @@ mod tests {
         let wid = WindowId(0);
         let session = app.pool.get(0).expect("session 0");
         // The resolved title is written into a caller-owned slot (the per-frame
-        // path reuses one buffer); identity/description are still returned.
+        // path reuses one buffer); the focused session is returned.
         let mut slot = String::new();
 
         // With neither OSC title nor cwd, native chrome uses the same final
         // presentation fallback as the tab label.
-        assert_eq!(
-            app.window_title_identity(wid, "", &mut slot),
-            (Some(0), None)
-        );
+        assert_eq!(app.window_title_identity(wid, "", &mut slot), Some(0));
         assert_eq!(slot, "aterm");
 
         crate::term_lock(&session.term)
@@ -4139,24 +4223,20 @@ mod tests {
                 "description",
                 Some("Runs the focused release checks".to_string()),
             );
-        let (session_id, description) = app.window_title_identity(wid, "", &mut slot);
+        let session_id = app.window_title_identity(wid, "", &mut slot);
         assert_eq!(session_id, Some(0));
-        assert_eq!(slot, "/aterm-proof/window-title");
         assert_eq!(
-            description.as_deref(),
-            Some("Runs the focused release checks")
+            slot, "/aterm-proof/window-title",
+            "OSC-7 cwd is the title, and an authored description is not joined into it"
         );
         assert_eq!(
-            app.title_summaries.compose(
+            app.chrome_labels.present(
                 session_id,
                 &slot,
-                description.as_deref(),
-                app.config.window_title_format_or_default(),
-                &app.config,
-                crate::title_summary::ChromeSurface::WindowTitle,
+                crate::chrome_label::ChromeSurface::WindowTitle,
             ),
-            "/aterm-proof/window-title — Runs the focused release checks",
-            "OSC-7 cwd remains the stable title while Description stays distinct"
+            "/aterm-proof/window-title",
+            "the window title is the identity title alone"
         );
 
         app.window_title_identity(wid, "vim src/main.rs", &mut slot);

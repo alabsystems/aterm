@@ -22,7 +22,7 @@ fn rainbow_landing_ring_light_theme_forks_to_source_over() {
         scale: 1.0,
     };
 
-    // DARK: additive square outline, never a source-over veil.
+    // Dark: additive square outline, never a source-over veil.
     let c_dark = cfg(GlowStyle::RainbowKitty, true);
     let dark = CursorGlow {
         ring: Some(ring),
@@ -39,7 +39,7 @@ fn rainbow_landing_ring_light_theme_forks_to_source_over() {
         "the dark ring is additive, never source-over"
     );
 
-    // LIGHT: source-over veil ring, no additive quads.
+    // Light: source-over veil ring, no additive quads.
     let mut c_light = cfg(GlowStyle::RainbowKitty, true);
     c_light.dark_theme = false;
     let light = CursorGlow {
@@ -65,15 +65,14 @@ fn rainbow_landing_ring_light_theme_forks_to_source_over() {
     );
 }
 
-/// The landing ring's four bars partition the square outline: no pixel is
-/// owned by two bars (an additive double-add would light each corner ~2×), and
-/// the outline stays closed on every edge.
+/// The classic landing ring's grade is floored at impact 1, capped at Rainbow
+/// Kitty's numbers (twice as wide, 300 ms) and monotone in between.
 #[test]
 fn classic_ring_grade_is_floored_and_capped_like_the_kittys() {
-    // Impact 1 (an 8-cell hop or less) is exactly what it was.
+    // Impact 1 (an 8-cell hop or less) is ungraded.
     assert_eq!(classic_ring_radius_factor(1.0), 1.0);
     assert_eq!(classic_ring_life(0.18, 1.0), 0.18);
-    // Below the floor and non-finite never SHRINK or explode a ring.
+    // Below the floor and non-finite never shrink or explode a ring.
     assert_eq!(classic_ring_radius_factor(0.2), 1.0);
     assert_eq!(classic_ring_radius_factor(f32::NAN), 1.0);
     assert_eq!(classic_ring_life(0.18, f32::INFINITY), 0.18);
@@ -152,6 +151,9 @@ fn classic_landing_ring_expands_wider_with_the_jump() {
     }
 }
 
+/// The landing ring's four bars partition the square outline: no pixel is
+/// owned by two bars (an additive double-add would light each corner ~2×), and
+/// the outline stays closed on every edge.
 #[test]
 fn landing_ring_bars_partition_the_square_outline() {
     let g = geom();
@@ -256,7 +258,7 @@ fn cold_navigation_timestamp_scatters_nothing() {
     let t0 = Instant::now();
     let mut out = Vec::new();
     let mut glow = CursorGlow::default();
-    glow.tick(Some((2, 30)), t0, &c, g, &mut out); // seed — cursor stays COLD
+    glow.tick(Some((2, 30)), t0, &c, g, &mut out); // seed: the cursor stays cold
     // (rainbow.disp left at its default 0.0 — no typing momentum, no ribbon.)
     glow.note_navigation(t0);
     glow.tick(Some((2, 0)), t0, &c, g, &mut out); // Ctrl-A leap on a cold cursor
@@ -265,7 +267,7 @@ fn cold_navigation_timestamp_scatters_nothing() {
         "a cold-cursor jump dissolves no phantom terminus (finding 3)"
     );
     // The starburst forks on distance: a cold Home/End past
-    // `RAINBOW_JUMP_MIN` (this 30-cell Ctrl-A) celebrates, while a one-row
+    // `timing::JUMP_MIN_CELLS` (this 30-cell Ctrl-A) celebrates, while a short
     // cold move such as a history recall throws nothing (pinned below).
     assert!(
         glow.v2_status().is_some_and(|s| s.meteors >= 1),

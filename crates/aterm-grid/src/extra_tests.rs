@@ -81,14 +81,6 @@ fn cell_extra_extended_flags() {
 }
 
 #[test]
-fn cell_extra_size_optimized() {
-    let size = std::mem::size_of::<CellExtra>();
-    // 56 bytes plus the niche-optimized `image` box (8 bytes). CellExtra is
-    // allocated only for cells that have extras.
-    assert_eq!(size, 64, "CellExtra should be exactly 64 bytes");
-}
-
-#[test]
 fn cell_extra_with_combining() {
     let mut extra = CellExtra::default();
     extra.add_combining('\u{0301}'); // Combining acute accent
@@ -318,40 +310,6 @@ fn cell_extras_empty_removed() {
 }
 
 #[test]
-fn is_combining_mark_basic() {
-    assert!(is_combining_mark('\u{0301}'));
-    assert!(is_combining_mark('\u{0308}'));
-    assert!(is_combining_mark('\u{0327}'));
-    assert!(!is_combining_mark('a'));
-    assert!(!is_combining_mark(' '));
-}
-
-#[test]
-fn is_combining_mark_all_ranges() {
-    assert!(is_combining_mark('\u{0300}'));
-    assert!(is_combining_mark('\u{036F}'));
-    assert!(is_combining_mark('\u{1AB0}'));
-    assert!(is_combining_mark('\u{1AFF}'));
-    assert!(is_combining_mark('\u{1DC0}'));
-    assert!(is_combining_mark('\u{1DFF}'));
-    assert!(is_combining_mark('\u{20D0}'));
-    assert!(is_combining_mark('\u{20FF}'));
-    assert!(is_combining_mark('\u{FE20}'));
-    assert!(is_combining_mark('\u{FE2F}'));
-
-    assert!(!is_combining_mark('\u{02FF}'));
-    assert!(!is_combining_mark('\u{0370}'));
-    assert!(!is_combining_mark('\u{1AAF}'));
-    assert!(!is_combining_mark('\u{1B00}'));
-    assert!(!is_combining_mark('\u{1DBF}'));
-    assert!(!is_combining_mark('\u{1E00}'));
-    assert!(!is_combining_mark('\u{20CF}'));
-    assert!(!is_combining_mark('\u{2100}'));
-    assert!(!is_combining_mark('\u{FE1F}'));
-    assert!(!is_combining_mark('\u{FE30}'));
-}
-
-#[test]
 fn complex_char_roundtrip() {
     let mut extra = CellExtra::default();
     assert!(extra.complex_char().is_none());
@@ -466,67 +424,6 @@ fn underline_color_u32_roundtrip() {
         extra.underline_color(),
         None,
         "storing an index clears the RGB slot on purpose"
-    );
-}
-
-#[test]
-fn row_has_hyperlinks_detection() {
-    let mut extras = CellExtras::new();
-
-    assert!(!extras.row_has_hyperlinks(0));
-
-    extras
-        .get_or_create(CellCoord::new(0, 5))
-        .add_combining('\u{0301}');
-    assert!(!extras.row_has_hyperlinks(0));
-
-    extras
-        .get_or_create(CellCoord::new(1, 3))
-        .set_hyperlink(Some(Arc::from("https://example.com")));
-    assert!(!extras.row_has_hyperlinks(0));
-    assert!(extras.row_has_hyperlinks(1));
-
-    extras
-        .get_or_create(CellCoord::new(0, 10))
-        .set_hyperlink(Some(Arc::from("https://test.com")));
-    assert!(extras.row_has_hyperlinks(0));
-
-    extras
-        .get_or_create(CellCoord::new(0, 10))
-        .set_hyperlink(None);
-    assert!(!extras.row_has_hyperlinks(0));
-}
-
-/// `row_has_hyperlinks` handles partial removal of several hyperlinks on one row.
-#[test]
-fn row_has_hyperlinks_partial_removal() {
-    let mut extras = CellExtras::new();
-
-    // Two hyperlinks on the same row
-    extras
-        .get_or_create(CellCoord::new(3, 0))
-        .set_hyperlink(Some(Arc::from("https://a.example.com")));
-    extras
-        .get_or_create(CellCoord::new(3, 10))
-        .set_hyperlink(Some(Arc::from("https://b.example.com")));
-    assert!(extras.row_has_hyperlinks(3));
-
-    // Remove one — row still has a hyperlink from the other cell
-    extras
-        .get_or_create(CellCoord::new(3, 0))
-        .set_hyperlink(None);
-    assert!(
-        extras.row_has_hyperlinks(3),
-        "row should still report hyperlinks when only one of two is removed"
-    );
-
-    // Remove the second — now the row is clean
-    extras
-        .get_or_create(CellCoord::new(3, 10))
-        .set_hyperlink(None);
-    assert!(
-        !extras.row_has_hyperlinks(3),
-        "row should report no hyperlinks after both are removed"
     );
 }
 

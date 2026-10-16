@@ -5,9 +5,9 @@
 
 use super::Model;
 
-/// Reconciliation retires the stage whose durable identity changed. It releases
-/// only a latch naming those exact bytes; a later artifact's latch is unrelated.
-/// `Buggy=1` reproduces leaving a withdrawn build's permanent latch behind.
+/// Reconciliation retires the stage whose durable identity changed. It releases only a latch
+/// naming those exact bytes; a later artifact's latch is unrelated. `Buggy=1` leaves a withdrawn
+/// build's permanent latch behind.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_update_retired_intent_model() -> Model {
@@ -27,13 +27,13 @@ pub fn native_update_retired_intent_model() -> Model {
             }
 
             invariant NoObsoleteLatch: retired == 0 || exact == 0 || latched == 0;
-            invariant OtherArtifactUntouched: exact == 1 || latched == 1;
+            uncaught OtherArtifactUntouched: exact == 1 || latched == 1;
         }
     }
 }
 
-/// A failed attempt remains attributed to its original artifact after a newer
-/// stage is imported. `Buggy=1` restores deriving the target at publication time.
+/// A failed attempt stays attributed to its original artifact after a newer stage is imported.
+/// `Buggy=1` derives the target at publication time.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_update_failure_target_model() -> Model {

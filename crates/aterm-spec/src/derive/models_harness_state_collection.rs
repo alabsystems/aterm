@@ -1,53 +1,34 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE LIVE UPGRADE'S CODEX RECORDS ARE COLLECTED (gap #22, 2026-09-29).
+//! The live upgrade's Codex records are collected.
 //!
-//! A Codex upgrade is filed per TAB (`<state>/upgrade/codex-<tab>.json`,
-//! `aterm_agent::harness::upgrade_drive`'s `codex` module), and until this
-//! slice only the visit forgot one — when a current Codex led that tab again.
-//! A tab id is never minted twice, so the record of every tab that closed was
-//! kept for ever: the Claude lane's week-old prune (`prune_states`) passes
-//! Codex records by. `codex::prune` removes one once its tab is proven gone
-//! (the rendezvous registry, `codex::registry_life`), it has sat unwritten for
-//! the Claude lane's week, and its upgrade is settled (`upgrade_drive::
-//! settled`: done, failed, or pending with no word of the owner's).
-//!
-//! As everywhere in this crate the model is hand-written Rust DESCRIBING that
-//! code: the Tier-1 bind in aterm-agent's `upgrade_codex_drive` tests runs the
-//! real `codex::prune` over records on disk, projected onto these variables,
-//! and holds each of its decisions to `Prune`'s guard in both directions.
+//! A Codex upgrade is filed per tab (`<state>/upgrade/codex-<tab>.json`, `upgrade_drive`'s
+//! `codex` module), and a tab id is never minted twice, so a closed tab's record would be kept
+//! for ever: the Claude lane's week-old prune (`prune_states`) passes Codex records by.
+//! `codex::prune` removes one once its tab is proven gone (`codex::registry_life`), it has sat
+//! unwritten a week, and its upgrade is `upgrade_drive::settled`. The Tier-1 bind in
+//! aterm-agent's `upgrade_codex_drive` tests runs the real `codex::prune` over records on disk
+//! and holds each decision to `Prune`'s guard in both directions.
 
 use super::*;
 
-/// ONE CODEX RECORD AND ITS TAB. The world: the tab closes (`TabCloses`) and
-/// never comes back; while it lives, the upgrade's round moves on the record —
-/// begins a restart (`Begin`), settles (`Settle`: done, failed, or a
-/// pending round the owner said nothing about), and starts a new round
-/// (`Rearm`); a hand-run pass fails a restart left in flight in a closed tab
-/// (`Expire`, the orphan pass's `expired`); and the week passes over a record
-/// nothing writes (`Week`). Every write starts the week again (`old = 0`).
-/// The lane: `Prune`, the one removal.
+/// One Codex record and its tab. The world: the tab closes for good (`TabCloses`); while it
+/// lives the round begins a restart (`Begin`), settles (`Settle`: done, failed, or pending with
+/// no word from the owner) and rearms (`Rearm`); a hand-run pass fails a restart left in flight
+/// in a closed tab (`Expire`); a week passes over a record nothing writes (`Week`), and every
+/// write restarts it (`old = 0`). The lane's one removal is `Prune`.
 ///
-/// Variables: `tab` 1 while the tab lives; `stage` 0 open (announced, or an
-/// owner's word on it), 1 a restart in flight (exiting, relaunched), 2
-/// settled; `old` 1 once the file has sat unwritten a week; `kept` 1 while
-/// the record is on disk; `aged` 1 once a week has passed over the record
-/// AFTER its tab closed and its round settled — history, which the one
-/// removal's guard never reads.
+/// `tab` 1 while the tab lives; `stage` 0 open, 1 a restart in flight, 2 settled; `old` 1 once
+/// the file has sat unwritten a week; `kept` 1 while on disk; `aged` 1 once a week has passed
+/// after the tab closed and the round settled (history `Prune`'s guard never reads).
 ///
-/// Three invariants, each caught by its own `Buggy` member alone:
-/// `OnlyAGoneTabsRecordGoes` (`PruneLiveTab`: a prune reading the host's own
-/// roster alone, so another window's live tab reads gone),
-/// `OnlyASettledRecordGoes` (`PruneInFlight`: a restart in flight taken from
-/// the orphan pass that would finish it) and `OnlyAWeekOldRecordGoes`
-/// (`PruneFresh`: the prune without the Claude lane's week). The fourth,
-/// `AClosedSettledRecordStaysAged` (`Rewrite`: a pass that writes a closed
-/// tab's record again), is the safety half of the liveness property
-/// ([`harness_upgrade_state_collection_liveness`]): nothing writes a closed
-/// tab's settled record, so once its week has passed it stays prunable. The
-/// real code writes a closed tab's record only to expire a restart left in
-/// flight (`Expire`), which a settled record never has.
+/// Each invariant is caught by its own mutant: `OnlyAGoneTabsRecordGoes` (`PruneLiveTab`: a
+/// prune reading only the host's own roster, so another window's live tab reads gone),
+/// `OnlyASettledRecordGoes` (`PruneInFlight`), `OnlyAWeekOldRecordGoes` (`PruneFresh`), and
+/// `AClosedSettledRecordStaysAged` (`Rewrite`), the safety half of
+/// [`harness_upgrade_state_collection_liveness`]: the real code writes a closed tab's record
+/// only to expire a restart in flight, which a settled record never has.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn harness_upgrade_state_collection_model() -> Model {
@@ -60,8 +41,7 @@ pub fn harness_upgrade_state_collection_model() -> Model {
             var kept = 1;
             var aged = 0;
 
-            // The round, in a live tab only: a record moves when its tab is
-            // visited.
+            // The round moves only when its live tab is visited.
             action Begin when (kept == 1 && tab == 1 && stage == 0) {
                 stage = 1;
                 old = 0;
@@ -74,8 +54,7 @@ pub fn harness_upgrade_state_collection_model() -> Model {
                 stage = 0;
                 old = 0;
             }
-            // A hand-run pass fails a restart left in flight in a closed tab
-            // (the orphan pass's `expired`): it settles, written now.
+            // A hand-run pass fails a closed tab's restart left in flight (`expired`).
             action Expire when (kept == 1 && tab == 0 && stage == 1) {
                 stage = 2;
                 old = 0;
@@ -92,7 +71,7 @@ pub fn harness_upgrade_state_collection_model() -> Model {
                 kept = 0;
             }
 
-            // The mutants (Buggy = 1).
+            // Mutants (Buggy = 1).
             action PruneLiveTab when (
                 Buggy == 1 && kept == 1 && tab == 1 && stage == 2 && old == 1
             ) {
@@ -108,8 +87,7 @@ pub fn harness_upgrade_state_collection_model() -> Model {
             ) {
                 kept = 0;
             }
-            // A pass that writes a closed tab's record again at every look:
-            // the week never passes over it.
+            // A pass that rewrites a closed tab's record at every look.
             action Rewrite when (Buggy == 1 && kept == 1 && tab == 0 && old == 1) {
                 old = 0;
             }
@@ -122,27 +100,17 @@ pub fn harness_upgrade_state_collection_model() -> Model {
     }
 }
 
-/// "A CLOSED TAB'S SETTLED RECORD GOES": `[]<>(kept = 0 \/ tab = 1 \/ stage
-/// <= 1)` — again and again, the record is removed, or its tab lives, or its
-/// upgrade is not settled. It says nothing of a closed tab's OPEN
-/// record (an announcement, an owner's word, a restart left in flight that no
-/// hand-run pass expires): those are kept, as the Claude lane keeps them.
+/// A closed tab's settled record goes: `[]<>(kept = 0 \/ tab = 1 \/ stage <= 1)`. A closed
+/// tab's open record (an announcement, an owner's word, a restart no hand-run pass expires) is
+/// kept, as the Claude lane keeps it.
 ///
-/// Fairness, and nothing more: `Week`, weakly fair — the clock moves; `Prune`,
-/// weakly fair — every pass that reads the tab gone takes it (every sweep runs
-/// the prune under the sweep lock: a window host's step, which a look takes
-/// only when an upgrade is due — the look itself (`due`) reads and prunes
-/// nothing — and a hand-run pass; so this assumes such passes keep coming).
-/// The world — the tab closing, the round's steps, a hand-run pass — is not
-/// fair.
-///
-/// The mutant that breaks it alone: `Rewrite`, a pass that writes a closed
-/// tab's record at every look, so the week never passes. The historical
-/// defect — no `Prune` at all for a Codex record — is the property's own
-/// negative control in the Tier-0 test: with `Prune` removed, a closed tab's
-/// settled record is kept for ever.
+/// Fairness: `Week` (the clock moves) and `Prune` (every pass that reads the tab gone takes it:
+/// the prune runs under the sweep lock in a window host's step, taken only when an upgrade is
+/// due, and in a hand-run pass, so this assumes such passes keep coming). The world is not
+/// fair. `Rewrite` alone breaks it; removing `Prune` is the Tier-0 test's negative control.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
+#[crate::liveness(crate::derive::harness_upgrade_state_collection_model)]
 pub fn harness_upgrade_state_collection_liveness() -> Liveness {
     Liveness {
         name: "AClosedTabsSettledRecordGoes",

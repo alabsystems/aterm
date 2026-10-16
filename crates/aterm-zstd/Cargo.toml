@@ -1,0 +1,35 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0 AND MIT
+#
+# The decoder under `src/decode/` is a modified, decode-only subset of the
+# upstream `ruzstd` crate 0.8.3 (https://github.com/KillingSpark/zstd-rs,
+# MIT-licensed, by Moritz Borcherding et al). See `LICENSE-MIT` in this
+# directory for the upstream license; each derived file names the upstream
+# file it derives from. The rest of the crate is first-party.
+
+[package]
+name = "aterm-zstd"
+version.workspace = true
+edition.workspace = true
+license = "Apache-2.0 AND MIT"
+repository.workspace = true
+description = "First-party Zstandard for aterm: a safe streaming decoder (carved from ruzstd 0.8.3), XXH64 and a raw-block frame writer"
+
+[lib]
+name = "aterm_zstd"
+path = "src/lib.rs"
+
+[dependencies]
+# None, on purpose: this crate is where the zstd / zstd-safe / zstd-sys family
+# (43,005 lines of C behind one cc build script) leaves the graph
+# (docs/AUDIT-third-party-2026-10-15.md, ZC.3-ZC.6).
+
+[dev-dependencies]
+# SHA-256 of the frames the zstd CLI wrote (tests/cli_frames.rs) and of what
+# the recorded frames decode to (tests/cli_decode.rs, tests/sweep.rs). Those
+# recorded answers are the decoder's oracle: libzstd, the `zstd` dev-dependency
+# until ZC.6, held the recordings to itself before it left the graph.
+aterm-digest = { workspace = true }
+
+[lints]
+workspace = true

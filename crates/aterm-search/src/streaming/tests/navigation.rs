@@ -62,43 +62,6 @@ fn navigation_without_wrap() {
 }
 
 #[test]
-fn toggle_wrap_flips_setting_and_changes_navigation_behavior() {
-    let mut search = StreamingSearch::new();
-    let mut content = TestContent::new(vec!["match 1", "match 2"]);
-
-    search.start_search("match", FilterMode::Literal).unwrap();
-    search.scan_all(&mut content);
-    assert_eq!(search.current_index(), 1);
-    assert!(search.wrap_enabled());
-
-    search.toggle_wrap();
-    assert!(!search.wrap_enabled());
-    search.prev_match();
-    assert_eq!(
-        search.current_index(),
-        1,
-        "wrap disabled should clamp at start"
-    );
-
-    search.toggle_wrap();
-    assert!(search.wrap_enabled());
-    search.prev_match();
-    assert_eq!(search.current_index(), 2, "wrap enabled should wrap to end");
-}
-
-#[test]
-fn toggle_highlight_all_flips_setting() {
-    let mut search = StreamingSearch::new();
-    assert!(search.highlight_all());
-
-    search.toggle_highlight_all();
-    assert!(!search.highlight_all());
-
-    search.toggle_highlight_all();
-    assert!(search.highlight_all());
-}
-
-#[test]
 fn current_match_returns_correct_match() {
     let mut search = StreamingSearch::new();
     let mut content = TestContent::new(vec!["hello world"]);

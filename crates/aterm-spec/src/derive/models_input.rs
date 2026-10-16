@@ -1,71 +1,48 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The unread-input gate on socket-driven input — the rule that a driver's key
-//! is never queued behind input a program the watch has established is not
-//! reading has left unread, and that nothing else is refused.
+//! The unread-input gate on socket-driven input: a driver's key is never queued behind unread
+//! input of a program established as not reading, and nothing else is refused.
 //!
-//! 2026-09-24: a Claude Code grown past 38 GiB stopped reading its terminal.
-//! The owner's Enter sat unread in the slave's input queue for hours, and a
-//! supervisor, fencing its keys on the SCREEN (which a frozen program never
-//! redraws, so every fence passed), wrote a `down` straight into the same
-//! queue. When the program next read, one `read()` returned both keystrokes
-//! and it acted on a key aimed at a screen it had never drawn. The screen
-//! cannot say this; the kernel's input queue can, and aterm-session's
-//! `SinkWriter::input_backlog` reads it and dates its oldest byte.
+//! A screen fence cannot see a program that stopped reading: it never redraws, so every fence
+//! passes, and when it next reads one `read()` returns the old key and the driver's together.
+//! The kernel's input queue can: aterm-session's `SinkWriter::input_backlog` reads it and dates
+//! its oldest byte.
 
 use super::Model;
 
-/// A raw-mode program's input queue (at most `Cap` unread writes, each with
-/// an age), the two writers that feed it — the human's window keyboard,
-/// never gated, and a socket driver, gated — the reader's states (reading or
-/// frozen, stopped or running, raw or canonical), and the input WATCH that
-/// publishes a stall.
+/// A raw-mode program's input queue (at most `Cap` unread writes, each with an age), its two
+/// writers (the window keyboard, never gated; a socket driver, gated), the reader's states
+/// (reading or frozen, stopped or running, raw or canonical), and the watch that publishes a
+/// stall.
 ///
-/// AGES ARE BANDS, not ticks: `a1` is the oldest unread write's band — `0`
-/// younger than `WARN_AFTER` (1 s), `1` from there to `STALL_AFTER` (10 s),
-/// `2` past it — and a `Tick` moves it to the next band. `a2` is the second
+/// Ages are bands, not ticks: `a1` is the oldest unread write's band (`0` younger than
+/// `WARN_AFTER`, `1` up to `STALL_AFTER`, `2` past it); `Tick` advances it. `a2` is the second
 /// write's band; the queue is FIFO, so consuming one promotes the second's.
 ///
-/// THE WATCH publishes (`Publish`) only a program that is not reading, whose
-/// raw input has aged into the stall band — its evidence, in aterm-session's
-/// `classify`: spinning and silent, or asleep, past thresholds the machine's
-/// load stretches. `reading == 0` is that evidence. It withdraws the stall
-/// (`Withdraw`) once the queue is read, turns canonical, or holds only input
-/// younger than the stall.
+/// The watch publishes (`Publish`) only a program that is not reading (`reading == 0`, standing
+/// for `classify`'s evidence) whose raw input has aged into the stall band, and withdraws it
+/// once the queue is read, turns canonical, or holds only younger input.
 ///
-/// THE GATE is aterm-session's `input_backlog::gate`, restated (owner
-/// direction, 2026-09-29: caps are warnings, and nothing blocks that does not
-/// have to). A driver key is REFUSED only when the queue is not empty and
-/// the job is stopped, or a stall is published and the raw oldest write is
-/// still in the stall band. Every other key is written; one written behind
-/// raw input in the warn band or older carries the warning (`warned`).
+/// The gate restates `input_backlog::gate`: a driver key is refused only when the queue is not
+/// empty and the job is stopped, or a stall is published and the raw oldest write is in the
+/// stall band. Every other key is written; one behind raw input in the warn band or older
+/// carries the warning (`warned`).
 ///
-/// Three latches, one per way the gate has been, or could be, wrong:
+/// One latch per way the gate could be wrong:
 ///
-/// * `behind_stalled` — a driver key landed behind input of a stopped job or
-///   of a program published as not reading: the 2026-09-24 incident, where a
-///   screen-fenced key queued behind a frozen Claude Code's Enter and was
-///   read hours later (`NoDriverKeyBehindStalledInput`);
-/// * `refused_live` — a driver key was refused with neither a stop nor a
-///   published stall: the 1 s static cap the owner overruled on 2026-09-29,
-///   which blocked every driver of a healthy program on a loaded machine
-///   (`NoRefusalWithoutAnEstablishedStall`);
-/// * `healthy_published` — the watch published a program that was reading
-///   (merely slow): a stall judged on age alone
+/// * `behind_stalled`: a driver key landed behind input of a stopped job or of a program
+///   published as not reading (`NoDriverKeyBehindStalledInput`);
+/// * `refused_live`: a driver key was refused with neither a stop nor a published stall, as a
+///   static age cap would (`NoRefusalWithoutAnEstablishedStall`);
+/// * `healthy_published`: the watch published a program that was reading, merely slow
 ///   (`NoReadingProgramPublished`).
 ///
-/// `Buggy = 1` is all three defects at once — the screen-only fence admits
-/// every key, the refusal fires on the static warn age, and the watch
-/// publishes on age alone — and each invariant, isolated, is falsified by
-/// its own.
+/// `Buggy = 1` is all three defects (a gate that admits every key, a refusal on the warn age, a
+/// watch that publishes on age alone); each invariant is falsified by its own.
 ///
-/// Tier-1 (`aterm-session/tests/conformance_input_unread.rs`) drives a real
-/// pty whose raw slave never reads, projects the sink's reading onto
-/// `raw`/`q`/`a1` at every step and the model's `published` onto the gate's
-/// argument, checks the shipped `gate` against `DriverKey`/`DriverRefused`
-/// and the warning, and `classify`'s entry against `Publish`, and replays
-/// the incident and the static cap as negative controls.
+/// Tier-1: `aterm-session/tests/conformance_input_unread.rs` drives a real pty whose raw slave
+/// never reads and checks the shipped `gate` and `classify` against the model.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn input_unread_gate_model() -> Model {

@@ -385,11 +385,8 @@ fn materialize_wide_char_at_last_col_does_not_corrupt_rgb() {
     );
 }
 
-/// VS16 presentation width survives materialization: a scrolled-back `❤️Z`
-/// keeps the heart as a 2-column cell, so `Z` stays at column 2.
-///
-/// The line is the one the live grid stores: its VS16 widening set the cell's
-/// `WIDE` bit, which Row-to-Line keeps on both of the unit's chars.
+/// VS16 width survives materialization: a scrolled-back `❤️Z` keeps the heart 2 columns wide
+/// (the live widening set `WIDE` on both of the unit's chars), so `Z` stays at column 2.
 #[test]
 fn materialize_preserves_vs16_widened_cell() {
     use crate::grid::scroll_materialize::materialize_from_line;
@@ -444,10 +441,9 @@ fn materialize_keeps_vs16_heart_narrow_at_last_column() {
     );
 }
 
-/// A VS16 cell the live grid kept narrow stays narrow in mid row: the writer
-/// had no room to widen it at the last column, and the screen's rewrap moved
-/// it off the edge as it was. The stored `WIDE` bit, clear here, decides, so
-/// the `Z` after it is drawn at the column its stored link names.
+/// A VS16 cell the live grid kept narrow (no room at the last column, then rewrapped off the edge)
+/// stays narrow mid-row: the stored `WIDE` bit, clear here, decides, so the `Z` after it sits at
+/// the column its stored link names.
 #[test]
 fn materialize_keeps_a_vs16_cell_stored_narrow_narrow_in_mid_row() {
     use crate::grid::scroll_materialize::materialize_from_line;
@@ -469,8 +465,8 @@ fn materialize_keeps_a_vs16_cell_stored_narrow_narrow_in_mid_row() {
     assert!(!linked(2) && !linked(4), "no other cell takes it");
 }
 
-/// VS15 presentation width survives materialization: a scrolled-back `⌚︎Z`
-/// keeps the watch NARROW (the live VS15 narrowing), so `Z` stays at column 1.
+/// VS15 presentation width survives materialization: a scrolled-back `⌚︎Z` keeps the watch
+/// narrow (the live VS15 narrowing), so `Z` stays at column 1.
 #[test]
 fn materialize_preserves_vs15_narrowed_cell() {
     use crate::grid::scroll_materialize::materialize_from_line;
@@ -508,8 +504,8 @@ fn materialize_keeps_unfolded_skin_tone_split() {
     assert!(row.cells[2].is_wide_continuation());
     assert_eq!(row.cells[3].char(), 'Z', "Z stays at col 3 as it was live");
 
-    // And the VS16-widened variant folds into one wide cell, Z at col 2. The
-    // live widening set the cell's `WIDE` bit, kept on the unit's three chars.
+    // The VS16-widened variant folds into one wide cell, Z at col 2: the live widening set
+    // `WIDE` on the unit's three chars.
     let wide = CellAttrs {
         flags: CellFlags::WIDE.bits(),
         ..CellAttrs::DEFAULT
@@ -881,8 +877,6 @@ fn extract_row_extras_hyperlink_spans_use_physical_columns() {
     assert_eq!(&*s2.url, "https://second.test");
 }
 
-// advance_grapheme_unit tests
-
 /// Mixed-content round-trip.
 #[test]
 fn materialize_mixed_content_allocation_free_path() {
@@ -994,10 +988,9 @@ fn fill_row_mixed_content_allocation_free_path() {
     );
 }
 
-/// A double-width character's continuation spacer carries the lead's visual
-/// attributes. Scroll-off conversion drops spacers (`scroll_convert::is_spacer`),
-/// and both re-derivations (`materialize_from_line`, `fill_row_from_line`)
-/// rebuild them with the lead's rendition.
+/// A wide char's continuation spacer carries the lead's visual attributes: scroll-off drops
+/// spacers (`scroll_convert::is_spacer`) and both re-derivations (`materialize_from_line`,
+/// `fill_row_from_line`) rebuild them with the lead's rendition.
 #[test]
 fn line_roundtrip_carries_rendition_into_the_wide_spacer() {
     use crate::grid::scroll_materialize::materialize_from_line;
@@ -1054,12 +1047,9 @@ fn line_roundtrip_carries_rendition_into_the_wide_spacer() {
     );
 }
 
-/// The spacer also carries the lead's SGR 58 underline colour and truecolor
-/// fg/bg, which live in the `CellExtra`.
-///
-/// The `Line` carries the underline span over the lead's column only (the shape
-/// `extract_row_extras` produces, since it skips spacers); both re-derivation
-/// paths colour both halves from it.
+/// The spacer also carries the lead's SGR 58 underline colour and truecolor fg/bg (in the
+/// `CellExtra`). The `Line`'s underline span covers the lead's column only, as
+/// `extract_row_extras` writes it; both re-derivation paths colour both halves from it.
 #[test]
 fn line_roundtrip_carries_rendition_extras_into_the_wide_spacer() {
     use crate::grid::scroll_materialize::materialize_from_line;

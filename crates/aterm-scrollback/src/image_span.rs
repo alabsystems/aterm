@@ -2,23 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Inline-image span type for scrollback lines.
-//!
-//! Represents a contiguous range of columns painting one row of a single image
-//! placement (iTerm2 OSC 1337 `File=`, and the sixel path that reuses the same
-//! placement). Used to preserve inline images when lines scroll from the visible
-//! grid into scrollback storage — a sidecar parallel to
-//! [`HyperlinkSpan`](super::HyperlinkSpan) and
+//! Inline-image spans for scrollback lines: a column range painting one row of a
+//! single image placement (OSC 1337 `File=`, sixel or Kitty), kept when lines
+//! scroll into scrollback, beside [`HyperlinkSpan`](super::HyperlinkSpan) and
 //! [`UnderlineColorSpan`](super::UnderlineColorSpan).
 //!
-//! ## Why a SPAN and not a per-cell ref
-//!
-//! One placement covers a `rows`×`cols` RECTANGLE, and the live grid stores it
-//! as one `ImageRef` per covered cell — a per-cell copy in history would carry
-//! one `Arc` bump, two `u16`s and a heap `Box` for every column of every row, to
-//! describe a geometry that is fully determined by (start column, footprint row,
-//! footprint column of the first cell). The span says exactly that once per row,
-//! and the tile coordinates of the cells in between are arithmetic.
+//! The live grid stores one `ImageRef` per covered cell; history stores one span
+//! per row, since (start column, footprint row, footprint column of the first
+//! cell) determine every cell's tile.
 
 use std::sync::Arc;
 
@@ -26,37 +17,20 @@ use aterm_types::{ImageData, KittyPlacementTag};
 
 /// Inline-image span within a line.
 ///
-/// The columns `[start_col, end_col)` all paint footprint row [`image_row`] of
-/// the SAME placement, left to right, starting at footprint column
-/// [`first_cell_col`]. The (possibly large) payload is shared behind the `Arc`:
-/// every row of a footprint, and every line the row is copied into by a rewrap,
-/// points at ONE allocation, which is also what lets the renderer keep its
-/// decode cache keyed by pointer identity.
+/// Columns `[start_col, end_col)` paint footprint row [`image_row`] of one
+/// placement, left to right from footprint column [`first_cell_col`]. Every row of
+/// a footprint, and every rewrapped copy, shares one `Arc` payload, which also
+/// keys the renderer's decode cache by pointer identity.
 ///
 /// [`image_row`]: Self::image_row
 /// [`first_cell_col`]: Self::first_cell_col
-///
-/// ## Memory Layout
-///
-/// ```text
-/// ┌─────────────────────────────────────────────────────────────────┐
-/// │ start_col: u16 (2 bytes) - Start column (inclusive)             │
-/// │ end_col: u16 (2 bytes) - End column (exclusive)                 │
-/// │ image_row: u16 (2 bytes) - Footprint row these cells paint      │
-/// │ first_cell_col: u16 (2 bytes) - Footprint column of start_col   │
-/// │ image: Arc<ImageData> (8 bytes) - SHARED payload                │
-/// │ kitty: Option<KittyPlacementTag> (12 bytes) - Kitty placement   │
-/// └─────────────────────────────────────────────────────────────────┘
-/// Total: 32 bytes per span (with padding), plus a refcount bump on the
-/// shared payload
-/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageSpan {
     /// Start column (inclusive).
     pub start_col: u16,
     /// End column (exclusive).
     pub end_col: u16,
-    /// Row WITHIN the image footprint that every cell of this span paints
+    /// Row within the image footprint that every cell of this span paints
     /// (0-indexed from the placement's top-left).
     pub image_row: u16,
     /// Column within the image footprint painted by `start_col`. Normally 0
@@ -118,22 +92,13 @@ impl ImageSpan {
         ))
     }
 
-    /// Bytes this span contributes to its LINE's memory footprint: the struct
-    /// plus this row's SHARE of the shared payload
-    /// ([`ImageData::per_row_bytes`]).
+    /// Bytes this span adds to its line's footprint: the struct plus this row's share
+    /// of the payload ([`ImageData::per_row_bytes`]).
     ///
-    /// The share, not the whole payload, is what keeps the scrollback byte
-    /// budget honest in both directions. Every row of one footprint holds the
-    /// same `Arc`, so charging each of them the full raster would report a
-    /// 1 MiB picture as `rows` MiB and make the budget evict history that is not
-    /// actually resident; charging none of them would let a wall of images sit
-    /// in the hot tier invisible to the budget that exists to bound it. Summing
-    /// the per-row share over a whole retained footprint recovers the payload
-    /// exactly once, so dropping one line drops exactly its share.
-    ///
-    /// Over-counts only in the degenerate case where one footprint row was
-    /// split into several spans by an overwrite — the safe direction, and the
-    /// same convention `HyperlinkSpan`'s URL accounting already takes.
+    /// Every row of a footprint holds the same `Arc`: charging each row the full
+    /// raster would over-report and evict history that is not resident; charging none
+    /// would hide images from the budget. The per-row shares sum to the payload once.
+    /// Over-counts only when an overwrite split one footprint row into several spans.
     #[must_use]
     pub fn memory_used(&self) -> usize {
         std::mem::size_of::<Self>().saturating_add(self.image.per_row_bytes())

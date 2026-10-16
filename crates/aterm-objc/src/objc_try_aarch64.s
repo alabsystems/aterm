@@ -4,21 +4,16 @@
 ; int aterm_objc_try(void *data, void (*body)(void *), void (*on_exc)(void *, id))
 ;
 ; The `@try [ body(data); return 0; ] @catch (id e) [ on_exc(data, e); return 1; ]`
-; (square brackets here because this text is a `global_asm!` template, where a
-; brace is a format placeholder)
-; wrapper, as the text `clang -S -fobjc-exceptions -O2` emits for it (the probe
-; that measured this design: scratchpad/probe-containment/asmsrc.s), with the
-; prototype reshaped to the one primitive `exception.rs` needs. Nothing is
-; compiled from C or Objective-C: the crate stays dependency-free and
-; `build.rs`-free by construction, and this text references exactly five
-; symbols outside itself — `___objc_personality_v0`, `_objc_begin_catch`,
-; `_objc_end_catch` and `_OBJC_EHTYPE_id` from libobjc, and `__Unwind_Resume`
-; from libunwind — all of them already in every aterm process.
+; wrapper (square brackets because this text is a `global_asm!` template, where
+; a brace is a format placeholder), as `clang -S -fobjc-exceptions -O2` emits
+; it, with the prototype reshaped to the one primitive `exception.rs` needs. It
+; references five symbols outside itself, all already in every aterm process:
+; `___objc_personality_v0`, `_objc_begin_catch`, `_objc_end_catch` and
+; `_OBJC_EHTYPE_id` from libobjc, and `__Unwind_Resume` from libunwind.
 ;
-; A Rust panic passing through is NOT caught here: the personality matches only
-; the `id` typeinfo, a foreign (Rust) exception matches no typeinfo but a
-; catch-all, so it continues to the `catch_unwind` outside (measured: the
-; probe's rust-panic-through-asmtry mode).
+; A Rust panic is not caught here: the personality matches only the `id`
+; typeinfo, and a foreign (Rust) exception matches no typeinfo but a catch-all,
+; so it continues to the `catch_unwind` outside.
 	.section	__TEXT,__text,regular,pure_instructions
 	.globl	_aterm_objc_try
 	.p2align	2

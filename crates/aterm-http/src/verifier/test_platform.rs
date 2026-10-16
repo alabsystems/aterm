@@ -9,7 +9,7 @@
 //! names.
 //!
 //! [`trust_service_silent`] is the workspace's one probe and one skip line
-//! (`aterm_uds::deadline`, the `test-support` feature: a code check, through
+//! (`aterm_uds::deadline`, a debug build's: a code check, through
 //! the same gate the shipped verifier evaluates under) PLUS, when that one
 //! answers, the exact call these tests depend on — one shipped certificate
 //! evaluation — because the two `trustd` round trips can diverge
@@ -41,7 +41,7 @@ pub(crate) fn trust_service_silent() -> bool {
 fn shipped_evaluation_unanswered() -> bool {
     static SILENT: OnceLock<bool> = OnceLock::new();
     let silent = *SILENT.get_or_init(|| {
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let provider = Arc::new(crate::tls::provider());
         let Ok(verifier) = PlatformVerifier::new(provider) else {
             // No platform verifier at all: the callers' own skips say so.
             return false;

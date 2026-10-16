@@ -11,7 +11,7 @@ const CELL_H: usize = 16;
 /// the shipping chrome that runs later in the same seam.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Chrome {
-    /// Nothing after the strip: the frame the fix is for.
+    /// Nothing after the strip.
     None,
     /// `splice_find_bar` — overwrites terminal cells in place and bumps
     /// `snapshot_seq`. Must cost the next frame its scoped arm.
@@ -199,7 +199,7 @@ fn corpus() -> Vec<Step> {
             engine: |t| t.process(b"y"),
             chrome: Chrome::None,
         },
-        // ---- strip ON (1 row): the shape the whole fix is about. ----
+        // ---- Strip on, one row. ----
         Step {
             name: "on1_appear",
             strip: 1,
@@ -654,8 +654,8 @@ fn a_strip_frames_retained_rows_match_a_full_re_extract_over_the_corpus() {
         }
     }
 
-    // ---- NON-vacuity. A corpus that silently fell back to Full on every
-    // strip frame would satisfy every equality above and prove nothing. ----
+    // ---- Non-vacuity: a corpus that fell back to Full on every strip frame
+    // would satisfy every equality above and prove nothing. ----
     assert!(
         scoped_on >= 20,
         "the strip-ON corpus reached the damage-scoped arm on only {scoped_on} frames — \
@@ -852,8 +852,7 @@ fn any_host_cell_write_before_the_prepend_disowns_the_lane() {
         "a blessed prepend re-arms the provenance token"
     );
 
-    // Now the ghost-paint shape: a host writes a cell (bumping the seq, the
-    // established discipline) before the prepend runs.
+    // A host writes a cell (bumping the seq) before the prepend runs.
     term_lock(&terminal).process(b"\x1b[1;1Hcontent2");
     {
         let ws = app.windows.get_mut(&wid).expect("fixture window");
@@ -887,7 +886,7 @@ fn any_host_cell_write_before_the_prepend_disowns_the_lane() {
         "the stamp gate accepted a frame whose cells a host had overwritten"
     );
 
-    // …and the un-splice refuses it, so the NEXT extract cannot retain rows
+    // …and the un-splice refuses it, so the next extract cannot retain rows
     // whose bytes the host changed.
     let ws = app.windows.get_mut(&wid).expect("fixture window");
     let mut pool = Vec::new();

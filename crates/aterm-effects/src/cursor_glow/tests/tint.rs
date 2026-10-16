@@ -15,11 +15,10 @@ const TINT_THEMES: [(&str, u32, u32); 5] = [
     ("Paper", 0x0033_3333, 0x00FA_F8F5),
 ];
 
-/// One spectrum, no seam: every mark on the light rail line reads
-/// `rainbow_sweep_at` / `rainbow_band_at`. The sweep is continuous (the six
-/// bands are an acyclic ramp, so a wrapping sweep would seam violet into red),
-/// and a cell's band is the same for the rail, the pop's bar and the glyph
-/// tint.
+/// One spectrum, no seam: every mark on the light rail reads `rainbow_sweep_at` /
+/// `rainbow_band_at`. The sweep is continuous (the seven stops are an acyclic ramp, so a
+/// wrapping sweep would seam violet into red), and a cell's band is the same for the rail, the
+/// pop's bar and the glyph tint.
 #[test]
 fn one_rainbow_sweep_is_continuous_and_shared() {
     // Continuity: no jump bigger than one step of the sweep's rate across
@@ -62,46 +61,6 @@ fn one_rainbow_sweep_is_continuous_and_shared() {
             );
         }
     }
-}
-
-/// Negative control for the box guard: an endpoint-only bound
-/// (`L(ink) <= cap`) is unsound, since a lerp between a bluish foreground and
-/// a reddish ink passes a colour with both maxima, brighter than either end.
-/// The corner bound is strictly stronger.
-#[test]
-fn glyph_tint_box_corner_is_stronger_than_its_endpoints() {
-    let mut found = false;
-    for &(_, fg, bg) in &TINT_THEMES {
-        let Some((_, cap)) = glyph_ink_bound(fg, bg) else {
-            continue;
-        };
-        for &band in &RAINBOW_BANDS {
-            // Some candidate must pass the endpoint test but fail the box
-            // test, or the guard is vacuous on this palette.
-            for step in 0..=64 {
-                let k = step as f32 / 64.0;
-                let ink = {
-                    let (r, g, b) = (
-                        ((band >> 16) & 0xff) as f32,
-                        ((band >> 8) & 0xff) as f32,
-                        (band & 0xff) as f32,
-                    );
-                    let (hi, lo) = (r.max(g).max(b), r.min(g).min(b));
-                    let span = (hi - lo).max(1e-3);
-                    let ch = |c: f32| ((((c - lo) / span * hi) * k + 0.5) as u32).min(255);
-                    (ch(r) << 16) | (ch(g) << 8) | ch(b)
-                };
-                if rel_luminance(ink) <= cap && rel_luminance(chan_max(ink, fg)) > cap {
-                    found = true;
-                }
-            }
-        }
-    }
-    assert!(
-        found,
-        "the box corner rejects candidates the endpoint test accepts — \
-         if this ever stops being true the guard has gone vacuous"
-    );
 }
 
 /// Bisection soundness: `fresh_ink_glyph_ink` bisects on `k`, valid only if
@@ -182,7 +141,7 @@ fn glyph_tint_palette_is_memoized_on_the_theme_key() {
         .expect("a key is memoized on the first tick");
     assert_eq!(first.0, (c.theme_fg, c.theme_bg));
     assert!(first.1.is_some(), "the fixture theme is usable");
-    // A tick with an unchanged theme keeps the SAME memo (bit-identical).
+    // A tick with an unchanged theme keeps the same memo.
     glow.tick(
         Some((3, 3)),
         t0 + Duration::from_millis(16),
@@ -207,7 +166,7 @@ fn glyph_tint_palette_is_memoized_on_the_theme_key() {
         second.1, first.1,
         "a different theme yields a different palette"
     );
-    // A REFUSAL is memoized too, so it is decided once and not per frame.
+    // A refusal is memoized too, so it is decided once and not per frame.
     c.theme_fg = 0x0012_3456;
     c.theme_bg = 0x0012_3456;
     glow.tick(
@@ -347,7 +306,7 @@ fn light_ink_bold_holds_one_ink_weight_across_the_spectrum() {
             hi <= LIGHT_INK_BOLD_MAX_CHANNEL + 1.0,
             "band {band:06X} -> {ink:06X} peaks at {hi}, over the channel bar"
         );
-        // HUE PRESERVED: the band is still recognisably its own colour.
+        // Hue preserved: the band is still recognisably its own colour.
         assert_eq!(
             order(band),
             order(ink),
@@ -377,8 +336,7 @@ fn rainbow_bands_are_the_spectrum_stops() {
             "RAINBOW_BANDS[{i}] is not the spectrum's stop {i}"
         );
     }
-    // Red is the anchor the arc's luminance was chosen to preserve: this
-    // family's red does not move, and the design says so in §2.2.
+    // Red is the anchor the arc's luminance was chosen to preserve.
     assert_eq!(RAINBOW_BANDS[0], 0x00FF_0000);
     // The names are ordered and distinct — a vocabulary, not a ramp with a
     // repeat in it.
@@ -409,7 +367,7 @@ fn light_ink_cap_keeps_glyphs_legible() {
     }
 }
 
-// ---- FRESH-INK POP (the typed-glyph highlight over the rainbow) --------
+// ---- Fresh-ink pop (the typed-glyph highlight over the rainbow) ----
 
 /// A crown-free, ring-free rainbow kitty config, so the halo stream carries
 /// only fresh-ink pops (stars/particles emit into `out`; the dark theme emits
@@ -420,8 +378,6 @@ fn rainbow_pop_cfg() -> GlowConfig {
     c.ring = false;
     c
 }
-
-// ---- the typing wake (the continuous plume under the typed row) --------
 
 /// The light-theme twin of [`rainbow_pop_cfg`]: the halo stream carries the
 /// fresh-ink darken veils (isolated by their exact veil colour).

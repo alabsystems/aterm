@@ -695,7 +695,7 @@ fn push_find_field(nodes: &mut Vec<(NodeId, Node)>, find: &GridFind) {
 /// nothing for a node without one. `crate::native_accessibility::announce_live` follows
 /// the same rule.
 ///
-/// `bounds` only for a message with a rectangle (see [`GridMessage::bar_row`]); a
+/// Bounds are set only for a message with a rectangle (see [`GridMessage::bar_row`]); a
 /// message spliced over grid rows is told, not placed.
 ///
 /// The message never takes focus, even when assertive: the keyboard is still in the
@@ -774,20 +774,14 @@ fn push_message(
 
 /// The accessibility tree for a plain terminal session (no overlay open).
 ///
-/// A `Role::Window` root parenting, in painted order: the visible tab strip (when on
-/// screen and a switcher), the chrome messages being shown ([`ChromeMessage`], live
-/// regions spoken as they arrive), the find field (while find mode is live), and the
-/// terminal: one read-only `Role::Terminal` document for an ordinary frame, or one per
-/// visible pane for a split.
+/// A `Role::Window` root parenting, in painted order: the tab strip (when on screen and
+/// a switcher), the chrome messages being shown (live regions), the find field (while
+/// find mode is live), and the terminal: one read-only `Role::Terminal` document, or one
+/// per visible pane for a split.
 ///
-/// Focus is where the keyboard is: the find field while the panel owns the keys, else
-/// the focused pane, else the single grid.
-///
-/// Events follow from the structure: AccessKit's consumer diffs this tree against the
-/// previous one and synthesises `object:text-changed:insert` / `:delete` and
-/// `object:text-caret-moved`, which is why row ids ([`ROW_BASE`]) stay stable across
-/// frames. The grid text is the same snapshot the SIGUSR1 `.txt` capture and the AppKit
-/// publisher use.
+/// AccessKit's consumer diffs this tree against the previous one to synthesise
+/// `object:text-changed:insert`/`:delete` and `object:text-caret-moved`, which is why
+/// row ids ([`ROW_BASE`]) stay stable across frames.
 pub(crate) fn grid_tree(
     snap: &crate::accessibility::AccessibleSnapshot,
     geom: Option<GridGeometry>,
@@ -889,10 +883,9 @@ pub(crate) fn grid_tree(
         }
     }
 
-    // Focus follows the keyboard: the
-    // find field while the panel owns the keys, else the pane the keyboard is in. The
-    // last child is the fallback — the single grid on an ordinary frame, and the last pane
-    // on a split whose focus the layout could not name, which is a real node either way.
+    // Focus follows the keyboard: the find field while the panel owns the keys, else the
+    // focused pane. The fallback is the last child: the single grid, or the last pane of
+    // a split whose focus the layout could not name.
     let focus = match (frame.find.is_some(), focused_pane) {
         (true, _) => FIND,
         (false, Some(pane)) => pane,
@@ -921,8 +914,7 @@ pub(crate) fn grid_tree(
 mod tests {
     use super::*;
 
-    /// A real engine's visible grid, so assertions run against the genuine
-    /// `AccessibleSnapshot::value()` (shared with the SIGUSR1 `.txt` snapshot).
+    /// A real engine's visible grid.
     fn live_grid(
         rows: u16,
         cols: u16,
@@ -950,11 +942,9 @@ mod tests {
         bar_h: 18.0,
     };
 
-    /// Band rows are published and placed: they reserve real terminal rows and announce
-    /// work the user did not start (a toolchain installing, an update downloading). They
-    /// appear in painted order between the strip and the grid, each with the band
-    /// rectangle it was drawn into, while surfaces with no fixed place carry none. Each
-    /// capsule is a button child bounded by its own cells.
+    /// Band rows are published in painted order between the strip and the grid, each
+    /// with the band rectangle it was drawn into; a surface with no fixed place carries
+    /// none, and each capsule is a button child bounded by its own cells.
     #[test]
     fn a_status_band_is_published_where_it_is_painted() {
         let snap = live_grid(2, 20, b"hi", Some((0, 2)));
@@ -1015,7 +1005,7 @@ mod tests {
             [capsule.node_id()]
         );
         assert_eq!(ChromeMessage::from_node(capsule.node_id()), Some(capsule));
-        // A surface with no reserved row publishes NO rectangle rather than a wrong one
+        // A surface with no reserved row publishes no rectangle rather than a wrong one
         // (the paste question overwrites the band's rows in place: `bar_row: None`).
         let floating = grid_tree(
             &snap,
@@ -1043,8 +1033,8 @@ mod tests {
         );
     }
 
-    /// `grid_tree` publishes the grid as a read-only `Role::Terminal` node under a
-    /// `Role::Window` root, carrying the snapshot's visible text.
+    /// The grid is a read-only `Role::Terminal` under a `Role::Window` root, carrying the
+    /// visible text.
     #[test]
     fn grid_tree_publishes_the_terminal_grid() {
         let snap = live_grid(2, 10, b"hello", Some((0, 5)));
@@ -1069,11 +1059,9 @@ mod tests {
         );
     }
 
-    /// The grid is a real text document: `accesskit_consumer::Node::supports_text_ranges()`
-    /// (which `accesskit_atspi_common` consults before exposing `org.a11y.atspi.Text`)
-    /// requires `Role::Terminal` plus a `Role::TextRun` child. One run per visible row,
-    /// each carrying its hard line break as one character, concatenating byte for byte
-    /// back to the snapshot text.
+    /// The grid is a real text document (`Role::Terminal` plus `Role::TextRun` children,
+    /// which `supports_text_ranges()` requires): one run per row, each carrying its hard
+    /// line break, concatenating back to the snapshot text.
     #[test]
     fn terminal_node_publishes_one_text_run_per_row() {
         let snap = live_grid(3, 12, b"alpha\r\nbeta", Some((1, 4)));
@@ -1572,9 +1560,7 @@ mod tests {
         }
     }
 
-    /// A live region carries its sentence in both name and value: `accesskit_atspi_common`
-    /// announces the name, `accesskit_windows` raises `LiveRegionChanged` and reads the
-    /// name, and `accesskit_macos` announces the value (and raises nothing without one).
+    /// A live region carries its sentence in both name and value (see [`push_message`]).
     #[test]
     fn every_chrome_message_announces_the_same_sentence_by_name_and_by_value() {
         let snap = live_grid(2, 20, b"hi", None);
@@ -1599,9 +1585,8 @@ mod tests {
         }
     }
 
-    /// No flooding: announcements fire when the spoken sentence changes, so volatile
-    /// figures go in the description (a property change, never an announcement) and the
-    /// meter in the node's numeric value.
+    /// No flooding: volatile figures go in the description and the meter in the numeric
+    /// value, so only a change of the spoken sentence announces.
     #[test]
     fn a_status_band_keeps_its_volatile_figures_out_of_the_announcement() {
         let snap = live_grid(2, 20, b"hi", None);
@@ -1736,9 +1721,8 @@ mod tests {
         assert_eq!(update.focus, GRID, "Enter still reaches the terminal");
     }
 
-    /// A message id round-trips to its own surface, is the same from frame to frame (so
-    /// AccessKit diffs a name change, which fires the announcement), and is refused by the
-    /// tab decoder.
+    /// A message id round-trips to its own surface, is stable across frames (so a name
+    /// change diffs as an announcement), and is refused by the tab decoder.
     #[test]
     fn message_ids_round_trip_are_stable_and_are_never_read_as_a_tab() {
         let snap = live_grid(2, 20, b"hi", None);
@@ -1854,8 +1838,7 @@ mod tests {
         assert_eq!(node(&untitled, ROOT).label(), Some("aterm"));
     }
 
-    /// An ordinary frame publishes not one message node — a window with nothing to say is
-    /// byte-identical to the tree it always was.
+    /// An ordinary frame publishes no message node.
     #[test]
     fn a_quiet_frame_publishes_no_message_nodes() {
         let snap = live_grid(2, 20, b"hi", Some((0, 2)));

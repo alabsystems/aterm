@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE WINDOW DRIVER: `vendor/winit`'s `window_delegate.rs` answering for real,
+//! THE WINDOW DRIVER: `crates/aterm-window`'s `window_delegate.rs` answering for real,
 //! through the 177 AppKit BINDING calls W8 moved off `objc2-app-kit`.
 //!
 //! # Why this exists beside the other three
@@ -13,13 +13,12 @@
 //! fullscreen, occlusion, close, drag-and-drop, the style mask, the appearance
 //! observer and the tab group.
 //!
-//! `crates/aterm-objc/tests/winit_sent_prototypes.rs` is the other half of the
-//! evidence and it is the CHEAPER half — it reads `method_getTypeEncoding` for
-//! all 96 sent selectors and catches a wrong prototype, which is how the
-//! `-requestUserAttention:` signedness defect was found. It cannot catch a
-//! CORRECT send of the WRONG selector, an inverted boolean, a constant that
-//! encodes fine and means something else (W7 shipped exactly that), or an
-//! ownership mistake. That is this file.
+//! A debug build compares every typed send's prototype with the runtime's
+//! `method_getTypeEncoding` (`aterm_objc::send`), which catches a wrong
+//! prototype (how the `-requestUserAttention:` signedness defect was found); it
+//! cannot catch a CORRECT send of the WRONG selector, an inverted boolean, a
+//! constant that encodes fine and means something else (W7 shipped exactly
+//! that), or an ownership mistake. That is this file.
 //!
 //! # What it drives, and against what
 //!
@@ -41,8 +40,8 @@
 //!
 //! # The weak-reference stage, added by W9
 //!
-//! Stage 12 does not drive `window_delegate.rs` at all; it drives
-//! `aterm_objc::weak`, the capability `vendor/winit`'s `view.rs:169` is blocked
+//! Stage 11 does not drive `window_delegate.rs` at all; it drives
+//! `aterm_objc::weak`, the capability `crates/aterm-window`'s `view.rs:169` is blocked
 //! on, against the objects it exists for. It is here rather than in a fifth
 //! driver because this file already stands up the exact graph the capability is
 //! about — a live `NSWindow`, its `NSView` and the delegate AppKit is holding,
@@ -87,7 +86,7 @@ const NOT_RUN: i32 = 2;
 fn main() -> std::process::ExitCode {
     eprintln!(
         "objc-window-drive: NOT RUN — this drives \
-         vendor/winit/src/platform_impl/macos/window_delegate.rs, which does not exist off macOS."
+         crates/aterm-window/src/platform_impl/macos/window_delegate.rs, which does not exist off macOS."
     );
     std::process::ExitCode::from(NOT_RUN as u8)
 }
@@ -107,10 +106,9 @@ mod macos {
     use winit::application::ApplicationHandler;
     use winit::event::WindowEvent;
     use winit::event_loop::ActiveEventLoop;
-    use winit::platform::macos::{MonitorHandleExtMacOS, WindowExtMacOS};
+    use winit::platform::macos::MonitorHandleExtMacOS;
     use winit::platform::pump_events::{EventLoopExtPumpEvents, PumpStatus};
-    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-    use winit::window::{Theme, Window, WindowButtons, WindowId};
+    use winit::window::{Theme, Window, WindowId};
 
     use super::{FAIL, NOT_RUN, PASS};
 
@@ -203,7 +201,7 @@ mod macos {
 
     // ------------------------------------------------------- the menu reads
     //
-    // W12, for `vendor/winit`'s `menu.rs`. Same rule as the sends above: each
+    // W12, for `crates/aterm-window`'s `menu.rs`. Same rule as the sends above: each
     // is a typed `objc_msgSend` cast written here, not a call into
     // `aterm_objc::send::*`, so the driver and the port cannot agree about a
     // shape they both got wrong.
@@ -310,7 +308,7 @@ mod macos {
 
     // ----------------------------------------------- the swizzle's own reads
     //
-    // W12, for `vendor/winit`'s `app.rs`. These do NOT go through
+    // W12, for `crates/aterm-window`'s `app.rs`. These do NOT go through
     // `aterm_objc::swizzle` — the point is to read the runtime's own tables
     // with the runtime's own C functions, so a bug in that module cannot make
     // this stage agree with it.
@@ -381,8 +379,7 @@ mod macos {
     /// `chars` must be a live `NSString`.
     unsafe fn key_up_event(window_number: isize, modifiers: usize, chars: Id) -> Id {
         // SAFETY: the ten-argument factory is
-        // `@@:Q{CGPoint=dd}Qdq@@@BS` — read from `method_getTypeEncoding` and
-        // censused in `winit_sent_prototypes.rs`.
+        // `@@:Q{CGPoint=dd}Qdq@@@BS` — read from `method_getTypeEncoding`.
         unsafe {
             #[allow(clippy::type_complexity)]
             let f: unsafe extern "C-unwind" fn(
@@ -554,14 +551,13 @@ mod macos {
 
     impl Driver {
         /// The `WinitWindowDelegate` AppKit is holding, and the `NSWindow` it
-        /// belongs to, reached WITHOUT the port: from the raw window handle's
+        /// belongs to, reached WITHOUT the port: from the window's content
         /// view, up to its window, then that window's own `-delegate`.
         fn pair(&self) -> Option<(Id, Id)> {
-            let handle = self.window.as_ref()?.window_handle().ok()?;
-            let RawWindowHandle::AppKit(h) = handle.as_raw() else {
+            let view = self.ns_view();
+            if view.is_null() {
                 return None;
-            };
-            let view = Id::from_ptr(h.ns_view.as_ptr());
+            }
             // SAFETY: `-window` is `@16@0:8` on `NSView`.
             let window = unsafe {
                 let f: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
@@ -578,15 +574,11 @@ mod macos {
             Some((delegate, window))
         }
 
-        /// The window's own `NSView`, from the raw handle. Nil if there is none.
+        /// The window's own content `NSView`. Nil if there is none.
         fn ns_view(&self) -> Id {
-            let Some(handle) = self.window.as_ref().and_then(|w| w.window_handle().ok()) else {
-                return Id::NIL;
-            };
-            let RawWindowHandle::AppKit(h) = handle.as_raw() else {
-                return Id::NIL;
-            };
-            Id::from_ptr(h.ns_view.as_ptr())
+            self.window
+                .as_ref()
+                .map_or(Id::NIL, aterm_objc::HasNsView::ns_view)
         }
     }
 
@@ -654,15 +646,14 @@ mod macos {
                 4 => self.stage_size_limits(),
                 5 => self.stage_visibility_and_focus(),
                 6 => self.stage_theme(),
-                7 => self.stage_window_ext(),
-                8 => self.stage_drag_and_drop(delegate),
-                9 => self.stage_close(delegate, ns),
-                10 => self.stage_fullscreen_enter(),
-                11 => self.stage_fullscreen_exit(),
-                12 => self.stage_weak_references(delegate, ns),
-                13 => self.stage_default_menu(),
-                14 => self.stage_monitors(),
-                15 => self.stage_send_event_swizzle(),
+                7 => self.stage_drag_and_drop(delegate),
+                8 => self.stage_close(delegate, ns),
+                9 => self.stage_fullscreen_enter(),
+                10 => self.stage_fullscreen_exit(),
+                11 => self.stage_weak_references(delegate, ns),
+                12 => self.stage_default_menu(),
+                13 => self.stage_monitors(),
+                14 => self.stage_send_event_swizzle(),
                 _ => {
                     self.done = true;
                     el.exit();
@@ -692,63 +683,25 @@ mod macos {
             }
         }
 
-        /// The style-mask surface: every setter that reads-modifies-writes the
-        /// `NSUInteger` that `NSWindowStyleMask` used to be, checked against
-        /// AppKit's own `-styleMask` rather than against the port's.
+        /// The style mask the window was BUILT with, read off AppKit's own
+        /// `-styleMask` rather than the port's state. (The setters this stage
+        /// also drove, `set_resizable`, `set_enabled_buttons` and
+        /// `set_decorations`, left macOS with the rest of the API no aterm
+        /// crate calls, winit-core step 5, 2026-10-16; every window is built
+        /// titled, closable, miniaturizable and resizable.)
         fn stage_style_mask(&mut self, ns: Id) {
-            println!("\n[2] style mask — resizable, buttons, decorations");
+            println!("\n[2] style mask — the mask the window was built with");
             const TITLED: usize = 1 << 0;
             const CLOSABLE: usize = 1 << 1;
             const MINIATURIZABLE: usize = 1 << 2;
             const RESIZABLE: usize = 1 << 3;
+            const BUILT: usize = TITLED | CLOSABLE | MINIATURIZABLE | RESIZABLE;
 
-            // SAFETY: `ns` is the live `NSWindow`, here and below.
-            let mask = |()| unsafe { style_mask(ns) };
-
-            self.w().set_resizable(false);
-            let m = mask(());
+            // SAFETY: `ns` is the live `NSWindow`.
+            let m = unsafe { style_mask(ns) };
             self.report.check(
-                m & RESIZABLE == 0 && !self.w().is_resizable(),
-                &format!("set_resizable(false) clears NSWindowStyleMaskResizable (mask {m:#x})"),
-            );
-            self.w().set_resizable(true);
-            let m = mask(());
-            self.report.check(
-                m & RESIZABLE != 0 && self.w().is_resizable(),
-                &format!("set_resizable(true) sets it back (mask {m:#x})"),
-            );
-
-            self.w().set_enabled_buttons(WindowButtons::empty());
-            let m = mask(());
-            self.report.check(
-                m & CLOSABLE == 0 && m & MINIATURIZABLE == 0,
-                &format!("empty buttons clear Closable|Miniaturizable (mask {m:#x})"),
-            );
-            let b = self.w().enabled_buttons();
-            self.report.check(
-                !b.contains(WindowButtons::CLOSE) && !b.contains(WindowButtons::MINIMIZE),
-                &format!("enabled_buttons() agrees: {b:?}"),
-            );
-            self.w().set_enabled_buttons(WindowButtons::all());
-            let b = self.w().enabled_buttons();
-            self.report.check(
-                b.contains(WindowButtons::CLOSE)
-                    && b.contains(WindowButtons::MINIMIZE)
-                    && b.contains(WindowButtons::MAXIMIZE),
-                &format!("all buttons restored: {b:?} (mask {:#x})", mask(())),
-            );
-
-            self.w().set_decorations(false);
-            let m = mask(());
-            self.report.check(
-                m & TITLED == 0 && !self.w().is_decorated(),
-                &format!("set_decorations(false) clears Titled (mask {m:#x})"),
-            );
-            self.w().set_decorations(true);
-            let m = mask(());
-            self.report.check(
-                m & TITLED != 0 && self.w().is_decorated(),
-                &format!("set_decorations(true) restores it (mask {m:#x})"),
+                m & BUILT == BUILT && self.w().is_decorated(),
+                &format!("titled, closable, miniaturizable and resizable (mask {m:#x})"),
             );
         }
 
@@ -793,12 +746,12 @@ mod macos {
             ));
         }
 
-        /// `-setContentMinSize:`/`-setContentMaxSize:` and the clamp that
-        /// follows them — the two sends whose effect is a RESIZE the caller did
-        /// not ask for.
+        /// `-setContentMinSize:` and the clamp that follows it — the send whose
+        /// effect is a RESIZE the caller did not ask for. (The maximum and the
+        /// resize-increments getter left macOS, winit-core step 5.)
         fn stage_size_limits(&mut self) {
             use winit::dpi::PhysicalSize;
-            println!("\n[4] size limits — min/max clamp the current size");
+            println!("\n[4] size limits — min clamps the current size");
 
             self.w()
                 .set_min_inner_size(Some(PhysicalSize::new(700_u32, 500)));
@@ -808,16 +761,7 @@ mod macos {
                 &format!("min 700x500 grew the window to {got:?}"),
             );
 
-            self.w()
-                .set_max_inner_size(Some(PhysicalSize::new(500_u32, 380)));
-            let got = self.w().inner_size();
-            self.report.check(
-                got.width <= 700 && got.height <= 500,
-                &format!("max 500x380 did not grow the window: {got:?}"),
-            );
-
             self.w().set_min_inner_size(None::<PhysicalSize<u32>>);
-            self.w().set_max_inner_size(None::<PhysicalSize<u32>>);
             let _ = self.w().request_inner_size(PhysicalSize::new(480_u32, 320));
             self.report.check(
                 self.w().inner_size() == PhysicalSize::new(480, 320),
@@ -827,13 +771,9 @@ mod macos {
                 ),
             );
 
+            // Stored for the next live resize; there is nothing to read back.
             self.w()
                 .set_resize_increments(Some(PhysicalSize::new(8_u32, 8)));
-            let inc = self.w().resize_increments();
-            self.report.check(
-                inc.is_some(),
-                &format!("resize_increments round-trips: {inc:?}"),
-            );
             self.w().set_resize_increments(None::<PhysicalSize<u32>>);
         }
 
@@ -899,67 +839,12 @@ mod macos {
             );
         }
 
-        /// `WindowExtMacOS` — shadow, tabbing identifier, tab count and the
-        /// document-edited dot. Six more sends, three of them nil-answering.
-        fn stage_window_ext(&mut self) {
-            println!("\n[7] WindowExtMacOS — shadow, tabs, document-edited");
-            let had = self.w().has_shadow();
-            self.w().set_has_shadow(!had);
-            self.report.check(
-                self.w().has_shadow() == !had,
-                &format!("set_has_shadow({}) round-trips", !had),
-            );
-            self.w().set_has_shadow(had);
-
-            self.w().set_tabbing_identifier("aterm-objc-window-drive");
-            let id = self.w().tabbing_identifier();
-            self.report.check(
-                id == "aterm-objc-window-drive",
-                &format!("tabbing_identifier round-trips: {id:?}"),
-            );
-
-            let n = self.w().num_tabs();
-            self.report.check(
-                n >= 1,
-                &format!("num_tabs {n} — nil tabbedWindows must read as the one tab it is"),
-            );
-            // Exercises `-tabGroup`, which answers nil for an untabbed window;
-            // the port must return rather than message nil.
-            self.w().select_tab_at_index(0);
-            self.w().select_next_tab();
-            self.w().select_previous_tab();
-            self.report
-                .check(true, "tab navigation on an untabbed window does not raise");
-
-            self.w().set_document_edited(true);
-            self.report.check(
-                self.w().is_document_edited(),
-                "set_document_edited(true) -> is_document_edited",
-            );
-            self.w().set_document_edited(false);
-            self.report.check(
-                !self.w().is_document_edited(),
-                "set_document_edited(false) -> !is_document_edited",
-            );
-
-            self.w().set_content_protected(true);
-            self.w().set_content_protected(false);
-            self.w().set_blur(true);
-            self.w().set_blur(false);
-            let _ = self.w().set_cursor_hittest(false);
-            let _ = self.w().set_cursor_hittest(true);
-            self.report.check(
-                true,
-                "content protection, blur and cursor hittest all complete",
-            );
-        }
-
         /// THE ROW WHOSE ABI W6 CORRECTED. `draggingEntered:` returns an
         /// eight-byte `NSDragOperation`, not a one-byte `BOOL`, and the value
         /// it must answer is `NSDragOperationCopy` (1) for a pasteboard with
         /// filenames and `NSDragOperationNone` (0) for one without.
         fn stage_drag_and_drop(&mut self, delegate: Id) {
-            println!("\n[8] drag and drop — draggingEntered: returns NSDragOperation");
+            println!("\n[7] drag and drop — draggingEntered: returns NSDragOperation");
             let Some((info, _pb)) = dragging_info(&["/tmp/aterm-drive-a", "/tmp/aterm-drive-b"])
             else {
                 self.report
@@ -997,7 +882,7 @@ mod macos {
         /// `windowShouldClose:` must answer NO and queue `CloseRequested` — the
         /// inversion that would make the window uncloseable or unstoppable.
         fn stage_close(&mut self, delegate: Id, ns: Id) {
-            println!("\n[9] close — windowShouldClose: answers NO and queues CloseRequested");
+            println!("\n[8] close — windowShouldClose: answers NO and queues CloseRequested");
             let before = self.close_requested;
             // SAFETY: `delegate` is the live delegate; `ns` is a valid sender.
             let answer = unsafe { window_should_close(delegate, ns) };
@@ -1015,7 +900,7 @@ mod macos {
         /// pump on purpose — see the note on [`Self::stage_fullscreen_exit`].
         fn stage_fullscreen_enter(&mut self) {
             use winit::window::Fullscreen;
-            println!("\n[10] fullscreen — entering");
+            println!("\n[9] fullscreen — entering");
             self.report
                 .check(self.w().fullscreen().is_none(), "starts windowed");
             self.w().set_fullscreen(Some(Fullscreen::Borderless(None)));
@@ -1045,7 +930,7 @@ mod macos {
         /// out of an AppKit frame, or a panic — fails the process, not this
         /// assertion.
         fn stage_fullscreen_exit(&mut self) {
-            println!("\n[11] fullscreen — leaving, and simple fullscreen");
+            println!("\n[10] fullscreen — leaving");
             let before = self.w().fullscreen().is_some();
             self.w().set_fullscreen(None);
             let after = self.w().fullscreen();
@@ -1058,18 +943,6 @@ mod macos {
                 after.is_some()
             ));
 
-            let was = self.w().simple_fullscreen();
-            let took = self.w().set_simple_fullscreen(true);
-            self.report.note(&format!(
-                "set_simple_fullscreen(true) -> {took} (was {was}, now {}) — refused while \
-                 native fullscreen is active, which is upstream's rule",
-                self.w().simple_fullscreen()
-            ));
-            self.w().set_simple_fullscreen(false);
-            self.report.check(
-                !self.w().simple_fullscreen(),
-                "simple fullscreen is off again",
-            );
             let m = self.w().is_maximized();
             self.report.check(
                 m == self.w().is_maximized(),
@@ -1084,7 +957,7 @@ mod macos {
         /// AppKit. This stage runs the same experiments on the real thing: the
         /// live `NSWindow` this drive created, its `NSView`, and the
         /// `WinitWindowDelegate` AppKit is holding — which is exactly the edge
-        /// `vendor/winit`'s `view.rs:169` needs, an `NSView` naming its
+        /// `crates/aterm-window`'s `view.rs:169` needs, an `NSView` naming its
         /// `NSWindow` weakly because the window retains the view.
         ///
         /// Foundation and AppKit are not the same runtime surface for this:
@@ -1095,7 +968,7 @@ mod macos {
         /// would be found here and nowhere else.
         fn stage_weak_references(&mut self, delegate: Id, ns: Id) {
             println!(
-                "\n[12] weak references — objc_initWeak/loadWeak/storeWeak/copyWeak/destroyWeak"
+                "\n[11] weak references — objc_initWeak/loadWeak/storeWeak/copyWeak/destroyWeak"
             );
 
             let view = self.ns_view();
@@ -1308,7 +1181,7 @@ mod macos {
             );
         }
 
-        /// THE DEFAULT APPLICATION MENU — `vendor/winit`'s `menu.rs`, read back
+        /// THE DEFAULT APPLICATION MENU — `crates/aterm-window`'s `menu.rs`, read back
         /// off `[NSApp mainMenu]`.
         ///
         /// W12 ported that file's twelve `objc2-app-kit` binding calls to typed
@@ -1331,7 +1204,7 @@ mod macos {
         /// `-stringByAppendingString:` was sent to the right receiver in the
         /// right order, and "About " + name is the only statement of that.
         fn stage_default_menu(&mut self) {
-            println!("\n[13] default menu — winit's menu.rs, off [NSApp mainMenu]");
+            println!("\n[12] default menu — winit's menu.rs, off [NSApp mainMenu]");
             let name = process_name();
             // SAFETY: the shared application is live; both accessors are
             // `@16@0:8`.
@@ -1487,7 +1360,7 @@ mod macos {
             );
         }
 
-        /// THE MONITOR SURFACE — `vendor/winit`'s `monitor.rs`, W12.
+        /// THE MONITOR SURFACE — `crates/aterm-window`'s `monitor.rs`, W12.
         ///
         /// # What it can catch, and what it cannot — measured, not asserted
         ///
@@ -1511,7 +1384,7 @@ mod macos {
         /// runtime; nothing here checks a consequence, because there is not one
         /// to check.
         fn stage_monitors(&mut self) {
-            println!("\n[14] monitors — winit's monitor.rs, against CoreGraphics and AppKit");
+            println!("\n[13] monitors — winit's monitor.rs, against CoreGraphics and AppKit");
             let cg_main = cg_main_display_id();
 
             let Some(primary) = self.w().primary_monitor() else {
@@ -1570,24 +1443,6 @@ mod macos {
                     .report
                     .note("no main screen; scale factor not compared"),
             }
-            // SAFETY: `+mainScreen` is `@16#0:8`.
-            let appkit_main = unsafe {
-                let f: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
-                f(class(c"NSScreen").as_id(), sel!(mainScreen))
-            };
-            match primary.ns_screen() {
-                Some(p) => self.report.check(
-                    p as usize == appkit_main.addr(),
-                    &format!(
-                        "MonitorHandleExtMacOS::ns_screen {p:p} IS +[NSScreen mainScreen] {:?}",
-                        appkit_main
-                    ),
-                ),
-                None => self
-                    .report
-                    .check(false, "the primary monitor answers an NSScreen"),
-            }
-
             let size = primary.size();
             let pos = primary.position();
             self.report.check(
@@ -1600,7 +1455,7 @@ mod macos {
             }
         }
 
-        /// THE SWIZZLE — `vendor/winit`'s `app.rs`, W12's first consumer of the
+        /// THE SWIZZLE — `crates/aterm-window`'s `app.rs`, W12's first consumer of the
         /// `aterm_objc::swizzle` capability.
         ///
         /// # Why the encoding proves nothing here, and what does
@@ -1625,7 +1480,7 @@ mod macos {
         /// replacement's `-[NSWindow sendEvent:]` forward. It is asserted after
         /// the pump, beside the drag stage's events.
         fn stage_send_event_swizzle(&mut self) {
-            println!("\n[15] -sendEvent: swizzle — winit's app.rs, off the runtime's own tables");
+            println!("\n[14] -sendEvent: swizzle — winit's app.rs, off the runtime's own tables");
             // SAFETY: `+sharedApplication` is `@16#0:8`.
             let app = unsafe {
                 let f: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
@@ -1742,8 +1597,8 @@ mod macos {
 
     /// Drive the loop until every stage has run, then report.
     pub fn run() -> i32 {
-        // The quiet builder (Accessory, no launch activation): the gate runs this
-        // drive beside a developer who is typing somewhere else.
+        // The quiet builder (Accessory, no launch activation): `verify appkit` runs
+        // this drive beside a developer who is typing somewhere else.
         let mut el = match aterm_gui::quiet_driver_event_loop_builder::<()>().build() {
             Ok(el) => el,
             Err(e) => {
@@ -1785,7 +1640,7 @@ mod macos {
         // The drag stage's HoveredFile events are delivered by the pump, so
         // they are read after the loop rather than inside the stage.
         let hovered = std::mem::take(&mut driver.hovered);
-        println!("\n[8b] the paths draggingEntered: queued");
+        println!("\n[7b] the paths draggingEntered: queued");
         let want = ["/tmp/aterm-drive-a", "/tmp/aterm-drive-b"];
         driver.report.check(
             hovered == want,
@@ -1797,7 +1652,7 @@ mod macos {
         );
 
         // The swizzle stage's forwarded key-up, on the same terms.
-        println!("\n[15b] the Cmd+keyUp the swizzled sendEvent: forwarded");
+        println!("\n[14b] the Cmd+keyUp the swizzled sendEvent: forwarded");
         if driver.posted_cmd_key_up {
             driver.report.check(
                 driver.key_ups >= 1,

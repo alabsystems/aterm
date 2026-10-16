@@ -12,10 +12,9 @@ use aterm_types::keyboard::KeyboardMode;
 
 use super::{KittyKeyboardFlags, Terminal, TerminalModes, XtermKeyboardState};
 
-/// Derive `KeyboardMode` from terminal modes, Kitty flags, and xterm state.
-///
-/// Delegates to `aterm_types::keyboard::TermMode::from_keyboard_state` as the
-/// single source of truth for the 10-flag keyboard projection.
+/// Derive `KeyboardMode` from terminal modes, Kitty flags and xterm state:
+/// `aterm_types::keyboard::TermMode::from_keyboard_state` (the single source of
+/// the keyboard projection) plus the legacy-encoding modes it does not cover.
 #[must_use]
 pub(crate) fn keyboard_mode_from_state(
     modes: &TerminalModes,
@@ -30,17 +29,15 @@ pub(crate) fn keyboard_mode_from_state(
         xterm,
     )
     .to_keyboard_mode();
-    // DECBKM (mode 67) is a legacy-encoding concern outside the TermMode kitty/xterm
-    // projection, so fold it in here.
+    // DECBKM (mode 67) is outside the TermMode projection.
     if modes.backarrow_sends_bs {
         km.insert(KeyboardMode::BACKARROW_SENDS_BS);
     }
-    // xterm keyboard private modes 1035/1036/1039 are likewise legacy-encoding
-    // concerns folded in here. Each is modeled so the `empty()`/default mode
-    // preserves the historical encoder contract:
-    //   - 1039 altSendsEscape: a negative flag — reset suppresses the Alt ESC.
-    //   - 1036 metaSendsEscape: a positive flag — set adds the Meta ESC.
-    //   - 1035 numLock: a negative flag — reset strips the NumLock modifier.
+    // xterm private modes 1035/1036/1039, modeled so the empty mode keeps the
+    // default encoding:
+    //   - 1039 altSendsEscape: negative flag, reset suppresses the Alt ESC.
+    //   - 1036 metaSendsEscape: positive flag, set adds the Meta ESC.
+    //   - 1035 numLock: negative flag, reset strips the NumLock modifier.
     if !modes.alt_send_escape {
         km.insert(KeyboardMode::ALT_NO_ESC);
     }
@@ -50,13 +47,11 @@ pub(crate) fn keyboard_mode_from_state(
     if !modes.special_modifiers {
         km.insert(KeyboardMode::NO_SPECIAL_MODIFIERS);
     }
-    // ConPTY win32-input-mode (DEC 9001): a negotiation with the console host,
-    // folded in beside the other legacy-encoding concerns. It is not gated on
-    // `kitty_keyboard_enabled` and never enters the kitty flag word — conhost
-    // set it and conhost reads the bytes, so in the encoder the record it
-    // asked for outranks a kitty push the application made through it (see
-    // `KeyboardMode::WIN32_INPUT` for the measurement). Only where the host
-    // says a console host is there (`win32_input_active`).
+    // ConPTY win32-input-mode (DEC 9001), only where the host says a console
+    // host is there (`win32_input_active`). Never in the kitty flag word and not
+    // gated on `kitty_keyboard_enabled`: conhost asked for it and reads the
+    // bytes, so in the encoder it outranks a kitty push (see
+    // `KeyboardMode::WIN32_INPUT`).
     if modes.win32_input_active() {
         km.insert(KeyboardMode::WIN32_INPUT);
     }
@@ -82,11 +77,8 @@ impl Terminal {
 
     /// Whether the kitty keyboard protocol's `REPORT_ALL_KEYS_AS_ESC` (0b1000)
     /// enhancement is active: every key reaches the application as a CSI-u
-    /// report, so the application by definition never receives echoing text.
-    ///
-    /// A narrow read-only projection of [`Self::keyboard_mode`] for consumers that
-    /// specifically need report-all semantics. Honors the same capability-off gating
-    /// as `keyboard_mode()` (a disabled kitty capability reports `false`).
+    /// report, so it never receives echoing text. A narrow read-only projection
+    /// of [`Self::keyboard_mode`], with the same capability-off gating.
     #[must_use]
     pub fn kitty_report_all_keys(&self) -> bool {
         self.keyboard_mode()
@@ -94,39 +86,26 @@ impl Terminal {
     }
 
     /// Whether the active Kitty keyboard mode reports functional keys that have
-    /// no legacy escape form at all — the Menu/Application key (`57363`),
-    /// F13-F35, the media cluster.
+    /// no legacy escape form (the Menu key `57363`, F13-F35, the media cluster).
+    /// Legacy modes encode them to zero bytes; only `DISAMBIGUATE_ESC_CODES` and
+    /// `REPORT_ALL_KEYS_AS_ESC` route a bare `Key::Named` press through the CSI-u
+    /// encoder (`should_encode_kitty_event`).
     ///
-    /// These keys are invisible to an application in every legacy mode: the
-    /// legacy encoder has no sequence for them, so the press produces zero
-    /// bytes. `DISAMBIGUATE_ESC_CODES` and `REPORT_ALL_KEYS_AS_ESC` are exactly
-    /// the two enhancements under which `should_encode_kitty_event` routes a
-    /// bare `Key::Named` press through the CSI-u encoder and the app finally
-    /// receives it.
-    ///
-    /// The point of the projection is chrome deference: a host gesture must not
-    /// claim a key that the front application has negotiated for. Off the two
-    /// flags the key reaches nobody, so binding it to chrome costs the app
-    /// nothing; on them the app asked for it and must get it. Kept a narrow,
-    /// read-only projection of [`Self::keyboard_mode`] for the same reason
-    /// [`Self::kitty_report_all_keys`] is — it never feeds an encoder.
+    /// For chrome deference: a host gesture must not claim a key the front
+    /// application negotiated for, and may take one nobody receives. A read-only
+    /// projection of [`Self::keyboard_mode`]; it never feeds an encoder.
     #[must_use]
     pub fn kitty_reports_functional_keys(&self) -> bool {
         self.keyboard_mode()
             .intersects(KeyboardMode::DISAMBIGUATE_ESC_CODES | KeyboardMode::REPORT_ALL_KEYS_AS_ESC)
     }
 
-    /// Whether the active Kitty keyboard mode makes predictive local echo unsafe.
-    ///
-    /// `REPORT_ALL_KEYS_AS_ESC` routes even plain text through CSI-u, so there is no
-    /// ordinary line echo to predict. `REPORT_EVENT_TYPES` is the narrower but equally
-    /// important application-owned-composer signal: full-screen-on-the-main-screen
-    /// clients such as Codex request press/repeat/release reports while repainting their
-    /// own input line. Painting terminal-level guesses there can briefly duplicate the
-    /// client's text and then erase it at the predictor timeout.
-    ///
-    /// Keep this as a narrow, read-only projection so display-side callers do not need
-    /// the full encoder-facing [`KeyboardMode`] word.
+    /// Whether the active Kitty keyboard mode makes predictive local echo unsafe:
+    /// `REPORT_ALL_KEYS_AS_ESC` routes even plain text through CSI-u, and
+    /// `REPORT_EVENT_TYPES` marks an application-owned composer (Codex on the
+    /// main screen repaints its own input line, so guesses would duplicate its
+    /// text until the predictor timeout). A narrow read-only projection for
+    /// display-side callers.
     #[must_use]
     pub fn kitty_suppresses_predictive_echo(&self) -> bool {
         self.keyboard_mode()
@@ -136,9 +115,8 @@ impl Terminal {
 
 #[cfg(test)]
 mod shift_enter_e2e_tests {
-    //! End-to-end ground truth for Shift+Enter in Claude Code: drive the exact
-    //! negotiation an app performs, then check the derived `KeyboardMode` and the
-    //! bytes the encoder emits for Shift+Enter.
+    //! Shift+Enter end to end: drive the negotiation an app performs, then check
+    //! the derived `KeyboardMode` and the bytes the encoder emits.
     use crate::terminal::Terminal;
     use aterm_types::keyboard::{
         Key, KeyEventType, KeyboardMode, Modifiers, NamedKey, encode_key_with_layout,
@@ -220,14 +198,10 @@ mod shift_enter_e2e_tests {
         assert!(!term.kitty_suppresses_predictive_echo());
     }
 
-    /// C5 remediation — `kitty_reports_functional_keys` is the chrome-deference
-    /// projection: it must be true in exactly the modes where a key with no
-    /// legacy form (here the Menu key, `57363`) actually reaches the app, and
-    /// false everywhere else — otherwise host chrome either steals a key the
-    /// application negotiated for, or refuses a key nobody can receive.
-    ///
-    /// Pinned against the ENCODER, not against a re-read of the flags, so the
-    /// projection cannot drift from what `encode_key_with_layout` really emits.
+    /// `kitty_reports_functional_keys` is true in exactly the modes where a key
+    /// with no legacy form (the Menu key, `57363`) reaches the app, else host
+    /// chrome steals a negotiated key or refuses one nobody receives. Pinned
+    /// against the encoder, not a re-read of the flags.
     #[test]
     fn functional_key_reporting_tracks_what_the_encoder_actually_emits() {
         let menu = |term: &Terminal| {
@@ -336,12 +310,10 @@ mod shift_enter_e2e_tests {
         );
     }
 
-    // --- ConPTY win32-input-mode (DEC 9001): "Shift+Enter in PowerShell" ---
-    //
-    // conhost sends `CSI ? 9001 h` at every ConPTY start. Without it, a legacy
-    // Shift+Enter LF reaches PSReadLine as Ctrl+Enter (InsertLineAbove), and
-    // Ctrl+Enter is indistinguishable from Enter. These walk the negotiation
-    // and pin the bytes conhost receives.
+    // ConPTY win32-input-mode (DEC 9001). conhost sends `CSI ? 9001 h` at every
+    // ConPTY start; without it a legacy Shift+Enter LF reaches PSReadLine as
+    // Ctrl+Enter (InsertLineAbove), and Ctrl+Enter is indistinguishable from
+    // Enter. These walk the negotiation and pin the bytes conhost receives.
 
     /// A session behind a console host: the posture aterm-gui applies to a
     /// ConPTY session (`spawn::apply_pty_keyboard_posture`).

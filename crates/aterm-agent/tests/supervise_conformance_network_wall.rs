@@ -1,29 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 for `SupervisorNetworkWall` (aterm-spec
-//! `supervisor_network_wall_model`): the real turn-end decider
-//! (`decide_turn_end`, with its `TurnEndState`) driven along every reachable
-//! state of the model, so the answer to an API error the network caused (`API
-//! Error: Can't reach the API server … (ENOTFOUND)`, or a reply cut off) is the
-//! model's, state for state.
+//! Tier-1 for `SupervisorNetworkWall` (aterm-spec `supervisor_network_wall_model`):
+//! the real turn-end decider (`decide_turn_end`, with its `TurnEndState`) driven
+//! along every reachable state of the model, so the answer to an API error the
+//! network caused (`ENOTFOUND`, or a reply cut off) is the model's, state for state.
 //!
-//! The world (`NetFails`, `NetReturns`) is invisible to the decider; the
-//! host's measure is the reading's `reach`; a wall appearing is the point
-//! observed with the vendor's retries as busy work; time moves one minute per
-//! tick with the real ladders scaled to the model's constants (`net_backoff` =
-//! `Rung1`, `Rung2`, `down_hold` = `Hold`); `Act` is the decider's own act,
-//! recorded with `acted`; and `Taken` is an idle point with no wall after real
-//! work. The decider is asked at every state, as the loop asks at every due
-//! and every change of the host's measure (`reach_edge`).
+//! The world (`NetFails`, `NetReturns`) is invisible to the decider; the host's
+//! measure is the reading's `reach`; a wall appearing is the point observed with the
+//! vendor's retries as busy work; one tick is one minute, with the real ladders
+//! scaled to the model's constants (`net_backoff` = `Rung1`, `Rung2`; `down_hold` =
+//! `Hold`); `Act` is the decider's act, recorded with `acted`; `Taken` is an idle
+//! point with no wall after real work. The decider is asked at every state, as the
+//! loop asks at every due and every change of the host's measure (`reach_edge`).
 //!
-//! At every state the invariants hold, and at a shown wall the decider types
-//! exactly where `Act` is enabled, under the model's rule (`api-back@v1`,
-//! `api-cutoff@v1`, `api-retry@v1`) and in `wall_retry_text`'s words, and
-//! otherwise waits until exactly the tick `Act` would become enabled.
-//! Negative controls: the `Buggy = 1` model (acting at once whatever the
-//! measure) and `Carry = 1` (the hold's clock carried across appearances)
-//! each disagree with the real decider somewhere.
+//! At every state the invariants hold, and at a shown wall the decider types exactly
+//! where `Act` is enabled, under the model's rule and in `wall_retry_text`'s words,
+//! and otherwise waits until exactly the tick `Act` would become enabled. Negative
+//! controls: `Buggy = 1` (acting at once whatever the measure) and `Carry = 1` (the
+//! hold's clock carried across appearances) each disagree somewhere.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
@@ -37,11 +32,13 @@ use aterm_agent::supervise::policy::turn_end::{
 use aterm_phase::{ApiCause, WallKind};
 use aterm_spec::derive::{Model, supervisor_network_wall_model};
 
+use crate::common::cnst;
+
 type State = BTreeMap<&'static str, i64>;
 
 const MIN: Duration = Duration::from_secs(60);
-/// The vendor's own retries before it gives up (about 3 minutes in the
-/// outage's journal): busy work short of the real `progress`.
+/// The vendor's own retries before it gives up (about 3 minutes): busy work short
+/// of the real `progress`.
 const VENDOR_RETRIES: Duration = Duration::from_secs(3 * 60);
 /// Real work between an act and the wall's next appearance: past `progress`.
 const REAL_WORK: Duration = Duration::from_secs(10 * 60);
@@ -50,14 +47,6 @@ const ENOTFOUND: &str =
     "API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)";
 const ASLEEP: &str =
     "API Error: Your computer went to sleep mid-response. The response above may be incomplete.";
-
-fn cnst(m: &Model, name: &str) -> i64 {
-    m.consts
-        .iter()
-        .find(|(n, _)| *n == name)
-        .map(|(_, v)| *v)
-        .unwrap_or_else(|| panic!("no const {name}"))
-}
 
 fn minutes(m: &Model, name: &str) -> Duration {
     MIN * u32::try_from(cnst(m, name)).expect("a small constant")
@@ -134,6 +123,10 @@ fn reading(st: &State, worked: Option<Duration>, at: Instant) -> TurnEndReading 
         thread_model: None,
         upgrade_goal: false,
         account: None,
+        autopilot: aterm_agent::supervise::Autopilot::Cruise,
+        login_label: None,
+        login_superseded: false,
+        login_notice: None,
     }
 }
 
@@ -221,9 +214,8 @@ fn verdict(a: &TurnEndAction, st: &State, now: Instant) -> Verdict {
     }
 }
 
-/// Mirror one model action on the real side (the model has fired it). A
-/// buggy `Act` the real decider would not take is refused (`false`): the
-/// walk does not descend through it.
+/// Mirror one model action on the real side (the model has fired it). A buggy `Act`
+/// the real decider would not take returns `false`: the walk does not descend.
 fn mirror(
     action: &str,
     before: &State,
@@ -258,10 +250,8 @@ fn mirror(
     true
 }
 
-/// Walk `m` against the real decider: the reachable state count, every
-/// verdict word seen, and each state where the two disagree. `strict`
-/// fails at the first disagreement (the model under test); otherwise they
-/// are collected (the negative control's).
+/// Walk `m` against the real decider: the reachable state count, every verdict word
+/// seen, and each state where the two disagree (`strict` fails at the first).
 fn walk(m: &Model, strict: bool) -> (usize, BTreeMap<&'static str, usize>, Vec<State>) {
     let cfg = SupervisorConfig::default();
     let base = Instant::now() + Duration::from_secs(3600);
@@ -336,10 +326,8 @@ fn tier1_the_real_decider_types_into_a_network_wall_exactly_where_the_model_allo
     }
 }
 
-/// Negative control: the `Buggy = 1` model (acting at once at every appearance
-/// whatever the measure) is not the real decider: at a measured outage's
-/// appearance it types where the real decider waits the hold, and the walk
-/// finds that without being told where to look.
+/// Negative control: the `Buggy = 1` model (acting at once whatever the measure)
+/// types at a measured outage's appearance where the real decider waits the hold.
 #[test]
 fn the_buggy_model_disagrees_with_the_real_decider() {
     let m = supervisor_network_wall_model();
@@ -354,11 +342,9 @@ fn the_buggy_model_disagrees_with_the_real_decider() {
         disagree.len()
     );
 
-    // `Carry = 1` — the hold's clock carried across the episode's
-    // appearances, `Act`'s guard untouched — is not the real decider either:
-    // it measures the hold from each appearance (`since` restarted when the
-    // wall comes back after its try), so the outage's re-appearance under a
-    // Down measure waits the hold again where `Carry` types at once.
+    // `Carry = 1` (the hold's clock carried across the episode's appearances) is not
+    // the real decider either: it measures the hold from each appearance, so a
+    // re-appearance under a Down measure waits the hold again where `Carry` types.
     let carry = aterm_spec::interp::with_consts(&m, &[("Carry", 1)]);
     let (_, _, carried) = walk(&carry, false);
     assert!(
@@ -369,8 +355,7 @@ fn the_buggy_model_disagrees_with_the_real_decider() {
         carried.len()
     );
 
-    // And the one state spelled out: the network down and measured so, the
-    // wall just shown.
+    // One state spelled out: the network down and measured so, the wall just shown.
     let mut st = m.init_state();
     for a in ["NetFails", "MeasureDown", "Unreachable"] {
         assert!(m.fire(a, &mut st), "{a}");

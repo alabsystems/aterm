@@ -219,8 +219,8 @@ pub fn stable_dmg_asset_name() -> String {
 /// The stable, version-independent twin of the updater zip, for bookmarked and
 /// printed links to `releases/latest/download/aterm-mac.zip`, the lightweight
 /// app-only container (the app installs its toolchain itself on first launch).
-/// The alab.systems homepage button is NOT this link: `publish/site-sync.py`
-/// points it at the versioned DMG of the newest release that carries one.
+/// The alab.systems homepage button is NOT this link: `ship site` points it at
+/// the versioned DMG of the newest release that carries one.
 /// Byte-identical to the [`zip_asset_name`] asset of the same cut, exactly as
 /// the DMG twin is to its canonical DMG, and like it elected by NO client —
 /// the in-app updater stages from the manifest's version-bound `zip` field —
@@ -268,7 +268,7 @@ pub fn sha256_sidecar_contents(sha256: &str, asset: &str) -> String {
 /// are unconditional for the inverse reason: every bookmarked or printed
 /// `releases/latest/download/aterm-mac.zip` or `.../aterm.dmg` link 404s on any
 /// release that drops them. (The homepage button links the versioned DMG, which
-/// `publish/site-sync.py` picks.) The sidecars are unconditional for the humans, not
+/// `ship site` picks.) The sidecars are unconditional for the humans, not
 /// the updater: the containers are the manual downloads, their digests
 /// otherwise live only inside the appcast TOML nobody opens, and a download
 /// nobody can check is a funnel that trains people not to check. The TWIN

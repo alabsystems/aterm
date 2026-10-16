@@ -2,8 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-#![deny(unsafe_op_in_unsafe_fn)]
-
 //! Grapheme cluster support for terminal text handling.
 //!
 //! Unicode grapheme cluster segmentation and width calculation. A grapheme
@@ -34,12 +32,17 @@
 //! - A grapheme cluster iterator implementing the UAX #29 boundary rules
 //! - Internal Unicode 16.0 width tables for display width (wcwidth equivalent)
 
-#![deny(clippy::all)]
+#![cfg_attr(
+    trust_verify,
+    feature(custom_inner_attributes, register_tool),
+    register_tool(trust)
+)]
 
 mod emoji_presentation;
 mod grapheme_iter;
 mod grid;
 mod position;
+mod props;
 pub mod tables;
 mod types;
 mod width;
@@ -53,6 +56,7 @@ pub use grid::{
     str_grid_columns, str_grid_columns_with,
 };
 pub use position::{byte_to_column, byte_to_column_with, column_to_char_index};
+pub use props::{GeneralCategory, PROPS_UNICODE_VERSION, Script, general_category, script};
 pub use tables::{char_width, char_width_cjk, is_ambiguous_width, str_width};
 pub use types::{Grapheme, GraphemeInfo};
 pub use width::{

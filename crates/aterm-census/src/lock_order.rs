@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Lock-order census: the lock-graph sense of L0-DEADLOCK, as a fail-closed,
-//! build-blocking obligation (docs/L0-CATALOG.md, the L0-DEADLOCK row).
+//! Lock-order census: the lock-graph sense of L0-DEADLOCK, as a fail-closed
+//! obligation (docs/L0-CATALOG.md, the L0-DEADLOCK row).
 //!
 //! Model deadlock (a `ty_model!` state with no enabled action) is ty's job;
 //! this census covers lock-graph deadlock, the ABBA cycle between real mutexes.
@@ -20,25 +20,22 @@
 //!    live scope of an earlier guard, plus one interprocedural hop (a call made
 //!    while holding, into a fn that acquires).
 //! 3. The graph: edges `A -> B` ("B acquired while A held"); any cycle fails
-//!    the build, naming every edge with both sites. Self-edges fail as
+//!    the census, naming every edge with both sites. Self-edges fail as
 //!    re-entrancy suspects (std locks are not re-entrant, and cross-instance
 //!    nesting needs an instance order this census cannot see).
 //!
-//! Consumers: `tools/freeze-safety-gate/build.rs` and the `aterm-census` bin
-//! (`targo --unverified run -p aterm-census -- --locks`). Limits are in
-//! [`LOCK_PRECISION_NOTE`].
+//! Limits are in [`LOCK_PRECISION_NOTE`].
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::Path;
 
 use crate::{
-    CensusOutcome, collect_rs_files, fn_defined_in, ident_ending_at, is_test_file,
+    CensusOutcome, Floor, collect_rs_files, fn_defined_in, ident_ending_at, is_test_file,
     parse_source_fns, strip_line_comment,
 };
 
-/// The walker's limits, printed in every RED diagnostic and quoted in
-/// docs/temporal-safety-gate.md.
+/// The walker's limits, printed with a red walk's findings.
 pub const LOCK_PRECISION_NOTE: &str = "    PRECISION / SCOPE (the honest limits of this census):
       - LEXICAL IDENTITY: a lock's identity is the receiver/accessor NAME at the
         acquisition site (`term_lock(..)` => `term`; `store.read()` /
@@ -78,7 +75,7 @@ pub const LOCK_PRECISION_NOTE: &str = "    PRECISION / SCOPE (the honest limits 
         a cycle — the UNKNOWN count is the census's standing honesty gap,
         printed every run.
       - GUARD SCOPE is tracked lexically: a `let g = <acquire>` guard (through
-        `unwrap`/`expect`/`unwrap_or_else` adapters only) lives to the end of its
+        `unwrap`/`expect`/`unwrap_or_else`/`map_err` adapters only) lives to the end of its
         enclosing block (brace depth), honoring `drop(g)` and shadowing; an
         acquisition consumed inside its statement lives for that statement;
         `match`/`if let`/`while let` scrutinee guards live for the whole
@@ -99,7 +96,12 @@ pub const LOCK_PRECISION_NOTE: &str = "    PRECISION / SCOPE (the honest limits 
         name AND that fn is in the call site's own namespace; otherwise the hop
         is counted and LISTED beside UNKNOWN. Following it unconditionally once
         bound std's `Condvar::wait` (which RELEASES its guard) to an unrelated
-        same-named fn and reported a lock cycle that does not exist.
+        same-named fn and reported a lock cycle that does not exist. A bare
+        call to a simply named fn parameter or live local binding is an
+        unresolved callback, never a same-named corpus fn; those held calls
+        are counted and listed too. Locals shadow only after their initializer
+        statement, until their block ends. Qualified paths and `self.name(..)`
+        are not shadowed by a parameter or local.
       - NAMESPACE BOUNDARY ON THE HOP: the by-name callee table spans the
         workspace crates AND every scanned vendored fork, so a name shared
         across that boundary must not resolve across it. A definition in the
@@ -173,12 +175,9 @@ pub const LOCK_PRECISION_NOTE: &str = "    PRECISION / SCOPE (the honest limits 
         upstream code).
 ";
 
-// The scanned crates are the aterm-gui process surface (one process, one lock
-// namespace), derived on every run by [`crate::scan_set::derive_gui_scan_set`]
-// from the Cargo.toml path-dependency closure of `crates/aterm-gui`; vendored
-// `[patch]` forks are classified by REVIEWED_VENDORED_CRATES and scanned in
-// vendored-identity mode. `scan_set::tests::derived_closure_matches_the_pinned_canary`
-// makes each scope change a reviewable test diff.
+// The scanned crates are the aterm-gui process (one process, one lock
+// namespace), derived every run by [`crate::scan_set::derive_gui_scan_set`];
+// vendored `[patch]` forks are scanned in vendored-identity mode.
 
 /// Acquisition vocabulary: the method-call tokens that take a lock, and
 /// whether the acquisition can block (a `try_*` cannot, so it is never the
@@ -200,7 +199,7 @@ const ACQ_METHODS: &[(&str, bool)] = &[
 /// Result-of-lock adapters that pass the guard through: a chain of only these
 /// to the end of a `let` means the guard itself is bound (block-scoped), not a
 /// value read out of it (statement-scoped).
-const GUARD_ADAPTERS: &[&str] = &["unwrap", "expect", "unwrap_or_else"];
+const GUARD_ADAPTERS: &[&str] = &["unwrap", "expect", "unwrap_or_else", "map_err"];
 
 /// A fn that acquires a lock and returns the guard: its callers hold the lock
 /// with no `.lock()` token at the call site, so each registered helper call
@@ -312,11 +311,19 @@ const GUARD_HELPERS: &[GuardHelper] = &[
     },
     GuardHelper {
         // atpkg's terminal meter: the one stderr line it draws and its current
-        // owner. `around`, `hold` and the drops take it through this free fn,
-        // and `around` keeps it across a caller's print.
+        // owner. `draw`, `around` and `TtyMeter`'s drop take it through this
+        // free fn, and `around` keeps it across a caller's print.
         symbol: "screen_lock",
         identity: "SCREEN",
         def_file: "crates/atpkg/src/meter.rs",
+    },
+    GuardHelper {
+        // The password-sheet gate returns its posting mutex to hwkey so an
+        // admitted native event pair finishes before a sheet can attach.
+        // Presentation drops the same mutex before entering AppKit.
+        symbol: "posting_permit",
+        identity: "posting",
+        def_file: "crates/aterm-gui/src/askpass.rs",
     },
 ];
 
@@ -650,19 +657,16 @@ pub(crate) fn mask_literals(line: &str) -> String {
     String::from_utf8(out).unwrap_or_else(|_| line.to_string())
 }
 
-/// Blank out `#[cfg(test)]`-gated items so the census
-/// graphs only the shipped lock discipline. Line count is preserved, so spans
-/// stay correct. A raw string forging a line that is exactly `<indent>}` can
-/// end a body early: at most a false positive (see [`mask_gated_items`]).
+/// Blank out `#[cfg(test)]`-gated items so the census graphs only the shipped
+/// lock discipline. Line count is preserved, so spans stay correct.
 pub(crate) fn mask_cfg_test_items(text: &str) -> String {
     mask_gated_items(text, &["#[cfg(test)]"])
 }
 
 /// Blank every item whose immediately preceding attribute line (trimmed)
-/// exactly matches one of `gates`. Shared with the wasm-process census, which
-/// also excludes `#[test]` fns and `#[cfg(not(target_arch = "wasm32"))]`
-/// items. Exact match is fail-closed: an unrecognized cfg spelling is not
-/// masked, so a hazard under it still fails the census.
+/// exactly matches one of `gates`. Shared with the wasm and scope censuses,
+/// each with its own gate list. Exact match is fail-closed: an unrecognized cfg
+/// spelling is not masked, so a hazard under it still fails the census.
 ///
 /// An item's end is found by rustfmt's layout, never by counting braces, with
 /// literals masked before every token test:
@@ -677,7 +681,7 @@ pub(crate) fn mask_cfg_test_items(text: &str) -> String {
 /// brace counters ([`crate::scope_census`]) rely on. A raw string containing
 /// a line that is exactly `<indent>}` can close a body early; readers carrying
 /// literal state across lines must blank literals first (as
-/// [`crate::held_guard::blank_non_code`] does).
+/// [`crate::lex::blank_non_code`] does).
 pub(crate) fn mask_gated_items(text: &str, gates: &[&str]) -> String {
     mask_items_where(text, &|attr| gates.contains(&attr))
 }
@@ -687,6 +691,21 @@ pub(crate) fn mask_gated_items(text: &str, gates: &[&str]) -> String {
 /// ([`crate::cfg_attr_never_ships`]), which must see
 /// `#[cfg(all(test, any(windows, target_os = "linux")))]` as test-only.
 pub(crate) fn mask_items_where(text: &str, is_gate: &dyn Fn(&str) -> bool) -> String {
+    let keep = unmasked_lines(text, is_gate);
+    let mut out = String::with_capacity(text.len());
+    for (line, keep) in text.lines().zip(keep) {
+        if keep {
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Per line of `text`, whether [`mask_items_where`] keeps it: `false` for
+/// every line of a gated item. For a reader that masks two aligned views of
+/// one file the same way.
+pub(crate) fn unmasked_lines(text: &str, is_gate: &dyn Fn(&str) -> bool) -> Vec<bool> {
     let lines: Vec<&str> = text.lines().collect();
     // A line's code: comments stripped, literals blanked (length-preserving).
     // Every token test below reads this, never the raw line.
@@ -719,6 +738,14 @@ pub(crate) fn mask_items_where(text: &str, is_gate: &dyn Fn(&str) -> bool) -> St
         let mut terminated = false;
         while k < lines.len() {
             let item = code_of(lines[k]);
+            // A line dedented below the gate closes the enclosing block, so the
+            // item ended on the line before (an unformatted last variant, field
+            // or element with no trailing comma).
+            if k > j && !item.trim().is_empty() && indent_of(lines[k]) < indent {
+                k -= 1;
+                terminated = true;
+                break;
+            }
             keep[k] = false;
             if item.contains('{') {
                 opened = true;
@@ -772,14 +799,7 @@ pub(crate) fn mask_items_where(text: &str, is_gate: &dyn Fn(&str) -> bool) -> St
         }
         i = k + 1;
     }
-    let mut out = String::with_capacity(text.len());
-    for (idx, line) in lines.iter().enumerate() {
-        if keep[idx] {
-            out.push_str(line);
-        }
-        out.push('\n');
-    }
-    out
+    keep
 }
 
 /// A logical statement line: rustfmt chain continuations (lines starting with
@@ -884,7 +904,7 @@ fn top_level_words(s: &str, word: &str) -> Vec<usize> {
             _ => {}
         }
         // `is_char_boundary` first: `i` walks BYTES, and slicing into the
-        // middle of a multi-byte character panics (a build script must not).
+        // middle of a multi-byte character panics.
         if depth == 0
             && s.is_char_boundary(i)
             && s[i..].starts_with(word)
@@ -1113,7 +1133,7 @@ struct SiteCtx<'a> {
 }
 
 impl SiteCtx<'_> {
-    /// The self type of the INNERMOST `impl` block covering this line, when it
+    /// The self type of the innermost `impl` block covering this line, when it
     /// is one this census may name.
     fn impl_ty(&self) -> Option<&str> {
         self.impls
@@ -1237,9 +1257,7 @@ fn acquisitions_on(line: &str, ctx: &SiteCtx<'_>) -> Vec<RawAcq> {
             });
         }
     }
-    // One `.`-scan for the whole table, sound by the scan invariant on
-    // [`ACQ_METHODS`]: tokens begin only at a `.`, contain no other `.`, and
-    // none is a prefix of another, so at most one matches per `.`.
+    // One `.`-scan for the whole table, sound by the `ACQ_METHODS` scan invariant.
     for (dot, _) in line.match_indices('.') {
         let tail = &line[dot..];
         for (token, blocking) in ACQ_METHODS {
@@ -1288,10 +1306,11 @@ fn call_end(line: &str, acq: &RawAcq) -> usize {
 }
 
 /// Does the guard produced by this acquisition survive as the statement's
-/// FINAL value? True iff everything between the call and the end of the
-/// statement is a poison adapter (`.unwrap()`, `.expect(..)`,
-/// `.unwrap_or_else(..)`) or `?`. Anything else (`.by_local(..)`, a `,`, a
-/// closing paren) consumes the guard WITHIN the statement, so a `let` binds
+/// final value? True iff everything between the call and the end of the
+/// statement is a result adapter (`.unwrap()`, `.expect(..)`,
+/// `.unwrap_or_else(..)`, `.map_err(..)`) or `?`. Mapping only the error also
+/// leaves an Ok guard inside a bound Result held. Anything else (`.by_local(..)`, a `,`, a
+/// closing paren) consumes the guard within the statement, so a `let` binds
 /// the read-out value, not the guard.
 fn guard_is_final_value(line: &str, acq: &RawAcq) -> bool {
     let bytes = line.as_bytes();
@@ -1422,7 +1441,7 @@ type FieldRecvCall = (usize, String, String);
 /// [`WORKSPACE_NS`] types (see [`FieldTypes::is_corpus_typed`]).
 #[derive(Default)]
 struct FieldTypes {
-    /// Every type NAME the corpus defines (`struct`/`enum`/`union`/`type` and
+    /// Every type name the corpus defines (`struct`/`enum`/`union`/`type` and
     /// `trait`, which a `dyn`/`impl` field resolves through).
     defined: BTreeSet<String>,
     /// Field name -> every type identifier in its declared type
@@ -1494,7 +1513,7 @@ impl FieldTypes {
                 }
             }
             depth += line.matches('{').count() as i32 - line.matches('}').count() as i32;
-            // Fields live one level INSIDE the declaration's brace, so the depth
+            // Fields live one level inside the declaration's brace, so the depth
             // to match is the one this line leaves us at.
             if opens_fields {
                 body_depth = Some(depth);
@@ -1515,17 +1534,51 @@ fn ident_prefix(s: &str) -> Option<&str> {
     (end > 0).then(|| &s[..end])
 }
 
+/// Simple parameter bindings shadow bare fn names even when their type is a
+/// generic, an `impl FnOnce`, or a fn pointer. Patterns this lexical walk cannot
+/// name remain under the existing by-name approximation.
+fn parameter_bindings(sig: &str) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    let Some((_, rest)) = sig.split_once("fn ") else {
+        return names;
+    };
+    let Some(name) = ident_prefix(rest) else {
+        return names;
+    };
+    let mut rest = rest[name.len()..].trim_start();
+    if rest.starts_with('<') {
+        let Some(close) = matching_angle(rest) else {
+            return names;
+        };
+        rest = rest[close + 1..].trim_start();
+    }
+    if !rest.starts_with('(') {
+        return names;
+    }
+    let Some(close) = match_paren(rest, 0) else {
+        return names;
+    };
+    for param in split_top_level(&rest[1..close]) {
+        let Some((binding, _)) = param.split_once(':') else {
+            continue;
+        };
+        let binding = binding.trim();
+        let binding = binding.strip_prefix("mut ").unwrap_or(binding).trim();
+        if binding != "self" && ident_prefix(binding) == Some(binding) {
+            names.insert(binding.to_string());
+        }
+    }
+    names
+}
+
 /// One-hop call targets on `line`: `(trusted, field_receiver)`, the latter as
-/// `(field, callee)`.
-///
-/// Callees are looked up by name across the corpus, so only shapes whose name
-/// belongs to a corpus fn are trusted: `name(..)` (a free fn) and
-/// `self.name(..)` (a method on `Self`). `self.field.name(..)` dispatches on the
-/// field's type, so it is type-directed (see [`FieldTypes`]): followed when the
-/// field's declared type is a corpus type, counted but not followed when it is
-/// foreign (`Condvar`, `AtomicU64`, `HashMap`). Following it blindly can bind
-/// a guard-releasing `Condvar::wait` to an unrelated `wait` and invent a cycle;
-/// dropping it would miss real hops like `self.shared.spill_is_empty()`.
+/// `(field, callee)`. Callees are looked up by name, so only `name(..)` and
+/// `self.name(..)` are trusted. `self.field.name(..)` dispatches on the field's
+/// type: the census follows it only when [`FieldTypes`] finds that type in the
+/// corpus and one same-namespace fn bears the name, and otherwise counts it
+/// (a foreign `Condvar` or `HashMap`). Following it blindly can bind a
+/// guard-releasing `Condvar::wait` to an unrelated `wait`; dropping it would
+/// miss real hops like `self.shared.spill_is_empty()`.
 fn held_call_targets(line: &str) -> (Vec<TrustedCall>, Vec<FieldRecvCall>) {
     const KEYWORDS: &[&str] = &[
         "if", "while", "for", "match", "return", "fn", "loop", "unsafe", "move", "let", "else",
@@ -1613,19 +1666,20 @@ struct FnLockFacts {
     edges: Vec<(usize, usize)>,
     /// Calls made while holding: (holder site, callee name, call `file:line`).
     held_calls: Vec<(usize, String, String)>,
-    /// Calls made while holding through a FIELD receiver (`self.field.name(..)`).
+    /// Calls made while holding through a field receiver (`self.field.name(..)`).
     /// Followed only once the field's type is resolved against the corpus — see
     /// [`held_call_targets`] and [`FieldTypes`].
     /// `(holder site, field name, callee name, call `file:line`)`.
     field_recv_calls: Vec<(usize, String, String, String)>,
+    /// Bare calls to a parameter/local are callbacks whose target this walk
+    /// cannot resolve, not calls to an unrelated same-named corpus fn.
+    binding_calls: Vec<(String, String)>,
 }
 
 /// Lexical guard-return detection over the signature region (def line to the
-/// line opening the body): a `->` whose return type contains an identifier
-/// ending in `Guard`. Matching per identifier, not by substring, keeps
-/// `-> GuardedInput` (a plain enum) out, while wrapped guards
-/// (`Option<MutexGuard<'_, T>>`, `io::Result<RwLockReadGuard<'_, T>>`) are
-/// still caught. Registering a non-guard would claim callers hold a lock they
+/// line opening the body): a `->` whose return type has an identifier ending in
+/// `Guard`, so `-> GuardedInput` stays out and `Option<MutexGuard<'_, T>>` is
+/// caught. A non-guard registered as one would claim callers hold a lock they
 /// do not, which can mask a real cycle.
 fn returns_guard(body: &[String]) -> bool {
     for line in body {
@@ -1700,8 +1754,17 @@ struct LiveGuard {
     active: bool,
 }
 
-/// The FILE-level lexical facts a body scan needs beyond the body's own text.
-/// File-scoped, not body-scoped, because every one of them is DECLARED outside
+/// A simple local name shadows bare fn lookup only after its initializer
+/// statement. Keep each nested binding so closing an inner block restores an
+/// outer local, rather than incorrectly restoring a same-named corpus fn.
+struct LocalBinding {
+    name: String,
+    binding_depth: i32,
+    active: bool,
+}
+
+/// The file-level lexical facts a body scan needs beyond the body's own text.
+/// File-scoped, not body-scoped, because every one of them is declared outside
 /// the fn that uses it.
 struct FileCtx<'a> {
     /// Repo-relative path, for the site spans.
@@ -1739,20 +1802,22 @@ fn scan_fn(
         edges: Vec::new(),
         held_calls: Vec::new(),
         field_recv_calls: Vec::new(),
+        binding_calls: Vec::new(),
     };
     let mut live: Vec<LiveGuard> = Vec::new();
     // Locals proven to hold a std::fs::File: name -> (binding depth, span). A
     // rebind to anything else or the block closing removes the evidence.
     let mut file_vars: BTreeMap<String, (i32, String)> = BTreeMap::new();
-    // Locals lexically PROVEN to hold a raw pointer (same ledger discipline):
+    // Locals lexically proven to hold a raw pointer (same ledger discipline):
     // a zero-arg `.read()` on one of these is `core::ptr::read`, not RwLock.
     let mut ptr_vars: BTreeMap<String, (i32, String)> = BTreeMap::new();
     // Single-letter locals aliasing a nameable path (`let m = &self.spill;`):
     // name -> (binding depth, identity; see [`alias_target`]). A non-path
     // rebind or the block closing drops the alias.
     let mut alias_vars: BTreeMap<String, (i32, String)> = BTreeMap::new();
+    let mut local_bindings: Vec<LocalBinding> = Vec::new();
     // The signature region (def line through the body-opening line), for the
-    // raw-pointer PARAM evidence (`input_ptr: &mut *const u8`).
+    // raw-pointer parameter evidence (`input_ptr: &mut *const u8`).
     let sig_text: String = {
         let mut s = String::new();
         for line in body {
@@ -1764,6 +1829,7 @@ fn scan_fn(
         }
         s
     };
+    let parameters = parameter_bindings(&sig_text);
     let mut depth: i32 = 0;
     for ll in &lines {
         let line = &ll.text;
@@ -1896,6 +1962,22 @@ fn scan_fn(
             }
             for (pos, callee) in trusted {
                 let call_span = format!("{}:{}", file.rel, ll.lineno);
+                let before = &line[..pos - callee.len()];
+                if !before.trim_end().ends_with(['.', ':']) {
+                    let binding = if local_bindings.iter().any(|b| b.active && b.name == callee) {
+                        Some("local")
+                    } else if parameters.contains(&callee) {
+                        Some("parameter")
+                    } else {
+                        None
+                    };
+                    if let Some(binding) = binding {
+                        facts
+                            .binding_calls
+                            .push((format!("{binding} `{callee}`"), call_span));
+                        continue;
+                    }
+                }
                 for g in live.iter().filter(|g| g.active) {
                     facts
                         .held_calls
@@ -1912,9 +1994,9 @@ fn scan_fn(
         }
         // 5. Promote block-scoped acquisitions to live guards: a `let`-bound
         //    guard (the acquisition is the statement's final value) or a
-        //    match-like scrutinee guard. A let-ELSE guard (`… else {` opens a
+        //    match-like scrutinee guard. A let-else guard (`… else {` opens a
         //    divergent block in which the pattern did not match) binds
-        //    INACTIVE and activates only when the else block closes.
+        //    inactive and activates only when the else block closes.
         let is_let_else =
             matches!(kind, LineKind::Let(_)) && line.ends_with('{') && line.contains(" else ");
         for (k, r) in raw.iter().enumerate() {
@@ -1935,6 +2017,11 @@ fn scan_fn(
         // 5b. Evidence ledgers: a File or raw-pointer construction marks the
         //     var; a rebind without that evidence removes it.
         if let LineKind::Let(Some(var)) = &kind {
+            local_bindings.push(LocalBinding {
+                name: var.clone(),
+                binding_depth: depth,
+                active: false,
+            });
             if is_file_binding_rhs(line) {
                 file_vars.insert(var.clone(), (depth, format!("{}:{}", file.rel, ll.lineno)));
             } else {
@@ -1969,6 +2056,16 @@ fn scan_fn(
         file_vars.retain(|_, (d, _)| depth >= *d);
         ptr_vars.retain(|_, (d, _)| depth >= *d);
         alias_vars.retain(|_, (d, _)| depth >= *d);
+        local_bindings.retain(|binding| depth >= binding.binding_depth);
+        // The new name is absent from its own initializer, including a
+        // multiline/block initializer and a let-else's divergent else body.
+        if line.ends_with(';') {
+            for binding in &mut local_bindings {
+                if depth == binding.binding_depth {
+                    binding.active = true;
+                }
+            }
+        }
         for g in &mut live {
             if depth == g.binding_depth {
                 g.active = true;
@@ -2011,9 +2108,11 @@ fn append_cycle_repair(log: &mut String, invert: &str) {
     );
 }
 
+/// The lock-order census's verdict title.
+const LOCKS: &str = "lock-order census";
+
 /// Run the lock-order census over the checkout at `root` (the directory
-/// holding `crates/`). A pure function of the source tree, safe in a build
-/// script and on any checkout.
+/// holding `crates/`). A pure function of the source tree.
 pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
     let mut log = String::new();
     let mut failures = 0usize;
@@ -2025,7 +2124,7 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
     );
 
     // Derive the scan set from the workspace manifests. An unclassifiable
-    // dependency graph stops the build rather than shrinking the domain.
+    // dependency graph stops the census rather than shrinking the domain.
     let scan = match crate::scan_set::derive_gui_scan_set(root) {
         Ok(s) => s,
         Err(e) => {
@@ -2034,10 +2133,9 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
                 "  ✗ FAIL [OB-7] SCAN-SET DERIVATION FAILED — the census cannot \
                  soundly determine the aterm-gui process closure from the workspace \
                  manifests, so it refuses to scan a guessed set (fail-closed).\n\
-                 \x20       {e}\n\
-                 lock-order census: FAILED — 1 obligation violation(s)."
+                 \x20       {e}"
             );
-            return CensusOutcome::red(log);
+            return CensusOutcome::red(LOCKS, log, "1 obligation violation(s).");
         }
     };
     log.push_str(&crate::scan_set::render_scan_set(&scan));
@@ -2147,11 +2245,10 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
         let _ = writeln!(
             log,
             "  ✗ FAIL [OB-7] ZERO lock-acquisition sites found under {} — the census \
-             walked nothing (parser broke, or this root is not an aterm checkout?).\n\
-             lock-order census: FAILED — 1 obligation violation(s).",
+             walked nothing (parser broke, or this root is not an aterm checkout?).",
             scan.scan_dirs.join(", ")
         );
-        return CensusOutcome::red(log);
+        return CensusOutcome::red(LOCKS, log, "1 obligation violation(s).");
     }
 
     // Held calls through a `self.field.…` receiver whose field type is foreign:
@@ -2188,6 +2285,10 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
     unresolved_field_calls.sort();
     unresolved_field_calls.dedup();
     let field_recv_calls = unresolved_field_calls.len();
+    let binding_calls: BTreeSet<_> = fns
+        .iter()
+        .flat_map(|f| f.binding_calls.iter().cloned())
+        .collect();
 
     // One-hop callee lookup: fn name -> definitions, grouped by the defining
     // crate's namespace. Vendored identities are namespaced but fn names are
@@ -2319,12 +2420,14 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
     }
     if failures > 0 {
         let _ = write!(log, "{LOCK_PRECISION_NOTE}");
-        let _ = writeln!(
+        return CensusOutcome::red(
+            LOCKS,
             log,
-            "lock-order census: FAILED — {failures} obligation violation(s) (registry/coverage \
-             stage; the graph stage did not run because its ground truth is broken)."
+            format!(
+                "{failures} obligation violation(s) (registry/coverage stage; the graph stage \
+                 did not run because its ground truth is broken)."
+            ),
         );
-        return CensusOutcome::red(log);
     }
 
     // ---- Assemble the edge set: intra-fn pairs + the one-hop calls. ----
@@ -2355,7 +2458,7 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
             // Definitions in the caller's own namespace shadow foreign ones
             // (see `by_name`).
             let shadowed = per_ns.contains_key(&f.namespace);
-            // One hop: every DIRECT blocking acquisition in every same-named
+            // One hop: every direct blocking acquisition in every same-named
             // callee (distinct identities once per call site).
             let mut seen: BTreeSet<String> = BTreeSet::new();
             for (def_ns, callee_fns) in per_ns {
@@ -2541,25 +2644,26 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
 
     if failures > 0 {
         let _ = write!(log, "{LOCK_PRECISION_NOTE}");
-        let _ = writeln!(
+        return CensusOutcome::red(
+            LOCKS,
             log,
-            "lock-order census: FAILED — {failures} obligation violation(s). A lock-order \
-             cycle has NO waiver channel (L0-DEADLOCK: none, ever) — it can only be \
-             fixed. This census blocks BOTH `targo --unverified run -p aterm-census -- \
-             --locks` and the build of tools/freeze-safety-gate."
+            format!(
+                "{failures} obligation violation(s). A lock-order cycle has NO waiver channel \
+                 (L0-DEADLOCK: none, ever) — it can only be fixed."
+            ),
         );
-        return CensusOutcome::red(log);
     }
 
-    // ---- GREEN summary (with the honesty ledger). ----
-    let _ = writeln!(
-        log,
-        "lock-order census: GREEN — {} acquisition site(s) across {} workspace crate(s) + {} \
+    // ---- GREEN: the summary, then the honesty ledger behind it. ----
+    let term_sites = identities.get("term").copied().unwrap_or(0);
+    let summary = format!(
+        "{} acquisition site(s) across {} workspace crate(s) + {} \
          vendored crate(s) ({} blocking, {} try_*, {} OS file-advisory, {} raw-pointer \
          ptr::read); {} resolved identities; {} UNKNOWN-identity site(s) + {} vendored \
          UNKNOWN site(s); {} audited vocabulary-interior site(s); {} held-acquire \
          pair(s) ({} intra-fn, {} via one-hop calls; {} distinct ordered identity \
          pairs); {} held call(s) through a `self.field.…` receiver NOT followed; \
+         {} held call(s) through a fn parameter/local binding NOT followed; \
          0 self-edges; global lock graph ACYCLIC.",
         sites.len(),
         scan.scan_dirs.len(),
@@ -2577,6 +2681,7 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
         hop_pairs,
         edges.len(),
         field_recv_calls,
+        binding_calls.len(),
     );
     let mut ids: Vec<(&str, usize)> = identities.into_iter().collect();
     ids.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
@@ -2645,6 +2750,19 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
         }
         if field_calls.len() > 20 {
             let _ = writeln!(log, "      … and {} more.", field_calls.len() - 20);
+        }
+    }
+    if !binding_calls.is_empty() {
+        let _ = writeln!(
+            log,
+            "    held calls through fn parameters/local bindings NOT followed — \
+             the binding shadows a corpus fn name, but its callback target is not resolved:"
+        );
+        for (binding, span) in binding_calls.iter().take(20) {
+            let _ = writeln!(log, "      {span}  {binding}(…)");
+        }
+        if binding_calls.len() > 20 {
+            let _ = writeln!(log, "      … and {} more.", binding_calls.len() - 20);
         }
     }
     if !scan.vendored_scanned.is_empty() {
@@ -2797,7 +2915,28 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
         scan.scan_dirs.join(", "),
         vendored_dirs.join(", ")
     );
-    CensusOutcome::green(log)
+    let floors = vec![
+        Floor::at_least(
+            "`term` lock acquisition sites",
+            term_sites,
+            100,
+            "the walk lost most of the GUI's lock sites (a renamed accessor or a parser \
+             regression), so the graph is acyclic vacuously",
+        ),
+        Floor::none(
+            "UNKNOWN-identity lock sites in aterm crates",
+            unknown.len(),
+            "an UNKNOWN is a node that can never close a cycle, so a deadlock through it is \
+             invisible; name each receiver listed above, never suppress the site",
+        ),
+        Floor::none(
+            "UNKNOWN-identity lock sites in vendored crates",
+            vendored_unknown.len(),
+            "a vendored fork gained an acquisition the census cannot name; give its \
+             receiver an identity (the per-crate list above has the spans)",
+        ),
+    ];
+    CensusOutcome::green(LOCKS, log, summary).with_floors(floors)
 }
 
 /// Iterative Tarjan strongly-connected components. Returns each SCC as a list
@@ -2856,7 +2995,7 @@ fn tarjan_sccs(adj: &[Vec<usize>]) -> Vec<Vec<usize>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scan_set::test_fixtures::{repo_root, synth_tree};
+    use crate::scan_set::test_fixtures::synth_tree;
 
     /// Crates a synthetic tree must contain beyond the base fixture (aterm-gui
     /// and aterm-types) because a `GUARD_HELPERS` entry is registered in them:
@@ -2864,6 +3003,8 @@ mod tests {
     /// tree composing its own manifest set must splice these in.
     const SYNTH_HELPER_CRATES: &[(&str, &str)] = &[("aterm-log", ""), ("atpkg", "")];
 
+    /// Every registered helper and vocabulary interior at its `def_file`, its
+    /// acquisition spelled as the shipping one is, so the registry checks hold.
     fn synth_helper_files() -> Vec<(String, String)> {
         let mut files = crate::scan_set::test_fixtures::workspace_manifests(SYNTH_HELPER_CRATES);
         files.push((
@@ -2878,9 +3019,6 @@ mod tests {
                 .to_string(),
         ));
         files.push((
-            // Settings ▸ Security's retire worker: `retire_slot` returns the
-            // guard of `self.shared`, spelled with the poison-recovering closure
-            // the shipping helper uses.
             "crates/aterm-gui/src/consent_retire.rs".to_string(),
             "impl RetireState {\n    \
              fn retire_slot(&self) -> std::sync::MutexGuard<'_, Slot> {\n        \
@@ -2895,26 +3033,18 @@ mod tests {
                 .to_string(),
         ));
         files.push((
-            // The PTY keeper link's state lock, spelled as the shipping helper
-            // is (the static, the poison-recovering adapter).
             "crates/aterm-gui/src/keeper_link.rs".to_string(),
             "fn keeper_state() -> std::sync::MutexGuard<'static, State> {\n    \
              KEEPER_STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner)\n}\n"
                 .to_string(),
         ));
         files.push((
-            // `fabric attach`'s supervisor latch. Spelled with the
-            // poison-recovering closure the shipping helper uses, so the
-            // fixture exercises the same acquisition token.
             "crates/aterm-gui/src/fabric_launch.rs".to_string(),
             "fn supervisor() -> std::sync::MutexGuard<'static, Supervisor> {\n    \
              SUPERVISOR.lock().unwrap_or_else(|p| p.into_inner())\n}\n"
                 .to_string(),
         ));
         files.push((
-            // Mirrors the shipping helpers and their static ring identities, so
-            // a stale singular registration fails. Both control_query.rs helpers
-            // share one fixture entry.
             "crates/aterm-gui/src/control_query.rs".to_string(),
             "fn search_cache_lock() -> MutexGuard<'static, VecDeque<SearchSnapshot>> {\n    \
              SEARCH_SNAPSHOTS.lock().unwrap()\n}\n\
@@ -2923,8 +3053,6 @@ mod tests {
                 .to_string(),
         ));
         files.push((
-            // The embedded operator's two guard-returning policy helpers both
-            // expose the same host authority mutex to their callers.
             "crates/aterm-gui/src/operator_host.rs".to_string(),
             "fn accepting_guard(&self) -> MutexGuard<'_, HostActuationGate> {\n    \
              self.shared.fleet_fault.lock().unwrap()\n}\n\
@@ -2933,17 +3061,12 @@ mod tests {
                 .to_string(),
         ));
         files.push((
-            // The process-environment mutation lock (`aterm_log::env`), held by
-            // `scoped`/`scoped_unset` across a caller-supplied body.
             "crates/aterm-log/src/lib.rs".to_string(),
             "fn env_lock() -> MutexGuard<'static, ()> {\n    \
              ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())\n}\n"
                 .to_string(),
         ));
         files.push((
-            // The session-connections record store: a `&self` method whose
-            // name is outside the standard vocabulary, so the registry — not
-            // the token scan — is what makes its callers' holds visible.
             "crates/aterm-gui/src/connections.rs".to_string(),
             "impl ConnectionTable {\n    \
              pub(crate) fn records(&self) -> MutexGuard<'_, Records> {\n        \
@@ -2951,16 +3074,20 @@ mod tests {
                 .to_string(),
         ));
         files.push((
-            // atpkg's terminal meter: the one stderr line it draws, behind a
-            // bare static `Mutex` whose guard escapes to `around`/`hold`.
             "crates/atpkg/src/meter.rs".to_string(),
             "fn screen_lock() -> std::sync::MutexGuard<'static, Screen> {\n    \
              SCREEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner)\n}\n"
                 .to_string(),
         ));
-        // The registered vocabulary interior (VOCABULARY_INTERIORS):
-        // `fn lock_or_recover` with its bare-`self` acquisition, at its
-        // registered def_file, so the fail-closed registry checks hold.
+        files.push((
+            "crates/aterm-gui/src/askpass.rs".to_string(),
+            "impl PromptInputGate {\n    \
+             pub(crate) fn posting_permit(&self) -> Result<std::sync::MutexGuard<'_, ()>, ()> {\n        \
+             let posting = self.posting.lock().unwrap_or_else(|e| e.into_inner());\n        \
+             if self.is_open() { Err(()) } else { Ok(posting) }\n    \
+             }\n}\n"
+                .to_string(),
+        ));
         files.push((
             "crates/aterm-types/src/mutex_ext.rs".to_string(),
             "impl<T> MutexExt<T> for Mutex<T> {\n    \
@@ -3183,8 +3310,7 @@ mod tests {
                 .as_deref(),
             Some("Spill::pair.1")
         );
-        // A NAMED field keeps the plain identity it has always had: renaming
-        // those would split every existing edge in the graph.
+        // A named field keeps its plain, unqualified identity.
         assert_eq!(
             acquisitions_on("let g = self.store.read().unwrap();", &ctx)[0]
                 .identity
@@ -3368,8 +3494,7 @@ mod tests {
             "the variants AFTER it must survive:\n{m}"
         );
 
-        // (3) A match arm, same rule, one nesting level deeper — the shape at
-        // crates/aterm-gui/src/lib.rs:9427.
+        // (3) A match arm, same rule, one nesting level deeper.
         let m = mask_gated_items(
             &src(&[
                 "fn settings(&self) -> Option<&S> {",
@@ -3449,6 +3574,32 @@ mod tests {
             m.matches('{').count(),
             m.matches('}').count(),
             "the mask must never splice a brace off its partner:\n{m}"
+        );
+
+        // (7) A last variant with no trailing comma ends at the enclosing
+        // block's close, not at the next item's `;` or `{`.
+        let m = mask_gated_items(
+            &src(&[
+                "enum Ev {",
+                "    A,",
+                "    #[cfg(test)]",
+                "    B",
+                "}",
+                "fn shipped() {",
+                "    alpha.lock();",
+                "}",
+            ]),
+            gates,
+        );
+        assert!(!m.contains('B'), "the gated variant must go:\n{m}");
+        assert!(
+            m.contains("fn shipped") && m.contains("alpha.lock()"),
+            "the item after the enum must survive:\n{m}"
+        );
+        assert_eq!(
+            m.matches('{').count(),
+            m.matches('}').count(),
+            "the enum's close must survive:\n{m}"
         );
 
         // Line count is preserved in every case, or every span the censuses
@@ -3549,6 +3700,179 @@ mod tests {
             "log:\n{}",
             out.log
         );
+    }
+
+    #[test]
+    fn callable_parameters_shadow_only_bare_one_hop_targets() {
+        let prefix = "fn post() {\n    posting.lock().unwrap();\n}\n";
+        for (label, signature, call) in [
+            ("impl", "fn with_post(post: impl FnOnce() -> ())", "post()"),
+            (
+                "generic",
+                "fn with_post<F: FnOnce(u8, u8) -> ()>(mut post: F)",
+                "post(1, 2)",
+            ),
+            (
+                "pointer",
+                "fn with_post(post: fn(u8, u8) -> ())",
+                "post(1, 2)",
+            ),
+        ] {
+            let out = run_synth(
+                label,
+                &format!(
+                    "{prefix}{signature} {{\n    let g = posting.lock().unwrap();\n    {call};\n}}\n"
+                ),
+            );
+            assert!(
+                out.ok,
+                "the parameter shadows the unrelated fn, not its locks:\n{}",
+                out.log
+            );
+            assert!(
+                out.log.contains("parameter `post`"),
+                "an unresolved callback must remain visible in the census:\n{}",
+                out.log
+            );
+        }
+        for (label, signature, call) in [
+            ("free", "fn with_post()", "post()"),
+            (
+                "qualified",
+                "fn with_post(post: impl FnOnce())",
+                "crate::post()",
+            ),
+            (
+                "qualified-space",
+                "fn with_post(post: impl FnOnce())",
+                "crate :: post()",
+            ),
+            (
+                "method",
+                "fn with_post(&self, post: impl FnOnce())",
+                "self.post()",
+            ),
+        ] {
+            let out = run_synth(
+                label,
+                &format!(
+                    "{prefix}{signature} {{\n    let g = posting.lock().unwrap();\n    {call};\n}}\n"
+                ),
+            );
+            assert!(
+                !out.ok && out.log.contains("RE-ENTRANCY SUSPECT"),
+                "an actual fn or method call still acquires the held lock:\n{}",
+                out.log
+            );
+        }
+    }
+
+    #[test]
+    fn error_mapping_preserves_a_guard_until_consumed_or_dropped() {
+        let reverse = "fn reverse() {\n    let g = beta_lock.lock().unwrap();\n    \
+                       let h = alpha_lock.lock().unwrap();\n}\n";
+        for (label, tail, release, cycle) in [
+            ("mapped-question", "?", "", true),
+            ("mapped-result", "", "", true),
+            ("mapped-consumed", ".is_ok()", "", false),
+            ("mapped-dropped", "?", "drop(g);", false),
+        ] {
+            let out = run_synth(
+                label,
+                &format!(
+                    "fn forward() -> Result<(), ()> {{\n    \
+                     let g = alpha_lock.lock().map_err(|_| ()){tail};\n    \
+                     {release}\n    let h = beta_lock.lock().unwrap();\n    \
+                     Ok(())\n}}\n{reverse}"
+                ),
+            );
+            assert_eq!(
+                !out.ok, cycle,
+                "mapping an error leaves the Ok guard held; consuming or dropping \
+                 the result releases it:\n{}",
+                out.log
+            );
+            if cycle {
+                assert!(
+                    out.log.contains("EDGE alpha_lock -> beta_lock")
+                        && out.log.contains("EDGE beta_lock -> alpha_lock"),
+                    "both real orders must form the cycle:\n{}",
+                    out.log
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn local_bindings_shadow_only_live_bare_one_hop_targets() {
+        for (label, body) in [
+            (
+                "local-pointer",
+                "unsafe {\n        let post: unsafe extern \"C-unwind\" fn() = msg();\n        post();\n    }",
+            ),
+            ("local-closure", "let post = || ();\n    post();"),
+            (
+                "local-nested",
+                "let post = || ();\n    {\n        let post = || ();\n        post();\n    }\n    post();",
+            ),
+            (
+                "local-multiline",
+                "let post = {\n        || ()\n    };\n    post();",
+            ),
+        ] {
+            let out = run_synth(
+                label,
+                &format!(
+                    "fn post() {{\n    posting.lock().unwrap();\n}}\n\
+                     fn caller() {{\n    let g = posting.lock().unwrap();\n    {body}\n}}\n"
+                ),
+            );
+            assert!(
+                out.ok,
+                "a local callback is not the corpus fn:\n{}",
+                out.log
+            );
+            assert!(
+                out.log.contains("local `post`"),
+                "the unresolved local target must remain reported:\n{}",
+                out.log
+            );
+        }
+    }
+
+    #[test]
+    fn local_binding_initializers_and_out_of_scope_calls_keep_real_edges() {
+        for (label, body) in [
+            ("local-rhs", "let post = post();"),
+            ("local-wrapped-rhs", "let post =\n        post();"),
+            (
+                "local-block-rhs",
+                "let post = {\n        post();\n        || ()\n    };",
+            ),
+            (
+                "local-else",
+                "let Some(post) = callback else {\n        post();\n        return;\n    };\n    post();",
+            ),
+            (
+                "local-expired",
+                "{\n        let post = || ();\n        post();\n    }\n    post();",
+            ),
+            ("local-qualified", "let post = || ();\n    crate :: post();"),
+            ("local-method", "let post = || ();\n    self.post();"),
+        ] {
+            let out = run_synth(
+                label,
+                &format!(
+                    "fn post() {{\n    posting.lock().unwrap();\n}}\n\
+                     fn caller(&self) {{\n    let g = posting.lock().unwrap();\n    {body}\n}}\n"
+                ),
+            );
+            assert!(
+                !out.ok && out.log.contains("RE-ENTRANCY SUSPECT"),
+                "this call resolves to the actual fn or method:\n{}",
+                out.log
+            );
+        }
     }
 
     #[test]
@@ -3882,8 +4206,8 @@ mod tests {
     /// flagged, while a guard wrapped in anything still is.
     #[test]
     fn a_return_type_must_name_a_guard_not_merely_contain_the_letters() {
-        // The exact defect, pinned in one line so it cannot rot: the old check
-        // was `contains("Guard")`, and this is the string that fooled it.
+        // A substring test (`contains("Guard")`) matches this name; the
+        // identifier test must not.
         assert!(
             "GuardedInput".contains("Guard"),
             "the substring the old check matched on"
@@ -4135,7 +4459,7 @@ mod tests {
             "fn aterm_order() {\n    let g = state.lock().unwrap();\n    \
              let h = queue.lock().unwrap();\n}\n",
             &[(
-                "vendor/winit/src/planted.rs",
+                "crates/aterm-window/src/planted.rs",
                 "fn winit_order() {\n    let g = queue.lock().unwrap();\n    \
                  let h = state.lock().unwrap();\n}\n",
             )],
@@ -4167,7 +4491,7 @@ mod tests {
             "fn hold_and_call() {\n    let g = alpha_lock.lock().unwrap();\n    \
              winit_side_helper();\n}\n",
             &[(
-                "vendor/winit/src/planted.rs",
+                "crates/aterm-window/src/planted.rs",
                 "fn winit_side_helper() {\n    event_state.lock().unwrap().push(1);\n}\n",
             )],
         );
@@ -4184,19 +4508,15 @@ mod tests {
         // Vendored fn names share the by-name callee table with aterm's, so
         // each side must resolve to its own definition: an aterm hold that
         // inherited a vendored lock identity could close a cycle nothing could
-        // repair (vendored sources are not edited). The hazard applies to any
-        // vendored crate sharing a fn name with aterm.
-        //
-        // The complementary case (a name the caller's namespace does not
-        // define still resolves across the boundary) is
-        // `synthetic_cross_boundary_one_hop_edge_is_graphed`.
+        // repair. The complementary case (an unshadowed name resolves across
+        // the boundary) is `synthetic_cross_boundary_one_hop_edge_is_graphed`.
         let out = run_synth_files(
             "nsshadow",
             "fn start() {\n    aterm_trace.lock().unwrap().push(1);\n}\n\
              fn aterm_hold_and_call() {\n    let g = alpha_lock.lock().unwrap();\n    \
              start();\n}\n",
             &[(
-                "vendor/smol_str/src/planted.rs",
+                "vendor/indexmap/src/planted.rs",
                 "fn start() {\n    writer.lock().unwrap().push(1);\n}\n\
                  fn vendored_hold_and_call() {\n    let g = stream.lock().unwrap();\n    \
                  start();\n}\n",
@@ -4209,18 +4529,18 @@ mod tests {
             out.log
         );
         assert!(
-            !out.log.contains("alpha_lock -> smol_str::writer"),
+            !out.log.contains("alpha_lock -> indexmap::writer"),
             "an aterm hold must NOT inherit a vendored lock identity through a \
              shared fn name:\n{}",
             out.log
         );
         assert!(
-            out.log.contains("smol_str::stream -> smol_str::writer"),
+            out.log.contains("indexmap::stream -> indexmap::writer"),
             "the vendored call site must resolve to the VENDORED `start`:\n{}",
             out.log
         );
         assert!(
-            !out.log.contains("smol_str::stream -> aterm_trace"),
+            !out.log.contains("indexmap::stream -> aterm_trace"),
             "and the boundary holds in both directions — a vendored hold must \
              not reach an aterm fn of the same name:\n{}",
             out.log
@@ -4249,8 +4569,8 @@ mod tests {
         // Chained `??` (Option<Result<_>>) resolves the same way.
         let acqs = acquisitions_on("self.inner??.lock().unwrap();", &ctx);
         assert_eq!(acqs[0].identity.as_deref(), Some("inner"));
-        // And the genuinely unresolvable receivers stay UNKNOWN — the fix must
-        // not become a way to invent names.
+        // The genuinely unresolvable receivers stay UNKNOWN: the `?` rule
+        // invents no names.
         let acqs = acquisitions_on("*self.0?.lock().unwrap() = None;", &ctx);
         assert!(acqs[0].identity.is_none());
         let acqs = acquisitions_on("a?.read().unwrap().clone()", &ctx);
@@ -4335,7 +4655,7 @@ mod tests {
              winit_side_helper();\n}\n\
              fn aterm_side_helper() {\n    alpha_lock.lock().unwrap().push(1);\n}\n",
             &[(
-                "vendor/winit/src/planted.rs",
+                "crates/aterm-window/src/planted.rs",
                 "fn winit_side_helper() {\n    event_state.lock().unwrap().push(1);\n}\n\
                  fn winit_hold_and_call() {\n    \
                  let g = event_state.lock().unwrap();\n    aterm_side_helper();\n}\n",
@@ -4350,7 +4670,7 @@ mod tests {
             out.log
         );
         assert!(
-            out.log.contains("vendor/winit/src/planted.rs:2")
+            out.log.contains("crates/aterm-window/src/planted.rs:2")
                 && out.log.contains("crates/aterm-gui/src/extra.rs:2"),
             "both crates' sites must be named in the diagnostic:\n{}",
             out.log
@@ -4366,7 +4686,7 @@ mod tests {
             "sliceabba",
             "fn plain() {\n    let g = alpha_lock.lock().unwrap();\n}\n",
             &[(
-                "vendor/winit/src/platform_impl/linux/planted.rs",
+                "crates/aterm-window/src/platform_impl/linux/planted.rs",
                 "fn ab() {\n    let g = sctk_state.lock().unwrap();\n    \
                  let h = x11_state.lock().unwrap();\n}\n\
                  fn ba() {\n    let g = x11_state.lock().unwrap();\n    \
@@ -4399,7 +4719,7 @@ mod tests {
             "vendorunknown",
             "fn plain() {\n    let g = alpha_lock.lock().unwrap();\n}\n",
             &[(
-                "vendor/winit/src/planted.rs",
+                "crates/aterm-window/src/planted.rs",
                 "fn opaque(&self) {\n    let g = self.0.lock().unwrap();\n    \
                  let h = event_state.lock().unwrap();\n}\n",
             )],
@@ -4421,8 +4741,9 @@ mod tests {
             out.log
         );
         assert!(
-            out.log
-                .contains("winit::UNKNOWN@vendor/winit/src/planted.rs:2 -> winit::event_state"),
+            out.log.contains(
+                "winit::UNKNOWN@crates/aterm-window/src/planted.rs:2 -> winit::event_state"
+            ),
             "the vendored unknown's held-acquire edge must still be reported, \
              namespaced:\n{}",
             out.log
@@ -4553,35 +4874,6 @@ mod tests {
         assert!(out.log.contains("no longer defined"), "log:\n{}", out.log);
     }
 
-    // ------------------------------------------------------------------
-    // Real-tree obligations.
-    // ------------------------------------------------------------------
-
-    /// One lock-order run over this tree, shared by every real-tree assertion.
-    fn this_tree() -> &'static CensusOutcome {
-        static RUN: std::sync::OnceLock<CensusOutcome> = std::sync::OnceLock::new();
-        RUN.get_or_init(|| run_lock_order_census(&repo_root()))
-    }
-
-    #[test]
-    fn no_unknown_identities_on_this_tree() {
-        // Every receiver is named, workspace and vendored: a new unnamed
-        // receiver fails here. Name the receiver, never suppress the site.
-        let out = this_tree();
-        assert!(
-            out.log.contains("0 UNKNOWN-identity site(s)"),
-            "UNKNOWN-identity sites reappeared — resolve them by naming the \
-             receiver, never by suppression:\n{}",
-            out.log
-        );
-        assert!(
-            out.log.contains("+ 0 vendored UNKNOWN site(s)"),
-            "vendored UNKNOWNs reappeared — they are summarized per crate in the \
-             log; re-audit the new sites:\n{}",
-            out.log
-        );
-    }
-
     #[test]
     fn synthetic_new_gui_dependency_is_scanned_automatically() {
         // A new crate entering aterm-gui's dependency graph, with no census
@@ -4653,28 +4945,6 @@ mod tests {
             out.log.contains("CYCLE") && out.log.contains("crates/aterm-newdep/src/lib.rs:2"),
             "the cycle diagnostic must name the new crate's sites:\n{}",
             out.log
-        );
-    }
-
-    #[test]
-    fn term_identity_dominates_on_this_tree() {
-        // Rot canary: the per-session `term` mutex is the dominant lock; if
-        // the walker stops seeing it, the census went blind.
-        let out = this_tree();
-        let ids_line = out
-            .log
-            .lines()
-            .find(|l| l.trim_start().starts_with("identities:"))
-            .expect("identities line");
-        let count: usize = ids_line
-            .split("term(")
-            .nth(1)
-            .and_then(|r| r.split(')').next())
-            .and_then(|n| n.parse().ok())
-            .expect("term(<count>) in the identities line");
-        assert!(
-            count >= 100,
-            "expected >=100 `term` acquisition sites, saw {count} — walker rot?\n{ids_line}"
         );
     }
 }

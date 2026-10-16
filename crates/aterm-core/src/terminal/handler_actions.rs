@@ -2,16 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Parser action dispatch for `TerminalHandler`: receives parsed escape
-//! sequences from the VT parser via the `ActionSink` trait and dispatches them
-//! to typed handler methods. Depends only on `parser` (for the trait) and
-//! `charset` (for character translation).
-//!
-//! ## Concern layers
-//!
-//! - **Parser actions** (this file): `ActionSink` dispatch from parser events
-//! - **State transitions** (`handler_state.rs`): grid/mode mutations from typed operations
-//! - **Side-effects**: callbacks and external service activation (inline in handler files)
+//! `ActionSink` for `TerminalHandler`: parser actions (print, C0/C1, CSI, DCS, APC) dispatched
+//! to typed handlers, the bulk ASCII writers, and the Kitty graphics protocol (APC `G`).
 
 use crate::grid::{CellFlags, PackedColor};
 use crate::parser::ActionSink;
@@ -35,12 +27,9 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 
 impl TerminalHandler<'_> {
-    /// Stamp the echo anchor: one past the last glyph of this print action's
-    /// run (so a glyph printed at the last column with the wrap deferred
-    /// reports the column past it), plus a monotonic action count (see
-    /// `TransientState::print_anchor`). Called at the tail of every
-    /// `ActionSink` print path, once per action. Observability only: no parser
-    /// or grid decision reads it back.
+    /// Stamp the echo anchor: one past the last glyph of this print action's run (a glyph at
+    /// the last column with the wrap deferred reports the column past it), plus a monotonic
+    /// action count. Called once per print action; observability only, nothing decides on it.
     #[inline]
     fn stamp_print_anchor(&mut self) {
         let cursor = self.grid.cursor();
@@ -55,7 +44,6 @@ impl TerminalHandler<'_> {
 impl ActionSink for TerminalHandler<'_> {
     fn print(&mut self, c: char) {
         self.note_sync_open_action();
-        // Handle VT52 cursor addressing state
         match self.transient.vt52_cursor_state {
             Vt52CursorState::WaitingRow => {
                 // First byte after ESC Y - row (encoded as row + 32)
@@ -77,20 +65,13 @@ impl ActionSink for TerminalHandler<'_> {
         self.stamp_print_anchor();
     }
 
-    /// Fast path: print a run of printable ASCII bytes (0x20-0x7E) in one of
-    /// three tiers:
-    ///
-    /// 1. Default style, autowrap, no insert mode → `write_ascii_blast`
-    /// 2. Styled but no RGB/hyperlinks/insert, autowrap → `write_ascii_run_styled`
-    /// 3. Fallback: per-character `write_char`
+    /// Fast path for a run of printable ASCII (0x20-0x7E): the bulk writers when charset,
+    /// modes and margins allow, else per-character `write_char`.
     fn print_ascii_bulk(&mut self, data: &Provenance<[u8], Pty>) {
         self.note_sync_open_action();
         let mut data = data.as_ref();
-        // VT52 direct cursor addressing (ESC Y) takes the next two printables
-        // as its row and column. Only those: the rest of the run is text and
-        // goes to the writer it would reach in the next read, or where a read
-        // boundary falls after the address would move the cursor (ruling
-        // 2026-10-10, r15 C5).
+        // VT52 direct cursor addressing (ESC Y) takes the next two printables as row and
+        // column; the rest of the run is text, written as if it came in the next read.
         while self.transient.vt52_cursor_state != Vt52CursorState::None {
             let Some((&byte, rest)) = data.split_first() else {
                 return;
@@ -102,11 +83,9 @@ impl ActionSink for TerminalHandler<'_> {
             return;
         }
 
-        // Per-character fallback: only for conditions that truly require it.
-        // Charset translation, insert mode, and no-autowrap need per-char processing
-        // because they change behavior at each character position. So does a run
-        // starting outside a DECSLRM span: the run writers clamp at the right
-        // margin only from a start inside it (`Grid::cursor_outside_margin_span`).
+        // Charset translation, insert mode and no-autowrap act per position, so they go per
+        // character. So does a run starting outside a DECSLRM span: the run writers clamp at
+        // the right margin only from a start inside it.
         if !self.charset.is_ascii_passthrough()
             || self.modes.insert_mode
             || !self.modes.auto_wrap
@@ -119,14 +98,11 @@ impl ActionSink for TerminalHandler<'_> {
             return;
         }
 
-        // Selection custody: ordinary output damages the rows it overwrites (see
-        // `TerminalHandler::write_char`, which brackets the per-character paths
-        // this one bypasses). One bracket per run keeps it off the per-glyph
-        // path; the absolute frame is invariant, so a run that wraps and
-        // scrolls is still named by its first and last cursor row.
+        // Selection custody: output damages the rows it overwrites (`write_char` brackets the
+        // per-character paths). One bracket per run: the absolute frame is invariant, so a run
+        // that wraps and scrolls is still named by its first and last cursor row.
         let origin = self.grid.output_damage_origin();
-        // Check if style needs CellExtras overflow (RGB, hyperlinks, etc.).
-        // Both flags cached at mutation time — no per-bulk-call overhead.
+        // Both flags are cached at mutation time.
         if self.style.has_style_extras() || self.transient.has_transient_extras {
             self.write_ascii_bulk_with_extras(data);
         } else {
@@ -168,26 +144,7 @@ impl ActionSink for TerminalHandler<'_> {
         self.stamp_print_anchor();
     }
 
-    /// Execute C0 and C1 control characters.
-    ///
-    /// Handles single-byte control codes that don't require parameters:
-    ///
-    /// **C0 codes (0x00-0x1F):**
-    /// - **0x07** (BEL): Ring bell (triggers callback)
-    /// - **0x08** (BS): Backspace with reverse wraparound support
-    /// - **0x09** (HT): Horizontal tab
-    /// - **0x0A-0x0C** (LF/VT/FF): Line feed (with optional CR in LNM mode)
-    /// - **0x0D** (CR): Carriage return
-    /// - **0x0E** (SO): Shift Out - select G1 character set
-    /// - **0x0F** (SI): Shift In - select G0 character set
-    /// - **0x18/0x1A** (CAN/SUB): Cancel/abort current sequence
-    ///
-    /// **C1 codes (0x80-0x9F):**
-    /// - **0x84** (IND): Index - same as ESC D
-    /// - **0x85** (NEL): Next line - same as ESC E
-    /// - **0x88** (HTS): Tab set - same as ESC H
-    /// - **0x8D** (RI): Reverse index - same as ESC M
-    /// - **0x8E/0x8F** (SS2/SS3): Single shift - same as ESC N/O
+    /// Execute a C0 or C1 control character (CAN/SUB are the parser's).
     fn execute(&mut self, byte: u8) {
         self.note_sync_open_action();
         // Per VT220 spec: a control character arriving mid-sequence cancels
@@ -246,22 +203,18 @@ impl ActionSink for TerminalHandler<'_> {
 
             // C1 control codes (0x80-0x9F): 8-bit forms of ESC sequences.
             0x84 => {
-                // IND (Index) - same as ESC D: cursor down, scrolling at the
-                // bottom of the region (within DECLRMM margins when active).
+                // IND, as ESC D.
                 self.margined_line_feed(self.modes.left_right_margin_mode);
             }
             0x85 => {
-                // NEL (Next Line) - same as ESC E
+                // NEL, as ESC E.
                 self.grid
                     .carriage_return_margin(self.modes.left_right_margin_mode);
-                // With DECLRMM active, NEL at the scroll boundary scrolls only
-                // within the horizontal margins (VT510).
                 self.margined_line_feed(self.modes.left_right_margin_mode);
             }
             0x88 => self.grid.set_tab_stop(), // HTS - same as ESC H
             0x8D => {
-                // RI (Reverse Index) - same as ESC M: cursor up, scrolling down
-                // at the top of the region (within DECLRMM margins when active).
+                // RI, as ESC M.
                 self.grid
                     .reverse_line_feed_margined(self.modes.left_right_margin_mode);
             }
@@ -286,36 +239,26 @@ impl ActionSink for TerminalHandler<'_> {
         self.sync_absolute_row_metadata();
         let params = params.as_ref();
         let intermediates = intermediates.as_ref();
-        // VT52 mode does not recognize CSI sequences — ESC [ is not a valid
-        // VT52 escape. Silently ignore any CSI that arrives while in VT52 mode.
+        // VT52 has no CSI (ESC [ is not a VT52 escape).
         if self.modes.vt52_mode {
             return;
         }
-        // Mint a zero-sized response capability for this CSI dispatch;
-        // handlers that may push to the PTY response buffer take `&cap`
-        // explicitly (see `response_capability.rs`). The engine gates
-        // individual responses at `send_response` rather than at mint time,
-        // since denying the mint would suppress all CSI handling;
-        // `response_capability::mint_for_dispatch_with_engine` is the variant
-        // that gates the whole dispatch.
+        // A zero-sized response capability for this dispatch (see `response_capability.rs`).
+        // The engine gates each response at `send_response`, not the mint: a denied mint would
+        // suppress all CSI handling.
         let cap = super::super::response_capability::ResponseCapability::mint_for_dispatch();
         // Fast path: no intermediates (the vast majority of CSI sequences).
         if intermediates.is_empty() {
             self.csi_dispatch_no_intermediates(&cap, params, final_byte);
             return;
         }
-        // Slow path: sequences with intermediates (DEC private, CSI > etc.)
-        // Per VT spec, sequences with unrecognized intermediates must be silently
-        // ignored — they must not fall through to standard CSI handlers, which
-        // would misinterpret e.g. CSI # h as CSI h (ANSI set mode).
+        // With intermediates: an unrecognized one is ignored, never falling through to the
+        // plain handler (`CSI # h` is not `CSI h`).
         let _ = self.csi_dispatch_with_intermediates(&cap, params, intermediates, final_byte);
     }
 
-    /// Handle CSI sequences with subparameter information.
-    ///
-    /// This is called when the parser detects colon-separated subparameters
-    /// (e.g., `ESC[4:3m` for curly underline). The `subparam_mask` indicates
-    /// which params were preceded by a colon.
+    /// CSI with colon subparameters (`ESC[4:3m`); `subparam_mask` marks the params preceded by
+    /// a colon.
     fn csi_dispatch_with_subparams(
         &mut self,
         params: &Provenance<[u16], Pty>,
@@ -356,7 +299,7 @@ impl ActionSink for TerminalHandler<'_> {
     ) {
         self.note_sync_open_action();
         self.sync_absolute_row_metadata();
-        // VT52 mode has no OSC sequences — silently ignore.
+        // VT52 has no OSC.
         if self.modes.vt52_mode {
             return;
         }
@@ -372,7 +315,7 @@ impl ActionSink for TerminalHandler<'_> {
         intermediates: &Provenance<[u8], Pty>,
         final_byte: u8,
     ) {
-        // VT52 mode has no DCS sequences — silently ignore.
+        // VT52 has no DCS.
         if self.modes.vt52_mode {
             return;
         }
@@ -384,23 +327,16 @@ impl ActionSink for TerminalHandler<'_> {
         self.dcs_put_inner(byte);
     }
 
-    /// Bulk-accumulate DCS data bytes (the parser's DcsPassthrough fast path
-    /// hands over nearly whole PTY chunks): budget accounting, data caps, and
-    /// the Sixel pixel-allocation sampling run once per run instead of once
-    /// per byte. Parity with per-byte `dcs_put` is documented and tested at
-    /// `dcs_put_bulk_inner` (handler_dcs.rs).
+    /// Bulk-accumulate DCS data (the parser's passthrough fast path hands over near-whole PTY
+    /// chunks): budget, caps and Sixel allocation sampling run once per run. Parity with
+    /// `dcs_put` is at `dcs_put_bulk_inner`.
     fn dcs_put_bulk(&mut self, data: &Provenance<[u8], Pty>) {
         self.dcs_put_bulk_inner(data.as_ref());
     }
 
-    /// Finalize a DCS sequence after receiving the String Terminator (ST).
-    ///
-    /// DCS unhook may produce responses for DECRQSS/XTGETTCAP; mint a
-    /// capability here so downstream handlers can thread it.
-    ///
-    /// `canceled` is `true` for a CAN/SUB abort, and the string is discarded:
-    /// a half-decoded sixel is dropped and a DECRQSS/XTGETTCAP query is not
-    /// answered.
+    /// Finish a DCS string, minting the response capability DECRQSS/XTGETTCAP answers need.
+    /// `canceled` (CAN/SUB) discards the string: a half-decoded sixel is dropped and a query is
+    /// not answered.
     fn dcs_unhook(&mut self, canceled: bool) {
         self.note_sync_open_action();
         let cap = super::super::response_capability::ResponseCapability::mint_for_dispatch();
@@ -408,17 +344,16 @@ impl ActionSink for TerminalHandler<'_> {
     }
 
     fn apc_start(&mut self) {
-        // VT52 mode has no APC sequences — silently ignore.
+        // VT52 has no APC.
         if self.modes.vt52_mode {
             return;
         }
-        // Release global budget from any abandoned prior DCS sequence, or an
-        // incomplete DCS (no ST) followed by APC would leak its sequence_bytes
-        // and eventually exhaust MAX_DCS_GLOBAL_BUDGET.
+        // Release an abandoned DCS's budget, or a DCS without ST followed by APC would leak
+        // its sequence_bytes.
         self.dcs.total_bytes = self.dcs.total_bytes.saturating_sub(self.dcs.sequence_bytes);
         self.dcs.sequence_bytes = 0;
-        // Abort an abandoned Sixel decoder before clearing dcs_type; abort()
-        // avoids unhook()'s transient full-size copy.
+        // Drop an abandoned Sixel decoder before clearing dcs_type, without the full-size
+        // copy `unhook` makes.
         #[cfg(feature = "sixel")]
         if matches!(self.dcs.dcs_type, super::super::DcsType::Sixel) {
             self.sixel.decoder.abort();
@@ -428,31 +363,23 @@ impl ActionSink for TerminalHandler<'_> {
     }
 
     fn apc_put(&mut self, byte: u8) {
-        // APC shares `dcs.data`, so it is counted against the global DCS
-        // budget (a DoS bound).
+        // APC shares `dcs.data`, so it counts against the global DCS budget.
         if self.dcs.total_bytes >= super::super::MAX_DCS_GLOBAL_BUDGET {
             return;
         }
-        // Always count bytes against the budget, even when the data vec
-        // is capped. Otherwise APC flooding past the cap goes untracked
-        // and the budget system cannot throttle it.
+        // Count every byte, even past the data cap, so the budget throttles an APC flood.
         self.dcs.total_bytes += 1;
         self.dcs.sequence_bytes += 1;
-        // Allow up to 4MB per APC sequence for Kitty graphics; the global DCS
-        // budget (10MB) still caps total memory.
+        // Up to 4 MiB per APC sequence for Kitty graphics; the global budget caps the total.
         if self.dcs.data.len() < 4 * 1024 * 1024 {
             self.dcs.data.push(byte);
         }
     }
 
     fn apc_put_bulk(&mut self, data: &Provenance<[u8], Pty>) {
-        // Bulk equivalent of `apc_put` over a contiguous run: budget accounting
-        // once and a single `extend_from_slice`. Must stay byte-identical to
-        // per-byte `apc_put` (`apc_put_bulk_crosses_caps_parity`):
-        //
-        //  - Only `MAX_DCS_GLOBAL_BUDGET - total_bytes` of the run are counted;
-        //    bytes past that are neither counted nor pushed.
-        //  - Of the counted bytes, byte k is pushed iff `data.len() + k < 4 MiB`.
+        // Bulk `apc_put`: byte-identical to it (`apc_put_bulk_crosses_caps_parity`). Only
+        // `MAX_DCS_GLOBAL_BUDGET - total_bytes` of the run are counted; bytes past that are
+        // neither counted nor pushed. Counted byte k is pushed iff `data.len() + k < 4 MiB`.
         let data = data.as_ref();
         let countable = data
             .len()
@@ -468,23 +395,20 @@ impl ActionSink for TerminalHandler<'_> {
         }
     }
 
-    /// End an APC string. One CAN or SUB canceled (`canceled`) is truncated:
-    /// its payload is discarded unparsed, a kitty one also ends the chunked
-    /// transfer in flight, and its budget and buffer are released as for a
-    /// complete one.
+    /// End an APC string. One cut short by CAN/SUB (`canceled`) is discarded unparsed, and a
+    /// kitty one also ends the chunked transfer in flight; either way the budget and buffer
+    /// are released as for a complete one.
     fn apc_end(&mut self, canceled: bool) {
         self.note_sync_open_action();
         let kitty = self.dcs.data.first() == Some(&b'G');
         if canceled && kitty {
-            // A canceled kitty command was a chunk of any chunked transfer in
-            // flight, so that transfer can no longer complete intact. Drop it:
-            // otherwise the next program's complete command would be taken as
-            // its continuation and lost with it.
+            // A canceled kitty command was a chunk of any transfer in flight, which can no
+            // longer complete intact: drop it, or the next complete command would be taken as
+            // its continuation.
             self.transient.kitty_pending = None;
         }
-        // Kitty graphics (APC 'G'): parse the accumulated payload and handle it.
-        // `parse_kitty_command` returns an owned command, so the borrow on
-        // `dcs.data` ends before `handle_kitty_command` mutates the grid/store.
+        // `parse_kitty_command` returns an owned command, so the borrow on `dcs.data` ends
+        // before `handle_kitty_command` mutates the grid and store.
         let cmd = if !canceled && kitty {
             crate::terminal::kitty_graphics::parse_kitty_command(&self.dcs.data)
         } else {
@@ -493,11 +417,9 @@ impl ActionSink for TerminalHandler<'_> {
         if let Some(cmd) = cmd {
             self.handle_kitty_command(cmd);
         }
-        // Release APC bytes from the global DCS budget.
         self.dcs.total_bytes = self.dcs.total_bytes.saturating_sub(self.dcs.sequence_bytes);
         self.dcs.sequence_bytes = 0;
-        // Clear the buffer and reclaim memory from large APC payloads (same
-        // policy as DCS unhook and OSC dispatch).
+        // Clear the buffer and reclaim memory from a large payload, as DCS unhook does.
         self.dcs.data.clear();
         if self.dcs.data.capacity() > 4096 {
             self.dcs.data.shrink_to(128);
@@ -505,29 +427,15 @@ impl ActionSink for TerminalHandler<'_> {
     }
 }
 
-/// Kitty graphics (APC `G`) command handling. An inherent impl (not part of
-/// `ActionSink`); called from `apc_end` above.
+/// Kitty graphics (APC `G`), called from `apc_end`.
 impl TerminalHandler<'_> {
-    /// Handle one parsed Kitty graphics command, assembling chunked
-    /// transmissions (`m=1`) first; per-action handling is
-    /// `handle_complete_kitty_command`. The first `m=1` chunk seeds the pending
-    /// command, continuation chunks append their payload, and the `m=0` chunk
-    /// dispatches the whole image; non-chunked commands dispatch immediately.
-    /// Before any of that, a command naming both `i=` and `I=` is refused
-    /// (`EINVAL`) and a query naming no `i=` is answered, whatever their
-    /// action and whether or not a load is in flight: kitty refuses both
-    /// before it routes a command, so neither is a chunk, nor opens or ends a
-    /// load.
-    /// Only a first chunk kitty would hold in flight opens a load
-    /// ([`kitty_would_hold`](Self::kitty_would_hold)): any other command
-    /// ignores `m=1` and runs at once, getting its usual answer, as in kitty.
-    /// While a load is in flight, a command is read as kitty reads it
-    /// ([`KittyCommand::during_load`]): as its next chunk, as a command that
-    /// ends it first, or as a command beside it. A prompt or command start
-    /// also ends it (`dispatch_shell_mark`), as does RIS.
-    /// The assembled payload is bounded by `MAX_KITTY_IMAGE_BYTES` (overflow
-    /// aborts the transfer). Takes the command by value so the payload moves
-    /// into the image store without a copy.
+    /// Handle one parsed Kitty command, assembling chunked transfers (`m=1`). As in kitty, a
+    /// command naming both `i=` and `I=` (`EINVAL`) and a query without `i=` are handled
+    /// first, never as chunks. Only a first chunk kitty would hold
+    /// ([`kitty_would_hold`](Self::kitty_would_hold)) opens a load; while one is in flight,
+    /// [`KittyCommand::during_load`] says whether a command continues it, ends it, or runs
+    /// beside it. A prompt or command start (`dispatch_shell_mark`) and RIS also end it. The
+    /// payload is bounded by `MAX_KITTY_IMAGE_BYTES`.
     fn handle_kitty_command(&mut self, cmd: KittyCommand) {
         if cmd.id.is_some() && cmd.number.is_some() {
             self.kitty_reply(&cmd, None, "EINVAL:i and I are exclusive");
@@ -551,15 +459,12 @@ impl TerminalHandler<'_> {
         if self.transient.kitty_pending.is_some()
             || (cmd.more && during_load == DuringLoad::Continues && self.kitty_would_hold(&cmd))
         {
-            // Bound the assembled payload before appending (read the current len
-            // first to avoid borrowing across the abort reset).
             let cur_len = self
                 .transient
                 .kitty_pending
                 .as_ref()
                 .map_or(0, |p| p.payload.len());
-            // Fail closed before touching the buffer: overflow past the cap, or
-            // an armed alloc fault, aborts the transfer.
+            // Fail closed before touching the buffer: overflow or an armed alloc fault aborts.
             if crate::fault::triggered("kitty.chunk_alloc")
                 || cur_len.saturating_add(cmd.payload.len()) > MAX_KITTY_IMAGE_BYTES
             {
@@ -567,17 +472,14 @@ impl TerminalHandler<'_> {
                 return;
             }
             let Some(pending) = self.transient.kitty_pending.as_mut() else {
-                // First chunk (`cmd.more` is true here): seed the accumulator
-                // with the owned command, metadata and payload, without copying.
+                // First chunk: the owned command seeds the accumulator without a copy.
                 self.transient.kitty_pending = Some(cmd);
                 return;
             };
-            // Continuation chunk: reserve fallibly before extending, so an OOM
-            // drops the transfer instead of aborting the process.
+            // Reserve fallibly: an OOM drops the transfer, not the process.
             if pending.payload.try_reserve(cmd.payload.len()).is_ok() {
                 pending.payload.extend_from_slice(&cmd.payload);
-                // A chunk may carry `q=`, which then holds for the answer to
-                // the whole load, as in kitty.
+                // A chunk's `q=` holds for the whole load's answer, as in kitty.
                 if cmd.quiet != 0 {
                     pending.quiet = cmd.quiet;
                 }
@@ -588,7 +490,6 @@ impl TerminalHandler<'_> {
             if cmd.more {
                 return; // more chunks to come
             }
-            // Final chunk: take the assembled command out and dispatch it.
             if let Some(assembled) = self.transient.kitty_pending.take() {
                 self.handle_complete_kitty_command(assembled);
             }
@@ -597,13 +498,9 @@ impl TerminalHandler<'_> {
         self.handle_complete_kitty_command(cmd);
     }
 
-    /// Whether kitty would hold a load in flight for `cmd`, the first chunk
-    /// (`m=1`) of a transmit, query or frame load on the direct medium: it
-    /// declares a size kitty loads ([`KittyCommand::declares_loadable_size`]),
-    /// and, for a frame, names an image the store holds, found as
-    /// [`load_kitty_frame`](Self::load_kitty_frame) finds it. kitty refuses
-    /// any other such chunk at once and holds nothing. A continuation chunk
-    /// is never asked: only the first chunk carries `s=`/`v=`.
+    /// Whether kitty would hold a load for `cmd`, a first chunk (`m=1`) of a direct transmit,
+    /// query or frame: it declares a loadable size and, for a frame, names a stored image.
+    /// kitty refuses any other such chunk at once. Only first chunks carry `s=`/`v=`.
     fn kitty_would_hold(&self, cmd: &KittyCommand) -> bool {
         cmd.declares_loadable_size()
             && (cmd.action != KittyAction::Frame
@@ -612,71 +509,25 @@ impl TerminalHandler<'_> {
                     .is_some_and(|id| self.transient.kitty_frames.contains_key(&id)))
     }
 
-    /// Handle one complete (chunk-assembled) Kitty graphics command.
+    /// Handle one complete Kitty command. A command naming `i=`/`I=` is answered as kitty
+    /// answers ([`kitty_reply`](Self::kitty_reply)); the text after an error code is aterm's.
+    /// Placements are layers: each covered cell stacks the tile in kitty's draw order (z-index,
+    /// then first transmit, then placement order: [`aterm_grid::ImageRef::draw_key`]), so
+    /// deleting one uncovers what lay beneath; an iTerm2 or sixel image takes its cells whole.
     ///
-    /// What the engine does, by action:
+    /// Where aterm differs from kitty:
     ///
-    ///   * `a=t` / `a=T` transmit — decode, store by `i=` (or by an id the
-    ///     terminal assigns an `I=` number), and for `a=T` show it as a put
-    ///     would;
-    ///   * `a=p` put — show a stored image laid out by the put's own
-    ///     `c=`/`r=`/`z=`/`x=`/`y=`/`w=`/`h=` (only one of `c=`/`r=` keeps the
-    ///     image's aspect), starting `X=`/`Y=` pixels into its first cell: at
-    ///     the cursor (kitty's cursor policy, `C=1` to keep it); as a virtual
-    ///     placement for `U=1`, drawn where the client prints
-    ///     Unicode placeholders, which name it by image id (foreground colour)
-    ///     and placement id (underline colour); or relative to a parent
-    ///     placement for `P=`/`Q=`, `H=`/`V=` cells from the parent's top-left,
-    ///     moving with the parent and deleted with it — a virtual parent's
-    ///     top-left being the top row and leftmost column of its placeholders
-    ///     on screen, found each frame ([`kitty_floating`]). A placement id (`p=`)
-    ///     names one placement of an image, so a later put with the same pair
-    ///     moves it;
-    ///   * `a=d` delete — the placements a selector addresses (only the
-    ///     id-addressed selectors reach virtual placements), their data too
-    ///     under an uppercase selector; `d=f`/`F` one animation frame;
-    ///   * `a=q` query — answered per medium availability;
-    ///   * `a=f` frame — load frame data: a new frame, or frame `r=` edited,
-    ///     composed at `x=`/`y=` onto frame `c=`, the edited frame or the
-    ///     background colour `Y=`, alpha-blended unless `X=1` (a PNG on either
-    ///     side is decoded to compose it);
-    ///   * `a=c` compose — a rectangle of frame `r=` onto frame `c=`;
-    ///   * `a=a` animation control — `c=` makes a frame the current one,
-    ///     everywhere the image shows; `s=`, `v=` and the frame gaps (`z=`,
-    ///     here or on `a=f`) play it, frame by frame on the host's clock
-    ///     ([`advance_kitty_animations`](Self::advance_kitty_animations)).
-    ///
-    /// Transmits, puts, frames and compositions that name an `i=`/`I=` are
-    /// answered when kitty answers them, with kitty's fields (`i=`, `I=`,
-    /// `p=`, and `r=` for `a=f`/`a=a`) and error codes, subject to `q=`; an
-    /// animation control only with `ENOENT`, for an image not held. The text
-    /// after an error code is aterm's own. The non-direct mediums work only
-    /// when the host installs the opt-in resolver.
-    ///
-    /// Placements are layers: each covered cell stacks the placement's tile
-    /// over what it already shows, ordered as kitty draws them — by z-index,
-    /// then by when the image was first transmitted, then placement order
-    /// ([`aterm_grid::ImageRef::draw_key`]) — so overlapping images blend and
-    /// deleting one uncovers what lay beneath. An iTerm2 or sixel image still
-    /// takes its cells whole.
-    ///
-    /// Not built, or bounded where kitty is not, with what happens instead:
-    ///
-    ///   * a `C=1` placement is clipped at the screen's last row instead of
-    ///     hanging below it;
-    ///   * a cell holds at most `MAX_IMAGE_LAYERS` (16) layers: a 17th
-    ///     overlapping placement pushes out that cell's lowest;
-    ///   * an unnamed placement put exactly over an unnamed one of the same
-    ///     image replaces it ([`replace_covered_kitty`](Self::replace_covered_kitty));
-    ///     kitty keeps both, which differs only where the newer is translucent;
-    ///   * at most `MAX_KITTY_FLOATING` (16) placements relative to a virtual
-    ///     placement, and at most `MAX_KITTY_VARIANTS` (16) differently laid-out
-    ///     placements of one image shown at once; past either, `ENOSPC`;
-    ///   * an animation plays on the live screen only: scrolled into history,
-    ///     an image shows the frame it had when it left;
-    ///   * a web embed plays animations only if its page calls the
-    ///     `advance_kitty_animations` export, and no page in this repository
-    ///     does yet.
+    ///   * a `C=1` placement is clipped at the last row instead of hanging below it;
+    ///   * a cell holds at most `MAX_IMAGE_LAYERS` (16) layers; a 17th pushes out the lowest;
+    ///   * an unnamed placement put exactly over an unnamed one of the same image replaces it
+    ///     ([`replace_covered_kitty`](Self::replace_covered_kitty)); kitty keeps both, which
+    ///     differs only where the newer is translucent;
+    ///   * at most `MAX_KITTY_FLOATING` (16) placements relative to a virtual one, and
+    ///     `MAX_KITTY_VARIANTS` (16) differently laid-out placements of one image shown at
+    ///     once; past either, `ENOSPC`;
+    ///   * animations play on the live screen only: in history an image keeps its frame;
+    ///   * a web embed plays animations only if its page calls the `advance_kitty_animations`
+    ///     export, and no page in this repository does.
     fn handle_complete_kitty_command(&mut self, cmd: KittyCommand) {
         match cmd.action {
             KittyAction::Delete => {
@@ -685,10 +536,7 @@ impl TerminalHandler<'_> {
             }
             KittyAction::Display => self.put_kitty(&cmd),
             KittyAction::Transmit | KittyAction::TransmitAndDisplay => self.transmit_kitty(cmd),
-            // Support probe: report OK (we support core transmit/display). The
-            // success response is suppressed by q>=1 — that Query then falls to
-            // the arm below (no response). Echo the id (i=) or number (I=) the
-            // client used.
+            // The support probe; `q>=1` suppresses its answer.
             KittyAction::Query if cmd.quiet == 0 => self.answer_kitty_query(&cmd),
             KittyAction::Query => {}
             KittyAction::Frame => self.load_kitty_frame(cmd),
@@ -697,8 +545,7 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// `a=p`: show a stored image (by `i=` or `I=`), laid out by the put's
-    /// own keys ([`show_kitty`](Self::show_kitty)).
+    /// `a=p`: show a stored image (`i=` or `I=`), laid out by the put's own keys.
     fn put_kitty(&mut self, cmd: &KittyCommand) {
         let Some(id) = self.resolve_kitty_id(cmd) else {
             self.kitty_reply(cmd, None, "ENOENT:no such image");
@@ -718,8 +565,7 @@ impl TerminalHandler<'_> {
         self.kitty_reply(cmd, Some(id), verdict);
     }
 
-    /// Show `image`, image `id` laid out for this command, as the command
-    /// asks: a virtual placement for `U=1`, relative to a parent for `P=`,
+    /// Show `image` (image `id`, laid out for `cmd`): virtual for `U=1`, relative for `P=`,
     /// else at the cursor.
     fn show_kitty(
         &mut self,
@@ -741,18 +587,15 @@ impl TerminalHandler<'_> {
                 Ok(())
             }
         };
-        // A placement put again elsewhere may have left relatives of it
-        // floating with no parent.
+        // A placement put again elsewhere may leave its relatives floating without a parent.
         self.prune_kitty_floating();
         shown
     }
 
-    /// `a=t` / `a=T`: decode, store under `i=` (or an id the terminal assigns
-    /// an `I=` number), and for `a=T` show it as a put would.
+    /// `a=t`/`a=T`: decode and store under `i=` (or a fresh id for `I=`); `a=T` also shows it.
     fn transmit_kitty(&mut self, mut cmd: KittyCommand) {
         if !self.kitty_medium_works(cmd.medium) {
-            // The same verdict the `a=q` probe gives this medium: the data was
-            // never read, so "bad image data" would name the wrong cause.
+            // The probe's verdict for this medium: the data was never read.
             self.kitty_reply(&cmd, cmd.id, KITTY_MEDIUM_DISABLED);
             return;
         }
@@ -780,8 +623,7 @@ impl TerminalHandler<'_> {
                 // The store refused the image: no placeholder could draw it.
                 Ok(())
             } else {
-                // Shown even when the store refused it: the pixels are in
-                // hand, only a later put by id cannot find them.
+                // Shown even when the store refused it: only a later put by id fails.
                 self.show_kitty(&image, id.unwrap_or(0), &cmd)
             };
             if let Err(error) = shown
@@ -793,19 +635,13 @@ impl TerminalHandler<'_> {
         self.kitty_reply(&cmd, id, verdict);
     }
 
-    /// `a=q` (not quieted): the support probe. A query naming no `i=` is
-    /// answered too, echoing its `I=` if any, where kitty answers none. The
-    /// answer names only whether the medium works: a query that declares a
-    /// size kitty refuses ([`KittyCommand::declares_loadable_size`]) is
-    /// answered `OK` on the direct medium where kitty answers `EINVAL`, and
-    /// opens no load in either.
+    /// `a=q` (not quieted): the support probe, answered even with no `i=` (echoing any `I=`;
+    /// kitty answers none). It names only whether the medium works: a size kitty refuses is
+    /// still `OK` on the direct medium (kitty: `EINVAL`), and opens no load.
     fn answer_kitty_query(&mut self, cmd: &KittyCommand) {
         use core::fmt::Write as _;
-        // Answer the probe per queried medium. Clients probe `a=q` before
-        // choosing a transmission strategy (kitty's icat falls back to direct
-        // on an error), and without the opt-in non-direct resolver
-        // (`allow_kitty_file_transfer`) every file/shm transmit would be
-        // dropped. Direct always works; the rest work only with the resolver.
+        // Clients probe before choosing a medium (kitty's icat falls back to direct on an
+        // error), so the answer names whether this one works.
         let verdict = if self.kitty_medium_works(cmd.medium) {
             "OK"
         } else {
@@ -819,16 +655,13 @@ impl TerminalHandler<'_> {
         } else {
             let _ = write!(r, "\x1b_G;{verdict}\x1b\\");
         }
-        // Route the reply through the single response sink (like every
-        // other terminal response) so it is gated by the response
-        // capability, the rate limiter and the buffer cap.
+        // The single response sink: capability, rate limiter and buffer cap apply.
         let cap = super::super::response_capability::ResponseCapability::mint_for_dispatch();
         self.send_response(&cap, r.as_bytes());
     }
 
-    /// Whether this session can read a transmission sent over `medium`: direct
-    /// always, the file / temp-file / shared-memory mediums only when the host
-    /// installed the opt-in resolver.
+    /// Whether this session can read a transmission over `medium`: direct always, the others
+    /// only with the host's opt-in resolver.
     fn kitty_medium_works(&self, medium: KittyMedium) -> bool {
         medium == KittyMedium::Direct || self.kitty_file_resolver.is_some()
     }
@@ -856,12 +689,10 @@ impl TerminalHandler<'_> {
         id
     }
 
-    /// Answer a command the way kitty does: only when it named an image (`i=`
-    /// or `I=`), `OK` unless `q>=1`, an error unless `q>=2`, naming the frame
-    /// an `a=f` or `a=a` command gave (`r=`). `id` is the image the command
-    /// resolved to, if any. The callers decide which commands are answered at
-    /// all: any command naming both `i=` and `I=` is refused; otherwise a
-    /// delete never is answered, an animation control only for a missing image.
+    /// Answer as kitty does: only a command naming an image (`i=` or `I=`); `OK` unless
+    /// `q>=1`, an error unless `q>=2`; naming the frame (`r=`) of an `a=f` or `a=a`. `id` is
+    /// the image it resolved to. Callers decide what is answered at all: deletes never, an
+    /// animation control only for a missing image.
     fn kitty_reply(&mut self, cmd: &KittyCommand, id: Option<u32>, verdict: &str) {
         let frame = matches!(cmd.action, KittyAction::Frame | KittyAction::Animate)
             .then_some(cmd.rows)
@@ -871,8 +702,8 @@ impl TerminalHandler<'_> {
         self.kitty_reply_naming(cmd, id, frame, verdict);
     }
 
-    /// [`kitty_reply`](Self::kitty_reply) naming frame `frame` (`r=`), as
-    /// kitty's answer to an `a=f` frame load names the frame it loaded.
+    /// [`kitty_reply`](Self::kitty_reply) naming frame `frame` (`r=`), as kitty's answer to a
+    /// frame load does.
     fn kitty_reply_naming(
         &mut self,
         cmd: &KittyCommand,
@@ -904,21 +735,16 @@ impl TerminalHandler<'_> {
             let _ = write!(r, "{sep}r={frame}");
         }
         let _ = write!(r, ";{verdict}\x1b\\");
-        // The single response sink, like the query arm (see there).
         let cap = super::super::response_capability::ResponseCapability::mint_for_dispatch();
         self.send_response(&cap, r.as_bytes());
     }
 
-    /// Store `image` under `id` in the image store, returning whether it fit.
-    ///
-    /// A base transmit stores the frame in two slots (`kitty_images[id]` and
-    /// the root of `kitty_frames[id]`), each charged to the global byte budget. The store
-    /// is capped by count (`MAX_KITTY_IMAGES`, a DoS bound; an existing id may
-    /// always update) and by the global budget (`MAX_KITTY_STORE_BYTES`,
-    /// fail-closed), so the per-item caps can't multiply. Re-transmitting an id
-    /// replaces its data and, as in kitty, removes its placements — on screen
-    /// (their pixels are the old image's) and virtual — with their relative
-    /// placements, and its re-laid-out variants.
+    /// Store `image` under `id`, returning whether it fit. A base transmit fills two slots
+    /// (`kitty_images[id]` and the root of `kitty_frames[id]`), each charged to the budget.
+    /// The store is capped by count (`MAX_KITTY_IMAGES`; an existing id may always update)
+    /// and by `MAX_KITTY_STORE_BYTES`. Re-transmitting an id replaces its data and, as in
+    /// kitty, removes its placements (on screen and virtual, with their relatives) and
+    /// variants.
     fn store_kitty_image(&mut self, id: u32, image: &Arc<ImageData>) -> bool {
         let replacing = self.transient.kitty_images.contains_key(&id);
         let add = image.bytes.len().saturating_mul(2);
@@ -942,8 +768,7 @@ impl TerminalHandler<'_> {
             self.transient.kitty_virtual.remove(&id);
             self.delete_kitty_where(&|tag, _| tag.image_id == id);
             self.prune_kitty_floating();
-            // The delete may have freed the image already (a relative
-            // placement of it lost its parent); whatever is left goes now.
+            // The delete may already have freed the image (an orphaned relative placement).
             let held = kitty_bytes_held(self.transient, id);
             let t = &mut *self.transient;
             let released = kitty_payload_held(t, id);
@@ -953,8 +778,7 @@ impl TerminalHandler<'_> {
         }
         let t = &mut *self.transient;
         t.kitty_images.insert(id, Arc::clone(image));
-        // A fresh base transmit resets the animation to just this frame (frame
-        // 1), stopped; `a=f` adds or edits frames, `a=a` selects and plays them.
+        // A base transmit resets the animation to this one frame, stopped.
         t.kitty_frames.insert(
             id,
             KittyAnimation::new(Arc::clone(image), image_serial, t.process_now),
@@ -964,11 +788,9 @@ impl TerminalHandler<'_> {
         true
     }
 
-    /// Free everything the store holds for `id` — image, frames, variants and
-    /// virtual placements — returning their bytes to the budget and forgetting
-    /// every number that named it. Placements already on screen, on either
-    /// grid, keep their own `Arc`s, so the images are charged to both screens'
-    /// live-image budgets ([`charge_released_kitty`]).
+    /// Free everything the store holds for `id` (image, frames, variants, virtual placements)
+    /// and forget every number naming it. Placements on either grid keep their own `Arc`s, so
+    /// the bytes are charged to both screens' live-image budgets ([`charge_released_kitty`]).
     fn free_kitty_image(&mut self, id: u32) {
         let held = kitty_bytes_held(self.transient, id);
         let t = &mut *self.transient;
@@ -983,9 +805,8 @@ impl TerminalHandler<'_> {
         self.damage_kitty_placeholders(id);
     }
 
-    /// Whether the Kitty store holds `image` for image `id` — as its image, a
-    /// frame or a re-laid-out variant — so that `MAX_KITTY_STORE_BYTES` already
-    /// bounds its bytes.
+    /// Whether the Kitty store holds `image` for image `id` (as its image, a frame or a
+    /// variant), so `MAX_KITTY_STORE_BYTES` already bounds it.
     pub(in crate::terminal) fn kitty_store_holds(&self, id: u32, image: &Arc<ImageData>) -> bool {
         let t = &*self.transient;
         t.kitty_images
@@ -1002,8 +823,7 @@ impl TerminalHandler<'_> {
                 .is_some_and(|variants| variants.iter().any(|v| Arc::ptr_eq(&v.image, image)))
     }
 
-    /// Every image the Kitty store holds, by address: images, frames and
-    /// variants, each bounded by `MAX_KITTY_STORE_BYTES`.
+    /// Every image the Kitty store holds (images, frames, variants), by address.
     pub(in crate::terminal) fn kitty_store_images(&self) -> HashSet<*const ImageData> {
         let t = &*self.transient;
         t.kitty_images
@@ -1023,9 +843,8 @@ impl TerminalHandler<'_> {
             .collect()
     }
 
-    /// The image a put displays: the stored image itself when the put's layout
-    /// (footprint, z-index, scaling, source rectangle) is the stored one's, else
-    /// a re-laid-out variant of it ([`kitty_variant`](Self::kitty_variant)).
+    /// The image a put displays: the stored one when the put's layout is its layout, else a
+    /// re-laid-out variant ([`kitty_variant`](Self::kitty_variant)).
     fn kitty_placement_image(
         &mut self,
         id: u32,
@@ -1039,18 +858,13 @@ impl TerminalHandler<'_> {
         self.kitty_variant(id, stored, layout)
     }
 
-    /// `stored` (image `id`, or one of its frames) laid out as `layout`: itself
-    /// when that is its layout, else a re-laid-out variant — a footprint is part
-    /// of the payload the renderer decodes, so a different one is a different
-    /// `ImageData`.
-    ///
-    /// A variant copies the image's bytes, so it is charged to the global budget
-    /// and capped per id (`MAX_KITTY_VARIANTS`). One no placement shows is a
-    /// cache entry, reused while it lasts and given up first for room
-    /// ([`reclaim_kitty_variants`](Self::reclaim_kitty_variants)), so a client
-    /// that re-crops on every scroll (image viewers do) and an animation shown
-    /// laid out anew recycle rather than exhaust them. Over either bound with
-    /// every copy shown, it fails closed with `ENOSPC`.
+    /// `stored` (image `id`, or one of its frames) laid out as `layout`: itself when that is its
+    /// layout, else a re-laid-out copy (the footprint is part of the payload the renderer
+    /// decodes). A copy is charged to the budget and capped per id (`MAX_KITTY_VARIANTS`); one
+    /// no placement shows is a cache entry, reused and reclaimed first
+    /// ([`reclaim_kitty_variants`](Self::reclaim_kitty_variants)), so viewers that re-crop on
+    /// every scroll recycle rather than exhaust them. Over a bound with every copy shown, the
+    /// put fails closed with `ENOSPC`.
     fn kitty_variant(
         &mut self,
         id: u32,
@@ -1099,9 +913,8 @@ impl TerminalHandler<'_> {
         Ok(variant)
     }
 
-    /// Every image a Kitty placement shows now — on screen, virtual or
-    /// floating — by address: what makes a re-laid-out copy more than a cache
-    /// entry.
+    /// Every image a Kitty placement shows now (on screen, virtual or floating), by address:
+    /// a re-laid-out copy one of them shows is more than a cache entry.
     fn kitty_images_shown(&self) -> HashSet<*const ImageData> {
         let t = &*self.transient;
         self.kitty_layers()
@@ -1116,10 +929,8 @@ impl TerminalHandler<'_> {
             .collect()
     }
 
-    /// Drop the re-laid-out copies no placement shows — image `only`'s, every
-    /// image's for `None` — oldest first, until `enough` holds, and return
-    /// whether it does: they are a cache for reuse, and the first thing the
-    /// store gives up for room.
+    /// Drop the re-laid-out copies no placement shows (image `only`'s, or every image's),
+    /// oldest first, until `enough` holds; returns whether it does.
     fn reclaim_kitty_variants(
         &mut self,
         only: Option<u32>,
@@ -1182,12 +993,10 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// Stamp a Kitty placement of `image` (image id `id`, `0` for an anonymous
-    /// transmit-and-display) at the cursor, under the command's placement id
-    /// and cursor policy. A non-zero `p=` names one placement of the image, so
-    /// displaying it again moves it — its relative placements with it — and a
-    /// placement put again without `P=` is no longer relative; an unnamed one
-    /// put exactly over another replaces it
+    /// Stamp a Kitty placement of `image` (image `id`, `0` for an anonymous `a=T`) at the
+    /// cursor, under the command's placement id and cursor policy. A non-zero `p=` names one
+    /// placement, so displaying it again moves it (relatives with it) and, without `P=`, makes
+    /// it no longer relative; an unnamed one put exactly over another replaces it
     /// ([`replace_covered_kitty`](Self::replace_covered_kitty)).
     fn place_kitty(&mut self, image: &Arc<ImageData>, id: u32, cmd: &KittyCommand) {
         let placement_id = cmd.placement.unwrap_or(0);
@@ -1206,14 +1015,11 @@ impl TerminalHandler<'_> {
         self.replace_covered_kitty(tag);
     }
 
-    /// An unnamed placement just stamped (`tag`) replaces every older unnamed
-    /// placement of the same image it covers exactly — the same top-left cell
-    /// and [`kitty_same_spot`] — as a redraw in place: an anonymous `a=T`
-    /// each frame (every anonymous image counting as one), or a put that
-    /// re-crops. Kitty keeps the older one under it, which shows only where
-    /// the new one is translucent; here each would hold a laid-out copy of the
-    /// image and a layer in every cell it covers. The older one's relatives
-    /// follow the new one.
+    /// An unnamed placement just stamped (`tag`) replaces every older unnamed placement of the
+    /// same image it covers exactly (same top-left cell and [`kitty_same_spot`]), as a redraw
+    /// in place: an anonymous `a=T` each frame, or a put that re-crops. Kitty keeps the older
+    /// one underneath; here each would hold a laid-out copy and a layer per cell. The older
+    /// one's relatives follow the new one.
     fn replace_covered_kitty(&mut self, tag: KittyPlacementTag) {
         if tag.placement_id != 0 {
             return;
@@ -1256,11 +1062,9 @@ impl TerminalHandler<'_> {
         self.prune_kitty_relations();
     }
 
-    /// Take placement `placement_id` of image `id` off the screen (or out of
-    /// the floating placements) to put it again, without deleting its
-    /// relative placements (they follow it), and forget whether it was
-    /// relative. Returns whether it was stamped on screen; `placement_id == 0`
-    /// names no single placement, so nothing moves.
+    /// Take placement `placement_id` of image `id` off the screen (or the floating list) to
+    /// put it again, keeping its relatives, and forget whether it was relative. Returns
+    /// whether it was on screen; `0` names no single placement, so nothing moves.
     fn lift_kitty_placement(&mut self, id: u32, placement_id: u32) -> bool {
         if placement_id == 0 {
             return false;
@@ -1282,15 +1086,11 @@ impl TerminalHandler<'_> {
             .is_empty()
     }
 
-    /// `P=`/`Q=`: stamp `image` (image `id`) relative to a parent placement —
-    /// the newest placement of image `parent_image` on screen, the one with
-    /// placement id `Q=` when given — `H=` columns and `V=` rows from the
-    /// parent's top-left cell, keeping the cells on screen. The cursor never
-    /// moves: the position is the parent's, not the cursor's. A parent not on
-    /// screen may be a virtual placement, or relative to one: the placement
-    /// then floats ([`place_kitty_floating`](Self::place_kitty_floating)).
-    /// Refused as kitty refuses it: `ECYCLE` when the placement would be its
-    /// own ancestor, `ETOODEEP` past `MAX_KITTY_RELATIVE_DEPTH` parents.
+    /// `P=`/`Q=`: stamp `image` (image `id`) `H=` columns and `V=` rows from the top-left of a
+    /// parent placement (the newest of image `parent_image` on screen, or placement `Q=`). The
+    /// cursor never moves. A parent not on screen may be virtual, or relative to one: the
+    /// placement then floats ([`place_kitty_floating`](Self::place_kitty_floating)). Refused
+    /// as kitty refuses it: `ECYCLE`, or `ETOODEEP` past `MAX_KITTY_RELATIVE_DEPTH` parents.
     fn place_kitty_relative(
         &mut self,
         image: &Arc<ImageData>,
@@ -1327,17 +1127,12 @@ impl TerminalHandler<'_> {
         Ok(())
     }
 
-    /// `P=`/`Q=` naming a virtual placement, or a placement relative to one:
-    /// keep the placement beside the grid ([`kitty_floating`]), placed each
-    /// frame `H=`/`V=` cells from where its parent shows — for a virtual
-    /// parent, the top row and leftmost column of its placeholders on screen
-    /// — and deleted with it. The cursor never moves. Refused as kitty
-    /// refuses it: `ENOPARENT` when image `parent_image` has no such placement,
-    /// `ECYCLE` when the placement would be its own ancestor, `ETOODEEP` past
-    /// `MAX_KITTY_RELATIVE_DEPTH` parents; and `ENOSPC` past
-    /// `MAX_KITTY_FLOATING` of them. An unnamed one put again with the same
-    /// parent, offset and [`kitty_same_spot`] layout replaces the older, as a
-    /// redraw does on screen ([`replace_covered_kitty`](Self::replace_covered_kitty)).
+    /// `P=`/`Q=` naming a virtual placement, or a placement relative to one: keep it beside the
+    /// grid ([`kitty_floating`]), placed each frame `H=`/`V=` cells from where its parent
+    /// shows (for a virtual parent, the top-left of its placeholders) and deleted with it. The
+    /// cursor never moves. Refused as kitty refuses it (`ENOPARENT`, `ECYCLE`, `ETOODEEP` past
+    /// `MAX_KITTY_RELATIVE_DEPTH`), and `ENOSPC` past `MAX_KITTY_FLOATING`. An unnamed one put
+    /// again with the same parent, offset and [`kitty_same_spot`] layout replaces the older.
     fn place_kitty_floating(
         &mut self,
         image: &Arc<ImageData>,
@@ -1446,10 +1241,8 @@ impl TerminalHandler<'_> {
         Ok(())
     }
 
-    /// Delete the floating placements whose parent is gone — theirs with them
-    /// — and the data of each image that thereby has no placement left: a
-    /// relative placement lives as long as its parent, and its image as long
-    /// as its placements.
+    /// Delete the floating placements whose parent is gone (and theirs), and the data of each
+    /// image left with no placement.
     fn prune_kitty_floating(&mut self) {
         for _ in 0..=MAX_KITTY_IMAGES {
             let mut orphans: Vec<u32> = Vec::new();
@@ -1491,10 +1284,9 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// Refuse a relative placement of `(id, placement_id)` under `parent` that
-    /// would be its own ancestor (`ECYCLE`: only a placement with an id can be
-    /// put again, so only such a one can close a cycle) or sit under more than
-    /// `MAX_KITTY_RELATIVE_DEPTH` parents (`ETOODEEP`).
+    /// Refuse a relative placement of `(id, placement_id)` under `parent` that would be its
+    /// own ancestor (`ECYCLE`; only a named placement can close a cycle) or sit under more
+    /// than `MAX_KITTY_RELATIVE_DEPTH` parents (`ETOODEEP`).
     fn check_kitty_ancestry(
         &self,
         parent: KittyPlacementTag,
@@ -1663,12 +1455,9 @@ impl TerminalHandler<'_> {
             .retain(|r| on_screen.contains(&r.child.serial));
     }
 
-    /// Record a virtual placement (`U=1`) of image `id`: `image` (the stored
-    /// image, or a variant laid out for the put) is what a Unicode placeholder
-    /// naming it draws. A placement id names one virtual placement, so putting
-    /// it again replaces it; unnamed ones accumulate, newest last, up to
-    /// `MAX_KITTY_VIRTUALS` per image. An image the store does not hold gets
-    /// none: no placeholder could draw it.
+    /// Record a virtual placement (`U=1`) of image `id`, drawn by Unicode placeholders naming
+    /// it. A placement id names one, so putting it again replaces it; unnamed ones accumulate
+    /// up to `MAX_KITTY_VIRTUALS`. An image not stored gets none.
     fn add_kitty_virtual(&mut self, id: u32, placement_id: u32, image: &Arc<ImageData>) {
         if !self.transient.kitty_images.contains_key(&id) {
             return;
@@ -1725,18 +1514,12 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// Clear every visible Kitty placement whose tag `selected` accepts,
-    /// damaging each cleared cell so the repaint erases it, and return the tags
-    /// of the placements it cleared — nothing else: their relative placements
-    /// stay ([`delete_kitty_where`](Self::delete_kitty_where) takes them too).
-    ///
-    /// Placements are image layers stacked into cell extras, each carrying its
-    /// placement's [`KittyPlacementTag`]; an image another protocol drew
-    /// carries none and is never touched, nor is any other layer of a cell.
-    /// `cell_extra_mut` is touched only for cells that actually match, so a
-    /// sweep over a grid with no images allocates nothing. Rows already
-    /// scrolled into scrollback keep their pixels — kitty deletion addresses
-    /// the screen, and scrolled-away placements age out with their rows.
+    /// Clear every visible Kitty placement whose tag `selected` accepts, damaging each cleared
+    /// cell, and return the cleared tags. Relative placements stay
+    /// ([`delete_kitty_where`](Self::delete_kitty_where) takes them too). Only layers carrying
+    /// a [`KittyPlacementTag`] are touched, and only matching cells are mutated, so a sweep
+    /// over an imageless grid allocates nothing. Rows already in scrollback keep their pixels:
+    /// kitty deletion addresses the screen.
     fn clear_kitty_placements(
         &mut self,
         selected: &dyn Fn(&KittyPlacementTag, &ImageData) -> bool,
@@ -1897,25 +1680,18 @@ impl TerminalHandler<'_> {
             .any(|f| f.tag.image_id == id)
     }
 
-    /// `a=d`: delete the placements the `d=` selector addresses. Kitty
-    /// semantics, on aterm's placement model:
+    /// `a=d`: delete the placements the `d=` selector addresses, with kitty's semantics:
     ///
-    ///   * a lowercase selector deletes placements and keeps the transmitted
-    ///     data (the id stays placeable) — preview cyclers (yazi, icat) lean on
-    ///     that; uppercase also frees the data of every image the command named
-    ///     or cleared that has no placement left (`A`: of every image with no
-    ///     virtual placement);
-    ///   * a selector addresses specific placements — never license to clear
-    ///     the whole store — and only KITTY placements: an iTerm2 or sixel
-    ///     image is not a Kitty delete's to erase;
-    ///   * only the id-addressed selectors (`i`, `n`, `r`) reach virtual
-    ///     placements, which have no place on screen for the others to hit;
+    ///   * lowercase keeps the data (the id stays placeable; preview cyclers such as yazi
+    ///     rely on it); uppercase also frees the data of each image named or cleared that
+    ///     has no placement left (`A`: every image with no virtual placement);
+    ///   * only Kitty placements are hit, never an iTerm2 or sixel image;
+    ///   * only the id selectors (`i`, `n`, `r`) reach virtual placements;
     ///   * a relative placement goes with its parent.
     ///
-    /// `x=`/`y=` are 1-based cell coordinates (for `r`, the id range); `z=`
-    /// defaults to 0. `f`/`F` delete one animation frame
-    /// ([`delete_kitty_frame`](Self::delete_kitty_frame)); an unknown selector
-    /// deletes nothing: recoverable, and never destructive.
+    /// `x=`/`y=` are 1-based cells (for `r`, the id range); `z=` defaults to 0. `f`/`F` delete
+    /// one frame ([`delete_kitty_frame`](Self::delete_kitty_frame)); an unknown selector
+    /// deletes nothing.
     fn delete_kitty_placements(&mut self, cmd: &KittyCommand) {
         let selector = cmd.delete_target.unwrap_or('a');
         let free_data = selector.is_ascii_uppercase();
@@ -1925,7 +1701,7 @@ impl TerminalHandler<'_> {
                 .and_then(|v| u16::try_from(v).ok())
         };
         let everything = 0..u16::MAX;
-        // Ids the command NAMES: their data goes under an uppercase selector
+        // Ids the command names: their data goes under an uppercase selector
         // even when none of their placements was on screen.
         let mut named: Vec<u32> = Vec::new();
         let cleared = match selector.to_ascii_lowercase() {
@@ -2031,13 +1807,10 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// `d=f` / `d=F`: delete frame `r=` of the image `i=`/`I=` names, as kitty
-    /// does — `r=` is 1-based, absent or 0 is frame 1, past the end is the last
-    /// frame — and the frames after it move up a number, gaps and all. The
-    /// current frame stays the frame it was when that frame survives, else it
-    /// is the frame now at its number, or the last; every placement of the
-    /// image shows it. An image with a single frame keeps it under `f`; under
-    /// `F` the image itself is deleted, placements and data.
+    /// `d=f`/`d=F`: delete frame `r=` (1-based; absent or 0 is frame 1, past the end the last)
+    /// of the image `i=`/`I=` names; later frames move up a number. The current frame stays
+    /// if it survives, else it is the frame now at its number, or the last. A lone frame
+    /// survives `f`; under `F` the image itself is deleted.
     fn delete_kitty_frame(&mut self, cmd: &KittyCommand, image_too: bool) {
         let Some(id) = self.resolve_kitty_id(cmd) else {
             return;
@@ -2073,15 +1846,10 @@ impl TerminalHandler<'_> {
         self.set_kitty_current_frame(id, current, now);
     }
 
-    /// `a=a`: animation control, in kitty's order — `r=` with `z=` sets frame
-    /// `r`'s gap (a negative gap makes it gapless); `c=` makes frame `c` the
-    /// current one, shown by every placement of the image; `s=` stops it (1),
-    /// runs it waiting for more frames at the last (2), or runs it looping
-    /// (3), and restarts its loop count; `v=` sets how many times it plays
-    /// (`1` forever, `n` n−1 times). Playback steps frames on their gaps
-    /// ([`advance_kitty_animations`](Self::advance_kitty_animations)).
-    /// Answered only with `ENOENT` for an image the store does not hold, as in
-    /// kitty.
+    /// `a=a`, in kitty's order: `r=` with `z=` sets frame `r`'s gap (negative: gapless); `c=`
+    /// makes frame `c` current everywhere; `s=` stops (1), runs waiting at the last frame (2)
+    /// or loops (3), restarting the loop count; `v=` sets the plays (`1` forever, `n` n−1
+    /// times). Answered only with `ENOENT` for an image not stored, as in kitty.
     fn control_kitty_animation(&mut self, cmd: &KittyCommand) {
         let id = self.resolve_kitty_id(cmd);
         let now = self.transient.process_now;
@@ -2140,15 +1908,11 @@ impl TerminalHandler<'_> {
         )
     }
 
-    /// Play every running Kitty animation shown on screen up to `now`, as
-    /// kitty's `scan_active_animations` does: a frame whose gap has run out
-    /// gives way to the next frame with a gap (gapless ones are stepped over),
-    /// the last to the first while loops remain — or, loading, the last stays
-    /// up until more frames come. Each new frame shows everywhere the image
-    /// shows ([`set_kitty_current_frame`](Self::set_kitty_current_frame)).
-    /// Returns whether a frame changed, and when the next one is due: `None`
-    /// when nothing plays on screen, so a still or idle terminal schedules
-    /// nothing.
+    /// Play every running Kitty animation shown on screen up to `now`, as kitty's
+    /// `scan_active_animations` does: an expired frame gives way to the next one with a gap,
+    /// the last to the first while loops remain (or, loading, the last stays up). Returns
+    /// whether a frame changed and when the next is due; `None` when nothing plays on screen,
+    /// so an idle terminal schedules nothing.
     pub(in crate::terminal) fn advance_kitty_animations(
         &mut self,
         now: aterm_time::Instant,
@@ -2362,11 +2126,9 @@ impl TerminalHandler<'_> {
         Some(image)
     }
 
-    /// `a=f`: load frame data into the image `i=`/`I=` names — a new frame, or
-    /// frame `r=` (1-based) edited when it exists — and answer as kitty does,
-    /// naming the frame (`r=`). See [`build_kitty_frame`](Self::build_kitty_frame)
-    /// for how the frame is made. Editing the current frame shows the edit
-    /// everywhere the image shows.
+    /// `a=f`: load a new frame, or edit frame `r=` (1-based) when it exists, into the image
+    /// `i=`/`I=` names, and answer naming the frame. An edit of the current frame shows
+    /// everywhere.
     fn load_kitty_frame(&mut self, mut cmd: KittyCommand) {
         let Some(id) = self.resolve_kitty_id(&cmd) else {
             self.kitty_reply(&cmd, None, "ENOENT:no such image");
@@ -2399,14 +2161,11 @@ impl TerminalHandler<'_> {
         self.kitty_reply_naming(&cmd, Some(id), Some(number), verdict);
     }
 
-    /// Make an `a=f` frame of image `id`: its data (`s=`×`v=` raw pixels, or a
-    /// PNG) placed at `x=`/`y=` on a canvas the root frame's size — the frame
-    /// being edited (`edit`), else frame `c=` when given, else the background
-    /// colour `Y=` (RGBA, default transparent black) — alpha-blended unless
-    /// `X=1` overwrites. The frame keeps the root frame's layout. Data that is
-    /// the whole canvas on a transparent background needs no canvas at all,
-    /// so it is kept as sent; anything else is composed into raw pixels, a PNG
-    /// on either side decoded first ([`kitty_rgba`]).
+    /// Make an `a=f` frame of image `id`: its data (`s=`×`v=` raw pixels, or a PNG) placed at
+    /// `x=`/`y=` on a root-sized canvas (the frame being edited, else frame `c=`, else colour
+    /// `Y=`, default transparent), alpha-blended unless `X=1`. It keeps the root's layout.
+    /// Data that is the whole canvas on a transparent background is kept as sent; anything
+    /// else is composed into raw pixels ([`kitty_rgba`]).
     fn build_kitty_frame(
         &self,
         id: u32,
@@ -2500,12 +2259,10 @@ impl TerminalHandler<'_> {
         Ok(raw_frame(canvas, width, height, root))
     }
 
-    /// Store `frame` as image `id`'s frame `edit` (0-based), or as a new last
-    /// frame, charged to the budget and capped by `MAX_KITTY_FRAMES`, with the
-    /// gap `z=` gave it (`gap`: kitty's 40 ms for a new frame without one, a
-    /// negative one gapless; an edit without one keeps its gap). An edit of
-    /// the current frame is shown everywhere the image shows. Returns the
-    /// verdict to answer with.
+    /// Store `frame` as image `id`'s frame `edit` (0-based) or a new last frame, charged to the
+    /// budget and capped by `MAX_KITTY_FRAMES`, with gap `gap` (`z=`: absent is kitty's 40 ms
+    /// for a new frame and unchanged for an edit; negative is gapless). An edit of the current
+    /// frame shows everywhere the image shows. Returns the verdict to answer with.
     fn commit_kitty_frame(
         &mut self,
         id: u32,
@@ -2523,9 +2280,7 @@ impl TerminalHandler<'_> {
         };
         let gap_ms = |gap: i32| u32::try_from(gap).unwrap_or(0);
         let Some(index) = edit else {
-            // Per-id frame-count cap and the global byte budget (fail-closed):
-            // a frame that would push the store over MAX_KITTY_STORE_BYTES is
-            // refused so the caps can't multiply into a resident OOM.
+            // Fail closed at the per-id frame cap or the store budget.
             if animation.frames.len() >= MAX_KITTY_FRAMES
                 || total.saturating_add(add) > MAX_KITTY_STORE_BYTES
             {
@@ -2644,27 +2399,16 @@ impl TerminalHandler<'_> {
         Ok((dst_index, raw_frame(canvas, width, height, dst)))
     }
 
-    /// The layout (footprint, z-index, scaling, source rectangle, in-cell
-    /// offset) a transmit or put asks for, for a raster of `px_w × px_h`
-    /// pixels, or `None` when its source rectangle (`x=`/`y=`/`w=`/`h=`)
-    /// misses the raster.
+    /// The layout a transmit or put asks for, for a `px_w × px_h` raster, or `None` when its
+    /// source rectangle (`x=`/`y=`/`w=`/`h=`) misses the raster.
     ///
-    /// `X=`/`Y=` start a put's image that many pixels into its first cell,
-    /// each held below a cell as kitty holds it, and the footprint grows to
-    /// keep the image whole, by kitty's own arithmetic (its
-    /// `update_dest_rect`). A transmit or a virtual placement takes no offset:
-    /// neither is shown in cells of its own.
-    ///
-    /// Natural size vs a requested cell box: `c=`/`r=` are the client asking
-    /// for the image scaled over that many cells, so the renderer fits it to the
-    /// footprint; with only one of them the other follows from the (cropped)
-    /// raster's aspect, as kitty computes it. With neither given the footprint
-    /// is merely the (cropped) raster's pixel size rounded up to whole cells,
-    /// and scaling back out to it would magnify by up to a cell — the same
-    /// rounding noise the sixel path is `PixelExact` to avoid. Kitty's own
-    /// reference terminal draws an un-sized transmission one image pixel to one
-    /// device pixel. The footprint is clamped to the grid so a huge image can't
-    /// request an enormous cell span.
+    /// `X=`/`Y=` start a put's image that many pixels into its first cell (held below a cell),
+    /// and the footprint grows to keep the image whole, by kitty's `update_dest_rect`
+    /// arithmetic; a transmit or virtual placement takes no offset. `c=`/`r=` ask for the image
+    /// fitted over that many cells, one alone taking the other from the aspect. With neither,
+    /// the image is `PixelExact` (one image pixel per device pixel, as kitty draws it): fitting
+    /// it to the rounded-up footprint would magnify by up to a cell. The footprint is clamped
+    /// to the grid.
     fn kitty_layout(&self, cmd: &KittyCommand, px_w: u32, px_h: u32) -> Option<KittyLayout> {
         let cropped = cmd.x.is_some()
             || cmd.y.is_some()
@@ -2677,7 +2421,7 @@ impl TerminalHandler<'_> {
             height: cmd.crop_height.unwrap_or(0),
         }
         .clamp_to(px_w, px_h)?;
-        // A rectangle that IS the whole raster is no crop at all, so a put that
+        // A rectangle that is the whole raster is no crop at all, so a put that
         // spells it out still reuses the stored image.
         let source_rect = (cropped && (vis_w, vis_h) != (px_w, px_h)).then_some(SourceRect {
             x,
@@ -2717,9 +2461,8 @@ impl TerminalHandler<'_> {
                 .div_ceil(u64::from(from_px) * u64::from(to_cell));
             u32::try_from(span).unwrap_or(u32::MAX)
         };
-        // Every length here is a client's `u32` (`c=`/`r=`, or a PNG header's
-        // size) plus an offset below a cell, so the sums saturate: the footprint
-        // is clamped to the grid below in any case.
+        // Client lengths (`c=`/`r=`, a PNG header's size) plus an offset can overflow, so the
+        // sums saturate; the footprint is clamped to the grid below.
         let (fit_cols, fit_rows) = match (cols, rows) {
             (Some(c), Some(r)) => (c, r),
             (Some(c), None) => (
@@ -2754,7 +2497,7 @@ impl TerminalHandler<'_> {
                 .unwrap_or(u16::MAX)
                 .min(self.grid.rows())
                 .max(1),
-            // Kitty z=: negative draws behind text. iTerm2/Sixel + z=0 default to 0.
+            // Kitty z=: negative draws behind text.
             z_index: cmd.z_index.unwrap_or(0),
             scaling: if cols.is_none() && rows.is_none() {
                 ImageScaling::PixelExact
@@ -2766,45 +2509,30 @@ impl TerminalHandler<'_> {
         })
     }
 
-    /// Build an [`ImageData`] from a complete (chunk-assembled) Kitty transmit
-    /// or frame command, or `None` if it declares a size kitty does not load
-    /// ([`KittyCommand::declares_loadable_size`], asked before any data is
-    /// read, whatever the format, as kitty asks it), the payload is
-    /// missing/oversized or the dimensions are invalid. PNG keeps its bytes
-    /// (the renderer decodes); raw `f=32`/`f=24` become `RawRgba8` (RGB
-    /// expands to opaque RGBA). The layout is the command's
-    /// ([`kitty_layout`](Self::kitty_layout)); the flag is `false` when its
-    /// source rectangle missed the raster, in which case the image is laid out
-    /// whole — the data is still good to store, only that display is not.
+    /// Build an [`ImageData`] from a complete Kitty transmit or frame command, or `None` if it
+    /// declares a size kitty does not load ([`KittyCommand::declares_loadable_size`]), or the
+    /// payload or dimensions are bad. PNG keeps its bytes; raw `f=32`/`f=24` become `RawRgba8`.
+    /// The flag is `false` when the source rectangle missed the raster: the image is then laid
+    /// out whole, still good to store but not to display.
     ///
-    /// `&mut cmd` so the direct-uncompressed payload (the common `kitten icat`
-    /// case, up to 4 MiB) moves into the image instead of being memcpy'd; the
-    /// caller must not read `cmd.payload` afterwards. All other fields are
-    /// left untouched.
+    /// Takes `&mut cmd` so a direct uncompressed payload moves into the image without a copy;
+    /// the caller must not read `cmd.payload` afterwards.
     fn build_kitty_image(&self, cmd: &mut KittyCommand) -> Option<(ImageData, bool)> {
         use crate::terminal::kitty_graphics::{KittyFormat, png_dimensions, rgb_to_rgba};
-        // The sizes kitty loads, the same rule that decides whether a first
-        // chunk opens a load (`kitty_would_hold`): asked before a file is
-        // resolved or a stream inflated.
+        // The same size rule that decides whether a first chunk opens a load
+        // (`kitty_would_hold`), asked before a file is resolved or a stream inflated.
         if cmd.payload.is_empty() || !cmd.declares_loadable_size() {
             return None;
         }
-        // The transmitted bytes: for `t=d` (direct) the payload is the data; for the
-        // non-direct mediums (`t=f` file / `t=t` temp-file / `t=s` shared memory) the
-        // payload is a PATH/name, and the host RESOLVER does the I/O + security policy
-        // and hands back the bytes. No resolver (the default) or a rejection ⇒ skip
-        // cleanly (fail-closed) — the engine never reads files/shm itself. The host is
-        // responsible for bounding what it reads to MAX_KITTY_IMAGE_BYTES.
-        //
-        // o=z (RFC 1950 zlib): the transmitted bytes (direct payload or resolved file
-        // contents) may be compressed — inflate first, bounded so a decompression bomb
-        // is rejected (fail closed).
+        // `t=d` carries the data. The other mediums (`t=f`/`t=t`/`t=s`) carry a name the host
+        // resolver reads under its own policy; with no resolver, or a refusal, nothing loads:
+        // the engine never reads files or shared memory itself. `o=z` data is inflated with a
+        // bound, so a decompression bomb is refused.
         let payload: Vec<u8> = if cmd.medium == KittyMedium::Direct {
             if cmd.compressed {
                 aterm_codec::inflate::zlib_decompress(&cmd.payload, MAX_KITTY_IMAGE_BYTES).ok()?
             } else {
-                // Zero-copy: the (chunk-assembled) payload moves straight into
-                // the image bytes. The emptiness guard above already ran.
+                // Zero-copy: the assembled payload moves into the image.
                 std::mem::take(&mut cmd.payload)
             }
         } else {
@@ -3057,17 +2785,13 @@ const MAX_KITTY_VARIANTS: usize = 16;
 const MAX_KITTY_VIRTUALS: usize = 8;
 /// Maximum decoded bytes for a single Kitty image (matches the APC payload cap).
 const MAX_KITTY_IMAGE_BYTES: usize = 4 * 1024 * 1024;
-/// Global byte budget for the whole Kitty image store (images + animation
-/// frames). Without it the per-item caps (`MAX_KITTY_IMAGES` ×
-/// `MAX_KITTY_FRAMES` × `MAX_KITTY_IMAGE_BYTES`) multiply to ~128 GiB, an OOM
-/// from untrusted PTY output. Mirrors the DCS global budget and inline-image
-/// cap.
+/// Byte budget for the whole Kitty store (images, frames, variants). Without it the per-item
+/// caps multiply to ~128 GiB of memory from untrusted PTY output.
 const MAX_KITTY_STORE_BYTES: usize = 64 * 1024 * 1024;
 
 /// CSI dispatch fast paths for `ActionSink::csi_dispatch`.
 impl TerminalHandler<'_> {
-    /// Fast-path CSI dispatch for sequences without intermediates: SGR and
-    /// the hottest cursor moves inline, the rest via
+    /// CSI without intermediates: SGR and the hottest cursor moves inline, the rest via
     /// `csi_dispatch_standard_core`.
     #[inline]
     fn csi_dispatch_no_intermediates(
@@ -3078,7 +2802,6 @@ impl TerminalHandler<'_> {
     ) {
         match final_byte {
             b'm' => self.csi_dispatch_sgr_fast(params),
-            // The hottest cursor moves, inline.
             b'A' => {
                 let n = params.first().copied().unwrap_or(1).max(1);
                 self.grid.cursor_up(n);
@@ -3129,13 +2852,12 @@ impl TerminalHandler<'_> {
         reason = "SGR dispatch table with many attribute codes"
     )]
     fn csi_dispatch_sgr_fast(&mut self, params: &[u16]) {
-        // SGR 0 and bare CSI m reset via reset_sgr(), which preserves the
-        // DECSCA protection attribute, and also clear the underline color.
+        // SGR 0 / bare CSI m: `reset_sgr` keeps the DECSCA protection attribute; the
+        // underline colour is cleared too.
         if params.is_empty() || (params.len() == 1 && params[0] == 0) {
             self.style.reset_sgr();
             self.transient.current_underline_color = None;
             self.transient.update_has_transient_extras();
-            // Reset the BCE cursor template when SGR is fully default.
             self.grid
                 .set_cursor_template(crate::grid::Cell::EMPTY, None);
             return;
@@ -3148,10 +2870,8 @@ impl TerminalHandler<'_> {
                     let index =
                         crate::terminal::sgr_color_u8(if p >= 90 { p - 90 + 8 } else { p - 30 });
                     self.style.fg = PackedColor::indexed(index);
-                    // Refresh the colour cache unconditionally (this also keeps
-                    // `cached_has_style_extras` in step after an RGB→indexed
-                    // change); no production reader consumes a `StyleId` (see
-                    // `SgrStyleHandler::apply_style_change`).
+                    // Refresh unconditionally: it also keeps `has_style_extras()` in step
+                    // after an RGB→indexed change.
                     self.style.update_cached_colors();
                     return;
                 }
@@ -3184,7 +2904,7 @@ impl TerminalHandler<'_> {
 
     #[inline(never)]
     fn csi_dispatch_sgr_extended(&mut self, params: &[u16]) {
-        // 5-param truecolor fg/bg — bat, delta, vim truecolor output
+        // 5-param truecolor fg/bg.
         if params.len() == 5 && params[1] == 2 {
             let rgb = PackedColor::rgb(
                 params[2].min(255) as u8,
@@ -3223,12 +2943,9 @@ impl TerminalHandler<'_> {
     }
 }
 
-/// True iff `data` contains a run of >= 4 identical bytes, the only content
-/// `write_ascii_bulk_fast`'s run-detection scan can turn into a
-/// `write_cell_run` splat; without one the caller can blast the whole run.
-///
-/// A branch-free windowed fold so LLVM auto-vectorizes it to NEON/SSE byte
-/// compares without `std::arch` (cf. `aterm-parser::simd`).
+/// True iff `data` holds a run of >= 4 identical bytes, the only content the run scan in
+/// `write_ascii_bulk_fast` can splat. A branch-free windowed fold, so LLVM vectorizes it
+/// without `std::arch` and it stays inside the Trust gate.
 #[inline]
 #[allow(
     clippy::needless_bitwise_bool,
@@ -3244,15 +2961,9 @@ fn has_run_of_4(data: &[u8]) -> bool {
 
 /// Bulk ASCII write helpers for `print_ascii_bulk`.
 impl TerminalHandler<'_> {
-    /// Fast-path bulk ASCII writer for data that passed all precondition checks.
-    ///
-    /// Selects between three strategies:
-    /// - **Cell-run path**: same byte repeated N times uses `write_cell_run`
-    ///   (memset-like fill, avoids per-cell branch overhead)
-    /// - **Blast path**: default style (no colors, no flags) uses `write_ascii_blast`
-    /// - **Styled path**: non-default style uses `write_ascii_run_styled`
-    ///
-    /// All paths update `last_graphic_char` for the REP (repeat) sequence.
+    /// Bulk ASCII writer for data that passed every precondition: runs of 4+ identical bytes
+    /// splat via `write_cell_run`, the rest is blasted (default style) or written styled
+    /// (`write_ascii_run_styled_packed`). Records `last_graphic_char` for REP.
     fn write_ascii_bulk_fast(&mut self, data: &[u8]) {
         let flags = if self.style.protected {
             self.style.flags.union(CellFlags::PROTECTED)
@@ -3262,11 +2973,8 @@ impl TerminalHandler<'_> {
         let is_default = self.style.is_default();
         let colors = self.style.cached_colors();
 
-        // Most output is short fragments or prose with no 4+ identical runs,
-        // where the scan below would find nothing to splat: blast those
-        // directly. Byte-identical either way; a false "run-free" only
-        // forgoes a splat. `has_run_of_4` stays safe, autovectorizable code
-        // so it remains inside the Trust gate.
+        // Most output is short or has no 4+ identical run: blast it whole. Byte-identical
+        // either way; a false "run-free" only forgoes a splat.
         if data.len() <= 64 || !has_run_of_4(data) {
             self.write_ascii_segment(data, is_default, colors, flags);
             return;
@@ -3304,7 +3012,6 @@ impl TerminalHandler<'_> {
                 continue;
             }
 
-            // Mixed segment: accumulate until we hit a 4+ run.
             let seg_start = pos;
             pos = run_end;
             while pos < data.len() {
@@ -3349,12 +3056,8 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// Bulk ASCII writer for styles that need `CellExtras` overflow.
-    ///
-    /// Handles RGB colors, hyperlinks, underline colors, and extended flags
-    /// in bulk instead of falling back to per-character processing. Writes
-    /// cells via `write_ascii_run_with_extras` (bulk cells, then batched
-    /// extras).
+    /// Bulk ASCII writer for styles that need `CellExtras` (RGB, hyperlinks, underline colour,
+    /// extended flags), via `write_ascii_run_with_extras` instead of per-character writes.
     fn write_ascii_bulk_with_extras(&mut self, data: &[u8]) {
         let colors = self.style.cached_colors();
         let flags = if self.style.protected {
@@ -3719,10 +3422,8 @@ mod kitty_display_tests {
         (term, at)
     }
 
-    /// Kitty's terminal-driven playback: `s=3` runs the animation, each frame
-    /// up for its gap, a gapless frame stepped over, the last giving way to
-    /// the first; the engine reports each step and when the next frame is due,
-    /// and nothing while stopped, so an idle terminal schedules no wake.
+    /// `s=3` plays each frame for its gap, skipping gapless ones and looping; the engine
+    /// reports each step and the next due time, and nothing while stopped.
     #[test]
     fn a_running_animation_steps_its_frames_on_their_gaps() {
         use crate::terminal::KittyAnimationStep;
@@ -3769,10 +3470,8 @@ mod kitty_display_tests {
         assert_eq!(reply(&mut term), "\x1b_Gi=99;ENOENT:no such image\x1b\\");
     }
 
-    /// `v=` bounds the loops (`v=2` plays the animation through once and
-    /// rests on its last frame), a new `s=` restarts the count, and `s=2`
-    /// (loading) waits at the last frame until another frame arrives, which
-    /// then plays.
+    /// `v=` bounds the loops, a new `s=` restarts the count, and `s=2` waits at the last frame
+    /// until another arrives.
     #[test]
     fn loop_counts_and_loading_rest_on_the_last_frame() {
         use crate::terminal::KittyAnimationStep;
@@ -3880,10 +3579,8 @@ mod kitty_display_tests {
         assert_eq!(shown, expected, "every frame, round and round");
     }
 
-    /// `d=f` deletes frame `r=` (1-based; absent is frame 1, past the end the
-    /// last) and the later frames move up a number; the displayed frame stays
-    /// the one it was while it survives, else it is the frame now at its
-    /// number. Each deleted frame returns its bytes to the budget.
+    /// `d=f` deletes frame `r=` as kitty does (see `delete_kitty_frame`) and returns its bytes
+    /// to the budget.
     #[test]
     fn frame_delete_removes_the_numbered_frame_as_kitty_does() {
         const FRAME: usize = 800;
@@ -3939,12 +3636,9 @@ mod kitty_display_tests {
         assert_eq!(term.transient.kitty_total_bytes, 0);
     }
 
-    /// On `a=f` the keys a transmit lays out by are ANIMATION keys: `x=`/`y=`
-    /// place the data on the canvas, `c=` names the frame it is drawn over, `r=`
-    /// the frame edited (a new one here: frame 2 does not exist yet) and `z=`
-    /// the gap. None of them crops, sizes or orders the frame, which takes its
-    /// root frame's layout, so the placeholder that shows it after `a=a` draws
-    /// it where it drew frame 1.
+    /// On `a=f`, `x=`/`y=`/`c=`/`r=`/`z=` are animation keys (canvas position, base frame,
+    /// edited frame, gap), never layout: the frame keeps its root's layout and draws where
+    /// frame 1 did.
     #[test]
     fn animation_frame_keys_place_the_data_and_keep_the_root_layout() {
         let mut term = Terminal::new(24, 80);
@@ -4002,14 +3696,11 @@ mod kitty_display_tests {
 
     #[test]
     fn non_direct_mediums_skip_cleanly_never_garbage() {
-        // t=f (file) / t=t (temp) / t=s (shared mem): the payload is a path, not
-        // pixels. aterm must not read host files/shm off an escape nor decode
-        // the path as an image; it skips cleanly (no placement, no panic).
+        // t=f / t=t / t=s carry a path, not pixels: with no resolver nothing is read or
+        // decoded, and nothing is placed.
         for medium in ["f", "t", "s"] {
             let mut term = Terminal::new(24, 80);
             term.set_cell_pixel_size(10, 20);
-            // A plausible path payload, declared as a 10x20 RGBA image via a non-direct
-            // medium. Without the skip, the path bytes would be mis-decoded.
             let control = format!("a=T,f=32,s=10,v=20,t={medium}");
             term.process(&apc_g(&control, b"/tmp/some/image.png"));
             assert!(
@@ -4051,8 +3742,7 @@ mod kitty_display_tests {
         use crate::terminal::kitty_graphics::KittyMedium;
         let mut term = Terminal::new(24, 80);
         term.set_cell_pixel_size(10, 20);
-        // t=s (shared memory) also routes through the resolver — the engine is medium-
-        // agnostic; the host implements shm_open etc. behind the same seam.
+        // t=s (shared memory) routes through the same resolver.
         term.set_kitty_file_resolver(|medium, name| {
             (medium == KittyMedium::SharedMemory && name == "/aterm-shm")
                 .then(|| vec![0u8; 10 * 20 * 4])
@@ -4109,8 +3799,7 @@ mod kitty_display_tests {
             term.cell_frame(24, 80).images[0].is_empty(),
             "an armed alloc fault must abort the transfer (fail closed), placing nothing"
         );
-        // After disarming, a fresh transfer assembles and places normally — the fault
-        // left no corrupt pending state behind (graceful, recoverable degradation).
+        // After disarming, a fresh transfer assembles and places: no corrupt pending state.
         term.process(&apc_g("a=T,f=32,s=10,v=20,m=1", &full[0..400]));
         term.process(&apc_g("m=1", &full[400..600]));
         term.process(&apc_g("m=0", &full[600..800]));
@@ -4137,10 +3826,8 @@ mod kitty_display_tests {
         );
     }
 
-    /// The probe answers per medium: a `t=f` query with no non-direct resolver
-    /// installed (the default; `allow_kitty_file_transfer` is opt-in) errors so
-    /// the prober falls back to direct. Installing the resolver flips it to OK;
-    /// direct stays OK throughout.
+    /// The probe answers per medium: `t=f` errors until the opt-in resolver is installed
+    /// (so the prober falls back to direct); direct is always OK.
     #[test]
     fn query_answers_per_medium_availability() {
         let mut term = Terminal::new(24, 80);
@@ -4216,10 +3903,8 @@ mod kitty_display_tests {
         );
     }
 
-    /// The bulk `apc_put_bulk` override (the parser's APC fast path) must
-    /// accumulate the same `dcs.data` and budget counters as per-byte
-    /// `apc_put`, even when one run straddles both the 4 MiB per-sequence cap
-    /// and the 10 MiB global DCS budget.
+    /// `apc_put_bulk` (the parser's APC fast path) accumulates the same `dcs.data` and budget
+    /// counters as per-byte `apc_put`, across the per-sequence cap and the global DCS budget.
     #[test]
     fn apc_put_bulk_crosses_caps_parity() {
         use crate::parser::ActionSink;
@@ -4278,17 +3963,15 @@ mod kitty_display_tests {
         assert_eq!(total_bulk, MAX_DCS_GLOBAL_BUDGET, "global budget reached");
     }
 
-    /// Bulk/per-byte parity for the DCS accumulator (`dcs_put_bulk`): identical
-    /// `dcs.data` and budget counters across both the per-type data cap and the
-    /// global DCS budget, for every non-sixel DCS type. `Unknown` pushes
-    /// nothing without a registered callback but must still count bytes.
+    /// `dcs_put_bulk` matches per-byte `dcs_put` across the per-type cap and the global budget
+    /// for every non-sixel type (`Unknown` keeps nothing but still counts).
     #[test]
     fn dcs_put_bulk_crosses_caps_parity() {
         use crate::parser::ActionSink;
         use crate::terminal::{DcsType, MAX_DCS_GLOBAL_BUDGET};
         use aterm_provenance::pty_wrap_ref;
 
-        // (dcs_type, per-type data cap; 0 = nothing pushed without a callback).
+        // (dcs_type, per-type data cap; 0 = nothing kept).
         let cases: &[(DcsType, usize)] = &[
             (DcsType::Decrqss, 256),
             (DcsType::Xtgettcap, 1024),
@@ -4439,11 +4122,8 @@ mod kitty_display_tests {
         assert!(term.transient.kitty_frames.is_empty());
     }
 
-    /// Regression: RIS (`ESC c`, full reset) clears the Kitty graphics store and
-    /// drops the global byte budget in lockstep — matching kitty/xterm and the
-    /// `a=d` delete-all path. If the budget survived RIS it would drift from the
-    /// now-empty store and could wrongly reject a later valid in-budget image, and
-    /// a stale id could still display after the reset.
+    /// RIS (`ESC c`) clears the Kitty store and its byte budget together, so a later in-budget
+    /// image is admitted and a stale id no longer displays.
     #[test]
     fn ris_clears_kitty_store_and_budget() {
         let mut term = Terminal::new(24, 80);
@@ -4551,10 +4231,8 @@ mod kitty_display_tests {
         assert_eq!(term.transient.kitty_images.len(), stored);
     }
 
-    /// Natural size is pixel-exact: with neither `c=` nor `r=` the footprint is
-    /// the raster's pixel size rounded up to whole cells, and the image draws
-    /// one image pixel per device pixel rather than scaled to fill it (as
-    /// kitty does, and as the sixel path's `PixelExact`).
+    /// With neither `c=` nor `r=` the image is pixel-exact in its rounded-up footprint (as
+    /// kitty draws it); an explicit cell box is fitted.
     #[test]
     fn un_sized_transmit_is_pixel_exact_but_an_explicit_cell_box_is_fitted() {
         // 15x25 px at a 10x20 cell: a 2x2-cell footprint that is not the raster,
@@ -4606,10 +4284,8 @@ mod kitty_display_tests {
             .collect()
     }
 
-    /// Kitty images are layers: a placement over another keeps it, ordered by
-    /// z-index, then by when the image was first sent, then placement order;
-    /// deleting the top one uncovers the one beneath, and an iTerm2 or sixel
-    /// image still takes a cell whole.
+    /// Kitty placements stack by z-index, first-sent order, then placement order; deleting
+    /// the top uncovers the one beneath; an iTerm2 or sixel image takes a cell whole.
     #[test]
     fn overlapping_placements_stack_by_z_then_image_then_placement_order() {
         let mut term = Terminal::new(24, 80);
@@ -4668,10 +4344,8 @@ mod kitty_display_tests {
         assert_eq!(layers_at(&term, 0, 0), [0]);
     }
 
-    /// Images of one z-index stack in the order they were first sent, as
-    /// kitty draws them, whatever ids the client chose: image 9 sent before
-    /// image 4 lies under it, an anonymous `a=T` sent after both lies over
-    /// them, and sending image 9 again keeps its place.
+    /// Images of one z-index stack in first-sent order, whatever their ids; sending one again
+    /// keeps its place.
     #[test]
     fn images_of_one_z_stack_in_the_order_they_were_first_sent() {
         let mut term = Terminal::new(24, 80);
@@ -4695,11 +4369,8 @@ mod kitty_display_tests {
         assert_eq!(layers_at(&term, 0, 0), [9, 4, 0], "and back in its place");
     }
 
-    /// Drawing an image again exactly where an unnamed placement of the same
-    /// image is (same cell, footprint and layout; only the source rectangle's
-    /// corner may differ) replaces it as a redraw, and relatives of the old
-    /// placement follow the new one. A put that differs (here, its z-index)
-    /// still stacks.
+    /// Redrawing an image exactly over its unnamed placement (only the crop corner may differ)
+    /// replaces it, relatives following; a put that differs (z-index) still stacks.
     #[test]
     fn a_redraw_in_place_replaces_the_placement_it_covers() {
         let mut term = Terminal::new(24, 80);
@@ -4743,10 +4414,8 @@ mod kitty_display_tests {
         assert_eq!(layers_at(&term, 4, 0), [1, 1], "another z-index stacks");
     }
 
-    /// Placements relative to a virtual placement are capped
-    /// (`MAX_KITTY_FLOATING`, `ENOSPC` past it), a redraw of one replaces it,
-    /// and however many images cover a cell, the frame carries its top
-    /// `MAX_IMAGE_LAYERS`.
+    /// Placements relative to a virtual one are capped (`MAX_KITTY_FLOATING`), a redraw
+    /// replaces one, and a frame carries each cell's top `MAX_IMAGE_LAYERS`.
     #[test]
     fn floating_placements_are_capped_and_a_frame_keeps_each_cells_top_layers() {
         use aterm_grid::MAX_IMAGE_LAYERS;
@@ -4793,10 +4462,8 @@ mod kitty_display_tests {
         assert_eq!(batch, top, "and per frame");
     }
 
-    /// An animation whose only placement is relative to a virtual placement
-    /// plays only while that placement shows: with its parent's placeholders
-    /// gone it is drawn nowhere, and nothing is scheduled for it until they
-    /// come back.
+    /// An animation shown only relative to a virtual placement plays only while its parent's
+    /// placeholders show.
     #[test]
     fn an_animation_drawn_nowhere_through_a_virtual_parent_does_not_play() {
         use crate::terminal::KittyAnimationStep;
@@ -4834,10 +4501,8 @@ mod kitty_display_tests {
         );
     }
 
-    /// `X=`/`Y=` start a put's image that many pixels into its first cell,
-    /// held below a cell as kitty holds them, and the footprint (and so the
-    /// cursor's move) grows to keep the image whole. A virtual placement takes
-    /// no offset.
+    /// `X=`/`Y=` start a put's image inside its first cell and grow the footprint (and the
+    /// cursor's move) to keep it whole; a virtual placement takes no offset.
     #[test]
     fn put_offsets_start_the_image_inside_its_first_cell() {
         let mut term = Terminal::new(24, 80);
@@ -4874,11 +4539,9 @@ mod kitty_display_tests {
         );
     }
 
-    /// A put lays the image out by its own keys — kitty's placement model —
-    /// not by the transmit's: `c=`/`r=` give it a cell box, `x=`/`y=`/`w=`/`h=`
-    /// crop it. Such a put gets a re-laid-out variant (a footprint is part of
-    /// the payload); an identical put reuses that variant, and a put with no
-    /// keys reuses the stored image itself.
+    /// A put lays the image out by its own keys (`c=`/`r=` box, `x=`/`y=`/`w=`/`h=` crop),
+    /// not the transmit's: a variant, reused by an identical put; a keyless put reuses the
+    /// stored image.
     #[test]
     fn put_lays_the_image_out_by_its_own_keys() {
         let mut term = Terminal::new(24, 80);
@@ -4943,10 +4606,8 @@ mod kitty_display_tests {
         assert!(reply.starts_with("\x1b_Gi=1;EINVAL"), "{reply:?}");
     }
 
-    /// Variants are charged to the store's budget and capped per id, but one
-    /// nothing shows is recycled, so a client that re-crops on every scroll
-    /// never runs out. Control: keeping them all on screen hits the cap, and
-    /// the put is refused rather than evicting pixels.
+    /// Variants are budgeted and capped per id, but unshown ones are recycled, so re-cropping
+    /// on every scroll never runs out. Control: all kept on screen, the cap refuses the put.
     #[test]
     fn put_variants_are_budgeted_recycled_and_capped() {
         let mut term = Terminal::new(40, 80);
@@ -5045,10 +4706,8 @@ mod kitty_display_tests {
         );
     }
 
-    /// Kitty's cursor policy: after a placement the cursor sits just past the
-    /// image's right edge on its last row (the next line's start when that is
-    /// past the margin); `C=1` leaves it where it was. iTerm2's policy (a
-    /// fresh line below the image) is the control.
+    /// Kitty's cursor policy: just past the image's right edge on its last row (or the next
+    /// line's start); `C=1` keeps it. iTerm2's fresh line below the image is the control.
     #[test]
     fn kitty_cursor_lands_after_the_image_and_c1_keeps_it() {
         let mut term = Terminal::new(24, 80);
@@ -5173,10 +4832,8 @@ mod kitty_display_tests {
         assert_eq!(term.cell_frame(24, 80).images[5][0].1.image.bytes[0], 2);
     }
 
-    /// `U=1` put: a virtual placement with its own id and cell box, which a
-    /// placeholder names in its underline colour. A placement id with no
-    /// virtual placement draws nothing; no underline colour picks the newest
-    /// one.
+    /// A `U=1` put has its own id and cell box, named by a placeholder's underline colour;
+    /// an unknown placement id draws nothing, no underline colour picks the newest.
     #[test]
     fn virtual_placements_carry_their_own_id_and_layout() {
         let mut term = Terminal::new(24, 80);
@@ -5263,10 +4920,8 @@ mod kitty_display_tests {
         assert_eq!(term.transient.kitty_total_bytes, 0, "and its budget");
     }
 
-    /// `P=`/`Q=`: a placement relative to a parent (`H=`/`V=` cells from the
-    /// parent's top-left, the cursor untouched) moves with the parent and is
-    /// deleted with it, and kitty's errors come back for a missing parent, a
-    /// cycle, a virtual parent and a relative virtual placement.
+    /// `P=`/`Q=`: a relative placement moves and is deleted with its parent, the cursor
+    /// untouched; kitty's errors come back for a missing parent, a cycle and virtual misuse.
     #[test]
     fn relative_placements_follow_their_parent() {
         let mut term = Terminal::new(24, 80);
@@ -5326,8 +4981,8 @@ mod kitty_display_tests {
         assert!(term.transient.kitty_relations.is_empty());
     }
 
-    /// The Kitty image ids of the placements whose tiles cover cell
-    /// `(row, col)`, bottom first.
+    /// `(image id, placement id)` of each Kitty placement covering cell `(row, col)`, bottom
+    /// first.
     fn tags_at(term: &Terminal, row: usize, col: usize) -> Vec<(u32, u32)> {
         term.images_row(row)
             .into_iter()
@@ -5337,12 +4992,9 @@ mod kitty_display_tests {
             .collect()
     }
 
-    /// A placement relative to a virtual placement shows `H=`/`V=` cells from
-    /// the top row and leftmost column of the placeholders showing its parent,
-    /// found each frame so it follows them, and a chain of such placements
-    /// follows in turn; with no placeholder on screen it is kept and drawn
-    /// nowhere, and it is deleted with its parent (its image too when it has
-    /// no placement left). Kitty's refusals hold.
+    /// A placement relative to a virtual placement shows `H=`/`V=` cells from the top-left of
+    /// its parent's placeholders, follows them (chains too), is kept but drawn nowhere with no
+    /// placeholder on screen, and is deleted with its parent. Kitty's refusals hold.
     #[test]
     fn placements_relative_to_a_virtual_placement_follow_its_placeholders() {
         let mut term = Terminal::new(24, 80);
@@ -5526,9 +5178,8 @@ mod kitty_display_tests {
         out
     }
 
-    /// A PNG takes part in a composition like raw pixels do: PNG frame data
-    /// over a canvas, a frame over a PNG root, an edit of a PNG root, and `a=c`
-    /// between PNG frames, each decoded, composed and kept as raw pixels.
+    /// PNG frames compose like raw ones (frame data, root, edit and `a=c`): decoded, composed
+    /// and kept as raw pixels.
     #[test]
     fn png_frames_are_decoded_to_compose() {
         const RED: [u8; 4] = [255, 0, 0, 255];
@@ -5620,11 +5271,8 @@ mod kitty_display_tests {
         assert_eq!(placed.image.scaling, aterm_grid::ImageScaling::PixelExact);
     }
 
-    /// A put's in-cell offset (`X=`/`Y=`) is added to a length the client
-    /// chose — `c=`/`r=` scaled to pixels, or the size a PNG's header claims —
-    /// so near `u32::MAX` the sum overflowed: a panic in a debug build, a
-    /// wrapped, one-row footprint in a release one. It saturates, and the
-    /// footprint is the grid's.
+    /// A put's in-cell offset (`X=`/`Y=`) added to a client's huge length (`c=`/`r=`, or a PNG
+    /// header's size) saturates, and the footprint is the grid's.
     #[test]
     fn huge_lengths_with_an_in_cell_offset_fill_the_grid() {
         // The footprint, in cells, of one transmit-and-display on a fresh grid.
@@ -5642,8 +5290,7 @@ mod kitty_display_tests {
         ] {
             assert_eq!(footprint(&control, &one_cell_rgba()), (80, 24), "{control}");
         }
-        // A PNG whose header claims u32::MAX x u32::MAX pixels (the engine
-        // reads no further).
+        // A PNG header claiming u32::MAX x u32::MAX pixels (the engine reads no further).
         let mut png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
         png.extend_from_slice(&13u32.to_be_bytes());
         png.extend_from_slice(b"IHDR");
@@ -5652,10 +5299,8 @@ mod kitty_display_tests {
         assert_eq!(footprint("a=T,f=100,X=5,Y=5,C=1,q=2", &png), (80, 24));
     }
 
-    /// A whole image declaring a side over kitty's limit is refused, raw or
-    /// PNG, as kitty refuses it, while one exactly at the limit is stored.
-    /// Each refused row's data is otherwise good: the raw bytes are exactly
-    /// `s=`×`v=` pixels, and the PNG's own size is 1×1.
+    /// A whole image declaring a side over kitty's limit is refused, raw or PNG; one exactly at
+    /// the limit is stored. Each refused payload is otherwise well-formed.
     #[test]
     fn a_whole_image_declaring_a_side_over_kittys_limit_is_refused() {
         let max = super::kitty_graphics::MAX_KITTY_DIMENSION;
@@ -5698,9 +5343,8 @@ mod kitty_display_tests {
         }
     }
 
-    /// A zlib stream (RFC 1950) of `len` zero bytes, `len >= 1`: one fixed-Huffman
-    /// block of a literal zero, then back-references of 258 bytes at distance 1
-    /// — about 13 bits per 258 bytes, the ratio an `o=z` image of one colour gets.
+    /// A zlib stream (RFC 1950) of `len` zero bytes, `len >= 1`: a literal zero, then
+    /// 258-byte back-references at distance 1 (about 13 bits per 258 bytes).
     fn zlib_zeros(len: usize) -> Vec<u8> {
         // Deflate packs fields low bit first; a Huffman code goes out most
         // significant bit first.
@@ -5745,11 +5389,8 @@ mod kitty_display_tests {
         bytes
     }
 
-    /// Kitty images the store does not keep — sent without an id, or refused
-    /// for room — still show, so they count against the screen's image budget.
-    /// Forty anonymous 4 MiB `o=z` images, each about 35 KB of output here
-    /// (zlib proper gets one colour to 4 KB), held 160 MiB of a 24x80 screen,
-    /// past the store's own 64 MiB, before they did.
+    /// Kitty images the store does not keep (sent without an id, or refused for room) still
+    /// show, so they count against the screen's image budget.
     #[test]
     fn unstored_kitty_images_stay_within_the_live_budget() {
         use crate::terminal::handler_osc_1337::MAX_LIVE_IMAGE_BYTES;
@@ -5779,11 +5420,8 @@ mod kitty_display_tests {
         }
     }
 
-    /// Images the Kitty store frees while a parked screen still shows them
-    /// count against that screen's budget. Placed on the main screen as a
-    /// stored image, then deleted from the alternate screen (where nothing
-    /// shows it, so the store let it go), each 4 MiB `o=z` image stayed on the
-    /// parked main screen uncharged: sixty rounds held 254 MB there.
+    /// Images the Kitty store frees while a parked screen still shows them count against that
+    /// screen's budget.
     #[test]
     fn kitty_images_freed_behind_a_parked_screen_stay_within_the_live_budget() {
         use crate::terminal::handler_osc_1337::MAX_LIVE_IMAGE_BYTES;
@@ -5811,9 +5449,7 @@ mod kitty_display_tests {
         }
     }
 
-    /// The same for a frame the store lets go: editing image 1's current
-    /// frame on the alternate screen replaces it in the store, while every
-    /// earlier placement on the parked main screen keeps the frame it showed.
+    /// The same for a frame the store replaces while the parked main screen still shows it.
     #[test]
     fn kitty_frames_replaced_behind_a_parked_screen_stay_within_the_live_budget() {
         use crate::terminal::handler_osc_1337::MAX_LIVE_IMAGE_BYTES;

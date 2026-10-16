@@ -15,7 +15,7 @@
 //! (`~/.aterm/machine.key`); the detached signature is exactly what the verify-only client
 //! (`atpkg::sig`) checks. `verify-signed` checks a signed file that is not an atpkg
 //! document (an ALab release's `SHA256SUMS`) with the client's own roster code;
-//! `tools/atpkg-auto-alab.sh` runs it before it builds anything.
+//! the ALab lane (`atpkg-publish lane run alab`) checks the same way before it builds.
 //!
 //! There is deliberately no standalone key generator: every signing identity is a machine
 //! key born in provisioning, so every key that exists is one the roster accounts for.

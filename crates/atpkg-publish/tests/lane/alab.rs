@@ -1,0 +1,1315 @@
+// Copyright 2026 Andrew Yates
+// SPDX-License-Identifier: Apache-2.0
+
+//! The Apple lane, end to end over the fake channel and real git: every decision, the
+//! row gate, the latch and its attempts, the coherence hold, the gap to trust main, the
+//! downgrade refusals, the once-a-day notices and the lock.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+use atpkg_publish::api::Build;
+use atpkg_publish::ctx::Ctx;
+use atpkg_publish::error::{Error, Result};
+use atpkg_publish::lane::LaneKind;
+use atpkg_publish::lane::alab::{self, Decision, Deps, Options, Outcome, Row};
+use atpkg_publish::lane::gap::PinCommit;
+use atpkg_publish::lane::report::Transcript;
+use atpkg_publish::lane::state::LaneState;
+use atpkg_publish::triple::{AARCH64_APPLE_DARWIN as ARM, X86_64_APPLE_DARWIN as X86};
+
+use super::fixture::{self, Fx, Release, git};
+
+/// The shell suite's world: index 5 pins ay 2, nn 2, trust-ir 1, trust 5, trust-mc 4 and
+/// carries a claude pin. ay's newest SIGNED release is v0.2.0 (build 3) beside a prerelease
+/// v0.3.0 and an unsigned v0.4.0; nn and trust-mc sit at their releases; trust's v0.9.0 is
+/// build 7 (a bundle: the human lane); trust-ir's v0.3.0 is build 2 (packed, then held by
+/// the rustc group while trust waits).
+struct World {
+    fx: Fx,
+    pins: Mutex<BTreeMap<(String, Build), PinCommit>>,
+    opts: Mutex<Options>,
+}
+
+fn sha_at(dir: &Path, build: u64) -> String {
+    let all = git(dir, &["rev-list", "--reverse", "HEAD"]);
+    all.lines()
+        .nth(usize::try_from(build).expect("small") - 1)
+        .expect("a commit at that build")
+        .to_string()
+}
+
+impl World {
+    fn new(label: &str) -> Self {
+        let fx = Fx::new(label);
+        let ay = fx.dev_repo("ay", 4);
+        fx.release("ay", "v0.1.0", &sha_at(&ay, 2), Release::GOOD);
+        fx.release("ay", "v0.2.0", &sha_at(&ay, 3), Release::GOOD);
+        fx.release(
+            "ay",
+            "v0.3.0",
+            &sha_at(&ay, 4),
+            Release {
+                prerelease: true,
+                ..Release::GOOD
+            },
+        );
+        fx.release(
+            "ay",
+            "v0.4.0",
+            &sha_at(&ay, 4),
+            Release {
+                signed: false,
+                ..Release::GOOD
+            },
+        );
+        let nn = fx.dev_repo("nn", 2);
+        fx.release("nn", "v0.1.0", &sha_at(&nn, 2), Release::GOOD);
+        let mc = fx.dev_repo("trust-mc", 4);
+        fx.release("trust-mc", "v0.6.0", &sha_at(&mc, 4), Release::GOOD);
+        let trust = fx.dev_repo("trust", 7);
+        fx.release("trust", "v0.9.0", &sha_at(&trust, 7), Release::GOOD);
+        let ir = fx.dev_repo("trust-ir", 2);
+        fx.release("trust-ir", "v0.3.0", &sha_at(&ir, 2), Release::GOOD);
+        fx.publish_head(
+            5,
+            &[
+                ("ay", 2),
+                ("nn", 2),
+                ("trust-ir", 1),
+                ("trust", 5),
+                ("trust-mc", 4),
+                ("claude", 2_026_090_101),
+            ],
+        );
+        let opts = Options::new(&fx.ctx, false);
+        Self {
+            fx,
+            pins: Mutex::new(BTreeMap::new()),
+            opts: Mutex::new(opts),
+        }
+    }
+
+    /// [`World::new`], run until every program sits at its pin: ay packed and pinned, the
+    /// person's trust bundle landed, the rustc group moved (head 7).
+    fn settled(label: &str) -> Self {
+        let w = Self::new(label);
+        ok(w.run(false));
+        w.fx.stage("trust", 7, &[ARM]);
+        let (o, _) = ok(w.run(false));
+        assert_eq!(o.published, Some(7));
+        w
+    }
+
+    fn dev(&self, repo: &str) -> PathBuf {
+        self.fx.path(&format!("dev/{repo}"))
+    }
+
+    fn run_as(&self, ctx: &Ctx, dry_run: bool) -> (Result<Outcome>, Transcript) {
+        let tx = Transcript::memory(alab::ME);
+        let pins = &self.pins;
+        let pin_commit = move |_: &Ctx, p: &str, b: Build| {
+            pins.lock().expect("pins").get(&(p.to_string(), b)).cloned()
+        };
+        let deps = Deps {
+            packer: &self.fx.packer,
+            indexer: &self.fx.indexer,
+            notifier: &self.fx.notes,
+            pin_commit: &pin_commit,
+        };
+        let mut opts = self.opts.lock().expect("opts").clone();
+        opts.dry_run = dry_run;
+        (alab::run(ctx, &opts, &deps, &tx), tx)
+    }
+
+    fn run(&self, dry_run: bool) -> (Result<Outcome>, Transcript) {
+        self.run_as(&self.fx.ctx, dry_run)
+    }
+
+    fn state(&self) -> LaneState {
+        LaneState::of(LaneKind::Alab, &self.fx.ctx.state_dir)
+    }
+
+    fn sync(&self) -> String {
+        std::fs::read_to_string(self.state().dir.join("ALAB-SYNC.md")).unwrap_or_default()
+    }
+}
+
+fn row<'a>(o: &'a Outcome, p: &str) -> &'a Row {
+    o.rows
+        .iter()
+        .find(|r| r.program.name == p)
+        .unwrap_or_else(|| panic!("no {p} row"))
+}
+
+fn rendered(o: &Outcome, p: &str) -> String {
+    let r = row(o, p);
+    let gap = o.gaps.iter().find(|g| g.program == p);
+    r.render(o.head.unwrap_or(0), "alabsystems", gap)
+}
+
+fn ok(r: (Result<Outcome>, Transcript)) -> (Outcome, Transcript) {
+    match r.0 {
+        Ok(o) => (o, r.1),
+        Err(e) => panic!("the run refused: {e}\n{}", r.1.text()),
+    }
+}
+
+#[test]
+fn a_dry_run_before_any_clone_decides_nothing_and_writes_nothing() {
+    let w = World::new("alab-dry");
+    let (o, tx) = ok(w.run(true));
+    let text = tx.text();
+    assert!(text.contains("channel index head: atpkg-index-5"), "{text}");
+    assert!(
+        matches!(&row(&o, "ay").decision, Decision::Unresolved(why) if why.contains("no scratch clone at")),
+        "{:?}",
+        row(&o, "ay").decision
+    );
+    assert!(text.contains("DRY_RUN — would pack: <none>"), "{text}");
+    assert!(
+        text.contains("WARNING — TRUST-MAIN: unknown — no scratch clone at"),
+        "{text}"
+    );
+    assert!(w.fx.calls("clone ").is_empty(), "a dry run clones nothing");
+    let state = w.state();
+    assert!(!state.dir.join("progs").exists());
+    assert!(!state.index_seen.exists(), "a dry run writes no state");
+    assert!(w.fx.notes.shown().is_empty(), "a dry run notifies nobody");
+}
+
+#[test]
+fn the_first_run_packs_both_apple_targets_and_holds_the_rustc_group() {
+    let w = World::new("alab-first");
+    let (o, tx) = ok(w.run(false));
+    let text = tx.text();
+    let ay = rendered(&o, "ay");
+    assert!(ay.starts_with("PACK: v0.2.0 (build 3) > pin 2"), "{ay}");
+    assert!(
+        !ay.contains("v0.3.0") && !ay.contains("v0.4.0"),
+        "neither the prerelease nor the unsigned release is elected: {ay}"
+    );
+    assert_eq!(rendered(&o, "nn"), "OK: pin 2 is v0.1.0");
+    assert_eq!(rendered(&o, "trust-mc"), "OK: pin 4 is v0.6.0");
+    assert!(
+        rendered(&o, "trust").starts_with("HUMAN-LANE: v0.9.0 (build 7) > pin 5"),
+        "{}",
+        rendered(&o, "trust")
+    );
+    assert!(
+        rendered(&o, "clean").starts_with("SKIP: not pinned by index-5"),
+        "an unpinned program is a human decision"
+    );
+    // The packs: ay on both Apple targets, aarch64 fresh and x86_64 merged onto a COPY of
+    // it beside the stage; trust-ir aarch64 only; the bundle never.
+    let legs = w.fx.packer.legs();
+    let out = w.state().dir.join("out/ay");
+    assert_eq!(legs.len(), 3, "{legs:?}");
+    assert_eq!(
+        (legs[0].0.as_str(), legs[0].1, legs[0].2.clone()),
+        ("ay", ARM, None)
+    );
+    assert_eq!(
+        (legs[1].0.as_str(), legs[1].1, legs[1].2.clone()),
+        ("ay", X86, Some(out.join("merge-base-ay-3.toml")))
+    );
+    assert_eq!((legs[2].0.as_str(), legs[2].1), ("trust-ir", ARM));
+    let staged = String::from_utf8(
+        w.fx.staging_asset("ay", 3, "pkg-ay-3.toml")
+            .expect("staged"),
+    )
+    .expect("utf8");
+    assert!(staged.contains("aarch64-apple-darwin") && staged.contains("x86_64-apple-darwin"));
+    assert!(
+        w.fx.staging_asset("trust-ir", 2, "pkg-trust-ir-2.toml")
+            .is_some()
+    );
+    // The hold, and the one index: ay alone moves.
+    assert_eq!(o.held, ["trust-ir"]);
+    assert!(
+        text.contains("trust-ir build 2 is packed on staging but HOLD (group rustc"),
+        "{text}"
+    );
+    assert_eq!(
+        w.fx.indexer.deltas(),
+        [BTreeMap::from([("ay".to_string(), 3)])]
+    );
+    assert_eq!(o.published, Some(6));
+    let state = w.state();
+    assert_eq!(state.index_seen().expect("seen"), 6);
+    let pins_seen = std::fs::read_to_string(&state.pins_seen).expect("pins seen");
+    assert!(pins_seen.lines().any(|l| l == "ay 3"), "{pins_seen}");
+    // What a person owes, and is told.
+    let sync = w.sync();
+    assert!(
+        sync.contains("Published atpkg-index-6: ay v0.2.0 (build 3)"),
+        "{sync}"
+    );
+    assert!(
+        sync.contains("## trust: v0.9.0 = build 7 (pin 5)"),
+        "{sync}"
+    );
+    assert!(
+        sync.contains("atpkg-publish publish-group rustc --seal"),
+        "{sync}"
+    );
+    let main7 = &sha_at(&w.dev("trust"), 7)[..10];
+    assert!(
+        text.contains(&format!(
+            "TRUST-MAIN: the published trust build 5 is 2 builds behind trust main {main7} (build 7, "
+        )),
+        "{text}"
+    );
+    assert!(
+        sync.contains(&format!(
+            "TRUST CUT OWED — trust main is build 7 ({main7}); the published build 5 is 2 builds behind:"
+        )),
+        "{sync}"
+    );
+    let shown = w.fx.notes.shown();
+    assert!(shown.iter().any(|n| n == "trust: published build 5 is 2 builds behind trust main — a cut is owed (ALAB-SYNC.md)"), "{shown:?}");
+    assert!(
+        shown
+            .iter()
+            .any(|n| n == "published atpkg-index-6: ay v0.2.0 (build 3)"),
+        "{shown:?}"
+    );
+}
+
+#[test]
+fn a_held_build_on_staging_reads_index_and_is_never_repacked() {
+    let w = World::new("alab-hold");
+    ok(w.run(false));
+    let packs = w.fx.packer.legs().len();
+    let (o, tx) = ok(w.run(false));
+    assert!(
+        tx.text()
+            .contains("channel index head: atpkg-index-6 (last processed: 6)")
+    );
+    assert_eq!(rendered(&o, "ay"), "OK: pin 3 is v0.2.0");
+    assert!(
+        rendered(&o, "trust-ir")
+            .starts_with("INDEX: v0.3.0 (build 2) is already on alabsystems as atpkg-trust-ir-2"),
+        "{}",
+        rendered(&o, "trust-ir")
+    );
+    assert_eq!(w.fx.packer.legs().len(), packs, "nothing is re-packed");
+    assert_eq!(
+        w.fx.indexer.count(),
+        1,
+        "a held-only run publishes no index"
+    );
+    assert!(
+        tx.text()
+            .contains("no index published (the group waits on: trust)")
+    );
+    assert!(
+        w.fx.notes
+            .shown()
+            .iter()
+            .any(|n| n.starts_with("packed but HELD by a coherence group: trust-ir"))
+    );
+}
+
+#[test]
+fn the_bundle_landing_on_staging_moves_the_whole_group_together() {
+    let w = World::new("alab-group");
+    ok(w.run(false));
+    // The person's bundle pack shows up as a staging release, like any pack.
+    w.fx.stage("trust", 7, &[ARM]);
+    let (o, _) = ok(w.run(false));
+    assert!(rendered(&o, "trust").starts_with("INDEX: v0.9.0 (build 7)"));
+    assert!(o.held.is_empty());
+    assert_eq!(
+        w.fx.indexer.deltas().last().expect("published"),
+        &BTreeMap::from([("trust".to_string(), 7), ("trust-ir".to_string(), 2)])
+    );
+    assert_eq!(o.published, Some(7));
+    assert!(!w.sync().contains("HUMAN LANE"), "the human lane landed");
+}
+
+#[test]
+fn a_pin_ahead_of_the_newest_signed_release_is_ok_and_a_clean_no_op() {
+    let fx = Fx::new("alab-ahead");
+    let nn = fx.dev_repo("nn", 1);
+    fx.release(
+        "nn",
+        "v0.1.1",
+        &git(&nn, &["rev-parse", "HEAD"]),
+        Release::GOOD,
+    );
+    fx.publish_head(5, &[("nn", 2)]);
+    let w = World {
+        opts: Mutex::new(Options::new(&fx.ctx, false)),
+        fx,
+        pins: Mutex::new(BTreeMap::new()),
+    };
+    let (o, tx) = ok(w.run(false));
+    assert_eq!(
+        rendered(&o, "nn"),
+        "OK: pin 2 is AHEAD of the newest signed release v0.1.1 (build 1) — a pack cut past the \
+         last promote"
+    );
+    assert!(tx.text().contains("clean no-op"), "{}", tx.text());
+    assert_eq!(w.fx.indexer.count(), 0);
+    assert!(
+        w.fx.notes.shown().is_empty(),
+        "an AHEAD pin notifies nobody"
+    );
+}
+
+#[test]
+fn a_pin_that_fell_on_the_channel_refuses_everything() {
+    let w = World::settled("alab-pin-down");
+    w.fx.publish_head(
+        8,
+        &[
+            ("ay", 3),
+            ("nn", 1),
+            ("trust-ir", 2),
+            ("trust", 7),
+            ("trust-mc", 4),
+        ],
+    );
+    let (r, _) = w.run(false);
+    let e = r.expect_err("a pin downgrade refuses");
+    assert_eq!(e.exit_code(), 1);
+    assert!(
+        e.to_string()
+            .contains("PIN DOWNGRADE on the channel: nn 2 -> 1 in index-8"),
+        "{e}"
+    );
+    assert_eq!(w.fx.indexer.count(), 2, "nothing more is signed");
+}
+
+#[test]
+fn an_index_head_below_the_one_processed_refuses_everything() {
+    let w = World::new("alab-index-down");
+    ok(w.run(false));
+    // The channel loses index 6: its head reads 5 again.
+    w.fx.host
+        .set_draft(&w.fx.ctx.index_slug(), "atpkg-index-6", true);
+    let (r, _) = w.run(false);
+    let e = r.expect_err("an index downgrade refuses");
+    assert!(
+        e.to_string()
+            .contains("channel head is index 5 but this lane already processed 6"),
+        "{e}"
+    );
+    assert_eq!(w.fx.packer.legs().len(), 3, "nothing is packed");
+}
+
+/// Builds 4 of ay: a release past the pin, with one fresh dev commit.
+fn ay_release(w: &World, tag: &str) -> u64 {
+    let ay = w.dev("ay");
+    fixture::commit(&ay, tag, None);
+    let build: u64 = git(&ay, &["rev-list", "--count", "HEAD"])
+        .parse()
+        .expect("count");
+    w.fx.release("ay", tag, &git(&ay, &["rev-parse", "HEAD"]), Release::GOOD);
+    build
+}
+
+#[test]
+fn a_failing_pack_retries_then_latches_and_a_deleted_latch_retries() {
+    let w = World::settled("alab-latch");
+    w.opts.lock().expect("opts").block_after = 2;
+    let build = ay_release(&w, "v0.5.0");
+    w.fx.packer.fail_on("ay", ARM);
+    let (r, tx) = w.run(false);
+    let e = r.expect_err("a run whose only candidate failed refuses");
+    assert!(
+        e.to_string().contains("every candidate failed to pack"),
+        "{e}"
+    );
+    assert!(
+        tx.text().contains(&format!(
+            "ay build {build}: the pack failed for aarch64-apple-darwin"
+        )),
+        "{}",
+        tx.text()
+    );
+    assert!(tx.text().contains("(attempt 1 of 2 — retrying next run)"));
+    let state = w.state();
+    assert!(
+        !state.blocked_file("ay", build).exists(),
+        "no latch after one failure"
+    );
+    let (r, tx) = w.run(false);
+    assert!(r.is_err());
+    assert!(
+        tx.text()
+            .contains(&format!("ay build {build} BLOCKED after 2 attempts"))
+    );
+    assert!(state.blocked_file("ay", build).exists());
+    let packs = w.fx.packer.legs().len();
+    let (o, _) = ok(w.run(false));
+    assert!(
+        rendered(&o, "ay").starts_with(&format!(
+            "BLOCKED: v0.5.0 (build {build}) latched by BLOCKED-ay-{build}.md"
+        )),
+        "{}",
+        rendered(&o, "ay")
+    );
+    assert_eq!(
+        w.fx.packer.legs().len(),
+        packs,
+        "a latched build is not re-packed"
+    );
+    std::fs::remove_file(state.blocked_file("ay", build)).expect("delete the latch");
+    w.fx.packer.heal();
+    let (o, _) = ok(w.run(false));
+    assert_eq!(o.pinned, ["ay"]);
+    assert!(
+        !state.attempts_file("ay", build).exists(),
+        "a packed build's counter goes"
+    );
+}
+
+#[test]
+fn a_half_packed_release_is_never_pinned_and_converges_when_unlatched() {
+    let w = World::settled("alab-half");
+    w.opts.lock().expect("opts").block_after = 1;
+    let build = ay_release(&w, "v0.6.0");
+    w.fx.packer.fail_on("ay", X86);
+    let (r, _) = w.run(false);
+    assert!(r.is_err());
+    let half = String::from_utf8(
+        w.fx.staging_asset("ay", build, &format!("pkg-ay-{build}.toml"))
+            .expect("the aarch64 leg uploaded"),
+    )
+    .expect("utf8");
+    assert!(!half.contains("x86_64-apple-darwin"), "{half}");
+    let (o, tx) = ok(w.run(false));
+    assert!(
+        !rendered(&o, "ay").starts_with("INDEX"),
+        "a half-packed release never reads INDEX"
+    );
+    assert!(
+        tx.text().contains(&format!(
+            "atpkg-ay-{build} on alabsystems lacks target row(s): x86_64-apple-darwin"
+        )),
+        "{}",
+        tx.text()
+    );
+    assert!(rendered(&o, "ay").starts_with("BLOCKED"));
+    assert_eq!(
+        w.fx.indexer.count(),
+        2,
+        "a half-packed build is never pinned"
+    );
+    std::fs::remove_file(w.state().blocked_file("ay", build)).expect("unlatch");
+    w.fx.packer.heal();
+    let (o, _) = ok(w.run(false));
+    assert!(
+        o.pinned.contains(&"ay".to_string()),
+        "the re-pack converges and publishes"
+    );
+    let full = String::from_utf8(
+        w.fx.staging_asset("ay", build, &format!("pkg-ay-{build}.toml"))
+            .expect("staged"),
+    )
+    .expect("utf8");
+    assert!(full.contains("x86_64-apple-darwin") && full.contains("aarch64-apple-darwin"));
+}
+
+#[test]
+fn a_one_shot_500_on_one_quad_asset_is_recovered() {
+    let w = World::new("alab-500-quad");
+    w.fx.host.fail_once(
+        &w.fx.ctx.index_slug(),
+        "atpkg-index-5",
+        "aterm-machines.toml.sig",
+    );
+    let (o, _) = ok(w.run(true));
+    assert_eq!(o.head, Some(5), "the retry finishes the partial download");
+}
+
+#[test]
+fn a_staging_owner_that_cannot_be_read_is_never_read_as_absent() {
+    let def = atpkg_publish::programs::get("ay").expect("ay");
+    let facts = alab::Facts {
+        program: def,
+        pin: Some(2),
+        release: Ok(alab::SignedRelease {
+            tag: "v0.7.0".into(),
+            public_commit: "ab".repeat(20),
+            dev_commit: "cd".repeat(20),
+            build: 9,
+        }),
+        staging: alab::Staging::Unknown("alabsystems unreachable".into()),
+        latched: false,
+    };
+    assert_eq!(
+        alab::decide(&facts),
+        Decision::Skip("alabsystems unreachable".into()),
+        "a transient failure never demotes a staged build to a re-pack"
+    );
+}
+
+#[test]
+fn an_unreachable_staging_owner_decides_nothing_and_a_retried_500_never_repacks() {
+    let w = World::settled("alab-unreachable");
+    let build = ay_release(&w, "v0.7.0");
+    w.fx.stage("ay", build, &[ARM, X86]);
+    let packs = w.fx.packer.legs().len();
+    w.fx.host.set_unreachable("alabsystems", true);
+    let (o, _) = ok(w.run(false));
+    // The clone is fetched as the staging identity too, so nothing about ay is known.
+    assert!(
+        rendered(&o, "ay").starts_with(
+            "UNRESOLVED: git fetch failed in ~/.local/state/aterm-auto/alab/progs/ay: \
+             unreachable: alabsystems did not answer"
+        ),
+        "{}",
+        rendered(&o, "ay")
+    );
+    assert_eq!(
+        w.fx.packer.legs().len(),
+        packs,
+        "unreachable is never 'absent'"
+    );
+    w.fx.host.set_unreachable("alabsystems", false);
+    let slug = w.fx.ctx.staging_slug("ay");
+    w.fx.host.fail_once(
+        &slug,
+        &format!("atpkg-ay-{build}"),
+        &format!("pkg-ay-{build}.toml"),
+    );
+    let (o, _) = ok(w.run(false));
+    assert!(
+        rendered(&o, "ay").starts_with(&format!("INDEX: v0.7.0 (build {build})")),
+        "{}",
+        rendered(&o, "ay")
+    );
+    assert_eq!(
+        w.fx.packer.legs().len(),
+        packs,
+        "a retried 500 never re-packs"
+    );
+}
+
+#[test]
+fn what_is_built_is_what_was_signed() {
+    let w = World::settled("alab-signed");
+    let ay = w.dev("ay");
+    fixture::commit(&ay, "v0.8.0", None);
+    let sha = git(&ay, &["rev-parse", "HEAD"]);
+    let packs = w.fx.packer.legs().len();
+    // A tampered signature.
+    w.fx.release(
+        "ay",
+        "v0.8.0",
+        &sha,
+        Release {
+            tamper: true,
+            ..Release::GOOD
+        },
+    );
+    let (o, _) = ok(w.run(false));
+    assert!(
+        matches!(&row(&o, "ay").decision, Decision::Unverified(why) if why.starts_with("SHA256SUMS.sig does not verify under the channel's roster")),
+        "{:?}",
+        row(&o, "ay").decision
+    );
+    // A SUMS signed for another tag, re-served here.
+    w.fx.release(
+        "ay",
+        "v0.8.0",
+        &sha,
+        Release {
+            header_tag: Some("v9.9.9"),
+            ..Release::GOOD
+        },
+    );
+    let (o, _) = ok(w.run(false));
+    let public = &w.fx.ctx.accounts.public;
+    assert!(
+        rendered(&o, "ay").contains(&format!(
+            "UNVERIFIED: the signed SHA256SUMS names {public}/ay v9.9.9, not {public}/ay v0.8.0"
+        )),
+        "{}",
+        rendered(&o, "ay")
+    );
+    // A signed release the ledger does not bind to a dev commit.
+    w.fx.host.put(
+        &fixture::public(&w.fx, "ay"),
+        "v0.8.0",
+        atpkg_publish::host::fake::FakeRelease::default(),
+    );
+    w.fx.release(
+        "ay",
+        "v0.8.1",
+        &sha,
+        Release {
+            ledger: false,
+            ..Release::GOOD
+        },
+    );
+    let (o, _) = ok(w.run(false));
+    assert!(
+        matches!(&row(&o, "ay").decision, Decision::Unresolved(why) if why.contains("has no ay row whose release_rev is the signed commit")),
+        "{:?}",
+        row(&o, "ay").decision
+    );
+    assert_eq!(
+        w.fx.packer.legs().len(),
+        packs,
+        "nothing unverified or unbound is built"
+    );
+    // The control: verified and bound, it packs.
+    w.fx.release("ay", "v0.8.2", &sha, Release::GOOD);
+    let (o, _) = ok(w.run(false));
+    assert!(
+        rendered(&o, "ay").starts_with("PACK: v0.8.2"),
+        "{}",
+        rendered(&o, "ay")
+    );
+}
+
+/// A trust world for the gap to main: pin 9 AHEAD of the newest signed release (v0.9.0,
+/// build 7), main at build 12, the pin's compiler reporting commit build 9.
+fn gap_world(label: &str) -> World {
+    let fx = Fx::new(label);
+    let trust = fx.dev_repo("trust", 0);
+    for i in 1..=9 {
+        fixture::commit(&trust, &format!("t{i}"), Some("2026-09-17"));
+    }
+    for i in 10..=12 {
+        fixture::commit(&trust, &format!("t{i}"), Some("2026-10-01"));
+    }
+    fx.release("trust", "v0.9.0", &sha_at(&trust, 7), Release::GOOD);
+    fx.publish_head(5, &[("trust", 9)]);
+    let w = World {
+        opts: Mutex::new(Options::new(&fx.ctx, false)),
+        fx,
+        pins: Mutex::new(BTreeMap::new()),
+    };
+    w.pins.lock().expect("pins").insert(
+        ("trust".into(), 9),
+        PinCommit {
+            commit: sha_at(&w.dev("trust"), 9)[..9].to_string(),
+            date: Some("2026-09-17".into()),
+        },
+    );
+    w
+}
+
+#[test]
+fn the_gap_to_trust_main_is_counted_on_the_graph_and_told_once_a_day() {
+    let w = gap_world("alab-gap");
+    let (o, tx) = ok(w.run(false));
+    let main = sha_at(&w.dev("trust"), 12);
+    let pin9 = &sha_at(&w.dev("trust"), 9)[..9];
+    assert_eq!(
+        rendered(&o, "trust"),
+        format!(
+            "OK: pin 9 is AHEAD of the newest signed release v0.9.0 (build 7) — a pack cut past \
+             the last promote; 3 builds behind trust main {} (TRUST-MAIN below)",
+            &main[..10]
+        )
+    );
+    let line = format!(
+        "TRUST-MAIN: the published trust build 9 ({pin9}, 2026-09-17) is 3 builds behind trust \
+         main {} (build 12, 2026-10-01), 14 days — a cut is owed (ALAB-SYNC.md lists it)",
+        &main[..10]
+    );
+    assert!(tx.text().contains(&line), "{}", tx.text());
+    assert!(
+        tx.text().contains(
+            "clean no-op; a cut is owed: trust (TRUST-MAIN above) — the cut is in ALAB-SYNC.md"
+        ),
+        "{}",
+        tx.text()
+    );
+    let sync = w.sync();
+    assert!(
+        sync.contains(&format!(
+            "TRUST CUT OWED — trust main is build 12 ({}); the published build 9 is 3 builds behind, 14 days:",
+            &main[..10]
+        )),
+        "{sync}"
+    );
+    // The cut, in the order trust's cutting doc runs it: the candidate gate before any
+    // release, push or publish.
+    let gate = sync
+        .find("ship trust candidate --candidate")
+        .expect("the gate");
+    let stage = sync
+        .find("cp -ac \"$SEAL\" \"$STAGE\"")
+        .expect("the staging");
+    assert!(stage < gate, "the trust-wp staging comes before the gate");
+    for later in [
+        "--publish",
+        "publish-group rustc --seal \"$STAGE\" --upload",
+    ] {
+        assert!(
+            sync.find(later).expect(later) > gate,
+            "{later} after the gate"
+        );
+    }
+    let notice = "trust: published build 9 is 3 builds (14 days) behind trust main — a cut is owed (ALAB-SYNC.md)";
+    assert_eq!(
+        w.fx.notes.shown().iter().filter(|n| *n == notice).count(),
+        1
+    );
+    // A dry run reads the clone as it stands, says so, and notifies nobody.
+    let before = w.fx.notes.shown().len();
+    let (_, tx) = ok(w.run(true));
+    assert!(
+        tx.text()
+            .contains(&format!("{line}, as of the last fetch of the clone"))
+    );
+    assert_eq!(w.fx.notes.shown().len(), before);
+    // The same gap is told once a day; the next day again.
+    ok(w.run(false));
+    assert_eq!(
+        w.fx.notes.shown().iter().filter(|n| *n == notice).count(),
+        1
+    );
+    let mut tomorrow = w.fx.ctx.clone();
+    tomorrow.now_unix = fixture::later(1);
+    ok(w.run_as(&tomorrow, false));
+    assert_eq!(
+        w.fx.notes.shown().iter().filter(|n| *n == notice).count(),
+        2
+    );
+}
+
+#[test]
+fn a_pin_off_main_is_said_to_be_off_it() {
+    let w = gap_world("alab-gap-off");
+    let trust = w.dev("trust");
+    // The pin is cut from a side branch that parted at build 7.
+    git(
+        &trust,
+        &["checkout", "-q", "-b", "side", &sha_at(&trust, 7)],
+    );
+    fixture::commit(&trust, "side8", Some("2026-09-17"));
+    let side = fixture::commit(&trust, "side9", Some("2026-09-17"));
+    git(&trust, &["checkout", "-q", "main"]);
+    w.pins.lock().expect("pins").insert(
+        ("trust".into(), 9),
+        PinCommit {
+            commit: side[..9].to_string(),
+            date: Some("2026-09-17".into()),
+        },
+    );
+    let (o, tx) = ok(w.run(false));
+    let main = sha_at(&trust, 12);
+    assert!(
+        tx.text().contains(&format!(
+            "TRUST-MAIN: the published trust build 9 ({}, 2026-09-17) is OFF trust main: main {} \
+             (build 12, 2026-10-01) has 5 commits it lacks, and it has 2 main does not (they part \
+             at {}, build 7)",
+            &side[..9],
+            &main[..10],
+            &sha_at(&trust, 7)[..10]
+        )),
+        "{}",
+        tx.text()
+    );
+    assert!(rendered(&o, "trust").ends_with(&format!(
+        "; off main, 5 commits behind trust main {} (TRUST-MAIN below)",
+        &main[..10]
+    )));
+    assert!(
+        w.sync()
+            .contains("the published build 9 is off main, 5 commits behind")
+    );
+    assert!(
+        w.fx.notes
+            .shown()
+            .iter()
+            .any(|n| n.starts_with("trust: published build 9 is off trust main, 5 commits"))
+    );
+}
+
+#[test]
+fn a_pin_whose_commit_the_clone_lacks_falls_back_to_build_numbers() {
+    let w = gap_world("alab-gap-number");
+    w.pins.lock().expect("pins").insert(
+        ("trust".into(), 9),
+        PinCommit {
+            commit: "012345678".into(),
+            date: Some("2026-09-17".into()),
+        },
+    );
+    let (_, tx) = ok(w.run(false));
+    assert!(
+        tx.text().contains("is 3 builds behind trust main")
+            && tx.text().contains(
+                "by build number — the clone lacks its commit 012345678, so whether it is on main \
+                 is not known"
+            ),
+        "{}",
+        tx.text()
+    );
+}
+
+#[test]
+fn a_pin_at_main_owes_nothing() {
+    let w = gap_world("alab-gap-at");
+    let trust = w.dev("trust");
+    w.fx.publish_head(6, &[("trust", 12)]);
+    w.pins.lock().expect("pins").insert(
+        ("trust".into(), 12),
+        PinCommit {
+            commit: sha_at(&trust, 12)[..9].to_string(),
+            date: Some("2026-10-01".into()),
+        },
+    );
+    let (_, tx) = ok(w.run(false));
+    assert!(
+        tx.text().contains(&format!(
+            "TRUST-MAIN: the published trust build 12 ({}, 2026-10-01) is trust main {} (",
+            &sha_at(&trust, 12)[..9],
+            &sha_at(&trust, 12)[..10]
+        )),
+        "{}",
+        tx.text()
+    );
+    assert!(!w.sync().contains("CUT OWED"));
+    assert!(
+        !w.fx
+            .notes
+            .shown()
+            .iter()
+            .any(|n| n.contains("behind trust main"))
+    );
+}
+
+#[test]
+fn a_run_in_flight_covers_this_one_and_a_stalled_one_is_refused() {
+    let w = World::new("alab-lock");
+    let state = w.state();
+    state.ensure().expect("state");
+    let holder = aterm_update_core::FileLock::acquire(&state.lock).expect("hold the lane lock");
+    let (o, tx) = ok(w.run(false));
+    assert!(o.covered);
+    assert!(
+        tx.text()
+            .contains("another run holds alab.lockf — it covers this one; exiting 0")
+    );
+    assert!(
+        !tx.text().contains("=== auto-alab"),
+        "a covered run starts nothing"
+    );
+    state.mark_started(atpkg_publish::testkit::NOW - 13 * 3600);
+    let (r, _) = w.run(false);
+    let e = r.expect_err("a stalled run is refused");
+    assert!(e.to_string().contains("a stalled run"), "{e}");
+    assert!(w.fx.notes.shown().iter().any(|n| n.contains("stalled run")));
+    drop(holder);
+    let (o, _) = ok(w.run(true));
+    assert!(!o.covered);
+}
+
+#[test]
+fn a_finished_run_leaves_no_start_stamp_for_the_next_lock_holder_to_be_read_as() {
+    let w = World::new("alab-run-ended");
+    ok(w.run(false));
+    let state = w.state();
+    assert!(!state.started.exists(), "the run that stamped it ended");
+    // `lane install` (or a person's dry run) holds the lock a day later: that is not a
+    // stalled run, and nobody is told it is.
+    let holder = aterm_update_core::FileLock::acquire(&state.lock).expect("hold the lane lock");
+    let mut later = w.fx.ctx.clone();
+    later.now_unix = fixture::later(1);
+    let (o, _) = ok(w.run_as(&later, false));
+    assert!(o.covered);
+    assert!(
+        !w.fx.notes.shown().iter().any(|n| n.contains("stalled run")),
+        "{:?}",
+        w.fx.notes.shown()
+    );
+    drop(holder);
+}
+
+#[test]
+fn a_signing_run_needs_the_key_and_both_token_files() {
+    let w = World::new("alab-preflight");
+    std::fs::remove_file(&w.fx.ctx.tokens.staging).expect("rm token");
+    let (r, _) = w.run(false);
+    let e = r.expect_err("no staging token");
+    assert!(matches!(e, Error::CannotRun(_)), "{e}");
+    assert!(
+        e.to_string().contains("staging token file missing/empty"),
+        "{e}"
+    );
+    ok(w.run(true));
+}
+
+/// Every pack is compressed by the zstd CLI: a Mac without it (what the production probe
+/// says over an empty `PATH`) is refused before any build, so no program counts an
+/// attempt toward its latch for a tool the machine lacks. The control: the same world
+/// packs once the tool is there.
+#[test]
+fn a_signing_run_needs_the_compressor_before_any_build() {
+    let w = World::new("alab-compressor");
+    let lacks = atpkg_publish::artifact::tarwrite::compressor_in(Some(std::ffi::OsStr::new("")))
+        .expect_err("an empty PATH has no zstd");
+    *w.fx.packer.lacks.lock().expect("lacks") = Some(lacks);
+    let (r, _) = w.run(false);
+    let e = r.expect_err("no compressor");
+    assert!(matches!(e, Error::CannotRun(_)), "{e}");
+    assert!(
+        e.to_string()
+            .contains("this Mac cannot pack: no `zstd` on this builder's PATH"),
+        "{e}"
+    );
+    assert!(
+        w.fx.packer.legs().is_empty(),
+        "a build ran without a compressor"
+    );
+    assert!(
+        !w.state().attempts_file("ay", 3).exists(),
+        "an attempt was counted"
+    );
+    ok(w.run(true));
+
+    *w.fx.packer.lacks.lock().expect("lacks") = None;
+    let (o, _) = ok(w.run(false));
+    assert!(
+        rendered(&o, "ay").starts_with("PACK: v0.2.0 (build 3)"),
+        "{}",
+        rendered(&o, "ay")
+    );
+    assert!(!w.fx.packer.legs().is_empty(), "the control packed nothing");
+}
+
+#[test]
+fn the_newest_signed_release_is_the_newest_published_vxyz_carrying_its_signature() {
+    let rel = |tag: &str, draft: bool, pre: bool, signed: bool| atpkg_publish::host::Release {
+        tag: tag.into(),
+        draft,
+        prerelease: pre,
+        assets: if signed {
+            vec!["SHA256SUMS".into(), "SHA256SUMS.sig".into()]
+        } else {
+            vec!["SHA256SUMS".into()]
+        },
+    };
+    let releases = [
+        rel("v0.9.0", false, false, true),
+        rel("v0.10.0", false, false, true),
+        rel("v0.11.0", true, false, true),
+        rel("v0.12.0", false, true, true),
+        rel("v0.13.0", false, false, false),
+        rel("v1.0", false, false, true),
+        rel("atpkg-index-4", false, false, true),
+    ];
+    assert_eq!(
+        alab::newest_signed_tag(&releases).as_deref(),
+        Some("v0.10.0")
+    );
+    assert_eq!(alab::newest_signed_tag(&[]), None);
+}
+
+#[test]
+fn a_compilers_version_names_the_pins_commit_and_date() {
+    let vv = "trustc 1.99.0-dev\nbinary: rustc\ncommit-hash: 321aaeda7f00ba\ncommit-date: 2026-09-17\nhost: aarch64-apple-darwin\n";
+    assert_eq!(
+        alab::parse_vv(vv),
+        Some(PinCommit {
+            commit: "321aaeda7".into(),
+            date: Some("2026-09-17".into())
+        })
+    );
+    assert_eq!(alab::parse_vv("commit-hash: unknown\n"), None);
+}
+
+/// The human lane's commands, over typed rows: trust is the group publish from one seal;
+/// trust-mc is one `pack-bundle` leg per Apple row its pin carries, aarch64 first and the
+/// x86_64 leg merged onto a copy of it, each naming the Trust sysroot its hello compiles
+/// against, never `--no-hello`.
+#[test]
+fn the_human_lane_prints_the_bundle_packs_never_runs_them() {
+    let w = World::new("alab-human");
+    let mc = w.dev("trust-mc");
+    fixture::commit(&mc, "v0.7.0", None);
+    w.fx.release(
+        "trust-mc",
+        "v0.7.0",
+        &git(&mc, &["rev-parse", "HEAD"]),
+        Release::GOOD,
+    );
+    // The pinned trust-mc manifest carries both Apple rows: the new build must too.
+    w.fx.stage("trust-mc", 4, &[ARM, X86]);
+    let (o, _) = ok(w.run(false));
+    let mc_row = row(&o, "trust-mc");
+    assert!(matches!(mc_row.decision, Decision::HumanLane { .. }));
+    let cmd = alab::bundle_command(mc_row);
+    let legs: Vec<&String> = cmd
+        .iter()
+        .filter(|l| l.starts_with("atpkg-publish pack-bundle trust-mc "))
+        .collect();
+    assert_eq!(legs.len(), 2, "{cmd:#?}");
+    assert!(legs[0].contains("--triple aarch64-apple-darwin") && !legs[0].contains("--merge-from"));
+    assert!(legs[1].contains("--triple x86_64-apple-darwin --merge-from <out dir>/pack-trust-mc-5/merge-base-trust-mc-5.toml"));
+    let copy = cmd
+        .iter()
+        .position(|l| l.starts_with("cp -f <out dir>/pack-trust-mc-5/pkg-trust-mc-5.toml"))
+        .expect("the base is copied aside");
+    let first = cmd.iter().position(|l| *l == *legs[0]).expect("first");
+    let second = cmd.iter().position(|l| *l == *legs[1]).expect("second");
+    assert!(first < copy && copy < second, "{cmd:#?}");
+    assert!(
+        legs.iter()
+            .all(|l| l.contains("--hello-sysroot <the Trust sysroot this leg's trust-mc-compiler"))
+    );
+    assert!(!cmd.iter().any(|l| l.contains("--no-hello")));
+    let trust = alab::bundle_command(row(&o, "trust"));
+    assert!(
+        trust.iter().any(|l| l
+            == "atpkg-publish publish-group rustc --seal <the staged copy of the seal> --upload")
+    );
+    assert!(
+        !trust.iter().any(|l| l.contains("pack-bundle")),
+        "{trust:#?}"
+    );
+}
+
+#[test]
+fn a_pins_record_from_other_targets_is_retired_once_never_believed() {
+    let w = World::new("alab-restamp");
+    let state = w.state();
+    state.ensure().expect("state");
+    // A record resolved for another target set, with a pin that would read as a downgrade.
+    std::fs::write(
+        &state.pins_seen,
+        "# pins-resolved-for aarch64-apple-darwin\nay 99\n",
+    )
+    .expect("write");
+    let (_, tx) = ok(w.run(false));
+    assert!(
+        tx.text()
+            .contains("pins-seen was not recorded for aarch64-apple-darwin x86_64-apple-darwin")
+    );
+    let text = std::fs::read_to_string(&state.pins_seen).expect("re-stamped");
+    assert!(
+        text.starts_with("# pins-resolved-for aarch64-apple-darwin x86_64-apple-darwin\n"),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_pinned_program_with_no_signed_release_is_skipped_and_holds_nothing_else() {
+    let w = World::new("alab-no-release");
+    let text = w.fx.index_text(
+        6,
+        &[
+            ("ay", 2),
+            ("clean", 4),
+            ("nn", 2),
+            ("trust-ir", 1),
+            ("trust", 5),
+            ("trust-mc", 4),
+        ],
+    );
+    w.fx.publish_index_text(6, &text);
+    let (o, tx) = ok(w.run(false));
+    let public = &w.fx.ctx.accounts.public;
+    assert!(
+        rendered(&o, "clean").starts_with(&format!(
+            "SKIP: no signed vX.Y.Z release readable on {public}/clean"
+        )),
+        "{}",
+        rendered(&o, "clean")
+    );
+    assert!(
+        tx.text()
+            .contains("clean: no signed vX.Y.Z release readable")
+    );
+    assert_eq!(
+        o.pinned,
+        ["ay"],
+        "a skipped program in no group holds nothing"
+    );
+}
+
+#[test]
+fn a_staged_pack_that_does_not_verify_is_never_pinned_or_packed_over() {
+    let w = World::settled("alab-invalid-stage");
+    let ay = w.dev("ay");
+    fixture::commit(&ay, "v0.9.0", None);
+    w.fx.release(
+        "ay",
+        "v0.9.0",
+        &git(&ay, &["rev-parse", "HEAD"]),
+        Release::GOOD,
+    );
+    let slug = w.fx.ctx.staging_slug("ay");
+    let text = fixture::manifest("ay", 5, &[ARM, X86]);
+    w.fx.host
+        .put_asset(&slug, "atpkg-ay-5", "pkg-ay-5.toml", text.into_bytes());
+    w.fx.host
+        .put_asset(&slug, "atpkg-ay-5", "pkg-ay-5.toml.sig", vec![0u8; 64]);
+    let packs = w.fx.packer.legs().len();
+    let (o, _) = ok(w.run(false));
+    assert!(
+        rendered(&o, "ay").starts_with("SKIP: atpkg-ay-5 on alabsystems does not verify"),
+        "{}",
+        rendered(&o, "ay")
+    );
+    assert_eq!(w.fx.packer.legs().len(), packs);
+    assert_eq!(w.fx.indexer.count(), 2);
+}
+
+#[test]
+fn a_horizon_inside_thirty_days_is_warned_written_and_told() {
+    let w = World::new("alab-horizon");
+    let text =
+        w.fx.index_text(6, &[("nn", 2)])
+            .replace(atpkg_publish::testkit::FAR_FUTURE, "2026-11-01T00:00:00Z");
+    w.fx.publish_index_text(6, &text);
+    let (_, tx) = ok(w.run(false));
+    let note = "index horizon 2026-11-01T00:00:00Z is 17 day(s) away";
+    assert!(
+        tx.text().contains(&format!("WARNING — {note}")),
+        "{}",
+        tx.text()
+    );
+    assert!(
+        w.sync().contains(&format!("HORIZON: {note}")),
+        "{}",
+        w.sync()
+    );
+    assert!(w.fx.notes.shown().iter().any(|n| n.starts_with(note)));
+}
+
+/// World's head, with `program`'s `[programs.*]` block naming `group`.
+fn head_with_group(w: &World, n: u64, program: &str, group: &str) {
+    let pins = [
+        ("ay", 2),
+        ("nn", 2),
+        ("trust-ir", 1),
+        ("trust", 5),
+        ("trust-mc", 4),
+        ("claude", 2_026_090_101),
+    ];
+    let repo = atpkg_publish::programs::get(program).map_or(program, |d| d.repo);
+    let block = format!("[programs.{program}]\nrepo = \"{repo}\"\npolicy = \"prebuilt-only\"\n");
+    let text = w.fx.index_text(n, &pins);
+    assert!(text.contains(&block), "{text}");
+    w.fx.publish_index_text(
+        n,
+        &text.replace(&block, &format!("{block}coherence_group = \"{group}\"\n")),
+    );
+}
+
+#[test]
+fn the_hold_follows_the_group_the_channel_enforces() {
+    let w = World::new("alab-head-group");
+    // The table puts ay in no group; the head clients enforce puts it with trust.
+    head_with_group(&w, 6, "ay", "rustc");
+    let (o, _) = ok(w.run(false));
+    assert!(o.packed.contains(&"ay".to_string()), "{:?}", o.packed);
+    assert_eq!(o.held, ["ay", "trust-ir"]);
+    assert!(o.published.is_none(), "nothing may move while trust waits");
+}
+
+#[test]
+fn a_head_and_table_that_disagree_on_a_group_refuse_the_run() {
+    let w = World::new("alab-group-divergence");
+    head_with_group(&w, 6, "trust-ir", "other");
+    let (r, _) = w.run(true);
+    let e = r.expect_err("divergence");
+    assert!(
+        e.to_string().contains(
+            "index-6 puts trust-ir in coherence group `other`, but this build's program table \
+             says `rustc`"
+        ),
+        "{e}"
+    );
+}
+
+#[test]
+fn a_scratch_clone_is_fetched_as_the_staging_identity_never_by_its_origin() {
+    let w = World::settled("alab-fetch");
+    let clone = w.state().dir.join("progs/ay");
+    // A bare `git fetch origin` would now fail, and the new release would not resolve.
+    git(&clone, &["remote", "set-url", "origin", "/nonexistent/ay"]);
+    let build = ay_release(&w, "v0.7.0");
+    let (o, tx) = ok(w.run(false));
+    assert!(
+        rendered(&o, "ay").starts_with(&format!("PACK: v0.7.0 (build {build})")),
+        "{}",
+        tx.text()
+    );
+    assert!(
+        w.fx.calls("fetch-repo ")
+            .contains(&"fetch-repo alabsystems/ay".to_string())
+    );
+}
+
+/// A release's signed SHA256SUMS lists every file it ships, so it outgrows the manifest
+/// cap (trust v0.8.0's is 8.7 MB): it is read under its own bound, and still verified.
+#[test]
+fn a_sums_larger_than_a_manifest_is_still_read_and_verified() {
+    let w = World::settled("alab-big-sums");
+    let ay = w.dev("ay");
+    fixture::commit(&ay, "v0.7.0", None);
+    let build: u64 = git(&ay, &["rev-list", "--count", "HEAD"])
+        .parse()
+        .expect("count");
+    let listing = usize::try_from(atpkg::net::MANIFEST_CAP / 64).expect("small");
+    w.fx.release(
+        "ay",
+        "v0.7.0",
+        &git(&ay, &["rev-parse", "HEAD"]),
+        Release {
+            listing,
+            ..Release::GOOD
+        },
+    );
+    let sums =
+        w.fx.host
+            .asset(&w.fx.ctx.public_slug("ay"), "v0.7.0", "SHA256SUMS")
+            .expect("published");
+    assert!(u64::try_from(sums.len()).expect("len") > atpkg::net::MANIFEST_CAP);
+    let (o, tx) = ok(w.run(false));
+    assert!(
+        rendered(&o, "ay").starts_with(&format!("PACK: v0.7.0 (build {build})")),
+        "{}",
+        tx.text()
+    );
+}
+
+#[test]
+fn a_ledger_key_that_is_not_a_full_sha_never_reaches_git() {
+    let w = World::settled("alab-ledger-key");
+    let ay = w.dev("ay");
+    fixture::commit(&ay, "v0.7.0", None);
+    w.fx.release("ay", "v0.7.0", "--upload-pack=touch", Release::GOOD);
+    let (o, _) = ok(w.run(true));
+    assert!(
+        matches!(&row(&o, "ay").decision, Decision::Unresolved(why) if why.contains("`--upload-pack=touch`, which is not a 40-hex dev commit")),
+        "{:?}",
+        row(&o, "ay").decision
+    );
+}
+
+#[test]
+fn a_key_the_roster_does_not_list_packs_and_signs_nothing() {
+    let w = World::new("alab-unrostered");
+    let (stranger, stranger_pub) = atpkg_keys::generate().expect("a key no roster lists");
+    std::fs::write(&w.fx.ctx.identity.key, stranger).expect("key");
+    std::fs::write(
+        &w.fx.ctx.identity.record,
+        format!(
+            "id = \"m99\"\npubkey = \"{stranger_pub}\"\nminted_at = \"2026-08-04T00:00:00Z\"\n"
+        ),
+    )
+    .expect("record");
+    let (r, _) = w.run(false);
+    let e = r.expect_err("an unrostered key refuses");
+    assert!(
+        e.to_string().contains("machine 'm99' is NOT on the roster"),
+        "{e}"
+    );
+    assert!(w.fx.packer.legs().is_empty() && w.fx.indexer.count() == 0);
+    assert!(w.fx.calls("clone ").is_empty(), "refused before any clone");
+    ok(w.run(true));
+}

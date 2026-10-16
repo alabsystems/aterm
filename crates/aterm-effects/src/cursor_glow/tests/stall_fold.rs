@@ -5,12 +5,10 @@
 
 use super::*;
 
-/// S8a: a 350 ms stall on the key whose echo wraps the row (the TUI
-/// model — the caret moves to the next row's head). Licensed by the one
-/// press in flight as a fold, the last column lit on the echoing tick
-/// and one beat later, nothing yet on the new row, the press spent, the
-/// pool not forgotten; the next key on the new row lays its own cell
-/// with nothing to bridge.
+/// A 350 ms stall on the key whose echo wraps the row (the TUI model: the caret moves to the
+/// next row's head) is licensed by the one press in flight as a fold: the last column lit on the
+/// echoing tick and a beat later, nothing yet on the new row, the press spent, the pool not
+/// forgotten. The next key on the new row lays its own cell with nothing to bridge.
 #[test]
 fn a_stalled_key_whose_echo_wraps_the_row_lights_the_last_column() {
     let g = wide_geom();
@@ -80,10 +78,9 @@ fn a_stalled_key_whose_echo_wraps_the_row_lights_the_last_column() {
     assert_eq!(bridged(&glow), 0, "nothing to bridge");
 }
 
-/// The DEFERRED-WRAP echo after a stall (the xterm model: the wrap lands
-/// with the next glyph, `(11,99) -> (12,1)`): a fold of two cells paid
-/// by two of three presses in flight — both fold cells lit, and the
-/// fold spends what it lays, not the whole pool.
+/// The deferred-wrap echo after a stall (the xterm model: the wrap lands with the next glyph,
+/// `(11,99) -> (12,1)`): a two-cell fold paid by two of three presses in flight lights both fold
+/// cells and spends only what it lays.
 #[test]
 fn a_deferred_wrap_echo_after_a_stall_lays_both_fold_cells() {
     let g = wide_geom();
@@ -111,9 +108,8 @@ fn a_deferred_wrap_echo_after_a_stall_lays_both_fold_cells() {
     );
 }
 
-/// CONTROLS: a program's newline with NO press in flight lays nothing
-/// (refused, dark); a fold with more cells than presses is refused AND
-/// forgotten (the cross-row edge).
+/// Controls: a program's newline with no press in flight lays nothing, and a fold with more
+/// cells than presses is refused and the pool forgotten (the cross-row edge).
 #[test]
 fn a_program_newline_with_no_press_in_flight_lays_nothing() {
     let g = wide_geom();
@@ -165,9 +161,8 @@ fn a_program_newline_with_no_press_in_flight_lays_nothing() {
     assert!(v2_cols(&short, 12).is_empty());
 }
 
-/// A PER-KEY FOLD IS BYTE-IDENTICAL under the origin-row sweep: the
-/// key's `Typed` replay already folded its cell onto the row above, and
-/// the sweep lays only what no live cell owns — exactly one new cell on
+/// A per-key fold is unchanged by the origin-row sweep: the key's `Typed` replay already folded
+/// its cell onto the row above, and the sweep lays only what no live cell owns — one new cell on
 /// the fold, nothing on the landing row for a landing at column 0.
 #[test]
 fn a_per_key_fold_lays_the_same_cells_under_the_origin_row_sweep() {
@@ -195,10 +190,9 @@ fn a_per_key_fold_lays_the_same_cells_under_the_origin_row_sweep() {
     assert_eq!(glow.admission_tally().declined, 0);
 }
 
-/// A STALLED FOLD IS BORN NO EARLIER THAN THE BIRTH FLOOR: the origin-row
-/// sweep is dated `max(press, now - 0.25 s)`, so after a 3 s stall the
-/// last column is lit on the echoing frame and still lit a beat later,
-/// not born three seconds into a cohort that has already faded.
+/// A stalled fold is born no earlier than the birth floor: the origin-row sweep is dated
+/// `max(press, now - 0.25 s)`, so after a 3 s stall the last column is lit on the echoing frame
+/// and a beat later, not born into a cohort that has already faded.
 #[test]
 fn a_stalled_fold_is_born_no_earlier_than_the_birth_floor() {
     let g = wide_geom();
@@ -229,13 +223,10 @@ fn a_stalled_fold_is_born_no_earlier_than_the_birth_floor() {
     );
 }
 
-/// S8e: the PENDING-WRAP glyph at the last column (the xterm model) —
-/// no cursor move is ever observed for it; the print anchor, counting
-/// the deferred wrap, sits one past the caret parked on the pane's last
-/// cell. The anchored lane admits it on the fresh stamp as a +1 echo
-/// (the last column lit on time); the fold that follows with the next
-/// key lays the new row's head, once. A keyless print of the same shape
-/// is silent.
+/// A pending-wrap glyph at the last column (the xterm model) shows no cursor move; the print
+/// anchor, counting the deferred wrap, sits one past the caret parked on the pane's last cell.
+/// The anchored lane admits it on the fresh stamp as a +1 echo, and the fold that follows with
+/// the next key lays the new row's head once. A keyless print of the same shape is silent.
 #[test]
 fn a_pending_wrap_glyph_at_the_last_column_lights_on_its_own_anchored_echo() {
     let g = wide_geom();
@@ -328,7 +319,7 @@ fn a_pending_wrap_glyph_at_the_last_column_lights_on_its_own_anchored_echo() {
         "the ring shows the pending-wrap echo and the fold"
     );
 
-    // CONTROL: the same last-column print with no stamp and no press.
+    // Control: the same last-column print with no stamp and no press.
     let mut cold = CursorGlow::default();
     cold.tick(Some((11, 99)), t0, &c, g, &mut out);
     cold.observe_print_anchor(Some((11, 99, 1)));

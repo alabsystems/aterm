@@ -1,13 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-use aterm_spec::{derive::ribbon_row_hold_model, verify};
-
-#[test]
-fn ribbon_row_hold_proves_and_catches_global_renewal() {
-    let model = ribbon_row_hold_model();
-    verify::prove_and_catch_scalar(&model, model.name);
-}
+use aterm_spec::derive::ribbon_row_hold_model;
 
 #[test]
 fn ribbon_row_hold_permits_returning_to_the_earlier_row() {

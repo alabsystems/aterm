@@ -216,8 +216,8 @@ fn repeated_new_output_is_not_mistaken_for_a_moved_row() {
 
 #[test]
 fn sparse_particle_rewrites_never_light_the_unchanged_composer_or_gaps() {
-    // The captured TUI uses braille particles. ASCII obeys the same rule:
-    // this is attribution by changed cells, not a Unicode-block exception.
+    // Braille particles and ASCII obey the same rule: attribution is by changed
+    // cells, not a Unicode-block exception.
     for particles in [["⠁", "⠂"], ["x", "y"]] {
         let mut h = Host::new(&format!(
             "\x1b[6;3HAsk Codex\x1b[6;25H{}\x1b[6;41H{}\x1b[6;3H",

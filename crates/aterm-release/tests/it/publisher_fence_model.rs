@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 binding from real bare-Git publisher fencing to
-//! `ReleasePublisherFence`. Recovery assumes the old publisher has been proved
-//! stopped; production must reject any residual stale guard's later mutation and
-//! exact-token cleanup authority.
+//! Tier-1 binding from real bare-Git publisher fencing to `ReleasePublisherFence`. Recovery
+//! assumes the old publisher is proved stopped; production must refuse a residual stale
+//! guard's later mutation and exact-token cleanup.
 
 use crate::{ledger, publish};
 
@@ -152,11 +151,9 @@ fn stopped_process_recovery_rejects_residual_guard_and_exact_cleanup() {
         "AcquireA",
         "publisher fence: create-only unique token",
     );
-    // NEGATIVE CONTROL, on the remote's real answer: the query `publisher_fence`
-    // sends returns TWO rows for one well-formed fence — the annotated ref and
-    // its `^{}` peel. A parser that took a row for a fence would count two and
-    // refuse, with no observed fault to explain the refusal; the real parse
-    // above read those same two rows as one fence.
+    // Negative control on the remote's real answer: one well-formed fence is two rows (the
+    // annotated ref and its `^{}` peel). A parser counting rows as fences would refuse with no
+    // observed fault; the real parse above read them as one.
     let peel = format!("{}^{{}}", publish::PUBLISHER_FENCE_REF);
     let out = ledger::GitRunner::git(
         &git,
@@ -182,10 +179,9 @@ fn stopped_process_recovery_rejects_residual_guard_and_exact_cleanup() {
         "publisher fence: exact owner+token admits mutation",
     );
 
-    // The operator has established the documented stopped-publisher precondition.
-    // Retaining a copy of A's guard lets this test prove that residual token data
-    // cannot mutate or delete B after B's exact-CAS rotation. It does not claim
-    // that rotation cancels an external request which was already in flight.
+    // The operator has established the stopped-publisher precondition. A retained copy of A's
+    // guard proves residual token data cannot mutate or delete B after B's exact-CAS rotation;
+    // rotation does not cancel an external request already in flight.
     state = transition(
         &model,
         &state,

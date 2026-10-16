@@ -1,22 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-//! Panic-freedom fuzz for the VT engine on hostile terminal output.
-//!
-//! A terminal must never panic on the bytes a program writes to it — a crash on
-//! `curl evil | cat`, a crafted log file, or a corrupt stream is a denial of
-//! service for a daily driver. This pins ROBUSTNESS across the full byte space
-//! (malformed UTF-8, the whole `0x00..=0xFF` range) and the structured
-//! escape-sequence space (CSI/OSC/DCS/APC/PM with extreme or random params,
-//! bodies, intermediates, and terminators), interleaved with resizes.
-//! It asserts `process()` never panics AND core invariants hold (cursor in
-//! bounds, dimensions positive, every cell accessible) after arbitrary input.
-//!
-//! Deterministic LCG so any failure reproduces exactly.
+//! Panic-freedom fuzz for the VT engine on hostile output (`curl evil | cat`): the full
+//! byte space and the structured escape space (CSI/OSC/DCS/APC/PM with extreme or random
+//! params, bodies, intermediates and terminators), interleaved with resizes, with core
+//! invariants asserted after every step. Deterministic LCG, so a failure reproduces.
 
 use aterm_core::terminal::Terminal;
 
-/// One step of a deterministic LCG (same constants as the lz4 decode fuzz).
+/// One step of a deterministic LCG (Knuth's MMIX constants).
 #[inline]
 fn next(state: &mut u64) -> u32 {
     *state = state
@@ -43,28 +35,22 @@ fn check_invariants(term: &Terminal) {
         "cursor col {} escaped bounds (cols {cols})",
         cur.col
     );
-    // Wire in the engine's own formal invariants (grid/invariants.rs): cursor
-    // bounds, scroll-region, ring-buffer structure, and wide-char pairing.
+    // The grid's own invariants (aterm-grid `invariants.rs`): cursor bounds, scroll
+    // region, ring structure, wide-char pairing.
     term.grid().assert_structural_invariants();
     term.grid().assert_wide_char_consistent();
 }
 
 /// Every extras-map entry on screen is claimed by its cell's HAS_EXTRAS bit
-/// (`Grid::assert_extras_claimed`): an operation that blanks or replaces a cell
-/// drops what the cell carried, or a later write adopts an old combining mark,
-/// skin tone or link. Run by the three process fuzzers and the two
-/// oscillating-resize fuzzers after every step; the resize ones gained it once
-/// a bottom line feed after a rows-only grow scrolled every row again
-/// (R15-CHUNK-RING-SCROLL, 4cb72d84b), the defect it had reported there as
-/// unclaimed entries.
+/// (`Grid::assert_extras_claimed`): an operation that blanks or replaces a cell drops
+/// what the cell carried, or a later write adopts an old combining mark, skin tone or link.
 fn check_extras_claimed(term: &Terminal) {
     term.grid().assert_extras_claimed();
 }
 
 /// Every cell must be accessible without panic (corruption would index-panic).
 fn walk_all_cells(term: &Terminal) {
-    // `Grid::cell(r, c)` is `row(r)` then `get(c)`; resolving the row once
-    // per row visits the same cells.
+    // `Grid::cell(r, c)` is `row(r)` then `get(c)`, so this visits the same cells.
     let (rows, cols) = (term.rows(), term.cols());
     for r in 0..rows {
         let Some(row) = term.grid().row(r) else {
@@ -105,9 +91,8 @@ fn process_crafted_escape_sequences_never_panics() {
     // unchecked index or overflow on an attacker-chosen parameter would panic.
     let mut s = 0x0BAD_C0DE_99C0_1A57u64;
     let mut term = Terminal::new(24, 80);
-    // Every `resize()` below reflows all retained history; at the default
-    // 10,000-line ring that was ~2/3 of the run. Same cap as the other resize
-    // fuzzers, which also lets the ring reach capacity and wrap.
+    // Each `resize()` reflows all retained history; the cap bounds that and lets the ring
+    // wrap.
     term.set_scrollback_line_limit(Some(RESIZE_FUZZ_SCROLLBACK_LINES));
     let mut buf: Vec<u8> = Vec::with_capacity(256);
     for _ in 0..100_000u32 {
@@ -176,12 +161,8 @@ fn process_unicode_edges_never_panics() {
     walk_all_cells(&term);
 }
 
-/// Deeper invariants for the reflow stress: everything `check_invariants` pins,
-/// plus scrollback consistency (`total_lines >= visible rows`, the spec's
-/// `TotalLinesMinimum`) and the offset-0 precondition of the strict cell walk.
-/// All O(1); the resize fuzzers run them after every step, and
-/// [`walk_visible_cells_strict`] (which calls this first) adds the O(rows x cols)
-/// cell walk where a row can have just been rebuilt.
+/// [`check_invariants`] plus scrollback consistency (`total_lines >= visible rows`, the
+/// spec's `TotalLinesMinimum`) and the offset-0 precondition of the strict cell walk.
 fn check_invariants_reflow(term: &Terminal) {
     check_invariants(term);
     let (rows, cols) = (term.rows(), term.cols());
@@ -190,17 +171,9 @@ fn check_invariants_reflow(term: &Terminal) {
         total >= rows as usize,
         "total_lines {total} < visible rows {rows} ({rows}x{cols})"
     );
-    // The cell walk (`walk_visible_cells_strict`) is an oracle with A precondition, so state it. `Grid::cell`
-    // resolves through `GridStorage::row_index`, the ring accessor — it serves only
-    // ring-resident rows and returns `None` for a viewport scrolled onto lazy or
-    // tiered history (pinned by `grid/tests/style_perf.rs`
-    // `row_returns_none_when_scrolled_into_tiered_scrollback`). The real viewport
-    // reader is `visible_row_view`, whose bound is `scrollback_lines()`. So "every
-    // visible cell is accessible" is a sound test only at offset 0, which is where
-    // these fuzzers always sit: nothing they emit moves the viewport, and the batch
-    // prologue re-pins only when it was already nonzero. Assert it rather than
-    // assume it — without this line a viewport change elsewhere reads out as
-    // "reflow corrupted the grid".
+    // `Grid::cell` reads ring-resident rows only (`None` on a viewport scrolled onto lazy
+    // or tiered history), so the cell walk holds only at offset 0. These fuzzers never
+    // move the viewport.
     assert_eq!(
         term.grid().display_offset(),
         0,
@@ -208,24 +181,13 @@ fn check_invariants_reflow(term: &Terminal) {
     );
 }
 
-/// Every visible cell must be accessible (a corrupt row index/length would
-/// panic or return None here), and reading its char must not panic. Only sound
-/// at display offset 0 — [`check_invariants_reflow`] asserts that first.
-///
-/// Where it runs: in `reflow_wide_char_resize_never_panics`, after every step
-/// (process and resize) and at the end. The per-step walk is the only strict
-/// row-width check that follows a `process()`, and it matters most once the
-/// capped ring ([`RESIZE_FUZZ_SCROLLBACK_LINES`]) wraps: `scroll_up` then
-/// recycles ring rows, and a recycled row of stale width shows up right after
-/// a `process()` step, where a later width-changing resize could rebuild it
-/// before a resize-only walk saw it. Measured cost on the capped test (debug
-/// build, CPU user seconds, box at load 40-95): 16.5-17.6 s with the per-step
-/// walk vs 19.6-20.7 s without it, i.e. below this box's noise; reflow of the
-/// retained history, not this walk, is the long pole.
+/// Every visible cell must be accessible (a corrupt row index/length would panic or return
+/// None here), and reading its char must not panic. Only sound at display offset 0, which
+/// [`check_invariants_reflow`] asserts first. Run after every step: once the capped ring
+/// ([`RESIZE_FUZZ_SCROLLBACK_LINES`]) wraps, `scroll_up` recycles ring rows, and a recycled
+/// row of stale width shows right after a `process()`, before a width change rebuilds it.
 fn walk_visible_cells_strict(term: &Terminal) {
     check_invariants_reflow(term);
-    // `Grid::cell(r, c)` is `row(r)` then `get(c)`: the row is resolved once
-    // per row, and a missing row fails at its first cell as before.
     let (rows, cols) = (term.rows(), term.cols());
     for r in 0..rows {
         let row = term.grid().row(r);
@@ -238,14 +200,10 @@ fn walk_visible_cells_strict(term: &Terminal) {
     }
 }
 
-/// Read every visible line plus a sampled scrollback window. This reconstructs
-/// reflowed rows + history lines (slicing wide graphemes), so corruption from a
-/// resize surfaces here as a panic or out-of-range slice rather than silently.
-///
-/// History is sampled, not walked: the 16 lines just above the screen, about 16
-/// lines strided across the full history depth, the oldest line, and one past
-/// it (the `None` boundary). The previous contiguous 256-line walk never
-/// reached the ring-cap or oldest-line boundaries of a deeper history.
+/// Read every visible line plus a sampled scrollback window, reconstructing reflowed rows
+/// and history lines (slicing wide graphemes), so resize corruption surfaces as a panic.
+/// History is sampled: the 16 lines just above the screen, about 16 lines strided across
+/// the full depth, the oldest line, and one past it (the `None` boundary).
 fn probe_lines(term: &Terminal) {
     let rows = i32::from(term.rows());
     for r in 0..rows {
@@ -321,24 +279,11 @@ fn screen_text(term: &Terminal) -> Vec<String> {
         .collect()
 }
 
-/// Feed `buf` as `process` would, checking every line feed that lands on the
-/// bottom row of a full-screen scroll region at the live bottom: it scrolls
-/// every visible row up by exactly one and leaves a blank bottom row. The
-/// resize fuzzers' screen-text invariant.
-///
-/// The split is at line feeds only, which these fuzzers never emit inside an
-/// escape sequence or between a base and its combining mark, so the engine
-/// sees the bytes it would see in one `process`.
-///
-/// Why (R15-CHUNK-RING-SCROLL, 2026-10-11): a rows-only grow revealing history
-/// left a wrapped ring below a lifted cap, and the next scroll's ring append
-/// landed mid-ring, so the rows past it stayed put (or the screen did not move
-/// at all and each line overwrote the bottom row) while the extras map
-/// scrolled whole. The chunking lane's `check_extras_claimed` saw that only
-/// where a stranded combining mark landed on a cell that no longer claimed it;
-/// this reads the cells themselves, with or without extras. The two are
-/// complementary: that one checks the extras map against the cells after any
-/// step, this one checks one operation's effect on the cells.
+/// Feed `buf` as `process` would, checking every line feed that lands on the bottom row of
+/// a full-screen scroll region at the live bottom: it scrolls every visible row up by
+/// exactly one and leaves a blank bottom row. The split is at line feeds only, which these
+/// fuzzers never emit inside an escape sequence or before a combining mark. Reading the
+/// cells catches a scroll that moved the extras but not the rows.
 fn process_checking_bottom_line_feeds(term: &mut Terminal, buf: &[u8]) {
     let mut rest = buf;
     while let Some(lf) = rest.iter().position(|&b| b == b'\n') {
@@ -384,12 +329,8 @@ fn process_checking_bottom_line_feeds(term: &mut Terminal, buf: &[u8]) {
 
 #[test]
 fn reflow_wide_char_resize_never_panics() {
-    // The gap the other fuzzers leave: WIDE graphemes driven through aggressive
-    // resize/reflow oscillation. A wide char straddling a shrunk column boundary
-    // is the classic reflow corruption surface; this asserts panic-freedom and
-    // the wide-continuation pairing and line-reconstruction across every resize,
-    // and that every line feed at the bottom scrolls the whole screen
-    // (`process_checking_bottom_line_feeds`).
+    // Wide graphemes through aggressive resize/reflow oscillation: a wide char straddling
+    // a shrunk column boundary is the classic reflow corruption surface.
     let mut s = 0x5EED_1234_ABCD_9001u64;
     let mut term = Terminal::new(24, 80);
     term.set_scrollback_line_limit(Some(RESIZE_FUZZ_SCROLLBACK_LINES));
@@ -415,10 +356,9 @@ fn reflow_wide_char_resize_never_panics() {
     walk_visible_cells_strict(&term);
 }
 
-/// A WideCharConsistent case replayed from bytes: `ESC # 6` makes the row
-/// DECDWL, 45 cells then U+A0E2 (a wide Yi syllable) put a pair at 45/46, and a
-/// resize 112 -> 46 truncates the row through that pair. The head in the new
-/// last column must be blanked, never left wide without its continuation.
+/// `ESC # 6` makes the row DECDWL, 45 cells then U+A0E2 (a wide Yi syllable) put a pair at
+/// 45/46, and a resize 112 -> 46 cuts through it: the head in the new last column is
+/// blanked, never left wide without its continuation.
 #[test]
 fn a_decdwl_row_resized_through_its_wide_pair_stays_consistent() {
     let mut term = Terminal::new(4, 112);
@@ -435,12 +375,9 @@ fn a_decdwl_row_resized_through_its_wide_pair_stays_consistent() {
     term.grid().assert_wide_char_consistent();
 }
 
-/// The alternate screen resizes without rewrap, so a width cut through a wide
-/// pair blanks its head (`Row::resize`). The head's extras go with it: a
-/// linked emoji cut that way leaves no link, mark or cluster on the blank for
-/// `hyperlink_at` (a click target), checkpoint serialization or a later
-/// extras-styled write to read. Replayed from the alternate-screen resize
-/// fuzzer's first `ExtrasClaimed` violation (2026-10-11).
+/// The alternate screen resizes without rewrap, so a width cut through a wide pair blanks
+/// its head (`Row::resize`) and drops the head's extras: no link, mark or cluster stays on
+/// the blank.
 #[test]
 fn an_alt_screen_width_cut_through_a_wide_pair_drops_its_extras() {
     for glyph in ["\u{1F680}", "\u{4E2D}\u{301}"] {
@@ -470,13 +407,9 @@ fn an_alt_screen_width_cut_through_a_wide_pair_drops_its_extras() {
 
 #[test]
 fn alt_screen_resize_never_panics() {
-    // Resizing while in the alternate screen (vim / htop / less) is a real,
-    // common scenario with a distinct buffer + resize path the other fuzzers
-    // never enter. Toggle DEC 1049 (alt screen + cursor save/restore) around
-    // wide-char content and aggressive resizes; assert panic-freedom + the
-    // structural invariants (via check_invariants) throughout the switches, and
-    // that every line feed at the bottom scrolls the whole screen
-    // (`process_checking_bottom_line_feeds`).
+    // The alternate screen (vim, htop, less) has its own buffer and resize path: toggle
+    // DEC 1049 around wide-char content and aggressive resizes, and check that every line
+    // feed at the bottom scrolls the whole screen.
     let mut s = 0xA17E_5C9E_2026_0601u64;
     let mut term = Terminal::new(24, 80);
     term.set_scrollback_line_limit(Some(RESIZE_FUZZ_SCROLLBACK_LINES));
@@ -606,14 +539,9 @@ fn emit_escape(s: &mut u64, buf: &mut Vec<u8>) {
     }
 }
 
-/// Resize / reflow robustness fuzz, with its own emitter, invariants and seed.
-///
-/// Drives realistic samples (long wrapping ASCII, wide CJK, emoji ZWJ
-/// clusters, combining marks, tabs, SGR, home, a lone cell in pending-wrap)
-/// and resizes about every other iteration through random dimensions,
-/// including 1xN / Nx1, asserting after each resize that the dimensions match
-/// and the cursor is in bounds, and at the end that every cell is accessible.
-/// Deterministic LCG: any failure reproduces exactly.
+/// Resize / reflow fuzz with its own emitter and seed: realistic samples (wrapping ASCII,
+/// wide CJK, ZWJ emoji, combining marks, tabs, SGR, home, a pending-wrap cell) and a
+/// resize about every other iteration, down to 1xN and Nx1.
 mod resize_reflow {
     use aterm_core::terminal::Terminal;
 
@@ -696,15 +624,9 @@ mod resize_reflow {
         }
     }
 
-    /// The same schedule under the ConPTY seam policy (how a Windows session
-    /// resizes), plus that policy's law: a rows-only grow appends blank rows at
-    /// the bottom and reveals nothing, so it never changes the history depth,
-    /// and it moves the counter with the rows it appends, so nothing renumbers.
-    ///
-    /// Fewer iterations than the native schedule: with no reveal, history
-    /// accumulates (up to a few thousand lines), so each width change also
-    /// rewraps history, the path this schedule exists to reach, at a much
-    /// higher cost per iteration.
+    /// The same schedule under the ConPTY seam policy, plus its law: a rows-only grow appends
+    /// blank rows and reveals nothing, so the history depth and every absolute key stay put.
+    /// Fewer iterations: with no reveal, history accumulates and each width change rewraps it.
     #[test]
     fn resize_reflow_keeps_engine_invariants_under_the_conpty_policy() {
         use aterm_core::grid::ResizePolicy;
@@ -760,10 +682,6 @@ mod resize_reflow {
     }
 }
 
-// Fresh-terminal batches: a fresh 24x80 terminal fed one multi-KiB batch,
-// chunked soup, 1..=3 x 1..=3 grids, and the adversarial corpus.
-// aterm-conformance's `vt` suite mounts the same file, so the soups also run
-// against aterm-core[sixel]; the module's doc says why that takes two binaries.
-// (This file is a module of `core_fuzz`, so `mod fresh;` finds
-// `fuzz_process_never_panics/fresh.rs`.)
+// Fresh-terminal batches. aterm-conformance's `vt` suite mounts the same file, so they
+// also run against aterm-core[sixel] (the module doc says why that takes two binaries).
 mod fresh;

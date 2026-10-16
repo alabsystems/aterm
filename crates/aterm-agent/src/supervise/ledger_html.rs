@@ -2,21 +2,14 @@
 // Copyright 2026 Andrew Yates
 
 //! `aterm drive ledger --format html`: one self-contained page with the
-//! summary on top, three swimlanes (manager, watcher, worker) and the fabric's
-//! mail on a time axis, then every row as a table.
+//! summary, swimlanes (manager, watcher, worker, fabric) on a time axis, and
+//! every row as a table.
 //!
 //! No network: style and script are inline, and a `Content-Security-Policy`
 //! of `default-src 'none'` keeps a URL in a worker's words from becoming a
-//! request. Every string from the worker, journal or bus is escaped, into the
-//! HTML as text ([`html_text`]) and into the embedded JSON with `<`, `>` and
-//! `&` as `\u` escapes ([`html_json_str`]), so nothing can close a tag.
-//!
-//! A turn is a bar in the worker lane from when `turn` started to where it
-//! settled, with a lighter bar on to the EVENT that ended the reply; the other
-//! lanes carry marks, one shape and hue per lane, with a status colour for
-//! what went wrong. Hovering shows the whole line, which the table also
-//! carries. The palette is declared under both the media query and the theme
-//! attribute, so the page reads in light and dark.
+//! request. Every string from the worker, journal or bus is escaped, as HTML
+//! text ([`html_text`]) and as embedded JSON with `<`, `>` and `&` as `\u`
+//! escapes ([`html_json_str`]), so nothing can close a tag.
 
 use std::fmt::Write as _;
 
@@ -192,9 +185,8 @@ const LEGEND: &[(&str, &str)] = &[
     ("mail", "fabric: a message to or from the worker"),
 ];
 
-/// The page's own style: the validated categorical palette (blue, orange,
-/// aqua, violet) and the fixed status pair, both surfaces, declared under the
-/// media query and the theme attribute alike.
+/// The page's style: one hue per lane and a status pair, declared under both
+/// the media query and the theme attribute.
 const STYLE: &str = r#"<style>
 .viz-root {
   color-scheme: light;
@@ -309,8 +301,8 @@ tr.lane-fabric td:nth-child(2) { color: var(--fabric); }
 </style>
 "#;
 
-/// The page's own script: it draws the lanes from the embedded data, and
-/// nothing else. No fetch, no import, no timer.
+/// The page's script: draws the lanes from the embedded data. No fetch, no
+/// import, no timer.
 const SCRIPT: &str = r#"(function () {
   var el = document.getElementById("ledger-data");
   var data = JSON.parse(el.textContent);
@@ -448,8 +440,7 @@ const SCRIPT: &str = r#"(function () {
 "#;
 
 /// Whether `html` is one self-contained file: nothing it would fetch, and a
-/// policy that forbids a fetch even if a worker's own words held a URL. (The
-/// SVG namespace is a name, not a request: `createElementNS` never opens it.)
+/// policy that forbids a fetch. (The SVG namespace is a name, not a request.)
 #[cfg(test)]
 pub(super) fn is_self_contained(html: &str) -> Result<(), String> {
     for bad in [

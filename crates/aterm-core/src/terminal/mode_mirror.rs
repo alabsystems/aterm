@@ -4,29 +4,19 @@
 
 //! Lock-free mirror of the terminal's input-encoding modes.
 //!
+//! Publishes as atomics the fold behind
 //! [`Terminal::keyboard_mode`](super::Terminal::keyboard_mode),
 //! [`Terminal::mouse_mode`](super::Terminal::mouse_mode) and
-//! [`Terminal::focus_reporting_enabled`](super::Terminal::focus_reporting_enabled)
-//! are pure folds of state that only `process()` and a few host mutators
-//! change. The mirror publishes that fold as atomics, so the input seam reads
-//! it on every key press without the terminal mutex, and the DEC 1004 gate at
-//! the window's tab/pane re-stabilization point (which may not take the engine
-//! mutex at all) can read it too.
-//!
-//! The word also carries the alternate-screen flag and DEC 1007 (alternate
-//! scroll), so a wheel's route can be decided lock-free
+//! [`Terminal::focus_reporting_enabled`](super::Terminal::focus_reporting_enabled), plus the
+//! alternate-screen flag and DEC 1007 (alternate scroll). The input seam reads it on every key
+//! press without the terminal mutex; so do the DEC 1004 gate at the window's tab/pane
+//! re-stabilization point, which may not take the engine mutex, and the wheel route
 //! (`input::wheel_route_mirrored`, twin of the locked `wheel_route_for`).
 //!
-//! It is refreshed under the lock at the end of every `process()` batch and by
-//! every host mutator that moves an input (the constructor,
-//! `set_kitty_keyboard_enabled`, `set_host_alternate_scroll`, `reset`, both
-//! checkpoint hydration paths). A debug assertion at the start of each batch
-//! checks the mirror still equals the fold, so a mutator that forgets to
-//! refresh fails on the next output in debug builds.
-//!
-//! Shared as an `Arc` because the seam holds only `&Mutex<Terminal>`: the
-//! terminal writes through one clone under the lock, the input path reads
-//! another. `Release` on publish, `Acquire` on read.
+//! Refreshed under the lock at the end of every `process()` batch and by every host mutator that
+//! moves an input. A debug assertion at the start of each batch checks the mirror still equals
+//! the fold, so a mutator that forgets to refresh fails on the next output. Shared as an `Arc`
+//! because the seam holds only `&Mutex<Terminal>`; `Release` on publish, `Acquire` on read.
 
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, Ordering};
 
@@ -69,11 +59,8 @@ impl ModeMirror {
         self.mouse.load(Ordering::Acquire) != 0
     }
 
-    /// Lock-free twin of `Terminal::focus_reporting_enabled()` (DEC 1004).
-    ///
-    /// The focus report is written from the window's re-stabilization point (a
-    /// tab switch, a pane-focus move) on the winit thread, which must never take
-    /// an engine mutex; usually no session has asked for DEC 1004 at all.
+    /// Lock-free twin of `Terminal::focus_reporting_enabled()` (DEC 1004), for the focus report
+    /// written on the winit thread, which must never take an engine mutex.
     #[must_use]
     pub fn focus_reporting_enabled(&self) -> bool {
         self.focus.load(Ordering::Acquire)
@@ -131,11 +118,8 @@ impl super::Terminal {
         &self.mode_mirror
     }
 
-    /// Re-publish the fold. Every mutation site that can move an input of
-    /// `keyboard_mode()` / `mouse_mode()` / `focus_reporting_enabled()` /
-    /// `is_alternate_screen()` / `modes().alternate_scroll` outside `process()`
-    /// calls this; `process_at` calls it once per batch after the parser has
-    /// run.
+    /// Re-publish the fold. Called by every site outside `process()` that can move one of its
+    /// inputs, and once per batch by `process_at` after the parser runs.
     pub(crate) fn refresh_mode_mirror(&self) {
         self.mode_mirror.publish(
             self.keyboard_mode(),
@@ -146,10 +130,8 @@ impl super::Terminal {
         );
     }
 
-    /// The obligation: the published word equals the live fold. Asserted at the
-    /// start of every `process()` batch in debug builds so a missed mutation
-    /// site fails on the next output byte instead of shipping a stale encoder
-    /// mode. Free in release.
+    /// Asserts the published word equals the live fold. Run at the start of every `process()`
+    /// batch in debug builds, so a missed mutation site fails on the next output byte.
     #[cfg(debug_assertions)]
     pub(crate) fn debug_assert_mode_mirror_in_sync(&self) {
         debug_assert_eq!(
@@ -182,9 +164,8 @@ impl super::Terminal {
 
 #[cfg(test)]
 mod tests {
-    //! The obligation, walked: every way the fold's inputs can move — through
-    //! `process()` and through every host mutator — leaves the mirror equal to
-    //! the fold, read lock-free.
+    //! Every way the fold's inputs move, through `process()` and every host mutator, leaves the
+    //! mirror equal to the fold.
     use super::super::Terminal;
     use aterm_types::keyboard::KeyboardMode;
     use aterm_types::mouse::MouseMode;
@@ -222,9 +203,7 @@ mod tests {
     #[test]
     fn a_fresh_terminal_publishes_its_fold_not_an_empty_word() {
         let term = Terminal::new(24, 80);
-        // The fresh fold is not `KeyboardMode::empty()` (negative flags such as
-        // ALT_NO_ESC / NO_SPECIAL_MODIFIERS may be set by default), so a mirror
-        // left at `Default` would already be wrong here.
+        // The constructor publishes the fresh fold rather than relying on `Default` to match it.
         assert_in_sync(&term, "construction");
     }
 
@@ -248,9 +227,7 @@ mod tests {
             ("mouse 1003", b"\x1b[?1003h"),
             ("mouse 9 (x10)", b"\x1b[?9h"),
             ("mouse off", b"\x1b[?1003l\x1b[?9l"),
-            // DEC 1004 — the focus-report gate the window's tab/pane lane reads
-            // lock-free. Both edges, because the gate is a bool and a mirror
-            // that only ever latched true would still pass a set-only walk.
+            // Both edges: a mirror that only latched true would pass a set-only walk.
             ("focus reporting on", b"\x1b[?1004h"),
             ("focus reporting off", b"\x1b[?1004l"),
             ("focus reporting on again", b"\x1b[?1004h"),
@@ -260,8 +237,7 @@ mod tests {
             ),
             ("DECSTR on alt", b"\x1b[!p"),
             ("leave alt screen", b"\x1b[?1049l"),
-            // DEC 1007 and the screen — the two facts the wheel's lock-free
-            // route reads — both edges each, and the 47 / 1047 doors too.
+            // DEC 1007 and the screen (the wheel route's inputs), both edges, every door.
             ("alternate scroll on", b"\x1b[?1007h"),
             ("enter alt screen 1049", b"\x1b[?1049h"),
             ("alternate scroll off on alt", b"\x1b[?1007l"),
@@ -271,8 +247,7 @@ mod tests {
             ("enter alt screen 1047", b"\x1b[?1047h"),
             ("leave alt screen 1047", b"\x1b[?1047l"),
             ("VT52 enter", b"\x1b[?2l"),
-            // `ESC <` leaves VT52 (ANSI mode); in VT52 neither CSI nor `ESC c`
-            // parse, so the walk must exit before the RIS step below.
+            // In VT52 neither CSI nor `ESC c` parse: leave it before RIS.
             ("VT52 exit", b"\x1b<"),
             ("RIS", b"\x1bc"),
         ];
@@ -280,8 +255,7 @@ mod tests {
             term.process(bytes);
             assert_in_sync(&term, what);
         }
-        // And the walk actually exercised a non-trivial word at least once:
-        // re-push and confirm the lock-free read carries the kitty bit.
+        // The walk carried a non-trivial word at least once.
         term.process(b"\x1b[>1u");
         assert!(
             term.mode_mirror()
@@ -290,9 +264,6 @@ mod tests {
         );
         term.process(b"\x1b[?1000h");
         assert_eq!(term.mode_mirror().mouse_mode(), MouseMode::Normal);
-        // ... and the focus gate really is readable without the mutex: this is
-        // the exact word `input::seam_egress`'s Focus arm now consults from the
-        // winit thread instead of blocking on the engine lock.
         term.process(b"\x1b[?1004h");
         assert!(term.mode_mirror().focus_reporting_enabled());
         term.process(b"\x1b[?1004l");
@@ -319,24 +290,16 @@ mod tests {
         );
         term.set_kitty_keyboard_enabled(true);
         assert_in_sync(&term, "set_kitty_keyboard_enabled(true)");
-        // The host's DEC 1007 default is a mutation site of its own (spawn arms
-        // it outside `process()`), in both directions.
         term.set_host_alternate_scroll(true);
         assert_in_sync(&term, "set_host_alternate_scroll(true)");
         assert!(term.mode_mirror().alternate_scroll());
         term.set_host_alternate_scroll(false);
         assert_in_sync(&term, "set_host_alternate_scroll(false)");
-        // `leave_alternate_screen` is the host's own exit from a screen a killed
-        // app left up.
         term.process(b"\x1b[?1049h");
         assert!(term.mode_mirror().alternate_screen());
         assert!(term.leave_alternate_screen());
         assert_in_sync(&term, "leave_alternate_screen()");
-        // The host is a mutation site: `apply_config` arms DEC 1004 through
-        // `apply_negotiated_mode`, outside `process()`. Without the republish at
-        // the end of `apply_config` the lock-free word the focus seam reads goes
-        // stale here, and the obligation assert below fires on the next output
-        // byte rather than at the site that broke it.
+        // `apply_config` arms DEC 1004 outside `process()`, so it must republish itself.
         let mut config = crate::config::TerminalConfig::default();
         config.focus_reporting = true;
         let _ = term.apply_config(&config);

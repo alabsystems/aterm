@@ -16,7 +16,7 @@ use super::{
 
 impl TerminalHandler<'_> {
     /// Route an OSC command by number to its handler. Called from
-    /// `ActionSink::osc_dispatch` in handler.rs.
+    /// `ActionSink::osc_dispatch_with_terminator` (handler_actions.rs).
     pub(super) fn osc_dispatch_inner(
         &mut self,
         cap: &super::response_capability::ResponseCapability,
@@ -42,8 +42,8 @@ impl TerminalHandler<'_> {
             19 => self.handle_osc_19(cap, params),
             7 => self.handle_osc_7(params),
             8 => self.handle_osc_8(params),
-            // OSC 9: simple desktop notification (Terminal / ConEmu style).
-            // Gated by host notification authorization (handler_osc_notify.rs).
+            // OSC 9 (Terminal / ConEmu), 99 and 777 notifications are gated by
+            // host notification authorization (handler_osc_notify.rs).
             9 => self.handle_osc_9(params),
             10 => self.handle_osc_10_11_12(cap, params, 0),
             11 => self.handle_osc_10_11_12(cap, params, 1),
@@ -58,7 +58,6 @@ impl TerminalHandler<'_> {
             // consumes it, and the engine does not render scaled text.
             66 => {}
             // OSC 99: kitty desktop-notification protocol.
-            // Gated by host notification authorization (handler_osc_notify.rs).
             99 => self.handle_osc_99(params),
             104 => self.handle_osc_104(params),
             110 => self.reset_dynamic_color(0),
@@ -71,14 +70,29 @@ impl TerminalHandler<'_> {
             133 => self.handle_osc_133(params),
             633 => self.handle_osc_633(params),
             // OSC 777: rxvt-unicode `notify` desktop notification.
-            // Gated by host notification authorization (handler_osc_notify.rs).
             777 => self.handle_osc_777(params),
-            // OSC 1337 (iTerm2): the handler acts only on `File=` inline images;
-            // other sub-commands (SetUserVar, …) go through the shell_api/KVP layer.
+            // OSC 1337 (iTerm2): only `File=` inline images; other sub-commands
+            // are ignored.
             1337 => self.handle_osc_1337(params),
+            // OSC 7501: the program's own lifecycle state, kept for display only
+            // (`program_state.rs`).
+            7501 => self.handle_osc_7501(params),
             30001 => self.handle_osc_30001(),
             30101 => self.handle_osc_30101(),
             _ => {} // Unknown OSC
+        }
+    }
+
+    /// OSC 7501 (`state=<word>:app=codex[:kind=<k>]`, `state=clear`): the
+    /// program's own state report, kept as one value for display
+    /// ([`super::program_state`]). The body is one parameter: a `;` inside it
+    /// makes it no report, never one read from its first half.
+    fn handle_osc_7501(&mut self, params: &[&[u8]]) {
+        let [_, body] = params else {
+            return;
+        };
+        if let Ok(body) = std::str::from_utf8(body) {
+            self.program_state.accept(body);
         }
     }
 
@@ -112,14 +126,11 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// Store a shell-reported working directory (or clear it). The title epoch
-    /// ([`Terminal::title_epoch`](super::Terminal::title_epoch)) bumps only when
-    /// the stored value changes: hosts label titleless tabs with the cwd, and a
-    /// shell re-reporting the same directory each prompt must not thrash it.
-    ///
-    /// A path [`reported_cwd_is_storable`] refuses (over-long or containing NUL)
-    /// is ignored: the prior cwd stays and nothing is signalled. This is the one
-    /// place OSC 7 and OSC 633 `P;Cwd=` store a cwd.
+    /// Store a shell-reported working directory (or clear it); the one place OSC
+    /// 7 and OSC 633 `P;Cwd=` store a cwd. The title epoch bumps only when the
+    /// value changes: hosts label titleless tabs with the cwd, and a shell
+    /// re-reporting it each prompt must not thrash the label. A path
+    /// [`reported_cwd_is_storable`] refuses is ignored (the prior cwd stays).
     pub(super) fn store_reported_cwd(&mut self, path: Option<&str>) {
         if path.is_some_and(|path| !reported_cwd_is_storable(path)) {
             return;
@@ -156,11 +167,8 @@ impl TerminalHandler<'_> {
                 Some(h) => format!("//{h}{path}"),
                 None => path.clone(),
             };
-            // Reject absurd paths before they reach the osc_events queue and
-            // current_working_directory: the parser admits up to MAX_OSC_DATA
-            // (8 MiB). 4 KiB (PATH_MAX) covers any real directory, UNC host
-            // included. A decoded NUL is refused on the same terms (see
-            // `reported_cwd_is_storable`), and not queued.
+            // Refuse an unstorable path before it is queued or stored (the parser
+            // admits up to MAX_OSC_DATA, 8 MiB).
             if !reported_cwd_is_storable(&event_payload) {
                 return;
             }
@@ -209,26 +217,18 @@ impl TerminalHandler<'_> {
         )
     )]
     pub(super) fn handle_osc_8(&mut self, params: &[&[u8]]) {
-        // params[0] = "8", params[1] = key=value params (may be empty),
-        // params[2] = URI (may be empty or absent when clearing).
-
-        // The URI is params[2..] rejoined with ";": URIs may contain literal
-        // semicolons (RFC 3986 §3.3), which the parser splits.
+        // params[1] = key=value params (may be empty); the URI is params[2..]
+        // rejoined with ";", since the parser splits a URI's literal semicolons
+        // (RFC 3986 §3.3).
         let uri_bytes = params.get(2..).unwrap_or_default().join(&b';');
         let uri = std::str::from_utf8(&uri_bytes).unwrap_or("");
 
-        // Accept the URL only if it passes all of, in this order (the O(1)
-        // length reject and early-exiting scheme check first, so an oversized
-        // URI short-circuits before the O(n) scans):
-        // - length and scheme allowlist;
-        // - no control chars (tab allowed);
-        // - no BiDi directional overrides (U+202A-E, U+2066-9; CVE-2021-42574),
-        //   which can reorder a displayed URL to spoof its host. Rejected, not
-        //   stripped: a sanitized URL is not the one the sender requested.
-        //
-        // These predicates are the whole acceptance decision. Tagging a cell is
-        // not following a link: what a click may open is decided in the host at
-        // press time.
+        // Admit the URI only if it passes, cheapest first (length, then scheme,
+        // then the O(n) scans): the length and scheme allowlist; no control chars
+        // (tab allowed); no BiDi overrides (U+202A-E, U+2066-9; CVE-2021-42574),
+        // which can reorder a displayed URL to spoof its host. Rejected, not
+        // stripped: a sanitized URL is not the one the sender requested. What a
+        // click may open is decided by the host at press time.
         let admitted = !uri.is_empty()
             && uri.len() <= MAX_HYPERLINK_URL_BYTES
             && is_allowed_scheme(uri, self.hyperlink_auth.extra_schemes())
@@ -277,8 +277,8 @@ impl TerminalHandler<'_> {
             Err(_) => return,
         };
 
-        // Parse selection characters; empty defaults to clipboard ('c') per
-        // xterm. Capped and de-duplicated against a long Pc parameter.
+        // Empty defaults to clipboard ('c') per xterm. Capped and de-duplicated
+        // against a long Pc parameter.
         let mut selections: Vec<ClipboardSelection> = Vec::with_capacity(4);
         if selection_str.is_empty() {
             selections.push(ClipboardSelection::Clipboard);
@@ -313,21 +313,17 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// Handle OSC 52 clipboard query (Pd = "?").
-    ///
-    /// Gated by both `super::clipboard_auth::ClipboardAuth::try_mint_query_capability`
-    /// and the `ResponseCapability`; without either the callback is not invoked
-    /// or no response can be sent. Both tokens are unforgeable outside their
-    /// modules (private `_seal: ()`).
+    /// Handle OSC 52 clipboard query (Pd = "?"). Needs both a host-minted query
+    /// capability and the `ResponseCapability`, each unforgeable outside its
+    /// module (private `_seal: ()`).
     fn handle_osc_52_query(
         &mut self,
         cap: &super::response_capability::ResponseCapability,
         selections: &[ClipboardSelection],
         selection_param: &str,
     ) {
-        // `None` when the host has not authorized query access (the default):
-        // no callback, no response. An installed policy's decision wins over
-        // the `authorize_query` bool.
+        // `None` unless the host authorized query access; an installed policy's
+        // decision wins over that.
         let Some(token) = self
             .clipboard_auth
             .try_mint_query_capability_with_engine(self.policy.gates())
@@ -339,7 +335,7 @@ impl TerminalHandler<'_> {
         else {
             return; // Callback returned None or is unwired — don't respond.
         };
-        // Cap on decoded bytes; see MAX_OSC52_QUERY_RESPONSE_BYTES doc for wire-size notes.
+        // Cap on decoded bytes (see MAX_OSC52_QUERY_RESPONSE_BYTES).
         if content.len() > MAX_OSC52_QUERY_RESPONSE_BYTES {
             return;
         }
@@ -374,14 +370,12 @@ impl TerminalHandler<'_> {
         super::clipboard_auth::invoke_clear(&mut self.clipboard.callback, token, selections);
     }
 
-    /// Handle OSC 52 clipboard set (Pd = base64 data). Gated by
-    /// `super::clipboard_auth::ClipboardAuth::try_mint_write_capability`:
-    /// without a host-minted [`super::clipboard_auth::ClipboardWriteCapability`]
-    /// (unforgeable outside `clipboard_auth.rs`) no PTY bytes reach the host
-    /// clipboard.
+    /// Handle OSC 52 clipboard set (Pd = base64 data). Without a host-minted
+    /// [`super::clipboard_auth::ClipboardWriteCapability`] no PTY bytes reach the
+    /// host clipboard.
     fn handle_osc_52_set(&mut self, selections: &[ClipboardSelection], data: &[u8]) {
         // Mint first, so unauthorized OSC 52 floods skip the base64 decode. An
-        // installed policy's decision wins over the legacy bool.
+        // installed policy's decision wins over `write_authorized`.
         let Some(token) = self
             .clipboard_auth
             .try_mint_write_capability_with_engine(self.policy.gates())
@@ -418,27 +412,23 @@ impl TerminalHandler<'_> {
         super::clipboard_auth::invoke_set(&mut self.clipboard.callback, token, selections, content);
     }
 
-    /// Handle OSC 60/61/62 xterm feature reporting (xterm-401).
-    ///
-    /// - OSC 60: reserved, no response.
-    /// - OSC 61: allowWindowOps query; answers `ESC ] 61 ; true ST` since window
+    /// Handle OSC 60/61/62 xterm feature reporting (xterm-401,
+    /// <https://invisible-island.net/xterm/ctlseqs/ctlseqs.html>), replying with
+    /// the request's terminator:
+    /// - OSC 60: reserved, no reply.
+    /// - OSC 61 (allowWindowOps): `true` rather than xterm's bitmask, since window
     ///   control belongs to the UI layer.
-    /// - OSC 62: feature list, `ESC ] 62 ; f1 ; f2 ; ... ST`, from
-    ///   `TerminalCapabilities::aterm_capabilities()`.
-    ///
-    /// See <https://invisible-island.net/xterm/ctlseqs/ctlseqs.html>.
+    /// - OSC 62: the `;`-separated feature list of
+    ///   `TerminalCapabilities::aterm_capabilities()`, named after xterm's where
+    ///   possible.
     pub(super) fn handle_osc_feature_reporting(
         &mut self,
         cap: &super::response_capability::ResponseCapability,
         cmd: u32,
     ) {
         match cmd {
-            // OSC 60 is reserved: xterm sends no response.
             60 => {}
             61 => {
-                // OSC 61: window operations are the UI layer's, so report all as
-                // allowed ("true" rather than xterm's bitmask). Match the request
-                // terminator.
                 let st = if self.transient.last_osc_bel_terminated {
                     "\x07"
                 } else {
@@ -448,8 +438,6 @@ impl TerminalHandler<'_> {
                 self.send_response(cap, response.as_bytes());
             }
             62 => {
-                // OSC 62: semicolon-separated features from TerminalCapabilities,
-                // named after xterm where possible. Match the request terminator.
                 use super::types::TerminalCapabilities;
                 let features = TerminalCapabilities::aterm_capabilities().feature_list_string();
                 let st = if self.transient.last_osc_bel_terminated {
@@ -476,13 +464,9 @@ fn reported_cwd_is_storable(path: &str) -> bool {
 }
 
 /// Strip from a title string: C0 controls except tab, C1 controls, and BiDi
-/// override codepoints (U+202A-U+202E, U+2066-U+2069).
-///
-/// Control characters would cause rendering artifacts and embedded-ESC
-/// attacks; BiDi overrides (CVE-2021-42574, "Trojan Source") can reorder a
-/// title to spoof a hostname. Titles do not pass through the grid's
-/// `BidiSecurity::Strict` filter, so the strip is unconditional, like the one
-/// for notifications in `handler_osc_notify.rs`.
+/// override codepoints (U+202A-U+202E, U+2066-U+2069; CVE-2021-42574), which
+/// can reorder a title to spoof a hostname. Titles skip the grid's
+/// `BidiSecurity::Strict` filter, so the strip is unconditional.
 pub(super) fn sanitize_title(title: &str) -> String {
     title
         .chars()
@@ -507,19 +491,15 @@ pub(super) fn sanitize_title(title: &str) -> String {
 
 /// Whether a URI's scheme is allowed for OSC 8 hyperlinks (case-insensitive).
 ///
-/// An allowlist: `http`, `https`, `mailto`, `sftp`, `tel`. Everything else is
-/// refused at parse time, including `ssh:`/`git:` (CVE-2023-51385 class),
-/// custom app URL handlers (`slack:`, `vscode:`, …) that could launch native
-/// apps, and `javascript:`, `data:`, `file:`, `ftp:`.
-///
-/// `extra` is the host-minted extension of the allowlist, authorized via
-/// `Terminal::authorize_hyperlink_scheme` (e.g. `orca`), stored lowercased and
-/// validated at mint time
-/// ([`super::hyperlink_auth::HyperlinkAuth::authorize_scheme`]). Empty by
-/// default.
+/// An allowlist: `http`, `https`, `mailto`, `sftp`, `tel`, plus `extra`, the
+/// schemes the host minted via `Terminal::authorize_hyperlink_scheme` (stored
+/// lowercased, validated by
+/// [`super::hyperlink_auth::HyperlinkAuth::authorize_scheme`]). Everything else
+/// is refused, including `ssh:`/`git:` (CVE-2023-51385 class), app URL handlers
+/// (`slack:`, `vscode:`, …) and `javascript:`, `data:`, `file:`, `ftp:`.
 #[must_use]
 fn is_allowed_scheme(uri: &str, extra: &[Box<str>]) -> bool {
-    /// RFC 3986 safe scheme allowlist for OSC 8 hyperlinks.
+    /// Schemes admitted without a host mint.
     const SAFE_SCHEMES: &[&str] = &["http", "https", "mailto", "sftp", "tel"];
 
     // The RFC 3986 scheme is the run before the first ':'. The shape walk is
@@ -594,7 +574,6 @@ mod tests {
     #[test]
     fn osc_0_title_strips_all_nine_bidi_overrides() {
         let mut term = Terminal::new(24, 80);
-        // All 9 codepoints concatenated with surrounding benign text.
         let payload = "X\u{202A}\u{202B}\u{202C}\u{202D}\u{202E}\u{2066}\u{2067}\u{2068}\u{2069}Y";
         let seq = format!("\x1b]0;{payload}\x07");
         term.process(seq.as_bytes());
@@ -608,8 +587,6 @@ mod tests {
 
     #[test]
     fn title_epoch_bumps_on_real_change_not_on_noop() {
-        // The title epoch advances on an actual window-title change and stays
-        // put on a no-op re-set.
         let mut term = Terminal::new(24, 80);
         let start = term.title_epoch();
 
@@ -638,7 +615,7 @@ mod tests {
             "title_epoch must increase when the title value actually changes"
         );
 
-        // The public set_title API shares the same change-detection semantics.
+        // The public set_title API detects changes the same way.
         let before_api = term.title_epoch();
         term.set_title("second"); // same value -> no bump
         assert_eq!(term.title_epoch(), before_api);
@@ -748,9 +725,8 @@ mod tests {
 
     #[test]
     fn osc_8_refused_uri_ends_the_open_link() {
-        // A new URI replaces the open link. One aterm refuses (a scheme off the
-        // list, a BiDi override, over the byte cap) ends it as an empty URI
-        // does, so the next text never carries the previous destination.
+        // A refused URI (scheme off the list, BiDi override, over the byte cap)
+        // ends the open link as an empty one does.
         let big = format!("https://a.example/{}", "a".repeat(MAX_HYPERLINK_URL_BYTES));
         for refused in [
             "file:///etc/passwd",
@@ -772,8 +748,6 @@ mod tests {
 
     #[test]
     fn osc_7_oversized_cwd_path_not_queued() {
-        // A decoded OSC 7 path beyond MAX_CWD_PATH_BYTES (PATH_MAX, 4 KiB) is
-        // rejected before it is stored or queued.
         let mut term = Terminal::new(24, 80);
 
         // Baseline: a normal sub-PATH_MAX directory is accepted and queued.
@@ -785,8 +759,7 @@ mod tests {
             "a legitimate OSC 7 cwd must still be queued for poll-based hosts"
         );
 
-        // Oversized: decoded path = "/" + big, longer than MAX_CWD_PATH_BYTES.
-        // It must leave the prior cwd untouched and queue nothing.
+        // Oversized: the prior cwd stays and nothing is queued.
         let big = "a".repeat(MAX_CWD_PATH_BYTES + 1);
         let seq = format!("\x1b]7;file:///{big}\x07");
         term.process(seq.as_bytes());
@@ -821,9 +794,8 @@ mod tests {
         );
     }
 
-    /// A percent-encoded NUL (`%00`) decodes to `\0`, which no directory can
-    /// contain and the seamless-update wire refuses. Such a report is ignored
-    /// like an over-long one: the prior cwd stays and nothing is queued.
+    /// A `%00` decodes to `\0`, which no directory contains: the report is ignored
+    /// like an over-long one (prior cwd kept, nothing queued).
     #[test]
     fn osc_7_cwd_with_a_nul_byte_is_ignored() {
         let mut term = Terminal::new(24, 80);
@@ -857,10 +829,9 @@ mod tests {
         assert_eq!(fresh.current_working_directory(), None);
     }
 
-    /// The NUL refusal lives in `store_reported_cwd`, the one place OSC 7 and
-    /// OSC 633 `P;Cwd=` store a cwd, so it holds for any caller. Pinned directly:
-    /// the parser already drops C0 NUL inside an OSC string, so OSC 633 cannot
-    /// carry one.
+    /// The NUL refusal is in `store_reported_cwd` itself, so it holds for every
+    /// caller. Called directly: the parser drops C0 NUL inside an OSC string, so
+    /// OSC 633 cannot carry one.
     #[test]
     fn the_cwd_store_ignores_a_path_with_a_nul_byte() {
         let mut term = Terminal::new(24, 80);
@@ -887,8 +858,8 @@ mod tests {
 
     #[test]
     fn osc_633_e_oversized_commandline_rejected() {
-        // OSC 633 'E' (explicit command text) is retained on the mark and block,
-        // so it is capped at MAX_COMMANDLINE_BYTES before unescaping/storing.
+        // OSC 633 'E' text is kept on the mark and block, so it is capped at
+        // MAX_COMMANDLINE_BYTES before unescaping.
         let mut term = Terminal::new(24, 80);
 
         // Prompt-start (A) creates a current block for the commandline to land on.
@@ -918,7 +889,6 @@ mod tests {
 
     #[test]
     fn osc_8_refuses_oversized_and_control_char_uris() {
-        // Valid hyperlinks accepted; control chars and oversized URIs rejected.
         let mut term = Terminal::new(24, 80);
         term.process(b"\x1b]8;;https://example.com/path\x07");
         assert_eq!(
@@ -978,8 +948,7 @@ mod tests {
             "extra-scheme matching must be ASCII-case-insensitive"
         );
 
-        // Literal-semicolon URI reconstruction composes with the mint:
-        // the OSC parser splits on ';' and handle_osc_8 rejoins params[2..].
+        // Semicolon rejoining applies to minted schemes too.
         term.process(b"\x1b]8;;\x07");
         term.process(b"\x1b]8;;orca://run/w1?cmd=a;b\x07");
         assert_eq!(
@@ -988,8 +957,7 @@ mod tests {
             "semicolon reconstruction must apply to extra-scheme URIs too"
         );
 
-        // Revoking the mint is the only way back: a minted scheme is admitted
-        // for exactly as long as the host keeps it minted.
+        // A minted scheme is admitted only while the host keeps it minted.
         term.process(b"\x1b]8;;\x07");
         term.revoke_hyperlink_scheme("orca");
         term.process(b"\x1b]8;;orca://focus/w3\x07");
@@ -1065,8 +1033,7 @@ mod tests {
 
     #[test]
     fn osc_8_extra_scheme_still_rejects_bidi_and_control_chars() {
-        // The orthogonal URI guards run unchanged for minted schemes: minting
-        // `orca` widens only the scheme comparison, never the char filters.
+        // Minting widens only the scheme comparison, never the char filters.
         let mut term = Terminal::new(24, 80);
         assert!(term.authorize_hyperlink_scheme("orca"));
         term.process("\x1b]8;;orca://safe\u{202E}live\x07".as_bytes());
@@ -1096,10 +1063,8 @@ mod tests {
 
     #[test]
     fn reset_clears_extra_schemes_is_a_host_choice() {
-        // Extra schemes are host state, like the OSC 8/52/DCS authorizations: an
-        // app-triggered DECSTR or RIS does not strip them (that would let an app
-        // downgrade host policy). The host clears them with
-        // revoke_hyperlink_scheme; a new Terminal starts empty.
+        // Extra schemes are host state: DECSTR and RIS leave them (an app must not
+        // downgrade host policy); the host clears them with revoke_hyperlink_scheme.
         let mut term = Terminal::new(24, 80);
         assert!(term.authorize_hyperlink_scheme("orca"));
         term.process(b"\x1b[!p"); // DECSTR soft reset
@@ -1139,13 +1104,8 @@ mod tests {
         assert_eq!(*captured.lock().expect("poisoned"), None);
     }
 
-    /// Every clipboard the handler admits is answered. The handler caps the
-    /// decoded clipboard at `MAX_OSC52_QUERY_RESPONSE_BYTES`, and the base64
-    /// response is ~1.34x that, so the response budgets must be sized on the
-    /// encoded length or large admitted clipboards produce no reply at all.
-    ///
-    /// Checked against aterm-policy's `standard()` profile (the one `spawn.rs`
-    /// installs) at sizes below, at and above the decoded-size boundary.
+    /// Every clipboard within the decoded cap is answered under the `standard()`
+    /// profile: the response budgets must allow for base64 (~1.34x the cap).
     #[test]
     fn osc52_query_answers_every_clipboard_it_admits() {
         for len in [
@@ -1221,8 +1181,7 @@ mod tests {
 
     #[test]
     fn osc_52_set_pre_decode_bound_rejects_oversized_without_decoding() {
-        // OSC 52 set bounds the encoded length before base64::decode, so an
-        // authorized oversized payload is not decoded only to be dropped.
+        // The encoded length is bounded before base64::decode.
         use crate::terminal::ClipboardAccess;
         use crate::terminal::ClipboardOperation;
         use std::sync::{Arc, Mutex};
@@ -1240,8 +1199,8 @@ mod tests {
 
         // `threshold` is exactly the encoded length of a cap-sized payload.
         let threshold = MAX_OSC52_QUERY_RESPONSE_BYTES / 3 * 4 + 4;
-        // Valid base64 one full group over the threshold: it would decode (to
-        // > 64 KiB of NULs), so this tests the early reject, not a decode error.
+        // Valid base64 one group over: it would decode, so this tests the early
+        // reject, not a decode error.
         let oversized = "A".repeat(threshold + 4);
         assert!(oversized.len() > threshold);
         assert_eq!(oversized.len() % 4, 0, "valid base64 length (no padding)");
@@ -1262,18 +1221,13 @@ mod tests {
 
     #[test]
     fn osc_52_set_pre_decode_bound_passes_exact_cap_payload() {
-        // The threshold is `>`, not `>=`: a payload decoding to exactly
-        // MAX_OSC52_QUERY_RESPONSE_BYTES passes both the pre-decode bound and the
-        // post-decode cap.
+        // The bound is `>`, not `>=`: a payload decoding to exactly the cap passes.
         use crate::terminal::ClipboardAccess;
 
         let mut term = Terminal::new(24, 80);
         term.authorize_clipboard_access(ClipboardAccess::Write);
 
-        // Exactly-cap content of NUL bytes (valid UTF-8). 65536 = 21845*3 + 1,
-        // so the standard-alphabet encoding is 21845*4 + 4 = 87384 chars =
-        // MAX_OSC52_QUERY_RESPONSE_BYTES / 3 * 4 + 4, i.e. the threshold; the
-        // `>` comparison passes it.
+        // 65536 = 21845*3 + 1, so the encoding is 21845*4 + 4 chars: the threshold.
         let content = vec![0u8; MAX_OSC52_QUERY_RESPONSE_BYTES];
         let encoded = base64::encode(&content).expect("encode cap-sized payload");
         assert_eq!(encoded.len(), MAX_OSC52_QUERY_RESPONSE_BYTES / 3 * 4 + 4);

@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-slog"
+# Integration tests are declared below, not discovered: every file is a module
+# of the one `slog_suite` binary. With autotests off a `tests/*.rs` file listed
+# nowhere never compiles.
+autotests = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "aterm session log engine: the hierarchical record (session > run > turn > step), its line codec, a bounded per-session ring with exact gap counts, the screen-verdict turn tracker, the fold and the token-budgeted brief. No clock, file, thread or socket: time enters as a host Stamp."
+
+[lints]
+workspace = true
+
+[dependencies]
+# The control wire's one percent escape (`aterm_codec::pct`): a record's
+# values are encoded exactly as every other `k=v` token on the wire.
+aterm-codec = { workspace = true }
+# The engine's one table of hidden characters
+# (`aterm_messages::text::is_hidden_char`), which free text passes before it
+# is stored (the metadata sanitizer the design names).
+aterm-messages = { workspace = true }
+
+[dev-dependencies]
+# Tier-0/Tier-1: the derived `SessionLogRing` and `TurnTracker` models, and the
+# generated-input tests' one generator (`aterm_spec::rng::XorShift`).
+aterm-spec = { workspace = true }
+# The vocabularies the box and wall words mirror (`PromptKind::name`,
+# `WallKind::name`), held equal by `vocab_mirrors_the_screen_reader`.
+aterm-phase = { workspace = true }
+
+[[test]]
+name = "slog_suite"
+path = "tests/slog_suite.rs"

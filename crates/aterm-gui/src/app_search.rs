@@ -1978,7 +1978,7 @@ impl App {
     /// Shared find-close core: drop the overlay state (+ its clickable-indicator
     /// geometry), optionally clear the selection highlight (accept keeps it on the
     /// match), and restore the newest title owned by the remaining authority. An
-    /// armed close warning stays untouched; otherwise the canonical Smart Title
+    /// armed close warning stays untouched; otherwise the canonical window-title
     /// cache is restored.
     ///
     /// `pub(crate)` for `sync_window`: a tab/pane switch tears the find bar down and
@@ -2353,11 +2353,11 @@ mod tests {
     }
 
     /// Native-title ownership is an explicit stack: the destructive-close warning
-    /// outranks find, and find outranks the continuously refreshed Smart Title.
+    /// outranks find, and find outranks the continuously refreshed canonical title.
     /// Canonical cache updates therefore cannot erase a live search status, while
-    /// dismissing search reveals the newest (not the pre-search) composed title.
+    /// dismissing search reveals the newest (not the pre-search) canonical title.
     #[test]
-    fn native_title_override_transitions_preserve_latest_smart_title() {
+    fn native_title_override_transitions_preserve_latest_canonical_title() {
         use crate::app_window::{WindowTitleAuthority, window_title_authority};
 
         assert_eq!(
@@ -2388,7 +2388,7 @@ mod tests {
             .expect("find active")
             .window_title();
 
-        // This is the cache update `apply_title` performs when a live summary
+        // This is the cache update `apply_title` performs when the program's title
         // changes under find. Search remains authoritative on glass.
         app.windows.get_mut(&wid).unwrap().current_title = "build — tests are passing".to_string();
         assert_eq!(
@@ -2398,7 +2398,7 @@ mod tests {
         assert_eq!(
             app.windows[&wid].search.as_ref().unwrap().window_title(),
             search_status,
-            "a canonical Smart Title refresh cannot mutate the find status"
+            "a canonical title refresh cannot mutate the find status"
         );
 
         app.search_close(true);
@@ -2441,7 +2441,7 @@ mod tests {
         assert_eq!(
             window_title_authority(false, false),
             WindowTitleAuthority::Canonical,
-            "closing search then restores the composed title"
+            "closing search then restores the canonical title"
         );
     }
 

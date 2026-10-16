@@ -1,0 +1,28 @@
+# claude-code 2.1.301 · MEASURED 2026-10-15, `aterm ctl text` of a private headless aterm (120x50, aterm 0.105.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake claude.ai OAuth token (`claude --subscriber`) and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · 2.5 s after the Enter on /usage, as a Max 5x subscriber (the token's scopes user:inference user:profile, the composed oauthAccount of ana@example.com seeded in the scratch .claude.json), the fullscreen renderer (CLAUDE_CODE_NO_FLICKER=1); the usage tab's windows are the 5h/7d header readings of the stub's answers (0.4257, 0.61): its read of the usage body went to the fixed claude.ai API base and the lab's black hole refused it · the lab's random project dir is spelled /private/tmp/at.lab0 here
+
+✻ Crunched for 0s · done 11:35 PM
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔ ◐ medium · /effort ▔
+   Settings  Status   Config   Usage   Stats
+
+   Session
+
+   Total cost:            $0.0921
+   Total duration (API):  0s
+   Total duration (wall): 6s
+   Total code changes:    0 lines added, 0 lines removed
+   Usage by model:
+        claude-opus-5-5:  23.0k input, 12 output, 0 cache read, 0 cache write ($0.0921)
+   Prompt cache (main):   1 request · 0% of input tokens from cache · no misses · no prompt caching reported by the
+   API
+
+   Current session
+   █████████████████████▎                             42% used
+   Resets 2:35am (America/Los_Angeles)
+
+   Current week (all models)
+   ██████████████████████████████▌                    61% used
+   Resets Oct 19 at 11:35pm (America/Los_Angeles)
+
+   Could not refresh usage data
+
+   r to retry · Esc to cancel

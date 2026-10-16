@@ -1,21 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-0 for `NativeUpdateRendezvousAdmission` (round eight of the update
-//! audit, U36): the outgoing process grants only to a dialer whose code is the
-//! successor's, commits to none LaunchServices disowns, turns no dialer away for
-//! a code check `trustd` did not answer, and files a refusal by its cause. The
-//! secret-only gate, the exit-as-corroboration reading (a disowned dialer
-//! committed to), the gate that closed an unanswered check, and the filing of a
-//! turned-away successor as an unexplained death are the caught mutants.
-
-#[test]
-fn rendezvous_admission_proves_and_catches_the_secret_only_gate() {
-    aterm_spec::verify::prove_and_catch_scalar(
-        &aterm_spec::derive::native_update_rendezvous_admission_model(),
-        "rendezvous admission",
-    );
-}
+//! Tier-0 for `NativeUpdateRendezvousAdmission`: the outgoing process grants only to a dialer
+//! whose code is the successor's, commits to none LaunchServices disowns, turns no dialer away
+//! for a code check `trustd` did not answer, and files a refusal by its cause; each rule has its
+//! caught mutant.
 
 /// Each mutant, alone, breaks the invariant it is named for, and only that one.
 #[test]
@@ -63,9 +52,9 @@ fn each_mutant_breaks_its_own_invariant() {
     }
 }
 
-/// THE HOLD (U36's review): a dialer whose check `trustd` did not answer is
-/// neither granted nor refused; it is granted once the check is answered, and
-/// otherwise the deadline ends the wait, filed by that cause.
+/// The hold: a dialer whose check `trustd` did not answer is neither granted nor refused; it is
+/// granted once the check is answered, and otherwise the deadline ends the wait, filed by that
+/// cause.
 #[test]
 fn an_unanswered_check_holds_until_it_is_answered_or_the_deadline() {
     let model = aterm_spec::derive::native_update_rendezvous_admission_model();

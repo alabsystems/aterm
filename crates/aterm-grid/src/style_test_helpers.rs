@@ -18,16 +18,6 @@ fn count_style_intern_op() {
     STYLE_INTERN_OPS.with(|c| c.set(c.get() + 1));
 }
 
-/// Take (read and reset) the style intern operation count.
-#[cfg(test)]
-pub fn take_style_intern_ops() -> usize {
-    STYLE_INTERN_OPS.with(|c| {
-        let v = c.get();
-        c.set(0);
-        v
-    })
-}
-
 impl Color {
     #[must_use]
     #[inline]

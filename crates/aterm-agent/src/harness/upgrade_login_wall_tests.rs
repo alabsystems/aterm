@@ -695,7 +695,7 @@ fn a_notice_answered_only_by_the_wall_never_reached_the_model() {
             "Winding down; two workflows still run.",
             "end_turn",
         ),
-        // The wall later, on the wind-down's next turn: the notice WAS read.
+        // The wall later, on the wind-down's next turn: the notice was read.
         auth_wall_row("2026-09-27T04:30:00.000Z", INCIDENT_SESSION),
     ]
     .join("\n");
@@ -708,7 +708,7 @@ fn a_notice_answered_only_by_the_wall_never_reached_the_model() {
     );
     assert_eq!(upgrade::notice_fate(&unanswered, marker), Some(false));
     assert_eq!(upgrade::notice_fate(&delivered, LEDGER[1].1), None);
-    // The notice typed AGAIN and answered: its latest copy decides.
+    // The notice typed again and answered: its latest copy decides.
     let again = [
         incident(INCIDENT_SESSION, 1, true),
         typed_row(
@@ -849,17 +849,14 @@ fn a_break_of_background_work_spends_nothing_at_the_login_wall() {
     assert_eq!(next_step(&tired, &at_break, false, late), Step::GiveUp);
 }
 
-/// A notice the wall answered spent no ask: its upgrade types it again at the
-/// first point a notice could be, without waiting out its window or giving up,
-/// as the same ask (the same READY marker); a READY that came first still wins,
-/// and the wall still waits. An upgrade that gave up on such notices (the
-/// recorded 0.93.0 state) is treated as though they spent no ask
-/// ([`upgrade::rearmed`]): pending when none reached the model (counted over
-/// the round's markers), else announced with the asks that did, its window run
-/// out, its next notice the next ask. Negative controls: a notice the model
-/// received waits its window and is given up on after the last ask; a give-up
-/// whose last notice, or every notice, the model received stays given up; a
-/// stop for any other reason stays stopped.
+/// A notice the wall answered spent no ask: it is typed again at the first point a notice could
+/// be, as the same ask (the same READY marker), without waiting out its window or giving up; a
+/// READY that came first still wins, and the wall still waits. A give-up over such notices (the
+/// recorded 0.93.0 state) is taken back ([`upgrade::rearmed`]): pending when none reached the
+/// model (counted over the round's markers), else announced with the asks that did. Negative
+/// controls: a notice the model received waits its window and is given up on after the last ask;
+/// a give-up whose last or every notice the model received stays given up; a stop for any other
+/// reason stays stopped.
 #[test]
 fn a_notice_the_wall_answered_spent_no_ask() {
     let unread = Facts {
@@ -1091,13 +1088,12 @@ fn the_incident_is_waited_out_and_its_last_notice_asked_again() {
     );
 }
 
-/// A READY to the current marker authorizes the restart under every gate, read
-/// by the real reader from the real transcript: the notice typed again once the
-/// login is back, the agent's `ATERM-UPGRADE-READY-12cbabd0` on a line by
-/// itself, and the restart is taken (the stand-in's job read stops it just
-/// before the signal: `wait:changed-before-signal`). A person's draft holds it
-/// (`draft`), and so does the wall returning after the answer (`login`).
-/// Negative control: the READY quoted in a sentence is no answer.
+/// A READY to the current marker authorizes the restart under every gate, read by the real reader
+/// from the real transcript: the notice typed again once the login is back, the agent's
+/// `ATERM-UPGRADE-READY-12cbabd0` on a line by itself, and the restart is taken (the stand-in's
+/// job read stops it just before the signal: `wait:changed`). A person's draft holds it
+/// (`draft`), and so does the wall returning after the answer (`login`). Negative control: the
+/// READY quoted in a sentence is no answer.
 #[cfg(unix)]
 #[test]
 fn a_ready_to_the_current_marker_restarts_under_every_gate() {
@@ -1389,16 +1385,12 @@ fn the_state_0_93_0_left_is_read_and_recovered() {
     );
 }
 
-/// A GIVE-UP TAKEN BACK COUNTS NO ASK TWICE (`St::notices`, the owner's "Asked
-/// N times"): the round typed four notices and counted four; the model read
-/// the first two and the login wall answered the last two, so once the login
-/// is back the give-up is taken back as announced twice ([`upgrade::rearmed`])
-/// and its third ask is typed again. That ask was counted when the round
-/// first typed it, so the record still says four (reviewed 2026-10-09: the
-/// spend was read against the give-up's phase, not the phase the ask was
-/// taken from, and the one notice counted three — seven). A record an older
-/// build wrote, with no list of the markers its round typed, cannot tell the
-/// ask was typed before: one notice still counts one at most.
+/// A give-up taken back counts no ask twice (`St::notices`, the status's "Asked N times"): the
+/// round typed four notices and counted four; the model read the first two and the wall answered
+/// the last two, so once the login is back the give-up is taken back as announced twice
+/// ([`upgrade::rearmed`]) and its third ask is typed again, already counted: the record still says
+/// four. A record an older build wrote, with no list of its round's markers, cannot tell the ask
+/// was typed before: one notice counts one at most.
 #[cfg(unix)]
 #[test]
 fn a_give_up_taken_back_counts_no_ask_twice() {

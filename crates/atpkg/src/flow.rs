@@ -18,7 +18,7 @@
 //!    already excluded), [`parse_pkg`], and check its signed `program`/`build_number`
 //!    bind the request (anti-replay, §4.2);
 //! 5. select the artifact for the target triple (a missing triple is a clean skip, §6);
-//! 6. download → [`crate::install::verify_and_stage`] (sha256 → extract → tree_root);
+//! 6. download → [`crate::install::verify_and_stage`] (signed digest → extract → tree_root);
 //! 7. [`crate::activate::activate_build`] + the `bin/` shim install
 //!    ([`crate::activate::install_shims`], entered here through its already-admitted half
 //!    because the flow needs the admitted tool set for the bundle resolve check); record.
@@ -37,6 +37,8 @@ use crate::manifest::{Channel, Index, parse_pkg};
 use crate::select::{Candidate, select_index};
 use crate::sig::{Anchor, BuildFloor, TrustedIndex};
 use crate::store::{Layout, ToolName};
+
+pub(crate) mod ahead;
 
 /// [`crate::install::verify_and_stage`], plus the sidecar discipline BOTH stage lanes owe.
 /// It deliberately takes the PLAIN name in this module — the import above is dropped — so
@@ -126,6 +128,22 @@ pub trait Fetcher {
         program: &str,
         build: u64,
     ) -> Result<(Vec<u8>, Vec<u8>), String>;
+    /// Fetch AHEAD, all at once, the [`Fetcher::pkg_manifest`] pairs a caller is about to read
+    /// one at a time — `(repo, program, build)` each ([`prefetch_pinned`]). Bytes, never
+    /// trust: every read still runs `verify_pkg` → `parse_pkg` on what it is handed, and a
+    /// pair that did not arrive is fetched again by the read that wants it, which meets the
+    /// failure itself.
+    ///
+    /// DEFAULT: nothing — a fetcher with no network leg reads each pair as cheaply on demand.
+    fn prefetch_manifests(&self, _pins: &[(String, String, u64)]) {}
+    /// This fetcher as one a pass may work from several threads at once — the vendor lane's
+    /// plans side by side, and its landings beside the set completion's — or `None`, and
+    /// the pass works it from its own thread, one request after another.
+    ///
+    /// DEFAULT: `None`. The network and `dir:` fetchers, whose memos are locked, are shared.
+    fn shared(&self) -> Option<&(dyn Fetcher + Sync)> {
+        None
+    }
     /// Download `asset` (from the program's `repo`) to `dest`.
     fn download(&self, repo: &str, asset: &str, dest: &Path) -> Result<(), String>;
     /// [`Fetcher::download`], additionally told WHICH program the asset belongs to and
@@ -422,7 +440,7 @@ pub enum FlowError {
     RequiresRetired(String),
     /// The asset download failed.
     Download(String),
-    /// Staging (sha256 / extract / tree_root) failed.
+    /// Staging (signed digest / extract / tree_root) failed.
     Stage(StageError),
     /// The pinned build's SIGNED digests are the ones a recent attempt already proved the
     /// published asset does not match, and the cooldown on that refusal has not lapsed —
@@ -450,6 +468,9 @@ pub enum FlowError {
     /// variant so the verb can add the re-run follow-up the index lane's
     /// [`FlowError::Unreachable`] has always had.
     VendorUnreachable(String),
+    /// The vendor publishes nothing aterm can verify for this target: the canonical
+    /// `unavailable on <target>: <hint>` state, whole — a state, never an error (design §2).
+    VendorUnavailable(String),
 }
 
 impl std::fmt::Display for FlowError {
@@ -527,7 +548,9 @@ impl std::fmt::Display for FlowError {
                 f,
                 "{p} is dev-linked; run `aterm pkg unlink {p}` to release it"
             ),
-            FlowError::Vendor(line) | FlowError::VendorUnreachable(line) => f.write_str(line),
+            FlowError::Vendor(line)
+            | FlowError::VendorUnreachable(line)
+            | FlowError::VendorUnavailable(line) => f.write_str(line),
         }
     }
 }
@@ -948,6 +971,7 @@ fn install_inner(
             installed,
             strategy,
             hooks: &crate::install::StageHooks::NONE,
+            download_turn: None,
         },
         &|dl| fetch_artifact(fetcher, program, repo, artifact, dl),
     )?;
@@ -984,7 +1008,12 @@ pub(crate) fn vendor_install_outcome(
     trust: &crate::vendor_direct::lane::Trust,
     now_unix: i64,
 ) -> crate::vendor_direct::lane::Outcome {
-    let policy = door_vendor_policy(fetcher, layout, anchor, floor, now_unix);
+    // Where nothing is served the lane asks no host, so no index is verified for its yanks.
+    let policy = if spec.serves(req.triple) {
+        door_vendor_policy(fetcher, layout, anchor, floor, now_unix)
+    } else {
+        crate::vendor_direct::policy::Policy::default()
+    };
     let lane = crate::vendor_direct::lane::Lane {
         layout,
         fetcher,
@@ -994,6 +1023,7 @@ pub(crate) fn vendor_install_outcome(
         legacy_index: None,
         asked: true,
         now: now_unix,
+        download_turn: None,
     };
     crate::vendor_direct::lane::install_one(&lane, spec, false)
 }
@@ -1043,6 +1073,104 @@ pub(crate) struct Landing<'a> {
     pub strategy: crate::dispatch::ApplyStrategy,
     /// The caller's gate and sidecars inside the stage.
     pub hooks: &'a crate::install::StageHooks<'a>,
+    /// This landing's place in line for the link among landings side by side, waited for
+    /// before the transfer and given up the moment it is over ([`DownloadTurns`]). `None`: no
+    /// turn to wait for.
+    pub download_turn: Option<&'a DownloadTicket<'a>>,
+}
+
+/// The order landings side by side take the link in: ONE TRANSFER AT A TIME, in the order
+/// their programs were taken ([`Self::ticket`]) — not in the order their threads reach the
+/// download, a coin flip between two lanes woken together — so the first program taken has
+/// the whole link, however slow, while a later one's landing gets as far as its transfer and
+/// waits there, its verify, unpack and activate overlapping the next transfer.
+#[derive(Default)]
+pub(crate) struct DownloadTurns {
+    state: std::sync::Mutex<Turns>,
+    changed: std::sync::Condvar,
+}
+
+/// The tickets taken and the ones still owed the link ([`DownloadTurns`]).
+#[derive(Default)]
+struct Turns {
+    next: u64,
+    open: std::collections::BTreeSet<u64>,
+}
+
+impl DownloadTurns {
+    /// The next place in line, behind every ticket taken before it. The caller takes it as
+    /// it takes the program, under the lock that orders the programs, so the tickets follow
+    /// that order.
+    pub(crate) fn ticket(&self) -> DownloadTicket<'_> {
+        let mut turns = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let n = turns.next;
+        turns.next = n.saturating_add(1);
+        turns.open.insert(n);
+        DownloadTicket { turns: self, n }
+    }
+}
+
+/// One landing's place in line ([`DownloadTurns::ticket`]): its transfer waits for every
+/// earlier ticket's to be over ([`Self::wait`]), and the ticket is done with the link at
+/// [`Self::release`] — after the transfer, or as soon as the landing knows it moves no byte —
+/// and at the latest when it is dropped, whatever the landing came to, so no later ticket
+/// waits on a landing that ended.
+pub(crate) struct DownloadTicket<'t> {
+    turns: &'t DownloadTurns,
+    n: u64,
+}
+
+impl DownloadTicket<'_> {
+    /// Wait until every ticket taken before this one is done with the link.
+    pub(crate) fn wait(&self) {
+        let turns = self
+            .turns
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        drop(
+            self.turns
+                .changed
+                .wait_while(turns, |turns| !is_next(turns, self.n))
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+    }
+
+    /// Done with the link: the next ticket's transfer may start. Idempotent.
+    pub(crate) fn release(&self) {
+        self.turns
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .open
+            .remove(&self.n);
+        self.turns.changed.notify_all();
+    }
+}
+
+impl Drop for DownloadTicket<'_> {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// Whether ticket `n` has the link: every ticket taken before it is done with it.
+fn is_next(turns: &Turns, n: u64) -> bool {
+    turns.open.first() == Some(&n)
+}
+
+/// Gives a held turn up when dropped: the transfer over, or an early return out of it.
+struct TurnHeld<'a>(Option<&'a DownloadTicket<'a>>);
+
+impl Drop for TurnHeld<'_> {
+    fn drop(&mut self) {
+        if let Some(ticket) = self.0 {
+            ticket.release();
+        }
+    }
 }
 
 /// What a landing laid.
@@ -1065,6 +1193,9 @@ pub(crate) fn land_artifact(
 ) -> Result<Landed, FlowError> {
     let (program, pinned, artifact, installed, strategy) =
         (l.program, l.build, l.artifact, l.installed, l.strategy);
+    // This landing's turn at the link ([`Landing::download_turn`]), given up on every way out
+    // of the transfer below — an early refusal before it included.
+    let turn = TurnHeld(l.download_turn);
     // 6a. THE DIGEST-REFUSAL MEMO first, because it is the one gate that can spare the
     // download entirely: a recent attempt at THIS build's signed digests already proved
     // the published asset does not match them, and nothing about that verdict changes
@@ -1075,11 +1206,19 @@ pub(crate) fn land_artifact(
         return Err(FlowError::StageRefused(note));
     }
     let dl = staged_download_path(layout, program, &artifact.asset)?;
+    // THE ARCHIVE FETCHED AHEAD ([`ahead`]): the set completion's download-ahead lane may
+    // already hold this program's download, or be moving it. Its answer stands in for the
+    // fetch below, and the lane made this path's pre-transfer checks before it fetched
+    // (this preflight, the stale-file rule, the partial sweep), so none is repeated over
+    // a download already made; the extract's own preflight below still runs.
+    let ahead = ahead::claim(program, &dl);
     // Disk preflight (§9): the compressed asset + its extracted tree must fit (they coexist
     // until the asset is reclaimed post-stage) while keeping the free floor. Fails OPEN when
     // free space can't be queried (available_bytes None) — preflight is a safety net.
-    let required = LandingBytes::of(artifact).need();
-    disk_gate(required, crate::freespace::available_bytes(&dl))?;
+    if ahead.is_none() {
+        let required = LandingBytes::of(artifact).need();
+        disk_gate(required, crate::freespace::available_bytes(&dl))?;
+    }
     make_staging_dir(&dl).map_err(|e| FlowError::Download(e.to_string()))?;
     // Clear any stale staging file BEFORE fetching — unless it is the verified archive
     // a previous attempt's failed stage RETAINED ([`carried_archive`]):
@@ -1089,8 +1228,8 @@ pub(crate) fn land_artifact(
     // it, and `fs::copy` truncates the shared inode. Both destroy a file inside the
     // user's signed app bundle. See `DirFetcher::download`; `carried_archive` refuses
     // a hard link for exactly that reason.
-    let reusable = carried_archive(&dl, artifact);
-    if !reusable {
+    let reusable = ahead.is_none() && carried_archive(&dl, artifact);
+    if ahead.is_none() && !reusable {
         let _ = std::fs::remove_file(&dl);
     }
     // A resumable transfer KEEPS its own `<asset>.part` across attempts — that is the
@@ -1103,7 +1242,9 @@ pub(crate) fn land_artifact(
     // a user may never run, so reclaim every OTHER partial now: at most one partial per
     // program survives between passes, and it is always the one the next attempt will
     // finish.
-    sweep_foreign_partials(&dl);
+    if ahead.is_none() {
+        sweep_foreign_partials(&dl);
+    }
     // Live-progress hooks (R5): the download runs in a curl child, so the byte meter
     // is a sibling `.part` poller against the SIGNED size. Every hook is a no-op
     // unless a `--progress-file` pass is live.
@@ -1111,13 +1252,28 @@ pub(crate) fn land_artifact(
     // No landing marker: a `claude` typed during the transfer runs
     // the build it has, silently, and activation's atomic flip below makes the next one
     // run this build ([`crate::landing`]).
-    let download_watch = crate::progress::watch_download(program, &dl, artifact.size);
+    // ONE TRANSFER AT A TIME among landings that take turns ([`Landing::download_turn`]),
+    // waited for before the meter starts — a row waiting for the link still reads queued, not
+    // a download at 0% — and given back the moment the transfer is over. A landing that moves
+    // no byte here (its archive fetched ahead or carried from the last attempt) gives its turn
+    // up at once.
+    if let Some(ticket) = turn.0 {
+        if ahead.is_none() && !reusable {
+            ticket.wait();
+        } else {
+            ticket.release();
+        }
+    }
+    // The lane's download carried its own meter.
+    let download_watch = ahead
+        .is_none()
+        .then(|| crate::progress::watch_download(program, &dl, artifact.size));
     if reusable {
         println!(
             "atpkg: {program}: reusing verified archive {} from the last attempt",
             artifact.asset
         );
-    } else if let Err(e) = fetch(&dl) {
+    } else if let Err(e) = ahead.unwrap_or_else(|| fetch(&dl)) {
         // An aborted transfer leaves bytes in `<dl>.part`, not at `<dl>`: the production
         // fetcher promotes the part onto `dl` only on curl success, so `dl` is either
         // absent or complete. The part is deliberately LEFT for the next attempt to
@@ -1128,8 +1284,10 @@ pub(crate) fn land_artifact(
         note_fetch_fault();
         return Err(FlowError::Download(e));
     }
-    // The transfer is over either way — stop the poller before the phase moves on.
+    // The transfer is over either way — stop the poller before the phase moves on, and let
+    // the next landing's transfer start.
     drop(download_watch);
+    drop(turn);
     crate::progress::note_phase(program, crate::progress::Phase::Verify);
     let build_dir = layout.build_dir(program, pinned);
     // Capture "this build is ALREADY live" BEFORE the stage swaps a new tree into it and
@@ -2352,11 +2510,10 @@ fn apply_group_txn_inner(
                     // digest alone, as the stage checks it: [`carried_archive`]'s one-link
                     // rule is about reusing a file, and refused a `dir:` registry's fresh
                     // download (a hard link to its archive) as a mismatch of equal digests.
-                    if !fetched.carried && !signed_digest_matches(&fetched.dl, &fetched.artifact) {
-                        let err = StageError::Sha256Mismatch {
-                            expected: fetched.artifact.sha256.clone(),
-                            got: crate::tree::file_sha256(&fetched.dl).unwrap_or_default(),
-                        };
+                    if !fetched.carried
+                        && let Err(err) =
+                            crate::install::check_signed_digest(&fetched.artifact, &fetched.dl)
+                    {
                         record_digest_refusal(
                             &layout.build_dir(m, fetched.pinned),
                             &fetched.artifact,
@@ -2676,13 +2833,13 @@ fn waited_words(secs: i64) -> String {
 /// # Trust posture
 ///
 /// A REUSE gate, never a verification shortcut — it can only ever SKIP A DOWNLOAD, never
-/// admit bytes. The file is accepted only when its SHA-256 equals the SIGNED `sha256`, so
-/// the bytes it stands for are by construction the ones the fetcher would have produced;
-/// `verify_and_stage` then re-checks that same digest AND the signed `tree_root` after
-/// extraction, exactly as it does for a freshly downloaded archive. An empty signed
-/// `sha256` (no digest to match) is refused, and so is anything that is not a regular
-/// file. A file that fails is not reused: the caller removes it and fetches, which is the
-/// old behaviour unchanged.
+/// admit bytes. The file is accepted only when its digest equals the SIGNED one
+/// ([`crate::install::check_signed_digest`]), so the bytes it stands for are by
+/// construction the ones the fetcher would have produced; `verify_and_stage` then
+/// re-checks that same digest AND the signed `tree_root` after extraction, exactly as it
+/// does for a freshly downloaded archive. A row with no signed digest (none to match) is
+/// refused, and so is anything that is not a regular file. A file that fails is not
+/// reused: the caller removes it and fetches, which is the old behaviour unchanged.
 ///
 /// The digest is the whole gate — deliberately NOT pre-filtered on the signed `size`,
 /// which is the download CAP and not a promise about a file already on disk. Reading the
@@ -2706,14 +2863,7 @@ fn carried_archive(dl: &Path, artifact: &crate::manifest::Artifact) -> bool {
             return false;
         }
     }
-    signed_digest_matches(dl, artifact)
-}
-
-/// Whether `dl`'s SHA-256 is the signed `sha256` — an empty one matches nothing, and an
-/// unreadable file matches nothing.
-fn signed_digest_matches(dl: &Path, artifact: &crate::manifest::Artifact) -> bool {
-    !artifact.sha256.is_empty()
-        && crate::tree::file_sha256(dl).is_ok_and(|got| got.eq_ignore_ascii_case(&artifact.sha256))
+    crate::install::check_signed_digest(artifact, dl).is_ok()
 }
 
 /// Disable the live commands of every member `decide` asked to force off its current build
@@ -2815,13 +2965,16 @@ fn sweep_foreign_partials(dl: &Path) {
             .is_some_and(|ext| ext == "part");
         // A `.part` of another asset, or — since archives of a failed stage are
         // RETAINED for reuse ([`carried_archive`]) — a full archive of another asset
-        // name: at most one of each survives per program, and it is this pass's.
-        let is_archive = std::path::Path::new(&entry_name)
-            .to_str()
-            .is_some_and(|n| n.ends_with(".tar.zst") || n.ends_with(".dmg"))
-            || entry_name
-                .to_str()
-                .is_some_and(|n| n.starts_with("claude-") || n.starts_with("codex-"));
+        // name (a vendor-direct download is `<program>-<version>-<triple>[.ext]`): at most
+        // one of each survives per program, and it is this pass's.
+        let is_archive = entry_name.to_str().is_some_and(|n| {
+            n.ends_with(".tar.zst")
+                || n.ends_with(".dmg")
+                || crate::vendor_direct::VENDORS.iter().any(|spec| {
+                    n.strip_prefix(spec.program)
+                        .is_some_and(|rest| rest.starts_with('-'))
+                })
+        });
         if is_part || is_archive {
             let _ = std::fs::remove_file(entry.path());
         }
@@ -2839,7 +2992,7 @@ fn sweep_foreign_partials(dl: &Path) {
 fn reclaim_after_failed_stage(dl: &Path, e: &StageError) {
     if matches!(
         e,
-        StageError::Sha256Mismatch { .. } | StageError::SignerRefused(_)
+        StageError::DigestMismatch { .. } | StageError::SignerRefused(_)
     ) {
         let _ = std::fs::remove_file(dl);
         discard_sibling_partial(dl);
@@ -2852,7 +3005,7 @@ fn reclaim_after_failed_stage(dl: &Path, e: &StageError) {
 /// THREE failures are recorded, differently, because they are evidence of different
 /// things:
 ///
-/// * the signed-`sha256` mismatch COOLS DOWN. Its retry costs a TRANSFER — it is the
+/// * the signed-digest mismatch COOLS DOWN. Its retry costs a TRANSFER — it is the
 ///   failure that (rightly) deletes the archive and its sibling partial: the bytes are
 ///   wrong, and a poisoned prefix must never seed the next attempt, so the next attempt
 ///   starts from byte 0. But one such verdict can be a truncated transfer or a proxy, so
@@ -2877,11 +3030,11 @@ fn reclaim_after_failed_stage(dl: &Path, e: &StageError) {
 /// refused installer lane), keeps its verified archive for the same reason, and retries
 /// freely.
 fn record_digest_refusal(build_dir: &Path, artifact: &crate::manifest::Artifact, e: &StageError) {
-    if artifact.sha256.is_empty() {
+    let Some(digest) = artifact.digest() else {
         return;
-    }
+    };
     let record = match e {
-        StageError::Sha256Mismatch { .. } => crate::store::record_stage_refusal,
+        StageError::DigestMismatch { .. } => crate::store::record_stage_refusal,
         StageError::SignerRefused(_) => crate::store::record_signer_refusal,
         StageError::TreeRootMismatch { .. } => crate::store::record_held_refusal,
         _ => return,
@@ -2890,7 +3043,7 @@ fn record_digest_refusal(build_dir: &Path, artifact: &crate::manifest::Artifact,
     // that could not record the refusal still reports the stage failure itself.
     let _ = record(
         build_dir,
-        &artifact.sha256,
+        digest,
         &artifact.tree_root,
         &e.to_string(),
         now_unix(),
@@ -2927,7 +3080,7 @@ fn digest_refusal_note(
 ) -> Option<String> {
     let now = now_unix();
     let memo = crate::store::stage_refusal(&layout.build_dir(program, build))?;
-    if !memo.binds(&artifact.sha256, &artifact.tree_root, now) {
+    if !memo.binds(artifact.digest()?, &artifact.tree_root, now) {
         return None;
     }
     // Built by hand rather than wrapped into one `format!` string: the sentence is long,
@@ -3047,10 +3200,26 @@ impl LandingBytes {
 /// gate sees when it lands last. A volume with that much free passes each unit's gate in
 /// every order the priority queue can choose.
 pub(crate) fn peak_need(units: impl IntoIterator<Item = LandingBytes>) -> u64 {
-    let (trees, asset) = units.into_iter().fold((0u64, 0u64), |(trees, asset), u| {
-        (trees.saturating_add(u.tree), asset.max(u.asset))
-    });
-    trees.saturating_add(asset)
+    peak_need_at_once(units, 1)
+}
+
+/// [`peak_need`] for units landing `lanes` at a time: every tree, and the archives of the
+/// `lanes` largest units, which can all be on disk together.
+pub(crate) fn peak_need_at_once(
+    units: impl IntoIterator<Item = LandingBytes>,
+    lanes: usize,
+) -> u64 {
+    let mut trees = 0u64;
+    let mut assets = Vec::new();
+    for u in units {
+        trees = trees.saturating_add(u.tree);
+        assets.push(u.asset);
+    }
+    assets.sort_unstable_by(|a, b| b.cmp(a));
+    assets
+        .into_iter()
+        .take(lanes)
+        .fold(trees, u64::saturating_add)
 }
 
 /// What the default set's up-front disk check reads of one install unit
@@ -3488,6 +3657,12 @@ pub(crate) fn fetch_faults() -> u32 {
     FETCH_FAULTS.with(std::cell::Cell::get)
 }
 
+/// Count, on the pass's thread, the `n` fetch faults a lane thread of the same pass counted
+/// on its own ([`note_fetch_fault`]): a pass's offline verdict reads one tally.
+pub(crate) fn note_fetch_faults(n: u32) {
+    FETCH_FAULTS.with(|count| count.set(count.get().saturating_add(n)));
+}
+
 /// The provenance of this thread's last [`resolve_verified_index`], `None` before the
 /// first.
 #[must_use]
@@ -3734,6 +3909,26 @@ fn refuse_vendor_program(program: &str) -> Result<(), FlowError> {
             spec.vendor
         ))),
         None => Ok(()),
+    }
+}
+
+/// [`Fetcher::prefetch_manifests`] for the manifests [`verified_pkg`] reads for `members` on
+/// `ch`: each member's pinned build, from its index-declared repo. A member with no pin or
+/// no program is left to the read, which says so.
+pub fn prefetch_pinned<'a>(
+    fetcher: &dyn Fetcher,
+    index: &TrustedIndex,
+    ch: &Channel,
+    members: impl IntoIterator<Item = &'a str>,
+) {
+    let mut pins: Vec<(String, String, u64)> = Vec::new();
+    for program in members {
+        if let (Some(&build), Some(declared)) = (ch.pin.get(program), index.program(program)) {
+            pins.push((declared.repo.clone(), program.to_string(), build));
+        }
+    }
+    if !pins.is_empty() {
+        fetcher.prefetch_manifests(&pins);
     }
 }
 
@@ -4043,26 +4238,39 @@ fn fetch_member(
     // what THIS member's own failed stage leaves behind when the failure was not the
     // bytes' ([`reclaim_after_failed_stage`]) — otherwise a non-digest refusal
     // re-downloads the whole archive (743 MB for `trust`) at every launch and tick.
-    let carried = carried_archive(&dl, artifact);
-    if !carried {
-        // Same reason as the singleton path: a stale staging entry can be a hardlink
-        // into a `dir:` registry, and fetching over it corrupts the registry. The
-        // carried arm never needs this: it only READS `dl` — nothing is written over a
-        // hardlink — and what it reads already matched the signed digest.
-        let _ = std::fs::remove_file(&dl);
+    //
+    // THE ARCHIVE FETCHED AHEAD ([`ahead`]): the set completion's download-ahead lane may
+    // already hold this member's download, or be moving it. Its answer stands in for the
+    // fetch below — the same lane, file and cap — and the lane made this path's own checks
+    // first (it never fetches over a file standing here), so none is repeated over it.
+    let ahead = ahead::claim(program, &dl);
+    let carried = ahead.is_none() && carried_archive(&dl, artifact);
+    if ahead.is_none() {
+        if !carried {
+            // Same reason as the singleton path: a stale staging entry can be a hardlink
+            // into a `dir:` registry, and fetching over it corrupts the registry. The
+            // carried arm never needs this: it only READS `dl` — nothing is written over a
+            // hardlink — and what it reads already matched the signed digest.
+            let _ = std::fs::remove_file(&dl);
+        }
+        // Same strandage bound as the singleton path: at most one partial — and one
+        // carried archive — per program survives between passes, and it is the one the
+        // next attempt will finish or reuse.
+        sweep_foreign_partials(&dl);
     }
-    // Same strandage bound as the singleton path: at most one partial — and one
-    // carried archive — per program survives between passes, and it is the one the
-    // next attempt will finish or reuse.
-    sweep_foreign_partials(&dl);
     if carried {
         println!(
             "atpkg: {program}: reusing verified archive {} from the last attempt",
             artifact.asset
         );
     } else {
-        let download_watch = crate::progress::watch_download(program, &dl, artifact.size);
-        if let Err(e) = fetch_artifact(fetcher, program, &repo, artifact, &dl) {
+        let fetched = ahead.unwrap_or_else(|| {
+            // The transfer is over when this returns — the poller stops before the phase
+            // moves on.
+            let _download_watch = crate::progress::watch_download(program, &dl, artifact.size);
+            fetch_artifact(fetcher, program, &repo, artifact, &dl)
+        });
+        if let Err(e) = fetched {
             // SAY WHY (see `stage_failure_note`). The transfer is the failure
             // this exit meets most often and `e` carries the fetcher's own words — HTTP
             // status, curl exit, the signed byte cap — which no later surface can
@@ -4079,8 +4287,6 @@ fn fetch_member(
             *why = format!("the download of {} failed: {e}", artifact.asset);
             return None;
         }
-        // The transfer is over — stop the poller before the phase moves on.
-        drop(download_watch);
     }
     let artifact = artifact.clone();
     Some(Fetched {
@@ -4458,9 +4664,9 @@ fn rollback_member(layout: &Layout, program: &str, s: &Staged) {
                 } else {
                     // A binary the new build added but the prior build lacks — drop the shim
                     // rather than leave it dangling at a nonexistent prior-build path.
-                    let _ = std::fs::remove_file(layout.shim(tool));
+                    let _ = crate::lay::remove_in_process(&layout.shim(tool));
                     if let Some(alias) = &alias {
-                        let _ = std::fs::remove_file(layout.shim(alias));
+                        let _ = crate::lay::remove_in_process(&layout.shim(alias));
                     }
                 }
             }
@@ -4468,11 +4674,11 @@ fn rollback_member(layout: &Layout, program: &str, s: &Staged) {
         Some(_) => { /* prior == new build: nothing meaningful to undo */ }
         None => {
             for tool in &s.exposes {
-                let _ = std::fs::remove_file(layout.shim(tool));
+                let _ = crate::lay::remove_in_process(&layout.shim(tool));
                 if s.aliases == Aliases::Alab
                     && let Some(alias) = tool.alias()
                 {
-                    let _ = std::fs::remove_file(layout.shim(&alias));
+                    let _ = crate::lay::remove_in_process(&layout.shim(&alias));
                 }
             }
             // A fresh install has no prior link to re-point, but `flip_member`'s
@@ -4566,19 +4772,36 @@ fn apply_sysroot_bundle(reloc: &str) -> Result<(), FlowError> {
 /// `rollback_member` had, harmless in practice (a PE starts with `MZ`, which fails
 /// [`crate::relocate::is_native_object`], and the bundle backend errors on Windows anyway) but
 /// not worth leaving as the one site that still spells the rule by hand.
+///
+/// The checks run side by side ([`crate::net::fan_out`]), and the verdict is the first
+/// failure in `exposes` order, as when they ran in turn. Each one is a fresh binary's FIRST
+/// exec, and that is paid per file in proportion to its size (measured on the trust
+/// toolchain's fifteen: 7 s in turn, 3.6 s at once — the floor is `trustc`'s first load of
+/// its 380 MB driver library, which the tools that link the same library wait on).
 pub(crate) fn bundle_resolve_check(
     build_dir: &Path,
     exposes: &[ToolName],
 ) -> Result<(), FlowError> {
-    for tool in exposes {
-        let bin = build_dir.join("bin").join(tool.exe_file());
-        // Only native objects (the compilers that link dylibs) have libraries to
-        // resolve; a wrapper script has none, so skip it.
-        if bin.is_file() && crate::relocate::is_native_object(&bin) {
-            crate::sysroot::resolve_check(&bin).map_err(FlowError::Activate)?;
-        }
-    }
-    Ok(())
+    bundle_resolve_check_with(build_dir, exposes, &crate::sysroot::resolve_check)
+}
+
+/// [`bundle_resolve_check`] with the per-binary check injected.
+fn bundle_resolve_check_with(
+    build_dir: &Path,
+    exposes: &[ToolName],
+    check: &(dyn Fn(&Path) -> Result<(), String> + Sync),
+) -> Result<(), FlowError> {
+    // Only native objects (the compilers that link dylibs) have libraries to resolve; a
+    // wrapper script has none, so it is skipped.
+    let bins: Vec<PathBuf> = exposes
+        .iter()
+        .map(|tool| build_dir.join("bin").join(tool.exe_file()))
+        .filter(|bin| bin.is_file() && crate::relocate::is_native_object(bin))
+        .collect();
+    crate::net::fan_out(&bins, &|bin: &PathBuf| check(bin))
+        .into_iter()
+        .collect::<Result<(), String>>()
+        .map_err(FlowError::Activate)
 }
 
 /// Current Unix epoch second — the `now_unix` input every freshness gate takes as a

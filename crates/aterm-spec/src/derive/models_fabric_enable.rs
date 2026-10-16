@@ -5,15 +5,11 @@
 
 use super::Model;
 
-/// A rejected mint cannot publish a replacement or reach broker supervision.
-/// Three grants bound the exhaustive model; Tier-1 runs the same counter with
-/// eight grants against the effect trace of the REAL command, in
-/// `crates/aterm-link/tests/world/fabric_on.rs`
-/// (`a_rejected_mint_publishes_nothing_and_the_trace_satisfies_the_model`) —
-/// that is the crate whose integration tests can run the binary. Existing
-/// capability bytes and temporary-file cleanup are checked there too, at every
-/// mint and on each failure exit.
-/// `Buggy=1` restores continuing after rejection and premature publication.
+/// A rejected mint cannot publish a replacement or reach broker supervision. Three grants bound
+/// the exhaustive model; Tier-1 runs the same counter with eight grants against the effect trace
+/// of the real command (`crates/aterm/tests/fabric_world/fabric_on.rs`), which also checks
+/// existing capability bytes and temporary-file cleanup at every mint and failure exit.
+/// `Buggy=1` adds continuing after a rejection and premature publication.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn fabric_capability_publication_model() -> Model {

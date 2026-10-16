@@ -108,7 +108,7 @@ pub(crate) struct UpdateState {
     /// The automatic lane's download in flight, which the band does not show
     /// (design ruling 220): the headline and detail say it.
     downloading: Option<QuietDownload>,
-    /// A DEV-MARKED copy (`tools/dev-app.sh`), which the updater leaves alone on
+    /// A DEV-MARKED copy (`ship dev-app`), which the updater leaves alone on
     /// purpose; `None` for every other copy ([`Self::with_dev_build`], gap #30).
     dev_build: Option<DevBuildPage>,
     /// Where this copy runs from (`aterm_update::which_copy::running_posture`),
@@ -116,6 +116,11 @@ pub(crate) struct UpdateState {
     /// when unread ([`Self::with_install_posture`]).
     install_posture: Option<aterm_update::which_copy::InstallPosture>,
 }
+
+/// The detail under "This copy of aterm can't update itself." for a copy that is
+/// not an app bundle at all: what it is, and how to get a copy that updates.
+pub(crate) const NOT_A_BUNDLE_DETAIL: &str =
+    "It isn\u{2019}t an installed aterm.app. Install aterm from alab.systems to get updates.";
 
 /// A dev-marked copy as the page says it (gap #30). The updater leaves it alone on
 /// purpose, so the "move it to Applications" remedy the other copies that cannot
@@ -157,8 +162,9 @@ impl DevBuildPage {
             .map(|lag| format!("It is {}. ", lag.words()))
             .unwrap_or_default();
         format!(
-            "{standing}The updater leaves a dev build alone: rebuild it with tools/dev-app.sh, \
-             or use the release (tools/install.sh puts it in Applications)."
+            "{standing}The updater leaves a dev build alone: rebuild it with `targo \
+             --unverified ship dev-app` in its checkout, or use the release (tools/install.sh \
+             puts it in Applications)."
         )
     }
 }
@@ -233,7 +239,7 @@ pub(crate) struct UpdateProjection {
     /// under "This copy of aterm can't update itself" — a claim about a release
     /// list this process never fetched (2026-08-19 round-6 audit).
     pub(crate) installable: bool,
-    /// This copy is DEV-MARKED (`tools/dev-app.sh`, gap #30): `installable` is false on
+    /// This copy is DEV-MARKED (`ship dev-app`, gap #30): `installable` is false on
     /// purpose, so every card that would say "can't update" or "reinstall" says it is a
     /// dev build instead.
     pub(crate) dev_build: bool,
@@ -860,9 +866,7 @@ impl UpdateState {
             use aterm_update::which_copy::InstallPosture;
             return match (&self.dev_build, self.install_posture) {
                 (Some(dev), _) => Some(dev.detail()),
-                (None, Some(InstallPosture::NotABundle)) => {
-                    Some("A plain binary never updates itself.".to_string())
-                }
+                (None, Some(InstallPosture::NotABundle)) => Some(NOT_A_BUNDLE_DETAIL.to_string()),
                 (None, posture) => posture.and_then(InstallPosture::remedy).map(str::to_string),
             };
         }
@@ -1510,10 +1514,7 @@ mod tests {
         );
         // A plain binary has no aterm.app to move.
         let binary = page(Some(InstallPosture::NotABundle)).detail;
-        assert_eq!(
-            binary.as_deref(),
-            Some("A plain binary never updates itself.")
-        );
+        assert_eq!(binary.as_deref(), Some(super::NOT_A_BUNDLE_DETAIL));
         // Unread: the headline alone, no guessed remedy.
         assert_eq!(page(None).detail, None);
         // The same state WITH a replaceable bundle is the ordinary healthy line.
@@ -1548,7 +1549,6 @@ mod tests {
             detail.starts_with("The updater leaves a dev build alone"),
             "{detail}"
         );
-        assert!(detail.contains("tools/dev-app.sh"), "{detail}");
         let behind = page(Some(DevLag::Behind {
             latest: "v0.93.0".into(),
             releases: Some(2),

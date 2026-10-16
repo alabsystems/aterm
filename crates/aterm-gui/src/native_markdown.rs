@@ -783,49 +783,9 @@ pub(crate) struct MarkdownSourceWindow {
     pub(crate) truncated_after: bool,
 }
 
-/// Materialize a UTF-8-safe, line-aligned source window around a reading
-/// anchor. Source and split modes stay bounded even for adversarial files while
-/// retaining canonical byte coordinates for selection/copy.
-#[cfg(test)]
-pub(crate) fn source_window(
-    source: &str,
-    anchor: usize,
-    max_bytes: usize,
-    max_lines: usize,
-) -> MarkdownSourceWindow {
-    if source.is_empty() || max_bytes == 0 || max_lines == 0 {
-        return MarkdownSourceWindow::default();
-    }
-    let mut anchor = anchor.min(source.len());
-    while !source.is_char_boundary(anchor) {
-        anchor = anchor.saturating_sub(1);
-    }
-    let line_start = source[..anchor].rfind('\n').map_or(0, |at| at + 1);
-    let context_start = source[..line_start]
-        .rmatch_indices('\n')
-        .nth(max_lines / 4)
-        .map_or(0, |(at, _)| at + 1);
-    let byte_limit = context_start.saturating_add(max_bytes).min(source.len());
-    let mut end = byte_limit;
-    while !source.is_char_boundary(end) {
-        end = end.saturating_sub(1);
-    }
-    let line_limited = source[context_start..end]
-        .match_indices('\n')
-        .nth(max_lines)
-        .map_or(end, |(relative, _)| context_start + relative + 1);
-    end = line_limited;
-    MarkdownSourceWindow {
-        text: source[context_start..end].to_string(),
-        source: context_start..end,
-        truncated_before: context_start > 0,
-        truncated_after: end < source.len(),
-    }
-}
-
 /// Source-reader window whose first row is the exact requested source line.
-/// Unlike the contextual inspection helper above, repeated page moves therefore
-/// make monotonic progress through even a single enormous fenced block.
+/// Because the window starts on that line, repeated page moves make monotonic
+/// progress through even a single enormous fenced block.
 pub(crate) fn source_window_from_anchor(
     source: &str,
     anchor: usize,
@@ -1106,60 +1066,6 @@ pub(crate) fn move_block_anchor(
         .saturating_add_signed(delta)
         .min(document.blocks.len().saturating_sub(1));
     document.blocks[target].source().start
-}
-
-/// Resolve a viewport-sized reading move to an exact block index. Both
-/// directions use the same width-aware block estimator as the visible layout,
-/// so a short final page never shrinks the following "previous page" move to a
-/// single block. Work is capped independently of document size.
-#[cfg(test)]
-pub(crate) fn page_target_block(
-    document: &MarkdownDocument,
-    source_anchor: usize,
-    viewport_width: f32,
-    viewport_height: f32,
-    direction: isize,
-) -> usize {
-    const MAX_PAGE_BLOCKS: usize = 256;
-
-    let Some(current) = block_at_source(document, source_anchor) else {
-        return 0;
-    };
-    if direction == 0 || document.blocks.len() <= 1 {
-        return current;
-    }
-    let target_height = if viewport_height.is_finite() {
-        (viewport_height * 0.82).clamp(1.0, 100_000.0)
-    } else {
-        1.0
-    };
-    let width = if viewport_width.is_finite() {
-        viewport_width.max(1.0)
-    } else {
-        1.0
-    };
-    let mut target = current;
-    let mut distance = 0.0;
-    for _ in 0..MAX_PAGE_BLOCKS {
-        let next = if direction < 0 {
-            let Some(previous) = target.checked_sub(1) else {
-                break;
-            };
-            previous
-        } else {
-            let next = target.saturating_add(1);
-            if next >= document.blocks.len() {
-                break;
-            }
-            next
-        };
-        target = next;
-        distance += estimated_block_height(&document.blocks[target], width);
-        if distance >= target_height {
-            break;
-        }
-    }
-    target
 }
 
 fn estimated_block_height(block: &MarkdownBlock, viewport_width: f32) -> f32 {
@@ -2253,23 +2159,6 @@ mod tests {
     }
 
     #[test]
-    fn source_window_is_utf8_safe_line_aligned_and_bounded() {
-        let source = (0..400)
-            .map(|line| format!("line {line} 🦀\n"))
-            .collect::<String>();
-        let anchor = source.find("line 220").unwrap();
-        let window = source_window(&source, anchor, 512, 24);
-        assert!(source.is_char_boundary(window.source.start));
-        assert!(source.is_char_boundary(window.source.end));
-        assert_eq!(&source[window.source.clone()], window.text);
-        assert!(window.text.lines().count() <= 25);
-        assert!(window.text.len() <= 512);
-        assert!(window.truncated_before);
-        assert!(window.truncated_after);
-        assert!(window.source.start <= anchor && anchor < window.source.end);
-    }
-
-    #[test]
     fn image_policy_requires_gesture_and_never_allows_capability_escape() {
         let document = parse(
             "![local](assets/diagram.png) ![remote](https://example.com/x.png) ![bad](../../secret.png)",
@@ -2662,28 +2551,5 @@ mod tests {
         skipped.insert("steps", 1);
         assert_eq!(admits(&model, &before, &skipped), None);
         assert!(!model.check_invariant("ExactIntraBlockProgress", &skipped));
-    }
-
-    #[test]
-    fn page_targets_remain_symmetric_at_the_short_final_page() {
-        let source = (0..24)
-            .map(|index| format!("Paragraph {index} with enough words for one row.\n\n"))
-            .collect::<String>();
-        let document = parse(&source);
-        let first = document.blocks[0].source().start;
-        let forward = page_target_block(&document, first, 680.0, 420.0, 1);
-        assert!(forward > 1);
-        let final_index = document.blocks.len() - 1;
-        let final_anchor = document.blocks[final_index].source().start;
-        let backward = page_target_block(&document, final_anchor, 680.0, 420.0, -1);
-        assert!(
-            final_index.saturating_sub(backward) > 1,
-            "a short remaining forward page must not collapse the backward page"
-        );
-        assert_eq!(page_target_block(&document, first, 680.0, 420.0, -1), 0);
-        assert_eq!(
-            page_target_block(&document, final_anchor, 680.0, 420.0, 1),
-            final_index
-        );
     }
 }

@@ -1,27 +1,24 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `atpkg verify [program]` (§12) — an offline drift/integrity audit of the installed store
-//! against the SIGNED `tree_root` recorded at install/update time.
+//! `atpkg verify [program]` (§12): an offline drift/integrity audit of the installed store
+//! against the signed `tree_root` recorded at install/update time.
 //!
-//! It recomputes the ACTIVE build dir's root — [`crate::tree::tree_root_declared`], the
-//! plain [`crate::tree::tree_root`] wherever the inode stores modes — and compares it to the
-//! release-key-verified value persisted in `status.toml` ([`crate::status::ProgramStatus::tree_root`]).
-//! That recorded root came from a manifest whose signature was checked over exact bytes
-//! before parse (verify-before-parse), so this attests that what is on disk still matches
-//! what was signed — it is NEVER a self-generated `files.sha256` (aterm-pkg's dropped
-//! mistake). Read-only: no parse path, no filesystem mutation.
+//! It recomputes the active build dir's root ([`crate::tree::tree_root_declared`]; the plain
+//! [`crate::tree::tree_root`] wherever the inode stores modes) and compares it to the
+//! release-key-verified value in `status.toml`
+//! ([`crate::status::ProgramStatus::tree_root`]). That root came from a manifest whose
+//! signature was checked over exact bytes before parse, so this attests that what is on disk
+//! still matches what was signed — never a self-generated checksum. Read-only.
 //!
 //! A vendor-direct build is attested by its `.vendor` record instead, and a vendor program
-//! rolled back to the legacy index build its first vendor install replaced — whose row
-//! that install overwrote — by the signed root the program's stamp kept for that build.
-//! Neither asks an index.
+//! rolled back to the legacy index build its first vendor install replaced (whose row that
+//! install overwrote) by the signed root the program's stamp kept for that build. Neither
+//! asks an index.
 //!
-//! `status.toml` shares the store's trust boundary (both under the 0700 hardened prefix), so
-//! `verify` defends against accidental corruption / non-privileged drift, NOT against an
-//! adversary who already owns the prefix (they could rewrite both). A future
-//! `atpkg verify --online` could re-fetch + re-verify the manifest to remove the status.toml
-//! dependency.
+//! `status.toml` shares the store's trust boundary (both under the 0700 prefix), so `verify`
+//! defends against accidental corruption and non-privileged drift, not against an adversary
+//! who already owns the prefix.
 
 use crate::store::Layout;
 
@@ -33,7 +30,7 @@ pub enum VerifyOutcome {
         /// The active build audited.
         build: u64,
     },
-    /// The store tree does NOT match the recorded signed root (drift / tampering / corruption).
+    /// The store tree does not match the recorded signed root (drift, tampering, corruption).
     Drift {
         /// The active build audited.
         build: u64,
@@ -42,8 +39,8 @@ pub enum VerifyOutcome {
         /// The root just recomputed over the on-disk tree.
         got: String,
     },
-    /// No signed `tree_root` was recorded (installed before verify support / a loose
-    /// manifest). Cannot attest — this is NOT a pass (fail-closed).
+    /// No signed `tree_root` was recorded (an older install, or a loose manifest). Cannot
+    /// attest: not a pass (fail-closed).
     NoSignedRoot {
         /// The active build, if any.
         build: Option<u64>,
@@ -57,14 +54,10 @@ pub enum VerifyOutcome {
         /// The IO error string.
         error: String,
     },
-    /// A relocated sysroot bundle: the (retired) install-time toolchain wiring added a
-    /// `toolchain` SYMLINK inside the build tree
-    /// AFTER the signed root was captured over the pristine payload, so the on-disk tree
-    /// intentionally differs from the recorded root and cannot be tree-attested. Informational
-    /// (exit 0), NOT a failure. Full tree-attestation is available with the default
-    /// `self-contained` bundle (which has no post-install mutation). This is an audit
-    /// convenience, not a security gate — the real integrity gate is the tree_root re-verify
-    /// AT INSTALL (`crate::install`), before any wiring.
+    /// A sysroot bundle carrying a `toolchain` symlink from the retired install-time
+    /// wiring, added after the signed root was captured over the payload, so the tree
+    /// cannot be tree-attested. Informational (exit 0), not a failure: the integrity gate
+    /// is the tree_root re-verify at install (`crate::install`), before any wiring.
     WiredSysroot {
         /// The active build.
         build: u64,
@@ -89,11 +82,11 @@ pub enum VerifyOutcome {
     },
 }
 
-/// Verify one program's ACTIVE build against the signed `tree_root` recorded in `status.toml`.
-/// Fail-closed, IN ORDER: not-installed ⇒ [`VerifyOutcome::NotInstalled`]; no recorded root ⇒
-/// [`VerifyOutcome::NoSignedRoot`] (NOT a pass); recorded root is for a different build ⇒
-/// [`VerifyOutcome::BuildMismatch`]; then recompute + compare (case-insensitive, mirroring
-/// the install-time re-verify). A vendor program's legacy build the row does not attest is
+/// Verify one program's active build against the signed `tree_root` recorded in `status.toml`.
+/// Fail-closed, in order: not installed ⇒ [`VerifyOutcome::NotInstalled`]; no recorded root ⇒
+/// [`VerifyOutcome::NoSignedRoot`] (not a pass); recorded root for a different build ⇒
+/// [`VerifyOutcome::BuildMismatch`]; then recompute and compare (case-insensitive, as the
+/// install-time re-verify does). A vendor program's legacy build the row does not attest is
 /// judged against the root its stamp kept for it ([`kept_legacy_root`]) before those two.
 #[must_use]
 pub fn verify_program(layout: &Layout, program: &str) -> VerifyOutcome {
@@ -116,10 +109,7 @@ pub fn verify_program(layout: &Layout, program: &str) -> VerifyOutcome {
             Some(root) => (Some(build), root),
             None => (recorded_build, recorded_root),
         };
-    // No signed record means no assurance: fail closed. A source-build provenance
-    // sidecar used to be consulted here first, reporting a lower-assurance
-    // SourceBuilt outcome; the source-build lane is gone, so an unsigned build is
-    // simply unverified.
+    // No signed record means no assurance: fail closed.
     if recorded_root.is_empty() {
         return VerifyOutcome::NoSignedRoot { build: Some(build) };
     }
@@ -130,13 +120,11 @@ pub fn verify_program(layout: &Layout, program: &str) -> VerifyOutcome {
         };
     }
     let build_dir = layout.build_dir(program, build);
-    // A rustup-linked sysroot bundle carries a sanctioned `toolchain` SYMLINK from the
-    // install-time toolchain wiring (added AFTER the signed root was captured), which
-    // `tree::tree_root` cannot walk. This is not drift or tampering — report it as such
-    // rather than a false Unreadable failure. (Self-contained bundles have no such symlink
-    // and get the full strict attestation below.)
-    // `is_reparse`, not `is_symlink`: on Windows the wired `toolchain` link is a directory
-    // JUNCTION (`is_symlink()` reports false), which the walk would otherwise descend into.
+    // A rustup-linked sysroot bundle carries a `toolchain` link from the retired
+    // install-time wiring, added after the signed root was captured, which
+    // `tree::tree_root` cannot walk: report it as such, not as drift or Unreadable.
+    // `is_reparse`, not `is_symlink`: on Windows the link is a directory junction
+    // (`is_symlink()` reports false), which the walk would otherwise descend into.
     if std::fs::symlink_metadata(build_dir.join("toolchain"))
         .is_ok_and(|m| crate::platform::is_reparse(&m))
     {
@@ -165,11 +153,8 @@ pub fn verify_program(layout: &Layout, program: &str) -> VerifyOutcome {
 /// file and call a healthy tree drifted — so its error names the re-stage that writes
 /// one, and the caller reports it as unreadable, never as a false Drift.
 ///
-/// ONE walk for both lanes. The vendor lane once walked with the plain
-/// [`crate::tree::tree_root`], so on Windows every vendor build read as drifted: minutes
-/// after the stage recorded claude 2.1.283's declared fold (`4f28d8d2…`, the index's
-/// signed root for the same bytes), `atpkg verify claude` said DRIFT, because the plain
-/// walk folds mode `0` there (`86f1a85e…`); codex 0.157.1 the same (2026-09-27).
+/// One walk for both lanes: the plain [`crate::tree::tree_root`] folds mode `0` on Windows
+/// and would call every vendor build there drifted.
 fn walked_root(build_dir: &std::path::Path) -> std::io::Result<String> {
     let modes = crate::store::declared_modes(build_dir)?;
     crate::tree::tree_root_declared(build_dir, &modes)
@@ -212,7 +197,7 @@ fn verify_vendor_build(layout: &Layout, program: &str, build: u64) -> VerifyOutc
     }
 }
 
-/// Verify EVERY active program (those live on PATH). An uninstalled status-only leftover is
+/// Verify every active program (those live on PATH). An uninstalled status-only leftover is
 /// not audited, so `verify_all` never emits false [`VerifyOutcome::NotInstalled`] noise.
 #[must_use]
 pub fn verify_all(layout: &Layout) -> Vec<(String, VerifyOutcome)> {
@@ -235,7 +220,7 @@ mod tests {
         crate::testdir::layout(&format!("atpkg-verify-{label}-"))
     }
 
-    /// The modes a stage would have DECLARED for the one-file build [`install`] lays —
+    /// The modes a stage would have declared for the one-file build [`install`] lays —
     /// what the walk folds on a filesystem without permission bits, and what the record
     /// beside the build says on Windows. Unix never consults it.
     fn modes_of(program: &str) -> crate::tree::DeclaredModes {
@@ -246,21 +231,19 @@ mod tests {
         modes
     }
 
-    /// The platform's EXECUTABLE spelling of `program` under `bin/` — `ay` on Unix,
-    /// `ay.exe` on Windows — the file the shim forwards to, without which the shim view
-    /// (`active_builds`) reports no active build and every verdict here is
-    /// `NotInstalled`. Byte-identical on Unix, where the suffix is empty.
+    /// `program`'s executable under `bin/` (`ay`, or `ay.exe` on Windows): the file the
+    /// shim forwards to, without which `active_builds` reports no active build.
     fn exe_name(program: &str) -> String {
         crate::store::ToolName::new(program).unwrap().exe_file()
     }
 
-    /// The root a producer would have SIGNED for the build [`install`] lays: the
+    /// The root a producer would have signed for the build [`install`] lays: the
     /// declared-mode walk, which on Unix is the plain walk over the stored bits.
     fn signed_root(dir: &std::path::Path, program: &str) -> String {
         crate::tree::tree_root_declared(dir, &modes_of(program)).unwrap()
     }
 
-    /// Lay down a COMPLETE, activated build with `bin/<program>`; return its dir.
+    /// Lay down a complete, activated build with `bin/<program>`; return its dir.
     fn install(layout: &Layout, program: &str, build: u64) -> PathBuf {
         let dir = layout.build_dir(program, build);
         std::fs::create_dir_all(dir.join("bin")).unwrap();
@@ -315,7 +298,6 @@ mod tests {
         let dir = install(&l, "ay", 18);
         let root = signed_root(&dir, "ay");
         record(&l, "ay", Some(18), &root);
-        // Mutate the on-disk tree AFTER recording the signed root.
         std::fs::write(dir.join("bin/ay"), b"tampered").unwrap();
         assert!(
             matches!(
@@ -350,9 +332,8 @@ mod tests {
         let l = layout("legacy-kept");
         let legacy = 2_026_091_901;
         let dir = install(&l, "claude", legacy);
-        // The root the stamp keeps is the index row's SIGNED root — the declared-mode
-        // fold ([`signed_root`]), which the plain walk reproduces only where the inode
-        // stores the modes.
+        // The root the stamp keeps is the index row's signed root: the declared-mode fold
+        // ([`signed_root`]).
         let root = signed_root(&dir, "claude");
         let vendor = crate::vendor_direct::Version::parse("2.1.280")
             .unwrap()
@@ -395,11 +376,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// A vendor-direct build is attested by the SAME walk as an index build — the modes its
-    /// stage declared, where the inode stores none. Its `.vendor` record holds the root the
-    /// stage folded, and the plain walk (mode `0` on Windows) called every vendor build
-    /// there drifted: claude 2.1.283 and codex 0.157.1 on the day they staged
-    /// (2026-09-27). A mutated tree still drifts, naming the root it walked.
+    /// A vendor-direct build is attested by the same declared-mode walk as an index build,
+    /// against the root its `.vendor` record holds; a mutated tree drifts, naming the root
+    /// it walked.
     #[test]
     fn a_vendor_build_is_attested_by_the_walk_its_stage_folded() {
         let l = layout("vendor-walk");
@@ -415,6 +394,7 @@ mod tests {
                 "https://downloads.claude.ai/claude-code-releases/2.1.283/win32-x64/claude.exe"
                     .into(),
             sha256: "9dbe16dafed59da5cdabbfe11ad0335738c753fad794989b47f9446accd6de3a".into(),
+            sha512: String::new(),
             size: 244_960_928,
             // What the stage records: the fold over the modes it declared.
             tree_root: signed_root(&dir, "claude"),
@@ -475,12 +455,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// The declared-mode record is what the walk folds where the inode stores no bits:
-    /// with it a Windows build attests to the very root a Unix producer signed; without
-    /// it the verdict is UNREADABLE (naming the re-stage), never a false Drift over a
-    /// tree whose every mode would read as `0`. On Unix the record is neither written
-    /// nor read, so removing it changes nothing — asserted, so the "not consulted where
-    /// the inode answers" half stays pinned too.
+    /// The declared-mode record is what the walk folds where the inode stores no bits: with
+    /// it a Windows build attests to the root a Unix producer signed; without it the verdict
+    /// is Unreadable (naming the re-stage), never a false Drift. On Unix the record is never
+    /// consulted, so removing it changes nothing.
     #[test]
     fn a_missing_declared_mode_record_is_unreadable_only_where_the_inode_has_no_bits() {
         let l = layout("modes-record");
@@ -512,7 +490,6 @@ mod tests {
         let ny = install(&l, "ny", 9);
         record(&l, "ay", Some(18), &signed_root(&ay, "ay"));
         record(&l, "ny", Some(9), &signed_root(&ny, "ny"));
-        // Drift ny.
         std::fs::write(ny.join("bin/ny"), b"tampered").unwrap();
         let outcomes: std::collections::BTreeMap<_, _> = verify_all(&l).into_iter().collect();
         assert_eq!(

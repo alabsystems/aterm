@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The alt blob of a checkpoint taken on the alternate screen has exactly
-//! `rows` records.
+//! The alt blob of a checkpoint taken on the alternate screen has exactly `rows` records.
 //!
-//! `Terminal::alt_grid` is the inactive grid: while the alternate screen is up
-//! it holds the saved primary, scrollback and all. `CheckpointMeta` carries one
-//! `history_lines`, describing the main blob, so the consumer validates the alt
-//! blob with `history = 0` and `deserialize_lines_strict` refuses any larger
-//! declared count. The producer is the only place that can honour that shape,
-//! so these tests pin it there.
+//! `Terminal::alt_grid` is the inactive grid: while the alternate screen is up it holds
+//! the saved primary, scrollback and all. `CheckpointMeta` carries one `history_lines`,
+//! describing the main blob, so the consumer validates the alt blob with `history = 0` and
+//! `deserialize_lines_strict` refuses any larger count. Only the producer can honour that
+//! shape, so these tests pin it there.
 
 use aterm_core::scrollback::{deserialize_lines_strict, serialize_lines};
 use aterm_core::terminal::{Terminal, TerminalCheckpoint};
@@ -19,9 +17,8 @@ const COLS: u16 = 131;
 /// The producer's real carry target (`seamless::max_handoff_history_lines`).
 const CARRY: usize = 256;
 
-/// Exactly the consumer's canonicality check for a grid blob that must hold
-/// `expected` records — `seamless::checkpoint_grid_is_canonical`, reproduced so
-/// this test fails for the same reason the updater did.
+/// The consumer's canonicality check for a grid blob of `expected` records
+/// (aterm-gui's `seamless::checkpoint_grid_is_canonical`), reproduced.
 fn is_canonical(bytes: &[u8], expected: usize, cols: u16) -> bool {
     let content_cap = usize::from(cols).saturating_mul(256);
     let record_cap = 16usize
@@ -123,9 +120,7 @@ fn the_alt_blob_is_exactly_rows_records_after_leaving_the_alternate_screen() {
     );
 }
 
-/// The main blob's own contract, which is the one `history_lines` describes:
-/// `rows + history_lines` records. Pinned alongside so a fix to the alt side
-/// cannot quietly break the side that is allowed to carry history.
+/// The main blob, which `history_lines` describes, holds `rows + history_lines` records.
 #[test]
 fn the_main_blob_is_rows_plus_its_declared_history() {
     let cp = carry(&primary_with_history());
@@ -141,12 +136,11 @@ fn the_main_blob_is_rows_plus_its_declared_history() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// After a self-update handoff the adopted engine restores the checkpoint at the
-// old grid size, the app repaints, and the window's first resize converges to
-// the new frame. The restored screen is the archive's baseline, and a resize
-// before any chrome height was measured leaves out the rows the new frame still
-// shows at the bottom, so the composer's rule and footer are not archived.
+// After a self-update handoff the adopted engine restores the checkpoint at the old grid
+// size, the app repaints, and the window's first resize converges to the new frame. The
+// restored screen is the archive's baseline; a resize before any chrome height was
+// measured leaves out the rows the new frame still shows at the bottom, so the composer's
+// rule and footer are not archived.
 
 /// A synthetic Claude-Code-shaped screen (never a real capture): transcript
 /// rows, then the composer — a blank, a rule, the prompt, a rule, the footer —
@@ -198,7 +192,7 @@ fn chrome_rows(t: &Terminal) -> Vec<String> {
         .collect()
 }
 
-/// Design test 4: restore, a frame at the old size, then the resize.
+/// Restore, a frame at the old size, then the resize.
 #[test]
 fn an_adopted_composer_is_never_archived_by_the_first_resize() {
     let transcript = |r: std::ops::Range<usize>| -> Vec<String> {
@@ -247,11 +241,10 @@ fn an_adopted_screen_resized_before_its_first_frame_archives_only_what_left() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// The archive crosses the handoff (`AltArchiveCarry`). The old engine's capture
-// is split as the GUI splits it (the head inside the freeze, beside the
-// checkpoint; the rows afterwards, behind the fence), and the adopting engine
-// imports it right after restoring the checkpoint.
+// The archive crosses the handoff (`AltArchiveCarry`). The old engine's capture is split
+// as the GUI splits it (the head inside the freeze, beside the checkpoint; the rows
+// afterwards, behind the fence), and the adopting engine imports it right after restoring
+// the checkpoint.
 
 use aterm_core::terminal::{AltArchiveCarry, AltArchiveGapKind, AltArchiveImport, AltArchiveQuery};
 
@@ -286,9 +279,8 @@ fn everything(t: &Terminal) -> aterm_core::terminal::AltArchiveRead {
     t.alt_archive_read(AltArchiveQuery::oldest(0, usize::MAX))
 }
 
-/// Design test 7's core half: with the archive carried, the adopted engine
-/// archives every later frame exactly as the old one would have — same
-/// origin, same indices, same rows, no gap, no chrome.
+/// With the archive carried, the adopted engine archives every later frame exactly as the
+/// old one would have: same origin, indices and rows, no gap, no chrome.
 #[test]
 fn a_carried_archive_goes_on_exactly_as_the_old_engine_would() {
     let (mut old, cp, archive) = old_side(12, true);
@@ -315,9 +307,9 @@ fn a_carried_archive_goes_on_exactly_as_the_old_engine_would() {
     );
 }
 
-/// H2: the window's first resize after the adoption is a real resize — a
-/// `resize` gap, honestly reported — but nothing is lost: every row that left
-/// the top is still archived, and the composer never is.
+/// The window's first resize after the adoption is a real resize, reported as a `resize`
+/// gap, but nothing is lost: every row that left the top is archived, and the composer
+/// never is.
 #[test]
 fn a_resize_after_a_carried_archive_is_a_gap_that_loses_nothing() {
     let (_old, cp, archive) = old_side(12, true);

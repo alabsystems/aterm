@@ -10,57 +10,6 @@
 use super::{ColdPage, ColdTier};
 
 impl ColdTier {
-    /// Pre-validate that `truncate_back_lines(n)` will succeed.
-    ///
-    /// Tries to decompress the boundary page (if any) without modifying state.
-    /// Call this before committing cross-tier removal to ensure error safety.
-    // Skip: the reverse page walk drives std iterator `next` (absent body) —
-    // the twin of tier_back_removal's. Pure validation; ARENA-SCROLL tested.
-    #[cfg_attr(trust_verify, trust::skip)]
-    pub(crate) fn pre_validate_truncate_back(
-        &self,
-        n: usize,
-    ) -> Result<(), crate::ScrollbackError> {
-        if n == 0 || n >= self.line_count {
-            return Ok(()); // No boundary page; whole-page removal is infallible.
-        }
-        let mut remaining = n;
-        let mut whole_pages = 0;
-        for page in self.pages.iter().rev() {
-            // saturating index/arith + total `get` — the exact twin of
-            // `tier_back_removal::pre_validate_truncate_back`: the guards prove
-            // the bounds but do not reach the ops in the verifier's model.
-            // Identical on every real path.
-            let actual_idx = self
-                .pages
-                .len()
-                .saturating_sub(1)
-                .saturating_sub(whole_pages);
-            let available = if actual_idx == 0 {
-                page.line_count.saturating_sub(self.front_offset)
-            } else {
-                page.line_count
-            };
-            if remaining >= available {
-                remaining = remaining.saturating_sub(available);
-                whole_pages = whole_pages.saturating_add(1);
-            } else {
-                break;
-            }
-        }
-        if remaining > 0 && whole_pages < self.pages.len() {
-            let boundary_idx = self
-                .pages
-                .len()
-                .saturating_sub(1)
-                .saturating_sub(whole_pages);
-            if let Some(p) = self.pages.get(boundary_idx) {
-                p.decompress()?;
-            }
-        }
-        Ok(())
-    }
-
     /// Remove the newest `n` lines from the back of the cold tier.
     ///
     /// Drops whole pages from the back without decompression. For the

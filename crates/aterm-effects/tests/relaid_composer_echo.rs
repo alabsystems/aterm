@@ -1,34 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A key whose echo rides a relayout is still the hand's key
-//! (owner, 2026-09-26).
+//! A key whose echo rides a relayout is still the hand's key.
 //!
-//! Claude Code echoes each key in a per-key shape (glyph addressed from home,
-//! caret after it, inside `?2026h` / `?25l` … `?25h` / `?2026l`), but a key can
-//! instead ride a relayout: a synchronized frame re-laying the whole screen
-//! with the bottom-anchored box one row higher (the agent list under it grew a
-//! row) and the composer text rewritten there.
+//! Claude Code echoes each key in a per-key shape (glyph addressed from home, caret after it,
+//! inside `?2026h` / `?25l` … `?25h` / `?2026l`), but a key can instead ride a relayout: a
+//! synchronized frame re-laying the whole screen with the bottom-anchored box one row higher (the
+//! agent list under it grew a row) and the composer text rewritten there.
 //!
-//! When the host's frame train stalls across the relayout (main thread
-//! starved), one tick observes the keys before, on and after it as one caret
-//! move, `(r, 21) → (r − 1, 25)`. The move judge
-//! (`CursorGlow::judge_observed_caret`) reads it against `last` on the old row
-//! and takes the typed re-anchor arm, laying only the landing; the follow pass
-//! (`rk::Engine::follow_rows`) then carries the band up a row. What lays the
-//! middle key is `rk::Engine::lay_crossed_echo` in the follow pass: it re-reads
-//! a buffered echo move that crossed rows with the caret's run as the same-row
-//! advance it is in the text's frame, and lays that sweep on the new row. With
-//! it switched off, the stalled takes go red while the per-key and keyless
-//! takes stay green.
+//! When the frame train stalls across the relayout, one tick sees the keys before, on and after
+//! it as one caret move, `(r, 21) → (r − 1, 25)`. The move judge
+//! (`CursorGlow::judge_observed_caret`) takes the typed re-anchor arm and lays only the landing;
+//! the follow pass (`Engine::follow_rows`) carries the band up a row, and its `lay_crossed_echo`
+//! re-reads the buffered row-crossing echo as the same-row advance it is in the text's frame and
+//! lays that sweep on the new row.
 //!
-//! Every take drives the real seam: an `aterm_core` [`Terminal`] fed the
-//! composer's bytes, its rows sampled as `app_render.rs`'s LOCK A samples them
-//! (`tests/composer_box_growth_wrap.rs` `Host::frame`, verbatim),
-//! [`CursorGlow`] ticked on a 16.7 ms train with the stamp the app makes for
-//! each key (`note_typed_expected`). The census is the plan's coverage on the
-//! text row (`tests/torn_read_gaps.rs`): a hole is a dark column strictly
-//! between two lit ones.
+//! Each take feeds an `aterm_core` [`Terminal`], samples rows as `app_render.rs`'s frame hold
+//! does and ticks [`CursorGlow`] every 16.7 ms with the app's per-key stamp
+//! (`note_typed_expected`). A hole is a dark column strictly between two lit ones in the text
+//! row's planned coverage.
 
 use aterm_core::render::GlowQuad;
 use aterm_core::terminal::Terminal;
@@ -36,17 +26,17 @@ use aterm_effects::cursor_glow::{CURSOR_WITNESS_ROWS, CursorGlow, Geom, GlowConf
 use aterm_effects::rainbow_kitty::TypedClass;
 use std::time::{Duration, Instant};
 
-/// The owner's cell (15×28 device px); a 90×30 pane keeps the take small.
+/// A 15×28 device-px cell; a 90×30 pane keeps the take small.
 const ROWS: usize = 30;
 const COLS: usize = 90;
 const CW: usize = 15;
 const CH: usize = 28;
 const FRAME_US: u64 = 16_667;
-/// The owner's recorded cadence around the hole: 60–120 ms between keys.
+/// Within the recorded cadence around the hole, 60–120 ms between keys.
 const KEY_MS: u64 = 90;
-/// macOS PTY reads.
+/// One macOS PTY read.
 const PTY_READ: usize = 1024;
-/// A column is LIT at this planned coverage (the glass census's 20/255).
+/// A column is lit at this planned coverage (the glass census's 20/255).
 const LIT_COV: u8 = 20;
 const SYNC_BEGIN: &str = "\x1b[?2026h";
 const SYNC_END: &str = "\x1b[?2026l";
@@ -57,7 +47,7 @@ const TEXT_ROW: usize = 22;
 /// The grid column (0-based) of the first text glyph: `❯` + NBSP before it.
 const COL0: usize = 2;
 
-/// The owner's line up to the relayout, the key that rode it, and the rest.
+/// The recorded line up to the relayout, the key that rode it, and the rest.
 const BEFORE: &str = "also in parallel, ch";
 const RIDER: char = 'e';
 const AFTER: &str = "ck why the ";
@@ -98,7 +88,7 @@ fn geom() -> Geom {
     }
 }
 
-/// The owner's setup: rainbow kitty at intensity 0.70 on the dark theme.
+/// Rainbow kitty at intensity 0.70 on the dark theme.
 fn cfg() -> GlowConfig {
     GlowConfig {
         classic_mono: false,
@@ -127,7 +117,7 @@ fn rule() -> String {
     "\u{2500}".repeat(COLS)
 }
 
-/// Plan coverage per column of `row` (`tests/torn_read_gaps.rs` `coverage`).
+/// Plan coverage per column of `row` (as `tests/common/mod.rs` `coverage`).
 fn coverage(glow: &CursorGlow, row: u16) -> Vec<u8> {
     let mut cov = vec![0u8; COLS];
     let rib = glow.v2_ribbon().expect("rainbow kitty owns the frame");
@@ -207,8 +197,8 @@ struct Host {
     agents: usize,
     label: String,
     census: Vec<Census>,
-    /// The host's frame train is STALLED: time passes, keys are pressed and
-    /// echoed, and no tick observes any of it until the stall ends.
+    /// The frame train is stalled: time passes and keys echo, and no tick
+    /// observes any of it until the stall ends.
     stalled: bool,
 }
 
@@ -281,8 +271,7 @@ impl Host {
         s.into_bytes()
     }
 
-    /// Exactly LOCK A, then the tick (`tests/composer_box_growth_wrap.rs`
-    /// `Host::frame`, verbatim), then the text row's census.
+    /// The frame hold's samples, then the tick, then the text row's census.
     fn frame(&mut self) {
         let c = self.term.cursor();
         let cur = self.term.cursor_visible().then_some((c.row, c.col));
@@ -433,7 +422,7 @@ impl Host {
         self.label = "after relayout".into();
     }
 
-    /// The first census frame on the NEW text row at or after `label`.
+    /// The first census frame labelled `label`.
     fn first_frame_labelled(&self, label: &str) -> usize {
         self.census
             .iter()
@@ -607,9 +596,8 @@ fn a_keyless_relayout_moves_the_band_and_the_next_keys_join_it() {
     assert_whole_from(&h, "after relayout", "a keyless relayout", forgotten_before);
 }
 
-/// The band laid before the relayout stays lit and whole: it moved up a row
-/// with its text and the caret, so it is not a line typed off. Under the stall
-/// too.
+/// The band laid before the relayout moved up a row with its text and the caret, so it stays
+/// lit and whole, under the stall too.
 #[test]
 fn the_band_laid_before_the_relayout_stays_lit_under_the_hand() {
     for stalled in [false, true] {
@@ -623,7 +611,7 @@ fn the_band_laid_before_the_relayout_stays_lit_under_the_hand() {
         h.type_str(&AFTER[..2]);
         h.resume();
         h.type_str(&AFTER[2..]);
-        // Past `FLOW_TOTAL_S` (1.34 s) from the relayout, the hand still typing.
+        // Past `FLOW_TOTAL_S` from the relayout, the hand still typing.
         h.type_str("aterm claude harness ");
         let last = h.census.last().expect("frames ran");
         let lit_before = last.lit.as_bytes()[COL0..COL0 + BEFORE.chars().count()]

@@ -1,39 +1,35 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! VI-1: the pure key → vi-action table for keyboard copy-mode. Maps ONE bare
-//! keystroke (while vi mode is active) to a motion / inline-search / visual / exit
-//! action. Stateless — the two-key sequences (a `g` prefix for `ge`/`gE`, and
-//! `f`/`F`/`t`/`T` awaiting a target character) are completed by the caller's small
-//! pending state via [`g_prefix_motion`]. Operates on the winit logical key so it slots
-//! into `on_key` before the PTY encoder; pure over its inputs, so the whole mapping is
-//! unit-tested here without a window.
+//! The key → vi-action table for keyboard copy-mode: one bare keystroke (while vi mode is
+//! active) maps to a motion, inline search, visual toggle or exit. Stateless: the caller's
+//! pending state completes the two-key sequences (`ge`/`gE` via [`g_prefix_motion`], and
+//! `f`/`F`/`t`/`T` awaiting a target character).
 
 use aterm_core::{InlineSearchKind, ViMotion, ViVisualType};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 
-/// One resolved vi keystroke. `BeginInline` and `GPrefix` are the two-key OPENERS the
+/// One resolved vi keystroke. `BeginInline` and `GPrefix` open a two-key sequence the
 /// dispatcher completes with the next key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ViAction {
     /// A cursor motion (always grid-bounded in normal mode).
     Motion(ViMotion),
-    /// `f`/`F`/`t`/`T`: the NEXT printable key is the search target.
+    /// `f`/`F`/`t`/`T`: the next printable key is the search target.
     BeginInline(InlineSearchKind),
     /// `;` / `,`: repeat the last inline search (forward / reverse).
     RepeatInline { reverse: bool },
     /// `v` / `V`: toggle visual selection of the given type.
     ToggleVisual(ViVisualType),
-    /// `g`: the NEXT key selects `ge` / `gE` (see [`g_prefix_motion`]).
+    /// `g`: the next key selects `ge` / `gE` (see [`g_prefix_motion`]).
     GPrefix,
     /// `Esc`: leave vi mode.
     Exit,
 }
 
-/// Map a bare keystroke to a [`ViAction`] while vi mode is active. `None` for any key
-/// with Ctrl/Alt/Super held (those never drive motions — they stay available for the
-/// app's own chords) or an unmapped key. Shift is ALLOWED: it is already folded into
-/// the produced character (`$`, `^`, `W`, `N`, …), so we match on the final `char`.
+/// Map a bare keystroke to a [`ViAction`] while vi mode is active. `None` for an unmapped
+/// key or one with Ctrl/Alt/Super held (those stay with the app's chords). Shift is
+/// already folded into the produced character (`$`, `W`, `N`, …), so it is allowed.
 #[must_use]
 pub(crate) fn key_to_vi_action(key: &Key, mods: ModifiersState) -> Option<ViAction> {
     if mods.control_key() || mods.alt_key() || mods.super_key() {
@@ -86,9 +82,9 @@ pub(crate) fn key_to_vi_action(key: &Key, mods: ModifiersState) -> Option<ViActi
     })
 }
 
-/// Resolve the SECOND key of a `g`-prefixed motion: `ge` → end of the previous
-/// semantic word, `gE` → end of the previous whitespace word. Any other key cancels
-/// (`None`). (The engine has no `gg`/`G`, so those are intentionally absent.)
+/// The second key of a `g`-prefixed motion: `ge` (end of the previous semantic word) or
+/// `gE` (end of the previous whitespace word); any other key cancels. The engine has no
+/// `gg`/`G`.
 #[must_use]
 pub(crate) fn g_prefix_motion(c: char) -> Option<ViMotion> {
     match c {

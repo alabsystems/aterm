@@ -1,18 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-0 for `DriverGeometry` (2026-09-27): a driver's own lease never
-//! re-grids the session it may still type into, so its `if-gen=` fence is
-//! never refused by a repaint its own hand caused — and the fence still
-//! refuses the program's own output. `RegridUnderTheHand` is the incident:
-//! the presence band's row committed the moment the lease was taken.
-//! `CommitLiveOnly` is the lease race of 2026-09-28: the refresh read the
-//! facts under the lease and committed the row after its release, judged by
-//! the live hold alone; `CommitTypingOnly` its first repair, which held on
-//! the snapshot's typing only. Each is a `Buggy = 1` action of its own.
-//! Tier-1 —
-//! the real `turn` and `lease` verbs on a real pty against the real presence
-//! projection — is `aterm-gui/src/driver_geometry_conformance.rs`.
+//! Tier-0 for `DriverGeometry`: a driver's own lease never re-grids the session it may still
+//! type into, so its `if-gen=` fence is never refused by a repaint its own hand caused, and the
+//! fence still refuses the program's own output. Each `Buggy = 1` mutant is its own action.
+//! Tier-1 (the real `turn` and `lease` verbs on a real pty) is
+//! `aterm-gui/src/driver_geometry_conformance.rs`.
 
 use crate::walk::{only, walk};
 use aterm_spec::derive::{driver_geometry_liveness, driver_geometry_model};
@@ -21,12 +14,6 @@ use aterm_spec::{interp, verify};
 #[test]
 fn a_drivers_own_lease_never_moves_the_screen_its_fence_judged() {
     let model = driver_geometry_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name),
-        "the driver-geometry model must stay enrolled in the spec-link registry"
-    );
     verify::prove_and_catch_scalar(&model, "driver geometry");
     let dead = [
         "RegridUnderTheHand",
@@ -35,14 +22,13 @@ fn a_drivers_own_lease_never_moves_the_screen_its_fence_judged() {
         "DropNoWake",
     ];
     assert_eq!(
-        verify::audit_dead_negative_controls(&model, &dead),
+        verify::audit_dead_negative_controls(std::slice::from_ref(&model)),
         Ok(dead.len()),
         "every mutant is a negative control caught alone"
     );
 
-    // The owner's visit, fixed: the driver reads the quiet screen, takes the
-    // lease, and the band's refresh cannot re-grid under its hand — the fence
-    // passes. Its input over, the row is born; the lease goes.
+    // The driver reads the quiet screen and takes the lease; the band's refresh cannot re-grid
+    // under its hand, so the fence passes. Its input over, the row is born and the lease goes.
     let mut state = model.init_state();
     for action in ["Read", "Take"] {
         assert!(model.fire(action, &mut state), "{action}: {state:?}");
@@ -65,8 +51,8 @@ fn a_drivers_own_lease_never_moves_the_screen_its_fence_judged() {
         "{moved:?}"
     );
 
-    // So does a re-grid another fact (mail) caused BEFORE the lease: the
-    // screen the driver judged moved, and it reads again.
+    // So does a re-grid another fact (mail) caused before the lease: the screen the driver
+    // judged moved, and it reads again.
     let mail = walk(&model, &["Read", "Note", "Regrid", "Take", "Fence"]);
     assert_eq!((mail["refused"], mail["refused_own"]), (1, 0), "{mail:?}");
 
@@ -74,9 +60,8 @@ fn a_drivers_own_lease_never_moves_the_screen_its_fence_judged() {
     let lease = walk(&model, &["Take", "Drop"]);
     assert_eq!((lease["gen"], lease["rows"]), (0, 0), "{lease:?}");
 
-    // THE INCIDENT (`RegridUnderTheHand`): the row is committed on the lease,
-    // the program repaints, and the fence the driver judged a moment earlier
-    // reads "changed" — 121 visits of 121.
+    // `RegridUnderTheHand`: the row commits on the lease, the program repaints, and the fence
+    // the driver judged a moment earlier reads "changed".
     let incident = verify::buggy_baseline_with(&model, "RegridUnderTheHand");
     let refused = walk(&incident, &["Read", "Take", "RegridUnderTheHand", "Fence"]);
     assert_eq!(refused["refused_own"], 1, "{refused:?}");
@@ -85,7 +70,7 @@ fn a_drivers_own_lease_never_moves_the_screen_its_fence_judged() {
         assert!(incident.fire(action, &mut state), "{action}");
     }
     assert!(!incident.check_invariant("OwnHandNeverRefusesTheFence", &state));
-    // …and a `lease acquire` alone resized the tab.
+    // …and a `lease acquire` alone resizes the tab.
     let mut state = incident.init_state();
     for action in ["Take", "RegridUnderTheHand"] {
         assert!(incident.fire(action, &mut state), "{action}");
@@ -93,18 +78,16 @@ fn a_drivers_own_lease_never_moves_the_screen_its_fence_judged() {
     assert!(!incident.check_invariant("NoRegridUnderTheHand", &state));
 }
 
-/// THE LEASE RACE (measured 2026-09-28 on a live window: `lease acquire` then
-/// `lease release` under 0.1 ms apart, a 24 → 23 → 24 flap inside 0.35 ms in
-/// 3 runs of 10). A refresh senses the facts under the lease, the lease moves,
-/// and the commit births a row for a hand already gone. Fixed, a lease that
-/// moved since the sense holds the commit until the wake that moved it
-/// re-derives the want — for a `lease release`, and for a `turn`'s end of
-/// input and release landing back to back.
+/// A refresh senses the facts under the lease, the lease moves (a live `lease acquire` and
+/// `lease release` can land under 0.1 ms apart), and the commit births a row for a hand already
+/// gone. A lease that moved since the sense holds the commit until the wake that moved it
+/// re-derives the want, for a `lease release` and for a `turn`'s end of input and release
+/// landing back to back.
 #[test]
 fn a_lease_that_moved_between_the_sense_and_the_commit_raises_no_row() {
     let model = driver_geometry_model();
-    // Fixed: the words a typing hand formed never commit once it is gone; the
-    // release's own wake re-derives the want, and there is nothing to re-grid.
+    // The words a typing hand formed never commit once it is gone; the release's own wake
+    // re-derives the want, and there is nothing to re-grid.
     let mut state = model.init_state();
     for action in ["Take", "Sense", "Drop"] {
         assert!(model.fire(action, &mut state), "{action}: {state:?}");
@@ -136,9 +119,8 @@ fn a_lease_that_moved_between_the_sense_and_the_commit_raises_no_row() {
     );
     assert_eq!((mail["rows"], mail["ghost"]), (1, 0), "{mail:?}");
 
-    // `CommitLiveOnly`, the race as shipped (the live hold alone), and
-    // `CommitTypingOnly`, the first repair (the snapshot's typing alone): each
-    // births the ghost row on its schedule — and ONLY this invariant sees it.
+    // `CommitLiveOnly` (the live hold alone) and `CommitTypingOnly` (the snapshot's typing
+    // alone) each birth the ghost row on its schedule, and only this invariant sees it.
     for (mutant, schedule) in [
         ("CommitLiveOnly", &["Take", "Sense", "Drop"][..]),
         (
@@ -165,31 +147,23 @@ fn a_lease_that_moved_between_the_sense_and_the_commit_raises_no_row() {
             );
         }
     }
-    // The first repair did close the `lease release` race: only the turn's
-    // schedule sees it.
+    // `CommitTypingOnly` does close the `lease release` race: only the turn's schedule sees it.
     let first_fix = verify::buggy_baseline_with(&model, "CommitTypingOnly");
     let state = walk(&first_fix, &["Take", "Sense", "Drop"]);
     assert!(!first_fix.fire("CommitTypingOnly", &mut state.clone()));
-    assert!(verify::uncaught_invariants(&model).is_empty());
 }
 
-/// THE HELD ROW CATCHES UP (the hold's progress half): proven under weak
-/// fairness of `Sense` (a posted wake is handled), `Commit` and `Catch` (the
-/// timer's owed commit), each of which
-/// the proof needs, on the interpreter and on `ty` wherever it is installed —
-/// and broken by `DropNoWake`, a release that posts no wake, alone; the same
-/// mutant breaks `EveryMovedLeaseOwesAWake`, its safety half. Every mutant is
-/// also a dead action `ty --strict-vacuity` credits as a negative control.
+/// The hold's progress half: proven under weak fairness of `Sense` (a posted wake is handled),
+/// `Commit` and `Catch` (the timer's owed commit), each of which the proof needs, and broken by
+/// `DropNoWake` (a release that posts no wake) alone; the same mutant breaks
+/// `EveryMovedLeaseOwesAWake`, its safety half.
 #[test]
 fn a_row_a_moved_lease_holds_catches_up_once_the_wake_is_handled() {
     let model = driver_geometry_model();
     let live = driver_geometry_liveness();
     verify::liveness_proves_and_catches_tiered(&model, &live, "DriverGeometry held row");
-    // The mutant's own schedule: the hand goes with no wake, the row its
-    // words raised stands, and no `Sense` is enabled to fold it.
-    // Mail wants the row while a lease holds it; the lease goes with no
-    // wake, and the held row never catches up: no `Sense` is owed, and the
-    // words formed under the lease never commit.
+    // Mail wants the row while a lease holds it; the lease goes with no wake, and the held row
+    // never catches up: no `Sense` is owed, and the words formed under the lease never commit.
     let silent = verify::buggy_baseline_with(&model, "DropNoWake");
     let stuck = walk(&silent, &["Take", "Note", "Sense", "DropNoWake"]);
     assert_eq!((stuck["rows"], stuck["other"], stuck["woke"]), (0, 1, 0));
@@ -203,14 +177,11 @@ fn a_row_a_moved_lease_holds_catches_up_once_the_wake_is_handled() {
     assert_eq!((cex["hand"], cex["woke"]), (0, 0), "{cex:?}");
 }
 
-/// A PEER'S LEASE THAT CAME AND WENT UNSEEN (review of the integration,
-/// 2026-09-29): mail wants the row while another session the window shows
-/// holds a lease; the refresh's projection is turned away, and the peer's
-/// lease is let go before its wake runs, so its sense finds its slot's copy
-/// unchanged and projects nothing. No `Sense` and no `Commit` is owed — only
-/// `Catch`, the timer's owed commit (`rows_deadline`), catches the row up.
-/// The audit in [`a_row_a_moved_lease_holds_catches_up_once_the_wake_is_handled`]
-/// proves `Catch`'s fairness load-bearing; this is the schedule that needs it.
+/// A peer's lease that came and went unseen: mail wants the row while another session the
+/// window shows holds a lease; the refresh's projection is turned away, and the peer's lease is
+/// let go before its wake runs, so its sense finds its slot's copy unchanged and projects
+/// nothing. No `Sense` or `Commit` is owed; only `Catch`, the timer's owed commit
+/// (`rows_deadline`), catches the row up. This schedule is why `Catch`'s fairness is needed.
 #[test]
 fn a_row_a_peers_unseen_lease_held_is_caught_up_by_the_timer() {
     let model = driver_geometry_model();

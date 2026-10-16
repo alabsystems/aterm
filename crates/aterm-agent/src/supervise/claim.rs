@@ -21,6 +21,13 @@
 //!   went unanswered is pending too.
 //! * A host without the claim (`ERR usage`, or `ERR denied` for an edge
 //!   token): the loop acts without it and says `CLAIM unavailable …` once.
+//! * Autopilot `off` (`lifecycle.rs`'s `park_while_off`): given back for the
+//!   park ([`Session::give_back_claim`]) — released as at the end, and
+//!   neither renewed nor tried while parked, so the session looks as
+//!   unsupervised as it is — and taken again as the park ends on another
+//!   word ([`Session::retake_claim`]). The holder a loop was behind as it
+//!   parked is remembered, so `WATCHING …` is said once a holder, not once
+//!   a park.
 //!
 //! No clock of its own: the renewal rides the requests the loop makes anyway.
 
@@ -55,13 +62,50 @@ pub(crate) enum Claim {
     Behind { holder: String, tried: Instant },
     /// The host has no claim to take (`why`): the loop acts without one.
     Unavailable { why: String },
+    /// A PROVEN SELF-CLAIM holds the session ([`Session::set_beside`]): the
+    /// agent supervises itself, and this loop watches beside it. It is
+    /// watching behind `holder` in every way an act reads
+    /// ([`Self::watching_behind`]: nothing typed, pressed, badged or mailed),
+    /// save that aterm's remedies acting from outside the agent stand
+    /// ([`Self::remedies_withheld`]: the stall's restart). Never claimed,
+    /// renewed or yielded to: the host started this loop for it.
+    Beside { holder: String },
+    /// Given back while the session's Autopilot is off
+    /// ([`Session::give_back_claim`]): held by nobody on this loop's account,
+    /// never renewed or tried, and taken again as the park ends
+    /// ([`Session::retake_claim`]). Refuses nothing: a parked loop sends no
+    /// input. `behind`: the other holder the loop was watching behind as it
+    /// parked, so the retake that finds the same holder says nothing new
+    /// ([`Self::known_holder`]): `WATCHING …` is said once a holder, not
+    /// once a park.
+    GivenBack { behind: Option<String> },
 }
 
 impl Claim {
     /// The other holder, when this loop is watching behind one.
     pub(crate) fn watching_behind(&self) -> Option<&str> {
         match self {
-            Claim::Behind { holder, .. } => Some(holder),
+            Claim::Behind { holder, .. } | Claim::Beside { holder } => Some(holder),
+            _ => None,
+        }
+    }
+
+    /// Whether aterm's remedies that act from outside the agent (the stall's
+    /// explicit restart) stand down: behind another supervisor, which
+    /// answers for the session — never beside a proven self-claim, whose
+    /// agent cannot restart itself out of a stall.
+    pub(crate) fn remedies_withheld(&self) -> bool {
+        matches!(self, Claim::Behind { .. })
+    }
+
+    /// The other holder this loop last knew of: the one it watches behind,
+    /// or the one it was behind as an Off park gave the claim back. What
+    /// [`Session::claim_from`] compares a new reply against, so neither a
+    /// renewal nor a park's retake says a holder twice.
+    fn known_holder(&self) -> Option<&str> {
+        match self {
+            Claim::Behind { holder, .. } | Claim::Beside { holder } => Some(holder),
+            Claim::GivenBack { behind } => behind.as_deref(),
             _ => None,
         }
     }
@@ -148,13 +192,16 @@ impl<C: Ctl> Session<'_, C> {
         let now = Instant::now();
         if r.ok() {
             // Taken quietly (`status supervisor=` says it); only a claim
-            // won from behind another holder is news.
-            let was_behind = self.claim.watching_behind().map(str::to_string);
+            // won from behind another holder is news — a park's retake of
+            // one it was behind as it parked included.
+            let was_behind = self.claim.known_holder().map(str::to_string);
             self.claim = Claim::Held { renewed: now };
             return was_behind.map(|h| format!("CLAIMED supervisor={} (after {h})", self.holder()));
         }
         if let Some(holder) = busy_holder(r) {
-            let said = self.claim.watching_behind() != Some(holder.as_str());
+            // A holder already said — at a renewal, or before an Off park
+            // gave the claim back — is not said again.
+            let said = self.claim.known_holder() != Some(holder.as_str());
             self.claim = Claim::Behind {
                 holder: holder.clone(),
                 tried: now,
@@ -172,6 +219,23 @@ impl<C: Ctl> Session<'_, C> {
     /// stands. A request not served leaves it untaken; the first renewal
     /// tries again.
     pub(super) fn take_claim(&mut self, review: &mut dyn Review) {
+        // Beside a proven self-claim: nothing is claimed, and it is said once.
+        if let Some(holder) = self.beside.clone() {
+            let said = self.claim.known_holder() != Some(holder.as_str());
+            self.claim = Claim::Beside {
+                holder: holder.clone(),
+            };
+            if said {
+                say_claim(
+                    &format!(
+                        "WATCHING a proven self-claim supervises this session: {holder} (aterm's \
+                         stall and memory remedies stand)"
+                    ),
+                    review,
+                );
+            }
+            return;
+        }
         match self.set_claim() {
             Some(r) => {
                 if let Some(line) = self.claim_from(&r) {
@@ -201,7 +265,10 @@ impl<C: Ctl> Session<'_, C> {
             Claim::Held { renewed } => Some(*renewed),
             Claim::Behind { tried, .. } => Some(*tried),
             Claim::Pending { .. } => None,
-            Claim::Off | Claim::Unavailable { .. } => return,
+            Claim::Off
+            | Claim::Unavailable { .. }
+            | Claim::GivenBack { .. }
+            | Claim::Beside { .. } => return,
         };
         if last.is_some_and(|t| t.elapsed() < self.claim_renew) {
             return;
@@ -235,7 +302,7 @@ impl<C: Ctl> Session<'_, C> {
     /// a turn: `ERR busy supervisor=<holder>` (`-` while pending).
     pub(super) fn claim_refuses(&self, args: &[&str]) -> Option<CtlReply> {
         let (holder, why) = match &self.claim {
-            Claim::Behind { holder, .. } if is_write(args) => {
+            Claim::Behind { holder, .. } | Claim::Beside { holder } if is_write(args) => {
                 (holder.as_str(), "this loop watches only")
             }
             Claim::Pending { .. } if is_input(args) => ("-", "the claim is not answered yet"),
@@ -254,15 +321,59 @@ impl<C: Ctl> Session<'_, C> {
     /// supervisor since, and a bare unset would clear that one's live claim.
     pub(super) fn release_claim(&mut self) {
         if matches!(self.claim, Claim::Held { .. }) {
-            let mine = format!("holder={}", self.holder());
-            let mut args: Vec<&str> = Vec::with_capacity(5);
-            if let Some(sid) = &self.sid {
-                args.push(sid.as_str());
-            }
-            args.extend(["meta", "unset", "supervisor", mine.as_str()]);
-            let _ = self.ctl.call(&args);
+            self.unset_claim();
         }
         self.claim = Claim::Off;
+    }
+
+    /// One `meta unset supervisor holder=<this loop>`, straight to the
+    /// transport as [`Self::set_claim`] is: a claim that is no longer this
+    /// loop's is left to its holder. What it answers changes nothing here.
+    fn unset_claim(&mut self) {
+        let mine = format!("holder={}", self.holder());
+        let mut args: Vec<&str> = Vec::with_capacity(5);
+        if let Some(sid) = &self.sid {
+            args.push(sid.as_str());
+        }
+        args.extend(["meta", "unset", "supervisor", mine.as_str()]);
+        let _ = self.ctl.call(&args);
+    }
+
+    /// AUTOPILOT OFF's park (`lifecycle.rs`'s `park_while_off`): the claim
+    /// given back, so the session looks as unsupervised as it is — `status
+    /// supervisor=` names nobody on this loop's account and the server raises
+    /// its boxes to the menu bar again — and [`Claim::GivenBack`], which
+    /// nothing renews or retries ([`Self::renew_claim_if_due`]) until the
+    /// park ends ([`Self::retake_claim`]). A held claim is released as at the
+    /// loop's end ([`Self::release_claim`]: only while it is this loop's); so
+    /// is a pending one, whose set may have landed though its answer did
+    /// not. Behind another holder there is nothing of this loop's to release:
+    /// only its retries stop, so it never wins the claim while parked — and
+    /// the holder is kept (`GivenBack { behind }`), so the retake that finds
+    /// it again does not say it again. A host with no claim, and a claim
+    /// already given back, are left as they stand.
+    pub(super) fn give_back_claim(&mut self) {
+        let behind = match &self.claim {
+            Claim::Off | Claim::Unavailable { .. } | Claim::GivenBack { .. } => return,
+            Claim::Held { .. } | Claim::Pending { .. } => {
+                self.unset_claim();
+                None
+            }
+            Claim::Behind { holder, .. } | Claim::Beside { holder } => Some(holder.clone()),
+        };
+        self.claim = Claim::GivenBack { behind };
+    }
+
+    /// The park is over on a word that is not `off`: a claim it gave back
+    /// ([`Self::give_back_claim`]) is taken again as at the loop's start
+    /// ([`Self::take_claim`]) — held, behind another holder (said only where
+    /// it is not the one the loop was behind as it parked, and a loop that
+    /// yields then ends), unavailable, or pending on an outage. Any other
+    /// claim is left as it stands.
+    pub(super) fn retake_claim(&mut self, review: &mut dyn Review) {
+        if matches!(self.claim, Claim::GivenBack { .. }) {
+            self.take_claim(review);
+        }
     }
 
     /// A loop that yields ([`SuperviseOpts::yield_when_held`]) behind
@@ -271,9 +382,11 @@ impl<C: Ctl> Session<'_, C> {
         if !opts.yield_when_held {
             return None;
         }
-        self.claim
-            .watching_behind()
-            .map(|holder| format!("{CLAIM_HELD}{holder}"))
+        // Never beside a proven self-claim: the host started this loop for it.
+        match &self.claim {
+            Claim::Behind { holder, .. } => Some(format!("{CLAIM_HELD}{holder}")),
+            _ => None,
+        }
     }
 }
 

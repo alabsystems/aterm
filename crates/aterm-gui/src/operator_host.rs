@@ -462,6 +462,11 @@ impl Drop for UpdateQuiesce {
     }
 }
 
+/// The embedded operator's voice: [`crate::notify::NotifyMsg::operator`] takes
+/// one, and its field is private to this module, so the operator's notices are
+/// the only ones posted through that door.
+pub(crate) struct OperatorVoice(());
+
 struct OperatorShared {
     fleet_id: String,
     /// Production resolves this lazily from `fleet_id`. Tests may pin a private
@@ -961,16 +966,13 @@ impl ControlHandle {
     }
 
     /// Queue one "aterm operator" notice for the desktop. aterm's OWN words
-    /// ([`crate::notify::NotifyMsg::own`]): the delivery thread drops it while
+    /// ([`crate::notify::NotifyMsg::operator`]): the delivery thread drops it while
     /// `desktop_alerts` is off, as it does every notice aterm writes itself.
     /// Nothing else shows it — no band row, no `messages.log` line — so off,
     /// the queue (counted by `aterm fleet status`) is its one record.
     fn surface_notice(&self, local_id: u64, body: &str) {
-        let message = crate::notify::NotifyMsg::own(
-            local_id,
-            Some("aterm operator".to_string()),
-            body.to_string(),
-        );
+        let message =
+            crate::notify::NotifyMsg::operator(OperatorVoice(()), local_id, body.to_string());
         match self.shared.notify_tx.try_send(message) {
             Ok(()) | Err(TrySendError::Disconnected(_)) => {}
             Err(TrySendError::Full(message)) => {
@@ -2759,12 +2761,21 @@ fn approval_gate(
 /// phrase and an actionable choice affordance must be present; prose merely discussing
 /// approval is not an event. The phrases a known agent draws are its anchors
 /// (`aterm_phase::anchor`, the one home of vendor text), matched without case;
-/// the rest are the generic shapes other agents print.
+/// the rest are the generic shapes other agents print. agy's boxes ask in a
+/// row of their own (`Run this command?`) over their one-shot allow. A
+/// SIGN-IN MENU is one too — agy's `Select login method:` over `Google
+/// OAuth`, Muse Code's `Log in with browser` over its key row — whose first
+/// option opens a browser on the person's desktop: a person's to answer.
 fn generic_choice_box(screen: &str) -> bool {
     let lower = screen.to_lowercase();
     let has = |needle: &str| lower.contains(&needle.to_lowercase());
     let request = [
         aterm_phase::anchor("prompt.proceed"),
+        aterm_phase::anchor("agy.box.command.ask"),
+        aterm_phase::anchor("agy.create.ask"),
+        aterm_phase::anchor("agy.edit.ask"),
+        aterm_phase::anchor("agy.signin.method"),
+        aterm_phase::anchor("muse.signin.browser"),
         "would you like to proceed",
         "would you like to run",
         "allow this command",
@@ -2778,6 +2789,11 @@ fn generic_choice_box(screen: &str) -> bool {
     let choice = [
         aterm_phase::anchor("prompt.cancel"),
         aterm_phase::anchor("codex.box.once"),
+        aterm_phase::anchor("agy.box.once"),
+        aterm_phase::anchor("agy.create.once"),
+        aterm_phase::anchor("agy.edit.once"),
+        aterm_phase::anchor("agy.signin.oauth"),
+        aterm_phase::anchor("muse.signin.keys"),
         "[y/n]",
         "(y/n)",
         "yes, allow",
@@ -2812,7 +2828,10 @@ fn manage_baseline_condition(
 /// Prompt-shape heuristic for a completed coding-agent turn. It intentionally knows
 /// only the distinctive Claude/Codex composer glyphs and rejects screens still carrying
 /// a live interrupt affordance (the agents' own `busy.interrupt` anchor, lowercase as
-/// both draw it, or a generic Ctrl-C one). This raises a candidate; it never drives the session.
+/// both draw it, or a generic Ctrl-C one). agy's caret is a bare `>`, which a
+/// shell's continuation prompt and a quoted mail draw too, so agy is ready only
+/// at its whole composer at rest ([`agy_at_rest`]). This raises a candidate; it
+/// never drives the session.
 fn looks_like_ready_prompt(screen: &str) -> bool {
     let lower = screen.to_lowercase();
     if [
@@ -2828,7 +2847,28 @@ fn looks_like_ready_prompt(screen: &str) -> bool {
     screen.lines().rev().take(8).any(|line| {
         let line = line.trim().trim_start_matches(['│', '┃', '┆', '┊', ' ']);
         line.starts_with('❯') || line.starts_with('›') || line.starts_with('»')
+    }) || agy_at_rest(screen)
+}
+
+/// agy's composer AT REST by its own grammar (`aterm_phase::agy`): its whole
+/// frame — a rule, `>` in column 0, a rule and its footer as the last row —
+/// with no spinner over it and the footer idle (`? for shortcuts`, or blank
+/// under a held draft), its reading evidence. The footer's `esc to cancel`
+/// (a turn, a box, the `/` menu) is never at rest. Read behind the panic
+/// fence: a screen that panics the reader is not at rest.
+fn agy_at_rest(screen: &str) -> bool {
+    let rows: Vec<String> = screen.lines().map(str::to_string).collect();
+    crate::reader_guard::guarded(|| {
+        aterm_phase::agy::composer(&rows).is_some()
+            && matches!(
+                aterm_phase::agy::phase(&rows),
+                (
+                    aterm_phase::Phase::Idle | aterm_phase::Phase::Question,
+                    true
+                )
+            )
     })
+    .unwrap_or(false)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -2944,6 +2984,7 @@ mod tests {
             generation_look: Default::default(),
             reset_lane: Default::default(),
             update_parked: Default::default(),
+            fenced_writes: Default::default(),
         });
         SessionHandle {
             sid,
@@ -3406,6 +3447,72 @@ mod tests {
         assert!(!looks_like_ready_prompt("ordinary shell output\n$ "));
     }
 
+    /// agy's screens, measured on 1.4.0: each of its boxes is refused over —
+    /// the command, file-creation and edit boxes by the generic shape too (its
+    /// own question row over its one-shot allow), so a reader that misses one
+    /// still refuses — and so is the sign-in menu of agy and of Muse Code,
+    /// which the readers read as a wall and whose first option opens a
+    /// browser. NEGATIVE CONTROLS: agy idle, mid-draft, at a turn's end,
+    /// after a refused box and with its `/` menu open, and Muse Code idle,
+    /// are no approval.
+    #[test]
+    fn agy_boxes_and_the_sign_in_menus_are_human_only() {
+        use aterm_phase::agy::fixtures as a;
+        use aterm_phase::muse::fixtures as u;
+        let text = |fixture: &str| aterm_phase::prompt::fixtures::screen(fixture).join("\n");
+        for fixture in [a::BOX_EXEC, a::BOX_EXEC_WRAPPED, a::BOX_CREATE, a::BOX_EDIT] {
+            assert!(generic_choice_box(&text(fixture)), "{fixture}");
+            assert!(looks_like_approval(&text(fixture)), "{fixture}");
+        }
+        for fixture in [a::BOX_CREATE_WORKSPACE, a::QUESTION, a::BOX_TRUST] {
+            assert!(looks_like_approval(&text(fixture)), "{fixture}");
+        }
+        for fixture in [a::SIGNED_OUT, u::SIGNED_OUT] {
+            assert!(generic_choice_box(&text(fixture)), "{fixture}");
+            assert!(looks_like_approval(&text(fixture)), "{fixture}");
+        }
+        for fixture in [
+            a::IDLE,
+            a::DRAFT,
+            a::END_OF_TURN,
+            a::DECLINED,
+            a::REJECTED,
+            a::SLASH_MENU,
+            u::IDLE,
+        ] {
+            assert!(!looks_like_approval(&text(fixture)), "{fixture}");
+        }
+    }
+
+    /// agy's turn is ready at its whole composer at rest: idle, a held draft,
+    /// a turn's end. NEGATIVE CONTROLS: its spinner over the open composer (a
+    /// turn runs, the footer `esc to cancel`), a box and the `/` menu (the
+    /// same footer, no turn running), the sign-in wall, and a bare `>` — a
+    /// shell's continuation prompt, a rule-less quote of agy's caret row —
+    /// are not.
+    #[test]
+    fn agy_is_ready_at_its_whole_composer_alone() {
+        use aterm_phase::agy::fixtures as a;
+        let text = |fixture: &str| aterm_phase::prompt::fixtures::screen(fixture).join("\n");
+        for fixture in [a::IDLE, a::DRAFT, a::END_OF_TURN, a::INTERRUPTED] {
+            assert!(looks_like_ready_prompt(&text(fixture)), "{fixture}");
+        }
+        for fixture in [
+            a::BUSY,
+            a::BUSY_TIP,
+            a::BOX_EXEC,
+            a::QUESTION,
+            a::SLASH_MENU,
+            a::SIGNED_OUT,
+        ] {
+            assert!(!looks_like_ready_prompt(&text(fixture)), "{fixture}");
+        }
+        assert!(!looks_like_ready_prompt("$ echo 'unclosed\n> "));
+        assert!(!looks_like_ready_prompt(
+            "  Done.\n> keep going\n? for shortcuts"
+        ));
+    }
+
     #[test]
     fn initial_approval_is_emitted_once_per_generation() {
         let now = Instant::now();
@@ -3643,8 +3750,8 @@ mod tests {
     // by the clock. They were 2 s, and each covers F_FULLFSYNC barriers — the
     // fault marker, its directory and the WAL commit here, sixteen WAL commits
     // in the next — that this file measures at 82-280 ms EACH on a contended
-    // disk; under another gate's disk load that exceeds 2 s with the code
-    // correct (the load-sensitive test audit of 2026-09-27).
+    // disk; under another test run's disk load that exceeds 2 s with the code
+    // correct.
     #[test]
     fn classify_to_overflow_fault_stays_inside_update_exclusion() {
         struct OverflowBarrierSink {

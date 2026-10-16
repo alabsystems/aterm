@@ -7,18 +7,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "aterm's portable clock: `std::time` where it exists, a performance.now()/Date.now() shim on wasm32-unknown-unknown."
+description = "aterm's portable clock: `std::time` where it exists, a performance.now()/Date.now() shim on wasm32-unknown-unknown over clocks the wasm module links in."
 
-# Native has no dependencies: the crate is `pub use std::time::…` there.
+# No dependencies on any target. Natively the crate is `pub use
+# std::time::…`. On wasm32-unknown-unknown the two browser clocks are link-time
+# symbols that the wasm module defines from its own JS bindings with
+# `aterm_time::wasm_clock_host!` (src/lib.rs). The wasm-bindgen row this table
+# held left with that seam (docs/AUDIT-third-party-2026-10-15.md, WP.4).
 [dependencies]
-
-# The browser clocks are JS functions, reached through the wasm-bindgen the
-# wasm frontends (aterm-wasm, aterm-gpu-web) link, pinned to their exact
-# version because the generated glue and the CLI must agree. Only
-# wasm32-unknown-unknown: wasm32-wasip1 and wasm32-unknown-emscripten have a
-# working `std::time` and take the native arm.
-[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
-wasm-bindgen = "=0.2.108"
 
 [lints]
 workspace = true

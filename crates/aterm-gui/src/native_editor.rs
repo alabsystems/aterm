@@ -1362,14 +1362,17 @@ impl EditorWorkspace {
         let (seq, deltas) = transact(store, view.document, current, frame.undo.clone())?;
         view.observe_own(seq, &deltas);
         self.last_commit = Some((view.document, seq, deltas.clone()));
-        self.histories
-            .entry(view.document)
-            .or_default()
-            .redo
-            .push(HistoryFrame {
-                expected_seq: seq,
-                ..frame
-            });
+        let history = self.histories.entry(view.document).or_default();
+        // The undo is a new commit: the frame under it now applies to the
+        // text at THIS sequence (its own edit's result, put back), so a
+        // second Undo goes on back instead of reading as diverged.
+        if let Some(next) = history.undo.last_mut() {
+            next.expected_seq = seq;
+        }
+        history.redo.push(HistoryFrame {
+            expected_seq: seq,
+            ..frame
+        });
         self.last_yank = None;
         Ok(())
     }
@@ -1401,14 +1404,16 @@ impl EditorWorkspace {
         let (seq, deltas) = transact(store, view.document, current, frame.redo.clone())?;
         view.observe_own(seq, &deltas);
         self.last_commit = Some((view.document, seq, deltas.clone()));
-        self.histories
-            .entry(view.document)
-            .or_default()
-            .undo
-            .push(HistoryFrame {
-                expected_seq: seq,
-                ..frame
-            });
+        let history = self.histories.entry(view.document).or_default();
+        // As in [`Self::undo`]: the next Redo applies to the text at this
+        // sequence.
+        if let Some(next) = history.redo.last_mut() {
+            next.expected_seq = seq;
+        }
+        history.undo.push(HistoryFrame {
+            expected_seq: seq,
+            ..frame
+        });
         self.last_yank = None;
         Ok(())
     }
@@ -2729,6 +2734,30 @@ mod tests {
             .execute(&mut store, &mut view, EditorCommand::Redo)
             .unwrap();
         assert_eq!(store.snapshot(document).unwrap().text.as_ref(), "aXYZc");
+    }
+
+    /// UNDO GOES ON BACK, AND REDO ON FORWARD: each is a commit of its own,
+    /// so the frame after it applies at that commit's sequence, never read
+    /// as a history another view diverged.
+    #[test]
+    fn undo_and_redo_step_through_more_than_one_edit() {
+        let (mut store, mut workspace, mut view, document) = editor("abc");
+        workspace.insert_text(&mut store, &mut view, "x").unwrap();
+        workspace.insert_text(&mut store, &mut view, "y").unwrap();
+        let text = |store: &DocumentStore| store.snapshot(document).unwrap().text.to_string();
+        assert_eq!(text(&store), "xyabc");
+        for expected in ["xabc", "abc"] {
+            workspace
+                .execute(&mut store, &mut view, EditorCommand::Undo)
+                .unwrap();
+            assert_eq!(text(&store), expected);
+        }
+        for expected in ["xabc", "xyabc"] {
+            workspace
+                .execute(&mut store, &mut view, EditorCommand::Redo)
+                .unwrap();
+            assert_eq!(text(&store), expected);
+        }
     }
 
     #[test]

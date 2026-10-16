@@ -20,6 +20,9 @@
 # Every row:  lang, gated (true => loads only when [sparkle_words] languages
 #             lists this lang, or "all"), cjk (true => no-space script: RAW
 #             keys, the whole typed run must equal the surface), notes.
+#   unglued  = (cjk rows only) surfaces OF THIS ROW that are never half of a
+#              run read as a name glued to a command (law 11). They still
+#              classify whole.
 #
 # THE LAWS (pinned by crates/aterm-lexicon/tests/tricks.rs):
 #
@@ -73,6 +76,20 @@
 #  9. A single-character no-space surface ALWAYS needs the vocative,
 #     whichever list it sits in.
 # 10. Lowercase; no duplicate surface within a language; at most 32 characters.
+# 11. THE GLUED READING IS A GUESS, AND `unglued` KEEPS THREE KINDS OF SURFACE
+#     OUT OF IT. In a script written without spaces the listener reads an
+#     unknown run as a name and a command (`猫咪坐下`, `ねこおすわり`). (a) A
+#     NAME that is also an everyday word: `宝宝` is a baby, th `ลูก` opens
+#     dictionary words (`ลูกบอล` a ball), `หนู` / `น้อง` / km `កូន` are
+#     pronouns and kin - glued to a verb they are ordinary clauses. Only a name
+#     that means the ANIMAL glues. (b) A command word that is a THING - a toy,
+#     a food, a body part, the vacuum cleaner: after the animal's name it is a
+#     compound noun (`猫咪玩具` a cat toy, `ねこじゃらし`, th `ขนมแมว` cat
+#     treats). (c) A command word that, glued to the name, spells ANOTHER word:
+#     zh `喂猫咪` is feed the kitty, `猫咪等` cats and the like, th `แมวมอง` a
+#     talent scout, ja `ネコ好き` a cat lover. With a space or `、` each
+#     still works (`猫咪 玩具`). When adding a no-space noun or an
+#     everyday-word name, list it in its row's `unglued` too.
 #
 # Seed authored with machine assistance; best-effort, extend via PR. New
 # languages are APPENDED as dated groups after English.
@@ -6838,7 +6855,8 @@ words    = ["坐下", "坐好", "坐下吧", "快坐下", "别动", "別動", "�
 address  = ["坐", "等等", "等一下", "等着", "等著", "等"]
 gated    = false
 cjk      = true
-notes    = "坐下 is the dog-school word; 别动/不许动 = stay / freeze. 等等 and 等一下 open chat messages (the `wait` ruling), so they need the pet named. Skeptic: dropped 坐坐 (a social `come sit a while`, not a command); added Cantonese 坐低."
+unglued  = ["等"]
+notes    = "坐下 is the dog-school word; 别动/不许动 = stay / freeze. 等等 and 等一下 open chat messages (the `wait` ruling), so they need the pet named. Skeptic: dropped 坐坐 (a social `come sit a while`, not a command); added Cantonese 坐低. 等 is unglued: after a name it is `and the like` (猫咪、狗狗等 cats, dogs etc.); `猫咪 等` still works."
 
 [[trick]]
 id       = "down"
@@ -6883,6 +6901,7 @@ words    = ["玩耍", "玩吧", "来玩", "來玩", "一起玩", "玩玩", "去�
 address  = ["玩", "跑", "追", "捡回来", "撿回來", "叼回来", "叼回來"]
 gated    = false
 cjk      = true
+unglued  = ["玩具", "毛线球", "毛線球", "激光笔", "雷射筆", "激光筆"]
 notes    = "跑酷 (parkour) is Chinese internet-speak for cat zoomies. 逗猫棒 (teaser wand) is NOT here: it contains the shared feline surface 猫. Skeptic: added 陪我玩 and HK-traditional 激光筆; the spin words moved to roll."
 
 [[trick]]
@@ -6892,6 +6911,7 @@ words    = ["打滚", "打滾", "打个滚", "打個滾", "翻滚", "翻滾", "�
 address  = []
 gated    = false
 cjk      = true
+unglued  = ["肚皮"]
 notes    = "打滚 is THE roll-over command. Bare 滚 is NOT here: alone it is the rude `get lost`. 装死 = play dead (en `playdead` lives under roll too)."
 
 [[trick]]
@@ -6937,7 +6957,8 @@ words    = ["嘬嘬嘬", "嘬嘬", "嘬嘬嘬嘬", "过来", "過來", "快过�
 address  = ["看", "看看", "来", "來", "这边", "這邊", "这里", "這裡", "喂", "嘿", "嗨", "你好", "哈喽", "哈囉", "听", "聽", "听着", "聽著", "注意"]
 gated    = false
 cjk      = true
-notes    = "嘬嘬嘬 is the Chinese pspsps (the lip-smack used to call a cat). 看 / 看看 / 来 / 你好 open ordinary chat lines, so they need the pet named. Skeptic: added Cantonese 過嚟."
+unglued  = ["喂"]
+notes    = "嘬嘬嘬 is the Chinese pspsps (the lip-smack used to call a cat). 看 / 看看 / 来 / 你好 open ordinary chat lines, so they need the pet named. Skeptic: added Cantonese 過嚟. 喂 is unglued: glued BEFORE a name it is the verb to feed (喂猫咪 feed the kitty); `hey kitty` is `喂 猫咪` or `喂、猫咪`."
 
 [[trick]]
 id       = "paw"
@@ -6946,6 +6967,7 @@ words    = ["握手", "握握手", "握爪", "击掌", "擊掌", "爪爪", "爪�
 address  = ["手", "爪"]
 gated    = false
 cjk      = true
+unglued  = ["爪爪", "爪子", "手手", "喵喵拳", "手", "爪"]
 notes    = "握手 is THE Chinese dog trick; 喵喵拳 = the cat-punch meme; 戳戳 = boop. 猫猫拳 is NOT here: it contains 猫."
 
 [[trick]]
@@ -6964,6 +6986,7 @@ words    = ["吓你一跳", "嚇你一跳", "吓一跳", "嚇一跳", "哈气", 
 address  = ["哇", "吓", "嚇", "砰", "嘭", "出去"]
 gated    = false
 cjk      = true
+unglued  = ["黄瓜", "黃瓜", "吸尘器", "吸塵器", "喷水壶", "噴水壺"]
 notes    = "哈气 is the Chinese word for a cat's hiss; 黄瓜 / 吸尘器 = cucumber / vacuum. Skeptic: 走开 / 去去去 / 闪开 (shoo) and 喷水壶 (spray bottle) moved here from hide / scold (en `shoo` / `scram` / `spraybottle` are boo); 出去 (`get out`) is address like en `away`."
 
 [[trick]]
@@ -6982,6 +7005,7 @@ words    = ["零食", "小零食", "罐头", "罐頭", "罐罐", "开罐头", "�
 address  = ["吃", "吃饭", "吃飯", "好吃", "奖励", "獎勵"]
 gated    = false
 cjk      = true
+unglued  = ["零食", "小零食", "罐头", "罐頭", "罐罐", "饭饭", "飯飯", "木天蓼", "奖励", "獎勵"]
 notes    = "罐头 / 罐罐 (the can) and 零食 are THE treat words. No surface contains 猫 / 鱼 / 牛 / 干 (shared-scanner ideographs; 干 is a listed expletive), so no 猫条, 猫粮, 小鱼干, 牛奶; 木天蓼 (silvervine) stands in for catnip. 吃 / 好吃 / 奖励 open ordinary lines: address. Skeptic: praise and the 乖乖 compounds moved to purr (brief + verified English)."
 
 [[vocative]]
@@ -6989,6 +7013,7 @@ lang     = "zh"
 words    = ["猫", "貓", "猫咪", "貓咪", "小猫", "小貓", "小猫咪", "小貓咪", "猫猫", "貓貓", "喵星人", "主子", "猫主子", "貓主子", "狗", "狗狗", "小狗", "小狗狗", "汪星人", "毛孩子", "宝宝", "寶寶", "宝贝", "寶貝", "小家伙", "小傢伙", "小可爱", "小可愛", "小喵"]
 gated    = false
 cjk      = true
+unglued  = ["主子", "宝宝", "寶寶", "宝贝", "寶貝", "小家伙", "小傢伙", "小可爱", "小可愛"]
 notes    = "Both scripts. 主子 (`master`) is what Chinese cat owners call the cat. 咪咪 is NOT here: it is also slang for breasts."
 
 [[filler]]
@@ -7033,6 +7058,7 @@ words    = ["のび", "のびー", "のびのび", "伸び", "伸びて", "ス�
 address  = ["おはよう", "おはよ", "おはようございます"]
 gated    = false
 cjk      = true
+unglued  = ["ストレッチ", "あくび"]
 notes    = "のび is the word for a cat's big stretch. おはよう is how people greet an assistant, so it is address."
 
 [[trick]]
@@ -7051,6 +7077,7 @@ words    = ["遊ぼう", "あそぼう", "遊ぼ", "あそぼ", "遊んで", "�
 address  = []
 gated    = false
 cjk      = true
+unglued  = ["じゃらし", "おもちゃ", "ボール", "ダンス", "運動会"]
 notes    = "じゃらし is the teaser wand (猫じゃらし / ねこじゃらし are NOT here: they contain the shared surfaces 猫 / ねこ). 運動会 (`sports day`) is cat-owner speak for the night zoomies."
 
 [[trick]]
@@ -7060,6 +7087,7 @@ words    = ["ごろん", "ゴロン", "ごろーん", "ごろんして", "転が
 address  = []
 gated    = false
 cjk      = true
+unglued  = ["おなか", "お腹", "へそ天", "へそてん"]
 notes    = "ごろん is THE Japanese roll-over trick word. へそ天 = belly-up cat-speak. バーン (`bang`) is the Japanese cue for play-dead, so it lives here rather than under boo."
 
 [[trick]]
@@ -7069,7 +7097,8 @@ words    = ["ごろごろ", "ゴロゴロ", "なでなで", "ナデナデ", "よ
 address  = ["好き", "すき", "大好き", "だいすき", "ありがとう", "愛してる", "あいしてる", "えらい", "偉い", "すごい", "すごいね", "いいね", "上手", "じょうず", "かわいい", "可愛い", "カワイイ", "かしこい", "賢い", "さすが", "天才", "よくできました", "グッド"]
 gated    = false
 cjk      = true
-notes    = "ごろごろ is the purr itself; なでなで / よしよし / もふもふ are the petting words; ふみふみ = kneading (en `biscuits`). いい子 / おりこう carry their own addressee like en `goodboy`: plain. Bare praise (えらい, すごい, いいね, かわいい), love and thanks are what people say to the assistant: address. Skeptic: praise moved here from treat (brief + verified English)."
+unglued  = ["好き", "すき", "大好き", "だいすき"]
+notes    = "ごろごろ is the purr itself; なでなで / よしよし / もふもふ are the petting words; ふみふみ = kneading (en `biscuits`). いい子 / おりこう carry their own addressee like en `goodboy`: plain. Bare praise (えらい, すごい, いいね, かわいい), love and thanks are what people say to the assistant: address. Skeptic: praise moved here from treat (brief + verified English). 好き / 大好き are unglued: after a name they are a noun or a statement (ネコ好き a cat lover, ねこ大好き I love cats); `ねこ 好き` still works."
 
 [[trick]]
 id       = "groom"
@@ -7078,6 +7107,7 @@ words    = ["毛づくろい", "毛繕い", "けづくろい", "グルーミン�
 address  = ["きれいにして", "片付けて", "かたづけて", "掃除"]
 gated    = false
 cjk      = true
+unglued  = ["毛づくろい", "毛繕い", "けづくろい", "グルーミング", "お風呂", "おふろ", "シャンプー", "ブラッシング", "ブラシ"]
 notes    = "毛づくろい is THE word. ぺろぺろ (lick-lick) is NOT here: it has a lewd otaku-slang use. 片付けて / 掃除 (`tidy up`) are assistant requests: address."
 
 [[trick]]
@@ -7114,6 +7144,7 @@ words    = ["お手", "おて", "オテ", "おかわり", "オカワリ", "ハ�
 address  = ["手"]
 gated    = false
 cjk      = true
+unglued  = ["ハイタッチ", "タッチ", "パンチ", "肉球", "にくきゅう", "手"]
 notes    = "お手 / おかわり are THE paw tricks (おかわり = the other paw). 肉球 = toe beans. 猫パンチ / ねこパンチ are NOT here (they contain shared surfaces); bare パンチ carries it."
 
 [[trick]]
@@ -7132,6 +7163,7 @@ words    = ["ばあ", "ばぁ", "わっ", "がおー", "ガオー", "シャー",
 address  = []
 gated    = false
 cjk      = true
+unglued  = ["きゅうり", "キュウリ", "掃除機", "そうじき", "おばけ", "霧吹き"]
 notes    = "ばあ / わっ are what one shouts to startle; シャー is the cat's hiss; きゅうり / 掃除機 = cucumber / vacuum. Skeptic: しっしっ / あっちいけ / どいて (shoo) and 霧吹き (spray bottle) moved here from hide / scold (en `shoo` / `spraybottle` are boo)."
 
 [[trick]]
@@ -7150,6 +7182,7 @@ words    = ["おやつ", "オヤツ", "おやつだよ", "ごはん", "ご飯", 
 address  = ["食べて", "たべて", "おいしい"]
 gated    = false
 cjk      = true
+unglued  = ["おやつ", "オヤツ", "ごはん", "ご飯", "ちゅーる", "チュール", "またたび", "マタタビ", "かつおぶし", "鰹節", "カリカリ", "ささみ", "ごほうび", "ご褒美"]
 notes    = "ちゅーる (Churu), またたび (silvervine) and かつおぶし are THE cat treats; カリカリ is cat-owner speak for kibble. 猫缶 is NOT here (contains 猫). 食べて / おいしい are address."
 
 [[vocative]]
@@ -7157,6 +7190,7 @@ lang     = "ja"
 words    = ["猫", "ねこ", "ネコ", "猫ちゃん", "ねこちゃん", "ネコちゃん", "猫さん", "ねこさん", "にゃんこ", "ニャンコ", "ぬこ", "子猫", "仔猫", "こねこ", "子猫ちゃん", "犬", "いぬ", "イヌ", "わんこ", "ワンコ", "わんちゃん", "ワンちゃん", "子犬", "仔犬", "こいぬ", "ちび", "おちび", "うちの子"]
 gated    = false
 cjk      = true
+unglued  = ["ちび", "おちび", "うちの子"]
 notes    = "Kana and kanji. ぬこ is the internet spelling of ねこ."
 
 [[filler]]
@@ -7387,6 +7421,7 @@ words    = ["เล่น", "มาเล่น", "เล่นสิ", "ไป�
 address  = ["วิ่ง", "เดิน"]
 gated    = false
 cjk      = true
+unglued  = ["ของเล่น", "บอล", "เลเซอร์"]
 notes    = "ไม้ตกแมว (the teaser wand) is NOT here: it contains the shared feline surface แมว; เล่นกัน and ลูกบอล are NOT here either (the scanner finds นก `bird` and กบ `frog` inside them)."
 
 [[trick]]
@@ -7396,6 +7431,7 @@ words    = ["กลิ้ง", "กลิ้งตัว", "พลิกตั�
 address  = ["หมุน"]
 gated    = false
 cjk      = true
+unglued  = ["พุง"]
 notes    = "กลิ้ง is THE roll-over command; โชว์พุง (`show the belly`) and ดุ๊กดิ๊ก (wiggle) are pet-speak; แกล้งตาย = play dead; หมุนตัว / หมุน = the spin trick."
 
 [[trick]]
@@ -7441,7 +7477,8 @@ words    = ["มานี่", "มานี่มา", "มานี่เร�
 address  = ["มา", "มาๆ", "ดู", "ดูสิ", "มอง", "นี่", "เฮ้", "ฮัลโหล", "สวัสดี", "หวัดดี", "ฟัง", "ฟังนะ"]
 gated    = false
 cjk      = true
-notes    = "มานี่มา is how one calls a pet over; จุ๊ๆ is the kissy call (the Thai pspsps). มา / ดู / นี่ / สวัสดี open ordinary lines: address."
+unglued  = ["มอง"]
+notes    = "มานี่มา is how one calls a pet over; จุ๊ๆ is the kissy call (the Thai pspsps). มา / ดู / นี่ / สวัสดี open ordinary lines: address. มอง is unglued: after แมว it spells แมวมอง (a talent scout); `แมว มอง` with a space still works."
 
 [[trick]]
 id       = "paw"
@@ -7450,6 +7487,7 @@ words    = ["ขอมือ", "ขอมือหน่อย", "จับม�
 address  = ["มือ", "ตบ"]
 gated    = false
 cjk      = true
+unglued  = ["อุ้งเท้า", "มือ"]
 notes    = "ขอมือ (`give me your hand`) is THE Thai paw trick and อีกข้าง (`other side`) its second half. ตะปบ / เขี่ย = the paw swipe; จิ้มจมูก = boop the nose. Skeptic: dropped bare จิ้ม (crude slang sense)."
 
 [[trick]]
@@ -7468,6 +7506,7 @@ words    = ["แฮ่", "ฟ่อ", "ฟ่อๆ", "ขู่ฟ่อ", "แ
 address  = ["ปัง", "ไป"]
 gated    = false
 cjk      = true
+unglued  = ["แตงกวา", "เครื่องดูดฝุ่น", "ฟ็อกกี้", "กระบอกฉีดน้ำ"]
 notes    = "แฮ่ is what one shouts to startle; ฟ่อ is the hiss; แตงกวา / เครื่องดูดฝุ่น = cucumber / vacuum. Skeptic: ชิ่ว / ไปไป๊ / ถอยไป (shoo) and ฟ็อกกี้ (what Thais call the spray bottle) moved here from hide / scold; ปัง is also everyday slang praise (`ปังมาก`), so it and bare ไป (`go!`) need the pet named."
 
 [[trick]]
@@ -7486,6 +7525,7 @@ words    = ["ขนม", "กินขนม", "อาหารเม็ด", "�
 address  = ["กิน", "อาหาร", "ข้าว", "อร่อย"]
 gated    = false
 cjk      = true
+unglued  = ["ขนม", "อาหารเม็ด", "อาหารเปียก", "ทูน่า", "แคทนิป", "รางวัล", "อาหาร", "ข้าว"]
 notes    = "ขนม and กินข้าว are THE treat / dinner calls; หม่ำๆ is the baby-talk. ขนมแมว, ปลาทู are NOT here (shared surfaces แมว / ปลา); นม (milk) is NOT here (it also means breasts). กิน / อาหาร / ข้าว / อร่อย are address. Skeptic: praise moved to purr."
 
 [[vocative]]
@@ -7493,6 +7533,7 @@ lang     = "th"
 words    = ["แมว", "น้องแมว", "เจ้าแมว", "แมวน้อย", "ลูกแมว", "เหมียว", "เจ้าเหมียว", "น้องเหมียว", "หมา", "น้องหมา", "หมาน้อย", "ลูกหมา", "เจ้าตูบ", "ตูบ", "น้อง", "หนู", "ลูก", "เด็กน้อย", "ตัวเล็ก", "เจ้าตัวเล็ก", "เจ้าอ้วน", "ที่รัก"]
 gated    = false
 cjk      = true
+unglued  = ["น้อง", "หนู", "ลูก", "เด็กน้อย", "ตัวเล็ก", "เจ้าตัวเล็ก", "เจ้าอ้วน", "ที่รัก"]
 notes    = "น้อง is how Thais address any pet. เหมียว is both `meow` and `kitty`; it is a shared feline surface, so it can only be a vocative here."
 
 [[filler]]
@@ -8651,6 +8692,7 @@ words    = ["លេង", "មកលេង", "ទៅលេង", "រាំ", "ប
 address  = ["រត់"]
 gated    = false
 cjk      = true
+unglued  = ["បាល់"]
 notes    = "លេង is THE word; រាំ = dance; បាល់ = ball."
 
 [[trick]]
@@ -8714,6 +8756,7 @@ words    = ["ចាប់ដៃ"]
 address  = ["ដៃ"]
 gated    = false
 cjk      = true
+unglued  = ["ដៃ"]
 notes    = "ចាប់ដៃ = shake hands."
 
 [[trick]]
@@ -8732,6 +8775,7 @@ words    = ["ត្រសក់", "ម៉ាស៊ីនបូមធូលី", 
 address  = ["ចេញ"]
 gated    = false
 cjk      = true
+unglued  = ["ត្រសក់", "ម៉ាស៊ីនបូមធូលី"]
 notes    = "ត្រសក់ = cucumber, ម៉ាស៊ីនបូមធូលី = vacuum cleaner, ខ្មោចលង = `a ghost is haunting!`; ចេញ (`get out`) is address."
 
 [[trick]]
@@ -8750,6 +8794,7 @@ words    = ["នំ", "ញ៉ាំបាយ", "ហូបបាយ"]
 address  = ["ញ៉ាំ", "បាយ", "អាហារ", "ឆ្ងាញ់"]
 gated    = false
 cjk      = true
+unglued  = ["នំ", "បាយ", "អាហារ"]
 notes    = "នំ = snack, ញ៉ាំបាយ = dinner time. ត្រី (fish) left out to stay clear of the animal roster. The eat / food / yum words are address. Praise moved to purr."
 
 [[vocative]]
@@ -8757,6 +8802,7 @@ lang     = "km"
 words    = ["ឆ្មា", "កូនឆ្មា", "ឆ្កែ", "កូនឆ្កែ", "អូន", "កូន", "សម្លាញ់"]
 gated    = false
 cjk      = true
+unglued  = ["អូន", "កូន", "សម្លាញ់"]
 notes    = "ឆ្មា = cat, ឆ្កែ = dog; អូន / កូន are how one addresses a little one."
 
 [[filler]]

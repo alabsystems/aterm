@@ -341,10 +341,8 @@ fn a_ring_only_grid_has_nothing_to_place_history_in_front_of() {
     ));
 }
 
-/// A scrollback cleared after the reserve stays cleared: the import runs on a
-/// worker after Commit while the shell already runs, and an attach after an ED3
-/// is refused, handing the built history back. Negative control: the same
-/// attach with no clear lands.
+/// An attach after an ED3 since the reserve is refused and hands the built
+/// history back. Negative control: the same attach with no clear lands.
 #[test]
 fn a_scrollback_cleared_after_the_reserve_refuses_the_import() {
     let lines: Vec<Line> = (0..40)

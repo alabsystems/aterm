@@ -1,13 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance for the presented-destination capture lifecycles.
-//!
-//! The tests drive the pure transition gates used by the shipping GPU taps,
-//! project each decision onto the Rust-derived model, and require its exact
-//! successor. Mutant controls show a failed map cannot publish pixels or leak
-//! a slot, and accepted invalid metadata cannot vanish without incrementing
-//! `dropped`.
+//! Tier-1 conformance for the presented-destination capture lifecycles: each decision of the
+//! taps' pure transition gates, projected onto the derived model, must be its exact successor.
+//! Mutant controls show a failed map cannot publish pixels or leak a slot, and accepted invalid
+//! metadata cannot vanish without incrementing `dropped`.
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -68,10 +65,9 @@ fn presented_outcome_code(outcome: PresentedFrameOutcome) -> i64 {
     }
 }
 
-/// Project one gate decision. `phase` and `result` are the DECISION's (a
-/// non-terminal decision carries no outcome, and no result exists before the
-/// terminal); the event supplies only what the gate does not decide — whether
-/// a copy was encoded (`accepted`) and whether the map succeeded (`mapped`).
+/// Project one gate decision. `phase` and `result` are the decision's; the event supplies only
+/// what the gate does not decide: whether a copy was encoded (`accepted`) and whether the map
+/// succeeded (`mapped`).
 fn project_presented(
     prev: &State,
     event: PresentedFrameEvent,
@@ -141,8 +137,7 @@ fn presented_frame_shipping_gate_conforms_on_success_and_every_error_edge() {
     assert_eq!(failed.outcome, PresentedFrameOutcome::Error);
     assert_exact_step(&model, &in_flight, &map_error, "MapError");
 
-    // A stale/duplicate callback cannot complete an Armed/Pending/Complete
-    // generation. These are the production gate's guard decisions.
+    // A stale/duplicate callback cannot complete an Armed/Pending/Complete generation.
     assert_eq!(
         presented_frame_transition(PresentedFramePhase::Armed, PresentedFrameEvent::CompleteMap),
         None
@@ -367,9 +362,9 @@ fn harvest_3_1_2(model: &Model, push: Push) -> [State; 3] {
     })
 }
 
-/// Tier-1 binding for the harvested-store projection in `VideoTapSlot`.
-/// Complete callbacks in the adversarial order 3,1,2 and require shipping
-/// insertion plus byte-budget eviction to match each exact modeled successor.
+/// Tier-1 binding for the harvested-store projection in `VideoTapSlot`: with callbacks in the
+/// adversarial order 3,1,2, the shipping insertion and byte-budget eviction must match each
+/// exact modeled successor.
 #[test]
 fn harvested_store_sorts_callbacks_and_evicts_lowest_sequence() {
     let model = video_tap_slot_model();
@@ -390,7 +385,7 @@ fn harvested_store_sorts_callbacks_and_evicts_lowest_sequence() {
     let three = model.successors("HarvestThree", &model.init_state())[0].clone();
     let one = model.successors("HarvestOne", &three)[0].clone();
 
-    // The historical defect: append in callback order, evict the front.
+    // Append in callback order, evict the front.
     let callback_order: Push = |store, bytes, budget, frame| {
         *bytes += frame.rgba.len();
         store.push_back(frame);
@@ -413,7 +408,7 @@ fn harvested_store_sorts_callbacks_and_evicts_lowest_sequence() {
     );
     assert!(!model.check_invariant("BudgetKeepsNewestTail", &wrong_tail));
 
-    // Sorted insertion, but the budget pops the NEWEST frame.
+    // Sorted insertion, but the budget pops the newest frame.
     let evict_newest: Push = |store, bytes, budget, frame| {
         *bytes += frame.rgba.len();
         let at = store

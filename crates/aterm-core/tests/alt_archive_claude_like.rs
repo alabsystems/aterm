@@ -1,18 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-//! The alt-screen scroll-off archive against a synthetic Claude-Code-shaped
-//! byte stream (never a real capture, which would carry private content).
+//! The alt-screen scroll-off archive against a synthetic Claude-Code-shaped byte stream
+//! (never a real capture, which would carry private content).
 //!
-//! Claude Code repaints the alternate screen inside DEC 2026 synchronized
-//! updates using only absolute cursor moves and erases, so a row leaving the
-//! top is gone from the grid. The stream is `?1049h`, then frames of `?2026h
-//! ?25l`, changed rows painted with CUP/VPA+CHA + text + EL (a transcript
-//! shifted by k rows, a spinner row, a fixed composer and footer), `?25h
-//! ?2026l`. Checked: the archive holds exactly the rows that scrolled off;
-//! 1..=17-byte chunking (and a split ESU) changes neither archive nor grid; a
-//! frame the sync timeout closes is committed; main-screen output archives
-//! nothing; the alt grid keeps zero scrollback.
+//! Claude Code repaints the alternate screen inside DEC 2026 synchronized updates with
+//! only absolute cursor moves and erases, so a row leaving the top is gone from the grid.
+//! The stream is `?1049h`, then frames of `?2026h ?25l`, changed rows painted with
+//! CUP/VPA+CHA + text + EL (a transcript shifted by k rows, a spinner row, a fixed
+//! composer and footer), `?25h ?2026l`.
 
 use std::time::Duration;
 
@@ -140,6 +136,10 @@ fn claude_like(layout: &Layout, frames: usize, alt: bool) -> (Vec<u8>, usize, us
     (out, start, frames + 1)
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "test code: the one instant a test mints and feeds in"
+)]
 fn fixed_clock() -> ClockReading {
     ClockReading {
         monotonic: aterm_time::Instant::now(),

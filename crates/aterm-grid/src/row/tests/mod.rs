@@ -8,7 +8,6 @@ mod algorithm_audit;
 mod basic_ops;
 mod bit10_protected;
 mod operations;
-mod style_id;
 mod unsafe_boundary;
 mod wide_char_fixup;
 mod wide_spacer_rendition;

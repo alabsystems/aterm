@@ -1,24 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A BAND ROW'S WORDS CLEAR THE SEAM THAT CLOSES IT (the band's foot room;
-//! amends design rulings 248, 254 and 256; investigation G3, 2026-09-28).
+//! A band row's words clear the seam that closes it (the band's foot room; design
+//! rulings 248, 254 and 256).
 //!
-//! The message band is one terminal cell row. It used to close with the face's
-//! UNDERLINE, stamped on every cell of the stack's last row two pixels under
-//! the baseline, while the words stood on the terminal's own baseline and the
-//! face leaves no foot room: the descenders of `p`, `g` and `y` ran through
-//! the seam and ended on the row's last pixel row, where the terminal's ground
-//! begins, and a chip's label stood on the strip's edge. The seam is now a
-//! 1 px rail on the row's LAST pixel row and the row asks its words to keep
-//! clear of it (`ChromeRaster::clear_rail`), so one pixel row of ground
-//! separates the lowest ink from the seam.
-//!
-//! These tests compose the band through the real `compose_band` and render it
-//! through the real CPU renderer at the sizes the band ships at, and pin the
-//! cell heights too short to lift (the face's underline stays the seam there)
-//! and the stacks that keep the underline (a strain rail, an outlined capsule,
-//! chips that keep their own fill).
+//! The seam is a 1 px rail on the band row's last pixel row, and the row asks its words
+//! to keep clear of it (`ChromeRaster::clear_rail`), so one pixel row of ground separates
+//! the lowest descender from the seam. These tests compose the band through the real
+//! `compose_band` and render it through the CPU renderer at the shipped sizes, and pin
+//! the cases that keep the face's underline as the seam: cells too short to lift, a
+//! strain rail, an outlined capsule, and chips that keep their own fill.
 
 use aterm_core::render::HostRowPixels;
 use aterm_core::terminal::{RenderCell, Terminal, UnderlineStyle};
@@ -153,9 +144,8 @@ fn assert_words_clear_the_seam(rows: usize) {
     for px in [16.0f32, 18.0, 24.0, 28.0, 32.0] {
         let mut face = Renderer::from_system(px, Theme::default())
             .expect("no font: build with aterm-render's default embedded-font feature");
-        // A cell, or a face, that cannot pay for the rail keeps the underline
-        // seam (`a_cell_too_short_to_lift_keeps_the_underline_seam`), decided
-        // exactly as this platform's host decides it.
+        // A cell or face that cannot pay for the rail keeps the underline seam,
+        // decided as this platform's host decides it.
         let (_, cell_h) = face.cell_size();
         if !seam_can_rail(cell_h, native_host_room(|| face.band_room())) {
             continue;
@@ -190,8 +180,8 @@ fn assert_words_clear_the_seam(rows: usize) {
     assert!(ran > 0);
 }
 
-/// RED before the change: the seam was the underline, 2 px under the baseline,
-/// through the descenders, and the words' feet ended on the last pixel row.
+/// A band row's lowest ink keeps one clear pixel row above the rail on its last pixel
+/// row.
 #[test]
 fn a_band_rows_words_keep_one_clear_pixel_row_above_its_closing_seam() {
     assert_words_clear_the_seam(1);
@@ -204,12 +194,9 @@ fn a_stacked_rows_divider_is_a_rail_with_the_same_clear_row() {
     assert_words_clear_the_seam(2);
 }
 
-/// Under [`RAIL_SEAM_MIN_CELL_H`] the face's head room cannot pay for the
-/// lift — nor where the face's measured room cannot ([`seam_can_rail`]:
-/// Windows' Cascadia Mono PL at 14 px, an 18 px cell, and at 18 px, a 23 px
-/// one, each with room `(0, 1)`): the seam stays the underline (no rail is
-/// laid, the words are not asked to lift), exactly as every stack drew it
-/// before.
+/// Under [`RAIL_SEAM_MIN_CELL_H`], or where the face's measured room cannot pay for the
+/// lift ([`seam_can_rail`]: Windows' Cascadia Mono PL at 14 px and 18 px, room
+/// `(0, 1)`), the seam stays the underline: no rail is laid and the words do not lift.
 #[test]
 fn a_cell_too_short_to_lift_keeps_the_underline_seam() {
     let mut ran = 0;
@@ -242,9 +229,8 @@ fn a_cell_too_short_to_lift_keeps_the_underline_seam() {
     assert!(ran > 0, "a size under the threshold was exercised");
 }
 
-/// The rail spans the frame edge to edge, so the renderer leaves the gutters'
-/// own seam segment out (a second line two pixels above the rail otherwise),
-/// and the finished seam is ONE line from window edge to window edge.
+/// The rail spans the frame edge to edge, so the renderer leaves out the gutters' own
+/// seam segment and the seam is one line from window edge to window edge.
 #[test]
 fn the_seam_rail_covers_the_gutters_and_the_bleed_adds_no_second_line() {
     let Composed { mut r, dst, at } = compose(RAILED_PX, 1, |_| {});
@@ -286,10 +272,9 @@ fn the_seam_rail_covers_the_gutters_and_the_bleed_adds_no_second_line() {
     }
 }
 
-/// A stack that carries a strain rail (a measured level, ruling 243), an
-/// outlined capsule (ruling 254) or chips that keep their own fill keeps the
-/// underline seam: those rows own their foot already, and a rail would leave
-/// holes under a chip's `own` columns.
+/// A stack with a strain rail (ruling 243), an outlined capsule (ruling 254) or chips
+/// that keep their own fill keeps the underline seam: those rows own their foot, and a
+/// rail would leave holes under a chip's `own` columns.
 #[test]
 fn a_stack_with_a_strain_rail_or_owned_chips_keeps_the_underline_seam() {
     use aterm_messages::ink::RowRaster;
@@ -323,8 +308,8 @@ fn a_stack_with_a_strain_rail_or_owned_chips_keeps_the_underline_seam() {
             "{kind}: no seam rail was laid over the row's own foot"
         );
         if kind == "strain rail" {
-            // The gauge is the row's lower edge where it is lit: the seam
-            // gives way to it cell by cell (`give_seam_to_rails`), as before.
+            // Where the gauge is lit it is the row's lower edge: the seam gives
+            // way to it cell by cell (`give_seam_to_rails`).
             assert!(m.rail_h > 1, "{kind}: the gauge keeps its own height");
         } else {
             assert!(

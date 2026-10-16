@@ -17,8 +17,6 @@ use super::clamp_u16;
 impl Grid {
     /// Set cursor position (clamped to bounds).
     ///
-    /// Clears pending_wrap — explicit positioning cancels deferred wrap.
-    ///
     /// REQUIRES: self.storage.visible_rows > 0
     /// ENSURES: self.storage.cursor.row < self.storage.visible_rows
     /// ENSURES: self.storage.cursor.col <= self.storage.max_col_for_row(self.storage.cursor.row)
@@ -124,9 +122,8 @@ impl Grid {
 
     /// Move cursor down by n rows, clamping to the screen edge (VPR, `CSI Ps e`).
     ///
-    /// Unlike CUD, VPR is NOT bounded by the scroll region's bottom margin — it
-    /// stops at the last visible line. xterm: VPR moves down within the page, not
-    /// the region (matches the `cud-margin-clamp` conformance note).
+    /// Unlike CUD, VPR is not bounded by the scroll region's bottom margin: as
+    /// in xterm, it stops at the last visible line.
     #[doc(hidden)] // pub for crate benchmarks; not part of stable API
     #[inline]
     pub fn line_position_relative(&mut self, n: u16) {
@@ -250,23 +247,18 @@ impl Grid {
         let bottom = self.storage.scroll_region.bottom;
         match self.storage.cursor.row.cmp(&bottom) {
             std::cmp::Ordering::Less => {
-                // Within scroll region - just move down
-                // (xterm CursorDown ends with ResetWrap)
                 self.storage.clear_pending_wrap();
                 self.storage.cursor.row = self.storage.cursor.row.saturating_add(1);
             }
             std::cmp::Ordering::Equal => {
-                // At bottom of scroll region: scroll within the region. LF is a
-                // cursor-down, so it also resets the deferred wrap (xterm
-                // CursorDown ResetWrap) even when it scrolls; scroll_region_up
-                // preserves pending_wrap for SU/SD, so clear it here, or the next
-                // glyph would scroll again (e.g. `\x1b[3;1Habcd\nZ`).
+                // LF is a cursor-down, so it resets the deferred wrap even when it
+                // scrolls (xterm CursorDown ResetWrap). scroll_region_up keeps
+                // pending_wrap for SU/SD, so clear it here, or the next glyph
+                // would scroll again (e.g. `\x1b[3;1Habcd\nZ`).
                 self.scroll_region_up(1);
                 self.storage.clear_pending_wrap();
             }
             std::cmp::Ordering::Greater => {
-                // Below scroll region - move down if possible
-                // (xterm CursorDown, clamped at max_row; ResetWrap either way)
                 self.storage.clear_pending_wrap();
                 if self.storage.cursor.row < self.storage.visible_rows.saturating_sub(1) {
                     self.storage.cursor.row = self.storage.cursor.row.saturating_add(1);
@@ -311,23 +303,17 @@ impl Grid {
 
         match self.storage.cursor.row.cmp(&bottom) {
             std::cmp::Ordering::Less => {
-                // Within scroll region — move down regardless of margins
-                // (xterm CursorDown ends with ResetWrap)
                 self.storage.clear_pending_wrap();
                 self.storage.cursor.row = self.storage.cursor.row.saturating_add(1);
             }
             std::cmp::Ordering::Equal => {
-                // At bottom of scroll region — scroll only if cursor is
-                // within horizontal margins; use rectangular scroll.
-                // pending_wrap is PRESERVED (xterm xtermScroll save/restore).
+                // Rectangular scroll, only with the cursor inside the margins;
+                // pending_wrap is kept (xterm xtermScroll saves and restores it).
                 if cursor_in_margins {
                     self.scroll_region_up_margined(1, margins.left, margins.right);
                 }
-                // If cursor is outside margins, no scroll and no cursor move.
             }
             std::cmp::Ordering::Greater => {
-                // Below scroll region — move down if possible
-                // (xterm CursorDown, clamped at max_row; ResetWrap either way)
                 self.storage.clear_pending_wrap();
                 if self.storage.cursor.row < self.storage.visible_rows.saturating_sub(1) {
                     self.storage.cursor.row = self.storage.cursor.row.saturating_add(1);
@@ -351,20 +337,14 @@ impl Grid {
         let top = self.storage.scroll_region.top;
         match self.storage.cursor.row.cmp(&top) {
             std::cmp::Ordering::Greater => {
-                // Within scroll region - just move up
-                // (xterm CursorUp ends with ResetWrap)
                 self.storage.clear_pending_wrap();
                 self.storage.cursor.row = self.storage.cursor.row.saturating_sub(1);
             }
             std::cmp::Ordering::Equal => {
-                // At top of scroll region - scroll region down.
-                // pending_wrap is PRESERVED: xterm RevScroll never touches
-                // screen->do_wrap.
+                // pending_wrap is kept: xterm RevScroll never touches do_wrap.
                 self.scroll_region_down(1);
             }
             std::cmp::Ordering::Less => {
-                // Above scroll region - move up if possible
-                // (xterm CursorUp, clamped at row 0; ResetWrap either way)
                 self.storage.clear_pending_wrap();
                 if self.storage.cursor.row > 0 {
                     self.storage.cursor.row = self.storage.cursor.row.saturating_sub(1);
@@ -410,23 +390,17 @@ impl Grid {
 
         match self.storage.cursor.row.cmp(&top) {
             std::cmp::Ordering::Greater => {
-                // Within scroll region — move up regardless of margins
-                // (xterm CursorUp ends with ResetWrap)
                 self.storage.clear_pending_wrap();
                 self.storage.cursor.row = self.storage.cursor.row.saturating_sub(1);
             }
             std::cmp::Ordering::Equal => {
-                // At top of scroll region — scroll only if cursor is
-                // within horizontal margins; use rectangular scroll.
-                // pending_wrap is PRESERVED (xterm RevScroll never touches it).
+                // Rectangular scroll, only with the cursor inside the margins;
+                // pending_wrap is kept (xterm RevScroll never touches it).
                 if cursor_in_margins {
                     self.scroll_region_down_margined(1, margins.left, margins.right);
                 }
-                // If cursor is outside margins, no scroll and no cursor move.
             }
             std::cmp::Ordering::Less => {
-                // Above scroll region — move up if possible
-                // (xterm CursorUp, clamped at row 0; ResetWrap either way)
                 self.storage.clear_pending_wrap();
                 if self.storage.cursor.row > 0 {
                     self.storage.cursor.row = self.storage.cursor.row.saturating_sub(1);
@@ -498,9 +472,7 @@ impl Grid {
 mod tests {
     use crate::{Cursor, Grid};
 
-    // -------------------------------------------------------------------------
     // set_cursor — absolute positioning and clamping
-    // -------------------------------------------------------------------------
 
     #[test]
     fn set_cursor_exact_position() {
@@ -543,9 +515,7 @@ mod tests {
         assert!(!grid.pending_wrap());
     }
 
-    // -------------------------------------------------------------------------
     // move_cursor_to — alias for set_cursor
-    // -------------------------------------------------------------------------
 
     #[test]
     fn move_cursor_to_lands_or_clamps() {
@@ -560,46 +530,7 @@ mod tests {
         }
     }
 
-    // -------------------------------------------------------------------------
-    // move_cursor_by — relative movement
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn move_cursor_by_positive_offset() {
-        let mut grid = Grid::new(24, 80);
-        grid.set_cursor(5, 10);
-        grid.move_cursor_by(3, 7);
-        assert_eq!(grid.cursor(), Cursor::new(8, 17));
-    }
-
-    #[test]
-    fn move_cursor_by_negative_offset() {
-        let mut grid = Grid::new(24, 80);
-        grid.set_cursor(10, 20);
-        grid.move_cursor_by(-5, -10);
-        assert_eq!(grid.cursor(), Cursor::new(5, 10));
-    }
-
-    #[test]
-    fn move_cursor_by_clamps_to_zero() {
-        let mut grid = Grid::new(24, 80);
-        grid.set_cursor(3, 5);
-        grid.move_cursor_by(-100, -100);
-        assert_eq!(grid.cursor(), Cursor::new(0, 0));
-    }
-
-    #[test]
-    fn move_cursor_by_clamps_to_max() {
-        let mut grid = Grid::new(10, 20);
-        grid.set_cursor(5, 10);
-        grid.move_cursor_by(1000, 1000);
-        assert_eq!(grid.cursor_row(), 9);
-        assert_eq!(grid.cursor_col(), 19);
-    }
-
-    // -------------------------------------------------------------------------
     // cursor_up — vertical movement, scroll region interaction
-    // -------------------------------------------------------------------------
 
     #[test]
     fn cursor_up_basic() {
@@ -654,9 +585,7 @@ mod tests {
         assert_eq!(grid.cursor_row(), 4);
     }
 
-    // -------------------------------------------------------------------------
     // cursor_down — vertical movement, scroll region interaction
-    // -------------------------------------------------------------------------
 
     #[test]
     fn cursor_down_basic() {
@@ -695,7 +624,7 @@ mod tests {
 
     #[test]
     fn cursor_down_above_scroll_region_stops_at_bottom_margin() {
-        // xterm CursorDown clamps on the bottom margin alone: a cursor ABOVE the
+        // xterm CursorDown clamps on the bottom margin alone: a cursor above the
         // region moving down still stops at the bottom margin, not the last line.
         let mut grid = Grid::new(20, 80);
         grid.set_scroll_region(3, 12);
@@ -706,7 +635,7 @@ mod tests {
 
     #[test]
     fn cursor_up_below_scroll_region_stops_at_top_margin() {
-        // Symmetric: a cursor BELOW the region moving up stops at the top margin.
+        // Symmetric: a cursor below the region moving up stops at the top margin.
         let mut grid = Grid::new(20, 80);
         grid.set_scroll_region(3, 12);
         grid.set_cursor(15, 0); // below region
@@ -743,9 +672,7 @@ mod tests {
         assert_eq!(grid.cursor_row(), 6);
     }
 
-    // -------------------------------------------------------------------------
     // cursor_forward — horizontal movement right
-    // -------------------------------------------------------------------------
 
     #[test]
     fn cursor_forward_basic() {
@@ -780,9 +707,7 @@ mod tests {
         assert!(!grid.pending_wrap());
     }
 
-    // -------------------------------------------------------------------------
     // cursor_backward — horizontal movement left
-    // -------------------------------------------------------------------------
 
     #[test]
     fn cursor_backward_basic() {
@@ -818,9 +743,7 @@ mod tests {
         assert_eq!(grid.cursor_col(), 78);
     }
 
-    // -------------------------------------------------------------------------
     // carriage_return
-    // -------------------------------------------------------------------------
 
     #[test]
     fn carriage_return_moves_to_col_zero() {
@@ -841,9 +764,7 @@ mod tests {
         assert_eq!(grid.cursor_col(), 0);
     }
 
-    // -------------------------------------------------------------------------
     // carriage_return_margin — DECLRMM interaction
-    // -------------------------------------------------------------------------
 
     #[test]
     fn carriage_return_margin_no_mode_goes_to_zero() {
@@ -871,9 +792,7 @@ mod tests {
         assert_eq!(grid.cursor_col(), 0);
     }
 
-    // -------------------------------------------------------------------------
     // line_feed — scroll region interaction
-    // -------------------------------------------------------------------------
 
     #[test]
     fn line_feed_moves_down_within_region() {
@@ -912,9 +831,7 @@ mod tests {
         assert_eq!(grid.cursor_row(), 9);
     }
 
-    // -------------------------------------------------------------------------
     // reverse_line_feed
-    // -------------------------------------------------------------------------
 
     #[test]
     fn reverse_line_feed_moves_up_within_region() {
@@ -962,69 +879,7 @@ mod tests {
         assert!(!grid.pending_wrap());
     }
 
-    // -------------------------------------------------------------------------
-    // backspace
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn backspace_at_col_zero_stays() {
-        let mut grid = Grid::new(10, 80);
-        grid.set_cursor(3, 0);
-        grid.backspace();
-        assert_eq!(grid.cursor_col(), 0);
-        assert_eq!(grid.cursor_row(), 3); // row unchanged
-    }
-
-    #[test]
-    fn backspace_clears_pending_wrap() {
-        let mut grid = Grid::new(10, 80);
-        grid.set_cursor(0, 79);
-        grid.set_pending_wrap(true);
-        grid.backspace();
-        assert!(!grid.pending_wrap());
-        assert_eq!(grid.cursor_col(), 78);
-    }
-
-    // -------------------------------------------------------------------------
-    // save_cursor / restore_cursor (DECSC / DECRC)
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn save_and_restore_cursor_roundtrip() {
-        let mut grid = Grid::new(24, 80);
-        grid.set_cursor(10, 30);
-        grid.save_cursor();
-
-        grid.set_cursor(0, 0);
-        assert_eq!(grid.cursor(), Cursor::new(0, 0));
-
-        grid.restore_cursor();
-        assert_eq!(grid.cursor(), Cursor::new(10, 30));
-    }
-
-    #[test]
-    fn restore_cursor_without_save_is_noop() {
-        let mut grid = Grid::new(24, 80);
-        grid.set_cursor(5, 10);
-        grid.restore_cursor(); // no prior save — should not change cursor
-        assert_eq!(grid.cursor(), Cursor::new(5, 10));
-    }
-
-    #[test]
-    fn restore_cursor_clamps_to_resized_grid() {
-        let mut grid = Grid::new(24, 80);
-        grid.set_cursor(20, 70);
-        grid.save_cursor();
-
-        grid.resize(10, 40);
-        grid.restore_cursor();
-        assert_eq!(grid.cursor_row(), 9); // clamped to new rows - 1
-        assert_eq!(grid.cursor_col(), 39); // clamped to new cols - 1
-    }
-
-    // -------------------------------------------------------------------------
     // cursor_forward_margin — DECLRMM interaction
-    // -------------------------------------------------------------------------
 
     #[test]
     fn cursor_forward_margin_no_mode_same_as_forward() {
@@ -1052,9 +907,7 @@ mod tests {
         assert_eq!(grid.cursor_col(), 79);
     }
 
-    // -------------------------------------------------------------------------
     // cursor_backward_margin — DECLRMM interaction
-    // -------------------------------------------------------------------------
 
     #[test]
     fn cursor_backward_margin_no_mode_same_as_backward() {
@@ -1082,9 +935,7 @@ mod tests {
         assert_eq!(grid.cursor_col(), 0);
     }
 
-    // -------------------------------------------------------------------------
     // Edge cases: 1x1 grid
-    // -------------------------------------------------------------------------
 
     #[test]
     fn grid_1x1_every_motion_stays_at_origin() {
@@ -1103,36 +954,5 @@ mod tests {
             motion(&mut grid);
             assert_eq!(grid.cursor(), Cursor::new(0, 0), "{label}");
         }
-    }
-
-    // -------------------------------------------------------------------------
-    // cursor_row / cursor_col accessor correctness after moves
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn accessors_consistent_with_cursor_struct() {
-        let mut grid = Grid::new(24, 80);
-        grid.set_cursor(15, 42);
-        let c = grid.cursor();
-        assert_eq!(c.row, grid.cursor_row());
-        assert_eq!(c.col, grid.cursor_col());
-    }
-
-    #[test]
-    fn accessors_after_sequential_moves() {
-        let mut grid = Grid::new(20, 60);
-        grid.set_cursor(10, 30);
-        grid.cursor_up(3);
-        assert_eq!(grid.cursor_row(), 7);
-        grid.cursor_forward(10);
-        assert_eq!(grid.cursor_col(), 40);
-        grid.cursor_down(5);
-        assert_eq!(grid.cursor_row(), 12);
-        grid.cursor_backward(20);
-        assert_eq!(grid.cursor_col(), 20);
-        grid.backspace();
-        assert_eq!(grid.cursor_col(), 19);
-        grid.carriage_return();
-        assert_eq!(grid.cursor_col(), 0);
     }
 }

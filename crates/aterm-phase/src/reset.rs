@@ -675,7 +675,7 @@ mod tests {
     use super::*;
     use crate::prompt::fixtures::{
         LIMIT_OPTIONS_DIALOG, LIMIT_OPTIONS_PANEL, limit_options_dialog, limit_options_panel,
-        provenance, screen,
+        screen,
     };
     use crate::prompt::{Role, Select, parse_prompt_v2};
 
@@ -696,6 +696,19 @@ mod tests {
     /// fullscreen panel's frame, the cursor on the first).
     fn row_among(labels: &[&str]) -> Option<ResetRow> {
         reset_row(&boxed(&limit_options_panel(labels, 0, false)))
+    }
+
+    /// MEASURED on 2.1.301 in the lab (crates/aterm-lab, 2026-10-15): the
+    /// usage-limit dialog at a five-hour wall whose at-wall reads of the
+    /// usage body failed (both reset programs flagged on) offers no reset:
+    /// no grant row, and no option whose words spend one.
+    #[test]
+    fn the_measured_dialog_with_no_reset_on_offer_has_no_grant_row() {
+        use crate::prompt::fixtures::LIMIT_DIALOG_NO_RESET_ROWS_2_1_301;
+        let dialog = boxed(&screen(LIMIT_DIALOG_NO_RESET_ROWS_2_1_301));
+        assert_eq!(reset_row(&dialog), None);
+        assert_eq!(dialog.options.len(), 4, "{:?}", dialog.options);
+        assert!(dialog.options.iter().all(|o| !spends_reset(&o.label)));
     }
 
     /// [`fixtures::CONFIRM`] with the rows between its title and its options
@@ -730,36 +743,6 @@ mod tests {
                 }
             })
             .collect()
-    }
-
-    /// EVERY FIXTURE OF THE RESET PROGRAM SAYS IT IS COMPOSED, on its first
-    /// line, in the spec's form: nothing here was captured, and a reader of
-    /// the file must not take it for a screen. NEGATIVE CONTROL: the wall
-    /// dialog's own fixtures, hand-built from an owner's report and a
-    /// ledger, do not say so.
-    #[test]
-    fn every_reset_fixture_says_it_was_composed_and_never_captured() {
-        for (name, text) in fixtures::ALL {
-            let head = provenance(text).unwrap_or_else(|| panic!("{name}: a provenance line"));
-            assert!(
-                head.starts_with(
-                    "claude-code 2.1.287 · COMPOSED 2026-10-02, never captured: the texts are \
-                     the bundle's ("
-                ),
-                "{name}: {head}"
-            );
-            for part in [
-                "the frame is the wall dialog's hand-built one (",
-                "same Dialog component",
-                "the values are invented · OPEN: replace with a capture (SPEC §6)",
-            ] {
-                assert!(head.contains(part), "{name}: {part:?} in {head}");
-            }
-            assert!(!head.contains("MEASURED"), "{name}");
-        }
-        for text in [LIMIT_OPTIONS_DIALOG, LIMIT_OPTIONS_PANEL] {
-            assert!(!provenance(text).expect("a line").contains("COMPOSED"));
-        }
     }
 
     /// THE GRANT ROW, by its exact label: the composed dialog gives its

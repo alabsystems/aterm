@@ -9,11 +9,11 @@
 //! it here. A machine with no displaced screen registers nothing, so an idle
 //! window never wakes for this (FL-1).
 //!
-//! LOCKS. A look never holds the terminal and a session's timeline together:
-//! the timeline (a strict leaf) says whether a look is due, the terminal is
-//! `try_lock`ed on its own for the probe, and the timeline is taken again to
-//! judge. A terminal the PTY reader holds is asked again after 100 ms, at most
-//! 20 times, then at the next risk window: no spin.
+//! A look never holds the terminal and a session's timeline together: the timeline
+//! (a strict leaf) says whether a look is due, the terminal is `try_lock`ed on its
+//! own for the probe, and the timeline is taken again to judge. A terminal the PTY
+//! reader holds is asked again after 100 ms, at most 20 times, then at the next risk
+//! window: no spin.
 
 use std::time::{Duration, Instant};
 

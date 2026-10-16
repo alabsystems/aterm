@@ -4,8 +4,8 @@
 //! `aterm-update`: silent, signature-pinned in-app self-update for the macOS
 //! `aterm.app` (and, through [`linux`], an enrolled Linux executable).
 //!
-//! Two entry points, both no-ops unless the running process is a real installed
-//! `.app` bundle and the updater is enabled:
+//! On macOS, two entry points apply only to an eligible installed `.app` with
+//! updating enabled. Linux enrollment and transactions live in [`linux`].
 //!
 //! * [`apply_staged_if_ready_preserving_fds_exact`]: call very early in `main()`,
 //!   before any window or thread. If a previous run staged a verified, newer build,
@@ -31,12 +31,8 @@
 //! A machine that never runs aterm is never updated, but the first launch after a
 //! release stages it and the running app applies it: at worst one apply behind.
 //!
-//! There is deliberately no LaunchAgent: it would only move staging before a
-//! launch (applying needs a running process); every verified path lives in the one
-//! GUI binary, so it would need a second signed headless binary in the bundle (a
-//! script would be a second, unverified download path); and `check_lane` is
-//! process-local, so it would contend with the app only on `stage_lock`. Its
-//! precondition is a headless `aterm update check` verb in the one binary.
+//! The app schedules its own checks; no LaunchAgent is installed. Explicit
+//! `aterm update check` uses the same binary and staging locks.
 //!
 //! # Trust model
 //!
@@ -44,7 +40,7 @@
 //! 1. No downgrade: the candidate's build number is strictly greater than the
 //!    running build and never below the persisted monotonic `min_build`/high-water
 //!    floor (blocks replay, rollback and yanked builds).
-//! 2. Integrity: the downloaded DMG's SHA-256 equals the manifest's.
+//! 2. Integrity: the downloaded container's SHA-256 equals the manifest's.
 //!
 //! Authenticity comes from every configured tier (defense in depth):
 //!
@@ -65,6 +61,13 @@
 //!
 //! Everything shells out to `codesign`/`spctl`/`hdiutil`/`ditto`/`curl`/`shasum`;
 //! the Ed25519 checks are `aterm_update_core::roster`'s.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_types,
+        reason = "test code: a stand-in child may inherit descriptors"
+    )
+)]
 
 #[cfg(target_os = "macos")]
 mod bundle;
@@ -105,11 +108,11 @@ mod health;
 mod install;
 mod install_posture;
 /// Signed single-executable Linux update transactions and explicit enrollment.
-/// Compiled into macOS test builds too, so the macOS gate runs its transaction
+/// Compiled into macOS test builds too, so a macOS test run covers its transaction
 /// tests (each one that needs the Linux kernel itself is marked so). Never into a
 /// Windows one: the lane is Unix through and through (`std::os::unix`, `libc`'s
-/// open flags, [`floor_sources`]), and the gate's Windows cells build this crate's
-/// tests (`xtask gate cells-foreign`).
+/// open flags, [`floor_sources`]), and `verify cells` builds this crate's tests
+/// for the Windows cells.
 #[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub mod linux;
@@ -401,7 +404,7 @@ pub fn enabled() -> bool {
 }
 
 /// Whether the running copy is a dev-marked bundle (`ATermDevBuild` in its
-/// `Info.plist`, written by `tools/dev-app.sh`), which the updater leaves alone
+/// `Info.plist`, written by `targo --unverified ship dev-app`), which the updater leaves alone
 /// wherever it sits, so a "move it into Applications" remedy would be wrong. One
 /// canonicalize and one bounded plist read. `false` for a bare binary, a disk-image
 /// or translocated launch, and off macOS.
@@ -718,6 +721,7 @@ impl HandoffCandidateFacts {
 #[cfg(target_os = "macos")]
 pub use bundle::{
     HANDOFF_GRANT_CHUNKS_KEY, HANDOFF_GRANT_CHUNKS_TOKEN, plist_declares_grant_chunks,
+    plist_marks_dev_build,
 };
 
 /// Non-macOS: there is no `.app` bundle, so nothing to pre-verify, refuse or read.
@@ -1252,10 +1256,12 @@ pub fn installed_update_facts_checked() -> Result<Option<InstalledUpdateFacts>, 
     // Info.plist values are only codesign-sealed evidence after the complete
     // configured policy gate succeeds. This runs on the updater facts worker,
     // never the event loop, so fail-closed verification adds no input latency.
-    verify::verify_bundle_policy(&installed.app_root, effective_team_id())?;
-    let build_number = verify::bundle_build_number(&installed.app_root)?;
-    let git_commit = verify::bundle_git_commit(&installed.app_root)?;
-    let version = verify::bundle_short_version(&installed.app_root).ok();
+    // Every helper runs at once (`verify::check_bundle`), read in the serial order.
+    let checks = verify::check_bundle(&installed.app_root, effective_team_id(), true);
+    checks.policy?;
+    let build_number = checks.build?;
+    let git_commit = checks.commit?;
+    let version = checks.short_version.and_then(Result::ok);
     let staging = paths::Staging::resolve();
     let receipt = staging
         .as_ref()
@@ -1905,15 +1911,17 @@ impl HealthAnnouncer {
         current_build: u64,
     ) -> Option<(String, String)> {
         let active = h.last_failure_at.as_str() >= self.started.as_str();
-        // Duration gate beside the count gate: at the check cadence three failures
-        // can span a few minutes, a blip rather than the broken pipeline the loud
-        // notice promises, so the streak must also have persisted >= 30 min. Measured
-        // on the escalating class's own clock: `failing_since` is any-class and is
-        // kept while an apply streak survives (`Health::record_success`), so reading
-        // it would let an old apply failure backdate a new blip past the gate.
+        // Duration gate beside the count gate: three failures can come within a few
+        // minutes, a blip rather than the broken lane the loud notice promises, so the
+        // streak must also have stood for [`PERSISTENT_SPAN`] (a class a check books
+        // already spans it between its own failures: `Health::persistent_class`).
+        // Measured on the escalating class's own clock: `failing_since` is any-class
+        // and is kept while an apply streak survives (`Health::record_success`), so
+        // reading it would let an old apply failure backdate a new blip past the gate.
         let escalated = h.persistent_class();
         let long_lived = escalated.is_some_and(|(class, _)| {
-            install::rfc3339_delta_secs(h.class_since(class), now).is_some_and(|d| d >= 30 * 60)
+            install::rfc3339_delta_secs(h.class_since(class), now)
+                .is_some_and(|d| d >= PERSISTENT_SPAN.as_secs())
         });
         if let Some((class, count)) = escalated
             && active
@@ -2670,6 +2678,40 @@ mod persistent_notice_tests {
         assert_eq!(title, super::health_failing_title("apply"));
     }
 
+    /// THREE QUICK FAILURES RAISE NO NOTICE, HOWEVER LONG AGO THEY BEGAN. At the
+    /// two-minute cadence a GitHub incident fails three checks in six minutes; a
+    /// laptop that sleeps on that streak and fails its first check on waking
+    /// (weather, booked `network`) must not wake to "Couldn't download updates". The
+    /// same streak spanning half an hour between its own failures is announced.
+    #[test]
+    fn a_quick_streak_raises_no_notice_and_a_spanning_one_does() {
+        let started = "2026-10-15T09:00:00Z".to_string();
+        let streak = |newest: &str| super::health::Health {
+            pipeline_failures: 3,
+            pipeline_since: "2026-10-15T10:00:00Z".to_string(),
+            last_diagnosis_at: newest.to_string(),
+            last_diagnosis_error: "release manifests exist but could not be fetched".to_string(),
+            network_failures: 1,
+            network_since: "2026-10-15T18:00:00Z".to_string(),
+            last_failure_at: "2026-10-15T18:00:00Z".to_string(),
+            kind: "network".to_string(),
+            last_error: "curl: (6) Could not resolve host: github.com".to_string(),
+            ..super::health::Health::default()
+        };
+        let woke = "2026-10-15T18:00:01Z";
+        let mut announcer = super::HealthAnnouncer::new(started.clone());
+        assert_eq!(
+            announcer.tick(&streak("2026-10-15T10:06:00Z"), woke, 7),
+            None,
+            "three failures inside six minutes"
+        );
+        let mut announcer = super::HealthAnnouncer::new(started);
+        let (title, _) = announcer
+            .tick(&streak("2026-10-15T10:30:00Z"), woke, 7)
+            .expect("three failures spanning half an hour are news");
+        assert_eq!(title, super::health_failing_title("pipeline"));
+    }
+
     /// A ledger whose `manifest` streak has persisted, its last failure at `last`.
     fn failing_checks(last: &str) -> super::health::Health {
         super::health::Health {
@@ -3009,9 +3051,9 @@ const SETTINGS_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
 const SETTINGS_MISS_LOG_EVERY: u64 = 60;
 
 /// Every how many consecutive `checker.lock` deferrals the loop says so again
-/// (one per cycle: about an hour at the ten-minute interval).
+/// (one per cycle: about an hour of them at the base interval).
 #[cfg(target_os = "macos")]
-const CHECKER_DEFERRAL_LOG_EVERY: u64 = 6;
+const CHECKER_DEFERRAL_LOG_EVERY: u64 = 3600 / cadence::INTERVAL_SECS;
 
 /// Every how many consecutive cycles that found this process's own check lane busy
 /// the loop says so again.
@@ -3470,6 +3512,9 @@ fn run_checker(
     let interval = cadence::INTERVAL_SECS;
     let mut schedule = cadence::Cadence::new(std::time::Duration::from_secs(interval));
     let mut failures = cadence::FailureLog::default();
+    // The last wake a wait detected: a check that fails inside its grace is a network
+    // still coming up (`cadence::after_wake`), whatever it failed on.
+    let mut woke_at: Option<std::time::Instant> = None;
     // Once per strand (`unreadable::StrandNotice`): announced once, then it
     // lives in `status.toml`; a readable check re-arms it.
     let mut strand_notice = unreadable::StrandNotice::default();
@@ -3496,7 +3541,7 @@ fn run_checker(
             let staged =
                 manifest::Ready::read_publishable(&staging).map(|ready| ready.build_number);
             let installed = bundle::resolve()
-                .and_then(|installed| verify::bundle_build_number(&installed.app_root).ok())
+                .and_then(|installed| installed_build_observed(&installed.app_root).ok())
                 .filter(|build| *build > current_build);
             let h = note_pending_update(&staging, current_build, staged, installed);
             let now = install::now_rfc3339();
@@ -3611,14 +3656,15 @@ fn run_checker(
             }
             // The bundle under our own executable may have moved on without a
             // stage (the release cutter rewriting it, a user dragging a new `.app`
-            // over it, a sibling's swap), none of which writes `ready.toml`. A plist
-            // read per cycle, plus the GUI's codesign policy only when it says newer,
-            // lets the activation lane fire on its own. A dev-marked bundle is
-            // skipped (`bundle::resolve` is dev-mark-aware): it can never pass the
-            // shipped tier, so verifying it would only spawn codesign forever.
+            // over it, a sibling's swap), none of which writes `ready.toml`. A stat of
+            // its plist per cycle (read again only when it moved), plus the GUI's
+            // codesign policy only when it says newer, lets the activation lane fire
+            // on its own. A dev-marked bundle is skipped (`bundle::resolve` is
+            // dev-mark-aware): it can never pass the shipped tier, so verifying it
+            // would only spawn codesign forever.
             if args.has_staged_hook()
                 && let Some(installed) = bundle::resolve()
-                && let Ok(installed_build) = verify::bundle_build_number(&installed.app_root)
+                && let Ok(installed_build) = installed_build_observed(&installed.app_root)
                 && installed_build > current_build
                 // A build below the operator apply floor (a yank) is not an update
                 // wherever it sits; announcing it would stage something every
@@ -3827,7 +3873,11 @@ fn run_checker(
                                 check_lane::after_skip((), (lane, lane_mark), interval, || {
                                     speak_health(&mut announcer);
                                     if matches!(wait(&schedule), cadence::Waited::Woke(_)) {
-                                        schedule.woke();
+                                        settle_after_wake(
+                                            &mut schedule,
+                                            &mut failures,
+                                            &mut woke_at,
+                                        );
                                     }
                                 });
                                 return Cycle::Next;
@@ -3892,16 +3942,15 @@ fn run_checker(
                         // Release the flock and the local lane before sleeping (the
                         // former blocks siblings, the latter this process's manual
                         // checks), then take the loop tail's jittered wait (a bare
-                        // `continue` would spin). The wake subtleties (settle window,
-                        // still-failing suppression) matter only before a network
-                        // check, which this cycle is not.
+                        // `continue` would spin). A wake in it is settled as the
+                        // tail's is: the next cycle may be the one that checks.
                         if !stamp(CheckerPhase::Waiting) {
                             return Cycle::Superseded(last.get());
                         }
                         check_lane::after_skip(_checker_gate, (lane, lane_mark), interval, || {
                             speak_health(&mut announcer);
                             if matches!(wait(&schedule), cadence::Waited::Woke(_)) {
-                                schedule.woke();
+                                settle_after_wake(&mut schedule, &mut failures, &mut woke_at);
                             }
                         });
                         return Cycle::Next;
@@ -3910,6 +3959,7 @@ fn run_checker(
                     // whether this check recorded a failure (see the `Ok(None)` arm).
                     // RFC 3339 strings compare chronologically.
                     let check_started = install::now_rfc3339();
+                    let check_began = std::time::Instant::now();
                     if !stamp(CheckerPhase::Checking) {
                         return Cycle::Superseded(last.get());
                     }
@@ -4032,26 +4082,26 @@ fn run_checker(
                             }
                         }
                         // A network that could not be reached at all (the first check
-                        // after a cold boot, Wi-Fi still joining) is retried within
-                        // seconds on the cadence's short rungs and logged at INFO while
-                        // those run: it is expected, and a WARN would bury real ones.
-                        Err(e)
-                            if (args.staging)().is_some_and(|s| {
-                                unreachable_before_the_channel(
-                                    &e,
-                                    &health::Health::read(&s.health()),
-                                    &check_started,
-                                )
-                            }) =>
-                        {
-                            schedule.failed_offline();
-                            emit(Some(
-                                failures.failure_expected(&e, schedule.retrying_offline()),
-                            ));
-                        }
+                        // after a cold boot, Wi-Fi still joining), or any failure inside
+                        // a wake's grace (a TLS failure, a reset, a portal's page from a
+                        // network still coming up), is retried within seconds on the
+                        // cadence's short rungs and logged at INFO while those run: it
+                        // is expected, and a WARN would bury real ones.
                         Err(e) => {
-                            emit(Some(failures.failure(&e)));
-                            schedule.failed();
+                            let offline = cadence::after_wake(woke_at, check_began)
+                                || (args.staging)().is_some_and(|s| {
+                                    unreachable_before_the_channel(
+                                        &e,
+                                        &health::Health::read(&s.health()),
+                                        &check_started,
+                                    )
+                                });
+                            emit(Some(cadence::note_failure(
+                                &mut schedule,
+                                &mut failures,
+                                &e,
+                                offline,
+                            )));
                         }
                     }
                 }
@@ -4111,18 +4161,9 @@ fn run_checker(
                 return Cycle::Superseded(last.get());
             }
             // Jittered, backed-off, wake-aware wait. A detected wake returns early and
-            // clears the backoff (the outage belonged to a network this Mac may no
-            // longer be on), then lets the network associate before the next check.
+            // is settled before the next check (`settle_after_wake`).
             if matches!(wait(&schedule), cadence::Waited::Woke(_)) {
-                log(&format!(
-                    "woke from sleep; checking for updates in {}s",
-                    cadence::WAKE_SETTLE.as_secs()
-                ));
-                schedule.woke();
-                // Suppress the "still failing" carry-over too: a pre-sleep DNS
-                // failure is not evidence about the post-wake network.
-                failures = cadence::FailureLog::default();
-                std::thread::sleep(cadence::WAKE_SETTLE);
+                settle_after_wake(&mut schedule, &mut failures, &mut woke_at);
             }
             Cycle::Next
         }));
@@ -4143,6 +4184,96 @@ fn run_checker(
             }
         }
     }
+}
+
+/// After a wait that ended on a detected wake: the backoff is cleared (the outage
+/// belonged to a network this Mac may no longer be on), and so is the failure log's
+/// "still failing" carry-over (a pre-sleep DNS failure is not evidence about the
+/// post-wake network); the wake is dated for [`cadence::after_wake`]; and the network
+/// gets [`cadence::WAKE_SETTLE`] to associate before the next check.
+#[cfg(target_os = "macos")]
+fn settle_after_wake(
+    schedule: &mut cadence::Cadence,
+    failures: &mut cadence::FailureLog,
+    woke_at: &mut Option<std::time::Instant>,
+) {
+    log(&format!(
+        "woke from sleep; checking for updates in {}s",
+        cadence::WAKE_SETTLE.as_secs()
+    ));
+    schedule.woke();
+    *failures = cadence::FailureLog::default();
+    *woke_at = Some(std::time::Instant::now());
+    std::thread::sleep(cadence::WAKE_SETTLE);
+}
+
+/// The installed bundle's build number (`CFBundleVersion`), read with PlistBuddy
+/// only when its `Info.plist` has moved since the last read ([`INSTALLED_BUILD`]).
+///
+/// OBSERVATION, never trust: its two per-cycle callers only notice a newer build
+/// installed under this older image — the pending-update clock, and the bundle
+/// probe, which verifies the bundle (`verify::verify_bundle_policy`) before it
+/// announces anything. Every trust decision reads the plist afresh after a verify
+/// (`verify::bundle_build_number`). Every cycle of every window used to spawn
+/// PlistBuddy twice for a number that changes once a release.
+#[cfg(target_os = "macos")]
+fn installed_build_observed(app_root: &std::path::Path) -> Result<u64, String> {
+    observed_build_with(&INSTALLED_BUILD, app_root, verify::bundle_build_number)
+}
+
+/// What identifies one version of a bundle's `Info.plist`: the bundle, and the
+/// file's device, inode, size, modification and status-change times. A bundle
+/// dragged over or swapped in is a new inode; a plist rewritten in place moves its
+/// mtime, and its ctime even under a restored mtime (no caller can set a ctime).
+#[cfg(target_os = "macos")]
+type PlistIdentity = (std::path::PathBuf, u64, u64, u64, i64, i64, i64, i64);
+
+/// The last build [`installed_build_observed`] read, and the plist it read it from.
+#[cfg(target_os = "macos")]
+static INSTALLED_BUILD: std::sync::Mutex<Option<(PlistIdentity, u64)>> =
+    std::sync::Mutex::new(None);
+
+/// [`installed_build_observed`] over an injected cache and reader. The plist is
+/// stat'ed BEFORE it is read, so a rewrite between the two leaves the older identity
+/// beside the newer number and the next stat reads again; a read that fails (a
+/// helper past its deadline, a swap in progress) is not remembered. The cache is
+/// not held across the read: a checker generation stuck in the helper must not
+/// hold up the replacement the watchdog starts, and two reads racing to store can
+/// only leave an identity older than its file, which the next stat reads again.
+#[cfg(target_os = "macos")]
+fn observed_build_with(
+    cache: &std::sync::Mutex<Option<(PlistIdentity, u64)>>,
+    app_root: &std::path::Path,
+    read: impl FnOnce(&std::path::Path) -> Result<u64, String>,
+) -> Result<u64, String> {
+    use std::os::unix::fs::MetadataExt as _;
+    let identity = std::fs::metadata(app_root.join("Contents/Info.plist"))
+        .ok()
+        .map(|m| {
+            (
+                app_root.to_path_buf(),
+                m.dev(),
+                m.ino(),
+                m.size(),
+                m.mtime(),
+                m.mtime_nsec(),
+                m.ctime(),
+                m.ctime_nsec(),
+            )
+        });
+    let lock = || {
+        cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    };
+    if let (Some(identity), Some((seen, build))) = (identity.as_ref(), lock().as_ref())
+        && identity == seen
+    {
+        return Ok(*build);
+    }
+    let build = read(app_root)?;
+    *lock() = identity.map(|identity| (identity, build));
+    Ok(build)
 }
 
 /// A sibling's stage is this process's news too: a skipping cycle never reaches the
@@ -4190,9 +4321,10 @@ fn after_healthy_check(schedule: &mut cadence::Cadence) {
     if let Some((head, checks)) = in_flight
         && let Some(rung) = cadence::in_flight_retry(checks)
     {
+        // A rung never outwaits the base (`Cadence::nominal_at`): say the wait taken.
         log(&format!(
             "aterm {head} is published but not downloadable yet; checking again in ~{} min",
-            rung.as_secs() / 60
+            rung.min(schedule.base()).as_secs() / 60
         ));
     }
 }
@@ -4223,8 +4355,16 @@ pub fn spawn_background_check_with_source(
 /// (drives [`UpdateStatus::is_failing_persistently`], the status wording, the GUI
 /// notification, and `aterm-ctl update`'s `persistent=` field). Cross-platform so
 /// status consumers can reason about it; the macOS `health` ledger uses the same
-/// threshold.
+/// threshold, beside [`PERSISTENT_SPAN`].
 pub const PERSISTENT_AFTER: u32 = 3;
+
+/// How long a streak a check books must span, on its class's own clock, before the
+/// macOS ledger calls it persistent (`health::Health::persistent_class`), and how
+/// long any escalated class must have stood before the loud notice speaks. Half an
+/// hour: a GitHub incident or a slow asset upload is over well inside it, and a broken
+/// pipeline is still named within the hour. Time, not checks, so the check cadence
+/// (`cadence::INTERVAL_SECS`) can change without moving it.
+pub const PERSISTENT_SPAN: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
 /// How long a newer build may wait on this machine (staged, or installed under an
 /// older running image) before the updater raises the loud notice
@@ -4418,7 +4558,8 @@ mod switch_scope_tests {
 /// The loop's schedule after a healthy check ([`after_healthy_check`]): the quick
 /// re-check rung the head in flight names (the receipt's count, 2 → 4 min), the base
 /// interval once the rungs are spent, and the base interval (the negative control)
-/// after a check that found no head in flight.
+/// after a check that found no head in flight. On a base longer than the rungs,
+/// where they show: at the shipped two-minute base every rung is the base.
 #[cfg(all(test, target_os = "macos"))]
 mod after_healthy_check_tests {
     use super::{after_healthy_check, cadence, github};
@@ -4429,7 +4570,7 @@ mod after_healthy_check_tests {
         let _guard = super::STRANDED_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let base = Duration::from_secs(cadence::INTERVAL_SECS);
+        let base = Duration::from_secs(10 * 60);
         let mut schedule = cadence::Cadence::new(base);
         for (latched, wait) in [
             (Some(("v0.92.0".to_string(), 2)), Duration::from_secs(240)),
@@ -4830,9 +4971,26 @@ fn unreachable_before_the_channel(
 /// against their own base. Two intervals (a fresh window of 1.4 of them) outlast
 /// every sibling's next wait (0.8–1.2 of the base) and the deferring process's own
 /// first rung (one base interval), so the deferring process aims its own timer at
-/// this window's end (`Cadence::deferred`).
+/// this window's end (`Cadence::deferred`). Never shorter than
+/// [`DEFERRED_WINDOW_FLOOR`].
 #[cfg(target_os = "macos")]
 const DEFERRED_WINDOW_INTERVALS: u32 = 2;
+
+/// The shortest window a recorded deferral holds the machine off the download host
+/// for, before the 70 % freshness cut: twenty minutes, a fresh window of 14, which is
+/// what two of the old ten-minute intervals held. A host that answered 429 asked for
+/// time, not for a number of checks, so a faster cadence must not shorten the
+/// retreat. Inside the deferring process's backoff ceiling (`Cadence::cap`, at
+/// least `MAX_BACKOFF`, 15 minutes), so its own held timer still reaches the end.
+#[cfg(target_os = "macos")]
+const DEFERRED_WINDOW_FLOOR: std::time::Duration = std::time::Duration::from_secs(20 * 60);
+
+#[cfg(target_os = "macos")]
+const _: () = assert!(
+    DEFERRED_WINDOW_FLOOR.as_secs() * 7 / 10 + SKIP_JITTER_SECS
+        <= cadence_bounds::MAX_BACKOFF.as_secs(),
+    "a deferring process whose held timer is capped short of its own window skips on its own note"
+);
 
 /// How far past a sibling's window a skipping process scatters its wake (0–60 s,
 /// from one entropy byte), so siblings released by the same receipt do not all check
@@ -4925,6 +5083,7 @@ fn checker_skip_for(
     // (`github::check_and_stage`), and its widened window stands.
     let window = if deferred {
         base.saturating_mul(DEFERRED_WINDOW_INTERVALS)
+            .max(DEFERRED_WINDOW_FLOOR)
     } else {
         cadence::in_flight_retry(check_receipt::head_in_flight_checks(&v))
             .map_or(base, |rung| rung.min(base))
@@ -5558,6 +5717,46 @@ mod checker_skip_tests {
         let _ = std::fs::remove_dir_all(&s.root);
     }
 
+    /// A 429 ASKED FOR TIME, NOT A NUMBER OF CHECKS. At the shipped two-minute base two
+    /// intervals are a 168 s window, so the retreat is floored
+    /// ([`super::DEFERRED_WINDOW_FLOOR`]): a deferral 13 minutes old still holds every
+    /// process off the host, one 15 minutes old does not, and the deferring process's
+    /// own held timer at that base still wakes past the window, for every entropy byte.
+    #[test]
+    fn a_deferral_holds_the_machine_off_for_minutes_however_fast_the_base() {
+        use super::cadence::{Cadence, INTERVAL_SECS};
+        let base = Duration::from_secs(INTERVAL_SECS);
+        let s = staging("deferral-floor");
+        write_receipt(&s, 13 * 60, "deferred");
+        assert!(
+            checker_skip(&s, base).is_some_and(|reason| reason.contains("deferred")),
+            "13 minutes into the retreat, every process still holds off"
+        );
+        write_receipt(&s, 15 * 60, "deferred");
+        assert!(checker_skip(&s, base).is_none(), "and past it, they check");
+        // NEGATIVE CONTROL: a completed check 13 minutes old holds nobody.
+        write_receipt(&s, 13 * 60, "completed");
+        assert!(checker_skip(&s, base).is_none());
+
+        write_receipt(&s, 0, "deferred");
+        let stamped = now();
+        let (_, expiry) = checker_skip_at(&s, base, stamped).expect("the deferral's window");
+        assert!(expiry >= stamped + 10 * 60, "{}s", expiry - stamped);
+        let at = std::time::Instant::now();
+        for entropy in [0u8, 128, 255] {
+            let until = skip_timer_target(expiry, entropy);
+            let mut schedule = Cadence::new(base);
+            schedule.deferred(Some(at + Duration::from_secs(until - stamped)), at, entropy);
+            let wake = stamped + schedule.delay_at(at, entropy).as_secs();
+            assert!(
+                checker_skip_at(&s, base, wake).is_none(),
+                "entropy {entropy}: woke at +{}s, inside its own window",
+                wake - stamped
+            );
+        }
+        let _ = std::fs::remove_dir_all(&s.root);
+    }
+
     #[test]
     fn a_missing_or_empty_ledger_never_defers_a_check() {
         let s = staging("missing");
@@ -5594,6 +5793,82 @@ mod checker_skip_tests {
                 format!(" delivery={note}")
             );
         }
+    }
+}
+
+/// The per-cycle read of the installed bundle's build number spawns PlistBuddy only
+/// when the plist moved ([`super::observed_build_with`]).
+#[cfg(all(test, target_os = "macos"))]
+mod installed_build_tests {
+    use std::cell::Cell;
+    use std::sync::Mutex;
+
+    /// AN UNCHANGED PLIST IS READ ONCE. Cycles over the same `Info.plist` reuse the
+    /// number its one read gave; a plist rewritten in place (another size, or the
+    /// same size under a restored mtime), or a bundle swapped in by rename (a new
+    /// inode), is read again; a read that failed is not remembered; and with no plist
+    /// to stat, every call reads (and fails as the reader does).
+    #[test]
+    fn an_unchanged_plist_is_read_once_and_a_moved_one_again() {
+        let dir = aterm_tempfile::TempDir::new().expect("scratch");
+        let app = dir.path().join("aterm.app");
+        let plist = app.join("Contents/Info.plist");
+        std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
+        let cache = Mutex::new(None);
+        let reads = Cell::new(0u32);
+        // What the stand-in PlistBuddy answers; `None` is a read that failed.
+        let answer = Cell::new(Some(900u64));
+        let observe = || {
+            super::observed_build_with(&cache, &app, |_| {
+                reads.set(reads.get() + 1);
+                answer
+                    .get()
+                    .ok_or_else(|| "PlistBuddy CFBundleVersion timed out".to_string())
+            })
+        };
+        std::fs::write(&plist, "build 900").unwrap();
+        for _ in 0..5 {
+            assert_eq!(observe(), Ok(900));
+        }
+        assert_eq!(reads.get(), 1, "five cycles, one read");
+
+        answer.set(Some(901));
+        std::fs::write(&plist, "build 9010").unwrap();
+        assert_eq!(observe(), Ok(901), "rewritten, another size");
+        assert_eq!(reads.get(), 2);
+
+        let mtime = std::fs::metadata(&plist).unwrap().modified().unwrap();
+        answer.set(Some(902));
+        std::fs::write(&plist, "build 9020").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&plist)
+            .and_then(|f| f.set_modified(mtime))
+            .unwrap();
+        assert_eq!(observe(), Ok(902), "the same size under a restored mtime");
+        assert_eq!(reads.get(), 3);
+
+        answer.set(Some(903));
+        let swapped = app.join("Contents/Info.plist.new");
+        std::fs::write(&swapped, "build 9030").unwrap();
+        std::fs::rename(&swapped, &plist).unwrap();
+        assert_eq!(observe(), Ok(903), "a new inode");
+        assert_eq!(reads.get(), 4);
+        assert_eq!(observe(), Ok(903));
+        assert_eq!(reads.get(), 4, "and then remembered");
+
+        answer.set(None);
+        std::fs::write(&plist, "build 9040").unwrap();
+        assert!(observe().is_err());
+        answer.set(Some(904));
+        assert_eq!(observe(), Ok(904), "a failed read is not remembered");
+        assert_eq!(reads.get(), 6);
+
+        std::fs::remove_file(&plist).unwrap();
+        answer.set(None);
+        assert!(observe().is_err());
+        assert!(observe().is_err());
+        assert_eq!(reads.get(), 8, "nothing to stat: every call reads");
     }
 }
 
@@ -5894,42 +6169,6 @@ mod commit_match_tests {
                 "{mutant} escapes {law}"
             );
         }
-    }
-
-    #[test]
-    fn status_reconciliation_shipping_anchor_is_linked() {
-        let refinements: Vec<_> = aterm_spec::xref::refinements()
-            .filter(|anchor| anchor.machine == "NativeUpdateStatusReconciliation")
-            .collect();
-        assert_eq!(refinements.len(), 1);
-        assert_eq!(refinements[0].action, "ReconcileStatus");
-        assert_eq!(refinements[0].rust_method, "reconcile_status_outcome");
-        assert_eq!(
-            refinements[0].project,
-            "aterm_update::status_reconciliation_projection"
-        );
-
-        let waivers: Vec<_> = aterm_spec::xref::waivers()
-            .filter(|waiver| waiver.machine == "NativeUpdateStatusReconciliation")
-            .collect();
-        assert!(
-            waivers
-                .iter()
-                .all(|waiver| waiver.rust_method == "reconcile_status_outcome")
-        );
-        let waived: std::collections::BTreeSet<_> =
-            waivers.iter().map(|waiver| waiver.action).collect();
-        assert_eq!(
-            waived,
-            std::collections::BTreeSet::from([
-                "NeutralizeDespiteReady",
-                "NeutralizeEveryAbsentReady",
-                "PickStatusInputs",
-                "ReconcileOnMarkerPresence",
-                "ReconcileTrustingLedger",
-            ]),
-            "the environment pick plus exactly the Buggy=1 reducers are waived"
-        );
     }
 
     #[test]

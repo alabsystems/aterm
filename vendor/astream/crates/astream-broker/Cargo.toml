@@ -11,8 +11,9 @@ rust-version.workspace = true
 # Zero third-party dependencies — std only (threads, sync, UnixListener) plus the
 # in-tree wire vocabulary. The broker is a substrate crate, so forbid(unsafe).
 [features]
-# Off by default: enforce capabilities on the accept path. Pulls astream-cap
-# (and its vetted sha2), so the default broker stays zero-third-party.
+# Off by default: enforce capabilities on the accept path. Pulls astream-cap and
+# its SHA-256, astream-digest -- both in-tree, so even a `cap` broker takes no
+# third-party crate.
 cap = ["dep:astream-cap"]
 # Off by default: an XChaCha20-Poly1305-sealed TCP transport (serve_tcp_sealed /
 # Client::connect_tcp_sealed). Pulls astream-aead (and its vetted cipher), so the

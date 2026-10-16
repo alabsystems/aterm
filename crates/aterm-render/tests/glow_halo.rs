@@ -1,27 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// GLOW-HALO cursor-effect radial light on the CPU renderer
-// (`RenderInput.glow_halo`: the EMBERFORGE round embers / crown stream). The
-// contract under test:
-//   * an empty `glow_halo` (never touched, explicitly emptied, and
-//     pushed-then-cleared) is byte-identical to the pre-halo path, also after
-//     `clear_overlays` (the `image plain` contract) — the no-op law, held by
-//     the `glow_halo` row of `tests/empty_channels.rs`;
-//   * a halo renders with RADIALLY DECREASING luminance: the centre pixel is
-//     the brightest, samples toward the ellipse edge monotonically dim, and
-//     the light only ever brightens the base (premultiplied `add_sat`);
-//   * dirty gate: a settled stream (equal, non-empty) gate-hits; a moved halo
-//     sets `glow_halo_changed` and marks exactly its prev∪cur rows;
-//   * damaged path: an animating halo re-renders with no ghosting
-//     (cached == fresh, byte-for-byte) — the aurora discipline;
-//   * `HaloMode::Over` (EMBERFORGE P7, the light-theme veil): an Over halo
-//     DARKENS a white background at its centre where the same Add halo is
-//     INVISIBLE (the smoke-on-light-theme law); an Over halo with no falloff
-//     coverage is a byte no-op; an Add-only stream lands byte-for-byte on the
-//     historical `add_sat(premul_rgb(..))` math (the no-regression law); and
-//     a mixed stream composites every Add quad BEFORE every Over quad (the
-//     GPU's per-mode split order — `over_rgb(add_sat(..))`).
+// Cursor-effect radial light on the CPU renderer (`RenderInput.glow_halo`, the Emberforge
+// embers and crown). The empty-stream no-op is the `glow_halo` row of
+// `tests/empty_channels.rs`. Pinned here: radial falloff that only brightens; the dirty gate
+// (settled gate-hits, moved marks prev∪cur rows); no ghosting on the damaged path; and
+// `HaloMode::Over`, the light-theme veil: it darkens white where `Add` is invisible, is a
+// no-op without coverage, and composites after every Add quad (the GPU's per-mode order).
 
 use aterm_core::render::{HaloMode, RainHalo};
 use aterm_core::terminal::Terminal;
@@ -32,8 +17,7 @@ fn renderer() -> Renderer {
         .expect("no font: build with aterm-render's default embedded-font feature")
 }
 
-/// A single-row-band halo whose falloff centre is the quad centre — the
-/// simplest legal emission (the producer splits row-spanning halos into
+/// A single-row-band halo centred on its quad (the producer splits row-spanning halos into
 /// per-row quads sharing one centre).
 fn halo(row: u16, x: u16, y: u16, w: u16, h: u16, color: u32) -> RainHalo {
     RainHalo {
@@ -51,15 +35,13 @@ fn halo(row: u16, x: u16, y: u16, w: u16, h: u16, color: u32) -> RainHalo {
     }
 }
 
-/// The luminance proxy used by the radial samples: the summed RGB channels
-/// (monotone in every channel under additive light, so ordering is exact).
+/// Summed-RGB luminance proxy (monotone in every channel under additive light).
 fn luma(p: u32) -> u32 {
     ((p >> 16) & 0xff) + ((p >> 8) & 0xff) + (p & 0xff)
 }
 
-/// RADIAL LAW: the halo's luminance decreases monotonically from the centre
-/// toward the ellipse edge (sampled along the centre scanline), and additive
-/// light only ever brightens the base.
+/// Luminance decreases monotonically from the centre toward the ellipse edge along the
+/// centre scanline, and additive light only brightens the base.
 #[test]
 fn glow_halo_luminance_decreases_radially_from_centre() {
     let mut rend = renderer();
@@ -119,9 +101,8 @@ fn glow_halo_luminance_decreases_radially_from_centre() {
     }
 }
 
-/// DIRTY GATE: settled halos (equal, non-empty) gate-hit with nothing marked;
-/// a moved halo sets `glow_halo_changed` and marks exactly its prev∪cur rows
-/// — the aurora's prev∪cur discipline, radial edition.
+/// Settled halos (equal, non-empty) gate-hit with nothing marked; a moved halo sets
+/// `glow_halo_changed` and marks exactly its prev∪cur rows.
 #[test]
 fn glow_halo_dirty_gate_marks_prev_and_cur_rows() {
     let mut term = Terminal::new(6, 8);
@@ -156,8 +137,7 @@ fn glow_halo_dirty_gate_marks_prev_and_cur_rows() {
     assert!(d.is_gate_hit(), "settled glow_halo must gate-hit");
     assert!(dirty.iter().all(|&b| !b), "settled halos must mark no rows");
 
-    // The halo steps row 1 → row 4: prev AND cur rows must repaint (vacated
-    // light rebuilt fresh, new light landed), nothing else.
+    // The halo steps row 1 → row 4: prev and cur rows repaint, nothing else.
     let cur = frame(&[halo(4, 0, 64, 8, 16, 0x0010_2010)]);
     let DirtyDecision::Rows(d) =
         compute_dirty_rows(&prev, &cur, false, None, false, None, 16, &mut dirty)
@@ -176,10 +156,8 @@ fn glow_halo_dirty_gate_marks_prev_and_cur_rows() {
     );
 }
 
-/// NO-GHOSTING through the persistent damage cache: a halo animating across
-/// rows (and finally draining) must leave the cached-damaged framebuffer equal
-/// to a fresh full render after every step — byte-for-byte. The final drained
-/// frame doubles as the gate-hit check on the steady state.
+/// A halo animating across rows and then draining leaves the cached damaged framebuffer
+/// equal to a fresh full render after every step; a repeat of the drained frame gate-hits.
 #[test]
 fn damaged_path_no_ghosting_as_glow_halo_animates() {
     let mut rend = renderer();
@@ -230,9 +208,8 @@ fn damaged_path_no_ghosting_as_glow_halo_animates() {
     );
 }
 
-/// A calm LIGHT theme: white background, near-black ink — the frame every
-/// additive (brighten-only) effect is invisible on, i.e. the frame
-/// `HaloMode::Over` exists for.
+/// A light theme (white background, near-black ink): additive light is invisible on it, which
+/// is what `HaloMode::Over` is for.
 fn light_theme() -> Theme {
     Theme {
         fg: 0x0020_2020,
@@ -241,8 +218,8 @@ fn light_theme() -> Theme {
     }
 }
 
-/// The `RainHalo` integer falloff weight, restated independently of the
-/// renderer (window-pixel coords): `nsq = (dx²·256)/rx² + (dy²·256)/ry²`,
+/// The `RainHalo` integer falloff weight, restated independently of the renderer
+/// (window-pixel coords): `nsq = (dx²·256)/rx² + (dy²·256)/ry²`,
 /// `wt = clamp(((256 − nsq)²) / 256, 0, 255)`.
 fn falloff_weight(q: &RainHalo, pad: usize, x: usize, y: usize) -> u8 {
     let dx = x as i32 - (pad as i32 + q.cx as i32);
@@ -253,13 +230,10 @@ fn falloff_weight(q: &RainHalo, pad: usize, x: usize, y: usize) -> u8 {
     ((wt * wt) / 256).min(255) as u8
 }
 
-/// THE SMOKE-ON-LIGHT-THEME LAW: over a WHITE background an `Over` veil
-/// DARKENS the frame — most at its centre (which lands the veil colour
-/// EXACTLY: the falloff weight is 255 there, and `over_rgb` at full coverage
-/// is the source colour), monotonically recovering toward white along the
-/// scanline — while the SAME halo as `Add` is byte-invisible (you cannot
-/// brighten white into smoke; `add_sat` saturates). Nothing outside the
-/// veil's row band changes.
+/// Over a white background an `Over` veil darkens the frame: at its centre it lands the veil
+/// colour exactly (weight 255, and `over_rgb` at full coverage is the source), recovering
+/// monotonically toward white, while the same halo as `Add` is byte-invisible (`add_sat`
+/// saturates). Nothing outside the veil's row band changes.
 #[test]
 fn over_halo_darkens_white_background_where_add_is_invisible() {
     let mut rend = Renderer::from_system(18.0, light_theme())
@@ -290,8 +264,7 @@ fn over_halo_darkens_white_background_where_add_is_invisible() {
         luma(centre) < luma(base[cy * f.width + cx]),
         "an Over veil must DARKEN a white background at its centre"
     );
-    // Monotone recovery toward white along the centre scanline: each step
-    // outward is no darker than the last, and never darker than the centre.
+    // Monotone recovery toward white along the centre scanline.
     let mut prev = luma(centre);
     for dx in 1..q.rx as usize {
         let cur = luma(f.pixels[cy * f.width + cx + dx]);
@@ -309,8 +282,8 @@ fn over_halo_darkens_white_background_where_add_is_invisible() {
         }
     }
 
-    // The FOIL: the same halo as Add-mode light is INVISIBLE on white —
-    // `add_sat` cannot leave 0xFFFFFF — which is precisely why Over exists.
+    // Foil: the same halo as Add is invisible on white, since `add_sat` cannot leave
+    // 0xFFFFFF.
     let mut add_input = term.cell_frame(3, 10);
     add_input.glow_halo = vec![RainHalo {
         mode: HaloMode::Add,
@@ -323,10 +296,8 @@ fn over_halo_darkens_white_background_where_add_is_invisible() {
     );
 }
 
-/// NO-COVERAGE NO-OP LAW: an `Over` quad whose rect lies entirely at (or
-/// beyond) the falloff ellipse edge — weight 0 on every covered pixel —
-/// leaves the frame byte-identical (the GPU twin blends `dst·(1−0)` there,
-/// also a no-op).
+/// An `Over` quad lying entirely at or beyond the falloff ellipse edge (weight 0 on every
+/// covered pixel) leaves the frame byte-identical; the GPU blends `dst·(1−0)` there.
 #[test]
 fn over_halo_with_zero_coverage_is_a_noop() {
     let mut rend = Renderer::from_system(18.0, light_theme())
@@ -336,8 +307,8 @@ fn over_halo_with_zero_coverage_is_a_noop() {
     term.process(b"\x1b[?25lzero coverage");
     let base = rend.render_input(&term.cell_frame(3, 10)).pixels.clone();
 
-    // Centre at the band's left edge with rx = cw; the quad starts at
-    // x = cx + rx, so every covered pixel has dx >= rx -> nsq >= 256 -> wt 0.
+    // Centre at the band's left edge with rx = cw; the quad starts at x = cx + rx, so every
+    // covered pixel has dx >= rx -> nsq >= 256 -> wt 0.
     let q = RainHalo {
         row: 1,
         x: (2 * cw) as u16,
@@ -360,11 +331,9 @@ fn over_halo_with_zero_coverage_is_a_noop() {
     );
 }
 
-/// THE NO-REGRESSION LAW: `HaloMode` defaults to `Add`, and an Add-only
-/// stream lands byte-for-byte on the HISTORICAL math — every covered pixel is
-/// exactly `add_sat(base, premul_rgb(color, wt))` with the integer falloff
-/// weight restated independently here — so frames that never mention the new
-/// field are byte-identical to the pre-`HaloMode` renderer.
+/// `HaloMode` defaults to `Add`, and an Add-only stream is exactly
+/// `add_sat(base, premul_rgb(color, wt))` per covered pixel, with the falloff weight
+/// restated independently here.
 #[test]
 fn add_only_stream_matches_the_historical_math_byte_for_byte() {
     assert_eq!(
@@ -409,11 +378,9 @@ fn add_only_stream_matches_the_historical_math_byte_for_byte() {
     }
 }
 
-/// MODE-SWEEP ORDER LAW: within one stream every Add quad composites BEFORE
-/// every Over quad — REGARDLESS of emission order — matching the GPU's
-/// per-mode split draws (the veil dims the ember, never vice versa). Pinned
-/// with an Over veil emitted FIRST but sharing its geometry with an Add
-/// ember: every covered pixel must equal `over_rgb(add_sat(base, ..), ..)`.
+/// Within one stream every Add quad composites before every Over quad, whatever the
+/// emission order, matching the GPU's per-mode split draws: with an Over veil emitted first
+/// over an Add ember's geometry, every covered pixel is `over_rgb(add_sat(base, ..), ..)`.
 #[test]
 fn mixed_stream_composites_add_before_over() {
     let mut rend = renderer();

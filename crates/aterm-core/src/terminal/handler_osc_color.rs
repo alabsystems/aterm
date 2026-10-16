@@ -9,15 +9,13 @@
 use super::handler::TerminalHandler;
 use aterm_types::{ColorPalette, Rgb};
 
-/// Per-sequence response cap for OSC palette queries when no
-/// [`PolicyEngine`][pe] is installed.
+/// Per-sequence response cap for OSC 4 / OSC 21 palette queries when no
+/// [`PolicyEngine`][pe] is installed (with one, the cap and cross-sequence
+/// throttle come from its `"palette"` rate limit).
 ///
-/// One OSC 4 / OSC 21 sequence can embed many `;idx;?` pairs, and the response
-/// rate limiter bounds only total output, so this caps single-sequence
-/// amplification. Pairs past the cap are dropped silently. 16 covers
-/// legitimate palette inspectors while bounding a 256-index query to ~320
-/// bytes. With a policy engine installed, the cap and cross-sequence throttle
-/// come from `engine.rate_limit_config("palette")`.
+/// The response rate limiter bounds only total output, so this caps one
+/// sequence's `;idx;?` amplification; pairs past it are dropped. 16 covers
+/// palette inspectors while bounding a 256-index query to ~320 bytes.
 ///
 /// [pe]: aterm_policy::engine::PolicyEngine
 pub(super) const LEGACY_PALETTE_PER_SEQUENCE_MAX: usize = 16;
@@ -111,11 +109,8 @@ impl TerminalHandler<'_> {
             .unwrap_or(true)
     }
 
-    /// Handle OSC 4 - color palette manipulation.
-    ///
-    /// Format: `OSC 4 ; index ; spec ST`
-    /// - To set: `OSC 4 ; index ; color-spec ST` (e.g., `OSC 4 ; 1 ; rgb:ff/00/00 ST`)
-    /// - To query: `OSC 4 ; index ; ? ST` (terminal responds with current color)
+    /// Handle OSC 4 (`OSC 4 ; index ; spec ST`, pairs repeating): set a palette
+    /// entry, or query it with `?`.
     pub(super) fn handle_osc_4(
         &mut self,
         cap: &super::response_capability::ResponseCapability,
@@ -160,8 +155,8 @@ impl TerminalHandler<'_> {
                     i += 2;
                     continue;
                 }
-                // Answer with the request's terminator (BEL vs ST), as xterm does.
-                let color = self.color.palette.get(index);
+                // Replies echo the request's terminator (BEL vs ST), as xterm's do.
+                let color = self.color.palette().get(index);
                 let st = if self.transient.last_osc_bel_terminated {
                     "\x07"
                 } else {
@@ -176,37 +171,32 @@ impl TerminalHandler<'_> {
                 self.send_response(cap, response.as_bytes());
                 responses_emitted += 1;
             } else {
-                // Set: gated by `modes.allow_palette_reconfigure` (default off),
-                // so by default a program cannot recolor the 256-entry palette.
-                // Queries above stay ungated.
-                if self.modes.allow_palette_reconfigure
-                    && let Some(color) = ColorPalette::parse_color_spec(spec)
-                {
-                    self.color.palette.set(index, color);
-                    self.fire_color_change_callback(
-                        super::ColorTarget::Palette,
-                        color,
-                        super::ColorChangeOp::Set,
-                    );
+                // Set: gated by `modes.allow_palette_reconfigure` (default off);
+                // queries above stay ungated. A refused set is reported to the
+                // host once per session; an invalid spec is ignored. Sets emit
+                // no PTY response.
+                if let Some(color) = ColorPalette::parse_color_spec(spec) {
+                    if self.modes.allow_palette_reconfigure {
+                        self.color.palette_mut().set(index, color);
+                        self.fire_color_change_callback(
+                            super::ColorTarget::Palette,
+                            color,
+                            super::ColorChangeOp::Set,
+                        );
+                    } else {
+                        self.note_palette_set_refused();
+                    }
                 }
-                // Invalid color specs (or set-while-disabled) are silently
-                // ignored — no PTY response is emitted for set ops anyway.
             }
 
             i += 2;
         }
     }
 
-    /// Handle OSC 10/11/12: foreground, background and cursor colors.
-    ///
-    /// Multiple specs cascade: OSC 10 with several sets foreground, then
-    /// background, then cursor; OSC 11 sets background, then cursor.
-    ///
-    /// - `start_at = 0`: start with foreground (OSC 10)
-    /// - `start_at = 1`: start with background (OSC 11)
-    /// - `start_at = 2`: start with cursor (OSC 12)
-    ///
-    /// A query `OSC N ; ? ST` answers `OSC N ; rgb:RRRR/GGGG/BBBB ST`.
+    /// Handle OSC 10/11/12 (foreground, background, cursor): `start_at` 0, 1 or
+    /// 2 picks the first slot and further specs cascade to the next (OSC 10 with
+    /// several sets fg, then bg, then cursor). `?` answers
+    /// `OSC N ; rgb:RRRR/GGGG/BBBB ST`.
     pub(super) fn handle_osc_10_11_12(
         &mut self,
         cap: &super::response_capability::ResponseCapability,
@@ -237,7 +227,6 @@ impl TerminalHandler<'_> {
                     .and_then(|cb| cb(slot.color_target()))
                     .unwrap_or(palette_color);
                 let osc_code = 10 + color_index;
-                // Match request terminator (BEL vs ST) per xterm behavior.
                 let st = if self.transient.last_osc_bel_terminated {
                     "\x07"
                 } else {
@@ -258,13 +247,9 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// Handle OSC 19 - selection foreground color.
-    ///
-    /// Set format: `OSC 19 ; color-spec ST`.
-    /// Query format: `OSC 19 ; ? ST`; the response uses the request's BEL/ST
-    /// terminator, matching xterm's dynamic-color query contract. When no
-    /// explicit selection foreground is active, report the default foreground
-    /// as the single-color protocol fallback for the renderer's automatic mode.
+    /// Handle OSC 19, the selection foreground (`OSC 19 ; spec ST`; `?` queries,
+    /// answered with the request's terminator). With no explicit selection
+    /// foreground the query reports the default foreground.
     pub(super) fn handle_osc_19(
         &mut self,
         cap: &super::response_capability::ResponseCapability,
@@ -300,18 +285,12 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// Handle OSC 21 - Extended color queries (kitty protocol).
-    ///
-    /// Format: `OSC 21 ; key=value ; key=value ST`
-    ///
-    /// Keys can be named colors (`foreground`, `background`, `cursor`,
-    /// `selection_background`, `selection_foreground`) or indexed palette
-    /// entries (`0-255`).
-    ///
-    /// Query format: `key=?` responds with `key=rgb:RRRR/GGGG/BBBB`,
-    /// `key=` for a known dynamic/undefined value, or `key=?` for an
-    /// unrecognized key. An empty value selects dynamic behavior where
-    /// supported; a bare key resets it to the host-configured default.
+    /// Handle OSC 21, kitty's extended colors (`OSC 21 ; key=value ; ... ST`).
+    /// Keys name `foreground`, `background`, `cursor`, `selection_background`,
+    /// `selection_foreground` or a palette index `0-255`. `key=?` answers
+    /// `key=rgb:...`, `key=` (known but dynamic/undefined) or `key=?` (unknown);
+    /// an empty value selects dynamic behavior where supported; a bare key
+    /// resets to the host-configured default.
     pub(super) fn handle_osc_21(
         &mut self,
         cap: &super::response_capability::ResponseCapability,
@@ -347,8 +326,6 @@ impl TerminalHandler<'_> {
                 if query_pairs.len() >= per_seq_cap {
                     continue;
                 }
-                // Cross-sequence rate limit via the policy engine's `"palette"`
-                // bucket; a denial drops this pair.
                 if !self.palette_rate_limit_consume_one() {
                     continue;
                 }
@@ -358,11 +335,10 @@ impl TerminalHandler<'_> {
                         query_pairs.push(format!("{key}={spec}"));
                     }
                     Osc21QueryValue::Undefined => query_pairs.push(format!("{key}=")),
-                    // Kitty's protocol answers an unknown key with `key=?`,
-                    // and that echo is the one reply here that carries bytes
-                    // the terminal did not produce: echo only a key spelled
-                    // like a real one, so DEL, spaces or punctuation never
-                    // reach the shell's input.
+                    // Kitty answers an unknown key with `key=?`, the one reply
+                    // carrying bytes the terminal did not produce: echo only a
+                    // key spelled like a real one, so no DEL, space or
+                    // punctuation reaches the shell's input.
                     Osc21QueryValue::Unknown if osc_21_key_is_echoable(key) => {
                         query_pairs.push(format!("{key}=?"));
                     }
@@ -382,7 +358,6 @@ impl TerminalHandler<'_> {
         }
 
         if !query_pairs.is_empty() {
-            // Match request terminator (BEL vs ST) per xterm behavior.
             let st = if self.transient.last_osc_bel_terminated {
                 "\x07"
             } else {
@@ -395,9 +370,7 @@ impl TerminalHandler<'_> {
 
     fn osc_21_query_color(&mut self, key: &str) -> Osc21QueryValue {
         if let Some(slot) = DynamicColorSlot::from_name(key) {
-            // Consult host query_callback for dynamic colors, matching
-            // OSC 10/11/12 behavior. The host may override the reported
-            // color (e.g., when the UI layer uses a different theme).
+            // The host's query callback may override, as for OSC 10/11/12.
             let palette_color = self.get_dynamic_color(slot);
             if let Some(color) = self
                 .color
@@ -430,7 +403,7 @@ impl TerminalHandler<'_> {
         let Ok(index) = key.parse::<u8>() else {
             return Osc21QueryValue::Unknown;
         };
-        Osc21QueryValue::Color(self.color.palette.get(index))
+        Osc21QueryValue::Color(self.color.palette().get(index))
     }
 
     /// Select a dynamic/undefined value for the OSC 21 fields that support it.
@@ -488,7 +461,7 @@ impl TerminalHandler<'_> {
         } else {
             ColorPalette::new().get(index)
         };
-        self.color.palette.set(index, color);
+        self.color.palette_mut().set(index, color);
         self.fire_color_change_callback(
             super::ColorTarget::Palette,
             color,
@@ -498,14 +471,11 @@ impl TerminalHandler<'_> {
 
     fn osc_21_set_color(&mut self, key: &str, color: Rgb) {
         if let Some(slot) = DynamicColorSlot::from_name(key) {
-            // Named dynamic-color slots are not gated: they go through the
-            // host's set_dynamic_color callback, not the indexed palette.
+            // Only the indexed palette is gated; named colors are theme surface.
             self.set_dynamic_color(slot, color);
             return;
         }
         if key.eq_ignore_ascii_case("selection_background") {
-            // Selection background is theme surface, not the indexed palette:
-            // ungated like the dynamic colors.
             self.color.selection_background = Some(color);
             self.fire_color_change_callback(
                 super::ColorTarget::SelectionBackground,
@@ -524,12 +494,12 @@ impl TerminalHandler<'_> {
             return;
         }
         if let Ok(index) = key.parse::<u8>() {
-            // Numeric index: this is a reconfigure of a palette slot.
-            // Gated by allow_palette_reconfigure (fail-closed).
+            // A palette slot: gated by allow_palette_reconfigure (fail-closed).
             if !self.modes.allow_palette_reconfigure {
+                self.note_palette_set_refused();
                 return;
             }
-            self.color.palette.set(index, color);
+            self.color.palette_mut().set(index, color);
             self.fire_color_change_callback(
                 super::ColorTarget::Palette,
                 color,
@@ -545,10 +515,11 @@ impl TerminalHandler<'_> {
     pub(super) fn handle_osc_104(&mut self, params: &[&[u8]]) {
         if params.len() <= 1 {
             // No indices: reset all to the theme palette, else xterm defaults.
-            if let Some(ref configured) = self.color.configured_palette {
-                self.color.palette = configured.clone();
+            let configured = self.color.configured_palette.clone();
+            if let Some(configured) = configured {
+                *self.color.palette_mut() = configured;
             } else {
-                self.color.palette.reset();
+                self.color.palette_mut().reset();
             }
         } else {
             // The callback fires only if at least one index was valid.
@@ -557,10 +528,15 @@ impl TerminalHandler<'_> {
                 if let Ok(index_str) = std::str::from_utf8(param)
                     && let Ok(index) = index_str.parse::<u8>()
                 {
-                    if let Some(ref configured) = self.color.configured_palette {
-                        self.color.palette.set(index, configured.get(index));
+                    let configured_color = self
+                        .color
+                        .configured_palette
+                        .as_ref()
+                        .map(|configured| configured.get(index));
+                    if let Some(color) = configured_color {
+                        self.color.palette_mut().set(index, color);
                     } else {
-                        self.color.palette.reset_color(index);
+                        self.color.palette_mut().reset_color(index);
                     }
                     any_reset = true;
                 }
@@ -569,7 +545,6 @@ impl TerminalHandler<'_> {
                 return;
             }
         }
-        // Notify UI that palette colors changed.
         self.fire_color_change_callback(
             super::ColorTarget::Palette,
             Rgb { r: 0, g: 0, b: 0 },
@@ -580,56 +555,51 @@ impl TerminalHandler<'_> {
     /// Handle OSC 30001: push the color state (256-color palette, default
     /// fg/bg, cursor, selection bg/fg) onto the kitty color stack, max depth
     /// 16, dropping the oldest entry when full.
+    ///
+    /// The entry is the program's diff from the configured baseline, not the
+    /// absolute colors, so a pop after a theme switch lands on the new theme.
     pub(super) fn handle_osc_30001(&mut self) {
         use super::callbacks::COLOR_STACK_MAX_DEPTH;
-        use super::grouped_state::ColorStackEntry;
 
         if self.color.stack.len() >= COLOR_STACK_MAX_DEPTH {
             self.color.stack.pop_front();
         }
-
-        self.color.stack.push_back(ColorStackEntry {
-            palette: self.color.palette.clone(),
-            default_foreground: self.color.default_foreground,
-            default_background: self.color.default_background,
-            cursor_color: self.color.cursor_color,
-            selection_background: self.color.selection_background,
-            selection_foreground: self.color.selection_foreground,
-        });
+        let entry = self.color.capture_overrides();
+        self.color.stack.push_back(entry);
     }
 
     /// Handle OSC 30101: pop the kitty color stack and restore all dynamic
-    /// colors; a no-op when empty.
+    /// colors to the baseline plus the popped diff; a no-op when empty.
+    ///
+    /// The palette is restored only under `allow_palette_reconfigure`, like
+    /// OSC 4/21 sets: a pop is a program writing the palette too.
     pub(super) fn handle_osc_30101(&mut self) {
         if let Some(entry) = self.color.stack.pop_back() {
-            self.color.palette = entry.palette;
-            self.color.default_foreground = entry.default_foreground;
-            self.color.default_background = entry.default_background;
-            self.color.cursor_color = entry.cursor_color;
-            self.color.selection_background = entry.selection_background;
-            self.color.selection_foreground = entry.selection_foreground;
+            let palette = self.modes.allow_palette_reconfigure;
+            self.color.restore_baseline(palette);
+            self.color.apply_overrides(&entry, palette);
+            let (fg, bg) = (self.color.default_foreground, self.color.default_background);
 
-            // Notify UI that palette was bulk-restored from stack.
-            self.fire_color_change_callback(
-                super::ColorTarget::Palette,
-                Rgb { r: 0, g: 0, b: 0 },
-                super::ColorChangeOp::Set,
-            );
-            // Notify UI that dynamic colors were restored.
+            if palette {
+                self.fire_color_change_callback(
+                    super::ColorTarget::Palette,
+                    Rgb { r: 0, g: 0, b: 0 },
+                    super::ColorChangeOp::Set,
+                );
+            }
             self.fire_color_change_callback(
                 super::ColorTarget::Foreground,
-                entry.default_foreground,
+                fg,
                 super::ColorChangeOp::Set,
             );
             self.fire_color_change_callback(
                 super::ColorTarget::Background,
-                entry.default_background,
+                bg,
                 super::ColorChangeOp::Set,
             );
-            // Notify the UI of the restored cursor color, keeping the explicit
-            // vs dynamic distinction: reporting a dynamic cursor as
+            // Keep explicit vs dynamic: reporting a dynamic cursor as
             // `Set(foreground)` would freeze renderers on that foreground.
-            if let Some(cursor_color) = entry.cursor_color {
+            if let Some(cursor_color) = self.color.cursor_color {
                 self.fire_color_change_callback(
                     super::ColorTarget::Cursor,
                     cursor_color,
@@ -642,9 +612,8 @@ impl TerminalHandler<'_> {
                     super::ColorChangeOp::Dynamic,
                 );
             }
-            // Notify the UI of the restored selection background; a saved None
-            // is dynamic, not a reset to the configured baseline.
-            if let Some(sel_bg) = entry.selection_background {
+            // A None selection background is dynamic, not a reset.
+            if let Some(sel_bg) = self.color.selection_background {
                 self.fire_color_change_callback(
                     super::ColorTarget::SelectionBackground,
                     sel_bg,
@@ -657,10 +626,8 @@ impl TerminalHandler<'_> {
                     super::ColorChangeOp::Dynamic,
                 );
             }
-            // Selection foreground is an independent dynamic color (OSC 19).
-            // Restore it alongside the selection background so a color-stack
-            // round trip cannot leave the renderer on the post-push value.
-            if let Some(sel_fg) = entry.selection_foreground {
+            // Selection foreground (OSC 19) likewise.
+            if let Some(sel_fg) = self.color.selection_foreground {
                 self.fire_color_change_callback(
                     super::ColorTarget::SelectionForeground,
                     sel_fg,
@@ -695,7 +662,6 @@ impl TerminalHandler<'_> {
                 .color
                 .selection_background
                 .unwrap_or(self.color.default_background);
-            // Match request terminator (BEL vs ST) per xterm behavior.
             let st = if self.transient.last_osc_bel_terminated {
                 "\x07"
             } else {
@@ -796,17 +762,32 @@ impl TerminalHandler<'_> {
         self.fire_color_change_callback(slot.color_target(), color, super::ColorChangeOp::Reset);
     }
 
-    /// Fire the color change callback if one is registered.
+    /// Record a palette set (OSC 4, numeric OSC 21) refused by the
+    /// `allow_palette_reconfigure` gate. Only the session's first refusal calls
+    /// the host's `palette_refused_callback` (a theme script sends dozens), so
+    /// a theme tool that silently did nothing (base16-shell, pywal, `theme.sh`)
+    /// can be traced.
+    fn note_palette_set_refused(&mut self) {
+        if self.color.palette_set_refused {
+            return;
+        }
+        self.color.palette_set_refused = true;
+        if let Some(callback) = self.color.palette_refused_callback.as_mut() {
+            callback();
+        }
+    }
+
+    /// Record a color change (snapshot authority, full damage) and fire the
+    /// change callback if one is registered.
     pub(super) fn fire_color_change_callback(
         &mut self,
         target: super::ColorTarget,
         color: Rgb,
         op: super::ColorChangeOp,
     ) {
-        // After an OSC color mutation or reset the affected terminal color is
-        // authoritative for owned render snapshots; `Terminal::new` leaves these
-        // channels unset so a standalone renderer can use its own theme. The
-        // cursor-dynamic policy has its own flag.
+        // Once OSC touches a color, the terminal's value is authoritative for
+        // owned render snapshots; `Terminal::new` leaves these unset so a
+        // standalone renderer can use its own theme.
         match target {
             super::ColorTarget::Foreground => {
                 self.color.frame_foreground_authoritative = true;
@@ -819,10 +800,8 @@ impl TerminalHandler<'_> {
             }
             _ => {}
         }
-        // A color set or reset recolors painted cells without changing content,
-        // so mark full grid damage (like DECSCNM). This advances `damage_epoch`,
-        // so a recolor with no grid write is still presented. Queries never
-        // reach here.
+        // A recolor changes painted cells without changing content: mark full
+        // damage (like DECSCNM) so it advances `damage_epoch` and is presented.
         self.grid.damage_mut().mark_full();
         if let Some(ref mut cb) = self.color.change_callback {
             cb(target, color, op);
@@ -832,13 +811,9 @@ impl TerminalHandler<'_> {
 
 #[cfg(test)]
 mod osc_color_response_cap_tests {
-    //! The per-sequence response cap on OSC palette queries: a sequence like
-    //! `ESC]4;0;?;1;?;...;255;?ST` must not emit one response per pair, while
-    //! small legitimate batches are untouched.
-    //!
-    //! The parser already truncates OSC sequences at 16 params
-    //! (`MAX_OSC_PARAMS`), so these tests call the handler directly via
-    //! `split_for_process` to feed more params and exercise the cap.
+    //! The per-sequence response cap on OSC palette queries. The parser stops at
+    //! 16 OSC params (`MAX_OSC_PARAMS`), so these tests call the handler
+    //! directly via `split_for_process` to feed more.
     use super::LEGACY_PALETTE_PER_SEQUENCE_MAX;
     use crate::terminal::Terminal;
     use crate::terminal::response_capability::ResponseCapability;
@@ -873,8 +848,7 @@ mod osc_color_response_cap_tests {
     }
 
     /// A 256-pair OSC 4 query emits at most `LEGACY_PALETTE_PER_SEQUENCE_MAX`
-    /// response frames. Calls `handle_osc_4` directly to bypass the parser's
-    /// param limit.
+    /// response frames.
     #[test]
     fn osc_4_query_256_pairs_capped_at_per_sequence_limit() {
         let mut term = Terminal::new(24, 80);
@@ -1014,7 +988,6 @@ mod osc_color_response_cap_tests {
     #[test]
     fn osc_recolor_with_no_glyph_marks_damage_and_advances_epoch() {
         let mut term = Terminal::new(24, 80);
-        // Paint a glyph, then consume the damage (as a real present does).
         term.process(b"X");
         term.take_damage();
         let epoch0 = term.damage_epoch();
@@ -1036,17 +1009,10 @@ mod osc_color_response_cap_tests {
         );
     }
 
-    /// Cursor-state escapes mark cursor-scoped damage, never the whole grid.
-    ///
-    /// DECTCEM, DECSCUSR and DEC mode 12 change only the cursor's appearance.
-    /// They must advance `damage_epoch` (a bare DECTCEM writes no cell), but
-    /// marking the whole grid would re-stamp every `row_rev` and force a
-    /// whole-screen raster (ncurses `curs_set()` sends `\E[?12l\E[?25h` under
-    /// `xterm-256color`).
-    ///
-    /// The vacated row is `aterm-render`'s job: its cursor diff marks both the
-    /// previous and current cursor rows, which keeps scoping safe across a
-    /// move, the case pinned here.
+    /// Cursor-state escapes (DECTCEM, DECSCUSR, DEC mode 12) advance
+    /// `damage_epoch` but never mark the whole grid, which would force a
+    /// whole-screen raster (ncurses `curs_set()` sends `\E[?12l\E[?25h`). The
+    /// vacated row is `aterm-render`'s job: its cursor diff marks both rows.
     #[test]
     fn cursor_state_escapes_damage_the_cursor_cell_not_the_whole_grid() {
         let mut term = Terminal::new(24, 80);
@@ -1094,8 +1060,8 @@ mod osc_color_response_cap_tests {
             "DECSCUSR must NOT mark the whole grid"
         );
 
-        // DEC mode 12, the other half of terminfo's `cnorm`. The cursor is a steady
-        // bar here, so enabling blink is a real style change and must mark damage.
+        // DEC mode 12 (the other half of terminfo's `cnorm`): the cursor is a
+        // steady bar, so enabling blink is a real change.
         term.take_damage();
         let e3 = term.damage_epoch();
         term.process(b"\x1b[?12h");
@@ -1110,9 +1076,8 @@ mod osc_color_response_cap_tests {
         );
     }
 
-    /// OSC 19 is a real dynamic color, not merely a transient callback event:
-    /// persist it for render snapshots, answer xterm-style queries with the
-    /// request terminator, and clear it through OSC 119.
+    /// OSC 19 is stored for render snapshots, answers queries with the request
+    /// terminator and is cleared by OSC 119.
     #[test]
     fn osc_19_selection_foreground_set_query_and_reset_are_stateful() {
         let mut term = Terminal::new(4, 8);
@@ -1166,9 +1131,8 @@ mod osc_color_response_cap_tests {
         assert_eq!(term.take_response(), Some(expected));
     }
 
-    /// Kitty OSC 21 has three distinct query results: concrete, known but
-    /// dynamic/undefined, and unknown. In particular, a fresh terminal's
-    /// selection/cursor fields must be echoed as empty rather than omitted.
+    /// OSC 21 queries distinguish concrete, known-but-undefined (empty) and
+    /// unknown (`?`) fields; a fresh terminal's selection/cursor fields are empty.
     #[test]
     fn osc_21_queries_report_undefined_and_unknown_fields() {
         let mut term = Terminal::new(4, 8);
@@ -1207,8 +1171,7 @@ mod osc_color_response_cap_tests {
         assert_eq!(term.take_response(), None, "nothing echoable, no reply");
     }
 
-    /// A host query callback remains authoritative even when the core cursor
-    /// state is dynamic: OSC 21 reports the explicit color the host renders.
+    /// A host query callback wins over a dynamic core cursor.
     #[test]
     fn osc_21_dynamic_cursor_query_honors_host_override() {
         let mut term = Terminal::new(4, 8);
@@ -1226,9 +1189,8 @@ mod osc_color_response_cap_tests {
         assert_eq!(term.take_response(), Some(expected));
     }
 
-    /// Empty OSC 21 values select dynamic behavior, while bare keys reset to
-    /// the host-configured baseline. These are intentionally different when a
-    /// theme supplies explicit cursor/selection colors.
+    /// Empty OSC 21 values select dynamic behavior; bare keys reset to the
+    /// host-configured baseline.
     #[test]
     fn osc_21_empty_values_are_dynamic_and_bare_keys_reset() {
         use std::sync::{Arc, Mutex};
@@ -1298,16 +1260,14 @@ mod osc_color_response_cap_tests {
         );
     }
 
-    /// A bare numeric key is the OSC 21 spelling of an indexed-color reset,
-    /// not a SET. Like OSC 104 it remains available under the default policy
-    /// that blocks palette reconfiguration.
+    /// A bare numeric key is an indexed-color reset, not a SET: like OSC 104 it
+    /// works while palette reconfiguration is blocked.
     #[test]
     fn osc_21_bare_numeric_key_resets_without_set_permission() {
         let mut term = Terminal::new(4, 8);
         let default = term.palette_color_components(42);
 
-        // Seed a changed value through a host-side config, avoiding the
-        // fail-closed wire SET gate that this reset must not inherit.
+        // Seed through host config, not the wire SET gate.
         let mut palette = aterm_types::ColorPalette::new();
         palette.set(42, aterm_types::Rgb::new(0xaa, 0xbb, 0xcc));
         let mut config = crate::config::TerminalConfig::default();
@@ -1335,9 +1295,8 @@ mod osc_color_response_cap_tests {
         assert_eq!(term.palette_color_components(42), default);
     }
 
-    /// Color-stack pop must preserve a saved dynamic cursor as dynamic. The
-    /// callback receives Dynamic rather than an explicit Set(foreground), which
-    /// would freeze a host renderer on the transient foreground value.
+    /// Color-stack pop reports a saved dynamic cursor as Dynamic, not
+    /// Set(foreground), which would freeze a host renderer on that foreground.
     #[test]
     fn color_stack_pop_reports_dynamic_cursor_as_dynamic() {
         use std::sync::{Arc, Mutex};
@@ -1371,8 +1330,8 @@ mod osc_color_response_cap_tests {
         );
     }
 
-    /// Kitty's color stack snapshots the complete selection palette. Restoring
-    /// only the background leaves selected glyph ink on a post-push value.
+    /// A color-stack round trip restores both selection colors: restoring only
+    /// the background leaves selected glyph ink on a post-push value.
     #[test]
     fn color_stack_round_trip_restores_both_selection_colors() {
         let mut term = Terminal::new(4, 8);

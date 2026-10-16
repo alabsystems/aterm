@@ -1,40 +1,27 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The first-party macOS CPU presenter: a `CALayer` whose `contents` is a
-//! `CGImage` built over the frame buffer, without `softbuffer`,
-//! `objc2-quartz-core` or `objc2-core-graphics`.
+//! The macOS CPU presenter: a `CALayer` whose `contents` is a `CGImage` built
+//! over the frame buffer, through hand-written CoreGraphics/QuartzCore FFI.
 //!
 //! Each present wraps the pixel words in a `CGDataProvider`, builds a 32bpp
 //! `CGImage` over them, and assigns it to a sublayer's `contents` inside a
-//! `CATransaction` with actions disabled, the same CoreGraphics calls in the
-//! same order as `softbuffer`'s CG backend, so the pixels are identical. Layer
-//! geometry is synced directly ([`MacCpuPresenter::sync_layer_geometry`])
-//! instead of through a KVO observer: `aterm-gui` calls [`CpuPresenter::resize`]
-//! on every present, the sync is change-gated, and no observer registration
-//! can dangle.
+//! `CATransaction` with actions disabled: the calls and order of `softbuffer`'s
+//! CG backend, so the pixels match it. Layer geometry is synced at each commit
+//! ([`MacCpuPresenter::sync_layer_geometry`], change-gated) rather than by a KVO
+//! observer, so no observer registration can dangle.
 //!
-//! Three properties matter:
+//! 1. **A fresh, zeroed buffer per acquisition.** CoreAnimation may read the
+//!    bytes after `commit` returns, so a retained buffer would tear;
+//!    CoreGraphics frees each one with the last image reference.
+//! 2. **`age()` is always 0**, so the frontend's `age() == 1` partial-copy path
+//!    (`app_render.rs`) is never taken.
+//! 3. **`present_with_damage` commits the same pixels as `present`**: a
+//!    `CALayer`'s `contents` is a whole-image property.
 //!
-//! 1. **A fresh, zeroed buffer per acquisition.** [`CpuPresenter::buffer_mut`]
-//!    allocates `vec![0; width * height]`, and [`CpuFrameBuffer::present`]
-//!    hands it to CoreGraphics, which frees it with the last image reference.
-//!    CoreAnimation may read the bytes after `commit` returns, so a retained
-//!    buffer would tear.
-//! 2. **`age()` is always 0**, following from (1), so the frontend's
-//!    `buf.age() != 1` gate (`app_render.rs`) always takes the full-copy branch.
-//! 3. **`present_with_damage` commits the same pixels as `present`.** A
-//!    `CALayer`'s `contents` is a whole-image property. The damage list still
-//!    crosses the seam for linux/windows; given (2) this arm is not reached on
-//!    macOS.
-//!
-//! # FFI conventions
-//!
-//! Hand-written, like `crates/aterm-gui/src/net_connections/keychain.rs` and
-//! `platform::layer_colorspace`: only the entry points used are declared,
-//! CoreGraphics and QuartzCore are already linked (AppKit pulls both), every
-//! `Create` result lands in an owning wrapper that releases it once, and every
-//! `unsafe` block states the invariant that makes it sound.
+//! Only the entry points used are declared (AppKit already links CoreGraphics
+//! and QuartzCore), and every `Create` result lands in an owning wrapper that
+//! releases it once.
 
 use std::ffi::c_void;
 use std::fmt;
@@ -45,14 +32,11 @@ use std::ptr;
 use std::sync::Arc;
 
 use aterm_objc::{CGPoint, CGRect, Id, Obj, Sel, class, sel};
-use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::Window;
 
 use super::{CpuFrameBuffer, CpuPresenter, DamageRect};
 use crate::appkit::{self, MainThread};
-// Reuse the releasers declared for the `window` verb's full-window capture:
-// `platform::layer_colorspace` needs `CGColorSpaceRelease` typed as
-// `*mut CGColorSpace`, so a `*mut c_void` copy here would clash with it.
+// The `window` verb's capture already declares these releasers.
 use crate::cg_capture::{CGColorSpaceRelease, CGImageRelease};
 
 // ---------------------------------------------------------------------------
@@ -186,12 +170,12 @@ impl Drop for OwnedColorSpace {
 /// Why a macOS CPU present could not be set up or committed.
 ///
 /// Every variant is a dropped frame or a declined window at the call site,
-/// never a panic: users reach this arm only after their GPU failed.
+/// never a panic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MacPresentError {
     /// AppKit views and layers are main-thread only.
     NotMainThread,
-    /// The window has no AppKit (`NSView`) handle — it is not a Cocoa window.
+    /// The window answered no AppKit content `NSView`.
     NoAppKitHandle,
     /// `-[NSView layer]` returned nil even after `setWantsLayer:`.
     NoRootLayer,
@@ -264,12 +248,10 @@ pub(crate) struct MacCpuPresenter {
 impl MacCpuPresenter {
     /// Keep our sublayer covering the view at the view's scale.
     ///
-    /// Pulls the root layer's `bounds` and `contentsScale` (the values a KVO
-    /// observer would push) on every present. Change-gated, so the steady state
-    /// costs two property reads.
-    ///
-    /// Caller must be inside a `CATransaction` with actions disabled; `frame`
-    /// and `contentsScale` carry implicit animations otherwise.
+    /// Pulls the root layer's `bounds` and `contentsScale` on every present
+    /// instead of observing them; change-gated, so a steady frame costs two
+    /// property reads. Caller must be inside a `CATransaction` with actions
+    /// disabled; `frame` and `contentsScale` animate implicitly otherwise.
     ///
     /// # Safety
     ///
@@ -329,17 +311,12 @@ impl CpuPresenter for MacCpuPresenter {
         // AppKit views and CoreAnimation layers may only be touched from the
         // main thread; refuse rather than corrupt AppKit state off it.
         let _main = MainThread::new().ok_or(MacPresentError::NotMainThread)?;
-        // Scoped so the borrow of `window` ends before `window` is moved into
-        // `Self`. `ns_view` is a plain `NonNull` and borrows nothing.
-        let ns_view = {
-            let handle = window
-                .window_handle()
-                .map_err(|_| MacPresentError::NoAppKitHandle)?;
-            match handle.as_raw() {
-                RawWindowHandle::AppKit(appkit) => appkit.ns_view,
-                _ => return Err(MacPresentError::NoAppKitHandle),
-            }
-        };
+        // `view` is a plain `Id` and borrows nothing, so `window` can move into
+        // `Self` below.
+        let view = crate::platform::ns_view_of(&window);
+        if view.is_null() {
+            return Err(MacPresentError::NoAppKitHandle);
+        }
         // Dynamic lookup: a process without QuartzCore gets a typed error.
         // `aterm_objc::class` is `objc_getClass`, which answers null.
         let layer_class = class(c"CALayer");
@@ -347,7 +324,7 @@ impl CpuPresenter for MacCpuPresenter {
             return Err(MacPresentError::MissingClass("CALayer"));
         }
 
-        // SAFETY: `ns_view` is this window's live `NSView` (winit owns it for the
+        // SAFETY: `view` is this window's live `NSView` (winit owns it for the
         // window's lifetime, which `window`, moved into `Self` below, holds open),
         // and we are on the main thread (checked above). `setWantsLayer:` and
         // `layer` are the AppKit layer-backing pair; `alloc`/`init` on `CALayer`
@@ -356,7 +333,6 @@ impl CpuPresenter for MacCpuPresenter {
         // is a framework constant, retained by the setter); `addSublayer:`
         // retains our layer, so our own +1 is still released.
         unsafe {
-            let view = Id::from_ptr(ns_view.as_ptr().cast());
             appkit::send_v_bool(view, sel!(setWantsLayer:), true);
             let root_layer = appkit::send_id(view, sel!(layer));
             if root_layer.is_null() {

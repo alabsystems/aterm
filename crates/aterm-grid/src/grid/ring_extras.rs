@@ -6,21 +6,18 @@
 //! uncompressed history holds.
 //!
 //! A row scrolling off the screen takes its extras with it
-//! (`Grid::extract_row_extras_into`): every OSC 8 span carries an `Arc<str>`
-//! of up to 8 KiB (`MAX_HYPERLINK_URL_BYTES`). On the live screen the extras
-//! map caps links at `MAX_HYPERLINK_ENTRIES`; in history the tiered store
-//! weighs them against its memory budget. Between the two sit the ring and the
-//! lazy buffer's staged rows, which hold rows uncompressed and were sized in
-//! lines on the assumption that a row costs its cells. A program printing a
-//! distinct 8 KiB link per cell made that 0.63 MiB a row, ~4 GiB a tab, that no
-//! byte count saw and no shed could reclaim.
+//! (`Grid::extract_row_extras_into`), and every OSC 8 span carries a URL of up
+//! to 8 KiB. The live extras map caps links at `MAX_HYPERLINK_ENTRIES` and the
+//! tiered store weighs them against its memory budget, but the ring and the
+//! lazy buffer's staged rows hold rows uncompressed and are sized in lines: a
+//! distinct 8 KiB link per cell costs 0.63 MiB a row.
 //!
-//! So both holders keep running sums of what their extras retain, which
-//! `Grid::memory_used` reports, and the OSC 8 share of it is held to
+//! So both holders keep running sums of what their extras retain (reported by
+//! `Grid::memory_used`), and the OSC 8 share is held to
 //! [`Grid::history_link_budget`]: past it the oldest rows lose their links and
-//! keep their text, the policy `CellExtras::enforce_hyperlink_limit` applies to
-//! the live map. The sums live in the containers ([`RingExtras`] here,
-//! `LazyBuffer` for the staged rows) so no push or pop site can forget them.
+//! keep their text, as `CellExtras::enforce_hyperlink_limit` does for the live
+//! map. The sums live in the containers ([`RingExtras`] here, `LazyBuffer` for
+//! the staged rows) so no push or pop site can forget them.
 
 use std::collections::VecDeque;
 
@@ -33,16 +30,13 @@ pub(crate) type RingSlot = Option<Box<ScrolledRowExtras>>;
 /// The fraction of the scrollback memory budget that OSC 8 payload in
 /// uncompressed history (ring + staged rows) may use: a quarter.
 ///
-/// The memory budget is the one statement of what a tab's history may cost (it
-/// is what the GUI's pressure shed and aggregate cap lower), and these rows are
-/// headed for the store it governs, so the allowance follows it, including
-/// while a shed has it lowered. A quarter keeps the total within 1.25 × the
-/// budget plus the ring's fixed cells, where it was ~40 × the 100 MB default,
-/// and at that default (25 MiB) the GUI's largest ring (10,000 lines) with a
-/// 2 KiB link on every row still keeps every link. Not the store's headroom:
-/// a store at its budget (the steady state of a long session) would then
-/// strip the newest history's links while the oldest compressed rows kept
-/// theirs.
+/// It follows the memory budget (what the GUI's pressure shed and aggregate cap
+/// lower) because these rows are headed for the store it governs. A quarter
+/// keeps the total within 1.25 × the budget plus the ring's fixed cells, and at
+/// the 100 MB default still keeps a 2 KiB link on every row of the GUI's
+/// largest ring (10,000 lines). Not the store's headroom: a store at its budget
+/// would then strip the newest history's links while older compressed rows
+/// kept theirs.
 const HISTORY_LINK_BUDGET_DIVISOR: usize = 4;
 
 /// [`RingSlot`]'s out-of-line bytes: `(retained, links)`, as
@@ -259,7 +253,6 @@ impl Grid {
     #[must_use]
     #[inline]
     pub fn history_link_bytes(&self) -> usize {
-        // Saturating, as in `Grid::memory_used`.
         self.storage
             .ring_extras
             .link_bytes()
@@ -280,11 +273,10 @@ impl Grid {
     }
 
     /// Hold [`history_link_bytes`](Self::history_link_bytes) to its budget:
-    /// O(1) while under it. Called after every scroll that moves rows into
-    /// history (the only path that grows it without bound: every other entry
-    /// re-homes rows already counted, or at most a screen the live map's cap
-    /// bounds) and whenever the budget is set, which is how the pressure shed
-    /// reaches it.
+    /// O(1) while under it. Called after every scroll into history (the only
+    /// unbounded growth path; every other entry re-homes rows already counted,
+    /// or at most a screen the live map's cap bounds) and whenever the budget
+    /// is set, which is how the pressure shed reaches it.
     #[inline]
     pub(crate) fn enforce_history_link_budget(&mut self) {
         let used = self.history_link_bytes();
@@ -298,16 +290,13 @@ impl Grid {
     }
 
     /// The over-budget path: strip links oldest row first (staged rows are
-    /// older than ring rows) down to a low-water mark of three quarters of the
-    /// budget, so a flood re-enters this once per quarter-budget of new links
-    /// rather than on every row (the same reason `enforce_hyperlink_limit`
-    /// trims the live map below its ceiling).
+    /// older than ring rows) down to three quarters of the budget, so a flood
+    /// re-enters this once per quarter-budget of new links, not on every row.
     ///
-    /// History content changed, so `content_gen` moves (the viewport memo must
-    /// not serve a row with the links it lost). The screen is damaged only
-    /// while a scrolled-back viewport can show history: at the live bottom it
-    /// shows none, and the scroll paths that call this mark their own rows
-    /// (the top-anchored one must not mark its protected footer).
+    /// `content_gen` moves so the viewport memo cannot serve a row with the
+    /// links it lost. The screen is damaged only while scrolled back: at the
+    /// live bottom no history shows, and the calling scroll paths mark their
+    /// own rows (the top-anchored one must not mark its protected footer).
     #[cold]
     #[inline(never)]
     fn strip_history_links(&mut self, used: usize, budget: usize) {

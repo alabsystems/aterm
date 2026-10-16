@@ -935,13 +935,13 @@ fn app_capture_case(case: usize, census: &mut DeskCensus) {
 /// column-bounded attribute check of the line decoder (plan P0-4b) carries a
 /// case-2 session blank.
 ///
-/// FOUR CHILD PROCESSES, TEN DESKS EACH (2026-09-30, gate speed). A desk sets
+/// FOUR CHILD PROCESSES, TEN DESKS EACH (test-run speed). A desk sets
 /// the process's HOME and publishes the successor's handoff environment, so
 /// in one process the forty run one after another under [`ENV_LOCK`] — 7.9 s
-/// alone, and every other test of this module the runner started meanwhile
-/// parked a test thread on the lock: measured the same day in the gate's `-p
-/// aterm-gui --lib` binary at `RUST_TEST_THREADS=7`, the owner's desk and four
-/// carry tests took 4.6 to 14.3 s there against 0.005 to 0.2 s alone. Each
+/// alone, and every other test of this module the runner starts meanwhile
+/// parks a test thread on the lock: in the `-p aterm-gui --lib` binary at
+/// `RUST_TEST_THREADS=7`, the owner's desk and four carry tests took 4.6 to
+/// 14.3 s there against 0.005 to 0.2 s alone. Each
 /// shard runs its desks (every fourth case) exactly as the single pass did, in
 /// a process whose environment is its own, and prints its census; this test
 /// sums the four and holds the sum to the same floor. The lock is held here

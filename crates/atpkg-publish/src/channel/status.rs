@@ -1,0 +1,181 @@
+// Copyright 2026 Andrew Yates
+// SPDX-License-Identifier: Apache-2.0
+
+//! `atpkg-publish status`: the channel as clients see it, read live and verified: the
+//! head's number, horizon, roster generation, every pin and per-target overlay, the yanks
+//! and floors, and any drift between the head's program metadata and
+//! [`crate::programs::PROGRAMS`].
+//!
+//! A head past its horizon is still described, marked LAPSED: the status of a channel
+//! every client refuses is what an operator needs most.
+
+use std::path::{Path, PathBuf};
+
+use super::{Log, Scratch, flag_value};
+use crate::ctx::Ctx;
+use crate::error::{Error, Result};
+use crate::programs;
+use crate::quad::{self, Freshness, VerifiedQuad};
+use crate::triple::Triple;
+
+/// The status lines of a verified quad at `now_unix`.
+#[must_use]
+pub fn describe(quad: &VerifiedQuad, now_unix: i64) -> Vec<String> {
+    let index = &quad.index;
+    let lapsed = if quad.lapsed(now_unix) {
+        " — LAPSED: every client refuses this index; re-sign it (atpkg-publish index \
+         --valid-until <future> --upload)"
+    } else {
+        ""
+    };
+    let mut out = vec![
+        format!(
+            "atpkg-index-{} — signed by machine {} under roster_seq {}",
+            index.index_build,
+            index.attribution().machine_id,
+            index.roster_seq()
+        ),
+        format!(
+            "horizon: index {}, roster {}{lapsed}",
+            index.valid_until, quad.roster.valid_until
+        ),
+    ];
+    for c in &index.channels {
+        out.push(format!(
+            "channel {} (channel_build {}): min_build {}",
+            c.name, c.channel_build, c.min_build
+        ));
+        for (p, floor) in &c.min_build_by_program {
+            out.push(format!("  min_build {p}: {floor}"));
+        }
+        if !c.yanked.is_empty() {
+            out.push(format!("  yanked: {}", c.yanked.join(" ")));
+        }
+        let order: Vec<&str> = programs::PROGRAMS
+            .iter()
+            .map(|d| d.name)
+            .filter(|n| c.pin.contains_key(*n))
+            .chain(
+                c.pin
+                    .keys()
+                    .map(String::as_str)
+                    .filter(|n| programs::get(n).is_none()),
+            )
+            .collect();
+        for p in order {
+            let group = index
+                .programs
+                .get(p)
+                .and_then(|b| b.coherence_group.as_deref())
+                .map(|g| format!(" [{g}]"))
+                .unwrap_or_default();
+            out.push(format!("  pin {p} = {}{group}", c.pin[p]));
+        }
+        for (t, cells) in &c.pin_by_target {
+            let known = if Triple::parse(t).is_ok() {
+                ""
+            } else {
+                " (not a target this client knows)"
+            };
+            for (p, b) in cells {
+                out.push(format!("  pin {p} = {b} on {t}{known}"));
+            }
+        }
+    }
+    for (name, block) in &index.programs {
+        match programs::get(name) {
+            None if atpkg::vendor_direct::is_vendor(name) => out.push(format!(
+                "[programs.{name}] is vendor-direct: no publish pins it, and --retire {name} \
+                 drops it"
+            )),
+            None => out.push(format!(
+                "drift: [programs.{name}] is in the index but not a row of programs::PROGRAMS"
+            )),
+            Some(def) => {
+                let mut drift = Vec::new();
+                if block.repo != def.repo {
+                    drift.push(format!("repo {:?} (table {:?})", block.repo, def.repo));
+                }
+                if block.policy != programs::POLICY {
+                    drift.push(format!(
+                        "policy {:?} (table {:?})",
+                        block.policy,
+                        programs::POLICY
+                    ));
+                }
+                if block.coherence_group.as_deref() != def.group {
+                    drift.push(format!(
+                        "coherence_group {:?} (table {:?})",
+                        block.coherence_group, def.group
+                    ));
+                }
+                if block.system.as_deref() != def.system {
+                    drift.push(format!(
+                        "system {:?} (table {:?})",
+                        block.system, def.system
+                    ));
+                }
+                if block.unavailable_hint.as_deref() != def.unavailable_hint {
+                    drift.push(format!(
+                        "unavailable_hint {:?} (table {:?})",
+                        block.unavailable_hint, def.unavailable_hint
+                    ));
+                }
+                if !drift.is_empty() {
+                    out.push(format!(
+                        "drift: [programs.{name}] {} — the next publish renders the table's",
+                        drift.join(", ")
+                    ));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `atpkg-publish status [--quad DIR]`: the channel head (or a quad on disk), verified.
+///
+/// # Errors
+///
+/// A usage error for a bad command line; a refusal when the quad does not verify; a
+/// could-not-run when the channel cannot be read.
+pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
+    let mut dir: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--quad" => dir = Some(PathBuf::from(flag_value(args, &mut i, "--quad")?)),
+            other => {
+                return Err(Error::usage(format!(
+                    "status: unknown argument `{other}` (status [--quad DIR])"
+                )));
+            }
+        }
+        i += 1;
+    }
+    let mut log = Log::echo("atpkg-publish status");
+    for line in lines(ctx, dir.as_deref())? {
+        log.say(line);
+    }
+    Ok(())
+}
+
+/// The status of the channel head (or of the quad in `dir`), verified but for its own
+/// horizon, which [`describe`] reports.
+///
+/// # Errors
+///
+/// A refusal when the quad does not verify; a could-not-run when the channel cannot be
+/// read.
+pub fn lines(ctx: &Ctx, dir: Option<&Path>) -> Result<Vec<String>> {
+    let quad = match dir {
+        Some(d) => quad::verify_dir_with(ctx, d, Freshness::Ignore)?,
+        None => {
+            let scratch = Scratch::new("status")?;
+            let (_, q) =
+                quad::fetch_head_with(ctx, &ctx.index_slug(), scratch.path(), Freshness::Ignore)?;
+            q
+        }
+    };
+    Ok(describe(&quad, ctx.now_unix))
+}

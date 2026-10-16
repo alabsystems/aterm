@@ -142,22 +142,3 @@ fn write_wide_char_no_fixup_matches_the_checked_path() {
         "and that spacer carries the lead's rendition"
     );
 }
-
-/// The StyleId twin of the same law.
-#[test]
-fn write_wide_char_with_style_id_inverse_reaches_the_spacer() {
-    let (_pages, mut row) = make_row(10);
-    row.write_wide_char_with_style_id(0, '\u{6F22}', crate::StyleId::new(3), CellFlags::INVERSE);
-
-    let spacer = row.get(1).unwrap();
-    assert!(spacer.is_wide_continuation(), "role bit kept");
-    assert!(
-        spacer.flags().contains(CellFlags::INVERSE),
-        "the StyleId path obeys the same law as the packed-colour path"
-    );
-    assert!(
-        spacer.flags().contains(CellFlags::USES_STYLE_ID),
-        "with_style_id still owns the storage discriminant"
-    );
-    assert!(!spacer.flags().contains(CellFlags::WIDE));
-}

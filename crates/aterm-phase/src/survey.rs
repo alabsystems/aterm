@@ -16,6 +16,18 @@
 //! The options row is the contract: `0: Dismiss` is the key that closes the card and is
 //! the same in every kind. The question row is the vendor's copy and differs by kind, so
 //! the block is found from the options row up, never from a question text.
+//!
+//! **IN A NARROW PANE** (MEASURED on 2.1.300, the harness sweep of 2026-10-15,
+//! ATERM-KI-1015-1 S2R-F2; the fixtures `claude-2.1.300-survey-session-NNcol.txt`): below
+//! 41 columns Ink wraps the question onto a row at column 2 (`● How is Claude doing this`
+//! over `session? (optional)`), and draws the options as four boxes side by side, each
+//! key at its box's column and each box's text wrapped inside it (`  1: Bad  2: Fine 3:
+//! Good 0:` over `Dismiss` under its `0:` at 34; `  1: Bad2:    3:    0: Dis` over
+//! `        Fine  Good  miss` at 26, `Dismiss` broken where its box ends). Read a row at
+//! a time no row was the options row, so the card was never dismissed and its rows were
+//! read as the worker's last words. The options are read as that one row of boxes
+//! ([`options_line`], [`crate::wrap::rejoined_cells`]) and the question as the line Ink
+//! wrapped ([`crate::wrap`]): one card, its kind named by its whole question.
 
 use crate::phase::{
     composer_frame, is_against_right_edge, is_glyph_row, is_rule, is_transcript_row,
@@ -103,6 +115,58 @@ fn is_options_row(row: &str) -> bool {
     !rest.starts_with(' ') && rest.contains("0: Dismiss")
 }
 
+/// The most rows the options' boxes are read across (module header, "IN A NARROW
+/// PANE"): two measured, from 26 to 40 columns; room for a narrower pane's third and
+/// fourth.
+const OPTION_ROWS: usize = 4;
+
+/// The cells the options' keys start at on the options' first row — `1:` at column 2
+/// first, then each `<digit>:` after it, whatever ran into it (`  1: Bad2:    3:` at 26
+/// columns): the columns of the boxes Ink lays the options out in. `None` when the row
+/// does not open `  1: ` two columns in.
+fn option_keys(row: &str) -> Option<Vec<usize>> {
+    let rest = row.strip_prefix("  1:")?;
+    if rest.starts_with(' ') && rest[1..].starts_with(' ') {
+        return None;
+    }
+    let chars: Vec<char> = row.chars().collect();
+    let mut starts = Vec::new();
+    let mut cell = 0;
+    for (i, &c) in chars.iter().enumerate() {
+        let key = c.is_ascii_digit()
+            && chars.get(i + 1) == Some(&':')
+            && (i == 0 || !chars[i - 1].is_ascii_digit());
+        if key {
+            starts.push(cell);
+        }
+        cell += crate::question::cells(c.encode_utf8(&mut [0; 4]));
+    }
+    (starts.first() == Some(&2)).then_some(starts)
+}
+
+/// The options read from row `first` of `rows`, `until` excluded, in a pane `width`
+/// cells wide: its last row. One row ([`is_options_row`]), as every wide pane draws it;
+/// else the row of boxes Ink wrapped (module header, "IN A NARROW PANE"), read across
+/// the rows under it that are its boxes' own ([`crate::wrap::rejoined_cells`]) and whole
+/// only when its first box is `1: <label>` and its last exactly `0: Dismiss` — the most
+/// such rows, at most [`OPTION_ROWS`]. `None` when neither reads.
+fn options_line(rows: &[String], first: usize, until: usize, width: usize) -> Option<usize> {
+    if is_options_row(&rows[first]) {
+        return Some(first);
+    }
+    let starts = option_keys(&rows[first])?;
+    let whole = |boxes: Vec<String>| {
+        boxes.first().is_some_and(|b| b.starts_with("1: "))
+            && boxes.last().is_some_and(|b| b == "0: Dismiss")
+    };
+    (first + 1..until.min(first + OPTION_ROWS))
+        .take_while(|&last| !crate::text::trim(&rows[last]).is_empty())
+        .filter(|&last| {
+            crate::wrap::rejoined_cells(&rows[first..=last], &starts, width).is_some_and(whole)
+        })
+        .last()
+}
+
 /// A row Claude Code parks between the transcript and an idle composer that is not
 /// part of the card: blank, a hint or banner against the right edge, a `⎿  Tip:` row.
 fn is_parked(row: &str, width: usize) -> bool {
@@ -113,26 +177,35 @@ fn is_parked(row: &str, width: usize) -> bool {
             .is_some_and(|g| crate::text::trim_start(g).starts_with("Tip:"))
 }
 
-/// The open rating card above the composer, if there is one: an options row with
-/// nothing between it and the composer's top rule but parked rows, a `●` question row
-/// in column 0 within [`MAX_ABOVE_OPTIONS`] rows above it, and only blank or indented
-/// rows between the two. Anything else — a copy quoted in a tool's output (`⎿`), in the
-/// worker's message, a question with no options, the options with words after them —
-/// is not open.
+/// The open rating card above the composer, if there is one: its options ([`options_line`],
+/// one row or the row of boxes a narrow pane wraps) with nothing between them and the
+/// composer's top rule but parked rows, a `●` question row in column 0 within
+/// [`MAX_ABOVE_OPTIONS`] rows above them, and only blank or indented rows between the
+/// two. Anything else — a copy quoted in a tool's output (`⎿`), in the worker's message,
+/// a question with no options, the options with words after them — is not open.
 #[must_use]
 pub fn survey_block(rows: &[String]) -> Option<SurveyBlock> {
     let frame = composer_frame(rows)?;
     let width = crate::text::trim_end(&rows[frame.bottom]).chars().count();
-    let options = (1..frame.top).rev().find_map(|i| {
-        if is_options_row(&rows[i]) {
-            Some(Some(i))
+    // Walking up from the rule: the options' first row, under which every row down to the
+    // rule is the options' own or parked. A box's wrapped row is passed over as a parked
+    // hint: it ends against the pane's right edge, for the last box's label (`0:
+    // Dismiss`) is the longest, so the boxes shrink it first and it wraps onto every row
+    // any box does (`Dismiss` alone at 34 and 40 columns, `Fine  Good  miss` at 26).
+    let (first, options) = (1..frame.top).rev().find_map(|i| {
+        if let Some(last) = options_line(rows, i, frame.top, width)
+            && rows[last + 1..frame.top]
+                .iter()
+                .all(|r| is_parked(r, width))
+        {
+            Some(Some((i, last)))
         } else if is_parked(&rows[i], width) {
             None
         } else {
             Some(None)
         }
     })??;
-    let head = (options.saturating_sub(MAX_ABOVE_OPTIONS)..options)
+    let head = (first.saturating_sub(MAX_ABOVE_OPTIONS)..first)
         .rev()
         .find_map(|i| {
             let row = &rows[i];
@@ -148,8 +221,15 @@ pub fn survey_block(rows: &[String]) -> Option<SurveyBlock> {
                 Some(None)
             }
         })??;
-    let question = rows[head].trim_start_matches('●').trim();
-    let kind = kind_of(question);
+    // The question is one line, which a narrow pane wraps onto the rows under it at
+    // column 2 ([`crate::wrap`]): its kind is read whole, its guard from the row the
+    // guard is matched on.
+    let row = rows[head].trim_start_matches('●');
+    let col = 1 + crate::phase::leading_spaces(row);
+    let end = crate::wrap::line_end(rows, head, crate::text::trim(row), col, width, first);
+    let line = crate::wrap::rejoined(&rows[head..=end]);
+    let kind = kind_of(line.trim_start_matches('●').trim());
+    let question = row.trim();
     // A future card's words are not known; its shape is — and `(optional)` is the
     // vendor's mark on every one of them: what a PRESS wants before it writes a `0`.
     let dismissable = kind != SurveyKind::Unknown
@@ -965,5 +1045,70 @@ mod tests {
         assert!(drafts_card(&no_head).is_none());
         let other = with(&DONE, &["", "✻ Bug report drafted: x", "Press any key", ""]);
         assert!(drafts_card(&other).is_none());
+    }
+
+    /// ATERM-KI-1015-1 S2R-F2 (the harness sweep of 2026-10-15, Claude Code
+    /// 2.1.300): in a pane narrower than 41 columns Ink wraps the session
+    /// survey's question onto a row at column two and draws its options as
+    /// four columns whose words wrap inside each column (`  1: Bad  2: Fine
+    /// 3: Good 0:` over `Dismiss` at 34; `  1: Bad2:    3:    0: Dis` over
+    /// `        Fine  Good  miss` at 26). Read a row at a time no row was the
+    /// options row: the card was never dismissed, its rows were read as the
+    /// worker's last words, and the continue policy typed `keep going` into
+    /// the standing card. The card is read as one block across those rows.
+    #[test]
+    fn a_survey_card_ink_wrapped_into_columns_is_one_card() {
+        use crate::prompt::fixtures::{
+            SURVEY_SESSION_26_2_1_300, SURVEY_SESSION_34_2_1_300, SURVEY_SESSION_40_2_1_300,
+            screen as fixture,
+        };
+        for text in [
+            SURVEY_SESSION_26_2_1_300,
+            SURVEY_SESSION_34_2_1_300,
+            SURVEY_SESSION_40_2_1_300,
+        ] {
+            let r = fixture(text);
+            let block = survey_block(&r).unwrap_or_else(|| panic!("the card: {r:#?}"));
+            assert_eq!(block.kind, SurveyKind::Session);
+            assert!(r[block.head].starts_with("● How is Claude doing this"));
+            // The card's last row is its options' last: the blank row and the
+            // composer's top rule under it.
+            assert!(r[block.options + 1].trim().is_empty(), "{r:#?}");
+            assert!(crate::phase::is_rule(&r[block.options + 2]));
+            assert_eq!(block.withheld(), None);
+            assert_eq!(block.guard, "^●.How.is.Claude.doing");
+            assert!(survey_open(&r));
+            assert_eq!(worker_phase(&r), Phase::Idle);
+            let said = last_said_row(&r).expect("a last said row");
+            assert!(
+                said.contains("(reply 1)") || said.ends_with("not a model."),
+                "{said:?}"
+            );
+        }
+        // CONTROLS: the boxes' first row alone (its `Dismiss` gone), and a
+        // `Dismiss` drawn a column off its box, are no card.
+        let r = fixture(SURVEY_SESSION_34_2_1_300);
+        let cut: Vec<String> = r
+            .iter()
+            .map(|x| {
+                if x.trim() == "Dismiss" {
+                    String::new()
+                } else {
+                    x.clone()
+                }
+            })
+            .collect();
+        assert!(survey_block(&cut).is_none(), "{cut:#?}");
+        let off: Vec<String> = r
+            .iter()
+            .map(|x| {
+                if x.trim() == "Dismiss" {
+                    format!(" {x}")
+                } else {
+                    x.clone()
+                }
+            })
+            .collect();
+        assert!(survey_block(&off).is_none(), "{off:#?}");
     }
 }

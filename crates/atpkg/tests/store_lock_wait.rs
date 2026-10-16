@@ -239,7 +239,7 @@ fn lock_path_of(prefix: &Path) -> String {
 }
 
 /// A hang detector, not a latency budget: the grace itself is 2 s, and the first exec
-/// of a freshly linked binary has been measured at 26 s under a loaded gate.
+/// of a freshly linked binary has been measured at 26 s on a loaded machine.
 const ANNOUNCE_WITHIN: Duration = Duration::from_secs(60);
 
 /// THE INCIDENT, FIXED: a `--wait-lock` child finds the lock held, announces the

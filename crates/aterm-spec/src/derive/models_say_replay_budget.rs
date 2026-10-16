@@ -5,17 +5,14 @@
 
 use super::Model;
 
-/// Two always-backlogged sessions, four pages per interval. `Control` is the
-/// roster's local and addressed work, which precedes replay. `QueuePriority`
-/// represents a halt, local event, addressed message or closure arriving while
-/// replay runs; the roster may finish one page then must yield. `FetchA/B`
-/// choose the next sid strictly after the last served one and spend one shared page.
-/// A pushed opt-in may take one page in its event turn, while a roster round
-/// can take the shared remainder after controls. `Buggy=1` permits the old
-/// per-session behavior: replay before control, repeated pages for one sid,
-/// and more than one interval's pages at once.
-/// Tier-1 drives the shipping `SayReplay` selector; the bridge's roster path
-/// calls it after its status, topic and outbox work.
+/// Two always-backlogged sessions, four pages per interval. `Control` is the roster's local and
+/// addressed work, which precedes replay. `QueuePriority` is a halt, local event, addressed
+/// message or closure arriving during replay; the roster may finish one page, then must yield.
+/// `FetchA/B` choose the next sid strictly after the last served one and spend one shared page.
+/// A pushed opt-in may take one page in its event turn; a roster round takes the shared
+/// remainder after controls. `Buggy=1` is per-session replay: before control, repeated pages
+/// for one sid, more than one interval's pages at once. Tier-1 drives the shipping `SayReplay`
+/// selector, which the bridge's roster path calls after its status, topic and outbox work.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn say_replay_budget_model() -> Model {

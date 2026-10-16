@@ -25,7 +25,7 @@ pub(crate) enum PackagesBusy {
     /// `atpkg uninstall --all` — remove the whole managed toolset, reclaiming its disk.
     Uninstall,
     /// `atpkg machine apply` — the `[machine]` host setting (Universal Control off),
-    /// applied now from the Security page's "Apply now". A LOCAL verb: no store lock, no network, and it works with the
+    /// applied now from the Security page's "Apply Now". A LOCAL verb: no store lock, no network, and it works with the
     /// package manager switched off. macOS only.
     MachineApply,
 }
@@ -457,9 +457,9 @@ impl LocalClock {
         }
     }
 
-    /// The clock as `date` reads it — a subprocess per read, so a WORKER's only: the offset
-    /// now and a window ago, and only when they differ (the week after a switch) the
-    /// switch between them, bisected to the minute (about fourteen reads).
+    /// The clock as this process reads it (`presence::local_offset_at`): the offset now
+    /// and a window ago, and only when they differ (the week after a switch) the switch
+    /// between them, bisected to the minute (about fourteen reads).
     pub(crate) fn read(now: i64) -> Self {
         Self::probe(now, crate::presence::local_offset_at)
     }
@@ -625,9 +625,9 @@ impl ProgramStateKind {
 
 /// What an agent program's row says beside its state: the vendor, the license and the
 /// size, parsed from atpkg's one authored line per agent program
-/// (`atpkg::stub::AGENT_STUB_NAMES`: `"<vendor product> — <license>, <size>, downloaded
-/// from <host>"`). A line that does not follow that grammar is kept whole as the vendor
-/// so nothing authored is lost.
+/// (`atpkg::vendor_direct::VendorSpec::description`: `"<vendor product> — <license>,
+/// <size>, downloaded from <host>"`). A line that does not follow that grammar is kept
+/// whole as the vendor so nothing authored is lost.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct VendorFacts {
     pub(crate) vendor: String,
@@ -1052,6 +1052,11 @@ pub(crate) fn cc_prereq_item(verdict: &atpkg::prereq::CcVerdict) -> String {
     }
 }
 
+/// The detail under "Package tool missing": what is wrong with this copy, and
+/// how to get one that manages ALab tools.
+pub(crate) const PACKAGE_TOOL_MISSING_DETAIL: &str =
+    "This copy of aterm has no package tool. Install aterm from alab.systems to manage ALab tools.";
+
 /// The longest cause a headline item quotes, in characters.
 const HEADLINE_CAUSE_CHARS: usize = 48;
 
@@ -1413,12 +1418,12 @@ fn collection_error_summary(errors: Vec<String>, total: usize) -> Option<String>
     Some(summary)
 }
 
-/// Collect the packages report from the real machine — filesystem reads, no network, and
-/// two subprocess kinds: `date`, for the local clock ([`LocalClock::read`]), and, over an
-/// installed toolset, the C toolchain probe ([`atpkg::prereq::probe`]: the compiler asked
-/// to build one small program, each step bounded, never Apple's install shim without a
-/// compiler behind it). MUST run off the event loop (worker threads only): it stats the
-/// co-located binary, parses `status.toml` and runs those.
+/// Collect the packages report from the real machine — filesystem reads, no network, the
+/// local clock ([`LocalClock::read`]) and, over an installed toolset, one subprocess kind:
+/// the C toolchain probe ([`atpkg::prereq::probe`]: the compiler asked to build one small
+/// program, each step bounded, never Apple's install shim without a compiler behind it).
+/// MUST run off the event loop (worker threads only): it stats the co-located binary,
+/// parses `status.toml` and runs that probe.
 pub(crate) fn collect_packages_status(available: bool) -> PackagesStatusReport {
     // The CONFIGURED prefix, not the default: this page is what every seed notice
     // points at, and reading the default store made a relocated lab store report
@@ -1695,7 +1700,7 @@ impl PackagesService {
     /// there was none. Either way the posture is now OBSERVED — a read error is a
     /// fact the card states, not a reason to keep saying "reading". Returns `true`
     /// when a rerun was queued while this read ran: the posture then STAYS
-    /// refreshing (Apply disabled, the card still "Reading…") and the caller must
+    /// refreshing (Apply disabled, the status still "Reading…") and the caller must
     /// spawn the already-admitted read directly, without requesting admission again.
     #[must_use = "a queued rerun must be spawned by the caller"]
     pub(crate) fn replace_machine_state(
@@ -1748,7 +1753,7 @@ impl PackagesService {
     }
 
     /// A pass printed a change; its own `machine-state:` record follows on the same
-    /// stream. The card reads as refreshing (Apply disabled) until it lands, and no
+    /// stream. The status reads as refreshing (Apply disabled) until it lands, and no
     /// read is spawned for it.
     pub(crate) fn expect_machine_record(&mut self) {
         if self.machine.awaiting_record {
@@ -2305,7 +2310,7 @@ impl PackagesState {
             }
             Some(detail)
         } else if !report.available {
-            Some("The package tool is missing from this copy of aterm.".to_string())
+            Some(PACKAGE_TOOL_MISSING_DETAIL.to_string())
         } else if !report.manager_enabled {
             // The one cause an inert manager has — an unpinned build; `aterm pkg doctor`
             // names the key.
@@ -2379,20 +2384,29 @@ impl PackagesState {
         }
         // THE SWITCH IS LIVE (Phase 4): the window's package loop re-reads `[packages]`
         // before every pass and every few seconds of a park, so what is saved is what runs
-        // — no "next launch". ONE switch (2026-09-23): `[packages] enabled`, Automatic
-        // updates, with the retired `auto_update` folded in ([`Self::master_enabled`]); when
+        // — no "next launch". ONE switch: `[packages] enabled`, Keep ALab tools up to
+        // date, with the retired `auto_update` folded in ([`Self::master_enabled`]); when
         // that retired key is what holds it off, the line names it
         // ([`Self::retired_switch_note`]) — the one control that clears it is the switch.
         // The line says what runs; when the last full check completed is the headline's
         // detail ("Checked 3 min ago").
-        let loop_status = if !self.loop_running {
-            "Not running in this window — Check & Update Now still works".to_string()
+        // "Check & Update Now still works" only where that button does.
+        let still_works = if report.available && report.manager_enabled {
+            "; Check & Update Now still works"
+        } else {
+            ""
+        };
+        let loop_status = if self.observed && !report.available {
+            "Unavailable in this copy of aterm".to_string()
+        } else if !self.loop_running {
+            format!("Not running in this window{still_works}")
         } else if !self.master_enabled && self.retired_switch_note.is_some() {
-            "Off — [packages] auto_update = false holds it off (turning Automatic updates \
-             on removes it); Check & Update Now still works"
-                .to_string()
+            format!(
+                "Off — [packages] auto_update = false holds it off (turning on Keep ALab tools \
+                 up to date removes it){still_works}"
+            )
         } else if !self.master_enabled {
-            "Off — nothing updates by itself; Check & Update Now still works".to_string()
+            format!("Off — nothing updates by itself{still_works}")
         } else {
             "On — updates arrive in the background, without interrupting".to_string()
         };
@@ -2410,7 +2424,8 @@ impl PackagesState {
         // verb that works with the manager switched off, so its slice gets the
         // page's idleness alone — observed, atpkg present, no worker inflight.
         let machine_idle = self.observed && report.available && !self.inflight;
-        let machine = self.machine_projection(machine_idle, now);
+        let machine =
+            self.machine_projection(machine_idle, self.observed && !report.available, now);
         PackagesProjection {
             machine,
             observed: self.observed,
@@ -2441,15 +2456,21 @@ impl PackagesState {
         }
     }
 
-    /// The "This Mac" card's words, derived HERE so pixels, accessibility and
-    /// `aterm ctl` introspection read one truth. `idle` is the page's idleness
+    /// The "This Mac" status's words, derived HERE so pixels, accessibility and
+    /// `aterm ctl` introspection read one truth. `tool_missing`: this copy has no
+    /// package tool, so nothing here can be read or applied. `idle` is the page's idleness
     /// (observed, atpkg present, no worker inflight) and deliberately NOT the
     /// manager-gated `actions_enabled`: `atpkg machine apply` is a local verb that
     /// works with the package manager switched off. The button additionally needs
     /// a parsed record, nothing in the way, and a verdict — measured posture ×
     /// the SAVED switches, which is what the apply child will read — that says
     /// something is left to do.
-    fn machine_projection(&self, idle: bool, now: std::time::SystemTime) -> MachineProjection {
+    fn machine_projection(
+        &self,
+        idle: bool,
+        tool_missing: bool,
+        now: std::time::SystemTime,
+    ) -> MachineProjection {
         use atpkg::config::UniversalControlPolicy;
         use atpkg::machine::{HomePosture, UcPosture};
         let posture = &self.machine;
@@ -2459,91 +2480,80 @@ impl PackagesState {
         // failure must not erase a measurement) but every measured sentence says
         // it is prior — a stale record never reads as a fresh one.
         let prior = if posture.read_error.is_some() && state.is_some() {
-            " (from the last successful read)"
+            " (as last read)"
         } else {
             ""
         };
         let universal_control = match state {
-            None => "Universal Control: not read yet".to_string(),
+            // No record: either the read has not finished, or it failed.
+            None if posture.read_error.is_some() => {
+                "aterm couldn\u{2019}t check Universal Control on this Mac.".to_string()
+            }
+            None => "Universal Control hasn\u{2019}t been checked yet.".to_string(),
             Some(s) => {
-                let word = match s.universal_control {
-                    UcPosture::Disabled => "disabled on this Mac",
+                // The row above shows the choice (Off or Leave as is), so the
+                // sentence says only what the Mac has.
+                let words = match s.universal_control {
+                    UcPosture::Disabled => "Universal Control is off on this Mac",
                     UcPosture::Default => {
-                        "at the OS default — the cursor roams to other Macs and iPads"
+                        "Universal Control is on: the pointer can move to other Macs and iPads"
                     }
-                    UcPosture::Partial => "partly disabled",
-                    // NOT "unknown" bare: the reader needs to know the machine was not
-                    // measured, and why that is not the same as "off".
-                    UcPosture::Unknown => "could not be read on this Mac",
-                };
-                let policy = match (s.policy, s.universal_control) {
-                    (UniversalControlPolicy::Leave, UcPosture::Disabled)
-                    | (UniversalControlPolicy::Off, _) => "",
-                    // NOT `= "leave"`: any spelling the parser does not know resolves
-                    // to Leave, so quoting the file back at the user could quote a word
-                    // they never wrote.
-                    (UniversalControlPolicy::Leave, _) => {
-                        " · left alone ([machine] universal_control is not \"off\")"
+                    UcPosture::Partial => "Universal Control is partly off on this Mac",
+                    // Not measured, which is not the same as off.
+                    UcPosture::Unknown => {
+                        "aterm couldn\u{2019}t read Universal Control on this Mac"
                     }
                 };
-                format!("Universal Control: {word}{policy}{prior}")
+                format!("{words}{prior}.")
             }
         };
-        let last_change = match posture.last_change.as_ref() {
-            None => "No change recorded this launch".to_string(),
-            Some((items, at)) => {
-                let age_ms = now
-                    .duration_since(*at)
-                    .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-                    .unwrap_or(0);
-                format!(
-                    "Last change: {items} · {}",
-                    crate::session_chrome::relative_age(age_ms)
-                )
-            }
-        };
+        let last_change = posture.last_change.as_ref().map(|(items, at)| {
+            let age_ms = now
+                .duration_since(*at)
+                .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+                .unwrap_or(0);
+            format!(
+                "Last change: {items} · {}",
+                crate::session_chrome::relative_age(age_ms)
+            )
+        });
         let reason = if let Some(error) = posture.read_error.as_deref() {
-            Some(format!("Could not read the machine state: {error}"))
+            Some(format!(
+                "Couldn\u{2019}t read this Mac\u{2019}s settings: {error}"
+            ))
         } else if state.is_some_and(|s| s.config_unreadable) {
             // The refusal the owner can fix, and the one that must not read as a
-            // measurement: the `[machine]` default ACTS, so a file that does not parse
-            // cannot be treated as "no opt-out was set".
+            // measurement: the default ACTS, so a file that does not parse cannot
+            // be treated as "no opt-out was set".
             Some(
-                "Not applied here: aterm.toml does not parse, so the [machine] switches \
-                 could not be read. Fix the file and the next pass applies them."
+                "Not applied: aterm.toml has an error, so this setting can\u{2019}t be read. \
+                 Fix the file and aterm applies it at the next check."
                     .to_string(),
             )
         } else {
-            match state.map(|s| s.home) {
+            // A home that isn't the account's stands in the way of a change
+            // only: with the Mac already as chosen there is nothing it blocks.
+            let wants_change = state.is_some_and(|s| {
+                atpkg::machine::MachineState {
+                    policy: self.saved_universal_control,
+                    home: HomePosture::Account,
+                    ..s.clone()
+                }
+                .next()
+            });
+            match state.map(|s| s.home).filter(|_| wants_change) {
                 Some(HomePosture::Mismatch) => Some(
-                    "Not applied here: this window's HOME is not the account's home, and \
-                     `defaults` writes the account's per-host settings regardless."
+                    "Not applied: this window uses a different home folder than your \
+                     account, so aterm won\u{2019}t change this Mac\u{2019}s settings from it."
                         .to_string(),
                 ),
                 Some(HomePosture::Unresolved) => Some(
-                    "Not applied here: the account home could not be resolved, so HOME \
-                     cannot be proven to be it."
+                    "Not applied: aterm couldn\u{2019}t find your account\u{2019}s home folder."
                         .to_string(),
                 ),
                 Some(HomePosture::Account) | None => None,
             }
         };
-        // A switch saved in Settings after the last read: the record's `policy=`
-        // came from the file as it was THEN, so say what the next read, pass or
-        // Apply now will use — the card must never look as if a flipped switch had
-        // already been measured.
-        let saved = state
-            .filter(|s| s.policy != self.saved_universal_control)
-            .map(|_| {
-                format!(
-                    "Saved since the last read: universal_control = \"{}\" — the next \
-                     package pass or Apply now uses it",
-                    match self.saved_universal_control {
-                        UniversalControlPolicy::Off => "off",
-                        UniversalControlPolicy::Leave => "leave",
-                    }
-                )
-            });
         // THE verdict — `MachineState::next`, the one the CLI uses, over the measured
         // posture and the SAVED switch (the apply child reads the file fresh, so a
         // switch flipped after the read decides what it will do; the record's own
@@ -2556,6 +2566,29 @@ impl PackagesState {
             }
             .next()
         });
+        // A switch saved in Settings after the last read: the record's `policy=`
+        // came from the file as it was THEN, so say what the next read or pass
+        // will do — the status must never look as if a flipped switch had already
+        // been measured. Apply Now is named only where it is drawn (something left
+        // to do, nothing in the way). Off on a Mac already off says nothing more:
+        // the measured line above already says the Mac is off and the row shows
+        // Off, so a "Saved:" line would only say it twice.
+        let saved = state
+            .filter(|s| s.policy != self.saved_universal_control)
+            .and_then(|s| match self.saved_universal_control {
+                UniversalControlPolicy::Off if next && reason.is_none() => Some(
+                    "Saved: aterm turns Universal Control off at the next ALab tools \
+                     check. Apply Now does it now.",
+                ),
+                UniversalControlPolicy::Off if s.universal_control == UcPosture::Disabled => None,
+                UniversalControlPolicy::Off => {
+                    Some("Saved: aterm turns Universal Control off at the next ALab tools check.")
+                }
+                UniversalControlPolicy::Leave => {
+                    Some("Saved: aterm leaves Universal Control as macOS has it.")
+                }
+            })
+            .map(str::to_string);
         let apply_enabled = idle
             && supported
             && posture.observed
@@ -2567,14 +2600,15 @@ impl PackagesState {
         // why — so "nothing to apply" is claimed only when nothing is in the way.
         let nothing_to_apply = posture.observed && reason.is_none() && !next;
         let next = if next && reason.is_none() {
-            "Apply now would set: Universal Control off for this host".to_string()
+            MACHINE_APPLY_WOULD.to_string()
         } else if nothing_to_apply {
-            "Nothing to apply — Universal Control is where [machine] wants it".to_string()
+            MACHINE_NOTHING_TO_APPLY.to_string()
         } else {
             String::new()
         };
         MachineProjection {
             supported,
+            tool_missing,
             observed: posture.observed,
             refreshing: posture.refreshing || posture.awaiting_record,
             universal_control,
@@ -2589,20 +2623,29 @@ impl PackagesState {
     }
 }
 
-/// The "This Mac" card on Settings ▸ Security, as words (the
+/// What Apply Now would do, said under the measured state beside the button.
+pub(crate) const MACHINE_APPLY_WOULD: &str = "Apply Now turns Universal Control off for this Mac.";
+/// The verdict when the Mac already matches the saved choice.
+pub(crate) const MACHINE_NOTHING_TO_APPLY: &str =
+    "Nothing to apply: Universal Control is already as you chose.";
+
+/// Settings ▸ Security's "This Mac" status, as words (the
 /// [`PackagesProjection`] slice for the `[machine]` host settings).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MachineProjection {
-    /// These are macOS host settings; elsewhere the card is absent.
+    /// These are macOS host settings; elsewhere the status is absent.
     pub(crate) supported: bool,
+    /// This copy has no package tool, so the Mac can't be read or changed
+    /// from it; the page shows no status rather than a failed read.
+    pub(crate) tool_missing: bool,
     /// A machine read has completed at least once.
     pub(crate) observed: bool,
     /// The machine read worker is running.
     pub(crate) refreshing: bool,
-    /// `Universal Control: …` — the measured posture.
+    /// The measured posture, as a sentence.
     pub(crate) universal_control: String,
-    /// `Last change: … · <age>` or `No change recorded this launch`.
-    pub(crate) last_change: String,
+    /// `Last change: … · <age>`, when this launch changed something.
+    pub(crate) last_change: Option<String>,
     /// The last `atpkg machine apply` verdict this launch, when there is one.
     pub(crate) last_verdict: Option<String>,
     /// Why an apply would do nothing here (home mismatch/unresolved) or why the
@@ -2610,14 +2653,14 @@ pub(crate) struct MachineProjection {
     pub(crate) reason: Option<String>,
     /// A `[machine]` switch saved after the last read, and what will use it.
     pub(crate) saved: Option<String>,
-    /// What Apply now would do (`Apply now would set: …`), or the "nothing to
+    /// What Apply Now would do ([`MACHINE_APPLY_WOULD`]), or the "nothing to
     /// apply" sentence; empty while unobserved or when a reason is in the way.
     pub(crate) next: String,
     /// The Apply now button: page idle, macOS, observed, not refreshing, and the
     /// verdict says something is left to do.
     pub(crate) apply_enabled: bool,
-    /// Observed, readable, and the verdict is "nothing to apply" — the card says so
-    /// in place of an enabled button.
+    /// Observed, readable, and the verdict is "nothing to apply": the status
+    /// offers no button, and a press from the palette says so.
     pub(crate) nothing_to_apply: bool,
 }
 
@@ -2625,7 +2668,7 @@ pub(crate) struct MachineProjection {
 /// `/packages` route (the [`crate::update_screen::UpdateProjection`] analogue).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PackagesProjection {
-    /// The `[machine]` host settings slice (Settings ▸ Security's "This Mac" card).
+    /// The `[machine]` host settings slice (Settings ▸ Security's "This Mac" status).
     pub(crate) machine: MachineProjection,
     pub(crate) observed: bool,
     pub(crate) available: bool,
@@ -3047,7 +3090,7 @@ mod tests {
         assert_eq!(unavailable.headline, "Package tool missing");
         assert_eq!(
             unavailable.detail.as_deref(),
-            Some("The package tool is missing from this copy of aterm.")
+            Some(super::PACKAGE_TOOL_MISSING_DETAIL)
         );
         assert!(!unavailable.actions_enabled);
 
@@ -3149,7 +3192,9 @@ mod tests {
             retired
                 .loop_status
                 .contains("[packages] auto_update = false")
-                && retired.loop_status.contains("Automatic updates on"),
+                && retired
+                    .loop_status
+                    .contains("turning on Keep ALab tools up to date"),
             "the key that holds it off is named, and the control that clears it: {}",
             retired.loop_status
         );
@@ -3198,7 +3243,7 @@ mod tests {
         };
         let note = atpkg::config::auto_update_note(false, Some(true));
         let service = "Off \u{2014} [packages] auto_update = false holds it off \
-                       (turning Automatic updates on removes it); Check & Update Now still works \
+                       (turning on Keep ALab tools up to date removes it); Check & Update Now still works \
                        \u{b7} last full check 3 h ago";
         for text in [note.as_str(), service] {
             for width in [MIN_REASON_WIDTH, 36, 56] {
@@ -3369,7 +3414,7 @@ mod tests {
         assert!(service.finish(sequence, succeeded(report(&after), PackagesBusy::Check)));
         let detail = projection(&service).detail.unwrap_or_default();
         assert!(!detail.contains("updated"), "{detail}");
-        // The machine apply has no band row: the card points at none (ruling
+        // The machine apply has no band row: the status points at none (ruling
         // 266), and the pointer it gives a verb promises no row either — a
         // quick check ends inside the progress grace, off the glass.
         let sequence = service.begin(Some(PackagesBusy::MachineApply)).unwrap();
@@ -4337,7 +4382,7 @@ mod tests {
     }
 
     /// THE PASS'S OWN RECORD ANSWERS THE CHANGE (2026-09-16). A `machine-settings:`
-    /// line opens an expectation — the card reads as refreshing, Apply disabled — and
+    /// line opens an expectation — the status reads as refreshing, Apply disabled — and
     /// NO read is spawned; the `machine-state:` record the pass prints behind it is
     /// the newest measurement and closes the expectation. A read that was running
     /// meanwhile is superseded: its older answer is dropped on arrival, so a walk that
@@ -4352,7 +4397,7 @@ mod tests {
         service.note_machine_change("universal-control disabled".into(), now);
         service.expect_machine_record();
         let waiting = service.state(true, true, true).projection();
-        assert!(waiting.machine.refreshing, "the card reads as refreshing");
+        assert!(waiting.machine.refreshing, "the status reads as refreshing");
         assert!(!waiting.machine.apply_enabled);
         assert!(service.machine().awaiting_record && !service.machine().refreshing);
         service.note_machine_record(machine_state(UcPosture::Disabled, HomePosture::Account));
@@ -4463,7 +4508,7 @@ mod tests {
         );
     }
 
-    /// The "This Mac" card reads the machine posture through the packages
+    /// The "This Mac" status reads the machine posture through the packages
     /// projection: unobserved says nothing and offers no button; a read bumps the
     /// revision and renders the measured words; `Apply now` follows
     /// `MachineState::next` (a home mismatch or nothing-left disables it); a
@@ -4479,15 +4524,12 @@ mod tests {
         assert!(!unobserved.machine.nothing_to_apply);
         assert_eq!(
             unobserved.machine.universal_control,
-            "Universal Control: not read yet"
+            "Universal Control hasn\u{2019}t been checked yet."
         );
-        assert_eq!(
-            unobserved.machine.last_change,
-            "No change recorded this launch"
-        );
+        assert_eq!(unobserved.machine.last_change, None);
         assert_eq!(unobserved.machine.supported, cfg!(target_os = "macos"));
 
-        // The page must be observed and idle before any verb — the machine card
+        // The page must be observed and idle before any verb — the machine status
         // shares that gate, so seed a live report first.
         let report =
             PackagesStatusReport::from_parts(true, true, "fp".into(), Some(&status("ok")), &[]);
@@ -4509,15 +4551,12 @@ mod tests {
         assert!(live.machine.observed);
         assert_eq!(
             live.machine.universal_control,
-            "Universal Control: at the OS default — the cursor roams to other Macs and iPads"
+            "Universal Control is on: the pointer can move to other Macs and iPads."
         );
         assert!(live.machine.reason.is_none());
         assert_eq!(live.machine.apply_enabled, cfg!(target_os = "macos"));
         assert!(!live.machine.nothing_to_apply);
-        assert_eq!(
-            live.machine.next,
-            "Apply now would set: Universal Control off for this host"
-        );
+        assert_eq!(live.machine.next, MACHINE_APPLY_WOULD);
         assert!(live.machine.saved.is_none(), "saved == measured ⇒ no note");
         // A switch flipped in Settings after the read is named, never shown as
         // already measured.
@@ -4527,10 +4566,46 @@ mod tests {
             .projection_at(now);
         assert_eq!(
             flipped.machine.saved.as_deref(),
-            Some(
-                "Saved since the last read: universal_control = \"leave\" — the next package pass or Apply now uses it"
-            )
+            Some("Saved: aterm leaves Universal Control as macOS has it.")
         );
+        // Off saved after a read that found Leave: the Saved line names Apply
+        // Now only where its button is drawn (something left to apply, nothing
+        // in the way). A Mac already off gets no Saved line: the measured line
+        // says it once. NEGATIVE CONTROLS: a Mac already off, and a home that
+        // isn't the account's, name no button.
+        for (uc, home, saved) in [
+            (
+                UcPosture::Default,
+                HomePosture::Account,
+                Some(
+                    "Saved: aterm turns Universal Control off at the next ALab tools check. \
+                     Apply Now does it now.",
+                ),
+            ),
+            (UcPosture::Disabled, HomePosture::Account, None),
+            (
+                UcPosture::Default,
+                HomePosture::Mismatch,
+                Some("Saved: aterm turns Universal Control off at the next ALab tools check."),
+            ),
+        ] {
+            let _ = service.replace_machine_state(Ok(atpkg::machine::MachineState {
+                policy: atpkg::config::UniversalControlPolicy::Leave,
+                ..machine_state(uc, home)
+            }));
+            let off = service
+                .state(true, true, true)
+                .with_machine_config(atpkg::config::UniversalControlPolicy::Off)
+                .projection_at(now);
+            assert_eq!(off.machine.saved.as_deref(), saved, "{uc:?} {home:?}");
+            assert_eq!(
+                saved.is_some_and(|saved| saved.contains("Apply Now")),
+                off.machine.next == MACHINE_APPLY_WOULD,
+                "Apply Now named exactly where it is drawn ({uc:?} {home:?})"
+            );
+        }
+        let _ = service
+            .replace_machine_state(Ok(machine_state(UcPosture::Default, HomePosture::Account)));
 
         // A recorded change carries its age; a verdict is quoted verbatim.
         service.note_machine_change(
@@ -4556,8 +4631,8 @@ mod tests {
         );
         let changed = service.state(true, true, true).projection_at(now);
         assert_eq!(
-            changed.machine.last_change,
-            "Last change: universal-control disabled · 2m ago"
+            changed.machine.last_change.as_deref(),
+            Some("Last change: universal-control disabled · 2m ago")
         );
         assert_eq!(
             changed.machine.last_verdict.as_deref(),
@@ -4578,14 +4653,11 @@ mod tests {
         let done = service.state(true, true, true).projection_at(now);
         assert_eq!(
             done.machine.universal_control,
-            "Universal Control: disabled on this Mac"
+            "Universal Control is off on this Mac."
         );
         assert!(!done.machine.apply_enabled);
         assert!(done.machine.nothing_to_apply);
-        assert_eq!(
-            done.machine.next,
-            "Nothing to apply — Universal Control is where [machine] wants it"
-        );
+        assert_eq!(done.machine.next, MACHINE_NOTHING_TO_APPLY);
 
         // A home mismatch disables the button and names the reason.
         let _ = service
@@ -4602,7 +4674,7 @@ mod tests {
                 .machine
                 .reason
                 .as_deref()
-                .is_some_and(|r| r.starts_with("Not applied here")),
+                .is_some_and(|r| r.starts_with("Not applied:")),
             "{:?}",
             mismatch.machine.reason
         );
@@ -4620,13 +4692,13 @@ mod tests {
         assert!(errored.machine.next.is_empty(), "{}", errored.machine.next);
         assert_eq!(
             errored.machine.reason.as_deref(),
-            Some("Could not read the machine state: atpkg machine printed no state")
+            Some("Couldn\u{2019}t read this Mac\u{2019}s settings: atpkg machine printed no state")
         );
         assert!(
             errored
                 .machine
                 .universal_control
-                .ends_with("(from the last successful read)"),
+                .ends_with("(as last read)."),
             "{}",
             errored.machine.universal_control
         );
@@ -4637,7 +4709,7 @@ mod tests {
         let _ = base;
     }
 
-    /// `atpkg machine apply` is a LOCAL verb: the card's Apply now must not inherit
+    /// `atpkg machine apply` is a LOCAL verb: the status's Apply Now must not inherit
     /// the package page's manager gate. With the manager inert (no pinned root key)
     /// or the status collection torn, the
     /// package verbs are off but the machine verdict and its button stay live.
@@ -4663,11 +4735,7 @@ mod tests {
                 "{why}: the machine verb is not"
             );
             assert!(!p.machine.nothing_to_apply, "{why}");
-            assert!(
-                p.machine.next.starts_with("Apply now would set"),
-                "{why}: {}",
-                p.machine.next
-            );
+            assert_eq!(p.machine.next, MACHINE_APPLY_WOULD, "{why}");
         }
     }
 
@@ -4700,16 +4768,12 @@ mod tests {
             .projection();
         assert!(!b.machine.apply_enabled);
         assert!(b.machine.nothing_to_apply);
-        assert!(
-            b.machine.next.starts_with("Nothing to apply"),
-            "{}",
-            b.machine.next
-        );
+        assert_eq!(b.machine.next, MACHINE_NOTHING_TO_APPLY);
         assert!(
             b.machine
                 .saved
                 .as_deref()
-                .is_some_and(|s| s.contains("universal_control = \"leave\"")),
+                .is_some_and(|s| s.contains("leaves Universal Control")),
             "{:?}",
             b.machine.saved
         );
@@ -4725,15 +4789,12 @@ mod tests {
             .projection();
         assert_eq!(a.machine.apply_enabled, cfg!(target_os = "macos"));
         assert!(!a.machine.nothing_to_apply);
-        assert_eq!(
-            a.machine.next,
-            "Apply now would set: Universal Control off for this host"
-        );
+        assert_eq!(a.machine.next, MACHINE_APPLY_WOULD);
         assert!(
             a.machine
                 .saved
                 .as_deref()
-                .is_some_and(|s| s.contains("universal_control = \"off\"")),
+                .is_some_and(|s| s.contains("turns Universal Control off")),
             "{:?}",
             a.machine.saved
         );
@@ -4772,7 +4833,7 @@ mod tests {
         assert!(service.machine().rerun);
 
         // The STALE read lands: the rerun is handed back to the caller, and the
-        // card keeps reading — the stale record never enables Apply.
+        // status keeps reading — the stale record never enables Apply.
         assert!(
             service
                 .replace_machine_state(Ok(machine_state(UcPosture::Default, HomePosture::Account)))
@@ -4833,7 +4894,7 @@ mod tests {
         let _ = service
             .replace_machine_state(Ok(machine_state(UcPosture::Default, HomePosture::Account)));
         let before = service.state(true, true, true).projection().machine;
-        assert_eq!(before.last_change, "No change recorded this launch");
+        assert_eq!(before.last_change, None);
 
         let at = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
         service.note_machine_change("universal-control disabled".to_string(), at);
@@ -4842,10 +4903,10 @@ mod tests {
             .projection_at(at + std::time::Duration::from_secs(24))
             .machine;
         assert!(
-            after
-                .last_change
-                .starts_with("Last change: universal-control disabled · "),
-            "{}",
+            after.last_change.as_deref().is_some_and(
+                |change| change.starts_with("Last change: universal-control disabled · ")
+            ),
+            "{:?}",
             after.last_change
         );
         // And a re-read can be asked for: the arm's other half.
@@ -4860,10 +4921,10 @@ mod tests {
     }
 
     /// A CONFIG THAT DOES NOT PARSE IS A REFUSAL, NOT A MEASUREMENT. The `[machine]`
-    /// default acts, so the card must not offer Apply — and must say which file to fix —
+    /// default acts, so the status must not offer Apply — and must say which file to fix —
     /// when the record reports that the switches could not be read.
     #[test]
-    fn an_unreadable_config_is_said_on_the_card_and_disables_apply() {
+    fn an_unreadable_config_is_said_in_the_status_and_disables_apply() {
         use atpkg::config::UniversalControlPolicy::Off;
         use atpkg::machine::{HomePosture, MachineState, UcPosture};
         let mut service = PackagesService::new();
@@ -4888,7 +4949,7 @@ mod tests {
             .projection()
             .machine;
         let reason = projection.reason.as_deref().expect("a refusal is said");
-        assert!(reason.contains("aterm.toml does not parse"), "{reason}");
+        assert!(reason.contains("aterm.toml has an error"), "{reason}");
         assert!(
             projection.next.is_empty(),
             "nothing is next when nothing may be applied: {projection:?}"
@@ -4922,8 +4983,8 @@ mod tests {
                 name: "partial",
                 state: machine_state(UcPosture::Partial, HomePosture::Account),
                 saved: Off,
-                universal_control: "Universal Control: partly disabled",
-                next: "Apply now would set: Universal Control off for this host",
+                universal_control: "Universal Control is partly off on this Mac.",
+                next: MACHINE_APPLY_WOULD,
                 reason_starts: None,
                 nothing_to_apply: false,
                 apply_on_macos: true,
@@ -4932,8 +4993,8 @@ mod tests {
                 name: "unknown",
                 state: machine_state(UcPosture::Unknown, HomePosture::Account),
                 saved: Off,
-                universal_control: "Universal Control: could not be read on this Mac",
-                next: "Apply now would set: Universal Control off for this host",
+                universal_control: "aterm couldn\u{2019}t read Universal Control on this Mac.",
+                next: MACHINE_APPLY_WOULD,
                 reason_starts: None,
                 nothing_to_apply: false,
                 apply_on_macos: true,
@@ -4945,8 +5006,8 @@ mod tests {
                     ..machine_state(UcPosture::Default, HomePosture::Account)
                 },
                 saved: Leave,
-                universal_control: "Universal Control: at the OS default — the cursor roams to other Macs and iPads · left alone ([machine] universal_control is not \"off\")",
-                next: "Nothing to apply — Universal Control is where [machine] wants it",
+                universal_control: "Universal Control is on: the pointer can move to other Macs and iPads.",
+                next: MACHINE_NOTHING_TO_APPLY,
                 reason_starts: None,
                 nothing_to_apply: true,
                 apply_on_macos: false,
@@ -4958,8 +5019,18 @@ mod tests {
                     ..machine_state(UcPosture::Disabled, HomePosture::Account)
                 },
                 saved: Leave,
-                universal_control: "Universal Control: disabled on this Mac",
-                next: "Nothing to apply — Universal Control is where [machine] wants it",
+                universal_control: "Universal Control is off on this Mac.",
+                next: MACHINE_NOTHING_TO_APPLY,
+                reason_starts: None,
+                nothing_to_apply: true,
+                apply_on_macos: false,
+            },
+            Row {
+                name: "home mismatch, already as chosen",
+                state: machine_state(UcPosture::Disabled, HomePosture::Mismatch),
+                saved: Off,
+                universal_control: "Universal Control is off on this Mac.",
+                next: MACHINE_NOTHING_TO_APPLY,
                 reason_starts: None,
                 nothing_to_apply: true,
                 apply_on_macos: false,
@@ -4968,9 +5039,11 @@ mod tests {
                 name: "home unresolved",
                 state: machine_state(UcPosture::Default, HomePosture::Unresolved),
                 saved: Off,
-                universal_control: "Universal Control: at the OS default — the cursor roams to other Macs and iPads",
+                universal_control: "Universal Control is on: the pointer can move to other Macs and iPads.",
                 next: "",
-                reason_starts: Some("Not applied here: the account home could not be resolved"),
+                reason_starts: Some(
+                    "Not applied: aterm couldn\u{2019}t find your account\u{2019}s home folder",
+                ),
                 nothing_to_apply: false,
                 apply_on_macos: false,
             },
@@ -5348,7 +5421,7 @@ mod tests {
             "2 min ago",
             "a relative time needs no zone"
         );
-        // The live reader (`date -r`), wherever it answers: the offset now, and a switch
+        // The live reader, wherever it answers: the offset now, and a switch
         // found exactly when this machine's zone has one in that week (a Pacific clock
         // bisects the real one).
         if let (Some(then), Some(at_now)) = (
@@ -5640,6 +5713,7 @@ mod tests {
             vendor: spec.vendor.to_string(),
             source_url: format!("{}2.1.280/darwin-arm64/claude", spec.url_prefixes[0]),
             sha256: "a".repeat(64),
+            sha512: String::new(),
             size: 1,
             tree_root: "0".repeat(64),
             apple_team: cfg!(target_os = "macos").then(|| spec.apple_team.to_string()),

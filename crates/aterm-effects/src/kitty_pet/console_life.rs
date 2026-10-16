@@ -969,7 +969,27 @@ impl PetBrain {
             } else {
                 PetGlyphId::PetStandEar
             });
-            if repairing && Self::console_may_stand(world, body, CLEARANCE) && self.flight.is_none()
+            let caret_overlaps_body = sense.caret.is_some_and(|(cr, cc)| {
+                let cr = f32::from(cr);
+                let cc = f32::from(cc);
+                cr + 1.0 > body.row
+                    && cr < body.row + body.rows
+                    && cc + 1.0 > body.col
+                    && cc < body.col + body.cols
+            });
+            let stand_pushed_past = home.is_some_and(|stand| {
+                (body.row - stand.row).abs() >= 0.25
+                    || if self.wall_side {
+                        body.col > stand.col + ARRIVED
+                    } else {
+                        body.col + ARRIVED < stand.col
+                    }
+            });
+            if repairing
+                && !caret_overlaps_body
+                && !stand_pushed_past
+                && Self::console_may_stand(world, body, CLEARANCE)
+                && self.flight.is_none()
             {
                 self.console.target = Some(body);
                 self.console.resident = true;
@@ -1438,10 +1458,26 @@ impl PetBrain {
         //
         // With the caret hidden (or no home) there is no stand, so the
         // admitted body is held where it stands.
-        let claimed = matches!(
-            self.console.attention,
-            PetAttention::Editing | PetAttention::Result
-        );
+        let caret_overlaps_body = sense.caret.is_some_and(|(cr, cc)| {
+            let cr = f32::from(cr);
+            let cc = f32::from(cc);
+            cr + 1.0 > body.row
+                && cr < body.row + body.rows
+                && cc + 1.0 > body.col
+                && cc < body.col + body.cols
+        });
+        let stand_pushed_past = |stand: PetRect| {
+            (body.row - stand.row).abs() >= 0.25
+                || if self.wall_side {
+                    body.col > stand.col + ARRIVED
+                } else {
+                    body.col + ARRIVED < stand.col
+                }
+        };
+        let claimed = matches!(self.console.attention, PetAttention::Result)
+            || (self.console.attention == PetAttention::Editing
+                && !caret_overlaps_body
+                && home.is_none_or(|stand| !stand_pushed_past(stand)));
         let target = match home.filter(|_| sense.caret.is_some()) {
             Some(stand)
                 if claimed
@@ -1722,8 +1758,19 @@ impl PetBrain {
     /// stand would be.
     fn console_caret_home(&self, sense: PetSense, width: f32) -> Option<PetRect> {
         let (r, c) = sense.caret.or(self.console.cursor_home)?;
-        let want = Self::station_with(c, sense.cols, width, self.standoff());
-        let stand = self.ink_stand(want, f32::from(r), width, sense.cols, sense.rows);
+        let want = if self.wall_side && f32::from(sense.cols) - width > 0.0 {
+            (f32::from(c) - width - STATION_LEAD - self.standoff()).max(0.0)
+        } else {
+            Self::station_with(c, sense.cols, width, self.standoff())
+        };
+        let stand = self.ink_stand_for(
+            want,
+            f32::from(r),
+            width,
+            sense.cols,
+            sense.rows,
+            Some((r, c)),
+        );
         let stand = self
             .console_station(stand, (sense.rows, sense.cols), width)
             .unwrap_or(stand);
@@ -3739,5 +3786,46 @@ mod tests {
             .filter(|w| !rolling(&w[0]) && rolling(&w[1]))
             .count();
         assert_eq!(rolls, 1, "performed at the new prompt, once");
+    }
+
+    #[test]
+    fn typing_after_repair_or_near_box_wall_never_sticks_on_caret_or_jiggles() {
+        let mut s = Scene::new();
+        s.type_text("hello");
+        let _ = s.watch(0.5);
+        // Backspace starts a repair, then forward typing advances past the repair target.
+        s.input(PetInputKind::Delete);
+        s.term.process(b"\x08 \x08");
+        s.frame(0.016);
+        for ch in "world!".chars() {
+            s.type_text(&ch.to_string());
+            let _ = s.watch(0.12);
+            let f = s.frame(0.016);
+            let cc = f32::from(s.term.cursor().col);
+            assert!(
+                f.col >= cc + 0.5 || f.col + art_cols(10, 20) <= cc + 0.1,
+                "cat at col {} must not stick on advancing caret at col {cc}",
+                f.col,
+            );
+        }
+
+        // Place a right-hand box border ahead on the same row and type toward it;
+        // the station must never step leftward onto the caret or sawtooth as lead decays.
+        s.term.process(b"\x1b[s\x1b[6;32H|\x1b[u");
+        for ch in "abcd".chars() {
+            s.type_text(&ch.to_string());
+            for _ in 0..10 {
+                let f = s.frame(0.02);
+                let cr = f32::from(s.term.cursor().row);
+                let cc = f32::from(s.term.cursor().col);
+                let on_caret_row = (f.row - cr).abs() < 0.5;
+                assert!(
+                    !on_caret_row || f.col >= cc + 0.5 || f.col + art_cols(10, 20) <= cc + 0.1,
+                    "cat at ({}, {}) must never park on caret ({cr}, {cc}) near box border",
+                    f.col,
+                    f.row
+                );
+            }
+        }
     }
 }

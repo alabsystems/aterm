@@ -2,11 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Transient terminal state cleared on reset.
-//!
-//! [`TransientState`] bundles the scalar fields and small buffers that
-//! `reset_common_fields` always clears together, so a new resettable field is
-//! added in one place.
+//! Transient terminal state: the fields `reset_common_fields` clears together
+//! ([`TransientState`]).
 
 use super::response_rate_limiter::ResponseRateLimiter;
 use super::types::SgrStackEntry;
@@ -16,15 +13,14 @@ use std::sync::Arc;
 
 use aterm_grid::ImageData;
 
-// XTSAVE mode storage.
+// XTSAVE saved DEC private modes.
 type XtsaveModesMap = HashMap<u16, bool>;
 
-/// Default foreground/background (light grey on black), re-exported from
-/// `aterm-types` so the runtime state and `TerminalConfig::default()` share one
-/// source. See [`aterm_types::DEFAULT_FOREGROUND`].
+/// Default foreground (light grey), single-sourced from [`aterm_types::DEFAULT_FOREGROUND`]
+/// so the runtime state and `TerminalConfig::default()` agree.
 pub(super) const DEFAULT_FOREGROUND: Rgb = aterm_types::DEFAULT_FOREGROUND;
 
-/// See [`DEFAULT_FOREGROUND`]; the spec default background (black), single-sourced.
+/// Default background (black); see [`DEFAULT_FOREGROUND`].
 pub(super) const DEFAULT_BACKGROUND: Rgb = aterm_types::DEFAULT_BACKGROUND;
 
 /// VT52 cursor addressing state: ESC Y row col collects two parameter bytes.
@@ -39,27 +35,25 @@ pub(super) enum Vt52CursorState {
     WaitingCol(u8),
 }
 
-/// Grouped transient terminal state. [`reset`](Self::reset) bumps
-/// `reset_generation` and clears the rest but the replies already owed to the
-/// PTY peer (`response_buffer`) and their rate limiter; the monotonic counts
-/// and serials, which must never rewind (`full_clears`, `screen_mutations`,
-/// `kitty_serial`, `print_anchor_seq`); the per-batch clocks, which each batch
-/// overwrites before any reader runs; and `kitty_last_assigned_id`, where the
-/// next `I=` id's search starts. New resettable fields go here and in `reset`.
+/// Grouped transient terminal state. [`reset`](Self::reset) bumps `reset_generation` and
+/// `screen_replaced` and clears the rest, except the replies already owed to the PTY peer
+/// (`response_buffer`) and their rate limiter; the monotonic counts and serials, which never
+/// rewind (`sync_end_seq`, `full_clears`, `screen_mutations`, `kitty_serial`,
+/// `print_anchor_seq`); the per-batch clocks, which each batch overwrites before any reader
+/// runs; and `kitty_last_assigned_id`, where the next `I=` id's search starts. New
+/// resettable fields go here and in `reset`.
 #[allow(
     clippy::struct_excessive_bools,
     reason = "independent terminal flags, not a state machine"
 )]
 pub(super) struct TransientState {
-    /// Response buffer for DSR/DA and other terminal responses. Not cleared by
-    /// [`reset`](Self::reset): a reply already generated is owed to the PTY
-    /// peer whatever follows it, so a query's answer cannot depend on whether
-    /// a later RIS arrived in the same read.
+    /// Response buffer for DSR/DA and other terminal responses. Not reset: a reply
+    /// already generated is owed to the PTY peer, so a query's answer cannot depend on
+    /// whether a later RIS arrived in the same read.
     pub(super) response_buffer: Vec<u8>,
     /// Token-bucket rate limiter gating `send_response`, so a peer spamming
-    /// DSR/DA/DECRQSS cannot force unlimited responses even when the host
-    /// drains the buffer in a tight loop. Not reset either: an RIS would
-    /// refill the bucket on demand.
+    /// DSR/DA/DECRQSS cannot force unlimited responses even when the host drains the
+    /// buffer in a tight loop. Not reset: an RIS would refill the bucket on demand.
     pub(super) response_rate_limiter: ResponseRateLimiter,
     /// Last graphic character received (for REP - CSI b). Stored raw
     /// (pre-charset-translation): xterm CASE_REP re-translates it through
@@ -98,35 +92,28 @@ pub(super) struct TransientState {
     /// exit (47/1047/1049) and full resets. A swapped or wiped screen no longer
     /// holds the rows a resize displaced. Never reset to 0.
     pub(super) screen_replaced: u64,
-    /// The ENGINE'S RENDER DEBT: `(shift, pushed)`, the sums of
-    /// `ResizeReport::shift()` and `net_pushed()` over the alternate-screen,
-    /// non-reflowed resizes run under `ResizePolicy::Native` since the screen
-    /// was last repainted from scratch (a full clear, a screen switch, a
-    /// reset). `(0, 0)` means the rows sit where the program painted them;
-    /// `(-1, 0)` means every row is one higher (a shrink demoted the top row
-    /// and nothing handed it back). Kept beside the two counters that zero it,
-    /// so it is exact however far the 16-entry journal has been overrun.
-    /// Session-only, like the journal: a checkpoint restore starts at
-    /// `(0, 0)` and the host seeds it ([`Terminal::seed_render_debt`]).
+    /// The engine's render debt `(shift, pushed)`: the sums of `ResizeReport::shift()`
+    /// and `net_pushed()` over the alternate-screen, non-reflowed resizes run under
+    /// `ResizePolicy::Native` since the screen was last repainted from scratch (a full
+    /// clear, a screen switch, a reset). `(0, 0)` means the rows sit where the program
+    /// painted them; `(-1, 0)` means every row is one higher. Kept beside the two counters
+    /// that zero it, so it stays exact however far the 16-entry journal is overrun.
+    /// Session-only: a checkpoint restore starts at `(0, 0)` and the host seeds it
+    /// ([`Terminal::seed_render_debt`](super::Terminal::seed_render_debt)).
     pub(super) render_debt: (i32, i32),
-    /// Monotonic count of NON-EMPTY batches [`process_at`](super::Terminal::process_at)
-    /// has consumed — every byte of output the terminal was fed, whatever it
-    /// changed — plus every Kitty animation frame step
-    /// ([`advance_kitty_animations`](super::Terminal::advance_kitty_animations),
-    /// the host's timer, no output). `content_seq` misses some of those
-    /// mutations (a VS15/VS16 width fix and an OSC 1337 image mark damage
-    /// without bumping it, a Kitty image transmitted or deleted changes what a
-    /// placeholder cell shows without touching the cell, and a frame step swaps
-    /// the picture a cell shows), so a reader that must never call a changed
-    /// screen unchanged keys on this as well. Never reset to 0.
+    /// Monotonic count of non-empty batches [`process_at`](super::Terminal::process_at)
+    /// consumed, whatever they changed, plus every Kitty animation frame step
+    /// ([`advance_kitty_animations`](super::Terminal::advance_kitty_animations)).
+    /// `content_seq` misses some mutations (a VS15/VS16 width fix, an OSC 1337 image
+    /// mark, a Kitty image transmitted or deleted under a placeholder cell, a frame step),
+    /// so a reader that must never call a changed screen unchanged keys on this as well.
+    /// Never reset to 0.
     pub(super) screen_mutations: u64,
-    /// Whether the CURRENT synchronized-output window has accepted any complete
-    /// PTY action since its opening `?2026h`. A host may safely present a
-    /// just-closed frame while the mode level already reads true again only
-    /// while this is false: once the new window is dirty, the mutable grid may
-    /// already contain a prefix of the next frame. Conservative by design —
-    /// parser queries/no-ops count too, so the exceptional close+reopen present
-    /// license fails closed rather than risking a torn frame.
+    /// Whether the current synchronized-output window has accepted any complete PTY
+    /// action since its `?2026h`. A host may present a just-closed frame while the mode
+    /// already reads true again only while this is false: once the new window is dirty,
+    /// the grid may hold a prefix of the next frame. Parser queries and no-ops count too,
+    /// so the close+reopen present fails closed.
     pub(super) sync_open_dirty: bool,
     /// Whether the program's synchronized-output bracket is open by its own
     /// account: set by `?2026h`, cleared only by `?2026l`, DECSTR or RIS. Unlike
@@ -136,16 +123,14 @@ pub(super) struct TransientState {
     /// Whether the program's open bracket (`app_sync_open`) has accepted any
     /// complete PTY action; the program-view twin of `sync_open_dirty`.
     pub(super) app_sync_dirty: bool,
-    /// Logical "now" for the current `process_at()` batch, captured once at the
-    /// top of [`Terminal::process_at`] ([`Terminal::process`] passes
-    /// `Instant::now()`). The bell rate-limiter, `sync_start` and the mode-2026
-    /// timeout read it instead of the clock, so a `(bytes, instant)` schedule
-    /// replays identically. Always overwritten before any reader runs.
+    /// Logical "now" for the current batch, captured once at the top of
+    /// [`Terminal::process_at`](super::Terminal::process_at). The bell rate limiter,
+    /// `sync_start` and the mode-2026 timeout read it instead of the clock, so a
+    /// `(bytes, instant)` schedule replays identically.
     pub(super) process_now: aterm_time::Instant,
-    /// Wall-clock epoch milliseconds for the current `process_at()` batch,
-    /// recorded by OSC 133/633 marks B/C/D; captured with [`process_now`] so
-    /// replay reproduces the `command_*_time_ms` values. `None` without a
-    /// platform clock. Always overwritten before any reader runs.
+    /// Wall-clock epoch milliseconds for the current batch, recorded by OSC 133/633
+    /// marks B/C/D; captured with `process_now` so replay reproduces the
+    /// `command_*_time_ms` values. `None` without a platform clock.
     pub(super) process_wall_ms: Option<u64>,
     /// SGR attribute stack for XTPUSHSGR/XTPOPSGR.
     pub(super) sgr_stack: VecDeque<SgrStackEntry>,
@@ -154,8 +139,8 @@ pub(super) struct TransientState {
     /// Whether the last combining character added was a ZWJ (U+200D); gates the
     /// grid lookup in `should_combine_with_previous_zwj`.
     pub(super) last_combining_was_zwj: bool,
-    /// Cached flag: true when `current_hyperlink.is_some() || current_underline_color.is_some()`.
-    /// Avoids 2 per-character Option checks in `write_char_core`.
+    /// Cached `current_hyperlink.is_some() || current_underline_color.is_some()`, so
+    /// `write_char_core` makes one check per character instead of two.
     pub(super) has_transient_extras: bool,
     /// Set by the RIS handler for side effects it cannot perform inside the
     /// parser's dispatch (clearing secure keyboard entry and the parked
@@ -187,14 +172,13 @@ pub(super) struct TransientState {
     /// an earlier app's save. Not checkpointed: a restored session takes the
     /// 1049 exit.
     pub(super) alt_entered_without_cursor_save: bool,
-    /// An orphaned alternate screen was left while a Windows console host sits
-    /// between us and the app (`win32_input_active`): our screen is primary again
-    /// but conhost's own alternate buffer is still up. Its next alt-screen enter
-    /// arrives as a full blank repaint followed by `?1049h` in one read, and its
-    /// exit as `?1049l` followed by a repaint of its frozen primary; both would
-    /// overwrite what the shell printed since. Set by
-    /// `TerminalHandler::leave_orphaned_alternate_screen`; taken by the first of
-    /// those events, which first moves the screen's rows into the scrollback
+    /// An orphaned alternate screen was left while a Windows console host sits between us
+    /// and the app (`win32_input_active`): our screen is primary again but conhost's
+    /// alternate buffer is still up. Its next alt-screen enter (a blank repaint then
+    /// `?1049h`, in one read) or exit (`?1049l` then a repaint of its frozen primary)
+    /// would overwrite what the shell printed since. Set by
+    /// `TerminalHandler::leave_orphaned_alternate_screen`; taken by the first of those
+    /// events, which first moves the screen's rows into the scrollback
     /// (`TerminalHandler::keep_screen_from_conhost_repaint`).
     pub(super) conhost_alt_screen_left_up: bool,
     /// XTSAVE (`CSI ? Ps s`) saved DEC private mode values, restored by
@@ -245,44 +229,31 @@ pub(super) struct TransientState {
     /// (`aterm_grid::KittyPlacementTag::serial`) or to an image first
     /// transmitted (`KittyPlacementTag::image_serial`).
     pub(super) kitty_serial: u32,
-    /// Running total of `ImageData.bytes.len()` across every slot in
-    /// `kitty_images`, `kitty_frames` and `kitty_variants` (each counted, even
-    /// when a base-transmit Arc is shared). The handler enforces
-    /// `MAX_KITTY_STORE_BYTES` against it so the per-item caps cannot multiply
-    /// into a multi-GiB footprint. Decremented on delete, clear and base
-    /// replacement.
+    /// Running total of `ImageData.bytes.len()` over every slot in `kitty_images`,
+    /// `kitty_frames` and `kitty_variants` (a shared base-transmit Arc counts each time),
+    /// held under `MAX_KITTY_STORE_BYTES` so the per-item caps cannot multiply into a
+    /// multi-GiB footprint.
     pub(super) kitty_total_bytes: usize,
-    /// In-flight Kitty chunked transmission (`m=1`): the first chunk's command
-    /// with `payload` growing as continuation chunks append, finalized on `m=0`.
-    /// Bounded by `MAX_KITTY_IMAGE_BYTES`. Dropped by a command that ends it
-    /// (`KittyCommand::during_load`), a canceled chunk, a shell prompt or
-    /// command start, and RIS.
+    /// In-flight Kitty chunked transmission (`m=1`): the first chunk's command, its
+    /// `payload` growing per chunk, finalized on `m=0`. Bounded by `MAX_KITTY_IMAGE_BYTES`.
+    /// Dropped by a command that ends it (`KittyCommand::during_load`), a canceled chunk,
+    /// a shell prompt or command start, and RIS.
     pub(super) kitty_pending: Option<crate::terminal::kitty_graphics::KittyCommand>,
-    /// Per screen (`[main, alternate]`, indexed by `modes.alternate_screen`),
-    /// an upper bound on the payload bytes of the inline images that screen
-    /// shows (the Kitty store's excepted): its last count, plus every image
-    /// stamped on it since, plus every image the store let go since (either
-    /// screen may still show one). Held under `MAX_LIVE_IMAGE_BYTES` by
-    /// `TerminalHandler::admit_live_image`, which counts and trims the active
-    /// screen's images only when its bound passes the budget. One bound per
-    /// screen because a count sees only the active grid: a shared one, reset
-    /// to the near-empty alternate screen's count, left the parked main
-    /// screen's images uncharged, a budget more per `?47h`/`?47l` round trip.
+    /// Per screen (`[main, alternate]`, indexed by `modes.alternate_screen`), an upper
+    /// bound on the payload bytes of the inline images that screen shows, held under
+    /// `MAX_LIVE_IMAGE_BYTES` by `TerminalHandler::admit_live_image` (which explains the
+    /// bound). One per screen because a count sees only the active grid.
     pub(super) live_image_charge: [usize; 2],
     /// Edge-triggered BEL flag set by `handle_bell()` (after rate limiting) and
     /// drained by `Terminal::drain_bell()`, for polling hosts.
     pub(super) bell_pending: bool,
     /// App-event queue of OSC payloads `(code, payload)` the host polls via
-    /// `Terminal::take_osc_event`: OSC 52 decoded clipboard, OSC 7 cwd, OSC 133
-    /// marks. Separate from `response_buffer` (PTY replies). Bounded by count and
-    /// bytes (`OscEventQueue`); cleared on reset.
+    /// `Terminal::take_osc_event`: OSC 52 decoded clipboard, OSC 7 cwd, OSC 133 marks.
     pub(super) osc_events: OscEventQueue,
-    /// Where the most recent PTY print run ended: the active-grid cursor
-    /// `(row, col)` after each print action (`print` / `print_ascii_bulk` /
-    /// `print_unicode_bulk`). The echo anchor the cursor-effect host samples
-    /// (`Terminal::print_anchor`): a TUI that hides or parks the cursor still
-    /// ends each keystroke's rewrite past the previous one's end. Observability
-    /// only; cleared on reset.
+    /// Where the most recent PTY print run ended: the active-grid cursor `(row, col)`
+    /// after each print action. The echo anchor the cursor-effect host samples
+    /// (`Terminal::print_anchor`): a TUI that hides or parks the cursor still ends each
+    /// keystroke's rewrite past the previous one's end. Cleared on reset.
     pub(super) print_anchor: Option<(u16, u16)>,
     /// Monotonic count of print actions, paired with [`Self::print_anchor`] so
     /// an unchanged end position still reads as new output. Never reset (a
@@ -310,10 +281,11 @@ impl TransientState {
             sync_open_dirty: false,
             app_sync_open: false,
             app_sync_dirty: false,
-            // Placeholder, overwritten at the top of every process_at() before any
-            // reader runs. aterm_time::Instant is the JS clock on wasm. grep_guard
-            // requires the clock exemption on the call line itself.
-            process_now: aterm_time::Instant::now(), // CLOCK-EXEMPT: seed only
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "a seed process_at overwrites before any reader runs"
+            )]
+            process_now: aterm_time::Instant::now(),
             process_wall_ms: None,
             sgr_stack: VecDeque::new(),
             pipeline_timestamps: PipelineTimestamps::default(),
@@ -362,15 +334,14 @@ impl TransientState {
         self.current_hyperlink_id = None;
         self.current_underline_color = None;
         self.vt52_cursor_state = Vt52CursorState::default();
-        // A reset closes any open sync window — bump the close counter (never
-        // zero it: a host comparing across the reset must still see "closed").
+        // A reset closes any open sync window. These counters are bumped, never zeroed:
+        // a reader comparing across the reset must see the change.
         if self.sync_start.is_some() {
             self.sync_end_seq += 1;
         }
-        // Never zeroed either: the alt-screen archive keys its wipe on a change.
         self.reset_generation = self.reset_generation.wrapping_add(1);
-        // A full reset replaces the whole screen; the counter itself survives.
-        // `full_clears` is not touched: a reader keys on either advancing.
+        // A full reset replaces the whole screen; `full_clears` is untouched, since a
+        // reader keys on either advancing.
         self.screen_replaced = self.screen_replaced.wrapping_add(1);
         self.render_debt = (0, 0);
         self.sync_start = None;
@@ -392,12 +363,9 @@ impl TransientState {
         self.last_osc_bel_terminated = false;
         self.bell_pending = false;
         self.osc_events.clear();
-        // The echo anchor names a pre-reset coordinate space; the seq is
-        // deliberately not rezeroed (see its field doc).
+        // The echo anchor names a pre-reset coordinate space; its seq is never rezeroed.
         self.print_anchor = None;
-        // RIS clears the Kitty graphics store (as kitty and xterm do, and as
-        // `a=d` delete-all does); the byte budget drops with it so it cannot
-        // reject later valid images, and no stale id can display.
+        // RIS clears the Kitty graphics store (as kitty and xterm do) and its byte budget.
         self.kitty_images.clear();
         self.kitty_frames.clear();
         self.kitty_variants.clear();
@@ -406,24 +374,20 @@ impl TransientState {
         self.kitty_floating.clear();
         self.kitty_numbers.clear();
         self.kitty_total_bytes = 0;
-        // Also drop any in-flight chunked transmission (`m=1`): left here it
-        // would merge into the first post-reset Kitty command and keep up to
-        // MAX_KITTY_IMAGE_BYTES alive across the reset.
+        // An in-flight chunked transmission (`m=1`) would otherwise merge into the first
+        // post-reset Kitty command and keep up to MAX_KITTY_IMAGE_BYTES alive.
         self.kitty_pending = None;
         // Neither reset screen shows an image.
         self.live_image_charge = [0; 2];
     }
 }
 
-/// The poll-host app-event queue ([`TransientState::osc_events`]): REAL OSC
-/// payloads `(code, payload)` in arrival order, bounded by count AND by total
-/// payload bytes.
+/// The poll-host app-event queue ([`TransientState::osc_events`]): OSC payloads
+/// `(code, payload)` in arrival order, bounded by count and by total payload bytes.
 ///
-/// A count cap alone let 1024 OSC 52 sets of up to 64 KiB each pin ~64 MiB per
-/// tab, and the native hosts never drain this queue (only the wasm and gpu-web
-/// hosts poll it). Past either bound the OLDEST events are dropped, so a host
-/// that polls late still sees the newest clipboard, cwd and mark. The byte
-/// total is kept by every mutation, so a push is O(1) amortized.
+/// A count cap alone would let 1024 OSC 52 sets of 64 KiB pin ~64 MiB per tab, and only
+/// the wasm and gpu-web hosts drain this queue. Past either bound the oldest events are
+/// dropped, so a host that polls late still sees the newest clipboard, cwd and mark.
 #[derive(Debug, Default)]
 pub(super) struct OscEventQueue {
     events: VecDeque<(u32, String)>,
@@ -607,11 +571,10 @@ pub(super) struct KittyVirtual {
     pub(super) image: Arc<ImageData>,
 }
 
-/// One Kitty placement relative to a virtual placement, directly or through
-/// other such placements (see `TransientState::kitty_floating`). It is not
-/// stamped into cells: it shows wherever its virtual ancestor's placeholders
-/// are printed, which moves with the text, so the render snapshot places it
-/// each frame (`kitty_floating::floating_origins`).
+/// One Kitty placement relative to a virtual placement, directly or through other such
+/// placements (see `TransientState::kitty_floating`). Not stamped into cells: it shows
+/// wherever its virtual ancestor's placeholders are printed, so the render snapshot places
+/// it each frame (`kitty_floating::floating_origins`).
 #[derive(Debug, Clone)]
 pub(super) struct KittyFloating {
     /// Its image id, placement id and serial.
@@ -648,9 +611,9 @@ pub(super) struct KittyRelation {
     pub(super) dy: i32,
 }
 
-/// Which placement a relative placement follows: by `(image id, placement
-/// id)` when the parent has a placement id — a re-put moves that placement,
-/// and its children follow it — else by the parent's one-off serial.
+/// Which placement a relative placement follows: `(image id, placement id)` when the
+/// parent has a placement id (a re-put moves it, and its children follow), else the
+/// parent's one-off serial.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum KittyParent {
     /// The parent's image id and non-zero placement id.

@@ -1,0 +1,50 @@
+# claude-code 2.1.300 · MEASURED 2026-10-15, `aterm ctl text` of a private headless aterm (144x50, aterm 0.103.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, tools/real-claude-lab) · a PreToolUse hook on Bash answering ask in the agent's own user settings, a Bash sed -i of an in-project file: drawn as an Edit file box, `Yes` / `No`, with NO reason row: the hook's reason is not drawn (ATERM-KI-1015-1 F1)
+✻ Churned for 0s · done 7:13 AM
+
+❯ toolstart
+
+⏺ Update(notes.txt)
+  ⎿  (No output)
+
+⏺ Tool call done.
+
+✻ Sautéed for 0s · done 7:13 AM
+
+❯ toolstart
+
+⏺ Update(notes.txt)
+  ⎿  (No output)
+
+⏺ Tool call done.
+
+✻ Cooked for 0s · done 7:13 AM
+
+❯ toolstart
+
+⏺ Update(notes.txt)
+  ⎿  Interrupted · What should Claude do instead?
+
+✻ Cooked for 0s · done 7:14 AM
+
+⏺ Auto mode lets Claude handle permission prompts automatically — Claude checks each tool call for risky actions and prompt injection
+  before executing. Actions Claude identifies as safe are executed, while actions Claude identifies as risky are blocked and Claude may
+  try a different approach. Ideal for long-running tasks. Sessions are slightly more expensive. Claude can make mistakes that allow
+  harmful commands to run, it's recommended to only use in isolated environments. Shift+Tab to change mode.
+
+❯ toolstart
+
+⏺ Update(notes.txt)
+  ⎿  Waiting…
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Edit file
+ notes.txt
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ 1 -seed
+ 1 +sprout
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Do you want to make this edit to notes.txt?
+ ❯ 1. Yes
+   2. No
+
+ Esc to cancel · Tab to amend

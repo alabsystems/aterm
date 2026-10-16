@@ -2,42 +2,33 @@
 // Copyright 2026 Andrew Yates
 
 //! A phrase boundary's space keeps its light: in a line like
-//! `› Adding Fable. HEY! zoom out. git pull▮` typed in bursts with thinking
-//! pauses between, the spaces at phrase boundaries must stay lit like every
-//! other cell of the one continuous walk (owner, 2026-09-21).
+//! `› Adding Fable. HEY! zoom out. git pull▮` typed in bursts with thinking pauses
+//! between, the spaces at phrase boundaries stay lit like every other cell of the
+//! one continuous walk.
 //!
-//! This is `scrub_gaps.rs`'s host-seam harness (a real
-//! `aterm_core::terminal::Terminal` driven byte for byte, rows sampled as
-//! `app_render.rs`'s frame hold samples them, fed to `CursorGlow` on a 16 ms
-//! frame train) aimed at that gesture: four phrases at 12 cps with 0.3–3 s
-//! pauses, the boundary space as the last key before the pause or the first
-//! after it, through zsh and an Ink-shaped composer
-//! (`docs/design/repro/inkish.py`), plus what a real Ink composer adds: its own
-//! inverse-video cursor cell, keys coalesced into one repaint under load,
-//! repaints during a pause with no content change, and a space's repaint
-//! landing late, past the typed hint's quarter-second freshness, with nothing
-//! after it at a burst's end.
+//! `scrub_gaps.rs`'s host-seam harness (a real `Terminal` driven byte for byte, rows
+//! sampled as `app_render.rs`'s frame hold samples them, fed to `CursorGlow` on a
+//! 16 ms frame train) aimed at that gesture: four phrases at 12 cps with 0.3–3 s
+//! pauses, the boundary space as the last key before the pause or the first after
+//! it, through zsh and an Ink-shaped composer (`docs/design/repro/inkish.py`), plus
+//! what a real Ink composer adds: its own inverse-video cursor cell, keys coalesced
+//! into one repaint, repaints during a pause with no content change, and a space's
+//! repaint landing past the typed hint's quarter-second freshness.
 //!
-//! The third composer, [`Composer::ClaudeCode`], writes exactly the frames
-//! `ptyrec.py` recorded from Claude Code mid-turn: a letter is one DEC 2026
-//! bracket (hide, home, CR, CUF to the column, CUD to the row, one glyph, park
-//! at the last row, CUP back after the glyph, show), a space is a bracket with
-//! only the CUP, and ~0.95 s into a pause one frame erases part of a status
-//! row. Independent dials ([`CcShape`]): the turn's spinner frame every 100 ms
-//! on `ROW - 3`; keys coalesced into one frame; bytes fed in PTY-sized chunks
-//! with the host's present rule between; a key's frame split from its key by
-//! up to half a second (so the engine holds the key and its cell comes from
-//! the echo); and spinner frames between a key and its frame. The present rule
-//! is `app_render.rs`'s: the frame hold runs when a bracket closes, when one
-//! has stayed open past `SYNC_HOLD_CAP` (150 ms, sampling the partial state),
-//! and every 16 ms while no bracket is open; a held frame runs no probe and no
-//! tick.
+//! [`Composer::ClaudeCode`] writes the frames `ptyrec.py` recorded from Claude Code
+//! mid-turn: a letter is one DEC 2026 bracket (hide, home, CR, CUF to the column,
+//! CUD to the row, one glyph, park at the last row, CUP back after the glyph, show),
+//! a space is a bracket with only the CUP, and ~0.95 s into a pause one frame erases
+//! part of a status row. Its dials ([`CcShape`]): the spinner frame every 100 ms on
+//! `ROW - 3`, keys coalesced into one frame, PTY-sized chunks with the host's present
+//! rule between, and a key's frame up to half a second after its key. The present
+//! rule is `app_render.rs`'s: the frame hold runs when a bracket closes, when one has
+//! stayed open past `SYNC_HOLD_CAP` (150 ms, sampling the partial state), and every
+//! 16 ms while no bracket is open; a held frame runs no probe and no tick.
 //!
-//! Every take's census is printed: typed columns with no owner (or no coverage
-//! on the settled final frame), and every cohort on the row as `(id, col0,
-//! col1, phase, phrase, wake, abandoned)`. One assertion per (composer,
-//! placement, pause): no gap on the final frame or on any settled post-burst
-//! frame.
+//! Every take's census is printed (typed columns with no owner or coverage, and every
+//! cohort on the row), and every take asserts no hole on the final frame or on any
+//! settled post-burst frame.
 
 use crate::common::{
     caret_sample, class_of, note_blink, observe_caret_row, observe_ribbon_rows, rainbow_cfg,
@@ -49,28 +40,26 @@ use aterm_effects::rainbow_kitty::ribbon::{Phase, Ribbon};
 use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
-/// The owner's grid: 63 rows, the composer on row 61.
+/// The grid: 63 rows, the composer on row 61.
 const ROWS: usize = 63;
 const COLS: usize = 80;
 const CW: usize = 8;
 const CH: usize = 16;
 const ROW: u16 = 61;
-/// The composer's two-cell prefix (`› ` for Ink, `% ` for zsh): the text
-/// starts at this column, as it did in the owner's screenshot.
+/// The composer's two-cell prefix (`› ` for Ink, `% ` for zsh): the text starts at
+/// this column.
 const COL0: u16 = 2;
-/// The owner's four phrases, in order; the boundary spaces are placed by the
-/// scenario.
+/// The four phrases, in order; the scenario places the boundary spaces.
 const BURSTS: [&str; 4] = ["Adding", "Fable.", "HEY!", "zoom out. git pull"];
 /// 12 cps.
 const KEY_MS: u64 = 83;
-/// The frame train.
 const FRAME_MS: u64 = 16;
 /// `inkish.py`'s split between the redraw's head and its tail.
 const INK_SPLIT_MS: u64 = 30;
 /// The thinking pauses swept, ms — either side of the 900 ms phrase rest.
 const PAUSES: [u64; 7] = [300, 700, 950, 1200, 1500, 2000, 3000];
-/// How long after the last key the FINAL census is read: inside the grace,
-/// so every cell of the line should be lit and past its attack.
+/// How long after the last key the final census is read: inside the grace, so
+/// every cell of the line should be lit and past its attack.
 const SETTLE_MS: u64 = 200;
 
 // ---- Claude Code's recorded shapes -------------------------------------
@@ -84,7 +73,7 @@ const SPINNER_MS: u64 = 100;
 const IDLE_FRAME_MS: u64 = 950;
 /// The spinner's glyphs, cycled one per frame.
 const SPINNER: [char; 6] = ['✻', '✽', '✶', '✳', '✢', '·'];
-/// The owner's turn had run 30 s at the screenshot.
+/// How long the turn has run when a take starts, for the spinner's elapsed count.
 const TURN_BASE_S: u64 = 30;
 /// The PTY chunk gap of a starved reader thread (load ~58): two 64-byte
 /// chunks keep a bracket open 80 ms, three keep it open past the cap.
@@ -101,7 +90,7 @@ const SYNC_OFF: &str = "\x1b[?2026l";
 const HIDE: &str = "\x1b[?25l";
 const SHOW: &str = "\x1b[?25h";
 
-/// The owner's config: rainbow kitty, tall, intensity 1.00, dark.
+/// The config under test: rainbow kitty, tall, intensity 1.00, dark.
 fn cfg() -> GlowConfig {
     GlowConfig {
         intensity: 1.0,
@@ -109,7 +98,6 @@ fn cfg() -> GlowConfig {
     }
 }
 
-/// The full line, the bursts joined by their boundary spaces.
 fn line() -> String {
     BURSTS.join(" ")
 }
@@ -512,7 +500,6 @@ impl Host {
         self.frame();
     }
 
-    /// One frame of the train, 16 ms on.
     fn step(&mut self) {
         self.now += Duration::from_millis(FRAME_MS);
         self.present();
@@ -579,7 +566,6 @@ impl Host {
         }
     }
 
-    /// Frames at 16 ms for `ms`.
     fn idle(&mut self, ms: u64) {
         let t = self.now + Duration::from_millis(ms);
         self.idle_to(t);
@@ -1289,8 +1275,7 @@ fn an_ink_composer_with_a_hidden_caret_keeps_every_boundary_space_lit() {
     );
 }
 
-/// (ii) keys coalesced into one repaint under load — two, and the three
-/// the owner's ring showed licensed as one key.
+/// (ii) two or three keys coalesced into one repaint under load.
 #[test]
 fn an_ink_composer_coalescing_keys_into_one_repaint_keeps_every_boundary_space_lit() {
     let mut takes = Vec::new();
@@ -1440,8 +1425,8 @@ fn claude_code_s_recorded_frames_idle_keep_every_boundary_space_lit_at_25cps() {
     assert_cc_takes(&takes);
 }
 
-/// The owner's moment: a turn running, the spinner frame every 100 ms on
-/// `ROW - 3` between the keys and their frames.
+/// Mid-turn: the spinner frame every 100 ms on `ROW - 3` between the keys and
+/// their frames.
 #[test]
 fn claude_code_s_recorded_frames_mid_turn_keep_every_boundary_space_lit_at_10cps() {
     let takes = cc_sweep(true, CC_CADENCES[0]);
@@ -1453,5 +1438,3 @@ fn claude_code_s_recorded_frames_mid_turn_keep_every_boundary_space_lit_at_25cps
     let takes = cc_sweep(true, CC_CADENCES[1]);
     assert_cc_takes(&takes);
 }
-
-// ---- the body, for the owner's screenshot --------------------------------

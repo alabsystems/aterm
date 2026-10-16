@@ -4,16 +4,11 @@
 //! The pet follows the caret it cannot see.
 //!
 //! Programs that hide the cursor with DECTCEM while repainting (progress bars,
-//! spinners, pagers, editors, LLM consoles) still have a caret. The host sends
-//! the caret cell and its visibility separately (`PetSense::caret` /
-//! `PetSense::caret_drawn`), so the console's hidden-caret hold is bounded
-//! when the caret is merely unpainted and unbounded only when it is genuinely
-//! absent (scrollback). Otherwise the pet would freeze wherever it stood for
-//! the whole hide and then cross many cells in one frame.
-//!
-//! Two related laws: the console's scroll compensation must not carry the body
-//! off the top of the glass, and a flight born this tick must not be advanced
-//! by this tick's clock.
+//! spinners, pagers, editors, LLM consoles) still have a caret. The host sends the
+//! caret cell and its visibility separately (`PetSense::caret` /
+//! `PetSense::caret_drawn`), so the console's hidden-caret hold is bounded when the
+//! caret is merely unpainted and unbounded only when it is absent (scrollback);
+//! an unbounded hold would freeze the pet for the whole hide, then jump it.
 
 use std::time::{Duration, Instant};
 
@@ -78,11 +73,11 @@ impl Scene {
 }
 
 /// A caret that moves while the cursor is hidden is still a caret, and the pet
-/// arrives at it rather than sitting where the hide began.
+/// arrives at it.
 #[test]
 fn a_pet_follows_a_caret_that_moves_while_the_cursor_is_hidden() {
     let mut s = Scene::new();
-    // A prompt near the TOP, the seat the owner kept finding the cat stuck in.
+    // A prompt near the top.
     s.term.process(b"\x1b[1;5H");
     let settled = s.settle(120);
     assert!(settled.alpha > 0, "the pet must be on glass to be judged");
@@ -92,12 +87,12 @@ fn a_pet_follows_a_caret_that_moves_while_the_cursor_is_hidden() {
         settled.row
     );
 
-    // The program hides the cursor and works — repainting, moving the caret to
-    // the far side of the screen, exactly as a TUI does.
+    // The program hides the cursor and moves the caret to the far side of the
+    // screen, as a TUI does.
     s.term.process(b"\x1b[?25l");
     s.term.process(format!("\x1b[{};40H", ROWS - 3).as_bytes());
 
-    // Two seconds of hidden repaints. The shipped build sat still for twenty.
+    // Two seconds of hidden repaints.
     let mut last = s.tick(16);
     for _ in 0..125 {
         last = s.tick(16);
@@ -116,15 +111,13 @@ fn a_pet_follows_a_caret_that_moves_while_the_cursor_is_hidden() {
     );
 }
 
-/// The tennis watch. A console repainting a row (`\r` or `ESC[row;1H`, erase,
-/// write, back to the caret column) reverses the caret's direction once per
-/// repaint; three reversals is a frolic, and a second frolic inside
-/// `TENNIS_AFTER` latches the watch. The watch must not stop the cat
-/// travelling to a caret rows away: it crosses and then holds a small gap.
+/// The tennis watch: a console repainting a row reverses the caret's direction once
+/// per repaint, three reversals is a frolic, and a second frolic inside
+/// `TENNIS_AFTER` latches the watch. The watch must not stop the cat travelling to a
+/// caret rows away.
 #[test]
 fn a_repainting_console_does_not_freeze_the_pet_away_from_the_caret() {
     let mut s = Scene::new();
-    // Settle the cat at a prompt near the TOP.
     s.term.process(b"\x1b[1;5H");
     s.settle(150);
     let settled = s.settle(60);
@@ -133,8 +126,8 @@ fn a_repainting_console_does_not_freeze_the_pet_away_from_the_caret() {
         "cat starts at the top"
     );
 
-    // Now REPAINT a row far below, the way a console does: to the margin,
-    // erase, write, then back to the caret column. That is the rally.
+    // Repaint a row far below as a console does: to the margin, erase, write, back
+    // to the caret column.
     let far = ROWS - 4;
     for i in 0..140 {
         let col = 12 + (i % 6);

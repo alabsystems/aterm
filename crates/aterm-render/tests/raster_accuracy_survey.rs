@@ -9,10 +9,6 @@
 //! 0.130/255 and a per-glyph worst cell of 6/255 against ground truth. Read its
 //! doc comment for where each bound comes from and for what it does NOT cover.
 //!
-//! [`bucketed_reference_is_bit_identical_to_the_full_scan`] pins the
-//! row-bucketed ground-truth reference that guard runs on to the full edge
-//! scan, bit for bit.
-//!
 //! GROUND TRUTH is an independent scanline reference (`reference_coverage`):
 //! exact analytic span coverage in x, midpoint-sampled at `SUB` sub-scanlines
 //! per pixel row in y, over an outline flattened `REF_SEGMENTS_*` times finer
@@ -66,7 +62,7 @@ impl Rec {
     }
 }
 
-impl ttf_parser::OutlineBuilder for Rec {
+impl aterm_font::OutlineSink for Rec {
     fn move_to(&mut self, x: f32, y: f32) {
         self.close_contour();
         self.start = P { x, y };
@@ -99,9 +95,9 @@ impl ttf_parser::OutlineBuilder for Rec {
     }
 }
 
-fn record(face: &ttf_parser::Face, gid: u16) -> Option<Rec> {
+fn record(face: &aterm_font::Face, gid: u16) -> Option<Rec> {
     let mut r = Rec::default();
-    face.outline_glyph(ttf_parser::GlyphId(gid), &mut r)?;
+    face.outline_glyph(aterm_font::GlyphId(gid), &mut r)?;
     r.close_contour();
     Some(r)
 }
@@ -237,9 +233,8 @@ fn reference_coverage_phased(
 /// crossing; the sweep still applies the exact half-open test per sub-scanline,
 /// and within a bucket the edges keep their global order, so every
 /// sub-scanline's crossing list is the SAME list, in the SAME order, as a scan
-/// of all edges gives — bit-identical coverage and flags
-/// ([`bucketed_reference_is_bit_identical_to_the_full_scan`] holds it to
-/// that). Horizontal and NaN edges are never crossed and go in no bucket.
+/// of all edges gives — bit-identical coverage and flags. Horizontal and NaN
+/// edges are never crossed and go in no bucket.
 ///
 /// Why: without it every sub-scanline visited every edge of the reference
 /// outline (flattened 256 times per curve), and this one reference was ~95%
@@ -587,21 +582,21 @@ struct GlyphCase {
     overlapped: bool,
 }
 
-fn build_case(face: &ttf_parser::Face, gid: u16, px: f32) -> Option<GlyphCase> {
+fn build_case(face: &aterm_font::Face, gid: u16, px: f32) -> Option<GlyphCase> {
     build_case_phased(face, gid, px, 0.0)
 }
 
 /// [`build_case`] with the reference's sub-scanline ladder displaced by `phase`
 /// px. Only the REFERENCE moves; the candidate rasters are untouched, so the
 /// error this changes is entirely the instrument's.
-fn build_case_phased(face: &ttf_parser::Face, gid: u16, px: f32, phase: f32) -> Option<GlyphCase> {
+fn build_case_phased(face: &aterm_font::Face, gid: u16, px: f32, phase: f32) -> Option<GlyphCase> {
     let upem = f32::from(face.units_per_em());
     let scale = px / upem;
     let rec = record(face, gid)?;
     if rec.segs.is_empty() {
         return None;
     }
-    let bbox = face.glyph_bounding_box(ttf_parser::GlyphId(gid))?;
+    let bbox = face.glyph_bounding_box(aterm_font::GlyphId(gid))?;
     let vx = (f32::from(bbox.x_min) * scale).floor() as i32;
     let vy = (f32::from(bbox.y_min) * scale).floor() as i32;
     let vw =
@@ -743,7 +738,7 @@ const fn guard_corpus() -> (&'static [f32], usize, usize) {
 fn guard_chars(bytes: &'static [u8], name: &str, stride: usize) -> Vec<char> {
     let all: Vec<char> = if name == "SymbolsNerd" {
         // The Nerd face's coverage is in the PUA; walk its own cmap.
-        let face = ttf_parser::Face::parse(bytes, 0).unwrap();
+        let face = aterm_font::Face::parse(bytes, 0).unwrap();
         let mut v = Vec::new();
         if let Some(st) = face
             .tables()
@@ -867,7 +862,7 @@ fn flattening_accuracy_is_bounded() {
     // a regression at the sizes a terminal actually draws.
     let mut rows: Vec<(String, usize, ErrStat)> = Vec::new();
     for (bytes, name) in [(DEJAVU, "DejaVuSansMono"), (NERD, "SymbolsNerd")] {
-        let face = ttf_parser::Face::parse(bytes, 0).unwrap();
+        let face = aterm_font::Face::parse(bytes, 0).unwrap();
         let chars = guard_chars(bytes, name, stride);
         for &px in pxs {
             let mut row = ErrStat::default();
@@ -985,7 +980,7 @@ fn bucketed_reference_is_bit_identical_to_the_full_scan() {
     ];
     let mut compared = 0usize;
     for (bytes, name, ch, px) in cases {
-        let face = ttf_parser::Face::parse(bytes, 0).unwrap();
+        let face = aterm_font::Face::parse(bytes, 0).unwrap();
         let gid = face.glyph_index(ch).unwrap();
         let case = build_case(&face, gid.0, px).unwrap();
         let edges = flatten_ref(

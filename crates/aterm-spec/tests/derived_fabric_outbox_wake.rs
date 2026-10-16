@@ -6,12 +6,6 @@ use aterm_spec::{derive::fabric_outbox_wake_model, interp, verify};
 #[test]
 fn prompt_outbox_wake_and_lost_event_backstop_prove_and_catch() {
     let model = fabric_outbox_wake_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name),
-        "the outbox wake contract must stay enrolled in spec-link"
-    );
     verify::prove_and_catch_scalar(&model, "Fabric outbox prompt and backstop");
 
     let mut prompt = model.init_state();

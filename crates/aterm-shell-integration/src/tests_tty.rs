@@ -157,7 +157,7 @@ impl LiveShell {
     /// `tcsetpgrp` first), so a ^C after `SLEEP42` reaches `sh` or the `sleep` it
     /// became, never the shell. A fixed pause after `133;C` stood in for that and
     /// under load sent the ^C while zsh was still forking, where it interrupted
-    /// nothing (measured 2026-09-29 in the merge gate: `133;D;0` after `^C`).
+    /// nothing (`133;D;0` after `^C`).
     fn ctrl_c_status(&mut self, runner: &str) -> String {
         let from = self.len();
         self.send_bytes(format!("{runner}sh -c 'echo SLEEP$((40+2)); exec sleep 4'\r").as_bytes());
@@ -447,6 +447,37 @@ fn an_integrated_zsh_keeps_its_tty_when_a_raw_program_dies() {
     sh.run_line("stty ixon", "0");
     sh.kill_raw_child(RawEnd::Exit1);
     assert_tty_usable(&mut sh, "stty ixon again, then a raw child's exit 1", true);
+    sh.finish();
+}
+
+/// A NEW integrated zsh whose rc ran a raw-mode program that died: the shell
+/// adopted that tty before its first prompt, whose read of it runs in the
+/// background — and its first command still runs sane, repaired through the
+/// thaw at that command's preexec, so the tty it then keeps frozen is the
+/// repaired one (a raw child's `exit 0` after it leaves the next command sane).
+/// IXON stays as the raw mode left it: the repair never touches it. The same
+/// rc under the unfixed scripts is the negative control.
+#[cfg(unix)]
+#[test]
+fn an_integrated_zsh_whose_rc_broke_the_tty_runs_its_first_command_sane() {
+    let Some(zsh) = live_pty_zsh() else { return };
+    let fx = LiveFixture::new();
+    std::fs::write(fx.home.join(".zshrc"), "sh -c 'stty raw -echo'\n").expect(".zshrc");
+    let ours = install_script_set(&fx.base).expect("install");
+
+    let unfixed = unfixed_folder(&fx.base);
+    let mut sh = spawn_pty_shell(ShellType::Zsh, zsh, &fx, &unfixed, &[]);
+    assert_tty_broken(
+        &mut sh,
+        "unfixed, the first command after the rc's raw child",
+    );
+    sh.finish();
+
+    let mut sh = spawn_pty_shell(ShellType::Zsh, zsh, &fx, &ours, &[]);
+    assert_tty_usable(&mut sh, "the first command after the rc's raw child", false);
+    assert!(sh.zsh_frozen(), "zsh: the repaired tty is the one frozen");
+    sh.kill_raw_child(RawEnd::Exit0);
+    assert_tty_usable(&mut sh, "a raw child's exit 0 after the repair", false);
     sh.finish();
 }
 
@@ -868,8 +899,8 @@ fn an_integrated_zsh_marks_every_prompt_whatever_its_rc_does_to_zle_line_init() 
     // prompt after a 3 is checked in every phase), and whether zsh reports that
     // status (`zsh: exit <status>`, PRINT_EXIT_VALUE). Each line is typed once
     // zle owns the tty, so its only echo is VERBOSE's: typed at the bare 133;A,
-    // a loaded machine let the tty echo it ahead of the prompt too (2026-10-05
-    // merge gate: `\n(exit 3)\r\n` twice in one prompt).
+    // a loaded machine lets the tty echo it ahead of the prompt too
+    // (`\n(exit 3)\r\n` twice in one prompt).
     let lines = [("(exit 3)", "3"), ("false", "1"), ("true", "0")];
     let prompts = |sh: &mut LiveShell, at: &mut usize, n: usize| -> Vec<(String, usize, &str)> {
         (0..n)
@@ -1201,21 +1232,21 @@ fn an_integrated_bash_under_xtrace_traces_the_users_commands_and_not_aterms() {
     sh.finish();
 }
 
-/// A user's ERR trap, `set -e` and `set -o functrace` meet the commands bare bash
-/// shows them. aterm's PROMPT_COMMAND returned the command's status and ran a
-/// `( exit <status> )` before the user's own PROMPT_COMMAND — failed commands
-/// both — so the ERR trap fired again at the prompt after every failure, and
-/// `set -e` closed the shell at the prompt after a failure bash itself lets pass
-/// (`false && true`; on bash 5 so did a missing atpkg hook's failed open). In a
-/// tab with atpkg's agents/ it still did, at the prompt after any command that
-/// hashed a name (`hash -d claude codex` fails for a name not hashed) and after
-/// atpkg wrote its hook (the reroute derivation says no). Under functrace the
-/// DEBUG trap fired inside aterm's own prompt functions: every prompt reported
-/// one of their lines as the user's command, and the command typed at it got no
-/// 633;E — and without functrace a function wrapping the trap (starship's
-/// layering on bash < 4.4) is no function the trap fired in: the commands typed
-/// after it are reported. The user's PROMPT_COMMAND still reads the command's
-/// `$?`.
+/// A user's ERR trap, `set -e` and `set -o functrace` meet the commands bare
+/// bash shows them. aterm's PROMPT_COMMAND returned the command's status and
+/// ran a `( exit <status> )` before the user's own PROMPT_COMMAND — failed
+/// commands both — so the ERR trap fired again at the prompt after every
+/// failure, and `set -e` closed the shell at the prompt after a failure bash
+/// itself lets pass (`false && true`; on bash 5 so did a missing atpkg hook's
+/// failed open). In a tab with atpkg's agents/ it still did, at the prompt
+/// after any command that hashed a name (`hash -d claude codex agy muse` fails
+/// for a name not hashed) and after atpkg wrote its hook (the reroute
+/// derivation says no). Under functrace the DEBUG trap fired inside aterm's own
+/// prompt functions: every prompt reported one of their lines as the user's
+/// command, and the command typed at it got no 633;E — and without functrace a
+/// function wrapping the trap (starship's layering on bash < 4.4) is no
+/// function the trap fired in: the commands typed after it are reported. The
+/// user's PROMPT_COMMAND still reads the command's `$?`.
 #[cfg(unix)]
 #[test]
 fn an_integrated_bash_keeps_the_users_err_trap_errexit_and_functrace_as_bare_bash_does() {

@@ -1,21 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-//! THE FALLBACK-COVERAGE GATE.
-//!
-//! A chain face may only WIN a code point it genuinely covers. The gate exists
-//! because the tier used to ask fontdue — whose char lookup mis-selects a Mac
-//! Roman subtable on Apple `.ttc` fonts, exactly as `primary_unicode_gid`
-//! documents for the tier above it — so a face could claim a character it does
-//! not have and then draw whatever the bogus id pointed at.
-//!
-//! On a stock macOS that is not hypothetical: the default CJK fallback is
-//! `Hiragino Sans GB.ttc`, a CHINESE face covering no Hangul at all, and it
-//! claimed 어 / 스 / 트. `한국어 조합 테스트` rendered `한국糯 조합 테陇腋` —
-//! confident, deterministic Han glyphs standing in for Korean, while the
-//! syllables fontdue happened not to claim fell through to a face that really
-//! covers them and looked perfectly fine. A half-correct line is the worst kind
-//! of wrong: it reads as a font-taste problem, not a bug.
+//! Fallback-coverage gate: a chain face may only win a code point its Unicode cmap
+//! really covers. fontdue's char lookup can mis-select a Mac Roman subtable on Apple
+//! `.ttc` fonts (as `primary_unicode_gid` documents), letting a face such as
+//! `Hiragino Sans GB.ttc`, which has no Hangul, claim Korean syllables and draw Han glyphs.
 
 /// Every winner must really cover its code point, across the scripts a terminal
 /// actually meets.
@@ -24,8 +13,7 @@ fn a_chain_face_only_wins_a_code_point_it_really_covers() {
     let mut r = aterm_render::Renderer::from_system(28.0, aterm_render::Theme::default())
         .expect("no font: build with aterm-render's default embedded-font feature");
     r.debug_block_on_lazy_fallbacks();
-    // Korean first — the reported break — then the scripts that share the CJK
-    // fallback with it, then a spread of other non-Latin writing systems.
+    // Korean, the scripts sharing its CJK fallback, then other non-Latin scripts.
     let samples = "한국어조합테스트中文字符测试日本語カタカナひらがな\
                    АБВГДЕЖЗ αβγδεζ עברית العربية हिन्दी বাংলা ไทย ᐃᓄᒃᑎᑐᑦ ⠁⠂⠃";
     let mut checked = 0usize;
@@ -39,11 +27,10 @@ fn a_chain_face_only_wins_a_code_point_it_really_covers() {
         let Ok(bytes) = std::fs::read(&path) else {
             continue;
         };
-        // Ask the UNICODE cmap directly, at every face of the collection: if NO
-        // face has the character, the chain had no business claiming it.
-        let faces = ttf_parser::fonts_in_collection(&bytes).unwrap_or(1);
+        // Ask the Unicode cmap of every face in the collection directly.
+        let faces = aterm_font::fonts_in_collection(&bytes).unwrap_or(1);
         let covered = (0..faces).any(|i| {
-            ttf_parser::Face::parse(&bytes, i)
+            aterm_font::Face::parse(&bytes, i)
                 .ok()
                 .and_then(|f| f.glyph_index(ch))
                 .is_some_and(|g| g.0 != 0)
@@ -62,8 +49,7 @@ fn a_chain_face_only_wins_a_code_point_it_really_covers() {
     );
 }
 
-/// The reported line, end to end: every syllable must land on a face that has
-/// it, and they must not be split across faces that disagree about the script.
+/// Every syllable of a Korean line lands on one face that has it.
 #[test]
 fn korean_resolves_consistently_to_a_face_that_has_hangul() {
     let mut r = aterm_render::Renderer::from_system(28.0, aterm_render::Theme::default())
@@ -87,13 +73,8 @@ fn korean_resolves_consistently_to_a_face_that_has_hangul() {
          symptom of a face claiming coverage it does not have",
         homes.len()
     );
-    // NON-VACUITY. `homes` is EMPTY when no face resolves any syllable — i.e.
-    // when the whole word is `.notdef` tofu, which is strictly worse than the
-    // split above. `0 <= 1` holds, so this test passed happily through exactly
-    // that state: on Windows the built-in chain carried no Hangul face at all
-    // and `한국어` rendered as three boxes while this gate stayed green. Only
-    // assert where a Hangul face is known to be installed, so a genuinely
-    // font-less host still skips instead of failing.
+    // Non-vacuity: an empty `homes` (every syllable tofu) also passes the check above, so
+    // where a Hangul face is installed every syllable must resolve.
     if hangul_face_installed() {
         assert_eq!(
             resolved,
@@ -105,10 +86,8 @@ fn korean_resolves_consistently_to_a_face_that_has_hangul() {
     }
 }
 
-/// Whether this host has a face that is known to carry Hangul, read from the
-/// FILESYSTEM rather than from the candidate list — asking the list would turn
-/// "someone deleted the Hangul face from the chain" into a silent skip, i.e.
-/// precisely the regression the caller exists to catch.
+/// Whether a face known to carry Hangul is on disk. Read from the filesystem, not the
+/// candidate list, so dropping the Hangul face from the chain fails instead of skipping.
 fn hangul_face_installed() -> bool {
     const KNOWN_HANGUL_FACES: &[&str] = &[
         // Windows

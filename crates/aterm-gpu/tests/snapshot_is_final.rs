@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// A snapshot is final on the GPU path: `GpuRenderer::render_input` plans
-// glyphs through its inner CPU renderer, so a fresh renderer's first snapshot
-// of a glyph the primary face lacks could draw the provisional `.notdef` a
-// background fallback parse leaves for a later frame. The capture path
-// (`render_input_target`) settles the parses the encode started and encodes
-// again while the routing epoch moved during the pass, as
-// `aterm_render::Renderer::render_input` does. Keying on the epoch matters: a
-// chain can land between two rows and be consumed by the later row's probe,
-// leaving nothing to settle while the earlier row is still blank.
+// A snapshot is final on the GPU path: `GpuRenderer::render_input` plans glyphs
+// through its inner CPU renderer, so a fresh renderer's first snapshot of a glyph
+// the primary face lacks could draw the provisional `.notdef` a background
+// fallback parse leaves. The capture path (`render_input_target`) settles the
+// parses the encode started and re-encodes while the font epoch moved during
+// the pass. Keying on the epoch matters: a chain can land between two rows and
+// be consumed by the later row's probe, leaving nothing to settle while the
+// earlier row is still blank.
 //
 // The renderer under test is deliberately not font-settled; a settled CPU
 // renderer is the oracle for which glyphs route off the primary face.
@@ -17,7 +16,7 @@
 // No GPU or no system font: no-op.
 
 use aterm_core::terminal::Terminal;
-use aterm_render::{FaceId, Renderer, Theme};
+use aterm_render::{FaceId, Theme};
 
 use crate::common::{self, bb, gg, rr};
 
@@ -29,10 +28,7 @@ fn dist(a: u32, c: u32) -> i32 {
 fn a_fresh_gpu_renderers_first_snapshot_paints_every_fallback_glyph() {
     let theme = Theme::default();
     let px = 20.0;
-    let Some(mut oracle) = Renderer::from_system(px, theme) else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut oracle = common::cpu(px, theme);
     oracle.debug_block_on_lazy_fallbacks();
     // The message band's fallback-face glyphs; a glyph the primary covers never
     // touches the chain, and a glyph nothing covers is honest tofu either way.
@@ -40,13 +36,11 @@ fn a_fresh_gpu_renderers_first_snapshot_paints_every_fallback_glyph() {
         .into_iter()
         .filter(|&ch| oracle.glyph_key_text(ch).source != FaceId::Primary)
         .collect();
-    if probed.is_empty() {
-        eprintln!("SKIP: every probed glyph is on the primary face here");
-        return;
-    }
-    let Some(mut gpu) = common::gpu_or_skip(px, theme) else {
-        return;
-    };
+    assert!(
+        !probed.is_empty(),
+        "the fixture primary leaves a probed glyph to the chain"
+    );
+    let mut gpu = common::gpu(px, theme);
     assert!(
         !gpu.fallback_parse_pending(),
         "precondition: a fresh renderer has probed nothing — the chain is lazy"

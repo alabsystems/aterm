@@ -3,16 +3,12 @@
 
 //! Pixel review for the live cursor engines.
 //!
-//! Unlike `cursor_glow_demo`, this drives `CursorGlow` itself through a hot
-//! typing run, then renders three animation phases with the shipping CPU
-//! compositor. Water and rainbow kitty get identity-layout panels; Fire and every
-//! non-fire style also get a HEAD-BAND panel (pad 8 + head 48, row-0 run +
-//! upward jump) so top-edge freedom is pinned by PNGs for each style. The
-//! output is suitable for visual review and design diffs.
+//! Unlike `cursor_glow_demo`, this drives `CursorGlow` itself through a hot typing run and
+//! renders three animation phases with the CPU compositor: identity-layout panels for
+//! water and rainbow kitty, and a head-band panel (pad 8 + head 48) for fire and every
+//! other style, so top-edge behaviour is visible per style.
 //!
-//! ```text
-//! cargo run -p aterm-render --example cursor_magic_demo -- /tmp/aterm-magic
-//! ```
+//! Run: `targo --unverified run -p aterm-render --example cursor_magic_demo -- <out_dir>`
 
 use std::{
     fs,
@@ -31,8 +27,7 @@ const COLS: usize = 68;
 fn config(style: GlowStyle, theme: Theme) -> GlowConfig {
     GlowConfig {
         classic_mono: false,
-        // Keep the pixel-review example honest about the shipping rainbow
-        // default. This field is ignored by the other style panels.
+        // The shipping rainbow default; the other styles ignore it.
         ribbon_tall: true,
         ribbon_flat: false,
         enabled: true,
@@ -46,7 +41,6 @@ fn config(style: GlowStyle, theme: Theme) -> GlowConfig {
         radius: 0.34,
         ring: false,
         dark_theme: true,
-        // This helper already takes a `Theme` and derives `color` from it.
         theme_fg: theme.fg & 0x00ff_ffff,
         theme_bg: theme.bg & 0x00ff_ffff,
         beam: false,
@@ -88,9 +82,8 @@ fn hot_run(style: GlowStyle, theme: Theme, cw: usize, ch: usize) -> (CursorGlow,
     glow.tick(Some((row, 8)), now, &cfg, geom, &mut quads);
     for col in 9..=54 {
         now += Duration::from_millis(22);
-        // This is a synthetic TYPING run, so give the engine the same positive
-        // input witness the real host supplies. In particular, Rainbow Kitty's
-        // anti-stray gate must not be bypassed just to make a review PNG light.
+        // The input witness the real host supplies, so Rainbow Kitty's anti-stray
+        // gate is not bypassed.
         glow.note_synthetic_typed(now, 1);
         glow.tick(Some((row, col)), now, &cfg, geom, &mut quads);
     }
@@ -133,10 +126,8 @@ fn render_phases(
         );
         let mut input = term.cell_frame(ROWS, COLS);
         input.cursor_glow_add = quads;
-        // Rainbow Kitty's ribbon body is deliberately under-ink; copying only
-        // the additive channel makes this review panel look cold even when the
-        // witnessed synthetic typing run produced a healthy wake. Mirror the
-        // shipping host's complete cursor-effect splice.
+        // Copy every cursor-effect stream, as the host does: Rainbow Kitty's ribbon
+        // body is under-ink, so the additive channel alone looks cold.
         input.glow_halo = glow.halos().to_vec();
         input.fire_patch = glow.patches().to_vec();
         input.glow_under = glow.under_quads().to_vec();
@@ -213,8 +204,8 @@ fn render_literal_rain(renderer: &mut Renderer, theme: Theme, dir: &Path) {
     effects.set_matrix_rain_enabled(true);
 
     let mut input = RenderInput::default();
-    // Drive enough real engine ticks to finish the atlas and establish a
-    // representative deterministic field. No sleeps or wall-clock sampling.
+    // Enough engine ticks to finish the atlas and settle a deterministic field; no
+    // wall clock.
     for _ in 0..18 {
         effects.advance(34.0);
         term.cell_frame_into(&mut input, rows, cols);
@@ -226,11 +217,9 @@ fn render_literal_rain(renderer: &mut Renderer, theme: Theme, dir: &Path) {
     println!("wrote {}", path.display());
 }
 
-/// FIRE review panel — the owner's iteration loop for flame legibility and the
-/// organic root. Renders a HOT top-row blaze over dense text with a real chrome
-/// head band (pad 8 + head 48), copying every fire stream (field patches,
-/// under-ink body, radial halos, charred ink, aurora quads) exactly as the GUI
-/// host does — so what these PNGs show is what the terminal shows.
+/// Fire review panel: a hot top-row blaze over dense text under a real chrome head band
+/// (pad 8 + head 48), copying every fire stream (patches, under-ink body, halos, charred
+/// ink, aurora quads) as the GUI host does.
 fn render_fire_band(renderer: &mut Renderer, theme: Theme, dir: &Path) -> Vec<Frame> {
     const PAD: usize = 8;
     const HEAD: usize = 48;
@@ -249,11 +238,11 @@ fn render_fire_band(renderer: &mut Renderer, theme: Theme, dir: &Path) -> Vec<Fr
         head: HEAD as u16,
     };
     let cfg = config(GlowStyle::Fire, theme);
-    // Dense text on the TOP row (the owner's screenshot case), cursor at its end.
+    // Dense text on the top row, cursor at its end.
     let mut term = Terminal::new(ROWS as u16, COLS as u16);
     term.process(b"\x1b[2J\x1b[H");
     term.process(b"fadsfadsfadsfadsfadsfadsfadsfadsfadsfadsfadsfadsfads");
-    // Hot run ALONG row 0 so the blaze towers over the glyphs.
+    // A hot run along row 0, so the blaze towers over the glyphs.
     let mut glow = CursorGlow::default();
     let mut quads = Vec::new();
     let mut now = Instant::now();
@@ -291,17 +280,11 @@ fn render_fire_band(renderer: &mut Renderer, theme: Theme, dir: &Path) -> Vec<Fr
     phases
 }
 
-/// HEAD-BAND review panel for EVERY non-fire style — the parameterized twin of
-/// [`render_fire_band`]: real chrome head band (pad 8 + head 48), dense text on
-/// the top row, a hot run ALONG row 0 (so upward-flying pixels — rainbow kitty stars,
-/// water spray, comet debris — cross into the chrome band and clamp at the
-/// effects-box top, not the grid top), then a drop to a lower row and a >=2-cell
-/// upward JUMP landing back on row 0 (arming the jump beam / splash ring /
-/// meteor against the band). The captured phases re-tick AFTER the jump, so the
-/// jump streak materializes in flight. Copies every window-space stream exactly
-/// as the GUI host does unconditionally for every style — streams a style does
-/// not emit stay empty, and `charred` stays empty under the no-recolor law —
-/// so what these PNGs show is what the terminal shows.
+/// Head-band review panel for every non-fire style, the twin of [`render_fire_band`]: a
+/// hot run along row 0, then a drop and an upward jump back onto row 0, so upward-flying
+/// pixels (stars, spray, debris) clamp at the effects-box top, not the grid top. The
+/// phases re-tick after the jump, so the jump streak shows in flight. Every window-space
+/// stream is copied as the GUI host copies it, for every style.
 fn render_band(
     renderer: &mut Renderer,
     theme: Theme,
@@ -326,11 +309,11 @@ fn render_band(
         head: HEAD as u16,
     };
     let cfg = config(style, theme);
-    // Dense text on the TOP row, so the band effects play over real glyphs.
+    // Dense text on the top row, so the band effects play over real glyphs.
     let mut term = Terminal::new(ROWS as u16, COLS as u16);
     term.process(b"\x1b[2J\x1b[H");
     term.process(b"fadsfadsfadsfadsfadsfadsfadsfadsfadsfadsfadsfadsfads");
-    // Hot run ALONG row 0 so the wake hugs the head band.
+    // A hot run along row 0, so the wake hugs the head band.
     let mut glow = CursorGlow::default();
     let mut quads = Vec::new();
     let mut now = Instant::now();
@@ -340,9 +323,8 @@ fn render_band(
         glow.note_synthetic_typed(now, 1);
         glow.tick(Some((0, col)), now, &cfg, geom, &mut quads);
     }
-    // Establish the cursor on a lower row mid-run, then JUMP >=2 cells back UP
-    // onto row 0 — the splash-ring / jump-beam arming move (dist >= 2), landing
-    // against the head band.
+    // Drop to a lower row, then jump >=2 cells back up onto row 0: the move that arms
+    // the splash ring and jump beam, landing against the head band.
     now += Duration::from_millis(22);
     glow.note_synthetic_move(now);
     glow.tick(Some((4, 48)), now, &cfg, geom, &mut quads);
@@ -389,16 +371,14 @@ fn main() {
     let water = render_phases(&mut renderer, theme, GlowStyle::Water, "water", dir);
     contact_sheet(&water, &dir.join("cursor_water_contact.png"));
 
-    // The artifact names stay `nyan` on purpose: they are the demo's on-disk
-    // output filenames, and existing capture scripts glob for them.
+    // Output names stay `nyan`: capture scripts glob for them.
     let rainbow_kitty = render_phases(&mut renderer, theme, GlowStyle::RainbowKitty, "nyan", dir);
     contact_sheet(&rainbow_kitty, &dir.join("cursor_nyan_contact.png"));
 
     let fire = render_fire_band(&mut renderer, theme, dir);
     contact_sheet(&fire, &dir.join("cursor_fire_contact.png"));
 
-    // Head-band panels for every non-fire style: row-0 run + upward jump
-    // against a real chrome band, one contact sheet per style.
+    // One head-band contact sheet per non-fire style.
     for (style, name) in [
         (GlowStyle::RainbowKitty, "nyan"),
         (GlowStyle::Water, "water"),

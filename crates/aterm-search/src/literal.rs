@@ -6,11 +6,8 @@
 
 /// Iterator over overlapping ASCII case-insensitive match byte offsets.
 ///
-/// Candidate starts are found with the crate's own `memchr`/`memchr2`
-/// ([`crate::bytesearch`]), then the complete
-/// needle is verified with the standard library's ASCII comparison. This is
-/// safe, allocation-free, and preserves the search engine's historical
-/// overlapping-match semantics.
+/// Candidate starts come from `memchr`/`memchr2` ([`crate::bytesearch`]); each is
+/// verified with `eq_ignore_ascii_case`.
 pub(crate) struct AsciiCaseInsensitiveMatches<'a> {
     haystack: &'a [u8],
     needle: &'a [u8],
@@ -43,9 +40,7 @@ impl Iterator for AsciiCaseInsensitiveMatches<'_> {
         let max_start = self.haystack.len().checked_sub(needle_len)?;
         let &first = self.needle.first()?;
 
-        // A word-at-a-time scan cannot pay for its setup on a fragment shorter
-        // than a word. Keep these very short haystacks scalar; normal
-        // terminal-width lines use the byte scanner below.
+        // A word-at-a-time scan cannot repay its setup on a haystack of a word or less.
         if self.haystack.len() <= 8 {
             while self.next_start <= max_start {
                 let candidate = self.next_start;

@@ -1,23 +1,16 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `cat_glyph` — render one traced cat-glyph asset TOML to a PNG for visual review.
-//!
-//! The cat-art v4 pipeline traces the reference sheets to SVG, then hand-labels each
-//! glyph into a semantic layered asset (`crates/aterm-effects/art/glyphs/<id>.toml`).
-//! This tool rasterizes an asset with the exact [`aterm_scene::vector`] filler the
-//! bake path uses, composites it on a light or dark ground, and writes a PNG — the
-//! human/agent QA loop against the reference crop.
+//! `cat_glyph` — render one layered glyph asset TOML
+//! (`crates/aterm-effects/art/glyphs/<id>.toml`) to a PNG for visual review, with the
+//! [`aterm_scene::vector`] filler the bake uses, on a light or dark ground.
 //!
 //! ```text
-//! cargo run -q -p aterm-effects --example cat_glyph -- <asset.toml> <out.png> [--px 200] [--bg dark|light]
+//! targo --unverified run -q -p aterm-effects --example cat_glyph -- <asset.toml> <out.png> [--px 200] [--bg dark|light]
 //! ```
 //!
-//! Asset format (see `art/glyphs/README` / the labeling brief): paths are SVG `d`
-//! strings in the glyph's own `viewbox = [w, h]` pixel frame; each `[[layer]]` names a
-//! `role`, a `ref_fill` (the colour it had in the reference), a `recolor` tag (what the
-//! genome may swap at bake time — this tool always paints `ref_fill`), and its `paths`.
-//! Painter order = file order. White/background paths are dropped at labeling time.
+//! The asset format is in `art/glyphs/README.md`. This tool always paints each layer's
+//! `ref_fill`, ignoring its `recolor` tag; painter order is file order.
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -53,7 +46,6 @@ fn main() -> ExitCode {
         }
     };
 
-    // Viewbox: the pixel frame the path d-strings live in.
     let vb = doc.get("viewbox").and_then(|v| v.as_array());
     let (vw, vh) = match vb {
         Some(a) if a.len() == 2 => (num(&a[0]), num(&a[1])),
@@ -108,7 +100,6 @@ fn main() -> ExitCode {
         painted += 1;
     }
 
-    // Composite over the requested ground.
     let bg: [u8; 3] = if dark {
         [0x1A, 0x1B, 0x26]
     } else {

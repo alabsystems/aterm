@@ -4,11 +4,12 @@
 //! WHEN A CELLS CACHE'S CHECKOUT IS GONE — ONE RULE, shared as SOURCE by
 //! its readers: the window's disk watch (`aterm_agent`'s
 //! `harness::disk::discover`, which below the floor deletes a gone
-//! checkout's cache whole, unattended), `xtask gate cells`' own sweep
-//! (`sweep_orphaned_cell_caches`) and atpkg's Rust build cache sweep
+//! checkout's cache whole, unattended) and atpkg's Rust build cache sweep
 //! (`build_cache::reclaim`), which include this file by path — the same rule
 //! with no dependency edge between the crates. Std only, and nothing here
-//! names any of them.
+//! names any of them. The cells cache (`~/.cache/aterm/cells`) is a layout
+//! nothing writes any more (`verify cells` builds under its run's target
+//! dir); the rule reclaims what machines still hold of it.
 //!
 //! A checkout is GONE only when it is SEEN to be ([`gone`]): its folder is
 //! there without a `Cargo.toml` (or Trust's `Targo.toml`, [`MANIFESTS`]), or
@@ -76,13 +77,13 @@ pub const VOLUME_ROOTS: &[&str] = &["/Volumes"];
 pub const VOLUME_ROOTS: &[&str] = &["/media", "/run/media", "/mnt"];
 
 /// The checkout a cells cache's `.checkout` marker names, read by BOTH
-/// sweeps from its bytes EXACTLY as `xtask gate cells` writes them: the
+/// sweeps from its bytes EXACTLY as the cells cache was written: the
 /// checkout's canonical path, nothing around it. Never trimmed and never
 /// decoded lossily — either turns a live checkout's path (a folder whose
 /// name ends in a space or U+00A0; on Linux, a name that is not UTF-8) into
 /// a sibling's that is missing beside the folder holding both, which
 /// [`gone`] then SEES gone. A marker ending in a line break names no
-/// checkout: the gate writes none, and read either way it could name a
+/// checkout: none was written so, and read either way it could name a
 /// missing sibling (`echo`'s `proj\n` beside `proj`) — such a cache is kept
 /// by both sweeps, as one with no marker is. Nor does one that is not an
 /// absolute path.

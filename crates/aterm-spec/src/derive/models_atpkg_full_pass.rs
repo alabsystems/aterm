@@ -48,6 +48,7 @@ use super::*;
 /// (the gate and the launch rule).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
+#[crate::model]
 pub fn atpkg_full_pass_rule_model() -> Model {
     let v = var;
     let n = int;
@@ -271,14 +272,17 @@ pub fn atpkg_full_pass_rule_model() -> Model {
         invariants: vec![
             Invariant {
                 name: "NoPassBackToBack",
+                kind: InvariantKind::Claim,
                 expr: eq(v("b2b"), n(0)),
             },
             Invariant {
                 name: "NoSuccessReadAsFailure",
+                kind: InvariantKind::Claim,
                 expr: eq(v("mistook"), n(0)),
             },
             Invariant {
                 name: "NoOwedPassHeldBack",
+                kind: InvariantKind::Claim,
                 expr: eq(v("starved"), n(0)),
             },
         ],

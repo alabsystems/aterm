@@ -3,41 +3,21 @@
 //
 //! Chunked feeding is equivalent to one `process()` of the whole burst.
 //!
-//! The PTY reader slices a 64 KiB read into <=8 KiB chunks and releases the
-//! terminal mutex between them (`aterm-gui/src/spawn.rs`), so a keystroke is not
-//! starved behind a flood. That is sound only if chunked feeding is
-//! byte-identical to one call, and per-chunk `take_response()` replies
-//! concatenate to what one final `take_response()` would return.
-//!
-//! Over a >8 KiB corpus whose SGR/CSI sequences, multibyte CJK runs and DSR
-//! queries straddle chunk boundaries, the final grid and the concatenated
-//! responses match for every chunking: one byte at a time (splitting every
-//! escape), the real 8 KiB slice, and off-by-one around it.
-//!
-//! One byte at a time also exercises the per-glyph writer (`print`) where a
-//! coalesced run takes the batched one (`print_unicode_bulk`), so this is the
-//! batched-vs-per-char oracle for wide glyphs too. The corpus carries Hangul, a
-//! wide glyph landing on the last column (wrap + BCE tail blank), and DECSLRM
-//! with the cursor outside the margin span
-//! (`hangul_run_under_decslrm_matches_per_char_writes`).
-//!
-//! The smaller cases below go further: each is fed whole, one byte at a time
-//! and cut once at every byte, and the grids must agree cell by cell (packed
-//! bits, the extras entry, truecolor bytes), row by row (`len`) and on the
-//! cursor, its deferred wrap and the replies (`assert_chunk_invariant`).
+//! The PTY reader feeds a burst in 8 or 16 KiB slices and releases the terminal lock
+//! between them (aterm-gui's `ingest_chunk_width`); that is sound only if the grid and the
+//! concatenated per-chunk `take_response()` replies match one call's. One byte at a time
+//! takes the per-glyph writer (`print`) where a coalesced run takes the batched one
+//! (`print_unicode_bulk`), so this is also the batched-vs-per-char oracle.
 
 use aterm_core::terminal::Terminal;
 
-/// 안녕하세요 — a pure-Hangul sample. Its lead syllable selects the wide-run
-/// batcher on a coalesced feed and the per-glyph writer on a fragmented one, so
-/// it is the sample that makes the two paths race for the same grid.
+/// 안녕하세요 — a pure-Hangul sample. Its lead syllable selects the wide-run batcher on a
+/// coalesced feed and the per-glyph writer on a fragmented one.
 const HANGUL: &str = "\u{C548}\u{B155}\u{D558}\u{C138}\u{C694}";
 
-/// A >8 KiB deterministic corpus mixing the surfaces most sensitive to chunk splits:
-/// multi-byte CSI/SGR sequences, multibyte UTF-8 (CJK and Hangul) runs, truecolor SGR,
-/// newlines (scroll), wide glyphs landing on the last column (autowrap + BCE tail
-/// blank), DECSLRM margin spans entered from outside, and DSR cursor-position queries
-/// whose reply depends on the cursor position when processed.
+/// A >8 KiB corpus of the surfaces most sensitive to chunk splits: CSI/SGR (truecolor
+/// too), CJK and Hangul runs, scrolls, wide glyphs at the last column (autowrap + BCE tail
+/// blank), DECSLRM spans entered from outside, and DSR queries that report the cursor.
 fn corpus() -> Vec<u8> {
     let mut v = Vec::new();
     for i in 0..400u32 {
@@ -49,22 +29,18 @@ fn corpus() -> Vec<u8> {
         v.extend_from_slice(" \u{6F22}\u{C790}\u{6F22}\u{C790}".as_bytes()); // 漢자漢자
         v.extend_from_slice(b" \x1b[38;2;200;100;50mtruecolor\x1b[0m");
         if i % 3 == 0 {
-            // RIGHT-EDGE wrap: park the cursor two columns short of the 80-column
-            // right edge, fill them, then start a wide run at the last column. The
-            // glyph cannot fit, so the writer must blank the skipped tail cell with
-            // a BCE blank and wrap — in the same column whether the run arrives
-            // coalesced or one syllable at a time.
+            // Right-edge wrap: `++` leaves the cursor on the last column, then a wide run.
+            // The glyph cannot fit, so the writer blanks the tail cell (BCE) and wraps,
+            // in the same column whether the run arrives coalesced or per syllable.
             v.extend_from_slice(b"\r\n\x1b[78G++");
             v.extend_from_slice(HANGUL.as_bytes());
         }
         if i % 5 == 0 {
-            // DECSLRM with the cursor outside the span. `CSI ? 69 h` arms
-            // DECLRMM, `CSI 11 ; 41 s` sets the span to columns 11-41 (1-based)
-            // and homes the cursor to column 1 — left of margins.left. A wide run
-            // started there crosses into the span mid-row, which is precisely
-            // where a row limit derived once per row diverges from one re-derived
-            // per glyph. The DSR right after it compares the resulting cursor
-            // column byte-for-byte, on top of the grid comparison.
+            // DECSLRM with the cursor outside the span: `CSI 11 ; 41 s` sets columns
+            // 11-41 and homes the cursor to column 1, left of the span. A wide run from
+            // there crosses into the span mid-row, where a row limit derived once per
+            // row diverges from one re-derived per glyph; the DSR after it compares the
+            // cursor column too.
             v.extend_from_slice(b"\x1b[?69h\x1b[11;41s\x1b[4;1H");
             for _ in 0..8 {
                 v.extend_from_slice(HANGUL.as_bytes());
@@ -88,9 +64,8 @@ fn corpus() -> Vec<u8> {
     v
 }
 
-/// Feed `data` to a fresh terminal in `chunk`-byte slices, draining replies per chunk
-/// and accumulating them in order — exactly the reader's sliced shape. Returns the
-/// final visible grid text and the concatenated replies.
+/// Feed `data` to a fresh terminal in `chunk`-byte slices, draining replies per chunk, as
+/// the reader does. Returns the visible grid text and the concatenated replies.
 fn feed(data: &[u8], chunk: usize) -> (String, Vec<u8>) {
     let mut t = Terminal::new(24, 80);
     let mut resp = Vec::new();
@@ -151,11 +126,9 @@ fn ris_keeps_the_replies_queries_before_it_generated() {
     }
 }
 
-/// A run of 30 `한` from column 1 under a DECSLRM span of columns 11-41: the
-/// per-glyph writer re-derives the margin-clamped row limit before every
-/// syllable and wraps at the right margin (20 on the row, the rest resuming at
-/// the left margin); the batched writer must do the same even though the
-/// cursor starts outside the span.
+/// A run of 30 `한` from column 1 under a DECSLRM span of columns 11-41: the batched
+/// writer wraps at the right margin like the per-glyph one, which re-derives the
+/// margin-clamped row limit before every syllable, though the cursor starts outside the span.
 #[test]
 fn hangul_run_under_decslrm_matches_per_char_writes() {
     let mut v = Vec::new();
@@ -177,9 +150,8 @@ fn hangul_run_under_decslrm_matches_per_char_writes() {
         whole_resp, per_char_resp,
         "cursor position after the run diverges under DECSLRM"
     );
-    // Non-vacuity: the run must actually have wrapped inside the margin span,
-    // i.e. the reference itself puts syllables on more than one row. Without
-    // this, a grid that silently stopped rendering Hangul would still "match".
+    // Non-vacuity: the run wrapped inside the margin span, so a grid that silently
+    // dropped Hangul cannot "match".
     let rows_with_hangul = whole.lines().filter(|l| l.contains('\u{D55C}')).count();
     assert!(
         rows_with_hangul >= 2,
@@ -203,19 +175,10 @@ fn xtversion_reports_the_shared_application_identity() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Whole, one byte at a time and every single cut: the same bytes make the same
-// grid, cell by cell (packed bits and extras entry), row `len`, cursor, deferred
-// wrap and replies.
-// ---------------------------------------------------------------------------
-
-/// Everything a read boundary could change: each row's `len` (the written
-/// extent copy, search, history and the render frame stop at) and text, every
-/// cell that is not a default blank or that has an extras-map entry (its char or
-/// cluster, flags, packed colours with the HAS_EXTRAS bit, and what its extras
-/// resolve to), the cursor and its deferred wrap, and the replies. Truecolor
-/// bytes are compared as resolved (`fg_rgb_at`), not by store: the per-glyph
-/// writer keeps them in the extras map and the run writers in the dense ring.
+/// Everything a read boundary could change: each row's `len` and text, every cell that is
+/// not a default blank or has an extras entry, the cursor and its deferred wrap, and the
+/// replies. Truecolor is compared as resolved (`fg_rgb_at`): the per-glyph writer keeps it
+/// in the extras map, the run writers in the dense ring.
 fn state(t: &Terminal, resp: &[u8]) -> String {
     use std::fmt::Write as _;
     let g = t.grid();
@@ -287,11 +250,10 @@ fn fold(rows: u16, cols: u16, chunks: &[&[u8]]) -> (Terminal, String) {
     (t, s)
 }
 
-/// The grid an extras-map entry belongs to claims it: every visible cell whose
-/// entry holds a mark, a cluster, a link, an underline colour or an image
-/// carries HAS_EXTRAS (`HAS_EXTRAS ⇔ entry`, `aterm-grid`'s erase.rs). An entry
-/// under a cell that no longer claims it is an orphan a later write adopts.
-/// Truecolor bytes alone are owned through the cell's RGB marker instead.
+/// Every visible cell whose extras entry holds a mark, a cluster, a link, an underline
+/// colour or an image carries HAS_EXTRAS (aterm-grid's `HAS_EXTRAS ⇔ entry`); an unclaimed
+/// entry is an orphan a later write would adopt. Truecolor bytes alone are owned through
+/// the cell's RGB marker instead.
 fn assert_no_orphan_extras(t: &Terminal, what: &str) {
     let g = t.grid();
     for row in 0..g.rows() {
@@ -346,12 +308,9 @@ fn row_texts(t: &Terminal) -> Vec<String> {
         .collect()
 }
 
-/// DECSLRM homes the cursor to column 1, left of a left margin past it. An
-/// ASCII run from there wraps at the right margin as soon as it enters the
-/// span (xterm `dotext`; the per-glyph writer), then continues at the left
-/// margin, whichever writer the run reaches: the blast, the styled run, the
-/// extras run, the cell-run splat, REP's fill, and a run that wraps from right
-/// of the span back to column 1.
+/// DECSLRM homes the cursor to column 1, left of the span. An ASCII run from there wraps
+/// at the right margin as soon as it enters the span (xterm `dotext`), then continues at
+/// the left margin, whichever writer the run reaches.
 #[test]
 fn ascii_run_entering_decslrm_from_outside_wraps_at_the_right_margin() {
     let alphabet = "abcdefghijklmnopqrstuvwxyz";
@@ -410,16 +369,9 @@ fn ascii_run_entering_decslrm_from_outside_wraps_at_the_right_margin() {
     }
 }
 
-/// A cell an operation blanks or overwrites outside the writers' stale-entry
-/// probe drops its extras with it, so a later write at that column (an extras
-/// style: truecolor, SGR 58, curly underline, OSC 8) never adopts an old
-/// combining mark, skin tone or link: VS16 widening over a marked cell, ICH
-/// pushing a toned emoji off the edge, a narrow glyph over a wide pair's half,
-/// VS15 narrowing a linked emoji, EL/ECH/DCH/DECERA bisecting a pair, DECSEL
-/// clearing a marked cell, DECCRA copying a head its source edge cut, a wide
-/// glyph wrapping off a marked last column, and ICH/DCH on a double-width row
-/// shifting its cells past the half its extras stay in. Every grid also keeps
-/// each extras entry claimed by its cell (`assert_no_orphan_extras`).
+/// A cell an operation blanks or overwrites outside the writers' stale-entry probe drops
+/// its extras with it, so a later extras-style write at that column never adopts an old
+/// combining mark, skin tone or link; every grid keeps each extras entry claimed.
 #[test]
 fn a_blanked_cell_keeps_no_extras_for_a_later_write_to_adopt() {
     // (name, rows, cols, input, the rows it must show, the row-0 columns that
@@ -608,11 +560,9 @@ fn a_blanked_cell_keeps_no_extras_for_a_later_write_to_adopt() {
     }
 }
 
-/// A wide pair a rectangle scroll brought into a row is a wide pair to every
-/// writer: RI at the top of a DECSLRM span copies the span's cells down, and a
-/// later run over one half of a copied pair blanks the other half whether it
-/// arrives in one read (the bulk writers, whose wide fixups the row's
-/// `HAS_WIDE_CHARS` hint gates) or a byte at a time (the per-glyph writer).
+/// A wide pair a rectangle scroll (RI at the top of a DECSLRM span) copied into a row is
+/// a wide pair to every writer: a later run over one half blanks the other, in one read
+/// (the bulk writers, gated by the row's `HAS_WIDE_CHARS` hint) or a byte at a time.
 #[test]
 fn a_rectangle_scroll_keeps_the_rows_wide_pairs_for_the_bulk_writers() {
     for (input, want) in [
@@ -675,12 +625,10 @@ fn rep_after_a_folded_emoji_repeats_the_same_character_on_every_path() {
     );
 }
 
-/// A printed blank is written text whichever writer printed it: a run of
-/// default spaces long enough for the splat (4+ identical bytes in a run over
-/// 64 bytes), or REP of a space, counts toward the row's `len` like the same
-/// spaces written one at a time, so trailing spaces, a mark on such a space,
-/// copy across a soft wrap and a prompt's cursor through a rewrap are the
-/// same for every read boundary. A mark attached to a cell writes it.
+/// A printed blank is written text whichever writer printed it (the splat of 4+ identical
+/// bytes in a run over 64 bytes, REP of a space, one at a time): it counts toward the
+/// row's `len`, so trailing spaces, a mark on one, copy across a soft wrap and a prompt's
+/// cursor through a rewrap match for every read boundary.
 #[test]
 fn printed_blanks_count_toward_the_row_len_on_every_writer() {
     let digits: String = (0..70).map(|i| char::from(b'0' + (i % 10) as u8)).collect();
@@ -702,16 +650,14 @@ fn printed_blanks_count_toward_the_row_len_on_every_writer() {
             row_texts(&t)
         );
     }
-    // REP of a space fills the run in one go; it is the same line as the
-    // spaces printed one by one.
+    // REP of a space writes the same line as the spaces printed one by one.
     let (_, rep) = fold(1, 80, &[b"x \x1b[9b"]);
     let (_, typed) = fold(1, 80, &[b"x          "]);
     assert_eq!(rep, typed, "REP's blanks are written like printed ones");
 
-    // A `read -p` prompt ending in printed spaces, then a width change and
-    // back: the program's cursor stays after the spaces, so typed text lands
-    // after them whatever the read boundaries were (text-fidelity R2's case,
-    // reached through the splat).
+    // A `read -p` prompt ending in printed spaces, then a width change and back: the
+    // cursor stays after the spaces, so typed text lands after them whatever the read
+    // boundaries were.
     let prompt = "Please enter the name of the project you would like to configure:    ";
     let typed_after = |chunks: &[&[u8]]| {
         let (mut t, _) = fold(3, 80, chunks);
@@ -761,13 +707,10 @@ fn printed_blanks_count_toward_the_row_len_on_every_writer() {
     );
 }
 
-/// VT52 direct cursor addressing consumes exactly its two address bytes; the
-/// rest of the run goes back to the writer it would take in the next read, so
-/// where a read ends cannot move the cursor. And no writer folds printable
-/// ASCII after a ZWJ (UAX #29 GB11 joins a ZWJ only to Extended_Pictographic,
-/// and no ASCII character is one; `aterm_grapheme::GridColumns` measures it so),
-/// so `a`ZWJ`xy` lays out the same under IRM, DECAWM off, a national charset
-/// and the bulk path.
+/// VT52 direct cursor addressing consumes exactly its two address bytes, so where a read
+/// ends cannot move the cursor. No writer folds printable ASCII after a ZWJ (UAX #29 GB11
+/// joins a ZWJ only to Extended_Pictographic), so `a`ZWJ`xy` lays out the same under IRM,
+/// DECAWM off, a national charset and the bulk path.
 #[test]
 fn vt52_address_and_ascii_after_zwj_lay_out_the_same_on_every_path() {
     assert_chunk_invariant(6, 12, "\x1b[?2l\x1bY%(a\u{200D}\x1bY%)_y".as_bytes());
@@ -789,18 +732,10 @@ fn vt52_address_and_ascii_after_zwj_lay_out_the_same_on_every_path() {
     assert_eq!(bulk.cursor().col, 3, "the emoji opened its own cell");
 }
 
-/// Seeded random differential over the surfaces above: modes (IRM, DECAWM,
-/// charsets and shifts, DECSLRM and DECLRMM, origin, VT52 and its address),
-/// SGR with extras (truecolor, curly underline, SGR 58, OSC 8), REP, ICH, DCH,
-/// DECIC, DECDC, ECH, EL, cursor moves, double-width lines and DECSC/DECRC,
-/// interleaved with text that exercises every writer (ASCII runs long enough
-/// to splat, CJK, Hangul, emoji with skin tones and flags, ZWJ sequences,
-/// VS15/VS16, combining marks). Each input must give the same [`state`] whole,
-/// one byte at a time and cut at a few random points, with every extras entry
-/// claimed. Deterministic: the seeds are fixed, so a failure names its input.
-/// 4,000 inputs, half a second in a debug build: 1,500 stopped short of the
-/// rectangle-scroll wide pair at input 2,162, and 100,000 found nothing more
-/// (2026-10-11).
+/// Seeded random differential over the surfaces above, interleaved with text for every
+/// writer: each input gives the same [`state`] whole, one byte at a time and cut at a few
+/// random points, with every extras entry claimed. 4,000 inputs because the
+/// rectangle-scroll wide pair first shows at input 2,162.
 #[test]
 fn random_streams_are_read_boundary_invariant() {
     const TOKENS: &[&str] = &[

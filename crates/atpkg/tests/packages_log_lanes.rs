@@ -13,6 +13,10 @@
 //! work, so no network and no store mutation happen.
 
 #![cfg(unix)]
+#![allow(
+    clippy::disallowed_types,
+    reason = "test code: a stand-in child may inherit descriptors"
+)]
 
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Output, Stdio};

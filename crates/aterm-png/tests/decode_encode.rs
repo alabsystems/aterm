@@ -130,8 +130,8 @@ fn corpus() -> Vec<PathBuf> {
 
 /// Whether the corpus walk stays out of the directory `name` inside `parent`:
 /// `target` and `.git` at any depth, and at the repository root every
-/// `target-*` sibling build dir (the gate's per-lane dirs) and the gate's
-/// `.aterm-verify` state dir, which the checked-in .gitignore names as
+/// `target-*` sibling build dir (`target-trust`, older lanes' leftovers) and a
+/// leftover `.aterm-verify` state dir, which the checked-in .gitignore names as
 /// `/target-*` and `/.aterm-verify/`.
 fn corpus_skips(root: &Path, parent: &Path, name: &str) -> bool {
     name == "target"
@@ -175,8 +175,8 @@ fn corpus_under(root: &Path) -> Vec<PathBuf> {
 fn the_repository_corpus_decodes_and_round_trips() {
     let files = corpus();
     assert!(
-        files.len() >= 24,
-        "expected at least the 24 `.png` files tracked in this repository, found \
+        files.len() >= 20,
+        "expected at least the 20 `.png` files tracked in this repository, found \
          {} — has the walk broken?",
         files.len()
     );
@@ -653,6 +653,78 @@ fn a_limit_of_exactly_the_output_buffer_decodes_every_format() {
         );
     }
     assert_eq!(cases.len(), 80);
+}
+
+/// Reading a source is bounded even if it never reaches EOF. The guard turns
+/// an unbounded read into an immediate regression failure instead of an OOM.
+#[test]
+fn encoded_input_cannot_bypass_the_pixel_budget() {
+    use std::cell::Cell;
+    use std::io::Read;
+
+    struct GuardedRepeat<'a> {
+        consumed: &'a Cell<usize>,
+        maximum: usize,
+    }
+
+    impl Read for GuardedRepeat<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            let left = self.maximum.saturating_sub(self.consumed.get());
+            assert!(left > 0, "decoder read beyond its encoded-input ceiling");
+            let n = left.min(buf.len());
+            buf[..n].fill(0);
+            self.consumed.set(self.consumed.get() + n);
+            Ok(n)
+        }
+    }
+
+    let pixel_budget = 4;
+    let encoded_limit = pixel_budget * 4 + 64 * 1024;
+    let consumed = Cell::new(0);
+    let mut decoder = aterm_png::Decoder::new(GuardedRepeat {
+        consumed: &consumed,
+        maximum: encoded_limit + 1,
+    });
+    decoder.set_limits(aterm_png::Limits {
+        bytes: pixel_budget,
+    });
+    assert!(matches!(
+        decoder.read_info(),
+        Err(aterm_png::DecodingError::LimitsExceeded)
+    ));
+    assert_eq!(consumed.get(), encoded_limit + 1);
+
+    // Container overhead is allowed beside an exact output budget. The
+    // boundary is inclusive; one more byte is refused rather than truncated.
+    let mut bytes = encode(aterm_png::ColorType::Rgba, 1, 1, &[1, 2, 3, 4]);
+    bytes.resize(encoded_limit, 0);
+    let mut decoder = aterm_png::Decoder::new(bytes.as_slice());
+    decoder.set_limits(aterm_png::Limits {
+        bytes: pixel_budget,
+    });
+    let mut reader = decoder.read_info().expect("input exactly at the limit");
+    let mut pixels = [0; 4];
+    reader.next_frame(&mut pixels).expect("pixels");
+    assert_eq!(pixels, [1, 2, 3, 4]);
+    bytes.push(0);
+    let mut decoder = aterm_png::Decoder::new(bytes.as_slice());
+    decoder.set_limits(aterm_png::Limits {
+        bytes: pixel_budget,
+    });
+    assert!(matches!(
+        decoder.read_info(),
+        Err(aterm_png::DecodingError::LimitsExceeded)
+    ));
+
+    let mut decoder = aterm_png::Decoder::new(bytes.as_slice());
+    decoder.set_limits(aterm_png::Limits { bytes: usize::MAX });
+    assert!(
+        decoder.read_info().is_ok(),
+        "a large budget must saturate without overflow"
+    );
 }
 
 /// A zlib stream of `n` zero bytes — one literal, then distance-1

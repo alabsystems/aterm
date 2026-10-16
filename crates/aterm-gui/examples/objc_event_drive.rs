@@ -3,7 +3,7 @@
 //! THE EVENT DRIVER: every `NSEvent`-taking row of the ported `WinitView`, and
 //! the `NSApplication` `sendEvent:` override, entered with a REAL `NSEvent` of
 //! every type AppKit can deliver to it — the v0.72.0 mouse-move abort, turned
-//! into a gate.
+//! into a `verify appkit` check.
 //!
 //! # The defect this exists to close
 //!
@@ -74,19 +74,14 @@
 //! Both are the shapes the design was measured on
 //! (`docs/measured/2026-09-03-delivery-and-objc-exception-containment.md`).
 //!
-//! # What it cannot construct, and says so on every run
+//! # The gesture family
 //!
-//! `NSEventTypePressure` (34) and `NSEventTypeSmartMagnify` (32) have no
-//! public factory, and `+eventWithCGEvent:` raises for a `CGEvent` retyped to
-//! either (measured on macOS 26.6.2: the factory asserts that the type lies
-//! strictly between 0 and `kCGSLastEventType`). `pressureChangeWithEvent:` is
-//! therefore NOT DRIVEN, and the transcript says so. `smartMagnifyWithEvent:`
-//! is driven with a `Gesture` (29) stand-in, which is honest only because the
-//! row reads no type-restricted accessor: it calls `mouse_motion`, whose one
-//! read of the event is `locationInWindow`, valid for every type. `Magnify`
-//! (30) and `Rotate` (18) CAN be built by retyping a bare `CGEvent`:
-//! `-magnification` answers on Magnify, `-rotation` on Rotate, and `-phase`
-//! on both (measured, same machine — `tools/nsevent-probe/matrix2.txt`).
+//! The view's magnify, smart-magnify, rotate and pressure rows are gone:
+//! nothing in aterm handled the events they queued. The `Gesture` (29),
+//! `Magnify` (30) and `Rotate` (18) shapes are still built, by retyping a bare
+//! `CGEvent` (measured on macOS 26.6.2 — `docs/measured/nsevent-accessors/`),
+//! and sent through `-[NSApplication sendEvent:]`, where AppKit now routes them
+//! up the responder chain past the view. Every shape this file builds is driven.
 //!
 //! # The exit contract, which `aterm_verify::stages::OBJC_DRIVES` reads
 //!
@@ -102,16 +97,17 @@
 //!
 //! The abort that `abort_on_unwind` and `__rust_foreign_exception` perform is
 //! `SIGABRT`, and an uncaught `SIGABRT` is what makes macOS write a
-//! DiagnosticReport and show "quit unexpectedly" — once per gate run for the
+//! DiagnosticReport and show "quit unexpectedly" — once per `verify appkit` run for the
 //! panic control child alone, and once more for every real finding. So the driver
 //! installs its own handler for the fatal signals before it drives anything:
 //! the handler writes one line naming the row being driven (kept in a static
 //! buffer the main thread fills before every send, read with
 //! async-signal-safe calls only) and `_exit`s with `3`. The abort still
 //! happens — the trampoline still reaches `abort()` — but the process leaves
-//! through `_exit`, which the crash reporter does not see. The exit is read by
-//! the stage as a gate FAILURE, not as could-not-run — the opposite of its
+//! through `_exit`, which the crash reporter does not see. `verify appkit`
+//! reads the exit as a FAILURE, not as could-not-run — the opposite of its
 //! siblings, and deliberately: for this driver the abort IS the answer.
+#![allow(clippy::disallowed_types, reason = "an example driver, never shipped")]
 
 #[cfg(target_os = "macos")]
 const PASS: i32 = 0;
@@ -126,7 +122,7 @@ const ABORTED: i32 = 3;
 fn main() -> std::process::ExitCode {
     eprintln!(
         "objc-event-drive: NOT RUN — this drives \
-         vendor/winit/src/platform_impl/macos/view.rs, which does not exist off macOS."
+         crates/aterm-window/src/platform_impl/macos/view.rs, which does not exist off macOS."
     );
     std::process::ExitCode::from(NOT_RUN as u8)
 }
@@ -148,10 +144,9 @@ mod macos {
         Bool, CGPoint, CGRect, Id, MainThread, Sel, autoreleasepool, class, msg, ns_string, sel,
     };
     use winit::application::ApplicationHandler;
-    use winit::event::{DeviceEvent, DeviceId, ElementState, WindowEvent};
+    use winit::event::{ElementState, WindowEvent};
     use winit::event_loop::ActiveEventLoop;
     use winit::platform::pump_events::{EventLoopExtPumpEvents, PumpStatus};
-    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use winit::window::{Window, WindowId};
 
     use super::{ABORTED, FAIL, NOT_RUN, PASS};
@@ -869,8 +864,6 @@ mod macos {
         report: Report,
         /// Every `WindowEvent` winit delivered, by name.
         events: Vec<String>,
-        /// Every `DeviceEvent`, by name — `app.rs`'s override queues these.
-        device: Vec<String>,
         done: bool,
         stage: usize,
         pending: Option<Deferred>,
@@ -882,11 +875,8 @@ mod macos {
 
     impl Driver {
         fn view(&self) -> Option<Id> {
-            let handle = self.window.as_ref()?.window_handle().ok()?;
-            let RawWindowHandle::AppKit(h) = handle.as_raw() else {
-                return None;
-            };
-            Some(Id::from_ptr(h.ns_view.as_ptr()))
+            let view = aterm_objc::HasNsView::ns_view(self.window.as_ref()?);
+            (!view.is_null()).then_some(view)
         }
 
         /// The `NSWindow` holding the view, and its number — the number is
@@ -1003,10 +993,6 @@ mod macos {
                     ..
                 } => "MouseInput(Released)",
                 WindowEvent::MouseWheel { .. } => "MouseWheel",
-                WindowEvent::PinchGesture { .. } => "PinchGesture",
-                WindowEvent::RotationGesture { .. } => "RotationGesture",
-                WindowEvent::DoubleTapGesture { .. } => "DoubleTapGesture",
-                WindowEvent::TouchpadPressure { .. } => "TouchpadPressure",
                 WindowEvent::KeyboardInput { .. } => "KeyboardInput",
                 WindowEvent::ModifiersChanged(_) => "ModifiersChanged",
                 WindowEvent::Ime(_) => "Ime",
@@ -1017,18 +1003,6 @@ mod macos {
                 _ => "other",
             };
             self.events.push(name.to_owned());
-        }
-
-        fn device_event(&mut self, _el: &ActiveEventLoop, _id: DeviceId, e: DeviceEvent) {
-            let name = match &e {
-                DeviceEvent::MouseMotion { .. } => "MouseMotion",
-                DeviceEvent::MouseWheel { .. } => "MouseWheel",
-                DeviceEvent::Motion { .. } => "Motion",
-                DeviceEvent::Button { .. } => "Button",
-                DeviceEvent::Key(_) => "Key",
-                _ => "other",
-            };
-            self.device.push(name.to_owned());
         }
 
         fn about_to_wait(&mut self, el: &ActiveEventLoop) {
@@ -1062,9 +1036,8 @@ mod macos {
                 3 => self.stage_buttons(view, win),
                 4 => self.stage_tracking(view, win),
                 5 => self.stage_scroll(view),
-                6 => self.stage_gestures(view, win),
-                7 => self.stage_keys(view, win),
-                8 => self.stage_send_event(win),
+                6 => self.stage_keys(view, win),
+                7 => self.stage_send_event(win),
                 _ => {
                     self.done = true;
                     el.exit();
@@ -1465,58 +1438,8 @@ mod macos {
             }));
         }
 
-        fn stage_gestures(&mut self, view: Id, win: isize) {
-            println!("\n=== 6. the gesture rows ===");
-            let _ = self.drain();
-            // SAFETY: retyped bare events; nil where the factory refuses.
-            let (magnify, rotate, gesture) =
-                unsafe { (cg_typed(MAGNIFY), cg_typed(ROTATE), cg_typed(GESTURE)) };
-            self.drive(
-                view,
-                sel!(magnifyWithEvent:),
-                "magnifyWithEvent:",
-                magnify,
-                "Magnify/cg",
-            );
-            self.drive(
-                view,
-                sel!(rotateWithEvent:),
-                "rotateWithEvent:",
-                rotate,
-                "Rotate/cg",
-            );
-            println!(
-                "    (smartMagnifyWithEvent: is driven with a Gesture stand-in: SmartMagnify (32) has \
-                 no factory and +eventWithCGEvent: raises for it; the row reads no type-restricted \
-                 accessor)"
-            );
-            self.drive(
-                view,
-                sel!(smartMagnifyWithEvent:),
-                "smartMagnifyWithEvent:",
-                gesture,
-                "Gesture/cg stand-in",
-            );
-            let why = "pressureChangeWithEvent:: NSEventTypePressure (34) has no public factory and \
-                       +eventWithCGEvent: raises for a CGEvent retyped to it (measured on macOS \
-                       26.6.2); the row's reads, -pressure and -stage, are documented valid on a \
-                       pressure event and are not measured here";
-            println!("    NOT DRIVEN {why}");
-            self.not_driven.push(why.to_owned());
-            let _ = win;
-            self.pending = Some(Box::new(|d: &mut Driver| {
-                let got = d.drain();
-                println!("    events after the gesture rows: {got:?}");
-                d.report.expect(
-                    "smartMagnifyWithEvent: yields DoubleTapGesture",
-                    Driver::count(&got, "DoubleTapGesture") >= 1,
-                    format!("{got:?}"),
-                );
-            }));
-        }
-
         fn stage_keys(&mut self, view: Id, win: isize) {
-            println!("\n=== 7. keyDown: / keyUp: / flagsChanged: ===");
+            println!("\n=== 6. keyDown: / keyUp: / flagsChanged: ===");
             let _ = self.drain();
             let Some(a) = ns_string("a") else {
                 self.report.fail("could not build an NSString".to_owned());
@@ -1603,9 +1526,8 @@ mod macos {
         /// override, and behind it AppKit's own routing into the window and
         /// the view. Survival is the assertion; what arrives is printed.
         fn stage_send_event(&mut self, win: isize) {
-            println!("\n=== 8. -[NSApplication sendEvent:] with every shape ===");
+            println!("\n=== 7. -[NSApplication sendEvent:] with every shape ===");
             let _ = self.drain();
-            self.device.clear();
             // SAFETY: `+sharedApplication` is `@@:`.
             let app = unsafe { send_id(class(c"NSApplication").as_id(), sel!(sharedApplication)) };
             if app.is_null() {
@@ -1696,9 +1618,7 @@ mod macos {
             }
             self.pending = Some(Box::new(|d: &mut Driver| {
                 let got = d.drain();
-                let dev = std::mem::take(&mut d.device);
                 println!("    window events after sendEvent: {got:?}");
-                println!("    device events after sendEvent: {dev:?}");
             }));
         }
     }
@@ -1723,8 +1643,8 @@ mod macos {
         trap::install();
         trap::set_row("(before any row)");
         arm_hang_watchdog();
-        // The quiet builder (Accessory, no launch activation): the gate runs this
-        // drive beside a developer who is typing somewhere else.
+        // The quiet builder (Accessory, no launch activation): `verify appkit` runs
+        // this drive beside a developer who is typing somewhere else.
         let mut el = match aterm_gui::quiet_driver_event_loop_builder::<()>().build() {
             Ok(el) => el,
             Err(e) => {
@@ -1736,7 +1656,6 @@ mod macos {
             window: None,
             report: Report::default(),
             events: Vec::new(),
-            device: Vec::new(),
             done: false,
             stage: 0,
             pending: None,
@@ -1772,12 +1691,12 @@ mod macos {
         for why in &driver.not_driven {
             println!("  NOT DRIVEN: {why}");
         }
-        // The one row this machine cannot build an event for is named above;
-        // anything beyond it is a shape that used to be constructible and no
-        // longer is, which is a change in AppKit this file must be re-read for.
-        if driver.not_driven.len() > 1 {
+        // Every shape this file builds was constructible when it was written;
+        // one that no longer is is a change in AppKit this file must be
+        // re-read for.
+        if !driver.not_driven.is_empty() {
             driver.report.fail(format!(
-                "{} entries were not driven; only pressureChangeWithEvent: is expected here",
+                "{} entries were not driven; every row is expected to be",
                 driver.not_driven.len()
             ));
         }

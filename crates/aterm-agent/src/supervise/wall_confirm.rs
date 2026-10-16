@@ -128,7 +128,7 @@
 //! account advice, the exceptions engine — sees the same wall or none. A
 //! flag in the reading would have had each of them check it.
 //!
-//! WHAT CLAUDE CODE 2.1.294 WRITES (measured in `tools/real-claude-lab`,
+//! WHAT CLAUDE CODE 2.1.294 WRITES (measured in the real-Claude lab,
 //! 2026-10-08): every wall the policy acts on is an `assistant` row of the
 //! `<synthetic>` model with `isApiErrorMessage: true`, the notice as its
 //! text and an `error` word, then a `system` row `turn_duration`:
@@ -709,9 +709,13 @@ impl<C: Ctl> Session<'_, C> {
         screen: &Screen,
         opts: &SuperviseOpts,
     ) -> Option<Refusal> {
-        let w = reading.wall.as_ref().filter(|w| {
-            reading.program == aterm_phase::Program::Claude && w.kind != WallKind::Memory
-        })?;
+        let w = match reading.program {
+            Program::Claude => reading
+                .wall
+                .as_ref()
+                .filter(|w| w.kind != WallKind::Memory)?,
+            Program::Codex | Program::Agy | Program::Muse | Program::Generic => return None,
+        };
         let host = opts.idle_host.as_ref();
         // A LIMIT A CANCEL LEFT read as a turn's answer at this screen
         // ([`Session::left_read`]): when that turn was asked, on the loop's

@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// CPU==GPU rendering parity FUZZ. The GPU renderer's sole correctness oracle is
-// the (independently verified) CPU renderer; the example tests in
-// `gpu_matches_cpu.rs` pin specific features. This sweeps RANDOM mixed content —
-// ASCII, colour emoji (single/VS16/ZWJ/flag), every SGR style + decoration,
-// wide CJK, combining diacritics, procedural box/block/braille/sextant/Powerline
-// glyphs, inline IMAGES (iTerm2 OSC 1337 File=, opaque + transparent), and
-// DECDWL/DECDHL line sizes — and asserts the two paths stay within the usual
-// glyph-antialiasing/blend tolerance on EVERY frame. A deterministic PRNG keeps
-// it reproducible; gated on a GPU.
+// CPU==GPU rendering parity fuzz. The CPU renderer is the GPU renderer's
+// correctness oracle; `gpu_matches_cpu.rs` pins specific features, and this
+// sweeps random mixed content (ASCII, colour emoji with VS16/ZWJ/flags, every
+// SGR style and decoration, wide CJK, combining marks, procedural glyphs,
+// opaque and transparent iTerm2 inline images, DECDWL/DECDHL) and asserts the
+// two paths stay within the glyph AA/blend tolerance on every frame. A
+// deterministic PRNG keeps it reproducible; gated on a GPU.
 
 use aterm_core::terminal::Terminal;
 use aterm_render::Theme;
@@ -48,8 +46,7 @@ fn image_osc(cw: u32, ch: u32) -> Vec<u8> {
 }
 
 /// Per-pixel ceiling for the rare divergent AA-fringe pixel. Metal measures
-/// 1 over this seed (inline images are stamped after glyphs on both
-/// backends); the ceiling keeps headroom for other GPU drivers.
+/// 1 over this seed; the ceiling leaves headroom for other GPU drivers.
 const EDGE_CEIL: i32 = 40;
 /// Max fringe pixels per frame (Metal measures 0). A real regression (a wrong
 /// glyph or region) produces thousands.
@@ -106,9 +103,7 @@ const TOKENS: &[&[u8]] = &[
 fn cpu_gpu_parity_fuzz() {
     let theme = Theme::default();
     let px = 17.0;
-    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(px, theme);
     // Compare the shared base render: GPU-only bloom and heat shimmer are
     // outside the parity check.
     gpu.set_bloom(false);

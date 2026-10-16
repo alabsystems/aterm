@@ -57,7 +57,7 @@ pub fn control_connection_admission_model() -> Model {
                 completed = completed + 1;
             }
             invariant LaneBounded: outstanding <= LaneCap;
-            invariant ArrivalsBounded: arrivals <= MaxArrivals;
+            bound ArrivalsBounded: arrivals <= MaxArrivals;
             invariant AcceptedWorkAccounted: accepted == outstanding + completed;
         }
     }
@@ -266,7 +266,7 @@ pub fn native_control_routing_model() -> Model {
                 explicit_session_allowed = if Buggy == 1 { active_terminal } else { 1 };
                 bare_session_allowed = if Buggy == 1 { 1 } else { bare_session_allowed };
             }
-            invariant FrontKindBounded: front_kind > 0 && front_kind <= 2;
+            bound FrontKindBounded: front_kind > 0 && front_kind <= 2;
             invariant FrontKindMatchesTerminalMirror:
                 if front_kind == 1 {
                     active_terminal == 1
@@ -493,8 +493,8 @@ pub fn native_tab_identity_model() -> Model {
                 close_count = close_count + 1;
                 removed_count = removed_count + 1;
             }
-            invariant TabCountBounded: tab_count > 0 && tab_count <= MaxTabs;
-            invariant TabSlotsCompact:
+            bound TabCountBounded: tab_count > 0 && tab_count <= MaxTabs;
+            uncaught TabSlotsCompact:
                 if tab_count == 1 {
                     tab_one > 0 && tab_two == 0 && tab_three == 0
                 } else {
@@ -504,7 +504,7 @@ pub fn native_tab_identity_model() -> Model {
                         tab_one > 0 && tab_two > 0 && tab_three > 0
                     }
                 };
-            invariant TabViewSlotsCompact:
+            uncaught TabViewSlotsCompact:
                 if tab_count == 1 {
                     tab_view_one > 0 && tab_view_two == 0 && tab_view_three == 0
                 } else {
@@ -514,7 +514,7 @@ pub fn native_tab_identity_model() -> Model {
                         tab_view_one > 0 && tab_view_two > 0 && tab_view_three > 0
                     }
                 };
-            invariant LiveViewSlotsCompact:
+            uncaught LiveViewSlotsCompact:
                 if tab_count == 1 {
                     live_view_one > 0 && live_view_two == 0 && live_view_three == 0
                 } else {
@@ -568,7 +568,7 @@ pub fn native_tab_identity_model() -> Model {
                         active_tab == tab_three && focused_view == tab_view_three
                     }
                 };
-            invariant FirstTabViewLive:
+            uncaught FirstTabViewLive:
                 if tab_view_one == live_view_one {
                     tab_view_one > 0
                 } else {
@@ -578,7 +578,7 @@ pub fn native_tab_identity_model() -> Model {
                         tab_view_one == live_view_three && tab_view_one > 0
                     }
                 };
-            invariant SecondTabViewLive:
+            uncaught SecondTabViewLive:
                 if tab_count == 1 {
                     tab_view_two == 0
                 } else {
@@ -592,7 +592,7 @@ pub fn native_tab_identity_model() -> Model {
                         }
                     }
                 };
-            invariant ThirdTabViewLive:
+            uncaught ThirdTabViewLive:
                 if tab_count <= 2 {
                     tab_view_three == 0
                 } else {
@@ -608,10 +608,10 @@ pub fn native_tab_identity_model() -> Model {
                 };
             invariant TabIdsNeverReused: reused_tab_id == 0;
             invariant ViewIdsNeverReused: reused_view_id == 0;
-            invariant CloseRemovesExactlyOne: close_count == removed_count;
-            invariant AllocatorsAdvanceTogether: next_tab_id == next_view_id;
-            invariant TabAllocatorBounded: next_tab_id <= MaxId + 1;
-            invariant ViewAllocatorBounded: next_view_id <= MaxId + 1;
+            uncaught CloseRemovesExactlyOne: close_count == removed_count;
+            uncaught AllocatorsAdvanceTogether: next_tab_id == next_view_id;
+            bound TabAllocatorBounded: next_tab_id <= MaxId + 1;
+            bound ViewAllocatorBounded: next_view_id <= MaxId + 1;
         }
     }
 }
@@ -674,11 +674,11 @@ pub fn native_reopen_ledger_model() -> Model {
                 lost_on_failure = if Buggy == 1 { 1 } else { lost_on_failure };
             }
             invariant LedgerBounded: ledger <= Cap;
-            invariant NativeLiveBounded: native_live <= MaxLive;
+            bound NativeLiveBounded: native_live <= MaxLive;
             invariant FreshReopenIdentity: reused_retired == 0;
             invariant FailedReopenRetainsDescriptor: lost_on_failure == 0;
-            invariant NextIdentityBounded: next_id <= MaxId + 1;
-            invariant FailureCountBounded: failures <= MaxFailures;
+            bound NextIdentityBounded: next_id <= MaxId + 1;
+            bound FailureCountBounded: failures <= MaxFailures;
         }
     }
 }
@@ -767,10 +767,10 @@ pub fn closed_recovery_ledgers_model() -> Model {
             }
             invariant ViewLedgerBounded: view_ledger <= ViewCap;
             invariant TabLedgerBounded: tab_ledger <= TabCap;
-            invariant LiveLeavesBounded: live_leaves <= MaxLeaves;
+            bound LiveLeavesBounded: live_leaves <= MaxLeaves;
             invariant OnlyOneRecordPerClose: double_recorded == 0;
             invariant FailedReopenRetainsRecord: lost_on_failure == 0;
-            invariant FailureCountBounded: failures <= MaxFailures;
+            bound FailureCountBounded: failures <= MaxFailures;
         }
     }
 }
@@ -849,7 +849,7 @@ pub fn native_markdown_history_model() -> Model {
                 } else {
                     len <= Cap
                 };
-            invariant VisitsBounded: visits <= MaxVisits;
+            bound VisitsBounded: visits <= MaxVisits;
         }
     }
 }
@@ -879,7 +879,7 @@ pub fn native_markdown_viewport_model() -> Model {
                 steps = steps + 1;
             }
             invariant ExactIntraBlockProgress: actual_row == expected_row;
-            invariant StepsBounded: steps <= MaxSteps;
+            bound StepsBounded: steps <= MaxSteps;
         }
     }
 }
@@ -958,7 +958,7 @@ pub fn native_editor_viewport_model() -> Model {
                 } else {
                     scroll_anchor_line <= ScrollDocumentLines - 1
                 };
-            invariant ScrollPhaseBounded: scroll_phase <= 2;
+            bound ScrollPhaseBounded: scroll_phase <= 2;
         }
     }
 }
@@ -1047,8 +1047,8 @@ pub fn native_editor_command_palette_model() -> Model {
                 if query_changed == 1 { selected == 0 } else { selected <= results };
             invariant SubmitIsExactSelected:
                 submitted == exact_selected_dispatch;
-            invariant ResultsBounded: results <= 4;
-            invariant PhaseBounded: query_phase <= 2;
+            bound ResultsBounded: results <= 4;
+            bound PhaseBounded: query_phase <= 2;
         }
     }
 }
@@ -1149,25 +1149,25 @@ pub fn manual_config_completion_model() -> Model {
                 accepted = accepted;
             }
 
-            invariant SelectionWithinResults: selected <= Results - 1;
+            uncaught SelectionWithinResults: selected <= Results - 1;
             invariant SelectedCandidateVisible:
                 if assist_visible == 1 {
                     window_start <= selected && selected <= window_start + Capacity - 1
                 } else {
                     selected <= Results - 1
                 };
-            invariant WindowWithinResults: window_start <= Results - 1;
+            uncaught WindowWithinResults: window_start <= Results - 1;
             invariant OrdinaryEnterEditsDocument: ordinary_enter == document_edits;
-            invariant OrdinaryDownMovesCaret: ordinary_down == caret;
+            uncaught OrdinaryDownMovesCaret: ordinary_down == caret;
             invariant AcceptsExactSelected:
                 if accepted > 0 { accepted == expected_accept } else { expected_accept == 0 };
-            invariant ExactContextDismissal:
+            uncaught ExactContextDismissal:
                 if dismissed_context == context && dismissed_context > 0 {
                     assist_visible == 0
                 } else {
                     assist_visible <= 1
                 };
-            invariant StateIsBounded:
+            bound StateIsBounded:
                 context <= MaxContext && assist_visible <= 1 && interacting <= 1 &&
                 selected <= Results - 1 && window_start <= Results - 1 &&
                 document_edits <= MaxContext && ordinary_enter <= MaxContext &&
@@ -1257,7 +1257,7 @@ pub fn manual_config_problem_navigation_model() -> Model {
                 jumps = jumps;
             }
 
-            invariant SelectionWithinProblems:
+            uncaught SelectionWithinProblems:
                 if problems > 0 { selected <= problems - 1 } else { selected == 0 };
             invariant JumpMovesToExactProblem:
                 if jumps > 0 { target == selected + 1 && caret_target == target } else {
@@ -1267,7 +1267,7 @@ pub fn manual_config_problem_navigation_model() -> Model {
                 if jumps > 0 { revealed == 1 } else { revealed == 0 };
             invariant FullProblemIsSemantic:
                 if jumps > 0 { semantic_full == 1 } else { semantic_full == 0 };
-            invariant StateIsBounded:
+            bound StateIsBounded:
                 problems <= MaxProblems && selected <= MaxProblems - 1 &&
                 target <= MaxProblems && caret_target <= MaxProblems &&
                 revealed <= 1 && semantic_full <= 1 && jumps <= 4;
@@ -1277,10 +1277,12 @@ pub fn manual_config_problem_navigation_model() -> Model {
 
 /// Bounded Settings → Manual handoff. The host, never the Settings payload,
 /// owns the canonical `aterm.toml` path; repeated requests reuse one editor,
-/// focus it, and preserve the requested target exactly. An authored key/search
-/// is selected and revealed, while an absent key seeds Search and keeps config
-/// completion ready to insert it. `Buggy=1` reproduces the unsafe redirect,
-/// duplicate-editor, lost-selection, and inert-fallback shortcuts.
+/// focus it, and preserve the requested target exactly. An authored key is
+/// selected and revealed, while an absent key is added to the buffer as one
+/// unsaved, undoable edit with its value selected (never a Search that cannot
+/// match), and config completion stays ready to change it. `Buggy=1`
+/// reproduces the unsafe redirect, duplicate-editor, lost-selection, and
+/// inert-fallback shortcuts.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn manual_config_handoff_model() -> Model {
@@ -1288,13 +1290,13 @@ pub fn manual_config_handoff_model() -> Model {
         ManualConfigHandoff {
             const Buggy = 0;
             const MaxRequests = 2;
-            // request_kind: 0 none, 1 authored key, 2 absent key, 3 matching search.
-            // outcome: 0 none, 1 exact selection, 2 seeded Search fallback.
+            // request_kind: 0 none, 1 authored key, 2 absent key.
+            // outcome: 0 none, 1 exact selection, 2 absent key added unsaved.
             var requests = 0;
             var request_kind = 0;
             var outcome = 0;
             var selected_exact = 0;
-            var search_exact = 0;
+            var added_exact = 0;
             var completion_ready = 0;
             var canonical_path_authority = 1;
             var editor_instances = 0;
@@ -1305,7 +1307,7 @@ pub fn manual_config_handoff_model() -> Model {
                 request_kind = 1;
                 outcome = 1;
                 selected_exact = if Buggy == 1 { 0 } else { 1 };
-                search_exact = 0;
+                added_exact = 0;
                 completion_ready = 0;
                 canonical_path_authority = if Buggy == 1 {
                     0
@@ -1317,30 +1319,13 @@ pub fn manual_config_handoff_model() -> Model {
                 };
                 focused = 1;
             }
-            action SeedAbsentKey when (requests <= MaxRequests - 1) {
+            action AddAbsentKey when (requests <= MaxRequests - 1) {
                 requests = requests + 1;
                 request_kind = 2;
                 outcome = 2;
                 selected_exact = 0;
-                search_exact = if Buggy == 1 { 0 } else { 1 };
+                added_exact = if Buggy == 1 { 0 } else { 1 };
                 completion_ready = if Buggy == 1 { 0 } else { 1 };
-                canonical_path_authority = if Buggy == 1 {
-                    0
-                } else { canonical_path_authority };
-                editor_instances = if editor_instances == 0 {
-                    1
-                } else {
-                    if Buggy == 1 { editor_instances + 1 } else { editor_instances }
-                };
-                focused = 1;
-            }
-            action RevealMatchingSearch when (requests <= MaxRequests - 1) {
-                requests = requests + 1;
-                request_kind = 3;
-                outcome = 1;
-                selected_exact = if Buggy == 1 { 0 } else { 1 };
-                search_exact = 0;
-                completion_ready = 0;
                 canonical_path_authority = if Buggy == 1 {
                     0
                 } else { canonical_path_authority };
@@ -1359,18 +1344,18 @@ pub fn manual_config_handoff_model() -> Model {
                     focused == 0 && editor_instances == 0
                 };
             invariant AuthoredTargetSelected:
-                if request_kind == 1 || request_kind == 3 {
-                    outcome == 1 && selected_exact == 1 && search_exact == 0 &&
+                if request_kind == 1 {
+                    outcome == 1 && selected_exact == 1 && added_exact == 0 &&
                     completion_ready == 0
                 } else { selected_exact == 0 };
-            invariant AbsentTargetSeedsSearch:
+            invariant AbsentTargetAdded:
                 if request_kind == 2 {
-                    outcome == 2 && selected_exact == 0 && search_exact == 1 &&
+                    outcome == 2 && selected_exact == 0 && added_exact == 1 &&
                     completion_ready == 1
-                } else { search_exact == 0 };
+                } else { added_exact == 0 };
             invariant StateIsBounded:
-                requests <= MaxRequests && request_kind <= 3 && outcome <= 2 &&
-                selected_exact <= 1 && search_exact <= 1 && completion_ready <= 1 &&
+                requests <= MaxRequests && request_kind <= 2 && outcome <= 2 &&
+                selected_exact <= 1 && added_exact <= 1 && completion_ready <= 1 &&
                 canonical_path_authority <= 1 && editor_instances <= 1 && focused <= 1;
         }
     }
@@ -1504,7 +1489,7 @@ pub fn native_packages_worker_model() -> Model {
                 } else { operation == 0 };
             invariant FinalResultIsPresented: presented_result == last_result;
             invariant RefreshKeepsVerbResult: last_result == expected_result;
-            invariant StateIsBounded:
+            bound StateIsBounded:
                 sequence <= MaxSequence && inflight <= 1 && operation <= 3 &&
                 observed <= 1 && last_operation <= 3 && last_result <= 2 &&
                 presented_result <= 2;
@@ -1578,8 +1563,8 @@ pub fn native_recovery_interaction_model() -> Model {
                 if pending == 0 { inflight == 0 } else { inflight == 1 };
             invariant StaleCannotClear:
                 if last_completion_was_stale == 1 { pending > 0 } else { inflight <= 1 };
-            invariant StartsBounded: starts <= MaxStarts;
-            invariant CompletionsBounded: completions <= MaxCompletions;
+            bound StartsBounded: starts <= MaxStarts;
+            bound CompletionsBounded: completions <= MaxCompletions;
         }
     }
 }
@@ -1732,15 +1717,15 @@ pub fn native_editor_modal_model() -> Model {
                 mark_active = 0;
                 last_exit = 1;
             }
-            invariant ModeBounded: mode <= 4;
-            invariant QueryBounded: query <= Cap;
+            bound ModeBounded: mode <= 4;
+            bound QueryBounded: query <= Cap;
             invariant CaretBounded: caret <= Cap;
             invariant AnchorBounded: anchor <= Cap;
             invariant MarkPinned:
                 if mark_active == 1 { anchor == mark_origin } else { anchor <= Cap };
             invariant MinibufferCannotEditDocument: document_edits == authorized_edits;
-            invariant DocumentEditsBounded: document_edits <= Cap;
-            invariant ExitKindBounded: last_exit <= 1;
+            bound DocumentEditsBounded: document_edits <= Cap;
+            bound ExitKindBounded: last_exit <= 1;
         }
     }
 }
@@ -1805,7 +1790,7 @@ pub fn native_settings_singleton_model() -> Model {
                 } else {
                     focused_window == requesting_window
                 };
-            invariant OpensBounded: opens <= MaxOpens;
+            bound OpensBounded: opens <= MaxOpens;
         }
     }
 }
@@ -1882,10 +1867,10 @@ pub fn native_settings_draft_close_model() -> Model {
                 if draft == 1 { recovery_visible == 1 } else { recovery_visible == 0 };
             invariant ConfirmationOwnsDraft:
                 if discard_armed == 1 { draft == 1 } else { draft <= 1 };
-            invariant FlagsBounded:
+            bound FlagsBounded:
                 draft <= 1 && discard_armed <= 1 && recovery_visible <= 1;
-            invariant ResultBounded: close_result <= 2;
-            invariant PreservationBounded: preservations <= MaxPreservations;
+            bound ResultBounded: close_result <= 2;
+            bound PreservationBounded: preservations <= MaxPreservations;
         }
     }
 }
@@ -2016,8 +2001,8 @@ pub fn native_config_transaction_model() -> Model {
             invariant NoBlindOverwrite: stale_overwrite == 0;
             invariant AtomicResetVisibility: partial_reset == 0;
             invariant RevisionCountsWrites: accepted + external_edits == revision;
-            invariant KeysBounded: key_a <= 2 && key_b <= 2;
-            invariant RevisionBounded: revision <= MaxRevision;
+            bound KeysBounded: key_a <= 2 && key_b <= 2;
+            bound RevisionBounded: revision <= MaxRevision;
         }
     }
 }
@@ -2101,8 +2086,8 @@ pub fn native_config_observation_handoff_model() -> Model {
                 // error) instead of leaving them pending — 92a43f0d, pinned by
                 // `failed_reconciliation_answers_queued_callers_…`. That commit
                 // changed the shipping lane and not this model; the refinement
-                // gate then failed on the first machine to run both lines
-                // together, which is the gate doing its job one merge late.
+                // check then failed on the first machine to run both lines
+                // together, which is the check doing its job one merge late.
                 queued = 0;
             }
             action RetryReconcile when (
@@ -2150,7 +2135,7 @@ pub fn native_config_observation_handoff_model() -> Model {
             invariant DeferredGenerationNeverLost: dropped_candidate == 0;
             invariant UnknownAuthorityFencesWrites: blind_write == 0;
             invariant LatestExactGenerationWins: stale_admission == 0;
-            invariant Bounds:
+            bound Bounds:
                 phase <= 2 && pending <= 2 && sampled <= 2 && admitted <= 2 &&
                 gate <= 1 && queued <= 1 && reconciliation_failed <= 1 &&
                 dropped_candidate <= 1 && blind_write <= 1 && stale_admission <= 1;
@@ -2312,13 +2297,13 @@ pub fn serious_mode_intent_queue_model() -> Model {
             invariant IdleIsAuthoritative:
                 if inflight == 0 { live == service && live == projection } else { live <= 1 };
             invariant ProjectionTracksLatestIntent: projection == last_desired;
-            invariant QueueBounded: queue_count <= 2;
+            bound QueueBounded: queue_count <= 2;
             // No accounting law `completed <= issued`: `Complete` needs an
             // in-flight write, and the shipping origin moves into its worker job
             // and back, so one request cannot complete twice — the type rules it
             // out. `IssuedBounded` and that guard bound `completed` too.
-            invariant IssuedBounded: issued <= MaxIssued;
-            invariant ValuesBoolean:
+            bound IssuedBounded: issued <= MaxIssued;
+            bound ValuesBoolean:
                 live <= 1 && service <= 1 && projection <= 1 && current_desired <= 1 &&
                 q1 <= 1 && q2 <= 1 && q1_expected <= 1 && q2_expected <= 1 &&
                 last_desired <= 1 && intent_kind <= 2;
@@ -2552,7 +2537,7 @@ pub fn config_file_commit_cas_model() -> Model {
                 };
             invariant ReconcileBeforeRetry: blind_retry == 0;
             // One commit owner is the type: `lock_owner` is a single variable.
-            invariant Bounded:
+            bound Bounded:
                 lock_owner <= 2 &&
                 disk <= 2 && service <= 2 && target <= 1 && link <= 1 &&
                 manual_phase <= 5 && settings_phase <= 5 &&
@@ -2719,7 +2704,7 @@ pub fn config_catalog_snapshot_model() -> Model {
             // Consumers receive the one immutable snapshot `Arc` — text and every
             // asset together — so a consumer's generation is complete whenever the
             // snapshot is (`SnapshotAtomic`) and not ahead of it (`ViewsNeverAhead`).
-            invariant RevisionBounded: revision <= MaxRevision && asset_refresh <= 2;
+            bound RevisionBounded: revision <= MaxRevision && asset_refresh <= 2;
         }
     }
 }
@@ -2806,10 +2791,10 @@ pub fn composite_accessibility_route_model() -> Model {
             }
             invariant NoCrossViewDispatch: cross_dispatch == 0;
             invariant NoStaleGenerationDispatch: stale_dispatch == 0;
-            invariant GenerationsBounded:
+            bound GenerationsBounded:
                 owner_one_generation <= 2 && owner_two_generation <= 2 &&
                 published_one_generation <= 2 && published_two_generation <= 2;
-            invariant OwnerDomain:
+            bound OwnerDomain:
                 focus_owner <= 2 && target_owner <= 2 && dispatched_owner <= 2;
         }
     }
@@ -2891,7 +2876,7 @@ pub fn native_document_publication_model() -> Model {
             invariant AnchorsTransformed: anchor_seq == edit_seq;
             invariant StaleTxnIsNoOp: stale_write == 0;
             invariant PublishIsAtomic: partial_publish == 0;
-            invariant SequenceBounded: edit_seq <= MaxSeq;
+            bound SequenceBounded: edit_seq <= MaxSeq;
         }
     }
 }
@@ -2957,8 +2942,8 @@ pub fn native_file_watch_model() -> Model {
                 } else {
                     verdict == 0
                 };
-            invariant InputsBounded: changed + equivalent + dirty + saving <= 4;
-            invariant VerdictBounded: verdict <= 5;
+            uncaught InputsBounded: changed + equivalent + dirty + saving <= 4;
+            bound VerdictBounded: verdict <= 5;
         }
     }
 }
@@ -3067,14 +3052,14 @@ pub fn watcher_failure_recovery_model() -> Model {
             }
             invariant FailureStatusExact: status_failed == failed;
             invariant FailureWakeDeduped: failure_wakes == failure_epochs;
-            invariant RecoveryWakeBounded: recovery_wakes <= failure_wakes;
+            uncaught RecoveryWakeBounded: recovery_wakes <= failure_wakes;
             invariant FailedPollRetainsCatalog:
                 if failed == 1 { catalog == latched_catalog } else { catalog <= MaxEpoch };
             invariant ConfigRecoveryAdmitsLatest:
                 recovered_candidate == 0 || recovered_candidate == latest_candidate;
-            invariant CandidateGenerationBounded:
+            bound CandidateGenerationBounded:
                 latest_candidate <= 2 && pending_candidate <= 2 && recovered_candidate <= 2;
-            invariant EpochsBounded: failure_epochs <= MaxEpoch;
+            bound EpochsBounded: failure_epochs <= MaxEpoch;
         }
     }
 }
@@ -3202,15 +3187,15 @@ pub fn native_draft_journal_model() -> Model {
                     desired_seq <= MaxSeq - 1
                 ) { 1 } else { stale_accepted };
             }
-            invariant DesiredIsLatest: desired_seq == edit_seq;
+            uncaught DesiredIsLatest: desired_seq == edit_seq;
             invariant NeverAckFuture: durable_seq <= desired_seq;
-            invariant PendingTargetWasPublished: target_seq <= desired_seq;
+            uncaught PendingTargetWasPublished: target_seq <= desired_seq;
             invariant PruneOnlyAfterFileDurable: baseline_seq <= file_durable_seq;
             invariant StaleProofIsNoOp: stale_accepted == 0;
             invariant NoUnsafePrune: unsafe_prune == 0;
             invariant JournalImageCas: wrong_image_accepted == 0;
-            invariant SequenceBounded: edit_seq <= MaxSeq;
-            invariant GenerationBounded:
+            bound SequenceBounded: edit_seq <= MaxSeq;
+            bound GenerationBounded:
                 generation <= MaxGeneration &&
                 journal_disk_generation <= MaxGeneration &&
                 plan_disk_generation <= MaxGeneration;
@@ -3356,8 +3341,8 @@ pub fn restore_manifest_single_use_model() -> Model {
                     visible <= 1
                 };
             invariant UniqueTemporaryNeverAliases: fixed_alias_corrupted == 0;
-            invariant OwnerBounded: lock_owner <= 3 && claim_owner <= 2;
-            invariant FlagsBounded:
+            bound OwnerBounded: lock_owner <= 3 && claim_owner <= 2;
+            bound FlagsBounded:
                 visible <= 1 && claim_synced <= 1 &&
                 unique_temporary <= 1 && unsafe_return <= 1 &&
                 fixed_alias_corrupted <= 1;
@@ -3463,7 +3448,7 @@ pub fn native_close_plan_model() -> Model {
             // Closed has no views by construction: the store derives `Suspended`
             // from an empty view map (`commit_detach`), and `CommitClose` empties
             // both counts in the transition that closes.
-            invariant SequenceBounded: edit_seq <= MaxSeq;
+            bound SequenceBounded: edit_seq <= MaxSeq;
         }
     }
 }
@@ -3578,7 +3563,7 @@ pub fn native_save_intent_latch_model() -> Model {
                 else { close_seq <= head };
             invariant ClosedSequenceIsDurable:
                 if closed == 1 { close_seq <= durable } else { head <= MaxSeq };
-            invariant SequenceBounded: head <= MaxSeq;
+            bound SequenceBounded: head <= MaxSeq;
         }
     }
 }
@@ -3682,7 +3667,7 @@ pub fn native_async_delivery_model() -> Model {
             invariant IdentityAndGenerationChecked: wrong_delivery == 0;
             invariant ServiceOutlivesRequester: service_dropped_with_view == 0;
             invariant ReducedAtMostOnce: reduced <= 1;
-            invariant GenerationsBounded: view_generation <= MaxGeneration;
+            bound GenerationsBounded: view_generation <= MaxGeneration;
         }
     }
 }

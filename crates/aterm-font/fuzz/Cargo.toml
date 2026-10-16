@@ -1,0 +1,38 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+#
+# aterm-font's coverage-guided fuzz lane (TF.3 of
+# docs/AUDIT-third-party-2026-10-15.md). STOCK EXCEPTION: Trust ships no
+# cargo-fuzz and no libFuzzer runtime, so this crate builds with a stock
+# nightly, outside the workspace (its own `[workspace]` below). The
+# deterministic half of the same property runs in every test pass:
+# `tests/never_panic.rs`.
+
+[package]
+name = "aterm-font-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.aterm-font]
+path = ".."
+
+# Keep this out of the aterm workspace.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "face"
+path = "fuzz_targets/face.rs"
+test = false
+doc = false
+bench = false

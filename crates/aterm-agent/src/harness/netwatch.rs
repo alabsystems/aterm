@@ -39,8 +39,8 @@ pub const API_HOST: &str = "api.anthropic.com";
 pub const API_PORT: u16 = 443;
 /// One probe's whole budget: resolve, connect and handshake together.
 pub const PROBE_BUDGET: Duration = Duration::from_secs(10);
-/// How long one loop's ask keeps the probe running (the loop asks at the top
-/// of every wait step, 20 s at most apart).
+/// How long one loop's ask keeps the probe running (a loop asks at every wait
+/// step, at most 20 s apart).
 pub const NET_LEASE: Duration = Duration::from_secs(60);
 /// How old a measure may be, on either clock, and still say anything.
 pub const FRESH: Duration = Duration::from_secs(120);
@@ -55,11 +55,11 @@ pub const STEADY_CADENCE: Duration = Duration::from_secs(60);
 /// A wall clock that steps back this little (a time sync) is not a sleep.
 const CLOCK_SLACK: Duration = Duration::from_secs(5);
 
-/// The variables that give an agent a route the host cannot reproduce
-/// (Claude Code 2.1.283's own: a base URL, its three cloud providers, a unix
-/// socket, and the proxies Node and Bun honour). Any non-empty value counts —
-/// `CLAUDE_CODE_USE_BEDROCK=0` included: a route read wrongly as custom
-/// costs only the time ladder, one read wrongly as the default a hold.
+/// The variables that give an agent a route the host cannot reproduce (Claude
+/// Code 2.1.283's: a base URL, its three cloud providers, a unix socket, and
+/// the proxies Node and Bun honour). Any non-empty value counts,
+/// `CLAUDE_CODE_USE_BEDROCK=0` included: a route misread as custom costs only
+/// the time ladder, one misread as the default a hold.
 pub const ROUTE_KEYS: &[&str] = &[
     "ANTHROPIC_BASE_URL",
     "ANTHROPIC_BEDROCK_BASE_URL",
@@ -102,9 +102,8 @@ pub enum Source {
 }
 
 impl From<Result<Option<String>, String>> for Source {
-    /// A document of Claude Code's settings chain as the chain's reader
-    /// returned it (`claude_settings::Source::text`): none, its text, or
-    /// why it cannot be read.
+    /// A document as the settings chain's reader returned it
+    /// (`claude_settings::Source::text`).
     fn from(text: Result<Option<String>, String>) -> Self {
         match text {
             Ok(None) => Self::Missing,
@@ -179,28 +178,33 @@ pub enum SettingsEnv {
     Unparsed,
 }
 
-/// ONE SETTINGS FILE AS THIS READER TAKES IT ([`settings_of`]): what a host
-/// judges an agent by, and nothing else of the file. The route reads its
-/// `env` block ([`settings_route`]); the accounts' judgment of whether the
-/// agent authenticates by its stored login reads the block and the helper
-/// (`super::accounts::ProcessLogin::with_settings`).
+/// One settings file as this reader takes it ([`settings_of`]): only what a
+/// host judges an agent by. The route reads its `env` block
+/// ([`settings_route`]); the accounts' stored-login judgment reads the block
+/// and the helper (`super::accounts::ProcessLogin::with_settings`); the usage
+/// tap's gate (`super::tap::gate`) reads those and the status line and hook
+/// switch.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Settings {
     /// Its `env` block, by key: each key with its value as text — a string
     /// as it is, `null` as the empty string, any other JSON value as its
     /// JSON text. Empty with no `env` block.
     pub env: Vec<(String, String)>,
-    /// It names an `apiKeyHelper` (Claude Code 2.1.286's and 2.1.287's
-    /// settings key for a command that prints a credential): the key is
-    /// there with any value but `null`, `false` and the empty string.
+    /// It names an `apiKeyHelper` (Claude Code's settings key for a command
+    /// that prints a credential): any value but `null`, `false` and `""`.
     pub api_key_helper: bool,
+    /// It sets a `statusLine`: any value but `null`. The usage tap is never
+    /// put on the relaunch line of a session whose chain sets one when the
+    /// line is typed (`super::tap::gate`).
+    pub status_line: bool,
+    /// It sets `disableAllHooks` to `true`, which also drops a status line.
+    pub hooks_off: bool,
 }
 
-/// Read one settings file's text: THE ONE SETTINGS READER, over the chain's
-/// one parse (`claude_settings::parse`: an empty or blank document is `{}`,
-/// a leading byte-order mark is dropped, as Claude Code reads them). `None`
-/// for text that is not a JSON object, or whose `env` is not one: what
-/// Claude Code would make of it is not this reader's to guess.
+/// Read one settings file's text: the one settings reader, over the chain's
+/// one parse (`claude_settings::parse`: empty or blank is `{}` and a leading
+/// byte-order mark is dropped, as Claude Code reads them). `None` for text that
+/// is not a JSON object, or whose `env` is not one.
 #[must_use]
 pub fn settings_of(text: &str) -> Option<Settings> {
     use aterm_json::Value;
@@ -228,9 +232,13 @@ pub fn settings_of(text: &str) -> Option<Settings> {
             Value::String(command) => !command.is_empty(),
             _ => true,
         });
+    let status_line = object.get("statusLine").is_some_and(|line| !line.is_null());
+    let hooks_off = object.get("disableAllHooks") == Some(&Value::Bool(true));
     Some(Settings {
         env,
         api_key_helper,
+        status_line,
+        hooks_off,
     })
 }
 
@@ -312,16 +320,15 @@ impl NetState {
     /// A loop asks for `who` (its session): its lease renewed, and the
     /// verdict now ([`Self::reach`]).
     pub fn ask(&mut self, who: &str, now: Instant, wall: SystemTime) -> Reach {
-        // A resolver can hold the worker indefinitely. Expire old sessions
-        // here too, so tab churn cannot retain every historical lease while
-        // the worker is unable to reach next_probe's cleanup.
+        // A resolver can hold the worker indefinitely, so the ask expires
+        // lapsed leases too: tab churn cannot pile them up meanwhile.
         self.waiting(now);
         self.waiters.insert(who.to_string(), now);
         self.reach(now, wall)
     }
 
-    /// The verdict: the last measure while it is fresh on both clocks and no
-    /// probe has overrun its budget ([`Self::budget`]) — `Up`/`Down` with the start of its run —
+    /// The verdict: the last measure (`Up`/`Down` with the start of its run)
+    /// while it is fresh on both clocks and no probe has overrun its budget,
     /// else [`Reach::Unknown`].
     #[must_use]
     pub fn reach(&self, now: Instant, wall: SystemTime) -> Reach {
@@ -388,10 +395,9 @@ impl NetState {
         true
     }
 
-    /// A probe ended with `outcome` — read as [`Outcome::Unknown`] when it
-    /// overran its budget, whatever it found. A measure that says what the
-    /// last fresh one said continues its run (`since` kept); any other
-    /// starts one.
+    /// A probe ended with `outcome`, read as [`Outcome::Unknown`] when it
+    /// overran its budget. A measure that repeats the last fresh one continues
+    /// its run (`since` kept); any other starts one.
     pub fn finish(&mut self, outcome: Outcome, now: Instant, wall: SystemTime) {
         let overran = self
             .flight
@@ -435,9 +441,8 @@ mod tests {
         st.finish(outcome, t, w);
     }
 
-    /// The worker cannot prune while DNS is stuck. New asks must retire
-    /// expired sessions themselves, including the exact lease boundary,
-    /// while retaining current peers and leaving the single flight alone.
+    /// Asks expire lapsed leases themselves while a stuck probe keeps the
+    /// worker from pruning, and start no second probe.
     #[test]
     fn asks_expire_churned_sessions_even_while_the_probe_is_stuck() {
         let (t, w) = t0();
@@ -457,8 +462,8 @@ mod tests {
             assert!(st.waiters.contains_key(&who));
             assert_eq!(st.flight, Some(t), "no second probe is started");
 
-            // Historical ask only inserted. No worker cleanup runs in
-            // either arm, so this control retains every departed session.
+            // Control: a bare insert, with no expiry on the ask, keeps every
+            // departed session.
             old.waiters.insert("live-peer".to_string(), at);
             old.waiters.insert(who, at);
             assert_eq!(old.reach(at, wall), Reach::Unknown);
@@ -470,11 +475,9 @@ mod tests {
         assert_eq!(st.waiters.len(), 3, "leases not yet expired stay live");
     }
 
-    /// The schedule: nothing while nobody waits; a probe at once for the
-    /// first waiter; after a Down 15 s, 30 s, then every 60 s; after an Up
-    /// every 60 s; one in flight at a time; and parked again once every
-    /// lease has lapsed (60 s without an ask). Negative control: a waiter
-    /// that keeps asking keeps it probing.
+    /// The schedule: parked while nobody waits, a probe at once for the first
+    /// waiter, then the Down and steady cadences, one in flight at a time.
+    /// Negative control: a waiter that keeps asking keeps it probing.
     #[test]
     fn the_schedule_probes_at_once_then_15_30_60_while_someone_waits_and_parks_when_nobody_does() {
         let (t, w) = t0();
@@ -504,10 +507,10 @@ mod tests {
         assert!(st.next_probe(at + 61 * S, w).is_some());
     }
 
-    /// A measure older than two minutes on either clock says nothing: the
-    /// monotonic clock stops while the Mac sleeps, the wall clock does not —
-    /// and a wall clock stepped far back is no evidence either. Negative
-    /// control: a fresh one on both clocks says what it measured.
+    /// A measure older than [`FRESH`] on either clock says nothing (the
+    /// monotonic clock stops while the Mac sleeps, the wall clock does not),
+    /// nor does one whose wall clock stepped far back. Negative control: a time
+    /// sync's small step back is no sleep.
     #[test]
     fn a_stale_measure_reads_unknown_on_either_clock() {
         let (t, w) = t0();
@@ -531,10 +534,8 @@ mod tests {
         assert_eq!(st.next_probe(t + 10 * S, w + 3600 * S), Some(t + 10 * S));
     }
 
-    /// `since` is the start of the run: an Up measured again keeps its
-    /// `since` (the loop sees no edge each minute); a Down between starts a
-    /// new run; a probe that overran its budget is Unknown whatever it
-    /// found, and one still in flight past it reads Unknown meanwhile.
+    /// An Up measured again keeps its `since`, so the loop sees no edge each
+    /// minute; a probe past its budget reads Unknown, in flight and after.
     #[test]
     fn since_is_the_runs_start_and_an_overrun_is_unknown() {
         let (t, w) = t0();
@@ -571,12 +572,9 @@ mod tests {
         }
     }
 
-    /// The route is the default only where nothing names another and every
-    /// source could be read: each route key in the agent's environment, each
-    /// in a settings `env` block (and under the proxy prefix), an
-    /// unreadable or unparseable source and an unreadable environment are
-    /// each custom. Negative controls: an empty value, an unrelated key,
-    /// and a settings file with no `env` are no route.
+    /// Every route key, in the environment or a settings `env` block, and every
+    /// unreadable or unparseable source makes the route custom. Negative
+    /// controls: an empty value, an unrelated key and no `env` are no route.
     #[test]
     fn the_route_is_the_default_only_without_a_base_url_provider_socket_or_proxy() {
         let quiet = [("user", Source::Text("{\"model\":\"opus\"}".to_string()))];
@@ -626,14 +624,11 @@ mod tests {
         assert!(matches!(route_of(&RouteFacts::default()), Route::Custom(_)));
     }
 
-    /// THE ONE SETTINGS READER: the `env` block's keys with their values as
-    /// text, and whether an `apiKeyHelper` is named — and the route's own
-    /// answer is read through it, key for key; an empty or blank document
-    /// is `{}` and a leading byte-order mark is dropped, as Claude Code
-    /// reads one. NEGATIVE CONTROLS: a helper that is `null`, `false` or
-    /// empty names none; a key of that name INSIDE the `env` block is a
-    /// variable, not the setting; text that is not an object, or whose `env`
-    /// is not one, is not read at all.
+    /// The settings reader: the `env` block's values as text and whether an
+    /// `apiKeyHelper` is named, with the route read through it. Negative
+    /// controls: a `null`, `false` or empty helper names none; an
+    /// `apiKeyHelper` key inside `env` is a variable, not the setting; text
+    /// that is not an object, or whose `env` is not one, is not read.
     #[test]
     fn one_reader_takes_a_settings_files_env_block_and_its_api_key_helper() {
         let text = r#"{"model":"opus","apiKeyHelper":"/usr/local/bin/key",
@@ -650,6 +645,7 @@ mod tests {
                     pair("HTTPS_PROXY", "http://gw.example:8080"),
                 ],
                 api_key_helper: true,
+                ..Settings::default()
             })
         );
         assert_eq!(
@@ -658,8 +654,7 @@ mod tests {
         );
         assert_eq!(settings_of("{}"), Some(Settings::default()));
         assert_eq!(settings_route("{}"), SettingsEnv::Quiet);
-        // As Claude Code reads a document (the chain's one parse): empty or
-        // blank is `{}`, and a leading byte-order mark is dropped.
+        // Empty or blank is `{}`, and a leading byte-order mark is dropped.
         for empty in ["", " \n\t", "\u{feff}", "\u{feff} \n"] {
             assert_eq!(settings_of(empty), Some(Settings::default()), "{empty:?}");
         }
@@ -683,6 +678,7 @@ mod tests {
             Some(Settings {
                 env: vec![pair("apiKeyHelper", "key.sh")],
                 api_key_helper: false,
+                ..Settings::default()
             })
         );
         for unparsed in [
@@ -698,6 +694,34 @@ mod tests {
                 SettingsEnv::Unparsed,
                 "{unparsed}"
             );
+        }
+    }
+
+    /// The same reader says whether a document sets a `statusLine` (any value
+    /// but `null`) and `disableAllHooks` to `true`. Negative controls: a
+    /// `null` status line, a `false` or non-boolean hook switch, and those
+    /// names inside the `env` block set neither.
+    #[test]
+    fn one_reader_says_whether_a_document_sets_a_status_line_or_turns_hooks_off() {
+        let read = |text: &str| settings_of(text).expect("a settings document");
+        for set in [
+            r#"{"statusLine":{"type":"command","command":"echo mine"}}"#,
+            r#"{"statusLine":"x"}"#,
+            r#"{"statusLine":{}}"#,
+        ] {
+            let s = read(set);
+            assert!(s.status_line && !s.hooks_off, "{set}");
+        }
+        assert!(read(r#"{"disableAllHooks":true}"#).hooks_off);
+        for quiet in [
+            "{}",
+            r#"{"statusLine":null}"#,
+            r#"{"disableAllHooks":false}"#,
+            r#"{"disableAllHooks":"true"}"#,
+            r#"{"env":{"statusLine":"x","disableAllHooks":"true"}}"#,
+        ] {
+            let s = read(quiet);
+            assert!(!s.status_line && !s.hooks_off, "{quiet}");
         }
     }
 }

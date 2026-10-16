@@ -80,21 +80,19 @@ impl CursorGlow {
     pub fn forge_fill(&self) -> Option<u32> {
         let t = ((self.cursor_temp - Self::FORGE_MIN_TEMP) / (1.0 - Self::FORGE_MIN_TEMP))
             .clamp(0.0, 1.0);
-        // The metal BREATHES: a slow molten shimmer rides the field phase
-        // (deterministic; quantized to u8 by the ramp, so idle settles).
+        // A slow molten shimmer rides the field phase (deterministic; quantized to u8 by the
+        // ramp, so idle settles).
         let breathe = 0.045 * t * (self.flame_phase * 1.7).sin();
         // Ramp floor 0.10 = a dull ember even stone-cold; never returns None,
         // so the fire cursor is warm the instant the style is active.
         Some(fire_ramp((0.10 + 0.64 * t + breathe).clamp(0.0, 0.86)))
     }
 
-    /// Zero the thermal integrators (heat / flare / coal / quench, the eased
-    /// display temperatures, the rainbow kitty momentum spine, the flame +
-    /// specular phases, the typing cadence clock): the full-dark half that
-    /// master-off and [`Self::reset`] add on top of
-    /// [`Self::clear_transient_state`]. The zero-amplitude path does not call
-    /// this: a momentary unfocus only cools by the elapsed gap, so earned
-    /// forge momentum survives a focus blip.
+    /// Zero the thermal integrators (heat / flare / coal / quench, the eased display
+    /// temperatures, the typing and erase momentum metrics, the flame phase, the typing cadence
+    /// clock): the full-dark half that master-off and [`Self::reset`] add on top of
+    /// [`Self::clear_transient_state`]. The zero-amplitude path does not call this: a momentary
+    /// unfocus only cools by the elapsed gap, so earned forge momentum survives a focus blip.
     pub(super) fn clear_thermals(&mut self) {
         self.heat = 0.0;
         self.heat_at = None;
@@ -105,8 +103,6 @@ impl CursorGlow {
         self.cursor_temp = 0.0;
         self.flame_phase = 0.0;
         self.momentum.reset();
-        // The erase metric is a thermal integrator too: reset in the
-        // full-dark wipe, not on the zero-amplitude path.
         self.erase_mom.reset();
         self.last_type = None;
     }
@@ -135,27 +131,21 @@ impl CursorGlow {
             navigation,
             ..
         } = mv;
-        // Typing cadence → heat: each keystroke earns credit by how quickly
-        // it followed the previous one, so only sustained fast typing ramps
-        // the wake up; one quick correction doesn't flare. The life math
-        // below also keys on `gap` (typing-continuity chaining).
+        // Each keystroke earns heat by how quickly it followed the previous one, so only
+        // sustained fast typing ramps the wake up; the life math downstream also keys on `gap`.
         if typing {
             let gap = self
                 .last_type
                 .map(|t| now.saturating_duration_since(t).as_secs_f32())
                 .unwrap_or(f32::MAX);
-            // Forward-only momentum is a fire law ("sustained forward
-            // momentum heats it"); the other styles keep direction-blind heat.
+            // Forward-only momentum heats fire; the other styles keep direction-blind heat.
             if (forward || !fire) && !deletion && !navigation {
-                // Shared helpers: the key-time click reconstructs this ramp to
-                // time-align its timbre with the light (`cue_keystroke`).
                 let cadence = Self::heat_cadence(gap);
                 let gain = Self::heat_gain(cfg, fire);
                 self.heat = (self.heat + cadence * gain).min(1.0);
-                // The coal bed charges on a much wider cadence window: human
-                // rhythm writing (300-400 ms/key) earns most of its credit, so
-                // the bed builds a persistent ember floor over a sentence or
-                // two. Fire-only.
+                // Fire-only: the coal bed charges on a much wider cadence window, so human
+                // rhythm writing (300-400 ms/key) builds a persistent ember floor over a
+                // sentence or two.
                 if fire {
                     let coal_cred = 1.0
                         - ((gap - Self::COAL_GAP_FULL)
@@ -164,28 +154,20 @@ impl CursorGlow {
                     self.coal = (self.coal + coal_cred * Self::COAL_GAIN).min(1.0);
                 }
             }
-            // The canonical typing-momentum metric builds here and only here:
-            // a non-delete printable typing advance (a forward glyph echo, a
-            // typing wrap/re-anchor, or a coalesced multi-glyph echo).
-            // Backward/vertical scrubbing, deletion echoes and navigation add
-            // nothing; deletes and kills drain at their key hints
-            // ([`Self::note_backspace`]/[`Self::note_kill`]). Rate
-            // normalization lives in [`TypingMomentum::advance`], so key count
-            // never buys momentum. Style-independent (a mid-run switch to
-            // rainbow kitty arrives with its earned warmth).
+            // The canonical typing-momentum metric builds here and only here: a non-delete
+            // printable typing advance (a forward glyph echo, a typing wrap/re-anchor, or a
+            // coalesced multi-glyph echo). Deletes and kills drain at their key hints
+            // ([`Self::note_backspace`]/[`Self::note_kill`]); rate normalization lives in
+            // [`TypingMomentum::advance`], so key count never buys momentum. It is
+            // style-independent, so a mid-run switch to rainbow kitty keeps its earned warmth.
             //
-            // Typed correlation (`typed_pair`): a forward same-row echo alone
-            // is program output, so every arm requires the fresh press hint
-            // ([`Self::note_typed`], armed by the host on a real printable
-            // key); neither PTY output nor a non-echoing keystream can buy the
-            // cat or the stars. A printable key whose echo is a forward move
-            // (vim `l`/`w` in normal mode) is indistinguishable from typed
-            // text and is not mode-detected. The spine advances on the press
-            // hint, not on candidate admission, so streaming collisions that
-            // deny every candidate still let real typing earn its starfield. A
-            // denied backspace landing wearing a wrap shape (`bs_pair`) is
-            // excluded, and one press credits at most one advance (the hint
-            // is consumed). The pulse below mirrors this advance onto the
+            // Every arm requires the fresh press hint ([`Self::note_typed`], armed by the host on
+            // a real printable key): a forward same-row echo alone is program output. A printable
+            // key whose echo is a forward move (vim `l`/`w`) is indistinguishable from typed
+            // text. The spine advances on the press hint, not on candidate admission, so
+            // streaming collisions that deny every candidate still let real typing earn its
+            // starfield. A denied Backspace landing in a wrap shape (`bs_pair`) is excluded, and
+            // one press credits at most one advance. The pulse mirrors the advance onto the
             // cursor cat ([`Self::take_momentum_pulse`]).
             if typed_hinted
                 && (forward || (wrap && !bs_pair) || rainbow_coalesce)

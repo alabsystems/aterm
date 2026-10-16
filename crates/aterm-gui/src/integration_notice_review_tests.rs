@@ -394,7 +394,56 @@ fn the_move_is_offered_only_when_the_harness_will_type_it() {
     assert!(remedy(&app).contains(" anew"), "{}", remedy(&app));
     // …and with no upgrade to come, the remedy promises no new build.
     assert!(!remedy(&app).contains("new build"), "{}", remedy(&app));
+    // A disabled Claude is not moved even while other agents are enabled.
+    host.set_config(aterm_agent::supervise::SupervisorConfig {
+        off: vec![aterm_phase::Program::Claude],
+        ..Default::default()
+    });
+    sweep(&mut app, &mut t, STEP);
+    sweep(&mut app, &mut t, Duration::from_secs(61));
+    let disabled = remedy(&app);
+    // The same Claude remains movable when only Codex is switched off.
+    host.set_config(aterm_agent::supervise::SupervisorConfig {
+        off: vec![aterm_phase::Program::Codex],
+        ..Default::default()
+    });
+    sweep(&mut app, &mut t, Duration::from_secs(61));
+    let enabled = remedy(&app);
     host.shutdown_and_join();
+    assert!(disabled.starts_with("open a new tab"), "{disabled}");
+    assert!(enabled.contains(" anew"), "{enabled}");
+}
+
+/// A CLAUDE CODE STARTED AS `node` HEALS WITH THE HARNESS'S MOVE (the npm
+/// ruling of 2026-10-16): the sweep asked the published program's NAME, so a
+/// `node` the host supervises by its screen (`harness_host::agent_of`) was
+/// offered a new tab though the live upgrade moves it in its own tab.
+/// NEGATIVE CONTROL: a `node` whose screen named no agent is offered a new tab.
+#[test]
+fn a_node_hosted_agent_the_harness_moves_heals_with_its_move() {
+    for (reader, moved) in [(true, true), (false, false)] {
+        let mut app = App::headless_for_test();
+        let host = harness(None);
+        app.harness = Some(host.clone());
+        let id = add_degraded(&mut app, "node");
+        app.pool
+            .get(id)
+            .expect("pooled")
+            .ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .set_agent_reader_for_test(reader);
+        let mut t = Instant::now();
+        sweep(&mut app, &mut t, STEP);
+        let said = live(&app)[0].2[1].clone();
+        host.shutdown_and_join();
+        assert_eq!(
+            said.contains(" anew"),
+            moved,
+            "screen read: {reader}: {said}"
+        );
+    }
 }
 
 /// THE SUCCESSOR BEFORE ITS COMMIT (verifier, 2026-09-29): the update that

@@ -7,12 +7,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "aterm performance harnesses (the examples `xtask perf` runs)."
+description = "aterm performance harnesses (the examples `verify perf` runs)."
 
 [dev-dependencies]
 aterm-core = { workspace = true }
 # The resize/rewrap harness steps PendingScrollbackReflow directly.
 aterm-grid = { workspace = true }
+# The zstd decode harness (the `zstd` lane): atpkg's `.tar.zst` decoder.
+aterm-zstd = { workspace = true }
 
 [lints]
 workspace = true

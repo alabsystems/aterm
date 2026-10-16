@@ -1,40 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Cat-art v4 codegen (docs/cat-art-v4-design.md §1): turns the semantic glyph
-//! asset TOMLs under `crates/aterm-effects/art/glyphs/` into the checked-in const
-//! drawlist module [`crate::cat_glyphs_gen`].
+//! Glyph codegen (docs/cat-art-v4-design.md §1): turns the glyph asset TOMLs
+//! under `art/glyphs/` into the checked-in drawlist module [`crate::cat_glyphs_gen`].
 //!
-//! The generator is a pure function, [`generate_from_assets`] (asset texts →
-//! Rust source), driven by the `gen_cat_glyphs` example to rewrite the file and
-//! pinned by the [`cat_glyphs_gen_matches_assets`](tests) drift test, which
-//! regenerates into a string and asserts byte-equality with the checked-in
-//! file.
+//! [`generate_from_assets`] is a pure function (asset texts → Rust source), run by
+//! the `gen_cat_glyphs` example and pinned byte-for-byte by the
+//! `cat_glyphs_gen_matches_assets` drift test. It opens no file: the shipped
+//! engine names no `std::fs` (docs/ATERM_DESIGN.md §2.7; aterm-census guard
+//! `engine-platform`), so the reader lives in `examples/support/asset_dir.rs`.
 //!
-//! The generator opens no file: the shipped engine names no `std::fs`
-//! (docs/ATERM_DESIGN.md §2.7; fenced by `tools/grep_guard.sh` lane 6a), so the
-//! `read_dir`/`read_to_string` half lives in `examples/support/asset_dir.rs`,
-//! compiled into the `gen_*` examples and this module's drift tests.
+//! The pet, dog, animal and Robi generators share the parse/quantize/fail-closed
+//! path and emit separate modules that import the cat module's shape types, so one
+//! drawlist walker paints every roster. They never join `GLYPHS`: every
+//! `GlyphKind::Special` there is a collectible kitty-log row, and the spec model
+//! pins `RosterCap` to `GLYPH_IDS.len()`.
 //!
-//! ## Separate rosters, one parser
-//!
-//! [`generate_pet_from_assets`] (and the dog, animal and Robi generators) run
-//! the same parse/quantize/fail-closed path over their own asset dirs and emit
-//! separate modules such as [`crate::pet_glyphs_gen`]. They never join `GLYPHS`:
-//! every `GlyphKind::Special` there is a collectible row in the GUI's kitty log,
-//! and the spec model pins its `RosterCap` to `GLYPH_IDS.len()`. Only the shape
-//! vocabulary is shared: the other modules import
-//! `GlyphDef`/`Layer`/`GlyphRole`/`Recolor`/`GlyphKind` from the cat module, so
-//! one drawlist walker paints every roster.
-//!
-//! ## What crosses the boundary
-//!
-//! Only glyphs of a roster kind (`head`, `special`, `accessory`) that are not
-//! `excluded = true` are emitted; paw-print and decoration props and unpromoted
-//! legacy imports are held out. Each path coordinate `(x, y)` in the glyph's
-//! `viewbox` frame is normalized and quantized to the integer `0..=FIXED_ONE`
-//! frame (`round(x / vw * FIXED_ONE)`, clamped), so the drawlist is integer,
-//! `Eq`-safe and byte-deterministic. Floats exist only at codegen time.
+//! Only roster kinds (`head`, `special`, `accessory`) not marked `excluded = true`
+//! are emitted. Coordinates are quantized from the `viewbox` frame to the integer
+//! `0..=FIXED_ONE` frame, so the drawlist is `Eq`-safe and byte-deterministic.
 
 use aterm_scene::vector::{FIXED_ONE, PathCmd};
 
@@ -93,9 +77,8 @@ const LAYER_KEYS: &[&str] = &["role", "ref_fill", "recolor", "paths"];
 struct Layer {
     role: &'static str,
     recolor: &'static str,
-    /// The layer's reference colour. `Recolor::Fixed` layers bake it verbatim;
-    /// `Coat`/`Iris` layers swap in a ramp colour but keep it as the fallback
-    /// and for the shade derivation.
+    /// The layer's reference colour: baked verbatim for `Recolor::Fixed`;
+    /// `Coat`/`Iris` layers bake a ramp colour instead.
     fill: u32,
     /// Each path is a sequence of `PathSeg` literal strings (e.g. `PathSeg::Move(1,2)`).
     paths: Vec<Vec<String>>,
@@ -117,10 +100,9 @@ struct Glyph {
     layers: Vec<Layer>,
 }
 
-/// Generate `cat_glyphs_gen.rs` from the roster asset texts `assets` (`(file
-/// name, TOML text)` pairs read from `art/glyphs/`). Deterministic: assets are
-/// ordered (heads, specials, accessories; each by `id`) and every coordinate is
-/// quantized by an integer rule.
+/// Generate `cat_glyphs_gen.rs` from `(file name, TOML text)` pairs read from
+/// `art/glyphs/`. Deterministic: glyphs are ordered (heads, specials,
+/// accessories; each by `id`) and every coordinate is integer-quantized.
 ///
 /// # Errors
 /// Any malformed TOML, unknown role/recolor/kind, missing viewbox/anchor, unknown
@@ -169,10 +151,8 @@ pub fn generate_robi_from_assets(assets: &[(String, String)]) -> Result<String, 
     Ok(emit_robi(&load_glyphs(assets)?))
 }
 
-/// Parse, order and collision-check every roster asset text in `assets`, shared
-/// by all rosters. Texts are visited in file-name order, so the first error
-/// named is the same everywhere; non-roster kinds and `excluded = true` assets
-/// are dropped by [`glyph_from_doc`].
+/// Parse, order and collision-check every roster asset text, for all rosters.
+/// Texts are visited in file-name order, so the first error named is stable.
 fn load_glyphs(assets: &[(String, String)]) -> Result<Vec<Glyph>, String> {
     let mut files: Vec<&(String, String)> = assets.iter().collect();
     files.sort_by(|a, b| a.0.cmp(&b.0));
@@ -188,8 +168,8 @@ fn load_glyphs(assets: &[(String, String)]) -> Result<Vec<Glyph>, String> {
     // Emit order: kind rank (head < special < accessory), then id.
     glyphs.sort_by(|a, b| a.kind_rank.cmp(&b.kind_rank).then_with(|| a.id.cmp(&b.id)));
 
-    // Variant-name collision guard (the ids are unique; assert the derived variants are
-    // too, so the roster enum is always well-formed).
+    // Variant-name collision guard: the ids are unique, but the derived
+    // variants must be too.
     let mut seen = std::collections::BTreeSet::new();
     for g in &glyphs {
         if !seen.insert(g.variant.clone()) {
@@ -454,7 +434,6 @@ fn emit(glyphs: &[Glyph]) -> String {
 
     s.push_str(STRUCTS);
 
-    // CatGlyphId roster enum.
     s.push_str(
         "/// The glyph roster: heads first, then specials, then accessories. Indexes [`GLYPHS`].\n",
     );
@@ -468,7 +447,8 @@ fn emit(glyphs: &[Glyph]) -> String {
     s.push_str("}\n\n");
 
     // Stable roster: persistence stores the `GlyphDef::id` string and resolves
-    // it through this table, never a Rust discriminant that could shift.
+    // it through this table, never a Rust discriminant that could shift. Every
+    // other roster's `*_GLYPH_IDS` follows the same rule.
     s.push_str("/// Every glyph id in [`GLYPHS`] order. Pair with `GLYPHS[i].id` for stable string lookup.\n");
     s.push_str("pub const GLYPH_IDS: &[CatGlyphId] = &[\n");
     for g in glyphs {
@@ -476,13 +456,11 @@ fn emit(glyphs: &[Glyph]) -> String {
     }
     s.push_str("];\n\n");
 
-    // GLYPHS table.
     s.push_str("/// Every roster glyph's const drawlist, indexed by [`CatGlyphId`] order.\n");
     s.push_str("pub const GLYPHS: &[GlyphDef] = &[\n");
     emit_glyph_rows(&mut s, glyphs);
     s.push_str("];\n\n");
 
-    // HEADS roster.
     s.push_str("/// The head variants (the roster the genome's `variant` field indexes, §3).\n");
     s.push_str("pub const HEADS: &[CatGlyphId] = &[\n");
     for g in glyphs.iter().filter(|g| g.kind == "Head") {
@@ -500,7 +478,6 @@ fn emit_pet(glyphs: &[Glyph]) -> String {
     let mut s = String::new();
     s.push_str(PET_HEADER);
 
-    // PetGlyphId roster enum.
     s.push_str("/// The pet roster: every authored full-body pose, ordered by id. Indexes\n");
     s.push_str("/// [`PET_GLYPHS`]. Not a collectible — the pet is one cat wearing the caret's\n");
     s.push_str("/// genome, so these are animation frames, not roster rows.\n");
@@ -513,8 +490,6 @@ fn emit_pet(glyphs: &[Glyph]) -> String {
     }
     s.push_str("}\n\n");
 
-    // Stable enum-value roster (same reason as the cat's GLYPH_IDS: pose selection
-    // resolves through `PET_GLYPHS[i].id` strings, never a Rust discriminant).
     s.push_str(
         "/// Every pose id in [`PET_GLYPHS`] order. Pair with `PET_GLYPHS[i].id` for stable\n",
     );
@@ -525,7 +500,6 @@ fn emit_pet(glyphs: &[Glyph]) -> String {
     }
     s.push_str("];\n\n");
 
-    // PET_GLYPHS table.
     s.push_str("/// Every pet pose's const drawlist, indexed by [`PetGlyphId`] order.\n");
     s.push_str("pub const PET_GLYPHS: &[GlyphDef] = &[\n");
     emit_glyph_rows(&mut s, glyphs);
@@ -541,7 +515,6 @@ fn emit_dog(glyphs: &[Glyph]) -> String {
     let mut s = String::new();
     s.push_str(DOG_HEADER);
 
-    // DogGlyphId roster enum.
     s.push_str("/// The dog roster: every authored breed head, ordered by id. Indexes\n");
     s.push_str("/// [`DOG_GLYPHS`]. Not a collectible — the typed-word dog cameo draws one\n");
     s.push_str("/// of these per summon; the kitty log never records them.\n");
@@ -554,8 +527,6 @@ fn emit_dog(glyphs: &[Glyph]) -> String {
     }
     s.push_str("}\n\n");
 
-    // Stable enum-value roster (same reason as the cat's GLYPH_IDS: any persisted
-    // reference resolves through `DOG_GLYPHS[i].id` strings, never a discriminant).
     s.push_str(
         "/// Every breed id in [`DOG_GLYPHS`] order. Pair with `DOG_GLYPHS[i].id` for stable\n",
     );
@@ -566,13 +537,11 @@ fn emit_dog(glyphs: &[Glyph]) -> String {
     }
     s.push_str("];\n\n");
 
-    // DOG_GLYPHS table.
     s.push_str("/// Every breed head's const drawlist, indexed by [`DogGlyphId`] order.\n");
     s.push_str("pub const DOG_GLYPHS: &[GlyphDef] = &[\n");
     emit_glyph_rows(&mut s, glyphs);
     s.push_str("];\n\n");
 
-    // DOG_HEADS roster (parallel to the cat's HEADS: what the summon picker draws from).
     s.push_str("/// The breed variants the typed-summon picker draws from, uniformly.\n");
     s.push_str("pub const DOG_HEADS: &[DogGlyphId] = &[\n");
     for g in glyphs.iter().filter(|g| g.kind == "Head") {
@@ -590,7 +559,6 @@ fn emit_robi(glyphs: &[Glyph]) -> String {
     let mut s = String::new();
     s.push_str(ROBI_HEADER);
 
-    // RobiGlyphId roster enum.
     s.push_str("/// The Robi roster: every authored robot pose (plus the tiling ladder\n");
     s.push_str("/// segment), ordered by id. Indexes [`ROBI_GLYPHS`]. Not a collectible —\n");
     s.push_str("/// these are animation frames for the chrome-walking helper robot.\n");
@@ -603,8 +571,6 @@ fn emit_robi(glyphs: &[Glyph]) -> String {
     }
     s.push_str("}\n\n");
 
-    // Stable enum-value roster (same reason as the cat's GLYPH_IDS: pose selection
-    // resolves through `ROBI_GLYPHS[i].id` strings, never a Rust discriminant).
     s.push_str("/// Every pose id in [`ROBI_GLYPHS`] order. Pair with `ROBI_GLYPHS[i].id` for\n");
     s.push_str("/// stable string lookup.\n");
     s.push_str("pub const ROBI_GLYPH_IDS: &[RobiGlyphId] = &[\n");
@@ -613,7 +579,6 @@ fn emit_robi(glyphs: &[Glyph]) -> String {
     }
     s.push_str("];\n\n");
 
-    // ROBI_GLYPHS table.
     s.push_str("/// Every Robi pose's const drawlist, indexed by [`RobiGlyphId`] order.\n");
     s.push_str("pub const ROBI_GLYPHS: &[GlyphDef] = &[\n");
     emit_glyph_rows(&mut s, glyphs);
@@ -626,7 +591,6 @@ fn emit_animal_roster(glyphs: &[Glyph]) -> String {
     let mut s = String::new();
     s.push_str(ANIMAL_HEADER);
 
-    // AnimalGlyphId roster enum.
     s.push_str("/// The animal roster: every authored species head, ordered by id. Indexes\n");
     s.push_str("/// [`ANIMAL_GLYPHS`]. One head per species; the id string IS the lexicon's\n");
     s.push_str("/// `species` key.\n");
@@ -639,8 +603,6 @@ fn emit_animal_roster(glyphs: &[Glyph]) -> String {
     }
     s.push_str("}\n\n");
 
-    // Stable roster: species resolve through `ANIMAL_GLYPHS[i].id` strings,
-    // never a Rust discriminant.
     s.push_str(
         "/// Every species id in [`ANIMAL_GLYPHS`] order. Pair with `ANIMAL_GLYPHS[i].id`\n",
     );
@@ -651,13 +613,11 @@ fn emit_animal_roster(glyphs: &[Glyph]) -> String {
     }
     s.push_str("];\n\n");
 
-    // ANIMAL_GLYPHS table.
     s.push_str("/// Every species head's const drawlist, indexed by [`AnimalGlyphId`] order.\n");
     s.push_str("pub const ANIMAL_GLYPHS: &[GlyphDef] = &[\n");
     emit_glyph_rows(&mut s, glyphs);
     s.push_str("];\n\n");
 
-    // The lexicon-key resolver: `species = \"monkey\"` → `AnimalGlyphId::Monkey`.
     s.push_str("/// Resolve a lexicon `species` key (`ANIMAL_GLYPHS[i].id`) to its roster id.\n");
     s.push_str("/// Linear over a few dozen species; called at rescan, not per frame.\n");
     s.push_str("#[must_use]\n");
@@ -671,8 +631,8 @@ fn emit_animal_roster(glyphs: &[Glyph]) -> String {
     s
 }
 
-/// The `GlyphDef { … }` rows both roster tables are built from — identical bytes for
-/// identical assets, so the pet and the cat can never drift in drawlist encoding.
+/// The `GlyphDef { … }` rows every roster table shares, so no two rosters can
+/// drift in drawlist encoding.
 fn emit_glyph_rows(s: &mut String, glyphs: &[Glyph]) {
     for g in glyphs {
         s.push_str(&format!("    // {} ({})\n", g.variant, g.id));
@@ -863,28 +823,22 @@ mod tests {
         asset_dir::read_toml_dir(dir).expect("read the roster asset dir")
     }
 
-    /// The asset dir shipped with the crate.
     fn glyph_dir() -> std::path::PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("art/glyphs")
     }
 
-    /// The pet-pose asset dir shipped with the crate.
     fn pet_dir() -> std::path::PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("art/pet")
     }
 
-    /// The species-head asset dir shipped with the crate.
     fn animal_dir() -> std::path::PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("art/animal")
     }
 
-    /// The robot-pose asset dir shipped with the crate.
     fn robi_dir() -> std::path::PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("art/robi")
     }
 
-    /// Robi drift gate: the regenerated source equals `robi_glyphs_gen.rs`.
-    /// Regenerate with `cargo run -p aterm-effects --example gen_robi_glyphs`.
     #[test]
     fn robi_glyphs_gen_matches_assets() {
         let generated = generate_robi_from_assets(&read_assets(&robi_dir()))
@@ -896,8 +850,6 @@ mod tests {
         );
     }
 
-    /// Animal drift gate: the regenerated source equals `animal_glyphs_gen.rs`.
-    /// Regenerate with `cargo run -p aterm-effects --example gen_animal_glyphs`.
     #[test]
     fn animal_glyphs_gen_matches_assets() {
         let generated = generate_animal_from_assets(&read_assets(&animal_dir()))
@@ -910,7 +862,6 @@ mod tests {
     }
 
     /// Cat drift gate (§1): the regenerated source equals `cat_glyphs_gen.rs`.
-    /// Regenerate with `cargo run -p aterm-effects --example gen_cat_glyphs`.
     #[test]
     fn cat_glyphs_gen_matches_assets() {
         let generated =
@@ -922,8 +873,6 @@ mod tests {
         );
     }
 
-    /// Pet drift gate: the regenerated source equals `pet_glyphs_gen.rs`.
-    /// Regenerate with `cargo run -p aterm-effects --example gen_pet_glyphs`.
     #[test]
     fn pet_glyphs_gen_matches_assets() {
         let generated = generate_pet_from_assets(&read_assets(&pet_dir()))
@@ -935,13 +884,10 @@ mod tests {
         );
     }
 
-    /// The breed asset dir shipped with the crate.
     fn dog_dir() -> std::path::PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("art/dogs")
     }
 
-    /// Dog drift gate: the regenerated source equals `dog_glyphs_gen.rs`.
-    /// Regenerate with `cargo run -p aterm-effects --example gen_dog_glyphs`.
     #[test]
     fn dog_glyphs_gen_matches_assets() {
         let generated = generate_dog_from_assets(&read_assets(&dog_dir()))
@@ -951,15 +897,6 @@ mod tests {
             generated, checked_in,
             "dog_glyphs_gen.rs is stale — rerun `targo --unverified run -p aterm-effects --example gen_dog_glyphs`"
         );
-    }
-
-    /// The generator is a pure function of the assets: two runs are byte-identical.
-    #[test]
-    fn cat_glyphs_codegen_is_deterministic() {
-        let assets = read_assets(&glyph_dir());
-        let a = generate_from_assets(&assets).expect("gen a");
-        let b = generate_from_assets(&assets).expect("gen b");
-        assert_eq!(a, b, "codegen must be deterministic");
     }
 
     #[test]

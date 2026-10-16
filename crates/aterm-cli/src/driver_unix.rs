@@ -1050,7 +1050,13 @@ mod tests {
                         aterm_pty::resize(HOST.load(Ordering::SeqCst), 40, 120);
                         // SAFETY: raises a signal at this thread; its handler
                         // runs before `raise` returns.
-                        unsafe { libc::raise(libc::SIGWINCH) };
+                        #[expect(
+                            clippy::disallowed_methods,
+                            reason = "test code: SIGWINCH, which dumps no core"
+                        )]
+                        unsafe {
+                            libc::raise(libc::SIGWINCH)
+                        };
                     }
                 })
                 .is_ok(),
@@ -1147,7 +1153,7 @@ mod tests {
                     let dir = DIR.get().expect("scratch dir");
                     // The shell's exit hangs up the job unless it already
                     // ignores SIGHUP: a job forked just before the exit can
-                    // be cut before its `trap` (seen under a loaded gate).
+                    // be cut before its `trap` (seen on a loaded machine).
                     wait_until("the job does not ignore SIGHUP yet", || {
                         dir.join("armed").exists()
                     });

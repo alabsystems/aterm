@@ -46,6 +46,47 @@ fn the_measured_manifest_parses_and_a_changed_layout_refuses() {
     }
 }
 
+/// AN ALAB BUILD IS KNOWN BY ITS PACKAGE, NOT ITS VERSION: codex-alab's
+/// package carries the publication scheme's pre-release version
+/// (`X.Y.0-dev.<n>+g<sha>`), which [`Version::parse`] refuses on purpose. The
+/// proven self-claim's image fact ([`alab_bytes`]) must still see an ALab build
+/// there (measured 2026-10-16: no claim was ever proven from a real package),
+/// while [`package_version`], the only reader that orders builds, still answers
+/// nothing for it.
+#[test]
+fn an_alab_package_with_a_pre_release_version_is_alab_bytes() {
+    let d = crate::supervise::ScratchDir::new("codex", "alab-pre-release");
+    let root = d.join("codex/0.164.0-dev.12365+g124c29509");
+    std::fs::create_dir_all(root.join("bin")).expect("bin");
+    let exe = root.join("bin/codex");
+    std::fs::write(&exe, "").expect("exe");
+    let manifest = PACKAGE_0_157_1.replace("0.157.1", "0.164.0-dev.12365+g124c29509");
+    std::fs::write(root.join(PACKAGE_JSON), &manifest).expect("manifest");
+    assert_eq!(
+        package_entrypoint(&manifest),
+        Some(PathBuf::from("bin/codex"))
+    );
+    assert_eq!(parse_package(&manifest), None, "no order is guessed");
+    // Negative control: without ALab's marker it is no ALab build.
+    assert!(!alab_bytes(&exe));
+    assert!(vendor_bytes(&exe));
+    std::fs::write(root.join(ALAB_BUILD_JSON), "{}").expect("marker");
+    assert!(
+        alab_bytes(&exe),
+        "the package and its marker say ALab built it"
+    );
+    assert!(!vendor_bytes(&exe));
+    assert_eq!(package_version(&exe), None);
+    // A changed layout or an entrypoint outside the root still refuses.
+    for bad in [
+        manifest.replace("\"layoutVersion\": 1", "\"layoutVersion\": 2"),
+        manifest.replace("bin/codex", "/abs/codex"),
+        manifest.replace("bin/codex", "../codex"),
+    ] {
+        assert_eq!(package_entrypoint(&bad), None, "{bad}");
+    }
+}
+
 #[test]
 fn a_version_is_read_from_the_package_that_names_the_binary_never_by_running_it() {
     let d = crate::supervise::ScratchDir::new("codex", "pkg");
@@ -83,10 +124,9 @@ fn a_version_is_read_from_the_package_that_names_the_binary_never_by_running_it(
     assert_eq!(Version::parse("codex-cli"), None);
 }
 
-/// THE CODEX LANE CARRIES THE MODEL, AND ONLY CARRIES IT: whatever model the
-/// launch named, in any spelling (`-m x`, `-mx`, `--model=x`), rides the
-/// relaunch verbatim with every other kept flag, and a launch that named none
-/// gets none — no model is guessed for Codex, and none is moved down.
+/// The Codex lane carries the model and only carries it: whatever model the launch named, in any
+/// spelling (`-m x`, `-mx`, `--model=x`), rides the relaunch verbatim with every other kept flag;
+/// a launch that named none gets none.
 #[test]
 fn the_rewrite_resumes_the_thread_with_every_kept_flag() {
     let a = argv(&[
@@ -307,7 +347,7 @@ fn the_exit_hint_is_the_tuis_own_last_words() {
         })
     );
     // 0.159+: the daemon's id under its own heading is still a daemon hint
-    // (missed, every daemon-mode upgrade ends `failed:no-resume-hint`).
+    // (missed, every daemon-mode upgrade would end `failed:no-resume-hint`).
     let two_line = daemon_exit_screen_two_line();
     let daemon = Some(ExitHint {
         thread: T1.into(),
@@ -329,7 +369,7 @@ fn the_exit_hint_is_the_tuis_own_last_words() {
     ]);
     assert_eq!(parse_exit_hint(&wrapped).map(|h| h.thread), Some(T1.into()));
     // An embedded id without its heading is not a hint: `codex resume <id>`
-    // is also what a PERSON types at a prompt.
+    // is also what a person types at a prompt.
     assert_eq!(
         parse_exit_hint(&rows(&[&format!("% codex resume {T2}")])),
         None
@@ -409,6 +449,41 @@ fn the_hint_is_read_above_the_prompts_first_row_past_the_tuis_own_tally() {
         "%",
     ]);
     assert_eq!(hint_above_prompt(&nothing, 3), None);
+}
+
+/// The exit hint is read by words the drift canary looks for: each is a
+/// literal `codex.exit.*` row of `aterm_phase::anchors::CODEX_ANCHORS`, which
+/// the canary greps the store's Codex for, so a build that rewords one fails
+/// a test run before an upgrade types `/exit` into it. 0.157's `Reconnect:`
+/// line is the one word read that no anchor carries: no build since prints
+/// it. NEGATIVE CONTROL: the embedded row under a heading no anchor names is
+/// no hint.
+#[test]
+fn the_exit_hints_words_are_the_canarys() {
+    use aterm_phase::anchors::{AnchorKind, CODEX_ANCHORS};
+    let exit: Vec<&str> = CODEX_ANCHORS
+        .iter()
+        .filter(|a| a.id.starts_with("codex.exit.") && a.kind == AnchorKind::Literal)
+        .map(|a| a.text)
+        .collect();
+    for word in [
+        RECONNECT_HEADING,
+        CONTINUE_HEADING,
+        CONTINUE,
+        STOP_HINT,
+        TOKEN_USAGE,
+    ] {
+        assert!(exit.contains(&word), "{word:?} is in no codex.exit anchor");
+    }
+    assert_eq!(exit.len(), 5, "{exit:?}");
+    assert!(
+        CODEX_ANCHORS
+            .iter()
+            .all(|a| !a.text.contains(RECONNECT.trim_end())),
+        "0.157's line is history, in no anchor"
+    );
+    let reworded = rows(&["To resume, run:", &format!("  codex resume {T2}")]);
+    assert_eq!(parse_exit_hint(&reworded), None);
 }
 
 #[test]
@@ -537,7 +612,7 @@ fn codexs_status_line_says_when_a_background_terminal_runs() {
 const STARTED: &str = r#"{"timestamp":"2026-09-26T05:37:10.315Z","ordinal":1,"type":"event_msg","payload":{"type":"task_started","turn_id":"01a0dc37-a8a4-7932-8499-ba298833de9f","root_turn_id":"01a0dc37-a8a4-7932-8499-ba298833de9f","started_at":1790401030,"model_context_window":258400,"collaboration_mode_kind":"default"}}"#;
 const USER: &str = r#"{"timestamp":"2026-09-26T05:37:10.338Z","ordinal":8,"type":"response_item","payload":{"type":"message","id":"msg_01a0dc37-a8c2-78e0-a4a8-fc661bfaae1b","role":"user","content":[{"type":"input_text","text":"say hello"}],"internal_chat_message_metadata_passthrough":{"turn_id":"01a0dc37-a8a4-7932-8499-ba298833de9f","create_time":1790401030.338192,"content_item_kinds":["user.text"]}},"metadata":{"client_authored":false,"user_input_order":0,"mcp_attribution":{"status":"none"}}}"#;
 const ABORTED: &str = r#"{"timestamp":"2026-09-26T05:37:50.848Z","ordinal":11,"type":"event_msg","payload":{"type":"turn_aborted","turn_id":"01a0dc37-a8a4-7932-8499-ba298833de9f","reason":"interrupted","started_at":1790401030,"completed_at":1790401070,"duration_ms":40536}}"#;
-/// 0.145's end of a turn (the research's shape: `last_agent_message`, `turn_id`).
+/// 0.145's end of a turn (`last_agent_message`, `turn_id`).
 const COMPLETE_0_145: &str = r#"{"timestamp":"2026-07-28T10:00:00.000Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"1","last_agent_message":"done"}}"#;
 
 fn assistant(text: &str) -> String {
@@ -670,13 +745,8 @@ fn a_turn_event_is_read_back_wherever_the_chunks_cut_it() {
     }
 }
 
-/// The worst case is linear: a line longer than a chunk is carried as the
-/// pieces read of it, each chunk moved into the carry (never copied) and joined
-/// once when the chunk holding the line's start arrives. At the drive's own
-/// chunk and bound: one line past the bound, bare or quoting a turn's end,
-/// reads Unknown; `task_started` behind a line of nearly the whole bound
-/// quoting one reads Busy; the bound filled with rows quoting turn events, all
-/// parsed, reads Unknown.
+/// The worst case is linear: a line longer than a chunk is carried as its pieces, each chunk moved
+/// into the carry (never copied) and joined once, when the chunk holding the line's start arrives.
 #[test]
 fn a_line_longer_than_many_chunks_is_carried_once() {
     const TAIL: u64 = 262_144;
@@ -807,7 +877,7 @@ fn ready_is_the_agents_last_word_after_the_latest_notice() {
     assert!(!rollout_has_ready(&user(&notice), marker));
     let answered = [user(&notice), assistant(&format!("Done.\n`{marker}`"))].join("\n");
     assert!(rollout_has_ready(&answered, marker));
-    // A marker merely QUOTED in a sentence is no answer.
+    // A marker merely quoted in a sentence is no answer.
     let quoted = [
         user(&notice),
         assistant(&format!("I will reply {marker} once the build ends")),
@@ -929,7 +999,7 @@ fn the_composer_is_read_by_codexs_caret_and_its_dim_placeholder() {
 #[test]
 fn a_box_replaces_the_composer_and_is_read_as_one() {
     use aterm_phase::codex::composer as composer_row;
-    // The folder-trust gate (0.157.0, the research's measurement).
+    // The folder-trust gate (0.157.0).
     let gate = rows(&[
         "  Folder access",
         "",
@@ -1043,13 +1113,11 @@ fn a_daemon_client_exits_at_an_idle_point_once_its_daemon_went_first() {
     );
 }
 
-/// The quiet upgrade on the Codex lane (the default): an embedded conversation
-/// is not asked first; at a genuinely idle point its `/exit` is the step
-/// (`Terminate`), with no notice and no READY, while work under it, a turn, a
-/// box or a draft still waits. A thread with nothing to resume is ended and
-/// started plain only once the owner has been told (`notice-shown`); a
-/// daemon-mode client, whose `/exit` ends none of its work, is not held for
-/// it. With `quiet` false:
+/// The quiet upgrade (the Codex lane's default): an embedded conversation is not asked first; at
+/// an idle point its `/exit` is the step, with no notice and no READY, while work, a turn, a box
+/// or a draft waits. A thread with nothing to resume is ended and started plain only once the
+/// owner was told (`notice-shown`); a daemon-mode client, whose `/exit` ends none of its work, is
+/// not held for it. With `quiet` false:
 /// [`an_embedded_conversation_is_asked_first_and_exits_only_on_ready`].
 #[test]
 fn a_quiet_embedded_conversation_exits_at_an_idle_point_with_nothing_asked() {
@@ -1185,7 +1253,7 @@ fn daemon(running: &str, pinned: bool) -> DaemonFacts {
 #[test]
 fn the_daemon_moves_onto_the_managed_build_only_while_every_thread_is_idle() {
     assert_eq!(daemon_step(&daemon("0.157.0", true)), DaemonStep::Update);
-    // The same build UNPINNED: the vendor's updater is armed; pin it.
+    // The same build unpinned: the vendor's updater is armed; pin it.
     assert_eq!(daemon_step(&daemon("0.157.1", false)), DaemonStep::Update);
     assert_eq!(daemon_step(&daemon("0.157.1", true)), DaemonStep::Current);
     // Never a downgrade: a vendor-updated daemon waits for atpkg.
@@ -1547,14 +1615,11 @@ fn a_stopped_codex_round_rests_then_rearms() {
     }
 }
 
-/// A goal on this screen places nothing: where the kernel names no thread (two
-/// threads, two clients), a running thread placed elsewhere still holds the
-/// client while its footer shows a goal being pursued (the goal's next turn
-/// runs under a screen that reads idle). `goal_on_screen` reads that footer
-/// through its anchor, under the input line only. Negative controls: without
-/// the goal the placed thread holds nothing; a thread the kernel names is the
-/// client's own (`Goal` or `Own`), placed or not; the footer's words quoted
-/// above the input line are no goal.
+/// A goal on this screen places nothing: where the kernel names no thread, a running thread placed
+/// elsewhere still holds the client while its footer shows a goal pursued (the goal's next turn
+/// runs under a screen that reads idle). `goal_on_screen` reads that footer under the input line
+/// only. Controls: without the goal the placed thread holds nothing; a thread the kernel names is
+/// the client's own (`Goal` or `Own`); the footer's words quoted above the input line are no goal.
 #[test]
 fn a_goal_on_the_screen_keeps_every_running_thread_unplaced() {
     use aterm_phase::codex::fixtures::GOAL_NEXT_TURN_0_158;
@@ -1676,13 +1741,11 @@ fn a_rollouts_first_line_names_its_spawn_tree() {
     assert_eq!(session_lineage(""), Lineage::Unread);
 }
 
-/// The kernel names a conversation, not a lock: with a daemon holding four
-/// writer locks (one root and three subagents) under one TUI, every thread
-/// hanging from one root, with that TUI the daemon's only client, names the
-/// root (the thread `codex resume` takes back); a depth-2 subagent hangs from
-/// it through its parent. Negative controls: a second root; a second client;
-/// clients unread; a subagent whose parent the daemon does not hold, that names
-/// none, or whose lineage was not read; a lone subagent; a loop.
+/// The kernel names a conversation, not a lock: four writer locks (a root and three subagents)
+/// under one TUI, the daemon's only client, name the root (the thread `codex resume` takes back),
+/// a depth-2 subagent reaching it through its parent. Controls: a second root or client, clients
+/// unread, a subagent whose parent the daemon does not hold or whose lineage is unread, a lone
+/// subagent, a loop.
 #[test]
 fn the_kernel_names_the_root_of_the_one_conversation_on_the_daemon() {
     let (tui, other_tui) = (4_242, 4_343);
@@ -1738,14 +1801,11 @@ fn the_kernel_names_the_root_of_the_one_conversation_on_the_daemon() {
     assert_eq!(own_thread(tui, &looped, Some(&[tui])), None);
 }
 
-/// A turn of the tab's own conversation holds it, subagents included: with one
-/// root, three subagents and one TUI, a subagent running while the root is
-/// idle, or the root running while the subagents are idle, is this client's own
-/// (`Goal` under a goal on its screen, else `Own`), placed or not; all idle,
-/// nothing holds it. Negative controls with two roots and two TUIs (the kernel
-/// names nothing): the other session's root, placed, holds nothing; a subagent
-/// is never placed; a root is never placed while this TUI is the daemon's only
-/// client or with clients unread; under a goal, nothing is.
+/// A turn of the tab's own conversation holds it, subagents included: with one root, three
+/// subagents and one TUI, any running thread is this client's own (`Goal` under a goal, else
+/// `Own`), placed or not; all idle, nothing holds it. Controls with two roots and two TUIs (the
+/// kernel names nothing): the other root, placed, holds nothing; a subagent is never placed; a
+/// root is never placed while this TUI is the only client, clients are unread, or under a goal.
 #[test]
 fn a_turn_of_the_tabs_own_conversation_holds_it_subagents_included() {
     use upgrade::DaemonTurn;
@@ -1861,13 +1921,11 @@ fn head_back(bytes: &[u8], chunk: u64) -> TurnState {
     rollout_head_back(&mut std::io::Cursor::new(bytes), len, chunk, u64::MAX)
 }
 
-/// A goal turn's head (`TurnState::Head`, the one point an Esc may stop a turn
-/// at): `task_started`, then only what the turn opened with (its context, the
-/// goal's message, the `world_state`, a token count), read whole wherever the
-/// chunks cut it. Past its head: its first reasoning item, a tool call, a
-/// half-written line (never a head). An ended turn is idle, and the lane's
-/// turn reader reads a head `Busy`. Negative control: the same rows plus one
-/// tool call is no head at any chunk.
+/// A goal turn's head (`TurnState::Head`, the one point an Esc may stop a turn at):
+/// `task_started`, then only what the turn opened with (its context, the goal's message,
+/// `world_state`, a token count), read whole wherever the chunks cut it. Its first reasoning item,
+/// a tool call or a half-written line is past it; an ended turn is idle; the plain turn reader
+/// reads a head `Busy`.
 #[test]
 fn a_goal_turns_head_is_told_from_its_work() {
     let token = r#"{"timestamp":"2026-09-29T00:35:15.620Z","type":"event_msg","payload":{"type":"token_count","info":null}}"#;
@@ -1979,20 +2037,10 @@ fn goal_look(hold: Option<&crate::harness::goal_hold::Hold>, now: u64) -> GoalLo
     }
 }
 
-/// The goal pause's edges the derived machine leaves to unit tests
-/// (`HarnessUpgradeGoalPause`'s doc): a pause is waited on through its take
-/// window, then the Esc at a head; a pause never shown is given up past
-/// `PAUSE_GIVE_UP_S` (said, typing nothing); a paused goal is resumed at its
-/// bound with no move; a resume is waited on, then made again, and past
-/// `MAX_RESUMES` said as left paused; an open switch types nothing for the
-/// upgrade's hold; a footer naming the goal neither paused nor pursued
-/// releases it, one naming no goal only with a person's hand since; no footer
-/// decides nothing; the Esc is weighed with the turn's status row up; a pause
-/// shown after a person's hand is theirs; a resume without the move is
-/// withheld in a sandbox; the rest after a hold that ended without its move
-/// keeps the next pause off, one that ended with it does not. The pause is
-/// never made where anything but the goal's turn holds the move, at a draft,
-/// or with a person typing.
+/// The goal pause's edges the derived machine (`HarnessUpgradeGoalPause`) leaves to unit tests:
+/// the take window and the Esc at a head, the give-up past `PAUSE_GIVE_UP_S`, the resume at the
+/// bound and its retries up to `MAX_RESUMES`, the footer's verdicts, a person's hand, the
+/// sandbox, the rest after a hold, and what keeps the pause off.
 #[test]
 fn the_goal_pause_waits_retries_gives_up_and_resumes_at_its_bound() {
     use crate::harness::goal_hold::{Hold, How, Stage};
@@ -2188,7 +2236,7 @@ fn the_goal_pause_waits_retries_gives_up_and_resumes_at_its_bound() {
             "{other:?}"
         );
     }
-    // A goal that ENDED in the pause's last turn (achieved) releases a hold
+    // A goal that ended in the pause's last turn (achieved) releases a hold
     // still pausing, as a paused one: nothing to resume, and the move goes on.
     assert_eq!(
         goal_step(&GoalLook {
@@ -2328,12 +2376,10 @@ fn the_goal_pause_waits_retries_gives_up_and_resumes_at_its_bound() {
     assert_eq!(goal_step(&restarted(false)), GoalStep::Resume(BY_HAND));
 }
 
-/// A narrow pane never drops the resume aterm owes. Footers captured live
-/// (Codex 0.158.0 in a scratch headless aterm): in a narrow pane Codex cuts the
-/// status row's left side and its ` · ` goes, so a reader keyed on ` · ` alone
-/// would take the key-hint row for the status row and release the hold. The
-/// real readers find the goal at every width: at 45 columns the pause is made
-/// and taken; at 40 the moved goal is resumed, as at 140 (the control).
+/// A narrow pane never drops the owed resume. Codex cuts a narrow status row's left side and its
+/// ` · ` goes, so a reader keyed on ` · ` alone would take the key-hint row for the status row and
+/// release the hold. Footers are Codex 0.158.0's: at 45 columns the pause is made and taken; at
+/// 40 the moved goal is resumed, as at 140 (the control).
 #[test]
 fn a_narrow_pane_never_drops_the_resume_aterm_owes() {
     use crate::harness::goal_hold::{Hold, How, Owner, Stage};
@@ -2400,5 +2446,208 @@ fn a_narrow_pane_never_drops_the_resume_aterm_owes() {
     assert_eq!(
         read(&paused40, Some(&paused), true, now),
         GoalStep::Resume("moved")
+    );
+}
+
+/// A CODEX LAUNCH'S PERMISSION MODE ([`permission_argv`]) is its approval
+/// and sandbox flags, in every spelling, as the rewrite carries them; every
+/// other flag goes. NEGATIVE CONTROL: an argv the rewrite refuses keeps its
+/// program alone, and a launch that set no mode has none.
+#[test]
+fn a_codex_launchs_permission_mode_is_its_approval_and_sandbox_flags() {
+    let a = argv(&[
+        "codex",
+        "-m",
+        "gpt-5-codex",
+        "-sread-only",
+        "--ask-for-approval=never",
+        "--approve-for-me",
+        "-c",
+        "sandbox_mode=x",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "-a",
+        "on-request",
+        "--sandbox",
+        "workspace-write",
+        "hi",
+    ]);
+    assert_eq!(
+        permission_argv(&a),
+        argv(&[
+            "codex",
+            "-sread-only",
+            "--ask-for-approval=never",
+            "--approve-for-me",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "-a",
+            "on-request",
+            "--sandbox",
+            "workspace-write",
+        ])
+    );
+    assert_eq!(
+        permission_argv(&argv(&["codex", "-s", "read-only", "--worktree"])),
+        argv(&["codex"])
+    );
+    assert_eq!(
+        permission_argv(&argv(&["codex", "-m", "o3", "--search"])),
+        argv(&["codex"])
+    );
+}
+
+/// A `turn_context` line as Codex 0.163.0 writes it (the lab's m-perms
+/// rollout, 2026-10-16, its long `collaboration_mode` cut away): the
+/// approval, reviewer and sandbox given.
+fn turn_context_0_163(approval: &str, reviewer: &str, sandbox: &str) -> String {
+    format!(
+        "{{\"timestamp\":\"2026-10-16T18:20:07.010Z\",\"ordinal\":22,\"type\":\"turn_context\",\
+         \"payload\":{{\"turn_id\":\"01a145f1-57bf-7df1-b824-9ae917a5f4dd\",\"root_turn_id\":\
+         \"01a145f1-57bf-7df1-b824-9ae917a5f4dd\",\"disabled_plugin_ids\":[],\"cwd\":\
+         \"/private/tmp/at.dRIY/proj\",\"approval_policy\":{approval},\"approvals_reviewer\":\
+         \"{reviewer}\",\"sandbox_policy\":{{\"type\":\"{sandbox}\"}},\"permission_profile\":\
+         {{\"type\":\"disabled\"}},\"model\":\"gpt-6.1-sol\",\"comp_hash\":\"3000\"}}}}"
+    )
+}
+
+/// The mode a measured-shape `turn_context` records ([`ThreadMode`]), read by
+/// the supervisor's own reader.
+fn mode_of(approval: &str, reviewer: &str, sandbox: &str) -> ThreadMode {
+    crate::supervise::codex_usage::rollout_turn_context(&turn_context_0_163(
+        approval, reviewer, sandbox,
+    ))
+    .expect("a turn_context")
+    .mode()
+}
+
+/// A RELAUNCH CARRIES THE THREAD'S OWN PERMISSION MODE ([`carried_mode`],
+/// [`rewrite_argv_carrying`]). MEASURED (Codex 0.163.0, the lab, 2026-10-16):
+/// a launch `-a on-request -s read-only` switched to Full Access by
+/// `/permissions` records `never`/`danger-full-access` in its next
+/// `turn_context`, and a resume carrying the launch's flags runs
+/// `on-request`/`read-only` again; a resume with none restores Full Access.
+/// So the line carries `-a never -s danger-full-access` in place of the
+/// launch's two, every other flag kept. NEGATIVE CONTROLS: a thread still in
+/// the launch's mode keeps the launch's flags verbatim; a launch that named no
+/// permission flag carries none (Codex restores the thread's); a bypassed
+/// launch whose thread now runs SANDBOXED keeps its bypass (that may be a
+/// fall, whose remedy is the launch's flags), while a narrower approval there
+/// is carried; Codex's auto review is carried as `--approve-for-me`; and
+/// `rewrite_argv` itself is the launch's line, unchanged.
+#[test]
+fn a_relaunch_carries_the_threads_own_permission_mode() {
+    let full = mode_of("\"never\"", "user", "danger-full-access");
+    assert_eq!(
+        full,
+        ThreadMode {
+            approval: Some("never".into()),
+            reviewer: Some("user".into()),
+            sandbox: Some("danger-full-access".into()),
+        }
+    );
+    let launch = argv(&[
+        "codex",
+        "-m",
+        "gpt-6.1-sol",
+        "-a",
+        "on-request",
+        "--search",
+        "-s",
+        "read-only",
+    ]);
+    // The measured case: Full Access chosen in the session is carried, the
+    // model flag kept as launched.
+    assert_eq!(
+        rewrite_argv_carrying(&launch, Some(T1), Some(&full)).expect("carried"),
+        argv(&[
+            "resume",
+            "-m",
+            "gpt-6.1-sol",
+            "--search",
+            "-a",
+            "never",
+            "-s",
+            "danger-full-access",
+            T1,
+        ])
+    );
+    // The control: `rewrite_argv` carries the launch's flags, which undo it.
+    assert_eq!(
+        rewrite_argv(&launch, Some(T1)).expect("carried"),
+        argv(&[
+            "resume",
+            "-m",
+            "gpt-6.1-sol",
+            "-a",
+            "on-request",
+            "--search",
+            "-s",
+            "read-only",
+            T1,
+        ])
+    );
+    // Still in the launch's mode: the launch's flags, verbatim.
+    let same = mode_of("\"on-request\"", "user", "read-only");
+    assert_eq!(carried_mode(&launch, &same), None);
+    assert_eq!(
+        rewrite_argv_carrying(&launch, Some(T1), Some(&same)),
+        rewrite_argv(&launch, Some(T1))
+    );
+    // No mode read: the launch's line.
+    assert_eq!(
+        rewrite_argv_carrying(&launch, Some(T1), None),
+        rewrite_argv(&launch, Some(T1))
+    );
+    // A launch that named no permission flag: a bare resume restores the
+    // thread's own mode.
+    let plain = argv(&["codex", "-m", "gpt-6.1-sol"]);
+    assert_eq!(carried_mode(&plain, &full), None);
+    // A bypassed launch whose thread now runs sandboxed (the incident's fall:
+    // `never` over `workspace-write`): the bypass stands, spelled as launched.
+    let bypass = argv(&["codex", "--dangerously-bypass-approvals-and-sandbox"]);
+    let fell = mode_of("\"never\"", "user", "workspace-write");
+    assert_eq!(carried_mode(&bypass, &fell), None);
+    assert_eq!(
+        carried_mode(&argv(&["codex", "-s", "danger-full-access"]), &fell),
+        None
+    );
+    // A person's `Ask for approval` under that launch: the approval is
+    // carried, the sandbox never narrowed.
+    let ask = mode_of("\"on-request\"", "user", "workspace-write");
+    assert_eq!(
+        carried_mode(&bypass, &ask),
+        Some(argv(&["-a", "on-request", "-s", "danger-full-access"]))
+    );
+    // Wider and equal are carried: `workspace-write` over a `read-only`
+    // launch.
+    assert_eq!(
+        carried_mode(&launch, &ask),
+        Some(argv(&["-a", "on-request", "-s", "workspace-write"]))
+    );
+    // `Approve for me` is its own flag, and leaving it is spelled out.
+    let auto = mode_of("\"on-request\"", "auto_review", "workspace-write");
+    assert_eq!(
+        carried_mode(&launch, &auto),
+        Some(argv(&["--approve-for-me"]))
+    );
+    let approve = argv(&["codex", "--approve-for-me"]);
+    assert_eq!(carried_mode(&approve, &auto), None);
+    assert_eq!(
+        carried_mode(&approve, &ask),
+        Some(argv(&["-a", "on-request", "-s", "workspace-write"]))
+    );
+    // A `granular` policy is no `-a` word: the launch's approval stands
+    // beside the thread's wider sandbox.
+    let granular = mode_of("{\"granular\":{}}", "user", "danger-full-access");
+    assert_eq!(granular.approval, None);
+    assert_eq!(
+        carried_mode(&launch, &granular),
+        Some(argv(&["-a", "on-request", "-s", "danger-full-access"]))
+    );
+    // Every spelling of the flags is read: attached and `=` forms.
+    let spelled = argv(&["codex", "-aon-request", "--sandbox=read-only"]);
+    assert_eq!(carried_mode(&spelled, &same), None);
+    assert_eq!(
+        rewrite_argv_carrying(&spelled, None, Some(&full)).expect("carried"),
+        argv(&["-a", "never", "-s", "danger-full-access"])
     );
 }

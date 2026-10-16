@@ -1,27 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! REACHABILITY PIN: A SEALED GENERATION NEVER BUILDS THE FONT-COVERAGE INDEX.
+//! A sealed generation never builds or queries the font-coverage index.
 //!
-//! `font_coverage_index` reads EVERY system font whole (~373 files, ~700 MB on
-//! a Mac, the 192 MB emoji collection included) and walks each cmap, to serve
-//! `runtime_fallback_scan_candidates` — the `Tier::RuntimeDecisions` lane that
-//! `font_chain` removes from every SEALED policy. Every GUI renderer is sealed
-//! before its first pixel, so the GUI's old `aterm-font-warm` thread built a
-//! table no GUI process could consult; it was deleted on that argument, and
-//! this test is the argument made checkable.
+//! `font_coverage_index` reads every system font whole (~373 files, ~700 MB on
+//! a Mac) to serve `runtime_fallback_scan_candidates`, the
+//! `Tier::RuntimeDecisions` lane `font_chain` removes from every sealed policy.
+//! Every GUI renderer is sealed before its first pixel, so nothing pre-warms
+//! the index; a sealed generation reaching it would be a pathname scan on the
+//! render thread, the freeze the seal exists to prevent.
 //!
-//! The pin drives a sealed system generation through exactly the code points
-//! that USED to reach the scan — CJK (broad chain), a Nerd-Font PUA icon
-//! (embedded backstop), a colour emoji, a math symbol and a noncharacter (the
-//! honest `.notdef`) — rasterizing each, and then asks the process whether the
-//! index was ever built or queried. Its own process (an integration test
-//! binary with one test), so no sibling's UNSEALED renderer can bump the
-//! counters behind it.
-//!
-//! If this ever goes red the warm's deletion is wrong for the sealed path and
-//! the seal is leaking a pathname scan onto the render thread — which is the
-//! freeze the seal exists to prevent, not a perf regression to re-warm.
+//! The test drives a sealed system generation through one code point per
+//! fallback lane, rasterizing each, then reads the process-global counters. It
+//! is its own test binary so no sibling's unsealed renderer moves them.
 
 use aterm_render::{Renderer, Theme};
 
@@ -51,8 +42,7 @@ fn a_sealed_system_generation_never_builds_or_queries_the_coverage_index() {
     for &ch in PROBES {
         let key = r.glyph_key(ch);
         let img = r.glyph_image(key);
-        // Touch the raster so the whole resolve → rasterize path runs, exactly
-        // as a frame would drive it.
+        // Touch the raster so the whole resolve → rasterize path runs.
         let _ = (img.width(), img.height(), key.source);
     }
     // And the bold/italic routing, which has its own memo and its own probe.
@@ -73,12 +63,9 @@ fn a_sealed_system_generation_never_builds_or_queries_the_coverage_index() {
          reads on the render thread that the seal is supposed to make impossible"
     );
 
-    // NON-VACUITY CONTROL, in the same process and AFTER the sealed half so
-    // the counters above were read at zero: an UNSEALED generation asked for a
-    // code point no face covers must reach the scan, or the zero above proves
-    // nothing about the seal. This half is what the deleted GUI warm used to
-    // pre-pay — and it is the whole-font-tree read, so it runs exactly once,
-    // here, last.
+    // Non-vacuity control, after the sealed half so the counters above read
+    // zero: an unsealed generation asked for a code point no face covers must
+    // reach the scan. It reads the whole font tree, so it runs once, last.
     let mut unsealed = Renderer::from_system(18.0, Theme::default()).expect("resolved once");
     unsealed.debug_block_on_lazy_fallbacks();
     let key = unsealed.glyph_key('\u{FFFF}');

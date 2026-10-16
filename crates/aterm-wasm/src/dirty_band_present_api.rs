@@ -1,76 +1,37 @@
 // SPDX-License-Identifier: MIT
 // Copyright 2026 Andrew Yates
 
-//! Dirty-band present export for the CPU wasm path (audit E3, Codex-modified).
+//! Dirty-band present for the CPU wasm path. `render()` re-expands only the damaged
+//! pixel bands into the persistent RGBA buffer, which stays fully coherent, and
+//! [`AtermTerminal::present_band_count`] / [`AtermTerminal::present_bands_ptr`]
+//! export them as `(x, y, w, h)` quads for the host to `putImageData` one by one.
 //!
-//! The old present pipeline paid O(W×H) EVERY frame regardless of damage: the
-//! whole u32 framebuffer was re-expanded to RGBA8 and the host `putImageData`d
-//! the whole canvas — ~4 MB of conversion + upload for a one-row keystroke.
-//! The engine already computes exact per-row damage (`compute_dirty_rows`, one
-//! source shared with the GPU scissor path); this module carries that damage
-//! ACROSS the wasm boundary the same way the spill band carries its rects:
+//! Band semantics:
 //!
-//! * `render()` now RE-EXPANDS ONLY the dirty pixel bands into the persistent
-//!   RGBA buffer (`rgba`/`rgba_ptr` semantics unchanged: the FULL buffer is
-//!   always coherent, because undamaged bytes are last frame's — byte-equal).
-//! * [`AtermTerminal::present_band_count`] / [`AtermTerminal::present_bands_ptr`]
-//!   export the packed `(x, y, w, h)` i32 bands of the JUST-rendered frame
-//!   (the `spill_rects_ptr` read discipline: consume synchronously after
-//!   `render()`, never cache the JS view). The host calls
-//!   `ctx.putImageData(imageData, 0, 0, x, y, w, h)` per band — and SKIPS the
-//!   canvas entirely on a zero-band (gate-hit) frame.
+//! * `Full` damage (first frame, resize, theme/font epoch, DECDHL) → one full-frame
+//!   band.
+//! * Gate hit → zero bands; the host skips conversion and `putImageData`.
+//! * Row damage → one full-width band per run of dirty grid rows, only without chrome:
+//!   a chromed frame (`set_chrome`) lets effects paint outside the row lattice, so it
+//!   always gets the full band.
+//! * A whole-row scroll blit, a presented sub-row residual and the frame that clears
+//!   it move the whole grid band → one full-frame band.
 //!
-//! ## Band semantics (the glue contract)
-//!
-//! * `Full` damage (first frame, resize, theme/font epoch, scrollback offset
-//!   change, DECDHL) → ONE full-frame band.
-//! * Gate hit (nothing changed) → ZERO bands; the RGBA buffer is already this
-//!   frame, the host skips conversion AND `putImageData`.
-//! * Row damage → one band per merged run of dirty grid rows, full-width,
-//!   `cell_h`-aligned within the grid box (a padding recolour forces `Full`
-//!   upstream). Only at 0/0 chrome — a chromed frame (`set_chrome`) lets
-//!   effects paint outside the row lattice, so chromed embedders always get
-//!   the full band (their band optimization is the spill export).
-//! * FRACTIONAL SCROLL: while a sub-row residual is presented (`scroll_px`
-//!   mid-row) — and on the frame that clears it — the M1b translate shifts
-//!   the whole grid band, so those frames export one full-frame band. Never a
-//!   stale partial under a moving band.
-//!
-//! ## Overlay damage / second-canvas contract (Codex requirement)
-//!
-//! ENGINE-drawn overlays (cursor, selection tint, LUMEN aurora / trail /
-//! sparkle quads, search-band effects) are already folded into
-//! `compute_dirty_rows` — their rows appear in the exported bands, so a
-//! partial present can never strand a moving glow. HOST-drawn overlays (IME
-//! preedit, find-bar highlight rectangles, DOM-side decorations) are outside
-//! the engine's damage model: a host must either (a) draw them on a SEPARATE
-//! canvas layered above the terminal canvas — the recommended shape, partial
-//! presents then never touch them — or (b) repaint its overlay after EVERY
-//! nonzero-band present. Compositing host overlays into the terminal canvas
-//! and presenting partial bands WILL ghost them.
-//!
-//! (Codex's third E3 note — measure how often the CPU fallback is actually
-//! taken vs WebGPU — is host-side telemetry: orc's glue owns backend choice;
-//! integrator note recorded in the commit.)
+//! Engine-drawn overlays (cursor, selection, effects) are in the engine's damage.
+//! Host-drawn overlays (IME preedit, find highlights, DOM decorations) are not: draw
+//! them on a separate canvas above this one, or repaint them after every nonzero-band
+//! present, or partial presents will ghost them.
 
 use crate::AtermTerminal;
 #[cfg(target_arch = "wasm32")]
-use wasm_bindgen::prelude::*;
+use aterm_wasm_abi::export;
 
-/// Expand `pixels[start..end]` (0xTTRRGGBB) into `rgba[start*4..end*4]`
-/// (straight RGBA8, alpha = 255 − TT) — the one packing rule of the CPU
-/// present path, band-scoped.
+/// Expand `pixels[start..end]` (0xTTRRGGBB) into `rgba[start*4..end*4]` (straight
+/// RGBA8, alpha = 255 − TT).
 ///
-/// This is the innermost loop of the whole CPU present path (every `Full`
-/// frame, every scroll frame's exposed bands, every keystroke's row bands),
-/// so it is written to cost ONE store per pixel: zipping the destination's
-/// `as_chunks_mut::<4>()` proves the bound once for the entire band and makes
-/// each pixel a single 4-byte array store, instead of four separately
-/// bounds-checked byte writes whose interleaved panic edges also block LLVM's
-/// store-merging pass. `(end - start) * 4` is divisible by 4 so the chunk
-/// remainder is always empty, and `[u8; 4]` is align-1. Same packing rule,
-/// same order, byte-identical output — the same idiom `aterm-render`'s spill
-/// buffer already uses.
+/// The innermost loop of the CPU present path: zipping `as_chunks_mut::<4>()` proves
+/// the bound once per band, so each pixel is one 4-byte store rather than four
+/// bounds-checked byte writes that block LLVM's store merging.
 pub(crate) fn expand_rgba_band(pixels: &[u32], rgba: &mut [u8], start: usize, end: usize) {
     let end = end.min(pixels.len());
     let start = start.min(end);
@@ -87,14 +48,10 @@ pub(crate) fn expand_rgba_band(pixels: &[u32], rgba: &mut [u8], start: usize, en
     }
 }
 
-/// Shift the pixel rows of the RGBA grid band `[y0, y1)` of `rgba` (a `w`-wide,
-/// 4-byte/px, row-major buffer) by `frac_px` device pixels IN PLACE — the u8
-/// twin of `scroll_translate::translate_grid_band_in_place`. The E7 scroll path
-/// applies it to the persistent present buffer so its retained rows track the
-/// engine's cache blit WITHOUT re-expanding them from the u32 cache. Same
-/// direction convention (positive = up, `dst[y] ← src[y + |frac|]`) and the same
-/// direction-matched in-place walk (a source row is never read after overwrite),
-/// so the shifted band is byte-identical to copying from a pristine snapshot.
+/// Shift rows `[y0, y1)` of a `w`-wide RGBA buffer by `frac_px` device px in place:
+/// the u8 twin of `scroll_translate::translate_grid_band_in_place`, with the same
+/// convention (positive = up) and a direction-matched walk so no source row is read
+/// after it is overwritten.
 pub(crate) fn shift_rgba_band(rgba: &mut [u8], w: usize, y0: usize, y1: usize, frac_px: i64) {
     if w == 0 || y0 >= y1 || frac_px == 0 {
         return;
@@ -104,14 +61,14 @@ pub(crate) fn shift_rgba_band(rgba: &mut [u8], w: usize, y0: usize, y1: usize, f
     let mag = frac_px.unsigned_abs() as usize;
     let moved = band_h.saturating_sub(mag);
     if frac_px > 0 {
-        // Shift UP: dst pulls from below (dst + mag). Walk top-down.
+        // Shift up: walk top-down.
         for i in 0..moved {
             let dst = y0 + i;
             let src = dst + mag;
             rgba.copy_within(src * stride..src * stride + stride, dst * stride);
         }
     } else {
-        // Shift DOWN: dst pulls from above (dst − mag). Walk bottom-up.
+        // Shift down: walk bottom-up.
         for i in 0..moved {
             let dst = y1 - 1 - i;
             let src = dst - mag;
@@ -120,8 +77,7 @@ pub(crate) fn shift_rgba_band(rgba: &mut [u8], w: usize, y0: usize, y1: usize, f
     }
 }
 
-/// Full-frame expansion + the single full band. Also (re)sizes the RGBA
-/// buffer, so every non-partial path funnels through one place.
+/// Full-frame expansion plus the single full band; also sizes the RGBA buffer.
 pub(crate) fn expand_full(
     pixels: &[u32],
     rgba: &mut Vec<u8>,
@@ -135,9 +91,8 @@ pub(crate) fn expand_full(
     bands.extend_from_slice(&[0, 0, w as i32, h as i32]);
 }
 
-/// Merge consecutive dirty GRID rows into full-width pixel bands
-/// (`x, y, w, h` quads appended to `out`), mapping row `r` to
-/// `grid_top + r*cell_h .. +cell_h`, clamped to the frame height.
+/// Merge runs of dirty grid rows into full-width `x, y, w, h` bands in `out`: row `r`
+/// spans `grid_top + r*cell_h ..+cell_h`, clamped to the frame height.
 pub(crate) fn dirty_rows_to_bands(
     dirty: &[bool],
     grid_top: usize,
@@ -166,22 +121,16 @@ pub(crate) fn dirty_rows_to_bands(
 }
 
 impl AtermTerminal {
-    /// Apply the recorded damage of the frame just rendered into the
-    /// persistent RGBA buffer, band-scoped, and publish the band list.
-    /// NOT called on a frame carrying (or just releasing) a sub-row
-    /// translate: the caller already full-expanded from the TRANSLATED view
-    /// (`expand_full` under its live borrow), which this untranslated-cache
-    /// path could not reproduce.
+    /// Apply the just-rendered frame's damage to the persistent RGBA buffer and
+    /// publish the band list. Not called on a frame carrying or releasing a sub-row
+    /// translate: the caller full-expands the translated view instead.
     pub(crate) fn expand_damage_to_rgba(&mut self) {
         use aterm_render::DamageOutcome;
         let expected = self.width * self.height * 4;
         let stale = self.rgba.len() != expected;
         let (cw, ch) = self.renderer.cell_size();
-        // Window chrome ([head][pad][grid][pad]) lets effects paint OUTSIDE
-        // the grid-row lattice (that is what the spill band exports), so row
-        // bands cannot cover a chromed frame's damage — chromed embedders
-        // take the full band. 0/0 chrome (the shipped pane shape) is the
-        // optimized path.
+        // Chrome lets effects paint outside the grid-row lattice (the spill band's
+        // job), so only a chromeless frame takes row bands.
         let chromeless = self.renderer.grid_top() == 0
             && self.height == self.rows * ch
             && self.width == self.cols * cw;
@@ -203,16 +152,10 @@ impl AtermTerminal {
                     expand_rgba_band(pixels, &mut self.rgba, y * self.width, (y + h) * self.width);
                 }
             }
-            // E7 SCROLL BLIT: the engine shifted the retained CACHE rows by
-            // `delta_rows·ch` and re-rasterized only the exposed strip + cursor
-            // rows. Mirror that in the persistent RGBA buffer with a cheap row
-            // memmove (instead of an O(W·H) re-expansion of the retained rows),
-            // then re-expand ONLY the flagged bands from the shifted+patched
-            // cache — leaving the whole buffer coherent. Every retained row MOVED
-            // on the host canvas, so a partial band list would strand them: export
-            // ONE FULL band (the host re-uploads the whole coherent buffer, exactly
-            // as it does for `Full`). The rendered buffer is byte-identical to a
-            // from-scratch full expansion (the E7 frame-identity oracle).
+            // Scroll blit: the engine shifted its cache rows by `delta_rows·ch` and
+            // re-rasterized only the exposed strip and cursor rows. Mirror the shift
+            // with a row memmove, re-expand the flagged bands, then export one full
+            // band: every retained row moved on the host canvas.
             DamageOutcome::Scroll { delta_rows } if !stale && chromeless => {
                 let grid_top = self.renderer.grid_top();
                 let y1 = (grid_top + self.rows * ch).min(self.height);
@@ -223,7 +166,6 @@ impl AtermTerminal {
                     y1,
                     i64::from(delta_rows) * ch as i64,
                 );
-                // The flagged (exposed + cursor) rows, as pixel bands.
                 dirty_rows_to_bands(
                     self.win.dirty_rows(),
                     grid_top,
@@ -238,7 +180,6 @@ impl AtermTerminal {
                     let (y, h) = (quad[1] as usize, quad[3] as usize);
                     expand_rgba_band(pixels, &mut self.rgba, y * self.width, (y + h) * self.width);
                 }
-                // Retained rows moved on-canvas → export one full band.
                 self.present_bands.clear();
                 self.present_bands.extend_from_slice(&[
                     0,
@@ -247,8 +188,7 @@ impl AtermTerminal {
                     self.height as i32,
                 ]);
             }
-            // Full damage — and any stale-buffer surprise on the other arms
-            // (first frame, resize race): one full expansion, one full band.
+            // Full damage, or a stale buffer (first frame, resize race).
             _ => {
                 let (w, h) = (self.width, self.height);
                 // Split borrows: pixels live in win, the buffers in self.
@@ -264,24 +204,19 @@ impl AtermTerminal {
     }
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
+#[cfg_attr(target_arch = "wasm32", export)]
 impl AtermTerminal {
-    /// Number of dirty present bands from the LAST `render()`. `0` = the
-    /// frame is byte-identical to the previous one — skip RGBA reads and
-    /// `putImageData` entirely. Read together with
-    /// [`present_bands_ptr`](Self::present_bands_ptr).
+    /// Number of dirty present bands from the last `render()`; `0` means the frame is
+    /// unchanged, so skip the RGBA read and `putImageData`.
     pub fn present_band_count(&self) -> u32 {
         (self.present_bands.len() / 4) as u32
     }
 
-    /// Byte offset (in wasm linear memory) of the packed dirty-band array:
-    /// `present_band_count()` bands of 4 `i32`s — `x, y, w, h`,
-    /// FRAME-ABSOLUTE device px, non-overlapping, top-to-bottom. Same read
-    /// discipline as `rgba_ptr`: consume synchronously after `render()`,
-    /// never cache the JS view across engine calls. The host presents each
-    /// band with `putImageData(imageData, 0, 0, x, y, w, h)` over the SAME
-    /// full-frame ImageData `rgba_ptr` backs. See the module docs for the
-    /// overlay/second-canvas contract.
+    /// Byte offset in wasm linear memory of the band array: `present_band_count()`
+    /// quads of `i32` `x, y, w, h`, frame-absolute device px, non-overlapping,
+    /// top-to-bottom. As with `rgba_ptr`, consume it synchronously after `render()` and
+    /// never cache the JS view across engine calls. Present each band with
+    /// `putImageData(imageData, 0, 0, x, y, w, h)` over the ImageData `rgba_ptr` backs.
     pub fn present_bands_ptr(&self) -> usize {
         self.present_bands.as_ptr() as usize
     }
@@ -295,8 +230,7 @@ mod tests {
         AtermTerminal::new_from_system(8, 40, 14.0)
     }
 
-    /// Reference oracle: what a from-scratch full expansion of the current
-    /// frame would produce.
+    /// What a from-scratch full expansion of the current frame produces.
     fn full_expansion(t: &AtermTerminal) -> Vec<u8> {
         let mut rgba = Vec::new();
         let mut bands = Vec::new();
@@ -361,8 +295,6 @@ mod tests {
             (banded_px as usize) < t.width * t.height,
             "a keystroke never pays a full-frame band"
         );
-        // THE oracle: the partially-updated persistent buffer is byte-equal
-        // to a from-scratch expansion of the same frame.
         assert_eq!(t.rgba, full_expansion(&t), "partial update is byte-exact");
     }
 
@@ -373,13 +305,12 @@ mod tests {
             t.process(format!("scroll line {i}\r\n").as_bytes());
         }
         t.render();
-        // A display-offset change is a FullRepaint upstream → one full band.
+        // A display-offset change presents one full band.
         t.scroll_lines(3);
         t.render();
         assert_eq!(t.present_bands[..2], [0, 0]);
         assert_eq!(t.present_bands[2..4], [t.width as i32, t.height as i32]);
         assert_eq!(t.rgba, full_expansion(&t));
-        // Resize: geometry change → full band, buffer resized coherently.
         t.resize(10, 44);
         t.render();
         assert_eq!(t.present_band_count(), 1);
@@ -402,8 +333,7 @@ mod tests {
             vec![0, 0, t.width as i32, t.height as i32],
             "a translated band frame must not export partial bands"
         );
-        // The frame that RELEASES the residual is full too (the band snaps
-        // back), and the buffer matches the untranslated cache again.
+        // The frame that releases the residual is full too.
         t.scroll_px(-half_cell);
         t.render();
         assert_eq!(
@@ -414,11 +344,8 @@ mod tests {
         assert_eq!(t.rgba, full_expansion(&t));
     }
 
-    /// E7 GUARD: the whole-row scroll BLIT path (the `scroll_lines` bench shape)
-    /// is actually TAKEN, and every scrolled frame's persistent RGBA buffer is
-    /// byte-identical to a from-scratch full expansion — the blit is faster, never
-    /// different. Walks many notches (the bench does 200) so the inductive
-    /// coherence of the shift+partial-expand buffer is exercised repeatedly.
+    /// The whole-row scroll blit is taken, and every scrolled frame's buffer equals a
+    /// from-scratch full expansion.
     #[test]
     fn scroll_blit_is_taken_and_stays_byte_exact() {
         use aterm_render::DamageOutcome;
@@ -433,18 +360,14 @@ mod tests {
         for _ in 0..60 {
             t.scroll_lines(3);
             t.render();
-            // The rescued whole-row scroll reports a `Scroll` damage outcome.
             if matches!(t.win.last_damage(), DamageOutcome::Scroll { .. }) {
                 blit_frames += 1;
             }
-            // THE oracle: the shifted + partially re-expanded persistent buffer
-            // equals a from-scratch full expansion of the same frame, every notch.
             assert_eq!(
                 t.rgba,
                 full_expansion(&t),
                 "scroll-blit present must be byte-identical to a full repaint"
             );
-            // A retained row moved on-canvas → the host gets one full band.
             assert_eq!(
                 t.present_bands,
                 vec![0, 0, t.width as i32, t.height as i32],
@@ -457,13 +380,9 @@ mod tests {
         );
     }
 
-    /// E7 GUARD (shade + overshoot). The scroll-blit present must stay byte-exact
-    /// even when the retained rows carry absolute-Y-parity shade dithers
-    /// (U+2591–2593) and upward-overshooting accented capitals — the two cases the
-    /// blit's frame-identity gate refuted. The engine re-rasters the shade-parity
-    /// rows and the overshoot aprons into its cache; this checks the wasm present
-    /// buffer (a row memmove + partial re-expansion) matches a from-scratch
-    /// expansion of that corrected cache, every notch.
+    /// The scroll-blit present stays byte-exact when retained rows carry
+    /// absolute-Y-parity shade dithers (U+2591–2593) and upward-overshooting capitals,
+    /// which the engine re-rasters into its cache.
     #[test]
     fn shade_scroll_blit_present_stays_byte_exact() {
         use aterm_render::DamageOutcome;
@@ -479,7 +398,7 @@ mod tests {
         t.render();
         let mut blit_frames = 0usize;
         for _ in 0..40 {
-            t.scroll_lines(1); // single notch → odd pixel shift when cell_h is odd
+            t.scroll_lines(1); // an odd pixel shift when cell_h is odd
             t.render();
             if matches!(t.win.last_damage(), DamageOutcome::Scroll { .. }) {
                 blit_frames += 1;

@@ -1,40 +1,31 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE RELEASE'S OWN HANDOFF FIXTURES: what this release's producer writes, recorded
-//! by its own cut and landed on main, so the next release's handoff fixture gate
-//! ([`crate::gates::handoff_fixture_gate`]) finds them without a hand step.
+//! The release's own handoff fixtures: what this release's producer writes, recorded by its
+//! own cut and landed on main for the next release's handoff fixture gate
+//! ([`crate::gates::handoff_fixture_gate_at`]). Only release N's producer can write the
+//! bytes that check N+1's consumer (`crates/aterm-gui/tests/fixtures/handoff/README.md`),
+//! so N's cut writes them in two halves:
 //!
-//! An installed release N updates to N+1 by handing its sessions over, and only N's
-//! fixture directory checks N+1's consumer against what N really writes
-//! (`crates/aterm-gui/tests/fixtures/handoff/README.md`). The bytes can only come
-//! from N's own producer, so N's cut writes them, in two halves:
+//! * [`stage`], before the claim (beside the `ship release` build): the in-tree
+//!   generator ([`GENERATOR_SOURCE`], two `#[ignore]`d libtests) runs in the clone under
+//!   the reserved identity's pins (release commit C and build n, and the prover's
+//!   `TRUST_STAGE2_BIN`) into the release cache, self-checking every desk against the
+//!   release's own consumer. A refusal, or a missing required desk, refuses the release
+//!   with nothing claimed.
+//! * [`land`], after the cut: one commit on origin/main's tip adding `vX.Y.0/`
+//!   and its `PINNED_DESKS` rows, pushed as a compare-and-swap like the claim's
+//!   ([`crate::ledger::claim`]). A tip that already holds them is a no-op, so a re-run
+//!   resumes.
 //!
-//! * [`stage`], BEFORE THE CLAIM (`ship release` step 9): the in-tree generator
-//!   ([`GENERATOR_SOURCE`], two `#[ignore]`d libtests) runs in the cut tree, as
-//!   R, under the reserved identity's pins — the release commit C and build n the
-//!   shipped binary stamps (`buildplan`'s `ATERM_BUILD_GIT_COMMIT`,
-//!   `ATERM_BUILD_GIT_COMMIT_FULL` and `SOURCE_DATE_EPOCH`) and the prover's
-//!   compiler (`TRUST_STAGE2_BIN`) — into the release cache, outside the clone. The
-//!   generator self-checks every desk against the release's own consumer; a refusal,
-//!   or a staging that lacks a required desk, refuses the release with nothing
-//!   claimed or published.
-//! * [`land`], AFTER THE CUT (step 13): one commit on origin/main's tip adding
-//!   `vX.Y.0/` and its `PINNED_DESKS` rows (which pin the rendezvous record too),
-//!   pushed as a compare-and-swap with the claim's retry discipline
-//!   ([`crate::ledger::claim`]): a non-fast-forward rejection rebuilds the commit on
-//!   the new tip, anything else stops. A tip that already holds the release's
-//!   fixtures, judged by the next cut's own gate, is a no-op, so a re-run resumes:
-//!   staged and not landed lands, landed does nothing.
-//!
-//! The staging is keyed by the reserved identity
-//! (`<cache>/handoff-fixtures/v<version>-<n>-<C12>/`), so a reservation the ledger
-//! passed, reserved anew, writes afresh, and its mark ([`STAGED_MARK`]) is written
-//! last, so a staging that stopped half way is written again.
+//! A staging is keyed by the reserved identity
+//! (`<cache>/handoff-fixtures/v<version>-<n>-<C12>/`) and its mark ([`STAGED_MARK`]) is
+//! written last, so a re-reserved identity or a half-written staging is written afresh.
 
+use aterm_uds::spawnfd::Command;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 
 use crate::gates::{
     GateTree, HANDOFF_FIXTURE_GUARD, HANDOFF_FIXTURE_GUARD_TARGET, HANDOFF_FIXTURE_README,
@@ -165,16 +156,14 @@ pub fn generator_args() -> Vec<&'static str> {
     args
 }
 
-/// STAGE the release's fixtures: run the in-tree generator in `tree` (the cut tree,
-/// at R) with `targo`, under `pins`, into `root` (the release cache's
-/// [`crate::snapshot::CacheRoot::handoff_fixtures`]), unless that identity is staged
-/// already. `run` is the process runner (the release's forwarded child, with the
-/// prover named in `TRUST_STAGE2_BIN`), so a test can hand it any outcome.
+/// Stage the release's fixtures: run the in-tree generator in `tree` (the cut tree) with
+/// `targo`, under `pins`, into `root` ([`crate::snapshot::CacheRoot::handoff_fixtures`]),
+/// unless that identity is staged already. `run` is the process runner, so a test can
+/// hand it any outcome.
 ///
-/// Refuses when the generator does not pass both its tests (one off macOS, which has
-/// no rendezvous), when a desk `REQUIRED_DESKS` asks of this release is missing, and
-/// when a desk was not written as `pins` (its `parent.toml`'s version, commit and
-/// build): what lands must be what the shipped binary writes.
+/// Refuses when the generator does not pass both its tests (one off macOS, which has no
+/// rendezvous), when a desk `REQUIRED_DESKS` asks of this release is missing, and when a
+/// desk's `parent.toml` was not written as `pins`.
 ///
 /// # Errors
 /// Each refusal above, and a staging directory that cannot be written.
@@ -315,10 +304,9 @@ pub fn stage(
     })
 }
 
-/// What `commit` holds of release `version`'s fixtures: `None` when it holds no
-/// `v<version>/` directory, else what the next cut's gate finds there. A directory
-/// the gate refuses is an error: it is someone's, and never this release's to
-/// overwrite.
+/// What `commit` holds of release `version`'s fixtures: `None` without a `v<version>/`
+/// directory, else what the next cut's gate finds there. A directory the gate refuses is
+/// an error: it is someone else's, never this release's to overwrite.
 ///
 /// # Errors
 /// Such a directory, and a git failure.
@@ -344,9 +332,9 @@ pub fn on_commit(
         })
 }
 
-/// `guard` (the source of [`HANDOFF_FIXTURE_GUARD`]) with one `PINNED_DESKS` row per
-/// desk of `v<version>` appended to the table, as a release adds them. Refuses a
-/// table that pins the release already or that it cannot read back.
+/// `guard` (the source of [`HANDOFF_FIXTURE_GUARD`]) with one `PINNED_DESKS` row per desk
+/// of `v<version>` appended. Refuses a table that pins the release already or that does
+/// not read back.
 ///
 /// # Errors
 /// As above.
@@ -391,9 +379,8 @@ pub fn with_pinned_rows(guard: &str, version: &str, desks: &[String]) -> Result<
     Ok(out)
 }
 
-/// `base`'s tree (none: empty) with each `(path, blob)` of `files` set, at any depth,
-/// made from git objects alone — no worktree, no index ([`crate::ledger::commit_with`]
-/// does the same for top-level files).
+/// `base`'s tree (none: empty) with each `(path, blob)` of `files` set, at any depth, made
+/// from git objects alone, with no worktree or index.
 ///
 /// # Errors
 /// A path through a file, and any git failure.
@@ -469,7 +456,7 @@ pub fn tree_with(
     Ok(tree.stdout_utf8().trim().to_string())
 }
 
-/// Every file under `dir`, as `(path relative to it with `/`, bytes)`, sorted.
+/// Every file under `dir` as (its `/`-separated path relative to `dir`, its bytes), sorted.
 fn files_under(dir: &Path) -> Result<Vec<(String, Vec<u8>)>> {
     let mut out = Vec::new();
     let mut stack = vec![(dir.to_path_buf(), String::new())];
@@ -593,14 +580,11 @@ impl Landed {
     }
 }
 
-/// LAND a staging on origin/main: fetch, and when the tip holds the release's
-/// fixtures already (judged by the next cut's gate, [`on_commit`]) do nothing; else
-/// commit `staged` and its `PINNED_DESKS` rows on top of the tip and push that as a
-/// fast-forward of main, the compare-and-swap. A non-fast-forward rejection is a
-/// lost race: fetch the winner's tip and rebuild the commit on it, up to
-/// `max_attempts` tries ([`crate::ledger::MAX_CLAIM_ATTEMPTS`]); any other push
-/// failure stops at once. A push is then verified the way the claim's is: origin/main
-/// is the pushed commit, or has it.
+/// Land a staging on origin/main: fetch; when the tip already holds the release's fixtures
+/// ([`on_commit`]) do nothing; else commit `staged` and its `PINNED_DESKS` rows on the tip
+/// and push it as a fast-forward of main. A non-fast-forward rejection is a lost race:
+/// rebuild on the winner's tip, up to `max_attempts` tries; any other push failure stops at
+/// once. A push is verified as the claim's is: origin/main is the commit, or has it.
 ///
 /// # Errors
 /// Each stop above, a tip whose fixture directory for the release is someone else's

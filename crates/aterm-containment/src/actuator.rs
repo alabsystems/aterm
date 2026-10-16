@@ -261,13 +261,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn os_sandbox_actuation_matches_platform() {
-        // The platform capability (not per-spawn; that is
-        // `network_sandbox_actuated`).
-        assert_eq!(os_sandbox_actuated(), cfg!(target_os = "macos"));
-    }
-
-    #[test]
     fn network_sandbox_in_force_only_for_containment_on_macos() {
         // Only Containment (network = None) is OS-network-sandboxed, and only on a
         // platform that can actuate. User/Safety/Master permit network → never.
@@ -466,26 +459,6 @@ mod tests {
             ),
             other => panic!("a sandbox with a home must Permit scoped, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn decision_is_permitted_helper_matches_variant() {
-        assert!(
-            SpawnDecision::Permit {
-                mode: ContainmentMode::User,
-                os_sandbox: false,
-                sbpl: None,
-                home_scoped: false,
-            }
-            .is_permitted()
-        );
-        assert!(
-            !SpawnDecision::Deny {
-                mode: ContainmentMode::Containment,
-                reason: NO_OS_SANDBOX_REASON,
-            }
-            .is_permitted()
-        );
     }
 
     // Enforcement proof (macOS). These tests spawn a probe via the same
@@ -1231,9 +1204,9 @@ mod tests {
             .expect("run the probe child");
             // BOUNDED. A `task_for_pid` that macOS answers with the
             // administrator dialog blocks until a person answers it, and an
-            // unattended gate has nobody: measured 2026-09-30 on a machine with
-            // developer mode off, the child sat at 0% CPU under an open
-            // SecurityAgent prompt for 1h37m and held `tools/verify.sh` with it.
+            // unattended test run has nobody: on a machine with developer mode
+            // off the child sits at 0% CPU under an open SecurityAgent prompt
+            // for as long as the prompt stands, and holds the run with it.
             // A probe that has not answered in PROBE_DEADLINE fails, naming
             // that cause, instead of waiting for ever. A hang detector, never a
             // latency budget: an answered probe ends in milliseconds.

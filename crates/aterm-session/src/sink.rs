@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 use std::io;
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -764,6 +764,22 @@ struct Shared {
     /// producer but the reply writer. Only ever compared for equality, so it
     /// wraps (2^64 writes away) instead of failing closed.
     driven_input: AtomicU64,
+    /// Packed `(SPILL_ACTIVE_BIT | accepted_order)`: bit 63 is set iff
+    /// [`Spill::buf`] is non-empty, and bits 0..63 hold the per-sink
+    /// accepted-order counter (`ORDER_MASK` is terminal, never wrapping).
+    /// Packing both in one atomic lets [`Self::direct_order_if_spill_empty`]
+    /// observe an empty spill and mint the next direct-write order in a single
+    /// lock-free CAS under `lock`, while [`Self::spill_append`] updates both
+    /// under `spill`.
+    order_state: AtomicU64,
+    /// Cached `Spill::buf.len()`, updated under the `spill` mutex so
+    /// [`Self::spill_len`] and [`Self::spill_is_empty`] never take `spill` on
+    /// the unspilled fast path.
+    spilled_bytes: AtomicUsize,
+    /// Optional caller-supplied hint for [`SinkWriter::tty_swallows_input`]
+    /// (`0` = uncached, `1` = `false`, `2` = `true`), avoiding a `tcgetattr`
+    /// syscall per keystroke when the line discipline is known.
+    cached_tty_swallows: AtomicU8,
     /// The wedged-tty SPILL buffer (design §6.2's backpressure layer, first
     /// milestone): bytes a non-parking writer could not hand to the kernel without
     /// blocking. While non-empty, EVERY writer appends behind it (global FIFO is
@@ -787,8 +803,7 @@ struct Shared {
     /// across a syscall, so the probe cannot wait behind a parked writer.
     ledger: Mutex<InputLedger>,
     /// Called (at most once per arming) when a write puts bytes in the kernel's
-    /// input queue ([`SinkWriter::install_input_hook`]). Runs under the fd lock
-    /// on the writing thread, so it must not block (same contract as `arranger`).
+    /// input queue ([`SinkWriter::install_input_hook`]).
     input_hook: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
     /// The hook has fired since the last [`SinkWriter::rearm_input_hook`].
     input_hook_armed: AtomicBool,
@@ -813,10 +828,6 @@ struct Shared {
 
 /// See [`Shared::spill`].
 struct Spill {
-    /// Per-sink order assigned at the direct-write/spill acceptance seam; kept
-    /// inside the ordering mutex so linearization is structural. `u64::MAX` is
-    /// terminal, never wrapping.
-    accepted_order: u64,
     /// Spilled bytes, oldest first. A frame is appended contiguously under the
     /// mutex and the drainer removes bytes only after the kernel accepted them,
     /// so "non-empty" is exactly "undelivered bytes exist", the FIFO predicate
@@ -845,17 +856,6 @@ struct Spill {
     /// after a closed peer or hard error. A completion fence must not mistake
     /// the resulting empty buffer for a successful drain.
     failed: bool,
-}
-
-impl Spill {
-    fn next_accepted_order(&mut self) -> io::Result<AcceptedOrder> {
-        let next = self
-            .accepted_order
-            .checked_add(1)
-            .ok_or_else(|| io::Error::other("PTY sink accepted-order token exhausted"))?;
-        self.accepted_order = next;
-        Ok(AcceptedOrder(next))
-    }
 }
 
 impl SinkWriter {
@@ -1043,14 +1043,28 @@ impl SinkWriter {
         aterm_pty::tty_echo(self.master)
     }
 
+    /// Cache a caller-observed `tty_swallows_input` hint so
+    /// [`Self::tty_swallows_input`] can answer without a `tcgetattr` syscall
+    /// on every keystroke.
+    pub fn set_tty_swallows_hint(&self, swallows: bool) {
+        self.shared
+            .cached_tty_swallows
+            .store(if swallows { 2 } else { 1 }, Ordering::Release);
+    }
+
     /// Whether the line discipline will swallow the next byte typed into this
     /// sink: canonical no-echo (`read -s`, `sudo`, a passphrase) swallows; raw
     /// mode does not, since the program draws its own echo. A non-tty master
     /// answers `false`: withhold only on positive evidence.
     #[must_use]
     pub fn tty_swallows_input(&self) -> bool {
-        self.tty_echo()
-            .is_some_and(aterm_pty::TtyEcho::swallows_input)
+        match self.shared.cached_tty_swallows.load(Ordering::Acquire) {
+            1 => false,
+            2 => true,
+            _ => self
+                .tty_echo()
+                .is_some_and(aterm_pty::TtyEcho::swallows_input),
+        }
     }
 
     /// How much input the program at this PTY has not read, and a LOWER BOUND
@@ -1207,6 +1221,10 @@ impl SinkWriter {
             let unsent = s.buf.len().saturating_sub(s.chunk_written);
             s.buf.clear();
             s.chunk_written = 0;
+            self.shared.spilled_bytes.store(0, Ordering::Release);
+            self.shared
+                .order_state
+                .fetch_and(!Shared::SPILL_ACTIVE_BIT, Ordering::Release);
             (epoch, unsent)
         };
         self.shared.drained.notify_all();
@@ -1324,13 +1342,17 @@ impl SinkWriter {
             }
             s.buf.clear();
             s.chunk_written = 0;
+            self.shared.spilled_bytes.store(0, Ordering::Release);
+            self.shared
+                .order_state
+                .fetch_and(!Shared::SPILL_ACTIVE_BIT, Ordering::Release);
         }
         self.shared.drained.notify_all();
     }
 
     /// Whether [`Self::sever_input`] has run. For tests, here and downstream
-    /// (the `testing` feature).
-    #[cfg(any(test, feature = "testing"))]
+    /// (a debug build's).
+    #[cfg(any(test, debug_assertions))]
     #[must_use]
     pub fn is_severed(&self) -> bool {
         self.shared.is_severed()
@@ -1338,8 +1360,8 @@ impl SinkWriter {
 
     /// Date every input byte this sink has handed the kernel `by` earlier, so a
     /// test can stand at the stall threshold without sleeping. Tests only (here
-    /// and downstream via the `testing` feature).
-    #[cfg(any(test, feature = "testing"))]
+    /// and downstream, in a debug build).
+    #[cfg(any(test, debug_assertions))]
     pub fn backdate_input_for_testing(&self, by: Duration) {
         self.shared
             .ledger
@@ -1360,9 +1382,9 @@ impl SinkWriter {
     }
 
     /// Bytes the reply queue holds reserved right now (queued or in flight).
-    /// Tests only (here and downstream via `testing`); dropped replies are
+    /// Tests only (here and downstream, in a debug build); dropped replies are
     /// counted by whoever drops them (the GUI's `reply_dropped` metric).
-    #[cfg(any(test, feature = "testing"))]
+    #[cfg(any(test, debug_assertions))]
     #[must_use]
     pub fn reply_reserved(&self) -> usize {
         self.shared.reply_reserved.load(Ordering::Acquire)
@@ -1432,9 +1454,9 @@ impl SinkWriter {
     }
 
     /// How many bytes the process-local spill holds right now. For tests,
-    /// here and downstream (the `testing` feature): a frame queued behind a
+    /// here and downstream (a debug build's): a frame queued behind a
     /// wedged tty is a FACT a test waits for, not a moment it sleeps toward.
-    #[cfg(all(unix, any(test, feature = "testing")))]
+    #[cfg(all(unix, any(test, debug_assertions)))]
     #[must_use]
     pub fn spilled_bytes(&self) -> usize {
         self.shared.spill_len()
@@ -1442,7 +1464,7 @@ impl SinkWriter {
 
     /// The spill's cap: a non-parking frame is refused once the spill holds
     /// this much. For tests, as [`Self::spilled_bytes`].
-    #[cfg(all(unix, any(test, feature = "testing")))]
+    #[cfg(all(unix, any(test, debug_assertions)))]
     pub const SPILL_CAP: usize = Shared::SPILL_CAP;
 
     /// Block an EXPENDABLE producer until every process-local spill byte has
@@ -1696,7 +1718,7 @@ impl SinkWriter {
                 return (ImmediateWrite::BusyZero, None);
             }
         };
-        let mut spill_guard = match self.shared.spill.try_lock() {
+        let spill_guard = match self.shared.spill.try_lock() {
             Ok(guard) => guard,
             Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) => {
@@ -1714,7 +1736,7 @@ impl SinkWriter {
 
         // Reserve under both ordering locks: the syscall may still refuse, but
         // no later frame can get an earlier token than bytes this call accepts.
-        let Ok(order) = spill_guard.next_accepted_order() else {
+        let Ok(order) = self.shared.next_accepted_order(false) else {
             return (ImmediateWrite::BusyZero, None);
         };
 
@@ -1736,8 +1758,11 @@ impl SinkWriter {
         drop(spill_guard);
         // Still under the fd lock, so this stamp is ordered with every other
         // write's.
-        self.shared.ledger_end(accepted);
+        self.shared.ledger_end(accepted, false);
         drop(fd_guard);
+        if accepted > 0 {
+            let _ = self.shared.fire_input_hook();
+        }
         (result, (accepted > 0).then_some(order))
     }
 
@@ -2404,7 +2429,13 @@ impl SinkWriter {
                     Ok(false) => {
                         return self.spill_tail_locked(guard, bytes, off, order, since, when_full);
                     }
-                    Err(e) => return Err(WriteReceiptError::after_write(e, off, order)),
+                    Err(e) => {
+                        drop(guard);
+                        if off > 0 {
+                            let _ = self.shared.fire_input_hook();
+                        }
+                        return Err(WriteReceiptError::after_write(e, off, order));
+                    }
                 }
             }
             // `off < bytes.len()` (the loop condition) makes both `get`s always
@@ -2421,10 +2452,13 @@ impl SinkWriter {
             };
             self.shared.ledger_begin(unit.len());
             let wrote = aterm_pty::write_some_nonparking(self.master, unit);
-            self.shared.ledger_end(match wrote {
-                aterm_pty::NonParkWrite::Wrote(n) => n,
-                _ => 0,
-            });
+            self.shared.ledger_end(
+                match wrote {
+                    aterm_pty::NonParkWrite::Wrote(n) => n,
+                    _ => 0,
+                },
+                false,
+            );
             match wrote {
                 aterm_pty::NonParkWrite::Closed => break, // peer closed mid-frame
                 aterm_pty::NonParkWrite::Wrote(n) => {
@@ -2444,11 +2478,18 @@ impl SinkWriter {
                     return self.spill_tail_locked(guard, bytes, off, order, since, when_full);
                 }
                 aterm_pty::NonParkWrite::Fatal(e) => {
+                    drop(guard);
+                    if off > 0 {
+                        let _ = self.shared.fire_input_hook();
+                    }
                     return Err(WriteReceiptError::after_write(e, off, order));
                 }
             }
         }
         drop(guard);
+        if off > 0 {
+            let _ = self.shared.fire_input_hook();
+        }
         Ok(WriteReceipt::completed(off, bytes.len(), order))
     }
 
@@ -2525,6 +2566,9 @@ impl SinkWriter {
         // like the successful-prepend path, so it is behavior-identical.
         let Some(tail) = bytes.get(off..) else {
             drop(guard);
+            if off > 0 {
+                let _ = self.shared.fire_input_hook();
+            }
             return Ok(WriteReceipt::new(bytes.len(), Some(order)));
         };
         if self
@@ -2532,10 +2576,16 @@ impl SinkWriter {
             .spill_prepend(self.master, tail, since, Room::NoWait)
         {
             drop(guard);
+            if off > 0 {
+                let _ = self.shared.fire_input_hook();
+            }
             return Ok(WriteReceipt::new(bytes.len(), Some(order)));
         }
         if when_full == WhenFull::Refuse {
             drop(guard);
+            if off > 0 {
+                let _ = self.shared.fire_input_hook();
+            }
             return Err(WriteReceiptError::no_drainer(
                 off,
                 (off > 0).then_some(order),
@@ -2552,6 +2602,10 @@ impl SinkWriter {
                 .write_stamped_blocking(self.master, rest, since, None)
             {
                 Ok(0) => {
+                    drop(guard);
+                    if off > 0 {
+                        let _ = self.shared.fire_input_hook();
+                    }
                     return Ok(WriteReceipt::new(off, (off > 0).then_some(order)));
                 }
                 // `write_some_blocking` never writes more than the slice it was
@@ -2568,15 +2622,87 @@ impl SinkWriter {
                     let room = bytes.len().saturating_sub(off);
                     off = off.saturating_add(if n <= room { n } else { room });
                 }
-                Err(e) => return Err(WriteReceiptError::after_write(e, off, order)),
+                Err(e) => {
+                    drop(guard);
+                    if off > 0 {
+                        let _ = self.shared.fire_input_hook();
+                    }
+                    return Err(WriteReceiptError::after_write(e, off, order));
+                }
             }
         }
         drop(guard);
+        if off > 0 {
+            let _ = self.shared.fire_input_hook();
+        }
         Ok(WriteReceipt::new(off, (off > 0).then_some(order)))
     }
 }
 
+#[cfg(clean_islands)]
+macro_rules! trust_island {
+    ($($item:item)*) => {
+        $($item)*
+    };
+}
+
+#[cfg(not(clean_islands))]
+macro_rules! trust_island {
+    ($($tt:tt)*) => {};
+}
+
+trust_island! {
+    clean {
+        namespace SinkSpillOrder
+
+        -- State of the packed order_state word and spill FIFO:
+        -- spill_non_empty tracks whether spilled bytes await delivery;
+        -- next_order is the monotonically increasing accepted-order counter.
+        structure OrderState where
+            spill_non_empty : Bool
+            next_order : Nat
+
+        -- Direct inline write admission under the fd lock: succeeds iff
+        -- spill_non_empty is false, advancing next_order by 1.
+        def tryDirectWrite (s : OrderState) : Option OrderState :=
+            if s.spill_non_empty = true then
+                none
+            else
+                some (OrderState.mk false (s.next_order + 1))
+
+        -- Spill append admission under the spill lock: marks spill_non_empty
+        -- true and advances next_order by 1.
+        def spillAppend (s : OrderState) : OrderState :=
+            OrderState.mk true (s.next_order + 1)
+
+        -- Theorem 1: When spill_non_empty is true, tryDirectWrite returns none
+        -- so no direct write can overtake undelivered spilled bytes.
+        theorem no_direct_overtake_when_spilled (n : Nat) :
+            tryDirectWrite (OrderState.mk true n) = none := by
+            rfl
+
+        -- Theorem 2: When spill_non_empty is false, tryDirectWrite mints
+        -- next_order + 1 and preserves spill_non_empty = false.
+        theorem direct_write_advances_when_empty (n : Nat) :
+            tryDirectWrite (OrderState.mk false n) =
+                some (OrderState.mk false (n + 1)) := by
+            rfl
+
+        -- Theorem 3: A spillAppend after a direct write receives strictly
+        -- greater order than the direct write.
+        theorem spill_after_direct_strictly_ordered (n : Nat) :
+            (spillAppend (OrderState.mk false (n + 1))).next_order = n + 2 := by
+            rfl
+
+        end SinkSpillOrder
+    }
+}
+
 impl Shared {
+    /// High bit of [`Self::order_state`]: set iff [`Spill::buf`] is non-empty.
+    const SPILL_ACTIVE_BIT: u64 = 1 << 63;
+    /// Low 63 bits of [`Self::order_state`]: the monotonic accepted-order counter.
+    const ORDER_MASK: u64 = (1 << 63) - 1;
     /// Spill capacity a BLOCKING writer waits under (backpressure for a paste into
     /// a wedged foreground); non-parking writers (tiny keystroke frames) may exceed
     /// it briefly rather than stall the UI.
@@ -2602,8 +2728,10 @@ impl Shared {
             lock: Mutex::new(()),
             input_epoch: AtomicU64::new(0),
             driven_input: AtomicU64::new(0),
+            order_state: AtomicU64::new(0),
+            spilled_bytes: AtomicUsize::new(0),
+            cached_tty_swallows: AtomicU8::new(0),
             spill: Mutex::new(Spill {
-                accepted_order: 0,
                 buf: VecDeque::new(),
                 chunk_written: 0,
                 draining: false,
@@ -2620,6 +2748,34 @@ impl Shared {
             restarts: AtomicU64::new(0),
             severed: AtomicBool::new(false),
             reply_reserved: AtomicUsize::new(0),
+        }
+    }
+
+    /// Mint the next [`AcceptedOrder`] token, optionally setting
+    /// [`Self::SPILL_ACTIVE_BIT`] in the same atomic step.
+    fn next_accepted_order(&self, mark_spill_active: bool) -> io::Result<AcceptedOrder> {
+        let mut cur = self.order_state.load(Ordering::Acquire);
+        loop {
+            let order = cur & Self::ORDER_MASK;
+            if order == Self::ORDER_MASK {
+                return Err(io::Error::other("PTY sink accepted-order token exhausted"));
+            }
+            let next_order = order + 1;
+            let active = (cur & Self::SPILL_ACTIVE_BIT)
+                | if mark_spill_active {
+                    Self::SPILL_ACTIVE_BIT
+                } else {
+                    0
+                };
+            match self.order_state.compare_exchange_weak(
+                cur,
+                active | next_order,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(AcceptedOrder(next_order)),
+                Err(actual) => cur = actual,
+            }
         }
     }
 
@@ -2661,16 +2817,18 @@ impl Shared {
     /// Close the ledger bracket: the syscall returned with `n` bytes accepted
     /// (0 for a refusal, would-block, closed peer or error). The stamp is
     /// taken here, still under the fd lock, so stamps are monotone and in
-    /// kernel order. When bytes landed and a hook is installed and not yet
-    /// fired, fire it — after the ledger mutex drops, so the hook never runs
-    /// under it.
-    fn ledger_end(&self, n: usize) {
+    /// kernel order. When `fire_hook` is true, bytes landed and a hook is
+    /// installed and not yet fired, fire it — after the ledger mutex drops, so
+    /// the hook never runs under it. Callers on the interactive/non-parking
+    /// paths pass `false` and fire [`Self::fire_input_hook`] after releasing
+    /// `self.lock`.
+    fn ledger_end(&self, n: usize, fire_hook: bool) {
         let at = Instant::now();
         self.ledger
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .end(n, at);
-        if n > 0 {
+        if fire_hook && n > 0 {
             let _ = self.fire_input_hook();
         }
     }
@@ -2773,10 +2931,13 @@ impl Shared {
             }
             self.ledger_begin(bytes.len());
             let wrote = aterm_pty::write_some_nonparking(fd, bytes);
-            self.ledger_end(match wrote {
-                aterm_pty::NonParkWrite::Wrote(n) => n,
-                _ => 0,
-            });
+            self.ledger_end(
+                match wrote {
+                    aterm_pty::NonParkWrite::Wrote(n) => n,
+                    _ => 0,
+                },
+                true,
+            );
             match wrote {
                 aterm_pty::NonParkWrite::Wrote(n) => return Ok(n),
                 aterm_pty::NonParkWrite::Closed => return Ok(0),
@@ -2846,7 +3007,7 @@ impl Shared {
         }
         self.ledger_begin(bytes.len());
         let wrote = blocking_write(bytes);
-        self.ledger_end(wrote.as_ref().map_or(0, |n| *n));
+        self.ledger_end(wrote.as_ref().map_or(0, |n| *n), true);
         wrote
     }
 
@@ -2863,26 +3024,37 @@ impl Shared {
     }
 
     /// While the caller holds the fd lock, bind an empty spill observation to a
-    /// direct-write order token. A contending non-parking writer can append to
-    /// the spill without taking the fd lock, so observing and minting must occur
-    /// under this mutex in one step; otherwise its later bytes could receive an
-    /// earlier token in the gap.
+    /// direct-write order token in one atomic CAS on [`Self::order_state`].
+    /// A contending non-parking writer that appends to the spill sets
+    /// [`Self::SPILL_ACTIVE_BIT`] and increments the order in one atomic step,
+    /// so observing an empty spill and minting a direct order never needs the
+    /// `spill` mutex on the unspilled fast path.
     fn direct_order_if_spill_empty(&self) -> io::Result<Option<AcceptedOrder>> {
-        let mut spill = self.spill.lock().unwrap_or_else(|p| p.into_inner());
-        if spill.buf.is_empty() {
-            spill.next_accepted_order().map(Some)
-        } else {
-            Ok(None)
+        let mut cur = self.order_state.load(Ordering::Acquire);
+        loop {
+            if cur & Self::SPILL_ACTIVE_BIT != 0 {
+                return Ok(None);
+            }
+            let order = cur & Self::ORDER_MASK;
+            if order == Self::ORDER_MASK {
+                return Err(io::Error::other("PTY sink accepted-order token exhausted"));
+            }
+            let next = order + 1;
+            match self.order_state.compare_exchange_weak(
+                cur,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(Some(AcceptedOrder(next))),
+                Err(actual) => cur = actual,
+            }
         }
     }
 
     /// Undelivered spilled bytes exist (the FIFO predicate every writer consults).
     fn spill_is_empty(&self) -> bool {
-        self.spill
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .buf
-            .is_empty()
+        self.spilled_bytes.load(Ordering::Acquire) == 0
     }
 
     /// Current undelivered spill length in bytes — the `SPILL_CAP` predicate the
@@ -2890,11 +3062,7 @@ impl Shared {
     /// the common (empty/small) path. Only the unix spill/drain path spills.
     #[cfg(unix)]
     fn spill_len(&self) -> usize {
-        self.spill
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .buf
-            .len()
+        self.spilled_bytes.load(Ordering::Acquire)
     }
 
     /// PREPEND a split frame's tail (or what a stopped paste still owes,
@@ -2938,6 +3106,11 @@ impl Shared {
         let poke = defer && s.arrange_pending;
         for b in tail.iter().rev() {
             s.buf.push_front(*b);
+        }
+        self.spilled_bytes.store(s.buf.len(), Ordering::Release);
+        if !s.buf.is_empty() {
+            self.order_state
+                .fetch_or(Self::SPILL_ACTIVE_BIT, Ordering::Release);
         }
         drop(s);
         if poke && let Some(arranger) = self.arranger.get() {
@@ -3020,7 +3193,9 @@ impl Shared {
             }
         }
         if self.discarded_since(since) {
-            return s.next_accepted_order().map(Spilled::Accepted);
+            return self
+                .next_accepted_order(!s.buf.is_empty())
+                .map(Spilled::Accepted);
         }
         // Who spawns the drainer. A NON-PARKING writer may be the UI thread;
         // with an arranger installed it never runs `dup`/`pthread_create`
@@ -3037,8 +3212,10 @@ impl Shared {
             }
         }
         let poke = defer && s.arrange_pending;
-        let order = s.next_accepted_order()?;
+        let will_be_non_empty = !s.buf.is_empty() || !bytes.is_empty();
+        let order = self.next_accepted_order(will_be_non_empty)?;
         s.buf.extend(bytes.iter().copied());
+        self.spilled_bytes.store(s.buf.len(), Ordering::Release);
         drop(s);
         if poke && let Some(arranger) = self.arranger.get() {
             arranger();
@@ -3105,6 +3282,7 @@ impl Shared {
         // DEFAULT class it is an E-core candidate whose descheduling parks every
         // keystroke behind it.
         aterm_pty::declare_interactive_thread();
+        let mut chunk: Vec<u8> = Vec::with_capacity(Self::DRAIN_CHUNK);
         loop {
             let guard = self.lock.lock().unwrap_or_else(|p| p.into_inner());
             // Peek without removing, so writers keep seeing "undelivered bytes
@@ -3112,19 +3290,32 @@ impl Shared {
             // in the same critical section as the peek: a discard bumps it
             // under this mutex as it empties `buf`, so a chunk and its epoch
             // always belong together.
-            let (chunk, since): (Vec<u8>, u64) = {
+            let since: u64 = {
                 let mut s = self.spill.lock().unwrap_or_else(|p| p.into_inner());
                 if s.buf.is_empty() {
                     s.draining = false;
+                    self.spilled_bytes.store(0, Ordering::Release);
+                    self.order_state
+                        .fetch_and(!Self::SPILL_ACTIVE_BIT, Ordering::Release);
                     drop(s);
                     drop(guard);
                     self.drained.notify_all();
                     return;
                 }
-                (
-                    s.buf.iter().take(Self::DRAIN_CHUNK).copied().collect(),
-                    self.discard_epoch(),
-                )
+                chunk.clear();
+                let (head, tail) = s.buf.as_slices();
+                let take_head = head.len().min(Self::DRAIN_CHUNK);
+                if let Some(prefix) = head.get(..take_head) {
+                    chunk.extend_from_slice(prefix);
+                }
+                let rem = Self::DRAIN_CHUNK.saturating_sub(chunk.len());
+                if rem > 0 {
+                    let take_tail = tail.len().min(rem);
+                    if let Some(prefix) = tail.get(..take_tail) {
+                        chunk.extend_from_slice(prefix);
+                    }
+                }
+                self.discard_epoch()
             };
             let mut off = 0;
             let mut dead = false;
@@ -3199,6 +3390,9 @@ impl Shared {
                     s.buf.clear();
                     s.draining = false;
                     s.failed = true;
+                    self.spilled_bytes.store(0, Ordering::Release);
+                    self.order_state
+                        .fetch_and(!Self::SPILL_ACTIVE_BIT, Ordering::Release);
                     drop(s);
                     self.drained.notify_all();
                     return;
@@ -3221,6 +3415,11 @@ impl Shared {
                 let take = if off <= len { off } else { len };
                 for _ in 0..take {
                     let _ = s.buf.pop_front();
+                }
+                self.spilled_bytes.store(s.buf.len(), Ordering::Release);
+                if s.buf.is_empty() {
+                    self.order_state
+                        .fetch_and(!Self::SPILL_ACTIVE_BIT, Ordering::Release);
                 }
             }
             self.drained.notify_all();
@@ -3572,8 +3771,11 @@ mod tests {
         let sink = SinkWriter::new(writer.as_raw_fd());
         {
             let mut spill = sink.shared.spill.lock().unwrap();
-            spill.accepted_order = 1;
             spill.buf.push_back(b'B');
+            sink.shared.spilled_bytes.store(1, Ordering::Release);
+            sink.shared
+                .order_state
+                .store(Shared::SPILL_ACTIVE_BIT | 1, Ordering::Release);
             // Model the narrow post-arrangement race without spawning a real
             // drainer: the fallback must append, so this flag is sufficient.
             spill.draining = true;

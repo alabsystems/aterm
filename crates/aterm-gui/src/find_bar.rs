@@ -633,6 +633,66 @@ fn field_layout(v: &FindBarView, c: &BandColors, cols: usize, well_start: usize)
     layout
 }
 
+/// The least contrast a highlight-all tint stands from the terminal background:
+/// the step that makes "this cell is a match" visible as a surface change (the
+/// band's hover rise, [`chrome_band::HOVER_RISE`]'s value).
+pub(crate) const MATCH_TINT_RISE: f64 = 1.5;
+
+/// The least `OkLab` distance between a highlight-all tint and the selection
+/// colour the current match is painted in, so the current match reads as a
+/// different mark from the others rather than as one more of them.
+pub(crate) const MATCH_DISTINCT_OKLAB: f64 = 0.06;
+
+/// The tint ramp: twentieths of the way from `bg` toward its seed, up to
+/// twelve of them (0.6). Past that the tint stops reading as a tint of the
+/// background and starts competing with the text on it.
+const MATCH_TINT_STEPS: (u8, f32) = (12, 20.0);
+
+/// The highlight-all tint the find panel paints under every visible match other
+/// than the current one (which the renderer paints in the selection colour).
+///
+/// The tint is the background stepped toward a hue seed until it stands
+/// [`MATCH_TINT_RISE`]:1 off the background and [`MATCH_DISTINCT_OKLAB`] away
+/// from the selection. The seed is the theme's accent (its cursor, floored to the
+/// band's 3:1 so a cursor that hugs the background still has somewhere to go),
+/// then the foreground for a theme whose accent sits on its selection. A
+/// halfway blend of background and selection, the old rule, vanishes where the
+/// selection is itself a faint step (Solarized Light) and makes every match
+/// look like the current one. Where no seed satisfies both (a user theme whose
+/// selection is the accent and the foreground at once), the accent's first tint
+/// that clears the rise wins: visible beats distinct.
+pub(crate) fn match_tint(theme: Theme) -> [u8; 3] {
+    let rgb = crate::settings::u32_rgb;
+    let (bg, fg, selection) = (rgb(theme.bg), rgb(theme.fg), rgb(theme.selection));
+    let accent = chrome_band::ensure_contrast(rgb(theme.cursor), bg, 3.0);
+    let (steps, per) = MATCH_TINT_STEPS;
+    let ramp = |seed: [u8; 3]| {
+        (1..=steps)
+            .map(move |step| chrome_band::mix3(bg, seed, f32::from(step) / per))
+            .filter(move |tint| chrome_band::contrast(*tint, bg) >= MATCH_TINT_RISE)
+    };
+    let distinct = |tint: &[u8; 3]| oklab_distance(*tint, selection) >= MATCH_DISTINCT_OKLAB;
+    [accent, fg]
+        .into_iter()
+        .find_map(|seed| ramp(seed).find(distinct))
+        .or_else(|| ramp(accent).next())
+        .unwrap_or_else(|| {
+            let deepest = chrome_band::mix3(bg, accent, f32::from(steps) / per);
+            chrome_band::ensure_contrast(deepest, bg, MATCH_TINT_RISE)
+        })
+}
+
+/// The `OkLab` Euclidean distance between two sRGB colours.
+pub(crate) fn oklab_distance(a: [u8; 3], b: [u8; 3]) -> f64 {
+    let lab = |c: [u8; 3]| {
+        let (l, chroma, hue) = aterm_messages::palette::oklch(c);
+        let h = hue.to_radians();
+        (l, chroma * h.cos(), chroma * h.sin())
+    };
+    let ((l1, a1, b1), (l2, a2, b2)) = (lab(a), lab(b));
+    ((l1 - l2).powi(2) + (a1 - a2).powi(2) + (b1 - b2).powi(2)).sqrt()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -657,6 +717,40 @@ mod tests {
 
     fn paint(v: &FindBarView, cols: usize) -> FindBarPaint {
         find_bar_paint(v, cols, FIND_BAR_ROWS, Theme::default(), true)
+    }
+
+    fn builtin_theme(name: &str) -> Theme {
+        let tp = aterm_types::scheme::builtin(name)
+            .expect("builtin exists")
+            .to_theme_parts();
+        Theme {
+            fg: tp.fg,
+            bg: tp.bg,
+            cursor: tp.cursor,
+            selection: tp.selection,
+        }
+    }
+
+    /// On every built-in theme the highlight-all tint is a visible surface
+    /// change ([`MATCH_TINT_RISE`]:1 off the background) and a different mark
+    /// from the selection colour the current match is painted in.
+    #[test]
+    fn match_tint_is_visible_and_apart_from_the_current_match() {
+        let rgb = crate::settings::u32_rgb;
+        for name in aterm_types::scheme::builtin_names() {
+            let theme = builtin_theme(name);
+            let tint = match_tint(theme);
+            let rise = chrome_band::contrast(tint, rgb(theme.bg));
+            assert!(
+                rise >= MATCH_TINT_RISE,
+                "{name}: highlight {tint:02x?} is {rise:.2}:1 off the background"
+            );
+            let apart = oklab_distance(tint, rgb(theme.selection));
+            assert!(
+                apart >= MATCH_DISTINCT_OKLAB,
+                "{name}: highlight {tint:02x?} is {apart:.3} from the selection"
+            );
+        }
     }
 
     fn text(row: &[RenderCell]) -> String {

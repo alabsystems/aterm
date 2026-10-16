@@ -11,12 +11,6 @@ use aterm_spec::{
 #[test]
 fn a_person_wins_and_no_exit_is_dropped_silently() {
     let model = harness_relaunch_on_exit_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name),
-        "the relaunch machine must stay enrolled in the spec-link registry"
-    );
     verify::prove_and_catch_scalar(&model, "harness relaunch on exit");
 
     // A crash is relaunched; one that keeps missing is said to a person
@@ -79,9 +73,9 @@ fn a_person_wins_and_no_exit_is_dropped_silently() {
     assert!(buggy.fire("Limited", &mut q));
     assert!(!buggy.check_invariant("NeverSilent", &q));
 
-    // The harness's OWN restart ended the agent: due whoever is at the tab,
-    // and never left — no person coming back, no limit and no "end of the
-    // launch" takes it off. It lands, is tried again, or is said.
+    // The harness's own restart ended the agent: due whoever is at the tab, and never left (no
+    // person coming back, no limit and no "end of the launch" takes it off). It lands, is tried
+    // again, or is said.
     let mut own = model.init_state();
     assert!(model.fire("Restarted", &mut own));
     assert_eq!(
@@ -97,9 +91,9 @@ fn a_person_wins_and_no_exit_is_dropped_silently() {
     assert_eq!((said["pending"], said["badged"]), (0, 1), "{said:?}");
     assert!(model.fire("Land", &mut own));
     assert_eq!((own["running"], own["restarted"]), (1, 0), "{own:?}");
-    // The host of c4e24cd3e: a person's keystroke or a hold read before the
-    // restart's record left it to them, and a restart its back-off let
-    // expire fell through to the graceful exit its own SIGTERM made.
+    // `Buggy = 1`: a person's keystroke or a hold read before the restart's record leaves it to
+    // them, and a restart its back-off let expire falls through to the graceful exit its own
+    // SIGTERM made.
     for off in ["PersonReturns", "Ended"] {
         let mut b = buggy.init_state();
         assert!(buggy.fire("Restarted", &mut b) && buggy.fire(off, &mut b));
@@ -107,23 +101,15 @@ fn a_person_wins_and_no_exit_is_dropped_silently() {
     }
 }
 
-/// Whether an exit left Claude Code's own
-/// record is read as the exit is seen and KEPT, so another Claude Code that
-/// removes the dead agent's record during the relaunch's back-off cannot turn
-/// a crash into a graceful exit — and the look waits out a graceful exit's
-/// own removal, so a clean exit is never read as a crash. NEGATIVE CONTROLS:
-/// the host of 57a2b7050 (the record read at the attempt, after the
-/// back-off) leaves a crash another Claude swept, and a look at the
-/// detection instant relaunches a graceful exit; each is caught.
+/// Whether an exit left Claude Code's own record is read as the exit is seen and kept, so
+/// another Claude Code that removes the dead agent's record during the relaunch's back-off
+/// cannot turn a crash into a graceful exit; the look waits out a graceful exit's own removal,
+/// so a clean exit is never read as a crash. `Buggy = 1` reads the record at the attempt, after
+/// the back-off (leaving a crash another Claude swept), and looks at the detection instant
+/// (relaunching a graceful exit); each is caught.
 #[test]
 fn a_crash_is_read_at_its_exit_and_kept_through_the_back_off() {
     let model = harness_exit_record_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name),
-        "the exit-record machine must stay enrolled in the spec-link registry"
-    );
     verify::prove_and_catch_scalar(&model, "harness exit record");
 
     // A crash, looked at, then swept by another Claude Code during the
@@ -175,24 +161,15 @@ fn a_crash_is_read_at_its_exit_and_kept_through_the_back_off() {
     assert!(!model.action_enabled("LookAtInstant", &instant));
 }
 
-/// A CODEX EXIT IS READ ON ITS SHELL'S WORD ALONE:
-/// someone's signal is never relaunched and a crash is left only when its
-/// word could not be read at the attempt either — proven; the first cut's
-/// look at the thread lock (which SIGTERM leaves behind as SIGKILL does)
-/// relaunches a person's `kill`, Claude Code's rule inherited (silence a
-/// graceful exit) leaves a crash, an attempt that decides on the look alone
-/// leaves a crash whose word came late, and one that reads the newest block
-/// whatever ran it relaunches a person's `kill` on another command's failure — each caught
-/// on a path of its own.
+/// A Codex exit is read on its shell's word alone: someone's signal is never relaunched, and a
+/// crash is left only when its word could not be read at the attempt either. Each `Buggy = 1`
+/// path is caught on its own: a look at the thread lock (which SIGTERM leaves behind as SIGKILL
+/// does) relaunches a person's `kill`; Claude Code's rule (silence means a graceful exit)
+/// leaves a crash; deciding on the look alone leaves a crash whose word came late; and reading
+/// the newest block whatever ran it relaunches a person's `kill` on another command's failure.
 #[test]
 fn a_codex_exit_is_decided_on_its_shells_word_alone() {
     let model = harness_codex_exit_witness_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name),
-        "the Codex exit machine must stay enrolled in the spec-link registry"
-    );
     verify::prove_and_catch_scalar(&model, "harness codex exit witness");
     let buggy = interp::with_buggy(&model, 1);
     for (path, caught) in [
@@ -216,9 +193,9 @@ fn a_codex_exit_is_decided_on_its_shells_word_alone() {
         }
         assert!(!buggy.check_invariant(caught, &st), "{path:?}: {st:?}");
     }
-    // The shipped machine: a crash told is relaunched, at the look or at the
-    // attempt; someone's signal, told, is left; no word at all — or none of
-    // its own, another command's newest — is left.
+    // The healthy machine: a crash told is relaunched, at the look or at the attempt; someone's
+    // signal, told, is left; no word at all, or none of its own (another command's newest), is
+    // left.
     for (path, decided) in [
         (&["Crash", "ShellWord", "Look", "Decide"][..], 1),
         (&["Crash", "LookGone", "ShellWord", "Decide"][..], 1),

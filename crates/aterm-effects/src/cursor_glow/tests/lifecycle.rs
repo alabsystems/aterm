@@ -98,7 +98,7 @@ fn conpty_hide_gap_still_spawns_the_typing_spark() {
     let c = cfg(GlowStyle::Lumen, true);
     let g = geom();
     glow.tick(Some((2, 5)), t0, &c, g, &mut out); // visible at col 5
-    // ConPTY echo choreography: a ~30ms HIDDEN frame presents…
+    // ConPTY echo choreography: a ~30 ms hidden frame presents…
     glow.tick(None, t0 + Duration::from_millis(15), &c, g, &mut out);
     // …then the cursor reappears one cell right (the echoed character).
     glow.note_synthetic_typed(t0 + Duration::from_millis(30), 1);
@@ -126,7 +126,7 @@ fn hidden_far_teleport_stays_suppressed() {
     let g = geom();
     glow.tick(Some((2, 5)), t0, &c, g, &mut out);
     glow.tick(None, t0 + Duration::from_millis(15), &c, g, &mut out);
-    // Reappears far away (row 5, col 30): NOT a typing move — no spark.
+    // Reappears far away (row 5, col 30): not a typing move, so no spark.
     let fp = glow.tick(
         Some((5, 30)),
         t0 + Duration::from_millis(45),
@@ -136,7 +136,7 @@ fn hidden_far_teleport_stays_suppressed() {
     );
     assert_eq!(fp, 0, "a far teleport out of a hide must not spawn");
     assert!(out.is_empty());
-    // And a LONG hide (alt-screen app) suppresses even an adjacent reappear.
+    // A long hide (alt-screen app) suppresses even an adjacent reappear.
     let mut glow2 = CursorGlow::default();
     glow2.tick(Some((2, 5)), t0, &c, g, &mut out);
     glow2.tick(None, t0 + Duration::from_millis(15), &c, g, &mut out);
@@ -151,8 +151,8 @@ fn hidden_far_teleport_stays_suppressed() {
     assert!(out.is_empty());
 }
 
-/// A LONE keystroke keeps the classic crisp wake: no chain floor applies (the
-/// burst-opening gap is infinite), so everything is fully dark ~500ms later.
+/// A lone keystroke keeps the classic crisp wake: no chain floor applies (the
+/// burst-opening gap is infinite), so everything is fully dark ~500 ms later.
 #[test]
 fn lone_key_wake_fades_crisply() {
     let mut glow = CursorGlow::default();
@@ -207,7 +207,6 @@ fn every_style_keeps_the_invariants() {
         glow.tick(Some((1, 38)), t0, &c, g, &mut out);
         assert!(!out.is_empty(), "{style:?}: expected light on a jump");
         assert_invariants(&out, g);
-        // animate a couple frames
         for ms in [16u64, 80, 160] {
             glow.tick(
                 Some((1, 38)),

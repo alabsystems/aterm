@@ -1,19 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A first-party HTTP/1.1 client for aterm's LLM title-summary worker: one
-//! JSON POST to a chat-completions endpoint, usually a loopback Ollama.
+//! A first-party HTTP/1.1 client for aterm: one bounded request at a time to
+//! an endpoint the caller names, over TCP or TLS the platform verifies.
+//!
+//! Two callers use it. The supervisor's network probe (`aterm-gui`'s
+//! `harness_netprobe`) opens a [`stream::Stream`] and completes a
+//! platform-verified TLS handshake under one [`Deadline`]. The dev-only
+//! real-Claude lab (`aterm-lab`'s stub) drives its loopback API stand-in with
+//! [`Client`] over plain HTTP. The request/response half was written for the
+//! LLM title-summary worker, retired with Smart Titles on 2026-10-15; its docs
+//! say what a caller gets, not who calls it.
 //!
 //! # Trust
 //!
 //! HTTPS endpoints are checked against the OPERATING SYSTEM's trust store,
-//! never a root set baked into the binary. TLS cannot be dropped for
-//! loopback-only plaintext: the `OpenAiCompatible` provider takes an
-//! operator-configured endpoint, and the bearer-token file, CA-bundle override
-//! and proxy handling exist to reach a remote HTTPS service. [`verifier`] makes
-//! the OS calls itself (`SecTrustEvaluateWithError` on macOS,
-//! `CertGetCertificateChain` on Windows, the distro CA store plus `rustls`'s
-//! webpki on Linux).
+//! never a root set baked into the binary, so an endpoint is reached the way
+//! the OS would reach it; a caller that names its own CA bundle
+//! ([`Trust::Roots`]) REPLACES the platform roots rather than adding to them.
+//! [`verifier`] makes the OS calls itself (`SecTrustEvaluateWithError` on
+//! macOS, `CertGetCertificateChain` on Windows, the distro CA store plus
+//! `rustls`'s webpki on Linux).
 //!
 //! # Shape
 //!
@@ -33,9 +40,9 @@
 //! # What it deliberately does NOT do
 //!
 //! No redirect following (a followed redirect is how a bearer token reaches a
-//! host the operator never named), no connection pool, no HTTP/2, no cookie
-//! jar, and no automatic decompression. One bounded worker making one call at
-//! a time needs none of it, and each would be another place for a response to
+//! host the caller never named), no connection pool, no HTTP/2, no cookie
+//! jar, and no automatic decompression. A caller making one bounded call at a
+//! time needs none of it, and each would be another place for a response to
 //! influence where the next request goes.
 
 pub mod client;

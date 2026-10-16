@@ -3,18 +3,15 @@
 
 use super::CandidateExitWatch;
 
-/// The orphan's gate: the write end of a pipe the orphan blocks on before its
-/// script's first command, so a caller can attach its [`CandidateExitWatch`] to a
-/// process that is provably still there (a timed sleep would race launchd's reap
-/// under load).
+/// The orphan's gate: the write end of a pipe the orphan blocks on before its script, so a
+/// caller can attach its [`CandidateExitWatch`] to a process provably still there (a timed
+/// sleep would race launchd's reap under load).
 ///
-/// The gate is a per-test pipe, CLOEXEC on both ends, but on Darwin
-/// [`make_cloexec_pipe`](super::make_cloexec_pipe) sets CLOEXEC after `pipe()`,
-/// so a sibling's fork can carry a copy of either end. That is tolerated: a
-/// carried read end is never read, and [`OrphanGate::release`] writes a newline
-/// rather than closing to EOF. The orphan waits on descriptor 3
-/// (`read -r go <&3`), since a non-interactive shell points a background job's
-/// stdin at `/dev/null`, and bash, dash and zsh leave descriptor 3 alone.
+/// On Darwin [`make_cloexec_pipe`](super::make_cloexec_pipe) sets CLOEXEC after `pipe()`, so
+/// a sibling test's fork can carry a copy of either end; hence [`OrphanGate::release`] writes
+/// a newline rather than closing to EOF. The orphan reads descriptor 3 (`read -r go <&3`),
+/// which bash, dash and zsh leave alone, because a non-interactive shell points a background
+/// job's stdin at `/dev/null`.
 struct OrphanGate(std::os::fd::OwnedFd);
 
 impl OrphanGate {
@@ -213,20 +210,17 @@ fn a_starved_candidate_on_the_launched_lane_takes_the_retry_lane() {
     );
 }
 
-/// An exit not witnessed before the lane acted, recovered after the candidate is
-/// provably gone. A launched candidate without a readable birth stamp is
-/// `Unwitnessed` and is signalled nothing, so the termination proof waits it
-/// out and the witness is read after; sound for an exit code, since SIGKILL
-/// never yields `WIFEXITED`. Without that second read this would be
-/// `Unobserved`.
+/// An exit not witnessed before the lane acted is recovered once the candidate is provably
+/// gone: an `Unwitnessed` candidate (no birth stamp) is signalled nothing, the termination
+/// proof waits it out, and the witness is read after. Sound for an exit code, since SIGKILL
+/// never yields `WIFEXITED`.
 #[test]
 fn an_exit_the_parent_did_not_see_coming_is_still_recovered_after_the_wait() {
     use super::{HandoffCandidate, HandoffCandidateHandle, observe_candidate_death};
 
     let (refusing, gate) = spawn_orphan("exit 0");
     let watch = CandidateExitWatch::watch(refusing).expect("the candidate is alive");
-    // A bare pid has no birth stamp, so nothing is signalled and the candidate
-    // reaches its own `exit`.
+    // A bare pid has no birth stamp, so nothing is signalled.
     let candidate = HandoffCandidate::from_bare_pid(refusing);
     let mut handle = HandoffCandidateHandle::Launched(Some(watch));
     // The gate is still shut, so the orphan cannot have reached its `exit`.

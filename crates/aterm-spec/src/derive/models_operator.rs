@@ -145,7 +145,7 @@ pub fn operator_event_delivery_model() -> Model {
                 stale_regression = if Buggy == 1 { 1 } else { stale_regression };
             }
 
-            invariant Bounds:
+            bound Bounds:
                 phase <= 5 && token <= TokenCap && next_token <= TokenCap &&
                 stale_token <= TokenCap && expired <= 1 &&
                 redeliveries <= RedeliveryCap && escalated <= 1 &&
@@ -454,7 +454,7 @@ pub fn operator_resync_cursor_model() -> Model {
                 cursor_seq = cursor_seq;
             }
 
-            invariant Bounds:
+            bound Bounds:
                 source_epoch <= MaxEpoch && cursor_epoch <= MaxEpoch &&
                 snapshot_epoch <= MaxEpoch && source_seq <= MaxSeq && cursor_seq <= MaxSeq &&
                 silent_loss <= 1;
@@ -554,7 +554,7 @@ pub fn operator_leadership_model() -> Model {
                 stale_accepted = if Buggy == 1 { 1 } else { stale_accepted };
             }
 
-            invariant Bounds:
+            bound Bounds:
                 a_live <= 1 && b_live <= 1 && epoch <= MaxEpoch &&
                 a_epoch <= MaxEpoch && b_epoch <= MaxEpoch &&
                 stale_epoch <= MaxEpoch && accepted_epoch <= MaxEpoch &&
@@ -702,7 +702,7 @@ pub fn operator_fleet_fault_model() -> Model {
                 blocked_egress = if Buggy == 1 { 1 } else { blocked_egress };
             }
 
-            invariant Bounds:
+            bound Bounds:
                 phase <= 4 && marker <= 1 && pending <= Managed &&
                 in_doubt <= 1 && actions <= 1 && blocked_egress <= 1;
             invariant MarkerOwnsEveryBlockedPhase:

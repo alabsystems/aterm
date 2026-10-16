@@ -1,28 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The CONNECTION MAP overlay (design §5.2): the whole instance's session-
-//! connection fabric on one card — sessions as chips grouped by window, one
-//! labeled arrow per flow direction (`pushes` when a write-class op is present,
-//! `pulls` when read-only), live lease/watcher annotations, and a keyboard
-//! selection model (chips raise, connections disconnect behind an inline
-//! confirm, Esc closes).
+//! The connection map overlay: the whole instance's session-connection fabric on one card —
+//! sessions as chips grouped by window, one labeled arrow per flow direction (`pushes` when a
+//! write-class op is present, `pulls` when read-only), live lease/watcher annotations, and a
+//! keyboard selection model (chips raise, connections disconnect behind an inline confirm, Esc
+//! closes).
 //!
-//! PURE like the palette/picker: the App glue ([`crate::app_connection_map`])
-//! snapshots groups + flows from the ONE edge fold ([`crate::connections::
-//! all_edges`] — never a second aggregation) and stamps the live annotations
-//! from the `who` verb's seam at paint time; this module owns only layout,
-//! selection, and paint. Lives in the single modal [`crate::overlay::Overlay`]
-//! slot, so its keys are structurally gated BEFORE the terminal.
+//! Pure like the palette/picker: the App glue ([`crate::app_connection_map`]) snapshots groups +
+//! flows from the one edge fold ([`crate::connections::all_edges`], never a second aggregation)
+//! and stamps the live annotations from the `who` verb's seam at paint time; this module owns
+//! only layout, selection and paint. It lives in the single modal [`crate::overlay::Overlay`]
+//! slot, so its keys are gated before the terminal.
 //!
-//! ## The layered projection (§5.2, REJECTED-11 stands)
-//!
-//! When the PUSH subgraph is acyclic, window groups are ordered so pushers sit
-//! above pushed — each session's level is its LONGEST push-path depth (a
-//! general DAG walk: a session pushed from two chains sits below both, never
-//! assume a tree), and a group sinks to its deepest member. A push cycle keeps
-//! the plain grouped layout — drawn honestly, never forced into layers. Pull
-//! arrows never constrain the layering (observation has no "above").
+//! When the push subgraph is acyclic, window groups are ordered so pushers sit above pushed:
+//! each session's level is its longest push-path depth (a general DAG walk; a session pushed
+//! from two chains sits below both), and a group sinks to its deepest member. A push cycle keeps
+//! the plain grouped layout. Pull arrows never constrain the layering.
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -48,8 +42,8 @@ const MAX_CARD_WIDTH: f32 = 760.0;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MapChip {
     pub sid: SessionId,
-    /// Registry local id — `None` for a FOREIGN sid (a wire-granted src no
-    /// local session owns, the §4.1 honesty rule): listed, but not raisable.
+    /// Registry local id, `None` for a foreign sid (a wire-granted src no local session owns):
+    /// listed, but not raisable.
     pub local_id: Option<u64>,
     /// Display title: user meta title ▸ registry title (the fleet-glance rung).
     pub title: String,
@@ -63,8 +57,7 @@ pub(crate) struct MapGroup {
     pub chips: Vec<MapChip>,
 }
 
-/// One directed flow arrow `src → dst` — one arrow PER DIRECTION, so a peer
-/// pair `A ⇆ B` is two arrows (drawn honestly, §5.2).
+/// One directed flow arrow `src → dst`, one per direction, so a peer pair `A ⇆ B` is two arrows.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MapFlow {
     pub src: SessionId,
@@ -82,9 +75,8 @@ impl MapFlow {
     }
 }
 
-/// Live per-session annotation, re-read from the `who` seam (turn lease +
-/// subscriber registry) at PAINT TIME — liveness has no wake funnel (§5.1),
-/// so it is exactly as fresh as the most recent paint, never fresher.
+/// Live per-session annotation, re-read from the `who` seam (turn lease + subscriber registry)
+/// at paint time: liveness has no wake funnel, so it is exactly as fresh as the latest paint.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub(crate) struct MapAnnotation {
     /// The live turn-lease holder (`who`'s `driving=` token), `None` when idle.
@@ -109,8 +101,8 @@ pub(crate) enum MapActivation {
     None,
     /// A chip: raise the session (its registry local id when hosted here).
     Raise(Option<u64>, SessionId),
-    /// A flow with NO armed confirm: arm the inline confirm (the same
-    /// two-step Delete takes — activation never disconnects un-confirmed).
+    /// A flow with no armed confirm: arm the inline confirm (the same two-step
+    /// Delete takes; activation never disconnects unconfirmed).
     Armed,
     /// A flow whose inline confirm was armed: dissolve `src → dst`.
     Disconnect(SessionId, SessionId),
@@ -134,11 +126,9 @@ enum MapLine {
     Empty,
 }
 
-/// Longest-path level per push-graph node — `None` when the push subgraph is
-/// CYCLIC (the §5.2 fallback signal). Kahn's topological order with a
-/// max-of-parents DP: a node reachable along two chains takes the LONGER one
-/// (multi-parent DAGs are first-class; never assume a tree). Self-loops never
-/// reach here (§1.5 filters them at the fold).
+/// Longest-path level per push-graph node, `None` when the push subgraph is cyclic (the
+/// plain-layout fallback). Kahn's topological order with a max-of-parents DP: a node reachable
+/// along two chains takes the longer one. Self-loops never reach here (the fold filters them).
 pub(crate) fn push_levels(flows: &[MapFlow]) -> Option<HashMap<String, usize>> {
     let mut nodes: Vec<&str> = Vec::new();
     let mut index: HashMap<&str, usize> = HashMap::new();
@@ -183,11 +173,10 @@ pub(crate) fn push_levels(flows: &[MapFlow]) -> Option<HashMap<String, usize>> {
     )
 }
 
-/// Order `groups` for the §5.2 layered projection: pushers above pushed by
-/// longest-path level, a group keyed by its DEEPEST member (the deepest pushed
-/// session drags its window below every pusher chain feeding it), stable
-/// within a level. Returns whether the layered order applied — `false` (order
-/// untouched) when the push subgraph is cyclic.
+/// Order `groups` for the layered projection: pushers above pushed by longest-path level, a
+/// group keyed by its deepest member (so it sinks below every pusher chain feeding it), stable
+/// within a level. Returns whether the layered order applied: `false` (order untouched) when the
+/// push subgraph is cyclic.
 pub(crate) fn order_groups(groups: &mut [MapGroup], flows: &[MapFlow]) -> bool {
     let Some(levels) = push_levels(flows) else {
         return false;
@@ -223,9 +212,9 @@ pub(crate) struct ConnectionMapState {
     annotations: BTreeMap<String, MapAnnotation>,
     /// Cursor over [`Self::items`].
     selected: usize,
-    /// Scroll over BODY LINES (headers included), clamped by moves.
+    /// Scroll over body lines (headers included), clamped by moves.
     scroll: usize,
-    /// The flow ITEM index whose inline disconnect confirm is armed.
+    /// The flow item index whose inline disconnect confirm is armed.
     confirm: Option<usize>,
     /// Exact item index under the pointer (the palette's distinct rule).
     pointer_over: Option<usize>,
@@ -324,8 +313,8 @@ impl ConnectionMapState {
         self.items().get(self.selected).copied()
     }
 
-    /// A chip's directional roles from THIS snapshot's arrows — the same
-    /// §4.1 vocabulary the tab mark renders (`▲` out, `▽` in, `⧗` both).
+    /// A chip's directional roles from this snapshot's arrows, in the tab mark's vocabulary
+    /// (`▲` out, `▽` in, `⧗` both).
     fn roles_glyph(&self, sid: &SessionId) -> &'static str {
         let outbound = self.flows.iter().any(|f| f.src == *sid);
         let inbound = self.flows.iter().any(|f| f.dst == *sid);
@@ -360,7 +349,7 @@ impl ConnectionMapState {
         s
     }
 
-    /// A flow's display line; the armed inline confirm renders IN the row.
+    /// A flow's display line; the armed inline confirm renders in the row.
     fn flow_text(&self, item: usize, flow: &MapFlow) -> String {
         let mut s = format!(
             "@{} \u{2500}{}\u{2192} @{}",
@@ -406,10 +395,9 @@ impl ConnectionMapState {
         }
     }
 
-    /// Replace the graph snapshot (the §2.4 freshness funnel: an authority
-    /// act recomposes the OPEN map immediately). Selection and the armed
-    /// confirm survive BY IDENTITY — a disconnect elsewhere must not silently
-    /// re-aim either at whatever inherited the ordinal.
+    /// Replace the graph snapshot (an authority act recomposes the open map at once). Selection
+    /// and the armed confirm survive by identity, so a disconnect elsewhere never re-aims either
+    /// at whatever inherited the ordinal.
     pub(crate) fn retarget(&mut self, mut groups: Vec<MapGroup>, flows: Vec<MapFlow>) {
         let keep_selected = self.identity(self.selected);
         let keep_confirm = self.confirm.and_then(|idx| self.identity(idx));
@@ -439,8 +427,8 @@ impl ConnectionMapState {
         self.clamp_scroll();
     }
 
-    /// Move the cursor over the items (wrapping); movement CANCELS an armed
-    /// confirm — walking away from the row is the keyboard's "keep".
+    /// Move the cursor over the items (wrapping); movement cancels an armed
+    /// confirm: walking away from the row is the keyboard's "keep".
     pub(crate) fn move_selection(&mut self, delta: isize) {
         self.pointer_over = None;
         self.pointer_armed = None;
@@ -457,7 +445,7 @@ impl ConnectionMapState {
     }
 
     /// Move the cursor to item `idx` (a11y Focus / pointer land here). A move
-    /// to a DIFFERENT item cancels the armed confirm, same as the arrows.
+    /// to a different item cancels the armed confirm, same as the arrows.
     pub(crate) fn select(&mut self, idx: usize) {
         let n = self.items().len();
         if n == 0 {
@@ -501,9 +489,9 @@ impl ConnectionMapState {
         self.scroll = self.scroll.min(total.saturating_sub(body));
     }
 
-    /// The Delete/Backspace press: on a flow row, arm the inline confirm, or —
-    /// already armed on THIS row — resolve to the disconnect pair. Chips (and
-    /// an empty map) do nothing: Delete only ever dissolves a connection.
+    /// The Delete/Backspace press: on a flow row, arm the inline confirm, or (already armed on
+    /// this row) resolve to the disconnect pair. Chips and an empty map do nothing: Delete only
+    /// ever dissolves a connection.
     pub(crate) fn delete_pressed(&mut self) -> Option<(SessionId, SessionId)> {
         let MapItem::Flow { flow } = self.selected_item()? else {
             return None;
@@ -538,7 +526,7 @@ impl ConnectionMapState {
         }
     }
 
-    /// The Esc press: an armed confirm is cancelled (the map STAYS open);
+    /// The Esc press: an armed confirm is cancelled (the map stays open);
     /// otherwise the map closes. Returns `true` to close.
     pub(crate) fn escape(&mut self) -> bool {
         if self.confirm.is_some() {
@@ -568,8 +556,8 @@ impl ConnectionMapState {
         changed
     }
 
-    /// Settle a left release: `(changed, activate)` — activation requires the
-    /// SAME item at press and release.
+    /// Settle a left release: `(changed, activate)`; activation requires the
+    /// same item at press and release.
     pub(crate) fn pointer_release(&mut self, idx: Option<usize>) -> (bool, bool) {
         let mut changed = self.pointer_hover(idx);
         let armed = self.pointer_armed.take();
@@ -594,8 +582,8 @@ impl ConnectionMapState {
         (self.scroll, total, total.min(MAX_BODY_LINES))
     }
 
-    /// Machine-readable lines for `controls connections` — the SAME rows the
-    /// card paints, so screen == introspection (§5.3 gates the read).
+    /// Machine-readable lines for `controls connections`: the same rows the
+    /// card paints, so screen == introspection.
     pub(crate) fn controls_lines(&self) -> Vec<String> {
         let sessions: usize = self.groups.iter().map(|g| g.chips.len()).sum();
         let mut out = vec![format!(
@@ -694,7 +682,7 @@ impl ConnectionMapState {
         a11y_epoch_from(h.finish())
     }
 
-    /// Decode a node minted by the CURRENT epoch to its item index.
+    /// Decode a node minted by the current epoch to its item index.
     #[cfg(a11y_tree)]
     pub(crate) fn a11y_item_index(&self, node: accesskit::NodeId) -> Option<usize> {
         a11y_slot_for(self.a11y_epoch(), node, self.items().len())
@@ -728,7 +716,7 @@ fn map_layout(state: &ConnectionMapState, g: &SettingsGeom) -> MapLayout {
     }
 }
 
-/// Exact painted selection/hit rectangle for one VISIBLE body slot.
+/// Exact painted selection/hit rectangle for one visible body slot.
 fn map_row_rect_in(
     layout: &MapLayout,
     g: &SettingsGeom,
@@ -770,7 +758,7 @@ pub(crate) fn map_item_hit(
 
 /// Paint the map: title + counts, the grouped chip/arrow band (cursor
 /// washed+ringed; the armed confirm ringed in the danger role), a key-hint
-/// footer. PURE.
+/// footer. Pure.
 pub(crate) fn map_tray(state: &ConnectionMapState, g: &SettingsGeom, theme: Theme) -> TrayInput {
     let r = Roles::from_theme(theme);
     let (cw, ch, px) = (g.cw, g.ch, g.font_px);
@@ -924,8 +912,8 @@ mod tests {
         }
     }
 
-    /// Longest-path leveling handles a DIAMOND (multi-parent DAG — never
-    /// assume a tree): the join node takes the LONGER chain's depth.
+    /// Longest-path leveling handles a diamond (a multi-parent DAG): the join
+    /// node takes the longer chain's depth.
     #[test]
     fn push_levels_layers_an_acyclic_graph_by_longest_path() {
         // a → b → d and a → c → d, plus a → d directly: d's level is 2, not 1.
@@ -941,12 +929,12 @@ mod tests {
         assert_eq!(levels["b"], 1);
         assert_eq!(levels["c"], 1);
         assert_eq!(levels["d"], 2);
-        // Pull arrows never constrain the layering — a pull CYCLE still levels.
+        // Pull arrows never constrain the layering: a pull cycle still levels.
         let with_pulls = vec![push("a", "b"), pull("b", "a"), pull("a", "b")];
         assert!(push_levels(&with_pulls).is_some());
     }
 
-    /// A push cycle yields `None` — the §5.2 fallback to the plain layout.
+    /// A push cycle yields `None`: the fallback to the plain layout.
     #[test]
     fn push_levels_refuses_a_cycle() {
         assert!(push_levels(&[push("a", "b"), push("b", "a")]).is_none());
@@ -954,8 +942,8 @@ mod tests {
     }
 
     /// The layered projection orders window groups pushers-above-pushed (a
-    /// group keyed by its DEEPEST member) and keeps the given order — flagged
-    /// honestly — on a push cycle.
+    /// group keyed by its deepest member) and keeps the given order, flagged,
+    /// on a push cycle.
     #[test]
     fn order_groups_layers_pushers_above_pushed_and_falls_back_on_cycle() {
         // Given in "wrong" order: the pushed window listed first.
@@ -992,8 +980,8 @@ mod tests {
         assert_eq!(cyclic[1].label, "two");
     }
 
-    /// A peer pair `A ⇆ B` is TWO labeled arrows — one per direction, each
-    /// labeled from ITS OWN op fold (§5.2 draws peers honestly).
+    /// A peer pair `A ⇆ B` is two labeled arrows, one per direction, each
+    /// labeled from its own op fold.
     #[test]
     fn peer_pair_lists_one_labeled_arrow_per_direction() {
         let state = ConnectionMapState::new(
@@ -1031,7 +1019,7 @@ mod tests {
         assert_eq!(both, 2, "both endpoints render the peer glyph");
     }
 
-    /// Navigation wraps over chips THEN flows; Delete on a flow arms the
+    /// Navigation wraps over chips then flows; Delete on a flow arms the
     /// inline confirm, a second Delete resolves it, and moving away cancels.
     #[test]
     fn selection_walks_chips_then_flows_and_delete_two_steps() {
@@ -1064,7 +1052,7 @@ mod tests {
         // Wrap: item 0 again after 3 more moves over 3 items.
         state.move_selection(3);
         assert_eq!(state.activate(), MapActivation::Raise(Some(1), sid("a")));
-        // Enter on an unarmed flow ARMS (never disconnects unconfirmed); Esc
+        // Enter on an unarmed flow arms (never disconnects unconfirmed); Esc
         // cancels the confirm and only a second Esc closes.
         state.move_selection(2);
         assert_eq!(state.activate(), MapActivation::Armed);
@@ -1078,7 +1066,7 @@ mod tests {
         );
     }
 
-    /// A graph refresh keeps selection and the armed confirm BY IDENTITY, and
+    /// A graph refresh keeps selection and the armed confirm by identity, and
     /// drops the confirm with its flow.
     #[test]
     fn retarget_keeps_selection_identity_and_drops_dead_confirms() {

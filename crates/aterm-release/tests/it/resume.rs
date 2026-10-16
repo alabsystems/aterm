@@ -1877,12 +1877,29 @@ fn cli_parses_the_whole_spec_5_surface() {
     assert_eq!(parse(&[]).unwrap(), cli::Cmd::Help);
     assert_eq!(parse(&["--help"]).unwrap(), cli::Cmd::Help);
     assert_eq!(parse(&["status"]).unwrap(), cli::Cmd::Status);
-    assert_eq!(parse(&["check"]).unwrap(), cli::Cmd::Check { commit: None });
+    // `ship check`: every section unless some are named; --export is the narrow entry
+    // `verify export` runs.
+    let check = |args: &[&str]| match parse(args) {
+        Ok(cli::Cmd::Check(opts)) => opts,
+        other => panic!("{args:?} parsed as {other:?}"),
+    };
+    let bare = check(&["check"]);
+    assert_eq!(bare, crate::release_steps::CheckOptions::default());
+    assert_eq!(bare.sections(), (true, true, true));
+    let named = check(&[
+        "check",
+        "--commit",
+        "f37ddc740",
+        "--engine",
+        "/e",
+        "--export",
+    ]);
+    assert_eq!(named.commit.as_deref(), Some("f37ddc740"));
+    assert_eq!(named.engine.as_deref(), Some(std::path::Path::new("/e")));
+    assert_eq!(named.sections(), (false, true, false));
     assert_eq!(
-        parse(&["check", "--commit", "f37ddc740"]).unwrap(),
-        cli::Cmd::Check {
-            commit: Some("f37ddc740".to_string())
-        }
+        check(&["check", "--cut", "--wasm32"]).sections(),
+        (true, false, true)
     );
     // The one release command: its flags, the Linux declaration carried, and the two
     // names for a release commit refused together.
@@ -2234,7 +2251,11 @@ fn cli_rejects_malformed_and_conflicting_invocations() {
             "--release-credentials given twice",
         ),
         (vec!["status", "extra"], "no arguments"),
-        (vec!["check", "extra"], "check takes only --commit"),
+        (
+            vec!["check", "extra"],
+            "check takes --commit <REV>, --engine <DIR>",
+        ),
+        (vec!["check", "--engine"], "--engine needs a directory"),
         (vec!["check", "--commit"], "--commit needs a commit"),
         (
             vec!["check", "--commit", "--dry-run"],
@@ -2364,9 +2385,9 @@ fn a_failure_that_names_its_verdict_is_not_prefixed_with_failed() {
     for own in [
         "NOT DONE — 1 waiting: the certificate errand is at Apple",
         "CHECK ONLY — nothing was written. 1 waiting: the certificate errand is at Apple.",
-        "tools/verify.sh --full COULD NOT RUN — nothing was decided about the tree",
-        "tools/trust-gate-all.sh NARROWED: this machine cannot verify every library",
-        "tools/verify.sh --full FAILED — fix the tree; nothing was claimed or committed",
+        "`verify release` COULD NOT RUN — nothing was decided about the tree",
+        "the trust lane NARROWED: this machine cannot verify every library",
+        "`verify release` FAILED — fix the tree; nothing was claimed or committed",
     ] {
         assert_eq!(cli::failure_line(own), format!("aterm-release: {own}"));
     }

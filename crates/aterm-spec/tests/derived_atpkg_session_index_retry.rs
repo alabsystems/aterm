@@ -6,11 +6,6 @@ use aterm_spec::{derive::atpkg_session_index_retry_model, interp, verify};
 #[test]
 fn same_build_retries_wait_longer_but_a_newer_build_bypasses_them() {
     let model = atpkg_session_index_retry_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name)
-    );
     verify::prove_and_catch_scalar(&model, "atpkg session index retry");
 
     let mut s = model.init_state();

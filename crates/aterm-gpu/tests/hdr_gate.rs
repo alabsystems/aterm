@@ -7,24 +7,22 @@
 //!
 //! * Tier-0: the `HdrPresentGate` model
 //!   (`aterm_spec::derive::hdr_present_gate_model`) carries `SdrInvariance`,
-//!   `BoostNeedsLinearF16` and `F16NeedsSupport`, proved and mutation-caught
-//!   by `derived_hdr_present_gate_proves_and_catches_hdr_without_optin` in
-//!   aterm-spec.
+//!   `BoostNeedsLinearF16` and `F16NeedsSupport`, proved and mutation-caught in
+//!   aterm-spec (`derived_hdr_present_gate_proves_and_catches_hdr_without_optin`).
 //! * Tier-1 (this file): [`aterm_gpu::hdr_swapchain_wants_f16`] (attach) and
-//!   [`aterm_gpu::hdr_present_plan`] (present) have finite boolean domains,
-//!   so every attach-to-present chain and every raw plan input (including
-//!   live config-flip states) is enumerated, with non-vacuity controls. The
-//!   macOS Metal attach uses [`aterm_gpu::hdr_swapchain_wants_f16_on_screen`],
-//!   which implies the base gate for every input, and the live re-pick
-//!   ([`aterm_gpu::hdr_screen_upgrade_wants_f16`]) implies that in turn, so
-//!   this enumeration bounds them.
+//!   [`aterm_gpu::hdr_present_plan`] (present) have finite boolean domains, so
+//!   every attach-to-present chain and every raw plan input is enumerated, with
+//!   non-vacuity controls. The macOS Metal attach
+//!   ([`aterm_gpu::hdr_swapchain_wants_f16_on_screen`]) implies the base gate,
+//!   and the live re-pick ([`aterm_gpu::hdr_screen_upgrade_wants_f16`]) implies
+//!   that, so this enumeration bounds them.
 //!
 //! ## On-GPU clamp laws
 //!
 //! The `gpu_*` tests drive the real `fs_blit` `hdr` arm and HDR aurora pass
 //! through `present_hdr_for_test` (an `Rgba16Float` stand-in, half-float
 //! readback) and check the laws `aterm_render::hdr` proves abstractly:
-//! (1) grid clamp: the non-additive stream never exceeds 1.0 and equals the
+//! (1) grid clamp: the non-additive stream stays within 1.0 and equals the
 //! linear decode of the SDR readback within f16 quantization;
 //! (2) additive clamp: with the aurora pass on, no channel exceeds the
 //! sanitized EDR max, and some channel exceeds 1.0.
@@ -79,7 +77,7 @@ fn hdr_gate_exhaustive_attach_present_chain() {
             !plan.glow_boost_pass || (plan.blit_linear_encode && is_f16),
             "({hdr_glow},{supports_f16},{glow}): boost without a linear f16 blit"
         );
-        // The encode follows the SURFACE, exactly.
+        // The encode follows the surface.
         assert_eq!(
             plan.blit_linear_encode, is_f16,
             "({hdr_glow},{supports_f16},{glow}): encode must track the actual format"
@@ -87,7 +85,7 @@ fn hdr_gate_exhaustive_attach_present_chain() {
         boosted += usize::from(plan.glow_boost_pass);
         f16_chosen += usize::from(is_f16);
     }
-    // NON-VACUITY: the invariants above must not hold because the gate is dead.
+    // Non-vacuity: the gate is live, so the invariants above are not vacuous.
     assert_eq!(f16_chosen, 2, "f16 is chosen iff hdr_glow AND supports_f16");
     assert_eq!(
         boosted, 1,
@@ -108,26 +106,12 @@ fn hdr_gate_exhaustive_attach_present_chain() {
 /// after a same-size Windows HDR change: drive `hdr_reconfigure_plan`, project
 /// onto the model, and require the modeled successor for both re-tag outcomes.
 ///
-/// THE PLANNER HALF. This file can only reach `hdr_reconfigure_plan`, which
-/// decides; the metadata each decision must actually apply lives on
-/// `WindowGpu::apply_hdr_reconfigure_plan` / `apply_hdr_surface_upgrade`, both
-/// private. So the other half of the `HdrReconfigureRetag` binding — the one
-/// that drives those applies on a real window and reads `capture_linear` back
-/// off them rather than off the plan the test already holds — is the in-crate
-/// `renderer::tests::hdr_reconfigure_apply_conforms_to_retag_model`. Every
-/// action of the machine is `#[refines]`-anchored on both halves; neither alone
-/// is the binding. Widening `WindowGpu`'s API with two HDR metadata mutators
-/// purely to pull that test in here is the trade that was deliberately refused.
-///
-/// Neither half can reach the `GpuSurface`, so the model's remaining two
-/// surface-side obligations — installing the resolved format, and the
-/// `if surf.is_hdr()` guard that separates `UpgradeSucceeds` from
-/// `UpgradeFails` — are held by ORDER, in
-/// [`every_live_surface_reconfigure_routes_through_hdr_recovery`] below. That is
-/// a source-order gate, NOT a `#[refines]` anchor: it witnesses no state, so it
-/// is deliberately not counted as a third half.
-/// `aterm_spec::derive::hdr_reconfigure_retag_model` carries the per-variable
-/// accounting of which instrument holds what.
+/// This is the planner half of the `HdrReconfigureRetag` binding. The apply half
+/// is the in-crate `renderer::tests::hdr_reconfigure_apply_conforms_to_retag_model`
+/// (the applies are private), and the surface-side obligations are held by
+/// source order in [`every_live_surface_reconfigure_routes_through_hdr_recovery`].
+/// `aterm_spec::derive::hdr_reconfigure_retag_model` documents which instrument
+/// holds what.
 #[test]
 fn hdr_reconfigure_retag_policy_conforms_and_old_ignore_failure_is_rejected() {
     let model = hdr_reconfigure_retag_model();
@@ -324,28 +308,19 @@ fn hdr_live_upgrade_gate_is_complete_and_hot_reloadable() {
     );
 }
 
-/// Bind the generic reconfigure policy above to every existing-surface call
-/// site. Initial attach configures a fresh local `surface` and has its own
-/// immediate tag/fallback gate; once a `GpuSurface` is live, direct
-/// `surf.surface.configure` is permitted only inside the shared transaction.
-/// Present also performs exactly one bounded reconciliation for same-size
-/// Windows HDR toggles in either direction, which need not produce a surface
-/// lifecycle event.
+/// Binds the reconfigure policy above to every existing-surface call site.
+/// Initial attach configures a fresh local `surface` with its own tag/fallback
+/// gate; once a `GpuSurface` is live, `surf.surface.configure` is permitted only
+/// inside the shared transaction. Present also runs one bounded reconciliation
+/// for same-size Windows HDR toggles, which need not produce a surface event.
 ///
-/// This intentionally scans source rather than mocking wgpu: the regression was
-/// a call-site omission, and neither CI nor non-Windows unit tests can force the
-/// DX12 swapchain recreation that clears the colour-space tag.
-///
-/// For the same reason this test also carries the SURFACE-SIDE obligations of
-/// the `HdrReconfigureRetag` binding — by order, not by anchor, since a source
-/// scan witnesses no state. The two model-bound conformance tests project
-/// a `WindowGpu`, which never sees the surface, so two obligations reach no
-/// projection at all: `FallbackToSdr` must install the retained SDR format
-/// before it flips capture metadata (`is_f16` in the projection is the planner's
-/// answer, not a read-back), and the live upgrade must publish extended-linear
-/// metadata only if configure+tag actually left an f16 surface. Both are pinned
-/// below as ORDER within their region — a weaker instrument than a projection,
-/// named as such rather than left implied by a green anchor count.
+/// A source scan rather than a wgpu mock: no unit test off Windows can force the
+/// DX12 swapchain recreation that clears the colour-space tag. For the same
+/// reason it holds the surface-side obligations of the `HdrReconfigureRetag`
+/// binding, by order (a source scan witnesses no state): `FallbackToSdr`
+/// installs the retained SDR format before it flips capture metadata, and the
+/// live upgrade publishes extended-linear metadata only if configure+tag left an
+/// f16 surface.
 #[test]
 fn every_live_surface_reconfigure_routes_through_hdr_recovery() {
     let source = include_str!("../src/renderer.rs");
@@ -397,11 +372,10 @@ fn every_live_surface_reconfigure_routes_through_hdr_recovery() {
         "post-configure and same-size live validation must share one recovery decision"
     );
 
-    // THE FORMAT HALF of every `HdrReconfigureRetag` transition. The in-crate
-    // conformance reads `capture_linear` back off the window, but `is_f16` there
-    // is the PLANNER's resolved format: the configure that actually installs it
-    // lives on the `GpuSurface`, here, behind a DX12 swapchain recreation no unit
-    // test can force. So the atomic fallback is held by order, not by projection.
+    // The format half of every `HdrReconfigureRetag` transition. The in-crate
+    // conformance reads `capture_linear` back off the window, but its `is_f16` is
+    // the planner's answer: the configure that installs the format lives here on
+    // the `GpuSurface`, so the atomic fallback is held by order.
     let recovery = source
         .split_once("    fn finish_surface_color_space_recovery(")
         .expect("the shared recovery decision must remain present")
@@ -472,12 +446,10 @@ fn every_live_surface_reconfigure_routes_through_hdr_recovery() {
         "probe must precede f16 selection, which must precede shared configure+tag"
     );
 
-    // THE BRANCH that separates `UpgradeSucceeds` from `UpgradeFails`. Whether
-    // the upgrade publishes extended-linear capture metadata is decided HERE, by
-    // re-reading the surface after configure+tag — not by the planner and not by
-    // the conformance test, which selects the apply itself. Leave this guard off
-    // and a failed scRGB tag still publishes linear capture over an SDR
-    // swapchain: capture and encoding disagree, which is
+    // The branch that separates `UpgradeSucceeds` from `UpgradeFails`: re-reading
+    // the surface after configure+tag decides whether the upgrade publishes
+    // extended-linear capture metadata. Without the guard a failed scRGB tag
+    // publishes linear capture over an SDR swapchain, violating
     // `CaptureMatchesSurfaceEncoding`.
     assert_eq!(
         reconcile.matches("if surf.is_hdr() {").count(),
@@ -540,9 +512,9 @@ fn every_live_surface_reconfigure_routes_through_hdr_recovery() {
     );
 }
 
-/// A tiny glow-bearing frame: an all-background grid with a row of
-/// premultiplied LUMEN quads (the glow_parity construction), cursor hidden so
-/// the pixels are exactly bg + aurora.
+/// A tiny glow-bearing frame: an all-background grid with a row of premultiplied
+/// additive glow quads (the glow_parity construction), cursor hidden so the
+/// pixels are exactly bg + aurora.
 fn glow_input(cpu_cell: (usize, usize), rows: usize, cols: usize) -> RenderInput {
     let (cw, ch) = cpu_cell;
     let mut t = Terminal::new(rows as u16, cols as u16);
@@ -558,7 +530,7 @@ fn glow_input(cpu_cell: (usize, usize), rows: usize, cols: usize) -> RenderInput
             w: cw as u16,
             h: ch as u16,
             color: premul_rgb(base, *a),
-            // ADDITIVE light (see `GlowQuad::alpha`).
+            // Additive light (see `GlowQuad::alpha`).
             alpha: 0,
             color2: premul_rgb(base, *a),
             alpha2: 0,
@@ -567,15 +539,15 @@ fn glow_input(cpu_cell: (usize, usize), rows: usize, cols: usize) -> RenderInput
     input
 }
 
-fn gpu(px: f32) -> Option<GpuRenderer> {
+fn gpu(px: f32) -> GpuRenderer {
     // The EDR gates drive the wgpu present stand-ins (the wgpu offscreen and
     // test-hdr destinations).
-    let mut g = common::wgpu_oracle_or_skip(px, aterm_render::Theme::default())?;
+    let mut g = common::wgpu_oracle(px, aterm_render::Theme::default());
     // Deterministic expectations: the bloom halo is a separate additive layer
     // over the offscreen, orthogonal to the laws under test.
     g.set_bloom(false);
     g.set_shimmer(false);
-    Some(g)
+    g
 }
 
 /// Grid clamp on the real pipeline: with `hdr_glow` on and headroom, the blit
@@ -584,17 +556,16 @@ fn gpu(px: f32) -> Option<GpuRenderer> {
 /// quantization.
 #[test]
 fn gpu_hdr_blit_grid_clamped_and_linear() {
-    let Some(mut gpu) = gpu(18.0) else { return };
+    let mut gpu = gpu(18.0);
     gpu.set_hdr_glow(true);
     let mut win = WindowGpu::new();
     win.set_edr_max(2.0);
     let (cw, ch) = gpu.cell_size();
     let input = glow_input((cw, ch), 4, 16);
 
-    // The SDR source of truth (this also proves the readback path is UNTOUCHED
-    // by the HDR config: same bytes as every parity suite pins).
+    // The SDR readback is the source of truth.
     let sdr = gpu.render_input(&mut win, &input, None);
-    // The EDR present WITHOUT the aurora pass: pure grid stream.
+    // The EDR present without the aurora pass: the pure grid stream.
     let (hdrpix, w, h) = gpu.present_hdr_for_test(&mut win, &input, false);
     assert_eq!((w as usize, h as usize), (sdr.width, sdr.height));
 
@@ -624,14 +595,13 @@ fn gpu_hdr_blit_grid_clamped_and_linear() {
 /// encode of the theme background.
 #[test]
 fn gpu_hdr_blit_bands_take_the_reference_white_scale() {
-    let Some(mut gpu) = gpu(18.0) else { return };
+    let mut gpu = gpu(18.0);
     gpu.set_hdr_glow(true);
     let mut win = WindowGpu::new();
     win.set_edr_max(2.0);
     win.set_sdr_white_scale(3.0);
 
-    // Real content (bright white text) so the scale has something above 1.0 to
-    // lift — an all-background frame would make the non-vacuity check moot.
+    // Bright white text gives the scale something to lift above 1.0.
     let (rows, cols) = (4usize, 16usize);
     let mut t = Terminal::new(rows as u16, cols as u16);
     t.process(b"band \x1b[97mWHITE\x1b[0m fit");
@@ -678,7 +648,7 @@ fn gpu_hdr_blit_bands_take_the_reference_white_scale() {
             }
         }
     }
-    // NON-VACUITY: both arms genuinely exercised, over the whole surface.
+    // Non-vacuity: the two arms cover the whole surface.
     assert_eq!(content_px, fw * fh);
     assert_eq!(band_px, w as usize * h as usize - fw * fh);
     // f16 quantization in [2, 4) is ~2e-3 per step; GPU pow noise is well below.
@@ -686,7 +656,7 @@ fn gpu_hdr_blit_bands_take_the_reference_white_scale() {
         max_dev <= 8e-3,
         "grid + bands must be the SAME scRGB encode of their bytes (max dev {max_dev})"
     );
-    // NON-VACUITY: the scale genuinely lifts the stream above reference white.
+    // Non-vacuity: the scale lifts the stream above reference white.
     assert!(
         hdrpix.iter().any(|&v| v > 1.0),
         "a 3.0x present of white text must exceed 1.0 somewhere"
@@ -698,7 +668,7 @@ fn gpu_hdr_blit_bands_take_the_reference_white_scale() {
 /// (`edr_max = 1.0`) the output equals the pass-less present.
 #[test]
 fn gpu_hdr_aurora_bounded_by_edr_and_nonvacuous() {
-    let Some(mut gpu) = gpu(18.0) else { return };
+    let mut gpu = gpu(18.0);
     gpu.set_hdr_glow(true);
     let mut win = WindowGpu::new();
     let (cw, ch) = gpu.cell_size();
@@ -743,7 +713,7 @@ fn gpu_hdr_aurora_bounded_by_edr_and_nonvacuous() {
 /// pass off even when asked and glow exists; no channel exceeds 1.0.
 #[test]
 fn gpu_hdr_off_never_boosts() {
-    let Some(mut gpu) = gpu(18.0) else { return };
+    let mut gpu = gpu(18.0);
     gpu.set_hdr_glow(false);
     let mut win = WindowGpu::new();
     win.set_edr_max(16.0); // maximum temptation
@@ -758,20 +728,13 @@ fn gpu_hdr_off_never_boosts() {
     }
 }
 
-/// SOURCE-SCAN CLOSURE (the scRGB re-tag): every live-surface reconfigure must
-/// go through `Renderer::configure_surface_retagging_scrgb`.
-///
-/// DX12 rebuilds the swapchain on EVERY `Surface::configure`, not just a resize,
-/// and each rebuild reverts to the DXGI gamma-2.2 default colour space. A bare
-/// `surf.surface.configure(..)` at any call site therefore silently drops the
-/// scRGB tag and washes out an EDR (f16) present, with >1.0 clipped by DWM.
-///
-/// This defect was live for the composite-alpha / copyable-usage reconcile:
-/// `swapchain_usage_for(surf.copyable, win.video.is_some())` flips when a
-/// recording arms, so starting a `video` capture on an EDR window reconfigured
-/// the swapchain and lost the tag mid-session. The domain is not a value space
-/// we can enumerate, so the closure is pinned structurally here — this is a
-/// Windows/DX12 path, so it cannot be exercised on a macOS or Linux CI runner.
+/// Every live-surface reconfigure goes through
+/// `GpuRenderer::configure_surface_retagging_scrgb`. DX12 rebuilds the swapchain
+/// on every `Surface::configure` (a resize, and the composite-alpha /
+/// copyable-usage reconcile when `swapchain_usage_for` flips for a `video`
+/// capture), and each rebuild reverts to the DXGI gamma-2.2 default, so a bare
+/// configure drops the scRGB tag and washes out an f16 present. Windows-only, so
+/// pinned structurally.
 #[test]
 fn every_surface_reconfigure_retags_scrgb() {
     const RENDERER: &str = include_str!("../src/renderer.rs");
@@ -813,8 +776,8 @@ struct Mark {
     white_core: bool,
 }
 
-/// The palette, straight off the design: five white cores and the coloured
-/// company they must not drag over reference white with them.
+/// The palette: five white cores and the coloured company they must not drag
+/// over reference white with them.
 const PALETTE: &[Mark] = &[
     // The meteor's head and the landing pin.
     Mark {
@@ -948,7 +911,7 @@ fn palette_input(
             w: cw as u16,
             h: ch as u16,
             color: premul_rgb(m.rgb, m.cov),
-            // ADDITIVE light (see `GlowQuad::alpha`).
+            // Additive light (see `GlowQuad::alpha`).
             alpha: 0,
             color2: premul_rgb(m.rgb, m.cov),
             alpha2: 0,
@@ -970,7 +933,7 @@ fn palette_input(
 ///     within 3 % of the boundary.
 #[test]
 fn only_the_whitest_cores_exceed_reference_white() {
-    let Some(mut gpu) = gpu(18.0) else { return };
+    let mut gpu = gpu(18.0);
     gpu.set_hdr_glow(true);
     let mut win = WindowGpu::new();
     // A 4.0x panel: headroom 3.0 == the cap, so nothing but opaque white is
@@ -1038,8 +1001,7 @@ fn only_the_whitest_cores_exceed_reference_white() {
             lit[base]
         );
     }
-    // NON-VACUITY: the law has both kinds of mark to separate, and something
-    // really does end up over reference white.
+    // Non-vacuity: some mark ends up over reference white.
     assert!(
         over_white_cells > 0,
         "no mark reached reference white — the differential is vacuous"
@@ -1062,7 +1024,7 @@ fn only_the_whitest_cores_exceed_reference_white() {
         (lit[b], lit[b] - plain[b])
     };
     // Re-emit the gold grain at the white core's coverage so only the white
-    // part differs, then compare the RED channel both marks carry at 1.0.
+    // part differs, then compare the red channel both marks carry at 1.0.
     let mut twin = input.clone();
     twin.cursor_glow_add[gold].color = premul_rgb(PALETTE[gold].rgb, PALETTE[white].cov);
     let (twin_plain, _, _) = gpu.present_hdr_for_test(&mut win, &twin, false);
@@ -1093,7 +1055,7 @@ fn only_the_whitest_cores_exceed_reference_white() {
 /// on a non-f16 swapchain is the separate `fs_sdr_glow`.)
 #[test]
 fn an_sdr_panel_is_byte_identical() {
-    let Some(mut gpu) = gpu(18.0) else { return };
+    let mut gpu = gpu(18.0);
     gpu.set_hdr_glow(true);
     let mut win = WindowGpu::new();
     let (cw, ch) = gpu.cell_size();
@@ -1148,17 +1110,13 @@ fn an_sdr_panel_is_byte_identical() {
     );
 }
 
-/// The macOS Metal arm's attach consults the SCREEN: the f16 pick is the
-/// proven gate narrowed by `NSScreen.maximumPotentialExtendedDynamicRange‑
-/// ColorComponentValue`, so a window on an SDR-only screen gets the 8-bit
-/// swapchain, which draws the SDR glow-boost crown there, instead of an f16
-/// one that draws no crown there at all (no headroom for the aurora, and
-/// `sdr_boost_pass` is off on f16) at ~2x the full-frame blit's GPU time and
-/// drawable memory (measured on a 2017 Intel MacBook Pro). The
-/// Tier-1 chain above stays complete because the screen gate IMPLIES the
-/// proven gate for every input; the source scan pins that the shipping attach
-/// really routes through it and resolves the screen off the SAME handle as
-/// the parent layer (before `target` is moved).
+/// The macOS Metal attach consults the screen: the f16 pick is the proven gate
+/// narrowed by `NSScreen.maximumPotentialExtendedDynamicRangeColorComponentValue`,
+/// so a window on an SDR-only screen gets the 8-bit swapchain and its SDR crown,
+/// not an f16 one that draws no crown at ~2x the blit's GPU time and drawable
+/// memory. The screen gate only narrows, so the Tier-1 chain stays complete; the
+/// source scan pins that the attach resolves the screen off the parent layer's
+/// handle before the pick (and before `target` is moved).
 #[test]
 fn metal_attach_pick_is_the_proven_gate_narrowed_by_the_screen() {
     for (hdr_glow, supports_f16, _) in all_inputs() {
@@ -1199,27 +1157,16 @@ fn metal_attach_pick_is_the_proven_gate_narrowed_by_the_screen() {
     );
 }
 
-/// The LIVE half of the screen gate: a window that attached 8-bit because its
-/// screen could not show EDR is re-picked from the frontend's monitor-change
-/// hook and its throttled headroom re-query
-/// (`GpuRenderer::upgrade_surface_for_screen`). Its decision,
-/// `hdr_screen_upgrade_wants_f16`, sits INSIDE the attach gate for every
-/// input — upgrade ⇒ on-screen pick ⇒ proven gate — so the Tier-1 enumeration
-/// above still bounds everything a live window can hold; and it rides only on
-/// a positive answer (an unresolved screen upgrades nothing, where the
-/// attach's `None` keeps the unconditional pick). The source scan pins that
-/// the renderer's upgrade routes through that function, resolves the screen
-/// with the SAME reader the attach uses, moves exactly the retained format
-/// the Metal present's reconcile reads, flips the LIVE layer through that
-/// reconcile (off the present's own `want` derivation) BEFORE the capture
-/// metadata is promoted — so the frontend's scRGB tag, replayed on `true`,
-/// never lands on a layer still holding 8-bit sRGB — reads the format the
-/// layer then holds rather than trusting `Ok` (a drawable acquisition in
-/// flight on the surface's worker defers the reconfigure), and reverts the
-/// retained format when the flip is refused or deferred. It also pins that
-/// the proven gate is checked BEFORE the screen is read: the throttled
-/// re-query calls the re-pick for every 8-bit GPU window, and one that can
-/// never upgrade must not cross into AppKit.
+/// The live half of the screen gate: a window that attached 8-bit on a non-EDR
+/// screen is re-picked by `GpuRenderer::upgrade_surface_for_screen` (from the
+/// frontend's monitor-change hook and throttled headroom re-query). Its decision,
+/// `hdr_screen_upgrade_wants_f16`, implies the attach gate for every input and
+/// acts only on a resolved screen. The source scan pins the upgrade's order: the
+/// proven gate before any AppKit read, the screen read with the attach's reader,
+/// the retained format moved, the live layer flipped through the present's own
+/// reconcile before capture metadata is promoted (so the scRGB tag never lands on
+/// an 8-bit layer), the held format read back rather than trusting `Ok`, and the
+/// retained format reverted when the flip is refused or deferred.
 #[test]
 fn metal_monitor_change_upgrade_is_the_attach_gate_on_positive_evidence() {
     for (hdr_glow, supports_f16, _) in all_inputs() {
@@ -1247,7 +1194,7 @@ fn metal_monitor_change_upgrade_is_the_attach_gate_on_positive_evidence() {
                     "({hdr_glow},{supports_f16},{swapchain_is_f16}): an unresolved screen \
                      is not evidence"
                 );
-                // After an upgrade the per-frame plan follows the NEW surface.
+                // After an upgrade the per-frame plan follows the new surface.
                 let now_f16 = swapchain_is_f16 || upgrade;
                 let plan = hdr_present_plan(hdr_glow, now_f16, true);
                 assert_eq!(
@@ -1264,7 +1211,7 @@ fn metal_monitor_change_upgrade_is_the_attach_gate_on_positive_evidence() {
 
     let src = include_str!("../src/renderer.rs");
     let body = src
-        .split_once("    pub fn upgrade_surface_for_screen<W: raw_window_handle::HasWindowHandle>(")
+        .split_once("    pub fn upgrade_surface_for_screen<W: WindowTarget>(")
         .expect("the live re-pick must remain present")
         .1
         .split_once("\n    }\n")
@@ -1312,9 +1259,8 @@ fn metal_monitor_change_upgrade_is_the_attach_gate_on_positive_evidence() {
         flip < revert && revert < promote,
         "the revert sits between the flip and the promotion"
     );
-    // `Ok` from reconcile is not a flip on its own: with a drawable
-    // acquisition in flight on the surface's worker, reconcile records the
-    // desire and leaves the layer alone. The format the layer holds decides,
+    // `Ok` from reconcile is not a flip: with a drawable acquisition in flight on
+    // the surface's worker it only records the desire. The held format decides,
     // and a layer still holding 8-bit takes the revert.
     let held = body
         .find("ms.config().format == want.format")

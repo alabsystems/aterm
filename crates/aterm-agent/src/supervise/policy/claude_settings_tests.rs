@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! [`bare_asks`] over settings chains written in scratch directories (never
-//! the owner's files), and [`bare_tool`] over the rule spellings Claude Code
-//! 2.1.295's parser takes.
+//! [`owner_asks`] over settings chains written in scratch directories (never
+//! the owner's files), and [`rule_tool`] over the rule spellings Claude Code
+//! takes.
 
 use super::*;
 use crate::supervise::ScratchDir;
@@ -19,43 +19,52 @@ fn asks(rules: &[&str]) -> String {
 }
 
 /// `(rule as written, its settings document)` of each bare rule found.
-fn found(got: Result<Vec<AskRule>, String>) -> Vec<(String, String)> {
+fn found(got: Result<Vec<OwnerAsk>, String>) -> Vec<(String, String)> {
     got.expect("the chain reads")
         .into_iter()
-        .map(|r| (r.rule, r.source))
+        .filter(|a| matches!(a.kind, AskKind::Rule { bare: true, .. }))
+        .map(|a| (a.text, a.source))
         .collect()
 }
 
-/// Claude Code 2.1.295 reads a rule as its bare tool with no parentheses, and
-/// with `()` or `(*)` (its parser, and driven: `Write(*)` drew the box for a
-/// Write into a subdirectory in accept-edits mode, where an unruled one draws
-/// none). Anything else carries a specifier, or names no tool.
+/// The tool of each bare rule `got` holds, in order.
+fn bare_tools(got: Result<Vec<OwnerAsk>, String>) -> Vec<String> {
+    got.expect("reads")
+        .into_iter()
+        .filter_map(|a| match a.kind {
+            AskKind::Rule { tool, bare: true } => Some(tool),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Claude Code reads a rule as its bare tool with no parentheses, `()` or
+/// `(*)`, and `Tool(content)` otherwise as the tool with a specifier. A
+/// malformed rule names no tool.
 #[test]
-fn a_bare_rule_is_its_tool_with_no_specifier() {
-    for (rule, tool) in [
-        ("Write", Some("Write")),
-        ("Edit()", Some("Edit")),
-        ("Read(*)", Some("Read")),
-        ("Edit(src/**)", None),
-        ("Read(~/x/**)", None),
-        ("Bash(touch:*)", None),
-        ("Write(**)", None),
+fn a_rule_names_its_tool_bare_or_with_a_specifier() {
+    for (rule, named) in [
+        ("Write", Some(("Write", true))),
+        ("Edit()", Some(("Edit", true))),
+        ("Read(*)", Some(("Read", true))),
+        ("Edit(src/**)", Some(("Edit", false))),
+        ("Read(~/x/**)", Some(("Read", false))),
+        ("Bash(touch:*)", Some(("Bash", false))),
+        ("Bash(sed:*)", Some(("Bash", false))),
+        ("Write(**)", Some(("Write", false))),
         ("Write(x", None),
         ("Write)(", None),
         ("(*)", None),
         ("", None),
     ] {
-        assert_eq!(bare_tool(rule), tool, "{rule:?}");
+        assert_eq!(rule_tool(rule), named, "{rule:?}");
     }
 }
 
-/// The agent's OWN chain: the user's `settings.json` in its Claude Code
-/// directory (`CLAUDE_CONFIG_DIR`, else `$HOME/.claude`), the project's two
-/// files where it was launched, the local one in the repository's main
-/// worktree too, and a `--settings` it was launched with. A rule with a
-/// specifier is left out, and a file not there sets nothing. Negative
-/// control: the same files under a directory the agent does not run under
-/// hold nothing for it.
+/// The agent's own chain: the user's file in its Claude Code directory, the
+/// project's two files, the main worktree's local one and a `--settings`; a
+/// rule with a specifier is no bare rule. Negative control: the same files
+/// elsewhere hold nothing for it.
 #[test]
 fn the_agents_own_settings_chain_is_read_for_bare_ask_rules() {
     let s = ScratchDir::new("claude-settings", "chain");
@@ -64,7 +73,7 @@ fn the_agents_own_settings_chain_is_read_for_bare_ask_rules() {
     std::fs::create_dir_all(&proj).expect("proj");
     let worker = WorkerEnv::hermetic(None).with(&format!("CLAUDE_CONFIG_DIR={}", claude.display()));
     assert!(
-        found(bare_asks(&worker, &proj)).is_empty(),
+        found(owner_asks(&worker, &proj)).is_empty(),
         "nothing written yet"
     );
 
@@ -79,11 +88,24 @@ fn the_agents_own_settings_chain_is_read_for_bare_ask_rules() {
     write(&local, &asks(&["Edit()"]));
     let name = |p: &Path| p.display().to_string();
     assert_eq!(
-        found(bare_asks(&worker, &proj)),
+        found(owner_asks(&worker, &proj)),
         [
             ("Edit()".to_string(), name(&local)),
             ("Read(*)".to_string(), name(&project)),
             ("Write".to_string(), name(&user)),
+        ]
+    );
+    let specified: Vec<(String, String)> = owner_asks(&worker, &proj)
+        .expect("reads")
+        .into_iter()
+        .filter(|a| matches!(a.kind, AskKind::Rule { bare: false, .. }))
+        .map(|a| (a.text, a.source))
+        .collect();
+    assert_eq!(
+        specified,
+        [
+            ("Bash(git push:*)".to_string(), name(&project)),
+            ("Edit(src/**)".to_string(), name(&user)),
         ]
     );
     // The same Claude Code directory by `$HOME`, and a `--settings` given
@@ -93,11 +115,7 @@ fn the_agents_own_settings_chain_is_read_for_bare_ask_rules() {
         r#"--settings={"permissions":{"ask":["NotebookEdit"]}}"#,
     ]);
     std::fs::rename(&claude, s.join(".claude")).expect("move the Claude directory");
-    let tools: Vec<String> = bare_asks(&by_home, &proj)
-        .expect("reads")
-        .into_iter()
-        .map(|r| r.tool)
-        .collect();
+    let tools = bare_tools(owner_asks(&by_home, &proj));
     assert_eq!(tools, ["NotebookEdit", "Edit", "Read", "Write"]);
     // Negative control: an agent under another Claude Code directory, launched
     // elsewhere, has none of these.
@@ -105,14 +123,11 @@ fn the_agents_own_settings_chain_is_read_for_bare_ask_rules() {
     std::fs::create_dir_all(&other).expect("other");
     let elsewhere =
         WorkerEnv::hermetic(None).with(&format!("CLAUDE_CONFIG_DIR={}", s.join("none").display()));
-    assert!(found(bare_asks(&elsewhere, &other)).is_empty());
+    assert!(found(owner_asks(&elsewhere, &other)).is_empty());
 }
 
-/// Claude Code 2.1.295 keeps `.claude/settings.local.json` in the repository's
-/// main worktree for every subdirectory and linked worktree of it, so an agent
-/// launched in a linked worktree (git's layout: a `.git` file naming
-/// `<main>/.git/worktrees/<name>`, whose `commondir` leads back to `<main>/.git`)
-/// is read for the main worktree's local rules as well as its own.
+/// An agent in a linked worktree is read for the main worktree's
+/// `.claude/settings.local.json` as well as its own.
 #[test]
 fn a_linked_worktree_reads_the_main_worktrees_local_settings() {
     let s = ScratchDir::new("claude-settings", "worktree");
@@ -125,19 +140,18 @@ fn a_linked_worktree_reads_the_main_worktrees_local_settings() {
     let sub = wt.join("crates/x");
     std::fs::create_dir_all(&sub).expect("sub");
     let worker = WorkerEnv::hermetic(None);
-    assert!(found(bare_asks(&worker, &sub)).is_empty());
+    assert!(found(owner_asks(&worker, &sub)).is_empty());
     let local = main.join(".claude/settings.local.json");
     write(&local, &asks(&["Write"]));
     assert_eq!(
-        found(bare_asks(&worker, &sub)),
+        found(owner_asks(&worker, &sub)),
         [("Write".to_string(), local.display().to_string())]
     );
 }
 
-/// A settings document that is there but cannot be read whole, does not
-/// parse, or holds an ask list that is no list of strings: what it asks is
-/// unknown, and the error names it (its reader fails closed). Negative
-/// control: one with no `permissions` at all asks nothing.
+/// A document that cannot be read whole, does not parse, or holds a malformed
+/// ask list is an error naming it. Negative control: no `permissions` asks
+/// nothing.
 #[test]
 fn a_settings_file_that_cannot_be_read_is_reported_not_skipped() {
     let s = ScratchDir::new("claude-settings", "unread");
@@ -155,7 +169,7 @@ fn a_settings_file_that_cannot_be_read_is_reported_not_skipped() {
         (padded.as_str(), "are larger than"),
     ] {
         write(&project, body);
-        let why = bare_asks(&worker, &proj).expect_err(body);
+        let why = owner_asks(&worker, &proj).expect_err(body);
         assert!(
             why.contains(says) && why.contains(&project.display().to_string()),
             "{why}"
@@ -164,21 +178,112 @@ fn a_settings_file_that_cannot_be_read_is_reported_not_skipped() {
     std::fs::remove_file(&project).expect("rm");
     std::fs::create_dir(&project).expect("a directory where the file goes");
     assert!(
-        bare_asks(&worker, &proj)
+        owner_asks(&worker, &proj)
             .expect_err("a directory")
             .contains("cannot be read as a regular file")
     );
     std::fs::remove_dir(&project).expect("rmdir");
     write(&project, r#"{"env":{"X":"1"}}"#);
-    assert!(found(bare_asks(&worker, &proj)).is_empty());
+    assert!(found(owner_asks(&worker, &proj)).is_empty());
 }
 
-/// Claude Code's settings loader (2.1.295 and 2.1.299) reads a file that is
-/// empty or only white space as `{}`, and strips a leading byte-order mark
-/// before it parses: such a file sets nothing, a marked one its rules — never
-/// `do not parse`, which held every file box (the review of 2026-10-09: an
-/// empty `settings.local.json` held a Write Claude Code ran unasked).
-/// Negative control: text that is not JSON still does not parse, marked or not.
+/// Each PreToolUse entry that names a hook is read with its matcher; an empty
+/// `hooks` list and another event hold nothing; a field of the wrong type
+/// makes what the settings ask unknown, naming the document.
+#[test]
+fn the_chains_pre_tool_use_hooks_are_read_with_their_matchers() {
+    let s = ScratchDir::new("claude-settings", "hooks");
+    let proj = s.join("proj");
+    let project = proj.join(".claude/settings.json");
+    let worker = WorkerEnv::hermetic(None);
+    let run = r#"[{"type":"command","command":"exit 0"}]"#;
+    write(
+        &project,
+        &format!(
+            r#"{{"hooks":{{"PreToolUse":[{{"matcher":"Bash","hooks":{run}}},{{"hooks":{run}}},{{"matcher":"Edit|Write","hooks":[]}}],"PostToolUse":[{{"matcher":"*","hooks":{run}}}]}}}}"#
+        ),
+    );
+    let hooks: Vec<(Option<String>, String)> = owner_asks(&worker, &proj)
+        .expect("reads")
+        .into_iter()
+        .filter_map(|a| match a.kind {
+            AskKind::Hook { matcher } => Some((matcher, a.text)),
+            AskKind::Rule { .. } => None,
+        })
+        .collect();
+    assert_eq!(
+        hooks,
+        [
+            (Some("Bash".to_string()), "Bash".to_string()),
+            (None, "(none)".to_string()),
+        ]
+    );
+    for (body, says) in [
+        (r#"{"hooks":[]}"#, "hold a `hooks` that is no object"),
+        (
+            r#"{"hooks":{"PreToolUse":{"matcher":"Bash"}}}"#,
+            "hold a `hooks.PreToolUse` that is no list",
+        ),
+        (
+            r#"{"hooks":{"PreToolUse":[{"matcher":["Bash"],"hooks":[]}]}}"#,
+            "hold a PreToolUse matcher that is no string",
+        ),
+    ] {
+        write(&project, body);
+        let why = owner_asks(&worker, &proj).expect_err(body);
+        assert!(
+            why.contains(says) && why.contains(&project.display().to_string()),
+            "{why}"
+        );
+    }
+}
+
+/// None, empty and `*` match every tool; names alone match the tools they
+/// name; anything else is a regex, taken to match. Only a bare rule asks every
+/// call.
+#[test]
+fn a_hook_matcher_matches_bash_as_claude_code_matches_it() {
+    for (matcher, matches) in [
+        (None, true),
+        (Some(""), true),
+        (Some("*"), true),
+        (Some("Bash"), true),
+        (Some("Edit|Bash"), true),
+        (Some("Write, Bash"), true),
+        (Some(" Bash |Read"), true),
+        (Some("Edit|Write"), false),
+        (Some("MultiEdit"), false),
+        (Some("bash"), false),
+        (Some("Bas"), false),
+        (Some(".*"), true),
+        (Some("mcp__.*"), true),
+        (Some("^Ba"), true),
+    ] {
+        assert_eq!(hook_may_match(matcher, "Bash"), matches, "{matcher:?}");
+    }
+    let ask = |kind: AskKind| OwnerAsk {
+        kind,
+        text: String::new(),
+        source: String::new(),
+    };
+    let rule = |tool: &str, bare: bool| {
+        ask(AskKind::Rule {
+            tool: tool.to_string(),
+            bare,
+        })
+    };
+    assert!(rule("Bash", true).asks_every("Bash") && rule("Bash", true).may_ask("Bash"));
+    assert!(!rule("Bash", false).asks_every("Bash") && rule("Bash", false).may_ask("Bash"));
+    assert!(!rule("Edit", true).may_ask("Bash"));
+    let hook = ask(AskKind::Hook {
+        matcher: Some("*".to_string()),
+    });
+    assert!(hook.may_ask("Bash") && !hook.asks_every("Bash"));
+}
+
+/// An empty or blank settings file reads as `{}` and a leading byte-order mark
+/// is stripped, never `do not parse` (which would hold every file box).
+/// Negative control: text that is not JSON still does not parse.
 #[test]
 fn an_empty_or_marked_settings_file_reads_as_claude_code_reads_it() {
     let s = ScratchDir::new("claude-settings", "empty");
@@ -187,28 +292,24 @@ fn an_empty_or_marked_settings_file_reads_as_claude_code_reads_it() {
     let worker = WorkerEnv::hermetic(None);
     for body in ["", " \n\t\r\n", "\u{feff}", "\u{feff}  \n"] {
         write(&project, body);
-        assert!(found(bare_asks(&worker, &proj)).is_empty(), "{body:?}");
+        assert!(found(owner_asks(&worker, &proj)).is_empty(), "{body:?}");
     }
     write(&project, &format!("\u{feff}{}", asks(&["Write"])));
     assert_eq!(
-        found(bare_asks(&worker, &proj)),
+        found(owner_asks(&worker, &proj)),
         [("Write".to_string(), project.display().to_string())]
     );
     for body in ["{ not json", "\u{feff}{ not json"] {
         write(&project, body);
-        let why = bare_asks(&worker, &proj).expect_err(body);
+        let why = owner_asks(&worker, &proj).expect_err(body);
         assert!(why.contains("do not parse"), "{why}");
     }
 }
 
-/// The documents read where Claude Code 2.1.299 reads them (its settings-path
-/// switch): a RELATIVE `CLAUDE_CONFIG_DIR` against the agent's directory
-/// (`path.resolve`), not skipped; `cowork_settings.json` in place of
-/// `settings.json` under a true `CLAUDE_CODE_USE_COWORK_PLUGINS`; and the
-/// project's two files under the root a `--project-config-root` names, in
-/// place of the launch directory's. Negative controls: a false
-/// `CLAUDE_CODE_USE_COWORK_PLUGINS` keeps `settings.json`; without the flag
-/// the launch directory's files are the project's.
+/// A relative `CLAUDE_CONFIG_DIR`, `CLAUDE_CODE_USE_COWORK_PLUGINS` and
+/// `--project-config-root` move the documents as Claude Code moves them.
+/// Negative controls: a false cowork flag keeps `settings.json`; without the
+/// root flag the launch directory's files are the project's.
 #[test]
 fn the_chain_is_read_where_claude_code_reads_it() {
     let s = ScratchDir::new("claude-settings", "where");
@@ -218,7 +319,7 @@ fn the_chain_is_read_where_claude_code_reads_it() {
     let user = proj.join("cc/settings.json");
     write(&user, &asks(&["Write"]));
     assert_eq!(
-        found(bare_asks(&relative, &proj)),
+        found(owner_asks(&relative, &proj)),
         [("Write".to_string(), user.display().to_string())]
     );
 
@@ -227,13 +328,7 @@ fn the_chain_is_read_where_claude_code_reads_it() {
     let cowork = claude.join("cowork_settings.json");
     write(&claude.join("settings.json"), &asks(&["Read"]));
     write(&cowork, &asks(&["Edit"]));
-    let tools = |w: &WorkerEnv, launch: &Path| -> Vec<String> {
-        bare_asks(w, launch)
-            .expect("reads")
-            .into_iter()
-            .map(|r| r.tool)
-            .collect()
-    };
+    let tools = |w: &WorkerEnv, launch: &Path| -> Vec<String> { bare_tools(owner_asks(w, launch)) };
     let on = WorkerEnv::hermetic(None)
         .with(&dir)
         .with("CLAUDE_CODE_USE_COWORK_PLUGINS= Yes");
@@ -273,11 +368,8 @@ fn the_chain_is_read_where_claude_code_reads_it() {
     }
 }
 
-/// The managed documents open the chain: `managed-settings.json` and the
-/// `*.json` drop-ins of `managed-settings.d` beside it, sorted (a file of
-/// another kind is none). Claude Code's own directory is [`MANAGED_DIR`]; a
-/// scratch tree stands in for it here. Negative control: with no managed
-/// directory there are none.
+/// The managed file and its sorted `*.json` drop-ins open the chain. Negative
+/// control: with no managed directory there are none.
 #[test]
 fn the_managed_file_and_its_drop_ins_open_the_chain() {
     let s = ScratchDir::new("claude-settings", "managed");
@@ -309,10 +401,8 @@ fn the_managed_file_and_its_drop_ins_open_the_chain() {
     assert!(there(None).is_empty(), "no managed directory");
 }
 
-/// Claude Code's managed preference domains (2.1.300: the account's, then
-/// the device's, under `/Library/Managed Preferences`): each that is there
-/// is reported as a document nobody here can read, and none is opened; the
-/// account is the worker's `USER`, else its `LOGNAME`. Negative controls:
+/// Each managed preference domain that is there (the account's, by `USER`
+/// else `LOGNAME`, then the device's) is reported unopened. Negative controls:
 /// none there, none reported; another account's is not this worker's.
 #[test]
 fn a_managed_preference_domain_is_a_document_this_reader_cannot_see() {
@@ -350,12 +440,9 @@ fn a_managed_preference_domain_is_a_document_this_reader_cannot_see() {
     );
 }
 
-/// THE ROUTE'S FENCE ([`sources_under`] given a home): a settings document
-/// that is there inside a file-provider domain of the home (iCloud Drive, a
-/// sync provider's folder) is reported WITHOUT being opened, though its text
-/// is perfectly good — reached by a symlink from an ordinary folder too —
-/// while the same file in an ordinary folder is read. NEGATIVE CONTROL: with
-/// no fence (the approval lane's [`sources`], or no home known) it is read.
+/// The route's fence reports a settings document in a file-provider domain
+/// unopened, through a symlink too; the same file elsewhere is read. Negative
+/// control: unfenced, it is read.
 #[test]
 fn a_settings_file_under_a_file_provider_domain_is_reported_never_opened() {
     let s = ScratchDir::new("claude-settings", "provider");
@@ -401,15 +488,9 @@ fn a_settings_file_under_a_file_provider_domain_is_reported_never_opened() {
     assert_eq!(text(None), Some(Ok(Some("{}".to_string()))));
 }
 
-/// THE ROUTE'S FENCE COVERS THE GIT FILES THE CHAIN OPENS to find a linked
-/// worktree's main worktree (the `.git` file, its git directory's
-/// `commondir`), as footer's fenced git read does: a git directory can lie in
-/// a file-provider domain from outside one, and a linked worktree inside one
-/// has its `.git` file there. Fenced, neither is opened and the main
-/// worktree's local settings are reported, never looked for. NEGATIVE
-/// CONTROL: unfenced (the approval lane's [`sources`]), both are read and the
-/// main worktree's `settings.local.json` is found. The review of 2026-10-14
-/// found f71bc6de9 opening both under the fence.
+/// The route's fence covers the git files the chain opens to find a main
+/// worktree: fenced, neither is opened and the main worktree's local settings
+/// are reported. Negative control: unfenced, both are read.
 #[test]
 fn the_routes_fence_opens_no_git_file_in_a_file_provider_domain() {
     let s = ScratchDir::new("claude-settings", "provider-git");
@@ -468,12 +549,8 @@ fn the_routes_fence_opens_no_git_file_in_a_file_provider_domain() {
     }
 }
 
-/// A settings document that is NOT THERE inside a file-provider domain sets
-/// nothing, as anywhere else: whether it is there is a `stat`, which no
-/// consent gates (docs/DESIGN-macos-tcc-prompts-2026-08-30.md §1.5), so the
-/// fence has nothing to keep unopened. The review of 2026-10-14 found it
-/// reported (`lie in a file-provider domain`), so a project in iCloud Drive or
-/// a sync folder with no `.claude` at all had every chain read fail.
+/// A settings document not there inside a file-provider domain sets nothing,
+/// as anywhere else.
 #[test]
 fn a_settings_file_not_there_in_a_file_provider_domain_sets_nothing() {
     let s = ScratchDir::new("claude-settings", "provider-none");
@@ -493,28 +570,18 @@ fn a_settings_file_not_there_in_a_file_provider_domain_sets_nothing() {
     }
 }
 
-/// Set in the environment of [`provider_home_stage`]'s run: this test binary
-/// is the child of
-/// [`the_approval_lane_reads_its_settings_in_a_file_provider_domain_of_this_home`],
-/// its `HOME` a scratch home, and this names a project inside a
-/// file-provider domain of it.
+/// The variable naming, in [`provider_home_stage`]'s child run, a project
+/// inside a file-provider domain of its scratch `HOME`.
 const PROVIDER_STAGE: &str = "ATERM_CLAUDE_SETTINGS_PROVIDER_PROJ";
 
 /// Where [`provider_home_stage`] says it ran every check (a child that a
 /// filter ran nothing in exits 0 too).
 const PROVIDER_STAGE_DONE: &str = "ATERM_CLAUDE_SETTINGS_PROVIDER_DONE";
 
-/// THE APPROVAL LANE READS AN AGENT'S SETTINGS IN A FILE-PROVIDER DOMAIN OF
-/// THIS PROCESS'S HOME (iCloud Drive, a sync provider's folder): none there
-/// sets nothing, and the project's `settings.local.json` is read for its ask
-/// rules and its `env`. The
-/// review of 2026-10-14 found every chain read there `Err` on f71bc6de9 (the
-/// route's fence, moved into the shared reader), so every read-only Bash box
-/// and every git read of such a project escalated (module header, "The
-/// file-provider fence is the route's"). Run in a child of this test binary
-/// whose `HOME` is a scratch home ([`provider_home_stage`]): the project is
-/// then in a file-provider domain of THIS process's home, the one the
-/// route's fence is against.
+/// The approval lane opens settings in a file-provider domain of this
+/// process's home: none there sets nothing, a local file's ask rules and `env`
+/// are read. Runs in a child whose `HOME` is a scratch home
+/// ([`provider_home_stage`]).
 #[test]
 fn the_approval_lane_reads_its_settings_in_a_file_provider_domain_of_this_home() {
     let s = ScratchDir::new("claude-settings", "provider-lane");
@@ -545,9 +612,9 @@ fn the_approval_lane_reads_its_settings_in_a_file_provider_domain_of_this_home()
     assert!(done.exists(), "the stage ran no check:\n{said}");
 }
 
-/// THE STAGE of
+/// The child half of
 /// [`the_approval_lane_reads_its_settings_in_a_file_provider_domain_of_this_home`],
-/// when [`PROVIDER_STAGE`] is set (and nothing at all otherwise).
+/// run when [`PROVIDER_STAGE`] is set; otherwise it does nothing.
 #[test]
 fn provider_home_stage() {
     let (Some(proj), Some(done)) = (
@@ -565,7 +632,10 @@ fn provider_home_stage() {
     );
     let worker = WorkerEnv::hermetic(None).with(&format!("HOME={}", home.display()));
     assert_eq!(worker.settings_env(&proj), Ok(()), "nothing there");
-    assert!(found(bare_asks(&worker, &proj)).is_empty(), "nothing there");
+    assert!(
+        found(owner_asks(&worker, &proj)).is_empty(),
+        "nothing there"
+    );
     let local = proj.join(".claude/settings.local.json");
     write(
         &local,
@@ -573,7 +643,7 @@ fn provider_home_stage() {
     );
     assert_eq!(worker.settings_env(&proj), Ok(()), "a quiet local file");
     assert_eq!(
-        found(bare_asks(&worker, &proj)),
+        found(owner_asks(&worker, &proj)),
         [("Write".to_string(), local.display().to_string())]
     );
     write(&local, r#"{"env":{"GIT_DIR":"elsewhere"}}"#);
@@ -585,10 +655,9 @@ fn provider_home_stage() {
     write(&done, "ran");
 }
 
-/// An agent whose directory is not known (a relative `launch`) has every
-/// document named from it reported, never read against this process's own
-/// directory: the project's, a relative `--settings` and a relative Claude
-/// Code directory. Negative control: what it names absolutely is read.
+/// A relative `launch` has every document named from it reported, never read
+/// against this process's directory. Negative control: what it names
+/// absolutely is read.
 #[test]
 fn an_agent_whose_directory_is_not_known_has_its_project_reported() {
     let s = ScratchDir::new("claude-settings", "blind");

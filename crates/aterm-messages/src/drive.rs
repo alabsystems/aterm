@@ -1,36 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE BAND'S ONE DRIVER (design ruling 336) — the per-frame SEQUENCING
-//! every host ran for itself until round 27: retire what expired, commit the
-//! row count, drain the log, take the wire's paced paint, lay the band out,
-//! read one motion frame, key and paint the rows, and fold the deadlines the
-//! host's timer arms. The owner's ask (2026-09-21): *"design the logic in
-//! aterm core and then keep the osx layer lightweight so that we can make
-//! this cross platform."*
+//! The band's one driver: the per-frame sequencing every host shares. Retire what
+//! expired, commit the row count, drain the log, take the wire's paced paint, lay the
+//! band out, read one motion frame, key and paint the rows, and fold the deadlines the
+//! host's timer arms.
 //!
-//! Nothing here reads a clock, owns a timer or knows a window system: every
-//! instant is the host's (`now`, injected), every input a plain value — the
-//! grids' heights the band may take a row from ([`afford`]), whether a
-//! handoff freezes the band ([`Commit::frozen`]), whether a view is on
-//! screen and may move ([`LookIn`]), its width and link posture ([`Lay`]),
-//! its hover, geometry and inks ([`View::paint`]). The host keeps what is
-//! its own: the re-grid a committed count asks for ([`Committed::regrid`]),
-//! the log file the drained lines go to, the timer, the compose of the
-//! painted rows onto its frame, and what a repaint request means there.
+//! Nothing here reads a clock, owns a timer or knows a window system: every instant is
+//! the host's `now`, every input a plain value (the grids' heights for [`afford`], the
+//! freeze in [`Commit::frozen`], [`LookIn`], [`Lay`], and the hover, geometry and inks
+//! of [`View::paint`]). The host keeps the re-grid a committed count asks for
+//! ([`Committed::regrid`]), the log file, the timer, the compose onto its frame, and
+//! what a repaint request means there.
 //!
-//! No wake is added: every instant a fold returns comes from the center's
-//! own deadlines ([`MessageCenter::deadline`],
-//! [`MessageCenter::motion_deadline`]) and the wire's paced paint
-//! ([`WireGate::due`]); an idle band returns `None` from each (FL-1).
+//! No wake is added: every instant a fold returns comes from the center's deadlines
+//! ([`MessageCenter::deadline`], [`MessageCenter::motion_deadline`]) and the wire's
+//! paced paint ([`WireGate::due`]); an idle band returns `None` from each.
 //!
-//! # One view per window
-//!
-//! A [`View`] is one surface's band state: the width law's layout (keyed by
-//! the center's fingerprint and the width), the motion frame the next
-//! present reads (and the look it was drawn in), the memoised next change
-//! from that frame, and the key the painted rows were built from. The macOS
-//! host keeps one per window; the web module one per terminal.
+//! A [`View`] is one surface's band state: the layout (keyed by the center's fingerprint
+//! and the width), the motion frame the next present reads, the memoised next change
+//! from that frame, and the paint key. The macOS host keeps one per window, the web
+//! module one per terminal.
 
 use std::borrow::Cow;
 use std::cell::Cell;
@@ -59,12 +49,11 @@ pub struct Commit {
     pub afford: u16,
     /// The row count the host's geometry reserves now.
     pub reserved: u16,
-    /// THE WINDOWS' CHROME REGROW FLOOR ([`crate::chrome`], ruling 414,
-    /// proposed): the latest [`crate::chrome::RegrowFloor::floor`] of every
-    /// window the band's re-grid resizes ([`crate::chrome::latest`]) — a quiet
-    /// shrink waits it, so another source's rise just before it (a presence
-    /// row's birth) is never undone by the band inside the settle. A host with
-    /// one surface and no other chrome source (the web) hands `None`.
+    /// The windows' chrome regrow floor: the latest
+    /// [`crate::chrome::RegrowFloor::floor`] of every window the band's re-grid resizes
+    /// ([`crate::chrome::latest`]). A quiet shrink waits for it, so the band never undoes
+    /// another source's rise (a presence row's birth) inside the settle. A host with one
+    /// surface and no other chrome source (the web) hands `None`.
     pub floor: Option<Instant>,
 }
 
@@ -80,11 +69,10 @@ pub struct Committed {
     pub regrid: Option<u16>,
 }
 
-/// Commit the row count (never under a freeze): the center's hysteresis
-/// over what the grids afford, its quiet shrink held to [`Commit::floor`],
-/// and the count the host re-grids to — `Some` when it moved or disagrees
-/// with [`Commit::reserved`]. A count above [`Commit::reserved`] is a RISE
-/// the host notes on every window it re-grids
+/// Commit the row count (never under a freeze): the center's hysteresis over what the
+/// grids afford, its quiet shrink held to [`Commit::floor`], and the count the host
+/// re-grids to (`Some` when it moved or disagrees with [`Commit::reserved`]). A count
+/// above [`Commit::reserved`] is a rise the host notes on every window it re-grids
 /// ([`crate::chrome::is_rise`]).
 pub fn commit(center: &mut MessageCenter, c: Commit) -> Option<u16> {
     // Handed in first, frozen or not, so the state deadline reads the floor
@@ -109,9 +97,9 @@ pub fn settle_and_commit(center: &mut MessageCenter, c: Commit) -> Committed {
     }
 }
 
-/// The step's second half: the log lines the center shelved (only when
-/// `persist`; a handoff's successor writes nothing before its commit), and
-/// whether the wire's one paced paint fell due (ruling 170).
+/// The step's second half: the log lines the center shelved (only when `persist`; a
+/// handoff's successor writes nothing before its commit), and whether the wire's one
+/// paced paint fell due.
 pub fn drain_and_pace(
     center: &mut MessageCenter,
     gate: &mut WireGate,
@@ -138,9 +126,9 @@ pub fn afford(grids: impl IntoIterator<Item = u16>, reserved: u16) -> u16 {
         .unwrap_or(MAX_ROWS)
 }
 
-/// The next instant the band's STATE needs the host back — a hold's
-/// expiry, an echo's end, a queued row's patience (holds suspended under a
-/// freeze), the wire's paced paint. `None` when idle.
+/// The next instant the band's state needs the host back: a hold's expiry, an echo's
+/// end, a queued row's patience (holds suspended under a freeze), the wire's paced
+/// paint. `None` when idle.
 #[must_use]
 pub fn state_deadline(center: &MessageCenter, gate: &WireGate, frozen: bool) -> Option<Instant> {
     [center.deadline(!frozen), gate.due()]
@@ -169,8 +157,8 @@ pub struct LookIn {
     pub forced: bool,
 }
 
-/// The look a view draws in (design ruling 140): MOVING only on screen,
-/// unfrozen and allowed; GRADED unless a forced palette owns the chrome.
+/// The look a view draws in: moving only on screen, unfrozen and allowed; graded unless
+/// a forced palette owns the chrome.
 #[must_use]
 pub fn look(i: LookIn) -> Look {
     Look {
@@ -198,9 +186,9 @@ pub struct Lay {
 }
 
 impl Lay {
-    /// A web page's layout (ruling 332): no `$HOME` to abbreviate, and the
-    /// links withheld until the page has a Details view. The native window's
-    /// is its own (`aterm-gui`'s `message_band::band_lay`).
+    /// A web page's layout: no `$HOME` to abbreviate, and the links withheld until the
+    /// page has a Details view. The native window's is `aterm-gui`'s
+    /// `message_band::band_lay`.
     #[must_use]
     pub fn web(cols: usize, details: bool) -> Self {
         Self {
@@ -292,9 +280,8 @@ impl View {
         self.motion = Some(motion);
         self.motion_fp = mfp;
         self.look = Some(look);
-        // A content-only present can prepare the SAME frame again: the memo's
-        // key keeps its answer valid, so it stays; a new frame misses the key
-        // on the next query and computes its own.
+        // The memo stays: its key keeps it valid when a content-only present prepares
+        // the same frame again, and a new frame misses the key on the next query.
         mfp
     }
 
@@ -523,10 +510,9 @@ impl View {
 
 // ---- many views -----------------------------------------------------------------
 
-/// The next instant any of `views` — the ON-SCREEN ones, each with its lay
-/// and look — needs a motion frame or a time word's tick
-/// (`View::motion_deadline`). `None` with no row reserved or under a
-/// freeze (the frame on glass stays where it is).
+/// The next instant any of `views` (the on-screen ones, each with its lay and look)
+/// needs a motion frame or a time word's tick (`View::motion_deadline`). `None` with no
+/// row reserved or under a freeze (the frame on glass stays where it is).
 pub fn motion_deadline_over<'a>(
     center: &MessageCenter,
     reserved: u16,
@@ -543,9 +529,8 @@ pub fn motion_deadline_over<'a>(
         .min()
 }
 
-/// Which of `views` — the ON-SCREEN ones, each named by `K` — are due a new
-/// frame at `now` (`View::due`). Nothing with no row reserved or under a
-/// freeze.
+/// Which of `views` (the on-screen ones, each named by `K`) are due a new frame at
+/// `now` (`View::due`). Nothing with no row reserved or under a freeze.
 pub fn due_views<'a, K>(
     center: &MessageCenter,
     reserved: u16,

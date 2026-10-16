@@ -1,0 +1,19 @@
+# muse 1.4.9-R6297.1 · MEASURED 2026-10-16, `aterm ctl text --json` of a private headless aterm 120x40 (aterm 0.105.0 098c216c7), the atpkg-managed muse (Meta latest) launched through its shim with a scratch HOME, `--provider echo --echo-delay-ms 8000` (Meta's offline echo provider: no login, no model), harness off · a `/` typed into the composer opens the command menu between the caret row and the bottom rule (7 rows and `↓ 43 more`); the footer is unchanged · cursor=7,3 (visible) · account and scratch path redacted at equal length
+
+  Muse Code 1.4.9
+
+  warning: local session messaging unavailable: unsafe_registry_root: unsafe local Session registry root
+  /tmp/at.XXXXXX/mhome/.local/share/muse/runtime/muse: root component is unsafe or unreadable
+
+── Voice input (⌥ + v to start) ────────────────────────────────────────────────────────────────────────────────────────
+❯ /
+  /bug                                         Report a bug to the team
+  /clear                                       Clear terminal and start a fresh session
+  /compact                                     Summarize the conversation to free up context
+  /copy                                        Copy a response, code block, or ran command to the clipboard
+  /deep-research                               Research a question across sources with cross-checking and citations
+  /effort                                      Set the model's effort level
+  /export                                      Save the conversation, or the full session log
+  ↓ 43 more
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  echo · /private/tmp/at.XXXXXX/mwork · Auto-review

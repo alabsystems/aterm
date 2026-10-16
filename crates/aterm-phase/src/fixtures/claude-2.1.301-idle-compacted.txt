@@ -1,0 +1,17 @@
+# claude-code 2.1.301 · MEASURED 2026-10-15, `aterm ctl text` of the owner's tab 2 (136x57, aterm 0.104.0 74147aac3d1f) after Claude Code compacted its idle conversation by itself (`compact_idle`, about 55 minutes after the turn that reported ATERM-TASK-DONE, nobody at the tab): the report's tail and its done row, the attachments the compaction restored (`⎿  Read …`, `⎿  Skills restored (…)`), then the vendor's own notice `⏺ Compacted while idle, before the prompt cache expired` as the last thing said — no `❯` row: nobody's message was answered · cut at the notice (the `❯ keep going` the harness typed under it, and the turn that answered it, left out) over the same screen's composer frame, its draft cleared · user name and session id redacted at equal length
+
+  ATERM-TASK-DONE
+
+✻ Crunched for 4m 59s · done 4:34 PM
+  ⎿  Read ../../../private/tmp/claude-1000/-Users-user00-aterm/00000000-0000-0000-0000-000000000000/tasks/b9k3hpxpb.output (14 lines)
+  ⎿  Read ../.claude/projects/-Users-user00-aterm/memory/work-in-main-worktree.md (34 lines)
+  ⎿  Read ../../../private/tmp/claude-1000/-Users-user00-aterm/00000000-0000-0000-0000-000000000000/tasks/bd7atk9ob.output (26 lines)
+  ⎿  Referenced file ../../../private/tmp/claude-1000/-Users-user00-aterm/00000000-0000-0000-0000-000000000000/scratchpad/BRIEF.md
+  ⎿  Skills restored (rust-in-aterm, workflow-authoring)
+
+⏺ Compacted while idle, before the prompt cache expired
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── fast mode ─
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents · 1 feedback draft

@@ -1,80 +1,99 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! How the bridge reaches the broker: the three transports §11.2's `serve`
-//! synopsis lists, behind one erased stream type.
+//! How the bridge reaches the broker: the three transports of §11.2's `serve`
+//! synopsis, behind one erased stream type.
 //!
 //! ```text
 //! aterm-link serve --broker <ep> [--tcp] [--key-file PATH]
 //! ```
 //!
-//! * no flag — a Unix socket, same machine. Reachability is scoped by the
-//!   socket path's permissions and nothing crosses a wire.
-//! * `--tcp` — PLAINTEXT TCP to `<host>:<port>`. §8.6's "trusted-network-only
-//!   setting", and it says so on stderr every time: every message and presence
-//!   row crosses in the clear.
-//! * `--tcp --key-file <path>` — the same TCP inside astream's sealed record
-//!   layer: XChaCha20-Poly1305 under a 32-byte pre-shared key, with each
-//!   record's AAD binding both hellos, the direction and the sequence, and a
-//!   key-confirming record each way so a peer without the key is refused INSIDE
-//!   the handshake (§8.6).
+//! * no flag: a Unix socket on this machine, scoped by the socket path's permissions.
+//! * `--tcp`: plaintext TCP to `<host>:<port>`, §8.6's trusted-network-only setting;
+//!   it says so on stderr every time.
+//! * `--tcp --key-file <path>`: the same TCP inside astream's sealed record layer
+//!   (XChaCha20-Poly1305 under a 32-byte pre-shared key; each record's AAD binds both
+//!   hellos, the direction and the sequence, and a key-confirming record each way
+//!   refuses a peer without the key inside the handshake, §8.6).
 //!
-//! ## Not offered: `--handshake` / `--identity`
+//! `--handshake` and `--identity` (astream's ephemeral-X25519 and signed-DH
+//! transports) are refused by name (`cli::parse`): §11.2 holds this crate's
+//! third-party crypto to `chacha20poly1305` + `getrandom`, which the curve crates
+//! would break, and `asb` serves no `identity` transport.
 //!
-//! astream also has ephemeral-X25519 (`handshake`) and signed-DH identity
-//! (`identity`) transports, and §8.6 says a node SHOULD use `identity`. But
-//! §11.2 pins this crate's third-party surface to "**exactly** the two vetted
-//! crypto dependencies the `cap`/`aead` features already isolate — `sha2`, and
-//! `chacha20poly1305` + `getrandom`", which the curve crates would break, and
-//! `asb` serves no `identity` transport. So both flags are refused by name
-//! (`cli::parse`).
-//!
-//! ## The erased stream and its closer
-//!
-//! The bridge must end a subscription from another thread — `recv` blocks with
-//! no timeout, and a reconnect that left the old group subscription running
-//! would deliver every record twice and could walk the commit backwards. So
-//! astream's [`astream_broker::connect`] makes a [`astream_broker::Closer`] at
-//! connect time from a duplicate of the underlying socket. What stays here is
-//! policy: which transports a node may use, and refusing the sealed wire by
-//! name in a build without it.
+//! The bridge must end a subscription from another thread (`recv` blocks without a
+//! timeout, and a reconnect that left the old group subscription running would
+//! deliver every record twice and could walk the commit backwards), so
+//! [`astream_broker::connect`] makes a [`astream_broker::Closer`] from a duplicate of
+//! the socket. This module keeps the policy: which transports a node may use.
 
 use std::io;
+use std::time::{Duration, Instant};
 
 use astream_broker::Record;
 
-/// Any byte stream a broker connection can ride — astream's [`AnyStream`](astream_broker::AnyStream).
-/// `Send` is a supertrait because each subscription is pumped by its own thread.
+/// Any byte stream a broker connection can ride. `Send` is a supertrait because each
+/// subscription is pumped by its own thread.
 pub use astream_broker::AnyStream as Stream;
 
-/// Ends a subscription from outside its reading thread, and bounds a
-/// connection's reads and writes — astream's [`Closer`](astream_broker::Closer).
-/// Past a read deadline the stream is no longer framed (the late reply may
-/// still arrive), so the caller drops the connection rather than retrying; a
-/// subscription wants `None`, since parking in `recv` is its normal state.
+/// Ends a subscription from outside its reading thread, and bounds a connection's
+/// reads and writes. Past a deadline the connection is out of step (a late reply may
+/// still arrive), so astream's client refuses every later request on it
+/// (`BrokenPipe`) and the caller reconnects. A subscription wants `None`, since
+/// parking in `recv` is its normal state, until the broker's first idle mark arms a
+/// liveness bound through this same closer (`Subscription::recv_live`).
 pub use astream_broker::Closer;
 
-/// One broker connection, with its transport erased so the bridge has ONE code
-/// path per verb rather than one per wire.
+/// One broker connection with its transport erased: one code path per verb, not one
+/// per wire.
 pub type Conn = astream_broker::AnyClient;
 
-/// Walk every row of a last-value face, paging on the resume cursor.
-///
-/// The broker clamps `max` AND bounds how many index entries one request may
-/// visit (§5.2, [`astream_broker::Client::last_page`]), so a short page — an
-/// empty one included — is not the end; only an empty `resume` is. The walk is
-/// astream's [`astream_broker::Client::last_walk`]; a page is at most the
-/// broker's `LAST_PAGE_MAX` rows.
-///
-/// Streaming: `on_row` sees each row as its page arrives, so a fleet-sized
-/// answer costs one page of memory. An `on_row` that fails ends the walk.
+/// Attach a whole capability ring to `conn` under one `Hello` with astream's
+/// [`attach_all`](astream_broker::Client::attach_all): two round trips however many
+/// grants the ring holds, the `Attach`es pipelined. An empty ring sends nothing (an
+/// unguarded broker with no cap files).
 ///
 /// # Errors
 ///
-/// Any broker or transport failure, an `on_row` that fails, or a walk that did
-/// not end within [`astream_broker::LAST_WALK_PAGES_MAX`] pages — a caller that
-/// cannot tell "no rows" from "stopped looking" reports an empty fleet while a
-/// node escalates.
+/// The socket, or the broker's first refusal in ring order (a
+/// [`astream_broker::BrokerRefusal`] inside). The grants ahead of the refused one stay
+/// attached, so a caller that needs the whole ring drops the connection, as every
+/// caller here does.
+pub fn attach_ring(conn: &mut Conn, ring: &[crate::bridge::Cap]) -> io::Result<()> {
+    conn.attach_all(
+        ring.iter()
+            .map(|cap| (cap.grant.as_str(), cap.tag.as_slice())),
+    )
+    .map(drop)
+}
+
+/// [`attach_ring`] over every capability in `cap_files`, in file order. The files are
+/// read on every call, so a connection opened after a re-mint attaches the new ring.
+///
+/// # Errors
+///
+/// A cap file that cannot be read, or [`attach_ring`]'s.
+pub fn attach_cap_files(conn: &mut Conn, cap_files: &[String]) -> io::Result<()> {
+    let mut ring = Vec::new();
+    for path in cap_files {
+        ring.extend(crate::bridge::read_cap_file(path)?);
+    }
+    attach_ring(conn, &ring)
+}
+
+/// Walk every row of a last-value face, paging on the resume cursor
+/// ([`astream_broker::Client::last_walk`]).
+///
+/// The broker clamps `max` and bounds the index entries one request visits (§5.2),
+/// so a short or empty page is not the end; only an empty `resume` is. `on_row` sees
+/// each row as its page arrives, so a fleet-sized answer costs one page of memory;
+/// an `on_row` that fails ends the walk.
+///
+/// # Errors
+///
+/// A broker or transport failure, a failing `on_row`, or a walk that did not end
+/// within [`astream_broker::LAST_WALK_PAGES_MAX`] pages: a caller that cannot tell
+/// "no rows" from "stopped looking" would report an empty fleet.
 pub fn walk_last<F>(conn: &mut Conn, filter: &str, mut on_row: F) -> io::Result<()>
 where
     F: FnMut(&Record) -> io::Result<()>,
@@ -126,30 +145,30 @@ impl Transport {
     }
 }
 
-/// Open one connection, answering it and the closer that can end it.
+/// Open one connection under `deadline`, answering it and the closer that can end it.
 ///
-/// astream's [`astream_broker::connect`] does the work; this maps the fabric's
-/// transport onto it and refuses the sealed wire BY NAME in a build without it.
+/// The deadline bounds every step a broker could leave this caller parked in: the
+/// TCP dial (each resolved address in turn), the sealed handshake, and every read and
+/// write after them (`SO_RCVTIMEO`/`SO_SNDTIMEO`, set through the closer before the
+/// first frame). A black-holed address, a broker that never answers, and one that
+/// stopped reading mid-frame all fail `TimedOut`/`WouldBlock` after `deadline`. A
+/// timed-out request leaves the stream unframed: drop the connection, do not retry
+/// on it. A subscriber lifts only the read deadline once subscribed
+/// (`closer.set_read_timeout(None)`); it writes nothing after its request. A Unix
+/// dial is unbounded (std has no bounded one) and fails at once when nothing listens.
 ///
-/// # Errors
-///
-/// The connect itself, the sealed handshake (a peer that lacks the key fails
-/// HERE, not on the first verb), or the descriptor duplication the closer needs.
-pub fn connect(transport: &Transport, endpoint: &str) -> io::Result<(Conn, Closer)> {
-    connect_within(transport, endpoint, None)
-}
-
-/// [`connect`] with a bound on ESTABLISHING the connection (every resolved TCP
-/// address in turn; on the sealed wire it also replaces the handshake's own
-/// deadline). A Unix connect is not bounded — std has no bounded one.
+/// The only connect here, so no caller can forget the bound; the sealed wire is
+/// refused by name in a build without it.
 ///
 /// # Errors
 ///
-/// As [`connect`], and `TimedOut` past the bound.
-pub fn connect_within(
+/// The connect itself, `TimedOut` past the bound, the sealed handshake (a peer that
+/// lacks the key fails here, not on the first verb), the descriptor duplication the
+/// closer needs, or a zero `deadline` (`InvalidInput`).
+pub fn connect(
     transport: &Transport,
     endpoint: &str,
-    timeout: Option<std::time::Duration>,
+    deadline: Duration,
 ) -> io::Result<(Conn, Closer)> {
     let wire = match transport {
         Transport::Unix => astream_broker::Transport::Unix,
@@ -166,7 +185,91 @@ pub fn connect_within(
         #[cfg(feature = "sealed")]
         Transport::Sealed(key) => astream_broker::Transport::Sealed(key.clone()),
     };
-    astream_broker::connect(&wire, endpoint, timeout)
+    let (conn, closer) = astream_broker::connect(&wire, endpoint, Some(deadline))?;
+    closer.set_read_timeout(Some(deadline))?;
+    closer.set_write_timeout(Some(deadline))?;
+    Ok((conn, closer))
+}
+
+/// The reconnect back-off floor and ceiling. §7: a bridge reconnects with jittered
+/// back-off and opens its publisher connection before its drain connection, because
+/// `MAX_CONNS` can refuse a herd and the publisher's `live inc+1` suppresses a fenced
+/// will.
+const RECONNECT_MIN: Duration = Duration::from_millis(100);
+pub(crate) const RECONNECT_MAX: Duration = Duration::from_secs(5);
+
+/// How long a link must have stayed up for its loss to restart the back-off from
+/// [`RECONNECT_MIN`] and be redialled at once. A link lost sooner is a failed attach:
+/// a subscription the broker refused (astream answers a `Subscribe` only when it
+/// delivers, so a refusal is the reader's first `recv` error, after the attach
+/// reported `up`), or a broker that accepts and drops. Equal to the ceiling, so a
+/// link that keeps dying that way dials at most once per [`RECONNECT_MAX`].
+const LINK_STABLE: Duration = RECONNECT_MAX;
+
+/// One broker client's reconnect back-off: doubling from [`RECONNECT_MIN`] to
+/// [`RECONNECT_MAX`], each wait drawn from `[b/2, b]` (equal jitter, so a refused herd
+/// does not come back in step), and reset only by a link that stayed up
+/// [`LINK_STABLE`], never by a dial that merely succeeded (a refused subscription
+/// would then redial at round-trip speed). Pure state: the caller passes the clock
+/// and does the waiting.
+#[derive(Debug)]
+pub(crate) struct Backoff {
+    next: Duration,
+    up_since: Option<Instant>,
+}
+
+impl Default for Backoff {
+    fn default() -> Self {
+        Self {
+            next: RECONNECT_MIN,
+            up_since: None,
+        }
+    }
+}
+
+impl Backoff {
+    /// A dial or attach failed: how long to wait before the next one, which waits
+    /// twice as long, up to the ceiling.
+    pub(crate) fn failed(&mut self) -> Duration {
+        let wait = random_u64().map_or(self.next, |r| jittered(self.next, r));
+        self.next = (self.next * 2).min(RECONNECT_MAX);
+        wait
+    }
+
+    /// The link came up at `now`.
+    pub(crate) fn attached(&mut self, now: Instant) {
+        self.up_since = Some(now);
+    }
+
+    /// The link that came up was lost at `now`: `None` when it had stayed up
+    /// [`LINK_STABLE`] (the back-off restarts at the floor and the redial goes now),
+    /// else the wait a failed attach gets ([`Self::failed`]). `None` too when no link
+    /// was up, so one loss is waited out once.
+    pub(crate) fn lost(&mut self, now: Instant) -> Option<Duration> {
+        let up = self.up_since.take()?;
+        if now.saturating_duration_since(up) >= LINK_STABLE {
+            self.next = RECONNECT_MIN;
+            None
+        } else {
+            Some(self.failed())
+        }
+    }
+}
+
+/// `b` jittered into `[b/2, b]` by `r`: integer-only, and never longer than
+/// `b`.
+fn jittered(b: Duration, r: u64) -> Duration {
+    let half = b / 2;
+    let span = u64::try_from((b - half).as_micros()).unwrap_or(u64::MAX);
+    half + Duration::from_micros(r % span.saturating_add(1))
+}
+
+/// A jitter draw from the OS CSPRNG; `None` when it cannot be read, and the
+/// caller then waits the whole `b` — never a shorter wait.
+fn random_u64() -> Option<u64> {
+    let mut raw = [0u8; 8];
+    aterm_uds::rand::fill(&mut raw).ok()?;
+    Some(u64::from_le_bytes(raw))
 }
 
 /// Read a `--key-file`: 64 hex characters, surrounding whitespace ignored — the
@@ -196,10 +299,9 @@ pub fn read_key_file(path: &str) -> io::Result<[u8; 32]> {
     }
 }
 
-/// One error from [`read_key_file`], [`check_private`] or
-/// [`read_private_key_file`] as text that names `path` ONCE: their own refusals
-/// already lead with it, and an OS error (a missing file, a denied `stat`)
-/// never carries one. A caller prefixes only its flag (`--key-file {…}`).
+/// One error from [`read_key_file`], [`check_private`], [`read_private_key_file`] or
+/// [`read_mint_secret`] as text naming `path` once: their own refusals lead with it,
+/// and an OS error never carries one. A caller prefixes only its flag.
 #[must_use]
 pub fn describe(path: &str, e: &io::Error) -> String {
     if e.raw_os_error().is_some() {
@@ -229,10 +331,9 @@ pub fn sealed_flags_refusal(args: &[String]) -> Option<&'static str> {
     (!SEALED && has("--tcp") && has("--key-file")).then_some(SEALED_UNAVAILABLE)
 }
 
-/// Refuse a SECRET file anyone but its owner can read: a mint secret, a
-/// pre-shared key, a capability file. `mode & 0o077` must be zero — 0600 or
-/// tighter. The refusal names the `chmod` rather than fixing it silently: a key
-/// that sat readable may already have been read.
+/// Refuse a secret file (mint secret, pre-shared key, capability) anyone but its
+/// owner can read: `mode & 0o077` must be zero. The refusal names the `chmod` rather
+/// than fixing it silently, since a key that sat readable may already have been read.
 ///
 /// # Errors
 ///
@@ -253,10 +354,39 @@ pub fn check_private(path: &str) -> io::Result<()> {
     }
 }
 
-/// [`read_key_file`] behind [`check_private`]: what the broker and `aterm
-/// fabric on|join` read a pre-shared key with. The bridge's own `--key-file`
-/// keeps the plain reader, so a fleet whose key predates this check still
-/// dials.
+/// Read a mint secret: the one reader for every verb that mints or guards with a
+/// secret (`aterm link broker --secret-file`, `aterm link mint`, `aterm fabric on`,
+/// `mint-for`/`join`). The file must pass [`check_private`] and hold at least
+/// [`crate::enable::SECRET_LEN`] bytes: HMAC takes a key of any length, so a short
+/// one would mint well-formed capabilities that seal nothing. Its bytes are the
+/// secret exactly as read, a trailing newline included, as `asb`'s `load_secret`
+/// reads it: minter and verifier must agree byte for byte.
+///
+/// # Errors
+///
+/// A missing or unreadable file (`NotFound` when it is not there, which a
+/// caller may answer with a hint), a mode with any group/other bit set
+/// (`PermissionDenied`, naming the `chmod`), or a short secret (`InvalidData`).
+pub fn read_mint_secret(path: &str) -> io::Result<Vec<u8>> {
+    check_private(path)?;
+    let secret = std::fs::read(path)?;
+    if secret.len() < crate::enable::SECRET_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{path} holds {} bytes; a mint secret is at least {} (a short key mints \
+                 capabilities that seal nothing)",
+                secret.len(),
+                crate::enable::SECRET_LEN
+            ),
+        ));
+    }
+    Ok(secret)
+}
+
+/// [`read_key_file`] behind [`check_private`]: how the broker and `aterm fabric
+/// on|join` read a pre-shared key. The bridge's own `--key-file` keeps the plain
+/// reader, so a fleet key that is not owner-only still dials.
 ///
 /// # Errors
 ///
@@ -266,8 +396,8 @@ pub fn read_private_key_file(path: &str) -> io::Result<[u8; 32]> {
     read_key_file(path)
 }
 
-/// A key as the key FILE spells it: 64 lowercase hex characters and a newline —
-/// the shape [`read_key_file`] and `asb --key-file` read.
+/// A key as the key file spells it: 64 lowercase hex characters and a newline, the
+/// shape [`read_key_file`] and `asb --key-file` read.
 #[must_use]
 pub fn key_file_text(key: &[u8; 32]) -> String {
     let mut s = aterm_codec::hex::encode_lower(key);
@@ -275,10 +405,9 @@ pub fn key_file_text(key: &[u8; 32]) -> String {
     s
 }
 
-/// Whether every address `endpoint` (`<host>:<port>`) resolves to is a
-/// LOOPBACK address — the only kind a TCP broker binds without
-/// `--allow-remote`. `0.0.0.0` and `[::]` are the unspecified addresses, which
-/// listen on EVERY interface, so they are not loopback.
+/// Whether every address `endpoint` (`<host>:<port>`) resolves to is loopback, the
+/// only kind a TCP broker binds without `--allow-remote`. The unspecified `0.0.0.0`
+/// and `[::]` listen on every interface, so they are not.
 ///
 /// # Errors
 ///
@@ -301,11 +430,9 @@ pub fn endpoint_port(endpoint: &str) -> Option<u16> {
     endpoint.rsplit_once(':')?.1.parse().ok()
 }
 
-/// The address THIS host's own clients dial for a broker bound at `bind`: the
-/// loopback address of the same family when `bind` is an unspecified address
-/// (`0.0.0.0:<p>` → `127.0.0.1:<p>`, `[::]:<p>` → `[::1]:<p>`), which a bind
-/// accepts on every interface but a connect cannot name; `bind` itself
-/// otherwise.
+/// The address this host's own clients dial for a broker bound at `bind`: the same
+/// family's loopback when `bind` is unspecified (`0.0.0.0:<p>` → `127.0.0.1:<p>`,
+/// `[::]:<p>` → `[::1]:<p>`), which a connect cannot name; `bind` itself otherwise.
 #[must_use]
 pub fn dial_for_bind(bind: &str) -> String {
     match bind.rsplit_once(':') {
@@ -343,40 +470,47 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A read deadline set through the closer reaches the socket under the
-    /// erased stream: a `hello` nobody answers fails at the deadline (what
-    /// `fabric=stalled reason=no-ack` rests on).
+    /// A connect's deadline bounds both directions: a `hello` nobody answers and a
+    /// post bigger than the socket's buffers to a broker that stopped reading both
+    /// fail at it. Each runs on its own thread behind the one-minute hang detector, so
+    /// a missing deadline fails the test rather than hanging it.
     #[test]
-    fn a_read_deadline_set_through_the_closer_ends_a_hello_nobody_answers() {
+    fn a_connects_deadline_ends_a_hello_nobody_answers_and_a_publish_nobody_reads() {
         use std::os::unix::net::UnixListener;
         let dir = std::env::temp_dir().join(format!("atlink-deadline-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("scratch");
         let sock = dir.join("s.sock");
         let _ = std::fs::remove_file(&sock);
         let listener = UnixListener::bind(&sock).expect("bind");
-        let (mut conn, closer) =
-            connect(&Transport::Unix, sock.to_str().expect("utf8")).expect("connect");
-        let (peer, _) = listener.accept().expect("accept");
-        closer
-            .set_read_timeout(Some(std::time::Duration::from_millis(300)))
-            .expect("deadline");
-        let started = std::time::Instant::now();
-        let err = conn.hello().expect_err("nobody answers");
-        let waited = started.elapsed();
-        assert!(
-            matches!(
-                err.kind(),
-                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-            ),
-            "{err:?}"
-        );
-        // Not an instant refusal; the upper bound is a hang detector.
-        assert!(
-            waited >= std::time::Duration::from_millis(250)
-                && waited < std::time::Duration::from_secs(60),
-            "the deadline, not a hang and not an instant refusal: {waited:?}"
-        );
-        drop(peer);
+        let path = sock.to_str().expect("utf8").to_string();
+        let deadline = Duration::from_millis(300);
+        for what in ["hello", "publish"] {
+            let (mut conn, _closer) = connect(&Transport::Unix, &path, deadline).expect("connect");
+            let (peer, _) = listener.accept().expect("accept");
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let served = if what == "hello" {
+                    conn.hello().map(|_| ())
+                } else {
+                    // 256 KiB: the bridge's post cap, far past a Unix
+                    // socket's buffers.
+                    conn.publish(1, 1, "/f/t/x", &[0; 256 * 1024]).map(|_| ())
+                };
+                let _ = tx.send(served);
+            });
+            let err = rx
+                .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                .unwrap_or_else(|_| panic!("a {what} nobody serves outlived the deadline"))
+                .expect_err("nobody serves it");
+            assert!(
+                matches!(
+                    err.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ),
+                "{what}: {err:?}"
+            );
+            drop(peer);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -403,6 +537,38 @@ mod tests {
         );
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
         assert_eq!(read_private_key_file(p).expect("read"), [0x5a; 32]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A mint secret is owner-only and at least 32 bytes, or refused with the reason,
+    /// and is read byte for byte, a trailing newline included.
+    #[test]
+    fn a_mint_secret_is_owner_only_long_enough_and_read_byte_for_byte() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("atlink-mint-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let path = dir.join("mint.secret");
+        let p = path.to_str().expect("utf8");
+        let chmod = |mode| {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("chmod")
+        };
+        assert_eq!(
+            read_mint_secret(p).expect_err("absent").kind(),
+            io::ErrorKind::NotFound
+        );
+        let mut bytes = vec![0x5a; 31];
+        bytes.push(b'\n');
+        std::fs::write(&path, &bytes).expect("write");
+        chmod(0o644);
+        let e = read_mint_secret(p).expect_err("0644");
+        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+        assert!(e.to_string().contains(&format!("chmod 600 {p}")), "{e}");
+        chmod(0o600);
+        assert_eq!(read_mint_secret(p).expect("0600, 32 bytes"), bytes);
+        std::fs::write(&path, [0x5a; 31]).expect("write");
+        let e = read_mint_secret(p).expect_err("short");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        assert!(e.to_string().contains("holds 31 bytes"), "{e}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -475,6 +641,49 @@ mod tests {
         assert_eq!(endpoint_port("[::1]:0"), Some(0));
         assert_eq!(endpoint_port("h1"), None);
         assert_eq!(endpoint_port("h1:x"), None);
+    }
+
+    /// Equal jitter: every draw lies in `[b/2, b]`, both ends reachable.
+    #[test]
+    fn a_jittered_wait_lies_in_the_upper_half_of_the_back_off() {
+        let b = RECONNECT_MAX;
+        assert_eq!(jittered(b, 0), b / 2);
+        let span = u64::try_from((b - b / 2).as_micros()).expect("fits");
+        assert_eq!(jittered(b, span), b);
+        for r in [1, 7, span + 1, u64::MAX / 3, u64::MAX] {
+            let d = jittered(b, r);
+            assert!(b / 2 <= d && d <= b, "{r}: {d:?}");
+        }
+    }
+
+    /// A link lost right after it came up is a failed attach (it waits and doubles);
+    /// only one that stayed up restarts the back-off at the floor and redials at once.
+    #[test]
+    fn only_a_link_that_stayed_up_resets_the_back_off() {
+        let within = |d: Duration, b: Duration| b / 2 <= d && d <= b;
+        let t0 = Instant::now();
+        let mut b = Backoff::default();
+        // Nothing was up: nothing to wait out twice.
+        assert_eq!(b.lost(t0), None);
+        b.attached(t0);
+        let early = b
+            .lost(t0 + Duration::from_millis(1))
+            .expect("an early loss waits");
+        assert!(within(early, RECONNECT_MIN), "{early:?}");
+        let next = b.failed();
+        assert!(within(next, RECONNECT_MIN * 2), "it doubled: {next:?}");
+        // Up long enough: the redial goes now, from the floor again.
+        b.attached(t0);
+        assert_eq!(b.lost(t0 + LINK_STABLE), None);
+        let floor = b.failed();
+        assert!(within(floor, RECONNECT_MIN), "{floor:?}");
+        // The ceiling holds, including when entropy is unavailable and each
+        // failure waits the full delay.
+        let draws: Vec<Duration> = (0..64).map(|_| b.failed()).collect();
+        assert!(
+            draws[8..].iter().all(|d| within(*d, RECONNECT_MAX)),
+            "{draws:?}"
+        );
     }
 
     /// A `Transport`'s `Debug` never carries the key.

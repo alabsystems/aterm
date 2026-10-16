@@ -65,10 +65,8 @@ fn warm_block_decompress_rejects_truncated_serialized_payload() {
     );
 }
 
-/// Proves that `WarmTier::get_line()` failures advance a corrupt block toward
-/// quarantine without using `record_failure()` directly. This is the critical
-/// behavioral contract from #5947: read-path callers must not silently tolerate
-/// persistent corruption.
+/// `WarmTier::get_line()` failures alone advance a corrupt block to quarantine:
+/// read-path callers do not silently tolerate persistent corruption.
 #[test]
 fn read_failures_reach_quarantine_without_manual_record_failure() {
     let mut warm = WarmTier::new();

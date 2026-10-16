@@ -47,8 +47,8 @@ fn style_switch_crossfades_the_old_light_and_stays_active() {
     assert!(!glow.sparks.is_empty(), "the laser run left live sparks");
     assert!(glow.heat > 0.0, "the hot run charged the heat envelope");
     let heat_before = glow.heat;
-    // HOT-SWAP to rainbow kitty on the next tick — SAME cursor cell (no move
-    // to spawn from), so every emitted photon below is the OLD style's residue.
+    // Switch to rainbow kitty on the next tick at the same cell (no move to spawn from), so every
+    // photon below is the old style's residue.
     let rainbow_kitty = cfg(GlowStyle::RainbowKitty, true);
     t += Duration::from_millis(8);
     glow.tick(Some((0, 30)), t, &rainbow_kitty, g, &mut out);
@@ -96,8 +96,7 @@ fn style_switch_crossfades_the_old_light_and_stays_active() {
     );
 }
 
-/// The no-switch path is inert for the crossfade machinery: a single-style run
-/// never arms a fade or a ramp (the whole-frame golden proof pins the bytes).
+/// A single-style run never arms a crossfade or a ramp.
 #[test]
 fn no_switch_keeps_the_crossfade_machinery_inert() {
     let g = geom();
@@ -120,9 +119,8 @@ fn no_switch_keeps_the_crossfade_machinery_inert() {
     assert!(glow.fading.is_empty() && glow.ramp_in_at.is_none());
 }
 
-/// Rapid sequential switches chain: each outgoing style hands off into its own
-/// fade (bounded at FADE_CAP, oldest shed), and no frame in the chain shows
-/// zero cursor-effect output while any fade lives.
+/// Rapid sequential switches chain: each outgoing style hands off into its own fade (at most
+/// `FADE_CAP`, oldest shed), and no frame in the chain is dark while any fade lives.
 #[test]
 fn chained_switches_cap_fades_and_never_go_dark() {
     let g = geom();
@@ -141,7 +139,7 @@ fn chained_switches_cap_fades_and_never_go_dark() {
     t += Duration::from_millis(40);
     glow.note_synthetic_move(t);
     glow.tick(Some((0, 30)), t, &phaser, g, &mut out);
-    // Three switches ~60 ms apart — well inside one 250 ms envelope.
+    // Three switches 60 ms apart, inside one `FADE_OUT_S` envelope.
     for style in [GlowStyle::Sparkle, GlowStyle::Comet, GlowStyle::Lumen] {
         let c = cfg(style, true);
         t += Duration::from_millis(60);
@@ -190,8 +188,8 @@ fn style_switch_drops_pending_sound_cues() {
     glow.note_synthetic_typed(t0, 1);
     glow.tick(Some((2, 1)), t0, &water, g, &mut out); // typed step -> cue recorded
     assert_eq!(glow.sound_cues.len(), 1, "the typed move recorded its cue");
-    // Switch to fire on the next tick WITHOUT draining (a stalled host):
-    // the water-forged cue must not survive to play fire's crackle.
+    // Switch to fire on the next tick without draining (a stalled host): the water-forged cue
+    // must not survive to play fire's crackle.
     let fire = cfg(GlowStyle::Fire, true);
     let t1 = t0 + Duration::from_millis(8);
     glow.tick(Some((2, 1)), t1, &fire, g, &mut out);
@@ -200,7 +198,7 @@ fn style_switch_drops_pending_sound_cues() {
         0,
         "cues forged under the old style are dropped at the switch edge"
     );
-    // A fresh typed move under the NEW style records exactly its own cue.
+    // A fresh typed move under the new style records exactly its own cue.
     glow.note_synthetic_typed(t1, 1);
     let t2 = t1 + Duration::from_millis(40);
     glow.tick(Some((2, 2)), t2, &fire, g, &mut out);
@@ -209,9 +207,8 @@ fn style_switch_drops_pending_sound_cues() {
     assert_eq!(cues[0].kind, SoundKind::Typed);
 }
 
-/// The non-fire crown is radial light: a hot run's crown lands as RainHalos
-/// around the head (falloff radii ≥ 1) for every non-fire style, rendered
-/// identically by both backends.
+/// The non-fire crown is radial light: a hot run's crown lands as `RainHalo`s around the head
+/// (radii ≥ 1) for every non-fire style.
 #[test]
 fn non_fire_crown_is_radial_halos_not_squares() {
     let g = geom();
@@ -254,9 +251,8 @@ fn non_fire_crown_is_radial_halos_not_squares() {
     }
 }
 
-/// The pooled bolt-jag buffers carry nothing between strikes: the same seed
-/// produces the same polyline strike after strike. The only behavioural
-/// coverage of laser in this crate.
+/// The pooled bolt-jag buffers carry nothing between strikes: the same seed produces the same
+/// polyline strike after strike.
 #[test]
 fn a_pooled_bolt_jag_is_deterministic_across_strikes() {
     let mut g = CursorGlow::default();
@@ -279,8 +275,8 @@ fn a_pooled_bolt_jag_is_deterministic_across_strikes() {
             if big { "jump" } else { "crackle" },
             first.len()
         );
-        // Intervening strikes with OTHER seeds, so the pooled buffers hold
-        // someone else's points when the repeat runs.
+        // Intervening strikes with other seeds, so the pooled buffers hold someone else's points
+        // when the repeat runs.
         for seed in [0xAAAA_5555, 0x0F0F_F0F0] {
             strike(&mut g, seed, !big);
         }

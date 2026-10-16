@@ -17,7 +17,7 @@ pub(crate) fn feed_numbered_lines(grid: &mut Grid, start: usize, n: usize) {
     }
 }
 
-/// Every history row oldest→newest, read WITHOUT draining (the `line` /
+/// Every history row oldest→newest, read without draining (the `line` /
 /// `search` path), trailing blanks trimmed.
 pub(crate) fn history_trimmed(grid: &Grid) -> Vec<String> {
     (0..grid.scrollback_lines())

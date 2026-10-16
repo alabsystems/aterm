@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Autorelease-pool nesting — D2's arming.
-//!
-//! Neither `!Send` nor `!Clone` implies LIFO drop order, so a safe
-//! `AutoreleasePool::new()` would be unsound. This file runs the four lines
-//! that break nesting — in a CHILD PROCESS, because they kill the process — and
-//! then the same shape written as scopes, the only form the crate offers
-//! without `unsafe`.
+//! Autorelease-pool nesting. Neither `!Send` nor `!Clone` implies LIFO drop order, so
+//! `AutoreleasePool::new()` is `unsafe`. The out-of-order pop that breaks nesting runs in a child
+//! process (it kills the process); the scope form, the only safe one, nests to any depth.
 
 #![cfg(target_os = "macos")]
+#![allow(
+    clippy::disallowed_types,
+    reason = "test code: a stand-in child may inherit descriptors"
+)]
 
 use std::os::unix::process::ExitStatusExt as _;
 use std::process::Command;
@@ -19,24 +19,21 @@ use aterm_objc::{AutoreleasePool, autoreleasepool, ns_string, ns_string_to_rust}
 /// Set in the child so it runs the body instead of re-spawning.
 const CHILD: &str = "ATERM_OBJC_POOL_OUT_OF_ORDER_CHILD";
 
-/// `SIGABRT`, spelled out rather than pulled from `libc`: this crate has ZERO
-/// dependencies by construction and the number is fixed by POSIX.
+/// `SIGABRT`, spelled out rather than taken from `libc`: this crate has no dependencies, and
+/// POSIX fixes the number.
 const SIGABRT: i32 = 6;
 
 #[test]
 fn an_out_of_order_pop_is_fatal_which_is_why_new_is_unsafe() {
     if std::env::var_os(CHILD).is_some() {
-        // This misuse is why `new` is `unsafe`.
-        // SAFETY: deliberately VIOLATED. This child process executes the
-        // misuse and lets the Objective-C runtime report it.
+        // SAFETY: deliberately violated, in a child, so the runtime reports the misuse.
         unsafe {
             let outer = AutoreleasePool::new();
             let inner = AutoreleasePool::new();
             drop(outer);
             drop(inner);
         }
-        // Reached only if the runtime tolerated the out-of-order pop, in which
-        // case the parent's assertion below fails and says so.
+        // Reached only if the runtime tolerated the pop; the parent then fails.
         println!("SURVIVED-THE-OUT-OF-ORDER-POP");
         return;
     }
@@ -75,9 +72,7 @@ fn an_out_of_order_pop_is_fatal_which_is_why_new_is_unsafe() {
 
 #[test]
 fn the_scope_form_nests_to_any_depth_and_keeps_objects_alive_to_its_end() {
-    // The same four lines' INTENT, written the only way the crate now allows.
-    // Out-of-order pop is unconstructible here: the inner scope cannot outlive
-    // the outer one, because it is inside it.
+    // The out-of-order shape as scopes: an inner scope cannot outlive the one it is inside.
     let deep = autoreleasepool(|_a| {
         autoreleasepool(|_b| {
             autoreleasepool(|_c| {
@@ -92,10 +87,8 @@ fn the_scope_form_nests_to_any_depth_and_keeps_objects_alive_to_its_end() {
 
 #[test]
 fn a_scope_pops_its_pool_even_when_the_body_unwinds() {
-    // If a panic could skip the pop, the next pool on this thread would pop
-    // against a stack the runtime no longer agrees with — the same fatal error
-    // as an out-of-order drop, just delayed. The pool is a local of
-    // `autoreleasepool`'s own frame, so unwinding drops it.
+    // The pool is a local of `autoreleasepool`'s frame, so unwinding pops it. A skipped pop would
+    // make the next pool on this thread pop against a stack the runtime disagrees with.
     let caught = std::panic::catch_unwind(|| {
         autoreleasepool(|_| {
             let s = ns_string("about to unwind").expect("NSString");
@@ -104,8 +97,7 @@ fn a_scope_pops_its_pool_even_when_the_body_unwinds() {
         })
     });
     assert!(caught.is_err());
-    // A pool pushed AFTER the unwind must still pop cleanly. If the previous
-    // one had leaked its token this line would abort the test binary.
+    // A pool pushed after the unwind still pops cleanly; a leaked token would kill the binary here.
     let after = autoreleasepool(|_| {
         let s = ns_string("after").expect("NSString");
         // SAFETY: `s` is a live +1 NSString owned by this scope.

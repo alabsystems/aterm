@@ -1691,7 +1691,7 @@ const CHECKER_STALLED_TITLES: [&str; 2] = [CHECKER_STALLED_TITLE, "aterm's updat
 /// through (`holds_lane`: it stalled in its lock wait or inside its check), in
 /// which case the fresh one cannot check until it lets go — and the sentence must
 /// not say the remedy has already happened. It asks nothing of the person (an
-/// update never asks for a restart, grep_guard B12): it says what aterm did and
+/// update never asks for a restart): it says what aterm did and
 /// where the details are.
 pub(crate) fn checker_stalled_body(
     for_secs: u64,
@@ -1733,7 +1733,7 @@ pub(crate) fn checker_stalled_body(
 /// round four every other aterm waited on it for good, so the machine stopped
 /// checking with no notice. This aterm now checks without waiting for it, and
 /// the sentence says both halves: what is stuck, and that updates go on. It
-/// asks nothing of the person (grep_guard B12): the status line names the streak
+/// asks nothing of the person: the status line names the streak
 /// (`checker_deferred=`), and the log names the holder's pid.
 pub(crate) fn checker_lock_held_body(cycles: u64) -> String {
     format!(
@@ -1887,13 +1887,13 @@ pub(crate) fn dev_build_entry(writes: DevSharedWrites) -> Entry {
     .resurface(Resurface::CHOICE)
     .more("this dev build's bundle is named aterm.app, which only the release may be")
     .more(
-        "rebuild it with tools/dev-app.sh, which installs it as aterm (dev).app, and remove \
-         this copy",
+        "rebuild it with `targo --unverified ship dev-app`, which installs it as aterm \
+         (dev).app, and remove this copy",
     )
 }
 
 /// A DEV BUILD'S STANDING AGAINST THE CHANNEL (gap #30, 2026-09-26). The updater
-/// leaves a dev-marked copy (`tools/dev-app.sh`) alone on purpose, so nothing said
+/// leaves a dev-marked copy (`ship dev-app`) alone on purpose, so nothing said
 /// that a weeks-old `aterm (dev).app` launched from the Dock was running old code;
 /// the window now reads the public channel's head once at start and daily
 /// (`aterm_update::dev_channel`) and says where this copy stands, in the dev
@@ -1920,8 +1920,8 @@ pub(crate) fn dev_build(lag: &aterm_update::dev_channel::DevLag) -> Option<Messa
         )
         .line("the updater leaves a dev build alone, so it stays this old until rebuilt")
         .sentence(
-            "rebuild it with tools/dev-app.sh, or use the release (tools/install.sh puts it in \
-             Applications)",
+            "rebuild it with `targo --unverified ship dev-app`, or use the release \
+             (tools/install.sh puts it in Applications)",
         )
         .hold(Hold::LogOnly)
         .key(KEY_DEV_BUILD),
@@ -2060,11 +2060,6 @@ mod tests {
         assert_eq!(behind.hold, Hold::LogOnly);
         assert_eq!(behind.key.as_deref(), Some(KEY_DEV_BUILD));
         assert_eq!(attention(&behind), Ok(Attention::Record));
-        assert!(
-            behind.detail.iter().any(|l| l.contains("tools/dev-app.sh")),
-            "what to do rides with it: {:?}",
-            behind.detail
-        );
         assert_eq!(
             aterm_messages::text::glass_title_fault(&behind.title),
             None,
@@ -2137,7 +2132,6 @@ mod tests {
         let said = msg.detail.join(" ");
         assert!(said.contains("`aterm pkg repair`"), "{said}");
         assert!(said.contains("`aterm agents install`"), "{said}");
-        assert!(said.contains("tools/dev-app.sh"), "{said}");
         // What it writes is what its switches let it write, each with its own repair,
         // and nothing from a bundle that is not named aterm.app (the release-bundle
         // rule stands its writers down).

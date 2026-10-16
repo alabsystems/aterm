@@ -147,14 +147,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn text_shaping_config_default() {
-        let cfg = TextShapingConfig::default();
-        assert_eq!(cfg.ligature_mode, LigatureMode::Enabled);
-        assert_eq!(cfg.ambiguous_width, AmbiguousWidth::Single);
-        assert!(cfg.font_features.is_empty());
-    }
-
-    #[test]
     fn parse_font_features_plus_minus() {
         let f = parse_font_features("+ss01 -calt");
         assert_eq!(f.len(), 2);
@@ -235,7 +227,7 @@ mod generated_tests {
 
     /// Every `FontFeature` the parser emits is WELL-FORMED: the 4-byte tag is all
     /// ASCII, right-padded with spaces (`<1..=4 chars><spaces>`), and never empty —
-    /// exactly the shape `rustybuzz` requires.
+    /// exactly the shape an OpenType feature tag takes (`aterm_font::Tag`).
     fn assert_well_formed(f: &FontFeature) {
         assert!(f.tag.iter().all(u8::is_ascii), "tag bytes must be ASCII");
         let first_space = f.tag.iter().position(|&b| b == b' ').unwrap_or(4);

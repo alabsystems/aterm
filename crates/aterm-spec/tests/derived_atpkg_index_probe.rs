@@ -13,11 +13,6 @@ use aterm_spec::{
 #[test]
 fn a_suppressed_host_rechecks_when_the_shared_stamp_expires() {
     let model = atpkg_index_shared_handoff_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name)
-    );
     verify::prove_and_catch_scalar(&model, "atpkg index shared handoff");
 
     let buggy = interp::with_buggy(&model, 1);
@@ -41,11 +36,6 @@ fn a_suppressed_host_rechecks_when_the_shared_stamp_expires() {
 #[test]
 fn the_next_probe_uses_the_shared_stamps_completion_clock() {
     let model = atpkg_index_probe_completion_cadence_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name)
-    );
     verify::prove_and_catch_scalar(&model, "atpkg index probe completion cadence");
 
     let buggy = interp::with_buggy(&model, 1);
@@ -72,12 +62,6 @@ fn the_next_probe_uses_the_shared_stamps_completion_clock() {
 #[test]
 fn cross_process_probe_cooldown_proves_and_catches_duplicate_ranges() {
     let model = atpkg_index_probe_cooldown_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name),
-        "the cross-process probe must stay enrolled in the spec-link registry"
-    );
     verify::prove_and_catch_scalar(&model, "atpkg index probe cooldown");
 
     let mut healthy = model.init_state();
@@ -122,11 +106,6 @@ fn cross_process_probe_cooldown_proves_and_catches_duplicate_ranges() {
 #[test]
 fn independent_hints_prove_highest_and_no_false_missing() {
     let model = atpkg_index_successor_selection_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name)
-    );
     verify::prove_and_catch_scalar(&model, "atpkg successor selection");
 
     let mut healthy = model.init_state();
@@ -151,11 +130,6 @@ fn independent_hints_prove_highest_and_no_false_missing() {
 #[test]
 fn failed_index_highwater_proves_no_older_replay() {
     let model = atpkg_index_wake_highwater_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name)
-    );
     verify::prove_and_catch_scalar(&model, "atpkg index wake highwater");
 
     let mut healthy = model.init_state();

@@ -3,9 +3,8 @@
 
 //! In-memory cold tier: compressed pages.
 //!
-//! Pages are compressed with zstd when the `zstd` feature is enabled, and with
-//! the warm tier's LZ4 codec otherwise (the default headless build). The codec
-//! is fixed at compile time, so pages are always decodable in the same build.
+//! Pages are compressed with the cold codec: the warm tier's size-prepended
+//! LZ4 (`encode_cold_block`), the same in every build.
 //!
 //! For disk-backed cold storage, see `DiskColdTier` (the `disk-tier` feature).
 
@@ -51,7 +50,7 @@ fn take_cold_find_page_steps() -> usize {
     })
 }
 
-/// A cold page (compressed with the cold codec: zstd, or LZ4 by default).
+/// A cold page (compressed with the LZ4 cold codec).
 ///
 /// Stored in memory. For disk-backed storage, see `DiskColdTier`.
 #[derive(Debug, Clone)]
@@ -80,11 +79,11 @@ impl ColdPage {
     }
 }
 
-/// Cold tier: Zstd compressed pages (in-memory).
+/// Cold tier: LZ4 compressed pages (in-memory).
 ///
 /// For disk-backed cold storage, use [`DiskColdTier`](super::DiskColdTier).
 /// Uses cumulative line counts for O(log P) page lookup and caches the
-/// last decompressed page to avoid redundant Zstd decompression.
+/// last decompressed page to avoid redundant decompression.
 ///
 /// The `front_offset` field enables O(1) line-limit enforcement: instead of
 /// decompressing the boundary page to remove a few oldest lines, we simply
@@ -158,7 +157,7 @@ impl ColdTier {
         self.pages.len()
     }
 
-    /// Push a warm block (re-compresses with Zstd).
+    /// Push a warm block (re-compresses with the cold codec).
     ///
     /// Returns the number of lines accepted. On decompression/re-compression
     /// failure, logs a warning, drops the block, and returns 0. This preserves
@@ -197,7 +196,7 @@ impl ColdTier {
     /// Get a line by index (0 = oldest available line, accounting for front_offset).
     ///
     /// Uses O(log P) binary search on cumulative line counts and caches the
-    /// last decompressed page to avoid redundant Zstd decompression.
+    /// last decompressed page to avoid redundant decompression.
     ///
     /// Returns `Ok(None)` for out-of-bounds, `Err` for decompression failures.
     // Skip: native typed-TrustIr lowering does not complete for this body (a
@@ -674,8 +673,7 @@ impl ColdTier {
         }
     }
 
-    // Back-removal methods (pre_validate_truncate_back, truncate_back_lines)
-    // are in cold_tier_back_removal.rs.
+    // Back-removal (truncate_back_lines) is in cold_tier_back_removal.rs.
 
     /// Clear all pages.
     // Skip: the page ring's element drop glue (std/alloc internals — the

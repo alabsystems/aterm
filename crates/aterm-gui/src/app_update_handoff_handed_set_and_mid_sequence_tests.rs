@@ -10,9 +10,8 @@ use super::{
 use crate::native_update_auto_intent::{ActivityFacts, ApplyPhase};
 use crate::native_updater_service::ApplyMode;
 
-/// A PTY pair, both ends close-on-exec from birth: a child another test
-/// spawns meanwhile never keeps the slave open past its exec, so a closed
-/// slave reads as hung up (the fd-copy sweep of 2026-09-27).
+/// A PTY pair, both ends close-on-exec from birth: a child another test spawns never keeps
+/// the slave open past its exec, so a closed slave reads as hung up.
 fn openpty() -> (i32, i32) {
     aterm_pty::open_pty_pair().expect("open_pty_pair")
 }
@@ -60,11 +59,9 @@ fn capture_for(
     .map(|parked| parked.screens.iter().map(|(id, _)| *id).collect())
 }
 
-/// A hop to an older successor carries no parser state it will read: a build
-/// predating the parser carry resumes at Ground, so a reader parked inside
-/// `ESC [ 38;5;19` with `6mcompiling` queued would print `6mcompiling`. On such
-/// a hop any partial sequence over queued output misses (re-parked on a
-/// boundary); the stalled case and the boundary are still carried.
+/// A build predating the parser carry resumes at Ground (a reader parked in `ESC [ 38;5;19`
+/// with `6mcompiling` queued would print `6mcompiling`), so on a hop to it any partial sequence
+/// over queued output misses; the stalled case and the boundary are still carried.
 #[test]
 fn an_older_successor_misses_a_split_csi_over_queued_output() {
     let running = 200;
@@ -115,16 +112,10 @@ fn set_master(app: &mut crate::App, id: u64, master: i32) {
         .master = master;
 }
 
-/// A reader parked inside a hooked DCS query (DECRQSS) with the rest queued
-/// must miss: no carry holds a query (its reply lives in the handler), so the
-/// successor would print the rest of the string as text. The same parser over a
-/// quiet PTY (stalled) is carried, as is queued output at a sequence boundary,
-/// and a hooked string the engine only consumes (a tmux passthrough wrapper),
-/// which the carry swallows to its terminator exactly as the engine would
-/// (round eight of the update audit, finding 57).
-///
-/// A reader parked inside `ESC [ 38;5;19` with `6m` queued is carried: the
-/// checkpoint holds the partial CSI and the successor finishes it.
+/// A reader parked inside a hooked DCS query (DECRQSS) with the rest queued must miss: no carry
+/// holds a query, so the successor would print the rest as text. Carried: the same parser over
+/// a quiet PTY, queued output at a boundary, a split CSI, and a hooked string the engine only
+/// consumes (a tmux passthrough wrapper).
 #[test]
 fn a_parser_parked_mid_sequence_over_queued_output_misses_the_park() {
     let mut app = crate::App::headless_for_test();
@@ -188,15 +179,10 @@ fn a_parser_parked_mid_sequence_over_queued_output_misses_the_park() {
     aterm_pty::close_fd(master);
 }
 
-/// A carry that would only swallow the queued tail is a miss, not a carry: an
-/// OSC over the 4 KiB cap and a started APC string are carried only as
-/// sequences to ignore, so the successor would dispatch nothing (no kitty
-/// image, no clipboard). Each re-parks on a boundary, on the fork lane as on
-/// the launched one; only a picture is carried once no free re-park is left.
-/// Over a quiet PTY each is still carried. The controls are what the carry
-/// continues exactly, carried over queued output: a short OSC, and a DCS
-/// header, carried as itself since 2026-10-10 (round fifteen, R15-PARSER-P1;
-/// it was carried as `DcsIgnore` and missed the park here before).
+/// A carry that would only swallow the queued tail is a miss: an OSC over the 4 KiB cap or a
+/// started APC is carried only as a sequence to ignore, so the successor would dispatch nothing.
+/// Each re-parks on a boundary on either lane; only a picture is carried once no free re-park
+/// is left. Quiet, each is carried. Controls: a short OSC and a DCS header carry exactly.
 #[test]
 fn a_carry_that_only_swallows_the_queued_tail_misses_the_park() {
     let mut app = crate::App::headless_for_test();
@@ -208,8 +194,7 @@ fn a_carry_that_only_swallows_the_queued_tail_misses_the_park() {
     let mut image = b"\x1b]1337;File=inline=1:".to_vec();
     image.extend(std::iter::repeat_n(b'A', 5000));
     for free_repark in [false, true] {
-        // The fork lane has no free re-park; the launched lane's attempt
-        // has one left.
+        // The fork lane has no free re-park; the launched lane's attempt has one left.
         app.update_handoff_prelaunch = free_repark.then(|| {
             let (mut prelaunch, ..) =
                 super::late_park_record_tests::prelaunch_record(1, ApplyMode::AutomaticPastGrace);
@@ -266,8 +251,8 @@ fn a_carry_that_only_swallows_the_queued_tail_misses_the_park() {
         }
     }
     app.update_handoff_prelaunch = None;
-    // CONTROLS: what the carry continues exactly is carried over queued
-    // output — a short OSC, and a DCS header.
+    // Controls: what the carry continues exactly (a short OSC, a DCS header) is carried over
+    // queued output.
     for (at, parked, queued) in [
         ("a short OSC", &b"\x1b]0;a ti"[..], &b"tle\x07"[..]),
         (
@@ -293,17 +278,10 @@ fn a_carry_that_only_swallows_the_queued_tail_misses_the_park() {
     aterm_pty::close_fd(master);
 }
 
-/// THE HELD CAPTURE IS BOUNDED BY WHAT CAN CROSS (round six of the update
-/// audit, finding 21). One live session and more exited panes than a
-/// handoff carries: the capture projects at most `MAX_HELD_PANES` of them
-/// — the manifest writer would drop the rest. A held capture whose own
-/// deadline has come projects nothing: the clock is read before each pane,
-/// so no pane is started past it. And that deadline is its own, a quarter
-/// of the budget short of the park's (`held_capture_deadline`, pinned on
-/// fixed instants): a held capture that ran to the park's deadline turned
-/// every landed park into a miss.
-///
-/// RED before the fix: every exited pane was projected (70 of them).
+/// The held capture projects at most `MAX_HELD_PANES` exited panes (the manifest writer drops
+/// the rest), nothing once its own deadline has come, and that deadline is a quarter of the
+/// budget short of the park's (`held_capture_deadline`), so it never turns a landed park into
+/// a miss.
 #[test]
 fn the_held_capture_stops_at_the_held_caps_and_at_its_own_deadline() {
     let mut app = crate::App::headless_for_test();
@@ -328,9 +306,8 @@ fn the_held_capture_stops_at_the_held_caps_and_at_its_own_deadline() {
     let live = app.handoff_live_sessions();
     assert_eq!(live.len(), 1, "PRECONDITION: only session 0 is handed");
 
-    // A hang detector, not a budget: the held capture runs only with half
-    // of it (a minute) to spare, and stops a quarter short of it, so on
-    // any machine it stops at the cap.
+    // A hang detector, not a budget: the held capture needs half of it to spare and stops a
+    // quarter short of it, so on any machine it stops at the cap.
     let window = std::time::Duration::from_secs(120);
     let parked = app
         .capture_parked_screens(
@@ -360,9 +337,8 @@ fn the_held_capture_stops_at_the_held_caps_and_at_its_own_deadline() {
         "a held capture whose deadline has come projects no pane"
     );
 
-    // ITS OWN DEADLINE, on fixed instants: held panes only with half the
-    // budget (`comfort`) to spare, and then a quarter of it short of the
-    // park's deadline — never the deadline itself.
+    // Its own deadline, on fixed instants: held panes only with half the budget (`comfort`) to
+    // spare, and then a quarter of it short of the park's deadline.
     let now = std::time::Instant::now();
     let comfort = std::time::Duration::from_millis(200);
     let deadline = now + comfort;
@@ -384,13 +360,9 @@ fn the_held_capture_stops_at_the_held_caps_and_at_its_own_deadline() {
     aterm_pty::close_fd(master);
 }
 
-/// The engine's in-flight output state over queued output (round eight of
-/// the update audit, finding 502). Parked inside an OSC 8 link, or between
-/// a VT52 `ESC Y` and its address bytes, a successor that carries the
-/// output state continues both, so the park carries the screen. A successor
-/// older than that carry would commit the rest of the link's text unlinked
-/// and print the address bytes: to it each is a miss. Over a quiet PTY
-/// each is carried to both; a closed link is the control.
+/// Parked inside an OSC 8 link, or between a VT52 `ESC Y` and its address bytes, over queued
+/// output: carried to a successor that carries the output state, a miss for an older one
+/// (which would print the rest unlinked, or print the address). Quiet, both carry it.
 #[test]
 fn an_open_link_or_a_vt52_address_over_queued_output_misses_only_an_older_hop() {
     let running = 200;
@@ -401,8 +373,7 @@ fn an_open_link_or_a_vt52_address_over_queued_output_misses_only_an_older_hop() 
     let (master, slave) = openpty();
     set_master(&mut app, 0, master);
     let term = app.pool.get(0).expect("session 0").term.clone();
-    // The launched lane's attempt, with its free re-parks unspent: the
-    // one place an open link still misses.
+    // The launched lane's attempt, its free re-parks unspent, so an open link still misses.
     let (prelaunch, ..) =
         super::late_park_record_tests::prelaunch_record(1, ApplyMode::AutomaticPastGrace);
     app.update_handoff_prelaunch = Some(prelaunch);
@@ -443,7 +414,7 @@ fn an_open_link_or_a_vt52_address_over_queued_output_misses_only_an_older_hop() 
         );
         crate::term_lock(&term).process(reset);
     }
-    // CONTROL: a link opened and closed before the park is no hazard.
+    // Control: a link opened and closed before the park is no hazard.
     crate::term_lock(&term).process(b"\x1b]8;;https://example.com\x07a\x1b]8;;\x07");
     write_all(slave, b"more output\r\n");
     assert_eq!(
@@ -460,11 +431,9 @@ fn an_open_link_or_a_vt52_address_over_queued_output_misses_only_an_older_hop() 
     aterm_pty::close_fd(master);
 }
 
-/// On a hop to a successor older than the output-state carry, an open link
-/// that never closes does not hold the update: its miss spends only the
-/// launched lane's free mid-sequence re-parks; after that, and on the fork
-/// lane, the screen is carried and that successor stops linking the rest.
-/// Negative control: a VT52 address is still a miss with the re-parks spent.
+/// On a hop to a successor older than the output-state carry, an open link that never closes
+/// spends only the launched lane's free mid-sequence re-parks; then, and on the fork lane, the
+/// screen is carried. Negative control: a VT52 address still misses with the re-parks spent.
 #[test]
 fn an_open_link_past_the_free_reparks_is_carried_not_missed() {
     let running = 200;
@@ -520,14 +489,10 @@ fn an_open_link_past_the_free_reparks_is_carried_not_missed() {
     aterm_pty::close_fd(master);
 }
 
-/// A GRAPHICS STREAM DOES NOT HOLD THE UPDATE (round eight of the update
-/// audit, finding 57): kitty-graphics chunks arrive back to back, so the
-/// parser is inside an APC at almost every batch edge, and every park
-/// missed while the stream played. On the fork lane, and once the
-/// launched lane's free re-parks are spent, the screen is carried and the
-/// in-flight frame dropped; the stream's next frame replaces it. NEGATIVE
-/// CONTROLS: with a free re-park left it is a miss, and an OSC 52
-/// clipboard write, which nothing replaces, stays a miss past them.
+/// A graphics stream does not hold the update: the parser is inside a kitty-graphics APC at
+/// almost every batch edge, so on the fork lane, and once the launched lane's free re-parks are
+/// spent, the screen is carried and the in-flight frame dropped. Negative controls: with a free
+/// re-park left it misses, and an OSC 52 clipboard write, which nothing replaces, always does.
 #[test]
 fn a_graphics_stream_past_the_free_reparks_is_carried_not_missed() {
     let mut app = crate::App::headless_for_test();
@@ -601,12 +566,9 @@ fn calm_land(live: &[(u64, i32, i32)]) -> ParkGateFacts {
     }
 }
 
-/// `aterm --hold` with one pane's command exited: its master stays hung up until
-/// the pane is closed. The pane is left out of the handed set, so the gate parks,
-/// the capture carries exactly the live sessions, and the manifest names exactly
-/// them.
-///
-/// Control: the whole pool, fed to the same gate, still waits.
+/// `aterm --hold` with one pane's command exited: its master stays hung up until the pane
+/// closes, so it is left out of the handed set and the gate, capture and manifest see only the
+/// live sessions. Control: the whole pool, fed to the same gate, still waits.
 #[test]
 fn an_exited_held_pane_is_not_handed_and_does_not_hold_the_park() {
     let mut app = crate::App::headless_for_test();
@@ -615,10 +577,8 @@ fn an_exited_held_pane_is_not_handed_and_does_not_hold_the_park() {
     write_all(exited_slave, b"build finished\r\n");
     aterm_pty::close_fd(exited_slave);
     let probe = [(1u64, exited_master, 0i32)];
-    // A hang detector, not 2 s: the hang-up arrives only once every copy of
-    // the slave is closed, and a child another test is forking holds one
-    // until it execs (the fd-copy sweep of 2026-09-27). A slave that never
-    // closes still fails.
+    // A hang detector: the hang-up arrives only once every copy of the slave is closed, and a
+    // child another test is forking holds one until it execs.
     let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
     while !handoff_masters_closed(&probe) {
         assert!(
@@ -695,14 +655,9 @@ fn an_exited_held_pane_is_not_handed_and_does_not_hold_the_park() {
     aterm_pty::close_fd(exited_master);
 }
 
-/// The foreground holder crosses at the Repaint rung: the successor restores a
-/// blank-carried session's modes, so the park capture reads every handed
-/// session's holder whatever its rung, and the lanes stamp it on the manifest
-/// record. Otherwise a job that died during the handoff would keep its alt
-/// screen and mouse under the prompt.
-///
-/// Carried blank by the policy ceiling (`carry = "repaint"`), which puts any
-/// screen at the Repaint rung.
+/// The foreground holder crosses even at the Repaint rung: the successor restores a
+/// blank-carried session's modes from it, or a job that died during the handoff would keep its
+/// alt screen and mouse under the prompt.
 #[test]
 fn a_repaint_rung_session_still_carries_its_foreground_holder() {
     let mut app = crate::App::headless_for_test();
@@ -766,11 +721,9 @@ fn a_repaint_rung_session_still_carries_its_foreground_holder() {
     assert_eq!(absent.sessions[0].fg_holder, None, "another session's");
 }
 
-/// THE CRASH JOURNAL'S KEY rides the record it names, and only that one
-/// (round seven of the update audit, leftover I2b): `App::journal_keys`
-/// is empty for a process with nothing taken over — so a healthy update
-/// writes no key, and an older reader sees the wire it always saw — and a
-/// key for another session is not this one's.
+/// The crash journal's key rides the record it names, and only that one. `App::journal_keys`
+/// is empty for a process with nothing taken over, so a healthy update writes no key and an
+/// older reader sees the wire it always saw.
 #[test]
 fn a_journal_key_rides_the_record_it_names_and_no_other() {
     let app = crate::App::headless_for_test();
@@ -795,12 +748,9 @@ fn a_journal_key_rides_the_record_it_names_and_no_other() {
     assert_eq!(other.sessions[0].journal_key, None, "another session's");
 }
 
-/// THE RENDER DEBT crosses the handoff (R08): a session on the alternate
-/// screen whose engine owes rows is read under the park, whatever else the
-/// capture does, and rides the manifest record as `render_debt`; one that
-/// owes nothing, one on the main screen and one carried blank on purpose
-/// write no key. NEGATIVE CONTROLS in the same test: the debt-free session
-/// and the Repaint rung.
+/// The render debt crosses the handoff: an alternate-screen session whose engine owes rows is
+/// read under the park and rides the manifest record as `render_debt`; one that owes nothing,
+/// one on the main screen and one carried blank on purpose write no key.
 #[test]
 fn a_session_that_owes_rows_carries_its_render_debt_and_the_others_carry_none() {
     let window = std::time::Duration::from_secs(30);
@@ -821,8 +771,8 @@ fn a_session_that_owes_rows_carries_its_render_debt_and_the_others_carry_none() 
     let owing = || {
         let mut t = aterm_core::terminal::Terminal::new(12, 20);
         t.process(b"\x1b[?1049h\x1b[2J");
-        // Every row painted, the cursor parked on the composer (the incident's
-        // shape): a shrink then demotes the TOP row, not a blank bottom one.
+        // Every row painted, the cursor parked on the composer: a shrink then demotes the top
+        // row, not a blank bottom one.
         for r in 0..12 {
             t.process(format!("\x1b[{};1HL{r}", r + 1).as_bytes());
         }
@@ -903,9 +853,8 @@ fn a_session_that_owes_rows_carries_its_render_debt_and_the_others_carry_none() 
     assert_eq!(other.sessions[0].render_debt, None);
 }
 
-/// A hold-cap stand-down says what held the park — the ledger used to read
-/// "the terminal never offered a moment to pause in" for an exited pane's
-/// master, blaming the user.
+/// A hold-cap stand-down says what held the park, so an exited pane's master is not blamed on
+/// the user.
 #[test]
 fn a_hold_cap_stand_down_names_what_held_the_park() {
     let held_for = std::time::Duration::from_secs(120);

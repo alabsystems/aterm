@@ -1,21 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// Animated-ink fg overrides (Sparkle Words v2, `RenderInput.ink`) on the CPU
-// renderer. The channel contract under test:
-//   * empty ink is byte-identical to the pre-ink path (also after
-//     `clear_overlays`, the `image plain` contract) — the `ink` row of
-//     `tests/empty_channels.rs`;
-//   * ink substitutes for the cell fg at EVERY fg consult site — glyph blit,
-//     combining marks, underline / strike / overline — so an inked cell renders
-//     byte-identically to the same cell recoloured via SGR truecolor fg;
-//   * ordering: ink FIRST, then the min-contrast floor, then (on selected
-//     cells) the selection fg floor — the floors see the FINAL ink colour;
-//   * an explicit SGR 58 underline colour still wins over ink;
-//   * a wide glyph is governed by its LEAD cell's InkCell (a continuation-only
-//     entry is inert);
-//   * dirty gate: settled (non-empty but EQUAL) ink gate-hits with zero rows
-//     marked; changed ink marks exactly the prev∪cur ink rows.
+// Animated-ink fg overrides (Sparkle Words v2, `RenderInput.ink`) on the CPU renderer. The
+// empty-ink no-op is the `ink` row of `tests/empty_channels.rs`. Pinned here: ink
+// substitutes for the cell fg at every consult site; it applies before the min-contrast and
+// selection floors; an explicit SGR 58 underline colour wins; a wide glyph follows its lead
+// cell's InkCell; the dirty gate.
 
 use aterm_core::render::InkCell;
 use aterm_core::terminal::Terminal;
@@ -24,11 +14,11 @@ use aterm_render::{
     floor_selection_fg, rgb_to_u32,
 };
 
-fn renderer() -> Renderer {
+pub(crate) fn renderer() -> Renderer {
     Renderer::from_system(18.0, Theme::default())
         .map(|mut r| {
-            // Deterministic pixels: block on the lazy fallback parses so a parse
-            // landing between two renders can't recolour a "must not change" frame.
+            // A lazy fallback parse landing between two renders would break the
+            // byte comparisons.
             r.debug_block_on_lazy_fallbacks();
             r
         })
@@ -45,20 +35,11 @@ fn cell_pixels(f: &Frame, cw: usize, ch: usize, row: usize, col: usize) -> Vec<u
     out
 }
 
-/// The definitive substitution proof: inking a cell is byte-identical to
-/// recolouring the SAME text via SGR truecolor fg — across a plain glyph, a
-/// combining-mark cell (é as e + U+0301), a wide CJK cell (lead-governed), an
-/// underlined cell, a struck cell and a CURLY-underlined cell. That is all five
-/// CPU consult sites: glyph blit, combining blit, pass 3's underline colour,
-/// pass 3's strike/overline colour, and pass 3b's AA undercurl.
-///
-/// The curl is called out because it is a SEPARATE pass, which once derived
-/// its OWN colour (a fresh `InkWalk`/`CharFgWalk`; it now blends the ink pass 3
-/// records), and it drifted: until ed9f774b the CPU curl kept the cell's own fg after ink.
-/// The straight-underline cell does not cover it — `\x1b[4m` never reaches
-/// pass 3b. The GPU twin (`ink_gpu_matches_cpu`) gained its curly cell in that
-/// same fix; this CPU-only proof did not, and it is the only one that runs on a
-/// host without a working wgpu device.
+/// Inking a cell is byte-identical to recolouring the same text via SGR truecolor fg, at
+/// all five CPU consult sites: glyph blit, combining blit (é as e + U+0301), pass 3's
+/// underline colour, pass 3's strike/overline colour and pass 3b's AA undercurl, plus a
+/// lead-governed wide CJK cell. The curly cell is needed because `\x1b[4m` never reaches
+/// pass 3b. The GPU twin is `ink_gpu_matches_cpu`; this one runs without a wgpu device.
 #[test]
 fn ink_renders_byte_identically_to_sgr_fg_recolor() {
     let mut rend = renderer();
@@ -125,9 +106,8 @@ fn ink_renders_byte_identically_to_sgr_fg_recolor() {
     assert_ne!(fa, rend.render_input(&plain).pixels);
 }
 
-/// At full glyph coverage the blit lands the EXACT host-resolved ink bytes
-/// (blend at cov 255 is the identity): the endpoint-exactness bar. U+2588 FULL
-/// BLOCK is procedurally drawn at coverage 255 across the whole cell.
+/// At full coverage (U+2588 is drawn at 255 across the cell) the blit lands the exact ink
+/// bytes.
 #[test]
 fn ink_endpoint_exact_at_full_coverage() {
     let mut rend = renderer();
@@ -149,11 +129,9 @@ fn ink_endpoint_exact_at_full_coverage() {
     );
 }
 
-/// Ordering: ink FIRST, then the selection fg floor on selected cells — the
-/// floor sees (and fixes) the FINAL ink colour, so selection legibility wins
-/// over shimmer. Pinned with an ink colour deliberately illegible against the
-/// selection band: the drawn colour is `floor_selection_fg(ink, sel_bg)`
-/// exactly, and the raw ink bytes never reach the frame.
+/// Ink applies before the selection fg floor on selected cells: with an ink colour
+/// illegible on the selection band, the drawn colour is exactly
+/// `floor_selection_fg(ink, sel_bg)` and the raw ink bytes never reach the frame.
 #[test]
 fn ink_then_selection_floor_applies_in_that_order() {
     use aterm_core::selection::{SelectionSide, SelectionType};
@@ -167,8 +145,7 @@ fn ink_then_selection_floor_applies_in_that_order() {
         sel.update_selection(0, 0, SelectionSide::Right);
         sel.complete_selection();
     }
-    // Near the default selection band colour (0x33415E): guaranteed under the
-    // 4.5:1 selection floor, so the floor MUST move it.
+    // The default selection band colour (0x33415E): under the 4.5:1 floor, so it moves.
     let ink: [u8; 3] = [0x33, 0x41, 0x5E];
     let sel_bg = rend.effective_selection_bg();
     let expected = floor_selection_fg(rgb_to_u32(ink), sel_bg);
@@ -196,9 +173,8 @@ fn ink_then_selection_floor_applies_in_that_order() {
     );
 }
 
-/// Ordering: ink FIRST, then the per-cell minimum-contrast floor on unselected
-/// cells — the host-configured floor guarantees the FINAL ink colour's
-/// readability against the cell's own bg. Same endpoint-exact pin as above.
+/// Ink applies before the per-cell minimum-contrast floor on unselected cells, so the floor
+/// sees the final ink colour.
 #[test]
 fn ink_then_min_contrast_floor_applies_in_that_order() {
     let mut rend = renderer();
@@ -234,10 +210,9 @@ fn ink_then_min_contrast_floor_applies_in_that_order() {
     );
 }
 
-/// An explicit SGR 58 underline colour wins over ink: with SGR 58 set, two
-/// frames differing ONLY in ink colour are byte-identical on an underlined
-/// SPACE cell (the underline is the sole fg consumer there); without SGR 58
-/// the underline follows ink exactly (solid fill == exact ink bytes).
+/// An explicit SGR 58 underline colour wins over ink: on an underlined space (the underline
+/// is its only fg consumer) two frames differing only in ink are byte-identical; without
+/// SGR 58 the underline is the exact ink bytes.
 #[test]
 fn sgr58_explicit_underline_color_wins_over_ink() {
     let mut rend = renderer();
@@ -263,7 +238,7 @@ fn sgr58_explicit_underline_color_wins_over_ink() {
     let fb = rend.render_input(&input).pixels.clone();
     assert_eq!(fa, fb, "SGR 58 must win over ink: ink colour is irrelevant");
 
-    // Control (non-vacuous): WITHOUT SGR 58 the underline follows ink.
+    // Control (non-vacuous): without SGR 58 the underline follows ink.
     let mut term = Terminal::new(1, 4);
     term.process(b"\x1b[?25l\x1b[4m \x1b[0m");
     let mut input = term.cell_frame(1, 4);
@@ -289,7 +264,7 @@ fn sgr58_explicit_underline_color_wins_over_ink() {
     );
 }
 
-/// The LEAD cell's InkCell governs a wide glyph; an entry on the continuation
+/// The lead cell's InkCell governs a wide glyph; an entry on the continuation
 /// column alone is inert (that column carries no glyph and no decoration).
 #[test]
 fn wide_cjk_continuation_only_ink_is_inert() {
@@ -310,10 +285,8 @@ fn wide_cjk_continuation_only_ink_is_inert() {
     );
 }
 
-/// Dirty gate: settled ink — non-empty but EQUAL between frames — is a gate
-/// hit (zero rendering; the steady state costs nothing); CHANGED ink marks
-/// exactly the prev∪cur ink rows (rows only — ink never spills its row band)
-/// and must not gate-hit.
+/// Settled ink (non-empty but equal between frames) gate-hits; changed ink marks exactly
+/// the prev∪cur ink rows and does not gate-hit.
 #[test]
 fn ink_dirty_gate_settled_hits_changed_marks_prev_union_cur_rows() {
     let mut term = Terminal::new(4, 8);
@@ -371,83 +344,5 @@ fn ink_dirty_gate_settled_hits_changed_marks_prev_union_cur_rows() {
         marked,
         vec![1, 3],
         "changed ink must mark exactly the prev∪cur ink rows"
-    );
-}
-
-/// §7.4/§14 P5 perf gate — `bench_ink_apply`: the §4.1 merge-walk overhead of
-/// a FULL 512-InkCell load (the MAX_INK_CELLS cap) in a full-frame render vs a
-/// no-ink baseline of the identical frame; both medians are reported. The
-/// merge-walk is O(1)/cell — one pointer compare per column — so the overhead
-/// must stay in the noise class, not the per-cell-binary-search class. Runs
-/// alternate so drift hits both sides. The measured numbers land in
-/// PROOF_CARRYING_PERFORMANCE.md ("Sparkle Words v2.1"). Timing-sensitive, so
-/// it follows the repo's manual-timing idiom:
-///
-/// ```sh
-/// targo --unverified test -p aterm-render --release --test render_suite -- \
-///   ink::bench_ink_apply --ignored --nocapture
-/// ```
-#[test]
-#[ignore = "perf gate (design §7.4): run manually: --release --test render_suite -- ink:: --ignored --nocapture"]
-fn bench_ink_apply() {
-    use std::time::Instant;
-    let mut rend = renderer();
-    let (rows, cols) = (40usize, 120usize);
-    let mut term = Terminal::new(rows as u16, cols as u16);
-    term.process(b"\x1b[?25l");
-    let line = "the quick brown fox jumps over the lazy dog 0123456789 ".repeat(3);
-    for r in 0..rows {
-        term.process(format!("\x1b[{};1H{}", r + 1, &line[..cols]).as_bytes());
-    }
-
-    let base_input = term.cell_frame(rows, cols);
-    let mut inked_input = base_input.clone();
-    // Exactly 512 InkCells (the cap), sorted (row, col), spread over every row
-    // — 12–13 word-shaped cells per row, the §7.3 worst-case ink screen.
-    let mut ink = Vec::with_capacity(512);
-    'fill: for r in 0..rows as u16 {
-        for c in 0..13u16 {
-            if ink.len() == 512 {
-                break 'fill;
-            }
-            let col = c * 9 + (r % 3); // staggered word-ish spread, still sorted
-            ink.push(InkCell {
-                row: r,
-                col,
-                color: [0x7C, 0xC8, 0xFF],
-            });
-        }
-    }
-    assert_eq!(ink.len(), 512, "the MAX_INK_CELLS worst case");
-    inked_input.ink = ink;
-
-    // Warm both paths.
-    for _ in 0..4 {
-        let _ = rend.render_input(&base_input);
-        let _ = rend.render_input(&inked_input);
-    }
-    let iters = 60usize;
-    let (mut t_base, mut t_ink) = (Vec::with_capacity(iters), Vec::with_capacity(iters));
-    for _ in 0..iters {
-        let s = Instant::now();
-        let _ = rend.render_input(&base_input);
-        t_base.push(s.elapsed());
-        let s = Instant::now();
-        let _ = rend.render_input(&inked_input);
-        t_ink.push(s.elapsed());
-    }
-    t_base.sort();
-    t_ink.sort();
-    let (mb, mi) = (t_base[iters / 2], t_ink[iters / 2]);
-    let overhead_us = (mi.as_nanos() as i128 - mb.as_nanos() as i128) as f64 / 1000.0;
-    println!(
-        "bench_ink_apply: no-ink full-frame median {mb:?}, 512-InkCell merge-walk \
-         median {mi:?} — overhead {overhead_us:.1} us/frame ({:.1} ns/inked cell; \
-         120x40 grid)",
-        overhead_us * 1000.0 / 512.0
-    );
-    assert!(
-        overhead_us < 500.0,
-        "§7.4 gate: 512-cell ink apply overhead {overhead_us:.0} us >= 500 us/frame"
     );
 }

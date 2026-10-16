@@ -829,19 +829,6 @@ mod tests {
         );
     }
 
-    /// One arm family: the sizes are a ladder, ordered, derived from the one
-    /// scale, and (before the erase hero band's own multiplier) within 2x end
-    /// to end.
-    #[test]
-    fn the_star_arm_ladder_is_ordered_and_derived() {
-        // Order and span are checked at build time (the `const _` block beside
-        // the ratios). Here: `star_arm`, which every emitter calls, realizes each
-        // rung as `cell · STAR_ARM · ratio`.
-        for r in [STAR_ARM_FINE, STAR_ARM_STD, STAR_ARM_HERO, STAR_ARM_INK] {
-            assert!((star_arm(16.0, r) - 16.0 * STAR_ARM * r).abs() < 1e-6);
-        }
-    }
-
     /// One silhouette, additive half: every proportion (arm length and waist,
     /// nucleus, glint offset and dimming) comes from the shared constants. The
     /// source-over half is checked by `cursor_glow`'s

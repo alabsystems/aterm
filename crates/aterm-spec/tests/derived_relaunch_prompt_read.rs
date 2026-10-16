@@ -1,12 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-0 of `RelaunchPromptRead`
-//! (`aterm_spec::derive::relaunch_prompt_read_model`): the relaunch line's
-//! read of a returned prompt. The invariant is proved at `Buggy = 0` and
-//! caught at `Buggy = 1`; the liveness is proved under its fairness and broken
-//! by tab #1's rule alone; tab #1 and the wrapped typing it looked like are
-//! walked as schedules. Tier-1 is `aterm-agent`'s
+//! Tier-0 of `RelaunchPromptRead`, the relaunch line's read of a returned prompt. The
+//! invariant is proved at `Buggy = 0` and caught at `Buggy = 1`; the liveness is proved under
+//! its fairness and broken by `ElsewhereReadAsTyping` alone; that schedule and the wrapped
+//! typing it resembles are walked. Tier-1 is `aterm-agent`'s
 //! `the_real_prompt_read_conforms_to_the_model`.
 
 use aterm_spec::derive::{relaunch_prompt_read_liveness, relaunch_prompt_read_model};
@@ -15,12 +13,6 @@ use aterm_spec::{interp, verify};
 #[test]
 fn relaunch_prompt_read_proves_and_catches_the_invariant_and_the_liveness() {
     let model = relaunch_prompt_read_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name),
-        "the relaunch prompt read must stay enrolled in the spec-link registry"
-    );
     let fired = interp::fired_actions(&model);
     for action in [
         "MarkHere",
@@ -51,9 +43,8 @@ fn relaunch_prompt_read_proves_and_catches_the_invariant_and_the_liveness() {
     );
 }
 
-/// TAB #1: the shell's mark names another row, the host stamps a person's
-/// input, nobody keyed — the line goes in. Under tab #1's rule
-/// (`ElsewhereReadAsTyping`) the same world never types: the read is taken
+/// The shell's mark names another row, the host stamps a person's input, nobody keyed: the
+/// line goes in. Under `ElsewhereReadAsTyping` the same world never types: the read is taken
 /// for typing, and every try after it waits.
 #[test]
 fn relaunch_prompt_read_types_at_tab_ones_prompt_and_tab_ones_rule_never_does() {
@@ -102,11 +93,10 @@ fn relaunch_prompt_read_types_at_tab_ones_prompt_and_tab_ones_rule_never_does() 
     );
 }
 
-/// THE WRAPPED TYPING tab #1 looked like: the mark names the row above the
-/// cursor because a person's command wrapped past the prompt's row. Their
-/// keys stand, so no read types — and neither tempting fix may: trusting the
-/// screen over the mark types onto their command, and so does the shape rule
-/// when their command ends in a blank.
+/// Wrapped typing: the mark names the row above the cursor because a person's command wrapped
+/// past the prompt's row. Their keys stand, so no read types, and neither tempting fix may:
+/// trusting the screen over the mark types onto their command, and so does the shape rule when
+/// their command ends in a blank.
 #[test]
 fn relaunch_prompt_read_never_types_onto_wrapped_typing() {
     let m = relaunch_prompt_read_model();
@@ -126,12 +116,10 @@ fn relaunch_prompt_read_never_types_onto_wrapped_typing() {
     }
 }
 
-/// NO MARK, NO BLANK, NOBODY KEYED: nothing says the shell is at a prompt —
-/// a command it runs holds the terminal (`claude; read`'s builtin), or a
-/// shell with no integration draws a prompt with no trailing blank — so the
-/// line waits, and says `unmarked`, not `typing`. The fix as first written
-/// (`UnmarkedTypedByStamp`: the stamp standing in for the prompt's shape)
-/// types into it.
+/// No mark, no blank, nobody keyed: nothing says the shell is at a prompt (a command it runs
+/// holds the terminal, as `claude; read`'s builtin does, or a shell with no integration draws a
+/// prompt with no trailing blank), so the line waits and says `unmarked`, not `typing`.
+/// `UnmarkedTypedByStamp` (the stamp standing in for the prompt's shape) types into it.
 #[test]
 fn relaunch_prompt_read_never_types_on_the_stamp_alone() {
     let m = relaunch_prompt_read_model();

@@ -948,7 +948,7 @@ mod tests {
     /// changed only its own rect. Equality is exact.
     #[test]
     fn a_multi_pass_multi_draw_scene_matches_repeated_one_shot_draws() {
-        let Some(dev) = device() else { return };
+        let dev = device();
         let _test_pool = AutoreleasePool::new();
         let latch = Arc::new(loss::LossLatch::new());
         let session = EncodeSession::new(&dev, Arc::clone(&latch)).expect("session");
@@ -1515,7 +1515,7 @@ mod tests {
     /// a named texel.
     #[test]
     fn texture_copies_move_exactly_the_named_bytes() {
-        let Some(dev) = device() else { return };
+        let dev = device();
         let _test_pool = AutoreleasePool::new();
         let latch = Arc::new(loss::LossLatch::new());
         let session = EncodeSession::new(&dev, Arc::clone(&latch)).expect("session");
@@ -1613,7 +1613,7 @@ mod tests {
     /// stays committable (the final commit proves it).
     #[test]
     fn the_copy_validators_refuse_what_metal_would_corrupt() {
-        let Some(dev) = device() else { return };
+        let dev = device();
         let _test_pool = AutoreleasePool::new();
         let latch = Arc::new(loss::LossLatch::new());
         let session = EncodeSession::new(&dev, Arc::clone(&latch)).expect("session");
@@ -1694,7 +1694,7 @@ mod tests {
     /// * B waited after A observes A terminal (commit order on one queue).
     #[test]
     fn try_outcome_polls_without_blocking_and_feeds_the_latch_once_terminal() {
-        let Some(dev) = device() else { return };
+        let dev = device();
         let _test_pool = AutoreleasePool::new();
         let latch = Arc::new(loss::LossLatch::new());
         let session = EncodeSession::new(&dev, Arc::clone(&latch)).expect("session");
@@ -1823,7 +1823,7 @@ mod tests {
     /// command-buffer mint ([`queue_ffi_census`]).
     #[test]
     fn an_injected_loss_refuses_further_encodes_fast_and_named() {
-        let Some(dev) = device() else { return };
+        let dev = device();
         let _test_pool = AutoreleasePool::new();
         let latch = Arc::new(loss::LossLatch::new());
         let session = EncodeSession::new(&dev, Arc::clone(&latch)).expect("session");
@@ -1883,7 +1883,7 @@ mod tests {
     /// and dropping the session frees the slot for the loss rebuild.
     #[test]
     fn one_latch_one_session_and_drop_frees_the_slot() {
-        let Some(dev) = device() else { return };
+        let dev = device();
         let _test_pool = AutoreleasePool::new();
         let latch = Arc::new(loss::LossLatch::new());
         let session = EncodeSession::new(&dev, Arc::clone(&latch)).expect("first session");
@@ -1919,7 +1919,7 @@ mod tests {
     /// however `wait_outcome` and `try_outcome` are mixed.
     #[test]
     fn terminal_outcomes_feed_the_latch_exactly_once_across_wait_and_poll() {
-        let Some(dev) = device() else { return };
+        let dev = device();
         let _test_pool = AutoreleasePool::new();
         let latch = Arc::new(loss::LossLatch::new());
         let session = EncodeSession::new(&dev, Arc::clone(&latch)).expect("session");
@@ -1982,7 +1982,7 @@ mod tests {
     /// stream, and a pass onto a non-render-target texture are named errors.
     #[test]
     fn the_draw_state_machine_refuses_what_the_driver_punishes() {
-        let Some(dev) = device() else { return };
+        let dev = device();
         let _test_pool = AutoreleasePool::new();
         let latch = Arc::new(loss::LossLatch::new());
         let session = EncodeSession::new(&dev, Arc::clone(&latch)).expect("session");

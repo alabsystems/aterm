@@ -78,7 +78,7 @@
 //! The daemon rule is a derived model
 //! (`aterm_spec::derive::harness_codex_daemon_update_model`), bound to
 //! [`daemon_step`] by this module's tests. The whole branch runs against a real
-//! Codex in `tools/test-codex-live-upgrade.sh` (private headless aterm,
+//! Codex in `targo --unverified lab codex-upgrade` (private headless aterm,
 //! loopback fake model): both modes, an inline TUI at a two-row prompt, and
 //! the SIGTERM negative control.
 //!
@@ -90,6 +90,7 @@ use std::path::{Path, PathBuf};
 
 use aterm_json::Value;
 
+use aterm_phase::anchors::anchor_text;
 use aterm_phase::codex::CodexGoal;
 
 use super::goal_hold::Hold;
@@ -99,6 +100,49 @@ use super::upgrade::{ArgvRefusal, Facts, Gate, NOTICE_CLOSE, Phase, Request, Ste
 
 /// The manifest every Codex package carries at its root (layoutVersion 1).
 pub const PACKAGE_JSON: &str = "codex-package.json";
+
+/// The file an ALab build of Codex (codex-alab) carries in its package root,
+/// beside [`PACKAGE_JSON`] (`alab/package.sh`, package layout v1): the mark of
+/// bytes ALab built, not the vendor's.
+pub const ALAB_BUILD_JSON: &str = "alab-build.json";
+
+/// Whether the Codex `exe` runs VENDOR BYTES: its package root (the one
+/// [`package_version`] reads, whose manifest names `exe` itself) carries no
+/// [`ALAB_BUILD_JSON`]. `false` for an exe with no such package (a build out
+/// of a checkout) and for a root whose marker cannot be looked at (fail
+/// closed). The Codex lane moves only vendor bytes, onto vendor bytes (the
+/// native harness contract §7): a codex-alab session's upgrade is its own or
+/// nobody's, and no reader here orders a vendor build against an ALab one.
+#[must_use]
+pub fn vendor_bytes(exe: &Path) -> bool {
+    alab_marker(exe)
+        .is_some_and(|marker| matches!(marker, Err(e) if e.kind() == std::io::ErrorKind::NotFound))
+}
+
+/// Whether the Codex `exe` runs ALAB BYTES (codex-alab): its package root
+/// (as for [`vendor_bytes`]) carries [`ALAB_BUILD_JSON`] as a regular file.
+/// `false` for an exe with no such package and for a marker that cannot be
+/// looked at. The proven self-claim's image fact (the native harness contract
+/// §1): only an ALab build's process proves a claim, never another program
+/// that happens to lead the foreground group.
+#[must_use]
+pub fn alab_bytes(exe: &Path) -> bool {
+    alab_marker(exe).is_some_and(|marker| marker.is_ok_and(|m| m.file_type().is_file()))
+}
+
+/// The [`ALAB_BUILD_JSON`] look of `exe`'s package root: `None` when `exe`
+/// has no package root whose manifest names it.
+fn alab_marker(exe: &Path) -> Option<std::io::Result<std::fs::Metadata>> {
+    let exe = std::fs::canonicalize(exe).ok()?;
+    let root = exe.ancestors().skip(1).take(2).find(|root| {
+        std::fs::read_to_string(root.join(PACKAGE_JSON))
+            .ok()
+            .and_then(|text| package_entrypoint(&text))
+            .and_then(|entry| std::fs::canonicalize(root.join(entry)).ok())
+            .is_some_and(|entry| entry == exe)
+    })?;
+    Some(std::fs::symlink_metadata(root.join(ALAB_BUILD_JSON)))
+}
 
 /// The version of the Codex `exe`, read from its package manifest, never by
 /// running it (`codex --version` is unparseable and an exec can hang, holding
@@ -116,20 +160,34 @@ pub fn package_version(exe: &Path) -> Option<Version> {
 }
 
 /// One `codex-package.json`: its version and entrypoint (relative to the root).
-/// `None` unless `layoutVersion` is 1 and both are present.
+/// `None` unless `layoutVersion` is 1, the entrypoint is one
+/// ([`package_entrypoint`]) and the version is one [`Version::parse`] reads.
 #[must_use]
 pub fn parse_package(text: &str) -> Option<(Version, PathBuf)> {
+    let entry = package_entrypoint(text)?;
+    let v: Value = aterm_json::from_str(text).ok()?;
+    let version = Version::parse(v.get("version")?.as_str()?)?;
+    Some((version, entry))
+}
+
+/// One `codex-package.json`'s entrypoint (relative to the root), whatever its
+/// version says: `None` unless `layoutVersion` is 1 and the entrypoint is a
+/// relative path inside the root. Which package names a binary needs no
+/// version, and an ALab build's is a pre-release (`X.Y.0-dev.<n>+g<sha>`, the
+/// publication scheme) that [`Version::parse`] refuses on purpose, so
+/// [`alab_bytes`] and [`vendor_bytes`] read only this; ordering builds stays
+/// [`package_version`]'s, which no ALab build ever answers.
+#[must_use]
+pub fn package_entrypoint(text: &str) -> Option<PathBuf> {
     let v: Value = aterm_json::from_str(text).ok()?;
     if v.get("layoutVersion").and_then(Value::as_u64) != Some(1) {
         return None;
     }
-    let version = Version::parse(v.get("version")?.as_str()?)?;
-    let entry = v.get("entrypoint")?.as_str()?;
-    let entry = Path::new(entry);
+    let entry = Path::new(v.get("entrypoint")?.as_str()?);
     if entry.is_absolute() || entry.components().any(|c| c.as_os_str() == "..") {
         return None;
     }
-    Some((version, entry.to_path_buf()))
+    Some(entry.to_path_buf())
 }
 
 // ---------------------------------------------------------------- the flags
@@ -272,6 +330,268 @@ fn maybe_option(tok: &str) -> bool {
 /// not resumable in place ([`ArgvRefusal::NotResumable`]: `exec`, `--remote`,
 /// `--worktree`, …).
 pub fn rewrite_argv(argv: &[String], thread: Option<&str>) -> Result<Vec<String>, ArgvRefusal> {
+    rewrite_argv_carrying(argv, thread, None)
+}
+
+/// [`rewrite_argv`], the launch's permission flags replaced by the mode
+/// `last` (the thread's newest `turn_context`, [`ThreadMode`]) where
+/// [`carried_mode`] carries one: `resume <the other kept flags> <the
+/// carried mode's flags> <thread>`. `None`, or a mode not carried, is
+/// [`rewrite_argv`]'s line.
+///
+/// # Errors
+/// As [`rewrite_argv`].
+pub fn rewrite_argv_carrying(
+    argv: &[String],
+    thread: Option<&str>,
+    last: Option<&ThreadMode>,
+) -> Result<Vec<String>, ArgvRefusal> {
+    let kept = match last.and_then(|last| carried_mode(argv, last)) {
+        Some(mode) => {
+            let mut kept = kept_flags(argv, |name| !PERMISSION_FLAGS.contains(&name))?;
+            kept.extend(mode);
+            kept
+        }
+        None => kept_flags(argv, |_| true)?,
+    };
+    Ok(match thread {
+        Some(t) => std::iter::once("resume".to_string())
+            .chain(kept)
+            .chain(std::iter::once(t.to_string()))
+            .collect(),
+        None => kept,
+    })
+}
+
+/// The variable Codex keeps its home by: its rollouts, thread writer locks,
+/// login and daemon live under `$CODEX_HOME`, else `~/.codex`.
+pub const HOME_ENV: &str = "CODEX_HOME";
+
+/// THE ENVIRONMENT A CODEX RELAUNCH LINE MUST CARRY: [`HOME_ENV`] with the
+/// value the TUI it replaces had in its own exec environment, verbatim, or
+/// nothing where it had none (the new TUI then takes its shell's). A TUI
+/// started as `CODEX_HOME=<dir> codex` (its own command line, or a wrapper's;
+/// the tab's shell never had it) keeps its thread under `<dir>`: relaunched
+/// without it, it resumes under `~/.codex`, where that thread does not
+/// exist, as a Claude Code relaunched without its `CLAUDE_CONFIG_DIR` came
+/// back on the wrong home (`relaunch`'s module doc, measured 2026-10-09).
+/// Required, as the Claude lane's home and login are
+/// (`relaunch::required_env`): the line is refused rather than typed without
+/// it.
+#[must_use]
+pub fn line_env(home: Option<&str>) -> Vec<(&'static str, &str)> {
+    home.map(|value| (HOME_ENV, value)).into_iter().collect()
+}
+
+/// The flags that set a Codex launch's PERMISSION MODE — its approval
+/// policy and its sandbox ([`permission_argv`]). A mode a `-c` override or a
+/// `--profile` sets is no flag of these: it goes with the other carried
+/// flags.
+const PERMISSION_FLAGS: &[&str] = &[
+    "-a",
+    "--ask-for-approval",
+    "-s",
+    "--sandbox",
+    "--approve-for-me",
+    "--dangerously-bypass-approvals-and-sandbox",
+];
+
+/// `argv` (`argv[0]` first) with only the flags that set its permission
+/// mode ([`PERMISSION_FLAGS`]), as [`rewrite_argv`] carries them: what a
+/// resume line a person is told steps down to before the bare one, where
+/// every carried flag does not fit its budget (`resume::shorter`), as
+/// Claude Code's does ([`super::upgrade::permission_argv`]). A bare `codex
+/// resume <thread>` brings a Codex started `-s read-only` back in the
+/// default sandbox. An argv the rewrite refuses keeps `argv[0]` alone.
+#[must_use]
+pub(crate) fn permission_argv(argv: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = argv.first().cloned().into_iter().collect();
+    if let Ok(flags) = kept_flags(argv, |name| PERMISSION_FLAGS.contains(&name)) {
+        out.extend(flags);
+    }
+    out
+}
+
+/// The approval policies `-a` takes (`codex --help` 0.163.0), the ones a
+/// thread's `turn_context` is carried in ([`ThreadMode`]). A `granular`
+/// policy, which only a config sets, is none of them.
+const APPROVALS: [&str; 4] = ["untrusted", "on-failure", "on-request", "never"];
+
+/// The sandboxes `-s` takes, narrowest first: the order [`carried_mode`]
+/// compares them by.
+const SANDBOXES: [&str; 3] = ["read-only", "workspace-write", "danger-full-access"];
+
+/// The reviewer `--approve-for-me` routes approvals to (`approvals_reviewer`
+/// in a `turn_context`; `user` otherwise). The flag sets it with
+/// `on-request` and `workspace-write` (its help's config,
+/// `approvals_reviewer="auto_review"approval_policy="on-request"
+/// sandbox_mode="workspace-write"` in the 0.163.0 binary).
+const AUTO_REVIEW: &str = "auto_review";
+
+/// A THREAD'S PERMISSION MODE as its newest `turn_context` records it
+/// (`approval_policy`, `approvals_reviewer`, `sandbox_policy.type`): the mode
+/// its next turn runs in. Codex 0.163.0 keeps it with the thread: a `codex
+/// resume <thread>` with no `-a`/`-s` restores it, and one WITH them runs
+/// the flags' instead (measured 2026-10-16 in the lab: a launch `-a
+/// on-request -s read-only` switched to Full Access by `/permissions` came
+/// back `on-request`/`read-only` from `codex resume -a on-request -s
+/// read-only <thread>`, and `never`/`danger-full-access` from a bare `codex
+/// resume <thread>`). The model is no part of it: the same resume kept a
+/// `/model` choice made for the session.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ThreadMode {
+    /// `approval_policy` where it is one `-a` takes ([`APPROVALS`]).
+    pub approval: Option<String>,
+    /// `approvals_reviewer`, as written (`user`, `auto_review`).
+    pub reviewer: Option<String>,
+    /// `sandbox_policy.type` where it is one `-s` takes ([`SANDBOXES`]).
+    pub sandbox: Option<String>,
+}
+
+impl ThreadMode {
+    /// The mode a `turn_context`'s three fields name, each kept only where it
+    /// is a value its flag takes.
+    #[must_use]
+    pub fn of(approval: Option<&str>, reviewer: Option<&str>, sandbox: Option<&str>) -> Self {
+        ThreadMode {
+            approval: approval
+                .filter(|a| APPROVALS.contains(a))
+                .map(str::to_owned),
+            reviewer: reviewer.map(str::to_owned),
+            sandbox: sandbox.filter(|s| SANDBOXES.contains(s)).map(str::to_owned),
+        }
+    }
+}
+
+/// What a launch's permission flags ([`PERMISSION_FLAGS`]) set, in argv
+/// order (the last flag for a field wins): `None` where none set it. `any`:
+/// it named one.
+#[derive(Default)]
+struct LaunchMode {
+    approval: Option<String>,
+    sandbox: Option<String>,
+    auto_review: bool,
+    any: bool,
+}
+
+/// [`LaunchMode`] of `argv` (`argv[0]` first), read off the flags
+/// [`kept_flags`] carries; nothing for an argv the rewrite refuses.
+fn launch_mode(argv: &[String]) -> LaunchMode {
+    let mut mode = LaunchMode::default();
+    let Ok(tokens) = kept_flags(argv, |name| PERMISSION_FLAGS.contains(&name)) else {
+        return mode;
+    };
+    let mut it = tokens.iter();
+    while let Some(tok) = it.next() {
+        let (name, attached) = match tok.split_once('=') {
+            Some((name, value)) if name.starts_with("--") => (name, Some(value.to_owned())),
+            _ if !tok.starts_with("--") && tok.chars().count() > 2 => {
+                let at = tok.char_indices().nth(2).map_or(tok.len(), |(i, _)| i);
+                (&tok[..at], Some(tok[at..].to_owned()))
+            }
+            _ => (tok.as_str(), None),
+        };
+        let mut value = || attached.clone().or_else(|| it.next().cloned());
+        mode.any = true;
+        match name {
+            "-a" | "--ask-for-approval" => mode.approval = value(),
+            "-s" | "--sandbox" => mode.sandbox = value(),
+            "--approve-for-me" => {
+                mode.approval = Some("on-request".to_owned());
+                mode.sandbox = Some("workspace-write".to_owned());
+                mode.auto_review = true;
+            }
+            "--dangerously-bypass-approvals-and-sandbox" => {
+                mode.approval = Some("never".to_owned());
+                mode.sandbox = Some("danger-full-access".to_owned());
+                mode.auto_review = false;
+            }
+            _ => {}
+        }
+    }
+    mode
+}
+
+/// Where `sandbox` stands among [`SANDBOXES`], narrowest first.
+fn sandbox_rank(sandbox: &str) -> Option<usize> {
+    SANDBOXES.iter().position(|s| *s == sandbox)
+}
+
+/// THE PERMISSION FLAGS A RELAUNCH CARRIES in place of the launch's, from the
+/// thread's last mode `last` ([`ThreadMode`]) — or `None`: the launch's
+/// flags stand, verbatim.
+///
+/// A resume carrying the launch's `-a`/`-s` runs the thread in them, so a
+/// mode a person chose in the session (`/permissions`) would be undone at
+/// every upgrade, crash or restart relaunch; one carrying none restores the
+/// thread's own. So:
+///
+/// * a launch that named no permission flag carries none: Codex restores
+///   the thread's mode itself;
+/// * the APPROVAL is the thread's where it records one `-a` takes, else the
+///   launch's;
+/// * the SANDBOX is the thread's only where it is as wide as the launch's or
+///   wider ([`SANDBOXES`]), never narrower: a bypassed launch whose thread
+///   now runs sandboxed may have FALLEN there (a daemon restart,
+///   `supervise::codex_usage::sandbox_fell`), and the launch's sandbox on
+///   the resume is that fall's remedy. A launch that named no sandbox takes
+///   the thread's;
+/// * Codex's auto review (`--approve-for-me`) is the thread's reviewer.
+///
+/// Where all that equals what the launch's own flags set, they stand. Else
+/// the mode is written `--approve-for-me` where it is exactly that flag's
+/// (auto review, `on-request`, `workspace-write`), and `-a <approval> -s
+/// <sandbox>` otherwise. The model is not carried: Codex keeps a thread's
+/// model across a resume.
+#[must_use]
+pub fn carried_mode(argv: &[String], last: &ThreadMode) -> Option<Vec<String>> {
+    let launch = launch_mode(argv);
+    if !launch.any {
+        return None;
+    }
+    let approval = last.approval.clone().or_else(|| launch.approval.clone());
+    let sandbox = match (&last.sandbox, &launch.sandbox) {
+        (Some(thread), Some(launched)) => match (sandbox_rank(thread), sandbox_rank(launched)) {
+            (Some(t), Some(l)) if t >= l => Some(thread.clone()),
+            _ => Some(launched.clone()),
+        },
+        (Some(thread), None) => Some(thread.clone()),
+        (None, launched) => launched.clone(),
+    };
+    let auto_review = match last.reviewer.as_deref() {
+        Some(reviewer) => reviewer == AUTO_REVIEW,
+        None => launch.auto_review,
+    };
+    let stands = launch
+        .approval
+        .is_none_or(|a| approval.as_deref() == Some(a.as_str()))
+        && launch
+            .sandbox
+            .is_none_or(|s| sandbox.as_deref() == Some(s.as_str()))
+        && auto_review == launch.auto_review;
+    if stands {
+        return None;
+    }
+    if auto_review
+        && approval.as_deref() == Some("on-request")
+        && sandbox.as_deref() == Some("workspace-write")
+    {
+        return Some(vec!["--approve-for-me".to_owned()]);
+    }
+    let mut flags = Vec::new();
+    if let Some(approval) = approval {
+        flags.extend(["-a".to_owned(), approval]);
+    }
+    if let Some(sandbox) = sandbox {
+        flags.extend(["-s".to_owned(), sandbox]);
+    }
+    Some(flags)
+}
+
+/// The flags [`rewrite_argv`] carries from `argv` (`argv[0]` first),
+/// verbatim and in argv order, of those whose name `keep` takes; every flag
+/// is read, so a refusal stands whatever `keep` takes.
+fn kept_flags(argv: &[String], keep: impl Fn(&str) -> bool) -> Result<Vec<String>, ArgvRefusal> {
     let mut kept: Vec<String> = Vec::new();
     let mut subcommand: Option<&str> = None;
     let mut i = 1;
@@ -336,17 +656,11 @@ pub fn rewrite_argv(argv: &[String], thread: Option<&str>) -> Result<Vec<String>
                 }
             }
         }
-        if fate == Fate::Keep {
+        if fate == Fate::Keep && keep(&name) {
             kept.extend(argv[start..i].iter().cloned());
         }
     }
-    Ok(match thread {
-        Some(t) => std::iter::once("resume".to_string())
-            .chain(kept)
-            .chain(std::iter::once(t.to_string()))
-            .collect(),
-        None => kept,
-    })
+    Ok(kept)
 }
 
 /// Whether `argv` is an interactive Codex TUI's (no subcommand, `resume` or
@@ -466,25 +780,28 @@ pub struct ExitHint {
 
 /// The daemon-mode hint's line prefix as 0.157 printed it. 0.159 and 0.160 print
 /// the embedded shape instead, under [`RECONNECT_HEADING`] (measured in both
-/// store builds' strings, 2026-10-01: neither carries this line).
+/// store builds' strings, 2026-10-01: neither carries this line). History, kept
+/// for a 0.157 TUI still running: no anchor, since the drift canary would name
+/// it missing from every build since. The words below are `codex.exit.*`
+/// anchors, which the canary looks for in the store's Codex.
 const RECONNECT: &str = "Reconnect: codex resume ";
 
 /// The heading over a daemon-mode client's `codex resume <id>` row (0.159+).
-const RECONNECT_HEADING: &str = "To reconnect";
+const RECONNECT_HEADING: &str = anchor_text("codex.exit.reconnect");
 
 /// The heading over an embedded session's `codex resume <id>` row.
-const CONTINUE_HEADING: &str = "To continue this session";
+const CONTINUE_HEADING: &str = anchor_text("codex.exit.continue");
 
 /// The embedded line's words (the row under `To continue this session,
 /// run:`).
-const CONTINUE: &str = "codex resume ";
+const CONTINUE: &str = anchor_text("codex.exit.resume");
 
 /// The daemon-mode hint's last line, under its `codex resume` one.
-const STOP_HINT: &str = "Stop the current turn:";
+const STOP_HINT: &str = anchor_text("codex.exit.stop");
 
 /// The token tally a TUI prints on leaving after a turn: under the daemon-mode
 /// hint (`Token usage so far: …`) or above the embedded one (`Token usage: …`).
-const TOKEN_USAGE: &str = "Token usage";
+const TOKEN_USAGE: &str = anchor_text("codex.exit.tokens");
 
 /// The last exit hint in `rows`: `codex resume <id>` under `To reconnect, run:`
 /// (daemon mode; 0.157 printed `Reconnect: codex resume <id>`) or under `To

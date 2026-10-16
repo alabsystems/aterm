@@ -239,7 +239,7 @@ fn abandoned_copy_reaping_requires_a_lapsed_disowned_attempt() {
     let model = reaper_model();
     aterm_spec::verify::prove_and_catch_scalar(&model, "abandoned copy reclamation");
     let dead = {
-        let mut child = Command::new("/usr/bin/true").spawn().unwrap();
+        let mut child = std::process::Command::new("/usr/bin/true").spawn().unwrap();
         let pid = child.id();
         child.wait().unwrap();
         pid
@@ -335,7 +335,7 @@ fn reaper_case(
 fn an_attempt_whose_caller_or_writer_died_is_eventually_reclaimed() {
     let staging = Staging::scratch("copy-lapsed");
     let dead = {
-        let mut child = Command::new("/usr/bin/true").spawn().unwrap();
+        let mut child = std::process::Command::new("/usr/bin/true").spawn().unwrap();
         let pid = child.id();
         child.wait().unwrap();
         pid

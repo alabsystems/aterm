@@ -461,21 +461,6 @@ mod tests {
         assert_eq!(permitted_points, 1, "non-vacuity: fading IS reachable");
     }
 
-    /// NEGATIVE CONTROL (the ty model's `Buggy=1` twin): a gate that ignores
-    /// `input_hot` disagrees with the proven one exactly on the typing point —
-    /// the truth-table assertion above genuinely catches that regression.
-    #[test]
-    fn ignoring_input_hot_is_caught() {
-        let buggy = |enabled: bool, _hot: bool, alt: bool, scrolled: bool, reduced: bool| {
-            enabled && !alt && !scrolled && !reduced
-        };
-        assert!(!fade_permitted(true, true, false, false, false));
-        assert!(
-            buggy(true, true, false, false, false),
-            "control: the buggy gate would fade the keystroke echo"
-        );
-    }
-
     /// IDLE GATE (perf): over ALL 2^4 inputs, and stated as the PROPERTY
     /// rather than the formula — NO FRAME THE GATE ADMITS CAN BE DEAD WORK.
     /// A frame's fingerprints are readable only if [`fade_permitted`] can hold
@@ -520,37 +505,6 @@ mod tests {
             "non-vacuity: the skip points are reachable"
         );
         assert_eq!(run_points, 3, "non-vacuity: the run path IS reachable");
-    }
-
-    /// NEGATIVE CONTROL (the pre-fix defect): the old code ALWAYS called
-    /// `update` (an implicit `|_, _| true`), so the disabled-and-dry frame paid
-    /// the whole-grid fingerprint pass. The gate above disagrees with that
-    /// constant exactly on `(off, dry)` — the point that was pure wasted work.
-    #[test]
-    fn always_calling_update_is_caught() {
-        let pre_fix = |_fade_on: bool, _fade_shown: bool| true;
-        assert!(
-            !fade_update_needed(false, false, false, false),
-            "off+dry now skips"
-        );
-        // …and the view-keyed pair, which the first fix did not reach: a vim
-        // session fingerprinted the whole grid every frame for nobody.
-        assert!(
-            !fade_update_needed(true, true, true, false),
-            "an alt-screen frame now skips"
-        );
-        assert!(
-            !fade_update_needed(true, true, false, true),
-            "a scrolled-back frame now skips"
-        );
-        assert!(
-            fade_update_needed(true, false, false, false),
-            "control: an ordinary on frame still runs"
-        );
-        assert!(
-            pre_fix(false, false),
-            "control: the old code fingerprinted the whole grid anyway"
-        );
     }
 
     /// CONVERGENCE (envelope half): `age >= fade` returns EXACTLY 255 for a

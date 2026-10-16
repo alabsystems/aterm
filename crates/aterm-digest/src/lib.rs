@@ -16,9 +16,11 @@
 //! - [`ct_eq`] -- constant-time byte-slice comparison
 //! - [`InvalidLength`], [`MacError`] -- API-compatible error types
 //!
-//! No SIMD, SHA-NI, assembly or `unsafe`: aterm hashes release manifests and
-//! capability tokens, not bulk traffic. Input is consumed in 64-byte blocks
-//! straight from the caller's slice with one partial-block buffer.
+//! No SIMD, SHA-NI, assembly or `unsafe`: this hashes release manifests and
+//! capability tokens, not bulk traffic. atpkg's bulk content (archive digests and
+//! the extract fold) runs on ring's hardware SHA-256 (`atpkg::tree::BulkSha256`).
+//! Input is consumed in 64-byte blocks straight from the caller's slice with one
+//! partial-block buffer.
 //!
 //! # Example
 //!
@@ -83,26 +85,6 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
         let _ = write!(s, "{b:02x}");
         s
     })
-}
-
-/// Decodes an even-length lowercase hex string, for test vectors only.
-#[cfg(test)]
-pub(crate) fn unhex(s: &str) -> Vec<u8> {
-    assert!(s.len().is_multiple_of(2), "hex literal must be even length");
-    s.as_bytes()
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| {
-            let nibble = |c: u8| match c {
-                b'0'..=b'9' => c - b'0',
-                b'a'..=b'f' => c - b'a' + 10,
-                b'A'..=b'F' => c - b'A' + 10,
-                _ => panic!("bad hex digit {c:?}"),
-            };
-            (nibble(pair[0]) << 4) | nibble(pair[1])
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -171,12 +153,5 @@ mod tests {
             body.contains("black_box"),
             "ct_eq lost its optimiser barrier"
         );
-    }
-
-    #[test]
-    fn hex_helper_round_trips() {
-        assert_eq!(hex(&[0x00, 0x0f, 0xf0, 0xff]), "000ff0ff");
-        assert_eq!(unhex("000ff0ff"), vec![0x00, 0x0f, 0xf0, 0xff]);
-        assert_eq!(unhex(&hex(&Sha256::digest(b"x"))), Sha256::digest(b"x"));
     }
 }

@@ -153,6 +153,7 @@ fn sealing_never_downgrades_a_resolved_code_point_to_notdef() {
 }
 
 /// A colour emoji, `Emoji_Presentation=Yes`: only the colour face can draw it.
+#[cfg(not(windows))]
 const EMOJI: char = '\u{1F680}';
 
 /// CONSERVATION, applied to the one source that is admitted BY PATH and is the
@@ -175,10 +176,19 @@ const EMOJI: char = '\u{1F680}';
 /// emoji that needs one" is nonetheless not an optimization available here, it
 /// is a silent feature loss, and this is the gate that says so.
 ///
-/// Host-dependent by nature (the face is a system file), so the UNSEALED
-/// resolution is the precondition: a host with no colour-emoji face skips.
+/// Host-dependent by nature (the face is a system file): a host with no
+/// colour-emoji face could not run it, read from the files. Not on Windows:
+/// its Segoe UI Symbol maps a monochrome 🚀, which outranks the colour face by
+/// design.
+#[cfg(not(windows))]
 #[test]
 fn sealing_a_system_generation_keeps_the_colour_emoji_face() {
+    // Every macOS ships a colour face, a Linux host when Noto Color Emoji is
+    // installed.
+    let noto = "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf";
+    if !cfg!(target_os = "macos") && !std::path::Path::new(noto).is_file() {
+        aterm_spec::host::could_not_run(format!("{noto} is not installed here"));
+    }
     let theme = Theme::default();
     let mut unsealed = Renderer::from_system(18.0, theme)
         .expect("no font: build with aterm-render's default embedded-font feature");
@@ -186,13 +196,11 @@ fn sealing_a_system_generation_keeps_the_colour_emoji_face() {
     // every mono face has had its chance to miss.
     unsealed.debug_block_on_lazy_fallbacks();
     let before = fingerprint(&mut unsealed, EMOJI);
-    if before.0 != FaceId::ColorEmoji {
-        eprintln!(
-            "SKIP: no colour-emoji face on this host (U+1F680 -> {:?})",
-            before.0
-        );
-        return;
-    }
+    assert_eq!(
+        before.0,
+        FaceId::ColorEmoji,
+        "the unsealed generation draws U+1F680 from the host's colour face"
+    );
 
     let mut sealed = Renderer::from_system(18.0, theme).expect("the primary resolved once already");
     sealed.seal_admitted_font_sources();

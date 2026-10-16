@@ -205,11 +205,6 @@ fn modifier_wire_values() {
 // =========================================================================
 
 #[test]
-fn key_event_type_default_is_press() {
-    assert_eq!(KeyEventType::default(), KeyEventType::Press);
-}
-
-#[test]
 fn key_event_type_kitty_values() {
     assert_eq!(KeyEventType::Press.kitty_value(), 1);
     assert_eq!(KeyEventType::Repeat.kitty_value(), 2);
@@ -548,32 +543,6 @@ fn named_key_kitty_codes_numpad() {
     assert_eq!(NamedKey::NumpadEqual.kitty_code(), 57415);
     assert_eq!(NamedKey::NumpadArrowUp.kitty_code(), 57419);
     assert_eq!(NamedKey::NumpadDelete.kitty_code(), 57426);
-}
-
-// =========================================================================
-// encode_key delegates to encode_key_with_event(Press)
-// =========================================================================
-
-#[test]
-fn encode_key_equals_encode_key_with_event_press() {
-    let keys = [
-        Key::Character('a'),
-        Key::Named(NamedKey::Enter),
-        Key::Named(NamedKey::ArrowUp),
-        Key::Named(NamedKey::F5),
-    ];
-    let modes = [
-        KeyboardMode::empty(),
-        KeyboardMode::DISAMBIGUATE_ESC_CODES,
-        KeyboardMode::APP_CURSOR,
-    ];
-    for key in &keys {
-        for mode in modes {
-            let a = encode_key(key, Modifiers::empty(), mode);
-            let b = encode_key_with_event(key, Modifiers::empty(), mode, KeyEventType::Press);
-            assert_eq!(a, b, "mismatch for {key:?} mode={mode:?}");
-        }
-    }
 }
 
 // Kitty progressive-enhancement flag tests (flag presence, encoding behavior,

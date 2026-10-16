@@ -1,0 +1,22 @@
+# claude-code 2.1.301 · MEASURED 2026-10-15, `aterm ctl text` of a private headless aterm (120x50, aterm 0.105.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake claude.ai OAuth token (`claude --subscriber`) and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · the Fable 429 WITH a reset, as a Max 5x subscriber (the token's scopes user:inference user:profile, the composed oauthAccount of ana@example.com seeded in the scratch .claude.json), the inline renderer, the harness off: 429 rate_limit_error, anthropic-ratelimit-unified-status rejected, -representative-claim seven_day_overage_included, -reset 2 h on (the stub's limit mode); no dialog opened · the lab's random project dir is spelled /private/tmp/at.lab0 here
+ ▐▛███▛█   Claude Code v2.1.301
+▝▜██████▀  Opus 5.5 · Claude Max
+ ▝▝   ▝▝   /private/tmp/at.lab0/proj
+
+
+❯ hi
+
+⏺ Hi! I am the local lab stub, not a model. (reply 1)
+
+✻ Cooked for 0s · done 11:36 PM
+
+❯ a turn into the Fable wall
+  ⎿  You've hit your Fable limit · resets 1:36am (America/Los_Angeles)
+
+✻ Cooked for 0s · done 11:36 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents
+                                  You've used 85% of your Fable limit · resets Oct 19 at 11:36pm (America/Los_Angeles)

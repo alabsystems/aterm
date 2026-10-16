@@ -32,11 +32,29 @@ pub fn grapheme_width(s: &str) -> GraphemeInfo {
 }
 
 fn grapheme_width_inner(s: &str, cjk: bool) -> GraphemeInfo {
+    if s.bytes().all(|b| (0x20..0x7F).contains(&b)) {
+        let n = s.len();
+        return GraphemeInfo {
+            byte_count: n,
+            grapheme_count: n,
+            display_width: n,
+            codepoint_count: n,
+            has_emoji: false,
+            has_combining: false,
+            has_wide: false,
+        };
+    }
     let mut info = GraphemeInfo {
         byte_count: s.len(),
         ..Default::default()
     };
     for g in s.graphemes() {
+        if g.len() == 1 {
+            info.grapheme_count += 1;
+            info.display_width += 1;
+            info.codepoint_count += 1;
+            continue;
+        }
         let codepoints = g.chars().count();
         let width = grapheme_display_width_inner(g, cjk);
         info.grapheme_count += 1;
@@ -55,8 +73,12 @@ fn grapheme_width_inner(s: &str, cjk: bool) -> GraphemeInfo {
 /// ENSURES: returns a terminal cell width in the inclusive range `0..=2`.
 ///
 /// A lone C0/C1 control is 1 (terminals advance past a rendered control); a
-/// cluster takes its first character's width, except that an emoji base with
+/// cluster takes its first spacing character's width, except that an emoji base with
 /// VS16, a skin tone or a ZWJ is 2.
+///
+/// This is cluster presentation width. Use [`crate::GridColumns`] for terminal
+/// cursor columns: minimally-qualified `❤‍🔥` presents as 2 here while the grid
+/// keeps its narrow base's 1, and grid fold state can cross cluster boundaries.
 pub fn grapheme_display_width(grapheme: &str) -> usize {
     grapheme_display_width_inner(grapheme, false)
 }
@@ -77,15 +99,20 @@ fn grapheme_display_width_inner(grapheme: &str, cjk: bool) -> usize {
 
     let first_cp = first as u32;
 
-    let second = match chars.next() {
-        Some(c) => c,
-        None => {
-            if first_cp <= 0x1F || (0x7F..=0x9F).contains(&first_cp) {
-                return 1;
-            }
-            return char_width_fn(first);
+    if chars.next().is_none() {
+        if first_cp <= 0x1F || (0x7F..=0x9F).contains(&first_cp) {
+            return 1;
         }
+        return char_width_fn(first);
+    }
+
+    // GB9b Prepend signs can precede the spacing base. Apply presentation
+    // rules to that base too, rather than only repairing the final width.
+    let mut chars = spacing_chars(grapheme);
+    let Some(first) = chars.next() else {
+        return 0;
     };
+    let second = chars.next();
 
     // Multi-codepoint grapheme cluster. VS16 (U+FE0F) widens a text-default
     // emoji, and only that: the grid's rule (`is_vs16_emoji_capable`), so `a️`
@@ -97,12 +124,14 @@ fn grapheme_display_width_inner(grapheme: &str, cjk: bool) -> usize {
 
     // An emoji base with a skin tone, or an emoji ZWJ sequence, is wide.
     if first_is_emoji
-        && (is_skin_tone_modifier(second) || second == '\u{200D}' || chars.any(|c| c == '\u{200D}'))
+        && (second.is_some_and(is_skin_tone_modifier)
+            || second == Some('\u{200D}')
+            || chars.any(|c| c == '\u{200D}'))
     {
         return 2;
     }
 
-    // Base + combining marks: the base's width.
+    // Base + combining marks: the spacing base's width.
     char_width_fn(first).min(2)
 }
 
@@ -167,9 +196,21 @@ fn split_graphemes_inner(s: &str, cjk: bool) -> impl Iterator<Item = Grapheme<'_
     })
 }
 
-/// Whether the cluster's first character [`is_emoji_char`].
+/// The cluster from its first spacing base. Ambiguous-width policy changes
+/// positive widths only, so the zero-width prefix is shared by both modes.
+fn spacing_chars(grapheme: &str) -> impl Iterator<Item = char> + '_ {
+    grapheme
+        .chars()
+        .skip_while(|&ch| unicode_tables::char_width(ch) == 0)
+}
+
+/// Whether the spacing base [`is_emoji_char`]. A cluster with no spacing
+/// base retains the coarse first-character classification (such as VS16).
 fn is_emoji_grapheme(grapheme: &str) -> bool {
-    grapheme.chars().next().is_some_and(is_emoji_char)
+    spacing_chars(grapheme)
+        .next()
+        .or_else(|| grapheme.chars().next())
+        .is_some_and(is_emoji_char)
 }
 
 /// Whether `c` is in an emoji-heavy block, a regional indicator or VS16: a

@@ -49,6 +49,10 @@
 //! rule 6).
 
 #![cfg(target_vendor = "apple")]
+#![allow(
+    clippy::disallowed_types,
+    reason = "test code: a stand-in child may inherit descriptors"
+)]
 
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::path::PathBuf;
@@ -508,7 +512,7 @@ fn dispatch_role() {
         Some("window") => window_role(false),
         Some("window-holder") => window_role(true),
         // Whether BYE and ADOPT are said is the role this child was launched
-        // as — read, not a literal (aterm-spec's foreign_facts_are_observed).
+        // as — read, not a literal.
         Some(
             role @ ("next-window"
             | "next-window-no-bye"

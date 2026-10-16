@@ -1,0 +1,15 @@
+# agy 1.4.0 · MEASURED 2026-10-16, `aterm ctl text --json` of a private headless aterm 120x40 (aterm 0.105.0 098c216c7), the atpkg-managed agy (Google latest) launched through its shim with a scratch HOME (no saved login), scratch ATERM_STATE_HOME/XDG dirs, harness off · the sign-in wall agy draws instead of a composer when no login is saved: the logo, `Welcome to the Antigravity CLI. You are currently not signed in.`, `Select login method:`, `> 1. Google OAuth` (selected), `2. Use a Google Cloud project`, key row `↑/↓ Navigate · enter Select`; cursor hidden; enter on option 1 opens a browser · cursor=13,30 (hidden) · account and scratch path redacted at equal length
+
+     ▄▀▀▄
+    ▀▀▀▀▀▀
+   ▀▀▀▀▀▀▀▀
+  ▄▀▀    ▀▀▄
+ ▄▀▀      ▀▀▄
+
+ Welcome to the Antigravity CLI. You are currently not signed in.
+
+ Select login method:
+ > 1. Google OAuth
+   2. Use a Google Cloud project
+
+   ↑/↓ Navigate · enter Select

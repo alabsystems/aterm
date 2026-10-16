@@ -5,25 +5,25 @@
 //!
 //! A Backspace's repaint can arrive in two reads with a present between. The
 //! walk releases `boundary..end` as one part, which contains the cell of the
-//! glyph the key really erased; on the complete present the standing text is
-//! back but that column stays blank. The part is lifted anyway: a column still
-//! blank when lifted is text that really went, and the walk on that same
-//! sample names it on its own. Otherwise every standing letter right of the
-//! boundary would retract and the next keys land past a dark stretch.
+//! glyph the key erased; on the complete present the standing text is back but
+//! that column stays blank. The part is lifted anyway: a column still blank
+//! when lifted is text that really went, and the walk on that sample names it
+//! on its own. Otherwise every standing letter right of the boundary would
+//! retract and the next keys land past a dark stretch.
 //!
-//! The seam is `review_regression.rs`'s: every take drives a real
-//! `aterm_core` [`Terminal`], samples it as `app_render.rs`'s frame hold does
-//! (the caret's row probe, then every ribbon row, whatever the caret's
-//! visibility), reads the content-scroll clock as `sync_cursor_effect_scroll`
-//! does, and ticks [`CursorGlow`] on a 16 ms train. The census is the plan's
-//! coverage per row: a hole is a dark column strictly between two lit ones.
-//! `RR_CELLS=1` adds every watched row's cells to a failure's dump.
+//! The seam is `review_real_bytes.rs`'s: a real `aterm_core` [`Terminal`],
+//! sampled as `app_render.rs`'s frame hold does (the caret's row probe, then
+//! every ribbon row, whatever the caret's visibility), the content-scroll
+//! clock read as `sync_cursor_effect_scroll` does, [`CursorGlow`] ticked on a
+//! 16 ms train. A hole is a dark column strictly between two lit ones in a
+//! row's planned coverage. `RR_CELLS=1` adds every watched row's cells to a
+//! failure's dump.
 //!
 //! Not pinned here (none is a gap under a typing hand): a torn ⌃K leaves the
-//! killed suffix lit over blank cells for up to 1.6 s (the kill's own retract
-//! owns those cells); a mid-line Backspace run blinks one cell at the edit
-//! column; and a Claude Code Enter's exit fade can carry a one-cell hole for a
-//! frame after a torn spinner present.
+//! killed suffix lit over blank cells for up to 1.6 s (the kill's own
+//! retract); a mid-line Backspace run blinks one cell at the edit column; a
+//! Claude Code Enter's exit fade can carry a one-cell hole for a frame after a
+//! torn spinner present.
 
 use crate::common::{
     LIT_COV, caret_sample, class_of, coverage, holes_of, is_arrow, is_key, note_blink,
@@ -600,7 +600,7 @@ impl Host {
     }
 
     /// Idle long past every swoosh, then T6: nothing on glass, no cadence,
-    /// no deadline, on EVERY one of the last frames.
+    /// no deadline, on every one of the last frames.
     fn assert_idle_to_zero(&mut self, what: &str) {
         self.idle((SWOOSH_TOTAL_S * 1000.0) as u64 + 1500);
         for _ in 0..10 {
@@ -671,13 +671,9 @@ fn assert_no_melt(h: &Host, rows: &[u16], what: &str) {
     }
 }
 
-/// Run every take, collecting failures instead of stopping at the first.
-///
-/// Each take builds its own host on its own clock, so the takes run on the
-/// binary's threads ([`crate::common::par_map`]) and their failures are
-/// listed in the takes' order, as one after another. WHY (2026-10-05): one
-/// after another, a law's 5 to 16 takes were 0.9 to 2.6 s alone on one thread
-/// and up to 10.1 s in a full-suite run at load 12 on 14 cores.
+/// Run every take, collecting failures instead of stopping at the first. Each
+/// take builds its own host on its own clock, so the takes run in parallel
+/// ([`crate::common::par_map`]); failures are listed in the takes' order.
 fn run_takes<T: Copy + Sync>(takes: Vec<(String, T)>, f: impl Fn(&str, T) + Sync) {
     let n = takes.len();
     let failed: Vec<String> = crate::common::par_map(&takes, |(what, t)| {
@@ -702,9 +698,7 @@ fn run_takes<T: Copy + Sync>(takes: Vec<(String, T)>, f: impl Fn(&str, T) + Sync
     );
 }
 
-// ---------------------------------------------------------------------------
 // (1) Codex particle replay, torn.
-// ---------------------------------------------------------------------------
 
 mod codex {
     use super::*;
@@ -859,9 +853,8 @@ mod codex {
 
 #[test]
 fn codex_particle_replay_stays_one_run_whole_and_torn_in_half_under_the_capped_sync_hold() {
-    // The two replays run side by side (`par_map`) and are judged in order:
-    // each is caught in its pool thread, so the torn replay's panic, if any,
-    // is raised only after the whole replay's laws are asserted.
+    // Each replay is caught in its pool thread, so the torn replay's panic is raised only
+    // after the whole replay's laws are asserted.
     let pairs = [(false, true), (true, true)];
     let replays = crate::common::par_map(&pairs, |&(torn, honor)| {
         std::panic::catch_unwind(|| codex::replay(torn, honor))
@@ -882,12 +875,10 @@ fn codex_particle_replay_stays_one_run_whole_and_torn_in_half_under_the_capped_s
     }
 }
 
-// ---------------------------------------------------------------------------
 // (2) A torn read inside a wrapped two-row composer.
-// ---------------------------------------------------------------------------
 
-/// Fixed two-row box (70 columns, 64-cell text rows): the owner's line wraps
-/// at text index 64; every key's frame torn at a boundary around the wrap.
+/// Fixed two-row box (70 columns, 64-cell text rows): the line wraps at text
+/// index 64; every key's frame torn at a boundary around the wrap.
 #[test]
 fn a_torn_read_at_the_wrap_column_of_a_fixed_two_row_composer_keeps_both_rows_whole() {
     let cols = 70;
@@ -941,7 +932,7 @@ fn claude_code_1024_byte_reads_with_the_boundary_at_the_wrap_keep_both_rows_whol
     });
 }
 
-/// A composer that GROWS at the wrap (the box grows upward by a scroll, as
+/// A composer that grows at the wrap (the box grows upward by a scroll, as
 /// Ink's bottom-pinned region does), every key torn around the wrap column.
 #[test]
 fn a_growing_composer_torn_at_its_wrap_keeps_the_band_whole() {
@@ -964,9 +955,7 @@ fn a_growing_composer_torn_at_its_wrap_keeps_the_band_whole() {
     });
 }
 
-// ---------------------------------------------------------------------------
 // (3) A torn read on every key for 3 s at 12 cps, the boundary fixed.
-// ---------------------------------------------------------------------------
 
 /// The lit count on the row at frame `i`.
 fn lit_count(h: &Host, i: usize, row: u16) -> usize {
@@ -1226,9 +1215,7 @@ fn a_torn_word_kill_frame_keeps_the_standing_text_lit() {
     });
 }
 
-// ---------------------------------------------------------------------------
 // (4) Ctrl-K mid-line.
-// ---------------------------------------------------------------------------
 
 fn kill_take(split: Split) -> (Host, usize, u16, usize, usize) {
     let mut h = Host::new(140, 1, false, 0);
@@ -1282,7 +1269,7 @@ fn ctrl_k_then_typing_on_keeps_one_run() {
     });
 }
 
-/// Ctrl-K, then typing on with EVERY key torn at the same boundary inside
+/// Ctrl-K, then typing on with every key torn at the same boundary inside
 /// the standing prefix.
 #[test]
 fn ctrl_k_then_typing_on_with_every_frame_torn_keeps_one_run() {
@@ -1310,12 +1297,10 @@ fn ctrl_k_then_typing_on_with_every_frame_torn_keeps_one_run() {
     });
 }
 
-/// T6 on the defect's own path: a torn Backspace, typing on, then idle —
-/// whatever the parts did, the engine still goes to zero.
+/// T6 after a torn Backspace and typing on: whatever the parts did, the
+/// engine still goes to zero.
 #[test]
 fn a_torn_backspace_then_typing_on_still_goes_idle_to_zero() {
-    // The two takes run side by side (`par_map`); the first failing one in
-    // this order raises its own panic.
     crate::common::par_map(&[false, true], |&spinner| {
         let mut h = Host::new(140, 1, spinner, 0);
         let row = h.text_row0();

@@ -13,9 +13,8 @@
 use super::handler::TerminalHandler;
 use super::response_capability::ResponseCapability;
 
-/// Maximum response size in bytes to prevent amplification attacks.
-/// 4096 accommodates all supported capabilities in a single query,
-/// including large terminfo string values like setaf/setab when hex-encoded.
+/// Maximum response bytes, against amplification: room for every supported
+/// capability in one query, hex-encoded setaf/setab included.
 const MAX_RESPONSE_SIZE: usize = 4096;
 
 impl TerminalHandler<'_> {
@@ -84,15 +83,11 @@ impl TerminalHandler<'_> {
     /// A capability's value by termcap or terminfo name; `None` if unknown.
     fn lookup_capability(name: &[u8]) -> Option<Vec<u8>> {
         match name {
-            // Terminal name (termcap: TN, terminfo: name)
             b"TN" | b"name" => Some(b"xterm-256color".to_vec()),
 
-            // Number of colors (termcap: Co, terminfo: colors)
             b"Co" | b"colors" => Some(b"256".to_vec()),
 
-            // Direct color / RGB support (ncurses extension)
-            // Value 8:8:8 indicates 8 bits per channel for R, G, B.
-            // ncurses-based programs parse this format for truecolor detection.
+            // ncurses direct color: 8 bits per channel.
             b"RGB" => Some(b"8:8:8".to_vec()),
 
             // True color support (tmux extension, empty = supported)
@@ -122,13 +117,10 @@ impl TerminalHandler<'_> {
                 Some(b"\x1b[%?%p1%{8}%<%t4%p1%d%e%p1%{16}%<%t10%p1%{8}%-%d%e48;5;%p1%d%;m".to_vec())
             }
 
-            // Reset attributes (terminfo: sgr0)
             b"sgr0" | b"me" => Some(b"\x1b(B\x1b[m".to_vec()),
 
-            // Bell (terminfo: bel)
             b"bel" => Some(b"\x07".to_vec()),
 
-            // Carriage return (terminfo: cr)
             b"cr" => Some(b"\r".to_vec()),
 
             // Alt screen enter/exit (terminfo: smcup/rmcup)
@@ -162,7 +154,6 @@ impl TerminalHandler<'_> {
             b"kf11" | b"F1" => Some(b"\x1b[23~".to_vec()),
             b"kf12" | b"F2" => Some(b"\x1b[24~".to_vec()),
 
-            // Unknown capability
             _ => None,
         }
     }

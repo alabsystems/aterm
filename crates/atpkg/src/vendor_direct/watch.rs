@@ -374,7 +374,7 @@ impl HeadWatch {
         }
     }
 
-    /// `[packages].exclude` as it reads NOW. A long-lived caller (the window's loop) hands
+    /// `[packages].exclude` as it reads now. A long-lived caller (the window's loop) hands
     /// it in before every slice, so an edit is heard without a relaunch: an excluded
     /// program is neither due nor asked, and one taken off the list is asked at its next
     /// due time. The other per-program gates — removed, held by a local pin, dev-linked —
@@ -442,7 +442,7 @@ impl HeadWatch {
         }
     }
 
-    /// Whether this watch's terminal session holds the store's EXCLUSIVE rendezvous
+    /// Whether this watch's terminal session holds the store's exclusive rendezvous
     /// right now ([`host`]). A seat holder between rounds may be behind a window.
     #[must_use]
     pub fn seated_session(&self) -> bool {
@@ -487,12 +487,10 @@ impl HeadWatch {
         }
     }
 
-    /// Establish a window's persistent shared claim even when there are no
-    /// vendor heads to check. Its package park still looks for held toolchain
-    /// moves, and the claim keeps a terminal session from launching the same
-    /// update. A session instead re-admits for each due look and holds its
-    /// exclusive claim through the launch decision. Returns whether this
-    /// window may check a held move this slice; a refused claim is retried.
+    /// Establish a window's persistent shared claim even with no vendor head to check: its
+    /// park still looks for held toolchain moves, and the claim keeps a session from
+    /// launching the same update. Returns whether this window may check a held move this
+    /// slice; a refused claim is retried.
     #[must_use]
     pub fn sit(&mut self, layout: &Layout) -> bool {
         if self.host != Some(Host::Window) || !layout.prefix.is_dir() {
@@ -586,12 +584,9 @@ impl HeadWatch {
     }
 
     /// Move the workers' completion notices off the channel, keeping only those whose head
-    /// is still pending; whether any arrived. A notice can outlive its head: a worker sends
-    /// it just before it finishes, so a harvest that read the channel first and saw the
-    /// thread finished after joined the head without it (32 of 3,000 offline rounds, whose
-    /// two GETs fail at once). Kept, that stale notice would skip every later park's wait,
-    /// and a host with nothing in flight — a session's runner following its pass, or a
-    /// window between due heads — would spin a core.
+    /// is still pending; whether any arrived. A notice can outlive its head (a worker sends
+    /// it just before it finishes, so a harvest may join the head first); kept, a stale
+    /// notice would skip every later park's wait and spin a host with nothing in flight.
     fn take_notices(&mut self) -> bool {
         let mut arrived = false;
         while let Ok(index) = self.completed_rx.try_recv() {
@@ -620,13 +615,11 @@ impl HeadWatch {
         woke
     }
 
-    /// ONE SLICE OF A HOST'S PARK (design §1.6), the unit both hosts run — the window's
-    /// package loop between its own lanes, a session's [`Runner`] alone: the slice's
-    /// clocks (over which the wall clock moved `wall_elapsed`, `None` backwards, and the
-    /// monotonic clock `mono_elapsed`: a wake asks every head [`AFTER_WAKE`] later), then,
-    /// when due, a round started or harvested ([`Self::check_pending_with_index_in_flight`]),
-    /// and the programs whose head moved — `None` when none did. The notes wait in
-    /// [`Self::take_notes`] for the host's log.
+    /// One slice of a host's park (design §1.6), the unit both hosts run — the window's
+    /// package loop between its own lanes, a session's [`Runner`] alone: note the slice's
+    /// clocks ([`Self::note_slice`]), then, when due, start or harvest a round
+    /// ([`Self::check_pending_with_index_in_flight`]). Answers the programs whose head
+    /// moved, `None` when none did; the notes wait in [`Self::take_notes`].
     pub fn slice(
         &mut self,
         layout: &Layout,
@@ -697,10 +690,9 @@ impl HeadWatch {
         self.check_pending_with_index_in_flight(layout, now, get, false)
     }
 
-    /// The GUI may be waiting for an independent index probe. Every due vendor
-    /// GET uses an owned worker, even when it is the only one: a slow vendor
-    /// must not delay a local bump, full-pass deadline, or switch response.
-    /// `index_in_flight` remains in this entry point for its existing callers.
+    /// [`Self::check_pending`]; `_index_in_flight` is ignored. Every due vendor GET runs on an
+    /// owned worker, even a lone one: a slow vendor must not delay a local bump, full-pass
+    /// deadline or switch response while the GUI waits on an independent index probe.
     pub fn check_pending_with_index_in_flight(
         &mut self,
         layout: &Layout,
@@ -739,10 +731,9 @@ impl HeadWatch {
                     }
                     self.watched[index].1 = watched;
                     self.round_notes[index] = Some(completed.notes);
-                    // A whole-store pass may have landed this build while the
-                    // hint was in flight (or the user may have removed/held the
-                    // program). Recheck the live store before spawning a second,
-                    // now-redundant targeted update.
+                    // A whole-store pass may have landed this build while the hint was in
+                    // flight, or the program was removed or held: recheck the live store
+                    // before a redundant targeted update.
                     let still_needs_pass =
                         !Self::excludes(&self.exclude, self.watched[index].0.program)
                             && self.watched[index].1.offered.is_some_and(|(head, _)| {
@@ -772,27 +763,27 @@ impl HeadWatch {
         if self.has_pending() {
             return Vec::new();
         }
-        let due: Vec<usize> = self
-            .watched
-            .iter()
-            .enumerate()
-            .filter_map(|(index, (spec, watched))| {
-                (!Self::excludes(&self.exclude, spec.program)
-                    && watched.due(now)
-                    && installed(layout, spec).is_some())
-                .then_some(index)
-            })
-            .take(2)
-            .collect();
-        // The empty case still walks `check_one` so uninstalled vendors get a
-        // cadence deadline instead of being rechecked on every park slice. It asks no
-        // head, so it needs no claim: a store with no vendor program installed never
-        // takes the rendezvous.
-        if due.is_empty() {
-            return self.check(layout, now, get.as_ref());
+        // A due vendor that is not installed is asked nothing and gets its cadence deadline
+        // now, as `check_one` gives it, so it never keeps the watch due on every park slice.
+        let mut due: Vec<usize> = Vec::new();
+        for (index, (spec, watched)) in self.watched.iter_mut().enumerate() {
+            if Self::excludes(&self.exclude, spec.program) || !watched.due(now) {
+                continue;
+            }
+            if installed(layout, spec).is_some() {
+                due.push(index);
+            } else {
+                watched.next_check_at = Some(now + CADENCE);
+            }
         }
-        // WHO WATCHES (gap #28): a round only as the store's rendezvous allows. A session
-        // admitted here holds it until the round is harvested ([`Self::finish_round_if_done`]).
+        due.truncate(2);
+        // Nothing installed is due: no head to ask, so no claim — a store with no vendor
+        // program installed never takes the rendezvous.
+        if due.is_empty() {
+            return Vec::new();
+        }
+        // A round only as the store's rendezvous allows; a session admitted here holds it
+        // until the round is harvested (`finish_round_if_done`).
         if !self.admitted(layout, now) {
             return Vec::new();
         }
@@ -991,8 +982,8 @@ fn check_one(
     (outcome, notes)
 }
 
-/// The original per-vendor decision, now driven either by a process-local state (test or
-/// read-only-store fallback) or by the state read under the store-scoped watch lock.
+/// The per-vendor decision, over process-local state (a test, or the read-only-store
+/// fallback) or the state read under the store-scoped watch lock.
 fn check_watched(
     spec: &VendorSpec,
     watched: &mut Watched,
@@ -1169,9 +1160,9 @@ fn check_shared(
     };
     let mut state = read_shared(&mut file, spec);
     let mut shared_watched = state.watched();
-    // The child may have finished while another window held this lock. Reconcile
-    // the exact offer's result durably BEFORE the no-GET early return; a newer
-    // offer of even the same version must not inherit the old child's result.
+    // The child may have finished while another window held this lock. Reconcile the
+    // exact offer's result durably before the no-GET early return; a newer offer of even
+    // the same version must not inherit the old child's result.
     if let Some(result) = watched.deferred_result {
         if shared_watched.matches_result(result) {
             shared_watched.apply_result(result);
@@ -1213,7 +1204,7 @@ fn check_shared(
     outcome
 }
 
-/// The watch the WINDOW's package thread may run ([`for_host`] as [`Host::Window`]).
+/// The watch the window's package thread may run ([`for_host`] as [`Host::Window`]).
 #[must_use]
 pub fn for_this_process(
     exclude: &[String],
@@ -1312,10 +1303,9 @@ mod tests {
     const CLAUDE_HEAD: &str = "https://downloads.claude.ai/claude-code-releases/latest";
     const CODEX_HEAD: &str = "https://releases.openai.com/codex/channels/latest";
 
-    /// A wait for something that must happen — a worker's answer, a test's own
-    /// release — is a hang detector of a minute, never a latency budget
-    /// (AGENTS.md). A simulated GET the test holds waits twice this for its
-    /// release, so it never gives up inside one.
+    /// The hang detector for a wait that must end (a worker's answer, a test's own
+    /// release). A simulated GET the test holds waits twice this, so it never gives up
+    /// inside one.
     pub(super) const HANG: Duration = Duration::from_secs(60);
 
     /// A park of two minutes, woken at 100 ms, returns inside [`HANG`]: the
@@ -1393,6 +1383,12 @@ mod tests {
             Anchor::OpenAiTwoHost => format!(
                 "https://github.com/openai/codex/releases/download/rust-v{version}/codex-package-aarch64-apple-darwin.tar.gz"
             ),
+            Anchor::GoogleTwoHost => format!(
+                "https://storage.googleapis.com/antigravity-public/antigravity-cli/{version}-1/darwin-arm/cli_mac_arm64.tar.gz"
+            ),
+            Anchor::MetaDeveloperId => format!(
+                "https://lookaside.facebook.com/lookaside/muse/download/?channel=muse&version={version}&file=muse-aarch64-macos"
+            ),
         };
         let record = VendorRecord {
             schema: RECORD_SCHEMA,
@@ -1401,6 +1397,7 @@ mod tests {
             vendor: spec.vendor.to_string(),
             source_url,
             sha256: "a".repeat(64),
+            sha512: String::new(),
             size: 1,
             tree_root: "b".repeat(64),
             apple_team: cfg!(target_os = "macos").then(|| spec.apple_team.to_string()),
@@ -1533,10 +1530,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// A STALE COMPLETION NEVER CUTS A PARK SHORT. A worker sends its notice just before its
-    /// thread finishes, so a harvest can join the head by its finished thread and leave the
-    /// notice behind ([`HeadWatch::take_notices`]). That race leaves exactly one state, set
-    /// here directly: a notice for a head no longer pending.
+    /// The notice/harvest race ([`HeadWatch::take_notices`]) leaves a notice for a head no
+    /// longer pending; the test sets that state directly.
     #[test]
     fn a_stale_completion_never_cuts_a_park_short() {
         let mut watch = HeadWatch::new(&[]);
@@ -1668,9 +1663,8 @@ mod tests {
         let owned_while_blocked = early
             .as_ref()
             .is_ok_and(|(watch, moved)| moved.is_empty() && watch.pending_count() == 1);
-        // Release on both sides of the regression so the old inline behavior
-        // fails once the minute is out instead of leaving its caller blocked
-        // for the GET's two.
+        // Release either way, so an inline GET fails the test after a minute instead of
+        // blocking the caller for the GET's two.
         let (lock, ready) = &*gate;
         *lock.lock().unwrap() = true;
         ready.notify_all();
@@ -1817,8 +1811,8 @@ mod tests {
         assert!(model.fire("VendorReady", &mut state));
         assert_eq!(watch.pending_count(), 0);
 
-        // Negative control: the model of the old inline fallback has one GET
-        // during the in-flight index probe and violates this same projection.
+        // Negative control: the buggy model makes an inline GET on helper failure and
+        // violates the same invariant.
         let buggy = aterm_spec::interp::with_buggy(&model, 1);
         let mut old = buggy.init_state();
         assert!(buggy.fire("Start", &mut old));
@@ -2462,24 +2456,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// `[packages].exclude` IS READ LIVE (§4.3's owed item): a program excluded after the
-    /// watch started is neither due nor asked from the next slice, and taking it off the
-    /// list asks it at once — a stale launch-time list neither kept hinting passes for a
-    /// program the person excluded nor stranded one they included again.
+    /// `[packages].exclude` is read live: a program excluded after the watch started is
+    /// neither due nor asked from the next slice, and one taken off the list is asked at once.
     #[test]
     fn an_exclusion_edited_mid_watch_is_heard_at_the_next_check() {
         let l = layout("live-exclude");
         install(&l, "claude", "2.1.280");
         let f = Vendors::default();
         f.head(CLAUDE_HEAD, "2.1.281", None);
-        let codex = [String::from("codex")];
-        let both = [String::from("claude"), String::from("codex")];
-        let mut w = HeadWatch::new(&codex);
-        w.set_exclude(&both);
+        let all: Vec<String> = VENDORS.iter().map(|s| s.program.to_string()).collect();
+        let others: Vec<String> = all.iter().filter(|p| *p != "claude").cloned().collect();
+        let mut w = HeadWatch::new(&others);
+        w.set_exclude(&all);
         assert!(!w.due(at(0)), "every watched head is excluded");
         assert!(check(&mut w, &l, &f, at(0)).is_empty());
         assert!(f.take_gets().is_empty(), "excluded: no request");
-        w.set_exclude(&codex);
+        w.set_exclude(&others);
         assert!(w.due(at(5)), "included again: due at once");
         assert_eq!(check(&mut w, &l, &f, at(5)), ["claude"]);
         assert_eq!(f.take_gets(), [(CLAUDE_HEAD.to_string(), None)]);

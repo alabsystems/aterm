@@ -5,8 +5,8 @@
 //! the `refines` / `spec_invariant` / `spec_unmodeled` attribute macros.
 //!
 //! Since TRUST_NATIVE_TLA Phase 0 the attribute macros are ANCHOR EMITTERS: they
-//! leave the annotated item unchanged AND emit an `inventory` record referencing
-//! `::aterm_spec::{inventory,xref}::…`. So this test now links `aterm-spec` (a
+//! leave the annotated item unchanged AND emit a registry record referencing
+//! `::aterm_spec::{registry,xref}::…`. So this test now links `aterm-spec` (a
 //! dev-dependency; the cycle is dev-only and Cargo-legal). The `ty_model!` macro
 //! emits `::aterm_spec::derive::*` paths and is exercised from `aterm-spec`'s own
 //! `tests/`.
@@ -14,11 +14,11 @@
 use aterm_spec_macros::{refines, spec_invariant, spec_unmodeled};
 
 // ── Attribute macros are pass-throughs: the annotated item still works ────────
-// `refines` accepts `machine = "..", action = ".."`, `spec_invariant` accepts
+// `refines` takes `machine`, `action` and `project` (all required), `spec_invariant` takes
 // `id = ".."` and an optional `tla = ".."`, and `spec_unmodeled` accepts
 // `reason = ".."`; the item each annotates must remain callable and unmodified.
 
-#[refines(machine = "Ring", action = "Push")]
+#[refines(machine = "Ring", action = "Push", project = "test::project")]
 fn push_impl(n: u32) -> u32 {
     n + 1
 }
@@ -42,7 +42,7 @@ fn platform_fast_path() -> &'static str {
 struct Engine;
 
 impl Engine {
-    #[refines(machine = "Cursor", action = "Deliver")]
+    #[refines(machine = "Cursor", action = "Deliver", project = "test::project")]
     fn deliver(&self, seq: u64) -> u64 {
         seq
     }
@@ -120,7 +120,7 @@ fn anchor_entry_id(action: &str) -> &'static str {
         .entry_id
 }
 
-#[refines(machine = "Shapes", action = "EarlyReturn")]
+#[refines(machine = "Shapes", action = "EarlyReturn", project = "test::project")]
 fn early_return(n: u32) -> u32 {
     if n == 0 {
         return 99;
@@ -128,12 +128,12 @@ fn early_return(n: u32) -> u32 {
     n * 2
 }
 
-#[refines(machine = "Shapes", action = "Generic")]
+#[refines(machine = "Shapes", action = "Generic", project = "test::project")]
 fn generic_identity<T: Clone>(t: &T) -> T {
     t.clone()
 }
 
-#[refines(machine = "Shapes", action = "Recursive")]
+#[refines(machine = "Shapes", action = "Recursive", project = "test::project")]
 fn recursive_sum(n: u64) -> u64 {
     if n == 0 { 0 } else { n + recursive_sum(n - 1) }
 }
@@ -142,7 +142,7 @@ fn recursive_sum(n: u64) -> u64 {
 /// non-const fn). It must still compile, still be usable in const position, and
 /// report itself as unprobed via an empty `entry_id` — which the gate treats as a
 /// failure rather than a pass, so this is not an escape hatch.
-#[refines(machine = "Shapes", action = "ConstFn")]
+#[refines(machine = "Shapes", action = "ConstFn", project = "test::project")]
 const fn const_double(n: u32) -> u32 {
     n * 2
 }
@@ -150,7 +150,7 @@ const fn const_double(n: u32) -> u32 {
 const CONST_EVALUATED: u32 = const_double(21);
 
 /// Inner attributes on the block must survive the prepend.
-#[refines(machine = "Shapes", action = "InnerAttr")]
+#[refines(machine = "Shapes", action = "InnerAttr", project = "test::project")]
 fn inner_attr_body() -> u32 {
     #![allow(clippy::let_and_return)]
     let v = 7;
@@ -163,7 +163,7 @@ struct ByValue {
 
 impl ByValue {
     /// `self` BY VALUE, and a tail expression that moves out of it.
-    #[refines(machine = "Shapes", action = "SelfByValue")]
+    #[refines(machine = "Shapes", action = "SelfByValue", project = "test::project")]
     fn into_n(self) -> u32 {
         self.n
     }
@@ -171,10 +171,10 @@ impl ByValue {
     /// FOUR anchors on one method — the `Terminal::post_process` shape. Attribute
     /// macros expand outside-in, so each expansion prepends its own probe to the
     /// body the next one sees, and all four ids must be recorded by one call.
-    #[refines(machine = "Shapes", action = "Multi1")]
-    #[refines(machine = "Shapes", action = "Multi2")]
-    #[refines(machine = "Shapes", action = "Multi3")]
-    #[refines(machine = "Shapes", action = "Multi4")]
+    #[refines(machine = "Shapes", action = "Multi1", project = "test::project")]
+    #[refines(machine = "Shapes", action = "Multi2", project = "test::project")]
+    #[refines(machine = "Shapes", action = "Multi3", project = "test::project")]
+    #[refines(machine = "Shapes", action = "Multi4", project = "test::project")]
     fn multi(&mut self) -> u32 {
         self.n += 1;
         self.n
@@ -342,5 +342,53 @@ fn an_unarmed_probe_records_nothing() {
         before,
         "closing the window must stop the recording, without discarding what the \
          window already saw"
+    );
+}
+
+// ── COLLECTION: every record this file submits is collected exactly once ──────
+//
+// The emitters' records reach `aterm_spec::xref` through a constructor-section
+// registry that runs before `main`. A target where those constructors never run,
+// or a node linked twice, would not fail any test above that looks one anchor up
+// by name; it fails this one. The digest pins this file's records (it leaves
+// `location` out: editing this file moves line numbers, not records), so a change
+// to an anchor above changes it too.
+
+/// FNV-1a over the sorted records, so the whole collected set is pinned by one value.
+fn records_digest(rows: &[String]) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in rows.iter().flat_map(|r| r.as_bytes().iter().chain(&[0xff])) {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
+#[test]
+fn the_registry_collects_every_record_this_file_submits_exactly_once() {
+    use aterm_spec::xref::{invariant_anchors, waivers};
+    let mut rows: Vec<String> = refinements()
+        .map(|r| {
+            format!(
+                "refines {}|{}|{}|{}|{}",
+                r.machine, r.action, r.rust_method, r.project, r.entry_id
+            )
+        })
+        .chain(waivers().map(|w| {
+            format!(
+                "unmodeled {}|{}|{}|{}",
+                w.machine, w.action, w.reason, w.rust_method
+            )
+        }))
+        .chain(
+            invariant_anchors()
+                .map(|i| format!("invariant {}|{}|{}", i.machine, i.id, i.rust_method)),
+        )
+        .collect();
+    rows.sort();
+    assert_eq!(
+        (rows.len(), records_digest(&rows).as_str()),
+        (15, "388d1c9f0d7b4c66"),
+        "the collected record set changed: {rows:#?}"
     );
 }

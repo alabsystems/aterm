@@ -1,14 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! M2 quit-safety guard (audit): a close/quit request while a foreground job is
-//! running is REFUSED the first time — a mis-click or a stray Cmd-W/Cmd-Q must not
-//! kill an in-flight build or AI run — and confirmed by a second request inside a
-//! brief window. The decision logic is pure and unit-tested here; `App` wires the
-//! PTY (`tcgetpgrp` on the session master on unix; a child-process walk of the
-//! shell pid on windows, vetted by creation time — [`ChildLinks::has_job`]), the
-//! shell-integration state ([`shell_word`]: the shell's own word that a command
-//! is running, or that it went idle), and the winit title/timer shims.
+//! Quit-safety guard: a close/quit request while a foreground job is running is
+//! refused the first time (a mis-click or a stray Cmd-W/Cmd-Q must not kill an
+//! in-flight build or AI run) and confirmed by a second request inside a brief window.
+//! The decisions are pure; `App` wires the PTY (`tcgetpgrp` on the session master on
+//! unix; a creation-time-vetted walk of the shell's children on windows,
+//! [`ChildLinks::has_job`]), the shell's own word ([`shell_word`]), and the title and
+//! timer shims.
 
 use std::time::{Duration, Instant};
 
@@ -17,10 +16,10 @@ use std::time::{Duration, Instant};
 /// request starts over.
 pub(crate) const CLOSE_CONFIRM_WINDOW: Duration = Duration::from_secs(2);
 
-/// The titlebar hint shown while a refused CLOSE keeps the confirm window armed.
+/// The titlebar hint shown while a refused close keeps the confirm window armed.
 pub(crate) const CLOSE_WARNING_TITLE: &str = "job running — close again within 2s to end it";
 
-/// The titlebar hint shown while a refused QUIT keeps the confirm window armed: a
+/// The titlebar hint shown while a refused quit keeps the confirm window armed: a
 /// repeat ends the whole program, not this window.
 pub(crate) const QUIT_WARNING_TITLE: &str = "job running — quit again within 2s to end it";
 
@@ -44,9 +43,9 @@ pub(crate) enum CloseDecision {
     Warn,
 }
 
-/// Decide a close/quit request: a busy foreground job refuses the FIRST request
-/// (arming the confirm window); a second request while armed — or any request with
-/// nothing busy — proceeds.
+/// Decide a close/quit request: a busy foreground job refuses the first request
+/// (arming the confirm window); a second request while armed, or any request with
+/// nothing busy, proceeds.
 pub(crate) fn close_decision(foreground_busy: bool, warning_armed: bool) -> CloseDecision {
     if foreground_busy && !warning_armed {
         CloseDecision::Warn
@@ -55,9 +54,8 @@ pub(crate) fn close_decision(foreground_busy: bool, warning_armed: bool) -> Clos
     }
 }
 
-/// The copy for a destructive close/quit confirmation dialog. Static strings, so the
-/// platform layer (`AppRt::confirm` → the native `NSAlert`) just hands them straight
-/// to the alert.
+/// The copy for a destructive close/quit confirmation dialog, handed as is to the
+/// platform alert (`AppRt::confirm` → `NSAlert`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ConfirmPrompt {
     /// The alert's primary message (`NSAlert.messageText`).
@@ -69,18 +67,15 @@ pub(crate) struct ConfirmPrompt {
     pub proceed: &'static str,
 }
 
-/// Decide whether a close/quit gesture needs a confirmation dialog, and with what
-/// copy. `exits_app` = the gesture quits the WHOLE program (Cmd-Q / app-menu Quit, or
-/// a close that would remove the last window); `busy` = closing now would SIGHUP a
-/// foreground job; `reopens` = the layout is restored at the next start
-/// (`restore_session`, on by default), so a quit loses the shells and their
-/// scrollback, not the windows.
+/// Whether a close/quit gesture needs a confirmation dialog, and with what copy.
+/// `exits_app`: the gesture quits the whole program (Cmd-Q / app-menu Quit, or a
+/// close that removes the last window); `busy`: closing now would SIGHUP a foreground
+/// job; `reopens`: the layout is restored at the next start (`restore_session`), so a
+/// quit loses the shells and their scrollback, not the windows.
 ///
-/// * A whole-app quit ALWAYS confirms — the iTerm-style "are you sure you want to
-///   quit?" prompt the user expects from ⌘Q — with copy that notes a running job.
-/// * A window/tab close that LEAVES the app running confirms only while a job is
-///   running, so an idle close stays instant.
-/// * An idle close that leaves the app running needs no confirmation (`None`).
+/// A whole-app quit always confirms (the ⌘Q prompt), with copy that notes a running
+/// job; a close that leaves the app running confirms only while a job runs, so an
+/// idle close stays instant (`None`).
 pub(crate) fn confirm_prompt(exits_app: bool, busy: bool, reopens: bool) -> Option<ConfirmPrompt> {
     if exits_app {
         Some(ConfirmPrompt {
@@ -112,21 +107,16 @@ pub(crate) fn confirm_prompt(exits_app: bool, busy: bool, reopens: bool) -> Opti
     }
 }
 
-/// The WINDOWS close-confirm policy — Windows Terminal's convention
-/// (`confirmCloseAllTabs`), NOT macOS's: confirm when the gesture would close
-/// MULTIPLE tabs or end a running job, and NEVER for a single idle tab — an
-/// idle Alt+F4 on a one-tab window closes instantly, even when it is the last
-/// window and thus quits the app. macOS's always-confirm-on-quit rule
-/// ([`confirm_prompt`]'s `exits_app` arm) is deliberately NOT ported: ⌘Q is a
-/// one-key slip next to ⌘W, while a Windows quit is Alt+F4 / the caption ✕ —
-/// gestures no neighbouring key mistypes — and no native Windows app confirms
-/// an idle single-document close.
+/// The Windows close-confirm policy, Windows Terminal's (`confirmCloseAllTabs`):
+/// confirm when the gesture would close multiple tabs or end a running job, never for
+/// a single idle tab, even the last window's (an idle Alt+F4 quits at once). macOS's
+/// always-confirm-on-quit is not ported: ⌘Q is a one-key slip next to ⌘W, while
+/// Alt+F4 and the caption ✕ are not, and no native Windows app confirms an idle
+/// single-document close.
 ///
-/// `tabs_closing` is the gesture's blast radius: every tab the close would take
-/// with it (the closing window's tabs, or all windows' for a whole-app quit).
-/// The busy/quit copy is shared verbatim with [`confirm_prompt`]; only the
-/// idle-multi-tab close of a NON-last window needs copy of its own (macOS never
-/// prompts there at all).
+/// `tabs_closing` is every tab the close would take with it (the window's, or all
+/// windows' for a whole-app quit). The busy/quit copy is [`confirm_prompt`]'s; only
+/// the idle multi-tab close of a non-last window has its own.
 #[cfg(windows)]
 pub(crate) fn confirm_prompt_windows(
     exits_app: bool,
@@ -144,29 +134,22 @@ pub(crate) fn confirm_prompt_windows(
     }))
 }
 
-/// Whether a PTY's foreground process group is a JOB rather than the shell itself.
-/// `tcgetpgrp(master)` returns the shell's own pgid (== its pid: the forkpty child
-/// is the session leader) at an idle prompt, the running job's pgid while one runs,
-/// and <= 0 on error — treated as idle on unix so a broken/torn-down PTY can never
-/// wedge a window open. windows: ConPTY has no `tcgetpgrp` ([`foreground_pgrp`] is
-/// always `-1` there), so the `fg_pgrp <= 0` case falls through to a Toolhelp32
-/// process-tree walk instead — a shell with a live CHILD process it started is
-/// running a job (the honest ConPTY analogue; the pty host is a child of aterm,
-/// not the shell, so it never counts). What "a child it started" means, and why
-/// a matching parent pid alone is not it, is [`ChildLinks::has_job`]. A
-/// dead/unknown shell has no children and stays idle.
-///
-/// `since_ms` (unix epoch ms) is windows-only: count only a child created at or
-/// after it — the instant the shell's own integration said it went idle
-/// ([`ShellWord::idle_since_ms`]). unix ignores it: `tcgetpgrp` already names
-/// the one foreground job, so a background child never reads as busy there.
+/// Whether a PTY's foreground process group is a job rather than the shell itself.
+/// `tcgetpgrp(master)` returns the shell's own pgid (its pid: the forkpty child is the
+/// session leader) at an idle prompt, the job's pgid while one runs, and <= 0 on
+/// error, which unix treats as idle so a torn-down PTY never wedges a window open.
+/// ConPTY has no `tcgetpgrp` ([`foreground_pgrp`] is `-1` on windows), so there the
+/// `fg_pgrp <= 0` case falls through to a Toolhelp32 walk: a shell with a live child
+/// it started is running a job ([`ChildLinks::has_job`]; the pty host is aterm's
+/// child, not the shell's, so it never counts).
 pub(crate) fn foreground_is_job(fg_pgrp: i32, shell_pid: i32) -> bool {
     foreground_is_job_since(fg_pgrp, shell_pid, None)
 }
 
-/// [`foreground_is_job`] with the Windows child-age floor (`since_ms`, see its
-/// doc) — the close guard's form. A separate name rather than a third argument
-/// on `foreground_is_job`, whose two-argument shape other callers keep using.
+/// [`foreground_is_job`] with the windows child-age floor, the close guard's form:
+/// `since_ms` (unix epoch ms) counts only a child created at or after the instant the
+/// shell said it went idle ([`ShellWord::idle_since_ms`]). Unix ignores it:
+/// `tcgetpgrp` already names the one foreground job.
 pub(crate) fn foreground_is_job_since(fg_pgrp: i32, shell_pid: i32, since_ms: Option<u64>) -> bool {
     if fg_pgrp > 0 {
         return fg_pgrp != shell_pid;
@@ -182,63 +165,48 @@ pub(crate) fn foreground_is_job_since(fg_pgrp: i32, shell_pid: i32, since_ms: Op
     }
 }
 
-/// Whether `term`'s shell is EXECUTING a command: the shell said a command
-/// started (OSC 133;C) and has not yet said it finished (133;D).
+/// Whether `term`'s shell is executing a command: it said a command started (OSC
+/// 133;C) and has not yet said it finished (133;D).
 ///
-/// THE DEFECT THIS CLOSES (audit 2026-09-22). On windows the job oracle is the
-/// child-process walk ([`foreground_is_job`]), and a cmdlet, loop or script
-/// running INSIDE `pwsh.exe` spawns no child: `close` on a last tab running
-/// `Start-Sleep 60` answered `OK closed` and the instance ended, while the same
-/// close on `ping -t` was refused. Yet the session model knew the shell was
-/// busy in both cases — `status`/`blocks` showed the block executing. This is
-/// that knowledge, read from the engine the close gesture is about to hang up.
-/// No shell integration (no 133 marks at all) reads as idle, so the process
-/// walk stays the only oracle for a bare shell — and a shell whose integration
-/// marks only its prompts (cmd.exe's `%PROMPT%` tier, pwsh without PSReadLine)
-/// never sends a 133;C either, so it is a bare shell here too.
+/// On windows the process walk misses a cmdlet, loop or script running inside
+/// `pwsh.exe` (`Start-Sleep 60` spawns no child), so this is the engine's own
+/// knowledge of a running command. No integration, or one that marks only prompts
+/// (cmd.exe's `%PROMPT%` tier, pwsh without PSReadLine), never sends 133;C and reads
+/// idle here, leaving the process walk the only oracle.
 ///
-/// It reads the engine's SHELL STATE, not its current block. The two are set
-/// together at 133;C and cleared together at 133;D, a new prompt (133;A) and
-/// a full reset — but the block is also dropped mid-command by anything that
-/// makes absolute rows unknowable: ED 3 (`CSI 3 J`, which `clear` / `cls` /
-/// `Clear-Host` emit) and a scrollback invalidation. A running in-shell loop
-/// that clears the screen (`while ($true) { Clear-Host; …; Start-Sleep 5 }`)
-/// therefore read idle through the block, and on windows the child walk misses
-/// it too — defect (a) again. The shell state carries no row, so neither
-/// touches it, and a 133;D still ends it (the phase it gates on survives too).
+/// It reads the engine's shell state, not its current block: both are set at 133;C
+/// and cleared at 133;D, a new prompt (133;A) and a full reset, but the block is also
+/// dropped mid-command by anything that makes absolute rows unknowable (ED 3, which
+/// `clear`/`cls`/`Clear-Host` emit, and a scrollback invalidation), so a running loop
+/// that clears the screen would read idle through the block.
 pub(crate) fn shell_executing(term: &aterm_core::terminal::Terminal) -> bool {
     term.shell_state() == aterm_core::terminal::ShellState::Executing
 }
 
-/// What the shell's OWN integration says, as the close guard reads it: the
-/// two facts [`foreground_busy`] needs from the engine, taken under one lock.
+/// What the shell's own integration says, as the close guard reads it: the two facts
+/// [`foreground_busy`] needs from the engine, taken under one lock.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ShellWord {
     /// The shell said a command started and has not said it finished
     /// ([`shell_executing`]).
     pub(crate) executing: bool,
-    /// When the shell last said a command FINISHED (its 133;D, unix epoch ms)
-    /// — `Some` only when that word is both the shell's own and complete:
-    /// the host required a capability nonce and has one in use (posture `On`,
-    /// so every mark the engine took carried it, and the pwsh, bash, zsh and
-    /// fish scripts scrub it from the environment, so no program the shell
-    /// runs can sign one), and the shell has reported at least one whole
-    /// command (133;C then 133;D — the engine drops a D that no C opened). A
-    /// shell that has done both SAYS when it runs something, so from this
-    /// instant on a child it had already started is not a foreground job
-    /// ([`ChildLinks::has_job`]).
+    /// When the shell last said a command finished (its 133;D, unix epoch ms), `Some`
+    /// only when that word is the shell's own and complete: the host requires a
+    /// capability nonce and has one in use (posture `On`; the pwsh, bash, zsh and fish
+    /// scripts scrub it from the environment, so no program the shell runs can sign a
+    /// mark), and the shell has reported at least one whole command (133;C then
+    /// 133;D). Such a shell says when it runs something, so from this instant a child
+    /// it had already started is not a foreground job ([`ChildLinks::has_job`]).
     pub(crate) idle_since_ms: Option<u64>,
 }
 
 /// Read [`ShellWord`] from the engine a close is about to hang up.
 ///
-/// `None` for [`ShellWord::idle_since_ms`] is every shell whose idle prompt is
-/// silence rather than a statement: no integration, marks a program could
-/// forge (no nonce required), a nonce not in use (an adopted shell whose
-/// handoff lost it), and an integration that marks prompts but never commands
-/// — cmd.exe's `%PROMPT%` tier and pwsh without PSReadLine send no 133;C, so
-/// their completed-command count never moves, and their prompt says nothing
-/// about what runs behind it.
+/// [`ShellWord::idle_since_ms`] is `None` for every shell whose idle prompt is
+/// silence rather than a statement: no integration, forgeable marks (no nonce
+/// required), a nonce not in use (an adopted shell whose handoff lost it), and an
+/// integration that marks prompts but never commands (cmd.exe's `%PROMPT%` tier,
+/// pwsh without PSReadLine), whose completed-command count never moves.
 pub(crate) fn shell_word(term: &aterm_core::terminal::Terminal) -> ShellWord {
     let own_marks =
         term.shell_integration_posture() == aterm_core::terminal::ShellIntegrationPosture::On;
@@ -254,71 +222,46 @@ pub(crate) fn shell_word(term: &aterm_core::terminal::Terminal) -> ShellWord {
     }
 }
 
-/// THE close guard's verdict for one session: busy when EITHER the shell said
-/// a command is executing ([`ShellWord::executing`]) OR the PTY says a job
-/// holds the foreground ([`foreground_is_job`]), read against the instant the
-/// shell last said it went idle ([`ShellWord::idle_since_ms`]).
+/// The close guard's verdict for one session: busy when the shell said a command is
+/// executing ([`ShellWord::executing`]) or the PTY says a job holds the foreground
+/// ([`foreground_is_job_since`]), read against the instant the shell last said it
+/// went idle ([`ShellWord::idle_since_ms`]).
 ///
-/// The shell is consulted FIRST on purpose: on windows the process walk is a
-/// whole system snapshot (~3 ms measured), so a session the shell already
-/// reports busy never pays for it. Neither signal subsumes the other — a bare
-/// shell without integration never says it is executing, and an in-shell loop
-/// has no child — so the guard is their union. Every close path (the ctl
-/// `close` / `tab close` refusal, the caption ✕, Close Tab, Quit) reads this
-/// one predicate, so the four cannot disagree about what "busy" means.
+/// The shell is consulted first: on windows the process walk is a whole system
+/// snapshot (~3 ms), which a session the shell already reports busy never pays.
+/// Neither signal subsumes the other (a bare shell never says it is executing; an
+/// in-shell loop has no child), so the guard is their union. Every close path (ctl
+/// `close` / `tab close`, the caption ✕, Close Tab, Quit) reads this one predicate.
 ///
-/// WHICH CHILDREN COUNT (windows, measured 2026-09-27 on 0.95.0). The walk
-/// used to count every live process whose parent pid was the shell's, and
-/// that is wrong twice over now that the wire REFUSES a busy close outright:
-/// an idle pwsh tab was refused three times because a process created 39 s
-/// before that pwsh listed its (recycled) pid as parent, and every idle Git
-/// Bash tab was refused because `Git\bin\bash.exe` — the program the ConPTY
-/// starts — keeps the real `usr\bin\bash.exe` as its child for life. The rule
-/// now: a child counts only if it was created after the shell, the shell a
-/// launcher starts is not a job (its own children are), and — once the
-/// shell's integration has reported a whole command — only a child created
-/// after the shell last said it went idle counts.
-///
-/// That last rule is a decision, not a measurement, and it is why a program
-/// the shell launched IN THE BACKGROUND does not refuse a close: `Start-Process
-/// notepad`, a pwsh `Start-Job`, bash's `sleep 60 &` are all created while
-/// their command runs, before its 133;D, and the prompt that follows is the
-/// shell's word that nothing holds the foreground. That matches unix, where
-/// `tcgetpgrp` never names a background job either, and a GUI program is not
-/// attached to the ConPTY's console, so the close would not end it anyway. A
-/// foreground job has its own reading: its command is an executing block. The
-/// child walk still runs behind the shell's word rather than being dropped,
-/// because a child created AFTER that word is one the integration failed to
-/// announce (a prompt function a profile replaced, PSReadLine removed
-/// mid-session) — a job the shell is running without saying so.
+/// On windows the walk's floor is the shell's idle word once it has reported a whole
+/// command ([`ChildLinks::has_job`]). That is a decision: a program launched in the
+/// background (`Start-Process notepad`, `Start-Job`, `sleep 60 &`) is created before
+/// its command's 133;D, and the prompt that follows is the shell's word that nothing
+/// holds the foreground, as `tcgetpgrp` never names a background job on unix (and a
+/// GUI program is not on the ConPTY's console, so the close would not end it anyway).
+/// The walk still runs behind that word: a child created after it is a job the
+/// integration failed to announce (a replaced prompt function, PSReadLine removed
+/// mid-session).
 pub(crate) fn foreground_busy(fg_pgrp: i32, shell_pid: i32, word: ShellWord) -> bool {
     word.executing || foreground_is_job_since(fg_pgrp, shell_pid, word.idle_since_ms)
 }
 
-/// How long ONE system process-table capture may keep serving the tab-status
+/// How long one system process-table capture may keep serving the tab-status
 /// observer while no session's evidence has moved.
 ///
-/// This is the CEILING, not the cadence: any session whose observable evidence
-/// changed (a grid write, a byte of PTY output, a keystroke) forces a fresh
-/// capture in that same sweep, so every state change a user can cause is still
-/// answered against a snapshot taken after it. The ceiling exists only so a
-/// completely silent, input-less job start — a shell that spawns a child while
-/// emitting nothing at all — still converges, and 2 s bounds that worst case.
-///
-/// Sized against [`crate::session_status`]'s default 250 ms observation
-/// interval: eight idle prompts used to buy eight system snapshots every
-/// 250 ms (~32/s, ~100 ms of CPU per second on the machine this was measured
-/// on). With this ceiling an idle window of ANY tab count buys one every 2 s.
+/// A ceiling, not the cadence: any session whose evidence changed (a grid write, PTY
+/// output, a keystroke) forces a fresh capture in that sweep, so every state change a
+/// user can cause is answered against a snapshot taken after it. The ceiling only
+/// bounds a silent, input-less job start (a shell spawning a child while emitting
+/// nothing). Against [`crate::session_status`]'s 250 ms observation interval it
+/// turns eight idle tabs' ~32 snapshots/s into one every 2 s.
 pub(crate) const JOB_PROBE_MAX_AGE: Duration = Duration::from_secs(2);
 
-/// The observable evidence a foreground-job verdict is derived from — the
-/// inputs whose movement means a fresh process-table capture is owed.
-///
-/// A shell cannot acquire a foreground child without consuming input or
-/// emitting output, and both of those move one of these fields, so an
-/// unchanged key means the previous verdict is still the right answer.
-/// [`JobProbe::JOB_PROBE_MAX_AGE`](JOB_PROBE_MAX_AGE) bounds the case where
-/// that reasoning does not hold.
+/// The observable evidence a foreground-job verdict is derived from: inputs whose
+/// movement owes a fresh process-table capture. A shell cannot acquire a foreground
+/// child without consuming input or emitting output, both of which move a field
+/// here, so an unchanged key means the previous verdict stands; [`JOB_PROBE_MAX_AGE`]
+/// bounds the case where that does not hold.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct JobEvidenceKey {
     /// The engine's monotonic content sequence — any grid write moves it.
@@ -331,20 +274,15 @@ pub(crate) struct JobEvidenceKey {
     pub(crate) input: Option<Instant>,
 }
 
-/// Every live `(parent pid, child pid)` link at one instant, SORTED by parent,
-/// deduplicated — the process table as the job walk reads it.
+/// Every live `(parent pid, child pid)` link at one instant, sorted by parent and
+/// deduplicated: the process table as the job walk reads it.
 ///
-/// A sorted `Vec` rather than a hash map on purpose. The capture books one
-/// entry per process on the machine (several hundred), and it is read only a
-/// handful of times per sweep — once per due session. Hashing several hundred
-/// keys to answer eight questions is the wrong trade, and measurably so: the
-/// `HashSet` form of this capture cost ~15 ms against ~3.9 ms for the
-/// single-pid walk it replaced, which would have handed back most of the
-/// saving the batched probe exists to make. Sort once, binary-search per
-/// session.
+/// A sorted `Vec`, not a hash map: the capture holds one entry per process (several
+/// hundred) and is read once per due session, so it is sorted once and
+/// binary-searched (a `HashSet` capture measured ~15 ms against ~3.9 ms).
 ///
-/// A link is only a CANDIDATE: a parent pid is a number Windows reuses, so
-/// [`Self::has_job`] reads each candidate's creation time before it counts.
+/// A link is only a candidate: Windows reuses parent pids, so [`Self::has_job`]
+/// reads each candidate's creation time before it counts.
 #[derive(Default, Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ChildLinks(Vec<(u32, u32)>);
 
@@ -358,12 +296,11 @@ pub(crate) struct ProcessFacts {
     pub(crate) image: String,
 }
 
-/// How soon after a shell a same-image child must be created to be the shell
-/// that shell LAUNCHED rather than a job. Git for Windows' `bin\bash.exe` —
-/// the program a `--shell bash` ConPTY starts — starts `usr\bin\bash.exe`
-/// 22–38 ms after itself (seven live pairs measured 2026-09-27), and keeps it
-/// as its child for life; a shell a person types at a prompt comes seconds
-/// later at the earliest. 2 s is fifty times the measured gap.
+/// How soon after a shell a same-image child must be created to be the shell that
+/// shell launched rather than a job. Git for Windows' `bin\bash.exe` (what a `--shell
+/// bash` ConPTY starts) starts `usr\bin\bash.exe` 22–38 ms after itself and keeps it
+/// as its child for life; a shell typed at a prompt comes seconds later. 2 s is fifty
+/// times the measured gap.
 const LAUNCHER_WINDOW_MS: u64 = 2_000;
 
 impl ProcessFacts {
@@ -395,35 +332,26 @@ impl ChildLinks {
             .map(|&(_, child)| child)
     }
 
-    /// THE job predicate: whether `shell` has a live child that is a job it
-    /// started. `facts` reads a process through a handle
-    /// ([`process_facts`]); it is injected so every rule below is
-    /// provable without a process table.
+    /// The job predicate: whether `shell` has a live child that is a job it started.
+    /// `facts` reads a process through a handle ([`process_facts`]), injected so every
+    /// rule is provable without a process table.
     ///
-    /// * A child created BEFORE the shell is not its child. Windows reuses
-    ///   pids, and a process keeps the parent pid it was born with after that
-    ///   parent dies, so a stranger can list a new shell's pid as its parent —
-    ///   measured 2026-09-27: an idle pwsh tab refused `tab close` three times
-    ///   over an `aterm-gui.exe` created 39 s before that pwsh existed.
-    /// * A process whose facts cannot be read is NOT counted. The handle asks
-    ///   for `PROCESS_QUERY_LIMITED_INFORMATION`, which Windows grants on any
-    ///   process the same user started, elevated or not — every child a shell
-    ///   in this session can start. What refuses it is another user's or a
-    ///   protected process, which the shell did not start, or a process that
-    ///   already exited, which no close can end. An unreadable SHELL means the
-    ///   same of every candidate — none can be told from a recycled-pid
-    ///   stranger — so nothing counts.
-    /// * The shell a launcher started is not a job, and ITS children are
-    ///   ([`ProcessFacts::is_the_shell_launched_by`]): Git Bash's launcher
-    ///   holds the real bash as its child for life, and read as a job it made
-    ///   every idle Git Bash tab refuse its close.
-    /// * With `since_ms` (the instant the shell's own integration said it went
-    ///   idle, [`ShellWord::idle_since_ms`]), only a child created at or after
-    ///   it counts: a background program a finished command started is not a
-    ///   foreground job ([`foreground_busy`] has why).
+    /// * A child created before the shell is not its child: Windows reuses pids, and a
+    ///   process keeps its birth parent pid after that parent dies, so a stranger can
+    ///   list a new shell's pid as its parent.
+    /// * A process whose facts cannot be read is not counted. The handle asks for
+    ///   `PROCESS_QUERY_LIMITED_INFORMATION`, granted on any process the same user
+    ///   started, elevated or not; what refuses it is another user's or a protected
+    ///   process, which the shell did not start, or one that already exited. An
+    ///   unreadable shell leaves no candidate distinguishable from a stranger, so
+    ///   nothing counts.
+    /// * The shell a launcher started is not a job, and its children are
+    ///   ([`ProcessFacts::is_the_shell_launched_by`]): Git Bash's launcher holds the
+    ///   real bash as its child for life.
+    /// * With `since_ms` ([`ShellWord::idle_since_ms`]), only a child created at or
+    ///   after it counts ([`foreground_busy`] has why).
     ///
-    /// A shell with no candidate costs no handle at all — the idle case, and
-    /// the common one.
+    /// A shell with no candidate, the common idle case, costs no handle.
     pub(crate) fn has_job(
         &self,
         shell: u32,
@@ -459,30 +387,20 @@ impl ChildLinks {
     }
 }
 
-/// The rate-limited, BATCHED foreground-job oracle behind the tab-status
-/// observer's `foreground_job` evidence.
+/// The rate-limited, batched foreground-job oracle behind the tab-status observer's
+/// `foreground_job` evidence.
 ///
-/// THE DEFECT IT REMOVES. [`foreground_is_job`] answers one pid per call and
-/// pays a whole system process-table snapshot to do it (~3.1 ms measured on
-/// the machine this was found on). The status observer called it once per due
-/// session per sweep, so the idle cost was `sessions / observe_interval`
-/// system snapshots per second — 32/s for an idle eight-tab window, and the
-/// reason such a window cost several times an idle one-tab window while
-/// presenting the same two frames a second. None of it appeared in the
-/// scheduler's deadline counters, because it rides the per-turn sweep rather
-/// than any armed wake.
+/// [`foreground_is_job`] pays a whole system process-table snapshot (~3 ms) per pid;
+/// called once per due session per sweep, that cost an idle eight-tab window 32
+/// snapshots/s, unseen by the scheduler's deadline counters because it rides the
+/// per-turn sweep. The verdict here is the same vetted child walk
+/// ([`ChildLinks::has_job`], with no `since`: the status classifier weighs the
+/// shell's own marks itself), and moved evidence still forces a capture taken after
+/// it, but one capture answers a whole sweep, and at most one is taken per
+/// [`JOB_PROBE_MAX_AGE`] while nothing moves.
 ///
-/// WHAT THIS CHANGES. Nothing about the verdict: the predicate is the same
-/// vetted child walk ([`ChildLinks::has_job`], with no `since`: this is the
-/// raw process fact, and the status classifier weighs the shell's own marks
-/// above it by itself), and any evidence movement still forces a capture taken
-/// AFTER that movement. What changes is HOW MANY captures answer it — at most
-/// one per sweep no matter how many sessions are due (they all read the same
-/// capture), and at most one per [`JOB_PROBE_MAX_AGE`] while nothing moves.
-///
-/// The close-confirm path keeps calling [`foreground_is_job`] directly: it
-/// asks once, at the instant of a close gesture, and must never answer from a
-/// cache.
+/// The close guard ([`foreground_busy`]) asks the process table directly, once, at
+/// the gesture, and never answers from a cache.
 #[derive(Default)]
 pub(crate) struct JobProbe {
     /// The last capture and when it was taken. Every session in a sweep reads
@@ -490,11 +408,9 @@ pub(crate) struct JobProbe {
     snapshot: Option<(Instant, ChildLinks)>,
     /// Per-session evidence at the moment its verdict was last derived.
     keys: std::collections::HashMap<u64, JobEvidenceKey>,
-    /// How many process-table captures this probe has taken. THE regression
-    /// number for the idle-wake fix: it must not scale with session count, and
-    /// an idle window must add at most one per [`JOB_PROBE_MAX_AGE`].
-    /// Instance-local on purpose — a process-global counter could not be
-    /// asserted on from a parallel test suite.
+    /// How many process-table captures this probe has taken: it must not scale with
+    /// session count, and an idle window adds at most one per [`JOB_PROBE_MAX_AGE`].
+    /// Instance-local so a parallel test suite can assert on it.
     captures: u64,
 }
 
@@ -558,7 +474,7 @@ impl JobProbe {
         capture: impl FnOnce() -> ChildLinks,
         verdict: impl FnOnce(&ChildLinks) -> bool,
     ) -> bool {
-        // Taken THIS sweep already: every other due session reads it rather
+        // Taken this sweep already: every other due session reads it rather
         // than buying a second snapshot of the same instant.
         let this_sweep = self.snapshot.as_ref().is_some_and(|(at, _)| *at == now);
         if !this_sweep {
@@ -642,13 +558,12 @@ pub(crate) fn foreground_pgrp(master: i32) -> i32 {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 const ROOT_CHILDREN_MAX: usize = 64;
 
-/// What the process table says about a session's ROOT — the process the PTY
-/// was spawned with, its session leader (crash journal, ruling 292). The
-/// foreground-group test alone misses two cases the quit confirm never had to
-/// see: a program that IS the root (`aterm -e vim`, `exec vim`, a `shell=`
-/// that is not a shell) holds the foreground as the root's own group, and a
-/// background or suspended job (`make &`, a Ctrl-Z'd vim) leaves the
-/// foreground at the shell. Both die with the session when aterm does.
+/// What the process table says about a session's root, the process the PTY was
+/// spawned with (its session leader). The foreground-group test alone misses two
+/// cases: a program that is the root (`aterm -e vim`, `exec vim`, a `shell=` that is
+/// not a shell) holds the foreground as the root's own group, and a background or
+/// suspended job (`make &`, a Ctrl-Z'd vim) leaves the foreground at the shell. Both
+/// die with the session when aterm does.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SessionRoot {
     /// The root's executable name: `p_comm` on macOS, `/proc/<pid>/comm` on
@@ -695,11 +610,9 @@ unsafe extern "C" {
     ) -> libc::c_int;
 }
 
-/// `pid`'s `proc_pidinfo(PROC_PIDTBSDINFO)` record: an exact-size read, and
-/// only a record that names `pid` — one about some OTHER pid could only
-/// mislead whatever reads it, so a kernel that disagrees about the pid it was
-/// asked about is no witness at all. `None` concludes nothing; each caller
-/// keeps its own meaning (and failure direction) for it.
+/// `pid`'s `proc_pidinfo(PROC_PIDTBSDINFO)` record: an exact-size read that names
+/// `pid` (a record about another pid is no witness). `None` concludes nothing; each
+/// caller keeps its own failure direction for it.
 #[cfg(target_os = "macos")]
 pub(crate) fn pid_bsdinfo(pid: libc::pid_t) -> Option<libc::proc_bsdinfo> {
     let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
@@ -833,22 +746,16 @@ mod windows_jobs {
         dwHighDateTime: u32,
     }
 
-    /// The console host the OS attaches to a console process — plumbing, never a
-    /// user job, so the child walk ignores it (a shell that allocated a classic
-    /// console must not read as busy forever).
+    /// The console host the OS attaches to a console process: plumbing, never a user
+    /// job, so the child walk ignores it (a shell that allocated a classic console
+    /// must not read as busy forever).
     const CONHOST: &str = "conhost.exe";
 
-    /// Every live parent -> child link, in one Toolhelp32 pass.
-    ///
-    /// ONE capture answers every shell. The tab-status observer asks once per
-    /// due session per sweep, and one snapshot costs ~2.2 ms in the kernel plus
-    /// ~1.6 ms of walk on the machine this was measured on, so a per-session
-    /// walk had an idle eight-tab window spending ~100 ms of CPU per second on
-    /// eight idle prompts; [`super::JobProbe`] shares one capture across a
-    /// sweep and rate-limits it. The close path takes its own capture at the
-    /// instant of the gesture ([`super::foreground_is_job`]). A failed snapshot
-    /// reads as "no children" — an unknown state must never wedge a close, the
-    /// same fail-idle posture as a `tcgetpgrp` error on unix.
+    /// Every live parent -> child link, in one Toolhelp32 pass (~2.2 ms in the kernel
+    /// plus ~1.6 ms of walk), so one capture answers every shell: [`super::JobProbe`]
+    /// shares it across a sweep and rate-limits it, and the close path takes its own
+    /// at the gesture. A failed snapshot reads as "no children": an unknown state must
+    /// never wedge a close, as with a `tcgetpgrp` error on unix.
     pub(super) fn capture_links() -> ChildLinks {
         let mut links = Vec::new();
         // SAFETY: standard Toolhelp walk — the entry is a plain #[repr(C)]
@@ -877,11 +784,9 @@ mod windows_jobs {
         ChildLinks::from_links(links)
     }
 
-    /// Which snapshot entries are CANDIDATE children at all, before any handle
-    /// is opened: a process that lists ITSELF as its parent is not its own job
-    /// (the System Idle Process is pid 0 with parent 0), and the console host
-    /// the OS attaches to a console process is plumbing, never a user job (a
-    /// shell that allocated a classic console must not read as busy forever).
+    /// Which snapshot entries are candidate children at all, before any handle is
+    /// opened: not a process that lists itself as its parent (the System Idle Process
+    /// is pid 0 with parent 0), nor [`CONHOST`].
     pub(super) const fn entry_counts_as_child(
         entry_pid: u32,
         entry_parent: u32,
@@ -1041,9 +946,8 @@ mod tests {
         assert_eq!(busy.proceed, "Close");
     }
 
-    /// The Windows policy (WT convention): a single idle tab NEVER prompts —
-    /// including the last-window case that quits the app, which is exactly the
-    /// macOS always-confirm rule this policy refuses to port.
+    /// The Windows policy (WT convention): a single idle tab never prompts, the
+    /// last-window quit included.
     #[cfg(windows)]
     #[test]
     fn windows_single_idle_tab_closes_without_a_prompt() {
@@ -1055,8 +959,8 @@ mod tests {
         assert!(confirm_prompt_windows(false, 0, false, true).is_none());
     }
 
-    /// Busy always prompts, with the shared macOS copy: "Quit" for a whole-app
-    /// exit, "Close" otherwise — the REAL verbs the TaskDialog buttons carry.
+    /// Busy always prompts, with the shared copy: "Quit" for a whole-app exit,
+    /// "Close" otherwise.
     #[cfg(windows)]
     #[test]
     fn windows_busy_prompts_with_the_real_verbs() {
@@ -1066,9 +970,8 @@ mod tests {
         assert_eq!(busy_quit.proceed, "Quit");
     }
 
-    /// Closing MULTIPLE tabs prompts even when idle: quit copy when the gesture
-    /// exits the app, the multi-tab close copy when another window survives
-    /// (a case macOS never prompts on, hence the dedicated copy).
+    /// Closing multiple tabs prompts even when idle: quit copy when the gesture exits
+    /// the app, the multi-tab close copy when another window survives.
     #[cfg(windows)]
     #[test]
     fn windows_multi_tab_close_prompts_when_idle() {
@@ -1119,10 +1022,9 @@ mod tests {
         idle_since_ms: None,
     };
 
-    /// A running block is busy on its own: the `Start-Sleep 60` shape — the
-    /// shell executing something with NO child process and NO foreground pgrp
-    /// (the windows answer for every ConPTY, and a `tcgetpgrp` error on unix)
-    /// — must arm the guard, where `foreground_is_job` alone reads it as idle.
+    /// A running block is busy on its own: the `Start-Sleep 60` shape, executing with
+    /// no child process and no foreground pgrp (every ConPTY on windows, a
+    /// `tcgetpgrp` error on unix), arms the guard where `foreground_is_job` reads idle.
     #[test]
     fn a_running_block_is_busy_without_a_foreground_child() {
         assert!(
@@ -1175,7 +1077,7 @@ mod tests {
     }
 
     /// The shell's idle word is earned, not assumed: only a nonce-signed
-    /// integration that has reported a WHOLE command (C then D) carries one,
+    /// integration that has reported a whole command (C then D) carries one,
     /// stamped with that command's 133;D.
     #[test]
     fn the_shells_idle_word_needs_its_own_completed_command() {
@@ -1203,10 +1105,9 @@ mod tests {
         assert_eq!(shell_word(&term).idle_since_ms, Some(since));
     }
 
-    /// Marks nothing authenticates are output a program could print, so they
-    /// never silence the child walk — the posture `--no-shell-integration`
-    /// leaves (no nonce required) and the one a user's own prompt script
-    /// would run under.
+    /// Unsigned marks (no nonce required: `--no-shell-integration`, a user's own
+    /// prompt script) are output a program could print, so they never silence the
+    /// child walk.
     #[test]
     fn unsigned_marks_never_earn_the_shells_idle_word() {
         let mut term = aterm_core::terminal::Terminal::new(24, 80);
@@ -1219,11 +1120,8 @@ mod tests {
         assert_eq!(shell_word(&term), ShellWord::default());
     }
 
-    /// An integration that marks prompts but never commands — cmd.exe's
-    /// `%PROMPT%` tier, pwsh without PSReadLine — says nothing about what runs
-    /// behind its prompt, so it never earns the word: `for /L` and `ping -t`
-    /// alike run with the prompt's B as the last mark, and a D no C opened is
-    /// dropped by the engine.
+    /// A prompt-only integration (cmd.exe's `%PROMPT%` tier, pwsh without
+    /// PSReadLine) never earns the word: the engine drops a D that no C opened.
     #[test]
     fn a_prompt_only_integration_never_earns_the_shells_idle_word() {
         let (mut term, id) = nonced_terminal();
@@ -1268,11 +1166,8 @@ mod tests {
 
     const SHELL_BORN: u64 = 1_790_549_217_000;
 
-    /// THE MEASURED CASE (2026-09-27): an idle pwsh tab (pid 17636, born
-    /// 15:46:57) refused `tab close` three times because the only process
-    /// listing 17636 as its parent was an `aterm-gui.exe` born 15:46:18 — 39 s
-    /// before the shell, so another process's child whose parent had died and
-    /// whose pid Windows had handed on. The creation time says so.
+    /// A process born before the shell it names as parent is a recycled pid (Windows
+    /// hands pids on), not a job: an idle pwsh tab must not refuse its close.
     #[test]
     fn a_child_older_than_its_shell_is_a_recycled_pid_not_a_job() {
         let links = ChildLinks::from_links(vec![(17636, 22432)]);
@@ -1317,9 +1212,9 @@ mod tests {
         assert_eq!(reads.get(), 0, "no candidate, no handle");
     }
 
-    /// THE GIT BASH CASE: `Git\bin\bash.exe` (the program the ConPTY starts)
-    /// keeps the real `usr\bin\bash.exe` as its child for life, started ~30 ms
-    /// after itself. That child is the shell, not a job; ITS children are.
+    /// Git Bash: `Git\bin\bash.exe` (the program the ConPTY starts) keeps the real
+    /// `usr\bin\bash.exe` as its child for life, started ~30 ms after itself. That
+    /// child is the shell, not a job; its children are.
     #[test]
     fn the_shell_a_launcher_started_is_not_a_job_but_its_children_are() {
         let launcher = 26612;
@@ -1333,16 +1228,16 @@ mod tests {
             !links.has_job(launcher, None, facts_of(&table)),
             "an idle Git Bash prompt is idle"
         );
-        // `ping -t` at that prompt: a child of the REAL bash.
+        // `ping -t` at that prompt: a child of the real bash.
         let links = ChildLinks::from_links(vec![(launcher, bash), (bash, 4040)]);
         table.push((4040, born(SHELL_BORN + 60_000, "ping.exe")));
         assert!(links.has_job(launcher, None, facts_of(&table)));
-        // …and a recycled pid under the real bash is vetted against ITS birth.
+        // …and a recycled pid under the real bash is vetted against its birth.
         table.last_mut().expect("ping").1.created_ms = SHELL_BORN + 10;
         assert!(!links.has_job(launcher, None, facts_of(&table)));
     }
 
-    /// The launcher rule is narrow: a same-image child started LATER than
+    /// The launcher rule is narrow: a same-image child started later than
     /// the launch window is a shell a person typed (`pwsh` at a pwsh prompt),
     /// which is a job like any other.
     #[test]
@@ -1410,18 +1305,15 @@ mod tests {
         );
         term.process(b"\x1b]133;D;0\x07");
         assert!(!shell_executing(&term), "133;D closed the command: idle");
-        // The next prompt after a completed command is idle too — the guard
-        // must not read the LAST command's state once a new prompt is up.
+        // The next prompt after a completed command is idle too: the guard must not
+        // read the last command's state once a new prompt is up.
         term.process(b"\x1b]133;A\x07PS> ");
         assert!(!shell_executing(&term));
     }
 
-    /// A running command that CLEARS THE SCROLLBACK stays busy. ED 3 (`CSI 3
-    /// J`: `clear`, `cls`, `Clear-Host`) drops the engine's current block —
-    /// its rows dangle once scrollback is gone — so a guard reading the block
-    /// saw `while ($true) { Clear-Host; …; Start-Sleep 5 }` go idle on its
-    /// first iteration, and on windows the child walk never saw it at all.
-    /// Only the shell's own 133;D ends the command.
+    /// A running command that clears the scrollback stays busy: ED 3 (`clear`, `cls`,
+    /// `Clear-Host`) drops the engine's current block, but only the shell's own 133;D
+    /// ends the command.
     #[test]
     fn a_command_that_clears_the_scrollback_is_still_executing() {
         let mut term = aterm_core::terminal::Terminal::new(24, 80);
@@ -1458,7 +1350,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_child_walk_detects_a_live_child() {
-        // A long-lived, childless child of THIS process (killed below); ping is
+        // A long-lived, childless child of this process (killed below); ping is
         // present on every Windows install.
         let mut child = aterm_uds::spawnfd::command("ping")
             .args(["-n", "30", "127.0.0.1"])
@@ -1530,12 +1422,9 @@ mod tests {
 
     // ---------------------------------------------------------------- probe --
     //
-    // IDLE-WAKE REGRESSION GUARDS. These pin the two properties that make an
-    // idle window's foreground-job evidence cost O(1) system captures instead
-    // of O(sessions x sweeps): one capture serves a whole sweep, and a sweep
-    // whose evidence did not move buys no capture at all until the ceiling.
-    // The capture is injected, so the laws are proven without a process table
-    // and without spawning anything.
+    // One capture serves a whole sweep, and a sweep whose evidence did not move buys
+    // none until the ceiling, so an idle window's foreground-job evidence costs O(1)
+    // captures, not O(sessions x sweeps). The capture is injected.
 
     fn key(seq: u64) -> JobEvidenceKey {
         JobEvidenceKey {
@@ -1600,8 +1489,7 @@ mod tests {
                 probe.child_verdict(session, key(0), at, capture, job_of(1000 + session as u32));
             }
         };
-        // Four sweeps a second for just under the ceiling: the shape an idle
-        // eight-tab window used to pay 8 captures per sweep for.
+        // Four sweeps a second for just under the ceiling.
         let mut at = t0;
         let mut sweeps = 0usize;
         while at.duration_since(t0) < JOB_PROBE_MAX_AGE {

@@ -2,11 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Scrollback query and management methods for [`Grid`].
-//!
-//! Provides access to tiered scrollback storage, ring buffer scrollback,
-//! and unified history line retrieval. Complements the scroll operations
-//! in [`super::scroll`] and materialization in [`super::scroll_materialize`].
+//! Scrollback query and management for [`Grid`]: history line access over
+//! the tiered store, the lazy buffer and the ring.
 
 use std::borrow::Cow;
 
@@ -16,10 +13,6 @@ use aterm_scrollback::{Line, ScrollbackStorage};
 use super::{Grid, scroll_convert, scroll_materialize};
 
 impl Grid {
-    // -------------------------------------------------------------------------
-    // Public forwarding stubs (bodies live on GridStorage)
-    // -------------------------------------------------------------------------
-
     /// Get a mutable reference to the scrollback storage, if attached.
     ///
     /// Drains the lazy buffer first so all deferred lines are available
@@ -36,33 +29,22 @@ impl Grid {
         self.storage.scrollback_lines()
     }
 
-    /// Get the number of lines in the tiered scrollback (if any).
+    /// Lines in the tiered store plus the lazy buffer.
     #[must_use]
     #[inline]
     pub fn tiered_scrollback_lines(&self) -> usize {
         self.storage.tiered_scrollback_lines()
     }
 
-    // -------------------------------------------------------------------------
-    // History line access
-    // -------------------------------------------------------------------------
-
-    /// Get a historical line by index (0 = oldest).
+    /// A history line by index (0 = oldest): the tiered store (oldest), then the
+    /// lazy buffer, then the ring (newest). `Ok(None)` when out of bounds.
     ///
-    /// This method provides unified access to all scrollback history:
-    /// 1. Lines from the tiered scrollback (oldest, if any)
-    /// 2. Lines from the lazy buffer (deferred, between tiered and ring)
-    /// 3. Lines from the ring buffer scrollback (newest)
-    ///
-    /// Returns `Ok(None)` if the index is out of bounds.
-    ///
-    /// Takes `&self` because the disk-backed scrollback's LRU cache and
-    /// deferred line `OnceCell` both use interior mutability.
+    /// `&self` suffices: the disk tier's LRU cache and the deferred line's
+    /// `OnceCell` are interior-mutable.
     pub fn try_get_history_line(
         &self,
         idx: usize,
     ) -> Result<Option<Cow<'_, Line>>, ScrollbackError> {
-        // Actual tiered scrollback lines (not including lazy buffer).
         let actual_tiered = self
             .storage
             .scrollback
@@ -76,25 +58,24 @@ impl Grid {
         }
 
         if idx < actual_tiered {
-            // Line is in tiered scrollback (Cow::Borrowed for hot, Cow::Owned for warm/cold)
+            // Tiered store: hot lines borrow, warm/cold lines decode owned.
             let Some(scrollback) = self.storage.scrollback() else {
                 return Ok(None);
             };
             scrollback.get_line(idx)
         } else if idx < actual_tiered + lazy_count {
-            // Line is in the lazy buffer (deferred — materializes on first access)
+            // Lazy buffer: a deferred line materializes on first access.
             let lazy_idx = idx - actual_tiered;
             match self.storage.lazy_buffer.get_line(lazy_idx) {
                 Some(line) => Ok(Some(Cow::Borrowed(line))),
                 None => Ok(None),
             }
         } else {
-            // Line is in ring buffer scrollback (always owned — constructed from row)
+            // Ring rows are always converted to an owned line.
             let ring_idx = idx - actual_tiered - lazy_count;
             let Some(row) = self.storage.ring_history_row(ring_idx) else {
                 return Ok(None);
             };
-            // Use preserved extras from ring_extras.
             let default_extras = scroll_convert::ScrolledRowExtras::default();
             let extras = self
                 .storage
@@ -108,16 +89,13 @@ impl Grid {
 
     /// Dense forward walk over history from index `start` (0 = oldest) to the
     /// newest line: item `k` is exactly what
-    /// [`get_history_line(start + k)`](Self::get_history_line) returns, with
-    /// `None` for an unreadable line.
+    /// [`get_history_line(start + k)`](Self::get_history_line) returns, `None`
+    /// for an unreadable line.
     ///
-    /// The tiered store is walked via [`ScrollbackStorage::dense_from`] (one
-    /// decode per warm block / cold page, lines moved out, hot lines borrowed,
-    /// one warning per corrupt segment) instead of a per-line search, cache
-    /// probe and clone. The lazy buffer and ring are read as the per-line
-    /// reader reads them. An undecodable segment yields one placeholder per
-    /// line, so `oldest + start + k` always keys the right row. Checked against
-    /// the per-line reader by `history_lines_from_matches_get_history_line_*`.
+    /// The tiered store is walked by [`ScrollbackStorage::dense_from`] (one
+    /// decode per warm block or cold page) instead of a per-line search, cache
+    /// probe and clone. An undecodable segment yields one placeholder per line,
+    /// so item `k` always keys row `oldest + start + k`.
     #[must_use]
     pub fn history_lines_from(&self, start: usize) -> HistoryLines<'_> {
         // The same three counts `try_get_history_line` partitions by.
@@ -151,8 +129,6 @@ impl Grid {
     }
 
     /// A historical line by reverse index (0 = most recent scrollback line).
-    ///
-    /// This is useful for displaying scrollback from bottom to top.
     pub(crate) fn try_history_line_rev(
         &self,
         rev_idx: usize,
@@ -182,11 +158,10 @@ impl Grid {
     /// Drop the `n` oldest ring-scrollback lines (ring-only retention shrink;
     /// see [`Grid::set_scrollback_line_limit`]).
     ///
-    /// Rebuilds the retained rows into a fresh page store (as
-    /// `erase_scrollback` does) so the evicted lines' page memory is
-    /// reclaimed. Survivors keep their absolute-row identity: only
-    /// `total_lines` shrinks, so `oldest_absolute_row()` advances by `n`, like
-    /// `scroll_up`'s at-capacity eviction.
+    /// Rebuilds the survivors into a fresh page store (as `erase_scrollback`
+    /// does) to reclaim the evicted pages. Survivors keep their absolute-row
+    /// identity: only `total_lines` shrinks, so `oldest_absolute_row()` advances
+    /// by `n`, as on `scroll_up`'s at-capacity eviction.
     pub(crate) fn evict_oldest_ring_scrollback(&mut self, n: usize) {
         let n = n.min(self.storage.ring_buffer_scrollback());
         if n == 0 {
@@ -224,43 +199,32 @@ impl Grid {
         self.storage.mark_content_full();
     }
 
-    /// The ring-tier row behind reverse history index `rev_idx`, with its
-    /// preserved extras, or `None` when that index is in the lazy buffer or
-    /// tiered store.
-    ///
-    /// The ring holds exactly the newest `ring_buffer_scrollback()` lines
-    /// (`scrollback_lines() == tiered + lazy + ring`), and `rev_idx` counts
-    /// back from the newest, so the ring count alone answers it: ring line iff
-    /// `rev_idx < ring`, at `ring - 1 - rev_idx`. This avoids a `dyn`
-    /// `line_count()` call on the tiered store for every declined row, since
-    /// it runs per visible row on every history read.
+    /// The ring row behind reverse history index `rev_idx`, with its extras, or
+    /// `None` when the index is in the lazy buffer or tiered store. The ring
+    /// holds the newest `ring_buffer_scrollback()` lines, so the ring count alone
+    /// answers it, with no `dyn` `line_count()` on the store per declined row
+    /// (this runs per visible row on every history read).
     fn ring_history_row_at_rev(
         &self,
         rev_idx: usize,
     ) -> Option<(&super::Row, Option<&scroll_convert::ScrolledRowExtras>)> {
         let ring = self.storage.ring_buffer_scrollback();
-        // `checked_*`: a `rev_idx` past the ring underflows here, and that is
-        // the decline; the caller then reads it as a `Line`.
+        // A `rev_idx` past the ring underflows here: that is the decline, and
+        // the caller reads it as a `Line`.
         let ring_idx = ring.checked_sub(rev_idx.checked_add(1)?)?;
         let row = self.storage.ring_history_row(ring_idx)?;
         Some((row, self.storage.ring_history_extras(ring_idx)))
     }
 
-    /// Materialize a scrollback line with full fidelity.
+    /// Materialize scrollback line `rev_idx` (0 = newest) with full fidelity:
+    /// cells plus their extras (hyperlinks, complex chars, RGB colors), read
+    /// through `MaterializedRow::get_extra` as for visible cells.
     ///
-    /// Returns a [`MaterializedRow`](scroll_materialize::MaterializedRow)
-    /// containing cells plus supplementary extras (hyperlinks, complex chars,
-    /// RGB colors). The bridge renderer queries
-    /// `MaterializedRow::get_extra(col)` for scrollback cells using the same
-    /// code path as visible-area cells.
-    ///
-    /// Ring tier first: for the newest lines the source row is still in RAM as
-    /// `Cell`s, and
+    /// Ring tier first: the newest lines' rows are still in RAM as `Cell`s, and
     /// [`materialize_from_row_extras`](scroll_materialize::materialize_from_row_extras)
-    /// reads it directly instead of serializing to text + RLE and parsing
-    /// back. It returns `None` whenever it cannot prove the same result, so the
-    /// `history_line_rev` path (whose hot-tier `Cow` avoids a clone) remains
-    /// the answer for declined cases and lines beyond the ring.
+    /// reads them directly instead of round-tripping through text + RLE. It
+    /// declines whenever it cannot prove the same result; `history_line_rev`
+    /// answers the declined cases and lines beyond the ring.
     #[must_use]
     pub fn materialize_scrollback_row_full(
         &self,
@@ -276,24 +240,18 @@ impl Grid {
         Some(scroll_materialize::materialize_from_line(&line, cols))
     }
 
-    /// The cells history line `idx` (0 = oldest) is drawn in, when the ring
-    /// tier draws it from its own cells: `push(bytes, col, width, count)` in
-    /// column order, as [`stored_line_cells`](scroll_materialize::stored_line_cells)
-    /// yields them, `bytes` the first cell's text in `text`, the line's text
-    /// as read ([`history_line_rev`](Self::history_line_rev) or the dense
-    /// walk, bounded), and `true`.
+    /// Where each cell of history line `idx` (0 = oldest) lies in `text`, when
+    /// the ring tier draws the row from its own cells: `push(bytes, col, width,
+    /// count)` in column order as
+    /// [`stored_line_cells`](scroll_materialize::stored_line_cells) yields them,
+    /// then `true`. `text` is the line's text as read
+    /// ([`history_line_rev`](Self::history_line_rev) or the dense walk, bounded).
     ///
-    /// `false` when the row is drawn by
-    /// [`stored_line_cells`](scroll_materialize::stored_line_cells), the walk
-    /// to read it with: a line past the ring tier, or a ring row the fast
-    /// path declines. The cells pushed before a `false` are not the row's.
-    ///
-    /// Why (r16 selection-stride review, 2026-10-11): the ring tier draws a
-    /// row from its cells ([`materialize_scrollback_row_full`](Self::materialize_scrollback_row_full)),
-    /// which keep apart what the stored walk joins (two flag halves drawn out
-    /// of order stay two cells), so reading every history row's cells from
-    /// its stored line put a double-click's word, a copy's columns and a
-    /// find match up to two cells off where the ring tier draws them.
+    /// `false` for a line past the ring or a ring row the fast path declines:
+    /// `stored_line_cells` draws that row and is the walk to read it with, and
+    /// the cells pushed so far are not the row's. Word selection, copy and find
+    /// ask here first because the ring tier's cells keep apart what the stored
+    /// walk joins (two flag halves drawn out of order stay two cells).
     pub fn ring_history_cells(
         &self,
         idx: usize,
@@ -352,10 +310,8 @@ mod tests {
             .open(&cold_path)
             .and_then(|file| file.set_len(32))
             .expect("truncate cold file");
-        // Windows: the cold tier maps the file and Windows refuses to shrink a
-        // mapped file (ERROR_USER_MAPPED_FILE), so corrupt it by overwriting
-        // every page byte past the 32-byte header instead (every cold-page read
-        // fails either way).
+        // Windows refuses to shrink a mapped file (ERROR_USER_MAPPED_FILE), so
+        // overwrite every page byte past the 32-byte header instead.
         #[cfg(windows)]
         {
             use std::io::{Seek, SeekFrom, Write};
@@ -406,9 +362,7 @@ mod tests {
     #[test]
     fn try_history_line_rev_propagates_scrollback_error() {
         let (grid, _temp_dir) = grid_with_corrupted_scrollback();
-        // rev_idx 0 = most recent scrollback line, which is in the corrupted tier.
-        // The newest lines might still be in hot/warm (both 0-limit), so use a
-        // high rev_idx to hit the cold tier.
+        // The oldest line, in the corrupted cold tier.
         let total = grid.scrollback_lines();
         let result = grid.try_history_line_rev(total.saturating_sub(1));
         assert!(
@@ -432,15 +386,14 @@ mod tests {
     }
 }
 
-/// Dense forward walk over a grid's history — see
-/// [`Grid::history_lines_from`]. Exactly one item per history line from the
-/// start index to the newest, in order: tiered store, then the lazy buffer,
-/// then the ring.
+/// Dense forward walk over a grid's history ([`Grid::history_lines_from`]):
+/// one item per line from the start index to the newest, in order: tiered
+/// store, lazy buffer, ring.
 pub struct HistoryLines<'a> {
     grid: &'a Grid,
     /// The tiered store's dense walk, while the cursor is still inside it.
     tiered: Option<aterm_scrollback::DenseScrollbackIter<'a>>,
-    /// History index of the NEXT item.
+    /// History index of the next item.
     idx: usize,
     tiered_end: usize,
     lazy_end: usize,

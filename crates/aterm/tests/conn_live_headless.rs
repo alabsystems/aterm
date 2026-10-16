@@ -1,33 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Live-headless end-to-end test for `aterm conn` — the §9 [v5.1] obligation
-//! (docs/design/SESSION_CONNECTIONS.md): the no-arg form shows both directions
-//! against a LIVE headless instance, and add/set/rm round-trip equals the wire
-//! verbs BYTE-FOR-BYTE in `edges` output.
+//! Live-headless end-to-end test for `aterm conn` (docs/design/SESSION_CONNECTIONS.md §9
+//! [v5.1]): the no-arg form shows both directions against a live headless instance, and an
+//! add/set/rm round trip equals the wire verbs byte for byte in `edges` output. Everything runs
+//! through the one `aterm` binary: `aterm --headless` boots the engine and control socket,
+//! `aterm ctl …` speaks the raw wire, `aterm conn …` is under test.
 //!
-//! The whole exercise runs through the ONE `aterm` binary (the same
-//! `CARGO_BIN_EXE_aterm` seam `protected_spawn.rs` drives): `aterm --headless`
-//! boots the real engine + control socket, `aterm ctl …` speaks the raw wire,
-//! and `aterm conn …` is the presentation layer under test — three faces of
-//! the shipped front door, no mocks anywhere.
-//!
-//! ISOLATION (the smoke-stage `Sandbox` discipline, `aterm-verify`
-//! `smoke_stages.rs`): the instance runs under a per-run scratch
-//! HOME and XDG roots, an explicit private control socket, and a private config
-//! disabling unrelated package, primer and machine maintenance. Reroute and
-//! native-update work are explicitly disabled too: private runtime/config roots
-//! alone still let a real window rewrite the user's default package prefix.
-//! `SHELL=/bin/sh` avoids shell rc files. Every client call is pinned to the
-//! instance with the explicit `--sock` flag and the same scratch environment.
-//!
-//! SHELL-LESS CALLER NOTE: the test process is not an aterm session, so the
-//! `@self` forms are exercised BOTH ways — once refusing without
-//! `$ATERM_PARENT_SESSION_ID` (the documented shell-less error), and then with
-//! the harness hosting the session context by setting that variable to the
-//! boot session's real sid, exactly what an in-session shell would carry.
+//! Isolation is `support/launch_isolation.rs`'s, and every client call is pinned with `--sock`.
+//! The test process is not an aterm session, so the `@self` forms run both without
+//! `$ATERM_PARENT_SESSION_ID` (the documented refusal) and with it set to the boot session.
 
 #![cfg(unix)]
+#![allow(
+    clippy::disallowed_types,
+    reason = "test code: a stand-in child may inherit descriptors"
+)]
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -54,23 +42,18 @@ fn boot() -> Option<Instance> {
 
 const CLIENT_EXIT_DEADLINE: Duration = Duration::from_secs(90);
 
-/// Apply the hermetic environment shared by the server and every client call:
-/// scratch runtime + config dirs, a quiet known shell, and none of the
-/// caller's own aterm session/socket context (the test may itself be running
-/// inside an aterm terminal — its env must never leak into the harness).
+/// The hermetic environment shared by the server and every client call
+/// ([`launch_isolation::apply`]): scratch runtime and config dirs, a quiet shell, none of the
+/// caller's own aterm session context.
 fn hermetic_env(cmd: &mut Command, tmp: &Path) {
     launch_isolation::apply(cmd, tmp);
 }
 
-/// THE SCRATCH WORLD KEEPS EVERY LAUNCH OFF THE MACHINE, through CONFIG (2026-09-23):
-/// the update system's environment vetoes are gone, so the observer reads the shipping
-/// config readers in the child's real launch environment and records what the
-/// automatic lanes would do — the app updater (`[update] enabled`), the package loop
-/// (`[packages] enabled`) — while the reroute's escape is a FLAG no environment can
-/// carry (`aterm --no-reroute`; the internal marker is cleared at the front door). The
-/// negative control is the same scratch world with the switches left at their
-/// batteries-included defaults, which must read as "would run", so the isolated
-/// "blocked" is the config's doing.
+/// The scratch world keeps every launch off the machine through config: an observer child
+/// reads the shipping config readers in the real launch environment and records whether the
+/// automatic lanes (`[update] enabled`, `[packages] enabled`) would run. No environment veto
+/// exists; the reroute's escape is a flag (`--no-reroute`). Negative control: the same world
+/// with the switches at their defaults reads "would run".
 #[test]
 fn private_launch_environment_gates_host_maintenance() {
     const OBSERVER: &str = "ATERM_FIXTURE_OBSERVER_ROOT";
@@ -184,11 +167,9 @@ fn private_launch_environment_gates_host_maintenance() {
     std::fs::remove_dir_all(base).unwrap();
 }
 
-/// Run one `aterm <args…>` client call against the instance with the hermetic
-/// environment plus `extra_env`, bounded by [`CLIENT_EXIT_DEADLINE`]: drain
-/// threads keep the child's pipes flowing while the main thread polls, so a
-/// hung client becomes a panic with the captured output, never a hung harness
-/// (the `protected_spawn.rs` bounded-wait discipline, compacted).
+/// Run one `aterm <args…>` client call with the hermetic environment plus `extra_env`, bounded
+/// by [`CLIENT_EXIT_DEADLINE`]: drain threads keep the pipes flowing, so a hung client is a
+/// panic, never a hung harness.
 fn run_client(inst: &Instance, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
     cmd.args(args)
@@ -246,9 +227,8 @@ fn client_ok(inst: &Instance, args: &[&str], extra_env: &[(&str, &str)]) -> Stri
     String::from_utf8(out.stdout).expect("client stdout is UTF-8")
 }
 
-/// Parse the raw `sessions` rows (`<local> <sid> <parent|-> <state> <title>
-/// [meta=…]`, title pct-encoded — vanishing entirely when empty) into
-/// `(local, sid, title)` triples.
+/// Parse the raw `sessions` rows, `<local> <sid> <parent|-> <state> <title> [meta=…]` (the
+/// title pct-encoded and absent when empty), into `(local, sid, title)` triples.
 fn parse_sessions(body: &str) -> Vec<(u64, String, String)> {
     let mut rows = Vec::new();
     for line in body.lines() {
@@ -287,21 +267,18 @@ fn title_of(rows: &[(u64, String, String)], sid: &str) -> String {
     format!("\"{t}\"")
 }
 
-/// The whole §9 [v5.1] loop against ONE live headless instance: spawn a second
-/// session over the wire, wire both directions with `conn add`, pin the no-arg
-/// and `ls` renders byte-stably, narrow to pull with `conn set` and pin the
-/// raw `edges --json` wire bytes to exactly the read-screen row, then `conn rm`
-/// both pairs back to empty and pin the empty renders too. One test function:
-/// the steps are one causal story, and a single instance keeps the run modest.
+/// The whole §9 [v5.1] loop against one live instance: spawn a second session, wire both
+/// directions with `conn add`, pin the no-arg and `ls` renders, narrow to pull with `conn set`
+/// and pin the raw `edges --json` bytes, then `conn rm` both pairs and pin the empty renders.
+/// One test: the steps are one causal story.
 #[test]
 fn conn_round_trips_against_a_live_headless_instance() {
     let Some(inst) = boot() else { return };
     let sock = inst.sock.clone();
 
     // --- the two sessions -------------------------------------------------
-    // The boot session is the only row of a fresh instance; the second is
-    // minted over the REAL wire (`spawn`, reply `OK <sid>` — immediately
-    // addressable, no shell settle needed for connection acts).
+    // The boot session is a fresh instance's only row; the second is minted over the wire
+    // (`spawn`, reply `OK <sid>`, addressable at once).
     let rows = titles(&inst, &sock);
     assert_eq!(
         rows.len(),
@@ -319,9 +296,8 @@ fn conn_round_trips_against_a_live_headless_instance() {
     assert_ne!(sid1, sid2);
 
     // --- (a) the shell-less refusal, then the hosted add ------------------
-    // Without $ATERM_PARENT_SESSION_ID the default direction's `@self` half
-    // must refuse with the documented error naming the variable (§6.1) — the
-    // honest shell-less-caller behavior, live.
+    // Without $ATERM_PARENT_SESSION_ID the default direction's `@self` half refuses with the
+    // documented error naming the variable (§6.1).
     let refused = run_client(
         &inst,
         &["conn", "--sock", &sock, "add", &format!("@{sid2}")],
@@ -418,10 +394,8 @@ fn conn_round_trips_against_a_live_headless_instance() {
         in_session,
     );
     assert_eq!(got, format!("set @{sid1} -> @{sid2} (pull)\n"));
-    // The §9 wire-equivalence pin, BYTE-FOR-BYTE: after the both→pull set,
-    // the raw `edges --json` body (the server's own emitter, no conn in the
-    // path) holds exactly the read-screen row — the push half is gone and no
-    // intermediate authority appeared in its place.
+    // The §9 wire-equivalence pin: after the both→pull set, the raw `edges --json` body (the
+    // server's own emitter) holds exactly the read-screen row.
     let got = client_ok(
         &inst,
         &[
@@ -481,11 +455,8 @@ fn conn_round_trips_against_a_live_headless_instance() {
     );
 }
 
-/// NEGATIVE CONTROL for the shared boot (`support/headless_boot.rs`): an
-/// instance that cannot start FAILS the test. Every copy of the boot this file
-/// once carried answered this case with `SKIP` and a green test — so a startup
-/// crash read as a pass. A launch flag the binary refuses is the startup
-/// failure here.
+/// Negative control for the shared boot (`support/headless_boot.rs`): an instance that cannot
+/// start fails the test, never a skip. A launch flag the binary refuses is the failure here.
 #[test]
 #[should_panic(expected = "before its control socket listened")]
 fn a_headless_instance_that_cannot_start_fails_the_boot() {

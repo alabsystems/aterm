@@ -3,8 +3,6 @@
 // Author: Andrew Yates
 
 //! Tests for DiskBackedScrollback.
-//!
-//! Extracted from tests.rs (#2100).
 
 use super::*;
 
@@ -21,19 +19,14 @@ fn disk_backed_scrollback_cold_memory_used() {
         .with_block_size(5);
     let mut sb = DiskBackedScrollback::with_config(config).unwrap();
 
-    // cold_memory_used returns metadata/cache size for disk-backed cold tier
     let initial_cold_mem = sb.cold_memory_used();
 
-    // Push 25 lines - should evict to disk-backed cold tier
     for i in 0..25 {
         sb.push_str(&format!("Line {i}")).unwrap();
     }
 
-    // Verify cold tier has data
     assert!(sb.cold_line_count() > 0);
-    // Disk usage should be > 0 (this is where the compressed data lives)
     assert!(sb.cold_disk_used() > 0);
-    // cold_memory_used includes metadata/index overhead for disk tier
     assert!(
         sb.cold_memory_used() >= initial_cold_mem,
         "cold memory should include index metadata"
@@ -65,28 +58,23 @@ fn disk_backed_scrollback_total_memory_used() {
         .with_block_size(5);
     let mut sb = DiskBackedScrollback::with_config(config).unwrap();
 
-    // memory_used includes base struct size, so initial is non-zero
     let initial_total = sb.total_memory_used();
 
-    // Push lines only to hot tier
     for i in 0..4 {
         sb.push_str(&format!("Line {i}")).unwrap();
     }
-    // Hot only: total = hot+warm + cold metadata
     let hot_warm = sb.memory_used();
     let cold_mem = sb.cold_memory_used();
     assert_eq!(sb.total_memory_used(), hot_warm + cold_mem);
 
-    // Push 25 lines - should have data in all tiers
     for i in 4..25 {
         sb.push_str(&format!("Line {i}")).unwrap();
     }
 
-    // Total memory = hot+warm + cold metadata (disk data not counted)
+    // Disk data is not counted.
     let hot_warm = sb.memory_used();
     let cold_mem = sb.cold_memory_used();
     assert_eq!(sb.total_memory_used(), hot_warm + cold_mem);
-    // Disk usage should be > 0 (separate from memory)
     assert!(sb.cold_disk_used() > 0, "cold disk usage should have data");
     assert!(
         sb.total_memory_used() > initial_total,
@@ -273,9 +261,7 @@ fn disk_backed_remove_newest_slow_path_restores_tier_structure() {
     }
 }
 
-// =========================================================================
-// DiskBackedScrollback Tier-Aware remove_newest Tests (#5918)
-// =========================================================================
+// Tier-aware remove_newest.
 
 /// Disk-backed remove_newest: hot-only fast path.
 #[test]
@@ -420,10 +406,8 @@ fn disk_backed_remove_newest_all_lines() {
     assert_eq!(sb.cold_line_count(), 0);
 }
 
-/// #5918: Disk-backed remove_newest(1) on a large scrollback does NOT spike memory.
-///
-/// Same property as the in-memory test, but exercises DiskColdTier::truncate_back_lines
-/// and the I/O path for boundary page re-write.
+/// `remove_newest(1)` on a large scrollback costs about one block of memory,
+/// not the whole history.
 #[test]
 fn disk_backed_remove_newest_memory_bounded_cross_tier() {
     use aterm_tempfile::tempdir;
@@ -435,8 +419,7 @@ fn disk_backed_remove_newest_memory_bounded_cross_tier() {
         .with_block_size(50);
     let mut sb = DiskBackedScrollback::with_config(config).unwrap();
 
-    // 1000 lines is enough to populate all three tiers (hot=5, warm=200,
-    // cold=~800 in ~16 blocks) while keeping disk I/O test time under 2s.
+    // Enough lines for all three tiers (hot=5, warm=200, cold ~800).
     let total = 1_000;
     for i in 0..total {
         sb.push_str(&format!("DiskMem-{i}")).unwrap();
@@ -444,7 +427,7 @@ fn disk_backed_remove_newest_memory_bounded_cross_tier() {
     assert!(sb.cold_line_count() > 0, "need cold tier data");
     assert!(sb.warm_line_count() > 0, "need warm tier data");
 
-    // Drain hot to force cross-tier path.
+    // Drain hot so the removal reaches the compressed tiers.
     let hot = sb.hot_line_count();
     if hot > 0 {
         sb.remove_newest(hot).expect("drain hot");
@@ -470,14 +453,11 @@ fn disk_backed_remove_newest_memory_bounded_cross_tier() {
     );
 }
 
-// =========================================================================
-// DiskBackedScrollback Line Limit Tests (#1865)
-// =========================================================================
+// Line limit.
 
 #[test]
 fn disk_backed_scrollback_line_limit_default_is_safe_cap() {
-    // #7929: disk-backed storage must default to a bounded line limit so a
-    // runaway stdout cannot fill the disk.
+    // A bounded default keeps runaway output from filling the disk.
     use aterm_tempfile::tempdir;
 
     let dir = tempdir().unwrap();
@@ -509,8 +489,6 @@ fn disk_backed_scrollback_set_line_limit() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("cold.dtrm");
 
-    // Start from the unlimited opt-in so the Some→None→Some matrix is
-    // unambiguous even after #7929 flipped the default.
     let config = DiskBackedScrollbackConfig::new(&path).with_unlimited_lines();
     let mut sb = DiskBackedScrollback::with_config(config).unwrap();
     assert_eq!(sb.line_limit(), None);
@@ -535,15 +513,12 @@ fn disk_backed_scrollback_line_limit_enforced_on_push() {
     let mut sb = DiskBackedScrollback::with_config(config).unwrap();
     sb.set_line_limit(Some(10));
 
-    // Push 15 lines
     for i in 0..15 {
         sb.push_str(&format!("Line {i}")).unwrap();
     }
 
-    // Only 10 lines should remain (oldest 5 discarded)
     assert_eq!(sb.line_count(), 10);
 
-    // Should have newest lines (5-14)
     let line = sb
         .get_line(0)
         .expect("no error")
@@ -574,17 +549,14 @@ fn disk_backed_scrollback_set_line_limit_truncates_immediately() {
         .with_warm_limit(1000);
     let mut sb = DiskBackedScrollback::with_config(config).unwrap();
 
-    // Push 20 lines
     for i in 0..20 {
         sb.push_str(&format!("Line {i}")).unwrap();
     }
     assert_eq!(sb.line_count(), 20);
 
-    // Set limit to 10 - should truncate immediately
     sb.set_line_limit(Some(10));
     assert_eq!(sb.line_count(), 10);
 
-    // Should keep newest 10 lines (10-19)
     let line = sb
         .get_line(0)
         .expect("no error")
@@ -613,15 +585,12 @@ fn disk_backed_scrollback_line_limit_zero_disables() {
     }
     assert_eq!(sb.line_count(), 5);
 
-    // Setting to Some(0) clears everything
     sb.set_line_limit(Some(0));
     assert_eq!(sb.line_count(), 0);
 }
 
-/// Regression test for #2254: evict_warm_to_cold must not silently drop lines.
-///
-/// After warm→cold eviction, `line_count` must equal the sum of per-tier counts
-/// and every line must be retrievable by index.
+/// After warm→cold eviction, `line_count` equals the tier sum and every line is
+/// retrievable.
 #[test]
 fn disk_backed_scrollback_evict_warm_cold_no_data_loss() {
     use aterm_tempfile::tempdir;
@@ -629,8 +598,7 @@ fn disk_backed_scrollback_evict_warm_cold_no_data_loss() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("cold.dtrm");
 
-    // Small limits to force warm→cold eviction: hot=5, warm=10, block=5.
-    // After 20 lines: hot should have ~5, warm ~10, cold ~5.
+    // Small limits force warm→cold eviction.
     let config = DiskBackedScrollbackConfig::new(&path)
         .with_hot_limit(5)
         .with_warm_limit(10)
@@ -642,7 +610,6 @@ fn disk_backed_scrollback_evict_warm_cold_no_data_loss() {
         sb.push_str(&format!("Line {i}")).unwrap();
     }
 
-    // line_count must equal per-tier sum.
     let hot = sb.hot_line_count();
     let warm = sb.warm_line_count();
     let cold = sb.cold_line_count();
@@ -653,7 +620,6 @@ fn disk_backed_scrollback_evict_warm_cold_no_data_loss() {
         sb.line_count()
     );
 
-    // Every line must be retrievable.
     for i in 0..sb.line_count() {
         let line = sb
             .get_line(i)
@@ -662,7 +628,6 @@ fn disk_backed_scrollback_evict_warm_cold_no_data_loss() {
         assert_eq!(line.to_string(), format!("Line {i}"));
     }
 
-    // Verify first and last lines are correct.
     assert_eq!(
         sb.get_line(0)
             .expect("no error")
@@ -679,18 +644,8 @@ fn disk_backed_scrollback_evict_warm_cold_no_data_loss() {
     );
 }
 
-// =========================================================================
-// Tier-aware truncate performance test (#5911)
-//
-// Proves that DiskBackedScrollback::truncate() uses O(1) cold-tier
-// truncation via front_offset instead of O(N) decompress-and-rebuild.
-// =========================================================================
-
-/// Tier-aware truncate on DiskBackedScrollback avoids decompress-and-rebuild.
-///
-/// Pushes enough data to fill cold tier, then truncates. Verifies that
-/// truncation preserves correct line content and uses front_offset
-/// (line count changes without full rebuild).
+/// `truncate` trims the cold tier through `front_offset` and leaves hot and
+/// warm untouched.
 #[test]
 fn disk_backed_tier_aware_truncate_avoids_rebuild() {
     use aterm_tempfile::tempdir;
@@ -712,11 +667,10 @@ fn disk_backed_tier_aware_truncate_avoids_rebuild() {
     let hot_before = sb.hot_line_count();
     assert!(cold_before > 0, "need cold data for this test");
 
-    // Truncate to keep 22 lines (remove 8 from cold tier).
+    // Keeping 22 removes 8 lines, all from the cold tier.
     sb.truncate(22).expect("truncate should succeed");
     assert_eq!(sb.line_count(), 22);
 
-    // Hot and warm tiers should be unchanged (only cold was trimmed).
     assert_eq!(sb.hot_line_count(), hot_before, "hot tier unchanged");
     assert_eq!(sb.warm_line_count(), warm_before, "warm tier unchanged");
     assert_eq!(
@@ -725,24 +679,20 @@ fn disk_backed_tier_aware_truncate_avoids_rebuild() {
         "cold tier lost 8 lines"
     );
 
-    // Verify line content: first kept line should be L008.
     let first = sb.get_line(0).unwrap().unwrap();
     assert_eq!(first.to_string(), "L008");
 
-    // Last line should be L029.
     let last = sb.get_line(21).unwrap().unwrap();
     assert_eq!(last.to_string(), "L029");
 
-    // Verify all 22 lines are accessible and in order.
     for i in 0..22 {
         let line = sb.get_line(i).unwrap().unwrap();
         assert_eq!(line.to_string(), format!("L{:03}", 8 + i));
     }
 }
 
-/// Push with line_limit truncates from the front (tier-aware truncation via
-/// front_offset) and keeps the newest lines readable. Its cost is not read
-/// off a clock here: a correctness test holds no latency budget.
+/// Pushing past the line limit truncates the front and keeps the newest lines
+/// readable.
 #[test]
 fn disk_backed_push_with_line_limit_keeps_the_newest_lines() {
     use aterm_tempfile::tempdir;
@@ -756,30 +706,23 @@ fn disk_backed_push_with_line_limit_keeps_the_newest_lines() {
     let mut sb = DiskBackedScrollback::with_config(config).unwrap();
     sb.set_line_limit(Some(100));
 
-    // Fill to capacity.
     for i in 0..100 {
         sb.push_str(&format!("init-{i}")).unwrap();
     }
     assert_eq!(sb.line_count(), 100);
 
-    // Push 200 more lines (each triggers a truncation).
+    // Each push past the limit truncates.
     for i in 0..200 {
         sb.push_str(&format!("extra-{i}")).unwrap();
     }
 
     assert_eq!(sb.line_count(), 100, "line limit enforced");
 
-    // Verify last pushed line is accessible.
     let last = sb.get_line(99).unwrap().unwrap();
     assert_eq!(last.to_string(), "extra-199");
 }
 
-// =========================================================================
-// DiskBacked push_str + get_line round-trip over generated lines (#2603)
-// =========================================================================
-//
-// The full pipeline: push_str → Line → serialize → compress → disk →
-// decompress → deserialize → get_line.
+// push_str → serialize → compress → disk → decompress → get_line round-trip.
 
 /// Terminal-like line content across the serialization paths: plain ASCII,
 /// short (inline storage), long (heap storage) and multi-byte Unicode.
@@ -811,8 +754,8 @@ fn generated_line(next: &mut impl FnMut(u64) -> u64) -> String {
     }
 }
 
-/// Push N lines, then verify every line, the tier sum and the out-of-bounds
-/// read. Each case does full disk I/O through hot→warm→cold, so 64 cases.
+/// Push N generated lines, then check every line, the tier sum and the
+/// out-of-bounds read; small limits push each case through hot→warm→cold.
 #[test]
 fn push_str_get_line_roundtrip() {
     let mut rng = aterm_spec::rng::XorShift::new(0xD15C_BAC0);
@@ -824,7 +767,6 @@ fn push_str_get_line_roundtrip() {
         let dir = aterm_tempfile::tempdir().unwrap();
         let path = dir.path().join("roundtrip.dtrm");
 
-        // Small limits to force tier transitions (hot→warm→cold)
         let config = DiskBackedScrollbackConfig::new(&path)
             .with_hot_limit(5)
             .with_warm_limit(10)
@@ -865,17 +807,14 @@ fn push_str_get_line_roundtrip() {
     }
 }
 
-// ── Eager promotion under memory pressure ───────────────────────────────────
+// Eager promotion under memory pressure.
 
 /// Push `n` lines just under 200 bytes, reporting whether the watermark was
 /// ever seen at Yellow or above.
 ///
-/// Sampled per push, not read at the end, because the mechanism under test
-/// RELIEVES the pressure that triggers it: promoting a block drops
-/// `budgeted_bytes` below the 50% Yellow-exit threshold, so a fixture that
-/// spent the whole run promoting reads Green afterwards. A final-state check
-/// would report "never reached Yellow" for the run that exercised the path
-/// hardest.
+/// Sampled per push, not at the end: promoting a block drops `budgeted_bytes`
+/// below the Yellow-exit threshold, so a run that promoted throughout reads
+/// Green afterwards.
 fn pressure_lines(sb: &mut DiskBackedScrollback, n: usize) -> bool {
     let mut saw_yellow = false;
     for i in 0..n {
@@ -899,36 +838,27 @@ fn pressure_fixture(path: &std::path::Path, budget: usize) -> DiskBackedScrollba
 /// Lines each arm pushes.
 const LINES: usize = 150;
 
-/// Far above [`LINES`], so `hot.len() >= hot_limit` — the ORDINARY promotion
-/// boundary — cannot be reached by either arm. That is what lets "anything
-/// outside hot" mean "the eager path fired" and nothing else.
+/// Above [`LINES`], so neither arm reaches the ordinary promotion boundary
+/// (`hot.len() >= hot_limit`): anything outside hot means the eager path fired.
 const HOT_LIMIT: usize = 200;
 
-// The claim above is the test's load-bearing one, so it is checked rather than
-// asserted in prose.
 const _: () = assert!(HOT_LIMIT > LINES);
 
-/// The disk-backed twin of `watermark_eager_promotion_fires_under_pressure`.
+/// The disk-backed twin of `watermark_eager_promotion_fires_under_pressure`:
+/// under Yellow, `push_line` promotes at `hot.len() >= block_size`, a block
+/// before the ordinary `hot_limit` boundary.
 ///
-/// `push_line` promotes hot→warm at `hot.len() >= block_size` once the watermark
-/// reaches Yellow (disk_backed.rs), a whole block earlier than the ordinary
-/// `hot.len() >= hot_limit` boundary. Only the in-memory backend had a test for
-/// that; this path had none in the crate, and the gap was invisible because the
-/// file that once covered it (`src/pressure_tests.rs`) was never `mod`-declared
-/// and so never compiled — it still named the pre-hysteresis
-/// `pressure_level_from_budget` API that #5233 replaced.
-///
-/// THE CONTROL IS THE POINT. The same [`LINES`] lines under a budget they cannot
-/// stress must stay wholly in hot: without that arm a green result here would
-/// equally be explained by eviction, by a block_size promotion that fires at
-/// every level, or by a fixture that never reached Yellow at all.
+/// The control arm is the point: the same [`LINES`] under a budget they cannot
+/// stress must stay wholly in hot, or a pass could equally come from eviction,
+/// from a block_size promotion that fires at every level, or from a fixture
+/// that never reached Yellow.
 #[test]
 fn disk_backed_eager_promotion_fires_under_pressure() {
     use aterm_tempfile::tempdir;
 
     let dir = tempdir().unwrap();
 
-    // CONTROL: a budget those lines cannot stress. Nothing leaves hot.
+    // Control: a budget those lines cannot stress. Nothing leaves hot.
     let mut calm = pressure_fixture(&dir.path().join("calm.dtrm"), 100_000_000);
     assert!(
         !pressure_lines(&mut calm, LINES),
@@ -945,7 +875,7 @@ fn disk_backed_eager_promotion_fires_under_pressure() {
         calm.cold_line_count(),
     );
 
-    // …and the same push under a budget those lines DO stress.
+    // The same push under a budget those lines do stress.
     let mut tight = pressure_fixture(&dir.path().join("tight.dtrm"), 20_000);
     assert!(
         pressure_lines(&mut tight, LINES),

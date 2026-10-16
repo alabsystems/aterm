@@ -1,0 +1,12 @@
+# muse 1.4.9-R6297.1 · MEASURED 2026-10-16, `aterm ctl text --json` of a private headless aterm 120x40 (aterm 0.105.0 098c216c7), the atpkg-managed muse (Meta latest) launched through its shim with a scratch HOME, `--provider echo --echo-delay-ms 8000` (Meta's offline echo provider: no login, no model), harness off · the end of a turn: the reply as `◆ echo: hello there` (bold diamond), then the idle composer · cursor=8,2 (visible) · account and scratch path redacted at equal length
+
+  Muse Code 1.4.9
+
+❯ hello there
+
+◆ echo: hello there
+
+── Voice input (⌥ + v to start) ────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  echo · /private/tmp/at.XXXXXX/mwork · Auto-review

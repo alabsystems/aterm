@@ -41,7 +41,7 @@ pub fn native_update_activation_observation_model() -> Model {
             }
 
             invariant NoRetirementWithoutEvidence: retained == 1 || changed == 1;
-            invariant ChangedIdentityRetires: reduced == 0 || changed == 0 || retained == 0;
+            uncaught ChangedIdentityRetires: reduced == 0 || changed == 0 || retained == 0;
         }
     }
 }

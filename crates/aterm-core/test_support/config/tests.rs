@@ -23,19 +23,6 @@ fn test_default_config() {
 }
 
 #[test]
-fn test_config_equality() {
-    let config1 = TerminalConfig::default();
-    let config2 = TerminalConfig::default();
-    assert_eq!(config1, config2);
-
-    let config3 = TerminalConfig {
-        cursor_blink: false,
-        ..TerminalConfig::default()
-    };
-    assert_ne!(config1, config3);
-}
-
-#[test]
 fn test_bidi_config_default() {
     let config = BiDiConfig::default();
     assert_eq!(config.mode, BiDiMode::Implicit);

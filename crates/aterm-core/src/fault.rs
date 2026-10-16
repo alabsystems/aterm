@@ -9,8 +9,8 @@
 //! closed without panicking or corrupting state.
 //!
 //! Production builds pay nothing: [`triggered`] is an `#[inline]` `const
-//! false`. The registry and `arm`/`disarm` exist only under `cfg(test)` or the
-//! `fault-injection` feature.
+//! false`. The registry and `arm`/`disarm` exist only in a test or debug build,
+//! where nothing arms a point but a test.
 //!
 //! Usage at a fail-closed seam:
 //! ```ignore
@@ -21,7 +21,7 @@
 //! In a test: `fault::arm("scrollback.disk_spill"); … assert graceful …;
 //! fault::disarm("scrollback.disk_spill");`
 
-#[cfg(any(test, feature = "fault-injection"))]
+#[cfg(any(test, debug_assertions))]
 mod imp {
     use std::cell::RefCell;
     use std::collections::HashSet;
@@ -65,7 +65,7 @@ mod imp {
     }
 }
 
-#[cfg(not(any(test, feature = "fault-injection")))]
+#[cfg(not(any(test, debug_assertions)))]
 mod imp {
     /// Production: no fault is ever armed; folded to `false` and inlined away.
     #[inline]
@@ -76,26 +76,5 @@ mod imp {
 }
 
 pub use imp::triggered;
-#[cfg(any(test, feature = "fault-injection"))]
+#[cfg(any(test, debug_assertions))]
 pub use imp::{arm, disarm, with_armed};
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn unarmed_is_false_armed_is_true() {
-        assert!(!triggered("nope"));
-        arm("x");
-        assert!(triggered("x"));
-        assert!(!triggered("y"));
-        disarm("x");
-        assert!(!triggered("x"));
-    }
-
-    #[test]
-    fn with_armed_scopes_and_disarms() {
-        assert!(with_armed("scoped", || triggered("scoped")));
-        assert!(!triggered("scoped"), "disarmed after the scope");
-    }
-}

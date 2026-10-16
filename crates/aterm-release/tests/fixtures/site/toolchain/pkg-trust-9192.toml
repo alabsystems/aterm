@@ -1,0 +1,11 @@
+schema = 2
+program = "trust"
+version = "9192"
+build_number = 9192
+exposes = ["trust"]
+
+[[artifact]]
+target = "aarch64-apple-darwin"
+kind = "binary"
+url = "trust-9192-aarch64-apple-darwin.tar.zst"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"

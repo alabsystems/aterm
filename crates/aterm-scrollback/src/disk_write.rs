@@ -8,46 +8,29 @@ use super::DiskColdTier;
 use crate::disk_format::{PAGE_HEADER_SIZE, PageIndexEntry, len_to_u32};
 use std::io::{self, Seek, SeekFrom, Write};
 
-/// Compressed-append bytes between durability barriers (fsync + header
-/// catch-up).
+/// Compressed-append bytes between durability barriers (fsync + header catch-up).
 ///
-/// WHY a policy boundary instead of the old per-page barrier: the cold tier
-/// receives one page per `block_size` (default 100) pushed lines, and the old
-/// append path paid TWO `sync_data()` calls plus a whole-file munmap/re-mmap
-/// per page — cost scaling with OUTPUT RATE (fsyncs) and TOTAL FILE SIZE
-/// (VMA/PTE churn), on the ingest path, serialized under the terminal lock.
-/// Those barriers were never load-bearing for crash consistency: `scan_pages`
-/// rebuilds the index by scanning page headers, treats the on-disk
-/// `page_count`/`line_count` fields as advisory preallocation hints (clamped),
-/// and already discards torn/partial tails (#5917). What the per-page fsync
-/// actually bought was a smaller power-loss window for the COLD tail — but the
-/// newest `hot_limit + warm_limit` (~11k default) lines live in RAM tiers that
-/// were never crash-durable at all, so history near the write head is lost on
-/// power failure regardless of how eagerly cold pages sync. Deferring the
-/// barrier to this byte boundary (plus close/clear/compaction/back-truncation,
-/// and a best-effort sync in `Drop`) keeps an equivalent guarantee: after
-/// recovery the store holds a valid prefix of the history, now up to
-/// `SYNC_APPEND_BYTES` of compressed pages shorter on power loss. A clean
-/// process exit still syncs everything via `Drop`, and kernel writeback bounds
-/// the window in wall-clock time on every supported platform.
+/// A per-page barrier would put two `sync_data()` calls per page on the ingest
+/// path, under the terminal lock, without buying crash consistency: `scan_pages`
+/// rebuilds the index from page headers, treats the header's
+/// `page_count`/`line_count` as clamped hints, and discards torn tails. The newest
+/// `hot_limit + warm_limit` lines (~11k by default) live in RAM and are lost on
+/// power failure anyway. With barriers here (plus close, clear, compaction,
+/// back-truncation and `Drop`), a recovered store holds a valid prefix of the
+/// history, at most `SYNC_APPEND_BYTES` of compressed pages short.
 const SYNC_APPEND_BYTES: usize = 1 << 20;
 
 impl DiskColdTier {
-    /// Push compressed data from a warm block.
+    /// Push cold-codec (LZ4) compressed data from a warm block.
     ///
-    /// The data is already Zstd compressed.
+    /// Transactional: line_count, index, cumulative_lines and write_offset change
+    /// only after all writes succeed, so an I/O failure leaves the last committed
+    /// state.
     ///
-    /// Uses a transactional pattern: internal state (line_count, index,
-    /// cumulative_lines, write_offset) is only updated after all writes
-    /// succeed. On I/O failure the state remains consistent with the
-    /// previously committed page (#7575).
-    ///
-    /// Durability is DEFERRED: no fsync and no header rewrite here — see
-    /// [`SYNC_APPEND_BYTES`] and [`Self::sync_appends`]. The mmap is also left
-    /// untouched: appends land at/beyond the mapped extent, and reads of pages
-    /// past that extent are served positionally by `read_page_bytes` until the
-    /// next load/compaction re-maps — the per-append whole-file unmap/remap is
-    /// gone as a category, not shaved.
+    /// Durability is deferred: no fsync or header rewrite here (see
+    /// [`SYNC_APPEND_BYTES`] and [`Self::sync_appends`]). The mmap is not touched:
+    /// pages past its extent are read positionally by `read_page_bytes` until the
+    /// next load or compaction re-maps.
     pub(crate) fn push_compressed(
         &mut self,
         compressed: &[u8],
@@ -57,14 +40,11 @@ impl DiskColdTier {
             return Ok(());
         }
 
-        // A mapped view covers only bytes below the extent it was created
-        // with, and appends write at `write_offset` >= that extent — EXCEPT
-        // right after a torn-tail crash recovery, where `load` mapped the full
-        // physical file but `scan_pages` rewound `write_offset` to the end of
-        // the last complete page. Overwriting bytes a live view maps is not a
-        // coherence bet we take on every platform, so drop the view for that
-        // (rare, at-most-once-per-recovery) overlap case; the positional-read
-        // fallback serves all cold reads until the next re-map.
+        // Appends write at or past the mapped extent, except right after torn-tail
+        // recovery: `load` mapped the whole file but `scan_pages` rewound
+        // `write_offset` to the end of the last complete page. Drop the view in that
+        // rare overlap rather than overwrite mapped bytes; positional reads serve
+        // cold reads until the next re-map.
         let stale_overlap = self
             .mmap
             .as_ref()
@@ -92,13 +72,10 @@ impl DiskColdTier {
                 line_count: len_to_u32(line_count),
             };
 
-            // --- I/O block: page header + page data. If any step fails, we
-            // return early WITHOUT modifying in-memory state. There is no
-            // durability barrier and no header-count rewrite here — both are
-            // deferred to the sync-policy boundary below. The old
-            // data-before-header write-ahead ordering (#5917) is moot once the
-            // header is advisory: scan_pages never trusts it beyond a clamped
-            // preallocation hint.
+            // Page header + data. A failure returns before any in-memory change.
+            // No barrier or header-count rewrite (deferred, below), and no
+            // data-before-header ordering: scan_pages treats the header as a
+            // clamped hint.
             let mut page_header = [0u8; PAGE_HEADER_SIZE];
             page_header[0..4].copy_from_slice(&len_to_u32(compressed.len()).to_le_bytes());
             page_header[4..8].copy_from_slice(&len_to_u32(line_count).to_le_bytes());
@@ -113,27 +90,24 @@ impl DiskColdTier {
             self.index.push(entry);
             self.cumulative_lines.push(new_cumulative);
 
-            // Deferred-durability bookkeeping. Saturating: byte totals of data
-            // this process actually wrote, so the sum always fits in `usize` —
-            // the saturation just discharges the strict gate's unconstrained-
-            // input overflow counterexample (crate idiom).
+            // Deferred-durability bookkeeping. Saturating discharges the strict
+            // gate's overflow obligation; bytes actually written always fit.
             self.unsynced_append_bytes = self
                 .unsynced_append_bytes
                 .saturating_add(PAGE_HEADER_SIZE)
                 .saturating_add(compressed.len());
             self.header_dirty = true;
             if self.unsynced_append_bytes >= SYNC_APPEND_BYTES {
-                // Policy-boundary barrier. A failure here is NOT a push
-                // failure: the page bytes are written and the in-memory state
-                // is committed, so surfacing an error would make the eviction
-                // driver restore the block to the warm tier and double-count
-                // it. Log and let the next boundary (or close) retry.
+                // A failed barrier is not a push failure: the page is written and
+                // committed, and an error would make the eviction driver restore
+                // the block to the warm tier and double-count it. The next
+                // boundary (or close) retries.
                 if let Err(e) = self.sync_appends() {
                     aterm_log::warn!("push_compressed: deferred sync failed ({e}), will retry");
                 }
             }
         } else {
-            // In-memory only mode - just update counts
+            // In-memory mode: update the counts only.
             let entry = PageIndexEntry {
                 offset: 0,
                 compressed_size: len_to_u32(compressed.len()),
@@ -141,7 +115,8 @@ impl DiskColdTier {
             };
             self.index.push(entry);
             self.line_count = self.line_count.saturating_add(line_count);
-            // Same live-last/absolute-base rule as the disk-backed branch.
+            // As in the file branch: `last()` is the last live entry (the dead
+            // prefix is at the front); when empty, the base is the absolute floor.
             let cumulative = self
                 .cumulative_lines
                 .last()
@@ -159,16 +134,14 @@ impl DiskColdTier {
     /// Bring the on-disk header counters up to date and issue the append-side
     /// durability barrier.
     ///
-    /// Idempotent and free when nothing is pending. Called from the byte-
-    /// policy boundary in [`Self::push_compressed`], from `Drop`, and from the
-    /// test-only `sync()`; the operations that write the header through their
-    /// own synced paths (clear/compaction/back-truncation) call
-    /// [`Self::mark_appends_synced`] instead. The header counters are ADVISORY
-    /// (`scan_pages` rebuilds and clamps them), so no write-ahead ordering is
-    /// needed between the header write and the page data — one `sync_data`
-    /// covers both, replacing the old two-barrier-per-page scheme.
-    // Skip: seek/write/sync over an OS handle — the io class the strict gate
-    // treats as absent-callee. Counter resets are plain stores.
+    /// Free when nothing is pending. Called from the byte boundary in
+    /// [`Self::push_compressed`], from `Drop`, and from the test-only `sync()`; paths
+    /// that write the header through their own synced I/O (clear, compaction,
+    /// back-truncation) call [`Self::mark_appends_synced`] instead. The header
+    /// counters are advisory (`scan_pages` rebuilds and clamps them), so one
+    /// `sync_data` covers header and page data with no write-ahead ordering.
+    // Skip: seek/write/sync over an OS handle, the io class the strict gate treats
+    // as absent-callee.
     #[cfg_attr(trust_verify, trust::skip)]
     pub(super) fn sync_appends(&mut self) -> io::Result<()> {
         if !self.header_dirty && self.unsynced_append_bytes == 0 {

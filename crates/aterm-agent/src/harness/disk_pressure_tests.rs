@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tests for the pressure pass: below the automatic floor, profiles inside the
-//! idle window give up their `incremental/` least recently used first, free
-//! space measured again before each, until the volume is back at the floor
-//! plus [`PRESSURE_MARGIN_GIB`].
-//!
-//! Every fixture is a build directory laid out as cargo lays one out
-//! ([`lay_target`], [`lay_profile`]), each profile recent (hours old, inside
-//! the one-day window). The re-measure is a script of free figures, so the
-//! stop is decided by the test, not the machine's disk.
+//! Tests for the pressure pass: below the automatic floor, profiles inside the idle window
+//! give up their `incremental/` least recently used first, free space measured again before
+//! each, until the volume is back at the floor plus [`PRESSURE_MARGIN_GIB`]. The re-measure is
+//! a script of free figures, so the test decides the stop.
 
 use super::tests::{Tmp, lay_profile, lay_target, no_pressure, now_after_write};
 use super::*;
@@ -49,11 +44,9 @@ fn blocks(p: &Path) -> u64 {
     std::fs::symlink_metadata(p).expect("stat").blocks() * 512
 }
 
-/// Three recent profiles in two build directories, in an order where path
-/// order and least-recently-used order disagree:
-/// `a/target/debug` 3 h old, `a/target/release` 1 h, `b/target/debug` 5 h
-/// (the oldest, and last by path), under `root`. Answers the canonical
-/// build directories and `now`.
+/// Three recent profiles under `root` whose path and least-recently-used orders disagree:
+/// `a/target/debug` 3 h old, `a/target/release` 1 h, `b/target/debug` 5 h. Answers the
+/// canonical build directories and `now`.
 pub(crate) fn three_recent(root: &Path) -> (PathBuf, PathBuf, i64) {
     let now = now_after_write(0);
     let a = lay_target(&root.join("a/target"));
@@ -122,16 +115,9 @@ fn pressure_order(rep: &Report) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Below the floor with every profile recent, the oldest unlocked profile
-/// goes first and the pass stops once free space is back. At the idle window
-/// alone the tick took nothing here (every profile is hours old). Under
-/// pressure the least recently used profile — `b/target/debug`, five hours
-/// — gives up its `incremental/`; free space measured again is at the
-/// floor plus the margin, so the pass stops there and the two more recent
-/// profiles keep theirs. The journal says each step as it happened —
-/// intent, outcome (the witness, the bytes the unlinks released), and the
-/// stop (the figure it stopped on and how many it left) — and the bytes are
-/// the query cache's blocks, counted, not the row's estimate.
+/// Below the floor with every profile recent, the least recently used goes first and the pass
+/// stops once free space is back; the journal records intent, outcome and stop, and the bytes
+/// are the counted blocks, not the row's estimate.
 #[test]
 fn below_the_floor_with_every_profile_recent_the_oldest_goes_first_and_the_pass_stops() {
     let tmp = Tmp::new("pressure-stop");
@@ -215,11 +201,8 @@ fn below_the_floor_with_every_profile_recent_the_oldest_goes_first_and_the_pass_
     );
 }
 
-/// The order is least recently used, not path order. With free space never
-/// back, every recent profile goes, and the intents are journalled oldest
-/// first: `b/target/debug` (5 h), `a/target/debug` (3 h), then
-/// `a/target/release` (1 h) — where path order would start in `a/`. The
-/// report lists them in that order too, the order the verb prints.
+/// The pressure pass takes profiles least recently used first, not in path order, and the
+/// report lists them in that order.
 #[test]
 fn the_pressure_pass_takes_profiles_least_recently_used_first() {
     let tmp = Tmp::new("pressure-order");
@@ -252,12 +235,9 @@ fn the_pressure_pass_takes_profiles_least_recently_used_first() {
     }
 }
 
-/// A locked profile is never touched, even when it is the oldest. A build
-/// holding any one of `b/target/debug`'s locks at the survey keeps it off
-/// the report (a note says why), and the pass starts at the next oldest. A
-/// build that takes the lock after the survey is met by the reclaim's own
-/// lock: the row is refused, its cache byte for byte intact, and the pass
-/// goes on to the next.
+/// A locked profile is never taken under pressure, even the oldest: one held at the survey is
+/// off the report (a note says why); one locked after the survey is refused by the reclaim's
+/// own lock, its cache intact, and the pass goes on.
 #[test]
 fn a_locked_profile_is_never_taken_under_pressure_even_when_it_is_the_oldest() {
     for lock in CARGO_LOCKS {
@@ -322,10 +302,8 @@ fn a_locked_profile_is_never_taken_under_pressure_even_when_it_is_the_oldest() {
     }
 }
 
-/// At or above the floor nothing happens: no pressure row is reported (a
-/// note says a recent profile would not be taken), nothing is planned, the
-/// re-measure is never read and every cache stays — and the owner's verb,
-/// with `disk.apply` on, takes nothing either, since no profile is idle.
+/// At or above the floor no recent profile is taken: no pressure row, no plan, no re-measure,
+/// and the owner's verb with `disk.apply` on takes nothing either.
 #[test]
 fn above_the_floor_no_recent_profile_is_taken() {
     let tmp = Tmp::new("pressure-above");
@@ -369,11 +347,8 @@ fn above_the_floor_no_recent_profile_is_taken() {
     }
 }
 
-/// A profile built within the last minutes is kept even under pressure: a
-/// build that just finished is usually followed by another, which would
-/// write the cache straight back. Five minutes old, `b/target/debug` is no
-/// row (a note says why) however low free space is; at exactly
-/// [`PRESSURE_MIN_IDLE_S`] it is one again.
+/// A profile built within [`PRESSURE_MIN_IDLE_S`] is kept even under pressure (a note says
+/// why); at exactly that age it is a row again.
 #[test]
 fn a_profile_built_within_the_last_minutes_is_kept_under_pressure() {
     let tmp = Tmp::new("pressure-recent");
@@ -401,11 +376,8 @@ fn a_profile_built_within_the_last_minutes_is_kept_under_pressure() {
     );
 }
 
-/// Idle profiles still go first, and whole. `target_stale_days` keeps its
-/// meaning: a profile past it is idle and its build directory's row takes
-/// it at once, before any recent profile and without a re-measure; only
-/// then does the pressure pass measure and stop. Here the idle profile
-/// alone is enough: the stop comes before any recent one.
+/// Idle profiles go first and whole, with no re-measure; only then does the pressure pass
+/// measure and stop. Here the idle profile alone is enough.
 #[test]
 fn idle_profiles_go_first_and_whole_before_any_recent_one() {
     let tmp = Tmp::new("pressure-idle-first");
@@ -478,9 +450,8 @@ fn a_failed_re_measure_stops_the_pressure_pass() {
     );
 }
 
-/// Only the measured volume: a build directory whose device is not the
-/// measured volume's gets no pressure row (reclaiming it frees nothing
-/// there), and a volume whose device could not be read gets none at all.
+/// A build directory off the measured volume gets no pressure row, and an unread volume
+/// device gives none at all.
 #[test]
 fn a_build_directory_on_another_volume_gets_no_pressure_row() {
     let tmp = Tmp::new("pressure-volume");
@@ -499,15 +470,9 @@ fn a_build_directory_on_another_volume_gets_no_pressure_row() {
     assert!(pressure_order(&rep).is_empty(), "{rep:?}");
 }
 
-/// A re-measure that never rises stops the pass once the counted bytes
-/// cover what was short. A local snapshot (or a clone, or a deferred free)
-/// can keep an unlink out of `statvfs` for a while; if only the figure could
-/// stop the pass, it would take every profile it has while the volume
-/// stayed under the floor. Here free space reads short of the target by
-/// exactly the oldest profile's cache and never moves: that profile goes,
-/// and the pass stops at the next row on the bytes its unlink released —
-/// the stop row says which stop fired, what was short and what was
-/// released — and the two more recent profiles keep theirs.
+/// A re-measure that never rises (a local snapshot can keep an unlink out of `statvfs`) stops
+/// the pass once the counted bytes cover what was short: the oldest profile goes, the stop row
+/// says which stop fired, and the rest keep theirs.
 #[test]
 fn a_re_measure_that_never_rises_stops_once_the_counted_bytes_cover_the_shortfall() {
     let tmp = Tmp::new("pressure-counted");
@@ -566,13 +531,8 @@ fn a_re_measure_that_never_rises_stops_once_the_counted_bytes_cover_the_shortfal
     }
 }
 
-/// With `target_stale_days = 0`, a profile built minutes ago is still never
-/// taken. A zero window makes every profile idle, and idle rows are taken
-/// whole with no re-measure — so the ten-minute rule has to hold in the idle
-/// pass too, or the docs' "never one built in the last 10 min" would be
-/// false for that setting. `b/target/debug`, built a minute ago, is no row
-/// (a note says why), the tick takes the older profiles in `a/` and not it,
-/// and the reclaim itself, which judges each profile again, takes nothing.
+/// With `target_stale_days = 0` every profile is idle, but one built minutes ago is still
+/// never taken: the ten-minute rule holds in the idle pass and in the reclaim.
 #[test]
 fn with_a_zero_day_window_a_profile_built_minutes_ago_is_still_never_taken() {
     let tmp = Tmp::new("pressure-zero-window");
@@ -635,11 +595,8 @@ fn with_a_zero_day_window_a_profile_built_minutes_ago_is_still_never_taken() {
     assert!(b.join("debug/incremental").exists());
 }
 
-/// A survey that did not probe the recent profiles makes no pressure row.
-/// Surveyed as if above the floor, only idle profiles are probed for a
-/// build's locks and sized; reported below it, a recent profile's row would
-/// say "no build holding its locks" of a profile nobody probed — here one a
-/// build holds — and 0 bytes. So the directory gets a note instead.
+/// A survey that did not probe the recent profiles (surveyed above the floor) makes no
+/// pressure row: it would vouch for locks nobody probed. The directory gets a note instead.
 #[test]
 fn a_survey_that_did_not_probe_the_recent_profiles_makes_no_pressure_row() {
     let tmp = Tmp::new("pressure-unprobed");
@@ -663,12 +620,9 @@ fn a_survey_that_did_not_probe_the_recent_profiles_makes_no_pressure_row() {
     drop(hold);
 }
 
-/// The headline keeps the pressure rows apart, as an upper bound. The pass
-/// stops at the floor plus the margin, so adding every pressure row into
-/// `reclaimable=` would promise far more than it takes. `reclaimable=` is
-/// what goes whole (the idle row); `under_pressure_up_to=` is every
-/// pressure row's bytes — in the headline, the JSON and the ledger's report
-/// row alike.
+/// The headline keeps the pressure rows apart as an upper bound: `reclaimable=` is what goes
+/// whole, `under_pressure_up_to=` every pressure row's bytes, in the headline, the JSON and
+/// the ledger row alike.
 #[test]
 fn the_headline_keeps_the_pressure_rows_apart_as_an_upper_bound() {
     let tmp = Tmp::new("pressure-headline");
@@ -706,10 +660,8 @@ fn the_headline_keeps_the_pressure_rows_apart_as_an_upper_bound() {
     }
 }
 
-/// A build directory inside another gives each profile one pressure row.
-/// Both are named, and the outer walk finds the inner one's profile too:
-/// that profile is listed once (as the inner directory's), counted once,
-/// and taken once — no second attempt that fails as a denial.
+/// A profile of a build directory nested in another gets one pressure row (the inner
+/// directory's), counted and taken once.
 #[test]
 fn a_build_directory_inside_another_gives_each_profile_one_pressure_row() {
     let tmp = Tmp::new("pressure-nested");
@@ -758,19 +710,10 @@ fn a_build_directory_inside_another_gives_each_profile_one_pressure_row() {
     assert!(!outer.join("debug/incremental").exists());
 }
 
-/// One verdict per profile, the innermost build directory's. A build directory
-/// named inside another is surveyed twice, and a build holding a nested lock
-/// at only one survey is read free by one and held by the other; only the
-/// inner directory's survey decides that profile.
-///
-/// * Held at the inner survey: no row lists the profile and a note keeps it.
-/// * Held at the outer survey: the inner directory's row, and no note.
-///
-/// The lock is taken and released around exactly one survey, with no clock
-/// involved.
-///
-/// Negative control: with no build at either survey the nested profile has
-/// its row, once, as the inner directory's, and no note keeps anything.
+/// The innermost build directory decides a nested profile: surveyed twice (outer, then
+/// inner), a build holding its lock at the inner survey keeps it (a note, no row), one held at
+/// the outer survey does not (the inner row, no note). Negative control: no build at either
+/// survey gives one inner row and no note.
 #[test]
 fn the_innermost_build_directory_decides_a_nested_profile_between_two_surveys() {
     /// Which survey a build holds the nested profile's `.cargo-lock` at.
@@ -792,9 +735,8 @@ fn the_innermost_build_directory_decides_a_nested_profile_between_two_surveys() 
         last_used(&inner.join("debug"), now - 4 * HOUR);
         let canon = |p: &Path| std::fs::canonicalize(p).expect("canonical");
         let (outer, inner) = (canon(&outer), canon(&inner));
-        // Released by `LOCK_UN` when dropped ([`target::Build`]), a panic's
-        // unwind included, so no child a sibling test is spawning keeps it
-        // for the next survey.
+        // Released by `LOCK_UN` on drop ([`target::Build`]), so no sibling test's spawned
+        // child keeps it for the next survey.
         let holding = |at: Build| {
             (build == at).then(|| target::Build::holds(&inner.join("debug/.cargo-lock")))
         };

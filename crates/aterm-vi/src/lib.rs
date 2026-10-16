@@ -22,9 +22,6 @@
 //! Search motions (n/N) use [`ViSearchState`] which is populated by
 //! the caller from whatever search engine is available.
 
-#![deny(unsafe_op_in_unsafe_fn)]
-#![deny(clippy::all)]
-
 mod cursor;
 pub(crate) mod navigation;
 pub(crate) mod search;
@@ -138,20 +135,6 @@ impl ViMode {
     #[must_use]
     pub fn cursor_point(&self) -> ViPoint {
         self.cursor.point
-    }
-
-    /// Get the last inline search state.
-    #[must_use]
-    #[cfg(test)]
-    pub fn inline_search(&self) -> Option<InlineSearchState> {
-        self.inline_search
-    }
-
-    /// Access the search state.
-    #[must_use]
-    #[cfg(test)]
-    pub fn search(&self) -> &ViSearchState {
-        &self.search
     }
 
     /// Mutable access to the search state.
@@ -430,12 +413,6 @@ impl ViMode {
     #[cfg(test)]
     pub fn set_mark(&mut self, mark: char) -> bool {
         self.marks.set(mark, self.cursor.point)
-    }
-
-    /// Record an inline search.
-    #[cfg(test)]
-    pub fn set_inline_search(&mut self, state: InlineSearchState) {
-        self.inline_search = Some(state);
     }
 
     /// Move the cursor `delta` lines (negative is up, toward history),

@@ -124,7 +124,7 @@ pub(crate) fn survey_cells(
     let mut surveys: Vec<CellSurvey> = Vec::new();
     let mut skipped: Vec<Skipped> = Vec::new();
     for cell in chosen {
-        match loc::survey_cell(root, cell) {
+        match loc::survey_cell(&crate::resolve::Cargo::from_env(), root, cell) {
             Ok(s) => surveys.push(s),
             Err(why) => skipped.push((cell.name.clone(), why)),
         }
@@ -1003,7 +1003,8 @@ mod tests {
         // Baseline rows are ceilings, so a legitimate retirement may shrink
         // below them. The report must print the current gathered quantities;
         // loc's cell tests separately enforce both baseline and TSV ceilings.
-        let actual = loc::survey_cell(&root, &cell("mac-arm")).expect("mac-arm resolves");
+        let actual = loc::survey_cell(&crate::resolve::Cargo::from_env(), &root, &cell("mac-arm"))
+            .expect("mac-arm resolves");
         let loc_text = format!(
             "  third-party   {} LOC   ",
             commas(actual.third_party_loc())
@@ -1055,7 +1056,8 @@ mod tests {
         // stray comma ships unnoticed.
         aterm_json::from_str::<aterm_json::Value>(&body)
             .unwrap_or_else(|e| panic!("hand-rolled JSON is malformed: {e}"));
-        let actual = loc::survey_cell(&root, &cell("mac-arm")).expect("mac-arm resolves");
+        let actual = loc::survey_cell(&crate::resolve::Cargo::from_env(), &root, &cell("mac-arm"))
+            .expect("mac-arm resolves");
         assert!(
             body.contains(&format!(
                 "\"third_party\": {},",

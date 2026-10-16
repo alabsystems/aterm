@@ -39,6 +39,29 @@ mod windows;
 #[cfg(windows)]
 pub use windows::*;
 
+/// What the kernel says of when a pid's process started ([`process_birth`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Birth {
+    /// Kernel start-time stamp used alongside the pid to detect reuse.
+    At(u64),
+    /// Nothing lives under the pid: no such process, or a zombie.
+    Gone,
+    /// The kernel would not say — a sandbox denying process-info, another account's process,
+    /// a platform with no reader — which says nothing about the process either way.
+    Unreadable,
+}
+
+impl Birth {
+    /// The start time, when the kernel gave one.
+    #[must_use]
+    pub const fn at(self) -> Option<u64> {
+        match self {
+            Self::At(born) => Some(born),
+            Self::Gone | Self::Unreadable => None,
+        }
+    }
+}
+
 /// The private-directory creator, [`aterm_update_core::ensure_private_dir`] on both
 /// platforms (Unix: `0700`, owned by our uid; Windows: `create_dir_all` under the
 /// per-user profile ACL, final component a real directory).
@@ -122,18 +145,61 @@ pub(crate) fn sync_durable(f: &std::fs::File) -> io::Result<()> {
 /// ([`sync_file_contents`]). It is still a real flush, made at the same point and in the
 /// same order, so a test sees the same files, renames and errors. What it drops is the
 /// drive-cache barrier. No test can observe that barrier, because it only orders the disk
-/// against a power loss. It also stalls the whole VOLUME while it runs. Measured
-/// 2026-10-05: one `atpkg --lib` run made 7,381 `F_FULLFSYNC`s (shim lays, vendor
-/// records, `status.toml`, the floors, swap directory syncs). Every test binary the gate
-/// ran beside it waited behind them for its own temp-dir metadata. With this arm the run
-/// took 28.5-29.8 s instead of 44.5-63.6 s alone, and 18.6-20.1 s instead of 74.6-96.5 s
-/// beside `aterm-gui --lib` (load 13-37). Off Apple targets `sync_all` already is
+/// against a power loss. It also stalls the whole VOLUME while it runs: one `atpkg --lib`
+/// run made 7,381 `F_FULLFSYNC`s (shim lays, vendor records, `status.toml`, the floors,
+/// swap directory syncs), and every test binary a run started beside it waited behind them
+/// for its own temp-dir metadata. With this arm the run took 28.5-29.8 s instead of
+/// 44.5-63.6 s alone, and 18.6-20.1 s instead of 74.6-96.5 s beside `aterm-gui --lib`
+/// (load 13-37). Off Apple targets `sync_all` already is
 /// `fsync(2)` (`FlushFileBuffers` on Windows, which is also what `sync_file_contents`
 /// calls there), so this arm changes nothing else. Integration tests and every shipped
 /// build compile the arm above.
 #[cfg(test)]
 pub(crate) fn sync_durable(f: &std::fs::File) -> io::Result<()> {
     sync_file_contents(f)
+}
+
+/// macOS's QoS launcher, the one the window wraps its package passes in. Absent
+/// elsewhere, where [`utility_clamped`] leaves a program bare.
+#[cfg(unix)]
+const TASKPOLICY: &str = "/usr/sbin/taskpolicy";
+
+/// The argv head that starts `program` at UTILITY QoS for a detached background pass:
+/// `taskpolicy -c utility <program>`, the clamp the window's lane gives the same passes
+/// (aterm-gui `qos::command(Role::Background, …)`). Bare, a session's pass — the
+/// six-hourly `aterm pkg update`, the daily `machine apply`, a head-watch pass, a warm —
+/// and everything it starts ran at the default band (`ps` pri 31), an equal of the
+/// program being typed into; behind the clamp it reads pri 20.
+///
+/// `taskpolicy` execs the program in place (`POSIX_SPAWN_SETEXEC`), so the pid a
+/// detaching shell reports and the process group it made stay the program's own.
+/// Wrapped only when both ends are real: `taskpolicy` exists and `program` is an absolute
+/// path to an executable file, so a missing program still fails as itself, not as
+/// `taskpolicy`'s exit 66. Never for a child that launches an aterm window: the clamp is
+/// inherited, and an aterm under UTILITY starves its own paint.
+#[cfg(unix)]
+pub(crate) fn utility_clamped(program: &std::ffi::OsStr) -> Vec<std::ffi::OsString> {
+    utility_clamped_with(program, Path::new(TASKPOLICY))
+}
+
+/// [`utility_clamped`] over an explicit launcher, so the decision is testable on every
+/// Unix against a stand-in.
+#[cfg(unix)]
+fn utility_clamped_with(program: &std::ffi::OsStr, taskpolicy: &Path) -> Vec<std::ffi::OsString> {
+    let path = Path::new(program);
+    if path.is_absolute()
+        && crate::toolchain::is_executable_file(path)
+        && crate::toolchain::is_executable_file(taskpolicy)
+    {
+        vec![
+            taskpolicy.into(),
+            "-c".into(),
+            "utility".into(),
+            program.into(),
+        ]
+    } else {
+        vec![program.into()]
+    }
 }
 
 /// Start `program args` DETACHED: stdio on `/dev/null`, its own process group, and NOT
@@ -143,8 +209,9 @@ pub(crate) fn sync_durable(f: &std::fs::File) -> io::Result<()> {
 /// as ITS zombie could be reaped in the shell's place, and `aterm` would exit with the
 /// pass's status instead of the shell's (reliably on Linux, ~6% of exits on macOS). So
 /// on unix a `/bin/sh` middle process — the group leader — backgrounds the program and
-/// exits at once, and reaping it here re-parents the program to launchd/init. `env` is
-/// one variable set on it.
+/// exits at once, and reaping it here re-parents the program to launchd/init. The
+/// program runs at utility QoS ([`utility_clamped`]), as the window's passes do. `env`
+/// is one variable set on it.
 ///
 /// # Errors
 /// The middle shell could not be started, or did not exit 0.
@@ -161,7 +228,7 @@ pub fn spawn_detached(
         }
         let status = command
             .args(["-c", "\"$@\" &", "sh"])
-            .arg(program)
+            .args(utility_clamped(program))
             .args(args)
             .stdin(aterm_uds::spawnfd::Stdio::null())
             .stdout(aterm_uds::spawnfd::Stdio::null())
@@ -697,41 +764,6 @@ pub(crate) fn cmd_landing_prelude(
     s
 }
 
-/// THE `.cmd` SELF-UPDATE BLOCK — TARGET, NOT RENDERED. The Windows twin of
-/// [`sh_selfupdate_prelude`] would sit ahead of the twin's exports and read:
-///
-/// ```text
-/// @rem atpkg agents twin: claude update, upgrade and install are answered by atpkg __selfupdate (aterm help pkg).
-/// @if /I "%~1"=="update" goto selfupdate
-/// @if /I "%~1"=="upgrade" goto selfupdate
-/// @if /I "%~1"=="install" goto selfupdate
-/// @goto store
-/// :selfupdate
-/// @if not exist "<atpkg>" goto store
-/// @"<atpkg>" __selfupdate "claude" "<prefix>" -- %* & @exit /b
-/// :store
-/// ```
-///
-/// It answers the EMPTY string on every input, so `claude update` on Windows runs the
-/// vendor's verb. Why: `"%~1"=="update"` expands the USER'S first argument onto a batch
-/// line, and an argument carrying a `"` can make `cmd.exe` report a syntax error and END
-/// the batch with the tool never run — the strand the Unix rule forbids (the `exec` is
-/// the guarantee). Every added line that runs a program would also have to end the
-/// batch on that line ([`CMD_FORWARD_TAIL`]). Rendering it waits for a Windows host that
-/// has measured `%~1` with `"`, `%` and `^` in the argument; the Rust half
-/// (`cli::cmd_selfupdate`) is platform-neutral. The arguments keep the renderer's
-/// signature.
-#[must_use]
-pub(crate) fn cmd_selfupdate_prelude(
-    program: &str,
-    prefix: &Path,
-    atpkg: &Path,
-    verbs: &[&str],
-) -> String {
-    let _ = (program, prefix, atpkg, verbs);
-    String::new()
-}
-
 /// A path as the LEGACY `.cmd` landing prelude embedded it, or `None` when it could not:
 /// the verbatim prefix off ([`strip_verbatim_prefix`]), trailing `\` and `/` trimmed (a
 /// quoted operand ending in `\"` is an escaped quote to the launched exe's argv parser),
@@ -754,7 +786,11 @@ fn cmd_embedded_path(path: &Path) -> Option<String> {
 
 /// THE PRELUDE of an agent program's `agents/` twin and its `bin/` shim — what
 /// [`crate::activate::reconcile_agents`] renders into both: the self-update block alone
-/// ([`sh_selfupdate_prelude`] on Unix; [`cmd_selfupdate_prelude`], empty, on Windows). A
+/// ([`sh_selfupdate_prelude`]) on Unix, and NOTHING on Windows — a `.cmd` block would test
+/// `"%~1"=="update"`, which expands the user's first argument onto a batch line, where an
+/// argument carrying a `"` can end the batch with the tool never run (the strand the Unix
+/// rule forbids); it waits for a Windows host that has measured `%~1` with `"`, `%` and
+/// `^` (`docs/DESIGN-vendor-self-update-2026-09-19.md`). A
 /// twin that still carries a legacy landing prelude compares unequal on the next pass
 /// and is re-laid once (temp + rename; a running `sh` keeps the old inode, a running
 /// `.cmd` ends its batch on the line that runs the program). `verbs` is the program's row
@@ -768,12 +804,10 @@ pub(crate) fn twin_prelude(
     atpkg: Option<&Path>,
     verbs: &[&str],
 ) -> String {
-    let atpkg = crate::stub::named(atpkg);
     if cfg!(windows) {
-        cmd_selfupdate_prelude(program, prefix, atpkg, verbs)
-    } else {
-        sh_selfupdate_prelude(program, prefix, atpkg, verbs)
+        return String::new();
     }
+    sh_selfupdate_prelude(program, prefix, crate::stub::named(atpkg), verbs)
 }
 
 /// The Unix `bin/` shim body: a `/bin/sh` stub that EXECs the store binary.
@@ -863,8 +897,8 @@ const SH_SHIM_ROUTE_NOTE: &str = "# atpkg exec root: this build ships bin/rustc 
 /// NOTHING THAT READS A SHIM SEES A DIFFERENCE. The env note and `export` lines stay
 /// ahead of the guard, so both `exec`s inherit them. The guard line starts with `[`, so
 /// `parse_sh_shim_target` — the first trimmed line that starts with `exec '` — still
-/// answers `S`, `parse_sh_shim_env` still reads the same exports, and
-/// `tools/bootstrap-publisher.sh`'s `sed '^exec …'` still prints `S`: `which`, gc's
+/// answers `S`, `parse_sh_shim_env` still reads the same exports, and a `sed '^exec …'`
+/// still prints `S`: `which`, gc's
 /// witnesses, `prune_stale_shims`, the alias reconcile and doctor's broken-shim scan all
 /// answer as they did for the plain shim.
 #[cfg(any(unix, test))]
@@ -1173,6 +1207,83 @@ pub(crate) fn read_cmd_shim_env(path: &Path) -> crate::shim_env::ShimEnv {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The clamp's decision, against a stand-in launcher so it runs the same on every
+    /// Unix: an absolute executable program runs behind `taskpolicy -c utility`; a
+    /// relative, missing or non-executable one, or no launcher, leaves the program alone.
+    #[cfg(unix)]
+    #[test]
+    fn only_an_absolute_executable_runs_behind_the_utility_clamp() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = crate::testdir::dir("atpkg-clamp-");
+        let launcher = dir.join("taskpolicy");
+        std::fs::write(&launcher, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let plain = dir.join("plain");
+        std::fs::write(&plain, "").unwrap();
+        let argv = |program: &Path, launcher: &Path| -> Vec<String> {
+            utility_clamped_with(program.as_os_str(), launcher)
+                .into_iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect()
+        };
+        let l = launcher.to_string_lossy().into_owned();
+        assert_eq!(
+            argv(Path::new("/bin/sh"), &launcher),
+            [l.as_str(), "-c", "utility", "/bin/sh"]
+        );
+        let missing = dir.join("no-such-tool");
+        for (program, why) in [
+            (Path::new("sh"), "a relative program"),
+            (missing.as_path(), "a missing program"),
+            (plain.as_path(), "a file with no execute bit"),
+            (&*dir, "a directory"),
+        ] {
+            assert_eq!(
+                argv(program, &launcher),
+                [program.to_string_lossy().into_owned()],
+                "{why} is started bare, so it fails as itself"
+            );
+        }
+        assert_eq!(
+            argv(Path::new("/bin/sh"), &dir.join("no-launcher")),
+            ["/bin/sh"],
+            "no launcher, no clamp"
+        );
+    }
+
+    /// The live contract: a program [`spawn_detached`] starts runs at utility (`ps` pri 20
+    /// or below), not the default band (31) the session lane's passes got bare.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_detached_program_starts_at_utility() {
+        let dir = crate::testdir::dir("atpkg-detached-band-");
+        let said = dir.join("pri");
+        let script = format!(
+            "/bin/ps -o pri= -p $$ > '{0}.tmp' && mv '{0}.tmp' '{0}'",
+            said.display()
+        );
+        spawn_detached("/bin/sh".as_ref(), &["-c".into(), script.into()], None).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let pri = loop {
+            if let Ok(text) = std::fs::read_to_string(&said) {
+                break text;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the detached program never ran"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let pri: i32 = pri
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("no priority in {pri:?}"));
+        assert!(
+            pri <= 20,
+            "a detached pass ran at pri {pri}, not utility (20)"
+        );
+    }
 
     /// Observed at creation, before any write or chmod: the temp is private from the
     /// instant it exists, and an existing one is refused.
@@ -1494,45 +1605,16 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    /// THE `.cmd` TWIN RENDERS NO PRELUDE: [`cmd_selfupdate_prelude`] answers the empty
-    /// string on every input — a verb list of any shape, an injection-shaped path — so
-    /// [`twin_prelude`]'s Windows arm is empty and the `.cmd` twin is the framed `.cmd`
-    /// shim byte for byte: no `%~1`, no `__selfupdate`, no `__landing`, one forward ending
-    /// its batch on its own line. The renderers are called directly, cfg-free, so this
-    /// pins the Windows bytes from the Unix suite.
+    /// THE `.cmd` TWIN RENDERS NO PRELUDE: [`twin_prelude`]'s Windows arm is empty, so the
+    /// `.cmd` twin is the framed `.cmd` shim byte for byte: no `%~1`, no `__selfupdate`, no
+    /// `__landing`, one forward ending its batch on its own line. The renderer is called
+    /// directly, cfg-free, so this pins the Windows bytes from the Unix suite.
     #[test]
     fn the_cmd_twin_renders_no_prelude_and_is_the_plain_framed_shim() {
         let prefix = Path::new("C:\\Program Files (x86)\\aterm\\pkg");
         let atpkg = Path::new("C:\\Program Files (x86)\\aterm\\app\\atpkg.exe");
         let target = Path::new(
             "C:\\Program Files (x86)\\aterm\\pkg\\store\\claude\\2026091601\\bin\\claude.exe",
-        );
-        for verbs in [
-            &[][..],
-            &["update"],
-            &["update", "upgrade", "install"],
-            &["up|date)"],
-            crate::selfupdate::verbs_of("claude"),
-            crate::selfupdate::verbs_of("codex"),
-        ] {
-            assert_eq!(
-                cmd_selfupdate_prelude("claude", prefix, atpkg, verbs),
-                "",
-                "{verbs:?}"
-            );
-        }
-        assert_eq!(
-            cmd_selfupdate_prelude(
-                "claude",
-                Path::new("C:\\x\\\"&calc.exe\""),
-                atpkg,
-                &["update"]
-            ),
-            ""
-        );
-        assert_eq!(
-            cmd_selfupdate_prelude("cla%ude", prefix, atpkg, &["update"]),
-            ""
         );
         if cfg!(windows) {
             assert_eq!(
@@ -1547,8 +1629,7 @@ mod tests {
             );
         }
         let env = crate::shim_env::ShimEnv::admit(&["DISABLE_AUTOUPDATER=1".to_string()]).unwrap();
-        let prelude = cmd_selfupdate_prelude("claude", prefix, atpkg, &["update"]);
-        let twin = cmd_shim_content_twin(target, &env, &prelude);
+        let twin = cmd_shim_content_twin(target, &env, "");
         assert_eq!(
             twin,
             cmd_shim_content_env(target, &env),
@@ -2318,6 +2399,11 @@ mod sh_shim_tests {
             sh_selfupdate_prelude("ay", prefix, atpkg, crate::selfupdate::verbs_of("ay")),
             "",
             "a program with no row has no verbs and no block"
+        );
+        assert_eq!(
+            sh_selfupdate_prelude("muse", prefix, atpkg, crate::selfupdate::verbs_of("muse")),
+            "",
+            "a rostered program with no updater has no block"
         );
         assert_eq!(
             sh_selfupdate_prelude("claude", prefix, atpkg, &["update", "up|date)"]),

@@ -1,22 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE ABOUT PROVENANCE MODEL: the `(key, value)` build-provenance rows the native
-//! Settings `/about` route paints, and the clipboard-ready block its COPY action puts on
-//! the pasteboard.
-//!
-//! ONE source ([`crate::build_info::about_fields`]) feeds the route's pixels, its
-//! semantics (`controls about` serializes that route's compiled semantic frame) and
-//! [`provenance_text`], so no observer can disagree with another.
-//!
-//! **The own-rendered About CARD that used to live here was DELETED on 2026-09-15.** It
-//! was an opaque floating [`crate::widget::DrawPrim`] panel with its own layout, painter,
-//! accessibility tree, pointer hit-test and selectable-text model. Nothing had been able
-//! to open it since the native whole-tab runtime landed (`72ac98091`, 2026-07-17): the
-//! `Overlay::About` variant and `App::about_enter` were `cfg(test)`-only, and shipping
-//! About became the native route. What was left was a retired surface still being
-//! compiled, painted and regression-tested — this round's cruft. The MODEL below stays
-//! because the native route reads it.
+//! The build-provenance rows the native Settings `/about` route paints, and the
+//! clipboard block its Copy action writes. One source
+//! ([`crate::build_info::about_fields`]) feeds the route's pixels, its semantics
+//! (`controls about`) and [`provenance_text`], so no observer can disagree with another.
 
 /// The build-provenance rows for the native Settings `/about` route.
 pub(crate) struct AboutState {
@@ -24,10 +12,9 @@ pub(crate) struct AboutState {
     rows: Vec<(&'static str, String)>,
 }
 
-/// The whole provenance block as clipboard-ready `key: value` lines — the SAME
-/// [`crate::build_info::about_fields`] rows the route paints, so what lands on the
-/// clipboard can never disagree with what is on screen. A free function of the build (no
-/// per-window state), so the copy path needs no [`AboutState`] borrow.
+/// The whole provenance block as clipboard-ready `key: value` lines, from the same
+/// [`crate::build_info::about_fields`] rows the route paints. A function of the build,
+/// so the copy path needs no [`AboutState`].
 #[must_use]
 pub(crate) fn provenance_text() -> String {
     let mut out = String::from("aterm\n");
@@ -55,8 +42,7 @@ impl AboutState {
         }
     }
 
-    /// Structured read projection for the native Settings `/about` route: the route's
-    /// rows, its semantics and the copy action all read these same provenance rows.
+    /// The provenance rows the route paints, its semantics and the copy action read.
     pub(crate) fn semantic_rows(&self) -> &[(&'static str, String)] {
         &self.rows
     }
@@ -74,8 +60,7 @@ impl AboutState {
 mod tests {
     use super::*;
 
-    /// The clipboard block and the route's rows come from the same source, so a build
-    /// row can never appear on screen and be missing from a paste (or the reverse).
+    /// Every row the route paints is in the clipboard block.
     #[test]
     fn provenance_text_carries_every_row_the_route_reads() {
         let state = AboutState::new();
@@ -89,8 +74,7 @@ mod tests {
         }
     }
 
-    /// The site row becomes an absolute URL whether or not the build spells a scheme,
-    /// and a build with no site row offers no link.
+    /// The site row becomes an absolute URL with or without a scheme; no row, no link.
     #[test]
     fn site_url_is_absolute_or_absent() {
         let mut state = AboutState::new();

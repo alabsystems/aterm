@@ -1,17 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! BUILD ONCE (2026-10-09): a release builds its universal bundle ONCE, under the
-//! number it reserved (`artifact.rs`), MEASURE judges those bytes and files its
-//! receipt under their executable's SHA-256, and the cut signs a byte copy of them —
-//! never a rebuild. These hold the release cache, the copy and the judges to that,
-//! against real files and real git: the shipped executable is the measured one (the
-//! digest recorded at the build is re-proved on the copy before anything signs it),
-//! bytes that changed after the build are never reused or signed, the key is what
-//! the bytes were built as, and every cut signs only its release's measured bundle.
-//! The release's own step machine — the resume that never rebuilds, the refusal that
-//! burns no number — is held in release_flow.rs, and the ledger half (a stale
-//! reservation refuses at the claim, nothing burned) in ledger_race.rs.
+//! Build once: a release builds its universal bundle once, under the number it reserved
+//! (`artifact.rs`); `verify release` judges those bytes and records the pass under R's tree
+//! with the executable's SHA-256; the cut signs a byte copy of them, never a rebuild. These
+//! tests hold the release cache, the copy and the judges to that against real files and real
+//! git. The release's step machine is tested in release_flow.rs, the ledger half in
+//! ledger_race.rs.
 
 use std::fs;
 use std::os::unix::fs::{PermissionsExt as _, symlink};
@@ -89,8 +84,7 @@ fn compilers() -> Compilers {
     }
 }
 
-/// A COMPLETE store entry for `identity`, as `artifact::build` leaves one: the bundle,
-/// the records beside it, and the record written last.
+/// A complete store entry for `identity`, as `artifact::build` leaves one, record last.
 fn complete_entry(store: &Path, identity: &Identity, exe: &[u8]) -> Complete {
     let key = artifact::key(identity, &compilers());
     let dir = store.join(&key);
@@ -129,11 +123,9 @@ fn complete_entry(store: &Path, identity: &Identity, exe: &[u8]) -> Complete {
     complete
 }
 
-/// THE SHIPPED EXECUTABLE IS THE MEASURED ONE. The digest the build recorded — the
-/// key MEASURE files its receipt under — is the digest of the cut's copy, re-proved
-/// before anything signs it, with every file, link and mode of the bundle; a copy
-/// whose executable or any other byte differs is refused, naming it, and a copy is
-/// only ever made into a fresh place.
+/// The cut's copy is re-proved against the build's recorded digest, with every file, link and
+/// mode, before anything signs it; a copy with any byte changed is refused, and a copy goes only
+/// into a fresh place.
 #[test]
 fn the_cut_signs_a_byte_copy_of_exactly_the_measured_bytes() {
     let dir = scratch();
@@ -172,7 +164,7 @@ fn the_cut_signs_a_byte_copy_of_exactly_the_measured_bytes() {
     let again = artifact::copy_bundle(&read, &read.app(&store), &staged).unwrap_err();
     assert!(again.contains("copied into a fresh place"), "{again}");
 
-    // NEGATIVE CONTROLS: other bytes are never the measured ones.
+    // Negative controls: other bytes are never the verified ones.
     fs::write(staged.join("Contents/Resources/Help.html"), "edited\n").unwrap();
     let err = artifact::prove(&complete, &staged).unwrap_err();
     assert!(
@@ -215,8 +207,8 @@ fn bytes_changed_in_the_store_after_the_build_are_never_reused_or_signed() {
     );
 }
 
-/// The record is written LAST: an entry without it is a build that did not finish —
-/// no build at all — and a record that names another key is no record of this one.
+/// The record is written last: an entry without it is no build, and a record naming another
+/// key is no record of this one.
 #[test]
 fn an_entry_without_its_record_is_no_build() {
     let dir = scratch();
@@ -232,9 +224,8 @@ fn an_entry_without_its_record_is_no_build() {
     assert!(err.contains("is the record of"), "{err}");
 }
 
-/// THE KEY IS WHAT THE BYTES WERE BUILT AS: the version, the reserved build number,
-/// the release commit and both compilers — any one of them another is another build,
-/// and the same inputs are the same key.
+/// The key is the version, reserved build number, release commit and both compilers: any one
+/// changed is another build.
 #[test]
 fn the_key_is_what_the_bytes_were_built_as() {
     let base = artifact::key(&identity(7), &compilers());
@@ -277,9 +268,8 @@ fn the_key_is_what_the_bytes_were_built_as() {
     assert_eq!(others.len(), 5);
 }
 
-/// The build's records ride to `dist/` with the bundle the cut signs, each replacing
-/// what `dist/` held under its name; one the build did not make is removed there,
-/// never left over from an earlier cut.
+/// The build's records replace what `dist/` held under their names; one the build did not make
+/// is removed there.
 #[test]
 fn the_records_beside_the_bundle_replace_dists() {
     let dir = scratch();
@@ -310,57 +300,57 @@ fn the_records_beside_the_bundle_replace_dists() {
     assert!(!dist.join("aterm.dSYM").exists());
 }
 
-fn receipt(head: &str, scope: &str, measured: &str, artifact: &str) -> String {
-    format!(
-        "{}\nhead {head}\nmode measure\nscope {scope}\nverdict PASS\nmerge-contract no\n\
-         measured {measured}\nartifact {artifact}\nwhen 1\n",
-        aterm_verify::receipt::MAGIC
-    )
-}
-
-/// THE ONE MEASURE JUDGE reads the receipt filed under the executable's digest, and
-/// says yes only to a whole-tree `measured yes` about exactly those bytes, judged by
-/// the release commit's own measuring suite — never another worktree's or commit's.
+/// The verified judge reads the record filed under the commit's tree and passes only one naming
+/// exactly these bytes.
 #[test]
-fn the_measure_judge_reads_the_receipt_filed_under_the_bytes() {
+fn the_verified_judge_reads_the_record_of_the_tree_on_these_bytes() {
     let dir = scratch();
-    let store = dir.path().join("receipts");
-    fs::create_dir_all(&store).unwrap();
+    let repo = dir.path().join("work");
+    fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q"]);
+    fs::write(repo.join("README"), "aterm\n").unwrap();
+    git(&repo, &["add", "README"]);
+    git(&repo, &["commit", "-q", "-m", "R"]);
+    let r = git(&repo, &["rev-parse", "HEAD"]);
+    // a commit with the same tree: the record is about the tree
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", "same tree"]);
+    let twin = git(&repo, &["rev-parse", "HEAD"]);
+    fs::write(repo.join("README"), "another tree\n").unwrap();
+    git(&repo, &["commit", "-q", "-am", "another tree"]);
+    let other = git(&repo, &["rev-parse", "HEAD"]);
+    let g = GitCli::new(&repo);
     let macho = "ab".repeat(32);
-    let r = "1".repeat(40);
-    let at = store.join(aterm_verify::receipt::measure_key(&macho));
-    let judge = || crate::gates::measured(&store, &macho, &r).unwrap();
+    let judge = |commit: &str| crate::gates::verified(&g, commit, &macho).unwrap();
 
-    let (yes, why) = judge();
-    assert!(!yes && why.contains("no MEASURE receipt"), "{why}");
-    for (text, why_not) in [
-        (
-            receipt(&r, "workspace", "yes", &"cd".repeat(32)),
-            "is about other bytes",
-        ),
-        (
-            receipt(&"2".repeat(40), "workspace", "yes", &macho),
-            "judged by the measuring suite of 222222222, not of the release's",
-        ),
-        (receipt(&r, "crate", "yes", &macho), "a narrowed run's"),
-        (receipt(&r, "workspace", "no", &macho), "`measured no`"),
-        (
-            "not a receipt".to_string(),
-            "not a receipt this cutter reads",
-        ),
-    ] {
-        fs::write(&at, text).unwrap();
-        let (yes, why) = judge();
-        assert!(!yes && why.contains(why_not), "{why}");
-    }
-    fs::write(&at, receipt(&r, "workspace", "yes", &macho)).unwrap();
-    let (yes, why) = judge();
-    assert!(yes && why.contains("MEASURED"), "{why}");
+    let (yes, why) = judge(&r);
+    assert!(
+        !yes && why.contains("no record that `verify release` passed"),
+        "{why}"
+    );
+    let at = crate::gates::record_verified(&g, &r, &"cd".repeat(32)).unwrap();
+    let (yes, why) = judge(&r);
+    assert!(
+        !yes && why.contains("on the executable cdcdcdcdc, not"),
+        "{why}"
+    );
+    fs::write(&at, "not a record").unwrap();
+    let (yes, why) = judge(&r);
+    assert!(
+        !yes && why.contains("not a record this cutter reads"),
+        "{why}"
+    );
+
+    crate::gates::record_verified(&g, &r, &macho).unwrap();
+    let (yes, why) = judge(&r);
+    assert!(yes && why.contains("PASSED"), "{why}");
+    assert!(judge(&twin).0, "the same tree is the same record");
+    let (yes, why) = judge(&other);
+    assert!(!yes && why.contains("no record"), "another tree: {why}");
 }
 
 /// A clone with a published commit S, its release journal reserving build `n` of
-/// [`VERSION`] as release commit C, the bundle built under that reservation COMPLETE
-/// in its release cache.
+/// [`VERSION`] as release commit C, and the bundle built under that reservation complete in
+/// its release cache.
 struct Clone {
     _dir: aterm_tempfile::TempDir,
     repo: PathBuf,
@@ -399,6 +389,12 @@ impl Clone {
                 macho_sha256: complete.macho_sha256.clone(),
                 build: reserved.build,
             }),
+            // Step 4 judged R's commit-only gates, the fixture guard and the censuses.
+            done: vec![
+                crate::release::COMMIT_GATES.to_string(),
+                crate::release::FIXTURE_GUARD.to_string(),
+                crate::release::CENSUS.to_string(),
+            ],
             ..crate::release::Journal::default()
         }
         .save(&Self::journal_path(&repo))
@@ -417,19 +413,13 @@ impl Clone {
             .join(crate::release::JOURNAL_FILE)
     }
 
-    fn measure(&self, macho: &str) {
-        let receipts = repo_receipts(&self.repo);
-        fs::create_dir_all(&receipts).unwrap();
-        fs::write(
-            receipts.join(aterm_verify::receipt::measure_key(macho)),
-            receipt(&self.source, "workspace", "yes", macho),
-        )
-        .unwrap();
+    fn verify(&self, macho: &str) {
+        crate::gates::record_verified(&GitCli::new(&self.repo), &self.source, macho).unwrap();
     }
 
     /// The bundle a cut whose prover is `toolchain` would sign.
-    fn bundle_for(&self, toolchain: &str) -> Result<crate::publish::MeasuredBundle, String> {
-        crate::publish::measured_release_bundle(
+    fn bundle_for(&self, toolchain: &str) -> Result<crate::publish::VerifiedBundle, String> {
+        crate::publish::verified_release_bundle(
             &GitCli::new(&self.repo),
             &self.repo,
             &self.source,
@@ -440,39 +430,34 @@ impl Clone {
     }
 
     /// The bundle a cut under the prover that compiled it would sign.
-    fn bundle(&self) -> Result<crate::publish::MeasuredBundle, String> {
+    fn bundle(&self) -> Result<crate::publish::VerifiedBundle, String> {
         self.bundle_for(&format!("/stage2/bin trustc {}", compilers().trustc))
     }
 }
 
-fn repo_receipts(repo: &Path) -> PathBuf {
-    repo.join(".git/aterm-verify/receipts")
-}
-
-/// A CUT SIGNS ONLY ITS RELEASE'S MEASURED BUNDLE, decided before its claim: the
-/// release journal of the published commit, its reservation, the bundle COMPLETE
-/// under it with its bytes re-proved and compiled by the cut's own prover, and a
-/// `measured yes` receipt filed under that bundle's executable by R's suite. Every refusal says nothing was claimed; the bundle it accepts
-/// carries the reservation the claim lands.
+/// A cut signs only its release's verified bundle, decided before its claim: the published
+/// commit's journal and reservation, the bundle complete under it, re-proved and compiled by the
+/// cut's own prover, and the `verify release` pass for R's tree on that executable. Every
+/// refusal says nothing was claimed.
 #[test]
-fn a_cut_signs_only_its_releases_measured_bundle() {
+fn a_cut_signs_only_its_releases_verified_bundle() {
     let c = Clone::new();
-    let err = c.bundle().err().expect("nothing measured");
+    let err = c.bundle().err().expect("nothing verified");
     assert!(
-        err.contains("NOTHING SHIPS UNMEASURED") && err.contains("Nothing was claimed"),
+        err.contains("NOTHING SHIPS UNVERIFIED") && err.contains("Nothing was claimed"),
         "{err}"
     );
 
-    // Measured: the bundle, its reservation and the judge's words.
-    c.measure(&c.complete.macho_sha256);
+    // Verified: the bundle, its reservation and the judge's words.
+    c.verify(&c.complete.macho_sha256);
     let bundle = c.bundle().unwrap();
     assert_eq!(bundle.reserved.build, 1_791_600_000);
     assert_eq!(bundle.reserved.commit, "e".repeat(40));
     assert_eq!(bundle.complete, c.complete);
-    assert!(bundle.line.contains("MEASURED"), "{}", bundle.line);
+    assert!(bundle.line.contains("PASSED"), "{}", bundle.line);
 
     // Another release's journal (another published commit): nothing to sign.
-    let other = crate::publish::measured_release_bundle(
+    let other = crate::publish::verified_release_bundle(
         &GitCli::new(&c.repo),
         &c.repo,
         &"0".repeat(40),
@@ -488,8 +473,7 @@ fn a_cut_signs_only_its_releases_measured_bundle() {
         "{other}"
     );
 
-    // ONE COMPILER: a cut whose prover is not the trustc that compiled the bytes would
-    // judge the tree's TRUST facts for another compiler than the one it ships — refused.
+    // One compiler: a prover other than the trustc that compiled the bytes is refused.
     let err = c
         .bundle_for(&format!("/other/bin trustc {}", "f".repeat(40)))
         .err()
@@ -501,17 +485,48 @@ fn a_cut_signs_only_its_releases_measured_bundle() {
         "{err}"
     );
 
-    // A journal whose bundle is not its reservation's (built under another number).
+    // What depends only on R's tree is read from the journal, never re-derived: a journal that
+    // never judged R's commit-only gates fails closed.
     let path = Clone::journal_path(&c.repo);
     let mut j = crate::release::Journal::load(&path).unwrap().unwrap();
     let kept = j.clone();
+    j.done.clear();
+    j.save(&path).unwrap();
+    let err = c.bundle().err().expect("R's commit-only gates not judged");
+    assert!(
+        err.contains("has not judged R's commit-only gates")
+            && err.contains(crate::release::COMMIT_GATES)
+            && err.contains("Nothing was claimed"),
+        "{err}"
+    );
+    // The guard and the censuses too: a whole-workspace `verify release` is no stand-in for the
+    // guard's own judge (a filter that matches no test is green there).
+    let mut j = kept.clone();
+    j.done.retain(|d| d == crate::release::COMMIT_GATES);
+    j.save(&path).unwrap();
+    let err = c
+        .bundle()
+        .err()
+        .expect("the guard and the censuses not judged");
+    assert!(
+        err.contains("the handoff fixture guard (`fixture-guard`)")
+            && err.contains("the L0 censuses (`census`)")
+            && !err.contains("R's commit-only gates")
+            && err.contains("Nothing was claimed"),
+        "{err}"
+    );
+    kept.save(&path).unwrap();
+    assert!(c.bundle().is_ok(), "the facts back: the bundle again");
+
+    // A journal whose bundle is not its reservation's (built under another number).
+    let mut j = crate::release::Journal::load(&path).unwrap().unwrap();
     j.reserved.as_mut().unwrap().build += 1;
     j.save(&path).unwrap();
     let err = c.bundle().err().expect("another reservation");
     assert!(err.contains("not the reserved build"), "{err}");
     kept.save(&path).unwrap();
 
-    // The store's bytes changed after the build (and after MEASURE): refused.
+    // The store's bytes changed after the build (and after `verify release`): refused.
     let store = artifact::store(&c.repo).unwrap();
     fs::write(
         c.complete.app(&store).join("Contents/Resources/Help.html"),
@@ -525,9 +540,8 @@ fn a_cut_signs_only_its_releases_measured_bundle() {
     );
 }
 
-/// THE REMOVED SURFACE STAYS REMOVED: the cut has no rebuild step to journal (its
-/// steps sign), a journal of the rebuilding format is another cutter's, and the
-/// flags that steered a rebuild or skipped its paint smoke are no flags at all.
+/// The cut has no build of its own: its steps sign, the rebuild flags are unknown, and a journal
+/// that has not signed must name the measured bytes it will sign.
 #[test]
 fn the_cut_has_no_build_of_its_own() {
     assert_eq!(
@@ -562,7 +576,7 @@ fn the_cut_has_no_build_of_its_own() {
         done: vec!["lock".to_string()],
     };
     let err = j.save(&path).unwrap_err().to_string();
-    assert!(err.contains("names no measured bundle"), "{err}");
+    assert!(err.contains("names no verified bundle"), "{err}");
     j.artifact = Some("aa".repeat(32));
     j.macho_sha256 = Some("bb".repeat(32));
     j.save(&path).unwrap();
@@ -573,10 +587,8 @@ fn the_cut_has_no_build_of_its_own() {
     j.save(&path).unwrap();
 }
 
-/// BETWEEN RELEASES, `ship build` builds HEAD: with no release in progress its bundle
-/// is HEAD's, read from HEAD's objects — the workspace version, and a provisional
-/// number `max(HEAD's ledger tail + 1, now)`, claimed nowhere — the one bundle a
-/// MEASURE run outside a release judges.
+/// Between releases `ship build` builds HEAD from HEAD's objects: the workspace version and a
+/// provisional number `max(ledger tail + 1, now)`, claimed nowhere.
 #[test]
 fn between_releases_ship_build_builds_head_under_a_provisional_number() {
     let dir = scratch();

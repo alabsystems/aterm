@@ -1,1 +1,5 @@
-jetbrains-mono.ttf — JetBrains Mono, SIL Open Font License 1.1; bundled solely as a deterministic test fixture for ligature/shaping tests.
+- `jetbrains-mono.ttf`: JetBrains Mono, SIL Open Font License 1.1 (`OFL.txt`). A fixed font that keeps shaping and rasterization tests deterministic.
+- `colr_1.ttf`, `colr_1_variable.ttf`: the COLRv1 test fonts from googlefonts/color-fonts, as ttf-parser 0.25.1 ships them in its `tests/fonts`; Apache License 2.0 (`colr_1.LICENSE.txt`). Inputs to the font oracle (`tests/font_oracle.rs`) and the COLR rasterizer's tests, since no macOS system face carries COLR; with them those tests run on every host.
+- `NotoSansSunuwar-Regular.otf`: Noto Sans Sunuwar 1.000, SIL Open Font License 1.1 (`NotoSansSunuwar.OFL.txt`), unmodified. The one committed CFF outline face: the font oracle records it so every host replays CFF charstrings (TF.3 holds aterm-font's CFF reader to it), not only a Mac with its system CFF faces.
+- `font-oracle/`: the font oracle's recorded answers; `tests/font_oracle.rs` says what each file holds and how to re-record them.
+- `procedural_*_corpus.txt`: golden coverage hashes for `tests/procedural_orthogonal_regression.rs`, which says how to re-bless them.

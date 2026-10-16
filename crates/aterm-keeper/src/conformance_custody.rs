@@ -1,65 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 of the PTY keeper's two machines
-//! (`docs/DESIGN-pty-keeper-2026-09-26.md` §6.4; a unit-test module, not an
-//! integration test, so the `#[refines]` anchors it checks are compiled in:
-//! `cfg(test)` turns them on, an integration test's build of the library does
-//! not): the REAL `KeeperCore` and
-//! `RelaunchBrake` against `PtyKeeperCustody` and `KeeperRelaunchBrake`
-//! (`aterm_spec::derive`), and the §5.4 classifier over real wait statuses.
+//! Tier-1 of the PTY keeper's machines (`docs/DESIGN-pty-keeper-2026-09-26.md` §6.4): the real
+//! `KeeperCore` and `RelaunchBrake` against `PtyKeeperCustody`, `KeeperRelaunchBrake` and
+//! `KeeperDeathJudgement` (`aterm_spec::derive`), and the §5.4 classifier over real wait
+//! statuses. A unit-test module, not an integration test, so `cfg(test)` compiles in the
+//! `#[refines]` anchors it checks.
 //!
-//! CUSTODY. A runner plays the processes around the keeper — the window `w`,
-//! its update successor `s`, the window `r` the keeper relaunches — and
-//! drives the real core with exactly the events the server would feed it:
-//! accept, HELLO, REGISTER (with the descriptor's rdev), RELEASE, BYE,
-//! PENDING, EOF, the kernel's exit status, and the clock. The world the core
-//! asks about (the holder scan, a shell's and a pid's liveness) is answered
-//! from the model state the runner is in. Every bounded sequence of those
-//! events is explored; after each, the keeper's own state (`k_holds_*`,
-//! `orphan_*`, `k_live`, the relaunch count) is projected and the step is
-//! checked as a transition the committed model admits — a clock tick that
-//! relaunched is checked as `Relaunch` followed by one `Offer` per master the
-//! relaunched window's HELLO was offered. Every reached state satisfies every
-//! invariant. Wherever the model FORBIDS a relaunch or an offer, the real
-//! core made none; wherever it ALLOWS one after a tick, the core made it.
+//! Custody: a runner plays the window `w`, its update successor `s` and the relaunched window
+//! `r`, feeds the real core the events the server would (accept, HELLO, REGISTER, RELEASE, BYE,
+//! PENDING, EOF, exit status, the clock), and answers the core's world queries from the model
+//! state. Every bounded event sequence is explored; each step's projection of the keeper's
+//! state must be a transition the model admits (a relaunching tick is `Relaunch` plus one
+//! `Offer` per master the relaunched HELLO was offered) and satisfy every invariant. Where the
+//! model forbids a relaunch or an offer the core made none, and where it allows one after a tick
+//! the core made it.
 //!
-//! The window's `LinkDrops` is driven both as the reconnect that registers
-//! again everything the window holds, and with a tab closed while the link is
-//! down (`LinkDrops` then `CloseTabA`/`B`): the reconnect registers only the
-//! open tabs, and the closed tab's RELEASE arrives on a connection that never
-//! claimed it, whose record only the dropped link of the same process claims.
-//!
-//! The update's successor is driven both ways the model's one `Commit` covers:
-//! one that registers at its Commit, and one that takes no part in the keeper
-//! (its keeper off, a build before the keeper), which never says HELLO, so its
-//! quit reaches the keeper only as its `exit(0)`. The window names its crash
-//! marker in every HELLO, as the product's does, and it is gone after the
-//! window's `exit(0)`: the Commit `_exit(0)`s through `clean_exit_now`, so a
-//! successor that crashed first (`SuccessorCrashesFirst`) leaves the keeper a
-//! Commit that reads, to §5.4 row 3's cross-check alone, as a quit.
-//!
-//! NEGATIVE CONTROL: the same real steps against `Buggy = 1` are rejected at
-//! the mutants' sites — a release the buggy keeper forgets, an update's exit
-//! the buggy keeper orphans, an offer that moves the copy, a BYE read as a
-//! crash, a successor's quit read as one, a Commit read as a quit when its
-//! successor died first.
-//!
-//! BRAKE. Every schedule of `KeeperRelaunchBrake` is replayed on the real
-//! `RelaunchBrake`; the buggy model rejects the real decisions at its mutants.
-//!
-//! CLASSIFIER. Real children end with `exit(0)`, `exit(74)`, `exit(101)`,
-//! `SIGKILL` and `SIGTERM`; the keeper's own exit watch reads each status and
-//! the real core judges the window that ended so. (SIGABRT and SIGSEGV are
-//! judged from their encodings only: AGENTS.md.)
-//!
-//! JUDGEMENT. Every schedule of `KeeperDeathJudgement` — the window's build
-//! and end, the evidence degrading, its shell's own end — is driven on the
-//! real core: HELLO naming the crash marker, REGISTER, BYE, the EOF, the
-//! kernel's status (or none, past the grace), the classifier reading the
-//! marker, the orphan's leader watched and its exit pruning the record. The
-//! buggy model (the classifier without the marker, the marker trusted alone,
-//! the orphan never pruned) rejects real steps at each mutant's site.
+//! Each test's negative control: the buggy model rejects the same real steps at its mutants'
+//! sites.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -162,11 +120,9 @@ struct Rig {
     /// be delivered (`KeeperHonoursBye`).
     quit_pending: bool,
     next_pid: u32,
-    /// The committed successor takes no part in the keeper (its keeper off, a
-    /// build before the keeper): it never says HELLO, registers nothing and
-    /// releases nothing. The model's `Commit` and `SuccessorQuits` are the
-    /// same steps for it as for one that registers; the runner drives both
-    /// (`CommitQuiet`, [`QUIET_COMMIT`]).
+    /// The committed successor takes no part in the keeper (its keeper off, or a pre-keeper
+    /// build): it never says HELLO, registers or releases. The model's `Commit` and
+    /// `SuccessorQuits` cover it too; the runner drives both kinds ([`QUIET_COMMIT`]).
     s_quiet: bool,
 }
 
@@ -174,12 +130,10 @@ struct Rig {
 /// the keeper: the model's `Commit`.
 const QUIET_COMMIT: &str = "CommitQuiet";
 
-/// The runner's own moves for a tab the window closes while its link is down:
-/// the model's `LinkDrops`, then its `CloseTabA` (`B`). The keeper reads the
-/// link's EOF while the window lives; the window closes the tab; its link
-/// reconnects and registers again only what the window still holds, then
-/// sends the closed tab's RELEASE — on a connection that never claimed that
-/// master, whose record only the DROPPED link of the same process claims.
+/// The runner's moves for a tab closed while the window's link is down: the model's `LinkDrops`,
+/// then `CloseTabA` (`B`). The link reconnects and registers again only the open tabs, then
+/// sends the closed tab's RELEASE on a connection that never claimed that master: only the
+/// dropped link of the same process claims its record.
 const LINK_DROPS_CLOSE_TAB_A: &str = "LinkDropsCloseTabA";
 const LINK_DROPS_CLOSE_TAB_B: &str = "LinkDropsCloseTabB";
 
@@ -658,11 +612,10 @@ fn env_move(model: &Model, rig: &mut Rig, mv: &'static str) -> Vec<Step> {
             }
         }
         "RelaunchedLinkDrops" => {
-            // The relaunched window's link reads EOF before it registered its
-            // offers, and reconnects (CAP_LINK). Every record offered on the
-            // dropped link is an orphan again, its leader watched again;
-            // the reconnected link is offered
-            // nothing, since the window still holds each descriptor.
+            // The relaunched window's link reads EOF before it registered its offers, and
+            // reconnects (CAP_LINK): every record offered on the dropped link is an orphan again,
+            // its leader watched again; the new link is offered nothing, since the window still
+            // holds each descriptor.
             let now = rig.now;
             let pids = rig.pids.clone();
             if let (Some(core), Some(conn)) = (rig.core.as_mut(), rig.conn.remove("r")) {
@@ -905,10 +858,8 @@ fn explore(
     }
 }
 
-/// The real keeper refines `PtyKeeperCustody` on every bounded event
-/// sequence, and between them the sequences fire every action of the
-/// committed model. The negative control: the buggy model rejects real steps
-/// at each mutant's site.
+/// Between them, the bounded event sequences fire every action of the model. Negative control:
+/// the buggy model rejects real steps at each mutant's site.
 #[test]
 fn the_real_keeper_conforms_to_the_custody_model() {
     let model = pty_keeper_custody_model();
@@ -933,12 +884,10 @@ fn the_real_keeper_conforms_to_the_custody_model() {
         "the exploration reaches the states it exists for: {}",
         out.reached.len()
     );
-    // What the exploration does not reach, it cannot reach: every model state
-    // it misses is one inside a relaunch's HELLO — the relaunched window alive
-    // with an orphan the keeper had not yet offered it, or a keeper that died
-    // between the relaunch and the HELLO. The real keeper offers every orphan
-    // in the HELLO's one answer, so those interleavings of the model's
-    // separate `Relaunch`/`OfferA`/`OfferB` steps never exist in it.
+    // Every model state the exploration misses is inside a relaunch's HELLO (the relaunched
+    // window alive with an orphan not yet offered, or a keeper that died between the relaunch
+    // and the HELLO): the real keeper offers every orphan in the HELLO's one answer, so those
+    // interleavings of the model's separate `Relaunch`/`OfferA`/`OfferB` steps never exist.
     let mut all: BTreeSet<State> = BTreeSet::from([model.init_state()]);
     let mut queue = vec![model.init_state()];
     while let Some(st) = queue.pop() {
@@ -952,9 +901,8 @@ fn the_real_keeper_conforms_to_the_custody_model() {
     }
     let missing: Vec<&State> = all.iter().filter(|s| !out.reached.contains(*s)).collect();
     for m in &missing {
-        // An orphan the relaunched window still HOLDS is not inside a HELLO:
-        // it is the return of an offer whose link dropped, which the real
-        // keeper must reach.
+        // An orphan the relaunched window still holds is not inside a HELLO: it is the return
+        // of an offer whose link dropped, which the real keeper must reach.
         let unoffered = |x: &str| {
             m[format!("orphan_{x}").as_str()] == 1 && m[format!("r_holds_{x}").as_str()] == 0
         };
@@ -973,7 +921,7 @@ fn the_real_keeper_conforms_to_the_custody_model() {
         out.reached.len()
     );
 
-    // NEGATIVE CONTROL: the buggy machine rejects real steps at each mutant.
+    // Negative control: the buggy machine rejects real steps at each mutant.
     let buggy = interp::with_buggy(&model, 1);
     let mut rejected: BTreeMap<&str, usize> = BTreeMap::new();
     for (before, action, after) in &out.steps {
@@ -1020,8 +968,8 @@ fn the_real_keeper_conforms_to_the_custody_model() {
     }
 }
 
-/// The anchors the conformance exercises are compiled in and were ENTERED —
-/// the refinements name real functions that ran, not decoration.
+/// The anchors the conformance exercises are compiled in and were entered: the refinements name
+/// real functions that ran.
 #[test]
 fn the_custody_anchors_are_live() {
     assert!(
@@ -1177,8 +1125,8 @@ fn the_real_brake_conforms_to_the_brake_model() {
         all,
         "the real brake reaches every model state"
     );
-    // NEGATIVE CONTROL: the buggy brake's reader relaunches after a quit and
-    // past the streak; the real steps are rejected there.
+    // Negative control: the buggy brake's reader relaunches after a quit and past the streak;
+    // the real steps are rejected there.
     let buggy = interp::with_buggy(&model, 1);
     let rejected = steps
         .iter()
@@ -1314,16 +1262,15 @@ fn the_classifier_judges_real_ends() {
     }
 }
 
-// ------------------------------------------------ the death judgement (P3's limits)
+// ------------------------------------------------ the death judgement
 
 /// The window whose end `KeeperDeathJudgement` judges, and when.
 const JUDGED_WINDOW: u32 = 4_343;
 const JUDGE_AT: u64 = 1 + crate::core::DEATH_GRACE_MS;
 
-/// The world a judgement asks about, answered from a `KeeperDeathJudgement`
-/// state: master `A`'s shell lives while `shell_live`; the window is dead once
-/// it ended; its marker says what `marker` says (and HELD while the window
-/// lives, `alive`).
+/// The world a judgement asks about, from a `KeeperDeathJudgement` state: master `A`'s shell
+/// lives while `shell_live`; the window's marker is held while it lives (`alive`), then what
+/// `marker` says.
 struct JudgeWorld<'a> {
     st: &'a State,
     alive: bool,
@@ -1366,15 +1313,15 @@ fn wait_status(model_status: i64) -> Option<i32> {
     }
 }
 
-/// One real step of the judgement runner: the core after it, and the state it
-/// projects to. `watching`: the core asked to watch master `A`'s shell.
+/// The judgement runner's real side: the core, and whether it asked to watch master `A`'s
+/// shell.
 #[derive(Clone)]
 struct JudgeRig {
     core: KeeperCore,
     watching: bool,
 }
 
-/// Drive the REAL keeper through `action` from `st`, and project.
+/// Drive the real keeper through `action` from `st`, and project.
 fn judge_step(model: &Model, rig: &JudgeRig, st: &State, action: &str) -> (JudgeRig, State) {
     let mut real = rig.clone();
     // The environment's own moves change what the world is; the model says
@@ -1390,9 +1337,8 @@ fn judge_step(model: &Model, rig: &JudgeRig, st: &State, action: &str) -> (Judge
             next = env_next()
         }
         "QuitWithBye" | "QuitByeLost" | "Killed" | "PanicExit" => {
-            // The window's life, on the real core: connect, HELLO (naming its
-            // marker, which the keeper finds held), REGISTER; then its end —
-            // the BYE if one arrives, and the connection's EOF.
+            // The window's life on the real core: connect, HELLO naming its (held) marker,
+            // REGISTER; then the BYE if one arrives, and the EOF.
             next = env_next();
             let core = &mut real.core;
             let mut alive = JudgeWorld { st, alive: true };
@@ -1469,13 +1415,9 @@ fn judge_step(model: &Model, rig: &JudgeRig, st: &State, action: &str) -> (Judge
     (real, next)
 }
 
-/// Tier-1 of `KeeperDeathJudgement`: every schedule of the machine, driven on
-/// the REAL `KeeperCore` — HELLO naming the marker, REGISTER, BYE, the EOF, the
-/// kernel's status (or none, past the grace), the classifier reading the
-/// marker, the orphan's leader watched and its exit pruning the record — each
-/// real step checked as a transition the committed model admits, and every
-/// model state reached. NEGATIVE CONTROL: the buggy model (the classifier
-/// without the marker, the marker trusted alone, the orphan never pruned)
+/// Tier-1 of `KeeperDeathJudgement`: every schedule driven on the real `KeeperCore`, each step a
+/// transition the model admits and every model state reached. Negative control: the buggy model
+/// (the classifier without the marker, the marker trusted alone, the orphan never pruned)
 /// rejects real steps at each mutant's site.
 #[test]
 fn the_real_keeper_conforms_to_the_death_judgement_model() {
@@ -1516,7 +1458,7 @@ fn the_real_keeper_conforms_to_the_death_judgement_model() {
         all,
         "the real keeper reaches every model state"
     );
-    // NEGATIVE CONTROL, per mutant site.
+    // Negative control, per mutant site.
     let buggy = interp::with_buggy(&model, 1);
     let rejected = |pick: &dyn Fn(&State, &str) -> bool| {
         steps

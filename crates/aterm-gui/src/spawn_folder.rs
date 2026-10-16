@@ -18,10 +18,18 @@
 //! The check runs on a thread of its own and is waited for at most
 //! [`CHECK_BUDGET`]: a folder on a network volume that stopped answering
 //! must not stall the event loop or the launch. A check that has not answered
-//! by then keeps the folder, and the child's `chdir` decides, inside the PTY
-//! spawn's own time limit. `stat` and `access(X_OK)` inside a macOS protected
-//! folder answer without asking (docs/DESIGN-macos-tcc-prompts-2026-08-30.md
-//! §1.5), and a privacy denial (`EPERM`) keeps the folder too.
+//! by then keeps a folder on a local volume (a starved CPU can hold a local
+//! disk that long), and the child's `chdir` decides. On a volume that is NOT
+//! local — SMB, NFS, AFP, WebDAV, a user-space file system — the same silence
+//! is [`Fault::Unresponsive`] and the shell starts in the home folder: the
+//! child would `chdir` there before `exec`, where a hung mount holds it past
+//! the PTY spawn's exec-status wait (10 s, then the reap) — on the event loop
+//! for a new window or a restore; a new tab or split spawns on the spawner
+//! thread (`tab_spawn`). Which volume holds the folder is read from the kernel's mount
+//! table, which asks no file system ([`remote_volume`]). `stat` and
+//! `access(X_OK)` inside a macOS protected folder answer without asking
+//! (docs/DESIGN-macos-tcc-prompts-2026-08-30.md §1.5), and a privacy denial
+//! (`EPERM`) keeps the folder too.
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -36,11 +44,15 @@ pub(crate) enum Fault {
     Missing,
     /// The folder is there, and this user may not enter it.
     Shut,
+    /// The folder's check did not answer in time, and the folder is on a
+    /// volume that is not local: a mount that stopped answering. Only a
+    /// spawn judges this ([`start_fault`]); [`folder_fault`] never says it.
+    Unresponsive,
 }
 
 impl Fault {
-    /// Both faults, in the order their rows are posted.
-    pub(crate) const ALL: [Self; 2] = [Self::Missing, Self::Shut];
+    /// Every fault, in the order their rows are posted.
+    pub(crate) const ALL: [Self; 3] = [Self::Missing, Self::Shut, Self::Unresponsive];
 }
 
 /// How long a spawn waits for the folder check. A local folder answers in
@@ -49,8 +61,9 @@ impl Fault {
 const CHECK_BUDGET: Duration = Duration::from_millis(250);
 
 /// The most checks left waiting on a hung volume at once: past this, a spawn
-/// does not start another and keeps its folder, so a mount that stopped
-/// answering costs a bounded number of parked threads.
+/// does not start another and judges its folder as one that did not answer
+/// ([`start_fault`]), so a mount that stopped answering costs a bounded number
+/// of parked threads.
 const CHECKS_IN_FLIGHT_MAX: usize = 4;
 
 static CHECKS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
@@ -62,7 +75,7 @@ static CHECKS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 pub(crate) fn folder_fault(dir: &str) -> Option<Fault> {
     #[cfg(unix)]
     {
-        within(&CHECKS_IN_FLIGHT, CHECK_BUDGET, dir, fault_now)
+        within(&CHECKS_IN_FLIGHT, CHECK_BUDGET, dir, fault_now).flatten()
     }
     #[cfg(not(unix))]
     {
@@ -71,18 +84,54 @@ pub(crate) fn folder_fault(dir: &str) -> Option<Fault> {
     }
 }
 
-/// Run `check(dir)` on a thread of its own and wait at most `budget` for it.
-/// `None` when it did not answer in time, when [`CHECKS_IN_FLIGHT_MAX`] checks
-/// counted in `in_flight` are already waiting, or when no thread could be
-/// started. Every spawn counts in [`CHECKS_IN_FLIGHT`]; a test counts in its
-/// own, so checks other tests leave waiting cannot fill its cap.
+/// Why a fresh shell cannot start in `dir`: [`folder_fault`], except that a
+/// check that did not answer in time — or was not started, the cap being
+/// reached — is [`Fault::Unresponsive`] for a folder on a volume that is not
+/// local ([`remote_volume`]). A folder on a local volume still stands.
+pub(crate) fn start_fault(dir: &str) -> Option<Fault> {
+    #[cfg(unix)]
+    {
+        start_fault_in(
+            &CHECKS_IN_FLIGHT,
+            CHECK_BUDGET,
+            dir,
+            fault_now,
+            remote_volume,
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        None
+    }
+}
+
+/// [`start_fault`] over its check, its cap and its mount table.
+#[cfg(unix)]
+fn start_fault_in(
+    in_flight: &'static AtomicUsize,
+    budget: Duration,
+    dir: &str,
+    check: fn(&str) -> Option<Fault>,
+    remote: impl FnOnce(&str) -> bool,
+) -> Option<Fault> {
+    within(in_flight, budget, dir, check)
+        .unwrap_or_else(|| remote(dir).then_some(Fault::Unresponsive))
+}
+
+/// Run `check(dir)` on a thread of its own and wait at most `budget` for it:
+/// `Some` of its answer, or `None` when it did not answer in time, when
+/// [`CHECKS_IN_FLIGHT_MAX`] checks counted in `in_flight` are already waiting,
+/// or when no thread could be started. Every spawn counts in
+/// [`CHECKS_IN_FLIGHT`]; a test counts in its own, so checks other tests leave
+/// waiting cannot fill its cap.
 #[cfg(unix)]
 fn within(
     in_flight: &'static AtomicUsize,
     budget: Duration,
     dir: &str,
     check: fn(&str) -> Option<Fault>,
-) -> Option<Fault> {
+) -> Option<Option<Fault>> {
     if in_flight.fetch_add(1, Ordering::AcqRel) >= CHECKS_IN_FLIGHT_MAX {
         in_flight.fetch_sub(1, Ordering::AcqRel);
         return None;
@@ -92,7 +141,8 @@ fn within(
     let spawned = std::thread::Builder::new()
         .name("aterm-folder-check".to_string())
         .spawn(move || {
-            // The event loop is blocked on this answer: rank with it.
+            // The spawn that asked waits on this answer, on the event loop or
+            // the spawner thread a person watches: rank with it.
             crate::qos::set_self(crate::qos::Role::Interactive);
             let fault = check(&owned);
             in_flight.fetch_sub(1, Ordering::AcqRel);
@@ -102,7 +152,7 @@ fn within(
         in_flight.fetch_sub(1, Ordering::AcqRel);
         return None;
     }
-    rx.recv_timeout(budget).unwrap_or(None)
+    rx.recv_timeout(budget).ok()
 }
 
 /// [`folder_fault`] without the time limit: `stat`, then `access(X_OK)` for a
@@ -130,6 +180,91 @@ fn fault_now(dir: &str) -> Option<Fault> {
     judged(&std::io::Error::last_os_error())
 }
 
+/// Whether `dir` is on a volume that is not local, by the kernel's mount
+/// table ([`mount_table`]) — the one question about a folder whose check hangs
+/// that cannot hang too.
+#[cfg(unix)]
+fn remote_volume(dir: &str) -> bool {
+    let table = mount_table();
+    on_remote_mount(dir, table.iter().map(|(on, local)| (on.as_path(), *local)))
+}
+
+/// PURE: whether the mount that holds `dir` — the longest mount point that is
+/// a whole-component prefix of it, as written — is not local. A symlink into a
+/// network volume is judged by the folder it is in (resolving it would ask the
+/// volume), and a path no mount holds is local.
+#[cfg(unix)]
+fn on_remote_mount<'a>(dir: &str, mounts: impl IntoIterator<Item = (&'a Path, bool)>) -> bool {
+    let dir = Path::new(dir);
+    mounts
+        .into_iter()
+        .filter(|(on, _)| dir.starts_with(on))
+        .max_by_key(|(on, _)| on.components().count())
+        .is_some_and(|(_, local)| !local)
+}
+
+// `<sys/mount.h>`: `int getfsstat(struct statfs *buf, int bufsize, int mode)`,
+// answering the number of mounts (written, or with a null `buf` mounted), or
+// -1. Declared here because `crates/aterm-libc` is generated and does not carry
+// it; Intel spells the 64-bit-inode `statfs` it fills (`libc::statfs`) as
+// `getfsstat$INODE64`, as `libc::statfs` itself is `statfs$INODE64` there.
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    #[cfg_attr(target_arch = "x86_64", link_name = "getfsstat$INODE64")]
+    fn getfsstat(buf: *mut libc::statfs, bufsize: libc::c_int, mode: libc::c_int) -> libc::c_int;
+}
+
+/// Every mount point, and whether its volume is local (`MNT_LOCAL`), as the
+/// kernel last recorded them: `MNT_NOWAIT` asks no file system to refresh its
+/// numbers, so a hung mount is listed without being touched. Empty when the
+/// table cannot be read, which judges every folder local.
+#[cfg(target_os = "macos")]
+fn mount_table() -> Vec<(std::path::PathBuf, bool)> {
+    use std::os::unix::ffi::OsStringExt as _;
+    /// `<sys/mount.h>`.
+    const MNT_NOWAIT: libc::c_int = 2;
+    const MNT_LOCAL: u32 = 0x0000_1000;
+    // SAFETY: a null buffer asks only for the count; nothing is written.
+    let Ok(count) = usize::try_from(unsafe { getfsstat(std::ptr::null_mut(), 0, MNT_NOWAIT) })
+    else {
+        return Vec::new();
+    };
+    // SAFETY: `statfs` is integers and arrays of them: all-zero is a value.
+    let blank: libc::statfs = unsafe { std::mem::zeroed() };
+    // Room for a few mounted between the two calls; one mounted past that is
+    // left out, and a folder on it is judged local.
+    let mut table = vec![blank; count + 4];
+    let Ok(bytes) = libc::c_int::try_from(std::mem::size_of_val(table.as_slice())) else {
+        return Vec::new();
+    };
+    // SAFETY: `table` is `bytes` writable bytes of whole `statfs` records, and
+    // getfsstat writes at most that many, answering how many it wrote.
+    let written = unsafe { getfsstat(table.as_mut_ptr(), bytes, MNT_NOWAIT) };
+    let Ok(written) = usize::try_from(written) else {
+        return Vec::new();
+    };
+    table
+        .iter()
+        .take(written)
+        .map(|record| {
+            // The kernel NUL-terminates the mount point inside its array.
+            let on = record.f_mntonname.iter().take_while(|&&c| c != 0);
+            let on: Vec<u8> = on.map(|&c| c.to_ne_bytes()[0]).collect();
+            (
+                std::ffi::OsString::from_vec(on).into(),
+                record.f_flags & MNT_LOCAL != 0,
+            )
+        })
+        .collect()
+}
+
+/// No mount table is read off macOS: every folder is judged local, and a check
+/// that does not answer keeps its folder, as it always did there.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn mount_table() -> Vec<(std::path::PathBuf, bool)> {
+    Vec::new()
+}
+
 /// Where a fresh shell starts: `cwd` for the PTY (`None`: the PTY's own
 /// default), and the folder it was asked for with why it could not start
 /// there, when the home folder stands in for it.
@@ -149,6 +284,7 @@ impl StartFolder {
                 match fault {
                     Fault::Missing => "was not found",
                     Fault::Shut => "could not be opened",
+                    Fault::Unresponsive => "did not answer",
                 }
             );
             note(dir, fault);
@@ -159,14 +295,20 @@ impl StartFolder {
 /// [`start_folder_in`] against the filesystem and the person's home folder.
 pub(crate) fn start_folder(wanted: Option<&str>) -> StartFolder {
     let home = aterm_types::dirs::home_dir();
-    start_folder_in(wanted, home.as_deref(), folder_fault)
+    start_folder_in(wanted, home.as_deref(), start_fault)
 }
 
 /// Where a shell asked to start in `wanted` starts, PURE over `fault`: the
 /// folder itself when a shell can start there; else `home`, naming the folder
 /// and why. An empty `wanted` asks for nothing. With no home folder to go to
 /// the request stands as it was (the child's `chdir` fails and the shell stays
-/// in aterm's folder), and nothing claims the home folder.
+/// in aterm's folder), and nothing claims the home folder — except for a
+/// folder that did not answer, which no `chdir` is handed: the PTY's own
+/// default stands instead. (For an aterm started from `/` that default is
+/// `$HOME`, so a network home that stopped answering still holds the child,
+/// as it holds every shell that asks for no folder: a new tab or split waits
+/// on the spawner thread (`tab_spawn`), a new window or a restore on the event
+/// loop.)
 pub(crate) fn start_folder_in(
     wanted: Option<&str>,
     home: Option<&Path>,
@@ -185,13 +327,20 @@ pub(crate) fn start_folder_in(
     let Some(why) = fault(dir) else {
         return stands;
     };
+    // The folder that failed IS the home folder (a pane at `~` on a network
+    // home): asking again would only fail again — for one that did not answer,
+    // after a second wait.
     match home
         .and_then(Path::to_str)
-        .filter(|home| fault(home).is_none())
+        .filter(|home| *home != dir && fault(home).is_none())
     {
         Some(home) => StartFolder {
             cwd: Some(home.to_owned()),
             fell_back: Some((dir.to_owned(), why)),
+        },
+        None if why == Fault::Unresponsive => StartFolder {
+            cwd: None,
+            fell_back: None,
         },
         None => stands,
     }
@@ -209,6 +358,33 @@ pub(crate) fn inherited(reported: String, held: impl FnOnce() -> bool) -> Option
         inherited_in(reported, held, folder_fault)
     } else {
         Some(reported)
+    }
+}
+
+/// What [`inherited`] judges a pane's folder by, read where the pane is (the
+/// event loop: the reported folder and one `tcgetpgrp`), so the folder check
+/// itself, up to [`CHECK_BUDGET`] for a held pane, can run where a spawn may
+/// wait (the spawner thread, `tab_spawn`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PaneFolder {
+    /// The folder the pane reported.
+    pub(crate) reported: String,
+    /// Whether a program other than the pane's shell held the pane then.
+    pub(crate) held: bool,
+}
+
+impl PaneFolder {
+    /// The folder a spawn takes from the pane ([`inherited`]).
+    pub(crate) fn resolve(self) -> Option<String> {
+        let Self { reported, held } = self;
+        inherited(reported, || held)
+    }
+
+    /// The folder the first of `panes`, in order, gives a spawn
+    /// ([`Self::resolve`]): a pane whose folder is not taken hands over to the
+    /// next, as the caller would have asked it next.
+    pub(crate) fn first_taken(panes: impl IntoIterator<Item = Self>) -> Option<String> {
+        panes.into_iter().find_map(Self::resolve)
     }
 }
 
@@ -281,6 +457,7 @@ impl Named {
 pub(crate) struct RowFolders {
     missing: Named,
     shut: Named,
+    unresponsive: Named,
 }
 
 impl RowFolders {
@@ -288,6 +465,7 @@ impl RowFolders {
         match fault {
             Fault::Missing => &mut self.missing,
             Fault::Shut => &mut self.shut,
+            Fault::Unresponsive => &mut self.unresponsive,
         }
     }
 }
@@ -296,7 +474,7 @@ impl RowFolders {
 mod tests {
     use super::{Fault, StartFolder, inherited_in, start_folder_in, take_noted};
     #[cfg(unix)]
-    use super::{folder_fault, within};
+    use super::{PaneFolder, folder_fault, on_remote_mount, remote_volume, start_fault_in, within};
     use std::path::Path;
     #[cfg(unix)]
     use std::time::{Duration, Instant};
@@ -347,9 +525,11 @@ mod tests {
         unsafe { libc::getuid() == 0 }
     }
 
-    /// A CHECK THAT DOES NOT ANSWER KEEPS THE FOLDER: `within` gives up on a
-    /// check still running, so a hung volume costs the wait, never the event
-    /// loop. The negative control is a check that answers.
+    /// A CHECK THAT DOES NOT ANSWER KEEPS A LOCAL FOLDER: `within` gives up on
+    /// a check still running, so a hung volume costs the wait, never the event
+    /// loop, and a spawn keeps a folder on a local volume. On a volume that is
+    /// not local the same silence is `Unresponsive`. The negative control is a
+    /// check that answers.
     #[cfg(unix)]
     #[test]
     fn a_check_that_does_not_answer_in_time_keeps_the_folder() {
@@ -389,6 +569,17 @@ mod tests {
             within(&IN_FLIGHT, Duration::from_millis(50), "/x", hangs),
             None
         );
+        let budget = Duration::from_millis(50);
+        assert_eq!(
+            start_fault_in(&IN_FLIGHT, budget, "/x", hangs, |_| false),
+            None,
+            "a local folder that did not answer stands"
+        );
+        assert_eq!(
+            start_fault_in(&IN_FLIGHT, budget, "/x", hangs, |_| true),
+            Some(Fault::Unresponsive),
+            "a folder on a volume that is not local, silent, is no place to start"
+        );
         let started = Instant::now();
         while !ENTERED.load(Ordering::SeqCst) {
             assert!(
@@ -401,8 +592,94 @@ mod tests {
         GATE.1.notify_all();
         assert_eq!(
             within(&IN_FLIGHT, Duration::from_secs(60), "/x", answers),
-            Some(Fault::Missing),
+            Some(Some(Fault::Missing)),
             "a check that answers is heard"
+        );
+        assert_eq!(
+            start_fault_in(&IN_FLIGHT, Duration::from_secs(60), "/x", answers, |_| true),
+            Some(Fault::Missing),
+            "an answer wins over the volume"
+        );
+    }
+
+    /// WITH THE CAP FULL NO CHECK STARTS, and the folder is judged as one that
+    /// did not answer: a folder on a volume that is not local is
+    /// `Unresponsive`, never handed to the child's `chdir` unchecked; a local
+    /// one stands. The check would have answered `Missing`, so neither verdict
+    /// is its.
+    #[cfg(unix)]
+    #[test]
+    fn a_full_cap_judges_the_folder_by_its_volume() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+        IN_FLIGHT.store(super::CHECKS_IN_FLIGHT_MAX, Ordering::SeqCst);
+        fn answers(_: &str) -> Option<Fault> {
+            Some(Fault::Missing)
+        }
+        let budget = Duration::from_secs(60);
+        assert_eq!(
+            start_fault_in(&IN_FLIGHT, budget, "/Volumes/share/x", answers, |_| true),
+            Some(Fault::Unresponsive)
+        );
+        assert_eq!(
+            start_fault_in(&IN_FLIGHT, budget, "/Users//me/x", answers, |_| false),
+            None
+        );
+        assert_eq!(
+            IN_FLIGHT.load(Ordering::SeqCst),
+            super::CHECKS_IN_FLIGHT_MAX,
+            "a refused check leaves the count as it found it"
+        );
+    }
+
+    /// THE VOLUME IS THE LONGEST MOUNT POINT HOLDING THE FOLDER, by whole path
+    /// components: a network share under a local root is not local, a local
+    /// mount inside a share is, `/Volumes/shared` is not inside
+    /// `/Volumes/share`, and a path no mount holds is local.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_is_judged_by_the_longest_mount_that_holds_it() {
+        let table = [
+            ("/", true),
+            ("/Volumes/share", false),
+            ("/Volumes/share/disk", true),
+        ];
+        let remote = |dir: &str| {
+            on_remote_mount(dir, table.iter().map(|(on, local)| (Path::new(on), *local)))
+        };
+        assert!(remote("/Volumes/share"));
+        assert!(remote("/Volumes/share/proj/src"));
+        assert!(
+            remote("/Volumes/share//proj/"),
+            "as written, separators aside"
+        );
+        assert!(!remote("/Volumes/share/disk/proj"));
+        assert!(!remote("/Volumes/shared/proj"));
+        assert!(!remote("/Users//me/src"));
+        assert!(!on_remote_mount("/Volumes/share/x", []), "no table");
+    }
+
+    /// THIS MACHINE'S MOUNT TABLE READS: a scratch folder and the root are on
+    /// local volumes, so a folder there that does not answer in time keeps
+    /// today's behaviour.
+    #[cfg(unix)]
+    #[test]
+    fn a_scratch_folder_is_on_a_local_volume() {
+        let scratch = aterm_tempfile::Builder::new()
+            .prefix("aterm-start-volume")
+            .tempdir()
+            .expect("scratch dir");
+        assert!(!remote_volume(scratch.path().to_str().expect("utf-8")));
+        assert!(!remote_volume("/"));
+        // The table is really read (an empty one would judge every folder
+        // local too): the root is in it, local.
+        #[cfg(target_os = "macos")]
+        assert!(
+            super::mount_table()
+                .iter()
+                .any(|(on, local)| on == Path::new("/") && *local),
+            "{:?}",
+            super::mount_table()
         );
     }
 
@@ -415,10 +692,15 @@ mod tests {
         let fault = |dir: &str| match dir {
             "/work/gone" => Some(Fault::Missing),
             "/work/shut" => Some(Fault::Shut),
+            "/Volumes/hung" => Some(Fault::Unresponsive),
             _ => None,
         };
         let home = Some(Path::new("/Users//me"));
-        for (dir, why) in [("/work/gone", Fault::Missing), ("/work/shut", Fault::Shut)] {
+        for (dir, why) in [
+            ("/work/gone", Fault::Missing),
+            ("/work/shut", Fault::Shut),
+            ("/Volumes/hung", Fault::Unresponsive),
+        ] {
             let fell_back = start_folder_in(Some(dir), home, fault);
             assert_eq!(fell_back.cwd.as_deref(), Some("/Users//me"));
             assert_eq!(fell_back.fell_back, Some((dir.to_owned(), why)));
@@ -437,6 +719,26 @@ mod tests {
             let stands = start_folder_in(Some("/work/gone"), no_home, fault);
             assert_eq!(stands.cwd.as_deref(), Some("/work/gone"), "{no_home:?}");
             assert_eq!(stands.fell_back, None, "no home folder is claimed");
+            // A folder that did not answer is never handed to a `chdir`.
+            let unasked = start_folder_in(Some("/Volumes/hung"), no_home, fault);
+            assert_eq!(
+                (unasked.cwd, unasked.fell_back),
+                (None, None),
+                "{no_home:?}"
+            );
+        }
+
+        // A failed folder that is the home folder itself is asked about once:
+        // a second check could only fail again, after a second wait.
+        for (dir, want) in [("/Volumes/hung", None), ("/work/gone", Some("/work/gone"))] {
+            let asked = std::cell::Cell::new(0);
+            let counted = |at: &str| {
+                asked.set(asked.get() + 1);
+                fault(at)
+            };
+            let start = start_folder_in(Some(dir), Some(Path::new(dir)), counted);
+            assert_eq!((start.cwd.as_deref(), start.fell_back), (want, None));
+            assert_eq!(asked.get(), 1, "{dir}: checked once");
         }
     }
 
@@ -489,5 +791,52 @@ mod tests {
         );
         let local = "/Users//me/src".to_owned();
         assert_eq!(inherited_in(local.clone(), || true, gone), Some(local));
+    }
+
+    /// A pane's folder read on the event loop and judged later, where the
+    /// spawn waits: a held pane's folder that is gone is not taken, one that is
+    /// here is, and a folder the pane's own shell reported is taken either way;
+    /// of several panes, the first whose folder is taken gives it.
+    #[cfg(unix)]
+    #[test]
+    fn a_pane_folder_read_now_is_judged_when_the_spawn_runs() {
+        let scratch = aterm_tempfile::Builder::new()
+            .prefix("aterm-pane-folder")
+            .tempdir()
+            .expect("scratch dir");
+        let here = scratch
+            .path()
+            .to_str()
+            .expect("utf-8 scratch path")
+            .to_owned();
+        let gone = scratch.path().join("gone").to_str().unwrap().to_owned();
+        let pane = |reported: &str, held| PaneFolder {
+            reported: reported.to_owned(),
+            held,
+        };
+        assert_eq!(pane(&gone, true).resolve(), None, "held, and not here");
+        assert_eq!(
+            pane(&here, true).resolve(),
+            Some(here.clone()),
+            "held, here"
+        );
+        assert_eq!(
+            pane(&gone, false).resolve(),
+            Some(gone.clone()),
+            "the pane's own shell reported it"
+        );
+        // A connected preset's origin first, then the focused pane: the next
+        // pane is asked only when the first's folder is not taken.
+        assert_eq!(
+            PaneFolder::first_taken([pane(&gone, true), pane(&here, true)]),
+            Some(here.clone()),
+            "a held origin's missing folder hands over to the focused pane's"
+        );
+        assert_eq!(
+            PaneFolder::first_taken([pane(&gone, false), pane(&here, true)]),
+            Some(gone),
+            "an origin's own shell's folder is taken"
+        );
+        assert_eq!(PaneFolder::first_taken([]), None, "no pane, no folder");
     }
 }

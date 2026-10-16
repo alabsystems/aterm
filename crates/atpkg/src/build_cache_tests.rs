@@ -178,13 +178,10 @@ fn check_tool(
     }
 }
 
-/// EVERY RULE, in both halves. A building verb with `--unverified` (or `clean`, which
-/// needs no lane) in a folder under `$HOME` gets the cache; each choice of the user's —
-/// an environment variable, a flag, a config line anywhere up the tree or in
-/// `$CARGO_HOME`, a folder outside the home or inside the cache, a cache that cannot be
-/// written — keeps the command exactly as typed, and so do the verified lane and the
-/// verbs that do not build. The `sh` block and [`with_build_dir`] answer alike in every
-/// shell found.
+/// Every rule, in both halves and every shell found: a building verb with `--unverified`
+/// (or `clean`) under `$HOME` gets the cache; each choice of the user's (an environment
+/// variable, a flag, a config line, a folder outside the home or inside the cache, an
+/// unwritable cache), the verified lane and the verbs that do not build keep it as typed.
 #[test]
 fn the_shim_and_the_rust_rule_decide_every_case_alike() {
     let f = Fixture::new("build-cache-rules");
@@ -368,8 +365,8 @@ fn the_shim_and_the_rust_rule_decide_every_case_alike() {
     check(&f, &cache, &[], build, false);
     std::fs::remove_dir_all(f.home.join("Library/Caches/aterm")).unwrap();
 
-    // A cache this process cannot write (a containment tab's): as before. A missing
-    // caches folder is the same answer.
+    // A cache this process cannot write (a containment tab's), or no caches folder at all:
+    // the command is kept as typed.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -383,9 +380,8 @@ fn the_shim_and_the_rust_rule_decide_every_case_alike() {
     }
 }
 
-/// A HOME CARGO CANNOT TAKE gets nothing, in both halves: one a TOML literal string
-/// cannot hold (a `'`), one Cargo would read as a template (a `{` or `}`), and one ending
-/// in `/`.
+/// A home Cargo cannot take gets nothing, in both halves: one a TOML literal string cannot
+/// hold (a `'`), one Cargo would read as a template (a `{` or `}`), and one ending in `/`.
 #[test]
 fn a_home_cargo_cannot_take_is_left_alone() {
     let f = Fixture::new("build-cache-home");
@@ -417,9 +413,9 @@ fn a_home_cargo_cannot_take_is_left_alone() {
     assert_eq!(config_value(Path::new("/h{b}")), None);
 }
 
-/// A WORKING DIRECTORY REACHED THROUGH A LINK is left alone by both halves: Cargo names
-/// the workspace by its real path, which may hold a brace or lie outside the home. (The
-/// shim sees the link in `$PWD`; the Rust half sees `$PWD` differ from the real folder.)
+/// A working directory reached through a link is left alone by both halves: Cargo names the
+/// workspace by its real path, which may hold a brace or lie outside the home. (The shim
+/// sees the link in `$PWD`; the Rust half sees `$PWD` differ from the real folder.)
 #[cfg(unix)]
 #[test]
 fn a_working_directory_reached_through_a_link_is_left_alone() {
@@ -456,8 +452,8 @@ fn a_working_directory_reached_through_a_link_is_left_alone() {
     );
 }
 
-/// AN UPSTREAM CARGO: no lane flag to look for, and a leading `+<toolchain>` (rustup's)
-/// stays first, the `--config` right after it.
+/// An upstream cargo has no lane flag, and a leading `+<toolchain>` (rustup's) stays first,
+/// the `--config` right after it.
 #[test]
 fn an_upstream_cargo_keeps_its_toolchain_first() {
     let f = Fixture::new("build-cache-cargo");
@@ -508,7 +504,7 @@ fn the_release_gate_reads_the_version_line() {
     }
 }
 
-/// THE PATH NAMES THE WORKSPACE, and two workspaces never share a folder: the value Cargo
+/// The path names the workspace, and two workspaces never share a folder: the value Cargo
 /// expands, and the directory it lands on, for nested and sibling workspaces.
 #[test]
 fn every_workspace_gets_its_own_folder_under_the_cache() {
@@ -538,9 +534,9 @@ fn every_workspace_gets_its_own_folder_under_the_cache() {
     }
 }
 
-/// THE RENDERED SHIM: a `targo` shim carries the block (on macOS) ahead of its unchanged
-/// `exec`, so every reader of a shim's target and environment answers as before; any
-/// other tool's shim is the plain one.
+/// A `targo` shim carries the block (on macOS) ahead of its unchanged `exec`, so every
+/// reader of a shim's target and environment answers the same; any other tool's shim is the
+/// plain one.
 #[test]
 fn the_targo_shim_carries_the_block_and_reads_as_before() {
     let targo = Path::new("/p/store/trust/9192/bin/targo");
@@ -586,9 +582,9 @@ fn the_targo_shim_carries_the_block_and_reads_as_before() {
     assert!(!tippy.contains("__atb"), "{tippy}");
 }
 
-/// THE SHIM, RUN WHOLE (macOS): its `exec` hands the real tool `--config …` first and the
-/// caller's arguments after it. The tool here is `/bin/echo` under the name `targo` (a
-/// link: a freshly written script would wait on the system's first-run assessment).
+/// The shim, run whole (macOS): its `exec` hands the real tool `--config …` first and the
+/// caller's arguments after. The tool is `/bin/echo` linked as `targo` (a freshly written
+/// script would wait on the system's first-run assessment).
 #[cfg(target_os = "macos")]
 #[test]
 fn the_rendered_shim_hands_targo_the_config() {
@@ -656,13 +652,9 @@ fn lay(root: &Path, workspace: &Path, ago: Duration) -> PathBuf {
 #[cfg(unix)]
 const DAY: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// RECLAIM: a build directory unwritten for a day whose workspace is seen gone goes (its
-/// folder there without a manifest, or the folder above it there without it); a live one
-/// (`Cargo.toml` or Trust's `Targo.toml`), one gone with its parent folder, one in a
-/// folder aterm never looks into, and any written within the day stay — until a month
-/// unwritten, when any goes. A `.cargo-build` that is a link stays (and what it names), a
-/// mirror folder that is a link is never entered, a removal an earlier pass left is
-/// finished, and the mirror folders left empty go.
+/// A day-unwritten build directory whose workspace is seen gone goes; a live one, one gone
+/// with its parent, one aterm never looks into and a fresh one stay until a month unwritten.
+/// Links are never followed, an earlier pass's removal is finished, emptied mirrors go.
 #[cfg(unix)]
 #[test]
 fn reclaim_removes_only_what_nobody_builds_into() {
@@ -780,11 +772,9 @@ fn age_tree(dir: &Path, ago: Duration) {
     age_by(dir, ago);
 }
 
-/// A BUILD WITH A TARGET, AND A BUILD RUNNING. A build that names a target triple writes
-/// `<triple>/<profile>/deps`, a level deeper: written today, its build directory stays
-/// however old the rest. One whose cargo lock (`.cargo-build-lock`, in a profile or a
-/// triple's profile) a build holds stays, and so does one whose lock is a link; released,
-/// a month unwritten, it goes. NEGATIVE CONTROL: the same tree unwritten for a month goes.
+/// A build naming a target triple writes a level deeper (`<triple>/<profile>/deps`), and a
+/// build directory whose cargo lock is held, or is a link, stays until released. Negative
+/// control: the same tree, idle and unlocked, goes.
 #[cfg(unix)]
 #[test]
 fn reclaim_reads_a_build_with_a_target_and_keeps_one_running() {
@@ -834,11 +824,10 @@ fn reclaim_reads_a_build_with_a_target_and_keeps_one_running() {
     assert!(cross.is_dir() && linked.is_dir());
 }
 
-/// A WORKSPACE REACHED THROUGH A LINK BELOW `$HOME` IS NEVER LOOKED THROUGH: Cargo names a
+/// A workspace reached through a link below `$HOME` is never looked through: Cargo names a
 /// workspace by the path it was given, so `~/links/doc` (a link into `~/Documents`) or
-/// `~/via/ws` (`via` a link to `~/Documents`) can name a build directory, and the gone
-/// rule looks at each folder on the way before anything under it. NEGATIVE CONTROL: a real
-/// folder without a manifest is looked into, and seen gone.
+/// `~/via/ws` can name a build directory, and the gone rule checks each folder on the way
+/// first. Negative control: a real folder without a manifest is looked into, and seen gone.
 #[cfg(unix)]
 #[test]
 fn a_workspace_reached_through_a_link_is_never_looked_through() {

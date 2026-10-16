@@ -12,10 +12,21 @@
 //!
 //! DEVIATIONS ONLY. The light is drawn only while its setting DIFFERS from
 //! what the owner expects ([`deviates`]) — or while a toggle of it is in
-//! flight, or its answer is on show. At rest, everything
-//! as expected, nothing is drawn beside the footer's facts in the composer's
-//! bottom rule, and Claude's own rows are whole. Hover a drawn light to read
-//! its title; click it to toggle.
+//! flight, or its answer is on show. At rest, everything as expected, no
+//! light is drawn beside the footer's facts in the composer's bottom rule,
+//! and Claude's own rows are whole. Hover a drawn light to read its title;
+//! click it to toggle.
+//!
+//! THE OVERRIDE, FOR TWO MARKS THAT ARE NOT LIGHTS (owner, 2026-10-15: "i
+//! want a small icon that allows me to toggle it on and off and another icon
+//! that takes me to the settings page for the claude code harness", "I need
+//! some visual indicator that the claude code session is being wrapped and a
+//! way to toggle on and off to show the improvement";
+//! `docs/DESIGN-harness-autopilot-2026-10-15.md` §2.3). The host draws the
+//! session's Autopilot chip and a `⚙` beside the light AT REST, whenever its
+//! footer draws and a harness host exists. They are aterm's own state, read
+//! from nothing Claude Code draws, so they are the host's chips and never a
+//! [`Light`]; the permission-mode light STAYS DEVIATIONS ONLY.
 //!
 //! One permission-mode light: auto-approve (`bypass permissions`) and auto mode
 //! are two positions of Claude Code's one permission mode, and the owner
@@ -159,14 +170,14 @@ impl Mode {
         }
     }
 
-    /// The pill glyph Claude draws before the mode (`footer::PILLS`): `⏸`
-    /// for plan and manual, `⏵⏵` for the rest.
+    /// The pill glyph Claude draws before the mode, read off the vendor's
+    /// table (`footer::PILLS`): `⏸` for plan and manual, `⏵⏵` for the rest.
     #[must_use]
     pub fn glyph(self) -> &'static str {
-        match self {
-            Mode::Plan | Mode::Manual => "\u{23F8}",
-            _ => "\u{23F5}\u{23F5}",
-        }
+        footer::PILLS
+            .iter()
+            .find(|pill| Mode::of_indicator(pill.id) == Some(self))
+            .map_or("", |pill| pill.glyph)
     }
 
     /// The mode's own ink where Claude gives it one (bypass's red, auto's
@@ -181,8 +192,9 @@ impl Mode {
     }
 }
 
-/// What one Claude Code screen says about the light's setting — the one
-/// parse the footer and the lights share per frame.
+/// What one Claude Code screen says about the light's setting and the turn
+/// — read off the engine where a toggle's next press is decided, and for a
+/// live upgrade's note (what a frame folds in is [`read_lights`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Screen {
     /// The permission mode its pill names — every mode draws one on 2.1.283,
@@ -202,17 +214,38 @@ pub struct Screen {
 #[must_use]
 pub fn read_screen(rows: &[String]) -> Option<Screen> {
     let (_, bottom) = aterm_phase::phase::composer_rules(rows)?;
-    // The pill this build sees, its `(shift+tab to cycle)` hint whole or cut.
-    let row = footer::pill_row_under(rows, bottom);
-    let mode = row
-        .and_then(|r| footer::pill_indicator(&rows[r]))
-        .and_then(Mode::of_indicator);
-    let pill = row.is_some();
+    let Reading { mode, pill } = reading_under(rows, bottom);
     // A turn in flight, by the phase reader's rule (the spinner, `Still
     // working`, `esc to interrupt`, …); a background monitor alone (`soft`) is
     // not a turn.
     let busy = aterm_phase::phase::busy_signal(rows).is_some_and(|b| !b.soft);
     Some(Screen { mode, pill, busy })
+}
+
+/// What the lights SHOW of `rows` — [`read_screen`]'s reading ([`read`] of
+/// it) without the turn: the mode its pill names and whether a pill is
+/// drawn. `None` without a composer frame. What a frame folds in: the turn
+/// is read only where a toggle's next press is decided, off the engine
+/// ([`Screen::busy`]), never off a painted frame.
+#[must_use]
+pub fn read_lights(rows: &[String]) -> Option<Reading> {
+    let (_, bottom) = aterm_phase::phase::composer_rules(rows)?;
+    Some(reading_under(rows, bottom))
+}
+
+/// [`read_lights`] under the composer bottom rule the caller has found (row
+/// `bottom`): the pill this build sees, its `(shift+tab to cycle)` hint whole
+/// or cut (`footer::pill_row_under`) — a reading of the rows under the rule
+/// alone.
+#[must_use]
+pub fn reading_under(rows: &[String], bottom: usize) -> Reading {
+    let row = footer::pill_row_under(rows, bottom);
+    Reading {
+        mode: row
+            .and_then(|r| footer::pill_indicator(&rows[r]))
+            .and_then(Mode::of_indicator),
+        pill: row.is_some(),
+    }
 }
 
 /// What the lights show: the permission mode its pill names.
@@ -501,9 +534,46 @@ mod tests {
         );
     }
 
+    /// WHAT A FRAME FOLDS IN IS WHAT THE SCREEN SAYS: on every recorded
+    /// screen in `aterm-phase`'s fixtures, [`read_lights`] — the lights'
+    /// reading with no turn read — is [`read`] of [`read_screen`], and
+    /// [`reading_under`] the composer's bottom rule is that same reading.
+    /// CONTROL: the corpus holds both, screens with a composer and screens
+    /// with none.
+    #[test]
+    fn the_lights_reading_is_the_screens_without_its_turn() {
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../aterm-phase/src/fixtures");
+        let (mut framed, mut bare) = (0, 0);
+        for entry in std::fs::read_dir(&dir).expect("the phase fixtures") {
+            let path = entry.expect("a fixture").path();
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            let rows: Vec<String> = text.lines().map(str::to_owned).collect();
+            let screen = read_screen(&rows);
+            let reading = read_lights(&rows);
+            assert_eq!(
+                reading,
+                screen.as_ref().map(|s| read(Some(s))),
+                "{}",
+                path.display()
+            );
+            match aterm_phase::phase::composer_rules(&rows) {
+                Some((_, bottom)) => {
+                    assert_eq!(reading, Some(reading_under(&rows, bottom)));
+                    framed += 1;
+                }
+                None => bare += 1,
+            }
+        }
+        assert!(
+            framed > 10 && bare > 10,
+            "CONTROL: {framed} framed, {bare} not"
+        );
+    }
+
     /// THE DRIFT CANARY. Every recorded FOOTER screen of every Claude Code
     /// build in the corpus (`claude-<version>-footer-*.txt` in aterm-phase's
-    /// fixtures, recorded by `tools/capture-claude-screens.sh`) has a composer
+    /// fixtures, recorded by `aterm-lab footers`) has a composer
     /// this reader sees, a mode row under it, and a pill the footer and the
     /// lights read as a mode. A new build that draws its mode row differently
     /// fails here by file and build. The directory is read, not listed, so new

@@ -230,7 +230,10 @@ fn etime_secs(etime: &str) -> Option<u64> {
     if parts.next().is_some() {
         return None;
     }
-    Some(days * 86_400 + hours * 3_600 + mins * 60 + secs)
+    days.checked_mul(86_400)?
+        .checked_add(hours.checked_mul(3_600)?)?
+        .checked_add(mins.checked_mul(60)?)?
+        .checked_add(secs)
 }
 
 /// An age in the two largest units: `11d 22h`, `3h 05m`, `4m 12s`, `42s`.
@@ -548,6 +551,15 @@ mod tests {
         assert_eq!(etime_secs("19:30"), Some(19 * 60 + 30));
         assert_eq!(etime_secs("1:02:03"), Some(3_723));
         assert_eq!(etime_secs("bad"), None);
+        assert_eq!(etime_secs(&u64::MAX.to_string()), Some(u64::MAX));
+        for overflow in [
+            format!("{}-00:00:00", u64::MAX),
+            format!("{}:00:00", u64::MAX),
+            format!("{}:00", u64::MAX),
+            format!("1:{}", u64::MAX),
+        ] {
+            assert_eq!(etime_secs(&overflow), None, "{overflow}");
+        }
         assert_eq!(age_words(11 * 86_400 + 22 * 3_600 + 5), "11d 22h");
         assert_eq!(age_words(3 * 3_600 + 5 * 60), "3h 05m");
         assert_eq!(age_words(4 * 60 + 12), "4m 12s");

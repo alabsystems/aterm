@@ -1,13 +1,9 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Cost consent + disk preflight (§9/§11) — the honest-accounting gates before bytes move.
-//!
-//! atpkg surfaces the **signed** `[cost]` (`download_bytes`/`disk_installed`, §4.2) and,
-//! for a large artifact, asks for consent before downloading; and it preflights disk so a
-//! multi-GB toolchain bundle never half-stages on a full volume (§9/§10.2). These are the
-//! pure decision + formatting helpers; the actual prompt and the free-space query are the
-//! CLI/OS edge.
+//! Byte formatting for the cost surface and the disk preflight, which refuses an install
+//! that would not leave [`FREE_FLOOR`] free, so a multi-GB bundle never half-stages on a
+//! full volume. The free-space query is the OS edge.
 
 /// The largest unit `n` fills at least once, as its size and name; `(1, "B")` below a KiB.
 fn unit_of(n: u64) -> (u64, &'static str) {
@@ -34,17 +30,15 @@ fn in_unit(n: u64, (size, name): (u64, &str)) -> String {
     }
 }
 
-/// Format a byte count as a short human string (`B`/`KiB`/`MiB`/`GiB`, one decimal) for
-/// the cost surface.
+/// A byte count as a short human string: whole bytes, else `KiB`/`MiB`/`GiB` to one decimal.
 #[must_use]
 pub fn human_bytes(n: u64) -> String {
     in_unit(n, unit_of(n))
 }
 
-/// Two byte counts a sentence sets side by side (a need and what is free), each by
-/// [`human_bytes`] unless the two round alike: 1174 MiB needed on 1147 MiB free both read
-/// `1.1 GiB`. Then both are written in the unit of their difference, in which they are at
-/// least one whole unit apart, so unequal counts never print as one figure.
+/// Two byte counts set side by side (a need and what is free), each by [`human_bytes`]
+/// unless both round alike (1174 MiB and 1147 MiB both read `1.1 GiB`); then both are
+/// written in the unit of their difference, so unequal counts never print as one figure.
 #[must_use]
 pub fn human_bytes_apart(a: u64, b: u64) -> (String, String) {
     let (ha, hb) = (human_bytes(a), human_bytes(b));
@@ -55,18 +49,16 @@ pub fn human_bytes_apart(a: u64, b: u64) -> (String, String) {
     (in_unit(a, unit), in_unit(b, unit))
 }
 
-/// Disk preflight (§9/§10.2): whether `required` installed bytes fit in `available` while
-/// still leaving at least `free_floor` bytes free afterward. Saturating — a colossal
-/// `required` can never wrap to "fits". An install's gate passes its unit's archives and
-/// trees together (`flow::LandingBytes::need`, summed over a coherence group's members).
+/// Whether `required` bytes fit in `available` while leaving `free_floor` free afterward.
+/// Saturating, so a colossal `required` never wraps to "fits". An install passes its unit's
+/// archives and trees together (`flow::LandingBytes::need`).
 #[must_use]
 pub fn disk_ok(required: u64, available: u64, free_floor: u64) -> bool {
     available >= required.saturating_add(free_floor)
 }
 
-/// Bytes to leave free AFTER an install completes — the disk-preflight reserve so a
-/// multi-GB toolchain never fills the volume to 0 (§9). Passed as `free_floor` to
-/// [`disk_ok`] at every preflight call site so they all agree on the reserve.
+/// Bytes to leave free after an install, so a multi-GB toolchain never fills the volume.
+/// Every preflight passes it to [`disk_ok`] as `free_floor`.
 pub const FREE_FLOOR: u64 = 1 << 30; // 1 GiB
 
 #[cfg(test)]
@@ -107,11 +99,11 @@ mod tests {
     #[test]
     fn disk_preflight_keeps_the_free_floor_and_cannot_overflow() {
         let gib = 1u64 << 30;
-        // 3 GiB required, 10 GiB available, keep 1 GiB free ⇒ fits (3+1 <= 10).
+        // 3 + 1 <= 10.
         assert!(disk_ok(3 * gib, 10 * gib, gib));
-        // 3 GiB required, 3.5 GiB available, keep 1 GiB ⇒ does NOT fit (4 > 3.5).
+        // 3 + 1 > 3.5.
         assert!(!disk_ok(3 * gib, 7 * gib / 2, gib));
-        // A colossal requirement never WRAPS (saturating) to fit on a small disk.
+        // Saturating: a colossal requirement never wraps to fit.
         assert!(!disk_ok(u64::MAX, 1000, 1));
         // Exact fit (required + floor == available) is allowed.
         assert!(disk_ok(3 * gib, 4 * gib, gib));

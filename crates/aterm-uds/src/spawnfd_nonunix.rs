@@ -3,8 +3,7 @@
 
 //! `spawnfd` off Unix: [`command`] and [`InheritNothing`], spelled as on Unix
 //! (and `Command`, `Stdio`, `Child` as `std`'s), so a spawn site shared with
-//! Unix (and a Windows-only one) is spelled the same everywhere and
-//! `tools/grep_guard.sh` B27 reads one rule.
+//! Unix (and a Windows-only one) is spelled the same everywhere.
 //!
 //! Nothing is stripped because there is no table of unflagged descriptors to
 //! strip: a Windows child inherits only a handle marked inheritable, `std`
@@ -21,15 +20,20 @@
 //! carry the measurements and why neither `CREATE_NO_WINDOW` always nor
 //! `DETACHED_PROCESS` is the rule. A site that needs another console (the
 //! windowed sibling's `Console::Detached`) or more flags (a new process group)
-//! calls [`crate::spawn::set_flags`] on the returned `Command`, which REPLACES
-//! the word this set (`tools/grep_guard.sh` B28).
+//! calls [`crate::spawn::set_gui_image_flags`] or [`crate::spawn::set_flags`] on
+//! the returned `Command`, which REPLACES the word this set.
 //!
 //! [`Console::Quiet`]: crate::spawn::Console::Quiet
 
 use std::ffi::OsStr;
 /// `std`'s own types: what the Unix [`Command`], `Stdio` and `Child` stand in
 /// for, so a spawn site shared with Unix names one set of types everywhere.
-pub use std::process::{Child, Command, Stdio};
+#[expect(
+    clippy::disallowed_types,
+    reason = "off Unix spawnfd's Command is std's: no descriptor table to strip"
+)]
+pub type Command = std::process::Command;
+pub use std::process::{Child, Stdio};
 
 /// The Unix strip's trait, a no-op here (the module docs say why).
 pub trait InheritNothing {
@@ -51,7 +55,7 @@ impl InheritNothing for Command {
 #[must_use]
 pub fn command(program: impl AsRef<OsStr>) -> Command {
     let mut command = Command::new(program);
-    crate::spawn::set_flags(&mut command, crate::spawn::Console::Quiet, 0);
+    crate::spawn::set_flags(&mut command, 0);
     command
 }
 

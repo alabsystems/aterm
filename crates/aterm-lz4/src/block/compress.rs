@@ -182,9 +182,9 @@ fn write_integer(output: &mut impl Sink, mut n: usize) {
     push_byte(output, n as u8);
 }
 
-/// `extend_from_slice` forwarder, like `push_byte` for `push`: isolates the
-/// generic `Sink` dispatch (unknown until monomorphization) in one skipped
-/// site so callers' own obligations stay verified.
+/// `extend_from_slice` forwarder, like `push_byte` for `push`: `SliceSink`
+/// requires capacity for the entire slice. The compressor's worst-case output
+/// reservation establishes that caller contract; generic dispatch cannot prove it.
 #[inline]
 #[cfg_attr(trust_verify, trust::skip)]
 fn push_slice(output: &mut impl Sink, s: &[u8]) {
@@ -448,8 +448,8 @@ pub(crate) fn compress_internal<T: HashTable, const USE_DICT: bool, S: Sink>(
 }
 
 #[inline]
-// Skip: forwards the generic `Sink::push` (impl unknown until
-// monomorphization); `SliceSink::push` owns the capacity contract.
+// `SliceSink::push` requires remaining capacity, established by the compressor's
+// worst-case output reservation. Keep this partial generic call as an assumption.
 #[cfg_attr(trust_verify, trust::skip)]
 fn push_byte(output: &mut impl Sink, el: u8) {
     output.push(el);

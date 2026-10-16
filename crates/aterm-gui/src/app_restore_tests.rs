@@ -567,8 +567,8 @@ fn restored_and_legacy_raw_metadata_is_sanitized_before_chrome() {
     }
     assert_eq!(
         app.tab_titles(WindowId(0))[0],
-        "rawtitle · firstsecond",
-        "both title-format fields cross the same sanitizer"
+        "rawtitle",
+        "the label is the sanitized title alone; the description is not joined in"
     );
     app.refresh_window_tabs(WindowId(0));
     let tooltip = app.windows[&WindowId(0)].tab_set.tabs()[0]
@@ -1442,10 +1442,12 @@ fn bare_leaf() -> restore::TerminalLeafRestore {
         role: None,
         attention: None,
         questions: None,
+        autopilot: None,
         identity: None,
         agent: None,
         supervised: None,
         held: false,
+        holds: Vec::new(),
     }
 }
 
@@ -1590,7 +1592,7 @@ fn a_handoff_keeps_user_metadata_on_every_adopted_window_bootstrap() {
     );
 
     // SUCCESSOR: window 0's bootstrap is the shell adopted in `main_entry`, window
-    // 1's the one adopted in `create_window_internal` — each picked by
+    // 1's the one adopted in `create_window_internal_connected` — each picked by
     // `bootstrap_local_id`, and each keeping the id the parent knew it by.
     // Adoption mints a fresh ctx, so both start with no USER metadata.
     let mut new = App::headless_for_test();
@@ -2183,6 +2185,7 @@ fn an_identitys_label_rides_the_adoption_and_a_cold_restore_never_creates_one() 
 /// The Claude Code agent a crash took from a tab, as its leaf records it.
 fn dead_agent() -> restore::AgentRestore {
     restore::AgentRestore {
+        word: String::new(),
         pid: 4242,
         start: "Sat Sep 27 01:02:03 2026".into(),
         program: "/opt/claude/bin/claude".into(),
@@ -2221,6 +2224,7 @@ const OWED_LOGIN: &str = "/Users//me/logins/work-2";
 #[cfg(unix)]
 fn owed_relaunch(tab: &str) -> aterm_agent::harness::relaunch::Snapshot {
     aterm_agent::harness::relaunch::Snapshot {
+        stored_login: false,
         tab: tab.to_string(),
         pid: 4242,
         start: "Sat Sep 27 01:02:03 2026".into(),
@@ -3095,6 +3099,581 @@ fn a_durable_layout_never_carries_the_explicit_restarts_cause() {
     host.shutdown_and_join();
 }
 
+/// LC-8 (ATERM-KI-1015-1, the 2026-10-15 sweep against Claude Code 2.1.300):
+/// A TAB ITS OWNER HELD STAYS THE HOLDER'S ACROSS ATERM'S END. `hold` is a
+/// stop: nothing is typed into the tab while it stands, and an exit read
+/// under it is the holder's (`relaunch::on_exit`'s `Held`). The layouts an
+/// end nobody chose leaves the next launch — the crash journal's image and a
+/// restart's quit layout (`App::fill_desk_agents`) — carried the tab's agent
+/// and no hold, so the next launch reopened the tab unheld, relaunched the
+/// agent and typed the continuation into it. Through the wire and a cold
+/// restore: the agent of a tab held by its OWNER (`origin=local`) is not
+/// handed to the host, the reopened row does not promise it, and the owner's
+/// hold is on the reopened tab; a FLEET hold is not carried (holds of that
+/// origin are the process's, and quitting is the one recovery from a stuck
+/// one: `fabric.rs`'s header), but its agent is not handed either.
+/// NEGATIVE CONTROL: an unheld tab's agent is handed, promised, and its tab
+/// is not held.
+#[cfg(unix)]
+#[test]
+fn a_held_tabs_agent_stays_the_holders_across_a_cold_restore() {
+    use crate::fabric::Hold;
+    // What a cold restore of the durable layout of a tab running an agent,
+    // under `hold`, does: the places the reopened row promises the agent
+    // back, how many agents it hands the host, and the holds on its tabs.
+    let cold_restore_of = |hold: Option<Hold>| -> (Vec<(u32, u32)>, usize, Vec<Hold>) {
+        let mut app = App::headless_for_test();
+        let _ = app.insert_logical_window(crate::stub_session(1), 24, 80);
+        let sid = {
+            let g = app.store.read().unwrap();
+            g.by_local(0).expect("registered").sid.as_str().to_string()
+        };
+        crate::harness_host::publish_snapshot_for_test(&sid, Some(&owed_relaunch(&sid)));
+        if let Some(hold) = hold {
+            let ctx = &app.pool.get(0).expect("the tab's session").ctx;
+            assert!(crate::fabric::apply_hold_for_test(ctx, Some(hold)));
+        }
+        let mut durable = app.capture_restore_manifest();
+        app.fill_desk_agents(&mut durable);
+        crate::harness_host::publish_snapshot_for_test(&sid, None);
+        let wire = durable.to_toml().expect("the wire");
+        let read = restore::RestoreManifest::from_toml(&wire).expect("read back");
+        let leaf = read
+            .handed_off_leaves()
+            .into_iter()
+            .find(|leaf| leaf.local_id == Some(0))
+            .expect("the tab's leaf");
+        assert!(leaf.agent.is_some(), "the durable leaf names the agent");
+        let reopened = crate::crash_journal::Reopened {
+            manifest: read,
+            class: crate::crash_journal::DeathClass::Killed,
+            sources: Vec::new(),
+            writers: Vec::new(),
+            handed: Vec::new(),
+            programs: None,
+            second_chance: false,
+        };
+        let mut cold = App::headless_for_test();
+        cold.restore_into_window(
+            WindowId(0),
+            window_of(vec![restore::RestoredSplitTree::leaf(
+                restore::RestoredView::Terminal(leaf),
+            )]),
+        );
+        for (&id, pooled) in cold.pool.sessions.iter_mut() {
+            pooled.session.pid = 40_000 + i32::try_from(id).unwrap();
+        }
+        let handed = cold.take_restored_agents().len();
+        let holds = cold
+            .pool
+            .sessions
+            .values()
+            .filter_map(|pooled| pooled.session.ctx.fabric.hold())
+            .collect();
+        (reopened.resumed(true), handed, holds)
+    };
+    let owners = Hold {
+        reason: "review".into(),
+        origin: "local".into(),
+    };
+    let (promised, handed, holds) = cold_restore_of(Some(owners.clone()));
+    assert_eq!(
+        handed, 0,
+        "the owner held the tab: its agent is not relaunched"
+    );
+    assert_eq!(
+        holds,
+        vec![owners],
+        "the owner's hold is on the reopened tab"
+    );
+    assert!(
+        promised.is_empty(),
+        "the row promises it nowhere: {promised:?}"
+    );
+    let fleet = Hold {
+        reason: "fleet-halt".into(),
+        origin: "fleet".into(),
+    };
+    let (promised, handed, holds) = cold_restore_of(Some(fleet));
+    assert_eq!(
+        handed, 0,
+        "the fleet held the tab: its agent is not relaunched"
+    );
+    assert!(holds.is_empty(), "a fleet hold is the process's: {holds:?}");
+    assert!(
+        promised.is_empty(),
+        "the row promises it nowhere: {promised:?}"
+    );
+    // NEGATIVE CONTROL: an unheld tab's agent comes back as ever.
+    let (promised, handed, holds) = cold_restore_of(None);
+    assert_eq!(
+        (promised, handed, holds),
+        (vec![(0, 0)], 1, Vec::new()),
+        "(promised, handed, holds) of an unheld tab"
+    );
+}
+
+/// LC-8, SAID (ruling 23): the restore pass records, for each tab that was
+/// held when aterm ended, that its agent was not relaunched — a RECORD, the
+/// person held the tab — naming the conversation to pick up and whose hold
+/// it was; the owner's hold is on the reopened tab, `carried=1` on its
+/// timeline, a fleet's is not. Once, and once for an agent two leaves name
+/// (a session shown in two tabs). NEGATIVE CONTROL: an unheld tab's agent is
+/// owed its relaunch and nothing is said of it.
+#[test]
+fn a_held_tabs_agent_left_at_its_shell_is_said_on_record() {
+    use crate::fabric::{Hold, render_hold};
+    // A leaf naming shell `shell` whose tab ran agent `pid`, under `hold`.
+    let held_leaf = |shell: u64, pid: u32, hold: Option<Hold>| {
+        restore::RestoredSplitTree::leaf(restore::RestoredView::Terminal(
+            restore::TerminalLeafRestore {
+                local_id: Some(shell),
+                agent: Some(Box::new(restore::AgentRestore {
+                    pid,
+                    ..dead_agent()
+                })),
+                holds: hold.iter().map(render_hold).collect(),
+                ..bare_leaf()
+            },
+        ))
+    };
+    let owners = Hold {
+        reason: "review".into(),
+        origin: "local".into(),
+    };
+    let fleet = Hold {
+        reason: "fleet-halt".into(),
+        origin: "fleet".into(),
+    };
+    // A host that relaunches restored agents: the hold is what kept each
+    // held tab's down.
+    let host =
+        crate::harness_host::HostHandle::for_restored_test(std::sync::Arc::new(|_, _, _| {
+            "wait:shell-prompt".to_string()
+        }));
+    let mut cold = App::headless_for_test();
+    cold.harness = Some(host.clone());
+    cold.restore_into_window(
+        WindowId(0),
+        window_of(vec![
+            held_leaf(7, 4242, Some(owners.clone())),
+            held_leaf(8, 4343, Some(fleet)),
+            held_leaf(9, 4444, None),
+            // The owner's held session shown in a second tab: said once.
+            held_leaf(7, 4242, Some(owners.clone())),
+        ]),
+    );
+    assert_eq!(
+        cold.restored_held
+            .iter()
+            .map(|(_, agent, fleet)| (agent.pid, *fleet))
+            .collect::<Vec<_>>(),
+        vec![(4242, false), (4343, true), (4242, false)],
+        "(agent, the fleet's): the held tabs' agents, not relaunched"
+    );
+    assert_eq!(cold.restored_agents.len(), 1, "the unheld tab's is owed");
+    let holds: Vec<Hold> = cold
+        .pool
+        .sessions
+        .values()
+        .filter_map(|pooled| pooled.session.ctx.fabric.hold())
+        .collect();
+    assert_eq!(
+        holds,
+        vec![owners.clone(), owners],
+        "the owner's hold alone came back, on each of its tabs"
+    );
+    let carried = cold.pool.sessions.values().any(|pooled| {
+        pooled
+            .session
+            .ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .since(None)
+            .any(|event| event.kind == "hold" && event.payload.ends_with("carried=1"))
+    });
+    assert!(carried, "its timeline says the hold was carried");
+    let records = cold.messages.log().records().count();
+    cold.say_restored_held();
+    let said: Vec<String> = cold
+        .messages
+        .log()
+        .records()
+        .skip(records)
+        .map(|record| record.title.clone())
+        .collect();
+    assert_eq!(said.len(), 2, "{said:?}");
+    assert!(
+        said.iter()
+            .all(|title| title.contains("not restarted") && title.contains("held")),
+        "{said:?}"
+    );
+    cold.say_restored_held();
+    assert_eq!(
+        cold.messages.log().records().count(),
+        records + 2,
+        "said once"
+    );
+    host.shutdown_and_join();
+}
+
+#[test]
+fn a_missing_held_leaf_does_not_hide_the_same_agents_surviving_leaf() {
+    let mut cold = App::headless_for_test();
+    let leaf = restore::RestoredSplitTree::leaf(restore::RestoredView::Terminal(
+        restore::TerminalLeafRestore {
+            local_id: Some(7),
+            agent: Some(Box::new(dead_agent())),
+            holds: vec![crate::fabric::render_hold(&crate::fabric::Hold {
+                reason: "review".into(),
+                origin: "local".into(),
+            })],
+            ..bare_leaf()
+        },
+    ));
+    cold.restore_into_window(WindowId(0), window_of(vec![leaf]));
+    let (_, agent, fleet) = cold.restored_held[0].clone();
+    assert!(cold.store.read().unwrap().by_local(u64::MAX).is_none());
+    cold.restored_held.insert(0, (u64::MAX, agent, fleet));
+    let records = cold.messages.log().records().count();
+    cold.say_restored_held();
+    let said = held_records(&cold, records);
+    assert_eq!(
+        said.len(),
+        1,
+        "the surviving leaf's held agent is reported: {said:?}"
+    );
+}
+
+/// The records the restore pass said of held tabs ([`App::say_restored_held`])
+/// since the log held `from`: each one's title and detail lines.
+fn held_records(app: &App, from: usize) -> Vec<(String, Vec<String>)> {
+    app.messages
+        .log()
+        .records()
+        .skip(from)
+        .map(|record| (record.title.clone(), record.detail.clone()))
+        .collect()
+}
+
+/// The `aterm ctl` command a record's line names, through its `off` or
+/// `on` (`@s-1 hold off`, `hold s-1 off`), its quoting stripped.
+fn ctl_command_named(lines: &[String]) -> Option<String> {
+    lines.iter().find_map(|line| {
+        let (_, tail) = line.split_once("aterm ctl ")?;
+        let mut words = Vec::new();
+        for word in tail.split_whitespace() {
+            let word = word.trim_matches(|c: char| matches!(c, '`' | ',' | ';' | '.' | ':'));
+            words.push(word.to_string());
+            if matches!(word, "off" | "on") {
+                return Some(words.join(" "));
+            }
+        }
+        None
+    })
+}
+
+/// THE REVIEW OF ROUND TWENTY'S LC-8 (its major): THE LIFT A HELD TAB'S
+/// RECORD NAMES IS ONE THE CONTROL SOCKET TAKES. The first cut's record (and
+/// ruling 23, and the KI entry) said `aterm ctl @<sid> hold off`; `hold`
+/// names its session as its argument and refuses a selector (`ERR denied`,
+/// `control::dispatch_hold_verb`), so a person who followed the record kept
+/// the tab held (live: `ERR denied`, `hold=1` after it). The command is read
+/// off the record the restore pass says and run as the Owner — the scope
+/// every in-session client holds — through control's `hold` path: it lifts
+/// the owner's carried hold.
+#[test]
+fn the_lift_a_held_tabs_record_names_is_one_the_control_socket_takes() {
+    use crate::fabric::{Hold, render_hold};
+    let owners = Hold {
+        reason: "review".into(),
+        origin: "local".into(),
+    };
+    let mut cold = App::headless_for_test();
+    cold.restore_into_window(
+        WindowId(0),
+        window_of(vec![restore::RestoredSplitTree::leaf(
+            restore::RestoredView::Terminal(restore::TerminalLeafRestore {
+                local_id: Some(7),
+                agent: Some(Box::new(dead_agent())),
+                holds: vec![render_hold(&owners)],
+                ..bare_leaf()
+            }),
+        )]),
+    );
+    let holds = |app: &App| -> Vec<Hold> {
+        app.pool
+            .sessions
+            .values()
+            .filter_map(|pooled| pooled.session.ctx.fabric.hold())
+            .collect()
+    };
+    assert_eq!(
+        holds(&cold),
+        vec![owners],
+        "PRECONDITION: the hold came back"
+    );
+    let from = cold.messages.log().records().count();
+    cold.say_restored_held();
+    let lines: Vec<String> = held_records(&cold, from)
+        .into_iter()
+        .flat_map(|(_, lines)| lines)
+        .collect();
+    let lift = ctl_command_named(&lines).expect("the record names the lift");
+    assert_eq!(
+        crate::control::hold_line_for_test(&cold.store, &lift, crate::control::Scope::Owner),
+        "OK hold=0\n",
+        "the lift the record names ({lift:?}), as the Owner runs it"
+    );
+    assert!(holds(&cold).is_empty(), "lifted: {:?}", holds(&cold));
+}
+
+/// THE REVIEW OF ROUND TWENTY'S LC-8: A HELD TAB'S RECORD IS ITS OWN
+/// AGENT'S. The first cut said "Claude was not restarted" and `type claude
+/// --resume <id>` whatever had run: a Codex's record named Claude and put the
+/// Codex thread under Claude's resume, and a Claude Code that ran under
+/// another home (`CLAUDE_CONFIG_DIR`, which its relaunch carries) was told a
+/// bare line that does not find its conversation. And it gave the hold as
+/// the reason where the cold restore would not have relaunched the agent
+/// anyway (no host: the harness off). Now: under a host that relaunches
+/// restored agents, each record names its program and the line that
+/// resumes it, its home on it; with none, a held tab's record says the hold
+/// came back and no reason the agent stayed down.
+#[test]
+fn a_held_tabs_record_is_its_own_agents() {
+    use crate::fabric::{Hold, render_hold};
+    const THREAD: &str = "019a2b3c-4d5e-7f60-8a9b-0c1d2e3f4a5b";
+    const HOME: &str = "/opt/agents/claude-work";
+    let owners = Hold {
+        reason: "review".into(),
+        origin: "local".into(),
+    };
+    let held = |shell: u64, agent: restore::AgentRestore| {
+        restore::RestoredSplitTree::leaf(restore::RestoredView::Terminal(
+            restore::TerminalLeafRestore {
+                local_id: Some(shell),
+                agent: Some(Box::new(agent)),
+                holds: vec![render_hold(&owners)],
+                ..bare_leaf()
+            },
+        ))
+    };
+    let homed = restore::AgentRestore {
+        home: Some(HOME.into()),
+        ..dead_agent()
+    };
+    let codex = restore::AgentRestore {
+        pid: 4343,
+        program: "/opt/codex/bin/codex".into(),
+        argv: vec!["/opt/codex/bin/codex".into()],
+        session: Some(THREAD.into()),
+        codex: Some(restore::CodexRestore {
+            home: "/opt/agents/codex".into(),
+            home_env: None,
+            embedded: true,
+            started_ms: 1,
+        }),
+        ..dead_agent()
+    };
+    let host =
+        crate::harness_host::HostHandle::for_restored_test(std::sync::Arc::new(|_, _, _| {
+            "wait:shell-prompt".to_string()
+        }));
+    let mut cold = App::headless_for_test();
+    cold.harness = Some(host.clone());
+    assert!(
+        host.relaunches_restored(),
+        "PRECONDITION: a relaunching host"
+    );
+    cold.restore_into_window(
+        WindowId(0),
+        window_of(vec![held(7, homed.clone()), held(8, codex)]),
+    );
+    let from = cold.messages.log().records().count();
+    cold.say_restored_held();
+    let said = held_records(&cold, from);
+    assert_eq!(said.len(), 2, "{said:?}");
+    let (claude_title, claude_lines) = &said[0];
+    assert!(
+        claude_title.contains("Claude") && claude_title.contains("because the tab was held"),
+        "{claude_title:?}"
+    );
+    let conversation = homed.session.as_deref().expect("a conversation");
+    assert!(
+        claude_lines.iter().any(|line| line.contains(&format!(
+            "CLAUDE_CONFIG_DIR={HOME} claude --resume {conversation}"
+        ))),
+        "the line its relaunch would carry, its home on it: {claude_lines:?}"
+    );
+    let (codex_title, codex_lines) = &said[1];
+    assert!(
+        codex_title.contains("Codex") && !codex_title.contains("Claude"),
+        "{codex_title:?}"
+    );
+    assert!(
+        codex_lines
+            .iter()
+            .any(|line| line.contains(&format!("codex resume {THREAD}")))
+            && !codex_lines.iter().any(|line| line.contains("claude")),
+        "Codex's own resume: {codex_lines:?}"
+    );
+    host.shutdown_and_join();
+
+    // NO HOST (the harness off): nothing would have relaunched the agent, so
+    // the hold is no reason given for it; the owner's hold came back, said.
+    let mut off = App::headless_for_test();
+    off.restore_into_window(WindowId(0), window_of(vec![held(7, homed)]));
+    let from = off.messages.log().records().count();
+    off.say_restored_held();
+    let said = held_records(&off, from);
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert!(
+        !said[0].0.contains("because the tab was held"),
+        "no host would have relaunched it: {said:?}"
+    );
+    assert!(
+        ctl_command_named(&said[0].1).is_some(),
+        "the lift: {said:?}"
+    );
+}
+
+/// A SHELL THE PTY KEEPER GAVE BACK KEEPS ITS OWN HOLDS; THE LAYOUT ADDS
+/// THE OWNER'S WHERE THEY HAVE NONE. Since `5287b96eb` (and both slots since
+/// `6b3367748`) the keeper's META carries the session's holds, both origins,
+/// and the recovered shell is held again before it is registered
+/// (`spawn::seed_adopted_fabric`). The crash journal's leaf names the holds
+/// too, and this branch's first cut seeded the leaf's hold on that shell
+/// again: an owner's or a fleet's hold carried twice (two `carried=1` rows),
+/// and a fleet hold the bridge lifted after the journal's last image put
+/// back — a fleet slot the owner may not lift. Now the fleet's slot is the
+/// META's alone, and the owner's from the leaf is added where the META's
+/// carry left it empty, fail-closed: neither sample can be ordered before the
+/// other (the journal captures at most every 2 s; the META is the last one
+/// delivered to the keeper, which contention or a failed link leaves older).
+/// A slot that stands takes nothing and records nothing. NEGATIVE CONTROLS:
+/// a fresh shell takes the leaf's owner's hold alone. (The headless restore's
+/// stub adoption seeds its handle's fabric as `spawn_session` does, so the
+/// keeper's carry is the production one.)
+#[test]
+fn a_shell_the_keeper_gave_back_keeps_its_own_hold() {
+    use crate::fabric::{Hold, render_hold, render_holds};
+    let owners = Hold {
+        reason: "review".into(),
+        origin: "local".into(),
+    };
+    let fleet = Hold {
+        reason: "fleet-halt".into(),
+        origin: "fleet".into(),
+    };
+    let rows = |holds: &[&Hold]| -> Vec<String> { holds.iter().map(|h| render_hold(h)).collect() };
+    // A desk whose shell 8 ran an agent under the leaf's holds.
+    let layout = |leaf: &[&Hold]| {
+        window_of(vec![
+            leaf_hosting(7, None),
+            restore::RestoredSplitTree::leaf(restore::RestoredView::Terminal(
+                restore::TerminalLeafRestore {
+                    local_id: Some(8),
+                    agent: Some(Box::new(dead_agent())),
+                    holds: rows(leaf),
+                    ..bare_leaf()
+                },
+            )),
+        ])
+    };
+    // Restore `layout(leaf)`, shell 8 given back by the keeper with the holds
+    // its META carried (`Some`), or fresh (`None`): each held session's
+    // outgoing id (`Some(8)`: the kept shell), its holds, and how many holds
+    // its timeline says were carried.
+    let restore = |leaf: &[&Hold], kept: Option<&[&Hold]>| {
+        let mut app = App::headless_for_test();
+        if let Some(meta) = kept {
+            app.seamless_adopt = vec![crate::spawn::Adopted {
+                holds: rows(meta),
+                ..handed_off_shell(8)
+            }];
+        }
+        app.restore_into_window(WindowId(0), layout(leaf));
+        assert!(app.seamless_adopt.is_empty(), "the kept shell was placed");
+        assert!(
+            app.restored_agents.is_empty()
+                && app.restored_held.is_empty() == (kept.is_some() || leaf.is_empty()),
+            "nothing relaunched: a kept shell's agent runs, a held tab's is the holder's"
+        );
+        let mut held: Vec<(Option<u64>, Vec<String>, usize)> = app
+            .pool
+            .sessions
+            .values()
+            .map(|pooled| {
+                let carried = pooled
+                    .session
+                    .ctx
+                    .timeline
+                    .lock()
+                    .unwrap()
+                    .since(None)
+                    .filter(|event| event.kind == "hold" && event.payload.ends_with("carried=1"))
+                    .count();
+                (
+                    pooled.session.handoff_local_id,
+                    render_holds(&pooled.session.ctx.fabric.holds()),
+                    carried,
+                )
+            })
+            .filter(|(_, holds, carried)| !holds.is_empty() || *carried > 0)
+            .collect();
+        held.sort_by_key(|(kept, _, _)| *kept);
+        held
+    };
+    let kept = |holds: &[&Hold], carried| vec![(Some(8), rows(holds), carried)];
+    assert_eq!(
+        restore(&[&fleet], Some(&[&fleet])),
+        kept(&[&fleet], 1),
+        "the keeper's fleet hold, carried once"
+    );
+    assert_eq!(
+        restore(&[&owners], Some(&[&owners])),
+        kept(&[&owners], 1),
+        "the owner's hold, carried once"
+    );
+    assert_eq!(
+        restore(&[&fleet], Some(&[])),
+        Vec::new(),
+        "lifted by the fleet after the journal's last image: the fleet's slot is the META's"
+    );
+    assert_eq!(
+        restore(&[&owners], Some(&[])),
+        kept(&[&owners], 1),
+        "the two samples disagree on the owner's: it stands (fail-closed)"
+    );
+    assert_eq!(
+        restore(&[], Some(&[&owners])),
+        kept(&[&owners], 1),
+        "held after the journal's last image: the keeper's carry"
+    );
+    assert_eq!(
+        restore(&[&fleet, &owners], Some(&[&fleet])),
+        kept(&[&fleet, &owners], 2),
+        "both slots: the META's fleet hold and the leaf's owner's, one carry each"
+    );
+    // NEGATIVE CONTROLS: a fresh shell takes the leaf's owner's hold alone.
+    assert_eq!(
+        restore(&[&owners], None),
+        vec![(None, rows(&[&owners]), 1)],
+        "a fresh shell, the owner's hold"
+    );
+    assert_eq!(
+        restore(&[&fleet], None),
+        Vec::new(),
+        "a fresh shell the fleet never halted"
+    );
+    assert_eq!(
+        restore(&[&fleet, &owners], None),
+        vec![(None, rows(&[&owners]), 1)],
+        "a fresh shell, the owner's slot alone"
+    );
+}
+
 /// REVIEW (separation lens, 2026-09-17): ON A COLD RESTORE, THE WINDOW'S
 /// FIRST LEAF KEEPS ITS IDENTITY. The window's bootstrap shell is grafted
 /// onto its first terminal leaf, and the graft carried only the USER meta:
@@ -3471,7 +4050,7 @@ fn handed_off_shell(local_id: u64) -> crate::spawn::Adopted {
         rekey: false,
         loader: false,
         history: crate::handoff_history::AdoptedHistory::default(),
-        hold: None,
+        holds: Vec::new(),
         title: String::new(),
         supervisor: None,
         attention_owners: Vec::new(),
@@ -3481,6 +4060,7 @@ fn handed_off_shell(local_id: u64) -> crate::spawn::Adopted {
         render_debt: None,
         fabric: Default::default(),
         timeline_id: 0,
+        log_carry: None,
         journal_key: None,
     }
 }
@@ -3837,6 +4417,7 @@ impl Successor {
         let parent = JournalId::now(cj::reaped_pid());
         let mut desk = cj::layout(&[("/a", "zsh"), ("/b", "claude")]);
         let claude = restore::AgentRestore {
+            word: String::new(),
             pid: 4242,
             start: "Sat Sep 27 01:02:03 2026".into(),
             program: "/opt/claude/bin/claude".into(),

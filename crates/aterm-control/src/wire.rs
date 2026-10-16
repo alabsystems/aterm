@@ -78,10 +78,15 @@ pub fn wait_ms(token: &str) -> Option<u64> {
 /// (ruling 2026-10-10, round fifteen, OUT-2).
 pub use aterm_codec::json::{escape as json_escape, escape_into as json_escape_into};
 
-/// A `"key":"<escaped>"` JSON member.
+/// A JSON string member, escaping both its key and value.
 #[must_use]
 pub fn json_str_field(key: &str, val: &str) -> String {
-    format!("\"{key}\":\"{}\"", json_escape(val))
+    let mut out = String::from("\"");
+    json_escape_into(&mut out, key);
+    out.push_str("\":\"");
+    json_escape_into(&mut out, val);
+    out.push('"');
+    out
 }
 
 /// Wrap a one-line JSON object body in the read-verb framing:
@@ -95,6 +100,17 @@ pub fn json_ok(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_member_keeps_arbitrary_keys_and_values_in_one_member() {
+        let key = "cwd\",\"injected\":\"\n\u{202e}";
+        let raw = "quoted \"value\"\\\n界";
+        let reply = format!("{{{}}}", json_str_field(key, raw));
+        let value: aterm_json::Value = aterm_json::from_str(&reply).expect("valid JSON");
+        assert_eq!(value.as_object().expect("object").len(), 1);
+        assert_eq!(value[key].as_str(), Some(raw));
+        assert!(!reply.contains(['\n', '\u{202e}']));
+    }
 
     /// The wire's JSON escape (OUT-2): what a terminal acts on past C0 — C1,
     /// DEL, the bidi controls, U+2028/9 — leaves as `\uXXXX`, never raw, and a

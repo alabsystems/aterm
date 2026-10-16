@@ -33,10 +33,10 @@ use crate::{App, accessibility, control_auth};
 /// encode and publication worker test in this file. The encoders run at
 /// `Background` QoS (`crate::qos::Role::Background`), the class macOS starves
 /// first: in a full `--workspace` run on a host at load average near 50
-/// (2026-09-27, several suites at once) a 10 s wait timed out (`visual capture
-/// worker reply: Timeout`) and passed alone three times out of three, and under
-/// the merge contract a render measured past 10 s on 2026-09-23 and 2026-09-24
-/// and then answered (`two_window_capture_rebinds_unequal_complete_render_contexts`,
+/// (several suites at once) a 10 s wait timed out (`visual capture worker
+/// reply: Timeout`) and passed alone three times out of three, and on a loaded
+/// machine a render takes past 10 s and then answers
+/// (`two_window_capture_rebinds_unequal_complete_render_contexts`,
 /// `headless_cursor_fx_tests`' image replies). A wait ends the moment the reply
 /// comes, so this bound only decides how long a worker that never runs takes to
 /// fail the test (the quarantine reaper's `REAPER_PATIENCE`, control.rs, is the
@@ -2670,9 +2670,18 @@ fn native_settings_field_kind(
         crate::prefs::EditKind::Enum { options } => {
             format!("enum options=[{}]", options.join(","))
         }
+        // Theme names are proper names with spaces ("Solarized Dark"), and a
+        // theme file's name is the person's own text: each is a quoted
+        // string, so a reader that splits the record on whitespace outside
+        // quotes (as it must for label=/value=) gets one token per option and
+        // no name can forge a `key=value` of the record.
         crate::prefs::EditKind::Theme => format!(
             "theme options=[{}]",
-            crate::native_settings::settings_theme_options(themes).join(",")
+            crate::native_settings::settings_theme_options(themes)
+                .iter()
+                .map(|name| format!("{name:?}"))
+                .collect::<Vec<_>>()
+                .join(",")
         ),
         crate::prefs::EditKind::Color => "color".to_string(),
     }
@@ -3573,7 +3582,7 @@ impl App {
         // suppress a user-forced Full policy or an explicit adaptive opt-out.
         let load_shed = self.load_shed_active();
         // PRISM WAKE knobs, resolved before the `self.windows` borrow below.
-        let streak_enabled = self.config.output_streak_enabled_or_default();
+        let streak_enabled = self.output_streak_shows();
         let streak_intensity = self.config.output_streak_intensity_or_default();
         let streak_tail = self.config.output_streak_tail_or_default();
         let streak_max = self.config.output_streak_max_streaks_or_default();
@@ -4162,10 +4171,7 @@ impl App {
             .map_or_else(|| window.overlay_fp(), |key| key.settings_fp);
         let card = Self::recording_card_identity(window.present_card());
         let theme = crate::VideoPresentedThemeIdentity {
-            fg: self.theme.fg,
-            bg: self.theme.bg,
-            cursor: self.theme.cursor,
-            selection: self.theme.selection,
+            colors: self.image_theme_fingerprint(),
         };
         let blink_phase = window.blink_phase;
         let cursor_override = (!window.focused && window.os_window.is_some())
@@ -4335,10 +4341,7 @@ impl App {
         let current_destination_height = window.win_px.map(|size| size.height.max(1) as usize);
         let current_card = Self::recording_card_identity(window.present_card());
         let current_theme = crate::VideoPresentedThemeIdentity {
-            fg: self.theme.fg,
-            bg: self.theme.bg,
-            cursor: self.theme.cursor,
-            selection: self.theme.selection,
+            colors: self.image_theme_fingerprint(),
         };
         let current_cursor_override = (!window.focused && window.os_window.is_some())
             .then_some(aterm_core::terminal::CursorStyle::HollowBlock);
@@ -5660,15 +5663,37 @@ impl App {
         })
     }
 
-    fn image_theme_fingerprint(&self) -> u64 {
-        use std::hash::{Hash, Hasher};
-
-        let mut theme = std::collections::hash_map::DefaultHasher::new();
-        self.theme.fg.hash(&mut theme);
-        self.theme.bg.hash(&mut theme);
-        self.theme.cursor.hash(&mut theme);
-        self.theme.selection.hash(&mut theme);
-        theme.finish() | 1
+    /// `theme-fingerprint`: every colour the installed theme draws, so two
+    /// themes that differ only in their ANSI palette, selected-text foreground
+    /// or bold brightening tell apart. The renderer chrome, then the installed
+    /// resolution's 16 ANSI slots, extended `palette[]` entries, selection
+    /// foreground and `bold_is_bright`, folded with FNV-1a so the value is
+    /// stable across builds and toolchains.
+    pub(crate) fn image_theme_fingerprint(&self) -> u64 {
+        let mut hash = aterm_hash::Fnv1a64::new();
+        hash.write(b"theme-fingerprint-v2");
+        for chrome in [
+            self.theme.fg,
+            self.theme.bg,
+            self.theme.cursor,
+            self.theme.selection,
+        ] {
+            hash.write(&chrome.to_le_bytes());
+        }
+        let colors = &self.installed_colors;
+        for rgb in &colors.scheme.ansi {
+            hash.write(&[rgb.r, rgb.g, rgb.b]);
+        }
+        hash.write(&(colors.extended_palette.len() as u64).to_le_bytes());
+        for (index, rgb) in &colors.extended_palette {
+            hash.write(&[*index, rgb.r, rgb.g, rgb.b]);
+        }
+        match colors.selection_fg() {
+            Some(rgb) => hash.write(&[1, rgb.r, rgb.g, rgb.b]),
+            None => hash.write(&[0]),
+        }
+        hash.write(&[u8::from(colors.bold_is_bright)]);
+        hash.finish() | 1
     }
 
     /// Hash the exact terminal-owned model fields a renderer consumes.
@@ -6623,13 +6648,12 @@ impl App {
     /// here: its AppKit read begins with `+[NSApplication sharedApplication]`, which
     /// CREATES the application object — and with it the process's WindowServer
     /// connection — in a headless process, whose display-free loop never built one
-    /// ([`read_app_menu_bar`] says what happened when it did).
+    /// ([`crate::app_menu_bar`] says what happened when it did).
     ///
     /// Off macOS there is no native chrome, so it returns a single explanatory line.
     #[cfg(target_os = "macos")]
     pub(crate) fn read_native_chrome(&self) -> Vec<String> {
-        use aterm_objc::{Id, autoreleasepool, sel};
-        use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        use aterm_objc::{autoreleasepool, sel};
 
         use crate::appkit::consts::{
             NS_TOOLBAR_DISPLAY_MODE_DEFAULT, NS_TOOLBAR_DISPLAY_MODE_ICON_AND_LABEL,
@@ -6658,23 +6682,19 @@ impl App {
         autoreleasepool(|_| {
             // --- The frontmost window's NSToolbar ------------------------------
             // Reach the NSWindow the SAME way `toolbar::install_window_toolbar`
-            // does: winit Window -> AppKit
-            // RawWindowHandle -> NSView -> NSWindow.
+            // does: winit Window -> content NSView -> NSWindow.
             let ns_window = self
                 .front()
                 .and_then(|ws| ws.os_window.as_ref())
-                .and_then(|w| w.window_handle().ok())
-                .and_then(|handle| match handle.as_raw() {
-                    // SAFETY: `ns_view` points at the front window's live NSView
-                    // (owned by winit for the window's lifetime); we only borrow it
-                    // on the main thread, as AppKit requires, to read its `window`.
+                .map(|w| crate::platform::ns_view_of(w))
+                .filter(|view| !view.is_null())
+                .and_then(|view| {
+                    // SAFETY: `view` is the front window's live NSView (owned by
+                    // winit for the window's lifetime); we only borrow it on the
+                    // main thread, as AppKit requires, to read its `window`.
                     // `-[NSView window]` is `-(NSWindow *)` and +0.
-                    RawWindowHandle::AppKit(h) => {
-                        let view = Id::from_ptr(h.ns_view.as_ptr());
-                        let window = unsafe { appkit::send_id(view, sel!(window)) };
-                        (!window.is_null()).then_some(window)
-                    }
-                    _ => None,
+                    let window = unsafe { appkit::send_id(view, sel!(window)) };
+                    (!window.is_null()).then_some(window)
                 });
 
             // SAFETY: all the AppKit getters below (`toolbar`/`toolbarStyle`/
@@ -7229,33 +7249,29 @@ impl App {
     /// RGBA8 + dims. The encode/write half lives on the encode worker.
     #[cfg(target_os = "macos")]
     fn window_rgba_of(&self, wid: Option<WindowId>) -> Result<(Vec<u8>, u32, u32), String> {
-        use aterm_objc::{Id, sel};
-        use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        use aterm_objc::sel;
 
         use crate::appkit;
 
         // Reach the window's NSView the SAME way `read_native_chrome` /
-        // `toolbar::install_window_toolbar` do: winit Window -> AppKit RawWindowHandle -> NSView. `None` here means
-        // there is no attached OS surface — i.e. headless — so the capture has no
-        // window to photograph.
+        // `toolbar::install_window_toolbar` do: winit Window -> content NSView.
+        // `None` here means there is no attached OS surface — i.e. headless — so
+        // the capture has no window to photograph.
         let Some(os_window) = wid
             .and_then(|id| self.windows.get(&id))
             .and_then(|ws| ws.os_window.as_ref())
         else {
             return Err("no window to capture (headless)".to_string());
         };
-        let Ok(handle) = os_window.window_handle() else {
+        let view = crate::platform::ns_view_of(os_window);
+        if view.is_null() {
             return Err("no window to capture (headless)".to_string());
-        };
-        let RawWindowHandle::AppKit(h) = handle.as_raw() else {
-            return Err("no window to capture (headless)".to_string());
-        };
-        // SAFETY: `ns_view` points at the front window's live NSView (owned by winit
+        }
+        // SAFETY: `view` points at the front window's live NSView (owned by winit
         // for the window's lifetime); we only borrow it on the main thread, as AppKit
         // requires, to read its `window` and the window's `windowNumber`.
         // `-[NSView window]` is `-(NSWindow *)` and +0 — borrowed, and nothing here
         // outlives the two accessor calls below, so no retain is owed.
-        let view = Id::from_ptr(h.ns_view.as_ptr());
         let ns_window = unsafe { appkit::send_id(view, sel!(window)) };
         if ns_window.is_null() {
             return Err("no window to capture (headless)".to_string());
@@ -7375,7 +7391,6 @@ impl App {
         window_height: u32,
     ) -> Result<Option<RgbaOverlay>, String> {
         use aterm_objc::{Id, Obj, class, sel};
-        use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
         use crate::appkit;
         use crate::appkit::consts::{
@@ -7397,18 +7412,15 @@ impl App {
             .os_window
             .as_ref()
             .ok_or_else(|| "no window to capture (headless)".to_string())?;
-        let handle = os_window
-            .window_handle()
-            .map_err(|error| format!("window capture could not read AppKit handle: {error}"))?;
-        let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
-            return Err("window capture has no AppKit window".to_string());
-        };
+        let content = crate::platform::ns_view_of(os_window);
+        if content.is_null() {
+            return Err("window capture could not read the AppKit content view".to_string());
+        }
         // SAFETY: Winit owns this live NSView for the OS window's lifetime. This
         // method runs only on the application's main event-loop thread.
         // `-[NSView window]` is `-(NSWindow *)` and `-[NSWindow
         // standardWindowButton:]` is `-(NSButton *)(NSWindowButtonType)`, an
         // NSUInteger — both +0, borrowed for the pool this runs inside.
-        let content = Id::from_ptr(handle.ns_view.as_ptr());
         let ns_window = unsafe { appkit::send_id(content, sel!(window)) };
         if ns_window.is_null() {
             return Err("window capture lost its AppKit window".to_string());
@@ -7832,179 +7844,6 @@ impl App {
     }
 }
 
-/// THE APPLICATION MENU BAR, read off AppKit (`NSApplication.mainMenu`): the
-/// `chrome` verb's `menu …` lines on a WINDOWED macOS instance, reached only
-/// through the injected [`App::app_menu_bar`] field, which `main_entry` sets to
-/// this function only when the launch is not `--headless`.
-///
-/// Its first send is `+[NSApplication sharedApplication]`, which answers the
-/// application object a windowed loop built at launch — and CREATES one when
-/// there is none. A headless instance has none on purpose: its display-free
-/// loop (`vendor/winit/src/platform_impl/macos/headless.rs`) exists so the
-/// process never becomes a WindowServer client, and creating the application
-/// object is exactly what makes it one (`-[NSApplication init]` checks the
-/// process in with LaunchServices and opens its SkyLight connection, and
-/// WindowServer then runs a synchronous TCC preflight of the binary on ITS main
-/// thread — AGENTS.md). Measured 2026-09-26: with that loop in place an
-/// idle headless instance drew no WindowServer preflight, and one `aterm ctl
-/// chrome` against it drew one, from this send reached through
-/// `read_native_chrome`. So a headless instance and every unit test get
-/// [`no_app_menu_bar`] instead, and `grep_guard` B9h keeps this function the
-/// only place `read_native_chrome`'s file sends `+sharedApplication`.
-#[cfg(target_os = "macos")]
-pub(crate) fn read_app_menu_bar(mtm: crate::appkit::MainThread) -> Vec<String> {
-    /// The title a row shows now: ⌘W's is live state that the item carries
-    /// only as last stamped (`menu::native_row_title`).
-    fn menu_item_title(item: aterm_objc::Id) -> String {
-        use aterm_objc::sel;
-        // SAFETY: `item` is a live `NSMenuItem` borrowed from its menu's
-        // `itemArray` inside the caller's pool, on the main thread; `-tag`
-        // and `-title` are side-effect-free getters with no preconditions,
-        // and the title is +0, copied out before the pool drains.
-        let (tag, stamped) = unsafe {
-            (
-                crate::appkit::send_isize(item, sel!(tag)),
-                crate::appkit::nsstring_to_rust(crate::appkit::send_id(item, sel!(title))),
-            )
-        };
-        crate::menu::native_row_title(tag, stamped)
-    }
-
-    /// A menu item the menu does not show: `-isHidden`, or an
-    /// `-isAlternate` item standing in for its neighbour only while a
-    /// modifier is held. Both are `-(BOOL)` getters with no side effect.
-    fn menu_item_unshown(item: aterm_objc::Id) -> bool {
-        use aterm_objc::sel;
-        // SAFETY: `item` is a live `NSMenuItem` borrowed from its menu's
-        // `itemArray` inside the caller's pool, on the main thread; both
-        // getters are `-(BOOL)` accessors with no preconditions.
-        unsafe {
-            crate::appkit::send_bool(item, sel!(isHidden))
-                || crate::appkit::send_bool(item, sel!(isAlternate))
-        }
-    }
-
-    use aterm_objc::{Id, autoreleasepool, class, sel};
-
-    use crate::appkit::{self, MainThread};
-
-    let mut out: Vec<String> = Vec::new();
-    // Every object read here is borrowed (+0) for this pool; only `String`s
-    // escape it (`read_native_chrome`'s reason for its own pool, unchanged).
-    autoreleasepool(|_| {
-        // SAFETY: `+sharedApplication` and `-mainMenu`/`-itemArray`/`-title`/
-        // `-submenu` are getters with no preconditions beyond a live receiver,
-        // on the main thread (`mtm`). All are +0 and borrowed for this pool.
-        // `+[NSApplication sharedApplication]` CREATES the instance on first
-        // call, which is why `objc2` demanded the marker for it — that
-        // obligation is why `mtm` is taken and consumed here rather than
-        // dropped in the port — and why only a windowed instance, whose loop
-        // created it at launch, may reach this (see the doc comment).
-        unsafe {
-            let _: MainThread = mtm;
-            let app = appkit::send_id(class(c"NSApplication").as_id(), sel!(sharedApplication));
-            let main = if app.is_null() {
-                Id::NIL
-            } else {
-                appkit::send_id(app, sel!(mainMenu))
-            };
-            if main.is_null() {
-                out.push("menu (none)".to_string());
-            } else {
-                let tops = appkit::send_id(main, sel!(itemArray));
-                let n = if tops.is_null() {
-                    0
-                } else {
-                    appkit::send_usize(tops, sel!(count))
-                };
-                for i in 0..n {
-                    let top = appkit::send_id_usize(tops, sel!(objectAtIndex:), i);
-                    if top.is_null() {
-                        continue;
-                    }
-                    let title = appkit::nsstring_to_rust(appkit::send_id(top, sel!(title)));
-                    let sub = appkit::send_id(top, sel!(submenu));
-                    if sub.is_null() {
-                        // A top-level item with no submenu (uncommon for a bar).
-                        out.push(format!("menu {title:?}: (no submenu)"));
-                        continue;
-                    }
-                    let kids = appkit::send_id(sub, sel!(itemArray));
-                    let kn = if kids.is_null() {
-                        0
-                    } else {
-                        appkit::send_usize(kids, sel!(count))
-                    };
-                    // One level of SUBMENU (round 19, File ▸ Driving) prints
-                    // exactly as the model serialiser prints it
-                    // (`menu::menu_chrome_lines`): `<label> ▸` in this line,
-                    // then the submenu as its own `menu "<parent> ▸ <label>"`
-                    // line right after — byte-matched by
-                    // `chrome_lines_render_titled_sections`' golden off macOS.
-                    let mut names: Vec<String> = Vec::with_capacity(kn);
-                    let mut nested: Vec<String> = Vec::new();
-                    for j in 0..kn {
-                        let kid = appkit::send_id_usize(kids, sel!(objectAtIndex:), j);
-                        if kid.is_null() {
-                            continue;
-                        }
-                        let name = menu_item_title(kid);
-                        // Skip separators (empty title) so the listing reads as
-                        // the command set, not the dividers — and what the
-                        // menu does not SHOW (ruling 267): AppKit keeps hidden
-                        // items and Option-key alternates in `itemArray`
-                        // (the Edit menu's dictation and emoji entries read
-                        // two and three times over).
-                        if name.is_empty() || menu_item_unshown(kid) {
-                            continue;
-                        }
-                        let sub = appkit::send_id(kid, sel!(submenu));
-                        if sub.is_null() {
-                            names.push(name);
-                            continue;
-                        }
-                        names.push(format!("{name} \u{25b8}"));
-                        let sub_title = format!("{title} \u{25b8} {name}");
-                        let grand = appkit::send_id(sub, sel!(itemArray));
-                        let gn = if grand.is_null() {
-                            0
-                        } else {
-                            appkit::send_usize(grand, sel!(count))
-                        };
-                        let rows: Vec<String> = (0..gn)
-                            .map(|g| {
-                                let item = appkit::send_id_usize(grand, sel!(objectAtIndex:), g);
-                                if item.is_null() || menu_item_unshown(item) {
-                                    String::new()
-                                } else {
-                                    menu_item_title(item)
-                                }
-                            })
-                            .filter(|t| !t.is_empty())
-                            .collect();
-                        nested.push(format!("menu {sub_title:?}: {}", rows.join(", ")));
-                    }
-                    out.push(format!("menu {title:?}: {}", names.join(", ")));
-                    out.append(&mut nested);
-                }
-            }
-        }
-    });
-    out
-}
-
-/// The menu-bar reader for a HEADLESS instance and for every unit test:
-/// `menu (none)`, the truth for a process with no menu bar, answered without
-/// asking AppKit. [`read_app_menu_bar`] would have to create the application
-/// object to ask, and with it a WindowServer connection (see there). The same
-/// injection as `keymap::no_lock_modifiers` / `platform::no_recent_user_input_event`,
-/// for the same reason (AGENTS.md's injected-field pattern). The in-app menu MODEL stays
-/// introspectable headless through `controls menu`.
-#[cfg(target_os = "macos")]
-pub(crate) fn no_app_menu_bar(_mtm: crate::appkit::MainThread) -> Vec<String> {
-    vec!["menu (none)".to_string()]
-}
-
 impl App {
     /// Capture an auxiliary own-rendered GUI surface to the confined PNG, replying its
     /// `(width, height)`. Serves Settings-route aliases such as `window prefs`
@@ -8343,6 +8182,167 @@ mod native_settings_compatibility_controls_tests {
         assert!(
             !trail.contains(HOST_ONLY),
             "host generation leaked into a stale view: {trail}"
+        );
+    }
+
+    /// Split a `controls` record the way its quoted fields require: on
+    /// whitespace outside `"…"` strings (with `\"` and `\\` escapes).
+    fn split_record(line: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut token = String::new();
+        let (mut quoted, mut escaped) = (false, false);
+        for ch in line.chars() {
+            if escaped {
+                escaped = false;
+            } else if quoted && ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                quoted = !quoted;
+            } else if ch.is_whitespace() && !quoted {
+                if !token.is_empty() {
+                    out.push(std::mem::take(&mut token));
+                }
+                continue;
+            }
+            token.push(ch);
+        }
+        if !token.is_empty() {
+            out.push(token);
+        }
+        out
+    }
+
+    /// `controls settings` lists Settings ▸ Themes like every other page: a
+    /// `ui` record per drawn card (role button, its accessible label, its id
+    /// as the value), the chips and the filter; and in Customize the
+    /// registry rows as `field` records, beside the palette's slots.
+    #[test]
+    fn controls_settings_lists_showcase_rows() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        {
+            let window = app.windows.get_mut(&wid).unwrap();
+            window.cols = 160;
+            window.rows = 50;
+        }
+        assert!(app.open_settings_tab(SettingsRoute::Themes));
+        let lines = app.read_aux_controls(AuxTarget::Prefs);
+        let card = lines
+            .iter()
+            .find(|line| {
+                line.starts_with("ui key=\"settings/showcase/card/")
+                    && line.contains(" role=Button ")
+            })
+            .unwrap_or_else(|| panic!("a card record: {lines:#?}"));
+        let tokens = split_record(card);
+        assert!(tokens.iter().any(|token| token == "role=Button"), "{card}");
+        assert!(
+            tokens.iter().any(|token| token.starts_with("label=")
+                && token.contains("text contrast")
+                && token.ends_with(":1\"")),
+            "{card}"
+        );
+        for key in [
+            "settings/showcase/filter",
+            "settings/showcase/chip/all",
+            "settings/showcase/chip/yours",
+            "settings/showcase/view/customize",
+        ] {
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.starts_with(&format!("ui key=\"{key}\" "))),
+                "{key}"
+            );
+        }
+        let (_, instance, view, _) = app.native_settings_view_target().unwrap();
+        let _ = app.native_runtime.dispatch(
+            instance,
+            view,
+            crate::native_app::AppEvent::Action(crate::native_app::ActionInvocation {
+                id: crate::native_ui::ActionId::new("settings/showcase/view/customize"),
+                value: None,
+            }),
+        );
+        let lines = app.read_aux_controls(AuxTarget::Prefs);
+        for key in [
+            crate::prefs::EDIT_FONT_FAMILY,
+            crate::prefs::EDIT_FOREGROUND,
+        ] {
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.starts_with(&format!("field key={key} "))),
+                "{key}: {lines:#?}"
+            );
+        }
+        // The palette is on a later page: the pager reaches it.
+        let mut found = false;
+        for _ in 0..12 {
+            let lines = app.read_aux_controls(AuxTarget::Prefs);
+            if lines
+                .iter()
+                .any(|line| line.starts_with("ui key=\"settings/showcase/palette/0\" "))
+            {
+                found = true;
+                break;
+            }
+            let _ = app.native_runtime.dispatch(
+                instance,
+                view,
+                crate::native_app::AppEvent::ScrollPage(1),
+            );
+        }
+        assert!(found, "palette slot");
+    }
+
+    /// The theme field's options are quoted strings: a quote-aware split
+    /// keeps "Solarized Dark" in one token and yields no stray `key=value`.
+    #[test]
+    fn controls_theme_options_are_quoted_and_split_whole() {
+        let mut app = App::headless_for_test();
+        // One theme always: Top Settings draws the one Color theme control
+        // (a theme that follows the system draws its Dark and Light slots).
+        app.native_config_service = crate::native_config_service::VersionedConfigService::new(
+            "theme = \"Nord\"\n".to_string(),
+        )
+        .unwrap();
+        let wid = WindowId(0);
+        {
+            let window = app.windows.get_mut(&wid).unwrap();
+            window.cols = 160;
+            window.rows = 50;
+        }
+        assert!(app.open_settings_tab(SettingsRoute::Home));
+        let lines = app.read_aux_controls(AuxTarget::Prefs);
+        let theme = lines
+            .iter()
+            .find(|line| line.starts_with(&format!("field key={} ", crate::prefs::EDIT_THEME)))
+            .expect("Top Settings exposes the theme picker");
+        let tokens = split_record(theme);
+        let options = tokens
+            .iter()
+            .find_map(|token| token.strip_prefix("options="))
+            .expect("theme options");
+        assert!(
+            options.contains("\"Solarized Dark\""),
+            "a spaced name is one quoted option: {options}"
+        );
+        assert!(
+            tokens.iter().all(|token| !token.starts_with("Dark")),
+            "no option leaks a stray token: {tokens:?}"
+        );
+        // Every token after the kind is a key=value of the record itself.
+        assert!(
+            tokens.iter().skip(1).all(|token| token.contains('=')),
+            "{tokens:?}"
+        );
+        // Negative control: the plain whitespace split the old unquoted
+        // record allowed does break the spaced name apart.
+        assert!(
+            theme
+                .split_whitespace()
+                .any(|token| token.starts_with("Dark\""))
         );
     }
 

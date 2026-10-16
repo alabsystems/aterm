@@ -278,10 +278,10 @@ pub(crate) struct Requested {
 /// separated, so `mail:kinds=task,ask` arrives as two pieces. The rule that
 /// puts it back: a piece that names NO stream continues the `mail` token. It is
 /// unambiguous because the stream names are a closed set and so are the kinds
-/// ([`crate::fabric::KINDS`]), and it fails CLOSED either way — a continuation
-/// that is not a kind is rejected by [`parse_mail_params`], and a mistyped
-/// stream name outside a `mail:` token still reaches the `_ => return None`
-/// arm.
+/// ([`aterm_types::fabric_grammar::KINDS`]), and it fails CLOSED either way — a
+/// continuation that is not a kind is rejected by [`parse_mail_params`], and a
+/// mistyped stream name outside a `mail:` token still reaches the `_ => return
+/// None` arm.
 fn fold_mail_params(s: &str) -> Vec<String> {
     // THE ONE VOCABULARY, plus the `ts` alias the catalog spells inside
     // `timestamps`. A fourth hand-written copy is how `mail` came to be missing
@@ -333,9 +333,10 @@ fn is_sender_selector(v: &str) -> bool {
 /// combination, in any order.
 ///
 /// FAIL-CLOSED on anything else: an unknown key, a repeated one, an empty
-/// value, or a kind that is not one of [`crate::fabric::KINDS`]. A filter that
-/// silently matched nothing would be a subscription that looks alive and says
-/// nothing — the same failure `parse`'s no-source rule exists to prevent.
+/// value, or a kind that is not one of [`aterm_types::fabric_grammar::KINDS`].
+/// A filter that silently matched nothing would be a subscription that looks
+/// alive and says nothing — the same failure `parse`'s no-source rule exists to
+/// prevent.
 fn parse_mail_params(spec: &str) -> Option<crate::fabric::MailFilter> {
     let mut want = crate::fabric::MailFilter::default();
     if spec.is_empty() {
@@ -347,13 +348,13 @@ fn parse_mail_params(spec: &str) -> Option<crate::fabric::MailFilter> {
                 return None;
             }
             for k in v.split(',') {
-                if !crate::fabric::KINDS.contains(&k) {
+                if !aterm_types::fabric_grammar::is_kind(k) {
                     return None;
                 }
                 want.kinds.push(k.to_string());
             }
         } else if let Some(v) = part.strip_prefix("topic=") {
-            if want.topic.is_some() || !crate::fabric::is_topic(v) {
+            if want.topic.is_some() || !aterm_types::fabric_grammar::is_topic(v) {
                 return None;
             }
             want.topic = Some(v.to_string());
@@ -1127,6 +1128,10 @@ fn drain_title_event(
 ///   registry, and the sid stops resolving in the same store write that records
 ///   it. It lands in the dying watch's final pass ([`Closing::drain`]), so it
 ///   always precedes `EVENT <sid> exited`.
+/// * `EVENT <sid> render <verdict>` for a `render` row (the resize ledger), and
+///   `EVENT <sid> <kind> <payload>` for the fabric digest's kinds (`inbox`,
+///   `post`, `hold`, …; [`crate::fabric::FABRIC_EVENT_KINDS`]) — metadata only,
+///   no body.
 ///
 /// Every other kind (`spawned`, `state-change`, `title-change`, `cwd-change`) is
 /// skipped: title has its own emitter and lifecycle state is what `exited`
@@ -1269,13 +1274,18 @@ pub(crate) fn timeline_wire_kind(kind: &str) -> Option<&'static str> {
         // displaced=<+-k> net=zero at=<ms>` / `EVENT <local> render
         // healed run=<r> after_ms=<ms>`, the push face of `status render=`.
         "render" => Some("render"),
+        // The `[harness]` policy cell moved (`App::announce_harness_policy`):
+        // `EVENT <local> harness-policy gen=<n>`, on which an agent that
+        // answers for itself re-reads `harness policy`.
+        crate::harness_policy_verb::HARNESS_POLICY_EVENT => Some("harness-policy"),
         // The FABRIC digest (design §11.2): `inbox`, `inbox-seen`, `post`,
         // `fetch`, `post-landed`, `hold`, `topic`. Their wire name IS the record kind, and the list
         // lives beside the code that WRITES them
         // ([`crate::fabric::FABRIC_EVENT_KINDS`]) rather than being retyped here,
         // so a new fabric event cannot ship recorded-but-never-pushed — the
         // exact drift the `closing` row shipped with. NONE of them carries a body:
-        // `inbox` is a count and an offset, `post` an address and a kind. The
+        // `inbox` is a row id, the sender's full principal, a kind and an offset,
+        // `post` an id, an address and a kind with their options. The
         // digest tells an agent that mail EXISTS; reading it is a separate,
         // deliberate `inbox` call, so a watcher is never handed message text it
         // did not ask for.
@@ -1533,26 +1543,19 @@ fn frame_gap(sid: &str, seq: u64) -> String {
     format!("GAP {sid} resync={seq}\n")
 }
 
-/// A `GAP <sid> events-resync=<floor>` frame: a `since-turn=` resume anchor sat below
-/// the ledger's retained low-water, so turn records in `(anchor, floor)` were
-/// drop-oldest evicted, or left behind by a self-update handoff that could not carry
-/// the ledger whole, and are gone — the resumed subscriber missed them (re-read
-/// `history` if it needs the content). The events-stream twin of `frame_gap`.
-///
-/// Returns a [`Frame`], not a `String`, because unlike its sibling formatters this
-/// one is emitted STANDALONE rather than appended to a target's wake body — and a
-/// standalone write is exactly what has to go through the egress to be stamped.
 /// The `mail` stream: one `MAIL` line per newly delivered row the filter wants,
 /// oldest first, preceded by a `GAP` when the ring evicted rows this subscriber
 /// was never shown. Appended to the wake's buffer like every other digest line,
 /// so a wake is still ONE frame.
 ///
 /// The cursor advances to the ring's HIGH, not to the last row emitted, so a
-/// row the filter rejected is stepped over once and never reconsidered — the
-/// same monotone rule the `Stop` hook's wait uses, and what stops a
-/// `kinds=`-filtered subscription re-walking the ring on every wake.
+/// row the filter rejected is stepped over once and never reconsidered — what
+/// stops a `kinds=`-filtered subscription re-walking the ring on every wake.
 ///
-/// NO BODY REACHES HERE: [`crate::fabric::MailLine`] has no field for one.
+/// NO BODY REACHES HERE: [`crate::fabric::MailLine`] has no field for one. The
+/// line is metadata, and `from=` is the sender's FULL principal for every row,
+/// an unaccepted sender's too — never a class. Its room for words is the
+/// principal grammar [`crate::fabric::valid_principal`] holds `deliver` to.
 ///
 /// LATENCY is the loop's 250 ms liveness tick, not a delivery-side wake:
 /// `cmd_deliver` signals the session's own condvar (what `await inbox` parks
@@ -1589,6 +1592,15 @@ fn drain_mail_events(watch: &mut Watch, sid: &str, out: &mut String) {
     watch.last_mail_id = watch.last_mail_id.max(since.high);
 }
 
+/// A `GAP <sid> events-resync=<floor>` frame: a `since-turn=` resume anchor sat below
+/// the ledger's retained low-water, so turn records in `(anchor, floor)` were
+/// drop-oldest evicted, or left behind by a self-update handoff that could not carry
+/// the ledger whole, and are gone — the resumed subscriber missed them (re-read
+/// `history` if it needs the content). The events-stream twin of `frame_gap`.
+///
+/// Returns a [`Frame`], not a `String`, because unlike its sibling formatters this
+/// one is emitted STANDALONE rather than appended to a target's wake body — and a
+/// standalone write is exactly what has to go through the egress to be stamped.
 fn frame_gap_events(tag: Tag, floor: u64) -> Frame {
     Frame::text(tag, format!("GAP {tag} events-resync={floor}\n"))
 }
@@ -2360,8 +2372,8 @@ fn pump<W: Write, P: FnMut() -> bool>(
 ///
 /// TEST-ONLY IS ENFORCED, not documented: the variable is read only in a build
 /// with `debug_assertions` — aterm-link's `Fault` rule — and only through
-/// `dev_seam!`, the one reader `env_reads` admits for a development seam, so a
-/// released binary has no hold to arm.
+/// `dev_seam!`, which compiles to `None` in a release build, so a released
+/// binary has no hold to arm.
 #[cfg(debug_assertions)]
 fn push_held(step: &str) -> bool {
     static DIR: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();

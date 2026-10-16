@@ -10,7 +10,8 @@
 //! background pane EOF, window open/close, background tab churn), and each step
 //! projects the real state onto the model's `<<truth, handle, next>>`. The three
 //! seams that spawn a PTY are driven from their post-spawn half
-//! (`install_new_tab`, `install_split_pane`, `install_window_state_with_parent`)
+//! (`install_new_tab`, `install_split_pane`, `install_window_state_with_parent`;
+//! the first two wrap what a tab or split spawned off the loop lands through)
 //! with a stub session; that half moves the front and re-points the handle.
 //!
 //! Projection:

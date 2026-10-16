@@ -12,11 +12,8 @@ impl StreamingSearch {
         self.current_index == 0 || self.current_index <= self.results.len()
     }
 
-    /// Verify INV-SEARCH-2: Result positions are internally consistent.
-    ///
-    /// Requires `start_col < end_col` (strict inequality) and `match_len > 0`,
-    /// INV-SEARCH-2c. Zero-display-width matches
-    /// (e.g., combining marks) must be filtered before insertion.
+    /// Verify INV-SEARCH-2: every result has `start_col < end_col` and `match_len ==
+    /// end_col - start_col`, so zero-width matches must be dropped before insertion.
     #[must_use]
     pub(crate) fn verify_result_positions_valid(&self) -> bool {
         self.results.iter().all(|m| {

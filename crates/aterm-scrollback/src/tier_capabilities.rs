@@ -2,34 +2,30 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Build-time tier capabilities of this scrollback crate (audit E1).
+//! Build-time tier capabilities of this scrollback crate.
 //!
-//! The tiered store is feature-shaped: the default build is the headless
-//! hot(RAM)+warm(LZ4) store whose "cold" pages also encode with LZ4 (the wasm
-//! renderer's shape), while native builds may opt into the zstd cold codec and
-//! the mmap disk spill. Hosts embedding several engine builds (orc: wasm
-//! renderer panes + native daemon sessions) need to DISTINGUISH those shapes to
-//! size budgets and describe retention honestly — a "same API" surface that
-//! silently means lz4-in-RAM on one host and zstd-on-disk on another is how
-//! capability drift ships. This module is the single build-truth answer.
+//! Every build keeps hot (RAM) + warm (LZ4) + LZ4 cold pages; native builds may
+//! add the mmap disk spill. Hosts embedding several engine builds (wasm renderer
+//! panes, native daemon sessions) read this to size budgets and describe
+//! retention per build.
 
-/// Codec used for cold-tier pages in THIS build.
+/// Codec used for cold-tier pages in this build.
+///
+/// A single codec (docs/AUDIT-third-party-2026-10-15.md, step ZC.2); the enum
+/// stays so the wire shape (`coldCodec`) is unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColdTierCodec {
-    /// Default build: cold pages fall back to the warm tier's LZ4 codec.
+    /// Cold pages use the warm tier's size-prepended LZ4 codec.
     Lz4,
-    /// `zstd` feature: cold pages use the zstd codec (`COLD_ZSTD_LEVEL`).
-    Zstd,
 }
 
-/// The tier shape this crate was BUILT with (cargo features, not runtime state).
+/// The tier shape this crate was built with (cargo features, not runtime state).
 ///
-/// Values are compile-time constants: capability answers must not depend on
-/// which store instance is asked (a per-instance answer would let a
-/// misconfigured pane misreport the build).
+/// Compile-time constants: the answer must not depend on which store instance
+/// is asked, or a misconfigured pane could misreport the build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TierCapabilities {
-    /// Cold-tier page codec (`Lz4` default, `Zstd` with the `zstd` feature).
+    /// Cold-tier page codec.
     pub cold_codec: ColdTierCodec,
     /// `disk-tier` feature: mmap-backed cold spill is available
     /// ([`DiskBackedScrollback`](crate::DiskBackedScrollback)).
@@ -42,32 +38,8 @@ impl TierCapabilities {
     #[must_use]
     pub const fn current() -> Self {
         Self {
-            cold_codec: if cfg!(feature = "zstd") {
-                ColdTierCodec::Zstd
-            } else {
-                ColdTierCodec::Lz4
-            },
+            cold_codec: ColdTierCodec::Lz4,
             disk_spill: cfg!(feature = "disk-tier"),
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn capabilities_track_the_built_features() {
-        let caps = TierCapabilities::current();
-        assert_eq!(
-            caps.cold_codec == ColdTierCodec::Zstd,
-            cfg!(feature = "zstd")
-        );
-        assert_eq!(caps.disk_spill, cfg!(feature = "disk-tier"));
-        // disk-tier implies zstd (the on-disk page format is zstd) — the
-        // feature graph must keep that edge.
-        if caps.disk_spill {
-            assert_eq!(caps.cold_codec, ColdTierCodec::Zstd);
         }
     }
 }

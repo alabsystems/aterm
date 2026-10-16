@@ -109,16 +109,13 @@ fn only_a_bare_sigkill_needs_proof_that_the_candidate_died_first() {
     );
 }
 
-/// The production assembly against a real child, through the reject path's own
-/// function: probe, kill, reap, classify. The kernel produces the facts, so the
-/// order of the steps is under test: an eager pre-kill probe would turn the
-/// `exit(0)` below into `Signalled { SIGKILL }`.
+/// The reject path's own assembly against a real child: probe, kill, reap, classify. An eager
+/// pre-kill probe would turn the `exit(0)` below into `Signalled { SIGKILL }`.
 #[test]
 fn a_candidate_that_exits_on_its_own_is_read_as_its_own_exit_not_our_kill() {
-    // A child that exits with the commonest refusal code, then a wait for the
-    // kernel to agree it is dead: the state the reject path finds it in.
-    // std on purpose: `HandoffCandidateHandle::Forked` holds the shipped fork lane's
-    // `std::process::Child`.
+    // A child that has exited with the commonest refusal code, as the reject path finds it.
+    // std, not spawnfd: `HandoffCandidateHandle::Forked` holds a `std::process::Child`, as
+    // in the shipped fork lane (same below).
     let child = std::process::Command::new("/bin/sh")
         .arg("-c")
         .arg("exit 0")
@@ -153,8 +150,6 @@ fn a_candidate_that_exits_on_its_own_is_read_as_its_own_exit_not_our_kill() {
 /// pre-kill probe can tell them apart.
 #[test]
 fn a_candidate_the_machine_killed_is_read_as_the_machine_s_kill() {
-    // std on purpose: `HandoffCandidateHandle::Forked` holds the shipped fork lane's
-    // `std::process::Child`.
     let child = std::process::Command::new("/bin/sleep")
         .arg("30")
         .spawn()
@@ -188,8 +183,6 @@ fn a_candidate_the_machine_killed_is_read_as_the_machine_s_kill() {
 /// read as the machine reclaiming it.
 #[test]
 fn a_kill_this_process_sends_is_never_read_as_the_candidate_s_own_death() {
-    // std on purpose: `HandoffCandidateHandle::Forked` holds the shipped fork lane's
-    // `std::process::Child`.
     let child = std::process::Command::new("/bin/sleep")
         .arg("30")
         .spawn()
@@ -215,8 +208,6 @@ fn a_kill_this_process_sends_is_never_read_as_the_candidate_s_own_death() {
 /// code the classifier would call structural.
 #[test]
 fn a_non_child_died_outcome_gathers_no_evidence_at_all() {
-    // std on purpose: `HandoffCandidateHandle::Forked` holds the shipped fork lane's
-    // `std::process::Child`.
     let child = std::process::Command::new("/bin/sh")
         .arg("-c")
         .arg("exit 74")

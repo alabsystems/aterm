@@ -39,10 +39,9 @@ pub const AUTO_FLOOR_MIB: u64 = 4 * 1024;
 pub const UNKNOWN_MACHINE_MIB: u64 = 16 * 1024;
 
 /// The swap rate, KiB/s (in plus out), at which a Mac whose kernel says warn
-/// is thrashing ([`AgentMemory::strain`]): 4 MB/s, equal to
-/// `aterm_messages::strain`'s `WARN_SWAP_ENTER_KIB_S` (aterm-gui pins the two
-/// equal). Machines frozen by memory swap tens of MB/s at warn.
-pub const THRASH_SWAP_KIB_S: u32 = 4096;
+/// is thrashing ([`AgentMemory::strain`]): the strain engine's own warn enter
+/// line, 4 MB/s. Machines frozen by memory swap tens of MB/s at warn.
+pub use aterm_messages::strain::WARN_SWAP_ENTER_KIB_S as THRASH_SWAP_KIB_S;
 
 /// The share of memory in use, percent, an agent must hold to be the dominant
 /// consumer ([`AgentMemory::dominant`]): a fifth.
@@ -384,16 +383,18 @@ impl MemoryOver {
     /// <footprint and ceiling>; <the machine>; <what comes next>`. What
     /// comes next: aterm's restart at the next idle point where the measure
     /// [`Self::acts`] and `restarts` (the host makes one); the person's,
-    /// with `resume` (the tab's own `claude --resume <id>`), where it acts
-    /// and the host makes none; else nothing — a warning — and the line that
-    /// restarts it by hand.
+    /// with `resume` (the tab's own `claude --resume <id>`, or a Codex's
+    /// `codex resume <thread>`), where it acts and the host makes none; else
+    /// nothing — a warning — and the line that restarts it by hand. The line
+    /// is the warning's last words, so a renderer that cuts keeps it whole
+    /// or not at all ([`never_cut`]).
     #[must_use]
     pub fn warning(&self, agent: &str, restarts: bool, resume: Option<&str>) -> String {
         let (footprint, ceiling) = (gb(self.footprint_mib), gb(self.ceiling_mib));
         let machine = self.machine();
         let yourself = match resume {
-            Some(line) => format!("to restart it yourself: {line}"),
-            None => "restart it yourself if it should give the memory back".to_string(),
+            Some(line) => format!("{RESTART_IT_YOURSELF}{line}"),
+            None => RESTART_IT_BY_HAND.to_string(),
         };
         let then = match self.verdict(restarts) {
             Verdict::Restart => {
@@ -411,6 +412,38 @@ impl MemoryOver {
             "{agent} uses {footprint}, past aterm's memory ceiling of {ceiling}; {machine}; {then}"
         )
     }
+}
+
+/// How the warning hands the person the tab's resume line, its last words
+/// ([`MemoryOver::warning`]); [`never_cut`] finds the line by it.
+const RESTART_IT_YOURSELF: &str = "to restart it yourself: ";
+
+/// What the warning says in its place where it can name no line.
+const RESTART_IT_BY_HAND: &str = "restart it yourself if it should give the memory back";
+
+/// `render(text)` for a warning [`MemoryOver::warning`] made, `render` a
+/// renderer that may cut its input to fit a cap or break it into lines (the
+/// window's row: the tab's place ahead of it, 400 characters, lines at its
+/// joints), with the resume line the warning ends with kept whole or not at
+/// all — a rendering keeps it where it ends with it: the first of `text`,
+/// `text` with each of the line's shorter forms
+/// ([`crate::harness::resume::shorter`]: its permission mode alone, then the
+/// conversation alone), and `text` naming no line, which still says to
+/// restart it by hand. Text naming no line is rendered as it is. A cut id
+/// names no conversation, or another's.
+#[must_use]
+pub fn never_cut(text: &str, render: impl Fn(&str) -> String) -> String {
+    let Some(at) = text.find(RESTART_IT_YOURSELF) else {
+        return render(text);
+    };
+    let (head, line) = (&text[..at], &text[at + RESTART_IT_YOURSELF.len()..]);
+    std::iter::once(line.to_string())
+        .chain(crate::harness::resume::shorter(line))
+        .find_map(|step| {
+            let out = render(&format!("{head}{RESTART_IT_YOURSELF}{step}"));
+            out.ends_with(&step).then_some(out)
+        })
+        .unwrap_or_else(|| render(&format!("{head}{RESTART_IT_BY_HAND}")))
 }
 
 #[cfg(test)]
@@ -750,6 +783,70 @@ mod tests {
         }
         assert_eq!(gb(0), "0.0 GB");
         assert_eq!(gb(1536), "1.5 GB");
+    }
+
+    /// THE WARNING'S RESUME LINE IS KEPT WHOLE OR NOT AT ALL ([`never_cut`]):
+    /// under a renderer's cap, a Codex's line steps down to its sandbox and
+    /// approval flags, then to its thread alone, and past that the warning
+    /// names no line and says to restart it by hand. A warning that names
+    /// none is rendered as it is. NEGATIVE CONTROL: the cap alone cuts the
+    /// thread.
+    #[test]
+    fn the_warnings_resume_line_is_kept_whole_or_not_at_all() {
+        let over = MemoryOver {
+            footprint_mib: 51_302,
+            ceiling_mib: 24 * GIB,
+            available_mib: Some(12_595),
+            strain: None,
+            dominant: true,
+        };
+        let thread = "019a0b1c-2d3e-7f40-8a5b-6c7d8e9f0a1b";
+        let argv: Vec<String> = [
+            "codex",
+            "-m",
+            "gpt-5-codex",
+            "-c",
+            "mcp_servers.github.command=\"/opt/homebrew/bin/github-mcp-server\"",
+            "-s",
+            "workspace-write",
+            "-a",
+            "on-request",
+        ]
+        .map(String::from)
+        .to_vec();
+        let line = crate::harness::resume::codex_command(&argv, thread, None).unwrap();
+        let text = over.warning("Codex", false, Some(&line));
+        let cap = |n: usize| {
+            move |t: &str| -> String {
+                let mut out: String = t.chars().take(n).collect();
+                if t.chars().count() > n {
+                    out.push('…');
+                }
+                out
+            }
+        };
+        let len = |t: &str| t.chars().count();
+        let head = text.strip_suffix(line.as_str()).unwrap();
+        let mode = format!("{head}codex resume -s workspace-write -a on-request {thread}");
+        let bare = format!("{head}codex resume {thread}");
+        assert_eq!(never_cut(&text, cap(len(&text))), text, "whole");
+        assert_eq!(never_cut(&text, cap(len(&text) - 1)), mode);
+        assert_eq!(never_cut(&text, cap(len(&mode) - 1)), bare);
+        let by_hand = never_cut(&text, cap(len(&bare) - 1));
+        assert!(
+            by_hand.ends_with(
+                "nothing is restarted; restart it yourself if it should give the memory back"
+            ),
+            "{by_hand}"
+        );
+        let restart = MemoryOver {
+            strain: Some(Strain::Critical),
+            ..over
+        }
+        .warning("Codex", true, Some(&line));
+        assert_eq!(never_cut(&restart, cap(400)), restart, "no line named");
+        // NEGATIVE CONTROL.
+        assert!(!cap(len(&text) - 1)(&text).contains(thread));
     }
 
     /// The key's text round-trips, takes a unit, and reads zero as off.

@@ -65,11 +65,10 @@ fn upgrade_row() -> Message {
     .key("harness.upgrade.s-3e79")
 }
 
-/// ROW 46, written as a test: a Warn row held until read, whose reason is fine
-/// and whose only capsules are `Not today` and `Skip version`. Two ways to be
-/// quiet and none to fix anything. It is recorded, never shown; the same row
-/// with no capsule (the sentence is the action), or with a real button beside
-/// the snoozes, stands.
+/// A Warn row held until read whose only capsules are `Not today` and `Skip version`
+/// (two ways to be quiet, none to fix anything) is recorded, never shown. The same row
+/// with no capsule (the sentence is the action), or with a real button beside the
+/// snoozes, stands.
 #[test]
 fn a_standing_row_whose_only_capsules_decline_is_recorded_never_shown() {
     let now = t0();
@@ -118,7 +117,7 @@ fn a_standing_row_whose_only_capsules_decline_is_recorded_never_shown() {
     assert_eq!(c.demotions(), 0);
 }
 
-/// `is_snooze` is the ONE list of what only silences a row.
+/// `is_snooze` is the one list of what only silences a row.
 #[test]
 fn is_snooze_names_exactly_the_snoozes() {
     let declines = [
@@ -170,10 +169,9 @@ fn is_snooze_names_exactly_the_snoozes() {
     }
 }
 
-/// A Live row shows work: a fill or `busy`. One that shows neither at Warn or
-/// above is blocked on a person and persists without saying why — recorded.
-/// `.working()` demands the same indicator. (At Info a still Live row is the
-/// engine's old shape and stays.)
+/// A Live row shows work: a fill or `busy`. One that shows neither at Warn or above is
+/// blocked on a person without saying why, so it is recorded; `.working()` demands the
+/// same indicator. At Info a still Live row stays.
 #[test]
 fn a_blocked_live_row_at_warn_is_a_record_and_work_needs_its_indicator() {
     let now = t0();
@@ -229,9 +227,8 @@ fn a_blocked_live_row_at_warn_is_a_record_and_work_needs_its_indicator() {
     assert_eq!(c.demotions(), 0);
 }
 
-/// A standing row is BORN LATE (the Row Law, clause 2): posted and withdrawn
-/// inside the progress grace, it never asks the band for a row and so never
-/// re-grids a window.
+/// A standing row is born late (Row Law, clause 2): posted and withdrawn inside the
+/// progress grace, it never asks the band for a row.
 #[test]
 fn a_standing_ask_waits_out_the_progress_grace() {
     let now = t0();
@@ -260,10 +257,9 @@ fn a_standing_ask_waits_out_the_progress_grace() {
 }
 
 /// A decision row keeps its ten minutes when it is a class: the posture row
-/// (`Ask::flash(.., Span::Ten)`) and a question (`Ask::question`, a `Hold::Ask`
-/// that ranks first). The same hold written by hand on an UNCLASSIFIED row is
-/// cut to two minutes and counted: the door does not lend a longer hold to a
-/// builder that has not declared a class.
+/// (`Ask::flash(.., Span::Ten)`) and a question (`Ask::question`, a `Hold::Ask` that ranks
+/// first). The same hold written by hand on an unclassified row is cut to
+/// `MAX_TRANSIENT` and counted.
 #[test]
 fn a_decision_row_keeps_its_ten_minutes_and_an_unclassified_one_is_cut() {
     let now = t0();
@@ -316,9 +312,9 @@ fn a_decision_row_keeps_its_ten_minutes_and_an_unclassified_one_is_cut() {
     assert_eq!(c.last_demoted(), Some("packages.posture2"));
 }
 
-/// The door names what it recorded, so the host's ONE warning points at the
-/// builder: a standing ask whose action is two actions (` or `) is recorded,
-/// keeps its words and its severity, and `last_demoted` is its key.
+/// The door names what it recorded, so the host's one warning points at the builder: a
+/// standing ask whose action is two actions (` or `) is recorded with its words and
+/// severity, and `last_demoted` is its key.
 #[test]
 fn a_recorded_ask_is_named_for_the_hosts_one_warning() {
     let now = t0();

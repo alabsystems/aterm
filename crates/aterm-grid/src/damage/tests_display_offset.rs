@@ -10,7 +10,6 @@ use super::display_offset::{DisplayOffsetDamage, compute_display_offset_damage};
 #[test]
 fn compute_display_offset_damage_rows() {
     // (label, old offset, new offset, visible rows, expected damage).
-    // Each row was its own test.
     let rows = [
         ("offset unchanged", 5, 5, 24, DisplayOffsetDamage::None),
         ("both offsets zero", 0, 0, 24, DisplayOffsetDamage::None),
@@ -87,15 +86,13 @@ fn test_apply_bottom_rows_marks_correct_rows() {
     assert!(damage.is_row_damaged(23));
 }
 
-/// THE DISPLAY-OFFSET CLASSIFICATION IS EXACT FOR EVERY DELTA AND SIZE. The
-/// result depends only on the delta, its direction and the visible rows, so
-/// every (old, new) over 0..=48 at every size 0..=40 and the `u16` edge, plus
-/// the offset pairs at the `u16::MAX` scale, reach every class at and around
-/// each boundary: `None` exactly when the offsets agree, `Full` exactly when
-/// the delta covers the screen, `TopRows(n)` (scrolled up) with `0 < n <
-/// rows`, `BottomRows` (scrolled down) with `0 < start < end == rows`, and the
-/// damaged row count always `min(delta, rows)` — with neither of the
-/// function's `u16::try_from(..).expect()`s firing.
+/// The display-offset classification is exact for every delta and size: every
+/// (old, new) over 0..=48 at every size 0..=40 and the `u16` edge, plus offset
+/// pairs at the `u16::MAX` scale, give `None` exactly when the offsets agree,
+/// `Full` exactly when the delta covers the screen, `TopRows(n)` (scrolled up)
+/// with `0 < n < rows`, `BottomRows` (scrolled down) with
+/// `0 < start < end == rows`, and `min(delta, rows)` damaged rows, with neither
+/// `u16::try_from(..).expect()` firing.
 #[test]
 fn display_offset_damage_classifies_every_delta_and_size() {
     let check = |old: usize, new: usize, rows: u16| {

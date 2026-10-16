@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `targo --unverified forge check`: the gate verb, wired as `xtask gate forge`.
+//! `targo --unverified forge check`: the `forge` check of
+//! `targo --unverified verify`, which calls it in-process.
 //!
 //! [`check_report`] answers whether aterm's third-party surface is still the
 //! surface this repository declares, with no compilation and no network: one
-//! `cargo tree` resolution per cell plus file reads, since the merge contract
-//! runs it every time.
+//! `cargo tree` resolution per cell plus file reads, so it is cheap to run on
+//! any change.
 //!
 //! # Why patch liveness matters
 //!
@@ -39,6 +40,7 @@
 //! | `[OB-14]` | the measured surface conforms to its ratchet | `tools/forge-budget.tsv` |
 //! | `[OB-15]` | no `[patch]` CAPTURES a differential oracle | `[dev-dependencies]` + `Cargo.lock` |
 //! | `[OB-17]` | the fork ledger parses, names the measured cell matrix, and records exactly the vendored forks — path, version, license, §4(b) flag and census class | `vendor/forge.toml` `[forge]` + `[[fork]]` via [`crate::policy`] |
+//! | `[OB-18]` | no resolved package is banned or from a source `deny.toml` does not allow | `deny.toml` `[bans] deny` + `[sources]` via [`crate::deny`] |
 //!
 //! # Not re-checked here
 //!
@@ -47,12 +49,13 @@
 //! `vendor/` directory no patch entry claims fails attest's `[OB-1]`.
 
 use crate::model::{Cell, Graph, PkgId};
+use crate::resolve::Cargo;
 use crate::{Outcome, PRECISION_NOTE, attest, budget, policy, resolve};
 use aterm_census::scan_set::{REVIEWED_VENDORED_CRATES, VendoredMode};
+use aterm_uds::output::CommandOutput as _;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// The policy file, which also carries the carve ledger (`[[carved]]` rows).
 const POLICY_FILE: &str = "vendor/forge.toml";
@@ -67,8 +70,11 @@ type Resolved = (Graph, BTreeMap<PkgId, PathBuf>);
 /// the only patch shape this repository uses.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PatchEntry {
-    /// The crates.io package being replaced (the table key).
+    /// The crates.io package being replaced ([`policy::patched_package`]).
     name: String,
+    /// The table key: `name` unless the row is renamed (`package = "…"`), which
+    /// is how two version lines of one package are patched side by side.
+    key: String,
     /// The declared replacement path, exactly as written (repo-relative).
     path: String,
 }
@@ -81,7 +87,7 @@ struct Carved {
     reason: String,
 }
 
-/// The gate's verdict. `could_not_run` is kept apart from `ok`:
+/// The check's verdict. `could_not_run` is kept apart from `ok`:
 /// [`check_report`] folds it into red, while [`run`] maps it onto exit code 3.
 struct Verdict {
     ok: bool,
@@ -89,25 +95,25 @@ struct Verdict {
     could_not_run: Option<String>,
 }
 
-/// The gate entry point called by `crates/xtask/src/gate.rs`. Runs every
-/// obligation over `root` across the cell matrix and returns
+/// Every obligation over `root` across the cell matrix, as
 /// `(green, transcript)`.
 ///
 /// Fail-closed: an unreadable manifest, an unresolvable cell or a missing
 /// `cargo` all produce `false`.
 pub fn check_report(root: &Path) -> (bool, String) {
-    let v = report_over(root, &resolve::default_cells());
+    let v = report_over(&Cargo::from_env(), root, &resolve::default_cells());
     (v.ok, v.log)
 }
 
-/// The verb behind `targo --unverified forge check [--cell NAME]...`.
+/// The verb behind `targo --unverified forge check [--cell NAME]...`, asking
+/// `cargo` for every graph.
 ///
 /// `Err` is could-not-run (exit 3): a bad `--cell`, an unreadable workspace, a
 /// cell cargo refused to resolve. A policy violation is
 /// `Ok(Outcome { ok: false, .. })` (exit 1).
-pub fn run(root: &Path, cells: &[String]) -> Result<Outcome, String> {
+pub fn run(cargo: &Cargo, root: &Path, cells: &[String]) -> Result<Outcome, String> {
     let selected = resolve::select(&resolve::default_cells(), cells)?;
-    let v = report_over(root, &selected);
+    let v = report_over(cargo, root, &selected);
     match v.could_not_run {
         // The reason first (`main` prefixes "could not run:"), then the
         // transcript of the obligations that did run.
@@ -126,7 +132,7 @@ pub fn run(root: &Path, cells: &[String]) -> Result<Outcome, String> {
 // The report
 // ---------------------------------------------------------------------------
 
-fn report_over(root: &Path, cells: &[Cell]) -> Verdict {
+fn report_over(cargo: &Cargo, root: &Path, cells: &[Cell]) -> Verdict {
     // Canonicalise once: cargo runs with `current_dir(root)` and
     // `--manifest-path <root>/Cargo.toml`, so a relative root would resolve
     // twice. `canon` falls back to the literal path for diagnostics.
@@ -138,7 +144,7 @@ fn report_over(root: &Path, cells: &[Cell]) -> Verdict {
 
     let _ = writeln!(
         log,
-        "=== gate forge (third-party surface: provenance, patch liveness, ratchet) ==="
+        "=== forge check (third-party surface: provenance, patch liveness, ratchet) ==="
     );
     let _ = writeln!(log, "  root: {}", root.display());
     let _ = writeln!(
@@ -156,7 +162,7 @@ fn report_over(root: &Path, cells: &[Cell]) -> Verdict {
         log,
         "  [OB-1..OB-10] PROVENANCE, LICENSE & NOTICE — delegated to `targo --unverified forge attest`:"
     );
-    let (attest_ok, attest_log) = attest::report(root);
+    let (attest_ok, attest_log) = attest::report_with(cargo, root);
     for line in attest_log.lines() {
         let _ = writeln!(log, "    {line}");
     }
@@ -200,15 +206,18 @@ fn report_over(root: &Path, cells: &[Cell]) -> Verdict {
     let _ = writeln!(
         log,
         "  [OB-11] REVIEW REGISTRATION — every VENDORED `[patch.crates-io]` path fork has a \
-         REVIEWED_VENDORED_CRATES row (first-party targets under crates/ are named, not \
-         registered — they are not third-party code):"
+         REVIEWED_VENDORED_CRATES row (first-party and absorbed targets under crates/ are \
+         named, not registered — they are workspace members, not forks under review):"
     );
     let mut missing_on_disk = false;
     for e in &patches {
-        let first_party = matches!(
-            aterm_census::scan_set::classify_patch_target(&e.name, &e.path, root),
-            Ok(aterm_census::scan_set::PatchTargetKind::FirstParty)
-        );
+        let kind = aterm_census::scan_set::classify_patch_target(&e.name, &e.path, root);
+        let absorbed = matches!(kind, Ok(aterm_census::scan_set::PatchTargetKind::Absorbed));
+        let first_party = absorbed
+            || matches!(
+                kind,
+                Ok(aterm_census::scan_set::PatchTargetKind::FirstParty)
+            );
         if first_party {
             match REVIEWED_VENDORED_CRATES
                 .iter()
@@ -227,10 +236,18 @@ fn report_over(root: &Path, cells: &[Cell]) -> Verdict {
                         e.name, e.path, r.path
                     );
                 }
+                None if absorbed => {
+                    let _ = writeln!(
+                        log,
+                        "    ✓ {} → {} (absorbed workspace member; no review row owed — its \
+                         license obligations are attest's, its census row ABSORBED_CRATES)",
+                        e.name, e.path
+                    );
+                }
                 None => {
                     let _ = writeln!(
                         log,
-                        "    ✓ {} → {} (first-party workspace member; no review row owed)",
+                        "    ✓ {} → {} (first-party, under crates/; no review row owed)",
                         e.name, e.path
                     );
                 }
@@ -243,7 +260,7 @@ fn report_over(root: &Path, cells: &[Cell]) -> Verdict {
                     "  ✗ FAIL [OB-11] `{}` is patched to `{}`, which has no Cargo.toml on \
                      disk — cargo cannot resolve this workspace at all. Fix: restore the \
                      crate, or delete the `[patch.crates-io].{}` line.",
-                    e.name, e.path, e.name
+                    e.name, e.path, e.key
                 );
             }
             continue;
@@ -293,7 +310,7 @@ fn report_over(root: &Path, cells: &[Cell]) -> Verdict {
                 "  ✗ FAIL [OB-11] `{}` is patched to `{}`, which has no Cargo.toml on disk — \
                  cargo cannot resolve this workspace at all. Fix: restore the vendored copy, or \
                  delete the `[patch.crates-io].{}` line.",
-                e.name, e.path, e.name
+                e.name, e.path, e.key
             );
         }
     }
@@ -312,6 +329,8 @@ fn report_over(root: &Path, cells: &[Cell]) -> Verdict {
          unpatched sibling (an unused `[patch]` is a cargo WARNING at exit 0):"
     );
     let mut live_in: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    // Each resolved cell, kept for [OB-18]'s judgment of the same graph.
+    let mut resolved_cells: Vec<(&Cell, Resolved)> = Vec::new();
     if missing_on_disk {
         let _ = writeln!(
             log,
@@ -321,7 +340,7 @@ fn report_over(root: &Path, cells: &[Cell]) -> Verdict {
     } else {
         for cell in cells {
             let mut cell_log = String::new();
-            let resolved = resolve::graph_and_paths(root, cell, &mut cell_log);
+            let resolved = resolve::graph_and_paths(cargo, root, cell, &mut cell_log);
             if !cell_log.is_empty() {
                 notes += 1;
                 log.push_str(&cell_log);
@@ -341,11 +360,11 @@ fn report_over(root: &Path, cells: &[Cell]) -> Verdict {
                 }
             };
             for e in &patches {
-                let want = canon(&root.join(&e.path));
-                let (live, siblings) = classify(&graph, &paths, &e.name, &want);
+                let scope = row_scope(root, &patches, e);
+                let (live, siblings) = classify(&graph, &paths, &e.name, &scope);
                 if live {
                     live_in
-                        .entry(e.name.as_str())
+                        .entry(e.key.as_str())
                         .or_default()
                         .push(cell.name.clone());
                 }
@@ -370,10 +389,11 @@ fn report_over(root: &Path, cells: &[Cell]) -> Verdict {
                         e.path,
                         cell.triple,
                         sib.0.spec(),
-                        e.name
+                        e.key
                     );
                 }
             }
+            resolved_cells.push((cell, (graph, paths)));
         }
     }
 
@@ -383,7 +403,7 @@ fn report_over(root: &Path, cells: &[Cell]) -> Verdict {
     if !missing_on_disk {
         let mut build_probe: Option<Result<Resolved, String>> = None;
         for e in &patches {
-            let live = live_in.get(e.name.as_str()).map_or(0, Vec::len);
+            let live = live_in.get(e.key.as_str()).map_or(0, Vec::len);
             if live == cells.len() && !cells.is_empty() {
                 live_all += 1;
                 let _ = writeln!(log, "    ✓ {} live in all {} cell(s)", e.name, cells.len());
@@ -401,41 +421,27 @@ fn report_over(root: &Path, cells: &[Cell]) -> Verdict {
                     live,
                     cells.len(),
                     live_in
-                        .get(e.name.as_str())
+                        .get(e.key.as_str())
                         .map_or(String::new(), |v| v.join(", "))
                 );
                 continue;
             }
-            // Live in no cell's `--edges normal` graph. A build-time-only fork
-            // (pkg-config) is expected there, so prove it in the build closure.
-            let build_only = REVIEWED_VENDORED_CRATES
-                .iter()
-                .find(|r| r.package == e.name)
-                .is_some_and(|r| matches!(r.mode, VendoredMode::BuildDepOnly { .. }));
+            // Live in no cell's `--edges normal` graph: a patch target a build
+            // script uses is still live, so look for it in the build closure.
             let Some(cell) = cells.first() else { continue };
-            let probe = build_probe.get_or_insert_with(|| build_closure(root, cell));
+            let probe = build_probe.get_or_insert_with(|| build_closure(cargo, root, cell));
             match probe {
                 Ok((graph, paths)) => {
-                    let want = canon(&root.join(&e.path));
-                    let (blive, bsibs) = classify(graph, paths, &e.name, &want);
+                    let scope = row_scope(root, &patches, e);
+                    let (blive, bsibs) = classify(graph, paths, &e.name, &scope);
                     if blive {
                         live_build += 1;
-                    }
-                    if blive && build_only {
-                        let _ = writeln!(
-                            log,
-                            "    ✓ {} live in the BUILD closure of cell `{}` (reviewed \
-                             build-dep-only; invisible to `--edges normal` by design)",
-                            e.name, cell.name
-                        );
-                    } else if blive {
                         notes += 1;
                         let _ = writeln!(
                             log,
                             "    • NOTE [OB-12] `{}` is live only in the BUILD closure of cell \
-                             `{}`, but its reviewed row does not classify it build-dep-only. \
-                             Fix: re-classify it `VendoredMode::BuildDepOnly` (with the \
-                             verification) in crates/aterm-census/src/scan_set.rs.",
+                             `{}`: build-script host code, invisible to `--edges normal`. Not a \
+                             failure; recorded so a patch that left every shipped graph is visible.",
                             e.name, cell.name
                         );
                     } else {
@@ -450,7 +456,7 @@ fn report_over(root: &Path, cells: &[Cell]) -> Verdict {
                              either delete `[patch.crates-io].{}` (with its vendored copy, its \
                              NOTICE line and its REVIEWED_VENDORED_CRATES row) or restore the \
                              dependency edge that used it.",
-                            e.name, e.path, cell.name, e.name, e.name
+                            e.name, e.path, cell.name, e.name, e.key
                         );
                     }
                     for sib in &bsibs {
@@ -527,7 +533,7 @@ fn report_over(root: &Path, cells: &[Cell]) -> Verdict {
         "  [OB-14] RATCHET — the measured surface conforms to {BUDGET_FILE}:"
     );
     if root.join(BUDGET_FILE).is_file() {
-        match budget::run(root, false, None) {
+        match budget::run(cargo, root, false, None) {
             Ok(out) => {
                 for line in out.log.lines() {
                     let _ = writeln!(log, "    {line}");
@@ -663,24 +669,68 @@ fn report_over(root: &Path, cells: &[Cell]) -> Verdict {
         );
     }
 
+    // -- [OB-18] deny.toml over the resolved graph ------------------------------
+    let _ = writeln!(
+        log,
+        "  [OB-18] BANS & SOURCES — deny.toml's `[bans] deny` and `[sources]` hold over every \
+         resolved cell:"
+    );
+    match crate::deny::policy(root) {
+        Err(e) => {
+            fails += 1;
+            could_not_run.get_or_insert(e.clone());
+            let _ = writeln!(log, "  ✗ FAIL [OB-18] {e}");
+        }
+        Ok(_) if missing_on_disk => {
+            let _ = writeln!(
+                log,
+                "    SKIPPED — no cell was resolved (a declared patch path is missing, above)."
+            );
+        }
+        Ok(deny) => {
+            let before = fails;
+            for (cell, (graph, paths)) in &resolved_cells {
+                for finding in crate::deny::findings(&deny, graph, paths) {
+                    fails += 1;
+                    let _ = writeln!(
+                        log,
+                        "  ✗ FAIL [OB-18] cell `{}`: {}",
+                        cell.name,
+                        describe(&finding)
+                    );
+                }
+            }
+            if fails == before {
+                let _ = writeln!(
+                    log,
+                    "    OK — {} ban(s) and the source policy hold in {} cell(s).",
+                    deny.bans.len(),
+                    resolved_cells.len()
+                );
+            }
+        }
+    }
+
     // -- verdict --------------------------------------------------------------
-    // Forks (third-party, under review) and first-party targets (workspace
-    // members) are counted separately.
-    let first_party_count = patches
-        .iter()
-        .filter(|e| {
-            matches!(
-                aterm_census::scan_set::classify_patch_target(&e.name, &e.path, root),
-                Ok(aterm_census::scan_set::PatchTargetKind::FirstParty)
-            )
-        })
-        .count();
+    // Forks (third-party, under review), absorbed crates and first-party
+    // targets (workspace members) are counted separately.
+    let kind_count = |want: aterm_census::scan_set::PatchTargetKind| {
+        patches
+            .iter()
+            .filter(|e| {
+                aterm_census::scan_set::classify_patch_target(&e.name, &e.path, root) == Ok(want)
+            })
+            .count()
+    };
+    let first_party_count = kind_count(aterm_census::scan_set::PatchTargetKind::FirstParty);
+    let absorbed_count = kind_count(aterm_census::scan_set::PatchTargetKind::Absorbed);
     if fails == 0 {
         let _ = writeln!(
             log,
             "{}",
             green_verdict(&GreenCounts {
-                forks: patches.len() - first_party_count,
+                forks: patches.len() - first_party_count - absorbed_count,
+                absorbed: absorbed_count,
                 first_party: first_party_count,
                 cells: cells.len(),
                 live_all,
@@ -693,7 +743,7 @@ fn report_over(root: &Path, cells: &[Cell]) -> Verdict {
     } else {
         let _ = writeln!(
             log,
-            "gate forge: FAILED — {fails} obligation(s) violated (every ✗ line above names its \
+            "forge check: FAILED — {fails} obligation(s) violated (every ✗ line above names its \
              fix)."
         );
         log.push_str(PRECISION_NOTE);
@@ -710,10 +760,12 @@ fn report_over(root: &Path, cells: &[Cell]) -> Verdict {
 // Pieces
 // ---------------------------------------------------------------------------
 
-/// What a green `gate forge` run measured, for [`green_verdict`].
+/// What a green `forge check` run measured, for [`green_verdict`].
 struct GreenCounts {
     /// Vendored forks (third-party source under review).
     forks: usize,
+    /// Absorbed crates (upstream source aterm owns as workspace members).
+    absorbed: usize,
     /// First-party patch targets (workspace members).
     first_party: usize,
     cells: usize,
@@ -731,10 +783,18 @@ struct GreenCounts {
 /// measured.
 fn green_verdict(c: &GreenCounts) -> String {
     format!(
-        "gate forge: GREEN — {} vendored fork(s) + {} first-party patch target(s): {} live in \
-         all {} cells, {} in some, {} build-only; no unpatched sibling; {} carved path(s) \
-         absent; provenance attested; {} note(s).",
-        c.forks, c.first_party, c.live_all, c.cells, c.live_some, c.live_build, c.carved, c.notes
+        "forge check: GREEN — {} vendored fork(s) + {} absorbed crate(s) + {} first-party patch \
+         target(s): {} live in all {} cells, {} in some, {} build-only; no unpatched sibling; \
+         {} carved path(s) absent; provenance attested; {} note(s).",
+        c.forks,
+        c.absorbed,
+        c.first_party,
+        c.live_all,
+        c.cells,
+        c.live_some,
+        c.live_build,
+        c.carved,
+        c.notes
     )
 }
 
@@ -835,12 +895,8 @@ fn ledger_findings(root: &Path) -> Vec<String> {
             .iter()
             .find(|v| v.package == p.name)
         {
-            let census = match &reviewed.mode {
-                VendoredMode::Scanned { namespace, .. } => {
-                    (policy::CensusMode::Scanned, Some(*namespace))
-                }
-                VendoredMode::BuildDepOnly { .. } => (policy::CensusMode::BuildDepOnly, None),
-            };
+            let VendoredMode::Scanned { namespace, .. } = &reviewed.mode;
+            let census = (policy::CensusMode::Scanned, Some(*namespace));
             let recorded = (f.census_mode, f.census_namespace.as_deref());
             if recorded != census {
                 out.push(format!(
@@ -864,20 +920,52 @@ fn ledger_findings(root: &Path) -> Vec<String> {
     out
 }
 
-/// Split the nodes named `name` into "the fork is live" and the unpatched
-/// siblings: any node of that name that is not the declared path package.
+/// What one patch row answers for in a resolved graph ([`classify`]).
+struct RowScope {
+    /// The row's own replacement directory, canonical.
+    want: PathBuf,
+    /// The other rows' targets for the same package: patched, so never an
+    /// unpatched sibling of this one.
+    others: Vec<PathBuf>,
+    /// A renamed row claims one version line ([`policy::in_row_scope`]).
+    renamed: bool,
+    /// The row's manifest version; `None` (unreadable) claims every copy.
+    version: Option<String>,
+}
+
+fn row_scope(root: &Path, patches: &[PatchEntry], e: &PatchEntry) -> RowScope {
+    RowScope {
+        want: canon(&root.join(&e.path)),
+        others: patches
+            .iter()
+            .filter(|o| o.name == e.name && o.key != e.key)
+            .map(|o| canon(&root.join(&o.path)))
+            .collect(),
+        renamed: e.key != e.name,
+        version: crate::loc::manifest_version(&root.join(&e.path)),
+    }
+}
+
+/// Is the row live (its directory resolves), and which copies of its package
+/// in its scope resolve from anywhere else (the unpatched siblings)?
 fn classify(
     graph: &Graph,
     paths: &BTreeMap<PkgId, PathBuf>,
     name: &str,
-    want: &Path,
+    scope: &RowScope,
 ) -> (bool, Vec<(PkgId, Option<PathBuf>)>) {
     let mut live = false;
     let mut siblings = Vec::new();
     for id in graph.nodes.iter().filter(|n| n.name == name) {
         let dir = paths.get(id);
-        if dir.is_some_and(|d| canon(d) == want) {
+        let canonical = dir.map(|d| canon(d));
+        if canonical.as_ref().is_some_and(|c| *c == scope.want) {
             live = true;
+        } else if canonical.as_ref().is_some_and(|c| scope.others.contains(c))
+            || !policy::in_row_scope(scope.renamed, scope.version.as_deref(), &id.version)
+        {
+            // Another row's target, or another version line than this
+            // renamed row claims: not this row's sibling.
         } else {
             siblings.push((id.clone(), dir.cloned()));
         }
@@ -914,18 +1002,19 @@ fn parse_patch_table(text: &str, whence: &Path) -> Result<(Vec<PatchEntry>, Vec<
     };
     let mut forks = Vec::new();
     let mut other = Vec::new();
-    for (name, item) in table.iter() {
+    for (key, item) in table.iter() {
         match item.get("path").and_then(aterm_toml::edit::Item::as_str) {
             Some(path) => {
                 forks.push(PatchEntry {
-                    name: name.to_string(),
+                    name: policy::patched_package(key, item).to_string(),
+                    key: key.to_string(),
                     path: path.to_string(),
                 });
             }
-            None => other.push(name.to_string()),
+            None => other.push(key.to_string()),
         }
     }
-    forks.sort_by(|a, b| a.name.cmp(&b.name));
+    forks.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.key.cmp(&b.key)));
     other.sort();
     Ok((forks, other))
 }
@@ -1009,7 +1098,7 @@ fn parse_carve_ledger(text: &str, whence: &Path) -> Result<Vec<Carved>, String> 
             return Err(format!(
                 "{}: `[[carved]]` row {} has path `{path}` — carved paths are REPO-RELATIVE and \
                  may not escape the tree. Fix: write it relative to the workspace root, e.g. \
-                 `vendor/winit/src/platform_impl/orbital`.",
+                 `crates/aterm-window/src/platform_impl/orbital`.",
                 whence.display(),
                 i + 1
             ));
@@ -1022,16 +1111,12 @@ fn parse_carve_ledger(text: &str, whence: &Path) -> Result<Vec<Carved>, String> 
 /// The `--edges normal,build` closure of one cell.
 ///
 /// Used only to decide whether a fork absent from every shipped graph is alive
-/// as a build-time dependency (`pkg-config`) or is a dead patch. Without
+/// as a build-time dependency or is a dead patch. Without
 /// `--no-dedupe`: only package identity is needed, and the deduped node set is
 /// the same at a fraction of the output.
-fn build_closure(root: &Path, cell: &Cell) -> Result<Resolved, String> {
-    // `CARGO` is set by targo itself, so a nested invocation uses the toolchain
-    // that launched forge; unset, it is Trust's `targo`, never a stock `cargo`.
-    let exe = std::env::var_os("CARGO").unwrap_or_else(|| "targo".into());
-    let mut cmd = Command::new(exe);
-    cmd.arg("tree")
-        .arg("--manifest-path")
+fn build_closure(cargo: &Cargo, root: &Path, cell: &Cell) -> Result<Resolved, String> {
+    let mut cmd = cargo.command("tree", root);
+    cmd.arg("--manifest-path")
         .arg(root.join("Cargo.toml"))
         .arg("-p")
         .arg(&cell.package)
@@ -1042,9 +1127,8 @@ fn build_closure(root: &Path, cell: &Cell) -> Result<Resolved, String> {
         .arg("--prefix")
         .arg("depth")
         .arg("--locked")
-        .arg("--offline")
-        .current_dir(root);
-    let out = cmd.output().map_err(|e| {
+        .arg("--offline");
+    let out = cmd.output_owned().map_err(|e| {
         format!(
             "could not execute `targo tree`: {e} — install the Trust toolchain (`aterm pkg \
              install trust`), or set CARGO to the targo to use"
@@ -1060,7 +1144,6 @@ fn build_closure(root: &Path, cell: &Cell) -> Result<Resolved, String> {
 fn mode_label(mode: &VendoredMode) -> &'static str {
     match mode {
         VendoredMode::Scanned { .. } => "reviewed, scanned in-process",
-        VendoredMode::BuildDepOnly { .. } => "reviewed, build-dep only",
     }
 }
 
@@ -1191,124 +1274,49 @@ fn rel(root: &Path, p: &Path) -> String {
         .into_owned()
 }
 
+/// One [OB-18] finding as its transcript line.
+fn describe(finding: &crate::deny::Finding) -> String {
+    use crate::deny::Finding;
+    match finding {
+        Finding::Banned { pkg, via, ban } => {
+            let parents = if via.is_empty() {
+                "it is the cell's root".to_string()
+            } else {
+                format!(
+                    "required by {}",
+                    via.iter().map(PkgId::spec).collect::<Vec<_>>().join(", ")
+                )
+            };
+            let wrappers = if ban.wrappers.is_empty() {
+                String::new()
+            } else {
+                format!(" (allowed only under {})", ban.wrappers.join(", "))
+            };
+            format!(
+                "`{}` is banned{wrappers}: {}; {parents}. Fix: drop the edge, or argue for the \
+                 package in deny.toml.",
+                pkg.spec(),
+                ban.reason
+            )
+        }
+        Finding::Source { pkg, source } => format!(
+            "`{}` comes from `{source}`, a source deny.toml does not allow (crates.io and \
+             path packages only). Fix: depend on the crates.io release, or vendor it.",
+            pkg.spec()
+        ),
+        Finding::BadRequirement { ban } => format!(
+            "the ban on `{}` states version `{}`, which forge does not read (comparators \
+             `<`, `<=`, `>`, `>=`, `=`, joined by commas). Fix: restate it.",
+            ban.name,
+            ban.version.as_deref().unwrap_or("")
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::repo_root;
-
-    /// Partition the real patch table the way [OB-11] does.
-    fn real_patches() -> (Vec<PatchEntry>, Vec<PatchEntry>) {
-        let (forks, _) = read_manifest_patches(&repo_root()).expect("root manifest reads");
-        forks.into_iter().partition(|f| {
-            !matches!(
-                aterm_census::scan_set::classify_patch_target(&f.name, &f.path, &repo_root()),
-                Ok(aterm_census::scan_set::PatchTargetKind::FirstParty)
-            )
-        })
-    }
-
-    /// The green sentence says where the patch targets are live, as measured.
-    #[test]
-    fn the_green_verdict_counts_partial_and_build_only_forks_apart() {
-        let v = green_verdict(&GreenCounts {
-            forks: 7,
-            first_party: 2,
-            cells: 8,
-            live_all: 7,
-            live_some: 1,
-            live_build: 1,
-            carved: 3,
-            notes: 1,
-        });
-        assert_eq!(
-            v,
-            "gate forge: GREEN — 7 vendored fork(s) + 2 first-party patch target(s): 7 live in \
-             all 8 cells, 1 in some, 1 build-only; no unpatched sibling; 3 carved path(s) \
-             absent; provenance attested; 1 note(s)."
-        );
-        assert!(!v.contains("all live"), "{v}");
-    }
-
-    /// The patch table is read as path patches, partitioned. The
-    /// `vendor/<name>` path shape is asserted for the vendored arm only.
-    #[test]
-    fn the_root_patch_table_is_read_as_path_forks() {
-        let (_, other) = read_manifest_patches(&repo_root()).expect("root manifest reads");
-        assert!(
-            other.is_empty(),
-            "this repo patches only path forks: {other:?}"
-        );
-        let (vendored, first_party) = real_patches();
-        let names: Vec<&str> = vendored.iter().map(|f| f.name.as_str()).collect();
-        assert_eq!(
-            names,
-            ["indexmap", "libm", "pkg-config", "smol_str", "winit"]
-        );
-        for f in &vendored {
-            assert_eq!(
-                f.path,
-                format!("vendor/{}", f.name),
-                "declared path for {}",
-                f.name
-            );
-        }
-        let fp: Vec<(&str, &str)> = first_party
-            .iter()
-            .map(|f| (f.name.as_str(), f.path.as_str()))
-            .collect();
-        assert_eq!(
-            fp,
-            [
-                ("arrayvec", "crates/aterm-arrayvec"),
-                ("cfg-if", "crates/aterm-cfg-if"),
-                ("core_maths", "crates/aterm-core-maths"),
-                ("libc", "crates/aterm-libc"),
-                ("log", "crates/aterm-log-shim"),
-                ("once_cell", "crates/aterm-once-cell"),
-                ("profiling", "crates/aterm-profiling"),
-                ("tracing", "crates/aterm-tracing"),
-            ]
-        );
-    }
-
-    #[test]
-    fn every_vendored_path_fork_in_this_repo_is_registered_for_review() {
-        let (vendored, _) = real_patches();
-        for f in &vendored {
-            let row = REVIEWED_VENDORED_CRATES
-                .iter()
-                .find(|r| r.package == f.name)
-                .unwrap_or_else(|| panic!("`{}` has no REVIEWED_VENDORED_CRATES row", f.name));
-            assert_eq!(row.path, f.path, "reviewed path for {}", f.name);
-        }
-    }
-
-    /// The other direction, and the one this change is FOR: a first-party
-    /// patch target must NOT be registered as a reviewed vendored fork. The
-    /// registry is the repository's record of third-party code it owes a
-    /// standing review; putting our own crate in it would be a false entry
-    /// that no later reader could tell from a true one.
-    #[test]
-    fn no_first_party_patch_target_is_registered_as_a_vendored_fork() {
-        let (_, first_party) = real_patches();
-        assert!(
-            !first_party.is_empty(),
-            "the partition is vacuous if there is no first-party target to test it on"
-        );
-        for f in &first_party {
-            assert!(
-                REVIEWED_VENDORED_CRATES.iter().all(|r| r.package != f.name),
-                "`{}` is a workspace member and must not carry a REVIEWED_VENDORED_CRATES row",
-                f.name
-            );
-            assert!(
-                repo_root().join(&f.path).join("Cargo.toml").is_file(),
-                "`{}` is patched to `{}`, which must exist on disk",
-                f.name,
-                f.path
-            );
-        }
-    }
 
     #[test]
     fn a_git_or_version_patch_is_not_counted_as_a_path_fork() {
@@ -1324,6 +1332,7 @@ gamma = { version = \"1.2.3\" }
             forks[0],
             PatchEntry {
                 name: "alpha".into(),
+                key: "alpha".into(),
                 path: "vendor/alpha".into()
             }
         );
@@ -1341,7 +1350,7 @@ gamma = { version = \"1.2.3\" }
     fn the_carve_ledger_reads_both_the_table_and_the_inline_form() {
         let tables = "\
 [[carved]]
-path = \"vendor/winit/src/platform_impl/orbital\"
+path = \"crates/aterm-window/src/platform_impl/orbital\"
 reason = \"aterm ships no Orbital GUI\"
 
 [[carved]]
@@ -1350,7 +1359,10 @@ reason = \"no arch intrinsics reach the shipped build\"
 ";
         let rows = parse_carve_ledger(tables, Path::new("/w/vendor/forge.toml")).unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].path, "vendor/winit/src/platform_impl/orbital");
+        assert_eq!(
+            rows[0].path,
+            "crates/aterm-window/src/platform_impl/orbital"
+        );
         assert_eq!(rows[1].reason, "no arch intrinsics reach the shipped build");
 
         let inline = "carved = [ { path = \"vendor/a/b\", reason = \"r\" } ]\n";
@@ -1399,7 +1411,7 @@ reason = \"no arch intrinsics reach the shipped build\"
 2winnow v1.0.3
 ";
         let (graph, paths) = resolve::parse_tree(text).unwrap();
-        let (live, sibs) = classify(&graph, &paths, "winnow", Path::new("/w/vendor/winnow"));
+        let (live, sibs) = classify(&graph, &paths, "winnow", &plain("/w/vendor/winnow"));
         assert!(live, "the path package at the declared dir is the fork");
         assert_eq!(sibs.len(), 1);
         assert_eq!(sibs[0].0, PkgId::new("winnow", "1.0.3"));
@@ -1407,14 +1419,110 @@ reason = \"no arch intrinsics reach the shipped build\"
 
         // A fork that resolves from somewhere ELSE is not live, and the copy
         // that did resolve is the sibling.
-        let (live, sibs) = classify(&graph, &paths, "winnow", Path::new("/w/forks/winnow"));
+        let (live, sibs) = classify(&graph, &paths, "winnow", &plain("/w/forks/winnow"));
         assert!(!live);
         assert_eq!(sibs.len(), 2);
     }
 
+    /// An un-renamed row at `want`, claiming every copy of its name.
+    fn plain(want: &str) -> RowScope {
+        RowScope {
+            want: PathBuf::from(want),
+            others: Vec::new(),
+            renamed: false,
+            version: Some("0.7.15".into()),
+        }
+    }
+
+    /// Two version lines of one package, patched by a renamed row: a copy in
+    /// another line is not the row's sibling, one in its own line is, and
+    /// another row's target is never one.
+    #[test]
+    fn a_renamed_row_answers_for_its_own_version_line_only() {
+        let text = "\
+0root v0.1.0 (/w/crates/root)
+1ring v0.17.14
+2windows-sys v0.52.0 (/w/crates/aterm-windows-sys-052)
+1http v0.1.0 (/w/crates/http)
+2windows-sys v0.61.2
+";
+        let (graph, paths) = resolve::parse_tree(text).unwrap();
+        let renamed = |others: Vec<PathBuf>| RowScope {
+            want: PathBuf::from("/w/crates/aterm-windows-sys-052"),
+            others,
+            renamed: true,
+            version: Some("0.52.0".into()),
+        };
+        let (live, sibs) = classify(&graph, &paths, "windows-sys", &renamed(Vec::new()));
+        assert!(live);
+        assert!(sibs.is_empty(), "0.61.2 is another line: {sibs:?}");
+
+        // NEGATIVE CONTROL: the same graph judged as an UN-renamed row.
+        let mut unscoped = renamed(Vec::new());
+        unscoped.renamed = false;
+        let (_, sibs) = classify(&graph, &paths, "windows-sys", &unscoped);
+        assert_eq!(sibs.len(), 1, "an un-renamed row owns every copy");
+        assert_eq!(sibs[0].0, PkgId::new("windows-sys", "0.61.2"));
+
+        // A registry copy in the row's OWN line is still a sibling.
+        let own_line = "\
+0root v0.1.0 (/w/crates/root)
+1ring v0.17.14
+2windows-sys v0.52.0 (/w/crates/aterm-windows-sys-052)
+1old v1.0.0
+2windows-sys v0.52.1
+";
+        let (graph, paths) = resolve::parse_tree(own_line).unwrap();
+        let (_, sibs) = classify(&graph, &paths, "windows-sys", &renamed(Vec::new()));
+        assert_eq!(sibs.len(), 1);
+        assert_eq!(sibs[0].0, PkgId::new("windows-sys", "0.52.1"));
+
+        // An unreadable row version claims every copy (fail-closed).
+        let mut blind = renamed(Vec::new());
+        blind.version = None;
+        let (graph, paths) = resolve::parse_tree(text).unwrap();
+        let (_, sibs) = classify(&graph, &paths, "windows-sys", &blind);
+        assert_eq!(sibs.len(), 1);
+
+        // Another row's target is patched, never a sibling.
+        let two_rows = "\
+0root v0.1.0 (/w/crates/root)
+1ring v0.17.14
+2windows-sys v0.52.0 (/w/crates/aterm-windows-sys-052)
+1http v0.1.0 (/w/crates/http)
+2windows-sys v0.52.0 (/w/crates/other-052)
+";
+        let (graph, paths) = resolve::parse_tree(two_rows).unwrap();
+        let (_, sibs) = classify(
+            &graph,
+            &paths,
+            "windows-sys",
+            &renamed(vec![PathBuf::from("/w/crates/other-052")]),
+        );
+        assert!(sibs.is_empty(), "{sibs:?}");
+    }
+
+    #[test]
+    fn a_renamed_row_is_read_as_the_package_it_names() {
+        let text = "\
+[patch.crates-io]
+windows-sys-052 = { package = \"windows-sys\", path = \"crates/aterm-windows-sys-052\" }
+";
+        let (forks, other) = parse_patch_table(text, Path::new("/w/Cargo.toml")).unwrap();
+        assert!(other.is_empty());
+        assert_eq!(
+            forks,
+            [PatchEntry {
+                name: "windows-sys".into(),
+                key: "windows-sys-052".into(),
+                path: "crates/aterm-windows-sys-052".into()
+            }]
+        );
+    }
+
     #[test]
     fn an_unknown_cell_is_could_not_run_not_a_policy_failure() {
-        let Err(err) = run(&repo_root(), &["macos".to_string()]) else {
+        let Err(err) = run(&Cargo::from_env(), &repo_root(), &["macos".to_string()]) else {
             panic!("an unknown cell must be could-not-run, never a verdict");
         };
         assert!(
@@ -1487,7 +1595,7 @@ reason = \"no arch intrinsics reach the shipped build\"
 
     /// A `workspace = true` dev-dependency is not an oracle: `aterm-gui`'s
     /// `winit = { workspace = true, features = ["aterm-test-key-event"] }`
-    /// inherits the patched fork on purpose, and counting it would fail
+    /// inherits the absorbed crate on purpose, and counting it would fail
     /// `[OB-15]` forever.
     #[test]
     fn an_inherited_dev_dependency_is_not_an_oracle() {
@@ -1495,30 +1603,9 @@ reason = \"no arch intrinsics reach the shipped build\"
         let holders = dev_dependency_oracles(&root, "winit");
         assert!(
             holders.is_empty(),
-            "winit's dev-dep is `workspace = true` (the patched fork), not a registry \
+            "winit's dev-dep is `workspace = true` (the absorbed crate), not a registry \
              oracle, but the scanner claimed: {holders:?}"
         );
-    }
-
-    /// Every patched package that is an oracle escapes capture today.
-    #[test]
-    fn no_patch_in_this_repo_currently_captures_an_oracle() {
-        let root = repo_root();
-        let (forks, _) = read_manifest_patches(&root).expect("root manifest reads");
-        for e in &forks {
-            let holders = dev_dependency_oracles(&root, &e.name);
-            if holders.is_empty() {
-                continue;
-            }
-            let lock = attest::lock_entries(&root, &e.name).expect("Cargo.lock reads");
-            assert!(
-                matches!(oracle_verdict(&lock), OracleVerdict::Escapes(_)),
-                "`{}` is patched to `{}` and held as an oracle by {holders:?}, but no \
-                 registry-sourced entry survives in Cargo.lock — the oracle is CAPTURED",
-                e.name,
-                e.path
-            );
-        }
     }
 
     /// The wgpu differential oracle is an optional normal dependency of

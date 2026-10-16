@@ -51,7 +51,7 @@ pub fn native_update_handoff_bind_retry_model() -> Model {
                 bound = 1;
             }
 
-            invariant BoundedAttempts: attempts <= Limit;
+            uncaught BoundedAttempts: attempts <= Limit;
             invariant PreserveOccupiedEndpoint: retried_occupied == 0;
         }
     }

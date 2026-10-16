@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! aterm performance harnesses: the examples `xtask perf` runs. This lib holds
+//! aterm performance harnesses: the examples `verify perf` runs. This lib holds
 //! the deterministic corpora shared between them.
 
 /// Trigram-diverse corpus: line counter + rotating 40-glyph body. Every line

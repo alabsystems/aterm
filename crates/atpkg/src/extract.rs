@@ -56,8 +56,6 @@ use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
 
-use aterm_digest::Sha256;
-
 use crate::tarread::EntryType as TarEntryType;
 
 mod zipread;
@@ -101,6 +99,10 @@ pub enum ExtractReject {
     /// reads its names back (`TreeAccumulator::require_spelled_back`); the path is the
     /// first recorded name the disk does not hold under those bytes.
     Respelled,
+    /// A single-file archive ([`stage_tar_gz_member`]) that is not EXACTLY ONE member
+    /// named by one bare component at its root: a second member, a nested or dotted name
+    /// (`dir/agy`, `./agy`, `agy/`), or — carried with an empty path — no member at all.
+    NotSingleFile,
 }
 
 /// The kind of an archive entry, as the reader classifies it.
@@ -143,6 +145,22 @@ pub struct ExtractOptions {
     /// ([`crate::tree::symlink_line`]). Off: every symlink is
     /// [`ExtractReject::DisallowedKind`].
     pub in_root_symlinks: bool,
+}
+
+/// Whether a `.tar.zst` stage demands each zstd frame's content checksum. The decoder
+/// verifies the checksum of every frame that carries one either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FrameChecksum {
+    /// A frame without one decodes: the `zstd` CLI (the packers' `zstd -19`) writes one by
+    /// default, but libzstd's library encoder does not, and atpkg-publish's in-process
+    /// packer is such a producer. Its rows sign a `tree_root`, which is the check there.
+    IfPresent,
+    /// A frame without one is refused at its header, before any of its content is laid
+    /// ([`aterm_zstd::DecodeError::NoChecksum`]). For a row that signs no `tree_root`,
+    /// whose decoded tree nothing else compares (`install::verify_and_stage` step 3):
+    /// either the signed root or the producer's checksum catches a decoding defect
+    /// (docs/AUDIT-third-party-2026-10-15.md ZC.5).
+    Required,
 }
 
 /// Steps 2–4 of [`vet_entry`]: the pure component walk. Accepts ONLY `Normal` segments
@@ -465,6 +483,14 @@ impl std::fmt::Display for ExtractError {
                  rewrites names, e.g. HFS+ decomposing Unicode or Windows dropping a \
                  trailing dot), so the installed tree could never match its recorded root"
             ),
+            ExtractError::Rejected(ExtractReject::NotSingleFile, p) if p.as_os_str().is_empty() => {
+                f.write_str("the archive holds no member; it must hold exactly one regular file")
+            }
+            ExtractError::Rejected(ExtractReject::NotSingleFile, p) => write!(
+                f,
+                "rejected entry {p:?}: the archive must hold exactly one regular file, named \
+                 at its root (this is a second member or a name that is not one bare component)"
+            ),
             ExtractError::Rejected(r, p) => write!(f, "rejected entry {p:?}: {r:?}"),
             ExtractError::TooLarge(r) => std::fmt::Display::fmt(r, f),
         }
@@ -526,9 +552,9 @@ fn classify(ty: TarEntryType) -> EntryKind {
 /// ([`Layer::regular`], [`Layer::directory`]), the directories a folding lane makes on a
 /// member's way ([`make_dir_exact`]), and the `.app` bundle the `dmg` lane's `ditto`
 /// copied (`install::vet_copied_tree`, AT3 in docs/AUDIT-atpkg-inputs-2026-10-04.md),
-/// so no lane lays a bit another one strips. The `raw-binary` lane's one file is the
-/// executable class, `0o755`.
-pub(crate) fn safe_mode(entry_mode: u32, is_dir: bool) -> u32 {
+/// so no lane lays a bit another one strips. The single-binary lanes' one file
+/// (`raw-binary`, `tar-gz-binary`) is the executable class, `0o755`.
+pub fn safe_mode(entry_mode: u32, is_dir: bool) -> u32 {
     if is_dir || entry_mode & 0o111 != 0 {
         0o755
     } else {
@@ -557,8 +583,8 @@ pub(crate) fn safe_mode(entry_mode: u32, is_dir: bool) -> u32 {
 /// record), and `disk_installed` signed only the content, so one shared counter refused
 /// honest bundles — `/usr/share/terminfo` tarred with the packers' flags is 2.9 MB of
 /// content in a 6.4 MB stream against a 5.9 MB cap. The packers sign at least half
-/// the decompressed stream (`atpkg_disk_installed`, tools/atpkg-publish-lib.sh), so a
-/// bundle they sign passes either count by construction.
+/// the decompressed stream (`atpkg_publish::artifact::tarwrite`), so a bundle they sign
+/// passes either count by construction.
 const TAR_ENTRY_STRUCTURAL_BUDGET: u64 = 1 << 20;
 
 /// Marker error the [`CappedReader`] raises when the structural budget is exhausted, so
@@ -1463,6 +1489,10 @@ pub(crate) fn create_symlink(target: &Path, link: &Path) -> io::Result<()> {
 /// `dest_root` should already exist as a hardened (`0700`, owned-by-uid) directory the
 /// caller owns; entries are written strictly beneath it.
 ///
+/// The zstd decoder is first-party (`aterm_zstd::Decoder`). It verifies the content
+/// checksum of every frame that carries one, so the stream is read to its end, past the
+/// tar's end-of-archive marker; a frame without a checksum decodes.
+///
 /// Returns `()`; the crate-private `extract_tar_zst_tree` is the same extraction folding the
 /// `tree_root` of what it wrote, which is what the staging path consumes.
 pub fn extract_tar_zst(
@@ -1473,15 +1503,14 @@ pub fn extract_tar_zst(
 ) -> Result<(), ExtractError> {
     // `fold = false`: the historical write-only extraction, with no content hashing and
     // no per-file `fstat` — its callers want only the bytes on disk.
-    let file = std::fs::File::open(archive)?;
-    let decoder = zstd::Decoder::new(file)?;
     extract_stream(
-        decoder,
+        zstd_decoder(archive, FrameChecksum::IfPresent)?,
         dest_root,
         max_total_bytes,
         max_entries,
         false,
         ExtractOptions::default(),
+        Trailer::Drained,
     )
     .map(|_| ())
 }
@@ -1495,24 +1524,39 @@ pub fn extract_tar_zst(
 ///
 /// Takes [`ExtractOptions`] and hands back the OPEN fold so the
 /// stage can record the `links` it creates afterwards before closing the root. The
-/// `tar-zst` vendor lane and (with default options) the release-bundle lane.
+/// `tar-zst` vendor lane and (with default options) the release-bundle lane; `checksum`
+/// is the stage's [`FrameChecksum`] rule.
 pub(crate) fn extract_tar_zst_tree(
     archive: &Path,
     dest_root: &Path,
     max_total_bytes: u64,
     max_entries: u64,
     opts: ExtractOptions,
+    checksum: FrameChecksum,
 ) -> Result<TreeAccumulator, ExtractError> {
-    let file = std::fs::File::open(archive)?;
-    let decoder = zstd::Decoder::new(file)?;
     folded(extract_stream(
-        decoder,
+        zstd_decoder(archive, checksum)?,
         dest_root,
         max_total_bytes,
         max_entries,
         true,
         opts,
+        Trailer::Drained,
     )?)
+}
+
+/// The zstd decoder over `archive` (first-party `aterm_zstd::Decoder`: a frame's content
+/// checksum is verified when the frame carries one, and required under
+/// [`FrameChecksum::Required`]).
+fn zstd_decoder(
+    archive: &Path,
+    checksum: FrameChecksum,
+) -> io::Result<aterm_zstd::Decoder<io::BufReader<std::fs::File>>> {
+    let decoder = aterm_zstd::Decoder::new(std::fs::File::open(archive)?);
+    Ok(match checksum {
+        FrameChecksum::IfPresent => decoder,
+        FrameChecksum::Required => decoder.require_checksum(),
+    })
 }
 
 /// The `tar-gz` vendor lane: the SAME tar extraction as [`extract_tar_zst_tree`] behind
@@ -1535,6 +1579,7 @@ pub(crate) fn extract_tar_gz_tree(
         max_entries,
         true,
         opts,
+        Trailer::Unread,
     )?)
 }
 
@@ -1558,10 +1603,26 @@ fn folded(tree: Option<TreeAccumulator>) -> Result<TreeAccumulator, ExtractError
     tree.ok_or_else(|| io::Error::other("extraction produced no tree_root").into())
 }
 
+/// What [`extract_stream`] does with the decoded bytes after the tar's end-of-archive
+/// marker: the marker's second block, the record padding `tar` writes after it, and
+/// anything else the stream holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Trailer {
+    /// Left unread. The `tar-gz` lane: its reader refuses trailing bytes that are not a
+    /// gzip member, which a vendor archive padded past its last member would hit.
+    Unread,
+    /// Read to the end of the stream, under one entry's structural budget and charged to
+    /// the structure allowance like any other tar structure. The zstd lanes: the decoder
+    /// checks a frame's content checksum when it reads the frame's last block, which can
+    /// lie past the marker (and a later frame entirely), so a tar that ends early would
+    /// otherwise skip the check.
+    Drained,
+}
+
 /// The one tar extraction body, over an already-decompressed `decoded` stream. `fold`
 /// decides whether it also accumulates the [`crate::tree::tree_root`] of what it writes
 /// (see [`extract_tar_zst_tree`]) or performs the historical write-only pass
-/// ([`extract_tar_zst`]).
+/// ([`extract_tar_zst`]); `trailer` what happens past the tar's end.
 fn extract_stream(
     decoded: impl Read,
     dest_root: &Path,
@@ -1569,6 +1630,7 @@ fn extract_stream(
     max_entries: u64,
     fold: bool,
     opts: ExtractOptions,
+    trailer: Trailer,
 ) -> Result<Option<TreeAccumulator>, ExtractError> {
     // Bound the decompressed bytes the tar reader pulls for each entry's STRUCTURAL
     // parts (header, padding, GNU/PAX extension-header body — the last read inside
@@ -1655,6 +1717,11 @@ fn extract_stream(
             }
         }
     }
+    if trailer == Trailer::Drained {
+        budget.set(TAR_ENTRY_STRUCTURAL_BUDGET);
+        io::copy(&mut tar.into_inner(), &mut io::sink()).map_err(map_tar_io)?;
+        layer.charge_structure(TAR_ENTRY_STRUCTURAL_BUDGET.saturating_sub(budget.get()))?;
+    }
     Ok(layer.finish())
 }
 
@@ -1673,7 +1740,7 @@ pub(crate) struct WrittenFile {
     pub(crate) mode: u32,
     /// Lowercase-hex SHA-256 of the content, accumulated over the SAME 64 KiB chunks the
     /// copy loop writes. Byte-for-byte the digest `tree::file_sha256` would produce by
-    /// reading the file back: the same bytes, the same streaming `Sha256`.
+    /// reading the file back: the same bytes, the same streaming `tree::BulkSha256`.
     pub(crate) content_sha_hex: String,
     /// Content bytes written.
     pub(crate) len: u64,
@@ -1714,7 +1781,7 @@ fn write_capped(
     } = sink;
     // One `Option` test per 64 KiB chunk when folding is off — unmeasurable next to the
     // decompress and the write it sits between.
-    let mut hasher = fold.then(Sha256::new);
+    let mut hasher = fold.then(crate::tree::BulkSha256::new);
     let mut len: u64 = 0;
     loop {
         // The read flows through the CappedReader (structural budget); map a budget
@@ -1784,7 +1851,7 @@ fn write_capped(
             let meta = f.metadata().map_err(|e| io_at(e, "fstat", dest))?;
             Ok(WrittenFile {
                 mode: crate::platform::folded_mode(&meta, mode),
-                content_sha_hex: aterm_codec::hex::encode_lower(&hasher.finalize()),
+                content_sha_hex: hasher.finalize_hex(),
                 len,
             })
         }
@@ -1857,6 +1924,72 @@ pub(crate) fn stage_file(
     )
 }
 
+/// The `tar-gz-binary` vendor lane's whole extraction: the gzip tar at `archive` holds
+/// EXACTLY ONE member, a regular file named by one bare component at its root, and that
+/// member's body is laid at `dest` with permission `mode`. The member's own name is vetted
+/// and dropped (the caller names the file). The body streams through the reader, the
+/// structural budget and allowance of [`extract_tar_gz_tree`] and the write loop of
+/// [`stage_file`], capped at `max_total_bytes`, so the file folds exactly as a
+/// `raw-binary` download of the same bytes would.
+///
+/// Refused before a byte of it is written: an archive with no member or a member whose
+/// name is not one bare component ([`ExtractReject::NotSingleFile`]), or a directory,
+/// link, device or other non-regular member ([`ExtractReject::DisallowedKind`]). A tar
+/// names its members as it goes, so a SECOND member shows only after the first one's
+/// body; it refuses the stage the same way, and the caller removes what was laid, as for
+/// any refusal mid-archive.
+pub(crate) fn stage_tar_gz_member(
+    archive: &Path,
+    dest: &Path,
+    mode: u32,
+    max_total_bytes: u64,
+) -> Result<WrittenFile, ExtractError> {
+    let file = std::fs::File::open(archive).map_err(|e| io_at(e, "open", archive))?;
+    let budget = Rc::new(Cell::new(TAR_ENTRY_STRUCTURAL_BUDGET));
+    let mut tar = crate::tarread::Archive::new(CappedReader {
+        inner: aterm_codec::inflate::stream::GzipReader::new(file),
+        budget: Rc::clone(&budget),
+    });
+    let mut entries = tar.entries().map_err(map_tar_io)?;
+    let mut remaining = max_total_bytes;
+    let mut structure = max_total_bytes;
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut written = None;
+    loop {
+        // Each entry's structure is budgeted, and charged to the stream's allowance, as
+        // `extract_stream` does it (`Layer::charge_structure`).
+        budget.set(TAR_ENTRY_STRUCTURAL_BUDGET);
+        let next = entries.next_entry().map_err(map_tar_io)?;
+        structure = structure
+            .checked_sub(TAR_ENTRY_STRUCTURAL_BUDGET.saturating_sub(budget.get()))
+            .ok_or(ExtractError::TooLarge(TooLargeReason::StructureCap))?;
+        let Some(mut entry) = next else {
+            break;
+        };
+        let raw = entry.path()?.into_owned();
+        if written.is_some() {
+            return Err(ExtractError::Rejected(ExtractReject::NotSingleFile, raw));
+        }
+        if classify(entry.header().entry_type()) != EntryKind::Regular {
+            return Err(ExtractError::Rejected(ExtractReject::DisallowedKind, raw));
+        }
+        if !raw.to_str().is_some_and(crate::vendor::bare_file_name) {
+            return Err(ExtractError::Rejected(ExtractReject::NotSingleFile, raw));
+        }
+        let file =
+            crate::platform::open_create_write(dest, mode).map_err(|e| io_at(e, "open", dest))?;
+        written = Some(write_capped(
+            &mut entry,
+            Sink { file, dest, mode },
+            &mut remaining,
+            &budget,
+            &mut buf,
+            true,
+        )?);
+    }
+    written.ok_or_else(|| ExtractError::Rejected(ExtractReject::NotSingleFile, PathBuf::new()))
+}
+
 /// Hand-built archive bytes shared by the extraction tests here and the staging tests
 /// in `install.rs`: raw USTAR headers (so adversarial names the high-level writers
 /// refuse to emit — `../`, symlinks, absolute paths — can be injected), the three
@@ -1907,8 +2040,12 @@ pub(crate) mod fixtures {
         tar
     }
 
+    /// One zstd frame holding `raw` in raw blocks, checksummed as `zstd` writes it
+    /// (`aterm_zstd::frame::write_raw`): a valid frame for the extractor, not a small one.
     pub(crate) fn zstd_bytes(raw: &[u8]) -> Vec<u8> {
-        zstd::encode_all(raw, 0).unwrap()
+        let mut out = Vec::new();
+        aterm_zstd::frame::write_raw(&mut out, raw, aterm_zstd::frame::Checksum::Xxh64).unwrap();
+        out
     }
 
     /// A gzip member (RFC 1952) around [`deflate_bytes`].
@@ -2475,6 +2612,7 @@ mod tests {
             10_000_000,
             10_000,
             ExtractOptions::default(),
+            FrameChecksum::IfPresent,
         )
         .unwrap();
         let (fused, walked) = fused_and_walked(tree, &root);
@@ -2638,6 +2776,7 @@ mod tests {
             10_000_000,
             10_000,
             ExtractOptions::default(),
+            FrameChecksum::IfPresent,
         )
         .unwrap_err();
         assert!(matches!(
@@ -2778,8 +2917,9 @@ mod tests {
     /// * bare directory headers, which bound the COUNT of content-free entries by the
     ///   signed size: one 512-byte header of the cap each.
     ///
-    /// Pinned by the count, not a clock: the cap admits exactly the bytes the reader pulls
-    /// (every header up to the first end-of-archive block) and refuses one fewer.
+    /// Pinned by the count, not a clock: the cap admits exactly the decompressed stream
+    /// (every header, and the end-of-archive marker, which a zstd lane reads to the end of
+    /// the stream for the frame's checksum) and refuses one fewer.
     #[test]
     fn the_tar_structure_counts_against_the_signed_cap() {
         let d = dest("structure-cap");
@@ -2809,6 +2949,7 @@ mod tests {
                 1 << 20,
                 10_000,
                 ExtractOptions::default(),
+                FrameChecksum::IfPresent,
             );
             assert!(
                 matches!(
@@ -2820,8 +2961,8 @@ mod tests {
                 tar.len(),
                 refused.map(|_| ())
             );
-            // The reader stops at the FIRST end-of-archive block.
-            let pulled = (tar.len() - 512) as u64;
+            // The zstd lanes read past the end-of-archive marker to the end of the stream.
+            let pulled = tar.len() as u64;
             for (cap, admitted) in [(pulled, true), (pulled - 1, false)] {
                 let got = extract_tar_zst_tree(
                     &archive,
@@ -2829,6 +2970,7 @@ mod tests {
                     cap,
                     10_000,
                     ExtractOptions::default(),
+                    FrameChecksum::IfPresent,
                 );
                 assert_eq!(
                     got.is_ok(),
@@ -2864,8 +3006,8 @@ mod tests {
         }
         tar.resize(tar.len() + 1024, 0);
         let content = (files * size) as u64;
-        // Everything the reader pulls (up to the FIRST end-of-archive block) but content.
-        let structure = (tar.len() - 512) as u64 - content;
+        // Everything the zstd lane decompresses (the whole stream) but content.
+        let structure = tar.len() as u64 - content;
         assert!(
             structure > content,
             "the fixture must carry more structure than content: {structure} vs {content}"
@@ -2880,6 +3022,7 @@ mod tests {
             signed_cap,
             10_000,
             ExtractOptions::default(),
+            FrameChecksum::IfPresent,
         );
         assert!(
             tree.is_ok(),
@@ -2898,6 +3041,7 @@ mod tests {
                 cap,
                 10_000,
                 ExtractOptions::default(),
+                FrameChecksum::IfPresent,
             )
             .map(|_| ())
         };
@@ -2915,6 +3059,137 @@ mod tests {
             "cap {} is one byte under the structure: {under:?}",
             structure - 1
         );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The refusal a zstd lane's decoder raised, inside the extraction error.
+    fn zstd_refusal(err: &ExtractError) -> Option<&aterm_zstd::DecodeError> {
+        match err {
+            ExtractError::Io { err, .. } => err.get_ref()?.downcast_ref(),
+            _ => None,
+        }
+    }
+
+    /// A zstd lane reads the stream to its end, so a frame's content checksum is checked
+    /// even where the tar ends a block before the frame does. Here the end-of-archive
+    /// marker's first block closes the frame's first 128 KiB block, and the last block
+    /// holds only what follows it (the second marker block and `tar`'s record padding);
+    /// the decoder checks the checksum when it reads that block. A damaged checksum is
+    /// refused, and the undamaged frame extracts. The negative control: with the trailer
+    /// left unread (the `tar-gz` lane's way) the damaged archive extracts, so the
+    /// refusal is the drain's.
+    #[test]
+    fn a_zstd_lane_checks_a_checksum_past_the_tar_end() {
+        let d = dest("checksum-past-end");
+        let block = aterm_zstd::frame::BLOCK_MAX;
+        let body = vec![b'x'; block - 1024];
+        let mut tar = raw_header("f", b'0', "", body.len()).to_vec();
+        tar.extend_from_slice(&body);
+        tar.resize(block + 512, 0); // the first marker block ends at `block`, then the second
+        tar.resize(tar.len().div_ceil(10_240) * 10_240, 0);
+        let mut zst = Vec::new();
+        aterm_zstd::frame::write_raw(&mut zst, &tar, aterm_zstd::frame::Checksum::Xxh64).unwrap();
+        let good = d.join("good.tar.zst");
+        std::fs::write(&good, &zst).unwrap();
+        let last = zst.len() - 1;
+        zst[last] ^= 1; // the checksum's last byte
+        let bad = d.join("bad.tar.zst");
+        std::fs::write(&bad, &zst).unwrap();
+
+        extract_tar_zst(&good, &d.join("good"), 1 << 20, 10).unwrap();
+        assert_eq!(std::fs::read(d.join("good/f")).unwrap(), body);
+        for (label, result) in [
+            (
+                "write-only",
+                extract_tar_zst(&bad, &d.join("bad"), 1 << 20, 10),
+            ),
+            (
+                "folding",
+                extract_tar_zst_tree(
+                    &bad,
+                    &d.join("bad-tree"),
+                    1 << 20,
+                    10,
+                    ExtractOptions::default(),
+                    FrameChecksum::IfPresent,
+                )
+                .map(|_| ()),
+            ),
+        ] {
+            let err = result.unwrap_err();
+            assert!(
+                matches!(
+                    zstd_refusal(&err),
+                    Some(aterm_zstd::DecodeError::Checksum { .. })
+                ),
+                "{label}: {err:?}"
+            );
+        }
+        let unread = extract_stream(
+            zstd_decoder(&bad, FrameChecksum::IfPresent).unwrap(),
+            &d.join("unread"),
+            1 << 20,
+            10,
+            false,
+            ExtractOptions::default(),
+            Trailer::Unread,
+        );
+        assert!(unread.is_ok(), "{:?}", unread.map(|_| ()));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// [`FrameChecksum::Required`] refuses a frame that carries no content checksum at its
+    /// header: nothing is laid. The same archive extracts under
+    /// [`FrameChecksum::IfPresent`], and the checksummed frame of the same tar under
+    /// `Required`.
+    #[test]
+    fn a_required_checksum_refuses_a_frame_without_one_before_any_entry() {
+        let d = dest("checksum-required");
+        let tar = tar_bytes(&[("bin/ay", b'0', "", b"#!/bin/true\n".as_slice(), 0o755)]);
+        let mut bare = Vec::new();
+        aterm_zstd::frame::write_raw(&mut bare, &tar, aterm_zstd::frame::Checksum::Omitted)
+            .unwrap();
+        let (bare_zst, checked_zst) = (d.join("bare.tar.zst"), d.join("checked.tar.zst"));
+        std::fs::write(&bare_zst, bare).unwrap();
+        std::fs::write(&checked_zst, zstd_bytes(&tar)).unwrap();
+        let at = |archive: &Path, label: &str, checksum: FrameChecksum| {
+            let root = d.join(label);
+            let got = extract_tar_zst_tree(
+                archive,
+                &root,
+                1 << 20,
+                10,
+                ExtractOptions::default(),
+                checksum,
+            )
+            .map(|_| ());
+            (root, got)
+        };
+
+        let (root, refused) = at(&bare_zst, "refused", FrameChecksum::Required);
+        let err = refused.unwrap_err();
+        assert_eq!(
+            zstd_refusal(&err),
+            Some(&aterm_zstd::DecodeError::NoChecksum),
+            "{err:?}"
+        );
+        assert_eq!(
+            std::fs::read_dir(&root).map_or(0, Iterator::count),
+            0,
+            "nothing is laid before the refusal"
+        );
+        for (archive, label, checksum) in [
+            (&bare_zst, "if-present", FrameChecksum::IfPresent),
+            (&checked_zst, "checked", FrameChecksum::Required),
+        ] {
+            let (root, got) = at(archive, label, checksum);
+            assert!(got.is_ok(), "{label}: {got:?}");
+            assert_eq!(
+                std::fs::read(root.join("bin/ay")).unwrap(),
+                b"#!/bin/true\n",
+                "{label}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -3002,6 +3277,7 @@ mod tests {
             10_000_000,
             10_000,
             ExtractOptions::default(),
+            FrameChecksum::IfPresent,
         )
         .unwrap();
         let (fused, walked) = fused_and_walked(tree, &root);
@@ -3092,7 +3368,14 @@ mod tests {
             for lane in ["tar", "zip"] {
                 let root = d.join(format!("{lane}-{}", first.len()));
                 let got = if lane == "tar" {
-                    extract_tar_zst_tree(&zst, &root, 1 << 20, 10, ExtractOptions::default())
+                    extract_tar_zst_tree(
+                        &zst,
+                        &root,
+                        1 << 20,
+                        10,
+                        ExtractOptions::default(),
+                        FrameChecksum::IfPresent,
+                    )
                 } else {
                     extract_zip_tree(&zip, &root, 1 << 20, 10, vendor(0))
                 };
@@ -3270,7 +3553,14 @@ mod tests {
             for (how, respell, blamed) in respellings {
                 let root = d.join(format!("{lane}-{how}"));
                 let tree = match lane {
-                    "tar-zst" => extract_tar_zst_tree(&zst, &root, 1 << 20, 10, vendor(0)),
+                    "tar-zst" => extract_tar_zst_tree(
+                        &zst,
+                        &root,
+                        1 << 20,
+                        10,
+                        vendor(0),
+                        FrameChecksum::IfPresent,
+                    ),
                     "tar-gz" => extract_tar_gz_tree(&gz, &root, 1 << 20, 10, vendor(0)),
                     _ => extract_zip_tree(&zip, &root, 1 << 20, 10, vendor(0)),
                 }
@@ -3311,6 +3601,7 @@ mod tests {
                 10_000_000,
                 10_000,
                 ExtractOptions::default(),
+                FrameChecksum::IfPresent,
             )
             .unwrap();
             let (fused, walked) = fused_and_walked(tree, &root);
@@ -3355,6 +3646,7 @@ mod tests {
             10_000_000,
             10_000,
             ExtractOptions::default(),
+            FrameChecksum::IfPresent,
         )
         .unwrap();
         let (fused, walked) = fused_and_walked(tree, &root);
@@ -3368,6 +3660,7 @@ mod tests {
             10_000_000,
             10_000,
             ExtractOptions::default(),
+            FrameChecksum::IfPresent,
         )
         .unwrap_err();
         assert!(
@@ -3387,6 +3680,7 @@ mod tests {
                 10_000_000,
                 10_000,
                 ExtractOptions::default(),
+                FrameChecksum::IfPresent,
             )
         };
         assert!(fold(&fresh).is_err());
@@ -3411,6 +3705,7 @@ mod tests {
             10_000_000,
             10_000,
             ExtractOptions::default(),
+            FrameChecksum::IfPresent,
         )
         .unwrap();
         let (fused, walked) = fused_and_walked(tree, &root);
@@ -3527,7 +3822,15 @@ mod tests {
 
         let r_zst = d.join("zst");
         let (root_zst, walk_zst) = fused_and_walked(
-            extract_tar_zst_tree(&zst, &r_zst, 10_000_000, 10_000, vendor(1)).unwrap(),
+            extract_tar_zst_tree(
+                &zst,
+                &r_zst,
+                10_000_000,
+                10_000,
+                vendor(1),
+                FrameChecksum::IfPresent,
+            )
+            .unwrap(),
             &r_zst,
         );
         let r_gz = d.join("gz");
@@ -3646,9 +3949,16 @@ mod tests {
 
         // The zstd lane is the same tar: same tree, same fused root.
         let rz = d.join("zst0");
-        let rootz = extract_tar_zst_tree(&zst, &rz, 10_000_000, 10_000, vendor(0))
-            .unwrap()
-            .root();
+        let rootz = extract_tar_zst_tree(
+            &zst,
+            &rz,
+            10_000_000,
+            10_000,
+            vendor(0),
+            FrameChecksum::IfPresent,
+        )
+        .unwrap()
+        .root();
         assert_eq!(rootz, root0, "zstd and gzip are the same tar");
 
         // A root-naming member is a no-op ONLY as a directory: as a FILE it still names
@@ -3892,7 +4202,15 @@ mod tests {
             ),
             (
                 "zst",
-                extract_tar_zst_tree(&zst, &root_zst, 10_000_000, 10_000, vendor(0)).map(|_| ()),
+                extract_tar_zst_tree(
+                    &zst,
+                    &root_zst,
+                    10_000_000,
+                    10_000,
+                    vendor(0),
+                    FrameChecksum::IfPresent,
+                )
+                .map(|_| ()),
                 &root_zst,
             ),
         ];
@@ -4303,6 +4621,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// `stage_tar_gz_member` judges the member by its header — a non-regular kind, a name
+    /// that is not one bare component, no member at all — before it opens the file it
+    /// would lay (the laid member: install.rs's
+    /// `a_one_member_tar_gz_binary_stages_its_file_at_bin_entry_0755`).
+    #[test]
+    fn stage_tar_gz_member_refuses_by_header_before_writing() {
+        let d = dest("tgz-member");
+        let out = d.join("agy");
+        for (i, tar) in [
+            tar_bytes(&[("antigravity", b'2', "/bin/sh", b"", 0o777)]),
+            tar_bytes(&[("antigravity/", b'5', "", b"", 0o755)]),
+            tar_bytes(&[("dir/antigravity", b'0', "", b"agy", 0o755)]),
+            tar_bytes(&[("antigravity\\x", b'0', "", b"agy", 0o755)]),
+            tar_bytes(&[]),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let gz = d.join(format!("{i}.tar.gz"));
+            std::fs::write(&gz, gzip_bytes(tar)).unwrap();
+            let err = stage_tar_gz_member(&gz, &out, 0o755, 1 << 20).unwrap_err();
+            assert!(matches!(err, ExtractError::Rejected(..)), "{i}: {err}");
+            assert!(!out.exists(), "{i}: nothing laid");
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     /// A symlink recorded AFTER extraction (the stage's `links`) folds to the same root
     /// the walk reads over the finished tree — the fold is open until the stage closes it.
     #[cfg(unix)]
@@ -4481,7 +4826,8 @@ mod tests {
         assert_eq!(w.len, body.len() as u64);
         // Read back off the same handle: the mode reached the inode we wrote.
         assert_eq!(w.mode, 0o755);
-        let mut h = Sha256::new();
+        // The scalar reference, not the fold's own `BulkSha256`.
+        let mut h = aterm_digest::Sha256::new();
         h.update(body);
         assert_eq!(
             w.content_sha_hex,

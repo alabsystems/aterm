@@ -1,0 +1,20 @@
+# claude-code 2.1.301 · MEASURED 2026-10-15, `aterm ctl text` of a private headless aterm (120x50, aterm 0.105.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake claude.ai OAuth token (`claude --subscriber`) and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · one Escape after the usage tab, as a Max 5x subscriber (the token's scopes user:inference user:profile, the composed oauthAccount of ana@example.com seeded in the scratch .claude.json), the inline renderer · the lab's random project dir is spelled /private/tmp/at.lab0 here
+ ▐▛███▛█   Claude Code v2.1.301
+▝▜██████▀  Opus 5.5 · Claude Max
+ ▝▝   ▝▝   /private/tmp/at.lab0/proj
+
+
+❯ hi
+
+⏺ Hi! I am the local lab stub, not a model. (reply 1)
+
+✻ Brewed for 0s · done 11:34 PM
+
+❯ /usage
+  ⎿  Settings dialog dismissed
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  lab status line                                                                                   ◐ medium · /effort
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents

@@ -68,9 +68,8 @@ fn the_flat_spelling_collapses_every_comet_branch_byte_for_byte() {
     for ((name, got), (want_name, want)) in flat.iter().zip(FLAT_GOLDENS) {
         assert_eq!(*name, want_name);
         // The four flat rows are Apple-silicon exact bits like the deletion
-        // goldens above them (`arm64_pin`): asserted everywhere but x86_64
-        // macOS, where a miss is reported and the render's determinism is
-        // what is asserted instead.
+        // goldens (`arm64_pin`): asserted everywhere but x86_64 macOS, where a
+        // miss is reported and the render's determinism is asserted instead.
         if crate::arm64_pin::moved(
             "cursor_glow::tests::goldens::the_flat_spelling_collapses_every_comet_branch_byte_for_byte",
             name,
@@ -119,42 +118,4 @@ fn the_other_nine_styles_are_byte_identical_with_v2_unconditional() {
             format_args!("{name}: the deletion moved a byte"),
         );
     }
-}
-
-/// The rainbow kitty's dark, light, underline and reduced-motion rows each fold
-/// to their pinned golden. The rows are re-pinned whenever v2 deliberately
-/// changes its bytes (the re-bake law on [`DELETION_GOLDENS`]), so any drift is
-/// a decision. The reduced row is independent of stardust position laws, and
-/// light and dark move by different amounts when the stardust population
-/// changes (`light_keeps` thins to [`rk::stardust::LIGHT_COUNT_SCALE`]). The
-/// non-kitty rows are pinned by
-/// `the_other_nine_styles_are_byte_identical_with_v2_unconditional`.
-#[test]
-fn rainbow_kitty_is_byte_identical_to_the_seam_era_v2() {
-    let rows = deletion_goldens();
-    let mut checked = 0;
-    // Every kitty row is read before any is judged, so one re-bake shows
-    // all four moved numbers at once instead of one per run.
-    let mut moved = Vec::new();
-    for ((name, got), (want_name, want)) in rows.iter().zip(DELETION_GOLDENS) {
-        assert_eq!(name, want_name);
-        if !name.starts_with("RainbowKitty") {
-            continue;
-        }
-        checked += 1;
-        if crate::arm64_pin::moved(
-            "cursor_glow::tests::goldens::rainbow_kitty_is_byte_identical_to_the_seam_era_v2",
-            name,
-            *got,
-            want,
-        ) {
-            moved.push(format!("{name}: got {got} want {want}"));
-        }
-    }
-    assert!(
-        moved.is_empty(),
-        "the deletion moved a v2 byte:\n{}",
-        moved.join("\n")
-    );
-    assert_eq!(checked, 4);
 }

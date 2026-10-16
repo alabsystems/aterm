@@ -67,10 +67,35 @@ pub(crate) fn shell_integration_outcome() -> Option<ShellIntegrationOutcome> {
         .clone()
 }
 
-fn record_shell_integration_outcome(outcome: ShellIntegrationOutcome) {
+/// Every outcome this process has recorded, so a failure is warned about once:
+/// a `/bin/sh` user's aterm.log held one identical line per tab.
+static SHELL_INTEGRATION_SEEN: std::sync::Mutex<Vec<ShellIntegrationOutcome>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Record `outcome` as the current truth (every time: the pill and
+/// `--diagnose` read the newest), and answer whether it is new to this process
+/// — the one time a failure is worth a warning.
+fn record_shell_integration_outcome(outcome: ShellIntegrationOutcome) -> bool {
+    let first = first_sighting(&SHELL_INTEGRATION_SEEN, &outcome);
     *SHELL_INTEGRATION_OUTCOME
         .lock()
         .expect("shell integration outcome lock") = Some(outcome);
+    first
+}
+
+/// Whether `seen` lacked `outcome`, adding it when it did.
+fn first_sighting(
+    seen: &std::sync::Mutex<Vec<ShellIntegrationOutcome>>,
+    outcome: &ShellIntegrationOutcome,
+) -> bool {
+    let mut seen = seen
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if seen.contains(outcome) {
+        return false;
+    }
+    seen.push(outcome.clone());
+    true
 }
 
 // Auto-prime: every fresh session spawn runs the coding-agent primer
@@ -116,7 +141,7 @@ pub(crate) enum AgentPrimeOutcome {
     /// `$HOME` is unset or empty: nowhere to look.
     NoHome,
     /// This process runs from an app bundle that is not the release `aterm.app` (a dev
-    /// bundle from `tools/dev-app.sh`, a renamed copy): nothing was read or written. The
+    /// bundle from `ship dev-app`, a renamed copy): nothing was read or written. The
     /// agents' context files are shared user state; a dev build primes them only when
     /// asked (`aterm agents install`). See `atpkg::hooks::runs_from_non_release_bundle`.
     NotReleaseBundle,
@@ -261,21 +286,26 @@ fn prepare_shell_integration(shell_hint: Option<&str>) -> Option<ShellIntegratio
                 .map(String::from)
                 .or_else(|| std::env::var("SHELL").ok())
                 .unwrap_or_else(|| "the default shell".to_string());
-            aterm_log::warn!(
-                "shell integration is not available for {name}: command blocks, cwd \
-                 tracking and the ALab tools' PATH hook (shell.d) will not work in \
-                 this shell — `aterm --diagnose` shows the runtime state"
-            );
-            record_shell_integration_outcome(ShellIntegrationOutcome::UnknownShell(name));
+            // Said once per shell name per process; every tab still records it.
+            let outcome = ShellIntegrationOutcome::UnknownShell(name.clone());
+            if record_shell_integration_outcome(outcome) {
+                aterm_log::warn!(
+                    "shell integration is not available for {name}: command blocks, cwd \
+                     tracking and the ALab tools' PATH hook (shell.d) will not work in \
+                     this shell — `aterm --diagnose` shows the runtime state"
+                );
+            }
             return None;
         }
         Err(e) => {
-            aterm_log::warn!(
-                "shell integration loader could not be written ({e}): command blocks, \
-                 cwd tracking and the ALab tools' PATH hook (shell.d) will not work — \
-                 `aterm --diagnose` shows the runtime state"
-            );
-            record_shell_integration_outcome(ShellIntegrationOutcome::WriteFailed(e.to_string()));
+            let outcome = ShellIntegrationOutcome::WriteFailed(e.to_string());
+            if record_shell_integration_outcome(outcome) {
+                aterm_log::warn!(
+                    "shell integration loader could not be written ({e}): command blocks, \
+                     cwd tracking and the ALab tools' PATH hook (shell.d) will not work — \
+                     `aterm --diagnose` shows the runtime state"
+                );
+            }
             return None;
         }
     };
@@ -381,6 +411,9 @@ mod interactive_shell_name_tests {
 /// authority minted in `main`, held by clone (cloning a `Cap` does not re-mint).
 /// The baseline `env_add` is the terminal-identity env without the
 /// shell-integration vars, which carry a per-tab nonce and are added per spawn.
+/// `Clone` so a tab spawned off the event loop takes its own copy to the spawner
+/// thread (`tab_spawn`).
+#[derive(Clone)]
 pub(crate) struct SessionFactory {
     pub(crate) spawn_cap: aterm_cap::Cap<aterm_cap::effects::Spawn>,
     pub(crate) sandbox_cap: aterm_cap::Cap<aterm_sandbox::Sandbox>,
@@ -407,10 +440,11 @@ pub(crate) struct SessionFactory {
     /// Engine config (scrollback/cursor/theme/palette) applied to each tab's
     /// `Terminal`, byte-identical to the single-session path.
     pub(crate) terminal_config: Option<aterm_core::config::TerminalConfig>,
-    /// Live OS color scheme, set on every new session's engine at construction
-    /// (`Terminal::set_color_scheme`) so a tab spawned after attach reports the
-    /// right scheme to apps (DEC 2031 / DSR `CSI ?996n`). Seeded `Dark` and kept
-    /// current by `App::sync_app_theme_to_appearance`.
+    /// The appearance of the palette on screen (`ResolvedColors::reported`), set
+    /// on every new session's engine at construction (`Terminal::set_color_scheme`)
+    /// so a tab spawned later reports the scheme its palette reads as to apps
+    /// (DEC 2031 / DSR `CSI ?996n`). Seeded from the startup resolution and kept
+    /// current by `App::install_colors`.
     pub(crate) appearance: aterm_types::Appearance,
     /// Whether to inject OSC 133/633 shell integration. Each tab gets a fresh
     /// CSPRNG nonce, authorized and required on its own engine, so one tab's
@@ -448,8 +482,15 @@ pub(crate) struct SessionFactory {
     /// consumed, so a child that dies pre-ready leaves them for the parent.
     /// Set iff `ATERM_HANDOFF_READY_FD` arrived; fresh spawns attach inline.
     pub(crate) defer_adopted_readers: bool,
+    /// A tab spawned off the event loop (`tab_spawn`): `spawn_session` leaves
+    /// the reader to the caller, which parks it on a gate the main thread opens
+    /// once the tab is installed and registered, so the reader's first
+    /// `Wake::Ready` or `Wake::Exit` never reaches the loop before the session
+    /// it names. Set only on the spawner's copy of the factory.
+    pub(crate) reader_after_install: bool,
     /// The foreground-process-group probe each PTY gather samples for the
-    /// foreground handback: [`crate::quit_safety::foreground_pgrp`]
+    /// foreground handback, and the status sweep reads for the group in front
+    /// (`App::observe_session_statuses`): [`crate::quit_safety::foreground_pgrp`]
     /// (`tcgetpgrp(master)`, `-1` when unknown). A plain `fn` so the gather thread
     /// copies it; `foreground_handback_conformance` swaps in a scripted probe.
     pub(crate) fg_probe: fn(i32) -> i32,
@@ -950,10 +991,12 @@ pub(crate) struct Adopted {
     /// than `checkpoint`, opened before the proof and imported after Commit, plus
     /// the lines this handoff could not carry. Default for fresh construction.
     pub history: crate::handoff_history::AdoptedHistory,
-    /// The handoff record's `"<origin> <reason>"` hold row, unparsed;
-    /// [`seed_adopted_fabric`] reads it fail-closed (`fabric::parse_hold`) before
-    /// registration, so a seamless update never lifts a halt. `None`: not held.
-    pub hold: Option<String>,
+    /// The handoff record's `"<origin> <reason>"` hold rows, unparsed, one per
+    /// standing origin (`SessionRecord::hold_rows`, or a keeper META's);
+    /// [`seed_adopted_fabric`] reads them fail-closed (`fabric::parse_holds`)
+    /// before registration, so a seamless update never lifts a halt — the
+    /// owner's or the fleet's. Empty: not held.
+    pub holds: Vec<String>,
     /// The fallback title for a checkpoint that carried no title of its own:
     /// the engine title the layout leaf naming this session was captured with
     /// at the park, or the handoff record's copy (`SessionRecord::title`),
@@ -1002,6 +1045,11 @@ pub(crate) struct Adopted {
     /// The record's newest timeline id (round seven, finding 50): the adopted
     /// timeline counts on above it ([`mark_handoff_gap`]). `0`: none carried.
     pub timeline_id: u64,
+    /// The session log's epoch and node-id counters the record carried
+    /// (`SessionRecord::log_ids`): the adopted log continues them
+    /// ([`mark_handoff_gap`]). `None`: none carried (an older producer, a
+    /// keeper's shell), and the log starts at its first epoch.
+    pub log_carry: Option<crate::session_log::LogCarry>,
     /// The pair the crash journal image this window takes over at its Commit
     /// keys this shell by, when the outgoing process held an image that was not
     /// its own (`SessionRecord::journal_key`, round seven's leftover I2b).
@@ -1013,23 +1061,29 @@ pub(crate) struct Adopted {
 /// Mark an adopted session's timeline, cast and temporal recorder as starting
 /// at the handoff ([`crate::session_timeline::HandoffGap`]), since none of them
 /// crosses the update: the timeline's `handoff carried=0 from_build=<n>` row,
-/// the cast header's `aterm_handoff`, `temporal status`'s tail. Called before
-/// any other row reaches the timeline.
+/// the cast header's `aterm_handoff`, `temporal status`'s tail, and the session
+/// log's `gap why=handoff epoch=<ep+1>` (`gap why=crash` for a shell the PTY
+/// keeper held, `keeper`). Called before any other row reaches the timeline.
 ///
 /// Timeline ids continue above `timeline_id`, the last one the outgoing process
-/// issued, so every row is above any `timeline since=` anchor taken before.
+/// issued, so every row is above any `timeline since=` anchor taken before; the
+/// session log's node ids continue the counters `log` carried.
 pub(crate) fn mark_handoff_gap(
     timeline: &std::sync::Mutex<crate::session_timeline::SessionTimeline>,
     cast: &std::sync::Mutex<crate::cast::CastRecorder>,
     temporal: &std::sync::Mutex<crate::temporal::TemporalRecorder>,
     from_build: Option<u64>,
     timeline_id: u64,
+    log: Option<crate::session_log::LogCarry>,
+    keeper: bool,
 ) {
     let gap = crate::session_timeline::HandoffGap { from_build };
     {
         let mut tl = timeline.lock().unwrap_or_else(|p| p.into_inner());
         tl.continue_ids(timeline_id);
         tl.record("handoff", gap.payload());
+        let at = tl.slog().now();
+        tl.slog_mut().adopt(log, keeper, at);
     }
     cast.lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -1046,12 +1100,13 @@ pub(crate) fn mark_handoff_gap(
 /// it was halted against.
 ///
 /// Topic rows are re-validated (`fabric::parse_topics` drops what does not
-/// read); the hold row fails closed (`fabric::parse_hold`).
+/// read); the hold rows fail closed (`fabric::parse_holds`), each into the
+/// slot of the origin it reads as.
 pub(crate) fn seed_adopted_fabric(
     fabric: &crate::fabric::SessionFabric,
     timeline: &Mutex<crate::session_timeline::SessionTimeline>,
     topics: &[String],
-    hold: Option<&str>,
+    holds: &[String],
     carry: &crate::fabric::FabricCarry,
 ) {
     // Broadcast opt-ins the handoff carried: receiver-side consent for
@@ -1059,9 +1114,10 @@ pub(crate) fn seed_adopted_fabric(
     if !topics.is_empty() {
         fabric.set_topics(crate::fabric::parse_topics(topics));
     }
-    if let Some(row) = hold {
-        fabric.seed_hold(crate::fabric::parse_hold(row), timeline);
-    }
+    fabric.seed_holds(
+        crate::fabric::parse_holds(holds.iter().map(String::as_str)),
+        timeline,
+    );
     // THE MAILBOX (round seven, findings 6/8/28): the posts a sender was told
     // are queued, the receipts still owed, and the id counters the sid's
     // bridge pins are keyed by — each id this session hands out from here is
@@ -1418,13 +1474,19 @@ pub(crate) fn spawn_session(
         .as_ref()
         .map(|adopted| adopted.topics.clone())
         .unwrap_or_default();
-    let adopt_hold: Option<String> = adopt.as_ref().and_then(|adopted| adopted.hold.clone());
+    let adopt_holds: Vec<String> = adopt
+        .as_ref()
+        .map(|adopted| adopted.holds.clone())
+        .unwrap_or_default();
     // …and the carried mailbox and the timeline's last id (round seven).
     let adopt_fabric: crate::fabric::FabricCarry = adopt
         .as_ref()
         .map(|adopted| adopted.fabric.clone())
         .unwrap_or_default();
     let adopt_timeline_id: u64 = adopt.as_ref().map_or(0, |adopted| adopted.timeline_id);
+    // …and the session log's epoch and node-id counters.
+    let adopt_log_carry: Option<crate::session_log::LogCarry> =
+        adopt.as_ref().and_then(|adopted| adopted.log_carry);
     // …and the build that handed it across, for the handoff gap.
     let adopt_from_build: Option<u64> = adopt.as_ref().and_then(|adopted| adopted.outgoing_build);
     // …and the title the park captured (or the record names), for a
@@ -1734,6 +1796,7 @@ pub(crate) fn spawn_session(
         generation_look: Default::default(),
         reset_lane: Default::default(),
         update_parked: Default::default(),
+        fenced_writes: Default::default(),
     });
     // ROOT session only: record the edges the OUTER aterm preminted for us (from
     // our injected env), so it holds the read/write/signal authority it granted.
@@ -1750,6 +1813,8 @@ pub(crate) fn spawn_session(
             &ctx.temporal,
             adopt_from_build,
             adopt_timeline_id,
+            adopt_log_carry,
+            recovered,
         );
     }
     // Restore the carried fabric (broadcast opt-ins and standing halt) before
@@ -1758,7 +1823,7 @@ pub(crate) fn spawn_session(
         &ctx.fabric,
         &ctx.timeline,
         &adopt_topics,
-        adopt_hold.as_deref(),
+        &adopt_holds,
         &adopt_fabric,
     );
     // Restore the carried supervisor lease (so its next renewal lands here) and
@@ -1872,6 +1937,7 @@ pub(crate) fn spawn_session(
     ));
 
     configure_bell(&term, proxy, id, window);
+    configure_palette_refusal(&term);
     // XTWINOPS host transport (Linux): the engine gates on `allow_window_ops`
     // in-core; without this callback an authorized `CSI 9;1t` was a no-op.
     #[cfg(target_os = "linux")]
@@ -1966,8 +2032,10 @@ pub(crate) fn spawn_session(
     // dies pre-ready consumed no PTY bytes and the parked parent resumes with
     // all of them (output waits in the kernel queue).
     // `App::maybe_signal_handoff_ready` attaches these readers. Fresh sessions
-    // and shells the PTY keeper kept (`recovered`) attach here.
-    if !(adopted && factory.defer_adopted_readers && !recovered) {
+    // and shells the PTY keeper kept (`recovered`) attach here, except a tab
+    // spawned off the event loop, whose reader starts parked until the tab is
+    // installed (`SessionFactory::reader_after_install`).
+    if !(adopted && factory.defer_adopted_readers && !recovered) && !factory.reader_after_install {
         attach_reader(&mut session, window, proxy, factory).map_err(std::io::Error::other)?;
     }
 
@@ -2410,7 +2478,7 @@ mod adoption_wiring_tests {
             let timeline = StdMutex::new(crate::session_timeline::SessionTimeline::default());
             let cast = StdMutex::new(crate::cast::CastRecorder::new(80, 24));
             let temporal = StdMutex::new(crate::temporal::TemporalRecorder::new());
-            super::mark_handoff_gap(&timeline, &cast, &temporal, from_build, 0);
+            super::mark_handoff_gap(&timeline, &cast, &temporal, from_build, 0, None, false);
             // …and a row recorded after it (the fabric seed, the registration).
             timeline
                 .lock()
@@ -2492,14 +2560,15 @@ mod adoption_wiring_tests {
             "ctx.fabric",
             "ctx.timeline",
             "adopt_topics",
-            "adopt_hold",
+            "adopt_holds",
             "adopt_fabric",
         ] {
             assert!(args.contains(arg), "the call hands over `{arg}`: {args}");
         }
         for inline in [
             "set_topics(",
-            "seed_hold(",
+            "seed_holds(",
+            "parse_holds(",
             "parse_hold(",
             "register_session(",
         ] {
@@ -3092,9 +3161,9 @@ impl DeferredReaderGate {
         self.inner.parked.load(Ordering::Acquire)
     }
 
-    /// Point-of-no-failure release used only after parent Commit. All OS threads,
-    /// channels, buffers, and wake descriptors were provisioned before ProofReady.
-    #[cfg(any(unix, test))]
+    /// Point-of-no-failure release, after the parent's Commit or once a tab
+    /// spawned off the loop is registered (`tab_spawn`). All OS threads, channels,
+    /// buffers, and wake descriptors were provisioned before it.
     pub(crate) fn release(&self) {
         self.inner.open.store(true, Ordering::Release);
         self.inner.ready.notify_all();
@@ -3133,6 +3202,35 @@ impl DeferredReaderGate {
             };
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod shell_integration_warn_tests {
+    use super::{ShellIntegrationOutcome, first_sighting};
+
+    /// A shell with no integration is warned about once per name, not once per
+    /// tab: the second `/bin/sh` tab is not new, a different shell is, and so is
+    /// a different write failure.
+    #[test]
+    fn a_failed_outcome_is_new_once_per_process() {
+        let seen = std::sync::Mutex::new(Vec::new());
+        let sh = ShellIntegrationOutcome::UnknownShell("/bin/sh".to_string());
+        assert!(first_sighting(&seen, &sh), "the first /bin/sh tab");
+        for _ in 0..20 {
+            assert!(!first_sighting(&seen, &sh), "every later /bin/sh tab");
+        }
+        assert!(first_sighting(
+            &seen,
+            &ShellIntegrationOutcome::UnknownShell("nu".to_string())
+        ));
+        let full = ShellIntegrationOutcome::WriteFailed("disk full".to_string());
+        assert!(first_sighting(&seen, &full));
+        assert!(!first_sighting(&seen, &full));
+        assert!(first_sighting(
+            &seen,
+            &ShellIntegrationOutcome::WriteFailed("read-only".to_string())
+        ));
     }
 }
 
@@ -3942,6 +4040,58 @@ mod shell_exit_tests {
         assert!(reader_ended, "the job let go, and the reader read on");
         assert_eq!(exits_after, 0, "the job's letting go is not a second exit");
     }
+
+    /// The gather's wait for its shell's retirement (before it posts the exit)
+    /// reaps nothing: a shell still running at the bound is left running, and
+    /// one that exited is left collectable — its status is the session's one
+    /// reap to take, which the UI thread then takes without waiting.
+    #[test]
+    fn waiting_for_the_shells_retirement_reaps_nothing() {
+        let mut shell = aterm_uds::spawnfd::command("/bin/sh")
+            .args(["-c", "read _; exit 3"])
+            .stdin(aterm_uds::spawnfd::Stdio::piped())
+            .stdout(aterm_uds::spawnfd::Stdio::null())
+            .stderr(aterm_uds::spawnfd::Stdio::null())
+            .spawn()
+            .expect("spawn the shell");
+        let pid = shell.id();
+        let exit = super::ShellExit {
+            watch: aterm_uds::exitwatch::exit_fd(pid).expect("the shell is watched"),
+            pid,
+        };
+        exit.await_retired(std::time::Duration::from_millis(1));
+        assert!(
+            shell.try_wait().expect("a look at the shell").is_none(),
+            "a shell still running is left running"
+        );
+        drop(shell.stdin.take());
+        // A hang detector: the shell's exit is the event.
+        exit.await_retired(aterm_spec::wait::MUST_HAPPEN);
+        // SAFETY: a zeroed `siginfo_t` out-param for a non-reaping peek.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: `WNOWAIT` leaves the child waitable; `WNOHANG` never blocks.
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+            )
+        };
+        assert_eq!(rc, 0, "waitid on our own child");
+        // SAFETY: `waitid` filled the siginfo (or left it zeroed).
+        let collectable = unsafe { info.si_pid() };
+        assert_eq!(
+            u32::try_from(collectable).ok(),
+            Some(pid),
+            "collectable the moment the wait ends"
+        );
+        assert_eq!(
+            shell.wait().expect("its owner reaps it").code(),
+            Some(3),
+            "and the status was left for its owner"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -4045,7 +4195,7 @@ pub(crate) fn new_live_terminal(
     appearance: aterm_types::Appearance,
     cell_px: Option<(u16, u16)>,
 ) -> Terminal {
-    // Attach a tiered scrollback store (hot / warm-LZ4 / cold-zstd, bounded by
+    // Attach a tiered scrollback store (hot / warm-LZ4 / cold-LZ4, bounded by
     // the memory budget) so `scrollback_lines` and the memory budget take
     // effect: without a store `apply_config`'s limit/budget setters no-op and
     // history is capped at the grid ring. The GUI uses only the in-memory
@@ -4065,10 +4215,10 @@ pub(crate) fn new_live_terminal(
     } else {
         t.set_scrollback_line_limit(Some(aterm_core::scrollback::DEFAULT_LINE_LIMIT));
     }
-    // Set the live OS color scheme at construction so a tab spawned after
-    // attach reports it (DEC 2031 / DSR `CSI ?996n`). A new session has no
-    // DEC 2031 subscriber yet, so no report is queued; the live-flip push is
-    // owned by `apply_os_color_scheme`.
+    // Set the reported scheme (the palette's appearance, `factory.appearance`)
+    // at construction so a tab spawned later reports it (DEC 2031 / DSR
+    // `CSI ?996n`). A new session has no DEC 2031 subscriber yet, so no report
+    // is queued; the live push is owned by `App::install_colors`.
     t.set_color_scheme(appearance);
     // CELL-PX-1: the real font metrics of the window this session is born into, so
     // the very FIRST DEC 1016 report and the very FIRST OSC 1337 image on a
@@ -4520,6 +4670,26 @@ fn configure_notifications(
             n.title,
             n.body.unwrap_or_default(),
         ));
+    });
+}
+
+/// Raised by any session's engine at its FIRST refused palette set (OSC 4,
+/// numeric OSC 21, under `allow_palette_reconfigure = false`); taken by the
+/// event loop's `about_to_wait` ([`take_palette_refused`]), which files the one
+/// digest line (`App::note_palette_refused`). The set arrives in a PTY chunk,
+/// whose own output wake runs that turn, so no wake of its own is needed.
+static PALETTE_REFUSED: AtomicBool = AtomicBool::new(false);
+
+/// Whether a session refused a palette set since the last call.
+pub(crate) fn take_palette_refused() -> bool {
+    PALETTE_REFUSED.load(Ordering::Relaxed) && PALETTE_REFUSED.swap(false, Ordering::AcqRel)
+}
+
+/// Tell the event loop about this session's first refused palette set. Runs
+/// on the reader thread under the Terminal lock, so it only raises a flag.
+fn configure_palette_refusal(term: &Arc<Mutex<Terminal>>) {
+    term_lock(term).set_palette_refused_callback(|| {
+        PALETTE_REFUSED.store(true, Ordering::Release);
     });
 }
 
@@ -5287,7 +5457,7 @@ const COMPRESS_TRICKLE_INTERVAL: std::time::Duration = std::time::Duration::from
 /// Per-session off-thread tier-compression worker. Parks on `recv()`; on each
 /// signal it promotes the engine's deferred lazy backlog into the compressed
 /// tiers in [`COMPRESS_BUDGET`]-line batches, releasing the term lock and
-/// yielding between batches, so LZ4/zstd work stays off the reader's drain path.
+/// yielding between batches, so LZ4 work stays off the reader's drain path.
 ///
 /// Returns `None` if the thread could not be spawned; the caller then leaves
 /// the offload inactive and the reader drains inline at the 1000-line
@@ -5372,14 +5542,84 @@ const EXIT_DRAIN_MAX: usize = 1024 * 1024;
 /// at the master's EOF alone. The watch is taken on the pid first and the
 /// identity checked after, so a reissued pid is never watched as the shell.
 #[cfg(unix)]
-fn shell_exit_watch(session: &Session) -> Option<std::os::fd::OwnedFd> {
+fn shell_exit_watch(session: &Session) -> Option<ShellExit> {
     let identity = session.shell_identity;
     if session.child_reaped.load(Ordering::Acquire) {
         return None;
     }
     let pid = u32::try_from(identity.pid).ok().filter(|pid| *pid > 1)?;
     let watch = aterm_uds::exitwatch::exit_fd(pid)?;
-    identity.verify().then_some(watch)
+    identity.verify().then_some(ShellExit { watch, pid })
+}
+
+/// The most the gather waits, once its shell's PTY has closed or its exit
+/// fired, for the kernel to retire the shell before the exit is posted: a
+/// shell closes its terminal on its way out, and the kernel posts the exit a
+/// moment before the process can be collected, so the exit path's one
+/// non-blocking look (`App::exit_status`) finds the status — the failed-start
+/// line names the real one. Paid by the gather, never the UI thread, and only
+/// while the shell is still there.
+#[cfg(unix)]
+pub(crate) const SHELL_RETIRE_WAIT: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// A session's shell's exit watch ([`shell_exit_watch`]) and the pid it
+/// watches.
+#[cfg(unix)]
+pub(crate) struct ShellExit {
+    watch: std::os::fd::OwnedFd,
+    pid: u32,
+}
+
+#[cfg(unix)]
+impl ShellExit {
+    fn as_raw_fd(&self) -> i32 {
+        std::os::fd::AsRawFd::as_raw_fd(&self.watch)
+    }
+
+    /// Wait at most `within` for the shell to be retired: the watch fires,
+    /// then a look that reaps nothing (`WNOWAIT`) finds it collectable. The
+    /// session's exit path keeps the one reap, and with it the latch that
+    /// stops a teardown signalling a reissued pid. A shell that is not this
+    /// process's child (adopted across an update) answers no such look, and
+    /// its status is its exit witness's: the wait ends at the watch.
+    fn await_retired(&self, within: std::time::Duration) {
+        let deadline = Instant::now() + within;
+        let mut fired = libc::pollfd {
+            fd: self.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ms = libc::c_int::try_from(within.as_millis()).unwrap_or(libc::c_int::MAX);
+        // SAFETY: one live pollfd for the length of the call.
+        if unsafe { libc::poll(&mut fired, 1, ms) } != 1 {
+            return;
+        }
+        let Ok(pid) = libc::pid_t::try_from(self.pid) else {
+            return;
+        };
+        loop {
+            // SAFETY: a zeroed `siginfo_t` out-param for a non-reaping peek.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            // SAFETY: `WNOWAIT` leaves the child waitable; `WNOHANG` never blocks.
+            let rc = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    self.pid,
+                    &mut info,
+                    libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+                )
+            };
+            // SAFETY: `waitid` filled a `CLD_*` siginfo or, with nothing
+            // waitable under `WNOHANG`, left it zeroed; `si_pid` is defined in
+            // both.
+            let collectable = rc == 0 && unsafe { info.si_pid() } == pid;
+            // `rc != 0`: not this process's child to collect.
+            if rc != 0 || collectable || Instant::now() >= deadline {
+                return;
+            }
+            std::thread::yield_now();
+        }
+    }
 }
 
 /// Batch messages from the gather stage to the parse stage (unix pipeline).
@@ -5429,7 +5669,7 @@ fn spawn_pty_gather(
     wake_rd: i32,
     // The shell's exit watch: once it fires, the gather passes on what the
     // master holds (at most [`EXIT_DRAIN_MAX`]) and ends the session as at EOF.
-    shell_exit: Option<std::os::fd::OwnedFd>,
+    shell_exit: Option<ShellExit>,
     id: u64,
     lat_epoch: Instant,
     latest_output_activity_ns: Arc<AtomicU64>,
@@ -5500,9 +5740,7 @@ fn spawn_pty_gather(
             // while `false` only costs syscalls.
             sink.note_master_nonblocking(nonblock);
             let mut buf = first_buf;
-            let mut exit_rd = shell_exit
-                .as_ref()
-                .map_or(-1, std::os::fd::AsRawFd::as_raw_fd);
+            let mut exit_rd = shell_exit.as_ref().map_or(-1, ShellExit::as_raw_fd);
             // Once the shell has exited, the output the master may still pass on
             // before the exit is reported (`ReadOutcome::Exited`).
             let mut after_exit: Option<usize> = None;
@@ -5530,6 +5768,9 @@ fn spawn_pty_gather(
                                 after_exit = None;
                                 exit_rd = -1;
                                 exit_reported = true;
+                                if let Some(exit) = &shell_exit {
+                                    exit.await_retired(SHELL_RETIRE_WAIT);
+                                }
                                 if filled_tx.send(GatherMsg::Exited).is_err() {
                                     break; // parse stage gone
                                 }
@@ -5565,6 +5806,11 @@ fn spawn_pty_gather(
                         }
                     }
                     aterm_pty::ReadOutcome::Eof => {
+                        // The shell closing its terminal on its way out: the
+                        // exit it is about to make goes with this one.
+                        if !exit_reported && let Some(exit) = &shell_exit {
+                            exit.await_retired(SHELL_RETIRE_WAIT);
+                        }
                         let _ = filled_tx.send(if exit_reported {
                             GatherMsg::Wake
                         } else {
@@ -5731,7 +5977,7 @@ struct PtyReaderWiring {
     /// The shell's exit watch ([`shell_exit_watch`]), moved into the gather and
     /// closed with it. `None`: the session ends at the master's EOF alone.
     #[cfg(unix)]
-    shell_exit: Option<std::os::fd::OwnedFd>,
+    shell_exit: Option<ShellExit>,
     /// Overlap child preparation gate. `Some` means every reader/helper resource
     /// exists, but this thread must consume zero PTY bytes until parent Commit.
     start_gate: Option<DeferredReaderGate>,
@@ -6016,8 +6262,14 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                             Some(at) if at > off => at,
                             _ => bytes.len(),
                         };
-                        let end =
-                            off + ingest_chunk_width(crate::metrics::input_pending, limit - off);
+                        let end = off
+                            + ingest_chunk_width(
+                                || {
+                                    crate::metrics::input_pending()
+                                        || ui_waiting.load(Ordering::Relaxed) != 0
+                                },
+                                limit - off,
+                            );
                         // The pasteboard and Kitty medium reads this slice asks
                         // for, done here, before its hold: the engine's callbacks
                         // only take them, so a read that blocks holds this reader,
@@ -6142,11 +6394,10 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                         off = end;
                         // Lock handoff: on macOS's unfair mutex a parked UI thread
                         // needs 10-30 µs to wake while this loop re-takes the lock in
-                        // ~100 ns. Spin, bounded, only while a UI acquisition is
-                        // registered and another slice follows.
-                        if off < bytes.len() {
-                            crate::yield_to_ui_waiter(&ui_waiting);
-                        }
+                        // ~100 ns. Spin, bounded, while a UI acquisition is registered
+                        // so neither intra-batch slices nor back-to-back batches from
+                        // `filled_rx` starve the UI thread.
+                        crate::yield_to_ui_waiter(&ui_waiting);
                     }
                     acc
                 };
@@ -6793,33 +7044,35 @@ impl crate::App {
             // every roster reads handles, and the next handoff record projects it.
             identity: session.identity.as_deref().map(Arc::from),
         };
-        let mut registry = store.write().unwrap_or_else(|p| p.into_inner());
-        registry.register(handle);
-        // An adopted shell with a frozen PATH is recorded where the
-        // managed-current row counts it and the next handoff carries it.
-        if session.frozen_path {
-            registry.mark_frozen_path(session.id);
-        }
-        // So is a shell with the re-key channel: the next handoff carries the
-        // fact, so its successor can re-key it (`shell_rekey`).
-        if session.rekey_channel {
-            registry.mark_rekey_channel(session.id);
-        }
-        // So is a shell with an integration loader, for its successor to point
-        // at its own body, and one adopted from before loaders, which `status
-        // integration_rev=` names `frozen` (`shell_body`).
-        if session.body_loader {
-            registry.mark_body_loader(session.id);
-        }
-        if session.integration_frozen {
-            registry.mark_integration_frozen(session.id);
-        }
-        // And the history its update handoffs could not carry: `status` says it
-        // (`history_lost=`) and the next handoff carries it on.
-        if let Some(history) = session.handoff_history.as_ref() {
-            registry.add_history_lost(session.id, history.lost);
-        }
-        drop(registry);
+        crate::fabric::register_on_log(&session.ctx, || {
+            let mut registry = store.write().unwrap_or_else(|p| p.into_inner());
+            registry.register(handle);
+            // An adopted shell with a frozen PATH is recorded where the
+            // managed-current row counts it and the next handoff carries it.
+            if session.frozen_path {
+                registry.mark_frozen_path(session.id);
+            }
+            // So is a shell with the re-key channel: the next handoff carries the
+            // fact, so its successor can re-key it (`shell_rekey`).
+            if session.rekey_channel {
+                registry.mark_rekey_channel(session.id);
+            }
+            // So is a shell with an integration loader, for its successor to point
+            // at its own body, and one adopted from before loaders, which `status
+            // integration_rev=` names `frozen` (`shell_body`).
+            if session.body_loader {
+                registry.mark_body_loader(session.id);
+            }
+            if session.integration_frozen {
+                registry.mark_integration_frozen(session.id);
+            }
+            // And the history its update handoffs could not carry: `status` says it
+            // (`history_lost=`) and the next handoff carries it on.
+            if let Some(history) = session.handoff_history.as_ref() {
+                registry.add_history_lost(session.id, history.lost);
+            }
+            drop(registry);
+        });
         // Sibling discovery: publish this session's graph entry (sid → our
         // instance socket) so an `@<sid>` arriving at ANOTHER same-uid instance
         // can be forwarded here. No-op until/unless the control socket is bound.
@@ -6841,6 +7094,53 @@ pub(crate) fn bundle_dir(exe: Option<&std::path::Path>) -> Option<String> {
     dir.to_str().map(str::to_owned)
 }
 
+/// The two environment variables that make a no-terminal `sudo` reach aterm's
+/// askpass helper (`docs/DESIGN-sudo-askpass-2026-10-15.md` §3.1). Pure over
+/// its inputs so it is unit-tested with no bundle and no sandbox:
+///
+/// - `bundle`: [`bundle_dir`] of the running executable — `Some` only inside a
+///   real `.app`, so a dev `targo run` sets nothing.
+/// - `contained`: the session runs under containment. Then nothing is set: the
+///   Seatbelt profile refuses setuid `sudo` and the window brokers nothing for
+///   a sandboxed shell (`ATERM_DESIGN` §5.6).
+/// - `inherited_askpass` / `inherited_display`: the launch environment's values.
+///
+/// Rules. `SUDO_ASKPASS` is set to this bundle's `aterm-askpass` when unset, or
+/// when the inherited value is itself an `aterm-askpass` (an enclosing aterm's,
+/// replaced with this instance's); a user's own helper is kept (not emitted, so
+/// `build_child_env` leaves the inherited value in place). `DISPLAY` is set to
+/// empty only when unset — `sudo`'s no-tty fallback tests presence, not value,
+/// and a real (XQuartz) `DISPLAY` is kept. Empty off macOS / no bundle /
+/// contained.
+pub(crate) fn askpass_env(
+    bundle: Option<&str>,
+    contained: bool,
+    inherited_askpass: Option<&str>,
+    inherited_display: Option<&str>,
+) -> Vec<(String, String)> {
+    if !cfg!(target_os = "macos") || contained {
+        return Vec::new();
+    }
+    let Some(bundle) = bundle else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let set_askpass = match inherited_askpass {
+        None => true,
+        Some(v) => v.ends_with("/aterm-askpass"),
+    };
+    if set_askpass {
+        out.push((
+            "SUDO_ASKPASS".to_string(),
+            format!("{bundle}/aterm-askpass"),
+        ));
+    }
+    if inherited_display.is_none() {
+        out.push(("DISPLAY".to_string(), String::new()));
+    }
+    out
+}
+
 /// The one `("PATH", value)` pair the baseline `env_add` carries, composed
 /// because `aterm_pty::build_child_env` applies `env_add` by key overwrite
 /// (`docs/DESIGN-toolchain-reroute-2026-09-07.md` §"Reaching PATH"). Front to back:
@@ -6850,7 +7150,7 @@ pub(crate) fn bundle_dir(exe: Option<&std::path::Path>) -> Option<String> {
 ///    removed first, so nesting and a user PATH that already names it still put
 ///    it first. Order matters, not just presence.
 /// 2. `agents_dir`: `<prefix>/agents/`, holding only the shims of the agent
-///    programs aterm manages (`claude`, `codex`; `atpkg::stub::AGENT_PROGRAMS`),
+///    programs aterm manages (`atpkg::stub::AGENT_PROGRAMS`),
 ///    with the same move-to-front rule, so it outranks `~/.local/bin` and
 ///    Homebrew copies: for these names aterm's copy is what runs (owner,
 ///    2026-09-10; `docs/DESIGN-which-copy-runs-2026-08-27.md`). Passed only
@@ -6858,6 +7158,11 @@ pub(crate) fn bundle_dir(exe: Option<&std::path::Path>) -> Option<String> {
 /// 3. `bundle_dir`: the co-located CLI tools, if given and not already present.
 /// 4. `inherited`: the launch PATH, verbatim (an empty entry means "here" to a
 ///    POSIX shell and is kept).
+/// 5. `bin_dir`: `<prefix>/bin/` ([`atpkg::session_bin_dir`]), APPENDED once and only
+///    when absent — the shell hook's own placement and guard (`atpkg::hooks`), so a
+///    managed tool never shadows a system one and a hook sourced later adds no second
+///    copy. A process that never sources the hook (an agent, a script, a shell
+///    without the integration) still runs a tool the moment its shim lands.
 ///
 /// `None` when there is nothing to inject.
 pub(crate) fn reroute_path_env(
@@ -6865,6 +7170,7 @@ pub(crate) fn reroute_path_env(
     agents_dir: Option<&str>,
     bundle_dir: Option<&str>,
     inherited: Option<&str>,
+    bin_dir: Option<&str>,
 ) -> Option<(String, String)> {
     let sep = if cfg!(windows) { ';' } else { ':' };
     let mut entries: Vec<&str> = inherited
@@ -6872,6 +7178,12 @@ pub(crate) fn reroute_path_env(
         .map(|p| p.split(sep).collect())
         .unwrap_or_default();
     let mut injected = false;
+    if let Some(bin) = bin_dir
+        && !entries.contains(&bin)
+    {
+        entries.push(bin);
+        injected = true;
+    }
     if let Some(bundle) = bundle_dir
         && !entries.contains(&bundle)
     {
@@ -6924,9 +7236,11 @@ pub(crate) fn managed_agents_dir(layout: &atpkg::store::Layout) -> Option<String
     }
 }
 
-/// [`atpkg_child_path`], resolved ONCE per process for readers — the Settings page's
-/// read-time SHADOWED rows, refreshed after every pass — so a page refresh never runs the
-/// login shell again. The passes resolve their own, per lane.
+/// [`atpkg_child_path`], resolved ONCE per process — for the package lane's update
+/// children (the lane starts it on a thread of its own at launch, so its launch seed never
+/// waits on it) and the Settings page's read-time SHADOWED rows, refreshed after every
+/// pass — so neither a pass nor a page refresh runs the login shell again. A person's
+/// Settings verb still asks afresh.
 pub(crate) fn atpkg_child_path_once() -> &'static str {
     static PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     PATH.get_or_init(atpkg_child_path)
@@ -7059,10 +7373,36 @@ fn login_shell_path_with(
         }
     });
     let deadline = std::time::Instant::now() + budget;
+    // THE ANSWER AT THE SHELL'S EXIT, not at the next tick of a 25 ms nap (measured:
+    // an empty-rc login zsh answers in under 10 ms and was read at 25-30): the kernel's
+    // exit witness, which reaps nothing, so the shell's pid still names its group for
+    // the kill below. Without one (the shell already gone, or no watch on this
+    // platform), and once it fires for a shell that has not exited or `poll` itself
+    // fails (never a spin on an error), the nap.
+    #[cfg(unix)]
+    let mut exit_watch = aterm_uds::exitwatch::exit_fd(child.id());
     let answered = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status.success(),
             Ok(None) if std::time::Instant::now() < deadline => {
+                #[cfg(unix)]
+                if let Some(watch) = exit_watch.as_ref() {
+                    use std::os::fd::AsRawFd as _;
+                    let left = deadline.saturating_duration_since(std::time::Instant::now());
+                    let fired = crate::control_listener::poll_readable(
+                        watch.as_raw_fd(),
+                        left.max(std::time::Duration::from_millis(1)),
+                    );
+                    let spent = match fired {
+                        Ok(true) => matches!(child.try_wait(), Ok(None)),
+                        Ok(false) => false,
+                        Err(_) => true,
+                    };
+                    if spent {
+                        exit_watch = None;
+                    }
+                    continue;
+                }
                 std::thread::sleep(std::time::Duration::from_millis(25));
             }
             _ => {
@@ -7177,9 +7517,14 @@ mod reroute_path_env_tests {
             "/usr/bin",
             AGENTS,
         ]);
-        let (_, value) =
-            reroute_path_env(Some(REROUTE), Some(AGENTS), Some(BUNDLE), Some(&inherited))
-                .expect("injects");
+        let (_, value) = reroute_path_env(
+            Some(REROUTE),
+            Some(AGENTS),
+            Some(BUNDLE),
+            Some(&inherited),
+            None,
+        )
+        .expect("injects");
         assert_eq!(
             value,
             path(&[
@@ -7199,10 +7544,13 @@ mod reroute_path_env_tests {
         );
         // Without a reroute dir the agents dir alone is still an injection…
         let (_, value) =
-            reroute_path_env(None, Some(AGENTS), None, Some("/usr/bin")).expect("injects");
+            reroute_path_env(None, Some(AGENTS), None, Some("/usr/bin"), None).expect("injects");
         assert_eq!(value, path(&[AGENTS, "/usr/bin"]));
         // …and with neither, nothing changes.
-        assert_eq!(reroute_path_env(None, None, None, Some("/usr/bin")), None);
+        assert_eq!(
+            reroute_path_env(None, None, None, Some("/usr/bin"), None),
+            None
+        );
     }
 
     /// The spawn seam creates the agents dir rather than waiting for it: a fresh
@@ -7258,6 +7606,7 @@ mod reroute_path_env_tests {
                 Some(&dir),
                 None,
                 Some("/Users//u/.local/bin:/opt/homebrew/bin"),
+                None,
             )
             .expect("injects");
             assert!(value.starts_with(&format!("{dir}:")), "{value}");
@@ -7565,6 +7914,7 @@ mod reroute_path_env_tests {
             None,
             Some(BUNDLE),
             Some(&path(&["/usr/bin", "/bin"])),
+            None,
         );
         assert_eq!(
             got,
@@ -7588,7 +7938,7 @@ mod reroute_path_env_tests {
             REROUTE,
         ]);
         let (_, value) =
-            reroute_path_env(Some(REROUTE), None, None, Some(&inherited)).expect("injects");
+            reroute_path_env(Some(REROUTE), None, None, Some(&inherited), None).expect("injects");
         assert_eq!(
             value,
             path(&[
@@ -7600,7 +7950,7 @@ mod reroute_path_env_tests {
         );
         assert_eq!(value.matches(REROUTE).count(), 1);
         let (_, again) =
-            reroute_path_env(Some(REROUTE), None, None, Some(&value)).expect("injects");
+            reroute_path_env(Some(REROUTE), None, None, Some(&value), None).expect("injects");
         assert_eq!(again, value, "idempotent under nesting");
     }
 
@@ -7610,15 +7960,15 @@ mod reroute_path_env_tests {
     #[test]
     fn bundle_dir_composes_once() {
         let already = path(&[BUNDLE, "/usr/bin"]);
-        let (_, value) =
-            reroute_path_env(Some(REROUTE), None, Some(BUNDLE), Some(&already)).expect("injects");
+        let (_, value) = reroute_path_env(Some(REROUTE), None, Some(BUNDLE), Some(&already), None)
+            .expect("injects");
         assert_eq!(value, path(&[REROUTE, BUNDLE, "/usr/bin"]));
         assert_eq!(
-            reroute_path_env(None, None, Some(BUNDLE), Some("/usr/bin")),
+            reroute_path_env(None, None, Some(BUNDLE), Some("/usr/bin"), None),
             Some(("PATH".to_string(), path(&[BUNDLE, "/usr/bin"])))
         );
         assert_eq!(
-            reroute_path_env(None, None, Some(BUNDLE), Some(&already)),
+            reroute_path_env(None, None, Some(BUNDLE), Some(&already), None),
             None
         );
     }
@@ -7629,23 +7979,89 @@ mod reroute_path_env_tests {
     #[test]
     fn empty_or_absent_inherited_path_and_nothing_to_inject() {
         assert_eq!(
-            reroute_path_env(Some(REROUTE), None, Some(BUNDLE), None).map(|p| p.1),
+            reroute_path_env(Some(REROUTE), None, Some(BUNDLE), None, None).map(|p| p.1),
             Some(path(&[REROUTE, BUNDLE]))
         );
         assert_eq!(
-            reroute_path_env(Some(REROUTE), None, None, Some("")).map(|p| p.1),
+            reroute_path_env(Some(REROUTE), None, None, Some(""), None).map(|p| p.1),
             Some(REROUTE.to_string())
         );
-        assert_eq!(reroute_path_env(None, None, None, Some("/usr/bin")), None);
-        assert_eq!(reroute_path_env(None, None, None, None), None);
+        assert_eq!(
+            reroute_path_env(None, None, None, Some("/usr/bin"), None),
+            None
+        );
+        assert_eq!(reroute_path_env(None, None, None, None, None), None);
         let (_, value) = reroute_path_env(
             Some(REROUTE),
             None,
             None,
             Some(&path(&["/usr/bin", "", "/bin"])),
+            None,
         )
         .expect("injects");
         assert_eq!(value, path(&[REROUTE, "/usr/bin", "", "/bin"]));
+    }
+
+    /// `bin/` goes LAST, once: appended behind every inherited entry (a system copy of
+    /// a name wins), never stacked on a PATH that already holds it — the hook sourced
+    /// later skips it by the same test — while reroute and agents stay in front. It is
+    /// an injection on its own, and `None` leaves every other arm as it was.
+    #[test]
+    fn the_bin_dir_is_appended_once_behind_the_inherited_path() {
+        const BIN: &str = "/Users//u/Library/Application Support/aterm/pkg/bin";
+        let inherited = path(&["/opt/homebrew/bin", "/usr/bin"]);
+        let (_, value) = reroute_path_env(
+            Some(REROUTE),
+            Some(AGENTS),
+            Some(BUNDLE),
+            Some(&inherited),
+            Some(BIN),
+        )
+        .expect("injects");
+        assert_eq!(
+            value,
+            path(&[
+                REROUTE,
+                AGENTS,
+                BUNDLE,
+                "/opt/homebrew/bin",
+                "/usr/bin",
+                BIN
+            ])
+        );
+        let (_, again) = reroute_path_env(
+            Some(REROUTE),
+            Some(AGENTS),
+            Some(BUNDLE),
+            Some(&value),
+            Some(BIN),
+        )
+        .expect("injects");
+        assert_eq!(
+            again, value,
+            "a PATH that holds it keeps it once, where it was"
+        );
+        let user_first = path(&[BIN, "/usr/bin"]);
+        assert_eq!(
+            reroute_path_env(None, None, None, Some(&user_first), Some(BIN)),
+            None,
+            "already there, wherever the user put it: nothing to inject"
+        );
+        assert_eq!(
+            reroute_path_env(None, None, None, Some("/usr/bin"), Some(BIN)).map(|p| p.1),
+            Some(path(&["/usr/bin", BIN]))
+        );
+        assert_eq!(
+            reroute_path_env(None, None, None, None, Some(BIN)).map(|p| p.1),
+            Some(BIN.to_string()),
+            "no inherited PATH: no dangling separator"
+        );
+        assert_eq!(
+            reroute_path_env(Some(REROUTE), Some(AGENTS), None, Some(&inherited), None)
+                .map(|p| p.1),
+            Some(path(&[REROUTE, AGENTS, "/opt/homebrew/bin", "/usr/bin"])),
+            "None hands no bin/"
+        );
     }
 
     /// Inside a .app bundle the executable's own directory is the bundle dir; inert
@@ -9434,5 +9850,64 @@ mod adoption_render_debt_tests {
             down <= up,
             "and it is still the back-to-back rows-1 -> rows pair"
         );
+    }
+}
+
+#[cfg(test)]
+mod askpass_env_tests {
+    use super::askpass_env;
+
+    const BUNDLE: &str = "/Applications/aterm.app/Contents/MacOS";
+
+    /// Inside a bundle, an uncontained session with no inherited values gets
+    /// both: the bundle's `aterm-askpass` and an empty `DISPLAY`.
+    #[test]
+    fn sets_both_when_unset_in_a_bundle() {
+        if !cfg!(target_os = "macos") {
+            return;
+        }
+        let env = askpass_env(Some(BUNDLE), false, None, None);
+        assert!(env.iter().any(|(k, v)| k == "SUDO_ASKPASS"
+            && v == "/Applications/aterm.app/Contents/MacOS/aterm-askpass"));
+        assert!(env.iter().any(|(k, v)| k == "DISPLAY" && v.is_empty()));
+    }
+
+    /// A user's own `SUDO_ASKPASS` is kept (not emitted), and a real `DISPLAY`
+    /// is kept — so neither overwrites the inherited value.
+    #[test]
+    fn keeps_the_users_own_values() {
+        if !cfg!(target_os = "macos") {
+            return;
+        }
+        let env = askpass_env(Some(BUNDLE), false, Some("/opt/my/askpass"), Some(":0"));
+        assert!(env.iter().all(|(k, _)| k != "SUDO_ASKPASS"), "{env:?}");
+        assert!(env.iter().all(|(k, _)| k != "DISPLAY"), "{env:?}");
+    }
+
+    /// An enclosing aterm's `SUDO_ASKPASS` IS replaced with this instance's.
+    #[test]
+    fn replaces_an_enclosing_aterms_helper() {
+        if !cfg!(target_os = "macos") {
+            return;
+        }
+        let env = askpass_env(
+            Some(BUNDLE),
+            false,
+            Some("/old/aterm.app/Contents/MacOS/aterm-askpass"),
+            Some(":0"),
+        );
+        assert_eq!(
+            env.iter()
+                .find(|(k, _)| k == "SUDO_ASKPASS")
+                .map(|(_, v)| v.as_str()),
+            Some("/Applications/aterm.app/Contents/MacOS/aterm-askpass")
+        );
+    }
+
+    /// No bundle (a dev `targo run`) and a contained session each set nothing.
+    #[test]
+    fn nothing_without_a_bundle_or_when_contained() {
+        assert!(askpass_env(None, false, None, None).is_empty());
+        assert!(askpass_env(Some(BUNDLE), true, None, None).is_empty());
     }
 }

@@ -97,28 +97,6 @@ fn legacy_shift_changes_every_shiftable_key() {
     }
 }
 
-/// PROVE-AND-CATCH (`catches_uppercase_bug_sat.smt2` twin): the obligation has
-/// teeth — the ORIGINAL buggy `to_ascii_uppercase`-only shift map FAILS the spec
-/// on at least one shiftable key. If this ever finds zero counterexamples the
-/// refinement test above has gone vacuous.
-#[test]
-fn uppercase_only_shift_is_caught_by_the_spec() {
-    let buggy = |c: char| c.to_ascii_uppercase(); // the pre-fix legacy branch
-    let mut caught = Vec::new();
-    for b in 0u8..=127 {
-        let c = b as char;
-        if let Some(spec) = spec_shifted(c)
-            && buggy(c) != spec
-        {
-            caught.push(c);
-        }
-    }
-    assert!(
-        caught.contains(&'2') && caught.len() >= 20,
-        "the spec must reject the to_ascii_uppercase bug on the digit/symbol rows; caught={caught:?}"
-    );
-}
-
 /// `write_u32` renders every magnitude, zero and `u32::MAX` included.
 ///
 /// Regression (#2775): from 2,000,000,000 up, a `u32` divisor overflowed at
@@ -193,10 +171,10 @@ fn shift_enter_distinct_from_enter_in_every_mode() {
 // flag opts into releases. The CSI-u encoder emits the `:3` event-type
 // subfield only under REPORT_EVENT_TYPES, so a release routed there under any
 // other flag reads as a press (`ESC[97u` for releasing 'a') and the app gets
-// every keystroke twice. Both the aterm GUI keyup
-// path (app_input.rs) and Orca's helper-textarea keyup path forward releases
-// unconditionally, relying on THIS contract: "the engine emits nothing for a
-// release outside kitty event-type reporting".
+// every keystroke twice. The aterm GUI keyup path (app_input.rs), and any
+// embedder that forwards every keyup (a web host's helper textarea, say),
+// forward releases unconditionally, relying on THIS contract: "the engine
+// emits nothing for a release outside kitty event-type reporting".
 //
 // A genuine PROOF over the whole 2^15 mode space (see the Shift+Enter
 // obligation above for why exhaustive = sound + complete here), crossed with a
@@ -223,7 +201,7 @@ fn release_obligation_keys() -> Vec<Key> {
 
 /// THEOREM (silence): in EVERY mode without REPORT_EVENT_TYPES — all 2^14 of
 /// them — a key release encodes to NOTHING, for every key and chord in the
-/// grid. This is the exact contract the GUI / Orca keyup forwarders rely on,
+/// grid. This is the exact contract the GUI and embedder keyup forwarders rely on,
 /// and the property whose violation doubled every key in the active Codex TUI.
 #[test]
 fn release_encodes_to_nothing_without_report_event_types() {

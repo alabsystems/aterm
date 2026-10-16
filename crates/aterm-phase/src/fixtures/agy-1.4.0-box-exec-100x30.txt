@@ -1,0 +1,27 @@
+# agy 1.4.0 · MEASURED 2026-10-16, `aterm ctl text --json` of a private headless aterm 100x30 (aterm 0.105.0 098c216c7), the atpkg-managed agy (Google latest) launched through its shim under the owner's signed-in account (Gemini 4 Argon, medium), scratch ATERM_STATE_HOME/XDG dirs, harness off · the shell-command approval at 100 columns (`ls -la`) · cursor=25,0 (hidden) · account and scratch path redacted at equal length
+
+      ▄▀▀▄        Antigravity CLI 1.4.0
+     ▀▀▀▀▀▀       redacted-user@example.test (Google AI Ultra)
+    ▀▀▀▀▀▀▀▀      Gemini 4 Argon (Medium)
+   ▄▀▀    ▀▀▄     /tmp/at.XXXXXX/work
+  ▄▀▀      ▀▀▄
+
+────────────────────────────────────────────────────────────
+> Use your shell tool to run exactly: ls -la
+
+● Ran (ls -la) (ctrl+o to expand)
+
+Command
+────────────────────────────────────────────────────────────────────────────────────────────────────
+
+Requesting permission for:
+   ls -la
+
+Run this command?
+> 1. Yes, run command
+  2. Yes, and always allow in this conversation for commands that start with 'ls'
+  3. Yes, and always allow for commands that start with 'ls' (Persist to settings.json)
+  4. No, cancel
+
+  ↑/↓ Navigate · tab Amend · ctrl+g edit/expand command
+esc to cancel                                                                Gemini 4 Argon · medium

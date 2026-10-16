@@ -3,7 +3,7 @@
 
 //! A split window renders decorations, ink, peeking cats, novas and the
 //! cursor companion in every visible pane; these pin that and the per-pane
-//! geometry behind it (owner, 2026-07-28).
+//! geometry behind it.
 
 use super::{PanePlace, seed_resident_pet_mid_flight_for_test};
 use crate::{App, WindowId, term_lock};
@@ -127,8 +127,8 @@ fn split_compose_emits_cats_in_every_visible_pane() {
     );
 }
 
-/// The merged ink stream satisfies `ink_row_slice`'s contract: non-empty and
-/// strictly increasing by `(row, col)`, which a pane-major concatenation of
+/// The merged ink stream is non-empty and strictly increasing by `(row, col)`,
+/// as `aterm_render::sparse_row_slice` requires; a pane-major concatenation of
 /// a vertical split is not.
 #[test]
 fn split_compose_ink_is_non_empty_and_sorted() {
@@ -151,12 +151,11 @@ fn split_compose_ink_is_non_empty_and_sorted() {
     );
 }
 
-// Not tested: that `deco_fp` alone repaints an animation-only frame. The
-// term is needed (an animating cat damages no cell), but with the clock
-// advancing other `now`-derived key terms present every frame, so such a
-// test would pass vacuously.
+// Not tested: that `deco_fp` alone repaints an animation-only frame (an
+// animating cat damages no cell). Other `now`-derived key terms present
+// every frame, so such a test would pass vacuously.
 
-/// T4 — without the cadence a correct emitter renders one frame and freezes.
+/// Without the cadence a correct emitter renders one frame and freezes.
 #[test]
 fn split_layout_arms_the_effect_frame_cadence() {
     let t0 = Instant::now();
@@ -300,7 +299,7 @@ fn split_present_hidden_pet_fade_does_not_claim_program_relocated_word() {
 /// The pet's drawn body, `(x0, x1, y0, y1)` frame px.
 type BodyPx = (i32, i32, i32, i32);
 
-/// The resident mid-flight, its caret painted, then ONE present with or
+/// The resident mid-flight, its caret painted, then one present with or
 /// without a DECTCEM hide, then the caret shown again: the drawn body
 /// `[before, at the hide, back]` and the cell size.
 fn split_midflight_pet_through_a_hide(hide: bool) -> ([BodyPx; 3], (i32, i32)) {
@@ -393,12 +392,9 @@ fn split_midflight_pet_through_a_hide(hide: bool) -> ([BodyPx; 3], (i32, i32)) {
 
 /// A DECTCEM hide inside the repaint hold (`HIDDEN_HOLD_MAX`) is no event
 /// for a pet in the air: the brain reads the hidden caret as the caret it
-/// last saw painted, so the flight goes on to land where it was going,
-/// drawn exactly as its painted twin draws it, and the caret's quick
-/// return walks on from there. RULE CHANGED 2026-09-29: this used to pin
-/// the body STILL on the hidden frame (feet within 1 px), which the old
-/// hold got by re-seating the pet from its drawn rect, freezing it in
-/// mid-air with the flight's lift baked into its feet.
+/// last saw painted, so the flight lands where it was going, drawn exactly
+/// as its painted twin draws it, and the caret's quick return walks on from
+/// there.
 #[test]
 fn split_present_holds_a_hidden_midflight_pet_and_quick_return_walks() {
     let ([before, painted, _], _) = split_midflight_pet_through_a_hide(false);
@@ -415,19 +411,13 @@ fn split_present_holds_a_hidden_midflight_pet_and_quick_return_walks() {
     );
 }
 
-/// A SPLIT-PANE FOCUS SWITCH CROSSFADES ACROSS PANES — the composed
-/// host's half of `PetSurfaceSeam`'s `Shift` (the owner's half is
-/// aterm-effects' `pet_coordinate_seams.rs`). The resident settles in the
-/// right pane; the focus moves left through the production verb, and the
-/// layout fence runs as the redraw entry runs it. On the very next frame
-/// the arriver is drawn in the LEFT pane while the old body is drawn as a
-/// ghost in the RIGHT pane, at the window pixels it was drawn at and
-/// beneath that pane's text: the host offered the right pane as glass
-/// and the ghost reached the window's channel, not the focused pane's
-/// staging, which would have cropped it away at the divider. A quarter
-/// second later the crossfade is spent: nothing of the pet is left in
-/// the right pane. Before this fix that frame drew nothing in the right
-/// pane, and the arriver alone faded in from nothing.
+/// A split-pane focus switch crossfades across panes: the composed host's
+/// half of `PetSurfaceSeam`'s `Shift` (the owner's half is aterm-effects'
+/// `pet_coordinate_seams.rs`). On the frame after the switch the arriver is
+/// drawn in the left pane and the old body as a ghost in the right pane, at
+/// its drawn window pixels and under that pane's text: the ghost reaches the
+/// window's channel, not the focused pane's staging, which would crop it at
+/// the divider. Once the crossfade is spent nothing of the pet is left there.
 #[test]
 fn split_focus_switch_fades_the_old_body_in_its_own_pane() {
     let t0 = Instant::now();
@@ -501,8 +491,7 @@ fn split_focus_switch_fades_the_old_body_in_its_own_pane() {
     assert_eq!(ws.fx.companion().alpha(), 255, "the arriver is full");
 }
 
-/// T6 — under per-pane state a split must not wipe the untouched pane's
-/// episodes (the old blanket `reset()` did exactly that).
+/// Under per-pane state a split keeps the untouched pane's episodes.
 #[test]
 fn splitting_does_not_reset_the_untouched_panes_episodes() {
     let t0 = Instant::now();
@@ -515,7 +504,7 @@ fn splitting_does_not_reset_the_untouched_panes_episodes() {
             .is_some_and(|ws| ws.fx.decos().is_active(t0)),
         "the composed frame established live episodes ({diag})"
     );
-    // A pane-space mutation now only EVICTS departed panes.
+    // A pane-space mutation evicts only departed panes.
     app.reset_pane_space_decorations(wid);
     assert!(
         app.windows
@@ -615,7 +604,7 @@ fn a_scaled_companion_is_cropped_at_a_divider_not_deleted() {
         1,
         "the companion SURVIVES the divider — dropping it is the bug"
     );
-    // Half the dest is cropped away, so half the SOURCE must be too — 10 of
+    // Half the dest is cropped away, so half the source must be too: 10 of
     // the 20 atlas texels, not the 20 dest pixels a 1:1 crop would take.
     assert_eq!((free[0].x, free[0].w), (380, 20), "dest cropped at 400");
     assert_eq!(
@@ -646,7 +635,7 @@ fn a_scaled_companion_is_cropped_at_a_divider_not_deleted() {
 }
 
 /// The ink/nova translators shift into window coords and clip at interior
-/// dividers — the cell-addressed and u16-pixel twins of T15.
+/// dividers.
 #[test]
 fn translate_ink_and_nova_shift_and_clip_at_the_divider() {
     let mut ink = vec![

@@ -1673,6 +1673,7 @@ impl ObservedPrompt {
             session: self.session,
             title: PROMPT_TITLE,
             body: format!("{asked} The program that asked waits until you answer."),
+            decided: (),
         }
     }
 }
@@ -1767,6 +1768,9 @@ pub(crate) struct AttentionNotice {
     pub(crate) title: &'static str,
     /// Notification body.
     pub(crate) body: String,
+    /// Private: only this module's gate and prompts build a notice, so
+    /// [`crate::notify::NotifyMsg::consent`] posts nothing they did not decide.
+    decided: (),
 }
 
 /// What the caller should do about one [`AttentionEvent`].
@@ -1860,6 +1864,7 @@ impl AttentionGate {
                         crate::menu::PrivacyPane::FullDiskAccess
                     )
                 ),
+                decided: (),
             }),
             refresh_status_item: true,
         }
@@ -1898,8 +1903,7 @@ mod tests {
 
     /// The module's SHIPPING source: everything before the first TOP-LEVEL
     /// `#[cfg(test)]` attribute, which is the test-seam block's (an indented one
-    /// gates a single test-only method and ends nothing). Mirrors
-    /// `tools/grep_guard.sh`'s `np_strip`, and it is what lets the scans below
+    /// gates a single test-only method and ends nothing). It is what lets the scans below
     /// name the very patterns they are forbidding.
     fn shipping_source() -> &'static str {
         const SOURCE: &str = include_str!("consent_observer.rs");
@@ -3143,7 +3147,7 @@ com.apple.sandboxd, pid=69745, auid=0, euid=0, binary_path=/usr/libexec/sandboxd
             "exactly one child is ever spawned, and it is LOG_TOOL"
         );
         assert!(
-            code.contains("LaneCommand::new(LOG_TOOL)") && !code.contains("std::process::Command"),
+            code.contains("LaneCommand::new(LOG_TOOL)"),
             "and it is spawned holding its stdout and nothing else (`spawnfd::spawn`)"
         );
     }

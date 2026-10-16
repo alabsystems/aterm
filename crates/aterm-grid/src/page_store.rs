@@ -27,17 +27,10 @@ pub(crate) struct PoolStats {
     pub reused: usize,
 }
 
-/// Page-backed allocator with memory pooling.
-///
-/// ## Pooling
-///
-/// Released pages go to a free list that new allocations check first. The
-/// pool grows unbounded; `shrink_to_fit()` releases unused pages.
-///
-/// ## Lazy zeroing
-///
-/// `page_used_bytes` tracks how much of each 64KB page was used, and only that
-/// portion is zeroed when the page is recycled.
+/// Page-backed allocator with memory pooling. Released pages go to a free list
+/// that new allocations check first; the pool grows unbounded until
+/// `shrink_to_fit()`. `page_used_bytes` records how much of each page was used,
+/// so a recycled page zeroes only that portion.
 #[derive(Debug, Default)]
 pub struct PageStore {
     /// Cell slices returned by removed rows, before `pages` for drop order.
@@ -75,7 +68,7 @@ impl PageStore {
         Self::default()
     }
 
-    /// Create a page store with the free list pre-filled with `pages` pages.
+    /// Create a page store with the free list pre-filled with `page_count` pages.
     #[must_use]
     pub(crate) fn with_capacity(page_count: usize) -> Self {
         let mut store = Self::new();
@@ -126,13 +119,6 @@ impl PageStore {
         self.free_pages.len()
     }
 
-    /// Number of completed pages with tracked used-byte metadata.
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) fn tracked_page_count(&self) -> usize {
-        self.page_used_bytes.len()
-    }
-
     /// Total memory used by all pages (active + free), in bytes. Saturating, as
     /// in `Grid::memory_used`: exact whenever it fits, `usize::MAX` otherwise.
     #[must_use]
@@ -155,11 +141,8 @@ impl PageStore {
         self.free_pages.shrink_to_fit();
     }
 
-    /// Reset the page store, moving all active pages to the free list.
-    ///
-    /// # Safety
-    ///
-    /// Caller must ensure no `PageSlice` references are used after reset.
+    /// Reset the page store, moving all active pages to the free list. No `PageSlice` from
+    /// before the reset may be used after it.
     #[cfg(test)]
     pub fn reset(&mut self) {
         // These handles point into the pages reset is about to recycle.
@@ -189,7 +172,6 @@ impl PageStore {
     /// allocate a new one.
     fn alloc_page(&mut self) -> Box<Page> {
         if let Some((page, used_bytes)) = self.free_pages.pop() {
-            // Zero only the used portion.
             if used_bytes > 0 {
                 // SAFETY: The page came from the free list, so we have exclusive
                 // access and no PageSlice references its data.
@@ -242,15 +224,15 @@ impl PageStore {
     }
 
     /// Allocate a typed slice within the page store. Exposed under
-    /// `feature = "testing"` for downstream property tests.
-    #[cfg(any(test, feature = "testing"))]
+    /// `debug_assertions` for downstream property tests.
+    #[cfg(any(test, debug_assertions))]
     #[allow(clippy::expect_used)]
     pub fn alloc_slice<T>(&mut self, len: u16) -> PageSlice<T> {
         self.alloc_slice_impl(len)
     }
 
     /// Allocate a typed slice within the page store (crate-internal in production).
-    #[cfg(not(any(test, feature = "testing")))]
+    #[cfg(not(any(test, debug_assertions)))]
     #[allow(clippy::expect_used)]
     pub(crate) fn alloc_slice<T>(&mut self, len: u16) -> PageSlice<T> {
         self.alloc_slice_impl(len)
@@ -272,7 +254,6 @@ impl PageStore {
             if !self.pages.is_empty() {
                 self.page_used_bytes.push(self.next_offset);
             }
-            // Need a new page - try free list first
             let page = self.alloc_page();
             self.pages.push(page);
             self.current_page = self.pages.len() - 1;
@@ -284,8 +265,8 @@ impl PageStore {
         // Use data_ptr() which goes through UnsafeCell, avoiding borrow invalidation
         // under Stacked/Tree Borrows when other pages are accessed later.
         let base_ptr = self.pages[page_id].data_ptr();
-        // SAFETY: offset is aligned to T and offset + size_of::<T>() * len <= PAGE_SIZE,
-        // verified by the loop above. base_ptr is valid for the lifetime of the Page.
+        // SAFETY: offset is aligned to T and offset + size_of::<T>() * len <= PAGE_SIZE
+        // (the size assert and the new-page check above); base_ptr is valid for the Page's life.
         let ptr = unsafe { base_ptr.add(offset).cast::<T>() };
         let ptr = NonNull::new(ptr).expect("page slice pointer is null");
 

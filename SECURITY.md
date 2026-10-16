@@ -7,23 +7,21 @@
 
 Security maintenance is best-effort and applies to the release marked Latest on
 this repository's [Releases](https://github.com/alabsystems/aterm/releases)
-page: the newest macOS application, and the source snapshot at its version. A
+page: the newest application build and the source snapshot at its version. A
 newer `vX.Y.0` prerelease with no application is source only. Earlier releases
 are superseded rather than maintained.
 
-Installed copies update themselves from that channel, so a running macOS
-install converges on the supported version on its own. An install that has
-turned automatic checks off (`[update] enabled = false`) or deferred applying
-(`[update] auto_apply = false`) is supported only once it is brought current —
-Check for Updates and Update Now in Settings ▸ Software Update, or `aterm update
+Installed copies update themselves from that channel. An install with automatic
+checks off (`[update] enabled = false`) or installs deferred
+(`[update] auto_apply = false`) is supported once it is brought current: Check
+for Updates and Update Now in Settings ▸ Software Update, or `aterm update
 check` then `aterm ctl update apply`; both work with either switch off.
 
-If a machine has stopped receiving updates, `aterm ctl update status` reports
-the reason and Settings ▸ Software Update shows it in the app; re-running the
-one-line installer from [README ▸ Install](README.md#install) restores a
-machine whose updater cannot recover on its own. A binary you build yourself is
-not updated by anything — the updater only ever replaces an installed
-`aterm.app` — and tracks whatever commit you built.
+If a machine has stopped receiving updates, `aterm update status` and Settings ▸
+Software Update say why; re-running the one-line installer from
+[README ▸ Install](README.md#install) restores a machine whose updater cannot
+recover on its own. A binary you build yourself is never updated and tracks
+whatever commit you built.
 
 ## Reporting a vulnerability
 
@@ -42,10 +40,10 @@ If the report needs confidentiality beyond plain email, say so in the first
 message so another channel can be arranged. There is no response-time
 guarantee.
 
-A fix ships as the next `MAJOR.MINOR.0` release on the public channel and
-reaches installed copies through the ordinary update path; because the patch
-slot is always `0`, there are no security-only patch releases. There is no
-separate advisory feed, and no embargo process beyond one agreed by mail.
+A fix ships as the next `MAJOR.MINOR.0` release and reaches installed copies
+through the ordinary update path; there are no security-only patch releases
+([VERSIONING.md](VERSIONING.md)). There is no separate advisory feed, and no
+embargo process beyond one agreed by mail.
 
 ## In scope
 

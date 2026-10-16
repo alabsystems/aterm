@@ -101,16 +101,15 @@ fn every_posix_script_is_a_loader_around_one_body() {
 fn the_script_set_carries_each_body_beside_its_loader() {
     let dir = aterm_tempfile::tempdir().unwrap();
     ensure_scripts(dir.path()).unwrap();
-    for (ext, script) in [
-        ("zsh", scripts::ZSH),
-        ("bash", scripts::BASH),
-        ("fish", scripts::FISH),
-    ] {
+    for ext in ["zsh", "bash", "fish"] {
+        let loader =
+            std::fs::read_to_string(dir.path().join(format!("aterm_shell_integration.{ext}")))
+                .unwrap();
         let written =
             std::fs::read_to_string(dir.path().join(format!("{BODY_FILE_STEM}.{ext}"))).unwrap();
         assert_eq!(
             written,
-            format!("{BODY_FILE_HEADER}{}", scripts::body(script).unwrap()),
+            format!("{BODY_FILE_HEADER}{}", scripts::body(&loader).unwrap()),
             "{ext}"
         );
     }
@@ -123,6 +122,146 @@ fn the_script_set_carries_each_body_beside_its_loader() {
     assert!(
         !script_set_matches(dir.path()),
         "a changed body is a different set"
+    );
+}
+
+/// What a real `shell` reads `script` as: its canonical text, the script read as
+/// the body of one function (`functions` in zsh, `declare -f` in bash), which
+/// keeps every word and every string and drops every comment.
+#[cfg(unix)]
+fn canonical_text(shell: &str, script: &str) -> String {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let path = dir.path().join("script");
+    std::fs::write(&path, script).unwrap();
+    let zsh = std::path::Path::new(shell)
+        .file_name()
+        .is_some_and(|name| name == "zsh");
+    let (flags, print): (&[&str], &str) = if zsh {
+        (&["-f", "-c"], "print -r -- \"${functions[__aterm_canon]}\"")
+    } else {
+        (&["--norc", "--noprofile", "-c"], "declare -f __aterm_canon")
+    };
+    let driver = format!("src=$(<\"$1\")\neval \"__aterm_canon() {{\n$src\n}}\"\n{print}\n");
+    let output = shell_command(shell)
+        .args(flags)
+        .arg(&driver)
+        .arg(shell)
+        .arg(&path)
+        .output()
+        .unwrap_or_else(|error| panic!("spawn {shell} to read a script: {error}"));
+    assert!(
+        output.status.success() && output.stderr.is_empty(),
+        "{shell} could not read the script: {:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).expect("canonical text is UTF-8")
+}
+
+/// A script folder holds the zsh and bash loaders, and so their bodies, without
+/// their comment lines (`strip_comment_lines`): the shell reads every line it
+/// sources, and two thirds of these are comment. That is safe only while no
+/// comment line sits where the shell reads it as text, and the shells say so
+/// themselves: each reads its script with and without the comment lines to the
+/// same canonical text. The control is a `#` line inside a string that spans
+/// lines, which the same reading tells apart — so a script that ever puts one
+/// there fails here, before a folder ships it.
+#[cfg(unix)]
+#[test]
+fn installed_scripts_run_the_code_of_their_source() {
+    let mut shells = vec![("bash", bash_shell(), scripts::BASH, installed_bash())];
+    if let Some(zsh) = zsh_shell() {
+        shells.push(("zsh", zsh, scripts::ZSH, installed_zsh()));
+    }
+    for (label, shell, source, installed) in shells {
+        let comment = |line: &&str| line.trim_start().starts_with('#');
+        assert!(
+            installed
+                .lines()
+                .skip(1)
+                .filter(comment)
+                .all(|line| line.starts_with(scripts::BODY_BEGIN)
+                    || line.starts_with(scripts::BODY_END)),
+            "{label}: the folder's loader keeps only its BODY markers of its comment lines"
+        );
+        assert_eq!(
+            canonical_text(shell, installed),
+            canonical_text(shell, source),
+            "{label}: the folder's loader runs the source's code"
+        );
+        assert_eq!(
+            scripts::body(installed).map(|body| canonical_text(shell, body)),
+            scripts::body(source).map(|body| canonical_text(shell, body)),
+            "{label}: the folder's body runs the source's body's code"
+        );
+        let control = "x='first\n# a line of the string\nlast'\n";
+        assert_ne!(
+            canonical_text(shell, &strip_comment_lines(control)),
+            canonical_text(shell, control),
+            "{label}: a `#` line inside a string is text, and the reading sees it go"
+        );
+    }
+}
+
+/// A folder's zsh loader and body, compiled (`compile_zsh_scripts`), are what a
+/// zsh then sources: the wordcode beside each script, in place of its text. The
+/// control is the same folder before the compile, where the text runs. The text
+/// of the body is replaced by a probe, older than the wordcode, so which of the
+/// two ran shows; the loader's wordcode is checked to be there. A second
+/// compile keeps what the first made.
+#[cfg(unix)]
+#[test]
+fn a_compiled_zsh_set_is_sourced_from_its_wordcode() {
+    let Some(zsh) = zsh_shell() else {
+        eprintln!("zsh not installed; skipping the compiled zsh set");
+        return;
+    };
+    let dir = aterm_tempfile::tempdir().unwrap();
+    ensure_scripts(dir.path()).unwrap();
+    let body = dir.path().join(format!("{BODY_FILE_STEM}.zsh"));
+    let probe = |path: &std::path::Path| {
+        let out = shell_command(zsh)
+            .args([
+                "-f",
+                "-c",
+                "source \"$1\"; print -r -- \"[defined=${+functions[__aterm_body_precmd]}]\"",
+            ])
+            .arg("zsh")
+            .arg(path)
+            .output()
+            .unwrap_or_else(|error| panic!("spawn zsh to source the body: {error}"));
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let old_text = |path: &std::path::Path| {
+        std::fs::write(path, "print -r -- '[text]'\n").unwrap();
+        let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+    };
+    // Control: nothing compiled, so the text is what runs.
+    let control = aterm_tempfile::tempdir().unwrap();
+    ensure_scripts(control.path()).unwrap();
+    let control_body = control.path().join(format!("{BODY_FILE_STEM}.zsh"));
+    old_text(&control_body);
+    assert_eq!(probe(&control_body), "[text]\n[defined=0]\n");
+
+    compile_zsh_scripts(dir.path(), std::path::Path::new(zsh)).unwrap();
+    let loader_zwc = dir.path().join("aterm_shell_integration.zsh.zwc");
+    let made = std::fs::metadata(&loader_zwc).unwrap().modified().unwrap();
+    old_text(&body);
+    assert_eq!(
+        probe(&body),
+        "[defined=1]\n",
+        "the compiled body runs, not its text"
+    );
+    compile_zsh_scripts(dir.path(), std::path::Path::new(zsh)).unwrap();
+    assert_eq!(
+        std::fs::metadata(&loader_zwc).unwrap().modified().unwrap(),
+        made,
+        "a set already compiled is kept"
     );
 }
 

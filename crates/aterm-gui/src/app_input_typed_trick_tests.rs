@@ -66,11 +66,28 @@ fn pending(app: &App, wid: WindowId) -> Option<Trick> {
     app.windows[&wid].fx.companion().brain().pending_trick()
 }
 
-fn flash(app: &App, wid: WindowId) -> TrickFlashPhase {
-    app.windows[&wid]
-        .fx
-        .decos()
-        .trick_flash_phase(Instant::now())
+/// Where the trick flash stands, read at `t0`: an instant the test took
+/// before its first key. Every stamp a key or a present leaves is at or after
+/// `t0`, and the phase reads an earlier clock as no time elapsed, so this is
+/// the slot's state — none, unfound, found, revoked — with no clock in it.
+/// Read at `Instant::now()` instead, a stall between a key and the read (a
+/// loaded test process) ages a pending flash past its 750 ms give-up bound
+/// and a found one past its 1.1 s window, and the read says `Idle`.
+fn flash(app: &App, wid: WindowId, t0: Instant) -> TrickFlashPhase {
+    app.windows[&wid].fx.decos().trick_flash_phase(t0)
+}
+
+/// Whether the pet grieves a failed command (12 ms long), judged at `typed`:
+/// an instant the test took before the line's keys. The forgiveness window
+/// (`TRICK_SUBMIT_FORGIVEN`, 2 s from the line's Enter) reads an earlier
+/// clock as no time elapsed, so a stalled test process cannot age the line
+/// out of it the way a read at `Instant::now()` could.
+fn grieves_at(app: &mut App, wid: WindowId, typed: Instant) -> bool {
+    crate::app_render::pet_fails_a_command_for_test(
+        app.windows.get_mut(&wid).expect("window"),
+        typed,
+        Some(12),
+    )
 }
 
 /// The line-abort set is exactly ⌃C ⌃Z ⌃\ ⌃J ⌃M with Ctrl and no Alt or
@@ -143,6 +160,7 @@ fn classify_press_marks_the_ctrl_abort_chords_as_line_abort_and_nothing_else() {
 /// Space's echo could be scanned.
 #[test]
 fn typing_sit_and_a_space_latches_the_pet_and_notes_the_flash() {
+    let t0 = Instant::now();
     let (mut app, wid, session) = pet_app();
     type_word(&mut app, wid, "sit");
     assert_eq!(
@@ -150,11 +168,11 @@ fn typing_sit_and_a_space_latches_the_pet_and_notes_the_flash() {
         None,
         "an open token commands nothing yet"
     );
-    assert_eq!(flash(&app, wid), TrickFlashPhase::Idle);
+    assert_eq!(flash(&app, wid, t0), TrickFlashPhase::Idle);
     type_word(&mut app, wid, " ");
     assert_eq!(pending(&app, wid), Some(Trick::Sit), "the boundary fires");
     assert_eq!(
-        flash(&app, wid),
+        flash(&app, wid, t0),
         TrickFlashPhase::Pending,
         "the flash is noted on the input path, waiting for the echo"
     );
@@ -173,6 +191,7 @@ fn typing_sit_and_a_space_latches_the_pet_and_notes_the_flash() {
 /// then `t` and Space typed, is still `sit␣`).
 #[test]
 fn an_ime_commit_is_typed_text_and_its_end_is_not_a_boundary() {
+    let t0 = Instant::now();
     let (mut app, wid, _) = pet_app();
     app.input(wid, InputEvent::Text("sit ".into()), Source::Human);
     assert_eq!(
@@ -180,7 +199,7 @@ fn an_ime_commit_is_typed_text_and_its_end_is_not_a_boundary() {
         Some(Trick::Sit),
         "the space inside the commit fires"
     );
-    assert_eq!(flash(&app, wid), TrickFlashPhase::Pending);
+    assert_eq!(flash(&app, wid, t0), TrickFlashPhase::Pending);
 
     let (mut app, wid, _) = pet_app();
     app.input(wid, InputEvent::Text("si".into()), Source::Human);
@@ -191,6 +210,46 @@ fn an_ime_commit_is_typed_text_and_its_end_is_not_a_boundary() {
         Some(Trick::Sit),
         "the run continued across the commit's end"
     );
+}
+
+/// A name glued to its command, as an IME commits an unspaced script, is a
+/// guess: `猫咪坐下␣` latches and flashes nothing, and prose after it drops it
+/// unheard. A name after it, or Enter on a line that stayed pet talk, sends
+/// it final, the command first or last. A thing behind the name, or a verb
+/// that glued spells another word, is no call.
+#[test]
+fn a_name_glued_to_its_command_by_ime_commit_waits_for_a_name_or_enter() {
+    let t0 = Instant::now();
+    let (mut app, wid, session) = pet_app();
+    app.input(wid, InputEvent::Text("猫咪坐下 ".into()), Source::Human);
+    assert_eq!(pending(&app, wid), None, "a guess says nothing yet");
+    assert_eq!(flash(&app, wid, t0), TrickFlashPhase::Idle);
+    app.input(wid, InputEvent::Text("猫咪 ".into()), Source::Human);
+    assert_eq!(pending(&app, wid), Some(Trick::Sit));
+    assert_eq!(flash(&app, wid, t0), TrickFlashPhase::Pending);
+    assert_eq!(
+        app.windows[&wid].trick_fire,
+        TrickLineFire::Admitted {
+            session,
+            addressed: true
+        },
+        "a name vouches for it"
+    );
+
+    let (mut app, wid, _) = pet_app();
+    app.input(wid, InputEvent::Text("坐下猫咪".into()), Source::Human);
+    app.input(wid, named(NamedKey::Enter), Source::Human);
+    let ws = app.windows.get_mut(&wid).expect("window");
+    ws.fx.companion_mut().revoke_trick();
+    assert_eq!(pending(&app, wid), Some(Trick::Sit), "sent: final");
+
+    for prose in ["猫咪坐下 很可爱", "猫咪玩具", "喂猫咪"] {
+        let (mut app, wid, _) = pet_app();
+        app.input(wid, InputEvent::Text(prose.into()), Source::Human);
+        app.input(wid, named(NamedKey::Enter), Source::Human);
+        assert_eq!(pending(&app, wid), None, "{prose:?}");
+        assert_eq!(flash(&app, wid, t0), TrickFlashPhase::Idle, "{prose:?}");
+    }
 }
 
 /// ⇧⏎ is an Enter to the listener (`enter_like` is any Enter press): the
@@ -224,6 +283,7 @@ fn shift_enter_submits_the_line_like_enter() {
 /// line without judging it (the shell got `sitxyz`).
 #[test]
 fn program_output_a_paste_and_raw_controller_bytes_never_command_the_cat() {
+    let t0 = Instant::now();
     let (mut app, wid, session) = pet_app();
     term_lock(&app.pool.get(session).expect("session").term).process(b"sit sit sit\r\n");
     assert_eq!(pending(&app, wid), None, "screen content is not typing");
@@ -249,7 +309,7 @@ fn program_output_a_paste_and_raw_controller_bytes_never_command_the_cat() {
         None,
         "`send` bytes are not typed characters"
     );
-    assert_eq!(flash(&app, wid), TrickFlashPhase::Idle);
+    assert_eq!(flash(&app, wid, t0), TrickFlashPhase::Idle);
     assert!(
         app.windows[&wid].trick_listener.is_poisoned(),
         "…and the line now holds bytes the listener did not see"
@@ -299,6 +359,7 @@ fn a_controller_key_commands_exactly_like_a_human_key() {
 #[test]
 fn enter_on_sit_submits_a_pet_only_line_the_cat_forgives() {
     let (mut app, wid, _) = pet_app();
+    let t0 = Instant::now();
     type_word(&mut app, wid, "sit");
     app.input(wid, named(NamedKey::Enter), Source::Human);
     assert_eq!(
@@ -311,30 +372,22 @@ fn enter_on_sit_submits_a_pet_only_line_the_cat_forgives() {
         TrickLineFire::None,
         "the line is over; nothing of it is left to confirm or revoke"
     );
-    let now = Instant::now();
-    {
-        let grieving = crate::app_render::pet_fails_a_command_for_test(
-            app.windows.get_mut(&wid).expect("window"),
-            now,
-            Some(12),
-        );
-        assert!(
-            !grieving,
-            "`sit: command not found` is forgiven — the whole line was pet talk"
-        );
-    }
+    assert!(
+        !grieves_at(&mut app, wid, t0),
+        "`sit: command not found` is forgiven — the whole line was pet talk"
+    );
 
-    // Negative control: the same failure after an ordinary command grieves.
+    // Negative control: the same failure after an ordinary command grieves,
+    // judged at the same early instant.
     let (mut plain, wid, _) = pet_app();
+    let t0 = Instant::now();
     type_word(&mut plain, wid, "ls");
     plain.input(wid, named(NamedKey::Enter), Source::Human);
     assert_eq!(pending(&plain, wid), None);
-    let grieving = crate::app_render::pet_fails_a_command_for_test(
-        plain.windows.get_mut(&wid).expect("window"),
-        now,
-        Some(12),
+    assert!(
+        grieves_at(&mut plain, wid, t0),
+        "an ordinary failed line still sulks"
     );
-    assert!(grieving, "an ordinary failed line still sulks");
 }
 
 /// One row of the gate table: the gate's name and the config edit that
@@ -347,6 +400,7 @@ type GateCase = (&'static str, fn(&mut App));
 /// and no flash is noted.
 #[test]
 fn the_master_the_tricks_bit_serious_mode_and_ignore_words_are_each_inert() {
+    let t0 = Instant::now();
     let setups: [GateCase; 4] = [
         ("sparkle master off", |app| {
             app.config.sparkle_words = Some(crate::app_config::SparkleWordsConfig {
@@ -386,7 +440,11 @@ fn the_master_the_tricks_bit_serious_mode_and_ignore_words_are_each_inert() {
         app.recompute_sparkle();
         type_word(&mut app, wid, "sit ");
         assert_eq!(pending(&app, wid), None, "{label}: the pet hears nothing");
-        assert_eq!(flash(&app, wid), TrickFlashPhase::Idle, "{label}: no flash");
+        assert_eq!(
+            flash(&app, wid, t0),
+            TrickFlashPhase::Idle,
+            "{label}: no flash"
+        );
         assert!(
             app.windows[&wid].trick_listener.is_pure()
                 && app.windows[&wid].trick_listener.line_chars() == 4,
@@ -428,6 +486,7 @@ fn the_master_the_tricks_bit_serious_mode_and_ignore_words_are_each_inert() {
 /// says withheld, the pet stays deaf, and the memory is not upgraded.
 #[test]
 fn a_withheld_fire_is_not_confirmed_by_naming_the_pet() {
+    let t0 = Instant::now();
     let (mut app, wid, session) = pet_app();
     app.config.sparkle_words = Some(crate::app_config::SparkleWordsConfig {
         tricks: Some(crate::app_config::SparkleTricksConfig {
@@ -454,7 +513,7 @@ fn a_withheld_fire_is_not_confirmed_by_naming_the_pet() {
         TrickLineFire::Withheld { session },
         "the memory is not upgraded by the confirmation"
     );
-    assert_eq!(flash(&app, wid), TrickFlashPhase::Idle);
+    assert_eq!(flash(&app, wid, t0), TrickFlashPhase::Idle);
 }
 
 /// The gate is read at every event: a fire admitted with tricks on, then a
@@ -531,17 +590,53 @@ fn an_erased_line_forgets_its_withheld_fire() {
         TrickLineFire::None,
         "the memory went with the text"
     );
+    let t0 = Instant::now();
     type_word(&mut app, wid, "kitty");
     app.input(wid, named(NamedKey::Enter), Source::Human);
-    let grieving = crate::app_render::pet_fails_a_command_for_test(
-        app.windows.get_mut(&wid).expect("window"),
-        Instant::now(),
-        Some(12),
-    );
     assert!(
-        !grieving,
+        !grieves_at(&mut app, wid, t0),
         "`kitty: command not found` is forgiven — nothing withheld is left on the line"
     );
+}
+
+/// `ignore_words` reads a fire's word and its command. A name glued to its
+/// command fires the whole run, so listing `坐下` holds back `坐下`,
+/// `猫咪坐下` and `坐下猫咪` alike, and listing the run holds back the run.
+/// A listed name holds back nothing, and a listed command holds back no other
+/// command glued to the same name. Each line names the pet after the word.
+#[test]
+fn ignore_words_holds_back_a_glued_run_by_its_command_never_by_its_name() {
+    let t0 = Instant::now();
+    for (listed, typed, fires) in [
+        ("坐下", "坐下 猫咪 ", None),
+        ("坐下", "猫咪坐下 猫咪 ", None),
+        ("坐下", "坐下猫咪 猫咪 ", None),
+        ("猫咪坐下", "猫咪坐下 猫咪 ", None),
+        ("猫咪", "猫咪坐下 猫咪 ", Some(Trick::Sit)),
+        ("坐下", "猫咪跳 猫咪 ", Some(Trick::Jump)),
+    ] {
+        let (mut app, wid, session) = pet_app();
+        app.config.sparkle_words = Some(crate::app_config::SparkleWordsConfig {
+            tricks: Some(crate::app_config::SparkleTricksConfig {
+                ignore_words: Some(vec![listed.into()]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        app.prepared_sparkle = app.config.prepare_sparkle_runtime();
+        app.sparkle_dirty = true;
+        app.recompute_sparkle();
+        app.input(wid, InputEvent::Text(typed.into()), Source::Human);
+        assert_eq!(pending(&app, wid), fires, "{listed:?} vs {typed:?}");
+        if fires.is_none() {
+            assert_eq!(
+                app.windows[&wid].trick_fire,
+                TrickLineFire::Withheld { session },
+                "{typed:?}"
+            );
+            assert_eq!(flash(&app, wid, t0), TrickFlashPhase::Idle, "{typed:?}");
+        }
+    }
 }
 
 /// The memory of a fire is keyed to its session. `sit␣` withheld on tab A,
@@ -574,6 +669,7 @@ fn a_fire_remembered_on_one_tab_says_nothing_about_another_tabs_line() {
         session_b,
         "fixture: tab B is in front"
     );
+    let t0 = Instant::now();
     type_word(&mut app, wid, "kitty");
     assert_eq!(
         app.windows[&wid].trick_fire,
@@ -582,13 +678,8 @@ fn a_fire_remembered_on_one_tab_says_nothing_about_another_tabs_line() {
     );
     app.input(wid, named(NamedKey::Enter), Source::Human);
     {
-        let grieving = crate::app_render::pet_fails_a_command_for_test(
-            app.windows.get_mut(&wid).expect("window"),
-            Instant::now(),
-            Some(12),
-        );
         assert!(
-            !grieving,
+            !grieves_at(&mut app, wid, t0),
             "B's pet-only line is forgiven: nothing on it was withheld"
         );
     }
@@ -607,6 +698,7 @@ fn a_fire_remembered_on_one_tab_says_nothing_about_another_tabs_line() {
 /// on glass, a typed command flashes and nothing is latched.
 #[test]
 fn with_no_pet_on_glass_a_typed_command_only_flashes() {
+    let t0 = Instant::now();
     for style in ["rainbow kitty flying", "off"] {
         let (mut app, wid, _) = pet_app();
         app.config.cursor_trail_style = Some(style.into());
@@ -618,7 +710,7 @@ fn with_no_pet_on_glass_a_typed_command_only_flashes() {
             "{style}: the brain was never told"
         );
         assert_eq!(
-            flash(&app, wid),
+            flash(&app, wid, t0),
             TrickFlashPhase::Pending,
             "{style}: the word flashes"
         );
@@ -630,14 +722,15 @@ fn with_no_pet_on_glass_a_typed_command_only_flashes() {
 /// unfound flash are dropped.
 #[test]
 fn a_tentative_command_followed_by_prose_is_revoked_on_both_consumers() {
+    let t0 = Instant::now();
     let (mut app, wid, _) = pet_app();
     type_word(&mut app, wid, "sit ");
     assert_eq!(pending(&app, wid), Some(Trick::Sit));
-    assert_eq!(flash(&app, wid), TrickFlashPhase::Pending);
+    assert_eq!(flash(&app, wid, t0), TrickFlashPhase::Pending);
     type_word(&mut app, wid, "tight ");
     assert_eq!(pending(&app, wid), None, "`sit tight` is prose");
     assert_eq!(
-        flash(&app, wid),
+        flash(&app, wid, t0),
         TrickFlashPhase::Idle,
         "the pending flash is dropped"
     );
@@ -729,18 +822,29 @@ fn the_verb_after_a_greeting_is_the_request() {
 /// A present the motion policy demotes ends a pending kitty flash: its tick
 /// is unpaintable, and an unpaintable tick drops the slot
 /// (`TrickFlash::emit`). The same frames at Full motion find the word.
+///
+/// The present runs on a pinned frame clock (`App::redraw_window_at`): the
+/// flash gives up 750 ms after its key and ends 1.1 s after the frame that
+/// found it, and on the wall clock a stalled test thread (a loaded
+/// one-process suite) pushed the Full frame past one or the other, so it
+/// read `Idle`. The negative control is that clock: the same Full present,
+/// its frame seconds after the keys, finds a flash that already gave up. A
+/// present that ignored the pin would find the word there.
 #[test]
 fn a_demoted_present_ends_a_pending_kitty_flash() {
-    for (motion, fate) in [
-        ("full", TrickFlashPhase::Live),
-        ("reduced", TrickFlashPhase::Idle),
+    for (label, motion, late, fate) in [
+        ("full", "full", false, TrickFlashPhase::Live),
+        ("reduced", "reduced", false, TrickFlashPhase::Idle),
+        ("full, a late frame", "full", true, TrickFlashPhase::Idle),
     ] {
+        let t0 = Instant::now();
         let (mut app, wid, _) = pet_app();
         app.windows.get_mut(&wid).expect("window").present = Some(crate::PresentTarget::Cpu {
             surface: crate::present::CpuSurface::Scripted(Default::default()),
         });
         type_word(&mut app, wid, "sit ");
-        assert_eq!(flash(&app, wid), TrickFlashPhase::Pending);
+        let typed = Instant::now();
+        assert_eq!(flash(&app, wid, t0), TrickFlashPhase::Pending, "{label}");
         app.config.motion = Some(motion.into());
         let term = app
             .front_terminal(wid)
@@ -749,12 +853,21 @@ fn a_demoted_present_ends_a_pending_kitty_flash() {
             .clone();
         term_lock(&term).process(b"sit ");
         let epoch = term_lock(&term).damage_epoch();
-        app.redraw_window(wid);
+        // Every key stamp is at or after `t0`, so `t0 + 300 ms` is inside the
+        // give-up bound of each however long the keys took; the late frame is
+        // past it however quickly they ran (a key queued behind a paste is
+        // stamped at most 1.5 s ahead, `ORDERED_EGRESS_WITNESS_GRACE`).
+        let frame = if late {
+            typed + Duration::from_secs(10)
+        } else {
+            t0 + Duration::from_millis(300)
+        };
+        app.redraw_window_at(wid, frame);
         assert!(
             !app.windows[&wid].fx.decos().needs_rescan(epoch),
-            "{motion}: the present rescanned the damaged grid"
+            "{label}: the present rescanned the damaged grid"
         );
-        assert_eq!(flash(&app, wid), fate, "{motion}");
+        assert_eq!(flash(&app, wid, t0), fate, "{label}");
     }
 }
 
@@ -764,14 +877,15 @@ fn a_demoted_present_ends_a_pending_kitty_flash() {
 /// both.
 #[test]
 fn a_revoke_spares_the_flash_of_an_addressed_fire() {
+    let t0 = Instant::now();
     let (mut app, wid, _) = pet_app();
     type_word(&mut app, wid, "kitty sit ");
-    assert_eq!(flash(&app, wid), TrickFlashPhase::Pending);
+    assert_eq!(flash(&app, wid, t0), TrickFlashPhase::Pending);
     let now = Instant::now();
     let ws = app.windows.get_mut(&wid).expect("window");
     super::revoke_trick_line(ws, now);
     assert_eq!(
-        ws.fx.decos_mut().trick_flash_phase(now),
+        ws.fx.decos().trick_flash_phase(t0),
         TrickFlashPhase::Pending,
         "an addressed word's flash finishes"
     );
@@ -788,7 +902,7 @@ fn a_revoke_spares_the_flash_of_an_addressed_fire() {
     let ws = app.windows.get_mut(&wid).expect("window");
     super::revoke_trick_line(ws, now);
     assert_eq!(
-        ws.fx.decos_mut().trick_flash_phase(now),
+        ws.fx.decos().trick_flash_phase(t0),
         TrickFlashPhase::Idle,
         "a tentative word's pending flash is dropped"
     );
@@ -799,6 +913,7 @@ fn a_revoke_spares_the_flash_of_an_addressed_fire() {
 /// block the next command; Esc and an arrow poison it until a reset.
 #[test]
 fn ctrl_c_and_ctrl_u_reset_the_line_where_esc_only_poisons_it() {
+    let t0 = Instant::now();
     let (mut app, wid, _) = pet_app();
     type_word(&mut app, wid, "sot");
     app.input(wid, chord('c', Modifiers::CTRL), Source::Human);
@@ -841,7 +956,7 @@ fn ctrl_c_and_ctrl_u_reset_the_line_where_esc_only_poisons_it() {
     assert_eq!(pending(&app, wid), Some(Trick::Sit));
     app.input(wid, chord('c', Modifiers::CTRL), Source::Human);
     assert_eq!(pending(&app, wid), None, "⌃C revokes the tentative latch");
-    assert_eq!(flash(&app, wid), TrickFlashPhase::Idle);
+    assert_eq!(flash(&app, wid, t0), TrickFlashPhase::Idle);
 }
 
 /// A word-kill on the open token clears just the token (`sot` ⌃W `sit␣`
@@ -872,14 +987,15 @@ fn a_word_kill_clears_the_token_and_forward_kills_are_no_ops() {
     assert_eq!(pending(&app, wid), Some(Trick::Sit));
 }
 
-/// ⌃Z and ⌃\ reset only a line the listener knows is empty. At a prompt
+/// ⌃Z and ⌃\ reset only a line the listener can prove is empty. At a prompt
 /// shells ignore them and keep the half-typed line, so `sot` ⌃Z `sit␣` is
 /// `sotsit ` and must not fire (the line is poisoned until ⌃C), and a
-/// tentative fire they interrupt is taken back. On an empty line (left
-/// poisoned by the backgrounded editor's Esc) the returning prompt is
-/// fresh, and `sit␣` fires.
+/// tentative fire they interrupt is taken back. A poisoned line is never
+/// proved empty, whatever its count reads: Esc then `sot`, ↑ and a paste each
+/// leave text the count never saw. A clean empty line stays clean.
 #[test]
-fn a_job_chord_resets_only_an_empty_line_and_breaks_a_typed_one() {
+fn a_job_chord_resets_only_a_provably_empty_line_and_breaks_any_other() {
+    let t0 = Instant::now();
     for c in ['z', '\\'] {
         let (mut app, wid, _) = pet_app();
         type_word(&mut app, wid, "sot");
@@ -894,16 +1010,38 @@ fn a_job_chord_resets_only_an_empty_line_and_breaks_a_typed_one() {
         type_word(&mut app, wid, "sit ");
         assert_eq!(pending(&app, wid), Some(Trick::Sit), "⌃{c}: …until ⌃C");
 
+        type PutText = fn(&mut App, WindowId);
+        let unseen: [(&str, PutText); 3] = [
+            ("Esc, then `sot`", |app, wid| {
+                app.input(wid, named(NamedKey::Escape), Source::Human);
+                type_word(app, wid, "sot");
+            }),
+            ("↑", |app, wid| {
+                app.input(wid, named(NamedKey::ArrowUp), Source::Human);
+            }),
+            ("a paste", |app, wid| {
+                let paste = InputEvent::Paste("sot".into(), PasteFraming::AtDrain);
+                app.input(wid, paste, Source::Human);
+            }),
+        ];
+        for (what, put_text) in unseen {
+            let (mut app, wid, _) = pet_app();
+            put_text(&mut app, wid);
+            let listener = &app.windows[&wid].trick_listener;
+            assert!(
+                listener.is_poisoned() && listener.line_chars() == 0,
+                "fixture: {what} poisons a line whose count reads 0"
+            );
+            app.input(wid, chord(c, Modifiers::CTRL), Source::Human);
+            type_word(&mut app, wid, "sit ");
+            assert_eq!(pending(&app, wid), None, "⌃{c} after {what}: never fires");
+        }
+
         let (mut app, wid, _) = pet_app();
-        app.input(wid, named(NamedKey::Escape), Source::Human);
-        assert!(
-            app.windows[&wid].trick_listener.is_poisoned(),
-            "fixture: Esc"
-        );
         app.input(wid, chord(c, Modifiers::CTRL), Source::Human);
         assert!(
             !app.windows[&wid].trick_listener.is_poisoned(),
-            "⌃{c} on an empty line: the program is gone, the prompt is fresh"
+            "⌃{c} on a clean empty line: nothing to break"
         );
         type_word(&mut app, wid, "sit ");
         assert_eq!(pending(&app, wid), Some(Trick::Sit), "⌃{c}: heard at once");
@@ -913,7 +1051,7 @@ fn a_job_chord_resets_only_an_empty_line_and_breaks_a_typed_one() {
         assert_eq!(pending(&app, wid), Some(Trick::Sit));
         app.input(wid, chord(c, Modifiers::CTRL), Source::Human);
         assert_eq!(pending(&app, wid), None, "⌃{c} revokes the tentative latch");
-        assert_eq!(flash(&app, wid), TrickFlashPhase::Idle);
+        assert_eq!(flash(&app, wid, t0), TrickFlashPhase::Idle);
         assert_eq!(app.windows[&wid].trick_fire, TrickLineFire::None);
     }
 }
@@ -923,6 +1061,7 @@ fn a_job_chord_resets_only_an_empty_line_and_breaks_a_typed_one() {
 /// revoked nor confirmed, and the line after a clear is heard.
 #[test]
 fn a_screen_clear_keeps_the_line() {
+    let t0 = Instant::now();
     let (mut app, wid, _) = pet_app();
     type_word(&mut app, wid, "si");
     app.input(wid, chord('l', Modifiers::CTRL), Source::Human);
@@ -938,14 +1077,14 @@ fn a_screen_clear_keeps_the_line() {
         Some(Trick::Sit),
         "`si` ⌃L `t␣` is `sit␣`"
     );
-    assert_eq!(flash(&app, wid), TrickFlashPhase::Pending);
+    assert_eq!(flash(&app, wid, t0), TrickFlashPhase::Pending);
     app.input(wid, chord('l', Modifiers::CTRL), Source::Human);
     assert_eq!(
         pending(&app, wid),
         Some(Trick::Sit),
         "a clear revokes nothing"
     );
-    assert_eq!(flash(&app, wid), TrickFlashPhase::Pending);
+    assert_eq!(flash(&app, wid, t0), TrickFlashPhase::Pending);
 
     let (mut app, wid, _) = pet_app();
     app.input(wid, chord('l', Modifiers::CTRL), Source::Human);
@@ -958,6 +1097,7 @@ fn a_screen_clear_keeps_the_line() {
 /// `aterm help kitty` promises. The flash is best-effort; the command is not.
 #[test]
 fn with_every_sparkle_family_off_a_typed_command_moves_the_pet_and_cannot_flash() {
+    let t0 = Instant::now();
     let (mut app, wid, session) = pet_app();
     app.config.sparkle_words = Some(crate::app_config::SparkleWordsConfig {
         profanity: Some(crate::app_config::SparkleProfanityConfig {
@@ -992,7 +1132,7 @@ fn with_every_sparkle_family_off_a_typed_command_moves_the_pet_and_cannot_flash(
         }
     );
     assert_eq!(
-        flash(&app, wid),
+        flash(&app, wid, t0),
         TrickFlashPhase::Idle,
         "nothing to flash with"
     );
@@ -1055,6 +1195,7 @@ fn a_no_echo_prompt_poisons_the_line_and_its_enter_resets_it() {
 /// pre-drain fire's confirmation reaches no pet.
 #[test]
 fn the_serious_drain_drops_the_hosts_memory_and_leaves_the_line_to_the_listener() {
+    let t0 = Instant::now();
     let (mut app, wid, _) = pet_app();
     type_word(&mut app, wid, "sit ");
     assert_eq!(pending(&app, wid), Some(Trick::Sit));
@@ -1097,7 +1238,7 @@ fn the_serious_drain_drops_the_hosts_memory_and_leaves_the_line_to_the_listener(
         None,
         "`npm run sit` is not a command to the cat, drain or no drain"
     );
-    assert_eq!(flash(&app, wid), TrickFlashPhase::Idle);
+    assert_eq!(flash(&app, wid, t0), TrickFlashPhase::Idle);
     // The hand ends the line; the next one is judged as ever.
     app.input(wid, chord('c', Modifiers::CTRL), Source::Human);
     type_word(&mut app, wid, "sit ");
@@ -1112,6 +1253,7 @@ fn the_serious_drain_drops_the_hosts_memory_and_leaves_the_line_to_the_listener(
     app.input(wid, named(NamedKey::Enter), Source::Human);
     app.set_serious_mode(true);
     app.set_serious_mode(false);
+    let t0 = Instant::now();
     type_word(&mut app, wid, "sit");
     app.input(wid, named(NamedKey::Enter), Source::Human);
     assert_eq!(
@@ -1119,12 +1261,10 @@ fn the_serious_drain_drops_the_hosts_memory_and_leaves_the_line_to_the_listener(
         Some(Trick::Sit),
         "the first line after Serious Mode lifts is heard"
     );
-    let grieving = crate::app_render::pet_fails_a_command_for_test(
-        app.windows.get_mut(&wid).expect("window"),
-        Instant::now(),
-        Some(12),
+    assert!(
+        !grieves_at(&mut app, wid, t0),
+        "…and its `command not found` is forgiven"
     );
-    assert!(!grieving, "…and its `command not found` is forgiven");
 }
 
 /// The introspection renderer declares the snapshot's row origin. `sit⏎`
@@ -1162,7 +1302,7 @@ fn a_headless_capture_declares_base_y_so_the_scrolled_flash_finds_the_typed_line
     // Enter is the boundary key: noted on the input path FIRST…
     app.input(wid, named(NamedKey::Enter), Source::Human);
     assert_eq!(pending(&app, wid), Some(Trick::Sit));
-    assert_eq!(flash(&app, wid), TrickFlashPhase::Pending);
+    assert_eq!(flash(&app, wid, t0), TrickFlashPhase::Pending);
     // …then the shell answers, scrolling the typed line two rows up.
     {
         let term = app.pool.get(session).expect("session").term.clone();

@@ -5,19 +5,16 @@ use crate::App;
 use crate::cursor_glow::GlowStyle;
 use aterm_effects::cursor_fx::forge_cursor_fill;
 
-/// The trail-style config spellings → `glow_config()` / `trail_config()`,
-/// one row per spelling (a config contract); each row asserts only the
-/// fields its case is about (`None` = not asserted).
+/// Each trail-style spelling's `glow_config()` / `trail_config()` (a config contract); a row
+/// asserts only the fields its case is about (`None`: not asserted).
 ///
-/// * "comet": the additive aurora crown (bloom + landing ring), the
-///   continuous beam along the swept path, and the faint cadence-comet
-///   `TrailCell` ember bed (coverage capped, see READABLE_ALPHA_CAP), with
-///   its own `Comet` aurora and glacial default hue.
-/// * "beam": the steady tube (`GlowStyle::Beam`, ice-blue default hue):
-///   aurora enabled but radius 0 and ring off, and no trail body even when
-///   crown and ring are configured. An explicit trail colour still wins.
-/// * the additive-only styles (lumen/rainbow/…) keep their crown, ring and
-///   beam and produce no trail body; water drops the beam, laser keeps it.
+/// * "comet": the additive crown (bloom + landing ring), the beam along the swept path, and
+///   the faint `TrailCell` ember bed (capped by `READABLE_ALPHA_CAP`), with its own `Comet`
+///   aurora and glacial default hue.
+/// * "beam": the steady tube (`GlowStyle::Beam`, ice-blue default): radius 0, ring off and no
+///   trail body even when crown and ring are configured; an explicit trail colour still wins.
+/// * The additive-only styles (lumen, rainbow, …) keep crown, ring and beam with no trail
+///   body; water drops the beam, laser keeps it.
 /// * "off", and `cursor_trail = false` for any style, disable both layers.
 #[test]
 fn trail_style_spellings_map_to_their_layers() {
@@ -32,8 +29,7 @@ fn trail_style_spellings_map_to_their_layers() {
         want_enabled: Option<bool>,
         want_style: Option<GlowStyle>,
         want_color: Option<u32>,
-        /// `Some(true)`: a bloom crown (radius > 0); `Some(false)`: beam-only
-        /// (radius exactly 0).
+        /// `Some(true)`: a bloom crown (radius > 0); `Some(false)`: beam-only (radius 0).
         want_crown: Option<bool>,
         want_ring: Option<bool>,
         want_beam: Option<bool>,
@@ -67,7 +63,7 @@ fn trail_style_spellings_map_to_their_layers() {
             want_color: Some(crate::cursor_glow::BEAM_DEFAULT_COLOR),
             want_crown: Some(false),
             want_ring: Some(false),
-            // The beam style is the pure additive beam (WATER-2).
+            // The beam style is the pure additive beam.
             want_beam: Some(true),
             want_trail: Some(false),
             want_comet: Some(false),

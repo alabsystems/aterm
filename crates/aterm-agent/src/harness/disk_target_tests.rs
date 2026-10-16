@@ -1,17 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tests for the build-directory reclaim: what a profile is, when it is
-//! idle, and what is ever removed (an idle profile's `incremental/`, under
-//! every one of cargo's locks — nothing else).
+//! Tests for the build-directory reclaim: what a profile is, when it is idle, and that only an
+//! idle profile's `incremental/` is removed, under every one of cargo's locks.
 //!
-//! Every fixture is laid out as cargo lays a build directory out (the disk
-//! tests' [`lay_target`]: locks in each profile, none at the root), extended
-//! with what a real one also holds and must keep: an uplifted binary (a hard
-//! link of its `deps/` twin), a `*.d` file, `examples/`, a criterion baseline,
-//! `doc/`, a nested build directory's own profiles. Each tree lives in its own
-//! scratch directory; no test reads or writes anything of the owner's, and
-//! none reads the process table.
+//! Fixtures are laid out as cargo lays a build directory ([`lay_target`]: locks in each
+//! profile, none at the root), each in its own scratch directory; no test touches the owner's
+//! files or reads the process table.
 
 use super::*;
 use crate::harness::disk::DEFAULT_TARGET_STALE_DAYS as STALE;
@@ -21,9 +16,8 @@ use crate::harness::disk::tests::{
 
 const DAY: i64 = 86_400;
 
-/// An hour before the stale window closes at `now`: a profile last written
-/// into then is still in use, whatever the window is (one day by default,
-/// so "yesterday" is already idle).
+/// An hour before the stale window closes at `now`: a profile last written then is still in
+/// use.
 fn inside_window(now: i64) -> i64 {
     now - (STALE * DAY - 3_600)
 }
@@ -58,9 +52,8 @@ fn set_mtime(path: &Path, at: i64) {
         .expect("set mtime");
 }
 
-/// Take `lock` exclusively, as a build would — through the module's one
-/// `try_lock` ([`HeldLock::try_take`]), so the test's release is by
-/// `LOCK_UN` too and never lingers in a child a sibling test is spawning.
+/// Take `lock` exclusively, as a build would, through [`HeldLock::try_take`] so the release
+/// is by `LOCK_UN` too.
 fn take(lock: &Path) -> HeldLock {
     let f = std::fs::File::open(lock).expect("the lock exists");
     HeldLock::try_take(f)
@@ -68,21 +61,16 @@ fn take(lock: &Path) -> HeldLock {
         .expect("the test takes the lock")
 }
 
-/// Is `lock` held by someone right now? A probe that takes it releases it by
-/// `LOCK_UN` ([`HeldLock`]), as the reclaim does: released by the close
-/// alone, the probe's own lock would stay held in any child a sibling test
-/// is spawning, and the next probe or reclaim would read it as a build's.
+/// Is `lock` held by someone right now? The probe releases by `LOCK_UN` ([`HeldLock`]): by
+/// close alone it would stay held in a child a sibling test is spawning.
 fn held(lock: &Path) -> bool {
     let f = std::fs::File::open(lock).expect("lock");
     !matches!(HeldLock::try_take(f), Ok(Some(_)))
 }
 
-/// A child forked from another thread and kept short of its exec, holding a
-/// copy of every descriptor this process had open at the fork — as every
-/// child any thread spawns does until its exec (the host spawns `df`, `ps`
-/// and `lsof`; a loaded machine stretches the window to tens of
-/// milliseconds). [`Parked::fork`] returns once the child exists, and it
-/// execs only at [`Parked::exec`]: a handshake over two pipes, not a sleep.
+/// A child forked from another thread and kept short of its exec, holding a copy of every
+/// descriptor open at the fork, as every child does until its exec. [`Parked::fork`] returns
+/// once the child exists; it execs only at [`Parked::exec`] (a handshake over two pipes).
 struct Parked {
     spawner: std::thread::JoinHandle<std::io::Result<std::process::ExitStatus>>,
     go: std::io::PipeWriter,
@@ -213,13 +201,8 @@ fn in_incremental(rel: &Path) -> bool {
         .any(|c| c.as_os_str() == std::ffi::OsStr::new(INCREMENTAL))
 }
 
-/// The only thing that goes is an idle profile's `incremental/`. On a build
-/// directory laid out as cargo lays one — locks in the profile, none at the
-/// root — the profile is found, its idle cache is reclaimed, and every other
-/// entry of the tree is byte-identical afterwards: the tag, the locks,
-/// `deps/`, `build/`, `.fingerprint/`, the uplifted binary and its `.d`,
-/// `examples/`, the dSYM link, the criterion baseline, `doc/`. The bytes
-/// counted are the blocks the query cache released.
+/// An idle profile loses only its `incremental/`: every other entry of a furnished build
+/// directory is byte-identical afterwards, and the bytes counted are the blocks released.
 #[test]
 fn an_idle_profile_loses_only_its_incremental_cache_and_everything_else_is_byte_identical() {
     let tmp = Tmp::new("only-incremental");
@@ -267,11 +250,9 @@ fn an_idle_profile_loses_only_its_incremental_cache_and_everything_else_is_byte_
     assert!(err.to_string().contains("nothing reclaimed"), "{err}");
 }
 
-/// Profiles are found at any depth and each is judged alone: `<t>/debug`,
-/// `<t>/<triple>/release`, and a custom profile nested one level further
-/// (`<t>/conformance-release/release`), each found by its own locks. A profile
-/// written inside the window keeps its `incremental/` while idle ones lose
-/// theirs.
+/// Profiles are found at any depth (`debug`, `<triple>/release`,
+/// `conformance-release/release`) and each is judged alone: one written inside the window
+/// keeps its `incremental/`.
 #[test]
 fn profiles_are_found_at_any_depth_and_each_is_judged_alone() {
     let tmp = Tmp::new("nested");
@@ -318,9 +299,7 @@ fn profiles_are_found_at_any_depth_and_each_is_judged_alone() {
     );
 }
 
-/// A walk cut short makes the whole directory not a candidate: past its
-/// entry budget or its depth, the report says so and has no row, however
-/// idle the profiles it did see.
+/// A walk cut short (entries, depth or time) makes the whole directory not a candidate.
 #[test]
 fn a_walk_cut_short_makes_the_whole_directory_not_a_candidate() {
     let tmp = Tmp::new("cut");
@@ -345,15 +324,12 @@ fn a_walk_cut_short_makes_the_whole_directory_not_a_candidate() {
         let why = target_witness(&td, now, STALE).expect_err("not a candidate");
         assert!(why.contains("not all known"), "{why}");
     }
-    // CONTROL: the shipped bounds read it all.
+    // Control: the shipped bounds read it all.
     assert!(target_witness(&assessed(&t, now), now, STALE).is_ok());
 }
 
-/// The idle clock is the cache directories', never a lock's or the
-/// profile's own. A lock file keeps its creation time, so an ancient lock
-/// beside a fresh `deps/` is a profile in use; a freshly touched lock or
-/// profile directory beside old caches is still idle; and a build of
-/// examples alone (`examples/` fresh) keeps it too.
+/// The idle clock is [`CLOCK_DIRS`], never a lock's or the profile directory's: a fresh lock
+/// or profile directory is not a use; a fresh `deps/` or `examples/` is.
 #[test]
 fn the_idle_clock_is_the_cache_directories_only() {
     let tmp = Tmp::new("clock");
@@ -384,11 +360,8 @@ fn the_idle_clock_is_the_cache_directories_only() {
     assert!(target_witness(&assessed(&t, now), now, STALE).is_err());
 }
 
-/// A build holding any one of cargo's locks keeps its profile — in the
-/// report (not a candidate, and the reason is the held lock) and in the
-/// reclaim itself, which re-takes the locks: the held profile keeps its
-/// cache byte for byte, while an idle sibling profile in the same build
-/// directory is still reclaimed.
+/// A build holding any one of cargo's locks keeps its profile, in the report and in the
+/// reclaim, while an idle sibling profile is still reclaimed.
 #[test]
 fn a_build_holding_any_lock_keeps_its_profile() {
     let now = now_after_write(STALE + 1);
@@ -434,9 +407,7 @@ fn a_build_holding_any_lock_keeps_its_profile() {
     }
 }
 
-/// The locks are held for the whole delete and released after it: when the
-/// delete starts every one of the profile's locks is held (a build that
-/// starts now waits), and once the reclaim is done every one is free.
+/// Every lock is held from before the delete until after it, then released.
 #[test]
 fn every_lock_is_held_for_the_whole_delete_and_released_after() {
     let tmp = Tmp::new("locks");
@@ -460,13 +431,9 @@ fn every_lock_is_held_for_the_whole_delete_and_released_after() {
     );
 }
 
-/// A lock is released while a child forked under it has yet to exec: every
-/// child holds a copy of every descriptor until its exec, and the reclaim
-/// releases each lock by `LOCK_UN` ([`HeldLock`]), so once it is done every
-/// lock is free regardless. The child is forked from another thread while the
-/// locks are held and kept short of its exec until every stage is read
-/// ([`Parked`]). Negative control: with [`HeldLock`]'s drop reduced to a plain
-/// close, every lock reads held at `Released`.
+/// The reclaim's locks are free once it is done, though a child forked under them has yet to
+/// exec ([`Parked`]). Negative control: with [`HeldLock`]'s drop reduced to a plain close,
+/// every lock reads held at `Released`.
 #[test]
 fn a_lock_is_released_while_a_child_forked_under_it_has_yet_to_exec() {
     let tmp = Tmp::new("fork-window");
@@ -498,14 +465,9 @@ fn a_lock_is_released_while_a_child_forked_under_it_has_yet_to_exec() {
     assert!(!debug.join(INCREMENTAL).exists());
 }
 
-/// The report's probe releases each lock while a child forked under the probe
-/// has yet to exec. The probe ([`locks_held`]) takes each of cargo's locks for
-/// an instant; a child forked ([`Parked`]) while it holds each keeps a copy of
-/// that descriptor until its exec. Released by `LOCK_UN`, every lock is free
-/// when the probe returns, so the next survey reads no build and the reclaim
-/// takes the profile while every child is still parked. Negative control: with
-/// the probe releasing by close alone, each lock reads held after the probe
-/// and the reclaim fails with "a build holds …/.cargo-lock".
+/// The report's probe ([`locks_held`]) releases each lock by `LOCK_UN`, so a child forked
+/// under it ([`Parked`]) does not keep it held. Negative control: with the probe releasing by
+/// close alone, each lock reads held after the probe and the reclaim fails.
 #[test]
 fn a_probed_lock_is_released_while_a_child_forked_under_the_probe_has_yet_to_exec() {
     let tmp = Tmp::new("probe-fork-window");
@@ -546,9 +508,7 @@ fn a_probed_lock_is_released_while_a_child_forked_under_the_probe_has_yet_to_exe
     assert_eq!(done.units, vec![debug.join(INCREMENTAL)], "{done:?}");
 }
 
-/// A compile since the survey keeps the profile: the verdict is derived
-/// again under the locks, and a cache written into since then is no longer
-/// idle — nothing is deleted.
+/// A compile since the survey keeps the profile: the verdict is derived again under the locks.
 #[test]
 fn a_compile_since_the_survey_keeps_the_profile() {
     let tmp = Tmp::new("since");
@@ -565,11 +525,8 @@ fn a_compile_since_the_survey_keeps_the_profile() {
     assert!(debug.join(INCREMENTAL).exists());
 }
 
-/// An unread clock is said as one: re-derived under the locks, a profile
-/// whose caches' clock could not be read is refused by both passes with that
-/// reason, never dated "written into 0d ago" (a time nobody measured). A
-/// profile written into since the threshold is still dated in days, and one
-/// inside the last ten minutes names the rule that keeps it.
+/// A profile whose clock could not be read is refused by both passes with that reason, never
+/// dated "written into 0d ago".
 #[test]
 fn an_unread_clock_is_said_never_dated_zero_days() {
     let now = 2_000_000_000;
@@ -581,8 +538,8 @@ fn an_unread_clock_is_said_never_dated_zero_days() {
         seen: now,
     };
     assert_eq!(lru.refuses(None, &judge(now)).as_deref(), Some(unread));
-    // The dated arms stand as they were: past the window it is idle, inside
-    // it the days are said, and at a 0-day window the ten minutes are.
+    // The dated arms: past the window it is idle, inside it the days are said, and at a
+    // 0-day window the ten minutes are.
     assert_eq!(
         idle.refuses(Some(now - (STALE + 1) * DAY), &judge(now)),
         None
@@ -606,12 +563,9 @@ fn an_unread_clock_is_said_never_dated_zero_days() {
     );
 }
 
-/// A missing lock is created only when the removal proceeds, and one that
-/// cannot be created skips the profile. A profile an older cargo built holds
-/// only `.cargo-lock`: the report creates nothing; the reclaim creates the
-/// other two and holds them. With `.cargo-lock` held, nothing is created. And
-/// when creating one fails — a full disk (ENOSPC) or a read-only profile —
-/// the profile is skipped whole, its cache intact.
+/// A missing lock is created only when the removal proceeds (an older cargo's profile holds
+/// only `.cargo-lock`), never while a build holds one, and a failure to create one (ENOSPC,
+/// a read-only profile) skips the profile whole.
 #[test]
 fn a_missing_lock_is_created_only_when_the_removal_proceeds_and_its_failure_skips() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -673,15 +627,9 @@ fn a_missing_lock_is_created_only_when_the_removal_proceeds_and_its_failure_skip
     assert_eq!(only(&t), 1);
 }
 
-/// Nothing is reached through a symlink:
-/// * a component of the build directory's path swapped for a link after
-///   the survey refuses the whole reclaim, and the link's target is
-///   untouched;
-/// * a profile's `incremental` that is a link is not followed (and not a
-///   candidate);
-/// * a link inside `incremental/` is unlinked, its target kept;
-/// * a profile directory swapped for a link while its locks are held
-///   redirects nothing: the work continues on the handle that was checked.
+/// Nothing is reached through a symlink: a path component swapped for a link refuses the
+/// reclaim; a linked `incremental` is no candidate; a link inside `incremental/` is unlinked,
+/// its target kept; a profile swapped for a link under the locks redirects nothing.
 #[test]
 fn nothing_is_reached_through_a_symlink() {
     let tmp = Tmp::new("links");
@@ -752,10 +700,8 @@ fn nothing_is_reached_through_a_symlink() {
     );
 }
 
-/// The delete never enters another device: a directory inside
-/// `incremental/` on "another device" (the device check told so) is not
-/// entered — it stays, reported, and uncounted — while everything else in
-/// the cache goes.
+/// The delete never enters a directory on another device (reported, uncounted), and a build
+/// directory on another volume than the one measured is refused.
 #[test]
 fn the_delete_never_enters_another_device() {
     let tmp = Tmp::new("device");
@@ -792,11 +738,8 @@ fn the_delete_never_enters_another_device() {
     assert!(t.join("debug").join(INCREMENTAL).exists());
 }
 
-/// What is counted is what the unlinks released: a file hard-linked into
-/// `deps/` (rustc links incremental objects there) frees nothing and is not
-/// counted — the `deps/` name keeps the data — and a sparse file counts the
-/// blocks it holds, not its length. The report's estimate and the reclaim's
-/// count agree.
+/// The bytes counted are what the unlinks released: a file hard-linked into `deps/` counts
+/// nothing, a sparse file its blocks; the report's estimate and the reclaim's count agree.
 #[test]
 fn the_bytes_counted_are_the_blocks_the_unlinks_released() {
     let tmp = Tmp::new("bytes");
@@ -823,10 +766,8 @@ fn the_bytes_counted_are_the_blocks_the_unlinks_released() {
     );
 }
 
-/// An undeletable entry is reported and the rest still goes: a read-only
-/// directory inside the cache keeps its file; every sibling is deleted and
-/// counted; the stuck file is reported and not counted; and
-/// `incremental/` itself, not empty, is not claimed as gone.
+/// An undeletable entry is reported and uncounted, its siblings deleted and counted, and the
+/// non-empty `incremental/` not claimed as gone.
 #[test]
 fn an_undeletable_entry_is_reported_and_its_siblings_still_go() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -876,13 +817,8 @@ fn a_directory_holding_source_is_never_a_candidate() {
     assert!(t.join("debug").join(INCREMENTAL).exists());
 }
 
-/// A reclaim cut short does not reset the idle clock. Unlinking a child
-/// writes its parent's mtime, so a delete that keeps one entry of
-/// `incremental/` (an entry it cannot delete, a mount, a quit mid-pass)
-/// leaves `incremental/` written "now". The clock is `deps/`,
-/// `.fingerprint/`, `build/` and `examples/` — what a compile writes — never
-/// `incremental/`, which the reclaim itself writes: the profile is still idle
-/// afterwards, and the next reclaim takes what is left.
+/// A reclaim cut short leaves the profile idle: its unlinks write `incremental/`'s mtime,
+/// which is not part of the idle clock, so the next reclaim takes what is left.
 #[test]
 fn a_reclaim_cut_short_leaves_the_profile_idle_for_the_next() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -923,10 +859,8 @@ fn a_reclaim_cut_short_leaves_the_profile_idle_for_the_next() {
     assert!(!inc.exists());
 }
 
-/// A lock the reclaim creates is the file cargo would have created: its
-/// mode is `0666` under the umask, as cargo's `OpenOptions` gives it, never
-/// a private `0600` a build by another member of a shared build directory's
-/// group could not open.
+/// A lock the reclaim creates gets the mode cargo's `OpenOptions` gives it (`0666` under the
+/// umask), never a private `0600` that locks out a shared build directory's group.
 #[test]
 fn a_created_lock_takes_the_mode_cargo_gives_it() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -957,11 +891,8 @@ fn a_created_lock_takes_the_mode_cargo_gives_it() {
     }
 }
 
-/// An empty `incremental/` is nothing to reclaim: an idle profile whose
-/// cache holds nothing (every release profile, every `CARGO_INCREMENTAL=0`
-/// build) is not a candidate — no row counts it, the reclaim takes no lock
-/// in it and creates none, and its empty directory stays — while an idle
-/// sibling with a real cache is still reclaimed.
+/// An idle profile with an empty `incremental/` (a release or `CARGO_INCREMENTAL=0` build) is
+/// not a candidate and gets no lock, while an idle sibling is reclaimed.
 #[test]
 fn an_empty_incremental_is_not_a_candidate_and_gets_no_lock() {
     let tmp = Tmp::new("empty-inc");
@@ -1005,11 +936,8 @@ fn an_empty_incremental_is_not_a_candidate_and_gets_no_lock() {
     assert!(!release.join(".cargo-artifact-lock").exists());
 }
 
-/// The device a path names is the one it resolves to: `dev_of` follows a
-/// link, as the free-space figure and the volume filter do, so a home that
-/// is a link to another volume fences the reclaim to that volume rather than
-/// to the link's own. The fixture links to `/dev` (devfs: a volume of its
-/// own) from the scratch directory.
+/// `dev_of` follows a link, as the free-space figure does, so a home linked to another volume
+/// fences the reclaim to that volume. The fixture links to `/dev` (devfs, its own volume).
 #[test]
 fn the_device_of_a_link_is_the_one_it_resolves_to() {
     use std::os::unix::fs::MetadataExt as _;
@@ -1035,12 +963,8 @@ fn last_used(profile: &Path, at: i64) {
     }
 }
 
-/// Under pressure one named profile goes, under all of its locks. Both
-/// profiles are recent (inside the one-day window, so the idle reclaim takes
-/// neither); [`reclaim_lru`] takes the one it is named — its
-/// `incremental/` alone, every one of its locks held from before the delete
-/// until after it — and leaves its sibling's cache, and everything else,
-/// alone.
+/// Under pressure [`reclaim_lru`] takes only the named recent profile's `incremental/`, under
+/// all of its locks, and leaves everything else byte-identical.
 #[test]
 fn reclaim_lru_takes_only_the_named_profile_under_every_lock() {
     let tmp = Tmp::new("lru-one");
@@ -1083,11 +1007,8 @@ fn reclaim_lru_takes_only_the_named_profile_under_every_lock() {
     );
 }
 
-/// Under the locks the pressure pick is derived again, and refused when:
-/// a compile wrote into it since the survey (a build is using it — it is no
-/// longer the least recently used); it was written into within
-/// [`PRESSURE_MIN_IDLE_S`]; it is not one of the build directory's
-/// profiles at all. Each refusal leaves the cache where it was.
+/// Under the locks the pressure pick is derived again, and refused when written since the
+/// survey, written within [`PRESSURE_MIN_IDLE_S`], or not one of the directory's profiles.
 #[test]
 fn reclaim_lru_refuses_a_profile_used_since_the_survey_or_just_built() {
     let tmp = Tmp::new("lru-refuse");
@@ -1131,15 +1052,9 @@ fn reclaim_lru_refuses_a_profile_used_since_the_survey_or_just_built() {
     assert!(debug.join(INCREMENTAL).exists());
 }
 
-/// A WHOLE REMOVAL TAKES NO PROFILE IT DID NOT LOCK, AND DELETES ONLY
-/// THROUGH THE HANDLE IT PINNED (review 13). A profile made after the first
-/// walk (a new target triple's build) holds a lock the reclaim never took:
-/// found again under the locks, it refuses the whole directory, nothing
-/// deleted. And a directory SWAPPED in under the build directory's name
-/// after the identity check is never entered: the pinned directory's
-/// contents go through its handle, the newcomer keeps its file, and the row
-/// says the name now names another directory. NEGATIVE CONTROL: left alone,
-/// the directory goes whole.
+/// A whole removal refuses when a profile appears after it locked the rest, and deletes only
+/// through the handle it pinned: a directory swapped in under the name is never entered.
+/// Control: left alone, the directory goes whole.
 #[test]
 fn a_whole_removal_takes_no_profile_it_did_not_lock_and_deletes_through_its_handle() {
     let now = now_after_write(2);

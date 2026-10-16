@@ -62,9 +62,8 @@ impl Grid {
         let visible = usize::from(self.storage.visible_rows).min(self.storage.rows.len());
         let cursor_row = usize::from(self.storage.cursor.row);
         let mut belt = 0usize;
-        // Detect the belt in content coordinates (`row_at_screen`), matching
-        // the extraction below; the offloaded detach runs before `resize()`
-        // zeroes `display_offset`.
+        // Content coordinates, as in the extraction below (see
+        // `trailing_blank_rows_below_cursor`).
         while belt < visible.min(cursor_row) {
             match self.storage.row_at_screen(row_u16(belt)) {
                 Some(r) if r.is_wrapped() && r.line_size() == LineSize::SingleWidth => belt += 1,
@@ -235,10 +234,9 @@ impl Grid {
         pull
     }
 
-    /// Invalidate the offloaded reflow's deficit-fill debt: a screen-clearing
-    /// erase (ED 0/2, DECSED 0/2) during the detach window makes the blank band
-    /// genuine, and filling it would resurrect pre-clear history. No-op outside
-    /// a detach window.
+    /// Drop the offloaded reflow's deficit-fill debt. An op that mints genuine
+    /// blank rows during the detach window (ED/DECSED 0 and 2, DL, SU) calls this:
+    /// filling them would resurrect pre-clear history. No-op outside a detach.
     #[inline]
     pub(super) fn invalidate_pending_fill_target(&mut self) {
         self.storage.pending_fill_target = None;

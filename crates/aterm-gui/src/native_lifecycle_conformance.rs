@@ -494,15 +494,13 @@ impl AsyncHarness {
             edits: patch
                 .edits
                 .into_iter()
-                .map(|edit| ConfigKeyEdit {
-                    key: edit.key,
-                    expected: match edit.expected {
-                        crate::native_app::ExpectedConfigValue::Any => ExpectedValue::Any,
-                        crate::native_app::ExpectedConfigValue::Exact(value) => {
-                            ExpectedValue::Exact(value)
-                        }
-                    },
-                    value: edit.value,
+                .map(|edit| {
+                    let crate::native_app::ExpectedConfigValue::Exact(expected) = edit.expected;
+                    ConfigKeyEdit {
+                        key: edit.key,
+                        expected: ExpectedValue::Exact(expected),
+                        value: edit.value,
+                    }
                 })
                 .collect(),
         });

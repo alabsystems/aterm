@@ -1,17 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// Visual demo of the "LUMEN WAKE" cursor aurora styles. Hand-builds the additive
-// light quads (the same premultiplied [`GlowQuad`]s the live animator emits) for
-// each style and renders them through the real CPU compositor to a PNG, so the
-// translucency (text shows THROUGH the light) and per-style colour are visible.
-// COLOURS come from the live animator's own shared ramps
-// (`aterm_effects::cursor_glow::style_comet_color` / `style_particle_color` —
-// a dev-dependency, like the sparkle demo), so the previewed palette can never
-// drift from the shipped art the way the old hand-copied ramp table did (its
-// laser previewed blue-to-white while the live laser is ELECTRIC YELLOW).
+// Renders each cursor-glow style's additive light quads through the CPU compositor to a
+// PNG, so the translucency and per-style colour are visible. Colours come from the live
+// ramps (`aterm_effects::cursor_glow::style_comet_color` / `style_particle_color`), so
+// the preview cannot drift from the shipped art.
 //
-//   cargo run -p aterm-render --example cursor_glow_demo -- <out_dir>
+//   targo --unverified run -p aterm-render --example cursor_glow_demo -- <out_dir>
 
 use aterm_core::terminal::Terminal;
 use aterm_effects::cursor_glow::{
@@ -21,8 +16,8 @@ use aterm_render::{
     BeamClip, CometSample, GlowQuad, Renderer, Theme, comet_glow_quads, premul_rgb,
 };
 
-/// Brighten a packed `0x00RRGGBB` by 1.5× — the accent derivation the live
-/// `glow_config` applies when no explicit `cursor_trail_accent` is set.
+/// Brighten a packed `0x00RRGGBB` by 1.5×: the live accent when `cursor_trail_accent` is
+/// unset.
 fn brighten(c: u32) -> u32 {
     let m = |sh: u32| ((((c >> sh) & 0xff) as f32) * 1.5).min(255.0) as u32;
     (m(16) << 16) | (m(8) << 8) | m(0)
@@ -45,10 +40,8 @@ fn main() {
     let comet_len = 22usize;
     let cursor = theme.cursor & 0x00FF_FFFF;
 
-    // (label, style, intensity, has_particles) — colours resolve per position
-    // through the SHARED `style_comet_color` ramp below, with the same base /
-    // accent derivation the live `glow_config` uses (laser defaults to its
-    // ELECTRIC YELLOW, the rest to the theme cursor; accent = base × 1.5).
+    // (label, style, intensity, has_particles). The base colour is the laser's default
+    // or the theme cursor, as the live `glow_config` resolves it.
     let styles: [(&str, GlowStyle, f32, bool); 5] = [
         ("lumen", GlowStyle::Lumen, 0.85, false),
         ("phaser", GlowStyle::Phaser, 0.85, false),
@@ -63,8 +56,7 @@ fn main() {
             _ => cursor,
         };
         let accent = brighten(base);
-        // The live comet ramp at path position `pos` (0 tail .. 1 head); the
-        // static demo frame renders hue phase 0.
+        // The live comet ramp at `pos` (0 tail .. 1 head), hue phase 0.
         let color_at = |pos: f32| style_comet_color(style, base, accent, 0.0, pos);
         let mut input = term.cell_frame(rows, cols);
         let mut q = Vec::<GlowQuad>::new();
@@ -92,7 +84,7 @@ fn main() {
                     w: (x1 - x0) as u16,
                     h: (band_end - yy) as u16,
                     color: premul,
-                    // ADDITIVE light (see `GlowQuad::alpha`).
+                    // Additive light (see `GlowQuad::alpha`).
                     alpha: 0,
                     color2: premul,
                     alpha2: 0,
@@ -118,9 +110,8 @@ fn main() {
                 cov,
             );
         }
-        // Bloom crown: 3 concentric additive boxes around the head, in the
-        // ramp's own head colour — the laser included (its live look is a tight
-        // SAME-HUE bloom with no white flash, per the style's contract).
+        // Bloom crown: 3 concentric additive boxes around the head in the ramp's
+        // head colour (the laser's bloom is same-hue, no white flash).
         let cx = (head * cw) as i32;
         let cy = (trow * ch) as i32;
         let bloom = color_at(1.0);
@@ -149,9 +140,7 @@ fn main() {
                 } else {
                     (a.cos() * rad, a.sin() * rad) // sparkles radiate
                 };
-                // The live particle ramp: farther-scattered = older = more
-                // faded, per-particle hue seed — the same colours the live
-                // ember/spark emitters and the settings-card demo resolve.
+                // The live particle ramp: farther-scattered = older = more faded.
                 let pcol = style_particle_color(style, base, (k as f32 * 0.11).fract(), 1.0 - life);
                 let px0 = cx + cw as i32 / 2 + dx as i32 - sz / 2;
                 let py0 = cy + ch as i32 / 2 + dy as i32 - sz / 2;
@@ -170,10 +159,8 @@ fn main() {
         );
     }
 
-    // ---- DIAGONAL before/after: the staircase fix ----
-    // The SAME diagonal cursor sweep, rendered the OLD way (one opaque cell per
-    // Bresenham step → a staircase of rectangles) and the NEW way (an anti-aliased
-    // glowing beam via `comet_beam` — soft halo + hot core, attached to the cursor).
+    // A diagonal sweep two ways: one cell per Bresenham step (a staircase) and the
+    // anti-aliased beam.
     let (drows, dcols) = (12usize, 46usize);
     let mut demo_term = Terminal::new(drows as u16, dcols as u16);
     demo_term.process(b"$ aterm \xe2\x80\x94 smooth crisp cursor zoom\r\n");
@@ -207,11 +194,10 @@ fn main() {
         v
     };
     let ncells = cells.len();
-    // The live Lumen ramp (accent → cursor along the tail), through the same
-    // shared function the style panel above used.
+    // The live Lumen ramp (accent to cursor along the tail).
     let lumen = |pos: f32| style_comet_color(GlowStyle::Lumen, cursor, brighten(cursor), 0.0, pos);
 
-    // BEFORE: full-cell staircase (exclude the head cell — the cursor owns it).
+    // Before: a full-cell staircase, head cell excluded (the cursor owns it).
     {
         let mut input = demo_term.cell_frame(drows, dcols);
         let mut q = Vec::<GlowQuad>::new();
@@ -228,7 +214,7 @@ fn main() {
                 w: cw as u16,
                 h: ch as u16,
                 color: premul_rgb(lumen(pos), cov),
-                // ADDITIVE light (see `GlowQuad::alpha`).
+                // Additive light (see `GlowQuad::alpha`).
                 alpha: 0,
                 color2: premul_rgb(lumen(pos), cov),
                 alpha2: 0,
@@ -241,8 +227,8 @@ fn main() {
         println!("wrote {dir}/glow_diag_before.png  (staircase, {nq} quads)");
     }
 
-    // AFTER: anti-aliased glowing beam — layered additive bloom under a hot core,
-    // mirroring `cursor_glow::emit_comet`, attached to the cursor.
+    // After: the anti-aliased beam (layered bloom under a hot core), as
+    // `cursor_glow::emit_comet` draws it.
     {
         let mut input = demo_term.cell_frame(drows, dcols);
         let mut q = Vec::<GlowQuad>::new();
@@ -262,8 +248,7 @@ fn main() {
                 }
             })
             .collect();
-        // The exact same layered-bloom look the live cursor uses. Identity
-        // convention (pad 0, head 0): `BeamClip::grid` — box == the grid extents.
+        // The live cursor's layered bloom; `BeamClip::grid` is the identity clip.
         comet_glow_quads(
             &mut q,
             BeamClip::grid(gw, gh, ch),

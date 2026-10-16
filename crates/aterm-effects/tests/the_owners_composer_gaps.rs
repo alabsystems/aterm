@@ -10,15 +10,14 @@
 //!
 //! * `wit hthe▯cu [Image #1]`: typing before a trailing `[Image #1]`, the Space
 //!   after `hthe` pushes the placeholder onto a new row; the box grows in the
-//!   same frame the Space echoes, and the caret moves `(R, c) → (R-1, c+1)`
-//!   before the follow pass sees the text move. That echo is laid by
-//!   `rainbow_kitty::Engine::lay_crossed_echo`.
+//!   frame the Space echoes, and the caret moves `(R, c) → (R-1, c+1)` before
+//!   the follow pass sees the text move. `Engine::lay_crossed_echo` lays it.
 //! * `interrupted`, wrapped while the app stalls: only its `i` has echoed when
 //!   the word wraps, and the rest comes in one late repaint.
-//!   `rainbow_kitty::Ribbon::note_rewrap_start` reads where the relaid text
-//!   starts from the landing row's own sample, so the batch's cells are lit.
+//!   `Engine::note_rewrap_starts` reads where the relaid text starts from the
+//!   landing row's own sample, so the batch's cells are lit.
 //!
-//! Non-vacuity: each case asserts the move it exists for really happened.
+//! Each case asserts that the move it exists for happened.
 
 #![allow(
     dead_code,
@@ -478,7 +477,7 @@ impl Sim {
     }
 
     /// Interior holes on every row: a column between two live cells of the
-    /// SAME row that has no live cell of its own.
+    /// same row that has no live cell of its own.
     fn scan_holes(&mut self) {
         let t = self.ms();
         let Some(rib) = self.glow.v2_ribbon() else {
@@ -706,9 +705,9 @@ fn keys_of(s: &str, start: u64, gap: u64) -> Vec<(u64, char)> {
         .collect()
 }
 
-/// A render per key at `delay` after it — but serialized: a render never
-/// precedes the previous one (the app processes input in order), and a
-/// render only ever happens once per `min_gap` (Ink's throttle).
+/// A render per key at `delay(i)` after it, serialized: a render never
+/// precedes the previous one (the app processes input in order), and renders
+/// that land on the same ms are one.
 fn renders_for(keys: &[(u64, char)], delay: impl Fn(usize) -> u64) -> Vec<u64> {
     let mut out: Vec<u64> = Vec::new();
     let mut last = 0u64;
@@ -725,8 +724,8 @@ fn renders_for(keys: &[(u64, char)], delay: impl Fn(usize) -> u64) -> Vec<u64> {
 const L1: &str = "ok. I also noticed that there was a typing latency stall on this machine. there was a message alert about it.";
 const L2: &str = "it said that the CPUs were busy. Keep designing superior solutions so that the end user experience is not";
 
-/// The owner's second screen: typing BEFORE `[Image #1]`; the Space after
-/// `hthe` pushes the placeholder onto a new row and the box grows.
+/// The second screen: typing before `[Image #1]`; the Space after `hthe`
+/// pushes the placeholder onto a new row and the box grows.
 fn typing_before_the_placeholder(gap: u64, delay: u64) -> Sim {
     let mut s = Sim::new("workspace");
     // Every admission logged: the non-vacuity check reads them.
@@ -744,8 +743,8 @@ fn typing_before_the_placeholder(gap: u64, delay: u64) -> Sim {
     s
 }
 
-/// Whether the log shows a licensed echo move that crossed rows — the shape
-/// this file exists for (the non-vacuity check).
+/// Whether the log shows a licensed echo move that crossed rows (the
+/// non-vacuity check).
 fn crossed_rows(s: &Sim) -> bool {
     s.log.iter().any(|l| {
         l.contains(" Licensed ")
@@ -779,8 +778,8 @@ fn a_space_that_grows_the_box_lights_its_own_cell() {
 }
 
 /// The first screen, stalled: `interrupted` typed at the end of the second
-/// line; its `n`'s echo held `stall` ms, so the wrap's repaint brings the
-/// whole word at once.
+/// line, key `at_key`'s echo held `stall` ms, so the wrap's repaint brings the
+/// rest of the word at once.
 fn interrupted_wrapped_in_a_stall(gap: u64, stall: u64, at_key: usize) -> Sim {
     let mut s = Sim::new("workspace");
     s.verbose = true;

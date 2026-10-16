@@ -9,38 +9,29 @@ repository.workspace = true
 description = "aterm's unified message engine — the platform-neutral model, glass policy, single-row width law, tagged log ring and line codec behind the message band, the Settings ▸ Messages page and the `messages`/`notice` verbs; and the per-tab presence row's core (facts, story, levels, words, tones, cells); the host paints cells, appends the file, performs intents and senses the presence facts."
 
 [dependencies]
-# The engine-wide injected-clock idiom (the aterm-predict shape): EXACTLY
-# std::time::Instant on native, a JS clock on wasm32. Every method that reads
-# time takes `now: Instant`; the crate itself never samples a clock (its own
-# test greps its sources for `::now()` and asserts zero hits). This is the
-# crate's ONLY dependency: no aterm-types, no serde — the carry and the log
-# are plain data plus a line codec owned here, so the crate is wasm-clean by
-# construction and links nothing the wasm canary would have to pin.
+# The only dependency, so the crate stays wasm-clean: `Instant` is std's on
+# native and a JS clock on wasm32. Every method that reads time takes
+# `now: Instant`; the crate never samples a clock (lib.rs's
+# `no_wall_clock_in_this_crate`).
 aterm-time = { workspace = true }
 
-# Tier-1 binds (aterm-spec's derive steps): the tests drive the shipping
-# `MessageCenter` in lock step with a `ty_model!` model. aterm-spec depends only
-# on aterm-spec-macros, so there is no cycle, and a dev-dependency
-# is not linked into the library (the wasm canary still sees one dependency).
+# tests/conformance_*.rs drive `MessageCenter` in lock step with aterm-spec's
+# derived models.
 [dev-dependencies]
 aterm-spec = { workspace = true }
-# TEST-ONLY: the control wire's percent escape, the encoder every host injects
-# as `enc` (`aterm_control::wire::pct_encode` re-exports it), so the tests pin
-# the bytes the socket carries. Dev-dependencies never enter the shipped or
-# wasm32 graph; the crate's one dependency above is unchanged.
+# Test-only: the control wire's percent escape (re-exported as
+# `aterm_control::wire::pct_encode`), so the tests pin the bytes the socket carries.
 aterm-codec = { workspace = true }
-# TEST-ONLY: the terminal grid's measure (`str_grid_columns`), the one every
-# host injects as `presence::Host::columns`, so the presence row's width law
-# and painter are proven against the cells the grid really gives a CJK glyph,
-# a combining mark or a ZWJ sequence. Like the codec above, it never enters
-# the shipped or wasm32 graph.
+# Test-only: the grid's measure (`str_grid_columns`), which hosts inject as
+# `presence::Host::columns`, so the presence width law is proven on real cells.
 aterm-grapheme = { workspace = true }
+# TEST-ONLY: the built-in colour schemes, so the band's warn/error inks are
+# held to their properties on every theme aterm ships. Never in the shipped
+# or wasm32 graph.
+aterm-types = { workspace = true }
 
-# The seal on a persistent hold (`Hold::Standing`, `Hold::Ask`) has no public
-# constructor, so a HOST's fixture that needs a bare persistent row cannot write
-# one. This feature (a dev-dependency of the hosts, off in every shipped build)
-# gives them `Hold::STANDING` / `Hold::asking(..)` and lends a fixture the
-# adopted ask the engine's own tests get, so it stands exactly as it did.
+# Hosts' tests (never a shipped build): `Hold::STANDING` and `Hold::asking(..)`,
+# since a persistent hold has no public constructor.
 [features]
 test-fixtures = []
 

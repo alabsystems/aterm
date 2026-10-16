@@ -60,22 +60,14 @@ impl HashTable4KU16 {
 }
 impl HashTable for HashTable4KU16 {
     #[inline]
-    // Skip: the Box-deref null/alignment row, as `put_at` below.
-    #[cfg_attr(trust_verify, trust::skip)]
     fn get_at(&self, hash: usize) -> usize {
         // `hash < 2^16`, so `hash >> 4 < 4096`; the `%` (a mask) states that
-        // across the trait boundary.
-        self.dict[(hash >> HASHTABLE_BIT_SHIFT_4K) % HASHTABLE_SIZE_4K] as usize
+        // across the trait boundary. Function-path `Deref::deref` avoids
+        // inlining Box's raw-pointer deref into this frame.
+        let dict: &[u16; HASHTABLE_SIZE_4K] = core::ops::Deref::deref(&self.dict);
+        dict[(hash >> HASHTABLE_BIT_SHIFT_4K) % HASHTABLE_SIZE_4K] as usize
     }
     #[inline]
-    // Skip: the MIR Box-deref null/alignment assert on `self.dict` needs
-    // allocation facts from the constructor, which the verifier cannot carry
-    // across functions (still unknown on seal 321aaeda7); trusting the Box
-    // type instead would let a transmute forge the facts. `dict` is non-null
-    // and aligned by construction; this crate has no transmute. A
-    // hoisted-reborrow respelling measured net-negative (it adds a Misaligned
-    // row). Drop the skip once the verifier has cross-function Box facts.
-    #[cfg_attr(trust_verify, trust::skip)]
     fn put_at(&mut self, hash: usize, val: usize) {
         // Same `%` mask idiom as `get_at` above (identical on all real calls).
         self.dict[(hash >> HASHTABLE_BIT_SHIFT_4K) % HASHTABLE_SIZE_4K] = val as u16;
@@ -100,18 +92,39 @@ impl HashTable4K {
 }
 impl HashTable for HashTable4K {
     #[inline]
-    // Skip: same audited Box-deref assert class as the U16 twin above.
-    #[cfg_attr(trust_verify, trust::skip)]
     fn get_at(&self, hash: usize) -> usize {
         // `hash < 2^16` by construction; `% 4096` is a mask and identical on
         // all real calls (see `HashTable4KU16::get_at`).
-        self.dict[(hash >> HASHTABLE_BIT_SHIFT_4K) % HASHTABLE_SIZE_4K] as usize
+        let dict: &[u32; HASHTABLE_SIZE_4K] = core::ops::Deref::deref(&self.dict);
+        dict[(hash >> HASHTABLE_BIT_SHIFT_4K) % HASHTABLE_SIZE_4K] as usize
     }
     #[inline]
-    // Skip: same audited Box-deref assert class as the U16 twin above.
-    #[cfg_attr(trust_verify, trust::skip)]
     fn put_at(&mut self, hash: usize, val: usize) {
         // Same `%` mask idiom as `get_at` above (identical on all real calls).
         self.dict[(hash >> HASHTABLE_BIT_SHIFT_4K) % HASHTABLE_SIZE_4K] = val as u32;
+    }
+}
+
+#[cfg(clean_islands)]
+macro_rules! trust_island {
+    ($($item:item)*) => {
+        $($item)*
+    };
+}
+
+#[cfg(not(clean_islands))]
+macro_rules! trust_island {
+    ($($tt:tt)*) => {};
+}
+
+trust_island! {
+    clean {
+        namespace Lz4HashTableBounds
+
+        def tableSize4K : Nat := 4096
+
+        theorem tableSize4K_eq : tableSize4K = 4096 := rfl
+
+        end Lz4HashTableBounds
     }
 }

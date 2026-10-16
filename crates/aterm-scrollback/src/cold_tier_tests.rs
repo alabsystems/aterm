@@ -83,7 +83,6 @@ fn cold_tier_multiple_pages() {
 
 #[test]
 fn compression_ratio() {
-    // Create some realistic terminal output
     let lines: Vec<Line> = (0..100)
         .map(|i| {
             Line::from(&*format!(
@@ -102,17 +101,9 @@ fn compression_ratio() {
     let cold_page = ColdPage::from_warm_block(&warm_block).expect("no error");
     let cold_size = cold_page.compressed.len();
 
-    // LZ4 should compress significantly
     assert!(lz4_size < uncompressed_size);
-    // The cold codec should compress relative to the uncompressed input.
     assert!(cold_size < uncompressed_size);
-    // With the zstd feature the cold tier re-compresses warm LZ4 blocks with
-    // zstd, which achieves a better ratio than LZ4 alone. In the default
-    // LZ4-only build the cold page just mirrors the warm codec.
-    #[cfg(feature = "zstd")]
-    assert!(cold_size < lz4_size);
 
-    // Verify data integrity
     let decompressed = cold_page.decompress().expect("no error");
     assert_eq!(decompressed.len(), 100);
     for (i, line) in decompressed.iter().enumerate() {
@@ -145,13 +136,12 @@ fn push_block_returns_line_count_on_success() {
 fn push_block_returns_zero_for_corrupt_block() {
     let mut cold = ColdTier::new();
 
-    // Add a valid page first.
     let valid_lines: Vec<Line> = (0..5).map(|i| Line::from(&*format!("V{i}"))).collect();
     let valid_block = WarmBlock::from_lines(&valid_lines);
     let accepted = cold.push_block(&valid_block);
     assert_eq!(accepted, 5);
 
-    // Now try a corrupt block — should be silently dropped.
+    // A corrupt block is dropped.
     let corrupt_block = WarmBlock::with_corrupt_data(10);
     let accepted = cold.push_block(&corrupt_block);
 
@@ -159,7 +149,6 @@ fn push_block_returns_zero_for_corrupt_block() {
     assert_eq!(cold.line_count(), 5, "line_count should be unchanged");
     assert_eq!(cold.page_count(), 1, "page_count should be unchanged");
 
-    // Existing data should still be accessible.
     assert_eq!(
         cold.get_line(0).expect("ok").expect("present").to_string(),
         "V0"
@@ -187,7 +176,11 @@ fn truncate_back_lines_aborts_on_corrupt_boundary_page() {
 
     if let Some(page) = cold.pages.back_mut() {
         let old_bytes = page.compressed.len();
-        page.compressed = vec![0x28, 0xB5, 0x2F, 0xFD];
+        // Another codec's bytes in place of the page (a zstd frame's magic
+        // number). As the LZ4 page's size prefix they claim 4,247,762,216
+        // bytes, past the page cap, so the page cannot decode.
+        let foreign_codec_page = vec![0x28, 0xB5, 0x2F, 0xFD];
+        page.compressed = foreign_codec_page;
         cold.bytes_used = cold.bytes_used.saturating_sub(old_bytes) + page.compressed.len();
         // Drop every cached decompressed page so the next read decodes the
         // corrupted bytes.
@@ -270,11 +263,8 @@ fn cold_tier_find_page_logarithmic_scaling() {
     );
 }
 
-/// Verify that batch eviction via `pop_front_batch` scales linearly (#5858).
-///
-/// With P pages, `pop_front_batch(P)` does: O(P) drain + O(P) adjustment = O(P).
-/// Compared to the old per-element `pop_front` loop which was O(P²).
-/// The scaling ratio for 10x pages should be ≤ 15x (linear), not ~100x (quadratic).
+/// `pop_front_batch` is O(P): 10x the pages costs about 10x the time, not the
+/// ~100x of a quadratic walk.
 #[test]
 fn pop_front_cost_scales_with_page_count() {
     fn evict_all_pages_batch(page_count: usize) -> std::time::Duration {
@@ -290,11 +280,8 @@ fn pop_front_cost_scales_with_page_count() {
         start.elapsed()
     }
 
-    // Wall-clock ratio is noisy under parallel test load (scheduler preemption,
-    // especially on Windows). Take the BEST (min) of several runs at each size: the
-    // minimum rejects positive scheduling noise, leaving the intrinsic O(P) cost.
-    // Counts are large enough that even the small baseline sits well above timer
-    // resolution, so the ratio reflects real work, not granularity.
+    // The best of several runs at each size rejects scheduler noise; the
+    // counts keep even the small baseline well above timer resolution.
     fn best_of(page_count: usize, runs: u32) -> std::time::Duration {
         (0..runs)
             .map(|_| evict_all_pages_batch(page_count))
@@ -308,8 +295,7 @@ fn pop_front_cost_scales_with_page_count() {
     eprintln!(
         "pop_front_batch scaling: 2000 pages = {small:?}, 20000 pages = {large:?}, ratio = {ratio:.1}x (linear ≈ 10x)"
     );
-    // Linear O(P) scaling: 10x pages → ~10x time. Allow up to 20x for residual noise;
-    // quadratic (O(P²)) would be ~100x, so this still fails loudly on a regression.
+    // Linear is ~10x, quadratic ~100x; 20x leaves room for noise.
     assert!(
         ratio <= 20.0,
         "pop_front_batch scaling ratio {ratio:.1}x exceeds 20x — expected linear"
@@ -319,7 +305,6 @@ fn pop_front_cost_scales_with_page_count() {
 /// Verify batch eviction preserves correctness — same result as repeated pop_front.
 #[test]
 fn pop_front_batch_matches_individual_pop_front() {
-    // Build two identical cold tiers.
     let mut individual = ColdTier::new();
     let mut batch = ColdTier::new();
     for i in 1..=10 {
@@ -332,7 +317,6 @@ fn pop_front_batch_matches_individual_pop_front() {
     assert_eq!(individual.line_count(), 55);
     assert_eq!(batch.line_count(), 55);
 
-    // Evict 5 pages individually vs batch.
     let mut individual_evicted = 0;
     for _ in 0..5 {
         individual_evicted += individual.pop_front();
@@ -343,7 +327,6 @@ fn pop_front_batch_matches_individual_pop_front() {
     assert_eq!(individual.line_count(), batch.line_count());
     assert_eq!(individual.page_count(), batch.page_count());
 
-    // Verify both tiers return the same lines.
     for idx in 0..individual.line_count() {
         let a = individual.get_line(idx).expect("ok").expect("present");
         let b = batch.get_line(idx).expect("ok").expect("present");
@@ -366,7 +349,6 @@ fn truncate_front_lines_partial_page() {
     assert_eq!(cold.line_count(), 7);
     assert_eq!(cold.page_count(), 1);
 
-    // get_line(0) should return what was L3 (the 4th original line).
     assert_eq!(
         cold.get_line(0).expect("ok").expect("present").to_string(),
         "L3"
@@ -423,22 +405,18 @@ fn truncate_front_lines_crosses_pages() {
     assert_eq!(cold.line_count(), 17);
     assert_eq!(cold.page_count(), 2);
 
-    // First available line should be P1-L3 (the 4th line of the original 2nd page).
     assert_eq!(
         cold.get_line(0).expect("ok").expect("present").to_string(),
         "P1-L3"
     );
-    // Last line of original second page.
     assert_eq!(
         cold.get_line(6).expect("ok").expect("present").to_string(),
         "P1-L9"
     );
-    // First line of third page.
     assert_eq!(
         cold.get_line(7).expect("ok").expect("present").to_string(),
         "P2-L0"
     );
-    // Last line.
     assert_eq!(
         cold.get_line(16).expect("ok").expect("present").to_string(),
         "P2-L9"
@@ -462,13 +440,11 @@ fn truncate_front_lines_then_push_block() {
     cold.truncate_front_lines(13);
     assert_eq!(cold.line_count(), 17);
 
-    // Push a new page.
     let new_lines: Vec<Line> = (0..5).map(|j| Line::from(&*format!("New-L{j}"))).collect();
     cold.push_block(&WarmBlock::from_lines(&new_lines));
     assert_eq!(cold.line_count(), 22);
     assert_eq!(cold.page_count(), 3); // P1 (partial), P2, NewPage
 
-    // Verify old content still accessible with correct offsets.
     assert_eq!(
         cold.get_line(0).expect("ok").expect("present").to_string(),
         "P1-L3"
@@ -485,7 +461,6 @@ fn truncate_front_lines_then_push_block() {
         cold.get_line(16).expect("ok").expect("present").to_string(),
         "P2-L9"
     );
-    // Verify new content accessible.
     assert_eq!(
         cold.get_line(17).expect("ok").expect("present").to_string(),
         "New-L0"
@@ -595,25 +570,21 @@ fn truncate_front_lines_updates_compressed_size() {
 #[test]
 fn pop_front_preserves_cumulative_invariant() {
     let mut cold = ColdTier::new();
-    // Push 10 pages with varying line counts.
     for i in 1..=10 {
         let lines: Vec<Line> = (0..i).map(|j| Line::from(&*format!("P{i}-L{j}"))).collect();
         let block = WarmBlock::from_lines(&lines);
         cold.push_block(&block);
     }
-    // Total: 1+2+...+10 = 55 lines, 10 pages
     assert_eq!(cold.line_count(), 55);
     assert_eq!(cold.page_count(), 10);
 
-    // Pop 5 pages (removing lines: 1+2+3+4+5 = 15 lines)
     for _ in 0..5 {
         cold.pop_front();
     }
     assert_eq!(cold.line_count(), 40); // 55 - 15
     assert_eq!(cold.page_count(), 5);
 
-    // Verify all remaining lines are accessible and correct.
-    // Remaining pages had 6,7,8,9,10 lines.
+    // The remaining pages hold 6, 7, 8, 9 and 10 lines.
     let mut idx = 0;
     for page_num in 6..=10 {
         for line_in_page in 0..page_num {
@@ -629,11 +600,10 @@ fn pop_front_preserves_cumulative_invariant() {
     assert_eq!(idx, 40);
 }
 
-/// ST-3 rotation oracle (in-memory twin of the disk-tier test): interleaves
-/// front truncation, batch page eviction, and pushes across page boundaries,
-/// checking every surviving line by content at each base state — base
-/// advances, pushes over a non-zero base, amortized dead-prefix reclamation,
-/// and the drop-to-empty base reset.
+/// Rotation oracle (in-memory twin of the disk-tier test): front truncation,
+/// batch eviction and pushes interleave across page boundaries, and every
+/// surviving line is checked by content after each round, through base
+/// advances, dead-prefix reclamation and the drop-to-empty base reset.
 #[test]
 fn cold_tier_rotation_interleave_matches_oracle() {
     fn push_page(

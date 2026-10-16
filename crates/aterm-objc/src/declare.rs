@@ -18,10 +18,8 @@
 //! * Superclass sends through [`crate::msg_super`] and
 //!   [`ObjcSuper`](crate::ObjcSuper).
 //!
-//! Ivars are dropped on whatever thread performs the last release (`S3` in the
-//! crate docs): nothing in the runtime ties the final `release` to the creating
-//! thread, so a Rust destructor can run on a foreign thread with no `Send`
-//! bound. Instantiation is gated by [`MainThread`]; the release end is not.
+//! Ivars drop on whatever thread performs the last release (`S3` in the crate
+//! docs). Instantiation is gated by [`MainThread`]; the release end is not.
 
 use std::ffi::{CStr, CString, c_void};
 use std::mem::MaybeUninit;
@@ -45,9 +43,7 @@ pub const IVAR_NAME: &CStr = c"_atermIvars";
 ///
 /// A witness, not a capability: it records that the question was asked. It is
 /// `!Send`/`!Sync`, so it cannot be carried off the main thread. [`Self::new`]
-/// asks `+[NSThread isMainThread]` at run time (the question AppKit itself
-/// asks); `pthread_main_np` would be faster, but most of the cost is the
-/// uncached `objc_getClass` (see [`crate::class`]).
+/// asks `+[NSThread isMainThread]`, the question AppKit itself asks.
 ///
 /// Class registration is not gated: `objc_allocateClassPair` and
 /// `objc_registerClassPair` are thread-safe, run no Rust destructor and produce
@@ -64,15 +60,26 @@ impl MainThread {
     /// `None` as "do nothing".
     #[must_use]
     pub fn new() -> Option<Self> {
+        static NS_THREAD_CLS: std::sync::atomic::AtomicPtr<c_void> =
+            std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+        let cls = {
+            let p = NS_THREAD_CLS.load(std::sync::atomic::Ordering::Relaxed);
+            if !p.is_null() {
+                Id::from_ptr(p)
+            } else {
+                let id = crate::runtime::class(c"NSThread").as_id();
+                if !id.is_null() {
+                    NS_THREAD_CLS.store(id.as_ptr(), std::sync::atomic::Ordering::Relaxed);
+                }
+                id
+            }
+        };
         // SAFETY: `+[NSThread isMainThread]` is a side-effect-free `BOOL` class
         // query on an always-linked Foundation class, cast as `-(BOOL)(id, SEL)`.
         let is_main = unsafe {
             let f: unsafe extern "C-unwind" fn(Id, Sel) -> crate::encode::Bool =
                 crate::runtime::msg();
-            f(
-                crate::runtime::class(c"NSThread").as_id(),
-                crate::sel!(isMainThread),
-            )
+            f(cls, crate::sel!(isMainThread))
         };
         is_main.as_bool().then(Self::mint)
     }
@@ -477,5 +484,9 @@ pub fn abort_on_unwind(method: &str) -> ! {
     let _ = err.write_all(method.as_bytes());
     let _ = err.write_all(b"`; aborting\n");
     let _ = err.flush();
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "unwinding into an Objective-C frame is undefined behaviour: a real crash, not a stand-in"
+    )]
     std::process::abort()
 }

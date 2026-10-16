@@ -1,0 +1,6 @@
+# codex-cli 0.163.0 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (144x50, aterm 0.105.0) running the real Codex, launched by path with a scratch `CODEX_HOME`, a composed fake ChatGPT `auth.json` (user@example.com) and the lab provider `base_url=http://127.0.0.1:<port>/v1` with `requires_openai_auth` (a local stub of the Responses API, crates/aterm-lab) · a composed fake ChatGPT login; `/logout` and Enter: the revoke goes to the stub (CODEX_REVOKE_TOKEN_URL_OVERRIDE), auth.json is removed, Codex exits to the shell
+Token usage: total=15,674 input=15,662 output=12
+To continue this session, run:
+  codex resume 01a145ee-623a-78b2-8414-274d78d9292e
+Or run codex resume and select lab stub.
+lab$

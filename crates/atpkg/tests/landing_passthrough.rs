@@ -1,21 +1,25 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! NO LANDING WAIT (`docs/DESIGN-atpkg-vendor-direct-updates-2026-09-22.md` Phase 2), at
-//! the REAL process edge: the dev `atpkg` binary over a temp prefix.
+//! No landing wait (`docs/DESIGN-atpkg-vendor-direct-updates-2026-09-22.md` Phase 2), at
+//! the real process edge: the dev `atpkg` binary over a temp prefix.
 //!
 //! * `__landing` — the hidden verb a twin laid by an older client still execs while a
-//!   landing marker stands — runs `bin/<program>` at ONCE and prints nothing, with a marker
-//!   naming a LIVE writer (this test process) and the shim still on the old build.
-//! * The same, reached the way it is reached in the field: an older twin's own bytes (the
-//!   self-update block, then the landing prelude) run in `/bin/sh` with the marker standing.
+//!   landing marker stands — runs `bin/<program>` at once and prints nothing, with a marker
+//!   naming a live writer (this test process) and the shim still on the old build.
+//! * The same, reached as in the field: an older twin's own bytes (the self-update block,
+//!   then the landing prelude) run in `/bin/sh` with the marker standing.
 //! * Every pass sweeps `landing/`: a mutating verb (`gc`, the one that needs no network)
 //!   leaves no marker behind, whoever wrote it.
 //!
-//! NEVER THE REAL STORE: `HOME` is a temp directory and `XDG_CONFIG_HOME` an absent one, so
+//! Never the real store: `HOME` is a temp directory and `XDG_CONFIG_HOME` an absent one, so
 //! the default prefix lands under that temp `HOME`; the registry is a local directory.
 
 #![cfg(unix)]
+#![allow(
+    clippy::disallowed_types,
+    reason = "test code: a stand-in child may inherit descriptors"
+)]
 
 use std::ffi::OsString;
 use std::os::unix::fs::PermissionsExt as _;
@@ -80,11 +84,11 @@ impl Fixture {
         exe
     }
 
-    /// A landing marker naming a LIVE writer and a build the shim does not run — the
+    /// A landing marker naming a live writer and a build the shim does not run — the
     /// state the retired verb waited out.
     fn stand_marker(&self) -> PathBuf {
         let layout = self.layout();
-        let marker = layout.landing_marker(&atpkg::store::ToolName::new("claude").unwrap());
+        let marker = layout.landing_dir().join("claude");
         std::fs::create_dir_all(layout.landing_dir()).unwrap();
         std::fs::write(
             &marker,
@@ -143,10 +147,10 @@ fn the_landing_verb_execs_the_bin_shim_at_once_and_prints_nothing() {
     assert!(marker.exists(), "the verb reads no marker and removes none");
 }
 
-/// AN OLDER TWIN, AS IT RUNS IN THE FIELD: the bytes an older client laid in
+/// An older twin as it runs in the field: the bytes an older client laid in
 /// `agents/claude` — the self-update block, then the landing prelude — run in `/bin/sh`
-/// with the marker standing and this dev binary as the embedded atpkg.
-/// A non-verb takes the hand-over and the store build runs at once, silently.
+/// with the marker standing and this dev binary as the embedded atpkg. A non-verb takes
+/// the hand-over and the store build runs at once, silently.
 #[test]
 fn an_older_twin_under_a_standing_marker_runs_the_tool_at_once() {
     let fx = Fixture::new("twin");
@@ -182,7 +186,7 @@ fn an_older_twin_under_a_standing_marker_runs_the_tool_at_once() {
     assert_eq!(text(&out.stderr), "", "nothing printed");
 }
 
-/// EVERY PASS SWEEPS `landing/`: a mutating verb takes the store lock and removes the
+/// Every pass sweeps `landing/`: a mutating verb takes the store lock and removes the
 /// directory — a live writer's marker in the old format and garbage alike, since no pass
 /// of this client writes one and the lock holder is the only pass.
 #[test]

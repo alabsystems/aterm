@@ -1,53 +1,30 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//! Windows 11 **default-terminal (DefTerm) handoff** — registration surface.
+//! Windows 11 default-terminal (DefTerm) handoff: registration.
 //!
-//! The marquee Windows integration: when aterm is the default terminal, a
-//! double-clicked `.bat`, `Win+R cmd`, or an installer's console window opens
-//! *in aterm* instead of conhost. Windows implements this by letting a terminal
-//! register two CLSIDs; when a console program starts, conhost creates the
-//! pseudoconsole and hands the far ends to that terminal over COM
-//! (`ITerminalHandoff*::EstablishPtyHandoff`), which then adopts them —
-//! `aterm_pty::adopt_handoff` is the receiving half and is fully built.
+//! When aterm is the default terminal, a console program (a double-clicked `.bat`,
+//! `Win+R cmd`) opens in aterm instead of conhost: conhost creates the pseudoconsole
+//! and hands its far ends over COM (`ITerminalHandoff*::EstablishPtyHandoff`) to the
+//! registered terminal, whose receiving half is `aterm_pty::adopt_handoff`.
 //!
-//! **This module registers NOTHING today, by design.** See
-//! [`handoff_server_available`] for the one blocker and the field evidence
-//! behind it. Everything here is the verified, reviewed registration path
-//! waiting on that gate, plus the always-available *removal* path.
+//! This module registers nothing: registration is gated on
+//! [`handoff_server_available`], which is false. Removal is always available.
 //!
-//! # Field study (this machine, 2026-08; all values MACHINE-VERIFIED)
+//! # The key
 //!
-//! The design doc said to verify the literal key name against a live conhost
-//! before shipping, because a wrong key silently disables handoff. Done:
+//! * `HKCU\Console\%%Startup` exists on stock Windows 11 with no values ("Let Windows
+//!   decide"). `%%Startup`, `DelegationConsole` and `DelegationTerminal` appear
+//!   verbatim in `conhost.exe`; the doubled `%` is two literal percent signs.
+//! * Values are `REG_SZ` CLSIDs in braced registry form. Windows Terminal writes
+//!   `DelegationConsole = {2EACA947-7F5F-4CFA-BA87-8F7FBEEFBE69}` (its
+//!   `OpenConsole.exe`) and `DelegationTerminal = {E12CFF52-A866-4C77-9A90-F570A7AA2C6B}`.
 //!
-//! * `HKCU\Console\%%Startup` — the key exists on a stock Windows 11 26200 with
-//!   zero values (the "Let Windows decide" default). The literal string
-//!   `%%Startup`, and the value names `DelegationConsole` / `DelegationTerminal`,
-//!   all appear verbatim in `C:\Windows\System32\conhost.exe`, alongside the
-//!   telemetry names `SrvInit_FoundDelegationConsole` /
-//!   `SrvInit_FoundDelegationTerminal` and the source path
-//!   `...\propslib\delegationconfig.cpp` that reads them. The doubled `%%` is
-//!   NOT an escape — it is two literal percent signs in the key name.
-//! * Values are `REG_SZ` CLSIDs in braced registry form.
+//! # Per-user and reversible
 //!
-//! Windows Terminal 1.24.11911.0's own values, read out of its AppxManifest:
-//! `DelegationConsole = {2EACA947-7F5F-4CFA-BA87-8F7FBEEFBE69}` (its
-//! `OpenConsole.exe`) and `DelegationTerminal =
-//! {E12CFF52-A866-4C77-9A90-F570A7AA2C6B}` (its `WindowsTerminal.exe`).
-//!
-//! # Why this is per-user and reversible
-//!
-//! Everything written lives under `HKCU`, needs no admin, and
-//! [`unset_default_terminal`] removes it in every build — including when the exe
-//! that wrote it is already gone. That is the whole reason the removal path is
-//! never gated on [`handoff_server_available`]: a dangling delegation CLSID is
-//! the one failure mode that could stop consoles from opening at all, so getting
-//! OUT must always work even when getting IN cannot.
-//!
-//! Removal is ungated but NOT unconditional: it removes **aterm's**
-//! registration only. The delegation values are a shared, machine-wide console
-//! setting normally owned by another terminal, and clobbering a third party's
-//! configuration is not an escape hatch — see [`unset_default_terminal`].
+//! Everything lives under `HKCU` and needs no admin. [`unset_default_terminal`] is
+//! never gated, because a dangling delegation CLSID can stop consoles from opening,
+//! but it removes only aterm's registration: the values are usually another
+//! terminal's.
 
 #![cfg(windows)]
 
@@ -82,72 +59,48 @@ unsafe extern "system" {
     fn RegDeleteValueW(hkey: Hkey, name: *const u16) -> i32;
 }
 
-/// The delegation key, exactly as conhost spells it. The doubled `%` is
-/// LITERAL — see the module docs. Written as a raw string so no layer of
-/// escaping can quietly halve it.
+/// The delegation key, exactly as conhost spells it: the doubled `%` is literal,
+/// and a raw string keeps any escaping layer from halving it.
 pub(crate) const STARTUP_KEY: &str = r"Console\%%Startup";
-/// Value naming the console HOST implementation to delegate to.
+/// Value naming the console host to delegate to.
 pub(crate) const VALUE_CONSOLE: &str = "DelegationConsole";
-/// Value naming the TERMINAL implementation to delegate to.
+/// Value naming the terminal to delegate to.
 pub(crate) const VALUE_TERMINAL: &str = "DelegationTerminal";
 
-/// aterm's terminal-side CLSID — the class conhost would `CoCreateInstance` and
-/// call `EstablishPtyHandoff` on. Freshly minted for aterm and STABLE from here
-/// on: it is written into a user's registry, so changing it later would orphan
-/// every machine that registered the old one.
+/// aterm's terminal-side CLSID: the class conhost would `CoCreateInstance` and call
+/// `EstablishPtyHandoff` on. Stable forever: changing it would orphan every
+/// registry that holds it.
 pub(crate) const CLSID_ATERM_TERMINAL: &str = "{02E7D4D8-6B51-4BB2-84CE-5949B78B2308}";
 
-/// aterm's console-host CLSID slot.
+/// aterm's console-host CLSID slot. Nothing writes it.
 ///
-/// **Deliberately unused, and the second blocker after the proxy/stub.**
-/// `DelegationConsole` names the console HOST, not the terminal: Windows
-/// Terminal points it at the `OpenConsole.exe` it ships. aterm ships no console
-/// host today (that is the separate §5.4 "own the console host" work), so the
-/// correct value here is either aterm's own sideloaded OpenConsole once that
-/// lands, or the inbox host's well-known CLSID. **Which of those, and the inbox
-/// host's literal GUID, are NOT established** — and a wrong CLSID in this value
-/// is precisely the failure that stops consoles from opening. So this constant
-/// exists to name the hole rather than to fill it: nothing WRITES it. It is read
-/// only by [`delegation_owner`], to recognize our own half-state if a future
-/// wave ever does write it.
+/// `DelegationConsole` names the console host, not the terminal (Windows Terminal
+/// points it at its `OpenConsole.exe`). aterm ships no console host, and whether
+/// this slot should name an aterm-shipped OpenConsole or the inbox host (whose GUID
+/// is not established) is open; a wrong CLSID here stops consoles from opening.
+/// Read only by [`delegation_owner`], to recognize aterm's own half-state.
 pub(crate) const CLSID_ATERM_CONSOLE: &str = "{17A55D2B-8FC4-4990-8805-617293BD5A4D}";
 
-/// Is a COM handoff server actually able to answer `EstablishPtyHandoff`?
+/// Is a COM handoff server able to answer `EstablishPtyHandoff`? Always `false`,
+/// which keeps this module inert: writing the delegation CLSIDs while nothing
+/// answers would hand every new console to a class that cannot be created, so no
+/// flag may reach that state.
 ///
-/// **`false`, and honestly so.** Registration is gated on this and there is no
-/// build configuration that flips it yet, which is what keeps this whole module
-/// inert. Writing the delegation CLSIDs while nothing answers would not merely
-/// fail to work — conhost would hand every new console to a class that cannot
-/// be created, which is the "consoles stop opening" outcome. Opt-in or not, that
-/// is not a state a user can be allowed to reach by typing a flag.
-///
-/// The blocker is NOT the vtable. That was established from the shipping
-/// `OpenConsoleProxy.dll` (see `docs/NATIVE_WINDOWS_DESIGN.md` §5). It is
-/// MARSHALLING: `EstablishPtyHandoff` is a cross-process call whose parameters
-/// are `system_handle`s, so the IIDs need a registered proxy/stub. On this
-/// machine none of the five handoff IIDs, and neither of Windows Terminal's two
-/// delegation CLSIDs, appear anywhere in `HKCR\Interface` or `HKCR\CLSID` —
-/// they resolve only through the PACKAGED-COM catalog its MSIX identity
-/// provides. An unpackaged `aterm.exe` therefore cannot borrow WT's proxy and
-/// has none of its own; supplying one means shipping a MIDL-generated
-/// proxy/stub DLL (or acquiring MSIX identity), which is its own project.
-///
-/// Until then the receiving half — `aterm_pty::adopt_handoff` and the
-/// signal-pipe resize — is built, tested and waiting. The STA broker thread
-/// that would pump the class factory's apartment was deleted on 2026-09-25 with
-/// no caller; it is written together with the server that needs it.
+/// The blocker is marshalling, not the vtable (`docs/NATIVE_WINDOWS_DESIGN.md` §5):
+/// `EstablishPtyHandoff` is cross-process with `system_handle` parameters, so its
+/// IIDs need a registered proxy/stub. Windows Terminal's resolve only through its
+/// MSIX identity's packaged-COM catalog (none appear in `HKCR\Interface` or
+/// `HKCR\CLSID`), so an unpackaged `aterm.exe` needs its own MIDL-generated
+/// proxy/stub DLL or MSIX identity. The receiving half (`aterm_pty::adopt_handoff`
+/// and the signal-pipe resize) is built; the STA broker thread for the class
+/// factory's apartment is written together with the server.
 #[must_use]
 pub(crate) fn handoff_server_available() -> bool {
     false
 }
 
-/// Open a delegation key for reading. `Ok(None)` = the key does not exist
-/// (a clean machine that has never chosen a terminal).
-///
-/// Takes the subkey so the tests can drive the whole read/ownership/remove
-/// pipeline against a SCRATCH key instead of the live console settings — the
-/// ownership guard below is the one thing in this crate that must never be
-/// tested by writing `HKCU\Console\%%Startup`.
+/// Open a delegation key for reading; `Ok(None)` when the key does not exist. Takes the
+/// subkey so tests drive the read/remove path against a scratch key, never the live one.
 fn open_startup_read_at(subkey: &str) -> io::Result<Option<Hkey>> {
     let sub = wide(subkey);
     let mut hk: Hkey = 0;
@@ -202,9 +155,8 @@ fn read_string(hk: Hkey, name: &str) -> Option<String> {
     Some(s.trim_end_matches('\0').to_string())
 }
 
-/// The current delegation pair: `(DelegationConsole, DelegationTerminal)`.
-/// `None` for a value that is absent or not a string — which is the stock state
-/// and means "Windows decides" (i.e. conhost).
+/// The current delegation pair: `(DelegationConsole, DelegationTerminal)`. `None` for a
+/// value that is absent or not a string: the stock state, "Windows decides" (conhost).
 pub(crate) fn current_delegation() -> io::Result<(Option<String>, Option<String>)> {
     current_delegation_at(STARTUP_KEY)
 }
@@ -229,10 +181,8 @@ pub(crate) fn is_aterm_default(terminal: Option<&str>) -> bool {
     terminal.is_some_and(|t| t.eq_ignore_ascii_case(CLSID_ATERM_TERMINAL))
 }
 
-/// Who the delegation values belong to. The whole point of naming this is that
-/// [`unset_default_terminal`] must never touch a registration it did not write:
-/// `HKCU\Console\%%Startup` is a SHARED, machine-wide console setting, and the
-/// app that owns it right now is usually somebody else.
+/// Who the delegation values belong to: [`unset_default_terminal`] never touches a
+/// registration aterm did not write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DelegationOwner {
     /// Neither value names a terminal — the stock "Let Windows decide" state.
@@ -243,14 +193,12 @@ pub(crate) enum DelegationOwner {
     Other,
 }
 
-/// Classify a delegation pair. PURE, so the guard that protects a third party's
-/// setting is decided by a function with no registry in it.
+/// Classify a delegation pair. Pure, so the guard that protects a third party's
+/// setting has no registry in it.
 ///
-/// `DelegationTerminal` is the deciding value — it names the terminal, and it
-/// is the only one [`set_default_terminal`] writes. A pair whose terminal slot
-/// is empty but whose console slot is aterm's is still ours (the half-state a
-/// future console-host wave could produce); anything else with a value in it
-/// belongs to someone else.
+/// `DelegationTerminal` decides: it names the terminal and is the only value
+/// [`set_default_terminal`] writes. An empty terminal slot with aterm's console
+/// CLSID is still aterm's (a possible half-state); any other value is someone else's.
 #[must_use]
 pub(crate) fn delegation_owner(console: Option<&str>, terminal: Option<&str>) -> DelegationOwner {
     if is_aterm_default(terminal) {
@@ -264,17 +212,15 @@ pub(crate) fn delegation_owner(console: Option<&str>, terminal: Option<&str>) ->
     }
 }
 
-/// What [`unset_default_terminal`] actually did — so the CLI can say something
-/// TRUE. The old `bool` could not distinguish "removed aterm's registration"
-/// from "deleted whatever was there", which is exactly how the CLI came to
-/// report a foreign terminal's removal as its own.
+/// What [`unset_default_terminal`] did, so the CLI can tell removing aterm's
+/// registration from finding another terminal's.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum UnsetOutcome {
     /// Nothing was registered; nothing was written.
     NothingRegistered,
     /// aterm's registration was removed.
     Removed,
-    /// Another terminal owns the delegation. **Nothing was changed.**
+    /// Another terminal owns the delegation; nothing was changed.
     NotOurs {
         console: Option<String>,
         terminal: Option<String>,
@@ -284,9 +230,8 @@ pub(crate) enum UnsetOutcome {
 /// Register aterm as the default terminal.
 ///
 /// # Errors
-/// `Unsupported` while [`handoff_server_available`] is false — which is always,
-/// today. The gate is checked FIRST, before any key is created, so a refusal
-/// leaves the registry byte-for-byte untouched.
+/// `Unsupported` while [`handoff_server_available`] is false, checked before any key
+/// is created so a refusal leaves the registry untouched.
 pub(crate) fn set_default_terminal() -> io::Result<()> {
     if !handoff_server_available() {
         return Err(io::Error::new(
@@ -296,13 +241,9 @@ pub(crate) fn set_default_terminal() -> io::Result<()> {
              console would fail to open. Refusing to write the delegation keys.",
         ));
     }
-    // Unreachable today, and DELIBERATELY INCOMPLETE: only `DelegationTerminal`
-    // is written. `DelegationConsole` is the second blocker (see
-    // `CLSID_ATERM_CONSOLE` — aterm ships no console host and the inbox host's
-    // CLSID is not established), so flipping `handoff_server_available` alone
-    // would produce exactly the half-registration the module docs warn about.
-    // The gate is NOT the only thing the next wave has to flip; the console slot
-    // has to be filled in here too.
+    // Unreachable while the gate is false, and incomplete: only `DelegationTerminal`
+    // is written. `DelegationConsole` must be filled in here too before the gate
+    // flips (see `CLSID_ATERM_CONSOLE`), or this writes a half-registration.
     let sub = wide(STARTUP_KEY);
     let mut hk: Hkey = 0;
     // SAFETY: valid NUL-terminated wide subkey; `hk` written on success.
@@ -337,24 +278,16 @@ pub(crate) fn set_default_terminal() -> io::Result<()> {
     Ok(())
 }
 
-/// Remove **aterm's** delegation registration, restoring "Let Windows decide".
+/// Remove aterm's delegation registration, restoring "Let Windows decide".
 ///
-/// NEVER GATED on [`handoff_server_available`]: clearing the delegation is the
-/// escape hatch from a registration that points at a class nothing can create —
-/// the one failure mode where new consoles stop opening at all — so it must work
-/// in every build, including one whose registering exe is already gone.
+/// Never gated on [`handoff_server_available`]: it is the escape hatch from a
+/// registration that points at a class nothing can create, so it works in every
+/// build, including one whose registering exe is gone.
 ///
-/// **GUARDED ON OWNERSHIP, which is not the same thing.** `HKCU\Console\%%Startup`
-/// is Windows' own key and the values in it are usually SOMEBODY ELSE'S: a user
-/// running Windows Terminal who types `aterm-gui --unset-default-terminal` — to
-/// see what it does, or on advice — must not silently lose their setting. So a
-/// pair we did not write is left byte-for-byte alone and reported as
-/// [`UnsetOutcome::NotOurs`]; the escape hatch is unaffected, because a
-/// delegation that points at ATERM's broken CLSID is by definition ours to
-/// clear. (`uninstall.ps1` has always guarded this way; the CLI path did not.)
-///
-/// Deletes the VALUES, not the key — the key is Windows' and may hold other
-/// settings. Missing values are not an error (idempotent).
+/// Guarded on ownership: `HKCU\Console\%%Startup` usually holds another terminal's
+/// setting, so a pair aterm did not write is left untouched and reported as
+/// [`UnsetOutcome::NotOurs`] (as `uninstall.ps1` does). Deletes the values, not the
+/// key, which is Windows' and may hold other settings. Idempotent.
 pub(crate) fn unset_default_terminal() -> io::Result<UnsetOutcome> {
     unset_delegation_at(STARTUP_KEY)
 }
@@ -362,7 +295,7 @@ pub(crate) fn unset_default_terminal() -> io::Result<UnsetOutcome> {
 /// [`unset_default_terminal`], against an arbitrary subkey (see
 /// [`open_startup_read_at`] for why the seam exists).
 fn unset_delegation_at(subkey: &str) -> io::Result<UnsetOutcome> {
-    // Read FIRST, and decide before anything is opened for writing.
+    // Decide from a read before anything is opened for writing.
     let (console, terminal) = current_delegation_at(subkey)?;
     match delegation_owner(console.as_deref(), terminal.as_deref()) {
         DelegationOwner::Unregistered => return Ok(UnsetOutcome::NothingRegistered),
@@ -381,8 +314,7 @@ fn unset_delegation_at(subkey: &str) -> io::Result<UnsetOutcome> {
     if rc != 0 {
         return Err(io::Error::from_raw_os_error(rc));
     }
-    // Both values go: they are a vendor PAIR, and the terminal slot we just
-    // matched says the pair is aterm's.
+    // Both values go: they are one vendor's pair, and the terminal slot says it is aterm's.
     for v in [VALUE_TERMINAL, VALUE_CONSOLE] {
         let n = wide(v);
         // SAFETY: open key + valid NUL-terminated wide value name.
@@ -397,10 +329,8 @@ fn unset_delegation_at(subkey: &str) -> io::Result<UnsetOutcome> {
 mod tests {
     use super::*;
 
-    /// The doubled percent is LITERAL. A well-meaning "fix" to a single `%`, or
-    /// any escaping layer that halves it, silently disables handoff — the exact
-    /// failure the design doc warned about. Pinned against the string found
-    /// verbatim inside conhost.exe.
+    /// The doubled percent is literal, as found verbatim in conhost.exe; halving it
+    /// silently disables handoff.
     #[test]
     fn startup_key_keeps_its_two_literal_percent_signs() {
         assert_eq!(STARTUP_KEY, "Console\\%%Startup");
@@ -415,9 +345,7 @@ mod tests {
         assert_eq!(*w.last().expect("non-empty"), 0, "must be NUL-terminated");
     }
 
-    /// The CLSID must be registry-shaped: braced, upper-case, 8-4-4-4-12.
-    /// A malformed CLSID here is written into a user's registry and is exactly
-    /// as bad as a wrong one.
+    /// Both CLSIDs are registry-shaped: braced, upper-case, 8-4-4-4-12.
     #[test]
     fn aterm_clsid_is_well_formed_braced_uppercase() {
         for clsid in [CLSID_ATERM_TERMINAL, CLSID_ATERM_CONSOLE] {
@@ -459,11 +387,8 @@ mod tests {
         }
     }
 
-    /// THE SAFETY INVARIANT of this whole bundle: while no COM server can
-    /// answer, `set_default_terminal` must refuse — never half-register a CLSID
-    /// that makes consoles fail to open. If a future change flips
-    /// `handoff_server_available` without landing a server, this test is the
-    /// thing that fails.
+    /// While no COM server can answer, `set_default_terminal` refuses rather than
+    /// register a CLSID that makes consoles fail to open.
     #[test]
     fn registration_refuses_while_no_handoff_server_can_answer() {
         assert!(
@@ -475,8 +400,7 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::Unsupported);
     }
 
-    /// A refusal must be inert: the delegation state before and after must be
-    /// identical. Read-only against the real registry — this test never writes.
+    /// A refused registration leaves the live delegation as it was (the test only reads).
     #[test]
     fn a_refused_registration_changes_nothing() {
         let before = current_delegation().expect("reading the delegation must not fail");
@@ -502,8 +426,8 @@ mod tests {
         )));
     }
 
-    /// The ownership classifier, exhaustively — this pure function is the whole
-    /// guard that keeps `--unset-default-terminal` off another app's setting.
+    /// The ownership classifier, exhaustively: it is the whole guard that keeps
+    /// `--unset-default-terminal` off another app's setting.
     #[test]
     fn delegation_owner_classifies_the_pair() {
         let wt_terminal = "{E12CFF52-A866-4C77-9A90-F570A7AA2C6B}";
@@ -519,9 +443,9 @@ mod tests {
             // Ours even when the console slot is a stranger's: the terminal slot
             // is the deciding one and it names us.
             (Some(wt_console), Some(CLSID_ATERM_TERMINAL), Aterm),
-            // Our own half-state, if a console-host wave ever writes that slot.
+            // aterm's own half-state, should it ever write the console slot.
             (Some(CLSID_ATERM_CONSOLE), None, Aterm),
-            // THE CASE THIS EXISTS FOR: Windows Terminal is the default.
+            // Windows Terminal is the default.
             (Some(wt_console), Some(wt_terminal), Other),
             (None, Some(wt_terminal), Other),
             // A console slot we did not write, with no terminal: not ours to touch.
@@ -538,9 +462,8 @@ mod tests {
         }
     }
 
-    /// A scratch key under our own name, so the removal path can be driven end
-    /// to end without ever writing the live console settings. Deleted on drop,
-    /// including on panic.
+    /// A scratch key under our own name, so the removal path runs end to end without
+    /// writing the live console settings. Deleted on drop, including on panic.
     struct ScratchKey(String);
 
     impl ScratchKey {
@@ -592,9 +515,8 @@ mod tests {
             let sub = wide(&self.0);
             // SAFETY: valid NUL-terminated wide subkey under HKCU.
             unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, sub.as_ptr()) };
-            // Take the parent too, but only with `RegDeleteKeyW`, which FAILS
-            // when the key still has subkeys — so a sibling test's scratch key
-            // running in parallel can never be swept up with ours.
+            // Take the parent too, but only with `RegDeleteKeyW`, which fails while
+            // the key has subkeys, so a parallel test's scratch key is never swept up.
             let parent = wide("Software\\aterm-defterm-selftest");
             // SAFETY: valid NUL-terminated wide subkey under HKCU.
             unsafe { RegDeleteKeyW(HKEY_CURRENT_USER, parent.as_ptr()) };
@@ -613,12 +535,8 @@ mod tests {
         fn RegDeleteKeyW(hkey: Hkey, subkey: *const u16) -> i32;
     }
 
-    /// THE MAJOR THIS FIXES, driven end to end against a real (scratch) key:
-    /// `--unset-default-terminal` used to `RegDeleteValueW` both delegation
-    /// values with no ownership check, so a user with Windows Terminal as their
-    /// default silently lost that setting — and was told aterm's registration
-    /// had been removed. A foreign pair must now survive BYTE FOR BYTE, and only
-    /// aterm's own registration may be removed.
+    /// Against a scratch key: a foreign pair survives unset byte for byte, and only
+    /// aterm's own registration is removed.
     #[test]
     fn unset_spares_a_foreign_registration_and_removes_only_ours() {
         let wt_terminal = "{E12CFF52-A866-4C77-9A90-F570A7AA2C6B}";
@@ -648,7 +566,7 @@ mod tests {
             "a foreign registration must survive --unset-default-terminal untouched"
         );
 
-        // 3. aterm owns it. Now — and only now — both values go.
+        // 3. aterm owns it: both values go.
         key.set(VALUE_TERMINAL, CLSID_ATERM_TERMINAL);
         assert_eq!(
             unset_delegation_at(&key.0).expect("unset must not error"),
@@ -667,9 +585,8 @@ mod tests {
         );
     }
 
-    /// The removal path must never consult the availability gate: it is the
-    /// escape hatch from a delegation nothing can answer. Behavioural — the gate
-    /// is false right now, and unset still works against a live key.
+    /// The removal path never consults the availability gate: it is the escape hatch
+    /// from a delegation nothing can answer.
     #[test]
     fn unset_is_not_gated_on_the_handoff_server() {
         assert!(!handoff_server_available());
@@ -681,8 +598,7 @@ mod tests {
         );
     }
 
-    /// Reading the live key must be total: present, absent, or empty are all
-    /// answers, never an error the CLI would have to explain.
+    /// Reading the live key is total: present, absent and empty are all answers.
     #[test]
     fn current_delegation_reads_the_live_machine_without_erroring() {
         let (console, terminal) = current_delegation().expect("must not error");

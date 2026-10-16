@@ -1,26 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-0 for `NativeUpdateSpeculativeSidecar` (warm successor P5, the
-//! outgoing process's artifact diet, docs/DESIGN-warm-successor-2026-09-29.md
-//! §5): a layout sidecar written before the park reaches the successor only
-//! once the park read it back byte-equal to its own layout; a desk that moved
-//! or a file that was disturbed is discarded and rewritten; a refused
-//! speculation costs the park its old write and nothing else; every retired
-//! attempt sweeps what it wrote; and every attempt is granted or retired.
+//! Tier-0 for `NativeUpdateSpeculativeSidecar`, the outgoing process's artifact diet
+//! (docs/DESIGN-warm-successor-2026-09-29.md §5): a layout sidecar written before the park
+//! reaches the successor only once the park read it back byte-equal to its own layout; a moved
+//! desk or a disturbed file is discarded and rewritten; a refused speculation costs only the
+//! park's old write; every retired attempt sweeps what it wrote; every attempt is granted or
+//! retired.
 
 use aterm_spec::{
     derive::{native_update_speculative_sidecar_liveness, native_update_speculative_sidecar_model},
     interp, verify,
 };
-
-#[test]
-fn speculative_sidecar_proves_and_catches() {
-    verify::prove_and_catch_scalar(
-        &native_update_speculative_sidecar_model(),
-        "speculative sidecar",
-    );
-}
 
 /// Each invariant mutant with the invariant it was written for.
 const MUTANTS: [(&str, &str); 5] = [
@@ -44,9 +35,8 @@ fn only(mutant: &str) -> aterm_spec::derive::Model {
     model
 }
 
-/// Every invariant is falsified by one mutant ALONE, so none is carried by
-/// another's counterexample — and with no mutant live the `Buggy = 1` model is
-/// clean, so each catch is the mutant's.
+/// Each invariant is falsified by one mutant alone, and with no mutant live the `Buggy = 1`
+/// model is clean, so each catch is the mutant's.
 #[test]
 fn each_mutant_alone_breaks_the_invariant_it_was_written_for() {
     for (mutant, invariant) in MUTANTS {
@@ -59,9 +49,8 @@ fn each_mutant_alone_breaks_the_invariant_it_was_written_for() {
         }
     }
     assert!(interp::bmc(&only("")).is_ok());
-    // A stale speculation kept unverified is ALSO a seal of the wrong bytes:
-    // the shortest counterexample above is the unverified keep of an unmoved
-    // desk, so ask the second invariant on its own.
+    // A stale speculation kept unverified also seals the wrong bytes; the shortest counterexample
+    // above keeps an unmoved desk, so check `SealHoldsTheParksBytes` on its own.
     let mut stale = only("SealUnverified");
     stale
         .invariants
@@ -72,10 +61,8 @@ fn each_mutant_alone_breaks_the_invariant_it_was_written_for() {
     );
 }
 
-/// The three ways a park seals the sidecar, walked: kept when nothing moved,
-/// discarded and rewritten when the desk moved or the file was disturbed, and
-/// written at the park when the speculation was refused. Each ends granted
-/// with the successor reading the park's bytes.
+/// The three ways a park seals the sidecar (kept, discarded and rewritten, written at the park)
+/// each end granted with the successor reading the park's bytes.
 #[test]
 fn the_park_keeps_rewrites_or_writes_and_the_successor_reads_its_bytes() {
     let model = native_update_speculative_sidecar_model();
@@ -128,20 +115,11 @@ fn the_park_keeps_rewrites_or_writes_and_the_successor_reads_its_bytes() {
     }
 }
 
-/// Liveness: every attempt is granted or retired, under the fairness stated on
-/// `native_update_speculative_sidecar_liveness`, and a park that waits on a
-/// refused speculation is the caught mutant — interpreter and, where
-/// installed, `ty`.
+/// Liveness: every attempt is granted or retired under the stated fairness; a park that waits on
+/// a refused speculation is the caught mutant.
 #[test]
 fn every_attempt_is_granted_or_retired() {
     let model = native_update_speculative_sidecar_model();
     let live = native_update_speculative_sidecar_liveness();
-    assert!(
-        aterm_spec::xref::liveness_registry()
-            .iter()
-            .any(|(registered, obligation)| registered.name == model.name
-                && obligation.name == live.name),
-        "the artifact diet's liveness must stay enrolled"
-    );
     verify::liveness_proves_and_catches_tiered(&model, &live, "NativeUpdateSpeculativeSidecar");
 }

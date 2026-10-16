@@ -1,83 +1,66 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Pending-program stubs (R6): from the moment the lean app first launches (and
-//! immediately after adoption), EVERY default-set program name resolves on `PATH`,
-//! and running one is always helpful — never "command not found". (The EXTRAS tier and
-//! its consent stubs were retired 2026-09-24, design 2026-09-22 §5.3(c): every program
-//! the signed index names is default-set, so a stub always bumps an install that is
-//! already coming. A stub an older client laid with its extra or requires marker line
-//! is still a stub — recognition is the first marker alone — and is re-laid plain.)
+//! Pending-program stubs (R6): from the moment the app first launches, every default-set
+//! program name resolves on `PATH`, and so does every command one exposes that people and
+//! agents type (`targo` for `trust`, [`program_of`]); running one is helpful, never
+//! "command not found". Every program the signed index names is default-set, so a stub
+//! always bumps an install already coming; a stub an older client laid with an extra marker
+//! line is still a stub (recognition is the first marker alone) and is re-laid plain.
 //!
-//! A stub is a tiny `/bin/sh` file at `<prefix>/bin/<tool>` (the same seam
-//! [`crate::flow`]'s tombstone shims use — no parallel machinery) that execs
-//! `atpkg __pending <tool>`: a short honest message with the LIVE install state, plus
-//! a bump of that program to the front of the install queue — and, for a person at a
-//! terminal while a pass installs it, a wait under the progress meter that runs the
-//! program the moment it lands. It grants nothing —
-//! the authoritative roster stays the signed index — and it is replaced by the real
-//! shim the moment the program installs, atomically: `platform::install_shim`
-//! already lands via temp+`rename(2)` (see `activate.rs`), so the name resolves to
-//! SOMETHING at every instant — stub before, real shim after, no window of absence,
-//! no `EEXIST`. `prune_stale_shims` skips it (a stub resolves to no store target)
-//! and `active_builds` never counts it.
+//! A stub is a tiny `/bin/sh` file at `<prefix>/bin/<tool>` (the seam [`crate::flow`]'s
+//! tombstone shims use) that execs `atpkg __pending <tool>`: a short message with the live
+//! install state, a bump of that program to the front of the install queue, and, for a
+//! person at a terminal while a pass installs it, a wait under the progress meter that runs
+//! the program the moment it lands. It grants nothing (the signed index stays the roster),
+//! and the real shim replaces it atomically (`platform::install_shim` lands via temp +
+//! `rename(2)`), so the name always resolves. `prune_stale_shims` skips it (a stub
+//! resolves to no store target) and `active_builds` never counts it.
 //!
 //! # The fallback chain (a stub must never dangle)
 //!
-//! An embedded absolute atpkg path breaks on app relocation or self-update, and a
-//! stub that prints sh's own "not found" would violate the guarantee. So the script
+//! An embedded absolute atpkg path breaks on app relocation or self-update, so the script
 //! falls back, in order:
 //!
 //! 1. the embedded atpkg path, if it exists and is executable;
 //! 2. the first `atpkg` an absolute `PATH` entry names (the `~/.local/bin` alias / shell
 //!    hook), never a relative or empty entry's;
-//! 3. a static honest message — and exit 127.
+//! 3. a static honest message, and exit 127.
 //!
-//! The per-launch seed-pass reconcile REWRITES stubs whose bytes changed, refreshing
-//! embedded paths as a matter of course; a byte-identical stub is left alone, so a
-//! steady-state pass lays nothing.
+//! The per-launch seed-pass reconcile rewrites stubs whose bytes changed, refreshing
+//! embedded paths; a byte-identical stub is left alone.
 //!
 //! # Which atpkg a laid file names ([`Embedder`])
 //!
-//! The same rule for every file this crate lays with an atpkg path in it — these stubs, the
+//! The same rule for every file this crate lays with an atpkg path in it: these stubs, the
 //! reroute stubs ([`crate::reroute::lay`]) and the `agents/` twins' self-update block
-//! ([`crate::activate::reconcile_agents`]). The process laying it offers the `atpkg` beside
+//! ([`crate::activate::reconcile_agents`]). The laying process offers the `atpkg` beside
 //! its own executable ([`co_located_atpkg_path`]); the file may already name one. Then:
 //!
-//! * **a path that is not there is never written.** A process whose co-located `atpkg` does
-//!   not exist offers nothing. With nothing live on either side the file names none (an
-//!   empty value, which fallback 1's `[ -x ]` refuses), and the next fallback answers.
-//! * **a live path is displaced only by one that lasts at least as long** ([`Durability`]):
-//!   an app bundle outranks a plain binary, which outranks a transient copy — one in a
-//!   temporary directory, a cargo target directory, Gatekeeper's translocated copy or a
-//!   mounted disk image. A path that is gone is displaced by anything live.
+//! * a path that is not there is never written: with nothing live on either side the file
+//!   names none (an empty value, which fallback 1's `[ -x ]` refuses);
+//! * a live path is displaced only by one that lasts at least as long ([`Durability`]): an
+//!   app bundle outranks a plain binary, which outranks a transient copy (a temporary
+//!   directory, a cargo target directory, Gatekeeper's translocated copy, a mounted disk
+//!   image). A path that is gone is displaced by anything live.
 //!
-//! Measured 2026-09-25, the end-to-end run's defect D1: a copy of aterm started from a
-//! scratch directory (no `atpkg` beside it) re-laid the machine's eight reroute stubs naming
-//! `<scratch>/bin/atpkg` — never there, and deleted with the scratch directory — over stubs
-//! naming the installed app's. The same lay runs at every launch, every session spawn and
-//! every pass, so every copy of aterm, wherever it ran, re-pointed the machine's files at
-//! the `atpkg` beside it — there or not.
+//! The lay runs at every launch, session spawn and pass, so without this rule any copy of
+//! aterm, wherever it ran, would re-point the machine's files at the `atpkg` beside it.
 //!
 //! # Trust posture
 //!
-//! Stub names pass [`crate::store::shim_allowed`] by construction (they are only
-//! ever written through [`crate::store::ToolName`]) — the sensitive-name refusal
-//! applies to stubs identically. A stub is recognized by its marker line and
-//! removed only when it still carries it: a real shim, a tombstone, a dev link or
-//! any hand-made file is never touched.
+//! Stub names pass [`crate::store::shim_allowed`] by construction (they are written only
+//! through [`crate::store::ToolName`]). A stub is recognized by its marker line and removed
+//! only while it carries it: a real shim, a tombstone, a dev link or a hand-made file is
+//! never touched.
 //!
-//! # An alias is never a stub (owner decision 2026-08-27)
+//! # An alias is never a stub
 //!
-//! A stub is laid for the PLAIN program name only. The `alab-<tool>` alias
-//! ([`crate::activate::Aliases`], `crate::store::ALIAS_PREFIX`) exists to name
-//! ALab's copy unambiguously ONCE IT IS INSTALLED — beside a `trust` that Homebrew's
-//! p11-kit may shadow, `alab-trust` always runs the managed build. Before the
-//! install there is nothing to disambiguate: the plain-name stub already answers
-//! (it bumps), and a second promising name on `PATH` would double
-//! every "not found" into two courtesy scripts for one program. So the reconcile
-//! never lays `alab-*`, and `write_pending_stub` is a no-op for an alias
-//! name — the alias appears with the real shims, and only then.
+//! A stub is laid under plain names only. The `alab-<tool>` alias
+//! ([`crate::activate::Aliases`], `crate::store::ALIAS_PREFIX`) disambiguates ALab's copy
+//! once it is installed; before that the plain-name stub already answers, and a second
+//! stub would double every "not found". So the reconcile never lays `alab-*`, and
+//! `write_pending_stub` is a no-op for an alias name.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -85,7 +68,7 @@ use std::path::{Path, PathBuf};
 
 use crate::store::{Layout, ToolName};
 
-/// The compile-time default-set roster the stubs cover BEFORE the first signed index
+/// The compile-time default-set roster the stubs cover before the first signed index
 /// resolves: `(name, one authored what-it-is line)`. Names only — no versions, no
 /// URLs — so staleness is harmless: the index-resolve reconcile adds stubs for newly
 /// published names and removes ones the signed index no longer lists.
@@ -114,20 +97,26 @@ pub const DEFAULT_SET_STUB_NAMES: &[(&str, &str)] = &[
     ("ty", "ALab's specification checker"),
 ];
 
-/// THE AGENT PROGRAMS (owner decision 2026-09-10): the coding agents aterm is the
-/// version manager for. Default-set members like every program the index names (an index
-/// that still marks them `extra = true` — build 21 does — reads the same since the key
-/// was retired). What is theirs alone, each enforced where it lives:
+/// The coding agents aterm is the version manager for: default-set members like every
+/// program the index names. What is theirs alone:
 ///
-/// * their shims are ALSO laid under `<prefix>/agents/`, the one managed directory
-///   that goes FIRST on `PATH` ([`crate::activate::reconcile_agents`]), so the managed
-///   copy is what `claude`/`codex` run — the rule-1 exception recorded in
-///   docs/DESIGN-which-copy-runs-2026-08-27.md;
+/// * their shims are also laid under `<prefix>/agents/`, the one managed directory that
+///   goes first on `PATH` ([`crate::activate::reconcile_agents`]), so the managed copy is
+///   what each name runs (docs/DESIGN-which-copy-runs-2026-08-27.md);
 /// * a pass that leaves them at the index pin says so on stdout
 ///   (`crate::cli::MANAGED_CURRENT_MARKER`).
 ///
-/// Names only — the signed index pins the bytes, as for every member.
-pub const AGENT_PROGRAMS: &[&str] = &["claude", "codex"];
+/// The names of [`crate::vendor_direct::VENDORS`], the one roster, in its order.
+pub const AGENT_PROGRAMS: &[&str] = &{
+    use crate::vendor_direct::VENDORS;
+    let mut names = [""; VENDORS.len()];
+    let mut i = 0;
+    while i < names.len() {
+        names[i] = VENDORS[i].program;
+        i += 1;
+    }
+    names
+};
 
 /// Whether `name` is one of [`AGENT_PROGRAMS`].
 #[must_use]
@@ -135,30 +124,80 @@ pub fn is_agent_program(name: &str) -> bool {
     AGENT_PROGRAMS.contains(&name)
 }
 
-/// The authored what-it-is line for each agent program (the pre-index stub copy). It
-/// still names the vendor, the license, the rough size and the host the bytes come
-/// from — descriptively ("OpenAI Codex CLI", "Anthropic Claude Code"), never as ALab
-/// marks — because the pending stub prints it while the install is on its way.
-pub const AGENT_STUB_NAMES: &[(&str, &str)] = &[
-    (
-        "claude",
-        "Anthropic Claude Code — proprietary, ~200 MB, downloaded from downloads.claude.ai",
-    ),
-    (
-        "codex",
-        "OpenAI Codex CLI — Apache-2.0, ~110 MB (~290 MB on disk), downloaded from github.com/openai/codex",
-    ),
-];
-
-/// The authored one-line description for `name`, if either compiled roster carries
-/// one. A program published after this binary gets the honest generic line instead.
+/// The authored one-line description for `name`: a default-set member's from
+/// [`DEFAULT_SET_STUB_NAMES`], an agent program's from its vendor row
+/// ([`crate::vendor_direct::VendorSpec::description`]). A program published after this
+/// binary gets the honest generic line instead.
 #[must_use]
 pub fn describe(name: &str) -> Option<&'static str> {
     DEFAULT_SET_STUB_NAMES
         .iter()
-        .chain(AGENT_STUB_NAMES)
         .find(|(n, _)| *n == name)
         .map(|(_, d)| *d)
+        .or_else(|| crate::vendor_direct::spec(name).map(|s| s.description))
+}
+
+/// Every name a compiled roster covers before the first signed index resolves: the
+/// default-set members, then the agent programs.
+fn compiled_names() -> impl Iterator<Item = &'static str> {
+    DEFAULT_SET_STUB_NAMES
+        .iter()
+        .map(|(n, _)| *n)
+        .chain(AGENT_PROGRAMS.iter().copied())
+}
+
+/// The commands a pending program answers for beside its own name: the branded names
+/// people and agents type (`targo`, `trustc`, `tippy`, `trustfmt`, `trustdoc` for `trust`),
+/// from the table that maps each to its program ([`crate::reroute::TABLE`]). The agent
+/// primer says to run `targo` once `$ATPKG_BIN` is set, which the seed's shell hook does
+/// before `trust` lands, so without these stubs `targo` is "command not found" until then.
+/// A command stub reports its program's state and waits for it like the program's own
+/// ([`crate::cli`]'s `__pending`), and the program's real shim replaces it in place.
+fn commands_of(program: &str) -> impl Iterator<Item = &'static str> + '_ {
+    crate::reroute::TABLE
+        .iter()
+        .filter(move |row| crate::reroute::program_of(row) == program)
+        .map(crate::reroute::branded_of)
+        .filter(move |branded| *branded != program)
+}
+
+/// The program a pending stub named `name` reports on and waits for: the program whose
+/// install lays `name` ([`commands_of`]), or `name` itself.
+#[must_use]
+pub fn program_of(name: &str) -> &str {
+    match crate::reroute::TABLE
+        .iter()
+        .find(|row| crate::reroute::branded_of(row) == name)
+    {
+        Some(row) => crate::reroute::program_of(row),
+        None => name,
+    }
+}
+
+/// The stubs for `program`'s commands ([`commands_of`]) in `bin/`, rendered, each only
+/// where [`pending_stub_executable`] would lay one; `keep` gains every command name whose
+/// slot is the program's to answer for — laid now, or already standing.
+fn command_stub_executables(
+    layout: &Layout,
+    program: &str,
+    keep: &mut BTreeSet<&str>,
+    files: &mut Vec<crate::lay::Executable>,
+) {
+    for command in commands_of(program) {
+        let Some(tool) = ToolName::new(command) else {
+            continue;
+        };
+        match pending_stub_executable(layout, &tool) {
+            Ok(Some(file)) => {
+                files.push(file);
+                keep.insert(command);
+            }
+            Ok(None) => {
+                keep.insert(command);
+            }
+            Err(_) => {}
+        }
+    }
 }
 
 /// The marker line that identifies a pending stub — the recognition gate for every
@@ -240,13 +279,12 @@ fn stub_named_atpkg(body: &str) -> Option<PathBuf> {
 }
 
 /// The stub script body for `tool`, naming `atpkg` as the fallback-1 path, or none
-/// ([`Embedder::embed`] decides which). Pure, so the shape is pinned by tests.
+/// ([`Embedder::embed`] decides). Pure.
 ///
-/// NOTE the `exec "$ATPKG"` spelling: `platform::parse_sh_shim_target` recognizes
-/// real shims by a trimmed line starting `exec '`, so the stub deliberately execs
-/// through a variable — a stub must resolve as NO store target (`resolve_shim` ⇒
-/// `None`), or `active_builds`/`which`/the front door would mistake it for an
-/// installed tool.
+/// The stub execs through a variable (`exec "$ATPKG"`) because
+/// `platform::parse_sh_shim_target` recognizes real shims by a line starting `exec '`: a
+/// stub must resolve as no store target, or `active_builds`/`which`/the front door would
+/// take it for an installed tool.
 #[must_use]
 fn stub_content(tool: &ToolName, atpkg: Option<&Path>) -> String {
     let atpkg = named(atpkg);
@@ -257,7 +295,7 @@ fn stub_content(tool: &ToolName, atpkg: Option<&Path>) -> String {
     }
 }
 
-/// How a renderer is told to name no atpkg: the EMPTY path. The `/bin/sh` bodies render it
+/// How a renderer is told to name no atpkg: the empty path. The `/bin/sh` bodies render it
 /// `ATPKG=''` / `__atpkg=''`, a value every body's `[ -x ]` refuses, so the body goes
 /// straight to its next fallback; the batch body leaves its `if exist` block out.
 #[must_use]
@@ -275,15 +313,14 @@ fn stub_content_sh(tool: &ToolName, atpkg: &Path) -> String {
     s.push('\n');
     s.push_str("# Replaced by the real shim when the program installs.\nATPKG=");
     s.push_str(&sh_single_quote(&atpkg.to_string_lossy()));
-    // The caller's arguments ride along (`"$@"`, 2026-09-15): an agent program's stub
-    // execs the user's own copy meanwhile ([`crate::cli::pending_passthrough`]), and
-    // `claude -p 'x'` typed during the install must reach it whole.
+    // The caller's arguments ride along: an agent program's stub execs the user's own copy
+    // meanwhile ([`crate::cli::pending_passthrough`]), and `claude -p 'x'` must reach it
+    // whole.
     s.push_str("\nif [ -x \"$ATPKG\" ]; then\n  exec \"$ATPKG\" __pending ");
     s.push_str(&name);
     s.push_str(" \"$@\"\nfi\n");
-    // The first atpkg an ABSOLUTE PATH entry names, by the reroute stub's own walk: the
-    // shell's `command -v atpkg` honoured a relative or empty entry, so with no live
-    // embedded atpkg the stub ran the current directory's `./atpkg` (2026-10-01 review).
+    // The first atpkg an absolute PATH entry names, by the reroute stub's own walk
+    // (`command -v` would honour a relative or empty entry and run `./atpkg`).
     s.push_str(&crate::reroute::sh_path_walk(
         "",
         "atpkg",
@@ -296,38 +333,27 @@ fn stub_content_sh(tool: &ToolName, atpkg: &Path) -> String {
     s
 }
 
-/// The first line of the batch stub's body, `@echo off` and its CRLF: 11 bytes. The
-/// tightest case of the frame's head argument: `cmd` resumes a rewritten batch file only
-/// after a line end of the OLD file, and the only old line end that can fall inside the
-/// head ([`crate::platform::CMD_FRAME_HEAD`], 13 bytes) is the FIRST line's (every later
-/// end is further along) — a pre-frame stub's ends exactly on the head's own CRLF, byte
-/// 11, which reads as an empty line; a byte shorter would end on `n` of `:main` and run
-/// the body again. Pinned at compile time below and by the stub's resume simulation.
+/// The first line of the batch stub's body, `@echo off` and its CRLF: 11 bytes. `cmd`
+/// resumes a rewritten batch file only after a line end of the old file, and the only old
+/// line end that can fall inside the frame head ([`crate::platform::CMD_FRAME_HEAD`], 13
+/// bytes) is the first line's: a pre-frame stub's ends on the head's own CRLF, byte 11,
+/// which reads as an empty line; a byte shorter would end on `n` of `:main` and run the
+/// body again. Pinned at compile time below and by the stub's resume simulation.
 const CMD_STUB_FIRST_LINE: &str = "@echo off\r\n";
 
 const _: () = assert!(CMD_STUB_FIRST_LINE.len() >= crate::platform::CMD_FRAME_HEAD.len() - 2);
 
 /// The batch twin: on Windows the shim slot is `bin/<tool>.cmd`
-/// ([`crate::store::ToolName::shim_file`]), and this module used to lay a
-/// `#!/bin/sh` body into it — cmd.exe then read POSIX shell as batch and the
-/// "pending" promise rendered as `'#!' is not recognized…` garbage. Same
-/// three fallbacks as the sh body, batch-spelled; the marker rides a `rem`
-/// line ([`is_pending_stub`] accepts both spellings) so recognition, rewrite
-/// and removal keep working on the file cmd.exe can actually run. `exit /b
-/// 127` throughout — the stub contract is "the tool did not run" regardless
-/// of which fallback answered. Tool names are `ToolName`-vetted and the atpkg
-/// path rides plain double quotes, the exact conventions of the real `.cmd`
-/// shim writer (`platform::cmd_shim_content`). Laid behind the same resume-proof
-/// frame as every other `.cmd` this crate writes ([`crate::platform::cmd_framed`],
-/// 2026-09-18): a stub of the pre-frame shape that is executing its `where atpkg`
-/// line (the one line of it `cmd` reads back after running something, the
-/// `__pending` calls sitting inside blocks `cmd` parses whole and exits from) at
-/// the moment it is re-laid resumes in the padding and returns silently, instead of
-/// inside the new body. [`is_pending_stub`] scans every line for the `rem` marker, so a
-/// framed stub is recognized, rewritten and removed exactly as before;
-/// [`CMD_STUB_FIRST_LINE`] is the first line AFTER `:main`. An EMPTY `atpkg` ([`named`])
-/// leaves the `if exist` block out: the stub names no atpkg and starts at `where atpkg`.
-/// Unverified on a Windows host.
+/// ([`crate::store::ToolName::shim_file`]), where cmd.exe would misread a `#!/bin/sh` body.
+/// Same three fallbacks as the sh body, batch-spelled; the marker rides a `rem` line
+/// ([`is_pending_stub`] scans every line and accepts both spellings). `exit /b 127`
+/// throughout: the contract is "the tool did not run" whichever fallback answered. Names
+/// are `ToolName`-vetted and the atpkg path rides plain double quotes, as in
+/// `platform::cmd_shim_content`. Laid behind the resume-proof frame every `.cmd` this crate
+/// writes uses ([`crate::platform::cmd_framed`]), so a pre-frame stub re-laid while running
+/// its `where atpkg` line resumes in the padding and returns silently;
+/// [`CMD_STUB_FIRST_LINE`] is the first line after `:main`. An empty `atpkg` ([`named`])
+/// leaves the `if exist` block out. Unverified on a Windows host.
 #[must_use]
 fn stub_content_cmd(tool: &ToolName, atpkg: &Path) -> String {
     let name = tool.as_str();
@@ -337,13 +363,19 @@ fn stub_content_cmd(tool: &ToolName, atpkg: &Path) -> String {
     s.push_str(STUB_MARKER);
     s.push_str("\r\n");
     s.push_str("rem Replaced by the real shim when the program installs.\r\n");
+    // The caller's arguments ride along (`%*`, the batch `"$@"` — the real shim forwards
+    // the same way): an agent program's stub execs the user's own copy meanwhile, and a
+    // program a person waits for runs with them ([`crate::cli::pending_passthrough`]).
+    // The sh body has carried them since 2026-09-15; this one dropped them, so
+    // `claude -p "x"` typed during an install reached the user's copy as a bare `claude`
+    // (found 2026-09-29 by the agents-stub test on Windows).
     if !atpkg.is_empty() {
         s.push_str(&format!(
-            "if exist \"{atpkg}\" (\r\n  \"{atpkg}\" __pending \"{name}\"\r\n  exit /b 127\r\n)\r\n"
+            "if exist \"{atpkg}\" (\r\n  \"{atpkg}\" __pending \"{name}\" %*\r\n  exit /b 127\r\n)\r\n"
         ));
     }
     s.push_str(&format!(
-        "where atpkg >nul 2>nul\r\nif not errorlevel 1 (\r\n  atpkg __pending \"{name}\"\r\n  exit /b 127\r\n)\r\n"
+        "where atpkg >nul 2>nul\r\nif not errorlevel 1 (\r\n  atpkg __pending \"{name}\" %*\r\n  exit /b 127\r\n)\r\n"
     ));
     // ASCII only: cmd.exe reads a batch file in the console's OEM code page, where
     // the UTF-8 em dash prints as mojibake.
@@ -353,13 +385,10 @@ fn stub_content_cmd(tool: &ToolName, atpkg: &Path) -> String {
 }
 
 /// Whether `name` can ride a batch script without becoming syntax:
-/// [`crate::store::shim_allowed`] admits quotes, `%`, carets and ampersands —
-/// the sh body neutralizes those with single-quoting, but cmd.exe has no
-/// robust equivalent (`%VAR%` expands even inside double quotes). A name that
-/// cannot be embedded inertly gets NO stub on Windows (fail closed: a missing
-/// courtesy stub costs one "command not found"; an injectable script costs
-/// arbitrary execution under the user's account). Real roster names are
-/// `[a-z0-9-]` and all pass.
+/// [`crate::store::shim_allowed`] admits quotes, `%`, carets and ampersands, and cmd.exe
+/// has no robust quoting (`%VAR%` expands even inside double quotes). A name that cannot be
+/// embedded inertly gets no stub on Windows (fail closed). Real roster names are
+/// `[a-z0-9-]`.
 #[must_use]
 fn cmd_stub_name_safe(name: &str) -> bool {
     !name.chars().any(|c| {
@@ -370,21 +399,15 @@ fn cmd_stub_name_safe(name: &str) -> bool {
     })
 }
 
-/// The co-located `atpkg` alias beside the running executable — what this process OFFERS
-/// as fallback 1's path ([`Embedder`] decides whether a laid file names it). Canonicalized
-/// so an argv0 alias (`atpkg` → `aterm`) or a `~/.local/bin` symlink resolves to the real
-/// bundle before the sibling join. NOT checked for existence here: a copy of aterm with no
-/// `atpkg` beside it answers a path that is not there ([`Embedder::this_process`] drops it).
-///
-/// On Windows `canonicalize` answers the VERBATIM spelling (`\\?\C:\…`), and this path
-/// is embedded in `.cmd` files — the pending stub's — where `cmd.exe`'s `if exist` and
-/// its command launch do not reliably accept it; the prefix is taken off there ([`crate::platform::strip_verbatim_prefix`],
-/// review finding 2026-09-17; no Windows box has rendered a real one).
+/// The `atpkg` beside the running executable, what this process offers as fallback 1's
+/// path ([`Embedder`] decides whether a laid file names it). Canonicalized so an argv0
+/// alias (`atpkg` → `aterm`) or a `~/.local/bin` symlink resolves to the real bundle
+/// first. Not checked for existence ([`Embedder::this_process`] drops a path that is not
+/// there). On Windows the verbatim prefix (`\\?\C:\…`) `canonicalize` adds is taken off
+/// ([`crate::platform::strip_verbatim_prefix`]): `cmd.exe`'s `if exist` and command launch
+/// do not reliably accept it.
 pub(crate) fn co_located_atpkg_path() -> PathBuf {
-    // `EXE_SUFFIX` (".exe" on Windows, "" elsewhere): a bare `atpkg` join
-    // embedded a path that exists on no Windows install — the same probe bug
-    // the GUI's co-located resolver fixed — so fallback 1 always missed there
-    // and every stub run leaned on PATH luck.
+    // `EXE_SUFFIX`: on Windows the file is `atpkg.exe`.
     let atpkg = format!("atpkg{}", std::env::consts::EXE_SUFFIX);
     let path = std::env::current_exe()
         .and_then(std::fs::canonicalize)
@@ -420,15 +443,10 @@ pub(crate) fn is_live_atpkg(path: &Path) -> bool {
     }
 }
 
-/// How long an atpkg path can be expected to keep standing — what [`Embedder::embed`]
-/// compares when the atpkg a process offers differs from the live one a file already
-/// names. A later variant outranks an earlier one.
-///
-/// The classes are the ones the code already tells apart: the app-bundle shape
-/// `…/<X>.app/Contents/MacOS/<exe>` and the translocated and mounted-image launches
-/// (`aterm_update::bundle::posture_from`, which this crate does not depend on — the same
-/// three tests, restated), the `target/` build every "not a bundle" comment names, and the
-/// scratch directory of D1 (module doc).
+/// How long an atpkg path can be expected to keep standing: what [`Embedder::embed`]
+/// compares when the offered atpkg differs from the live one a file already names. A
+/// later variant outranks an earlier one. The bundle, translocated and mounted-image tests
+/// restate `aterm_update::bundle::posture_from`, which this crate does not depend on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Durability {
     /// Goes away on its own: under a temporary directory, inside a cargo target directory
@@ -441,7 +459,7 @@ pub(crate) enum Durability {
     /// purpose.
     Plain,
     /// Inside an app bundle (`…/<X>.app/Contents/MacOS/`) anywhere not transient: the
-    /// installed `aterm.app`, or a dev bundle `tools/dev-app.sh` assembled — installed, or
+    /// installed `aterm.app`, or a dev bundle `ship dev-app` assembled — installed, or
     /// left in `dist/` by `--no-install`. No bundle is ranked above another, so the laid
     /// files name whichever bundle last ran.
     Bundle,
@@ -493,6 +511,15 @@ pub(crate) fn durability(atpkg: &Path, temp_roots: &[PathBuf]) -> Durability {
     }
 }
 
+/// Whether the executable at `path` keeps standing where it is: anything but
+/// [`Durability::Transient`] ([`temp_roots`]). Asked before aterm names its own path in a
+/// command another program runs long after (aterm-agent's `harness::tap::stable_exe`), so
+/// a build in a cargo target directory or a copy in `/tmp` never qualifies.
+#[must_use]
+pub fn lasting(path: &Path) -> bool {
+    durability(path, &temp_roots()) != Durability::Transient
+}
+
 /// This machine's temporary directories, each as spelled and as it resolves (`/tmp` is
 /// `/private/tmp` on macOS, and `$TMPDIR` sits under `/private/var/folders`): the system
 /// temp dir, `/tmp` and `/var/tmp`. A root that is the filesystem root itself (a `TMPDIR=/`)
@@ -514,7 +541,7 @@ fn temp_roots() -> Vec<PathBuf> {
     roots
 }
 
-/// Which atpkg a file laid NOW names (module doc, "Which atpkg a laid file names"): the one
+/// Which atpkg a file laid now names (module doc, "Which atpkg a laid file names"): the one
 /// rule every writer of an atpkg path goes through — the pending stubs, the reroute stubs
 /// and the `agents/` twins.
 #[derive(Debug, Clone)]
@@ -527,7 +554,7 @@ pub(crate) struct Embedder {
 }
 
 impl Embedder {
-    /// The embedder of THIS process: its co-located atpkg, this machine's temp dirs.
+    /// The embedder of this process: its co-located atpkg, this machine's temp dirs.
     #[must_use]
     pub(crate) fn this_process() -> Self {
         Self {
@@ -547,15 +574,11 @@ impl Embedder {
         }
     }
 
-    /// The atpkg a file names once laid, given the one it names now (`standing`: `None` for
-    /// a file not there yet, or one that names none), or `None` to name none:
-    ///
-    /// * a path that is not a live atpkg ([`is_live_atpkg`]), or is not absolute, is never
-    ///   the answer — on either side;
-    /// * a live `standing` path stays unless the offered one is live and lasts at least as
-    ///   long ([`Durability`]): a scratch copy never takes a file from the installed app,
-    ///   while the installed app — moved, reinstalled, or a dev bundle installed on
-    ///   purpose — takes it from anything.
+    /// The atpkg a file names once laid, given the one it names now (`standing`: `None`
+    /// for a file not there yet or naming none), or `None` to name none. A path that is
+    /// not absolute and live ([`is_live_atpkg`]) is never the answer, on either side; a
+    /// live `standing` stays unless the offered one is live and lasts at least as long
+    /// ([`Durability`]), so a scratch copy never takes a file from the installed app.
     #[must_use]
     pub(crate) fn embed(&self, standing: Option<&Path>) -> Option<PathBuf> {
         let live = |path: &Path| path.is_absolute() && is_live_atpkg(path);
@@ -577,10 +600,9 @@ impl Embedder {
     }
 }
 
-/// Whether `line` is `marker` in either spelling — bare (the sh body) or behind a
-/// batch `rem` (the `.cmd` body). Both are recognized on every platform, so a store
-/// migrated across platforms (or a stub laid by the old sh-everywhere writer on
-/// Windows) still reconciles instead of squatting.
+/// Whether `line` is `marker` bare (the sh body) or behind a batch `rem` (the `.cmd`
+/// body). Both are recognized on every platform, so a store migrated across platforms
+/// still reconciles.
 fn is_marker_line(line: &str, marker: &str) -> bool {
     let l = line.trim();
     l == marker
@@ -588,11 +610,10 @@ fn is_marker_line(line: &str, marker: &str) -> bool {
             .is_some_and(|rest| rest.trim() == marker)
 }
 
-/// Whether the file at `path` is a pending stub THIS module wrote — the recognition
-/// gate for every rewrite and removal: a line that is [`STUB_MARKER`] (bare or behind a
-/// batch `rem`). Bounded, symlink-refusing read; anything else (absent, a real shim
-/// symlink, a tombstone, a hand-made file) answers `false`. A stub an older client laid
-/// with its retired extra or requires line is still recognized by this first marker.
+/// Whether the file at `path` is a pending stub this module wrote, the recognition gate
+/// for every rewrite and removal: a line that is [`STUB_MARKER`] (bare or behind a batch
+/// `rem`). Bounded, symlink-refusing read; anything else (absent, a symlink shim, a
+/// tombstone, a hand-made file) answers `false`.
 #[must_use]
 pub fn is_pending_stub(path: &Path) -> bool {
     // A real Unix-era symlink shim is not even a regular file; the bounded reader
@@ -609,22 +630,20 @@ pub fn pending_stub_exists(layout: &Layout, tool: &str) -> bool {
 }
 
 /// Lay (or refresh) the pending stub for `tool`, atomically (temp `0755` + `rename(2)`,
-/// the tombstone writer's shape). NEVER over anything that is not already a pending
+/// the tombstone writer's shape). Never over anything that is not already a pending
 /// stub: a resolvable shim, a tombstone, or any unrecognized file wins and the write is
 /// a clean no-op — the stub is the lowest-precedence occupant of the name.
 #[cfg(test)]
 pub(crate) fn write_pending_stub(layout: &Layout, tool: &ToolName) -> io::Result<()> {
     match pending_stub_executable(layout, tool)? {
-        Some(file) => crate::lay::write_in_process(&file),
+        Some(file) => crate::lay::write_regenerable(&file),
         None => Ok(()),
     }
 }
 
-/// The pending stub `write_pending_stub` would lay, RENDERED but not written —
-/// `Ok(None)` when there is nothing to lay (an alias, a name Windows cannot embed
-/// inertly, a name something else occupies), so the two roster loops render a whole pass
-/// before they lay it. The precedence rule lives here, once: NEVER over anything that is
-/// not already a pending stub.
+/// The pending stub `write_pending_stub` would lay, rendered but not written; `Ok(None)`
+/// when there is nothing to lay (an alias, a name Windows cannot embed inertly, a name
+/// something else occupies), so the roster loops render a whole pass before laying it.
 pub(crate) fn pending_stub_executable(
     layout: &Layout,
     tool: &ToolName,
@@ -641,16 +660,11 @@ pub(crate) fn pending_stub_executable(
     pending_stub_executable_at(layout, tool, layout.shim(tool))
 }
 
-/// [`pending_stub_executable`] for a stub at an explicit path — the `bin/` slot, or an
-/// AGENT program's `agents/` twin (2026-09-15): `agents/` is first on every PATH, so
-/// a pending `claude`/`codex` laid only in `bin/` (appended LAST) never answered on a
-/// machine with a brew cask, and R6's "typing the name prints the install state" did
-/// not hold for the two names it matters most for (audit 2026-09-14). Same precedence
-/// rule: never over anything that is not already a pending stub.
-///
-/// The atpkg the stub names is [`Embedder::embed`]'s answer over the one the stub standing
-/// there names now: a copy of aterm with no `atpkg` beside it, or one that lasts less than
-/// the atpkg already named, re-points nothing (module doc).
+/// [`pending_stub_executable`] for a stub at an explicit path: the `bin/` slot, or an agent
+/// program's `agents/` twin, since a pending `claude`/`codex` only in `bin/` (appended
+/// last) would never answer on a machine with a brew cask. The precedence rule lives here:
+/// never over anything that is not already a pending stub. The atpkg it names is
+/// [`Embedder::embed`]'s answer over the one the standing stub names.
 pub(crate) fn pending_stub_executable_at(
     layout: &Layout,
     tool: &ToolName,
@@ -666,11 +680,9 @@ pub(crate) fn pending_stub_executable_at(
     let atpkg =
         Embedder::this_process().embed(standing.as_deref().and_then(stub_named_atpkg).as_deref());
     let body = stub_content(tool, atpkg.as_deref());
-    // Ours already, and byte-identical: nothing to lay — the reroute stubs' rule
-    // (`reroute::lay`). Every seed runs the adoption lay and every install pass reconciles
-    // twice, so a name that stays wanted-and-absent re-laid identical bytes each time. A body
-    // that differs — the atpkg it names changed, or an older client's retired extra/requires
-    // line — is rewritten.
+    // Ours already and byte-identical: nothing to lay (the reroute stubs' rule). Seeds and
+    // install passes reconcile repeatedly; a body that differs (another atpkg named, an
+    // older client's retired line) is rewritten.
     if standing.is_some() && stub_is_current(&shim, &body) {
         return Ok(None);
     }
@@ -680,24 +692,27 @@ pub(crate) fn pending_stub_executable_at(
     Ok(Some(crate::lay::Executable::new(shim, body)))
 }
 
-/// Whether the pending stub at `shim` is CURRENT: exactly the bytes this pass would
+/// Whether the pending stub at `shim` is current: exactly the bytes this pass would
 /// render (`body`).
 fn stub_is_current(shim: &Path, body: &str) -> bool {
     std::fs::read(shim).is_ok_and(|have| have == body.as_bytes())
 }
 
-/// Remove `program`'s stub iff the name still resolves to a pending stub — the
-/// per-program removal discipline (`atpkg uninstall <p>`, an index de-listing).
+/// Remove `program`'s stub and its commands' ([`commands_of`]), each only while it is
+/// still a pending stub: `atpkg uninstall <p>`, an index de-listing.
 pub fn remove_stub(layout: &Layout, program: &str) {
-    if let Some(tool) = ToolName::new(program) {
-        let shim = layout.shim(&tool);
-        if is_pending_stub(&shim) {
-            let _ = std::fs::remove_file(&shim);
+    let commands: Vec<&str> = commands_of(program).collect();
+    for name in std::iter::once(program).chain(commands) {
+        if let Some(tool) = ToolName::new(name) {
+            let shim = layout.shim(&tool);
+            if is_pending_stub(&shim) {
+                let _ = std::fs::remove_file(&shim);
+            }
         }
     }
 }
 
-/// Remove EVERY pending stub in `bin/` — `uninstall --all` / a recorded decline.
+/// Remove every pending stub in `bin/` — `uninstall --all` / a recorded decline.
 /// Recognition-gated per file, so nothing that is not a stub can be swept.
 pub fn remove_all_stubs(layout: &Layout) {
     let Ok(entries) = std::fs::read_dir(layout.bin_dir()) else {
@@ -711,27 +726,34 @@ pub fn remove_all_stubs(layout: &Layout) {
     }
 }
 
-/// Lay the compile-time rosters' stubs at ADOPTION time — before a single network
-/// byte moves, so `PATH` coverage exists from the first instant the machine wants
-/// the toolset. Skips programs
-/// already installed and ones the user removed on purpose; failures are per-name
-/// and best-effort (a stub is a courtesy, never a gate on the pass). The compiled
-/// rosters carry no `system` key, so system satisfaction is the index reconcile's
-/// call — the first resolve retires any stub a system install makes moot.
-pub fn lay_adoption_stubs(layout: &Layout) {
+/// Lay the compiled rosters' stubs at adoption time, before a network byte moves, so
+/// `PATH` coverage exists from the first instant. Skips programs already installed, ones
+/// removed on purpose or opted out by `[packages].exclude` (`vendor_wanted`), and a
+/// vendor-direct program its vendor publishes nothing for here
+/// ([`crate::vendor_direct::VendorSpec::serves`]). Best-effort per name. The compiled
+/// rosters carry no `system` key; the first index resolve retires any stub a system
+/// install makes moot.
+pub fn lay_adoption_stubs(layout: &Layout, cfg: &crate::config::PackagesConfig) {
     let installed = crate::ops::active_builds(layout);
     let removed = layout.removed_programs();
+    let triple = crate::cli::current_triple();
     let mut files = Vec::new();
-    for (name, _) in DEFAULT_SET_STUB_NAMES.iter().chain(AGENT_STUB_NAMES) {
-        let name = *name;
-        if installed.contains_key(name) || removed.contains(name) {
+    // Which command names stand is the reconcile's question; this lay sweeps nothing.
+    let mut commands = BTreeSet::new();
+    for name in compiled_names() {
+        if installed.contains_key(name)
+            || !crate::cli::vendor_wanted(cfg, &removed, name)
+            || crate::vendor_direct::spec(name).is_some_and(|s| !s.serves(triple))
+        {
             continue;
         }
         if let Some(tool) = ToolName::new(name) {
             if let Ok(Some(file)) = pending_stub_executable(layout, &tool) {
                 files.push(file);
             }
-            // The agent programs' stubs go FIRST on PATH too ([`pending_stub_executable_at`]).
+            // The commands it exposes answer too (`targo` for `trust`, [`commands_of`]).
+            command_stub_executables(layout, name, &mut commands, &mut files);
+            // The agent programs' stubs go first on PATH too ([`pending_stub_executable_at`]).
             if is_agent_program(name)
                 && let Ok(Some(twin)) =
                     pending_stub_executable_at(layout, &tool, layout.agent_shim(&tool))
@@ -741,17 +763,15 @@ pub fn lay_adoption_stubs(layout: &Layout) {
         }
     }
     // Best-effort like every stub, but never silent: the reason is printed once.
-    if let Err(e) = files.iter().try_for_each(crate::lay::write_in_process) {
+    if let Err(e) = files.iter().try_for_each(crate::lay::write_regenerable) {
         eprintln!("atpkg: warn — pending stubs not laid: {e}");
     }
 }
 
-/// The index-resolve reconcile: `wanted` is the SIGNED set the pass will keep
-/// complete (installable ∧ not-removed), `installed` the active builds. Adds/refreshes a
-/// stub for every wanted absent name (embedded paths refreshed as a matter of course),
-/// then sweeps every pending stub whose name is no longer wanted and missing —
-/// de-listed, removed on purpose, or now installed under a name its real shims do not
-/// expose.
+/// The index-resolve reconcile: `wanted` is the signed set the pass keeps complete
+/// (installable and not removed), `installed` the active builds. Adds or refreshes a stub
+/// for every wanted absent program and the commands it exposes ([`commands_of`]), then
+/// sweeps every other pending stub: one whose program is no longer wanted or is installed.
 pub fn reconcile(layout: &Layout, wanted: &BTreeSet<String>, installed: &BTreeMap<String, u64>) {
     let mut keep: BTreeSet<&str> = BTreeSet::new();
     let mut files = Vec::new();
@@ -759,7 +779,7 @@ pub fn reconcile(layout: &Layout, wanted: &BTreeSet<String>, installed: &BTreeMa
         if installed.contains_key(name.as_str()) {
             continue;
         }
-        // The ToolName gate IS the sensitive-name refusal: an index listing `sudo`
+        // The ToolName gate is the sensitive-name refusal: an index listing `sudo`
         // gets no stub, exactly as it gets no shim.
         let Some(tool) = ToolName::new(name) else {
             continue;
@@ -780,11 +800,12 @@ pub fn reconcile(layout: &Layout, wanted: &BTreeSet<String>, installed: &BTreeMa
         {
             files.push(twin);
         }
+        command_stub_executables(layout, name, &mut keep, &mut files);
     }
     // Every stub this reconcile adds or refreshes. A lay that fails leaves the names it
     // would have laid in `keep`, so the sweep below removes nothing over it — and the
     // reason is printed once.
-    if let Err(e) = files.iter().try_for_each(crate::lay::write_in_process) {
+    if let Err(e) = files.iter().try_for_each(crate::lay::write_regenerable) {
         eprintln!("atpkg: warn — pending stubs not laid: {e}");
     }
     // Both directories a pending stub can stand in: `bin/`, and `agents/` for the
@@ -825,16 +846,13 @@ mod tests {
         ToolName::new(name).unwrap()
     }
 
-    /// Every compiled roster name passes the shim gate — a roster entry that could
-    /// not be shimmed could never be stubbed either, and should fail HERE, not at a
-    /// user's first launch.
-    /// An agent program's pending stub stands in `agents/` too — first on every PATH —
-    /// carries the caller's arguments through, and leaves once the program installs or
-    /// is de-listed (2026-09-15). A non-agent program gets no twin.
+    /// An agent program's pending stub stands in `agents/` too, carries the caller's
+    /// arguments through, and leaves once the program installs or is de-listed; a
+    /// non-agent program gets no twin.
     #[test]
     fn an_agent_programs_pending_stub_stands_in_agents_too_and_passes_arguments() {
         let l = layout("agents-stub");
-        lay_adoption_stubs(&l);
+        lay_adoption_stubs(&l, &crate::config::PackagesConfig::default());
         let claude = tool("claude");
         let twin = l.agent_shim(&claude);
         assert!(
@@ -848,8 +866,14 @@ mod tests {
             "only the agent programs get a twin"
         );
         let body = std::fs::read_to_string(&twin).unwrap();
+        // Spelled per host: the sh body's `"$@"`, the batch body's `%*`.
+        let forwards = if cfg!(windows) {
+            "__pending \"claude\" %*"
+        } else {
+            "__pending 'claude' \"$@\""
+        };
         assert!(
-            body.contains("__pending 'claude' \"$@\""),
+            body.contains(forwards),
             "the caller's arguments ride through: {body}"
         );
         // Installed: the reconcile's sweep removes the twin stub (its real twin, laid by
@@ -864,6 +888,111 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
+    /// A program's commands stand with it: `targo`, `trustc`, `tippy`, `trustfmt` and
+    /// `trustdoc` answer from the adoption lay on, each naming itself to `__pending` (which
+    /// reports `trust`'s state); the index reconcile keeps them while `trust` is wanted and
+    /// absent and sweeps them once it is installed or no longer wanted; `remove_stub` takes
+    /// them with the program. No upstream name (`cargo`, `rustc`, `clippy`, …) is laid in
+    /// `bin/`: those belong to the reroute directory.
+    #[test]
+    fn a_programs_commands_are_stubbed_while_it_is_wanted_and_absent() {
+        let l = layout("commands");
+        lay_adoption_stubs(&l, &crate::config::PackagesConfig::default());
+        let commands = ["targo", "trustc", "tippy", "trustfmt", "trustdoc"];
+        for command in commands {
+            assert!(pending_stub_exists(&l, command), "{command} answers");
+            assert_eq!(program_of(command), "trust");
+            let body = std::fs::read_to_string(l.shim(&tool(command))).unwrap();
+            assert!(
+                body.contains(&format!("__pending '{command}' \"$@\"")),
+                "the stub names what was typed: {body}"
+            );
+        }
+        assert_eq!(program_of("ty"), "ty", "a program is its own");
+        for upstream in [
+            "cargo", "rustc", "clippy", "rustfmt", "rustdoc", "lean", "z3",
+        ] {
+            assert!(
+                std::fs::symlink_metadata(l.bin_dir().join(upstream)).is_err(),
+                "{upstream} is never stubbed in bin/"
+            );
+        }
+        let trust: BTreeSet<String> = ["trust".to_string()].into_iter().collect();
+        reconcile(&l, &trust, &BTreeMap::new());
+        assert!(commands.iter().all(|c| pending_stub_exists(&l, c)), "kept");
+        reconcile(&l, &BTreeSet::new(), &BTreeMap::new());
+        assert!(
+            commands.iter().all(|c| !l.shim(&tool(c)).exists()),
+            "swept once trust leaves `wanted`"
+        );
+        reconcile(&l, &trust, &BTreeMap::new());
+        assert!(
+            commands.iter().all(|c| pending_stub_exists(&l, c)),
+            "laid again"
+        );
+        let installed: BTreeMap<String, u64> = [("trust".to_string(), 1u64)].into_iter().collect();
+        reconcile(&l, &trust, &installed);
+        assert!(
+            commands.iter().all(|c| !l.shim(&tool(c)).exists()),
+            "swept once trust is installed (its real shims stand there next)"
+        );
+        reconcile(&l, &trust, &BTreeMap::new());
+        remove_stub(&l, "trust");
+        assert!(
+            commands.iter().all(|c| !l.shim(&tool(c)).exists()),
+            "an uninstall takes the commands with the program"
+        );
+    }
+
+    /// A command stub is the lowest-precedence occupant like every stub: a file it did not
+    /// lay under the name is never overwritten, and never swept.
+    #[test]
+    fn a_command_stub_never_takes_a_file_it_did_not_lay() {
+        let l = layout("command-foreign");
+        std::fs::create_dir_all(l.bin_dir()).unwrap();
+        let mine = l.shim(&tool("targo"));
+        std::fs::write(&mine, "#!/bin/sh\necho mine\n").unwrap();
+        let trust: BTreeSet<String> = ["trust".to_string()].into_iter().collect();
+        reconcile(&l, &trust, &BTreeMap::new());
+        assert_eq!(
+            std::fs::read_to_string(&mine).unwrap(),
+            "#!/bin/sh\necho mine\n"
+        );
+        assert!(pending_stub_exists(&l, "trustc"), "its siblings are laid");
+        reconcile(&l, &BTreeSet::new(), &BTreeMap::new());
+        assert_eq!(
+            std::fs::read_to_string(&mine).unwrap(),
+            "#!/bin/sh\necho mine\n",
+            "nor swept"
+        );
+    }
+
+    /// A stub lost in a crash (gone, or cut short with its marker still on top) is laid whole
+    /// again by the next lay. This is why stubs are written without the drive-cache barrier
+    /// ([`crate::lay::write_regenerable`]): every seed puts back what is missing or differs
+    /// ([`stub_is_current`]).
+    #[test]
+    fn a_lost_or_cut_short_stub_is_laid_again() {
+        let l = layout("relay");
+        let cfg = crate::config::PackagesConfig::default();
+        lay_adoption_stubs(&l, &cfg);
+        let targo = l.shim(&tool("targo"));
+        let trustc = l.shim(&tool("trustc"));
+        let whole = std::fs::read_to_string(&trustc).unwrap();
+        std::fs::remove_file(&targo).unwrap();
+        std::fs::write(&trustc, format!("#!/bin/sh\n{STUB_MARKER}\n")).unwrap();
+        lay_adoption_stubs(&l, &cfg);
+        assert!(
+            pending_stub_exists(&l, "targo"),
+            "a missing stub is laid again"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&trustc).unwrap(),
+            whole,
+            "a cut-short stub is rewritten whole"
+        );
+    }
+
     #[test]
     fn roster_names_all_pass_shim_allowed() {
         for (name, desc) in DEFAULT_SET_STUB_NAMES {
@@ -875,8 +1004,8 @@ mod tests {
         }
     }
 
-    /// An alias is never a stub (module doc): the reconcile lays the PLAIN names only,
-    /// and the writer is a no-op for an `alab-` name even when asked directly.
+    /// An alias is never a stub: the reconcile lays plain names only, and the writer is a
+    /// no-op for an `alab-` name even when asked directly.
     #[test]
     fn an_alias_is_never_a_stub() {
         let l = layout("alias-stub");
@@ -899,10 +1028,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// The stub body: marker present, the three-step fallback chain in order, the
-    /// tool name and embedded path quote-safely embedded — and CRUCIALLY it parses
-    /// as NO shim target, so `which`/`active_builds`/`prune_stale_shims` never
-    /// mistake a stub for an installed tool.
+    /// The stub body: marker present, the three-step fallback chain in order, the tool name
+    /// and embedded path quote-safe, and it parses as no shim target, so
+    /// `which`/`active_builds`/`prune_stale_shims` never take a stub for an installed tool.
     #[test]
     fn stub_content_shape_and_shim_invisibility() {
         // The sh body directly — `stub_content` dispatches by compile target,
@@ -936,17 +1064,15 @@ mod tests {
         assert!(body.contains("ATPKG='/x'\\''y/atpkg'"));
     }
 
-    /// The batch twin's shape: what cmd.exe actually runs on Windows, where
-    /// the shim slot is `<tool>.cmd` — the old sh-everywhere writer put
-    /// `#!/bin/sh` there and the pending promise rendered as `'#!' is not
-    /// recognized…` garbage. Pinned from every build host (pure string).
+    /// The batch twin's shape, what cmd.exe runs in the `<tool>.cmd` slot. Pinned from
+    /// every build host (pure string).
     #[test]
     fn cmd_stub_shape_marker_and_safety() {
         let body = stub_content_cmd(
             &tool("trust"),
             Path::new(r"C:\Program Files\aterm\atpkg.exe"),
         );
-        // The frame first (2026-09-18), then the batch body `@echo off` opens.
+        // The frame first, then the batch body's `@echo off`.
         let frame = crate::platform::cmd_frame();
         assert!(body.starts_with(&frame), "framed: {body}");
         assert!(
@@ -965,7 +1091,11 @@ mod tests {
             exist < where_probe && where_probe < static_msg,
             "fallbacks in order"
         );
-        assert!(body.contains("__pending \"trust\""));
+        assert_eq!(
+            body.matches("__pending \"trust\" %*\r\n").count(),
+            2,
+            "both arms that reach atpkg carry the caller's arguments: {body}"
+        );
         assert!(
             body.matches("exit /b 127").count() >= 3,
             "every arm exits 127"
@@ -980,7 +1110,7 @@ mod tests {
         );
 
         // The batch-hostility gate: sh can neutralize these, batch cannot —
-        // and `shim_allowed` admits them, so the WRITE must refuse.
+        // and `shim_allowed` admits them, so the write must refuse.
         for hostile in ["a%b", "a\"b", "a&b", "a^b", "a|b", "a<b", "a!b"] {
             assert!(
                 !cmd_stub_name_safe(hostile),
@@ -992,15 +1122,39 @@ mod tests {
         }
     }
 
-    /// THE RESUME SIMULATION for the pending stub (review finding, 2026-09-18: the stub
-    /// was the one `.cmd` this crate laid without the frame). A stub of the pre-frame
-    /// shape — the body alone, which is what every Windows stub was until 2026-09-18 —
-    /// re-laid to its framed successor while it executes: at every line end of the old
-    /// file (the only offsets `cmd` can resume at) and at every offset up to its
-    /// end-of-file, the new file reads a colon label, an empty line or `@exit /b`. The
-    /// longest stub the writer lays — a `MAX_PATH` atpkg path at three UTF-8 bytes a
-    /// unit, embedded twice — still ends inside the padding. As the control, the same old
-    /// stub over an UNFRAMED successor resumes into a command line. A model of `cmd`'s documented rules, not a run on Windows.
+    /// The batch stub gives a private stand-in atpkg the caller's arguments,
+    /// checked by real cmd.exe when this test runs on Windows.
+    #[cfg(windows)]
+    #[test]
+    fn the_batch_stub_hands_atpkg_the_callers_arguments() {
+        let l = layout("cmd-args");
+        let record = l.prefix.join("argv.txt");
+        let fake = l.prefix.join("fake-atpkg.cmd");
+        std::fs::write(&fake, format!("@echo %*> \"{}\"\r\n", record.display())).unwrap();
+        let stub = l.prefix.join("claude.cmd");
+        std::fs::write(&stub, stub_content_cmd(&tool("claude"), &fake)).unwrap();
+        let mut command = aterm_uds::spawnfd::command("cmd");
+        command
+            .args(["/d", "/c"])
+            .arg(&stub)
+            .args(["-p", "two words"]);
+        let ran = aterm_uds::deadline::output_until(
+            &mut command,
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+        )
+        .expect("the private cmd fixture must finish within the hang detector");
+        let got = std::fs::read_to_string(&record)
+            .unwrap_or_else(|e| panic!("the stand-in never ran ({e}): {ran:?}"));
+        assert_eq!(got.trim_end(), "__pending \"claude\" -p \"two words\"");
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// A pre-frame stub (the body alone) re-laid to its framed successor while it runs: at
+    /// every line end of the old file (the only offsets `cmd` resumes at) and every offset
+    /// up to its end, the new file reads a colon label, an empty line or `@exit /b`, even
+    /// for the longest stub the writer lays (a `MAX_PATH` atpkg path at three UTF-8 bytes a
+    /// unit, embedded twice). Control: an unframed successor resumes into a command line.
+    /// A model of `cmd`'s documented rules, not a run on Windows.
     #[test]
     fn a_pre_frame_cmd_stub_re_laid_while_executing_resumes_into_the_frame() {
         use crate::platform::{
@@ -1086,10 +1240,9 @@ mod tests {
                 );
             }
         }
-        // THE CONTROL: the old (bare) stub over an UNFRAMED successor whose embedded
-        // atpkg path moved 30 bytes longer (an app relocated) — the old end-of-file
-        // offset lands 60 bytes short of the new end, inside the `echo …` line: a
-        // fragment run as a command, the shape before the frame.
+        // The control: the old bare stub over an unframed successor whose atpkg path grew
+        // 30 bytes (an app relocated) resumes 60 bytes short of the new end, inside the
+        // `echo …` line, a fragment run as a command.
         let old = &cases[0].1[frame.len()..];
         let moved = stub_content_cmd(
             &tool("trust"),
@@ -1112,10 +1265,7 @@ mod tests {
         );
     }
 
-    /// A stub written with the batch marker is still a stub to every consumer:
-    /// recognition (and therefore rewrite/removal/reconcile) must accept both
-    /// spellings on both platforms, or a store migrated across platforms
-    /// squats its own bin dir.
+    /// A stub written with the batch marker is a stub to every consumer, on both platforms.
     #[test]
     fn rem_marker_recognition_round_trips() {
         let dir = crate::testdir::dir("atpkg-stub-rem-");
@@ -1129,10 +1279,8 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// Laid stub → recognized; real-shim install lands OVER it via temp+rename with
-    /// the name resolving to SOMETHING at every instant (no window of absence, no
-    /// EEXIST), and afterwards the stub is gone and the shim is exactly today's
-    /// fast path.
+    /// A laid stub is recognized, the real shim lands over it via temp+rename with the name
+    /// always resolving, and afterwards the stub is gone.
     #[cfg(unix)]
     #[test]
     fn install_over_a_stub_never_leaves_a_window() {
@@ -1149,13 +1297,11 @@ mod tests {
         std::fs::write(build_bin.join("trust"), "#!/bin/sh\nexit 0\n").unwrap();
         crate::platform::install_shim(&build_bin, &t, &shim)
             .expect("install over a stub must not EEXIST");
-        // After: the SAME name resolves to the store target; the stub is gone.
+        // After: the same name resolves to the store target; the stub is gone.
         let target = crate::platform::resolve_shim(&shim).expect("real shim resolves");
         assert!(target.starts_with(&build_bin));
         assert!(!is_pending_stub(&shim));
-        // At every instant: the write path is temp+rename, so the only two
-        // observable states are the two proven above — pin the mechanism by
-        // asserting no non-stub temp survives beside the shim.
+        // The write path is temp+rename: no non-stub temp survives beside the shim.
         let strays: Vec<_> = std::fs::read_dir(l.bin_dir())
             .unwrap()
             .filter_map(Result::ok)
@@ -1168,7 +1314,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// The stub is the LOWEST-precedence occupant: it never overwrites a real shim,
+    /// The stub is the lowest-precedence occupant: it never overwrites a real shim,
     /// a tombstone, or a hand-made file — and removal is recognition-gated the same
     /// way.
     #[cfg(unix)]
@@ -1198,14 +1344,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// Adoption lays the whole roster minus removed/installed; `remove_all_stubs`
-    /// clears exactly the stubs.
+    /// Adoption lays the whole roster minus removed/excluded/installed;
+    /// `remove_all_stubs` clears exactly the stubs.
     #[cfg(unix)]
     #[test]
     fn adoption_lays_the_roster_and_remove_all_clears_it() {
         let l = layout("adoption");
         std::fs::write(l.removed(), "ny\n").unwrap();
-        lay_adoption_stubs(&l);
+        let cfg = crate::config::PackagesConfig {
+            exclude: Some(vec![String::from("agy")]),
+            ..Default::default()
+        };
+        lay_adoption_stubs(&l, &cfg);
+        let agy = tool("agy");
+        assert!(
+            !l.shim(&agy).exists() && !l.agent_shim(&agy).exists(),
+            "an excluded program gets no stub, in bin/ or agents/"
+        );
         for (name, _) in DEFAULT_SET_STUB_NAMES {
             let expect = *name != "ny";
             assert_eq!(
@@ -1214,24 +1369,30 @@ mod tests {
                 "{name}: removed-on-purpose stays removed at adoption"
             );
         }
-        // The agent programs ride along like every default-set member.
+        // The agent programs ride along like every default-set member — each one its
+        // vendor serves this machine.
+        let triple = crate::cli::current_triple();
         for name in AGENT_PROGRAMS {
-            assert!(pending_stub_exists(&l, name), "{name}: laid at adoption");
+            let served = crate::vendor_direct::spec(name).is_some_and(|s| s.serves(triple));
+            assert_eq!(
+                pending_stub_exists(&l, name),
+                served && *name != "agy",
+                "{name}: laid at adoption only where it can arrive"
+            );
         }
         // A foreign file beside them survives the sweep.
         std::fs::write(l.bin_dir().join("mine"), "not a stub").unwrap();
         remove_all_stubs(&l);
-        for (name, _) in DEFAULT_SET_STUB_NAMES.iter().chain(AGENT_STUB_NAMES) {
+        for name in compiled_names() {
             assert!(!pending_stub_exists(&l, name), "{name} swept with the rest");
         }
         assert!(l.bin_dir().join("mine").exists());
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// A stub already on disk with the exact bytes the pass would render is NEVER re-laid,
-    /// tagged or not (Phase 3, 2026-09-22): `pending_stub_executable` answers `Ok(None)`, so
-    /// a steady-state seed or install pass lays nothing — no new inode. A stub whose body
-    /// changed (an older client's extra line, a moved atpkg) is still rewritten.
+    /// A stub already on disk with the exact bytes the pass would render is never re-laid
+    /// (no new inode); a stub whose body changed (an older client's extra line, a moved
+    /// atpkg) is rewritten.
     #[cfg(unix)]
     #[test]
     fn an_identical_stub_is_left_alone_and_a_changed_one_is_rewritten() {
@@ -1255,7 +1416,7 @@ mod tests {
         let ino = std::fs::metadata(&shim).unwrap().ino();
         let wanted: BTreeSet<String> = ["trust".to_string()].into_iter().collect();
         reconcile(&l, &wanted, &BTreeMap::new());
-        lay_adoption_stubs(&l);
+        lay_adoption_stubs(&l, &crate::config::PackagesConfig::default());
         assert!(pending_stub_exists(&l, "trust"), "the reconcile keeps it");
         assert!(
             pending_stub_executable(&l, &t).unwrap().is_none(),
@@ -1298,7 +1459,7 @@ mod tests {
     #[test]
     fn reconcile_tracks_the_signed_set_and_refuses_sensitive_names() {
         let l = layout("reconcile");
-        lay_adoption_stubs(&l);
+        lay_adoption_stubs(&l, &crate::config::PackagesConfig::default());
         assert!(pending_stub_exists(&l, "ay"));
         let wanted: BTreeSet<String> = [
             "brandnew".to_string(),
@@ -1329,10 +1490,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// The fallback chain END-TO-END, run through a real `/bin/sh`: a live embedded
-    /// atpkg wins; a dangling embedded path falls back to the first absolute-entry atpkg on
-    /// PATH (never a relative or empty entry's); with
-    /// neither reachable the static honest message lands on stderr with exit 127.
+    /// The fallback chain through a real `/bin/sh`: a live embedded atpkg wins; a dangling
+    /// one falls back to the first absolute-entry atpkg on PATH (never a relative or empty
+    /// entry's); with neither, the static message lands on stderr with exit 127.
     #[cfg(unix)]
     #[test]
     fn fallback_chain_runs_in_a_real_shell() {
@@ -1393,9 +1553,8 @@ mod tests {
         );
         assert_eq!(out.status.code(), Some(127));
         assert!(String::from_utf8_lossy(&out.stderr).contains(STUB_UNREACHABLE_MSG));
-        // ... and never an atpkg a RELATIVE or EMPTY PATH entry names (2026-10-01 review):
-        // run from the directory holding one, `.` and a stray `:` both mean it, and the
-        // stub still answers 3.
+        // ... and never an atpkg a relative or empty PATH entry names: run from the
+        // directory holding one, `.` and a stray `:` both mean it, and the stub answers 3.
         let script = l.prefix.join("stub-under-test");
         std::fs::write(&script, stub_content(&t, None)).unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -1414,27 +1573,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// The AGENT roster (owner decision 2026-09-10): `claude` and `codex`, with a
-    /// shim-admissible name and a vendor-descriptive line the pending stub prints while
-    /// the install is on its way.
+    /// Every agent program is a shim-admissible name no default-set member also claims (one
+    /// in both would be laid twice and described as the other), and its pending stub prints
+    /// its vendor row's line: descriptive of the vendor, never an ALab mark, naming the host
+    /// the bytes come from.
     #[test]
-    fn agent_programs_are_their_own_roster() {
-        assert_eq!(AGENT_PROGRAMS, &["claude", "codex"]);
-        for name in AGENT_PROGRAMS {
+    fn an_agent_program_is_a_shim_name_described_by_its_vendor() {
+        for row in crate::vendor_direct::VENDORS {
+            let (name, desc) = (row.program, row.description);
             assert!(is_agent_program(name));
-            assert!(crate::store::shim_allowed(name));
+            assert!(crate::store::shim_allowed(name), "{name}");
             assert!(
-                DEFAULT_SET_STUB_NAMES.iter().all(|(n, _)| n != name),
+                DEFAULT_SET_STUB_NAMES.iter().all(|(n, _)| *n != name),
                 "{name} is in two rosters"
             );
-            let desc = describe(name).expect("an authored line");
+            assert_eq!(describe(name), Some(desc));
             assert!(desc.contains("downloaded from"), "{name}: {desc}");
+            assert!(
+                desc.starts_with(&format!("{} ", row.vendor)),
+                "{name}: {desc}"
+            );
         }
         assert!(!is_agent_program("trust"));
         assert!(!is_agent_program("nonesuch"));
-        // The line is descriptive of the vendor, never an ALab mark.
-        assert!(describe("codex").unwrap().starts_with("OpenAI "));
-        assert!(describe("claude").unwrap().starts_with("Anthropic "));
     }
 
     // ── which atpkg a laid file names ───────────────────────────────────────────────
@@ -1454,7 +1615,7 @@ mod tests {
             format!("{CACHEDIR_TAG_SIGNATURE}\n# This file is a cache directory tag.\n"),
         )
         .unwrap();
-        // A file of that name WITHOUT the signature tags nothing.
+        // A file of that name without the signature tags nothing.
         let untagged = root.join("untagged");
         std::fs::create_dir_all(&untagged).unwrap();
         std::fs::write(untagged.join("CACHEDIR.TAG"), "not a tag\n").unwrap();
@@ -1512,6 +1673,14 @@ mod tests {
             ),
             Durability::Bundle
         );
+        // `lasting` is that rule on this machine's temp dirs: the installed app and a plain
+        // binary last; a copy under a temp dir and a build in a cargo target dir do not.
+        assert!(lasting(Path::new(
+            "/Applications/aterm.app/Contents/MacOS/aterm"
+        )));
+        assert!(lasting(Path::new("/usr/local/lib/aterm/bin/aterm")));
+        assert!(!lasting(&std::env::temp_dir().join("x/bin/aterm")));
+        assert!(!lasting(&target.join("debug/aterm")));
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
@@ -1550,7 +1719,7 @@ mod tests {
         let embed = |offered: &Path, standing: Option<&Path>| {
             Embedder::offering(offered, &scratch_roots).embed(standing)
         };
-        // D1: the offered atpkg is not there — the standing live one stays, or none is named.
+        // The offered atpkg is not there: the standing live one stays, or none is named.
         assert_eq!(embed(&gone, Some(&installed)), Some(installed.clone()));
         assert_eq!(embed(&gone, None), None);
         assert_eq!(embed(&gone, Some(&gone)), None);
@@ -1590,9 +1759,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// What a laid file names is read back exactly as it was written — every quoting the
-    /// renderers produce, the empty value as "none", and nothing from a line this crate did
-    /// not quote; the batch stub leaves its `if exist` block out when it names none.
+    /// What a laid file names reads back exactly as written: every quoting the renderers
+    /// produce, the empty value as none, nothing from a line this crate did not quote; the
+    /// batch stub leaves its `if exist` block out when it names none.
     #[test]
     fn the_named_atpkg_reads_back_as_written() {
         let t = tool("trust");
@@ -1653,10 +1822,9 @@ mod tests {
     #[cfg(unix)]
     const LAY_AS_COPY_PROBE: &str = "stub::tests::probe_lays_every_file_as_this_copy";
 
-    /// The copy's whole job: the three lays that run at every launch, session spawn and pass
-    /// — the reroute stubs, the pending stubs, the `agents/` twins — over the prefix it is
-    /// handed, as the binary it IS (its own `current_exe`, its own neighbours). Outside a
-    /// copy (the env unset) it does nothing.
+    /// The copy's whole job: the three lays that run at every launch, session spawn and
+    /// pass (the reroute stubs, the pending stubs, the `agents/` twins) over the prefix it
+    /// is handed, as the binary it is. With the env unset it does nothing.
     #[cfg(unix)]
     #[test]
     fn probe_lays_every_file_as_this_copy() {
@@ -1667,22 +1835,18 @@ mod tests {
             prefix: std::path::PathBuf::from(prefix),
         };
         crate::reroute::lay(&l).expect("the reroute lay");
-        lay_adoption_stubs(&l);
+        lay_adoption_stubs(&l, &crate::config::PackagesConfig::default());
         crate::activate::reconcile_agents(&l);
     }
 
-    /// Place a copy of THIS test binary at `exe` — with the `atpkg` alias beside it when
-    /// `alias`, the shape every bundle and install.sh's store carry — and run
+    /// Place a copy of this test binary at `exe` (with the `atpkg` alias beside it when
+    /// `alias`, as every bundle and install.sh's store carry) and run
     /// [`probe_lays_every_file_as_this_copy`] from there over `l`.
     ///
-    /// A copy already at `exe` is REMOVED first, never written over. macOS keeps a
-    /// binary's code-signature state with the file it ran from, and a file written over
-    /// after it has run can be SIGKILLed by the kernel at its next exec, before the probe
-    /// runs (`unix_wait_status(9)`) — the fixture failing, not the lay. Measured 2026-09-25, every kill at the second copy to one path: copied
-    /// over, 5 of 200 runs of the test below were killed (and a shell `cp` over a copy that
-    /// had already run, 38 of 40); removed first, which gives the copy a new file, 0 of 200
-    /// run one at a time and 0 of 200 run four at a time. The same kernel class is recorded
-    /// in `caller_shell`'s outliving-program test.
+    /// A copy already at `exe` is removed first, never written over: macOS keeps a binary's
+    /// code-signature state with the file it ran from, and a file written over after it ran
+    /// can be SIGKILLed at its next exec (5 of 200 runs copied over; 0 of 200 removed
+    /// first).
     #[cfg(unix)]
     fn lay_as_copy_at(exe: &Path, alias: bool, l: &Layout) {
         std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
@@ -1744,8 +1908,8 @@ mod tests {
         named
     }
 
-    /// Rewrite every atpkg a laid file under `prefix` names to `atpkg` — the state a launch of
-    /// the installed app leaves behind.
+    /// Rewrite every atpkg a laid file under `prefix` names to `atpkg`: the state a launch
+    /// of the installed app leaves behind.
     #[cfg(unix)]
     fn name_atpkg_everywhere(prefix: &Path, atpkg: &Path) {
         let quoted = sh_single_quote(&atpkg.to_string_lossy());
@@ -1772,30 +1936,18 @@ mod tests {
         }
     }
 
-    /// D1 of the 2026-09-25 end-to-end run: a private copy of aterm started from a scratch
-    /// directory re-laid the machine's eight reroute stubs with
-    /// `ATPKG='<scratch>/bin/atpkg'` — a file that was never there, in a directory that was
-    /// deleted after the run — over stubs naming the installed app's live atpkg. Every launch
-    /// and session spawn runs that lay, and so does every pass for the pending stubs and the
-    /// `agents/` twins, all from `<current_exe dir>/atpkg`, never asking whether it exists.
-    ///
-    /// Reproduced as it happened: a copy of this test binary in a scratch `bin/` with no
-    /// `atpkg` beside it runs the three real lays over a prefix whose every file names a
-    /// live, installed atpkg. Nothing may be re-pointed at the scratch directory, and every
-    /// file still names the installed atpkg afterwards.
-    ///
-    /// NEGATIVE CONTROL, the legitimate re-lay: the installed app MOVES (its old atpkg gone,
-    /// the app at a new path with the `atpkg` alias beside it) and every file is re-laid
-    /// naming the new path; and a FRESH prefix is laid naming it too. Without this half the
-    /// first half would pass for a lay that re-points nothing ever.
+    /// A copy of this test binary in a scratch `bin/` with no `atpkg` beside it runs the
+    /// three real lays over a prefix whose every file names the installed app's live atpkg:
+    /// nothing is re-pointed at the scratch directory. Negative control: when the installed
+    /// app moves (old atpkg gone, the alias beside its new path), every file is re-laid
+    /// naming the new path, and a fresh prefix names it too.
     #[cfg(unix)]
     #[test]
     fn a_copy_run_from_a_scratch_dir_never_re_points_a_laid_file_at_a_missing_atpkg() {
         if std::env::var_os(LAY_AS_COPY_ENV).is_some() {
             return;
         }
-        // Removed however the test ends — a failed run leaves no copies of this binary
-        // (tens of MB each) behind in the temp dir.
+        // Removed however the test ends: no copies of this binary left in the temp dir.
         let scratch = aterm_tempfile::Builder::new()
             .prefix("atpkg-lay-as-copy-")
             .tempdir()
@@ -1829,7 +1981,7 @@ mod tests {
         crate::store::mark_build_ready(&build).unwrap();
         // Every file laid once, then named at the installed app — its launch's state.
         crate::reroute::lay(&l).unwrap();
-        lay_adoption_stubs(&l);
+        lay_adoption_stubs(&l, &crate::config::PackagesConfig::default());
         crate::activate::reconcile_agents(&l);
         name_atpkg_everywhere(&l.prefix, &installed);
         let before = atpkg_named_under(&l.prefix);
@@ -1851,7 +2003,7 @@ mod tests {
             );
         }
 
-        // THE SCRATCH COPY: `<scratch>/bin/aterm`, nothing beside it.
+        // The scratch copy: `<scratch>/bin/aterm`, nothing beside it.
         let scratch = root.join("scratch/bin/aterm");
         lay_as_copy_at(&scratch, false, &l);
         let after = atpkg_named_under(&l.prefix);
@@ -1870,8 +2022,8 @@ mod tests {
             "every laid file still names the installed atpkg"
         );
 
-        // NEGATIVE CONTROL: the installed app moved. Its old atpkg is gone; the app runs
-        // from its new path, alias beside it, and every file follows it.
+        // Negative control: the installed app moved (its old atpkg gone, the alias beside
+        // its new path), and every file follows it.
         std::fs::remove_file(&installed).unwrap();
         let moved = root.join("Moved/aterm.app/Contents/MacOS/aterm");
         lay_as_copy_at(&moved, true, &l);

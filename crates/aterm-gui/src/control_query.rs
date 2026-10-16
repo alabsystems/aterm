@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Read-only screen introspection serializers — the SACRED AI-reads-the-screen
-//! path. These verbs read the live [`Terminal`] grid/renderer and serialize it
-//! to the control protocol's text/JSON replies; they NEVER mutate state. Moved
-//! verbatim from `control.rs` (behavior-preserving); the shared JSON/encode
-//! helpers (`json_*`, `pct_encode`, `visible_char`, `cursor_style_name`) stay in
+//! Screen and application introspection serializers, plus message write adapters.
+//! Screen queries read the live [`Terminal`] grid/renderer and serialize it to
+//! text/JSON replies. The `notice`, `appnotice` and `devtools` adapters instead
+//! send explicit requests to the main-thread owner. Shared JSON/encode helpers
+//! (`json_*`, `pct_encode`, `visible_char`, `cursor_style_name`) live in
 //! `control.rs` and are imported via `super::`.
 
 use std::collections::VecDeque;
@@ -1058,7 +1058,7 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
              n_reflow={} reflow_p50_ms={:.2} reflow_p95_ms={:.2} reflow_p99_ms={:.2} \
              n_present_tainted={} present_tainted_p50_ms={:.2} \
              present_tainted_p95_ms={:.2} present_tainted_p99_ms={:.2} \
-             turns_by_root={}{}{}{}{}\n",
+             turns_by_root={} main_busy_ms_per_s={:.2}{}{}{}{}\n",
             input.count(),
             p(input, 0.50),
             p(input, 0.95),
@@ -1115,6 +1115,9 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
             // THE MAIN-LOOP TURN DISTRIBUTION PER ROOT (responsiveness audit
             // item 3): the census on the summary line keeps last/max/count only.
             turns_by_root_pairs(),
+            // …and their sum per second of the window: the main thread's
+            // occupancy, which no percentile of one turn can show.
+            crate::watchdog::main_busy_ms_per_s(),
             // UI-THREAD TERMINAL-MUTEX WAIT, per acquiring site (the redraw's one
             // frame hold, the key press): the span the typing audit listed as
             // unmeasured. Formatted by one helper so text and JSON stay twins.
@@ -1242,7 +1245,7 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
          startup_gpu_cell_pipeline_ms={} \
          effect_pipeline_builds={} effect_pipeline_build_ms={:.2} \
          effect_pipelines_built={} \
-         first_present_ms={:.2} first_visible_ms={:.2}{}{}{}{}{}{}{}\n",
+         first_present_ms={:.2} first_visible_ms={:.2}{}{}{}{}{}{}{}{}\n",
         m.frames_presented,
         ms(m.last_present_latency_ns),
         ms(m.max_present_latency_ns),
@@ -1444,6 +1447,11 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
         // claimed a handoff, each boundary of its boot in ms after the claim,
         // and the warm it did before its dial. `none` on every other launch.
         crate::metrics::handoff_claim_fields_text(),
+        // BEFORE WINIT RUNS (CS-2): the kernel's birth → Rust main (the
+        // loader's share, a Gatekeeper hold included), and GUI preparation in
+        // ten exclusive phases that sum to `startup_gui_prepare_ms` — read
+        // live, so a headless launch answers too.
+        crate::metrics::startup_prepare_fields_text(m.startup_gui_prepare_ns),
         // THE CONTROL LISTENER (2026-09-25 incident): accepts, the last
         // accept's age, the kernel queue it last read, rebinds of a wedged
         // listening socket, and the lane-admission refusals.
@@ -1784,7 +1792,8 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
              \"n_reflow\":{},\"reflow_p50_ms\":{:.2},\"reflow_p95_ms\":{:.2},\
              \"reflow_p99_ms\":{:.2},\"n_present_tainted\":{},\
              \"present_tainted_p50_ms\":{:.2},\"present_tainted_p95_ms\":{:.2},\
-             \"present_tainted_p99_ms\":{:.2},\"turns_by_root\":{}{}{}{}{}}}",
+             \"present_tainted_p99_ms\":{:.2},\"turns_by_root\":{},\
+             \"main_busy_ms_per_s\":{:.2}{}{}{}{}}}",
             input.count(),
             p(input, 0.50),
             p(input, 0.95),
@@ -1840,6 +1849,7 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
             p(tainted, 0.99),
             // Twin of the text form's per-root turn distribution.
             turns_by_root_object(),
+            crate::watchdog::main_busy_ms_per_s(),
             // Field-for-field twin of the text form's term-wait fragment.
             json_term_wait_fields(),
             // Field-for-field twin of the text form's echo fragment.
@@ -1949,7 +1959,7 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
          \"startup_gpu_cell_pipeline_ms\":{},\
          \"effect_pipeline_builds\":{},\"effect_pipeline_build_ms\":{:.2},\
          \"effect_pipelines_built\":\"{}\",\
-         \"first_present_ms\":{:.2},\"first_visible_ms\":{:.2}{}{}{}{}{}{}{}}}",
+         \"first_present_ms\":{:.2},\"first_visible_ms\":{:.2}{}{}{}{}{}{}{}{}}}",
         m.frames_presented,
         ms(m.last_present_latency_ns),
         ms(m.max_present_latency_ns),
@@ -2110,6 +2120,8 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
         crate::metrics::handoff_input_fields_json(),
         // Field-for-field twin of the text summary's claim-timeline fragment.
         crate::metrics::handoff_claim_fields_json(),
+        // Field-for-field twin of the text summary's before-winit fragment.
+        crate::metrics::startup_prepare_fields_json(m.startup_gui_prepare_ns),
         // Field-for-field twin of the text summary's control-listener fragment.
         crate::control_listener::fields_json(),
         // Field-for-field twin of the text summary's PTY census.
@@ -2412,7 +2424,7 @@ fn format_offscreen_reply(
 }
 
 /// `line <n>` -> `OK <text>\n` for the line at MONOTONIC ABSOLUTE row `n`, or
-/// `ERR out of range\n` / `ERR evicted\n`.
+/// `ERR out of range\n` / `ERR evicted\n` / `ERR unreadable\n`.
 ///
 /// COORDINATE SPACE (B-2): `n` is an ABSOLUTE row — the same space `blocks` and
 /// `search` report — NOT a 0-based history index. This is the ONE documented
@@ -2426,7 +2438,8 @@ fn format_offscreen_reply(
 /// A row OLDER than `oldest_absolute_row()` has scrolled past the scrollback cap
 /// and is reported as an EXPLICIT `ERR evicted\n` (never silently-shifted text —
 /// the same eviction contract `blocktext` honors). Control chars collapse to
-/// spaces; trailing spaces are trimmed.
+/// spaces; trailing spaces are trimmed. An unreadable retained row is an
+/// explicit error, distinct from the live screen's end.
 pub(crate) fn cmd_line(term: &Arc<Mutex<Terminal>>, rest: &str) -> String {
     let Ok(n) = rest.trim().parse::<u64>() else {
         return "ERR usage: line <abs_row>\n".to_string();
@@ -2436,6 +2449,7 @@ pub(crate) fn cmd_line(term: &Arc<Mutex<Terminal>>, rest: &str) -> String {
         AbsRow::Text(s) => s,
         AbsRow::Evicted => return "ERR evicted\n".to_string(),
         AbsRow::OutOfRange => return "ERR out of range\n".to_string(),
+        AbsRow::Unreadable => return "ERR unreadable\n".to_string(),
     };
     let mut s: String = text.chars().map(visible_char).collect();
     while s.ends_with(' ') {
@@ -2452,6 +2466,8 @@ pub(crate) enum AbsRow {
     Evicted,
     /// Newer than the live bottom visible row (no such row).
     OutOfRange,
+    /// Within retained history, but its stored line could not be read.
+    Unreadable,
 }
 
 /// Resolve a MONOTONIC ABSOLUTE row to its grapheme-faithful text, in the ONE
@@ -2477,7 +2493,7 @@ pub(crate) fn abs_row_text(t: &Terminal, abs_row: u64) -> AbsRow {
         // Scrollback history line `rel` (0 = oldest retained).
         match grid.get_history_line(rel as usize) {
             Some(line) => AbsRow::Text(line.to_string()),
-            None => AbsRow::OutOfRange,
+            None => AbsRow::Unreadable,
         }
     } else {
         let visible = rel - scrollback;
@@ -2607,7 +2623,7 @@ pub(crate) fn read_abs_rows(
             }
             None => text.push(match abs_row_text(t, abs) {
                 AbsRow::Text(s) => s,
-                AbsRow::Evicted | AbsRow::OutOfRange => String::new(),
+                AbsRow::Evicted | AbsRow::OutOfRange | AbsRow::Unreadable => String::new(),
             }),
         }
         wrapped.push(abs_row_wrapped(t, abs));
@@ -2643,8 +2659,9 @@ pub(crate) fn logical_origin(t: &Terminal, abs_row: u64, floor: u64) -> Option<u
     None
 }
 
-/// `search <pat…> [case] [regex]` -> `OK <count>[ incomplete[ capped][ rewrapping][ long-line][ older]]\n`
-/// then `<abs_row> <col> <len>` per match.
+/// `search <pat…> [case] [regex]` -> `OK <count>[ incomplete[ capped][ rewrapping][ long-line][ changed][ older]]\n`
+/// then `<abs_row> <col> <len>` per match. The header ends with
+/// `screen_first=<abs_row>`, the live screen's first row in the searched frame.
 ///
 /// SEARCH-1: backed by the engine's real `TerminalSearch`, indexing BOTH the
 /// SCROLLBACK (one dense walk, [`read_abs_rows`]) AND the visible rows
@@ -2689,9 +2706,10 @@ pub(crate) fn logical_origin(t: &Terminal, abs_row: u64, floor: u64) -> Option<u
 /// when a regex scan could not finish some line within the line's budget (a
 /// soft-wrapped run of megabytes), so matches past where it stopped on that line
 /// are missing — the pattern is fine, and the rest of the searched range was
-/// searched — and ` older` when, besides one of those, history older than the
-/// newest `search_history_lines` lines was not read. The depth cap alone is a
-/// bare ` incomplete`, as it has been since DL-2.
+/// searched — ` changed` when the terminal moved while the snapshot or query
+/// ran, so its coordinates require a fresh read — and ` older` when, besides
+/// one of those, history older than the newest `search_history_lines` lines
+/// was not read. The depth cap alone is a bare ` incomplete`, as it has been since DL-2.
 ///
 /// LOCKING (P1.0c): the O(scrollback) index build NEVER runs under the Terminal
 /// mutex — a rebuild while the shell is streaming output would stall the PTY
@@ -2740,7 +2758,12 @@ fn cmd_search_capped(
         pat = head.trim_end();
     }
     if pat.is_empty() {
-        return "OK 0\n".to_string();
+        let t = term_lock(term);
+        let screen_first = t
+            .grid()
+            .oldest_absolute_row()
+            .saturating_add(t.grid().scrollback_lines() as u64);
+        return format!("OK 0 screen_first={screen_first}\n");
     }
     let before = rewrap();
     let searched = search_full_history_capped(term, pat, case_sensitive, is_regex, depth_cap);
@@ -2752,19 +2775,20 @@ fn cmd_search_capped(
             // never shadow an `io::Write` elsewhere in the module.
             use std::fmt::Write as _;
             let qualifier = search_incomplete_marker(
-                search.results.incomplete || rewrapping,
+                search.results.incomplete || rewrapping || !search.consistent,
                 search.results.matches.len() >= MAX_SEARCH_MATCHES,
                 rewrapping,
                 search.results.cut_short_lines > 0,
+                !search.consistent,
                 search.searched_lines.is_some(),
             );
-            let mut out = format!("OK {}{qualifier}\n", search.results.matches.len());
-            // One buffer, sized once: a match line ("<row> <col> <len>\n") is ~16
-            // bytes typical, and the result set is capped at MAX_SEARCH_MATCHES
-            // (100_000) => at most ~2.4 MB, so this can neither overflow nor run
-            // away. The old shape allocated a throwaway `String` per match purely
-            // to memcpy it in, and grew `out` by ~17 doubling reallocs on a broad
-            // pattern. Bytes on the wire are unchanged.
+            let mut out = format!(
+                "OK {}{qualifier} screen_first={}\n",
+                search.results.matches.len(),
+                search.base_y,
+            );
+            // Reserve an estimated 24 bytes per match in this capped list;
+            // wider decimal coordinates can grow the buffer as needed.
             out.reserve(search.results.matches.len() * 24);
             for m in &search.results.matches {
                 // m.line is the ABSOLUTE row (the index is keyed by absolute row).
@@ -2779,24 +2803,16 @@ fn cmd_search_capped(
 
 /// The ` incomplete…` marker of a `search` reply header ([`cmd_search`]):
 /// empty for an exhaustive list, else ` incomplete` followed by EVERY cause that
-/// applies, in a fixed order — ` capped`, ` rewrapping`, ` long-line`, then
-/// ` older` for the depth cap (`search_history_lines` left older history
-/// unread). The depth cap alone stays a bare ` incomplete`, its form since DL-2,
-/// so a reader that knows only that form still reads it right; the rule a reader
-/// applies is "older history was not searched when no cause follows
-/// ` incomplete`, or when ` older` does".
-///
-/// Ruling 2026-10-11 (R15 content-2 review): the header named ONE cause, and the
-/// first one won, so a depth cap under a cut-short line (`long-line`), a full
-/// list (`capped`) or a rewrap went unsaid, and an agent reading the verb help
-/// concluded the older history had been searched. Every cause is now named; the
-/// tokens follow the count, which is all the framing reads, so an older client
-/// keeps every match and an older `aterm ctl` still names the first cause.
+/// applies, in a fixed order — ` capped`, ` rewrapping`, ` long-line`,
+/// ` changed`, then ` older` for the depth cap (`search_history_lines` left
+/// older history unread). A bare ` incomplete` also means the depth cap alone;
+/// ` older` is explicit only when another cause is present.
 fn search_incomplete_marker(
     incomplete: bool,
     capped: bool,
     rewrapping: bool,
     cut_short: bool,
+    changed: bool,
     older: bool,
 ) -> String {
     if !incomplete {
@@ -2808,6 +2824,7 @@ fn search_incomplete_marker(
         (capped, " capped"),
         (rewrapping, " rewrapping"),
         (cut_short, " long-line"),
+        (changed, " changed"),
     ] {
         if applies {
             marker.push_str(token);
@@ -4478,6 +4495,60 @@ pub(crate) fn cmd_notice(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     };
     match control_media::call_main(proxy, |reply| Wake::Notice { request, reply }) {
         Ok(line) => format!("{line}\n"),
+        Err(error) => format!("ERR {error}\n"),
+    }
+}
+
+/// The usage line every junk `devtools` form answers with.
+pub(crate) const DEVTOOLS_USAGE: &str = "ERR usage: devtools hand-over [now]\n";
+
+/// The grammar of `devtools hand-over [now]`, checked on the control thread so a junk
+/// form is a usage error and never a wake: `Ok(now)`. Pure.
+pub(crate) fn parse_devtools(rest: &str) -> Result<bool, &'static str> {
+    let mut words = rest.split_whitespace();
+    let now = match (words.next(), words.next(), words.next()) {
+        (Some("hand-over"), None, None) => false,
+        (Some("hand-over"), Some("now"), None) => true,
+        _ => return Err(DEVTOOLS_USAGE),
+    };
+    Ok(now)
+}
+
+/// What one asked hand-over did, as the wire answers it: `OK <word>` for everything the
+/// window decided (done, waiting, or nothing and why: `granted`, `unknown`, `declined`,
+/// `unstable`, `recent`), `ERR headless: …` on a headless instance, and an `ERR` for a
+/// page that did not open (an owner press's outcome; the verb never opens the page as
+/// it asks). Pure.
+pub(crate) fn devtools_reply(outcome: crate::devtools_helper::HandOver) -> String {
+    use crate::devtools_helper::HandOver;
+    match outcome {
+        HandOver::Headless => {
+            "ERR headless: a headless instance brings no System Settings page up\n".to_string()
+        }
+        HandOver::OpenFailed => "ERR devtools: System Settings did not open\n".to_string(),
+        other => format!("OK {}\n", other.as_str()),
+    }
+}
+
+/// `devtools hand-over [now]` -> one status line: the control verb's way into the
+/// window's ONE Developer Tools hand-over (`App::hand_devtools_to_owner` with
+/// `devtools_helper::Origin::Ctl`), which `aterm doctor` asks so the owner gets aterm's
+/// helper panel beside System Settings instead of a bare page (owner ask 2026-10-15).
+/// Owner-only at the socket, and held by the window to its own rules besides (Owner is
+/// every in-session client): the bare form waits for a quiet moment, `now` shows only
+/// the panel and leaves the page to its asker. The grammar is [`parse_devtools`]'s and
+/// the answer [`devtools_reply`]'s; the hand-over itself runs on the MAIN THREAD
+/// (`Wake::DevToolsHandOverAsked`). Off macOS there is no such list, answered here.
+pub(crate) fn cmd_devtools(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
+    let now = match parse_devtools(rest) {
+        Ok(now) => now,
+        Err(usage) => return usage.to_string(),
+    };
+    if !cfg!(target_os = "macos") {
+        return "ERR unsupported: the Developer Tools list is macOS's\n".to_string();
+    }
+    match control_media::call_main(proxy, |reply| Wake::DevToolsHandOverAsked { now, reply }) {
+        Ok(outcome) => devtools_reply(outcome),
         Err(error) => format!("ERR {error}\n"),
     }
 }
@@ -6640,9 +6711,17 @@ mod tests {
              and the one row below the boundary that a soft-wrap run could have reached \
              into it from"
         );
+        let after = cmd_search(&term, "NEEDLE_alpha", &RewrapGauge::default());
+        let (before_head, before_hits) = r1.split_once('\n').expect("header");
+        let (after_head, after_hits) = after.split_once('\n').expect("header");
+        assert!(before_head.ends_with(" screen_first=18"), "{r1}");
+        assert!(after_head.ends_with(" screen_first=19"), "{after}");
         assert_eq!(
-            cmd_search(&term, "NEEDLE_alpha", &RewrapGauge::default()),
-            r1,
+            search_header_without_frame(&after),
+            search_header_without_frame(&r1)
+        );
+        assert_eq!(
+            after_hits, before_hits,
             "absolute row of the old needle is stable across the refresh"
         );
     }
@@ -6707,7 +6786,7 @@ mod tests {
         );
         let hit = cmd_search(&term, "L9", &RewrapGauge::default());
         let mut lines = hit.lines();
-        assert_eq!(lines.next(), Some("OK 1"), "{hit}");
+        assert_eq!(lines.next(), Some("OK 1 screen_first=3"), "{hit}");
         let row: u64 = lines
             .next()
             .and_then(|l| l.split(' ').next())
@@ -6737,7 +6816,7 @@ mod tests {
         term.lock().unwrap().process("→→foo bar".as_bytes());
         assert_eq!(
             cmd_search(&term, "foo", &RewrapGauge::default()),
-            "OK 1\n0 4 3\n"
+            "OK 1 screen_first=0\n0 4 3\n"
         );
 
         let term = Arc::new(Mutex::new(Terminal::new(4, 10)));
@@ -6749,7 +6828,7 @@ mod tests {
         );
         assert_eq!(
             cmd_search(&term, "abfoo", &RewrapGauge::default()),
-            "OK 1\n0 8 5\n"
+            "OK 1 screen_first=0\n0 8 5\n"
         );
     }
 
@@ -6771,7 +6850,7 @@ mod tests {
         );
         assert_eq!(
             cmd_search(&term, "XYZ", &RewrapGauge::default()),
-            "OK 1\n0 4 3\n"
+            "OK 1 screen_first=0\n0 4 3\n"
         );
     }
 
@@ -6803,7 +6882,10 @@ mod tests {
         fresh.lock().unwrap().process("→→foo bar".as_bytes());
         fresh.lock().unwrap().apply_config(&wide);
         let fresh = cmd_search(&fresh, "foo", &RewrapGauge::default());
-        assert_eq!(fresh, "OK 1\n0 2 3\n", "where the grid paints it");
+        assert_eq!(
+            fresh, "OK 1 screen_first=0\n0 2 3\n",
+            "where the grid paints it"
+        );
         assert_eq!(narrow, fresh, "a row keeps the cells it was drawn in");
         assert_eq!(after_switch, fresh);
     }
@@ -6825,13 +6907,30 @@ mod tests {
         let ask = |q: &str| cmd_search(&term, q, &RewrapGauge::default());
         let on_screen: Vec<String> = queries.iter().map(|q| ask(q)).collect();
         assert_eq!(
-            on_screen[0], "OK 1\n3 0 3\n",
+            on_screen[0], "OK 1 screen_first=0\n3 0 3\n",
             "only the line ending at `foo`"
         );
-        assert_eq!(on_screen[2], "OK 1\n0 0 5\n", "the printed spaces are text");
+        assert_eq!(
+            on_screen[2], "OK 1 screen_first=0\n0 0 5\n",
+            "the printed spaces are text"
+        );
         term.lock().unwrap().process(b"\r\n1\r\n2\r\n3\r\n4");
         let in_history: Vec<String> = queries.iter().map(|q| ask(q)).collect();
-        assert_eq!(in_history, on_screen);
+        for (before, after) in on_screen.iter().zip(&in_history) {
+            let (before_head, before_rows) = before.split_once('\n').expect("header");
+            let (after_head, after_rows) = after.split_once('\n').expect("header");
+            assert!(before_head.ends_with(" screen_first=0"), "{before}");
+            assert!(after_head.ends_with(" screen_first=4"), "{after}");
+            assert_eq!(
+                before_head
+                    .split_once(" screen_first=")
+                    .map(|(head, _)| head),
+                after_head
+                    .split_once(" screen_first=")
+                    .map(|(head, _)| head),
+            );
+            assert_eq!(after_rows, before_rows, "absolute hit coordinates stay put");
+        }
     }
 
     /// A soft-wrap run is indexed as ONE line keyed at the row it starts on, so
@@ -6876,7 +6975,9 @@ mod tests {
     fn row_text(term: &Arc<Mutex<Terminal>>, abs: u64) -> String {
         match super::abs_row_text(&term_lock(term), abs) {
             super::AbsRow::Text(s) => s,
-            super::AbsRow::Evicted | super::AbsRow::OutOfRange => "<evicted>".to_string(),
+            super::AbsRow::Evicted | super::AbsRow::OutOfRange | super::AbsRow::Unreadable => {
+                "<evicted>".to_string()
+            }
         }
     }
 
@@ -6905,7 +7006,7 @@ mod tests {
         );
         assert_eq!(
             cmd_search(&term, "KLMNOPQRST", &RewrapGauge::default()),
-            "OK 1\n2 0 10\n",
+            "OK 1 screen_first=0\n2 0 10\n",
             "the hit is reported on the row it is printed on"
         );
     }
@@ -6926,7 +7027,7 @@ mod tests {
         );
         assert_eq!(
             cmd_search(&term, "ABCDEFGHIJ", &RewrapGauge::default()),
-            "OK 1\n1 0 10\n",
+            "OK 1 screen_first=0\n1 0 10\n",
             "the hit is reported on the row it is printed on"
         );
     }
@@ -6949,12 +7050,12 @@ mod tests {
         // beginning, and its near side is not an end.
         assert_eq!(
             cmd_search(&term, "^ABC regex", &RewrapGauge::default()),
-            "OK 0\n",
+            "OK 0 screen_first=0\n",
             "a continuation row's column 0 is not where the line begins"
         );
         assert_eq!(
             cmd_search(&term, "9$ regex", &RewrapGauge::default()),
-            "OK 0\n",
+            "OK 0 screen_first=0\n",
             "the column the wrap pushed to a row's end is not where the line ends"
         );
 
@@ -6962,11 +7063,11 @@ mod tests {
         // re-expressed on the physical row it occupies.
         assert_eq!(
             cmd_search(&term, "^0123 regex", &RewrapGauge::default()),
-            "OK 1\n0 0 4\n"
+            "OK 1 screen_first=0\n0 0 4\n"
         );
         assert_eq!(
             cmd_search(&term, "J$ regex", &RewrapGauge::default()),
-            "OK 1\n1 9 1\n"
+            "OK 1 screen_first=0\n1 9 1\n"
         );
         assert_eq!(
             cmd_search(
@@ -6974,7 +7075,7 @@ mod tests {
                 "^0123456789ABCDEFGHIJ$ regex",
                 &RewrapGauge::default()
             ),
-            "OK 1\n0 0 20\n",
+            "OK 1 screen_first=0\n0 0 20\n",
             "anchored end to end, the run is ONE line whose len counts through the wrap"
         );
 
@@ -6983,7 +7084,7 @@ mod tests {
         term.lock().unwrap().process(b"\x1b[3;1Hxyz");
         assert_eq!(
             cmd_search(&term, "^xyz$ regex", &RewrapGauge::default()),
-            "OK 1\n2 0 3\n"
+            "OK 1 screen_first=0\n2 0 3\n"
         );
     }
 
@@ -7169,6 +7270,15 @@ mod tests {
         );
     }
 
+    /// The count and cause tokens, with the additive absolute-frame field
+    /// separated from them. Full wire fixtures below check the field itself.
+    fn search_header_without_frame(reply: &str) -> &str {
+        let header = reply.lines().next().expect("search header");
+        let (head, first) = header.split_once(" screen_first=").expect("search frame");
+        first.parse::<u64>().expect("absolute screen row");
+        head
+    }
+
     /// The header names WHY a list is not exhaustive when it is not the depth
     /// cap: a full list (`capped`) over a buffer inside the cap, and a search
     /// a rewrap overlapped (`rewrapping`), which may have reached only the
@@ -7186,7 +7296,7 @@ mod tests {
             super::DEFAULT_MAX_CACHED_LINES,
             RewrapReading::default,
         );
-        let header = full.lines().next().unwrap_or_default();
+        let header = search_header_without_frame(&full);
         assert_eq!(
             header,
             format!("OK {} incomplete capped", super::MAX_SEARCH_MATCHES)
@@ -7209,11 +7319,11 @@ mod tests {
         let gauge = Arc::new(RewrapGauge::default());
         let held = gauge.begin_job(1);
         let away = super::cmd_search_capped(&small, "missing", cap, || gauge.reading());
-        assert_eq!(away, "OK 0 incomplete rewrapping\n");
+        assert_eq!(away, "OK 0 incomplete rewrapping screen_first=0\n");
         held.finish(WaitEnd::Done);
         let home = super::cmd_search_capped(&small, "missing", cap, || gauge.reading());
         assert_eq!(
-            home, "OK 0\n",
+            home, "OK 0 screen_first=0\n",
             "a job that ended before the search is no overlap"
         );
     }
@@ -7239,7 +7349,7 @@ mod tests {
             .unwrap()
             .process(format!("$ cat bundle.js\r\n{bundle}\r\n$ echo x=1\r\n").as_bytes());
         let reply = super::cmd_search_capped(&term, "[a-z]+= regex", cap, RewrapReading::default);
-        let header = reply.lines().next().unwrap_or_default();
+        let header = search_header_without_frame(&reply);
         let count: usize = header
             .strip_prefix("OK ")
             .and_then(|n| n.parse().ok())
@@ -7259,7 +7369,11 @@ mod tests {
             RewrapReading::default,
         );
         let mut lines = reply.lines();
-        assert_eq!(lines.next(), Some("OK 2 incomplete long-line"), "{reply}");
+        assert_eq!(
+            search_header_without_frame(lines.next().expect("header")),
+            "OK 2 incomplete long-line",
+            "{reply}"
+        );
         assert_eq!(
             lines.map(|line| line.split(' ').nth(1)).collect::<Vec<_>>(),
             vec![Some("7"), Some("6")],
@@ -7276,7 +7390,7 @@ mod tests {
     #[test]
     fn the_search_header_names_the_depth_cap_beside_another_cause() {
         let _serial = super::search_cap_test_guard();
-        let header = |reply: &str| reply.lines().next().unwrap_or_default().to_string();
+        let header = |reply: &str| search_header_without_frame(reply).to_string();
         let term = Arc::new(Mutex::new(Terminal::new(4, 500)));
         let mut text = String::from("old z\r\n");
         for i in 0..400 {
@@ -7362,10 +7476,14 @@ mod tests {
             }
         });
         assert!(!gauge.reading().running, "idle at both readings");
-        assert_eq!(reply, "OK 0 incomplete rewrapping\n");
+        assert_eq!(
+            search_header_without_frame(&reply),
+            "OK 0 incomplete rewrapping"
+        );
+        assert_eq!(reply.lines().count(), 1, "no matches in detached history");
         let home = super::cmd_search_capped(&term, "NEEDLE", cap, || gauge.reading());
         assert!(
-            home.starts_with("OK 1\n"),
+            home.starts_with("OK 1 screen_first="),
             "the re-attached history holds the needle: {home}"
         );
     }
@@ -7456,6 +7574,23 @@ mod tests {
             raced.content_seq,
             term_lock(&term).content_seq(),
             "the result retains its original coordinate-generation stamp"
+        );
+
+        // The socket reply must preserve that refusal too: clients have no
+        // FullHistorySearch generation stamp to judge its coordinates by.
+        let gauge = crate::session_waits::RewrapGauge::default();
+        let settled = super::cmd_search(&term, "needle", &gauge);
+        assert!(settled.starts_with("OK 1 screen_first=0\n"), "{settled}");
+        super::arm_search_cache_hit_mutation(&term);
+        let raced = super::cmd_search(&term, "needle", &gauge);
+        assert!(
+            raced.starts_with("OK 1 incomplete changed screen_first=0\n"),
+            "{raced}"
+        );
+        let settled = super::cmd_search(&term, "needle", &gauge);
+        assert!(
+            settled.starts_with("OK 1 screen_first=0\n"),
+            "the next stable read: {settled}"
         );
     }
 
@@ -7662,6 +7797,20 @@ mod tests {
             ("startup_successful_compose_ms", SUMMARY),
             ("startup_successful_surface_transaction_ms", SUMMARY),
             ("startup_successful_finalize_ms", SUMMARY),
+            // Before winit: the loader's share, and GUI preparation split.
+            ("process_birth_to_rust_main_ms", SUMMARY),
+            ("startup_prepare_schema", SUMMARY),
+            ("startup_prepare_valid", SUMMARY),
+            ("startup_prepare_boot_ms", SUMMARY),
+            ("startup_prepare_warm_ms", SUMMARY),
+            ("startup_prepare_event_loop_ms", SUMMARY),
+            ("startup_prepare_services_ms", SUMMARY),
+            ("startup_prepare_journal_ms", SUMMARY),
+            ("startup_prepare_session0_ms", SUMMARY),
+            ("startup_prepare_control_ms", SUMMARY),
+            ("startup_prepare_config_join_ms", SUMMARY),
+            ("startup_prepare_app_ms", SUMMARY),
+            ("startup_prepare_arm_ms", SUMMARY),
             ("startup_attach_schema", SUMMARY),
             ("startup_attach_valid", SUMMARY),
             ("startup_attach_dispatch_ms", SUMMARY),
@@ -7726,6 +7875,9 @@ mod tests {
             ("resize_p99_ms", PERCENTILES),
             ("n_reflow", PERCENTILES),
             ("reflow_p99_ms", PERCENTILES),
+            // The main thread's occupancy: on the summary with the census it
+            // sums, and beside the per-root distributions it is the sum of.
+            ("main_busy_ms_per_s", ALL),
             // ECHO ROUND TRIP (audit item 5): the only slice on this line that
             // measures the CHILD rather than aterm. Its counters are asserted
             // alongside its percentiles because a percentile published without
@@ -7843,6 +7995,7 @@ mod tests {
                     "turns",
                     "long_turns",
                     "long_turn_threshold_ms",
+                    "main_busy_ms_per_s",
                 ][..],
             ),
         ] {
@@ -9728,6 +9881,72 @@ mod story_tests {
     }
 }
 
+#[cfg(test)]
+mod devtools_verb_tests {
+    //! `devtools hand-over [now]` (owner ask 2026-10-15): the grammar is checked on
+    //! the control thread, and every outcome of the window's one hand-over has one
+    //! wire answer, which the verb's help names.
+
+    use super::{DEVTOOLS_USAGE, devtools_reply, parse_devtools};
+    use crate::devtools_helper::{HandOver, Refusal};
+
+    #[test]
+    fn the_grammar_is_hand_over_with_an_optional_now() {
+        assert_eq!(parse_devtools("hand-over"), Ok(false));
+        assert_eq!(parse_devtools("  hand-over  "), Ok(false));
+        assert_eq!(parse_devtools("hand-over now"), Ok(true));
+        assert_eq!(parse_devtools("hand-over   now\t"), Ok(true));
+        for junk in [
+            "",
+            "   ",
+            "handover",
+            "hand-over later",
+            "hand-over now now",
+            "now",
+            "now hand-over",
+            "HAND-OVER",
+            "hand-over NOW",
+            "open",
+        ] {
+            assert_eq!(parse_devtools(junk), Err(DEVTOOLS_USAGE), "{junk:?}");
+        }
+    }
+
+    /// Each outcome one line, `OK <word>` for what the window decided and an `ERR`
+    /// only where nothing could be decided (headless) or the page failed; and every
+    /// answer the verb can give as it asks is named in its help, so an asker
+    /// (`aterm doctor`) can key on the words the help promises.
+    #[test]
+    fn every_outcome_has_one_answer_and_the_help_names_the_verbs_own() {
+        let asked = [
+            (HandOver::Queued, "OK queued\n"),
+            (HandOver::Shown, "OK shown\n"),
+            (HandOver::Unshown, "OK unshown\n"),
+            (HandOver::Refused(Refusal::Granted), "OK granted\n"),
+            (HandOver::Refused(Refusal::Unknown), "OK unknown\n"),
+            (HandOver::Refused(Refusal::Declined), "OK declined\n"),
+            (HandOver::Refused(Refusal::Unstable), "OK unstable\n"),
+            (HandOver::Refused(Refusal::Recent), "OK recent\n"),
+            (HandOver::Refused(Refusal::Listed), "OK listed\n"),
+        ];
+        let help = aterm_types::control_verbs::spec("devtools")
+            .expect("devtools is in the table")
+            .help_line();
+        for (outcome, want) in asked {
+            assert_eq!(devtools_reply(outcome), want);
+            let words = format!("`{}`", want.trim_end());
+            assert!(help.contains(&words), "the help names {words}\n{help}");
+        }
+        let headless = devtools_reply(HandOver::Headless);
+        assert!(headless.starts_with("ERR headless: "), "{headless}");
+        assert!(help.contains("`ERR headless: \u{2026}`"), "{help}");
+        // An owner press's outcomes, total though the verb never opens as it asks.
+        assert_eq!(devtools_reply(HandOver::Opened), "OK opened\n");
+        assert_eq!(devtools_reply(HandOver::Listing), "OK listing\n");
+        assert!(devtools_reply(HandOver::OpenFailed).starts_with("ERR "));
+    }
+}
+
 /// DENSE HISTORY on the native search: the snapshot the `search` verb and the
 /// find bar index reads its scrollback through [`read_abs_rows`]'s one dense
 /// walk, row for row what the per-row readers answer.
@@ -9737,7 +9956,7 @@ mod dense_history_tests {
 
     use aterm_core::terminal::Terminal;
 
-    use super::{AbsRow, abs_row_text, abs_row_wrapped, cmd_search, read_abs_rows};
+    use super::{AbsRow, abs_row_text, abs_row_wrapped, cmd_line, cmd_search, read_abs_rows};
     use crate::session_waits::RewrapGauge;
 
     /// A terminal whose history runs through a TIERED store holding a corrupt
@@ -9817,7 +10036,7 @@ mod dense_history_tests {
             .map(|abs| {
                 let text = match abs_row_text(t, abs) {
                     AbsRow::Text(s) => s,
-                    AbsRow::Evicted | AbsRow::OutOfRange => String::new(),
+                    AbsRow::Evicted | AbsRow::OutOfRange | AbsRow::Unreadable => String::new(),
                 };
                 (text, abs_row_wrapped(t, abs))
             })
@@ -9879,6 +10098,22 @@ mod dense_history_tests {
                 .expect("the second needle is read")
         };
         assert_eq!(after(&skipping) + corrupt, after(&text));
+
+        // A per-row client must not mistake a corrupt retained row for the
+        // end of the live screen and silently stop a transcript there.
+        let unreadable = oldest
+            + t.grid()
+                .history_lines_from(0)
+                .position(|line| line.is_none())
+                .expect("a corrupt row") as u64;
+        let bottom = oldest + scrollback as u64 + u64::from(t.rows());
+        let term = Arc::new(Mutex::new(t));
+        assert_eq!(cmd_line(&term, &unreadable.to_string()), "ERR unreadable\n");
+        assert_eq!(cmd_line(&term, &bottom.to_string()), "ERR out of range\n");
+        assert!(
+            cmd_line(&term, &(oldest + 2).to_string()).contains("NEEDLE_before"),
+            "a readable row in the same history remains available"
+        );
     }
 
     #[test]

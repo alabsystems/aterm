@@ -1,124 +1,51 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! TYPED-WORD detector: the companion reacts to words you TYPE at the prompt,
-//! in every language the lexicon knows.
+//! Typed-word detector: the companion reacts to lexicon words typed at the prompt, in every
+//! language [`aterm_lexicon`] knows.
 //!
-//! Three families are recognized, all straight out of [`aterm_lexicon`]:
+//! * [`Class::Feline`] (`kitty`, `gato`, `猫`, …) records a Kitty Log sighting, at most one
+//!   per [`TYPED_SUMMON_COOLDOWN`]. It draws nothing itself: the echoed word gets the screen
+//!   scanner's ambient word-cat.
+//! * [`Class::Profanity`] makes the companion wince, as `word_decorations`'s `CurseCue` does
+//!   for a curse on screen; this also covers a curse typed into a no-echo prompt.
+//! * [`Class::Canine`] (`dog`, `perro`, `子犬`, …) summons the dog cameo
+//!   ([`crate::dog_cameo`]), only after [`DOG_SUMMON_KEYS`] printed keystrokes.
 //!
-//! * [`Class::Feline`] — typing `kitty` (or `gato`, `chat`, `neko`, `kucing`,
-//!   `猫`, …) records a Kitty Log sighting. It draws NOTHING of its own: the
-//!   word echoes onto the grid and the screen scanner answers it with the one
-//!   ambient word-cat, centred on the word (owner, 2026-08-12: *"I want the cat
-//!   just like in the main text"*).
-//! * [`Class::Profanity`] — typing a complete curse in any listed language
-//!   makes the companion WINCE. The screen scanner already reacts to profanity
-//!   it can SEE (`word_decorations`'s `CurseCue`); this is the same reaction
-//!   owed to a word that is merely typed, including into a no-echo prompt.
-//! * [`Class::Canine`] — typing `dog` / `puppy` (or `perro`, `chiot`,
-//!   `hund`, `子犬`, …) pops up a DOG next to the cursor — but only after the
-//!   window has typed a lot ([`DOG_SUMMON_KEYS`] printed keystrokes). Every
-//!   summon rolls a fresh breed from the authored roster
-//!   ([`crate::dog_cameo`]); dogs carry no ledger tier at all.
+//! Matching is the lexicon's own (word boundaries, `ambiguous` gating, morphology), never a
+//! substring test: substrings of a multilingual vocabulary fire on innocent words (`pick`).
 //!
-//! MULTILINGUAL BY CONSTRUCTION, AND WORD-BOUNDED. Until 2026-07-26 this module
-//! hardcoded `WORD: [char; 5] = ['k','i','t','t','y']` and completed on a
-//! case-folded SUBSTRING suffix, so `sKitty` summoned. Both properties are now
-//! gone deliberately:
-//!
-//! * English-only detection could never satisfy the multilingual requirement,
-//!   and re-deriving per-language surfaces here would fork the vocabulary away
-//!   from the one compiled list the screen scanner uses.
-//! * Substring matching is actively dangerous on a multilingual vocabulary —
-//!   that is precisely the bug in `27724514` ("typing `pick` fired an f-bomb —
-//!   and 11 other languages had the same bug"). The lexicon's own word-boundary
-//!   matching, `ambiguous` gating, and possessive/clitic morphology are the
-//!   tested defence, so the detector defers to them wholesale.
-//!
-//! The detector is a bounded rolling window of the most recent PRINTED
-//! keystrokes delivered to one window's front session, fed exclusively from
-//! the host's committed key-press path — NEVER from screen
-//! content. `cat`ing a file full of "kitty", a program printing the word, or
-//! pasting it cannot fire here: PTY output never reaches the detector,
-//! `InputEvent::Text` is IME-commit only, and `InputEvent::Paste` is a
-//! different dispatch arm entirely. On-screen occurrences remain the ambient
-//! word-cats' domain (`word_decorations`); this module only ever sees keys.
-//! Like every effect on the input path the detector is Source-agnostic — a
-//! controller typing "kitty" fires exactly like a human (the
-//! indistinguishability invariant forbids branching on `Source`).
-//!
-//! A plain Backspace pops one letter, making the run backspace-TOLERANT:
-//! `kitx⌫ty` still fires, because fixing a typo is still typing the word.
-//! Every key that edits or moves beyond one glyph (Enter, Tab, Escape,
-//! Delete, navigation, kill/nav chords, raw controller byte sequences)
-//! CLEARS the window: a word assembled across an editing boundary was never
-//! typed as a word. A pop alone can never fire by construction — only
-//! [`TypedKittySummon::note_char`] checks for completion, mirroring the
-//! Settings law that "backspacing alone never does".
-//!
-//! TWO TIERS for the feline family, deliberately split (owner, 2026-07-24:
-//! "writing kitty is suppose to cause the toy kitty to appear. I just now typed
-//! it, and it didn't appear! why! it should be 100% of the time"):
-//!
-//! * The COMPLETION fires on EVERY typed word and is CONSUMED there. Typing
-//!   the word is a direct request; answering it only sometimes reads as broken,
-//!   not as restraint. What answers it is the ambient word-cat.
-//! * The LEDGER row is what [`TYPED_SUMMON_COOLDOWN`] rate-limits, measured
-//!   from the last RECORDED summon (a suppressed completion does not restamp
-//!   the clock). That was always the documented concern: kitty-spam must not
-//!   inflate the Kitty Log or force its writer batches. Nothing about it
-//!   requires withholding the drawing, and nothing here does.
-//!
-//! Profanity carries no ledger tier at all — the companion's wince is pure
-//! expression and records nothing.
-//!
-//! A completion CONSUMES its letters either way — holding `y` re-triggers
-//! nothing — the keystroke analogue of the Settings counter's count-increase
-//! rule (deleting and retyping the whole word works; the tail alone never does).
+//! The detector is fed only from the host's committed key presses, never screen content: PTY
+//! output, paste and a program printing the word cannot fire it. It does not branch on
+//! `Source`, so a controller typing `kitty` fires like a human.
 
 use aterm_lexicon::{Class, Lexicon, Match, ScanOptions, ScanScratch};
 use aterm_time::Instant;
 use std::time::Duration;
 
-/// Minimum spacing between LEDGER-RECORDED summons, per window. ~30 s keeps a
-/// deliberate second recorded summon reachable within one sitting while making
-/// kitty-spam pointless; it matches the Kitty Log's own flush-debounce scale,
-/// so spam cannot force ledger writer batches.
-///
-/// This bounds the RECORD ONLY. The word's own cat — the ambient peek the
-/// screen scanner grows — is never withheld; see the two-tier note in the
-/// module docs.
+/// Minimum spacing between Kitty Log rows from typed summons, per window. 30 s matches the Kitty
+/// Log's flush debounce, so spam cannot force writer batches. The completion itself (and its
+/// ambient cat) is never withheld.
 pub const TYPED_SUMMON_COOLDOWN: Duration = Duration::from_secs(30);
 
-/// THE DOG GATE (owner's design, 2026-08-10: "you have to type a lot first"):
-/// canine completions summon only after this many PRINTED keystrokes have been
-/// fed to this window's detector, lifetime-of-the-window. The kitty answers
-/// its name from the first keystroke — it lives here; the dog has to hear a
-/// LOT of typing before it trots over from wherever dogs wait. Counted on the
-/// same committed-key path as the rolling window (PTY output, paste, and IME
-/// non-commits can never inflate it), never reset by session switches,
-/// breaks, or backspaces — deleting text does not un-type it.
+/// Printed keystrokes this window's detector must see before a canine word summons the dog.
+/// Counted on the committed-key path only, over the window's lifetime; session switches, breaks
+/// and backspaces never reset it.
 pub const DOG_SUMMON_KEYS: u64 = 500;
 
-/// Everything one keystroke (or one IME commit char) produced.
-///
-/// Four independent latches. [`Self::feline`] and [`Self::records`] are the two
-/// feline tiers: the completion is unconditional, the ledger row is what the
-/// cooldown limits, and `records` implies `feline`.
+/// Everything one keystroke (or one IME commit char) produced: four independent flags.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct TypedHit {
-    /// A feline word completed. Expression only — nothing on the input path
-    /// draws for it; the echoed word's own ambient cat is the answer.
+    /// A feline word completed. Nothing on the input path draws for it; the echoed word's
+    /// ambient cat is the answer.
     pub feline: bool,
-    /// A feline word completed AND the Kitty Log's cooldown granted the row.
+    /// A feline word completed and the Kitty Log's cooldown granted the row.
     /// Never set without [`Self::feline`].
     pub records: bool,
-    /// A profanity word completed — the companion's WINCE reaction is owed.
+    /// A profanity word completed: the companion's wince is owed.
     pub profanity: bool,
-    /// A canine word completed AND the window has typed a lot
-    /// ([`DOG_SUMMON_KEYS`]) — the dog cameo is owed. Below the gate a canine
-    /// completion is consumed silently (no tier, no ledger, no reaction): the
-    /// dog simply has not arrived yet.
+    /// A canine word completed past the [`DOG_SUMMON_KEYS`] gate: the dog cameo is owed. Below
+    /// the gate the completion is consumed silently.
     pub canine: bool,
 }
 
@@ -135,38 +62,23 @@ impl TypedHit {
     }
 }
 
-/// Rolling-window capacity in chars. Must exceed the longest lexicon surface in
-/// any language (well under 20 chars) plus some backspace-tolerance history.
-/// Small because the typing path scans it on every key; after warmup nothing
-/// allocates.
+/// Rolling-window capacity in chars: must exceed the longest lexicon surface, plus backspace
+/// history. Small because the typing path scans it on every key.
 const BUF_CAP: usize = 48;
 
-/// Ident-namespace tag for synthetic typed-summon sightings (`b"typedKit"` as
-/// big-endian ASCII), XOR'd with the App-wide summon sequence so every granted
-/// summon is a fresh `(session, ident)` episode for the Kitty Log's dedupe
-/// ring, in a namespace apart from the word renderer's occurrence idents.
-///
-/// scope-waiver: the DECLARATION is a compile-time namespace tag — a constant
-/// cannot multiply. The App-wide sequence it is XOR'd with is
-/// `App::kitty_summon_seq`, whose own cardinality is waived (and queued as a
-/// ScopeClaim) at its declaration in `lib.rs`.
+/// Ident-namespace tag for typed-summon sightings (`b"typedKit"` as big-endian ASCII). The host
+/// XORs it with its summon sequence (`App::kitty_summon_seq`) so each recorded summon is a fresh
+/// `(session, ident)` episode for the Kitty Log's dedupe ring, apart from the word renderer's
+/// occurrence idents.
 pub const TYPED_SUMMON_IDENT_TAG: u64 = 0x7479_7065_644B_6974;
 
-/// Ident-namespace tag for synthetic favourite sightings (`b"favKitty"` as
-/// big-endian ASCII), sharing the App-wide summon sequence so every press is a
-/// fresh `(session, ident)` episode. The favourite path bypasses the dedupe
-/// ring; the tag keeps ledger episode identities collision-free.
-///
-/// scope-waiver: same shape as [`TYPED_SUMMON_IDENT_TAG`] — a constant
-/// namespace tag, not the sequence.
+/// Ident-namespace tag for favourite sightings (`b"favKitty"` as big-endian ASCII), sharing the
+/// summon sequence. The favourite path bypasses the dedupe ring; the tag keeps ledger episode
+/// identities collision-free.
 pub const FAVOURITE_IDENT_TAG: u64 = 0x6661_764B_6974_7479;
 
-/// Ident-namespace tag for typed dog summons (`b"typedDog"` as big-endian
-/// ASCII), XOR'd with the same summon sequence. Never recorded (the Kitty Log
-/// is cats); it seeds the dog cameo's breed/coat roll, fresh per summon.
-///
-/// scope-waiver: same shape as [`TYPED_SUMMON_IDENT_TAG`] — a constant
-/// namespace tag, not the sequence.
+/// Ident-namespace tag for typed dog summons (`b"typedDog"` as big-endian ASCII), XOR'd with
+/// the same summon sequence. Never recorded; it seeds the dog cameo's breed/coat roll.
 pub const DOG_SUMMON_IDENT_TAG: u64 = 0x7479_7065_6444_6f67;
 
 /// Per-window detector state: the rolling keystroke window (keyed to the
@@ -174,15 +86,14 @@ pub const DOG_SUMMON_IDENT_TAG: u64 = 0x7479_7065_6444_6f67;
 /// scan buffers.
 #[derive(Default)]
 pub struct TypedKittySummon {
-    /// Rolling window of recent printed keystrokes (≤ [`BUF_CAP`] chars).
-    /// Stored RAW — the lexicon owns folding, and pre-folding here would
-    /// defeat its morphology handling.
+    /// Rolling window of recent printed keystrokes (≤ [`BUF_CAP`] chars), stored raw: the
+    /// lexicon owns folding, and pre-folding would defeat its morphology handling.
     buf: String,
     /// The session the window's letters were typed into. A switch clears the
     /// window; letters typed into different sessions never form one word.
     session: Option<u64>,
-    /// Instant of the last granted summon (the rate limiter). Not reset on
-    /// session switch, so flipping tabs cannot defeat the per-window cooldown.
+    /// Instant of the last recorded summon. Not reset on session switch, so flipping tabs
+    /// cannot defeat the per-window cooldown.
     last_summon: Option<Instant>,
     /// Resident scan buffers: after warmup the per-keystroke scan allocates
     /// nothing.
@@ -191,9 +102,8 @@ pub struct TypedKittySummon {
     scratch: ScanScratch,
     /// Reused `(byte offset, char)` walk for [`Self::trailing_scan_start`].
     tail: Vec<(usize, char)>,
-    /// Lifetime count of printed keystrokes fed to this window's detector: the
-    /// [`DOG_SUMMON_KEYS`] odometer. Not reset by session switches, breaks or
-    /// backspaces, and not persisted.
+    /// Lifetime count of printed keystrokes fed to this detector: the [`DOG_SUMMON_KEYS`]
+    /// odometer. Not persisted.
     keys_typed: u64,
 }
 
@@ -215,14 +125,11 @@ impl TypedKittySummon {
         }
     }
 
-    /// Feed one committed printed keystroke.
+    /// Feed one committed printed keystroke; reports what the lexicon word it completed owes.
     ///
-    /// Fires when this character COMPLETED a lexicon word — i.e. the scan
-    /// finds a match whose end is the window's end. For the feline family the
-    /// cooldown only decides whether the Kitty Log may record it. A completion
-    /// consumes its letters regardless, so the tail can never re-trigger; a
-    /// suppressed RECORD does not restamp the clock, so steady spam cannot
-    /// starve the next legitimate ledger row.
+    /// A completion consumes its letters, so its tail never re-fires. For a feline word the
+    /// cooldown decides only whether the Kitty Log records it, and a suppressed record does not
+    /// restamp the clock.
     pub fn note_char(
         &mut self,
         now: Instant,
@@ -295,8 +202,6 @@ impl TypedKittySummon {
                     ..TypedHit::default()
                 }
             }
-            // Below the [`DOG_SUMMON_KEYS`] gate the completion is still
-            // consumed, and nothing tiers, records or reacts.
             Class::Canine => TypedHit {
                 canine: self.keys_typed >= DOG_SUMMON_KEYS,
                 ..TypedHit::default()

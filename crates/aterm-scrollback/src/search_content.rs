@@ -20,19 +20,13 @@ fn read_search_row_text(
     line: Result<Option<Cow<'_, crate::Line>>, crate::ScrollbackError>,
 ) -> Option<String> {
     match line {
-        // Direct construction instead of `line.to_string()`: `Line`'s Display
-        // writes exactly `String::from_utf8_lossy(self.as_bytes())`, so this is
-        // byte-identical — but it avoids the `format_args!`/`fmt::Arguments`
-        // machinery in to_string's Display path, whose macro-expanded unsafe
-        // the strict Trust gate fails closed on.
+        // What `Line`'s Display writes, without the `format_args!` machinery
+        // whose macro-expanded unsafe the strict Trust gate fails closed on.
         Ok(Some(line)) => Some(String::from_utf8_lossy(line.as_bytes()).into_owned()),
         Ok(None) => None,
         Err(error) => {
-            // Direct `warn!` (see ScrollbackStorageIter::next for why the
-            // error interpolation cannot go through a pre-render shim): this
-            // leaves ONE documented full-verify gap on this function — a
-            // toolchain limitation (`fmt::Arguments` cannot lower), not a
-            // refutation.
+            // Direct `warn!`: an error cannot go through a log shim (see
+            // log_shim.rs), which leaves one documented full-verify gap.
             aterm_log::warn!("{source}::get_row_text({row}) failed: {error}");
             None
         }

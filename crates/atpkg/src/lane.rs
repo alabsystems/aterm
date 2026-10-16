@@ -1,35 +1,27 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `atpkg lane` — the Rust-lane reader over ONE shell command line.
+//! `atpkg lane` — the Rust-lane reader over one shell command line.
 //!
-//! [`aterm_types::rust_lane`] finds a stock Rust tool (`cargo`, `cargo +1.97.1`,
-//! `rustc`, `rustfmt`, clippy, rustdoc) at COMMAND POSITION in a shell line — quote-,
-//! heredoc-, comment- and case-pattern-aware, through `$(…)`, backticks, `bash -c`,
-//! `eval`, `find -exec`, prefix words with their options and `rustup run` — and
-//! renders the Trust spelling of the same command. The reroute stubs cannot use it:
-//! they answer a NAME looked up on PATH and never see a command line. This verb is
-//! where that reading is asked for.
+//! [`aterm_types::rust_lane`] finds a stock Rust tool (`cargo`, `cargo +1.97.1`, `rustc`,
+//! `rustfmt`, clippy, rustdoc) at command position in a shell line, through substitutions
+//! and wrappers, and renders the Trust spelling of the same command. The reroute stubs
+//! answer a name looked up on PATH and never see a command line; this verb reads one.
 //!
-//! WHY A VERB, AND WHAT IT IS NOT. On 2026-09-23 the owner ruled that Rust on this
-//! machine means the Trust toolchain everywhere, and an interim `PreToolUse` script in
-//! `~/.claude/hooks` began refusing an agent's stock command; it missed shapes the
-//! reader here gets right (the review of 2026-09-24 measured 13 of 42 probes). The
-//! first home planned for the reader was an `aterm harness install` capability, but
-//! decision "B" (2026-09-22, finished 2026-09-23) retired that installer: aterm
-//! installs nothing into an agent. So this verb installs nothing, reads nothing but
-//! its input, and knows no vendor: it takes a command line — argv, stdin, or one
-//! string field of a JSON object on stdin (`--json tool_input.command`) — and answers
-//! with an exit code and stderr. Whoever wants a guard wires it themselves.
+//! It installs nothing, reads nothing but its input and knows no vendor: it takes a command
+//! line (argv, stdin, or one string field of a JSON object on stdin,
+//! `--json tool_input.command`) and answers with an exit code and stderr. Whoever wants a
+//! guard wires it themselves.
 //!
-//! THE ANSWER. Exit 0 and silence: no stock Rust tool at command position. Exit 0 and
-//! one stderr line: one stood there, cleared by `ATERM_STOCK_REASON='<why>'` in front
-//! of it. Exit [`crate::reroute::REFUSAL_EXIT`] (2) with [`rust_lane::refusal`] on
-//! stderr — the Trust spelling of the same command; the stock pin in force
-//! (`$RUSTUP_TOOLCHAIN`, else the directory's toolchain file), unless the command
-//! names its own channel or toolchain; the escape: one did. Exit 1: the input or the
-//! arguments could not be read (not JSON, not UTF-8, over [`MAX_INPUT_BYTES`], a usage
-//! error), so there is no verdict either way.
+//! - Exit 0 and silence: no stock Rust tool at command position.
+//! - Exit 0 and one stderr line: one stood there, cleared by `ATERM_STOCK_REASON='<why>'` in
+//!   front of it.
+//! - Exit [`crate::reroute::REFUSAL_EXIT`] (2) with [`rust_lane::refusal`] on stderr: the
+//!   Trust spelling of the command, the stock pin in force (`$RUSTUP_TOOLCHAIN`, else the
+//!   directory's toolchain file) unless the command names its own channel or toolchain,
+//!   and the escape.
+//! - Exit 1: the input or the arguments could not be read (not JSON, not UTF-8, over
+//!   [`MAX_INPUT_BYTES`], a usage error), so there is no verdict.
 
 use std::path::{Path, PathBuf};
 
@@ -185,13 +177,11 @@ pub enum Answer {
 /// The reader's answer for `command`, a refusal naming the stock pin of `cwd` (or
 /// `$RUSTUP_TOOLCHAIN`, `env_toolchain`, which rustup ranks above a file).
 ///
-/// The reader looks at the directory of a path-form command word
-/// ([`rust_lane::verdict_in`], [`rust_lane::file_beside`]): a relative one is under
-/// `cwd`, a leading `~/` or `$HOME/` is `home`. So a Trust toolchain's own `rustc` by
-/// path — `build/<host>/stage2/bin/rustc -vV`, `~/toolchains/trust-…/bin/rustc`, the
-/// compiler under measurement — is not refused, and its `cargo` is refused with that
-/// directory's `targo`. With no `cwd`, only an absolute or home-relative directory
-/// can be looked at.
+/// A path-form command word's directory is looked at ([`rust_lane::verdict_in`],
+/// [`rust_lane::file_beside`]): a relative one under `cwd`, a leading `~/` or `$HOME/` under
+/// `home`. So a Trust toolchain's own `rustc` by path (`build/<host>/stage2/bin/rustc -vV`)
+/// is not refused, and its `cargo` is refused with that directory's `targo`. With no `cwd`,
+/// only an absolute or home-relative directory can be looked at.
 #[must_use]
 pub fn answer(
     command: &str,
@@ -219,7 +209,7 @@ pub fn answer(
 #[cfg(test)]
 mod tests {
     /// Input at the limit is read whole; one byte past it is refused, never judged on a
-    /// prefix (a cut command line would read clean, a cut JSON object as "not JSON").
+    /// prefix.
     #[test]
     fn input_past_the_limit_is_refused_not_cut() {
         let limit = usize::try_from(super::MAX_INPUT_BYTES).unwrap();
@@ -276,9 +266,8 @@ mod tests {
         }
     }
 
-    /// The JSON source reads one string field by its dotted path — the shape a hook
-    /// payload carries it in — and a payload without it is nothing to read, not an
-    /// error; input that is not JSON is an error, never a refusal.
+    /// The JSON source reads one string field by its dotted path; a payload without it is
+    /// nothing to read, and input that is not JSON is an error, never a refusal.
     #[test]
     fn a_json_field_is_read_by_its_dotted_path() {
         let payload = br#"{"session_id":"x","cwd":"/r","tool_name":"Bash","tool_input":{"command":"cargo +1.97.1 test -p x","description":"d"}}"#;

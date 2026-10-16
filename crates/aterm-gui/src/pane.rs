@@ -1,96 +1,58 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! In-tab SPLIT-PANE tree (iTerm2-style panes within one tab).
+//! In-tab split panes: a binary [`PaneTree`] of session ids (the ids
+//! [`crate::Session::id`] routes `Wake`s with) over the generic [`SplitTree`], the
+//! compatibility projection a terminal-only tab keeps of its canonical tree
+//! ([`crate::tab_model::Tab`]). Pure geometry and bookkeeping, with no `Terminal`,
+//! PTY or rendering, so the layout math and the split/close/focus state machine
+//! test headless.
 //!
-//! A window has TABS (the existing [`crate::TabIndex`] + `Vec<Session>` model);
-//! each TAB now owns a binary [`PaneTree`] of live sessions. A fresh tab is a
-//! single [`PaneNode::Leaf`] — the exact one-session-per-tab behavior, so with no
-//! splits the geometry is byte-identical to before. Splitting the FOCUSED leaf
-//! turns it into a [`PaneNode::Split`] of two leaves (the original session and a
-//! freshly-spawned sibling), and closing the focused leaf collapses its parent.
+//! A split reserves a one-cell divider between its children; `ratio` is the first
+//! child's fraction of the extent minus the divider. A fresh split is 50/50.
 //!
-//! This module is PURE GEOMETRY + tree bookkeeping over session ids (`u64`, the
-//! same stable ids [`crate::Session::id`] routes `Wake`s with). It owns no
-//! `Terminal`, no PTY, and no rendering — the GUI ([`crate::App`]) maps the
-//! [`PaneRect`]s this produces back onto the live `Vec<Session>` and composes
-//! their per-pane snapshots into the one window frame. Keeping it headless makes
-//! the layout math (and the split/close/focus state machine) unit-testable with
-//! no window, PTY, or event loop, mirroring [`crate::TabIndex`].
+//! # The minimum pane
 //!
-//! DIVIDERS: a split reserves ONE cell line between its children (drawn by the
-//! GUI). The `ratio` is the FIRST child's fraction of the splittable extent
-//! (everything but the 1-cell divider); MVP always splits 50/50, but the ratio is
-//! stored per-split so a later divider drag is a pure data edit (no structural
-//! change). Each child is clamped to at least 1 cell so a tiny window never yields
-//! a 0-extent pane.
+//! 1. **Creation.** A split is refused unless both resulting panes are at least
+//!    [`MIN_PANE_ROWS`] x [`MIN_PANE_COLS`] ([`split_fits_in`]). The caller
+//!    ([`crate::App::split_focused_pane_in`]) asks before it spawns anything, and
+//!    measures the unzoomed rect ([`PaneTree::focused_rect`]) since a split
+//!    un-zooms.
+//! 2. **Resize.** Shrinking clamps; it never restructures the tree.
+//!    [`PaneTree::compute_layout`] keeps every rect inside the window grid with at
+//!    least one cell per pane, so below the minimum panes may coincide on the last
+//!    row or column, and growing back restores the exact geometry.
 //!
-//! # The MINIMUM PANE (2026-08-25 splits audit)
-//!
-//! A split that cannot fit is REFUSED, not minted. Before this rule, splitting a
-//! 24x80 window thirteen times produced fourteen panes — five of them sharing the
-//! IDENTICAL off-grid rect `24,79,1x1` (row 24 of a 0..23-row grid), focus landed
-//! on a pane nobody could see, and each invisible pane had spawned a REAL SHELL
-//! (14 `pwsh.exe` + 14 `conhost.exe` alive). Two things went wrong and both are
-//! fixed here:
-//!
-//! 1. **Creation.** [`split_fits_in`] is the law: a split is allowed only when
-//!    BOTH resulting panes are at least [`MIN_PANE_ROWS`] x [`MIN_PANE_COLS`]
-//!    cells. The caller ([`crate::App::split_focused_pane_in`]) asks BEFORE it
-//!    spawns anything, so a refused split costs exactly zero processes and
-//!    answers the person the way every other impossible gesture in this app does
-//!    (a stderr line + the transient failure card). It measures the UNZOOMED rect,
-//!    because a split un-zooms: a zoomed pane fills the window and is about to
-//!    hand that room straight back, so trusting it would wave through the very
-//!    split this rule exists to refuse ([`PaneTree::focused_rect`]).
-//! 2. **Resize.** A window can still be dragged smaller than its open layout
-//!    needs, and shrinking must never restructure the tree (your panes are not
-//!    the window manager's to close). THE RULE: **shrinking CLAMPS, it never
-//!    collapses.** [`PaneTree::compute_layout`] pins every rect INSIDE the window
-//!    grid — an origin can never exceed the last row/column and an extent can
-//!    never run past the edge — while keeping at least one cell per pane. Below
-//!    the minimum, panes may therefore COINCIDE on the last row/column (unavoidable:
-//!    N panes cannot be disjoint in fewer than N cells), but nothing ever lands
-//!    outside the grid and the TREE IS UNTOUCHED, so growing the window back
-//!    restores the exact geometry it had.
-//!
-//! The other engine that places panes — [`crate::tab_model::Tab::visible_plan`],
-//! which serves heterogeneous native/terminal tabs — obeys the same rule by a
-//! different route: its children plus the divider gap TILE the parent exactly, so
-//! no rect can escape the bounds by construction. It differs from this module in
-//! only one respect, and deliberately: it keeps panes DISJOINT and lets an extent
-//! reach zero, where this module keeps a one-cell floor and lets panes coincide.
-//! Both keep every leaf, neither restructures, and both round-trip on regrowth
+//! [`crate::tab_model::Tab::visible_plan`] meets the same rule differently: its
+//! children and dividers tile the parent exactly, keeping panes disjoint and
+//! letting an extent reach zero
 //! (`tab_model::tests::shrinking_a_canonical_plan_stays_inside_the_bounds_and_drops_no_leaf`).
 
 use crate::tab_model::{
     FocusDirection, LogicalDividerHit, LogicalPoint, LogicalRect, RemoveLeaf, SplitAxis, SplitTree,
 };
 
-/// Which way a [`PaneNode::Split`] divides its rectangle.  This remains the
-/// terminal command spelling; the generic tree stores the corresponding
-/// content axis explicitly.
+/// Which way a [`PaneNode::Split`] divides its rectangle, in the terminal
+/// commands' spelling (named for the divider); the generic tree stores the
+/// content axis.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum SplitDir {
-    /// Children sit SIDE BY SIDE, split by a vertical divider (Cmd-D). The first
-    /// child is the LEFT pane, the second the RIGHT; the columns are divided.
+    /// Side by side across a vertical divider (Cmd-D): first child left, second
+    /// right.
     Vertical,
-    /// Children are STACKED, split by a horizontal divider (Cmd-Shift-D). The
-    /// first child is the TOP pane, the second the BOTTOM; the rows are divided.
+    /// Stacked across a horizontal divider (Cmd-Shift-D): first child top, second
+    /// bottom.
     Horizontal,
 }
 
-/// Terminal compatibility name for the generic content split tree.  Its leaf
-/// payload is still a session id during Phase A; window integration resolves
-/// stable `ViewId`s through the process `ViewStore` before reaching this adapter.
+/// The generic split tree with session ids as leaves. Window code resolves stable
+/// `ViewId`s through the `ViewStore` before reaching this adapter.
 pub(crate) type PaneNode = SplitTree<u64>;
 
-/// One visible pane's placement in the window grid, in CELL coordinates. The GUI
-/// locks that session's `Terminal`, snapshots it at `(rows, cols)`, and blits the
-/// cells into the composite window frame at `(row_off, col_off)`.
+/// One visible pane's content placement in the window grid, in cell coordinates.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct PaneRect {
-    /// The session occupying this rect (`Leaf::session`).
+    /// The session occupying this rect.
     pub session: u64,
     /// Top-left cell row offset of this pane within the window grid.
     pub row_off: u16,
@@ -102,56 +64,42 @@ pub(crate) struct PaneRect {
     pub cols: u16,
 }
 
-/// A tab's pane layout: the binary tree plus the id of the FOCUSED leaf (the pane
-/// that keyboard input + the control socket target, and whose cursor draws solid).
-/// Every tab owns one; a fresh tab is a single leaf focused on its own session.
+/// A tab's pane layout: the binary tree and its focused leaf, the pane keyboard
+/// input and the control socket target.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct PaneTree {
     root: PaneNode,
-    /// The session id of the focused leaf. Always references a leaf that exists in
-    /// `root` (maintained by `split`/`close`); used to route input + draw the solid
-    /// cursor in exactly one pane.
+    /// The focused leaf's session id, always a leaf in `root`: it routes input and
+    /// draws the solid cursor in exactly one pane.
     focus: u64,
-    /// When `true`, the focused pane is temporarily ZOOMED to fill the whole
-    /// window ([`compute_layout`](Self::compute_layout) returns just it). A purely
-    /// presentational toggle over the unchanged tree — unzoom restores the layout
-    /// exactly. Ignored for a single-pane tab. iTerm2-style pane zoom.
+    /// The focused pane fills the window ([`compute_layout`](Self::compute_layout)
+    /// returns just it): presentation only over the unchanged tree. A single-pane
+    /// tab ignores it.
     zoomed: bool,
 }
 
-/// The smallest fraction a divider drag may leave the FIRST child (and, by
-/// symmetry via `1 - MIN_RATIO` = [`MAX_RATIO`], the second). Keeps both panes
-/// visibly non-trivial so a drag to the very edge never collapses a pane to a
-/// sliver. The logical split engine also enforces a nonzero leaf floor.
+/// The smallest first-child fraction: the bound a divider drag is clamped to in
+/// the generic tree, applied here to a restored ratio so neither pane is a sliver.
 const MIN_RATIO: f32 = 0.05;
-/// The largest fraction a divider drag may give the first child — the mirror of
-/// [`MIN_RATIO`], so the SECOND child also keeps at least `MIN_RATIO`.
+/// The largest first-child fraction, mirroring [`MIN_RATIO`].
 const MAX_RATIO: f32 = 0.95;
 
-/// The fewest ROWS a pane the app CREATES may have: a prompt line, the command
-/// line it wraps onto, and one line of output. Two rows is a prompt with nowhere
-/// to answer; one row is the 1x1 ghost the splits audit found.
+/// The fewest rows a pane the app creates may have: a prompt line, the line it
+/// wraps onto, and one line of output.
 pub(crate) const MIN_PANE_ROWS: u16 = 3;
-/// The fewest COLUMNS a pane the app CREATES may have. Sixteen is the width at
-/// which a short prompt and a short command still share one line; narrower than
-/// that, every single line a shell prints wraps, and the pane stops being a place
-/// you can work.
+/// The fewest columns a pane the app creates may have: the width at which a short
+/// prompt and a short command still share one line.
 pub(crate) const MIN_PANE_COLS: u16 = 16;
 
 /// Can a pane allocation of `rows` x `cols` cells be split in `dir` and leave
-/// BOTH halves at least [`MIN_PANE_ROWS`] x [`MIN_PANE_COLS`] content cells,
-/// with one additional subtab header row each?
+/// both halves at least [`MIN_PANE_ROWS`] x [`MIN_PANE_COLS`] content cells,
+/// with one subtab header row each?
 ///
-/// THE EXACT GEOMETRY, not an estimate. A fresh split is always 50/50 over the
-/// splittable extent — everything but the 1-cell divider — so the divided axis
-/// yields `ceil((extent - 1) / 2)` and `floor((extent - 1) / 2)`; the SMALLER half
-/// is the floor, and it clears the minimum exactly when `extent - 1 >= 2 * min`.
-/// The perpendicular axis must clear its content minimum plus the header.
-/// `rows` includes any existing header, since the two new headers replace it.
-///
-/// `pane_tree_min_fit_matches_the_layout_engine` re-derives this against the real
-/// [`PaneTree::compute_layout`] over every window size in a wide sweep, so this
-/// closed form can never drift away from the layout it predicts.
+/// Exact, not an estimate: a fresh split is 50/50 over the extent minus the
+/// 1-cell divider, so the smaller half is `floor((extent - 1) / 2)` and clears
+/// the minimum iff `extent - 1 >= 2 * min`. `rows` includes any existing header,
+/// since the two new headers replace it. `pane_tree_min_fit_matches_the_layout_engine`
+/// checks this against [`PaneTree::compute_layout`].
 #[must_use]
 pub(crate) fn split_fits_in(dir: SplitDir, rows: u16, cols: u16) -> bool {
     let min_rows = MIN_PANE_ROWS + 1; // each child also owns a subtab header
@@ -161,9 +109,8 @@ pub(crate) fn split_fits_in(dir: SplitDir, rows: u16, cols: u16) -> bool {
     }
 }
 
-/// The smallest pane, in cells, that `dir` can be split out of — the geometry
-/// [`split_fits_in`] demands, spelled for the refusal message so the person is
-/// told the number they are short of rather than just "no".
+/// The smallest pane `(rows, cols)` that `dir` can be split out of, as
+/// [`split_fits_in`] demands, for the refusal message.
 #[must_use]
 pub(crate) fn split_needs(dir: SplitDir) -> (u16, u16) {
     match dir {
@@ -182,22 +129,19 @@ impl SplitDir {
     }
 }
 
-/// One pane divider's identity + geometry, produced by [`PaneTree::divider_at`] and
-/// consumed by [`PaneTree::ratio_for_pointer`] / [`PaneTree::set_divider_ratio`] to
-/// drive a drag-to-resize. The embedded logical hit names the exact split with a
-/// root-to-node path and carries the divided-axis span used for pointer ratios.
+/// A divider hit from [`PaneTree::divider_at`], for [`PaneTree::ratio_for_pointer`]
+/// and [`PaneTree::set_divider_ratio`] in a drag-to-resize. The logical hit names
+/// the split by its root-to-node path and carries the divided-axis span.
 #[derive(Clone, PartialEq, Debug)]
 pub(crate) struct DividerHit {
     /// Canonical logical-pixel divider identity.
     logical: LogicalDividerHit,
-    /// Which way the hit split divides (vertical divider = columns, horizontal =
-    /// rows). Lets the GUI pick the resize cursor (E-W vs N-S).
+    /// Which way the hit split divides; picks the resize cursor (E-W vs N-S).
     pub dir: SplitDir,
 }
 
 impl PaneTree {
-    /// A new single-pane tab holding `session` (the day-one one-session-per-tab
-    /// layout). Focus is that one session.
+    /// A single-pane tab holding and focused on `session`.
     #[must_use]
     pub(crate) fn new(session: u64) -> Self {
         PaneTree {
@@ -207,23 +151,21 @@ impl PaneTree {
         }
     }
 
-    /// Toggle pane ZOOM: when on, [`compute_layout`](Self::compute_layout) returns
-    /// only the focused pane filling the window. A no-op (stays off) for a
-    /// single-pane tab. Returns the new zoom state.
+    /// Toggle zoom (see `zoomed`) and return the new state; a single-pane tab
+    /// stays unzoomed.
     pub(crate) fn toggle_zoom(&mut self) -> bool {
         self.zoomed = !self.zoomed && self.len() > 1;
         self.zoomed
     }
 
-    /// The currently FOCUSED session id (the pane keyboard input + the control
-    /// socket target). Always a live leaf.
+    /// The focused session id; always a live leaf.
     #[must_use]
     pub(crate) fn focus(&self) -> u64 {
         self.focus
     }
 
-    /// Move focus to `session` if it is a leaf in this tab. No-op (returns `false`)
-    /// for an unknown id, so a stale focus request can never desync `focus`.
+    /// Move focus to `session` if it is a leaf in this tab; `false` (focus kept)
+    /// for an unknown id.
     pub(crate) fn set_focus(&mut self, session: u64) -> bool {
         if self.contains(session) {
             self.focus = session;
@@ -240,7 +182,7 @@ impl PaneTree {
     }
 
     /// Every leaf session id in this tab, in left-to-right / top-to-bottom tree
-    /// order. Used to resize/tear-down a whole tab's panes and to test round-trips.
+    /// order.
     #[must_use]
     pub(crate) fn sessions(&self) -> Vec<u64> {
         self.root.leaves()
@@ -258,14 +200,11 @@ impl PaneTree {
         self.zoomed
     }
 
-    /// Convert this tab's live pane tree into a serializable
-    /// [`crate::restore::PaneLayout`] for session restore (RESTORE-1). `session_meta(id)`
-    /// supplies each leaf's `(cwd, title)` — the GUI reads them off the live
-    /// [`crate::Session`] — and the FOCUSED leaf is tagged so restore can re-focus it.
-    /// Each leaf ALSO records its process-local `u64` session id (`local_id`). A durable
-    /// cold-quit restore ignores it and respawns fresh sessions, re-assigning ids in tree
-    /// order via [`rebuild`](Self::rebuild); a SEAMLESS-update boot uses it as the
-    /// layout↔live-fd bridge, re-adopting the running shell into its exact original pane.
+    /// This tree as a [`crate::restore::PaneLayout`] for session restore, with each
+    /// leaf's `(cwd, title)` from `session_meta` and the focused leaf tagged. Each
+    /// leaf also records its session id (`local_id`): a cold-quit restore ignores it
+    /// and respawns via [`rebuild`](Self::rebuild); a seamless-update boot uses it to
+    /// re-adopt the running shell into its original pane.
     #[must_use]
     pub(crate) fn to_layout(
         &self,
@@ -308,12 +247,9 @@ impl PaneTree {
     }
 
     /// Rebuild a tab's pane tree from a persisted [`crate::restore::PaneLayout`],
-    /// assigning the `fresh` session ids to leaves in tree order (the same
-    /// left-to-right / top-to-bottom order [`sessions`](Self::sessions) yields).
-    /// `fresh` MUST hold at least one id per leaf (`PaneLayout::leaf_count`); focus goes
-    /// to the leaf the layout tagged `focused`, else the first leaf. Returns `None` when
-    /// `fresh` is too short (the caller then falls back to a plain single-pane tab), so a
-    /// short spawn list can never panic-index.
+    /// assigning the `fresh` ids to leaves in tree order (as [`sessions`](Self::sessions)
+    /// yields them). Focus goes to the leaf tagged `focused`, else the first. `None`
+    /// when `fresh` holds fewer ids than the layout has leaves.
     #[must_use]
     pub(crate) fn rebuild(layout: &crate::restore::PaneLayout, fresh: &[u64]) -> Option<Self> {
         if fresh.len() < layout.leaf_count() {
@@ -361,9 +297,7 @@ impl PaneTree {
                         SplitKind::Vertical => SplitAxis::Horizontal,
                         SplitKind::Horizontal => SplitAxis::Vertical,
                     },
-                    // A persisted ratio is clamped to the same ergonomic bounds a live
-                    // divider drag is held to, so a hand-edited manifest can't collapse a
-                    // pane to a sliver.
+                    // A hand-edited manifest cannot leave a sliver either.
                     ratio: (*ratio).clamp(MIN_RATIO, MAX_RATIO),
                     first,
                     second,
@@ -378,15 +312,12 @@ impl PaneTree {
         self.root.len()
     }
 
-    /// Split the FOCUSED leaf in `dir`, inserting `new_session` as the SECOND child
-    /// (right/bottom) and keeping the original session as the first. Focus moves to
-    /// the new pane (the standard "split and type in the new one" behavior). The
-    /// split is 50/50. No-op (returns `false`) if the focused
-    /// leaf somehow isn't found (it always is), leaving the tree untouched so the
-    /// caller can drop the just-spawned session.
+    /// Split the focused leaf 50/50 in `dir`: the original session stays first,
+    /// `new_session` becomes the second child (right/bottom) and takes focus.
+    /// `false` (tree untouched, so the caller can drop the new session) if the
+    /// focused leaf is not found.
     ///
-    /// TRUST anchor: this is the `Split` action of the ty-proven `pane_tree` machine
-    /// (`pane_tree_model()`); the Tier-1 binding is `pane_tree_conformance`.
+    /// The `pane_tree` model's `Split` action, bound by `pane_tree_conformance`.
     #[cfg_attr(
         test,
         aterm_spec::refines(
@@ -403,7 +334,7 @@ impl PaneTree {
         };
         if self.root.split_leaf(focus, axis, new_session) {
             self.focus = new_session;
-            // A structural change exits zoom (the layout the user zoomed is gone).
+            // A structural change exits zoom.
             self.zoomed = false;
             true
         } else {
@@ -411,30 +342,22 @@ impl PaneTree {
         }
     }
 
-    /// Close the FOCUSED pane (Cmd-W). See [`Self::close_pane`].
+    /// Close the focused pane (Cmd-W). See [`Self::close_pane`].
     pub(crate) fn close_focused(&mut self) -> CloseOutcome {
         self.close_pane(self.focus)
     }
 
-    /// Close the pane holding `session` (the FOCUSED pane via [`Self::close_focused`],
-    /// or any pane whose reader hit EOF). Returns the outcome:
-    /// * [`CloseOutcome::Collapsed`] — the leaf was removed and its parent replaced
-    ///   by the SIBLING sub-tree; focus re-seats on the nearest surviving leaf. The
-    ///   tab (and window) keeps living.
-    /// * [`CloseOutcome::LastPane`] — that leaf was the tab's ONLY pane, so the whole
-    ///   tab should close (the caller removes the tab; the engine's last tab closing
-    ///   exits the app, unchanged).
+    /// Close the pane holding `session` (the focused one, or one whose reader hit
+    /// EOF); an unknown id closes the focused pane. Returns:
+    /// * [`CloseOutcome::Collapsed`]: the parent split is replaced by the sibling
+    ///   sub-tree and focus re-seats on a survivor.
+    /// * [`CloseOutcome::LastPane`]: it was the tab's only pane, so the tab closes.
     ///
-    /// Either way the returned `closed` is the session id that was removed, so the
-    /// caller tears down exactly that session (closes its PTY master → its reader
-    /// thread ends) and deregisters it. Every OTHER pane's session — and its reader
-    /// thread — is untouched. An unknown id is treated as the focused pane (the
-    /// caller only calls this for live panes; `close_session` filters unknown ids).
+    /// Either way `closed` is the session to tear down; every other pane's session
+    /// is untouched.
     ///
-    /// TRUST anchor: the `CloseOutcome::Collapsed` arm is the `Close` action of the
-    /// ty-proven `pane_tree` machine (`pane_tree_model()`) — the tree shrinks by one
-    /// leaf and focus re-seats on a survivor IN RANGE. (`LastPane` is a tab-machine
-    /// transition, out of this model's scope.) Tier-1 binding: `pane_tree_conformance`.
+    /// `Collapsed` is the `pane_tree` model's `Close` action (bound by `pane_tree_conformance`);
+    /// `LastPane` is a tab-level transition outside the model.
     #[cfg_attr(
         test,
         aterm_spec::refines(
@@ -453,56 +376,30 @@ impl PaneTree {
         if matches!(self.root, PaneNode::Leaf(_)) {
             return CloseOutcome::LastPane { closed };
         }
-        // THE REMOVAL IS THE TRANSITION — it is BOUND, never carried inside the
-        // assertion. `debug_assert_eq!` expands to `if cfg!(debug_assertions) { … }`,
-        // so a RELEASE build compiles its argument away: this line used to read
-        // `debug_assert_eq!(self.root.remove_leaf(closed), RemoveLeaf::Removed)`
-        // and every shipped binary therefore returned `Collapsed` for a tree that
-        // still held the closed leaf. The caller believed it, retired the session
-        // and its stable view, and the canonical tab tree was left naming a view
-        // the `ViewStore` no longer had — the leaf that
-        // `App::active_visible_content_route` fails closed on, which returns from
-        // `redraw_window` BEFORE any present and freezes the window for the rest
-        // of its life. Every debug test passed; only the shipped build froze.
-        // WHO INHERITS THE SPACE — read BEFORE the collapse, which is the very
-        // operation that erases the parent naming the sibling sub-tree.
+        // Bound, never inside a `debug_assert*!` (a release build drops the argument). The
+        // heir is read before the collapse erases the parent naming it.
         let heir = self.root.absorbing_neighbor(closed);
         let removed = self.root.remove_leaf(closed);
         debug_assert_eq!(removed, RemoveLeaf::Removed);
-        // Re-seat focus on the nearest surviving leaf if the focused pane was the
-        // one removed; otherwise focus stays where it was (a background pane's EOF
-        // must not steal focus from the pane the user is typing in).
-        //
-        // NEAREST MEANS ACROSS THE DIVIDER, not `root.first_leaf()`. This line used
-        // to read `self.focus = self.root.first_leaf()`, which is the tree's global
-        // top-left pane: close the focused bottom-right pane of `a | (b / c)` and
-        // the keyboard jumped to `a` in the opposite corner while `b` grew into the
-        // freed space, so the next command the person typed ran in a DIFFERENT live
-        // shell from the one the layout had just pointed at. The pane that absorbs
-        // the space is the pane that gets the keyboard ([`PaneNode::absorbing_neighbor`]).
+        // Focus moves only off the removed pane (a background pane's EOF never
+        // steals it), and to the pane that absorbs the freed space, not the
+        // tree's top-left `first_leaf()`: the pane that grew gets the keyboard.
         if self.focus == closed || !self.contains(self.focus) {
             self.focus = heir.unwrap_or_else(|| self.root.first_leaf());
         }
-        // A structural change exits zoom (the zoomed layout no longer applies).
+        // A structural change exits zoom.
         self.zoomed = false;
         CloseOutcome::Collapsed { closed }
     }
 
-    /// Compute every visible pane's placement for a window of `rows`×`cols` cells.
-    /// Returns one content [`PaneRect`] per leaf, with a subtab header row in
-    /// each visible split pane and 1-cell dividers reserved between
-    /// split children (the gaps are NOT covered by any rect; the GUI paints them).
-    /// A single-leaf tab yields exactly one rect covering the whole window — the
-    /// non-split geometry, byte-identical to today.
+    /// Every visible pane's content [`PaneRect`] for a `rows`×`cols` window: one per
+    /// leaf, a subtab header row above each split pane that keeps a content row, and
+    /// 1-cell divider gaps between split children that no rect covers. A
+    /// single-leaf tab gets one rect covering the whole window.
     ///
-    /// EVERY RETURNED RECT LIES INSIDE THE WINDOW GRID. That is the shrink rule of
-    /// this module (see the module docs): a window dragged below what its open
-    /// layout needs CLAMPS — origins pin to the last row/column, extents stop at
-    /// the edge, each pane keeps at least one cell — and the TREE is never
-    /// restructured, so growing back restores the exact geometry. Without the
-    /// clamp a 1-row pane split in two put its second child at `row_off = 24` of a
-    /// 24-row grid and the `.max(1)` below inflated it into a 1x1 phantom: a pane
-    /// the compositor drew off the end of the world.
+    /// Every rect lies inside the grid: below what the layout needs, origins pin to
+    /// the last row/column and extents stop at the edge, each pane keeping at least
+    /// one cell (see the module docs).
     #[must_use]
     pub(crate) fn compute_layout(&self, rows: u16, cols: u16) -> Vec<PaneRect> {
         let mut rects = self.layout_cells(rows, cols, self.zoomed);
@@ -524,19 +421,15 @@ impl PaneTree {
         rects
     }
 
-    /// Outer pane allocations before subtab rows are reserved, with zoom named
-    /// explicitly. The caller that overrides it is [`Self::focused_rect`]: a
-    /// split un-zooms (see [`Self::split_focused`]), so the rectangle a split is
-    /// about to divide is the UNZOOMED one, never the full window a zoomed pane
-    /// currently occupies. Measuring the zoomed rect would let a split through on
-    /// the strength of room the pane is about to give back — and that is exactly
-    /// the shell-leaking split this module exists to refuse.
+    /// Outer pane allocations before subtab header rows are reserved. Zoom is an
+    /// argument because [`Self::focused_rect`] measures unzoomed: a split un-zooms,
+    /// so a zoomed pane's full-window rect would admit a split that does not fit.
     #[must_use]
     fn layout_cells(&self, rows: u16, cols: u16, zoomed: bool) -> Vec<PaneRect> {
         let win_rows = rows.max(1);
         let win_cols = cols.max(1);
-        // Zoomed: the focused pane alone fills the window (other panes are hidden
-        // until unzoom). Single-pane tabs ignore the flag and take the normal path.
+        // Zoomed: the focused pane alone fills the window. A single-pane tab
+        // ignores the flag.
         if zoomed && self.len() > 1 {
             return vec![PaneRect {
                 session: self.focus,
@@ -554,10 +447,9 @@ impl PaneTree {
             )
             .into_iter()
             .map(|leaf| {
-                // The old terminal adapter promises nonzero grids even for a
-                // pathologically tiny host. Logical app layout itself remains
-                // bounded and may report zero extent in that impossible fit — so
-                // the floor is applied here, and then pinned back INSIDE the grid.
+                // This adapter promises nonzero grids, but the logical layout may
+                // report a zero extent in an impossible fit: apply the floor, then
+                // pin the rect back inside the grid.
                 let row_off = (leaf.rect.origin.y.round() as u16).min(win_rows - 1);
                 let col_off = (leaf.rect.origin.x.round() as u16).min(win_cols - 1);
                 PaneRect {
@@ -575,11 +467,9 @@ impl PaneTree {
             .collect()
     }
 
-    /// The FOCUSED pane's outer allocation, including its subtab header, in a
-    /// `rows`×`cols` window. Measured on the UNZOOMED layout: a split divides this
-    /// allocation and installs a header in each child, replacing the old one.
-    /// `None` only if the focused leaf somehow isn't in the tree, and the caller
-    /// must treat that as "unmeasurable", never as "fits".
+    /// The focused pane's outer allocation, header included, in a `rows`×`cols`
+    /// window, measured unzoomed: a split divides this allocation. `None` (focus not
+    /// in the tree) means unmeasurable, never "fits".
     #[must_use]
     pub(crate) fn focused_rect(&self, rows: u16, cols: u16) -> Option<PaneRect> {
         self.layout_cells(rows, cols, false)
@@ -587,12 +477,10 @@ impl PaneTree {
             .find(|r| r.session == self.focus)
     }
 
-    /// The session of the pane directly adjacent to the focused one in `dir`, or
-    /// `None` when there is no pane on that side. Used by keyboard pane navigation
-    /// (directional focus). A candidate must lie on the `dir` side of the focused
-    /// rect AND share some perpendicular extent with it (so "left" of a tall pane
-    /// only considers panes that overlap its rows); ties break toward the larger
-    /// overlap, then the smaller offset (top-/left-most), for a stable choice.
+    /// The pane adjacent to the focused one in `dir`, for keyboard pane navigation;
+    /// `None` at an edge or while zoomed. A candidate lies on the `dir` side and
+    /// shares some perpendicular extent with the focused rect; the nearest wins,
+    /// ties going to the larger overlap, then the smaller (top-/left-most) offset.
     #[must_use]
     pub(crate) fn focus_neighbor(&self, dir: FocusDir, rows: u16, cols: u16) -> Option<u64> {
         if self.zoomed {
@@ -613,12 +501,9 @@ impl PaneTree {
         )
     }
 
-    /// Hit-test a DIVIDER: if cell `(row, col)` lands on a split's 1-cell divider
-    /// line (the gap [`compute_layout`] reserves between a split's children, owned
-    /// by no pane), return that divider's [`DividerHit`]; otherwise `None` (the cell
-    /// is inside a pane or outside the grid). Used by drag-to-resize to start a
-    /// divider drag. Zoomed or single-pane tabs have no draggable divider (the
-    /// focused pane fills the window), so this is always `None` for them.
+    /// The divider whose 1-cell gap (reserved by [`compute_layout`], owned by no
+    /// pane) holds cell `(row, col)`, for drag-to-resize. Always `None` for a
+    /// single-pane or zoomed tab.
     #[must_use]
     pub(crate) fn divider_at(
         &self,
@@ -646,13 +531,9 @@ impl PaneTree {
         Some(DividerHit { logical, dir })
     }
 
-    /// Map a pointer at cell `(row, col)` to the new FIRST-child fraction for the
-    /// split named by `hit`, BEFORE clamping (the raw geometric ratio). The pointer
-    /// is projected onto the hit split's divided axis and divided by the split's
-    /// splittable extent, so dropping the
-    /// divider where the pointer is yields that ratio. Returns `None` only for a
-    /// degenerate split too small to hold a divider. The caller passes the result to
-    /// [`Self::set_divider_ratio`], which applies the `[MIN_RATIO, MAX_RATIO]` clamp.
+    /// The unclamped first-child fraction that puts `hit`'s divider under a pointer
+    /// at cell `(row, col)`; [`Self::set_divider_ratio`] clamps it. `None` for a
+    /// split too small to hold a divider.
     #[must_use]
     pub(crate) fn ratio_for_pointer(&self, hit: &DividerHit, row: u16, col: u16) -> Option<f32> {
         SplitTree::<u64>::ratio_for_pointer(
@@ -665,13 +546,9 @@ impl PaneTree {
         )
     }
 
-    /// Set the FIRST-child fraction of the split named by `hit` to `ratio`, clamped
-    /// to `[MIN_RATIO, MAX_RATIO]` so neither pane collapses to a sliver. Returns
-    /// `true` once the targeted split's `ratio` was written (it always is for a
-    /// `hit` produced by [`Self::divider_at`] on the same tree); `false` if the path
-    /// no longer names a split (e.g. the tree changed under a stale hit), leaving the
-    /// tree untouched. A pure DATA edit — no structural change, so focus/zoom are
-    /// preserved; the caller relays out + repaints.
+    /// Set the first-child fraction of the split named by `hit` to `ratio`, clamped
+    /// to `[MIN_RATIO, MAX_RATIO]`. `false` (tree untouched) when the path no
+    /// longer names a split, as for a stale hit. A data edit: focus and zoom keep.
     pub(crate) fn set_divider_ratio(&mut self, hit: &DividerHit, ratio: f32) -> bool {
         self.root.set_divider_ratio(&hit.logical, ratio)
     }
@@ -690,16 +567,15 @@ pub(crate) enum FocusDir {
     Down,
 }
 
-/// The result of [`PaneTree::close_focused`]: which session was removed and
-/// whether the tab survives (a sibling remained) or must close (it was the last
-/// pane).
+/// The result of [`PaneTree::close_pane`]: the removed session, and whether the
+/// tab survives (a sibling remained) or must close (it was the last pane).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum CloseOutcome {
     /// A sibling remained: the parent split collapsed into it. `closed` is the
     /// removed session.
     Collapsed { closed: u64 },
-    /// The focused pane was the tab's only one; the whole tab should close.
-    /// `closed` is that session.
+    /// The pane was the tab's only one; the whole tab should close. `closed` is
+    /// that session.
     LastPane { closed: u64 },
 }
 
@@ -717,9 +593,7 @@ impl CloseOutcome {
 mod tests {
     use super::*;
 
-    /// A fresh single-pane tab lays out as ONE rect covering the whole window —
-    /// the non-split geometry must be byte-identical to "no panes" (the whole
-    /// no-regression contract rests on this).
+    /// A fresh single-pane tab lays out as one rect covering the whole window.
     #[test]
     fn single_pane_fills_window() {
         let t = PaneTree::new(7);
@@ -739,10 +613,9 @@ mod tests {
         );
     }
 
-    /// RESTORE-1 round-trip: a multi-pane tab → `to_layout` → `rebuild` with fresh ids
-    /// reconstructs the SAME tree shape (split dirs + ratios + tree order), re-focuses
-    /// the tagged leaf, and carries each leaf's cwd/title through the layout. Also proves
-    /// a short spawn list fails safe (`None`) instead of panic-indexing.
+    /// A multi-pane tab → `to_layout` → `rebuild` with fresh ids keeps the tree
+    /// shape (dirs, ratios, order), the focused leaf and each leaf's cwd/title; a
+    /// short spawn list fails safe (`None`).
     #[test]
     fn layout_round_trips_with_fresh_ids() {
         // Tab shape: 1 | (2 stacked over 3), focus on session 3.
@@ -752,12 +625,10 @@ mod tests {
         assert_eq!(t.focus(), 3);
         let order = t.sessions(); // [1, 2, 3] in tree order
 
-        // Serialize: each leaf's cwd = "/s{id}", title = "t{id}".
         let meta = |id: u64| (Some(format!("/s{id}")), format!("t{id}"));
         let layout = t.to_layout(&meta);
         assert_eq!(layout.leaf_count(), 3);
 
-        // Rebuild with brand-new ids assigned in tree order.
         let fresh = [10u64, 11, 12];
         let rebuilt = PaneTree::rebuild(&layout, &fresh).expect("rebuild");
         assert_eq!(
@@ -768,11 +639,9 @@ mod tests {
         // Focus followed the tagged leaf: old focus 3 was the 3rd leaf → fresh[2] = 12.
         assert_eq!(rebuilt.focus(), 12);
 
-        // Re-serializing the rebuilt tree (mapping fresh ids back to the original meta)
-        // yields a STRUCTURALLY identical layout — dirs, ratios, focus flag, per-leaf
-        // cwd/title all preserved. The per-leaf `local_id` deliberately DIFFERS: it
-        // tracks the live session id (now 10/11/12, not 1/2/3), the seamless-handoff
-        // bridge — so it is normalized away for this structural comparison.
+        // Re-serializing the rebuilt tree (fresh ids mapped back to the original
+        // meta) yields a structurally identical layout. `local_id` differs (it
+        // tracks the live id, now 10/11/12), so it is normalized away here.
         let meta2 = |id: u64| {
             let orig = order[fresh.iter().position(|&f| f == id).unwrap()];
             (Some(format!("/s{orig}")), format!("t{orig}"))
@@ -805,7 +674,7 @@ mod tests {
             }
         }
         assert_eq!(structural(&rebuilt.to_layout(&meta2)), structural(&layout));
-        // The rebuilt leaves DO carry the fresh live ids (the handoff bridge).
+        // The rebuilt leaves carry the fresh live ids.
         assert_eq!(
             rebuilt.to_layout(&meta2).leaves()[0].local_id(),
             Some(10),
@@ -816,8 +685,8 @@ mod tests {
         assert!(PaneTree::rebuild(&layout, &[10, 11]).is_none());
     }
 
-    /// Cmd-D vertical split: two panes side by side, a 1-cell divider column
-    /// between them, both full height. 80 cols → 79 splittable → 40 | divider | 39.
+    /// Cmd-D vertical split: two panes side by side across a 1-cell divider column, each
+    /// under a header row. 80 cols → 79 splittable → 40 | divider | 39.
     #[test]
     fn vertical_split_geometry() {
         let mut t = PaneTree::new(1);
@@ -848,7 +717,7 @@ mod tests {
                 cols: 39
             }
         );
-        // The divider column (40) is covered by NO rect.
+        // No rect covers the divider column (40).
         assert!(
             rects
                 .iter()
@@ -856,8 +725,8 @@ mod tests {
         );
     }
 
-    /// Cmd-Shift-D horizontal split: two panes stacked, a 1-cell divider row
-    /// between them, both full width. 24 rows → 23 splittable → 12 | divider | 11.
+    /// Cmd-Shift-D horizontal split: two full-width panes stacked over a 1-cell divider row,
+    /// each under a header row. 24 rows → 23 splittable → 12 | divider | 11.
     #[test]
     fn horizontal_split_geometry() {
         let mut t = PaneTree::new(1);
@@ -903,16 +772,13 @@ mod tests {
         assert_eq!(t.sessions(), vec![1, 2, 3]);
         let rects = t.compute_layout(24, 80);
         assert_eq!(rects.len(), 3);
-        // Left pane spans full height.
         let left = rects.iter().find(|r| r.session == 1).unwrap();
         assert_eq!(left.rows, 23);
-        // The two right panes share the right column band and stack.
         let top = rects.iter().find(|r| r.session == 2).unwrap();
         let bot = rects.iter().find(|r| r.session == 3).unwrap();
         assert_eq!(top.col_off, bot.col_off);
         assert_eq!(top.cols, bot.cols);
         assert!(top.row_off < bot.row_off);
-        // No two rects overlap (cell-by-cell disjointness over the window).
         assert!(rects_disjoint(&rects));
     }
 
@@ -995,10 +861,7 @@ mod tests {
         );
     }
 
-    /// Split → close round-trip: closing the focused (new) pane collapses back to
-    /// the original single pane, with focus re-seated on the survivor. The
-    /// surviving session is untouched (its reader thread stays alive — the caller
-    /// only tears down `closed`).
+    /// Split, then close the new pane: back to the original single pane, focused.
     #[test]
     fn split_then_close_round_trips() {
         let mut t = PaneTree::new(1);
@@ -1009,7 +872,7 @@ mod tests {
         assert_eq!(t.len(), 1, "collapsed back to one pane");
         assert_eq!(t.sessions(), vec![1], "the sibling survives");
         assert_eq!(t.focus(), 1, "focus re-seats on the survivor");
-        // And the survivor lays out full-window again — byte-identical to fresh.
+        // The survivor lays out as a fresh tab does.
         assert_eq!(
             t.compute_layout(24, 80),
             PaneTree::new(1).compute_layout(24, 80)
@@ -1033,27 +896,14 @@ mod tests {
             "focus re-seats on the survivor that ABSORBS the freed space (2, the \
              pane above the closed one), not on the tree's top-left leaf"
         );
-        // The geometry is now exactly a 2-pane vertical split of 1 | 2.
         let mut expected = PaneTree::new(1);
         expected.split_focused(SplitDir::Vertical, 2);
         assert_eq!(t.compute_layout(24, 80), expected.compute_layout(24, 80));
     }
 
-    /// THE KEYBOARD FOLLOWS THE SPACE. Closing the focused pane hands its cells to
-    /// exactly one sibling sub-tree, and the pane that visibly grows into the hole
-    /// is the pane the next keystroke must reach.
-    ///
-    /// The bug this pins: focus used to re-point at `root.first_leaf()`, the
-    /// window's TOP-LEFT pane. Measured on glass at 1400x700 on the pre-fix release
-    /// binary — `1 | (2 / 3)` with 3 focused, `aterm ctl invoke CloseTab`: pane 2
-    /// grew from `0,77,19x75` to `0,77,38x75` (it took the space) while focus and
-    /// the divider's bright half crossed to `0,0,38x76`, and `echo` typed into the
-    /// window afterwards ran in pane 1's shell, not pane 2's. A different live
-    /// shell than the one the layout had just pointed at.
-    ///
-    /// Each shape below names the survivor that inherits the freed cells. Three of
-    /// them differ from `first_leaf()`; the fourth is the case where the two
-    /// coincide, kept so the fix cannot be over-rotated into breaking it.
+    /// Closing the focused pane focuses the survivor that absorbs its cells, not
+    /// the tree's `first_leaf()`: the pane that grows into the hole takes the next
+    /// keystroke. Each shape names that survivor.
     #[test]
     fn close_focuses_the_pane_that_absorbs_the_freed_space() {
         // Build a tree with `build`, focus the pane about to be closed, and hand
@@ -1072,8 +922,8 @@ mod tests {
                 .expect("laid-out pane")
         };
 
-        // THE REPORTED SHAPE: 1 | (2 / 3), close the bottom-right pane.
-        // first_leaf() answers 1 — the far column, which grows by nothing.
+        // 1 | (2 / 3), close the bottom-right pane: `first_leaf()` would answer 1,
+        // the far column, which does not grow.
         let (mut t, before) = tree(
             &|t| {
                 t.split_focused(SplitDir::Vertical, 2); // 1 | 2
@@ -1101,8 +951,8 @@ mod tests {
              {survivor_after:?}"
         );
 
-        // NESTED SIBLING: 1 | ((2 | 4) / 3), close 3. The sub-tree `(2 | 4)` takes
-        // the space; the leaf pressed against the seam is its LAST one, 4.
+        // Nested sibling: 1 | ((2 | 4) / 3), close 3. The sub-tree `(2 | 4)` takes
+        // the space; the leaf against the seam is its last one, 4.
         let (mut t, _) = tree(
             &|t| {
                 t.split_focused(SplitDir::Vertical, 2); // 1 | 2
@@ -1119,8 +969,8 @@ mod tests {
             "1 | ((2 | 4) / 3), close 3 -> focus 4, the leaf against the seam"
         );
 
-        // FIRST-CHILD CLOSE, mirrored: 1 / (2 | 3), close 2. The sibling now lies
-        // to the RIGHT, so the near leaf is its FIRST one, 3 — not 1 two rows up.
+        // First-child close, mirrored: 1 / (2 | 3), close 2. The sibling lies to
+        // the right, so the near leaf is its first one, 3, not 1 two rows up.
         let (mut t, _) = tree(
             &|t| {
                 t.split_focused(SplitDir::Horizontal, 2); // 1 / 2
@@ -1131,8 +981,8 @@ mod tests {
         assert_eq!(t.close_focused(), CloseOutcome::Collapsed { closed: 2 });
         assert_eq!(t.focus(), 3, "1 / (2 | 3), close 2 -> focus 3");
 
-        // NO REGRESSION where the old answer was already right: (1 / 3) | 2,
-        // close 3. The absorbing neighbour IS the tree's first leaf, 1.
+        // Where the absorbing neighbour is also the tree's first leaf: (1 / 3) | 2,
+        // close 3 -> 1.
         let (mut t, _) = tree(
             &|t| {
                 t.split_focused(SplitDir::Vertical, 2); // 1 | 2
@@ -1145,8 +995,7 @@ mod tests {
         assert_eq!(t.focus(), 1, "(1 / 3) | 2, close 3 -> focus 1");
     }
 
-    /// Closing a BACKGROUND pane (reader EOF on a non-focused pane) collapses it
-    /// but does NOT steal focus from the pane the user is typing in.
+    /// Closing a background pane (reader EOF) collapses it without taking focus.
     #[test]
     fn close_background_pane_keeps_focus() {
         let mut t = PaneTree::new(1);
@@ -1159,8 +1008,7 @@ mod tests {
         assert_eq!(t.focus(), 1, "focus stays on the pane the user is using");
     }
 
-    /// Closing the LAST pane signals the tab should close (LastPane), not a
-    /// collapse — the caller removes the tab (and the last tab closing exits).
+    /// Closing the last pane reports `LastPane` (the tab closes), not a collapse.
     #[test]
     fn close_last_pane_signals_tab_close() {
         let mut t = PaneTree::new(9);
@@ -1180,7 +1028,7 @@ mod tests {
         assert_eq!(t.focus(), 1);
     }
 
-    /// `set_focus`/`contains` reject ids that aren't leaves in this tab.
+    /// `contains` names only this tab's leaves.
     #[test]
     fn focus_only_live_leaves() {
         let t = PaneTree::new(3);
@@ -1188,8 +1036,7 @@ mod tests {
         assert!(!t.contains(4));
     }
 
-    /// A 2x1 golden across an odd width: 81 cols → 80 splittable → 40 | 40, divider
-    /// at col 40. (Round-trips the even/odd split math.)
+    /// An odd width: 81 cols → 80 splittable → 40 | 40, divider at col 40.
     #[test]
     fn vertical_split_odd_width() {
         let mut t = PaneTree::new(1);
@@ -1201,8 +1048,7 @@ mod tests {
         assert_eq!(rects[1].cols, 40);
     }
 
-    /// A degenerate tiny window still yields one non-zero rect per pane (never a
-    /// 0-extent pane the renderer would choke on).
+    /// A degenerate tiny window still yields a non-zero rect per pane.
     #[test]
     fn tiny_window_no_zero_panes() {
         let mut t = PaneTree::new(1);
@@ -1253,9 +1099,8 @@ mod tests {
         }
     }
 
-    /// Divider drag on a vertical split: hitting the divider column yields a
-    /// `DividerHit`, and `set_divider_ratio` moves the boundary — the left pane
-    /// grows/shrinks while the geometry stays a valid 2-pane split.
+    /// A hit on a vertical split's divider column yields a `DividerHit`, and
+    /// `set_divider_ratio` moves the boundary.
     #[test]
     fn vertical_divider_drag_moves_boundary() {
         let mut t = PaneTree::new(1);
@@ -1263,7 +1108,7 @@ mod tests {
         // The divider sits at column 40, any row.
         let hit = t.divider_at(5, 40, 24, 80).expect("divider hit at col 40");
         assert_eq!(hit.dir, SplitDir::Vertical);
-        // A cell inside a pane is NOT on the divider.
+        // A cell inside a pane is not on the divider.
         assert!(t.divider_at(5, 10, 24, 80).is_none());
         assert!(t.divider_at(5, 60, 24, 80).is_none());
         // Drag the divider left to column 20: ratio ~ 20/79.
@@ -1279,7 +1124,7 @@ mod tests {
         assert_eq!(rects[1].cols, 59); // 79 splittable - 20 first
     }
 
-    /// `set_divider_ratio` CLAMPS to `[MIN_RATIO, MAX_RATIO]`: dragging the divider
+    /// `set_divider_ratio` clamps to `[MIN_RATIO, MAX_RATIO]`: dragging the divider
     /// to (or past) an edge never collapses a pane to zero.
     #[test]
     fn divider_ratio_clamps() {
@@ -1296,7 +1141,6 @@ mod tests {
             .into_iter()
             .min_by_key(|r| r.col_off)
             .unwrap();
-        // MIN_RATIO of 79 splittable ≈ 4 cells (round(0.05*79)=4), well above 0.
         assert!(left.cols >= (MIN_RATIO * 79.0).floor() as u16);
         // Drag hard right (ratio 1.0) clamps to MAX_RATIO; right pane survives.
         assert!(t.set_divider_ratio(&hit, 1.0));
@@ -1313,7 +1157,6 @@ mod tests {
         t.split_focused(SplitDir::Horizontal, 2); // 24 rows -> 12 | divider(12) | 11
         let hit = t.divider_at(12, 30, 24, 80).expect("divider hit at row 12");
         assert_eq!(hit.dir, SplitDir::Horizontal);
-        // Off the divider row → None.
         assert!(t.divider_at(3, 30, 24, 80).is_none());
         // Drag to row 6: ratio ~ 6/23.
         let ratio = t.ratio_for_pointer(&hit, 6, 30).expect("ratio");
@@ -1325,8 +1168,8 @@ mod tests {
         assert_eq!(rects[1].row_off, 8);
     }
 
-    /// In a NESTED tree the hit-test targets the correct (inner) split: dragging the
-    /// inner divider edits only that split, leaving the outer one untouched.
+    /// In a nested tree the hit-test targets the inner split: dragging its divider
+    /// leaves the outer split untouched.
     #[test]
     fn nested_divider_targets_inner_split() {
         // 1 | (2 / 3): vertical outer, horizontal inner on the right band.
@@ -1344,9 +1187,8 @@ mod tests {
             .divider_at(div_row, probe_col, 24, 80)
             .expect("inner divider hit");
         assert_eq!(hit.dir, SplitDir::Horizontal, "inner split is horizontal");
-        // Record the OUTER (left) pane width; editing the inner split must not move it.
+        // Editing the inner split must not move the outer (left) pane.
         let left_before = rects.iter().find(|r| r.session == 1).unwrap().cols;
-        // Drag the inner divider up.
         let ratio = t
             .ratio_for_pointer(&hit, top.row_off + 2, probe_col)
             .unwrap();
@@ -1354,16 +1196,14 @@ mod tests {
         let after = t.compute_layout(24, 80);
         let left_after = after.iter().find(|r| r.session == 1).unwrap().cols;
         assert_eq!(left_before, left_after, "outer split untouched");
-        // Pane 2 (the inner first child) actually moved.
         let top_after = after.iter().find(|r| r.session == 2).unwrap();
         assert_ne!(top_after.rows, top.rows, "inner first child resized");
-        // Sanity: still three disjoint panes.
         assert_eq!(after.len(), 3);
         assert!(rects_disjoint(&after));
         let _ = bot;
     }
 
-    /// A single-pane (and a zoomed) tab has NO draggable divider.
+    /// A single-pane (and a zoomed) tab has no draggable divider.
     #[test]
     fn no_divider_when_single_or_zoomed() {
         let t = PaneTree::new(1);
@@ -1398,15 +1238,9 @@ mod tests {
         assert_eq!(before, t.compute_layout(24, 80), "tree untouched");
     }
 
-    /// THE MINIMUM-PANE LAW, cross-checked against the layout engine it predicts.
-    ///
-    /// [`split_fits_in`] is a closed form (`extent - 1 >= 2 * min`, plus the
-    /// perpendicular minimum); [`PaneTree::compute_layout`] is the real geometry.
-    /// A closed form that drifts from its engine is worse than none — it would
-    /// either refuse splits that fit or, far worse, admit the 1x1 ghosts this
-    /// whole rule exists to stop. So: over EVERY window size in a wide sweep and
-    /// both directions, actually split a fresh tree and demand the two answers
-    /// agree exactly — `true` iff both resulting panes clear the minimum.
+    /// [`split_fits_in`]'s closed form agrees with [`PaneTree::compute_layout`]
+    /// over every window size in a sweep, both directions: `true` iff both panes
+    /// of a real split clear the minimum.
     #[test]
     fn pane_tree_min_fit_matches_the_layout_engine() {
         let mut checked_true = 0u32;
@@ -1417,9 +1251,8 @@ mod tests {
                     let mut t = PaneTree::new(1);
                     assert!(t.split_focused(dir, 2));
                     let rects = t.compute_layout(rows, cols);
-                    // A window of `rows`x`cols` IS the focused pane's rect for a
-                    // fresh single-pane tab, so this is the same question the
-                    // caller asks before it spawns anything.
+                    // For a fresh single-pane tab the window is the focused pane's rect:
+                    // the question the caller asks before it spawns anything.
                     let engine_ok = rects
                         .iter()
                         .all(|r| r.rows >= MIN_PANE_ROWS && r.cols >= MIN_PANE_COLS);
@@ -1437,17 +1270,15 @@ mod tests {
                 }
             }
         }
-        // Both verdicts are actually exercised (a sweep that only ever says "no"
-        // would pass a predicate hard-coded to false).
+        // Both verdicts occur, so a predicate hard-coded to `false` would fail.
         assert!(
             checked_true > 0 && checked_false > 0,
             "sweep covers both verdicts"
         );
     }
 
-    /// The exact boundary, spelled out: a left/right split needs
-    /// `2 * MIN_PANE_COLS + 1` columns (two panes plus the divider) and
-    /// `MIN_PANE_ROWS + 1` rows — usable content plus each child's title row.
+    /// The exact boundary: a left/right split needs `2 * MIN_PANE_COLS + 1` columns (two panes
+    /// plus the divider) and `MIN_PANE_ROWS + 1` rows (content plus each child's header row).
     #[test]
     fn split_fit_boundary_is_two_panes_plus_the_divider() {
         let pane_rows = MIN_PANE_ROWS + 1;
@@ -1477,7 +1308,7 @@ mod tests {
         // A 0x0 window can't underflow the `extent - 1` arithmetic into a "yes".
         assert!(!split_fits_in(SplitDir::Vertical, 0, 0));
         assert!(!split_fits_in(SplitDir::Horizontal, 0, 0));
-        // And the refusal message's numbers ARE the boundary.
+        // The refusal message's numbers are the boundary.
         assert_eq!(split_needs(SplitDir::Vertical), (pane_rows, need));
         assert_eq!(
             split_needs(SplitDir::Horizontal),
@@ -1485,22 +1316,11 @@ mod tests {
         );
     }
 
-    /// ZOOM CANNOT SMUGGLE A SPLIT THROUGH THE MINIMUM.
-    ///
-    /// A zoomed pane occupies the WHOLE window — but [`PaneTree::split_focused`]
-    /// clears `zoomed`, so the rectangle a split actually divides is the pane's
-    /// UNZOOMED one. If the gate measured the zoomed rect it would approve a split
-    /// on the strength of room the pane is about to hand straight back, and mint
-    /// exactly the unusable pane (with a live shell behind it) that this whole
-    /// rule exists to refuse.
-    ///
-    /// So: [`PaneTree::focused_rect`] must report the unzoomed rect even while
-    /// zoomed — and the proof that it is the RIGHT rect is that performing the
-    /// split reproduces it as the union of the two children.
+    /// [`PaneTree::focused_rect`] reports the unzoomed rect while zoomed: a split
+    /// clears zoom and divides that rect, as the split's two children show.
     #[test]
     fn focused_rect_ignores_zoom_because_splitting_unzooms() {
-        // 40 columns is the size that makes the trap concrete: the WINDOW clears a
-        // left/right split's 33-column bar, each HALF of it does not.
+        // At 40 columns the window clears a left/right split's 33-column bar; each half does not.
         let mut t = PaneTree::new(1);
         assert!(t.split_focused(SplitDir::Vertical, 2)); // 40 -> 20 | div | 19
         let unzoomed = t.focused_rect(24, 40).expect("focused leaf is in the tree");
@@ -1511,7 +1331,7 @@ mod tests {
         );
 
         assert!(t.toggle_zoom(), "the split tab zooms");
-        // Zoom IS a presentation transform: the visible layout is the full window…
+        // Zoom is a presentation transform: the visible layout is the full window…
         assert_eq!(
             t.compute_layout(24, 40),
             vec![PaneRect {
@@ -1523,10 +1343,10 @@ mod tests {
             }],
             "a zoomed pane fills the window on screen"
         );
-        // …and THAT rect would clear the bar. This is the temptation.
+        // …and that rect would clear the bar.
         assert!(split_fits_in(SplitDir::Vertical, 24, 40));
 
-        // But the rect a SPLIT would divide is unchanged by zoom, and it does not.
+        // But the rect a split would divide is unchanged by zoom, and it does not.
         let measured = t.focused_rect(24, 40).expect("focused leaf is in the tree");
         assert_eq!(
             measured, unzoomed,
@@ -1537,8 +1357,8 @@ mod tests {
             "19 columns cannot hold two 16-column panes plus a divider"
         );
 
-        // GROUND TRUTH: split anyway and the children tile exactly the rect
-        // `focused_rect` reported — not the 40-column window zoom was showing.
+        // Split anyway: the children tile exactly the rect `focused_rect`
+        // reported, not the 40-column window zoom was showing.
         assert!(t.split_focused(SplitDir::Vertical, 3));
         assert!(!t.zoomed, "a split exits zoom");
         let children: Vec<_> = t
@@ -1559,15 +1379,11 @@ mod tests {
         );
     }
 
-    /// THE SHRINK RULE: a window dragged below what its open layout needs CLAMPS.
-    /// Every rect stays INSIDE the grid — this is the exact defect the splits
-    /// audit found, where a 14-pane tab in a 24x80 window reported five panes at
-    /// the identical OFF-GRID rect `24,79,1x1` (row 24 of rows 0..23). The tree is
-    /// never restructured, so growing the window back restores the geometry byte
-    /// for byte.
+    /// A window shrunk below what its layout needs clamps: every rect stays inside
+    /// the grid, and the untouched tree restores the exact geometry on regrowth.
     #[test]
     fn shrinking_below_the_minimum_clamps_inside_the_grid() {
-        // Build a deep tree the way the audit did: alternate the two directions.
+        // A deep tree: alternate the two directions.
         let mut t = PaneTree::new(1);
         for (i, dir) in [
             SplitDir::Vertical,
@@ -1608,7 +1424,7 @@ mod tests {
             }
         }
 
-        // Reversible: the tree was only ever READ, so growing back is exact.
+        // The tree was only read, so growing back is exact.
         assert_eq!(
             t.compute_layout(48, 200),
             roomy,
@@ -1617,8 +1433,7 @@ mod tests {
         assert_eq!(t.len(), 8, "and no pane was collapsed on the way");
     }
 
-    /// Helper: are all rects pairwise cell-disjoint? (No two panes claim the same
-    /// cell — dividers are gaps owned by neither.)
+    /// Whether no two rects claim the same cell (dividers belong to neither).
     fn rects_disjoint(rects: &[PaneRect]) -> bool {
         for (i, a) in rects.iter().enumerate() {
             for b in &rects[i + 1..] {

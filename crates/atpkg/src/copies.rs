@@ -1,24 +1,18 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! STALE COPIES OF aterm (macOS): bundles that claim aterm's identifier, signed ad hoc to
-//! their own cdhash, left beside the installed release — `aterm-prev-<epoch>.app` and
-//! `aterm-local-<epoch>.app` in `/Applications` on the owner's Mac (six of them, 219 MB,
-//! removed by hand on 2026-10-14). Nothing in this repository makes those names (the
-//! updater keeps `aterm.app.rollback` and removes it once the new build is confirmed;
-//! `tools/install.sh` swaps through `.aterm.app.old.<random>` and deletes it;
-//! `tools/dev-app.sh` installs `aterm (dev).app` under an identifier of its own), so they
-//! were made by hand or by an agent. Each one resets aterm's privacy grants whenever it
-//! asks macOS for one (`aterm_containment::consent`, "The claimant census"), and the owner
-//! wants no extra copies on the machine (ruling 2026-10-14).
+//! Stale copies of aterm (macOS): bundles that claim aterm's identifier, signed ad hoc to
+//! their own cdhash, left beside the installed release (`aterm-prev-<epoch>.app` and the
+//! like, made by hand or by an agent: the updater, `tools/install.sh` and `ship dev-app`
+//! leave none). Each one resets aterm's privacy grants whenever it asks macOS for one
+//! (`aterm_containment::consent`, "The claimant census").
 //!
-//! `aterm doctor` therefore prunes them ([`prune`]): exactly the copies the claimant census
-//! offers for the Trash ([`aterm_containment::consent::Claimants::retirable`] — ad hoc to
-//! their cdhash or unsigned, no link leading to them, beside a running release whose
-//! grant survives updates; never a Developer ID copy), re-checked right before the move
-//! and never while a process runs from one, moved to the Trash with Apple's own tool so
-//! each stays recoverable. The Settings ▸ Security panel's *Move to Trash* uses the same
-//! move ([`trash`]).
+//! `aterm doctor` prunes them ([`prune`]): exactly the copies the census offers for the
+//! Trash ([`aterm_containment::consent::Claimants::retirable`]: ad hoc to their cdhash or
+//! unsigned, no link leading to them, beside a running release whose grant survives
+//! updates; never a Developer ID copy), re-checked right before the move and never while a
+//! process runs from one, moved with Apple's own tool so each stays recoverable. The
+//! Settings ▸ Security panel's *Move to Trash* uses the same move ([`trash`]).
 
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -356,8 +350,8 @@ mod tests {
         Claimants { found, enumeration }
     }
 
-    /// The owner's Mac before 2026-10-14's clean-up: the release running, ad hoc copies
-    /// beside it, and a Developer ID rollback that is never moved.
+    /// The release running, ad hoc copies beside it, and a Developer ID rollback that is
+    /// never moved.
     fn owners_mac() -> Claimants {
         census_of(
             vec![

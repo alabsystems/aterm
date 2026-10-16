@@ -1,38 +1,28 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The observation kernel: event-driven "observe this surface until condition C
-//! holds".
+//! The observation kernel: event-driven "observe this surface until condition C holds".
 //!
-//! Every program byte folds into the grid and bumps one write-only logical
-//! clock, [`Terminal::content_seq`](super::Terminal::content_seq). Watchers are
-//! evaluated at the seam where every mutation has landed
-//! ([`Terminal::post_process`]) and latched there, so a transiently true
-//! condition is never lost to a coalesced wake. Live deltas, idle quiescence and
-//! row matching are the same mechanism with different predicates. All
-//! predicates except `BlockComplete` (OSC 133/633 block state) work without
-//! shell integration, including for alt-screen TUIs.
-//!
-//! Every armed observer is a [`Watcher`] in one list, distinguished by its
-//! [`WatcherSpec`]. [`WatcherSet::observe`] evaluates all kinds in one pass;
-//! `IdleFor` also fires from [`WatcherSet::expire`] at a host-supplied instant.
-//! The regex behind [`WatcherSpec::RowMatches`] is an opaque [`RowMatch`] built
-//! in `aterm-observe`, so `aterm-core` has no direct `regex` dependency.
+//! Every program byte folds into the grid and bumps one logical clock,
+//! [`Terminal::content_seq`](super::Terminal::content_seq). Watchers are evaluated after each
+//! batch's `post_process`, where every mutation has landed, and latched there, so a transiently
+//! true condition is never lost to a coalesced wake. Every armed observer is a [`Watcher`] in
+//! one list, distinguished by its [`WatcherSpec`]; [`WatcherSet::observe_screen`] evaluates all
+//! kinds in one pass, and the deadline kinds also fire from [`WatcherSet::expire`]. All
+//! predicates except `BlockComplete` (OSC 133/633 block state) work without shell integration,
+//! alt-screen TUIs included.
 //!
 //! Properties:
 //!
-//! 1. No silent loss: a predicate that holds at any processed batch latches at
-//!    that batch (`watcher_latch_model`, `conformance_observe.rs`).
-//! 2. Deterministic idle: `IdleFor` latches at the computed deadline
-//!    (`activity_at + dur`), not the observation instant, so live and replay
-//!    latch the same [`Satisfaction`]. (`idle_deadline_model` covers the host
-//!    arming the earliest deadline, [`WatcherSet::next_deadline`].)
+//! 1. No silent loss: a predicate that holds at any processed batch latches at that batch
+//!    (`watcher_latch_model`, `conformance_observe.rs`).
+//! 2. Deterministic idle: `IdleFor` latches at the computed deadline (`activity_at + dur`), not
+//!    the observation instant, so live and replay latch the same [`Satisfaction`]
+//!    (`idle_deadline_model`).
 //!
-//! The kernel is observation-only: it reads `content_seq` and grid rows, never
-//! mutates the surface, and is never part of a [`TerminalCheckpoint`], so it
+//! The kernel only observes: it never mutates the surface and is never checkpointed, so it
 //! cannot affect replay. Its clock is the injected
-//! [`process_now`](super::TransientState::process_now); it never reads the wall
-//! clock.
+//! [`process_now`](super::TransientState::process_now), never the wall clock.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -67,33 +57,25 @@ impl From<bool> for RowVerdict {
     }
 }
 
-/// An opaque, pre-compiled row matcher. The regex implementation lives in
-/// `aterm-observe`; the core evaluates matches but cannot construct one, and
-/// takes no direct `regex` dependency (checked by
-/// `regex_is_not_in_aterm_core_production_deps`).
+/// An opaque, pre-compiled row matcher. The regex implementation lives in `aterm-observe`; the
+/// core evaluates matches but cannot construct one, and takes no direct `regex` dependency
+/// (checked by `regex_is_not_in_aterm_core_production_deps`).
 ///
-/// # Two questions, and an undecided row answers no to both (ruling 2026-10-10)
-///
-/// A predicate waiting for a row to APPEAR asks [`matches`](Self::matches). A
-/// predicate waiting for a row to LEAVE asks [`clears`](Self::clears). An
-/// [`Undecided`](RowVerdict::Undecided) row is neither, so both kinds of wait
-/// keep waiting until a later scan decides it. The matcher used to answer a
-/// bare `bool`, which made "the scan ran out" read as "no match": that is
-/// fail-closed for `await match` and `key if=`, but fail-OPEN for anything that
-/// latches on the absence of a match (`await gone`, `turn … settle=gone:`, the
-/// supervisor's busy-row test). `gone` then latched while the row was still on
-/// the screen. `clears` is the only spelling of absence; `!matches(row)` is not
-/// absence.
+/// A wait for a row to appear asks [`matches`](Self::matches); a wait for a row to leave asks
+/// [`clears`](Self::clears). An [`Undecided`](RowVerdict::Undecided) row is neither, so both
+/// kinds keep waiting until a later scan decides it. `clears` is the only spelling of absence:
+/// `!matches(row)` would let `await gone`, `turn … settle=gone:` and the supervisor's busy-row
+/// test latch while the row is still on screen.
 pub trait RowMatch: Send + Sync + std::fmt::Debug {
     /// What scanning `row` (one visible row's text) established.
     fn verdict(&self, row: &str) -> RowVerdict;
 
-    /// The scan SHOWED that `row` matches. An undecided row does not.
+    /// The scan showed that `row` matches. An undecided row does not.
     fn matches(&self, row: &str) -> bool {
         self.verdict(row) == RowVerdict::Match
     }
 
-    /// The scan SHOWED that `row` does not match. An undecided row does not.
+    /// The scan showed that `row` does not match. An undecided row does not.
     fn clears(&self, row: &str) -> bool {
         self.verdict(row) == RowVerdict::NoMatch
     }
@@ -148,31 +130,25 @@ pub enum WatcherSpec {
         /// Latch once `content_seq()` exceeds this value.
         after: u64,
     },
-    /// Latch after `dur` of no content mutation (quiescence / turn-completion).
-    /// Latches at the exact deadline `activity_at + dur`, independent of when it
-    /// is observed — the determinism property.
+    /// Latch after `dur` of no content mutation (quiescence, turn completion), at the exact
+    /// deadline `activity_at + dur` however late it is observed.
     IdleFor {
         /// Latch after this much wall-time with no content mutation.
         dur: Duration,
     },
     /// Latch when the visible surface shows a completed/prompt-ready shell block.
     BlockComplete,
-    /// Latch when any visible row in `rows` satisfies `matcher` (the semantic
-    /// predicate; the `matcher` is built in `aterm-observe`, regex out of core).
+    /// Latch when any visible row in `rows` satisfies `matcher`.
     RowMatches {
-        /// The opaque pre-compiled matcher (regex lives in `aterm-observe`).
+        /// The opaque pre-compiled matcher.
         matcher: Arc<dyn RowMatch>,
         /// Which visible rows to scan.
         rows: RowRange,
     },
-    /// Latch at a fixed, caller-computed instant: the analytic crossing of a
-    /// decaying quantity below `floor` (the typing-momentum law `v·e^(−t/τ)`,
-    /// solved by the host at arm). The `await momentum` / `turn yield=`
-    /// predicate.
-    ///
-    /// Deadline-triggered like [`IdleFor`](WatcherSpec::IdleFor) but never reset
-    /// by content activity. The arming verb re-reads the quantity when it fires
-    /// and re-arms on the new crossing.
+    /// Latch at a fixed instant the host computed at arm: the crossing of a decaying quantity
+    /// below `floor` (the typing-momentum law `v·e^(−t/τ)`), for `await momentum` and
+    /// `turn yield=`. Deadline-triggered like [`IdleFor`](WatcherSpec::IdleFor) but never reset
+    /// by content activity; the arming verb re-reads the quantity when it fires and re-arms.
     MomentumBelow {
         /// The floor the quantity must have decayed to (documentary here; the
         /// host solved the crossing from it).
@@ -185,7 +161,7 @@ pub enum WatcherSpec {
     /// leaving (a busy footer). Level-triggered: no matching row at arm latches
     /// at arm.
     RowsClear {
-        /// The opaque pre-compiled matcher (regex lives in `aterm-observe`).
+        /// The opaque pre-compiled matcher.
         matcher: Arc<dyn RowMatch>,
         /// Which visible rows to scan.
         rows: RowRange,
@@ -220,8 +196,7 @@ impl WatcherSpec {
     }
 }
 
-/// A latched satisfaction. For [`WatcherSpec::IdleFor`], `at` is the deadline,
-/// not the observation instant, so live and replay latch identically.
+/// A latched satisfaction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Satisfaction {
     /// The `content_seq` in force when the predicate became true.
@@ -269,10 +244,9 @@ fn any_row_matches(rows: &[Option<String>], matcher: &dyn RowMatch, range: RowRa
     })
 }
 
-/// Whether every pre-collected visible row in `range` is shown NOT to match
-/// `matcher`: the `RowsClear` scan. A row the matcher could not decide keeps
-/// the range from reading clear (see [`RowMatch`]); a row with no text has
-/// nothing to match. Stops at the first row that is not clear.
+/// Whether every pre-collected visible row in `range` is shown not to match `matcher`: the
+/// `RowsClear` scan. A row the matcher could not decide keeps the range from reading clear (see
+/// [`RowMatch`]); a row with no text has nothing to match. Stops at the first row not clear.
 #[must_use]
 fn every_row_clear(rows: &[Option<String>], matcher: &dyn RowMatch, range: RowRange) -> bool {
     rows.iter().enumerate().all(|(idx, cell)| {
@@ -286,10 +260,9 @@ fn every_row_clear(rows: &[Option<String>], matcher: &dyn RowMatch, range: RowRa
 struct ActivityClock {
     last_seq: u64,
     last_at: Option<Instant>,
-    /// Which grid `last_seq` was read from. `content_seq` is per grid: entering
-    /// the alt screen installs a grid whose counter restarts at 1, and leaving
-    /// restores the main grid's higher value, so a flip is a resync rather than
-    /// a comparison (as in `subscribe.rs`, `control_query` and `search_index`).
+    /// Which grid `last_seq` was read from. `content_seq` is per grid: entering the alt screen
+    /// installs a grid whose counter restarts at 1, and leaving restores the main grid's higher
+    /// value, so a flip is a resync rather than a comparison.
     alt: bool,
     /// The screen generation `last_seq` was read in: the terminal's
     /// [`invalidation_epoch`](super::ContentScrollState::invalidation_epoch),
@@ -305,19 +278,18 @@ struct ActivityClock {
 struct Watcher {
     id: WatchId,
     spec: WatcherSpec,
-    /// For [`WatcherSpec::IdleFor`]: the current fire deadline (`activity_at +
-    /// dur`), recomputed on each content advance. `None` for the other specs.
+    /// For `IdleFor`, the current fire deadline (`activity_at + dur`), recomputed on each
+    /// content advance; for `MomentumBelow`, the fixed crossing. `None` for the other specs.
     deadline: Option<Instant>,
     /// `Some` once the predicate has held; sticky while armed.
     latched: Option<Satisfaction>,
-    /// A freshly armed row watcher is scanned once even without a content
-    /// advance, so an already-matching row (or already-clear range) latches at
-    /// arm. Cleared after the first `observe`.
+    /// A freshly armed row watcher is scanned once even without a content advance, so an
+    /// already-matching row (or already-clear range) latches at arm. Cleared after the first
+    /// `observe_screen`.
     fresh: bool,
-    /// Which grid this watcher was armed against: `SeqAdvanced`'s `after` is a
-    /// per-grid `content_gen`. Crossing a buffer swap is a surface change, so
-    /// it latches; otherwise `await seq` would starve on the alt screen and fire
-    /// spuriously on 1049 exit.
+    /// Which grid this watcher was armed against: `SeqAdvanced`'s `after` is per grid, so
+    /// crossing a buffer swap latches; otherwise `await seq` would starve on the alt screen and
+    /// fire spuriously on 1049 exit.
     armed_alt: bool,
     /// Which screen generation this watcher was armed in
     /// ([`ActivityClock::epoch`]); crossing an epoch step latches too.
@@ -363,8 +335,7 @@ impl WatcherSet {
         !self.watchers.is_empty()
     }
 
-    /// Which screen generation [`seen_seq`](Self::seen_seq) was read in
-    /// ([`ActivityClock::epoch`]); the dirty-row gate compares it too.
+    /// The screen generation the kernel last saw (`ActivityClock::epoch`).
     #[must_use]
     #[cfg(test)]
     pub fn seen_epoch(&self) -> u64 {
@@ -440,7 +411,7 @@ impl WatcherSet {
             .and_then(|w| w.latched)
     }
 
-    /// Seed the activity baseline so the first `observe` after arming does not
+    /// Seed the activity baseline so the first `observe_screen` after arming does not
     /// read a phantom advance. Monotone: never lowers an existing baseline.
     pub fn seed_seq(&mut self, seq: u64) {
         if self.clock.last_seq < seq {
@@ -483,12 +454,7 @@ impl WatcherSet {
             .min()
     }
 
-    /// The seam call, run from `post_process` after every batch (and at arm for
-    /// a level-triggered spec) with `now == transient.process_now`. Stamps
-    /// activity if `content_seq` advanced and latches every predicate that holds,
-    /// in one pass. `rows[idx]` supplies visible-row text for row predicates; the
-    /// caller collects it only when `wants_row_scan` holds, so an empty `rows` is
-    /// never mistaken for a clear surface. Returns `true` if anything latched.
+    /// [`observe_screen`](Self::observe_screen) on the main grid at the current generation.
     #[cfg(test)]
     pub fn observe(
         &mut self,
@@ -501,10 +467,13 @@ impl WatcherSet {
         self.observe_screen(content_seq, false, epoch, newest_block_complete, now, rows)
     }
 
-    /// [`observe`](Self::observe) with the active-grid identity and screen
-    /// generation, as the engine calls it. A change of grid or generation is a
-    /// resync: activity is stamped and the baseline set (not raised), since the
-    /// counter is not comparable across it ([`ActivityClock::epoch`]).
+    /// The seam call, run by `observe_at` after every batch (and at arm for a level-triggered
+    /// spec) with `now == transient.process_now`. Stamps activity if the surface advanced and
+    /// latches every predicate that holds, in one pass. A change of grid or generation is a
+    /// resync: the baseline is set, not raised, since the counter is not comparable across it
+    /// (`ActivityClock::epoch`). `rows[idx]` is visible-row text for the row predicates; the
+    /// caller collects it only when [`wants_row_scan`](Self::wants_row_scan) holds, and an empty
+    /// `rows` is never read as a clear surface. Returns `true` if anything latched.
     pub fn observe_screen(
         &mut self,
         content_seq: u64,
@@ -561,8 +530,7 @@ impl WatcherSet {
                     matcher,
                     rows: range,
                 } => {
-                    // Dirty-row gate: scan only on advance or a fresh arm. Reads
-                    // the pre-collected row text by reference — no re-allocation.
+                    // Dirty-row gate: scan only on advance or a fresh arm.
                     if (advanced || w.fresh) && any_row_matches(rows, &**matcher, *range) {
                         new_latch = Some(Satisfaction {
                             seq: content_seq,
@@ -574,11 +542,9 @@ impl WatcherSet {
                     matcher,
                     rows: range,
                 } => {
-                    // Inverse verdict: latch when every row in range is shown
-                    // not to match. Only on a batch the caller collected rows for,
-                    // and only when the range meets at least one collected row:
-                    // scanning nothing is not evidence of a clear surface, and
-                    // neither is a row the matcher could not decide.
+                    // Latch only when every row in range is shown not to match, on a batch with
+                    // rows collected and a range meeting at least one: scanning nothing, or a
+                    // row the matcher could not decide, is not evidence of a clear surface.
                     if (advanced || w.fresh)
                         && range.covers_any(rows.len())
                         && every_row_clear(rows, &**matcher, *range)
@@ -654,13 +620,11 @@ impl super::Terminal {
     /// from [`watch`](Self::watch) at arm) with the injected clock. Read-only on
     /// the surface.
     pub(super) fn observe_at(&mut self, now: Instant) {
-        // Zero-watcher fast path: a single bool (the `subscribers.any()` analog).
         if !self.watchers.has_armed() {
             return;
         }
         let seq = self.content_seq();
-        // The active-grid identity travels with the reading: `content_seq` is
-        // per-grid, so a 1049 swap makes the raw counter incomparable.
+        // `content_seq` is per grid: a 1049 swap makes the raw counter incomparable.
         let alt = self.is_alternate_screen();
         // And the screen generation: a leave-and-re-enter keeps `alt` and can
         // repeat `seq`; only the epoch says the grid is another one.
@@ -674,19 +638,14 @@ impl super::Terminal {
                     super::BlockState::PromptOnly | super::BlockState::Complete
                 )
             });
-        // Collect visible-row text only when a row scan will run, into a
-        // persistent scratch buffer taken out of `self` (so row reads borrow
-        // `&self` while `observe` borrows `self.watchers`), refilled via the
-        // non-allocating `row_text_into` and put back. Both the outer `Vec` and
-        // each `String`'s capacity are reused across batches.
+        // Collect visible-row text only when a row scan will run, into a persistent scratch
+        // taken out of `self` (row reads borrow `&self` while `observe_screen` borrows
+        // `self.watchers`); the `Vec` and each `String`'s capacity are reused across batches.
         if self.watchers.wants_row_scan(advanced) {
             let rows = self.rows() as usize;
             let mut scratch = std::mem::take(&mut self.row_text_scratch);
             scratch.resize_with(rows, || None);
             for (i, slot) in scratch.iter_mut().enumerate() {
-                // Reuse the String's capacity. `row_text_into` returns `true` iff
-                // the row was in bounds (always, for `i < rows()`); otherwise `s`
-                // stays empty, mirroring `row_text`'s `None`.
                 let mut s = slot.take().unwrap_or_default();
                 *slot = self.row_text_into(i, &mut s).then_some(s);
             }
@@ -715,16 +674,15 @@ impl super::Terminal {
             .seed_screen(seq, self.is_alternate_screen(), epoch);
         let id = self.watchers.arm(spec, now)?;
         if arm_eval {
-            // `seed_seq` already set the baseline, so this pass sees
-            // `advanced == false` and stamps no activity; `SeqAdvanced` latches
-            // on `content_seq > after`, independent of `advanced`.
+            // The baseline was just seeded, so this pass sees `advanced == false` and stamps no
+            // activity; `SeqAdvanced` latches on `content_seq > after` regardless.
             self.observe_at(now);
         }
         Some(id)
     }
 
     /// Convenience for the common row predicate: latch when any visible row in
-    /// `rows` matches `matcher` (built in `aterm-observe`, regex out of core).
+    /// `rows` matches `matcher` (built in `aterm-observe`).
     #[must_use]
     pub fn watch_rows(
         &mut self,
@@ -758,13 +716,13 @@ impl super::Terminal {
         self.watchers.disarm(id);
     }
 
-    /// The soonest pending `IdleFor` deadline — the L1 verb bounds its park here.
+    /// The soonest pending deadline ([`WatcherSet::next_deadline`]).
     #[must_use]
     pub fn watch_next_deadline(&self) -> Option<Instant> {
         self.watchers.next_deadline()
     }
 
-    /// Host-driven idle firing: latch any `IdleFor` whose deadline `<= now`.
+    /// Host-driven deadline firing ([`WatcherSet::expire`]).
     pub fn watch_expire(&mut self, now: Instant) -> bool {
         self.watchers.expire(now)
     }
@@ -809,15 +767,13 @@ mod tests {
     use super::*;
 
     fn t0() -> Instant {
-        Instant::now() // CLOCK-EXEMPT: test seed; all deltas below are explicit
+        Instant::now() // test seed; all deltas below are explicit
     }
 
     /// No row text: the scalar predicates do not read rows.
     const NO_ROWS: &[Option<String>] = &[];
 
-    /// The arm-time contract: which predicates are level-triggered, and that
-    /// `Terminal::watch` evaluates them before returning, so `await seq <n>` on
-    /// a quiet session with output since `n` latches immediately.
+    /// Exactly the level-triggered predicates are evaluated at arm (`Terminal::watch`).
     #[test]
     fn needs_arm_eval_is_exactly_the_level_triggered_predicates() {
         // Statements about the surface as it already is -> must latch at arm.
@@ -829,8 +785,6 @@ mod tests {
                 RowVerdict::NoMatch
             }
         }
-        // Both row predicates: "a row matches now" and "no row matches now" are
-        // each a fact about the present surface, so both are evaluated at arm.
         assert!(
             WatcherSpec::RowMatches {
                 matcher: Arc::new(Never),
@@ -846,13 +800,11 @@ mod tests {
             .needs_arm_eval(),
             "RowsClear is level-triggered: an already-clear surface latches at arm"
         );
-        // ...and the row predicate must actually be wired.
         assert!(
             WatcherSpec::SeqAdvanced { after: 7 }.needs_arm_eval(),
             "SeqAdvanced is level-triggered; arming must not wait for the next batch"
         );
-        // Edge/deadline-triggered: idle is arm-relative, and BlockComplete
-        // latching at arm would fire `await block` on the previous block.
+        // Edge/deadline-triggered.
         assert!(
             !WatcherSpec::IdleFor {
                 dur: Duration::from_millis(1)
@@ -862,10 +814,8 @@ mod tests {
         assert!(!WatcherSpec::BlockComplete.needs_arm_eval());
     }
 
-    /// A `MomentumBelow` watcher latches at exactly its armed crossing
-    /// (`at = crossing`, whenever the host woke), and content activity neither
-    /// resets nor advances it; an `IdleFor` beside it is reset by the same
-    /// activity (vacuity control).
+    /// `MomentumBelow` latches at its armed crossing whenever the host wakes, and content
+    /// activity does not move it; an `IdleFor` beside it is reset by the same activity.
     #[test]
     fn a_momentum_watcher_latches_at_its_crossing_and_content_activity_does_not_move_it() {
         let base = t0();
@@ -908,8 +858,7 @@ mod tests {
         let sat = set.poll(id).expect("crossed");
         assert_eq!(sat.at, crossing, "latched at the deadline, not at `now`");
         assert_eq!(sat.seq, 7, "the seq the clock last saw");
-        // The idle one latched too — at its moved deadline (+800 ms), which is
-        // the reset this predicate deliberately does not take.
+        // The idle watcher latched too, at its moved deadline (+800 ms).
         assert_eq!(
             set.poll(idle).map(|s| s.at),
             Some(typed + Duration::from_millis(500))
@@ -919,13 +868,11 @@ mod tests {
     #[test]
     fn watch_latches_an_already_advanced_seq_before_it_returns() {
         let mut term = crate::terminal::Terminal::new(6, 20);
-        // Advance content_seq the way real output does, then stop: no further batch
-        // will arrive (a quiet session).
+        // Output, then a quiet session: no further batch arrives.
         term.process(b"hello");
         let seq = term.content_seq();
         assert!(seq > 0, "feeding bytes must advance content_seq");
 
-        // Ask the question an agent asks between turns: "anything since 0?"
         let id = term
             .watch(WatcherSpec::SeqAdvanced { after: 0 }, t0())
             .expect("watcher budget");
@@ -934,8 +881,7 @@ mod tests {
             .expect("an ALREADY-advanced seq must latch at arm, with no new batch");
         assert_eq!(latched.seq, seq);
 
-        // The converse must still hold, or we have traded a false negative for a
-        // false positive: nothing has happened since `seq`, so this stays pending.
+        // The converse: nothing since `seq`, so this stays pending.
         let id2 = term
             .watch(WatcherSpec::SeqAdvanced { after: seq }, t0())
             .expect("watcher budget");
@@ -1135,7 +1081,6 @@ mod tests {
 
     #[test]
     fn row_matches_latches_in_the_one_list_on_content_advance() {
-        // RowMatches latches through the same list and path as every WatcherSpec.
         #[derive(Debug)]
         struct Contains(&'static str);
         impl RowMatch for Contains {
@@ -1183,8 +1128,6 @@ mod tests {
         }
     }
 
-    /// Level-triggered like `RowMatches`: a surface already showing no matching
-    /// row latches on the arm-time scan, with no content advance.
     #[test]
     fn rows_clear_latches_at_arm_when_nothing_matches() {
         let base = t0();
@@ -1201,9 +1144,7 @@ mod tests {
         );
     }
 
-    /// A matching row holds the watcher pending, a quiet frame (no rows
-    /// collected) is not read as clear, and the content advance that removes
-    /// the row latches.
+    /// A quiet frame in between, with no rows collected, is not read as clear.
     #[test]
     fn rows_clear_holds_while_a_row_matches_then_latches_when_it_leaves() {
         let base = t0();
@@ -1222,22 +1163,17 @@ mod tests {
         ];
         w.observe(2, false, base, &still_busy);
         assert!(w.poll(id).is_none(), "still matching => still pending");
-        // Quiescent frame: no advance, the row-scan gate is closed and the caller
-        // hands over no rows. That must never read as "nothing matches".
+        // Quiescent frame: no advance, so the caller collects no rows.
         w.observe(2, false, base, NO_ROWS);
         assert!(
             w.poll(id).is_none(),
             "an un-scanned frame is not a clear surface"
         );
-        // The advance that takes the footer away latches, at that seq.
         let clear = [Some("Done.".to_string()), Some("❯ ".to_string())];
         w.observe(3, false, base, &clear);
         assert_eq!(w.poll(id).unwrap().seq, 3);
     }
 
-    /// `rows <a> <b>` scopes the scan: a match outside the range does not hold
-    /// the watcher, and the same surface with the range placed over the match
-    /// stays pending.
     #[test]
     fn rows_clear_range_ignores_a_match_outside_the_range() {
         let base = t0();
@@ -1265,10 +1201,7 @@ mod tests {
         );
     }
 
-    /// A range covering no visible row (starting past the grid, or inverted)
-    /// keeps `RowsClear` pending at arm and on every advance: no reading is not
-    /// a clear reading. A span that only reaches past the grid is intersected
-    /// with it.
+    /// An empty range keeps `RowsClear` pending: no reading is not a clear reading.
     #[test]
     fn rows_clear_never_latches_on_a_range_that_covers_no_visible_row() {
         let base = t0();
@@ -1314,11 +1247,8 @@ mod tests {
         assert!(!RowRange::All.covers_any(0));
     }
 
-    /// A row the matcher could not decide (a bounded engine out of budget) is
-    /// evidence NOT gathered: it neither fires `RowMatches` nor lets `RowsClear`
-    /// latch, and both answer as soon as a later scan decides the row (ruling
-    /// 2026-10-10). Before the verdict was tri-state, "undecided" read as "no
-    /// match", so `RowsClear` latched while the row was still on screen.
+    /// An undecided row (a bounded engine out of budget) neither fires `RowMatches` nor lets
+    /// `RowsClear` latch; both answer once a later scan decides it.
     #[test]
     fn an_undecided_row_holds_both_row_predicates_pending() {
         /// Decides a row only when it is short: a stand-in for a scan budget.
@@ -1432,9 +1362,7 @@ mod tests {
         );
     }
 
-    /// A `RowMatches` watcher driven through `observe_at` over many batches
-    /// stays pending until a visible row matches, then latches: the reused
-    /// `row_text_scratch` sees the same text a fresh collection would.
+    /// The reused `row_text_scratch` sees the same text a fresh collection would.
     #[test]
     fn observe_at_reuses_scratch_across_batches_and_still_latches() {
         use crate::terminal::Terminal;
@@ -1453,8 +1381,6 @@ mod tests {
             .watch_rows(Arc::new(Contains("BUILD SUCCESSFUL")), RowRange::All, now)
             .expect("arm the row watcher");
 
-        // Several non-matching batches, each refilling the scratch; the watcher
-        // stays pending.
         term.process(b"Compiling...\r\n");
         assert!(term.watch_poll(id).is_none(), "pending while building (1)");
         term.process(b"Linking...\r\n");
@@ -1462,7 +1388,6 @@ mod tests {
         term.process(b"Running tests...\r\n");
         assert!(term.watch_poll(id).is_none(), "pending while building (3)");
 
-        // The matching row finally appears -> the watcher latches at that batch.
         term.process(b"BUILD SUCCESSFUL");
         assert!(
             term.watch_poll(id).is_some(),

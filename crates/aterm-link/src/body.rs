@@ -32,72 +32,18 @@ pub(crate) fn decode_calls() -> usize {
     DECODE_CALLS.with(std::cell::Cell::get)
 }
 
-/// The kinds an `in` record may carry (§4.2). CLOSED: a kind outside this set is
-/// refused at the subject, so nothing an agent reads carries a token the bridge
-/// never classified. This is the same list the endpoint's `deliver` accepts.
-pub const KINDS: [&str; 9] = [
-    "ask",
-    "answer",
-    "task",
-    "report",
-    "note",
-    "control",
-    "ack",
-    "expired",
-    "undeliverable",
-];
-
-/// Whether `k` is one of [`KINDS`].
-#[must_use]
-pub fn is_kind(k: &str) -> bool {
-    KINDS.contains(&k)
-}
-
-/// The verdicts a receipt may carry (R8) — the three words `inbox seen` accepts.
-pub const VERDICTS: [&str; 3] = ["handled", "refused", "deferred"];
-
-/// Whether `v` is one of [`VERDICTS`].
-#[must_use]
-pub fn is_verdict(v: &str) -> bool {
-    VERDICTS.contains(&v)
-}
-
-/// The most relay hops a `via=` chain may name, and the most bytes it may spend
-/// on them.
-///
-/// [`Body::decode`] is total, so `via=` arrives unbounded; every consumer must
-/// bound it, and they must agree. A record head runs to the broker's 16 MiB, so
-/// an unbounded chain on a `deliver` line overruns the request-line bound and
-/// the record is lost with no verdict. This is the one place the bound lives;
-/// the byte cap is computed from the hop cap and
-/// [`crate::subject::PRINCIPAL_MAX`].
-///
-/// Sixteen is past any relay §6.7 describes, and the whole is far under the
-/// request-line bound. A chain is a claim on the relayer's word, never
-/// authority: `via.is_some()` alone already demotes the record's kind.
-pub const VIA_MAX_HOPS: usize = 16;
-
-/// The byte cap [`VIA_MAX_HOPS`] implies, separators included.
-pub const VIA_MAX_BYTES: usize = VIA_MAX_HOPS * (crate::subject::PRINCIPAL_MAX + 1);
-
-/// Whether a `via=` chain may be put on a wire line.
-///
-/// The endpoint's own rule — every comma element a principal — plus the two
-/// bounds the endpoint does not have. An EMPTY chain is refused too: it is a
-/// relay claim naming no relay, and it still demotes the record's kind.
-///
-/// Not applied in [`Body::decode`], deliberately: `via.is_some()` is what makes
-/// [`crate::bridge::Bridge::classify_kind`] demote a `task` and `trust_of`
-/// answer `relayed`, so dropping an over-long chain at the door would hand a
-/// stranger the undemoted kind. It is bounded where used, and a failing record
-/// earns a verdict.
-#[must_use]
-pub fn via_ok(via: &str) -> bool {
-    !via.is_empty()
-        && via.len() <= VIA_MAX_BYTES
-        && via.split(',').count() <= VIA_MAX_HOPS
-        && via.split(',').all(crate::subject::is_principal)
-}
+// The closed word sets a body is held to (§4.2 kinds, R8 verdicts, the `via=`
+// bounds) are the fabric's, defined once in `aterm-types` because the endpoint
+// holds its `deliver` and `post` lines to them too.
+//
+// `via_ok` is NOT applied in [`Body::decode`], deliberately: `via.is_some()` is
+// what makes [`crate::bridge::Bridge::classify_kind`] demote a `task` and
+// `trust_of` answer `relayed`, so dropping an over-long chain at the door would
+// hand a stranger the undemoted kind. It is bounded where used, and a failing
+// record earns a verdict.
+pub use aterm_types::fabric_grammar::{
+    is_kind, is_verdict, via_ok, KINDS, VERDICTS, VIA_MAX_BYTES, VIA_MAX_HOPS,
+};
 
 // No demotion list here: the policy lives in `bridge::DEMOTE_UNLESS_ACCEPTED`,
 // beside the code that applies it.

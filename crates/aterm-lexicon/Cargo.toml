@@ -14,7 +14,7 @@ repository.workspace = true
 description = "Multilingual whole-word lexical matching for the sparkle-words text decorations (profanity + feline families)"
 
 [dependencies]
-serde = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 aterm-toml = { workspace = true }
 aterm-hash = { workspace = true }
 

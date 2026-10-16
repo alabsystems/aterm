@@ -12,9 +12,9 @@ fn assert_line_text(sb: &Scrollback, idx: usize, expected: &str, context: &str) 
     assert_eq!(line.to_string(), expected, "{context}: wrong text at {idx}");
 }
 
-/// Regression for the warm front_offset path: if a trimmed corrupt warm block is
-/// later repaired, reads and warm->cold eviction must preserve only the
-/// surviving logical suffix instead of resurrecting the consumed prefix.
+/// A trimmed corrupt warm block that is later repaired keeps only its surviving
+/// logical suffix through reads and warm->cold eviction (the warm
+/// `front_offset` path).
 #[test]
 fn repaired_trimmed_warm_block_keeps_logical_suffix() {
     let mut sb = Scrollback::with_block_size(5, 10, 10_000_000, 5);

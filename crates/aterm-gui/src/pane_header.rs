@@ -99,9 +99,10 @@ impl HeaderCache {
 }
 
 impl App {
-    /// Nonblocking reads, with the previous label retained during PTY contention.
-    /// The same fingerprint gates repaint and the cached raster; title-only and
-    /// focus-only changes therefore repaint even with the native parent strip.
+    /// Refreshes each split leaf's header and returns their fingerprint (0 for none). Reads are
+    /// nonblocking: a contended PTY keeps the previous label. The fingerprint gates both repaint
+    /// and the cached raster, so a title- or focus-only change repaints even under the native
+    /// strip.
     pub(crate) fn refresh_pane_headers(&mut self, wid: WindowId, plan: &VisibleLeafPlan) -> u64 {
         let Some(ws) = self.windows.get_mut(&wid) else {
             return 0;
@@ -298,8 +299,7 @@ fn semantic_row(
         marker.fg = if focused { colors.accent } else { colors.label };
     }
     let status = status_label(indicators);
-    // Focus is the `▸` marker and the label's colour; the right side is the
-    // pane's status alone, so the title keeps the room.
+    // Focus is the `▸` marker and the label's colour; the right side is status alone.
     let suffix = if cols >= 6 {
         status.to_string()
     } else {
@@ -591,8 +591,7 @@ fn raster(
         });
     }
     let status = status_label(indicators);
-    // Focus is the accent rail and the bold label; the right side is the
-    // pane's status alone, so the title keeps the room.
+    // Focus is the accent rail and the bold label; the right side is status alone.
     let suffix = status.to_string();
     let suffix_size = TypeStep::Caption.px(h * 0.70);
     let suffix_width = tray_raster::ui_text_width_for(TextFace::Ui, &suffix, suffix_size.get());
@@ -729,14 +728,8 @@ mod tests {
         );
     }
 
-    /// The header paints a title in exactly the cells it measured it in, by
-    /// the grid's own walk. A title of explicit Devanagari half forms
-    /// (`क्‍ष`, which the grid folds into ONE cell after the ZWJ) was measured
-    /// as one cell per form and painted as two, so the row ran off its end
-    /// and indexed past the cell vector: a panic in the paint path from a
-    /// title any program can set with OSC 0/2. Sinhala `ක්‍ය` is two clusters
-    /// in one cell; its second cluster joins the first's cell rather than
-    /// vanish or take a cell of its own.
+    /// A title paints in exactly the cells it was measured in: Devanagari half forms the
+    /// grid folds after a ZWJ stay in the row, and Sinhala's second cluster joins the first's cell.
     #[test]
     fn header_rows_paint_titles_in_the_cells_they_measure() {
         let theme = aterm_render::Theme::default();

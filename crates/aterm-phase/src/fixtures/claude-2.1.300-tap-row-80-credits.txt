@@ -1,0 +1,17 @@
+# claude-code 2.1.300 · MEASURED 2026-10-15, `aterm ctl text` of a private headless aterm (80x24, aterm 0.103.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake claude.ai OAuth token (`claude --subscriber`) and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, tools/real-claude-lab) · the usage tap row at 80x24 beside the usage-credits notice
+ ▐▛███▛█   Claude Code v2.1.300
+▝▜██████▀  Sonnet 5.5 · Claude API
+ ▝▝   ▝▝   /private/tmp/at.6Z7y/proj
+
+
+❯ hi
+
+⏺ Hi! I am the local lab stub, not a model. (reply 1)
+
+✻ Churned for 0s · done 9:26 AM
+
+────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────
+  5h 100% · 7d 61%                                     Now using usage credits
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents       ◐ medium · /effort

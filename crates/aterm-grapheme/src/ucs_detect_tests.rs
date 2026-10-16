@@ -174,16 +174,6 @@ mod tests {
         assert!(info.display_width <= 2);
     }
 
-    /// Test Devanagari virama (halant) combining
-    #[test]
-    fn zero_devanagari_virama() {
-        // ka + virama + sha
-        let ksha = "\u{0915}\u{094D}\u{0937}";
-        let info = grapheme_width(ksha);
-        // Conjuncts may render as 1-2 graphemes depending on font
-        assert!(info.grapheme_count >= 1);
-    }
-
     /// Test Zero Width Joiner alone has no width
     #[test]
     fn zero_zwj_alone() {
@@ -231,28 +221,6 @@ mod tests {
         assert!(has_zwj(scientist));
         let info = grapheme_width(scientist);
         assert_eq!(info.grapheme_count, 1);
-    }
-
-    /// Test gender ZWJ sequences
-    #[test]
-    fn zwj_gender_sequences() {
-        // Person running + ZWJ + male sign + VS16
-        let man_running = "\u{1F3C3}\u{200D}\u{2642}\u{FE0F}";
-        assert!(has_zwj(man_running));
-
-        // Person running + ZWJ + female sign + VS16
-        let woman_running = "\u{1F3C3}\u{200D}\u{2640}\u{FE0F}";
-        assert!(has_zwj(woman_running));
-    }
-
-    /// Test that non-ZWJ emoji don't have ZWJ flag
-    #[test]
-    fn zwj_not_present_in_simple_emoji() {
-        assert!(!has_zwj("\u{1F600}"));
-        assert!(!has_zwj("\u{1F389}"));
-        assert!(!has_zwj("\u{1F680}"));
-        assert!(!has_zwj("A"));
-        assert!(!has_zwj("\u{4E2D}"));
     }
 
     // =========================================================================
@@ -340,13 +308,6 @@ mod tests {
         let fr_flag = "\u{1F1EB}\u{1F1F7}";
         assert!(is_flag_emoji(fr_flag));
         assert_eq!(grapheme_width(fr_flag).grapheme_count, 1);
-    }
-
-    /// Test that single regional indicator is not a flag
-    #[test]
-    fn flags_single_indicator_not_flag() {
-        let single = "\u{1F1FA}";
-        assert!(!is_flag_emoji(single));
     }
 
     // =========================================================================

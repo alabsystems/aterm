@@ -3,10 +3,8 @@
 //
 // Inline-image (iTerm2 OSC 1337 / Kitty) pixel and precedence parity. Both
 // renderers composite the real image pixels: Kitty z<0 tiles sit after
-// backgrounds/underlayers but before base+combining glyphs, while z>=0 tiles
-// retain the traditional over-text slot before line decorations.
-//
-// Gated: no GPU or no system font -> the test no-ops.
+// backgrounds/underlayers but before base+combining glyphs; z>=0 tiles draw
+// over text, before line decorations.
 
 use crate::common;
 use aterm_core::terminal::Terminal;
@@ -63,9 +61,7 @@ fn cell_pixels(f: &Frame, cw: usize, ch: usize, row: usize, col: usize) -> Vec<u
 fn gpu_skips_glyph_under_image_like_cpu() {
     let theme = Theme::default();
     let px = 18.0;
-    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(px, theme);
     let (cw, ch) = cpu.cell_size();
     let (rows, cols) = (4usize, 8usize);
 
@@ -117,9 +113,7 @@ fn gpu_skips_emoji_under_image_like_cpu() {
     // An image also suppresses a colour emoji's glyph on both paths.
     let theme = Theme::default();
     let px = 18.0;
-    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(px, theme);
     let (cw, ch) = cpu.cell_size();
     let (rows, cols) = (4usize, 8usize);
 
@@ -136,7 +130,7 @@ fn gpu_skips_emoji_under_image_like_cpu() {
     let cpu_frame = cpu.render_input(&input);
     let gpu_frame = gpu.render_input(&mut win, &input, None);
 
-    // The emoji's saturated red must NOT survive under the image on either path.
+    // The emoji's saturated red must not survive under the image on either path.
     let red_emoji = |px: &[u32]| -> usize {
         px.iter()
             .filter(|&&p| rr(p) > 150 && gg(p) < 80 && bb(p) < 80)
@@ -154,9 +148,7 @@ fn combining_mark_draws_over_negative_z_image_on_cpu_and_gpu() {
     // suppression and painter-order errors.
     let theme = Theme::default();
     let px = 18.0;
-    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(px, theme);
     // Make the solid-image-background oracle exact: glyph coverage blends
     // directly over the framebuffer, without the corrected-alpha remap's
     // separate home-cell-bg operand.
@@ -283,9 +275,7 @@ fn semitransparent_negative_z_image_composites_before_text_cpu_and_gpu() {
     // forces the GPU's additive pass split for an under-image stream.
     let theme = Theme::default();
     let px = 18.0;
-    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(px, theme);
     cpu.set_text_blending(aterm_render::TextBlending::Linear);
     gpu.set_text_blending(aterm_render::TextBlending::Linear);
     let (cw, ch) = cpu.cell_size();
@@ -343,7 +333,7 @@ fn semitransparent_negative_z_image_composites_before_text_cpu_and_gpu() {
                 w: cw as u16,
                 h: ch as u16,
                 color: glow,
-                // ADDITIVE light (see `GlowQuad::alpha`).
+                // Additive light (see `GlowQuad::alpha`).
                 alpha: 0,
                 color2: glow,
                 alpha2: 0,
@@ -362,8 +352,8 @@ fn semitransparent_negative_z_image_composites_before_text_cpu_and_gpu() {
     };
     let image_input = make_input(cell_bg, true);
     let oracle_input = make_input(blended_bg, false);
-    // Pre-composite the underlayer into the cell bg: this is the framebuffer
-    // state immediately before the old, wrong glyph-then-image order.
+    // Pre-composite the underlayer into the cell bg: the framebuffer a wrong
+    // glyph-then-image order would blend the image over.
     let text_on_lit_bg = make_input(lit_bg_rgb, false);
 
     let cpu_image = cpu.render_input(&image_input);
@@ -425,9 +415,7 @@ fn semitransparent_negative_z_image_composites_before_text_cpu_and_gpu() {
 fn kitty_z_threshold_and_below_cell_background_tier_match_cpu_gpu() {
     let theme = Theme::default();
     let px = 18.0;
-    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(px, theme);
     let (cw, ch) = cpu.cell_size();
     let (rows, cols) = (2usize, 4usize);
     let frame_default_bg = [1, 2, 3];
@@ -553,9 +541,7 @@ fn image_pixels_gpu_match_cpu() {
     // `blit_image_cell`, within the 8-LSB blend tolerance.
     let theme = Theme::default();
     let px = 18.0;
-    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(px, theme);
     let (cw, ch) = cpu.cell_size();
     let (rows, cols) = (4usize, 8usize);
 
@@ -614,13 +600,11 @@ fn image_pixels_gpu_match_cpu() {
 fn sixel_rawrgba8_pixels_gpu_match_cpu() {
     // A decoded sixel (`ImageFormat::RawRgba8`) driven through the Terminal
     // paints the same pixels on the GPU as the CPU's `blit_image_cell`, within
-    // the 8-LSB tolerance. The test build enables aterm-core's `sixel` feature;
-    // the red sanity check below also proves the feature is on.
+    // the 8-LSB tolerance. Needs aterm-core's `sixel` feature, which the test
+    // build enables.
     let theme = Theme::default();
     let px = 18.0;
-    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(px, theme);
     let (cw, ch) = cpu.cell_size();
     let (rows, cols) = (4usize, 8usize);
 
@@ -639,8 +623,7 @@ fn sixel_rawrgba8_pixels_gpu_match_cpu() {
     term.process(b"\x1b[44m"); // blue cell background (shows through the transparent cell)
     term.process(&dcs);
 
-    // The sixel must have been DECODED + placed as a RawRgba8 image (proves the
-    // feature is wired and the DCS path produced the format under test).
+    // The DCS path decoded and placed the sixel as a RawRgba8 image.
     assert!(
         !term.images_row(0).is_empty(),
         "sixel DCS must place a RawRgba8 inline image on row 0"
@@ -653,8 +636,8 @@ fn sixel_rawrgba8_pixels_gpu_match_cpu() {
     let delta = max_channel_delta(&cpu_frame, &gpu_frame);
     assert!(delta <= 8, "sixel RawRgba8 CPU/GPU diverge by {delta} > 8");
 
-    // Sanity: the GPU actually drew the opaque red sixel pixels in cell (0,0), so a
-    // do-nothing GPU pass cannot pass the delta check by both renderers being blank.
+    // Sanity: both renderers drew the opaque red sixel pixels in cell (0,0), so a
+    // do-nothing pass cannot pass the delta check.
     let red = |f: &Frame, row: usize, col: usize| -> usize {
         cell_pixels(f, cw, ch, row, col)
             .iter()
@@ -678,9 +661,7 @@ fn image_scissored_present_byte_identical_to_full() {
     // their rows dirty (`row_differs`), so the band covers them.
     let theme = aterm_render::Theme::default();
     let px = 18.0;
-    let Some((cpu, mut gpu)) = backends(px, theme) else {
-        return;
-    };
+    let (cpu, mut gpu) = backends(px, theme);
     let (cw, ch) = cpu.cell_size();
     let (rows, cols) = (6usize, 16usize);
     let png = solid_png(2 * cw as u32, 2 * ch as u32, [220, 60, 160]);
@@ -707,8 +688,8 @@ fn image_scissored_present_byte_identical_to_full() {
         "image present frame 1 must match a full render"
     );
 
-    // Frame 2: change ONE cell on the text row (image rows untouched) — this takes
-    // the scissored dirty-row path; the image must survive verbatim.
+    // Frame 2: change one cell on the text row (image rows untouched), taking the
+    // scissored dirty-row path; the image must survive verbatim.
     term.process(b"\x1b[4;3HX");
     let input2 = term.cell_frame(rows, cols);
     let before = gpu.scissor_taken();
@@ -737,13 +718,11 @@ fn image_scissored_present_byte_identical_to_full() {
 
 #[test]
 fn image_free_frame_stays_within_cpu_gpu_tolerance() {
-    // The image plumbing must be inert for image-free content: a normal text
-    // frame stays within the usual antialiasing tolerance, exactly as before.
+    // The image plumbing is inert for image-free content: a text frame stays
+    // within the usual antialiasing tolerance.
     let theme = Theme::default();
     let px = 18.0;
-    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(px, theme);
     let (rows, cols) = (4usize, 12usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
     term.process(b"\x1b[31mhello\x1b[0m \x1b[44mworld\x1b[0m");
@@ -756,17 +735,12 @@ fn image_free_frame_stays_within_cpu_gpu_tolerance() {
 }
 
 /// A Kitty `a=T` RGBA image rasterizes to real pixels through the CPU inline
-/// image compositor. CPU-only; skips without a system font.
+/// image compositor. CPU-only.
 #[test]
 fn kitty_rgba_image_rasterizes_to_pixels_cpu() {
     let theme = Theme::default();
     let px = 18.0;
-    let Some(mut cpu) = Renderer::from_system(px, theme) else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
-    // Deterministic parity: block on the lazy fallback parses so neither
-    // renderer compares a provisional `.notdef` frame against a real glyph.
+    let mut cpu = common::cpu(px, theme);
     cpu.debug_block_on_lazy_fallbacks();
     let (cw, ch) = cpu.cell_size();
     let (rows, cols) = (4usize, 8usize);
@@ -807,9 +781,7 @@ fn kitty_rgba_image_rasterizes_to_pixels_cpu() {
 #[test]
 fn stretched_image_fills_its_footprint_on_cpu_and_gpu() {
     let theme = Theme::default();
-    let Some((mut cpu, mut gpu)) = backends(18.0, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(18.0, theme);
     let (cw, ch) = cpu.cell_size();
     let (rows, cols) = (3usize, 8usize);
     let png = solid_png(ch as u32, ch as u32, [220, 20, 20]);
@@ -860,9 +832,7 @@ fn stretched_image_fills_its_footprint_on_cpu_and_gpu() {
 #[test]
 fn kitty_cropped_put_matches_cpu_and_gpu() {
     let theme = Theme::default();
-    let Some((mut cpu, mut gpu)) = backends(18.0, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(18.0, theme);
     let (cw, ch) = cpu.cell_size();
     let (rows, cols) = (4usize, 8usize);
     // Two cells wide: the left cell's worth red, the right cell's worth blue.
@@ -934,9 +904,7 @@ fn kitty_solid_cell(term: &mut Terminal, id: u32, cw: usize, ch: usize, rgba: [u
 #[test]
 fn overlapping_kitty_images_stack_by_z_on_cpu_and_gpu() {
     let theme = Theme::default();
-    let Some((mut cpu, mut gpu)) = backends(18.0, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(18.0, theme);
     let (cw, ch) = cpu.cell_size();
     let (rows, cols) = (4usize, 8usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
@@ -984,9 +952,7 @@ fn overlapping_kitty_images_stack_by_z_on_cpu_and_gpu() {
 #[test]
 fn kitty_put_offset_matches_cpu_and_gpu() {
     let theme = Theme::default();
-    let Some((mut cpu, mut gpu)) = backends(18.0, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(18.0, theme);
     let (cw, ch) = cpu.cell_size();
     let (rows, cols) = (4usize, 8usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
@@ -1025,9 +991,7 @@ fn kitty_put_offset_matches_cpu_and_gpu() {
 #[test]
 fn placement_relative_to_a_virtual_one_matches_cpu_and_gpu() {
     let theme = Theme::default();
-    let Some((mut cpu, mut gpu)) = backends(18.0, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(18.0, theme);
     let (cw, ch) = cpu.cell_size();
     let (rows, cols) = (4usize, 8usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
@@ -1074,9 +1038,7 @@ fn placement_relative_to_a_virtual_one_matches_cpu_and_gpu() {
 fn a_stack_taller_than_the_image_texture_shows_its_top_on_cpu_and_gpu() {
     use aterm_core::grid::extra::{ImageData, ImageFormat, ImageRef, ImageScaling};
     let theme = Theme::default();
-    let Some((mut cpu, mut gpu)) = backends(18.0, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(18.0, theme);
     let (cw, ch) = cpu.cell_size();
     let (rows, cols) = (4usize, 8usize);
     let colour = |layer: u8| [layer * 15, 255 - layer * 15, 40, 255];
@@ -1129,9 +1091,7 @@ fn a_stack_taller_than_the_image_texture_shows_its_top_on_cpu_and_gpu() {
 #[test]
 fn a_kitty_frame_advance_repaints_on_retained_cpu_and_gpu_renderers() {
     let theme = Theme::default();
-    let Some((mut cpu, mut gpu)) = backends(18.0, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(18.0, theme);
     let (cw, ch) = cpu.cell_size();
     let (rows, cols) = (4usize, 8usize);
     let mut term = Terminal::new(rows as u16, cols as u16);

@@ -94,12 +94,14 @@ fn shipping_lane_admission_matches_the_derived_model() {
 }
 
 /// Per-session budget for the alt-screen reclaim tests: small enough that the CRITICAL
-/// eighth lands on the 1 MiB floor, below what 50k lines of history occupy.
+/// eighth lands on the 1 MiB floor, below what 30k lines of history occupy.
 const ALT_TEST_BUDGET: usize = 8 * 1024 * 1024;
 
-/// A headless App whose one session has a real tiered store holding 50k lines of
+/// A headless App whose one session has a real tiered store holding 30k lines of
 /// pseudo-random history, then sits on the alternate screen (`CSI ?1049h`).
-/// Returns the App and the history bytes before any shed.
+/// Returns the App and the history bytes before any shed: above the 1 MiB floor
+/// and under half the budget. The bytes follow the cold codec's ratio: on LZ4,
+/// 30k lines hold about 3.0 MB and 50k would not fit under half.
 fn app_with_alt_screen_history() -> (App, usize) {
     let app = App::headless_for_test();
     let session = app.pool.iter().next().expect("headless session");
@@ -112,7 +114,7 @@ fn app_with_alt_screen_history() -> (App, usize) {
     );
     let mut state: u64 = 0x2026_0926;
     let mut chunk = String::with_capacity(64 * 1024);
-    for i in 0..50_000usize {
+    for i in 0..30_000usize {
         chunk.push_str(&format!("{i:06} "));
         for _ in 0..12 {
             state = state
@@ -140,6 +142,10 @@ fn app_with_alt_screen_history() -> (App, usize) {
     assert!(
         before > 1 << 20,
         "history must exceed the 1 MiB shed floor for the shed to bite (got {before})"
+    );
+    assert!(
+        before < ALT_TEST_BUDGET / 2,
+        "history must sit under half the budget for WARN to keep it whole (got {before})"
     );
     drop(term);
     (app, before)

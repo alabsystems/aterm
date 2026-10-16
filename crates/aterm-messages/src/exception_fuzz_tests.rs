@@ -1,16 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Test-only: the digest against an INDEPENDENT oracle. The oracle is the
-//! log FILE — every line the center ever drained, kept without a ring — so a
-//! bug in the ring (a dismissal forgotten after 512 later records), in the
-//! ordering of "the latest word" (a record posted between an entry's posting
-//! and its dismissal), in the wall clock an adopted entry ends with, or in a
-//! restart, shows as a disagreement about ONE question the owner cares about:
-//! when a fact is posted, was it quiet (`Suppressed`) or new?
+//! Test-only: the digest against an independent oracle, the log file (every line the
+//! center drained, kept without a ring). A bug in the ring (a dismissal forgotten after
+//! [`crate::LOG_CAP`] later records), in the order of "the latest word", in the wall
+//! clock an adopted entry ends with, or in a restart shows as a disagreement about one
+//! question: when a fact is posted, was it quiet (`Suppressed`) or new?
 //!
-//! Randomised but deterministic (a fixed xorshift per seed), so a failure names
-//! its seed and step and repeats.
+//! Randomised but deterministic (a fixed xorshift per seed), so a failure names its seed
+//! and step and repeats.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -41,9 +39,9 @@ impl Rng {
     }
 }
 
-/// What the ONE kind of fact under test looks like: the upgrade's own-work
-/// entry per tab (a wait: a week) or the Full Disk Access entry (the owner's
-/// choice: a month, with a button that does its action).
+/// The kind of fact under test: the upgrade's own-work entry per tab (a wait: a week) or
+/// the Full Disk Access entry (the owner's choice: a month, with a button that does its
+/// action).
 #[derive(Clone)]
 struct Kind {
     key: String,
@@ -96,9 +94,9 @@ fn entry(pick: usize, words: u32) -> Message {
     .later(ask)
 }
 
-/// The file, and what the file says about every exception's retirements.
-/// Each line is encoded and decoded ONCE, as it is drained; a restart replays
-/// those decoded lines (a line that does not decode is not in the file).
+/// The file, and what it says about every exception's retirements. Each line is encoded
+/// and decoded once, as it is drained; a restart replays those decoded lines (a line
+/// that does not decode is not in the file).
 #[derive(Default)]
 struct Oracle {
     file: Vec<LogLine>,
@@ -246,8 +244,8 @@ fn the_digest_agrees_with_the_file_through_restarts_floods_and_records() {
                     c = next;
                 }
                 7 => {
-                    // A RECORD under an entry's own key: another fact's word,
-                    // never a resolution and never a forgetting.
+                    // A record under an entry's own key: another fact's word, never a
+                    // resolution and never a forgetting.
                     let k = kind(rng.below(4));
                     c.post(
                         Message::new(tags::HARNESS, Severity::Info, "a wait, recorded")

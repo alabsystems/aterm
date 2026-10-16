@@ -1,18 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! OSC 8 hyperlink URI scheme allowlist: conformance table.
-//!
-//! Locks the allowlist in `handler_osc.rs::is_allowed_scheme` and the
-//! orthogonal URI guards in `handle_osc_8` behaviorally: feed
-//! `OSC 8 ; ; URI ST  X  OSC 8 ; ; ST` and observe whether the printed cell
-//! carries the hyperlink (`Screen::hyperlink_at`). A retained link means the
-//! URI passed every check; a missing link means it was refused at parse time.
-//!
-//! An allowlist, not a blocklist: attacker-registered macOS URL handlers
-//! (`slack:`, `vscode:`, ...) would slip past any blocklist and launch native
-//! apps via `NSWorkspace.open`. The default-safe set is exactly: http, https,
-//! mailto, sftp, tel.
+//! OSC 8 hyperlink scheme allowlist and URI guards, observed end to end: feed
+//! `OSC 8 ; ; URI ST  X  OSC 8 ; ; ST` and check whether the printed cell
+//! carries the link (`Screen::hyperlink_at`). The allowlist and its rationale
+//! are `is_allowed_scheme` in aterm-core's `handler_osc.rs`.
 
 use aterm_conformance::Screen;
 
@@ -27,28 +19,18 @@ fn screen_with_link(uri: &str) -> Screen {
 
 fn link_retained(uri: &str) -> Option<String> {
     let s = screen_with_link(uri);
-    // The glyph must always land regardless of link acceptance.
     assert_eq!(s.row(0), "X", "printed glyph must be on screen for {uri:?}");
     s.hyperlink_at(0, 0)
 }
 
-// =============================================================================
-// Allowed schemes — each must survive end-to-end and be exposed per-cell.
-// =============================================================================
-
 #[test]
 fn osc8_allowed_schemes_retained() {
-    // (uri, why this scheme is on the allowlist)
     let allowed: &[(&str, &str)] = &[
-        // http/https: the web; the entire point of OSC 8.
         ("http://example.com/a", "plain web link"),
         ("https://example.com/path?q=1", "TLS web link"),
-        // mailto: opens a compose window; no code execution surface.
         ("mailto:user@example.com", "mail compose"),
-        // sftp: file transfer URL; unlike ssh: it does not feed a hostname
-        // into a shell-adjacent command line (CVE-2023-51385 class).
+        // Unlike ssh:, sftp: feeds no hostname into a command line.
         ("sftp://host.example.com/file", "sftp transfer"),
-        // tel: dialer hand-off; no filesystem or shell surface.
         ("tel:+15551234567", "telephone"),
     ];
     for (uri, why) in allowed {
@@ -62,8 +44,7 @@ fn osc8_allowed_schemes_retained() {
 
 #[test]
 fn osc8_allowed_scheme_is_case_insensitive() {
-    // RFC 3986 §3.1: schemes are case-insensitive. The allowlist must
-    // match HTTPS:// as https:// — rejecting it would break real emitters.
+    // RFC 3986 §3.1: schemes are case-insensitive.
     let uri = "HTTPS://EXAMPLE.COM/Path";
     assert_eq!(
         link_retained(uri).as_deref(),
@@ -72,46 +53,32 @@ fn osc8_allowed_scheme_is_case_insensitive() {
     );
 }
 
-// =============================================================================
-// Dangerous schemes — each must be refused at parse time (no cell link).
-// =============================================================================
-
 #[test]
 fn osc8_dangerous_schemes_rejected() {
-    // (uri, attack vector the rejection blocks)
     let dangerous: &[(&str, &str)] = &[
-        // javascript: executes attacker JS in whatever opens the link (XSS).
         (
             "javascript:alert(1)",
             "XSS / script execution in the opener",
         ),
-        // data: smuggles attacker-controlled documents (phishing pages,
-        // drive-by HTML) with no origin and no network fetch to inspect.
         (
             "data:text/html;base64,PHNjcmlwdD4=",
             "origin-less phishing/XSS payload",
         ),
-        // file: discloses or opens local files; on macOS can launch
-        // documents with registered handlers (local-exec surface).
         ("file:///etc/passwd", "local file disclosure / local exec"),
-        // ssh: CVE-2023-51385 class — a hostname like `-oProxyCommand=...`
-        // becomes an argument/command injection when handed to ssh.
+        // A hostname like `-oProxyCommand=...` is an argument to ssh.
         (
             "ssh://-oProxyCommand=evil/host",
             "ssh argument injection / local exec",
         ),
-        // git: same argument-injection class as ssh (git shells out to ssh).
         (
             "git://example.com/repo.git",
             "git->ssh argument injection class",
         ),
-        // ftp: cleartext fetch; not in the safe set.
         (
             "ftp://example.com/file",
             "cleartext fetch / legacy handler abuse",
         ),
-        // Attacker-registered app handlers: the reason the scheme check is an
-        // allowlist rather than a blocklist.
+        // Registered app handlers: why the check is an allowlist.
         ("slack://settings", "attacker-registered app URL handler"),
         ("vscode://payload", "attacker-registered app URL handler"),
     ];
@@ -124,13 +91,8 @@ fn osc8_dangerous_schemes_rejected() {
     }
 }
 
-// =============================================================================
-// Non-RFC-3986 garbage schemes — refused before any allowlist comparison.
-// =============================================================================
-
 #[test]
 fn osc8_garbage_schemes_rejected() {
-    // (uri, why it is not a valid RFC 3986 scheme)
     let garbage: &[(&str, &str)] = &[
         // RFC 3986 §3.1: scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )
         (
@@ -155,16 +117,10 @@ fn osc8_garbage_schemes_rejected() {
     }
 }
 
-// =============================================================================
-// Guard composition — each orthogonal guard must reject INDEPENDENTLY:
-// one bad property at a time, on an otherwise perfectly allowed https URI.
-// =============================================================================
-
+// Each guard rejects alone: one bad property on an otherwise allowed https URI.
 #[test]
 fn osc8_overlength_uri_rejected_independently() {
-    // Valid scheme, no control chars, no BiDi — only too long.
-    // MAX_HYPERLINK_URL_BYTES = 8192 (terminal/mod.rs); memory-exhaustion
-    // guard against OSC 8 spam with megabyte URIs.
+    // Only too long: over `MAX_HYPERLINK_URL_BYTES` (8192).
     let long_uri = format!("https://example.com/{}", "a".repeat(8200));
     assert_eq!(
         link_retained(&long_uri),
@@ -179,12 +135,8 @@ fn osc8_overlength_uri_rejected_independently() {
 
 #[test]
 fn osc8_control_char_in_uri_rejected_independently() {
-    // Valid scheme, under-length, no BiDi — only an embedded control char.
-    // Control chars in URIs enable log/status-bar spoofing and splitting
-    // attacks when the URI is later rendered or passed to an opener.
-    //
-    // DEL (0x7F): the parser puts 0x20-0xFF in OSC strings, so it reaches
-    // the handler and must be refused there (is_control()).
+    // Only an embedded control char. DEL (0x7F) is OSC string data to the
+    // parser, so the handler must refuse it.
     assert_eq!(
         link_retained("https://example.com/\x7Ffoo"),
         None,
@@ -201,10 +153,8 @@ fn osc8_control_char_in_uri_rejected_independently() {
 
 #[test]
 fn osc8_bidi_override_in_uri_rejected_independently() {
-    // Valid scheme, under-length, no control chars — only a BiDi override.
-    // Trojan Source (CVE-2021-42574): U+202E visually reorders
-    // "https://safe.example\u{202E}moc.live" in previews/status bars to
-    // spoof the destination hostname. Reject outright, never strip.
+    // Only a BiDi override: U+202E (Trojan Source, CVE-2021-42574) reorders a
+    // preview to spoof the host. Rejected outright, never stripped.
     assert_eq!(
         link_retained("https://safe.example\u{202E}moc.live"),
         None,
@@ -217,10 +167,6 @@ fn osc8_bidi_override_in_uri_rejected_independently() {
         "LRI inside URI must be rejected by the BiDi guard alone"
     );
 }
-
-// =============================================================================
-// Oracle sanity — cell-level retention matches link open/close semantics.
-// =============================================================================
 
 #[test]
 fn osc8_link_applies_only_while_open() {

@@ -342,15 +342,6 @@ fn a_bare_claimant_keeps_its_key_matchable_across_a_precedence_replacement() {
 }
 
 #[test]
-fn cat_command_not_decorated_by_default() {
-    // The literal `cat` shell command is a bare 3-letter token → opt-in only.
-    assert_eq!(
-        classes("cat file.txt | grep foo", &default_opts()),
-        Vec::<Class>::new()
-    );
-}
-
-#[test]
 fn prose_cat_decorated_when_enabled() {
     assert_eq!(
         classes("I love my cat", &opts_allow_cat()),

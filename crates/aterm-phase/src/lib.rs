@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! **aterm-phase** — what an agent worker (Claude Code, Codex) is doing RIGHT
-//! NOW, from one screen read, as pure functions over the screen's rows.
+//! **aterm-phase** — what an agent worker (Claude Code, Codex, agy, Muse Code)
+//! is doing RIGHT NOW, from one screen read, as pure functions over the
+//! screen's rows.
 //!
 //! * [`phase::worker_phase`] — busy | prompt | limited | idle | question, read
 //!   from the LIVE ZONE around the composer (the status row above its top
@@ -31,12 +32,18 @@
 //!   ([`wall::memory_wall`]), which the reader keeps even under a busy
 //!   spinner;
 //! * [`turn`] — what a finished turn leaves for the next one: Claude Code's
-//!   own suggestion, an armed `/goal`, the worker's last words, a stalled
-//!   token count;
+//!   own suggestion, an armed `/goal`, the worker's last words — and the
+//!   launch card: what it names ([`turn::launch_card`]) and where it sits
+//!   ([`turn::launch_card_place`], for the harness card drawn around it, with
+//!   the build it names: [`turn::launch_card_version`]);
 //! * [`reader::identify`] / [`reader::read`] — the reader for the session's
-//!   PROGRAM (Claude Code, Codex, anything else), and one screen read whole;
-//!   [`reader::Program::supervisable`] — the programs the supervisor hosts;
-//! * [`codex`] — Codex's grammar, measured on codex 0.156.1;
+//!   PROGRAM (Claude Code, Codex, agy, Muse Code, anything else), and one
+//!   screen read whole; [`reader::Program::supervisable`] — the programs the
+//!   supervisor hosts;
+//! * [`codex`] — Codex's grammar, measured on codex 0.156.1 and on later
+//!   builds through 0.163.0 (the builds its fixtures name);
+//! * [`agy`] — agy's (Google's Antigravity CLI), measured on 1.4.0;
+//! * [`muse`] — Muse Code's, measured on 1.4.9-R6297.1;
 //! * [`panel`] — Claude Code's Settings panel (`/usage`'s dialog): whether
 //!   it is what the screen shows, by which renderer, and what a row under
 //!   its header says of the Usage tab;
@@ -44,6 +51,8 @@
 //!   dialog by its exact label, the confirmation it opens read exactly or
 //!   refused, the name it draws each limit type by, the two pending lines,
 //!   and the line the vendor answers with;
+//! * [`credits`] — usage credits carrying the session, and the vendor's own
+//!   warning that a window is filling, read for the record;
 //! * [`anchors::ANCHORS`] — the literal strings other crates guard on.
 //!
 //! ## Why a crate of its own
@@ -58,9 +67,19 @@
 //! (the measurements are in the doc comments and the tests); the fixtures
 //! under [`prompt::fixtures`] are the screens those sessions showed, each
 //! newer one with its program, version and provenance on its first line.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_types,
+        reason = "test code: a stand-in child may inherit descriptors"
+    )
+)]
 
+pub mod agy;
 pub mod anchors;
 pub mod codex;
+pub mod credits;
+pub mod muse;
 pub mod panel;
 pub mod phase;
 pub mod prompt;
@@ -73,25 +92,24 @@ pub mod turn;
 pub mod wall;
 mod wrap;
 
-pub use anchors::{ANCHORS, Anchor, AnchorKind, CODEX_ANCHORS, anchor, anchor_text};
+pub use anchors::{ANCHORS, anchor, anchor_text};
 pub use panel::{
     PanelRenderer, SettingsPanel, panel_tail, settings_panel, usage_tab_mark, usage_unsettled,
 };
 pub use phase::{
-    Busy, Phase, Zone, background_only, busy_signal, busy_zone_start, context_left, is_placeholder,
-    limit_notice, notice_reset, survey_open, transcript_end, worker_phase,
+    Phase, background_only, busy_signal, busy_zone_start, context_left, limit_notice, notice_reset,
+    transcript_end, worker_phase,
 };
 pub use prompt::{
-    Cancel, CancelEffect, Header, Opt, Origin, OwnerReview, Prompt, PromptKind, PromptV2,
-    ReviewKind, RmBreaker, RmBreakerKind, RmCommand, Role, Select, footer_keys, parse_header,
-    parse_prompt, parse_prompt_v2, prompt_box_first_row, prompt_box_span, rm_breaker_of,
+    Opt, Origin, PromptKind, PromptV2, Role, footer_keys, parse_prompt, parse_prompt_v2,
+    prompt_box_first_row, prompt_box_span,
 };
 pub use question::{
-    ButtonRow, ChatRow, FreeText, QuestionDialog, QuestionFocus, QuestionForm, QuestionOption,
-    QuestionTab, QuestionText, Recommended, ReviewRow,
+    FreeText, QuestionDialog, QuestionFocus, QuestionForm, QuestionOption, QuestionText,
+    Recommended,
 };
 pub use reader::{
-    AGENT_RUNTIMES, BLANK_GAP, ClaudeReader, CodexReader, GenericReader, Program, Reading,
+    AgyReader, BLANK_GAP, ClaudeReader, CodexReader, GenericReader, MuseReader, Program, Reading,
     ScreenReader, identify, live_zone_reaches_above, live_zone_start, may_host_agent, program_of,
     read, read_at,
 };
@@ -99,12 +117,14 @@ pub use reset::{
     ConfirmRead, ResetConfirm, ResetLine, ResetPending, ResetRow, reset_confirm, reset_limit_name,
     reset_line, reset_pending, reset_row, spends_reset,
 };
-pub use survey::{SurveyBlock, SurveyKind, ask_card, drafts_card, survey_block};
+pub use survey::{SurveyBlock, SurveyKind, survey_block};
 pub use turn::{
-    LaunchCard, Progress, continuation_suggestion, goal_active, interrupted, launch_card,
-    said_tail, status_row_progress, status_row_stall,
+    CardPlace, LaunchCard, continuation_suggestion, goal_active, idle_compacted, interrupted,
+    launch_card, launch_card_place, launch_card_scan, launch_card_unmoved, launch_card_version,
+    said_tail,
 };
 pub use wall::{
     ApiCause, AutoContinue, Placement, SinceLimit, Wall, WallKind, auto_continue_end,
-    classify_wall, left_wall, login_restored, memory_banner_head, memory_wall, since_limit, wall,
+    classify_wall, left_wall, login_expires_in, login_restored, memory_banner_head, since_limit,
+    wall,
 };

@@ -47,8 +47,10 @@
 //!   failure is said as `refused:<why>`.
 //!
 //! In the window the new process belongs to its supervisor as soon as it holds
-//! the conversation (`adopted`, [`Opts::hand_back`]); the continuation is
-//! typed at that loop's first idle point ([`owed`], [`resume`]).
+//! the conversation (`adopted`, [`Opts::hand_back`]); the relaunch's last
+//! step is taken at that loop's first idle point ([`owed`], [`resume`]): the
+//! continuation, or nothing for a quiet restart and every account move
+//! ([`carried_quietly`]).
 //!
 //! Every fact is re-read at the act and every upgrade guard is kept: the
 //! shell's own foreground job on an aterm tab's terminal, the tab's unique PTY
@@ -216,6 +218,10 @@ pub(super) struct Launch<'a> {
     /// adds nothing: the process had no such variable, and the new one takes
     /// its shell's, as every relaunch did before accounts existed.
     pub(super) login: Option<&'a str>,
+    /// THE PROCESS IT REPLACES AUTHENTICATED BY ITS STORED LOGIN, by its own
+    /// exec environment ([`Snapshot::stored_login`]): the usage tap's first
+    /// question ([`super::tap::gate`]). `false` puts no tap on the line.
+    pub(super) stored_login: bool,
 }
 
 /// The REQUIRED environment of a relaunch line for `login`
@@ -265,11 +271,19 @@ pub(super) fn plan(
     } else {
         launch.cwd.to_string()
     };
-    let cd = (!want.is_empty() && cwd_of(shell).as_deref() != Some(want.as_str())).then_some(want);
+    let cd =
+        (!want.is_empty() && cwd_of(shell).as_deref() != Some(want.as_str())).then(|| want.clone());
     // A line that asks no model of its own never carries a `--model` the
     // record marks FAILED ([`line_model_of`]).
     let model = line_model_of(opts, launch.session, launch.argv, launch.model);
-    let line = line_for(
+    // The usage tap, where `[harness] usage_tap` names this aterm
+    // ([`Opts::usage_tap`]) and its gate holds for the relaunched process in
+    // the directory it starts in ([`tap_of`]).
+    let tap = opts
+        .usage_tap
+        .as_ref()
+        .and_then(|armed| tap_of(opts, launch, armed, &want));
+    let line = line_tapped(
         dialect,
         heal.as_deref(),
         cd.as_deref(),
@@ -279,11 +293,43 @@ pub(super) fn plan(
         model,
         launch.mode,
         &required_env(launch.home, launch.login),
+        tap.as_deref(),
     )?;
     Ok(Plan {
         shell,
         dialect,
         line,
+    })
+}
+
+/// THE USAGE TAP'S `--settings` VALUE FOR `launch`, or `None`
+/// ([`super::tap::gate`]): `armed` names this aterm and the login of the
+/// machine's one account, `cwd` is the directory the relaunched process
+/// starts in. The cheap refusals come first, so nothing is read for a line
+/// that cannot carry it; then the settings chain Claude Code reads there
+/// ([`super::upgrade_drive::tap_settings`]) and the vendor's profile store
+/// ([`super::upgrade_drive::tap_profile_store`]).
+fn tap_of(
+    opts: &Opts,
+    launch: &Launch<'_>,
+    armed: &super::tap::Armed,
+    cwd: &str,
+) -> Option<String> {
+    let lone = armed.lone_login.as_deref();
+    let own = launch.stored_login && super::tap::own_login(launch.login, launch.home, lone);
+    if !own || super::tap::settings_value(&armed.exe).is_none() {
+        return None;
+    }
+    let settings = super::upgrade_drive::tap_settings(opts, launch.argv, cwd);
+    super::tap::gate(&super::tap::GateFacts {
+        exe: Some(&armed.exe),
+        stored_login: launch.stored_login,
+        login: launch.login,
+        lone_login: lone,
+        home: launch.home,
+        argv: launch.argv,
+        settings: &settings,
+        profile_store: super::upgrade_drive::tap_profile_store(opts),
     })
 }
 
@@ -317,6 +363,8 @@ pub(super) fn shell_dialect(shell: u32, t: &[(u32, u32, String)]) -> Option<Dial
 /// The survey switch ([`CLAUDE_LAUNCH_ENV`]) is a nicety, dropped first: the
 /// line is tried with both, then with the required part alone. With nothing
 /// required that is the line and its fallback as they always were.
+///
+/// It carries no usage tap: [`line_tapped`] with none.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn line_for(
     dialect: Dialect,
@@ -328,6 +376,31 @@ pub(super) fn line_for(
     model: Option<&str>,
     mode: Option<&str>,
     required: &[(&str, &str)],
+) -> Result<String, NoPlan> {
+    line_tapped(
+        dialect, heal, cd, exe, argv, session, model, mode, required, None,
+    )
+}
+
+/// [`line_for`] with the usage tap's `--settings` value `tap`, where its
+/// gate gave one ([`super::tap::gate`]; [`with_tap`]). The tap is a nicety
+/// too, and the line's bound a hard one: the line is tried with what is
+/// required, the survey switch and the tap; then without the switch; then
+/// without the tap and with the switch; then with what is required alone —
+/// the tap is dropped before anything the session must run under. With no
+/// tap that is [`line_for`]'s two tries, byte for byte.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn line_tapped(
+    dialect: Dialect,
+    heal: Option<&Path>,
+    cd: Option<&str>,
+    exe: &Path,
+    argv: &[String],
+    session: Option<&str>,
+    model: Option<&str>,
+    mode: Option<&str>,
+    required: &[(&str, &str)],
+    tap: Option<&str>,
 ) -> Result<String, NoPlan> {
     let mut flags =
         upgrade::rewrite_argv(argv, session.unwrap_or("-")).map_err(|e| NoPlan::Refused {
@@ -343,15 +416,40 @@ pub(super) fn line_for(
     // The survey switch is a nicety and the line's bound a hard one: a launch
     // whose line fits only WITHOUT the export (the switch adds 38 bytes to
     // a bound of 1000) is relaunched without it, never refused for it. What
-    // is REQUIRED stays on both tries, first on the line.
+    // is REQUIRED stays on every try, first on the line.
     let both: Vec<(&str, &str)> = required.iter().copied().chain(CLAUDE_LAUNCH_ENV).collect();
-    upgrade::relaunch_line_env(dialect, heal, cd, &both, exe, &flags)
-        .or_else(|_| upgrade::relaunch_line_env(dialect, heal, cd, required, exe, &flags))
+    let tapped = tap.map(|value| with_tap(flags.clone(), value));
+    let line = |env: &[(&str, &str)], flags: &[String]| {
+        upgrade::relaunch_line_env(dialect, heal, cd, env, exe, flags)
+    };
+    tapped
+        .as_deref()
+        .map_or_else(|| Err(String::new()), |t| line(&both, t))
+        .or_else(|_| {
+            tapped
+                .as_deref()
+                .map_or_else(|| Err(String::new()), |t| line(required, t))
+        })
+        .or_else(|_| line(&both, &flags))
+        .or_else(|_| line(required, &flags))
         .map_err(|e| NoPlan::Refused {
             why: format!("line:{e}"),
             what: "line".to_string(),
             detail: e,
         })
+}
+
+/// `flags` with the usage tap's pair, `--settings <value>`, before the
+/// trailing `--resume` pair (at the end of a fresh start's flags). The flags
+/// carry no `--settings` of their own: the tap's gate refuses a launch with
+/// one ([`super::tap::gate`]), and its own is shed ([`upgrade::rewrite_argv`]).
+pub(super) fn with_tap(mut flags: Vec<String>, value: &str) -> Vec<String> {
+    let at = flags
+        .iter()
+        .rposition(|f| f == "--resume")
+        .unwrap_or(flags.len());
+    flags.splice(at..at, ["--settings".to_string(), value.to_string()]);
+    flags
 }
 
 /// `flags` with every `--model` spelling replaced by `model` (before the
@@ -1484,11 +1582,20 @@ fn adopted_detail(st: &St) -> &'static str {
     }
 }
 
-/// Whether the restart `st` records is carried on with NOTHING typed
-/// ([`St::quiet`]): an upgrade's quiet move, never a relaunch's
-/// ([`relaunch_cause`], whose continuation says why it came back).
+/// Whether a restart of `cause` is carried on with NOTHING typed: EVERY MOVE
+/// TO ANOTHER ACCOUNT ([`CAUSE_ACCOUNT`]), at a wall or ahead of one — its
+/// supervisor types the point's own act there, the wall's resume after a move
+/// made at one, else what it would have typed with no move — and an
+/// upgrade's quiet move (`quiet`, [`St::quiet`]), never another relaunch's
+/// ([`relaunch_cause`], whose continuation says why it came back). PURE.
+#[must_use]
+pub fn carried_quietly(cause: &str, quiet: bool) -> bool {
+    cause.starts_with(CAUSE_ACCOUNT) || (quiet && !relaunch_cause(cause))
+}
+
+/// [`carried_quietly`], for the restart `st` records.
 fn resumes_quietly(st: &St) -> bool {
-    st.quiet && !relaunch_cause(&st.cause)
+    carried_quietly(&st.cause, st.quiet)
 }
 
 /// How long one [`await_held`] step waits for the relaunched process to
@@ -1732,7 +1839,7 @@ fn line_over(c: &mut Client, tab: &str, block: u64) -> Option<bool> {
 /// `None`: no reply, none marked, or one that cannot be read.
 fn newest_block(c: &mut Client, tab: &str) -> Option<Value> {
     let (head, body) = c.request_counted(&format!("@{tab} blocks 1 --json")).ok()?;
-    if !head.starts_with("OK") {
+    if !crate::is_ok_reply(&head) {
         return None;
     }
     let json = if body.trim().is_empty() {
@@ -1763,7 +1870,7 @@ pub(super) fn first_idle(
         "@{tab} await agent idle timeout={}",
         FIRST_IDLE.as_millis()
     ));
-    if !awaited.is_ok_and(|reply| reply.starts_with("OK")) {
+    if !awaited.is_ok_and(|reply| crate::is_ok_reply(&reply)) {
         wait_until(FIRST_IDLE, record_idle);
     }
 }
@@ -1873,11 +1980,12 @@ fn carry_on_once(
     let Some(current) = continuation_session(&records, new.pid, key) else {
         return said(r, "wait:conversation-changed");
     };
-    // A QUIET RESTART ([`super::upgrade_drive::St::quiet`], the default) is
-    // carried on with NOTHING: the agent was idle, nothing was
-    // asked of it, and it is resumed as it was — the tab's loop decides the
-    // point as if nothing had moved (`done:resumed`, a last word that moves
-    // nothing), so an agent that had finished, or asked its person something,
+    // A QUIET RESTART ([`super::upgrade_drive::St::quiet`], the default, and
+    // every account move: [`carried_quietly`]) is carried on with NOTHING: the
+    // agent was idle, nothing was asked of it, and it is resumed as it was —
+    // the tab's loop decides the point as if nothing had moved (`done:resumed`,
+    // a last word that moves nothing; after a move made at a wall, that wall's
+    // resume), so an agent that had finished, or asked its person something,
     // is never told to carry on. The model it runs now is its next answer's
     // to say, and no step waits for that answer: the outcome names the model
     // it ran before, never "unconfirmed", which read as a check that failed
@@ -2292,7 +2400,8 @@ pub(super) fn fallback_carried(
 }
 
 /// Whether a record of `cause` is a relaunch's (its continuation says why,
-/// [`resumed_prompt`]) rather than the upgrade's. [`CAUSE_HOST`] counts.
+/// [`resumed_prompt`]; an account move's is none, [`carried_quietly`]) rather
+/// than the upgrade's. [`CAUSE_HOST`] counts.
 pub(super) fn relaunch_cause(cause: &str) -> bool {
     cause == CAUSE_EXIT
         || cause == CAUSE_MEMORY
@@ -2370,14 +2479,6 @@ pub fn resumed_prompt_as(agent: &str, version: &str, cause: &str) -> String {
             "Relaunched on {model}: the usage limit that moved this session to another model has \
              reset, so it was restarted back on it ({session_only})"
         )
-    } else if let Some(label) = cause.strip_prefix(CAUSE_ACCOUNT) {
-        // The LABEL and nothing else, and nothing about limits: the agent
-        // cannot know them, and the move may have been made ahead of one or
-        // on the owner's word.
-        format!(
-            "Relaunched under another Claude account ({}): this session was ended and restarted",
-            one_line(label)
-        )
     } else {
         format!("Relaunched: {agent} exited without anyone asking, and this session was restarted")
     };
@@ -2401,10 +2502,10 @@ pub fn resumed_prompt_as(agent: &str, version: &str, cause: &str) -> String {
 /// work under it, nobody's hand, never this process's own ancestry. The
 /// relaunch is [`relaunch`] itself, handed back to the loop that asked
 /// (`adopted`), whose next idle point types the continuation with the
-/// restart's reason ([`resumed_prompt`]). A restart left between the signal
-/// and the new process is carried on first ([`carry_in_flight`]) — and an
-/// account move asked over one of another kind is then not tried
-/// ([`IN_FLIGHT_OTHER`]).
+/// restart's reason ([`resumed_prompt`]) — an account move's, nothing
+/// ([`carried_quietly`]). A restart left between the signal and the new
+/// process is carried on first ([`carry_in_flight`]) — and an account move
+/// asked over one of another kind is then not tried ([`IN_FLIGHT_OTHER`]).
 ///
 /// One word per step: `adopted` (`relaunched` without a loop),
 /// `would-restart[:model=<m>]` in a dry run, `wait:<why>`, `busy:<why>`,
@@ -2630,6 +2731,7 @@ pub(super) fn restart_as(
         // the login, never the home.
         home: snap.home.as_deref(),
         login: login.as_deref(),
+        stored_login: snap.stored_login,
     };
     let mut st = St {
         from: sf.version.clone(),
@@ -2802,6 +2904,29 @@ pub struct Snapshot {
     /// Codex, a snapshot a reopened layout gave back (read from its `home`
     /// and its `cwd` then, where its relaunch starts it).
     pub claude_dir: Option<PathBuf>,
+    /// IT AUTHENTICATES BY ITS STORED LOGIN, by its own exec environment
+    /// ([`accounts::ProcessLogin::of_exec_env`]'s `stored_login`: no
+    /// credential, profile or route variable, and a login that can be told),
+    /// read with its argv. The usage tap's gate asks it of the process a line
+    /// replaces ([`Launch::stored_login`], [`super::tap::gate`]); an
+    /// environment that was not read is `false`. A snapshot a reopened layout
+    /// gave back was not read so, and is `false`: a cold restore carries no
+    /// tap.
+    pub stored_login: bool,
+}
+
+impl Snapshot {
+    /// The agent it is of: a Codex where it holds a Codex's run
+    /// ([`Snapshot::codex`]), else Claude Code. No other program is ever
+    /// snapshotted ([`snapshot`] refuses one, `not-claude`), and a restored
+    /// layout names only these two (`aterm-gui`'s `AgentRestore`).
+    #[must_use]
+    pub fn agent(&self) -> upgrade::Agent {
+        match self.codex {
+            Some(_) => upgrade::Agent::Codex,
+            None => upgrade::Agent::Claude,
+        }
+    }
 }
 
 /// What a Codex TUI's relaunch on exit needs beside the [`Snapshot`] (whose
@@ -2810,6 +2935,14 @@ pub struct Snapshot {
 pub struct CodexRun {
     /// The `$CODEX_HOME` it runs with (canonical).
     pub home: PathBuf,
+    /// THE `CODEX_HOME` ITS OWN EXEC ENVIRONMENT SET, verbatim; `None`: it
+    /// had no such variable. `home` cannot tell a variable set to
+    /// `~/.codex` from the default. Its relaunch line carries it as
+    /// REQUIRED environment ([`super::upgrade_codex::line_env`]): a TUI
+    /// started `CODEX_HOME=<dir> codex` keeps its thread under `<dir>`, and
+    /// relaunched at a shell without the variable it would resume under
+    /// `~/.codex`, where that thread does not exist.
+    pub home_env: Option<String>,
     /// It holds its thread's writer lock itself (`--no-daemon`, or kept out of
     /// the daemon); `false`: a daemon client, whose daemon holds the thread.
     pub embedded: bool,
@@ -2849,7 +2982,8 @@ pub struct CodexRun {
 /// for ever, `wait:shell-dialect`), launch flags it can carry into a resume
 /// ([`super::upgrade_codex::rewrite_argv`]: `--worktree`, `--remote` or a
 /// flag it does not know refuse, `failed:argv:…`), and a line it can write
-/// ([`upgrade::relaunch_line`], as [`resumes_on_exit`] asks it of a Claude
+/// with the `CODEX_HOME` it must carry ([`upgrade::relaunch_line_env`],
+/// [`CodexRun::home_env`], as [`resumes_on_exit`] asks it of a Claude
 /// Code's; `failed:line:…`) — each a relaunch refused with nothing typed
 /// after the act's signals (review of 0ce4678a5, 2026-10-09). Even where it
 /// is carried, a Codex's relaunch ON ITS CONVERSATION is not promised
@@ -2862,13 +2996,17 @@ pub fn carries_restart(snap: &Snapshot) -> bool {
     };
     // The line without its `cd` and heal, which the plan adds only as it
     // finds the shell at exit; on the program it ran (a managed build's twin
-    // is chosen then). Whether the argv is refused does not depend on the
-    // thread.
+    // is chosen then), with the `CODEX_HOME` it must carry. Whether the argv
+    // is refused does not depend on the thread.
+    let env = super::upgrade_codex::line_env(run.home_env.as_deref());
     (run.embedded || snap.session.is_some())
         && !snap.cwd.chars().any(char::is_control)
         && snap.dialect.is_some_and(|dialect| {
             super::upgrade_codex::rewrite_argv(&snap.argv, snap.session.as_deref()).is_ok_and(
-                |flags| upgrade::relaunch_line(dialect, None, None, &snap.program, &flags).is_ok(),
+                |flags| {
+                    upgrade::relaunch_line_env(dialect, None, None, &env, &snap.program, &flags)
+                        .is_ok()
+                },
             )
         })
 }
@@ -2909,8 +3047,9 @@ pub fn resumes_on_exit(snap: &Snapshot) -> bool {
 /// finds needs.
 #[must_use]
 pub fn exit_line(snap: &Snapshot) -> Option<String> {
-    if snap.codex.is_some() {
-        return None;
+    match snap.agent() {
+        upgrade::Agent::Claude => {}
+        upgrade::Agent::Codex => return None,
     }
     let dialect = snap.dialect?;
     let session = snap
@@ -2952,11 +3091,19 @@ pub fn launched(
     native: &Path,
     registered: bool,
 ) -> Option<(PathBuf, Vec<String>)> {
-    let is_claude = |p: &Path| {
-        p.file_name()
-            .and_then(|n| n.to_str())
-            .and_then(aterm_phase::program_of)
-            == Some(aterm_phase::Program::Claude)
+    let is_claude = |p: &Path| match p
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(aterm_phase::program_of)
+    {
+        Some(aterm_phase::Program::Claude) => true,
+        Some(
+            aterm_phase::Program::Codex
+            | aterm_phase::Program::Agy
+            | aterm_phase::Program::Muse
+            | aterm_phase::Program::Generic,
+        )
+        | None => false,
     };
     if let Some(script) = argv.get(1).map(Path::new)
         && script.is_absolute()
@@ -3024,15 +3171,19 @@ pub(super) fn snapshot_with(opts: &Opts, k: &dyn Kernel) -> Result<Snapshot, &'s
     }
     let start = kernel_start(pid).ok_or("start")?;
     let image = exe_of(pid);
-    // A Codex TUI: the Codex lane reads its run.
-    if image
+    // A Codex TUI: the Codex lane reads its run. An agent no lane relaunches
+    // (agy, Muse Code) is refused here, never read as Claude Code.
+    match image
         .as_deref()
         .and_then(Path::file_name)
         .and_then(|n| n.to_str())
         .and_then(aterm_phase::program_of)
-        == Some(aterm_phase::Program::Codex)
     {
-        return super::upgrade_drive::codex_snapshot(opts, tab, pid, start, shell, &args);
+        Some(aterm_phase::Program::Codex) => {
+            return super::upgrade_drive::codex_snapshot(opts, tab, pid, start, shell, &args);
+        }
+        Some(aterm_phase::Program::Agy | aterm_phase::Program::Muse) => return Err("no-lane"),
+        Some(aterm_phase::Program::Claude | aterm_phase::Program::Generic) | None => {}
     }
     // Claude's record of this process, under the Claude home its own exec
     // environment names: `~/.claude` names none of an agent started under
@@ -3085,6 +3236,8 @@ pub(super) fn snapshot_with(opts: &Opts, k: &dyn Kernel) -> Result<Snapshot, &'s
         // its records under it.
         home: args.env_var(accounts::HOME_ENV).map(str::to_owned),
         claude_dir: records.dir().map(Path::to_path_buf),
+        stored_login: accounts::ProcessLogin::of_exec_env(&args.env)
+            .is_some_and(|who| who.stored_login),
     })
 }
 
@@ -3123,8 +3276,9 @@ pub fn foreground(snap: &Snapshot, fg: i64) -> Foreground {
 pub fn follow(home: &Path, snap: &mut Snapshot) -> bool {
     // A Codex keeps no record of its process to follow: its snapshot is
     // taken again at the loop's idle points.
-    if snap.codex.is_some() {
-        return false;
+    match snap.agent() {
+        upgrade::Agent::Claude => {}
+        upgrade::Agent::Codex => return false,
     }
     let Some(sf) = Records::of_snapshot(home, snap)
         .session_file(snap.pid)
@@ -3260,8 +3414,9 @@ pub struct ExitLook {
     pub running: bool,
     /// Its record, when one of its own start is on disk (Claude Code's).
     pub record: Option<SessionFile>,
-    /// A Codex's look: `record` is never read, `crashed` decides.
-    pub codex: bool,
+    /// Whose look it is ([`Snapshot::agent`]): a Codex's never reads
+    /// `record`, `crashed` decides.
+    pub agent: upgrade::Agent,
     /// A Codex's exit per its shell: `Some(true)` a crash, `Some(false)` its own
     /// exit or someone's signal, `None` not told yet
     /// ([`super::upgrade_codex::crashed_status`]).
@@ -3296,7 +3451,7 @@ pub fn look_at_exit(home: &Path, snap: &Snapshot) -> ExitLook {
     ExitLook {
         running,
         record,
-        codex: false,
+        agent: upgrade::Agent::Claude,
         crashed: None,
     }
 }
@@ -3329,18 +3484,21 @@ pub fn exit_record(
             if waited >= EXIT_GONE {
                 return ExitRecord::Unread;
             }
-        } else if now.codex {
-            match now.crashed {
-                Some(true) => return ExitRecord::Crashed,
-                Some(false) => return ExitRecord::Removed,
-                None if waited >= EXIT_GONE => return ExitRecord::Unread,
-                None => {}
-            }
         } else {
-            match now.record {
-                None => return ExitRecord::Removed,
-                Some(sf) if waited >= EXIT_SETTLE => return ExitRecord::Survived(Box::new(sf)),
-                Some(_) => {}
+            match now.agent {
+                upgrade::Agent::Codex => match now.crashed {
+                    Some(true) => return ExitRecord::Crashed,
+                    Some(false) => return ExitRecord::Removed,
+                    None if waited >= EXIT_GONE => return ExitRecord::Unread,
+                    None => {}
+                },
+                upgrade::Agent::Claude => match now.record {
+                    None => return ExitRecord::Removed,
+                    Some(sf) if waited >= EXIT_SETTLE => {
+                        return ExitRecord::Survived(Box::new(sf));
+                    }
+                    Some(_) => {}
+                },
             }
         }
         if !wait(EXIT_LOOK) {
@@ -3433,8 +3591,11 @@ fn after_exit_as(
     cause: ExitCause,
 ) -> Report {
     // A Codex is relaunched by the Codex lane, on the thread it held.
-    if snap.codex.is_some() {
-        return super::upgrade_drive::codex_after_exit(opts, snap, left, upgrade, cause);
+    match snap.agent() {
+        upgrade::Agent::Codex => {
+            return super::upgrade_drive::codex_after_exit(opts, snap, left, upgrade, cause);
+        }
+        upgrade::Agent::Claude => {}
     }
     let mut r = Report {
         pid: snap.pid,
@@ -3642,6 +3803,7 @@ fn after_exit_as(
         // same Claude home, on the same account.
         home: snap.home.as_deref(),
         login: snap.login.as_deref(),
+        stored_login: snap.stored_login,
     };
     let mut st = St {
         from: version.unwrap_or_default(),
@@ -3819,14 +3981,9 @@ fn codex_exit_is_restarts(st: &St) -> bool {
 /// the conversation it is filed under: the one that ended process `pid`
 /// ([`ended_by_restart`]). No `pid` (the host read nothing of the agent that
 /// left) names no process, and finds none.
-fn restart_record(opts: &Opts, codex: bool, pid: Option<u32>) -> Option<(String, St)> {
+fn restart_record(opts: &Opts, agent: upgrade::Agent, pid: Option<u32>) -> Option<(String, St)> {
     let tab = opts.only_sid.as_deref()?;
     let pid = pid?;
-    let agent = if codex {
-        upgrade::Agent::Codex
-    } else {
-        upgrade::Agent::Claude
-    };
     let now = now_s();
     record_where(opts, |st| ended_by_restart(st, agent, tab, pid, now))
 }
@@ -3908,13 +4065,13 @@ fn adopted_holds(opts: &Opts, st: &St, session: &str) -> bool {
 /// (`wait:held`, `wait:typing`, `wait:shell-prompt`, `wait:resume` …) and
 /// whose agent then left the tab with no step watching it. `pid` is the
 /// agent that left (the host's snapshot of it; `None`, nothing read, finds
-/// nothing) — a Codex TUI if `codex` says so, else a Claude Code — and the
-/// restart is the record that ended that very process, both lanes by one
-/// rule ([`ended_by_restart`]). Read-only: the state files, and whether the
+/// nothing) — a Codex TUI or a Claude Code, as `agent` says
+/// ([`Snapshot::agent`]) — and the restart is the record that ended that
+/// very process, both lanes by one rule ([`ended_by_restart`]). Read-only: the state files, and whether the
 /// relaunched Codex TUI a record names still lives; no lock.
 #[must_use]
-pub fn restarted(opts: &Opts, codex: bool, pid: Option<u32>) -> bool {
-    restart_record(opts, codex, pid).is_some()
+pub fn restarted(opts: &Opts, agent: upgrade::Agent, pid: Option<u32>) -> bool {
+    restart_record(opts, agent, pid).is_some()
 }
 
 /// THE ACCOUNT MOVE WHOSE RESTART SIGNALLED the Claude Code `pid` of tab
@@ -3930,7 +4087,7 @@ pub fn restarted(opts: &Opts, codex: bool, pid: Option<u32>) -> bool {
 /// it). Read-only: the state files; no lock.
 #[must_use]
 pub fn account_restart(opts: &Opts, pid: u32) -> Option<String> {
-    restart_record(opts, false, Some(pid))
+    restart_record(opts, upgrade::Agent::Claude, Some(pid))
         .and_then(|(_, st)| st.cause.strip_prefix(CAUSE_ACCOUNT).map(str::to_owned))
 }
 
@@ -3950,7 +4107,7 @@ pub fn account_restart(opts: &Opts, pid: u32) -> Option<String> {
 /// made of it — or `told:<why>` where the move's own row asks them
 /// ([`told_by_its_row`]).
 #[must_use]
-pub fn carry_restart(opts: &Opts, codex: bool, pid: Option<u32>) -> Report {
+pub fn carry_restart(opts: &Opts, agent: upgrade::Agent, pid: Option<u32>) -> Report {
     let tab = opts.only_sid.clone().unwrap_or_else(|| "-".to_string());
     let r = Report {
         pid: pid.unwrap_or(0),
@@ -3964,18 +4121,15 @@ pub fn carry_restart(opts: &Opts, codex: bool, pid: Option<u32>) -> Report {
         Ok(lock) => lock,
         Err(why) => return said(r, format!("busy:{why}")),
     };
-    let Some((session, mut st)) = restart_record(opts, codex, pid) else {
+    let Some((session, mut st)) = restart_record(opts, agent, pid) else {
         // A move FINISHED since the host read the exit as its own: that exit
         // was the move's, and the owner is asked nothing about an agent
         // that is back. A Codex restart that landed on a TUI gone already
         // ([`codex_landed_gone`]) is closed as the Codex lane's relaunch on
         // exit closes it, and the owner is asked nothing about it either.
-        let found = pid.and_then(|pid| {
-            if codex {
-                codex_landed_gone(opts, pid)
-            } else {
-                landed(opts, pid)
-            }
+        let found = pid.and_then(|pid| match agent {
+            upgrade::Agent::Codex => codex_landed_gone(opts, pid),
+            upgrade::Agent::Claude => landed(opts, pid),
         });
         let Some((session, mut st)) = found else {
             return said(r, "refused:no-restart-in-flight");
@@ -3986,21 +4140,26 @@ pub fn carry_restart(opts: &Opts, codex: bool, pid: Option<u32>) -> Report {
             to: format!("{}({})", st.to, st.source),
             ..r
         };
-        if codex && !opts.dry_run {
-            st.close_overtaken("exited-before-continuing", now_s());
-            ledger(
-                opts,
-                &said(r.clone(), "failed:exited-before-continuing"),
-                "the relaunched Codex exited before its continuation was typed",
-            );
-            save(opts, &session, &st);
+        match agent {
+            upgrade::Agent::Codex => {
+                if !opts.dry_run {
+                    st.close_overtaken("exited-before-continuing", now_s());
+                    ledger(
+                        opts,
+                        &said(r.clone(), "failed:exited-before-continuing"),
+                        "the relaunched Codex exited before its continuation was typed",
+                    );
+                    save(opts, &session, &st);
+                }
+            }
+            upgrade::Agent::Claude => {}
         }
         return said(r, "landed");
     };
     // This carry follows the exit the host just saw by at most one
     // [`CARRY_EVERY`], so the stale-exit bound ([`STALE_S`]) counts from now,
     // never from a signal a slow shutdown outlived. A Codex lane keeps its own.
-    if st.agent == upgrade::Agent::Claude && st.seen_gone(now_s()) && !opts.dry_run {
+    if carried_here(st.agent) && st.seen_gone(now_s()) && !opts.dry_run {
         save(opts, &session, &st);
     }
     let r = Report {
@@ -4082,7 +4241,7 @@ fn carry_own_step(opts: &Opts, r: Report, mut st: St, session: &str, tab: &str) 
     if let upgrade::Phase::Failed(why) = &st.phase {
         return refused(r, why);
     }
-    if st.agent == upgrade::Agent::Claude && adopted_holds(opts, &st, session) {
+    if carried_here(st.agent) && adopted_holds(opts, &st, session) {
         let mut r = said(r, "adopted");
         r.pid = st.relaunched_pid;
         return r;
@@ -4095,7 +4254,7 @@ fn carry_own_step(opts: &Opts, r: Report, mut st: St, session: &str, tab: &str) 
     // `landed`: the restart's relaunch landed, and what ended after it is the relaunched
     // agent's own exit — never the restart's, whose carry answered with an
     // end is said as one that cannot land ([`Relaunches::attempted`]).
-    if st.agent == upgrade::Agent::Claude && st.relaunched_gone(alive) {
+    if carried_here(st.agent) && st.relaunched_gone(alive) {
         if !opts.dry_run {
             st.close_overtaken("exited-before-continuing", now_s());
             ledger(
@@ -4110,7 +4269,7 @@ fn carry_own_step(opts: &Opts, r: Report, mut st: St, session: &str, tab: &str) 
     // A Codex restart is its lane's to carry, its own age limit included:
     // counted from its typed `/exit`, never from the TUI's exit — a TUI still
     // alive a minute after its `/exit` is one the `/exit` did not take.
-    if st.agent == upgrade::Agent::Claude
+    if carried_here(st.agent)
         && let Some((why, detail)) = expired(&st, now_s())
     {
         if !opts.dry_run {
@@ -4128,6 +4287,19 @@ fn carry_own_step(opts: &Opts, r: Report, mut st: St, session: &str, tab: &str) 
     match r.step.strip_prefix("failed:").map(str::to_string) {
         Some(why) => refused(r, &why),
         None => r,
+    }
+}
+
+/// Whether a restart of `agent`'s lane is carried by this module's own rules
+/// ([`carry_restart`], [`carry_own_step`]: the stale-exit bound counted from
+/// the carry, the adopted process, the relaunched agent gone, the age limit)
+/// — Claude Code's — or by its lane's, which keeps all of them itself (a
+/// Codex restart: [`super::upgrade_drive::codex_carry_in_flight`], its age
+/// counted from its typed `/exit`).
+fn carried_here(agent: upgrade::Agent) -> bool {
+    match agent {
+        upgrade::Agent::Claude => true,
+        upgrade::Agent::Codex => false,
     }
 }
 
@@ -4198,10 +4370,12 @@ pub fn resume(opts: &Opts) -> Report {
     };
     // A Codex restart's continuation is the Codex branch's to type: the same
     // step, over the TUI its relaunch line brought back.
-    if st.agent == upgrade::Agent::Codex {
-        return super::upgrade_drive::codex_carry_in_flight(&carry, r, st, &session);
+    match st.agent {
+        upgrade::Agent::Codex => {
+            super::upgrade_drive::codex_carry_in_flight(&carry, r, st, &session)
+        }
+        upgrade::Agent::Claude => carry_in_flight(&carry, r, st, &session, &tab),
     }
-    carry_in_flight(&carry, r, st, &session, &tab)
 }
 
 /// THE HOST'S WORD FOR AN EXIT THE EXPLICIT RESTART'S STAMP STILL NAMES

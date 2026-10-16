@@ -72,7 +72,7 @@ fn find_last_page_data_offset(path: &std::path::Path) -> Option<u64> {
 }
 
 /// Corrupt the last page's compressed data in a `.dtrm` file by overwriting
-/// bytes *after* the Zstd frame magic (so `scan_pages` still
+/// bytes *after* the LZ4 size prefix (so `scan_pages` still
 /// accepts the page header, but decompression fails).
 fn corrupt_last_page_payload(path: &std::path::Path) {
     let data_offset =
@@ -84,9 +84,9 @@ fn corrupt_last_page_payload(path: &std::path::Path) {
         .open(path)
         .expect("open for corruption");
 
-    // Overwrite bytes 4..12 of compressed data (after the 4-byte Zstd magic).
-    // The Zstd magic (0x28B52FFD) at offset+0 stays intact so the page passes
-    // the scan check, but the corrupted frame header makes decompression fail.
+    // Overwrite bytes 4..12 of compressed data (after the 4-byte LZ4 size
+    // prefix). The prefix at offset+0 stays intact so the page passes the scan
+    // check, but the corrupted block makes decompression fail.
     file.seek(SeekFrom::Start(data_offset + 4)).unwrap();
     file.write_all(&[0xFF; 8]).unwrap();
     file.sync_all().unwrap();
@@ -127,7 +127,7 @@ fn disk_cold_truncate_back_corrupt_boundary_preserves_state() {
         let mut storage = build_small_tier(&cold_path);
         let loaded_lines = storage.line_count();
 
-        // The cold tier accepted the corrupt page (magic was intact).
+        // The cold tier accepted the corrupt page (its header was intact).
         assert!(
             loaded_lines > 0,
             "lines should be loaded despite corruption"

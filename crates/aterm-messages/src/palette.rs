@@ -226,6 +226,19 @@ pub fn oklch(c: [u8; 3]) -> (f64, f64, f64) {
     (big_l, a.hypot(bb), h)
 }
 
+/// The Euclidean `OkLab` distance between two sRGB colours: how far apart
+/// they look, lightness and colour together.
+#[must_use]
+pub fn oklab_distance(a: [u8; 3], b: [u8; 3]) -> f64 {
+    let lab = |c: [u8; 3]| {
+        let (l, ch, h) = oklch(c);
+        let (sin, cos) = h.to_radians().sin_cos();
+        [l, ch * cos, ch * sin]
+    };
+    let (p, q) = (lab(a), lab(b));
+    (p[0] - q[0]).hypot(p[1] - q[1]).hypot(p[2] - q[2])
+}
+
 /// The WCAG relative luminance of an sRGB colour, with a FUSED weighted sum.
 ///
 /// The band's SIDE decisions (which end of the scale a word or a fill sits

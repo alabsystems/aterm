@@ -84,8 +84,8 @@ fn assert_planned_frame_builds_once(mut app: App, expected: crate::VisibleConten
     );
 }
 
-/// Every frame route — terminal, native, heterogeneous — threads one visible
-/// plan through its frame (the helper asserts the fixture's route first).
+/// Every frame route (terminal, native, heterogeneous) threads one visible plan through its
+/// frame.
 #[test]
 fn every_frame_route_threads_one_visible_plan() {
     type Fixture = fn() -> (App, crate::VisibleContentRoute);
@@ -161,11 +161,9 @@ fn terminal_capture_threads_one_fresh_visible_plan() {
     );
     assert_eq!(visible_leaf_plan_builds(), 1, "single-pane Retain");
 
-    // An all-terminal tab owns a `layouts` entry, so the split goes through
-    // the legacy tree and is mirrored forward (production's
-    // `!canonical_split` arm): `split_active_stub_tab` splits `layouts` and
-    // calls `sync_tab_model_from_layout`. `split_active_with_stub_terminal`
-    // is the canonical arm and would desync the two topologies here.
+    // An all-terminal tab owns a `layouts` entry, so the split goes through the legacy tree
+    // and is mirrored forward, as production's `!canonical_split` arm does.
+    // `split_active_with_stub_terminal` is the canonical arm and would desync the two here.
     app.split_active_stub_tab(wid);
     for (label, clock) in [
         (
@@ -212,8 +210,7 @@ fn charge_cursor_body(state: &mut WindowState, now: Instant) {
             enabled: true,
             intensity: 1.0,
             blinking: false,
-            // This fixture only needs a CHARGED body engine; the base is
-            // the scheduler's business, not this test's.
+            // Only a charged body engine is needed; the base is the scheduler's.
             base: None,
             head_rgb: None,
             paint: None,
@@ -688,12 +685,9 @@ fn layout_coordinate_change_rebases_cursor_kitty_and_pet_placement() {
     app.windows.get_mut(&wid).unwrap().scale = 2.0;
     assert!(!app.prepare_layout_coordinate_space(wid, route));
     let state = app.windows.get_mut(&wid).unwrap();
-    // THE SAME VIEW RE-GRIDDED KEEPS THE RESIDENT (2026-10-01): a DPI
-    // change, a resize or a font step leaves the pet's cells the same
-    // terminal's cells, so the body stays on glass — retiring it here
-    // blinked the cat out on every font step and for the whole of a live
-    // drag. Only this frame's pixels go: the hit target is withdrawn
-    // until the next frame draws the body again.
+    // A re-grid of the same view (DPI, resize, font step) leaves the pet on the same
+    // terminal's cells, so the body stays on glass; only the hit target is withdrawn until the
+    // next frame draws it.
     assert!(
         state.fx.companion_mut().brain().is_active(),
         "a re-grid of the focused view keeps the resident's body"
@@ -720,10 +714,8 @@ fn layout_coordinate_change_rebases_cursor_kitty_and_pet_placement() {
     assert!(state.input_scratch.cursor_fill_override.is_none());
     assert!(state.input_scratch.cursor_effect_style_override.is_none());
 
-    // CONTROL: a layout that focuses ANOTHER view replaced the surface,
-    // and the resident leaves it — dark at the boundary, no hit target,
-    // no frame debt, the same companion — whatever crossfade the next
-    // frame performs.
+    // Control: a layout focusing another view replaced the surface, and the resident leaves
+    // it: dark, no hit target, no frame debt, the same companion.
     app.push_stub_tab(wid, crate::stub_session(app.next_session_id));
     {
         let state = app.windows.get_mut(&wid).unwrap();
@@ -870,8 +862,7 @@ fn mixed_split_uses_canonical_root_and_schedules_the_composed_body() {
     }
     assert!(app.active_tab_contains_native(wid));
 
-    // This is the exact setup seam `redraw_window` now calls before its
-    // heterogeneous early return.
+    // The setup seam `redraw_window` calls before its heterogeneous early return.
     assert!(app.prepare_layout_coordinate_space(wid, route));
     let state = &app.windows[&wid];
     assert_eq!(state.last_composed, Some(true));
@@ -890,25 +881,19 @@ fn mixed_split_uses_canonical_root_and_schedules_the_composed_body() {
     );
 }
 
-/// A native frame inherits no companion sprite from the previous terminal
-/// frame through the reused `input_scratch`, driven end to end through the
-/// real native preparation. Native routes tick no word engine and no
-/// `PetBrain`, so anything left on the planes would be re-presented at a
-/// frozen age and ignore the trail master.
+/// A native frame inherits no companion sprite from the previous terminal frame through the
+/// reused `input_scratch`, through the real native preparation. Native routes tick no word
+/// engine and no `PetBrain`, so anything left would be re-presented at a frozen age.
 ///
-/// * The planes: `prepare_layout_coordinate_space`'s
-///   `retire_torn_cursor_fx` → `suppress_torn_cursor_projection` clears the
-///   sprite, glow and cat planes on this edge, and
-///   `prepare_native_input_scratch`'s `clear_effect_overlays_for_compose`
-///   clears them again; the latter alone guards `nova_add`.
-/// * The brain: the front-content identity fence (`lib.rs`'s `sync_window`,
-///   `CompanionOwner::retire_owner`) fires first, backed by
-///   `retire_torn_cursor_fx` (`route` is a term of
-///   [`crate::LayoutCoordinateSpaceKey`]). Without both, the brain keeps
-///   `needs_frames()` latched on a route that never ticks it.
+/// * The planes: `retire_torn_cursor_fx` → `suppress_torn_cursor_projection` clears the
+///   sprite, glow and cat planes on this edge, and `clear_effect_overlays_for_compose` clears
+///   them again; the latter alone guards `nova_add`.
+/// * The brain: the front-content fence in `sync_window` (`CompanionOwner::retire_owner`)
+///   fires first, backed by `retire_torn_cursor_fx` (`route` is a term of
+///   [`crate::LayoutCoordinateSpaceKey`]); without both, `needs_frames()` stays latched on a
+///   route that never ticks it.
 ///
-/// The terminal frame comes first: a cold window has no previous coordinate
-/// space, so the switch would not register as a change.
+/// The terminal frame comes first: a cold window has no previous coordinate space to change.
 #[test]
 fn fronting_a_native_tab_strips_the_terminal_frames_decoration_and_its_pet() {
     let mut app = App::headless_for_test();

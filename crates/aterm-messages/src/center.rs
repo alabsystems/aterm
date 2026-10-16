@@ -573,10 +573,9 @@ impl Live {
         self.load.filter(|_| self.load_shown).map(|(l, _)| l)
     }
 
-    /// The load words the row SAYS on the glass (ruling 246): its shown
-    /// load, unless that is the work's own primary load and nothing is
-    /// `slowing`. The band's layout and the wire's `load=` both read this
-    /// one rule (ruling 441 (b)).
+    /// The load words the row says on the glass: its shown load, unless that
+    /// is the work's own primary load and nothing is `slowing`. The band's
+    /// layout and the wire's `load=` both read this.
     pub(crate) fn said_load(&self, slowing: bool) -> Option<Load> {
         self.shown_load()
             .filter(|l| slowing || self.msg.primary != Some(*l))
@@ -738,7 +737,7 @@ pub struct MessageCenter {
     /// still closes their records as fixed ([`Self::fix_closed`]). Bounded by
     /// [`UNFIXED_CAP`], oldest out.
     unfixed: Vec<Unfixed>,
-    /// The exceptions ([`Need::Later`]): a store BESIDE the live set, never in
+    /// The exceptions ([`Need::Later`]): a store beside the live set, never in
     /// it, so nothing that lays out the band can seat one.
     digest: Digest,
     /// Messages the door demoted to a record ([`Message::admit`]): a persistent
@@ -803,8 +802,7 @@ impl MessageCenter {
         self.slowing
     }
 
-    /// The load words row `row` says on the glass: its shown load, unless
-    /// that is the work's own primary load and nothing is slowed.
+    /// [`Live::said_load`] under [`Self::slowing`].
     fn said_load(&self, row: &Live) -> Option<Load> {
         row.said_load(self.slowing)
     }
@@ -832,7 +830,7 @@ impl MessageCenter {
     /// [`MAX_LIVE`] a row is evicted ([`Self::evict_past_cap`]).
     pub fn post(&mut self, msg: Message, stamp: WallStamp, now: Instant) -> Posted {
         let mut msg = msg.normalized();
-        // THE DOOR: a class that cannot stand is a record.
+        // The door: a class that cannot stand is a record.
         match msg.admit() {
             Admission::Kept => {}
             Admission::Demoted => {
@@ -846,8 +844,7 @@ impl MessageCenter {
             return self.post_later(msg, stamp, now);
         }
         // A standing row the owner already read is not raised again inside
-        // [`crate::need::STANDING_QUIET`] (the reporters' own once-only code,
-        // in one place): nothing shown, nothing logged.
+        // [`crate::need::STANDING_QUIET`]: nothing shown, nothing logged.
         if let (Need::Now(ask), Some(key)) = (&msg.need, msg.key.as_deref())
             && ask.is_standing()
             && !ask.is_adopted()
@@ -864,11 +861,9 @@ impl MessageCenter {
             let id = self.log.mint();
             self.log
                 .record_posted(LogRecord::from_posted(id, stamp, &msg));
-            // A reporter that changed a family from a standing row to a
-            // record (a newer build) never re-asserts the row its parent
-            // carried across the update; it would stand for ever, adopted
-            // and unconfirmed. A CLASSIFIED record under an adopted row's key
-            // is the newer build saying the row is no longer its answer.
+            // A classified record under an adopted row's key is a newer build
+            // saying the row its parent carried is no longer its answer; left
+            // alone it would stand for ever, adopted and unconfirmed.
             if matches!(msg.need, Need::Record)
                 && let Some(i) = msg.key.as_deref().and_then(|k| self.index_by_key(k))
                 && matches!(&self.live[i].msg.need, Need::Now(a) if a.is_adopted())
@@ -1195,20 +1190,16 @@ impl MessageCenter {
         fixed
     }
 
-    /// Re-word a record in place: a record ([`Retired::Recorded`], an entry
-    /// that never stood on the glass) takes `msg`'s title and detail with no
-    /// new entry, so one waiting upgrade stays one message whose words move
-    /// until it resolves. The log gets one more `retired` line for the same
-    /// record, so a relaunch replays it re-worded ([`MessageLog::replay`]).
-    /// `revision + 1` when the words changed. Only the words: its mark, key
-    /// and capsules are the record's.
+    /// Re-word a record ([`Retired::Recorded`]) in place: it takes `msg`'s
+    /// title and detail with no new entry, so one waiting upgrade stays one
+    /// message, and one more `retired` line lets a relaunch replay it re-worded
+    /// ([`MessageLog::replay`]). `revision + 1` when the words changed; its
+    /// mark, key and capsules stay the record's.
     ///
-    /// `false` and nothing written for a live row (that is
-    /// [`Self::restate`]'s), for any other retirement (a row dismissed, read,
-    /// answered, withdrawn or resolved keeps the words it left with), for
-    /// words the record says already, and for a message whose capsules differ
-    /// from the record's: a record keeps the capsules it was written with (a
-    /// relaunch replays those), so such words would name buttons it lacks.
+    /// `false` and nothing written for a live row ([`Self::restate`]'s), any
+    /// other retirement (it keeps the words it left with), words it says
+    /// already, and a message whose capsules differ from the record's (the
+    /// words would name buttons it lacks).
     pub fn reword_record(&mut self, id: MessageId, msg: &Message) -> bool {
         let msg = msg.clone().normalized();
         if self.index(id).is_some()
@@ -1225,16 +1216,12 @@ impl MessageCenter {
         changed
     }
 
-    /// Replace a record by the row `by` that tells its story on. A record
-    /// cannot come back to the glass, so `by` is posted and the record retires
-    /// [`Retired::Superseded`] by it, as a live row superseded under its key
-    /// does: Settings ▸ Messages says `replaced` and names the row. Its words
-    /// and instant stay; one more `retired` line goes to the log, so a
-    /// relaunch replays it replaced ([`MessageLog::replay`] takes a later
-    /// Retired line's retirement). `revision + 1`.
-    ///
-    /// `false` and nothing written for anything but a record
-    /// ([`Retired::Recorded`]), and for `by == id`.
+    /// Replace a record by the row `by` that tells its story on: the record
+    /// retires [`Retired::Superseded`] by it, as a keyed supersede does
+    /// (Settings ▸ Messages says `replaced`), keeping its words and instant;
+    /// one more `retired` line goes to the log, so a relaunch replays it
+    /// replaced. `revision + 1`. `false` and nothing written for anything but a
+    /// record ([`Retired::Recorded`]), and for `by == id`.
     pub fn supersede_record(&mut self, id: MessageId, by: MessageId) -> bool {
         if id == by
             || self.index(id).is_some()
@@ -1258,15 +1245,12 @@ impl MessageCenter {
         true
     }
 
-    /// Turn a live row into its own record, in place: the row leaves the glass
-    /// as a withdrawn one does (a vanish, no outcome) and retires
-    /// [`Retired::Recorded`] under `msg`'s title, detail and mark. One entry,
-    /// which [`Self::reword_record`] keeps re-wording and
-    /// [`Self::supersede_record`] replaces should it need the glass again.
-    ///
-    /// Only words drawn for the capsules its record keeps
-    /// ([`Self::reword_record`]'s rule): for other capsules it keeps the words
-    /// it showed, still under `msg`'s mark. `false` when `id` is no live row.
+    /// Turn a live row into its own record in place: it leaves the glass as a
+    /// withdrawn row does (a vanish) and retires [`Retired::Recorded`] under
+    /// `msg`'s mark, one entry that [`Self::reword_record`] re-words and
+    /// [`Self::supersede_record`] replaces. It takes `msg`'s title and detail
+    /// only when `msg` has the record's capsules ([`Self::reword_record`]'s
+    /// rule). `false` when `id` is no live row.
     pub fn keep_as_record(&mut self, id: MessageId, msg: &Message, now: Instant) -> bool {
         let Some(i) = self.index(id) else {
             return false;
@@ -1291,15 +1275,13 @@ impl MessageCenter {
 
     // ---- lifecycle ---------------------------------------------------
 
-    /// Change a live row in place: no log line, `revision + 1` when the
-    /// row's words, meter, capsules, hold or look changed; a Live row
-    /// re-arms its staleness cap; a new hold re-anchors on glass. A carried
-    /// row restated before the handoff commit is the successor's own from
-    /// here: the handoff cap comes off with the carried flag and its own
-    /// lifetime starts now (on glass its hold anchors; queued, the patience
-    /// clock already runs). A new meter feeds the estimator, starts a glide
-    /// from the fill shown, and restarts the load clock when the declared
-    /// load changes; a change of activity restarts the motion epoch.
+    /// Change a live row in place: no log line, `revision + 1` when the row's
+    /// words, meter, capsules, hold or look changed; a Live row re-arms its
+    /// staleness cap; a new hold re-anchors on glass. A carried row restated
+    /// before the handoff commit becomes the successor's own: the handoff cap
+    /// comes off and its own lifetime starts now. A new meter feeds the
+    /// estimator, glides from the fill shown and restarts the load clock when
+    /// the load changes; a change of activity restarts the motion epoch.
     /// `false` when no such live row.
     pub fn restate(&mut self, id: MessageId, r: Restatement, now: Instant) -> bool {
         let Some(i) = self.index(id) else {
@@ -1349,7 +1331,7 @@ impl MessageCenter {
             row.msg.excerpt = excerpt;
         }
         let was_carried = std::mem::take(&mut row.carried_pending);
-        // THE DOOR, again: a restatement may shorten a row's hold or end it, but
+        // The door again: a restatement may shorten a row's hold or end it, but
         // it cannot make a row persistent, and it cannot stretch a transient
         // one past its span (the class decides the span).
         let admitted = r.hold.and_then(|h| {
@@ -1390,13 +1372,10 @@ impl MessageCenter {
         if row.activity() != activity && row.on_glass_since.is_some() {
             row.motion_since = Some(now);
         }
-        // A restatement that changed nothing the row says (a reporter's
-        // heartbeat re-feeding the same reading) is not a change of the
-        // glass: no revision, so no repaint and no Settings publish. Its
-        // staleness cap was still re-armed above. The same reading at a later
-        // instant can move the estimate (a re-anchor, an unlatch), and no
-        // motion deadline is armed for that, so an estimate that moved counts
-        // as a change of the glass too.
+        // A restatement that changed nothing the row says (a heartbeat
+        // re-feeding the same reading) is not a change of the glass: no
+        // revision, so no repaint and no Settings publish. An estimate that
+        // moved counts as a change, since no motion deadline is armed for it.
         let eta_moved = row.track.eta(now) != eta_before;
         let changed = row.msg != before || was_carried || eta_moved;
         if changed {
@@ -1506,11 +1485,9 @@ impl MessageCenter {
     }
 
     /// [`Self::withdraw`] whose log entry keeps `title` and `detail` as its
-    /// final words: an episode's live row that becomes its own record (the
-    /// strain row's fold), so the log holds one entry per episode instead of
-    /// the withdrawn row beside a record that repeats it. The glass sees the
-    /// row it showed (its echo is taken before the words change); `false`
-    /// when no such live row.
+    /// final words: an episode's live row becomes its own record (the strain
+    /// row's fold), one log entry per episode. The glass sees the row it showed
+    /// (its echo is taken first); `false` when no such live row.
     pub fn withdraw_as(
         &mut self,
         id: MessageId,
@@ -1530,14 +1507,11 @@ impl MessageCenter {
         true
     }
 
-    /// [`Self::withdraw_as`] whose log entry becomes `record` WHOLE: its
-    /// words and its MARK. An episode's record is the one entry the episode
-    /// leaves (ruling 209), and its mark is the episode's, not the row's last
-    /// one (ruling 441 (c)): a strain episode that reached critical memory
-    /// records Warn (`record_severity`) though a calmer reading restated its
-    /// row Info before the fold, exactly as the same episode does when its
-    /// row faded first and the record is posted whole. `false` when no such
-    /// live row.
+    /// [`Self::withdraw_as`] whose log entry becomes `record` whole, words and
+    /// mark: an episode's record is the one entry it leaves, under the
+    /// episode's mark, not the row's last one (a strain episode that reached
+    /// critical memory records Warn though a calmer reading restated its row
+    /// Info before the fold). `false` when no such live row.
     pub fn withdraw_as_record(&mut self, id: MessageId, record: &Message, now: Instant) -> bool {
         let Some(i) = self.index(id) else {
             return false;
@@ -1556,11 +1530,10 @@ impl MessageCenter {
     }
 
     /// The person answered the row with a word its reporter confirmed was
-    /// taken: it retires `Answered { label }`, as a `NotNow` press does, with
-    /// no echo (the word is the ending, not delivered work and not a fix). For
-    /// a row whose capsule's word is written off the host's thread and may be
-    /// refused, so the press itself ([`Self::act`]) cannot close it. `false`
-    /// when no such live row.
+    /// taken: it retires `Answered { label }` with no echo, as a `NotNow` press
+    /// does. For a capsule whose word is written off the host's thread and may
+    /// be refused, so the press ([`Self::act`]) cannot close it. `false` when
+    /// no such live row.
     pub fn answer(&mut self, id: MessageId, label: &str, now: Instant) -> bool {
         let Some(i) = self.index(id) else {
             return false;
@@ -1699,11 +1672,10 @@ impl MessageCenter {
 
     /// The next instant a settle would act on: the nearest fold (holds only),
     /// staleness, patience or reveal instant, an echo's end, a load word's
-    /// arrival on the glass, or the pending shrink, at the later of its own
-    /// quiet's end ([`Self::quiet_shrink_at`]) and the chrome regrow floor
-    /// the host last handed in (holds only: `commit_rows` consumes it and runs
-    /// only while the holds run, so a frozen band never re-arms an overdue
-    /// shrink). `None` when nothing is armed. These are state wakes; the
+    /// arrival, or the pending shrink at the later of its quiet's end
+    /// ([`Self::quiet_shrink_at`]) and the chrome regrow floor (holds only:
+    /// [`crate::drive::commit`] commits no rows under a freeze, so a frozen
+    /// band never re-arms an overdue shrink). `None` when nothing is armed. The
     /// motion's frames are [`Self::motion_deadline`]'s.
     #[must_use]
     pub fn deadline(&self, holds: bool) -> Option<Instant> {
@@ -1748,21 +1720,16 @@ impl MessageCenter {
     }
 
     /// Commit the row count with hysteresis over `min(wanted, afford)`: grow
-    /// now, shrink only after [`SHRINK_QUIET`] of wanting less — unless the
-    /// shrink is the WINDOW's (`afford` fell below the committed count):
-    /// the quiet exists so a burst of short rows folds the grid once, and a
-    /// window that just lost its last terminal row to the band is not a
-    /// burst; it gets the row back now. A quiet shrink waits its own quiet
-    /// ([`Self::quiet_shrink_at`]), which never ends while an echo still plays
-    /// (ruling 415 (b)), and the windows' chrome regrow floor
-    /// ([`Self::set_regrow_floor`], ruling 414): measured on main `8b24e99a4`,
-    /// a presence row born 4–6 ms before this shrink made a net-zero pair
-    /// that shifted a busy alternate screen. The window's own
-    /// shrink is neither floored nor held for an echo: it cuts one short,
-    /// dropping the echoes whose slot is past the new count. `Some(new)`
-    /// exactly when the count moved. Rows that just reached the glass anchor
-    /// their holds here — only rows within the committed count ever do. The
-    /// revision moves when the count or the glass did.
+    /// now, shrink only after [`SHRINK_QUIET`] of wanting less, so a burst of
+    /// short rows folds the grid once. The window's own shrink (`afford` fell
+    /// below the committed count) is not a burst: it gets the row back now,
+    /// neither floored nor held for an echo, dropping the echoes whose slot is
+    /// past the new count. A quiet shrink waits its own quiet
+    /// ([`Self::quiet_shrink_at`], never while an echo plays) and the windows'
+    /// chrome regrow floor ([`Self::set_regrow_floor`]). `Some(new)` exactly
+    /// when the count moved. Rows that just reached the glass anchor their
+    /// holds here; only rows within the committed count ever do. The revision
+    /// moves when the count or the glass did.
     pub fn commit_rows(&mut self, now: Instant, afford: u16) -> Option<u16> {
         let want = self.wanted_rows().min(afford);
         let mut moved = None;
@@ -2263,12 +2230,10 @@ impl MessageCenter {
         self.revision
     }
 
-    /// A center that REPLACES another (the web's `messages_restore`, which
-    /// builds a fresh center over the kept log) moves its revision past the
-    /// one it replaces: the log is an observable change, and a reader gating
-    /// on the revision (the page's `rev=`, ruling 388 (5)) would otherwise
-    /// read the same number over a log that went from nothing to N records
-    /// (ruling 441 (e)).
+    /// A center that replaces another (the web's `messages_restore`, a fresh
+    /// center over the kept log) moves its revision past the one it replaces,
+    /// or a reader gating on the revision (the page's `rev=`) would read the
+    /// same number over a log that went from nothing to N records.
     pub fn follow_revision(&mut self, replaced: u64) {
         self.revision = self.revision.max(replaced.saturating_add(1));
     }
@@ -2511,17 +2476,16 @@ impl MessageCenter {
         }
     }
 
-    /// The next instant the band needs a frame for the presentation `p` in
-    /// `look`, folded only over the moving rows and echoes on it (`None` when
-    /// there are none: an idle band arms nothing). The text ticks (an elapsed
-    /// boundary, the ETA's next word or its running out, the onset of a stall,
-    /// in the ETA slot or in the bar's dim ink where the width starved the
-    /// slot) arm in every look; frames for a comet and its glyph cell, a
-    /// glide, a travelling glint and a graded echo only while Moving, and for a
-    /// bar only where the frame draws something new at the row's cell
-    /// resolution ([`Surface::cells`]). A resting glint arms its next start,
-    /// not a frame, and a stalled bar's glint arms nothing. Every instant snaps
-    /// up to the grid. This is the band's only clock.
+    /// The next instant the band needs a frame for `p` in `look`, folded over
+    /// the moving rows and echoes on it (`None` when there are none). Text
+    /// ticks (an elapsed boundary, the ETA's next word or its running out, a
+    /// stall's onset in the ETA slot or, where the width starved the slot, the
+    /// bar's dim ink) arm in every look; frames for a comet, a glide, a
+    /// travelling glint and a graded echo only while Moving, and a bar's only
+    /// where the frame draws something new at cell resolution
+    /// ([`Surface::cells`]). A resting glint arms its next start, a stalled
+    /// bar's nothing. Instants snap up to the frame grid, or to the display's
+    /// cadence for a glide or echo in flight. This is the band's only clock.
     #[must_use]
     #[allow(
         clippy::too_many_lines,
@@ -2590,13 +2554,12 @@ impl MessageCenter {
                         .and_then(|phase| q.checked_sub(phase))
                         .map(|start| start + GLINT_TRAVEL);
                     let busy_until = glide_end.into_iter().chain(travel_end).max();
-                    // A frame is asked only where it draws something new at
-                    // the row's cells: at a short bar's end the glint's centre
-                    // is off the fill, and a small glide can stay inside one
-                    // tone step. Each scan stops at the first frame that
-                    // differs. What the frame at grid instant `g` draws: its
-                    // cells and its edge to a sixteenth of a cell, the glide
-                    // read on the fine instant under `g`.
+                    // A frame is asked only where it draws something new at the
+                    // row's cells (a short bar's glint can sit off the fill, a
+                    // small glide inside one tone step); each scan stops at the
+                    // first frame that differs. A frame's signature: its cells
+                    // and its edge to a sixteenth of a cell, the glide read on
+                    // the fine instant under `g`.
                     let sig = |g: Instant, gf: Instant| {
                         let s = moving_bar_at(row, data, (g, gf), epoch, look.graded, cols);
                         let edge = s
@@ -2712,18 +2675,14 @@ impl MessageCenter {
         }
     }
 
-    /// The rows a handoff did not carry end with the parent (ruling 441 (d)):
-    /// at Commit, right before its last write, the parent retires every live
-    /// row whose id is not in `carried`, the ids of the carry it handed over
-    /// at the park ([`Self::carried`]): an unrevealed row (its work ends with
-    /// this process), the measured level (the successor measures for itself
-    /// and starts calm), a row posted after the park. Each retires
-    /// [`Retired::Withdrawn`] with no echo (no frame follows), so its record
-    /// reads as ended, never in the successor as a record replayed open from
-    /// a process that died without an ending (`still open when aterm
-    /// stopped`, ruling 267), nor as a phantom beside the reporter's re-post
-    /// there. A row the carry took stays open: it is the successor's now.
-    /// Returns how many rows it closed.
+    /// The rows a handoff did not carry end with the parent: at Commit, right
+    /// before its last write, the parent retires every live row whose id is not
+    /// in `carried` (the carry it handed over at the park, [`Self::carried`]):
+    /// an unrevealed row, the measured level, a row posted after the park. Each
+    /// retires [`Retired::Withdrawn`] with no echo, so its record reads as ended
+    /// rather than replayed open in the successor (`still open when aterm
+    /// stopped`) or doubled beside the reporter's re-post there. A carried row
+    /// stays open: it is the successor's now. Returns how many rows it closed.
     pub fn close_uncarried(&mut self, carried: &[u64], now: Instant) -> usize {
         let mut closed = 0;
         let mut i = 0;
@@ -2752,15 +2711,13 @@ impl MessageCenter {
     }
 
     /// Re-seed the carry: each row keeps its id, words, hold and duplicate
-    /// count (a wire row stays the wire's), and takes the handoff staleness
-    /// cap ([`STALE_HANDOFF`]) in place of its anchors until
+    /// count (a wire row stays the wire's) and takes the handoff cap
+    /// ([`STALE_HANDOFF`]) in place of its anchors until
     /// [`MessageCenter::after_handoff_commit`]; unknown severities, tags and
-    /// intents are dropped silently; `next_id` is raised. A seeded row is
-    /// revealed and keeps its indicator: its fill, or `busy` (until the commit
-    /// stills it unless restated); an older parent's carry has no `busy` and
-    /// reads as still. `wall` is the host's wall clock at `now`: a seeded
-    /// row's life in this process is measured from it, never from the
-    /// parent's ingress stamp.
+    /// intents are dropped; `next_id` is raised. A seeded row is revealed and
+    /// keeps its fill or `busy` (an older parent's carry has no `busy` and reads
+    /// as still). `wall` is the host's wall clock at `now`: the row's life here
+    /// is measured from it, not from the parent's ingress stamp.
     pub fn seed_carried(&mut self, carry: &Carry, wall: WallStamp, now: Instant) {
         // First, so an id the log mints while adopting (a squatter moved off
         // a carried number) is above every carried one.
@@ -2804,16 +2761,15 @@ impl MessageCenter {
                 need: crate::need::Need::Unclassified,
             }
             .normalized();
-            // The door reads a carried persistent row as ADOPTED: its parent
-            // admitted it (an older parent had no need to carry), and its
-            // reporter re-asserts it at Commit. It runs while the origin is
-            // still `Carried` (that is what it keys on).
+            // The door reads a carried persistent row as adopted: its parent
+            // admitted it, and its reporter re-asserts it at Commit. It runs
+            // while the origin is still `Carried` (what it keys on).
             let mut msg = msg;
             let _ = msg.admit();
-            // A wire row stays the wire's (rulings 167, 192): a keyed one by
-            // its `wire.` key, a keyless one by keeping its Wire origin — its
-            // lines stay in the wire's file, it counts against the wire's cap
-            // and it never folds into a host row (ruling 415 (h)).
+            // A wire row stays the wire's: a keyed one by its `wire.` key, a
+            // keyless one by keeping its Wire origin, so its lines stay in the
+            // wire's file, it counts against the wire's cap and it never folds
+            // into a host row.
             let msg = if c.wire && !msg.origin.wire_owned(msg.key.as_deref()) {
                 Message {
                     origin: crate::model::Origin::Wire,
@@ -2853,19 +2809,15 @@ impl MessageCenter {
     }
 
     /// Re-read the parent's record after the handoff committed: `disk` is the
-    /// message log loaded from the file once the parent (which flushed its
-    /// last line before Commit) is gone. A successor that booted before its
-    /// parent's last write merges in what that parent recorded after the
-    /// boot's load, and the true ending of each row the boot read as `Stale`
-    /// ([`MessageLog::merge_reloaded`]); a row live here keeps its record, and
-    /// takes from the file the mark its Retired line is weighed against.
+    /// log loaded from the file once the parent (flushed before Commit) is
+    /// gone. What the parent recorded after this process's boot load, and the
+    /// true ending of each row the boot read as `Stale`, merge in
+    /// ([`MessageLog::merge_reloaded`]); a row live here keeps its record.
     pub fn merge_reloaded_log(&mut self, disk: &MessageLog) {
         self.log.merge_reloaded(disk);
-        // The mark the file gave each live row: a row its parent posted after
-        // this process's boot load was seeded with no Posted line to weigh its
-        // shown mark against, and took the carried one; its Retired line is
-        // weighed against the file's, so a row restated to another mark still
-        // says so there.
+        // A row its parent posted after this process's boot load was seeded
+        // with the carried mark; take the file's, which its Retired line is
+        // weighed against.
         for row in &mut self.live {
             if let Some(mark) = disk.open_posted_mark(row.id, row.stamp, &row.msg.tag) {
                 row.logged_mark = mark;
@@ -2874,23 +2826,19 @@ impl MessageCenter {
         self.revision += 1;
     }
 
-    /// AT COMMIT, after [`Self::merge_reloaded_log`]: a CARRIED row still in its
-    /// carried words that its parent ENDED after the park's capture — a person's
-    /// press or dismissal there, its reporter's resolve or withdrawal — ends here
-    /// too (round eight of the update audit, lead U62). Rows cross only in the
-    /// carry captured at the park, and the parent's loop runs on until Commit;
-    /// kept live, such a row came back with a fresh hold after the parent had
-    /// closed it. It ends WITHOUT a second log line, as a digest entry the parent
-    /// filed meanwhile does ([`Self::catch_up`]): the parent's line is in the
-    /// file, and the ring's record takes its ending ([`MessageLog::adopt_ending`]).
-    /// Only those four endings: a fold, a quit or an eviction there is about the
-    /// parent's glass, never the row's fact, and a row this process restated
-    /// since the seed is its own. `disk` is the file loaded again; returns the
-    /// rows it ended, each with the ending the parent gave it. It ends ROWS only:
-    /// a host that keeps state beside a row decides that state by its own record
-    /// in `disk`, never by the row's ending — the parent can change such state
-    /// with no row left to end (one folded off its glass, or dismissed, before
-    /// the change) and end a row without changing it.
+    /// At Commit, after [`Self::merge_reloaded_log`]: a carried row still in its
+    /// carried words that its parent ended after the park's capture (a press or
+    /// dismissal there, its reporter's resolve or withdrawal) ends here too;
+    /// rows cross only in the carry captured at the park, while the parent runs
+    /// on until Commit. It ends without a second log line, as an entry the
+    /// parent filed meanwhile does ([`Self::catch_up`]): the parent's line is in
+    /// the file, and the ring's record takes its ending
+    /// ([`MessageLog::adopt_ending`]). Only those four endings: a fold, a quit
+    /// or an eviction there is about the parent's glass, and a row this process
+    /// restated since the seed is its own. `disk` is the file loaded again;
+    /// returns the rows it ended with the parent's ending. It ends rows only: a
+    /// host that keeps state beside a row decides it by its own record in
+    /// `disk`, since the parent can change such state with no row left to end.
     pub fn end_carried_rows_the_parent_ended(
         &mut self,
         disk: &MessageLog,
@@ -2905,10 +2853,10 @@ impl MessageCenter {
                     | Retired::Withdrawn
             )
         };
-        // The row's record BY THE NUMBER THE PARENT WROTE IT UNDER (round
-        // eight's U5 review): another writer of the shared file that posted
-        // under the same number first has its record loaded there, and the
-        // parent's moved to a fresh id ([`MessageLog::record_of_file_id`]).
+        // The row's record by the number the parent wrote it under: another
+        // writer of the shared file that posted under the same number first
+        // has its record there, and the parent's moved to a fresh id
+        // ([`MessageLog::record_of_file_id`]).
         let record = |row: &Live| disk.record_of_file_id(row.id, row.stamp, &row.msg.tag);
         let ended: Vec<MessageId> = self
             .live
@@ -2941,15 +2889,13 @@ impl MessageCenter {
         gone
     }
 
-    /// The handoff committed: every carried row still saying its carried words
-    /// takes its own lifetime back. A Live row re-arms its cap, a Standing row
-    /// stands, a held row on glass anchors its own hold now (`Default`: the
-    /// severity's; `For` / `Ask`: the named span), and a queued one waits for
-    /// the glass unanchored under the patience clock. A row restated before
-    /// the commit already took its lifetime back then. A row no one here
-    /// restated also stops animating: work that is not this process's own is
-    /// shown still ([`Meter::busy`] cleared); a restated row keeps what its
-    /// restatement said.
+    /// The handoff committed: every carried row still in its carried words
+    /// takes its own lifetime back (a Live row re-arms its cap, a Standing row
+    /// stands, a held row on glass anchors its own hold now, a queued one waits
+    /// unanchored under the patience clock) and stops animating
+    /// ([`Meter::busy`] cleared): work that is not this process's own is shown
+    /// still. A row restated before the commit already took its lifetime back
+    /// and keeps what it said.
     pub fn after_handoff_commit(&mut self, now: Instant) {
         for row in &mut self.live {
             if !std::mem::take(&mut row.carried_pending) {
@@ -3120,28 +3066,24 @@ impl MessageCenter {
             .position(|l| l.msg.key.as_deref() == Some(key))
     }
 
-    /// The record that keeps `key` quiet at `stamp`: the LATEST word on the
-    /// fact decides — by RETIREMENT TIME, among the digest's own records for
-    /// the key (a `Record` or a row that shares the key is another fact and
-    /// says nothing about this one: a record posted after an entry opened and
-    /// before the owner dismissed it sits later in the ring but is an older
-    /// word). Filed by the owner (`Dismissed`, `Answered`), aged out (`Unseen`)
-    /// or capped (`Evicted`) inside the ask's quiet span. The span BACKS OFF
-    /// with each dismissal of the same fact inside
-    /// [`crate::need::FILED_KEEP`] (a week, then four, then at most 90 days,
-    /// [`crate::need::Resurface::backed_off`]). Read from the ring, which is
-    /// replayed from disk and keeps a filing for `FILED_KEEP` whatever else
-    /// is posted, so a dismissal holds across a restart, an update and any
-    /// number of unrelated records with no state of its own.
+    /// The record that keeps `key` quiet at `stamp`: the latest word on the
+    /// fact by retirement time, not ring order (`MessageLog::last_word`), among
+    /// the digest's own records for the key (a `Record` or a row sharing the
+    /// key is another fact). Filed by the owner (`Dismissed`, `Answered`), aged
+    /// out (`Unseen`) or capped (`Evicted`) inside the ask's quiet span, which
+    /// backs off with each dismissal inside [`crate::need::FILED_KEEP`]
+    /// ([`crate::need::Resurface::backed_off`]). Read from the ring, which is
+    /// replayed from disk and keeps a filing for `FILED_KEEP` whatever else is
+    /// posted, so a dismissal holds across a restart, an update and any number
+    /// of unrelated records.
     fn quiet_record(&self, key: &str, ask: &LaterAsk, stamp: WallStamp) -> Option<MessageId> {
         let last = self.log.last_word(key, true)?;
         if !last.filed_exception() {
             return None;
         }
-        // The span is fixed by the filing that earned it: how often the fact
-        // had been put away in the FILED_KEEP before THAT filing, not before
-        // the moment somebody asks (which would shrink it as the older
-        // filings age out mid-span).
+        // The span is fixed by the filing that earned it: the filings in the
+        // FILED_KEEP before that filing, not before now (which would shrink it
+        // as older filings age out mid-span).
         let filed_at = last.retired_unix_ms?;
         if filed_at > stamp.unix_ms.saturating_add(FILING_SKEW_MS) {
             return None;
@@ -3155,7 +3097,7 @@ impl MessageCenter {
     }
 
     /// The record that keeps a standing row's `key` quiet at `stamp`: the
-    /// LATEST word on the key (by retirement time, as [`Self::quiet_record`])
+    /// latest word on the key (by retirement time, as [`Self::quiet_record`])
     /// is a read (`Folded`) or an answer/dismissal inside
     /// [`crate::need::STANDING_QUIET`]. A row that was resolved or withdrawn
     /// (its cause ended) is news if it returns.
@@ -3195,10 +3137,9 @@ impl MessageCenter {
         );
     }
 
-    /// DISMISS ALL: every open exception is filed `Dismissed` at one wall
-    /// stamp (one press = one batch: the lines share it), each with its own
-    /// log line and its final words, and each fact is quiet for its ask's
-    /// resurface span. Returns how many were filed.
+    /// Dismiss all: every open exception is filed `Dismissed` at one wall stamp
+    /// (one press, one batch), each with its own log line and final words, and
+    /// each fact is quiet for its ask's resurface span. Returns how many.
     pub fn file_digest(&mut self, stamp: WallStamp, now: Instant) -> usize {
         let n = self.digest.len();
         while self.digest.len() > 0 {
@@ -3235,11 +3176,10 @@ impl MessageCenter {
             .get(usize::from(action.0))?
             .clone();
         self.log.record_acted(id, stamp.unix_ms, intent.label());
-        // The owner did the entry's ONE action (its button), or declined it:
-        // either way nothing is left to ask until the fact changes, and the
-        // fact is put away as ANSWERED — not `Resolved` (the cause has not
-        // been seen to end) and not `Dismissed` (they acted). A navigation
-        // (`Show tab`) is neither: the entry stays.
+        // The owner did the entry's one action (its button) or declined it:
+        // nothing is left to ask until the fact changes, so it is filed
+        // `Answered`, not `Resolved` (the cause was not seen to end) and not
+        // `Dismissed` (they acted). A navigation (`Show tab`) leaves it.
         let did_it = self
             .digest
             .get(i)
@@ -3278,14 +3218,12 @@ impl MessageCenter {
         n
     }
 
-    /// THE DIGEST'S OWN CLOCK, called by the host's settle (`stamp` is the real
+    /// The digest's own clock, called by the host's settle (`stamp` is the real
     /// wall clock): an entry a family pass stopped naming
-    /// [`crate::need::RESOLVE_AFTER`] ago ends `Resolved` (its reporter sent no
-    /// second look, or none was due), and an open one files itself `Unseen`
-    /// after [`crate::need::DIGEST_EXPIRY`] from its first ingress: nothing
-    /// waits for ever, and nothing is lost — the log keeps its words. (`Unseen`
-    /// is the log's existing word for AGED OUT; the digest keeps no look
-    /// state, so it does not claim nobody looked.) `true` when any ended.
+    /// [`crate::need::RESOLVE_AFTER`] ago ends `Resolved`, and an open one files
+    /// itself `Unseen` (the log's word for aged out) after
+    /// [`crate::need::DIGEST_EXPIRY`] from its first ingress; the log keeps its
+    /// words. `true` when any ended.
     pub fn settle_digest(&mut self, stamp: WallStamp, now: Instant) -> bool {
         let limit = u64::try_from(DIGEST_EXPIRY.as_millis()).unwrap_or(u64::MAX);
         let mut any = false;
@@ -3311,28 +3249,25 @@ impl MessageCenter {
     }
 
     /// The next instant [`Self::settle_digest`] has something to end: the
-    /// earliest unnamed entry's end. `None` with nothing pending — an idle
-    /// digest never wakes the loop. (The 14-day expiry is not armed: it is
-    /// read at every settle and at launch, and a process asleep for days has
-    /// nothing to draw.)
+    /// earliest unnamed entry's end. `None` with nothing pending, so an idle
+    /// digest never wakes the loop. The 14-day expiry is not armed: settle and
+    /// launch read it.
     #[must_use]
     pub fn digest_deadline(&self) -> Option<Instant> {
         self.digest.next_end()
     }
 
-    /// A REPORTER'S WHOLE ANSWER for one family of exceptions (level-triggered):
-    /// `desired` is every exception that holds NOW under `prefix`. Each is
-    /// posted (a new entry, a restatement, or the quiet a dismissal earned);
-    /// an open entry of the family that `desired` no longer names is MISSED:
-    /// its clock starts, and it ends `Resolved` once it has gone unnamed for
-    /// [`crate::need::RESOLVE_AFTER`] — at a later look, or at
-    /// [`Self::settle_digest`] when no look comes (a reporter whose looks are
-    /// sent only when its rows change has none to send). So a reporter cannot
-    /// leave a stale entry by forgetting to end it, a flicker neither ends nor
-    /// re-posts a fact, and a family pass never touches another family's
-    /// entries. A family has ONE producer: the pass sweeps every entry under
-    /// its prefix, so an event-raised sibling must have a prefix of its own
-    /// ([`crate::exceptions::Family::mode`]).
+    /// A reporter's whole answer for one family of exceptions (level-triggered):
+    /// `desired` is every exception that holds now under `prefix`. Each is
+    /// posted (a new entry, a restatement, or the quiet a dismissal earned); an
+    /// open entry of the family that `desired` no longer names is missed: its
+    /// clock starts, and it ends `Resolved` once unnamed for
+    /// [`crate::need::RESOLVE_AFTER`], at a later look or at
+    /// [`Self::settle_digest`]. So a reporter cannot leave a stale entry by
+    /// forgetting to end it, a flicker neither ends nor re-posts a fact, and a
+    /// pass never touches another family. A family has one producer: the pass
+    /// sweeps every entry under its prefix, so an event-raised sibling needs a
+    /// prefix of its own ([`crate::exceptions::Family::mode`]).
     pub fn sync_digest(
         &mut self,
         prefix: &str,
@@ -3343,14 +3278,12 @@ impl MessageCenter {
         self.sync_digest_keeping(prefix, desired, &[], stamp, now)
     }
 
-    /// [`Self::sync_digest`], where the pass also NAMES `kept`: keys of facts
+    /// [`Self::sync_digest`], where the pass also names `kept`: keys of facts
     /// that still hold whose new words the host's door refused
-    /// ([`crate::exceptions::Entry::message`]). An open entry under one
-    /// stands in the words it was last shown in, and no clock starts for it:
-    /// a wording fault is the reporter's to fix, and never the end of a fact
-    /// that still holds (2026-10-08: twelve refused restatements in a day, and
-    /// each one's pass would have filed the open entry `Resolved` ten minutes
-    /// on while its cause stood). A kept key with nothing open opens nothing.
+    /// ([`crate::exceptions::Entry::message`]). An open entry under one stands
+    /// in the words it was last shown in, and no clock starts for it: a wording
+    /// fault is the reporter's to fix, never the end of a fact that still
+    /// holds. A kept key with nothing open opens nothing.
     pub fn sync_digest_keeping(
         &mut self,
         prefix: &str,
@@ -3424,28 +3357,26 @@ impl MessageCenter {
         true
     }
 
-    /// The cause ended and NOTHING is open under `key`: when the latest word on
-    /// the key is a FILING (the owner pressed the entry's button and it went
-    /// `Answered`, or dismissed it, or it aged out), that word is rewritten
+    /// The cause ended and nothing is open under `key`: when the latest word on
+    /// the key is a filing (answered, dismissed or aged out), it is rewritten
     /// `Resolved` at `wall`, so the fact's quiet span ([`Self::quiet_record`])
-    /// ends with its cause and the next regression is news, not a repeat of what
-    /// the owner put away. A key whose latest word is already a resolution, or
-    /// that has no word, is left alone. `true` when a filing was resolved.
+    /// ends with its cause and the next regression is news. A key whose latest
+    /// word is already a resolution, or that has no word, is left alone. `true`
+    /// when a filing was resolved.
     pub fn forget_filing(&mut self, key: &str, wall: WallStamp, now: Instant) -> bool {
         self.digest.find_key(key).is_none() && self.log.resolve_filing(key, wall.unix_ms, now)
     }
 
-    /// A STANDING row's fact is NEW, and nothing is live under its `key`: when
+    /// A standing row's fact is new and nothing is live under its `key`: when
     /// the latest word on the key keeps it quiet ([`Self::quiet_standing`]: the
-    /// owner read, dismissed or answered an EARLIER occurrence inside
+    /// owner read, dismissed or answered an earlier occurrence inside
     /// [`crate::need::STANDING_QUIET`]), that word is rewritten `Withdrawn` at
-    /// `wall` — a second `Retired` line, which replay applies in order — so the
-    /// next post under the key is news, never taken for the repeat of what the
-    /// owner put away: the standing row's counterpart of
+    /// `wall` (a second `Retired` line, which replay applies in order), so the
+    /// next post under the key is news: the standing row's counterpart of
     /// [`Self::forget_filing`]. For a reporter that knows the earlier occurrence
-    /// ENDED (a wait that ended, and another that began), never for the one the
-    /// owner read. A key with a live row, whose latest word keeps no quiet, or
-    /// with no word, is left alone. `true` when a word was rewritten.
+    /// ended, never for the one the owner read. A key with a live row, whose
+    /// latest word keeps no quiet, or with no word, is left alone. `true` when
+    /// a word was rewritten.
     pub fn end_standing_quiet(&mut self, key: &str, wall: WallStamp, now: Instant) -> bool {
         if self.index_by_key(key).is_some() {
             return false;
@@ -3456,18 +3387,16 @@ impl MessageCenter {
         self.log.withdraw_read(read, wall.unix_ms, now)
     }
 
-    /// AT COMMIT OF A SEAMLESS UPDATE, in the SUCCESSOR: the lines the parent
-    /// wrote while the two overlapped. The successor loaded the file at its
-    /// launch and the parent (whose record is its own to the end) kept
-    /// appending, so a dismissal the owner made in the parent after that load
-    /// is in the file but not in this ring — and this process would show the
-    /// fact the owner had just filed. `tail` is the file's tail read again, in
-    /// file order (lines already in the ring are recognised and change
-    /// nothing): it is folded into the ring, the digest entries the parent
-    /// filed meanwhile end here WITHOUT a second log line, and the ones it
-    /// opened are adopted. Call it before the first digest sync of the
-    /// process; ids the parent minted are raised past first, so nothing this
-    /// process mints afterwards can collide with them.
+    /// At Commit of a seamless update, in the successor: the lines the parent
+    /// wrote while the two overlapped. The successor loaded the file at launch
+    /// and the parent kept appending, so a dismissal the owner made in the
+    /// parent after that load is in the file but not in this ring. `tail` is
+    /// the file's tail read again, in file order (lines already in the ring
+    /// change nothing): it is folded into the ring, the digest entries the
+    /// parent filed meanwhile end here without a second log line, and the ones
+    /// it opened are adopted. Ids the parent minted are raised past first, so
+    /// none this process mints afterwards collides with them. Call it before
+    /// the process's first digest sync.
     pub fn catch_up(
         &mut self,
         tail: impl IntoIterator<Item = LogLine>,
@@ -3491,7 +3420,7 @@ impl MessageCenter {
         out
     }
 
-    /// AT LAUNCH: re-open the exceptions the replayed log left open (a
+    /// At launch: re-open the exceptions the replayed log left open (a
     /// `need=later` line with no retirement), each under its old id. Their
     /// reporters re-assert at their first look and replace the words in place;
     /// what they do not re-assert is swept by [`Self::resolve_digest_prefix`].
@@ -3530,8 +3459,8 @@ impl MessageCenter {
                 ask,
                 stamp: r.stamp,
                 posted_at: now,
-                // Adopted: the clock the entry's END is written with runs from
-                // NOW, not from the old ingress stamp.
+                // Adopted: the clock the entry's end is written with runs from
+                // now, not from the old ingress stamp.
                 anchor_wall: wall.unix_ms,
                 repeats: r.repeats,
                 missed_at: None,
@@ -3543,14 +3472,13 @@ impl MessageCenter {
     }
 }
 
-/// What a supersede by key carries over from the row it replaces: the
-/// slot, the reveal (a revealed row stays revealed; an unrevealed one keeps
-/// the EARLIER clock, so Downloading → Verifying keeps its first grace), the
-/// work's start (the elapsed clock) and the motion epoch while the activity
-/// is the same, the estimator while the
-/// series is, the load clock while a load is declared on both sides (the
-/// resource may change: the machine stayed busy), the reserved load slot,
-/// and a glide from the fill shown when the fill moved.
+/// What a supersede by key carries over from the row it replaces: the slot,
+/// the reveal (a revealed row stays revealed; an unrevealed one keeps the
+/// earlier clock, so Downloading → Verifying keeps its first grace), the
+/// work's start and the motion epoch while the activity is the same, the
+/// estimator while the series is, the load clock while a load is declared on
+/// both sides, the reserved load slot, and a glide from the fill shown when the
+/// fill moved.
 fn inherit(entry: &mut Live, old: &Live, now: Instant) {
     entry.on_glass_since = old.on_glass_since;
     if old.revealed {
@@ -3823,14 +3751,12 @@ fn text_ticks(row: &Live, layout: &RowLayout, q: Instant, look: Look) -> [Option
 }
 
 /// What a moving determinate bar draws at frame `t`: the one function the
-/// frame ([`live_motion`]) and its deadline's look-ahead
+/// frame ([`live_motion`]) and the deadline's look-ahead
 /// ([`MessageCenter::motion_deadline`]) both read, so a deadline never asks a
-/// frame the motion would not draw, nor misses one it would. The stalled ink
-/// once the bytes stopped, else the fill shown (the glide) under the glint.
-///
-/// The glide is read at the fine instant `tf` and the glint at the grid's
-/// `t`, on a row `cols` wide (the glint's least width). A measured level is
-/// its rail.
+/// frame the motion would not draw, nor misses one. The stalled ink once the
+/// bytes stopped, else the fill shown under the glint; a measured level is its
+/// rail. The glide is read at the fine instant `tf`, the glint at the grid's
+/// `t` (at `tf` mid-glide), on a row `cols` wide.
 fn moving_bar_at(
     row: &Live,
     data: u16,
@@ -3960,20 +3886,15 @@ fn live_motion(
 }
 
 /// An echo's motion at frame `q`, over the whole row. A Complete echo wears ✓
-/// beside its finished words and says nothing in its time slots (the
-/// past-tense title already says it finished); a title with no past tense
-/// keeps its words and says `done` there instead, so `✓ Uploading the backup`
-/// never reads as still going. A Fault echo wears ⚠ and says `failed` in the
-/// row's time slot (the ETA slot, else the elapsed one) in the fault hue, so a
-/// bar that drains and fades reads as a failure, not a render glitch. A Vanish
-/// claims no outcome and keeps the frozen elapsed words. Nothing re-grids: the
-/// slot is the row's own.
+/// and says nothing in its time slots, except a title with no past tense, which
+/// says `done` there (`✓ Uploading the backup` must not read as still going).
+/// A Fault echo wears ⚠ and says `failed` in the row's time slot (the ETA slot,
+/// else the elapsed one). A Vanish keeps the frozen elapsed words. Nothing
+/// re-grids: the slot is the row's own.
 fn echo_motion(e: &Echo, layout: &RowLayout, q: Instant, look: Look, cols: usize) -> RowMotion {
     // Past its end an echo is at its end (the row goes at the next settle).
     let t = q.min(e.until).saturating_duration_since(e.started);
     let (surface, fade) = echo(e, t, look, cols);
-    // The outcome said in the row's time slot — the ETA slot, else the
-    // elapsed one.
     let said = |word: &str| {
         (
             layout
@@ -3984,8 +3905,6 @@ fn echo_motion(e: &Echo, layout: &RowLayout, q: Instant, look: Look, cols: usize
         )
     };
     let (readout, eta) = match e.kind {
-        // A title with no past tense (a wire script's `Uploading the backup`)
-        // would read as still going: `done` says it finished.
         EchoKind::Complete if e.msg.finished_words().is_none() => said(DONE_WORD),
         EchoKind::Complete => (None, None),
         EchoKind::Fault => said(FAILED_WORD),

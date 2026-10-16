@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Drives the block ABI through REAL system code that copies and invokes the
-//! block — libdispatch and Foundation — rather than by calling `invoke`
-//! ourselves. Calling our own function pointer would prove only that the
-//! pointer is where we put it; the whole risk is whether `libclosure` accepts
-//! the layout, runs the copy/dispose helpers, and hands `invoke` the block back
-//! as its first argument.
+//! Drives the block ABI through system code that copies and invokes the block
+//! (libdispatch, Foundation, CoreFoundation). Calling our own `invoke` pointer
+//! would prove only that it is where we put it; the risk is whether
+//! `libclosure` accepts the layout, runs the copy/dispose helpers, and hands
+//! `invoke` the block back as its first argument.
 
 #![cfg(target_os = "macos")]
 
@@ -92,13 +91,11 @@ fn foundation_invokes_an_arity_two_block() {
     // completion handler has.
     let lines = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let sink = Arc::clone(&lines);
-    // The `stop` out-parameter is `BOOL *`. On the x86_64 compat slice
-    // Foundation writes a `signed char` into that byte, so `*mut bool` would be
-    // undefined behaviour; `RcBlock::newN`'s `Encode` bound refuses it, and
-    // `*mut Bool` is the only spelling that compiles. Its encoding is `^B` on
-    // arm64 and `^c` on x86_64 (clang encodes the `BOOL` typedef, never the
-    // `char *` it aliases — see `BOOL_PTR_ENCODING`).
-    // SAFETY: the prototype below is exactly what AppKit documents for
+    // `stop` is `BOOL *`, a `signed char` on the x86_64 compat slice, so
+    // `*mut bool` would be undefined behaviour; `*mut Bool` is the only
+    // spelling `RcBlock::newN`'s `Encode` bound accepts (see
+    // `BOOL_PTR_ENCODING`).
+    // SAFETY: the prototype below is exactly what Foundation documents for
     // `enumerateLinesUsingBlock:`.
     let block = unsafe {
         RcBlock::new2(move |line: Id, _stop: *mut aterm_objc::Bool| {
@@ -127,11 +124,8 @@ fn foundation_invokes_an_arity_two_block() {
 
 #[test]
 fn a_returning_block_hands_its_value_back() {
-    // The `alert_keys.rs` shape: one object in, one object out. Driven through
-    // `-[NSArray indexOfObjectPassingTest:]`? That is arity 3, so instead this
-    // invokes the block the way the ObjC ABI does — through the block's own
-    // `invoke` slot, read back out of the heap block the runtime built. That is
-    // still the runtime's copy of the block, not our stack original.
+    // The `alert_keys.rs` shape, one object in and one out, invoked through the
+    // `invoke` slot of the runtime's heap copy rather than our stack original.
     let sentinel = ns_string("sentinel").expect("NSString");
     let expect = sentinel.id();
     // SAFETY: an `id (^)(id)` block, matching the prototype used below.
@@ -205,7 +199,7 @@ fn a_retained_block_defers_the_dispose() {
 
 #[test]
 fn the_runtime_agrees_a_block_is_an_objc_object() {
-    // A heap block's isa is `_NSConcreteMallocBlock`, which IS an ObjC class,
+    // A heap block's isa is `_NSConcreteMallocBlock`, which is an ObjC class,
     // so the runtime answers `-class` on it. This is what lets AppKit retain a
     // handler with `objc_retain` and store it in an ivar.
     // SAFETY: a `void (^)(void)` block.
@@ -222,11 +216,8 @@ fn the_runtime_agrees_a_block_is_an_objc_object() {
             "heap block reported class {name:?}, expected an NSBlock kind"
         );
         // And it is a kind of the shared NSBlock class Foundation exports.
-        // `-isKindOfClass:` returns `BOOL`, not a Rust `bool`. This line said
-        // `-> bool` until the `Encode` bound on `msg` refused it: on the
-        // x86_64 compat slice `BOOL` is `signed char`, so a receiver that
-        // answered a non-0/1 byte would have been materialised as an invalid
-        // `bool`. D3's rule, now enforced rather than remembered.
+        // `-isKindOfClass:` returns `BOOL`; `msg`'s `Encode` bound refuses a
+        // Rust `bool` there.
         let is_kind: unsafe extern "C-unwind" fn(
             Id,
             Sel,
@@ -244,7 +235,7 @@ fn the_runtime_agrees_a_block_is_an_objc_object() {
 }
 
 // ---------------------------------------------------------------------------
-// W12 — the ownership rule `observer.rs::queue_closure` now depends on.
+// The ownership rule winit's `observer.rs::queue_closure` depends on.
 // ---------------------------------------------------------------------------
 
 unsafe extern "C" {
@@ -256,19 +247,10 @@ unsafe extern "C" {
     static kCFRunLoopDefaultMode: *const c_void;
 }
 
-/// `CFRunLoopPerformBlock` TAKES ITS OWN REFERENCE, so the caller may release
-/// immediately.
-///
-/// This is the one new ownership claim the `observer.rs` port makes. Upstream
-/// passed a `&block2::Block` borrowed from an `RcBlock` that dropped at the end
-/// of the same function, so the shape is not new — but it was implicit in a
-/// binding type, and here it is a raw pointer and a `Drop` two lines apart. If
-/// the run loop did NOT copy, this test invokes a freed heap block.
-///
-/// Both halves are asserted, and the second is what makes it a measurement
-/// rather than a smoke test: the closure RAN (so the block survived our
-/// release), and its captured payload was dropped EXACTLY ONCE afterwards (so
-/// the run loop's reference was given back rather than leaked).
+/// `CFRunLoopPerformBlock` takes its own reference, so the caller may release
+/// immediately, as winit's `observer.rs` `queue_closure` does. The closure must
+/// run (the block survived our release) and its capture drop exactly once
+/// afterwards (the run loop's reference was given back, not leaked).
 #[test]
 fn cfrunloopperformblock_takes_its_own_reference() {
     let drops = Arc::new(AtomicUsize::new(0));
@@ -290,8 +272,8 @@ fn cfrunloopperformblock_takes_its_own_reference() {
     // Foundation's own constant, and the block is a live heap block.
     unsafe { CFRunLoopPerformBlock(CFRunLoopGetCurrent(), kCFRunLoopDefaultMode, block.as_ptr()) };
 
-    // THE RELEASE, before the run loop has run anything. `queue_closure`'s
-    // `RcBlock` goes out of scope at exactly this point.
+    // The release, before the run loop has run anything: where
+    // `queue_closure`'s `RcBlock` goes out of scope.
     drop(block);
     assert_eq!(
         drops.load(Ordering::SeqCst),

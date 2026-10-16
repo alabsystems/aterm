@@ -24,7 +24,10 @@ publish = false
 # repository counts packages. chacha20poly1305 + getrandom still appear in
 # `Cargo.lock` (a lockfile records reachable optional deps; the curves do not,
 # as nothing here can enable them); `targo tree -p aterm-link -e normal` shows a
-# default build compiles none. `tests/two_nodes_sealed.rs` turns it on.
+# default build compiles none. `crates/aterm`'s `two_nodes_sealed` turns it on.
+# The Trust lane verifies this crate's `sealed` arms in a row of their own,
+# `aterm-link+sealed` (this library with `--features sealed`, beside the
+# default row; trust/floors.tsv).
 sealed = ["astream-broker/aead"]
 # Development seams (`aterm_types::dev_seam!`) in an optimized build: `ATERM_BIN`,
 # the bridge's and notifier's fault switches, `fabric on`'s effect trace and mint
@@ -33,9 +36,10 @@ sealed = ["astream-broker/aead"]
 dev-seams = []
 
 [dependencies]
-# The bus: `cap` for the bound grant every fabric principal attaches with. With
-# `sealed`, the crate's whole third-party crypto surface is sha2,
-# chacha20poly1305 and getrandom.
+# The bus: `cap` for the bound grant every fabric principal attaches with. Its
+# SHA-256 is astream's own astream-digest, so a default build takes no
+# third-party crate from astream; with `sealed`, the crate's whole third-party
+# crypto surface is chacha20poly1305 and getrandom.
 astream-broker = { path = "../../vendor/astream/crates/astream-broker", features = ["cap"] }
 astream-cap = { path = "../../vendor/astream/crates/astream-cap" }
 # The verb table (what the bridge may call) and the control-socket vocabulary.
@@ -49,6 +53,8 @@ aterm-codec = { workspace = true }
 # The one FNV-1a/64 (the `gen=` fingerprint, the say-cursor shard): the same
 # hash `status` stamps `hash=` with.
 aterm-hash = { workspace = true }
+# Durable publication identities: semantic SHA-256 before the first send.
+aterm-digest = { workspace = true }
 # The control-socket client: the same rendezvous walk and Owner-token read
 # `aterm ctl instances`/`ls` use, so `aterm fabric` and the bridge's hosted set
 # cannot find different instances than the client does.
@@ -59,18 +65,12 @@ aterm-ctl = { path = "../aterm-ctl" }
 aterm-toml = { workspace = true }
 
 [dev-dependencies]
-# `aterm fabric status --json` is asserted as JSON, not as substrings.
-aterm-json = { workspace = true }
-# `tests/world/fabric_on.rs` runs `fabric on`'s effect trace through the
-# capability-publication model's `Model::fire`.
+# The unit tests drop the broker's retained record and dedup entry together.
+astream-broker = { path = "../../vendor/astream/crates/astream-broker", features = ["cap", "retention"] }
+# The unit tests' derived models and hang detectors.
 aterm-spec = { workspace = true }
-# Scratch directories removed on drop, and `stand_in`: a fake program with one
-# pre-assessed inode per body.
-aterm-tempfile = { workspace = true, features = ["stand-in"] }
-
-[[bin]]
-name = "aterm-link"
-path = "src/main.rs"
+# Scratch directories removed on drop.
+aterm-tempfile = { workspace = true }
 
 [lints]
 workspace = true

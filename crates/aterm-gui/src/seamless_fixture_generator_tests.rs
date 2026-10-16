@@ -289,6 +289,7 @@ fn fx_record(local_id: u64, title: &str) -> SessionRecord {
         role: None,
         attention: None,
         questions: None,
+        autopilot: None,
         control: None,
         frozen_path: false,
         identity: None,
@@ -314,12 +315,14 @@ fn fx_record(local_id: u64, title: &str) -> SessionRecord {
         // (`SessionTimeline::handoff_id`). `viewport_from_bottom` is stamped
         // with the history carry, from the park's head.
         hold: None,
+        more_holds: Vec::new(),
         supervisor: None,
         claim_known: true,
         attention_owners: Vec::new(),
         viewport_from_bottom: None,
         fabric: crate::fabric::FabricCarry::default(),
         timeline_id: 24 + local_id * 3 + crate::session_timeline::HANDOFF_ID_RESERVE,
+        log_ids: None,
         // Since v0.101.0, stamped by the park (`fx_write`, as
         // `stamp_render_debts` and `stamp_journal_keys`): the rows the engine
         // owed a carried alternate screen, and the crash journal key of a
@@ -354,12 +357,14 @@ fn fx_leaf(local_id: u64, title: &str, cwd: Option<&str>) -> crate::restore::Res
         attention: None,
         identity: None,
         questions: None,
+        autopilot: None,
         // Since v0.95.0: filled only by the crash journal and a system
         // quit's layout, never by the handoff's (`capture_restore_manifest`).
         agent: None,
         supervised: None,
         // Since v0.100.0: a pane kept open after its command exited.
         held: false,
+        holds: Vec::new(),
     }))
 }
 
@@ -3591,8 +3596,8 @@ mod rendezvous_generator {
         let target_value = crate::seamless::encode_target_identity(build, commit);
         let parent_birth_value = crate::seamless::outgoing_parent_env()
             .into_iter()
-            .find(|(key, _)| *key == crate::seamless::ENV_PARENT_BIRTH)
-            .map(|(_, value)| value)
+            .find(|(key, _)| *key == crate::seamless::ENV_PARENT_BIRTH.name())
+            .and_then(|(_, value)| value.into_string().ok())
             .expect("the kernel's birth record for this process");
 
         let ptys = RZ_SESSIONS
@@ -3664,7 +3669,7 @@ mod rendezvous_generator {
         );
         line(
             "env_rendezvous",
-            toml_string(crate::handoff_rendezvous::ENV_RENDEZVOUS),
+            toml_string(crate::handoff_rendezvous::ENV_RENDEZVOUS.name()),
         );
         line(
             "rendezvous_file_shape",
@@ -3672,23 +3677,26 @@ mod rendezvous_generator {
         );
         line(
             "env_claim",
-            toml_string(crate::handoff_rendezvous::ENV_CLAIM),
+            toml_string(crate::handoff_rendezvous::ENV_CLAIM.name()),
         );
         line("claim_hex_len", capture.claim_hex_len.to_string());
         line(
             "env_proof_term",
-            toml_string(crate::handoff_rendezvous::ENV_PROOF_TERM),
+            toml_string(crate::handoff_rendezvous::ENV_PROOF_TERM.name()),
         );
         line(
             "proof_term_launched",
             toml_string(&proof_term_of("OutOfBand")),
         );
         line("proof_term_fork", toml_string(&proof_term_of("Fork")));
-        line("env_target", toml_string(crate::seamless::ENV_TARGET));
+        line(
+            "env_target",
+            toml_string(crate::seamless::ENV_TARGET.name()),
+        );
         line("target_value", toml_string(&target_value));
         line(
             "env_parent_birth",
-            toml_string(crate::seamless::ENV_PARENT_BIRTH),
+            toml_string(crate::seamless::ENV_PARENT_BIRTH.name()),
         );
         line("parent_birth_value", toml_string(&parent_birth_value));
         line("proof_layout_digest", toml_string(&hex_of(&layout)));

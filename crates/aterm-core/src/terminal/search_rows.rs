@@ -2,33 +2,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! A row as search reads it: its text as written, and the grid cells that
-//! text was read from.
+//! A row as search reads it: its text as written, and the grid cells that text was read
+//! from.
 //!
-//! The search index reports a match in the cells that hold it
-//! ([`LineCells`]), not where a walk of the text would put them: the grid
-//! folds a character into the cell before it only when that cell is the one
-//! before the cursor as the character arrives, so two flag halves written
-//! out of order (or brought together by a delete-character) stay two cells,
-//! and a VS16 base in a row's last column stays one cell wide. Every search
-//! over this terminal reads its rows here: the full index build, its
-//! refresh, the budgeted search, and the GUI's own index.
+//! The search index reports a match in the cells that hold it ([`LineCells`]), not where a
+//! walk of the text would put it: the grid folds a character into the cell before it only
+//! when that cell is the one before the cursor as it arrives, so two flag halves written
+//! out of order (or brought together by a delete-character) stay two cells, and a VS16 base
+//! in a row's last column stays one cell wide. Every search over this terminal reads its
+//! rows here: the full index build, its refresh, the budgeted search, and the GUI's index.
 //!
-//! A history row's cells are the ones it is drawn in
-//! ([`history_line_text_cells`]): a ring-tier row's own cells, read by the
-//! walk the ring tier draws it with (`Grid::ring_history_cells`), and a row
-//! past the ring the walk of its stored line it is drawn by. The stored walk
-//! costs one unit scan per grapheme, about 0.9 us a row of 70 decomposed
-//! accents, measured +17% on a full build of such scrollback and within noise
-//! on ASCII, agent output and CJK (the walk steps over printable ASCII runs);
-//! accepted (ruling 2026-10-11, r15 content-5), a full build runs only on a
-//! cold or invalidated index. Reading the ring tier from its cells (ruling
-//! 2026-10-11, r16 selection-stride review: the stored walk joined what the
-//! ring tier draws apart, two flag halves drawn out of order among them, so
-//! find, a double-click and a copy were up to two cells off there) steps over
-//! printable ASCII runs too: over 50,000 rows behind a 10,000-row ring, the
-//! median of 6 alternated runs of a full build moved -3.4% (ASCII), 0.0%
-//! (agent output), -0.6% (CJK) and +0.5% (decomposed accents), within noise.
+//! A history row's cells are the ones it is drawn in ([`history_line_text_cells`]): a
+//! ring-tier row's own cells (`Grid::ring_history_cells`), else the walk of its stored line.
+//! The stored walk costs one unit scan per grapheme (about 0.9 µs a row of 70 decomposed
+//! accents: +17% on a full build of such scrollback, within noise on ASCII, agent output
+//! and CJK); a full build runs only on a cold or invalidated index.
 
 use std::borrow::Cow;
 
@@ -85,17 +73,12 @@ fn history_row_written(grid: &Grid, idx: usize, line: &Line) -> (String, LineCel
     (text, cells)
 }
 
-/// The cells `text`, a read of history line `idx` (0 = oldest) of `grid`
-/// whose stored line is `line`, is drawn in: the ring tier's own cells where
-/// it draws the row from them ([`Grid::ring_history_cells`]), else the walk
-/// the row is drawn by from its stored line ([`stored_line_cells`]). Every
-/// reader of a history row's cells comes here: search (the index, its
-/// refresh, the budgeted search, the GUI's find), a double-click's window,
-/// a web host's word under a cell and a copy's columns, so a column names
-/// the cell drawn there on either tier (r16 selection-stride review,
-/// 2026-10-11: reading every history row from its stored line put words,
-/// copies and matches after two flag halves drawn apart two cells off where
-/// the ring tier draws them).
+/// The cells `text`, a read of history line `idx` (0 = oldest) of `grid` whose stored line
+/// is `line`, is drawn in: the ring tier's own cells where it draws the row from them
+/// ([`Grid::ring_history_cells`]), else the walk of the stored line
+/// ([`stored_line_cells`]). Every reader of a history row's cells comes here (search, a
+/// double-click's window, a web host's word under a cell, a copy's columns), so a column
+/// names the cell drawn there on either tier.
 #[must_use]
 pub fn history_line_text_cells(grid: &Grid, idx: usize, line: &Line, text: &str) -> LineCells {
     let mut cells = LineCells::new();

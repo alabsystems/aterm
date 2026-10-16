@@ -40,6 +40,10 @@
 //! build). A headless instance opens no window.
 
 #![cfg(unix)]
+#![allow(
+    clippy::disallowed_types,
+    reason = "test code: a stand-in child may inherit descriptors"
+)]
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -372,7 +376,7 @@ fn propose(inst: &Instance, json: &str) -> (bool, String) {
 /// A `next` parked by a client of its own and HOLDING the waiter slot, shown
 /// by this client's `next timeout=0` being refused `already waiting` while the
 /// parked client runs. The parked client has to spawn, connect and register
-/// first — a moment alone, seconds on a loaded gate, where a fixed 300-500 ms
+/// first — a moment alone, seconds on a loaded machine, where a fixed 300-500 ms
 /// sleep read a slot not yet taken as the refusal missing (or killed a client
 /// that had never parked, and the crash cycle tested nothing) — so a probe
 /// that finds the slot FREE (served `OK timeout`) is asked again while the

@@ -1,65 +1,29 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//! WHAT A BARE `cargo`/`rustc` IS ABOUT TO RUN, named by what it is (2026-09-29).
+//! What a bare `cargo`/`rustc` is about to run, named by what it is.
 //!
-//! The reroute's SIGNPOST ([`crate::reroute`]) said "running upstream 'rustc' (no proof
-//! claim)" of every bare `rustc`, whatever that name ran. Measured 2026-09-29 after
-//! `rustup default trust`: in an unpinned directory `rustc -vV` printed `trust: 0.1.0` —
-//! the Trust seal 7d5533b2 — under a line that called it upstream, and in a directory
-//! pinning `1.97.1` it printed stock 1.97.1 under the very same line. The owner: *"fix that
-//! naming so that there is NO CONFUSION NOW"*.
+//! The reroute's signpost ([`crate::reroute`]) resolves the copy it is about to exec
+//! ([`resolve`]) and names it:
 //!
-//! So the signpost RESOLVES the copy it is about to exec ([`resolve`]) and names it:
+//! * A rustup proxy ([`rustup_proxy`]) is asked `rustup which <name>` in the caller's
+//!   directory and environment, a `+<toolchain>` passed on as `--toolchain`, auto-install
+//!   off: the file it would exec, and so the toolchain rustup picked ([`Rustup`]). Why it
+//!   picked that one is said only where it is measured ([`Picked`]).
+//! * Any other copy is asked exactly as it will run, `<copy> [+<toolchain>] -vV`, in the
+//!   caller's directory and environment: a wrapper around a proxy passes the
+//!   `+<toolchain>` on, so it is part of the question.
+//! * The `-vV` says what it is ([`parse_vv`]): Trust by its `trust:` line, stock only with no
+//!   mark of Trust at all; anything else (a mark with no `trust:` line, no answer, a failure,
+//!   a timeout) is not known to be Trust.
 //!
-//! * A rustup proxy — known by its file, never by its directory: a link to `rustup` (or
-//!   `rustup-init`), `rustup`'s own inode, or `rustup`'s own bytes, beside the name on PATH
-//!   or beside the file that name resolves to ([`rustup_proxy`]) — is asked `rustup which
-//!   <name>` in the caller's directory and environment, a `+<toolchain>` passed on as
-//!   `--toolchain`, auto-install off: the toolchain file it would exec, and so the
-//!   toolchain rustup picked ([`Rustup`]). Why it picked that one is said only where it is
-//!   measured ([`Picked`]).
-//! * Any other copy is itself, asked exactly as it will run: `<copy> [+<toolchain>] -vV`
-//!   in the caller's directory and environment. A wrapper around a proxy passes the
-//!   `+<toolchain>` on, so it is part of the question (2026-09-30: asked without it, a
-//!   `#!` wrapper over rustup's proxy was named Trust while `cargo +1.97.1` ran stock).
-//! * That file's `-vV` says what it is ([`parse_vv`]): a `trust:` line is Trust, named by
-//!   its commit; a `release:` line with no `trust:` line and NO MARK OF TRUST at all is
-//!   STOCK, named by its version; one that carries a mark of Trust but no `trust:` line is
-//!   named by what it printed and is not known to be Trust (the shipped seal e9ca4908's
-//!   cargo prints `trust-repo-commit-hash:` and no `trust:`, measured 2026-09-30: it was
-//!   called STOCK, and refused in a Trust checkout as "a stock compiler"); any other answer
-//!   — none, a failure, a timeout — is NOT KNOWN. Neither of the last two is ever Trust.
+//! It runs before every bare `cargo`/`rustc`, so rustup's answer ([`which_key`]) and a
+//! toolchain file's identity ([`CacheKey`]) are cached ([`CACHE_FILE`]), each keyed by
+//! everything it depends on: a warm call costs a few dozen `stat`s and one small read, where a
+//! live `rustup which` alone measured 70 ms. Nothing else is cached: a `#!` wrapper or a
+//! compiled dispatcher can be a different compiler in each directory.
 //!
-//! CHEAP, because it runs before every bare `cargo`/`rustc` a session types: rustup's answer
-//! and a toolchain file's identity are cached ([`CACHE_FILE`]), each keyed by everything it
-//! depends on, so a warm call costs a few dozen `stat`s and one small read. Measured the
-//! same day on a loaded machine, a live `rustup which` alone took 70 ms — more than the
-//! whole reroute before this.
-//!
-//! * rustup's answer, by what rustup reads to give it ([`which_key`]): the name, the
-//!   `+<toolchain>`, `$RUSTUP_TOOLCHAIN`, rustup's home, the directory, the file identity of
-//!   `settings.toml` (the default and every directory override), of the `toolchains/`
-//!   directory (an install, an uninstall, a re-link), of the `rustup` binary, and of the
-//!   nearest toolchain file up the tree. A failure is never cached, and a cached answer
-//!   that is no longer a file is asked again.
-//! * The identity of A TOOLCHAIN'S OWN FILE — a compiled binary named what was typed, in a
-//!   `bin/` whose `../lib` holds the `librustc_driver` every toolchain ships — by its
-//!   canonical path, device, inode, length and mtime and those of that driver, where a
-//!   compiler's version lives ([`CacheKey`]). The name and the file are one, so the
-//!   `argv[0]` it is asked by is the one it runs by. NOTHING ELSE IS CACHED, because nothing
-//!   else is known to be one compiler: a `#!` wrapper that execs a proxy by name is a
-//!   different compiler in each directory (the genesis stage0 wrapper was Trust 7d5533b2
-//!   from `~/aterm` and stock 1.98.0 from `$HOME/trust`, measured 2026-09-29), and so is a
-//!   COMPILED dispatcher — a mise/proto-style shim that picks the tool by its `argv[0]` and
-//!   directory, or a rustup proxy [`rustup_proxy`] did not recognise. Measured 2026-09-30
-//!   when every compiled binary was cached: a 10-line C dispatcher, symlinked as `cargo` and
-//!   `rustc`, had `rustc`'s Trust answer from one directory cached under its one path and
-//!   served for `cargo` in a directory pinning stock 1.97.1.
-//!
-//! INSIDE A TRUST SOURCE CHECKOUT — `x.py` beside a `src/stage0` whose
-//! `compiler_dist_channel=trust` ([`trust_checkout`]) — the reroute refuses a resolution
-//! that is not Trust: a stock compiler there would build part of Trust (the plan of
-//! 2026-09-29, under the owner's "NO STOCK RUST IN THE TOOLCHAIN FOR TRUST").
+//! Inside a Trust source checkout ([`trust_checkout`]) the reroute refuses a resolution that
+//! is not Trust: a stock compiler there would build part of Trust.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -70,10 +34,7 @@ use crate::reroute::PASSTHROUGH_ENV;
 
 /// The resolution cache, a file under the manager prefix.
 pub const CACHE_FILE: &str = "reroute-identity.cache";
-/// The first field of every cache line; a line with another is ignored. `v1` keyed any
-/// compiled binary's identity by its file alone, a compiled dispatcher's included, so none
-/// of its lines is read ([`CacheKey::of`]); `v2` kept no [`Vv::mark`], so a Trust build
-/// with no `trust:` line read back as STOCK.
+/// The first field of every cache line; a line with another (an older schema's) is ignored.
 const CACHE_SCHEMA: &str = "v3";
 /// A binary's identity ([`CacheKey`]): one entry per canonical path.
 const KIND_IDENTITY: &str = "id";
@@ -103,9 +64,9 @@ pub struct Vv {
     pub host: Option<String>,
     /// The `trust:` line — Trust's own version. Present only on Trust.
     pub trust: Option<String>,
-    /// The first other mark of Trust it printed: `trust-repo-commit-hash:
-    /// e9ca49080f0f`, `binary: trustc`, `(trustc 0.1.0)`. With no `trust:` line it makes the
-    /// answer not known to be Trust, where its absence makes it STOCK.
+    /// The first other mark of Trust it printed: `trust-repo-commit-hash: e9ca49080f0f`,
+    /// `binary: trustc`, `(trustc 0.1.0)`. With no `trust:` line it makes the answer not known
+    /// to be Trust, where its absence makes it stock.
     pub mark: Option<String>,
 }
 
@@ -303,14 +264,12 @@ pub fn resolve(ask: &Ask<'_>) -> Resolved {
 }
 
 /// The `rustup` to ask when the copy on PATH at `target` (canonical: `canonical`) is one of
-/// rustup's proxies, `None` otherwise. Known by the FILE: a link to `rustup`/`rustup-init`
+/// rustup's proxies, `None` otherwise. Known by the file: a link to `rustup`/`rustup-init`
 /// (the macOS layout), or `rustup`'s own inode (a hard link, rustup's default on Linux) or
-/// own bytes (a copy) — of the `rustup` beside the name on PATH, or of the one beside the
-/// file that name resolves to: a symlink to `~/.cargo/bin/cargo` sits beside no `rustup`,
-/// and the hard link it reaches sits beside rustup's. Measured 2026-09-30 when only the
-/// first was asked: that proxy was missed, run as a plain copy, and its `-vV` named a
-/// different toolchain in each directory. A proxy still missed here is run and asked as a
-/// plain copy, never cached ([`CacheKey::of`]).
+/// bytes (a copy), of the `rustup` beside the name on PATH or beside the file that name
+/// resolves to (a symlink to `~/.cargo/bin/cargo` sits beside no `rustup`; the hard link it
+/// reaches does). A proxy still missed is run and asked as a plain copy, never cached
+/// ([`CacheKey::of`]).
 fn rustup_proxy(target: &Path, canonical: &Path) -> Option<PathBuf> {
     let named_rustup = |path: &Path| {
         path.file_name()
@@ -507,8 +466,8 @@ fn default_toolchain(rustup_home: &Path) -> Option<String> {
 }
 
 /// The first answer of a Rust tool's `-vV`: `None` when it is not one (no `release:` line).
-/// Trust by its `trust:` line alone; STOCK only when it carries no mark of Trust at all
-/// ([`Vv::mark`]) — a release string says nothing either way (any build from source,
+/// Trust by its `trust:` line alone; stock only when it carries no mark of Trust at all
+/// ([`Vv::mark`]). A release string says nothing either way (any build from source,
 /// upstream's included, reports `-dev`).
 #[must_use]
 pub fn parse_vv(text: &str) -> Option<Vv> {
@@ -532,9 +491,9 @@ pub fn parse_vv(text: &str) -> Option<Vv> {
 
 /// The first mark of Trust in a `-vV`, other than a `trust:` line with a version: a
 /// `(trustc …)`/`(targo …)` on the first line (the branded entries stamp it), `binary:
-/// trustc`, or any key beginning `trust` — `trust-repo-commit-hash:`, which the shipped seal
-/// e9ca4908's cargo prints with no `trust:` line, or an empty `trust:`. Named by the line,
-/// its value cut to 12 characters. Upstream Rust prints none of these.
+/// trustc`, or any key beginning `trust` (`trust-repo-commit-hash:`, which a shipped Trust
+/// cargo prints with no `trust:` line, or an empty `trust:`). Named by the line, its value cut
+/// to 12 characters. Upstream Rust prints none of these.
 fn trust_mark(text: &str) -> Option<String> {
     let first = text.lines().next().unwrap_or_default();
     for brand in ["(trustc", "(targo"] {
@@ -563,13 +522,11 @@ fn trust_mark(text: &str) -> Option<String> {
 /// ([`CacheKey::of`]) handed no `+<toolchain>`, else its `-vV`, asked as it will run and
 /// cached only under that key.
 ///
-/// A KEYED FILE IS ASKED BY ITS OWN PATH. `exec` reaches `real` through links —
-/// rustup's `toolchains/<tc>`, a symlink on PATH — and a link re-pointed between the
-/// `canonicalize` that named `real` and the probe would have had another file's answer
-/// cached under `real`'s key, served until that file changed: a stock answer named Trust
-/// (2026-10-01 review). The keyed file is the one asked; its name is the same (a key
-/// needs `real` named `ask.name`), so the question is the same. Unkeyed, it is asked as
-/// it will run, through `exec`.
+/// A keyed file is asked by its own path: `exec` reaches `real` through links (rustup's
+/// `toolchains/<tc>`, a symlink on PATH), and a link re-pointed between the `canonicalize`
+/// and the probe would cache another file's answer under `real`'s key. The name is the same
+/// (a key needs `real` named `ask.name`), so the question is too. Unkeyed, it is asked as it
+/// will run, through `exec`.
 fn identity_of(ask: &Ask<'_>, exec: &Path, real: &Path, plus: Option<&str>) -> Identity {
     let key = match (ask.cache, plus) {
         (Some(_), None) => CacheKey::of(real, ask.name),
@@ -659,13 +616,12 @@ struct CacheKey {
 }
 
 impl CacheKey {
-    /// The key of the canonical file `real`, run as `name` — only when it is A TOOLCHAIN'S
-    /// OWN FILE: a Mach-O or ELF binary named `name` (so the `argv[0]` it is asked by is
-    /// its own), in a `bin/` whose `../lib` holds at least one `librustc_driver*`, the
-    /// driver every toolchain ships. `None` for anything else, whose answer is not known to
-    /// be the file's alone: a script, a compiled dispatcher that picks a tool by its
-    /// `argv[0]` or directory (a shim under another name, or anywhere outside a toolchain),
-    /// a proxy [`rustup_proxy`] missed — and for a path a cache line cannot carry.
+    /// The key of the canonical file `real`, run as `name`, only when it is a toolchain's own
+    /// file: a Mach-O or ELF binary named `name` (so the `argv[0]` it is asked by is its own),
+    /// in a `bin/` whose `../lib` holds at least one `librustc_driver*`. `None` for anything
+    /// else, whose answer is not known to be the file's alone (a script, a compiled dispatcher
+    /// that picks a tool by `argv[0]` or directory, a proxy [`rustup_proxy`] missed), and for
+    /// a path a cache line cannot carry.
     fn of(real: &Path, name: &str) -> Option<Self> {
         if real.file_name()? != name {
             return None;

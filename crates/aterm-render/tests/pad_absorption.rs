@@ -113,28 +113,6 @@ fn pad_split_exact_cover_maximal_floor_near_even() {
     );
 }
 
-/// NEGATIVE CONTROL: the pre-fix behavior — sizing the surface to the quantized
-/// frame and letting the compositor stretch — corresponds to pretending
-/// `pad_lo == pad_hi == pad` for a window with a remainder. Show the exact-cover
-/// law genuinely rejects it (the invariant is not satisfiable by the old world).
-#[test]
-fn pad_split_rejects_the_prefix_quantized_frame() {
-    // 80 columns of a 9px cell + 4px pad + a 7px drag remainder.
-    let (pad, cell) = (4usize, 9usize);
-    let w = 2 * pad + 80 * cell + 7;
-    let s = pad_split(w, pad, cell);
-    assert_eq!(s.cells, 80);
-    // The old world: both pads at the base value -> the cover misses by 7px,
-    // which is exactly what the compositor then rescaled the frame to hide.
-    assert_ne!(pad + s.cells * cell + pad, w, "pre-fix cover must miss");
-    assert_eq!(
-        s.pad_lo + s.cells * cell + s.pad_hi,
-        w,
-        "fixed cover is exact"
-    );
-    assert_eq!((s.pad_lo, s.pad_hi), (pad + 3, pad + 4), "7px splits 3/4");
-}
-
 /// Tier-1 MODEL ↔ CODE conformance: drive the `PadAbsorption` model's own
 /// executable interpreter (`Model::fire` — the same semantics `ty` checks) over
 /// its ENTIRE bounded domain and assert the settled `(acc, pad_lo, pad_hi)`

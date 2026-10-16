@@ -1789,8 +1789,8 @@ fn the_host_dismisses_every_kind_of_rating_card_and_reads_a_busy_worker_busy_und
 /// holds only because a point read before any footer is waited on by its
 /// content (`aterm_agent::supervise`'s `agent_wake`): a loop that waited on
 /// the verdict slept through the footer and handed the box over as `the rm
-/// circuit breaker outside a bypass session` — this test's red under a
-/// loaded gate (2026-09-26/27), where the late start came from the load.
+/// circuit breaker outside a bypass session` — this test's failure on a
+/// loaded machine, where the late start came from the load.
 #[test]
 fn the_host_hands_over_what_it_cannot_prove_and_types_nothing() {
     // `rm_breaker_ask = true`: since 4be9d668d (the owner's "informative and
@@ -1950,8 +1950,8 @@ fn one_supervisor_per_session() {
     };
     let sel = format!("@{}", inst.sid);
     // Hold the claim through launch and program detection — past the
-    // [`HANG`] `program_is` may take. Those two control calls can be slow under
-    // a full workspace gate; an 8-second claim started here could lapse before
+    // [`HANG`] `program_is` may take. Those two control calls can be slow on
+    // a loaded machine; an 8-second claim started here could lapse before
     // the fake even begins, allowing the host to answer and exit before
     // `program_is` samples it.
     ctl_ok(
@@ -1968,8 +1968,8 @@ fn one_supervisor_per_session() {
     // The box, then a screen held for [`HOLD_S`]: the fake outlives the host's
     // answer, so the claim the last look reads is still held. A fake that exits
     // on the answer lets the host release its claim within a poll, and a look
-    // taken a second later on a loaded machine read `supervisor=-` (seen in the
-    // merge gate, 2026-10-09: the badge was gone 151 ms after the exit).
+    // taken a second later on a loaded machine reads `supervisor=-` (the badge
+    // can be gone 151 ms after the exit).
     run_fake(&inst, "k1", &["read.txt", "worked.hold"]);
     program_is(&inst, "claude", HANG);
     // Start the lease being tested only after Claude is observably running.
@@ -2021,6 +2021,49 @@ fn a_headless_instance_limited_by_its_config_supervises_nothing() {
         );
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// AUTOPILOT OFF, LIVE (the Autopilot design, 2026-10-15, §2.2): under
+/// `[harness] autopilot = "off"` the host keeps its hands off every session
+/// with no word of its own — the box waits, nothing is typed, `status` says
+/// `supervisor=-` and `autopilot=off`, and the bare `meta` names the unset
+/// word (`autopilot=-`). The session's own word `cruise` (`meta set autopilot
+/// cruise`, the chip's write) opts that one session in by hand: the host
+/// claims it and answers the box.
+#[test]
+fn autopilot_off_keeps_the_hosts_hands_off_until_the_session_opts_in() {
+    let Some(inst) = boot("ap", "autopilot = \"off\"\n") else {
+        return;
+    };
+    run_fake(&inst, "k1", &["read.txt"]);
+    program_is(&inst, "claude", HANG);
+    assert_eq!(field(&meta(&inst), "autopilot"), Some("-"));
+    let quiet_until = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < quiet_until {
+        let s = status(&inst);
+        assert_eq!(field(&s, "supervisor"), Some("-"), "{s}");
+        assert_eq!(field(&s, "autopilot"), Some("off"), "{s}");
+        assert!(
+            keys(&inst, "k1").is_empty(),
+            "typed: {:?}",
+            keys(&inst, "k1")
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    ctl_ok(
+        &inst,
+        &[
+            &format!("@{}", inst.sid),
+            "meta",
+            "set",
+            "autopilot",
+            "cruise",
+        ],
+    );
+    keys_until(&inst, "k1", &["1"], HANG);
+    // The fake ends at the press (`status autopilot=` is `-` once no agent
+    // runs); the session keeps its word.
+    assert_eq!(field(&meta(&inst), "autopilot"), Some("cruise"));
 }
 
 // ---------------------------------------------------------------------------
@@ -2416,7 +2459,7 @@ fn version_waits(inst: &Instance) -> usize {
 }
 
 /// The session's loop journal (`<sid>.journal.jsonl`): a host's step is a
-/// journal line, and a step's wait word is written nowhere else — the gate
+/// journal line, and a step's wait word is written nowhere else — the test
 /// failure of 32a51a716 could not say which wait left its restart in flight.
 fn journal(inst: &Instance) -> String {
     ["state", "home"]

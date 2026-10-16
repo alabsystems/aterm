@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! aterm-link notify --fleet <F> --broker <ep> --cap-file <p>...
-//!                   --on <attention|ask:<p>|halt>,... --exec <cmd>
+//!                   --on <attention|ask:<person>|halt>,... --exec <cmd>
 //!                   [--rate <n>/<window>] [--state DIR] [--since head|start|<off>] [--once]
 //!                   [--exec-timeout <ms>] [--tcp [--key-file <p>]]
 //! ```
@@ -63,20 +63,41 @@
 //! ## What is remembered, and where
 //!
 //! Under `<state>/notify/`, beside the bridge's own durable state, each file
-//! written the way [`crate::state`] writes its own — temp, `fsync`, `rename`:
+//! written temp, `fsync`, `rename` — [`crate::state`]'s durable tier, and for
+//! its reason: these dedup a human's notifications by bus offset, and the bus
+//! outlives a reboot:
 //!
 //! | file | what it holds |
 //! |---|---|
 //! | `cur/<key>` | the next offset to scan for one selector; MONOTONE |
 //! | `journal` | the newest [`JOURNAL_KEEP`] verdicts, `<off> firing\|fired\|dropped …` |
+//! | `log` | the identity of the bus log the two above are offsets on |
+//! | `logs/<identity>/` | `cur/` and `journal` of any other log this notifier read ([`Store::for_log`]) |
+//! | `standing` | per presence subject, the `attention=` a human was last told of ([`STANDING_KEEP`]) |
 //! | `rate` | the timestamps of the last fires, for the budget window |
 //! | `suppressed` | rate-dropped notifications a human has not been told about yet |
 //!
-//! Dedup is BY OFFSET, which is §9.3's word and the only identity a record has.
-//! A presence row that carries the same `attention=` string at a new offset is a
-//! new notification, not a duplicate: collapsing on the value would be a silent
-//! drop, which is the one thing this module refuses to do. The budget is what
-//! bounds a storm.
+//! Dedup is BY OFFSET, which is §9.3's word and the only identity a record has —
+//! and, for `attention`, ALSO BY VALUE PER SUBJECT, once per transition. A
+//! presence row is a LAST-VALUE face, not an event stream: the bridge writes a
+//! session's row again, standing `attention=` and all, on every attach (its
+//! first, every reconnect, the successor's after a seamless update), on every
+//! role, detail, phase or title change in `meta` mode, and in its `exited` row.
+//! Paged once per offset, one open escalation re-paged the human on each of
+//! those and spent the budget a genuinely new one then found empty. So a row
+//! whose `attention=` is the one the human was last TOLD of on that subject
+//! pages nobody and charges nothing (`standing=` in the closing line); a clear
+//! (`attention=-`, or none) re-arms the subject, and a raise after it pages
+//! again, the same text included. This is not the silent drop the module
+//! refuses: the publisher already collapses an unchanged value inside its own
+//! window, and every offset of the face is read in order, so a clear that
+//! reached the bus is seen before the raise after it — an escalation the bus
+//! can tell apart from the last one always pages. "Told" is a command that
+//! answered `rc=0`, as for `suppressed`: a rate-dropped escalation, or one whose
+//! command failed, leaves nothing standing, so its next republish is offered
+//! again — told twice, never untold. The one loss: a retention trim that
+//! removed a clear below this notifier's cursor before it read it. The budget is
+//! still what bounds a storm of distinct escalations.
 
 use aterm_uds::spawnfd::Stdio;
 use std::io::{self, Write};
@@ -86,9 +107,9 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use crate::body::Body;
-use crate::bridge::read_cap_file;
+use crate::bridge::ACK_DEADLINE;
 use crate::subject::{is_fleet, is_principal};
-use crate::transport::{self, Conn, Transport};
+use crate::transport::{self, Backoff, Closer, Conn, Transport};
 
 /// How many records one `Fetch` page asks for while catching up.
 const PAGE: u32 = 256;
@@ -98,6 +119,11 @@ const PAGE: u32 = 256;
 /// interrupted, and the journal has to outlive that page with room to spare.
 const JOURNAL_KEEP: usize = 1024;
 
+/// How many subjects `standing` remembers. Past it the oldest is forgotten,
+/// which can only cost a re-page of an escalation already told, never a missed
+/// one.
+const STANDING_KEEP: usize = JOURNAL_KEEP;
+
 /// The cap on the free text handed to the command. §3.2's reason, at another
 /// seam: a bounded string is one that cannot carry a sentence into somewhere it
 /// was not invited.
@@ -106,10 +132,6 @@ const TEXT_MAX: usize = 256;
 /// How often the exec wait looks at the child. Not synchronisation — the child's
 /// exit is the observable, and this only keeps the wait off a core.
 const EXEC_POLL: Duration = Duration::from_millis(10);
-
-/// The reconnect back-off floor and ceiling for a follow-mode reader.
-const RECONNECT_MIN: Duration = Duration::from_millis(100);
-const RECONNECT_MAX: Duration = Duration::from_secs(5);
 
 /// How long a notification command may run before it is killed. A hung `curl`
 /// with no timeout would wedge every later notification behind it — which is
@@ -127,6 +149,11 @@ enum Notice {
     /// not match. Sent after the page's records so the executor persists it
     /// only after it has handled every matching record in that page.
     Checkpoint(usize, u64),
+    /// The reader at this index just connected, to a broker serving the log
+    /// with this identity (`None`: one that predates identity). Sent before
+    /// any record of that connection, so the executor files each record's
+    /// verdict and cursor under the log it was read from ([`Store::for_log`]).
+    Log(usize, Option<astream_broker::LogIdentity>),
 }
 
 /// A broker reader hands one row directly to the serial notification executor.
@@ -145,7 +172,10 @@ fn notice_handoff() -> (mpsc::SyncSender<Notice>, mpsc::Receiver<Notice>) {
 pub enum Sel {
     /// A presence row carrying a non-empty `attention=` (§4.1).
     Attention,
-    /// An `ask` addressed to anyone, from this principal.
+    /// An `ask` ADDRESSED TO this principal — a session's `post to=<p>
+    /// kind=ask`, which its node publishes on `/f/<F>/in/p/<p>/<node>/ask`: how
+    /// a person is reached (§9.3). The person's own cap
+    /// ([`crate::enable::person_grants`]'s `ro:/f/<F>/in/p/<p>/>`) reads it.
     Ask(String),
     /// A fleet halt coming ON (§9.3).
     Halt,
@@ -188,8 +218,27 @@ impl Sel {
     pub fn key(&self) -> String {
         match self {
             Sel::Attention => "attention".to_string(),
-            Sel::Ask(p) => format!("ask.{p}"),
+            // `ask-to.`, not the `ask.` an older build kept for its asks FROM
+            // `<p>`: that cursor scanned another filter, and resuming this one
+            // from it would skip every ask TO `<p>` below it, unseen.
+            Sel::Ask(p) => format!("ask-to.{p}"),
             Sel::Halt => "halt".to_string(),
+        }
+    }
+
+    /// The grant that reads [`Sel::filter`], and which cap carries it — what a
+    /// refused first read names ([`Notifier::preflight`]).
+    #[must_use]
+    pub fn grant(&self, fleet: &str) -> String {
+        match self {
+            Sel::Attention => {
+                format!("`ro:/f/{fleet}/pub/>`, which node.cap and a person's cap both hold")
+            }
+            Sel::Ask(p) => format!(
+                "`ro:/f/{fleet}/in/p/{p}/>`, which {p}'s own cap holds (`aterm fabric mint-for \
+                 {p} --out <cap>` on the host that holds the fleet's mint secret)"
+            ),
+            Sel::Halt => format!("`ro:/f/{fleet}/fleet/>`, which node.cap holds"),
         }
     }
 
@@ -199,7 +248,7 @@ impl Sel {
     pub fn filter(&self, fleet: &str) -> String {
         match self {
             Sel::Attention => format!("/f/{fleet}/pub/*/*/presence"),
-            Sel::Ask(p) => format!("/f/{fleet}/in/*/*/{p}/ask"),
+            Sel::Ask(p) => format!("/f/{fleet}/in/p/{p}/*/ask"),
             Sel::Halt => format!("/f/{fleet}/fleet/*/halt"),
         }
     }
@@ -213,18 +262,20 @@ impl Sel {
     /// **Every segment it keeps is a principal, checked here**, because each one
     /// becomes an environment value of `/bin/sh -c`. They are not cap-forced: a
     /// presence row's owner, and an `ask`'s node and sid, are the SENDER's
-    /// choice, and astream refuses only wildcards and bytes below `0x20`. An
-    /// oversized segment would make `spawn` fail `E2BIG` after the rate budget
-    /// was charged. The presence arm calls [`crate::glance::Row::parse`]; the
-    /// others call [`crate::subject::is_principal`]. A refused subject is not a
-    /// hit: no journal line, no budget charged, nothing spawned.
+    /// choice, and astream's subject grammar checks structure, not shape: it
+    /// refuses wildcards, empty segments and control bytes, but no character
+    /// set, so a bidi override or a shell metacharacter arrives intact. Its
+    /// 4 KiB bound on a published subject is the broker's, and `--broker` may
+    /// name one that predates it; an oversized segment would then make `spawn`
+    /// fail `E2BIG` after the rate budget was charged. The presence arm calls
+    /// [`crate::glance::Row::parse`]; the others call
+    /// [`crate::subject::is_principal`]. A refused subject is not a hit: no
+    /// journal line, no budget charged, nothing spawned.
     fn hit(&self, fleet: &str, offset: u64, subject: &str, body: &[u8]) -> Option<Hit> {
         let segs: Vec<&str> = subject.split('/').collect();
         if segs.first() != Some(&"") || segs.get(1) != Some(&"f") || segs.get(2) != Some(&fleet) {
             return None;
         }
-        let (parsed, _) = Body::decode(body);
-        let field = |k: &str| parsed.unknown.get(k).cloned().unwrap_or_default();
         match self {
             Sel::Attention => {
                 // One reader of a presence row: the same wall `ls` and
@@ -245,43 +296,54 @@ impl Sel {
                 })
             }
             Sel::Ask(p) => {
-                if segs.len() != 8 || segs[3] != "in" || segs[7] != "ask" || segs[6] != p {
+                // `/f/<F>/in/p/<p>/<src>/ask`, by position from the left: the
+                // literal owner `p`, the watched principal, and the sender.
+                if segs.len() != 8
+                    || segs[3] != "in"
+                    || segs[4] != "p"
+                    || segs[5] != p
+                    || segs[7] != "ask"
+                {
                     return None;
                 }
-                // `parse_in`'s rule, minus the node equality it cannot check
-                // here (this reader watches every node's lane, not its own):
-                // the node segment is a principal and the sid is an `s-` one.
-                // Both are the SENDER's choice — the inbox grant cap-forces
-                // only `segs[6]`, which is the operator's own `--on ask:<p>`.
-                if !crate::subject::is_principal(segs[4]) {
+                // The sender is cap-forced (a node, or a person under a ring of
+                // its own) but still checked: it becomes `$ATERM_NOTIFY_NODE`.
+                if !crate::subject::is_principal(segs[6]) {
                     return None;
                 }
-                if !segs[5].starts_with("s-") || !crate::subject::is_principal(segs[5]) {
-                    return None;
-                }
+                let (parsed, _) = Body::decode(body);
+                // The asking session, as its node attests it in the body; any
+                // other shape is the empty string, never the raw token.
+                let sid = parsed
+                    .from
+                    .as_deref()
+                    .filter(|s| s.starts_with("s-") && crate::subject::is_principal(s))
+                    .unwrap_or_default();
                 Some(Hit {
                     on: self.label(),
                     offset,
                     subject: subject_env(subject),
-                    node: segs[4].to_string(),
-                    who: segs[6].to_string(),
-                    sid: segs[5].to_string(),
+                    node: segs[6].to_string(),
+                    who: p.clone(),
+                    sid: sid.to_string(),
                     text: one_line(&parsed.text),
                 })
             }
             Sel::Halt => {
-                if segs.len() != 6 || segs[3] != "fleet" || segs[5] != "halt" {
-                    return None;
-                }
+                // A halt the bridges apply, by their own rule
+                // ([`crate::subject::parse_halt`]): a human's row. An `a-`
+                // service's or a node's `state=on` holds no session anywhere,
+                // and waking someone for it reports a stop that never happened.
+                let row = crate::subject::parse_halt(fleet, subject, body)?;
                 // The halting principal, same wall. `fleet/<who>/halt` is
                 // cap-forced for a human's own grant, but a fleet cap that ends
                 // in `>` is not, and this segment becomes `$ATERM_NOTIFY_WHO`.
-                if !crate::subject::is_principal(segs[4]) {
+                if !crate::subject::is_principal(row.human) {
                     return None;
                 }
                 // A halt coming OFF is good news, and good news does not wake
                 // anybody at 3 a.m.
-                if field("state") != "on" {
+                if !row.on {
                     return None;
                 }
                 Some(Hit {
@@ -289,13 +351,28 @@ impl Sel {
                     offset,
                     subject: subject_env(subject),
                     node: String::new(),
-                    who: segs[4].to_string(),
+                    who: row.human.to_string(),
                     sid: String::new(),
-                    text: one_line(&crate::pct::decode(&field("reason"))),
+                    text: one_line(&crate::pct::decode(
+                        row.reason.as_deref().unwrap_or_default(),
+                    )),
                 })
             }
         }
     }
+}
+
+/// What a presence row says of its subject's escalation, for `attention`'s
+/// standing set: `None` for a row this reader does not accept (the wall
+/// [`Sel::hit`] stands behind), `Some(None)` for a row that raises none — a
+/// clear — and `Some(Some(token))` for the raw `attention=` token it raises.
+/// Raw, not decoded: [`crate::glance::Row::parse`] splits a body on
+/// whitespace, so a token is one word, and `standing` keeps it on a line.
+fn escalation(fleet: &str, offset: u64, subject: &str, body: &[u8]) -> Option<Option<String>> {
+    let row = crate::glance::Row::parse(fleet, offset, subject, body)?;
+    let raw = row.field("attention");
+    let text = crate::pct::decode(raw);
+    Some((!text.is_empty() && text != crate::glance::ABSENT).then(|| raw.to_string()))
 }
 
 /// One record worth waking a human for, reduced to the facts the command gets.
@@ -307,12 +384,14 @@ pub struct Hit {
     pub offset: u64,
     /// The full subject, verbatim.
     pub subject: String,
-    /// The node the record is about, when the subject names one.
+    /// The node the record is about, when the subject names one (for an `ask`,
+    /// the asking node).
     pub node: String,
-    /// The principal it is about (a presence row's owner, an ask's sender, the
-    /// human who halted).
+    /// The principal it is about (a presence row's owner, the person an ask is
+    /// addressed to, the human who halted).
     pub who: String,
-    /// The addressed session, for an `ask`.
+    /// The asking session, for an `ask`: with [`Hit::node`], the
+    /// `to=@<sid>@<node>` an answer goes to.
     pub sid: String,
     /// The free text, flattened and capped. UNTRUSTED, and it never becomes a
     /// shell word.
@@ -363,6 +442,20 @@ pub enum Since {
 
 /// `<state>/notify/` — the four files above, written the way the state dir
 /// writes its own.
+///
+/// THE CURSORS AND THE JOURNAL ARE ONE LOG'S. Both are bus offsets, and an
+/// offset names a record in one log only: pointed at a log that was deleted
+/// and recreated, repaired, restored, or another host's, a `cur/` past its
+/// head pages to an empty "head" and subscribes beyond every escalation below
+/// it, and a journal verdict keyed by a bare offset skips a new record that
+/// reuses it. So they are filed by the log's identity ([`Store::for_log`]):
+/// the root's are the log `notify/log` names (the first one this notifier
+/// read under an identity — the files from before identity were that log's),
+/// and any other log's live in `notify/logs/<identity>/`, where a log this
+/// notifier has never read starts the way a first run does, from `--since`.
+/// The rate budget and the `suppressed` count are the human's, not a log's,
+/// and stay at the root.
+#[derive(Clone)]
 struct Store {
     root: PathBuf,
 }
@@ -396,6 +489,54 @@ impl Store {
             .ok()
             .map(|s| s.trim_end_matches('\n').to_string())
             .filter(|s| !s.is_empty())
+    }
+
+    /// The store whose `cur/` and `journal` are the log `log`'s
+    /// ([`Store`]'s doc): this root for a broker that predates identity, for
+    /// the log the root's `log` file names, and — recorded there — for the
+    /// first identity read; `logs/<identity>/` for any other.
+    fn for_log(&self, log: Option<astream_broker::LogIdentity>) -> io::Result<Store> {
+        let Some(log) = log else {
+            return Ok(self.clone());
+        };
+        let name = log.to_string();
+        let path = self.root.join("log");
+        // Only an absent identity file permits the first claim. An unreadable
+        // or damaged witness cannot turn the existing cursors and journal into
+        // another log's state. A dangling symlink is an existing, unreadable
+        // witness too, not an absent file to replace.
+        let owner = match std::fs::read_to_string(&path) {
+            Ok(saved) => Some(
+                astream_broker::LogIdentity::parse(saved.trim_end_matches('\n')).ok_or_else(
+                    || {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("{}: invalid notifier log identity", path.display()),
+                        )
+                    },
+                )?,
+            ),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                match std::fs::symlink_metadata(&path) {
+                    Err(missing) if missing.kind() == io::ErrorKind::NotFound => None,
+                    Err(other) => return Err(other),
+                    Ok(_) => return Err(e),
+                }
+            }
+            Err(e) => return Err(e),
+        };
+        match owner {
+            None => {
+                self.write("log", &name)?;
+                Ok(self.clone())
+            }
+            Some(owner) if owner == log => Ok(self.clone()),
+            Some(_) => {
+                let root = self.root.join("logs").join(&name);
+                std::fs::create_dir_all(root.join("cur"))?;
+                Ok(Store { root })
+            }
+        }
     }
 
     fn cursor(&self, key: &str) -> Option<u64> {
@@ -432,6 +573,28 @@ impl Store {
     fn set_stamps(&self, stamps: &[u64]) -> io::Result<()> {
         let joined: Vec<String> = stamps.iter().map(u64::to_string).collect();
         self.write("rate", &joined.join(","))
+    }
+
+    /// `<subject> <attention token>` per line, the oldest first. Both are one
+    /// word by construction ([`escalation`]); a line that is not two words is
+    /// skipped, which can only cost a re-page.
+    fn standing(&self) -> Vec<(String, String)> {
+        self.read("standing")
+            .map(|s| {
+                s.lines()
+                    .filter_map(|l| {
+                        let (subject, token) = l.split_once(' ')?;
+                        (!subject.is_empty() && !token.is_empty() && !token.contains(' '))
+                            .then(|| (subject.to_string(), token.to_string()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn set_standing(&self, rows: &[(String, String)]) -> io::Result<()> {
+        let lines: Vec<String> = rows.iter().map(|(s, t)| format!("{s} {t}")).collect();
+        self.write("standing", &lines.join("\n"))
     }
 
     fn suppressed(&self) -> u64 {
@@ -518,12 +681,26 @@ pub struct Counts {
     pub dup: u64,
     pub skipped: u64,
     pub dropped: u64,
+    /// `attention` rows that republished the escalation a human was already
+    /// told of on that subject: no command, no journal line, no budget.
+    pub standing: u64,
 }
 
 struct Notifier {
     cfg: Config,
     store: Store,
+    /// The store of the log this notifier is reading NOW ([`Store::for_log`]):
+    /// where its cursors and `journal` are read and written.
+    log_store: Store,
+    /// That log's identity, `None` for a broker that predates one.
+    log_now: Option<astream_broker::LogIdentity>,
+    /// The log each follow-mode reader's connection last reached
+    /// ([`Notice::Log`]), by selector index.
+    reader_log: Vec<Option<astream_broker::LogIdentity>>,
     journal: Vec<String>,
+    /// The log in hand's `standing` ([`Store::standing`]): per presence
+    /// subject, the `attention=` token a human was last told of.
+    standing: Vec<(String, String)>,
     stamps: Vec<u64>,
     suppressed: u64,
     fault: Fault,
@@ -536,8 +713,12 @@ impl Notifier {
         let fault = Fault::from_env(&store);
         Ok(Self {
             journal: store.journal(),
+            standing: store.standing(),
             stamps: store.stamps(),
             suppressed: store.suppressed(),
+            log_store: store.clone(),
+            log_now: None,
+            reader_log: vec![None; cfg.on.len()],
             store,
             cfg,
             fault,
@@ -545,15 +726,94 @@ impl Notifier {
         })
     }
 
-    /// One broker connection with every capability attached.
+    /// One broker connection with every capability attached, every exchange on
+    /// it bounded by [`ACK_DEADLINE`]: a wedged broker ends `--once` with an
+    /// error, not a cron run that never exits.
     fn connect(&self) -> io::Result<Conn> {
-        let (mut conn, _closer) = transport::connect(&self.cfg.transport, &self.cfg.broker)?;
+        let (mut conn, _closer) =
+            transport::connect(&self.cfg.transport, &self.cfg.broker, ACK_DEADLINE)?;
+        transport::attach_cap_files(&mut conn, &self.cfg.cap_files)?;
+        Ok(conn)
+    }
+
+    /// Read and write cursors and verdicts as the log `log`'s from here on
+    /// ([`Store::for_log`]), loading its journal when that is another log
+    /// than the one in hand. Said once on stderr: the human reading it learns
+    /// why escalations already journalled are not skipped on this log.
+    fn scope_to(&mut self, log: Option<astream_broker::LogIdentity>) -> io::Result<()> {
+        if log == self.log_now {
+            return Ok(());
+        }
+        let scoped = self.store.for_log(log)?;
+        if scoped.root != self.log_store.root {
+            eprintln!(
+                "aterm-link notify: the broker serves {} — its cursors and journal are {}",
+                log.map_or_else(
+                    || "a log with no identity".to_string(),
+                    |l| format!("log {l}")
+                ),
+                scoped.root.display()
+            );
+            self.journal = scoped.journal();
+            self.standing = scoped.standing();
+        }
+        self.log_store = scoped;
+        self.log_now = log;
+        Ok(())
+    }
+
+    /// THE GRANTS, CHECKED ONCE, BEFORE ANYTHING RUNS. A cap file that cannot
+    /// be read, a ring the broker refuses, or a selector whose filter no
+    /// attached grant covers is a configuration that can never succeed — a
+    /// follow-mode reader would retry it every few seconds for ever and a
+    /// `--once` would stop at it before the selectors after it ran — so it is
+    /// a refusal naming what is missing. Only a PERMANENT answer
+    /// ([`astream_broker::BrokerRefusal::is_permanent`]) refuses: a broker that
+    /// cannot be reached, or one that refuses for now, is left to the readers'
+    /// own back-off, which is how this notifier outlives a broker restart.
+    ///
+    /// # Errors
+    ///
+    /// What is missing, in words.
+    fn preflight(&self) -> Result<(), String> {
         for path in &self.cfg.cap_files {
-            for cap in read_cap_file(path)? {
-                conn.attach(&cap.grant, &cap.tag)?;
+            crate::bridge::read_cap_file(path).map_err(|e| format!("--cap-file {path}: {e}"))?;
+        }
+        let permanent = |e: &io::Error| {
+            astream_broker::broker_refusal(e)
+                .is_some_and(astream_broker::BrokerRefusal::is_permanent)
+        };
+        let Ok((mut conn, _closer)) =
+            transport::connect(&self.cfg.transport, &self.cfg.broker, ACK_DEADLINE)
+        else {
+            return Ok(());
+        };
+        match transport::attach_cap_files(&mut conn, &self.cfg.cap_files) {
+            Ok(()) => {}
+            Err(e) if permanent(&e) => {
+                return Err(format!(
+                    "the broker refused the cap files ({}): {e}",
+                    self.cfg.cap_files.join(" ")
+                ));
+            }
+            Err(_) => return Ok(()),
+        }
+        for sel in &self.cfg.on {
+            let filter = sel.filter(&self.cfg.fleet);
+            match conn.fetch(0, &filter, 0) {
+                Ok(_) => {}
+                Err(e) if permanent(&e) => {
+                    return Err(format!(
+                        "--on {} reads {filter}, and the broker refused it ({e}): no --cap-file \
+                         grants it. It needs {}",
+                        sel.label(),
+                        sel.grant(&self.cfg.fleet)
+                    ));
+                }
+                Err(_) => return Ok(()),
             }
         }
-        Ok(conn)
+        Ok(())
     }
 
     /// The verdict the journal holds for an offset, if any.
@@ -570,6 +830,42 @@ impl Notifier {
         })
     }
 
+    /// Whether the journal's verdict for `off` says a human was TOLD: a
+    /// `fired` line whose command answered `rc=0`, the module doc's rule.
+    fn told(&self, off: u64) -> bool {
+        self.journal.iter().any(|line| {
+            let mut it = line.split_whitespace();
+            it.next().and_then(|t| t.parse::<u64>().ok()) == Some(off)
+                && it.next() == Some("fired")
+                && it.any(|t| t == "rc=0")
+        })
+    }
+
+    /// The `attention=` token a human was last told of on `subject`.
+    fn standing_of(&self, subject: &str) -> Option<&str> {
+        self.standing
+            .iter()
+            .find(|(s, _)| s == subject)
+            .map(|(_, t)| t.as_str())
+    }
+
+    /// Make `token` the escalation standing on `subject` (`None`: nothing
+    /// stands there), durably, keeping the newest [`STANDING_KEEP`] subjects.
+    /// Written only when it changes, so a republished row writes nothing.
+    fn set_standing(&mut self, subject: &str, token: Option<&str>) -> io::Result<()> {
+        if self.standing_of(subject) == token {
+            return Ok(());
+        }
+        self.standing.retain(|(s, _)| s != subject);
+        if let Some(token) = token {
+            self.standing.push((subject.to_string(), token.to_string()));
+        }
+        while self.standing.len() > STANDING_KEEP {
+            self.standing.remove(0);
+        }
+        self.log_store.set_standing(&self.standing)
+    }
+
     /// Write one verdict, replacing any the offset already had, and keep the
     /// newest [`JOURNAL_KEEP`].
     fn record(&mut self, off: u64, line: String) -> io::Result<()> {
@@ -583,7 +879,7 @@ impl Notifier {
         while self.journal.len() > JOURNAL_KEEP {
             self.journal.remove(0);
         }
-        self.store.set_journal(&self.journal)
+        self.log_store.set_journal(&self.journal)
     }
 
     /// Whether the budget has room, at `now`. Stamps outside the window are
@@ -611,19 +907,48 @@ impl Notifier {
 
     /// One record off the bus, already matched against `sel`.
     fn on_record(&mut self, sel: &Sel, off: u64, subject: &str, body: &[u8]) -> io::Result<()> {
+        // `attention` IS A LAST-VALUE FACE (the module doc): what the row says
+        // of its subject's escalation decides before anything else whether it
+        // is news. A clear re-arms the subject; a raise of ANOTHER value means
+        // the one standing there is not standing any more, told or not.
+        let raised = match sel {
+            Sel::Attention => match escalation(&self.cfg.fleet, off, subject, body) {
+                None => return Ok(()),
+                Some(None) => return self.set_standing(subject, None),
+                Some(Some(token)) => {
+                    if self.standing_of(subject).is_some_and(|t| t != token) {
+                        self.set_standing(subject, None)?;
+                    }
+                    Some(token)
+                }
+            },
+            Sel::Ask(_) | Sel::Halt => None,
+        };
         let Some(hit) = sel.hit(&self.cfg.fleet, off, subject, body) else {
             return Ok(());
         };
         let dup = match self.verdict(off) {
             // Terminal: this offset has had its answer. Never fired twice, and
-            // never re-offered after the window rolls.
+            // never re-offered after the window rolls. A replay of a TOLD
+            // escalation puts it back as standing — the re-scan of a page a
+            // crash interrupted can deliver its subject's earlier clear first.
             Some("fired" | "dropped") => {
+                if let Some(token) = raised.as_deref().filter(|_| self.told(off)) {
+                    self.set_standing(subject, Some(token))?;
+                }
                 self.counts.skipped += 1;
                 return Ok(());
             }
             // IN DOUBT — a crash between the spawn and the completion. Fire
             // again and say so; see the module doc for why this direction.
             Some(_) => true,
+            // THE ESCALATION THE HUMAN WAS ALREADY TOLD OF, republished — an
+            // attach, a reconnect, an update's successor, a phase change, the
+            // `exited` row. Not news: no command, no journal line, no budget.
+            None if raised.is_some() && self.standing_of(subject) == raised.as_deref() => {
+                self.counts.standing += 1;
+                return Ok(());
+            }
             None => false,
         };
         let now = crate::now_ms();
@@ -665,6 +990,11 @@ impl Notifier {
         if carried > 0 && verdict == "rc=0" {
             self.suppressed -= carried;
             self.store.set_suppressed(self.suppressed)?;
+        }
+        // AND ONLY A TOLD ESCALATION STANDS, after its `fired` line: a crash
+        // between the two is the replay above, which reads the line back.
+        if let Some(token) = raised.as_deref().filter(|_| verdict == "rc=0") {
+            self.set_standing(subject, Some(token))?;
         }
         if dup {
             self.counts.dup += 1;
@@ -717,7 +1047,7 @@ impl Notifier {
                             );
                             "rc=signalled".to_string()
                         }
-                    }
+                    };
                 }
                 Ok(None) => {}
                 Err(e) => {
@@ -740,7 +1070,7 @@ impl Notifier {
 
     /// Where a selector's scan starts: its cursor, or `--since`.
     fn start_offset(&self, conn: &mut Conn, sel: &Sel) -> io::Result<u64> {
-        if let Some(off) = self.store.cursor(&sel.key()) {
+        if let Some(off) = self.log_store.cursor(&sel.key()) {
             return Ok(off);
         }
         Ok(match self.cfg.since {
@@ -755,6 +1085,8 @@ impl Notifier {
     /// it is also what a follow-mode reader's first subscription replays.
     fn catch_up(&mut self) -> io::Result<()> {
         let mut conn = self.connect()?;
+        let log = log_of(&mut conn, &self.cfg)?;
+        self.scope_to(log)?;
         for sel in self.cfg.on.clone() {
             let filter = sel.filter(&self.cfg.fleet);
             let key = sel.key();
@@ -764,7 +1096,7 @@ impl Notifier {
                 for (off, subject, body) in rows {
                     self.on_record(&sel, off, &subject, &body)?;
                 }
-                self.store.set_cursor(&key, next)?;
+                self.log_store.set_cursor(&key, next)?;
                 if next >= head || next <= from {
                     break;
                 }
@@ -791,16 +1123,23 @@ impl Notifier {
         drop(tx);
         while let Ok(notice) = rx.recv() {
             match notice {
+                Notice::Log(idx, log) => {
+                    if let Some(slot) = self.reader_log.get_mut(idx) {
+                        *slot = log;
+                    }
+                }
                 Notice::Record(idx, off, subject, body) => {
                     let Some(sel) = self.cfg.on.get(idx).cloned() else {
                         continue;
                     };
+                    self.scope_to(self.reader_log[idx])?;
                     self.on_record(&sel, off, &subject, &body)?;
-                    self.store.set_cursor(&sel.key(), off + 1)?;
+                    self.log_store.set_cursor(&sel.key(), off + 1)?;
                 }
                 Notice::Checkpoint(idx, next) => {
-                    if let Some(sel) = self.cfg.on.get(idx) {
-                        self.store.set_cursor(&sel.key(), next)?;
+                    if let Some(key) = self.cfg.on.get(idx).map(Sel::key) {
+                        self.scope_to(self.reader_log[idx])?;
+                        self.log_store.set_cursor(&key, next)?;
                     }
                 }
             }
@@ -822,18 +1161,30 @@ impl Notifier {
 /// It re-reads the cursor from DISK on every reconnect and never resumes below
 /// what it has already forwarded, so a reconnect replays at most the records the
 /// executor had not finished with — which the journal then dedups. The paged
-/// scan matters: astream's plain subscription snapshots every retained record
-/// from its cursor into an Arc-pointer vector, so subscribing directly from a
-/// stale cursor would exchange startup latency for a broker-side memory spike.
+/// scan is what moves the durable cursor across records this selector does NOT
+/// match: a `Fetch` page's `next` is the offset after the last record the
+/// broker scanned, and the per-page `Checkpoint` persists it. A subscription
+/// reports only matches, so a sparse selector (`halt`, `ask:<p>`) subscribed
+/// straight from a stale cursor would restart from its last match after every
+/// restart. (Broker memory is not the reason: astream's catch-up copies the log
+/// a bounded `TAIL_CHUNK` at a time.)
 fn reader(idx: usize, sel: &Sel, cfg: &Config, root: &Path, tx: &mpsc::SyncSender<Notice>) {
     let filter = sel.filter(&cfg.fleet);
     let key = sel.key();
     let mut seen: Option<u64> = None;
-    let mut backoff = RECONNECT_MIN;
+    // The log the offsets in `seen` were read on: a reconnect to ANOTHER log
+    // never resumes from them ([`Store::for_log`]).
+    let mut seen_on: Option<PathBuf> = None;
+    // Reset only by a connection that stayed up, so a broker that accepts and
+    // then refuses or drops is redialled under the back-off, not every 100 ms.
+    let mut backoff = Backoff::default();
     loop {
-        match connect_for_reader(cfg, root, &key, &filter, seen) {
-            Ok((mut conn, mut from)) => {
-                backoff = RECONNECT_MIN;
+        let wait = match connect_for_reader(cfg, root, &key, &filter, &mut seen, &mut seen_on) {
+            Ok((mut conn, closer, mut from, log)) => {
+                if tx.send(Notice::Log(idx, log)).is_err() {
+                    return; // the executor is gone
+                }
+                backoff.attached(Instant::now());
                 let mut closed = false;
                 loop {
                     let (rows, (next, head)) = match conn.fetch(from, &filter, PAGE) {
@@ -863,46 +1214,55 @@ fn reader(idx: usize, sel: &Sel, cfg: &Config, root: &Path, tx: &mpsc::SyncSende
                         break;
                     }
                 }
-                if closed {
-                    std::thread::sleep(backoff);
-                    backoff = (backoff * 2).min(RECONNECT_MAX);
-                    continue;
-                }
-                let mut sub = match conn.subscribe(from, &filter) {
-                    Ok(sub) => sub,
-                    Err(e) => {
-                        eprintln!(
+                if !closed {
+                    match conn.subscribe(from, &filter) {
+                        Ok(mut sub) => {
+                            // Following is parking in `recv`: the read bound
+                            // the catch-up ran under comes off here, and comes
+                            // back as a LIVENESS bound on the broker's first
+                            // idle mark — so a link that went silent without a
+                            // FIN ends the subscription and is redialled,
+                            // instead of parking this reader for good.
+                            let _ = closer.set_read_timeout(None);
+                            loop {
+                                match sub.recv_live(&closer, astream_broker::IDLE_MARK_DEADLINE) {
+                                    Ok(Some((off, subject, body))) => {
+                                        if tx.send(Notice::Record(idx, off, subject, body)).is_err()
+                                        {
+                                            return; // the executor is gone
+                                        }
+                                        seen = Some(seen.map_or(off + 1, |s| s.max(off + 1)));
+                                    }
+                                    Ok(None) => break,
+                                    Err(e) => {
+                                        eprintln!(
+                                            "aterm-link notify: {} subscription ended: {e}",
+                                            sel.label()
+                                        );
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => eprintln!(
                             "aterm-link notify: {} could not subscribe: {e}",
                             sel.label()
-                        );
-                        std::thread::sleep(backoff);
-                        backoff = (backoff * 2).min(RECONNECT_MAX);
-                        continue;
-                    }
-                };
-                loop {
-                    match sub.recv() {
-                        Ok(Some((off, subject, body))) => {
-                            if tx.send(Notice::Record(idx, off, subject, body)).is_err() {
-                                return; // the executor is gone
-                            }
-                            seen = Some(seen.map_or(off + 1, |s| s.max(off + 1)));
-                        }
-                        Ok(None) => break,
-                        Err(e) => {
-                            eprintln!("aterm-link notify: {} subscription ended: {e}", sel.label());
-                            break;
-                        }
+                        ),
                     }
                 }
+                backoff.lost(Instant::now())
             }
-            Err(e) => eprintln!(
-                "aterm-link notify: {} could not subscribe: {e}",
-                sel.label()
-            ),
+            Err(e) => {
+                eprintln!(
+                    "aterm-link notify: {} could not subscribe: {e}",
+                    sel.label()
+                );
+                Some(backoff.failed())
+            }
+        };
+        if let Some(wait) = wait {
+            std::thread::sleep(wait);
         }
-        std::thread::sleep(backoff);
-        backoff = (backoff * 2).min(RECONNECT_MAX);
     }
 }
 
@@ -915,17 +1275,23 @@ fn connect_for_reader(
     root: &Path,
     key: &str,
     filter: &str,
-    seen: Option<u64>,
-) -> io::Result<(Conn, u64)> {
+    seen: &mut Option<u64>,
+    seen_on: &mut Option<PathBuf>,
+) -> io::Result<(Conn, Closer, u64, Option<astream_broker::LogIdentity>)> {
+    let (mut conn, closer) = transport::connect(&cfg.transport, &cfg.broker, ACK_DEADLINE)?;
+    transport::attach_cap_files(&mut conn, &cfg.cap_files)?;
+    // THE CURSOR IS THIS LOG'S ([`Store::for_log`]), and so is what this
+    // thread forwarded: offsets read on another log name nothing here.
+    let log = log_of(&mut conn, cfg)?;
     let store = Store {
         root: root.to_path_buf(),
-    };
-    let (mut conn, _closer) = transport::connect(&cfg.transport, &cfg.broker)?;
-    for path in &cfg.cap_files {
-        for cap in read_cap_file(path)? {
-            conn.attach(&cap.grant, &cap.tag)?;
-        }
     }
+    .for_log(log)?;
+    if seen_on.as_ref().is_some_and(|on| *on != store.root) {
+        *seen = None;
+    }
+    *seen_on = Some(store.root.clone());
+    let seen = *seen;
     let from = match (store.cursor(key), seen) {
         (Some(c), Some(s)) => c.max(s),
         (Some(c), None) => c,
@@ -940,7 +1306,18 @@ fn connect_for_reader(
             }
         },
     };
-    Ok((conn, from))
+    Ok((conn, closer, from, log))
+}
+
+/// The identity of the log `conn` reaches: what its attach's `Hello` answered,
+/// or — with no cap file, so no `Hello` went — one asked for now. `None` is a
+/// broker that predates identity.
+fn log_of(conn: &mut Conn, cfg: &Config) -> io::Result<Option<astream_broker::LogIdentity>> {
+    match conn.seen_log_identity() {
+        Some(log) => Ok(Some(log)),
+        None if cfg.cap_files.is_empty() => conn.log_identity(),
+        None => Ok(None),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -952,9 +1329,14 @@ const USAGE: &str = "\
 aterm-link notify — run a command when the fabric needs a human
 
   aterm-link notify --fleet <F> --broker <ep> --cap-file <path>...
-                    --on <attention|ask:<p>|halt>,... --exec <cmd> [options]
+                    --on <attention|ask:<person>|halt>,... --exec <cmd> [options]
 
-  --on <sel>,...         what is worth waking someone for; repeatable
+  --on <sel>,...         what is worth waking someone for; repeatable.
+                         attention: a presence row raising one (node.cap reads it);
+                         ask:<person>: an ask a session posted to=<person>, read
+                         with that person's cap (`aterm fabric mint-for <person>`);
+                         halt: a fleet halt coming on (node.cap reads it). A
+                         selector no --cap-file grants is refused, exit 2
   --exec <cmd>           run as `/bin/sh -c <cmd>`; record facts arrive only in
                          $ATERM_NOTIFY_*, never in <cmd>
   --rate <n>/<window>    the budget, e.g. 10/1m, 1/30s, 40/1h (default 10/1m)
@@ -965,8 +1347,10 @@ aterm-link notify — run a command when the fabric needs a human
   --tcp                  reach the broker over TCP — PLAINTEXT unless --key-file
   --key-file <path>      the sealed wire's key (needs --tcp and a `sealed` build)
 
-The command runs once per matching offset, deduped across restarts. A crash
-during the exec re-fires it with ATERM_NOTIFY_DUP=1: twice, never zero times.
+The command runs once per matching offset, deduped across restarts, and for
+attention once per escalation: a session's row republished with the attention
+it was told of pages nobody; a clear and a raise pages again. A crash during
+the exec re-fires it with ATERM_NOTIFY_DUP=1: twice, never zero times.
 ";
 
 /// `aterm-link notify`.
@@ -998,6 +1382,10 @@ pub fn main(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if let Err(e) = notifier.preflight() {
+        eprintln!("aterm-link notify: {e}");
+        return ExitCode::from(2);
+    }
     let outcome = if once {
         notifier.catch_up()
     } else {
@@ -1005,8 +1393,8 @@ pub fn main(args: &[String]) -> ExitCode {
     };
     let c = notifier.counts;
     println!(
-        "notify: fired={} dup={} skipped={} dropped={} suppressed={}",
-        c.fired, c.dup, c.skipped, c.dropped, notifier.suppressed
+        "notify: fired={} dup={} skipped={} dropped={} suppressed={} standing={}",
+        c.fired, c.dup, c.skipped, c.dropped, notifier.suppressed, c.standing
     );
     match outcome {
         Ok(()) => ExitCode::SUCCESS,
@@ -1118,14 +1506,17 @@ fn parse_rate(s: &str) -> Result<(u32, u64), String> {
     if limit == 0 {
         return Err(format!("--rate {s}: a limit of 0 drops every notification"));
     }
-    let (digits, unit) = window.split_at(window.len().saturating_sub(1));
-    let count: u64 = digits.parse().map_err(|_| bad())?;
-    let ms = match unit {
-        "s" => count * 1_000,
-        "m" => count * 60_000,
-        "h" => count * 3_600_000,
-        _ => return Err(bad()),
+    let (digits, scale) = if let Some(digits) = window.strip_suffix('s') {
+        (digits, 1_000)
+    } else if let Some(digits) = window.strip_suffix('m') {
+        (digits, 60_000)
+    } else if let Some(digits) = window.strip_suffix('h') {
+        (digits, 3_600_000)
+    } else {
+        return Err(bad());
     };
+    let count: u64 = digits.parse().map_err(|_| bad())?;
+    let ms = count.checked_mul(scale).ok_or_else(bad)?;
     if ms == 0 {
         return Err(format!("--rate {s}: the window must be non-zero"));
     }
@@ -1182,8 +1573,10 @@ mod tests {
     }
 
     /// Every subject segment that becomes an environment value is a principal:
-    /// a sender-chosen 200 000-byte segment would otherwise fail `spawn` with
-    /// `E2BIG` after the budget slot was charged.
+    /// a bidi override passes astream's subject grammar, and a sender-chosen
+    /// 200 000-byte segment, which a broker without the 4 KiB name bound
+    /// passes, would fail `spawn` with `E2BIG` after the budget slot was
+    /// charged.
     #[test]
     fn a_subject_segment_that_is_not_a_principal_never_becomes_an_environment_value() {
         let huge = "x".repeat(200_000);
@@ -1191,16 +1584,28 @@ mod tests {
 
         let ask = Sel::Ask("h-andrew".into());
         assert!(ask
-            .hit("f1", 7, "/f/f1/in/n-a/s-b/h-andrew/ask", b"v=1 t=1 text=hi")
+            .hit(
+                "f1",
+                7,
+                "/f/f1/in/p/h-andrew/n-a/ask",
+                b"v=1 t=1 from=s-b text=hi"
+            )
             .is_some());
         for bad in [
-            format!("/f/f1/in/n-a/{huge}/h-andrew/ask"), // the SENDER's sid
-            format!("/f/f1/in/{huge}/s-b/h-andrew/ask"), // the SENDER's node
-            format!("/f/f1/in/n-a/{bidi}/h-andrew/ask"), // a bidi override
-            "/f/f1/in/n-a/h-b/h-andrew/ask".to_string(), // a sid that is not s-
-            "/f/f1/in/NODE/s-b/h-andrew/ask".to_string(), // not lowercase
+            format!("/f/f1/in/p/h-andrew/{huge}/ask"), // the SENDER's node
+            format!("/f/f1/in/p/h-andrew/{bidi}/ask"), // a bidi override
+            "/f/f1/in/p/h-andrew/NODE/ask".to_string(), // not lowercase
         ] {
             assert_eq!(ask.hit("f1", 7, &bad, b"v=1 t=1"), None, "{}", &bad[..40]);
+        }
+        // The asking SESSION rides in the body, the node's word: a `from=` that
+        // is not an `s-` principal is no sid at all, never the raw token.
+        for from in [huge.as_str(), bidi, "h-b"] {
+            let body = format!("v=1 t=1 from={from} text=hi");
+            let hit = ask
+                .hit("f1", 7, "/f/f1/in/p/h-andrew/n-a/ask", body.as_bytes())
+                .expect("the subject is honest");
+            assert_eq!(hit.sid, "", "{}", &from[..from.len().min(40)]);
         }
 
         let att = Sel::Attention;
@@ -1226,7 +1631,12 @@ mod tests {
 
         // And what does pass is bounded by `TEXT_MAX`.
         let hit = ask
-            .hit("f1", 7, "/f/f1/in/n-a/s-b/h-andrew/ask", b"v=1 t=1 text=hi")
+            .hit(
+                "f1",
+                7,
+                "/f/f1/in/p/h-andrew/n-a/ask",
+                b"v=1 t=1 from=s-b text=hi",
+            )
             .expect("the honest ask");
         for v in [&hit.subject, &hit.node, &hit.who, &hit.sid, &hit.text] {
             assert!(v.len() <= TEXT_MAX, "{v} is {} bytes", v.len());
@@ -1261,24 +1671,29 @@ mod tests {
     }
 
     /// THE SELECTORS MATCH BY POSITION, and an over-long subject is not a hit
-    /// however its tail reads. `…/in/n-a/s-b/s-1/h-andrew/ask` has a
-    /// right-anchored reading in which `h-andrew` asked; parsing from the left
-    /// makes it a nine-segment subject and nothing else.
+    /// however its tail reads. `ask:<p>` is an ask ADDRESSED TO `<p>` — the
+    /// `/f/<F>/in/p/<p>/<node>/ask` a session's `post to=<p> kind=ask` lands on
+    /// — and never one `<p>` sent, which reads `…/in/<node>/<sid>/<p>/ask`.
     #[test]
     fn a_selector_matches_by_position_and_an_overlong_subject_never_matches() {
         let ask = Sel::Ask("h-andrew".into());
-        let honest = "/f/f1/in/n-a/s-b/h-andrew/ask";
+        let honest = "/f/f1/in/p/h-andrew/n-a/ask";
         let hit = ask
-            .hit("f1", 7, honest, b"v=1 t=1 text=is%20this%20ok%3F")
-            .expect("the honest seven-segment ask matches");
-        assert_eq!((hit.who.as_str(), hit.sid.as_str()), ("h-andrew", "s-b"));
+            .hit("f1", 7, honest, b"v=1 t=1 from=s-b text=is%20this%20ok%3F")
+            .expect("the honest ask to h-andrew matches");
+        assert_eq!(
+            (hit.who.as_str(), hit.node.as_str(), hit.sid.as_str()),
+            ("h-andrew", "n-a", "s-b")
+        );
         assert_eq!(hit.text, "is this ok?");
         for bad in [
-            "/f/f1/in/n-a/s-b/s-1/h-andrew/ask", // eight segments, forged tail
-            "/f/f1/in/n-a/s-b/s-1/ask",          // a different sender
-            "/f/f1/in/n-a/s-b/h-andrew/note",    // a different kind
-            "/f/f2/in/n-a/s-b/h-andrew/ask",     // another fleet
-            "/f/f1/pub/n-a/s-b/h-andrew/ask",    // another face
+            "/f/f1/in/n-a/s-b/h-andrew/ask",   // an ask FROM h-andrew
+            "/f/f1/in/p/h-andrew/n-a/s-1/ask", // nine segments, forged tail
+            "/f/f1/in/p/h-other/n-a/ask",      // to someone else
+            "/f/f1/in/p/h-andrew/n-a/note",    // a different kind
+            "/f/f2/in/p/h-andrew/n-a/ask",     // another fleet
+            "/f/f1/pub/p/h-andrew/n-a/ask",    // another face
+            "/f/f1/in/n-a/h-andrew/n-b/ask",   // no literal `p` owner
         ] {
             assert_eq!(ask.hit("f1", 7, bad, b"v=1 t=1"), None, "{bad}");
         }
@@ -1315,6 +1730,16 @@ mod tests {
             .hit("f1", 4, lane, b"v=1 t=1 state=on reason=main%20broken")
             .is_some());
         assert_eq!(halt.hit("f1", 4, lane, b"v=1 t=1 state=off"), None);
+        // And a halt no bridge applies wakes nobody either: a bridge holds a
+        // session for a HUMAN's row alone, so an `a-` service's or a node's
+        // `state=on` is a stop that never happened.
+        for lane in ["/f/f1/fleet/a-svc/halt", "/f/f1/fleet/n-node/halt"] {
+            assert_eq!(
+                halt.hit("f1", 4, lane, b"v=1 t=1 state=on reason=stop"),
+                None,
+                "{lane}"
+            );
+        }
     }
 
     /// UNTRUSTED TEXT IS FLATTENED. An attention string can carry any byte a cap
@@ -1349,6 +1774,174 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A notifier over `dir` whose command appends each offset it is run for to
+    /// `<dir>/fired`, under a budget of `limit` (and `exec` in front of it).
+    fn appending(dir: &str, limit: u32, exec: &str) -> (Notifier, PathBuf) {
+        std::fs::create_dir_all(dir).expect("scratch");
+        let fired = Path::new(dir).join("fired");
+        let mut c = cfg(dir);
+        c.limit = limit;
+        c.exec = format!(
+            "{exec}printf '%s\\n' \"$ATERM_NOTIFY_OFFSET\" >> {}",
+            fired.display()
+        );
+        (Notifier::new(c).expect("open"), fired)
+    }
+
+    fn fired_offsets(fired: &Path) -> Vec<u64> {
+        std::fs::read_to_string(fired)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| l.trim().parse().ok())
+            .collect()
+    }
+
+    fn feed(n: &mut Notifier, off: u64, sid: &str, body: &str) {
+        let subject = format!("/f/f1/pub/n-a/{sid}/presence");
+        n.on_record(&Sel::Attention, off, &subject, body.as_bytes())
+            .expect("on_record");
+    }
+
+    /// **A STANDING ATTENTION PAGES ONCE PER TRANSITION, NOT ONCE PER OFFSET**
+    /// (r3-22). Presence is a last-value face the bridge rewrites on every
+    /// attach, reconnect, successor after an update, meta change and exit,
+    /// standing `attention=` and all. s-one raises "needs a key": it pages.
+    /// Its row republished by an attach (`inc=2`), a phase change and its
+    /// `exited` row pages nobody and charges nothing — the negative control:
+    /// offset dedup alone ran the command for all four. s-two's identical text
+    /// is s-two's own escalation and pages. A clear and the same text again
+    /// pages; so does another value, and the first value after it. A restart
+    /// remembers what stands. And the re-scan of a page a crash interrupted —
+    /// the clear below an escalation already told, then that escalation —
+    /// leaves it standing, so its next republish pages nobody.
+    #[test]
+    fn a_standing_attention_pages_once_per_transition_not_once_per_offset() {
+        let dir = scratch("standing");
+        let (mut n, fired) = appending(&dir, 100, "");
+        let key = "attention=needs%20a%20key";
+        feed(
+            &mut n,
+            1,
+            "s-one",
+            &format!("v=1 t=1 state=live inc=1 {key}"),
+        );
+        feed(
+            &mut n,
+            2,
+            "s-one",
+            &format!("v=1 t=2 state=live inc=2 {key}"),
+        );
+        feed(
+            &mut n,
+            3,
+            "s-one",
+            &format!("v=1 t=3 inc=2 phase=busy {key}"),
+        );
+        feed(
+            &mut n,
+            4,
+            "s-one",
+            &format!("v=1 t=4 state=exited inc=2 {key}"),
+        );
+        feed(
+            &mut n,
+            5,
+            "s-two",
+            &format!("v=1 t=5 state=live inc=1 {key}"),
+        );
+        assert_eq!(fired_offsets(&fired), [1, 5]);
+        assert_eq!((n.counts.fired, n.counts.standing), (2, 3));
+        for off in [2, 3, 4] {
+            assert_eq!(n.verdict(off), None, "a republish is not a verdict");
+        }
+        assert_eq!(n.stamps.len(), 2, "and charges no budget");
+
+        feed(&mut n, 6, "s-one", "v=1 t=6 state=live inc=3 attention=-");
+        feed(
+            &mut n,
+            7,
+            "s-one",
+            &format!("v=1 t=7 state=live inc=3 {key}"),
+        );
+        assert_eq!(fired_offsets(&fired), [1, 5, 7], "a clear re-arms it");
+
+        let (mut back, _) = appending(&dir, 100, "");
+        feed(
+            &mut back,
+            8,
+            "s-one",
+            &format!("v=1 t=8 state=live inc=4 {key}"),
+        );
+        assert_eq!(fired_offsets(&fired), [1, 5, 7], "a restart remembers");
+        feed(
+            &mut back,
+            9,
+            "s-one",
+            "v=1 t=9 attention=a%20new%20question",
+        );
+        feed(&mut back, 10, "s-one", &format!("v=1 t=10 {key}"));
+        assert_eq!(
+            fired_offsets(&fired),
+            [1, 5, 7, 9, 10],
+            "a value that moved is a new escalation, and so is moving back"
+        );
+
+        // THE RE-SCAN of offsets 6 and 7, after a crash before their cursor.
+        feed(&mut back, 11, "s-two", "v=1 t=11 attention=-");
+        feed(&mut back, 12, "s-two", &format!("v=1 t=12 {key}"));
+        feed(&mut back, 11, "s-two", "v=1 t=11 attention=-");
+        feed(&mut back, 12, "s-two", &format!("v=1 t=12 {key}"));
+        feed(&mut back, 13, "s-two", &format!("v=1 t=13 inc=2 {key}"));
+        assert_eq!(fired_offsets(&fired), [1, 5, 7, 9, 10, 12]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **AN ESCALATION NOBODY WAS TOLD OF DOES NOT STAND** (r3-22). Value
+    /// dedup must not become the silent drop the module refuses. With a budget
+    /// of one, s-one's raise pages and s-two's is rate-dropped: s-two's
+    /// republish is offered again, and with room it pages. A command that
+    /// answered `rc=3` told nobody, so its escalation's republish runs the
+    /// command again; once it answers `rc=0`, the next republish pages nobody.
+    #[test]
+    fn an_escalation_nobody_was_told_of_is_offered_again_on_its_republish() {
+        let dir = scratch("untold");
+        let (mut n, fired) = appending(&dir, 1, "");
+        feed(&mut n, 1, "s-one", "v=1 t=1 attention=first");
+        feed(&mut n, 2, "s-two", "v=1 t=2 attention=second");
+        assert_eq!(n.verdict(2), Some("dropped"));
+        let (mut room, _) = appending(&dir, 10, "");
+        feed(&mut room, 3, "s-two", "v=1 t=3 inc=2 attention=second");
+        assert_eq!(
+            fired_offsets(&fired),
+            [1, 3],
+            "the dropped escalation pages"
+        );
+        feed(&mut room, 4, "s-two", "v=1 t=4 inc=3 attention=second");
+        assert_eq!(fired_offsets(&fired), [1, 3], "and, told, stands");
+
+        let (mut broken, _) = appending(
+            &dir,
+            10,
+            &format!("if [ ! -e {dir}/fixed ]; then exit 3; fi; "),
+        );
+        feed(&mut broken, 5, "s-three", "v=1 t=5 attention=third");
+        feed(&mut broken, 6, "s-three", "v=1 t=6 inc=2 attention=third");
+        assert!(
+            broken
+                .journal
+                .iter()
+                .any(|l| l.starts_with("6 fired on=attention rc=3")),
+            "an untold escalation runs the command on its republish: {:?}",
+            broken.journal
+        );
+        std::fs::write(Path::new(&dir).join("fixed"), b"").expect("fix the command");
+        feed(&mut broken, 7, "s-three", "v=1 t=7 inc=3 attention=third");
+        feed(&mut broken, 8, "s-three", "v=1 t=8 inc=4 attention=third");
+        assert_eq!(fired_offsets(&fired), [1, 3, 7]);
+        assert_eq!(broken.counts.standing, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The journal is keyed by offset, keeps one verdict per offset, is bounded,
     /// and survives a reopen — which is the whole of "deduped by offset across a
     /// restart".
@@ -1379,8 +1972,138 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn an_uncertain_notify_log_identity_never_claims_another_logs_cursors() {
+        let a = astream_broker::LogIdentity {
+            id: [0xaa; 16],
+            generation: 0,
+        };
+        let b = astream_broker::LogIdentity {
+            id: [0xbb; 16],
+            generation: 0,
+        };
+        for bad in ["invalid-utf8", "malformed", "dangling"] {
+            let dir = aterm_tempfile::Builder::new()
+                .prefix("notify-owner")
+                .tempdir()
+                .unwrap();
+            let store = Store::open(dir.path().to_str().unwrap()).unwrap();
+            store.set_cursor("attention", 900).unwrap();
+            store.set_journal(&["7 fired".to_string()]).unwrap();
+            let path = store.root.join("log");
+            match bad {
+                "invalid-utf8" => std::fs::write(&path, [0xff]).unwrap(),
+                "malformed" => std::fs::write(&path, "not-a-log\n").unwrap(),
+                "dangling" => std::os::unix::fs::symlink("missing-owner", &path).unwrap(),
+                _ => unreachable!(),
+            }
+            assert!(
+                store.for_log(Some(b)).is_err(),
+                "{bad}: uncertainty is not permission to adopt A's offsets as B's"
+            );
+            assert_eq!(store.cursor("attention"), Some(900));
+            assert_eq!(store.journal(), ["7 fired"]);
+            match bad {
+                "invalid-utf8" => assert_eq!(std::fs::read(&path).unwrap(), [0xff]),
+                "malformed" => assert_eq!(std::fs::read_to_string(&path).unwrap(), "not-a-log\n"),
+                "dangling" => assert_eq!(
+                    std::fs::read_link(&path).unwrap(),
+                    PathBuf::from("missing-owner")
+                ),
+                _ => unreachable!(),
+            }
+            // Repair the same state in place, then prove A resumes and B starts
+            // with its own empty namespace, rather than A's cursor/journal.
+            std::fs::remove_file(&path).unwrap();
+            store.write("log", &a.to_string()).unwrap();
+            let resumed = store.for_log(Some(a)).unwrap();
+            assert_eq!(resumed.cursor("attention"), Some(900));
+            assert_eq!(resumed.journal(), ["7 fired"]);
+            let fresh = store.for_log(Some(b)).unwrap();
+            assert_eq!(fresh.cursor("attention"), None);
+            assert!(fresh.journal().is_empty());
+        }
+    }
+
     /// The cursor is MONOTONE. A cursor that walked backwards would re-offer
     /// offsets the bounded journal has already forgotten.
+    /// **ANOTHER LOG IS READ AS A FIRST RUN, AND THE OLD ONE RESUMES** (r2-01).
+    /// Each log carries an escalation at offset 0. Run against log A, it fires
+    /// and A's cursor and journal say so. Pointed at log B — a recreated
+    /// bus.log, or another host's broker — that cursor and that journal name
+    /// A's records: B's escalation at the same offset fires all the same,
+    /// filed under B. Back on A, A's cursor and journal stand and nothing
+    /// fires twice. Negative control: one cursor and one journal for every
+    /// log, as before, and B's escalation is skipped as already fired.
+    #[cfg(unix)]
+    #[test]
+    fn a_notifier_files_its_cursor_and_journal_under_the_log_it_read() {
+        let dir = scratch("logs");
+        let base = PathBuf::from(&dir);
+        std::fs::create_dir_all(&base).expect("scratch");
+        let serve = |name: &str| {
+            let broker = astream_broker::Broker::open(base.join(format!("{name}.log"))).unwrap();
+            let sock = base.join(format!("{name}.sock"));
+            let handle = broker.serve(&sock).unwrap();
+            let (mut c, _) =
+                transport::connect(&Transport::Unix, &sock.to_string_lossy(), ACK_DEADLINE)
+                    .unwrap();
+            let (off, _) = c
+                .publish(
+                    7,
+                    1,
+                    "/f/f1/pub/n-a/s-x/presence",
+                    b"v=1 t=1 attention=help",
+                )
+                .unwrap();
+            assert_eq!(off, 0);
+            (sock.to_string_lossy().into_owned(), broker, handle)
+        };
+        let (a, broker_a, _a) = serve("a");
+        let (b, broker_b, _b) = serve("b");
+        let fired = base.join("fired");
+        let mut c = cfg(&dir);
+        c.since = Since::Start;
+        c.limit = 10;
+        c.exec = format!(
+            "printf '%s\\n' \"$ATERM_NOTIFY_OFFSET\" >> {}",
+            fired.display()
+        );
+        let run = |broker: &str| {
+            let mut c = c.clone();
+            c.broker = broker.to_string();
+            Notifier::new(c)
+                .expect("open")
+                .catch_up()
+                .expect("catch up");
+            std::fs::read_to_string(&fired)
+                .unwrap_or_default()
+                .lines()
+                .count()
+        };
+        assert_eq!(run(&a), 1, "A's escalation fires");
+        assert_eq!(
+            run(&b),
+            2,
+            "B's escalation is B's, whatever A's cursor says"
+        );
+        assert_eq!(run(&a), 2, "back on A, nothing fires twice");
+        assert_eq!(run(&b), 2, "nor on B");
+        let root = base.join("notify");
+        assert_eq!(
+            std::fs::read_to_string(root.join("log")).unwrap().trim(),
+            broker_a.log_identity().to_string(),
+            "the root is the first log's"
+        );
+        assert!(root
+            .join("logs")
+            .join(broker_b.log_identity().to_string())
+            .join("cur/attention")
+            .exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn the_cursor_never_goes_backwards() {
         let dir = scratch("cursor");
@@ -1401,10 +2124,10 @@ mod tests {
         assert_eq!(Sel::parse("attention"), Ok(Sel::Attention));
         assert_eq!(Sel::parse("halt"), Ok(Sel::Halt));
         assert_eq!(Sel::parse("ask:h-andrew"), Ok(Sel::Ask("h-andrew".into())));
-        assert_eq!(Sel::Ask("h-andrew".into()).key(), "ask.h-andrew");
+        assert_eq!(Sel::Ask("h-andrew".into()).key(), "ask-to.h-andrew");
         assert_eq!(
             Sel::Ask("h-andrew".into()).filter("f1"),
-            "/f/f1/in/*/*/h-andrew/ask"
+            "/f/f1/in/p/h-andrew/*/ask"
         );
         for bad in ["ask:../../etc", "ask:", "ask:H-Andrew", "wake", "ask"] {
             assert!(Sel::parse(bad).is_err(), "{bad}");
@@ -1423,6 +2146,21 @@ mod tests {
         );
         assert!(parse_rate("10/0m").is_err(), "a zero window is refused");
         for bad in ["10", "10/1d", "x/1m", "10/m", ""] {
+            assert!(parse_rate(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn rate_windows_refuse_overflow_and_non_ascii_units() {
+        for (unit, scale) in [('s', 1_000), ('m', 60_000), ('h', 3_600_000)] {
+            let largest = u64::MAX / scale;
+            assert_eq!(
+                parse_rate(&format!("1/{largest}{unit}")),
+                Ok((1, largest * scale))
+            );
+            assert!(parse_rate(&format!("1/{}{unit}", largest + 1)).is_err());
+        }
+        for bad in ["1/1é", "1/日", "1/1\u{1f600}", "1/"] {
             assert!(parse_rate(bad).is_err(), "{bad}");
         }
     }

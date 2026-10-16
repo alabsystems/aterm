@@ -24,10 +24,19 @@
 //!   and disclose the reduced posture. afunix carries no ancillary data, so
 //!   [`fdpass`] refuses there.
 
-// Registers the `trust` tool namespace under the Trust verifier so the
-// `trust::skip` opt-out on the FFI CSPRNG wrapper resolves.
+// Registers the `trust` tool namespace under the Trust verifier so the crate's `trust::skip`
+// opt-outs resolve.
 #![cfg_attr(trust_verify, feature(register_tool))]
 #![cfg_attr(trust_verify, register_tool(trust))]
+// Unit tests start stand-in children with std's `Command`: a test's child may
+// inherit this process's descriptors (clippy.toml: one child constructor).
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_types,
+        reason = "test code: a stand-in child may inherit descriptors"
+    )
+)]
 
 #[cfg(unix)]
 pub type CtlStream = std::os::unix::net::UnixStream;
@@ -41,15 +50,14 @@ pub mod win;
 #[cfg(windows)]
 pub use win::{CtlListener, CtlStream};
 
-/// A deadline on a call that can block forever: in this process ([`deadline::Gate`],
-/// the shared [`deadline::TRUST`] gate) or in a child ([`deadline::output_until`]).
-/// Native-only: it exists for macOS's `trustd` and child processes, and starts
-/// threads, which the wasm32 build never does.
+/// A deadline on a call that can block forever: in this process ([`deadline::Gate`], the
+/// shared [`deadline::TRUST`] gate) or in a child ([`deadline::output_until`]). Native-only:
+/// it starts threads, which the wasm32 build never does.
 #[cfg(not(target_arch = "wasm32"))]
 pub mod deadline;
-/// A kernel witness of another process's death, with its `wait(2)` status (the
-/// PTY keeper's death classifier; lifted from the seamless handoff), and the
-/// moment of it ([`exitwatch::ExitMoment`], `aterm ctl subscribe`'s redial).
+/// A kernel witness of another process's death with its `wait(2)` status (the PTY keeper's
+/// death classifier), and the moment of it ([`exitwatch::ExitMoment`], read by
+/// `aterm ctl subscribe`'s redial).
 pub mod exitwatch;
 pub mod fdpass;
 /// Whether a connected stream's peer has closed entirely (a lane's hangup check).
@@ -66,6 +74,9 @@ pub mod lifeline;
 /// Which listening socket a path names, so a hang-up is judged by the listener
 /// that accepted the stream and never by the pid alone.
 pub mod listener;
+/// Captured subprocess output, optionally delegated to a caller-owned executor.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod output;
 /// Who holds a file's owner lock (the PTY keeper reads a dead window's crash
 /// marker with it).
 #[cfg(unix)]
@@ -77,27 +88,32 @@ pub mod process;
 /// nothing but a `/dev/null` stdio (the PTY keeper's one spawn).
 pub mod pspawn;
 pub mod rand;
-/// Which Windows console a child process gets: a WINDOWLESS one when this
-/// process has none (the window), so no console flashes on screen, and nothing
-/// changed when it has one or off Windows. [`spawnfd::command`] applies it to
-/// every child; [`spawn::set_flags`] is the one creation-flags setter. See
-/// [`spawn`].
+/// Unix-only: the process-wide reaper of children nobody else waits for (a
+/// dropped `spawnfd` child still running, a PTY shell past its deadline). See
+/// [`reaper`].
+#[cfg(unix)]
+pub mod reaper;
+/// Which Windows console a child process gets: a windowless one when this process has none
+/// (the window), so no console flashes on screen, and nothing changed when it has one or off
+/// Windows. [`spawnfd::command`] applies it to every child; [`spawn::set_flags`] is the one
+/// creation-flags setter. See [`spawn`].
 pub mod spawn;
-/// Start a child holding two descriptors at fixed numbers and nothing else above
-/// stdio — the fabric bridge's launch — the inheritance strip for a spawn that
-/// must fork (the PTY child's), [`spawnfd::command`], the `Command` every
-/// other child is built with (on Darwin one `posix_spawn`, no fork), and
-/// [`spawnfd::transparent`], the pass-throughs' spawn, whose child inherits this
-/// process's whole table whatever std is linked. See [`spawnfd`].
+/// Child spawns that inherit only what they are handed: [`spawnfd::command`], the `Command`
+/// every child is built with (on Darwin one `posix_spawn`, no fork); the fabric bridge's
+/// spawn with two descriptors at fixed numbers; the inheritance strip for a spawn that must
+/// fork (the PTY child's); and [`spawnfd::transparent`], the pass-throughs' spawn, whose child
+/// inherits this process's whole table. See [`spawnfd`].
 #[cfg(unix)]
 pub mod spawnfd;
 /// Off Unix, [`spawnfd::command`] (there: the Windows console rule of [`spawn`]),
-/// [`spawnfd::transparent`] (the same), [`spawnfd::InheritNothing`] and `std`'s
-/// `Command`, `Stdio` and `Child` under spawnfd's names, so a shared spawn site
-/// reads the same on every platform.
+/// [`spawnfd::transparent`], [`spawnfd::InheritNothing`] and std's `Command`, `Stdio` and
+/// `Child` under spawnfd's names, so a shared spawn site reads the same on every platform.
 #[cfg(not(unix))]
 #[path = "spawnfd_nonunix.rs"]
 pub mod spawnfd;
+/// The kernel facts a `sudo` askpass relay stands on, and a scrubbed secret
+/// for the password in flight (`docs/DESIGN-sudo-askpass-2026-10-15.md`).
+pub mod sudo;
 
 /// The per-user directory holding aterm's control socket and token, resolved
 /// identically for the server and every client. `None` only when the

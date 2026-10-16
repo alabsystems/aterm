@@ -23,7 +23,7 @@ dev-seams = ["aterm-update-core/dev-seams"]
 [dependencies]
 # Manifest (aterm-appcast.toml) + the on-disk `ready.toml` staging marker.
 aterm-toml = { workspace = true }
-serde = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 # The Linux lane's compiled binary identity crosses as JSON
 # (`binary_identity_json`, and the candidate's identity probe in `linux.rs`).
 aterm-json = { workspace = true }
@@ -56,15 +56,17 @@ aterm-uds = { workspace = true }
 aterm-spec = { workspace = true, optional = true }
 
 [dev-dependencies]
-# The one trustd probe and skip line (`aterm_uds::deadline::trust_service_silent`).
-aterm-uds = { workspace = true, features = ["test-support"] }
+# install.sh's tests build atpkg's shim from its own block (`build_cache::shim_block`),
+# so the shim writer and the installer's reader answer to one contract.
+atpkg = { workspace = true }
 # Signing side (Ed25519KeyPair::from_seed_unchecked + .sign) for the roster-chain
 # fixtures; the verifying side is `aterm_update_core::roster`'s.
-ring = { version = "0.17.14" }
+ring = { workspace = true, features = ["default"] }
 # Tier-1 binds the real updater reducers to their single-source derived models;
 # production builds retain no spec dependency.
 aterm-spec = { workspace = true }
-# Test scratch directories removed on drop.
+# Test scratch directories removed on drop, and the shared-inode stand-ins the
+# install.sh tests lay as stub tools (`stand_in`, a debug build's).
 aterm-tempfile = { workspace = true }
 
 [lints]

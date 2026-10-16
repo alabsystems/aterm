@@ -23,28 +23,21 @@ pub(crate) struct MouseReportMemo {
 }
 
 impl Terminal {
-    /// Whether a MOTION report carrying `(x, y)` would only repeat the position
-    /// the last mouse report carried, and so is not to be sent.
-    ///
-    /// xterm ctlseqs, button-event tracking (DEC 1002): "Motion events are
-    /// reported only if the mouse pointer has moved to a different character
-    /// cell"; any-event tracking (1003) is the same with buttonless motion added.
-    /// xterm keeps one `mouse_row`/`mouse_col` memo, set by every press, release
-    /// and reported motion, and kitty and Alacritty gate on the same cell change.
-    /// `(x, y)` are the coordinates the report would carry, so under DEC 1016
-    /// (SGR-pixel) a sub-cell move is a new position, as kitty treats it. A memo
-    /// written under another tracking mode or encoding never matches: a program
-    /// that changed either has not seen a report in the new terms.
+    /// Whether a motion report carrying `(x, y)` would only repeat the last report's position,
+    /// and so is not to be sent. xterm's DEC 1002/1003 report motion "only if the mouse pointer
+    /// has moved to a different character cell", with one memo set by every press, release and
+    /// reported motion; kitty and Alacritty gate the same way. `(x, y)` are the report's own
+    /// coordinates, so under DEC 1016 (SGR-pixel) a sub-cell move is new, as in kitty. A memo
+    /// written under another tracking mode or encoding never matches: the program has seen no
+    /// report in the new terms.
     #[must_use]
     pub fn mouse_motion_repeats_last_report(&self, x: u16, y: u16) -> bool {
         self.mouse_report_memo == Some(self.mouse_report_at(x, y))
     }
 
-    /// Record that the host just produced a mouse report carrying `(x, y)` for
-    /// this terminal: a press, a release, a wheel notch or a motion report. Read
-    /// back by [`Self::mouse_motion_repeats_last_report`]. Host bookkeeping kept
-    /// beside the mode it is judged under, like the text selection; the input
-    /// seam writes it under this terminal's lock.
+    /// Record that the host just produced a mouse report (press, release, wheel notch or motion)
+    /// carrying `(x, y)`, for [`Self::mouse_motion_repeats_last_report`]. The input seam writes
+    /// it under this terminal's lock.
     pub fn note_mouse_report(&mut self, x: u16, y: u16) {
         self.mouse_report_memo = Some(self.mouse_report_at(x, y));
     }
@@ -57,10 +50,6 @@ impl Terminal {
             y,
         }
     }
-
-    // =========================================================================
-    // Mouse event encoding — delegates to aterm_types::mouse for byte encoding
-    // =========================================================================
 
     /// Encode a mouse button press event.
     ///
@@ -99,9 +88,8 @@ impl Terminal {
             return None;
         }
 
-        // Pass the original button: the encoder substitutes the button-3 release
-        // code only for the single-byte formats, so an SGR release keeps the
-        // button identity and the 'm' terminator.
+        // Pass the original button: the encoder substitutes the button-3 release code only for
+        // the legacy formats, so an SGR release keeps the button and the 'm' terminator.
         Some(encode_mouse(
             button | modifiers,
             col,
@@ -221,8 +209,8 @@ mod tests {
         assert_eq!(wheel(&t, WheelDir::Right), "\x1b[<67;11;6M");
     }
 
-    /// Modifiers OR into the horizontal codes exactly as they do into the
-    /// vertical ones (shift=4, alt=8, ctrl=16) — one code path, no special case.
+    /// Modifiers OR into the horizontal codes as into the vertical ones (shift=4, alt=8,
+    /// ctrl=16).
     #[test]
     fn wheel_modifiers_or_into_the_horizontal_codes() {
         let t = sgr_tracking();

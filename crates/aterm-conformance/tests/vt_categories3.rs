@@ -6,23 +6,18 @@
 // (DECLRMM/DECSLRM), tab ops (CHT/CBT/TBC), charset shifts (SO/SI/SS2),
 // DECALN, DECDWL/DECSWL, DECSC charset save, REP, and DECSCA selective erase.
 //
-// Every expectation is spec-correct xterm/VT510 behavior with the source cited
-// inline.
+// Expectations are xterm/VT510 behavior with the source cited inline.
 
 use aterm_conformance::{Screen, run};
 use aterm_core::terminal::Terminal;
 
-/// Local helper (Screen lacks color access): feed bytes to a raw engine
-/// `Terminal` so tests can read render-resolved colors / responses.
+/// Feed bytes to a raw engine `Terminal`, for the render-resolved colours and
+/// line attributes `Screen` does not expose.
 fn term_24x80(input: &[u8]) -> Terminal {
     let mut t = Terminal::new(24, 80);
     t.process(input);
     t
 }
-
-// =========================================================================
-// 1. Alt-screen mode trio (47 / 1047 / 1049)
-// =========================================================================
 
 #[test]
 fn mode_1049_saves_cursor_switches_and_clears_alt() {
@@ -107,9 +102,8 @@ fn mode_47_swap_does_not_move_cursor() {
 #[test]
 fn mode_47_alt_content_persists_across_reentry() {
     let mut s = Screen::new(24, 80);
-    // xterm: mode 47 never clears the alt buffer, so content written to it
-    // survives exit + re-enter (this stale-content behavior is exactly why
-    // 1047/1049 added clearing).
+    // xterm: mode 47 never clears the alt buffer, so its content survives exit
+    // and re-entry.
     s.feed(b"\x1b[?47h\x1b[1;1HSTALE\x1b[?47l\x1b[?47h");
     assert_eq!(
         s.row(0),
@@ -117,10 +111,6 @@ fn mode_47_alt_content_persists_across_reentry() {
         "alt buffer content survives a 47 round trip"
     );
 }
-
-// =========================================================================
-// 2. DECCOLM gating (modes 3 / 40 / 95)
-// =========================================================================
 
 #[test]
 fn deccolm_ignored_when_mode_40_is_reset() {
@@ -174,10 +164,6 @@ fn decncsm_suppresses_clear_on_deccolm_switch() {
     assert_eq!(s.row(0), "keep", "DECNCSM suppresses the DECCOLM clear");
 }
 
-// =========================================================================
-// 3. DECSCNM (mode 5) reverse video
-// =========================================================================
-
 #[test]
 fn decscnm_reverse_video_flips_existing_and_new_cells() {
     let mut t = term_24x80(b"AB");
@@ -217,10 +203,6 @@ fn decscnm_reverse_video_flips_existing_and_new_cells() {
     assert_eq!((cells[2].fg, cells[2].bg), (fg, bg));
 }
 
-// =========================================================================
-// 4. Left/right margins (DECLRMM mode 69 + DECSLRM)
-// =========================================================================
-
 #[test]
 fn declrmm_autowrap_wraps_to_left_margin() {
     let mut s = Screen::new(24, 80);
@@ -229,7 +211,7 @@ fn declrmm_autowrap_wraps_to_left_margin() {
     assert_eq!(s.cursor(), (0, 0), "DECSLRM homes the cursor");
     s.feed(b"\x1b[2;19HXYZ"); // X at (1,18), Y at (1,19)=right margin, Z wraps
     // VT420/VT510: with DECLRMM, autowrap at the right margin moves the cursor
-    // to the LEFT MARGIN (col 5, 0-based 4) of the next line, not column 0
+    // to the left margin (col 5, 0-based 4) of the next line, not column 0
     assert_eq!(
         s.row(2),
         "    Z",
@@ -253,10 +235,6 @@ fn declrmm_cursor_clamps_and_reset_restores_full_width() {
     assert_eq!(s.cursor(), (0, 79), "full width restored after CSI ?69l");
 }
 
-// =========================================================================
-// 5. Tab ops: CHT, CBT, TBC
-// =========================================================================
-
 #[test]
 fn cht_forward_and_cbt_backward_tab_stops() {
     let mut s = Screen::new(24, 80);
@@ -269,11 +247,8 @@ fn cht_forward_and_cbt_backward_tab_stops() {
     assert_eq!(s.cursor(), (0, 8), "CBT moves back one tab stop");
 }
 
-/// CBT's left-margin clamp is gated on DECOM, pinned through the escape
-/// sequence.
-///
-/// xterm `tabs.c` `TabToPrevStop` clamps the landing column to the left margin
-/// only when the ORIGIN flag is set:
+/// CBT clamps to the left margin only under DECOM, as xterm `tabs.c`
+/// `TabToPrevStop` does when the ORIGIN flag is set:
 ///
 /// ```c
 /// int next_column = TabPrev(xw->tabs, screen->cur_col);
@@ -284,9 +259,9 @@ fn cht_forward_and_cbt_backward_tab_stops() {
 /// set_cur_col(screen, next_column);
 /// ```
 ///
-/// Unlike `CursorBack`, which `cursor.c` clamps to the left margin
-/// unconditionally. Both arms run the real `CSI Z`, so the handler's passing of
-/// the mode is covered, not just `back_tab_margin`.
+/// (`CursorBack` in `cursor.c` clamps unconditionally.) Both arms run the real
+/// `CSI Z`, so the handler's passing of the mode is covered, not just
+/// `back_tab_margin`.
 #[test]
 fn cbt_stops_at_the_left_margin_only_under_decom() {
     // Margins at 1-based 11..31, i.e. 0-based 10..30. Default tab stops are
@@ -294,7 +269,7 @@ fn cbt_stops_at_the_left_margin_only_under_decom() {
     // left margin, which is what makes the two arms differ.
     let armed = b"\x1b[?69h\x1b[11;31s";
 
-    // DECOM RESET: no clamp. CBT runs past the left margin to the real stop.
+    // DECOM reset: no clamp, CBT runs past the left margin to the real stop.
     let mut s = Screen::new(3, 40);
     s.feed(armed);
     s.feed(b"\x1b[?6l\x1b[1;13H\x1b[Z");
@@ -304,7 +279,7 @@ fn cbt_stops_at_the_left_margin_only_under_decom() {
         "DECOM reset: CBT is unclamped and reaches the tab stop at column 8"
     );
 
-    // DECOM SET: clamped. The cursor stops ON the left margin instead.
+    // DECOM set: clamped, the cursor stops on the left margin.
     // `CSI 1;3H` is margin-relative under DECOM, so it lands on column 12 too.
     let mut s = Screen::new(3, 40);
     s.feed(armed);
@@ -333,10 +308,6 @@ fn tbc_clears_one_stop_then_all_stops() {
         "TAB with no stops goes to the right margin"
     );
 }
-
-// =========================================================================
-// 6. Charsets: SO/SI locking shifts, SS2 single shift
-// =========================================================================
 
 #[test]
 fn so_si_locking_shift_g1_line_drawing() {
@@ -408,10 +379,6 @@ fn so_shift_and_truecolor_survive_a_scroll_region_scroll() {
     );
 }
 
-// =========================================================================
-// 7. DECALN
-// =========================================================================
-
 #[test]
 fn decaln_fills_screen_with_e_and_homes_cursor() {
     let s = run(b"\x1b[5;10H\x1b#8");
@@ -422,10 +389,6 @@ fn decaln_fills_screen_with_e_and_homes_cursor() {
     // xterm ctlseqs: DECALN also moves the cursor to home
     assert_eq!(s.cursor(), (0, 0), "DECALN homes the cursor");
 }
-
-// =========================================================================
-// 8. DECDWL / DECSWL
-// =========================================================================
 
 #[test]
 fn decdwl_truncates_right_half_and_decswl_keeps_text() {
@@ -452,19 +415,16 @@ fn decdwl_truncates_right_half_and_decswl_keeps_text() {
 
 #[test]
 fn ed2_erases_complete_lines_so_a_decdwl_row_comes_back_single_width() {
-    // VT510 Programmer Information, Erase in Display: "When you erase complete
-    // lines, they become single-height, single-width lines, with all visual
-    // character attributes cleared." xterm's ED 2 (`do_erase_display` case 2 ->
-    // `ClearScreen` -> `ClearBufRows(0, max_row)`) carries the same rule in its
-    // own comment: "clearing the whole row resets the doublesize characters".
-    // So a stray `ESC#6` cannot leave a row double-width after `clear`.
+    // VT510 ED: "When you erase complete lines, they become single-height,
+    // single-width lines, with all visual character attributes cleared."
+    // xterm's ED 2 (`ClearBufRows`) resets doublesize too, so a stray `ESC#6`
+    // cannot leave a row double-width after `clear`.
     let mut s = Screen::new(24, 80);
     s.feed(b"\x1b[1;1H\x1b#6"); // DECDWL poisons row 0
     s.feed(b"\x1b[2J\x1b[H"); // ED 2 + home — the `clear` a user reaches for
     s.feed("a".repeat(50).as_bytes());
-    // A double-width row still holds only cols/2 = 40 characters and autowraps
-    // there, so the 50 'a' would split 40/10 across two rows. All 80 columns are
-    // usable again, so they stay on row 0.
+    // A double-width row would hold only 40 and wrap the 50 'a' 40/10; a
+    // single-width row keeps them on row 0.
     assert_eq!(
         s.row(0),
         "a".repeat(50),
@@ -485,10 +445,9 @@ fn ed2_erases_complete_lines_so_a_decdwl_row_comes_back_single_width() {
 
 #[test]
 fn el2_leaves_a_decdwl_row_double_because_xterm_does() {
-    // The asymmetry is deliberate. xterm's EL 2 (`do_erase_line` case 2 ->
-    // `ClearLine` -> `ClearInLine` -> `ClearInLine2`) never reaches
-    // `ClearBufRows` and never writes `DblCS`, and the VT510 EL page carries
-    // none of the ED page's single-width language.
+    // A deliberate asymmetry, as in xterm: EL 2 (`ClearInLine2`) never reaches
+    // `ClearBufRows` or writes `DblCS`, and the VT510 EL page has none of the
+    // ED page's single-width language.
     let t = term_24x80(b"\x1b[1;1H\x1b#6\x1b[2K");
     assert_eq!(
         t.grid().row(0).expect("visible row").line_size(),
@@ -496,10 +455,6 @@ fn el2_leaves_a_decdwl_row_double_because_xterm_does() {
         "EL 2 clears the characters, not the line attribute"
     );
 }
-
-// =========================================================================
-// 9. DECSC/DECRC saves charset state
-// =========================================================================
 
 #[test]
 fn decsc_decrc_saves_and_restores_charset() {
@@ -511,10 +466,6 @@ fn decsc_decrc_saves_and_restores_charset() {
     assert_eq!(s.cursor(), (0, 1));
 }
 
-// =========================================================================
-// 10. REP
-// =========================================================================
-
 #[test]
 fn rep_repeats_preceding_graphic_char() {
     // ECMA-48 / xterm REP: CSI Ps b repeats the preceding graphic character
@@ -523,10 +474,6 @@ fn rep_repeats_preceding_graphic_char() {
     assert_eq!(s.row(0), "AAAA");
     assert_eq!(s.cursor(), (0, 4));
 }
-
-// =========================================================================
-// 11. DECSCA + DECSED selective erase
-// =========================================================================
 
 #[test]
 fn decsca_protects_from_decsed_but_not_from_ed() {

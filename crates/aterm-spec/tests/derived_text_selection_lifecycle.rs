@@ -9,11 +9,6 @@ use aterm_spec::{derive::text_selection_lifecycle_model, interp, verify};
 #[test]
 fn text_selection_calls_act_only_in_their_phase() {
     let model = text_selection_lifecycle_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name)
-    );
     verify::prove_and_catch_scalar(&model, "text selection lifecycle");
 
     // The committed machine: press, drag, release, shift-click, clear.

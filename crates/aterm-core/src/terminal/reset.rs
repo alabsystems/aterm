@@ -2,10 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Terminal reset logic — `ResetGroups`, `reset_common_fields`, `Terminal::reset`.
-//!
-//! Both [`Terminal::reset()`] and `TerminalHandler::reset_terminal_state()` (ESC c / RIS)
-//! share [`reset_common_fields`] as a single source of truth.
+//! Terminal reset. [`Terminal::reset()`] and RIS (`TerminalHandler::reset_terminal_state()`)
+//! share [`reset_common_fields`].
 
 use crate::grid::Grid;
 
@@ -34,6 +32,7 @@ pub(super) struct ResetGroups<'a> {
     pub(super) notifications: &'a mut NotificationState,
     pub(super) marks_state: &'a mut MarksState,
     pub(super) taskbar_progress: &'a mut Option<TaskbarProgress>,
+    pub(super) program_state: &'a mut super::program_state::ProgramStateReport,
 }
 
 impl ResetGroups<'_> {
@@ -47,21 +46,22 @@ impl ResetGroups<'_> {
         self.sixel.reset();
         self.dcs.reset();
         self.notifications.reset();
-        // Clear marks and annotations — they reference positions in the now-erased
-        // grid. Preserve next_*_id counters for ID uniqueness.
+        // Marks and annotations point into the erased grid; the next_*_id counters stay
+        // so IDs stay unique.
         self.marks_state.marks.clear();
         self.marks_state.annotations.clear();
         *self.taskbar_progress = None;
+        // A program's state report does not outlive a full reset (OSC 7501).
+        self.program_state.reset();
     }
 }
 
-/// The modes a full reset leaves: power-on, except the HOST's policy. No escape
-/// sequence sets these, so none may clear them: a program's reset must not lift
-/// a fail-closed authorization (`allow_*`, the shell-integration nonce
-/// requirement), re-enable an input capability the host declared absent (kitty)
-/// or claim one it never declared (win32-input), or flip host display state it
-/// cannot set back (CJK ambiguous width, the OS appearance). The one list for
-/// both reset paths, which had drifted when each kept its own.
+/// The modes a full reset leaves: power-on, except the host's policy. No escape sequence
+/// sets these, so none may clear them: a program's reset must not lift a fail-closed
+/// authorization (`allow_*`, the shell-integration nonce requirement), re-enable an input
+/// capability the host declared absent (kitty) or claim one it never declared
+/// (win32-input), or flip host display state (CJK ambiguous width, the OS appearance). The
+/// one list for both reset paths.
 fn reset_modes(prev: &TerminalModes) -> TerminalModes {
     TerminalModes {
         allow_osc52_query: prev.allow_osc52_query,
@@ -78,12 +78,9 @@ fn reset_modes(prev: &TerminalModes) -> TerminalModes {
     }
 }
 
-/// Reset shared terminal state.
-///
-/// Core fields are passed individually for split borrows; grouped
-/// protocol/image/title state is bundled in [`ResetGroups`]. A new resettable
-/// field goes in its group's `reset()`, or in `TransientState` for ungrouped
-/// scalars.
+/// Reset the state both reset paths share. Core fields are passed one by one for split
+/// borrows, grouped state in [`ResetGroups`]. A new resettable field goes in its group's
+/// `reset()`, or in `TransientState` for ungrouped scalars.
 #[allow(
     clippy::too_many_arguments,
     reason = "reset needs split-borrow access to each field"
@@ -100,64 +97,49 @@ pub(super) fn reset_common_fields(
     secure_keyboard_entry: &mut bool,
     groups: &mut ResetGroups<'_>,
 ) {
-    // Capture before the modes reset below: it tells us what `alt_grid` holds.
+    // Read before the modes reset: it says what `alt_grid` holds.
     let was_alternate_screen = modes.alternate_screen;
     *modes = reset_modes(modes);
     style.reset();
     charset.reset();
-    // If on the alternate screen, `grid` currently points at the alt grid and
-    // `alt_grid` holds the main grid (with its scrollback).  Swap the main
-    // grid back before resetting so we erase/reset the *main* grid rather than
-    // dropping it.  On the main screen the slot instead holds the
-    // persistent (inactive) alt buffer — leave the main grid in place and let
-    // the `*alt_grid = None` below drop the alt buffer.
+    // On the alternate screen `alt_grid` holds the main grid (with its scrollback): swap it
+    // back so the main grid is reset, not dropped. On the main screen it holds the
+    // inactive alt buffer, which `*alt_grid = None` below drops.
     if was_alternate_screen {
         if let Some(main_grid) = alt_grid.take() {
             *grid = main_grid;
         }
     }
-    // A full reset replaces the screen: no resize undo may hand rows back into
-    // it (the erase below moves `content_gen`, which drops it too; this says so).
+    // No resize undo may hand rows back into a replaced screen (the erase below moving
+    // `content_gen` drops it too).
     grid.drop_resize_undo();
-    // Grid: reset scroll region and horizontal margins before erasing
     grid.reset_scroll_region();
     grid.reset_horizontal_margins();
     grid.erase_scrollback();
     // RIS resets SGR first, so cursor template is default (no BCE bg).
     grid.set_cursor_template(crate::grid::Cell::EMPTY, None);
     grid.erase_screen();
-    // RIS must clear DECDWL/DECDHL line attributes. ED 2 already resets the
-    // rows it erases; RIS owes the reset by its own spec text and must not
-    // inherit it from whichever erase it calls.
+    // RIS clears DECDWL/DECDHL by its own spec text, not as a side effect of the erase.
     grid.clear_line_attributes();
     grid.set_cursor(0, 0);
     grid.reset_tab_stops();
-    // RIS swaps the main grid back in, erases the screen, clears line
-    // attributes and homes the cursor: every host-cached coordinate is stale.
-    // `Terminal::reset()` drains this flag and reports it once itself.
+    // Every host-cached coordinate is stale; `Terminal::reset()` drains this flag itself.
     grid.invalidate_host_coordinates();
-    // Alternate screen — already consumed by the swap above; ensure cleared.
     *alt_grid = None;
     cursor_save.reset();
-    // Transient state (hyperlinks, underline, SGR stack, etc.); replies already
-    // generated stay queued for the PTY peer.
+    // Replies already generated stay queued for the PTY peer.
     transient.reset();
     color.reset();
-    // Secure keyboard entry: clear so platform exits secure input mode
+    // So the platform leaves secure input mode.
     *secure_keyboard_entry = false;
     groups.reset();
 }
 
 impl Terminal {
-    /// Reset terminal to initial state.
-    ///
-    /// Delegates to `reset_common_fields` for shared state, then resets
-    /// parser state (which cannot be reset inside the RIS handler since
-    /// we're already inside parser dispatch).
+    /// Reset the terminal to its initial state, keeping the host's policy. Also resets the
+    /// parser, which the RIS handler cannot do from inside parser dispatch.
     pub fn reset(&mut self) {
         self.parser.reset();
-        // Host-configured policy survives: `reset_common_fields` keeps it
-        // (`reset_modes`).
         let mut groups = ResetGroups {
             kitty_keyboard: &mut self.kitty_keyboard,
             xterm_keyboard: &mut self.xterm_keyboard,
@@ -170,6 +152,7 @@ impl Terminal {
             notifications: &mut self.notifications,
             marks_state: &mut self.marks_state,
             taskbar_progress: &mut self.taskbar_progress,
+            program_state: &mut self.program_state,
         };
         reset_common_fields(
             &mut self.grid,
@@ -183,47 +166,33 @@ impl Terminal {
             &mut self.secure_keyboard_entry,
             &mut groups,
         );
-        // Restore the host-preferred default cursor style: RIS wiped modes back to
-        // CursorStyle::default(), but the host's configured default must survive a
-        // reset (it's host preference, not app state, like the policy `reset_modes` keeps).
+        // The host's default cursor style is host preference, not app state: it survives.
         self.modes.cursor_style = self.default_cursor_style;
         // Mode 12 mirrors the style's blink bit (see `set_cursor_blink`).
         self.modes.cursor_blink = self.modes.cursor_style.blinks();
-        // Invalidate BiDi render cache — mode flags are reset but the cache
-        // may hold stale resolutions from pre-reset content.
+        // The BiDi cache may hold resolutions of pre-reset content.
         self.invalidate_bidi_all();
-        // Clear selection — anchors point at content that no longer exists.
+        // Selection anchors point at content that no longer exists.
         self.text_selection.clear();
-        // `reset_common_fields` swapped the main grid back and dropped the alt
-        // buffer: an alt->main switch that never reaches `post_process`, so nothing
-        // else restores or retires the parked slot. Without this the slot outlives
-        // the reset holding a selection over a grid that was just erased — the
-        // lifetime invariant on the field, violated.
+        // The alt buffer was dropped without an alt->main switch through `post_process`,
+        // so nothing else retires the parked selection over the erased grid.
         self.parked_text_selection.clear();
-        // Direct reset does not pass through `post_process`, so publish its
-        // wholesale coordinate change here. Drain the grid's reset sentinels:
-        // otherwise the next unrelated `process` batch would report this same
-        // reset a second time. The counters themselves deliberately survive.
+        // This path skips `post_process`, so publish the coordinate change here and drain
+        // the grid's reset signals, or the next batch reports this reset again. The
+        // counters themselves survive.
         let _ = self.grid.take_absolute_row_update();
         let _ = self.grid.take_selection_row_update();
         let _ = self.grid.take_content_scroll_delta();
-        // Drain the grid's coordinates-moved signal and selection damage, or the
-        // next unrelated batch reports this reset again; the selection was
-        // cleared above.
         let _ = self.grid.take_coordinates_invalidated();
         let _ = self.grid.take_selection_damage();
-        // The band record travels with the flag and is drained with it. The
-        // `invalidate()` below deliberately publishes no band batch: a reset moves
-        // everything, so a band-translating host must see an unexplained epoch step
-        // and discard — fail-closed by construction, not by a flag it could miss.
+        // The band record drains with the flag. `invalidate()` publishes no band batch on
+        // purpose: a band-translating host sees an unexplained epoch step and discards.
         let _ = self.grid.take_row_band_moves();
         self.content_scroll_state.invalidate();
-        // RIS moved every input of the encoder fold (kitty stack, xterm keyboard
-        // state, DECCKM/DECKPAM/mouse modes) without passing through
-        // `process()`, so republish the lock-free mirror here.
+        // Every input of the encoder fold moved outside `process()`: republish the mirror.
         self.refresh_mode_mirror();
-        // The alt-screen archive: `reset_common_fields` bumped the reset
-        // generation, and this path never reaches `process_at`, so wipe here.
+        // `transient.reset()` bumped the reset generation, and this path never reaches
+        // `process_at`: wipe the alt-screen archive here.
         self.alt_archive_after_host_reset();
     }
 }

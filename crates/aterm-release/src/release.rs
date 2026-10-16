@@ -15,38 +15,47 @@
 //! THE STEPS, in order ([`Step`]):
 //!
 //! ```text
-//!  1 checks           everything knowable now, refused NOW with its remedy
+//!  1 checks           everything knowable now, refused NOW with its remedy: one run per
+//!                     clone, the prover, the machine, the candidate; this machine's
+//!                     provisioning (audit 1: a gap only the owner closes is asked once
+//!                     here and waited on at the publish); what the cut would refuse that
+//!                     needs nothing the publish makes (`publish::pre_publish_gates`)
 //!  2 sync             the publication engine to its origin/main (appended audit rows
 //!                     kept), and the vendor/astream submodule
 //!  3 commit           the release commit R: `--bump` commits the next MINOR on main's
 //!                     tip and pushes it; else main's tip, or `--commit`
-//!  4 preflight-early  every export guard (the engine's own dry run, never skipped),
-//!                     the fixtures, the version, the engine and the wasm32 engine; the
-//!                     machine's provisioning; the handoff fixture guard (once per R)
-//!  5 trust            tools/trust-gate-all.sh, the whole tree (the CURRENT lane)
-//!  6 lock             this machine's gate lock, held from here to the end
-//!  7 build            BUILD ONCE: reserve the release's identity (`ledger::reserve`:
+//!  4 stage            R's own pre-claim gates that read only the commit (seconds; the
+//!                     journal's `commit-gates`, which the cut reads), then the REAL `pub
+//!                     stage aterm --commit R --repo-path <this clone>` — every export
+//!                     guard, the public-clone gate with its wasm32 clause, the private
+//!                     staging tier — with the handoff fixture guard and the L0 censuses
+//!                     beside it (fail-fast copies of checks `verify release` runs again)
+//!  5 build            BUILD ONCE: reserve the release's identity (`ledger::reserve`:
 //!                     build n and the release commit C, made from objects, claimed
 //!                     nowhere), then `ship build` — both slices at once from the
 //!                     snapshot of C into the release cache, the unsigned bundle kept
-//!                     by what it was built as (`artifact.rs`)
-//!  8 measure          tools/verify.sh --measure <that bundle>: the bytes that ship
-//!  9 preflight        the preflight and the provisioning again, with what changed
-//!                     while the long steps ran (the cut's disk, the version's tag, the
-//!                     cut's read-only pre-claim gates): READY, or nothing is staged;
-//!                     then the release's OWN handoff fixtures, written by the in-tree
-//!                     generator under the reserved identity into the release cache
+//!                     by what it was built as (`artifact.rs`) — and beside it the
+//!                     release's OWN handoff fixtures, written by the in-tree generator
+//!                     under the reserved identity into the release cache
 //!                     (`fixtures::stage`): a generator that refuses, refuses here
-//! 10 stage            pub stage aterm --commit R --repo-path <this clone>
-//! 11 publish          pub publish aterm --repo-path <this clone>
-//! 12 cut              ship cut: claim the reservation, then sign, notarize and
-//!                     package a byte copy of the MEASURED bundle (a claimed cut:
-//!                     --resume; the cut never builds)
-//! 13 after-cut        the published release's shape, from what GitHub serves, then
+//!  6 verify           `verify release --app <that bundle>` in the clone: every check
+//!                     a release requires, MEASURE of the bytes that ship among them;
+//!                     on a pass, the record that R's tree passed on those bytes
+//!  7 ready            READY: that record stands for R, or nothing
+//!                     goes public (`--prepare` stops here)
+//!  8 publish          this machine's provisioning (audit 2: a gap only the owner closes
+//!                     is waited on here), what the cut would refuse, the engine that
+//!                     staged R (else the stage runs again, by the engine as it is now),
+//!                     then pub publish aterm --repo-path <this clone>
+//!  9 cut              ship cut: claim the reservation, then sign, notarize and
+//!                     package a byte copy of the VERIFIED bundle (a claimed cut:
+//!                     --resume; the cut never builds, and reads what depends only on
+//!                     R's tree from this release instead of judging it again)
+//! 10 after-cut        the published release's shape, from what GitHub serves, then
 //!                     alab.systems brought to it, then the staged handoff fixtures
 //!                     landed on main with their PINNED_DESKS rows (`fixtures::land`,
 //!                     a compare-and-swap; nothing to do when main holds them)
-//! 14 check            the channel's `latest` is vX.Y.0
+//! 11 check            the channel's `latest` is vX.Y.0
 //! ```
 //!
 //! Then ONE final line: `RELEASED …`, or `REFUSED at <step>: <why> — <what is public>.
@@ -54,41 +63,61 @@
 //! from this machine's measured step times.
 //!
 //! RESUMABLE BY FACTS. Every step asks whether its work is ALREADY DONE for R, never
-//! whether it ran: the trust verdict for R from the release's prover, the bundle the
-//! journal names COMPLETE in the release cache with its bytes re-proved, a `measured
-//! yes` MEASURE receipt filed under its executable's digest, a promotable attestation
+//! whether it ran: the bundle the
+//! journal names COMPLETE in the release cache with its bytes re-proved, the record that
+//! `verify release` passed for R's tree on that bundle's executable, a promotable attestation
 //! of R in `publish/.out`, R in the engine's ledger (`mappings.json`), the cut journal
 //! (`dist/cut-state.toml`: finished, or claimed and resumed). The release's own journal
 //! (`<git common dir>/aterm-release/release.toml`) fixes the version, R, the prover,
 //! the Linux declaration, the reserved identity and the bundle built from it, so a bare
 //! re-run resumes and never chases main's moving tip, nor rebuilds what it built: the
 //! READY candidate is kept, and only `--commit` replaces it, out loud, while it is
-//! unpublished.
+//! unpublished. What depends only on R's tree is judged ONCE, in this journal — R's
+//! commit-only gates (`commit-gates`), the fixture guard and the censuses at step 4,
+//! and every check of the `release` set at `verify` — and the cut reads those facts,
+//! refusing without them, instead of judging R's tree again.
 //!
-//! BUILD ONCE. The bytes MEASURE judges are the bytes the cut signs: step 7 reserves
-//! the identity they carry (build n, release commit C) without claiming it, builds them
-//! once, and step 8 measures them; the cut claims that reservation and signs a byte
-//! copy of them, refusing a copy whose executable is not the measured one. A release
+//! PREPARE, THEN RELEASE. `--prepare` runs the same machine and stops after `ready`
+//! (READY), before anything is public: R staged, its bundle built once and
+//! passed by `verify release`. The journal records PREPARED ([`Prepared`]: the prover
+//! this run leased — its bin dir and `trustc -vV` commit — the reserved build, the
+//! verified executable and the engine that staged), this clone's run markers are let
+//! go, and the line names the command that finishes it. A bare run on a PREPARED journal
+//! FIRST asks the live world again — the prover re-leased with its identity required
+//! and this machine's provisioning (step 1), the version's tag absent on origin,
+//! origin's ledger tail below the reserved build, the prepare's own facts, the engine at
+//! its origin/main with the code that staged (else the stage runs again) — refusing on
+//! a mismatch with nothing public or claimed, and only then goes on, by facts, from
+//! READY. What it cannot ask is a COULD NOT RUN. A stale prepare is made again by
+//! `--prepare`, which redoes only what the change undid and records PREPARED anew — after
+//! a publish too, until a cut claims: only a claimed cut is past its prepare.
+//!
+//! BUILD ONCE. The bytes `verify release` judges are the bytes the cut signs: `build`
+//! reserves the identity they carry (build n, release commit C) without claiming it,
+//! builds them once, and `verify` verifies them; the cut claims that reservation and signs
+//! a byte copy of them, refusing a copy whose executable is not the verified one. A release
 //! that refuses before the cut's claim burns no number; a claim the ledger has passed
 //! meanwhile refuses with nothing burned, and the next run reserves anew and builds
 //! again.
 //!
-//! A COULD NOT RUN IS A STOP, NOT A RETRY. A step that decided nothing (the trust lane
-//! left libraries unmeasured, a MEASURE stage could not run, Apple's notary did not
-//! answer) ends the run as a resumable stop: the journal keeps the candidate, and the
+//! A COULD NOT RUN IS A STOP, NOT A RETRY. A step that decided nothing (`verify
+//! release` could not run a check, Apple's notary did
+//! not answer) ends the run as a resumable stop: the journal keeps the candidate, and the
 //! same command resumes at that step. A FAIL is never re-run, and COULD NOT RUN is never
 //! a pass.
 //!
 //! THE OWNER IS ASKED ONCE, AND NOTHING WAITS FOR HIM THAT DOES NOT NEED HIM. This
-//! machine's provisioning ([`crate::provision::audit`]) is audited before the long steps
-//! and before every step that needs it. A gap this machine's operator closes (a missing
-//! x86 slice, a stale toolchain) refuses before the hours of the long steps. A gap only
-//! the owner closes (Apple's developer agreement, a notary credential, the channel
-//! token) is raised ONCE as a standing ask on the owner's aterm (`aterm ctl notice ask`:
-//! `Message::now(Ask::standing(StandingWhy::OnlyYou(..), Then::step(..)))`, the one
-//! action in words), while the trust lane and MEASURE run; the release then waits at
-//! the strict preflight — the candidate READY, nothing public — re-auditing every ten
-//! minutes, and goes on the moment the gap closes, resolving the ask.
+//! machine's provisioning ([`crate::provision::audit`]) is audited twice: at the checks,
+//! before anything changes, and right before the publish, where it must hold. A gap
+//! this machine's operator closes (a missing x86 slice, a stale toolchain) refuses at
+//! minute one. A gap only the owner closes (Apple's developer agreement, a notary
+//! credential, the channel token) is raised ONCE, at the checks, as a standing ask on
+//! the owner's aterm (`aterm ctl notice ask`: `Message::now(Ask::standing(StandingWhy::
+//! OnlyYou(..), Then::step(..)))`, the one action in words), while the stage, the build
+//! and `verify release` run; the release then waits at the publish —
+//! the candidate READY, nothing public — re-auditing every ten minutes, and goes on the
+//! moment the gap closes, resolving the ask. The cut keeps its own credential and roster
+//! checks.
 //!
 //! ONE RUN PER CLONE: `<git common dir>/aterm-release/running` names the live run (its
 //! pid and that pid's start time, so a reused pid is no holder); a second run is
@@ -96,7 +125,7 @@
 //! session and process group), so a run killed outright leaves no step running unseen:
 //! while that child lives, the next run is refused naming it. The run re-executes
 //! itself as R's own cutter once the clone is at R (`gates::own_cutter`), so every
-//! judgment it makes of R — the receipts, the pre-claim gates, the fixture guard — is
+//! judgment it makes of R — the records, the pre-claim gates, the fixture guard — is
 //! R's; `exec` keeps the pid and its start time, so the claim is the same run's. Every
 //! relative path flag is anchored once, where the release started
 //! ([`ReleaseOptions::anchored`]), for the steps and the re-exec, which run from the
@@ -104,16 +133,15 @@
 //!
 //! INTERRUPTED, NEVER ORPHANED. Ctrl-C, a closed terminal or `kill -TERM <pid>` is
 //! passed to the running step's process group — every member but a Trust trustd,
-//! which is never signalled; the release waits for that step to end, lets the
-//! machine's lock go, and ends in ONE line, `INTERRUPTED at <step> — <what is public>.
-//! …`, exit 130. A second signal kills the step's group (trustd aside) outright. The
-//! waits that run no child — for the machine's lock, for the owner — end within a
-//! second of the signal the same way. A signal the release was started ignoring
+//! which is never signalled; the release waits for that step to end and ends in ONE
+//! line, `INTERRUPTED at <step> — <what is public>. …`, exit 130. A second signal kills
+//! the step's group (trustd aside) outright. A wait for the owner, which runs no child,
+//! ends within a second of the signal the same way. A signal the release was started ignoring
 //! (`nohup`) stays ignored.
 //!
-//! Exit: 0 released (or a dry run a real run would carry through) · 1 refused (the
-//! final line names the step, why and the remedy) · 2 bad usage · 3 a resumable stop
-//! (COULD NOT RUN: run it again) · 130 interrupted.
+//! Exit: 0 released, prepared (`--prepare`), or a dry run a real run would carry
+//! through · 1 refused (the final line names the step, why and the remedy) · 2 bad
+//! usage · 3 a resumable stop (COULD NOT RUN: run it again) · 130 interrupted.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -125,6 +153,39 @@ use crate::provision::{AskWords, Audited, Finding};
 /// How an operator runs a release — the ONE spelling every remedy names.
 pub const RELEASE_COMMAND: &str = crate::ledger::RELEASE_COMMAND;
 
+/// What `verify` runs in the clone at R after the release's own `targo`, as an agent would
+/// run it — every check a release requires — then `--app <the bundle>`, the bytes it
+/// judges. The spawn and every printed rerun line are built from it.
+pub const VERIFY_ARGS: [&str; 7] = [
+    "--unverified",
+    "run",
+    "-q",
+    "-p",
+    "aterm-verify",
+    "--",
+    "release",
+];
+
+/// [`VERIFY_ARGS`] as a command an operator pastes, `app` the bundle it judges.
+#[must_use]
+pub fn verify_command(app: &str) -> String {
+    format!("targo {} --app {}", VERIFY_ARGS.join(" "), shell_word(app))
+}
+
+/// `word` as one shell word: as it is when nothing in it is special to a shell, else
+/// single-quoted.
+pub(crate) fn shell_word(word: &str) -> String {
+    let plain = !word.is_empty()
+        && word
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"/._-+=:,@%".contains(&b));
+    if plain {
+        word.to_string()
+    } else {
+        format!("'{}'", word.replace('\'', "'\\''"))
+    }
+}
+
 /// The release's directory in the clone's git common directory: its journal, its
 /// run claim — shared by every worktree of the clone.
 pub const RELEASE_DIR: &str = "aterm-release";
@@ -135,9 +196,59 @@ pub const JOURNAL_FILE: &str = "release.toml";
 /// The live run's claim, beside the journal.
 pub const RUNNING_FILE: &str = "running";
 
-/// The running step's child (its pid, start time and step), beside the claim: what a
-/// run killed outright would leave running.
+/// The running step's children, beside the claim: a note per child, `running.child.<pid>`
+/// (its pid, start time and step) — a step runs several beside each other — naming what
+/// a run killed outright would leave running. A bare `running.child` (an older cutter's
+/// note) is read the same way.
 pub const RUNNING_CHILD_FILE: &str = "running.child";
+
+/// The note of the step's child `pid` in `dir` ([`RUNNING_CHILD_FILE`]).
+#[must_use]
+pub fn child_note(dir: &Path, pid: u32) -> PathBuf {
+    dir.join(format!("{RUNNING_CHILD_FILE}.{pid}"))
+}
+
+/// Every step child's note in `dir`: `running.child.<pid>`, and a bare `running.child`.
+#[must_use]
+pub fn child_notes(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut notes: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|entry| is_child_note(&entry.file_name().to_string_lossy()))
+        .map(|entry| entry.path())
+        .collect();
+    notes.sort();
+    notes
+}
+
+/// `running.child`, or `running.child.<pid>`.
+fn is_child_note(name: &str) -> bool {
+    name == RUNNING_CHILD_FILE
+        || name
+            .strip_prefix(RUNNING_CHILD_FILE)
+            .and_then(|rest| rest.strip_prefix('.'))
+            .is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// The journal's fact that R's own pre-claim gates that read only the commit passed —
+/// the changelog, the predecessor's handoff fixtures, the handoff policy, the locked
+/// metadata — written by the release before anything is staged, and read by the cut
+/// (`publish::verified_release_bundle`), which refuses without it: what depends only on
+/// R's tree is judged once, and never re-derived at the claim.
+pub const COMMIT_GATES: &str = "commit-gates";
+
+/// The journal's fact that the handoff fixture guard passed for R.
+pub const FIXTURE_GUARD: &str = "fixture-guard";
+
+/// The journal's fact that the L0 censuses (`aterm-census --all`) passed over R's tree.
+pub const CENSUS: &str = "census";
+
+/// The journal's fact that the release's own handoff fixtures are staged in the release
+/// cache for the journal's reservation: written beside the build, dropped with
+/// the reservation when a fresh one replaces it.
+pub const FIXTURES_STAGED: &str = "fixtures-staged";
 
 /// How often an owner gap is audited again while the release waits on it: a poll
 /// cadence, never a verdict.
@@ -156,13 +267,10 @@ pub enum Step {
     Checks,
     Sync,
     Commit,
-    PreflightEarly,
-    Trust,
-    Lock,
-    Build,
-    Measure,
-    Preflight,
     Stage,
+    Build,
+    Verify,
+    Ready,
     Publish,
     Cut,
     AfterCut,
@@ -171,17 +279,14 @@ pub enum Step {
 
 impl Step {
     /// Every step, in the order a release runs them.
-    pub const ALL: [Step; 14] = [
+    pub const ALL: [Step; 11] = [
         Step::Checks,
         Step::Sync,
         Step::Commit,
-        Step::PreflightEarly,
-        Step::Trust,
-        Step::Lock,
-        Step::Build,
-        Step::Measure,
-        Step::Preflight,
         Step::Stage,
+        Step::Build,
+        Step::Verify,
+        Step::Ready,
         Step::Publish,
         Step::Cut,
         Step::AfterCut,
@@ -195,13 +300,10 @@ impl Step {
             Step::Checks => "checks",
             Step::Sync => "sync",
             Step::Commit => "commit",
-            Step::PreflightEarly => "preflight-early",
-            Step::Trust => "trust",
-            Step::Lock => "lock",
-            Step::Build => "build",
-            Step::Measure => "measure",
-            Step::Preflight => "preflight",
             Step::Stage => "stage",
+            Step::Build => "build",
+            Step::Verify => "verify",
+            Step::Ready => "ready",
             Step::Publish => "publish",
             Step::Cut => "cut",
             Step::AfterCut => "after-cut",
@@ -218,31 +320,24 @@ impl Step {
             .map_or(0, |i| i + 1)
     }
 
-    /// `n/14 name`, as a refusal names the step.
+    /// `n/N name`, as a refusal names the step.
     #[must_use]
     pub fn at(self) -> String {
         format!("{}/{} {}", self.number(), Step::ALL.len(), self.name())
     }
 
-    /// What a step took before this machine measured it (the 2026-09-29 plan's and
-    /// critique's figures, and 0.101's cut log): the two slices' build 7m04s and
-    /// 6m33s one after the other, at once about 7.5 min, plus the lipo, dSYM and
-    /// Rosetta drive; MEASURE 858 s for 0.99, of which the 307.8 s fat-LTO build it no
-    /// longer does; stage 3.5 min, publish 3 min, the cut 19.5-39.7 min over
-    /// 0.94-0.98 less the build and paint smoke it no longer runs, after-cut 52 s, and the whole-tree
-    /// trust lane 2-4 h.
+    /// What a step takes before this machine has timed it: the plan's estimates, until
+    /// `steps.tsv` holds this machine's own.
     fn default_secs(self) -> u64 {
         match self {
-            Step::Checks | Step::Sync => 15,
-            Step::Commit | Step::PreflightEarly | Step::Preflight | Step::AfterCut => 60,
-            Step::Trust => 10_800,
+            Step::Sync | Step::Ready => 15,
+            Step::Checks | Step::Commit | Step::AfterCut => 60,
+            Step::Stage => 330,
             Step::Build => 600,
-            Step::Measure => 550,
-            Step::Stage => 210,
+            Step::Verify => 3_600,
             Step::Publish => 180,
             Step::Cut => 900,
             Step::Check => 5,
-            Step::Lock => 0,
         }
     }
 }
@@ -339,6 +434,9 @@ pub struct ReleaseOptions {
     pub engine: Option<PathBuf>,
     pub dry_run: bool,
     pub verbose: bool,
+    /// `--prepare`: run the heavy half and stop after the stage, PREPARED, nothing
+    /// public; a bare run then finishes it ([`Prepared`]).
+    pub prepare: bool,
     /// `--forget`: drop this clone's release journal (nothing public changes).
     pub forget: bool,
     /// `--abandon vX.Y.Z`: withdraw this clone's claimed, unpublished cut of it.
@@ -425,22 +523,54 @@ pub struct Journal {
     pub started: u64,
     #[serde(default)]
     pub linux: LinuxDecl,
-    /// Facts only this journal holds for R: `fixture-guard`, `after-cut`,
-    /// `site-deferred`, `check`.
+    /// Facts only this journal holds for R: [`COMMIT_GATES`], [`FIXTURE_GUARD`],
+    /// [`CENSUS`], [`FIXTURES_STAGED`], `after-cut`, `site-deferred`, `check`.
     #[serde(default)]
     pub done: Vec<String>,
     /// The owner asks DELIVERED and not yet resolved, by key — carried over when the
     /// candidate is replaced, withdrawn by `--forget`.
     #[serde(default)]
     pub asks: Vec<String>,
-    /// R's reserved identity (`ledger::reserve`, step 7): what the bundle is built
+    /// R's reserved identity (`ledger::reserve`, `build`): what the bundle is built
     /// as, and what the cut claims. Kept until the claim lands it; replaced only when
     /// origin's ledger has passed it.
     #[serde(default)]
     pub reserved: Option<Reservation>,
-    /// The bundle step 7 built from it, once: what MEASURE judges and the cut signs.
+    /// The bundle built from that reservation: what `verify release` judges and the cut
+    /// signs.
     #[serde(default)]
     pub artifact: Option<Artifact>,
+    /// `--prepare` stopped here, everything heavy done for R and nothing claimed: what a
+    /// bare run asks the live world again before it goes on from the publish. Written
+    /// only at that stop (again by a `--prepare` after a publish that stopped short of the
+    /// claim); a replaced candidate starts without one.
+    #[serde(default)]
+    pub prepared: Option<Prepared>,
+}
+
+/// A PREPARED release, as `--prepare` left it at its stop: R staged, its bundle built
+/// once and passed by `verify release`, its source staged, nothing claimed (and nothing public, unless a
+/// visible half published the source and stopped short of the claim) — and the
+/// identities the visible half requires again before it goes on.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Prepared {
+    /// Epoch seconds the prepare stopped.
+    pub at: u64,
+    /// The prover the prepare leased: its bin dir, physical — the build the visible half
+    /// re-leases.
+    pub prover: String,
+    /// That prover's `trustc -vV` commit-hash. A run whose prover differs from the
+    /// prepare's in this or in its bin dir refuses before the claim: the bundle and its
+    /// `verify release` pass are the prepare's prover's.
+    pub trustc: String,
+    /// The build number it reserved (the journal's reservation), built and verified.
+    pub build: u64,
+    /// SHA-256 of the executable `verify release` judged (the record it passed on).
+    pub macho_sha256: String,
+    /// The engine commit R's attestation names: the engine that staged. Empty only when
+    /// R's source was already published and publish/.out no longer names it — the visible
+    /// half asks no engine of a published source.
+    pub engine: String,
 }
 
 /// A reserved release identity, as the journal keeps it ([`crate::ledger::Reserved`]).
@@ -466,7 +596,7 @@ impl Reservation {
 }
 
 /// The bundle built ONCE for a reservation, as the journal keeps it: its store key,
-/// where it is, and the digest of the executable MEASURE judges.
+/// where it is, and the digest of the executable `verify release` judges.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Artifact {
     /// The [`crate::artifact::key`] it is kept under in the release cache.
@@ -603,9 +733,9 @@ fn alive(holder: &Holder, started_of: &mut dyn FnMut(u32) -> Option<String>) -> 
 }
 
 /// The live holder of `path`, if any: a claim whose pid is alive with the start time
-/// it recorded — else a step's child its run left alive ([`RUNNING_CHILD_FILE`] beside
-/// it), which holds the clone as surely: a second run would start the same step beside
-/// it. `started_of` answers a pid's start time (`None`: no such process).
+/// it recorded — else a step's child its run left alive (a note beside it,
+/// [`child_notes`]), which holds the clone as surely: a second run would start the same
+/// step beside it. `started_of` answers a pid's start time (`None`: no such process).
 pub fn live_holder(
     path: &Path,
     started_of: &mut dyn FnMut(u32) -> Option<String>,
@@ -613,11 +743,20 @@ pub fn live_holder(
     if let Some(holder) = read_holder(path).filter(|h| alive(h, started_of)) {
         return Some(holder);
     }
-    let child = read_holder(&path.with_file_name(RUNNING_CHILD_FILE))?;
-    alive(&child, started_of).then(|| Holder {
-        step: Some(child.step.clone().unwrap_or_else(|| "?".into())),
-        ..child
-    })
+    live_child(path.parent().unwrap_or(Path::new(".")), started_of)
+}
+
+/// The first step child noted in `dir` that is still alive: its note's holder, its step
+/// named.
+fn live_child(dir: &Path, started_of: &mut dyn FnMut(u32) -> Option<String>) -> Option<Holder> {
+    child_notes(dir)
+        .into_iter()
+        .filter_map(|note| read_holder(&note))
+        .find(|child| alive(child, started_of))
+        .map(|child| Holder {
+            step: Some(child.step.clone().unwrap_or_else(|| "?".into())),
+            ..child
+        })
 }
 
 impl RunClaim {
@@ -645,8 +784,10 @@ impl RunClaim {
         }
         let dir = path.parent().unwrap_or(Path::new("."));
         std::fs::create_dir_all(dir).map_err(|e| Err(format!("create {}: {e}", dir.display())))?;
-        // a dead run's child that is dead too holds nothing
-        let _ = std::fs::remove_file(dir.join(RUNNING_CHILD_FILE));
+        // a dead run's children that are dead too hold nothing
+        for note in child_notes(dir) {
+            let _ = std::fs::remove_file(note);
+        }
         if path.exists() {
             let aside = dir.join(format!("{RUNNING_FILE}.stale"));
             std::fs::rename(path, &aside)
@@ -739,14 +880,14 @@ pub struct CutState {
     pub finished: bool,
 }
 
-/// What the after-cut step did (step 13): the published release's shape checked as
+/// What the after-cut step did: the published release's shape checked as
 /// GitHub serves it, and alab.systems brought to it — or not from here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AfterCut {
     /// The step's line.
     pub note: String,
-    /// This machine has no usable site checkout (`publish/post-promote` exited 3 —
-    /// none found, or one it cannot build or deploy from — having touched nothing):
+    /// This machine has no usable site checkout (`ship site` found none, or one it
+    /// cannot build or deploy from, and touched nothing):
     /// the site is a hand step on a machine that has one
     /// ([`SITE_BY_HAND`]), recorded and said, and the release goes on to its check.
     pub site_deferred: bool,
@@ -756,8 +897,8 @@ pub struct AfterCut {
 /// the final line and every later run of the release say it. No ` — ` in it: the final
 /// line's parts are separated by that.
 pub const SITE_BY_HAND: &str = "alab.systems was NOT synced: this machine has no usable \
-     site checkout (publish/post-promote exited 3, touching nothing), so run \
-     `publish/post-promote --latest` on a machine with one";
+     site checkout (ship site touched nothing), so run \
+     `targo --unverified ship site --latest` on a machine with one";
 
 /// The journal's fact for a deferred site.
 const SITE_DEFERRED: &str = "site-deferred";
@@ -771,6 +912,20 @@ pub struct EngineRows {
     pub has: bool,
     /// Its row's release revision on the public channel.
     pub rev: Option<String>,
+}
+
+/// The publication engine as a PREPARED release's visible half finds it, against the
+/// engine that staged R ([`Backend::engine_now`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EngineNow {
+    /// At its origin/main, with the code that staged (its two ledgers aside: the audit
+    /// log and `mappings.json`, which every stage and every publish append to).
+    Same(String),
+    /// At its origin/main, and its code moved since it staged R: the stage runs again,
+    /// so the engine that publishes is the engine whose guards judged the export.
+    Moved(String),
+    /// Not at its origin/main: `pub stage` and `pub publish` refuse such an engine.
+    Off(String),
 }
 
 /// A judge's answer: yes or no, in its own words — or no answer at all.
@@ -820,15 +975,17 @@ pub struct Facts {
     pub engine: EngineRows,
     /// A promotable attestation of R in `publish/.out`.
     pub attested: bool,
-    /// The trust verdict for R, from the release's prover.
-    pub trusted: Answer,
+    /// The engine commit that attestation names (`engine.commit`): the engine that
+    /// staged R. `None` without a promotable attestation of R.
+    pub staged_by: Option<String>,
     /// The journal's bundle: COMPLETE in the release cache, its bytes re-proved,
     /// built by the release's prover.
     pub built: Answer,
-    /// The MEASURE verdict for that bundle's executable.
-    pub measured: Answer,
+    /// Whether `verify release` passed for R's tree on that bundle's executable (the
+    /// record `verify` writes, [`crate::gates::verified`]).
+    pub verified: Answer,
     /// The release's own handoff fixtures on origin/main, as the next cut's gate judges
-    /// them (`fixtures::on_commit`): landed by step 13, or by hand.
+    /// them (`fixtures::on_commit`): landed by `after-cut`, or by hand.
     pub fixtures: Answer,
 }
 
@@ -847,11 +1004,38 @@ pub struct Candidate {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ran {
     pub code: i32,
-    /// The lines that say why (a log tail, the gate's summary lines).
+    /// The lines that say why (a log tail, a check's summary lines).
     pub detail: Vec<String>,
 }
 
-/// Everything the release asks of the world — git, the engine, the receipts, the
+/// What step 4 runs beside each other, each only while its fact is missing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Beside {
+    /// `pub stage` (R not staged, or staged by an engine whose code moved since).
+    pub stage: bool,
+    /// The handoff fixture guard ([`FIXTURE_GUARD`] not journaled for R).
+    pub guard: bool,
+    /// The L0 censuses ([`CENSUS`] not journaled for R).
+    pub census: bool,
+}
+
+/// What each of them answered; `None` for one not run.
+#[derive(Debug, Default)]
+pub struct Besides {
+    pub stage: Option<Result<Ran, Refusal>>,
+    pub guard: Option<Result<String, Refusal>>,
+    pub census: Option<Result<String, Refusal>>,
+}
+
+/// What the build step's child answered, and the release's own handoff fixtures staged
+/// beside it (`None`: not asked for).
+#[derive(Debug)]
+pub struct Built {
+    pub artifact: Result<Artifact, Refusal>,
+    pub fixtures: Option<Result<String, Refusal>>,
+}
+
+/// Everything the release asks of the world — git, the engine, the records, the
 /// children, the clock, the owner's aterm. [`crate::release_steps`] is the real one;
 /// the tests drive the same machine with a fake.
 pub trait Backend {
@@ -886,13 +1070,13 @@ pub trait Backend {
     fn prover(&mut self, journaled: Option<&str>) -> Result<Prover, String>;
     /// Hold the prover for the release's life (atpkg's lease).
     fn lease(&mut self, prover: &Prover);
-    /// The build-steering variables the gate records, cleared for every child.
+    /// The build-steering variables cleared for every child, as the checks line names them.
     fn cleared_env(&mut self) -> Vec<String>;
     /// The machine's step-1 refusals: an explicit credentials path that is no file, the
-    /// cut's disk, the engine checkout, this clone (clean by
-    /// `aterm_verify::identity::dirty_against`, on main). The roster id is the answer
-    /// (empty when none is named: the audit's owner gap). gh, the credentials profile and
-    /// the roster are the provisioning audit's alone ([`Backend::audit`]).
+    /// cut's disk, the engine checkout, this clone (clean by [`crate::clean`], on main).
+    /// The roster id is the answer (empty when none is named: the audit's owner gap). gh,
+    /// the credentials profile and the roster are the provisioning audit's alone
+    /// ([`Backend::audit`], asked right after).
     fn machine(&mut self, creds: &Path, explicit: bool) -> (String, Vec<Refusal>);
     /// `git fetch origin main` and the tags on origin; the tip of origin/main.
     fn fetch(&mut self) -> Result<String, Refusal>;
@@ -911,6 +1095,17 @@ pub trait Backend {
     /// `RELEASES.ledger`'s versions at `rev`, oldest first.
     fn ledger_versions(&mut self, rev: &str) -> Vec<String>;
     fn engine_rows(&mut self, commit: Option<&str>) -> EngineRows;
+    /// The engine NOW, against `staged` (the engine commit R's attestation names): at its
+    /// origin/main with the code that staged, moved, or off its origin/main. Read-only.
+    /// `Err` when it cannot be asked.
+    fn engine_now(&mut self, staged: &str) -> Result<EngineNow, String>;
+    /// The private staging tier NOW, against R's attestation in publish/.out: `Ok(None)`
+    /// while `<repo>-staging`'s main is the commit the attestation names
+    /// (`staging.attested_rev`), `Ok(Some(why))` once it moved — any peer's `pub stage
+    /// aterm` (a `pub cycle --all`) moves it, and `pub promote` then dies "staging moved
+    /// after attestation; re-stage". Read-only (`git ls-remote`); `Err` when it cannot
+    /// be asked.
+    fn staging_moved(&mut self) -> Result<Option<String>, String>;
     fn cut_journal(&mut self) -> Option<CutState>;
     /// The Linux handoff directory exists.
     fn is_dir(&mut self, path: &Path) -> bool;
@@ -923,31 +1118,39 @@ pub trait Backend {
     /// This clone's main to R, its submodules at their gitlinks, and clean there.
     fn move_to(&mut self, commit: &str) -> Result<(), Refusal>;
     /// Whether this binary is R's own cutter (`gates::own_cutter`).
-    fn own_cutter(&mut self, commit: &str) -> Result<String, String>;
+    fn own_cutter(&mut self, commit: &str) -> Result<String, crate::cutter::NotOwn>;
     /// Exec R's own cutter with this process's arguments. Returns only on failure.
     fn reexec(&mut self, prover: &Prover) -> Refusal;
     /// The facts for R; `artifact` is the journal's bundle, when it names one.
     fn facts(&mut self, c: &Candidate, prover: &Prover, artifact: Option<&Artifact>) -> Facts;
-    /// Free GiB here, and whether the MEASURE run's lanes are warm.
+    /// Free GiB here, and whether the clone's target directory is warm.
     fn disk(&mut self) -> (Option<u64>, bool);
-    /// The preflight: every export guard (the engine's dry run), the fixtures and
-    /// changelog (R's own pre-claim gates), the tag, the engine and the wasm32
-    /// engine. The blocks; a `receipt` block is one steps 5-8 answer. `dry`: only
-    /// what reads — the engine's dry run (it appends an audit row) and the wasm32
-    /// compile are a real run's. `again` (step 9): R's gates and the engine's
-    /// readiness, not the engine's dry run and the wasm32 compile — step 4 judged
-    /// both for this R, and `pub stage`, the step after, runs both as its own gates.
-    fn preflight(&mut self, c: &Candidate, dry: bool, again: bool) -> Vec<(bool, Refusal)>;
+    /// The preflight of step 4, seconds, before the stage: R's own pre-claim gates that
+    /// read only the commit — the changelog, the predecessor's handoff fixtures, the
+    /// handoff policy (each read from R's objects, judged for the release's version: a
+    /// bump not made yet is judged on its parent), the locked metadata (the clone, at R)
+    /// — and the engine's readiness (gitleaks installed, the pre-promote seam). The
+    /// blocks, each with its fix. `dry`: a dry run's (it says when this cutter is not R's
+    /// own yet).
+    fn commit_gates(&mut self, c: &Candidate, dry: bool) -> Vec<Refusal>;
     /// The cut's own pre-claim gates that read without building and need nothing the
-    /// publish makes (`publish::pre_publish_gates`): the locked metadata, no process run
-    /// out of a staged bundle, the release lease, the channel's write permission, the
-    /// signature policy, the roster ratchet and the channel floor. Asked at step 8, so a
-    /// refusal there leaves nothing public.
+    /// publish makes (`publish::pre_publish_gates`): no process run out of a staged
+    /// bundle, the release lease, the channel's write permission, the signature policy,
+    /// the roster ratchet and the channel floor — and the two of R's commit-only gates
+    /// that also read origin (the predecessor's handoff fixtures, the handoff policy:
+    /// the predecessor is the newest release tagged on origin, which a peer may tag
+    /// while the long steps run). Asked at the checks and again right before the
+    /// publish (or the fresh cut it does not publish for), so a refusal leaves nothing
+    /// (more) public.
     fn cut_gates(&mut self, c: &Candidate, creds: &Path) -> Vec<Refusal>;
-    fn fixture_guard(&mut self, prover: &Prover) -> Result<String, Refusal>;
+    /// Step 4's heavy half, what `beside` names of it, each beside the others: `pub
+    /// stage` (the engine synced before and after it), the handoff fixture guard and the
+    /// L0 censuses over the clone at R (`gates::census_gate`), each with the prover's
+    /// `targo` and a target directory of its own.
+    fn stage_beside(&mut self, c: &Candidate, prover: &Prover, beside: Beside) -> Besides;
     /// Write the release's own handoff fixtures for its reserved identity into the
-    /// release cache, with the in-tree generator in the cut tree, unless they are
-    /// staged already (`fixtures::stage`): what was done, or the refusal.
+    /// release cache, with the in-tree generator in the clone, unless they are staged
+    /// already (`fixtures::stage`): what was done, or the refusal.
     fn stage_fixtures(
         &mut self,
         c: &Candidate,
@@ -969,31 +1172,43 @@ pub trait Backend {
     fn resolve(&mut self, key: &str) -> Result<String, String>;
     /// Withdraw it (`notice done <key> withdraw`): its release is forgotten.
     fn withdraw(&mut self, key: &str) -> Result<String, String>;
-    fn trust_pending(&mut self, c: &Candidate, prover: &Prover) -> Vec<String>;
-    fn trust_lane(&mut self, prover: &Prover, remeasure: bool) -> Ran;
-    fn lock(&mut self, caller: &str) -> Result<String, Refusal>;
-    fn unlock(&mut self);
     /// Origin's ledger tail (the newest claimed build), from step 1's fetch.
     fn origin_tail(&mut self) -> Option<u64>;
     /// Reserve R's identity (`ledger::reserve`): build n and the release commit C,
     /// made from objects, claimed nowhere.
     fn reserve(&mut self, c: &Candidate) -> Result<Reservation, Refusal>;
     /// Build the bundle of `reserved` ONCE (`ship build`, `artifact::build`): both
-    /// slices at once into the release cache, or the COMPLETE entry already there.
+    /// slices at once into the release cache, or the COMPLETE entry already there — and,
+    /// with `fixtures`, the release's own handoff fixtures staged beside it
+    /// ([`Backend::stage_fixtures`]).
     fn build(
         &mut self,
         c: &Candidate,
         reserved: &Reservation,
         prover: &Prover,
-    ) -> Result<Artifact, Refusal>;
-    /// `tools/verify.sh --measure <app> …`; `true` when a MEASURE stage itself could
-    /// not run.
-    fn measure(&mut self, prover: &Prover, app: &Path) -> (Ran, bool);
+        fixtures: bool,
+    ) -> Built;
+    /// `verify release --app <the bundle>` in the clone at R with the release's prover,
+    /// its output streamed; on exit 0 the record that R's tree passed on the bundle's
+    /// executable is written ([`crate::gates::record_verified`]). `Err` (could not run,
+    /// nothing recorded) when the clone was not at R's tree and clean as the run started,
+    /// or no longer was when it passed.
+    fn verify(
+        &mut self,
+        c: &Candidate,
+        prover: &Prover,
+        artifact: &Artifact,
+    ) -> Result<Ran, Refusal>;
     /// `pub stage`, the engine synced before and after it; `Err` when either sync failed
-    /// (the audit rows it kept are named).
+    /// (the audit rows it kept are named). Step 4 runs it beside the guard and the
+    /// censuses ([`Backend::stage_beside`]); the publish alone, when the engine that
+    /// staged R moved since.
     fn stage(&mut self, c: &Candidate, prover: &Prover) -> Result<Ran, Refusal>;
     /// `pub publish`, the engine synced before it; `Err` when that sync failed.
     fn publish(&mut self, prover: &Prover) -> Result<Ran, Refusal>;
+    /// The published source's signed manifest pair, read from the channel now. A
+    /// ledger row alone can survive a publish that failed before signing it.
+    fn source_publication(&mut self, c: &Candidate) -> Result<(), Refusal>;
     fn cut(&mut self, args: &[String], prover: &Prover) -> Ran;
     /// The published release's shape, then the site; `Err` with the step's why.
     fn after_cut(&mut self, version: &str) -> Result<AfterCut, Refusal>;
@@ -1065,10 +1280,12 @@ struct Run<'b> {
     cur: Step,
     cur_t0: u64,
     t_start: u64,
-    /// A dry run's refusals, `n/14 step: why`.
+    /// A dry run's refusals, `n/N step: why`.
     would: Vec<String>,
-    /// A dry run's owner waits.
+    /// A dry run's owner waits, each gap once, and the step a real run would first wait
+    /// at.
     waits: Vec<String>,
+    wait_at: Option<Step>,
     public: String,
     prover: Option<Prover>,
     machine_id: String,
@@ -1080,7 +1297,18 @@ struct Run<'b> {
     planned: Vec<Step>,
     est: BTreeMap<String, u64>,
     plan_secs: u64,
-    locked: bool,
+    /// `--prepare`: the steps the visible half runs after the stop, and their estimate.
+    later: Vec<Step>,
+    later_secs: u64,
+    /// The engine moved since it staged R — a PREPARED release's ([`Run::reask_prepared`])
+    /// or any release's right before its publish ([`Run::engine_still_staged`], where a
+    /// moved staging tier stages again too): (the engine a fresh attestation must not
+    /// name again, if any; why). The stage runs again.
+    restage: Option<(Option<String>, String)>,
+    /// Owner asks delivered before this run had a journal to note them in (its checks,
+    /// on a first run): journaled with the candidate at step 3, so they are not raised
+    /// again.
+    early_asks: Vec<String>,
     /// Seconds the current step waited for the owner (not its own time).
     waited: u64,
     /// A dry run audits once.
@@ -1107,6 +1335,7 @@ pub fn run_with(b: &mut dyn Backend, opts: &ReleaseOptions, home: &Path) -> Outc
         t_start: 0,
         would: Vec::new(),
         waits: Vec::new(),
+        wait_at: None,
         public: "nothing public".to_string(),
         prover: None,
         machine_id: String::new(),
@@ -1118,7 +1347,10 @@ pub fn run_with(b: &mut dyn Backend, opts: &ReleaseOptions, home: &Path) -> Outc
         planned: Vec::new(),
         est: BTreeMap::new(),
         plan_secs: 0,
-        locked: false,
+        later: Vec::new(),
+        later_secs: 0,
+        restage: None,
+        early_asks: Vec::new(),
         waited: 0,
         dry_audit: None,
         last: String::new(),
@@ -1139,14 +1371,12 @@ pub fn run_with(b: &mut dyn Backend, opts: &ReleaseOptions, home: &Path) -> Outc
                 run.public,
                 log.display()
             );
+            run.withdraw_early_asks();
             let last = run.last.clone();
             run.b.say(&last);
             1
         }
     };
-    if run.locked {
-        run.b.unlock();
-    }
     Outcome {
         code,
         last: run.last,
@@ -1199,31 +1429,16 @@ impl Run<'_> {
         self.refresh();
         self.plan_print();
 
-        self.begin(Step::PreflightEarly)?;
+        self.begin(Step::Stage)?;
         if let Some(why) = self.claimed_words() {
             self.skip(&why);
         } else {
+            // a PREPARED release asks the live world again before anything else
+            if let Some(prep) = self.pending_reask() {
+                self.reask_prepared(&prep)?;
+            }
             self.disk_still_needed()?;
-            self.preflight(false)?;
-        }
-
-        self.begin(Step::Trust)?;
-        if let Some(why) = self.skip_trust() {
-            self.skip(&why);
-        } else {
-            self.trust()?;
-        }
-
-        self.begin(Step::Lock)?;
-        if !self.lock_needed() {
-            self.skip(
-                "nothing heavy or judged on the clock remains (built, measured, and the cut \
-                 finished)",
-            );
-        } else if self.dry {
-            self.finish("would take this machine's gate lock in its line and hold it to the end");
-        } else {
-            self.take_lock()?;
+            self.stage()?;
         }
 
         self.begin(Step::Build)?;
@@ -1233,32 +1448,32 @@ impl Run<'_> {
             self.build()?;
         }
 
-        self.begin(Step::Measure)?;
-        if let Some(why) = self.skip_measure() {
+        self.begin(Step::Verify)?;
+        if let Some(why) = self.skip_verify() {
             self.skip(&why);
         } else {
-            self.measure()?;
+            self.verify()?;
         }
 
-        self.begin(Step::Preflight)?;
+        self.begin(Step::Ready)?;
         if let Some(why) = self.claimed_words() {
             self.skip(&why);
         } else {
-            self.preflight(true)?;
+            self.ready()?;
         }
 
-        self.begin(Step::Stage)?;
-        if let Some(why) = self.skip_stage() {
-            self.skip(&why);
-        } else {
-            self.stage()?;
+        // `--prepare` stops here: everything heavy done, nothing public
+        if self.opts.prepare {
+            self.prepare_stop()?;
         }
 
         self.begin(Step::Publish)?;
-        if let Some(why) = self.skip_publish() {
-            self.skip(&why);
-        } else {
-            self.publish()?;
+        match self.skip_publish() {
+            Some(why) if matches!(self.cut_mode(), CutMode::Fresh) => {
+                self.audit_before_cut(&why)?;
+            }
+            Some(why) => self.skip(&why),
+            None => self.publish()?,
         }
 
         self.begin(Step::Cut)?;
@@ -1282,7 +1497,7 @@ impl Run<'_> {
             if !shaped {
                 words.push(format!(
                     "would check v{v}'s shape as GitHub serves it, then bring alab.systems to \
-                     it (publish/post-promote --latest)"
+                     it (ship site --latest)"
                 ));
             }
             words.push(if self.facts.fixtures.yes {
@@ -1338,17 +1553,12 @@ impl Run<'_> {
         Ok(())
     }
 
-    /// A signal arrived (the step's child was handed it and has ended): the machine's
-    /// lock goes, and the run ends in its ONE line, exit 130. The journal is durable,
-    /// so the same command resumes.
+    /// A signal arrived (the step's child was handed it and has ended): the run ends in
+    /// its ONE line, exit 130. The journal is durable, so the same command resumes.
     fn halt_if_interrupted(&mut self) -> Flow {
         let Some(sig) = self.b.interrupted() else {
             return Ok(());
         };
-        if self.locked {
-            self.b.unlock();
-            self.locked = false;
-        }
         let step = self.cur;
         let cut = if step == Step::Cut {
             " The cut stopped with this run; running the command again resumes it."
@@ -1361,9 +1571,31 @@ impl Run<'_> {
             signal_name(sig),
             self.public
         );
+        self.withdraw_early_asks();
         let last = self.last.clone();
         self.say(&last);
         Err(Halt::Said(130))
+    }
+
+    /// The owner asks the checks delivered with no journal to note them in, when the run
+    /// stops before step 3 journals them: withdrawn, said before the final line — else
+    /// the standing ask outlives the run with nothing that would ever resolve or withdraw
+    /// it (`--forget` withdraws only what a journal holds). The next run's audit raises
+    /// it again if the gap still stands.
+    fn withdraw_early_asks(&mut self) {
+        for key in std::mem::take(&mut self.early_asks) {
+            let line = match self.b.withdraw(&key) {
+                Ok(reply) => format!(
+                    "        withdrew the owner's ask {key} ({reply}): no journal holds it yet, \
+                     and the next run's audit asks again"
+                ),
+                Err(why) => format!(
+                    "        could not withdraw the owner's ask {key} ({why}): no journal holds \
+                     it, so it stands until the owner closes it"
+                ),
+            };
+            self.say(&line);
+        }
     }
 
     fn finish(&mut self, note: &str) {
@@ -1466,10 +1698,6 @@ impl Run<'_> {
         for line in &r.detail {
             self.b.say(&format!("        | {line}"));
         }
-        if self.locked {
-            self.b.unlock();
-            self.locked = false;
-        }
         let why = if r.could_not_run {
             format!("COULD NOT RUN — {}", r.why)
         } else {
@@ -1481,6 +1709,7 @@ impl Run<'_> {
             self.public,
             r.remedy
         );
+        self.withdraw_early_asks();
         let last = self.last.clone();
         self.say(&last);
         Err(Halt::Said(if r.could_not_run { 3 } else { 1 }))
@@ -1494,17 +1723,29 @@ impl Run<'_> {
         } else {
             format!(
                 ", and wait for the owner at {} ({})",
-                Step::Preflight.at(),
+                self.wait_at.unwrap_or(Step::Publish).at(),
                 self.waits.join("; ")
             )
         };
         if self.would.is_empty() {
-            self.last = format!(
-                "DRY RUN aterm {v} from {}: a real run would go ahead, about {} of work{waits} \
-                 — nothing was changed",
-                short(&r),
-                fmt_dur(self.plan_secs)
-            );
+            self.last = if self.opts.prepare {
+                format!(
+                    "DRY RUN aterm {v} from {}: a real --prepare would go ahead and stop PREPARED \
+                     after {}, about {} of work{waits}; then {RELEASE_COMMAND} would finish it, \
+                     about {} — nothing was changed",
+                    short(&r),
+                    Step::Ready.at(),
+                    fmt_dur(self.plan_secs),
+                    fmt_dur(self.later_secs)
+                )
+            } else {
+                format!(
+                    "DRY RUN aterm {v} from {}: a real run would go ahead, about {} of \
+                     work{waits} — nothing was changed",
+                    short(&r),
+                    fmt_dur(self.plan_secs)
+                )
+            };
             let last = self.last.clone();
             self.say(&last);
             return Err(Halt::Said(0));
@@ -1620,6 +1861,425 @@ impl Run<'_> {
         Err(Halt::Said(0))
     }
 
+    // -- prepare, then release --------------------------------------------------
+
+    /// The journal's PREPARED record of R, if it holds one and R is not released yet (a
+    /// finished release's record is history).
+    fn prepared(&self) -> Option<Prepared> {
+        let r = self.commit_r();
+        self.journal
+            .as_ref()
+            .filter(|j| j.commit == r && !j.finished())
+            .and_then(|j| j.prepared.clone())
+    }
+
+    /// What the VISIBLE HALF asks again: a run without `--prepare`, on a journal that
+    /// prepared R, before the claim (past it, the cut's own journal is what resumes).
+    fn pending_reask(&mut self) -> Option<Prepared> {
+        if self.opts.prepare || self.claimed() {
+            return None;
+        }
+        self.prepared()
+    }
+
+    /// `p` is the very build the prepare held: its bin dir and its `trustc` commit.
+    fn same_prover(p: &Prover, prep: &Prepared) -> bool {
+        p.bin.display().to_string() == prep.prover && p.commit == prep.trustc
+    }
+
+    /// This clone's run claim, let go: this run holds nothing now.
+    fn let_go(&mut self) {
+        self.claim = None;
+    }
+
+    /// A PREPARED release stages again ([`Run::reask_prepared`]): `old` is the engine R's
+    /// attestation names, which a fresh stage must not name again; planned, with its ETA.
+    fn stage_again(&mut self, old: Option<String>, why: String) {
+        if !self.planned.contains(&Step::Stage) {
+            let secs = self.est_secs(Step::Stage);
+            self.planned.push(Step::Stage);
+            self.planned.sort();
+            self.plan_secs += secs;
+        }
+        self.restage = Some((old, why));
+    }
+
+    /// THE VISIBLE HALF ASKS THE LIVE WORLD AGAIN, first, on a journal `--prepare` left
+    /// PREPARED — before anything is claimed (or public, unless a visible half published
+    /// and stopped short of the claim), and before it goes on by facts. The prover was
+    /// re-leased at step 1, its identity required there, and this machine's provisioning
+    /// audited there (a gap only the owner closes is waited on at the publish); here: the
+    /// version's tag absent on origin, origin's ledger tail still below the reserved
+    /// build, the prepare's own facts (the bundle built once, `verify release`
+    /// passed on those bytes), and the engine R's attestation names at its origin/main
+    /// with the code that staged R — else the stage runs again, so the engine that
+    /// publishes is the one whose guards judged the export (and it is asked once more
+    /// right before the publish, [`Run::engine_still_staged`]). A mismatch refuses: the
+    /// prepare is stale, and `--prepare` makes again only what it undid. What cannot be
+    /// asked is a resumable stop (COULD NOT RUN), never a pass.
+    fn reask_prepared(&mut self, prep: &Prepared) -> Flow {
+        let (v, r) = (self.version(), self.commit_r());
+        let when = self.b.hms(prep.at);
+        // step 1's verdict on the prover: a real run that got here holds the same build;
+        // a dry run noted a mismatch there and planned on
+        let prover = if self
+            .prover
+            .as_ref()
+            .is_some_and(|p| Self::same_prover(p, prep))
+        {
+            "its prover, re-leased at step 1, is the same build"
+        } else {
+            "its prover is NOT the prepared build (step 1's refusal, above)"
+        };
+        let mut words = vec![format!(
+            "v{v} was PREPARED at {when}; asked again: {prover}"
+        )];
+        // what no longer holds (a refusal each, with its fix), and what could not be asked
+        let mut stale: Vec<Refusal> = Vec::new();
+        let mut unasked: Vec<String> = Vec::new();
+        let again = format!(
+            "prepare it again: {RELEASE_COMMAND} --prepare (it makes again only what this \
+             undid), then {RELEASE_COMMAND}"
+        );
+
+        // the version is not cut
+        let tag = format!("v{v}");
+        match self.b.origin_tag_now(&tag) {
+            Ok(None) => words.push(format!("{tag} is not on origin")),
+            Ok(Some(at)) => {
+                stale.push(Refusal::new(
+                    format!(
+                        "{tag} is on origin now (at {}): it was cut since the prepare",
+                        short(&at)
+                    ),
+                    format!(
+                        "release the next MINOR: {RELEASE_COMMAND} --forget, then \
+                         {RELEASE_COMMAND} --bump"
+                    ),
+                ));
+            }
+            Err(why) => unasked.push(format!("whether {tag} is on origin: {why}")),
+        }
+
+        // the reserved build is still claimable
+        let reserved = self.reservation().map(|res| res.build);
+        match (reserved, self.b.origin_tail()) {
+            (_, None) => {
+                unasked.push("origin's ledger tail (origin/main:RELEASES.ledger)".to_string());
+            }
+            (Some(n), Some(tail)) if n == prep.build && tail < n => {
+                words.push(format!(
+                    "the ledger tail {tail} is below the reserved build {n}"
+                ));
+            }
+            (Some(n), Some(tail)) if n == prep.build => {
+                stale.push(Refusal::new(
+                    format!(
+                        "origin's ledger tail {tail} reached the reserved build {n}: another \
+                         release claimed past it (nothing was claimed here, nothing burned)"
+                    ),
+                    format!("{again} (it reserves anew, then builds and verifies again)"),
+                ));
+            }
+            (held, Some(_)) => {
+                let held = held.map_or_else(|| "none".to_string(), |n| format!("build {n}"));
+                stale.push(Refusal::new(
+                    format!(
+                        "the journal's reservation ({held}) is not the prepared build {}",
+                        prep.build
+                    ),
+                    again.clone(),
+                ));
+            }
+        }
+
+        // the prepare's own facts still stand, for the bytes it verified
+        let facts = [
+            ("the bundle built once", self.facts.built.clone()),
+            ("the `verify release` record", self.facts.verified.clone()),
+        ];
+        for (name, answer) in facts {
+            if answer.unanswered {
+                unasked.push(format!("{name}: {}", answer.words));
+            } else if !answer.yes {
+                let why = format!("{name} no longer stands: {}", answer.words);
+                stale.push(Refusal::new(why, again.clone()));
+            }
+        }
+        let verified = self.artifact().map(|a| a.macho_sha256);
+        if verified.as_deref() == Some(prep.macho_sha256.as_str()) {
+            words.push(format!(
+                "built once and verified: executable {}",
+                short(&prep.macho_sha256)
+            ));
+        } else {
+            let why = format!(
+                "the journal's bundle is not the one the prepare verified (executable {})",
+                short(&prep.macho_sha256)
+            );
+            stale.push(Refusal::new(why, again.clone()));
+        }
+
+        // the engine that publishes is the engine that staged: the one R's attestation
+        // names, never one this run assumes
+        let staged = self.facts.staged_by.clone();
+        if self.facts.engine.has {
+            words.push("its source is published: the stage is behind it".to_string());
+        } else if !self.facts.attested {
+            words.push("publish/.out holds no attestation of R: the stage runs again".to_string());
+        } else if let Some(staged) = staged {
+            if self.dry {
+                words.push(format!(
+                    "would ask that the engine is at its origin/main with the code that staged \
+                     {} (else the stage runs again)",
+                    short(&staged)
+                ));
+            } else {
+                match self.b.engine_now(&staged) {
+                    Ok(EngineNow::Same(note)) => words.push(note),
+                    Ok(EngineNow::Moved(why)) => {
+                        words.push(format!("{why}: the stage runs again"));
+                        self.stage_again(Some(staged), why);
+                    }
+                    Ok(EngineNow::Off(why)) => {
+                        let fix = format!(
+                            "{RELEASE_COMMAND} again: its sync step brings the engine to its \
+                             origin/main"
+                        );
+                        stale.push(Refusal::new(why, fix));
+                    }
+                    Err(why) => {
+                        unasked.push(format!(
+                            "whether the engine is the one that staged {}: {why}",
+                            short(&r)
+                        ));
+                    }
+                }
+            }
+        } else {
+            // `pub publish` refuses an attestation that names no engine commit
+            let why = "R's attestation names no engine commit, which pub publish refuses";
+            words.push(format!("{why}: the stage runs again"));
+            self.stage_again(None, why.to_string());
+        }
+        let line = words.join("; ");
+        self.say(&format!("        {line}"));
+
+        // a decided mismatch refuses (exit 1) before what could not be asked (exit 3)
+        if stale.len() == 1 {
+            let one = stale.remove(0);
+            let why = format!("the PREPARED v{v} is stale: {}", one.why);
+            self.refuse(Refusal::new(why, one.remedy))?;
+        } else if !stale.is_empty() {
+            let detail: Vec<String> = stale
+                .iter()
+                .flat_map(|s| [s.why.clone(), format!("  fix: {}", s.remedy)])
+                .collect();
+            let why = format!("the PREPARED v{v} is stale ({} finding(s))", stale.len());
+            self.refuse(Refusal::new(why, "each finding's fix line above").detail(detail))?;
+        }
+        if !unasked.is_empty() {
+            self.refuse(
+                Refusal::new(
+                    format!(
+                        "could not ask again for the PREPARED v{v}: {}",
+                        unasked.join("; ")
+                    ),
+                    format!("run {RELEASE_COMMAND} again once it answers (the prepare is kept)"),
+                )
+                .could_not_run(),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// THE STOP OF `--prepare`, after READY: everything heavy done for R and nothing
+    /// claimed. The journal records PREPARED — the prover this run leased (its bin dir and
+    /// `trustc -vV` commit), the reserved build, the verified executable and the engine
+    /// that staged — only when every one of those facts stands now; then this clone's run
+    /// markers are let go (`running`, and a `running.child` whose process is gone; a live
+    /// one refuses), and the line says what was prepared
+    /// and the command that finishes it, exit 0. A dry run says where it would stop and
+    /// plans the visible half after it.
+    ///
+    /// Only a CLAIMED cut is past its prepare: the cut's own journal resumes it. A source
+    /// a visible half published before it stopped short of the claim (the cut overtaken,
+    /// a cut gate refusing, the prover gone) is prepared anew, so the record the next
+    /// bare run asks against is this run's — its prover, its reservation, its bytes —
+    /// and the visible half keeps its re-asks up to the claim.
+    fn prepare_stop(&mut self) -> Flow {
+        let (v, r) = (self.version(), self.commit_r());
+        let later: Vec<&str> = self.later.iter().map(|s| s.name()).collect();
+        let later = if later.is_empty() {
+            "nothing".to_string()
+        } else {
+            later.join(" ")
+        };
+        let asks = "the prover re-leased and required to be the same build, this machine's \
+                    provisioning (a gap only the owner closes waited on at the publish), the \
+                    version's tag absent on origin, origin's ledger tail below the reserved \
+                    build, the prepare's facts, and the engine at its origin/main with the \
+                    code that staged (else the stage runs again)";
+        if self.dry {
+            self.say(&format!(
+                "release: --prepare would stop here, PREPARED — the journal records the prover, \
+                 the reserved build, the verified executable and the engine that staged; this \
+                 clone's run is let go. Then {RELEASE_COMMAND} asks again: {asks}; and runs: \
+                 {later} (about {})",
+                fmt_dur(self.later_secs)
+            ));
+            return Ok(());
+        }
+        if let Some(why) = self.claimed_words() {
+            self.let_go();
+            self.last = format!(
+                "release: aterm {v} from {} is past its prepare ({why}; its cut's own journal \
+                 resumes it) — nothing was recorded. Finish it: {RELEASE_COMMAND}",
+                short(&r)
+            );
+            let last = self.last.clone();
+            self.say(&last);
+            return Err(Halt::Said(0));
+        }
+        // a source already public needs no stage: its engine is asked of nobody again
+        let published = self.facts.engine.has;
+
+        // what the record names must stand now
+        let mut missing: Vec<String> = Vec::new();
+        for (name, answer) in [
+            ("built once", &self.facts.built),
+            ("verified", &self.facts.verified),
+        ] {
+            if !answer.yes {
+                missing.push(format!("{name}: {}", answer.words));
+            }
+        }
+        let attested = self.facts.attested;
+        let staged_by = self.facts.staged_by.clone().filter(|_| attested);
+        if !published && staged_by.is_none() {
+            missing.push(
+                "staged: publish/.out holds no promotable attestation of R (one naming the \
+                 engine that staged it)"
+                    .to_string(),
+            );
+        }
+        let engine = staged_by.or_else(|| published.then(String::new));
+        let record = (
+            self.prover.clone(),
+            self.reservation(),
+            self.artifact(),
+            engine,
+        );
+        let (p, reserved, artifact, engine) = match record {
+            (Some(p), Some(reserved), Some(artifact), Some(engine)) if missing.is_empty() => {
+                (p, reserved, artifact, engine)
+            }
+            _ => {
+                if missing.is_empty() {
+                    missing.push("the journal names no prover, reservation or bundle".to_string());
+                }
+                return self.refuse(
+                    Refusal::new(
+                        format!("nothing to record as PREPARED: {}", missing.join("; ")),
+                        format!("{RELEASE_COMMAND} --prepare again (the candidate is kept)"),
+                    )
+                    .could_not_run(),
+                );
+            }
+        };
+
+        // a step's child still alive holds the clone: the prepare holds nothing running
+        let release_dir = self.b.release_dir();
+        let left = {
+            let mut started_of = |pid| self.b.started_of(pid);
+            live_child(&release_dir, &mut started_of)
+        };
+        if let Some(h) = left {
+            return self.refuse(
+                Refusal::new(
+                    format!(
+                        "the {} step's child is still running (pid {}, since {}), so nothing was \
+                         recorded as PREPARED",
+                        h.step.as_deref().unwrap_or("?"),
+                        h.pid,
+                        h.started
+                    ),
+                    format!("let it end, then {RELEASE_COMMAND} --prepare again"),
+                )
+                .could_not_run(),
+            );
+        }
+        for note in child_notes(&release_dir) {
+            let _ = std::fs::remove_file(note);
+        }
+
+        let now = self.b.now();
+        if let Some(j) = self.journal.as_mut() {
+            j.prepared = Some(Prepared {
+                at: now,
+                prover: p.bin.display().to_string(),
+                trustc: p.commit.clone(),
+                build: reserved.build,
+                macho_sha256: artifact.macho_sha256.clone(),
+                engine: engine.clone(),
+            });
+        }
+        self.save_journal()?;
+        self.let_go();
+
+        let public = if published {
+            self.public.clone()
+        } else {
+            "nothing public, nothing claimed".to_string()
+        };
+        self.say(&format!(
+            "release: PREPARED in {} — {public}; this clone's run let go",
+            self.journal_path.display()
+        ));
+        self.say(&format!(
+            "        prover   {} (trustc {}; {}) — the next run re-leases it and goes on only \
+             with this build",
+            p.bin.display(),
+            short(&p.commit),
+            p.source
+        ));
+        self.say(&format!(
+            "        bundle   {} — executable sha256 {}",
+            artifact.app.display(),
+            artifact.macho_sha256
+        ));
+        self.say(&format!(
+            "        build    {} reserved as {}, claimed nowhere",
+            reserved.build,
+            short(&reserved.commit)
+        ));
+        let staged = match (published, engine.is_empty()) {
+            (false, _) => format!("by the engine at {}", short(&engine)),
+            (true, false) => format!(
+                "by the engine at {}, and published: no engine is asked of it again",
+                short(&engine)
+            ),
+            (true, true) => "and published; publish/.out names no engine now".to_string(),
+        };
+        self.say(&format!("        staged   {staged}"));
+        self.say(&format!(
+            "        then     {RELEASE_COMMAND} asks again: {asks}; and runs: {later} (about {})",
+            fmt_dur(self.later_secs)
+        ));
+        let took = now.saturating_sub(self.t_start);
+        self.last = format!(
+            "PREPARED aterm {v} (build {}) from {} — built once, verified and staged; \
+             {} — {}. Finish it: {RELEASE_COMMAND}",
+            reserved.build,
+            short(&r),
+            self.public,
+            fmt_dur(took)
+        );
+        let last = self.last.clone();
+        self.say(&last);
+        Err(Halt::Said(0))
+    }
+
     // -- step 1 -----------------------------------------------------------
 
     fn checks(&mut self) -> Result<String, Halt> {
@@ -1681,7 +2341,7 @@ impl Run<'_> {
         }
 
         // the machine: an explicit credentials path, the disk, the engine, this clone (gh,
-        // the profile and the roster are the provisioning audit's, step 4)
+        // the profile and the roster are the provisioning audit's, just below)
         let creds = self.creds.clone();
         let explicit = self.opts.release_credentials.is_some();
         let (machine_id, refusals) = self.b.machine(&creds, explicit);
@@ -1711,6 +2371,73 @@ impl Run<'_> {
         self.choose_candidate()?;
         if self.cand.as_ref().is_some_and(|c| c.bump_from.is_none()) {
             self.public_state();
+        }
+        // AUDIT 1, before anything changes and once what is public is known (a refusal
+        // says it): a gap this machine's operator closes refuses now, at minute one; a gap
+        // only the owner closes is asked now, while the long steps run, and waited on
+        // before the cut (audit 2). A re-run as R's own cutter asks it again: the cutter
+        // before its exec may be an older one that asked neither this nor what follows,
+        // and an ask the journal holds is not raised twice — seconds.
+        notes.push(self.provision(false)?);
+        // what the cut would refuse that needs nothing the publish makes — the disk, the
+        // version's tag on origin now, and the cut's own read-only pre-claim gates (the
+        // release lease, the channel, its floor, the roster) — asked at minute one, and
+        // again right before the publish (or the cut it does not publish for). A claimed
+        // cut is past every pre-claim gate.
+        if !self.claimed()
+            && let Some(c) = self.cand.clone()
+        {
+            self.still_possible(&c, None)?;
+        }
+
+        // ONE PROVER ACROSS THE PREPARE: the visible half re-leased the prover the journal
+        // names (above) and goes on only with the very build the prepare held
+        if let Some(prep) = self.pending_reask()
+            && let Some(p) = self.prover.clone()
+        {
+            if Self::same_prover(&p, &prep) {
+                notes.push(format!(
+                    "the PREPARED prover re-leased: {} (trustc {})",
+                    prep.prover,
+                    short(&prep.trustc)
+                ));
+            } else {
+                let again = self.est_or_default(Step::Build) + self.est_or_default(Step::Verify);
+                let v = self.version();
+                self.refuse(Refusal::new(
+                    format!(
+                        "v{v} was PREPARED with the prover {} (trustc {}), and this run's is {} \
+                         (trustc {}; {}) — the bundle and its `verify release` pass are the \
+                         prepared prover's",
+                        prep.prover,
+                        short(&prep.trustc),
+                        p.bin.display(),
+                        short(&p.commit),
+                        p.source
+                    ),
+                    format!(
+                        "when TRUST_STAGE2_BIN names another prover, unset it and run \
+                         {RELEASE_COMMAND} again; else prepare again with this one: \
+                         {RELEASE_COMMAND} --prepare (the build and `verify \
+                         release` again, about {}), then {RELEASE_COMMAND}",
+                        fmt_dur(again)
+                    ),
+                ))?;
+            }
+        } else if self.opts.prepare
+            && let Some(prep) = self.prepared()
+            && let Some(p) = self.prover.clone()
+            && !Self::same_prover(&p, &prep)
+        {
+            notes.push(format!(
+                "DECISION: --prepare proves v{} again with the prover {} (trustc {}) — it was \
+                 PREPARED with {} (trustc {}), whose facts this one makes anew",
+                self.version(),
+                p.bin.display(),
+                short(&p.commit),
+                prep.prover,
+                short(&prep.trustc)
+            ));
         }
 
         // the Linux declaration the cut requires: given now, else the journal's
@@ -1865,18 +2592,16 @@ impl Run<'_> {
                     ));
                 }
                 // THE READY CANDIDATE IS REPLACED ONLY OUT LOUD: what it costs.
-                let lane = self.est_or_default(Step::Trust);
-                let measure = self.est_or_default(Step::Measure);
+                let verify = self.est_or_default(Step::Verify);
                 self.say(&format!(
                     "DECISION: --commit {} replaces the unpublished candidate v{} from {} — \
-                     {} costs a whole-tree Trust lane (about {}) and a MEASURE run (about {}) \
-                     unless its facts already stand",
+                     {} costs a `verify release` run (about {}) unless its record already \
+                     stands",
                     short(&r),
                     j.version,
                     short(&j.commit),
                     short(&r),
-                    fmt_dur(lane),
-                    fmt_dur(measure)
+                    fmt_dur(verify)
                 ));
                 why = format!(
                     "--commit, replacing the unpublished candidate {}",
@@ -2185,18 +2910,29 @@ impl Run<'_> {
                 asks,
                 reserved: None,
                 artifact: None,
+                prepared: None,
             });
         } else if !self.claimed()
             && let Some(j) = self.journal.as_mut()
         {
             // before a claim, a new prover is this release's prover from now on — and
-            // a bundle another prover built is not this release's (step 7 builds it
+            // a bundle another prover built is not this release's (`build` builds it
             // again: `artifact::key` holds the prover's commit); after the claim the
-            // bundle is built and measured, and no prover changes its bytes
+            // bundle is built and verified, and no prover changes its bytes
             j.prover = prover.bin.display().to_string();
             j.trustc = prover.commit.clone();
             if self.linux.declared() {
                 j.linux = self.linux.clone();
+            }
+        }
+        // the asks the checks delivered before there was a journal to note them in
+        if !self.early_asks.is_empty()
+            && let Some(j) = self.journal.as_mut()
+        {
+            for key in std::mem::take(&mut self.early_asks) {
+                if !j.asks.contains(&key) {
+                    j.asks.push(key);
+                }
             }
         }
         if let Some(j) = &self.journal
@@ -2231,25 +2967,24 @@ impl Run<'_> {
         let r = self.commit_r();
         match self.b.own_cutter(&r) {
             Ok(_) => Ok(()),
-            Err(why) => {
+            Err(not) => {
                 if self.claim.as_ref().is_some_and(|c| c.adopted) {
                     return self.refuse(Refusal::new(
                         format!(
-                            "this cutter was rebuilt at {} and is still not its own ({why})",
-                            short(&r)
+                            "this cutter was rebuilt at {} and is still not its own ({})",
+                            short(&r),
+                            not.why
                         ),
-                        format!(
-                            "targo clean --release -p aterm-release, then {RELEASE_COMMAND} \
-                             (nothing was claimed)"
-                        ),
+                        format!("{} (nothing was claimed)", not.fix),
                     ));
                 }
                 // an exec forgets the signals this process caught: one caught in step 3
                 // (the bump's push, the move to R) ends the run here, never in R's cutter
                 self.halt_if_interrupted()?;
                 self.say(&format!(
-                    "release: {why} — re-running as {}'s own cutter ({RELEASE_COMMAND}, same \
+                    "release: {} — re-running as {}'s own cutter ({RELEASE_COMMAND}, same \
                      arguments)",
+                    not.why,
                     short(&r)
                 ));
                 let prover = self.prover.clone().ok_or(Halt::Said(1))?;
@@ -2268,9 +3003,8 @@ impl Run<'_> {
         if self.dry && c.bump_from.is_some() {
             let pending = Answer::no("the bump commit is not made yet");
             self.facts = Facts {
-                trusted: pending.clone(),
                 built: pending.clone(),
-                measured: pending,
+                verified: pending,
                 ..Facts::default()
             };
             return;
@@ -2283,16 +3017,16 @@ impl Run<'_> {
         facts.cut = facts.cut.filter(|cut| cut.version == c.version);
         // A reservation that can never be claimed now — origin's ledger has reached
         // it — is never signed: its bytes carry its number, so they are neither built
-        // nor measured for this release any more, and step 7 reserves anew.
+        // nor verified for this release any more, and `build` reserves anew.
         if facts.cut.is_none()
             && let Some(spent) = self.spent()
         {
             let stale = Answer::no(format!(
-                "{}; step 7 reserves anew and builds again",
+                "{}; step 5 reserves anew and builds again",
                 spent.words()
             ));
             facts.built = stale.clone();
-            facts.measured = stale;
+            facts.verified = stale;
         }
         self.facts = facts;
         if c.bump_from.is_none() {
@@ -2308,26 +3042,30 @@ impl Run<'_> {
         ))
     }
 
-    fn skip_trust(&self) -> Option<String> {
+    /// The build step is done when its bundle is built and the release's own handoff
+    /// fixtures are staged beside it for the same reservation (or are on main already).
+    fn skip_build(&self) -> Option<String> {
         self.claimed_words().or_else(|| {
+            let fixtures = if self.facts.fixtures.yes {
+                self.facts.fixtures.words.clone()
+            } else if self.journal_has(FIXTURES_STAGED) {
+                "its handoff fixtures staged beside it (this release's journal)".to_string()
+            } else {
+                return None;
+            };
             self.facts
-                .trusted
+                .built
                 .yes
-                .then(|| self.facts.trusted.words.clone())
+                .then(|| format!("{}; {fixtures}", self.facts.built.words))
         })
     }
 
-    fn skip_build(&self) -> Option<String> {
-        self.claimed_words()
-            .or_else(|| self.facts.built.yes.then(|| self.facts.built.words.clone()))
-    }
-
-    fn skip_measure(&self) -> Option<String> {
+    fn skip_verify(&self) -> Option<String> {
         self.claimed_words().or_else(|| {
             self.facts
-                .measured
+                .verified
                 .yes
-                .then(|| self.facts.measured.words.clone())
+                .then(|| self.facts.verified.words.clone())
         })
     }
 
@@ -2379,12 +3117,35 @@ impl Run<'_> {
                 short(self.facts.engine.rev.as_deref().unwrap_or("?"))
             ));
         }
+        // a PREPARED release whose engine moved stages again ([`Run::reask_prepared`])
+        if self.restage.is_some() {
+            return None;
+        }
         self.facts.attested.then(|| {
             format!(
                 "{} is staged (publish/.out holds its promotable attestation)",
                 short(&r)
             )
         })
+    }
+
+    /// Step 4 is done when R is staged (or published) and its preflight, the fixture
+    /// guard and the censuses passed for it (this release's journal), or the cut is
+    /// claimed.
+    fn stage_done(&self) -> Option<String> {
+        if let Some(why) = self.claimed_words() {
+            return Some(why);
+        }
+        let staged = self.skip_stage()?;
+        [COMMIT_GATES, FIXTURE_GUARD, CENSUS]
+            .iter()
+            .all(|fact| self.journal_has(fact))
+            .then(|| {
+                format!(
+                    "{staged}; its preflight, the handoff fixture guard and the L0 censuses \
+                     passed for it (this release's journal)"
+                )
+            })
     }
 
     fn skip_publish(&self) -> Option<String> {
@@ -2412,13 +3173,6 @@ impl Run<'_> {
         }
     }
 
-    /// The build, the MEASURE run or the cut is still to come.
-    fn lock_needed(&self) -> bool {
-        self.skip_build().is_none()
-            || self.skip_measure().is_none()
-            || !matches!(self.cut_mode(), CutMode::Done(_))
-    }
-
     fn plan_print(&mut self) {
         let tsv = self.b.times();
         self.est = estimates(&tsv);
@@ -2427,12 +3181,10 @@ impl Run<'_> {
         let mut done = Vec::new();
         for step in &Step::ALL[3..] {
             let skipped = match step {
-                Step::PreflightEarly | Step::Preflight => self.claimed_words().is_some(),
-                Step::Trust => self.skip_trust().is_some(),
-                Step::Lock => !self.lock_needed(),
+                Step::Stage => self.stage_done().is_some(),
+                Step::Ready => self.claimed_words().is_some(),
                 Step::Build => self.skip_build().is_some(),
-                Step::Measure => self.skip_measure().is_some(),
-                Step::Stage => self.skip_stage().is_some(),
+                Step::Verify => self.skip_verify().is_some(),
                 Step::Publish => self.skip_publish().is_some(),
                 Step::Cut => matches!(self.cut_mode(), CutMode::Done(_)),
                 Step::AfterCut => self.journal_has("after-cut") && self.facts.fixtures.yes,
@@ -2444,6 +3196,13 @@ impl Run<'_> {
                 run.push(*step);
             }
         }
+        // `--prepare` runs up to its stop after READY; the visible half asks READY again,
+        // then runs the publish onward
+        if self.opts.prepare {
+            self.later = run.iter().copied().filter(|s| *s >= Step::Ready).collect();
+            run.retain(|s| *s <= Step::Ready);
+        }
+        self.later_secs = self.later.iter().map(|s| self.est_secs(*s)).sum();
         self.plan_secs = run.iter().map(|s| self.est_secs(*s)).sum();
         self.planned = run.clone();
         let (v, r) = (self.version(), self.commit_r());
@@ -2481,11 +3240,24 @@ impl Run<'_> {
                 done.join(" ")
             }
         ));
+        if self.opts.prepare {
+            let later: Vec<&str> = self.later.iter().map(|s| s.name()).collect();
+            self.say(&format!(
+                "release: --prepare stops after {}, PREPARED with nothing public; then \
+                 {RELEASE_COMMAND} asks the live world again and runs: {} (about {})",
+                Step::Ready.at(),
+                if later.is_empty() {
+                    "nothing".to_string()
+                } else {
+                    later.join(" ")
+                },
+                fmt_dur(self.later_secs)
+            ));
+        }
         let now = self.b.now();
         let at = self.b.hms(now + self.plan_secs);
         self.say(&format!(
-            "release: ETA {} — {} of work, by {} (a wait for the machine's lock or for the \
-             owner is not in it)",
+            "release: ETA {} — {} of work, by {} (a wait for the owner is not in it)",
             &at[..at.len().min(5)],
             fmt_dur(self.plan_secs),
             if measured_here {
@@ -2496,39 +3268,29 @@ impl Run<'_> {
         ));
     }
 
-    // -- step 4 and 8: the preflight ------------------------------------------
+    // -- step 4: the preflight, then the real stage ---------------------------
 
-    /// The disk the steps still to come need, asked before the hours of the trust lane:
-    /// the build and its MEASURE run as the gate budgets them (39 GiB from empty lanes,
-    /// 30 on warm ones), or for MEASURED bytes whose tree is not yet TRUSTED the trust
-    /// lane's 6 then the cut's 10.
+    /// The disk the steps still to come need, asked before the long steps: the build and
+    /// `verify release` (39 GiB from an empty target directory, 30 on a warm one), then
+    /// the cut's 10.
     fn disk_still_needed(&mut self) -> Flow {
-        if self.facts.measured.yes && self.facts.trusted.yes {
+        if self.facts.verified.yes {
             return Ok(());
         }
         let (free, warm) = self.b.disk();
         let Some(free) = free else {
             return Ok(());
         };
-        if self.facts.measured.yes {
-            if free < 6 + CUT_GIB {
-                return self.refuse(Refusal::new(
-                    format!("only {free} GiB free — the trust run needs 6, then the cut {CUT_GIB}"),
-                    "free space, then re-run",
-                ));
-            }
-            return Ok(());
-        }
         let (need, what) = if warm {
-            (30, "30 (its lanes are warm)")
+            (30, "30 (its target directory is warm)")
         } else {
             (39, "39 (cold)")
         };
         if free < need {
             return self.refuse(Refusal::new(
                 format!(
-                    "only {free} GiB free — the build and MEASURE run still to come need {what}, \
-                     then the cut {CUT_GIB}"
+                    "only {free} GiB free — the build and `verify release` still to come need \
+                     {what}, then the cut {CUT_GIB}"
                 ),
                 "free space, then re-run",
             ));
@@ -2536,180 +3298,238 @@ impl Run<'_> {
         Ok(())
     }
 
-    /// The preflight: EARLY, every block but the receipt ones (MEASURE, trust: what
-    /// steps 5-8 answer) refuses; STRICT, every block — and, asked again right before
-    /// the stage, what the cut would refuse that can change while the long steps run
-    /// (its disk, the version's tag, its read-only pre-claim gates). A judge that could
-    /// not answer is a resumable stop at once, never a "no" the long steps would
-    /// answer. Then this machine's provisioning (a machine gap refuses, an owner gap is
-    /// asked — and, strict, waited on), then the handoff fixture guard, once per R.
-    fn preflight(&mut self, strict: bool) -> Flow {
-        let Some(c) = self.cand.clone() else {
+    /// STEP 4, THE REAL STAGE FIRST. The preflight — R's own pre-claim gates that read
+    /// only the commit and the engine's readiness, seconds — refuses before anything
+    /// else, and its pass is journaled for R ([`COMMIT_GATES`]: the fact the cut reads
+    /// instead of judging R's tree again); a judge of the records that could not answer
+    /// stops here too. Then, BESIDE EACH OTHER, the real `pub stage` (every export guard,
+    /// the public-clone gate with its wasm32 clause, the private staging tier), the
+    /// handoff fixture guard and the L0 censuses, each only while its fact is missing:
+    /// the guard and the censuses are fail-fast copies of checks `verify release` runs
+    /// again at `verify`, kept so their refusal precedes the build. Every pass is
+    /// journaled before any refusal is said, so a re-run runs only what refused.
+    fn stage(&mut self) -> Flow {
+        let (Some(c), Some(p)) = (self.cand.clone(), self.prover.clone()) else {
             return Ok(());
         };
-        let Some(p) = self.prover.clone() else {
+        // asked on every unclaimed run (a claimed one never gets here), step 4 journaled
+        // or not: a resumed run's `verify release` must not run for an hour
+        // before a judge that cannot read its record says so
+        self.verification_answer()?;
+        if let Some(why) = self.stage_done() {
+            self.skip(&why);
             return Ok(());
+        }
+        let mut words = vec![self.commit_gates(&c)?];
+        let beside = Beside {
+            stage: self.skip_stage().is_none(),
+            guard: !self.journal_has(FIXTURE_GUARD),
+            census: !self.journal_has(CENSUS),
         };
-        let mut words = Vec::new();
-        // a dry run's step 9 plans steps 5-8 rather than asking their receipts again
-        let planned = self.dry && strict;
-        let mut blocks = if planned {
-            words.push(
-                "would run the preflight again, and stage only on READY; asked now: what \
-                 only reads"
-                    .to_string(),
-            );
-            Vec::new()
-        } else {
-            if self.dry {
-                words.push(
-                    "would run the engine's own dry run (every export guard) and the wasm32 \
-                     check; asked now: what reads"
-                        .to_string(),
-                );
-            }
-            self.b.preflight(&c, self.dry, strict)
-        };
-        if !planned {
-            // the two receipts the cut requires, which steps 5-8 answer
-            for (name, answer, remedy) in [
-                (
-                    "MEASURE tier",
-                    &self.facts.measured,
-                    "steps 7-8 build and measure it",
-                ),
-                ("TRUST lane", &self.facts.trusted, "step 5 runs the lane"),
-            ] {
-                if !answer.yes && !answer.unanswered {
-                    blocks.push((
-                        true,
-                        Refusal::new(format!("{name} — {}", answer.words), remedy),
-                    ));
-                }
-            }
+        if self.dry {
+            words.push(self.beside_plan(&c, beside));
+            self.finish(&words.join("; "));
+            return Ok(());
         }
-        if strict {
-            for r in self.cut_still_possible(&c, true) {
-                blocks.push((false, r));
-            }
+        words.extend(self.beside_done(beside));
+        if beside.stage {
+            let log = self.b.log_path(Step::Stage);
+            self.say(&format!("        log: {}", log.display()));
         }
-        let receipts = blocks.iter().filter(|(receipt, _)| *receipt).count();
-        let real: Vec<Refusal> = blocks
-            .into_iter()
-            .filter(|(receipt, _)| strict || !*receipt)
-            .map(|(_, r)| r)
-            .collect();
-        if !real.is_empty() {
-            self.refuse(blocked(
-                format!("the preflight BLOCKED ({} finding(s))", real.len()),
-                &real,
-            ))?;
-        }
-        // a judge that could not answer decided nothing: stop now, not after the hours
-        // of the long steps whose receipts it would then not read either
-        if !planned {
-            let unanswered: Vec<String> = [&self.facts.measured, &self.facts.trusted]
-                .into_iter()
-                .filter(|a| a.unanswered)
-                .map(|a| a.words.clone())
-                .collect();
-            if !unanswered.is_empty() {
-                self.refuse(
-                    Refusal::new(
-                        format!(
-                            "the cutter's own judge could not answer: {}",
-                            unanswered.join("; ")
-                        ),
-                        format!(
-                            "run {RELEASE_COMMAND} again once it answers (the candidate is kept)"
-                        ),
-                    )
-                    .could_not_run(),
-                )?;
-            }
-        }
-        words.push(if !real.is_empty() {
-            format!("BLOCKED ({} finding(s), above)", real.len())
-        } else if receipts > 0 && !strict {
-            format!("no block but the {receipts} receipt block(s) steps 5-8 answer")
-        } else {
-            "READY".to_string()
-        });
-        words.push(self.provision(strict)?);
-        if self.journal_has("fixture-guard") {
-            words.push(format!(
-                "the handoff fixture guard passed for {} (this release's journal)",
-                short(&c.commit)
-            ));
-        } else if self.dry {
-            words.push(
-                "would run the handoff fixture guard (targo --unverified test -p aterm-gui --lib, \
-                 as the cut runs it)"
-                    .to_string(),
-            );
-        } else {
-            match self.b.fixture_guard(&p) {
-                Ok(note) => {
-                    self.journal_add("fixture-guard")?;
+        let ran = self.b.stage_beside(&c, &p, beside);
+        let mut refused: Vec<Refusal> = Vec::new();
+        for (fact, outcome) in [(FIXTURE_GUARD, ran.guard), (CENSUS, ran.census)] {
+            match outcome {
+                Some(Ok(note)) => {
+                    self.journal_add(fact)?;
                     words.push(note);
                 }
-                Err(r) => self.refuse(r)?,
+                Some(Err(r)) => refused.push(r),
+                None => {}
             }
         }
-        if strict {
-            words.push(self.stage_fixtures(&c, &p)?);
+        if let Some(staged) = ran.stage {
+            self.refresh();
+            match self.stage_verdict(&c, staged) {
+                Ok(note) => words.push(note),
+                Err(r) => refused.push(r),
+            }
         }
+        self.refuse_all("step 4", refused)?;
         self.finish(&words.join("; "));
         Ok(())
     }
 
-    /// THE RELEASE'S OWN HANDOFF FIXTURES, before the claim: what its producer writes,
-    /// under the identity the shipped binary stamps (the reservation), staged in the
-    /// release cache for step 13 to land. A generator that refuses refuses the release
-    /// here, with nothing claimed or published.
-    fn stage_fixtures(&mut self, c: &Candidate, p: &Prover) -> Result<String, Halt> {
-        let v = &c.version;
-        if self.facts.fixtures.yes {
-            return Ok(self.facts.fixtures.words.clone());
-        }
-        let generator = format!(
-            "the in-tree generator (targo --unverified test -p aterm-gui --lib -- {})",
-            crate::fixtures::generator_args().join(" ")
-        );
-        if self.dry {
-            let identity = match self.reservation() {
-                Some(r) => format!("build {} ({})", r.build, short(&r.commit)),
-                None => "the build step 7 reserves".to_string(),
-            };
+    /// R's own pre-claim gates that read only the commit, and the engine's readiness:
+    /// once per R. Their pass is journaled as [`COMMIT_GATES`], which the cut reads
+    /// (`publish::verified_release_bundle`) and refuses without.
+    fn commit_gates(&mut self, c: &Candidate) -> Result<String, Halt> {
+        if self.journal_has(COMMIT_GATES) {
             return Ok(format!(
-                "would write v{v}'s handoff fixtures for {identity} with {generator} into the \
-                 release cache, refusing here if it refuses; step 13 lands them on main"
+                "the preflight passed for {} (this release's journal)",
+                short(&c.commit)
             ));
         }
-        let Some(reserved) = self.reservation() else {
-            self.refuse(
-                Refusal::new(
-                    format!("no reservation of v{v} to write its handoff fixtures as"),
-                    format!("run {RELEASE_COMMAND} again: step 7 reserves it"),
-                )
-                .could_not_run(),
-            )?;
-            return Ok(String::new());
+        let found = self.b.commit_gates(c, self.dry);
+        if found.is_empty() {
+            self.journal_add(COMMIT_GATES)?;
+            return Ok(String::from(
+                "the preflight passes: R's commit-only gates (the changelog, the predecessor's \
+                 handoff fixtures, the handoff policy, the locked metadata) and the engine's \
+                 readiness",
+            ));
+        }
+        let n = found.len();
+        self.refuse(blocked(
+            format!("the preflight BLOCKED ({n} finding(s))"),
+            &found,
+        ))?;
+        Ok(format!("the preflight BLOCKED ({n} finding(s), above)"))
+    }
+
+    /// Stop before the long steps if their verification record cannot be read.
+    fn verification_answer(&mut self) -> Flow {
+        if !self.facts.verified.unanswered {
+            return Ok(());
+        }
+        self.refuse(
+            Refusal::new(
+                format!(
+                    "the cutter's own judge could not answer: {}",
+                    self.facts.verified.words
+                ),
+                format!("run {RELEASE_COMMAND} again once it answers (the candidate is kept)"),
+            )
+            .could_not_run(),
+        )
+    }
+
+    /// A dry run's words for step 4's heavy half: what would run beside each other, and
+    /// what is done already.
+    fn beside_plan(&self, c: &Candidate, beside: Beside) -> String {
+        let r = if c.bump_from.is_some() {
+            "<the bump commit>".to_string()
+        } else {
+            c.commit.clone()
         };
-        match self.b.stage_fixtures(c, &reserved, p) {
-            Ok(note) => Ok(note),
-            Err(r) => {
-                self.refuse(r)?;
-                Ok(String::new())
+        let mut run = Vec::new();
+        if beside.stage {
+            run.push(format!(
+                "pub stage aterm --commit {r} --repo-path <this clone>"
+            ));
+        }
+        if beside.guard {
+            run.push(format!(
+                "the handoff fixture guard (targo --unverified test -p aterm-gui --lib -- {})",
+                crate::gates::HANDOFF_FIXTURE_GUARD_FILTER
+            ));
+        }
+        if beside.census {
+            run.push(format!(
+                "the L0 censuses (targo {} <this clone>)",
+                crate::gates::CENSUS_ARGS.join(" ")
+            ));
+        }
+        let mut words = Vec::new();
+        if !run.is_empty() {
+            words.push(format!("would run, beside each other: {}", run.join("; ")));
+        }
+        words.extend(self.beside_done(beside));
+        words.join("; ")
+    }
+
+    /// What of step 4's heavy half is done already, by its facts.
+    fn beside_done(&self, beside: Beside) -> Vec<String> {
+        let r = short(&self.commit_r()).to_string();
+        let mut done = Vec::new();
+        if !beside.stage
+            && let Some(why) = self.skip_stage()
+        {
+            done.push(why);
+        }
+        if !beside.guard {
+            done.push(format!(
+                "the handoff fixture guard passed for {r} (this release's journal)"
+            ));
+        }
+        if !beside.census {
+            done.push(format!(
+                "the L0 censuses passed over {r} (this release's journal)"
+            ));
+        }
+        done
+    }
+
+    /// What `pub stage` ending with `ran` means for R, the facts read again after it: the
+    /// step's words, or its refusal. A stage again — the engine that staged R moved since
+    /// — counts only when it passed and left an attestation by the engine as it is now:
+    /// the old attestation, still in publish/.out, is the one the move made stale. One
+    /// for a staging tier that moved is by the same engine, so it names no old engine
+    /// (`restage.0` is `None`), and its caller asks the staging tier again after it.
+    fn stage_verdict(
+        &mut self,
+        c: &Candidate,
+        ran: Result<Ran, Refusal>,
+    ) -> Result<String, Refusal> {
+        let r = short(&c.commit).to_string();
+        let ran = ran?;
+        if let Some((old, why)) = self.restage.clone() {
+            let fresh = self.facts.attested
+                && self.facts.staged_by.is_some()
+                && self.facts.staged_by != old;
+            if ran.code == 0 && fresh {
+                self.restage = None;
+                return Ok(format!(
+                    "staged {r} again ({why}; a promotable attestation in publish/.out)"
+                ));
+            }
+            return Err(Refusal::new(
+                format!(
+                    "pub stage did not stage {r} again by the engine as it is now (exit {})",
+                    ran.code
+                ),
+                format!("read its log, then {RELEASE_COMMAND}"),
+            )
+            .detail(ran.detail));
+        }
+        if self.facts.attested || self.facts.engine.has {
+            return Ok(format!(
+                "staged {r} (a promotable attestation in publish/.out)"
+            ));
+        }
+        Err(Refusal::new(
+            format!("pub stage did not stage {r} (exit {})", ran.code),
+            format!(
+                "read its log; fix the source on main, then {RELEASE_COMMAND} --commit \
+                 origin/main"
+            ),
+        )
+        .detail(ran.detail))
+    }
+
+    /// Refuse what work run beside each other found (`what` names it when several did):
+    /// one finding is the refusal itself; several are one refusal, each with its own fix —
+    /// a COULD NOT RUN only when every one of them is one.
+    fn refuse_all(&mut self, what: &str, mut found: Vec<Refusal>) -> Flow {
+        match found.len() {
+            0 => Ok(()),
+            1 => self.refuse(found.remove(0)),
+            n => {
+                let could_not_run = found.iter().all(|r| r.could_not_run);
+                let mut r = blocked(format!("{what} refused ({n} finding(s))"), &found);
+                r.could_not_run = could_not_run;
+                self.refuse(r)
             }
         }
     }
 
-    /// What the cut would refuse that can change while the long steps run — its disk
-    /// (the trust lane and MEASURE write tens of GiB), the version's tag (a rostered
+    /// What the cut would refuse that can change while a release runs — its disk (the
+    /// build and `verify release` write tens of GiB), the version's tag (a rostered
     /// peer may cut it meanwhile) and, with `gates`, the cut's own read-only pre-claim
-    /// gates — asked right before the stage, and the first two again right before a
-    /// fresh cut, so the refusal arrives with nothing (more) public.
+    /// gates — asked at the checks, again right before the publish, and the first two
+    /// once more right before a fresh cut, so the refusal arrives with nothing (more)
+    /// public. Origin not answering whether the tag is there decided nothing: that one is
+    /// a COULD NOT RUN.
     fn cut_still_possible(&mut self, c: &Candidate, gates: bool) -> Vec<Refusal> {
         let mut out = Vec::new();
         if let (Some(free), _) = self.b.disk()
@@ -2740,10 +3560,13 @@ impl Run<'_> {
                     ));
                 }
             }
-            Err(why) => out.push(Refusal::new(
-                format!("cannot ask origin whether {tag} is cut: {why}"),
-                "check the network and your git credentials, then re-run",
-            )),
+            Err(why) => out.push(
+                Refusal::new(
+                    format!("cannot ask origin whether {tag} is cut: {why}"),
+                    "check the network and your git credentials, then re-run",
+                )
+                .could_not_run(),
+            ),
         }
         if gates {
             let creds = self.creds.clone();
@@ -2752,40 +3575,162 @@ impl Run<'_> {
         out
     }
 
-    /// ASKED AGAIN RIGHT BEFORE WHAT GOES PUBLIC. The stage and the publish each audit
-    /// the provisioning first, and may wait there for the owner — hours, the machine's
-    /// lock let go — after step 8 asked [`Run::cut_still_possible`]. So it is asked
-    /// again after that wait, immediately before `pub stage` (whose attestation the
-    /// publish promotes) and before `pub publish` (which makes the source public): the
+    /// WHAT THE CUT WOULD REFUSE, asked where a refusal still leaves nothing public: at
+    /// the checks (`before` none), and again right before the publish (`before` names
+    /// it), after the provisioning audit there, which may wait hours for the owner — the
     /// cut's disk, the version's tag on origin now, a leftover local tag, and the cut's
-    /// read-only pre-claim gates (the release lease, the roster, the channel floor). A
+    /// read-only pre-claim gates (the release lease, the channel, its floor, the roster).
+    /// A decided refusal (exit 1) comes before what could not be asked (exit 3), and a
     /// refusal here leaves no source public ahead of a binary that cannot follow it.
-    fn still_possible(&mut self, c: &Candidate) -> Flow {
+    fn still_possible(&mut self, c: &Candidate, before: Option<&str>) -> Flow {
         let found = self.cut_still_possible(c, true);
-        if found.is_empty() {
-            return Ok(());
+        let (unasked, decided): (Vec<Refusal>, Vec<Refusal>) =
+            found.into_iter().partition(|r| r.could_not_run);
+        let asked = before.map_or_else(String::new, |step| {
+            format!("asked again right before the {step}, ")
+        });
+        if !decided.is_empty() {
+            self.refuse(blocked(
+                format!("{asked}the cut would refuse ({} finding(s))", decided.len()),
+                &decided,
+            ))?;
         }
-        let step = self.cur.name();
-        self.refuse(blocked(
-            format!(
-                "asked again right before the {step}, the cut would refuse ({} finding(s))",
-                found.len()
+        if !unasked.is_empty() {
+            let mut r = blocked(
+                format!(
+                    "{asked}what the cut would refuse could not be asked ({} question(s))",
+                    unasked.len()
+                ),
+                &unasked,
+            );
+            r.remedy = format!("run {RELEASE_COMMAND} again once it answers (nothing changed)");
+            self.refuse(r.could_not_run())?;
+        }
+        Ok(())
+    }
+
+    /// THE ENGINE THAT PUBLISHES IS THE ENGINE THAT STAGED, asked right before `pub
+    /// publish` of EVERY release: the stage (step 4) came before the long steps, and the
+    /// engine checkout is shared — peers pull it and push to its origin. The engine is
+    /// synced first, as the publish will find it. One whose code moved since it staged
+    /// R — or a publish/.out that no longer holds a promotable attestation of R naming
+    /// its engine, or a staging tier whose main moved since R was attested (a peer's
+    /// `pub stage aterm`: `pub promote` refuses that attestation) — stages again here, by
+    /// the engine as it is now, and only a passing stage that leaves a fresh attestation
+    /// of the staging tier as it is now lets the publish go on. An engine off its
+    /// origin/main after the sync, or an engine or staging tier that cannot be asked, is
+    /// a resumable stop with nothing public.
+    fn engine_still_staged(&mut self, c: &Candidate, p: &Prover) -> Flow {
+        if let Err(r) = self.b.sync() {
+            return self.refuse(r);
+        }
+        self.refresh();
+        let r = short(&c.commit).to_string();
+        let attested = self.facts.attested;
+        let staged = self.facts.staged_by.clone().filter(|_| attested);
+        // (the engine a fresh stage must not name again, why): a stage again for the
+        // staging tier is by the same engine, so it names none
+        let (old, why) = match staged.as_deref() {
+            None => (
+                None,
+                format!(
+                    "publish/.out holds no promotable attestation of {r} naming the engine \
+                     that staged it"
+                ),
             ),
-            &found,
-        ))
+            Some(engine) => match self.b.engine_now(engine) {
+                Ok(EngineNow::Same(_)) => match self.staging_still(&r)? {
+                    None => return Ok(()),
+                    Some(why) => (None, why),
+                },
+                Ok(EngineNow::Moved(why)) => (staged.clone(), why),
+                Ok(EngineNow::Off(why)) => {
+                    return self.refuse(
+                        Refusal::new(
+                            format!("asked again right before the publish: {why}"),
+                            format!(
+                                "{RELEASE_COMMAND} again: its sync step brings the engine to its \
+                                 origin/main (nothing is public)"
+                            ),
+                        )
+                        .could_not_run(),
+                    );
+                }
+                Err(why) => {
+                    return self.refuse(
+                        Refusal::new(
+                            format!(
+                                "could not ask again, right before the publish, whether the \
+                                 engine is the one that staged {r}: {why}"
+                            ),
+                            format!("run {RELEASE_COMMAND} again once it answers"),
+                        )
+                        .could_not_run(),
+                    );
+                }
+            },
+        };
+        self.say(&format!(
+            "        {why}: {r} is staged again by the engine as it is now, before the publish"
+        ));
+        self.restage = Some((old, why));
+        let ran = self.b.stage(c, p);
+        self.refresh();
+        let note = match self.stage_verdict(c, ran) {
+            Ok(note) => note,
+            Err(refusal) => return self.refuse(refusal),
+        };
+        // the fresh attestation names the staging tier's main as the stage left it: a
+        // peer staging again meanwhile would make it stale as well
+        if let Some(why) = self.staging_still(&r)? {
+            return self.refuse(
+                Refusal::new(
+                    format!(
+                        "{r} was staged again right before the publish, and the staging tier \
+                         moved again: {why}"
+                    ),
+                    format!(
+                        "{RELEASE_COMMAND} again once no peer is staging aterm (nothing is \
+                         public)"
+                    ),
+                )
+                .could_not_run(),
+            );
+        }
+        self.say(&format!("        {note}"));
+        Ok(())
+    }
+
+    /// Whether `<repo>-staging`'s main moved since R's attestation was made
+    /// ([`Backend::staging_moved`]): `Some(why)` when it did. A staging tier that cannot
+    /// be asked is a resumable stop, nothing public.
+    fn staging_still(&mut self, r: &str) -> Result<Option<String>, Halt> {
+        match self.b.staging_moved() {
+            Ok(moved) => Ok(moved),
+            Err(why) => {
+                self.refuse(
+                    Refusal::new(
+                        format!(
+                            "could not ask again, right before the publish, whether the \
+                             staging tier's main is the commit {r}'s attestation names: {why}"
+                        ),
+                        format!("run {RELEASE_COMMAND} again once it answers"),
+                    )
+                    .could_not_run(),
+                )?;
+                Ok(None)
+            }
+        }
     }
 
     /// THIS MACHINE'S PROVISIONING, audited now ([`crate::provision::audit`]): a gap
     /// this machine's operator closes refuses; a gap only the owner closes is asked
     /// ONCE (a standing ask on the owner's aterm, journaled only once it was delivered,
     /// and raised again at each audit until it is) and — at a step that needs it closed
-    /// (`wait`) — waited on, re-audited every [`OWNER_POLL_SECS`], the machine's lock let
-    /// go for the whole wait and taken again, in its line, only once the audit passes
-    /// (a lock still busy then is a resumable stop); an audit that could not be asked is
-    /// a resumable stop where it is needed. Returns the line the step says.
+    /// (`wait`) — waited on, re-audited every [`OWNER_POLL_SECS`]; an audit that could not
+    /// be asked is a resumable stop where it is needed. Returns the line the step says.
     fn provision(&mut self, wait: bool) -> Result<String, Halt> {
         let mut said_waiting = false;
-        let mut relock = false;
         loop {
             let id = self.machine_id.clone();
             let found = match (&self.dry_audit, self.dry) {
@@ -2837,17 +3782,10 @@ impl Run<'_> {
             }
             self.settle_asks(&owner, &unknown_keys)?;
             if owner.is_empty() && (unknown.is_empty() || !wait) {
-                if relock {
-                    let caller = self.lock_caller();
-                    match self.b.lock(&caller) {
-                        Ok(_) => self.locked = true,
-                        Err(r) => self.refuse(r.could_not_run())?,
-                    }
-                }
                 let mut line = format!("this machine's provisioning passes ({id})");
                 if !unknown.is_empty() {
                     line.push_str(&format!(
-                        "; not answered now, asked again before the stage: {}",
+                        "; not answered now, asked again before the publish: {}",
                         unknown.join("; ")
                     ));
                 }
@@ -2878,7 +3816,13 @@ impl Run<'_> {
             }
             let gaps: Vec<String> = owner.iter().map(|(g, _)| g.clone()).collect();
             if self.dry {
-                self.waits.extend(gaps.iter().cloned());
+                // a real run waits at the first such step, and the gap is closed after it
+                self.wait_at.get_or_insert(self.cur);
+                for gap in &gaps {
+                    if !self.waits.contains(gap) {
+                        self.waits.push(gap.clone());
+                    }
+                }
                 self.say(&format!(
                     "[{:>2}/{}] {:<15} WOULD WAIT  for the owner: {} (asked once; re-audited \
                      every {} until it closes)",
@@ -2892,8 +3836,8 @@ impl Run<'_> {
             }
             if !said_waiting {
                 let (v, r) = (self.version(), self.commit_r());
-                let ready = if self.facts.trusted.yes && self.facts.measured.yes {
-                    "READY (trusted, built once, measured)"
+                let ready = if self.facts.verified.yes {
+                    "READY (built once, verified)"
                 } else {
                     "not yet READY"
                 };
@@ -2906,12 +3850,6 @@ impl Run<'_> {
                     fmt_dur(OWNER_POLL_SECS)
                 ));
                 said_waiting = true;
-            }
-            // the machine's lock is let go for the whole wait: peers' gates go on
-            if self.locked {
-                self.b.unlock();
-                self.locked = false;
-                relock = true;
             }
             let t0 = self.b.now();
             self.b.sleep(OWNER_POLL_SECS);
@@ -2937,7 +3875,10 @@ impl Run<'_> {
         let mut changed = false;
         let mut now_asked: BTreeSet<String> = BTreeSet::new();
         for (_, words) in owner {
-            if asked.contains(&words.key) || !now_asked.insert(words.key.clone()) {
+            if asked.contains(&words.key)
+                || self.early_asks.contains(&words.key)
+                || !now_asked.insert(words.key.clone())
+            {
                 continue;
             }
             match self.b.ask(words) {
@@ -2946,9 +3887,14 @@ impl Run<'_> {
                         "        asked the owner once ({}): {} — {} (delivered: {reply})",
                         words.key, words.reason, words.step
                     ));
-                    if let Some(j) = self.journal.as_mut() {
-                        j.asks.push(words.key.clone());
-                        changed = true;
+                    match self.journal.as_mut() {
+                        Some(j) => {
+                            j.asks.push(words.key.clone());
+                            changed = true;
+                        }
+                        // asked by the checks of a release with no journal yet: noted
+                        // here, journaled with the candidate at step 3
+                        None => self.early_asks.push(words.key.clone()),
                     }
                 }
                 Err(why) => self.say(&format!(
@@ -2987,182 +3933,61 @@ impl Run<'_> {
         Ok(())
     }
 
-    // -- step 5: trust ----------------------------------------------------------
-
-    fn trust(&mut self) -> Flow {
-        let (Some(c), Some(p)) = (self.cand.clone(), self.prover.clone()) else {
-            return Ok(());
-        };
-        let pending = if self.dry && c.bump_from.is_some() {
-            Vec::new()
-        } else {
-            self.b.trust_pending(&c, &p)
-        };
-        let words = self.facts.trusted.words.clone();
-        if self.dry {
-            if pending.is_empty() {
-                self.finish(&format!(
-                    "would run tools/trust-gate-all.sh over the whole tree ({words})"
-                ));
-            } else {
-                self.finish(&format!(
-                    "would run tools/trust-gate-all.sh --remeasure on only what the stored facts \
-                     left undecided: {} ({words})",
-                    pending.join(" ")
-                ));
-            }
-            return Ok(());
-        }
-        self.provision(false)?;
-        let log = self.b.log_path(Step::Trust);
-        if pending.is_empty() {
-            self.say(&format!("        runs: {words}"));
-        } else {
-            self.say(&format!(
-                "        runs: --remeasure, only what the stored facts left undecided: {} ({words})",
-                pending.join(" ")
-            ));
-        }
-        self.say(&format!("        log: {}", log.display()));
-        let ran = self.b.trust_lane(&p, !pending.is_empty());
-        self.refresh();
-        if self.facts.trusted.yes {
-            let words = self.facts.trusted.words.clone();
-            self.finish(&words);
-            return Ok(());
-        }
-        let words = self.facts.trusted.words.clone();
-        if self.facts.trusted.unanswered {
-            return self.refuse(
-                Refusal::new(
-                    format!(
-                        "the lane ran (exit {}), and its judge could not answer: {words}",
-                        ran.code
-                    ),
-                    format!(
-                        "run {RELEASE_COMMAND} again once it answers (the lane's facts are kept)"
-                    ),
-                )
-                .detail(ran.detail)
-                .could_not_run(),
-            );
-        }
-        let r = short(&c.commit).to_string();
-        // 1 (FAIL) outranks 2 (COULD NOT RUN): a failed library is the tree's to fix.
-        if ran.code == 4 {
-            return self.refuse(
-                Refusal::new(
-                    format!(
-                        "this machine cannot verify every library of {r} (NARROWED BY MEMORY; \
-                         nothing failed)"
-                    ),
-                    "release from a clone on a machine with more RAM (each line below names its need)",
-                )
-                .detail(ran.detail),
-            );
-        }
-        if ran.code != 1 {
-            let left = self.b.trust_pending(&c, &p);
-            if !left.is_empty() {
-                return self.refuse(
-                    Refusal::new(
-                        format!(
-                            "the trust lane decided nothing about {} for {r} (exit {}; {words}) — \
-                             nothing failed, the machine's clock or trustd left them unmeasured",
-                            left.join(" "),
-                            ran.code
-                        ),
-                        format!(
-                            "run {RELEASE_COMMAND} again, from any session in this clone, when the \
-                             machine is quieter: it measures only those again (--remeasure)"
-                        ),
-                    )
-                    .detail(ran.detail)
-                    .could_not_run(),
-                );
-            }
-            if ran.code != 0 {
-                return self.refuse(
-                    Refusal::new(
-                        format!(
-                            "the whole-tree trust lane could not run (exit {}; {words})",
-                            ran.code
-                        ),
-                        format!(
-                            "nothing failed: {RELEASE_COMMAND} again once the lane's own cause \
-                             (below) is gone"
-                        ),
-                    )
-                    .detail(ran.detail)
-                    .could_not_run(),
-                );
-            }
-        }
-        self.refuse(
-            Refusal::new(
-                format!(
-                    "the whole-tree trust lane did not pass (exit {}; {words})",
-                    ran.code
-                ),
-                format!(
-                    "fix the library on main (docs/RELEASING.md, the whole-tree Trust advisory \
-                     lane), then {RELEASE_COMMAND} --commit origin/main"
-                ),
-            )
-            .detail(ran.detail),
-        )
-    }
-
-    // -- step 6: the lock -------------------------------------------------------
-
-    fn lock_caller(&self) -> String {
-        format!("{RELEASE_COMMAND} v{}", self.version())
-    }
-
-    fn take_lock(&mut self) -> Flow {
-        let caller = self.lock_caller();
-        match self.b.lock(&caller) {
-            Ok(note) => {
-                self.locked = true;
-                self.finish(&note);
-                Ok(())
-            }
-            Err(r) => self.refuse(r),
-        }
-    }
-
-    // -- step 7: build, once -------------------------------------------------
+    // -- build once, with the release's own handoff fixtures -----------------
 
     /// BUILD ONCE: reserve R's identity unless the journal holds a reservation of R
     /// the ledger has not passed — a fresh one when it has (another release claimed
     /// past it while this one waited; nothing was claimed here, so nothing is burned)
     /// — journal it, then build its bundle once (or take the COMPLETE one the release
-    /// cache holds) and journal that. A new reservation is new bytes: the bundle and its
-    /// measurement follow it.
+    /// cache holds) and journal that. A new reservation is new bytes: the bundle, its
+    /// verification and its staged fixtures follow it.
+    ///
+    /// THE RELEASE'S OWN HANDOFF FIXTURES, beside the build, before the claim: what its
+    /// producer writes, under the identity the shipped binary stamps (the reservation),
+    /// staged in the release cache for `after-cut` to land, and journaled
+    /// ([`FIXTURES_STAGED`]). A generator that refuses refuses the release here, with
+    /// nothing claimed or published; its bundle, built beside it, is kept.
     fn build(&mut self) -> Flow {
         let (Some(c), Some(p)) = (self.cand.clone(), self.prover.clone()) else {
             return Ok(());
         };
         if self.dry {
-            let reserved = match (self.reservation(), self.b.origin_tail()) {
-                (Some(r), Some(tail)) if r.build > tail => format!(
+            let held = match (self.reservation(), self.b.origin_tail()) {
+                (Some(r), Some(tail)) if r.build > tail => Some(r),
+                _ => None,
+            };
+            let reserved = match &held {
+                Some(r) => format!(
                     "build {} reserved as {} (this release's journal)",
                     r.build,
                     short(&r.commit)
                 ),
-                _ => "would reserve build n = max(origin's ledger tail + 1, now) and the \
-                      release commit (R + the ledger line + the rolled changelog), claimed \
-                      nowhere"
+                None => "would reserve build n = max(origin's ledger tail + 1, now) and the \
+                         release commit (R + the ledger line + the rolled changelog), claimed \
+                         nowhere"
                     .to_string(),
+            };
+            let fixtures = if self.facts.fixtures.yes {
+                self.facts.fixtures.words.clone()
+            } else {
+                let identity = held.map_or_else(
+                    || "the build it reserves".to_string(),
+                    |r| format!("build {} ({})", r.build, short(&r.commit)),
+                );
+                format!(
+                    "beside it, would write v{}'s handoff fixtures for {identity} with {} into \
+                     the release cache, refusing here if it refuses; step 10 lands them on main",
+                    c.version,
+                    fixture_generator()
+                )
             };
             self.finish(&format!(
                 "{reserved}; would build both slices at once from its snapshot into the \
-                 release cache, the unsigned bundle kept by what it is built as ({})",
+                 release cache, the unsigned bundle kept by what it is built as ({}); {fixtures}",
                 self.facts.built.words
             ));
             return Ok(());
         }
-        self.provision(false)?;
         let reserved = match self.reservation() {
             Some(r) if self.b.origin_tail().is_some_and(|tail| r.build > tail) => r,
             _ => {
@@ -3176,6 +4001,7 @@ impl Run<'_> {
                 if let Some(j) = self.journal.as_mut() {
                     j.reserved = Some(reserved.clone());
                     j.artifact = None;
+                    j.done.retain(|fact| fact != FIXTURES_STAGED);
                 }
                 self.save_journal()?;
                 self.say(&format!(
@@ -3188,29 +4014,56 @@ impl Run<'_> {
                 reserved
             }
         };
-        let log = self.b.log_path(Step::Build);
-        self.say(&format!("        log: {}", log.display()));
-        let artifact = match self.b.build(&c, &reserved, &p) {
-            Ok(a) => a,
-            Err(r) => return self.refuse(r),
+        let fixtures = !self.facts.fixtures.yes && !self.journal_has(FIXTURES_STAGED);
+        let mut words = Vec::new();
+        let mut refused: Vec<Refusal> = Vec::new();
+        let staged = if self.facts.built.yes {
+            words.push(self.facts.built.words.clone());
+            fixtures.then(|| self.b.stage_fixtures(&c, &reserved, &p))
+        } else {
+            let log = self.b.log_path(Step::Build);
+            self.say(&format!("        log: {}", log.display()));
+            let built = self.b.build(&c, &reserved, &p, fixtures);
+            match built.artifact {
+                Ok(artifact) => {
+                    if let Some(j) = self.journal.as_mut() {
+                        j.artifact = Some(artifact.clone());
+                    }
+                    self.save_journal()?;
+                    self.refresh();
+                    if self.facts.built.yes {
+                        words.push(format!(
+                            "built ONCE: {} — executable sha256 {}",
+                            artifact.app.display(),
+                            artifact.macho_sha256
+                        ));
+                    } else {
+                        let words = self.facts.built.words.clone();
+                        refused.push(Refusal::new(
+                            format!(
+                                "the build ended, and its bundle is not the journal's: {words}"
+                            ),
+                            format!("read its log, then {RELEASE_COMMAND} (it builds again)"),
+                        ));
+                    }
+                }
+                Err(r) => refused.push(r),
+            }
+            built.fixtures
         };
-        if let Some(j) = self.journal.as_mut() {
-            j.artifact = Some(artifact.clone());
+        match staged {
+            Some(Ok(note)) => {
+                self.journal_add(FIXTURES_STAGED)?;
+                words.push(note);
+            }
+            Some(Err(r)) => refused.push(r),
+            None => {}
         }
-        self.save_journal()?;
-        self.refresh();
-        if !self.facts.built.yes {
-            let words = self.facts.built.words.clone();
-            return self.refuse(Refusal::new(
-                format!("the build ended, and its bundle is not the journal's: {words}"),
-                format!("read its log, then {RELEASE_COMMAND} (it builds again)"),
-            ));
+        if self.facts.fixtures.yes {
+            words.push(self.facts.fixtures.words.clone());
         }
-        self.finish(&format!(
-            "built ONCE: {} — executable sha256 {}",
-            artifact.app.display(),
-            artifact.macho_sha256
-        ));
+        self.refuse_all("the build step", refused)?;
+        self.finish(&words.join("; "));
         Ok(())
     }
 
@@ -3227,190 +4080,161 @@ impl Run<'_> {
         Ok(())
     }
 
-    // -- step 8: measure ------------------------------------------------------
+    // -- verify ------------------------------------------------------------
 
-    fn measure(&mut self) -> Flow {
+    /// `verify release --app <the bundle>`: every check a release requires, run in the
+    /// clone at R as an agent would run it, MEASURE of the bytes that ship among them. A
+    /// pass is recorded (R's tree, the bundle's executable) and a resumed release reads
+    /// that record instead of running it again; any other exit refuses, naming the
+    /// command that reruns it. A clone off R's tree, or dirty, before or after the run
+    /// records nothing and stops resumably.
+    fn verify(&mut self) -> Flow {
         let (Some(c), Some(p)) = (self.cand.clone(), self.prover.clone()) else {
             return Ok(());
         };
-        let words = self.facts.measured.words.clone();
+        let words = self.facts.verified.words.clone();
         if self.dry {
             self.finish(&format!(
-                "would run tools/verify.sh --measure <the bundle step 7 built> under the \
-                 release's lock ({words})"
+                "would run `targo {} --app <the bundle step 5 built>` in the clone ({words})",
+                VERIFY_ARGS.join(" ")
             ));
             return Ok(());
         }
         let Some(artifact) = self.artifact() else {
             return self.refuse(Refusal::new(
-                "no bundle is built for this release — MEASURE judges the bytes that ship",
-                format!("{RELEASE_COMMAND} (step 7 builds it)"),
+                "no bundle is built for this release — `verify release` judges the bytes that \
+                 ship",
+                format!("{RELEASE_COMMAND} (step 5 builds it)"),
             ));
         };
-        self.provision(false)?;
-        let log = self.b.log_path(Step::Measure);
-        self.say(&format!("        runs: {words}"));
-        self.say(&format!("        judges: {}", artifact.app.display()));
+        let rerun = verify_command(&artifact.app.display().to_string());
+        let log = self.b.log_path(Step::Verify);
+        self.say(&format!("        runs: {rerun}"));
         self.say(&format!("        log: {}", log.display()));
-        let (ran, stage_could_not_run) = self.b.measure(&p, &artifact.app);
+        let ran = self.b.verify(&c, &p, &artifact);
         self.refresh();
         if let Some(spent) = self.spent() {
             return self.refuse(
                 Refusal::new(
                     format!(
-                        "origin's ledger reached the reservation while it was measured: {}; \
+                        "origin's ledger reached the reservation while it was verified: {}; \
                          these bytes can never ship",
                         spent.words()
                     ),
                     format!(
-                        "run {RELEASE_COMMAND} again — it reserves anew, then builds and measures"
+                        "run {RELEASE_COMMAND} again — it reserves anew, then builds and verifies"
                     ),
                 )
                 .could_not_run(),
             );
         }
-        if self.facts.measured.yes {
-            let words = self.facts.measured.words.clone();
+        let ran = match ran {
+            Ok(ran) => ran,
+            Err(refusal) => return self.refuse(refusal),
+        };
+        if self.facts.verified.yes {
+            let words = self.facts.verified.words.clone();
             self.finish(&words);
             return Ok(());
         }
-        let words = self.facts.measured.words.clone();
-        if self.facts.measured.unanswered {
-            return self.refuse(
-                Refusal::new(
-                    format!(
-                        "the MEASURE run ended (exit {}), and its judge could not answer: {words}",
-                        ran.code
-                    ),
-                    format!("run {RELEASE_COMMAND} again once it answers (its receipt is kept)"),
-                )
-                .detail(ran.detail)
-                .could_not_run(),
-            );
-        }
+        let words = self.facts.verified.words.clone();
         let r = short(&c.commit).to_string();
-        if ran.code == 3 && stage_could_not_run {
-            return self.refuse(
-                Refusal::new(
-                    format!(
-                        "the MEASURE tier could not run for {r} (exit 3, COULD NOT RUN; {words}) — \
-                         nothing failed"
-                    ),
-                    format!(
-                        "run {RELEASE_COMMAND} again, from any session in this clone, when the \
-                         machine is quieter"
-                    ),
-                )
-                .detail(ran.detail)
-                .could_not_run(),
-            );
-        }
-        if ran.code == 3 {
-            return self.refuse(
-                Refusal::new(
-                    format!(
-                        "the MEASURE gate could not run for {r} (exit 3; {words}) — nothing failed, \
-                         and no MEASURE stage was starved: the cause below is not the machine's \
-                         load"
-                    ),
-                    format!("remove the cause the gate names (below), then {RELEASE_COMMAND}"),
-                )
-                .detail(ran.detail)
-                .could_not_run(),
-            );
-        }
-        self.refuse(
-            Refusal::new(
-                format!(
-                    "the MEASURE tier did not measure {r} (exit {}; {words})",
-                    ran.code
-                ),
-                format!("a real red is fixed on main, then {RELEASE_COMMAND} --commit origin/main"),
+        let refusal = match ran.code {
+            0 => Refusal::new(
+                format!("`verify release` passed for {r}, and its record cannot be read: {words}"),
+                format!("run {RELEASE_COMMAND} again once it reads (the candidate is kept)"),
             )
-            .detail(ran.detail),
-        )
+            .could_not_run(),
+            1 => Refusal::new(
+                format!("`verify release` failed for {r} (exit 1)"),
+                format!(
+                    "fix what it names on main (`{rerun}` in the clone runs it again), then \
+                     {RELEASE_COMMAND} --commit origin/main"
+                ),
+            ),
+            code => Refusal::new(
+                format!(
+                    "`verify release` could not run every check for {r} (exit {code}: {}) — \
+                     nothing failed, and a release needs every check",
+                    match code {
+                        3 => "a check could not run or was skipped",
+                        2 => "its command line was refused",
+                        _ => "it did not finish",
+                    }
+                ),
+                format!(
+                    "remove the cause it names (above, and in its log), then {RELEASE_COMMAND}; \
+                     `{rerun}` in the clone runs it alone"
+                ),
+            )
+            .could_not_run(),
+        };
+        self.refuse(refusal.detail(ran.detail))
     }
 
-    // -- steps 10 and 11 ------------------------------------------------------
+    // -- READY, then publish --------------------------------
 
-    fn receipts_stand(&mut self, what_refuses: &str) -> Flow {
+    fn records_stand(&mut self, what_refuses: &str) -> Flow {
         let r = short(&self.commit_r()).to_string();
-        if !self.facts.measured.yes {
-            let words = self.facts.measured.words.clone();
+        if !self.facts.verified.yes {
+            let words = self.facts.verified.words.clone();
             self.refuse(Refusal::new(
-                format!("no MEASURE receipt for the bundle of {r} ({words}) — {what_refuses}"),
-                format!("{RELEASE_COMMAND} (steps 7-8 build and measure it)"),
-            ))?;
-        }
-        if !self.facts.trusted.yes {
-            let words = self.facts.trusted.words.clone();
-            self.refuse(Refusal::new(
-                format!("the whole-tree trust lane does not verify {r} ({words}) — {what_refuses}"),
-                format!("{RELEASE_COMMAND} (step 5 runs the lane)"),
+                format!(
+                    "`verify release` has not passed for the bundle of {r} ({words}) — \
+                     {what_refuses}"
+                ),
+                format!("{RELEASE_COMMAND} (steps 5-6 build and verify it)"),
             ))?;
         }
         Ok(())
     }
 
-    fn stage(&mut self) -> Flow {
-        let (Some(c), Some(p)) = (self.cand.clone(), self.prover.clone()) else {
-            return Ok(());
-        };
+    /// READY: the record the cut requires stands for R — that `verify release` passed on
+    /// its bundle's executable — or nothing goes public. `--prepare` stops after it, PREPARED.
+    fn ready(&mut self) -> Flow {
         if self.dry {
-            let r = if c.bump_from.is_some() {
-                "<the bump commit>".to_string()
-            } else {
-                c.commit.clone()
-            };
-            self.finish(&format!(
-                "would run: pub stage aterm --commit {r} --repo-path <this clone>"
-            ));
+            self.finish(
+                "would require the `verify release` record to stand for R: READY, or nothing \
+                 goes public",
+            );
             return Ok(());
         }
-        self.receipts_stand("the cut would refuse after the publish")?;
-        self.provision(true)?;
-        self.still_possible(&c)?;
-        let ran = match self.b.stage(&c, &p) {
-            Ok(ran) => ran,
-            Err(r) => {
-                self.refresh();
-                return self.refuse(r);
-            }
+        self.records_stand("nothing goes public")?;
+        let source = if self.facts.engine.has {
+            "its source published"
+        } else if self.facts.attested {
+            "its source staged"
+        } else {
+            "its source to be staged again at the publish"
         };
-        self.refresh();
-        if self.facts.attested || self.facts.engine.has {
-            self.finish(&format!(
-                "staged {} (a promotable attestation in publish/.out)",
-                short(&c.commit)
-            ));
-            return Ok(());
-        }
-        self.refuse(
-            Refusal::new(
-                format!(
-                    "pub stage did not stage {} (exit {})",
-                    short(&c.commit),
-                    ran.code
-                ),
-                format!(
-                    "read its log; fix the source on main, then {RELEASE_COMMAND} --commit \
-                     origin/main"
-                ),
-            )
-            .detail(ran.detail),
-        )
+        let r = short(&self.commit_r()).to_string();
+        self.finish(&format!(
+            "READY: {r}, its bundle built once and verified, {source}"
+        ));
+        Ok(())
     }
 
+    /// THE PUBLISH, where the source goes public: AUDIT 2 — this machine's provisioning,
+    /// a gap only the owner closes WAITED on here, the candidate READY and nothing public —
+    /// then, after that wait, what the cut would refuse, and the engine that staged R
+    /// ([`Run::engine_still_staged`]: else the stage runs again), then `pub publish`.
     fn publish(&mut self) -> Flow {
         let (Some(c), Some(p)) = (self.cand.clone(), self.prover.clone()) else {
             return Ok(());
         };
         if self.dry {
-            self.finish("would run: pub publish aterm --repo-path <this clone>");
+            let line = self.provision(true)?;
+            self.finish(&format!(
+                "{line}; would ask again what the cut would refuse and that the engine is the \
+                 one that staged R (else stage again), then run: pub publish aterm --repo-path \
+                 <this clone>"
+            ));
             return Ok(());
         }
+        self.records_stand("the cut would refuse after the publish")?;
         self.provision(true)?;
-        self.still_possible(&c)?;
+        self.still_possible(&c, Some("publish"))?;
+        self.engine_still_staged(&c, &p)?;
         let ran = match self.b.publish(&p) {
             Ok(ran) => ran,
             Err(r) => return self.refuse(r),
@@ -3458,12 +4282,48 @@ impl Run<'_> {
                 .detail(ran.detail),
             );
         }
+        if let Err(r) = self.b.source_publication(&c) {
+            return self.refuse(r);
+        }
         let rev = self.facts.engine.rev.clone().unwrap_or_default();
         self.finish(&format!("published {r} -> alabsystems {}", short(&rev)));
         Ok(())
     }
 
-    // -- step 12: the cut -------------------------------------------------------
+    /// AUDIT 2 FOR A FRESH CUT THIS RUN PUBLISHES NOTHING FOR: an earlier run published
+    /// R and stopped before the claim (interrupted, or refused pre-claim), so the cut
+    /// that follows claims with no publish between. The waiting audit and the re-check
+    /// of what the cut would refuse are asked here all the same: the cut's own pre-claim
+    /// checks ask Apple nothing, so an owner gap opened since (an expired developer
+    /// agreement) would first be met after the claim, a build spent.
+    fn audit_before_cut(&mut self, why: &str) -> Flow {
+        let Some(c) = self.cand.clone() else {
+            self.skip(why);
+            return Ok(());
+        };
+        // the publish itself is skipped (no time of it is recorded): said as a skip
+        let line = self.provision(true)?;
+        if self.dry {
+            self.skip(&format!(
+                "{why}; {line}; would ask again what the cut would refuse, then go on to the cut"
+            ));
+            return Ok(());
+        }
+        self.still_possible(&c, Some("cut"))?;
+        // A publish may have recorded R, then failed at sign-release. The ledger
+        // skips the publish on a re-run, but never proves that its signed source
+        // manifest exists: ask the channel before the cut can claim or make head.
+        if let Err(r) = self.b.source_publication(&c) {
+            return self.refuse(r);
+        }
+        self.skip(&format!(
+            "{why}; asked again before the cut it does not publish for: {line}, and what the \
+             cut would refuse"
+        ));
+        Ok(())
+    }
+
+    // -- cut ---------------------------------------------------------------
 
     fn cut_args(&self, mode: &CutMode) -> Vec<String> {
         let mut args = vec![
@@ -3490,7 +4350,6 @@ impl Run<'_> {
             ));
             return Ok(());
         }
-        self.provision(true)?;
         if matches!(mode, CutMode::Fresh) {
             // the engine as the cut will read it: R must be its newest aterm row
             if let Err(r) = self.b.sync() {
@@ -3501,13 +4360,13 @@ impl Run<'_> {
             if !self.facts.engine.has {
                 return self.refuse(Refusal::new(
                     format!("the engine's ledger does not record {r} — the cut signs only a published commit's build"),
-                    format!("{RELEASE_COMMAND} (step 11 publishes it)"),
+                    format!("{RELEASE_COMMAND} (step 8 publishes it)"),
                 ));
             }
             if let Some(refusal) = self.newest_row_refusal() {
                 return self.refuse(refusal);
             }
-            self.receipts_stand("the cut refuses pre-claim")?;
+            self.records_stand("the cut refuses pre-claim")?;
             // what changes while a release waits: the disk, the version's tag
             if let Some(refusal) = self.cut_still_possible(&c, false).into_iter().next() {
                 return self.refuse(refusal);
@@ -3540,12 +4399,12 @@ impl Run<'_> {
         )
     }
 
-    // -- steps 13 and 14 ---------------------------------------------------------
+    // -- after-cut and final check ------------------------------------------
 
-    /// A SITE THIS MACHINE CANNOT SYNC IS A HAND STEP, NEVER A STOP. `publish/
-    /// post-promote` exits 3 on a machine with no usable site checkout, before it
-    /// touches anything: re-running here could only meet that again, and the release is
-    /// cut and well shaped. So it is journaled (`site-deferred` with `after-cut`, in one
+    /// A SITE THIS MACHINE CANNOT SYNC IS A HAND STEP, NEVER A STOP. `ship site` finds
+    /// no usable site checkout on such a machine before it touches anything:
+    /// re-running here could only meet that again, and the release is cut and well
+    /// shaped. So it is journaled (`site-deferred` with `after-cut`, in one
     /// save), said with the command for a machine that has the checkout — here, in the
     /// final line and by every later run of this release — and the release goes on to
     /// its check.
@@ -3652,10 +4511,6 @@ impl Run<'_> {
         }
         self.journal_add("check")?;
         self.finish(&format!("v{v} is the channel's latest release"));
-        if self.locked {
-            self.b.unlock();
-            self.locked = false;
-        }
         let build = self
             .facts
             .cut
@@ -3685,7 +4540,7 @@ enum CutMode {
 }
 
 /// What the cut would refuse, as ONE refusal: `why`, then each finding with its own fix
-/// line (the preflight's block, and the re-check right before the stage and publish).
+/// line (the preflight's block, the cut's re-checks, step 4's findings).
 fn blocked(why: String, found: &[Refusal]) -> Refusal {
     let detail: Vec<String> = found
         .iter()
@@ -3704,6 +4559,14 @@ fn blocked(why: String, found: &[Refusal]) -> Refusal {
         ),
     )
     .detail(detail)
+}
+
+/// The in-tree handoff fixture generator, as a plan line names it.
+fn fixture_generator() -> String {
+    format!(
+        "the in-tree generator (targo --unverified test -p aterm-gui --lib -- {})",
+        crate::fixtures::generator_args().join(" ")
+    )
 }
 
 fn running_refusal(h: &Holder) -> Refusal {

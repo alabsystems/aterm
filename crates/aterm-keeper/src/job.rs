@@ -1,26 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! WHERE THE KEEPER LIVES: its launchd label, its socket, and the job control
-//! that starts, reads and ends it (`docs/DESIGN-pty-keeper-2026-09-26.md` §0
-//! decision 1, §5.1, §11.3 M1).
+//! Where the keeper lives: its launchd label, its socket, and the job control that starts,
+//! reads and ends it (`docs/DESIGN-pty-keeper-2026-09-26.md` §5.1).
 //!
-//! The installed app's keeper is the transient `launchctl submit` job
-//! [`INSTALLED_LABEL`] in the user's GUI domain: no plist, nothing persisted,
-//! no Background Items notice (M3), outside the app's coalition (M1). A
-//! submitted job is KeepAlive unconditionally and throttled to one start per
-//! 10 s; it cannot end itself (exiting is a restart), and `launchctl remove`
-//! ends it with SIGTERM. Dev and test builds use a DIFFERENT label and socket,
-//! derived from the executable's path, so they can never collide with the
-//! installed keeper (decision 6).
-//!
-//! [`submit`] is called by `aterm keeper start` (with this build's own label
-//! or a test one); the window never starts a keeper itself.
+//! The installed app's keeper is the transient `launchctl submit` job [`INSTALLED_LABEL`] in
+//! the user's GUI domain: no plist, nothing persisted, no Background Items notice, outside the
+//! app's coalition. A submitted job is KeepAlive unconditionally and throttled to one start per
+//! 10 s; it cannot end itself (exiting is a restart), and `launchctl remove` ends it with
+//! SIGTERM. A dev build's label and socket derive from its executable's path, and a test's label
+//! from [`TEST_LABEL_PREFIX`], so neither collides with the installed keeper. A window never
+//! starts a keeper: [`submit`] is `aterm keeper start`'s.
 
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// The installed app's keeper label (decision 1).
+/// The installed app's keeper label.
 pub const INSTALLED_LABEL: &str = "com.aterm.aterm.keeper";
 /// The prefix of a dev build's label: `<prefix>.<hash of the executable path>`.
 pub const DEV_LABEL_PREFIX: &str = "com.aterm.aterm.keeper.dev";
@@ -70,10 +65,9 @@ pub fn own_place() -> KeeperPlace {
     place_for(&exe)
 }
 
-/// The per-uid private directory the keeper's socket lives in: `$TMPDIR/aterm`
-/// when `$TMPDIR` is an absolute, private (owned, not group/other-writable),
-/// non-`/tmp` directory — the rendezvous rules (`handoff_rendezvous.rs`) — else
-/// the control-socket directory. Nothing is created here.
+/// The per-uid private directory the keeper's socket lives in: `$TMPDIR/aterm` when `$TMPDIR` is
+/// an absolute, private (owned, not group/other-writable), non-`/tmp` directory (the rules of
+/// `aterm-gui`'s `handoff_rendezvous`), else the control-socket directory. Creates nothing.
 #[must_use]
 pub fn keeper_dir() -> Option<PathBuf> {
     admitted_temp_base()
@@ -278,11 +272,8 @@ mod tests {
         );
     }
 
-    /// M1's route, measured again as a test: a TEST-labelled job is submitted
-    /// into the GUI domain, launchd runs it with its stderr in the log `start`
-    /// names, `remove` ends it, and launchd then knows no such job. The
-    /// installed label is never touched. A guard removes the job if an
-    /// assertion fails midway.
+    /// A test-labelled job is submitted into the GUI domain, runs with its stderr in the log,
+    /// and after `remove` launchd knows no such job; a guard removes it if an assertion fails.
     #[cfg(target_vendor = "apple")]
     #[test]
     fn a_test_job_is_submitted_and_removed_without_a_trace() {
@@ -332,10 +323,8 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         remove(&label).expect("remove");
-        // launchd drops the job asynchronously too: it stays loaded until its
-        // process has answered the SIGTERM (measured 2026-09-29 at load ~100:
-        // `Loaded { pid }` read straight after `remove`). A minute is a hang
-        // detector.
+        // launchd drops the job asynchronously too: it stays loaded until its process has
+        // answered the SIGTERM. A minute is a hang detector.
         let started = std::time::Instant::now();
         loop {
             let now = state(&label).expect("launchctl");

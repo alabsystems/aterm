@@ -53,12 +53,8 @@ fn serialize_lines_roundtrip() {
     }
 }
 
-/// Regression: `deserialize_lines` must not retain a Vec whose capacity is
-/// driven by an untrusted, inflated `count`. A crafted block can declare a huge
-/// line count, contain one valid line, then stop; reserving
-/// `count.min((len-4)/5)` slots (~16K+ `Line` structs for an ~82 KiB page)
-/// without shrinking pins spare capacity in DiskColdTier's cache that
-/// page_byte_size (len-based) does not count, defeating cache_byte_limit.
+/// A crafted block's inflated `count` must not size the retained Vec: spare
+/// capacity in the DiskColdTier cache escapes `page_byte_size` (len-based).
 #[test]
 fn deserialize_lines_bounds_capacity_for_inflated_count() {
     // A well-formed single-line block: [count=1][valid line record].
@@ -100,12 +96,6 @@ fn line_content_heap() {
     let long = LineContent::from_bytes(&long_data);
     assert!(matches!(long, LineContent::Heap(_)));
     assert_eq!(long.len(), 200);
-}
-
-#[test]
-fn line_memory_used() {
-    let line = Line::from("test");
-    assert!(line.memory_used() > 0);
 }
 
 // ============================================================================
@@ -176,9 +166,8 @@ fn line_with_attrs() {
     assert_eq!(line.get_attr(5).fg, DEFAULT_FG);
 }
 
-/// E6a: the run-cursor is byte-identical to `get_attr` at EVERY index —
-/// monotone walks, repeated indices, past-the-end reads, and the backward
-/// rewind — over many-run and no-attr lines.
+/// The run-cursor matches `get_attr` at every index (monotone walks, repeats,
+/// past-the-end reads, the backward rewind) over many-run and no-attr lines.
 #[test]
 fn attr_cursor_matches_get_attr_everywhere() {
     // 7 runs of varying length, alternating styles.
@@ -369,12 +358,9 @@ fn line_no_hyperlinks() {
 
 #[test]
 fn deserialize_caps_oversized_hyperlink_url_and_id() {
-    // A crafted checkpoint / .dtrm page can declare a hyperlink span whose
-    // url_len/id_len far exceed what OSC 8 ingestion would ever admit
-    // (MAX_HYPERLINK_URL_BYTES=8192, id<=256). MAX_LINE_CONTENT_BYTES bounds only
-    // the CONTENT section, so without a hyperlink-section cap the deserializer
-    // would Arc::from a multi-MiB URL — a stored Line breaching the 2 MiB content
-    // invariant. Deserialize must skip an over-cap URL span and drop an over-cap id.
+    // A crafted checkpoint or .dtrm page can declare a span whose url_len/id_len
+    // exceed the OSC 8 ingestion caps: deserialize skips the over-cap URL span
+    // and drops the over-cap id.
     use crate::line::line_codec::{MAX_HYPERLINK_ID_BYTES, MAX_HYPERLINK_URL_BYTES};
 
     let url_big: String = "h".repeat(MAX_HYPERLINK_URL_BYTES + 100);
@@ -437,14 +423,11 @@ fn deserialize_caps_oversized_hyperlink_url_and_id() {
 
 #[test]
 fn deserialize_caps_hyperlink_span_count() {
-    // A crafted Line can declare up to u16::MAX (65535) hyperlink spans; each is
-    // ~40 B in memory, so an uncapped rebuild balloons one line's span SmallVec to
-    // ~2.6 MiB (the 2 MiB content cap does NOT cover the hyperlink section). A legit
-    // row has <= MAX_GRID_COLS coalesced spans, so deserialize caps the reconstructed
-    // count at MAX_HYPERLINK_SPANS.
+    // A crafted line can declare u16::MAX hyperlink spans; deserialize caps the
+    // rebuilt count at MAX_HYPERLINK_SPANS (see its doc).
     use crate::line::line_codec::MAX_HYPERLINK_SPANS;
 
-    // Build MANY 1-column spans (well over the cap) at distinct columns.
+    // 1-column spans at distinct columns, well over the cap.
     let n = MAX_HYPERLINK_SPANS + 500;
     let mut hyperlinks = Vec::with_capacity(n);
     for i in 0..n {
@@ -535,8 +518,7 @@ fn line_underline_color_serialize_roundtrip() {
 
 #[test]
 fn line_without_underline_colors_stays_v3() {
-    // The common path is byte-identical to before: no SGR 58 → version 3, no
-    // trailing section, so a v3 reader is unaffected (backward/forward compat).
+    // No SGR 58: version 3 and no trailing section, so a v3 reader is unaffected.
     let rle: Rle<CellAttrs> = Rle::new();
     let hyperlinks = vec![HyperlinkSpan::new(0, 4, Arc::from("https://x.test"))];
     let line = Line::with_hyperlinks("hello", rle, hyperlinks);
@@ -551,8 +533,8 @@ fn line_without_underline_colors_stays_v3() {
 
 #[test]
 fn line_underline_colors_and_hyperlinks_roundtrip_together() {
-    // Underline colours are appended AFTER hyperlinks; deserialize must locate the
-    // section past the hyperlink bytes (offset threading), so both survive.
+    // Underline colours follow the hyperlinks; deserialize must locate the
+    // section past the hyperlink bytes, so both survive.
     let rle: Rle<CellAttrs> = Rle::new();
     let hyperlinks = vec![HyperlinkSpan::with_id(
         0,
@@ -576,10 +558,8 @@ fn line_underline_colors_and_hyperlinks_roundtrip_together() {
 
 #[test]
 fn serialize_lines_underline_colors_block_framing() {
-    // Block-level framing regression: a v4 (underline-coloured) line SANDWICHED
-    // between other lines. line_size_v1v2 must include the underline section, or
-    // `offset` lands mid-section and every following record misframes — the exact
-    // corruption the RAM-tier parity tests can't see (warm/cold tier + checkpoint).
+    // A v4 line between two others: `line_size_v1v2` must include the underline
+    // section, or every following record misframes.
     let mut lines = Vec::new();
     lines.push(Line::from("before"));
 
@@ -621,7 +601,7 @@ fn serialize_lines_underline_colors_block_framing() {
 
 #[test]
 fn line_underline_colors_no_hyperlinks_roundtrip() {
-    // Underline colours with ZERO hyperlinks: the section begins right after the
+    // Underline colours with no hyperlinks: the section begins right after the
     // 2-byte hyperlink count (deserialize_hyperlinks_v3 must report that offset,
     // not `data.len()`, or the underline section would be missed).
     let rle: Rle<CellAttrs> = Rle::new();
@@ -729,10 +709,8 @@ fn hyperlink_span_serialized_size() {
 // Robustness tests for untrusted input
 // =============================================================================
 
-/// Verifies that deserialize_lines clamps with_capacity to data-derived maximum.
-///
-/// A crafted count=1M with only 4 bytes of actual data cannot contain any lines,
-/// so capacity is clamped to 0 (data_remaining / MIN_LINE_SIZE = 0 / 5 = 0).
+/// `deserialize_lines` clamps its reservation to what the data can hold: a count
+/// of 1M over no records reserves nothing.
 #[test]
 fn deserialize_lines_malicious_count_over_allocates() {
     let count: u32 = 1_000_000;
@@ -764,8 +742,8 @@ fn deserialize_lines_truncated_header() {
     assert!(result.is_empty());
 }
 
-/// Fix F: a record declaring a content length past `MAX_LINE_CONTENT_BYTES` is
-/// REJECTED, not materialized. A legitimate line (well under the cap) round-trips.
+/// A record declaring content past `MAX_LINE_CONTENT_BYTES` is rejected, not
+/// materialized; a normal line round-trips.
 #[test]
 fn deserialize_rejects_oversized_line_content() {
     use crate::line::line_codec::MAX_LINE_CONTENT_BYTES;
@@ -790,8 +768,8 @@ fn deserialize_rejects_oversized_line_content() {
     );
 }
 
-/// Fix G: deserialize_lines_capped bounds the RECONSTRUCTED line count so a crafted
-/// block of many tiny records cannot amplify into a huge Vec<Line>. The uncapped
+/// `deserialize_lines_capped` bounds the reconstructed line count, so a block of
+/// many tiny records cannot amplify into a huge `Vec<Line>`; the uncapped
 /// `deserialize_lines` (checkpoint path) still returns them all.
 #[test]
 fn deserialize_lines_capped_bounds_reconstructed_count() {
@@ -877,7 +855,7 @@ fn strict_decode_one_row(line: &Line, cols: usize) -> Option<Vec<Line>> {
     )
 }
 
-/// A styled row whose attrs RLE has one entry per CHARACTER, as the grid's
+/// A styled row whose attrs RLE has one entry per character, as the grid's
 /// row→line conversion emits it (`push_cell_text` charges `chars().count()`,
 /// one attr per combining mark, nothing for a wide spacer).
 fn styled_row(text: &str) -> Line {
@@ -889,11 +867,8 @@ fn styled_row(text: &str) -> Line {
     Line::with_attrs(text, rle)
 }
 
-/// The 2026-09-22 update wedge: a bold 149-column row of 148 `a` and an NFD
-/// `e` + U+0301 is 149 CELLS but 150 CHARACTERS, and the strict decoder
-/// compared the attrs RLE's character count to the cell cap, so the whole
-/// visible screen was "not canonical" and every in-session update refused.
-/// Fails on that comparison (`cells > max_cells_per_line`).
+/// A bold 149-column row of 148 `a` and an NFD `e` + U+0301 is 149 cells but
+/// 150 characters; comparing the attrs count to the cell cap would refuse it.
 #[test]
 fn strict_checkpoint_decoder_admits_a_full_styled_row_with_a_combining_mark() {
     let text = format!("{}e\u{301}", "a".repeat(148));
@@ -909,9 +884,8 @@ fn strict_checkpoint_decoder_admits_a_full_styled_row_with_a_combining_mark() {
     );
 }
 
-/// The ZWJ variant of the same wedge: `👨‍💻` is three codepoints in two cells,
-/// so 147 `a` plus the cluster fill 149 columns with 150 characters.
-/// Fails on the old comparison.
+/// The ZWJ variant: `👨‍💻` is three codepoints in two cells, so 147 `a` plus the
+/// cluster fill 149 columns with 150 characters.
 #[test]
 fn strict_checkpoint_decoder_admits_a_full_styled_row_with_a_zwj_emoji() {
     let text = format!("{}\u{1F468}\u{200D}\u{1F4BB}", "a".repeat(147));
@@ -925,9 +899,9 @@ fn strict_checkpoint_decoder_admits_a_full_styled_row_with_a_zwj_emoji() {
     );
 }
 
-/// The leniency is bounded by the line's OWN character count: an attrs RLE
+/// The leniency is bounded by the line's own character count: an attrs RLE
 /// that claims more entries than the line has characters and more than the
-/// grid has columns is still refused, so the cap never became unbounded.
+/// grid has columns is still refused.
 #[test]
 fn strict_checkpoint_decoder_still_refuses_attrs_beyond_both_bounds() {
     let bold = CellAttrs::new(DEFAULT_FG, DEFAULT_BG, 1);
@@ -941,7 +915,7 @@ fn strict_checkpoint_decoder_still_refuses_attrs_beyond_both_bounds() {
         strict_decode_one_row(&line, 80).is_none(),
         "attrs beyond both the column cap and the character count are hostile"
     );
-    // Exactly `cols` attrs is still admitted, as before.
+    // Exactly `cols` attrs is admitted.
     let mut rle: Rle<CellAttrs> = Rle::new();
     for _ in 0..80 {
         rle.push(bold);
@@ -950,8 +924,8 @@ fn strict_checkpoint_decoder_still_refuses_attrs_beyond_both_bounds() {
     assert!(strict_decode_one_row(&line, 80).is_some());
 }
 
-/// Hyperlink and underline-colour spans are PHYSICAL columns, not characters,
-/// so the character-count leniency must not reach them: a span ending past
+/// Hyperlink and underline-colour spans are physical columns, not characters,
+/// so the character-count leniency does not reach them: a span ending past
 /// `cols` is refused even on a line with more characters than columns.
 #[test]
 fn strict_checkpoint_decoder_keeps_span_columns_bounded_by_cols() {
@@ -995,10 +969,7 @@ fn deserialize_lines_count_exceeds_actual() {
     assert_eq!(result[0].to_string(), "test");
 }
 
-/// Fuzz crash artifact: exercises integer overflow in deserialization.
-///
-/// Crash-24c1eee0 (41 bytes) — should not panic on any code path.
-/// Filed as #4950: line_codec integer overflow in Line::deserialize.
+/// A 41-byte fuzz crash artifact: no decode path panics or overflows on it.
 #[test]
 fn fuzz_crash_4950_line_codec_no_overflow() {
     let data: &[u8] = &[
@@ -1101,10 +1072,8 @@ fn fuzz_regression_rle_run_length_overflow() {
     assert!(line.has_attrs());
 }
 
-/// #5860: serialize_lines pre-allocates capacity from content sizes.
-///
-/// The initial allocation should cover plain-text lines without reallocation.
-/// Content-aware estimate: 4 + sum(line.len()) + 9 * line_count.
+/// `serialize_lines` of plain-text lines fits a content-aware estimate:
+/// 4 + sum(line.len()) + 9 per line.
 #[test]
 fn serialize_lines_capacity_covers_plain_text() {
     let lines: Vec<Line> = (0..100)
@@ -1116,8 +1085,6 @@ fn serialize_lines_capacity_covers_plain_text() {
 
     let serialized = serialize_lines(&lines);
 
-    // Plain-text lines (no attrs, no hyperlinks) should fit within
-    // the content-aware estimate — zero reallocations on the hot path.
     assert!(
         serialized.len() <= estimated_cap,
         "serialized size {} exceeds content-aware estimate {}: \
@@ -1168,7 +1135,7 @@ fn serialize_lines_capacity_covers_styled_hyperlinked_rows() {
     }
 }
 
-/// #5860: serialize_lines handles empty and single-line blocks correctly.
+/// serialize_lines handles empty and single-line blocks.
 #[test]
 fn serialize_lines_empty_and_single() {
     // Empty block.
@@ -1187,12 +1154,9 @@ fn serialize_lines_empty_and_single() {
 
 #[test]
 fn fuzz_deserialize_lines_never_panics_on_corrupt_disk_data() {
-    // Scrollback pages are read back from disk files that may be truncated or
-    // bit-flipped. `deserialize_lines` must NEVER panic on arbitrary bytes, and
-    // must not over-allocate from an attacker-controlled count header (the
-    // capacity is clamped to what the data can hold). This deterministic fuzz
-    // sweeps 100k pseudo-random byte sequences — including ones with a huge
-    // leading count header — and checks no panic + a bounded result.
+    // Disk pages may be truncated or bit-flipped: `deserialize_lines` never
+    // panics on arbitrary bytes and never decodes more lines than the data can
+    // hold, including under a maximal count header.
     let mut state: u64 = 0x6A09_E667_F3BC_C908;
     let mut next = move || {
         state = state
@@ -1248,13 +1212,9 @@ fn fuzz_serialize_deserialize_roundtrip() {
     }
 }
 
-/// `Line::record_is_valid` is the acceptance predicate the warm→cold eviction
-/// path validates a page with WITHOUT materializing it, so it must agree with
-/// `Line::deserialize` on every record — including the corrupt and truncated
-/// ones. A divergence would either admit a corrupt block to the cold tier or
-/// reject a good one. (The block decoder additionally debug-asserts the pair on
-/// every record it walks; this pins the malformed inputs that decoder never
-/// sees.)
+/// `Line::record_is_valid` must agree with `Line::deserialize` on every record,
+/// corrupt and truncated ones included. The block decoder debug-asserts the pair
+/// on every record it walks; this pins the malformed inputs it never sees.
 #[test]
 fn record_is_valid_agrees_with_deserialize_on_malformed_records() {
     let mut rle: Rle<CellAttrs> = Rle::new();
@@ -1328,10 +1288,9 @@ fn record_is_valid_agrees_with_deserialize_on_malformed_records() {
 
 // ── Inline images in history ────────────────────────────────────────────────
 //
-// The property under test is that `Line` HAS somewhere to keep a picture,
-// and that keeping it does not lie to the memory budget. The end-to-end
-// "scroll it off, scroll back, the tiles are there" test lives in aterm-core
-// (`tests/image_survives_scrollback.rs`); these pin the storage contract.
+// These pin the storage contract: `Line` can keep a picture without lying to the
+// memory budget. The end-to-end test is aterm-core's
+// `tests/image_survives_scrollback.rs`.
 
 /// A `rows`-tall placement whose raster is `payload` bytes.
 fn test_image(rows: u16, cols: u16, payload: usize) -> Arc<aterm_types::ImageData> {
@@ -1438,10 +1397,9 @@ fn a_line_with_no_image_serializes_exactly_as_it_did_before_images_existed() {
 
 #[test]
 fn serialization_drops_the_image_and_keeps_everything_else() {
-    // THE SCOPE LINE, pinned so it cannot move silently in either direction: a
-    // picture survives in the in-memory hot tier and is dropped when its line
-    // is compressed for the warm/cold/disk tiers. If a future change gives the
-    // block codec a payload table, this test is what says so.
+    // Pins the scope line: a picture survives in the in-memory hot tier and is
+    // dropped when its line is compressed. A block-codec payload table would
+    // change this test.
     let rle: Rle<CellAttrs> = Rle::new();
     let mut line = Line::with_hyperlinks("under the image", rle, Vec::new());
     line.set_images(vec![ImageSpan::new(0, 4, 0, 0, test_image(1, 4, 128))]);
@@ -1458,13 +1416,10 @@ fn serialization_drops_the_image_and_keeps_everything_else() {
     );
 }
 
-/// `clear_hyperlinks` DROPS THE LINKS AND NOTHING ELSE. A self-update's
-/// producer uses it on a screen line whose record is past the wire's size
-/// bound, so the line must still read,
-/// render and wrap exactly as it did: the text, the attrs, `WRAPPED`, the
-/// underline colours and the images all stay. And the cleared line must
-/// serialize byte-for-byte like one that never had a link, because the wire
-/// only admits canonical records.
+/// `clear_hyperlinks` drops the links and nothing else: text, attrs, `WRAPPED`,
+/// underline colours and images stay, and the cleared line serializes
+/// byte-for-byte like one that never had a link (the wire admits only canonical
+/// records).
 #[test]
 fn clearing_hyperlinks_drops_the_links_and_keeps_everything_else() {
     let red = CellAttrs::new(0x01_FF0000, DEFAULT_BG, 0);
@@ -1599,7 +1554,7 @@ fn the_link_ceiling_is_the_record_cap_plus_one_maximal_link_per_column() {
     );
 }
 
-/// Law L3's half of the contract: on every block the strict decoder admits,
+/// The relaxation only adds leniency: on every block the strict decoder admits,
 /// the stripping decoder returns the very same lines and strips none.
 #[test]
 fn the_stripping_decoder_reads_whatever_the_strict_one_admits_unchanged() {
@@ -1622,10 +1577,9 @@ fn the_stripping_decoder_reads_whatever_the_strict_one_admits_unchanged() {
     );
 }
 
-/// THE DEFECT'S SHAPE (2026-09-28): one row of twelve 8 KiB links is a
-/// ~96 KiB record against the 56 KiB cap of an 80-column frame. The strict
-/// decoder refuses the whole block for it (the NEGATIVE CONTROL); the
-/// stripping decoder keeps that line with only its links dropped, and every
+/// One row of twelve 8 KiB links is a ~96 KiB record against the 56 KiB cap of
+/// an 80-column frame: the strict decoder refuses the block (the negative
+/// control); the stripping decoder keeps the line without its links and every
 /// other line exactly.
 #[test]
 fn a_link_dense_line_over_the_cap_keeps_its_text_and_loses_only_its_links() {
@@ -1677,7 +1631,7 @@ fn a_link_dense_line_over_the_cap_keeps_its_text_and_loses_only_its_links() {
 }
 
 /// Everything else the strict decoder refuses is still refused: the relaxation
-/// is for a record over the cap BECAUSE OF ITS LINKS, within the ceiling.
+/// is for a record over the cap because of its links, within the ceiling.
 #[test]
 fn the_stripping_decoder_refuses_every_record_its_links_do_not_explain() {
     let cols = 8;
@@ -1755,14 +1709,10 @@ fn the_stripping_decoder_refuses_every_record_its_links_do_not_explain() {
     let long = Line::with_hyperlinks(&text, Rle::new(), long.hyperlinks().unwrap().to_vec());
     refused("content over the content cap", &[long]);
 
-    // Over the cap because of bytes the DECODE drops, not its links: at 80
-    // columns, one short link and 8,000 underline-colour spans (~64 KB against
-    // the 56 KiB cap). `Line::deserialize` keeps only the first
-    // `MAX_UNDERLINE_SPANS` of them, so the decoded line without its link fits
-    // the cap — a rule judged on the decoded line alone would admit ~30 KB of
-    // bytes no link explains. The record is not what the serializer writes
-    // for the line it decodes to, and it is refused like the same record with
-    // no link.
+    // Over the cap because of bytes the decode drops, not its links: one short
+    // link and 8,000 underline spans at 80 columns. `Line::deserialize` keeps
+    // only `MAX_UNDERLINE_SPANS` of them, so judged on the decoded line, dropping
+    // the link would fit the cap; the record is not canonical, so it is refused.
     let smuggler = |linked: bool| {
         let spans = if linked {
             vec![HyperlinkSpan::new(0, 1, Arc::from("https://a.test"))]

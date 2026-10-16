@@ -1,28 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The `tone` control verb's report: the window's tone tracker
-//! ([`aterm_effects::tone_infer::ToneTracker`]) read beside every gate this
-//! host owns — the knob, the trail-sound master, the audio host, the key
-//! seam — so the wire line is a pure function of plain data.
+//! The `tone` control verb's report: the window's tone tracker read beside every gate
+//! this host owns, as plain data so the wire line is headless-testable.
 
 use aterm_effects::tone::Tone;
 
-/// Everything the `tone` control verb reports, gathered from the App in one
-/// place so the WIRE FORMAT is a pure function of plain data (no `App`, no
-/// window, no audio device) and can be pinned by a headless test.
-///
-/// The fields are chosen to answer the ONE question a driver actually asks —
-/// "is the mood steering my typing sounds, and if not, which gate stopped
-/// it?" — so every conjunct of `App::tone_infer_active` appears as its own
-/// field rather than being collapsed into the single `active` verdict.
+/// Everything the `tone` control verb reports. Each conjunct of
+/// `App::tone_infer_active` is its own field, so a driver can see which gate stopped
+/// the mood from steering typing sounds.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) struct ToneStatus {
-    /// The classifier's cached verdict, BEFORE the knob.
+    /// The classifier's cached verdict, before the knob.
     pub(crate) tone: Tone,
-    /// What the drain seams actually stamp onto events (`tone` with the knob
-    /// on, `technical` with it off) — the field to read when asking what the
-    /// synth HEARD, as opposed to what the model thought.
+    /// What the drain seams stamp onto events: `tone` with the knob on, `technical` off.
     pub(crate) effective: Tone,
     /// `tone_melody` config knob.
     pub(crate) knob: bool,
@@ -30,60 +21,40 @@ pub(crate) struct ToneStatus {
     pub(crate) sounds: bool,
     /// `trail_sound_volume`, already clamped to 0..1.
     pub(crate) volume: f32,
-    /// The audio host's honest state — not merely whether a channel exists
-    /// (see [`crate::trail_audio::HostState`]).
+    /// The audio host's state (`live` means started, not merely that a channel exists).
     pub(crate) audio: crate::trail_audio::HostState,
-    /// The AND of the four above: whether inference may run at all.
+    /// `App::tone_infer_active`: whether inference may run at all.
     pub(crate) active: bool,
-    /// Chars in the typed window (never the text — see
-    /// [`aterm_effects::tone_infer::ToneTracker::window_chars`]).
+    /// Chars in the typed window (never the text).
     pub(crate) window_chars: usize,
-    /// Inferences run since the window was created. ZERO with a non-neutral
-    /// `tone` is impossible; zero with `active=true` after typing means the
-    /// feed is broken, not that your prose reads technical.
+    /// Inferences run since the window was created. Zero with `active=true` after
+    /// typing means the feed is broken.
     pub(crate) inferences: u64,
-    /// Saturating count of sound cues dropped on a full ingress channel over
-    /// the host's lifetime. A handful is a burst; thousands alongside
-    /// `audio=wedged` is the wedge's cost, printed instead of private.
+    /// Saturating lifetime count of dropped sound cues (`TrailAudio::dropped_cues`).
     pub(crate) dropped: u64,
-    /// THE ANSWER: `None` ⇒ a keypress right now makes a sound; `Some(r)` ⇒
-    /// the gate that stops it. Carried as the `Copy` enum rather than a
-    /// `String` so this struct keeps `Copy` for the wire tests; `line()`
-    /// renders it.
+    /// `None`: a keypress now makes a sound; `Some(r)`: the gate that stops it.
     pub(crate) seam: Option<crate::sound_seam::SeamReason>,
-    /// `CursorGlow::sound_seam_open()` — the engine's own key gate, the term
-    /// that was MISSING while a load-shed frame and macOS `Reduce Motion`
-    /// silenced typing with `audio=live` on the row.
+    /// `CursorGlow::sound_seam_open()`: the engine's own key gate.
     pub(crate) engine_sound: bool,
-    /// [`crate::sound_seam::trail_on`]: `GlowConfig::enabled` — the master
-    /// knob AND serious mode AND a style that resolves, the gate the engine
-    /// itself reads — AND a nonzero brightness knob, the person's own off.
+    /// [`crate::sound_seam::trail_on`]: `GlowConfig::enabled` and a nonzero brightness.
     pub(crate) trail: bool,
-    /// The cursor-effect focus fold, the SAME value `trail status` prints as
-    /// `focused=`, so the two verbs cannot contradict each other.
+    /// The cursor-effect focus fold; the same value `trail status` prints as `focused=`.
     pub(crate) focused: bool,
     /// `SeriousEffect::TerminalSound`, spelled as `streak status` spells it.
     pub(crate) serious_sound: bool,
-    /// `full` or `reduced` — the D1/D2 evidence pair with `shed`, in the same
-    /// spellings and formats `trail status` uses, so a human diffing the two
-    /// rows on one process is never misled by precision skew.
+    /// `full` or `reduced`, spelled as `trail status` spells it.
     pub(crate) motion_stage: &'static str,
     /// The soft load-shed envelope in 0..1 (1.0 = not shedding).
     pub(crate) shed: f32,
-    /// Wedge revivals SPENT. A revival stands up a fresh worker with a fresh
-    /// counter, so `dropped=0` beside `revives=2` stops being a lie by
-    /// omission.
+    /// Wedge revivals spent; a revival replaces the worker, so read it beside `dropped`.
     pub(crate) revives: u64,
-    /// Device reopens the audio worker has LEFT ([`REOPEN_BUDGET`] at birth).
-    /// One lower than baseline after a transient CoreAudio fault is the
-    /// signal that the host recovered rather than died; `0` beside
-    /// `audio=failed` is the one honestly terminal reading.
+    /// Device reopens the audio worker has left (`trail_audio::REOPEN_BUDGET` at birth);
+    /// `0` beside `audio=failed` is terminal.
     pub(crate) reopens_left: u8,
 }
 
 impl ToneStatus {
-    /// The wire tail after `OK ` — one line, `key=value` pairs in a fixed
-    /// order, the shape `rain status` established.
+    /// The wire tail after `OK `: one line of `key=value` pairs in a fixed order.
     pub(crate) fn line(&self) -> String {
         format!(
             "tone={} effective={} knob={} sounds={} volume={:.2} audio={} \
@@ -117,9 +88,7 @@ impl ToneStatus {
 mod tests {
     use super::*;
 
-    /// The wire line: every gate is its own field, in a fixed order, and the
-    /// tone words are the classifier's own labels (so a driver can compare
-    /// them against `Tone::label`, not a second spelling of the same enum).
+    /// Every gate is its own field, in a fixed order, using `Tone::label` spellings.
     #[test]
     fn status_line_reports_every_gate_in_a_fixed_order() {
         let status = ToneStatus {
@@ -152,9 +121,7 @@ mod tests {
         );
     }
 
-    /// The wedge is its own word on the wire: a stuck worker must never be
-    /// spelled `live` (the 2026-08 incident) nor collapsed into `inert`
-    /// (which names the sealed/failed forms a restart cannot revive).
+    /// A stuck worker is spelled `wedged`, never `live` or `inert`.
     #[test]
     fn status_line_spells_a_wedged_host_wedged() {
         let status = ToneStatus {

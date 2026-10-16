@@ -1,13 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The cold update lane retires the control socket right before its `exec`,
-//! inside the resident operator's commit permit (`App::run_cold_exec`,
-//! `control_listener::Endpoint`), and reopens it when the `exec` returns
-//! (`App::resume_after_cold_exec`). Driven over the real
-//! supervised accept loop and the real request lanes on a temporary socket;
-//! only the request handling is a stand-in, whose `hold` keeps its lane the way
-//! a verb waiting on the main thread does while that thread execs.
+//! The cold update lane retires the control socket right before its `exec`, inside the
+//! resident operator's commit permit (`App::run_cold_exec`, `control_listener::Endpoint`), and
+//! reopens it when the `exec` returns (`App::resume_after_cold_exec`). Driven over the real
+//! supervised accept loop and request lanes on a temporary socket; only the request handling is
+//! a stand-in, whose `hold` keeps its lane the way a verb waiting on the main thread does.
 
 use std::io::{BufRead as _, BufReader, ErrorKind, Read as _, Write as _};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,9 +23,8 @@ use crate::operator_host::ControlHandle as OperatorControl;
 /// calls it a hang.
 const HANG: Duration = Duration::from_secs(60);
 
-/// `AUTH ok` authenticates; `hold` is answered only once the test releases it
-/// — a verb whose answer the main thread owes; any other line is answered at
-/// once.
+/// `AUTH ok` authenticates; `hold` is answered only once the test releases it (a verb whose
+/// answer the main thread owes); any other line is answered at once.
 #[derive(Default)]
 struct MainThreadVerbs {
     hold: Mutex<Hold>,
@@ -114,30 +111,15 @@ fn assert_answers(path: &std::path::Path, what: &str) {
     assert_eq!(reply, "OK ping\n", "{what}");
 }
 
-/// THE COLD EXEC'S DRAIN. A client holds an authenticated connection whose
-/// verb the main thread owes; the main thread prepares the `exec`.
+/// A client holds an authenticated connection whose verb the main thread owes while the main
+/// thread prepares the `exec`. While the operator's commit permit refuses, no `exec` runs: the
+/// held connection stays open (WouldBlock) and the socket keeps answering. Once it is granted,
+/// by the time the `exec` runs the held connection reads EOF and a new client is refused; when
+/// the `exec` returns the same path serves again.
 ///
-/// First the resident operator's commit permit refuses (it is shutting
-/// down): no `exec` runs, so the held connection must stay open (WouldBlock)
-/// and the socket keep answering — retired before the permit, the held
-/// connection read EOF for an `exec` that never ran.
-///
-/// Then the permit is granted: when the `exec` runs, the held connection must
-/// already read EOF and a new client be refused — not, as before, left open
-/// (WouldBlock) and queued (a connect that succeeds) for as long as the `exec`
-/// takes to terminate every other thread, which is seconds on a saturated
-/// machine. The `exec` returns: the same path must serve again.
-///
-/// ALONE IN ITS OWN PROCESS. A child that any thread forks holds a copy of
-/// every descriptor until it execs, this listening socket's included
-/// (close-on-exec acts only at the exec), and the socket closes only with its
-/// last copy. In the shared lib-test process a sibling's child that had not
-/// exec'd yet (a `pre_exec` spawn, a pty, a parked child) kept the retired
-/// listener listening, and the refused connect below succeeded: 5 of 20 runs
-/// of `control::` beside the forking modules at load 145. macOS offers no
-/// close-on-fork to opt out with: the 26 SDK defines `FD_CLOFORK`, but
-/// `F_SETFD` drops it on 26.6 (measured). So the test runs where no other
-/// thread forks.
+/// Runs alone in its own process: a forked child holds a copy of the listening socket until it
+/// execs, so a sibling test's not-yet-exec'd child keeps a retired listener accepting. macOS has
+/// no working close-on-fork (`F_SETFD` drops `FD_CLOFORK` on 26.6).
 #[test]
 fn a_cold_exec_retires_the_control_socket_and_a_failed_one_reopens_it() {
     if !crate::test_alone::alone() {

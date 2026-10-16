@@ -1555,6 +1555,13 @@ impl KittyLogHost {
         self.favourite
     }
 
+    /// [`Self::favourite_look`] as far as the ledger has loaded, for a reader
+    /// that holds `&self` (the Settings preview's companion): it never polls,
+    /// so before the first load lands it claims nothing.
+    pub(crate) fn favourite_look_loaded(&self) -> Option<KittyLook> {
+        self.favourite
+    }
+
     /// TYPED drain-site entry point (`record_typed_kitty`): dedupe, record,
     /// and debounce-flush this tick's sightings. A first-ever discovery is
     /// RETURNED as the Kitty Log's own accounting of the unlock (the caller

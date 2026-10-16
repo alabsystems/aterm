@@ -2,16 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Hot tier: uncompressed lines in VecDeque.
-//!
-//! Instant access, no decompression overhead.
+//! Hot tier: uncompressed lines in a `VecDeque`, no decompression on access.
 
 use super::line::Line;
 use std::collections::VecDeque;
 
 /// Hot tier: uncompressed lines in RAM.
-///
-/// Uses VecDeque for efficient front/back operations.
 #[derive(Debug)]
 pub(crate) struct HotTier {
     /// Lines stored uncompressed.
@@ -42,10 +38,8 @@ impl HotTier {
 
     /// Push a line to the back.
     ///
-    /// Spelled `saturating_add`: the counters track bytes of memory this
-    /// process actually holds, so the true sum always fits in `usize` and the
-    /// saturation can never fire on a real path — it just discharges the
-    /// strict L0 gate's unconstrained-input overflow counterexamples.
+    /// Saturating: the counters track bytes this process holds, so the sum always
+    /// fits; saturation only discharges the strict gate's overflow obligations.
     #[inline]
     pub(crate) fn push(&mut self, line: Line) {
         let mem = line.memory_used();
@@ -54,10 +48,7 @@ impl HotTier {
         self.lines.push_back(line);
     }
 
-    /// Get a line by index (0 = oldest).
-    ///
-    /// Returns a reference — no clone. Callers that need ownership should
-    /// clone explicitly or use `Cow::into_owned()` at the tier-dispatch level.
+    /// Get a line by index (0 = oldest), by reference.
     #[must_use]
     // Skip: the ring index read — VecDeque::get navigates the ring's head/len
     // arithmetic the verifier cannot chain. Total by the `Option` return.
@@ -69,11 +60,9 @@ impl HotTier {
     /// Take n lines from the front.
     pub(crate) fn take_front(&mut self, n: usize) -> Vec<Line> {
         let n = n.min(self.lines.len());
-        // Capacity is only a hint (never affects the returned lines). Real
-        // callers pass block-size-scale counts (`block_size` is clamped to
-        // MAX_DECODE_PAGE_LINES at construction), so the bounded branch is the
-        // one that always runs; the bound just makes the strict L0 gate's
-        // allocation-budget obligation provable.
+        // Capacity is a hint only. Real callers pass block-size counts (`block_size`
+        // is clamped to MAX_DECODE_PAGE_LINES), so the bounded branch always runs;
+        // the bound makes the strict gate's allocation-budget obligation provable.
         let mut result = if n <= crate::line::MAX_DECODE_PAGE_LINES {
             Vec::with_capacity(n)
         } else {
@@ -91,8 +80,8 @@ impl HotTier {
     }
 
     /// Truncate to keep only the last n lines.
-    // Skip: the ring `drain(..n)` under its `n <= len` guard — the
-    // BLANKET-unmodeled drain class (guards don't chain). Unit-tested.
+    // Skip: the ring `pop_front` loop under its `len > n` guard, an unmodeled
+    // VecDeque op (guards don't chain). Unit-tested.
     #[cfg_attr(trust_verify, trust::skip)]
     pub(crate) fn truncate_front(&mut self, n: usize) {
         while self.lines.len() > n {
@@ -108,7 +97,7 @@ impl HotTier {
     ///
     /// Used by Kitty CSI +T unscroll: recovered lines must be removed
     /// from scrollback after being placed back into the visible grid.
-    // Skip: the ring truncate's blanket-drain class (twin of truncate_front).
+    // Skip: the same ring-pop class as truncate_front.
     #[cfg_attr(trust_verify, trust::skip)]
     pub(crate) fn truncate_back(&mut self, n: usize) {
         for _ in 0..n.min(self.lines.len()) {
@@ -140,13 +129,10 @@ impl HotTier {
         self.budgeted_bytes
     }
 
-    /// Saturating fold for the same strict-gate reason as
-    /// [`push`](Self::push) (identical on every real path).
+    /// Saturating for the same strict-gate reason as [`push`](Self::push).
     ///
-    /// cfg: callers are the test suite and `DiskBackedScrollback`'s
-    /// debug-build invariant recomputation (`disk-tier`); `Scrollback`'s own
-    /// recomputation is test-only, so this exact cfg avoids dead code in
-    /// non-test default-feature debug builds.
+    /// Callers are the test suite and `DiskBackedScrollback`'s debug-build
+    /// invariant check (`disk-tier`), hence the cfg.
     #[cfg(any(test, all(debug_assertions, feature = "disk-tier")))]
     #[must_use]
     pub(crate) fn recompute_memory_used(&self) -> usize {

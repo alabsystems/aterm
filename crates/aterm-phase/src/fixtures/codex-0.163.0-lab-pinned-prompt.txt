@@ -1,0 +1,51 @@
+# codex-cli 0.163.0 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (144x50, aterm 0.105.0) running the real Codex, launched by path with a scratch `CODEX_HOME`, the lab provider `base_url=http://127.0.0.1:<port>/v1`, `wire_api = "responses"`, a fake `env_key` (a local stub of the Responses API, crates/aterm-lab) · a reply taller than the screen STREAMED in small deltas on the ALTERNATE screen: Codex pins the turn's prompt on the top row over paragraph 50 while its own row and paragraphs 1-49 are in the host's archive (offscreen back=0)
+› Write seventy streamed paragraphs.
+  Streamed paragraph 50 of a reply taller than the screen.
+
+  Streamed paragraph 51 of a reply taller than the screen.
+
+  Streamed paragraph 52 of a reply taller than the screen.
+
+  Streamed paragraph 53 of a reply taller than the screen.
+
+  Streamed paragraph 54 of a reply taller than the screen.
+
+  Streamed paragraph 55 of a reply taller than the screen.
+
+  Streamed paragraph 56 of a reply taller than the screen.
+
+  Streamed paragraph 57 of a reply taller than the screen.
+
+  Streamed paragraph 58 of a reply taller than the screen.
+
+  Streamed paragraph 59 of a reply taller than the screen.
+
+  Streamed paragraph 60 of a reply taller than the screen.
+
+  Streamed paragraph 61 of a reply taller than the screen.
+
+  Streamed paragraph 62 of a reply taller than the screen.
+
+  Streamed paragraph 63 of a reply taller than the screen.
+
+  Streamed paragraph 64 of a reply taller than the screen.
+
+  Streamed paragraph 65 of a reply taller than the screen.
+
+  Streamed paragraph 66 of a reply taller than the screen.
+
+  Streamed paragraph 67 of a reply taller than the screen.
+
+  Streamed paragraph 68 of a reply taller than the screen.
+
+  Streamed paragraph 69 of a reply taller than the screen.
+
+  Streamed paragraph 70 of a reply taller than the screen.
+
+  Worked for 9s • 1:41 PM
+
+
+› Ask Codex to do anything
+
+  GPT-6.1-Sol medium · /private/tmp/at.wZPe/proj · lab stub                                                          Plan mode (⇧tab to cycle)
+  ? for shortcuts

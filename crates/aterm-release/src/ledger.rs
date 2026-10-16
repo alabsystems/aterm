@@ -1,68 +1,54 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Build-number ledger (release spec §2): parse/append `RELEASES.ledger`
-//! (`#` comments ignored; records are `<build_number> <version>`; malformed
-//! non-comment lines abort with their line number), compute
-//! `n = max(last + 1, unix_now)`, and run the claim protocol in its two halves:
+//! Build-number ledger: parse and append `RELEASES.ledger` (`#` comments; records are
+//! `<build_number> <version>`; a malformed non-comment line refuses with its line number),
+//! compute `n = max(last + 1, unix_now)`, and run the claim in two halves:
 //!
-//! * [`reserve`] fixes the release's identity BEFORE anything is built from it:
-//!   `n` from origin's ledger tail and the clock, and the RELEASE commit C — the
-//!   published commit plus the ledger line and the rolled changelog, nothing
-//!   else — made from git objects, touching no worktree and no index, pushed
-//!   nowhere. The binary is built and MEASURED from C carrying `n`, so the bytes
-//!   MEASURE judged are the bytes that ship; and a release that refuses anywhere
-//!   before the claim burns no number, because nothing was claimed.
-//! * [`claim`] lands that reservation: main takes C (a fast-forward, or a merge
-//!   onto a tip peers moved), and that `git push` is a compare-and-swap on the
-//!   ledger tail, with the rebuild-the-landing retry (max 5) on rejection and the
-//!   mandatory post-push verification that the remote tail is byte-exactly ours.
-//!   A reservation whose `n` the tail has reached in the meantime — another
-//!   release claimed past it — is never re-numbered: its bytes carry `n`, so it
-//!   refuses, nothing burned, and the release reserves again and builds again.
+//! * [`reserve`] fixes the release's identity before anything is built from it: `n` from
+//!   origin's ledger tail and the clock, and the release commit C (the published commit
+//!   plus the ledger line and the rolled changelog), made from git objects and pushed
+//!   nowhere. The binary is built and verified from C carrying `n`, so the bytes `verify
+//!   release` judged are the bytes that ship, and a release that refuses before the claim
+//!   burns no number.
+//! * [`claim`] lands the reservation: main takes C (a fast-forward, or a merge onto a tip
+//!   peers moved), and that `git push` is a compare-and-swap on the ledger tail, retried on
+//!   rejection up to [`MAX_CLAIM_ATTEMPTS`] times and verified afterwards against the
+//!   remote tail byte for byte. A reservation whose `n` the tail has reached is never
+//!   re-numbered (its bytes carry `n`): it refuses, and the release reserves and builds
+//!   again.
 //!
-//! Only a verified claim is ever SHIPPED: a reserved `n` reaches an unsigned
-//! candidate and its measurement, and nothing is signed for it until [`claim`]
-//! has landed it.
-//!
-//! This module also hosts the crate-wide plumbing every pipeline stage shares
-//! (`Error`, the injectable [`GitRunner`] seam, [`git_ok`]): the spec's file
-//! plan (§9) gives the crate no separate utility module, and the claim is the
-//! one stage every other stage feeds, so the shared pieces live with it.
+//! Nothing is signed for a reserved `n` until [`claim`] has landed it. The crate-wide
+//! plumbing (`Error`, the [`GitRunner`] seam, [`git_ok`]) lives here too, since the claim
+//! is the stage every other stage feeds.
 
+use aterm_uds::spawnfd::{Command, command};
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use crate::changelog;
 
-/// How an operator runs a release — the ONE spelling every remedy names
-/// (`release::RELEASE_COMMAND` is this). Here, with the crate-wide plumbing,
-/// because the claim's remedies name it and the changelog's test binary mounts
-/// this module without the release machine.
+/// How an operator runs a release: the one spelling every remedy names
+/// (`release::RELEASE_COMMAND` is this). It lives here because the claim's remedies name
+/// it and the changelog test binary mounts this module without the release machine.
 pub const RELEASE_COMMAND: &str = "targo --unverified ship release";
 
-/// The ledger's repo-root-relative path. Committed and append-only: one line
-/// per claimed build number, never edited, never reused (spec §2).
+/// The ledger's repo-root-relative path. Committed and append-only: one line per claimed
+/// build number, never edited, never reused.
 pub const LEDGER_FILE: &str = "RELEASES.ledger";
 
-/// The v0.25 seed build number (the last committer-epoch-derived build ever
-/// published). Every minted `n` must be strictly above it — below-floor
-/// numbers would be invisible to the deployed fleet's `floor.toml` ratchets
-/// and would reorder the About window's "built" date.
+/// The v0.25 seed build number (the last committer-epoch-derived build published). Every
+/// minted `n` must be above it: a lower number would be invisible to the fleet's
+/// `floor.toml` ratchets and would reorder the About window's "built" date.
 pub const LEDGER_FLOOR: u64 = 1_783_354_739;
 
-/// Total push attempts before the claim aborts (spec §2 step 4: "retry
-/// (max 5)"): the first push plus four regenerate-and-retry rounds. Losing
-/// five straight CAS races on a single-operator repo means something is
-/// systemically wrong — stop and let the operator look.
+/// Total push attempts before the claim stops: the first push plus four rebuild-and-retry
+/// rounds. Losing five straight races means something is systemically wrong.
 pub const MAX_CLAIM_ATTEMPTS: u32 = 5;
 
-/// One release-pipeline failure, formatted for the operator at the failure
-/// site (what failed + why + what to do next). A single stringly type is
-/// deliberate: nothing upstream ever matches on failure *kind* — every error
-/// is terminal for the cut and is printed verbatim, so a variant enum would
-/// be dead weight.
+/// One release-pipeline failure, formatted for the operator where it happens (what failed,
+/// why, what to do next). One string type: every error is terminal for the cut and printed
+/// verbatim, and nothing matches on its kind.
 #[derive(Debug)]
 pub struct Error(pub String);
 
@@ -80,9 +66,8 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// The build/package stages (buildplan/bundle/sign/dmg) return
-/// `Result<_, String>` — this lets the pipeline `?` them straight into the
-/// crate-wide error without a per-site `map_err`.
+/// The build and package stages return `Result<_, String>`; this lets the pipeline `?`
+/// them into the crate-wide error.
 impl From<String> for Error {
     fn from(s: String) -> Self {
         Error(s)
@@ -91,9 +76,8 @@ impl From<String> for Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Captured output of one runner invocation. `status` is the exit code, with
-/// signal-death mapped to -1 (still non-zero, so it can never read as
-/// success).
+/// Captured output of one runner invocation. `status` is the exit code, signal death
+/// mapped to -1 (never success).
 pub struct RunOut {
     pub status: i32,
     pub stdout: Vec<u8>,
@@ -105,9 +89,8 @@ impl RunOut {
         self.status == 0
     }
 
-    /// Lossy UTF-8 view of stdout — fine for shas/refs/ls-remote listings.
-    /// The one byte-exactness-critical read (the ledger blob) goes through
-    /// [`show_origin_ledger`], which refuses non-UTF-8 instead of mangling it.
+    /// Lossy UTF-8 view of stdout, fine for shas, refs and listings. The ledger blob, whose
+    /// bytes matter, goes through [`show_origin_ledger`], which refuses non-UTF-8.
     pub fn stdout_utf8(&self) -> String {
         String::from_utf8_lossy(&self.stdout).into_owned()
     }
@@ -117,19 +100,16 @@ impl RunOut {
     }
 }
 
-/// The ONE seam between the release tool and `git`: argv in, captured output
-/// out. Production uses [`GitCli`] (real `git -C <repo>`); the race tests wrap
-/// it with a hook that lands a rival's push between this process's fetch and
-/// push — driving REAL git against local bare-repo fixtures instead of
-/// mocking git semantics (which is exactly what a compare-and-swap proof must
-/// not do).
+/// The one seam between the release tool and `git`: argv in, captured output out.
+/// Production uses [`GitCli`]; the race tests wrap it with a hook that lands a rival's push
+/// between this process's fetch and push, driving real git against local bare repositories
+/// rather than mocking the semantics a compare-and-swap proof rests on.
 pub trait GitRunner {
     fn git(&self, args: &[&str]) -> Result<RunOut>;
 
-    /// `git <args>` with `input` on its stdin: the objects-only writes
-    /// ([`commit_with`]: `hash-object --stdin`, `mktree -z`). A runner that
-    /// cannot feed git refuses, naming the command — never a write that read
-    /// nothing.
+    /// `git <args>` with `input` on its stdin, for the objects-only writes
+    /// ([`commit_with`]: `hash-object --stdin`, `mktree -z`). A runner that cannot feed git
+    /// refuses, naming the command.
     fn git_input(&self, args: &[&str], input: &[u8]) -> Result<RunOut> {
         let _ = input;
         Err(Error::new(format!(
@@ -139,12 +119,12 @@ pub trait GitRunner {
     }
 }
 
-/// Run `cmd` (a `git` with its leading arguments) with `args` and `input` on its
-/// stdin, captured as [`RunOut`]. The stdin is written from a thread, so git's
-/// output never fills a pipe the writer waits behind.
+/// Run `cmd` (a `git` with its leading arguments) with `args` and `input` on its stdin,
+/// captured as [`RunOut`]. A thread writes the stdin, so git's output never fills a pipe
+/// the writer waits behind.
 pub(crate) fn run_with_input(mut cmd: Command, args: &[&str], input: &[u8]) -> Result<RunOut> {
+    use aterm_uds::spawnfd::Stdio;
     use std::io::Write as _;
-    use std::process::Stdio;
     let mut child = cmd
         .args(args)
         .stdin(Stdio::piped())
@@ -185,14 +165,14 @@ impl GitCli {
 
 impl GitRunner for GitCli {
     fn git(&self, args: &[&str]) -> Result<RunOut> {
-        let out = Command::new("git")
+        let out = command("git")
             .arg("-C")
             .arg(&self.repo)
             .args(args)
             .output()
             .map_err(|e| Error::new(format!("failed to spawn git {}: {e}", args.join(" "))))?;
         Ok(RunOut {
-            // Signal-death has no exit code; -1 keeps it unambiguously a failure.
+            // Signal death has no exit code; -1 keeps it a failure.
             status: out.status.code().unwrap_or(-1),
             stdout: out.stdout,
             stderr: out.stderr,
@@ -200,28 +180,24 @@ impl GitRunner for GitCli {
     }
 
     fn git_input(&self, args: &[&str], input: &[u8]) -> Result<RunOut> {
-        let mut cmd = Command::new("git");
+        let mut cmd = command("git");
         cmd.arg("-C").arg(&self.repo);
         run_with_input(cmd, args, input)
     }
 }
 
-/// `git -C <repo>` that answers for that repository's objects as they are recorded and
-/// for nothing else: every `GIT_*` variable the caller's shell set is removed
-/// (`GIT_DIR`, `GIT_OBJECT_DIRECTORY`, `GIT_ALTERNATE_OBJECT_DIRECTORIES`,
-/// `GIT_REPLACE_REF_BASE`, `GIT_GRAFT_FILE`, `GIT_SHALLOW_FILE` … would each answer for
-/// another repository or rewrite this one), no system or global config is read,
-/// replace refs are ignored, nothing is fetched lazily, nothing prompts, no optional
-/// lock is taken, and stdin is empty.
+/// `git -C <repo>` that answers for that repository's objects as recorded and nothing
+/// else: every inherited `GIT_*` variable is removed (`GIT_DIR`, `GIT_OBJECT_DIRECTORY`,
+/// `GIT_GRAFT_FILE` … would answer for another repository or rewrite this one), no system
+/// or global config is read, replace refs are ignored, nothing is fetched lazily or
+/// prompts, no optional lock is taken, and stdin is empty.
 ///
-/// Replace refs matter most: under `git replace <a> <b>`, `git cat-file --batch`
-/// answers a request for `<a>` with `<b>`'s bytes under a header naming `<a>`
-/// (MEASURED 2026-10-09), so a reader of what a commit holds that honoured them would
-/// take another object's bytes for it. The ONE git for reading what a commit holds:
-/// the release snapshot ([`crate::snapshot`]) and the Trust lane
-/// ([`crate::trust_oblig::TrustGit`]) both spawn it.
+/// Replace refs matter most: under `git replace <a> <b>`, `git cat-file --batch` answers
+/// for `<a>` with `<b>`'s bytes under a header naming `<a>`. The one git for reading what
+/// a commit holds: the release snapshot ([`crate::snapshot`]) and the Trust lane
+/// ([`crate::trust_oblig::TrustGit`]) spawn it.
 pub fn object_git(repo: &Path) -> Command {
-    let mut cmd = Command::new("git");
+    let mut cmd = command("git");
     for (key, _) in std::env::vars_os() {
         if key.to_string_lossy().starts_with("GIT_") {
             cmd.env_remove(&key);
@@ -235,13 +211,12 @@ pub fn object_git(repo: &Path) -> Command {
         .env("GIT_OPTIONAL_LOCKS", "0")
         .arg("-C")
         .arg(repo)
-        .stdin(std::process::Stdio::null());
+        .stdin(aterm_uds::spawnfd::Stdio::null());
     cmd
 }
 
-/// Run a git command and REQUIRE success; the error carries the argv and the
-/// trimmed stderr so a failed cut prints the actual git diagnostic, not a
-/// generic "git failed".
+/// Run a git command and require success; the error carries the argv and git's trimmed
+/// stderr.
 pub fn git_ok(git: &dyn GitRunner, args: &[&str]) -> Result<RunOut> {
     let out = git.git(args)?;
     if !out.success() {
@@ -270,12 +245,10 @@ pub struct Record {
     pub version: String,
 }
 
-/// Parse the full ledger. Grammar (spec §2): lines starting with `#` are
-/// comments; every other line must be exactly two whitespace-separated fields
-/// with a u64 first field. ANY malformed non-comment line — blank lines
-/// included — aborts with its 1-based line number: the ledger is the ordering
-/// root of the whole update fleet, so an edit we cannot fully parse is an edit
-/// we must not build on.
+/// Parse the full ledger: `#` lines are comments; every other line, blank ones included,
+/// must be two whitespace-separated fields with a u64 first, or the parse refuses with its
+/// 1-based line number. The ledger orders the whole update fleet, so an edit that does not
+/// parse is not built on.
 pub fn parse(text: &str) -> Result<Vec<Record>> {
     let mut records = Vec::new();
     for (idx, raw) in text.lines().enumerate() {
@@ -304,9 +277,8 @@ pub fn parse(text: &str) -> Result<Vec<Record>> {
     Ok(records)
 }
 
-/// The last record — the parser contract of spec §2 ("last non-comment line,
-/// first field as u64"). An empty ledger is an error: the committed file is
-/// seeded with the v0.25 line, so "no records" means the file was gutted.
+/// The last record. An empty ledger is an error: the committed file is seeded with the
+/// v0.25 line, so no records means the file was gutted.
 pub fn tail(text: &str) -> Result<Record> {
     parse(text)?.pop().ok_or_else(|| {
         Error::new(format!(
@@ -315,11 +287,9 @@ pub fn tail(text: &str) -> Result<Record> {
     })
 }
 
-/// Number rule (spec §2): `n = max(last + 1, unix_now)`, asserted above the
-/// v0.25 floor. `max(…, now)` keeps n epoch-scale forever (About's "built"
-/// date stays sane, dev builds on the committer-epoch fallback stay on the
-/// same ordering scale); `last + 1` keeps n monotonic even under a backwards
-/// clock.
+/// `n = max(last + 1, unix_now)`, required above [`LEDGER_FLOOR`]. `now` keeps n
+/// epoch-scale (About's "built" date stays sane, and dev builds on the committer-epoch
+/// fallback share the scale); `last + 1` keeps n monotonic under a backwards clock.
 pub fn next_build(last: u64, now: u64) -> Result<u64> {
     let n = last.saturating_add(1).max(now);
     if n <= LEDGER_FLOOR {
@@ -332,62 +302,54 @@ pub fn next_build(last: u64, now: u64) -> Result<u64> {
     Ok(n)
 }
 
-/// Inputs to one claim. `now` is injected (not read inside) so the race tests
-/// are deterministic and so every retry reuses ONE clock reading — retries
-/// derive monotonicity from the ledger tail, never from time moving.
+/// Inputs to one claim. `now` is injected so the race tests are deterministic and every
+/// retry reuses one clock reading: retries take monotonicity from the ledger tail.
 pub struct ClaimPlan<'a> {
-    /// Release version being cut, e.g. "0.2.0" (`[workspace.package] version`,
-    /// always `MAJOR.MINOR.0`).
+    /// Release version, e.g. "0.2.0" (`[workspace.package] version`, always `MAJOR.MINOR.0`).
     pub version: &'a str,
     /// Unix seconds, read once by the caller.
     pub now: u64,
-    /// Main ALREADY carries this version's `## [X.Y.Z]` changelog section —
-    /// rolled there by an earlier claim whose cut wedged — so a lost race onto
-    /// such a tip is this cut's own history, not a cut elsewhere. The remote-TAG
-    /// abort always applies: a tag means the version was fully published.
+    /// Main already carries this version's `## [X.Y.Z]` changelog section, rolled there by
+    /// an earlier claim whose cut wedged, so a lost race onto such a tip is this cut's own
+    /// history. A remote tag always refuses: it means the version was published.
     pub allow_existing_section: bool,
     /// Normally [`MAX_CLAIM_ATTEMPTS`]; a knob so tests can prove the cap.
     pub max_attempts: u32,
-    /// The published commit (full sha) the release is cut from: on `origin/main`,
-    /// the release commit's one parent, and where the worktree [`claim`] runs in
-    /// — the cut tree — sits until the claim lands.
+    /// The published commit (full sha) the release is cut from: on `origin/main`, the
+    /// release commit's one parent, and where the cut tree sits until the claim lands.
     pub source: &'a str,
 }
 
-/// The ref that keeps a reservation's release commit reachable (git's gc keeps
-/// what a ref names) while the release builds, measures and publishes, before
-/// [`claim`] puts it on main.
+/// The ref that keeps a reservation's release commit safe from gc until [`claim`] puts
+/// it on main.
 pub const RESERVED_REF: &str = "refs/aterm-release/reserved";
 
-/// A release's identity, fixed before anything is built from it ([`reserve`]):
-/// what the binary is stamped with, what MEASURE judges, and — once [`claim`]
-/// lands it — what ships.
+/// A release's identity, fixed by [`reserve`] before anything is built from it: what the
+/// binary is stamped with, what `verify release` judges, and, once [`claim`] lands it,
+/// what ships.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reserved {
     /// `n`: `max(origin tail + 1, now)` when reserved.
     pub build: u64,
-    /// The RELEASE commit C (full sha): the published commit plus `line` appended
-    /// to ITS ledger and its rolled changelog, nothing else. Made from objects,
-    /// pushed nowhere until the claim.
+    /// The release commit C (full sha): the published commit plus `line` appended to its
+    /// ledger and its rolled changelog, nothing else. Pushed nowhere until the claim.
     pub commit: String,
     /// The ledger line C appends, e.g. "1783918101 0.2.0".
     pub line: String,
 }
 
-/// A verified claim: the number is on origin/main, tail-checked byte-exactly,
-/// and safe to bake into artifacts.
+/// A verified claim: the number is on origin/main, tail-checked byte for byte, and safe
+/// to bake into artifacts.
 #[derive(Debug)]
 pub struct Claim {
     pub build: u64,
-    /// The RELEASE commit (full sha): the published commit plus the ledger line
-    /// and the rolled changelog, and nothing else. The artifacts are built from
-    /// here; the worktree the claim ran in (the cut tree) is left on it, detached.
+    /// The release commit (full sha), the artifacts' source; the cut tree is left on it,
+    /// detached.
     pub commit: String,
-    /// The commit that landed on origin/main: the release commit itself when main
-    /// had not moved past the published commit, else a merge of it onto main's
-    /// tip ([`landing_commit`]).
+    /// The commit that landed on origin/main: the release commit itself when main had not
+    /// moved past the published commit, else a merge of it onto main's tip.
     pub landed: String,
-    /// The exact ledger line we appended, e.g. "1783918101 0.2.0".
+    /// The exact ledger line appended, e.g. "1783918101 0.2.0".
     pub ledger_line: String,
 }
 
@@ -395,17 +357,15 @@ pub struct Claim {
 /// CHANGELOG.md: `(release commit's, main's)`. See `changelog::claim_changelogs`.
 pub type ClaimChangelogs<'a> = &'a dyn Fn(&str, &str) -> Result<(String, String)>;
 
-/// RESERVE the release's identity (spec §2, steps 1-3, before anything is built):
-/// read origin's ledger tail, `n = max(tail + 1, plan.now)`, and make the RELEASE
-/// commit C — `plan.source` plus `n version` appended to ITS ledger and its rolled
-/// changelog (`changelogs`' first half), nothing else — from git objects
-/// ([`commit_with`]): no worktree, no index, no push. [`RESERVED_REF`] holds C so
-/// git keeps it while the release builds and measures. Nothing is claimed: a
+/// Reserve the release's identity before anything is built: read origin's ledger tail,
+/// `n = max(tail + 1, plan.now)`, and make the release commit C (`plan.source` plus `n
+/// version` appended to its ledger and its rolled changelog, `changelogs`' first half)
+/// from git objects ([`commit_with`]), with no worktree, index or push. [`RESERVED_REF`]
+/// keeps C reachable while the release builds and measures. Nothing is claimed, so a
 /// release that refuses from here to [`claim`] burns no number.
 ///
-/// Fails closed offline — `n` read from a stale ledger would be a fiction the
-/// claim then refuses; a source that is not on `origin/main`; and every failure
-/// of the ledger's parse, the changelog roll or git.
+/// Fails closed offline (a stale ledger's `n` would be a fiction the claim refuses), on a
+/// source not on `origin/main`, and on every ledger, changelog or git failure.
 pub fn reserve(
     git: &dyn GitRunner,
     plan: &ClaimPlan<'_>,
@@ -443,24 +403,20 @@ pub fn reserve(
     })
 }
 
-/// CLAIM a reservation (spec §2, steps 4-5): main takes the release commit
-/// `reserved.commit` whatever its tip is — as a fast-forward when main has not
-/// moved past the published commit, else as a merge onto the tip whose tree is
-/// the tip's plus the same ledger line and the shipped notes moved out of
-/// `[Unreleased]` (`changelogs`' second half, [`commit_with`]) — and the push of
-/// that commit is the compare-and-swap (owner ruling R2: peers' pushes since the
-/// publish stay on main and out of the release).
+/// Claim a reservation: main takes the release commit `reserved.commit` whatever its tip
+/// is, as a fast-forward when main has not moved past the published commit, else as a
+/// merge onto the tip (the tip's tree plus the same ledger line and the shipped notes
+/// moved out of `[Unreleased]`, `changelogs`' second half). The push of that commit is
+/// the compare-and-swap; peers' pushes since the publish stay on main and out of the
+/// release.
 ///
-/// THE NUMBER IS THE RESERVATION'S, ALWAYS. The binary built and measured from
-/// C carries `reserved.build`, so the claim never re-numbers: before every push
-/// origin's tail must be below it, and a tail at or past it — another release
-/// claimed past ours while this one was built and measured — refuses with nothing
-/// claimed and nothing burned (the release reserves again and builds again). A
-/// lost race to anything below it rebuilds only the landing, from the winner's
-/// ledger, and pushes again.
+/// The number is always the reservation's: the binary built from C carries
+/// `reserved.build`, so before every push origin's tail must be below it. A tail at or
+/// past it (another release claimed past this one meanwhile) refuses with nothing claimed
+/// or burned; a lost race below it rebuilds only the landing, from the winner's ledger.
 ///
-/// `worktree` is the cut tree: at the published commit, untouched until the claim
-/// has landed and been verified, then put on C. Every abort leaves it where it was.
+/// `worktree` is the cut tree: at the published commit until the claim has landed and
+/// been verified, then put on C. Every abort leaves it where it was.
 pub fn claim(
     git: &dyn GitRunner,
     worktree: &Path,
@@ -470,9 +426,8 @@ pub fn claim(
 ) -> Result<Claim> {
     check_version_shape(plan.version)?;
 
-    // Step 4a: fetch, and require HEAD == the published commit, on origin/main.
-    // Fail closed if offline — an offline "claim" would be a local fiction
-    // another machine could race.
+    // Fetch, and require HEAD to be the published commit, on origin/main. Offline fails
+    // closed: an offline claim would be a local fiction another machine could race.
     git_ok(git, &["fetch", "origin", "main"]).map_err(|e| {
         Error::new(format!(
             "cannot reach origin (no offline cuts — the ledger claim IS the push): {e}"
@@ -495,9 +450,8 @@ pub fn claim(
         reserved.line.as_str(),
     );
 
-    // Step 4b: read the tail from ORIGIN's blob (not a worktree file) — the blob
-    // is what the push CASes against, and re-reading it on every retry is what
-    // preserves a race winner's line byte-exactly.
+    // Read the tail from origin's blob, which the push compares against; re-reading it on
+    // every retry preserves a race winner's line byte for byte.
     let mut base = show_origin_ledger(git)?;
     let mut attempt = 0u32;
     let landed = loop {
@@ -506,7 +460,7 @@ pub fn claim(
         if tail_build >= n {
             return Err(Error::new(format!(
                 "origin's ledger tail is build {tail_build}, at or past the reserved build {n} \
-                 — another release claimed past this one while it was built and measured. \
+                 — another release claimed past this one while it was built and verified. \
                  Nothing was claimed and nothing was burned; the reserved bytes carry {n}, \
                  so they are never claimed under another number: run `{}` again, which \
                  reserves a fresh number and builds and measures it",
@@ -535,20 +489,17 @@ pub fn claim(
             )?
         };
 
-        // Step 4c: the push IS the compare-and-swap — a fast-forward of the tip
-        // succeeds for exactly one appender per remote tip.
+        // The push is the compare-and-swap: a fast-forward of the tip succeeds for exactly
+        // one appender per remote tip.
         let push = git.git(&["push", "origin", &format!("{landed}:refs/heads/main")])?;
         if push.success() {
             break landed;
         }
         let push_err = push.stderr_utf8().trim().to_string();
 
-        // Only a non-fast-forward rejection is a lost CAS race — the one
-        // failure rebuilding the landing can fix. Anything else (expired
-        // credentials, branch protection, network death mid-push) would fail
-        // identically on every round; abort NOW with git's own diagnostic
-        // instead of burning five rounds against an unmoved origin and then
-        // misreporting a "push race" on a single-operator repo.
+        // Only a non-fast-forward rejection is a lost race, the one failure rebuilding the
+        // landing can fix. Anything else (credentials, branch protection, network) would
+        // fail identically every round, so it stops now with git's own diagnostic.
         let lost_race = push_err.contains("non-fast-forward")
             || push_err.contains("fetch first")
             || push_err.contains("[rejected]");
@@ -560,8 +511,6 @@ pub fn claim(
             )));
         }
 
-        // Someone else won this tip: fetch the winner's truth before deciding
-        // whether to retry.
         git_ok(git, &["fetch", "origin", "main"])?;
 
         if attempt >= plan.max_attempts {
@@ -572,10 +521,9 @@ pub fn claim(
             )));
         }
 
-        // Same-version-cut-elsewhere abort: if origin now carries tag vX.Y.Z
-        // or a "## [X.Y.Z]" changelog section, this version is being (or was) cut
-        // on another machine — racing it with a second number would publish
-        // two artifacts claiming one version.
+        // If origin now carries tag vX.Y.Z or a "## [X.Y.Z]" changelog section, this
+        // version is being (or was) cut elsewhere: a second number would publish two
+        // artifacts claiming one version.
         let tag_ref = format!("refs/tags/v{}", plan.version);
         let tags = git_ok(git, &["ls-remote", "--tags", "origin", &tag_ref])?;
         if !tags.stdout_utf8().trim().is_empty() {
@@ -595,17 +543,15 @@ pub fn claim(
             }
         }
 
-        // Retry from the winner's ledger: the landing is rebuilt on its tip; the
-        // number stays the reservation's, checked against the new tail above.
+        // Retry from the winner's ledger: the landing is rebuilt on its tip; the number
+        // stays the reservation's, checked against the new tail above.
         base = show_origin_ledger(git)?;
     };
 
-    // Step 5: verify the append LANDED as ours — a successful push exit code
-    // is git's claim; shipping requires the remote bytes. Fresh fetch, tip
-    // identity, and byte-exact tail equality. Every failure from here on may follow
-    // a claim that LANDED, before any cut journal holds it: nothing is signed,
-    // tagged or published yet, so there is nothing to withdraw (`--abandon` needs a
-    // journal), and the remedy is the re-run that reserves anew.
+    // Verify the append landed as ours (a push's exit code is git's claim; shipping requires
+    // the remote bytes): fresh fetch, tip identity, byte-exact tail. A failure here may
+    // follow a claim that landed before any cut journal holds it; nothing is signed, tagged
+    // or published yet, so the remedy is the re-run that reserves anew.
     let unjournaled = |why: String| {
         Error::new(format!(
             "post-push verify failed: {why} — the claim of build {n} may have LANDED on \
@@ -630,9 +576,8 @@ pub fn claim(
             "the remote ledger tail {remote_tail:?} is not byte-exactly our line {line:?}"
         )));
     }
-    // The cut tree onto the release commit, where everything after the claim reads
-    // (and where a resume puts it back); the reservation's ref goes, since main
-    // keeps the commit now.
+    // The cut tree onto the release commit, where everything after the claim reads; the
+    // reservation's ref goes, since main keeps the commit now.
     git_ok(git, &["checkout", "-q", "--detach", release])
         .map_err(|e| unjournaled(e.to_string()))?;
     let head = rev_parse(git, "HEAD").map_err(|e| unjournaled(e.to_string()))?;
@@ -651,7 +596,7 @@ pub fn claim(
     })
 }
 
-/// `source` is a commit of `origin/main` — a claim lands on main.
+/// `source` is a commit of `origin/main`: a claim lands on main.
 fn source_on_main(git: &dyn GitRunner, source: &str) -> Result<()> {
     if git
         .git(&["merge-base", "--is-ancestor", source, "origin/main"])?
@@ -664,14 +609,11 @@ fn source_on_main(git: &dyn GitRunner, source: &str) -> Result<()> {
     )))
 }
 
-/// The reservation is a release commit OF THIS CLAIM: its one parent the published
-/// commit, its version's line the tail of its ledger, and nothing moved against the
-/// published commit but what the reservation writes — its ledger the published
-/// commit's plus that line, and its changelog exactly the published commit's rolled
-/// for the version ([`changelog::release_changelog`], on the date its section names),
-/// which is the published commit's own when that already carries the section (a
-/// recut from main's tip after an earlier claim rolled it there): then the ledger is
-/// all that moved.
+/// The reservation is this claim's release commit: its one parent is the published commit,
+/// its ledger is the published commit's plus the version's line, its changelog is the
+/// published commit's rolled for the version ([`changelog::release_changelog`], on the
+/// date its section names, or as it stands when it already carries the section), and
+/// nothing else moved.
 fn reservation_is_the_claims(
     git: &dyn GitRunner,
     plan: &ClaimPlan<'_>,
@@ -736,11 +678,11 @@ fn reservation_is_the_claims(
     Ok(())
 }
 
-/// A commit made from git objects alone — no worktree, no index: `base`'s root
-/// tree with each top-level `files` entry's bytes replaced (each must already be
-/// a blob there), committed with `parents` and `message` under this repository's
-/// configured identity. The blobs are hashed as `git add` would hash them at
-/// their paths (`--path`), so the bytes match a commit made in a checkout.
+/// A commit made from git objects alone, with no worktree or index: `base`'s root tree with
+/// each top-level `files` entry's bytes replaced (each must already be a blob there),
+/// committed with `parents` and `message` under the repository's configured identity. The
+/// blobs are hashed at their paths (`--path`), so the bytes match a commit made in a
+/// checkout.
 ///
 /// # Errors
 /// A `base` with no such top-level blob, and any git failure.
@@ -819,31 +761,25 @@ fn appended(base: &str, line: &str) -> String {
     out
 }
 
-/// `git show <rev>:<path>`, strict UTF-8: the same bytes are re-used as a base
-/// to append to or roll, so a lossy decode could silently rewrite them — refuse
-/// instead.
+/// `git show <rev>:<path>`, strict UTF-8: the bytes are re-used as a base to append to or
+/// roll, so a lossy decode could silently rewrite them.
 fn show_utf8(git: &dyn GitRunner, rev: &str, path: &str) -> Result<String> {
     let spec = format!("{rev}:{path}");
     let out = git_ok(git, &["show", &spec])?;
     String::from_utf8(out.stdout).map_err(|_| Error::new(format!("{spec} is not valid UTF-8")))
 }
 
-/// `git show origin/main:RELEASES.ledger` — the blob the claim's push CASes
+/// `git show origin/main:RELEASES.ledger`: the blob the claim's push compares and swaps
 /// against.
 pub fn show_origin_ledger(git: &dyn GitRunner) -> Result<String> {
     show_utf8(git, "origin/main", LEDGER_FILE)
 }
 
-/// The release version is spliced into a tag name, a changelog heading, the
-/// DMG asset name and the ledger grammar — reject anything that is not
-/// exactly three canonical numeric components before it can poison those
-/// greps. There is ONE version scheme: `MAJOR.MINOR.PATCH` (a release is the
-/// workspace `MAJOR.MINOR.0` as written — see `VERSIONING.md`).
-///
-/// Canonical means non-empty, ASCII digits only, and no leading zero unless
-/// the component IS `"0"`: one version must have exactly ONE spelling, or two
-/// tags could share a numeric order. Public: cli.rs applies the same shape
-/// check to `--abandon` / `verify vX.Y.Z` arguments up front.
+/// The release version is spliced into a tag name, a changelog heading, the DMG asset
+/// name and the ledger grammar, so it must be canonical `MAJOR.MINOR.PATCH` (a release is
+/// the workspace `MAJOR.MINOR.0`; see `VERSIONING.md`): three non-empty ASCII-digit
+/// components, no leading zero unless the component is `"0"`, so one version has one
+/// spelling. cli.rs applies the same check to version arguments up front.
 pub fn check_version_shape(version: &str) -> Result<()> {
     let parts: Vec<&str> = version.split('.').collect();
     let ok = parts.len() == 3
@@ -860,27 +796,21 @@ pub fn check_version_shape(version: &str) -> Result<()> {
     Ok(())
 }
 
-/// Fixture plumbing every test binary shares: the `git` a fixture's own setup and
-/// reads run, the runner tests hand the code under test, a fresh repository with
-/// its identity, and stand-in executables.
+/// Fixture plumbing every test binary shares: the `git` a fixture's own setup runs, the
+/// runner tests hand the code under test, and a fresh repository with its config.
 #[cfg(test)]
 pub(crate) mod testing {
+    use aterm_uds::spawnfd::{Command, command};
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::process::Command;
     use std::sync::OnceLock;
 
     /// The executable a `git` from PATH ends up running, resolved once per process.
     ///
-    /// WHY (MEASURED on a 14-core M-series Mac): macOS's `/usr/bin/git`
-    /// is xcode-select's trampoline, which finds the developer directory and execs
-    /// the git it names on every call: 8.3 ms of CPU per `rev-parse HEAD` against
-    /// 2.7 ms for that git run directly, 200 in a row, and 23 ms against 7.8 ms with
-    /// fourteen at once; the `it` binary ran 4,936 git processes through it. It is
-    /// the same file with the same argv; the trampoline adds only the SDK variables
-    /// (`SDKROOT`, `CPATH`, `LIBRARY_PATH`, `MANPATH`), which git does not read.
-    /// Where the `git` on PATH is no trampoline (Linux, a Homebrew git first) this
-    /// is that git.
+    /// macOS's `/usr/bin/git` is xcode-select's trampoline, which execs the developer
+    /// directory's git on every call (8.3 ms of CPU per `rev-parse HEAD` against 2.7 ms
+    /// direct) with the same argv, adding only SDK variables (`SDKROOT`, `CPATH`, …) git
+    /// does not read. Where the `git` on PATH is no trampoline this is that git.
     pub(crate) fn git_path() -> &'static Path {
         static GIT: OnceLock<PathBuf> = OnceLock::new();
         GIT.get_or_init(|| {
@@ -895,7 +825,7 @@ pub(crate) mod testing {
                 return on_path;
             }
             // What the trampoline asks (`xcrun --find`), so the same git.
-            Command::new("/usr/bin/xcrun")
+            command("/usr/bin/xcrun")
                 .args(["--find", "git"])
                 .output()
                 .ok()
@@ -908,15 +838,13 @@ pub(crate) mod testing {
 
     /// `git`, for a fixture's own setup and reads ([`git_path`]).
     pub(crate) fn git() -> Command {
-        Command::new(git_path())
+        command(git_path())
     }
 
     /// The [`GitRunner`](super::GitRunner) a test hands the code under test:
-    /// [`GitCli`](super::GitCli)'s `git -C <repo> <args…>`, its output and exit read as `GitCli`
-    /// reads them, run by [`git_path`] rather than the `git` on PATH: the same executable without
-    /// the trampoline in front of it (MEASURED: it takes the `it` binary's trampolined git
-    /// processes from 2,818 to 109). `GitCli` itself still runs wherever the code under test builds
-    /// its own: the cut tree, a receipt store, the cutter binary the handoff tests drive.
+    /// [`GitCli`](super::GitCli)'s `git -C <repo> <args…>`, run by [`git_path`] rather than
+    /// the trampolined `git` on PATH. `GitCli` still runs wherever the code under test
+    /// builds its own.
     pub(crate) struct Git {
         repo: PathBuf,
     }
@@ -970,20 +898,14 @@ pub(crate) mod testing {
         config(dir, pairs);
     }
 
-    /// What one `git config <key> <value>` per pair leaves in the config of a fresh
-    /// init, clone or bare repository at `repo`, written in one append: each section
-    /// once, in the order its first key comes, its keys in order — where git puts a
-    /// key whose section the file does not hold yet, and the next of that section's
-    /// keys after it (checked byte for byte against git 2.50). One
-    /// write, not a process per pair. A value is written bare, so one git would quote
-    /// is refused.
+    /// Append to the config of the fresh repository at `repo`, in one write, what one
+    /// `git config <key> <value>` per pair would leave (each section once, in first-key
+    /// order; checked byte for byte against git 2.50). A value git would quote is refused.
     ///
-    /// Then `maintenance.auto = false`, which every fixture takes: each commit, fetch
-    /// and push into it started a `git maintenance run --auto` that ran no task in a
-    /// repository this small (`gc --auto` waits for thousands of loose objects or
-    /// fifty packs) — 540 of the `it` binary's 6,496 git processes, not one of
-    /// which started a child. A bare origin takes it with `&[]`: its
-    /// pushes ran one each.
+    /// Then `maintenance.auto = false`, which every fixture takes (a bare origin with
+    /// `&[]`): otherwise each commit, fetch and push starts a `git maintenance run --auto`
+    /// that does nothing in a repository this small (540 of the `it` binary's 6,496 git
+    /// processes).
     ///
     /// # Panics
     /// On a key that is not `section.name`, a section the file already holds, a value
@@ -1002,8 +924,8 @@ pub(crate) mod testing {
                 .split_once('.')
                 .filter(|(_, name)| !name.contains('.'))
                 .expect("a section.name key, no subsection");
-            // git quotes a value with an outer space, `#` or `;`, and escapes a
-            // quote, a backslash, a newline and a tab (git 2.50).
+            // git quotes a value with an outer space, `#` or `;`, and escapes a quote, a
+            // backslash, a newline and a tab (git 2.50).
             assert!(
                 !value.is_empty()
                     && value.trim() == value

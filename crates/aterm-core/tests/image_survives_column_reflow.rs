@@ -1,12 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-//! Inline images survive a width-changing reflow.
-//!
-//! An image cell carries a cell extra and no glyph, so an image-only row has
-//! `Row::len() == 0`; column reflow must still carry those cells. These tests
-//! drive the real `Terminal::resize`, the entry the GUI's window drag and the
-//! control socket's `resize` verb take.
+//! Inline images survive a width-changing reflow through `Terminal::resize`: an image cell
+//! carries a cell extra and no glyph, so an image-only row has `Row::len() == 0`, and
+//! column reflow must still carry its cells.
 
 use aterm_core::terminal::Terminal;
 
@@ -43,7 +40,6 @@ fn a_column_resize_keeps_every_tile_of_an_inline_image() {
     let before = image_cells(&term);
     assert_eq!(before.len(), 12, "4x3 footprint covers 12 cells");
 
-    // Shrink by one column.
     term.resize(10, 19);
     assert_eq!(
         image_cells(&term),

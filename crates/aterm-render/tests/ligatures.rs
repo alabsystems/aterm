@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 //
 // Programming-ligature gate for the CPU renderer: with a ligature font
-// (JetBrains Mono, bundled with Orca), rendering "a => b != c" must produce
+// (JetBrains Mono), rendering "a => b != c" must produce
 // DIFFERENT ink than the same text with ligatures disabled (proving the shaped
 // ligature glyph is actually used), AND a control row of "a = > b" (operators
 // separated by spaces, so no run forms) must render IDENTICALLY with ligatures
@@ -284,11 +284,11 @@ fn ligature_breaks_on_wide_cell() {
 }
 
 /// Remove the `GSUB` table from an sfnt font's table directory, yielding a font
-/// that ttf-parser/rustybuzz see as having NO ligature features. The sfnt header
+/// that aterm-font sees as having NO ligature features. The sfnt header
 /// is `[u32 sfntVersion][u16 numTables][u16 searchRange][u16 entrySelector]
 /// [u16 rangeShift]` (12 bytes), followed by `numTables` × 16-byte table records
 /// `[Tag tag][u32 checksum][u32 offset][u32 length]`. Dropping the `GSUB` record
-/// and decrementing `numTables` is enough: ttf-parser locates every table strictly
+/// and decrementing `numTables` is enough: aterm-font locates every table strictly
 /// via the directory, so the (still-present) table BYTES become unreachable. The
 /// search-range fields are hints, not used for lookup, so they need no fix-up.
 /// Returns `None` if the input isn't a directory-style sfnt with a `GSUB` table.
@@ -349,10 +349,8 @@ fn strip_gsub(bytes: &[u8]) -> Option<Vec<u8>> {
 #[test]
 fn no_ligature_font_skips_shaping_and_is_identical() {
     let bytes = ligature_test_font();
-    let Some(stripped) = strip_gsub(&bytes) else {
-        eprintln!("SKIP: fixture is not a directory-style sfnt with a GSUB table");
-        return;
-    };
+    let stripped =
+        strip_gsub(&bytes).expect("the fixture is a directory-style sfnt with a GSUB table");
 
     // The probe must see no liga/calt feature once GSUB is gone.
     let mut r_on = Renderer::from_bytes(&stripped, 18.0, Theme::default()).unwrap();
@@ -411,35 +409,41 @@ fn fixture_font_has_ligature_features_and_still_ligates() {
 
 // ---------------------------------------------------------------------------
 // WIRE-FONTFEAT-OPENTYPE: the user's `font_features` (ss01/cv01/zero/stylistic
-// sets) must actually reach `rustybuzz::shape`, not be silently dropped. These
-// tests drive the SHARED feature-list seam plus an end-to-end rustybuzz shape
+// sets) must actually reach the shaper (`aterm_font::shape`), not be silently
+// dropped. These tests drive the SHARED feature-list seam plus an end-to-end shape
 // against the embedded DejaVu Sans Mono face (always present — no SKIP).
 // ---------------------------------------------------------------------------
 
 use aterm_types::text_shaping::{FontFeature, FontFeatureSet};
-use rustybuzz::ttf_parser::Tag;
 
 /// The embedded last-resort face (DejaVu Sans Mono). Always available, so these
 /// tests never SKIP. DejaVu's GSUB advertises `liga`, `rlig`, `dlig`, … — we use
 /// the discretionary-ligature `dlig` feature as a concrete user feature whose
-/// effect on `rustybuzz::shape` is observable (it ligates "fi" -> one glyph).
+/// effect on the shaper is observable (it ligates "fi" -> one glyph).
 const DEJAVU: &[u8] = include_bytes!("../assets/DejaVuSansMono.ttf");
 
-fn shape_gids(bytes: &[u8], s: &str, features: &[rustybuzz::Feature]) -> Vec<u32> {
-    let face = rustybuzz::Face::from_slice(bytes, 0).unwrap();
-    let mut buf = rustybuzz::UnicodeBuffer::new();
+/// `s` shaped on face 0 of `bytes` under `features`, each over the whole run
+/// (the renderer's convention), by the shaping engine called directly.
+fn shape_gids(bytes: &[u8], s: &str, features: &[FontFeature]) -> Vec<u32> {
+    use aterm_font::shape::{Feature, ShapeFace, UnicodeBuffer};
+    let face = ShapeFace::from_slice(bytes, 0).unwrap();
+    let features: Vec<Feature> = features
+        .iter()
+        .map(|f| Feature::new(aterm_font::Tag::from_bytes(&f.tag), f.value))
+        .collect();
+    let mut buf = UnicodeBuffer::new();
     buf.push_str(s);
-    let out = rustybuzz::shape(&face, features, buf);
+    let out = aterm_font::shape::shape(&face, &features, buf);
     out.glyph_infos().iter().map(|i| i.glyph_id).collect()
 }
 
 /// END-TO-END: a user `FontFeature` built by the renderer's feature seam
-/// genuinely changes `rustybuzz::shape` output. The base `[liga, calt]` list
+/// genuinely changes the shaper's output. The base `[liga, calt]` list
 /// leaves "fi" as two glyphs; adding the user `dlig=1` feature collapses it to
 /// the single discretionary-ligature glyph. If the user feature were dropped
 /// (the pre-WIRE-FONTFEAT bug) the two shapes would be identical.
 #[test]
-fn user_feature_changes_rustybuzz_shape_output() {
+fn user_feature_changes_shape_output() {
     let base = aterm_render::ligature_shaping::build_feature_list(&[], true);
     let with_dlig =
         aterm_render::ligature_shaping::build_feature_list(&[FontFeature::new(*b"dlig", 1)], true);
@@ -447,15 +451,13 @@ fn user_feature_changes_rustybuzz_shape_output() {
     let dlig_gids = shape_gids(DEJAVU, "fi", &with_dlig);
     assert_ne!(
         base_gids, dlig_gids,
-        "the user 'dlig' feature must reach rustybuzz::shape and change the result \
+        "the user 'dlig' feature must reach the shaper and change the result \
          (base={base_gids:?}, dlig={dlig_gids:?}) — it was silently dropped"
     );
     // Sanity: the user feature really is present in the built array with the
     // right tag + value (the testable seam), appended after the base pair.
     assert!(
-        with_dlig
-            .iter()
-            .any(|f| f.tag == Tag::from_bytes(b"dlig") && f.value == 1),
+        with_dlig.contains(&FontFeature::new(*b"dlig", 1)),
         "built feature array must contain the user 'dlig=1' feature"
     );
 }
@@ -635,49 +637,22 @@ fn feature_does_not_drag_box_drawing_into_primary_face() {
 // `merged_ligatures`): a run whose OpenType shaping COLLAPSES several cells into
 // ONE wide glyph is sliced into per-cell tiles.
 //
-// aterm bundles no merged-ligature font, but any font with the classic Latin
-// `f_i`/`f_l`/`ffi` ligatures collapses `fi`/`fl`/`ffi` to a single glyph under
-// `liga`/`calt` — exactly the N:1 shape the Cascadia path handles. These tests
-// DISCOVER such a font ($ATERM_MERGED_FONT, else common macOS fonts) and SKIP
-// cleanly when none is present, mirroring the ligature-font discovery above.
+// Any face with the classic Latin `f_i`/`f_l` ligatures collapses `fi`/`fl` to a
+// single glyph under `liga` — exactly the N:1 shape the Cascadia path handles.
+// The checked-in Luckiest Guy (Apache-2.0, `assets/game`) is such a face.
 // ---------------------------------------------------------------------------
 
-/// A font whose `fi` (and usually `ffi`) collapses N:1, plus the collapse it
-/// produces for `fi` (the wide gid and the cell count), read off a standalone
-/// rustybuzz shape with the renderer's base feature list. Order:
-/// $ATERM_MERGED_FONT, then well-known macOS faces carrying Latin `f`-ligatures.
-/// `None` -> the caller SKIPs.
-fn merged_ligature_font() -> Option<(Vec<u8>, u16, u16)> {
+/// The checked-in face whose `fi` collapses N:1, plus the collapse it produces
+/// for `fi` (the wide gid and the cell count), read off a standalone shape with
+/// the renderer's base feature list.
+fn merged_ligature_font() -> (Vec<u8>, u16, u16) {
+    let bytes = include_bytes!("../assets/game/LuckiestGuy-Regular.ttf").to_vec();
     let feats = aterm_render::ligature_shaping::build_feature_list(&[], true);
-    let collapse = |bytes: &[u8]| -> Option<(u16, u16)> {
-        rustybuzz::Face::from_slice(bytes, 0)?;
-        match shape_gids(bytes, "fi", &feats)[..] {
-            [gid] => Some((u16::try_from(gid).ok()?, 2)),
-            _ => None,
-        }
+    let [gid] = shape_gids(&bytes, "fi", &feats)[..] else {
+        panic!("Luckiest Guy's `fi` must shape to one ligature glyph");
     };
-    let mut candidates: Vec<String> = Vec::new();
-    if let Ok(p) = std::env::var("ATERM_MERGED_FONT") {
-        candidates.push(p);
-    }
-    candidates.extend(
-        [
-            "/System/Library/Fonts/Avenir Next Condensed.ttc",
-            "/System/Library/Fonts/MuktaMahee.ttc",
-            "/System/Library/Fonts/Supplemental/Georgia.ttf",
-            "/System/Library/Fonts/Supplemental/Times New Roman.ttf",
-        ]
-        .iter()
-        .map(|s| (*s).to_string()),
-    );
-    for path in candidates {
-        if let Ok(bytes) = std::fs::read(&path)
-            && let Some((gid, n)) = collapse(&bytes)
-        {
-            return Some((bytes, gid, n));
-        }
-    }
-    None
+    let gid = u16::try_from(gid).expect("a glyph id fits u16");
+    (bytes, gid, 2)
 }
 
 fn merged_renderer(bytes: &[u8], admit: bool) -> Renderer {
@@ -706,10 +681,7 @@ fn frame(r: &mut Renderer, text: &[u8], rows: usize, cols: usize) -> aterm_rende
 #[test]
 fn merged_ligature_expands_to_slices_only_when_admitted() {
     use aterm_render::ColumnGlyph;
-    let Some((bytes, gid, n)) = merged_ligature_font() else {
-        eprintln!("SKIP: no merged-ligature font (set ATERM_MERGED_FONT)");
-        return;
-    };
+    let (bytes, gid, n) = merged_ligature_font();
     assert_eq!(n, 2, "`fi` collapses two cells");
     let mut term = Terminal::new(1, 4);
     term.process(b"fi");
@@ -748,10 +720,7 @@ fn merged_ligature_expands_to_slices_only_when_admitted() {
 /// plain per-cell path.
 #[test]
 fn merged_ligature_slices_reach_pixels() {
-    let Some((bytes, _gid, _n)) = merged_ligature_font() else {
-        eprintln!("SKIP: no merged-ligature font");
-        return;
-    };
+    let (bytes, _gid, _n) = merged_ligature_font();
     let mut on = merged_renderer(&bytes, true);
     let mut off = merged_renderer(&bytes, false);
     let mut nolig = {
@@ -789,10 +758,7 @@ fn merged_ligature_slices_reach_pixels() {
 #[test]
 fn merged_ligature_slice_tiles_reassemble_wide_glyph() {
     use aterm_render::{GlyphImage, StyleBits};
-    let Some((bytes, gid, _n)) = merged_ligature_font() else {
-        eprintln!("SKIP: no merged-ligature font");
-        return;
-    };
+    let (bytes, gid, _n) = merged_ligature_font();
     let mut r = merged_renderer(&bytes, true);
     let (cell_w, _cell_h) = r.cell_size();
     // The wide glyph, rasterized once (its real width/xmin from the font).
@@ -805,10 +771,7 @@ fn merged_ligature_slice_tiles_reassemble_wide_glyph() {
             bytes,
             ..
         } => (width, height, xmin, bytes),
-        GlyphImage::Rgba { .. } => {
-            eprintln!("SKIP: wide ligature glyph is colour (unexpected for fi)");
-            return;
-        }
+        GlyphImage::Rgba { .. } => panic!("the wide `fi` ligature must be Mono coverage"),
     };
     assert!(pw > 0 && ph > 0, "wide glyph must have ink");
     // Slices span every cell the wide glyph's ink touches (run-origin space
@@ -844,10 +807,7 @@ fn merged_ligature_slice_tiles_reassemble_wide_glyph() {
 /// rect) never bleeds a neighbour — the Cascadia analogue of the 1:1 cursor pin.
 #[test]
 fn merged_ligature_block_cursor_recolours_only_its_cell() {
-    let Some((bytes, _gid, _n)) = merged_ligature_font() else {
-        eprintln!("SKIP: no merged-ligature font");
-        return;
-    };
+    let (bytes, _gid, _n) = merged_ligature_font();
     let mut r = merged_renderer(&bytes, true);
     let (cell_w, _) = r.cell_size();
     let pad = r.pad();

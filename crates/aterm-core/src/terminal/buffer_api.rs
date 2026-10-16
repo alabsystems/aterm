@@ -11,9 +11,9 @@ use super::Terminal;
 /// Maximum paste size in bytes (16 MiB). Pastes exceeding this are truncated
 /// at a char boundary to prevent unbounded memory allocation.
 const MAX_PASTE_BYTES: usize = 16 * 1024 * 1024;
-/// Maximum UTF-8 prefix inspected synchronously by the GUI's cursor-gesture
-/// admission probe. Formatting still consumes the full bounded paste off the
-/// event thread; admission is deliberately conservative beyond this prefix.
+/// Maximum UTF-8 prefix the GUI's cursor-gesture admission probe inspects
+/// synchronously; past it admission is conservative. Formatting still takes the
+/// whole bounded paste, off the event thread.
 const PASTE_GESTURE_PROBE_BYTES: usize = 4 * 1024;
 /// Maximum UTF-8 body the delivered-insert pricer ([`Terminal::paste_insert_cells`])
 /// walks. A single-line body longer than this is wider than any row and wraps,
@@ -51,15 +51,14 @@ fn paste_char_can_move(c: char) -> bool {
 }
 
 impl Terminal {
-    /// Whether a paste contains an authored character that survives the
-    /// formatter's control-character sanitizer, within a bounded prefix.
+    /// Whether a paste contains an authored character that survives the formatter's
+    /// control-character sanitizer, within a bounded prefix.
     ///
-    /// Bracketed-paste wrapper bytes are ignored: framing alone cannot land a
-    /// cursor, so it must not license a cursor-trail gesture. The scan
-    /// allocates nothing, stops at the first ordinary character and examines at
-    /// most [`PASTE_GESTURE_PROBE_BYTES`], so a 16 MiB control-only clipboard
-    /// cannot stall the UI thread (a payload behind a longer control-only
-    /// prefix still pastes, just without a trail licence).
+    /// Bracketed-paste framing alone cannot land a cursor, so it does not license a
+    /// cursor-trail gesture. The scan allocates nothing and examines at most
+    /// [`PASTE_GESTURE_PROBE_BYTES`], so a 16 MiB control-only clipboard cannot stall
+    /// the UI thread (a payload behind a longer control-only prefix still pastes,
+    /// without a trail licence).
     #[must_use]
     pub fn paste_has_payload(text: &str) -> bool {
         let text = bounded_paste_text(text);
@@ -124,14 +123,10 @@ impl Terminal {
         self.grid.scrollback()
     }
 
-    /// The tiered store holding this terminal's history, whichever grid slot it
-    /// sits in: the scrollback twin of [`Self::main_grid`].
-    ///
-    /// [`Self::scrollback`] reads the active grid, which is right for a viewport
-    /// but wrong for accounting or reclaiming history: while the alternate
-    /// screen is up the primary grid and its tiered store are parked in
-    /// `alt_grid`. Memory-pressure shedding must read history through this
-    /// accessor.
+    /// The tiered store holding this terminal's history, whichever grid slot it sits
+    /// in (the scrollback twin of [`Self::main_grid`]). [`Self::scrollback`] reads the
+    /// active grid, but while the alt screen is up the primary grid and its store are
+    /// parked in `alt_grid`, so accounting and memory-pressure shedding read this.
     #[must_use]
     pub fn history_scrollback(&self) -> Option<&crate::scrollback::ScrollbackStorage> {
         self.main_grid().scrollback()
@@ -152,23 +147,18 @@ impl Terminal {
         Some(store + grid.history_link_bytes())
     }
 
-    /// Evict the history store down to `keep(budget)` bytes, then restore its
-    /// own `budget` so the tab can keep growing history. Used by the GUI's
-    /// memory-pressure shed and aggregate-cap lane.
+    /// Evict the history store down to `keep(budget)` bytes, then restore its own
+    /// `budget` so the tab can keep growing history: the GUI's memory-pressure shed
+    /// and aggregate-cap lane.
     ///
-    /// The lowered budget also lowers the history grid's link allowance (a
-    /// quarter of it, [`Grid::history_link_budget`]), so the OSC 8 payload its
-    /// ring holds uncompressed is stripped oldest-first with the store's
-    /// eviction: `after` is at most `keep(budget)` plus that quarter.
-    ///
-    /// Acts on the store that holds the history, including while the alternate
-    /// screen is up (see [`Self::history_scrollback`]), and reports the bytes
-    /// measured before and after, as [`Self::history_scrollback_bytes`] counts
-    /// them. Budget-setter errors are not surfaced: the hot tier may refuse to
-    /// evict rows it is serving, and [`HistoryShed::freed`] reports what was
-    /// actually given back.
-    ///
-    /// Returns `None` (and changes nothing) when no tiered store is attached.
+    /// The lowered budget also lowers the history grid's link allowance (a quarter of
+    /// it, [`Grid::history_link_budget`]), so the ring's uncompressed OSC 8 payload is
+    /// stripped oldest-first with the store: `after` is at most `keep(budget)` plus that
+    /// quarter. Acts on the store holding the history even while the alt screen is up,
+    /// measuring as [`Self::history_scrollback_bytes`] does. Budget-setter errors are
+    /// not surfaced (the hot tier may refuse to evict rows it serves);
+    /// [`HistoryShed::freed`] reports what was given back. `None`, changing nothing,
+    /// when no tiered store is attached.
     ///
     /// [`Grid::history_link_budget`]: crate::grid::Grid::history_link_budget
     pub fn shed_history_scrollback(
@@ -223,22 +213,16 @@ impl Terminal {
         }
     }
 
-    /// Set the retained scrollback line limit (`None` = unlimited).
+    /// Set the retained scrollback line limit (`None` = unlimited) on the
+    /// primary-content grid (the active grid, or the saved primary while the alt
+    /// screen is up; the alt buffer keeps no scrollback). It is one total retention
+    /// count: on tiered grids ring + staged + store; ring-only grids re-cap the ring,
+    /// evicting the oldest lines on shrink (see
+    /// [`Grid::set_scrollback_line_limit`](crate::grid::Grid::set_scrollback_line_limit)).
     ///
-    /// Applied to the primary-content grid (the active grid, or the saved
-    /// primary while the alt screen is up): the alt buffer has no scrollback
-    /// and its ring cap stays 0. The limit is one total retention count: on
-    /// tiered grids it caps ring + staged + store together; ring-only grids
-    /// re-cap the ring, evicting the oldest lines on shrink (see
-    /// [`Grid::set_scrollback_line_limit`]).
-    ///
-    /// [`Grid::set_scrollback_line_limit`]: crate::grid::Grid::set_scrollback_line_limit
-    ///
-    /// This is `SelectionCustody`'s `Evict`: shrinking drops the oldest lines
-    /// with no content scroll and no damage band, so the selection is re-floored
-    /// here. Partial eviction clamps the head and records the loss; only a
-    /// selection whose whole interval fell off is destroyed. Driven by
-    /// `aterm_gui::selection_custody_conformance`.
+    /// This is `SelectionCustody`'s `Evict`: shrinking drops the oldest lines with no
+    /// content scroll and no damage band, so the selection is re-floored here (partial
+    /// eviction clamps the head; only a selection wholly evicted is destroyed).
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
         aterm_spec::refines(
@@ -314,15 +298,12 @@ impl Terminal {
         self.grid.set_ring_byte_watermark(budget);
     }
 
-    /// Monotonic count of history lines lost to non-user-requested truncation
-    /// across the main and alternate grids: flood-backpressure staged-line
-    /// drops, detached-reflow-window cap drops and memory-pressure store
-    /// evictions. Hosts surface it (`metrics`, `lines`). Flood drops are also
-    /// marked in band with a dim `— aterm dropped N lines here …` row at each
-    /// cut; see [`Grid::truncated_lines`](aterm_grid::Grid::truncated_lines).
-    /// It also counts the lines of a quarantined (undecodable) store block,
-    /// which stay in the scrollback line count as blank rows when older
-    /// history sits before them, so the two can overlap.
+    /// Monotonic count of history lines lost to non-user-requested truncation across
+    /// both grids: flood-backpressure staged-line drops, detached-reflow-window cap
+    /// drops, memory-pressure store evictions, and the lines of a quarantined
+    /// (undecodable) store block, which may also stay in the line count as blank rows.
+    /// Hosts surface it (`metrics`, `lines`); flood drops are also marked in band at
+    /// each cut ([`Grid::truncated_lines`](aterm_grid::Grid::truncated_lines)).
     #[must_use]
     pub fn scrollback_truncated_lines(&self) -> u64 {
         let mut total = self.grid.truncated_lines();
@@ -332,15 +313,12 @@ impl Terminal {
         total
     }
 
-    /// Monotonic count of history rows that crossed the image retention horizon
-    /// across the main and alternate grids: rows that kept their text but lost
-    /// their inline picture when the tiered store compressed them. Separate from
-    /// [`scrollback_truncated_lines`](Self::scrollback_truncated_lines) because
-    /// no line was lost.
-    ///
-    /// An inline image is kept only while its lines are held uncompressed, so a
-    /// footprint ages out one row at a time from its top. Hosts poll this; the
-    /// user's content is never marked.
+    /// Monotonic count of history rows, across both grids, that kept their text but
+    /// lost their inline picture when the tiered store compressed them (an image is
+    /// kept only while its lines are uncompressed, so a footprint ages out a row at a
+    /// time from its top). Separate from
+    /// [`scrollback_truncated_lines`](Self::scrollback_truncated_lines): no line was
+    /// lost. Hosts poll this; the content is never marked.
     #[must_use]
     pub fn scrollback_image_rows_dropped(&self) -> u64 {
         let mut total = self.grid.image_rows_dropped_by_compression();
@@ -529,7 +507,6 @@ impl Terminal {
     /// ```
     #[must_use]
     pub fn format_paste_framed(&self, text: &str, bracketed: bool) -> Vec<u8> {
-        // Truncate at char boundary to prevent unbounded allocation.
         let text = bounded_paste_text(text);
 
         if bracketed {
@@ -545,11 +522,9 @@ impl Terminal {
             result.extend_from_slice(b"\x1b[201~");
             result
         } else {
-            // The same sanitization outside bracketed paste: C1 controls can
-            // inject commands with 8-bit controls enabled, and C0 signals (0x03,
-            // 0x04, 0x1a, …) could hijack a non-bracketed reader mid-paste.
+            // The same sanitization unbracketed: C1 controls inject commands with
+            // 8-bit controls enabled, and C0 signals could hijack the reader.
             let cleaned: String = text.chars().filter(|&c| paste_char_allowed(c)).collect();
-            // Convert newlines to CR.
             cleaned
                 .replace("\r\n", "\r")
                 .replace('\n', "\r")
@@ -794,8 +769,7 @@ mod tests {
         );
         assert_eq!(term.take_osc_event(), None, "queue drained");
 
-        // The RFC 8089 local forms — empty host and "localhost" — keep the
-        // bare path, byte-identical to the historical payload.
+        // The RFC 8089 local forms (empty host, "localhost") keep the bare path.
         term.process(b"\x1b]7;file:///var/log\x07");
         assert_eq!(term.take_osc_event(), Some((7, "/var/log".to_string())));
         term.process(b"\x1b]7;file://localhost/var/tmp\x07");

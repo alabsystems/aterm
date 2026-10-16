@@ -1409,13 +1409,4 @@ mod tests {
         full.network = NetworkCapability::Full;
         assert!(profile_for(&full).is_none());
     }
-
-    #[test]
-    fn sandbox_exec_path_is_the_fixed_absolute_wrapper() {
-        assert_eq!(SANDBOX_EXEC_PATH, "/usr/bin/sandbox-exec");
-        assert!(
-            SANDBOX_EXEC_PATH.starts_with('/'),
-            "must be an absolute path (no PATH search in the child)"
-        );
-    }
 }

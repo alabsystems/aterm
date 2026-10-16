@@ -1,29 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The torn-read fix on real bytes.
+//! Torn reads on real bytes, through the host seam: a real `aterm_core` [`Terminal`] fed the
+//! bytes, its rows sampled as `app_render.rs`'s frame hold samples them (the caret's row, every
+//! row the ribbon names, the print anchor), its content-scroll clock read as
+//! `sync_cursor_effect_scroll` reads it, fed to [`CursorGlow`] with the hints `app_input.rs`
+//! stamps for each key.
 //!
-//! Everything here drives the host seam: a real `aterm_core` [`Terminal`] fed
-//! the bytes, its rows sampled as `app_render.rs`'s frame hold samples them
-//! (the caret's row, every row the ribbon names, the print anchor), its
-//! content-scroll clock read as `sync_cursor_effect_scroll` reads it, fed to
-//! [`CursorGlow`] with the hints `app_input.rs` stamps for each key.
-//!
-//! * **Real bytes at every read size.** The Claude Code composer takes and
-//!   Codex's particle take, each burst presented whole, then re-cut into 1024-
-//!   and 512-byte reads with a present after every read. No interior dark run
-//!   on the composer row from the first typed key to the last, and nothing
-//!   drawn once the take has rested past the longest swoosh. Claude takes are
-//!   read with the `?2026` hold lapsed (the host's cap is 150 ms,
-//!   `SYNC_HOLD_CAP`), the torn-read condition; Codex's take with the hold
-//!   held, as SYNC-1 holds it.
-//! * **A typed line into the swoosh.** A line typed at 12 cps into an
-//!   Ink-shaped composer with every key's repaint torn at the same text
-//!   column, then the hand rests through the whole exit. Two censuses: the
-//!   plan's coverage (what a pixel census reads) and the ribbon's own live
-//!   cells (the census `codex_particle_replay.rs` reads, since the plan
-//!   feathers across a one-cell gap until the band drains). Neither may show
-//!   a gap.
+//! * Real bytes at every read size: the Claude Code composer takes and Codex's particle take,
+//!   each burst presented whole, then re-cut into 1024- and 512-byte reads with a present after
+//!   each. No interior dark run on the composer row from the first typed key to the last, and
+//!   nothing drawn once the take has rested past the longest swoosh. Claude takes run with the
+//!   `?2026` hold lapsed (past `SYNC_HOLD_CAP`, 150 ms), the torn-read condition; Codex's with
+//!   the hold held (SYNC-1).
+//! * A typed line into the swoosh: 12 cps into an Ink-shaped composer, every key's repaint torn
+//!   at the same text column, then a rest through the whole exit. Neither the plan's coverage
+//!   (what a pixel census reads) nor the ribbon's live cells (whose one-cell gaps the plan
+//!   feathers over) may show a gap.
 
 use std::time::{Duration, Instant};
 
@@ -36,16 +29,14 @@ use aterm_core::terminal::{ContentScrollState, Terminal};
 use aterm_effects::cursor_glow::{CursorGlow, Geom, GlowConfig};
 use aterm_effects::rainbow_kitty::ribbon::Ribbon;
 
-// ===========================================================================
-// Shared
-// ===========================================================================
+// Shared.
 
-/// Idle after the last gesture before T6 is read: every v2 life is shorter
-/// (the longest swoosh is a 1.5 s rest plus 0.79 s at the slowest tempo —
-/// `rainbow_kitty_v2_frame_cost.rs`'s own ceiling).
+/// Idle after the last gesture before T6 is read, as in
+/// `rainbow_kitty_v2_frame_cost.rs`: longer than the longest swoosh (a 1.5 s
+/// rest plus 0.79 s at the slowest tempo).
 const IDLE_CEILING_MS: u64 = 2_500;
 
-/// The owner's line.
+/// The line the swoosh test types.
 const LINE: &str = "zoom out. first of all, STOP LANDING BRANCHES AND PATCHES! YOU NEED TO FUCKING MERGE ALL BEST WORK INTO MAIN!!!!";
 
 fn lit_map(cov: &[u8]) -> String {
@@ -79,7 +70,7 @@ fn live_gaps(rib: &Ribbon, row: u16) -> Vec<u16> {
         .collect()
 }
 
-/// What T6 reads once the take has rested.
+/// What T6 (idle → zero) reads once the take has rested.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Rest {
     cells: u32,
@@ -120,9 +111,7 @@ fn rest_of(glow: &CursorGlow, fp: u64, now: Instant) -> Rest {
     }
 }
 
-// ===========================================================================
-// 1. Real bytes at every read size
-// ===========================================================================
+// 1. Real bytes at every read size.
 
 struct Take {
     name: &'static str,
@@ -536,9 +525,7 @@ fn assert_take_holds(take: &Take) {
     );
 }
 
-/// Claude Code's bytes at every read size (the insert take): the line typed,
-/// ⌥← into it, `INTO ` inserted, ⌥→ back; presented whole and in 1024- and
-/// 512-byte reads. No interior hole while typing; nothing drawn at rest.
+/// The insert take: the line typed, ⌥← into it, `INTO ` inserted, ⌥→ back.
 #[test]
 fn claude_code_s_insert_take_holds_whole_and_torn_at_every_read_size() {
     assert_take_holds(&TAKES[0]);
@@ -563,22 +550,19 @@ fn claude_code_s_popup_take_holds_whole_and_torn_at_every_read_size() {
     assert_take_holds(&TAKES[3]);
 }
 
-/// Codex's bytes at every read size. Codex paints braille particles into the
-/// composer's blank cells on every ~150 ms frame inside `?2026`; re-cut at
-/// 1024 and 512 bytes, with SYNC-1 holding the present while a bracket is
-/// open. The band under the typed line, the backward edit and the forward hops
-/// stays one run, and nothing is left at rest.
+/// Codex's particle take: braille particles painted into the composer's blank
+/// cells on every ~150 ms frame inside `?2026`, with SYNC-1 holding the
+/// present while a bracket is open.
 #[test]
 fn codex_s_particle_take_holds_whole_and_torn_at_every_read_size() {
     assert_take_holds(&TAKES[4]);
 }
 
-/// Claude Code's bytes, a plain-arrow insert: the line typed, walked back into
-/// with ← (one `CUP` per press) and typed into twice, each key's diff frame
-/// rewriting the rest of the line one column on. The band from the prompt to
-/// the end of the text is lit on the last typing frame: the pushed tail
-/// carries its light (a dark tail is not an interior hole, so the hole census
-/// alone cannot see it).
+/// The plain-arrow insert take: ← (one `CUP` per press) back into the line and
+/// typing there, each key's diff frame rewriting the rest of the line one
+/// column on. On the last typing frame the band is lit from the prompt to the
+/// end of the text: a dark pushed tail is not an interior hole, so the hole
+/// census alone cannot see it.
 #[test]
 fn claude_code_s_arrow_insert_keeps_the_pushed_tail_lit_at_every_read_size() {
     let take = &TAKES[5];
@@ -602,9 +586,7 @@ fn claude_code_s_arrow_insert_keeps_the_pushed_tail_lit_at_every_read_size() {
     }
 }
 
-// ===========================================================================
-// 2. A typed line, torn, into the swoosh
-// ===========================================================================
+// 2. A typed line, torn, into the swoosh.
 
 const COMPOSER_ROWS: usize = 40;
 const COMPOSER_CW: usize = 8;
@@ -616,7 +598,7 @@ const TEXT_ROWS: usize = 3;
 const SPIN_ROW: usize = R0 - 2;
 const HINT_ROW: usize = R0 + TEXT_ROWS + 1;
 const FRAME_MS: u64 = 16;
-/// 12 cps, the owner's pace.
+/// 12 cps.
 const KEY_MS: u64 = 83;
 
 /// Where a present lands inside one repaint.
@@ -648,11 +630,10 @@ struct Composer {
     spin_i: usize,
     label: String,
     frames: usize,
-    /// `(ms, row, label, lit map, holes)` per frame with an interior dark
-    /// run in the PLAN.
+    /// `(ms, row, label, lit map, holes)` per frame with an interior dark run
+    /// in the plan.
     holes: Vec<RowHoleFrame>,
-    /// `(ms, row, columns)` per frame with an interior gap in the LIVE
-    /// cells.
+    /// `(ms, row, columns)` per frame with an interior gap in the live cells.
     gaps: Vec<(u64, u16, Vec<u16>)>,
     rows_lit_max: usize,
 }
@@ -703,7 +684,7 @@ impl Composer {
         self.now.saturating_duration_since(self.t0).as_millis() as u64
     }
 
-    /// the frame hold and the tick; then the census.
+    /// The frame hold and the tick, then the census.
     fn frame(&mut self) {
         let (c, cur) = caret_sample(&self.term);
         let now = self.now;
@@ -848,11 +829,9 @@ impl Composer {
     }
 }
 
-/// A line typed at 12 cps, every key's repaint from `…WORK IN` on torn at the
-/// same text column (the 1 KiB read boundary), then the hand rests through
-/// the whole exit. Neither the plan nor the ribbon's live cells (whose
-/// one-cell gaps the plan feathers over until the drain) may carry an interior
-/// dark run. The control is the same line untorn.
+/// A line typed at 12 cps, every key's repaint from `…WORK IN` on torn at the same text column
+/// (the 1 KiB read boundary), then a rest through the whole exit. Neither the plan nor the
+/// ribbon's live cells may carry an interior dark run. The control is the same line untorn.
 #[test]
 fn the_owner_s_line_torn_at_the_same_column_stays_whole_into_the_swoosh() {
     /// The text index of the `T` of `INTO`: a read boundary here shows

@@ -14,12 +14,11 @@ description = "Terminal grid model: cells, rows, styles, damage tracking, page s
 
 [features]
 default = ["disk-tier"]
-# Disk-backed scrollback cold tier (mmap + zstd). Default-on so native builds keep
-# it; off for wasm32 (no libc/zstd-sys), where the grid runs the RAM tiers only.
+# Disk-backed scrollback cold tier (libc mmap). Default-on so native builds keep
+# it; off for wasm32 (no libc), where the grid runs the RAM tiers only.
 disk-tier = ["aterm-scrollback/disk-tier"]
 alacritty-compat = []  # Expose legacy Alacritty-facing CellFlags aliases
 fuzz = ["aterm-scrollback/fuzz"]  # Expose fuzz-only APIs
-testing = []  # Expose test-only helpers for downstream crate tests
 # Compile the `#[refines]` anchors (page store, row, resize undo) into the library so
 # the `spec_xref_closure` gate in aterm-gui collects them. Off by default so
 # production builds carry no aterm-spec.
@@ -28,7 +27,7 @@ spec-anchors = ["dep:aterm-spec"]
 [dependencies]
 aterm-rle = { workspace = true }
 # Its disk tier is enabled through this crate's `disk-tier` feature, so a wasm
-# consumer can drop libc/zstd-sys.
+# consumer can drop libc.
 aterm-scrollback = { workspace = true }
 aterm-types = { workspace = true }
 aterm-log = { workspace = true }
@@ -39,20 +38,10 @@ aterm-grapheme = { workspace = true }
 aterm-spec = { workspace = true, optional = true }
 
 [dev-dependencies]
-# The corruption seam for the dense-history conformance tests
-# (`history_lines_from_*`); dev-only, so no product build carries it.
-aterm-scrollback = { workspace = true, features = ["testing"] }
 aterm-tempfile = { workspace = true }
 aterm-selection = { workspace = true }
 # The `#[refines]` anchors under a plain test run, and the derived models and seeded
 # `XorShift` the tests use.
-aterm-spec = { workspace = true }
-
-[build-dependencies]
-# build.rs model-checks the scrollback-offload detach-window protocol
-# (`offload_window_spec.rs`, shared with tests/conformance_offload.rs), so a violated
-# invariant fails the build. No cycle: aterm-spec depends only on aterm-spec-macros
-# and aterm-json.
 aterm-spec = { workspace = true }
 
 [lints]
@@ -67,3 +56,14 @@ path = "tests/grid_suite.rs"
 [[test]]
 name = "conformance_offload"
 path = "tests/conformance_offload.rs"
+
+# The lib's unit tests reach other crates' debug-only test seams, so they are
+# no bench target (the bench profile has no debug assertions).
+[lib]
+bench = false
+
+# A measurement, run by hand: `targo --unverified bench -p aterm-grid`.
+[[bench]]
+name = "reflow_step"
+path = "benches/reflow_step.rs"
+harness = false

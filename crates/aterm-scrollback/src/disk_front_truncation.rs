@@ -10,12 +10,9 @@ use crate::disk_format::len_u32_to_usize;
 impl DiskColdTier {
     /// Logically remove the oldest `n` lines without decompression.
     ///
-    /// Advances `front_offset` by `n` and drops any pages that become fully
-    /// consumed. O(1) when no page boundary is crossed; O(pages_dropped) when
-    /// pages are consumed. No decompression is performed.
-    ///
-    /// Consumed pages remain in the file but are removed from the in-memory
-    /// index so they are no longer accessible.
+    /// Advances `front_offset` by `n` and drops fully consumed pages from the
+    /// in-memory index (their bytes stay in the file until compaction). O(1) when
+    /// no page boundary is crossed, else O(pages_dropped).
     pub(crate) fn truncate_front_lines(&mut self, n: usize) {
         if n == 0 {
             return;
@@ -36,7 +33,6 @@ impl DiskColdTier {
         self.line_count = self.line_count.saturating_sub(n);
 
         // Drop fully consumed pages from the front of the index.
-        // Count first, then advance the cursor once.
         let mut pages_dropped = 0;
         let mut offset_consumed = 0usize;
         for entry in self.live_index() {
@@ -51,28 +47,19 @@ impl DiskColdTier {
         if pages_dropped > 0 {
             self.front_offset = self.front_offset.saturating_sub(offset_consumed);
 
-            // O(pages_dropped) amortized index maintenance: the shared
-            // cursor and absolute base advance; no surviving entry of either
-            // vector is drained or rebased (the old path here memmoved the
-            // page index AND memmoved+rebased the cumulative index — O(total
-            // pages) per drop, reached from the line-limit enforcement of
-            // every push in a capped session). See drop_front_index_entries.
+            // O(pages_dropped): the shared cursor and absolute base advance; no
+            // surviving entry is moved or rebased.
             self.drop_front_index_entries(pages_dropped);
             // Invalidate cache — live page indices shifted.
             self.clear_page_cache();
 
-            // Refresh accounting only when state that feeds calculate_memory_used
-            // changed. With pages_dropped == 0 every term is untouched (drains
-            // don't run, cache is intact; front_offset/line_count are inline
-            // fields covered by size_of::<Self>), so bytes_used is still exact
-            // and a full cache walk per truncated line would be pure overhead.
+            // Accounting changes only when pages drop: front_offset and line_count
+            // are inline fields already counted by size_of::<Self>.
             self.reset_bytes_used();
         }
 
-        // Compact when dead space exceeds live data (>50% waste).
-        // Amortized O(1): compaction rewrites O(live_bytes), but only fires
-        // after accumulating dead_bytes > live_bytes, so each byte is rewritten
-        // at most once per full rotation of the scrollback.
+        // Compact when dead space exceeds live data. Amortized O(1): each byte is
+        // rewritten at most once per full rotation of the scrollback.
         if self.file.is_some()
             && !self.live_index().is_empty()
             && self.dead_bytes() > self.live_bytes()
@@ -82,5 +69,5 @@ impl DiskColdTier {
         }
     }
 
-    // pre_validate_truncate_back and truncate_back_lines are in disk_memory.rs.
+    // truncate_back_lines is in disk_memory.rs.
 }

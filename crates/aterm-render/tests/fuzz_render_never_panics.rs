@@ -1,21 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-//! Panic-freedom fuzz for the CPU RENDER path on adversarial engine states.
-//!
-//! The engine fuzz (`aterm-core`) pins that `process()` never panics; this pins
-//! the next stage — turning a grid into pixels — never panics either. That path
-//! grew a lot of new code (rustybuzz cluster shaping, Apple-Color-Emoji `sbix`
-//! decode, combining-mark centering, DECDWL/DECDHL NEAREST scaling, synthetic
-//! bold/italic, the SGR decoration rects, procedural box/block/braille/sextant/
-//! Powerline) that today is exercised only by CURATED parity/golden tests. A
-//! shaping or metrics panic on hostile output would crash the window.
-//!
-//! This drives the engine with input BIASED toward those features (emoji of
-//! every form, decomposed combining sequences, wide CJK, procedural glyphs,
-//! random SGR styling, DEC line sizing) plus raw/garbage bytes, then RENDERS
-//! every resulting frame and asserts the rasterizer never panics and always
-//! returns a non-degenerate framebuffer. Deterministic LCG → reproducible.
+//! Panic-freedom fuzz for the CPU render path: drive the engine with input biased toward
+//! shaping, emoji, combining marks, wide CJK, procedural glyphs, random SGR styling and DEC
+//! line sizing, plus garbage bytes, then render every frame and assert the rasterizer never
+//! panics and returns a non-degenerate framebuffer. Deterministic LCG, so reproducible.
 
 use aterm_core::terminal::Terminal;
 use aterm_render::{Renderer, Theme};
@@ -28,10 +17,8 @@ fn next(state: &mut u64) -> u32 {
     (*state >> 33) as u32
 }
 
-/// SGR styling: a run of random parameters (incl. the truecolor / underline-
-/// colour `38;2`/`48;2`/`58;2;r;g;b` and `4:n` underline-style forms) then `m`.
-/// Exercises synthetic bold/italic, every underline style, strike/overline, and
-/// SGR-58 underline colour.
+/// A run of random SGR parameters, including the truecolor `38;2`/`48;2`/`58;2;r;g;b` and
+/// `4:n` underline-style forms, then `m`.
 fn emit_sgr(s: &mut u64, buf: &mut Vec<u8>) {
     buf.extend_from_slice(b"\x1b[");
     let np = 1 + next(s) % 5;
@@ -80,7 +67,7 @@ fn render_adversarial_engine_states_never_panics() {
     let mut s = 0x5EED_1337_C0DE_FACEu64;
     let mut term = Terminal::new(24, 80);
 
-    // Byte samples that drive the NEW render paths.
+    // Byte samples for the render paths under test.
     let samples: &[&[u8]] = &[
         "🚀".as_bytes(),
         "❤\u{fe0f}".as_bytes(),              // VS16 colour
@@ -101,8 +88,8 @@ fn render_adversarial_engine_states_never_panics() {
         "\u{1fb00}\u{1fb1e}\u{1fb3b}".as_bytes(), // sextants
         "\u{1cd00}\u{1cd73}\u{1cde5}".as_bytes(), // octants
         "\u{e0b0}\u{e0b1}\u{e0b2}\u{e0bc}".as_bytes(), // Powerline
-        // W8 (g)/(h): symbol-tier glyphs whose raster overruns their cell and
-        // is CONDENSED + column-clamped — the new slicing/re-pack arithmetic.
+        // Symbol-tier glyphs whose raster overruns the cell and is condensed and
+        // column-clamped.
         "\u{27F5}\u{27F6}\u{27F7}\u{27F8}\u{27F9}\u{27FA}\u{27FB}\u{27FC}".as_bytes(),
         "\u{21D2}\u{21D4}\u{2261}\u{27F0}\u{2A7D}".as_bytes(),
         b"\x1b#3",
@@ -118,8 +105,7 @@ fn render_adversarial_engine_states_never_panics() {
     ];
 
     let mut buf: Vec<u8> = Vec::with_capacity(256);
-    // 700 frames × up to 8 feature-chunks each — high diversity per render keeps
-    // wall-clock reasonable in the debug suite while covering the new paths well.
+    // 700 frames × up to 8 feature chunks keeps the debug suite fast.
     for _ in 0..700u32 {
         buf.clear();
         let chunks = 1 + next(&mut s) % 8;
@@ -144,17 +130,14 @@ fn render_adversarial_engine_states_never_panics() {
         }
         term.process(&buf);
 
-        // Occasionally resize so the render path sees fresh dimensions (and the
-        // reflow of pathological wide/cluster/mark content across the new grid).
+        // Occasionally resize (and reflow) at modest sizes; large grids dominate render
+        // cost.
         if next(&mut s).is_multiple_of(96) {
-            // Bounded sizes: large grids dominate render cost, and the wrap /
-            // reflow / scale edges we care about fire at modest dimensions too.
             let rr = (1 + next(&mut s) % 32) as u16;
             let cc = (1 + next(&mut s) % 100) as u16;
             term.resize(rr, cc);
         }
 
-        // RENDER the resulting frame — this is what must never panic.
         let (rows, cols) = (term.rows() as usize, term.cols() as usize);
         let frame = r.render_input(&term.cell_frame(rows, cols));
         assert!(

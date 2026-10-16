@@ -13,11 +13,15 @@
 //!   update just brought in — and again when the owner comes back to aterm while aterm is
 //!   not on it, at most once a minute ([`REREAD_EVERY`]; the read is the `privacy` verb's:
 //!   the switch's row in the system TCC.db and tccd's answers, on a worker,
-//!   `Wake::DevToolsProbeReady` when done);
-//! * `not_granted` raises ONE digest line whose one press opens the pane
-//!   ([`crate::message_reporters::devtools_entry`]), and, once per aterm version, opens the
-//!   pane itself ([`atpkg::devtools::hand_to_owner`], with `spctl developer-mode
-//!   enable-terminal` first on a Mac whose list is empty, so the pane exists);
+//!   `Wake::DevToolsProbeReady` when done). Once aterm has brought the owner to the pane,
+//!   the focus gain that brings them back reads whenever it comes
+//!   ([`DevToolsWatch::note_handed_over`]): that return is when the switch may have moved;
+//! * `not_granted` raises ONE digest line whose one press opens the pane and whose second
+//!   opens aterm's own Settings ▸ Security ([`crate::message_reporters::devtools_entry`]),
+//!   and, once per aterm version, asks for the pane brought up for the owner at a quiet
+//!   moment (`App::hand_devtools_to_owner`, [`crate::devtools_helper`]: with `spctl
+//!   developer-mode enable-terminal` first on a Mac whose list is empty, so the pane
+//!   exists, and aterm's own panel beside it);
 //! * `granted` ends the line; `unknown` changes nothing.
 //!
 //! It never presses anything in System Settings, never writes TCC.db and never calls
@@ -59,16 +63,23 @@ pub(crate) struct DevToolsWatch {
     awaiting_owner: bool,
     /// When a focus gain last asked for a read.
     last_read: Option<Instant>,
-    /// This process already asked for the pane opened: two readings that land before
-    /// the worker writes its marker open it once.
+    /// This process already asked for the pane brought up: two readings that land
+    /// before the hand-over writes its marker ask once.
     handed_over: bool,
+    /// aterm brought the owner to the pane since the last read: the next focus gain
+    /// reads, however soon after `last_read` it comes and whatever the last reading
+    /// said.
+    read_on_return: bool,
 }
 
 impl DevToolsWatch {
     /// Whether a focus gain at `now` should read the list: the first one (the launch
-    /// read), then, while aterm is not on the list, one at most every [`REREAD_EVERY`].
+    /// read); the first after aterm brought the owner to the pane
+    /// ([`Self::note_handed_over`]); otherwise, while aterm is not on the list, one at
+    /// most every [`REREAD_EVERY`].
     pub(crate) fn wants_read(&mut self, now: Instant) -> bool {
         let want = !self.read_once
+            || self.read_on_return
             || (self.awaiting_owner
                 && self
                     .last_read
@@ -76,8 +87,27 @@ impl DevToolsWatch {
         self.read_once = true;
         if want {
             self.last_read = Some(now);
+            self.read_on_return = false;
         }
         want
+    }
+
+    /// aterm just brought the owner to the Developer Tools pane (its own hand-over, a
+    /// press that opened it): the focus gain that brings them back reads the list,
+    /// even inside [`REREAD_EVERY`] of the read before (the launch read is seconds
+    /// old when an update's first focus hands the pane over) and whatever that read
+    /// said. One read: the gate is back after it.
+    pub(crate) fn note_handed_over(&mut self) {
+        self.read_on_return = true;
+    }
+
+    /// The hand-over this process asked for ended refused for want of a reading
+    /// (`unknown` at its quiet moment: a later reading, without Full Disk Access and
+    /// with no new program in tccd's window, read nothing), which is no decision
+    /// against bringing the owner to the page: the next `not_granted` reading asks
+    /// again, once.
+    pub(crate) fn forget_hand_over(&mut self) {
+        self.handed_over = false;
     }
 
     /// What a completed reading asks for. `opened_this_version`: aterm already opened
@@ -139,5 +169,61 @@ mod tests {
             !watch.wants_read(t1 + REREAD_EVERY * 9),
             "on the list: focus reads nothing"
         );
+        // A hand-over that ended refused as unknown asks again at the next
+        // `not_granted`, once; the control above (no forgetting) asked once.
+        watch.forget_hand_over();
+        assert_eq!(
+            watch.observe(DevToolGrant::NotGranted, false),
+            Step::Raise { hand_over: true }
+        );
+        assert_eq!(
+            watch.observe(DevToolGrant::NotGranted, false),
+            Step::Raise { hand_over: false }
+        );
+    }
+
+    /// After aterm brings the owner to the pane, the focus gain that brings them back
+    /// reads, though the launch read was seconds before it; one read, then the gate is
+    /// back. It reads whatever the last reading said (an owner's press when the list
+    /// could not be read). NEGATIVE CONTROL: the same return with no hand-over reads
+    /// nothing.
+    #[test]
+    fn the_return_from_a_hand_over_reads_however_soon_it_comes() {
+        let t0 = Instant::now();
+        let soon = Duration::from_secs(20);
+        assert!(soon < REREAD_EVERY);
+        // The control: launch read, not granted, back 20 s later: gated.
+        let mut watch = DevToolsWatch::default();
+        assert!(watch.wants_read(t0));
+        assert_eq!(
+            watch.observe(DevToolGrant::NotGranted, false),
+            Step::Raise { hand_over: true }
+        );
+        assert!(!watch.wants_read(t0 + soon), "no hand-over: the gate holds");
+        // The same, with the pane handed over.
+        let mut watch = DevToolsWatch::default();
+        assert!(watch.wants_read(t0));
+        assert_eq!(
+            watch.observe(DevToolGrant::NotGranted, false),
+            Step::Raise { hand_over: true }
+        );
+        watch.note_handed_over();
+        assert!(watch.wants_read(t0 + soon), "back from System Settings");
+        assert!(
+            !watch.wants_read(t0 + soon + Duration::from_secs(1)),
+            "one read: the gate is back"
+        );
+        assert!(watch.wants_read(t0 + soon + REREAD_EVERY));
+        // Not awaiting the owner (the list could not be read, or read on): an owner's
+        // press still has its return read.
+        for grant in [DevToolGrant::Unknown, DevToolGrant::Granted] {
+            let mut watch = DevToolsWatch::default();
+            assert!(watch.wants_read(t0));
+            let _ = watch.observe(grant, false);
+            assert!(!watch.wants_read(t0 + REREAD_EVERY * 9), "{grant:?}");
+            watch.note_handed_over();
+            assert!(watch.wants_read(t0 + REREAD_EVERY * 9), "{grant:?}");
+            assert!(!watch.wants_read(t0 + REREAD_EVERY * 20), "{grant:?}");
+        }
     }
 }

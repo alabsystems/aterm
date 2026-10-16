@@ -1,0 +1,165 @@
+# The level sweep, recorded from Homebrew's zstd CLI v1.5.7 on 2026-10-16 for
+# docs/AUDIT-third-party-2026-10-15.md ZC.6: the frames the ZC.4 differential
+# had libzstd's encoder write at run time, made once and kept, so the
+# differential runs with no libzstd in the graph. sweep-zstd-1.5.7.zst holds
+# every frame back to back; each row says where one lies, the input it was
+# made from (tests/support `input(spec)` regenerates it), the command that
+# wrote it, and the length and SHA-256 of what `zstd -dc` decodes it to,
+# checked equal to the input's own when recorded.
+# The plan: at every level from --fast=5 to --ultra -22, a 1,536-byte words
+# input, a 2,048-byte inserts input in 1 KiB blocks (`--zstd=wlog=10`), a
+# 140,000-byte run and the four bytes `zstd`; a 3,072-byte words input in
+# 1 KiB blocks at -3, 6, 12 and 22, `one_code` (RLE tables whose codes carry
+# extra bits) at 5, 12 and 19, `rle_literals` at 6, 13 and 19; then words at
+# every Frame_Content_Size edge up to 1,025 bytes and `sparse` across the
+# block size, at levels -3, 1, 7 and 19 in turn. Checksum and content size
+# (a file input declares its size, a pipe does not) turn per level, so each
+# input meets all four combinations.
+# row	offset	length	input	command	decoded_len	sha256
+0	0	1029	words:1536:5	zstd -q --fast=5 -c <file>	1536	0f122c7fde6f24c1ea73f51937a03cec9778fa50845c02777603013a1c55b0df
+1	1029	432	inserts:2048:5	zstd -q --fast=5 --zstd=wlog=10 -c < <file>	2048	0f8b4443fd719c129326bdd9a63732cf3d3805762ac0d47a9d3d4be20eeb094e
+2	1461	30	run:140000:0	zstd -q --fast=5 --no-check -c <file>	140000	e9bc06d5df2518c28d92e41fd9595d1c8502f29426ba74f05f0e557e06bb8307
+3	1491	13	text:0:zstd	zstd -q --fast=5 --no-check -c < <file>	4	242daddb4ed79680ac790d9f9c01ca43c8fc3a16f1af137f7cb090c086988782
+4	1504	1080	words:1536:4	zstd -q --fast=4 -c < <file>	1536	0f122c7fde6f24c1ea73f51937a03cec9778fa50845c02777603013a1c55b0df
+5	2584	365	inserts:2048:4	zstd -q --fast=4 --no-check --zstd=wlog=10 -c <file>	2048	0f8b4443fd719c129326bdd9a63732cf3d3805762ac0d47a9d3d4be20eeb094e
+6	2949	26	run:140000:0	zstd -q --fast=4 --no-check -c < <file>	140000	e9bc06d5df2518c28d92e41fd9595d1c8502f29426ba74f05f0e557e06bb8307
+7	2975	17	text:0:zstd	zstd -q --fast=4 -c <file>	4	242daddb4ed79680ac790d9f9c01ca43c8fc3a16f1af137f7cb090c086988782
+8	2992	911	words:1536:3	zstd -q --fast=3 --no-check -c <file>	1536	9985d2f50be0b332d159a8e59c19fdfae78eb8f5a8dddf929fd69590e2d2c2e4
+9	3903	340	inserts:2048:3	zstd -q --fast=3 --no-check --zstd=wlog=10 -c < <file>	2048	6ef86ff0e1110174f5010b11d97a84db85b77576018263a3f70f0bd59d2fc325
+10	4243	32	run:140000:0	zstd -q --fast=3 -c <file>	140000	e9bc06d5df2518c28d92e41fd9595d1c8502f29426ba74f05f0e557e06bb8307
+11	4275	17	text:0:zstd	zstd -q --fast=3 -c < <file>	4	242daddb4ed79680ac790d9f9c01ca43c8fc3a16f1af137f7cb090c086988782
+12	4292	1893	words:3072:103	zstd -q --fast=3 --no-check --zstd=wlog=10 -c <file>	3072	0cd33412da5296586f517bba856da14b8258d2c7aa339889c8e28228d15eeeb1
+13	6185	937	words:1536:2	zstd -q --fast=2 --no-check -c < <file>	1536	9985d2f50be0b332d159a8e59c19fdfae78eb8f5a8dddf929fd69590e2d2c2e4
+14	7122	291	inserts:2048:2	zstd -q --fast=2 --zstd=wlog=10 -c <file>	2048	6ef86ff0e1110174f5010b11d97a84db85b77576018263a3f70f0bd59d2fc325
+15	7413	28	run:140000:0	zstd -q --fast=2 -c < <file>	140000	e9bc06d5df2518c28d92e41fd9595d1c8502f29426ba74f05f0e557e06bb8307
+16	7441	13	text:0:zstd	zstd -q --fast=2 --no-check -c <file>	4	242daddb4ed79680ac790d9f9c01ca43c8fc3a16f1af137f7cb090c086988782
+17	7454	786	words:1536:1	zstd -q --fast=1 -c <file>	1536	2267497aa61cfbbc96204e73e6e22e4d5c84ae48c588ea93d133eff4dad8fd31
+18	8240	326	inserts:2048:1	zstd -q --fast=1 --zstd=wlog=10 -c < <file>	2048	fb9fd094f381da4ba1dca0f2aab201a88f358b168cf5b2c840f97b5dc540604c
+19	8566	26	run:140000:0	zstd -q --fast=1 --no-check -c <file>	140000	e9bc06d5df2518c28d92e41fd9595d1c8502f29426ba74f05f0e557e06bb8307
+20	8592	13	text:0:zstd	zstd -q --fast=1 --no-check -c < <file>	4	242daddb4ed79680ac790d9f9c01ca43c8fc3a16f1af137f7cb090c086988782
+21	8605	710	words:1536:1	zstd -q -1 -c < <file>	1536	2267497aa61cfbbc96204e73e6e22e4d5c84ae48c588ea93d133eff4dad8fd31
+22	9315	324	inserts:2048:1	zstd -q -1 --no-check --zstd=wlog=10 -c <file>	2048	fb9fd094f381da4ba1dca0f2aab201a88f358b168cf5b2c840f97b5dc540604c
+23	9639	23	run:140000:0	zstd -q -1 --no-check -c < <file>	140000	e9bc06d5df2518c28d92e41fd9595d1c8502f29426ba74f05f0e557e06bb8307
+24	9662	17	text:0:zstd	zstd -q -1 -c <file>	4	242daddb4ed79680ac790d9f9c01ca43c8fc3a16f1af137f7cb090c086988782
+25	9679	677	words:1536:2	zstd -q -2 --no-check -c <file>	1536	9985d2f50be0b332d159a8e59c19fdfae78eb8f5a8dddf929fd69590e2d2c2e4
+26	10356	281	inserts:2048:2	zstd -q -2 --no-check --zstd=wlog=10 -c < <file>	2048	6ef86ff0e1110174f5010b11d97a84db85b77576018263a3f70f0bd59d2fc325
+27	10637	30	run:140000:0	zstd -q -2 -c <file>	140000	e9bc06d5df2518c28d92e41fd9595d1c8502f29426ba74f05f0e557e06bb8307
+28	10667	17	text:0:zstd	zstd -q -2 -c < <file>	4	242daddb4ed79680ac790d9f9c01ca43c8fc3a16f1af137f7cb090c086988782
+29	10684	677	words:1536:3	zstd -q -3 --no-check -c < <file>	1536	9985d2f50be0b332d159a8e59c19fdfae78eb8f5a8dddf929fd69590e2d2c2e4
+30	11361	281	inserts:2048:3	zstd -q -3 --zstd=wlog=10 -c <file>	2048	6ef86ff0e1110174f5010b11d97a84db85b77576018263a3f70f0bd59d2fc325
+31	11642	27	run:140000:0	zstd -q -3 -c < <file>	140000	e9bc06d5df2518c28d92e41fd9595d1c8502f29426ba74f05f0e557e06bb8307
+32	11669	13	text:0:zstd	zstd -q -3 --no-check -c <file>	4	242daddb4ed79680ac790d9f9c01ca43c8fc3a16f1af137f7cb090c086988782
+33	11682	672	words:1536:4	zstd -q -4 -c <file>	1536	0f122c7fde6f24c1ea73f51937a03cec9778fa50845c02777603013a1c55b0df
+34	12354	286	inserts:2048:4	zstd -q -4 --zstd=wlog=10 -c < <file>	2048	0f8b4443fd719c129326bdd9a63732cf3d3805762ac0d47a9d3d4be20eeb094e
+35	12640	26	run:140000:0	zstd -q -4 --no-check -c <file>	140000	e9bc06d5df2518c28d92e41fd9595d1c8502f29426ba74f05f0e557e06bb8307
+36	12666	13	text:0:zstd	zstd -q -4 --no-check -c < <file>	4	242daddb4ed79680ac790d9f9c01ca43c8fc3a16f1af137f7cb090c086988782
+37	12679	677	words:1536:5	zstd -q -5 -c < <file>	1536	0f122c7fde6f24c1ea73f51937a03cec9778fa50845c02777603013a1c55b0df
+38	13356	223	inserts:2048:5	zstd -q -5 --no-check --zstd=wlog=10 -c <file>	2048	0f8b4443fd719c129326bdd9a63732cf3d3805762ac0d47a9d3d4be20eeb094e
+39	13579	23	run:140000:0	zstd -q -5 --no-check -c < <file>	140000	e9bc06d5df2518c28d92e41fd9595d1c8502f29426ba74f05f0e557e06bb8307
+40	13602	17	text:0:zstd	zstd -q -5 -c <file>	4	242daddb4ed79680ac790d9f9c01ca43c8fc3a16f1af137f7cb090c086988782
+41	13619	701	one_code:24:5	zstd -q -5 --no-check -c <file>	132416	3d93751a8a0e8e922bbb2dd039d2c880977689f9b51064e3b1ea86c278669d4c
+42	14320	652	words:1536:6	zstd -q -6 --no-check -c <file>	1536	a5a9be7fae377c2bbfb5a8cc242d3e804dfaa4264c3dc08b79c4a4eb5a8765c8
+43	14972	214	inserts:2048:6	zstd -q -6 --no-check --zstd=wlog=10 -c < <file>	2048	6a211b03c24f96337d5aff449ed7b5c43869cc3a4e84327b3cdaf50fa51787c7
+44	15186	29	run:140000:0	zstd -q -6 -c <file>	140000	e9bc06d5df2518c28d92e41fd9595d1c8502f29426ba74f05f0e557e06bb8307
+45	15215	17	text:0:zstd	zstd -q -6 -c < <file>	4	242daddb4ed79680ac790d9f9c01ca43c8fc3a16f1af137f7cb090c086988782
+46	15232	1196	words:3072:106	zstd -q -6 --no-check --zstd=wlog=10 -c <file>	3072	17fd97e3f503777af47f71f63da623e44044b461f3b9999a91d2dabd64977a62
+47	16428	432	rle_literals:100:6	zstd -q -6 -c <file>	135172	ea4564219295a87ffc9a316f3d3b422336d1fd0beee5b548f0efbc2847416537
+48	16860	660	words:1536:7	zstd -q -7 --no-check -c < <file>	1536	a5a9be7fae377c2bbfb5a8cc242d3e804dfaa4264c3dc08b79c4a4eb5a8765c8
+49	17520	216	inserts:2048:7	zstd -q -7 --zstd=wlog=10 -c <file>	2048	6a211b03c24f96337d5aff449ed7b5c43869cc3a4e84327b3cdaf50fa51787c7
+50	17736	26	run:140000:0	zstd -q -7 -c < <file>	140000	e9bc06d5df2518c28d92e41fd9595d1c8502f29426ba74f05f0e557e06bb8307
+51	17762	13	text:0:zstd	zstd -q -7 --no-check -c <file>	4	242daddb4ed79680ac790d9f9c01ca43c8fc3a16f1af137f7cb090c086988782
+52	17775	651	words:1536:8	zstd -q -8 -c <file>	1536	6aff977e8930d7e6301062bbb4a8a238c52e4439c958732f673cac7545ad6f27
+53	18426	225	inserts:2048:8	zstd -q -8 --zstd=wlog=10 -c < <file>	2048	d0c6f726a2d78e9b53d45c9ca587cea59764853523967e13f87e25f4843747a5
+54	18651	25	run:140000:0	zstd -q -8 --no-check -c <file>	140000	e9bc06d5df2518c28d92e41fd9595d1c8502f29426ba74f05f0e557e06bb8307
+55	18676	13	text:0:zstd	zstd -q -8 --no-check -c < <file>	4	242daddb4ed79680ac790d9f9c01ca43c8fc3a16f1af137f7cb090c086988782
+56	18689	665	words:1536:9	zstd -q -9 -c < <file>	1536	6aff977e8930d7e6301062bbb4a8a238c52e4439c958732f673cac7545ad6f27
+57	19354	221	inserts:2048:9	zstd -q -9 --no-check --zstd=wlog=10 -c <file>	2048	d0c6f726a2d78e9b53d45c9ca587cea59764853523967e13f87e25f4843747a5
+58	19575	22	run:140000:0	zstd -q -9 --no-check -c < <file>	140000	e9bc06d5df2518c28d92e41fd9595d1c8502f29426ba74f05f0e557e06bb8307
+59	19597	17	text:0:zstd	zstd -q -9 -c <file>	4	242daddb4ed79680ac790d9f9c01ca43c8fc3a16f1af137f7cb090c086988782
+60	19614	644	words:1536:10	zstd -q -10 --no-check -c <file>	1536	841f56e45856943d01dd9af07706ebd7b6fdd1be7c035e67f5c36bd52b77b016
+61	20258	220	inserts:2048:10	zstd -q -10 --no-check --zstd=wlog=10 -c < <file>	2048	c24cefddafa0cff80da71d63a6a8ea524cef010125b3ee3e41ad5b854784e7af
+62	20478	29	run:140000:0	zstd -q -10 -c <file>	140000	e9bc06d5df2518c28d92e41fd9595d1c8502f29426ba74f05f0e557e06bb8307
+63	20507	17	text:0:zstd	zstd -q -10 -c < <file>	4	242daddb4ed79680ac790d9f9c01ca43c8fc3a16f1af137f7cb090c086988782
+64	20524	652	words:1536:11	zstd -q -11 --no-check -c < <file>	1536	841f56e45856943d01dd9af07706ebd7b6fdd1be7c035e67f5c36bd52b77b016
+65	21176	217	inserts:2048:11	zstd -q -11 --zstd=wlog=10 -c <file>	2048	c24cefddafa0cff80da71d63a6a8ea524cef010125b3ee3e41ad5b854784e7af
+66	21393	26	run:140000:0	zstd -q -11 -c < <file>	140000	e9bc06d5df2518c28d92e41fd9595d1c8502f29426ba74f05f0e557e06bb8307
+67	21419	13	text:0:zstd	zstd -q -11 --no-check -c <file>	4	242daddb4ed79680ac790d9f9c01ca43c8fc3a16f1af137f7cb090c086988782
+68	21432	675	words:1536:12	zstd -q -12 -c <file>	1536	73175802c1dbb31b76680d55e03497a7752a5ea01ef6035ad1131288503387e8
+69	22107	214	inserts:2048:12	zstd -q -12 --zstd=wlog=10 -c < <file>	2048	9f58b6a96e8f2c6ef0979dc7e1561d8f8224b40998f40d8ae5b5fa2fdcd2c951
+70	22321	26	run:140000:0	zstd -q -12 --no-check -c <file>	140000	e9bc06d5df2518c28d92e41fd9595d1c8502f29426ba74f05f0e557e06bb8307
+71	22347	13	text:0:zstd	zstd -q -12 --no-check -c < <file>	4	242daddb4ed79680ac790d9f9c01ca43c8fc3a16f1af137f7cb090c086988782
+72	22360	1225	words:3072:112	zstd -q -12 --zstd=wlog=10 -c <file>	3072	c0ffd09509333ffcf55015fdb15194ac796d847395e70bcb696c4230542ee0af
+73	23585	701	one_code:24:12	zstd -q -12 -c < <file>	132416	d5c7f75a00c4d9217843d4177cdf964efafe0a3b46824f48c15107426e8eb2e4
+74	24286	684	words:1536:13	zstd -q -13 -c < <file>	1536	73175802c1dbb31b76680d55e03497a7752a5ea01ef6035ad1131288503387e8
+75	24970	207	inserts:2048:13	zstd -q -13 --no-check --zstd=wlog=10 -c <file>	2048	9f58b6a96e8f2c6ef0979dc7e1561d8f8224b40998f40d8ae5b5fa2fdcd2c951
+76	25177	23	run:140000:0	zstd -q -13 --no-check -c < <file>	140000	e9bc06d5df2518c28d92e41fd9595d1c8502f29426ba74f05f0e557e06bb8307
+77	25200	17	text:0:zstd	zstd -q -13 -c <file>	4	242daddb4ed79680ac790d9f9c01ca43c8fc3a16f1af137f7cb090c086988782
+78	25217	404	rle_literals:100:13	zstd -q -13 --no-check -c < <file>	135172	57b175ebe5992709e2bb3bb675ac3212454018de55febb0c115d6c814f76267d
+79	25621	647	words:1536:14	zstd -q -14 --no-check -c <file>	1536	0f7402add24df5f10397cf28056301975c2feb10e812a006604e713456b74dcc
+80	26268	213	inserts:2048:14	zstd -q -14 --no-check --zstd=wlog=10 -c < <file>	2048	88e265a1a4fb5adcad2bf6bfbc348b00a1356182197079b654cf11d07a2e73c9
+81	26481	29	run:140000:0	zstd -q -14 -c <file>	140000	e9bc06d5df2518c28d92e41fd9595d1c8502f29426ba74f05f0e557e06bb8307
+82	26510	17	text:0:zstd	zstd -q -14 -c < <file>	4	242daddb4ed79680ac790d9f9c01ca43c8fc3a16f1af137f7cb090c086988782
+83	26527	658	words:1536:15	zstd -q -15 --no-check -c < <file>	1536	0f7402add24df5f10397cf28056301975c2feb10e812a006604e713456b74dcc
+84	27185	209	inserts:2048:15	zstd -q -15 --zstd=wlog=10 -c <file>	2048	88e265a1a4fb5adcad2bf6bfbc348b00a1356182197079b654cf11d07a2e73c9
+85	27394	27	run:140000:0	zstd -q -15 -c < <file>	140000	e9bc06d5df2518c28d92e41fd9595d1c8502f29426ba74f05f0e557e06bb8307
+86	27421	13	text:0:zstd	zstd -q -15 --no-check -c <file>	4	242daddb4ed79680ac790d9f9c01ca43c8fc3a16f1af137f7cb090c086988782
+87	27434	624	words:1536:16	zstd -q -16 -c <file>	1536	f30d387919cea3f8321a6dde84046a8bfa0e80329078c42d3a46e1ed950dfb40
+88	28058	203	inserts:2048:16	zstd -q -16 --zstd=wlog=10 -c < <file>	2048	b1ad934c66190a4d12cd1b1562bdf8cc55a32cb9e456d511ea603bbd6539bfaf
+89	28261	25	run:140000:0	zstd -q -16 --no-check -c <file>	140000	e9bc06d5df2518c28d92e41fd9595d1c8502f29426ba74f05f0e557e06bb8307
+90	28286	13	text:0:zstd	zstd -q -16 --no-check -c < <file>	4	242daddb4ed79680ac790d9f9c01ca43c8fc3a16f1af137f7cb090c086988782
+91	28299	637	words:1536:17	zstd -q -17 -c < <file>	1536	f30d387919cea3f8321a6dde84046a8bfa0e80329078c42d3a46e1ed950dfb40
+92	28936	199	inserts:2048:17	zstd -q -17 --no-check --zstd=wlog=10 -c <file>	2048	b1ad934c66190a4d12cd1b1562bdf8cc55a32cb9e456d511ea603bbd6539bfaf
+93	29135	22	run:140000:0	zstd -q -17 --no-check -c < <file>	140000	e9bc06d5df2518c28d92e41fd9595d1c8502f29426ba74f05f0e557e06bb8307
+94	29157	17	text:0:zstd	zstd -q -17 -c <file>	4	242daddb4ed79680ac790d9f9c01ca43c8fc3a16f1af137f7cb090c086988782
+95	29174	651	words:1536:18	zstd -q -18 --no-check -c <file>	1536	76bb4f53a42e2a4b56d467dd2788fbb6373cfa0d6fef655114c4552dc7239591
+96	29825	204	inserts:2048:18	zstd -q -18 --no-check --zstd=wlog=10 -c < <file>	2048	6db8fb8c526c72f1d45fddab13a30cfe7271f4b21c20ce3b6985097e017ec19b
+97	30029	29	run:140000:0	zstd -q -18 -c <file>	140000	e9bc06d5df2518c28d92e41fd9595d1c8502f29426ba74f05f0e557e06bb8307
+98	30058	17	text:0:zstd	zstd -q -18 -c < <file>	4	242daddb4ed79680ac790d9f9c01ca43c8fc3a16f1af137f7cb090c086988782
+99	30075	650	words:1536:19	zstd -q -19 --no-check -c < <file>	1536	76bb4f53a42e2a4b56d467dd2788fbb6373cfa0d6fef655114c4552dc7239591
+100	30725	201	inserts:2048:19	zstd -q -19 --zstd=wlog=10 -c <file>	2048	6db8fb8c526c72f1d45fddab13a30cfe7271f4b21c20ce3b6985097e017ec19b
+101	30926	26	run:140000:0	zstd -q -19 -c < <file>	140000	e9bc06d5df2518c28d92e41fd9595d1c8502f29426ba74f05f0e557e06bb8307
+102	30952	13	text:0:zstd	zstd -q -19 --no-check -c <file>	4	242daddb4ed79680ac790d9f9c01ca43c8fc3a16f1af137f7cb090c086988782
+103	30965	705	one_code:24:19	zstd -q -19 -c <file>	132416	0135522eaf2a3d68b5bafcf7c38d1e95b845ad234d353a6e6da5a780cdc9c712
+104	31670	395	rle_literals:100:19	zstd -q -19 -c < <file>	135172	0ea0de85ce6a85eea7aa22c531e5168aa46dde769e08603af0603c8a02fc4595
+105	32065	629	words:1536:20	zstd -q --ultra -20 -c <file>	1536	825be16cb71cf6e57199e7b633cb5d952bf11deef1d76f8e26b8bcc10e467594
+106	32694	202	inserts:2048:20	zstd -q --ultra -20 --zstd=wlog=10 -c < <file>	2048	a44400e0021deef15d2daef232c9fe097d7e010f4a8e15894d02be051811de0a
+107	32896	25	run:140000:0	zstd -q --ultra -20 --no-check -c <file>	140000	e9bc06d5df2518c28d92e41fd9595d1c8502f29426ba74f05f0e557e06bb8307
+108	32921	13	text:0:zstd	zstd -q --ultra -20 --no-check -c < <file>	4	242daddb4ed79680ac790d9f9c01ca43c8fc3a16f1af137f7cb090c086988782
+109	32934	628	words:1536:21	zstd -q --ultra -21 -c < <file>	1536	825be16cb71cf6e57199e7b633cb5d952bf11deef1d76f8e26b8bcc10e467594
+110	33562	200	inserts:2048:21	zstd -q --ultra -21 --no-check --zstd=wlog=10 -c <file>	2048	a44400e0021deef15d2daef232c9fe097d7e010f4a8e15894d02be051811de0a
+111	33762	22	run:140000:0	zstd -q --ultra -21 --no-check -c < <file>	140000	e9bc06d5df2518c28d92e41fd9595d1c8502f29426ba74f05f0e557e06bb8307
+112	33784	17	text:0:zstd	zstd -q --ultra -21 -c <file>	4	242daddb4ed79680ac790d9f9c01ca43c8fc3a16f1af137f7cb090c086988782
+113	33801	625	words:1536:22	zstd -q --ultra -22 --no-check -c <file>	1536	a151eb8b0d9fcd8a10f56353e00ca40c0b748fb8475a807f258ed3ceee5a483c
+114	34426	185	inserts:2048:22	zstd -q --ultra -22 --no-check --zstd=wlog=10 -c < <file>	2048	f2660918b372590180d6c58a913a08df6535fd22835502eb5dfbbf8f7db77de5
+115	34611	29	run:140000:0	zstd -q --ultra -22 -c <file>	140000	e9bc06d5df2518c28d92e41fd9595d1c8502f29426ba74f05f0e557e06bb8307
+116	34640	17	text:0:zstd	zstd -q --ultra -22 -c < <file>	4	242daddb4ed79680ac790d9f9c01ca43c8fc3a16f1af137f7cb090c086988782
+117	34657	1155	words:3072:122	zstd -q --ultra -22 --no-check --zstd=wlog=10 -c <file>	3072	fd5cb42af2a0ce32f0f7f23ed0313e67bc1b653d213b7a570d4ba6ab4ac3c0a4
+118	35812	13	words:0:1000	zstd -q --fast=3 -c <file>	0	e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+119	35825	14	words:1:1001	zstd -q -1 -c < <file>	1	e3b98a4da31a127d4bde6e43033f66ba274cab0eb7eb1c70ec41402bf6273dd8
+120	35839	11	words:2:1002	zstd -q -7 --no-check -c <file>	2	7519aaef7e4f0edfba8bbacdd5e96febb6b00a3fcc7c6b7ce518cae130cd7c77
+121	35850	12	words:3:1003	zstd -q -19 --no-check -c < <file>	3	fa832ef7b261578d666206c7deeb7d748d3b05a88a487ab784e8df20eabd11e4
+122	35862	17	words:4:1004	zstd -q --fast=3 -c < <file>	4	391af860941bd529b5c88e1684ed3b375b9b68aa4a31c17633c04a968b3ef056
+123	35879	16	words:7:1005	zstd -q -1 --no-check -c <file>	7	596a59e838720ae8277d6da2d6377d77948c9f2f3c4d28584aa722d4094bd09f
+124	35895	17	words:8:1006	zstd -q -7 --no-check -c < <file>	8	d74729286fdd01c04ffcb7b724089de817899c3c385cb36c0e9e60cacdf2f859
+125	35912	28	words:15:1007	zstd -q -19 -c <file>	15	26d7116936c1bc79647e342967d0a109a3868ced1d45584ea23d5dcf7141a2c5
+126	35940	25	words:16:1008	zstd -q --fast=3 --no-check -c <file>	16	605d6efff364343793ba678f3fcf86c904c59fdcca273ffafde170df4eaf64a2
+127	35965	40	words:31:1009	zstd -q -1 --no-check -c < <file>	31	8cd1d419fd851082a3ce5fea2ad4df0b3c0565ff40feb648eaf2155bb6411a4b
+128	36005	45	words:32:1010	zstd -q -7 -c <file>	32	e1295fcbefe208e92046d388bc628dd8296109ec60201a47b0fa6e1a8c92fc2d
+129	36050	68	words:63:1011	zstd -q -19 -c < <file>	63	5509fdbe727cccf8cfe37d288de8dfcdfa66a5a1300d9d4e9374869d7c3535d8
+130	36118	73	words:64:1012	zstd -q --fast=3 --no-check -c < <file>	64	cd23410745d813468e7a7e1b1c24e172bf6186e3fdf581b11f9a64f4e0bdae9a
+131	36191	94	words:100:1013	zstd -q -1 -c <file>	100	fae36c7cdd77a7778c97f0a37474f911ca278464b9c1ff9d0d2390b87c728f11
+132	36285	177	words:255:1014	zstd -q -7 -c < <file>	255	6ddcdfafa286ca68bcde6ae89f8aeeb1ce51ceb1d08e7fd41631ce73b58d06b2
+133	36462	170	words:256:1015	zstd -q -19 --no-check -c <file>	256	d43566ae033595f168f94d547ceb67e7ea8a9451fdaba775ca2a6b7fdbeae764
+134	36632	242	words:257:1016	zstd -q --fast=3 -c <file>	257	0f5ad96c29523d4d299a7f403e5af7a5c171e67b848c4f41f9ed70a6fd86851c
+135	36874	510	words:1000:1017	zstd -q -1 -c < <file>	1000	5081aa4adc3f0b364d872a0119040282cbb4e37d495c52002c44e5fc6ac235cc
+136	37384	483	words:1023:1018	zstd -q -7 --no-check -c <file>	1023	fa7c3d7d6f06f6884491eb44dd8b4a55b564ccd8f4ff7aebc93d82c9cd286746
+137	37867	471	words:1024:1019	zstd -q -19 --no-check -c < <file>	1024	233b2c33843c57477a267be7d6edc0d188f4817f98d2d0f6c3d86208f93af4e4
+138	38338	704	words:1025:1020	zstd -q --fast=3 -c < <file>	1025	4adaf8c39e62700ed1ef7fea1db8740ffdd392ff8ec67fc6869d163da384bd0b
+139	39042	19	sparse:4096:1021	zstd -q -1 --no-check -c <file>	4096	7ce31613d9be2ff07efca56d38974afd64446a454fd8438cd3d9b7270e4085e9
+140	39061	77	sparse:65535:1022	zstd -q -7 --no-check -c < <file>	65535	2fd48776387b65352d18790f1c6c92034c0b5afb3996a9aca882f8288c914d10
+141	39138	79	sparse:65791:1023	zstd -q -19 -c <file>	65791	302139da287539c54c09bd5526fd03e1d77410766bd0c1b58cf1529cef2c5ed1
+142	39217	116	sparse:65792:1024	zstd -q --fast=3 --no-check -c <file>	65792	1fe1ed16e63ebecec0f9d00062885aea2ae6ad7720ec9fb7c01ad4822fe66c07
+143	39333	116	sparse:131071:1025	zstd -q -1 --no-check -c < <file>	131071	d82dd04f00f3ebb0036183573e358534e2565ca0924e0a8a040f2b246749a792
+144	39449	121	sparse:131072:1026	zstd -q -7 -c <file>	131072	4ff8f8b0de651f10f0bf9c6f9b74d4822feefda91472ab528ea60719dc535911
+145	39570	120	sparse:131073:1027	zstd -q -19 -c < <file>	131073	5a594ecc3263d3dc0e7604d3fd9c67015db41f4540bd74d2ff5d44eb238590a5
+146	39690	332	sparse:262145:1028	zstd -q --fast=3 --no-check -c < <file>	262145	dd72a0e03ac842ea3a4854f14fd3ea865e25a3936509df0d416c1324d68bbf0a

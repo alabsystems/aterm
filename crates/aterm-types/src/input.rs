@@ -2,16 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! High-level input event types for editor and plugin systems.
-//!
-//! These types represent user input events (key presses with modifiers) at a
-//! higher abstraction level than the terminal keyboard encoding types in
-//! [`super::keyboard`]. The `keyboard` module handles terminal protocol
-//! encoding (CSI u, xterm, legacy); this module provides the application-level
-//! event model consumed by the editor and plugin systems.
-//!
-//! Use `input` for editor/plugin/application logic. Use `keyboard` for terminal
-//! protocol encoding. Use the [`TryFrom`] bridge when crossing between the two:
+//! Application-level key events (key codes with modifiers), above the terminal protocol
+//! encoding in [`super::keyboard`]. The [`TryFrom`] bridge crosses between the two:
 //!
 //! ```
 //! use aterm_types::input::KeyCode;
@@ -20,9 +12,6 @@
 //! let back: KeyCode = key.try_into().expect("Enter round-trips");
 //! assert_eq!(back, KeyCode::Enter);
 //! ```
-//!
-//! Lives here so `aterm-editor` and `aterm-core::plugins` share these types
-//! without a circular dependency.
 
 /// Key codes for key events.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,14 +66,11 @@ bitflags! {
     }
 }
 
-/// Lossless conversion from `input::KeyModifiers` to `keyboard::Modifiers`.
-///
-/// Both types share identical bit layout (Kitty protocol ordering:
-/// Shift=1, Alt=2, Ctrl=4, Super=8), making this a zero-cost conversion.
+/// Lossless conversion to `keyboard::Modifiers`: both use the Kitty bit layout
+/// (Shift=1, Alt=2, Ctrl=4, Super=8).
 impl From<KeyModifiers> for crate::keyboard::Modifiers {
     fn from(m: KeyModifiers) -> Self {
-        // SAFETY invariant: bit layouts are identical, enforced by
-        // `bit_layout_matches_keyboard_modifiers` below.
+        // Identical bit layouts, pinned by `bit_layout_matches_keyboard_modifiers`.
         crate::keyboard::Modifiers::from_bits_truncate(m.bits())
     }
 }
@@ -125,10 +111,8 @@ impl std::fmt::Display for KeyConversionError {
 
 impl std::error::Error for KeyConversionError {}
 
-/// Bridge from application-level `KeyCode` to protocol-level `keyboard::Key`.
-///
-/// All `KeyCode` variants map except `F(0)` and `F(n > 24)`.
-/// `KeyCode::Char(' ')` stays `Key::Character(' ')` (not `NamedKey::Space`).
+/// Bridge from `KeyCode` to protocol-level `keyboard::Key`: every variant maps except `F(0)`
+/// and `F(n > 24)`, and `Char(' ')` stays `Key::Character(' ')` (not `NamedKey::Space`).
 impl TryFrom<KeyCode> for crate::keyboard::Key {
     type Error = KeyConversionError;
 
@@ -151,7 +135,6 @@ impl TryFrom<KeyCode> for crate::keyboard::Key {
             KeyCode::Insert => Key::Named(NamedKey::Insert),
             KeyCode::Delete => Key::Named(NamedKey::Delete),
             KeyCode::F(n @ 1..=24) => {
-                // Map F1..F24 to the corresponding NamedKey variant.
                 const FKEYS: [NamedKey; 24] = [
                     NamedKey::F1,
                     NamedKey::F2,
@@ -178,9 +161,8 @@ impl TryFrom<KeyCode> for crate::keyboard::Key {
                     NamedKey::F23,
                     NamedKey::F24,
                 ];
-                // The `1..=24` pattern bounds `n - 1` to 0..=23, always a valid
-                // index into the 24-entry table; the total `get` proves that to
-                // the Trust gate. The `None` arm is unreachable.
+                // `1..=24` bounds the index to 0..=23; the total `get` proves it to the Trust
+                // gate, so the `None` arm is unreachable.
                 match FKEYS.get(usize::from(n - 1)) {
                     Some(&named) => Key::Named(named),
                     None => return Err(KeyConversionError::FunctionKeyOutOfRange(n)),
@@ -191,10 +173,8 @@ impl TryFrom<KeyCode> for crate::keyboard::Key {
     }
 }
 
-/// Bridge from protocol-level `keyboard::Key` to application-level `KeyCode`.
-///
-/// `Key::Named(NamedKey::Space)` maps to `KeyCode::Char(' ')`.
-/// Numpad keys return `KeyConversionError::ProtocolOnlyKey`.
+/// Bridge from protocol-level `keyboard::Key` to `KeyCode`: `NamedKey::Space` becomes
+/// `Char(' ')`; numpad and other protocol-only keys are `ProtocolOnlyKey`.
 impl TryFrom<crate::keyboard::Key> for KeyCode {
     type Error = KeyConversionError;
 
@@ -272,14 +252,10 @@ mod tests {
         assert_eq!(input_mods, back);
     }
 
-    // ========================================================================
-    // Key bridge: TryFrom roundtrip tests (#5681)
-    // ========================================================================
-
     #[test]
     fn key_bridge_space_roundtrip() {
         use crate::keyboard::Key;
-        // KeyCode::Char(' ') -> Key::Character(' '), NOT NamedKey::Space
+        // KeyCode::Char(' ') -> Key::Character(' '), not NamedKey::Space
         let key: Key = KeyCode::Char(' ').try_into().unwrap();
         assert_eq!(key, Key::Character(' '));
         let back: KeyCode = key.try_into().unwrap();

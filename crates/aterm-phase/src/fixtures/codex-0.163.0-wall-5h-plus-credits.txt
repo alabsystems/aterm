@@ -1,0 +1,51 @@
+# codex-cli 0.163.0 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (144x50, aterm 0.105.0) running the real Codex, launched by path with a scratch `CODEX_HOME`, the lab provider `base_url=http://127.0.0.1:<port>/v1`, `wire_api = "responses"`, a fake `env_key` (a local stub of the Responses API, crates/aterm-lab) · the stub's five_hour limit, a 429 {error:{type:usage_limit_reached, resets_at, limit_window_minutes:300, plan_type plus}} with x-codex-credits-has-credits true, -unlimited false, -balance 12.5, after one ok turn; the screen 4 s after the turn, before any key
+
+  >_ OpenAI Codex (v0.163.0)
+     /private/tmp/at.7WA6/proj
+
+
+› hi
+
+
+• Hi! I am the local lab stub, not a model. (reply 1)
+
+  Worked for <1s • 11:14 AM
+
+
+› carry on with the task
+
+
+■ You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/settings/usage to purchase more
+credits or try again at 11:24 AM.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+› Ask Codex to do anything
+
+  GPT-6.1-Sol default · /private/tmp/at.7WA6/proj · lab stub
+  ? for shortcuts

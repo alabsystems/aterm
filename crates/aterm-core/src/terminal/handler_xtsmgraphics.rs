@@ -2,47 +2,26 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! XTSMGRAPHICS (`CSI ? Pi ; Pa ; Pv S`): the graphics-capability query
-//! image tools use to discover Sixel/ReGIS limits before rendering.
+//! XTSMGRAPHICS (`CSI ? Pi ; Pa ; Pv S`), the graphics-capability query image
+//! tools use to discover sixel limits
+//! (<https://invisible-island.net/xterm/ctlseqs/ctlseqs.txt>).
 //!
-//! Reference: xterm control sequences (Thomas E. Dickey)
-//! <https://invisible-island.net/xterm/ctlseqs/ctlseqs.txt>
+//! - `Pi` item: 1 color registers, 2 sixel geometry, 3 ReGIS geometry
+//!   (unsupported).
+//! - `Pa` action: 1 read, 4 read the maximum; 2 reset and 3 set fail
+//!   (read-only).
 //!
-//! ## Parameters
-//!
-//! - `Pi` - Item number:
-//!   - 1: Color registers (palette size)
-//!   - 2: Sixel graphics geometry (width x height in pixels)
-//!   - 3: ReGIS graphics geometry (not supported)
-//!
-//! - `Pa` - Action:
-//!   - 1: Read current value
-//!   - 2: Reset to default (not supported, read-only)
-//!   - 3: Set to value (not supported, read-only)
-//!   - 4: Read maximum value
-//!
-//! - `Pv` - Value (for Pa=3 set operations, ignored in read-only mode)
-//!
-//! ## Response
-//!
-//! Response format: `CSI ? Pi ; Ps ; Pv S` where:
-//! - `Ps` - Status:
-//!   - 0: Success
-//!   - 1: Error in Pi
-//!   - 2: Error in Pa
-//!   - 3: Failure (unsupported action or item)
-//!
-//! - `Pv` - Result value(s):
-//!   - For Pi=1: Single value (color count)
-//!   - For Pi=2: Two values (width ; height)
+//! The reply is `CSI ? Pi ; Ps ; Pv S`: `Ps` 0 success, 1 bad Pi, 2 bad Pa, 3
+//! failure; `Pv` the count (Pi 1) or `width ; height` (Pi 2).
 
 use super::handler::TerminalHandler;
 
-/// Default max color registers when sixel is disabled.
+/// aterm-sixel's color-register count for a build without `sixel`; must equal
+/// it, so both builds report the same limits.
 #[cfg(not(feature = "sixel"))]
 const MAX_COLOR_REGISTERS: usize = 1024;
-/// Default max sixel dimension when sixel is disabled. Must match the value
-/// in aterm-sixel (4096) to avoid reporting inconsistent limits.
+/// aterm-sixel's raster dimension limit for a build without `sixel`; must
+/// equal it, so both builds report the same limits.
 #[cfg(not(feature = "sixel"))]
 const SIXEL_MAX_DIMENSION: usize = 4096;
 #[cfg(feature = "sixel")]
@@ -132,13 +111,11 @@ impl TerminalHandler<'_> {
             }
 
             (XtsmgraphicsItem::SixelGeometry, XtsmgraphicsAction::Read) => {
-                // Per xterm, Pa=1 (Read) returns the current text area in
-                // pixels, not the maximum; lsix and img2sixel size their output
-                // from it. That is the fact CSI 14 t reports, so it rides the
-                // same window-ops capability (policy engine, then
-                // `allow_window_ops`) and the same answer. Without the
-                // capability, or before a host has reported a cell box, it
-                // answers the maximum dimension.
+                // Read answers the current text area in pixels, not the maximum
+                // (xterm; lsix and img2sixel size output from it). That is CSI
+                // 14 t's fact, so it takes the same window-ops capability and
+                // answer; without one, or before a host reports a cell box, it
+                // answers the maximum.
                 let max_dim = u16::try_from(SIXEL_MAX_DIMENSION).unwrap_or(u16::MAX);
                 let window_cap = super::window_auth::WindowMintAuthority::new()
                     .try_mint_with_engine(

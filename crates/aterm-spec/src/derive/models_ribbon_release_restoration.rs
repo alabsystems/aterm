@@ -5,21 +5,18 @@
 
 use super::Model;
 
-/// One two-cell ribbon was active before a content observation released it.
-/// `clock=1` names its exact saved pre-release clock tuple; `clock=2` is the
-/// abandoned/retracting state. These are identities, not elapsed durations.
-/// A full observation includes every original (row, column, birth, glyph,
-/// width) unit and at least one returned released nonblank unit. Partial,
-/// missing, changed and unsampled observations cannot supply that authority.
+/// One two-cell ribbon was active before a content observation released it. `clock=1` names
+/// its exact saved pre-release clock tuple, `clock=2` the abandoned/retracting state: identities,
+/// not durations. A full observation includes every original (row, column, birth, glyph, width)
+/// unit and at least one returned released nonblank unit; partial, missing, changed and
+/// unsampled observations cannot restore.
 ///
-/// Explicit abandonment, replacement, or retirement revokes restoration
-/// custody. Failed observations alone retain it. A successful restoration
-/// consumes custody once and restores the old clock without minting cells or
-/// births. Ordinary later typed input and animation ticks are outside this
-/// bounded transaction. Tier-1 drives the real witness and ribbon, projecting
-/// abandonment, exact clock equality, cell count and original birth identity.
-/// `Buggy=1` omits the full-observation requirement, allowing partial content
-/// to revive an abandoned ribbon.
+/// Abandonment, replacement or retirement revokes restoration custody; failed observations
+/// alone keep it. A successful restoration consumes custody once and restores the old clock
+/// without minting cells or births. Later typed input and animation ticks are outside this
+/// transaction. Tier-1 drives the real witness and ribbon, projecting abandonment, exact clock
+/// equality, cell count and original birth identity. `Buggy=1` drops the full-observation
+/// requirement, so partial content revives an abandoned ribbon.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn ribbon_release_restoration_model() -> Model {
@@ -67,14 +64,14 @@ pub fn ribbon_release_restoration_model() -> Model {
             invariant RestorationNeedsEveryOriginal:
                 if phase == 2 { sample == 2 && originals == 1 && revoked == 0 }
                 else { originals <= 1 };
-            invariant RestorationConservesBirthsAndCells:
+            uncaught RestorationConservesBirthsAndCells:
                 if phase == 2 { cells == 2 && births == 2 } else { cells <= 2 };
-            invariant RestorationUsesSavedClock:
+            uncaught RestorationUsesSavedClock:
                 if phase == 2 { clock == 1 && custody == 0 }
                 else { if phase == 1 { clock == 2 } else { clock <= 2 } };
-            invariant RevokedCustodyCannotReturn:
+            uncaught RevokedCustodyCannotReturn:
                 if revoked == 1 { custody == 0 && phase <= 1 } else { custody <= 1 };
-            invariant StateBounded:
+            bound StateBounded:
                 phase <= 2 && custody <= 1 && revoked <= 1 && originals <= 1
                     && cells > 0 && cells <= 2 && births > 0 && births <= 3
                     && clock > 0 && clock <= 2 && sample <= 4;

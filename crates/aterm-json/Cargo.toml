@@ -14,10 +14,15 @@ description = "First-party JSON for aterm: a serde Deserializer/Serializer and a
 # `aterm-toml` records. The typed call sites in this tree are `from_str::<T>`
 # against `#[derive(Deserialize)]` models, so the replacement has to BE a
 # `serde::Deserializer`; a parser that returned a value tree would mean
-# rewriting every model by hand. serde_derive is a proc macro and contributes
-# zero machine code to the shipped binary, and `serde` itself is already in the
-# graph for a dozen other reasons. Retiring serde is explicitly NOT in scope.
+# rewriting every model by hand. `serde` is the workspace row: first-party
+# crates/aterm-serde and its derive since docs/AUDIT-third-party-2026-10-15.md
+# SP.6, so this crate's whole graph is aterm's own.
 serde = { workspace = true }
+
+[dev-dependencies]
+# The tests and doctests derive their models, as a dependent would. The normal
+# row stays derive-free so the lib's closure holds no proc macro (Trust PM-1).
+serde = { workspace = true, features = ["derive"] }
 
 [lints]
 workspace = true

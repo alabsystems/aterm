@@ -12,7 +12,7 @@
 //! cursor effects' typing momentum — the only presence signal the harness had
 //! (`await momentum`) — never latched for it, and it was kept per WINDOW, not
 //! per session. The OS-wide HID idle (`user_input_recent`, the updater's; its
-//! APIs fenced by `grep_guard` B9) answers "is anyone at this Mac", not "did
+//! APIs fenced by the aterm-census guard `input-probe`) answers "is anyone at this Mac", not "did
 //! anyone key THIS session". So the server stamps, per session, the instant a
 //! [`crate::input::Source::Human`] gesture addressed to it passed the App
 //! input seam ([`crate::App::input_to_session`]) — before any filter that

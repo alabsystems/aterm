@@ -1,0 +1,75 @@
+aterm-trust plan 1
+driver /x/Library/Application Support/aterm/pkg/rustup/trust/bin/targo
+driver-id targo 1.99.0-dev (321aaeda7 2026-09-17) (targo 0.1.0)
+only 
+per-commit 0
+scope-file /x/aterm-run/tools/trust-gate-scope.tsv
+logdir /x/aterm-run/target-trust-seal/logs
+ratchet /x/aterm-run/tools/trust-gate-ratchet.tsv
+memory-file /x/aterm-run/tools/trust-gate-memory.tsv
+host-obs /x/scratch/gate/seal-host-memory.tsv
+try-refused 0
+remeasure 0
+crate-budget 21600
+host-mem 25769803776
+host-mem-os -
+now 2026-10-02T01:26:32Z
+crate aterm-bits	aterm-bits@0.101.0	gate
+crate aterm-census	aterm-census@0.101.0	gate
+crate aterm-cli	aterm-cli@0.101.0	gate
+crate aterm-core	aterm-core@0.101.0	gate
+crate aterm-grid	aterm-grid@0.101.0	gate
+crate aterm-release	aterm-release@0.101.0	no-lib
+crate aterm-render	aterm-render@0.101.0	gate
+crate aterm-scrollback	aterm-scrollback@0.101.0	gate
+crate astream-cap	astream-cap@0.1.0	gate
+crate smol_str	smol_str@0.2.2	gate
+crate winit	winit@0.30.13	queued:queued
+memory aterm-bits	16.0	-	-	-	-	-
+memory aterm-census	16.0	8	4.0	1.3	=	2026-09-29: the 8 GiB A18 Pro Mac with RAM faked to 32 GiB (DYLD interposer), seal 321aaeda7, tree 32fbdd443, nothing ran out
+memory aterm-cli	16.0	24	4.0	3.0	=	2026-10-01: m101 (24 GiB) with RAM faked to 32 GiB (DYLD interposer), seal 321aaeda7, tree d060d2a40, nothing ran out: 92 of 558 proved against a floor of 75; the peak is the whole-crate R1 pre-pass's, before any body. At m101's real 3.0 GiB ceiling the same tree printed peak 3.0, ceiling 3.0, and proved 0 of 443 (2.4 GiB with room on 2026-09-28's trees)
+memory aterm-core	16.0	-	-	-	-	-
+memory aterm-grid	16.0	-	-	-	-	-
+memory aterm-render	16.0	-	-	-	-	-
+memory aterm-scrollback	16.0	-	-	-	-	-
+memory astream-cap	16.0	24	3.0	0.3	=	2026-09-29: m101 (24 GiB), its real ceiling
+memory smol_str	16.0	-	-	-	-	-
+refused aterm-cli	-	-	-	-
+trustd /private/tmp/trustd-runtime-locks-501/trust-memory-jobserver.sock
+file 
+store /x/aterm/.git/aterm-verify/receipts
+commit 36b2c3df36eac4971b8189da9967ab7cc442bbf2
+tree 1d62da03bc107f280acbe4cd7965d3277924449b
+prover f6de73348782ac8a01c3d4fa4825b14955a576583098e9c8a4b37b92c7f1c682
+prover-bin /x/Library/Application Support/aterm/pkg/rustup/trust/bin
+lane-pin SOURCE_DATE_EPOCH=0
+lane-pin ATERM_BUILD_GIT_COMMIT=trust-lane
+lane-pin ATERM_BUILD_GIT_COMMIT_FULL=trust-lane
+lane-pin ATERM_BUILD_DEV_COMMITS=0
+lane-pin TRUST_NO_MIGRATE_WARN=1
+lane-pin CARGO_INCREMENTAL=0
+lane-passed PATH
+lane-passed HOME
+lane-passed USER
+lane-passed LOGNAME
+lane-passed TMPDIR
+lane-passed LANG
+lane-passed CARGO_BUILD_JOBS
+lane-passed RUSTDOC
+lane-passed CARGO_TARGET_DIR
+cargo-home /x/.cargo
+target-root /x/aterm-run/target-trust-seal
+metadata /x/aterm-run/target-trust-seal/logs/metadata-targo.json
+argv aterm-bits	--profile trust-lane --config profile.trust-lane.inherits="dev" --config profile.trust-lane.opt-level=0 --config profile.trust-lane.package."adler2".opt-level=0 --config profile.trust-lane.package."aterm-census".opt-level=0 --config profile.trust-lane.package."aterm-png".opt-level=0 --config profile.trust-lane.package."aterm-regex".opt-level=0 --config profile.trust-lane.package."aterm-spec".opt-level=0 --config profile.trust-lane.package."base64".opt-level=0 --config profile.trust-lane.package."crc32fast".opt-level=0 --config profile.trust-lane.package."fdeflate".opt-level=0 --config profile.trust-lane.package."flate2".opt-level=0 --config profile.trust-lane.package."memchr".opt-level=0 --config profile.trust-lane.package."miniz_oxide".opt-level=0 --config profile.trust-lane.package."png".opt-level=0 --config profile.trust-lane.package."regex".opt-level=0 --config profile.trust-lane.package."regex-automata".opt-level=0 --config profile.trust-lane.package."regex-syntax".opt-level=0 --config profile.trust-lane.package."ttf-parser".opt-level=0 -p aterm-bits@0.101.0 --lib
+argv aterm-census	--profile trust-lane --config profile.trust-lane.inherits="dev" --config profile.trust-lane.opt-level=0 --config profile.trust-lane.package."adler2".opt-level=0 --config profile.trust-lane.package."aterm-census".opt-level=0 --config profile.trust-lane.package."aterm-png".opt-level=0 --config profile.trust-lane.package."aterm-regex".opt-level=0 --config profile.trust-lane.package."aterm-spec".opt-level=0 --config profile.trust-lane.package."base64".opt-level=0 --config profile.trust-lane.package."crc32fast".opt-level=0 --config profile.trust-lane.package."fdeflate".opt-level=0 --config profile.trust-lane.package."flate2".opt-level=0 --config profile.trust-lane.package."memchr".opt-level=0 --config profile.trust-lane.package."miniz_oxide".opt-level=0 --config profile.trust-lane.package."png".opt-level=0 --config profile.trust-lane.package."regex".opt-level=0 --config profile.trust-lane.package."regex-automata".opt-level=0 --config profile.trust-lane.package."regex-syntax".opt-level=0 --config profile.trust-lane.package."ttf-parser".opt-level=0 -p aterm-census@0.101.0 --lib
+argv aterm-core	--profile trust-lane --config profile.trust-lane.inherits="dev" --config profile.trust-lane.opt-level=0 --config profile.trust-lane.package."adler2".opt-level=0 --config profile.trust-lane.package."aterm-census".opt-level=0 --config profile.trust-lane.package."aterm-png".opt-level=0 --config profile.trust-lane.package."aterm-regex".opt-level=0 --config profile.trust-lane.package."aterm-spec".opt-level=0 --config profile.trust-lane.package."base64".opt-level=0 --config profile.trust-lane.package."crc32fast".opt-level=0 --config profile.trust-lane.package."fdeflate".opt-level=0 --config profile.trust-lane.package."flate2".opt-level=0 --config profile.trust-lane.package."memchr".opt-level=0 --config profile.trust-lane.package."miniz_oxide".opt-level=0 --config profile.trust-lane.package."png".opt-level=0 --config profile.trust-lane.package."regex".opt-level=0 --config profile.trust-lane.package."regex-automata".opt-level=0 --config profile.trust-lane.package."regex-syntax".opt-level=0 --config profile.trust-lane.package."ttf-parser".opt-level=0 -p aterm-core@0.101.0 --lib
+argv aterm-grid	--profile trust-lane --config profile.trust-lane.inherits="dev" --config profile.trust-lane.opt-level=0 --config profile.trust-lane.package."adler2".opt-level=0 --config profile.trust-lane.package."aterm-census".opt-level=0 --config profile.trust-lane.package."aterm-png".opt-level=0 --config profile.trust-lane.package."aterm-regex".opt-level=0 --config profile.trust-lane.package."aterm-spec".opt-level=0 --config profile.trust-lane.package."base64".opt-level=0 --config profile.trust-lane.package."crc32fast".opt-level=0 --config profile.trust-lane.package."fdeflate".opt-level=0 --config profile.trust-lane.package."flate2".opt-level=0 --config profile.trust-lane.package."memchr".opt-level=0 --config profile.trust-lane.package."miniz_oxide".opt-level=0 --config profile.trust-lane.package."png".opt-level=0 --config profile.trust-lane.package."regex".opt-level=0 --config profile.trust-lane.package."regex-automata".opt-level=0 --config profile.trust-lane.package."regex-syntax".opt-level=0 --config profile.trust-lane.package."ttf-parser".opt-level=0 -p aterm-grid@0.101.0 --lib
+argv aterm-render	--profile trust-lane --config profile.trust-lane.inherits="dev" --config profile.trust-lane.opt-level=0 --config profile.trust-lane.package."adler2".opt-level=0 --config profile.trust-lane.package."aterm-census".opt-level=0 --config profile.trust-lane.package."aterm-png".opt-level=0 --config profile.trust-lane.package."aterm-regex".opt-level=0 --config profile.trust-lane.package."aterm-spec".opt-level=0 --config profile.trust-lane.package."base64".opt-level=0 --config profile.trust-lane.package."crc32fast".opt-level=0 --config profile.trust-lane.package."fdeflate".opt-level=0 --config profile.trust-lane.package."flate2".opt-level=0 --config profile.trust-lane.package."memchr".opt-level=0 --config profile.trust-lane.package."miniz_oxide".opt-level=0 --config profile.trust-lane.package."png".opt-level=0 --config profile.trust-lane.package."regex".opt-level=0 --config profile.trust-lane.package."regex-automata".opt-level=0 --config profile.trust-lane.package."regex-syntax".opt-level=0 --config profile.trust-lane.package."ttf-parser".opt-level=0 -p aterm-render@0.101.0 --lib
+argv aterm-scrollback	--profile trust-lane --config profile.trust-lane.inherits="dev" --config profile.trust-lane.opt-level=0 --config profile.trust-lane.package."adler2".opt-level=0 --config profile.trust-lane.package."aterm-census".opt-level=0 --config profile.trust-lane.package."aterm-png".opt-level=0 --config profile.trust-lane.package."aterm-regex".opt-level=0 --config profile.trust-lane.package."aterm-spec".opt-level=0 --config profile.trust-lane.package."base64".opt-level=0 --config profile.trust-lane.package."crc32fast".opt-level=0 --config profile.trust-lane.package."fdeflate".opt-level=0 --config profile.trust-lane.package."flate2".opt-level=0 --config profile.trust-lane.package."memchr".opt-level=0 --config profile.trust-lane.package."miniz_oxide".opt-level=0 --config profile.trust-lane.package."png".opt-level=0 --config profile.trust-lane.package."regex".opt-level=0 --config profile.trust-lane.package."regex-automata".opt-level=0 --config profile.trust-lane.package."regex-syntax".opt-level=0 --config profile.trust-lane.package."ttf-parser".opt-level=0 -p aterm-scrollback@0.101.0 --lib
+argv astream-cap	--profile trust-lane --config profile.trust-lane.inherits="dev" --config profile.trust-lane.opt-level=0 --manifest-path vendor/astream/crates/astream-cap/Cargo.toml -p astream-cap@0.1.0 --no-default-features --lib
+argv smol_str	--profile trust-lane --config profile.trust-lane.inherits="dev" --config profile.trust-lane.opt-level=0 --manifest-path vendor/smol_str/Cargo.toml -p smol_str@0.2.2 --no-default-features --features default,std --lib
+since 1790904392
+host 14 cores, 24 GiB
+load 3.32 -> 1.41
+jobs 1
+date 2026-10-02T06:39:12Z

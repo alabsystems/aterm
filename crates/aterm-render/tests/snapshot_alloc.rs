@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! What the CPU snapshot path allocates, read off a counting allocator.
+//! What the CPU snapshot and image paths allocate, read off a counting
+//! allocator.
 //!
-//! An owned CPU capture transfers the completed framebuffer out of its temporary
-//! window cache. Count full-frame allocations on the shipping snapshot path;
-//! a byte-parity check alone would let its old extra clone come back unnoticed.
-//! And an inline image is decoded within its raster budget however far the
-//! font is zoomed past the size it was placed at — the raster is the only
-//! buffer its size the decode allocates.
+//! An owned CPU capture moves the completed framebuffer out of its temporary
+//! window cache: one full-frame allocation, which byte parity alone cannot
+//! tell from a second clone. A zoomed inline image decodes within its raster
+//! budget, and the window's decode cache keeps each on-screen placement
+//! decoded once.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Mutex;
@@ -163,8 +163,7 @@ fn owned_snapshots_transfer_pixels_without_a_full_frame_clone() {
         let dims = (view.width(), view.height());
         let expected = view.pixels().to_vec();
         let bytes = expected.len() * std::mem::size_of::<u32>();
-        // The plain copy is a negative control for the counter, and is the
-        // exact extra allocation the old snapshot path made after rasterizing.
+        // A plain copy: the counter's negative control.
         let (copy, copies) = count_frames(bytes, || expected.clone());
         assert_eq!(copies, 1, "the counter must observe a full-frame clone");
         assert_eq!(copy, expected);
@@ -261,12 +260,11 @@ fn a_zoomed_placement_decodes_within_the_raster_budget() {
     );
 }
 
-/// The same zoom for a picture the program sized in CELLS — Kitty `c=`/`r=`,
-/// iTerm2 `imgcat`'s width/height: FIT, the source upscaled into the raster.
-/// The resample used to build a float plane of the whole fitted box beside
-/// the raster (16 bytes a pixel: 263 MiB for this one, the largest single
-/// allocation of the frame); it now writes the raster row by row, so the
-/// raster is the largest buffer and what the frame holds stays within it.
+/// The same zoom for a picture the program sized in cells (Kitty `c=`/`r=`,
+/// iTerm2 `imgcat`'s width/height): fit, the source upscaled into the raster.
+/// The resample writes the raster row by row, never a float plane of the
+/// fitted box (16 bytes a pixel, 263 MiB here), so the raster is the largest
+/// buffer and what the frame holds stays within it.
 #[test]
 fn a_zoomed_fit_placement_decodes_within_the_raster_budget() {
     let _counters = COUNTERS
@@ -304,10 +302,9 @@ fn a_zoomed_fit_placement_decodes_within_the_raster_budget() {
 }
 
 /// Two placements whose decodes together pass the decode cache's byte budget,
-/// both on screen — two window-wide pictures scrolled to their seam — are each
-/// decoded ONCE: a repaint finds both in the window's cache. A strict LRU under
-/// the budget evicted each just before the next repaint asked for it, so every
-/// frame decoded both again.
+/// both on screen (two window-wide pictures scrolled to their seam), are each
+/// decoded once: a repaint finds both in the window's cache. A strict LRU under
+/// the budget would evict each just before the next repaint asks for it.
 #[test]
 fn two_placements_past_the_byte_budget_are_decoded_once() {
     let _counters = COUNTERS
@@ -372,15 +369,14 @@ fn two_placements_past_the_byte_budget_are_decoded_once() {
     }
 }
 
-/// Pictures LAYERED on the same cells — three Kitty placements at z = 0, 1, 2,
-/// each over 64 x 40 cells — zoomed to the 200 px ceiling, where each one's
-/// full raster is 127 MiB and the three pass the frame's working set
-/// together. The CPU's image passes walk each row cell by cell with the cell's
-/// layers together, so a cache that let one of them go to admit another missed
-/// on every covered cell: 45 decodes a repaint, six seconds. The frame's
-/// rasters are sized to fit its working set instead: each picture is decoded
-/// once, the frame holds no more than the working set, and every repaint after
-/// the first decodes nothing.
+/// Pictures layered on the same cells (three Kitty placements at z = 0, 1, 2
+/// over 64 x 40 cells) at the 200 px ceiling, where each full raster is
+/// 127 MiB and the three together pass the frame's working set. The CPU image
+/// passes walk each row cell by cell with the cell's layers together, so a
+/// cache that evicted one layer to admit another would miss on every covered
+/// cell; the frame's rasters are sized to fit the working set instead. Each
+/// picture decodes once, the frame holds no more than the working set, and
+/// every later repaint decodes nothing.
 #[test]
 fn layered_placements_past_the_working_set_are_decoded_once() {
     let _counters = COUNTERS
@@ -445,11 +441,11 @@ fn layered_placements_past_the_working_set_are_decoded_once() {
     }
 }
 
-/// More distinct placements on screen than the decode cache's 64-entry cap —
-/// a contact sheet of 9 x 9 Kitty thumbnails — are each decoded ONCE: a
-/// repaint finds all 81 in the window's cache. A strict LRU under the entry
-/// cap evicted each just before the next repaint asked for it, so every frame
-/// decoded all 81 again.
+/// More distinct placements on screen than the decode cache's 64-entry cap (a
+/// 9 x 9 contact sheet of Kitty thumbnails) are each decoded once: a repaint
+/// finds all 81 in the window's cache. The frame in progress keeps all of its
+/// own entries; a strict LRU under the cap would evict each just before the
+/// next repaint asks for it.
 #[test]
 fn a_contact_sheet_past_the_entry_cap_is_decoded_once() {
     let _counters = COUNTERS

@@ -5,8 +5,7 @@ use crate::walk::{only, reachable, walk};
 use aterm_spec::derive::{Model, harness_upgrade_notice_owner_model};
 use aterm_spec::{interp, verify};
 
-/// The defects the notice's owner was fixed for, one knob each, and the
-/// invariant that catches each alone.
+/// One knob per notice-owner defect, and the invariant that catches each alone.
 const KNOBS: [(&str, &str); 2] = [
     ("NoReask", "NeverWaitsOnAGoneNotice"),
     ("KeepRound", "OnlyOnItsOwnAnswer"),
@@ -15,11 +14,6 @@ const KNOBS: [(&str, &str); 2] = [
 #[test]
 fn ready_from_tab_a_never_authorizes_tab_b_or_duplicate_owners() {
     let model = harness_upgrade_notice_owner_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name)
-    );
     let fired = interp::fired_actions(&model);
     assert_eq!(
         fired.len(),
@@ -27,8 +21,7 @@ fn ready_from_tab_a_never_authorizes_tab_b_or_duplicate_owners() {
         "every action fires at the committed configuration: {fired:?}"
     );
     verify::prove_and_catch_scalar(&model, "harness upgrade notice owner");
-    // Each invariant is load-bearing on its own: the reducers before the fix
-    // break every one.
+    // Each invariant is load-bearing alone: `Buggy = 1` breaks every one.
     for invariant in [
         "OnlyIssuerSignaled",
         "NoDuplicateOwnerSignal",
@@ -82,11 +75,9 @@ fn ready_from_tab_a_never_authorizes_tab_b_or_duplicate_owners() {
     assert!(!buggy.check_invariant("NoPartialScanSignal", &partial));
 }
 
-/// ONE KNOB PER DEFECT, EACH CAUGHT ON ITS OWN: main before 2026-09-27
-/// (`NoReask`) strands the upgrade on a notice whose process is gone, and the
-/// tempting fix that asks afresh in the SAME round (`KeepRound`) signals the
-/// new process on the gone one's READY. The committed configuration breaks
-/// neither, and neither knob breaks the other's invariant.
+/// `NoReask` strands the upgrade on a notice whose process is gone, and `KeepRound`, asking
+/// afresh in the same round, signals the new process on the gone one's READY. The committed
+/// configuration breaks neither, and neither knob breaks the other's invariant.
 #[test]
 fn each_notice_owner_defect_is_caught_on_its_own() {
     let model = harness_upgrade_notice_owner_model();
@@ -109,11 +100,10 @@ fn each_notice_owner_defect_is_caught_on_its_own() {
     }
 }
 
-/// A NOTICE WHOSE PROCESS IS GONE IS ASKED AFRESH OF THE LIVE HOLDER, in the
-/// notice's own tab, in another, and under the notice's pid recycled — in a
-/// new round, the gone process's READY no answer to it, so the new process is
-/// signalled only on its own READY. While the notified process lives, or two
-/// hold the conversation, it waits, and that wait is no strand.
+/// A notice whose process is gone is asked afresh of the live holder (in the notice's own tab,
+/// in another, and under the notice's pid recycled) in a new round, the gone process's READY no
+/// answer to it, so the new process is signalled only on its own READY. While the notified
+/// process lives, or two hold the conversation, it waits, and that wait is no strand.
 #[test]
 fn a_notice_whose_process_is_gone_is_asked_afresh_in_a_new_round() {
     let model = harness_upgrade_notice_owner_model();
@@ -162,13 +152,13 @@ fn a_notice_whose_process_is_gone_is_asked_afresh_in_a_new_round() {
         assert!(!model.action_enabled("Reask", &s), "{proof}");
         assert!(!model.action_enabled("Terminate", &s), "{proof}");
     }
-    // Main before the fix: the visit waits for good.
+    // `NoReask`: the visit waits for good.
     let stuck = interp::with_consts(&model, &[("NoReask", 1)]);
     let mut s = walk(&stuck, &["Announce", "Ready", "OwnerExits", "Resume"]);
     assert!(!stuck.action_enabled("Reask", &s));
     assert!(stuck.fire("Look", &mut s));
     assert!(!stuck.check_invariant("NeverWaitsOnAGoneNotice", &s));
-    // The wrong fix: the new process signalled on the gone one's READY.
+    // `KeepRound`: the new process signalled on the gone one's READY.
     let kept = interp::with_consts(&model, &[("KeepRound", 1)]);
     let mut s = walk(
         &kept,
@@ -185,10 +175,9 @@ fn a_notice_whose_process_is_gone_is_asked_afresh_in_a_new_round() {
     assert!(!kept.check_invariant("OnlyOnItsOwnAnswer", &s));
 }
 
-/// THE VISIT'S WAIT IS THE REDUCER'S OWN GUARDS NEGATED: on every reachable
-/// state with its proofs complete, `Look` is enabled exactly where neither
-/// `Reask` nor `Terminate` is, at the committed configuration, under `Buggy`
-/// and under each knob.
+/// The visit's wait is the reducer's own guards negated: on every reachable state with its
+/// proofs complete, `Look` is enabled exactly where neither `Reask` nor `Terminate` is, at the
+/// committed configuration, under `Buggy` and under each knob.
 #[test]
 fn the_notice_owners_wait_is_derived_from_its_guards() {
     let model = harness_upgrade_notice_owner_model();

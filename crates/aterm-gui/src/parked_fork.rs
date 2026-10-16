@@ -3,19 +3,16 @@
 
 //! Test-only: makes the fork→exec window deterministic.
 //!
-//! A `flock` belongs to the open file description, and a child forked by any
-//! thread holds a copy of every descriptor (close-on-exec ones included) until
-//! it execs. A lock released only by closing its `File` therefore stays held in
-//! that copy for the child's fork→exec window, and a single `try_lock` is
-//! refused for a lock nobody holds. `LOCK_UN`
-//! ([`crate::native_document_host::HeldAdvisoryLock`]) strips the lock from the
-//! description itself, the child's copy included.
+//! A `flock` belongs to the open file description, and a child forked by any thread holds a
+//! copy of every descriptor (close-on-exec ones included) until it execs. A lock released only
+//! by closing its `File` stays held in that copy for the child's fork→exec window, so a
+//! `try_lock` in that window is refused although nobody holds the lock. `LOCK_UN`
+//! ([`crate::native_document_host::HeldAdvisoryLock`]) strips the lock from the description
+//! itself, the child's copy included.
 //!
-//! [`ParkedChild::fork`] forks `/bin/sh` from its own thread; its pre-exec hook
-//! reports that it exists and then waits short of `execve` until
-//! [`ParkedChild::release`]. [`arm_at`] places the fork inside a held lock: the
-//! `n`-th [`fork_if_armed`] site the arming thread reaches (each sits just after
-//! a lock is taken) forks the child while that lock is held.
+//! [`ParkedChild::fork`] forks `/bin/sh` from its own thread and parks it short of `execve`
+//! until [`ParkedChild::release`]. [`arm_at`] makes the `n`-th [`fork_if_armed`] site (each
+//! sits just after a lock is taken) on the arming thread fork the child while that lock is held.
 
 use std::cell::RefCell;
 use std::io::{PipeWriter, Read as _, Write as _};
@@ -47,11 +44,10 @@ impl ParkedChild {
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
-            // SAFETY: the hook runs in the forked child before exec and calls
-            // only async-signal-safe functions (close, write, read, and errno)
-            // on descriptors this closure keeps open across the spawn. It drops
-            // its own copy of `go`'s write end first, so the parent's end
-            // closing — a panic included — lets it exec rather than wait.
+            // SAFETY: the hook runs in the forked child before exec and calls only
+            // async-signal-safe functions (close, write, read, errno) on descriptors this closure
+            // keeps open across the spawn. It closes its copy of `go`'s write end first, so the
+            // parent's end closing (a panic included) lets it exec rather than wait.
             unsafe {
                 cmd.pre_exec(move || {
                     let interrupted = || {

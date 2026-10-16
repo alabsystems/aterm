@@ -383,6 +383,37 @@ fn a_supervisor_note_puts_its_state_in_the_title_and_the_rest_below() {
     assert!(one.detail.is_empty(), "{:?}", one.detail);
 }
 
+/// AN AUTOPILOT SET FROM THE WINDOW IS A RECORD (the Autopilot design, §2):
+/// titled with the mode the session now runs under, its first line led by
+/// the tab and saying what the mode does, its second whose word it is, and
+/// keyed per session so the next replaces it. NEGATIVE CONTROL: a session no
+/// tab shows leads with nothing.
+#[test]
+fn an_autopilot_set_from_the_window_is_a_keyed_record() {
+    use crate::autopilot::AutopilotView;
+    let msg = super::autopilot_set("s-a1", "in tab 2", AutopilotView::Land, true);
+    assert_eq!(msg.title, "Autopilot set to land");
+    assert_eq!(attention(&msg), Ok(Attention::Record));
+    assert_eq!(msg.tag, tags::HARNESS);
+    assert_eq!(msg.key.as_deref(), Some("harness.autopilot.s-a1"));
+    assert_eq!(
+        msg.detail,
+        [
+            "Tab 2: the harness wraps the work up, then stops",
+            "this session's own setting"
+        ]
+    );
+    let back = super::autopilot_set("s-a1", "in its tab", AutopilotView::Cruise, false);
+    assert_eq!(back.title, "Autopilot set to cruise");
+    assert_eq!(
+        back.detail,
+        [
+            "the harness keeps the work moving",
+            "back to the default, [harness] autopilot"
+        ]
+    );
+}
+
 /// THE STALLED ROW NAMES THE PROCESSES THAT HOLD THE MOVE (2026-09-27: the
 /// agent's notice named the shells under it, and the owner's row said only
 /// `its own work runs` — the pids reached the owner in the give-up's
@@ -1595,18 +1626,19 @@ fn a_record_nothing_checks_is_said_as_aterms_own_fault() {
 
 /// A TAB NO WORKER OF ATERM'S RUNS IN, BY SOMEONE ELSE'S HAND, IS NEVER
 /// SAID AS ATERM'S OWN FAULT (the review of 2026-09-30, of C10): its agent
-/// suspended with `^Z` (not in front), or its tab under another
-/// supervisor's claim (`Row::aside`, which the owner's view sets). The
-/// record nothing has stamped for three hours is told by what holds it —
-/// "it is not in front in its tab", "another supervisor holds its tab" —
-/// and by what moves it: `fg` in the tab, that supervisor letting go.
-/// NEGATIVE CONTROL: the same record with no aside reads as aterm's own
-/// fault ("not checked for 3 h — aterm's own fault"), as it must where
-/// aterm's watch is at fault.
+/// suspended with `^Z` (not in front), its tab under another supervisor's
+/// claim, or its Autopilot turned off by the owner (the review of a295792e4)
+/// (`Row::aside`, which the owner's view sets). The record nothing has
+/// stamped for three hours is told by what holds it — "it is not in front in
+/// its tab", "another supervisor holds its tab", "its autopilot is off" —
+/// and by what moves it: `fg` in the tab, that supervisor letting go, the
+/// Autopilot on again. NEGATIVE CONTROL: the same record with no aside reads
+/// as aterm's own fault ("not checked for 3 h — aterm's own fault"), as it
+/// must where aterm's watch is at fault.
 #[test]
 fn a_tab_held_aside_is_said_by_whose_hand_holds_it() {
     use aterm_agent::harness::upgrade::Phase;
-    use aterm_agent::harness::upgrade_drive::{CLAIMED, NOT_FOREGROUND, Row};
+    use aterm_agent::harness::upgrade_drive::{AUTOPILOT_OFF, CLAIMED, NOT_FOREGROUND, Row};
     const NOW: u64 = 1_790_311_076;
     let row = |aside: &str| Row {
         tab: "s-b5cf2faabac5ce5127bd".into(),
@@ -1644,6 +1676,12 @@ fn a_tab_held_aside_is_said_by_whose_hand_holds_it() {
             "another supervisor holds its tab",
             "it moves once the supervisor holding its tab lets it go; Skip version keeps it \
              on 2.1.281",
+        ),
+        (
+            AUTOPILOT_OFF,
+            "its autopilot is off",
+            "it moves once its autopilot is cruise or land again; Skip version keeps it on \
+             2.1.281",
         ),
     ] {
         let msg = super::agent_upgrade_stalled(&row(aside), NOW, "in tab 2");
@@ -1915,9 +1953,10 @@ use super::*;
 /// THE SOCKETLESS HARNESS ROW KEEPS ITS FIX WHOLE (the audit of
 /// 2026-09-30): cause, consequence and fix were one detail line, which
 /// the line cap cut inside `--control-sock <path>` on the default macOS
-/// folder of any home name of six letters or more. The fix is a line of
-/// its own, and a person's words ([`sentence_lines`]). NEGATIVE CONTROL:
-/// the old one-line macOS sentence for the same folder is clipped.
+/// folder of a long enough home name (twelve letters, with today's clause).
+/// The fix is a line of its own, and a person's words ([`sentence_lines`]).
+/// NEGATIVE CONTROL: the old one-line macOS sentence for such a folder is
+/// clipped.
 #[test]
 fn the_socketless_harness_row_keeps_its_fix_whole_past_a_long_folder() {
     let cause = "/Users//someone/Library/Application Support/aterm can't be made private to \
@@ -1940,8 +1979,9 @@ fn the_socketless_harness_row_keeps_its_fix_whole_past_a_long_folder() {
     assert_eq!(off.detail.len(), 1, "{:?}", off.detail);
     // The macOS fix, spelled out: Windows' shorter one fits the old line.
     let macos_fix = "set XDG_RUNTIME_DIR to a folder you own, or pass --control-sock <path>";
+    let twelve = cause.replace("someone", "someone.else");
     let old = Message::new(tags::HARNESS, Severity::Warn, "t").line(format!(
-        "{cause}, so {HARNESS_BOXES_UNANSWERED} \u{2014} {macos_fix}"
+        "{twelve}, so {HARNESS_BOXES_UNANSWERED} \u{2014} {macos_fix}"
     ));
     assert!(old.detail[0].ends_with('\u{2026}'), "{:?}", old.detail);
 }
@@ -2190,6 +2230,24 @@ fn every_reporter_message() -> Vec<Message> {
     all.push(gpu_lost());
     all.extend(integration_lost_fixtures());
     all.push(integration_rekey_waits("in tab 2", "s-0123456789abcdef"));
+    for place in ["in tab 2", "in window 12, tab 10", "in its tab"] {
+        all.push(resume_ask(
+            "s-0123456789abcdef",
+            &UpgradeSpot {
+                place: place.to_string(),
+                nav: None,
+            },
+            &Exception {
+                kind: ExceptionKind::Login,
+                when: Urgency::Now,
+                why: "Its login is gone, and the roster has no other account to move it to."
+                    .to_string(),
+                action: "Run aterm harness accounts login pool-a.".to_string(),
+                clears: "the login signed in again, an account to move to, or the agent working",
+                escalated: false,
+            },
+        ));
+    }
     all.push(a11y_publisher_dead("Server GUID mismatch", true));
     all.push(a11y_publisher_dead("Server GUID mismatch", false));
     all.push(presence_not_saved(
@@ -2204,8 +2262,23 @@ fn every_reporter_message() -> Vec<Message> {
         "the write could not be verified",
         true,
     ));
-    all.push(fleet_hold(true));
-    all.push(fleet_hold(false));
+    all.push(theme_not_saved(
+        "Gruvbox Dark",
+        "aterm.toml changed first; its current value was kept",
+        false,
+    ));
+    all.push(theme_not_saved(
+        "Gruvbox Dark",
+        "the write could not be verified",
+        true,
+    ));
+    all.push(fleet_hold(true, "main%20broken"));
+    all.push(fleet_hold(false, "main%20broken"));
+    all.push(fleet_hold(false, crate::fabric::FABRIC_LOST));
+    for view in crate::autopilot::AutopilotView::ALL {
+        all.push(autopilot_set("s-1", "in tab 2", view, true));
+        all.push(autopilot_set("s-1", "in its tab", view, false));
+    }
     all.push(hold_refused(true, "no session"));
     all.push(hold_refused(false, "no session"));
     all.push(fabric_failure(
@@ -2721,6 +2794,86 @@ fn a_supervisors_memory_warning_is_a_row_and_its_information_a_record() {
     assert_eq!(attention(&note), Ok(Attention::Record));
 }
 
+/// THE MEMORY ROW NEVER CUTS A RESUME LINE
+/// ([`aterm_agent::supervise::memory::never_cut`]): a Codex launched with
+/// many flags, led by its tab, passes the row's 400 characters, so the row
+/// names its line with its sandbox and approval flags alone, whole on one
+/// detail line. NEGATIVE CONTROL: the cap alone cuts the thread.
+#[test]
+fn the_memory_row_steps_a_long_resume_line_down_whole() {
+    use aterm_agent::supervise::memory::MemoryOver;
+    let thread = "019a0b1c-2d3e-7f40-8a5b-6c7d8e9f0a1b";
+    let argv: Vec<String> = [
+        "codex",
+        "-m",
+        "gpt-5-codex",
+        "-c",
+        "model_reasoning_effort=high",
+        "-c",
+        "mcp_servers.github.command=\"/opt/homebrew/bin/github-mcp-server\"",
+        "-C",
+        "/Users//someone/Developer/some-project",
+        "-s",
+        "workspace-write",
+        "-a",
+        "on-request",
+    ]
+    .map(String::from)
+    .to_vec();
+    let line = aterm_agent::harness::resume::codex_command(&argv, thread, None).unwrap();
+    let over = MemoryOver {
+        footprint_mib: 51_302,
+        ceiling_mib: 24 * 1024,
+        available_mib: Some(12_595),
+        strain: None,
+        dominant: true,
+    };
+    let text = over.warning("Codex", true, Some(&line));
+    let row = super::supervisor_warning("s-2", "in tab 2", &text);
+    assert!(
+        row.detail[0].starts_with("Tab 2: Codex uses 50.0 GB"),
+        "{:?}",
+        row.detail
+    );
+    let mode =
+        format!("to restart it yourself: codex resume -s workspace-write -a on-request {thread}");
+    assert_eq!(row.detail.last(), Some(&mode), "{:?}", row.detail);
+    // NEGATIVE CONTROL.
+    let cut = atpkg::progress::sanitize_for_tty(&format!("Tab 2: {text}"), 400);
+    assert!(!cut.contains(thread), "{cut}");
+
+    // Inside the 400 characters, but its clause longer than a detail line:
+    // laid out whole, the line would be split across two; it steps down.
+    const CLAUSE: &str = "to restart it yourself: ";
+    let spare = MemoryOver {
+        available_mib: None,
+        ..over
+    };
+    let (text, line) = (1..)
+        .map(|n| {
+            let dir = format!("/{}", "d".repeat(n));
+            let argv = ["codex", "-C", &dir, "-s", "workspace-write"]
+                .map(String::from)
+                .to_vec();
+            let line = aterm_agent::harness::resume::codex_command(&argv, thread, None).unwrap();
+            (spare.warning("Codex", true, Some(&line)), line)
+        })
+        .find(|(_, line)| CLAUSE.len() + line.len() > aterm_messages::DETAIL_LINE_CAP)
+        .unwrap();
+    let led = format!("Tab 2: {text}");
+    assert!(led.chars().count() <= 400, "{led}");
+    let row = super::supervisor_warning("s-2", "in tab 2", &text);
+    let mode = format!("{CLAUSE}codex resume -s workspace-write {thread}");
+    assert!(
+        row.detail.last().is_some_and(|l| l.ends_with(&mode)),
+        "{:?}",
+        row.detail
+    );
+    // NEGATIVE CONTROL.
+    let laid = aterm_messages::text::split_sentence(&led, aterm_messages::DETAIL_LINE_CAP);
+    assert!(laid.iter().all(|l| !l.contains(&line)), "{laid:?}");
+}
+
 /// AUDIT #7 FINDING 48 — a shell that started in the home folder because
 /// its folder was gone is ONE warning row, keyed, in the failure grammar,
 /// saying where the shell is instead and naming the folder; several
@@ -2941,8 +3094,8 @@ fn gesture_failures() -> Vec<Message> {
 }
 
 /// The fences the question's copy must keep, whichever form carries it (the
-/// retired row, the digest entry): the owner's restart-phrase ruling
-/// (`tools/grep_guard.sh` B12), the honesty rule that no coverage or scope
+/// retired row, the digest entry): the owner's restart-phrase ruling, the
+/// honesty rule that no coverage or scope
 /// claim may ship while §7 S1 and S4 are unrun, and the ruling that
 /// mitigating this annoyance is acceptable, so it may never read as
 /// elimination.
@@ -3004,7 +3157,7 @@ fn assert_fda_copy_is_fence_clean<'a>(texts: impl Iterator<Item = &'a String>) {
 /// THE COPY OF THE ONE QUESTION THIS FEATURE ASKS UNPROMPTED (the fence
 /// that held the retired card's caption, `notice.rs`, moved onto the
 /// words themselves — design §7.1). Three fences at once: the owner's
-/// restart-phrase ruling (`tools/grep_guard.sh` B12), the honesty
+/// restart-phrase ruling, the honesty
 /// rule that no coverage or scope claim may ship while §7 S1 and S4 are
 /// unrun, and the ruling that mitigating this annoyance is acceptable —
 /// so it may never read as elimination. The title and `detail[0]` (the why) are
@@ -3443,6 +3596,7 @@ fn reopened_with_agent(
 ) -> crate::crash_journal::Reopened {
     let mut reopened = reopened_with_programs(class, programs);
     let claude = crate::restore::AgentRestore {
+        word: String::new(),
         pid: 4242,
         start: "Sat Sep 27 01:02:03 2026".into(),
         program: "/opt/claude/bin/claude".into(),
@@ -4102,6 +4256,19 @@ fn config_family_titles_are_terse_and_the_first_sentence_is_the_excerpt() {
         ]
     );
     assert_eq!(font.key.as_deref(), Some("config.font-family"));
+    // The font catalog's own sentences read the same way.
+    for sentence in [
+        "config font_family: \"Nope\" does not resolve to a font file; keeping the current working face",
+        "config emoji_font \"Nope\" was not admitted",
+    ] {
+        let mut one = ConfigWarnings::default();
+        one.push(ConfigFamily::Fonts, sentence.to_string());
+        assert_eq!(
+            one.into_messages().remove(0).detail[0],
+            "no font named Nope",
+            "{sentence}"
+        );
+    }
 
     // Past the engine's line cap the last line is the roll-up.
     let mut many = ConfigWarnings::default();
@@ -4721,11 +4888,11 @@ fn feedback_sentences_split_into_a_title_and_a_cause() {
     // A Hold press on a held session asked for what already is: a
     // record. A Release the fleet refused failed: a gesture row, titled
     // with the outcome.
-    let held = fleet_hold(true);
+    let held = fleet_hold(true, "main%20broken");
     assert_eq!(held.title, "Session already held");
     assert_eq!(held.hold, Hold::LogOnly);
     assert_eq!(held.detail, ["the fleet holds it"]);
-    let kept = fleet_hold(false);
+    let kept = fleet_hold(false, "main%20broken");
     assert_eq!(kept.title, "Couldn't release the hold");
     assert_eq!(kept.severity, Severity::Warn);
     assert_eq!(kept.hold, Hold::For(HOLD_GESTURE));
@@ -5852,8 +6019,7 @@ fn glued(line: &str) -> bool {
 fn an_invalid_aterm_toml_at_launch_keeps_its_caret_diagram_in_rows() {
     let path = std::path::Path::new("/home/someone/.config/aterm/aterm.toml");
     let error = aterm_toml::from_str::<crate::app_config::Config>("font_px = \n")
-        .err()
-        .expect("a malformed aterm.toml");
+        .expect_err("a malformed aterm.toml");
     let notice = crate::app_config::launch_config_notice(
         path,
         crate::app_config::LaunchConfigProblem::Invalid(&error),
@@ -7129,4 +7295,58 @@ fn a_quiet_give_up_upgrade_now_does_move_keeps_its_button() {
     };
     assert_eq!(running.remedy(NOW), Some(Remedy::Waits));
     assert!(!super::agent_upgrade_words(&running, NOW).contains(&UpgradeWord::Now));
+}
+
+/// THE LOGIN LIFECYCLE'S WORDS ARE SHOWABLE (accounts v2 S7): the due line,
+/// the day's warning, the wrong account, each a valid entry whose title
+/// counts and whose detail names the labels, never an address; and the
+/// machine's renew ask, a standing Now whose one step renews every label,
+/// or the whole batch where the labels would not fit.
+#[test]
+fn the_login_lifecycle_entries_and_the_renew_ask_are_showable() {
+    let labels = |names: &[&str]| -> Vec<String> { names.iter().map(|n| n.to_string()).collect() };
+    let due = super::accounts_due_entry(&labels(&["m7-a", "pool-1"]))
+        .expect("an entry")
+        .message()
+        .expect("a valid entry");
+    assert_eq!(due.title, "2 Claude logins due for renewal");
+    assert!(
+        due.detail.iter().any(|l| l == "Due: m7-a, pool-1"),
+        "{:?}",
+        due.detail
+    );
+    assert!(super::accounts_due_entry(&[]).is_none());
+    let none = super::accounts_none_soon_entry()
+        .message()
+        .expect("a valid entry");
+    assert_eq!(none.severity, Severity::Warn);
+    let wrong = super::accounts_wrong_entry(&labels(&["m7-a"]))
+        .expect("an entry")
+        .message()
+        .expect("a valid entry");
+    assert!(
+        wrong
+            .detail
+            .iter()
+            .any(|l| l == "Run aterm harness accounts renew m7-a"),
+        "{:?}",
+        wrong.detail
+    );
+    for text in due.detail.iter().chain(&none.detail).chain(&wrong.detail) {
+        assert!(!text.contains('@'), "{text}");
+    }
+    let ask = super::renew_ask(&labels(&["m7-a"]), &["in tab 3".to_string()]);
+    assert!(matches!(ask.hold, aterm_messages::Hold::Standing(_)));
+    assert_eq!(ask.key.as_deref(), Some(super::RENEW_ASK_KEY));
+    assert!(ask.title.ends_with("in tab 3"), "{}", ask.title);
+    let many: Vec<String> = (0..20).map(|i| format!("account-number-{i:02}")).collect();
+    let ask = super::renew_ask(&many, &["in tab 3".to_string(), "in tab 4".to_string()]);
+    assert!(
+        ask.detail
+            .iter()
+            .any(|l| l == "Run aterm harness accounts renew --due"),
+        "the batch where the labels do not fit: {:?}",
+        ask.detail
+    );
+    assert_eq!(ask.title, "Claude's login ended in 2 tabs");
 }

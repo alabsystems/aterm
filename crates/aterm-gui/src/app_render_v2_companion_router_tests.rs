@@ -59,11 +59,10 @@ fn the_router_lead_is_the_footprints_own_lead() {
     assert_eq!(lead_px(0), 0);
 }
 
-/// The OCCLUSION fix (L-D), host side: with v2 engaged and the words
-/// ahead of the caret inked, the flying head is seated BEHIND the caret
-/// — expressed as a negative lead on the frame copy — while blank glass
-/// ahead keeps the shipped seat byte-for-byte; and the pet, which seats
-/// itself, is never moved.
+/// Host side of the occlusion law (L-D): with v2 engaged and the words ahead of the caret
+/// inked, the flying head seats behind the caret (a negative lead on the frame copy); blank
+/// glass ahead keeps the default seat unchanged, and the pet, which seats itself, is never
+/// moved.
 #[test]
 fn a_v2_flying_head_yields_behind_inked_text_and_the_pet_is_never_moved() {
     let mut app = App::headless_for_test();
@@ -84,7 +83,7 @@ fn a_v2_flying_head_yields_behind_inked_text_and_the_pet_is_never_moved() {
     );
     let before = ws.fx.companions_mut().cursor_cat.static_frame(now);
 
-    // Blank glass ahead: the shipped seat, untouched.
+    // Blank glass ahead: the default seat, untouched.
     let mut frame = before;
     ws.input_scratch.cells = inked_row(0, 0);
     route_v2_companion(
@@ -172,7 +171,7 @@ fn the_offer_seam_hands_the_meteors_arrival_to_the_resident() {
         .cursor_mut()
         .glow
         .tick(Some((3, 40)), t1, &cfg, glow_geom(), &mut out);
-    // The host's order, verbatim: the pet's own tick, then the offer.
+    // The host's order: the pet's own tick, then the offer.
     let pet_frame = crate::app_render::pet_tick_for_test(
         ws,
         aterm_effects::host::CaptureMode::Present,
@@ -195,8 +194,7 @@ fn the_offer_seam_hands_the_meteors_arrival_to_the_resident() {
         ws.fx.companion_mut().brain().pending_v2_offer().0,
         "the meteor's arrival edge never reached the resident"
     );
-    // …and the router's drain still had the impulse to route: the offer
-    // is a pure READ, and running it first costs the flying head nothing.
+    // The offer is a pure read: the router's drain still has the impulse to route.
     let mut cat = ws.fx.companions_mut().cursor_cat.static_frame(t1);
     route_v2_companion(
         ws,

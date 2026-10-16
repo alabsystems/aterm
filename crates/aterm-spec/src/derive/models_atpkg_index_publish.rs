@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The atpkg index channel's writer/reader contract: `tools/atpkg-index.sh` publishes
+//! The atpkg index channel's writer/reader contract: `atpkg-publish index` publishes
 //! `atpkg-index-N`, and a client finds the newest by walking tags up from its verified floor.
 
 use super::*;
@@ -164,8 +164,8 @@ fn number_admitted(p: &Publisher) -> Expr {
     )
 }
 
-/// `tools/atpkg-index.sh` (the WRITER) and the client's tag walk (the READER) as ONE
-/// contract. Two publishers — the ALab lane, the Linux lane, the rustc-group lane and a
+/// `atpkg-publish index` (the WRITER) and the client's tag walk (the READER) as ONE
+/// contract. Two publishers — the ALab lane, the Linux lane, the rustc-group publish and a
 /// hand publish all run the same indexer — each READ a baseline (the channel's newest
 /// published index), then publish `atpkg-index-<baseline + 1>`:
 ///
@@ -192,12 +192,15 @@ fn number_admitted(p: &Publisher) -> Expr {
 /// draft at 3, is a hole the walk from 1 cannot cross; B converging onto A's tag overwrites
 /// it.
 ///
-/// Tier-1 (`crates/atpkg/src/net/index_publish_conformance.rs`) drives the real indexer's
-/// number and compare-and-swap decisions from every modelled publisher state against a
-/// fixture channel, and the real tag walk over every reachable channel; its negative
-/// control is a `Buggy = 1` hole that the real walk does not cross either.
+/// Tier-1 is two halves. The writer's (`crates/atpkg-publish/tests/channel/
+/// conformance_index_publish.rs`) drives the real indexer's number and compare-and-swap
+/// decisions from every modelled publisher state against a fake channel, with every
+/// `Buggy = 1` decision refused; the reader's (`crates/atpkg/src/net/
+/// index_publish_conformance.rs`) drives the real tag walk over every reachable channel,
+/// its negative control a `Buggy = 1` hole that the real walk does not cross either.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
+#[crate::model]
 pub fn atpkg_index_publish_walk_model() -> Model {
     let buggy = || eq(cst("Buggy"), int(1));
     let mut actions = Vec::new();
@@ -339,6 +342,7 @@ pub fn atpkg_index_publish_walk_model() -> Model {
         invariants: vec![
             Invariant {
                 name: "OneRun",
+                kind: InvariantKind::Claim,
                 expr: and_(
                     or_(not(published(3)), published(2)),
                     or_(not(published(4)), published(3)),
@@ -346,10 +350,12 @@ pub fn atpkg_index_publish_walk_model() -> Model {
             },
             Invariant {
                 name: "WalkLandsNewest",
+                kind: InvariantKind::Claim,
                 expr: eq(walk_from(var("floor")), highest(published)),
             },
             Invariant {
                 name: "NoOverwrite",
+                kind: InvariantKind::Claim,
                 expr: eq(var("overwrote"), int(0)),
             },
         ],

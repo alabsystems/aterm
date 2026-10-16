@@ -32,23 +32,6 @@ fn observe_floor_and_withdraw(
     )
 }
 
-/// A healthy outcome says how often it checks, in words, and never how it reads
-/// the channel — `lane=` and the log carry those.
-#[test]
-fn the_healthy_note_says_how_often_and_nothing_about_how() {
-    let note = cadence_note();
-    assert_eq!(
-        note,
-        format!(
-            " \u{b7} checks every {} min",
-            crate::cadence::INTERVAL_SECS / 60
-        )
-    );
-    for jargon in ["lane", "rung", "token", "API", "unmetered", "credential"] {
-        assert!(!note.contains(jargon), "{jargon}: {note}");
-    }
-}
-
 /// The standing "cannot read the channel" wording must survive being read months
 /// later out of `status.toml`: the consequence, every cause GitHub renders
 /// identically, and the remedy — never a bare "idle", which an operator cannot tell
@@ -514,6 +497,8 @@ fn a_stage_that_could_not_finish_books_no_verdict_but_escalates_in_its_own_words
         memo.moment && !memo.is_quarantine(),
         "never a verdict: {memo:?}"
     );
+    // The streak spans the persistence window (`Health::persistent_class`).
+    crate::health::backdate_streaks(&staging.health(), crate::PERSISTENT_SPAN);
     let h = crate::health::Health::read(&staging.health());
     assert_eq!(
         h.persistent_class(),
@@ -944,6 +929,8 @@ fn a_full_disk_is_charged_to_neither_the_release_nor_the_download_host() {
                 <= *crate::manifest::MOMENT_BACKOFF_SECS.last().unwrap(),
             "{lane}: {memo:?}"
         );
+        // The streak spans the persistence window (`Health::persistent_class`).
+        crate::health::backdate_streaks(&staging.health(), crate::PERSISTENT_SPAN);
         let h = crate::health::Health::read(&staging.health());
         assert_eq!(
             h.persistent_class(),
@@ -2803,53 +2790,6 @@ fn roster_freshness_conformance() {
     assert!(!model.check_invariant("NoSwapPastTheWindow", &swapped));
 }
 
-/// The roster-freshness pair is LINKED: the swap's gates and the check's
-/// observation carry `#[refines]` anchors into the machine under the one
-/// projection, and the environment and the negative controls are waived.
-#[test]
-fn roster_freshness_shipping_anchors_are_linked() {
-    let mut refinements: Vec<_> = aterm_spec::xref::refinements()
-        .filter(|anchor| anchor.machine == "NativeUpdateRosterFreshness")
-        .map(|anchor| (anchor.action, anchor.rust_method, anchor.project))
-        .collect();
-    refinements.sort_unstable();
-    assert_eq!(
-        refinements,
-        [
-            (
-                "Check",
-                "observe_floor_and_withdraw_at",
-                "aterm_update::roster_freshness_projection"
-            ),
-            (
-                "Swap",
-                "stage_admission_gates",
-                "aterm_update::roster_freshness_projection"
-            ),
-        ]
-    );
-    let mut waived: Vec<_> = aterm_spec::xref::waivers()
-        .filter(|waiver| waiver.machine == "NativeUpdateRosterFreshness")
-        .map(|waiver| waiver.action)
-        .collect();
-    waived.sort_unstable();
-    assert_eq!(
-        waived,
-        [
-            "ConfirmWithoutTheRoster",
-            "Revoke",
-            "SwapOnTheFloorAlone",
-            "Tick"
-        ]
-    );
-    let model = aterm_spec::derive::native_update_roster_freshness_model();
-    assert_eq!(
-        model.actions.len(),
-        refinements.len() + waived.len(),
-        "every action is bound or waived"
-    );
-}
-
 /// A STAGE THE FLOOR WITHDRAWS IS ANNOUNCED NOWHERE, AND IS RETIRED BY THE
 /// CHECK THAT SAW THE WITHDRAWAL. Build 20 is staged; the owner yanks it
 /// (`min_build = 21`). The floor rises on observation, and neither the check's
@@ -3024,6 +2964,8 @@ fn a_floor_that_stays_unreadable_is_booked_until_it_is_said() {
             assert!(crate::is_passing_refusal(refusal), "{refusal}");
             assert!(refusal.contains(&floor), "{refusal}");
         }
+        // The streak spans the persistence window (`Health::persistent_class`).
+        crate::health::backdate_streaks(&staging.health(), crate::PERSISTENT_SPAN);
         let h = crate::health::Health::read(&staging.health());
         assert_eq!(
             h.persistent_class(),

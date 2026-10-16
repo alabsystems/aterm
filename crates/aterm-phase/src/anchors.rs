@@ -11,20 +11,24 @@
 //! release they were read on, and whether they are one literal in the
 //! vendor's binary or composed at run time from key hints.
 //!
-//! Codex's strings are their own table, [`CODEX_ANCHORS`] (ids `codex.…`);
-//! [`anchor`] and [`anchor_text`] read both.
+//! Each other agent's strings are a table of its own — [`CODEX_ANCHORS`]
+//! (ids `codex.…`), [`AGY_ANCHORS`] (`agy.…`), [`MUSE_ANCHORS`] (`muse.…`);
+//! [`anchor`] and [`anchor_text`] read them all.
 //!
-//! The tests `every_literal_anchor_is_in_the_store_claude` and
-//! `every_literal_codex_anchor_is_in_the_store_codex` grep the store's
+//! The tests `every_literal_anchor_is_in_the_store_claude`,
+//! `every_literal_codex_anchor_is_in_the_store_codex`,
+//! `every_literal_agy_anchor_is_in_the_store_agy` and
+//! `every_literal_muse_anchor_is_in_the_store_muse` grep the store's
 //! binaries for every [`AnchorKind::Literal`] row (the Codex one for every
-//! [`crate::codex::WALLS`] phrase too) and name the misses — the drift
-//! canaries. Both RUN in the suite (the merge gate's included) wherever a
-//! store binary is found (`$ATERM_CLAUDE_BIN` / `$ATERM_CODEX_BIN`, else
-//! `aterm pkg which <program>`), so a new build the vendor's auto-updater or
-//! `aterm pkg update` brought is judged by the next gate run, and say so
-//! loudly and return where there is none — a canary that could not look has
-//! not passed, and is not counted as having. Neither is `#[ignore]`d: an
-//! ignored test is run by nobody.
+//! [`crate::codex::WALLS`] phrase and [`crate::codex::TOOL_HEADS`] head too)
+//! and name the misses — the drift canaries. They RUN in the suite (`verify
+//! test` included) wherever a store binary is found (`$ATERM_CLAUDE_BIN`,
+//! `$ATERM_CODEX_BIN`, `$ATERM_AGY_BIN`, `$ATERM_MUSE_BIN`, else `aterm pkg
+//! which <program>`), so a new build the vendor's auto-updater or `aterm pkg
+//! update` brought is judged by the next test run, and say so loudly and
+//! return where there is none — a canary that could not look has not passed,
+//! and is not counted as having. None is `#[ignore]`d: an ignored test is run
+//! by nobody.
 
 /// How an anchor's text reaches the screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -199,7 +203,7 @@ pub const ANCHORS: &[Anchor] = &[
     // a subagent`, `from a remote cloud agent`, `from the <name> plugin`,
     // `from a plugin` — read by `crate::prompt::parse_header` (the named
     // forms' `from the ` is plain English, spelled there: a row here is
-    // fenced out of every other crate by tools/grep_guard.sh V1). And the
+    // imported by id everywhere else). And the
     // title's own parenthetical (f2e(): `Bash command (unsandboxed)`, `Bash
     // command (runs on <machine>)`; Xo() gives the file boxes the second).
     lit("origin.workflow", "from a workflow", "2.1.280"),
@@ -290,9 +294,8 @@ pub const ANCHORS: &[Anchor] = &[
     // bar's Submit chip (the tick figure and ` Submit`), the review tab's
     // rows, and the AFK countdown row the host may draw under the dialog.
     // The multi-select button (`Next`/`Submit`) and the review's `Cancel`
-    // are read by POSITION, never by anchor: one-word anchors are fenced
-    // everywhere else in the tree (tools/grep_guard.sh V1) and those words
-    // are spelled in aterm-gui and aterm-search.
+    // are read by POSITION, never by anchor: those words are spelled in
+    // aterm-gui and aterm-search.
     lit(
         "question.navigate_tabs",
         "Tab/Arrow keys to navigate",
@@ -455,6 +458,18 @@ pub const ANCHORS: &[Anchor] = &[
         "Interrupted · What should Claude do instead?",
         "2.1.280",
     ),
+    // The notice Claude Code appends when it compacts an idle conversation by
+    // itself (`compact_idle`, mode `compact`: nobody at the tab, no turn in
+    // flight), as a `⏺` row of its own (measured 2026-10-15 on two tabs).
+    lit(
+        "turn.idle_compacted",
+        "Compacted while idle, before the prompt cache expired",
+        "2.1.300",
+    ),
+    // The label of the summary Claude Code appends to an idle conversation
+    // (`※ recap: <summary> (disable recaps in /config)`, its `※` drawn from a
+    // `※` escape, the summary wrapped two columns in; measured 2026-10-15).
+    lit("turn.recap", "recap:", "2.1.301"),
     lit(
         "survey.question",
         "How is Claude doing this session",
@@ -536,6 +551,21 @@ pub const ANCHORS: &[Anchor] = &[
         "Update installed · Restart to update",
         "2.1.267",
     ),
+    // The vendor's OWN `⏺` paragraphs that are nobody's words: drawn as a
+    // message row in the transcript, but no turn's reply, so the readers of
+    // what the worker last said step over them (`phase::vendor_paragraph`).
+    // The auto-mode notice (`getAutoModeDescription` in 2.1.300, its head
+    // `… automatically \u2014 Claude checks each tool call …` read from the
+    // binary): drawn after the first reply of a session relaunched
+    // `--permission-mode auto --resume <id>` (MEASURED on 2.1.300, the
+    // harness sweep of 2026-10-15, ATERM-KI-1015-1 LC-10), and over the
+    // first turn of a session in auto mode (2.1.287's
+    // `claude-2.1.287-box-bash-ask-rule-auto.txt`).
+    lit(
+        "notice.auto_mode",
+        "Auto mode lets Claude handle permission prompts automatically",
+        "2.1.287",
+    ),
     lit(
         "model.saved",
         "saved as your default for new sessions",
@@ -565,8 +595,8 @@ pub const ANCHORS: &[Anchor] = &[
     // (`prompt::fixtures::USAGE_REFRESHING`), and `⎿  Settings dialog
     // dismissed` under `❯ /usage` after the Escape under the INLINE renderer
     // (the fullscreen one leaves no row); the rest were not seen.
-    // `usage.refreshing` is one word: a matcher that spells it spells it
-    // quoted, which is what `grep_guard`'s V1 fences.
+    // `usage.refreshing` is one word: a matcher reads it through
+    // `crate::anchor`, never as a quoted copy.
     lit("usage.refreshing", "Refreshing", "2.1.287"),
     lit("usage.loading", "Loading usage data", "2.1.287"),
     lit("usage.last_known", "Showing last-known usage", "2.1.287"),
@@ -708,10 +738,43 @@ pub const ANCHORS: &[Anchor] = &[
     // for 2h41m). Placed by `wall::memory_wall`, never by `PHRASES`: a
     // composer draft quoting it carries the same words.
     lit("wall.memory", "Critical memory usage", "2.1.280"),
+    // Usage credits carry the session (the 2.1.300 bundle's own list of these
+    // notices, measured in the lab): the footer's lasting item, the
+    // notification as they start, and the same two under an admin's
+    // allocation. Read by place, `credits::in_use`.
+    lit("credits.in_use", "Now using usage credits", "2.1.300"),
+    lit(
+        "credits.started",
+        "You're now using usage credits",
+        "2.1.300",
+    ),
+    lit(
+        "credits.allocation",
+        "Now using your usage allocation",
+        "2.1.300",
+    ),
+    lit(
+        "credits.allocation_started",
+        "You're now using your usage allocation",
+        "2.1.300",
+    ),
+    // The vendor's own warning that a window is filling (`You've used 80% of
+    // your weekly limit · resets Oct 18 at 8:50pm (…)`, measured):
+    // `credits::usage_warning`.
+    lit("usage.warning", "You've used", "2.1.300"),
+    // Claude Code's own word that the stored login ends soon (READ in the
+    // 2.1.300 bundle, the `oauth-expiry` warning notification: `Your login
+    // expires in ` + N + ` day`/`days`, then ` · run /login to renew` drawn
+    // dim; shown only while the refresh token's end is 3 days away or
+    // nearer, and the same words as a footer segment at 1 day or less).
+    // Read by `wall::login_expires_in` for the login's forecast; its screen
+    // placement was NOT measured.
+    lit("login.expires_in", "Your login expires in ", "2.1.300"),
+    lit("login.renew_hint", "run /login to renew", "2.1.300"),
 ];
 
-/// Every string aterm guards on in Codex's screen (codex 0.156.1: the
-/// captures in [`crate::codex::fixtures`] and the binary).
+/// Every string aterm guards on in Codex's screen (codex 0.156.1 to
+/// 0.163.0: the captures in [`crate::codex::fixtures`] and the binary).
 pub const CODEX_ANCHORS: &[Anchor] = &[
     // The approval boxes.
     lit(
@@ -745,6 +808,20 @@ pub const CODEX_ANCHORS: &[Anchor] = &[
         "Press enter to confirm or esc to cancel",
         "0.156.1",
     ),
+    // The exec box's Reason row when an owner's prompt rule sent it
+    // (`prefix_rule(…, decision="prompt")`, MEASURED on 0.163.0): `` `<the
+    // shell-wrapped command>` requires approval by policy``, or `` … requires
+    // approval: <the rule's justification>`` — `PromptV2::owner_review`.
+    lit("codex.box.policy", "requires approval by policy", "0.163.0"),
+    lit("codex.box.policy_why", "requires approval: ", "0.163.0"),
+    // The `Usage limit reached` banner a workspace member is drawn under the
+    // out-of-credits and spend-cap walls (MEASURED on 0.162.1 and 0.163.0):
+    // its `Yes` asks the workspace's owner for a limit increase, and no rule
+    // presses it.
+    lit("codex.banner.request", "Request increase?", "0.162.1"),
+    // The session card's title, `>_ OpenAI Codex (v<version>)`; the `(v`
+    // is the literal's, the version the build's.
+    lit("codex.card.title", "OpenAI Codex (v", "0.156.1"),
     // The folder-trust gate.
     lit("codex.trust.title", "Folder access", "0.156.1"),
     lit("codex.trust.yes", "Trust and continue", "0.156.1"),
@@ -753,6 +830,17 @@ pub const CODEX_ANCHORS: &[Anchor] = &[
     lit("codex.plan.yes", "Yes, implement this plan", "0.156.1"),
     lit("codex.question.recommended", "(Recommended)", "0.156.1"),
     lit("codex.question.none", "None of the above", "0.156.1"),
+    // The question's NOTES FIELD (MEASURED on 0.163.0): Tab on `None of the
+    // above` opens it, drawn `  › Add notes` while empty, the dialog's
+    // footer offering it (`tab to add notes | …`) and, open, its clearing
+    // (`tab or esc to clear notes | …`).
+    lit("codex.question.notes", "Add notes", "0.163.0"),
+    hint("codex.question.notes.tab", "tab to add notes", "0.163.0"),
+    hint(
+        "codex.question.notes.open",
+        "tab or esc to clear notes",
+        "0.163.0",
+    ),
     // The live zone and the turn's end.
     hint("codex.busy.interrupt", "esc to interrupt", "0.156.1"),
     lit(
@@ -773,6 +861,23 @@ pub const CODEX_ANCHORS: &[Anchor] = &[
     // The tip 0.157.0 draws right-aligned between a turn's end and the
     // composer.
     lit("codex.tip", "Tip: ", "0.157.0"),
+    // What a TUI prints on the main screen as it LEAVES, which the live
+    // upgrade takes the thread it relaunches from (`aterm-agent`'s
+    // `upgrade_codex::parse_exit_hint`): the heading over an embedded
+    // session's `  codex resume <id>` row, that row's words and the token
+    // tally printed with it (MEASURED after `/quit`,
+    // [`crate::codex::fixtures::EXIT`]); the daemon-mode hint's last line
+    // (0.157.0) and, from 0.159, its heading over the same row (the 0.159.3
+    // and 0.160.0 strings). 0.157's one-line `Reconnect: codex resume <id>`
+    // is in no build since, so it is no anchor: the upgrade reads it as
+    // history. A reworded one leaves a daemon-mode client's thread unnamed
+    // after `/exit` was typed, and the upgrade fails `no-resume-hint` at a
+    // shell.
+    lit("codex.exit.continue", "To continue this session", "0.156.1"),
+    lit("codex.exit.resume", "codex resume ", "0.156.1"),
+    lit("codex.exit.tokens", "Token usage", "0.156.1"),
+    lit("codex.exit.stop", "Stop the current turn:", "0.157.0"),
+    lit("codex.exit.reconnect", "To reconnect", "0.159.3"),
     // The walls' reset (`codex::WALLS` is their phrases, canaried beside
     // this table).
     lit("codex.wall.retry_at", "Try again at", "0.156.1"),
@@ -838,12 +943,120 @@ pub const CODEX_ANCHORS: &[Anchor] = &[
     lit("codex.goal.resume.leave", "Leave paused", "0.157.1"),
 ];
 
+/// Every string aterm guards on in agy's screen (agy 1.4.0: the captures in
+/// [`crate::agy::fixtures`] and the binary).
+pub const AGY_ANCHORS: &[Anchor] = &[
+    // The footer's left side, and the key row under a box or a menu (`↑/↓`
+    // and `Navigate` are two strings in the binary).
+    lit("agy.footer.idle", "? for shortcuts", "1.4.0"),
+    lit("agy.footer.cancel", "esc to cancel", "1.4.0"),
+    hint("agy.footer.exit", "press ctrl+c again to exit", "1.4.0"),
+    hint("agy.keys.navigate", "↑/↓ Navigate", "1.4.0"),
+    // The logo row naming the build, and the turn's end after an Esc or a
+    // refused box.
+    lit("agy.banner", "Antigravity CLI", "1.4.0"),
+    lit("agy.turn.interrupted", "Interrupted · What should", "1.4.0"),
+    // The sign-in wall: no option of its menu is ever pressed (its first
+    // opens a browser).
+    lit(
+        "agy.signin.wall",
+        "You are currently not signed in.",
+        "1.4.0",
+    ),
+    lit("agy.signin.method", "Select login method:", "1.4.0"),
+    lit("agy.signin.oauth", "Google OAuth", "1.4.0"),
+    // The workspace-trust box.
+    lit(
+        "agy.trust.title",
+        "Do you trust the contents of this project?",
+        "1.4.0",
+    ),
+    lit("agy.trust.yes", "Yes, I trust this folder", "1.4.0"),
+    lit("agy.trust.no", "No, exit", "1.4.0"),
+    // The boxes' titles.
+    lit("agy.title.command", "Command", "1.4.0"),
+    lit("agy.title.create", "Create file", "1.4.0"),
+    lit("agy.title.edit", "Pending edit", "1.4.0"),
+    lit("agy.title.question", "Question", "1.4.0"),
+    // The command box.
+    lit("agy.box.command.for", "Requesting permission for:", "1.4.0"),
+    lit("agy.box.command.ask", "Run this command?", "1.4.0"),
+    lit("agy.box.once", "Yes, run command", "1.4.0"),
+    lit(
+        "agy.box.session",
+        "Yes, and always allow in this conversation for commands that start with",
+        "1.4.0",
+    ),
+    lit(
+        "agy.box.persist",
+        "Yes, and always allow for commands that start with",
+        "1.4.0",
+    ),
+    lit("agy.box.deny", "No, cancel", "1.4.0"),
+    // The file boxes.
+    lit("agy.create.reason", "Reason:", "1.4.0"),
+    lit("agy.create.ask", "Allow creation of this file?", "1.4.0"),
+    lit("agy.edit.ask", "Accept this file edit?", "1.4.0"),
+    lit("agy.create.once", "Yes, allow creation", "1.4.0"),
+    lit(
+        "agy.create.persist",
+        "Yes, and always allow non-workspace access",
+        "1.4.0",
+    ),
+    lit("agy.create.deny", "No, deny creation", "1.4.0"),
+    lit("agy.edit.once", "Yes, accept this change", "1.4.0"),
+    lit("agy.edit.deny", "No, reject this change", "1.4.0"),
+    // The question's row for the person's own words.
+    lit("agy.question.write_in", "Write-in...", "1.4.0"),
+];
+
+/// Every string aterm guards on in Muse Code's screen (muse 1.4.9-R6297.1:
+/// the captures in [`crate::muse::fixtures`] and the binary).
+pub const MUSE_ANCHORS: &[Anchor] = &[
+    // The composer's labelled top rule, the status row's hint, the banner.
+    lit(
+        "muse.composer.voice",
+        "Voice input (⌥ + v to start)",
+        "1.4.9-R6297.1",
+    ),
+    lit("muse.busy.interrupt", "esc to interrupt", "1.4.9-R6297.1"),
+    lit("muse.banner", "Muse Code", "1.4.9-R6297.1"),
+    // The sign-in wall: no option of it is ever pressed (its first opens a
+    // browser).
+    lit(
+        "muse.signin.browser",
+        "Log in with browser",
+        "1.4.9-R6297.1",
+    ),
+    lit(
+        "muse.signin.keys",
+        "↓↑ to select · Esc to quit",
+        "1.4.9-R6297.1",
+    ),
+    // The workspace-trust box.
+    lit(
+        "muse.trust.title",
+        "Do you trust this workspace?",
+        "1.4.9-R6297.1",
+    ),
+    lit("muse.trust.path", "Workspace:", "1.4.9-R6297.1"),
+    lit("muse.trust.yes", "Trust and continue", "1.4.9-R6297.1"),
+    lit("muse.trust.quit", "Quit", "1.4.9-R6297.1"),
+    lit("muse.trust.keys", "Esc quits.", "1.4.9-R6297.1"),
+];
+
 /// The text of the anchor `id`. Panics on an id the table does not have —
 /// a typo in a caller is a bug to find in its first test, not a guard that
 /// silently matches nothing.
 #[must_use]
 pub fn anchor(id: &str) -> &'static str {
-    match ANCHORS.iter().chain(CODEX_ANCHORS).find(|a| a.id == id) {
+    match ANCHORS
+        .iter()
+        .chain(CODEX_ANCHORS)
+        .chain(AGY_ANCHORS)
+        .chain(MUSE_ANCHORS)
+        .find(|a| a.id == id)
+    {
         Some(a) => a.text,
         None => panic!("aterm-phase has no anchor {id:?}"),
     }
@@ -879,6 +1092,20 @@ pub const fn anchor_text(id: &str) -> &'static str {
     while i < CODEX_ANCHORS.len() {
         if same(CODEX_ANCHORS[i].id, id) {
             return CODEX_ANCHORS[i].text;
+        }
+        i += 1;
+    }
+    let mut i = 0;
+    while i < AGY_ANCHORS.len() {
+        if same(AGY_ANCHORS[i].id, id) {
+            return AGY_ANCHORS[i].text;
+        }
+        i += 1;
+    }
+    let mut i = 0;
+    while i < MUSE_ANCHORS.len() {
+        if same(MUSE_ANCHORS[i].id, id) {
+            return MUSE_ANCHORS[i].text;
         }
         i += 1;
     }
@@ -988,7 +1215,7 @@ fn canary_prefix(home: &std::path::Path) -> std::path::PathBuf {
 /// ahead on PATH, or a managed program whose row says `not what runs outside
 /// aterm: … this shell's own copy` (atpkg's outside-aterm rows, `state.rs`) —
 /// names a copy aterm does not manage (an old brew build judged against the
-/// managed build's anchors turns the gate red). The managed copy is then read
+/// managed build's anchors fails the test). The managed copy is then read
 /// where the store keeps it
 /// (`<prefix>/store/<program>/current/bin/<program>`), and `None` where that
 /// is not there either.
@@ -1106,7 +1333,12 @@ mod tests {
 
     #[test]
     fn ids_are_unique_and_every_text_is_non_empty() {
-        let all: Vec<&Anchor> = ANCHORS.iter().chain(CODEX_ANCHORS).collect();
+        let all: Vec<&Anchor> = ANCHORS
+            .iter()
+            .chain(CODEX_ANCHORS)
+            .chain(AGY_ANCHORS)
+            .chain(MUSE_ANCHORS)
+            .collect();
         for (i, a) in all.iter().enumerate() {
             assert!(!a.text.trim().is_empty(), "{}", a.id);
             assert!(
@@ -1115,11 +1347,24 @@ mod tests {
                 a.id
             );
         }
-        // Codex's ids are namespaced, and both accessors read its table.
-        for a in CODEX_ANCHORS {
-            assert!(a.id.starts_with("codex."), "{}", a.id);
-            assert_eq!(anchor(a.id), a.text);
+        // Each agent's ids are namespaced, and both accessors read its
+        // table.
+        for (space, table) in [
+            ("codex.", CODEX_ANCHORS),
+            ("agy.", AGY_ANCHORS),
+            ("muse.", MUSE_ANCHORS),
+        ] {
+            for a in table {
+                assert!(a.id.starts_with(space), "{}", a.id);
+                assert_eq!(anchor(a.id), a.text);
+                assert_eq!(anchor_text(a.id), a.text);
+            }
         }
+        assert!(ANCHORS.iter().all(|a| {
+            !["codex.", "agy.", "muse."]
+                .iter()
+                .any(|space| a.id.starts_with(space))
+        }));
         assert_eq!(anchor("prompt.proceed"), "Do you want to proceed?");
         // The compile-time accessor reads the same table.
         const PROCEED: &str = anchor_text("prompt.proceed");
@@ -1127,9 +1372,6 @@ mod tests {
         for a in ANCHORS {
             assert_eq!(anchor_text(a.id), a.text, "{}", a.id);
         }
-        // grep_guard's V1a refuses a table it reads fewer than 20 texts
-        // from; the memory banner's row is one of them.
-        assert!(ANCHORS.len() >= 20, "{}", ANCHORS.len());
         assert_eq!(
             ANCHORS
                 .iter()
@@ -1188,27 +1430,47 @@ mod tests {
         Some((path, bytes))
     }
 
-    /// The dotted version `<path> --version` prints (`2.1.286 (Claude Code)`,
-    /// `codex-cli 0.130.0`), or `None` when it cannot be read.
+    /// The version `<path> --version` prints, or `None` when it cannot be
+    /// read ([`version_in`]).
     fn build_version(path: &str) -> Option<String> {
         let out = std::process::Command::new(path)
             .arg("--version")
             .output()
             .ok()?;
-        String::from_utf8_lossy(&out.stdout)
-            .split_whitespace()
-            .find(|w| {
-                w.split('.').count() >= 2
-                    && w.split('.')
-                        .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
-            })
-            .map(str::to_string)
+        version_in(&String::from_utf8_lossy(&out.stdout))
     }
 
-    /// Whether dotted version `a` is newer than `b`, numerically part by part.
+    /// The version a `--version` line names: a dotted one (`2.1.286 (Claude
+    /// Code)`, `codex-cli 0.130.0`, agy's bare `1.4.0`), or Muse Code's with
+    /// its revision, `x.y.z-R<n>.<s>` — `Muse Code 1.4.9 (1.4.9-R6297.1)`
+    /// names both, and the revision is the build its anchors were read on.
+    fn version_in(text: &str) -> Option<String> {
+        let dotted = |v: &str| {
+            v.split('.').count() >= 2
+                && v.split('.')
+                    .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+        };
+        let words: Vec<&str> = text
+            .split_whitespace()
+            .map(|w| w.trim_matches(|c: char| matches!(c, '(' | ')' | ',')))
+            .collect();
+        words
+            .iter()
+            .find(|w| {
+                w.split_once("-R").is_some_and(|(v, rev)| {
+                    dotted(v) && (dotted(rev) || rev.parse::<u64>().is_ok())
+                })
+            })
+            .or_else(|| words.iter().find(|w| dotted(w)))
+            .map(|w| (*w).to_string())
+    }
+
+    /// Whether version `a` is newer than `b`, numerically part by part, a
+    /// revision's parts after the version's (`1.4.9-R6297.1` is `1.4.9.6297.1`).
     fn newer_than(a: &str, b: &str) -> bool {
         let parts = |v: &str| {
-            v.split('.')
+            v.replace("-R", ".")
+                .split('.')
                 .map(|p| p.parse::<u64>().unwrap_or(0))
                 .collect::<Vec<_>>()
         };
@@ -1221,29 +1483,76 @@ mod tests {
         assert!(!newer_than("2.1.286", "2.1.286"));
         assert!(!newer_than("2.1.9", "2.1.10"), "by number, not by text");
         assert!(newer_than("0.130.0", "0.99.0"));
+        // Muse Code's revisions, by number after the version.
+        assert!(!newer_than("1.4.9-R6297.1", "1.4.9-R6297.1"));
+        assert!(newer_than("1.4.9-R6297.2", "1.4.9-R6297.1"));
+        assert!(newer_than("1.4.9-R6300.0", "1.4.9-R6297.9"));
+        assert!(newer_than("1.4.10-R1.0", "1.4.9-R6297.1"));
+        assert!(!newer_than("1.4.9-R6297.1", "1.4.10-R1.0"));
+    }
+
+    /// MUSE CODE'S VERSION IS READ WITH ITS REVISION: `muse --version` prints
+    /// `Muse Code 1.4.9 (1.4.9-R6297.1)` (measured), and the build is the
+    /// revision its anchors carry — read as the dotted `1.4.9` alone, every
+    /// anchor of the build it was measured on would be "newer than the build"
+    /// and owed by none. The other agents' lines read as they did. NEGATIVE
+    /// CONTROLS: a line with no version names none, and a revision that is no
+    /// number is no revision.
+    #[test]
+    fn a_muse_version_is_read_with_its_revision() {
+        assert_eq!(
+            version_in("Muse Code 1.4.9 (1.4.9-R6297.1)\n").as_deref(),
+            Some("1.4.9-R6297.1")
+        );
+        let since = MUSE_ANCHORS[0].since;
+        assert!(!newer_than(
+            since,
+            &version_in("Muse Code 1.4.9 (1.4.9-R6297.1)").unwrap()
+        ));
+        assert!(newer_than(since, "1.4.9"), "why the revision is read");
+        for (line, want) in [
+            ("2.1.286 (Claude Code)", "2.1.286"),
+            ("codex-cli 0.130.0", "0.130.0"),
+            ("1.4.0\n", "1.4.0"),
+            ("Muse Code 1.4.9 (1.4.9-Rnext)", "1.4.9"),
+        ] {
+            assert_eq!(version_in(line).as_deref(), Some(want), "{line}");
+        }
+        assert_eq!(version_in("Muse Code"), None);
     }
 
     fn contains(bytes: &[u8], needle: &str) -> bool {
         super::contains_bytes(bytes, needle.as_bytes())
     }
 
-    /// The literal anchors of `table` missing from `bytes`, and the
-    /// [`crate::codex::WALLS`] phrases — which are read lowercased — missing
-    /// from them lowercased.
-    fn missing(bytes: &[u8], table: &[Anchor], walls: bool) -> Vec<&'static str> {
+    /// The literal anchors of `table` missing from `bytes`, and for Codex
+    /// (`codex`) the [`crate::codex::WALLS`] phrases — which are read
+    /// lowercased — missing from them lowercased, and the
+    /// [`crate::codex::TOOL_HEADS`] missing from them, each less its trailing
+    /// space (the vendor draws the head and the space after it as two spans).
+    /// A head the build no longer spells is an agent's last words read for a
+    /// tool row's, or a tool row's for the agent's: 0.163.0 draws `Viewed
+    /// image`, and the table said `Viewed Image`.
+    fn missing(bytes: &[u8], table: &[Anchor], codex: bool) -> Vec<&'static str> {
         let mut out: Vec<&'static str> = table
             .iter()
             .filter(|a| a.kind == AnchorKind::Literal)
             .filter(|a| !a.text.split(" · ").all(|part| contains(bytes, part)))
             .map(|a| a.id)
             .collect();
-        if walls {
+        if codex {
             let lower = bytes.to_ascii_lowercase();
             out.extend(
                 crate::codex::WALLS
                     .iter()
                     .map(|(phrase, _)| *phrase)
                     .filter(|phrase| !contains(&lower, phrase)),
+            );
+            out.extend(
+                crate::codex::TOOL_HEADS
+                    .iter()
+                    .copied()
+                    .filter(|head| !contains(bytes, head.trim_end())),
             );
         }
         out
@@ -1303,6 +1612,11 @@ mod tests {
             .iter()
             .map(|a| a.text.to_string())
             .chain(crate::codex::WALLS.iter().map(|(p, _)| p.to_uppercase()))
+            .chain(
+                crate::codex::TOOL_HEADS
+                    .iter()
+                    .map(|h| h.trim_end().to_string()),
+            )
             .collect::<Vec<_>>()
             .join("\0");
         assert!(missing(every.as_bytes(), CODEX_ANCHORS, true).is_empty());
@@ -1310,6 +1624,23 @@ mod tests {
         assert_eq!(
             missing(short.as_bytes(), CODEX_ANCHORS, true),
             vec!["codex.trust.title", "spend cap"]
+        );
+        // A tool head the build spells otherwise is named: a binary with
+        // 0.156.1's `Viewed Image` and not 0.163.0's `Viewed image`.
+        let old_heads = every.replace("Viewed image", "Viewed Image");
+        assert_eq!(
+            missing(old_heads.as_bytes(), CODEX_ANCHORS, true),
+            vec!["Viewed image"]
+        );
+        // Claude's canary asks nothing of Codex's tables.
+        assert!(missing(b"", &[], false).is_empty());
+        // The exit hint's words are looked for too: a build that prints
+        // 0.157's `Reconnect: codex resume <id>` line and no `To reconnect`
+        // heading is named.
+        let old = every.replace("To reconnect", "Reconnect: codex resume ");
+        assert_eq!(
+            missing(old.as_bytes(), CODEX_ANCHORS, true),
+            vec!["codex.exit.reconnect"]
         );
     }
 
@@ -1341,10 +1672,10 @@ mod tests {
         let missing = missing(&bytes, &owed, walls);
         assert!(
             missing.is_empty(),
-            "{path}: {} literal anchors or wall phrases missing: {missing:?}",
+            "{path}: {} literal anchors, wall phrases or tool heads missing: {missing:?}",
             missing.len()
         );
-        eprintln!("{path}: every literal anchor (and wall phrase) is present");
+        eprintln!("{path}: every literal anchor (and wall phrase and tool head) is present");
     }
 
     #[test]
@@ -1475,5 +1806,15 @@ mod tests {
     #[test]
     fn every_literal_codex_anchor_is_in_the_store_codex() {
         literal_anchors_are_in_the_store("codex", "ATERM_CODEX_BIN", CODEX_ANCHORS, true);
+    }
+
+    #[test]
+    fn every_literal_agy_anchor_is_in_the_store_agy() {
+        literal_anchors_are_in_the_store("agy", "ATERM_AGY_BIN", AGY_ANCHORS, false);
+    }
+
+    #[test]
+    fn every_literal_muse_anchor_is_in_the_store_muse() {
+        literal_anchors_are_in_the_store("muse", "ATERM_MUSE_BIN", MUSE_ANCHORS, false);
     }
 }

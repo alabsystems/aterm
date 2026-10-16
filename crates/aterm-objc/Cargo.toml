@@ -9,38 +9,45 @@ license.workspace = true
 repository.workspace = true
 description = "aterm's first-party Objective-C runtime layer: typed message sends, ownership, runtime class creation, and the block ABI — the foundation that retires the objc2 cluster."
 
-# ZERO dependencies, by construction. This crate exists to REMOVE third-party
-# code (objc2 + block2 + the objc2-* binding crates), so adding one here would
-# defeat the whole point. Everything below is std plus `libobjc`/`Foundation`,
-# which ship with the OS and are already loaded in every aterm process.
+# Zero dependencies by design: this crate replaces objc2, block2 and the
+# objc2-* binding crates. Everything is std plus libobjc, Foundation and
+# CoreFoundation (and, under `cg`, CoreGraphics), which ship with the OS.
 #
-# The integration files that only READ the runtime are modules of one binary,
-# `tests/objc_static_suite.rs`; every file that owns process-global state (a
+# Integration files that only read the runtime are modules of one binary,
+# `tests/objc_static_suite.rs`; each file that owns process-global state (a
 # swizzle, a panic hook, a global allocator, a self re-exec) is its own
-# `[[test]]` below. With autotests off a `tests/*.rs` file listed nowhere never
-# compiles.
+# `[[test]]` below. With autotests off, a `tests/*.rs` file listed nowhere
+# never compiles.
 autotests = false
 
 [lints]
 workspace = true
 
-# THE CONTAINER DRIVE, as a test with no libtest harness. libtest runs every
-# `#[test]` on a worker and parks its main thread, so neither branch of
-# `run_on_main` (which `MainThreadBound`'s `Drop` goes through) can be driven
-# from one. Without the harness `main` is the process main thread; the file
-# answers libtest's argv itself, as one test of this name.
+[features]
+# `aterm_objc::cg`, which links CoreGraphics. Off by default: the link is not
+# dead-stripped, so with it on every consumer binary loads a GUI framework
+# (`otool -L` on `aterm-sysprobe`'s display-less test binary shows it). winit
+# (crates/aterm-window), its one user, turns it on. Features unify per build:
+# `-p aterm-sysprobe` stays CG-free, a `--workspace` build links it everywhere.
+cg = []
+
+# No libtest harness: libtest runs each `#[test]` on a worker and parks the
+# main thread, so neither branch of `run_on_main` (which `MainThreadBound`'s
+# `Drop` goes through) is reachable from one. Here `main` is the process main
+# thread; the file answers libtest's argv itself, as one test of this name.
 [[test]]
 name = "main_thread_bound_drive"
 harness = false
 
-# TEST-ONLY. The shipped layer keeps its zero dependencies; the Tier-1 bind of
-# the run-loop wake timer (`tests/conformance_wake_timer.rs`) steps the derived
-# `run_loop_waker_model` beside the real timer, and that model lives in
-# `aterm-spec` (first-party, no dependency on this crate).
+# Test-only: `tests/conformance_wake_timer.rs` steps aterm-spec's derived
+# `run_loop_waker_model` beside the real wake timer.
 [dev-dependencies]
 aterm-spec = { workspace = true }
-# The SDK-constant probes' scratch directories, removed on drop. Workspace crate,
-# std-only, zero dependencies; already in the dev graph via aterm-spec.
+# `cg` for this crate's own tests and lint (`--all-targets`): the self-dev-
+# dependency unifies the feature into the lib under test. A dev edge, so no
+# consumer's normal graph turns it on.
+aterm-objc = { path = ".", features = ["cg"] }
+# Scratch directories for the SDK-constant probes.
 aterm-tempfile = { workspace = true }
 
 [[test]]
@@ -52,8 +59,8 @@ path = "tests/objc_static_suite.rs"
 name = "swizzle"
 path = "tests/swizzle.rs"
 
-# Alone: installs a process panic hook; `--test winit_seam` is the spelling
-# crates/aterm-gui/examples/objc_live_class_audit.rs cites.
+# Alone: installs a process panic hook. aterm-gui's `objc_live_class_audit`
+# example cites this test name.
 [[test]]
 name = "winit_seam"
 path = "tests/winit_seam.rs"

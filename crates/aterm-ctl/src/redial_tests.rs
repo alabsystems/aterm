@@ -168,10 +168,9 @@ fn a_resumed_subscribe_drops_its_old_process_anchors() {
     );
 }
 
-/// A resumed `events` stream asks the successor for what comes after the
-/// newest `block-complete` and `turn` it relayed (ids the handoff carries).
-/// Negative controls: a multi-target stream carries none, and a stream that
-/// relayed nothing keeps the anchor it was opened with.
+/// A resumed `events` stream asks for what follows the newest `block-complete`
+/// and `turn` it relayed, never below its opening anchor; a multi-target stream
+/// carries none.
 #[test]
 fn a_resumed_events_stream_keeps_its_carried_anchors() {
     let mut t = FrameTracker::new("subscribe @s-a events\n");
@@ -213,18 +212,9 @@ fn a_resumed_events_stream_keeps_its_carried_anchors() {
     );
 }
 
-/// A SELF target (`@.`, `@`, or none) is resolved again on the successor —
-/// for a client outside every session, the active tab — so the carried
-/// anchors ride only once it is pinned to the sid the stream's `sub` line
-/// named. With no such sid they are left off (the successor seeds at its live
-/// high); sent, another tab's finished blocks would come back as fresh events.
-///
-/// THE FALLBACK FOR A PINNED RESUME THE SUCCESSOR REFUSES: a replacement that
-/// is not an update names its sessions afresh, so the pinned sid meets `ERR no
-/// such session`. The request asked once more is the self target AS WRITTEN
-/// and NO anchors. Only where there is a pin to give up: a sid target, an
-/// unpinnable self target (no sid tied) and a multi-target stream have no
-/// other request to ask.
+/// A self target carries anchors only once pinned to the stream's `sub` sid
+/// (unpinned, another tab's finished blocks would come back as fresh events);
+/// a refused pin falls back to self as written, with no anchors.
 #[test]
 fn a_refused_pin_falls_back_to_self_as_written_without_anchors() {
     let seen = EventAnchors {
@@ -260,8 +250,8 @@ fn a_refused_pin_falls_back_to_self_as_written_without_anchors() {
             "{request}"
         );
     }
-    // Nothing to pin it to: the selector stays and the anchors do not ride.
-    // NEGATIVE CONTROL: a sid target carries its anchors as before.
+    // Nothing to pin it to: the selector stays and the anchors do not ride; a
+    // sid target carries its anchors.
     for (request, resumed) in [
         (
             "subscribe @. events since-block=3\n",
@@ -279,7 +269,7 @@ fn a_refused_pin_falls_back_to_self_as_written_without_anchors() {
             "{request}"
         );
     }
-    // NEGATIVE CONTROLS: nothing else to ask.
+    // Negative controls: nothing else to ask.
     for (request, sids) in [
         // A sid target keeps its anchors and has no self to fall back to.
         ("subscribe @s-bbbb events\n", &tied[..]),
@@ -301,11 +291,8 @@ fn a_refused_pin_falls_back_to_self_as_written_without_anchors() {
     }
 }
 
-/// The fallback outlives an update: after an update's successor took the
-/// pinned request, the next leg names the sid (`@s-a`), yet the fallback is
-/// still the original request's self as written. The negative control derives
-/// it from the last leg instead. A stream that named its session by sid has no
-/// fallback on any leg.
+/// The fallback derives from the original request, not from a last leg pinned to
+/// its sid; a stream that named its session by sid has no fallback.
 #[test]
 fn a_fallback_to_self_survives_a_leg_that_was_pinned() {
     let seen = EventAnchors {
@@ -337,9 +324,8 @@ fn a_fallback_to_self_survives_a_leg_that_was_pinned() {
     );
 }
 
-/// A successor's start for the relay tests below: after any hang-up — a fresh
-/// instance. (Without a stand-in, the in-process fake successor is THIS test
-/// process, which started long before the hang-up it serves.)
+/// A successor's start after any hang-up: a fresh instance. Without it the
+/// in-process fake successor is this test process, started long before.
 fn started_later(_: u32) -> Option<Stamp> {
     Some(Stamp {
         boot: Some(BootClock(u64::MAX)),
@@ -352,21 +338,11 @@ fn start_unknown(_: u32) -> Option<Stamp> {
     None
 }
 
-/// A PINNED SELF RESUME AND ITS FALLBACK'S LIMIT. A successor that lacks the
-/// pinned `s-old` answers `ERR no such session`. A FRESH one (started after
-/// the hang-up: a relaunch after a crash or a quit) is asked once more,
-/// unpinned and with no anchors, and the stream goes on with its own session
-/// (`fresh-self`, `fresh-bare`). One ALREADY RUNNING at the hang-up — the
-/// alias naming another window, or an update's successor whose copy of the
-/// tab closed — is played by this test process itself, whose real start
-/// predates the hang-up: it is NOT asked again, and the stream ends 75 instead
-/// of moving to its active tab (`stranger-self`).
-/// CONTROLS: an unreadable start fails closed (`unknown-self`); a successor
-/// that CARRIED the session is asked for it pinned, once (`carried-self`, the
-/// self-update); a stream that named `@s-old` is never re-targeted
-/// (`fresh-named`); and a refusal other than `ERR no such session` — a busy
-/// or saturated socket, a halt, a denial, from a successor that may well hold
-/// the session — is no reason to move, even from a fresh one (`fresh-refused`).
+/// A successor lacking the pinned `s-old` is asked again, unpinned, only when it
+/// started after the hang-up; one already running (this test process) ends the
+/// stream 75. Controls: an unreadable start fails closed, a carried session is
+/// asked for pinned once, a stream naming `@s-old` is never re-targeted, and a
+/// refusal other than `ERR no such session` never moves it.
 #[cfg(unix)]
 #[test]
 fn a_self_stream_moves_to_a_successors_own_session_only_when_it_started_after_the_hangup() {
@@ -531,14 +507,9 @@ fn a_self_stream_moves_to_a_successors_own_session_only_when_it_started_after_th
     }
 }
 
-/// The decision at a refused resume, pure: the successor is asked again, with
-/// self as written, only when it answered `ERR no such session` to the pinned
-/// form and started after the hang-up; that leg relays another session
-/// ([`LegSession::Other`], which [`FrameTracker::start_leg`] takes from here).
-/// Negative controls: a successor already running, one whose start cannot be
-/// read, one on the `latest` alias, another refusal, no answer, a stream with
-/// no self fallback, and a fallback equal to the pinned request all end the
-/// relay; a refused fallback is never followed by a third ask.
+/// The decision at a refused resume: asked again, self as written, only after
+/// `ERR no such session` to the pinned form from a fresh successor, and never a
+/// third time.
 #[test]
 fn a_refused_pin_is_asked_again_only_of_a_fresh_successor() {
     let pinned = Ask {
@@ -618,12 +589,8 @@ fn a_refused_pin_is_asked_again_only_of_a_fresh_successor() {
     );
 }
 
-/// A fallen-back stream follows another session, so the lost session's
-/// anchors must not ride with it: the next resume, pinned to the new sid,
-/// carries only what the new session relayed. Driven through the [`Ask`]
-/// [`after_refusal`] returns and [`FrameTracker::start_leg`]. Marking the leg
-/// [`LegSession::Same`] instead would pin `s-old`'s block 12 and turn 7 to
-/// `s-new`. Negative control: a leg on the same session keeps them.
+/// A fallen-back stream's next resume carries only the new session's anchors;
+/// a same-session leg keeps the old ones.
 #[test]
 fn a_fallen_back_stream_carries_only_its_new_sessions_anchors() {
     let original = "subscribe @. events\n";
@@ -672,12 +639,11 @@ const CHILD: [&str; 2] = ["redial::tests::serve_as_a_child_successor", "--exact"
 #[cfg(unix)]
 const CHILD_ENV: &str = "ATERM_CTL_REDIAL_TEST_CHILD";
 
-/// The body of a fake successor process for a relay test: it has a pid of its
-/// own, so the relay takes it for the successor of an in-process one (or the
-/// reverse). Idle unless [`CHILD_ENV`] is set. It binds its socket at once and
-/// says so; a test moves the socket into place by renaming it (a bound socket
-/// answers at its new path). It answers `version` probes `OK` and plays its
-/// role on the first other request:
+/// A fake successor process for relay tests: its own pid, so the relay takes it
+/// for the successor of an in-process server (or the reverse). Idle unless
+/// [`CHILD_ENV`] is set. It binds at once and says so (a test renames the bound
+/// socket into place), answers `version` `OK`, and plays its role on the first
+/// other request:
 ///
 /// - `second`: records it, answers for its `s-new` with that session's
 ///   `exited`, and leaves;
@@ -956,11 +922,8 @@ impl Drop for Orphan {
     }
 }
 
-/// The fallback's leg reset, through the relay: a self stream on `s-old` falls
-/// back to a fresh successor's own `s-new`, which relays its block 2, and is
-/// then replaced again by a second successor that carried `s-new` (an update).
-/// That one is asked for `s-new` with `s-new`'s anchor alone; resetting the
-/// fallback leg as the same session would send `since-block=12 since-turn=7`.
+/// After a fallback to a fresh successor's `s-new`, the next successor (which
+/// carried `s-new`) is asked with `s-new`'s anchor alone, never `s-old`'s.
 #[cfg(unix)]
 #[test]
 fn a_fallen_back_stream_asks_the_next_successor_for_its_new_sessions_anchors_only() {
@@ -1073,10 +1036,9 @@ fn conn_after(
     (dir, client)
 }
 
-/// What one ask of a successor came to. A busy listener writes its refusal and
-/// closes without reading, so the client's write of a 4 MiB request fails; the
-/// refusal left behind is the answer. A close with nothing left behind is
-/// `Gone`; an `OK`, and a close after the request, are lines.
+/// A failed write reads the refusal a busy listener left before closing unread;
+/// a close with nothing left is `Gone`; an `OK`, and a close after the request,
+/// are lines.
 #[cfg(unix)]
 #[test]
 fn a_write_that_fails_reads_the_refusal_the_successor_left() {
@@ -1132,22 +1094,12 @@ fn a_write_that_fails_reads_the_refusal_the_successor_left() {
     server.join().unwrap();
 }
 
-/// A SUCCESSOR THAT CLOSES ON THE RESUME IS ASKED AGAIN, AND IS NEVER EXIT 0
-/// WITHOUT ITS STREAM. A live successor can close on the resume ask (the
-/// listener with no lane free answers busy and closes without reading; macOS
-/// can discard that line with the unread request): that is neither a successor
-/// gone away nor an end on purpose. The connection the successor is handed for
-/// an ask is held 50 ms and closed, its request unread; the request is 4 MiB,
-/// so the client is still writing when the close lands and the WRITE FAILS,
-/// deterministically. BUSY (its reason written) and SILENT (nothing left
-/// behind), once each: the same successor is asked again and the stream goes
-/// on. SATURATED: silent once, and then — every lane at work — the next three
-/// connections, the probe that judges the silence among them, are answered busy
-/// unread; the busy probe is the successor still there (by `version`'s `OK`
-/// alone it would read as gone). SILENT FOREVER: asked again until the
-/// successor wait is spent, then exit 75 and nothing relayed — never 0. FAILS
-/// WITHOUT THE FIX: exit 75 after the first close, with nothing relayed;
-/// SATURATED, after the whole successor wait.
+/// A live successor that closes on the resume ask is asked again, and the
+/// stream never ends 0 without it. Each closed ask is held 50 ms and dropped
+/// unread, so the 4 MiB write fails. Busy and silent: asked again, the stream
+/// goes on. Saturated: silent, then busy to the next three connections, the
+/// probe among them proving it still there. Silent forever: exit 75 once the
+/// wait is spent.
 #[cfg(unix)]
 #[test]
 fn a_successor_that_closes_on_the_resume_is_asked_again_and_never_a_silent_exit_0() {
@@ -1189,13 +1141,10 @@ fn a_successor_that_closes_on_the_resume_is_asked_again_and_never_a_silent_exit_
                     let _ = (&conn).write_all(b"ERR control server busy; retry\n");
                     continue;
                 }
-                // Classified by its first eight bytes and no more: a probe
-                // is `version\n`, a `stop` is `stop\n`, and anything else is
-                // an ask. One it closes on leaves its 4 MiB request UNREAD —
-                // reading it would let the client's write succeed and the
-                // close never happen (a mutation check showed the test
-                // passing with the fix removed when this fake read the whole
-                // line).
+                // Classified by its first eight bytes alone: `version\n` is a
+                // probe, `stop\n` a stop, anything else an ask. One it closes on
+                // leaves its 4 MiB request unread; reading it would let the
+                // client's write succeed and the close never land.
                 use std::io::Read as _;
                 let _ = conn.set_read_timeout(Some(Duration::from_millis(500)));
                 let mut head = [0u8; 8];
@@ -1276,13 +1225,8 @@ fn a_successor_that_closes_on_the_resume_is_asked_again_and_never_a_silent_exit_
     }
 }
 
-/// A BUSY SUCCESSOR IS ASKED AGAIN: right after a Commit every client
-/// re-dials the successor at once, and a listener with no lane free answers
-/// `ERR control server busy; retry` — a passing refusal from a successor that
-/// is live and holds the session. The same successor is asked again within
-/// the successor wait: here it answers busy twice, then takes the
-/// stream, which goes on (its session's `exited` ends it, exit 0). FAILS
-/// WITHOUT THE FIX: exit 75 after the first busy answer.
+/// A successor answering busy is asked again within the successor wait: here
+/// busy twice, then it takes the stream.
 #[cfg(unix)]
 #[test]
 fn a_busy_successor_is_asked_again_and_the_stream_resumes() {
@@ -1356,13 +1300,8 @@ fn a_busy_successor_is_asked_again_and_the_stream_resumes() {
     );
 }
 
-/// THE HOLE BETWEEN TWO LEGS IS MARKED ON THE STREAM. A successor's resumed
-/// watch starts live: the PTY bytes its readers drained between the Commit and
-/// the resubscribe, and whatever mail and timeline records came in between, are
-/// never pushed (a `subscribe … bytes > build.log` would lose `BUILD OK` in
-/// silence). Each target the last leg named gets `GAP <local> replaced` between
-/// the legs, the stream's own loss marker. FAILS WITHOUT THE FIX: the legs are
-/// spliced bare.
+/// A resumed stream marks the hole between its legs with `GAP <local> replaced`,
+/// before the successor's frames.
 #[cfg(unix)]
 #[test]
 fn a_resumed_stream_marks_the_hole_between_its_legs() {
@@ -1433,16 +1372,10 @@ fn publish_entry(dir: &std::path::Path, sid: &str, sock: &std::path::Path) {
     .unwrap();
 }
 
-/// A FORWARDED STREAM FOLLOWS THE HOST THAT SERVES IT, NOT THE RELAY. A
-/// sibling aterm (A) that forwards `subscribe @s-abc …` to the aterm hosting
-/// the session (B) stays up when B self-updates and `_exit`s at its Commit,
-/// so an EOF from a live A is no end on purpose. A says so on the stream
-/// (`ERR gone pid=<B> sock=<B's socket>`, its last line), and the relay
-/// follows B's successor where B's sessions are republished (`graph/<sid>`
-/// beside B's socket): asked from the last block relayed, the marker never
-/// reaching the consumer. With none there within the wait: exit 75, never 0.
-/// FAILS WITHOUT THE FIX: the marker is relayed, A still answering reads as a
-/// deliberate end, and the stream exits 0 — in both cases.
+/// A relay (A) forwarding `subscribe @s-abc …` to a host (B) that went away
+/// stays up and says so on the stream: the relay follows B's successor where it
+/// republishes `graph/<sid>`, never passing the marker on; with none there
+/// within the wait, exit 75, never 0.
 #[cfg(unix)]
 #[test]
 fn a_forwarded_stream_follows_its_hosts_successor_not_the_relay() {
@@ -1541,10 +1474,8 @@ fn same_leg(request: &str) -> Ask {
     }
 }
 
-/// THE RESUME NOTE SAYS WHAT WAS NOT DELIVERED: it names the hole (`GAP
-/// <local> replaced`), what is lost in it, and goes on from the last relayed
-/// only for the events whose anchor the resume carried (a multi-target stream
-/// carries none).
+/// The resume note names the hole and what it lost, and says events go on from
+/// the last relayed only where the resume carried that anchor.
 #[test]
 fn the_resume_note_says_what_was_not_delivered() {
     let note = |asked: &str| {
@@ -1581,17 +1512,9 @@ fn the_resume_note_says_what_was_not_delivered() {
     );
 }
 
-/// THE RESUME NOTE SAYS WHAT THE SUCCESSOR WAS, AS FAR AS IT IS KNOWN. One
-/// running when the hang-up was seen is an update's successor; one that
-/// started after it on the fixed socket and took the stream pinned to its
-/// session is a relaunch that recovered the session (its keeper did), whose
-/// block and turn counts started over, so some events between the two may
-/// not have been delivered — the server replays after an anchor at or below
-/// its own count, so the note does not say none were; one that took `@*` or
-/// a self target never tied to a sid recovered nothing the note can name,
-/// and it says a relaunch and no more; an unreadable or shared arrival is
-/// not known to be either, and the note says only that aterm was replaced.
-/// CONTROL: the update wording is unchanged.
+/// The resume note names the successor only as far as it is known: an update,
+/// a relaunch that recovered the session (whose counts started over), a bare
+/// relaunch, or just a replaced aterm.
 #[test]
 fn the_resume_note_says_what_the_successor_was_only_as_far_as_it_is_known() {
     let pinned = same_leg("subscribe @s-a events since-block=12 since-turn=4\n");
@@ -1669,15 +1592,10 @@ fn started_between(_: u32) -> Option<Stamp> {
     *BETWEEN.lock().unwrap()
 }
 
-/// Each successor is judged against the hang-up it follows. A self stream on A
-/// (`s-old`) moves to S1, a child process, and loses it too; then S2 (this
-/// process) answers on the same fixed socket, lacks `s-old`, and started
-/// between the two hang-ups ([`BETWEEN`]): an update successor of S1. Against
-/// S1's hang-up it predates, so the stream ends 75 and S2 is asked only for
-/// `s-old`. Two ways to lose S1: `after-a-leg` (S1 took the pinned request and
-/// its stream hung up) and `after-a-failed-send` (S1 closed while a 4 MiB
-/// request was still being written; it reads 32 bytes). Controls (`…, fresh`):
-/// the same S2 started after both hang-ups is followed.
+/// Each successor is judged against the hang-up it follows: S2, started
+/// between the stream losing A and losing S1 (after a leg, or a failed send),
+/// predates S1's hang-up and ends the stream 75; started after both, it is
+/// followed.
 #[cfg(unix)]
 #[test]
 fn a_later_successor_is_judged_against_the_hangup_it_follows() {
@@ -1792,18 +1710,11 @@ fn a_later_successor_is_judged_against_the_hangup_it_follows() {
     }
 }
 
-/// A self stream moves only on the fixed socket the call named. Every
-/// successor here is fresh and lacks `s-old`. On a fixed `--sock` path only a
-/// relaunch of the instance configured there can bind, so the stream moves to
-/// its own session (`fixed`). Elsewhere a fresh process may be another
-/// window's (e.g. its update successor republishing the `latest` alias), so the
-/// stream ends 75 and is never asked for its self there: `--sock` to the alias
-/// (`alias`), the flagless follow of the alias from outside any session
-/// (`alias-follow`), `--sock` to another link (`link`), to a plain socket named
-/// as the alias (`alias-name`), or to an instance's own `aterm-<pid>.sock`
-/// (`instance`). Nor does a call made inside a session whose stale graph entry
-/// names a fixed socket a relaunch now holds (`graph-entry`). The rule is
-/// [`only_a_relaunch_binds`] plus the `--sock` arm in [`Redial::arrival`].
+/// A self stream moves to a fresh successor's own session only on a fixed
+/// `--sock` path (`fixed`), which only a relaunch can bind. On the alias, a
+/// link, an instance's own socket, or through a stale graph entry, a fresh
+/// process may be another window's, and the stream ends 75
+/// ([`only_a_relaunch_binds`]).
 #[cfg(unix)]
 #[test]
 fn a_self_stream_moves_only_on_the_fixed_socket_the_call_named() {
@@ -1966,13 +1877,9 @@ fn fresh_only_here(pid: u32) -> Option<Stamp> {
     }
 }
 
-/// The process asked is the one judged: every ask is a new connection, and the
-/// socket can change hands after the probe. P1 (this process, fresh) answers
-/// the probe on the fixed socket, then P2 (a child already running at the
-/// hang-up) has its socket renamed over P1's before the ask. P2 lacks `s-old`
-/// and predates the hang-up, so the stream ends 75 and P2 is asked only for
-/// `s-old`. Control (`both fresh`): with P2 fresh too, the hand-over is
-/// followed to P2's own session.
+/// The process asked is the one judged: P1 (fresh) answers the probe, then P2
+/// (already running) takes the socket before the ask, so the stream ends 75
+/// with P2 asked for `s-old` alone; with P2 fresh too, it is followed.
 #[cfg(unix)]
 #[test]
 fn a_refusal_is_judged_by_the_process_that_gave_it() {
@@ -2057,15 +1964,9 @@ fn a_refusal_is_judged_by_the_process_that_gave_it() {
     }
 }
 
-/// A leg resumed on a fresh instance's own session says it was a relaunch
-/// without the stream's session, and names self as the caller wrote it —
-/// `@.`, `@`, or no selector — never `@.` for the other two. One that did not
-/// move names the instance answering now and that it lacks the stream's
-/// session, in one line whatever the arrival was; the same pid back on a fresh
-/// listener reads as that, not as two processes. NEGATIVE CONTROL: neither
-/// reads "replaced", nor explains the clocks it was judged by. (The
-/// carried-session leg still reads "an update", never "fresh":
-/// [`the_resume_note_says_what_the_successor_was_only_as_far_as_it_is_known`].)
+/// A fallback leg's note says a relaunch without the stream's session and names
+/// self as the caller wrote it; an unresumed one names the instance answering
+/// now, or the same pid reopening its socket.
 #[test]
 fn the_notes_say_what_the_successor_was() {
     for (original, words) in [
@@ -2116,13 +2017,10 @@ fn the_notes_say_what_the_successor_was() {
     );
 }
 
-/// A successor's start is the kernel's record, on the boot clock the hang-up
-/// is read from (macOS and Linux). A process spawned after a moment reads as
-/// [`Arrival::Fresh`] against it, this test process (started before) as
-/// [`Arrival::Predates`]; an ended process has no start. The child is spawned
-/// two Linux clock ticks after the moment, since Linux records a start by its
-/// tick. Where the platform keeps no start record every start is unknown and
-/// the relay fails closed ([`Arrival::Unknown`]).
+/// A successor's start is the kernel's boot-clock record (macOS and Linux): a
+/// child spawned after a moment is fresh against it, this process predates it,
+/// and an ended process has none; elsewhere every start is unknown. The 20 ms
+/// sleep spans two Linux clock ticks.
 #[cfg(unix)]
 #[test]
 fn a_process_started_after_a_moment_is_fresh_against_it() {
@@ -2276,17 +2174,10 @@ fn linux_zombie(pid: u32) -> Option<Stamp> {
     linux_started(pid, 123_457, 'Z')
 }
 
-/// The Linux start record moves a self stream only for a relaunch. Run on any
-/// host through the relay, with the relay's clock and the successor's start
-/// read as Linux reads them (boot clock in nanoseconds, `/proc/<pid>/stat`
-/// field 22 in ticks, [`linux_started`]). A successor started in the tick after
-/// the hang-up's is a relaunch: asked again unpinned, and the stream continues
-/// with its `s-new` (exit 0). Negative controls, each ending 75 with only the
-/// pinned `s-old` asked: a start well before the hang-up; a start in the
-/// hang-up's own tick (read as the tick's first instant); and a record of an
-/// ended process. On Linux the same order is driven with real processes in
-/// [`a_process_started_after_a_moment_is_fresh_against_it`] and
-/// [`a_relaunch_between_the_old_servers_exit_and_the_relays_read_is_fresh`].
+/// The Linux start record moves a self stream only for a relaunch, run on any
+/// host with Linux's clock and start record ([`linux_started`]): a start in the
+/// tick after the hang-up's is followed; one well before, in the hang-up's own
+/// tick, or of an ended process ends the stream 75.
 #[cfg(unix)]
 #[test]
 fn a_linux_start_record_moves_a_self_stream_only_for_a_relaunch() {
@@ -2320,7 +2211,7 @@ fn wall_at(seconds: u64) -> Option<SystemTime> {
     UNIX_EPOCH.checked_add(Duration::from_secs(1_800_000_000 + seconds))
 }
 
-/// A hang-up as the x86_64 slice reads it under ROSETTA
+/// A hang-up as the x86_64 slice reads it under Rosetta
 /// ([`aterm_uds::process::boot_clock_now`] answers `None` there): the wall
 /// clock alone, at [`wall_at`] 10.
 fn rosetta_clock() -> Stamp {
@@ -2356,14 +2247,9 @@ fn started_in_kernel_ticks_before(_: u32) -> Option<Stamp> {
     })
 }
 
-/// A relay under Rosetta orders a relaunch on the wall clock: the translated
-/// x86_64 slice reads no boot clock ([`rosetta_clock`]) while start records
-/// are in kernel ticks. `relaunch` (wall later) is followed; `already running`
-/// (wall earlier) ends 75. Control: the translated reading taken for the boot
-/// clock ([`rosetta_clock_in_nanoseconds`]) puts the hang-up ×125/3 after every
-/// start, and the same relaunch ends 75. The withholding itself is
-/// [`aterm_uds::process::apple_boot_clock`]'s, tested by
-/// `a_translated_process_reads_no_boot_clock`.
+/// Under Rosetta (no boot clock, start records in kernel ticks) a relaunch is
+/// ordered on the wall clock; the translated nanoseconds taken for boot ticks
+/// would end the same relaunch 75.
 #[cfg(unix)]
 #[test]
 fn a_relay_under_rosetta_orders_a_relaunch_on_the_wall_clock() {
@@ -2407,17 +2293,10 @@ fn a_relay_under_rosetta_orders_a_relaunch_on_the_wall_clock() {
     }
 }
 
-/// THE ORDER, pure ([`later`], [`arrival_of`], [`earliest`]) — what
-/// [`Redial::arrival`] judges every relay's successor by: the boot clock
-/// decides wherever both sides were read on it, whatever the wall clock says
-/// (the first two cases: a wall clock stepped back would read a relaunch as
-/// already running, one stepped ahead an update's successor as a relaunch);
-/// the wall clock only where one side has no boot reading; nothing where the
-/// two share no clock (a Linux start, boot-only, against a hang-up read
-/// without a boot clock) — [`Arrival::Unknown`], which ends the stream. A
-/// hang-up is the EARLIER of the relay's read and the exit's stamp, each of
-/// which is at or after the exit; the read alone when there is no stamp or
-/// the two cannot be ordered.
+/// The boot clock orders a start and a hang-up wherever both have it, whatever
+/// the wall clock says; the wall clock decides only where one side lacks it,
+/// and with no shared clock the arrival is [`Arrival::Unknown`]. A hang-up is
+/// the earlier of the relay's read and the exit stamp.
 #[test]
 fn the_boot_clock_orders_a_start_and_a_hangup_wherever_both_have_it() {
     let at = |boot: Option<u64>, wall: Option<u64>| Stamp {
@@ -2618,20 +2497,13 @@ fn crash_and_let_its_watch_stamp_it(server: &mut ChildSuccessor) {
     }
 }
 
-/// A relaunch between the old server's exit and the relay's read is fresh.
-/// The old instance is a real process on the fixed socket; it is `SIGKILL`ed
-/// while the relay is blocked writing to a stalled consumer ([`Stall`]), and a
-/// real relaunch starts after the crash and before the relay reads the EOF.
-/// Judged against the exit the kernel reported to the relay's watch it is
-/// fresh, and the stream continues with its `s-new`. `relaunch, orphaned
-/// server`: the same with the old instance an orphan, so the watch is
-/// registered on a same-uid process that is not this one's child, as in
-/// production (Darwin gates `NOTE_EXITSTATUS` on parentage or the right to
-/// signal). Controls, each ending 75 with only `s-old` asked: `already
-/// running` (the successor starts after the watch is registered and before the
-/// crash, as in a real update, so it predates the exit; a watch stamping at
-/// registration would get this wrong), and `no watch` (the old server was gone
-/// before a watch could be registered, so the relay's own read decides).
+/// A relaunch between the old server's exit and the relay's read is fresh: the
+/// old instance is `SIGKILL`ed while the relay is blocked on a stalled consumer
+/// ([`Stall`]), and the relaunch is judged against the exit the kernel
+/// reported. An orphaned old instance is watched too, as in production (Darwin
+/// gates `NOTE_EXITSTATUS` on parentage or the right to signal). Controls
+/// ending 75: a successor up before the crash (a watch stamping at registration
+/// would misjudge it), and a server gone before any watch.
 #[cfg(unix)]
 #[test]
 fn a_relaunch_between_the_old_servers_exit_and_the_relays_read_is_fresh() {
@@ -2736,13 +2608,9 @@ fn a_relaunch_between_the_old_servers_exit_and_the_relays_read_is_fresh() {
     }
 }
 
-/// Each leg's server is watched from its ask: a self stream rides an update to
-/// S1, a real process that carried `s-old`; S1 then crashes while the relay is
-/// blocked writing its frames, and a relaunch R starts before the relay reads
-/// the EOF. R is judged against S1's exit as reported to the watch registered
-/// at the ask, so it is fresh and the stream continues with R's `s-new`. The
-/// first leg's watch is covered by
-/// [`a_relaunch_between_the_old_servers_exit_and_the_relays_read_is_fresh`].
+/// A later leg's server is watched from its ask: S1, reached through an update,
+/// crashes under a stalled relay, and a relaunch started before the relay reads
+/// the EOF is fresh against S1's exit.
 #[cfg(unix)]
 #[test]
 fn a_relaunch_after_a_later_legs_server_crashed_is_judged_by_that_exit() {
@@ -2811,10 +2679,8 @@ fn a_relaunch_after_a_later_legs_server_crashed_is_judged_by_that_exit() {
     assert!(text.contains("sub 5 s-new"), "R's leg: {text}");
 }
 
-/// A local number is an old-process anchor: a successor numbers adopted
-/// sessions afresh. Each local target is rewritten to the sid the stream's
-/// `sub <n> <sid>` line named; one never tied to a sid cannot be followed.
-/// Negative control: sid, self and roster targets pass unchanged.
+/// A resumed subscribe names each local target by the sid its `sub` line tied
+/// it to; an untied one cannot be followed.
 #[test]
 fn a_resumed_subscribe_names_a_local_target_by_its_sid() {
     let tied = [
@@ -2905,12 +2771,9 @@ fn only_anchorless_blocking_reads_are_asked_again() {
     assert!(!is_blocking_read(&parts("send hi")));
 }
 
-/// A `turn` or a `post` cut by its server going away is reported as a
-/// replacement — exit 75 with a note that its text may already have been typed,
-/// or the post queued and carried — never the bare exit-1 transport error a
-/// caller retries (typing the prompt twice, or sending a duplicate beside the
-/// carried copy). It is a write, so it is never asked again. NEGATIVE CONTROL:
-/// the other writes keep their old error.
+/// A cut `turn` or `post` is reported as a replacement (exit 75, a note that it
+/// may already have taken effect), never as a bare error a caller would retry,
+/// and is never asked again; other writes keep their error.
 #[test]
 fn a_cut_turn_or_post_is_reported_as_a_replacement_and_never_asked_again() {
     let parts = |s: &str| -> Vec<String> { s.split_whitespace().map(String::from).collect() };
@@ -2930,7 +2793,20 @@ fn a_cut_turn_or_post_is_reported_as_a_replacement_and_never_asked_again() {
         for &word in words {
             assert!(note.contains(word), "{write}: {note}");
         }
+        // And when nothing answered in time — a crash the PTY keeper recovers
+        // the session from leaves its agent running — the same instead.
+        let gone = gone_request_note(
+            gone_note(Some(7), Duration::from_secs(30), false, None),
+            &parts(write),
+        );
+        for &word in words.iter().chain(&["cannot be resumed"]) {
+            assert!(gone.contains(word), "{write}: {gone}");
+        }
+        assert!(gone.ends_with("(exit 75)"), "{gone}");
     }
+    // NEGATIVE CONTROL: a read cut by a crash says only that it is gone.
+    let gone = gone_note(Some(7), Duration::from_secs(30), false, None);
+    assert_eq!(gone_request_note(gone.clone(), &parts("text")), gone);
     for write in ["send hi", "key enter"] {
         assert!(!reports_replacement(&parts(write)), "{write}");
     }
@@ -2965,19 +2841,17 @@ fn only_a_server_that_answers_counts_as_serving() {
     server.join().unwrap();
 }
 
-/// A successor bound for a verdict that must be REACHED — the fake server's
-/// thread answering the probe: a hang detector (AGENTS.md: a minute, never a
-/// latency budget), left the moment the server answers. The short bounds below
-/// are only for `Gone`, where waiting the bound out is the verdict: under a
-/// 300-400 ms bound a loaded box could leave the fake server unscheduled past
-/// the probe's timeout, and a server that answers read as gone.
+/// A successor bound for a verdict that must be reached: a one-minute hang
+/// detector, left the moment the server answers. Short bounds are only for
+/// `Gone`, where waiting the bound out is the verdict: under one, a loaded
+/// machine can leave a fake server unscheduled past the probe, and a server
+/// that answers then reads as gone.
 #[cfg(unix)]
 const REACHED: Duration = Duration::from_secs(60);
 
-/// A successor bound only a REGRESSION waits out — a call that should not wait
-/// for a successor at all, or should stop at its own deadline: five minutes, so
-/// [`REACHED`], a minute's hang detector, tells the two apart whatever the
-/// machine's load (AGENTS.md: never a latency budget of seconds).
+/// A successor bound only a regression waits out (a call that should not wait,
+/// or should stop at its own deadline): far enough past [`REACHED`] to tell the
+/// two apart under any load.
 #[cfg(unix)]
 const FAR: Duration = Duration::from_secs(300);
 
@@ -3048,15 +2922,10 @@ fn a_hangup_is_classified_by_who_serves_the_path_now() {
     assert!(started.elapsed() < REACHED, "{:?}", started.elapsed());
 }
 
-/// THE COLD UPDATE LANE, replayed: aterm-gui's `Endpoint::retire` closes the
-/// listening socket and cuts every stream right before the `exec`, which
-/// keeps the pid; the exec'd image binds the same path, and an `exec` that
-/// returned reopens it — a fresh listener renamed over the path — from the
-/// same process. The relay here is that process's own client, up only once
-/// the fresh listener is: the stream follows the SAME pid to it, and when that
-/// listener, still serving, ends the resumed stream, the stream is over (exit
-/// 0), never followed again. A `--pid` pin follows it as `--sock` does: that
-/// pid is the one process the pin names.
+/// A cold update cuts every stream for an `exec` that keeps the pid (aterm-gui's
+/// `Endpoint::retire`), then binds a fresh listener at the same path: the stream
+/// follows the same pid there, under `--sock` and `--pid` alike, and that
+/// listener ending the resumed stream ends it 0.
 #[cfg(unix)]
 #[test]
 fn a_stream_cut_for_an_exec_follows_the_same_pid_to_its_fresh_listener() {
@@ -3121,10 +2990,8 @@ fn a_stream_cut_for_an_exec_follows_the_same_pid_to_its_fresh_listener() {
     }
 }
 
-/// A `--pid` pin whose process has ended is gone at once, even unreaped. The
-/// pinned instance is this test's own child, `SIGKILL`ed and left a zombie,
-/// which `kill(pid, 0)` still finds; the pin must not wait out the successor
-/// bound for it.
+/// A `--pid` pin whose process ended unreaped (a zombie `kill(pid, 0)` still
+/// finds) is gone at once, without waiting out the successor bound.
 #[cfg(unix)]
 #[test]
 fn a_pid_pin_whose_process_has_ended_unreaped_is_gone_at_once() {
@@ -3237,7 +3104,7 @@ fn a_subscription_follows_its_server_across_a_replacement() {
     assert!(requests[0].contains("since=9"));
     assert_eq!(requests[1], "subscribe @s-a cursor,events\n");
 
-    // Control: the relay as it was, on the same shape of first leg.
+    // Control: a plain copy-to-EOF relay stops at the hang-up.
     let (_dir2, sock2) = scratch_sock("rd-before");
     let (tx2, _rx2) = std::sync::mpsc::channel();
     let old2 = fake_server(
@@ -3259,10 +3126,9 @@ fn a_subscription_follows_its_server_across_a_replacement() {
     );
 }
 
-/// The old server acknowledged `subscribe @3 …` with `sub 3 s-aaaa`; the
-/// successor is asked for `@s-aaaa`, not `@3`. A local target the stream never
-/// tied to a sid (no `sub` line read) is not followed: exit 75, the successor
-/// asked nothing.
+/// A stream by local number follows its session: the successor is asked for
+/// the sid its `sub` line tied (`@s-aaaa`, not `@3`); untied, exit 75 with
+/// nothing asked.
 #[cfg(unix)]
 #[test]
 fn a_subscription_by_local_number_follows_its_session_not_the_number() {
@@ -3546,7 +3412,7 @@ fn a_blocking_read_is_asked_again_only_where_that_means_the_same_question() {
         .unwrap();
         assert_eq!(code, ExitCode::from(EXIT_REPLACED), "{cut}");
     }
-    // The same server still answering: the original error, as before.
+    // The same server still answering: the original error.
     let err = super::super::replaced_before_reply(
         &path,
         Some(std::process::id()),
@@ -3563,21 +3429,12 @@ fn a_blocking_read_is_asked_again_only_where_that_means_the_same_question() {
     server.join().unwrap();
 }
 
-/// An explicit `--timeout` bounds the wait for a successor. Against the real
-/// 30 s [`SUCCESSOR_BOUND`], the classification, a `subscribe` relay under a
-/// short watch, and a blocking read with little left each give up at about
-/// the deadline (exit 75, naming the deadline). Negative control: with no
-/// deadline the whole bound is waited (on a 1 s bound of its own).
-///
-/// Sized so load cannot decide it. The legs run against a [`FAR`] successor
-/// bound of five minutes, and each must end inside `deadline..`[`REACHED`]: the
-/// floor is safe because every leg's clock starts before its deadline is fixed,
-/// and it shows each really waited for a successor; the ceiling is a minute's
-/// hang detector (AGENTS.md) and still sits minutes under the bound that
-/// ignoring the deadline would wait. The 2 s deadline is also the relay's
-/// headroom to read its already-buffered frames and EOF before its watch
-/// expires. The control runs on a 1 s bound of its own, so the test does not
-/// pay the bound.
+/// An explicit `--timeout` bounds the wait for a successor: the classification,
+/// a `subscribe` relay and a blocking read each give up at the deadline (exit
+/// 75, naming it). Each must end inside `deadline..`[`REACHED`] against a
+/// [`FAR`] bound, so load cannot decide it; the 2 s deadline also leaves the
+/// relay time to read its buffered frames. Control: with no deadline the whole
+/// (1 s) bound is waited.
 #[cfg(unix)]
 #[test]
 fn an_explicit_timeout_bounds_the_wait_for_a_successor() {
@@ -3804,7 +3661,7 @@ fn a_flagless_call_never_takes_an_unrelated_instance_for_a_successor() {
         follow.after_hangup(alias.to_str().unwrap(), Some(gone), None, None),
         Hangup::Gone { .. }
     ));
-    // Outside any session the alias IS what the call followed: taken.
+    // Outside any session the alias is what the call followed: taken.
     let outside = Redial::new(Follow::Flagless {
         dir: dir.clone(),
         self_sid: None,
@@ -3833,11 +3690,8 @@ fn a_flagless_call_never_takes_an_unrelated_instance_for_a_successor() {
     stranger.join().unwrap();
 }
 
-/// The relay across the real update path: the old instance's socket goes dark
-/// for good, the successor comes up on its own socket and republishes the
-/// session's graph entry, and the stream resumes from it on the same stdout.
-/// The successor binds AFTER the hang-up, while the client waits, and is found
-/// inside the bound.
+/// Across the real update path the stream resumes on the successor's own
+/// socket, found through the graph entry it republishes after the hang-up.
 #[cfg(unix)]
 #[test]
 fn a_flagless_subscription_resumes_on_the_successors_new_socket() {
@@ -3906,10 +3760,8 @@ fn a_flagless_subscription_resumes_on_the_successors_new_socket() {
 }
 
 /// Where a redial looks follows how the call resolved: a `--pid` pin follows no
-/// successor, `--sock` follows its path, and the flagless default the calling
-/// session's graph entry and the alias in the rendezvous dir (`Nothing` with no
-/// such dir). No environment variable selects a socket, so none steers a
-/// redial.
+/// successor, `--sock` its path, and the flagless default the calling session's
+/// graph entry or the alias (`Nothing` with no rendezvous dir).
 #[test]
 fn a_redial_follows_what_the_call_resolved_through() {
     use super::super::redial_follow_in as follow;
@@ -3986,7 +3838,7 @@ fn a_dial_stream_whose_remote_closes_is_exit_75_not_0() {
     .unwrap();
     assert_eq!(code, ExitCode::from(EXIT_REPLACED));
     assert!(String::from_utf8(out).unwrap().contains("hello"));
-    // A hang detector (AGENTS.md): a successor wait sits out [`FAR`].
+    // A hang detector: a successor wait would sit out [`FAR`].
     assert!(started.elapsed() < REACHED, "no successor wait");
     stop(&sock);
     server.join().unwrap();
@@ -4106,12 +3958,8 @@ fn each_exit_75_note_gives_the_one_reason_it_knows() {
     assert_eq!(dial_name(&["text"]), None);
 }
 
-/// A `dial` whose remote closes before answering exits 75, and a dialled `turn`
-/// or `post` (possibly already typed or queued on the remote) says not to send
-/// it again blind, as [`not_asked_again_note`] does after an update. Each case
-/// is the whole request, as both call sites pass it to
-/// [`remote_closed_note_for`], so parsing the relayed request past `dial
-/// <name>` is pinned too.
+/// A dialled `turn` or `post` cut by its remote says never to send it again
+/// blind. Each case is the whole request, as both call sites pass it.
 #[test]
 fn a_dialled_turn_or_post_cut_by_its_remote_is_never_sent_again_blind() {
     for (request, words) in [
@@ -4160,12 +4008,9 @@ fn a_dialled_turn_or_post_cut_by_its_remote_is_never_sent_again_blind() {
     );
 }
 
-/// A dialled wait for a change after its arm (`await block`, `await consent`,
-/// a bare `await seq`) cut by its remote says to read the session there before
-/// waiting again: a self-updating remote's successor parses the finished
-/// command's output before any re-dial can arm. Negative control: a dialled
-/// plain read (`await idle`) and an `await seq` with a counter keep the plain
-/// note.
+/// A dialled wait from its arm cut by its remote says to read the session there
+/// before waiting again; a plain read and an `await seq` with a counter keep
+/// the plain note.
 #[test]
 fn a_dialled_wait_from_its_arm_cut_by_its_remote_reads_the_session_first() {
     for (request, wait) in [
@@ -4209,13 +4054,8 @@ fn a_dialled_wait_from_its_arm_cut_by_its_remote_reads_the_session_first() {
 }
 
 /// End to end: a `dial` request cut before its reply while the relay still
-/// serves is the remote closing the connection, and exits 75 — not the exit-1
-/// `server closed the connection without responding` a caller retries, which
-/// for a `turn` or `post` typed a prompt twice or sent a post beside a queued
-/// copy. The note's words, and the relayed request both call sites hand it,
-/// are pinned by [`each_exit_75_note_gives_the_one_reason_it_knows`] and
-/// [`a_dialled_turn_or_post_cut_by_its_remote_is_never_sent_again_blind`];
-/// stderr is not captured here.
+/// serves exits 75, not the exit-1 transport error a caller retries (the note's
+/// words are pinned by the tests above; stderr is not captured here).
 #[cfg(unix)]
 #[test]
 fn a_dialled_turn_or_post_cut_while_the_relay_serves_is_exit_75() {

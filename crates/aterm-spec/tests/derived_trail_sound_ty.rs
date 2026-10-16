@@ -1,36 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-//! Tier-0 for the typing-sound machines: the key SEAM (`TrailSoundSeam`,
-//! D1/D2 — a motion or performance policy must not mute typing) and the
-//! audio host's REOPEN LADDER (`TrailAudioReopenLadder`, D5 — one device
-//! fault is not forever, and the budget is really spent).
+//! Tier-0 for the typing-sound machines: the key seam (`TrailSoundSeam`: a motion or
+//! performance policy must not mute typing) and the audio host's reopen ladder
+//! (`TrailAudioReopenLadder`: one device fault is not forever, and the budget is really spent).
 //!
-//! Every obligation is discharged by the in-process interpreter and, where a
-//! Trust `ty` is discoverable, additionally by `ty` (the tiers must agree;
-//! see `aterm_spec::verify`). Each test prints which tiers actually ran.
-//!
-//! Beyond prove-and-catch, three non-vacuity checks run on both machines,
-//! because a green prove-and-catch can still hide a model that proves
-//! nothing:
-//!
-//! * PER-INVARIANT catching — every invariant is falsified by the
-//!   `Buggy = 1` family when checked ALONE (`uncaught_invariants` is empty),
-//!   so no invariant is a ghost riding on another's counterexample.
-//! * NO DEAD ACTION — every action fires somewhere in the committed space.
-//! * THE GUARD-CONJUNCT AUDIT — the recorded gap where a green run missed a
-//!   real race because a guard CONJUNCT made the racing state unreachable
-//!   and the invariant naming it was vacuously true. For every top-level
-//!   conjunct of every guard it reports WHAT DROPPING IT DOES: which
-//!   invariants it carries (each checked alone), and whether it changes a
-//!   NON-STUTTER transition (a self-loop is not behaviour). The test pins
-//!   that report against a declared role per conjunct, so a new guard, or a
-//!   guard that starts carrying an invariant, fails until it is declared:
-//!   a DECISION must carry nothing and change behaviour; a STUTTER
-//!   suppressor changes nothing but self-loops; an ENVIRONMENT premise (a
-//!   clock cannot run out before it started) may carry an invariant, and is
-//!   then exactly what the Tier-1 conformance binds by comparing
-//!   `Model::action_enabled` with the real predicate everywhere it goes.
+//! Beyond prove-and-catch, both machines are checked for non-vacuity: every invariant is caught
+//! alone, every action fires, and the guard-conjunct audit (which invariants each conjunct
+//! carries, and whether dropping it changes a non-stutter transition) is pinned against a
+//! declared `Role` per conjunct. A guard conjunct can make a racing state unreachable and its
+//! invariant vacuously true, so a new guard, or one that starts carrying an invariant, fails
+//! until declared.
 
 use std::collections::BTreeSet;
 
@@ -69,7 +49,7 @@ fn assert_no_ghosts_and_no_dead_actions(m: &Model) {
     assert_eq!(fired, all, "{}: an action never fires at Buggy=0", m.name);
 }
 
-/// The declared role of one guard conjunct (see the module note).
+/// The declared role of one guard conjunct.
 #[derive(Clone, Copy, Debug)]
 enum Role {
     /// Carries no invariant and changes behaviour.
@@ -115,9 +95,7 @@ fn trail_sound_seam_proves_the_rulings_and_catches_d1() {
     let covered = verify::prove_and_catch_scalar(&m, m.name);
     eprintln!("TrailSoundSeam prove-and-catch covered by: {covered:?}");
     assert_no_ghosts_and_no_dead_actions(&m);
-    // No guards at all: every tick class and both readers are enabled
-    // everywhere, so the audit has nothing to weaken — asserted rather than
-    // assumed, so a guard added later is audited instead of slipping past.
+    // No guards at all, asserted so a guard added later is audited.
     assert!(m.actions.iter().all(|a| a.guard.is_none()));
     assert!(audit_guard_conjuncts(&m, None).is_empty());
 }
@@ -129,8 +107,7 @@ fn trail_sound_seam_witnesses_every_ruling_and_the_d1_replay() {
     // The rulings, on the committed machine.
     for (tick, key, tone) in [
         ("TickLit", 1, 1),
-        // THE FIX: dark only for a motion or performance reason, still heard,
-        // and the verb says so.
+        // Dark for a motion or performance reason: still heard, and the verb says so.
         ("TickDarkMotion", 1, 1),
         ("TickDarkUnfocused", 2, 2),
         ("TickDarkUserOff", 2, 2),
@@ -145,15 +122,13 @@ fn trail_sound_seam_witnesses_every_ruling_and_the_d1_replay() {
     // Before any tick nothing is heard: a host that never ticks is silent.
     let s = run(&m, &["Key"]);
     assert_eq!(s["key"], 2);
-    // A tick clears the readers, so an answer is always about ITS tick.
+    // A tick clears the readers, so an answer is always about its tick.
     let s = run(&m, &["TickDarkUnfocused", "Key", "TickLit"]);
     assert_eq!(s["key"], 0);
 
     let buggy = interp::with_buggy(&m, 1);
-    // D1/D2 REPLAYED: the zero-amplitude return closed the seam
-    // unconditionally, so a shed frame or Reduce Motion muted the key — and
-    // the verb, which reads the engine last, reports the silence as
-    // `closed:engine-silent`, the sensor this machine exists to keep dark.
+    // The muted-typing replay: the zero-amplitude return closes the seam unconditionally, so a
+    // shed frame or Reduce Motion mutes the key and the verb reports `closed:engine-silent`.
     let d1 = run(&buggy, &["TickDarkMotion", "Key", "Tone"]);
     assert_eq!((d1["key"], d1["tone"]), (2, 3));
     assert!(!buggy.check_invariant("FocusedKeyIsHeard", &d1));
@@ -162,16 +137,15 @@ fn trail_sound_seam_witnesses_every_ruling_and_the_d1_replay() {
     let fixed = run(&m, &["TickDarkMotion", "Key", "Tone"]);
     assert!(m.check_invariant("FocusedKeyIsHeard", &fixed));
 
-    // The naive over-correction: opening every dark return sounds a key in
-    // an unfocused window while the verb says `closed:unfocused`.
+    // The over-correction: opening every dark return sounds a key in an unfocused window while
+    // the verb says `closed:unfocused`.
     let over = run(&buggy, &["TickDarkUnfocused", "Key", "Tone"]);
     assert_eq!((over["key"], over["tone"]), (1, 2));
     assert!(!buggy.check_invariant("ForeignKeyIsSilent", &over));
     assert!(!buggy.check_invariant("ToneAgreesWithTheKey", &over));
 
-    // The verb's pre-fix `trail_on = enabled`: a user-dimmed aurora is
-    // silent, correctly, but named `engine-silent` — a false regression
-    // alarm on the one field meant to raise a real one.
+    // Buggy=1, `trail_on = enabled`: a user-dimmed aurora is silent, correctly, but named
+    // `engine-silent`, a false regression alarm.
     let dimmed = run(&buggy, &["TickDarkUserOff", "Key", "Tone"]);
     assert_eq!((dimmed["key"], dimmed["tone"]), (2, 3));
     assert!(!buggy.check_invariant("EngineSilentIsUnreachable", &dimmed));
@@ -184,14 +158,9 @@ fn trail_audio_reopen_ladder_proves_bounded_recovery_and_catches_every_replay() 
     let covered = verify::prove_and_catch_scalar(&m, m.name);
     eprintln!("TrailAudioReopenLadder prove-and-catch covered by: {covered:?}");
     assert_no_ghosts_and_no_dead_actions(&m);
-    // What each guard conjunct IS, measured (see the module note). Two
-    // change behaviour; four only suppress self-loops; exactly one — the
-    // healthy window can only run out once it has started — carries
-    // invariants, and it is an environment fact the Tier-1 conformance
-    // checks against the real `played_since` in every configuration. That
-    // it carries all three is the point of the `evidence` record: a window
-    // that finishes without a delivery is now refuted HERE, where the first
-    // draft of this machine stayed green and only Tier-1 noticed.
+    // Only the healthy window's "it has started" conjunct carries invariants: an environment fact
+    // Tier-1 checks against the real `played_since`. It carries all three because of the
+    // `evidence` record, which refutes a window that finishes without a delivery.
     assert_audit(
         &m,
         &[
@@ -212,9 +181,7 @@ fn trail_audio_reopen_ladder_proves_bounded_recovery_and_catches_every_replay() 
         ],
     );
 
-    // …and at the SHIPPING budget (`REOPEN_BUDGET = 6`), which is what the
-    // Tier-1 conformance drives, the committed machine still proves and the
-    // defect family is still caught.
+    // It also proves and catches at the shipping budget (`REOPEN_BUDGET = 6`, what Tier-1 drives).
     let shipping = interp::with_consts(&m, &[("Budget", 6)]);
     let covered = verify::prove_and_catch_scalar(&shipping, "TrailAudioReopenLadder@Budget=6");
     eprintln!("TrailAudioReopenLadder@Budget=6 covered by: {covered:?}");
@@ -227,8 +194,8 @@ fn trail_audio_reopen_ladder_witnesses_recovery_exhaustion_and_the_replays() {
     let budget = m.consts.iter().find(|c| c.0 == "Budget").expect("Budget").1;
     assert_eq!(budget, 2);
 
-    // A transient fault: the first reopen is immediate, the device plays,
-    // and once it has PLAYED through a healthy window the budget is back.
+    // A transient fault: the first reopen is immediate, and once the device has played through a
+    // healthy window the budget is back.
     let s = run(&m, &["Cue", "CueSounds", "DeviceFaults"]);
     assert_eq!((s["attempts"], s["waiting"], s["failed"]), (1, 0, 0));
     let s = fire(&m, "Cue", &s);
@@ -247,8 +214,7 @@ fn trail_audio_reopen_ladder_witnesses_recovery_exhaustion_and_the_replays() {
         (0, 0, 0)
     );
 
-    // TIME SINCE THE FAULT IS NOT PLAY TIME: a fault gone stale, then one
-    // delivery, hands nothing back.
+    // Time since the fault is not play time: a stale fault then one delivery hands nothing back.
     let s = run(
         &m,
         &["Cue", "DeviceFaults", "StaleElapses", "Cue", "CueSounds"],
@@ -269,23 +235,20 @@ fn trail_audio_reopen_ladder_witnesses_recovery_exhaustion_and_the_replays() {
     let s = fire(&m, "DeviceFaults", &waited);
     assert_eq!((s["failed"], s["attempts"]), (1, budget));
     assert!(m.check_invariant("SilenceIsPermanentOnlyWhenTheBudgetIsSpent", &s));
-    // Terminal: nothing after exhaustion opens a device, resets the ladder
-    // or spends another reopen.
+    // Terminal: nothing after exhaustion opens a device, resets the ladder or spends a reopen.
     for action in ["Cue", "CueSounds"] {
         assert_eq!(fire(&m, action, &s), s, "{action} after exhaustion");
     }
     assert!(!m.action_enabled("DeviceFaults", &s));
 
     let buggy = interp::with_buggy(&m, 1);
-    // THE PRE-D5 LAW REPLAYED: one failed open was terminal, with the whole
-    // budget unspent.
+    // Buggy=1, one failed open is terminal with the whole budget unspent.
     let terminal = run(&buggy, &["DeviceFaults"]);
     assert_eq!((terminal["failed"], terminal["attempts"]), (1, 0));
     assert!(!buggy.check_invariant("SilenceIsPermanentOnlyWhenTheBudgetIsSpent", &terminal));
 
-    // THE FIRST DRAFT OF D5 REPLAYED: a successful open reset the ladder, so
-    // a device that constructs and never plays reopened forever while the
-    // wire reported a full budget.
+    // Buggy=1, a successful open resets the ladder: a device that constructs and never plays
+    // reopens forever while the wire reports a full budget.
     let mut s = fire(&buggy, "Cue", &buggy.init_state());
     for _ in 0..=budget {
         s = fire(&buggy, "DeviceFaults", &s);
@@ -300,9 +263,8 @@ fn trail_audio_reopen_ladder_witnesses_recovery_exhaustion_and_the_replays() {
     assert!(!buggy.check_invariant("RecoveryIsBounded", &s));
     assert!(!buggy.check_invariant("ReopensLeftIsTruthful", &s));
 
-    // THE SHIPPED D5 LAW REPLAYED: the window measured from the FAULT. A
-    // device that plays one block and stalls gets the budget back on every
-    // delivery after a stale fault, and cycles the ladder forever.
+    // Buggy=1, window measured from the fault: a device that plays one block and stalls gets the
+    // budget back on every delivery after a stale fault and cycles the ladder forever.
     let mut s = fire(&buggy, "Cue", &buggy.init_state());
     for round in 1..=budget + 1 {
         s = fire(&buggy, "DeviceFaults", &s);
@@ -316,13 +278,9 @@ fn trail_audio_reopen_ladder_witnesses_recovery_exhaustion_and_the_replays() {
     assert!(!buggy.check_invariant("ReopensLeftIsTruthful", &s));
 }
 
-/// A CHANGE TO THE RESET LAW IS REFUTED AT TIER-0, not only at Tier-1. The
-/// first draft of this machine compared `attempts` against a `spent` ghost
-/// that reset on the identical condition, so an edit to that condition —
-/// letting the healthy window finish without a delivery, or handing the
-/// budget back on any delivery — left every invariant green. The spec's
-/// reset law now reads its own `evidence` record, and each such edit is
-/// caught, at the committed budget and at the shipping one.
+/// An edit to the reset law (the healthy window finishing without a delivery, or the budget
+/// handed back on any delivery) is refuted at the committed and shipping budgets, because the
+/// law reads its own `evidence` record.
 #[test]
 fn trail_audio_reopen_ladder_refutes_edits_to_its_own_reset_law() {
     use aterm_spec::derive::Update;
@@ -372,8 +330,7 @@ fn trail_audio_reopen_ladder_refutes_edits_to_its_own_reset_law() {
         ("both counters reset on any delivery", eager_both),
     ] {
         for budget in [2, 6] {
-            // Checked ALONE, so the refutation is this invariant's own and
-            // not a neighbour's.
+            // Checked alone, so the refutation is this invariant's own.
             let mut at = interp::with_consts(&edited, &[("Budget", budget)]);
             at.invariants
                 .retain(|i| i.name == "ResetOnlyOnPlayedWindow");
@@ -381,7 +338,7 @@ fn trail_audio_reopen_ladder_refutes_edits_to_its_own_reset_law() {
             eprintln!("{label} @Budget={budget}: refuted by {inv} at {state:?}");
         }
     }
-    // …while the committed machine proves at both budgets.
+    // The committed machine proves at both budgets.
     for budget in [2, 6] {
         interp::bmc(&interp::with_consts(&committed, &[("Budget", budget)]))
             .unwrap_or_else(|e| panic!("committed @Budget={budget}: {e:?}"));

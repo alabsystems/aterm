@@ -8,10 +8,11 @@
 //! REAL git against a local bare origin, a rival's push landed between the fetch and
 //! the push to make the race deterministic, as `ledger_race` does for the claim.
 
+use aterm_uds::spawnfd::Command;
 use std::cell::{Cell, RefCell};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 
 use crate::fixtures::{self, Landed, Pins};
 use crate::gates::{HANDOFF_FIXTURE_GUARD, HANDOFF_FIXTURE_ROOT};

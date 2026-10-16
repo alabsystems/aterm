@@ -48,25 +48,6 @@ impl MarksState {
     }
 }
 
-/// A snapshot of all color state saved by OSC 30001 (XTPUSHCOLORS). Per the
-/// Kitty color stack protocol, push/pop covers every dynamic color: palette,
-/// default fg/bg, cursor and both selection colors.
-#[derive(Debug, Clone)]
-pub(super) struct ColorStackEntry {
-    /// The 256-color palette snapshot.
-    pub(super) palette: ColorPalette,
-    /// Default foreground color (OSC 10).
-    pub(super) default_foreground: Rgb,
-    /// Default background color (OSC 11).
-    pub(super) default_background: Rgb,
-    /// Cursor color (OSC 12). `None` = use foreground.
-    pub(super) cursor_color: Option<Rgb>,
-    /// Selection background color (OSC 21). `None` = renderer default.
-    pub(super) selection_background: Option<Rgb>,
-    /// Selection foreground color (OSC 19). `None` = renderer default.
-    pub(super) selection_foreground: Option<Rgb>,
-}
-
 /// Grouped color state: the 256-color palette, default fg/bg, cursor color,
 /// selection fg/bg, and the Kitty OSC 30001/30101 color stack.
 #[allow(
@@ -74,10 +55,18 @@ pub(super) struct ColorStackEntry {
     reason = "independent per-channel authority bits (fg, bg, cursor) plus an unrelated rendering flag, not a state machine"
 )]
 pub(super) struct ColorState {
-    /// Maps 256 indexed colors to RGB values (OSC 4).
-    pub(super) palette: ColorPalette,
-    /// Saved color states for Kitty OSC 30001/30101 push/pop.
-    pub(super) stack: VecDeque<ColorStackEntry>,
+    /// Maps 256 indexed colors to RGB values (OSC 4). Private to `grouped_state`
+    /// so every mutation flows through [`Self::palette_mut`] or
+    /// [`Self::palette_and_configured_mut`], invalidating `palette_hash`.
+    palette: ColorPalette,
+    /// Cached nonzero FxHash digest of `palette` (`0` = uncached).
+    palette_hash: std::sync::atomic::AtomicU64,
+    /// Saved color states for Kitty OSC 30001/30101 push/pop. Per the Kitty
+    /// color stack protocol a push covers every dynamic color (palette,
+    /// default fg/bg, cursor, both selection colors); each entry is kept as
+    /// a diff from the configured baseline, so a pop after the theme moved
+    /// lands on the new theme with the program's own colors over it.
+    pub(super) stack: VecDeque<super::checkpoint_state::ColorOverridesRepr>,
     /// Default foreground color (OSC 10, reset via OSC 110).
     pub(super) default_foreground: Rgb,
     /// Default background color (OSC 11, reset via OSC 111).
@@ -128,12 +117,20 @@ pub(super) struct ColorState {
     /// Callback for dynamic color queries (OSC 10/11/12 with `?`). A
     /// `Some(Rgb)` result replaces the palette color in the response.
     pub(super) query_callback: Option<super::callbacks::ColorQueryCallback>,
+    /// Whether an OSC 4 / numeric OSC 21 palette set has been refused by the
+    /// `allow_palette_reconfigure` gate in this session. Session-level, so RIS
+    /// leaves it: the host hears about the FIRST refusal only.
+    pub(super) palette_set_refused: bool,
+    /// Called once, at the first refused palette set (see
+    /// `Terminal::set_palette_refused_callback`).
+    pub(super) palette_refused_callback: Option<Box<dyn FnMut() + Send>>,
 }
 
 impl ColorState {
     pub(super) fn new() -> Self {
         Self {
             palette: ColorPalette::new(),
+            palette_hash: std::sync::atomic::AtomicU64::new(0),
             stack: VecDeque::new(),
             default_foreground: DEFAULT_FOREGROUND,
             default_background: DEFAULT_BACKGROUND,
@@ -153,7 +150,72 @@ impl ColorState {
             faint_opacity: aterm_types::DIM_FACTOR,
             change_callback: None,
             query_callback: None,
+            palette_set_refused: false,
+            palette_refused_callback: None,
         }
+    }
+
+    /// Read-only access to the 256-color palette.
+    #[inline]
+    pub(super) fn palette(&self) -> &ColorPalette {
+        &self.palette
+    }
+
+    /// Mutable access to the 256-color palette, invalidating the cached
+    /// [`Self::palette_fingerprint`] digest.
+    #[inline]
+    pub(super) fn palette_mut(&mut self) -> &mut ColorPalette {
+        self.palette_hash
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        &mut self.palette
+    }
+
+    /// Disjoint mutable borrow of both the live and configured palettes,
+    /// invalidating the cached [`Self::palette_fingerprint`] digest.
+    #[cfg(test)]
+    #[inline]
+    pub(super) fn palette_and_configured_mut(
+        &mut self,
+    ) -> (&mut ColorPalette, &mut Option<ColorPalette>) {
+        self.palette_hash
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        (&mut self.palette, &mut self.configured_palette)
+    }
+
+    /// Cached 64-bit FxHash digest of all 256 indexed palette entries.
+    ///
+    /// When `palette.overrides_count() == 0` (the built-in xterm 256-color
+    /// palette), returns a `OnceLock` constant in O(1) without hashing or
+    /// touching `palette_hash`. When overrides exist, computes the 256-entry
+    /// hash once and caches it in `palette_hash` (`0` = uncached; every mutable
+    /// borrow via [`Self::palette_mut`] resets `palette_hash` to `0`).
+    pub(super) fn palette_fingerprint(&self) -> u64 {
+        use std::hash::Hasher as _;
+        use std::sync::OnceLock;
+        use std::sync::atomic::Ordering;
+
+        fn compute_palette_hash(palette: &ColorPalette) -> u64 {
+            let mut h = aterm_hash::FxHasher::default();
+            for i in 0..=u8::MAX {
+                let c = palette.get(i);
+                let packed = (u32::from(c.r) << 16) | (u32::from(c.g) << 8) | u32::from(c.b);
+                h.write_u32(packed);
+            }
+            let digest = h.finish();
+            if digest == 0 { 1 } else { digest }
+        }
+
+        if self.palette.overrides_count() == 0 {
+            static DEFAULT_HASH: OnceLock<u64> = OnceLock::new();
+            return *DEFAULT_HASH.get_or_init(|| compute_palette_hash(&ColorPalette::new()));
+        }
+        let cached = self.palette_hash.load(Ordering::Relaxed);
+        if cached != 0 {
+            return cached;
+        }
+        let computed = compute_palette_hash(&self.palette);
+        self.palette_hash.store(computed, Ordering::Relaxed);
+        computed
     }
 
     /// Reset all color state to the theme-configured values (RIS /
@@ -161,20 +223,11 @@ impl ColorState {
     /// Callbacks and configured defaults are kept (they are not terminal
     /// state).
     pub(super) fn reset(&mut self) {
-        if let Some(ref configured) = self.configured_palette {
-            self.palette = configured.clone();
-        } else {
-            self.palette.reset();
-        }
         self.stack.clear();
         // Reset to the configured default, never a transient state: reverse
         // video (SGR 7 / DECSCNM) is applied at render time in color_resolve, so
         // it is neither captured nor preserved here (xterm semantics).
-        self.default_foreground = self.configured_foreground;
-        self.default_background = self.configured_background;
-        self.cursor_color = self.configured_cursor;
-        self.selection_background = self.configured_selection_background;
-        self.selection_foreground = self.configured_selection_foreground;
+        self.restore_baseline(true);
     }
 }
 
@@ -220,6 +273,13 @@ pub(super) struct ShellIntegrationState {
     /// timestamps it never repeats, so it answers "did a new command finish".
     /// Preserved across `reset()` like `next_block_id`.
     pub(super) completed_seq: u64,
+    /// Monotonic count of commands the shell started (an OSC 133/633 C the
+    /// A→B→C→D gate accepted), block or no block. A clear (ED 3, Cmd-K) or a
+    /// RIS can take a block, and a RIS also swallows the D that would have
+    /// ended it, but no clear takes a C already counted: so a reader that
+    /// counts C's knows how many commands ran, wherever their blocks went.
+    /// Preserved across `reset()` like `completed_seq`.
+    pub(super) started_seq: u64,
     /// Number of block command/output reads that found the block's rows
     /// already evicted from scrollback. A `Cell` so the `&self` accessors can
     /// count.
@@ -253,6 +313,7 @@ impl ShellIntegrationState {
             current_block: None,
             next_block_id: 0,
             completed_seq: 0,
+            started_seq: 0,
             eviction_reads: std::cell::Cell::new(0),
             eviction_seen: [const { std::cell::Cell::new(None) }; 2],
             eviction_news: std::cell::Cell::new(0),
@@ -268,7 +329,8 @@ impl ShellIntegrationState {
         self.command_marks.clear();
         self.output_blocks.clear();
         self.current_block = None;
-        // next_block_id is not reset so block IDs stay unique across resets
+        // next_block_id, completed_seq and started_seq are not reset: block
+        // ids stay unique and the counters monotonic across resets
     }
 }
 
@@ -391,8 +453,7 @@ pub(super) struct Iterm2State {
     pub(super) user_vars: UserVarsMap,
     /// First-insertion order of `user_vars` keys, for deterministic
     /// oldest-first eviction at capacity (`HashMap` iteration order is not
-    /// deterministic). Re-inserting a key keeps its position. See
-    /// `set_user_var` in `shell_api.rs`.
+    /// deterministic). Re-inserting a key keeps its position.
     pub(super) user_vars_order: std::collections::VecDeque<String>,
     /// Cursor line highlight state (OSC 1337 HighlightCursorLine); `None`
     /// until a command is received.

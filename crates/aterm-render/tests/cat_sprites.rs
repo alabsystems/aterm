@@ -1,21 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// Peeking-cat sprites (Sparkle Words v2, `RenderInput.cat_quads` + `cat_atlas`)
-// on the CPU renderer. The contract under test:
-//   * empty cat fields (quads empty / atlas absent — and quads empty WITH an
-//     atlas set) are byte-identical to the pre-cat path, also after
-//     `clear_overlays` (the `image plain` contract) — the `cat_quads` row of
-//     `tests/empty_channels.rs`;
-//   * pass 1c z-order: cat sprites draw UNDER the row's glyphs and UNDER inline
-//     images (matching the GPU's `emit_base_pre` stream order);
-//   * the cat stamp is NEAREST 1:1 and endpoint-exact (tint 0xFFFFFF + alpha
-//     255 + opaque texels land the EXACT atlas bytes; a checker atlas yields NO
-//     intermediate colours);
-//   * damaged path: a moved cat re-renders with no ghosting (cached == fresh);
-//   * dirty gate: settled (non-empty but EQUAL) cat quads at the same atlas
-//     version gate-hit with zero rows marked; a change marks exactly the
-//     prev∪cur cat rows; an atlas-version bump alone un-gates.
+// Peeking-cat sprites (`RenderInput.cat_quads` + `cat_atlas`) on the CPU renderer:
+//   * empty cat fields (no quads and no atlas, or no quads with an atlas) are
+//     byte-identical to a cat-free frame, also after `clear_overlays` (the
+//     `cat_quads` row of `tests/empty_channels.rs`);
+//   * pass 1c z-order: sprites draw under the row's glyphs and under inline images
+//     (the GPU's stream order);
+//   * the stamp is nearest 1:1 and endpoint-exact;
+//   * damaged path: a moved cat leaves no ghost (cached == fresh);
+//   * dirty gate: settled quads gate-hit; a change marks exactly the prev∪cur cat
+//     rows; an atlas-version bump alone un-gates.
 
 use std::sync::Arc;
 
@@ -25,7 +20,7 @@ use aterm_render::{
     DirtyDecision, Frame, Renderer, Theme, WindowCpu, compute_dirty_rows, rgb_to_u32,
 };
 
-fn renderer() -> Renderer {
+pub(crate) fn renderer() -> Renderer {
     Renderer::from_system(18.0, Theme::default())
         .expect("no font: build with aterm-render's default embedded-font feature")
 }
@@ -40,9 +35,9 @@ fn cell_pixels(f: &Frame, cw: usize, ch: usize, row: usize, col: usize) -> Vec<u
     out
 }
 
-/// A deterministic, fully-opaque patterned RGBA atlas (per-texel distinct
-/// colours so a wrong NEAREST index or an accidental filter shows up).
-fn patterned_atlas(w: u32, h: u32, version: u64) -> SceneAtlas {
+/// A deterministic opaque atlas with a distinct colour per texel, so a wrong nearest
+/// index or a filter shows.
+pub(crate) fn patterned_atlas(w: u32, h: u32, version: u64) -> SceneAtlas {
     let mut rgba = Vec::with_capacity((w * h * 4) as usize);
     for y in 0..h {
         for x in 0..w {
@@ -62,8 +57,7 @@ fn patterned_atlas(w: u32, h: u32, version: u64) -> SceneAtlas {
     }
 }
 
-/// A 2×2 opaque black/white checker atlas: NEAREST sampling can only ever
-/// produce pure black or pure white; any intermediate grey proves filtering.
+/// A 2×2 opaque black/white checker atlas: nearest sampling yields only black or white.
 fn checker_atlas(version: u64) -> SceneAtlas {
     #[rustfmt::skip]
     let rgba = vec![
@@ -79,7 +73,7 @@ fn checker_atlas(version: u64) -> SceneAtlas {
 }
 
 /// Opaque untinted quad: `dest = [x, y, w, h]`, `src = [ax, ay, aw, ah]`.
-fn quad(row: u16, dest: [u16; 4], src: [u16; 4]) -> SpriteQuad {
+pub(crate) fn quad(row: u16, dest: [u16; 4], src: [u16; 4]) -> SpriteQuad {
     SpriteQuad {
         row,
         x: dest[0],
@@ -96,12 +90,10 @@ fn quad(row: u16, dest: [u16; 4], src: [u16; 4]) -> SpriteQuad {
     }
 }
 
-/// Pass-1c z-order on the CPU: an opaque cat sprite spanning two cells of a row
-/// where the FIRST cell holds a full-block glyph. The glyph draws OVER the
-/// sprite (cell 0 is the theme fg, exactly); the sprite shows where no glyph
-/// covers it (cell 1 carries sprite colours). (The inline-image-over-cat case
-/// is pinned on BOTH backends by `cat_under_opaque_sixel_is_hidden_on_both_
-/// backends` in aterm-gpu's cat_parity.rs.)
+/// Pass-1c z-order: under an opaque sprite spanning two cells, the full-block glyph in
+/// cell 0 draws over it (exactly the theme fg) and cell 1 shows the sprite. The
+/// inline-image-over-cat case is pinned on both backends by aterm-gpu's
+/// `cat_under_opaque_sixel_is_hidden_on_both_backends`.
 #[test]
 fn glyph_draws_over_cat_sprite() {
     let mut rend = renderer();
@@ -118,8 +110,7 @@ fn glyph_draws_over_cat_sprite() {
     };
     let mut input = term.cell_frame(2, 8);
     input.cat_atlas = Some(Arc::new(red_atlas));
-    // One row-0 band quad across cells 0..2 (bake==dest is the cat contract, but
-    // z-order is independent of scale; a flat atlas keeps the stamp exact).
+    // One row-0 band quad across cells 0..2; a flat atlas keeps the stamp exact.
     input.cat_quads = vec![SpriteQuad {
         row: 0,
         x: 0,
@@ -150,11 +141,9 @@ fn glyph_draws_over_cat_sprite() {
     );
 }
 
-/// NEAREST 1:1 endpoint exactness: with tint 0xFFFFFF, alpha 255 and opaque
-/// texels, every dest pixel is the EXACT atlas texel byte (blend at cov 255 is
-/// the identity) — the CPU stamp does zero colour math beyond the multiply
-/// identities. And NEAREST discrimination: a 2×2 checker scaled up yields ONLY
-/// pure black/white (any grey would mean the cat regime picked up a filter).
+/// Nearest 1:1 stamp: with tint 0xFFFFFF, alpha 255 and opaque texels every dest pixel
+/// is the exact atlas texel, and a scaled-up 2×2 checker yields only pure black and white
+/// (any grey would mean filtering).
 #[test]
 fn cat_stamp_is_nearest_and_endpoint_exact_at_one_to_one() {
     let mut rend = renderer();
@@ -199,20 +188,15 @@ fn cat_stamp_is_nearest_and_endpoint_exact_at_one_to_one() {
     }
 }
 
-/// Damaged-path no-ghosting: prime a persistent damage cache with a cat at row
-/// 1, then move it to row 2. The cached repaint must equal a FRESH full render
-/// of frame B byte-for-byte — the vacated row-1 band is re-cleared and
-/// re-stamped by pass 1c inside `render_row` (no post-pass ghost).
+/// Damaged path: moving a cat from row 1 to row 2 repaints byte-identically to a fresh
+/// full render (the vacated band is re-cleared, no ghost).
 #[test]
 fn damaged_path_no_ghosting_when_cat_moves() {
     let mut rend = renderer();
     let (_, ch) = rend.cell_size();
-    // Glyph-free terminal (all background), like the damaged-path glow parity
-    // test: a glyph whose AA overhangs its band by 1 px is erased by a
-    // neighbouring band's refill but survives a full render — a PRE-EXISTING
-    // engine-snapshot quirk (blank rows carry empty cell vecs, so their pass-1
-    // fill is a no-op) that exists with the v1 glow overlay too and is not what
-    // this test pins. The cat contract is the row bands it owns.
+    // Glyph-free terminal: a glyph whose AA overhangs its band by 1 px is erased by a
+    // neighbouring band's refill but survives a full render (blank rows carry empty cell
+    // vecs, so their pass-1 fill is a no-op), which is not what this test pins.
     let mut term = Terminal::new(4, 12);
     term.process(b"\x1b[?25l");
     let atlas = Arc::new(patterned_atlas(32, 32, 4));
@@ -244,10 +228,9 @@ fn damaged_path_no_ghosting_when_cat_moves() {
     );
 }
 
-/// Dirty gate: settled cat quads — non-empty but EQUAL, same atlas version —
-/// gate-hit with zero rows marked (the 0% steady state); a moved quad marks
-/// exactly the prev∪cur cat rows; an atlas-version bump alone (equal quads)
-/// sets `cat_changed` and marks the quad rows.
+/// Dirty gate: equal non-empty quads at the same atlas version gate-hit with no rows
+/// marked; a moved quad marks exactly the prev∪cur cat rows; an atlas-version bump alone
+/// marks the quad rows.
 #[test]
 fn cat_dirty_gate_settled_hits_changed_marks_prev_union_cur_rows() {
     let mut term = Terminal::new(5, 8);
@@ -298,7 +281,7 @@ fn cat_dirty_gate_settled_hits_changed_marks_prev_union_cur_rows() {
         "changed cat must mark exactly the prev∪cur cat rows"
     );
 
-    // Atlas-version bump with byte-equal quads: a rebake must repaint.
+    // Atlas-version bump with equal quads: a rebake must repaint.
     cur.cat_quads = settled;
     cur.cat_atlas = Some(Arc::new(patterned_atlas(16, 16, 2)));
     let DirtyDecision::Rows(d) =
@@ -317,80 +300,4 @@ fn cat_dirty_gate_settled_hits_changed_marks_prev_union_cur_rows() {
         .filter_map(|(r, &b)| b.then_some(r))
         .collect();
     assert_eq!(marked, vec![1], "the rebake marks the (unmoved) cat's row");
-}
-
-/// §7.4/§14 P5 perf gate — `bench_render_row_under_sprites`: the pass-1c row
-/// cost. A 120×40 text frame with ONE cat-scale sprite quad (80 px × cell)
-/// under EVERY row is rendered against a no-sprite baseline of the same frame;
-/// both full-frame medians are reported plus the per-row pass-1c delta. Runs
-/// alternate so drift hits both sides. The measured numbers land in
-/// PROOF_CARRYING_PERFORMANCE.md ("Sparkle Words v2.1"). Timing-sensitive, so
-/// it follows the repo's manual-timing idiom:
-///
-/// ```sh
-/// targo --unverified test -p aterm-render --release --test render_suite -- \
-///   cat_sprites::bench_render_row_under_sprites --ignored --nocapture
-/// ```
-#[test]
-#[ignore = "perf gate (design §7.4): run manually: --release --test render_suite -- cat_sprites:: --ignored --nocapture"]
-fn bench_render_row_under_sprites() {
-    use std::time::Instant;
-    let mut rend = renderer();
-    let (cw, ch) = rend.cell_size();
-    let (rows, cols) = (40usize, 120usize);
-    let mut term = Terminal::new(rows as u16, cols as u16);
-    term.process(b"\x1b[?25l");
-    let line = "the quick brown fox jumps over the lazy dog 0123456789 ".repeat(3);
-    for r in 0..rows {
-        term.process(format!("\x1b[{};1H{}", r + 1, &line[..cols]).as_bytes());
-    }
-
-    let base_input = term.cell_frame(rows, cols);
-    let mut sprite_input = base_input.clone();
-    sprite_input.cat_atlas = Some(std::sync::Arc::new(patterned_atlas(128, ch as u32, 1)));
-    // One cat-scale quad (≈ a settled HeadPeek body slice: 80 px wide, one full
-    // row band) under EVERY row — 40 pass-1c stamps per frame.
-    sprite_input.cat_quads = (0..rows as u16)
-        .map(|r| {
-            quad(
-                r,
-                [(4 * cw) as u16, r * ch as u16, 80, ch as u16],
-                [0, 0, 80, ch as u16],
-            )
-        })
-        .collect();
-
-    // Warm both paths.
-    for _ in 0..4 {
-        let _ = rend.render_input(&base_input);
-        let _ = rend.render_input(&sprite_input);
-    }
-    let iters = 60usize;
-    let (mut t_base, mut t_sprite) = (Vec::with_capacity(iters), Vec::with_capacity(iters));
-    for _ in 0..iters {
-        let s = Instant::now();
-        let _ = rend.render_input(&base_input);
-        t_base.push(s.elapsed());
-        let s = Instant::now();
-        let _ = rend.render_input(&sprite_input);
-        t_sprite.push(s.elapsed());
-    }
-    t_base.sort();
-    t_sprite.sort();
-    let (mb, ms) = (t_base[iters / 2], t_sprite[iters / 2]);
-    let per_row_ns = (ms.as_nanos() as i128 - mb.as_nanos() as i128) as f64 / rows as f64;
-    println!(
-        "bench_render_row_under_sprites: baseline full-frame median {mb:?} \
-         ({:.1} us/row), with a sprite under EVERY row median {ms:?} ({:.1} us/row) \
-         — pass-1c cost {:.2} us/row (120x40, {}x{} px cells, 80 px quad/row)",
-        mb.as_nanos() as f64 / rows as f64 / 1000.0,
-        ms.as_nanos() as f64 / rows as f64 / 1000.0,
-        per_row_ns / 1000.0,
-        cw,
-        ch
-    );
-    assert!(
-        per_row_ns < 10_000.0,
-        "§7.4 gate: pass-1c row cost {per_row_ns:.0} ns/row >= 10 us/row"
-    );
 }

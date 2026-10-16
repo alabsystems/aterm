@@ -136,6 +136,7 @@ fn worker_loop(request_rx: Receiver<Request>, proxy: EventLoopProxy<Wake>) {
         }
         let analysis = std::panic::catch_unwind(|| {
             let mut analysis = crate::native_config_language::analyze(&request.source);
+            analysis.adopt_theme_names(&request.assets.themes);
             if !analysis.has_errors() {
                 let diagnostics = crate::native_config_language::analyze_host_with_assets(
                     &request.source,
@@ -229,7 +230,9 @@ impl App {
         // failure is fail-visible and blocks Save instead of moving parse/I/O
         // work back onto the UI thread.
         let mut analysis = if self.proxy.is_none() {
-            crate::native_config_language::analyze(&snapshot.text)
+            let mut analysis = crate::native_config_language::analyze(&snapshot.text);
+            analysis.adopt_theme_names(&config_assets.themes);
+            analysis
         } else {
             crate::native_config_language::ConfigAnalysis::pending_failure(
                 "background config validator is unavailable; restart aterm to retry",

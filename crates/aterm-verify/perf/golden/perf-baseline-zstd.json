@@ -1,0 +1,5 @@
+{
+  "_comment": "aterm ZSTD-DECODE baseline (ZC.4): median decoded MB/s of aterm_zstd::Decoder over five recorded zstd 1.5.7 CLI frames (-19, --ultra -22 --long=27, --fast=5, a 1 KiB window, a single-segment file frame). BIGGER-IS-BETTER. Re-record with targo --unverified verify perf --record zstd. Recorded 2026-10-15 on m11 (Apple M4 Pro, 14 logical cores, 48 GB) under a load average of 19-23 from other sessions: three runs gave medians 917.1, 925.3 and 930.9 MB/s, and the floor keeps the lowest. For scale, not gated: on the same box, libzstd 1.5.7 decodes a 2.76 GB toolchain tar (744 MB zst, -19) at about 1.9x this decoder's rate (docs/AUDIT-third-party-2026-10-15.md ZC.4 commit).",
+  "zstd_decode_median_mbps": 917.123,
+  "pass_ratio": 0.450
+}

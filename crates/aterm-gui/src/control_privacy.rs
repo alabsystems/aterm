@@ -9,7 +9,7 @@
 //! pointers with an inert arm: a windowed instance gets the live arms; a
 //! headless instance and every unit test get arms that answer `unknown` without
 //! a syscall, so no test binary reaches `tccd` or `WindowServer` (`AGENTS.md`,
-//! `tools/grep_guard.sh` B9). A `--headless` instance still answers the verb,
+//! the aterm-census guard `input-probe`). A `--headless` instance still answers the verb,
 //! with `full_disk_access=unknown probe=refused_disabled`: not consulted, which
 //! is distinct from a denial.
 //!
@@ -1256,6 +1256,12 @@ fn signing_identity_if_warm() -> &'static SigningIdentity {
 /// been read off it.
 pub(crate) fn running_bundle_id_if_warm() -> Option<&'static str> {
     signing_identity_if_warm().bundle_id.as_deref()
+}
+
+/// The designated requirement's class for the event loop: `DrClass::Unknown` until
+/// the identity has been read off it (which `grant_stable` treats as unstable).
+pub(crate) fn running_dr_class_if_warm() -> DrClass {
+    signing_identity_if_warm().dr
 }
 
 /// Whether the running executable sits inside a `.app` bundle: a pure path

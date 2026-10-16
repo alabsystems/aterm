@@ -1,31 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 bind for `HandoffAddressOwner`'s ORDER half
+//! Tier-1 bind for `HandoffAddressOwner`'s order half
 //! (`aterm_spec::derive::handoff_address_owner_model`,
-//! `CandidateNamedOnlyAfterCommit`): a per-process update candidate names itself
-//! in no `graph/<sid>` entry until the Commit, so one `@<sid>` is never answered
-//! by two live instances while the parent still owns the session.
+//! `CandidateNamedOnlyAfterCommit`): a per-process update candidate names itself in
+//! no `graph/<sid>` entry until the Commit, so one `@<sid>` is never answered by two
+//! live instances while the parent still owns the session (a supervisor reads that
+//! as `ERR ambiguous session id <sid> also served by pid <new>`).
 //!
-//! The evidence it answers: on every live update up to 0.98, the outgoing
-//! window's supervisor failed once — `harness @<sid>: EXIT await idle 500 failed:
-//! aterm-ctl: ERR ambiguous session id <sid> also served by pid <new>`, then
-//! `restarting the supervisor (1 of 5 this hour)` — because the incoming instance
-//! had published `graph/<sid>` for every carried id 191–272 ms before the Commit.
+//! The run drives the real gated publication (`publish_when_committed`, the one
+//! function `control::spawn` publishes through) against a real bound socket and
+//! discovery directory, projecting the model's state from disk and the gate:
 //!
-//! The run drives the REAL gated publication (`publish_when_committed`, the one
-//! function `control::spawn` publishes through) against a real bound socket and a
-//! real discovery directory, and projects the model's state from what is on disk
-//! and the gate, never from a flag the code keeps:
+//! * `entry`: 1 when the carried id's `graph/<sid>` names the candidate's socket,
+//!   0 while it still names the parent's;
+//! * `pred`: 1 until the Commit releases the gate, 0 after;
+//! * `cand = registered = 1`: the parent's lane made and registered this candidate
+//!   (the model's `Launch`).
 //!
-//! * `entry` — 1 when the carried id's `graph/<sid>` names the candidate's
-//!   socket, 0 while it still names the parent's;
-//! * `pred` — 1 until the Commit releases the gate, 0 after;
-//! * `cand = registered = 1` — the parent's lane made and registered this
-//!   candidate (the model's `Launch`), which is where the candidate's life begins.
-//!
-//! NEGATIVE CONTROL: the same publication with no gate — the boot-time order
-//! every candidate had before round seven — writes the step the committed model
+//! Negative control: the same publication with no gate writes the step the model
 //! rejects and `Early = 1` admits, into a state `CandidateNamedOnlyAfterCommit`
 //! refuses.
 
@@ -86,9 +79,8 @@ impl Drop for ProcessDiscoveryReset {
     }
 }
 
-/// A candidate booted with two carried ids: its root session's and one more in
-/// the store, each with the PARENT's entry already on disk (the parent published
-/// them; it still owns them), and the candidate's own socket bound early.
+/// A candidate booted with two carried ids, its root session's and one more in the
+/// store, each with the parent's entry already on disk, and its own socket bound.
 struct Candidate {
     _dir: aterm_tempfile::TempDir,
     _mirror: aterm_tempfile::TempDir,
@@ -165,11 +157,10 @@ impl Candidate {
     }
 }
 
-/// THE ORDER, DRIVEN: through the whole pre-Commit window the carried ids'
-/// entries still name the parent and the `latest` alias does not move — the
-/// model's `SuccessorPublishes` is disabled there, and the real code takes no
-/// step. The Commit releases the gate, and the real publication is exactly the
-/// model's `Commit` then `SuccessorPublishes`, into a state every invariant holds.
+/// Through the whole pre-Commit window the carried ids' entries still name the
+/// parent and the `latest` alias does not move (`SuccessorPublishes` is disabled
+/// there). The Commit releases the gate, and the real publication is the model's
+/// `Commit` then `SuccessorPublishes`, into a state every invariant holds.
 #[test]
 fn a_candidates_entries_name_it_only_after_the_commit() {
     let _guard = crate::proxy::self_sock_test_guard();
@@ -200,8 +191,8 @@ fn a_candidates_entries_name_it_only_after_the_commit() {
         })
     };
 
-    // THE PRE-COMMIT WINDOW (the 191–272 ms the live updates measured, and
-    // longer): every carried entry still names the parent, and nothing moved.
+    // The pre-Commit window (300 ms, past the 191–272 ms an ungated candidate took
+    // to publish): every carried entry still names the parent, and nothing moved.
     let window = std::time::Instant::now() + std::time::Duration::from_millis(300);
     while std::time::Instant::now() < window {
         for sid in c.ids() {
@@ -227,7 +218,7 @@ fn a_candidates_entries_name_it_only_after_the_commit() {
         "the publication waits on the Commit"
     );
 
-    // THE COMMIT: the gate opens, and the candidate publishes.
+    // The Commit: the gate opens, and the candidate publishes.
     gate.release();
     let listener = publisher
         .join()
@@ -262,12 +253,10 @@ fn a_candidates_entries_name_it_only_after_the_commit() {
     drop(listener);
 }
 
-/// NEGATIVE CONTROL — the boot-time order, from a REAL state: the same
-/// publication with no gate names the candidate while the parent still owns the
-/// carried ids. The committed model rejects that step, `Early = 1` (the order
-/// before round seven) admits exactly it, and the state it reaches is the one
-/// `CandidateNamedOnlyAfterCommit` refuses — the double registration that made
-/// the parent's own supervisor read `ERR ambiguous session id`.
+/// Negative control, from a real state: with no gate the publication names the
+/// candidate while the parent still owns the carried ids. The committed model rejects
+/// that step, `Early = 1` admits exactly it, and `CandidateNamedOnlyAfterCommit`
+/// refuses the state it reaches.
 #[test]
 fn the_ungated_publication_is_the_caught_boot_time_step() {
     let _guard = crate::proxy::self_sock_test_guard();

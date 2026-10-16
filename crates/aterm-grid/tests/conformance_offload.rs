@@ -4,8 +4,7 @@
 //! Scrollback-offload detach window: derived spec plus Tier-1 binding to the
 //! real `Grid`.
 //!
-//! The `ty_model!` source is `include!`d from `offload_window_spec.rs`, the same
-//! file `build.rs` checks at compile time.
+//! The `ty_model!` source is `include!`d from `offload_window_spec.rs`.
 //!
 //! - Tier 0: `ty check` proves the invariants over every Produce/Erase/config/
 //!   replacement/Reattach/Abort interleaving and requires a counterexample at
@@ -566,8 +565,7 @@ fn run_settings_lockstep(
 
 // Tests
 
-/// Tier 0 backstop (the build.rs gate runs the same check at compile time; this
-/// duplicates it in the test suite so `cargo test` alone also proves it).
+/// Tier 0: the invariants prove at `Buggy=0` and are caught at `Buggy=1`.
 #[test]
 fn offload_window_spec_model_checked_in_trust() {
     // Interpreter prove-and-catch always; ty too where installed.

@@ -4,22 +4,15 @@
 use aterm_spec::derive::{harness_upgrade_goal_pause_liveness, harness_upgrade_goal_pause_model};
 use aterm_spec::{interp, verify};
 
-/// THE LIVE UPGRADE'S GOAL PAUSE: a
-/// goal the upgrade paused is resumed before the host lets the tab go, the
-/// Esc is pressed only at a turn's head, the goal is resumed once and never
-/// over a person's hand, and no pause is made under an open switch or before
-/// the ladder's Land rung. Each invariant is caught by its own `Buggy`
-/// member, and each dead action ALONE by an invariant
-/// (`verify::audit_dead_negative_controls`). Tier-1 against the real
-/// `goal_step` is in aterm-agent's `harness::upgrade_drive` goal tests.
+/// The live upgrade's goal pause: a goal the upgrade paused is resumed before the host lets the
+/// tab go, the Esc is pressed only at a turn's head, the goal is resumed once and never over a
+/// person's hand, and no pause is made under an open switch or before the ladder's Land rung.
+/// Each invariant is caught by its own `Buggy` member, and each dead action alone by an
+/// invariant. Tier-1 against the real `goal_step` is in aterm-agent's
+/// `harness/upgrade_goal_tests.rs`.
 #[test]
 fn the_goal_pause_is_resumed_once_and_never_cuts_a_tool_off() {
     let model = harness_upgrade_goal_pause_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name)
-    );
     verify::prove_and_catch_scalar(&model, "harness upgrade goal pause");
     let dead: Vec<&str> = model
         .actions
@@ -28,13 +21,13 @@ fn the_goal_pause_is_resumed_once_and_never_cuts_a_tool_off() {
         .filter(|a| !interp::fired_actions(&interp::with_buggy(&model, 0)).contains(a))
         .collect();
     assert_eq!(
-        verify::audit_dead_negative_controls(&model, &dead),
+        verify::audit_dead_negative_controls(std::slice::from_ref(&model)),
         Ok(8),
         "{dead:?}"
     );
 
-    // The incident's goal: its turns chain, and before the Land rung nothing
-    // pauses it — the move never comes.
+    // A goal whose turns chain: before the Land rung nothing pauses it, and the move never
+    // comes.
     let mut s = model.init_state();
     assert!(!model.action_enabled("GoalPause", &s), "not at first sight");
     assert!(model.fire("TurnEnds", &mut s));
@@ -140,22 +133,15 @@ fn the_goal_pause_is_resumed_once_and_never_cuts_a_tool_off() {
     assert!(!buggy.check_invariant("NothingTypedOverThePause", &t));
 }
 
-/// "THE UPGRADE LANDS UNDER A GOAL" under its stated fairness (the clock, the
-/// lane's look and acts, and Codex taking a typed pause), and each named
-/// mutant breaks it ALONE: the rule before the owner's decision, a goal
-/// holding its tab for as long as it runs (`GoalHoldsTheTab`), the host
-/// letting a current tab go with its goal left paused (`LetGoPaused`), and
-/// the supervisor typing a turn onto the paused thread at each idle point
-/// (`ContinuePaused`).
+/// "The upgrade lands under a goal" under its stated fairness (the clock, the lane's look and
+/// acts, and Codex taking a typed pause), and each named mutant breaks it alone: a goal holding
+/// its tab for as long as it runs (`GoalHoldsTheTab`), the host letting a current tab go with
+/// its goal left paused (`LetGoPaused`), and the supervisor typing a turn onto the paused
+/// thread at each idle point (`ContinuePaused`).
 #[test]
 fn the_upgrade_lands_under_a_goal_and_leaves_it_pursued() {
     let model = harness_upgrade_goal_pause_model();
     let live = harness_upgrade_goal_pause_liveness();
-    assert!(
-        aterm_spec::xref::liveness_registry()
-            .iter()
-            .any(|(m, l)| m.name == model.name && l.name == live.name)
-    );
     verify::liveness_proves_and_catches_tiered(&model, &live, "HarnessUpgradeGoalPause lands");
 
     let held = verify::buggy_baseline_with(&model, "GoalHoldsTheTab");

@@ -10,15 +10,38 @@
 use astream_wire::{Frame, FrameError, Offset, MAX_PAYLOAD_LEN};
 
 /// Broker record format version (2 adds the optional atomic `commit` annotation).
+///
+/// Every stored record's payload starts with this byte, and a log is read record by
+/// record, so a log holds whatever versions wrote it. EVERY version keeps the same
+/// first nine bytes — this byte, then the record's own offset as a little-endian
+/// `u64` — because that prefix is how an older build tells a newer record from
+/// damage.
+///
+/// A FORMAT CHANGE — bumping this, or changing what an existing version's stored
+/// bytes mean (a hidden record's body, a durable key's derivation, a sidecar beside
+/// the log) — ships, in the same change:
+///
+/// - a READ-THROUGH: [`BrokerRecord::from_payload`] decodes every version an astream
+///   release has written up to the new one (fields the old one lacks take their
+///   defaults), so every existing log still opens, while appends write the newest;
+/// - a FIXTURE of the previous format: a small log written by the last release,
+///   committed as bytes and never regenerated, and a test that this build opens it
+///   and reads its records back as that release wrote them.
+///
+/// The other direction is already handled and needs nothing new: a build that meets
+/// a record above its own version refuses the log by name — written by a newer
+/// astream, `ErrorKind::Unsupported` — on `open` and `open_repair` alike, never as
+/// corruption and never truncated. (v1 is not read: 2b84f85 dropped it with no
+/// read-through, before this rule was written down.)
 pub const BREC_VERSION: u8 = 2;
 /// Fixed header: version(1) + seq(8) + producer_id(8) + producer_seq(8).
 const HEADER: usize = 25;
 /// The largest record payload the log accepts: the frame cap minus a margin, so a
 /// stored record ALWAYS also fits the frame wherever it is re-framed — inside a
-/// `Replicate` request (whose envelope is a few bytes larger than the record's own),
-/// and sealed at rest on an encrypted log (a 24-byte nonce and a 16-byte tag). A
-/// record at the cap could otherwise be committed on a leader yet never be
-/// shippable to, or storable on, a follower.
+/// `Replicate` request (whose envelope, with the leader's log-identity trailer, is 25
+/// bytes larger than the record's own), and sealed at rest on an encrypted log (a
+/// 24-byte nonce and a 16-byte tag). A record at the cap could otherwise be committed
+/// on a leader yet never be shippable to, or storable on, a follower.
 pub const MAX_RECORD_PAYLOAD: usize = MAX_PAYLOAD_LEN - RECORD_MARGIN;
 /// The larger of the two re-framing overheads above: the at-rest seal's 40 bytes.
 const RECORD_MARGIN: usize = 40;
@@ -53,6 +76,19 @@ pub struct GroupCommit {
     pub group: String,
     /// The last offset the group has fully processed (resume is `upto + 1`).
     pub upto: u64,
+}
+
+/// The record format a stored payload names, when it is NEWER than this build reads,
+/// judged by the prefix every version keeps (see [`BREC_VERSION`]): a version byte
+/// above this build's, then — when `offset` is known — the record's own offset. Asked
+/// only of a payload that passed the frame CRC, so such a record was written by a
+/// newer astream, not damaged; the offset check is what keeps a payload this build
+/// cannot read for another reason (an encrypted log opened without its key, whose
+/// first byte is a random nonce byte) from passing as one. `None` otherwise.
+pub(crate) fn newer_format(p: &[u8], offset: Option<u64>) -> Option<u8> {
+    let version = *p.first()?;
+    let seq = u64::from_le_bytes(p.get(1..9)?.try_into().ok()?);
+    (version > BREC_VERSION && offset.is_none_or(|o| o == seq)).then_some(version)
 }
 
 impl BrokerRecord {
@@ -196,7 +232,12 @@ mod tests {
         };
         let bytes = at_cap.encode().expect("at the record cap encodes");
         assert_eq!(bytes.len(), 12 + MAX_RECORD_PAYLOAD);
-        let req = crate::proto::encode_replicate(1, 1, 1, "", &at_cap.body, None);
+        // The largest envelope: the leader's log-identity trailer included.
+        let leader = crate::LogIdentity {
+            id: [1; 16],
+            generation: 1,
+        };
+        let req = crate::proto::encode_replicate(1, 1, 1, "", &at_cap.body, None, Some(&leader));
         assert!(
             Frame::new(req).encode().is_ok(),
             "the same record inside a Replicate request still fits the frame cap"

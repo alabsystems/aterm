@@ -1,22 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Exact allocation regression for the kitty-command trick flash.
+//! The kitty-command trick flash allocates nothing on the input path or the frame path.
 //!
-//! Two halves run on paths that must not allocate. The note runs on the input
-//! path at a boundary key (`WordDecorations::note_trick_typed`, with
-//! `revoke_trick_flash` and `trick_flash_phase` beside it): O(word length) into
-//! fixed inline buffers, whatever the word (Thai under combining marks, the
-//! full 32-character window, one too many, nothing at all). The paint runs once
-//! per frame for about a second: at most 32 cells merged into the host's
-//! resident `ink` scratch, which has its capacity after the first frame.
+//! The note (`WordDecorations::note_trick_typed`, with `revoke_trick_flash` and
+//! `trick_flash_phase`) runs at a boundary key: O(word length) into fixed inline buffers, whatever
+//! the word. The paint runs once per frame for about a second: at most 32 cells merged into the
+//! host's `ink` scratch, which has its capacity after the first frame. The rescan is not pinned
+//! here: it lends the engine's resident row buffer.
 //!
-//! The rescan half is not pinned here: it lends the engine's resident row
-//! buffer, and the scan pass has its own allocation story.
-//!
-//! One `#[test]` in its own binary, like `typed_tricks_alloc.rs`: the counter
-//! is a process-global allocator switched by a global flag, so a parallel test
-//! would bleed into the count. Do not add tests to this file.
+//! One `#[test]` in its own binary: the counter is a process-global allocator switched by a
+//! global flag, so a parallel test would bleed into the count. Do not add tests to this file.
 
 use std::{
     alloc::{GlobalAlloc, Layout, System},
@@ -92,8 +86,8 @@ fn a_flash_costs_the_input_path_and_the_frame_path_no_allocation() {
     term.process(b"$ sit");
     wd.rescan(&term, 4, 40, &lex, &cfg, 1, now);
 
-    // Every shape a note can take, built BEFORE the counter is on: the word
-    // the glass holds goes LAST, so it is the one left pending.
+    // Every shape a note can take, built before the counter is on. The word the glass holds goes
+    // last, so it is the one left pending.
     let window = "x".repeat(TrickLexicon::MAX_SURFACE_CHARS);
     let too_long = "x".repeat(TrickLexicon::MAX_SURFACE_CHARS + 1);
     let shapes: [&str; 6] = ["", "\u{200d}", "นั่ง", &too_long, &window, "sit"];
@@ -114,8 +108,8 @@ fn a_flash_costs_the_input_path_and_the_frame_path_no_allocation() {
     );
     assert_eq!(allocations, 0, "a note must not allocate");
 
-    // The Space echoes, the rescan finds the word, and ONE frame warms the
-    // host's `ink` scratch. (Neither is counted: see the module docs.)
+    // The Space echoes, the rescan finds the word, and one frame warms the host's `ink` scratch
+    // (neither is counted).
     term.process(b" ");
     wd.rescan(&term, 4, 40, &lex, &cfg, 2, now);
     assert_eq!(wd.trick_flash_phase(now), TrickFlashPhase::Live);

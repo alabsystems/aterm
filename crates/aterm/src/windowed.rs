@@ -20,7 +20,7 @@
 //! On macOS and Linux this target still builds — cargo has no per-target `cfg`
 //! for a `[[bin]]` — but as a std-only STUB: including the front door there
 //! would make every `build --release -p aterm` (the release cutter's per-arch
-//! slice, `tools/dev-app.sh`, `tools/install.sh`, the conformance support
+//! slice, `ship dev-app`, `tools/install.sh`, the conformance support
 //! build) run a second whole-program `lto = true` link of the largest binary,
 //! for an artifact no bundle, release or install list carries.
 

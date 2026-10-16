@@ -1,28 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE PRESENCE DRIVER (design ruling 353) — the sequencing every host
-//! shares, as `crate::drive` (ruling 336) is for the band: fold a session's
-//! facts into its slot and re-project every window that shows it, project
-//! one window's focused session onto its view and commit the row to its
-//! geometry, the fold law's decision, the edge ripple and the choice pulse,
-//! a told story, the one deadline the host's timer arms and the tick that
-//! timer runs. The owner's ask: *"design the logic in aterm core and then
-//! keep the osx layer lightweight so that we can make this cross platform."*
+//! The presence driver: the sequencing every host shares, as `crate::drive`
+//! is for the band. It folds a session's facts into its slot and re-projects
+//! every window showing it, commits the row to a window's geometry, decides
+//! the fold law, starts the ripple and the choice pulse, takes a told story,
+//! and computes the one deadline the host's timer arms ([`deadline`]) and the
+//! tick that timer runs.
 //!
-//! Nothing here reads a clock, owns a timer or knows a window system. What
-//! only a host can do comes in through [`Desk`]: the clock, the window walk,
-//! the facts it senses, whether a band is on screen, the motion policy, the
-//! re-grid a committed row count asks for, the repaint request, the tab
-//! chips, the menu-bar herald and the chime. The per-session state the
-//! driver keeps is [`Table`].
-//!
-//! No wake is added: every instant [`deadline`] returns is a ripple's step,
-//! a told point's flash, a row's own `since` clock (only while its band is on
-//! screen), a row's held fold ([`FOLD_QUIET`], and the window's chrome regrow
-//! floor, [`crate::chrome`]) or a birth a lifted hold left owed
-//! (`rows_deadline`), a cooperative lease's lapse, a supervisor claim's lapse
-//! or the host's owed notification. A quiet desktop returns `None`.
+//! Nothing here reads a clock, owns a timer or knows a window system: what
+//! only a host can do comes in through [`Desk`], and the per-session state is
+//! [`Table`]. A quiet desktop arms no deadline.
 
 use std::collections::HashMap;
 
@@ -151,29 +139,28 @@ pub trait Desk {
     /// Whether the motion policies let a ripple start on `w` (`focused`:
     /// whether it counts as focused for them).
     fn ripple_allowed(&self, w: Self::Win, focused: bool) -> bool;
-    /// The View menu's presence BAND toggle.
+    /// The View menu's presence band toggle.
     fn band_toggle(&self) -> bool;
-    /// The View menu's presence RIM toggle.
+    /// The View menu's presence rim toggle.
     fn rim_toggle(&self) -> bool;
     /// A seamless handoff freezes every window's row count.
     fn rows_frozen(&self) -> bool;
-    /// THE DRIVER'S GEOMETRY: whether a driver may still type into any
-    /// session `w` shows (a `turn` before its settle, a live drive lease).
-    /// The window's row count holds meanwhile — a re-grid resizes every pane,
-    /// the program repaints on the `SIGWINCH`, and a driver's `if-gen=` fence
-    /// would read its own lease's re-grid as a change (measured: the live
-    /// upgrade's notice refused on 121 visits of 121). The row catches up on
-    /// the wake that lifts it ([`Facts::typing`]).
+    /// Whether a driver may still type into any session `w` shows (a `turn`
+    /// before its settle, a live drive lease). The window's row count holds
+    /// meanwhile: a re-grid resizes every pane, the program repaints on the
+    /// `SIGWINCH`, and a driver's `if-gen=` fence would read its own lease's
+    /// re-grid as a change. The row catches up on the wake that lifts it
+    /// ([`Facts::typing`]).
     fn driver_may_type(&self, w: Self::Win) -> bool {
         let _ = w;
         false
     }
-    /// THE LIVE LEASE of `session`, as [`Facts::lease`] reduces it — read
-    /// again now, not the slot's copy. The row's commit holds while it
-    /// differs from the mark the front session's words were formed under
-    /// (`commit_rows`), and a window refreshed meanwhile re-senses the
-    /// session first (`refresh_window`). `None`: the host keeps no lease, and
-    /// only [`Facts::typing`] and [`Self::driver_may_type`] hold.
+    /// The live lease of `session`, as [`Facts::lease`] reduces it, read now
+    /// rather than the slot's copy. The row's commit holds while it differs
+    /// from the mark the front session's words were formed under
+    /// (`commit_rows`), and a window refreshed meanwhile re-senses the session
+    /// first. `None`: the host keeps no lease, and only [`Facts::typing`] and
+    /// [`Self::driver_may_type`] hold.
     fn lease_mark(&self, session: u64) -> Option<LeaseMark> {
         let _ = session;
         None
@@ -187,17 +174,16 @@ pub trait Desk {
         let _ = w;
         None
     }
-    /// THE WINDOW'S CHROME REGROW FLOOR ([`crate::chrome`], ruling 414,
-    /// proposed): the earliest instant an unforced fold may re-grid `w`
-    /// ([`chrome::RegrowFloor::floor`]) — [`chrome::CHROME_REGROW_SETTLE`]
-    /// past the last rise of ANY of its chrome rows (this row's birth, a band
-    /// row, the strip). `None`: no floor — no rise noted, or a window whose
-    /// grid never re-grids for its chrome (no glass).
+    /// The window's chrome regrow floor ([`chrome::RegrowFloor::floor`]): the
+    /// earliest instant an unforced fold may re-grid `w`,
+    /// [`chrome::CHROME_REGROW_SETTLE`] past the last rise of any of its
+    /// chrome rows (this row's birth, a band row, the strip). `None`: no rise
+    /// noted, or a window whose grid never re-grids for its chrome.
     fn chrome_floor(&self, w: Self::Win) -> Option<Instant> {
         let _ = w;
         None
     }
-    /// The row was just BORN on `w` at `now` (its grid is about to shrink by
+    /// The row was just born on `w` at `now` (its grid is about to shrink by
     /// the one row [`Self::regrid`] pays): note the rise on `w`'s floor
     /// ([`chrome::RegrowFloor::rose`]), so no other source's fall re-grids
     /// the window back inside the settle.
@@ -284,11 +270,11 @@ pub fn ripple<D: Desk>(d: &mut D, w: D::Win, now: Instant) {
     start_ripple(d, w, now, false);
 }
 
-/// Start the CHOICE PULSE on `w`: the same 300 ms edge flash, painted in the
-/// story tone and shown even on a window with no rim. It IS a rim flash, so
-/// the rim toggle off means none; it is not held to the OS key focus — its
-/// point is to show that a question in a window the person is NOT in was
-/// answered. Only reduced motion and serious mode stop it.
+/// Start the choice pulse on `w`: the same 300 ms edge flash, painted in the
+/// story tone and shown even on a window with no rim. It is a rim flash, so
+/// the rim toggle off means none; it is not held to the OS key focus, since
+/// its point is to show a question answered in a window the person is not
+/// in. Only reduced motion and serious mode stop it.
 pub fn pulse<D: Desk>(d: &mut D, w: D::Win, now: Instant) {
     if d.rim_toggle() {
         start_ripple(d, w, now, true);
@@ -334,18 +320,15 @@ fn project<V: Host>(
     (level, rim, words)
 }
 
-/// Project `w`'s front session onto its view — level, rim, words and the
-/// row's existence — and commit the row count to its geometry. Asks for a
-/// repaint when anything the painter reads moved or the row folded.
+/// Project `w`'s front session onto its view (level, rim, words and the row's
+/// existence) and commit the row count to its geometry. Asks for a repaint
+/// when anything the painter reads moved or the row folded.
 ///
-/// A front session whose lease MOVED since its slot was sensed
-/// ([`lease_moved`]) is re-sensed first — the whole [`refresh_session`], so
-/// every window showing it is re-projected from the one read — rather than
-/// left to the wake that moved it: a refresh (a tick, a focus change, a tab
-/// switch) never projects words from a lease that is gone, and the row a
-/// moved lease holds catches up on the first refresh after the move, the
-/// release's own wake or any other. Once: a lease that moves again under
-/// that read is held by `commit_rows`, and its own wake follows.
+/// A front session whose lease moved since its slot was sensed
+/// ([`lease_moved`]) is re-sensed first through [`refresh_session`], so no
+/// refresh (a tick, a focus change, a tab switch) projects words from a gone
+/// lease. Once: a lease that moves again under that read is held by
+/// `commit_rows` until its own wake.
 pub fn refresh_window<D: Desk>(d: &mut D, w: D::Win) {
     if let Some(session) = d.front_session(w).filter(|s| lease_moved(d, *s)) {
         refresh_session(d, session, false);
@@ -365,15 +348,11 @@ fn project_window<D: Desk>(d: &mut D, w: D::Win) {
 /// fold law's keystroke), which waits only for the row's minimum life
 /// ([`View::fold_read`]).
 ///
-/// A SWITCH OF THE WINDOW'S FRONT SESSION IS NOT A READ. Read at once, a
-/// switch to a tab that wants no row folded it, and the switch back re-bore it
-/// on the same call: `ctl tab 1; ctl tab 0` 10-30 ms apart, a pane focus flip
-/// or a quick pair of tab keys re-gridded every pane of every tab N -> N+1 ->
-/// N, two `SIGWINCH`es an alternate-screen program in the background answers
-/// by reading an unchanged size. The switch starts the ordinary fold quiet
-/// instead, which the switch back cancels with no re-grid; the person's first
-/// key in the new tab is the fold law's read and folds it then
-/// ([`human_acted`]), so the blank row never stands under what they type.
+/// A switch of the window's front session is not a read: a quick switch away
+/// and back (two tab keys, a pane focus flip) would fold and re-bear the row,
+/// re-gridding every pane twice. The switch starts the ordinary fold quiet,
+/// which the switch back cancels; the person's first key in the new tab is
+/// the read ([`human_acted`]).
 fn refresh_window_at<D: Desk>(d: &mut D, w: D::Win, now: Instant, read: bool) {
     let session = d.front_session(w);
     let watermark = session
@@ -392,12 +371,10 @@ fn refresh_window_at<D: Desk>(d: &mut D, w: D::Win, now: Instant, read: bool) {
     }
 }
 
-/// THE TOLD FLASH ENDS ON THE ROW'S OWN CLOCK (ruling 415):
-/// while the front session's told point stands in the phase slot
-/// ([`super::TOLD_FLASH`]), the row's words are due again when it ends, so
-/// the tick at that instant — the one [`deadline`] names for it — re-projects
-/// the phase. Without it the flash stood until the words' own minute clock,
-/// or an unrelated change, recomposed the row.
+/// While the front session's told point stands in the phase slot
+/// ([`super::TOLD_FLASH`]), make the row's words due again when it ends, so
+/// the tick [`deadline`] names for it re-projects the phase rather than
+/// leaving the flash until the words' minute clock.
 fn due_by_told_end<D: Desk>(d: &mut D, w: D::Win, now: Instant) {
     let end = d
         .front_session(w)
@@ -419,59 +396,28 @@ pub fn refresh_all<D: Desk>(d: &mut D) {
 }
 
 /// Commit the row's existence to `w`'s geometry: `true` when the count moved
-/// (and the host re-gridded — ONE PTY resize). Frozen mid-handoff, held while
-/// a driver may type ([`Desk::driver_may_type`]), and yielding to the last
-/// terminal row of a real window.
+/// (one PTY re-grid). Frozen mid-handoff, held while a driver may type
+/// ([`Desk::driver_may_type`]), and yielding to the last terminal row of a
+/// real window.
 ///
-/// THE HOLD IS JUDGED ON THE WORDS' OWN SNAPSHOT TOO. The row's want is the
-/// front session's words, formed from the facts its last refresh SENSED; the
-/// host's [`Desk::driver_may_type`] reads the LIVE lease, later. A lease let
-/// go between the two (measured: `lease acquire` then `lease release` under
-/// 0.1 ms apart, 3 runs of 10 on a live window) left words that still said
-/// "driven" and a live read that said "nobody typing" — the row was born for a
-/// hand already gone and folded again on the release's own wake, a 24 → 23 →
-/// 24 re-grid inside 0.35 ms under a program on the alternate screen. A `turn`
-/// ending its input and releasing its lease back to back does the same with
-/// words that say "settling". So the words' own lease holds as well: while the
-/// mark they were formed under ([`Slot::lease`]) differs from the host's live
-/// one ([`Desk::lease_mark`]) — any move of the lease, which always posts a
-/// wake — and while it said a driver may type ([`Slot::typing`], for a host
-/// that keeps no live mark). The wake that moved it re-derives the want. The
-/// live read still holds a lease taken after the sense. `DriverGeometry`'s
-/// `NoBirthForAGoneHand` and `TheHeldRowCatchesUp` are the two halves
-/// (`aterm-spec`).
+/// The hold is judged on the words' own snapshot too: a lease let go between
+/// the sense and this commit would bear a row for a gone hand. So the row
+/// also holds while the words' mark ([`Slot::lease`]) differs from the live
+/// one ([`Desk::lease_mark`]) or they said a driver may type
+/// ([`Slot::typing`]); the wake that moved the lease re-derives the want.
+/// Such a want decides nothing: no birth, no fold, no start or cancel of the
+/// quiet, and [`rows_deadline`] arms no instant meanwhile. `DriverGeometry`'s
+/// `NoBirthForAGoneHand` and `TheHeldRowCatchesUp` (`aterm-spec`) are the two
+/// halves.
 ///
-/// THE FOLD QUIET (ruling 394): a birth commits at once, a fold only
-/// when [`fold_due`] says — a row born and folded inside a millisecond cost
-/// two re-grids, and an alternate-screen program that repaints only on a
-/// CHANGED size never repainted after the net-zero pair. A want that returns
-/// first cancels the fold with no re-grid. Two folds are not held at all: the
-/// WINDOW's (a real window that can no longer afford the row gets its terminal
-/// row back now, as the band's D1 rule does) and the human's hiding the band
-/// (the View menu). `read` marks the fold a person's read
-/// ([`View::fold_read`]). The quiet runs through a hold: a fold whose want
-/// stayed away through a handoff or a driver's input commits as the hold
-/// lifts.
-///
-/// THE WINDOW'S CHROME REGROW FLOOR (ruling 414): a quiet fold — a timed one
-/// or a person's read — also waits [`Desk::chrome_floor`], so another chrome
-/// source's RISE (a band row reaching the glass, the strip) just before it
-/// cannot make a shrink-then-grow pair milliseconds apart (measured: a band
-/// row rising 11–13 ms before the timed fold, and 3–6 ms before a person's key
-/// folded a row that had stood its quiet, shifted a busy alternate screen).
-/// The window's and the band toggle's folds stay exempt. A birth commits at
-/// once and is noted as a rise ([`Desk::chrome_rose`]), which the band's quiet
-/// shrink then waits.
-///
-/// THE TWO COMPOSE ON ONE RULE: a want formed under a lease that has since
-/// moved ([`lease_moved`]) decides NOTHING — no birth, no fold, and no start
-/// or cancel of the quiet: a pending fold keeps its clock (and a person's
-/// read of it) until the wake the move posted re-senses the session and
-/// judges the fresh want, and [`rows_deadline`] arms no instant meanwhile, so
-/// the tick never spins on a fold it may not commit. The window's and the
-/// band toggle's folds wait that one wake too: it is already posted. A
-/// sensed [`Slot::typing`] is an ordinary hold, like the live one: the
-/// quiet runs through it.
+/// A birth commits at once (noted as a rise, [`Desk::chrome_rose`]); a fold
+/// only when [`fold_due`] says and past [`Desk::chrome_floor`], so another
+/// chrome row's rise just before it cannot make a shrink-then-grow pair. A
+/// want that returns first cancels the fold with no re-grid. The quiet runs
+/// through a hold, so a fold whose want stayed away commits as the hold
+/// lifts. Two folds wait for neither: a real window that can no longer afford
+/// the row, and hiding the band. `read` marks the fold a person's read
+/// ([`View::fold_read`]).
 fn commit_rows<D: Desk>(d: &mut D, w: D::Win, now: Instant, read: bool) -> bool {
     let front = d.front_session(w);
     let moved = front.is_some_and(|s| lease_moved(d, s));
@@ -569,17 +515,15 @@ fn words_stale<D: Desk>(d: &D, w: D::Win) -> bool {
 
 /// When `v`'s pending fold may commit; `None` with none pending.
 ///
-/// * A person's READ ([`View::fold_read`]: the fold law's keystroke) folds
-///   at once, once the row has stood [`FOLD_QUIET`] since its
-///   birth — a person acting is not a flap, but a row a key folds
-///   milliseconds after a told story bore it is a flap.
-/// * Any other fold waits [`FOLD_QUIET`] past the want's drop, and past the
-///   last LOOK a driver took at the window's screen ([`Desk::looked_at`]),
-///   the look's hold bounded by [`FOLD_LOOK_CAP`] past the drop: a fold
-///   committed between a driver's read and its fenced act refuses the act.
+/// * A person's read ([`View::fold_read`]) folds once the row has stood
+///   [`FOLD_QUIET`] since its birth: a key that folds a row milliseconds
+///   after a told story bore it is a flap.
+/// * Any other fold waits [`FOLD_QUIET`] past the want's drop and past the
+///   last look a driver took at the window's screen ([`Desk::looked_at`]),
+///   bounded by [`FOLD_LOOK_CAP`] past the drop.
 ///
-/// The fold's OWN due, before the window's chrome regrow floor
-/// ([`Desk::chrome_floor`]), which the commit and `rows_deadline` add.
+/// The commit and `rows_deadline` add the chrome regrow floor
+/// ([`Desk::chrome_floor`]) on top.
 #[must_use]
 pub fn fold_due(v: &View, looked: Option<Instant>) -> Option<Instant> {
     let since = v.fold_since?;
@@ -593,26 +537,17 @@ pub fn fold_due(v: &View, looked: Option<Instant>) -> Option<Instant> {
 /// When `w`'s row count owes a commit, never before `now`; `None` while its
 /// count is held, or with nothing owed.
 ///
-/// * A held FOLD is due at [`fold_due`], and not before the window's chrome
-///   regrow floor ([`Desk::chrome_floor`], [`chrome::at_floor`]): the fold's
-///   commit declines until then, so an earlier instant would spin the tick.
-/// * A BIRTH the words want that no hold stands against is owed `now`. A birth
-///   is committed by the projection that formed its want, and a hold turns
-///   that projection away; nothing re-projects the window for it but a wake
-///   whose facts moved. A hold that lifts without one strands it: a background
-///   tab's lease that held the birth ([`Desk::driver_may_type`] reads every
-///   session the window shows) is taken and let go before either of its wakes
-///   runs, so both read facts identical to its slot and [`refresh_session`]
-///   projects nothing — and the same for a lease taken between a refresh's
-///   sense and its commit and let go before its wake. The band's words clock
-///   would catch it up only a minute later, and never on a headless or
-///   occluded window: the tick commits it instead. No spin: this excludes
-///   exactly [`commit_rows`]' holds, and the tick re-projects the window
-///   before it commits.
-///
-/// The wake that lifts a hold the words themselves carry
-/// ([`words_stale`]) re-projects the window; one that lifts a live hold is
-/// what the birth's clause above catches when it does not.
+/// * A held fold is due at [`fold_due`], and not before the window's chrome
+///   regrow floor ([`chrome::at_floor`]): the commit declines until then, so
+///   an earlier instant would spin the tick.
+/// * A birth the words want that no hold stands against is owed `now`. A
+///   hold turns the birth's projection away, and a hold that lifts without a
+///   wake whose facts moved strands it (a background tab's lease taken and
+///   let go before either of its wakes runs, so [`refresh_session`] projects
+///   nothing); the band's words clock would catch it only a minute later, and
+///   never on a headless or occluded window, so the tick commits it. No spin:
+///   this excludes exactly [`commit_rows`]' holds, and the tick re-projects
+///   the window before it commits.
 fn rows_deadline<D: Desk>(d: &D, w: D::Win, v: &View, now: Instant) -> Option<Instant> {
     if d.rows_frozen() || d.driver_may_type(w) || words_stale(d, w) {
         return None;
@@ -623,9 +558,9 @@ fn rows_deadline<D: Desk>(d: &D, w: D::Win, v: &View, now: Instant) -> Option<In
     Some(chrome::at_floor(fold_due(v, d.looked_at(w))?, d.chrome_floor(w)).max(now))
 }
 
-/// THE FOLD LAW. The human acted (a key, a click) in `w`: if its front
-/// session is CALM, the story is read — the watermark moves to the newest
-/// point and the row folds. Never on focus alone, never on a timer, and
+/// The fold law. The human acted (a key, a click) in `w`: if its front
+/// session is calm, the story is read (the watermark moves to the newest
+/// point) and the row folds. Never on focus alone, never on a timer, and
 /// never while anything is still happening.
 pub fn human_acted<D: Desk>(d: &mut D, w: D::Win) {
     let Some(session) = d.front_session(w) else {
@@ -634,21 +569,17 @@ pub fn human_acted<D: Desk>(d: &mut D, w: D::Win) {
     human_acted_on(d, w, session);
 }
 
-/// THE FOLD LAW for an act that may move the front: the human acted in `w`
-/// while `session` was its front — the story they SAW. A click presses the
-/// layout the person saw first (ruling 369), and that press can bring
-/// another session front (a click in another split pane) or none at all (a
-/// capsule that opens Settings or an editor); the fold reads the session
-/// that was front BEFORE it, never the one the press made front (ruling
-/// 372). The same law as [`human_acted`] otherwise: only while calm, once.
+/// The fold law for an act that may move the front: the human acted in `w`
+/// while `session` was its front, the story they saw. A click presses the
+/// layout the person saw first, and that press can bring another session
+/// front (a click in another split pane) or none (a capsule that opens
+/// Settings); the fold reads the session front before it. Otherwise as
+/// [`human_acted`]: only while calm, once.
 pub fn human_acted_on<D: Desk>(d: &mut D, w: D::Win, session: u64) {
-    // CALM IS JUDGED ON THE LIVE LEASE. A lease taken whose wake has not run
-    // yet leaves the slot reading calm: the key read the story (the watermark
-    // moved) while the commit's moved-lease hold dropped the read, so once the
-    // lease ended the blank row stood a fresh quiet — and with the wake
-    // handled first, the same key read nothing. Re-sensing a moved lease
-    // first, as [`refresh_window`] does, makes both orders one: a lease just
-    // taken is not calm, and one just let go is judged as let go.
+    // Calm is judged on the live lease: a lease whose wake has not run yet
+    // leaves the slot reading calm. Re-sensing a moved lease first, as
+    // [`refresh_window`] does, makes both orders one: a lease just taken is
+    // not calm, and one just let go is judged as let go.
     if lease_moved(d, session) {
         refresh_session(d, session, false);
     }
@@ -658,19 +589,14 @@ pub fn human_acted_on<D: Desk>(d: &mut D, w: D::Win, session: u64) {
         .filter(|slot| slot.calm())
         .map(|slot| slot.story_seq)
     else {
-        // A FOLD THE FRONT NO LONGER WANTS IS NOT A STORY READ. A switch to a
-        // tab whose session wants no row leaves the old row pending and blank;
-        // that session may still not be calm — its attention told by the
-        // message band, or aterm's own hand driving it — or hold no slot at
-        // all (no wake has touched it yet), and either early return left the
-        // blank row standing out its quiet under what the person types. Calm
-        // guards reading a STORY away; here there is no story on the row to
-        // read, so the key folds it as a read, and the watermark stays put.
-        // ONLY while `session` is still the window's front: a click reads the
-        // session front BEFORE its press (ruling 372), so a click from a
-        // non-calm A into a quiet B would otherwise fold B's blank row at
-        // once, and the click back would bear it again — a net-zero re-grid
-        // pair.
+        // A fold the front no longer wants is not a story read. After a switch
+        // to a tab whose session wants no row, that session may not be calm
+        // (attention told by the band, aterm's own hand) or may hold no slot
+        // yet; calm guards reading a story away, but there is none on the row,
+        // so the key folds the blank row as a read and the watermark stays.
+        // Only while `session` is still the front: a click reads the session
+        // front before its press, so a click from a non-calm A into a quiet B
+        // would otherwise fold B's blank row and the click back re-bear it.
         let blank_pending = d.front_session(w) == Some(session)
             && d.view_of(w)
                 .is_some_and(|v| v.fold_since.is_some() && !v.fold_read && v.words.is_none());
@@ -689,10 +615,8 @@ pub fn human_acted_on<D: Desk>(d: &mut D, w: D::Win, session: u64) {
         return;
     }
     v.watermarks.insert(session, seq);
-    // The keystroke is a READ, and the read folds the row: a person reading
-    // a calm story is not a sub-millisecond flap (the fold quiet's cause) and
-    // the row cannot come back from the story just read — once the row has
-    // stood its minimum life ([`fold_due`]); until then the timer folds it.
+    // The keystroke is a read, and the read folds the row once it has stood
+    // its minimum life ([`fold_due`]); until then the timer folds it.
     let now = d.clock();
     refresh_window_at(d, w, now, true);
 }
@@ -701,7 +625,7 @@ pub fn human_acted_on<D: Desk>(d: &mut D, w: D::Win, session: u64) {
 /// brought current first (a story on a session no wake has touched must not
 /// print a blank row), the point is noted, and every window showing the
 /// session is re-projected. A [`StoryVerb::Chose`] pulses every window whose
-/// FRONT tab shows the session (a background tab has its story dot, and a
+/// front tab shows the session (a background tab has its story dot, and a
 /// rim flash would name the wrong tab) and chimes once. `None` for a session
 /// the host no longer holds; else the point's seq.
 pub fn tell<D: Desk>(d: &mut D, session: u64, verb: StoryVerb, text: &str) -> Option<u64> {
@@ -747,7 +671,7 @@ pub fn deadline<D: Desk>(d: &D, now: Instant) -> Option<Instant> {
         if let Some(x) = v.ripple_deadline(now) {
             fold(x);
         }
-        // A told point's flash is read off the FRONT session's slot only: a
+        // A told point's flash is read off the front session's slot only: a
         // background tab's flash has no row to return from.
         if let Some(x) = d
             .front_session(w)
@@ -779,14 +703,12 @@ pub fn deadline<D: Desk>(d: &D, now: Instant) -> Option<Instant> {
 }
 
 /// The timer's tick at `now`: a lapsed supervisor claim is removed and its
-/// session re-read, every owed notification the rate limit allows is
-/// posted, a lapsed cooperative lease is re-read, a finished ripple retires,
-/// and every row whose `since` figure moved, or whose told flash ended, is
-/// recomposed (its session's
-/// facts re-read first, so a fact whose change posted nothing reaches the
-/// row at the tick), and a row whose held fold is due folds, or whose birth
-/// a lifted hold left owed is born — after the lapses above, so a lease that
-/// lapsed at this tick is what it judges.
+/// session re-read, owed notifications the rate limit allows are posted, a
+/// lapsed cooperative lease is re-read, a finished ripple retires, every row
+/// whose `since` figure moved or whose told flash ended is recomposed (its
+/// session's facts re-read first, so a fact whose change posted nothing
+/// reaches the row), and a due held fold or owed birth commits, after the
+/// lapses above so a lease that lapsed at this tick is what it judges.
 /// Returns the windows that need a repaint.
 pub fn tick<D: Desk>(d: &mut D, now: Instant) -> Vec<D::Win> {
     let mut out = Vec::new();
@@ -864,10 +786,9 @@ pub fn tick<D: Desk>(d: &mut D, now: Instant) -> Vec<D::Win> {
 }
 
 // ---------------------------------------------------------------------------
-// THE WIRE STRINGS (design ruling 358): what the `status` and `chrome` verbs
-// print of presence, composed here so every host prints the same bytes. The
-// percent codec stays the host's ([`Host::pct_encode`], through
-// [`Hand::wire`](super::Hand::wire)); no second encoder can drift.
+// The wire strings: what the `status` and `chrome` verbs print of presence,
+// composed here so every host prints the same bytes. The percent codec stays
+// the host's ([`Host::pct_encode`]).
 
 /// The highest story watermark any window holds for `session` (0: no window
 /// has read its story).
@@ -877,14 +798,10 @@ fn read_mark<D: Desk>(d: &D, session: u64) -> u64 {
     mark
 }
 
-/// A session's level as `status level=` reports it: read against the
-/// HIGHEST watermark any window holds for the session — a story a human
-/// read in any window (the fold law moved that window's mark) is read,
-/// whichever tab is in front now. The tab chip reads its own window's mark,
-/// so on a one-window desktop the two never disagree: reading the FOCUSED
-/// window's mark instead would answer `level=story` for a story the human
-/// had already folded, once another tab came to the front. [`Level::Quiet`]
-/// for a session no refresh has touched.
+/// A session's level as `status level=` reports it: read against the highest
+/// watermark any window holds for the session, so a story read in any window
+/// is read whichever tab is in front now. [`Level::Quiet`] for a session no
+/// refresh has touched.
 #[must_use]
 pub fn session_level<D: Desk>(d: &D, session: u64) -> Level {
     d.table()
@@ -893,10 +810,9 @@ pub fn session_level<D: Desk>(d: &D, session: u64) -> Level {
 }
 
 /// The additive presence `status` fields: `hand=<token> level=<level>
-/// story=<n>` (design §5), then `why=` — what put the session at
-/// `level=attention` ([`Slot::why`]). Plain reads of the slot the refreshes
-/// keep current — no lock, no classification — and `hand=- level=quiet story=0
-/// why=-` for a session no refresh has touched yet.
+/// story=<n> why=<causes>` ([`Slot::why`]), plain reads of the slot the
+/// refreshes keep current; `hand=- level=quiet story=0 why=-` for a session
+/// no refresh has touched yet.
 #[must_use]
 pub fn status_tail<D: Desk>(d: &D, session: u64) -> String {
     let level = session_level(d, session).wire();
@@ -911,10 +827,10 @@ pub fn status_tail<D: Desk>(d: &D, session: u64) -> String {
     }
 }
 
-/// The row's words as the `chrome` verb reads them: the line as the PAINTER
-/// fits it at `cols` terminal columns (the row keeps one margin cell each
-/// side, [`text_cols`], so the wire never reports a slot the human cannot
-/// see) — empty with no row — and the rim's name.
+/// The row's words as the `chrome` verb reads them: the line as the painter
+/// fits it at `cols` terminal columns (inside the margins, [`text_cols`], so
+/// the wire never reports a slot the human cannot see), empty with no row,
+/// and the rim's name.
 #[must_use]
 pub fn report<V: Host>(v: &View, cols: usize) -> (String, &'static str) {
     let line = v
@@ -925,18 +841,15 @@ pub fn report<V: Host>(v: &View, cols: usize) -> (String, &'static str) {
     (line, v.rim.wire())
 }
 
-/// `chrome`'s presence line for the host's front window `front` (`cols`:
-/// its terminal columns) — what the human sees, as words: `presence
+/// `chrome`'s presence line for the host's front window `front` (`cols`: its
+/// terminal columns), what the human sees as words: `presence
 /// rim=<none|drive|wait|stop|stop-hold> level=<level> band="<the row, fitted
-/// to the window>" sentence="<the a11y sentence>"`. The two quoted values are
-/// cell-sanitized already (no control bytes); `"` and `\` are escaped so the
-/// line stays one parseable record. A quiet window, or no window, prints both
-/// empty; a front the host holds no view for prints an empty `rim=`, as the
-/// host's own line always did (ruling 358). A row the facts want that the
-/// window has not committed prints empty, with ` held=<driver|handoff|height>`
-/// after the sentence: why it is not on the glass yet (ruling 365). No
-/// command text, mail body, OSC title or limit message can appear here: the
-/// row never carries one.
+/// to the window>" sentence="<the a11y sentence>"`. The quoted values are
+/// cell-sanitized already; `"` and `\` are escaped so the line stays one
+/// parseable record. A quiet window, or no window, prints both empty; a front
+/// with no view prints an empty `rim=`. A row the facts want that the window
+/// has not committed prints empty, with ` held=<driver|handoff|height>` after
+/// the sentence.
 #[must_use]
 pub fn chrome_line<D: Desk>(d: &D, front: Option<D::Win>, cols: usize) -> String {
     let Some(w) = front else {
@@ -947,10 +860,9 @@ pub fn chrome_line<D: Desk>(d: &D, front: Option<D::Win>, cols: usize) -> String
         );
     };
     let view = d.view_of(w);
-    // WHAT IS DRAWN, never what is projected (ruling 365): a row the facts
-    // want but the window has not committed — a driver's hand on the session,
-    // a handoff's freeze, a window one row tall — is not on the glass, so the
-    // line prints it empty and says why it waits (`held=`).
+    // What is drawn, never what is projected: a row the facts want but the
+    // window has not committed (a driver's hand, a handoff's freeze, a window
+    // one row tall) prints empty, and `held=` says why it waits.
     let drawn = view.filter(|v| v.rows > 0);
     let (band, _) = drawn.map(|v| report::<D::V>(v, cols)).unwrap_or_default();
     let rim = view.map(|v| v.rim.wire()).unwrap_or_default();

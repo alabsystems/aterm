@@ -1,0 +1,47 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+# THE DIRECTORY AND THE PACKAGE NAME DIFFER ON PURPOSE, as with
+# crates/aterm-cfg-if and crates/aterm-getrandom: `[patch.crates-io]` matches
+# on PACKAGE name, so this must be called `windows-sys` to take ring's
+# `windows-sys = "0.52"` edge, and the directory keeps the `aterm-` prefix so
+# it reads as ours. The `-052` is the version line it replaces: the root
+# manifest patches it through the RENAMED row `windows-sys-052`, beside the
+# 0.61 line's `windows-sys-061` (docs/AUDIT-third-party-2026-10-15.md,
+# windows-bindings steps 1 and 3).
+name = "windows-sys"
+# NOT `version.workspace = true`: a SEMVER CONTRACT with ring, not an aterm
+# release number. Every ring from 0.17.8 to 0.17.14 asks `^0.52`; 0.52.0 is
+# the only 0.52 release and what the lock held, so no registry 0.52.x can
+# outrank it (`targo --unverified forge check` [OB-12] fails if one does).
+version = "0.52.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "First-party `windows-sys` 0.52 for aterm: the Win32 declarations ring 0.17 reads on aarch64 Windows (replaces the crates.io windows-sys 0.52, windows-targets and its import library under ring)"
+
+# `windows-sys` is the PACKAGE; `windows_sys` is what ring writes.
+[lib]
+name = "windows_sys"
+path = "src/lib.rs"
+# No unit tests live in src/; tests/recorded.rs holds the declarations.
+test = false
+
+[features]
+# The four upstream features ring 0.17.14 requests, directly
+# (`Win32_Foundation`, `Win32_System_Threading`) or through upstream's own
+# implications (`Win32`, `Win32_System`), with upstream's edges. They gate
+# nothing: the four declarations are always present (src/lib.rs says why).
+# Every other upstream feature is ABSENT, so a new consumer asking for one
+# fails to resolve instead of compiling against declarations nobody checked.
+Win32 = []
+Win32_Foundation = ["Win32"]
+Win32_System = ["Win32"]
+Win32_System_Threading = ["Win32_System"]
+
+# No dependencies: upstream's `windows-targets` and the `windows_*` import
+# library crates under it leave with the registry package.
+
+[lints]
+workspace = true

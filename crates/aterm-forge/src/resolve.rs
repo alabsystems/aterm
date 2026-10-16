@@ -18,9 +18,52 @@
 //! offline, including triples this host cannot build for.
 
 use crate::model::{Cell, Graph, PkgId};
+use aterm_uds::output::CommandOutput as _;
+use aterm_uds::spawnfd::{Command, command};
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+
+/// The cargo forge asks for `tree` and `metadata`, and the PATH its children
+/// see: one value per run, so every child answers from one toolchain.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Cargo {
+    program: OsString,
+    path: Option<OsString>,
+}
+
+impl Cargo {
+    /// `$CARGO` (targo sets it, so a nested run asks the toolchain that
+    /// launched it), else Trust's `targo` off PATH: forge's own CLI.
+    #[must_use]
+    pub fn from_env() -> Self {
+        Self {
+            program: std::env::var_os("CARGO").unwrap_or_else(|| "targo".into()),
+            path: None,
+        }
+    }
+
+    /// `program` with `path` as its children's PATH: a caller that resolved
+    /// its toolchain once hands it here, so `$CARGO` and PATH order never pick
+    /// another.
+    #[must_use]
+    pub fn pinned(program: impl Into<OsString>, path: impl Into<OsString>) -> Self {
+        Self {
+            program: program.into(),
+            path: Some(path.into()),
+        }
+    }
+
+    /// `<program> <verb>`, from `root`, under this cargo's PATH.
+    pub(crate) fn command(&self, verb: &str, root: &Path) -> Command {
+        let mut cmd = command(&self.program);
+        cmd.arg(verb).current_dir(root);
+        if let Some(path) = &self.path {
+            cmd.env("PATH", path);
+        }
+        cmd
+    }
+}
 
 /// The eight measurement cells, in report order.
 ///
@@ -28,8 +71,8 @@ use std::process::Command;
 ///
 /// `atpkg::manifest::TARGETS` lists the triples this project publishes
 /// artifacts for; each has a cell, including the second architecture of each
-/// OS, where a cfg break otherwise hides. `crates/atpkg/tests/
-/// shipped_triples_have_a_compile_cell.rs` keeps the two lists in step.
+/// OS, where a cfg break otherwise hides. atpkg's
+/// `every_published_triple_is_a_forge_cell` holds the shipped triples to a cell each.
 ///
 /// # Order is append-only
 ///
@@ -40,8 +83,8 @@ use std::process::Command;
 ///
 /// The six native cells are rooted at the binary package `aterm`. `aterm` is
 /// never compiled for `wasm32`, so the wasm cells are rooted at the two shipped
-/// browser modules, each compiled by name in `xtask gate cells-foreign` and
-/// `tools/wasm-bench/run.sh`:
+/// browser modules, each compiled by name in `verify cells` and the `wasm`
+/// lane of `verify perf`:
 ///
 /// * `aterm-wasm`: the CPU/`putImageData` path (`aterm-render` rasterizer);
 /// * `aterm-gpu-web`: the GPU path (`aterm-gpu` over `wgpu` -> WebGL2/WebGPU).
@@ -80,8 +123,7 @@ pub fn default_cells() -> Vec<Cell> {
             package: "aterm-gpu-web".to_string(),
         },
         // The second architecture of each shipped OS, rooted at `aterm`. None
-        // is a fleet host triple, so all three run in `xtask gate
-        // cells-foreign`.
+        // is a fleet host triple, so all three run in `verify cells`.
         //
         // The Intel-Mac slice of the universal release binary
         // (`aterm-release`'s buildplan.rs builds it under `RUSTUP_TOOLCHAIN=
@@ -91,8 +133,8 @@ pub fn default_cells() -> Vec<Cell> {
             triple: "x86_64-apple-darwin".to_string(),
             package: "aterm".to_string(),
         },
-        // ARM Linux: the triple tools/linux-auto-atpkg.sh cross-packs beside
-        // x86_64 (`cross_linker_for`), and the one an aarch64 cell would serve.
+        // ARM Linux: the triple the Linux lane (`atpkg-publish lane run linux`)
+        // cross-packs beside x86_64, and the one an aarch64 cell would serve.
         Cell {
             name: "linux-arm".to_string(),
             triple: "aarch64-unknown-linux-gnu".to_string(),
@@ -305,15 +347,16 @@ pub fn parse_tree(text: &str) -> Result<(Graph, BTreeMap<PkgId, PathBuf>), Strin
 /// Runs `--locked --offline` first. On failure, one retry without `--offline`
 /// is allowed and noted in `log`, since that number may not reproduce offline.
 pub fn graph_and_paths(
+    cargo: &Cargo,
     root: &Path,
     cell: &Cell,
     log: &mut String,
 ) -> Result<(Graph, BTreeMap<PkgId, PathBuf>), String> {
     let root = &abs_root(root)?;
-    let text = match run_tree(root, cell, true) {
+    let text = match run_tree(cargo, root, cell, true) {
         Ok(text) => text,
         Err(offline_err) => {
-            let online = run_tree(root, cell, false).map_err(|online_err| {
+            let online = run_tree(cargo, root, cell, false).map_err(|online_err| {
                 format!(
                     "`targo tree` could not resolve cell `{}` ({}).\n  \
                      with --offline: {}\n  without --offline: {}\n  \
@@ -345,7 +388,7 @@ pub fn graph_and_paths(
 #[cfg(test)]
 pub fn graph(root: &Path, cell: &Cell) -> Result<Graph, String> {
     let mut log = String::new();
-    let out = graph_and_paths(root, cell, &mut log);
+    let out = graph_and_paths(&Cargo::from_env(), root, cell, &mut log);
     if !log.is_empty() {
         eprint!("{log}");
     }
@@ -376,7 +419,7 @@ pub(crate) fn real_workspace_graph_and_paths(
         .clone();
     slot.get_or_init(|| {
         let mut log = String::new();
-        let out = graph_and_paths(&real_workspace_root(), cell, &mut log);
+        let out = graph_and_paths(&Cargo::from_env(), &real_workspace_root(), cell, &mut log);
         if !log.is_empty() {
             eprint!("{log}");
         }
@@ -431,13 +474,10 @@ pub fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
     PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(&text))
 }
 
-fn run_tree(root: &Path, cell: &Cell, offline: bool) -> Result<String, String> {
-    // `CARGO` is set by targo, so a nested invocation uses the launching
-    // toolchain; unset, it is Trust's `targo` (`tree` takes no lane flag).
-    let exe = std::env::var_os("CARGO").unwrap_or_else(|| "targo".into());
-    let mut cmd = Command::new(exe);
-    cmd.arg("tree")
-        .arg("--manifest-path")
+fn run_tree(cargo: &Cargo, root: &Path, cell: &Cell, offline: bool) -> Result<String, String> {
+    // `tree` takes no lane flag.
+    let mut cmd = cargo.command("tree", root);
+    cmd.arg("--manifest-path")
         .arg(root.join("Cargo.toml"))
         .arg("-p")
         .arg(&cell.package)
@@ -448,12 +488,11 @@ fn run_tree(root: &Path, cell: &Cell, offline: bool) -> Result<String, String> {
         .arg("--prefix")
         .arg("depth")
         .arg("--no-dedupe")
-        .arg("--locked")
-        .current_dir(root);
+        .arg("--locked");
     if offline {
         cmd.arg("--offline");
     }
-    let out = cmd.output().map_err(|e| {
+    let out = cmd.output_owned().map_err(|e| {
         format!(
             "could not execute `targo tree`: {e} — install the Trust toolchain (`aterm pkg \
              install trust`), or set CARGO to the targo to use"
@@ -513,60 +552,6 @@ mod tests {
 
     fn names(cells: &[Cell]) -> Vec<&str> {
         cells.iter().map(|c| c.name.as_str()).collect()
-    }
-
-    #[test]
-    fn the_matrix_is_eight_cells_in_report_order() {
-        let cells = default_cells();
-        assert_eq!(
-            names(&cells),
-            [
-                "mac-arm",
-                "linux",
-                "win",
-                "wasm-cpu",
-                "wasm-gpu",
-                "mac-x64",
-                "linux-arm",
-                "win-arm",
-            ]
-        );
-        // Native cells measure the one binary; the wasm cells measure the two
-        // modules the browser loads.
-        assert_eq!(
-            cells.iter().map(|c| c.package.as_str()).collect::<Vec<_>>(),
-            [
-                "aterm",
-                "aterm",
-                "aterm",
-                "aterm-wasm",
-                "aterm-gpu-web",
-                "aterm",
-                "aterm",
-                "aterm",
-            ],
-            "a cell must be rooted at something aterm ships for that target"
-        );
-        assert_eq!(cells[0].triple, "aarch64-apple-darwin");
-        assert_eq!(cells[3].triple, "wasm32-unknown-unknown");
-        assert_eq!(cells[4].triple, "wasm32-unknown-unknown");
-        // Every triple atpkg publishes is a cell. The authoritative check is
-        // crates/atpkg/tests/shipped_triples_have_a_compile_cell.rs; this is
-        // its local echo.
-        let triples: Vec<&str> = cells.iter().map(|c| c.triple.as_str()).collect();
-        for shipped in [
-            "aarch64-apple-darwin",
-            "x86_64-apple-darwin",
-            "x86_64-unknown-linux-gnu",
-            "aarch64-unknown-linux-gnu",
-            "x86_64-pc-windows-msvc",
-            "aarch64-pc-windows-msvc",
-        ] {
-            assert!(
-                triples.contains(&shipped),
-                "no cell compiles `{shipped}`, and atpkg publishes artifact rows for it"
-            );
-        }
     }
 
     #[test]

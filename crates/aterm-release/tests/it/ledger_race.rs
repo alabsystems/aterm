@@ -1,40 +1,34 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Bare-repo race proofs for the build-number ledger claim (release spec §2),
-//! and for where it lands: the release commit on the published commit, main
-//! taking it as a fast-forward or a merge (owner ruling R2, 2026-09-23). The
-//! claim lands a RESERVATION ([`ledger::reserve`], build once 2026-10-09): the
-//! number and the release commit are fixed before the build, so a lost race
-//! never re-numbers — a tail that reached the reservation refuses, nothing burned.
+//! Bare-repo race proofs for the build-number ledger claim and where it lands: the release
+//! commit on the published commit, main taking it as a fast-forward or a merge. The claim
+//! lands a reservation ([`ledger::reserve`]): number and release commit are fixed before the
+//! build, so a lost race never re-numbers, and a tail that reached the reservation refuses
+//! with nothing burned.
 //!
-//! REAL git against a local bare-repo origin — no mocks of git semantics: the
-//! claim's fast-forward push either is or is not a compare-and-swap, and only
-//! git can say. The injectable [`ledger::GitRunner`] seam is used solely to
-//! land a rival's push at the exact moment between the claimant's fetch and
-//! its own push — the race window itself, made deterministic. Every runner
-//! underneath is [`ledger::testing::Git`]: `GitCli`'s spawn of that same git.
+//! Real git against a local bare origin: whether the claim's fast-forward push is a
+//! compare-and-swap only git can say. The [`ledger::GitRunner`] seam only lands a rival's push
+//! between the claimant's fetch and its own push, making the race window deterministic; the
+//! runner underneath is always [`ledger::testing::Git`].
 
 use crate::{changelog, ledger};
 
+use aterm_uds::spawnfd::command;
 use std::cell::{Cell, RefCell};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use ledger::testing::Git;
 use ledger::{ClaimPlan, GitRunner, LEDGER_FLOOR, RunOut};
 
-/// One frozen "clock" for every test: claims take `now` as an input (spec §2
-/// computes `n = max(last + 1, unix_now)`), so freezing it makes every minted
-/// number an exact-equality assertion instead of a range check.
+/// One frozen clock: claims take `now` as an input (`n = max(last + 1, now)`), so every minted
+/// number is an exact-equality assertion.
 const NOW: u64 = 1_790_000_000;
 
-/// The committed seed (spec §2) re-spelled in the ONE version scheme — the
-/// whole-file equality asserts below hang off these exact bytes. The real
-/// `RELEASES.ledger` keeps its pre-cut-over two-component lines verbatim
-/// (append-only history is never edited); `parse_takes_last_record_and_names_
-/// malformed_lines` covers that mixed-history file directly.
+/// The committed seed in the three-component scheme; the whole-file equality asserts hang off
+/// these bytes. The real `RELEASES.ledger` keeps its two-component history lines verbatim;
+/// `parse_takes_last_record_and_names_malformed_lines` covers that mixed file.
 const SEED_LEDGER: &str = "# aterm release ledger — append-only; one line per claimed build number. Never edit or reuse.\n1783354739 0.25.0\n";
 
 /// Minimal changelog: the claim rolls it on both sides, and its "cut elsewhere"
@@ -44,10 +38,7 @@ const SEED_CHANGELOG: &str = "# Changelog\n\n## [Unreleased]\n\n### Added\n- **S
 /// The roll date every claim here uses.
 const DATE: &str = "2026-09-23";
 
-// --------------------------------------------------------------------------
-// fixture: bare origin + a rival clone (the "other machine") + the claimant's
-// working clone
-// --------------------------------------------------------------------------
+// --- fixture: bare origin, a rival clone (the other machine), the claimant's clone ---
 
 struct Fixture {
     root: aterm_tempfile::TempDir,
@@ -77,9 +68,8 @@ impl Fixture {
             &["clone", "-q", origin.to_str().unwrap(), "rival"],
         );
         config_identity(&rival);
-        // A clone of an EMPTY repo names its unborn branch from local config
-        // (init.defaultBranch), which this machine may set to anything —
-        // force main so the seed push matches the claim's hardcoded refs.
+        // A clone of an empty repo names its unborn branch from local config
+        // (init.defaultBranch): force main so the seed push matches the claim's refs.
         run(&rival, "git", &["symbolic-ref", "HEAD", "refs/heads/main"]);
         fs::write(rival.join("RELEASES.ledger"), SEED_LEDGER).unwrap();
         fs::write(rival.join("CHANGELOG.md"), SEED_CHANGELOG).unwrap();
@@ -102,13 +92,13 @@ impl Fixture {
     }
 }
 
-/// Run a command, assert success, return stdout. Setup/assertion plumbing
-/// only — the code under test never goes through here.
+/// Run a command, assert success, return stdout. Setup only: the code under test never comes
+/// through here.
 fn run(cwd: &Path, prog: &str, args: &[&str]) -> String {
     let mut command = if prog == "git" {
         ledger::testing::git()
     } else {
-        Command::new(prog)
+        command(prog)
     };
     let out = command
         .current_dir(cwd)
@@ -138,8 +128,7 @@ fn config_identity(repo: &Path) {
     );
 }
 
-/// Read a file straight out of the BARE origin — the ground truth every
-/// preservation assert compares against (never a clone's view of it).
+/// A file read from the bare origin, the ground truth every preservation assert compares with.
 fn origin_file(fix: &Fixture, path: &str) -> String {
     run(&fix.origin, "git", &["show", &format!("main:{path}")])
 }
@@ -148,8 +137,7 @@ fn origin_subjects(fix: &Fixture) -> String {
     run(&fix.origin, "git", &["log", "--format=%s", "main"])
 }
 
-/// The rival ("another machine") appends a ledger line and pushes — the write
-/// a real race winner performs.
+/// The rival (another machine) appends a ledger line and pushes, as a real race winner does.
 fn rival_append(fix: &Fixture, line: &str) {
     run(&fix.rival, "git", &["fetch", "-q", "origin", "main"]);
     run(&fix.rival, "git", &["reset", "-q", "--hard", "origin/main"]);
@@ -169,8 +157,8 @@ fn rival_append(fix: &Fixture, line: &str) {
     run(&fix.rival, "git", &["push", "-q", "origin", "main"]);
 }
 
-/// The rival lands a FULL claim of the version (ledger line + rolled
-/// changelog section) — the "cut elsewhere" shape the retry must refuse.
+/// The rival lands a full claim of the version (ledger line and rolled section): the "cut
+/// elsewhere" shape the retry must refuse.
 fn rival_land_section(fix: &Fixture, line: &str, version: &str) {
     run(&fix.rival, "git", &["fetch", "-q", "origin", "main"]);
     run(&fix.rival, "git", &["reset", "-q", "--hard", "origin/main"]);
@@ -193,13 +181,10 @@ fn rival_land_section(fix: &Fixture, line: &str, version: &str) {
     run(&fix.rival, "git", &["push", "-q", "origin", "main"]);
 }
 
-// --------------------------------------------------------------------------
-// the race hook: a GitRunner that fires a callback right before each push
-// --------------------------------------------------------------------------
+// --- the race hook: a GitRunner that fires a callback before each push -----
 
-/// Wraps the real runner ([`Git`]) and invokes `on_push(attempt_no)` before
-/// forwarding each `push` — everything else passes straight through to real
-/// git. This is the deterministic stand-in for "the rival's push lands first".
+/// Wraps [`Git`] and calls `on_push(attempt_no)` before forwarding each `push`: the
+/// deterministic stand-in for "the rival's push lands first".
 struct HookRunner<F: FnMut(u32)> {
     inner: Git,
     pushes: Cell<u32>,
@@ -231,8 +216,8 @@ impl<F: FnMut(u32)> GitRunner for HookRunner<F> {
     }
 }
 
-/// The rival pushes a peer's CODE and a changelog entry after the publish — the
-/// shape that must neither block a cut nor leak into it.
+/// The rival pushes a peer's code and a changelog entry after the publish: the shape that must
+/// neither block a cut nor leak into it.
 fn rival_peer_push(fix: &Fixture) {
     run(&fix.rival, "git", &["fetch", "-q", "origin", "main"]);
     run(&fix.rival, "git", &["reset", "-q", "--hard", "origin/main"]);
@@ -280,9 +265,8 @@ fn do_claim(
     (res, attempts.get())
 }
 
-/// A lost/aborted claim must leave NOTHING behind (spec §2: "abort with tree
-/// reset clean — nothing burned"): the checkout clean and back on the published
-/// commit, and no release commit on origin.
+/// A lost or aborted claim leaves nothing behind: the checkout clean on the published commit,
+/// no release commit on origin.
 fn assert_clean_at(fix: &Fixture, source: &str) {
     assert!(
         run(&fix.work, "git", &["status", "--porcelain"])
@@ -320,9 +304,7 @@ fn moved(repo: &Path, from: &str, to: &str) -> String {
         .replace('\n', " ")
 }
 
-// --------------------------------------------------------------------------
-// parser + number rule (pure)
-// --------------------------------------------------------------------------
+// --- parser + number rule (pure) -------------------------------------------
 
 #[test]
 fn parse_takes_last_record_and_names_malformed_lines() {
@@ -330,11 +312,9 @@ fn parse_takes_last_record_and_names_malformed_lines() {
     let t = ledger::tail(good).unwrap();
     assert_eq!((t.build, t.version.as_str()), (1_783_918_101, "0.26.0"));
 
-    // The REAL post-cut-over file: pre-cut-over history keeps its retired
-    // two-component versions verbatim (append-only, never edited) and a
-    // three-component line is appended on top. The ledger grammar is column
-    // 1 — the build number — so column 2's shape is never parsed, and the
-    // mixed file must read back with its exact three-component tail.
+    // The real file keeps its two-component history lines verbatim beneath three-component
+    // ones. The grammar parses only column 1, the build number, so the mixed file reads back
+    // with its exact tail.
     let mixed = "# comment\n1784869524 0.61\n1790000000 0.2.0\n";
     let t = ledger::tail(mixed).unwrap();
     assert_eq!((t.build, t.version.as_str()), (1_790_000_000, "0.2.0"));
@@ -348,9 +328,8 @@ fn parse_takes_last_record_and_names_malformed_lines() {
         "retired history stays readable; it is just never a cut's source"
     );
 
-    // Every malformed shape aborts and names its 1-based line — blank lines
-    // included: the ledger is append-only, so ANY unparseable edit is treated
-    // as corruption, never skipped over.
+    // Every malformed shape aborts naming its 1-based line, blank lines included: in an
+    // append-only file any unparseable edit is corruption, never skipped.
     let cases: [(&str, usize); 4] = [
         ("# c\n1783354739 0.25.0\n\n1783918101 0.26.0\n", 3), // blank line
         ("1783354739\n", 1),                                  // one field
@@ -377,13 +356,12 @@ fn next_build_is_monotonic_and_floored() {
         ledger::next_build(LEDGER_FLOOR, 0).unwrap(),
         LEDGER_FLOOR + 1
     );
-    // Below the v0.25 seed floor entirely → refuse to mint.
+    // Below the seed floor: refuse to mint.
     assert!(ledger::next_build(5, 10).is_err());
 }
 
-/// One version scheme: canonical `MAJOR.MINOR.PATCH`. The retired
-/// two-component spelling is refused like any other malformed shape — a claim
-/// may never mint a build number for a version no client can select.
+/// One version scheme, canonical `MAJOR.MINOR.PATCH`: a claim never mints a build number for a
+/// version no client can select.
 #[test]
 fn claim_rejects_non_canonical_three_component_versions() {
     // Shape-checked before any git runs, so a dead path is fine as the repo.
@@ -424,9 +402,7 @@ fn claim_rejects_non_canonical_three_component_versions() {
     }
 }
 
-// --------------------------------------------------------------------------
-// claim protocol against real git
-// --------------------------------------------------------------------------
+// --- claim protocol against real git ---------------------------------------
 
 #[test]
 fn happy_path_claims_appends_and_verifies() {
@@ -458,7 +434,7 @@ fn happy_path_claims_appends_and_verifies() {
         origin_file(&fix, "RELEASES.ledger"),
         format!("{SEED_LEDGER}1790000000 0.26.0\n")
     );
-    // The roll landed in the SAME single commit, and only the claim's two files moved.
+    // The roll landed in the same commit, and only the claim's two files moved.
     assert!(origin_file(&fix, "CHANGELOG.md").contains(&format!(
         "## [Unreleased]\n\n## [0.26.0] - {DATE}\n\n### Added\n- **Something real**"
     )));
@@ -468,10 +444,9 @@ fn happy_path_claims_appends_and_verifies() {
     );
 }
 
-/// THE RULING (R2): peers pushed code after the publish. The release commit is
-/// still the published commit plus the claim's two files; main takes it by a
-/// merge whose tree is its own tip plus the same two files; the peer's code and
-/// its unreleased changelog entry stay on main, out of the release.
+/// Peers pushed code after the publish: the release commit is still the published commit plus
+/// the claim's two files, and main takes it by a merge whose tree is its tip plus the same two
+/// files. The peer's code and unreleased changelog entry stay on main, out of the release.
 #[test]
 fn a_published_commit_behind_main_is_released_and_merged() {
     let fix = Fixture::new("behind");
@@ -550,10 +525,9 @@ fn a_published_commit_behind_main_is_released_and_merged() {
     assert!(!released.contains("A peer's entry"), "{released}");
 }
 
-/// A failure while BUILDING main's commit — after the release commit exists,
-/// before anything is pushed — leaves nothing: the checkout is still on the
-/// published commit, clean (the claim builds from objects and moves it only once
-/// the push is verified), and origin never saw a claim.
+/// A failure building main's commit, after the release commit exists and before any push,
+/// leaves the checkout clean on the published commit (the claim builds from objects and moves
+/// it only once the push is verified), and origin never saw a claim.
 #[test]
 fn a_failure_building_mains_commit_leaves_the_checkout_on_the_published_commit() {
     struct FailingLanding(Git);
@@ -618,10 +592,9 @@ fn a_checkout_off_the_published_commit_is_refused_before_anything() {
     assert!(!origin_subjects(&fix).contains("release: v0.26.0"));
 }
 
-/// BUILD ONCE: the reserved number is the one its bytes carry, so a lost race
-/// whose winner took a number at or past it is never re-numbered — the claim
-/// refuses with NOTHING burned (no line, no release commit on origin, the checkout
-/// on the published commit, clean) and names the re-run that reserves anew.
+/// Build once: the reserved number is the one its bytes carry, so a lost race whose winner took
+/// a number at or past it is never re-numbered. The claim refuses with nothing burned and names
+/// the re-run that reserves anew.
 #[test]
 fn a_reservation_the_tail_reached_refuses_and_burns_nothing() {
     let fix = Fixture::new("stale");
@@ -677,10 +650,8 @@ fn a_fresh_reservation_after_a_stale_one_lands_above_the_winner() {
 #[test]
 fn a_lost_race_below_the_reservation_lands_it_with_its_own_number() {
     let fix = Fixture::new("cas-clock");
-    // Winner's number is BELOW the reservation's clock-derived n: the retry
-    // rebuilds only the landing on the winner's tip and lands the SAME number —
-    // still strictly above the new tail, never published anywhere in between.
-    // Documents the max(…, now) subtlety of spec §2 under build once.
+    // The winner's number is below the reservation's clock-derived n: the retry rebuilds only
+    // the landing on the winner's tip and lands the same number, still above the new tail.
     let winner = "1789999000 0.98.0";
     let runner = HookRunner::new(&fix.work, |attempt| {
         if attempt == 1 {
@@ -706,8 +677,8 @@ fn a_lost_race_below_the_reservation_lands_it_with_its_own_number() {
 fn retry_cap_aborts_clean_with_nothing_burned() {
     let fix = Fixture::new("cap");
     let source = head_of(&fix.work);
-    // A rival lands a fresh push before EVERY attempt, each below the reserved
-    // number — the claimant must lose all 5 rounds, then stop cleanly.
+    // A rival lands a push below the reserved number before every attempt: all 5 rounds are
+    // lost, then the claim stops cleanly.
     let runner = HookRunner::new(&fix.work, |attempt| {
         rival_append(&fix, &format!("17899990{attempt:02} 0.9{attempt}.0"));
     });
@@ -771,10 +742,8 @@ fn remote_changelog_section_means_version_cut_elsewhere() {
 #[test]
 fn recut_flag_claims_fresh_n_past_existing_section() {
     let fix = Fixture::new("recut");
-    // The recut path (spec §5): the version's section ALREADY sits on origin
-    // (rolled by the earlier wedged claim, whose number is below this
-    // reservation's); a fresh claim for the same version must ride past it
-    // instead of aborting, and leave main's roll as it is.
+    // Recut: the version's section already sits on origin, rolled by a wedged claim with a lower
+    // number; a fresh claim rides past it instead of aborting and leaves main's roll as it is.
     let runner = HookRunner::new(&fix.work, |attempt| {
         if attempt == 1 {
             rival_land_section(&fix, "1789999300 0.26.0", "0.26.0");
@@ -796,11 +765,9 @@ fn recut_flag_claims_fresh_n_past_existing_section() {
     );
 }
 
-/// A RECUT FROM MAIN'S TIP: an earlier claim of the version rolled its section onto
-/// main and its cut was abandoned, so the published commit — main's tip — already
-/// carries `## [0.26.0]`. The reservation takes that changelog as it stands and moves
-/// only the ledger; the claim accepts exactly that release commit and lands it as a
-/// fast-forward (a claim that required both files to move refused it on every run).
+/// A recut from main's tip: an abandoned claim rolled the section onto main, so the published
+/// commit already carries `## [0.26.0]`. The reservation takes that changelog as it stands and
+/// moves only the ledger, and the claim lands it as a fast-forward.
 #[test]
 fn a_recut_from_a_source_carrying_the_section_moves_only_the_ledger() {
     let fix = Fixture::new("recut-tip");
@@ -927,11 +894,9 @@ fn a_reservation_that_is_not_the_claims_is_refused_before_the_push() {
     assert_clean_at(&fix, &source);
 }
 
-/// A claim that LANDED and then failed its post-push steps (here, putting the cut
-/// tree on the release commit) holds no cut journal, so `--abandon` has nothing to
-/// act on: the refusal names what is true — the number may be spent, nothing was
-/// signed or published, the re-run reserves anew — and a re-run's reservation lands
-/// a fresh number above the spent one.
+/// A claim that landed and then failed a post-push step (putting the cut tree on the release
+/// commit) holds no cut journal, so the refusal names the re-run, not `--abandon`: the number
+/// may be spent, nothing was signed or published, and the re-run lands a fresh number above it.
 #[test]
 fn a_claim_that_landed_unjournaled_names_the_re_run_not_an_abandon() {
     struct FailingCheckout(Git);
@@ -996,8 +961,7 @@ fn malformed_remote_ledger_aborts_before_any_commit() {
     let (res, attempts) = do_claim(&git, &fix.work, "0.26.0", false);
     let err = res.unwrap_err().to_string();
     assert!(err.contains("line 3") && err.contains("not a u64"), "{err}");
-    // Parse failure precedes the roll, the reservation and the push — nothing
-    // happened.
+    // The parse precedes the roll, the reservation and the push.
     assert_eq!(attempts, 0);
     assert_clean_at(&fix, &source);
 }

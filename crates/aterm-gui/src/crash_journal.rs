@@ -521,7 +521,8 @@ impl Reopened {
 
     /// One `(window, tab)` per agent the next launch relaunches on its
     /// conversation, at the first terminal leaf that names it, in layout
-    /// order: only when `relaunching`
+    /// order — none of a tab that was held (`TerminalLeafRestore::holds`,
+    /// LC-8): only when `relaunching`
     /// ([`crate::harness_host::HostHandle::relaunches_restored`]) and the record
     /// resumes ([`crate::restore::AgentRestore::resumes`]). A session shown in
     /// two windows names its agent on both leaves, and it is relaunched once,
@@ -544,9 +545,12 @@ impl Reopened {
                 crate::restore::RestoredSplitTree::Leaf {
                     view: crate::restore::RestoredView::Terminal(leaf),
                 } => {
+                    // A held tab's agent is the holder's: never relaunched
+                    // (`App::carry_restored_identity`, ruling 23).
                     if let Some(agent) = leaf
                         .agent
                         .as_deref()
+                        .filter(|_| leaf.holds.is_empty())
                         .filter(|agent| agent.resumes())
                         .filter(|agent| {
                             seen.as_ref()
@@ -581,6 +585,48 @@ impl Reopened {
             }
         }
         out
+    }
+
+    /// This layout as the row tells it where the host relaunches only the
+    /// agents `relaunched` takes
+    /// ([`crate::harness_host::HostHandle::relaunches_restored_of`]): every
+    /// other agent's leaf names none, so no place says it comes back
+    /// ([`Self::resumed`]) and its program counts among what was lost
+    /// ([`Self::lost_given`]).
+    pub(crate) fn relaunched_by(
+        &self,
+        relaunched: impl Fn(&crate::restore::AgentRestore) -> bool,
+    ) -> Self {
+        fn walk(
+            node: &mut crate::restore::RestoredSplitTree,
+            relaunched: &dyn Fn(&crate::restore::AgentRestore) -> bool,
+        ) {
+            match node {
+                crate::restore::RestoredSplitTree::Leaf {
+                    view: crate::restore::RestoredView::Terminal(leaf),
+                } => {
+                    if leaf
+                        .agent
+                        .as_deref()
+                        .is_some_and(|agent| !relaunched(agent))
+                    {
+                        leaf.agent = None;
+                    }
+                }
+                crate::restore::RestoredSplitTree::Leaf { .. } => {}
+                crate::restore::RestoredSplitTree::Split { first, second, .. } => {
+                    walk(first, relaunched);
+                    walk(second, relaunched);
+                }
+            }
+        }
+        let mut told = self.clone();
+        for window in &mut told.manifest.windows {
+            for tab in &mut window.restored_tabs {
+                walk(&mut tab.root, &relaunched);
+            }
+        }
+        told
     }
 
     /// The layout's terminal panes whose folder no shell can start in
@@ -1034,9 +1080,10 @@ mod unix {
         /// this process forked while the lock was held keeps a copy of its
         /// description until that child's `exec`, and a lock released only by
         /// the close stays taken on that copy for the child's whole fork→exec
-        /// window — which a child that demoted itself first (the managed
-        /// Ollama daemon's spawn did, until its parent took the demotion
-        /// after the exec) stretched past ten seconds on a loaded host. `LOCK_UN` strips the
+        /// window — which a child that demoted itself first (the since-retired
+        /// managed Ollama daemon's spawn did, until its parent took the
+        /// demotion after the exec) stretched past ten seconds on a loaded
+        /// host. `LOCK_UN` strips the
         /// lock from the description itself, the child's copy included.
         fn drop(&mut self) {
             // SAFETY: `flock` on the descriptor this owner holds open until
@@ -1889,14 +1936,15 @@ pub(crate) enum Runs {
 impl Runs {
     /// Whether the agent `record` describes may still be the one running.
     fn may_be(self, record: &crate::restore::AgentRestore) -> bool {
-        let kind = if record.codex.is_some() {
-            aterm_phase::Program::Codex
-        } else {
-            aterm_phase::Program::Claude
-        };
+        // The restore names its agent as its relaunch reads it
+        // (`AgentRestore::agent`): an agent this build has no lane for is
+        // none of the agents a status read names.
+        let kind = record
+            .agent()
+            .map(aterm_agent::harness::upgrade::Agent::program);
         match self {
             Self::Unread => true,
-            Self::Agent(program) => program == kind,
+            Self::Agent(program) => kind == Some(program),
             Self::Other => false,
         }
     }
@@ -2808,10 +2856,12 @@ pub(crate) mod fixtures {
                 role: None,
                 attention: None,
                 questions: None,
+                autopilot: None,
                 identity: None,
                 agent: None,
                 supervised: None,
                 held: false,
+                holds: Vec::new(),
             },
         ))
     }
@@ -3126,6 +3176,7 @@ pub(crate) mod tests {
         } = &mut hosted.windows[0].restored_tabs[1].root
         {
             leaf.agent = Some(Box::new(restore::AgentRestore {
+                word: String::new(),
                 pid: 4242,
                 start: "Sat Sep 27 01:02:03 2026".into(),
                 program: "/opt/claude/bin/claude".into(),
@@ -3229,6 +3280,7 @@ pub(crate) mod tests {
         use crate::message_reporters::{JOURNAL_ONLY_SCROLLBACK, journal_reopened_message};
         use aterm_messages::{Hold, Severity};
         let claude = |session: Option<&str>| restore::AgentRestore {
+            word: String::new(),
             pid: 4242,
             start: "Sat Sep 27 01:02:03 2026".into(),
             program: "/opt/claude/bin/claude".into(),
@@ -3338,6 +3390,75 @@ pub(crate) mod tests {
             0,
         );
         assert_eq!(row.title, "Tabs restored, claude lost");
+        // An agent the host does not relaunch — its own switch off
+        // (`HostHandle::relaunches_restored_of`) — is lost with the relaunch
+        // on; one it does is told as before.
+        let claude_only = |agent: &restore::AgentRestore| match agent.agent() {
+            Some(aterm_agent::harness::upgrade::Agent::Claude) => true,
+            Some(aterm_agent::harness::upgrade::Agent::Codex) | None => false,
+        };
+        assert_eq!(only.relaunched_by(claude_only).resumed(true), vec![(0, 1)]);
+        let switched_off = only.relaunched_by(|_| false);
+        assert!(switched_off.resumed(true).is_empty());
+        let row = journal_reopened_message(
+            &switched_off,
+            None,
+            None,
+            None,
+            true,
+            PanesWithoutFolder::NONE,
+            0,
+        );
+        assert_eq!(row.title, "Tabs restored, claude lost");
+        assert_eq!(only.resumed(true), vec![(0, 1)], "the layout itself kept");
+        // A Codex beside it, Codex switched off and Claude Code on: the
+        // Codex is lost, the Claude Code comes back.
+        let codex = restore::AgentRestore {
+            word: String::new(),
+            pid: 4343,
+            program: "/opt/codex/bin/codex".into(),
+            argv: vec!["/opt/codex/bin/codex".into()],
+            session: Some("019a0b1c-2d3e-7f40-8a5b-6c7d8e9f0a1b".into()),
+            cwd: "/work/c".into(),
+            version: None,
+            codex: Some(restore::CodexRestore {
+                home: "/h/.codex".into(),
+                home_env: None,
+                embedded: false,
+                started_ms: 0,
+            }),
+            ..claude(None)
+        };
+        let mut manifest = layout(&[
+            ("/work/a", "zsh"),
+            ("/work/b", "claude"),
+            ("/work/c", "codex"),
+        ]);
+        manifest.fill_agents(&|id| match id {
+            1 => Some(claude(Some(CONVERSATION))),
+            2 => Some(codex.clone()),
+            _ => None,
+        });
+        let codex_in = |tab: u32| super::LeafProgram {
+            program: "codex".to_string(),
+            ..agent_in(tab)
+        };
+        let (dir, logs) = (scratch("cj-dir"), scratch("cj-logs"));
+        die(run_said(
+            dir.path(),
+            logs.path(),
+            &manifest,
+            Some(vec![agent_in(1), codex_in(2)]),
+        ));
+        let mixed = claim_here(dir.path(), logs.path())
+            .reopened
+            .expect("reopened");
+        assert_eq!(mixed.resumed(true), vec![(0, 1), (0, 2)], "both on");
+        let told = mixed.relaunched_by(claude_only);
+        assert_eq!(told.resumed(true), vec![(0, 1)]);
+        let row =
+            journal_reopened_message(&told, None, None, None, true, PanesWithoutFolder::NONE, 0);
+        assert_eq!(row.title, "Tabs restored, codex lost");
     }
 
     /// Two dead writers' journals merge: each one's leaves keep their own
@@ -3548,8 +3669,8 @@ pub(crate) mod tests {
     /// has yet to exec. Released by the close alone it stayed taken on that
     /// child's copy of the description, and a claim in the window skipped the
     /// dead run's journal as a live one's: the full suite's conformance runner
-    /// waited out a sibling test's background-band fork (the managed Ollama
-    /// daemon's) past ten seconds. The fork is made for real while the lock is
+    /// waited out a sibling test's background-band fork (the since-retired
+    /// managed Ollama daemon's) past ten seconds. The fork is made for real while the lock is
     /// held, and parked short of its exec through the claim.
     #[test]
     fn a_dead_owners_lock_is_free_while_a_child_forked_under_it_has_yet_to_exec() {
@@ -3575,6 +3696,7 @@ pub(crate) mod tests {
     fn a_killed_runs_journal_brings_back_its_agent() {
         let (dir, logs) = (scratch("cj-dir"), scratch("cj-logs"));
         let claude = restore::AgentRestore {
+            word: String::new(),
             pid: 4242,
             start: "Sat Sep 27 01:02:03 2026".into(),
             program: "/opt/claude/bin/claude".into(),
@@ -4648,6 +4770,7 @@ pub(crate) mod tests {
     fn a_successors_own_fact_about_a_tab_ends_what_it_carries_for_good() {
         use super::{HandedSession, Runs};
         let record = |session: &str| restore::AgentRestore {
+            word: String::new(),
             pid: 4242,
             start: "Sat Sep 27 01:02:03 2026".into(),
             program: "/opt/claude/bin/claude".into(),

@@ -64,7 +64,6 @@ fn blank(seq: u64) -> ActivitySample {
     ActivitySample {
         alt_screen: false,
         content_seq: seq,
-        last_input: None,
         last_output: None,
     }
 }
@@ -74,6 +73,8 @@ fn done(id: u64, exit_code: i32) -> Option<CompletedBlock> {
     Some(CompletedBlock {
         id,
         exit_code: Some(exit_code),
+        started_ms: None,
+        ended_ms: None,
     })
 }
 
@@ -176,7 +177,6 @@ fn alt_screen_transition_is_a_resync_not_activity() {
     let mut ev = evidence(ActivitySample {
         alt_screen: false,
         content_seq: 900,
-        last_input: None,
         last_output: None,
     });
     ev.foreground_job = Some(true);
@@ -185,7 +185,6 @@ fn alt_screen_transition_is_a_resync_not_activity() {
     ev.activity = ActivitySample {
         alt_screen: true,
         content_seq: 3,
-        last_input: None,
         last_output: None,
     };
     settle(&mut fsm, &ev, t0 + Duration::from_millis(10));
@@ -1109,6 +1108,170 @@ fn the_status_record_carries_the_input_fields_before_supervisor() {
     }
 }
 
+/// `land_at=` AND `task=` (the Autopilot design, §9.3.5 and §9.4.1), on
+/// `status`, the `sessions` roster and the bare `meta`: `-` with nothing
+/// stored, just before the screen's stamp on `status` and last on the
+/// roster's row. The task's face prints only for an agent session whose
+/// live claim THIS window's host holds — told through the host's own wake
+/// (`App::apply_harness_fact`) — and the instant only for an agent session,
+/// where `meta` prints what is stored. NEGATIVE CONTROLS: a face told with
+/// no claim, or under another holder's, prints `-`; a stored instant on a
+/// session that runs no agent prints `-` on `status` and the roster.
+#[test]
+fn the_status_record_and_the_roster_carry_land_at_and_task() {
+    use aterm_agent::harness::acts::TaskFace;
+    let mut app = crate::App::headless_for_test();
+    let status = |app: &crate::App| app.session_status_record(0).expect("live session");
+    let roster = |app: &crate::App| {
+        crate::control::cmd_sessions_store(&app.store, None)
+            .lines()
+            .nth(1)
+            .expect("one session")
+            .to_string()
+    };
+    let field = |line: &str, key: &str| {
+        line.split_whitespace()
+            .find_map(|t| t.strip_prefix(key))
+            .unwrap_or_else(|| panic!("{key} in {line}"))
+            .to_string()
+    };
+    let record = status(&app);
+    assert!(
+        record.contains(" flaps=0 land_at=- task=- reset_at=- gen="),
+        "{record}"
+    );
+    assert_stamp_rides_last(&record);
+    assert!(
+        roster(&app).ends_with(" upgrade=- land_at=- task=-"),
+        "{}",
+        roster(&app)
+    );
+
+    let ctx = app.pool.get(0).unwrap().ctx.clone();
+    let sid = ctx.self_id.as_str().to_string();
+    ctx.meta.lock().unwrap().land_at = Some(1_792_249_200_999);
+    assert_eq!(field(&status(&app), "land_at="), "-", "no agent runs here");
+    assert_eq!(field(&roster(&app), "land_at="), "-", "no agent runs here");
+    {
+        let mut tl = ctx.timeline.lock().unwrap();
+        tl.note_foreground_group(7);
+        tl.set_program(7, Some("claude".into()));
+    }
+    assert_eq!(
+        field(&status(&app), "land_at="),
+        "1792249200",
+        "unix seconds"
+    );
+    assert_eq!(field(&roster(&app), "land_at="), "1792249200");
+
+    // A face told with no claim of this host's: kept, never printed.
+    app.apply_harness_fact(&sid, crate::HarnessFact::Task(Some(TaskFace::Landed)));
+    assert_eq!(
+        ctx.timeline.lock().unwrap().task_face().map(|(f, _)| f),
+        Some(TaskFace::Landed)
+    );
+    assert_eq!(field(&status(&app), "task="), "-", "no live claim here");
+    assert_eq!(field(&roster(&app), "task="), "-", "no live claim here");
+    crate::session_timeline::claim_supervisor(
+        &ctx,
+        crate::autopilot::own_holder(),
+        None,
+        None,
+        crate::metrics::now_us(),
+    )
+    .unwrap();
+    assert_eq!(field(&status(&app), "task="), "landed");
+    assert_eq!(field(&roster(&app), "task="), "landed");
+    app.apply_harness_fact(&sid, crate::HarnessFact::Task(Some(TaskFace::Spent)));
+    assert_eq!(field(&status(&app), "task="), "spent");
+    app.apply_harness_fact(&sid, crate::HarnessFact::Task(None));
+    assert_eq!(field(&status(&app), "task="), "-", "unknown again");
+    // Another holder's claim: this host hears nothing from its loop.
+    app.apply_harness_fact(&sid, crate::HarnessFact::Task(Some(TaskFace::Done)));
+    assert_eq!(field(&status(&app), "task="), "done");
+    assert!(crate::session_timeline::release_supervisor(
+        &ctx,
+        None,
+        crate::metrics::now_us()
+    ));
+    crate::session_timeline::claim_supervisor(
+        &ctx,
+        "aterm-supervise:9",
+        None,
+        None,
+        crate::metrics::now_us(),
+    )
+    .unwrap();
+    assert_eq!(field(&status(&app), "task="), "-", "another holder's claim");
+    assert_eq!(field(&roster(&app), "task="), "-", "another holder's claim");
+    // A fact for a sid this window does not hold is dropped.
+    app.apply_harness_fact(
+        "no-such-sid",
+        crate::HarnessFact::Task(Some(TaskFace::Open)),
+    );
+    let record = status(&app);
+    assert_stamp_rides_last(&record);
+}
+
+/// `autopilot=` BESIDE `supervisor=` (the Autopilot design, 2026-10-15, §5):
+/// `-` for a session that runs no agent the harness supervises; once one
+/// does, its EFFECTIVE Autopilot — `off` with no host to supervise it, then
+/// the table's default under one, then the session's own word — on BOTH arms
+/// of the record. NEGATIVE CONTROL: the master switch off reads `off`
+/// whatever the word.
+#[test]
+fn the_status_record_carries_the_effective_autopilot_beside_supervisor() {
+    let mut app = crate::App::headless_for_test();
+    let field = |app: &crate::App| {
+        let record = app.session_status_record(0).expect("live session");
+        assert!(
+            record.contains(" supervisor=- supervisor_proven=0 autopilot="),
+            "{record}"
+        );
+        record
+            .split_whitespace()
+            .find_map(|t| t.strip_prefix("autopilot="))
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(field(&app), "-", "no agent");
+    {
+        let ctx = app.pool.get(0).unwrap().ctx.clone();
+        let mut tl = ctx.timeline.lock().unwrap();
+        tl.note_foreground_group(7);
+        tl.set_program(7, Some("claude".into()));
+    }
+    assert_eq!(field(&app), "off", "an agent no host supervises");
+    let host = crate::harness_host::HostHandle::for_supervised_test(
+        Vec::new(),
+        Arc::new(|_| crate::harness_host::BodyEnd::Stopped),
+    );
+    app.harness = Some(host.clone());
+    assert_eq!(field(&app), "cruise", "the table's default");
+    let ctx = app.pool.get(0).unwrap().ctx.clone();
+    ctx.meta
+        .lock()
+        .unwrap()
+        .set("autopilot", Some("land".into()));
+    assert_eq!(field(&app), "land", "the session's own word");
+    let observed = {
+        let mut ev = evidence(blank(1));
+        ev.shell = Some(ShellEvidence::Complete { exit_code: Some(0) });
+        settle_observer(&mut app.session_status, 0, &ev, Instant::now());
+        app.session_status_record(0).expect("live session")
+    };
+    assert!(observed.contains(" observed=true "), "{observed}");
+    assert!(
+        observed.contains(" supervisor=- supervisor_proven=0 autopilot=land human_ms="),
+        "{observed}"
+    );
+    app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
+        crate::app_config::HarnessPolicy::read("[harness]\nenabled = false\n"),
+    );
+    assert_eq!(field(&app), "off", "the master switch wins over the word");
+    host.shutdown_and_join();
+}
+
 /// The two ADDITIVE fabric fields (§11.2). They answer the question a driver
 /// asks right after `ERR halted`: is this session held, and is there a bridge
 /// alive to lift it? Both arrive on BOTH arms of the record — the unobserved
@@ -1146,15 +1309,18 @@ fn the_status_record_carries_hold_and_fabric_body() {
     );
     // The person's stamp (2026-09-25) and its count (2026-09-27): no
     // person has keyed session 0, and the fields ride after
-    // `supervisor=`; the owner's columns
+    // `supervisor=` and `autopilot=` (no agent here: `-`); the owner's columns
     // follow it, then the history this session's handoffs lost (none:
     // it never crossed one, 2026-09-26), the integration its shell runs
     // (none signed: `-`, 2026-09-26), the resize ledger's verdict and
-    // counts (never resized: `ok`, 2026-09-28), then the screen's stamp.
+    // counts (never resized: `ok`, 2026-09-28), the harness's timer and task
+    // face (none: `-`, 2026-10-16), the Codex wall reset the harness placed
+    // (none: `-`, 2026-10-16), then the screen's stamp.
     assert!(
         record.contains(
-            " supervisor=- human_ms=- human_seq=0 path_evidence=- copy=- upgrade=- history_lost=0 \
-             integration_rev=- render=ok resizes=0 flaps=0 gen="
+            " supervisor=- supervisor_proven=0 autopilot=- human_ms=- human_seq=0 path_evidence=- \
+             copy=- upgrade=- history_lost=0 integration_rev=- render=ok resizes=0 flaps=0 land_at=- \
+             task=- reset_at=- gen="
         ),
         "{record}"
     );
@@ -1227,6 +1393,12 @@ fn fabric_batch_matches_single_status_fields_for_each_session() {
     let guard = locked_term.lock().unwrap();
     assert_same(&app);
     drop(guard);
+    // No hold, so no origin: the bridge's row says whose hold stands.
+    assert!(
+        app.fabric_status_fields(0)
+            .unwrap()
+            .contains(" hold=0 hold_origin=- ")
+    );
 
     // One session becomes classified and held; its cached detail supplies
     // the same percent-encoded fallback when its terminal is contended.
@@ -1254,6 +1426,27 @@ fn fabric_batch_matches_single_status_fields_for_each_session() {
             .contains("detail=Claude%20Code")
     );
     drop(guard);
+    assert!(
+        app.fabric_status_fields(0)
+            .unwrap()
+            .contains(" hold=1 hold_origin=fleet ")
+    );
+
+    // The owner's LOCAL hold is named as one: the bridge never lifts it.
+    let ctx = app.pool.get(1).unwrap().ctx.clone();
+    crate::fabric::apply_hold_for_test(
+        &ctx,
+        Some(crate::fabric::Hold {
+            reason: "mine".to_string(),
+            origin: "local".to_string(),
+        }),
+    );
+    assert_same(&app);
+    assert!(
+        app.fabric_status_fields(1)
+            .unwrap()
+            .contains(" hold=1 hold_origin=local ")
+    );
 }
 
 #[test]
@@ -1556,241 +1749,43 @@ fn consent_at_risk_rides_the_reasons_token_only_on_the_conjunction() {
     }
 }
 
-/// LIVE TYPING (review follow-up to frame audit #3). The audit's decay
-/// classified `Entering` as plain `Idle` unconditionally, so the settled
-/// verdict engaged WHILE the user was typing and the typing subject never
-/// showed. Typing must publish the live marker at once: prompt entry with
-/// fresh keystroke echo is the same `Idle` phase on the wire, but NOT
-/// settled — and because the phase does not change, the marker rides a
-/// same-phase reasons update and never waits out a dwell.
+/// A prompt is `Idle` however its grid moves. `EnteringCommand` is the steady
+/// state whenever a prompt is DISPLAYED, so the keystroke echo of a command
+/// line being typed and a background job printing at an idle prompt
+/// (`tail -f &`, a sibling build) look alike here, and neither is work: the
+/// record publishes nothing new and owes the event loop no wake, so typing
+/// costs no chrome refresh.
 #[test]
-fn typing_at_the_prompt_publishes_live_without_a_dwell() {
-    let t0 = Instant::now();
-    let mut fsm = StatusFsm::new(policy(), t0);
-    let mut ev = evidence(blank(1));
-    ev.shell = Some(ShellEvidence::Prompt);
-    settle(&mut fsm, &ev, t0);
-    assert_eq!(fsm.status().phase, Phase::Idle);
-    assert!(fsm.status().settled_idle(), "a bare prompt is settled idle");
-
-    // The first keystroke: block Entering, the echo advances the counter,
-    // and the KEY ITSELF is evidence — movement alone is a background job.
-    ev.shell = Some(ShellEvidence::Entering);
-    ev.activity.content_seq = 2;
-    let t1 = t0 + DWELL + Duration::from_millis(10);
-    ev.activity.last_input = Some(t1);
-    assert!(
-        fsm.observe(&ev, t1),
-        "the live marker publishes immediately"
-    );
-    assert_eq!(
-        fsm.status().phase,
-        Phase::Idle,
-        "typing is still idle on the wire — RFC §6 permits no stronger claim"
-    );
-    assert!(
-        !fsm.status().settled_idle(),
-        "…but NOT settled, so the typing subject may show while keys land"
-    );
-    assert_eq!(
-        fsm.status().reasons,
-        vec![Reason::ShellBlock, Reason::ContentActivity],
-        "the record says WHY: prompt entry plus live echo"
-    );
-}
-
-/// THE REVIEW'S REGRESSION, pinned: `EnteringCommand` is the steady state
-/// whenever a prompt is DISPLAYED, so a background job printing at an idle
-/// prompt (`tail -f &`, a sibling build) moves the grid without anyone
-/// typing. Movement alone re-stuck the "Typing a command" subject on a
-/// window nobody had touched for minutes; the marker needs a keystroke.
-#[test]
-fn background_output_at_a_prompt_is_not_live_typing() {
-    let t0 = Instant::now();
-    let mut fsm = StatusFsm::new(policy(), t0);
-    let mut ev = evidence(blank(1));
-    ev.shell = Some(ShellEvidence::Entering);
-    settle(&mut fsm, &ev, t0);
-    assert!(
-        fsm.status().settled_idle(),
-        "a displayed prompt nobody typed at is settled"
-    );
-
-    // A background job prints: the counter advances, no key was pressed.
-    ev.activity.content_seq = 2;
-    let t1 = t0 + DWELL + Duration::from_millis(10);
-    fsm.observe(&ev, t1);
-    assert_eq!(fsm.status().phase, Phase::Idle);
-    assert!(
-        fsm.status().settled_idle(),
-        "ambient output must not claim live typing"
-    );
-    assert_eq!(
-        fsm.status().reasons,
-        vec![Reason::ShellBlock],
-        "no ContentActivity marker without a keystroke"
-    );
-
-    // A STALE keystroke (older than the activity window) is no better.
-    ev.activity.content_seq = 3;
-    ev.activity.last_input = Some(t1);
-    let t2 = t1 + QUIET + Duration::from_millis(1);
-    fsm.observe(&ev, t2);
-    assert!(
-        fsm.status().settled_idle(),
-        "a keystroke aged past quiet_after cannot resurrect the subject"
-    );
-}
-
-/// An ABANDONED half-typed prompt: the echo ages out over `quiet_after`,
-/// the observer owes the event loop a wake for a transition no new output
-/// will ever cause, and the record settles to plain `Idle` — the decay of
-/// frame audit #3, with the live state intact this time.
-#[test]
-fn an_abandoned_prompt_settles_and_owes_the_wake_that_retires_it() {
+fn movement_at_a_prompt_publishes_nothing_and_owes_no_wake() {
     let t0 = Instant::now();
     let mut observer = StatusObserver::new(policy(), Duration::from_millis(0));
     let mut ev = evidence(blank(1));
     ev.shell = Some(ShellEvidence::Entering);
+    let t1 = t0 + DWELL + Duration::from_millis(10);
     observer.observe(1, &ev, t0);
-    let t1 = t0 + Duration::from_millis(10);
-    ev.activity.content_seq = 2;
-    ev.activity.last_input = Some(t1);
     observer.observe(1, &ev, t1);
-    let t2 = t1 + DWELL;
-    ev.activity.content_seq = 3;
-    // The LAST keystroke; nothing lands after it, so the stamp ages
-    // out exactly like the echo it caused.
-    ev.activity.last_input = Some(t2);
-    observer.observe(1, &ev, t2);
+    let status = observer.status(1).expect("published");
+    assert_eq!(status.phase, Phase::Idle, "a displayed prompt is idle");
+    assert_eq!(observer.next_wake(), None, "a settled prompt parks");
+
+    // The grid moves at the prompt: a keystroke echo or ambient output.
+    ev.activity.content_seq = 2;
+    let t2 = t1 + Duration::from_millis(10);
+    assert!(
+        !observer.observe(1, &ev, t2),
+        "movement at a prompt is not a published change"
+    );
     let status = observer.status(1).expect("published");
     assert_eq!(status.phase, Phase::Idle);
-    assert!(!status.settled_idle(), "typing is live");
-
-    // No more keystrokes will ever land. The event loop must still be
-    // told to come back, or the typing subject never decays.
-    let owed = observer
-        .next_wake()
-        .expect("a live typing pane owes a wake");
     assert_eq!(
-        owed,
-        t2 + QUIET,
-        "the settle window is quiet_after past the last echo"
+        status.reasons,
+        vec![Reason::ShellBlock],
+        "no activity reason rides an idle prompt"
     );
-
-    // At that wake the marker retires with no new bytes at all.
-    assert!(observer.observe(1, &ev, owed), "the decay publishes");
-    assert!(
-        observer.status(1).expect("published").settled_idle(),
-        "an abandoned prompt settles to plain Idle"
-    );
-    // Settled: nothing left owing a wake, so an idle machine parks.
-    assert_eq!(observer.next_wake(), None);
-}
-
-/// A command that is typed, run, and finishes returns to a SETTLED idle at
-/// the Complete mark itself: the typing marker never outlives prompt
-/// entry, so the decay needs no echo window after real work.
-#[test]
-fn a_settled_command_returns_to_settled_idle() {
-    let t0 = Instant::now();
-    let mut fsm = StatusFsm::new(policy(), t0);
-    let mut ev = evidence(blank(1));
-    ev.shell = Some(ShellEvidence::Entering);
-    fsm.observe(&ev, t0);
-    ev.activity.content_seq = 2;
-    let t1 = t0 + DWELL;
-    ev.activity.last_input = Some(t1);
-    fsm.observe(&ev, t1);
-    assert!(!fsm.status().settled_idle(), "typing is live");
-
-    ev.shell = Some(ShellEvidence::Executing);
-    ev.activity.content_seq = 3;
-    let t2 = settle(&mut fsm, &ev, t1 + Duration::from_millis(10));
-    assert_eq!(fsm.status().phase, Phase::Running);
-
-    ev.shell = Some(ShellEvidence::Complete { exit_code: Some(0) });
-    ev.activity.content_seq = 4;
-    settle(&mut fsm, &ev, t2 + Duration::from_millis(10));
-    assert_eq!(fsm.status().phase, Phase::Idle);
-    assert!(
-        fsm.status().settled_idle(),
-        "Complete is not prompt entry: the marker does not survive it"
-    );
-    assert_eq!(fsm.status().last_outcome, Outcome::Success);
-}
-
-/// The verdict seam end to end over the REAL App wiring: while the user is
-/// typing, NEITHER push site — the publish edge
-/// (`refresh_session_status_chrome`) nor the per-observation reconcile
-/// (`note_title_activity`, which runs on the very output wakes typing
-/// produces) — may decay the typing subject; once the echo settles, both
-/// flip it to the prompt description.
-#[test]
-fn the_typing_subject_shows_while_typing_and_decays_once_settled() {
-    let mut app = crate::App::headless_for_test();
-    let term = app.pool.get(0).expect("session 0").term.clone();
-    // OSC 133 A + B: the block is EnteringCommand — prompt entry is open —
-    // and the echo of what the user typed has moved the cursor off the
-    // command-start mark (an untouched prompt reads as `Ready`, not
-    // typing: `title_summary::block_activity`).
-    term.lock()
-        .unwrap()
-        .process(b"\x1b]133;A\x1b\\\x1b]133;B\x1b\\ls");
-
-    // Classifier: Entering with the echo moving the grid between samples.
-    let t0 = Instant::now();
-    let mut ev = evidence(blank(1));
-    ev.shell = Some(ShellEvidence::Entering);
-    app.session_status.observe(0, &ev, t0);
-    ev.activity.content_seq = 2;
-    // The keystroke behind that echo — the marker's evidence.
-    ev.activity.last_input = Some(t0 + DWELL);
-    assert!(
-        app.session_status.observe(0, &ev, t0 + DWELL),
-        "the live typing record publishes"
-    );
-    assert!(
-        !app.session_status
-            .status(0)
-            .expect("published")
-            .settled_idle()
-    );
-
-    // The coordinator observes the Entering block; the reconcile pushes
-    // the LIVE verdict, so the typing subject stays up.
-    app.note_title_activity(0);
     assert_eq!(
-        app.title_summaries.activity(0, &app.config),
-        Some("Typing a command"),
-        "the typing subject must show WHILE the user is typing"
-    );
-
-    // The publish edge pushes the same live verdict.
-    app.refresh_session_status_chrome(0);
-    assert_eq!(
-        app.title_summaries.activity(0, &app.config),
-        Some("Typing a command"),
-        "the publish edge must not decay a LIVE typing subject"
-    );
-
-    // The echo ages out with no further bytes: the abandoned prompt
-    // settles, and the same edge now decays the subject.
-    assert!(
-        app.session_status.observe(0, &ev, t0 + DWELL + QUIET),
-        "the settle publishes"
-    );
-    assert!(
-        app.session_status
-            .status(0)
-            .expect("published")
-            .settled_idle()
-    );
-    app.refresh_session_status_chrome(0);
-    assert_eq!(
-        app.title_summaries.activity(0, &app.config),
-        Some("Ready"),
-        "an abandoned prompt decays to the prompt-state description"
+        observer.next_wake(),
+        None,
+        "nothing ages out of an idle prompt, so nothing is owed"
     );
 }
 

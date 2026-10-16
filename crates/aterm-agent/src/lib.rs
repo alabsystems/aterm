@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! aterm-agent: the agent interface layer. Two responsibilities that live
-//! outside the engine core:
+//! aterm-agent: agent control and supervision outside the engine core.
+//! The basic control primitives are:
 //!
 //! 1. Turn completion ([`Turn`]): "an agent finished its turn" is
 //!    `IdleFor(d) ∧ RowMatches(prompt-ready)` composed over the engine's
@@ -23,6 +23,19 @@
 //! a loop without linking this crate. Cross-session self-amplification is
 //! bounded by the proxy's per-op edge tokens (`ProxyEntry::token_for` returns
 //! `None` for `DeriveLoop`).
+//!
+//! [`supervise`] composes the session loop and its approval, question and
+//! turn-end policies; [`harness`] supplies usage/account views and the
+//! relaunch/upgrade adapters. [`drive_cli`] and [`fleet_cli`] expose these
+//! through the shipped executable, with [`operator`] holding the embedded
+//! fleet's durable queue.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_types,
+        reason = "test code: a stand-in child may inherit descriptors"
+    )
+)]
 
 /// The crate's durability flushes ([`durable::sync_all`], [`durable::sync_data`]).
 mod durable;
@@ -212,6 +225,8 @@ impl<E: std::fmt::Display> std::fmt::Display for TurnError<E> {
     }
 }
 
+/// AI connections: one working login per AI CLI, its doctor, and reviews across AIs.
+pub mod ai;
 /// The `aterm drive` CLI (binary-era `aterm-drive`), callable in-process.
 pub mod drive_cli;
 /// The `aterm fleet` CLI (binary-era `aterm-fleet`), callable in-process.
@@ -446,8 +461,42 @@ impl ControlClient for CtlClient {
 /// Max body lines a single `text` reply may contain: a bound on an untrusted
 /// `OK <n>` count from a possibly compromised relay peer.
 const MAX_TEXT_LINES: usize = 200_000;
-/// Max bytes in a single control-protocol line.
+/// Max bytes before a control-protocol line's LF, including an optional CR.
 const MAX_LINE_BYTES: usize = 1 << 20; // 1 MiB
+/// Max retained bytes in one counted reply. The individual row/count bounds
+/// alone allow a peer to make the client retain hundreds of gigabytes.
+const MAX_REPLY_BYTES: usize = 256 << 20; // 256 MiB
+
+fn is_ok_reply(header: &str) -> bool {
+    header == "OK" || header.starts_with("OK ")
+}
+
+/// A numeric reply count that does not fit `usize` is an invalid count,
+/// never an uncounted status: otherwise its unread body becomes the next
+/// request's reply on this persistent connection.
+fn reply_count(header: &str) -> std::io::Result<Option<usize>> {
+    let Some(token) = header
+        .strip_prefix("OK ")
+        .and_then(|rest| rest.split_whitespace().next())
+    else {
+        return Ok(None);
+    };
+    if token
+        .strip_prefix('+')
+        .unwrap_or(token)
+        .bytes()
+        .all(|b| b.is_ascii_digit())
+    {
+        token.parse().map(Some).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "reply count exceeds the numeric bound",
+            )
+        })
+    } else {
+        Ok(None)
+    }
+}
 
 /// A [`ControlClient`] over one persistent, authenticated control connection,
 /// the remote twin of [`CtlClient`]. It speaks the raw control verbs directly,
@@ -501,7 +550,7 @@ impl<S: Read + Write> RelayClient<S> {
             return Ok(reply.clone());
         }
         let reply = self.request_counted(&format!("help {verb}"))?;
-        if reply.0.starts_with("OK") && self.help.len() < HELP_MEMO_MAX {
+        if is_ok_reply(&reply.0) && self.help.len() < HELP_MEMO_MAX {
             self.help.push((verb.to_string(), reply.clone()));
         }
         Ok(reply)
@@ -532,7 +581,14 @@ impl<S: Read + Write> RelayClient<S> {
     /// Read one `\n`-terminated line, returned without its trailing `\r?\n`.
     fn read_line(&mut self) -> std::io::Result<String> {
         loop {
-            if let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
+            let end = self.buf.iter().position(|&b| b == b'\n');
+            if end.unwrap_or(self.buf.len()) > MAX_LINE_BYTES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "control line exceeds the length bound",
+                ));
+            }
+            if let Some(pos) = end {
                 let mut line: Vec<u8> = self.buf.drain(..=pos).collect();
                 line.pop(); // drop '\n'
                 if line.last() == Some(&b'\r') {
@@ -541,12 +597,6 @@ impl<S: Read + Write> RelayClient<S> {
                 return String::from_utf8(line).map_err(|_| {
                     std::io::Error::new(std::io::ErrorKind::InvalidData, "non-utf8 control line")
                 });
-            }
-            if self.buf.len() > MAX_LINE_BYTES {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "control line exceeds the length bound",
-                ));
             }
             let mut tmp = [0u8; 8192];
             let n = self.io.read(&mut tmp)?;
@@ -575,9 +625,8 @@ impl<S: Read + Write> RelayClient<S> {
 
     /// Issue a request whose reply is a single status line; `ERR …`/unexpected → Err.
     fn request_status(&mut self, line: &str) -> std::io::Result<String> {
-        self.write_line(line)?;
-        let resp = self.read_reply()?;
-        if resp == "OK" || resp.starts_with("OK ") {
+        let resp = self.request_line(line)?;
+        if is_ok_reply(&resp) {
             Ok(resp)
         } else {
             Err(std::io::Error::other(resp))
@@ -588,33 +637,20 @@ impl<S: Read + Write> RelayClient<S> {
     /// Each body line is returned with a trailing `\n`, byte-identical to the
     /// `aterm-ctl` stdout that [`CtlClient`] captures for `text`.
     fn read_text(&mut self) -> std::io::Result<String> {
-        self.write_line("text")?;
-        let header = self.read_reply()?;
-        if !(header == "OK" || header.starts_with("OK ")) {
+        let header = self.request_line("text")?;
+        if !is_ok_reply(&header) {
             return Err(std::io::Error::other(header));
         }
-        let count: usize = header
-            .strip_prefix("OK ")
-            .and_then(|rest| rest.split_whitespace().next())
-            .and_then(|tok| tok.parse().ok())
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("malformed text header: {header:?}"),
-                )
-            })?;
-        if count > MAX_TEXT_LINES {
-            return Err(std::io::Error::new(
+        // Text requires a count; optional-count requests keep uncounted status
+        // headers. Both read the same grammar, with text's own malformed-header
+        // diagnostic for either an absent or an overflowing count.
+        let count = reply_count(&header).ok().flatten().ok_or_else(|| {
+            std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "text reply line count exceeds the bound",
-            ));
-        }
-        let mut out = String::new();
-        for _ in 0..count {
-            out.push_str(&self.read_line()?);
-            out.push('\n');
-        }
-        Ok(out)
+                format!("malformed text header: {header:?}"),
+            )
+        })?;
+        self.read_body_lines(count, MAX_REPLY_BYTES)
     }
 
     /// The underlying transport, so a caller can take a second handle on the
@@ -643,17 +679,19 @@ impl<S: Read + Write> RelayClient<S> {
     /// body and no further read.
     ///
     /// # Errors
-    /// I/O errors, or a count past the client's own line bound.
+    /// I/O errors, or a count/body past the client's own reply bounds.
     pub fn request_counted(&mut self, line: &str) -> std::io::Result<(String, String)> {
-        self.write_line(line)?;
-        let header = self.read_reply()?;
-        let count: Option<usize> = header
-            .strip_prefix("OK ")
-            .and_then(|rest| rest.split_whitespace().next())
-            .and_then(|tok| tok.parse().ok());
+        let header = self.request_line(line)?;
+        let count = reply_count(&header)?;
         let Some(count) = count else {
             return Ok((header, String::new()));
         };
+        Ok((header, self.read_body_lines(count, MAX_REPLY_BYTES)?))
+    }
+
+    /// The shared collector for text and generic counted replies. Charge the
+    /// normalized trailing newline too, so even empty rows consume the bound.
+    fn read_body_lines(&mut self, count: usize, max_bytes: usize) -> std::io::Result<String> {
         if count > MAX_TEXT_LINES {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -662,10 +700,17 @@ impl<S: Read + Write> RelayClient<S> {
         }
         let mut body = String::new();
         for _ in 0..count {
-            body.push_str(&self.read_line()?);
+            let line = self.read_line()?;
+            if line.len() >= max_bytes.saturating_sub(body.len()) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "reply body exceeds the aggregate length bound",
+                ));
+            }
+            body.push_str(&line);
             body.push('\n');
         }
-        Ok((header, body))
+        Ok(body)
     }
 
     /// Send one control line and read a byte-framed reply: the header, then
@@ -677,12 +722,8 @@ impl<S: Read + Write> RelayClient<S> {
     /// I/O errors, a body past the line bound, or a stream that ends inside
     /// the body.
     pub fn request_bytes(&mut self, line: &str) -> std::io::Result<(String, Vec<u8>)> {
-        self.write_line(line)?;
-        let header = self.read_reply()?;
-        let count: Option<usize> = header
-            .strip_prefix("OK ")
-            .and_then(|rest| rest.split_whitespace().next())
-            .and_then(|tok| tok.parse().ok());
+        let header = self.request_line(line)?;
+        let count = reply_count(&header)?;
         let Some(count) = count else {
             return Ok((header, Vec::new()));
         };
@@ -707,6 +748,28 @@ impl<S: Read + Write> RelayClient<S> {
         Ok((header, body))
     }
 
+    /// Send one length-framed request — `<head> <len>\n` and then `payload` —
+    /// and read its one reply line, returned verbatim. This is the frame
+    /// `feed-bin` and `paste-bin` read: the payload reaches the PTY byte for
+    /// byte, where an inline `send <text>` has leading `id=`/`if=` tokens
+    /// parsed out of it and a trailing literal `\n` turned into CR.
+    ///
+    /// # Errors
+    /// I/O errors, and a `head` carrying a line terminator.
+    pub fn request_frame(&mut self, head: &str, payload: &[u8]) -> std::io::Result<String> {
+        if head.contains(['\n', '\r']) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "control request must not contain an embedded line terminator",
+            ));
+        }
+        let mut frame = format!("{head} {}\n", payload.len()).into_bytes();
+        frame.extend_from_slice(payload);
+        self.io.write_all(&frame)?;
+        self.io.flush()?;
+        self.read_reply()
+    }
+
     /// Read one line a server pushed on a connection that is already parked
     /// on a stream (`subscribe`). Nothing is written.
     ///
@@ -714,6 +777,21 @@ impl<S: Read + Write> RelayClient<S> {
     /// I/O errors, and `UnexpectedEof` when the stream ends.
     pub fn next_pushed(&mut self) -> std::io::Result<String> {
         self.read_line()
+    }
+
+    /// `dial <connection>` on this authenticated local connection, proved live
+    /// end to end by a `version` the REMOTE answers.
+    fn relayed_to(mut self, connection: &str) -> std::io::Result<Self> {
+        self.write_line(&format!("dial {connection}"))?;
+        self.write_line("version")?;
+        let resp = self.read_line()?;
+        if is_ok_reply(&resp) {
+            Ok(self)
+        } else {
+            Err(std::io::Error::other(format!(
+                "dial {connection} failed: {resp}"
+            )))
+        }
     }
 }
 
@@ -771,21 +849,6 @@ impl RelayClient<aterm_uds::CtlStream> {
     /// cannot be read, prefixed `token: ` and naming the file.
     pub fn dial_via_local_beside(sock_path: &str, connection: &str) -> std::io::Result<Self> {
         Self::connect_local_beside(sock_path)?.relayed_to(connection)
-    }
-
-    /// `dial <connection>` on this authenticated local connection, proved live
-    /// end to end by a `version` the REMOTE answers.
-    fn relayed_to(mut self, connection: &str) -> std::io::Result<Self> {
-        self.write_line(&format!("dial {connection}"))?;
-        self.write_line("version")?;
-        let resp = self.read_line()?;
-        if resp.starts_with("OK") {
-            Ok(self)
-        } else {
-            Err(std::io::Error::other(format!(
-                "dial {connection} failed: {resp}"
-            )))
-        }
     }
 }
 
@@ -896,8 +959,8 @@ COMMANDS
                        omitted.
     help               Show this text.
 
-SUPERVISING A WORKER (an agent session — Claude Code or Codex — in another tab; `@sid` from `aterm ctl ls`)
-    Every agent session in an aterm window is ALREADY supervised by the
+SUPERVISING A WORKER (an agent session — Claude Code, Codex or agy — in another tab; `@sid` from `aterm ctl ls`)
+    Every such session in an aterm window is ALREADY supervised by the
     window's own host, by default: this engine, one loop per session, under
     aterm.toml's [harness] table (`aterm help harness` lists its keys and
     names the few that add power; `enabled = false`, or the Harness row in
@@ -970,15 +1033,30 @@ SUPERVISING A WORKER (an agent session — Claude Code or Codex — in another t
                        command or `s///w` flag in sed, a `-f` program file, all
                        refuse. A tie breaks toward not-read-only.
     phase [@sid]       One read, one word: busy | prompt | limited | idle |
-                       question. For a prompt the parsed box follows: `kind`,
+                       question. The worker is read by its own program's
+                       grammar (`status program=`, else what its screen shows:
+                       Claude Code's or Codex's), as the window's loops read
+                       it. For a prompt the parsed box follows: `kind`,
                        `command`, `description`, one `note <text>` per note
                        row (a Bash box's warning rows, e.g. the critical-path
                        `rm` warning), `classify` (a Bash box), one `option N …`
-                       per option, then `cancel esc` — and for a question
-                       dialog `box <token>`, its token for `answer --box`. For
+                       per option, then what Esc does — `cancel esc` (it
+                       leaves the box) — and for a question `box <token>`,
+                       its token for `answer --box`. For
                        busy, `reason <where>: <rule>` names the signal that
                        fired. For limited, `message <text>` and `reset
-                       <text|->`. A prompt wins over busy, busy over limited,
+                       <text|->`. On Codex a question's `description` is its
+                       question and its options are its numbered answers,
+                       and its Esc line is `interrupt esc`: Esc there ends
+                       the whole turn (`■ Conversation interrupted`) and
+                       declines nothing. On Codex busy is
+                       `reason status row: esc to interrupt`, `reason status
+                       line: a background terminal running` or `reason
+                       transcript: the last message has no end row under it`
+                       (the answer streaming); `context <n>%` below is its
+                       footer's `<n>% context left`, and it draws no survey.
+                       What follows describes Claude Code's grammar.
+                       A prompt wins over busy, busy over limited,
                        limited over question — except a busy that is only a
                        background monitor: a question, a limit notice or any
                        other wall the turn ended on (an API error, a lost login,
@@ -1061,8 +1139,10 @@ SUPERVISING A WORKER (an agent session — Claude Code or Codex — in another t
                        in which the rules you gave it may not survive (see
                        --context-warn).
     answer @sid [--box TOKEN] <answer...>
-                       Type YOUR choice into the worker's Claude Code question
-                       dialog — the screen on display, one tab at a time: an
+                       Type YOUR choice into the worker's question, read by its
+                       own program's grammar (`status program=`, else what its
+                       screen shows). Claude Code's question dialog — the
+                       screen on display, one tab at a time: an
                        option's number or exact label; for a multi-select the
                        options to check, `, `-joined (each whose check differs
                        is toggled, then its button); `submit` on the review
@@ -1079,21 +1159,33 @@ SUPERVISING A WORKER (an agent session — Claude Code or Codex — in another t
                        the focus moved a row a key, each move seen landing,
                        then Enter guarded on the chosen row under the screen
                        fence; never a digit, Esc or a key on the free-text,
-                       chat or cancel row. --box TOKEN (`phase`'s `box`) refuses
-                       another dialog, nothing typed. Take a worker's questions
+                       chat or cancel row. Codex's question (`Question 1/1`,
+                       read by its answers' roles): an answer's number or exact
+                       label, `recommended` (the window's own: its
+                       `(Recommended)` answer, else the first) or `human`; the
+                       key is the answer's digit, which Codex takes at once,
+                       guarded on the question's title row under the
+                       screen fence (a host without the fence: NOT-SERVED,
+                       nothing typed) — never Enter or Esc, and never its last
+                       row, `None of the above`, which asks for a person's own
+                       words. --box TOKEN (`phase`'s `box`) refuses another
+                       question, nothing typed. Take a worker's questions
                        with `aterm ctl @sid meta set questions ask` (its window
                        then raises each instead of answering it). Prints one
                        line: `ANSWERED @sid enters=<k> answer=<what> next=<the
-                       question now on display|review|none>` (exit 0), `LEFT`
+                       question now on display|review|none>` (exit 0; <k> the
+                       answering keys: the Enters, Codex's one digit), `LEFT`
                        (a person keyed the session, or `human`; exit 0),
                        `NO-BOX` (exit 1), `REFUSED <why>` (exit 2, nothing
                        typed) or `NOT-SERVED <why> (enters=<k>)` (exit 3).
     await-turn [@sid] [--timeout MS] [--reconnect-s S]
                        Block until the phase is no longer busy, then print it
                        exactly like `phase` (its `survey 0` and `context <n>%`
-                       lines included). The loop is `await idle 2000` → read →
-                       `await seq` (never a sleep); where the host knows `await
-                       gone`, the busy footer LEAVING is the first wait. A screen
+                       lines included), by the grammar of the program `status`
+                       names before the wait. The loop is `await idle 2000` →
+                       read → `await seq` (never a sleep); where the host knows
+                       `await gone`, the busy row LEAVING (Claude Code's footer,
+                       Codex's status row) is the first wait. A screen
                        without the composer rules (a build, a script, a REPL) whose
                        output never held still for the 2 s is busy too: its turn
                        ends when the output pauses. Exit 124 on --timeout (default:
@@ -1205,18 +1297,24 @@ SUPERVISING A WORKER (an agent session — Claude Code or Codex — in another t
                        the session's cwd is read from its `meta`, and unknown
                        it is yours (with the retired rm_breaker = false, no
                        rm is proven at all); a Read box whose one
-                       absolute path is outside the secrets list (.ssh, .aws,
-                       Keychains, *.pem, .env, *.token, …); and the folder-
-                       trust dialog when its folder is exactly the session's cwd
-                       and lies under a trust root (~/aterm*, ~/ay*, $HOME/trust*,
-                       /private/tmp/claude-*). Those rules decide first under
-                       \"all\" too, so a proven read keeps its rule in the
-                       ledger. \"none\" answers nothing. A person's keystroke
-                       within `human_grace_s` (the server's `status
-                       human_ms=`) HOLDS a box the policy would answer: neither
-                       pressed nor escalated, judged again when the grace ends.
-                       The press is GUARDED by the row that was
-                       judged — `key if=<that row, anchored> 1`, plus
+                       absolute path lies under a trust root, /usr, /etc or
+                       /opt/homebrew and outside the secrets list (.ssh,
+                       .aws, Keychains, *.pem, .env, *.token, …); and the
+                       folder-trust dialog when its folder is exactly the
+                       session's cwd and lies under a trust root. The trust
+                       roots are the folders you list in [harness]
+                       trust_roots, and none by default: list your own to
+                       have their trust dialog answered under \"safe\". Of a
+                       Codex session's boxes those rules judge only its
+                       folder-trust gate: every other is yours. Those
+                       rules decide first under \"all\" too, so a proven
+                       read keeps its rule in the ledger. \"none\" answers
+                       nothing. A person's keystroke within `human_grace_s`
+                       (the server's `status human_ms=`) HOLDS a box the
+                       policy would answer: neither pressed nor escalated,
+                       judged again when the grace ends. The press is
+                       GUARDED by the row that was judged — `key if=<that
+                       row, anchored> 1`, plus
                        `if-gen=<the read's generation>` (`text --json`'s gen)
                        where `help key` names that fence — so a box swapped
                        between the read and the press matches nothing, even
@@ -1551,14 +1649,20 @@ SUPERVISING A WORKER (an agent session — Claude Code or Codex — in another t
                          Inbox: task @<off>
                        typed as a `turn` (idle=600 timeout=2500, not waited
                        on: its verdict may say status=timeout — submitted=1 is
-                       what counts), its Enter guarded on the composer's caret
+                       what counts, or an Enter written and not seen to land,
+                       pressed=, once the composer no longer holds the nudge;
+                       one it still holds, or a composer that cannot be read,
+                       is the error), its Enter guarded on
+                       the composer's caret
                        row holding the nudge (submit=guarded:), so it never
                        lands in a box; a guard that missed is the error (the
                        nudge may be left typed) — a busy worker gets the mail
                        alone, and
                        reads it at its next look at the inbox. Nothing wakes
                        a worker for mail: it is typed to, as a human would
-                       type to it. Prints
+                       type to it. A Codex worker in its own sandbox gets the
+                       nudge and not the body: the sandbox refuses the control
+                       socket (the primer's Codex addendum). Prints
                        `task @<off> nudged=0|1` once the post
                        LANDED (the broker's offset, which the worker's `inbox`
                        row shows as `off=` and its answer carries as `re=`).
@@ -1630,16 +1734,54 @@ SUPERVISING A WORKER (an agent session — Claude Code or Codex — in another t
                        footer), found by position; every other row is kept
                        verbatim (done rows, tables, todo items, code), blank rows
                        at either end aside. archived=/screen= count where the
-                       rows came from. complete=1 only when the host kept an
-                       archive, the start was found, the archive is the one the
-                       mark named, the worker is on the alternate screen, no row
-                       after the start was evicted and no gap lies after it, and
-                       --max-rows (default 8000) held every row; otherwise
+                       rows came from. A CODEX worker runs on the alternate
+                       screen by default (0.163.0): its report is the
+                       archive's too, read in Codex's grammar — its user rows
+                       open with `›` (never its empty composer, `› Ask Codex
+                       to do anything`, which the archive can keep, nor the
+                       copy of your prompt it pins on the top row over a reply
+                       taller than the screen), matched the same way, and its
+                       live zone (a box, the `• Working
+                       (… esc to interrupt)` status row, the composer and
+                       footer) is cut. A Codex drawing INLINE (`status
+                       program=codex`, `--no-alt-screen`) is on the MAIN
+                       screen, with no archive: its user rows open with `›`,
+                       matched the same way. A start
+                       still on the screen is the screen's report; one
+                       scrolled off is found among the scrollback's `›` rows
+                       (`search ^› regex`), newest first, each read with `line
+                       <row>`, and the rows are read with `line` from it down
+                       to the screen's last, its live zone cut (its box, the
+                       running turn's `• Working (… esc to interrupt)` status
+                       row and the background terminals' line, its composer
+                       and footer): --max-rows bounds those reads — spent
+                       before the screen, the report keeps the rows read and
+                       closes with the screen's (its last row found by a few
+                       `line` probes), the middle missing — archived= counts
+                       the rows above the screen, and last=- (no archive
+                       mark). complete=1 only when the start was found, no row
+                       after it was evicted, --max-rows (default 8000) held
+                       every row and — but for a Codex drawing inline — the
+                       host kept an archive, the archive is the one the mark
+                       named, the worker is on the alternate screen and no gap
+                       lies after the start (an inline Codex's: its `search`
+                       said nothing it left out could hold the start); otherwise
                        reason= lists why: no-archive (a host without `offscreen`
                        or with its archive off, or an `aterm ctl` too old to
                        relay the rows: the screen alone), main-screen (the worker
                        is not on the alternate screen — not a fullscreen app, or
-                       it left one: its main screen's scrollback is not read),
+                       it left one — and no Codex: its main screen's scrollback
+                       is not read; a Codex on a host without `search` or
+                       `line`: the screen alone),
+                       search-incomplete (an inline Codex's `search` said it
+                       was ` incomplete`: older history not searched where the
+                       start was not found, or rows left out anywhere — the
+                       match cap, a rewrap, a long line — where a newer `›`
+                       row may hide (a start it found is still read from); or
+                       its reply lacks screen_first coordinates, or it may
+                       have left out rows anywhere with no ledger turn to
+                       find: then, as when no start is found, only the screen
+                       is reported),
                        archive-reset (the host restarted since the mark, or an
                        aterm self-update could not carry the archive — one that
                        could keeps it, turn ledger and all), archive-gap (rows
@@ -1666,7 +1808,15 @@ SUPERVISING A WORKER (an agent session — Claude Code or Codex — in another t
                        and every `❯` row of yours, the done rows with them, and
                        no tool row or `⎿` output at all. A table, a bullet, a
                        todo item or indented code inside a message is kept, as
-                       it is without a view. Both add
+                       it is without a view. A Codex worker's report is read
+                       in Codex's grammar: its `•` messages (never a `•` tool
+                       or notice — `• Ran …`, `• Explored`, `• Edited …`, a
+                       head with `└` output under it — nor an approval's `✔`
+                       / `✗` echo, nor its session card and greeting), its `›`
+                       rows, and as done rows its end rows (`  1:39 PM`,
+                       `  Worked for 1s • 7:14 AM`) and its `■` blocks whole
+                       (an interrupt, an error, a wall; never a tip drawn
+                       right under one); no `└` output. Both add
                        ` view=<final|messages> kept=<n>` to the header after
                        `last=`; `rows=` still counts every row the report
                        holds, and without either flag the output is byte for
@@ -1880,15 +2030,23 @@ SUPERVISING A WORKER (an agent session — Claude Code or Codex — in another t
                        `context <n>%` line (and no box up) is the compaction.
                        watch keeps one watch for as long as it runs. Only the
                        indicator is read: nothing Claude Code says about
-                       compacting. A compaction replaces the worker's history
-                       with a summary, and standing rules you gave it (run
-                       nothing heavy while a flag file exists, say) can silently
-                       drop out. On `EVENT context`, have the worker bring its
-                       handoff and notes up to date before it compacts; on
-                       `EVENT compacted`, re-send your standing rules in one
-                       turn. /compact or /clear typed into the worker rewrites
-                       or drops its whole context, what its human told it
-                       included.
+                       compacting. A Codex is read the same where its footer
+                       draws `<n>% context left` (an empty `tui.status_line`).
+                       Where it draws none (0.163.0's default footer), the
+                       figure is the one Codex's own records hold: the last
+                       response's tokens against the model's window, computed
+                       as Codex computes its own, looked at once a minute and
+                       not while a box is up. Its compaction is then that
+                       figure's rise, never a read without one, and `phase`
+                       prints no `context <n>%` line for it. A compaction
+                       replaces the worker's history with a summary, and
+                       standing rules you gave it (run nothing heavy while a
+                       flag file exists, say) can silently drop out. On `EVENT
+                       context`, have the worker bring its handoff and notes
+                       up to date before it compacts; on `EVENT compacted`,
+                       re-send your standing rules in one turn. /compact or
+                       /clear typed into the worker rewrites or drops its whole
+                       context, what its human told it included.
     --journal FILE     (supervise, watch) Append one JSON object per line the
                        loop prints — and, for supervise, per line watch WOULD
                        have printed for what it decides silently: its
@@ -2221,6 +2379,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn relay_help_memoizes_only_protocol_success() {
+        let mut client = RelayClient::new(RecordingTransport::new(b"OKAY\nOK 1\nfresh\n"));
+        assert_eq!(client.help_counted("turn").unwrap().0, "OKAY");
+        let fresh = client.help_counted("turn").unwrap();
+        assert_eq!(fresh, ("OK 1".to_string(), "fresh\n".to_string()));
+        assert_eq!(client.help_counted("turn").unwrap(), fresh);
+        assert_eq!(client.io.sent, b"help turn\nhelp turn\n");
+    }
+
+    #[test]
+    fn relay_version_handshake_requires_protocol_success() {
+        for header in ["OK", "OK version=1"] {
+            let client =
+                RelayClient::new(RecordingTransport::new(format!("{header}\n").as_bytes()))
+                    .relayed_to("work")
+                    .expect("successful remote version probe");
+            assert_eq!(client.io.sent, b"dial work\nversion\n");
+        }
+        for header in ["OKAY", "OK\tversion=1", "ERR dial unavailable"] {
+            let error = RelayClient::new(RecordingTransport::new(format!("{header}\n").as_bytes()))
+                .relayed_to("work")
+                .err()
+                .expect("failed remote version probe");
+            assert_eq!(error.to_string(), format!("dial work failed: {header}"));
+        }
+    }
+
     /// Canned server responses for one full driven turn, in order: send -> `OK`,
     /// key enter -> `OK`, await idle -> `OK idle 7`, await match -> `OK match 1`,
     /// text -> `OK 2` + two body lines (`⏺ ANSWER: 391`, `❯ `).
@@ -2297,6 +2483,124 @@ mod tests {
             .write_line("AUTH token\nsend injected")
             .expect_err("a request must occupy exactly one line");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(client.io.sent.is_empty());
+    }
+
+    #[test]
+    fn relay_client_bounds_a_line_even_when_the_last_read_contains_its_newline() {
+        for (len, accepted) in [(MAX_LINE_BYTES, true), (MAX_LINE_BYTES + 1, false)] {
+            let mut reply = vec![b'x'; len];
+            reply.extend_from_slice(b"\nOK next\n");
+            let mut client = RelayClient::new(RecordingTransport::new(&reply));
+            let result = client.request_line("status");
+            if accepted {
+                assert_eq!(result.expect("the exact content bound").len(), len);
+                assert_eq!(client.request_line("status").unwrap(), "OK next");
+            } else {
+                assert_eq!(
+                    result
+                        .expect_err("the final newline cannot bypass the cap")
+                        .kind(),
+                    std::io::ErrorKind::InvalidData
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn relay_client_counted_body_has_one_aggregate_allowance() {
+        let mut exact = RelayClient::new(RecordingTransport::new(b"a\r\nb\nOK next\n"));
+        assert_eq!(
+            exact
+                .read_body_lines(2, 4)
+                .expect("the normalized body fits"),
+            "a\nb\n"
+        );
+        assert_eq!(exact.read_line().expect("the next reply"), "OK next");
+
+        let mut over = RelayClient::new(RecordingTransport::new(b"a\r\nb\nOK next\n"));
+        let error = over
+            .read_body_lines(2, 3)
+            .expect_err("short rows must share the body allowance");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("aggregate"));
+        assert_eq!(over.read_line().expect("no extra row consumed"), "OK next");
+
+        let mut empty = RelayClient::new(RecordingTransport::new(b"\n\n"));
+        assert_eq!(empty.read_body_lines(2, 2).unwrap(), "\n\n");
+        assert!(empty.read_body_lines(0, 0).unwrap().is_empty());
+        assert_eq!(
+            empty
+                .read_body_lines(MAX_TEXT_LINES + 1, usize::MAX)
+                .expect_err("the count is bounded before a read")
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn relay_client_refuses_overflowing_counts_instead_of_reading_them_as_status() {
+        let mut client = RelayClient::new(RecordingTransport::new(
+            b"OK 99999999999999999999999999999999999\nbody\n",
+        ));
+        assert_eq!(
+            client
+                .request_counted("text")
+                .expect_err("a numeric count overflow")
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        let mut client = RelayClient::new(RecordingTransport::new(
+            b"OK 99999999999999999999999999999999999\nbody\n",
+        ));
+        assert_eq!(
+            client
+                .request_bytes("cast")
+                .expect_err("a numeric count overflow")
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert_eq!(reply_count("OK schema=1").unwrap(), None);
+        assert_eq!(reply_count("OK 2 incomplete").unwrap(), Some(2));
+        assert!(reply_count("OK +99999999999999999999999999999999999").is_err());
+        assert_eq!(reply_count("OK +2 incomplete").unwrap(), Some(2));
+        assert!(reply_count("OK +").is_err());
+        assert_eq!(
+            reply_count("OK 99999999999999999999999999999999999x").unwrap(),
+            None,
+            "an overflowing-looking status token is still not a numeric count"
+        );
+
+        let header = "OK 99999999999999999999999999999999999";
+        let mut client =
+            RelayClient::new(RecordingTransport::new(format!("{header}\n").as_bytes()));
+        let error = client
+            .read_text()
+            .expect_err("text requires a usable count");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            format!("malformed text header: {header:?}")
+        );
+    }
+
+    /// A framed request carries its payload byte for byte after a header that
+    /// counts it, and reads one reply; a header with a line terminator is
+    /// refused before anything is written.
+    #[test]
+    fn relay_client_frames_a_payload_byte_for_byte() {
+        let mut client = RelayClient::new(RecordingTransport::new(b"OK 9 bytes\n"));
+        let reply = client
+            .request_frame("feed-bin", b"id=x go\\n")
+            .expect("a framed request");
+        assert_eq!(reply, "OK 9 bytes");
+        assert_eq!(client.io.sent, b"feed-bin 9\nid=x go\\n");
+
+        let mut client = RelayClient::new(RecordingTransport::new(b""));
+        let err = client
+            .request_frame("feed-bin\nsend evil", b"x")
+            .expect_err("a header occupies one line");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         assert!(client.io.sent.is_empty());
     }
 

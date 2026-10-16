@@ -8,6 +8,10 @@
 // must emit that allow itself (the lint's span is inside the expansion, where a
 // caller's `#[allow]` cannot reach). The ten-colon selector below makes the
 // lint fire if the macro stops emitting it.
+#![allow(
+    clippy::disallowed_types,
+    reason = "test code: a stand-in child may inherit descriptors"
+)]
 
 use std::ffi::{CStr, c_char, c_void};
 use std::sync::Arc;
@@ -15,24 +19,17 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use aterm_objc::{Bool, ClassPtr, ClassType, Id, Sel, class, declare_class, msg, sel};
 
-/// The [`MainThread`](aterm_objc::MainThread) witness every instantiation owes,
-/// for a test that is not on the main thread and does not need to be.
-///
-/// libtest runs every test on a worker (`pthread_main_np()` is 0 there even
-/// under `--test-threads=1`), so `MainThread::new()` correctly answers `None`
-/// here and the checked constructor is unusable. Every class in this file is an
-/// `NSObject`/`NSView` subclass that touches no AppKit state, is instantiated
-/// and released on the SAME worker, and whose `Ivars` are therefore dropped on
-/// the thread that made them — which is the second form of `new_unchecked`'s
-/// obligation, written once instead of at every call site.
+/// The [`MainThread`](aterm_objc::MainThread) witness, minted unchecked:
+/// libtest runs every test on a worker, so `MainThread::new()` answers `None`.
+/// Every class here touches no AppKit state and is created and released on the
+/// same worker, which is `new_unchecked`'s second obligation.
 fn mtm() -> aterm_objc::MainThread {
     // SAFETY: see this function's doc comment — the class has no main-thread
     // affinity and its ivars are born and dropped on this one worker.
     unsafe { aterm_objc::MainThread::new_unchecked() }
 }
 
-/// An ivar that needs 16-byte alignment — `class_addIvar` is told the
-/// alignment as a log2, and nothing else in the crate exercises a value > 3.
+/// An ivar that needs 16-byte alignment (`class_addIvar` takes it as log2 4).
 #[repr(align(16))]
 struct AlignedIvars {
     marker: u64,
@@ -71,10 +68,8 @@ declare_class! {
 }
 
 declare_class! {
-    /// TEN colons — the widest selector `msg` can send, because `MsgFn` is
-    /// implemented up to twelve PARAMETERS and two of those are `self` and
-    /// `_cmd`. Eleven arguments still declares and still registers; it just
-    /// cannot be sent from Rust. See the report.
+    /// Ten colons: wide enough that `clippy::too_many_arguments` fires inside
+    /// the expansion (see the note at the top of the file).
     struct Wide: NSObject {
         const NAME: &str = "ATermObjcWideW2";
         type Ivars = ();
@@ -244,19 +239,14 @@ const SIGABRT: i32 = 6;
 
 #[test]
 fn an_instance_objective_c_minted_is_caught_by_the_ivar_flag() {
-    // The initialised flag is checked in RELEASE builds too,
-    // because the class is registered under a public name and ObjC code can
-    // `+alloc`/`-init` it without ever reaching `alloc_init`. That instance's
-    // ivar slot is all zeros; reading it as an `Arc` would be undefined
-    // behaviour. The assert turns it into a named abort instead.
+    // The initialised flag is checked in release builds too: ObjC code can
+    // `+alloc`/`-init` the class by name without reaching `alloc_init`, leaving
+    // an all-zero ivar slot. The assert turns that into a named abort.
     use std::os::unix::process::ExitStatusExt as _;
     if std::env::var_os(OBJC_MINTED_CHILD).is_some() {
-        // SAFETY: `+alloc` and `-init` on a registered class, then a message
-        // the class declares. This is EXACTLY what a nib or an
-        // `NSClassFromString` would do, and it is what the flag guards.
-        // Register the class the normal way, then reach it BY NAME through the
-        // runtime and build an instance without `alloc_init` — which is what a
-        // nib or an `NSClassFromString` does.
+        // SAFETY: `+alloc` and `-init` on a registered class reached by name,
+        // then a message the class declares: what a nib or
+        // `NSClassFromString` does, and what the flag guards.
         let _ = Aligned::class();
         unsafe {
             let cls = class(c"ATermObjcAlignedW2");
@@ -302,15 +292,14 @@ fn an_instance_objective_c_minted_is_caught_by_the_ivar_flag() {
 
 #[test]
 fn a_bool_argument_is_never_materialised_as_a_rust_bool() {
-    // D3's value half, on the arch that can execute it. `Bool` is a byte and
-    // `as_bool` is `!= 0` on x86_64, so no byte is an invalid bit pattern.
-    // Here the only thing arm64 can show is that the round trip is exact.
+    // `Bool` is a byte and `as_bool` is `!= 0` on x86_64, so no byte is an
+    // invalid bit pattern; on arm64 the round trip is exact.
     assert_eq!(size_of::<Bool>(), 1);
     assert_eq!(align_of::<Bool>(), 1);
     assert!(Bool::YES.as_bool());
     assert!(!Bool::NO.as_bool());
-    // And that the crate exposes no `Encode for bool` — checked at compile
-    // time by `tests/` failing to build if it did; asserted here in prose.
+    // No `Encode for bool` exists: the `compile_fail` doctests on `msg` and
+    // `RcBlock::new2` check that.
     assert_eq!(
         <Bool as aterm_objc::Encode>::ENCODING,
         if cfg!(target_arch = "aarch64") {

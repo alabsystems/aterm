@@ -86,7 +86,9 @@
 //!
 //! A PTY child needs `setrlimit` (the session sandbox) and a controlling
 //! terminal (`TIOCSCTTY`, via `login_tty`), neither of which `posix_spawn` can
-//! express, so it forks and strips; so does a `std` command that must run a
+//! express: even with `POSIX_SPAWN_SETSID`, a slave opened by a file action
+//! does not become the child's terminal (measured; aterm-pty's fork gives the
+//! numbers). So it forks and strips; so does a `std` command that must run a
 //! `pre_exec` hook anyway (the seamless successor's lanes,
 //! [`InheritNothing`]). The strip LISTS the
 //! child's own table (`PROC_PIDLISTFDS` on Darwin, `close_range` or
@@ -110,8 +112,8 @@
 //! end into 17-27 of 200 children, and [`command`] into 0 of 400. (That test's
 //! control is a raw leaky spawn, `test_support`: Trust's std hands a `Command`
 //! child nothing above stdio since SP-1.) It is the one way product code
-//! starts a child, and it strips on any std (`tools/grep_guard.sh` B27, whose
-//! allow-list names the reviewed exceptions).
+//! starts a child, and it strips on any std (the workspace clippy.toml bans
+//! `std::process::Command`; each reviewed exception carries its `#[expect]`).
 //!
 //! [`command`] returns this module's [`Command`] — `std`'s shape and `std`'s
 //! rules ([`no_fork`]'s docs list the few places it differs) — which on Darwin
@@ -337,8 +339,8 @@ impl LaneCommand {
 /// pid is ours alone (an unreaped child keeps it, zombie or not), so
 /// [`LaneChild::kill`] signals only our own child, and after the reap it
 /// signals nothing. Dropping an unreaped handle collects a child that has
-/// already exited (no zombie is left behind for it) and leaves a running one
-/// running, as `std` does.
+/// already exited and hands a running one to [`crate::reaper`], so no zombie
+/// is left behind either way (`std` leaves a running one unreaped).
 #[derive(Debug)]
 pub struct LaneChild {
     pid: i32,
@@ -415,9 +417,13 @@ impl LaneChild {
     }
 }
 
+/// A handle let go unreaped never leaves a zombie: an exited child is
+/// collected here, a running one by [`crate::reaper`] once it exits.
 impl Drop for LaneChild {
     fn drop(&mut self) {
-        let _ = self.try_wait();
+        if matches!(self.try_wait(), Ok(None)) {
+            crate::reaper::hand_off_pid(self.pid);
+        }
     }
 }
 
@@ -1431,10 +1437,14 @@ pub trait InheritNothing {
     /// survives holds every descriptor close-on-exec, so nothing it later
     /// spawns or execs inherits one unless it clears that flag again. Use it
     /// with `exec` only where the error path hands nothing on (the shipped
-    /// `exec` sites are B27's allow-listed raw ones, none through here).
+    /// `exec` sites are the reviewed raw ones, none through here).
     fn inherit_nothing(&mut self) -> &mut Self;
 }
 
+#[expect(
+    clippy::disallowed_types,
+    reason = "the strip a reviewed raw std Command (a PTY child's pre_exec) installs"
+)]
 impl InheritNothing for std::process::Command {
     fn inherit_nothing(&mut self) -> &mut Self {
         use std::os::unix::process::CommandExt as _;
@@ -1455,11 +1465,12 @@ impl InheritNothing for std::process::Command {
 
 #[path = "spawnfd_command.rs"]
 mod no_fork;
-pub use no_fork::{Child, Command, Stdio};
+pub use no_fork::{Child, Command, Rusage, Stdio};
 
 /// A [`Command`] for `program`: its child holds its stdio and nothing else, and
 /// on Darwin it is started without a fork — THE way product code starts a
-/// child (`tools/grep_guard.sh` B27). `std::process::Command`'s shape:
+/// child (the workspace clippy.toml bans `std::process::Command`).
+/// `std::process::Command`'s shape:
 /// arguments, environment, working directory, stdio, process group,
 /// `spawn`/`output`/`status`/`exec`; [`no_fork`]'s docs list the few places it
 /// differs, `pre_exec` the one it lacks.

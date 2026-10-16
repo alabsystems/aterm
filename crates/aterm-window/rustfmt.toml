@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+#
+# Added by the aterm project in 2026 (see the repository NOTICE).
+#
+# THIS CRATE KEEPS UPSTREAM WINIT'S FORMATTING STYLE. It is winit 0.30.13,
+# absorbed: aterm owns and carves it (docs/AUDIT-third-party-2026-10-15.md,
+# winit-core), and while it is carved its diff against upstream must stay
+# readable, so it is formatted the way upstream formats it rather than at the
+# workspace defaults, which would rewrite nearly every file. These four options
+# are the ones that reproduce the published 0.30.13 sources (`trustfmt --check`
+# over them reports 3 hunks, all upstream's own drift); upstream's comment and
+# import options are left out because the published sources do not follow them.
+#
+# THIS CRATE IS NOT AT THE WORKSPACE EDITION either, and `rustfmt` learns a
+# file's edition from the nearest `rustfmt.toml`, never from `Cargo.toml`
+# (crates/aterm-link/rustfmt.toml says why that matters; `verify fmt` holds the
+# two to agreement).
+edition = "2021"
+use_small_heuristics = "Max"
+use_field_init_shorthand = true
+match_block_trailing_comma = true
+overflow_delimited_expr = true

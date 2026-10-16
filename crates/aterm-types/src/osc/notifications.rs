@@ -7,10 +7,8 @@
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-/// Taskbar progress state for ConEmu OSC 9;4.
-///
-/// This allows applications to display progress in the taskbar/dock.
-/// Format: `ESC ] 9 ; 4 ; <state> ; <progress> ST`
+/// Taskbar progress state for ConEmu OSC 9;4 (`ESC ] 9 ; 4 ; <state> ; <progress> ST`),
+/// shown in the taskbar or dock.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -27,12 +25,8 @@ pub enum TaskbarProgress {
     Paused(u8),
 }
 
-/// Notification urgency level (OSC 99 'u' parameter).
-///
-/// Maps to kitty protocol urgency values:
-/// - 0: Low priority
-/// - 1: Normal priority (default)
-/// - 2: Critical (requires immediate attention)
+/// Notification urgency level (OSC 99 `u` parameter): 0 low, 1 normal (the default), 2
+/// critical.
 #[non_exhaustive]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -57,11 +51,8 @@ impl NotificationUrgency {
     }
 }
 
-/// Desktop notification (OSC 99 - kitty protocol).
-///
-/// Represents a complete notification ready to be displayed to the user.
-/// This struct aggregates all parameters from potentially multiple OSC 99
-/// sequences that share the same notification ID.
+/// Desktop notification (OSC 99, kitty protocol), aggregated from the OSC 99 sequences that
+/// share a notification ID.
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Notification {

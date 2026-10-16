@@ -1,22 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-//! Glyph-key/metrics, overlay-effect, rain, and kitty-persistence models — spec-model
-//! data constructors moved verbatim out of the one-file catalog in `derive.rs`
-//! (pure code motion; every constructor keeps its `crate::derive` path via the
-//! `pub use` re-exports there).
+//! Glyph-key and metric, overlay-effect, rain and kitty-persistence models, re-exported from
+//! `crate::derive`.
 
 use super::*;
 
-/// The cell-observation snapshot protocol for PRISM WAKE. Token and glyph
-/// identity are each quotiented to two distinguishable values: OtherRow flips
-/// only the token; Echo consumes a glyph change without licensing it. Rebase
-/// forgets both. The Tier-1 bind drives real Terminal VT and the shipping
-/// OutputStreak, including an echo followed by unrelated output; retaining the
-/// pre-echo snapshot or trusting the global token would fail that observation.
-/// GeometryBaseline covers a reflow token; GeometryWithoutToken covers a host
-/// resize arriving before another terminal token. Both establish history
-/// silently. Geometry/span bounds are checked against emitted real quads.
+/// The cell-observation snapshot protocol for prism wake. Token and glyph identity are each
+/// quotiented to two values: `OtherRow` flips only the token; `Echo` consumes a glyph change
+/// without licensing it; `Rebase` forgets both. `GeometryBaseline` covers a reflow token and
+/// `GeometryWithoutToken` a host resize arriving before another terminal token; both establish
+/// history silently. Tier-1 (`aterm-effects/tests/output_streak_attribution.rs`) drives the real
+/// Terminal VT and `OutputStreak`, including an echo followed by unrelated output, which a kept
+/// pre-echo snapshot or a trusted global token would fail, and checks geometry and span bounds
+/// against emitted quads.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn output_streak_attribution_model() -> Model {
@@ -78,7 +75,7 @@ pub fn output_streak_attribution_model() -> Model {
                 fresh = 0; echo = 0; moved = 0; licensed = 0;
                 geometry_changed = 0;
             }
-            invariant Bounded:
+            bound Bounded:
                 based <= 1 && token <= 1 && snapshot <= 1 &&
                 fresh <= 1 && echo <= 1 && moved <= 1 && licensed <= 1 &&
                 geometry_changed <= 1;
@@ -92,40 +89,29 @@ pub fn output_streak_attribution_model() -> Model {
     }
 }
 
-/// GLYPH-KEY INJECTIVITY (W12) — px is part of every [`aterm_render::GlyphKey`] by
-/// construction, so a cache/atlas lookup for a glyph at one pixel size can NEVER
-/// collide with the SAME glyph rasterized at a different size. This underwrites the
-/// mixed-DPI refactor: one shared glyph cache safely hosts every window's size at
-/// once precisely because the key's identity separates the sizes.
+/// Glyph-key injectivity: px is part of every [`aterm_render::GlyphKey`], so a lookup for a
+/// glyph at one pixel size never collides with the same glyph at another, which is what lets
+/// one shared glyph cache host every window's size at once.
 ///
-/// The abstraction: two lookups for a glyph that agrees on every OTHER field
-/// (source / class / code point / style) but differs in pixel size (`PxA != PxB`).
-/// The cache ADDRESS of a key is its identity; the px is one component of it
-/// (`Base + px` — ty has no multiplication, so the folded 26.6 quantization of the
-/// real key is modelled additively as "px contributes to the address"). The gate
-/// PROVES `NoCollision` at `Buggy=0` (the two addresses stay distinct — different
-/// size ⇒ different slot) over the bounded space, and CATCHES the defect at
-/// `Buggy=1` (a key that DROPS px — the pre-enabler world where one cache could not
-/// host two sizes — so the two lookups alias the same slot) → counterexample. The
-/// Tier-1 binding to the real derived `Eq`/`Hash` is aterm-render's
-/// `tests/glyph_key_injectivity.rs` (the SAME injectivity, enumerated over real
-/// keys at two sizes).
+/// Two lookups agree on every other field and differ in px (`PxA != PxB`). A key's address is
+/// `Base + px` (the real key's 26.6 quantization modelled additively, as ty has no
+/// multiplication). `NoCollision`: the two addresses stay distinct; `Buggy=1` drops px from the
+/// key. Tier-1 against the real derived `Eq`/`Hash`: aterm-render's
+/// `tests/glyph_key_injectivity.rs`.
 #[must_use]
-// Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
-// models above) — the MODEL it returns is what `ty` machine-checks.
+// Skip (T2 vcgen-budget lane): a model data constructor; `ty` checks the model it returns.
 #[cfg_attr(trust_verify, trust::skip)]
+#[crate::model]
 pub fn key_injectivity_model() -> Model {
-    // A key's cache address folds a shared base (source/class/ch/style) with its px
-    // component. The correct key keeps px; the Buggy key drops it (the two sizes
-    // then alias). `Buggy=1` substitutes 0 for the px component of BOTH keys.
+    // A key's address folds a shared base (source/class/ch/style) with its px; `Buggy`
+    // drops the px, so the two sizes alias.
     let addr_for =
         |px: &'static str| add(cst("Base"), if_(eq(cst("Buggy"), int(1)), int(0), cst(px)));
     Model {
         name: "KeyInjectivity",
         consts: vec![("Base", 10), ("PxA", 1), ("PxB", 2), ("Buggy", 0)],
         vars: vec![
-            // Init the two addresses DISTINCT so `Init` itself satisfies the
-            // invariant; `Compute` then re-derives them from the key policy.
+            // Distinct at Init so `Init` satisfies the invariant; `Compute` re-derives them.
             StateVar {
                 name: "addr_a",
                 init: 0,
@@ -141,7 +127,6 @@ pub fn key_injectivity_model() -> Model {
         ],
         fn_vars: vec![],
         actions: vec![Action {
-            // Resolve the cache address of each key from its (shared base, own px).
             name: "Compute",
             guard: Some(eq(var("done"), int(0))),
             updates: vec![
@@ -160,46 +145,37 @@ pub fn key_injectivity_model() -> Model {
             ],
         }],
         invariants: vec![Invariant {
-            // Two keys differing only in px map to DIFFERENT cache slots.
+            // Two keys differing only in px map to different cache slots.
             name: "NoCollision",
+            kind: InvariantKind::Claim,
             expr: neq(var("addr_a"), var("addr_b")),
         }],
     }
 }
 
-/// PER-WINDOW METRIC CONSISTENCY (W12) — every draw of window `w` must use metrics
-/// derived from `w`'s OWN scale factor, never a shared "most-recently-scaled wins"
-/// global. This is the safety property behind retiring the single shared-backend
-/// font size/pad: scaling one window (moving it to a different-DPI display) must
-/// not change how ANOTHER window renders.
+/// Per-window metric consistency: every draw of window `w` uses metrics from `w`'s own scale
+/// factor, never a shared "most recently scaled wins" global, so moving one window to a
+/// different-DPI display does not change how another renders.
 ///
-/// The abstraction: two windows, each with its own `scale` token (`{1,2}`), plus a
-/// shared backend metric `g` (the process-global the pre-fix code rescales on every
-/// window's `ScaleFactorChanged` / attach). A `DrawWin*` renders a window; the
-/// correct code sources that window's OWN `scale`, the `Buggy=1` code sources the
-/// shared `g` (the SHARED-BACKEND LIMITATION). ty PROVES `PerWindowConsistent` at
-/// `Buggy=0` (a drawn window's rendered metric always equals its own scale, for ALL
-/// interleavings of scale-changes and draws), and CATCHES the defect at `Buggy=1`:
-/// scale window 2 to hi-DPI (`g := 2`), then redraw window 1 → it renders at `g=2`
-/// though its own scale is 1 → counterexample. The actual `round(FONT_PX·scale)` /
-/// `round(PAD·scale)` arithmetic is NOT here (ty has no multiplication) — those
-/// per-window laws are the L0 lattice tests (`font_px_for_scale` / `pad_for_scale`,
-/// and the W1 per-window padding lattice).
+/// Two windows, each with a `scale` token (`{1,2}`), and a shared backend metric `g` that every
+/// window's `ScaleFactorChanged` rescales. `DrawWin*` renders a window from its own `scale`, or
+/// from `g` at `Buggy=1` (scale window 2 to hi-DPI, redraw window 1: it renders at 2). The
+/// `round(FONT_PX·scale)` / `round(PAD·scale)` arithmetic is not here (no multiplication); it
+/// is the lattice tests' (`font_px_for_scale` / `pad_for_scale`).
 #[must_use]
-// Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
-// models above) — the MODEL it returns is what `ty` machine-checks.
+// Skip (T2 vcgen-budget lane): a model data constructor; `ty` checks the model it returns.
 #[cfg_attr(trust_verify, trust::skip)]
+#[crate::model]
 pub fn per_window_metrics_model() -> Model {
-    // A window's rendered metric: its own scale (correct) or the shared global
-    // (Buggy — the most-recently-scaled backend wins).
+    // `Buggy` renders from the shared global: the most recently scaled window wins.
     let render_from = |scale: &'static str| if_(eq(cst("Buggy"), int(1)), var("g"), var(scale));
     Model {
         name: "PerWindowMetrics",
         consts: vec![("Buggy", 0)],
         vars: vec![
-            // The shared backend metric (the global the pre-fix path rescales).
+            // The shared backend metric.
             StateVar { name: "g", init: 1 },
-            // Each window's own display scale token (1 = lo-DPI, 2 = hi-DPI).
+            // Each window's own display scale (1 = lo-DPI, 2 = hi-DPI).
             StateVar {
                 name: "scale1",
                 init: 1,
@@ -208,7 +184,7 @@ pub fn per_window_metrics_model() -> Model {
                 name: "scale2",
                 init: 1,
             },
-            // The metric each window was last DRAWN with (0 = not yet drawn).
+            // The metric each window was last drawn with.
             StateVar {
                 name: "rendered1",
                 init: 0,
@@ -228,10 +204,8 @@ pub fn per_window_metrics_model() -> Model {
         ],
         fn_vars: vec![],
         actions: vec![
-            // Window 1 moves to a hi-DPI display: the shared backend rescales to it.
-            // A scale change INVALIDATES the window's on-screen frame (winit re-grids
-            // and repaints), so `drawn1 := 0` — the invariant tracks only the CURRENT
-            // frame, and the window is not "drawn at the new scale" until redrawn.
+            // Window 1 moves to a hi-DPI display: the shared backend rescales to it. The
+            // scale change invalidates the window's frame, so it is undrawn until redrawn.
             Action {
                 name: "ScaleWin1Hi",
                 guard: Some(eq(var("scale1"), int(1))),
@@ -250,8 +224,7 @@ pub fn per_window_metrics_model() -> Model {
                     },
                 ],
             },
-            // Window 2 moves to a hi-DPI display: same shared rescale (the clobber),
-            // invalidating window 2's own frame.
+            // Window 2 moves to a hi-DPI display: the same shared rescale.
             Action {
                 name: "ScaleWin2Hi",
                 guard: Some(eq(var("scale2"), int(1))),
@@ -270,7 +243,6 @@ pub fn per_window_metrics_model() -> Model {
                     },
                 ],
             },
-            // Render window 1 — from its own scale (correct) or the shared g (Buggy).
             Action {
                 name: "DrawWin1",
                 guard: None,
@@ -285,7 +257,6 @@ pub fn per_window_metrics_model() -> Model {
                     },
                 ],
             },
-            // Render window 2 — from its own scale (correct) or the shared g (Buggy).
             Action {
                 name: "DrawWin2",
                 guard: None,
@@ -302,8 +273,9 @@ pub fn per_window_metrics_model() -> Model {
             },
         ],
         invariants: vec![Invariant {
-            // Every DRAWN window rendered at its OWN scale — no cross-window clobber.
+            // Every drawn window rendered at its own scale.
             name: "PerWindowConsistent",
+            kind: InvariantKind::Claim,
             expr: and_(
                 or_(
                     eq(var("drawn1"), int(0)),
@@ -318,20 +290,15 @@ pub fn per_window_metrics_model() -> Model {
     }
 }
 
-/// Rainbow kitty blink-flare admission. A charged cursor may translate a terminal blink
-/// edge into one bounded twinkle; a settled cursor must leave the ordinary
-/// blink alone. `Buggy=1` reproduces the regression where every idle blink
-/// creates a fresh effect episode, pinning recurring animation wakes forever.
-/// The flare carries a two-tick countdown and a fuel invariant: whenever it is
-/// armed, the remaining bounded state-space budget is sufficient to execute
-/// `Age` and `Finish`. The buggy idle restart also corrupts that countdown,
-/// making the termination obligation independently non-vacuous.
+/// Rainbow kitty blink-flare admission. A charged cursor may turn a terminal blink edge into one
+/// bounded twinkle; a settled cursor leaves the ordinary blink alone. `Buggy=1` starts a fresh
+/// episode at every idle blink, pinning animation wakes for ever. The flare carries a two-tick
+/// countdown with a fuel invariant (while armed, the remaining budget covers `Age` and
+/// `Finish`), which the buggy restart also breaks.
 ///
-/// Tier-1 binding: `cursor_rainbow::idle_blink_transition_conforms_to_model`
-/// drives the shipping admission decision through a reachable charged flare,
-/// cooling, and an idle blink while that flare is still active. It projects
-/// the real animator's `twinkle_seq`: an idle restart is therefore observable
-/// even when the coarse `twinkle` boolean remains `1` on both sides.
+/// Tier-1: `cursor_rainbow::idle_blink_transition_conforms_to_model` drives the shipping
+/// admission through a charged flare, cooling, and an idle blink while the flare is active,
+/// projecting the animator's `twinkle_seq` so a restart shows even when `twinkle` stays `1`.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn rainbow_idle_twinkle_model() -> Model {
@@ -399,30 +366,26 @@ pub fn rainbow_idle_twinkle_model() -> Model {
                     remaining == 0
                 };
             invariant IdleBlinkSilent: idle_restarts == 0;
-            invariant TwinkleBounded: twinkle <= 1;
+            bound TwinkleBounded: twinkle <= 1;
             invariant RemainingBounded: remaining <= FlareTicks;
-            invariant FlareSeqBounded: flare_seq <= steps;
-            invariant StepsBounded: steps <= MaxSteps;
+            uncaught FlareSeqBounded: flare_seq <= steps;
+            bound StepsBounded: steps <= MaxSteps;
         }
     }
 }
 
 /// Sparse-frame sampling for the rainbow kitty finger-lift exit lifecycle.
 ///
-/// Logical time may pass the complete `grace + reach + retract` deadline
-/// without any callback. On the first later observation, healthy code samples
-/// the settled state and emits/arms nothing. `Buggy = 1` reproduces the former
-/// callback-relative implementation: it births reach cells and starts the
-/// retract clock at the observation itself, resurrecting visible motion.
+/// Logical time may pass the whole `grace + reach + retract` deadline without a callback; the
+/// first later observation samples the settled state and emits and arms nothing. `Buggy = 1` is
+/// callback-relative: it births reach cells and starts the retract clock at the observation,
+/// resurrecting visible motion.
 ///
-/// Tier-1 binding: aterm-effects'
-/// `rainbow_kitty::tests::a_late_tick_samples_the_settled_exit_swoosh` drives
-/// the real rainbow kitty engine from a live ribbon (a single key, a slow word,
-/// a flow run) through a silence of 5 s, 30 s and 10 min to ONE late tick,
-/// projects what that frame put on glass and what the engine then asks the
-/// host for, and refuses the same engine with this `Buggy = 1` injected into
-/// its ribbon (`Ribbon::restart_unobserved_swooshes`: every swoosh that ran out
-/// unobserved restarts at the late observation).
+/// Tier-1: aterm-effects' `rainbow_kitty::tests::a_late_tick_samples_the_settled_exit_swoosh`
+/// drives the real engine from a live ribbon (a single key, a slow word, a flow run) through
+/// 5 s, 30 s and 10 min of silence to one late tick, projects what that frame painted and what
+/// the engine then asks the host for, and refuses the engine with `Buggy = 1` injected
+/// (`Ribbon::restart_unobserved_swooshes`).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn rainbow_exit_sampling_model() -> Model {
@@ -445,15 +408,14 @@ pub fn rainbow_exit_sampling_model() -> Model {
                 if logical_done == 1 && sampled == 1 { visible == 0 } else { visible <= 1 };
             invariant SettledSampleDisarms:
                 if logical_done == 1 && sampled == 1 { active == 0 } else { active <= 1 };
-            invariant SampleBounded: sampled <= 1;
+            bound SampleBounded: sampled <= 1;
         }
     }
 }
 
-/// Content-present/effect-timer ownership. A useful present consumes any
-/// already-armed animation deadline and becomes the next cadence anchor, so an
-/// immediately following stale timer cannot create a frame doublet. `Buggy=1`
-/// leaves the deadline armed—the shipped regression.
+/// Content-present/effect-timer ownership. A useful present consumes any armed animation
+/// deadline and becomes the next cadence anchor, so a stale timer right after it cannot create a
+/// frame doublet. `Buggy=1` leaves the deadline armed.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn effect_present_rebase_model() -> Model {
@@ -482,17 +444,15 @@ pub fn effect_present_rebase_model() -> Model {
             invariant NoImmediateTimerDoublet: after_content + pending <= 1;
             invariant ContentAnchored:
                 if after_content == 1 { anchor == steps } else { after_content == 0 };
-            invariant AnchorBounded: anchor <= MaxSteps;
-            invariant StepsBounded: steps <= MaxSteps;
+            bound AnchorBounded: anchor <= MaxSteps;
+            bound StepsBounded: steps <= MaxSteps;
         }
     }
 }
 
-/// Focus/typed-wake demotion must preserve the already-armed effect deadline
-/// until one settle present can erase the last animated raster. An unrelated
-/// event-loop turn may observe the wake as expired before that deadline fires;
-/// dropping the slot there strands lit pixels on an unfocused window.
-/// `Buggy=1` reproduces that edge-triggered park.
+/// Focus/typed-wake demotion keeps the armed effect deadline until one settle present erases the
+/// last animated raster. An unrelated event-loop turn may see the wake expired before that
+/// deadline fires; dropping the slot there (`Buggy=1`) strands lit pixels on an unfocused window.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn effect_presentability_settle_model() -> Model {
@@ -531,25 +491,23 @@ pub fn effect_presentability_settle_model() -> Model {
                 if presentable == 0 && pixels_lit == 1 {
                     pending == 1 && settle_owed == 1
                 } else { pending <= 1 };
-            invariant SettledPixelsAreClear:
+            uncaught SettledPixelsAreClear:
                 if settles == 1 {
                     pixels_lit == 0 && effect_active == 0 && settle_owed == 0
                 } else { settles == 0 };
-            invariant StateBounded:
+            bound StateBounded:
                 presentable <= 1 && effect_active <= 1 && pixels_lit <= 1
                     && pending <= 1 && settle_owed <= 1 && settles <= 1;
-            invariant StepsBounded: steps <= MaxSteps;
+            bound StepsBounded: steps <= MaxSteps;
         }
     }
 }
 
-/// Phase-locked brisk effect cadence with a two-tick interval. Timer fire owns
-/// the cadence anchor; sub-interval wake/render cost must not slide the next
-/// deadline. Late delivery and arbitrarily overloaded rendering are reachable:
-/// once the next phase slot has already passed, re-arm starts one fresh full
-/// interval with no catch-up burst. `Buggy=1` reproduces both failure modes:
-/// completion-relative scheduling while the next phase slot is still live,
-/// and an already-due catch-up deadline after an overloaded frame.
+/// Phase-locked brisk effect cadence with a two-tick interval. Timer fire owns the cadence
+/// anchor, so sub-interval wake and render cost do not slide the next deadline. Late delivery
+/// and overloaded rendering are reachable: once the next phase slot has passed, re-arm starts
+/// one fresh full interval with no catch-up burst. `Buggy=1` schedules from completion while
+/// the next slot is live and arms an already-due catch-up deadline after an overloaded frame.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn effect_phase_lock_model() -> Model {
@@ -604,7 +562,7 @@ pub fn effect_phase_lock_model() -> Model {
                 phase_locked = if now <= anchor + Interval - 1 { 1 } else { 0 };
                 fresh = 1;
             }
-            invariant DeadlineFromBase: deadline == schedule_base + Interval;
+            uncaught DeadlineFromBase: deadline == schedule_base + Interval;
             invariant BriskPhaseLocked:
                 if pending == 1 && phase_locked == 1 {
                     schedule_base == anchor
@@ -613,29 +571,25 @@ pub fn effect_phase_lock_model() -> Model {
                 };
             invariant FreshDeadlineFuture:
                 if fresh == 1 { now <= deadline - 1 } else { fresh == 0 };
-            invariant FreshIsPending: fresh <= pending;
-            invariant StateOwned: pending + rendering == 1;
-            invariant NowBounded: now <= MaxTime;
-            invariant BaseBounded: schedule_base <= MaxTime;
-            invariant DeadlineBounded: deadline <= MaxTime + Interval;
+            uncaught FreshIsPending: fresh <= pending;
+            uncaught StateOwned: pending + rendering == 1;
+            bound NowBounded: now <= MaxTime;
+            bound BaseBounded: schedule_base <= MaxTime;
+            bound DeadlineBounded: deadline <= MaxTime + Interval;
         }
     }
 }
 
-/// PRISM WAKE's cross-component episode delivery: one opening cue survives the
-/// synth's shared keystroke gap, the host parks only after arming the analytic
-/// settle crossing, and that one wake closes the episode. Output cues never
-/// claim the human voice gap, so the next authored key remains admissible.
+/// Prism wake's cross-component episode delivery: one opening cue survives the synth's shared
+/// keystroke gap, the host parks only after arming the analytic settle crossing, and that one
+/// wake closes the episode. Output cues never claim the human voice gap, so the next authored
+/// key stays admissible. The three `Buggy*` actions thin the sole Shimmer right after Enter,
+/// park an open episode without its settle wake, and let an output cue take the next human
+/// slot.
 ///
-/// The three `Buggy*` actions replay the exact regression classes this model
-/// exists to catch: thinning the sole Shimmer immediately after Enter, parking
-/// an open episode without its settle wake, and letting a machine-output cue
-/// consume the next human admission slot.
-///
-/// Tier-1 drives `OutputStreak`'s public analytic deadline and `TrailSynth`'s
-/// public admission surface. Native and web hosts' folds of that deadline
-/// remain separate host-level unit tests; this model does not claim to execute
-/// either event loop.
+/// Tier-1 (`aterm-effects/tests/output_streak_conformance.rs`) drives `OutputStreak`'s analytic
+/// deadline and `TrailSynth`'s admission surface; the native and web hosts' folds of that
+/// deadline are host-level unit tests, and neither event loop is modelled.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn output_streak_episode_delivery_model() -> Model {
@@ -647,10 +601,10 @@ pub fn output_streak_episode_delivery_model() -> Model {
             var shimmer = 0;
             var settle = 0;
             var wake = 0;
-            // One means a human voice currently owns the shared min-gap.
+            // 1 while a human voice owns the shared min-gap.
             var human_gap = 0;
-            // A separately governed output cue was delivered while the human
-            // slot was open; the next human attempt checks that it stayed open.
+            // An output cue was delivered while the human slot was open; the next human
+            // attempt checks that it stayed open.
             var audio_checked = 0;
             var next_human = 0;
 
@@ -702,7 +656,7 @@ pub fn output_streak_episode_delivery_model() -> Model {
                 human_gap = 1;
             }
 
-            invariant Bounds:
+            bound Bounds:
                 phase <= 3 && shimmer <= 1 && settle <= 1 && wake <= 1 &&
                 human_gap <= 1 && audio_checked <= 1 && next_human <= 1;
             invariant OpeningCueSurvivesSharedGap:
@@ -721,7 +675,7 @@ pub fn output_streak_episode_delivery_model() -> Model {
                 } else {
                     human_gap <= 1
                 };
-            invariant NextHumanFollowsCheckedOutput:
+            uncaught NextHumanFollowsCheckedOutput:
                 if next_human == 1 {
                     audio_checked == 1
                 } else {
@@ -733,30 +687,22 @@ pub fn output_streak_episode_delivery_model() -> Model {
 
 /// Acceptance-ordered publication of the GUI's output-echo evidence.
 ///
-/// A sink receipt is ordered where its bytes enter the direct/spill serializer,
-/// but its writer may be descheduled before publishing that receipt to the
-/// render-time tracker. This bounded machine fixes the regression-shaped pair:
-/// receipt 1 is an older echoable input and receipt 2 is the newer Enter turn
-/// boundary. Their completions may publish in either order. The newer boundary
-/// must remain authoritative even when the older completion arrives last, and a
-/// sample must observe one whole published timestamp tuple rather than fields
-/// from both versions.
+/// A sink receipt is ordered where its bytes enter the direct/spill serializer, but its writer
+/// may be descheduled before publishing it to the render-time tracker. Receipt 1 is an older
+/// echoable input and receipt 2 the newer Enter turn boundary; their completions may publish in
+/// either order. The newer boundary stays authoritative when the older completion arrives last,
+/// and a sample sees one whole published timestamp tuple, never fields from both versions.
 ///
-/// The opaque production `aterm_session::sink::AcceptedOrder` never exposes a
-/// number. `1` and `2` here are only relative classes established by Tier-1's
-/// real `older < newer` comparison. Timestamp values likewise project to
-/// presence bits; wall-clock arithmetic is outside this ordering contract.
+/// `aterm_session::sink::AcceptedOrder` exposes no number: `1` and `2` are the relative classes
+/// Tier-1's real `older < newer` comparison establishes. Timestamps project to presence bits.
 ///
-/// `Buggy=1` replays three defects independently. `PublishOlderEcho` overwrites a
-/// newer publication, matching the pre-token completion-order race. `Sample`
-/// combines the boundary's publication order with the older echo timestamps,
-/// matching the pre-mutex independent-atomic read. And `PublishOlderEcho` fires
-/// before the sink accepted the echo — an order minted at the write ATTEMPT
-/// (`InputEpoch`'s shape) instead of at acceptance (`AcceptedOrder`'s), which for a
-/// write that then fails manufactures the post-return echo timestamp
-/// `OutputEchoWrite::finish` refuses by publishing only on
-/// `receipt.accepted_order()` (`PublishFollowsAcceptance`). Tier-0 contains an
-/// explicit trace for each mutant so one counterexample cannot mask another.
+/// `Buggy=1` adds three independent defects: `PublishOlderEcho` overwrites a newer publication
+/// (completion order wins); `Sample` mixes the boundary's order with the older echo's
+/// timestamps (independent atomics instead of one mutex-owned record); and `PublishOlderEcho`
+/// fires before the sink accepted the echo, an order minted at the write attempt
+/// (`InputEpoch`'s shape) rather than at acceptance, which `OutputEchoWrite::finish` refuses by
+/// publishing only on `receipt.accepted_order()` (`PublishFollowsAcceptance`). Tier-0 has an
+/// explicit trace per mutant so one counterexample cannot mask another.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn output_echo_receipt_publication_model() -> Model {
@@ -808,8 +754,8 @@ pub fn output_echo_receipt_publication_model() -> Model {
             action Sample when (published_order > 0 && sampled == 0) {
                 sampled = 1;
                 sample_order = published_order;
-                // The mutant represents the sampler observing the boundary's
-                // generation/debt store between the older timestamp loads.
+                // `Buggy`: the sampler sees the boundary's store between the older
+                // timestamp loads.
                 sample_accepted = if Buggy == 1 && older_done == 1 &&
                     newer_done == 1 && published_order == 2 {
                     1
@@ -853,7 +799,7 @@ pub fn output_echo_receipt_publication_model() -> Model {
                 };
             // The tracker never publishes an order the sink has not accepted.
             invariant PublishFollowsAcceptance: published_order <= accepted;
-            invariant StateBounded:
+            bound StateBounded:
                 accepted <= 2 && older_done <= 1 && newer_done <= 1 &&
                 published_order <= 2 && accepted_shadow <= 1 &&
                 boundary_shadow <= 1 && sampled <= 1 && sample_order <= 2 &&
@@ -862,40 +808,26 @@ pub fn output_echo_receipt_publication_model() -> Model {
     }
 }
 
-/// PHOSPHOR rain lifecycle (docs/matrix-rain-design.md §5/§10), authored via
-/// [`ty_model!`] in the [`nova_phase_model`] shape: `{0 Idle, 1 Raining,
-/// 2 Draining}`. `Activity` (a host activity event — enable, a content-seq
-/// delta, a licensed refocus resumption) is the ONLY entry into Raining;
-/// `StartDrain` (idle sleep / unfocus) opens the mandatory drain; `DrainTick`
-/// consumes the drain fuel one engine tick at a time and lands Idle at EXACTLY
-/// `DrainBound = 30` ticks — the engine's `DRAIN_TICKS` (the field decays `L`
-/// per tick, so 30 ticks empties every column REGARDLESS of geometry: the
-/// design's "no configuration animates forever").
+/// Phosphor rain lifecycle (docs/matrix-rain-design.md §5/§10), in the [`nova_phase_model`]
+/// shape: `{0 Idle, 1 Raining, 2 Draining}`. `Activity` (enable, a content-seq delta, a
+/// licensed refocus resumption) is the only entry into Raining; `StartDrain` (idle sleep or
+/// unfocus) opens the mandatory drain; `DrainTick` lands Idle at exactly `DrainBound = 30`
+/// ticks, the engine's `DRAIN_TICKS` (the field decays `L` per tick, so 30 ticks empty every
+/// column whatever the geometry).
 ///
-/// Invariants: `NoUnlicensedRain: rains <= acts` — every Raining entry is
-/// paid for by an activity event (the phantom-replay class: a drained pane
-/// must never relight on cmd-tab alone); `CanReachIdle` is the fuel invariant
-/// in the [`nova_phase_model`] `CanSettle` idiom — while Draining, the unspent
-/// step budget `MaxSteps − steps` always covers the `DrainBound − drained`
-/// ticks left to Idle, so no reachable drain is ever stranded by the
-/// finiteness guard (`MaxSteps = 64` is TIGHT: two full episodes are
-/// `2·(Activity + StartDrain + 30·DrainTick) = 64` steps — a 63-step budget
-/// fails this very invariant at `Buggy = 0`); `StateBounded`/`DrainBounded`
-/// are the always-true structural controls.
+/// `NoUnlicensedRain: rains <= acts`: every Raining entry is paid for by an activity event, so a
+/// drained pane never relights on cmd-tab alone. `CanReachIdle` is the fuel invariant: while
+/// Draining, `MaxSteps − steps` covers the `DrainBound − drained` ticks left. `MaxSteps = 64` is
+/// tight: two full episodes take `2·(1 + 1 + 30)` steps, and 63 fails it at `Buggy = 0`.
+/// `StateBounded`/`DrainBounded` are structural controls. `Buggy = 1` enables `Rearm`, which
+/// re-enters Raining from Idle without an activity event.
 ///
-/// `Buggy = 1` enables `Rearm`: Idle re-enters Raining WITHOUT an activity
-/// event (`rains` grows past `acts`) — `ty` PROVES all four invariants at
-/// `Buggy = 0` over the whole bounded space and CATCHES the unlicensed
-/// relight at `Buggy = 1` (counterexample on `NoUnlicensedRain`).
-///
-/// Tier-1 binding: aterm-effects'
-/// `rain_lifecycle_conformance_real_engine_projects_onto_model` drives the
-/// REAL `MatrixRain` through an enable → rain → idle-sleep-drain → resume
-/// script, projecting `(state, fuel) = (lifecycle, drain_ticks)` onto this
-/// model tick-for-tick, with the phantom-relight negative-control twin.
+/// Tier-1: aterm-effects' `rain_lifecycle_conformance_real_engine_projects_onto_model` drives
+/// the real `MatrixRain` through enable, rain, idle-sleep drain and resume, projecting
+/// `(lifecycle, drain_ticks)` onto this model tick for tick, with a phantom-relight negative
+/// control.
 #[must_use]
-// Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
-// models above) — the MODEL it returns is what `ty` machine-checks.
+// Skip (T2 vcgen-budget lane): a model data constructor; `ty` checks the model it returns.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn rain_lifecycle_model() -> Model {
     crate::ty_model! {
@@ -928,8 +860,7 @@ pub fn rain_lifecycle_model() -> Model {
                 state = if drained == DrainBound - 1 { 0 } else { 2 };
                 steps = steps + 1;
             }
-            // The defect class: a drained pane relights with NO activity event
-            // (phantom replay). Only expressible at Buggy = 1.
+            // A drained pane relights with no activity event (phantom replay).
             action Rearm when (Buggy == 1 && state == 0 && steps <= MaxSteps - 1) {
                 state = 1;
                 drained = 0;
@@ -937,59 +868,48 @@ pub fn rain_lifecycle_model() -> Model {
                 steps = steps + 1;
             }
             invariant NoUnlicensedRain: rains <= acts;
-            // Fuel: the remaining step budget always covers the remaining
-            // drain, so Draining ALWAYS reaches Idle within DrainBound ticks
-            // of the last activity event (nova CanSettle idiom).
+            // Fuel: the step budget always covers the remaining drain (nova `CanSettle`).
             invariant CanReachIdle:
                 (if state == 2 { steps + DrainBound } else { 0 }) <= MaxSteps + drained;
-            invariant StateBounded: state <= 2;
-            invariant DrainBounded: drained <= DrainBound;
+            bound StateBounded: state <= 2;
+            bound DrainBounded: drained <= DrainBound;
         }
     }
 }
 
-/// PHOSPHOR rain band containment (docs/matrix-rain-design.md §7/§10) — the
-/// damage law behind `aterm_render::compute_dirty_rows` for `rain_quads`:
-/// EVERY emitted quad whose bytes changed this tick lies in a marked dirty row,
-/// INCLUDING the mutation-tick case where the glyph hash window rolls and every
-/// lit trail cell changes at once (not just the stepped head/tail edges).
-/// Hand-built in the [`deco_band_containment_model`] shape (nondeterministic
-/// `in_range` picks need the `Expr` builders; the `ty_model!` grammar has
-/// none): a phased pick walk chooses one column's head row, its trail length,
-/// whether this is a mutation tick, and a probe row anywhere in the band's
-/// visible part (the just-expired tail included); then `Mark` records what the
-/// tick did to that row and what the marker decided.
+/// Phosphor rain band containment (docs/matrix-rain-design.md §7/§10): the damage law behind
+/// `aterm_render::compute_dirty_rows` for `rain_quads`. Every emitted quad whose bytes changed
+/// this tick lies in a marked dirty row, including a mutation tick, where the glyph hash window
+/// rolls and every lit trail cell changes at once. Hand-built in the
+/// [`deco_band_containment_model`] shape (the `in_range` picks need the `Expr` builders): a
+/// phased walk picks one column's head row, its trail length, whether this is a mutation tick,
+/// and a probe row anywhere in the band's visible part (the just-expired tail included); then
+/// `Mark` records what the tick did to that row and what the marker decided.
 ///
-/// The column lives in a `Viewport`-row window and its head may already have
-/// run off the bottom (`head >= Viewport`) — the tail stays on-screen. That is
-/// the case that makes the law non-trivial, because the marker has TWO parts:
+/// The column lives in a `Viewport`-row window and its head may have run off the bottom
+/// (`head >= Viewport`) while the tail stays on screen. The marker has two parts:
 ///
-/// * the per-row MERGE-DIFF marks every row whose quad slice differs — the
-///   stepped head, the expired tail (its quad vanished: the prev∪cur half), and
-///   on a mutation tick every visible lit row;
-/// * the SCISSOR-BAND FILL then marks every row carrying a current quad inside
-///   the bounding band `[first, last]` of what the merge-diff marked.
+/// * the per-row merge-diff marks every row whose quad slice differs: the stepped head, the
+///   expired tail (its quad vanished), and on a mutation tick every visible lit row;
+/// * the scissor-band fill then marks every row carrying a current quad inside the band
+///   `[first, last]` of what the merge-diff marked.
 ///
-/// So with both edges on screen the fill alone covers the whole band, and a
-/// merge-diff that missed the mutation would still be masked. Once the head
-/// has left the screen, only the tail steps, the fill band collapses onto it,
-/// and the mutation-changed interior rows are marked by the merge-diff or by
-/// nothing. `Buggy = 1` is exactly that merge-diff — it sees the stepped edges
-/// and not the glyph swap — and `ty` catches it: a strictly-interior row of a
-/// mutation tick changes UNMARKED under an off-screen head, the stale-glyph
-/// ghost the renderer's no-ghost byte-equality test pins.
+/// With both edges on screen the fill covers the whole band and would mask a merge-diff that
+/// missed the mutation. Once the head has left, the fill band collapses onto the tail and the
+/// mutation-changed interior rows are marked by the merge-diff or by nothing. `Buggy = 1` is a
+/// merge-diff that sees the stepped edges and not the glyph swap: an interior row changes
+/// unmarked under an off-screen head, the stale-glyph ghost.
 ///
-/// Safety `Contained`: `changed <= marked` once the row is marked (indicator
-/// order, the [`grid_translate_model`] idiom).
+/// Safety `Contained`: `changed <= marked` once the row is marked (indicator order, the
+/// [`grid_translate_model`] idiom).
 ///
 /// Tier-1: `aterm-render/tests/rain_render.rs::rain_marking_conforms_to_the_rain_band_containment_model`
-/// feeds the shipping `compute_dirty_rows` one column's band for every point
-/// of this lattice, step and mutation ticks alike, and requires each row's real
-/// verdict to be the model's one `Mark` successor.
+/// feeds the shipping `compute_dirty_rows` one column's band for every point of this lattice and
+/// requires each row's verdict to be the model's one `Mark` successor.
 #[must_use]
-// Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
-// models above) — the MODEL it returns is what `ty` machine-checks.
+// Skip (T2 vcgen-budget lane): a model data constructor; `ty` checks the model it returns.
 #[cfg_attr(trust_verify, trust::skip)]
+#[crate::model]
 pub fn rain_band_containment_model() -> Model {
     let tail = || sub(var("head"), var("l"));
     let head_visible = || le(var("head"), sub(cst("Viewport"), int(1)));
@@ -1007,9 +927,9 @@ pub fn rain_band_containment_model() -> Model {
             int(0),
         )
     };
-    // The LAST row the merge-diff marks (its first is always the expired tail):
-    // every visible lit row on a mutation tick — unless Buggy, whose diff sees
-    // the stepped edges only — else the head if it is on screen, else the tail.
+    // The last row the merge-diff marks (its first is the expired tail): every visible lit row
+    // on a mutation tick (not under Buggy, whose diff sees only the stepped edges), else the
+    // head if on screen, else the tail.
     let diff_last = || {
         if_(
             and_(eq(var("mt"), int(1)), eq(cst("Buggy"), int(0))),
@@ -1066,9 +986,8 @@ pub fn rain_band_containment_model() -> Model {
                 ],
             },
             Action {
-                // Trail length >= 2 so a strictly-interior row exists (the
-                // mutation-only change the Buggy marker misses); <= head keeps
-                // the expired tail at or below the top row, and the lower bound
+                // l >= 2 so a strictly interior row exists (what the Buggy marker misses);
+                // l <= head keeps the expired tail at or below the top row, and the lower bound
                 // keeps it on screen when the head has left.
                 name: "PickTrail",
                 guard: Some(eq(var("phase"), int(1))),
@@ -1091,7 +1010,7 @@ pub fn rain_band_containment_model() -> Model {
                 ],
             },
             Action {
-                // Mutation tick or plain stepping tick — BOTH cases quantified.
+                // Mutation tick or plain stepping tick, both quantified.
                 name: "PickTick",
                 guard: Some(eq(var("phase"), int(2))),
                 updates: vec![
@@ -1141,46 +1060,34 @@ pub fn rain_band_containment_model() -> Model {
             },
         ],
         invariants: vec![Invariant {
-            // THE THEOREM: a changed quad row is always a marked dirty row.
-            // Buggy=1 leaves a mutation-tick interior row unmarked (ghost).
+            // A changed quad row is always a marked dirty row; Buggy=1 leaves a mutation-tick
+            // interior row unmarked.
             name: "Contained",
+            kind: InvariantKind::Claim,
             expr: or_(neq(var("phase"), int(5)), le(var("changed"), var("marked"))),
         }],
     }
 }
 
-/// PHOSPHOR rain ignition floor (docs/matrix-rain-design.md §4/§10) — the
-/// structural flash-safety theorem: a column's head passes any given cell at
-/// most once per second, because the cycle length carries the runtime
-/// G-EXTENSION `G = max(G_natural, ceil(1000/(p·tick_ms)) − rows − L)`
-/// (`aterm_effects::matrix_rain::field::col_params`), which forces
-/// `C·p·tick_ms = (rows + L + G)·p·tick_ms >= 1000 ms` however small the
-/// grid. Hand-built with `rows` as a nondeterministic model VARIABLE
-/// (`in_range` needs the `Expr` builders): the walk picks a small grid
-/// (`rows ∈ 3..=8` — exactly the regime where the natural gap alone is too
-/// short), a step period `p ∈ 2..=5` (the engine's pre-knob range; 2 is the
-/// fastest, worst-case column), a clamped trail `L ∈ 3..=rows`, and a natural
-/// gap `G_natural ∈ 1..=rows`, then settles `C`. `tick_ms` is pinned at the
-/// default 33 ms (30 fps); the runtime recomputes the same ceil for every
-/// configured rate. `ty` has no `*`, so the product is encoded as literal
-/// repeated addition (`C·66/99/132/165` branched on `p`) and the per-`p`
-/// floor table `{16, 11, 8, 7}` is VERIFIED against `>= 1000` by the checker
-/// itself, not assumed.
+/// Phosphor rain ignition floor (docs/matrix-rain-design.md §4/§10): a column's head passes a
+/// cell at most once per second, because the cycle carries the G-extension
+/// `G = max(G_natural, ceil(1000/(p·tick_ms)) − rows − L)`
+/// (`aterm_effects::matrix_rain::field::col_params`), so `(rows + L + G)·p·tick_ms >= 1000 ms`
+/// however small the grid.
 ///
-/// `Buggy = 1` drops the G-extension (`G = G_natural` — the pre-fix field): a
-/// 3-row grid at `p = 2` cycles in `7·2·33 = 462 ms`, the head re-flashes the
-/// same cell twice a second, and `ty` produces the counterexample.
-/// `CycleExceedsViewport` is the always-true non-vacuity control (the cycle
-/// always clears the viewport plus trail at BOTH `Buggy` values).
+/// Hand-built with `rows` a nondeterministic variable: the walk picks `rows ∈ 3..=8` (where the
+/// natural gap alone is too short), `p ∈ 2..=5` (2 is the fastest column), a clamped trail
+/// `L ∈ 3..=rows` and `G_natural ∈ 1..=rows`, then settles `C`. `tick_ms` is pinned at 33 ms. With
+/// no `*`, the product is repeated addition branched on `p`, and the checker verifies the floor
+/// table `{16, 11, 8, 7}` against `>= 1000`. `Buggy = 1` drops the G-extension (a 3-row grid at
+/// `p = 2` cycles in 462 ms). `CycleExceedsViewport` is the always-true non-vacuity control.
 ///
-/// Tier-1 binding: aterm-effects' field tests drive the REAL
-/// `col_params` over the same small-grid lattice and assert
-/// `c * p * tick_ms >= 1000` per column, with the engine's flash-floor
-/// behavior pinned by the matrix_rain unit suite.
+/// Tier-1: `matrix_rain`'s `rain_ignition_conformance_real_col_params_hold_the_flash_floor`
+/// drives the real `col_params` over the same lattice and asserts `c * p * tick_ms >= 1000`.
 #[must_use]
-// Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
-// models above) — the MODEL it returns is what `ty` machine-checks.
+// Skip (T2 vcgen-budget lane): a model data constructor; `ty` checks the model it returns.
 #[cfg_attr(trust_verify, trust::skip)]
+#[crate::model]
 pub fn rain_ignition_model() -> Model {
     // `C · k` by literal repeated addition (the grammar has no `*`).
     let c_times = |k: i64| {
@@ -1202,8 +1109,8 @@ pub fn rain_ignition_model() -> Model {
             ),
         )
     };
-    // ceil(1000 / (p·33)) per period — the runtime flash floor. The table is
-    // not trusted: HeadPassFloor re-verifies `floor·p·33 >= 1000` numerically.
+    // ceil(1000 / (p·33)) per period, the runtime flash floor; `HeadPassFloor` re-checks
+    // `floor·p·33 >= 1000` rather than trusting the table.
     let floor_rows = || {
         if_(
             eq(var("p"), int(2)),
@@ -1248,8 +1155,7 @@ pub fn rain_ignition_model() -> Model {
         fn_vars: vec![],
         actions: vec![
             Action {
-                // Small grids: exactly where the natural gap alone breaks the
-                // floor (a 50-row grid satisfies it without the extension).
+                // Small grids, where the natural gap alone breaks the floor.
                 name: "PickRows",
                 guard: Some(eq(var("phase"), int(0))),
                 updates: vec![
@@ -1308,8 +1214,7 @@ pub fn rain_ignition_model() -> Model {
                 ],
             },
             Action {
-                // C = rows + L + G, with (Buggy=0) or without (Buggy=1) the
-                // G-extension.
+                // C = rows + L + G, with the G-extension unless Buggy.
                 name: "Settle",
                 guard: Some(eq(var("phase"), int(4))),
                 updates: vec![
@@ -1326,37 +1231,31 @@ pub fn rain_ignition_model() -> Model {
         ],
         invariants: vec![
             Invariant {
-                // THE THEOREM: the per-cell head-pass period is >= 1 s.
+                // The per-cell head-pass period is >= 1 s.
                 // Buggy=1: rows=3, L=3, G=1, p=2 ⇒ 7·66 = 462 < 1000.
                 name: "HeadPassFloor",
+                kind: InvariantKind::Claim,
                 expr: settled_implies(le(int(1000), product())),
             },
             Invariant {
-                // Always-true control (both Buggy values): the settled cycle
-                // clears viewport + minimum trail + a live gap, so the floor
-                // theorem is checked on non-degenerate cycles, not vacuously.
+                // Always-true control: the settled cycle clears viewport, minimum trail and a
+                // live gap, so the floor is checked on non-degenerate cycles.
                 name: "CycleExceedsViewport",
+                kind: InvariantKind::Uncaught,
                 expr: settled_implies(le(add(var("rows"), int(4)), var("c"))),
             },
         ],
     }
 }
 
-/// Generated cat-art collectible set. Each accepted semantic glyph key is
-/// inserted at most once, so the unlocked/discovery count grows monotonically
-/// to the finite generated roster and a repeated sighting changes only the
-/// encounter counters. `RosterCap` is pinned to `GLYPH_IDS.len()` by the
-/// Tier-1 shipping-code conformance test in `aterm-gui::kitty_log`.
-///
-/// `Buggy = 1` reproduces a set implemented as an append-only event list: a
-/// repeated key incorrectly grows both `unlocked` and `discoveries`. That
-/// immediately violates `DuplicateIdempotent` and, with enough repeats, also
-/// exceeds `RosterBound`, giving the prove-and-catch obligation real teeth.
-/// Monotonicity is structural: neither action contains a decrement, and the
-/// only growth action in the healthy machine is `Unlock`.
+/// Generated cat-art collectible set. Each accepted semantic glyph key is inserted at most once,
+/// so the unlocked count grows monotonically to the finite roster and a repeated sighting
+/// changes only the encounter counters. `RosterCap` is pinned to `GLYPH_IDS.len()` by the Tier-1
+/// conformance test in `aterm-gui::kitty_log`. `Buggy = 1` is an append-only event list: a
+/// repeated key grows `unlocked` and `discoveries`, breaking `DuplicateIdempotent` and, with
+/// enough repeats, `RosterBound`. Monotonicity is structural: no action decrements.
 #[must_use]
-// Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
-// models above) — the MODEL it returns is what `ty` machine-checks.
+// Skip (T2 vcgen-budget lane): a model data constructor; `ty` checks the model it returns.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn kitty_collectibles_model() -> Model {
     crate::ty_model! {
@@ -1385,36 +1284,29 @@ pub fn kitty_collectibles_model() -> Model {
                 duplicates = duplicates + 1;
             }
             invariant RosterBound: unlocked <= RosterCap;
-            invariant DiscoverySetAgreement: discoveries == unlocked;
+            uncaught DiscoverySetAgreement: discoveries == unlocked;
             invariant DuplicateIdempotent: discoveries + duplicates == sightings;
-            invariant SightingsBounded: sightings <= MaxSightings;
+            uncaught SightingsBounded: sightings <= MaxSightings;
         }
     }
 }
 
-/// Bidirectional rollback-safe collectible persistence. Current `Discover`
-/// writes the authoritative sidecar and its embedded mirror. A
-/// collectible-aware rollback can `OldDiscover` a new semantic key or
-/// `OldRepeat` an existing key into that mirror; `OldRepeatReset` covers an
-/// existing key detectably recreated after a pre-collectibles mirror erasure
-/// (its `first_seen` is strictly after the baseline window). `Reconcile`
-/// imports only the positive event delta identified against the stored mirror
-/// baseline. Thus a replicated row is never counted twice. A pre-collectibles
-/// `OldRewrite` may erase the embedded replica only after it is reconciled;
-/// `RestoreMirror` reconstructs it from the sidecar for another rollback.
+/// Bidirectional rollback-safe collectible persistence. `Discover` writes the authoritative
+/// sidecar and its embedded mirror. A collectible-aware rollback build can `OldDiscover` a new
+/// key or `OldRepeat` an existing one into that mirror; `OldRepeatReset` is an existing key
+/// detectably recreated after a pre-collectibles build erased the mirror (its `first_seen` is
+/// after the baseline window). `Reconcile` imports only the positive delta against the stored
+/// mirror baseline, so a replicated row is never counted twice. A pre-collectibles `OldRewrite`
+/// may erase the replica only once it is reconciled; `RestoreMirror` rebuilds it from the
+/// sidecar.
 ///
-/// `Buggy = 1` models the former base-only current writer. `Discover` appears
-/// healthy to the live process, but leaves both sidecar key and event counts
-/// behind. `Discover -> OldRewrite` then loses the unlock and violates both
-/// `NoUnlockRollback` and `NoCountRollback`. At `Buggy = 0`, both invariants are
-/// inductive over every bounded interleaving of current discovery, rollback
-/// discovery/repeat, reconciliation, destructive rewrite, and mirror restore.
-/// Same-timestamp/clock-regression ambiguity is deliberately outside the count
-/// model and documented by the runtime ledger; the unlock-set invariant does
-/// not depend on timestamps.
+/// `Buggy = 1` is a base-only writer: `Discover` looks healthy to the live process but leaves the
+/// sidecar's key and event counts behind, so `Discover -> OldRewrite` loses the unlock
+/// (`NoUnlockRollback`, `NoCountRollback`). Same-timestamp and clock-regression ambiguity is
+/// outside the count model (the runtime ledger documents it); the unlock-set invariant does not
+/// depend on timestamps.
 #[must_use]
-// Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
-// models above) — the MODEL it returns is what `ty` machine-checks.
+// Skip (T2 vcgen-budget lane): a model data constructor; `ty` checks the model it returns.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn kitty_sidecar_durability_model() -> Model {
     crate::ty_model! {
@@ -1503,44 +1395,40 @@ pub fn kitty_sidecar_durability_model() -> Model {
                 durable = sidecar;
                 durable_events = sidecar_events;
             }
-            invariant KnownBounded: known <= Cap;
-            invariant EventsBounded: events <= EventCap;
-            invariant BaseWithinKnown: base <= known;
-            invariant SidecarWithinKnown: sidecar <= known;
-            invariant PendingWithinKnown: pending <= known;
-            invariant PendingEventsWithinEvents: pending_events <= events;
-            invariant SidecarEventsWithinEvents: sidecar_events <= events;
+            uncaught KnownBounded: known <= Cap;
+            uncaught EventsBounded: events <= EventCap;
+            uncaught BaseWithinKnown: base <= known;
+            uncaught SidecarWithinKnown: sidecar <= known;
+            uncaught PendingWithinKnown: pending <= known;
+            uncaught PendingEventsWithinEvents: pending_events <= events;
+            uncaught SidecarEventsWithinEvents: sidecar_events <= events;
             invariant NoUnlockRollback: durable == known;
             invariant NoCountRollback: durable_events == events;
         }
     }
 }
 
-/// Nonblocking Kitty Log flush-worker lifecycle. The ordinary capacity-one
-/// lane, a host-retained tail, the shutdown-only exit lane, the worker pending
-/// accumulator, and durable storage form one ownership equation. A tail
-/// retained while the ordinary lane is full moves only through
-/// `BeginExit → OfferTail → DrainNormal → AbsorbTail`; it can never disappear
-/// merely because normal delivery was saturated.
+/// Nonblocking Kitty Log flush-worker lifecycle. The capacity-one ordinary lane, a host-retained
+/// tail, the shutdown-only exit lane, the worker's pending accumulator and durable storage form
+/// one ownership equation (`AcceptedConserved`). A tail retained while the ordinary lane is full
+/// moves only through `BeginExit → OfferTail → DrainNormal → AbsorbTail`; saturated delivery
+/// never drops it.
 ///
-/// Active lock contention is a stuttering observation: it leaves the worker
-/// accumulator eligible for a later flush without consuming the terminal
-/// budget. Only after exit begins and both delivery lanes drain does exit lock
-/// contention advance the finite retry counter. An ordinary filesystem call
-/// that never returns advances the event-loop-owned deadline and detaches at
-/// `DeadlineCap`. Detachment
-/// retains the conceptual pending batch: best-effort observability may lose a
-/// crash window, but the UI thread never pretends it persisted. `Buggy = 1`
-/// reproduces the retired one-lane exit path: `OfferTail` clears the host tail
-/// while the full ordinary lane prevents ownership from reaching the exit lane.
+/// Active lock contention is a stuttering observation that leaves the batch eligible for a later
+/// flush without spending the exit budget; only after exit begins and both lanes drain does
+/// contention advance the finite retry counter. A filesystem call that never returns advances
+/// the event-loop-owned deadline and detaches at `DeadlineCap`, keeping the pending batch: a
+/// crash window may be lost, but the UI thread never claims it persisted. `Buggy = 1` is a
+/// one-lane exit: `OfferTail` clears the host tail while the full ordinary lane keeps it from
+/// the exit lane.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn kitty_flush_worker_model() -> Model {
     crate::ty_model! {
         KittyFlushWorker {
             const Buggy = 0;
-            // A slow worker may own one pending batch while the capacity-one
-            // ordinary lane holds a second and the host retains a third tail.
+            // A slow worker may own one pending batch while the capacity-one ordinary lane
+            // holds a second and the host retains a third tail.
             const BatchCap = 3;
             const RetryCap = 4;
             const DeadlineCap = 2;
@@ -1630,26 +1518,26 @@ pub fn kitty_flush_worker_model() -> Model {
             ) {
                 joined = 1;
             }
-            invariant BatchBounded: accepted <= BatchCap;
-            invariant NormalLaneBounded: normal_lane <= 1;
-            invariant HostTailBounded: host_tail <= 1;
-            invariant ExitLaneBounded: exit_lane <= 1;
-            invariant RetryBounded: retries <= RetryCap;
-            invariant DeadlineBounded: deadline <= DeadlineCap;
+            uncaught BatchBounded: accepted <= BatchCap;
+            bound NormalLaneBounded: normal_lane <= 1;
+            bound HostTailBounded: host_tail <= 1;
+            bound ExitLaneBounded: exit_lane <= 1;
+            uncaught RetryBounded: retries <= RetryCap;
+            bound DeadlineBounded: deadline <= DeadlineCap;
             invariant AcceptedConserved:
                 accepted == normal_lane + host_tail + exit_lane + pending + persisted;
-            invariant ExitLaneOnlyAfterExit: exit_lane <= exiting;
-            invariant JoinedOnlyAfterExit: joined <= exiting;
-            invariant StalledOnlyDuringExit: stalled <= exiting;
-            invariant DetachedOnlyAfterExit: detached <= exiting;
-            invariant OneExitDisposition: joined + detached <= 1;
-            invariant DetachedOnlyAtDeadline:
+            uncaught ExitLaneOnlyAfterExit: exit_lane <= exiting;
+            uncaught JoinedOnlyAfterExit: joined <= exiting;
+            uncaught StalledOnlyDuringExit: stalled <= exiting;
+            uncaught DetachedOnlyAfterExit: detached <= exiting;
+            uncaught OneExitDisposition: joined + detached <= 1;
+            uncaught DetachedOnlyAtDeadline:
                 if detached == 1 {
                     deadline == DeadlineCap
                 } else {
                     1 == 1
                 };
-            invariant JoinedHasFiniteOutcome:
+            uncaught JoinedHasFiniteOutcome:
                 if joined == 1 {
                     normal_lane == 0 && host_tail == 0 && exit_lane == 0 &&
                     (pending == 0 || retries == RetryCap)
@@ -1659,13 +1547,3 @@ pub fn kitty_flush_worker_model() -> Model {
         }
     }
 }
-
-// -----------------------------------------------------------------------------
-// Native tab-app platform models (`docs/NATIVE_TAB_APPS_DESIGN.md`, section 8).
-//
-// These are Tier-0 obligations for the platform contracts.  They intentionally
-// live in the drift-free derived lane: the Rust declaration below is both the
-// executable bounded machine and the source of the TLA+ checked by `ty`.
-// Tier-1 status is model-specific and lives beside each genuine shipping seam;
-// for example, control admission is bound in aterm-gui's
-// `control_connection_conformance` test rather than duplicated here.

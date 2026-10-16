@@ -1,22 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// Swapchain band placement: the swapchain is sized to the window's raw
-// physical pixels (not the grid-quantized frame, which would make
-// CAMetalLayer rescale it non-integrally), and the frame is placed at the
-// centred remainder offset (`aterm_render::band_offset`) with the leftover
-// bands painted theme-bg in the same blit pass.
-//
-// A window of grid-fit + 7 px must render the exact-fit content byte-identical
-// at the pad-split offset, unscaled, with every band pixel the theme
-// background.
-//
-// Drives the real blit pipeline (`vs_blit`/`fs_blit`, `BlitUniform`) into a
-// readable stand-in via `blit_to_sized_for_test` and compares against the
-// offscreen readback. The CPU counterpart `aterm_render::place_frame_bands`
-// over the same source must equal the GPU output byte-for-byte.
-//
-// No GPU or no system font: no-op.
+// Swapchain band placement: the swapchain is the window's raw physical size (a grid-quantized
+// one would make CAMetalLayer rescale non-integrally), the frame sits at the centred remainder
+// offset (`aterm_render::band_offset`), and the leftover bands are painted theme bg in the same
+// blit pass. Drives the real blit pipeline (`vs_blit`/`fs_blit`, `BlitUniform`) via
+// `blit_to_sized_for_test` against the offscreen readback and the CPU twin
+// `aterm_render::place_frame_bands`. No GPU or no system font: no-op.
 
 use aterm_core::terminal::Terminal;
 use aterm_gpu::{DropOverlay, GpuRenderer, PresentCrop};
@@ -27,14 +17,12 @@ use crate::common;
 const ROWS: usize = 6;
 const COLS: usize = 24;
 
-/// This suite drives the wgpu oracle arm's blit seams (they read the wgpu
-/// offscreen).
-fn fresh_gpu() -> Option<GpuRenderer> {
-    common::wgpu_oracle_or_skip(18.0, Theme::default())
+/// The blit seams read the wgpu offscreen, so this suite drives the wgpu oracle arm.
+fn fresh_gpu() -> GpuRenderer {
+    common::wgpu_oracle(18.0, Theme::default())
 }
 
-/// A representative changed frame: a prompt, coloured text and a glyph, so the
-/// placement is pinned over real glyph + colour pixels (not a flat clear).
+/// A prompt, coloured text and glyphs, so placement is pinned over real pixels, not a clear.
 fn representative_input() -> RenderInput {
     let mut term = Terminal::new(ROWS as u16, COLS as u16);
     term.process(b"$ band check >_\r\n");
@@ -43,22 +31,20 @@ fn representative_input() -> RenderInput {
     term.cell_frame(ROWS, COLS)
 }
 
-/// Grid fit + 7 px per axis: content byte-identical at the centred offset (3
-/// leading / 4 trailing), bands exactly theme bg, no scaling, and the CPU
-/// placement agrees with the GPU blit.
+/// Grid fit + 7 px per axis: content byte-identical at the centred offset (3 leading / 4
+/// trailing), bands exactly theme bg, no scaling, and CPU placement agrees.
 #[test]
 fn window_seven_px_past_grid_fit_offsets_content_without_scaling() {
-    let Some(mut gpu) = fresh_gpu() else { return };
+    let mut gpu = fresh_gpu();
     let mut win = aterm_gpu::WindowGpu::new();
     let input = representative_input();
 
-    // The offscreen readback is the exact-fit content (blitted 1:1; see
-    // tests/blit_invert.rs).
+    // The offscreen readback is the exact-fit content (blitted 1:1; see blit_invert.rs).
     let source = gpu.render_input(&mut win, &input, None);
     let (fw, fh) = (source.width, source.height);
 
-    // The window grew 7px per axis without gaining a column/row: the swapchain
-    // is the RAW size; the frame must land at the centred band offset.
+    // 7 px more per axis without a new column/row: the swapchain is the raw size and the
+    // frame lands at the centred band offset.
     let (dw, dh) = (fw + 7, fh + 7);
     let blit = gpu.blit_to_sized_for_test(&mut win, false, dw as u32, dh as u32);
     assert_eq!(
@@ -96,12 +82,11 @@ fn window_seven_px_past_grid_fit_offsets_content_without_scaling() {
             }
         }
     }
-    // NON-VACUITY: both branches genuinely exercised, over the whole surface.
+    // Non-vacuity: both branches cover the whole surface.
     assert_eq!(content_px, fw * fh);
     assert_eq!(band_px, dw * dh - fw * fh);
 
-    // CPU/GPU AGREEMENT: the softbuffer twin over the same source must equal
-    // the GPU blit byte-for-byte — both backends absorb the remainder the same.
+    // The softbuffer twin over the same source equals the GPU blit byte-for-byte.
     let mut cpu = vec![0u32; dw * dh];
     place_frame_bands(&mut cpu, dw, dh, &source.pixels, fw, fh, false, bg, 0..0);
     for (i, (&c, &g)) in cpu.iter().zip(blit.pixels.iter()).enumerate() {
@@ -113,10 +98,10 @@ fn window_seven_px_past_grid_fit_offsets_content_without_scaling() {
     }
 }
 
-/// The bell flash inverts CONTENT only: bands are chrome and stay theme-bg.
+/// The bell flash inverts content only: bands are chrome and stay theme bg.
 #[test]
 fn bands_do_not_invert_on_bell() {
-    let Some(mut gpu) = fresh_gpu() else { return };
+    let mut gpu = fresh_gpu();
     let mut win = aterm_gpu::WindowGpu::new();
     let input = representative_input();
     let source = gpu.render_input(&mut win, &input, None);
@@ -144,11 +129,10 @@ fn bands_do_not_invert_on_bell() {
     }
 }
 
-/// A swapchain SMALLER than the frame (transient mid-drag) crops the frame,
-/// centred — still 1:1, never scaled.
+/// A swapchain smaller than the frame (transient mid-drag) crops it, centred, 1:1.
 #[test]
 fn undersized_swapchain_crops_centred_never_scales() {
-    let Some(mut gpu) = fresh_gpu() else { return };
+    let mut gpu = fresh_gpu();
     let mut win = aterm_gpu::WindowGpu::new();
     let input = representative_input();
     let source = gpu.render_input(&mut win, &input, None);
@@ -173,13 +157,12 @@ fn undersized_swapchain_crops_centred_never_scales() {
     }
 }
 
-/// The asymmetric frontend crop is enforced by the present shader before
-/// bell inversion and the drop overlay. With an odd five-row removal, three
-/// raw rows above and two below become chrome; the overlay border is measured
-/// against the shorter visible interval, including its trailing edge.
+/// The present shader applies the asymmetric frontend crop before bell inversion and the drop
+/// overlay: with a five-row removal, three raw rows above and two below become chrome, and
+/// the overlay border follows the visible interval's edges.
 #[test]
 fn asymmetric_crop_keeps_raw_bands_outside_invert_and_drop_overlay() {
-    let Some(mut gpu) = fresh_gpu() else { return };
+    let mut gpu = fresh_gpu();
     let mut win = aterm_gpu::WindowGpu::new();
     let input = representative_input();
     let source = gpu.render_input(&mut win, &input, None);
@@ -207,9 +190,8 @@ fn asymmetric_crop_keeps_raw_bands_outside_invert_and_drop_overlay() {
     let red = 0x00ff_0000;
     let x = fw / 2;
 
-    // The three leading and two trailing raw rows are now chrome. Bell invert
-    // makes this non-vacuous even though the renderer's padding is itself bg:
-    // sampling those rows would produce !bg, while the crop branch emits bg.
+    // The three leading and two trailing raw rows are chrome. Bell invert makes this
+    // non-vacuous though the padding is itself bg: sampling those rows would give !bg.
     for y in (0..3).chain((fh - 2)..fh) {
         for px in &blit.pixels[y * fw..(y + 1) * fw] {
             assert_eq!(
@@ -220,8 +202,7 @@ fn asymmetric_crop_keeps_raw_bands_outside_invert_and_drop_overlay() {
         }
     }
 
-    // The production border is at least two device pixels. Pin both the new
-    // visible top and bottom edges at a centre column, away from the X border.
+    // The border is at least two device pixels: pin both visible edges at a centre column.
     for y in [3, 4, fh - 4, fh - 3] {
         assert_eq!(
             blit.pixels[y * fw + x] & 0x00ff_ffff,
@@ -230,8 +211,7 @@ fn asymmetric_crop_keeps_raw_bands_outside_invert_and_drop_overlay() {
         );
     }
 
-    // Wash alpha is zero, so a point beyond every border remains the exact
-    // bell-inverted source texel rather than being spuriously highlighted.
+    // Wash alpha is zero, so the interior stays the exact bell-inverted source texel.
     let interior_y = 6;
     assert_eq!(
         blit.pixels[interior_y * fw + x] & 0x00ff_ffff,
@@ -240,14 +220,12 @@ fn asymmetric_crop_keeps_raw_bands_outside_invert_and_drop_overlay() {
     );
 }
 
-/// Chrome reaches the window edge: with two chrome rows (the second a metered
-/// row whose gutters use its fill and track tones), a window 7 px past grid
-/// fit continues each chrome row's edge pixels through the leftover bands,
-/// keeps every other band pixel theme bg, and matches `place_frame_bands`
-/// with the same `edge_rows`.
+/// Chrome rows (here the second is a metered row with fill and track gutters) continue their
+/// edge pixels through the leftover bands; every other band pixel stays theme bg, and
+/// `place_frame_bands` with the same `edge_rows` agrees.
 #[test]
 fn chrome_rows_continue_their_edge_pixels_through_the_leftover_bands() {
-    let Some(mut gpu) = fresh_gpu() else { return };
+    let mut gpu = fresh_gpu();
     const FILL: u32 = 0x0050_FA7B;
     const TRACK: u32 = 0x0044_4750;
     const BAND: u32 = 0x0030_3135;
@@ -335,15 +313,12 @@ fn chrome_rows_continue_their_edge_pixels_through_the_leftover_bands() {
     }
 }
 
-/// `ChromeBleed::first` reaches the presenters: a band below a strip row with
-/// no surface of its own (macOS's in-grid strip) continues only its own edge
-/// pixels; beside the strip row the leftover bands stay theme bg even where
-/// that row's edge pixel differs (a red cell at pad 0 here). GPU and CPU
-/// agree, so the shader's `chrome_y0` bound and `place_frame_bands`' range
-/// match.
+/// `ChromeBleed::first` reaches the presenters: beside a strip row with no surface of its own
+/// (macOS's in-grid strip) the leftover bands stay theme bg even where that row's edge pixel
+/// differs; GPU (`chrome_y0`) and CPU (`place_frame_bands`) agree.
 #[test]
 fn rows_above_the_chrome_start_keep_the_flat_leftover_band() {
-    let Some(mut gpu) = fresh_gpu() else { return };
+    let mut gpu = fresh_gpu();
     const BAND: u32 = 0x0030_3135;
     gpu.set_pad(0);
     gpu.set_chrome_bleed(Some(aterm_render::ChromeBleed {

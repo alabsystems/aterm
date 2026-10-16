@@ -193,6 +193,83 @@ a = 1
     );
 }
 
+/// A removal that leaves its table with no entries takes the bare header with
+/// it, and the walk climbs while each parent is bare too. A table that keeps an
+/// entry, or a comment of its own (above its header, on its header line, or
+/// kept from the removed line), stays.
+#[test]
+fn a_removal_prunes_the_tables_it_left_bare() {
+    fn pruned(text: &str, path: &[&str]) -> String {
+        let mut doc: DocumentMut = text.parse().expect("parse");
+        assert!(
+            doc.remove_path_pruning(path).is_some(),
+            "{path:?} in {text:?}"
+        );
+        doc.to_string()
+    }
+    assert_eq!(
+        pruned(
+            "font_px = 12.0\n\n[sparkle_words.feline]\nenabled = false\n",
+            &["sparkle_words", "feline", "enabled"]
+        ),
+        "font_px = 12.0\n"
+    );
+    assert_eq!(
+        pruned(
+            "[update]\nauto_apply = false\n[machine]\nx = 1\n",
+            &["update", "auto_apply"]
+        ),
+        "[machine]\nx = 1\n"
+    );
+    assert_eq!(pruned("a.b.c = 1\nd = 2\n", &["a", "b", "c"]), "d = 2\n");
+    assert_eq!(
+        pruned("rain = { on = true }\nx = 1\n", &["rain", "on"]),
+        "x = 1\n"
+    );
+    // A parent that still holds a table stops the walk.
+    assert_eq!(
+        pruned(
+            "[s.feline]\nenabled = false\n[s.profanity]\nenabled = false\n",
+            &["s", "feline", "enabled"]
+        ),
+        "[s.profanity]\nenabled = false\n"
+    );
+    // A header left holding only a sub-table prints no more, and comes back
+    // with the next line written under it.
+    let text = "x = 1\n\n[s]\nenabled = false\n\n[s.feline]\nenabled = false\n";
+    let mut doc: DocumentMut = text.parse().expect("parse");
+    assert!(doc.remove_path_pruning(&["s", "enabled"]).is_some());
+    assert_eq!(doc.to_string(), "x = 1\n\n[s.feline]\nenabled = false\n");
+    set_nested_ours(&mut doc, &["s", "enabled"], Item::Value(Value::from(false)));
+    assert_eq!(doc.to_string(), text);
+    assert_eq!(
+        pruned(
+            "# mine\n[s]\nenabled = false\n[s.feline]\nenabled = false\n",
+            &["s", "enabled"]
+        ),
+        "# mine\n[s]\n[s.feline]\nenabled = false\n",
+        "a commented header stays"
+    );
+    // Comments are the person's, so their tables stay.
+    for text in [
+        "# mine\n[rain]\non = true\n",
+        "[rain] # mine\non = true\n",
+        "[rain]\n# mine\non = true\n",
+    ] {
+        let out = pruned(text, &["rain", "on"]);
+        assert!(
+            out.contains("[rain]") && out.contains("# mine"),
+            "{text:?} -> {out:?}"
+        );
+    }
+    let out = pruned("rain = { on = true } # mine\n", &["rain", "on"]);
+    assert!(out.contains("# mine"), "{out:?}");
+    // Nothing removed, nothing pruned.
+    let mut doc: DocumentMut = "[rain]\n".parse().expect("parse");
+    assert!(doc.remove_path_pruning(&["rain", "on"]).is_none());
+    assert_eq!(doc.to_string(), "[rain]\n");
+}
+
 /// A leading byte-order mark is the file's, so it stays first whatever an edit
 /// removes or adds. The edits are Settings' Reset then Undo, which reads the
 /// reset file back before writing the key again, and the retired

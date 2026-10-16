@@ -14,18 +14,14 @@ use crate::grid::ResizePolicy;
 mod resize_conpty_tests;
 
 impl Terminal {
-    /// Resize the terminal.
+    /// Resize the terminal under [`ResizePolicy::Native`] (the grid is the frame, as
+    /// under a Unix PTY).
     ///
-    /// The primary screen reflows (soft-wrapped lines rewrap); the alt screen
-    /// does not (the app redraws after SIGWINCH). The inactive grid in
-    /// `alt_grid` uses its own mode, as in xterm, Alacritty and kitty.
-    ///
-    /// Dimensions are clamped by the grid to
+    /// The primary screen reflows (soft-wrapped lines rewrap); the alt screen does not
+    /// (the app redraws after SIGWINCH). The inactive grid keeps its own mode, as in
+    /// xterm, Alacritty and kitty. The grid clamps dimensions to
     /// `1..=`[`MAX_GRID_ROWS`](crate::grid::MAX_GRID_ROWS)`/`[`MAX_GRID_COLS`](crate::grid::MAX_GRID_COLS),
     /// so a hostile resize cannot request an arbitrarily large allocation.
-    ///
-    /// This is [`resize_with_policy`](Self::resize_with_policy) under
-    /// [`ResizePolicy::Native`]: the grid is the frame, as under a Unix PTY.
     pub fn resize(&mut self, rows: u16, cols: u16) {
         self.resize_with_policy(rows, cols, ResizePolicy::Native);
     }
@@ -38,10 +34,9 @@ impl Terminal {
     /// repaint or lines are lost or duplicated (see [`ResizePolicy`]). Both grids
     /// get the policy, since conhost repaints the alt screen the same way.
     pub fn resize_with_policy(&mut self, rows: u16, cols: u16, policy: ResizePolicy) {
-        // The resize journal's pre-resize facts (geometry, screen, open 2026
-        // frame), consumed by `finalize_resize` — see `resize_journal`.
+        // The resize journal's pre-resize facts, consumed by `finalize_resize`.
         let origin = self.resize_origin(policy);
-        // Captured BEFORE the resize: afterwards both grids carry the new width.
+        // Captured before the resize: afterwards both grids carry the new width.
         let cols_changed = self.grid.cols() != cols;
         // `finalize_resize` needs the shrink amount; the grid publishes only the
         // grow shift. Both grids are resized to the same `rows`.
@@ -55,15 +50,13 @@ impl Terminal {
         // Each saved cursor rides the resize of the grid it belongs to.
         self.lend_saved_cursors();
         if self.modes.alternate_screen {
-            // Alt screen active: don't reflow current grid (app-managed content).
-            // Saved primary grid should reflow normally.
+            // Alt active: the app redraws its grid; the saved primary reflows.
             self.grid.resize_no_reflow_with_policy(rows, cols, policy);
             if let Some(ref mut saved_primary) = self.alt_grid {
                 saved_primary.resize_with_policy(rows, cols, policy);
             }
         } else {
-            // Primary screen active: reflow current grid.
-            // Alt grid (if present) should not be reflowed.
+            // Primary active: it reflows; the alt grid does not.
             self.grid.resize_with_policy(rows, cols, policy);
             if let Some(ref mut alt) = self.alt_grid {
                 alt.resize_no_reflow_with_policy(rows, cols, policy);
@@ -113,15 +106,15 @@ impl Terminal {
         }
     }
 
-    /// Resize with the width-change rewrap of off-screen scrollback moved off
-    /// the caller's thread.
+    /// Resize with the width-change rewrap of off-screen scrollback moved off the
+    /// caller's thread.
     ///
-    /// The visible grids resize synchronously (bounded by the viewport), and the
-    /// tiered scrollback of the primary-content grid (the active primary, or the
-    /// saved primary while alt is up) is detached in O(1). The returned `Send`
-    /// job rewraps it via [`PendingScrollbackReflow::reflow`]; pass the result to
-    /// [`Terminal::finish_resize_offload`]. `None` when there is nothing to
-    /// offload (no width change or no tiered store): then this equals
+    /// The visible grids resize synchronously, and the tiered scrollback of the
+    /// primary-content grid (the active primary, or the saved primary while alt is up)
+    /// is detached in O(1). The returned `Send` job rewraps it via
+    /// [`PendingScrollbackReflow::reflow`](aterm_grid::PendingScrollbackReflow::reflow);
+    /// pass the result to [`Terminal::finish_resize_offload`]. `None` when there is
+    /// nothing to offload (no width change or no tiered store): then this equals
     /// [`Terminal::resize`].
     pub fn resize_offloading_scrollback(
         &mut self,
@@ -142,27 +135,25 @@ impl Terminal {
         cols: u16,
         policy: ResizePolicy,
     ) -> Option<aterm_grid::PendingScrollbackReflow> {
-        // Captured BEFORE the resize, as in `resize`.
+        // Captured before the resize, as in `resize_with_policy`.
         let origin = self.resize_origin(policy);
         let cols_changed = self.grid.cols() != cols;
         let rows_before = self.grid.rows();
-        // Same image pin as the synchronous path: the offloaded resize still
-        // rewraps the visible grid inline, which is where the placements live.
+        // The visible grid still rewraps inline, where the image placements live.
         if cols_changed {
             self.pin_image_rows_for_width_change(cols);
         }
-        // As in `resize_with_policy`; the re-attach lends them again for the
-        // deficit fill it runs.
+        // As in `resize_with_policy`; the re-attach lends the saved cursors again
+        // for its deficit fill.
         self.lend_saved_cursors();
         let pending = if self.modes.alternate_screen {
-            // Alt active: the alt grid is app-managed; the saved primary holds
-            // the scrollback that reflows.
+            // Alt active: the saved primary holds the scrollback that reflows.
             self.grid.resize_no_reflow_with_policy(rows, cols, policy);
             self.alt_grid.as_mut().and_then(|saved_primary| {
                 saved_primary.resize_offloading_scrollback_with_policy(rows, cols, policy)
             })
         } else {
-            // Primary active: current grid reflows (offloaded); alt is unreflowed.
+            // Primary active: it reflows (offloaded); the alt grid does not.
             let pending = self
                 .grid
                 .resize_offloading_scrollback_with_policy(rows, cols, policy);
@@ -177,15 +168,14 @@ impl Terminal {
     }
 
     /// Re-attach a scrollback store rewrapped off-thread by
-    /// [`resize_offloading_scrollback`](Self::resize_offloading_scrollback) onto
-    /// the primary-content grid. A no-op if that grid re-acquired a tiered store
-    /// meanwhile (see [`Grid::reattach_reflowed_scrollback`]).
+    /// [`resize_offloading_scrollback`](Self::resize_offloading_scrollback) onto the
+    /// primary-content grid. A no-op if that grid re-acquired a tiered store meanwhile
+    /// ([`Grid::reattach_reflowed_scrollback`](crate::grid::Grid::reattach_reflowed_scrollback)).
     ///
-    /// If the width changed while the reflow ran, the store is stale: it is
-    /// re-detached at the current width and returned. Drive that job like the
-    /// original and call this again (at most one extra pass per settled drag);
-    /// dropping it without [`Self::abort_resize_offload`] would wedge the detach
-    /// window.
+    /// If the width changed while the reflow ran, the store is stale: it is re-detached
+    /// at the current width and returned. Drive that job like the original and call this
+    /// again (at most one extra pass per settled drag); dropping it without
+    /// [`Self::abort_resize_offload`] wedges the detach window.
     #[must_use = "drive the returned convergence job and re-attach it (or abort), or the detach window wedges"]
     pub fn finish_resize_offload(
         &mut self,
@@ -208,8 +198,9 @@ impl Terminal {
 
     /// Abort an offloaded resize whose reflow will never re-attach (the worker
     /// panicked or died before [`finish_resize_offload`](Self::finish_resize_offload)),
-    /// returning the primary-content grid to a bounded state so the detach
-    /// window does not wedge it; see [`Grid::abort_reflow_offload`]. Idempotent.
+    /// returning the primary-content grid to a bounded state so the detach window
+    /// does not wedge it; see
+    /// [`Grid::abort_reflow_offload`](crate::grid::Grid::abort_reflow_offload). Idempotent.
     pub fn abort_resize_offload(&mut self) {
         let target = if self.modes.alternate_screen {
             self.alt_grid.as_mut()
@@ -225,7 +216,7 @@ impl Terminal {
     /// Attach or detach the off-thread compression worker on the
     /// primary-content grid (the one owning the tiered scrollback). While
     /// attached, ingest defers lazy-buffer draining to the worker, keeping
-    /// LZ4/zstd promotion off the PTY-drain path. See
+    /// LZ4 promotion off the PTY-drain path. See
     /// [`Grid::set_compress_offload_active`](aterm_grid::Grid::set_compress_offload_active).
     pub fn set_compress_offload_active(&mut self, active: bool) {
         let target = if self.modes.alternate_screen {
@@ -295,14 +286,10 @@ impl Terminal {
         // Journal first, from the active grid's row accounting (a separate record
         // from `take_last_resize_row_shift`, which selection custody drains).
         self.journal_resize(origin);
-        // Only a width change invalidates coordinates (rewrap renumbers rows). A
-        // rows-only resize keeps row identity, so it re-runs the existing range
-        // check with delta 0, the new live-bottom row count and the scrollback
-        // floor.
-        //
-        // The vi cursor gets the same relabel as the selection, resize undo
-        // included, and is clamped onto the new grid. A rewrap maps nothing, so
-        // a width change only clamps it.
+        // Only a width change invalidates coordinates (rewrap renumbers rows): the
+        // selections clear, and the vi cursor is only clamped since a rewrap maps
+        // nothing. A rows-only resize keeps row identity: the selection and vi
+        // cursor are relabelled by the row shift (resize undo included) and clamped.
         if cols_changed {
             // A width change never keeps a grid resize undo, so none is open.
             self.resize_undo_selection = None;
@@ -314,17 +301,12 @@ impl Terminal {
             self.parked_text_selection.clear();
             self.vi_shift(0);
         } else {
-            // A rows grow that revealed retained history moves every pre-resize
-            // row `revealed` rows down, as `Grid::resize_with_reflow_mode` does for
-            // the cursors; the selection lives on the Terminal, so it follows here.
-            // `adjust_for_scroll` subtracts its delta, so the move is `-revealed`.
-            // Read from the active grid; each grid records its own shift. Below the
-            // floor anchors clamp, which is only correct with this delta.
-            //
-            // A rows-only shrink is not a uniform delta: `adjust_row_count_rows_only`
-            // pushes the bottom `demoted` viewport rows into history while top rows
-            // stay, so scrollback anchors gain `demoted` lines above them.
-            // `adjust_for_rows_shrink` is that piecewise map (see its doc).
+            // A rows grow that revealed retained history moves every pre-resize row
+            // `revealed` rows down, as the grid does for its cursors;
+            // `adjust_for_scroll` subtracts its delta, hence `-revealed`. Below the
+            // floor anchors clamp, which is only correct with this delta. A rows-only
+            // shrink is not uniform: the bottom `demoted` viewport rows go to history
+            // while top rows stay, the piecewise map `adjust_for_rows_shrink` applies.
             let selection_before = self.text_selection.clone();
             let vi_before = self.vi_is_active().then(|| self.vi.cursor_point().line);
             let revealed = i32::from(self.grid.take_last_resize_row_shift());
@@ -332,9 +314,8 @@ impl Terminal {
             let demoted = i32::from(rows_before.saturating_sub(self.grid.rows()));
             let floor = i32::try_from(self.grid.scrollback_lines()).unwrap_or(i32::MAX);
             if demoted > 0 {
-                // `revealed` is the shrink's actual relabel distance (the demote
-                // count), not the height delta: trimming trailing blank rows moves
-                // nothing.
+                // Here `revealed` is the demote count, not the height delta:
+                // trimming trailing blank rows moves nothing.
                 self.text_selection
                     .adjust_for_rows_shrink(max_rows, revealed, floor);
                 self.vi_shift(revealed.saturating_neg());
@@ -343,16 +324,15 @@ impl Terminal {
                     .adjust_for_scroll(-revealed, max_rows, floor);
                 self.vi_shift(revealed);
             }
-            // Resize undo: the transform above clamps an anchor on a row the alt
-            // grid demoted, so the grow would land it a row low even though every
-            // cell came back. Keep the selection the first shrink found and put it
-            // back when the grid hands its undo back whole. Active screen only; the
-            // parked (main) selection's grid keeps history and opens no undo.
+            // Resize undo: the transform above clamps an anchor on a row the alt grid
+            // demoted, so the grow would land it a row low though every cell came
+            // back. Keep the selection the first shrink found and restore it when the
+            // grid hands its undo back whole. Active screen only: the parked main
+            // grid keeps history and opens no undo.
             self.follow_resize_undo_selection(selection_before, vi_before, undone);
-            // The parked selection gets the same treatment against the other grid,
-            // with that grid's floor (the active alt grid's `scrollback_lines()` is 0
-            // and would evict every scrollback anchor). `max_rows` and `demoted` are
-            // shared: both grids ran the same height change.
+            // The parked selection follows the other grid, with that grid's own shift
+            // and floor (the active alt grid's `scrollback_lines()` is 0 and would
+            // evict every scrollback anchor); both grids ran the same height change.
             if let Some(parked_grid) = self.alt_grid.as_mut() {
                 let parked_revealed = i32::from(parked_grid.take_last_resize_row_shift());
                 let parked_floor =
@@ -392,10 +372,24 @@ impl Terminal {
                 ch,
             );
         }
-        // INTEGRITY-SELFCHECK: resize/reflow is the other major grid mutation
-        // boundary. Debug builds only.
+        // Resize is a major grid mutation boundary: check structure (debug builds).
         #[cfg(debug_assertions)]
         self.grid.assert_structural_invariants();
+    }
+
+    /// Install the callback told about the FIRST palette set (OSC 4, numeric
+    /// OSC 21) the `allow_palette_reconfigure` gate refuses in this session.
+    /// It runs inside `process()` under the Terminal lock, at most once per
+    /// session (RIS does not re-arm it), so a host only records the fact.
+    pub fn set_palette_refused_callback<F: FnMut() + Send + 'static>(&mut self, callback: F) {
+        self.color.palette_refused_callback = Some(Box::new(callback));
+    }
+
+    /// Whether this session has refused a palette set (see
+    /// [`Self::set_palette_refused_callback`]).
+    #[must_use]
+    pub fn palette_set_refused(&self) -> bool {
+        self.color.palette_set_refused
     }
 
     /// Set bell callback.
@@ -404,11 +398,10 @@ impl Terminal {
     }
 
     /// Install the host resolver for Kitty non-direct transmission mediums
-    /// (`t=f`/`t=t`/`t=s`). The engine hands the host `(medium, path-or-name)`
-    /// and gets the image bytes or `None`. The host owns the I/O and the security
-    /// policy (whether to read files or shared memory at all, which paths, size
-    /// caps); with no resolver installed, non-direct mediums are skipped. The
-    /// engine stays pure and wasm-safe.
+    /// (`t=f`/`t=t`/`t=s`): it gets `(medium, path-or-name)` and returns the image
+    /// bytes or `None`. The host owns the I/O and its security policy (whether to
+    /// read at all, which paths, size caps), so the engine stays pure and wasm-safe;
+    /// with no resolver installed, non-direct mediums are skipped.
     pub fn set_kitty_file_resolver<F>(&mut self, resolver: F)
     where
         F: Fn(crate::terminal::kitty_graphics::KittyMedium, &str) -> Option<Vec<u8>>

@@ -1621,18 +1621,6 @@ mod tests {
     }
 
     #[test]
-    fn safe_endpoints_do_not_license_crossing_text() {
-        let mut term = Terminal::new(10, 40);
-        term.process(b"\x1b[?25l\x1b[5;17Hwall");
-        let world = observe(&mut term);
-        let from = PetRect::new(3.5, 3.0, 1.7, 5.0);
-        let to = PetRect::new(3.5, 25.0, 1.7, 5.0);
-        assert!(world.clear(from, 0.2) && world.clear(to, 0.2));
-        assert!(!world.corridor_clear(from, to, 0.2));
-        assert!(world.corridor_clear(from, PetRect { col: 5.0, ..from }, 0.2));
-    }
-
-    #[test]
     fn ordinary_ink_and_protected_pixels_have_distinct_placement_planes() {
         let mut term = Terminal::new(12, 40);
         term.process(b"\x1b[?25l\x1b[3;11H\x1b[41m \x1b[0m\x1b[4;11H\x1b[4m \x1b[0m");

@@ -16,7 +16,7 @@
 //!   winit's event callback. The vendored runner takes the handler out of a `Cell`
 //!   during dispatch and routes `RedrawRequested` unbuffered to `call_event_handler`,
 //!   which panics on re-entry
-//!   (`vendor/winit/src/platform_impl/windows/event_loop/runner.rs`), so the
+//!   (`crates/aterm-window/src/platform_impl/windows/event_loop/runner.rs`), so the
 //!   `WM_PAINT` after a popup would kill the app. (`drag_window()` is safe because
 //!   winit posts `WM_NCLBUTTONDOWN` and returns first; a popup at the pointer has no
 //!   equally cheap deferral point.)

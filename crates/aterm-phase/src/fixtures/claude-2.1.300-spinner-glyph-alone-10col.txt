@@ -1,0 +1,50 @@
+# claude-code 2.1.300 · MEASURED 2026-10-15, `aterm ctl text` of a private headless aterm (10x50, aterm 0.103.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, tools/real-claude-lab) · a running turn's spinner row wrapped with its glyph alone on its row: `·` over `Precipitat` over `ing…`, all at column 0
+
+ ▐▛███▛█
+▝▜██████▀
+ ▝▝   ▝▝
+
+
+❯ long
+  task
+
+·
+Precipitat
+ing…
+
+
+──────────
+❯
+──────────
+  ⏵⏵
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

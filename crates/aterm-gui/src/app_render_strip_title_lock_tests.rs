@@ -104,67 +104,50 @@ fn strip_titles_keep_stale_when_session_metadata_is_busy() {
     assert_eq!(titles, vec!["next title".to_string()]);
 }
 
-/// Per-frame Smart-Title composition is served from the coordinator's label
-/// cache: unchanged inputs perform zero compositions, and a title or
-/// description change recomposes exactly once.
+/// The per-frame label is served from the per-session presented-label cache:
+/// a clean title presents nothing at all, an unchanged title that needs the
+/// sanitizer is a cache hit, and a title change presents exactly once.
 #[test]
-fn strip_refill_serves_unchanged_labels_from_the_compose_cache() {
-    let mut app = App::headless_for_test();
+fn strip_refill_serves_unchanged_labels_from_the_label_cache() {
+    let app = App::headless_for_test();
     let wid = WindowId(0);
     let term = app.pool.get(0).expect("session 0").term.clone();
     term_lock(&term).process(b"\x1b]2;build shell\x07");
 
-    // No description + presentation-clean title: the fast path keeps the
-    // raw slot verbatim and composes nothing at all.
+    // A presentation-clean title: the fast path keeps the raw slot verbatim
+    // and presents nothing at all.
     let mut titles = Vec::new();
     app.refill_strip_titles(wid, &mut titles);
     assert_eq!(titles, vec!["build shell".to_string()]);
-    let fast = app.title_summaries.compose_runs();
+    let fast = app.chrome_labels.runs();
     app.refill_strip_titles(wid, &mut titles);
     assert_eq!(
-        app.title_summaries.compose_runs(),
+        app.chrome_labels.runs(),
         fast,
-        "a clean title with no description must not compose"
+        "a clean title must not be presented"
     );
 
-    // A live generated description forces real composition; unchanged
-    // inputs must then hit the per-session cache.
-    app.config.descriptive_titles = Some(true);
-    app.config.title_summary_provider = Some(crate::app_config::TitleSummaryProvider::Builtin);
-    app.note_title_activity(0);
-    app.title_summaries
-        .set_test_activity(0, "Compiling the release build");
+    // A title the sanitizer must see (a program's spinner glyph and a doubled
+    // space): presented once, then every unchanged frame is a cache hit.
+    term_lock(&term).process("\x1b]2;✳ build  shell\x07".as_bytes());
     app.refill_strip_titles(wid, &mut titles);
-    assert_eq!(
-        titles,
-        vec!["build shell · Compiling the release build".to_string()]
-    );
-    let warm = app.title_summaries.compose_runs();
+    assert_eq!(titles, vec!["✳ build shell".to_string()]);
+    let warm = app.chrome_labels.runs();
+    assert_eq!(warm, fast + 1);
     app.refill_strip_titles(wid, &mut titles);
     app.refill_strip_titles(wid, &mut titles);
+    assert_eq!(titles, vec!["✳ build shell".to_string()]);
     assert_eq!(
-        titles,
-        vec!["build shell · Compiling the release build".to_string()]
-    );
-    assert_eq!(
-        app.title_summaries.compose_runs(),
+        app.chrome_labels.runs(),
         warm,
-        "unchanged title+description frames must be cache hits"
+        "unchanged title frames must be cache hits"
     );
 
-    // A title change invalidates and recomposes exactly once...
-    term_lock(&term).process(b"\x1b]2;linker\x07");
+    // A title change presents exactly once.
+    term_lock(&term).process("\x1b]2;✳ linker\x07".as_bytes());
     app.refill_strip_titles(wid, &mut titles);
-    assert_eq!(
-        titles,
-        vec!["linker · Compiling the release build".to_string()]
-    );
-    assert_eq!(app.title_summaries.compose_runs(), warm + 1);
-    // ...and so does a description change.
-    app.title_summaries.set_test_activity(0, "Linking objects");
-    app.refill_strip_titles(wid, &mut titles);
-    assert_eq!(titles, vec!["linker · Linking objects".to_string()]);
-    assert_eq!(app.title_summaries.compose_runs(), warm + 2);
+    assert_eq!(titles, vec!["✳ linker".to_string()]);
+    assert_eq!(app.chrome_labels.runs(), warm + 1);
 }
 
 /// The native toolbar strip path ([`crate::App::tab_titles`], run by
@@ -188,7 +171,7 @@ fn tab_titles_keep_stale_on_contention_and_never_block() {
             vec!["hello".to_string()],
             "warm cache keeps the last-read title under contention"
         );
-        // Contended with a COLD cache: the presentation fallback, no block.
+        // Contended with a cold cache: the presentation fallback, no block.
         if let Some(ws) = app.windows.get_mut(&wid) {
             ws.tab_title_cache.clear();
         }

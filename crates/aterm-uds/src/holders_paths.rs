@@ -279,7 +279,7 @@ mod mac {
     /// `Err(Failed::Dead)` when it is a dead vnode ([`uses`] reads that as no
     /// working directory; the module docs say why).
     pub(super) fn cwd(pid: i32) -> Result<Option<PathBuf>, Failed> {
-        let mut buf = vec![0u8; ffi::VNODEPATHINFO_SIZE];
+        let mut buf = [0u8; ffi::VNODEPATHINFO_SIZE];
         let size = i32::try_from(buf.len()).map_err(|_| Failed::Other)?;
         clear_errno();
         // SAFETY: `buf` is exactly the structure this flavor fills.
@@ -303,7 +303,7 @@ mod mac {
 
     /// The executable of `pid`.
     pub(super) fn exe(pid: i32) -> Result<Option<PathBuf>, Failed> {
-        let mut buf = vec![0u8; ffi::PIDPATH_MAX];
+        let mut buf = [0u8; ffi::PIDPATH_MAX];
         let size = u32::try_from(buf.len()).map_err(|_| Failed::Other)?;
         clear_errno();
         // SAFETY: `buf` is `size` writable bytes; the call writes at most that.
@@ -326,7 +326,7 @@ mod mac {
 
     /// The path of `pid`'s vnode descriptor `fd`.
     fn fd_path(pid: i32, fd: i32) -> Result<Option<PathBuf>, Failed> {
-        let mut buf = vec![0u8; ffi::VNODE_PATH_SIZE];
+        let mut buf = [0u8; ffi::VNODE_PATH_SIZE];
         let size = i32::try_from(buf.len()).map_err(|_| Failed::Other)?;
         clear_errno();
         // SAFETY: `buf` is exactly the structure this flavor fills.
@@ -727,13 +727,12 @@ mod tests {
     /// so nothing it runs can open one again. SIGKILL it and reap it with
     /// [`reap`].
     ///
-    /// SPAWNED, NOT FORKED (2026-10-02). A raw `fork` of this multithreaded
-    /// test binary died before its first line of code now and then: libSystem's
-    /// atfork child handler (`_notify_fork_child`) met an `os_once` another
-    /// test's thread was inside at the fork, and aborted the child
+    /// SPAWNED, NOT FORKED. A raw `fork` of this multithreaded test binary
+    /// dies before its first line of code now and then: libSystem's atfork
+    /// child handler (`_notify_fork_child`) meets an `os_once` another test's
+    /// thread is inside at the fork, and aborts the child
     /// (`_os_once_gate_corruption_abort`, a SIGKILL and a crash report each
-    /// time) — `stopped, not exited: 0x9` in a merge gate, 2 of 40 whole-binary
-    /// runs here.
+    /// time) — `stopped, not exited: 0x9`, 2 of 40 whole-binary runs.
     #[cfg(target_vendor = "apple")]
     fn bare_child(cwd: &std::path::Path) -> (crate::spawnfd::Child, i32) {
         const WUNTRACED: i32 = 2;
@@ -1078,10 +1077,10 @@ mod tests {
 
     /// A PROCESS WITH NO DESCRIPTOR AT ALL IS READ, and holds nothing: libproc
     /// answers its empty table with 0 and no `errno` — an answer, not a
-    /// refusal. Measured 2026-10-01: a gate harness's process-group anchor (a
-    /// Python that `closerange`s every descriptor and waits, another
-    /// session's) read as unreadable, and its every appearance kept every gone
-    /// owner's build directory on the machine. Its working directory is still
+    /// refusal. A test harness's process-group anchor (a Python that
+    /// `closerange`s every descriptor and waits, another session's) once read as
+    /// unreadable, and its every appearance kept every gone owner's build
+    /// directory on the machine. Its working directory is still
     /// read: from inside the directory it is a user. NEGATIVE CONTROL: a table
     /// the kernel refuses (launchd's, read because it is named, whatever its
     /// uid) is still unreadable.

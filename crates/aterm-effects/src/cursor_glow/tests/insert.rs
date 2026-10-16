@@ -1,20 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Delivered inserts.
+//! Delivered inserts. A paste or drop reaches the seam as program output
+//! unless the host re-stamps it when the bytes land (enqueue is not
+//! delivery): the host's completed write arms `note_insert_delivered`, and
+//! the seam lays the echo as one sweep joining the cohort.
 
 use super::*;
 
-// -- The delivered insert -------------------------------------------------
-//
-// A paste or drop reaches the seam as program output unless the host
-// re-stamps it when the bytes land (enqueue is not delivery). The host's
-// completed write arms `note_insert_delivered`, the delivered-insert
-// licence, and the seam lays its echo as one sweep joining the cohort.
-
-/// The seam's two cells of a row `a` and `b` walk the same step — the
-/// hue-continuity oracle: a cell that joined the cohort takes the stop
-/// its column has in it; a cold restart re-anchors at red instead.
+/// The hue walk's step from lit cell `a` to lit cell `b` of `row`: the
+/// continuity oracle. A cell that joined the cohort takes the stop its
+/// column has in it; a cold restart re-anchors at red instead.
 fn walk_step(glow: &CursorGlow, row: u16, a: u16, b: u16) -> f32 {
     let at = |col: u16| {
         glow.v2
@@ -24,13 +20,11 @@ fn walk_step(glow: &CursorGlow, row: u16, a: u16, b: u16) -> f32 {
     at(b) - at(a)
 }
 
-/// The delivered insert, visible caret: three keys lay `2..5`; 400 ms of
-/// quiet (every stamp stale); the host reports an 11-cell insert
-/// delivered; the shell echoes it 20 ms later as one hop `5 → 16`. The
-/// hop is licensed under the insert class, the eleven cells are laid as
-/// one sweep joining the cohort (the walk steps by the same amount across
-/// `4 → 5` as across `3 → 4`), no momentum pulse and no cue are minted
-/// for it, and two keys typed after it continue the same walk.
+/// The delivered insert, visible caret: after every stamp has gone stale, an
+/// 11-cell insert echoed as one hop `5 → 16` is licensed under the insert class
+/// and laid as one sweep joining the cohort (the walk steps evenly across
+/// `4 → 5`). It mints no momentum pulse or cue, and keys typed after it
+/// continue the walk.
 #[test]
 fn a_delivered_insert_lays_its_span_as_one_sweep_under_a_visible_caret() {
     let g = geom();
@@ -115,10 +109,10 @@ fn a_delivered_insert_lays_its_span_as_one_sweep_under_a_visible_caret() {
 }
 
 /// The delivered insert, hidden caret (Claude Code's shape): the input
-/// row's print anchor advances 60 cells with the delivered stamp behind
-/// it, wider than `RAINBOW_TYPED_SWEEP_MAX`, so the bound is the insert's
-/// own width, not the typed coalesce cap. Licensed, laid `4..64`, the row
-/// is not branded, and the three typed echoes after it still anchor.
+/// row's print anchor advances 33 cells with the delivered stamp behind
+/// it, bounded by the insert's own width, not the typed coalesce cap.
+/// Licensed, laid `4..37`, the row is not branded, and the three typed
+/// echoes after it still anchor.
 #[test]
 fn a_delivered_insert_lights_a_hidden_caret_tui_at_its_print_anchor() {
     let g = geom();
@@ -137,7 +131,7 @@ fn a_delivered_insert_lights_a_hidden_caret_tui_at_its_print_anchor() {
     glow.observe_print_anchor(Some((11, 4, 3)));
     glow.tick(None, at(125), &c, g, &mut out);
     assert_eq!(glow.spawns(), 2, "phase-1 typed echoes must light");
-    // >250 ms quiet, then the drop: DELIVERED 33 cells wide (the test grid is 40
+    // >250 ms quiet, then the drop: delivered 33 cells wide (the test grid is 40
     // columns); the TUI echoes the path and the row's end advances 4 -> 37.
     glow.note_insert_delivered(at(420), InsertWidth::Cells(33));
     glow.observe_print_anchor(Some((11, 37, 4)));
@@ -177,16 +171,14 @@ fn a_delivered_insert_lights_a_hidden_caret_tui_at_its_print_anchor() {
     );
 }
 
-/// The placeholder rewrite: after the hidden-caret insert, the TUI swaps
-/// the path for `[Image #1] ` 300 ms later and the row's end pulls back
-/// 64 -> 15 with no key. The seam reads the keyless retreat inside the
-/// fresh insert span as the insert's own rewrite (`licensed
-/// licence=rewrite`): the cells at and right of the new caret retract
-/// farthest-first and are gone by `12·n + 240` ms plus the fade, the cells
-/// left of it keep their light under a live hand, and keys typed after it
-/// continue the same cohort. The visible-caret twin runs the same shape
-/// through `spawn`. Controls: a Backspace inside the span keeps its own
-/// class, and a keyless retreat with no insert span behind it declines and
+/// The placeholder rewrite: after the hidden-caret insert the TUI swaps the
+/// path for `[Image #1] ` and the row's end pulls back 37 -> 15 with no key.
+/// A keyless retreat inside the fresh insert span is the insert's own rewrite
+/// (`licence=rewrite`): the cells at and right of the new caret retract
+/// farthest-first (gone by `12·n + 240` ms plus the fade), the cells left of
+/// it keep their light, and keys after it continue the cohort. The visible-caret
+/// twin runs the same shape through `spawn`. Controls: a Backspace inside the
+/// span keeps its own class; a keyless retreat with no insert span declines and
 /// retires nothing.
 #[test]
 fn the_placeholder_rewrite_retracts_the_ribbon_to_the_new_caret_like_a_kill() {
@@ -299,7 +291,7 @@ fn the_placeholder_rewrite_retracts_the_ribbon_to_the_new_caret_like_a_kill() {
         "nothing right of the retyped run survives the rewrite: {lit:?}"
     );
 
-    // CONTROL 1: a Backspace inside the span is the erase's own retract,
+    // Control 1: a Backspace inside the span is the erase's own retract,
     // never a rewrite.
     let mut bs = CursorGlow::default();
     let mut bout = Vec::new();
@@ -316,7 +308,7 @@ fn the_placeholder_rewrite_retracts_the_ribbon_to_the_new_caret_like_a_kill() {
         last.line(at(808))
     );
 
-    // CONTROL 2: a keyless retreat with no insert span behind it is
+    // Control 2: a keyless retreat with no insert span behind it is
     // program output — declined, and it retires nothing.
     let mut cold = CursorGlow::default();
     let mut cout = Vec::new();
@@ -668,7 +660,7 @@ fn a_delivered_insert_survives_a_hidden_boundary_while_fresh_and_is_revoked_at_i
     );
 }
 
-/// An insert and a key delivered in ONE frame: the 12-cell hop is the
+/// An insert and a key delivered in one frame: the 12-cell hop is the
 /// 11-cell insert plus the key's own glyph. The surplus is paid from the
 /// press ring (one credit spent, its stamp consumed), all twelve cells
 /// are lit, and the same stamps cannot fund a 13-cell hop.
@@ -791,7 +783,7 @@ fn a_delivered_insert_mints_nothing_in_every_other_style() {
     }
 }
 
-/// A receipt that lands AFTER the frame that observed the echo (a
+/// A receipt that lands after the frame that observed the echo (a
 /// preempted writer thread) still lights the insert: the refused hop of
 /// exactly the insert's width is remembered for one delivery and laid
 /// when the stamp arrives — both lanes. A hop of another width is not

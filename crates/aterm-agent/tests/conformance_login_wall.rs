@@ -1,35 +1,49 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 for `HarnessLoginWall` (aterm-spec `harness_login_wall_model`): on
-//! every reachable state of the model, the real code (the screen reader
-//! `aterm_phase`, `upgrade::transcript_login`, `upgrade::rearmed` over
-//! `upgrade::notices_received`, `upgrade::clock_held`/`clock_held_until`,
-//! `upgrade::next_step`/`announce_asks`, and `decide_turn_end`) is handed what
-//! the state stands for and takes exactly the step the model's guards allow.
+//! Tier-1 for `HarnessLoginWall` (aterm-spec `harness_login_wall_model`): on every
+//! reachable state of the model, the real code (the screen reader `aterm_phase`,
+//! `upgrade::transcript_login`, `upgrade::rearmed` over `upgrade::notices_received`,
+//! `upgrade::clock_held`/`clock_held_until`, `upgrade::next_step`/`announce_asks`,
+//! and `decide_turn_end`) is handed what the state stands for and takes exactly the
+//! step the model's guards allow.
 //!
-//! A state stands for a screen (the `⏺ Login expired · Please run /login` row
-//! where `wall`, `Login interrupted` where dismissed, `Login successful` where
-//! `back`, else a turn that ended after real work), a transcript (the latest
-//! notice answered by the wall's `authentication_failed` row or by the model,
-//! the person's `/login`, the agent's READY, a turn the wall answered last)
-//! and clocks. The real facts are read back and checked against the state, and
-//! the supervisor types `/login` and continuations, and the upgrade announces,
-//! gives up, restarts and lets its window run out, exactly where `TypeLogin`,
-//! `Continue`, `Announce`, `GiveUp`, `Restart` and `Elapse` are enabled.
+//! A state stands for a screen (`Login expired` where `wall`, `Login interrupted`
+//! where dismissed, `Login successful` where `back`, else a turn that ended after
+//! real work), a transcript (the latest notice answered by the wall's
+//! `authentication_failed` row or by the model, the person's `/login`, the agent's
+//! READY, a turn the wall answered last) and clocks. The real facts are checked
+//! against the state, and the supervisor and the upgrade act exactly where
+//! `TypeLogin`, `Continue`, `Announce`, `GiveUp`, `Restart` and `Elapse` are enabled.
 //!
-//! Negative controls: the model with any one defect switched on (`Buggy`, and
-//! each knob) disagrees with the real code somewhere.
+//! A renewable login: a `rostered` state's readings carry the session's renewable
+//! login (`login_label`), and a `renewed` one the host's advice to move onto it.
+//! There the real decider never types `/login`; it waits, relaunches (`Relaunch`)
+//! and follows (`Follow`) exactly where the model does. The real exception asks
+//! for the renewal exactly where `AskRenew` is enabled, and the real
+//! `aterm harness accounts renew`, run through a recording host, checks the new
+//! login in its staging home alone, never the idle one it replaces, as the
+//! model's `Renew` does.
+//!
+//! Negative controls: the model with any one defect switched on (`Buggy`, and each
+//! knob) disagrees with the real code somewhere.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use aterm_agent::harness::align::Captured;
+use aterm_agent::harness::cli::{AccountsCmd, AccountsHost, Env, RenewBrowser, run_accounts};
 use aterm_agent::harness::upgrade::{
     self, Agent, Facts, GAVE_UP, MAX_ASKS, Phase, REASK_S, Step, Version,
 };
 use aterm_agent::supervise::SupervisorConfig;
+use aterm_agent::supervise::policy::exception::{Exception, RENEW_STEP, exception_for};
+use aterm_agent::supervise::policy::outlook::ExceptionKind;
 use aterm_agent::supervise::policy::turn_end::{
-    RULE_CONTINUE, RULE_LOGIN, TurnEndAction, TurnEndReading, TurnEndState, decide_turn_end,
+    AccountAdvice, AccountAt, RULE_CONTINUE, RULE_LOGIN, Restart, TurnEndAction, TurnEndReading,
+    TurnEndState, decide_turn_end,
 };
 use aterm_json::Value;
 use aterm_phase::prompt::fixtures::{LOGIN_EXPIRED, screen};
@@ -90,6 +104,9 @@ fn screen_of(s: &S) -> Vec<String> {
         with_tail(&[WALL_ROW, "", "❯ /login", "  ⎿  Login successful"])
     } else if s["track"] == 1 {
         with_tail(&[WALL_ROW, "", "❯ /login", "  ⎿  Login interrupted"])
+    } else if hidden(s) {
+        // A person's `/status` over the wall: its row gone, the login not.
+        with_tail(&[WALL_ROW, "", "❯ /status", "  ⎿  Status dialog dismissed"])
     } else {
         with_tail(&[
             "⏺ Stage done: the suites are green.",
@@ -101,8 +118,8 @@ fn screen_of(s: &S) -> Vec<String> {
 
 // ---------------------------------------------------------------- the transcript
 
-/// A transcript row as Claude Code 2.1.281 writes one, in the fields the
-/// readers take (the measured rows' shape: `upgrade_login_wall_tests.rs`).
+/// A transcript row as Claude Code 2.1.281 writes one, in the fields the readers
+/// take (the shape of `upgrade_login_wall_tests.rs`'s recorded rows).
 fn row(kind: &str, at: u64, body: &str) -> String {
     let stamp = aterm_agent::harness::usage::rfc3339_utc(i64::try_from(at).expect("at"));
     format!(
@@ -224,9 +241,8 @@ fn transcript_of(m: &Model, s: &S) -> (String, String) {
         _ => String::new(),
     };
     // A wall in the rows so far is history unless the state says it stands:
-    // lifted by the person's `/login` (`back`), or by a turn the model
-    // answered since. The person's `/login` lifts a wall — one of its own
-    // when the rows hold none.
+    // lifted by the person's `/login` (`back`; one of its own when the rows hold
+    // none), or by a turn the model answered since.
     let walled_before = rows.iter().any(|r| r.contains("authentication_failed"));
     let t = lifted_at(s);
     if s["back"] == 1 {
@@ -360,8 +376,8 @@ fn upgrade_action(step: &Step) -> Option<&'static str> {
     match step {
         Step::Announce => Some("Announce"),
         Step::GiveUp => Some("GiveUp"),
-        // A taskless conversation's restart without a notice (main's
-        // `Step::Fresh`) starts the new build all the same.
+        // A taskless conversation's restart without a notice (`Step::Fresh`)
+        // starts the new build all the same.
         Step::Terminate | Step::Fresh => Some("Restart"),
         // A stopped round's new one (`Step::Rearm`) is the never-strands
         // model's: no round here has rested `RETRY_S` (`Facts::failed_s` 0).
@@ -391,16 +407,46 @@ fn window_runs(m: &Model, s: &S) -> bool {
     )
 }
 
+/// A rostered login's wall with its row off the screen (a person's
+/// `/status`): the login gone, nothing typed at it.
+fn hidden(s: &S) -> bool {
+    s["rostered"] == 1 && s["wall"] == 0 && s["stood"] == 1 && s["track"] == 0 && s["back"] == 0
+}
+
 /// The reading of a real screen, `worked` the busy work since the last point.
 fn reading(rows: &[String], worked: Option<Duration>) -> TurnEndReading {
     let r = aterm_phase::read(Some("claude"), rows, Some(2));
     TurnEndReading::of(&r, rows, false, worked, None, None)
 }
 
-/// What the real supervisor decides at the point state `s` stands for: a
-/// fresh policy, or — where the state's lost-login track stands — the one
-/// that typed `/login` at the wall's first point.
-fn supervisor_at(s: &S) -> TurnEndAction {
+/// The renewable login a rostered state's session runs on.
+const LABEL: &str = "m7-a";
+
+/// `r` as the window's host hands it over for state `s`. On a rostered login:
+/// the session's renewable label and a host that relaunches; once renewed, the
+/// process on the superseded login and the advice to move onto the renewed one
+/// (what `accounts::advise` gives at a lost login or a turn end). Elsewhere `r`
+/// unchanged: no host keeps a roster for it.
+fn hosted(s: &S, renewed: bool, r: TurnEndReading) -> TurnEndReading {
+    if s["rostered"] == 0 {
+        return r;
+    }
+    TurnEndReading {
+        login_label: Some(LABEL.to_string()),
+        login_superseded: renewed,
+        restartable: true,
+        account: renewed.then(|| AccountAdvice::Move {
+            to: LABEL.to_string(),
+        }),
+        ..r
+    }
+}
+
+/// What the real supervisor decides at the point state `s` stands for, and the
+/// exception it raises there. Its policy is fresh, except where the state's
+/// lost-login track stands (it typed `/login` at the wall's first point) and
+/// where a rostered login's wall is hidden (it waited at the wall).
+fn supervisor_at(s: &S) -> (TurnEndAction, Option<Exception>) {
     let cfg = SupervisorConfig::default();
     let t0 = Instant::now() + Duration::from_secs(10 * 3600);
     let mut st = TurnEndState::default();
@@ -415,13 +461,23 @@ fn supervisor_at(s: &S) -> TurnEndAction {
         );
         st.acted(&a, &first, t0);
         None
+    } else if hidden(s) {
+        let first = hosted(s, false, reading(&with_tail(&[WALL_ROW]), long));
+        st.observe(&first, t0);
+        let a = decide_turn_end(&st, &first, &cfg, t0);
+        assert!(matches!(&a, TurnEndAction::WaitUntil { .. }), "{a:?}");
+        st.acted(&a, &first, t0);
+        None
     } else {
         long
     };
     let now = t0 + Duration::from_secs(60);
-    let r = reading(&screen_of(s), worked);
+    let r = hosted(s, s["renewed"] == 1, reading(&screen_of(s), worked));
     st.observe(&r, now);
-    decide_turn_end(&st, &r, &cfg, now)
+    (
+        decide_turn_end(&st, &r, &cfg, now),
+        exception_for(&st, &r, &cfg, now),
+    )
 }
 
 /// The model's action a real turn-end decision is.
@@ -429,21 +485,50 @@ fn supervisor_action(a: &TurnEndAction) -> Option<&'static str> {
     match a {
         TurnEndAction::TypeCommand { rule_id, .. } if *rule_id == RULE_LOGIN => Some("TypeLogin"),
         TurnEndAction::Type { rule_id, .. } if *rule_id == RULE_CONTINUE => Some("Continue"),
+        TurnEndAction::Restart {
+            why: Restart::Account { to, at },
+            ..
+        } if to == LABEL => Some(match at {
+            AccountAt::Wall => "Relaunch",
+            AccountAt::Ahead => "Follow",
+        }),
         _ => None,
     }
 }
 
-/// Whether the model `m` agrees at `s` with what the real code decided.
-fn agrees(m: &Model, s: &S, up: &Upgrade, sup: Option<&'static str>) -> bool {
+/// Whether the real exception at the point is the renewal's ask: the owner
+/// needed now to renew the login, not an escalation of the loop's.
+fn asks_renewal(e: Option<&Exception>) -> bool {
+    e.is_some_and(|e| {
+        e.kind == ExceptionKind::Login && !e.escalated && e.action.starts_with(RENEW_STEP)
+    })
+}
+
+/// Whether the model `m` agrees at `s` with what the real code decided: the
+/// upgrade, the supervisor, its exception, and, where the model's renewal is
+/// enabled, what the real renewal touched (`renew_clean`: no check under any
+/// login but its new one, the live login left as it was).
+fn agrees(
+    m: &Model,
+    s: &S,
+    up: &Upgrade,
+    (sup, ask): (Option<&'static str>, bool),
+    renew_clean: bool,
+) -> bool {
     let taken = upgrade_action(&up.step);
     let upgrade_ok = ["Announce", "GiveUp", "Restart"]
         .iter()
         .all(|a| m.action_enabled(a, s) == (taken == Some(*a)));
-    let supervisor_ok = ["TypeLogin", "Continue"]
+    let supervisor_ok = ["TypeLogin", "Continue", "Relaunch", "Follow"]
         .iter()
         .all(|a| m.action_enabled(a, s) == (sup == Some(*a)));
-    // The ask the notice goes as: the same ask again, and the bound reached,
-    // alike.
+    let ask_ok = m.action_enabled("AskRenew", s) == ask;
+    let renew_ok = !m.action_enabled("Renew", s) || {
+        let mut next = s.clone();
+        m.fire("Renew", &mut next)
+            && (next["login"] == s["login"] && next["checked"] == s["checked"]) == renew_clean
+    };
+    // The ask the notice goes as: the same ask again, and the bound reached.
     let asks_ok = taken != Some("Announce") || {
         let mut next = s.clone();
         let fired = m.fire("Announce", &mut next);
@@ -457,7 +542,121 @@ fn agrees(m: &Model, s: &S, up: &Upgrade, sup: Option<&'static str>) -> bool {
     };
     let clock_ok = !(s["phase"] == 1 && s["window"] == 0)
         || m.action_enabled("Elapse", s) == window_runs(m, s);
-    upgrade_ok && supervisor_ok && asks_ok && clock_ok
+    upgrade_ok && supervisor_ok && ask_ok && renew_ok && asks_ok && clock_ok
+}
+
+/// A host for the real renewal that records what it runs: its sign-in writes
+/// into the staging home the address it was hinted with (the row's: the browser
+/// held that account), its check answers that home's record, and an
+/// `auth status` under any other login is counted as a check under an idle
+/// login.
+#[derive(Default)]
+struct Recording {
+    flows: RefCell<Vec<String>>,
+    checked: RefCell<Vec<String>>,
+    idle_checks: RefCell<usize>,
+}
+
+impl AccountsHost for Recording {
+    fn stdin_is_terminal(&self) -> bool {
+        true
+    }
+    fn auth_status(&self, _login: &str) -> Result<Captured, String> {
+        *self.idle_checks.borrow_mut() += 1;
+        Err("an idle login is never asked".to_string())
+    }
+    fn unaskable(&self) -> Option<String> {
+        None
+    }
+    fn login(&self, _dir: Option<&str>) -> Result<i32, String> {
+        Err("no plain sign-in".to_string())
+    }
+    fn now(&self) -> i64 {
+        0
+    }
+    fn renew_flow(&self, home: &str, email: &str, _: &RenewBrowser) -> Result<i32, String> {
+        self.flows.borrow_mut().push(home.to_string());
+        std::fs::write(Path::new(home).join(".claude.json"), email).map_err(|e| e.to_string())?;
+        Ok(0)
+    }
+    fn status_in_home(&self, home: &str) -> Result<Captured, String> {
+        self.checked.borrow_mut().push(home.to_string());
+        let email = std::fs::read_to_string(Path::new(home).join(".claude.json"))
+            .map_err(|e| e.to_string())?;
+        Ok(Captured {
+            stdout: format!(
+                r#"{{"loggedIn":true,"authMethod":"claude.ai","email":"{email}","subscriptionType":"max"}}"#
+            )
+            .into_bytes(),
+            code: Some(0),
+        })
+    }
+}
+
+/// Runs the real `aterm harness accounts renew m7-a` once, over a temp machine
+/// whose roster lists that login with an email, and returns whether it was
+/// clean: one sign-in and one check, both in one new staging home under the
+/// logins directory, no `auth status` under any other login, and the row bound
+/// to that home.
+fn real_renewal_is_clean() -> bool {
+    let tmp = aterm_tempfile::Builder::new()
+        .prefix("aterm-conf-login-wall-renew-")
+        .tempdir()
+        .expect("temp dir");
+    let root = tmp.path();
+    std::fs::write(
+        root.join("accounts.toml"),
+        format!(
+            "[[account]]\nlabel = \"{LABEL}\"\nclass = \"dedicated\"\nemail = \"a@example.com\"\n"
+        ),
+    )
+    .expect("roster");
+    let env = Env {
+        state: root.join("state"),
+        aterm_state: None,
+        cwd: root.to_path_buf(),
+        home: Some(root.join("home")),
+        claude_dir: None,
+        claude_config_unusable: None,
+        claude_profile: None,
+        claude_custom_oauth: false,
+        claude_session: None,
+        claude_pid: None,
+        codex_thread: None,
+        codex_home: None,
+        now: 1_790_600_000,
+        sid: String::new(),
+        sock: None,
+        config: Some(root.join("aterm.toml")),
+        claude_tmp: None,
+        cells: None,
+        claude_running: None,
+    };
+    let host = Recording::default();
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let code = run_accounts(
+        &AccountsCmd::Renew {
+            labels: vec![LABEL.to_string()],
+            due: false,
+            on: None,
+        },
+        &env,
+        &host,
+        &mut out,
+        &mut err,
+    );
+    let staging: PathBuf = env.accounts_store().logins_dir().join(format!("{LABEL}+1"));
+    let staging = staging.to_string_lossy().into_owned();
+    let bound = env
+        .accounts_store()
+        .load_logins(env.now)
+        .ok()
+        .and_then(|(logins, _)| logins.get(LABEL).and_then(|b| b.dir.clone()));
+    format!("{code:?}") == format!("{:?}", std::process::ExitCode::SUCCESS)
+        && *host.flows.borrow() == [staging.clone()]
+        && *host.checked.borrow() == [staging.clone()]
+        && *host.idle_checks.borrow() == 0
+        && bound.as_deref() == Some(staging.as_str())
 }
 
 /// The model with one defect switched on.
@@ -465,9 +664,18 @@ fn defective() -> Vec<(&'static str, Model)> {
     let model = harness_login_wall_model();
     std::iter::once(("Buggy", aterm_spec::interp::with_buggy(&model, 1)))
         .chain(
-            ["NoGate", "NoRefund", "ClockAtWall", "NoSee", "NoHold"]
-                .into_iter()
-                .map(|knob| (knob, aterm_spec::interp::with_consts(&model, &[(knob, 1)]))),
+            [
+                "NoGate",
+                "NoRefund",
+                "ClockAtWall",
+                "NoSee",
+                "NoHold",
+                "TypeOnRoster",
+                "NoFollow",
+                "CheckIdle",
+            ]
+            .into_iter()
+            .map(|knob| (knob, aterm_spec::interp::with_consts(&model, &[(knob, 1)]))),
         )
         .collect()
 }
@@ -480,6 +688,11 @@ fn the_real_code_conforms_to_the_login_wall_model() {
     let defective = defective();
     let mut disagree: BTreeMap<&str, usize> = defective.iter().map(|(n, _)| (*n, 0)).collect();
     let mut taken = BTreeSet::new();
+    let renew_clean = real_renewal_is_clean();
+    assert!(
+        renew_clean,
+        "the real renewal checks its staging home alone"
+    );
     for s in &states {
         for inv in &model.invariants {
             assert!(model.check_invariant(inv.name, s), "{} at {s:?}", inv.name);
@@ -500,25 +713,44 @@ fn the_real_code_conforms_to_the_login_wall_model() {
                 "the notice's fate at {s:?}"
             );
         }
-        let sup = supervisor_action(&supervisor_at(s));
+        let (decided, exception) = supervisor_at(s);
+        let sup = supervisor_action(&decided);
+        let ask = asks_renewal(exception.as_ref());
         assert!(
-            agrees(&model, s, &up, sup),
-            "at {s:?}: the real upgrade took {:?} (asks {}, about {:?}), the supervisor {sup:?}",
+            agrees(&model, s, &up, (sup, ask), renew_clean),
+            "at {s:?}: the real upgrade took {:?} (asks {}, about {:?}), the supervisor \
+             {decided:?} ({sup:?}), its exception {exception:?}",
             up.step,
             up.asks,
             up.asked_about
         );
         taken.extend(upgrade_action(&up.step));
         taken.extend(sup);
+        if ask {
+            taken.insert("AskRenew");
+        }
+        if model.action_enabled("Renew", s) {
+            taken.insert("Renew");
+        }
         for (name, m) in &defective {
-            if !agrees(m, s, &up, sup) {
+            if !agrees(m, s, &up, (sup, ask), renew_clean) {
                 *disagree.get_mut(name).expect("a knob") += 1;
             }
         }
     }
     assert_eq!(
         taken,
-        BTreeSet::from(["Announce", "GiveUp", "Restart", "TypeLogin", "Continue"]),
+        BTreeSet::from([
+            "Announce",
+            "GiveUp",
+            "Restart",
+            "TypeLogin",
+            "Continue",
+            "Relaunch",
+            "Follow",
+            "AskRenew",
+            "Renew",
+        ]),
         "every decision of the real code is taken somewhere"
     );
     for (name, n) in &disagree {

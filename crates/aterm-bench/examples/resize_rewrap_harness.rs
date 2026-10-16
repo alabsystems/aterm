@@ -18,7 +18,7 @@
 //   converge      a second width change lands mid-flight; reports whether
 //                 the settled wrap width is stale (1) or the final width (0).
 //
-// The gate applies a baseline-relative floor to the rates and absolute caps
+// `verify perf` applies a baseline-relative floor to the rates and absolute caps
 // to the worst-ms values, so the caps hold even with no recorded baseline.
 //
 //   targo --unverified run --release -q -p aterm-bench --example resize_rewrap_harness

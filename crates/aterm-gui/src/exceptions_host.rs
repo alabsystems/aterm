@@ -84,6 +84,11 @@ const RESUME_SETTLE: Duration = Duration::from_secs(10 * 60);
 const DISK_NOTED: &str = "disk";
 const DISK_CLEANUP_OFF_NOTED: &str = "disk:cleanup-off";
 
+/// The `host_noted` marks of the usage tap's line ([`HostNote::UsageTap`]):
+/// one per tab whose tap stands silent, and the day it was last raised.
+const USAGE_TAP_NOTED: &str = "usage-tap:";
+const USAGE_TAP_DAY: &str = "usage-tap-day:";
+
 /// The instant this process first looked at its exceptions, and whether it has
 /// since ended the supervisor lines an earlier process left open that nothing
 /// has told of ([`App::sweep_adopted_supervisor_lines`]): once per process, at the
@@ -197,6 +202,7 @@ impl App {
             if now >= first + RESUME_SETTLE {
                 self.resume_swept = true;
                 self.hand_resume_exceptions();
+                self.sweep_resume_asks();
             }
         }
         if self.ripening.iter().all(|claim| claim.due > now) {
@@ -300,7 +306,7 @@ impl App {
             // Nothing was open, but the owner had put the fact away: its cause
             // has now ended, so the next time it returns it is news.
             aterm_log::info!("exceptions: {key} filed earlier; its cause has ended");
-            self.flush_messages_log();
+            self.flush_messages_log_within(crate::messages_host::MESSAGES_FLUSH_UI_WAIT);
         }
     }
 
@@ -505,9 +511,32 @@ impl App {
                 ));
             }
             HostNote::ResumeException { sid, standing } => {
+                // A `Now` that no escalation of the loop's carries (a lost
+                // login waited at with no account left) is the owner's ask on
+                // the glass while it stands; one the loop escalated (the old
+                // lost login's `/login` and its badge) is that escalation's,
+                // so nothing is said twice. A RENEWABLE login's (its step
+                // `accounts renew <label>`) is no tab's ask: every such tab
+                // is in the machine's one ([`Self::raise_renew_ask`]).
+                let unescalated = standing
+                    .as_ref()
+                    .filter(|exception| exception.when == Urgency::Now && !exception.escalated);
+                match unescalated.map(|exception| (renew_label(exception), exception)) {
+                    Some((Some(label), _)) => {
+                        self.end_resume_ask(&sid);
+                        self.raise_renew_ask(&sid, &label);
+                    }
+                    Some((None, exception)) => {
+                        self.end_renew_ask(&sid);
+                        self.raise_resume_ask(&sid, exception);
+                    }
+                    None => {
+                        self.end_resume_ask(&sid);
+                        self.end_renew_ask(&sid);
+                    }
+                }
                 match standing {
-                    // A lost login (`Now`) is the supervisor's own escalation;
-                    // only what can wait for the owner's next look is a line.
+                    // Only what can wait for the owner's next look is a line.
                     Some(exception) if exception.when == Urgency::Later => {
                         aterm_log::info!(
                             "harness @{sid}: needs a person ({}): {} => {}",
@@ -549,14 +578,60 @@ impl App {
             },
             HostNote::Relaunch { sid, said } => self.note_relaunch(&sid, said),
             HostNote::Accounts(said) => {
+                // A roster that lists rows speaks for Claude's login: the AI
+                // CLIs' lines then say nothing of Claude (`ai_screen`).
+                self.note_ai_accounts_listed(matches!(said, AccountsSaid::Listed { .. }));
                 // One fact at a time, the one whose action can be done: a
                 // refused roster names no account, so its line stands alone.
                 // Each end is said at every note, as every end here is.
-                let (refused, labels) = match said {
-                    AccountsSaid::Nothing => (false, Vec::new()),
-                    AccountsSaid::Refused => (true, Vec::new()),
-                    AccountsSaid::Listed { signed_out } => (false, signed_out),
+                let refused = said == AccountsSaid::Refused;
+                let (labels, credits, full, due, none_soon, wrong) = match said {
+                    AccountsSaid::Nothing | AccountsSaid::Refused => Default::default(),
+                    AccountsSaid::Listed {
+                        signed_out,
+                        credits,
+                        window_full,
+                        due,
+                        none_soon,
+                        wrong,
+                    } => (signed_out, credits, window_full, due, none_soon, wrong),
                 };
+                // The login lifecycle's lines and the account's usage
+                // (accounts v2 §5.4: credits in use, the day's line, and the
+                // week nearly used with no credits), each standing while its
+                // fact does; a roster that cannot be read says nothing of
+                // them, and what the owner filed of one holds.
+                let lines = [
+                    (
+                        message_reporters::ACCOUNTS_DUE_KEY,
+                        message_reporters::accounts_due_entry(&due),
+                    ),
+                    (
+                        message_reporters::ACCOUNTS_NONE_SOON_KEY,
+                        none_soon.then(message_reporters::accounts_none_soon_entry),
+                    ),
+                    (
+                        message_reporters::ACCOUNTS_WRONG_KEY,
+                        message_reporters::accounts_wrong_entry(&wrong),
+                    ),
+                    (
+                        message_reporters::ACCOUNTS_CREDITS_KEY,
+                        message_reporters::accounts_credits_entry(&credits),
+                    ),
+                    (
+                        message_reporters::ACCOUNTS_WINDOW_FULL_KEY,
+                        message_reporters::accounts_window_full_entry(&full),
+                    ),
+                ];
+                for (key, entry) in lines {
+                    match entry {
+                        Some(entry) => self.except(&entry),
+                        None if refused => {
+                            self.except_end(key);
+                        }
+                        None => self.except_clear(key),
+                    }
+                }
                 if refused {
                     self.except(&message_reporters::accounts_refused_entry());
                 } else {
@@ -598,10 +673,41 @@ impl App {
                 let place = self.upgrade_place(&sid);
                 self.record_message(message_reporters::supervisor_note(&sid, &place, &text));
             }
+            // ONE line for the machine while any tab's usage tap stands
+            // silent, raised at most once a calendar day (UTC): a fact worth
+            // a look later. Its end is said when the last tab is heard again
+            // or its worker ends.
+            HostNote::UsageTap { sid, silent } => {
+                let tab = format!("{USAGE_TAP_NOTED}{sid}");
+                if silent {
+                    self.host_noted.insert(tab);
+                    let day = aterm_time::unix_secs().map_or(0, |s| s / 86_400);
+                    let today = format!("{USAGE_TAP_DAY}{day}");
+                    if !self.host_noted.contains(&today) {
+                        self.host_noted
+                            .retain(|key| !key.starts_with(USAGE_TAP_DAY));
+                        self.host_noted.insert(today);
+                        self.except(&message_reporters::usage_tap_silent_entry());
+                    }
+                } else {
+                    self.host_noted.remove(&tab);
+                    if !self
+                        .host_noted
+                        .iter()
+                        .any(|key| key.starts_with(USAGE_TAP_NOTED))
+                    {
+                        self.except_clear(message_reporters::USAGE_TAP_SILENT_KEY);
+                    }
+                }
+            }
             HostNote::Warn { sid, text } => {
                 let place = self.upgrade_place(&sid);
                 self.post_message(message_reporters::supervisor_warning(&sid, &place, &text));
             }
+            // What a layout carries of the tab's agent moved (an in-app
+            // `/clear` followed on a quiet desk, LC-1): the crash journal
+            // captures again. Its wake already says so; this says why.
+            HostNote::AgentPublished { .. } => self.crash_journal.note_activity(),
             HostNote::UpgradeRuns { sid } => {
                 self.host_noted.remove(&format!("upgrade:{sid}"));
                 // Another tab's upgrade that cannot run keeps the one line.
@@ -697,6 +803,145 @@ impl App {
         );
     }
 
+    /// A tab's resume loop needs the owner NOW and nothing of the loop's says
+    /// so ([`message_reporters::resume_ask`]): its standing ask is posted —
+    /// the same words are a duplicate, new ones restate it in place — and
+    /// this process marks the tab as one it holds an ask for.
+    fn raise_resume_ask(
+        &mut self,
+        sid: &str,
+        exception: &aterm_agent::supervise::policy::exception::Exception,
+    ) {
+        if self.host_noted.insert(resume_asked_key(sid)) {
+            aterm_log::warn!(
+                "harness @{sid}: needs a person now ({}): {} => {}",
+                exception.kind.word(),
+                exception.why,
+                exception.action
+            );
+        }
+        let spot = self.upgrade_spot(sid);
+        self.post_message(message_reporters::resume_ask(sid, &spot, exception));
+    }
+
+    /// THE MACHINE'S ONE RENEW ASK ([`message_reporters::renew_ask`]): tab
+    /// `sid` stands stopped on the ended login `label`. Raised, or restated
+    /// with every tab so stopped and every label to renew, from the marks
+    /// [`RENEW_ASKED`] keeps one per tab. Said once in the log per tab.
+    fn raise_renew_ask(&mut self, sid: &str, label: &str) {
+        let mark = renew_asked_key(sid, label);
+        if !self.host_noted.contains(&mark) {
+            self.host_noted.retain(|m| {
+                m.strip_prefix(RENEW_ASKED)
+                    .is_none_or(|rest| !rest.starts_with(&format!("{sid}\u{1f}")))
+            });
+            self.host_noted.insert(mark);
+            aterm_log::warn!(
+                "harness @{sid}: needs a person now (login): its login {label} ended; renew it"
+            );
+        }
+        self.post_renew_ask();
+    }
+
+    /// Tab `sid` no longer stands stopped on an ended login: it leaves the
+    /// machine's ask, which is withdrawn, claiming no outcome, once no tab
+    /// is left in it.
+    fn end_renew_ask(&mut self, sid: &str) {
+        let before = self.host_noted.len();
+        self.host_noted.retain(|m| {
+            m.strip_prefix(RENEW_ASKED)
+                .is_none_or(|rest| !rest.starts_with(&format!("{sid}\u{1f}")))
+        });
+        if self.host_noted.len() != before {
+            self.post_renew_ask();
+        }
+    }
+
+    /// The machine's renew ask as the marks now have it: posted (restated in
+    /// place, its key one per machine), or withdrawn with no tab left.
+    fn post_renew_ask(&mut self) {
+        let held: Vec<(String, String)> = self
+            .host_noted
+            .iter()
+            .filter_map(|mark| mark.strip_prefix(RENEW_ASKED)?.split_once('\u{1f}'))
+            .map(|(sid, label)| (sid.to_string(), label.to_string()))
+            .collect();
+        if held.is_empty() {
+            if let Some(id) = self
+                .messages
+                .live_by_key(message_reporters::RENEW_ASK_KEY)
+                .map(|row| row.id)
+            {
+                let _ = self.withdraw_message(id);
+            }
+            return;
+        }
+        let mut labels: Vec<String> = held.iter().map(|(_, label)| label.clone()).collect();
+        labels.sort();
+        labels.dedup();
+        let places: Vec<String> = held
+            .iter()
+            .map(|(sid, _)| self.upgrade_spot(sid).place)
+            .collect();
+        self.post_message(message_reporters::renew_ask(&labels, &places));
+    }
+
+    /// The tab's ask is over (the loop's point no longer holds it, or the loop
+    /// ended): its row is withdrawn, claiming no outcome — the loop says the
+    /// point moved on, not that the owner's step was taken.
+    fn end_resume_ask(&mut self, sid: &str) {
+        self.host_noted.remove(&resume_asked_key(sid));
+        let key = message_reporters::resume_ask_key(sid);
+        if let Some(id) = self.messages.live_by_key(&key).map(|row| row.id) {
+            let _ = self.withdraw_message(id);
+        }
+    }
+
+    /// The asks an earlier process carried here that no loop of this one
+    /// tells of: withdrawn at the resume family's settle, once every loop has
+    /// had its first point ([`RESUME_SETTLE`]), as the digest's lines end then.
+    fn sweep_resume_asks(&mut self) {
+        let held: std::collections::BTreeSet<String> = self
+            .host_noted
+            .iter()
+            .filter_map(|mark| mark.strip_prefix(RESUME_ASKED))
+            .map(message_reporters::resume_ask_key)
+            .collect();
+        let prefix = format!("{}.", message_reporters::RESUME_ASK_KEY);
+        let left: Vec<aterm_messages::MessageId> = self
+            .messages
+            .live_rows()
+            .filter(|row| {
+                row.msg
+                    .key
+                    .as_deref()
+                    .is_some_and(|key| key.starts_with(&prefix) && !held.contains(key))
+            })
+            .map(|row| row.id)
+            .collect();
+        for id in left {
+            let _ = self.withdraw_message(id);
+        }
+        // The machine's renew ask an earlier process left, with no tab of
+        // this one's in it.
+        if !self.host_noted.iter().any(|m| m.starts_with(RENEW_ASKED))
+            && let Some(id) = self
+                .messages
+                .live_by_key(message_reporters::RENEW_ASK_KEY)
+                .map(|row| row.id)
+        {
+            let _ = self.withdraw_message(id);
+        }
+    }
+
+    /// A session refused a program's palette set under
+    /// `allow_palette_reconfigure = false` (the engine tells only a session's
+    /// first): one digest line for every tab, never an on-screen alert. Posting
+    /// it again is a duplicate, and a line the owner dismissed stays filed.
+    pub(crate) fn note_palette_refused(&mut self) {
+        self.except(&message_reporters::palette_refused_entry());
+    }
+
     /// The repaint nudge gave up on `session`'s render epoch (`render.<tab>.
     /// unrepaired`, an EVENT of [`Family::Render`]): the tab may be drawn one row
     /// off, and dragging the window edge one row and back is the owner's. One
@@ -782,6 +1027,28 @@ impl App {
     /// cannot be true and nobody can act on it, so they end (the worker of a
     /// closed tab has no later word to end them).
     pub(crate) fn end_relaunch_lines_of_closed_tabs(&mut self) {
+        // Every loop turn comes here (`ripen_exceptions`), and the live tabs'
+        // keys cost a string per tab: they are computed only while there is a
+        // relaunch line, claim or told mark to judge, which is almost never.
+        let mut keys: Vec<String> = self
+            .messages
+            .digest_keys_under(&Family::Supervisor.prefix())
+            .into_iter()
+            .filter(|key| is_relaunch_key(key))
+            .collect();
+        keys.extend(
+            self.ripening
+                .iter()
+                .filter(|claim| is_relaunch_key(&claim.key))
+                .map(|claim| claim.key.clone()),
+        );
+        let told = self
+            .host_noted
+            .iter()
+            .any(|noted| noted.starts_with("relaunch:"));
+        if keys.is_empty() && !told {
+            return;
+        }
         // Whether a line's tab is still there is decided by computing the keys
         // of the tabs that ARE there, never by reading an id back out of a key:
         // a key shortens a subject that does not fit its cap (a real session id
@@ -791,14 +1058,10 @@ impl App {
             .iter()
             .flat_map(|sid| message_reporters::relaunch_keys(sid))
             .collect();
-        let mut keys = self
-            .messages
-            .digest_keys_under(&Family::Supervisor.prefix());
-        keys.extend(self.ripening.iter().map(|claim| claim.key.clone()));
         keys.sort();
         keys.dedup();
         for key in keys {
-            if is_relaunch_key(&key) && !live_keys.contains(&key) {
+            if !live_keys.contains(&key) {
                 self.except_clear(&key);
             }
         }
@@ -888,12 +1151,12 @@ impl App {
 
     /// The owner's `Dismiss all` (the menu-bar item, Settings, `notice dismiss
     /// review`): every open entry is filed `Dismissed` at one stamp. The log
-    /// is flushed before this returns, so a dismissal cannot die with the
-    /// process. Returns how many were filed.
+    /// is flushed before this returns (bounded), so a dismissal cannot die
+    /// with the process. Returns how many were filed.
     pub(crate) fn dismiss_exceptions(&mut self) -> usize {
         let filed = self.messages.file_digest(wall_stamp_now(), Instant::now());
         if filed > 0 {
-            self.flush_messages_log();
+            self.flush_messages_log_within(crate::messages_host::MESSAGES_FLUSH_UI_WAIT);
             self.digest_moved();
         }
         filed
@@ -909,7 +1172,7 @@ impl App {
             .messages
             .file_digest_one(id, wall_stamp_now(), Instant::now());
         if filed {
-            self.flush_messages_log();
+            self.flush_messages_log_within(crate::messages_host::MESSAGES_FLUSH_UI_WAIT);
             self.digest_moved();
         }
         filed
@@ -920,7 +1183,8 @@ impl App {
     /// fault has changed: a level family restates at every look) when its
     /// words fail the rule: an owner is never shown words the rule refuses,
     /// and the roster test
-    /// (`host_exceptions_tests::every_host_entry_passes_the_door_and_the_caps`) fails in the gate first.
+    /// (`host_exceptions_tests::every_host_entry_passes_the_door_and_the_caps`)
+    /// fails in a test run first.
     fn checked_entry(&mut self, entry: &Entry) -> Option<Message> {
         let key = entry.key();
         match entry.message() {
@@ -1011,6 +1275,40 @@ fn relaunch_told_key(sid: &str) -> String {
     format!("relaunch:{sid}")
 }
 
+/// The stem of [`resume_asked_key`].
+const RESUME_ASKED: &str = "resume-ask:";
+
+/// The `host_noted` key that says THIS process holds a tab's resume ask
+/// ([`App::raise_resume_ask`]).
+fn resume_asked_key(sid: &str) -> String {
+    format!("{RESUME_ASKED}{sid}")
+}
+
+/// The stem of a tab's mark in the machine's renew ask (`host_noted`).
+const RENEW_ASKED: &str = "renew-ask:";
+
+/// Tab `sid`'s mark in the machine's renew ask, stopped on `label`'s ended
+/// login: the two split by a unit separator, which neither holds.
+fn renew_asked_key(sid: &str, label: &str) -> String {
+    format!("{RENEW_ASKED}{sid}\u{1f}{label}")
+}
+
+/// The label a renewable login's exception asks to renew: its step is
+/// `aterm_agent::supervise::policy::exception::RENEW_STEP` and a label.
+/// `None` for any other exception's step.
+fn renew_label(exception: &aterm_agent::supervise::policy::exception::Exception) -> Option<String> {
+    use aterm_agent::supervise::policy::outlook::ExceptionKind;
+    if exception.kind != ExceptionKind::Login {
+        return None;
+    }
+    exception
+        .action
+        .strip_prefix(aterm_agent::supervise::policy::exception::RENEW_STEP)?
+        .strip_suffix('.')
+        .filter(|label| aterm_agent::harness::accounts::admissible_label(label))
+        .map(str::to_string)
+}
+
 /// Whether `key` is a `harness.supervisor.<subject>.not-back|gone` key: a
 /// tab's relaunch line. Its subject may be a shortened form of the session id,
 /// so it names no tab; compare it with `message_reporters::relaunch_keys`.
@@ -1044,6 +1342,26 @@ mod tests {
 
     fn full_disk_access() -> Entry {
         crate::message_reporters::file_access_entry(&crate::consent_card::NeedWords::sample())
+    }
+
+    /// LC-1 (ATERM-KI-1015-1): THE HOST'S WORD THAT WHAT A RESTORE CARRIES OF
+    /// A TAB'S AGENT MOVED OWES THE CRASH JOURNAL A CAPTURE — its conversation
+    /// followed on a desk that draws nothing more, the image a crash leaves
+    /// names it — and says nothing. NEGATIVE CONTROL: another note owes none.
+    #[test]
+    fn an_agent_publication_owes_the_crash_journal_a_capture() {
+        let mut app = App::headless_for_test();
+        let _ = app.crash_journal.take_dirty();
+        app.note_harness_host(crate::harness_host::HostNote::SupervisorSteady {
+            sid: "s-x".to_string(),
+        });
+        assert!(!app.crash_journal.take_dirty(), "another note owes none");
+        let said = app.messages.digest().len();
+        app.note_harness_host(crate::harness_host::HostNote::AgentPublished {
+            sid: "s-x".to_string(),
+        });
+        assert!(app.crash_journal.take_dirty(), "a capture owed");
+        assert_eq!(app.messages.digest().len(), said, "nothing said");
     }
 
     /// THE DIGEST COSTS THE TERMINAL NOTHING (the Row Law, clause 1): post,
@@ -1081,6 +1399,27 @@ mod tests {
             app.message_band_rows, rows,
             "the pane's chrome rows never moved"
         );
+    }
+
+    /// A DISMISS CLICK NEVER WAITS ON A WRITER THAT DOES NOT ANSWER: the
+    /// record's flush is bounded (law L5), so with the messages log's thread
+    /// wedged the owner's `Dismiss all` and the per-entry `Dismiss` still
+    /// file and return. Unbounded, either waited forever on the UI thread.
+    #[test]
+    fn a_dismissal_returns_though_the_log_writer_never_answers() {
+        let mut app = App::headless_for_test();
+        let dir = aterm_tempfile::tempdir().expect("a temp dir");
+        let (writer, _thread) =
+            crate::messages_store::Writer::stalled(&dir.path().join("messages.log"));
+        app.messages_log = Some(writer);
+        app.except_replace(Family::Upgrade, &[tab_one()]);
+        app.sync_messages();
+        let id = app.messages.digest().entries[0].id;
+        assert!(app.dismiss_exception(id), "filed, the writer wedged");
+        app.except(&full_disk_access());
+        app.sync_messages();
+        assert_eq!(app.dismiss_exceptions(), 1, "filed, the writer wedged");
+        assert!(app.messages.digest().is_empty());
     }
 
     /// A SCRIPT'S DISMISSAL MOVES THE SURFACES (`aterm ctl notice dismiss review`
@@ -1183,7 +1522,7 @@ mod tests {
 
     /// A reporter that words an entry against the rule shows the owner nothing:
     /// the entry is recorded in `aterm.log`, not posted (the roster test fails
-    /// in the gate first).
+    /// in a test run first).
     #[test]
     fn an_entry_that_breaks_the_rule_is_never_shown() {
         let mut app = App::headless_for_test();

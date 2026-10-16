@@ -1,24 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A self-contained X11 clipboard (CLIPBOARD + PRIMARY) over the pure-Rust
-//! x11rb connection, with no helper binary (`xclip`/`xsel`) and no extra crate
-//! (x11rb is already a winit dependency). The Linux/X11 counterpart of the
-//! in-process NSPasteboard path on macOS.
+//! A self-contained X11 clipboard (CLIPBOARD + PRIMARY) over the pure-Rust x11rb connection
+//! (already a winit dependency), with no helper binary (`xclip`/`xsel`).
 //!
-//! X11 has no "set and forget" clipboard: the copying client must own the
-//! selection and answer `SelectionRequest` conversions for as long as the data
-//! should stay pasteable. One background thread owns an X connection and an
-//! unmapped 1×1 window, takes selection ownership on
-//! [`set`](X11Clipboard::set) and serves conversions from its event loop.
-//! [`get`](X11Clipboard::get) returns our stored text when we still own the
-//! selection, or asks the current owner via `ConvertSelection` and waits
+//! X11 has no "set and forget" clipboard: the copying client must own the selection and answer
+//! `SelectionRequest` conversions for as long as the data should stay pasteable. One background
+//! thread owns an X connection and an unmapped 1×1 window, takes ownership on
+//! [`set`](X11Clipboard::set) and serves conversions. [`get`](X11Clipboard::get) returns our
+//! stored text when we own the selection, or asks the owner via `ConvertSelection` and waits
 //! briefly for the reply.
 //!
-//! Scope: UTF-8 text. Serving is single-shot (no INCR), which covers ordinary
-//! terminal copies; pasting also accepts INCR transfers. Without `$DISPLAY`
-//! (pure Wayland) [`X11Clipboard::get_handle`] returns `None` and the caller
-//! degrades gracefully.
+//! Scope: UTF-8 text. Serving is single-shot (no INCR), which covers ordinary terminal copies;
+//! pasting also accepts INCR. Without `$DISPLAY` [`X11Clipboard::get_handle`] returns `None`.
 
 use std::sync::mpsc::{Sender, channel};
 use std::sync::{Mutex, OnceLock};
@@ -498,11 +492,9 @@ fn read_incr(inner: &Inner, property: Atom) -> Option<String> {
 mod tests {
     use super::*;
 
-    /// Cross-client round trip: two independent `X11Clipboard` handles (each its
-    /// own connection and owner window); `a` copies and `b` pastes through the
-    /// full `SetSelectionOwner` → `ConvertSelection` → `SelectionRequest` /
-    /// `SelectionNotify` protocol, as another app would. Skipped without an X
-    /// display.
+    /// Cross-client round trip: two handles (each its own connection and owner window); `a`
+    /// copies and `b` pastes through the full selection protocol, as another app would. Skipped
+    /// without an X display.
     #[test]
     fn cross_client_clipboard_round_trip() {
         // Private per-process selection names keep a real clipboard manager from

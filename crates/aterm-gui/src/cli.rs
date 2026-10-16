@@ -1,14 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! CLI argument parsing for `aterm-gui`. Pure, no `App` coupling: parses
-//! `aterm-gui [OPTIONS] [-e CMD ARGS… | --help | --version]`. A launch flag is
-//! recorded — the render/font flags (`--cpu`/`--gpu`, `--font`, `--font-px`,
-//! `--scale`) in [`crate::launch`], the rest in [`LaunchFlags`], process state the
-//! rest of the window reads — and never exported: no environment variable changes
-//! what a shipped aterm does (owner, 2026-09-22: "NOT ENV VARS those are for
-//! development"), so the flag is the one spelling and a child process inherits
-//! nothing from it.
+//! CLI argument parsing for `aterm-gui`, with no `App` coupling. A launch flag is recorded — the
+//! render/font flags (`--cpu`/`--gpu`, `--font`, `--font-px`, `--scale`) in [`crate::launch`],
+//! the rest in [`LaunchFlags`] — and never exported: no environment variable changes what a
+//! shipped aterm does, so a child process inherits nothing from a flag.
 
 use std::sync::RwLock;
 
@@ -21,30 +17,21 @@ pub(crate) struct Cli {
     pub(crate) exec_command: Option<Vec<std::ffi::OsString>>,
     pub(crate) cwd: Option<String>,
     pub(crate) hold: bool,
-    /// `--headless`: no window is ever created — engine + PTY + control socket
-    /// only — and on macOS no application object either (winit's display-free
-    /// loop: no Dock tile, never the front app, no WindowServer connection;
-    /// `main_entry` in `lib.rs`), so a harness may boot one beside a human who is
-    /// typing. The flag is the one spelling; an update successor inherits it with
-    /// the rest of argv.
+    /// `--headless`: no window — engine + PTY + control socket only — and on macOS no
+    /// application object either (no Dock tile, never the front app, no WindowServer connection;
+    /// `main_entry` in `lib.rs`), so a harness may boot one beside a person who is typing. An
+    /// update successor inherits it with the rest of argv.
     pub(crate) headless: bool,
-    /// `--lifeline-fd <n>` (headless only): the descriptor whose end-of-file
-    /// means the process that started this instance is gone, so it shuts down
-    /// ([`crate::lifeline`]). `None` — every launch that does not pass the flag —
-    /// changes nothing.
+    /// `--lifeline-fd <n>` (headless only): the descriptor whose end-of-file means the process
+    /// that started this instance is gone, so it shuts down ([`crate::lifeline`]).
     pub(crate) lifeline_fd: Option<i32>,
     /// The render/font flags, for `main` to [`crate::launch::install`].
     pub(crate) launch: crate::launch::Launch,
 }
 
-/// THE LAUNCH FLAGS — what this process's command line asked of it, recorded by
-/// [`parse_cli`] before any thread exists and read wherever the window needs it
-/// (the socket plan, the initial grid, the shell, the containment funnel).
-///
-/// They used to be ENVIRONMENT variables the parser wrote back (`--columns` set
-/// `$ATERM_COLUMNS`, and every `ATERM_*` spelling worked on its own), so an export
-/// in a shell rc changed what a shipped window did, and a flag leaked into every
-/// child that did not strip it. A flag now lives here and nowhere else.
+/// The launch flags: what this process's command line asked of it, recorded by [`parse_cli`]
+/// before any thread exists and read wherever the window needs it (the socket plan, the initial
+/// grid, the shell, the containment funnel).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct LaunchFlags {
     /// `--columns <n>` (20..=500, validated on the way in).
@@ -80,8 +67,8 @@ impl LaunchFlags {
         verbose: false,
     };
 
-    /// The control-socket directive these flags ask for — the SAME decision a
-    /// client makes about a socket path ([`aterm_types::control_socket::socket_directive`]).
+    /// The control-socket directive these flags ask for: the same decision a client makes about a
+    /// socket path ([`aterm_types::control_socket::socket_directive`]).
     pub(crate) fn socket_directive(&self) -> aterm_types::control_socket::SocketDirective {
         aterm_types::control_socket::socket_directive(
             self.control_sock.as_deref(),
@@ -111,13 +98,9 @@ fn set_launch_flag(set: impl FnOnce(&mut LaunchFlags)) {
     set(&mut flags);
 }
 
-/// The `--help` text. A clean OPTIONS section where every user-facing flag shows
-/// its argument, a one-line description, AND its `[config: key]` equivalent where
-/// it has one — the discoverable surface an AI (or human) reads to drive aterm
-/// without source-diving. Kept in constants printed only by the `--help` arm, so a
-/// no-arg / Finder launch never touches them. There is no ENVIRONMENT section: no
-/// variable changes what a shipped aterm does, so precedence is flag > config >
-/// default.
+/// The `--help` text: every user-facing flag with its argument, a one-line description and its
+/// `[config: key]` where it has one. There is no ENVIRONMENT section: no variable changes what a
+/// shipped aterm does, so precedence is flag > config > default.
 const HELP_TITLE: &str = "aterm-gui — a fast, hardened terminal\n";
 const HELP_HEAD: &str = concat!(
     "\n",
@@ -197,10 +180,9 @@ const HELP_HEAD: &str = concat!(
     "    -V, --version                  Print the version and exit.\n\n",
 );
 
-/// The keyboard-shortcut help, PER PLATFORM: macOS shows the hardcoded Cmd-* chords;
-/// every other platform shows the Ctrl+Shift defaults seeded by
-/// [`crate::keybinding::Keybindings::platform_defaults`] (there is no Cmd key, and
-/// the Super key is grabbed by the desktop environment).
+/// The macOS keyboard-shortcut help: the common Cmd-* chords. Other platforms list the
+/// Ctrl+Shift defaults seeded by [`crate::keybinding::Keybindings::platform_defaults`] (no Cmd
+/// key there, and the desktop grabs Super).
 #[cfg(target_os = "macos")]
 const KEYS_HELP: &str = concat!(
     "KEYS (in the window):\n",
@@ -223,15 +205,10 @@ const KEYS_HELP: &str = concat!(
     "    more) with their live chords.\n\n",
 );
 
-/// See [`KEYS_HELP`] (macOS) — the non-macOS KEYS section, GENERATED from
-/// [`crate::keybinding::Keybindings::PLATFORM_DEFAULT_PAIRS`], the same const
-/// `platform_defaults()` seeds, so this help can never drift from what the
-/// window actually does. (It used to: the hand-written list it replaces had
-/// fallen behind the table — no palette, no splits, no prompt jumps, none of
-/// the plain-Ctrl paste trio — and was headed "Linux has no menu bar" on
-/// Windows.) Chords are grouped per action in table order, so paste's three
-/// spellings read as one row; the chord strings are printed VERBATIM because
-/// they are exactly what a `[keybindings]` override key must say.
+/// The non-macOS KEYS section, generated from
+/// [`crate::keybinding::Keybindings::PLATFORM_DEFAULT_PAIRS`] (the table `platform_defaults()`
+/// seeds) so it cannot drift from the window. Chords are grouped per action in table order and
+/// printed verbatim: they are exactly what a `[keybindings]` override key says.
 #[cfg(not(target_os = "macos"))]
 fn keys_help() -> String {
     let mut groups: Vec<(&str, Vec<&str>)> = Vec::new();
@@ -263,9 +240,7 @@ fn keys_help() -> String {
     s
 }
 
-/// The macOS KEYS section: the hardcoded Cmd-* chords, hand-written above —
-/// there is no seed table to generate from (macOS ships an empty
-/// `platform_defaults()`; the menu bar owns these chords).
+/// The macOS KEYS section, hand-written: macOS seeds no default chords (the menu bar owns them).
 #[cfg(target_os = "macos")]
 fn keys_help() -> String {
     KEYS_HELP.to_string()
@@ -274,12 +249,13 @@ fn keys_help() -> String {
 const HELP_TAIL: &str = concat!(
     "CHILD-SHELL ENV HYGIENE:\n",
     "    The spawned shell has every AI-agent context variable STRIPPED before exec —\n",
-    "    CLAUDE*, ANTHROPIC_*, COPILOT_*, CODEX_*, CURSOR_*, AI_*, and _DEVTOOL_* — so they\n",
-    "    never leak into your session. An inner agent whose context vars went missing was\n",
-    "    sanitized here by design (aterm_types::env_sanitize), not lost. The one exception:\n",
-    "    a session spawned with `aterm ctl spawn identity=<name>` gets each agent's home\n",
-    "    variable (CLAUDE_CONFIG_DIR, CODEX_HOME) pointed into <state>/identities/<name>/ —\n",
-    "    set AFTER the strip, so neither your login nor the identity's leaks into the other.\n\n",
+    "    CLAUDE*, ANTHROPIC_*, COPILOT_*, CODEX_*, ANTIGRAVITY_*, CURSOR_*, AI_*, and\n",
+    "    _DEVTOOL_* — so they never leak into your session. An inner agent whose context\n",
+    "    vars went missing was sanitized here by design (aterm_types::env_sanitize), not\n",
+    "    lost. The one exception: a session spawned with `aterm ctl spawn identity=<name>`\n",
+    "    gets each agent's home variable (CLAUDE_CONFIG_DIR, CODEX_HOME) pointed into\n",
+    "    <state>/identities/<name>/ — set AFTER the strip, so neither your login nor the\n",
+    "    identity's leaks into the other.\n\n",
     "CONFIG:  <aterm.toml>  (live settings reload; launch/session settings disclose their timing; precedence flag > config > default)\n",
     "  Appearance  font_px, font_family, theme (name, or dark:<name>,light:<name>),\n",
     "              foreground, background, cursor_color, selection_color,\n",
@@ -287,23 +263,13 @@ const HELP_TAIL: &str = concat!(
     "              palette [array of #RRGGBB], window_theme, tab_strip_rows,\n",
     "              robi (the tip-sharing helper robot; default off; once on,\n",
     "              typing robi makes him greet you).\n",
-    "  Window/Tabs descriptive_titles, title_summary_provider, title_summary_model,\n",
-    "              title_summary_endpoint, title_summary_token_file,\n",
-    "              title_summary_timeout_seconds, title_summary_proxy_mode,\n",
-    "              title_summary_ca_file,\n",
-    "              title_summary_interval_seconds,\n",
-    "              title_summary_context_lines, title_summary_include_output,\n",
-    "              title_summary_allow_remote, tab_title_format, window_title_format,\n",
-    "              tab_status, tab_status_quiet_after_ms, tab_status_dwell_ms,\n",
+    "  Window/Tabs tab_status, tab_status_quiet_after_ms, tab_status_dwell_ms,\n",
     "              tab_status_badge, tab_connection_badge.\n",
     "  Cursor      serious_mode (mute all sound/decorative effects), motion,\n",
     "              cursor_style, cursor_blink, cursor_momentum_glow (typing-speed glow),\n",
     "              cursor_trail, cursor_trail_style (default rainbow kitty pet),\n",
     "              cursor_trail_color/_accent/_intensity/_radius,\n",
     "              cursor_trail_ms/_length/_ring, cursor_trail_bloom (+_strength/_radius).\n",
-    // Sound is its own help block because it is its own Settings box now (the
-    // owner's Sound menu); listing it under Cursor is what made the volume dial
-    // hard to find in the first place.
     "  Sound       trail_sounds (master), trail_sound_volume (scales every synth\n",
     "              voice), trail_sound_style (the typing sound: auto | music box |\n",
     "              warm pluck | glitter | ice chime | droplet | pew | zap | tick |\n",
@@ -316,7 +282,7 @@ const HELP_TAIL: &str = concat!(
     "  Text        ligatures, font_features, bidi, ambiguous_width,\n",
     "              text_blending (linear-corrected | linear), font_thicken (macOS),\n",
     "              stem_gamma,\n",
-    "              font_hinting (Linux/Windows: full | light | native | off),\n",
+    "              font_hinting (Linux/Windows: full | light | off),\n",
     "              font_subpixel (Linux CPU renderer: off | rgb | bgr),\n",
     "              font_variation [\"wght=450\", ...], font_weight,\n",
     "              font_weight_dark_nudge (variable fonts, e.g. SF Mono),\n",
@@ -335,14 +301,9 @@ const HELP_TAIL: &str = concat!(
     "  Keys        [keybindings] \"chord\"=\"action\"; [key_sequences] \"chord\"=raw bytes.\n",
 );
 
-/// The slot [`HELP_TAIL`]'s CONFIG line and [`STARTER_CONFIG`]'s header carry
-/// where the config path goes, filled at print/write time with the path the
-/// loader ACTUALLY resolves (`app_config::config_path`, the rule the window
-/// loads and hot-reloads by). A literal there was wrong on every Windows box:
-/// measured 2026-09-22 on 0.90.0, `aterm-gui --help` said
-/// `CONFIG:  ~/.config/aterm/aterm.toml` and the `--write-config` starter was
-/// headed the same, while the window they describe read
-/// `%APPDATA%\aterm\aterm.toml`.
+/// The placeholder in [`HELP_TAIL`]'s CONFIG line and [`STARTER_CONFIG`]'s header, filled at
+/// print/write time with the path the loader resolves (`app_config::config_path`), since the
+/// path differs by platform (Windows reads `%APPDATA%\aterm\aterm.toml`).
 const CONFIG_PATH_SLOT: &str = "<aterm.toml>";
 
 /// The variables the loader resolves the config path from, for the one message
@@ -372,13 +333,9 @@ fn starter_config_for(path: &std::path::Path) -> String {
 
 /// Windows-only verbs, appended to `--help` on Windows alone.
 ///
-/// `--unset-default-terminal` is here because it is the ESCAPE HATCH: a machine
-/// whose `HKCU\Console\%%Startup` delegation points at a class nothing can
-/// create stops opening consoles entirely, and the way out has to be findable
-/// from the binary — not only from a README the user may not have.
-/// `--set-default-terminal` is not listed: it refuses in every build (no COM
-/// handoff server), so its dispatch arm stays only to answer a script with that
-/// refusal.
+/// `--unset-default-terminal` is the escape hatch from an `HKCU\Console\%%Startup` delegation to
+/// a class nothing can create (no console opens), so it must be findable from the binary.
+/// `--set-default-terminal` is not listed: it refuses in every build (no COM handoff server).
 #[cfg(windows)]
 const WINDOWS_HELP_TAIL: &str = concat!(
     "\nWINDOWS:\n",
@@ -388,12 +345,9 @@ const WINDOWS_HELP_TAIL: &str = concat!(
     "                               terminal's registration is left alone.\n",
 );
 
-/// A documented starter config written by `--write-config`. Linux-tuned (real
-/// key names, sensible non-macOS defaults); EVERY line is commented, so writing it
-/// changes nothing — it just makes the settings surface
-/// DISCOVERABLE for a new user who has no `aterm.toml` yet. The header's
-/// [`CONFIG_PATH_SLOT`] is filled with the path the file is written to
-/// ([`starter_config_for`]).
+/// The documented starter config `--write-config` writes: Linux-tuned, every line commented so
+/// writing it changes nothing. The header's [`CONFIG_PATH_SLOT`] is filled with the path it is
+/// written to ([`starter_config_for`]).
 const STARTER_CONFIG: &str = "\
 # aterm — <aterm.toml>
 # Every setting is optional; uncomment to override. Live settings reload on save;
@@ -450,27 +404,6 @@ const STARTER_CONFIG: &str = "\
 # scrollback_lines = 100000        # total history across ring + tiered store (default 100k, 0 = unlimited)
 # tab_strip_rows = 1               # in-grid tab bar rows (default 1; 0 on macOS, whose toolbar carries tabs)
 
-# --- smart titles (window + tabs) ---------------------------------------------
-# aterm keeps the stable Title and an authored Description, and can add a generated
-# live Activity fallback describing what the session is doing. The builtin provider is local, deterministic,
-# and sends nothing anywhere. Aterm auto-starts only its managed Ollama install,
-# with Ollama cloud access disabled. A pre-existing localhost service is untrusted,
-# like any remote provider, and stays blocked until title_summary_allow_remote = true.
-# descriptive_titles = true        # generate live Activity (default ON); false preserves authored Description
-# title_summary_provider = \"builtin\" # builtin | ollama | openai-compatible | off
-# title_summary_model = \"qwen3.5:4b-q4_K_M\" # Ollama/service model name
-# title_summary_endpoint = \"\" # Ollama only: blank = private per-process ephemeral Ollama endpoint; OpenAI-compatible requires a URL
-# title_summary_token_file = \"~/.config/aterm/title-summary.token\" # path only; NEVER put a raw token here
-# title_summary_timeout_seconds = 20 # provider deadline, clamped to 1..=120
-# title_summary_proxy_mode = \"environment\" # environment | direct; managed Ollama is always direct
-# title_summary_ca_file = \"~/.config/aterm/private-model-ca.pem\" # custom PEM roots (replaces platform roots)
-# title_summary_interval_seconds = 15 # refresh cadence, clamped to 5..=300
-# title_summary_context_lines = 24 # recent terminal lines considered, clamped to 4..=80
-# title_summary_include_output = true # false limits context to shell/title metadata
-# title_summary_allow_remote = false # privacy gate; filtering is heuristic, so remote consent may expose terminal context
-# tab_title_format = \"title-description\" # title | description | title-description | description-title
-# window_title_format = \"title-description\" # title | description | title-description | description-title
-
 # --- tab subject & status -------------------------------------------------------
 # Entirely local classification of what each session is DOING (running / quiet /
 # idle / exited), from shell integration, the foreground-job boolean, and screen
@@ -495,8 +428,8 @@ const STARTER_CONFIG: &str = "\
 # cursor_trail_intensity = 1.0         # trail brightness 0.0..=1.0 (every style)
 # cursor_trail_radius = 0.6            # bloom-crown radius in cells (0.0..=2.0)
 # cursor_trail_ring = true             # expanding landing \"ping\" ring on a jump (default ON)
-# --- sound (Settings > Cursor & Motion > Sound) -------------------------------
-# trail_sounds = true              # macOS-only trail-style audio (parsed but inert elsewhere); silent whenever the trail is (default ON)
+# --- sound (Settings > Sound) -------------------------------------------------
+# trail_sounds = true              # Music effects: every synth sound on or off together (typing notes, song, ambient bed, chimes, bonk); macOS-only (parsed but inert elsewhere). Typing notes are silent while the cursor trail is off; the other sounds still play (default ON)
 # trail_sound_volume = 0.4         # 0.0..=1.0 trail sound level (default 0.4 ~= -22 dBFS peaks, far under the bell); does NOT scale bell_sound
 # trail_sound_style = \"auto\"     # typing sound: auto = follow the trail style; or an instrument for every keystroke whatever the trail looks like:
 #                                  #   music box | warm pluck | glitter | ice chime | droplet | pew | zap | tick | crackle  (the nine palettes, by sound)
@@ -531,7 +464,7 @@ const STARTER_CONFIG: &str = "\
 # font_thicken = false             # macOS: CoreText font smoothing (heavier glyphs)
 # stem_gamma = 1.0                 # aesthetic stem weight (<1 thicker, >1 thinner)
 # font_hinting = \"full\"           # Linux/Windows grid fitting: full (crispest, default) | light
-#                                  # (hintslight look) | native (font bytecode) | off
+#                                  # (hintslight look) | off
 # font_subpixel = \"off\"           # Linux subpixel-RGB text (CPU renderer only, stage 1):
 #                                  # off (default) | rgb | bgr; opaque frames only
 # font_variation = [\"wght=450\"]    # variable-font axes (clamped to fvar; default = Regular / wght=400)
@@ -596,7 +529,7 @@ const STARTER_CONFIG: &str = "\
 # anim_ms = 2500                   # how long a word sparkles after appearing (350..=10000)
 # jitter = 2                       # sub-cell sparkle jitter in px (0..=6)
 # intensity = 0.85                 # opacity 0.0..=1.0
-# bonk = true                      # the curse BONK sound effect on a TYPED curse (default ON; scaled by trail_sound_volume — Settings shows it in the Sound box)
+# bonk = true                      # the curse BONK sound effect on a TYPED curse (default ON; scaled by trail_sound_volume; Settings > Sound shows it)
 # bonk_detonation = false          # also bonk when an on-screen curse's supernova ignites (default OFF; typed provenance only unless opted in)
 # extra_words = [\"frak\"]           # extra words to treat as profanity
 # ignore_words = [\"fluff\"]         # never decorate these as profanity
@@ -661,7 +594,7 @@ const STARTER_CONFIG: &str = "\
 # to any of it. Inert in builds without a pinned root key — Settings ▸ Packages
 # shows the live posture. --
 # [packages]
-# enabled = true                   # Automatic updates — THE switch (Settings ▸ Packages):
+# enabled = true                   # Keep ALab tools up to date — THE switch (Settings ▸ Packages):
 #                                  #   a published index within minutes, a full signed
 #                                  #   check every 6 hours; read LIVE — an edit stands
 #                                  #   the loop down or resumes it within seconds (what
@@ -672,7 +605,7 @@ const STARTER_CONFIG: &str = "\
 #                                  #   and `enabled = false` always win)
 # exclude = []                     # per-program opt-out from the SIGNED default set
 # [packages.links]                 # a maintainer's local checkout, per program:
-# ay = \"~/ay\"                      #   path → managed dev-link (registry skipped)
+# ay = \"~/src/ay\"                  #   path → managed dev-link (registry skipped)
 # [reroute]
 # announce = true                  # a rerouted cargo/rustc/tlc says so before it runs
 #                                  #   upstream (false silences the line, never the run)
@@ -680,7 +613,7 @@ const STARTER_CONFIG: &str = "\
 # --- this Mac: host settings, applied once a day at the first window or
 # terminal session, and by the next package pass after an edit here.
 # `aterm pkg machine apply` applies now; `aterm pkg machine` reads them.
-# Settings ▸ Security shows the measured state and has Apply now. macOS only.
+# Settings ▸ Security shows the measured state and has Apply Now. macOS only.
 # [machine]
 # universal_control = \"off\"        # \"off\" (default: disable it for this host) | \"leave\"
 
@@ -725,20 +658,13 @@ fn initial_dimension_flag(value: &str, min: u16, max: u16) -> Option<u16> {
         .filter(|dimension| (min..=max).contains(dimension))
 }
 
-/// Write a print-and-exit flag's ANSWER to stdout and end the process: with the
-/// flag's own `code`, or 1 when the answer could not be written.
+/// Write a print-and-exit flag's answer to stdout and end the process with the flag's `code`, or
+/// 1 when the answer could not be written.
 ///
-/// Never `print!`: it PANICS when stdout is a pipe whose reader has gone, and on
-/// Windows that is an ordinary shape of the windowed image's answer. Measured
-/// 2026-09-27 on the installed 0.95.0: pwsh does not wait for a GUI-subsystem
-/// child even while it captures it, so `aterm-gui --version 1>$null` and `$v =
-/// aterm-gui --version` close the pipe before the answer is written, and the
-/// panic banner (`failed printing to stdout: The pipe is being closed. (os error
-/// 232)`) printed after the next prompt; a reader that stops early panicked
-/// both images (`aterm-gui --help | findstr /c:"x" nosuchfile.txt` and `aterm
-/// --window --help | …`: `The pipe has been ended. (os error 109)`). The one
-/// `write_all` also hands the whole answer to the console in as few writes as
-/// the stream allows, where each `println!` was a write of its own.
+/// Never `print!`: it panics when the pipe's reader has gone, an ordinary shape on Windows, where
+/// pwsh does not wait for a GUI-subsystem child (`aterm-gui --version 1>$null`, os error 232) and
+/// a reader may stop early (`| findstr …`, os error 109). One `write_all` also hands the console
+/// the answer in as few writes as the stream allows.
 fn answer_and_exit(argv: &[String], text: &str, code: i32) -> ! {
     use std::io::Write as _;
     let written = {
@@ -758,12 +684,9 @@ fn answer_and_exit(argv: &[String], text: &str, code: i32) -> ! {
     std::process::exit(status)
 }
 
-/// The status a print-and-exit flag ends with, from how its answer's write went:
-/// the flag's own `code` when it was written — or when the reader CLOSED the pipe
-/// (`BrokenPipe`, which Windows' "pipe is being closed" and "pipe has been
-/// ended" both map to): a reader that went away has said it wants no more,
-/// aterm-ctl's rule for `| head` — and otherwise the stderr line naming the
-/// failure (a full disk behind `> file`), which ends the process with 1.
+/// The status a print-and-exit flag ends with: its own `code` when the answer was written or the
+/// reader closed the pipe (`BrokenPipe`, which both Windows pipe-closed errors map to; aterm-ctl's
+/// rule for `| head`), else the stderr line naming the failure, which exits 1.
 fn answer_status(written: std::io::Result<()>, code: i32) -> Result<i32, String> {
     match written {
         Ok(()) => Ok(code),
@@ -772,27 +695,21 @@ fn answer_status(written: std::io::Result<()>, code: i32) -> Result<i32, String>
     }
 }
 
-/// Whether this answer went straight onto a console this process ATTACHED to —
-/// the windowed image (GUI subsystem) typed at a shell prompt with its output not
-/// redirected, which is the one shape whose answer can land after the prompt.
-/// The console image, a redirected or piped answer, and a launch with no console
-/// behind it (Explorer, the console image's own handoff, whose stdio is NUL)
-/// never are.
+/// Whether this answer went straight onto a console this process attached to: the windowed
+/// image (GUI subsystem) typed at a shell prompt with its output not redirected, the one shape
+/// whose answer can land after the prompt. The console image, a redirected or piped answer, and
+/// a launch with no console behind it (Explorer, the console image's own handoff, whose stdio is
+/// NUL) never are.
 #[cfg(windows)]
 fn answered_onto_an_unwaited_console() -> bool {
     use std::io::IsTerminal as _;
     crate::win32::attached_a_console() && std::io::stdout().is_terminal()
 }
 
-/// The one stderr line under such an answer. No handoff can make a prompt wait:
-/// the prompt is waiting for no one — it did not wait for THIS process, so it
-/// would not wait for a console image this process started and waited on
-/// either. So the answer stays, and the line names the spelling a prompt does
-/// wait for: the console image, `aterm --window` and the same flags, whose
-/// answer is this parser's, byte for byte. Measured 2026-09-27 on the installed
-/// 0.95.0: `aterm-gui --version; Write-Output AFTER-GUI` printed `AFTER-GUI`
-/// first in pwsh and in an interactive cmd; `cmd /c` and a pwsh pipeline (`|
-/// Out-String`) do wait, which is why the line says "can", not "did".
+/// The one stderr line under such an answer. Nothing can make the prompt wait (it would not wait
+/// for a child of this process either), so the line names the spelling a prompt does wait for:
+/// `aterm --window` with the same flags, whose answer is this parser's byte for byte. `cmd /c`
+/// and a pwsh pipeline do wait, hence "can", not "did".
 #[cfg(any(windows, test))]
 fn unwaited_answer_line(argv: &[String]) -> String {
     let flags: Vec<String> = argv
@@ -813,22 +730,15 @@ fn unwaited_answer_line(argv: &[String]) -> String {
 }
 
 /// CLI: `aterm-gui [OPTIONS] [-e CMD ARGS… | --help | --version]`.
-/// `--help`/`--version` print and exit; an unknown option, a `-d` without a valid
-/// directory, `-e` without a command, or a value flag missing its argument prints
-/// a hint and exits 2 (no window launch). With no args (a Finder/.app launch) this
-/// is a no-op and a normal interactive shell starts in the inherited working
-/// directory. A launch flag is recorded, never exported: the render/font flags in
-/// [`Cli::launch`], the rest in [`LaunchFlags`]. Numeric flags are validated here
-/// for a clean early error; containment is validated by its own fail-closed funnel
-/// in `main`. Every print-and-exit flag answers through [`answer_and_exit`].
+/// `--help`/`--version` print and exit; an unknown option, a bad `-d`, `-e` without a command,
+/// or a value flag missing its argument prints a hint and exits 2. With no args (a Finder/.app
+/// launch) a normal shell starts in the inherited directory. Numeric flags are validated here,
+/// containment by its own fail-closed funnel in `main`. Every print-and-exit flag answers
+/// through [`answer_and_exit`].
 pub(crate) fn parse_cli(os_argv: Vec<std::ffi::OsString>) -> Cli {
-    // A flag and its value are read by their lossy spelling, the binary era's
-    // `env::args()` UTF-8 boundary (a non-UTF8 flag was a panic there; here it
-    // degrades to a usage error). Kept whole as well as walked: an answer that
-    // may print after the prompt names the command line to type instead
-    // (`unwaited_answer_line`). The walk itself is over the OS's strings: the
-    // `-e` payload is not text and is handed on as it came, so a program's
-    // arguments reach it byte for byte.
+    // Flags and values are read lossily (a non-UTF-8 flag is a usage error); argv is also kept
+    // whole for `unwaited_answer_line`. The walk is over the OS strings, so the `-e` payload
+    // reaches the program byte for byte.
     let argv: Vec<String> = os_argv
         .iter()
         .map(|a| a.to_string_lossy().into_owned())
@@ -846,36 +756,24 @@ pub(crate) fn parse_cli(os_argv: Vec<std::ffi::OsString>) -> Cli {
     while let Some(arg) = args.next() {
         match &*arg.to_string_lossy() {
             "-h" | "--help" => {
-                // Title, then the origin line (`by Andrew Yates · ALab ·
-                // alab.systems`), then the body.
                 let help = format!(
                     "{HELP_TITLE}{}\n{HELP_HEAD}{}{}",
                     aterm_types::identity::ORIGIN_LINE,
                     keys_help(),
                     help_tail()
                 );
-                // Windows-only verbs, printed here rather than folded into the
-                // cross-platform HELP_TAIL so no Unix build advertises a flag it
-                // does not have. `--unset-default-terminal` in particular is the
-                // ESCAPE HATCH from a delegation that stops consoles opening;
-                // leaving it discoverable only through the README strands anyone
-                // who reaches that state on a stripped machine. `--set-...`
-                // refuses in every build, so it is not advertised.
+                // Windows-only verbs stay out of HELP_TAIL so no Unix build advertises a flag
+                // it lacks.
                 #[cfg(windows)]
                 let help = help + WINDOWS_HELP_TAIL;
                 answer_and_exit(&argv, &help, 0);
             }
             "-V" | "--version" => {
-                // The DISPLAY version: semver + the compiler-provenance suffix
-                // (+r.<slug> = upstream Rust, +t.<slug> = Trust fork) — what
-                // the ship tool (aterm-release buildplan.rs) echoes into the
-                // cut transcript as provenance.
+                // The workspace version as written, with no build-provenance suffix.
                 let version = format!("aterm-gui {}\n", crate::build_info::version_display());
                 answer_and_exit(&argv, &version, 0);
             }
-            // Diagnostics ("doctor"): print the report and exit (no window). Placed
-            // after the env-setting flags so e.g. `--gpu --diagnose` reports the
-            // effective renderer.
+            // Flags before it count: `--gpu --diagnose` reports the GPU renderer.
             "--diagnose" => {
                 crate::launch::install(launch.clone());
                 answer_and_exit(&argv, &crate::diagnostics::collect().render(), 0);
@@ -900,8 +798,6 @@ pub(crate) fn parse_cli(os_argv: Vec<std::ffi::OsString>) -> Cli {
                 answer_and_exit(&argv, &crate::diagnostics::show_config(), 0);
             }
             "--write-config" => {
-                // Discoverability: drop a documented starter config (every line
-                // commented out, so it changes nothing) where the loader looks for it.
                 let said = match crate::app_config::config_path() {
                     Some(path) if path.exists() => format!(
                         "config already exists: {} (left unchanged)\n",
@@ -943,7 +839,11 @@ pub(crate) fn parse_cli(os_argv: Vec<std::ffi::OsString>) -> Cli {
                 answer_and_exit(&argv, &msg, i32::from(!ok));
             }
             "--list-themes" => {
-                answer_and_exit(&argv, &crate::diagnostics::list_themes(), 0);
+                let report = crate::diagnostics::theme_list_report(
+                    None,
+                    crate::diagnostics::ThemeListFormat::Text,
+                );
+                answer_and_exit(&argv, &report, 0);
             }
             // Windows: install/remove the "Open aterm here" Explorer context menu
             // (per-user HKCU verb on directories/backgrounds/drives → `aterm-gui -d <path>`).
@@ -970,12 +870,9 @@ pub(crate) fn parse_cli(os_argv: Vec<std::ffi::OsString>) -> Cli {
                     0,
                 );
             }
-            // Windows 11 default-terminal (DefTerm) handoff. Opt-in only, and
-            // currently REFUSED — see `defterm_win::handoff_server_available`.
-            // The refusal is deliberately loud and specific: silently doing
-            // nothing would leave the user believing their consoles had been
-            // redirected, and "it didn't take" is the one DefTerm failure that
-            // looks identical to a wrong registry key.
+            // Windows 11 default-terminal (DefTerm) handoff: refused in every build
+            // (`defterm_win::handoff_server_available`), loudly, since a silent no-op would look
+            // like a registration that took.
             #[cfg(windows)]
             "--set-default-terminal" => match crate::defterm_win::set_default_terminal() {
                 Ok(()) => answer_and_exit(
@@ -1008,13 +905,10 @@ pub(crate) fn parse_cli(os_argv: Vec<std::ffi::OsString>) -> Cli {
                     std::process::exit(1);
                 }
             },
-            // Never GATED on the handoff server: removal is the escape hatch
-            // from a broken delegation and must work in every build, including
-            // on a machine whose registering exe is already gone. But it is
-            // guarded on OWNERSHIP — `HKCU\Console\%%Startup` is a shared,
-            // machine-wide console setting, so a registration aterm did not
-            // write is left alone and said so, never deleted and then reported
-            // as ours.
+            // Never gated on the handoff server: removal is the escape hatch from a broken
+            // delegation and works in every build. It is guarded on ownership: the
+            // `HKCU\Console\%%Startup` setting is shared, so a registration aterm did not write is
+            // left alone and said so.
             #[cfg(windows)]
             "--unset-default-terminal" => {
                 use crate::defterm_win::UnsetOutcome;
@@ -1053,7 +947,7 @@ pub(crate) fn parse_cli(os_argv: Vec<std::ffi::OsString>) -> Cli {
                 cwd = Some(dir);
             }
             "--hold" => hold = true,
-            // --- The render/font flags: carried by `launch`, no env twin. ---
+            // --- The render/font flags: carried by `launch`. ---
             "--font-px" => {
                 let v = flag_value("--font-px", &mut args);
                 if valid_font_px_flag(&v) {
@@ -1083,18 +977,15 @@ pub(crate) fn parse_cli(os_argv: Vec<std::ffi::OsString>) -> Cli {
                     }
                 }
             }
-            // `--gpu` / `--cpu`: the LAST one given wins (each overwrites the other),
-            // and either outranks config `gpu`.
+            // `--gpu` / `--cpu`: the last one given wins, and either outranks config `gpu`.
             "--gpu" => launch.renderer = Some(crate::launch::RendererFlag::Gpu),
             "--cpu" => launch.renderer = Some(crate::launch::RendererFlag::Cpu),
             // --- The rest of the launch flags: recorded in `LaunchFlags`. ---
-            // --shell: the interactive shell to spawn. Discovery-resolved by the
-            // PTY layer — "bash" finds Git for Windows off-PATH, "pwsh"/"cmd"/
             "--shell" => {
                 let shell = flag_value("--shell", &mut args);
                 set_launch_flag(|f| f.shell = Some(shell));
             }
-            // Containment: the LAST of these wins (`--sandbox --containment
+            // Containment: the last of these wins (`--sandbox --containment
             // user` is user); the fail-closed parse is the launch funnel's.
             "--containment" => {
                 let mode = flag_value("--containment", &mut args);
@@ -1133,11 +1024,7 @@ pub(crate) fn parse_cli(os_argv: Vec<std::ffi::OsString>) -> Cli {
                     std::process::exit(2);
                 }
             }
-            // Accepted for compatibility and does nothing: shell integration is
-            // on by default and `--no-shell-integration` is the opt-out. This
-            // used to `flag_env("ATERM_SHELL_INTEGRATION", "1")`, which exported
-            // a variable no code has ever read — a write-only name in the env
-            // surface. The flag stays; the phantom variable is gone.
+            // Accepted and ignored: shell integration is on by default.
             "--shell-integration" => {}
             "--no-shell-integration" => set_launch_flag(|f| f.no_shell_integration = true),
             "--verbose" => {
@@ -1153,11 +1040,9 @@ pub(crate) fn parse_cli(os_argv: Vec<std::ffi::OsString>) -> Cli {
                 exec_command = Some(cmd);
                 break;
             }
-            // NOTE: verbs are NOT parsed here. `ship` briefly was, and that was the
-            // whole defect — this parser is reached only when the mode fork already
-            // chose the window, so a verb wired here is invisible at a terminal. The
-            // front door (`crates/aterm/src/main.rs`) owns every verb in
-            // `aterm_cli::Verb`, above the fork.
+            // Verbs are not parsed here: this parser runs only after the mode fork chose the
+            // window, so a verb wired here is invisible at a terminal. The front door
+            // (`crates/aterm/src/main.rs`) owns every `aterm_cli::Verb`.
             other => {
                 // A bare word is a command the front door did not resolve, not an
                 // option — the session parser's same split, so one mistake reads
@@ -1188,24 +1073,20 @@ pub(crate) fn parse_cli(os_argv: Vec<std::ffi::OsString>) -> Cli {
 
 /// The usage error `-d <dir>` stops a launch with, or `None` to take the folder.
 ///
-/// A folder that is not there stops a PERSON's launch — they typed it, and a
-/// window in some other folder would not be what they asked for. It never stops
-/// an UPDATE's relaunch of a window already running (`update_successor`; round
-/// eight of the update audit, #6): the folder was there when the window opened
-/// and has gone since (a removed worktree, an unmounted volume), and exiting 2
-/// there killed every successor of that window, so it never updated. The folder
-/// stays the window's default for new tabs, as it was; a shell that cannot start
-/// in it starts in the home folder and says so (`spawn_folder::start_folder`).
+/// A missing folder stops a person's launch (a window elsewhere is not what they asked for),
+/// never an update's relaunch of a running window (`update_successor`): the folder existed when
+/// the window opened, and refusing there would stop that window ever updating. The folder stays
+/// the default for new tabs; a shell that cannot start there starts in the home folder and says
+/// so (`spawn_folder::start_folder`).
 fn start_dir_refusal(dir: &str, update_successor: bool) -> Option<String> {
     (!update_successor && !std::path::Path::new(dir).is_dir())
         .then(|| format!("not a directory: {dir}"))
 }
 
-/// The `--lifeline-fd` decision, pure: `Ok(None)` when the flag is absent — the
-/// launch every person and service makes, left exactly as it was — the descriptor
-/// number when it is well-formed on a headless launch, and the usage error
-/// otherwise. A WINDOW is refused rather than armed: it is a person's to close,
-/// and the quit path a cut lifeline takes would ask them first.
+/// The `--lifeline-fd` decision, pure: `Ok(None)` when the flag is absent, the descriptor number
+/// when it is well-formed on a headless launch, and the usage error otherwise. A window is
+/// refused rather than armed: it is a person's to close, and the quit path a cut lifeline takes
+/// would ask them first.
 fn lifeline_request(value: Option<&str>, headless: bool) -> Result<Option<i32>, String> {
     let Some(value) = value else {
         return Ok(None);
@@ -1228,9 +1109,8 @@ fn lifeline_request(value: Option<&str>, headless: bool) -> Result<Option<i32>, 
 mod tests {
     use super::HELP_HEAD;
 
-    /// Round eight of the update audit, #6: a `-d` folder that has gone since the
-    /// window opened stops a person's launch (exit 2, as it always did) and never
-    /// an update's relaunch of that window.
+    /// A `-d` folder that has gone since the window opened stops a person's launch (exit 2) and
+    /// never an update's relaunch of that window.
     #[test]
     fn a_vanished_start_folder_stops_a_launch_and_never_an_update_relaunch() {
         let gone = std::env::temp_dir().join("aterm-start-dir-that-is-not-there-r8-6");
@@ -1246,10 +1126,8 @@ mod tests {
         assert_eq!(super::start_dir_refusal(&here, true), None);
     }
 
-    /// Every user-facing diagnostic verb. The advertise-vs-dispatch gate below
-    /// requires EACH entry to be both documented in `--help` AND have a real match
-    /// arm in [`parse_cli`], so a new verb can never be added to one without the
-    /// other (or silently advertised without a handler).
+    /// Every user-facing diagnostic verb: each must be advertised in `--help` and have a match
+    /// arm in `parse_cli`.
     const DIAGNOSTIC_VERBS: &[&str] = &[
         "--diagnose",
         "--list-actions",
@@ -1262,11 +1140,8 @@ mod tests {
         "--list-themes",
     ];
 
-    /// A reader that CLOSED the pipe ends the answer quietly with the flag's own
-    /// status — both Windows spellings of it included, the two the installed
-    /// 0.95.0 panicked on (232 under `aterm-gui --version 1>$null` in pwsh, 109
-    /// under `| findstr … nosuchfile.txt`) — and any other failure is said, with
-    /// status 1, never swallowed.
+    /// A reader that closed the pipe (Windows os errors 232 and 109 included) ends the answer
+    /// quietly with the flag's own status; any other failure is said, with status 1.
     #[test]
     fn a_closed_pipe_ends_the_answer_quietly_and_any_other_failure_is_said() {
         use std::io::{Error, ErrorKind};
@@ -1299,8 +1174,8 @@ mod tests {
         );
     }
 
-    /// No print-and-exit arm prints with `print!`/`println!` any more: each
-    /// panicked on a closed stdout. `eprintln!` (a usage error) is not an answer.
+    /// No print-and-exit arm uses `print!`/`println!`, which panic on a closed stdout;
+    /// `eprintln!` (a usage error) is not an answer.
     #[test]
     fn every_answer_goes_through_the_panic_free_writer() {
         let src = include_str!("cli.rs");
@@ -1342,16 +1217,6 @@ mod tests {
         );
     }
 
-    /// Only the windowed image ATTACHED to a prompt's console adds the line. The
-    /// test harness, like the console image, was handed every std handle, so it
-    /// attached nothing and never does.
-    #[cfg(windows)]
-    #[test]
-    fn a_process_that_attached_no_console_adds_no_line() {
-        assert!(!crate::win32::attached_a_console());
-        assert!(!super::answered_onto_an_unwaited_console());
-    }
-
     #[test]
     fn help_advertises_diagnostic_flags() {
         // Every user-facing diagnostic flag must be discoverable in --help.
@@ -1363,11 +1228,9 @@ mod tests {
         }
     }
 
-    /// Off macOS the KEYS section is generated from the platform seed table, so
-    /// EVERY seeded chord and action is documented (the hand-written list it
-    /// replaced had drifted to omit five actions and the plain-Ctrl paste trio)
-    /// and no macOS `cmd+*` chord — which off macOS would mean the shell-owned
-    /// Win/Super key — can leak in.
+    /// Off macOS the KEYS section is generated from the seed table: every seeded chord and
+    /// action is documented, and no `cmd+*` chord (off macOS, the desktop-owned Super key) leaks
+    /// in.
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn keys_help_documents_every_seeded_default_and_no_cmd_chords() {
@@ -1397,8 +1260,7 @@ mod tests {
             HELP_HEAD.contains("--headless") && !HELP_HEAD.contains("[env: ATERM_HEADLESS]"),
             "--help names the flag and no environment spelling"
         );
-        // No lifeline unless one is asked for: a person's or a service's headless
-        // instance runs exactly as it did before the flag existed.
+        // No lifeline unless one is asked for.
         assert_eq!(cli.lifeline_fd, None);
     }
 
@@ -1538,8 +1400,7 @@ mod tests {
             None,
             "a blank family is no pin"
         );
-        // The parser has no way left to write the environment at all (the
-        // `flag_env` funnel every flag once exported through is deleted).
+        // Nothing in this file writes the environment.
         let source = include_str!("cli.rs");
         let writer = ["aterm_log::env::", "set("].concat();
         assert!(
@@ -1550,9 +1411,8 @@ mod tests {
 
     #[test]
     fn every_advertised_verb_is_dispatchable() {
-        // Each advertised verb must have a real `"<flag>" =>` match arm in this
-        // file (the dispatch side). Reading the source keeps the gate honest
-        // without invoking the arms (they call `std::process::exit`).
+        // Each advertised verb has a `"<flag>" =>` arm in this file; read from source because
+        // the arms call `std::process::exit`.
         let src = include_str!("cli.rs");
         for flag in DIAGNOSTIC_VERBS {
             let arm = format!("\"{flag}\" =>");
@@ -1563,11 +1423,9 @@ mod tests {
         }
     }
 
-    /// An escape hatch nobody can find is not an escape hatch. Every Windows
-    /// verb except `--set-default-terminal` (which refuses in every build and
-    /// keeps only its dispatch arm) must be advertised in the Windows help
-    /// block, that block must actually reach `--help`, and each verb must have
-    /// a dispatch arm.
+    /// Every Windows verb but `--set-default-terminal` (which refuses in every build) is
+    /// advertised in the Windows help block, the block reaches `--help`, and each verb has a
+    /// dispatch arm.
     #[cfg(windows)]
     #[test]
     fn windows_help_advertises_every_windows_verb() {
@@ -1602,15 +1460,10 @@ mod tests {
         );
     }
 
-    /// THE INVARIANT THAT MATTERS on the unset side: it must never be gated on
-    /// the handoff server being available. Clearing `HKCU\Console\%%Startup` is
-    /// the escape hatch from a delegation that points at a class nothing can
-    /// create — a state where every new console fails to open — so a user in
-    /// that hole must be able to dig out with the binary they already have.
-    ///
-    /// Behavioural, not source-text: `set` really does refuse with `Unsupported`
-    /// while the gate is false, and `unset` really does return an outcome rather
-    /// than that refusal, on the live machine, without writing anything.
+    /// Unset is never gated on the handoff server: clearing `HKCU\Console\%%Startup` is the
+    /// escape hatch from a delegation to a class nothing can create. Behavioural: `set` refuses
+    /// with `Unsupported` while the gate is false, and `unset` returns an outcome on the live
+    /// machine without writing anything.
     #[cfg(windows)]
     #[test]
     fn unset_default_terminal_is_never_gated_while_set_refuses() {
@@ -1626,19 +1479,16 @@ mod tests {
         crate::defterm_win::unset_default_terminal()
             .expect("unset must not fail on the live machine, gated or not");
         let after = crate::defterm_win::current_delegation().expect("read");
-        // On a machine where aterm is not the default (every machine today) the
-        // unset must also have been INERT — see `defterm_win`'s scratch-key test
-        // for the foreign-registration case driven end to end.
+        // aterm is never the default (set refuses), so unset is inert here; `defterm_win`'s
+        // scratch-key test drives the foreign-registration case.
         assert_eq!(
             before, after,
             "unset must not touch a delegation aterm does not own"
         );
     }
 
-    /// `--help`'s CONFIG line and the starter's header name the path the loader
-    /// resolves on THIS machine, never a literal: measured 2026-09-22 on 0.90.0,
-    /// both printed the Unix `~/.config/aterm/aterm.toml` on a Windows box
-    /// whose window was reading `%APPDATA%\aterm\aterm.toml`.
+    /// `--help`'s CONFIG line and the starter's header name the path the loader resolves on this
+    /// machine, never a literal (Windows reads `%APPDATA%\aterm\aterm.toml`).
     #[test]
     fn help_and_starter_name_the_resolved_config_path() {
         assert!(
@@ -1676,52 +1526,10 @@ mod tests {
     }
 
     #[test]
-    fn help_and_starter_document_smart_title_privacy() {
-        for key in [
-            "descriptive_titles",
-            "title_summary_provider",
-            "title_summary_model",
-            "title_summary_endpoint",
-            "title_summary_token_file",
-            "title_summary_timeout_seconds",
-            "title_summary_proxy_mode",
-            "title_summary_ca_file",
-            "title_summary_interval_seconds",
-            "title_summary_context_lines",
-            "title_summary_include_output",
-            "title_summary_allow_remote",
-            "tab_title_format",
-            "window_title_format",
-        ] {
-            assert!(
-                super::HELP_TAIL.contains(key),
-                "--help must make smart-title setting `{key}` discoverable"
-            );
-            assert!(
-                super::STARTER_CONFIG.contains(&format!("# {key} =")),
-                "the starter config must document smart-title setting `{key}`"
-            );
-        }
-        assert!(super::STARTER_CONFIG.contains("sends nothing anywhere"));
-        assert!(super::STARTER_CONFIG.contains("NEVER put a raw token here"));
-        assert!(super::STARTER_CONFIG.contains("title_summary_allow_remote = false"));
-        assert!(super::STARTER_CONFIG.contains("filtering is heuristic"));
-        assert!(super::STARTER_CONFIG.contains("private per-process ephemeral Ollama"));
-        assert!(
-            !super::STARTER_CONFIG
-                .contains("title_summary_endpoint = \"http://127.0.0.1:11434/api/chat\"")
-        );
-    }
-
-    #[test]
     fn starter_config_keys_all_deserialize() {
-        // Every commented top-level `key = value` line the `--write-config` starter
-        // ships must, when uncommented, deserialize into `Config`. A TYPE-mismatched
-        // example (e.g. the old `bidi = false` against an `Option<String>` field)
-        // aborts the WHOLE `aterm_toml::from_str::<Config>` at load, so `load_config` falls
-        // back to `Config::default()` and silently discards the user's entire config.
-        // This gate makes the discoverability surface honest: an uncommentable line
-        // can never reach the starter again.
+        // Every commented top-level `key = value` line in the starter must deserialize into
+        // `Config` when uncommented: one type-mismatched example fails the whole parse, and
+        // `load_config` then ignores the user's entire file.
         use crate::app_config::Config;
         let mut in_table = false;
         let mut checked: Vec<String> = Vec::new();
@@ -1756,10 +1564,8 @@ mod tests {
                 checked.push(key.to_string());
             }
         }
-        // The security opt-ins were once BELOW the `[keybindings]` table header, so the
-        // table-scope skip above silently never checked them (and a user uncommenting
-        // both the table and an opt-in aborted the whole config). They MUST stay above
-        // `[keybindings]` (the last section) — assert each was actually reached here.
+        // Bare top-level keys must sit above `[keybindings]` (the last section), or the
+        // table-scope skip never checks them: assert each security opt-in was reached.
         for must in [
             "allow_window_ops",
             "allow_notifications",
@@ -1774,8 +1580,6 @@ mod tests {
                  `[table]` header? Keep all bare top-level keys ABOVE every table."
             );
         }
-        // stream_fade / stream_fade_ms default OFF; the starter file shows them
-        // commented out. Guard that the sample keeps both.
         for must in ["stream_fade", "stream_fade_ms"] {
             assert!(
                 checked.iter().any(|k| k == must),
@@ -1796,15 +1600,11 @@ mod tests {
         }
     }
 
-    /// The `[matrix_rain]` starter block is TABLE-scoped, which the `in_table`
-    /// latch above never validates (a known blind spot: table-scoped keys are
-    /// only checked line-by-line as top-level docs, which they are not).
-    /// Uncomment the WHOLE block (strip the leading `# `) and parse it as one
-    /// document: every example line must deserialize into [`Config`] — a
-    /// type-mismatched value would abort the entire config load — AND every
-    /// documented key must actually land in [`crate::app_config::MatrixRainConfig`]
-    /// (serde ignores unknown keys, so a typo'd starter key would otherwise be
-    /// silently dead documentation).
+    /// The `[matrix_rain]` starter block is table-scoped, so the line-by-line check above skips
+    /// it: uncomment the whole block and parse it as one document. Every line must deserialize
+    /// into [`Config`], and every documented key must land in
+    /// [`crate::app_config::MatrixRainConfig`] (serde ignores unknown keys, so a typo would be
+    /// dead documentation).
     #[test]
     fn starter_config_matrix_rain_block_deserializes() {
         use crate::app_config::Config;
@@ -1840,8 +1640,6 @@ mod tests {
         let mr = parsed
             .matrix_rain
             .expect("the assembled block populates the [matrix_rain] table");
-        // Every documented knob must be Some — a typo'd key in the starter
-        // would leave its field None (serde(default) ignores unknown keys).
         assert!(mr.enabled.is_some(), "starter documents `enabled`");
         assert!(mr.fps.is_some(), "starter documents `fps`");
         assert!(mr.density.is_some(), "starter documents `density`");
@@ -1862,7 +1660,7 @@ mod tests {
         assert_eq!(mr.ink_text, None, "starter omits inert ink_text");
         assert_eq!(mr.phosphor, None, "starter omits inert phosphor");
         assert!(mr.seed.is_some(), "starter documents `seed`");
-        // The starter documents the DEFAULT-OFF posture (costume mode is opt-in).
+        // The starter documents the default-off posture (costume mode is opt-in).
         assert_eq!(mr.enabled, Some(false), "the starter example ships OFF");
     }
 }

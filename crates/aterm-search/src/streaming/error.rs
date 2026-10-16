@@ -35,6 +35,4 @@ impl std::fmt::Display for SearchError {
 impl std::error::Error for SearchError {}
 
 /// Result type alias for search operations.
-///
-/// Represents `Ok(T)` on success or `Err(SearchError)` on failure.
 pub type SearchResult<T> = Result<T, SearchError>;

@@ -45,7 +45,11 @@
 //! and reflows by a cell when the focus leaves it; the row reads as its
 //! rows joined with one space, which is the text typed, exactly. The
 //! multi-select row ticks itself `[✔]` when typed into, and Enter with the
-//! focus in it unticks it.
+//! focus in it unticks it. **2.1.300** may draw that ticked box with no
+//! space after it, its rows a column short (MEASURED at 50 columns: `4.
+//! [✔]Decide yourself: …` over rows at column 8, where 80 columns draws `[✔]
+//! Decide` over column 9; ATERM-KI-1015-1 F2): read either way
+//! ([`checkbox`], [`label_col`]).
 //!
 //! **NEVER READ WHOLE UNLESS SOUND.** A form is read only when every row of
 //! it is one of the rows above, the options are numbered `1..=N` from the
@@ -63,6 +67,7 @@ use std::ops::Range;
 
 use crate::anchors::anchor_text;
 use crate::phase::{is_rule, is_transcript_row, leading_spaces};
+use crate::text::blank;
 
 /// The question dialog, read ([`crate::prompt::PromptV2::question_dialog`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -462,12 +467,29 @@ fn numbered(row: &str) -> Option<(Pointer, u8, &str)> {
 }
 
 /// A multi-select label's checkbox: `[ ] x` → `(false, "x")`, `[✔] x` →
-/// `(true, "x")`.
+/// `(true, "x")` — and `[✔]x`, the box with no space after it, as Claude
+/// Code 2.1.300 draws a ticked free-text row in a narrow pane (MEASURED at 50
+/// columns: `4. [✔]Decide yourself: …`, its rows at column 8, the fixture
+/// `claude-2.1.300-question-multi-typed-50col.txt`; ATERM-KI-1015-1 F2).
 fn checkbox(text: &str) -> Option<(bool, &str)> {
     if let Some(rest) = text.strip_prefix("[ ] ") {
         Some((false, rest))
+    } else if let Some(rest) = text.strip_prefix("[✔] ") {
+        Some((true, rest))
     } else {
-        text.strip_prefix("[✔] ").map(|rest| (true, rest))
+        text.strip_prefix("[✔]")
+            .filter(|rest| rest.starts_with(|c: char| !c.is_whitespace()))
+            .map(|rest| (true, rest))
+    }
+}
+
+/// The column a numbered row's label starts at, its rows under it with it
+/// (module header): 5, past `N. `, and in multi-select past the checkbox as
+/// drawn ([`checkbox`]: 9 past `[ ] `, 8 past `[✔]` with no space).
+fn label_col(text: &str, multi: bool) -> usize {
+    match checkbox(text).filter(|_| multi) {
+        Some((_, label)) => 5 + cells(text) - cells(label),
+        None => 5,
     }
 }
 
@@ -541,10 +563,6 @@ pub(crate) fn tab_bar(row: &str) -> Option<(Vec<QuestionTab>, bool)> {
     Some((tabs, submit_tab))
 }
 
-fn blank(row: &str) -> bool {
-    crate::text::trim(row).is_empty()
-}
-
 /// A row's width in cells when it can be measured: printable ASCII, as
 /// `aterm-agent`'s `cells_are_chars` measures a box's command row, and the
 /// glyphs the dialog itself draws in its own one-cell columns — the pointer
@@ -606,7 +624,7 @@ pub(crate) fn cells(s: &str) -> usize {
 
 /// `row` split at cell `col`: the characters that start left of it, and
 /// the rest.
-fn split_at_cell(row: &str, col: usize) -> (&str, &str) {
+pub(crate) fn split_at_cell(row: &str, col: usize) -> (&str, &str) {
     let mut cell = 0;
     for (i, c) in row.char_indices() {
         if cell >= col {
@@ -843,8 +861,9 @@ enum Walk {
 
 /// The single- or multi-select options zone above the divider: the
 /// contiguous rows up to a blank row, each a numbered row (the pointer
-/// column, the number at column 2), a row at the label column (5, or 9 in
-/// multi-select: a description or a wrap) under one, or — multi-select, the
+/// column, the number at column 2), a row at its label column (5, or 9 in
+/// multi-select, 8 under a `[✔]` drawn with no space: [`label_col`]; a
+/// description or a wrap) under one, or — multi-select, the
 /// zone's last row — the button. `None` for any other row.
 fn options_zone(rows: &[String], divider: usize) -> Option<Walk> {
     let mut top = divider.checked_sub(1)?;
@@ -860,18 +879,21 @@ fn options_zone(rows: &[String], divider: usize) -> Option<Walk> {
         .filter_map(|i| numbered(&rows[i]).map(|(_, _, t)| t))
         .collect();
     let multi = !texts.is_empty() && texts.iter().all(|t| checkbox(t).is_some());
-    let label_col = if multi { 9 } else { 5 };
+    // The label column of the numbered row above (of a cut one, at the
+    // screen's top, the column its box draws with a space).
+    let mut col = if multi { 9 } else { 5 };
     let mut button = None;
     let mut seen_numbered = false;
     let mut scrolled = false;
     for i in zone.clone() {
         let r = &rows[i];
-        if let Some((pointer, _, _)) = numbered(r) {
+        if let Some((pointer, _, text)) = numbered(r) {
             seen_numbered = true;
             scrolled |= pointer == Pointer::Scrolled;
+            col = label_col(text, multi);
         } else if multi && i + 1 == divider && button_row(r).is_some() {
             button = Some(i);
-        } else if leading_spaces(r) == label_col && (seen_numbered || top == 0) {
+        } else if leading_spaces(r) == col && (seen_numbered || top == 0) {
             // A description or a wrap (under a numbered row; at the screen's
             // top, under one that is cut off).
         } else {

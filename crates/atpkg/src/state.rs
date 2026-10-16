@@ -1,35 +1,30 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The CANONICAL per-program states — one spelling each, used verbatim by `status.toml`,
-//! the pass log, `atpkg doctor`, `atpkg which`, and the Packages rows
+//! The canonical per-program states: one spelling each, used verbatim by `status.toml`, the
+//! pass log, `atpkg doctor`, `atpkg which` and the Packages rows
 //! (`docs/DESIGN-which-copy-runs-2026-08-27.md` §2).
 //!
 //! A program is always in exactly one of these:
 //!
-//! * `managed <build> — pinned by index <N>` — atpkg installed it from the ALab index and
-//!   keeps it at the index pin;
-//! * `managed <version> — <Vendor> latest` — a vendor-direct program
-//!   ([`crate::vendor_direct`]) at its vendor's head; `managed <version> — <why>` while
-//!   the head was not taken (a hold, a yank, a rollback). Never a store build id, never an
-//!   index;
-//! * `system: <path> — not managed by aterm` (`+ (managed copy retired <date>)`) — a
-//!   binary the user already had satisfies the member; atpkg downloads nothing;
-//! * `managed <build> — SHADOWED by <path>` — atpkg's copy is installed, but a binary
-//!   earlier on `PATH` runs instead (a warning, never a fault, never "fixed"); a vendor
-//!   build is named by its version here too;
-//! * `unavailable on <target>: <hint>` — the pinned build carries no row for this target;
-//! * `held: pinned build <N> is not published for <target>; staying on build <current>` —
-//!   an installed member whose group's new pin carries no artifact for this target (a
-//!   sibling's row names it: `held: <owner>'s pinned build …`). Deferred, never a fault.
+//! * `managed <build> — pinned by index <N>`: installed from the ALab index, kept at its pin;
+//! * `managed <version> — <Vendor> latest`: a vendor-direct program ([`crate::vendor_direct`])
+//!   at its vendor's head, or `managed <version> — <why>` while the head was not taken (a
+//!   hold, a yank, a rollback); never a store build id or an index;
+//! * `system: <path> — not managed by aterm` (`+ (managed copy retired <date>)`): a binary
+//!   the user already had satisfies the member, and atpkg downloads nothing;
+//! * `managed <build> — SHADOWED by <path>`: atpkg's copy is installed but a binary earlier
+//!   on `PATH` runs instead (a warning, never a fault); a vendor build is named by version;
+//! * `unavailable on <target>: <hint>`: the pinned build carries no row for this target;
+//! * `held: pinned build <N> is not published for <target>; staying on build <current>`: an
+//!   installed member whose group's new pin has no artifact for this target (a sibling's
+//!   row reads `held: <owner>'s pinned build …`); deferred, never a fault.
 //!
-//! (`extra — not installed …`, `installed via …`, `needs admin …` and `blocked by …` went
-//! with the extras and the OS-installer protocols, design 2026-09-22 §5.3(b)/(c),
-//! 2026-09-24; a row an older pass wrote in one of them is an unknown spelling, rewritten
-//! by the next pass.)
+//! A row in a retired spelling (`extra —`, `installed via`, `needs admin`, `blocked by`) is
+//! unknown, and the next pass rewrites it.
 //!
-//! Every constructor here is the ONLY place its spelling lives; the parsers beside them
-//! (`system_path`, `managed_pin`, …) read the same words back so `doctor` and `which` can
+//! Each constructor here is the only place its spelling lives, and the parsers beside them
+//! (`system_path`, `managed_pin`, …) read the same words back, so `doctor` and `which`
 //! never drift from what the pass wrote.
 
 use std::path::Path;
@@ -40,38 +35,36 @@ pub const MANAGED_PREFIX: &str = "managed ";
 pub const SYSTEM_PREFIX: &str = "system: ";
 /// The tail every system-satisfied row carries before the optional retirement note.
 pub const SYSTEM_TAIL: &str = " — not managed by aterm";
-/// The whole row of an AGENT PROGRAM ([`crate::stub::AGENT_PROGRAMS`]) the pass has not
-/// installed yet: default-set, so it is COMING.
+/// The whole row of an agent program ([`crate::stub::AGENT_PROGRAMS`]) the pass has not
+/// installed yet: it is default-set, so it is coming.
 pub const AGENT_INSTALLING: &str = "agent program — installing";
 /// The head of a member the pinned build does not serve on this target.
 pub const UNAVAILABLE_PREFIX: &str = "unavailable on ";
 /// The hint an index row that names none falls back to.
 pub const UNAVAILABLE_DEFAULT_HINT: &str = "no build is published for this target";
-/// The whole row of a member whose channel PIN is on the `yanked` list or below
-/// `min_build` ([`crate::gate::ApplyDecision::Tombstone`]): there is no safe build, so
-/// nothing installs and a live copy is tombstoned. One spelling for the update lane and
-/// both default-set arms, so `which`/`doctor`/Settings read the same words — a
-/// `tombstoned:` prefix, which doctor counts as a FAULT (it is one: the fix is upstream).
+/// The whole row of a member whose channel pin is yanked or below `min_build`
+/// ([`crate::gate::ApplyDecision::Tombstone`]): no safe build, so nothing installs and a
+/// live copy is tombstoned. One spelling for the update lane and both default-set arms; the
+/// `tombstoned:` prefix is a doctor fault, since the fix is upstream.
 pub const TOMBSTONED_PIN: &str = "tombstoned: pin yanked/below floor";
 /// The head of an installed member held on its current build because its coherence
 /// group's new pin is not published for this target: `held: …`.
 pub const HELD_PREFIX: &str = "held: ";
-/// The head of a Trust toolchain member whose new build is STAGED and whose flip waits for
-/// quiet ([`crate::quiet`]): `deferred: …`. The `deferred:` family [`not_current`] already
-/// reads as `deferred` — a state, never a fault: doctor does not count it a problem.
+/// The head of a Trust toolchain member whose new build is staged and whose flip waits for
+/// quiet ([`crate::quiet`]): `deferred: …`. [`not_current`] reads it as `deferred`, a state,
+/// never a fault.
 pub const FLIP_DEFERRED_PREFIX: &str = "deferred: ";
-/// The `*toolset*` row on a machine the signed index serves NOTHING for — an Intel
-/// Mac before x86_64 lands — as the seed and `install
-/// --default-set` record it. `doctor` lists it; it is also the one fault nobody on the
-/// machine can fix, so the window states it without its Packages badge.
+/// The `*toolset*` row on a machine the signed index serves nothing for (an Intel Mac before
+/// x86_64 lands), as the seed and `install --default-set` record it. `doctor` lists it; no
+/// one on the machine can fix it, so the window states it without a Packages badge.
 pub const TOOLSET_UNSERVED: &str = "unavailable: no build for this architecture";
 /// [`TOOLSET_UNSERVED`] as an update's set completion records it.
 pub const TOOLSET_UNSERVED_BLOCKED: &str = "blocked: no build for this architecture";
-/// The `*toolset*` row of an empty store the index DOES serve, emptied by
+/// The `*toolset*` row of an empty store the index does serve, emptied by
 /// `[packages].exclude` alone: an `unavailable:` fault, because the fix is one line of
 /// config (atpkg `cli.rs`, `Narrowing::verdict`).
 pub const TOOLSET_EXCLUDED: &str = "unavailable: [packages].exclude leaves nothing to install";
-/// The `*toolset*` row of an empty store the index DOES serve, where every program it
+/// The `*toolset*` row of an empty store the index does serve, where every program it
 /// serves was uninstalled on purpose: a decision, so no fault prefix — `doctor` lists
 /// nothing for it and the window lights no badge.
 pub const TOOLSET_REMOVED: &str = "removed on this machine: nothing to install";
@@ -103,11 +96,9 @@ pub fn managed(build: u64, index_build: u64) -> String {
     s
 }
 
-/// `managed <to> — rolled back from <from>`: an index program a person rolled back — a
-/// managed row ([`is_managed`]) that records what happened and claims no pin
-/// ([`managed_pin`] is `None` for it): the index pins the build the person just left,
-/// and a row saying `pinned by index N` for the one they returned to was a false claim
-/// `which` then repeated (audit, 2026-09-25).
+/// `managed <to> — rolled back from <from>`: an index program a person rolled back. A
+/// managed row ([`is_managed`]) that claims no pin ([`managed_pin`] is `None`), because the
+/// index still pins the build the person just left.
 #[must_use]
 pub fn rolled_back(to: u64, from: u64) -> String {
     let mut s = String::from(MANAGED_PREFIX);
@@ -167,7 +158,7 @@ pub fn vendor_row(state: &str) -> Option<(&str, &str)> {
 
 /// `Some((version, vendor))` for exactly `managed <version> — <vendor> latest` where
 /// `vendor` is a vendor of [`crate::vendor_direct::VENDORS`]: the row that says the build
-/// IS its vendor's head. Every kept reason reads `None`.
+/// is its vendor's head. Every kept reason reads `None`.
 #[must_use]
 pub fn vendor_latest(state: &str) -> Option<(&str, &str)> {
     let (version, why) = vendor_row(state)?;
@@ -204,34 +195,24 @@ pub fn shadowed(build: u64, path: &Path) -> String {
     s
 }
 
-/// The tail of an AGENT PROGRAM's shell-local shadow row: `managed <build> — SHADOWED in
+/// The tail of an agent program's shell-local shadow row: `managed <build> — SHADOWED in
 /// this shell by <path>…` ([`agent_shadowed_in_shell`]). Distinct from [`shadowed`]'s
-/// ` — SHADOWED by ` on purpose: [`shadowed_by`] must never read this row as the
-/// machine-wide state, because it is not one.
+/// ` — SHADOWED by ` so [`shadowed_by`] never reads this one shell's row as the machine-wide
+/// state.
 pub const AGENT_SHADOWED_IN_SHELL: &str = " — SHADOWED in this shell by ";
 
-/// `managed <build> — SHADOWED in this shell by <path>: its PATH has no <agents_dir> (a
-/// shell that has not sourced the atpkg hook) — \`<remedy>\` here picks the managed copy
-/// up; a tab opened on this build puts agents/ first on its own` — or, with `agents_on_path`, `…: its PATH has
-/// <agents_dir> behind <path's dir> — \`<remedy>\` here moves it to the front; …`.
+/// `managed <build> — SHADOWED in this shell by <path>: …`, the tail
+/// [`agent_shell_shadow_tail`] writes: the agent programs' shadow row.
 ///
-/// The AGENT PROGRAMS' shadow row (2026-09-16). For `claude`/`codex` aterm's copy IS what
-/// runs (owner decision 2026-09-10) — through `agents/` first on every session `PATH` — so
-/// a foreign copy ahead of it is not the machine's state but ONE SHELL's: a tab adopted
-/// across the update that introduced `agents/`, or opened before the seed pass created it.
-/// Owner, 2026-09-16: *"it is telling me to open a new tab. NO! all the latest and best
-/// MUST WORK IN THE SAME TAB"* — so the remedy named is in-place, never a new tab, and
-/// never "remove or reorder that copy". `remedy` is the command the CALLER has checked is
-/// true for this machine (`cli::shell_remedy_command`): the hook sourced in place —
-/// `. ~/.aterm/shell.d/00-atpkg.zsh` (`source …fish`, `. …ps1`) — wherever that hook
-/// file exists, the same sentence the window records (an `aterm ctl appstatus` entry since
-/// 2026-09-22), and a `PATH` line in the shell's dialect only where it does not. NEVER
-/// `exec $SHELL`: measured the same day, a re-exec'd shell inside an aterm tab loses the
-/// tab's shell integration (the zsh wrapper consumes `ATERM_ORIGINAL_ZDOTDIR`; bash rides
-/// `--rcfile`), while the source heals `PATH` and keeps it. The cause is stated as what
-/// is KNOWN — this shell has not run the hook — not as a guess about when it was opened.
-/// NEVER RECORDED: `status.toml` and the Packages row keep the machine-wide managed row
-/// (`managed <version> — <Vendor> latest`) for such a program.
+/// For `claude`/`codex` aterm's copy is what runs, through `agents/` first on every session
+/// `PATH`, so a foreign copy ahead of it is one shell's state, not the machine's. The remedy
+/// is in place, never a new tab or "remove that copy": `remedy` is the command the caller
+/// checked holds here (`cli::shell_remedy_command`), sourcing the hook where its file
+/// exists, else a `PATH` line in the shell's dialect. Never `exec $SHELL`: a re-exec'd shell
+/// in an aterm tab loses the tab's shell integration (the zsh wrapper consumes
+/// `ATERM_ORIGINAL_ZDOTDIR`; bash rides `--rcfile`), while sourcing keeps it. The cause named
+/// is what is known (this shell has not run the hook), never a guess about when it opened.
+/// Never recorded: `status.toml` and the Packages row keep the machine-wide managed row.
 #[must_use]
 pub fn agent_shadowed_in_shell(
     build: u64,
@@ -257,16 +238,12 @@ pub fn agent_shadowed_in_shell(
 /// the stub was laid keeps the path it cached until `rehash` (zsh) / `hash -r` (bash), once
 /// (aterm help reroute)`.
 ///
-/// The AGENT PROGRAMS' row for a shell whose `PATH` puts a foreign copy ahead of `agents/`
-/// but whose reroute stub answers first and takes the twin (2026-09-23,
-/// `reroute::agents_stub_body_sh`): what runs is the managed copy, decided when it runs —
-/// the case [`agent_shadowed_in_shell`] used to report as SHADOWED, measured that day in a
-/// session shell from 2026-09-10 whose `PATH` had no `agents/` at all. Not SHADOWED — but
-/// not remedy-free either: this report runs as a CHILD of the shell and cannot see its
-/// command cache, and zsh and bash keep the path a name was first found at, so a shell
-/// that ran the program before the stub existed runs that cached path until it forgets it
-/// (the 2026-09-23 review measured it in zsh and bash). The row names that one step.
-/// Never recorded, like the shadow row.
+/// The agent programs' row for a shell whose `PATH` puts a foreign copy ahead of `agents/`
+/// but whose reroute stub answers first and takes the twin (`reroute::agents_stub_body_sh`):
+/// the managed copy runs, decided at exec time. This report runs as a child of the shell
+/// and cannot see its command cache, and zsh and bash keep the path a name was first found
+/// at, so a shell that ran the program before the stub existed keeps running that cached
+/// path; the row names the one step that clears it. Never recorded.
 #[must_use]
 pub fn agent_routed_in_shell(build: u64, stub: &Path, foreign: &Path) -> String {
     let name = stub
@@ -287,10 +264,9 @@ pub fn agent_routed_in_shell(build: u64, stub: &Path, foreign: &Path) -> String 
 /// `managed <build> — not what runs outside aterm: <stub> passes through to <foreign>, this
 /// shell's own copy (the managed copy leads inside aterm only; aterm help reroute)`.
 ///
-/// The AGENT PROGRAMS' row for a shell OUTSIDE aterm whose reroute stub answers first
-/// (2026-09-23, `reroute::agents_stub_body_sh`): the stub runs the user's own copy there
-/// by design (owner law, 03513b5d7), so this is no shadow and names no remedy. Never
-/// recorded.
+/// The agent programs' row for a shell outside aterm whose reroute stub answers first
+/// (`reroute::agents_stub_body_sh`): there the stub runs the user's own copy by design, so
+/// this is no shadow and names no remedy. Never recorded.
 #[must_use]
 pub fn agent_passed_through(build: u64, stub: &Path, foreign: &Path) -> String {
     let mut s = String::from(MANAGED_PREFIX);
@@ -308,12 +284,10 @@ pub fn agent_passed_through(build: u64, stub: &Path, foreign: &Path) -> String {
 /// copy (the managed copy leads inside aterm only; aterm help reroute)`.
 ///
 /// [`agent_passed_through`]'s row where no reroute stub answers first on this shell's
-/// `PATH` (2026-09-24) — an iTerm shell has no reroute directory on it at all, or one
-/// behind the foreign copy — whether the stub is laid or not (the same day's review: it
-/// decides nothing in such a shell). Outside aterm the user's own copy is the design
-/// either way (owner law, 03513b5d7), so this names no remedy: the rc hook
-/// [`agent_shadowed_in_shell`] names demotes `agents/` outside aterm, so sourcing it there
-/// does nothing, and its no-hook `PATH` line would undo the law. Never recorded.
+/// `PATH` (an iTerm shell with no reroute directory on it, or one behind the foreign copy),
+/// whether or not the stub is laid. Outside aterm the user's own copy is the design, so this
+/// names no remedy: the rc hook demotes `agents/` outside aterm, so sourcing it does nothing
+/// there, and its no-hook `PATH` line would undo the design. Never recorded.
 #[must_use]
 pub fn agent_own_copy_outside_aterm(build: u64, foreign: &Path) -> String {
     let mut s = String::from(MANAGED_PREFIX);
@@ -330,8 +304,11 @@ const OWN_COPY_OUTSIDE_ATERM: &str =
     "this shell's own copy (the managed copy leads inside aterm only; aterm help reroute)";
 
 /// The tail of [`agent_shadowed_in_shell`] after `managed <build> — `: `SHADOWED in this
-/// shell by <path>: its PATH has …; a tab opened on this build puts agents/ first on its own`. For a shell a
-/// user is in (`doctor`, `which`) — the pass's own `PATH` is no user's shell, and
+/// shell by <path>: its PATH has no <agents_dir> (a shell that has not sourced the atpkg
+/// hook) — \`<remedy>\` here picks the managed copy up`, or with `agents_on_path` `…: its
+/// PATH has <agents_dir> behind <path's dir> — \`<remedy>\` here moves it to the front`,
+/// then `; a tab opened on this build puts agents/ first on its own`. For a shell a user is
+/// in (`doctor`, `which`); the pass's own `PATH` is no user's shell, and
 /// `cli::reconcile_shadowed` prints its own words for it.
 #[must_use]
 pub fn agent_shell_shadow_tail(
@@ -386,24 +363,21 @@ pub fn unavailable(target: &str, hint: &str) -> String {
     s
 }
 
-/// The head of a member HELD after a failed stage: `held: last attempt failed with
-/// <why>; <how to retry>` ([`held_failed`]). A sub-family of [`HELD_PREFIX`] with its
-/// own head, because the two mean opposite things to a reader: the group hold keeps an
-/// INSTALLED member on a build that works ("nothing to do here"), this keeps a member
-/// that is NOT installed off a stage that would fail again ("here is the retry"). Doctor
-/// counts it as a problem and names the retry; the pending stub says it instead of
-/// promising the next pass; `which` quotes it. Written by the pass whose digest-refusal
-/// memo bound ([`crate::store::StageRefusal`]), 2026-09-22.
+/// The head of a member held after a failed stage: `held: last attempt failed with <why>;
+/// <how to retry>` ([`held_failed`]). Its own head within [`HELD_PREFIX`] because the two
+/// mean opposite things: the group hold keeps an installed member on a working build, this
+/// keeps a member that is not installed off a stage that would fail again. Doctor counts it
+/// a problem and names the retry; the pending stub says it; `which` quotes it. Written by
+/// the pass whose digest-refusal memo bound ([`crate::store::StageRefusal`]).
 pub const HELD_FAILED_PREFIX: &str = "held: last attempt failed with ";
 
-/// `held: last attempt failed with <why>; <how>` — `why` is the stage's own sentence
-/// (the `StageError` Display, digests and all, so the row IS the ledger entry) and `how`
-/// names the one retry, `aterm pkg install <p>`.
+/// `held: last attempt failed with <why>; <how>`: `why` is the stage's own sentence (the
+/// `StageError` Display, digests and all) and `how` names the one retry,
+/// `aterm pkg install <p>`.
 ///
-/// The FIRST `; ` of the row is the seam between the two, by construction: a `; ` inside
-/// `why` (a signer's free text can carry one) is written `, `. The pending stub splits
-/// there to cap the failure and print the retry whole; a seam inside the `why` would hand
-/// it half a failure as the retry. `how` is atpkg's own words and may carry its own `; `.
+/// The first `; ` of the row is the seam between them: a `; ` inside `why` is written `, `,
+/// so the pending stub, which splits there, never prints half a failure as the retry. `how`
+/// may carry its own `; `.
 #[must_use]
 pub fn held_failed(why: &str, how: &str) -> String {
     let mut s = String::from(HELD_FAILED_PREFIX);
@@ -415,15 +389,11 @@ pub fn held_failed(why: &str, how: &str) -> String {
 
 /// `deferred: build <N> is staged and installs when nothing is using the toolchain, by
 /// <time> at the latest while an aterm window or terminal session is open; staying on build
-/// <current>` — the row of a Trust toolchain member whose flip waits for quiet
+/// <current>`: the row of a Trust toolchain member whose flip waits for quiet
 /// ([`FLIP_DEFERRED_PREFIX`], [`crate::quiet`]). `to` is the staged build when the record
-/// names it, `current` the build still live. "At the latest" holds while a host looks: an
-/// aterm window's park, or with no window the terminal session in the watch's seat
-/// ([`crate::quiet::Recheck`]). Every interactive session may take that seat, and does at
-/// its next held-move look whether or not a vendor program is there to watch
-/// (2026-09-26 — before, only a round of head checks took it, and on a store
-/// with none these words were untrue); with neither open, no pass runs at all
-/// until one is.
+/// names it, `current` the live build. "At the latest" holds while a host looks: an aterm
+/// window's park, or with no window an interactive terminal session in the watch's seat
+/// ([`crate::quiet::Recheck`]); with neither open, no pass runs until one is.
 #[must_use]
 pub fn flip_deferred(to: Option<u64>, current: Option<u64>, until: &str) -> String {
     let mut s = String::from(FLIP_DEFERRED_PREFIX);
@@ -511,12 +481,11 @@ pub fn is_managed(state: &str) -> bool {
     state.starts_with(MANAGED_PREFIX)
 }
 
-/// The fix-line that rides AFTER a SHADOWED row on the surfaces that speak to a person
-/// (the pass log, `doctor`, `which`): `type alab-<tool> for the managed one`. `alias` is
-/// the alias shim that actually resolves (`crate::store::ToolName::alias`), so the
-/// sentence is printed only when typing it works. NEVER part of the canonical state
-/// string — [`shadowed`] stays exactly as spelled, `status.toml` and the Packages row
-/// carry the state alone, and the parsers above never see this text.
+/// The fix-line after a SHADOWED row on the surfaces that speak to a person (the pass log,
+/// `doctor`, `which`): `type alab-<tool> for the managed one`. `alias` is the alias shim
+/// that resolves (`crate::store::ToolName::alias`), so it is printed only when typing it
+/// works. Never part of the canonical state: `status.toml`, the Packages row and the parsers
+/// see [`shadowed`] alone.
 #[must_use]
 pub fn alias_hint(alias: &str) -> String {
     let mut s = String::from("type ");
@@ -525,11 +494,10 @@ pub fn alias_hint(alias: &str) -> String {
     s
 }
 
-/// Where `program`'s builds come from, as the package log and Settings ▸ Packages name it
-/// (Phase 4): `Anthropic latest` / `OpenAI latest` for a vendor-direct program — its
-/// vendor's channel, whatever its row says this pass — and `ALab index <N>` for everything
-/// else, `N` being the index its row is pinned by, else the one the last pass resolved
-/// (`last_index_build`; `0` when none has), else no number at all.
+/// Where `program`'s builds come from, as the package log and Settings ▸ Packages name it:
+/// `Anthropic latest` / `OpenAI latest` for a vendor-direct program (its vendor's channel,
+/// whatever its row says) and `ALab index <N>` for everything else, `N` being the index its
+/// row is pinned by, else the one the last pass resolved (`last_index_build`), else none.
 #[must_use]
 pub fn source_words(program: &str, state: &str, last_index_build: u64) -> String {
     if let Some(spec) = crate::vendor_direct::spec(program) {
@@ -546,13 +514,12 @@ pub fn source_words(program: &str, state: &str, last_index_build: u64) -> String
     s
 }
 
-/// Why a row is NOT current, when it says so: a one-word `result` (what the package log and
+/// Why a row is not current, when it says so: a one-word `result` (what the package log and
 /// the Activity list call it) and the `reason` in the row's own words. `None` for a row that
-/// is current or says nothing wrong — pinned by its index, its vendor's latest, a vendor
-/// build no lane has judged yet, system-satisfied, an agent on its way, a SHADOWED row
-/// (per-shell truth, never a fault) — and for any spelling this build does not know.
-/// Reads the canonical spellings above and the fault prefixes `doctor` matches; never a
-/// second vocabulary.
+/// is current or says nothing wrong (pinned by its index, its vendor's latest, a vendor
+/// build no lane has judged, system-satisfied, an agent on its way, a SHADOWED row) and for
+/// any spelling this build does not know. Reads the canonical spellings and doctor's fault
+/// prefixes; never a second vocabulary.
 #[must_use]
 pub fn not_current(state: &str) -> Option<(&'static str, &str)> {
     if let Some((_, why)) = vendor_row(state) {
@@ -604,15 +571,12 @@ pub fn not_current(state: &str) -> Option<(&'static str, &str)> {
     Some((result, state))
 }
 
-/// Whether an `error:` row's reason is a REFUSAL — atpkg declining bytes or a document it
-/// could not trust — as its writers spell one, at the HEAD of the reason: the vendor lane's
-/// `<program> [<version>] refused: <why>` (`vendor_direct::lane`'s outcome line, which
-/// `record_vendor_status` records), the flow's `manifest refused: `, `artifact row
-/// refused: ` and `the signed row for <program> was refused: `, and a stage's `stage:
-/// signer refused: `. Never a substring: an error that
-/// quotes the OS's `Connection refused (os error 61)` is a network failure, and naming it a
-/// refusal told a person a digest or signature had not checked out when a host was down
-/// (review of Phase 4, 2026-09-23).
+/// Whether an `error:` row's reason is a refusal (atpkg declining bytes or a document it
+/// could not trust) as its writers spell one at the head of the reason: the vendor lane's
+/// `<program> [<version>] refused: <why>` (recorded by `record_vendor_status`), the flow's
+/// `manifest refused: `, `artifact row refused: ` and `the signed row for <program> was
+/// refused: `, and a stage's `stage: signer refused: `. Never a substring: an OS
+/// `Connection refused (os error 61)` is a network failure.
 fn is_refusal(reason: &str) -> bool {
     const HEADS: [&str; 3] = [
         "manifest refused: ",
@@ -665,9 +629,8 @@ mod tests {
         );
     }
 
-    /// Phase 4's two words per row: where the builds come from, and why a row is not
-    /// current — read off the canonical spellings, so the package log, the Activity list
-    /// and the program rows say what `doctor` says.
+    /// A row's source and why it is not current are read off the canonical spellings, so the
+    /// package log, the Activity list and the program rows say what `doctor` says.
     #[test]
     fn a_rows_source_and_why_it_is_not_current_come_from_its_canonical_words() {
         assert_eq!(
@@ -689,7 +652,7 @@ mod tests {
             shadowed(1971, Path::new("/opt/homebrew/bin/ay")),
             system(Path::new("/usr/bin/git"), None),
             agent_installing(),
-            // Rows an older pass wrote in the retired spellings (§5.3(b)/(c)): unknown now.
+            // Rows in retired spellings are unknown now.
             String::from("extra — not installed (opt in: aterm pkg install vendorx)"),
             String::from("needs admin — run: aterm pkg install clt"),
             String::from("blocked by clt: needs admin — run: aterm pkg install clt"),
@@ -771,6 +734,11 @@ mod tests {
         let source = vendor_source("0.156.0", "OpenAI");
         assert_eq!(source, "managed 0.156.0 — updates from OpenAI");
         assert_eq!(vendor_latest(&source), None);
+        let muse = vendor_source("1.4.9-R6297.1", "Meta");
+        assert_eq!(
+            vendor_row(&muse),
+            Some(("1.4.9-R6297.1", "updates from Meta"))
+        );
         // A kept reason that merely mentions the latest is no claim to be it.
         let newer = vendor_kept("2.1.281", "newer than Anthropic's latest (2.1.280)");
         assert_eq!(vendor_latest(&newer), None);
@@ -786,6 +754,7 @@ mod tests {
                 Path::new("/p"),
             ),
             String::from("managed 2.1 — Anthropic latest"),
+            String::from("managed 1.4.9-r6297 — updates from Meta"),
             String::from("managed 2.1.280 — "),
         ] {
             assert_eq!(vendor_row(&other), None, "{other}");
@@ -821,6 +790,12 @@ mod tests {
             assert!(!s.contains(&build.to_string()), "{s}");
         }
         assert_eq!(shadowed_by("managed 2.1 — SHADOWED by /p"), None);
+        let muse = crate::vendor_direct::Version::parse("1.4.9-R6297.1")
+            .unwrap()
+            .build_id();
+        let row = shadowed(muse, Path::new("/p/muse"));
+        assert_eq!(row, "managed 1.4.9-R6297.1 — SHADOWED by /p/muse");
+        assert_eq!(shadowed_by(&row), Some((muse, "/p/muse")));
     }
 
     #[test]
@@ -851,7 +826,7 @@ mod tests {
             unavailable("aarch64-pc-windows-msvc", ""),
             "unavailable on aarch64-pc-windows-msvc: no build is published for this target"
         );
-        // The alias fix-line is a SEPARATE sentence: the SHADOWED state never carries it,
+        // The alias fix-line is a separate sentence: the SHADOWED state never carries it,
         // so a row that was written and read back stays byte-identical.
         assert_eq!(
             alias_hint("alab-trust"),
@@ -866,9 +841,8 @@ mod tests {
         );
     }
 
-    /// The agent programs' shell-local shadow row (2026-09-16): the in-place remedy,
-    /// never a new tab, never "remove that copy"; and NOT a `SHADOWED by` row to the
-    /// parser, because it is one shell's state, not the machine's.
+    /// The agent programs' shell-local shadow row names the in-place remedy (never a new tab
+    /// or "remove that copy") and is not a `SHADOWED by` row to the parser.
     #[test]
     fn the_agent_shadow_row_names_the_in_place_remedy_and_is_never_the_machine_state() {
         let agents = Path::new("/Users//dev/Library/Application Support/aterm/pkg/agents");
@@ -931,7 +905,7 @@ mod tests {
         let noted = system(Path::new("/opt/homebrew/bin/gh"), Some("2026-08-27"));
         assert_eq!(system_path(&noted), Some("/opt/homebrew/bin/gh"));
         assert_eq!(system_retired(&noted), Some("2026-08-27"));
-        // A path that itself contains the tail's words still parses at the FIRST tail.
+        // A path that itself contains the tail's words still parses at the first tail.
         let odd = system(Path::new("/x — not managed by aterm/gh"), None);
         assert_eq!(system_path(&odd), Some("/x"));
         assert_eq!(managed_pin(&managed(6808, 41)), Some((6808, 41)));
@@ -955,9 +929,9 @@ mod tests {
         }
     }
 
-    /// The states doctor treats as FAULTS are prefix-matched (`error:`, `unavailable:`,
-    /// `blocked:`, `aborted:`, `tombstoned:`); none of the canonical spellings may start
-    /// with one of those, or a normal row would read as a problem.
+    /// Doctor prefix-matches its faults (`error:`, `unavailable:`, `blocked:`, `aborted:`,
+    /// `tombstoned:`); no canonical spelling may start with one, or a normal row would read
+    /// as a problem.
     #[test]
     fn no_canonical_state_reads_as_a_doctor_fault() {
         for s in [

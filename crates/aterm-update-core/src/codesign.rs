@@ -4,11 +4,10 @@
 //! The Developer ID gate: `/usr/bin/codesign --verify --strict` under a designated
 //! requirement that pins Apple's anchor, the Developer ID chain and one Team ID.
 //!
-//! ONE requirement text for every caller — the app updater's bundle check and atpkg's
-//! staged agent binaries — so the two cannot disagree about what "signed by team X"
-//! means. The spawn is bounded by a deadline (`aterm_uds::deadline::output_until`, the
-//! workspace's one bounded child runner) and fails closed: a timeout, a spawn failure or
-//! a non-zero exit is never a pass.
+//! One requirement text for the app updater's bundle check and atpkg's staged agent binaries,
+//! so they cannot disagree about what "signed by team X" means. The spawn is bounded
+//! (`aterm_uds::deadline::output_until`) and fails closed: a timeout, a spawn failure or a
+//! non-zero exit is never a pass.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -23,16 +22,11 @@ pub const CODESIGN: &str = "/usr/bin/codesign";
 pub const VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The slowest read rate a size-scaled verification ([`verify_timeout_for`]) is given time
-/// for: 2 MiB/s. codesign `--verify --strict` hashes every page of the file, so its time
-/// is its READ time, and under atpkg's `taskpolicy -c utility` clamp (the window spawns
-/// every pass as `qos::Role::Background`, and codesign inherits the clamp) those reads are
-/// IO-throttled behind whatever else the disk is doing. Measured at a load average of
-/// ~90: a 238 MB binary verified in 1.98 s unclamped and in 453 s clamped (throttled
-/// reads, 2.3 s of CPU in all), and a fixed 30 s ceiling failed it, then passed it 21 s
-/// later — a race against the disk, not a verdict.
-/// So no deadline is long enough on a saturated machine: this rate covers a moderately
-/// busy one, and what a deadline still cannot cover is DEFERRED by the caller, never
-/// failed (atpkg's `StageError::VerifyDeferred`).
+/// for. `--verify --strict` hashes every page, so its time is read time, and under the
+/// window's background QoS clamp (which codesign inherits) those reads are throttled behind
+/// the rest of the disk: at load ~90 a 238 MB binary took 1.98 s unclamped and 453 s clamped.
+/// No deadline covers a saturated machine; this one covers a moderately busy one, and the
+/// caller defers what it cannot cover (atpkg's `StageError::VerifyDeferred`), never fails it.
 pub const VERIFY_MIN_BYTES_PER_SEC: u64 = 2 * 1024 * 1024;
 
 /// The most time [`verify_timeout_for`] gives one file, however large: a verification
@@ -40,9 +34,9 @@ pub const VERIFY_MIN_BYTES_PER_SEC: u64 = 2 * 1024 * 1024;
 /// next pass rather than waited on.
 pub const VERIFY_TIMEOUT_MAX: Duration = Duration::from_secs(600);
 
-/// The deadline one verification of a `len`-byte file is given: [`VERIFY_TIMEOUT`] plus
-/// one second per [`VERIFY_MIN_BYTES_PER_SEC`], capped at [`VERIFY_TIMEOUT_MAX`]. A small
-/// file keeps the historical 30 s; codex's 238 MB binary gets 143 s.
+/// The deadline one verification of a `len`-byte file is given: [`VERIFY_TIMEOUT`] plus one
+/// second per [`VERIFY_MIN_BYTES_PER_SEC`], capped at [`VERIFY_TIMEOUT_MAX`]. A 238 MB binary
+/// gets 143 s.
 #[must_use]
 pub fn verify_timeout_for(len: u64) -> Duration {
     VERIFY_TIMEOUT
@@ -66,10 +60,9 @@ pub enum CodesignError {
     Spawn(std::io::Error),
     /// Waiting for codesign failed.
     Wait(std::io::Error),
-    /// codesign did not finish by the deadline; it was killed and reaped. Never a pass,
-    /// and never a verdict on the bytes ([`Self::is_verdict`]): what a caller does with it
-    /// is its own policy — the app updater refuses the update, atpkg's Developer ID gate
-    /// defers the program to its next pass (`StageError::VerifyDeferred`).
+    /// codesign did not finish by the deadline; it was killed and reaped. Never a pass and
+    /// never a verdict on the bytes: the app updater refuses the update, atpkg defers the
+    /// program to its next pass (`StageError::VerifyDeferred`).
     TimedOut,
     /// codesign ran and refused. `code` is its exit status (`None` when a signal ended
     /// it): 1 is a signature that does not verify, 3 a valid signature that fails the
@@ -101,17 +94,12 @@ impl std::fmt::Display for CodesignError {
 
 impl std::error::Error for CodesignError {}
 
-/// codesign's words (Security.framework's `errSecCS…` strings) for a signature fault in
-/// the bytes it read. Exit 1 also reports a file it could not read or an internal
-/// failure, and those are facts about this machine, not verdicts on the bytes. The
-/// bundle-level two (a changed, added or removed sealed resource; a stray file in the
-/// bundle root) were measured on an ad hoc signed `.app` under `--deep --strict`: the
-/// app updater's stage is a bundle, and its tampering must stay a verdict where a
-/// non-verdict is a passing refusal. `bundle format
-/// unrecognized, invalid, or unsuitable` is the bundle's form of the object-file line
-/// (`errSecCSBadBundleFormat`, measured: an `.app` with no `Info.plist`, or
-/// an empty one): a bundle that is not a bundle stays that way until something
-/// replaces it.
+/// codesign's words (Security.framework's `errSecCS…` strings) for a signature fault in the
+/// bytes it read; exit 1 also reports an unreadable file or an internal failure, which are not
+/// verdicts. The bundle-level lines (a changed, added or removed sealed resource, a stray file
+/// in the bundle root, `bundle format unrecognized…` for an `.app` with no or an empty
+/// `Info.plist`) are what `--deep --strict` prints for an ad hoc signed `.app`, so tampering
+/// with the app updater's staged bundle stays a verdict.
 const SIGNATURE_FAULTS: [&str; 11] = [
     "code object is not signed at all",
     "invalid signature (code or signature have been modified)",
@@ -126,9 +114,8 @@ const SIGNATURE_FAULTS: [&str; 11] = [
     "bundle format unrecognized, invalid, or unsuitable",
 ];
 
-/// codesign's words for a failure to READ or to run, on a line of an exit-1 refusal:
-/// facts about this machine at this moment, never about the bytes
-/// ([`CodesignError::judged_nothing`]).
+/// codesign's words, on a line of an exit-1 refusal, for a failure to read or run: facts
+/// about this machine, never about the bytes ([`CodesignError::judged_nothing`]).
 const MACHINE_FAULTS: [&str; 8] = [
     "Permission denied",
     "No such file or directory",
@@ -160,13 +147,11 @@ impl CodesignError {
         }
     }
 
-    /// Whether codesign RAN and KNOWABLY judged nothing: a signal ended it, or exit 1
-    /// names only a failure to read or to run ([`MACHINE_FAULTS`]) and no signature
-    /// fault. Narrower than `!is_verdict()` on purpose: a refusal in words not listed
-    /// either way (codesign has many) stays a refusal of the bytes, so a caller that
-    /// discards or asks a person on a refusal keeps doing so for any tampering it has
-    /// not been taught (a modified Info.plist and a modified resource directory were
-    /// measured in words neither list then held).
+    /// Whether codesign ran and knowably judged nothing: a signal ended it, or exit 1 names
+    /// only a failure to read or run ([`MACHINE_FAULTS`]) and no signature fault. Narrower
+    /// than `!is_verdict()` on purpose: a refusal in words neither list holds stays a refusal
+    /// of the bytes, so a caller that discards or asks a person on a refusal keeps doing so
+    /// for tampering it has not been taught.
     #[must_use]
     pub fn judged_nothing(&self) -> bool {
         match self {
@@ -208,7 +193,7 @@ pub fn developer_id_requirement(team: &str) -> Result<String, CodesignError> {
     ))
 }
 
-/// [`verify_developer_id_until`] within [`VERIFY_TIMEOUT`] — the tests' spelling.
+/// [`verify_developer_id_until`] within [`VERIFY_TIMEOUT`].
 #[cfg(test)]
 fn verify_developer_id(path: &Path, team: &str, deep: bool) -> Result<(), CodesignError> {
     verify_developer_id_until(path, team, deep, Instant::now() + VERIFY_TIMEOUT)
@@ -226,6 +211,22 @@ pub fn verify_developer_id_until(
     deep: bool,
     deadline: Instant,
 ) -> Result<(), CodesignError> {
+    let mut cmd = developer_id_command(path, team, deep)?;
+    developer_id_verdict(output_until(&mut cmd, deadline))
+}
+
+/// The codesign run [`verify_developer_id_until`] makes, for a caller that runs it
+/// beside other helpers (`aterm_uds::deadline::outputs_until`) and judges the run with
+/// [`developer_id_verdict`].
+///
+/// # Errors
+/// [`CodesignError::InvalidTeam`] before anything is built; [`CodesignError::Unsupported`]
+/// off macOS.
+pub fn developer_id_command(
+    path: &Path,
+    team: &str,
+    deep: bool,
+) -> Result<aterm_uds::spawnfd::Command, CodesignError> {
     let requirement = developer_id_requirement(team)?;
     if !cfg!(target_os = "macos") {
         return Err(CodesignError::Unsupported);
@@ -237,7 +238,17 @@ pub fn verify_developer_id_until(
     }
     cmd.args(["--strict", "--verbose=2", "-R", &requirement])
         .arg(path);
-    let out = output_until(&mut cmd, deadline).map_err(|e| match e {
+    Ok(cmd)
+}
+
+/// What one run of [`developer_id_command`] says: a pass only for a clean exit.
+///
+/// # Errors
+/// The spawn, wait, timeout or refusal, each a rejection.
+pub fn developer_id_verdict(
+    run: Result<std::process::Output, RunError>,
+) -> Result<(), CodesignError> {
+    let out = run.map_err(|e| match e {
         RunError::Spawn(e) => CodesignError::Spawn(e),
         RunError::Wait(e) => CodesignError::Wait(e),
         RunError::TimedOut => CodesignError::TimedOut,
@@ -257,8 +268,7 @@ pub fn verify_developer_id_until(
 mod tests {
     use super::*;
 
-    /// The requirement is Apple's Developer ID shape with the team spliced in verbatim —
-    /// the exact text the app updater has always passed to `-R`.
+    /// The requirement is Apple's Developer ID shape with the team spliced in verbatim.
     #[test]
     fn the_requirement_pins_anchor_chain_and_team() {
         assert_eq!(
@@ -269,8 +279,7 @@ mod tests {
         );
     }
 
-    /// A team that could rewrite the requirement — or say nothing — is refused before
-    /// anything runs, on every platform.
+    /// A team that could rewrite the requirement, or is empty, is refused before any spawn.
     #[test]
     fn a_team_that_is_not_alphanumeric_is_refused_before_any_spawn() {
         for bad in ["", "Q6L2\"SF6YD", "ABC DEF", "ÄBCDEFGHIJ", "A\"or\"B"] {
@@ -293,8 +302,7 @@ mod tests {
         ));
     }
 
-    /// An unsigned file is a refusal (exit 1), never a pass, and the refusal carries
-    /// codesign's own words.
+    /// An unsigned file is refused (exit 1) with codesign's own words.
     #[cfg(target_os = "macos")]
     #[test]
     fn an_unsigned_file_is_refused_with_codesigns_reason() {
@@ -312,9 +320,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Exit 3, and exit 1 naming a signature fault, are verdicts on the bytes; exit 1 for
-    /// a file codesign could not read or an internal failure, any other exit, a signal and
-    /// a failure to run at all are not.
+    /// Exit 3, and exit 1 naming a signature fault, are verdicts; exit 1 for an unreadable
+    /// file or internal failure, any other exit, a signal and a failure to run are not.
     #[test]
     fn only_a_signature_fault_is_a_verdict() {
         let refused = |code: Option<i32>, stderr: &str| CodesignError::Refused {
@@ -360,11 +367,8 @@ mod tests {
         assert!(!CodesignError::InvalidTeam(String::new()).is_verdict());
     }
 
-    /// What a caller that DISCARDS or ASKS A PERSON on a refusal may set aside
-    /// ([`CodesignError::judged_nothing`]): a signal, and exit 1 naming only a failure to
-    /// read or run. NEGATIVE CONTROLS: a refusal in words neither list holds — the next
-    /// tampering codesign words differently — judged something (fail closed), as does a
-    /// line naming a machine fault beside a signature fault, and exit 2 or 3.
+    /// A signal, and exit 1 naming only a failure to read or run, judged nothing. Negative
+    /// controls: unlisted words, a machine fault beside a signature fault, and exit 2 or 3.
     #[test]
     fn only_a_known_machine_fault_or_a_signal_judged_nothing() {
         let refused = |code: Option<i32>, stderr: &str| CodesignError::Refused {
@@ -401,8 +405,8 @@ mod tests {
         assert!(!CodesignError::TimedOut.judged_nothing());
     }
 
-    /// Measured on the real tool: exit 1 for a file codesign cannot read is NOT a verdict
-    /// (the same bytes verify once readable), while exit 1 for an unsigned file is.
+    /// Exit 1 for a file codesign cannot read is not a verdict (the bytes verify once
+    /// readable); exit 1 for an unsigned file is.
     #[cfg(target_os = "macos")]
     #[test]
     fn an_unreadable_file_is_not_a_verdict_and_an_unsigned_one_is() {
@@ -433,8 +437,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// THE DEADLINE SCALES WITH THE FILE: a small file keeps 30 s, a 238 MB binary gets
-    /// 143 s, and nothing is given more than the ten-minute cap.
+    /// A small file keeps 30 s, a 238 MB binary gets 143 s, nothing more than the cap.
     #[test]
     fn the_verify_deadline_scales_with_the_file_and_is_capped() {
         assert_eq!(verify_timeout_for(0), VERIFY_TIMEOUT);
@@ -461,9 +464,8 @@ mod tests {
         ));
     }
 
-    /// Apple's own binaries are signed by Apple, not by a Developer ID: the requirement
-    /// refuses them (exit 3, or 1 where the platform binary has no leaf OU), which is
-    /// the proof the team pin is doing work rather than accepting any valid signature.
+    /// Apple's own binaries carry no Developer ID: the requirement refuses them (exit 3, or 1
+    /// where a platform binary has no leaf OU), so the team pin does work.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_validly_signed_binary_of_another_signer_is_refused() {

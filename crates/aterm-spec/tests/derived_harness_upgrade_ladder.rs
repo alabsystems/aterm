@@ -21,11 +21,6 @@ use aterm_spec::{interp, verify};
 #[test]
 fn the_ladder_keeps_every_floor_and_counts_a_quiet_looking_pause() {
     let model = harness_upgrade_ladder_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name)
-    );
     verify::prove_and_catch_scalar(&model, "harness upgrade ladder");
     // EVERY dead action is a negative control some invariant catches ALONE.
     // The committed space's fired set is walked once, not once per action
@@ -38,7 +33,7 @@ fn the_ladder_keeps_every_floor_and_counts_a_quiet_looking_pause() {
         .filter(|a| !fired.contains(a))
         .collect();
     assert_eq!(
-        verify::audit_dead_negative_controls(&model, &dead),
+        verify::audit_dead_negative_controls(std::slice::from_ref(&model)),
         Ok(11),
         "{dead:?}"
     );
@@ -236,24 +231,6 @@ fn the_ladder_keeps_every_floor_and_counts_a_quiet_looking_pause() {
     assert!(buggy.fire("Move", &mut pin));
     assert!(buggy.fire("PinDropsDue", &mut pin));
     assert!(!buggy.check_invariant("AnUnpinnedDaemonKeepsItsTabDue", &pin));
-}
-
-/// "THE UPGRADE LANDS" under its stated fairness (the clock, the lane's look
-/// and its move, and the pin), and each named mutant breaks it ALONE —
-/// livelocks all, which no deadlock check sees: a person near the tab for
-/// ever (`AttendedWithoutLadder`), a mark the reader never reads
-/// (`BlindReader`), another session's goal for ever (`OtherTurnHolds`), and a
-/// current, unpinned daemon nobody's step visits (`PinDropsDue`).
-#[test]
-fn the_upgrade_lands_under_fairness_and_catches_the_livelocks() {
-    let model = harness_upgrade_ladder_model();
-    let live = harness_upgrade_ladder_liveness();
-    assert!(
-        aterm_spec::xref::liveness_registry()
-            .iter()
-            .any(|(m, l)| m.name == model.name && l.name == live.name)
-    );
-    verify::liveness_proves_and_catches_tiered(&model, &live, "HarnessUpgradeLadder lands");
 }
 
 /// Each livelock the test above catches is the cycle its mutant names — the

@@ -8,7 +8,8 @@
 //! * [`ColorRepr`] carries the colour state as a diff from the host's
 //!   configured baseline, so adopting into a terminal whose theme changed
 //!   applies the application's overrides (OSC 4, OSC 10/11) on the new theme.
-//!   The XTPUSHCOLORS stack travels whole.
+//!   The XTPUSHCOLORS stack travels as [`ColorOverridesRepr`] diffs too, so a
+//!   pop after the handoff also lands on the new theme.
 //! * [`ShellRepr`] carries the OSC 133/633 phase, the in-progress mark and
 //!   block, the still-readable completed marks and blocks, and the monotonic
 //!   counters observers key on. Rows are absolute and each grid's absolute row
@@ -25,7 +26,7 @@ use aterm_types::{ColorPalette, Rgb};
 
 use super::Terminal;
 use super::callbacks::{COLOR_STACK_MAX_DEPTH, TITLE_STACK_MAX_DEPTH};
-use super::grouped_state::{ColorStackEntry, ShellIntegrationPhase};
+use super::grouped_state::{ColorState, ShellIntegrationPhase};
 use super::shell::{
     BlockState, COMMAND_MARKS_MAX, CommandMark, OUTPUT_BLOCKS_MAX, OutputBlock, ShellState,
 };
@@ -52,7 +53,9 @@ pub struct ColorSlotRepr {
     pub rgb: Option<Rgb>,
 }
 
-/// One XTPUSHCOLORS (OSC 30001) stack entry, whole.
+/// One XTPUSHCOLORS (OSC 30001) stack entry, whole: the shape a parent that
+/// predates [`ColorRepr::stack_overrides`] writes. Read (as a diff from this
+/// engine's baseline), never written.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ColorStackEntryRepr {
@@ -68,6 +71,73 @@ pub struct ColorStackEntryRepr {
     pub selection_background: Option<Rgb>,
     /// Selection foreground.
     pub selection_foreground: Option<Rgb>,
+}
+
+/// The colour slots an application overrode, as a diff from the host's
+/// configured baseline. `Default` is "nothing overridden".
+///
+/// The one colour-diff form: [`ColorRepr`]'s live slots, each XTPUSHCOLORS
+/// stack entry, and what `apply_config` replays over a new theme, so a
+/// program's colours survive any baseline change.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ColorOverridesRepr {
+    /// Palette entries that differ from the configured palette.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Vec::is_empty")
+    )]
+    pub palette: Vec<PaletteOverrideRepr>,
+    /// Foreground, when it differs from the configured one.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub foreground: Option<Rgb>,
+    /// Background, when it differs from the configured one.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub background: Option<Rgb>,
+    /// Cursor colour, when it differs from the configured one.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub cursor: Option<ColorSlotRepr>,
+    /// Selection background, when it differs from the configured one.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub selection_background: Option<ColorSlotRepr>,
+    /// Selection foreground, when it differs from the configured one.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub selection_foreground: Option<ColorSlotRepr>,
+}
+
+impl ColorOverridesRepr {
+    /// The same diff with at most one palette entry per index (the last listed
+    /// wins, as applying the list in order would), in index order, so a wire
+    /// entry costs no more than the engine's own capture.
+    #[must_use]
+    fn normalized(&self) -> Self {
+        let mut slots = [None; 256];
+        for e in &self.palette {
+            slots[usize::from(e.index)] = Some(e.rgb);
+        }
+        Self {
+            palette: (0..=u8::MAX)
+                .zip(slots)
+                .filter_map(|(index, rgb)| rgb.map(|rgb| PaletteOverrideRepr { index, rgb }))
+                .collect(),
+            ..self.clone()
+        }
+    }
 }
 
 /// The colour state applications set, as a diff from the configured baseline
@@ -111,12 +181,20 @@ pub struct ColorRepr {
         serde(default, skip_serializing_if = "Option::is_none")
     )]
     pub selection_foreground: Option<ColorSlotRepr>,
-    /// The XTPUSHCOLORS stack, oldest first.
+    /// The XTPUSHCOLORS stack, oldest first, as whole entries. Read only when
+    /// `stack_overrides` is empty; never written.
     #[cfg_attr(
         feature = "serde",
         serde(default, skip_serializing_if = "Vec::is_empty")
     )]
     pub stack: Vec<ColorStackEntryRepr>,
+    /// The XTPUSHCOLORS stack, oldest first, each entry a diff from the
+    /// configured baseline. A parent that predates this field carries `stack`.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Vec::is_empty")
+    )]
+    pub stack_overrides: Vec<ColorOverridesRepr>,
 }
 
 impl ColorRepr {
@@ -125,14 +203,146 @@ impl ColorRepr {
     pub fn is_default(&self) -> bool {
         *self == Self::default()
     }
+
+    /// Whether the carry holds a pushed XTPUSHCOLORS stack, in either shape.
+    #[must_use]
+    pub fn has_stack(&self) -> bool {
+        !self.stack.is_empty() || !self.stack_overrides.is_empty()
+    }
+
+    /// Drop the pushed stack, in either shape.
+    pub fn clear_stack(&mut self) {
+        self.stack.clear();
+        self.stack_overrides.clear();
+    }
+
+    /// The live slots' diff, without the stack.
+    fn overrides(&self) -> ColorOverridesRepr {
+        ColorOverridesRepr {
+            palette: self.palette.clone(),
+            foreground: self.foreground,
+            background: self.background,
+            cursor: self.cursor,
+            selection_background: self.selection_background,
+            selection_foreground: self.selection_foreground,
+        }
+    }
+}
+
+impl ColorState {
+    /// The palette entry the host configured at `index` (the theme palette, or
+    /// xterm's default when the theme sets none).
+    fn configured_palette_entry(&self, index: u8) -> Rgb {
+        self.configured_palette
+            .as_ref()
+            .map_or_else(|| ColorPalette::default_color(index), |p| p.get(index))
+    }
+
+    /// The live colours as a diff from the configured baseline: what a program
+    /// set (OSC 4/10/11/12/17/19/21) and nothing the theme supplies.
+    pub(super) fn capture_overrides(&self) -> ColorOverridesRepr {
+        let palette = (0..=u8::MAX)
+            .filter_map(|index| {
+                let rgb = self.palette().get(index);
+                (rgb != self.configured_palette_entry(index))
+                    .then_some(PaletteOverrideRepr { index, rgb })
+            })
+            .collect();
+        let slot = |live: Option<Rgb>, configured: Option<Rgb>| {
+            (live != configured).then_some(ColorSlotRepr { rgb: live })
+        };
+        ColorOverridesRepr {
+            palette,
+            foreground: (self.default_foreground != self.configured_foreground)
+                .then_some(self.default_foreground),
+            background: (self.default_background != self.configured_background)
+                .then_some(self.default_background),
+            cursor: slot(self.cursor_color, self.configured_cursor),
+            selection_background: slot(
+                self.selection_background,
+                self.configured_selection_background,
+            ),
+            selection_foreground: slot(
+                self.selection_foreground,
+                self.configured_selection_foreground,
+            ),
+        }
+    }
+
+    /// Set every live slot to its configured baseline — the palette only when
+    /// `palette` (a caller whose palette writes are gated passes the gate).
+    /// The stack is left alone.
+    pub(super) fn restore_baseline(&mut self, palette: bool) {
+        if palette {
+            match self.configured_palette.clone() {
+                Some(configured) => *self.palette_mut() = configured,
+                None => self.palette_mut().reset(),
+            }
+        }
+        self.default_foreground = self.configured_foreground;
+        self.default_background = self.configured_background;
+        self.cursor_color = self.configured_cursor;
+        self.selection_background = self.configured_selection_background;
+        self.selection_foreground = self.configured_selection_foreground;
+    }
+
+    /// Write a diff's slots over the live colours — its palette entries only
+    /// when `palette`. Slots the diff leaves out keep their live value.
+    pub(super) fn apply_overrides(&mut self, overrides: &ColorOverridesRepr, palette: bool) {
+        if palette && !overrides.palette.is_empty() {
+            let live = self.palette_mut();
+            for e in &overrides.palette {
+                live.set(e.index, e.rgb);
+            }
+        }
+        if let Some(fg) = overrides.foreground {
+            self.default_foreground = fg;
+        }
+        if let Some(bg) = overrides.background {
+            self.default_background = bg;
+        }
+        if let Some(slot) = overrides.cursor {
+            self.cursor_color = slot.rgb;
+        }
+        if let Some(slot) = overrides.selection_background {
+            self.selection_background = slot.rgb;
+        }
+        if let Some(slot) = overrides.selection_foreground {
+            self.selection_foreground = slot.rgb;
+        }
+    }
+
+    /// A whole (pre-diff) stack entry as a diff from this engine's baseline.
+    fn overrides_from_whole(&self, e: &ColorStackEntryRepr) -> ColorOverridesRepr {
+        let slot = |saved: Option<Rgb>, configured: Option<Rgb>| {
+            (saved != configured).then_some(ColorSlotRepr { rgb: saved })
+        };
+        ColorOverridesRepr {
+            palette: (0..=u8::MAX)
+                .zip(e.palette.iter())
+                .filter(|&(index, rgb)| *rgb != self.configured_palette_entry(index))
+                .map(|(index, rgb)| PaletteOverrideRepr { index, rgb: *rgb })
+                .collect(),
+            foreground: (e.foreground != self.configured_foreground).then_some(e.foreground),
+            background: (e.background != self.configured_background).then_some(e.background),
+            cursor: slot(e.cursor, self.configured_cursor),
+            selection_background: slot(
+                e.selection_background,
+                self.configured_selection_background,
+            ),
+            selection_foreground: slot(
+                e.selection_foreground,
+                self.configured_selection_foreground,
+            ),
+        }
+    }
 }
 
 /// The titles a program set: the window title, the icon name, and the
 /// XTWINOPS title stack, whole. `Default` is a terminal nothing has titled.
 ///
-/// Every string is exactly what the engine stores, which is already capped and
-/// stripped of controls on the way in; a restore does both again
-/// ([`Terminal::restore_title`]), because the wire is not the engine.
+/// Every string is what the engine stores, already capped and stripped of controls;
+/// a restore does both again ([`Terminal::restore_title`]), as the wire is untrusted.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct TitleRepr {
@@ -263,6 +473,20 @@ pub struct ShellRepr {
     /// Completed-command counter observers key on; never replayed backwards.
     #[cfg_attr(feature = "serde", serde(default))]
     pub completed_seq: u64,
+    /// Started-command counter (accepted OSC 133/633 C); never replayed
+    /// backwards. Absent from a predecessor that did not count it, and left
+    /// out at `0`, so that state re-encodes as it was written.
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "is_zero_seq"))]
+    pub started_seq: u64,
+}
+
+#[cfg(feature = "serde")]
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if hands the predicate a reference"
+)]
+fn is_zero_seq(n: &u64) -> bool {
+    *n == 0
 }
 
 impl ShellRepr {
@@ -409,95 +633,56 @@ fn state_from_wire(s: u8) -> ShellState {
 }
 
 impl Terminal {
-    /// The palette entry the host configured at `index` (the theme palette, or
-    /// xterm's default when the theme sets none).
-    fn configured_palette_entry(&self, index: u8) -> Rgb {
-        self.color
-            .configured_palette
-            .as_ref()
-            .map_or_else(|| ColorPalette::default_color(index), |p| p.get(index))
-    }
-
     /// Project the application-set colour state (see [`ColorRepr`]).
     pub(super) fn capture_color_repr(&self) -> ColorRepr {
-        let c = &self.color;
-        let palette = (0..=u8::MAX)
-            .filter_map(|index| {
-                let rgb = c.palette.get(index);
-                (rgb != self.configured_palette_entry(index))
-                    .then_some(PaletteOverrideRepr { index, rgb })
-            })
-            .collect();
-        let slot = |live: Option<Rgb>, configured: Option<Rgb>| {
-            (live != configured).then_some(ColorSlotRepr { rgb: live })
-        };
+        let ColorOverridesRepr {
+            palette,
+            foreground,
+            background,
+            cursor,
+            selection_background,
+            selection_foreground,
+        } = self.color.capture_overrides();
         ColorRepr {
             palette,
-            foreground: (c.default_foreground != c.configured_foreground)
-                .then_some(c.default_foreground),
-            background: (c.default_background != c.configured_background)
-                .then_some(c.default_background),
-            cursor: slot(c.cursor_color, c.configured_cursor),
-            selection_background: slot(c.selection_background, c.configured_selection_background),
-            selection_foreground: slot(c.selection_foreground, c.configured_selection_foreground),
-            stack: c
-                .stack
-                .iter()
-                .map(|e| ColorStackEntryRepr {
-                    palette: (0..=u8::MAX).map(|i| e.palette.get(i)).collect(),
-                    foreground: e.default_foreground,
-                    background: e.default_background,
-                    cursor: e.cursor_color,
-                    selection_background: e.selection_background,
-                    selection_foreground: e.selection_foreground,
-                })
-                .collect(),
+            foreground,
+            background,
+            cursor,
+            selection_background,
+            selection_foreground,
+            stack: Vec::new(),
+            stack_overrides: self.color.stack.iter().cloned().collect(),
         }
     }
 
-    /// Apply a carried [`ColorRepr`] over this terminal's configured colours,
-    /// through the same authority and damage path an OSC mutation takes, so the
-    /// host's colour-change callback hears about every restored slot.
+    /// Write a program's colour diff over this terminal's configured colours
+    /// (the stack excluded). Sets the slots only: [`Self::apply_color_repr`]
+    /// adds the callbacks a handoff fires, `apply_config` its own change set.
+    pub(super) fn apply_color_overrides(&mut self, overrides: &ColorOverridesRepr) {
+        self.color.apply_overrides(overrides, true);
+    }
+
+    /// Apply a carried [`ColorRepr`] over this terminal's configured colours, taking
+    /// the OSC mutation's authority and damage path (and host callback) for the
+    /// restored foreground, background, cursor and palette.
     pub(super) fn apply_color_repr(&mut self, repr: &ColorRepr) {
         use super::{ColorChangeOp, ColorTarget};
-        for e in &repr.palette {
-            self.color.palette.set(e.index, e.rgb);
-        }
-        if let Some(fg) = repr.foreground {
-            self.color.default_foreground = fg;
-        }
-        if let Some(bg) = repr.background {
-            self.color.default_background = bg;
-        }
-        if let Some(slot) = repr.cursor {
-            self.color.cursor_color = slot.rgb;
-        }
-        if let Some(slot) = repr.selection_background {
-            self.color.selection_background = slot.rgb;
-        }
-        if let Some(slot) = repr.selection_foreground {
-            self.color.selection_foreground = slot.rgb;
-        }
-        let keep = repr.stack.len().saturating_sub(COLOR_STACK_MAX_DEPTH);
-        self.color.stack = repr
-            .stack
-            .iter()
-            .skip(keep)
-            .map(|e| {
-                let mut palette = ColorPalette::new();
-                for (index, rgb) in (0..=u8::MAX).zip(e.palette.iter()) {
-                    palette.set(index, *rgb);
-                }
-                ColorStackEntry {
-                    palette,
-                    default_foreground: e.foreground,
-                    default_background: e.background,
-                    cursor_color: e.cursor,
-                    selection_background: e.selection_background,
-                    selection_foreground: e.selection_foreground,
-                }
-            })
-            .collect::<VecDeque<_>>();
+        self.apply_color_overrides(&repr.overrides());
+        // A parent that predates `stack_overrides` sent whole entries; they become
+        // diffs from this terminal's baseline.
+        let stack: Vec<ColorOverridesRepr> = if repr.stack_overrides.is_empty() {
+            repr.stack
+                .iter()
+                .map(|e| self.color.overrides_from_whole(e))
+                .collect()
+        } else {
+            repr.stack_overrides
+                .iter()
+                .map(ColorOverridesRepr::normalized)
+                .collect()
+        };
+        let keep = stack.len().saturating_sub(COLOR_STACK_MAX_DEPTH);
+        self.color.stack = stack.into_iter().skip(keep).collect::<VecDeque<_>>();
 
         let (_parser, mut handler) = self.split_for_process();
         if let Some(fg) = repr.foreground {
@@ -544,6 +729,7 @@ impl Terminal {
                 .collect(),
             next_block_id: s.next_block_id,
             completed_seq: s.completed_seq,
+            started_seq: s.started_seq,
         }
     }
 
@@ -562,15 +748,12 @@ impl Terminal {
     }
 
     /// Install a carried [`TitleRepr`] as if a program had sent it: every string
-    /// capped and stripped the way the OSC handler stores one, and the stack cut
-    /// to [`TITLE_STACK_MAX_DEPTH`] entries — its bottom ones, because that is
-    /// what a live engine keeps when a push finds the stack full (the push is
-    /// dropped). A real change of the window title bumps the title epoch, so a
-    /// host polling [`Terminal::title_epoch`] relabels the tab.
+    /// capped and stripped as the OSC handler stores one, and the stack cut to its
+    /// bottom [`TITLE_STACK_MAX_DEPTH`] entries, as a live engine drops a push onto a
+    /// full stack. A real window-title change bumps [`Terminal::title_epoch`].
     ///
-    /// Why not the host's `set_title`: it caps but does not sanitize, since a
-    /// host sets its own words. A carried title is the previous process's copy
-    /// of a program's words, read back from a file, and gets the program's rules.
+    /// Not the host's `set_title`, which caps but does not sanitize: a carried title
+    /// is a program's words read back from a file, so it gets the program's rules.
     pub fn restore_title(&mut self, repr: &TitleRepr) {
         let window = carried_title(&repr.window);
         if *self.title.window != *window {
@@ -612,9 +795,10 @@ impl Terminal {
             .cloned()
             .map(OutputBlockRepr::into_block)
             .collect();
-        // Monotonic counters only ever move forward, even onto a terminal that
-        // already counted some commands of its own.
+        // Monotonic counters only move forward, even onto a terminal that already
+        // counted commands of its own.
         s.next_block_id = s.next_block_id.max(repr.next_block_id);
         s.completed_seq = s.completed_seq.max(repr.completed_seq);
+        s.started_seq = s.started_seq.max(repr.started_seq);
     }
 }

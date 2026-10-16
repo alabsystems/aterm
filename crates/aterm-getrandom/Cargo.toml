@@ -1,0 +1,69 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+# THE DIRECTORY AND THE PACKAGE NAME DIFFER ON PURPOSE, as with
+# crates/aterm-cfg-if, crates/aterm-once-cell and crates/aterm-log-shim:
+# `[patch.crates-io]` matches on PACKAGE name, so the package must be called
+# `getrandom` to take ring's `getrandom = "0.2.10"` edge; the directory keeps
+# the `aterm-` prefix so nobody mistakes this for a vendored upstream.
+name = "getrandom"
+# NOT `version.workspace = true`: a SEMVER CONTRACT with the consumers. ring
+# 0.17.14 asks `^0.2.10` and astream-aead (aterm's `sealed` feature) `^0.2`;
+# 0.2.17 is what the lock held before the swap and upstream's latest 0.2. It
+# must stay >= every other `0.2.x` in the graph, or cargo resolves the registry
+# copy and the patch row replaces nothing with no warning
+# (`targo --unverified forge check` [OB-12] says so). getrandom 0.3 and 0.4 are
+# other majors and stay registry packages; neither is in a shipped cell.
+version = "0.2.17"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "First-party `getrandom` 0.2 for aterm (forwards to aterm_uds::rand::fill, the workspace's one entropy surface; replaces the crates.io getrandom 0.2 under ring)"
+
+[lib]
+name = "getrandom"
+path = "src/lib.rs"
+
+[features]
+# Upstream's feature names, declared (a `[patch]` target must accept every
+# feature its consumers ask for) and INERT. No aterm cell enables any of them;
+# ring forwards `js` only from its own `wasm32_unknown_unknown_js`, which
+# nothing here turns on. What each would change upstream, and does not here:
+#   std                     the `std::error::Error` impl and `From<Error> for
+#                           io::Error` (always present here: this crate is std)
+#   custom                  `register_custom_getrandom!` on targets with no
+#                           backend (absent: a caller fails to compile)
+#   js, rdrand              a wasm32 JavaScript or x86 RDRAND backend (absent:
+#                           those targets return Err(UNSUPPORTED))
+#   linux_disable_fallback  drops the /dev/urandom fallback (kept here)
+# The rest complete upstream's table: `rustc-dep-of-std` and `test-in-browser`,
+# and the names cargo synthesizes from upstream's optional dependencies.
+std = []
+custom = []
+js = ["wasm-bindgen", "js-sys"]
+rdrand = []
+linux_disable_fallback = []
+rustc-dep-of-std = ["compiler_builtins", "core"]
+test-in-browser = []
+compiler_builtins = []
+core = []
+wasm-bindgen = []
+js-sys = []
+
+# The one entropy surface (deny.toml's getrandom ban names it). No other
+# dependency: upstream's cfg-if, libc and wasi go with it, and `wasi` leaves
+# Cargo.lock. Elsewhere (wasm32, where no aterm crate needs entropy) there is
+# no backend at all and a non-empty request is Err(UNSUPPORTED).
+[target.'cfg(any(unix, windows))'.dependencies]
+aterm-uds = { workspace = true }
+
+[dev-dependencies]
+# The consumer that matters: `ring::rand::SystemRandom` reaches this package
+# through the `[patch.crates-io]` row (tests/fill.rs). Not an oracle: ring is
+# not patched, and a registry getrandom cannot be a dev-dependency here (the
+# patch would capture it; `forge check` [OB-15]).
+ring = { workspace = true }
+
+[lints]
+workspace = true

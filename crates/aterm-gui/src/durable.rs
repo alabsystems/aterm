@@ -22,8 +22,8 @@ pub(crate) fn sync_all(file: &File) -> std::io::Result<()> {
 /// the same point and in the same order, so a test sees the same files, renames and
 /// errors. What it drops is the drive-cache barrier. No test can observe that barrier,
 /// because it only orders the disk against a power loss. It also stalls the whole
-/// VOLUME while it runs, so every test binary the gate runs beside this one waits behind
-/// it for its own temp-dir metadata. Measured 2026-10-05: one `aterm-gui --lib` run made
+/// VOLUME while it runs, so every test binary running beside this one waits behind
+/// it for its own temp-dir metadata. Measured: one `aterm-gui --lib` run made
 /// 4,763 `F_FULLFSYNC`s, 2,477 of them the restore manifest's. Run alone,
 /// `crash_journal_conformance::the_real_journal_conforms_to_the_model` went from
 /// 13.6-17.0 s to 3.7 s when they became `fsync(2)`, and a no-op flush gained nothing

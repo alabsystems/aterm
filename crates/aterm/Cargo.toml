@@ -12,10 +12,8 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "aterm — THE one binary: the transparent terminal session, the GPU window, and every verb (ctl/pkg/fleet/drive/help), behind a single name."
-# Two `[[bin]]` targets below, so `cargo run -p aterm` must be told which one it
-# means — without this it refuses on every platform ("could not determine which
-# binary to run", measured 2026-09-27), and CONTRIBUTING.md's build-from-source
-# check is exactly that command.
+# Select the product front door when `targo --unverified run -p aterm` omits
+# `--bin`; the Windows launcher below is a second development target.
 default-run = "aterm"
 
 [[bin]]
@@ -71,17 +69,10 @@ aterm-update = { path = "../aterm-update" }
 # internals beyond the file.
 aterm-update-core = { path = "../aterm-update-core" }
 aterm-log = { path = "../aterm-log" }    # the log facade (the update verb records to aterm.log)
-# THE compiler gate (crates/trust-gate): a build script with no dependencies
-# that refuses any non-Trust rustc FIRST, with the one message naming the fix
-# (`aterm pkg doctor`, or the installer), instead of letting an upstream
-# compiler die deep in the graph on Trust-only syntax. Native builds only
-# (TARGET == HOST): the release's x86_64 compat slice is a cross build on
-# upstream stable and is not gated. The library is empty; nothing links in.
-trust-gate = { path = "../trust-gate" }
 # `aterm_uds::spawnfd::command` for the windowed front door's launch (Windows: no
 # descriptor to strip there, and one spelling of a spawn everywhere,
-# `tools/grep_guard.sh` B27), with its console flag (`Console::Detached`) from
-# `aterm_uds::spawn::set_flags`, the one creation-flags setter (B28). Every
+# clippy.toml: one child constructor), with its console flag (`Console::Detached`)
+# from `aterm_uds::spawn::set_gui_image_flags`. Every
 # live-headless test arms its instance with this crate's lifeline too
 # (`tests/support/launch_isolation.rs::lifeline`), so a killed test run takes its
 # instances with it. A dependency-free leaf the binary links already.
@@ -96,26 +87,19 @@ aterm-uds = { workspace = true }
 # off-by-default `sealed` feature, so this adds no cipher tree to the shipped
 # binary.
 #
-# UNIX ONLY, on purpose (2026-09-14): the bridge is Unix-domain sockets and
+# UNIX ONLY, on purpose: the bridge is Unix-domain sockets and
 # descriptors inherited at fixed numbers (`aterm_uds::spawnfd`: `dup2` between
 # fork and exec) end to end — `std::os::unix` and `std::os::fd` at module
-# level across ctl.rs, mirror.rs and transport.rs — and its Unix-domain
-# sharding in the astream broker (`astream_broker::sharded`) is
-# `cfg(unix)` too (the broker itself serves TCP on Windows); on macOS the
-# broker is kept alive by launchd. Unconditional, it made the shipped Windows
-# binary unbuildable from the commit that made it a workspace member
-# (2026-09-12, shipped as v0.82.0), and no gate RAN that said so: `xtask gate
-# cells --cell win` type-checks `-p aterm` for x86_64-pc-windows-msvc and
-# would have failed on the `std::os::unix` imports, but it lives behind
-# `tools/verify.sh --full` and nothing ran it between v0.82.0 and 2026-09-14;
-# the x86_64-pc-windows-gnu cfg-validation lane (.cargo/config.toml's
-# `[target.x86_64-pc-windows-gnu]` linker/ar pair) was dead too, from the libc
-# swap until 2026-09-16, because crates/aterm-libc listed no windows-gnu cell
-# and the lane therefore died on a `compile_error!` at the BOTTOM of the graph,
-# before one line of `cfg(windows)` code was read. That cell is listed now —
-# `cargo +stable check --target x86_64-pc-windows-gnu -p aterm` is green — and
-# crates/aterm-libc/tests/target_gate.rs is the standing guard that keeps a
-# configured lane and that cell list in step from any box. On non-unix targets the
+# level in ctl.rs, and a Unix-socket dial and owner-only permission bits in
+# transport.rs — and astream has that face only on unix too (`Broker::serve` is
+# `cfg(unix)`, and `connect` refuses `Transport::Unix` elsewhere; the broker
+# itself serves TCP on Windows); on macOS the broker is kept alive by launchd.
+# Unconditional, it would make the Windows binary unbuildable: `verify cells`
+# type-checks `-p aterm` for x86_64-pc-windows-msvc and fails on the
+# `std::os::unix` imports. The x86_64-pc-windows-gnu cfg-validation lane
+# (.cargo/config.toml's `[target.x86_64-pc-windows-gnu]` linker/ar pair) needs
+# crates/aterm-libc's windows-gnu cell, or it dies on a `compile_error!` at the
+# BOTTOM of the graph before one line of `cfg(windows)` code is read. On non-unix targets the
 # `link` verb stays on the roster and refuses by name (src/main.rs
 # `link_unavailable`) instead of failing to exist.
 [target.'cfg(unix)'.dependencies]
@@ -149,7 +133,7 @@ dev-seams = [
 [dev-dependencies]
 # The live tests' raw process and descriptor calls (signals, waits, process groups, fd flags, rlimits).
 libc = { workspace = true }
-# Private scratch directories removed on drop.
+# Private scratch directories removed on drop, and `stand_in` programs.
 aterm-tempfile = { workspace = true }
 # The live tests' bounded polls (`aterm_spec::wait`): one hang-detector loop.
 aterm-spec = { workspace = true }
@@ -161,6 +145,16 @@ aterm-spec = { workspace = true }
 # spawned onto it kept a copy of its own master. Already in the graph through
 # aterm-gui.
 aterm-pty = { workspace = true }
+# The fabric worlds' fixture config is asserted as TOML.
+aterm-toml = { workspace = true }
+# `fabric status --json` is asserted as JSON, not as substrings.
+aterm-json = { workspace = true }
+
+# The fabric worlds (`tests/fabric_world`, `tests/two_nodes_sealed.rs`): an
+# in-process guarded broker and the caps minted for it.
+[target.'cfg(unix)'.dev-dependencies]
+astream-broker = { path = "../../vendor/astream/crates/astream-broker", features = ["cap"] }
+astream-cap = { path = "../../vendor/astream/crates/astream-cap" }
 
 [build-dependencies]
 # Windows only: compile + link the icon, the side-by-side manifest and
@@ -182,6 +176,19 @@ workspace = true
 [[test]]
 name = "aterm_suite"
 path = "tests/aterm_suite.rs"
+
+# The fabric worlds: a broker, this binary `--headless` and the `aterm link
+# serve` bridge it launches. Its own binary: its harness caps the live stacks
+# it holds at once.
+[[test]]
+name = "fabric_world"
+path = "tests/fabric_world/main.rs"
+
+# The sealed cross-host rung: the one target that builds the cipher tree.
+[[test]]
+name = "two_nodes_sealed"
+path = "tests/two_nodes_sealed.rs"
+required-features = ["sealed"]
 
 # Alone: re-execs its own binary with an `--exact` filter.
 [[test]]

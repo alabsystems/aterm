@@ -23,6 +23,7 @@ fn file_with(pid: Option<u32>, heartbeat_unix: u64) -> ProgressFile {
         pid,
         pass: "net".to_string(),
         started_unix: 1,
+        generation: None,
         heartbeat_unix,
         overall: Overall {
             programs_done: 0,

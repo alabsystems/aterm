@@ -990,8 +990,8 @@ fn json_corpus(root: &std::path::Path) -> Vec<std::path::PathBuf> {
 
 /// Whether the corpus walk stays out of `dir`: `target`, `.git` and
 /// `target-tippy` at any depth, and at the repository root every `target-*`
-/// sibling build dir (the gate's per-lane dirs) and the gate's `.aterm-verify`
-/// state dir, which the checked-in .gitignore names as `/target-*` and
+/// sibling build dir (`target-trust`, older lanes' leftovers) and a leftover
+/// `.aterm-verify` state dir, which the checked-in .gitignore names as `/target-*` and
 /// `/.aterm-verify/`.
 fn corpus_skips(root: &std::path::Path, dir: &std::path::Path) -> bool {
     let Some(name) = dir.file_name().and_then(|n| n.to_str()) else {

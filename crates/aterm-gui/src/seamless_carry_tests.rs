@@ -94,6 +94,7 @@ pub(super) fn pre_carry_parse(toml: &str) -> Option<SessionHandoff> {
                 attention: r.attention,
                 // That build had no question policy to carry.
                 questions: None,
+                autopilot: None,
                 control: None,
                 frozen_path: false,
                 identity: None,
@@ -106,6 +107,7 @@ pub(super) fn pre_carry_parse(toml: &str) -> Option<SessionHandoff> {
                 history_withheld: false,
                 history_lost: 0,
                 hold: None,
+                more_holds: Vec::new(),
                 supervisor: None,
                 claim_known: false,
                 attention_owners: Vec::new(),
@@ -113,6 +115,7 @@ pub(super) fn pre_carry_parse(toml: &str) -> Option<SessionHandoff> {
                 render_debt: None,
                 fabric: Default::default(),
                 timeline_id: 0,
+                log_ids: None,
                 journal_key: None,
             })
             .collect(),
@@ -851,6 +854,8 @@ fn manifests_cross_between_the_two_shapes_both_ways() {
             // Set on purpose: a worker's question policy stays with it across
             // the update.
             questions: Some("recommended".to_string()),
+            // Set on purpose too: an Off session stays Off across the update.
+            autopilot: Some("off".to_string()),
             control: Some(handoff_carry::stamp(b"{}")),
             frozen_path: true,
             identity: Some("worker".to_string()),
@@ -867,6 +872,7 @@ fn manifests_cross_between_the_two_shapes_both_ways() {
             history_withheld: false,
             history_lost: 0,
             hold: None,
+            more_holds: Vec::new(),
             supervisor: None,
             claim_known: false,
             attention_owners: Vec::new(),
@@ -876,6 +882,7 @@ fn manifests_cross_between_the_two_shapes_both_ways() {
             render_debt: Some("-1,0".to_string()),
             fabric: Default::default(),
             timeline_id: 0,
+            log_ids: None,
             journal_key: None,
         }],
         roster_seq: None,
@@ -901,6 +908,10 @@ fn manifests_cross_between_the_two_shapes_both_ways() {
     assert!(
         wire.contains("questions = \"recommended\"") && !old_wire.contains("questions"),
         "the question policy rides this build's wire and an old reader drops it"
+    );
+    assert!(
+        wire.contains("autopilot = \"off\"") && !old_wire.contains("autopilot"),
+        "the Autopilot word rides this build's wire and an old reader drops it"
     );
     assert!(
         wire.contains("render_debt = \"-1,0\"") && !old_wire.contains("render_debt"),

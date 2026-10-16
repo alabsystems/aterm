@@ -7,12 +7,13 @@
 //! This crate is published into the build under the package name `log` (the
 //! directory is `crates/aterm-log-shim`; see the manifest for why the two names
 //! differ, and why this one needed a suffix) so that `[patch.crates-io]` can
-//! redirect the **fourteen** third-party consumers in aterm's graph at code we
-//! own. It replaces `log 0.4.32` — 6,286 lines of Rust in the package, 5,698 of
-//! them under `src/` — with a six-element lattice and seven macros that do
-//! nothing at all.
+//! redirect the **thirteen** third-party consumers in aterm's graph at code we
+//! own (fourteen when it landed; rustybuzz left at TF.6 of
+//! `docs/AUDIT-third-party-2026-10-15.md`). It replaces `log 0.4.32` — 6,286
+//! lines of Rust in the package, 5,698 of them under `src/` — with a
+//! six-element lattice and seven macros that do nothing at all.
 //!
-//! # The consumers, all fourteen, per cell
+//! # The consumers, all thirteen, per cell
 //!
 //! The brief this crate was built from named seven. Re-derived here — and the
 //! re-derivation is the point, because eight of them are absent from the mac
@@ -27,12 +28,18 @@
 //! `log` — this path member — and every consumer below resolves to it.
 //!
 //! * **all four cells** (mac-arm, windows-msvc, linux-gnu, wasm32) — `naga`,
-//!   `wgpu`, `wgpu-core`, `wgpu-hal`, `wgpu-types`, `rustybuzz`
+//!   `wgpu`, `wgpu-core`, `wgpu-hal`, `wgpu-types`. On mac they are the wgpu
+//!   oracle's test graph only: since `rustybuzz`, the one consumer every
+//!   shipped cell compiled, left at TF.6, the shipped mac graph has no `log`.
 //! * **windows + linux** — `gpu-allocator`
 //! * **linux only** — `calloop`, `sctk-adwaita`, `smithay-client-toolkit`,
 //!   `tiny-skia`, `wayland-sys`, `xkbcommon-dl`
-//! * **windows build-dependency** — `gl_generator` (under `glutin_wgl_sys`),
-//!   the graph's only `#[macro_use] extern crate log;`
+//! * **lock only** — `gl_generator`, the graph's only
+//!   `#[macro_use] extern crate log;`. It is a build-dependency of
+//!   `glutin_wgl_sys`, under wgpu-hal's GL backend on Windows, which no cell
+//!   turns on (Windows builds `dx12`; `gles` is wasm32's, where
+//!   `glutin_wgl_sys` is cfg'd out). Measured 2026-10-16 with `--target
+//!   x86_64-pc-windows-msvc`; `--target all` ignores the cfg and lists it.
 //!
 //! `-e all`, not `-e normal`: a consumer reached only through a dev or build
 //! edge (`gl_generator` is one) is invisible to a `-e normal` census.
@@ -160,8 +167,9 @@
 //!    implements upstream's `FromStr` exactly and has no `parse`.
 //! 4. **`no_std`.** `aterm_log` is std-only (`std::sync::OnceLock`,
 //!    `std::borrow::Cow`, `std::error::Error`, a whole `pub mod env` over
-//!    `std::env`). Seven consumers are `#![no_std]` — naga, wgpu, wgpu-core,
-//!    wgpu-hal, wgpu-types, rustybuzz, tiny-skia — and none enables `log/std`.
+//!    `std::env`). Six consumers are `#![no_std]` — naga, wgpu, wgpu-core,
+//!    wgpu-hal, wgpu-types, tiny-skia (rustybuzz was a seventh until TF.6) —
+//!    and none enables `log/std`.
 //!
 //! Reasons 2 and 3 are the decisive ones, because they are cases where
 //! delegating would ship an API that is *wrong*, not merely inelegant. Reason 1
@@ -215,10 +223,11 @@
 //! `--cap-lints allow`) or the Windows build-dep `gl_generator` (also registry).
 //! No first-party aterm crate depends on crates.io `log` — grepped across every
 //! workspace `Cargo.toml`, the only hits are `crates/aterm-tracing`'s inert
-//! `log = []` / `log-always = ["log"]` *feature names* — and `vendor/winit`, the
-//! one path dependency that does not get `--cap-lints`, contains zero `log::`
-//! references. So the workspace's `-D warnings` gate is untouched. Re-check that
-//! claim if any aterm crate ever takes a `log` dependency.
+//! `log = []` / `log-always = ["log"]` *feature names* — and
+//! `crates/aterm-window`, the absorbed winit (a member, held to `-D warnings`),
+//! contains zero `log::` references. So the workspace's `-D warnings` gate is
+//! untouched. Re-check that claim if any aterm crate ever takes a `log`
+//! dependency.
 //!
 //! The alternative — a `let _ = &$arg;` per argument to keep names "used" — was
 //! rejected for the same reason `crates/aterm-tracing` rejected it: taking a
@@ -228,13 +237,14 @@
 //! # Proof of surface
 //!
 //! macOS resolves `wgpu-hal` to `default, metal, portable-atomic` — no dx12, no
-//! gles, no vulkan. So a local build reaches the five LEVEL macros in bulk
-//! (naga, rustybuzz) and, of the hard forms, only naga's three `log!` sites and its one
-//! `log_enabled!`. Invisible here: all seven wgpu-hal `log!` sites, all four
-//! `max_level()` sites, the `const &[(&str, log::Level)]` array, the five
-//! `level == log::Level::…` comparisons, gpu-allocator's glob and its two
-//! raw-string `log!`s, smithay's eighteen `target:` forms, and gl_generator's
-//! `#[macro_use] extern crate log;`.
+//! gles, no vulkan. So a local build (the wgpu oracle's test graph; the shipped
+//! mac graph has no `log` since TF.6) reaches the five LEVEL macros in bulk
+//! (naga, and rustybuzz until TF.6) and, of the hard forms, only naga's three
+//! `log!` sites and its one `log_enabled!`. Invisible here: all seven wgpu-hal
+//! `log!` sites, all four `max_level()` sites, the
+//! `const &[(&str, log::Level)]` array, the five `level == log::Level::…`
+//! comparisons, gpu-allocator's glob and its two raw-string `log!`s, smithay's
+//! eighteen `target:` forms, and gl_generator's `#[macro_use] extern crate log;`.
 //!
 //! ## A real patch, run
 //!
@@ -286,9 +296,9 @@
 
 #![no_std]
 // `no_std` unconditionally, and not behind the `std` feature — the same choice
-// `crates/aterm-tracing` made and for a sharper reason. Seven of the fourteen
+// `crates/aterm-tracing` made and for a sharper reason. Six of the thirteen
 // consumers are `#![no_std]` (naga, wgpu, wgpu-core, wgpu-hal, wgpu-types,
-// rustybuzz, tiny-skia) and `gpu-allocator` is
+// tiny-skia; rustybuzz was a seventh until TF.6) and `gpu-allocator` is
 // `#![cfg_attr(not(feature = "std"), no_std)]`; none of them enables `log/std`,
 // measured on all four cells. Nothing in this crate needs an allocator or an
 // OS, so the simplest way to guarantee it keeps working for them is to never

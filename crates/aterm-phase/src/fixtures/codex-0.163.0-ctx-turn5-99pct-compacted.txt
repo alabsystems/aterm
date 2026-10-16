@@ -1,0 +1,51 @@
+# codex-cli 0.163.0 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (144x50, aterm 0.105.0) running the real Codex, launched by path with a scratch `CODEX_HOME`, the lab provider `base_url=http://127.0.0.1:<port>/v1`, `wire_api = "responses"`, a fake `env_key` (a local stub of the Responses API, crates/aterm-lab) · Codex 0.163.0 idle after a turn at 99.6% (every answer's usage input 257000 + output 300 of model_context_window 258400): pre-turn auto-compaction ran, then the turn; footer gains a warning item, no context-left item
+› stream cut test H status 502
+http://127.0.0.1:49683/v1/responses
+
+
+› stream cut test I recovers
+
+
+• Hi! I am the local lab stub, not a model. (reply 100)
+
+  Worked for <1s • 11:27 AM
+
+
+› context fill turn 1
+
+
+• Context-fill answer: input 129000 output 200.
+
+  Worked for <1s • 11:27 AM
+
+
+› context fill turn 2
+
+
+• Context-fill answer: input 206000 output 700.
+
+  Worked for <1s • 11:27 AM
+
+
+› context fill turn 3
+
+
+• Context-fill answer: input 245000 output 500.
+
+  Worked for <1s • 11:28 AM
+
+
+› context fill turn 4
+
+
+• Context compacted · 0s
+
+• Context-fill answer: input 257000 output 300.
+
+  Worked for <1s • 11:28 AM
+
+
+› Ask Codex to do anything
+
+  GPT-6.1-Sol default · /private/tmp/at.lI6N/proj · lab stub
+  ? for shortcuts                                                                                                      ⚠ 1 warning · f2 to view

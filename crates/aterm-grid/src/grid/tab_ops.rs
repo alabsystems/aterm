@@ -19,7 +19,6 @@ impl Grid {
     /// ENSURES: self.storage.cursor.col <= self.storage.max_col_for_row(self.storage.cursor.row)
     #[inline]
     pub fn tab(&mut self) {
-        // pending_wrap is preserved (see module docs).
         let max_col = self.storage.max_col_for_row(self.storage.cursor.row);
         let start = usize::from(self.storage.cursor.col.saturating_add(1));
         let end = usize::from(max_col);
@@ -34,7 +33,6 @@ impl Grid {
             }
         }
         if !found {
-            // No tab stop found, move to last column
             self.storage.cursor.col = max_col;
         }
         debug_assert!(
@@ -50,13 +48,9 @@ impl Grid {
             self.tab();
             return;
         }
-        // NOTE: pending_wrap is deliberately preserved (xterm TabToNextStop
-        // never touches do_wrap; see module docs).
         let margins = self.storage.horizontal_margins();
         let max_col = self.storage.max_col_for_row(self.storage.cursor.row);
         let col = self.storage.cursor.col;
-        // Only constrain to margins when cursor is inside the margin region.
-        // When outside, use the screen edge (matching cursor_forward_margin).
         let in_margins = col >= margins.left && col <= margins.right;
         let right_bound = if in_margins {
             margins.right.min(max_col)
@@ -106,12 +100,10 @@ impl Grid {
     /// ENSURES: self.storage.cursor.col <= old(self.storage.cursor.col)
     #[inline]
     pub fn back_tab(&mut self) {
-        // pending_wrap is preserved, as in `tab()` (xterm's `TabToPrevStop`
-        // never calls `ResetWrap`).
         let max_col = usize::from(self.storage.max_col_for_row(self.storage.cursor.row));
         let current = usize::from(self.storage.cursor.col).min(max_col);
         if current == 0 {
-            return; // Already at column 0
+            return;
         }
         for col in (0..current).rev() {
             if self.storage.tab_stops[col] {
@@ -119,35 +111,29 @@ impl Grid {
                 return;
             }
         }
-        // No tab stop found, move to column 0
         self.storage.cursor.col = 0;
     }
 
-    /// Margin-aware back tab (CBT): origin mode decides whether the left margin
-    /// binds, not DECLRMM.
-    ///
-    /// VT510's CBT stops at column one, and DECOM turns "column one" into "the
-    /// left margin". xterm's `TabToPrevStop` clamps to `ScrnLeftMargin` only
-    /// under ORIGIN, as does Ghostty's `horizontalTabBack`; `ScrnLeftMargin` is
-    /// 0 unless DECLRMM is on, so both flags must be set (hence two parameters).
-    /// CUB clamps on the margin unconditionally; CBT does not.
-    ///
-    /// A cursor already left of the left margin stands still rather than being
-    /// dragged forward onto it (as Ghostty does; xterm drags it).
+    /// Margin-aware back tab (CBT): the left margin binds only when DECLRMM and
+    /// origin mode are both on. VT510's CBT stops at column one, which DECOM
+    /// makes the left margin; xterm's `TabToPrevStop` and Ghostty's
+    /// `horizontalTabBack` clamp to it only under origin mode, and xterm's left
+    /// margin is 0 unless DECLRMM is on. Unlike CUB, CBT does not clamp
+    /// otherwise. A cursor already left of the margin stays put (as in Ghostty;
+    /// xterm drags it forward).
     #[inline]
     pub fn back_tab_margin(&mut self, left_right_margin_mode: bool, origin_mode: bool) {
         if !(left_right_margin_mode && origin_mode) {
             self.back_tab();
             return;
         }
-        // pending_wrap preserved — see `back_tab`.
         let margins = self.storage.horizontal_margins();
         let max_col = usize::from(self.storage.max_col_for_row(self.storage.cursor.row));
         let current = usize::from(self.storage.cursor.col).min(max_col);
         let left_bound = usize::from(margins.left);
         if current <= left_bound {
-            // At the margin, or already outside it to the left: a BACKWARD tab
-            // never moves the cursor forward (Ghostty's guard, not xterm's clamp).
+            // At or left of the margin: a backward tab never moves the cursor
+            // forward (Ghostty's guard, not xterm's clamp).
             return;
         }
         for col in (left_bound..current).rev() {
@@ -156,7 +142,6 @@ impl Grid {
                 return;
             }
         }
-        // No tab stop found, move to boundary
         self.storage.cursor.col = row_u16(left_bound);
     }
 
@@ -171,8 +156,7 @@ impl Grid {
         }
     }
 
-    /// Margin-aware back tab by n stops — see [`Grid::back_tab_margin`] for why
-    /// the left margin binds only under origin mode.
+    /// Margin-aware back tab by n stops (see [`Grid::back_tab_margin`]).
     #[inline]
     pub fn back_tab_n_margin(&mut self, n: u16, left_right_margin_mode: bool, origin_mode: bool) {
         for _ in 0..n {

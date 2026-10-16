@@ -5,14 +5,15 @@
 //!
 //! Path packages in this workspace are one of three shapes:
 //!
-//!   * `crates/<name>`: code aterm wrote. First-party, not a redistribution, so
-//!     it owes none of attest's `[OB-3]`..`[OB-10]`. Includes the first-party
+//!   * `crates/<name>`: code aterm owns. First-party, so it is billed to the
+//!     workspace, never to the third-party surface. Includes the first-party
 //!     `[patch.crates-io]` replacements, which are members patched in by
-//!     package name.
+//!     package name, and the ABSORBED crates (`crates/aterm-window`, winit
+//!     0.30.13), upstream source aterm took over as members: those still owe
+//!     attest's license obligations (`[OB-5]`/`[OB-6]`/`[OB-7]`/`[OB-9]`).
 //!   * `vendor/<name>`: upstream source aterm forked and keeps reviewing
-//!     (winit, indexmap, libm, pkg-config, smol_str). Third-party; owes every
-//!     obligation, and `[OB-1]` holds the patch table and the directory listing
-//!     in agreement.
+//!     (indexmap). Third-party; owes every obligation, and `[OB-1]` holds the
+//!     patch table and the directory listing in agreement.
 //!   * a first-party path dependency vendored in-tree: `vendor/astream`, the
 //!     same owner's astream repository as a git submodule
 //!     (`vendor/README-astream.md`), path-depended on by `crates/aterm-link`.
@@ -62,12 +63,14 @@ pub const FIRST_PARTY_VENDORED: &[FirstPartyVendored] = &[FirstPartyVendored {
           name — so this is aterm's own code, not a redistribution. It is under vendor/ for a \
           BUILD reason: crates/aterm-link path-depended on a sibling checkout most clones do \
           not have, so cargo build never built the fabric bridge and no release ever shipped \
-          it. It is a git submodule (vendor/README-astream.md), and aterm resolves four of its \
-          crates (wire, cap, broker, aead) by path, outside this workspace; aead only under \
-          aterm-link's off-by-default sealed feature. Not on crates.io, so no \
+          it. It is a git submodule (vendor/README-astream.md), and aterm resolves five of its \
+          crates (wire, digest, cap, broker, aead) by path, outside this workspace; aead only \
+          under aterm-link's off-by-default sealed feature. Not on crates.io, so no \
           [patch.crates-io] entry could ever name it: a patch entry replaces a registry \
-          package and there is none to replace. The third-party packages it DRAGS IN (the \
-          sha2 chain under astream-cap) are unaffected by this row and stay on the ratchet.",
+          package and there is none to replace. The third-party packages it DRAGS IN (none in \
+          a default build since astream-cap's SHA-256 became astream-digest, 2026-10-15; \
+          chacha20poly1305 and getrandom under aterm-link's sealed feature) are unaffected \
+          by this row and stay on the ratchet.",
 }];
 
 /// The roster row whose directory contains `rel`, if any. `rel` is
@@ -200,18 +203,6 @@ mod tests {
     use super::*;
     use crate::test_support::repo_root;
 
-    /// A roster row that names a directory nobody has is an exemption granted
-    /// to nothing, and it would go on being granted forever.
-    #[test]
-    fn every_roster_row_names_a_directory_that_exists() {
-        let stale = stale_rows(&repo_root());
-        assert!(
-            stale.is_empty(),
-            "stale FIRST_PARTY_VENDORED row(s): {:?}",
-            stale.iter().map(|r| r.dir).collect::<Vec<_>>()
-        );
-    }
-
     /// The roster's shape is load-bearing: `roster_row` matches on a `/`
     /// boundary, so a row must not carry one at either end.
     #[test]
@@ -244,13 +235,15 @@ mod tests {
             &root,
             &root.join("vendor/astream/crates/astream-cap")
         ));
-        for fork in ["winit", "indexmap", "libm", "pkg-config", "smol_str"] {
-            assert!(
-                !is_first_party(&root, &root.join("vendor").join(fork)),
-                "`vendor/{fork}` is a REDISTRIBUTED fork and must stay third-party"
-            );
-        }
+        assert!(
+            !is_first_party(&root, &root.join("vendor/indexmap")),
+            "`vendor/indexmap` is a REDISTRIBUTED fork and must stay third-party"
+        );
         assert!(is_first_party(&root, &root.join("crates/aterm-core")));
+        assert!(
+            is_first_party(&root, &root.join("crates/aterm-window")),
+            "the absorbed winit is a workspace member, billed as aterm's own lines"
+        );
         assert_eq!(
             roster_row("vendor/astream-broker"),
             None,

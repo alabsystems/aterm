@@ -23,6 +23,72 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+/// The accounting handle owns the wait, including a nonblocking look while a
+/// pipe handshake keeps the child alive, and caches status and usage together.
+#[cfg(all(
+    target_pointer_width = "64",
+    any(target_vendor = "apple", target_os = "linux")
+))]
+#[test]
+fn resource_accounting_reaps_once_and_keeps_the_childs_status() {
+    const NAME: &str =
+        "spawnfd::command_tests::resource_accounting_reaps_once_and_keeps_the_childs_status";
+    const ALLOCATED: usize = 8 * 1024 * 1024;
+    if std::env::var(STAGE_ENV).as_deref() == Ok("rusage") {
+        let mut memory = vec![0u8; ALLOCATED];
+        for (n, byte) in memory.iter_mut().enumerate() {
+            *byte = n as u8;
+        }
+        std::hint::black_box(&memory);
+        std::io::stdout().write_all(b"ready\n").unwrap();
+        std::io::stdout().flush().unwrap();
+        let mut go = [0];
+        std::io::stdin().read_exact(&mut go).unwrap();
+        std::process::exit(7);
+    }
+    let mut child = command(std::env::current_exe().unwrap())
+        .args([NAME, "--exact", "--nocapture"])
+        .env(STAGE_ENV, "rusage")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut ready = std::io::BufReader::new(child.stdout.take().unwrap());
+    let (sent, received) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::BufRead as _;
+        let mut line = String::new();
+        while ready.read_line(&mut line).is_ok_and(|n| n > 0) {
+            if line.ends_with("ready\n") {
+                let _ = sent.send(());
+                return;
+            }
+            line.clear();
+        }
+    });
+    received
+        .recv_timeout(Duration::from_secs(60))
+        .expect("child never reached its handshake");
+    assert_eq!(child.try_wait_with_rusage().unwrap(), None);
+    child.stdin.as_mut().unwrap().write_all(b"x").unwrap();
+    let usage = child.wait_with_rusage().unwrap();
+    assert_eq!(usage.status.code(), Some(7));
+    assert!(usage.maxrss >= ALLOCATED as u64, "{usage:?}");
+    assert!(usage.cpu > Duration::ZERO, "{usage:?}");
+    assert_eq!(child.try_wait_with_rusage().unwrap(), Some(usage));
+    assert_eq!(child.wait_with_rusage().unwrap(), usage);
+    assert_eq!(child.wait().unwrap(), usage.status);
+    assert_eq!(child.try_wait().unwrap(), Some(usage.status));
+    child.kill().unwrap();
+
+    let mut ordinary = command("/bin/sh").args(["-c", "exit 3"]).spawn().unwrap();
+    assert_eq!(ordinary.wait().unwrap().code(), Some(3));
+    assert!(
+        ordinary.try_wait_with_rusage().is_err(),
+        "a consumed status has no recoverable accounting"
+    );
+}
+
 /// A private scratch directory, removed on drop.
 struct Scratch(PathBuf);
 

@@ -399,11 +399,11 @@ end
 # by equality. The quoted `"$d"` keeps an EMPTY entry — the user's — intact.
 #
 # $ATPKG_AGENTS — set by the atpkg shell.d hook sourced just above — names
-# <prefix>/agents, which holds ONLY the claude and codex shims aterm keeps current
-# (owner decision 2026-09-10). It fails the same way (measured 2026-09-10 on m27:
-# behind /opt/homebrew/bin and ~/.local/bin), so it is moved to the front first,
-# then the reroute directory, so PATH reads reroute, agents, … — the spawn seam's
-# own order.
+# <prefix>/agents, which holds ONLY the agent shims aterm keeps current (claude,
+# codex, agy, muse; owner decisions 2026-09-10 and 2026-10-15). It fails the same
+# way (measured 2026-09-10 on m27: behind /opt/homebrew/bin and ~/.local/bin), so it
+# is moved to the front first, then the reroute directory, so PATH reads reroute,
+# agents, … — the spawn seam's own order.
 function __aterm_path_front --argument-names dir
     set -l rest
     for d in $PATH

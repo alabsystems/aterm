@@ -23,10 +23,11 @@
 //! **Semantics are the macOS arm's, not a Windows dialect.** `NSOpenPanel` there
 //! is configured `canChooseFiles` / `!canChooseDirectories` /
 //! `!allowsMultipleSelection` / `resolvesAliases`, with a title, an OK-button
-//! prompt, no allowed-content-type restriction and no forced starting directory;
-//! [`dialog_options`] maps each of those onto a `FILEOPENDIALOGOPTIONS` bit and
-//! [`ALL_FILES`] mirrors the unrestricted type list. Cancel returns `None` — a
-//! user decision, never an error.
+//! prompt, no allowed-content-type restriction for a document (images only for
+//! a wallpaper) and no forced starting directory; [`dialog_options`] maps each
+//! of those onto a `FILEOPENDIALOGOPTIONS` bit, [`ALL_FILES`] mirrors the
+//! unrestricted document list and [`PNG_IMAGES`] the images the wallpaper
+//! decoder reads here. Cancel returns `None` — a user decision, never an error.
 //!
 //! **`IFileOpenDialog`, not `GetOpenFileName`.** The Common Item Dialog is the
 //! shell's own picker (places bar, search, per-user MRU, high-DPI, dark mode);
@@ -234,16 +235,20 @@ impl Drop for Apartment {
 // The pure halves — everything a headless test can reach
 // ---------------------------------------------------------------------------
 
-/// The file-type list. ONE unrestricted row, because the macOS panel restricts
-/// nothing either (`NSOpenPanel` there is left with no `allowedContentTypes`):
-/// the wallpaper decoder and the Markdown/editor document host each validate what
-/// they were handed, and a type filter here would only be a second, drifting copy
-/// of that rule that silently hides files the runtime would have accepted.
+/// The document picker's file-type list. ONE unrestricted row, because the
+/// macOS document panel restricts nothing either: the Markdown/editor document
+/// host validates what it was handed, and a type filter here would only be a
+/// second, drifting copy of that rule that silently hides files it would have
+/// accepted.
 ///
 /// It is spelled out rather than omitted so the dialog still shows the type combo
 /// Windows users reach for; "everything" is then a visible answer instead of a
 /// missing control.
 const ALL_FILES: [(&str, &str); 1] = [("All Files", "*.*")];
+
+/// The wallpaper picker's list: off macOS the wallpaper decoder reads PNG only
+/// (`app_config::decode_wallpaper_bytes`), so that is all it offers.
+const PNG_IMAGES: [(&str, &str); 1] = [("PNG images", "*.png")];
 
 /// Owned `COMDLG_FILTERSPEC` rows: the wide buffers AND the array of pointers
 /// into them, kept together so the array cannot outlive its strings.
@@ -354,12 +359,22 @@ pub(crate) fn available() -> bool {
 /// the caller still canonicalizes, bounds, UTF-8-validates and mints the
 /// process-local document grant before reading the file.
 pub(crate) fn choose(title: &str, prompt: &str) -> Option<PathBuf> {
+    choose_from(title, prompt, &ALL_FILES)
+}
+
+/// [`choose`] offering only the images the wallpaper decoder reads here; the
+/// Windows arm of `menu::choose_local_image`.
+pub(crate) fn choose_image(title: &str, prompt: &str) -> Option<PathBuf> {
+    choose_from(title, prompt, &PNG_IMAGES)
+}
+
+fn choose_from(title: &str, prompt: &str, types: &[(&str, &str)]) -> Option<PathBuf> {
     // SAFETY: `show_dialog` is one linear pass of documented shell COM calls;
     // every pointer it hands the shell lives for the duration of its call (the
     // wide strings and the filter table are locals that outlive each use), every
     // returned interface is RAII-released, and the apartment is balanced by
     // `Apartment`'s Drop.
-    match unsafe { show_dialog(title, prompt, owner_window()) } {
+    match unsafe { show_dialog(title, prompt, types, owner_window()) } {
         Ok(picked) => picked,
         Err((step, hr)) => {
             aterm_log::warn!("file picker skipped ({step}: hr={hr:#010x})");
@@ -390,6 +405,7 @@ fn owner_window() -> isize {
 unsafe fn show_dialog(
     title: &str,
     prompt: &str,
+    types: &[(&str, &str)],
     owner: isize,
 ) -> Result<Option<PathBuf>, StepError> {
     let _apartment = Apartment::enter()?;
@@ -416,7 +432,7 @@ unsafe fn show_dialog(
     )?;
 
     // The filter table must outlive the call that reads it.
-    let filters = FilterSpecs::new(&ALL_FILES);
+    let filters = FilterSpecs::new(types);
     check(
         unsafe { (vt.set_file_types)(ptr, filters.len(), filters.as_ptr()) },
         "SetFileTypes",
@@ -580,9 +596,9 @@ mod tests {
         }
     }
 
-    /// The type list the dialog is handed must still be UNRESTRICTED — the macOS
-    /// panel sets no allowed content types, and a filter here would silently hide
-    /// files the Markdown/editor/wallpaper runtimes accept. Also pins the FFI
+    /// The document type list must still be UNRESTRICTED — the macOS document
+    /// panel sets no allowed content types, and a filter here would silently
+    /// hide files the Markdown/editor runtimes accept. Also pins the FFI
     /// shape: the array the shell reads has to point at live, NUL-terminated
     /// buffers after `FilterSpecs` was moved into place.
     #[test]

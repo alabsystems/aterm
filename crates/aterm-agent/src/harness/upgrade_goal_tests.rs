@@ -1,20 +1,17 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The goal pause, bound to the code: once the upgrade is due, aterm types
-//! `/goal pause` (or presses Esc the instant a new goal turn starts), moves
-//! Codex onto the new build, then types `/goal resume`, so no running tool call
-//! is cut off. Two tests (owner, 2026-09-28):
+//! The goal pause, bound to the code: once the upgrade is due, aterm types `/goal pause` (or
+//! presses Esc the instant a new goal turn starts), moves Codex onto the new build, then types
+//! `/goal resume`, so no running tool call is cut off.
 //!
 //! * Tier-1: the derived `HarnessUpgradeGoalPause` machine against the real
-//!   `upgrade_codex::goal_step`, `goal_owed` and `daemon_turn`, over every
-//!   state the machine reaches, each built into the visit's look
-//!   ([`cx::GoalLook`]) and projected back (`upgrade_drive::goal_projection`);
-//!   every `Buggy` member caught, every anchor entered.
-//! * A recorded goal-mode daemon client whose next turn begins 14 ms after each
-//!   one ends, replayed through the visit's assembly and the real `goal_step`:
-//!   `wait:goal` until the Land rung, the pause, the last turn run to its end,
-//!   the move, and the resume.
+//!   `upgrade_codex::goal_step`, `goal_owed` and `daemon_turn`, over every state the machine
+//!   reaches, each built into the visit's look ([`cx::GoalLook`]) and projected back
+//!   (`upgrade_drive::goal_projection`); every `Buggy` member caught, every anchor entered.
+//! * A recorded goal-mode daemon client whose next turn begins 14 ms after each one ends,
+//!   replayed through the visit's assembly and the real `goal_step`: `wait:goal` until the Land
+//!   rung, the pause, the last turn run to its end, the move, and the resume.
 
 use aterm_spec::derive::harness_upgrade_goal_pause_model;
 
@@ -120,11 +117,10 @@ fn look_of<'a>(s: &State, hold: Option<&'a Hold>) -> cx::GoalLook<'a> {
     }
 }
 
-/// The ordinary waits a visit can end on at a HELD goal's idle point — a
-/// turn, the daemon behind its client (its settle, its busy thread), a
-/// person near the tab, the ladder's settle — each worded by the real
-/// `goal_wait_word` as the visit words it, and whether the host then owns
-/// the session's turn end (`upgrade_drive::owns_turn_ends`) for every one.
+/// The ordinary waits a visit can end on at a held goal's idle point (a turn, the daemon behind
+/// its client, a person near the tab, the ladder's settle), each worded by the real
+/// `goal_wait_word`, and whether the host then owns the session's turn end
+/// (`upgrade_drive::owns_turn_ends`) for every one.
 fn every_held_wait_owns_the_turn_end() -> bool {
     [
         "wait:goal",
@@ -236,7 +232,7 @@ fn the_real_goal_pause_is_the_derived_machine() {
             s["behind"] == 1 && real_daemon_turn(s) == DaemonTurn::None,
             "Move at {s:?}"
         );
-        // ADVANCE, the ladder's clock: enabled exactly where the real rung
+        // Advance, the ladder's clock: enabled exactly where the real rung
         // stands short of Land at every age this state stands for, and past
         // it the real rung stands at Land.
         let short = behind_of(s["land"]).iter().all(|&b| !land_at(b));
@@ -295,7 +291,7 @@ fn the_real_goal_pause_is_the_derived_machine() {
             }
             seen.insert("MoveOverdue");
         }
-        // RESTED, the clock: a hold that ended without its move rests now,
+        // Rested, the clock: a hold that ended without its move rests now,
         // and once `GOAL_REST_S` has passed the real `goal_rest_until` ends
         // the rest and the look projects no hold.
         for next in model.successors("Rested", s) {
@@ -341,7 +337,7 @@ fn the_real_goal_pause_is_the_derived_machine() {
             caught.insert("LetGoPaused");
         }
         // A turn typed onto the paused thread: at every look the real rule
-        // HOLDS, every wait the visit words there owns the session's turn
+        // holds, every wait the visit words there owns the session's turn
         // end, so no supervisor continues it.
         if buggy.action_enabled("ContinuePaused", s)
             && real == cx::GoalStep::Hold
@@ -455,7 +451,7 @@ impl Goal {
     }
 }
 
-/// `rows` with the footer's goal PAUSED (`Goal paused (/goal resume)` where
+/// `rows` with the footer's goal paused (`Goal paused (/goal resume)` where
 /// `Pursuing goal (…)` was).
 fn paused_footer(mut rows: Vec<String>) -> Vec<String> {
     let footer = rows.len() - 2;
@@ -679,13 +675,11 @@ fn the_goal_mode_incident_now_moves_at_land_and_resumes_the_goal() {
     }
 }
 
-/// The paused goal behind its daemon: the replayed schedule with the Codex
-/// daemon behind too and the paused goal's thread still settling (written in
-/// the last 20 s) at the idle point after its last turn. The real rule holds,
-/// the client's step waits on its daemon, which waits on the settle, and the
-/// visit's word for that wait is `goal-held`, which owns the session's turn
-/// end, so the supervisor types nothing into that Codex until the daemon
-/// moves.
+/// The paused goal behind its daemon: the daemon behind too and the paused goal's thread still
+/// settling (written in the last 20 s) at the idle point after its last turn. The real rule holds,
+/// the client waits on its daemon, which waits on the settle, and the visit words that wait
+/// `goal-held`, which owns the session's turn end: the supervisor types nothing into that Codex
+/// until the daemon moves.
 #[test]
 fn a_paused_goal_behind_its_daemon_keeps_its_turn_ends() {
     let start = NOW - 2 * 3_600;

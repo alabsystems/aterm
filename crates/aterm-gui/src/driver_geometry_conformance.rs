@@ -793,7 +793,6 @@ fn a_peers_lease_let_go_before_its_wakes_ran_is_caught_up_by_the_timer() {
                 activity: ActivitySample {
                     alt_screen: false,
                     content_seq: 1,
-                    last_input: None,
                     last_output: Some(t0),
                 },
             };

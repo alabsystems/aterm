@@ -1,68 +1,51 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! [`Command`], [`Stdio`] and [`Child`]: `std::process`'s shapes for a child
-//! that holds its stdio and NOTHING ELSE of this process — started, on
-//! Darwin, by one `posix_spawn` with `POSIX_SPAWN_CLOEXEC_DEFAULT`, so this
-//! process never forks for it. [`super::command`] is the constructor product
-//! code uses; the parent module's docs say why it exists and what it cost
-//! before.
+//! [`Command`], [`Stdio`] and [`Child`]: `std::process`'s shapes for a child that holds its
+//! stdio and nothing else of this process, started on Darwin by one `posix_spawn` with
+//! `POSIX_SPAWN_CLOEXEC_DEFAULT`, so this process never forks for it. [`super::command`] is
+//! the constructor product code uses; the parent module's docs say why.
 //!
-//! It is `std::process::Command` where a caller can tell, and different only
-//! where `std` would hand the child more than its stdio:
+//! It is `std::process::Command` where a caller can tell, and differs only where std would hand
+//! the child more than its stdio:
 //!
-//! * **arguments, environment, working directory** — `std`'s rules: `env`,
-//!   `envs`, `env_remove` and `env_clear` edit a copy of this process's
-//!   environment taken at the spawn (a changed one is passed sorted by key,
-//!   as `std` passes it); a NUL anywhere is `InvalidInput` at the spawn.
-//! * **the program** — `execvp`'s search, which `std` gets from
-//!   `posix_spawnp` or `execvp`: a name holding a `/` is that file (relative
-//!   to the child's working directory), a bare name is searched on the `PATH`
-//!   the CHILD will hold (`/usr/bin:/bin` when it holds none), a candidate
-//!   that exists but may not be run (`EACCES`) is passed over and reported
-//!   only when nothing later starts, and a file the kernel will not exec as
-//!   an image (`ENOEXEC`) is run by `/bin/sh`. A `PATH` entry too long to
-//!   join to the name ends the search with `ENAMETOOLONG` when the child's
-//!   `PATH` is this process's own (`std` then takes `posix_spawnp`) and is
-//!   passed over when it was edited (`std` then forks and takes `execvp`).
-//!   Failures carry `std`'s errno, so `std`'s `io::ErrorKind`: `NotFound` for
-//!   a missing program (or a missing working directory), `PermissionDenied`
-//!   for one that may not be run. A failed exec is an `Err`, never a child.
-//! * **stdio** — `std`'s defaults (`spawn` and `status` inherit all three;
-//!   `output` reads `/dev/null` and pipes stdout and stderr) and modes:
-//!   [`Stdio::inherit`], [`Stdio::null`], [`Stdio::piped`] (the parent's end
-//!   comes back as `std`'s own `ChildStdin` / `ChildStdout` / `ChildStderr`),
-//!   or a descriptor (`From<OwnedFd>`, `File`, a child's pipe, an
-//!   `io::pipe()` end) placed at that number. One difference, on Darwin: an
-//!   inherited slot this process has CLOSED is given `/dev/null` — a child
-//!   born with stdout closed hands its first `open` that number (off Darwin
-//!   `std`'s rule stands: it stays closed). This process's end of a pipe
-//!   never sits on 0..=2, where it would pass for an inherited slot.
-//! * **signals** — `SIGPIPE` back to its default disposition, the others as
-//!   this process has them (both as `std`); the signal MASK starts empty,
-//!   where `std` now copies the spawning thread's — which in the window
-//!   blocks `SIGUSR1` (`aterm-gui`'s snapshot thread).
-//! * **process group and session** — [`Command::process_group`] and
-//!   [`Command::setsid`], spawn attributes on Darwin; with both, the session
-//!   wins and the child leads its own group (`0` included, which the kernel
-//!   alone would refuse with `EPERM`).
-//! * **no `pre_exec`.** Code between a fork and an exec is what this type
-//!   exists to avoid. A spawn that needs it (a PTY child's `setrlimit` and
-//!   controlling terminal, a descriptor handed over above stdio) builds a
-//!   `std::process::Command` with [`super::InheritNothing`] and is a reviewed
-//!   exception (`tools/grep_guard.sh` B27).
+//! * Arguments, environment, working directory: std's rules. `env`, `envs`, `env_remove` and
+//!   `env_clear` edit a copy of this process's environment taken at the spawn (a changed one
+//!   is passed sorted by key, as std passes it); a NUL anywhere is `InvalidInput`.
+//! * The program: `execvp`'s search. A name holding a `/` is that file (relative to the
+//!   child's working directory); a bare name is searched on the `PATH` the child will hold
+//!   (`/usr/bin:/bin` when it holds none); a candidate that may not be run (`EACCES`) is passed
+//!   over and reported only when nothing later starts; an `ENOEXEC` file is run by `/bin/sh`.
+//!   A `PATH` entry too long to join to the name ends the search with `ENAMETOOLONG` when the
+//!   child's `PATH` is this process's own (std then takes `posix_spawnp`) and is passed over
+//!   when it was edited (std then forks and takes `execvp`). Failures carry std's errno:
+//!   `NotFound` for a missing program or working directory, `PermissionDenied` for one that may
+//!   not be run. A failed exec is an `Err`, never a child.
+//! * Stdio: std's defaults (`spawn` and `status` inherit all three; `output` reads `/dev/null`
+//!   and pipes stdout and stderr) and modes: [`Stdio::inherit`], [`Stdio::null`],
+//!   [`Stdio::piped`] (the parent's end comes back as std's own `ChildStdin` / `ChildStdout` /
+//!   `ChildStderr`), or a descriptor placed at that number. One difference, on Darwin: an
+//!   inherited slot this process has closed is given `/dev/null`, since a child born with
+//!   stdout closed hands its first `open` that number (off Darwin std's rule stands). This
+//!   process's end of a pipe never sits on 0..=2, where it would pass for an inherited slot.
+//! * Signals: `SIGPIPE` back to its default, the others as this process has them (both as
+//!   std); the signal mask starts empty, where std copies the spawning thread's, which in the
+//!   window blocks `SIGUSR1` (aterm-gui's snapshot thread).
+//! * Process group and session: [`Command::process_group`] and [`Command::setsid`], spawn
+//!   attributes on Darwin; with both, the session wins and the child leads its own group.
+//! * No `pre_exec`: code between a fork and an exec is what this type exists to avoid. A
+//!   spawn that needs it (a PTY child's `setrlimit` and controlling terminal, a descriptor
+//!   handed over above stdio) builds a `std::process::Command` with
+//!   [`super::InheritNothing`] and is a reviewed exception.
 //!
-//! [`Child`] REAPS EXACTLY ONCE: the first `wait`/`try_wait` that collects the
-//! exit keeps it and every later call answers from it; `kill` after the reap
-//! signals nothing (the pid may name another process by then) and answers
-//! `Ok`, as `std` does; `wait` closes the child's stdin first, as `std` does;
-//! and dropping an unreaped handle collects a child that has already exited,
-//! so it leaves no zombie (a running one is left running, as `std` leaves it
-//! — `aterm_pty::reap_in_background` takes one a caller lets go).
+//! [`Child`] reaps exactly once: the first `wait`/`try_wait` that collects the exit keeps it
+//! and later calls answer from it; `kill` after the reap signals nothing (the pid may name
+//! another process by then) and answers `Ok`, and `wait` closes the child's stdin first, both
+//! as std does; dropping an unreaped handle collects an exited child and leaves a running one
+//! to [`crate::reaper`] (std leaves it unreaped).
 //!
-//! Off Darwin the same type starts its child through `std`, forked, with
-//! [`super::InheritStrip`] in the child — `close_range(3, ~0,
-//! CLOSE_RANGE_CLOEXEC)` on Linux — and the mask emptied there too.
+//! Off Darwin the same type starts its child through std, forked, with
+//! [`super::InheritStrip`] in the child and the mask emptied there too.
 
 use super::{F_GETFL, F_SETFL, fcntl};
 use std::collections::BTreeMap;
@@ -181,9 +164,9 @@ impl Env {
         self.vars.clear();
     }
 
-    /// Whether the child's `PATH` may differ from this process's — `std`'s
-    /// `have_changed_path`, the test that sends a bare name from
-    /// `posix_spawnp` (which searches THIS process's `PATH`) to `execvp`.
+    /// Whether the child's `PATH` may differ from this process's: std's `have_changed_path`,
+    /// the test that sends a bare name from `posix_spawnp` (which searches this process's
+    /// `PATH`) to `execvp`.
     #[cfg(target_vendor = "apple")]
     fn saw_path(&self) -> bool {
         self.clear || self.vars.contains_key(OsStr::new("PATH"))
@@ -460,7 +443,22 @@ pub struct Child {
     /// The parent's end of a piped stderr.
     pub stderr: Option<ChildStderr>,
     handle: Handle,
+    usage: Option<Rusage>,
 }
+
+/// A child's exit status and the resources it and the descendants it reaped used.
+/// Collected with `wait4` on Darwin and Linux, under the child's own reaping handle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rusage {
+    pub status: ExitStatus,
+    /// User plus system CPU time.
+    pub cpu: std::time::Duration,
+    /// The largest process's resident peak, in bytes on every host.
+    pub maxrss: u64,
+}
+
+#[path = "spawnfd_rusage.rs"]
+mod rusage;
 
 impl fmt::Debug for Child {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -474,6 +472,46 @@ impl fmt::Debug for Child {
 }
 
 impl Child {
+    /// Wait for the child and collect its resource accounting. Repeated calls return
+    /// the same result; ordinary `wait` and `try_wait` then share its cached status.
+    /// Call this before reaping through either ordinary method: resource accounting
+    /// cannot be recovered after another wait collected the child.
+    ///
+    /// # Errors
+    /// `wait4`'s, or `Unsupported` off 64-bit Darwin/Linux. An already reaped child whose
+    /// accounting was not collected returns an error without asking its old pid.
+    pub fn wait_with_rusage(&mut self) -> io::Result<Rusage> {
+        drop(self.stdin.take());
+        self.collect_rusage(true)?
+            .ok_or_else(|| io::Error::other("wait4 returned no exit status"))
+    }
+
+    /// Collect status and resource accounting if the child has exited, else `None`.
+    /// The same ownership and caching rules as [`Self::wait_with_rusage`].
+    ///
+    /// # Errors
+    /// As [`Self::wait_with_rusage`].
+    pub fn try_wait_with_rusage(&mut self) -> io::Result<Option<Rusage>> {
+        self.collect_rusage(false)
+    }
+
+    fn collect_rusage(&mut self, block: bool) -> io::Result<Option<Rusage>> {
+        if let Some(usage) = self.usage {
+            return Ok(Some(usage));
+        }
+        if self.handle.status.is_some() {
+            return Err(io::Error::other(
+                "child already reaped without resource accounting",
+            ));
+        }
+        let usage = rusage::wait(self.id(), block)?;
+        if let Some(usage) = usage {
+            self.handle.status = Some(usage.status);
+            self.usage = Some(usage);
+        }
+        Ok(usage)
+    }
+
     /// The child's pid.
     #[must_use]
     pub fn id(&self) -> u32 {
@@ -633,10 +671,9 @@ type Handle = super::LaneChild;
 
 #[cfg(target_vendor = "apple")]
 impl Command {
-    /// Replace THIS process with the program (`POSIX_SPAWN_SETEXEC`): it
-    /// holds this process's stdio and nothing else, and this process's own
-    /// table is untouched if the exec fails. Unset stdio is inherited.
-    /// Returns only on failure.
+    /// Replace this process with the program (`POSIX_SPAWN_SETEXEC`): it holds this process's
+    /// stdio and nothing else, and this process's own table is untouched if the exec fails.
+    /// Unset stdio is inherited. Returns only on failure.
     pub fn exec(&mut self) -> io::Error {
         match self.launch(Fallback::Inherit, true, true) {
             Ok(_) => io::Error::other("the exec returned a child"),
@@ -651,6 +688,7 @@ impl Command {
             stdout: stdout.map(ChildStdout::from),
             stderr: stderr.map(ChildStderr::from),
             handle: super::LaneChild { pid, status: None },
+            usage: None,
         })
     }
 
@@ -726,16 +764,13 @@ impl Command {
             };
         }
         if replace {
-            // Darwin's `POSIX_SPAWN_SETEXEC` closes this process's close-on-exec
-            // descriptors BEFORE it runs the file actions, so a `dup2` or an
-            // inherit FROM one answers `EBADF` (measured 2026-10-01: a handed
-            // `File`, a pipe end, or a stdio of ours carrying the flag) — and
-            // every descriptor `std` opens carries it. The exec takes each such
-            // source from a copy without the flag: `CLOEXEC_DEFAULT` still keeps
-            // the copy itself out of the new image, and a failed exec closes it
-            // with the rest of `handed`. A fork on another thread in that instant
-            // would inherit the copy: exec from a quiescent process (the keeper's
-            // re-exec is one). An unflagged source is inherited as it is.
+            // `POSIX_SPAWN_SETEXEC` closes this process's close-on-exec descriptors before it
+            // runs the file actions, so a `dup2` or an inherit from one answers `EBADF`, and
+            // every descriptor std opens carries the flag. The exec takes each such source from
+            // a copy without it: `CLOEXEC_DEFAULT` still keeps the copy itself out of the new
+            // image, and a failed exec closes it with the rest of `handed`. A fork on another
+            // thread in that instant would inherit the copy: exec from a quiescent process (the
+            // keeper's re-exec is one). An unflagged source is inherited as it is.
             for (target, source) in (0..).zip(sources.iter_mut()) {
                 let fd = match *source {
                     Source::Fd(fd) => fd,
@@ -781,34 +816,55 @@ impl Command {
 // Elsewhere: std's fork, with the strip in the child
 // ---------------------------------------------------------------------------
 
-/// A `std` child, collected on drop if it has already exited.
+/// A `std` child: on drop collected if it has exited, else handed to
+/// [`crate::reaper`].
 #[cfg(not(target_vendor = "apple"))]
 #[derive(Debug)]
-struct Handle(std::process::Child);
+struct Handle {
+    child: std::process::Child,
+    status: Option<ExitStatus>,
+}
 
 #[cfg(not(target_vendor = "apple"))]
 impl Handle {
     fn id(&self) -> u32 {
-        self.0.id()
+        self.child.id()
     }
 
     fn kill(&mut self) -> io::Result<()> {
-        self.0.kill()
+        if self.status.is_some() {
+            Ok(())
+        } else {
+            self.child.kill()
+        }
     }
 
     fn wait(&mut self) -> io::Result<ExitStatus> {
-        self.0.wait()
+        if let Some(status) = self.status {
+            return Ok(status);
+        }
+        let status = self.child.wait()?;
+        self.status = Some(status);
+        Ok(status)
     }
 
     fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
-        self.0.try_wait()
+        if let Some(status) = self.status {
+            return Ok(Some(status));
+        }
+        self.status = self.child.try_wait()?;
+        Ok(self.status)
     }
 }
 
 #[cfg(not(target_vendor = "apple"))]
 impl Drop for Handle {
     fn drop(&mut self) {
-        let _ = self.0.try_wait();
+        if matches!(self.try_wait(), Ok(None))
+            && let Ok(pid) = i32::try_from(self.id())
+        {
+            crate::reaper::hand_off_pid(pid);
+        }
     }
 }
 
@@ -838,13 +894,12 @@ const SIG_SETMASK: i32 = 2;
 
 #[cfg(not(target_vendor = "apple"))]
 impl Command {
-    /// Replace THIS process with the program: [`super::InheritStrip`] marks
-    /// this process's own table first, so a FAILED exec leaves every
-    /// descriptor close-on-exec ([`super::InheritNothing`] says what that
-    /// means). The hooks run in THIS process, so a failed exec also leaves
-    /// its signal mask empty and, with [`Self::setsid`], this process leading
-    /// a new session (Darwin's `exec` changes nothing when it fails). Returns
-    /// only on failure.
+    /// Replace this process with the program: [`super::InheritStrip`] marks this process's
+    /// own table first, so a failed exec leaves every descriptor close-on-exec
+    /// ([`super::InheritNothing`] says what that means). The hooks run in this process, so a
+    /// failed exec also leaves its signal mask empty and, with [`Self::setsid`], this process
+    /// leading a new session (Darwin's `exec` changes nothing when it fails). Returns only on
+    /// failure.
     pub fn exec(&mut self) -> io::Error {
         use std::os::unix::process::CommandExt as _;
         match self.forked() {
@@ -871,12 +926,20 @@ impl Command {
             stdin: child.stdin.take(),
             stdout: child.stdout.take(),
             stderr: child.stderr.take(),
-            handle: Handle(child),
+            handle: Handle {
+                child,
+                status: None,
+            },
+            usage: None,
         })
     }
 
     /// The `std` command this one is: [`super::InheritNothing`]'s strip
     /// first, then the empty mask and the session in one more hook.
+    #[expect(
+        clippy::disallowed_types,
+        reason = "spawnfd's own Command, started through std's fork with the strip installed first"
+    )]
     fn forked(&self) -> io::Result<std::process::Command> {
         use super::InheritNothing as _;
         use std::os::unix::process::CommandExt as _;

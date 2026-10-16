@@ -4,61 +4,36 @@
 
 //! Streaming search with memory-bounded results.
 //!
-//! ## Spec of record: the DERIVED `StreamingSearch` machine
+//! Scans content row by row (literal, regex or fuzzy), stores at most `max_results`
+//! matches, navigates them with optional wraparound, and follows content that is
+//! added, reflowed or invalidated.
 //!
-//! `aterm_spec::derive::streaming_search_model()` — a drift-free `ty_model!`
-//! twin registered in the global spec/ledger closure.
-//! Tier-0 prove-and-catch: `aterm-spec/tests/derived_streaming_search_ty.rs`
-//! (+ the compile-time gate in this crate's `build.rs`); Tier-1 lockstep over a
-//! bounded unit-effect alphabet against this real engine:
-//! `aterm-search/tests/conformance_streaming.rs`. The per-method `#[refines]`
-//! anchors in `engine/operations.rs` bind those model actions. Calls that add or
-//! remove multiple matches atomically are deliberately outside that exact scalar
-//! transition abstraction and remain covered by the engine's
-//! `verify_all_invariants`, which the streaming tests assert after every step.
+//! Spec of record: the derived `StreamingSearch` machine
+//! (`aterm_spec::derive::streaming_search_model()`), proven by aterm-spec's
+//! `tests/derived_streaming_search_ty.rs` and run in lockstep against this engine by
+//! `tests/conformance_streaming.rs` through the `#[refines]` anchors in
+//! `engine/operations.rs`. Calls that add or remove several matches at once fall
+//! outside that scalar model; `verify_all_invariants`, which the streaming tests
+//! assert after every step, covers them.
 //!
-//! This module implements a streaming search system that:
-//! - Searches through content incrementally (row by row)
-//! - Bounds memory usage with configurable result limits
-//! - Supports multiple filter modes: Literal, Regex, Fuzzy
-//! - Provides navigation with optional wraparound
-//! - Handles dynamic content changes (additions/invalidations)
+//! | ID | Invariant | Checked by |
+//! |----|-----------|------------|
+//! | INV-SEARCH-1 | `CurrentIndexValid` | model + `verify_all_invariants` |
+//! | INV-SEARCH-2 | `ResultPositionsValid` | `verify_all_invariants` |
+//! | INV-SEARCH-3 | `MemoryBounded` | model + `verify_all_invariants` |
+//! | INV-SEARCH-4 | `NoDuplicateResults` | `verify_all_invariants` |
+//! | INV-SEARCH-5 | `ScanProgressConsistent` | model + `verify_all_invariants` |
+//! | INV-SEARCH-6 | `TotalMatchesConsistent` | model + `verify_all_invariants` |
 //!
-//! ## Safety Invariants
-//!
-//! | ID | Invariant | Discharged by |
-//! |----|-----------|---------------|
-//! | INV-SEARCH-1 | `CurrentIndexValid` | model Tier-0/Tier-1 + `verify_all_invariants` |
-//! | INV-SEARCH-2 | `ResultPositionsValid` | `verify_all_invariants` (not scalar-expressible) |
-//! | INV-SEARCH-3 | `MemoryBounded` | model Tier-0/Tier-1 + `verify_all_invariants` |
-//! | INV-SEARCH-4 | `NoDuplicateResults` | `verify_all_invariants` (not scalar-expressible) |
-//! | INV-SEARCH-5 | `ScanProgressConsistent` | model Tier-0/Tier-1 + `verify_all_invariants` |
-//! | INV-SEARCH-6 | `TotalMatchesConsistent` | model Tier-0/Tier-1 + `verify_all_invariants` |
-//!
-//! INV-SEARCH-2/-4 quantify over per-result data (coordinates, duplicates), so
-//! no scalar model carries them: the engine's `verify_all_invariants` checks
-//! them over the real results, and the streaming and regex tests assert it
-//! after every operation.
-//!
-//! ## State Machine
+//! INV-SEARCH-2 and -4 quantify over per-result data, which no scalar model carries.
 //!
 //! ```text
-//! ┌─────────────────────────────────────────────────────────────┐
-//! │                                                             │
-//! │  ┌──────┐  StartSearch   ┌───────────┐  ScanComplete       │
-//! │  │ Idle │ ─────────────▶ │ Searching │ ──────────────┐     │
-//! │  └──────┘                └───────────┘               │     │
-//! │      ▲                        │                      ▼     │
-//! │      │     Cancel             │ ScanComplete    ┌─────────┐│
-//! │      ├────────────────────────┤                 │HasResult││
-//! │      │                        │                 └─────────┘│
-//! │      │     Cancel             ▼                      │     │
-//! │      ├───────────────── ┌───────────┐               │     │
-//! │      │                  │ NoResults │ ◀─────────────┘     │
-//! │      │                  └───────────┘  (results empty)    │
-//! │      │                        │                            │
-//! │      └────────────────────────┘                            │
-//! └─────────────────────────────────────────────────────────────┘
+//! any        ──start──────────────────────▶ Searching
+//! Searching  ──last row scanned───────────▶ HasResults | NoResults
+//! NoResults  ──content_added (a match)────▶ HasResults
+//! HasResults ──content_invalidated (none)─▶ NoResults
+//! any active ──content_reflowed───────────▶ Searching
+//! any active ──cancel─────────────────────▶ Idle
 //! ```
 
 mod content;
@@ -98,8 +73,7 @@ mod test_content {
         }
     }
 
-    /// Content provider with configurable wrapped-row flags for testing
-    /// wrapped-line search coordinate remapping (#7572).
+    /// Content provider with per-row soft-wrap flags.
     pub(super) struct WrappedTestContent {
         lines: Vec<String>,
         /// Which rows are continuations of the previous row (soft wrap).

@@ -1,14 +1,11 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Codex's usage wall and the reset it names: the Codex lane's stand-in
-//! instance and kernel, the tab's Codex at its usage wall (the `■` row
-//! codex-rs prints, naming `try again at <when>` in the printing Codex's zone,
-//! or `try again later`). The record keeps the named reset
-//! (`St::limit_until`) as the Claude lane does, so the owner's view tells a
-//! Codex limit at its real reset; the quiet flow reads a wall a grace past its
-//! reset as an idle point. The reset is read in the Codex's own zone, and the
-//! same words keep their first placement (owner, 2026-09-29).
+//! Codex's usage wall and the reset it names (`try again at <when>` in the printing Codex's
+//! zone, or `try again later`). The record keeps the named reset (`St::limit_until`) as the
+//! Claude lane does, so the owner's view tells a Codex limit at its real reset; the quiet flow
+//! reads a wall a grace past its reset as an idle point. The reset is read in the Codex's own
+//! zone, and the same words keep their first placement.
 
 use super::*;
 use crate::harness::upgrade_drive::{self as drive, LIMIT_GRACE_S, Watcher};
@@ -383,11 +380,10 @@ fn a_codex_spend_wall_is_the_owners_hold_never_a_limit_that_passed() {
 }
 
 /// The quiet upgrade moves a Codex whose wall is a grace past its reset: under
-/// `upgrade_ask = false` the wall left `LIMIT_GRACE_S` past its named reset is
-/// no limit, and the idle conversation's `/exit` goes there, nothing asked
-/// (owner, 2026-09-29).
-/// Negative controls, each waiting `limited` with nothing typed: a minute
-/// short of the grace; a wall naming no reset; a live wall; and the ask flow.
+/// `upgrade_ask = false` the wall left `LIMIT_GRACE_S` past its named reset is no limit, and
+/// the idle conversation's `/exit` goes there, nothing asked. Negative controls, each waiting
+/// `limited` with nothing typed: minutes short of the grace; a wall naming no reset; a live
+/// wall; and the ask flow.
 #[test]
 fn a_codex_wall_a_grace_past_its_named_reset_is_moved_as_any_idle_point() {
     let now = now_s();

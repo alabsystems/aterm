@@ -14,13 +14,18 @@ description = "aterm visual-effects engines: the host-agnostic cursor aurora/com
 autotests = false
 
 [features]
-# Test-only observation seam for proving how many OS open attempts one exact
-# visual-feed path receives. No shipping crate enables this feature.
-test-open-probe = []
+# Compile the kitty-command anchors (`#[refines]` on the listener and the flash,
+# machines `TrickListenerPurity` and `TrickFlashLifecycle`) into the LIBRARY.
+# OFF by default: the shipped build carries no `aterm-spec` and no probe. The
+# unit-test build expands them through `cfg(test)`, the integration tests
+# through the dev edge on this crate below.
+spec-anchors = ["dep:aterm-spec"]
 
 [dependencies]
+# Library dependency only under `spec-anchors`.
+aterm-spec = { workspace = true, optional = true }
 # Engine snapshot types (Terminal for the rescan, RenderCell, selection view).
-# default-features = false keeps the closure wasm32-clean (no disk-tier libc/zstd);
+# default-features = false keeps the closure wasm32-clean (no disk-tier libc mmap);
 # the GUI's `bidi` feature unions in via the workspace build without affecting us.
 aterm-core = { path = "../aterm-core", default-features = false }
 # Explicit terminal progress facts; already part of the core dependency graph.
@@ -37,7 +42,7 @@ aterm-lexicon = { workspace = true }
 # keys with) + serde/aterm-toml for the `[[sparkle_words.custom]]` fragment both the
 # native resolver and the web `set_sparkle_custom_specs` surface parse.
 aterm-hash = { workspace = true }
-serde = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 aterm-toml = { workspace = true }
 # Deterministic kinematics kit (mix_rgb/smoothstep) + the procedural Tile the
 # cat baker draws with. Pure/dependency-free (no `bridge` feature needed here).
@@ -55,6 +60,10 @@ libc = { workspace = true }
 [dev-dependencies]
 # The ty models the sparkle tests run (identity episodes, flash limiter).
 aterm-spec = { workspace = true }
+# The integration tests link the library with its anchors on, so a Tier-1 bind
+# in `tests/` sees its machine's anchors. A dev edge: a build of the library
+# never follows it.
+aterm-effects = { path = ".", features = ["spec-anchors"] }
 # Atlas PNG dumps for visual iteration (`ATERM_CAT_ART_DUMP_DIR` in
 # tests/cat_art_quality.rs).
 aterm-png = { workspace = true }
@@ -87,3 +96,16 @@ path = "tests/typed_tricks_alloc.rs"
 [[test]]
 name = "word_reflow_identity"
 path = "tests/word_reflow_identity.rs"
+
+# ---- release perf gates: `targo --unverified bench -p aterm-effects` ----------
+# Wall-clock budgets measured in the bench profile; their deterministic halves
+# are the tests above.
+[[bench]]
+name = "cursor_bench"
+path = "benches/cursor_bench.rs"
+harness = false
+
+[[bench]]
+name = "rainbow_kitty_v2_frame_cost"
+path = "benches/rainbow_kitty_v2_frame_cost.rs"
+harness = false

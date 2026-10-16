@@ -1,19 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-// FIX 3, THE SAME BOX IS ONE POINT: the review key of a box (`box_key`, through
-// the loop's own reader) and the one ask a box gets however the vendor
-// redraws it — and the negative controls, two boxes that ARE two requests
-// asked twice. The replayed incident: one box re-alerting, `CLEARED` then
-// `ESCALATED` 7 s apart. Included into `run.rs`'s test module (`mod engine`'s
-// `mod box_key`), where `Mock`, the engine's box helpers and its journal live.
+// The review key of a box (`box_key`) and the one ask a box gets however the vendor redraws it,
+// with negative controls. Included into `run_tests.rs`'s `mod engine::box_key`.
 
 use aterm_phase::prompt::fixtures as f;
 
-/// The measured rm box (Claude Code 2.1.283, 80x24, 2026-09-25) as read
-/// before the supervisor's `1`, and the same box 5 ms after it was taken:
-/// its countdown and one blank row wiped, the transcript reflowed above it
-/// (`Listed 1 directory` scrolled into view), the box still drawn.
+/// The measured rm box (Claude Code 2.1.283, 80x24) before the supervisor's `1`, and 5 ms
+/// after it was taken: its countdown and one blank row wiped, the transcript reflowed above
+/// it, the box still drawn.
 const BEFORE: &str = include_str!("policy/fixtures/cap-taken-box-1-before.txt");
 const REDRAWN: &str = include_str!("policy/fixtures/cap-taken-box-2-redrawn.txt");
 
@@ -51,12 +46,9 @@ fn swap_rows(rows: &[String], edits: &[(&str, &[&str])]) -> Vec<String> {
     out
 }
 
-/// THE MEASURED BOX RE-WRAPPED AT ANOTHER WIDTH — SYNTHESIZED from
-/// [`BEFORE`] (no capture of one box at two widths exists yet): its command
-/// row broken mid-token (`S=/tmp/ahpP.PY` | `JV/scratch …`) and again at a
-/// space, its note and its countdown broken at other points, the transcript
-/// above re-wrapped, and `Listed 1 directory` scrolled into view at the top,
-/// as the measured redraw has it.
+/// [`BEFORE`] re-wrapped at another width, synthesized (no capture of one box at two widths
+/// exists): its command row broken mid-token and at a space, its note and countdown broken
+/// elsewhere, the transcript above re-wrapped, and `Listed 1 directory` scrolled in at the top.
 fn rewrapped() -> Vec<String> {
     let mut out = rows(&["", "  Listed 1 directory", ""]);
     out.extend(swap_rows(
@@ -141,8 +133,8 @@ fn edit_focused(n: u8) -> Vec<String> {
         .collect()
 }
 
-/// The measured Edit box on `notes.txt` with ANOTHER diff: the same path,
-/// the same question, another hunk.
+/// The measured Edit box on `notes.txt` with another diff: the same path and question, another
+/// hunk.
 fn edit_other_diff() -> Vec<String> {
     swap_rows(
         &f::screen(f::BOX_EDIT),
@@ -234,19 +226,10 @@ fn asked(tag: &str, script: Vec<Vec<String>>, opts: &SuperviseOpts) -> (Asked, M
 
 // ---- the key, pure ---------------------------------------------------------
 
-/// K1: THE BOX KEY HOLDS across every way the vendor redraws one box, each
-/// pair proven a real change of the rows first: (a) the MEASURED redraw
-/// (the countdown and a blank row wiped, the transcript reflowed
-/// above it); (b) the same box re-wrapped at another width (SYNTHESIZED,
-/// [`rewrapped`]: a command row broken mid-token and at a space, the note
-/// and countdown broken elsewhere, the transcript re-wrapped and a row
-/// scrolled in above); (c) the measured 2.1.281 countdown ticking 1:59, 1:58,
-/// 1:57, and in its two-row wrapped shape; (d) the measured Edit box with its
-/// focus moved to option 3; (e) the measured trust dialog with its focus
-/// moved (its options carry no numbers); (f) a `Tool use` box with a
-/// countdown row above its question, ticking — HAND-BUILT, its placement
-/// unmeasured (the box is a subject kind, whose reason rows keep a
-/// countdown: the digest drops it all the same). Each key is a whole box's.
+/// The box key holds across every way the vendor redraws one box, each pair first proven a real
+/// change of the rows: (a) the measured redraw; (b) a re-wrap at another width (synthesized);
+/// (c) a ticking countdown, wrapped or not; (d) the Edit box's focus moved; (e) the trust
+/// dialog's focus moved; (f) a hand-built tool box with a ticking countdown row.
 #[test]
 fn the_box_key_holds_across_a_redraw_a_rewrap_a_reflow_a_focus_move_and_a_ticking_countdown() {
     let same = |label: &str, a: &[String], b: &[String]| {
@@ -306,11 +289,8 @@ fn the_box_key_holds_across_a_redraw_a_rewrap_a_reflow_a_focus_move_and_a_tickin
     same("(f) a tool box ticking", &tool("1:59"), &tool("1:58"));
 }
 
-/// K2, THE NEGATIVE CONTROLS: the key CHANGES for another box, however
-/// alike — the review's (a) first: two Edit boxes on one path with another
-/// diff (the parsed prompt's content is the path alone); the same rows titled
-/// `Write file`; another command; the rm breaker's note naming another
-/// target; another description; another grant in option 2; another url.
+/// Negative controls: the key changes for another box however alike (another diff on one path,
+/// a Write title, another command, note target, description, grant or url).
 #[test]
 fn the_box_key_changes_for_another_box() {
     let differ = |label: &str, a: &[String], b: &[String]| {
@@ -376,12 +356,9 @@ fn the_box_key_changes_for_another_box() {
     );
 }
 
-/// K3 (the review's (d)): the key is read by the LOOP'S reader, never the
-/// screen's guess. A reader that reads no box (the generic one) gives the
-/// generic key — no `prompt <kind>` line — where Claude Code's reads the
-/// box. And in the loop under `program=codex`, Codex's exec box served
-/// twice, its `Tip:` rows re-wrapped above it the second time, is one point:
-/// one `EVENT prompt`, one badge, one ask.
+/// The key is read by the loop's reader, never the screen's guess: the generic reader gives the
+/// generic key where Claude Code's reads the box, and under `program=codex` Codex's exec box
+/// served twice, its `Tip:` rows re-wrapped, is one point.
 #[test]
 fn the_box_key_is_the_readers() {
     let before = f::screen(BEFORE);
@@ -421,11 +398,8 @@ fn the_box_key_is_the_readers() {
 
 // ---- the loop --------------------------------------------------------------
 
-/// L1, THE INCIDENT'S SHAPE: a box handed over, then redrawn (measured) and
-/// re-wrapped (synthesized), each read twice, with no busy read between —
-/// one `EVENT prompt`, one badge, one ask, one `ESCALATED`, no `CLEARED`.
-/// The old layout key ([`layout_key`]) read each drawing as a new box: three
-/// of each, and the incident's `CLEARED`/`ESCALATED` pair.
+/// A box handed over, then redrawn and re-wrapped with no busy read between: one `EVENT
+/// prompt`, one badge, one ask, no `CLEARED`.
 #[test]
 fn a_redrawn_box_is_asked_once() {
     let script = vec![
@@ -440,10 +414,8 @@ fn a_redrawn_box_is_asked_once() {
     assert_eq!(a, Asked::each(1, 0), "{:#?}", m.requests);
 }
 
-/// L2, THE TICKING COUNTDOWN: the 2.1.281 rm box, its countdown ticking
-/// 1:59, 1:58, 1:57 and then wrapped onto two rows, handed over by the safe
-/// rules (`rm_breaker_ask`) and under `approve = "none"` alike — one ask.
-/// The old layout key read every tick as a new box.
+/// A ticking auto-deny countdown, wrapped or not, is asked once, under the safe rules and
+/// `approve = "none"` alike.
 #[test]
 fn a_ticking_countdown_is_asked_once() {
     let script = vec![
@@ -459,14 +431,10 @@ fn a_ticking_countdown_is_asked_once() {
     }
 }
 
-/// L3, NEGATIVE CONTROL for the review's (a): two Edit boxes on ONE path,
-/// another diff in the second, no busy read between — two `EVENT prompt`s,
-/// two badges, two asks, the first badge cleared. Run twice: with the mock's
-/// own `await gone` (it latches whenever another screen is scripted), and
-/// with the server's judgement (`gone_on_next`): the box's first row — its
-/// path — never leaves the screen, so the wait on it runs out, and only the
-/// read after the step that ran out sees the second box (the probe in
-/// `wait_for_next`; without it the second box is never looked at).
+/// Negative control: two Edit boxes on one path with different diffs, no busy read between,
+/// are two asks, the first badge cleared. Run with the mock's own `await gone` and with the
+/// server's (`gone_on_next`), where the path row never leaves and only the read after the
+/// step that ran out sees the second box.
 #[test]
 fn two_edit_boxes_on_one_path_are_two_asks() {
     for servers in [false, true] {
@@ -493,8 +461,8 @@ fn two_edit_boxes_on_one_path_are_two_asks() {
     }
 }
 
-/// L4, NEGATIVE CONTROL: two Bash boxes with different commands, no busy
-/// read between — two of everything.
+/// Negative control: two Bash boxes with different commands, no busy read between, are two
+/// asks.
 #[test]
 fn two_bash_boxes_with_different_commands_are_two_asks() {
     let script = vec![busy_screen(), rm_box("cmd-A"), rm_box("cmd-B")];
@@ -513,14 +481,9 @@ fn writing_frame() -> Vec<String> {
     before[..rule].to_vec()
 }
 
-/// L5, THE REVIEW'S (c): a box handed over, then two reads of output being
-/// written (no composer, no box, no busy row, a screen that never holds
-/// still — the second after an `await idle` that did not latch, which the
-/// loop counts as busy), then the same box — one ask: no read showed the
-/// worker's own busy row, so the box was redrawn, not asked again after
-/// work. NEGATIVE CONTROLS: the same script with the worker's busy screen
-/// in place of the writing frames is two asks (and the badge cleared at the
-/// busy read); `the_same_box_after_the_worker_worked_is_a_new_ask` stays.
+/// A box redrawn through frames of output being written (no read of the worker's own busy
+/// row) is asked once; with the worker's busy screen in their place it is asked twice, the
+/// badge cleared at the busy read.
 #[test]
 fn a_box_redrawn_through_a_writing_frame_is_asked_once() {
     let writing = writing_frame();
@@ -553,12 +516,9 @@ fn a_box_redrawn_through_a_writing_frame_is_asked_once() {
     }
 }
 
-/// L6, THE REVIEW'S (e): under a NONZERO box settle the box is judged only
-/// on a read made after the settle (an `await seq` before its badge), and
-/// its redraws after the ask are the same point — one ask. The box stands
-/// until its badge is up (`attention_gates`), so the settle runs out on it.
-/// The old layout key read the redraw as a new point: its settle started
-/// over (`Step::Again`) and it was asked a second time.
+/// Under a nonzero box settle the box is judged only on a read made after the settle (an
+/// `await seq` before its badge), and its redraws after the ask are the same point: one ask.
+/// The box stands until its badge is up (`attention_gates`), so the settle runs out on it.
 #[test]
 fn a_redrawn_box_under_the_settle_is_asked_once_after_the_settle() {
     let settle = Duration::from_millis(300);
@@ -590,20 +550,14 @@ fn a_redrawn_box_under_the_settle_is_asked_once_after_the_settle() {
     );
 }
 
-/// L7, PART E's RESETS: the key of a whole box no longer counts the
-/// transcript above it beyond its last letters, so the same box asked again
-/// after the worker worked (here: the same rows exactly) is the same key —
-/// and must still wait out the vendor's key guard: the box settle is counted
-/// from the read that first showed THIS mount of it. Under full power, a box
-/// pressed, the worker busy, the same box again: two presses, and between
-/// each box's first read and its press an `await seq` (the settle). A press
-/// seen leaving ends the mount (`box_left`); so does a read with no box
-/// (`await_turn_from`) — the second arm hands each box over instead, under
-/// a busy spell the loop READS between them.
+/// The same box asked again after work has the same key and still waits out the vendor's key
+/// guard: the box settle counts from the read that first showed this mount of it. Pressed
+/// under full power and handed over alike, each box's first read and its act have an `await
+/// seq` between them.
 #[test]
 fn a_box_asked_again_after_work_waits_the_settle_again() {
     let settle = Duration::from_millis(300);
-    // Each box between its first read and its next is waited on.
+    // An `await seq` lies between a box's first read and its act.
     let settled_between = |m: &Mock, first_read: usize, act: usize| {
         m.requests[first_read..act]
             .iter()
@@ -690,11 +644,10 @@ fn a_box_asked_again_after_work_waits_the_settle_again() {
 
 // ---- someone answering the box, the window above it -------------------------
 
-/// The measured subagent box (2.1.283, 149x62, a fresh pane: rows 22-40 of
-/// 62) with the blank rows under it trimmed, so it sits at the pane's
-/// bottom as in a full one. The rows right over it are the MAIN thread's:
-/// `⏺ The subagent is running your command now…` and the spinner `✻ Waiting
-/// for 1 background agent to finish`.
+/// The measured subagent box (2.1.283, 149x62, a fresh pane) with the blank rows under it
+/// trimmed, so it sits at the pane's bottom as in a full one. The rows right over it are the
+/// main thread's: `⏺ The subagent is running your command now…` and the spinner `✻ Waiting for
+/// 1 background agent to finish`.
 fn subagent_box() -> Vec<String> {
     let mut r = f::screen(f::BOX_RM_SUBAGENT_FRESH_PANE);
     while r.last().is_some_and(|x| x.trim().is_empty()) {
@@ -703,10 +656,8 @@ fn subagent_box() -> Vec<String> {
     r
 }
 
-/// [`subagent_box`] with the main thread printing one row more over the
-/// spinner while the box waits — HAND-BUILT (that the main thread can print
-/// while a background agent's box waits is inferred, not captured), the
-/// pane's height kept: two rows off its top.
+/// [`subagent_box`] with the main thread printing one row more over the spinner while the box
+/// waits, hand-built (inferred, not captured), the pane's height kept: two rows off its top.
 fn subagent_box_printed_over() -> Vec<String> {
     let mut r = subagent_box()[2..].to_vec();
     let spinner = r
@@ -720,9 +671,8 @@ fn subagent_box_printed_over() -> Vec<String> {
     r
 }
 
-/// The measured preview dialog (2.1.282) with the focus moved to `2. Tabs`
-/// and the pane following it — HAND-BUILT from the capture and the option's
-/// own `preview` text in its prompt rows.
+/// The measured preview dialog (2.1.282) with the focus moved to `2. Tabs` and the pane
+/// following it, hand-built from the capture and the option's own `preview` text.
 fn preview_moved() -> Vec<String> {
     let mut r = f::screen(f::QUESTION_PREVIEW);
     let at = r
@@ -748,9 +698,8 @@ fn preview_moved() -> Vec<String> {
     r
 }
 
-/// The measured Edit box with text typed into option 1 — HAND-BUILT: the
-/// shape Claude Code draws for `Tab to amend` is not captured; what counts
-/// is that the typing stays in the option rows.
+/// The measured Edit box with text typed into option 1, hand-built (the `Tab to amend` shape is
+/// not captured): what counts is that the typing stays in the option rows.
 fn edit_amended() -> Vec<String> {
     swap_rows(
         &f::screen(f::BOX_EDIT),
@@ -758,19 +707,10 @@ fn edit_amended() -> Vec<String> {
     )
 }
 
-/// L9: a box someone is ANSWERING — a person, or the manager it was handed
-/// to — is asked ONCE, under the server's own `await gone` (`gone_on_next`):
-/// the box's first row stands, so every wait on it runs out. The measured
-/// multi-select ticked, the measured free-text field typed into, the
-/// measured preview with its focus moved and its pane following it
-/// (HAND-BUILT from the capture), the measured Edit box with its focus moved
-/// to option 3 and with text typed into option 1 (`Tab to amend`,
-/// HAND-BUILT), and the measured subagent box with the main thread printing
-/// a row over it (HAND-BUILT): one `EVENT prompt`, one badge, one ask, no
-/// `CLEARED` (never the badge cleared and raised again). A question and
-/// a command are read again only when their row leaves — no read at all
-/// while they stand; a file box is read once a step, and its request (title
-/// to question) holds while its options change.
+/// A box someone is answering (a multi-select ticked, free text typed, a preview's focus
+/// moved, an Edit box's focus moved or option amended, a subagent box printed over) is asked
+/// once under the server's own `await gone`: a question or a command is not read while its row
+/// stands, and a file box is read once a step, its request holding while its options change.
 #[test]
 fn a_box_someone_is_answering_is_asked_once() {
     let edit = f::screen(f::BOX_EDIT);
@@ -842,10 +782,9 @@ fn a_box_someone_is_answering_is_asked_once() {
     }
 }
 
-/// [`BEFORE`]'s 2.1.283 layout — the vendor's echo of the pending call
-/// (`Running 1 shell command…` over `⎿  $ <command>`, wrapped at a space as
-/// the capture wraps it) right over the box — around a 55-letter command,
-/// under `transcript`. HAND-BUILT on the measured geometry (80 columns).
+/// [`BEFORE`]'s 2.1.283 layout (the vendor's echo of the pending call, `Running 1 shell
+/// command…` over `⎿  $ <command>`, wrapped at a space as the capture wraps it) around a
+/// 55-letter command, under `transcript`. Hand-built on the measured 80-column geometry.
 fn suite_box(transcript: &[&str]) -> Vec<String> {
     let mut r = rows(transcript);
     r.extend(rows(&[
@@ -869,12 +808,9 @@ fn suite_box(transcript: &[&str]) -> Vec<String> {
     r
 }
 
-/// L10: the same long command asked AGAIN after it failed — its error and
-/// the worker's next words appended above the new echo, the busy spell
-/// between unseen (`await idle` passes over it, as in a retried push) — is a
-/// new point, printed twice. The window of [`ABOVE_LETTERS`] right over the
-/// title is the echo alone, the same letters in both (shown first), so the
-/// key counts the letters above the echo ([`before_the_echo`]).
+/// The same long command asked again after it failed (its error and the worker's next words
+/// above the new echo, the busy spell unseen) is a new point: the [`ABOVE_LETTERS`] right over
+/// the title are the echo alone, so the key counts the letters above it ([`before_the_echo`]).
 #[test]
 fn a_retried_long_command_is_asked_again() {
     let said = "⏺ The fix is in; running the integration suite on one thread.";
@@ -947,14 +883,10 @@ enum Seen {
     Box { req: i64, form: i64 },
 }
 
-/// THE OLD LAYOUT KEY (the spec's "key before FIX 3") — the former
-/// `review_key`'s arm for a prompt, rebuilt from the helpers it used
-/// (`event_summary`, still the same for a box; `status_row`;
-/// `prompt_box_span`; the last [`KEY_ROWS`] rows' words, `push_words_above`):
-/// the box's rows VERBATIM, its focus marker and countdown with them, and
-/// the words of the rows above it one by one.
-/// Kept for the Tier-1 negative control alone: walked over the same reads,
-/// it must be refused.
+/// The layout key the model's negative control replays: a prompt's review key built from the
+/// box's rows verbatim (focus marker and countdown with them) and the words of the rows above
+/// it one by one (`event_summary`, `status_row`, `prompt_box_span`, `push_words_above`).
+/// Walked over the same reads, it must be refused.
 fn layout_key(rows: &[String]) -> String {
     let turn = prompt_turn(rows.to_vec());
     let mut key = format!(
@@ -988,29 +920,23 @@ fn shipping_key(rows: &[String]) -> String {
 /// ([`walk_reads`]: [`shipping_key`], or [`layout_key`] for the replay).
 type KeyOf<'k> = &'k dyn Fn(&[String]) -> String;
 
-/// Walks the real loop's reads of one script (`Mock::reads`: the script
-/// index of each `text` read, in order) on `model`, and — given `key` — binds
-/// the real loop to it READ BY READ:
+/// Walks the real loop's reads of one script (`Mock::reads`: the script index of each `text`
+/// read, in order) on `model`, and, given `key`, binds the real loop to it read by read:
 ///
-/// - a read straight after an `await gone` on the box's row that ran out
-///   (`Mock::after_gone`) is the wait's own read, never a look: no action
-///   fires, no ask may follow it, and it must end the wait exactly when the
-///   model says another request is up — the real `file_request_key` of what
-///   it read against the one of the box last looked at;
-/// - a busy read is `Answer` (a request up) then `Work`; a writing read is
-///   `Writing`; any other box read is `NextBox` (another request: it must be
-///   the next one the model draws) or `Redraw` (its drawing changed), then
-///   the loop's `Look` — and before the `Look`, the model's `key == handed`
-///   must hold exactly when `key` of this screen equals `key` of the box
-///   last looked at (the real review key's equalities, the model's `key`);
-/// - the asks the model counts at a read must be the `post … kind=ask` the
-///   real loop sent between that read and the next.
+/// - a read straight after an `await gone` on the box's row that ran out (`Mock::after_gone`)
+///   is the wait's own read, never a look: no action fires, no ask may follow it, and it must
+///   end the wait exactly when the model says another request is up (the real
+///   `file_request_key` of what it read against that of the box last looked at);
+/// - a busy read is `Answer` (a request up) then `Work`; a writing read is `Writing`; any other
+///   box read is `NextBox` (another request: the next the model draws) or `Redraw`, then
+///   `Look`, and before the `Look` the model's `key == handed` must hold exactly when `key` of
+///   this screen equals `key` of the box last looked at;
+/// - the asks the model counts at a read must be the `post … kind=ask` the real loop sent
+///   between that read and the next.
 ///
-/// Every invariant is checked at every state. `key` `None` walks the model
-/// alone (the dials' negative controls). `Ok` the asks the model counts;
-/// `Err` the first bind or invariant broken, or the action refused, its
-/// message starting with what broke: `key`, `request`, `asks`, `order`, or
-/// the invariant's name.
+/// Every invariant is checked at every state. `key` `None` walks the model alone (the dials'
+/// negative controls). `Ok` the asks the model counts; `Err` the first thing broken, its
+/// message starting with `key`, `request`, `asks`, `order`, or the invariant's name.
 fn walk_reads(
     model: &aterm_spec::derive::Model,
     script: &[(Vec<String>, Seen)],
@@ -1124,12 +1050,10 @@ fn walk_reads(
     Ok(past + st["asks"])
 }
 
-/// One script of the Tier-1 bind: its screens, each as the model sees it;
-/// whether `await idle` never latches (a screen being written never holds
-/// still); whether `await gone` is the server's (`gone_on_next`: a box's
-/// first row that stands runs the wait out); whether the old layout key
-/// must be refused walking its reads (the historical bug replayed); and the
-/// dial that must break an invariant walking them.
+/// One script of the Tier-1 bind: its screens as the model sees each; whether `await idle`
+/// never latches; whether `await gone` is the server's (`gone_on_next`); whether
+/// [`layout_key`] must be refused walking its reads; and the dial that must break an invariant
+/// walking them.
 struct Walked {
     tag: &'static str,
     screens: Vec<(Vec<String>, Seen)>,
@@ -1139,26 +1063,11 @@ struct Walked {
     caught: Option<(&'static str, &'static str)>,
 }
 
-/// L8, TIER-1 for `SupervisorBoxAsk`: the real `Session` over the scripted
-/// server — the incident's redraw (S1), the ticking countdown (S2), two
-/// Edit boxes on one path then the second asked again after work (S3), the
-/// box redrawn through writing frames (S4); under the server's own `await
-/// gone`, the same two Edit boxes (S5), the Edit box arrowed through (S6),
-/// and boxes someone is answering — the multi-select ticked, the free text
-/// typed, the preview's focus moved — and the subagent box printed over
-/// (S7-S10), each a Redraw — every read bound as [`walk_reads`] says: the
-/// real review key's equalities to the model's `key == handed` at every
-/// look, the wait's own reads' request comparison to the model's request,
-/// each ask the model counts to a `post … kind=ask` sent right after that
-/// read, every invariant at every state — and every request a script draws
-/// looked at.
-///
-/// NEGATIVE CONTROLS. THE HISTORICAL BUG REPLAYED: S1 and S2 walked with the
-/// old layout key ([`layout_key`]) are refused on the key — the redraw and
-/// the tick it read as another box. And the model alone (non-vacuity): the
-/// key of the drawing (`Drawing = 1`, S1), the key of the head alone
-/// (`Coarse = 1`, S3) and a writing read taken for work (`WritingWorks = 1`,
-/// S4) each break their invariant on the same reads.
+/// Tier-1 for `SupervisorBoxAsk`: the real `Session` over each scripted server (S1-S10), every
+/// read bound as [`walk_reads`] says, every invariant at every state, and every request a
+/// script draws looked at. Negative controls: S1 and S2 walked with [`layout_key`] are refused
+/// on the key, and the model alone breaks its invariant under `Drawing = 1` (S1), `Coarse = 1`
+/// (S3) and `WritingWorks = 1` (S4).
 #[test]
 fn tier1_the_box_is_asked_once_per_request() {
     use Seen::{Box as B, Busy, Writing};
@@ -1291,10 +1200,8 @@ fn tier1_the_box_is_asked_once_per_request() {
             model_asks > 0,
             "{tag}: a walk that asked nothing proves nothing"
         );
-        // Every request the script draws is LOOKED at — the wait's own reads
-        // aside — or a request the loop never read would pass unasked and
-        // unseen by the model too (the second Edit under the server's gone,
-        // without the wait's read).
+        // Every request the script draws is looked at (the wait's own reads aside), else a
+        // request the loop never read would pass unasked and unseen by the model too.
         let request_of = |i: usize| match screens[i].1 {
             B { req, .. } => Some(req),
             Busy | Writing => None,

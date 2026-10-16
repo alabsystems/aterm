@@ -10,81 +10,43 @@ use super::*;
 use super::{emit::*, seam::*, spawn::*};
 use crate::cursor_trail::{CursorTrail, TrailConfig};
 
-/// Band moves and the Codex composer.
 mod band_move;
-/// The beam style.
 mod beam;
-/// Cold program motion stays dark.
 mod cold_motion;
-/// The comet style.
 mod comet;
-/// Backspace and kill: the poof, the steam and their licences.
 mod erase;
-/// The fire style: meteors, the EMBERFORGE thermal laws, the forge field.
 mod fire;
-/// The byte-exact deletion and flat-spelling goldens.
 mod goldens;
-/// Typing heat and the laser, sparkle and laser bursts.
 mod heat_and_laser;
-/// The Ink wrap seam trace.
 mod ink_wrap_seam;
-/// Delivered inserts.
 mod insert;
-/// Insert witnesses, receipts and spinner rows.
 mod insert_witness;
-/// The licence seam and its derived-model conformance.
 mod licence;
-/// Light is born on a move, fades to empty, and keeps its invariants.
 mod lifecycle;
-/// Shared momentum and the composed-pane folds.
+mod light_ground;
 mod momentum;
-/// The park: Ink's rewrite observed as two sync brackets.
 mod park;
-/// The phaser band and coalesced echo sweeps.
 mod phaser;
-/// The rainbow kitty ribbon.
 mod rainbow;
-/// Wrap re-anchors, bridged moves and box growth.
 mod reanchor;
-/// The resident-state cap and its derived model.
 mod resident_cap;
-/// The review's findings on the stall, fold and park.
 mod review;
-/// Landing rings and halo culling.
 mod rings;
-/// The seam's licence-class laws (one-shots spend once, a glyph supersedes
-/// nothing whose echo is owed, one kill one `Kill`, a held park is a wake
-/// source).
 mod seam_laws;
-/// Typing sound cues and the key-time ledger.
 mod sound;
-/// The stall: keys typed into a stalled event loop.
 mod stall;
-/// The fold after a stall.
 mod stall_fold;
-/// Fresh-ink pop, the typing wake and the `trail` status row.
 mod status;
-/// The stray a fresh hint licenses.
 mod stray;
-/// Style-switch crossfades, the non-fire crown and pooled bolts.
 mod style_switch;
-/// Glyph tint and light-theme ink.
 mod tint;
-/// Trail Packs (the `GlowStyle::Custom` data path).
 mod trail_pack;
-/// Typed stamps across gestures, hidden carets and program rows.
 mod typed_stamps;
-/// Unknown-width inserts and their orphan keys.
 mod unknown_insert;
-/// Rainbow kitty v2 at the seam.
 mod v2_seam;
-/// The wake census at the seam.
 mod wake_census;
-/// The water style.
 mod water;
-/// The ribbon's witness rows and the exact-key credit ring.
 mod witness;
-/// The word move sounds every time.
 mod word_nav;
 
 fn ms(n: u64) -> Duration {
@@ -119,9 +81,6 @@ fn type_echoed(
     }
     t + ms(3)
 }
-
-// The test pinning `prefs::CURSOR_TRAIL_STYLES` to `GlowStyle::parse` lives
-// beside the list in aterm-gui's `prefs.rs`.
 
 /// Press one plain Backspace and let its one-column retreat be seen: the press
 /// stamps `quench_hint` (licensing the retreat and classifying it as a
@@ -159,19 +118,14 @@ fn geom() -> Geom {
     }
 }
 
-// ---- Living flow ------------------------------------------------------
-//
-// The channel's own gates: it moves, does not flicker, does not re-colour, and
-// spends no light, plus the reduced-motion stand-down.
-
 fn cfg(style: GlowStyle, enabled: bool) -> GlowConfig {
     GlowConfig {
         enabled,
-        // The SPECTRUM face, which the whole-frame golden pins for `classic`.
+        // The spectrum face, which the whole-frame golden pins for `classic`.
         classic_mono: false,
         dark_theme: true,
-        // The documented default dark palette — a COHERENT pair, never 0/0
-        // (`fg == bg` reads as a conceal-shaped theme and suppresses the tint).
+        // The default dark palette: a coherent pair, never 0/0 (`fg == bg` reads as a
+        // conceal-shaped theme and suppresses the tint).
         theme_fg: 0x00C8_D3F5,
         theme_bg: 0x001A_1B26,
         style,
@@ -199,8 +153,8 @@ fn cfg(style: GlowStyle, enabled: bool) -> GlowConfig {
 /// derive its presentation from the same raw spelling.
 fn cfg_for_style_name(raw: &str, enabled: bool) -> GlowConfig {
     let mut c = cfg(GlowStyle::parse(raw), enabled);
-    // The tall body is the default; only an explicit `... underline`
-    // spelling opts out (the app_config seam's law, mirrored).
+    // The tall body is the default; only an explicit `... underline` spelling opts out, as at
+    // the app_config seam.
     c.ribbon_tall = !GlowStyle::style_names_underline_ribbon(raw);
     c.ribbon_flat = GlowStyle::style_names_flat_ribbon(raw);
     c
@@ -248,7 +202,7 @@ fn lum(out: &[GlowQuad]) -> u64 {
         .sum()
 }
 
-/// Whether ANY visible cursor-effect stream is non-empty this frame.
+/// Whether any visible cursor-effect stream is non-empty this frame.
 fn frame_has_output(out: &[GlowQuad], glow: &CursorGlow) -> bool {
     !out.is_empty()
         || !glow.halos().is_empty()
@@ -452,11 +406,7 @@ fn ribbon_cols(out: &[GlowQuad], row: u16, g: Geom) -> std::collections::BTreeSe
         .collect()
 }
 
-// ===================================================================
-// Trail Packs (the `GlowStyle::Custom` data path).
-// ===================================================================
-
-/// Every built-in style. Adding `Custom` must not change any of these.
+/// Every built-in style; the tenth entry repeats `Lumen` as padding.
 const BUILTINS: [GlowStyle; 10] = [
     GlowStyle::Lumen,
     GlowStyle::Phaser,
@@ -467,28 +417,17 @@ const BUILTINS: [GlowStyle; 10] = [
     GlowStyle::Beam,
     GlowStyle::Water,
     GlowStyle::Comet,
-    GlowStyle::Lumen, // padding kept intentionally distinct in the fold order
+    GlowStyle::Lumen, // padding
 ];
 
 fn typed_scratch() -> Vec<GlowQuad> {
     Vec::new()
 }
 
-// ===================================================================
-// Rainbow Kitty v2: the seam (`docs/design/RAINBOW-KITTY-V2.md` §17.2, D14).
-// ===================================================================
-
-/// The deletion oracle's script: one session reaching every v2 producer (a
-/// probed row for stardust, ten keys at human cadence, an end-of-line fling,
-/// three more keys, two backspaces, a kill, a home fling, a Return, four keys
-/// on the new row, a five-cell word hop, and a decay tail to 5 s), folding
-/// every observable the host reads each frame: fingerprint, `out` / `under`
-/// quad bytes, halo fields, cue kinds, the caret seam (`caret_paint`,
-/// `caret_flare_at`, `rainbow_field`, `rainbow_head_rgb`), the spine
-/// (`momentum_display`, `rainbow_phase`, `typing_momentum`), the scheduler
-/// (`needs_frame_cadence`, `next_change_deadline`, `is_active`), the companion
-/// impulse, the motion pulse and the v2 status row. `reduced` drives the
-/// posture seam. Deterministic given the relative schedule.
+/// The deletion oracle's script (`docs/design/RAINBOW-KITTY-V2.md` §17.2, D14): one session
+/// reaching every v2 producer (stardust, typing, flings, backspaces, a kill, a Return, a word hop
+/// and a decay tail to 5 s), folding every observable the host reads each frame into one hash.
+/// `reduced` drives the posture seam. Deterministic given the relative schedule.
 fn deletion_script(cfg: &GlowConfig, g: Geom, reduced: bool) -> u64 {
     let mut glow = CursorGlow::default();
     glow.set_reduced_motion(reduced);
@@ -635,26 +574,16 @@ fn deletion_script(cfg: &GlowConfig, g: Geom, reduced: bool) -> u64 {
     acc
 }
 
-/// The deletion goldens: [`deletion_script`]'s fold for every variant (the
-/// nine built-ins dark, then rainbow kitty light, underline and reduced
-/// motion). The eight non-kitty rows never move: v2 does not engage for those
-/// styles (`the_other_nine_styles_are_byte_identical_with_v2_unconditional`).
-/// The four kitty rows are pinned by
-/// `rainbow_kitty_is_byte_identical_to_the_seam_era_v2`, so any drift is a
-/// decision. A kitty row is the arc's bytes: any change to
-/// `crate::spectrum`'s table moves all four.
+/// The deletion goldens: [`deletion_script`]'s fold for every variant (the nine built-ins dark,
+/// then rainbow kitty light, underline and reduced motion). v2 does not engage for the eight
+/// non-kitty styles, so their rows never move; any drift in a kitty row is a decision, and any
+/// change to `crate::spectrum`'s table moves all four.
 ///
-/// THE RE-BAKE LAW. A v2 change that moves a kitty byte re-reads exactly
-/// the kitty rows it moves — and the flat spelling's twins,
-/// [`FLAT_GOLDENS`], the same way — with the eight non-kitty rows
-/// as the control (they must hold) and, where the change has a switch,
-/// the decomposition as the proof: with the clause toggled back in place
-/// every row reads its previous number. Which rows move is itself a
-/// claim: light has no rail and no hot edge (L6), reduced has no wipe
-/// and no flight (§6.11), so a change confined to one of those moves
-/// the other rows and holds these. Every past re-bake — what moved, the
-/// numbers before and after, which control held — is in `git log -L` on
-/// this table and in CHANGELOG.md.
+/// Re-baking: a v2 change that moves a kitty byte re-reads exactly the kitty rows it moves (and
+/// their [`FLAT_GOLDENS`] twins), with the non-kitty rows as the control and, where the change
+/// has a switch, the clause toggled back reproducing every previous number. Which rows move is
+/// itself a claim: light has no rail and no hot edge (L6) and reduced has no wipe and no flight
+/// (§6.11), so a change confined to one of those holds that row.
 const DELETION_GOLDENS: [(&str, u64); 12] = [
     ("Lumen dark", 1_264_411_311_373_267_895),
     ("Phaser dark", 2_726_566_909_586_900_035),
@@ -670,35 +599,17 @@ const DELETION_GOLDENS: [(&str, u64); 12] = [
     ("RainbowKitty reduced", 8_179_550_295_111_973_776),
 ];
 
-/// The flat spelling's goldens: the four kitty rows of [`DELETION_GOLDENS`]
-/// under `rainbow kitty flat` (`GlowConfig::ribbon_flat`). Every comet branch
-/// in `ribbon.rs` (comet profile, vivid rail, from-the-hand wipe) collapses to
-/// the flat expression under the flag;
-/// `the_flat_spelling_collapses_every_comet_branch_byte_for_byte` reads these
-/// with the flag on, and its `assert_ne!` shows the default body moves every
-/// row away from them.
-///
-/// These rows move with [`DELETION_GOLDENS`] on every change that is NOT
-/// a comet branch — the seam feeds both spellings the same events, and
-/// the landing, the attach, the boundary law, the soft end and the colour
-/// walk stand under the flat body too — and hold when only a comet branch
-/// changes. Re-read them whenever the kitty rows are re-baked; the history
-/// is in `git log -L` on this table. Older docs call it `PRE_COMET_GOLDENS`;
-/// it was renamed because laws the flag does not gate have since moved these
-/// bytes away from the pre-comet tree's.
+/// The flat spelling's goldens: the four kitty rows of [`DELETION_GOLDENS`] under `rainbow kitty
+/// flat` (`GlowConfig::ribbon_flat`), where every comet branch in `ribbon.rs` (comet profile,
+/// vivid rail, from-the-hand wipe) collapses to the flat expression. They move with
+/// [`DELETION_GOLDENS`] on any change outside a comet branch and hold when only a comet branch
+/// changes: re-read them whenever the kitty rows are re-baked.
 const FLAT_GOLDENS: [(&str, u64); 4] = [
     ("RainbowKitty dark", 17_890_278_511_770_188_755),
     ("RainbowKitty light", 6_430_388_712_169_283_571),
     ("RainbowKitty underline", 15_379_506_098_573_732_577),
     ("RainbowKitty reduced", 12_943_034_956_261_997_624),
 ];
-
-// =======================================================================
-// The stall: keys typed into an event-loop stall come back as one merged
-// frame. A press is in flight until its row echoes or an observed edge it
-// cannot explain forgets it; it does not expire on a wall clock while its row
-// stays silent.
-// =======================================================================
 
 /// One beat past the park window: a held park ([`HeldPark`]) is judged on the
 /// first tick more than [`CursorGlow::TYPE_HINT_FRESH`] after it, so a verdict
@@ -732,8 +643,7 @@ fn pre_roll(glow: &mut CursorGlow, row: u16, t0: Instant, c: &GlowConfig, g: Geo
     type_echoed(glow, row, 2, "xxx", t0, c, g)
 }
 
-/// `n` keys at the owner's cadence from `t`, none echoed. Returns the
-/// clock of the last press.
+/// `n` keys 85 ms apart from `t`, none echoed. Returns the clock of the last press.
 fn stalled_keys(glow: &mut CursorGlow, n: u64, t: Instant) -> Instant {
     let mut last = t;
     for i in 0..n {
@@ -751,11 +661,6 @@ fn dark_in(glow: &CursorGlow, row: u16, cols: std::ops::Range<u16>) -> Vec<u16> 
 fn bridged(glow: &CursorGlow) -> u32 {
     glow.v2_status().map_or(0, |s| s.bridged)
 }
-
-// =======================================================================
-// The fold after a stall: a key whose echo wraps the row, observed after a
-// stall (`11,99 -> 12,0`), must still light the last column.
-// =======================================================================
 
 /// Keys echoed on time up to `(row, col)` on a 100-column row, from
 /// `col - 4`. Returns the clock of the last echo.
@@ -784,12 +689,6 @@ fn roll_to(
     t + Duration::from_millis(3)
 }
 
-// =======================================================================
-// The park: Ink's rewrite seen as two sync brackets ~40 ms apart, the caret
-// parked at the start of the input, then the row rewritten to its end plus
-// the new glyph.
-// =======================================================================
-
 /// One ring row as `(reason, licence, origin, target)`.
 type RingRow = (&'static str, &'static str, (u16, u16), (u16, u16));
 
@@ -799,16 +698,8 @@ fn ring_rows(glow: &CursorGlow) -> Vec<RingRow> {
         .collect()
 }
 
-// ---- The word move sounds every time ----------------------
-//
-// Option+Left / Option+Right (and Ctrl+arrow, Alt-b/f) have no key-time cue:
-// the keyed seam opens only for a typed glyph, and D11 vetoes a nav pre-cue
-// because a no-op Ctrl-E must stay silent. A word move's whole sound is minted
-// when this seam licenses the observed caret delta, so every refusal is a
-// silent word hop.
-//
-// Shapes: zsh (caret-only echo), an Ink-style TUI (hide, rewrite, place,
-// show), a fast pair, a program move with no key behind it, and the word kill.
+// A word move has no key-time cue (D11: a no-op Ctrl-E must stay silent), so its sound is minted
+// when the seam licenses the observed caret delta, and every refusal is a silent word hop.
 
 /// Nav ticks / meteors / word-kill voices drained since the last call.
 #[derive(Default, PartialEq, Eq, Debug)]

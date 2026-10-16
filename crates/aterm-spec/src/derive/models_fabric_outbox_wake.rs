@@ -5,15 +5,12 @@
 
 use super::Model;
 
-/// `Queue` represents each endpoint producer after it has put a post, receipt,
-/// or fetch in the outbox. The bridge drains on its pushed event. If the push
-/// stream loses that event, its two-second roster round drains the same durable
-/// queue. `Buggy=1` removes the prompt event and the backstop, so the model
-/// catches both ways a queued item used to wait indefinitely.
+/// `Queue` is an endpoint producer putting a post, receipt or fetch in the outbox. The bridge
+/// drains on its pushed event; if the push stream loses it, the two-second roster round drains
+/// the same durable queue. `Buggy=1` removes both the prompt event and the backstop.
 ///
-/// Tier-1 drives the real endpoint and bridge: a `fetch` event is read from the
-/// session timeline, a lost `post` event is fault-injected, and delivery is
-/// observed through the recipient's inbox.
+/// Tier-1 drives the real endpoint and bridge: a `fetch` event is read from the session timeline,
+/// a lost `post` event is fault-injected, and delivery is observed through the recipient's inbox.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn fabric_outbox_wake_model() -> Model {
@@ -53,14 +50,11 @@ pub fn fabric_outbox_wake_model() -> Model {
     }
 }
 
-/// A broker outage owns one absolute reconnect deadline. Local `EVENT` rows
-/// may wake the mailbox, but only the deadline permits another dial; aterm's
-/// inherited-lane close ends the wait immediately. `Buggy=1` is the historical
-/// one-shot `mailbox.take(backoff)` behavior: the first event permits a retry.
-///
-/// The model has no physical clock. Tier-1 supplies the elapsed-time check
-/// against the real mailbox helper and projects its event, deadline, and close
-/// observations onto these actions.
+/// A broker outage owns one absolute reconnect deadline. Local `EVENT` rows may wake the mailbox,
+/// but only the deadline permits another dial; aterm's inherited-lane close ends the wait at once.
+/// `Buggy=1` is a one-shot `mailbox.take(backoff)`: the first event permits a retry. The model has
+/// no clock; Tier-1 checks elapsed time against the real mailbox helper and projects its event,
+/// deadline and close observations onto these actions.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn fabric_reconnect_backoff_model() -> Model {
@@ -89,12 +83,11 @@ pub fn fabric_reconnect_backoff_model() -> Model {
     }
 }
 
-/// A discovered session keeps its refill debt across a failed broker Fetch.
-/// The durable group cursor may already be past its old mail. The subscription
-/// can already be live when a new session is discovered, so its newer group
-/// record must wait for refill even if the reader has queued it. `Buggy=1`
-/// allows the former lost-debt path and premature delivery after a live Fetch
-/// failure. Tier-1 drives both timings through the real bridge and broker.
+/// A discovered session keeps its refill debt across a failed broker Fetch: the durable group
+/// cursor may already be past its old mail. The subscription can be live when a new session is
+/// discovered, so its newer group record waits for refill even if the reader has queued it.
+/// `Buggy=1` drops the debt and delivers early after a live Fetch failure. Tier-1 drives both
+/// timings through the real bridge and broker.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn fabric_refill_retry_model() -> Model {
@@ -135,9 +128,8 @@ pub fn fabric_refill_retry_model() -> Model {
 
             invariant RefillDebtSurvivesFailure:
                 discovered == 0 || old_delivered == 1 || owed == 1;
-            // A reader opened before discovery may stay open while refill is
-            // owed. It may not be treated as ready after that debt disappears
-            // until the old record was actually delivered.
+            // A reader opened before discovery may stay open while refill is owed, but is
+            // not ready until the old record was delivered.
             invariant OldBeforeLive:
                 live == 0 || discovered == 0 || owed == 1 || old_delivered == 1;
             invariant OldBeforeNew: new_delivered == 0 || old_delivered == 1;

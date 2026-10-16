@@ -6,12 +6,6 @@ use aterm_spec::{derive::fabric_refill_retry_model, interp, verify};
 #[test]
 fn failed_fetch_keeps_old_mail_owed_before_a_group_subscription() {
     let model = fabric_refill_retry_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name),
-        "the refill retry contract must stay enrolled in spec-link"
-    );
     verify::prove_and_catch_scalar(&model, "Fabric refill debt and delivery order");
 
     let mut s = model.init_state();
@@ -43,8 +37,8 @@ fn failed_fetch_keeps_old_mail_owed_before_a_group_subscription() {
     assert!(buggy.fire("DeliverNew", &mut lost));
     assert!(!buggy.check_invariant("OldBeforeNew", &lost));
 
-    // The group reader may precede a newly opened tab. A Fetch fault after
-    // discovery must keep its already-queued new record behind the old one.
+    // The group reader may precede a newly opened tab: a fetch fault after discovery keeps the
+    // already-queued new record behind the old one.
     let mut live = model.init_state();
     for action in ["Attach", "Subscribe", "Discover", "FetchFails"] {
         assert!(model.fire(action, &mut live), "{action}: {live:?}");

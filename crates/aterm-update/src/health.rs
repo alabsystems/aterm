@@ -40,14 +40,17 @@ use std::path::Path;
 /// hundreds of them, and past it the holder is stopped or wedged.
 const HEALTH_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Consecutive `pipeline` failures at which the state is called PERSISTENT: the
-/// status wording stops saying "deferred" and the GUI raises a notification.
+/// Consecutive failures of one class at which the state may be called PERSISTENT:
+/// the status wording stops saying "deferred", the update screen headlines it, and
+/// the GUI raises a notification.
 ///
-/// Three checks in a row: at the ten-minute cadence (`cadence::INTERVAL_SECS`,
-/// doubling while checks fail) about half an hour of one failure class — long enough
-/// that a network blip never escalates, short enough that a broken pipeline is named
-/// within the hour.
-pub use crate::PERSISTENT_AFTER;
+/// Three checks in a row, AND, for the classes a check books, a streak that spans
+/// [`PERSISTENT_SPAN`] on that class's own clock ([`Health::persistent_class`]). A
+/// count alone is a duration only at one cadence: three failures took half an hour at
+/// the old ten-minute interval and take six minutes at the two-minute one, inside a
+/// short GitHub incident. Long enough that a blip never escalates, short enough that a
+/// broken pipeline is named within the hour.
+pub use crate::{PERSISTENT_AFTER, PERSISTENT_SPAN};
 
 /// The durable health record. All fields default so an absent/corrupt file reads as
 /// "healthy" (fail-open here is correct: health is observability, never a gate).
@@ -123,6 +126,13 @@ pub struct Health {
     /// re-labels itself to a standing diagnosis class it restores this.
     #[serde(default)]
     pub last_diagnosis_error: String,
+    /// RFC3339 UTC of [`Self::last_diagnosis_error`] (empty when there is none): the
+    /// newest failure of the standing diagnosis class, the end of the span
+    /// [`Self::persistent_class`] measures. [`Self::last_failure_at`] is any-class: a
+    /// DNS blip hours after three quick `pipeline` failures would stretch that streak
+    /// past [`PERSISTENT_SPAN`] with no new evidence about the pipeline.
+    #[serde(default)]
+    pub last_diagnosis_at: String,
     /// RFC3339 UTC of [`Self::last_apply_error`] (empty when there is none).
     ///
     /// [`Self::last_failure_at`] is any-class: a DNS blip would re-date an apply
@@ -356,6 +366,14 @@ impl Health {
     /// The class whose streak has crossed [`PERSISTENT_AFTER`], with its own count —
     /// or `None` while nothing is persistently failing.
     ///
+    /// A class a CHECK books (`pipeline`, `manifest`, `stage`) must also have failed
+    /// for [`PERSISTENT_SPAN`]: from its streak's start ([`Self::class_since`]) to its
+    /// newest failure ([`Self::last_diagnosis_at`]; a ledger an older build wrote has
+    /// only the any-class [`Self::last_failure_at`]). Measured between two failures,
+    /// never against the clock, so a laptop asleep on a short streak wakes to the same
+    /// verdict it slept on. `apply` is counted in attempts the apply lane paces on its
+    /// own clock, and its count alone escalates.
+    ///
     /// Callers need the CLASS, not just the boolean: the count and the sentence a
     /// user is shown have to come from the streak that actually escalated.
     ///
@@ -370,7 +388,22 @@ impl Health {
             ("apply", self.apply_failures),
         ]
         .into_iter()
-        .find(|(_, n)| *n >= PERSISTENT_AFTER)
+        .find(|&(class, n)| n >= PERSISTENT_AFTER && self.spans_persistently(class))
+    }
+
+    /// Whether `class`'s streak has lasted [`PERSISTENT_SPAN`] (see
+    /// [`Self::persistent_class`]). An unreadable stamp has not.
+    fn spans_persistently(&self, class: &str) -> bool {
+        if class == "apply" {
+            return true;
+        }
+        let newest = if self.last_diagnosis_at.is_empty() {
+            &self.last_failure_at
+        } else {
+            &self.last_diagnosis_at
+        };
+        crate::install::rfc3339_delta_secs(self.class_since(class), newest)
+            .is_some_and(|span| span >= PERSISTENT_SPAN.as_secs())
     }
 
     /// Whether the ledger shows a PERSISTENT failure of a lane that strands the
@@ -461,6 +494,7 @@ impl Health {
         h.last_error = capped_error(error);
         if matches!(kind, "pipeline" | "manifest" | "stage") {
             h.last_diagnosis_error = h.last_error.clone();
+            h.last_diagnosis_at = h.last_failure_at.clone();
         }
     }
 
@@ -476,6 +510,7 @@ impl Health {
             h.last_failure_at = String::new();
             h.last_error = String::new();
             h.last_diagnosis_error = String::new();
+            h.last_diagnosis_at = String::new();
             return;
         }
         match h.standing_acquisition_class() {
@@ -533,6 +568,7 @@ impl Health {
         // ITS reason, or nothing — or `update status` would report the apply
         // streak under whatever transient network message happened to land last.
         h.last_diagnosis_error = String::new();
+        h.last_diagnosis_at = String::new();
         Self::relabel_by_standing(&mut h);
         h.write(path);
         h
@@ -903,6 +939,31 @@ impl Health {
             let _ = std::fs::remove_file(&tmp);
         }
     }
+}
+
+/// TEST SEAM: move every streak clock of the ledger at `path` back by `by`, as if
+/// each standing streak had begun that much earlier — the span
+/// [`Health::persistent_class`] measures, without waiting [`PERSISTENT_SPAN`] for it.
+/// The newest-failure stamps stay where they are.
+#[cfg(test)]
+pub(crate) fn backdate_streaks(path: &Path, by: std::time::Duration) {
+    let mut h = Health::read(path);
+    for since in [
+        &mut h.network_since,
+        &mut h.pipeline_since,
+        &mut h.manifest_since,
+        &mut h.stage_since,
+        &mut h.apply_since,
+        &mut h.failing_since,
+    ] {
+        if let Some(at) = aterm_types::rfc3339::parse_utc(since)
+            .and_then(|at| u64::try_from(at).ok())
+            .and_then(|at| at.checked_sub(by.as_secs()))
+        {
+            *since = aterm_types::rfc3339::format_rfc3339(at);
+        }
+    }
+    h.write(path);
 }
 
 #[cfg(test)]
@@ -1389,6 +1450,7 @@ mod tests {
                 "authoritative update v0.61 is unsigned under the pinned channel",
             );
         }
+        backdate_streaks(&p, PERSISTENT_SPAN);
         let h = Health::read(&p);
         assert_eq!(h.manifest_failures, PERSISTENT_AFTER);
         assert!(
@@ -1413,6 +1475,7 @@ mod tests {
         for _ in 0..PERSISTENT_AFTER {
             Health::record_failure(&p, "stage", "sha256 mismatch");
         }
+        backdate_streaks(&p, PERSISTENT_SPAN);
         let h = Health::read(&p);
         assert!(h.is_persistent());
         assert_eq!(h.persistent_class(), Some(("stage", PERSISTENT_AFTER)));
@@ -1426,6 +1489,7 @@ mod tests {
         for _ in 0..(PERSISTENT_AFTER * 4) {
             Health::record_failure(&p, "network", "dns");
         }
+        backdate_streaks(&p, PERSISTENT_SPAN * 4);
         let h = Health::read(&p);
         assert!(h.network_failures >= PERSISTENT_AFTER);
         assert!(
@@ -1433,6 +1497,87 @@ mod tests {
             "a flaky network must not tell the user their updater is broken"
         );
         assert_eq!(h.persistent_class(), None);
+    }
+
+    /// THREE FAILED CHECKS ARE PERSISTENT ONLY ONCE THEY SPAN HALF AN HOUR. At the
+    /// two-minute cadence three failures of a check class come 0, 2 and 6 minutes
+    /// apart — a GitHub incident or a slow asset upload, not the broken lane the
+    /// status, the update screen's headline and the loud notice promise. The same
+    /// three spanning 30 minutes escalate. The span ends at the class's own newest
+    /// failure: a DNS blip hours later (weather, which never resets a standing
+    /// diagnosis) moves only the any-class stamp and stretches nothing. A ledger an
+    /// older build wrote, with no `last_diagnosis_at`, is measured to its
+    /// `last_failure_at`. `apply` counts attempts the apply lane paces itself, and
+    /// three quick ones still escalate.
+    #[test]
+    fn a_check_class_streak_is_persistent_only_once_it_spans_half_an_hour() {
+        let streak = |class: &str, count: u32, newest: &str| {
+            let mut h = Health {
+                last_failure_at: newest.to_string(),
+                last_diagnosis_at: newest.to_string(),
+                kind: class.to_string(),
+                ..Health::default()
+            };
+            let (n, since) = h.class_streak_mut(class).expect("a ledger class");
+            *n = count;
+            *since = "2026-10-15T10:00:00Z".to_string();
+            h
+        };
+        for class in ["pipeline", "manifest", "stage"] {
+            let quick = streak(class, PERSISTENT_AFTER, "2026-10-15T10:06:00Z");
+            assert_eq!(
+                quick.persistent_class(),
+                None,
+                "{class}: three inside 7 minutes"
+            );
+            let long = streak(class, PERSISTENT_AFTER, "2026-10-15T10:30:00Z");
+            assert_eq!(
+                long.persistent_class(),
+                Some((class, PERSISTENT_AFTER)),
+                "{class}: three spanning 30 minutes"
+            );
+            // NEGATIVE CONTROL: the span alone is not a streak.
+            let few = streak(class, PERSISTENT_AFTER - 1, "2026-10-15T14:00:00Z");
+            assert_eq!(few.persistent_class(), None, "{class}: two in four hours");
+            // A blip hours after a quick streak moves only `last_failure_at`.
+            let mut blipped = quick.clone();
+            blipped.network_failures = 1;
+            blipped.last_failure_at = "2026-10-15T18:00:00Z".to_string();
+            assert_eq!(
+                blipped.persistent_class(),
+                None,
+                "{class}: weather stretches nothing"
+            );
+            // An older build's ledger: the any-class stamp is all there is.
+            let mut older = long.clone();
+            older.last_diagnosis_at.clear();
+            assert_eq!(older.persistent_class(), Some((class, PERSISTENT_AFTER)));
+            older.last_failure_at = "2026-10-15T10:06:00Z".to_string();
+            assert_eq!(older.persistent_class(), None);
+        }
+        let apply = streak("apply", PERSISTENT_AFTER, "2026-10-15T10:06:00Z");
+        assert_eq!(apply.persistent_class(), Some(("apply", PERSISTENT_AFTER)));
+
+        // Through the writer: three booked at once are not persistent, the same three
+        // once their streak began half an hour earlier are, and a success ends it.
+        let p = tmp("persistent-span");
+        for _ in 0..PERSISTENT_AFTER {
+            Health::record_failure(&p, "pipeline", "asset fetch failed");
+        }
+        let h = Health::read(&p);
+        assert_eq!(h.pipeline_failures, PERSISTENT_AFTER);
+        assert!(!h.is_persistent(), "{h:?}");
+        assert_eq!(
+            h.last_diagnosis_at, h.last_failure_at,
+            "the class's own clock"
+        );
+        backdate_streaks(&p, PERSISTENT_SPAN);
+        assert_eq!(Health::read(&p).persistent_class(), Some(("pipeline", 3)));
+        let h = Health::record_success(&p);
+        assert!(
+            h.last_diagnosis_at.is_empty() && !h.is_persistent(),
+            "{h:?}"
+        );
     }
 
     #[test]
@@ -1456,6 +1601,7 @@ mod tests {
         // An interleaved network blip must NOT reset the pipeline streak (or a flaky
         // network could suppress the stranded-client escalation forever).
         Health::record_failure(&p, "network", "blip");
+        backdate_streaks(&p, PERSISTENT_SPAN);
         let h = Health::record_failure(&p, "pipeline", "asset fetch failed");
         assert_eq!(h.pipeline_failures, PERSISTENT_AFTER);
         assert!(
@@ -1656,6 +1802,7 @@ mod tests {
         Health::record_failure(&p, "stage", stage_reason);
         Health::record_failure(&p, "stage", stage_reason);
         Health::record_failure(&p, "stage", stage_reason);
+        backdate_streaks(&p, PERSISTENT_SPAN);
         let h = Health::record_failure(&p, "network", "curl: (6) could not resolve host");
         assert_eq!(h.standing_acquisition_class(), Some("stage"));
         assert_eq!(h.persistent_class(), Some(("stage", 3)));

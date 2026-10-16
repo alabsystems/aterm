@@ -1,59 +1,35 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The owner's exceptions inbox raises a cause ONCE: what needs a look but not
-//! now is one dismissable item, and dismissing it files it in a durable log;
-//! the same cause is never raised again, across the restarts and updates that
-//! replaced the process, and no surface shows an entry before its raise line is queued.
+//! The owner's exceptions inbox raises a cause once: what needs a look but not now is one
+//! dismissable item, dismissing it files it in a durable log, the same cause is never raised
+//! again across restarts and updates, and no surface shows an entry before its raise line is
+//! queued. A dismissal held only in process memory re-raises on every start.
 //!
-//! Three shipped defects are the reason it is a machine and not a comment:
-//! * the upgrade stall row re-posted for a stall the owner had already read
-//!   (`stall_already_shown`, `seen_through` and `same_stall` exist to stop it,
-//!   one reporter at a time);
-//! * the Full Disk Access question raised on EVERY process start — eight rows
-//!   in four days, six of them within a second of an update landing — because
-//!   its only memory of a dismissal was the process's own;
-//! * (guarded, not yet shipped) a surface counting an entry whose raise line
-//!   is still in the writer's queue: an edge-triggered loss (a crash last
-//!   time, scrollback left behind) is gone with the process that saw it.
+//! State for one key. `st`: 0 no entry, 1 open, 2 filed by the owner. `cause` is what the
+//! reporter asserts now (1, then 2 after `Drift`, never back), `ecause` the open entry's, `fcause`
+//! the cause the ledger remembers a dismissal for, `disk` how much of the entry the file holds (0
+//! nothing, 1 the raise, 2 the raise and the filing), `shown` whether the chip counts it. `dcause`
+//! and `reshown` are ghosts: the last cause dismissed, and a dismissed cause shown again.
 //!
-//! State for ONE key. `st`: 0 no entry, 1 open, 2 filed by the owner. `cause`
-//! is what the reporter asserts now (1, then 2 after `Drift`, never back),
-//! `ecause` the open entry's, `fcause` the cause the ledger remembers a
-//! dismissal for, `disk` how much of the entry the file holds (0 nothing, 1
-//! the raise, 2 the raise and the filing), `shown` whether the chip counts it.
-//! `dcause` and `reshown` are ghosts: the last cause the owner dismissed, and
-//! a dismissed cause shown again.
+//! A seamless update overlaps the old process and its successor for seconds. `succ` is 1 while
+//! a successor holds, frozen, the snapshot of the file it loaded at launch (`sst`, `sfc`);
+//! `Commit` is the parent flushing its queue and the successor taking over by folding the file's
+//! tail in (`MessageCenter::catch_up`), never by trusting the snapshot, so a dismissal made in
+//! the parent after the successor loaded is honoured.
 //!
-//! THE UPDATE: a seamless update overlaps the old process and its
-//! successor for seconds, and six of the eight Full Disk Access raises came
-//! within a second of one. `succ` is 1 while a successor holds a snapshot of the
-//! FILE it loaded at launch (`sst`, `sfc`: what it saw), frozen and
-//! silent; `Commit` is the parent flushing its queue and the successor taking
-//! over — by folding the file's tail in (`MessageCenter::catch_up`), never by
-//! trusting the snapshot. A dismissal made in the parent after the successor
-//! loaded is in the file by Commit, and the successor must honour it.
+//! Invariants: `DismissedStaysQuiet` (a dismissed cause is never shown again) and
+//! `ShownImpliesQueued` (nothing is shown before its raise is queued).
 //!
-//! Invariants: `DismissedStaysQuiet` (a dismissed cause is never shown again)
-//! and `ShownImpliesQueued` (nothing is shown before its raise is queued).
+//! `Buggy = 1` switches on every mutant at once; each also has its own switch and alone
+//! falsifies its invariant: `Reopen` (a filed cause is raised again), `Early` (the chip shows
+//! before the raise is queued), `Volatile` (the filing never reaches the file, so a restart
+//! replays the raise alone), `StaleSuccessor` (the successor trusts its snapshot at Commit),
+//! `NoFlush` (the parent execs without flushing, so the dismissal never reaches the file).
 //!
-//! `Buggy = 1` switches on all three defects at once — each alone falsifies
-//! its invariant, so none masks another — and each has its own switch:
-//! `Reopen` (a filed cause with the same fingerprint is raised again),
-//! `Early` (the chip shows before the raise is queued), `Volatile` (the
-//! filing never reaches the file, so a restart replays the raise alone),
-//! `StaleSuccessor` (the successor trusts the snapshot it loaded and never
-//! folds the file's tail in at Commit, so the dismissal the owner made while
-//! the two overlapped is forgotten), `NoFlush` (the parent execs without
-//! flushing its queue, so the dismissal never reaches the file).
-//!
-//! Tier-1 is the real `MessageCenter` (`aterm-messages/src/family_tests.rs`,
-//! `crates/aterm-messages/tests/conformance_digest.rs`): a restart replays the
-//! ENCODED log, a seamless update's successor loads the file and folds the
-//! parent's tail in at Commit (`MessageCenter::catch_up`), and the same cause
-//! asserted again is `Suppressed`; `StaleSuccessor` (no catch-up) and
-//! `NoFlush` (the parent's dismissal never reached the file) are the caught
-//! negative controls.
+//! Tier-1 is the real `MessageCenter` in `aterm-messages/src/family_tests.rs`: a restart replays
+//! the encoded log, a successor folds the parent's tail in at Commit, the same cause asserted
+//! again is `Suppressed`, and `StaleSuccessor` and `NoFlush` are caught negative controls.
 
 use super::Model;
 
@@ -131,7 +107,7 @@ pub fn exceptions_once_model() -> Model {
                 disk = if st == 0 { disk } else { if st == 1 { 1 } else { if Buggy <= 0 && Volatile <= 0 { 2 } else { 1 } } };
             }
 
-            // A seamless update: the successor launches and loads the FILE as it is
+            // A seamless update: the successor launches and loads the file as it is
             // now (not the parent's memory), then waits, frozen.
             action Handoff when (succ == 0) {
                 succ = 1;

@@ -6,23 +6,22 @@
 //!
 //! Upstream predates `std`'s `OnceLock`; this crate expresses the same cells over
 //! [`std::sync::OnceLock`], [`std::sync::Mutex`] and [`core::cell::Cell`], with
-//! no dependencies and no `unsafe`. All thirteen consumers are third-party, so
+//! no dependencies and no `unsafe`. All twelve consumers are third-party, so
 //! the `[patch.crates-io]` row is the only thing that reaches them.
 //!
 //! # Liveness per consumer
 //!
-//! Unlike `crates/aterm-core-maths`, this code RUNS, so it must be right, not
-//! merely present. Measured against the consumers' resolved sources:
+//! Unlike the retired `core_maths` facade, this code RUNS, so it must be
+//! right, not merely present. Measured against the consumers' resolved
+//! sources:
 //!
 //! ```text
 //! DEAD  (import sits under a `cfg` that is off in every cell)
 //!   rustls 0.23.41       race::OnceBox    #[cfg(not(feature = "std"))], std ON
 //!   naga 29.0.3          race::OnceBox    #[cfg(no_std)]; naga's build.rs sets
 //!                                         `std` from `wgsl-in`, which is ON
-//!   read-fonts 0.43.2    race::OnceBox    #[cfg(not(feature = "std"))], std ON
 //!
 //! LIVE  (called on the cells named)
-//!   ahash 0.8.12         race::OnceBox    linux            get_or_init, set
 //!   wgpu-core 29.0.3     sync::OnceCell   linux win wasm-gpu   get_or_try_init
 //!   x11-dl 2.21.0        sync::OnceCell   linux            get_or_try_init
 //!   xkbcommon-dl 0.4.2   sync::OnceCell   linux            get_or_init
@@ -30,7 +29,7 @@
 //!   x11rb 0.13.2         sync::Lazy       linux            force, Deref
 //!   wgpu-hal 29.0.3      sync::Lazy       win              Deref, Debug
 //!   js-sys 0.3.85        unsync::Lazy     wasm-gpu         Deref
-//!   wasm-bindgen 0.2.108 unsync::Lazy     wasm-cpu wasm-gpu   force, Deref
+//!   wasm-bindgen 0.2.108 unsync::Lazy     wasm-gpu         force, Deref
 //!   wasm-bindgen-futures unsync::Lazy     wasm-gpu         Deref
 //!
 //! DEV-ONLY (outside every `targo --unverified forge` cell, but `cargo test` builds them)
@@ -38,7 +37,11 @@
 //! ```
 //!
 //! On mac-arm, whose sole parent is `rustls`, the package is dead weight; on
-//! the other four cells it is running code.
+//! linux, win and wasm-gpu it is running code. wasm-cpu no longer resolves
+//! it: its one parent there was `wasm-bindgen`, which the CPU module left at
+//! wasm-platform WP.7 (docs/AUDIT-third-party-2026-10-15.md; re-measured
+//! 2026-10-16). `race::OnceBox` has no live caller: `ahash` left the graph at
+//! winit-core step 2 and `read-fonts` at text-fonts TF.4.
 //!
 //! ## The contract that has teeth
 //!
@@ -70,8 +73,8 @@
 //!    concurrent `get_or_init` may call more than one `f` but returns one value
 //!    to all; ours calls `f` exactly once, which meets that contract. Reentrant
 //!    initialisation deadlocks here (as in upstream's `sync::OnceCell`) where
-//!    upstream's `race` merely wastes an allocation. No consumer reenters;
-//!    `ahash`'s closure is a `Box::new`.
+//!    upstream's `race` merely wastes an allocation. No consumer calls it: its
+//!    importers, `rustls` and `naga`, compile the import out in every cell.
 //!
 //! 3. **`with_value` is not `const`.** `std` exposes no const initialiser for
 //!    a filled `OnceLock` or `core::cell::OnceCell`. Only this crate's own
@@ -89,10 +92,11 @@
 //!    `sync::OnceCell::get_unchecked` (`unsafe` by signature). Using one is a
 //!    compile error.
 //!
-//! 6. **Feature flags gate nothing.** All nine upstream names are declared (a
-//!    `[patch]` target must accept them) and inert. `critical-section`,
-//!    `atomic-polyfill`, `parking_lot` and `portable-atomic` would change
-//!    upstream's implementation; `tests/consumers.rs` fails if a cell enables one.
+//! 6. **Feature flags gate nothing.** The five upstream names that change
+//!    nothing here are declared (a `[patch]` target must accept them) and
+//!    inert. `critical-section`, `atomic-polyfill`, `parking_lot` and
+//!    `portable-atomic` would change upstream's implementation, so they are not
+//!    declared: a consumer that asks for one fails to resolve.
 //!
 //! # Auto traits match upstream
 //!
@@ -118,8 +122,8 @@
 //! so a panic inside an initialiser leaves the cell empty and retryable, as
 //! upstream does.
 
-#![deny(missing_docs)]
-#![deny(rust_2018_idioms)]
+#![warn(missing_docs)]
+#![warn(rust_2018_idioms)]
 #![forbid(unsafe_code)]
 
 /// Single-threaded, non-blocking cells.
@@ -296,7 +300,7 @@ pub mod unsync {
     /// `const fn new` carries no bound on `F`, matching upstream:
     /// `wasm-bindgen 0.2.108` calls it inside an unbounded `impl<T, F>`, so a
     /// wrapper over [`core::cell::LazyCell`] (whose `new` is bounded) would not
-    /// compile on either wasm cell.
+    /// compile on wasm-gpu.
     pub struct Lazy<T, F = fn() -> T> {
         cell: OnceCell<T>,
         init: Cell<Option<F>>,

@@ -40,27 +40,16 @@ fn the_cold_lane_refuses_what_it_could_not_reopen() {
         .cold_lane_layout()
         .expect_err("nothing would reopen them");
     assert!(refusal.contains("session restore is off"), "{refusal}");
-    // CONTROL: a headless instance has no windows to leave.
+    // Control: a headless instance has no windows to leave.
     let mut headless = windowed_with_settings();
     headless.headless = true;
     assert_eq!(headless.cold_lane_layout(), Ok(None));
 }
 
-/// A layout write that fails is this machine's condition, never a `Failed`
-/// charged to the artifact. A PASSING cause (a full disk, an I/O error,
-/// another aterm holding the restore lock past the main thread's bound) is
-/// a refusal the lane retries.
-///
-/// ROUND EIGHT, U48: a SETTLED cause (a data folder this user cannot write,
-/// a read-only volume, no data dir) was refused too, every minute with no
-/// end, while the posture said the update installs by itself. The lane now
-/// goes on without the layout and says why. And a write that failed AFTER it
-/// published (its directory's sync) is the layout it wrote, which an
-/// `exec` that does not happen takes back, where the refusal left it on
-/// disk for a later launch to open beside this window.
-///
-/// RED before the fix: the settled cause refused (and so did the published
-/// one, leaving its layout).
+/// A failed layout write is this machine's condition, never a `Failed` charged to the
+/// artifact. A passing cause (full disk, I/O error, another aterm holding the restore lock past
+/// the main thread's bound) refuses and is retried; a settled one (unwritable data folder,
+/// read-only volume, no data dir) lets the lane go on without the layout and say why.
 #[test]
 fn a_layout_the_disk_will_not_take_refuses_only_while_its_cause_passes() {
     use crate::restore::RestoreFault;
@@ -94,10 +83,8 @@ fn a_layout_the_disk_will_not_take_refuses_only_while_its_cause_passes() {
         ))
     );
 
-    // PUBLISHED, THEN FAILED (its directory's sync): the layout a reader
-    // sees, `Written` whatever the cause — the successor reads it, and an
-    // `exec` that does not happen takes it back, this run's desk alone;
-    // another instance's quit layout the write kept stays.
+    // Published, then failed (its directory's sync): `Written` whatever the cause. An `exec`
+    // that does not happen takes back this run's desk alone; another instance's stays.
     let dir = aterm_tempfile::tempdir().expect("scratch dir");
     let path = dir.path().join("session.toml");
     let wait = super::COLD_LANE_LAYOUT_LOCK_WAIT;
@@ -132,7 +119,7 @@ fn a_layout_the_disk_will_not_take_refuses_only_while_its_cause_passes() {
         );
     }
 
-    // CONTROL: a write that lands, and no layout at all.
+    // Control: a write that lands, and no layout at all.
     let mut wrote = false;
     assert_eq!(
         super::leave_cold_lane_layout(Some(&layout), |_| {
@@ -149,20 +136,8 @@ fn a_layout_the_disk_will_not_take_refuses_only_while_its_cause_passes() {
     );
 }
 
-/// The record a settled layout write leaves: why the new version opens
-/// without those tabs, in Messages, written before the switch.
-///
-/// ROUND EIGHT, U48's REVIEW: ON RECORD ONCE THE SWITCH IS GRANTED, AND
-/// ONCE PER TARGET BUILD AND CAUSE. It was written before the operator's
-/// quiesce, so every attempt a busy operator turned back (retried on the
-/// activity cadence) said the new version "starts without them" while the
-/// old one ran on, and a record is never folded: one more per retry. It
-/// is written after the quiesce now, just before the steps whose
-/// message-log flush carries it, and an `exec` that then fails and is
-/// retried does not write it again.
-///
-/// RED before the fix: the record came before the quiesce, and a retry
-/// wrote a second.
+/// A settled layout write leaves one Messages record per target build and cause, written once
+/// the operator's quiesce grants the switch and before the flush that carries it.
 #[test]
 fn a_layout_not_kept_is_said_on_record_once_the_switch_is_granted() {
     const CAUSE: &str = "open restore lock: Permission denied (os error 13)";
@@ -189,14 +164,14 @@ fn a_layout_not_kept_is_said_on_record_once_the_switch_is_granted() {
         1,
         "A RETRY OF THE SAME SWITCH DOES NOT RECORD IT AGAIN"
     );
-    // CONTROLS: another cause, or another build, is news.
+    // Controls: another cause, or another build, is news.
     app.say_cold_lane_tabs_not_kept(7, "open restore lock: Read-only file system");
     assert_eq!(records(&app, "Read-only file system"), 1);
     app.say_cold_lane_tabs_not_kept(8, CAUSE);
     assert_eq!(records(&app, "Permission denied"), 2);
 
-    // THE WIRING: in the cold arm, after the operator's quiesce is granted
-    // and before the steps that flush the message log; nowhere else.
+    // The wiring: in the cold arm, after the operator's quiesce is granted and before the
+    // steps that flush the message log; nowhere else.
     let (src, start) = attempt_entry_source();
     let quiesce = start
         .find(".map(crate::operator_host::ControlHandle::try_begin_update_quiesce)")
@@ -221,8 +196,7 @@ fn a_layout_not_kept_is_said_on_record_once_the_switch_is_granted() {
     );
 }
 
-/// This file's source, and the body of the attempt's entry,
-/// `start_unix_update_handoff`, in it.
+/// `app_update_handoff.rs`, and the body of the attempt's entry, `start_unix_update_handoff`.
 pub(super) fn attempt_entry_source() -> (&'static str, &'static str) {
     let src = include_str!("app_update_handoff.rs");
     let start = &src[src
@@ -237,24 +211,11 @@ pub(super) fn attempt_entry_source() -> (&'static str, &'static str) {
     (src, &start[..end])
 }
 
-/// ROUND EIGHT, U49's REVIEW: A REFUSED TAKE-BACK IS OWED, NEVER DROPPED.
-/// The cold lane's layout written for an `exec` that did not happen is
-/// taken back waiting at most the main thread's bound for the restore
-/// lock; refused there (another aterm holding it just then), this run's
-/// desk stayed in `session.toml` while the process ran on. A later crash's
-/// claim then set the journal's newer desk aside by this run's name and
-/// reopened the stale one, and after a seamless update the desk read as
-/// another instance's, which every later quit kept and the next cold
-/// launch reopened beside the windows it stood for. The take-back is now
-/// owed: the event loop tries it again, spaced and bounded, until it lands;
-/// a switch that writes no newer desk of this run (a seamless park, a cold
-/// `exec` with no layout to leave) tries it first and refuses while its
-/// cause passes; a quit that writes no desk of this run tries it once
-/// more; and a newer write of this run's desk (the next cold attempt's,
-/// the quit's) replaces it.
-///
-/// RED before the fix: the refused take-back was logged and dropped, so
-/// nothing was owed and the desk stayed after the lock let go.
+/// A refused take-back of the cold lane's layout (the restore lock held past the main thread's
+/// bound) is owed, never dropped: a desk left behind reopens as another instance's. The event
+/// loop retries it, spaced and bounded; a switch that writes no newer desk of this run tries it
+/// first and refuses while its cause passes; a quit tries it once more; a newer write of this
+/// run's desk replaces it.
 #[test]
 fn a_refused_take_back_is_owed_until_it_lands_or_a_newer_write_replaces_it() {
     use crate::native_document_host::HeldAdvisoryLock;
@@ -322,8 +283,7 @@ fn a_refused_take_back_is_owed_until_it_lands_or_a_newer_write_replaces_it() {
         super::OWED_TAKE_BACK_RETRY_CAP,
         "spaced at most a minute"
     );
-    // A seamless park would end this run: it tries now and refuses while
-    // the cause passes, the terminal untouched.
+    // A seamless park tries now and refuses while the cause passes, the terminal untouched.
     let refusal = app
         .settle_owed_layout_take_back_before_switch_with(t0, unwrite)
         .expect_err("a passing refusal refuses the park");
@@ -335,14 +295,13 @@ fn a_refused_take_back_is_owed_until_it_lands_or_a_newer_write_replaces_it() {
     app.retry_owed_layout_take_back_with(due, unwrite);
     assert_eq!(app.owed_layout_take_back_at(), None, "landed: nothing owed");
     assert_eq!(runs(), ["1-1"], "THIS RUN'S DESK TAKEN BACK, W'S KEPT");
-    // CONTROL: with nothing owed the park tries nothing.
+    // Control: with nothing owed the park tries nothing.
     assert_eq!(
         app.settle_owed_layout_take_back_before_switch_with(t0, |_| unreachable!("owed none")),
         Ok(())
     );
 
-    // A NEWER WRITE OF THIS RUN'S DESK REPLACES IT: the next cold attempt's
-    // write, or the quit's.
+    // A newer write of this run's desk (the next cold attempt's, or the quit's) replaces it.
     write_this_runs_desk();
     let holder = hold();
     let _ = app.take_back_cold_lane_layout_with(Some(RUN.to_string()), t0, unwrite);
@@ -367,9 +326,9 @@ fn a_refused_take_back_is_owed_until_it_lands_or_a_newer_write_replaces_it() {
     assert_eq!(app.owed_layout_take_back_at(), None);
     assert_eq!(runs(), ["1-1"], "the quit took this run's desk back");
 
-    // THE WIRING: a cold `exec` that writes no newer desk of this run tries
-    // it before the operator's quiesce, and the seamless lane before the
-    // park changes anything; a write of this run's desk replaces it.
+    // The wiring: a cold `exec` that writes no newer desk of this run tries it before the
+    // operator's quiesce, the seamless lane before the park changes anything, and a write of
+    // this run's desk replaces it.
     let (_, start) = attempt_entry_source();
     let switches = start
         .match_indices("self.settle_owed_layout_take_back_before_switch(")
@@ -387,8 +346,7 @@ fn a_refused_take_back_is_owed_until_it_lands_or_a_newer_write_replaces_it() {
             && switches[1] < at("self.begin_update_installing(")
     );
 
-    // A SETTLED cause goes on past the switch (logged): no retry changes
-    // it, and an update held on it had no end (U48).
+    // A settled cause goes on past the switch (logged): no retry changes it.
     let _ = app.take_back_cold_lane_layout_with(Some(RUN.to_string()), t0, |_| {
         Err(crate::restore::RestoreFault::settled(
             "no data dir for session restore",
@@ -404,17 +362,8 @@ fn a_refused_take_back_is_owed_until_it_lands_or_a_newer_write_replaces_it() {
     );
 }
 
-/// Round eight, #70, the cold lanes: a resident operator BUSY at the
-/// replacement — a proposal in flight at the quiesce, or its gate held for a
-/// moment at the `exec`'s permit — defers the attempt as activity, which the
-/// synchronous arm retries and charges nothing, exactly as the seamless
-/// Commit files the same answer. It was `Failed`, which that arm charges to
-/// the physical budget. A refusal that is no work in flight (shutting down)
-/// stays the failure it was.
-///
-/// RED before the fix: every operator refusal was minted `failed`, so the
-/// first assertion fails (measured by making `operator_refused` answer
-/// `failed` again).
+/// A busy resident operator (a proposal in flight at the quiesce, or its gate held at the
+/// `exec`'s permit) defers a cold replacement as activity, retried and charged nothing.
 #[test]
 fn a_busy_resident_operator_defers_a_cold_replacement_and_charges_nothing() {
     use crate::native_updater_service::ApplyMode;
@@ -439,7 +388,7 @@ fn a_busy_resident_operator_defers_a_cold_replacement_and_charges_nothing() {
     }
     drop(proposal);
 
-    // NEGATIVE CONTROL: shutting down is no work in flight — a failure.
+    // Negative control: shutting down is no work in flight, so a failure.
     operator.begin_shutdown();
     let shut = operator
         .try_begin_update_quiesce()

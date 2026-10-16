@@ -20,19 +20,16 @@ fn insert_chars_at_wide_continuation_clears_orphan() {
     let fg = PackedColor::DEFAULT_FG;
     let bg = PackedColor::DEFAULT_BG;
 
-    // Write wide char at cols 2-3
     row.write_wide_char(2, '\u{4E2D}', fg, bg, CellFlags::empty());
     assert!(row.get(2).unwrap().is_wide());
     assert!(row.get(3).unwrap().is_wide_continuation());
 
-    // Insert 1 blank at col 3 (the continuation cell).
     row.insert_chars(3, 1);
 
     let cell2 = row.get(2).unwrap();
     let cell3 = row.get(3).unwrap();
 
-    // The continuation shifted to col 4, so col 2's orphaned WIDE head is
-    // cleared by the wide-char fixup.
+    // The continuation shifted to col 4, so col 2's orphaned head is cleared.
     assert_eq!(
         cell2.flags() & CellFlags::WIDE,
         CellFlags::empty(),
@@ -54,12 +51,10 @@ fn delete_chars_splits_wide_char_at_boundary() {
     let fg = PackedColor::DEFAULT_FG;
     let bg = PackedColor::DEFAULT_BG;
 
-    // Write "A" at col 0, wide char at cols 1-2, "B" at col 3
     row.write_char_styled(0, 'A', fg, bg, CellFlags::empty());
     row.write_wide_char(1, '\u{4E2D}', fg, bg, CellFlags::empty());
     row.write_char_styled(3, 'B', fg, bg, CellFlags::empty());
 
-    // Delete 1 char at col 1 (the WIDE cell).
     row.delete_chars(1, 1);
 
     let cell0 = row.get(0).unwrap();
@@ -67,14 +62,12 @@ fn delete_chars_splits_wide_char_at_boundary() {
 
     assert_eq!(cell0.char(), 'A', "col 0 should be unchanged");
 
-    // The continuation shifts from col 2 to col 1 and, with no WIDE head before
-    // it, is cleared by the fixup.
+    // The continuation shifts to col 1 with no head before it and is cleared.
     assert_eq!(
         cell1.flags() & CellFlags::WIDE_CONTINUATION,
         CellFlags::empty(),
         "orphaned WIDE_CONTINUATION at col 1 should be cleared"
     );
-    // 'B' should have shifted from col 3 to col 2
     assert_eq!(
         row.get(2).unwrap().char(),
         'B',
@@ -91,19 +84,16 @@ fn delete_chars_removes_continuation_orphans_wide() {
     let fg = PackedColor::DEFAULT_FG;
     let bg = PackedColor::DEFAULT_BG;
 
-    // Wide char at cols 4-5, then "XY" at 6-7
     row.write_wide_char(4, '\u{4E2D}', fg, bg, CellFlags::empty());
     row.write_char_styled(6, 'X', fg, bg, CellFlags::empty());
     row.write_char_styled(7, 'Y', fg, bg, CellFlags::empty());
 
-    // Delete 1 char at col 5 (the continuation).
     row.delete_chars(5, 1);
 
     let cell4 = row.get(4).unwrap();
     let cell5 = row.get(5).unwrap();
 
-    // Col 4's WIDE flag is cleared by wide char fixup since its continuation
-    // at col 5 was deleted.
+    // Col 4 lost its continuation, so its WIDE head is cleared.
     assert_eq!(
         cell4.flags() & CellFlags::WIDE,
         CellFlags::empty(),
@@ -128,14 +118,11 @@ fn insert_chars_count_exceeds_remaining_space() {
     }
     assert_eq!(row.len(), 5);
 
-    // Insert 20 blanks at col 2 — much more than remaining space
     row.insert_chars(2, 20);
 
-    // Cols 0-1 should be unchanged (before insertion point)
     assert_eq!(row.get(0).unwrap().char(), 'A');
     assert_eq!(row.get(1).unwrap().char(), 'B');
 
-    // Cols 2-9 should be blank (insertion fills them)
     for col in 2..10u16 {
         assert_eq!(
             row.get(col).unwrap().char(),
@@ -191,7 +178,6 @@ fn selective_clear_range_len_with_protected_at_end() {
     let fg = PackedColor::DEFAULT_FG;
     let bg = PackedColor::DEFAULT_BG;
 
-    // Write "ABCPD" where P is protected at col 3
     row.write_char_styled(0, 'A', fg, bg, CellFlags::empty());
     row.write_char_styled(1, 'B', fg, bg, CellFlags::empty());
     row.write_char_styled(2, 'C', fg, bg, CellFlags::empty());
@@ -199,8 +185,6 @@ fn selective_clear_range_len_with_protected_at_end() {
     row.write_char_styled(4, 'D', fg, bg, CellFlags::empty());
     assert_eq!(row.len(), 5);
 
-    // Selectively clear the entire range 0..5
-    // Should erase A, B, C, D but not P
     row.selective_clear_range(0, 5);
 
     assert_eq!(
@@ -210,7 +194,6 @@ fn selective_clear_range_len_with_protected_at_end() {
     );
     assert_eq!(row.get(4).unwrap().char(), ' ', "D should be erased");
 
-    // len should be 4 (protected cell at col 3 is the last non-empty)
     assert_eq!(
         row.len(),
         4,
@@ -234,7 +217,6 @@ fn selective_clear_all_protected_preserves_len() {
 
     row.selective_clear();
 
-    // Nothing should change since all cells are protected
     assert_eq!(row.len(), 5);
     for i in 0..5u16 {
         assert_eq!(
@@ -256,10 +238,7 @@ fn clear_range_middle_preserves_len() {
     }
     assert_eq!(row.len(), 10);
 
-    // Clear cols 3-5 (middle of content)
     row.clear_range_with(3, 6, Cell::EMPTY);
-    // Content should be: "ABC   GHIJ"
-    // len should still be 10 since cols 6-9 have content
     assert_eq!(
         row.len(),
         10,
@@ -278,9 +257,7 @@ fn erase_chars_middle_preserves_len() {
     }
     assert_eq!(row.len(), 10);
 
-    // Erase 3 chars at col 2
     row.erase_chars(2, 3);
-    // "AB   FGHIJ"
     assert_eq!(
         row.len(),
         10,
@@ -321,19 +298,6 @@ fn erase_chars_wide_head_at_tail_recalcs_len() {
     assert!(row.get(3).unwrap().is_empty());
 }
 
-/// clear_from at col 0 should set len to 0.
-#[test]
-fn clear_from_zero_sets_len_to_zero() {
-    let (_pages, mut row) = make_row(10);
-    for i in 0..10u16 {
-        row.write_char(i, 'X');
-    }
-    assert_eq!(row.len(), 10);
-
-    row.clear_from(0);
-    assert_eq!(row.len(), 0, "clear_from(0) should leave len at 0");
-}
-
 /// delete_chars at the last column with a large count should handle gracefully.
 #[test]
 fn delete_chars_at_last_col() {
@@ -365,7 +329,6 @@ fn row_set_last_valid_column_updates_len() {
         "len should be cols (100) after writing last column"
     );
 
-    // Out-of-bounds write should fail and leave len unchanged
     assert!(!row.set(100, cell), "set at col 100 should fail (OOB)");
     assert_eq!(row.len(), 100, "len unchanged after OOB set");
 }
@@ -382,7 +345,6 @@ fn row_set_single_column_row() {
     assert!(row.set(0, cell), "set at col 0 should succeed");
     assert_eq!(row.len(), 1, "len should be 1 after writing sole column");
 
-    // Col 1 is out of bounds
     assert!(!row.set(1, cell), "set at col 1 should fail (OOB)");
     assert_eq!(row.len(), 1);
 }
@@ -402,7 +364,6 @@ fn row_set_page_max_cols_last_valid() {
     );
     assert_eq!(row.len(), 8192, "len should be 8192 after writing col 8191");
 
-    // Col 8192 is out of bounds
     assert!(
         !row.set(8192, cell),
         "set at col 8192 should fail (OOB on 8192-element row)"

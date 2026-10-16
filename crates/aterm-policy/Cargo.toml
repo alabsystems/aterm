@@ -11,12 +11,22 @@ description = "OSC / escape-sequence policy engine data model and built-in profi
 
 [features]
 default = []
+# The policy file's TOML form: the serde derives on the data model and
+# `Policy::to_toml`. Off by default, so the lib's normal closure holds no proc
+# macro and Trust's loader admits it (PM-1,
+# docs/PLAN-pm1-proc-macro-reach-2026-10-16.md). The engine and the built-in
+# profiles need neither.
+toml = ["dep:aterm-toml", "dep:serde", "serde/derive"]
 
 [dependencies]
-serde = { workspace = true }
-aterm-toml = { workspace = true }
+serde = { workspace = true, optional = true }
+aterm-toml = { workspace = true, optional = true }
 # std's Instant on native; the JS clock on wasm32, where std's panics.
 aterm-time = { workspace = true }
+
+[dev-dependencies]
+# The unit tests and tests/serde_corpus.rs round-trip policies through TOML.
+aterm-policy = { path = ".", features = ["toml"] }
 
 [lints]
 workspace = true

@@ -5,28 +5,23 @@
 
 use super::*;
 
-// ---- The stray a fresh hint could license ---------------------
-//
-// Beyond "no key" and "a stale hint", a fresh hint the key never spent (the
-// key moved nothing, e.g. Ctrl-E at end of line, or its echo has not landed)
-// must not license the program's own caret relocation. The probe is swept
-// over the settle window (how long frames still see the caret at rest before
-// the repaint hides it) and the landing time. No time bound separates a
-// relocation inside the echo window from the echo itself: cross-row strays
-// are refused by shape (`BridgeReach::line_start`), and the same-row case is
-// indistinguishable from Ctrl-A's own frames and stays licensed.
+// A fresh hint the key never spent (the key moved nothing, e.g. Ctrl-E at end of line, or its
+// echo has not landed) must not license the program's own caret relocation. The probe sweeps the
+// settle window (how long frames still see the caret at rest before the repaint hides it) and
+// the landing time. Strays two or more rows off are refused by shape (`BridgeReach::line_start`);
+// the same-row case is indistinguishable from Ctrl-A's own frames and stays licensed.
 
 /// Which key, if any, stands behind the relocation the probe replays.
 #[derive(Clone, Copy, Debug)]
 enum StrayArm {
-    /// (A) The pinned control: the program moves its caret, nobody typed.
+    /// The program moves its caret; nobody typed.
     NoKey,
-    /// (B) The pinned control's twin: a TYPED key, whose bridge is capped
-    /// at `HIDE_BRIDGE_TYPED_MAX_DIST` and cannot reach the target.
+    /// A typed key, whose bridge is capped at `HIDE_BRIDGE_TYPED_MAX_DIST` and cannot reach the
+    /// target.
     TypedKey,
-    /// (C) A navigation key that moved nothing: the caret sits at its own
-    /// cell for the settle window, then the app's spinner repaint hides and
-    /// re-shows it elsewhere, inside the licence window.
+    /// A navigation key that moved nothing: the caret sits at its own cell for the settle
+    /// window, then the app's spinner repaint hides and re-shows it elsewhere, inside the
+    /// licence window.
     NavKeyThatMovedNothing,
 }
 
@@ -152,8 +147,7 @@ impl StrayBed {
                 self.trail.note_navigation(key);
             }
         }
-        // The key moved NOTHING: every frame until the settle sees the
-        // caret still at its own cell.
+        // The key moved nothing: every frame until the settle sees the caret at its own cell.
         let mut ms = 20u64;
         while ms <= timing.settle {
             self.frame(Some((2, 42)), key + Duration::from_millis(ms));
@@ -215,21 +209,18 @@ fn the_stray_probe_s_bed_bridges_a_real_word_hop_across_a_repaint() {
     assert!(bed.cells.is_empty());
 }
 
-/// (7) A fresh nav hint does not license the program's own cross-row
-/// relocation, at any repaint phase.
-///
-/// Three arms over one relocation, swept over the settle window (0 to 100 ms)
-/// and five targets: four inside the 4-row ceiling, where geometry alone
-/// admits them, and `(2,42)->(9,3)` beyond it. Arm C is refused by the
-/// line-gesture shape.
+/// A fresh nav hint does not license the program's own cross-row relocation at any repaint phase.
+/// All three arms are swept over the settle window and five targets, four inside the
+/// `HIDE_BRIDGE_NAV_MAX_ROWS` ceiling (where geometry alone admits them) and one beyond it; the
+/// nav arm is refused by the line-gesture shape.
 #[test]
 fn a_nav_key_that_moved_nothing_licenses_no_cross_row_relocation_at_any_repaint_phase() {
     let targets = [
         (4u16, 90u16), // two rows down, across the pane
         (5, 88),       // three rows down (an autorepeat face)
         (6, 3),        // four rows down, at the box's start (its worst face)
-        (0, 30),       // two rows UP to an interior column
-        (9, 3),        // seven rows down: the owner's measured stray
+        (0, 30),       // two rows up to an interior column
+        (9, 3),        // seven rows down, beyond the ceiling
     ];
     for settle in [0u64, 20, 40, 60, 80, 100] {
         for target in targets {
@@ -249,15 +240,12 @@ fn a_nav_key_that_moved_nothing_licenses_no_cross_row_relocation_at_any_repaint_
     }
 }
 
-/// (8) The same-row relocation is Ctrl-A's own frames. From `(2,42)`, a
-/// hidden→visible landing at `(2,3)` under a fresh nav hint is exactly Ctrl-A
-/// on a Claude Code line through an Ink repaint, and `(2,99)` is Ctrl-E's; no
-/// byte the host sees separates them. So this law states the residual: inside
-/// the echo window the landing is licensed, and only the clock refuses it (a
-/// frame that saw the caret at rest more than `NAV_NOOP_SETTLE_MS` after the
-/// press, or a landing later than `NAV_BRIDGE_LANDING_MS`). The remaining
-/// exposure is a relocation on the caret's row or one row off, within 150 ms
-/// of a nav key that moved nothing, when no frame caught the caret at rest.
+/// A same-row hidden→visible landing under a fresh nav hint is exactly Ctrl-A's (`(2,3)`) or
+/// Ctrl-E's (`(2,99)`) frames through an Ink repaint, and no byte the host sees separates them.
+/// Inside the echo window it is licensed; only the clock refuses it (a frame that saw the caret
+/// at rest more than `NAV_NOOP_SETTLE_MS` after the press, or a landing later than
+/// `NAV_BRIDGE_LANDING_MS`). The residual exposure is a relocation on the caret's row or one row
+/// off within 150 ms of a nav key that moved nothing, when no frame caught the caret at rest.
 #[test]
 fn a_same_row_landing_inside_the_echo_window_is_ctrl_a_s_shape_and_only_the_clock_refuses_it() {
     let ms = |settle, landing| StrayTiming { settle, landing };
@@ -300,9 +288,8 @@ fn a_same_row_landing_inside_the_echo_window_is_ctrl_a_s_shape_and_only_the_cloc
     }
 }
 
-/// (9) A refused stray must not eat the stamp, or the word hop actually
-/// pressed would land a frame later unlicensed and silent. Driven at a slow
-/// and a fast repaint, on the two near faces.
+/// A refused stray must not eat the stamp, or the word hop actually pressed would land a frame
+/// later unlicensed and silent.
 #[test]
 fn a_refused_stray_leaves_the_word_key_its_own_licence() {
     for (target, settle) in [((9u16, 3u16), 100u64), ((5, 88), 40), ((6, 3), 0)] {
@@ -320,8 +307,8 @@ fn a_refused_stray_leaves_the_word_key_its_own_licence() {
         );
         assert_eq!(bed.glow.spawns(), 0);
 
-        // The owner's OWN word hop, pressed while that stray was still on
-        // screen: it is visible-to-visible, and it sounds.
+        // The user's own word hop, pressed while that stray was still on screen: visible to
+        // visible, and it sounds.
         let hop = key + Duration::from_millis(170);
         bed.glow.note_motion(hop);
         bed.frame(Some(target), hop + Duration::from_millis(4));
@@ -339,9 +326,8 @@ fn a_refused_stray_leaves_the_word_key_its_own_licence() {
     }
 }
 
-/// (10) Autorepeat: holding Option+Left at line start re-stamps the hint every
-/// 33 ms, so the settle bound cannot bite; the repaint's relocation three
-/// rows down is refused by shape alone.
+/// Holding Option+Left at line start re-stamps the hint every 33 ms, so the settle bound cannot
+/// bite; the repaint's relocation three rows down is refused by shape alone.
 #[test]
 fn a_held_word_key_at_the_line_start_licenses_no_relocation_the_repaint_makes() {
     let mut bed = StrayBed::new();

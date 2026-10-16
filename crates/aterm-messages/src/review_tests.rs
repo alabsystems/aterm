@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Test-only: junk-tolerance and flood nets from the 2026-09-22 adversarial
-//! review — a deterministic PRNG drives the codec, every small decoder, both
-//! wire parsers, the text shapers and the words at random and at extremes,
-//! and a 6000-step flood asserts every bound after every step. The
-//! defect-pinning tests from the same review live beside their code.
+//! Junk-tolerance and flood nets: a deterministic PRNG drives the codec,
+//! every small decoder, both wire parsers, the text shapers and the words at
+//! random and at extremes, and a 6000-step flood asserts every bound after
+//! every step.
 
 use std::collections::BTreeMap;
 
@@ -253,12 +252,11 @@ fn decoders_and_wire_parsers_never_panic_on_junk() {
     }
 }
 
-/// `notice` survives junk (design rulings 163–179): random lines after
-/// every sub-form never panic the parser; whatever it accepts applies to a
-/// center with a one-line reply, and every row the wire raised carries no
-/// capsule, a control-free title, a glass title in form and an attention
-/// verdict (a record for news; a row only for a failure or for work with its
-/// indicator) — whatever the order, the instants and the budgets did.
+/// `notice` survives junk: random lines after every sub-form never panic the
+/// parser; whatever it accepts applies to a center with a one-line reply, and
+/// every row the wire raised carries no capsule, a control-free title, a
+/// glass title in form and an attention verdict (a record for news; a row
+/// only for a failure or for work with its indicator).
 #[test]
 fn notice_lines_never_panic_and_never_forge_a_row() {
     let mut rng = Rng(0x5eed_0f_a11_0e5);
@@ -565,10 +563,9 @@ fn a_flood_keeps_every_bound() {
             );
         }
         assert_eq!(c.queued(), c.live_rows().count() - glass.len());
-        // The words of every live row are within their caps and control-free.
-        // A row whose title and detail are the ones already vetted at an
-        // earlier step (the same words, which the checks read alone) is not
-        // walked character by character again.
+        // The words of every live row are within their caps and control-free;
+        // a row whose title and detail are unchanged since an earlier step
+        // vetted them is not walked again (the checks read only the words).
         let mut still_vetted = BTreeMap::new();
         for l in c.live_rows() {
             let words = match vetted.remove(&l.id) {

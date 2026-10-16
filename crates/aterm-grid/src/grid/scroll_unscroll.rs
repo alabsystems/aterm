@@ -27,10 +27,9 @@ impl Grid {
         // Drain the lazy buffer so history is the ring (newest) over the store.
         self.drain_lazy_buffer();
 
-        // History's newest lines are the ring rows directly above the viewport,
-        // then the lazy buffer, then the tiered store. Pull newest-first from
-        // the ring, then the store only when no lazy-staged lines sit between
-        // them (the `fill_viewport_deficit_from_history` rule).
+        // The drain keeps lines staged during a reflow's detach window; staged
+        // lines sit between the ring and the store, so the store counts only
+        // when nothing is staged (the `fill_viewport_deficit_from_history` rule).
         let ring = self.storage.ring_buffer_scrollback();
         let available = if self.storage.lazy_buffer_lines() > 0 {
             ring
@@ -50,8 +49,8 @@ impl Grid {
         let bottom = usize::from(self.storage.scroll_region.bottom);
         let n = n.min(available).min(bottom - top + 1);
 
-        // Read all lines before any destructive operation; if any fails to
-        // decompress, abort rather than lose data.
+        // Read every line before mutating anything, so a decompression failure
+        // loses nothing.
         let mut lines = Vec::with_capacity(n);
         for rev_idx in (0..n).rev() {
             match self.try_history_line_rev(rev_idx) {
@@ -79,11 +78,9 @@ impl Grid {
             self.fill_row_from_line(row_u16(top + i), line, cols);
         }
 
-        // Remove recovered lines from history: ring first (newest), then the
-        // store. Ring rows go only after the fill, since dropping them rotates
-        // `ring_head` and the indices above predate that. A failed store
-        // removal leaves lines duplicated rather than lost; with try-read-first
-        // it is unreachable.
+        // Remove the recovered lines, ring (newest) first. Ring rows go only
+        // after the fill: dropping them rotates `ring_head`, which the indices
+        // above predate. A failed store removal duplicates lines, never loses them.
         let from_ring = n.min(ring);
         if from_ring > 0 {
             self.drop_newest_ring_scrollback(from_ring);
@@ -97,14 +94,12 @@ impl Grid {
                 "unscroll_from_scrollback: failed to remove {from_tiered} lines from scrollback: {e}"
             );
         }
-        // Every older history row keeps its line but its absolute key shifted
-        // by `n`, which no content_gen or damage signal describes. Bump the
-        // epoch so absolute-row-keyed caches (the search index) rebuild.
+        // Older history rows keep their lines but their absolute keys shift by
+        // `n`, which no content_gen or damage signal describes: bump the epoch so
+        // absolute-row-keyed caches (the search index) rebuild, and drop the
+        // selection band wholesale.
         self.storage.history_renumber_epoch = self.storage.history_renumber_epoch.saturating_add(1);
-        // History renumbered wholesale, so no band can describe the selection
-        // damage.
         self.force_selection_invalidation();
-        // Only the scroll region rows changed — mark them, not the full screen.
         let top_u16 = self.storage.scroll_region.top;
         let bottom_u16 = self.storage.scroll_region.bottom;
         self.storage

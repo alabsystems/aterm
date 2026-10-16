@@ -113,7 +113,14 @@ fn roster() -> Vec<Entry> {
         &std::iter::repeat_n(note, 5).collect::<Vec<_>>(),
     ));
     all.push(mr::upgrade_cannot_run_entry("busy:state-unwritable", None));
-    all.push(mr::devtools_entry());
+    for step in [
+        atpkg::devtools::Step::Add,
+        atpkg::devtools::Step::SwitchOn,
+        atpkg::devtools::Step::ListedOn,
+    ] {
+        all.push(mr::devtools_entry(step));
+    }
+    all.push(mr::palette_refused_entry());
     // The accounts': one signed out, three, the most a roster lists at the
     // longest a label can be, the longest label the action names and the first
     // it does not, and the roster that is refused.
@@ -129,6 +136,7 @@ fn roster() -> Vec<Entry> {
         all.push(mr::accounts_signed_out_entry(&labels).expect("a label is an entry"));
     }
     all.push(mr::accounts_refused_entry());
+    all.push(mr::usage_tap_silent_entry());
     // The relaunch's, in every place, for every cause and reason it can name.
     for spot in places() {
         for cause in ["held", "shell-prompt", "other-tab"] {
@@ -204,6 +212,8 @@ fn resume_exception(kind: ExceptionKind) -> Exception {
         why: why.to_string(),
         action: action.to_string(),
         clears: "the agent working",
+        // The old lost login is the loop's own escalation.
+        escalated: kind == ExceptionKind::Login,
     }
 }
 
@@ -215,7 +225,7 @@ fn stall_exception() -> Exception {
 /// EVERY WORD THE HOST CAN SAY passes the door and the rule's own caps: a title
 /// that is a glass title, a reason and an action of at most 90 characters, one
 /// action (no `; `, no ` or `), a reason that does not lean on waiting, and no
-/// word that asks for a restart (grep_guard B12). Keys stay within their cap, sit
+/// word that asks for a restart. Keys stay within their cap, sit
 /// under their family's prefix, and share nothing with a record's key.
 #[test]
 fn every_host_entry_passes_the_door_and_the_caps() {
@@ -245,10 +255,7 @@ fn every_host_entry_passes_the_door_and_the_caps() {
         assert!(!then.contains("; ") && !then.contains(" or "), "{then}");
         for line in [&why, &then, &msg.title] {
             let low = line.to_lowercase();
-            // Spelled in pieces: grep_guard B12 reads this file for the same words.
-            let next_launch = ["next", "launch"].join(" ");
-            let cold = ["re", "boot"].concat();
-            for needle in ["restart", "relaunch", "reopen", &next_launch, &cold] {
+            for needle in ["restart", "relaunch", "reopen", "next launch", "reboot"] {
                 assert!(!low.contains(needle), "{}: {line}", entry.key());
             }
         }
@@ -274,6 +281,7 @@ fn the_host_families_speak_by_event() {
         Family::Disk,
         Family::UpgradeHost,
         Family::Render,
+        Family::Terminal,
     ] {
         assert_eq!(family.mode(), Mode::Event, "{family:?}");
     }
@@ -675,10 +683,12 @@ fn a_volume_aterm_could_not_help_is_one_line_and_space_ends_it() {
 }
 
 /// THE DEVELOPER TOOLS LIST (owner ruling 2026-10-14) is one line however often a
-/// reading says `not_granted`, whose one press opens the Developer Tools pane; a reading
-/// that finds aterm on the list ends it; `unknown` leaves it as it was. Never a band row
-/// or a re-grid. (The hand-over that opens the pane by itself is the wake handler's, on a
-/// windowed instance only: `apply_devtools_step` reports it and opens nothing.)
+/// reading says `not_granted`, whose one press opens the Developer Tools pane and whose
+/// second capsule opens aterm's own Settings ▸ Security, in `atpkg::devtools`' words (owner
+/// ask 2026-10-15: one spelling on every surface); a reading that finds aterm on the list
+/// ends it; `unknown` leaves it as it was. Never a band row or a re-grid. (The hand-over
+/// that opens the pane by itself is the wake handler's, on a windowed instance only:
+/// `apply_devtools_step` reports it and opens nothing.)
 #[test]
 fn the_developer_tools_list_is_one_line_and_a_reading_decides_it() {
     use crate::devtools_watch::Step;
@@ -700,14 +710,91 @@ fn the_developer_tools_list_is_one_line_and_a_reading_decides_it() {
         "one line, however often it is told"
     );
     let line = app.messages.digest().entries[0].clone();
-    assert!(
-        line.actions.iter().any(|a| matches!(
-            a,
-            aterm_messages::Intent::OpenSystemPane { pane } if pane == mr::PANE_DEVELOPER_TOOLS
-        )),
-        "the one press opens Developer Tools: {:?}",
-        line.actions
+    assert_eq!(
+        line.actions,
+        [
+            aterm_messages::Intent::OpenSystemPane {
+                pane: mr::PANE_DEVELOPER_TOOLS.to_string()
+            },
+            aterm_messages::Intent::OpenSettings {
+                route: crate::native_settings::SettingsRoute::Security
+                    .path()
+                    .to_string()
+            },
+        ],
+        "the one press opens Developer Tools; beside it, aterm's Security page"
     );
+    assert_eq!(
+        line.actions
+            .iter()
+            .map(aterm_messages::Intent::label)
+            .collect::<Vec<_>>(),
+        ["Open Settings", "Security"],
+        "two capsules that never read alike"
+    );
+    assert_eq!(line.then, atpkg::devtools::HELPER_STEP, "the one action");
+    let skips = aterm_containment::SpikeEvidence::UNMEASURED.devtool_skips_first_run_check;
+    assert!(
+        line.detail.iter().any(|l| l == atpkg::devtools::why(skips)),
+        "why, in atpkg's words: {:?}",
+        line.detail
+    );
+    assert!(
+        line.detail.iter().any(|l| l
+            .starts_with(aterm_containment::consent::DEVTOOLS_SETTINGS_WORDS)
+            && l.ends_with(&format!("({})", atpkg::devtools::PLUS_ROUTE))),
+        "the path, and the + route beside the drag: {:?}",
+        line.detail
+    );
+    // The line follows what the list holds of aterm as the lane last read it, as
+    // the panel and the card do: a row switched off asks for its switch, a row on
+    // while macOS still checks names the causes; neither speaks of a drag or of +.
+    for (list, title, then, causes) in [
+        (
+            crate::devtools_helper::test_arms::list(
+                aterm_containment::consent::DevToolListing::Off,
+                aterm_containment::consent::DevToolListLabel::Read,
+                Some(2),
+            ),
+            "aterm is off in Developer Tools",
+            atpkg::devtools::STEP_SWITCH_ON,
+            false,
+        ),
+        (
+            crate::devtools_helper::test_arms::on(),
+            "macOS still checks programs aterm starts",
+            atpkg::devtools::STEP_LISTED_ON,
+            true,
+        ),
+    ] {
+        let mut app = App::headless_for_test();
+        app.devtools_helper.note_reading(
+            crate::devtools_helper::test_arms::reading(
+                aterm_containment::DevToolGrant::NotGranted,
+                list,
+            ),
+            std::time::Instant::now(),
+        );
+        let _ = app.apply_devtools_step(Step::Raise { hand_over: false });
+        assert_eq!(keys(&app), [mr::DEVTOOLS_KEY], "one line");
+        let line = app.messages.digest().entries[0].clone();
+        assert_eq!((line.title.as_str(), line.then.as_str()), (title, then));
+        assert_eq!(
+            line.detail
+                .iter()
+                .any(|l| l == atpkg::devtools::HELPER_LISTED_ON),
+            causes,
+            "{:?}",
+            line.detail
+        );
+        assert!(
+            line.detail
+                .iter()
+                .all(|l| !l.contains(atpkg::devtools::PLUS_ROUTE)),
+            "no + route for a listed aterm: {:?}",
+            line.detail
+        );
+    }
     assert!(!app.apply_devtools_step(Step::Nothing));
     assert_eq!(keys(&app), [mr::DEVTOOLS_KEY], "unknown leaves it");
     assert!(!app.apply_devtools_step(Step::Clear));
@@ -981,6 +1068,11 @@ fn the_accounts_lines_follow_what_the_host_says_and_mark_nothing() {
     let listed = |labels: &[&str]| {
         HostNote::Accounts(AccountsSaid::Listed {
             signed_out: labels.iter().map(|l| l.to_string()).collect(),
+            credits: Vec::new(),
+            window_full: Vec::new(),
+            due: Vec::new(),
+            none_soon: false,
+            wrong: Vec::new(),
         })
     };
     let step = |app: &mut App, note: HostNote| -> Vec<(String, String)> {
@@ -1158,14 +1250,119 @@ fn the_accounts_lines_follow_what_the_host_says_and_mark_nothing() {
     assert_eq!(glass(&app), before);
 }
 
+/// THE ACCOUNT'S USAGE LINES (`HostNote::Accounts`, accounts v2 S5): usage
+/// credits carrying an account's sessions are ONE line,
+/// `harness.accounts.credits`, raised once — the same note again moves
+/// nothing — and ended when nothing names it (credits over); the week nearly
+/// used with credits off is ONE line, `harness.accounts.window-full`, whose
+/// action is to turn credits on, or to raise their cap where the vendor said
+/// they ran out. Neither marks a tab, puts a row on the band or writes a
+/// record. NEGATIVE CONTROLS: a note that names neither raises neither (the
+/// window-full line needs credits known off: the host names none
+/// otherwise), and both Entries pass the door's caps and vocabulary.
+#[test]
+fn the_accounts_usage_lines_follow_what_the_host_says_and_mark_nothing() {
+    let mut app = App::headless_for_test();
+    let before = glass(&app);
+    let said = |credits: &[&str], full: &[(&str, &str)]| {
+        HostNote::Accounts(AccountsSaid::Listed {
+            signed_out: Vec::new(),
+            credits: credits.iter().map(|l| l.to_string()).collect(),
+            window_full: full
+                .iter()
+                .map(|(l, why)| (l.to_string(), why.to_string()))
+                .collect(),
+            due: Vec::new(),
+            none_soon: false,
+            wrong: Vec::new(),
+        })
+    };
+    let step = |app: &mut App, note: HostNote| -> Vec<(String, String)> {
+        app.note_harness_host(note.clone());
+        assert_eq!(glass(app), before, "{note:?}: nothing on the glass");
+        assert!(app.host_noted.is_empty(), "{note:?}: no claim held");
+        let mut lines: Vec<(String, String)> = app
+            .messages
+            .digest()
+            .entries
+            .iter()
+            .map(|e| (e.key.clone(), e.then.clone()))
+            .collect();
+        lines.sort();
+        lines
+    };
+    let credits = (
+        mr::ACCOUNTS_CREDITS_KEY.to_string(),
+        "Review the usage credit cap in claude.ai settings".to_string(),
+    );
+    let turn_on = (
+        mr::ACCOUNTS_WINDOW_FULL_KEY.to_string(),
+        "Turn on usage credits in claude.ai settings".to_string(),
+    );
+    let raise = (
+        mr::ACCOUNTS_WINDOW_FULL_KEY.to_string(),
+        "Raise the usage credit cap in claude.ai settings".to_string(),
+    );
+    // NEGATIVE CONTROL: nothing named, nothing raised.
+    assert!(step(&mut app, said(&[], &[])).is_empty());
+    // Credits in use: the line, once.
+    assert_eq!(
+        step(&mut app, said(&["main"], &[])),
+        std::slice::from_ref(&credits)
+    );
+    let rev = app.messages.digest_revision();
+    assert_eq!(
+        step(&mut app, said(&["main"], &[])),
+        std::slice::from_ref(&credits)
+    );
+    assert_eq!(app.messages.digest_revision(), rev, "the same words again");
+    let e = app.messages.digest().entries[0].clone();
+    assert_eq!(e.title, "Claude is running on usage credits");
+    assert!(
+        e.detail.iter().any(|l| l == "On credits: main"),
+        "{:?}",
+        e.detail
+    );
+    // Over: the line ends.
+    assert!(step(&mut app, said(&[], &[])).is_empty());
+    // The week nearly used with credits off, and spent.
+    assert_eq!(
+        step(&mut app, said(&[], &[("main", "org_level_disabled")])),
+        std::slice::from_ref(&turn_on)
+    );
+    assert!(step(&mut app, said(&[], &[])).is_empty());
+    assert_eq!(
+        step(&mut app, said(&[], &[("main", "out_of_credits")])),
+        [raise]
+    );
+    // The owner's switch off, or no roster: both end.
+    assert_eq!(
+        step(&mut app, said(&["main"], &[("main", "org_level_disabled")])).len(),
+        2
+    );
+    assert!(step(&mut app, HostNote::Accounts(AccountsSaid::Nothing)).is_empty());
+    // The door's own checks, every wording.
+    for entry in [
+        mr::accounts_credits_entry(&["main".to_string(), "work-2".to_string()]),
+        mr::accounts_window_full_entry(&[("main".to_string(), "out_of_credits".to_string())]),
+        mr::accounts_window_full_entry(&[("main".to_string(), String::new())]),
+    ] {
+        let entry = entry.expect("an entry");
+        assert_eq!(entry.family(), Family::Accounts);
+        assert!(entry.message().is_ok(), "{:?}", entry.message().err());
+    }
+    assert!(mr::accounts_credits_entry(&[]).is_none());
+    assert!(mr::accounts_window_full_entry(&[]).is_none());
+}
+
 /// THE RESUME LOOP'S EXCEPTIONS REACH THE DIGEST (design-exceptions 9.3, X3d).
 /// A `Later` point a tab's loop found only a person can answer is ONE line per
 /// kind naming its tabs (`harness.resume.<kind>`), filed once whatever the count;
-/// a lost login (`Now`) is the supervisor's own escalation and never a line; a
-/// stall no reader names is a line per tab (`harness.resume.<tab>.stalled`); and
-/// each ends with its fact, ten minutes after the last look that named it (the
-/// digest's clock). NEGATIVE CONTROLS: `Now` raises nothing; a tab whose worker
-/// ended takes its lines away with it.
+/// a lost login the supervisor escalated (`Now`) is that escalation's and never
+/// a line; a stall no reader names is a line per tab
+/// (`harness.resume.<tab>.stalled`); and each ends with its fact, ten minutes
+/// after the last look that named it (the digest's clock). NEGATIVE CONTROLS:
+/// `Now` raises no line; a tab whose worker ended takes its lines away with it.
 #[test]
 fn a_resume_exception_is_one_line_per_kind_and_a_stall_one_per_tab_and_each_ends_with_its_fact() {
     let mut app = App::headless_for_test();
@@ -1417,6 +1614,34 @@ fn a_relaunch_claim_and_line_end_when_their_tab_is_gone() {
     assert_eq!(keys, [mr::relaunch_keys(&tab)[0].clone()], "{keys:?}");
 }
 
+/// The closed-tab sweep runs on every loop turn and judges only what is
+/// there to judge: with no relaunch line or claim open, a told mark alone
+/// still ends with its tab, and every other fact the host holds stands.
+/// NEGATIVE CONTROL: the open tab's told mark stands too.
+#[test]
+fn a_told_relaunch_mark_alone_ends_with_its_tab_and_nothing_else_moves() {
+    let mut app = App::headless_for_test();
+    let tab = front_tab_sid(&mut app);
+    app.host_noted.insert("stalled:s-1".to_string());
+    app.host_noted.insert(format!("relaunch:{tab}"));
+    app.host_noted.insert(format!("relaunch:{CLOSED_SID}"));
+    let digest_before = app.messages.digest_revision();
+    app.end_relaunch_lines_of_closed_tabs();
+    let mut noted: Vec<&str> = app.host_noted.iter().map(String::as_str).collect();
+    noted.sort_unstable();
+    let open_mark = format!("relaunch:{tab}");
+    assert_eq!(noted, [open_mark.as_str(), "stalled:s-1"]);
+    assert_eq!(app.messages.digest_revision(), digest_before);
+    // Nothing relaunch-shaped left: a turn changes nothing at all.
+    app.host_noted.remove(&open_mark);
+    app.end_relaunch_lines_of_closed_tabs();
+    assert_eq!(
+        app.host_noted.iter().collect::<Vec<_>>(),
+        [&"stalled:s-1".to_string()]
+    );
+    assert_eq!(app.messages.digest_revision(), digest_before);
+}
+
 /// A RELAUNCH LINE AN EARLIER PROCESS LEFT is ended by the adoption sweep unless
 /// this process's own worker told of it; one this process told of stands. Short
 /// ids and real-length ones (whose keys carry a shortened subject).
@@ -1448,6 +1673,115 @@ fn the_adoption_sweep_ends_relaunch_lines_this_process_did_not_tell() {
         want.sort();
         assert_eq!(keys, want, "{told}");
     }
+}
+
+/// The loop's words for a lost login waited at with no account left to move
+/// to (`policy/exception.rs`): `Now`, and no escalation of the loop's carries
+/// it.
+fn stuck_login_exception() -> Exception {
+    Exception {
+        kind: ExceptionKind::Login,
+        when: Urgency::Now,
+        why: "Its login is gone, and the roster has no other account to move it to.".to_string(),
+        action: "Run aterm harness accounts login pool-a.".to_string(),
+        clears: "the login signed in again, an account to move to, or the agent working",
+        escalated: false,
+    }
+}
+
+/// A NOW NO ESCALATION OF THE LOOP'S CARRIES IS THE OWNER'S ASK ON THE GLASS
+/// (the alert rule: the owner is needed now, aterm cannot settle it, and one
+/// step changes it): a tab's lost login waited at with no account left is ONE
+/// standing row, `harness.resume-ask.<tab>`, `Now`-class, in the loop's words
+/// — its why and its one step, `Run aterm harness accounts login <label>.` —
+/// and no line of the digest. Told again in the same words it is the same
+/// row; its end (`None`: the move onto the login signed in again was asked)
+/// takes the row down, as the loop's own escalation taking its place does. A
+/// row an earlier process carried here that no loop of this one tells of ends
+/// at the resume family's settle, and a told one stands. NEGATIVE CONTROLS:
+/// the same login carried by the loop's own escalation (`/login` typed, its
+/// badge) raises no row and no line, and a `Later` one is a line and no row.
+#[test]
+fn a_now_no_escalation_carries_is_a_standing_ask_until_its_point_moves_on() {
+    use aterm_messages::need::Need;
+    let mut app = App::headless_for_test();
+    let told = |app: &mut App, sid: &str, standing: Option<Exception>| {
+        app.note_harness_host(HostNote::ResumeException {
+            sid: sid.to_string(),
+            standing,
+        });
+    };
+    let asks = |app: &App| -> Vec<String> {
+        app.messages
+            .live_rows()
+            .filter(|row| matches!(row.msg.need(), Need::Now(_)))
+            .map(|row| row.msg.key.clone().unwrap_or_default())
+            .collect()
+    };
+    // NEGATIVE CONTROLS: the loop's own escalation; a `Later` one.
+    told(
+        &mut app,
+        "s-1",
+        Some(resume_exception(ExceptionKind::Login)),
+    );
+    assert!(asks(&app).is_empty(), "the loop's escalation says it");
+    assert!(app.messages.digest().is_empty());
+    told(
+        &mut app,
+        "s-1",
+        Some(resume_exception(ExceptionKind::Spend)),
+    );
+    assert!(asks(&app).is_empty());
+    assert_eq!(app.messages.digest().len(), 1, "a line, no row");
+    told(&mut app, "s-1", None);
+    // The ask.
+    let lines = app.messages.digest().len();
+    told(&mut app, "s-1", Some(stuck_login_exception()));
+    let key = mr::resume_ask_key("s-1");
+    assert_eq!(asks(&app), std::slice::from_ref(&key));
+    assert_eq!(app.messages.digest().len(), lines, "no line of the digest");
+    let row = app.messages.live_by_key(&key).expect("the ask");
+    assert!(matches!(row.msg.hold, aterm_messages::Hold::Standing(_)));
+    assert!(
+        row.msg
+            .detail
+            .iter()
+            .any(|l| l == "Run aterm harness accounts login pool-a."),
+        "{:?}",
+        row.msg.detail
+    );
+    let id = row.id;
+    told(&mut app, "s-1", Some(stuck_login_exception()));
+    assert_eq!(
+        app.messages.live_by_key(&key).map(|row| row.id),
+        Some(id),
+        "the same row"
+    );
+    // Its end takes it down.
+    told(&mut app, "s-1", None);
+    assert!(asks(&app).is_empty(), "the move asked");
+    // …and so does the loop's own escalation taking its place.
+    told(&mut app, "s-2", Some(stuck_login_exception()));
+    assert_eq!(asks(&app), [mr::resume_ask_key("s-2")]);
+    told(
+        &mut app,
+        "s-2",
+        Some(resume_exception(ExceptionKind::Login)),
+    );
+    assert!(asks(&app).is_empty(), "said once, by the escalation");
+    // A row an earlier process carried, which no loop of this one tells of,
+    // ends at the settle; the one a loop tells of stands.
+    let mut app = App::headless_for_test();
+    app.post_message(mr::resume_ask(
+        "s-9",
+        &places()[0],
+        &stuck_login_exception(),
+    ));
+    told(&mut app, "s-3", Some(stuck_login_exception()));
+    app.ripen_exceptions(Instant::now());
+    assert_eq!(asks(&app).len(), 2, "not yet settled");
+    app.ripen_exceptions(Instant::now() + DAY);
+    assert_eq!(asks(&app), [mr::resume_ask_key("s-3")]);
 }
 
 /// A LINE AN EARLIER PROCESS LEFT OPEN for a resume exception no loop of this
@@ -1598,6 +1932,34 @@ fn a_stall_at_ninety_minutes_is_a_record_once_and_no_line() {
     assert!(!app.host_noted.contains("stalled:s-1"));
     told(&mut app, Some(95));
     assert_eq!(recorded(&app), 2, "a new episode is told again");
+}
+
+/// A PALETTE SET THE OWNER'S CONFIG REFUSED is one digest line for every tab,
+/// naming the setting: never a band row, and a session's later refusals (or
+/// another session's first) add nothing.
+#[test]
+fn a_refused_palette_set_is_one_line_naming_the_setting() {
+    let mut app = App::headless_for_test();
+    assert!(app.messages.digest().is_empty());
+    app.note_palette_refused();
+    let rev = app.messages.digest_revision();
+    app.note_palette_refused();
+    assert_eq!(
+        app.messages.digest_revision(),
+        rev,
+        "a second refusal moves nothing"
+    );
+    let digest = app.messages.digest();
+    assert_eq!(digest.entries.len(), 1);
+    assert_eq!(digest.entries[0].key, "terminal.palette-refused");
+    let msg = mr::palette_refused_entry()
+        .message()
+        .expect("the entry is well formed");
+    let words = format!("{msg:?}");
+    assert!(
+        words.contains("allow_palette_reconfigure"),
+        "the line names the setting that refused it: {words}"
+    );
 }
 
 /// A REPAINT THAT GAVE UP is one line, `render.<tab>.unrepaired`, "Tab N may be
@@ -1986,4 +2348,199 @@ fn foreign_tools_are_one_entry_per_look_with_atpkgs_fix_ended_when_it_sees_none(
         &format!("atpkg: {FOREIGN_MARKER}{FOREIGN_PATH} gh /u/.local/bin/gh"),
     );
     assert!(app.messages.digest().is_empty(), "no fix, no entry");
+}
+
+/// A renewable login's stuck tab, as the loop tells it (accounts v2 S7): the
+/// policy's words, its step `Run aterm harness accounts renew <label>.`.
+fn ended_login_exception(label: &str) -> Exception {
+    Exception {
+        kind: ExceptionKind::Login,
+        when: Urgency::Now,
+        why: "Its login has ended, and only a renewal in your browser restores it.".to_string(),
+        action: format!(
+            "{}{label}.",
+            aterm_agent::supervise::policy::exception::RENEW_STEP
+        ),
+        clears: "the login signed in again, an account to move to, or the agent working",
+        escalated: false,
+    }
+}
+
+/// EVERY TAB STOPPED ON AN ENDED, RENEWABLE LOGIN IS IN ONE ASK PER MACHINE
+/// (`harness.accounts.renew-ask`): restated in place as tabs join it — its
+/// step renewing every label — and withdrawn once the last one leaves. No
+/// per-tab ask and no line of the digest for them. The machine's due logins
+/// are an Info line of the digest, NEVER an ask; no working login within a
+/// day a Warn line; a renewal that signed in another account a line.
+/// NEGATIVE CONTROLS: S0's stuck login after a move (`accounts login`)
+/// keeps its own tab's ask; the loop's escalated login raises nothing; an
+/// earlier process's renew ask no tab of this one holds ends at the settle.
+#[test]
+fn every_tab_stopped_on_an_ended_login_is_in_one_machine_ask() {
+    use aterm_messages::need::Need;
+    let mut app = App::headless_for_test();
+    let told = |app: &mut App, sid: &str, standing: Option<Exception>| {
+        app.note_harness_host(HostNote::ResumeException {
+            sid: sid.to_string(),
+            standing,
+        });
+    };
+    let asks = |app: &App| -> Vec<String> {
+        app.messages
+            .live_rows()
+            .filter(|row| matches!(row.msg.need(), Need::Now(_)))
+            .map(|row| row.msg.key.clone().unwrap_or_default())
+            .collect()
+    };
+    let detail = |app: &App| -> Vec<String> {
+        app.messages
+            .live_by_key(mr::RENEW_ASK_KEY)
+            .map(|row| row.msg.detail.clone())
+            .unwrap_or_default()
+    };
+    let lines = app.messages.digest().len();
+    told(&mut app, "s-1", Some(ended_login_exception("m7-a")));
+    assert_eq!(asks(&app), [mr::RENEW_ASK_KEY]);
+    assert!(
+        detail(&app)
+            .iter()
+            .any(|l| l == "Run aterm harness accounts renew m7-a"),
+        "{:?}",
+        detail(&app)
+    );
+    let id = app.messages.live_by_key(mr::RENEW_ASK_KEY).map(|r| r.id);
+    told(&mut app, "s-2", Some(ended_login_exception("m7-a")));
+    told(&mut app, "s-3", Some(ended_login_exception("pool-1")));
+    assert_eq!(asks(&app), [mr::RENEW_ASK_KEY], "one ask, whatever stopped");
+    assert!(
+        detail(&app)
+            .iter()
+            .any(|l| l == "Run aterm harness accounts renew m7-a pool-1"),
+        "{:?}",
+        detail(&app)
+    );
+    assert!(
+        app.messages
+            .live_by_key(mr::RENEW_ASK_KEY)
+            .is_some_and(|row| row.msg.title.contains("in 3 tabs")),
+        "the tabs counted"
+    );
+    assert_eq!(app.messages.digest().len(), lines, "no line of the digest");
+    let _ = id;
+    told(&mut app, "s-1", None);
+    told(&mut app, "s-2", None);
+    assert_eq!(asks(&app), [mr::RENEW_ASK_KEY], "s-3 still stopped");
+    assert!(
+        detail(&app)
+            .iter()
+            .any(|l| l == "Run aterm harness accounts renew pool-1"),
+        "{:?}",
+        detail(&app)
+    );
+    told(&mut app, "s-3", None);
+    assert!(asks(&app).is_empty(), "the last tab moved");
+
+    // NEGATIVE CONTROLS: the stuck login after a move keeps its tab's ask;
+    // the loop's escalation raises nothing.
+    told(&mut app, "s-4", Some(stuck_login_exception()));
+    assert_eq!(asks(&app), [mr::resume_ask_key("s-4")]);
+    told(&mut app, "s-4", None);
+    told(
+        &mut app,
+        "s-5",
+        Some(resume_exception(ExceptionKind::Login)),
+    );
+    assert!(asks(&app).is_empty(), "said once, by the escalation");
+
+    // The machine's due logins, a day's warning, a wrong account: lines.
+    let listed = |due: &[&str], none_soon: bool, wrong: &[&str]| {
+        HostNote::Accounts(AccountsSaid::Listed {
+            signed_out: Vec::new(),
+            credits: Vec::new(),
+            window_full: Vec::new(),
+            due: due.iter().map(|l| l.to_string()).collect(),
+            none_soon,
+            wrong: wrong.iter().map(|l| l.to_string()).collect(),
+        })
+    };
+    let keys = |app: &App| -> Vec<String> {
+        app.messages
+            .digest()
+            .entries
+            .iter()
+            .map(|e| e.key.clone())
+            .collect()
+    };
+    app.note_harness_host(listed(&["m7-a"], false, &[]));
+    assert_eq!(keys(&app), [mr::ACCOUNTS_DUE_KEY]);
+    assert!(asks(&app).is_empty(), "a due login is a line, never an ask");
+    app.note_harness_host(listed(&["m7-a"], true, &["m7-a"]));
+    let mut want = vec![
+        mr::ACCOUNTS_DUE_KEY.to_string(),
+        mr::ACCOUNTS_NONE_SOON_KEY.to_string(),
+        mr::ACCOUNTS_WRONG_KEY.to_string(),
+    ];
+    want.sort();
+    let mut have = keys(&app);
+    have.sort();
+    assert_eq!(have, want);
+    app.note_harness_host(listed(&[], false, &[]));
+    let _ = app.settle_messages(Instant::now() + DAY);
+    assert!(keys(&app).is_empty(), "renewed: every line ends");
+
+    // An earlier process's renew ask no tab of this one holds ends at the
+    // settle; one a loop tells of stands.
+    let mut app = App::headless_for_test();
+    app.post_message(mr::renew_ask(
+        &["m7-a".to_string()],
+        &["in tab 9".to_string()],
+    ));
+    app.ripen_exceptions(Instant::now() + DAY);
+    assert!(asks(&app).is_empty());
+    let mut app = App::headless_for_test();
+    app.post_message(mr::renew_ask(
+        &["m7-a".to_string()],
+        &["in tab 9".to_string()],
+    ));
+    told(&mut app, "s-6", Some(ended_login_exception("m7-a")));
+    app.ripen_exceptions(Instant::now() + DAY);
+    assert_eq!(asks(&app), [mr::RENEW_ASK_KEY]);
+}
+
+/// A SILENT USAGE TAP IS ONE LINE FOR THE MACHINE (`HostNote::UsageTap`,
+/// `harness.accounts.no-tap`): raised by the first tab that goes silent,
+/// held while any tab stands silent, ended when the last is heard again or
+/// its worker ends — and raised at most once a day, so a second silent tab
+/// the same day, after the first was heard again, raises nothing. An `Info`
+/// line, never a band row or a tab's mark. NEGATIVE CONTROL: a `silent:
+/// false` for a tab never marked moves nothing.
+#[test]
+fn a_silent_usage_tap_is_one_line_once_a_day_and_ends_with_the_last_tab() {
+    let mut app = App::headless_for_test();
+    let before = glass(&app);
+    let note = |app: &mut App, sid: &str, silent: bool| {
+        app.note_harness_host(HostNote::UsageTap {
+            sid: sid.to_string(),
+            silent,
+        });
+        assert_eq!(glass(app), before, "nothing on the glass");
+        app.messages
+            .digest()
+            .entries
+            .iter()
+            .map(|e| e.key.clone())
+            .collect::<Vec<_>>()
+    };
+    assert!(note(&mut app, "s-1", false).is_empty(), "nothing to end");
+    assert_eq!(note(&mut app, "s-1", true), [mr::USAGE_TAP_SILENT_KEY]);
+    assert_eq!(note(&mut app, "s-2", true), [mr::USAGE_TAP_SILENT_KEY]);
+    assert_eq!(app.messages.digest().entries.len(), 1, "one line");
+    assert_eq!(
+        note(&mut app, "s-1", false),
+        [mr::USAGE_TAP_SILENT_KEY],
+        "s-2 stands"
+    );
+    assert!(note(&mut app, "s-2", false).is_empty(), "the last is heard");
+    assert!(note(&mut app, "s-3", true).is_empty(), "once a day");
+    assert!(note(&mut app, "s-3", false).is_empty());
 }

@@ -76,8 +76,7 @@ fn sixel_decoder_reuse_across_cycles() {
 /// rows_spanned and cols_spanned must not panic for any cell size.
 #[test]
 fn sixel_image_span_calculations_no_panic() {
-    // `@` (0x40 ⇒ bit 1, paints row 0) so unhook() yields an image and the span
-    // calculations are actually exercised.
+    // `@` (0x40 - 0x3F = 1) paints row 0, so unhook() yields an image to measure.
     let mut decoder = SixelDecoder::new();
     decoder.hook();
     decoder.put(b'@');

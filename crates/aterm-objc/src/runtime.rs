@@ -3,11 +3,10 @@
 
 //! The raw runtime surface: symbols, typed sends, ownership, pools.
 //!
-//! Conventions follow `aterm-gpu/src/metal/ffi.rs`, except that the
-//! autorelease pool is a scope ([`AutoreleasePool`]), [`msg`] picks
-//! `objc_msgSend` or `objc_msgSend_stret` from the prototype's return type
-//! ([`returns_indirectly`]), and class-pair creation, super sends, protocols
-//! and [`autorelease`] are bound here too.
+//! Conventions follow `aterm-gpu/src/metal/ffi.rs`, except that sends are
+//! `"C-unwind"`, the autorelease pool is a scope ([`AutoreleasePool`]), and
+//! [`msg`] picks `objc_msgSend` or `objc_msgSend_stret` from the prototype's
+//! return type ([`returns_indirectly`]).
 
 use std::ffi::{CStr, c_char, c_uint, c_void};
 
@@ -185,8 +184,7 @@ impl std::fmt::Debug for Sel {
 /// constructor therefore yields a class or null ([`ClassPtr::NULL`],
 /// [`class`], [`crate::ClassMeta::class`]); the runtime's own returns come out
 /// of `unsafe` sends and lookups, whose callers vouch for them, and
-/// [`ClassPtr::from_ptr`] is `unsafe` (boundaries hunt L4, ruling 2026-10-10,
-/// `docs/AUDIT-boundaries-2026-10-09.md`).
+/// [`ClassPtr::from_ptr`] is `unsafe` (`docs/AUDIT-boundaries-2026-10-09.md`).
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ClassPtr(*mut c_void);
@@ -198,10 +196,9 @@ impl ClassPtr {
     /// Wrap a raw class pointer.
     ///
     /// `unsafe` because the type's invariant is what lets safe code read
-    /// through it (the [`Debug`](std::fmt::Debug) impl's `class_getName`): a
-    /// safe `from_ptr` handed any other pointer let safe code read arbitrary
-    /// memory. A class named at compile time comes from [`class`], a class
-    /// this crate registered from [`crate::ClassMeta::class`].
+    /// through it (the [`Debug`](std::fmt::Debug) impl's `class_getName`). A
+    /// class named at compile time comes from [`class`], a class this crate
+    /// registered from [`crate::ClassMeta::class`].
     ///
     /// Safe code cannot build one from an arbitrary pointer:
     ///
@@ -402,13 +399,8 @@ unsafe extern "C" {
     // one. ---
     pub(crate) fn method_getImplementation(method: *const c_void) -> *const c_void;
 
-    // --- replacing an existing implementation, for [`crate::swizzle`].
-    // `class_addMethod` returns `NO` for an existing row, so it cannot
-    // substitute. `method_setImplementation` takes no `types` argument and
-    // leaves the encoding unchanged; `class_replaceMethod` ignores a differing
-    // `types` for a row the class already has; `class_addMethod` changes
-    // nothing (`tests/swizzle.rs`). So no swizzle can corrupt an encoding, and
-    // no encoding check can see one. ---
+    // --- replacing an existing implementation, for [`crate::swizzle`], whose
+    // module docs say why no swizzle can change an encoding. ---
     pub(crate) fn method_setImplementation(
         method: *const c_void,
         imp: *const c_void,
@@ -814,9 +806,8 @@ pub fn sel(name: &'static CStr) -> Sel {
 /// Look up a class from a checked C-string literal, e.g. `class(c"NSString")`.
 ///
 /// Not cached: every call pays `objc_getClass`'s string hash, roughly ten times
-/// the cost of a send and most of what [`crate::MainThread::new`] (and so
-/// [`crate::run_on_main`]) costs. Classes are immortal, so a cache mirroring
-/// [`crate::SelCache`] would be sound.
+/// the cost of a send. Classes are immortal, so a hot caller may cache the
+/// result, as [`crate::MainThread::new`] does.
 #[inline]
 #[must_use]
 pub fn class(name: &'static CStr) -> ClassPtr {
@@ -1145,18 +1136,10 @@ impl Drop for Obj {
 /// With no pool on the thread the object leaks and nothing else goes wrong, so
 /// a missing pool is a leak, not undefined behaviour — which is why the safe
 /// [`Obj::autorelease`] and [`crate::Retained::autorelease`] may call this.
-/// libobjc reports it only under `OBJC_DEBUG_MISSING_POOLS=YES`:
-///
-/// ```text
-/// $ CHILD=1 ./adversary_w2c                              (no output)
-/// $ CHILD=1 OBJC_DEBUG_MISSING_POOLS=YES ./adversary_w2c
-/// objc[75911]: MISSING POOLS: (0x16fb43000) Object 0x100f33610 of class
-/// __NSCFString autoreleased with no pool in place - just leaking - break on
-/// objc_autoreleaseNoPool() to debug
-/// ```
-///
-/// (`tests/adversary_w2c.rs` runs both.) A Cocoa main thread always has a pool
-/// in the event loop; elsewhere use [`autoreleasepool`].
+/// libobjc says so only under `OBJC_DEBUG_MISSING_POOLS=YES` (`MISSING POOLS:
+/// … autoreleased with no pool in place - just leaking`); `tests/adversary_w2c.rs`
+/// checks both. A Cocoa main thread always has a pool in the event loop;
+/// elsewhere use [`autoreleasepool`].
 ///
 /// # Safety
 /// `obj` must be a +1 reference the caller is handing over, or null.
@@ -1289,10 +1272,9 @@ pub fn ns_string(s: &str) -> Option<Obj> {
 ///
 /// Reads the string's counted UTF-16 code units (`-length`, then
 /// `-getCharacters:range:`), never a C string: `-UTF8String` stops at the
-/// first U+0000, and answers NULL for a string holding an unpaired surrogate,
-/// so a paste of `a\0b` read as `a` and a paste cut mid-surrogate-pair read as
-/// nothing at all. An unpaired surrogate, which an `NSString` can hold and a
-/// Rust `String` cannot, becomes U+FFFD; everything else is exact.
+/// first U+0000 and answers NULL for a string holding an unpaired surrogate.
+/// An unpaired surrogate, which an `NSString` can hold and a Rust `String`
+/// cannot, becomes U+FFFD; everything else is exact.
 ///
 /// # Safety
 /// `s` must be a live `NSString` (or nil, which yields an empty string).

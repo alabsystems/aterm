@@ -170,11 +170,9 @@ fn reads_eof(stream: &aterm_uds::CtlStream) -> bool {
 /// back the trial launch.
 #[test]
 fn a_successor_that_exits_on_eof_is_proven_gone_without_a_signal() {
-    // The stand-in exits when its stdin closes, which the hook below does once the
-    // stand-down has revoked and found it still running: it is FORCED to exit
-    // inside the grace, with no count of milliseconds for the exit watch to beat
-    // (a `sleep 0.2` stand-in could be gone before `CandidateExitWatch::watch`
-    // attached to it on a loaded machine).
+    // The stand-in exits when the hook below closes its stdin, once the stand-down has revoked
+    // and found it running: forced inside the grace, with no timing for the exit watch to beat
+    // (a timed stand-in could exit before `CandidateExitWatch::watch` attached under load).
     let Some((held, mut child, stream)) =
         hold_with_stdin(EXIT_ON_STDIN_EOF, aterm_uds::spawnfd::Stdio::piped())
     else {
@@ -215,8 +213,8 @@ fn a_successor_that_exits_on_eof_is_proven_gone_without_a_signal() {
     assert_a_live_successor_cannot_retire(&model);
 }
 
-/// A stand-in that exits `0` exactly when the test closes its stdin, and
-/// never before: the losing interleavings below are FORCED, not waited for.
+/// A stand-in that exits `0` exactly when the test closes its stdin, and never before, so
+/// the losing interleavings below are forced, not waited for.
 const EXIT_ON_STDIN_EOF: &str = "read line; exit 0";
 
 /// The losing interleaving, forced: the loop reads the witness (the stand-in is
@@ -237,8 +235,8 @@ fn the_exit_between_the_witness_read_and_the_pid_probe_is_still_witnessed() {
     let stood =
         super::stand_down_held_successor_between(held, aterm_spec::wait::MUST_HAPPEN, &mut || {
             misses += 1;
-            // Only the FIRST miss exits it; a second one would mean the probe
-            // failed to see a reaped pid as gone.
+            // Only the first miss exits it; a second would mean the probe failed to see a
+            // reaped pid as gone.
             if let Some(stdin) = stdin.take() {
                 drop(stdin);
                 reaped = Some(reaper.take().expect("one reaper").join().expect("reaper"));

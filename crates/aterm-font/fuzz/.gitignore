@@ -1,0 +1,4 @@
+# What a fuzz run writes (the seeds are copied in; see fuzz_targets/face.rs).
+corpus/
+artifacts/
+coverage/

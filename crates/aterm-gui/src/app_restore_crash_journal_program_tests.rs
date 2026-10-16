@@ -401,6 +401,7 @@ fn the_journal_names_the_tabs_whose_programs_a_death_would_take() {
     // agent; every other entry is not (the negative control).
     let mut manifest = app.capture_restore_manifest();
     let hosted = restore::AgentRestore {
+        word: String::new(),
         pid: u32::try_from(fg_group).unwrap_or(0),
         start: "Sat Sep 27 01:02:03 2026".into(),
         program: "/opt/claude/bin/claude".into(),
@@ -568,6 +569,7 @@ fn a_held_panes_folder_that_is_not_here_is_not_asked_for_or_counted() {
             .to_string()
     };
     let agent = aterm_agent::harness::relaunch::Snapshot {
+        stored_login: false,
         tab: sid.clone(),
         pid: 4242,
         start: "Sat Sep 27 01:02:03 2026".into(),

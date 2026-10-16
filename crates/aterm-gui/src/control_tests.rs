@@ -5119,6 +5119,7 @@ fn image_read_replies_are_exact() {
         (false, "", "OK 0\n"),
         // Cell (0,1) is the right tile of the 2-wide image: cell_col == 1.
         (true, "0 1", "OK 1\n0 0 2 1 0 1 png 12 iVBORw0KGgoAAAAA\n"),
+        (true, "0 1 extra", "ERR bad args\n"),
         (true, "0 5", "ERR none\n"),
         (true, "9 9", "ERR out of range: rows 0-2, cols 0-9\n"),
         (true, "7", "ERR out of range: rows 0-2, cols 0-9\n"),
@@ -6348,6 +6349,39 @@ fn sessionless_front_paste_is_owner_bare_only_and_terminal_routing_is_unchanged(
     );
 }
 
+/// A bare `key` with a native view in front (Settings) reaches that view's own
+/// keyboard handling, so its arrows and Tab can be driven headless; a terminal
+/// front, an explicit selector and an Edge keep their answers.
+#[test]
+fn sessionless_front_key_is_owner_bare_only_and_terminal_routing_is_unchanged() {
+    let route = sessionless_front_key_event("down", None, false, NativeControlPrincipal::Owner)
+        .expect("a native-front key is classified before session resolution")
+        .expect("owner may drive its front app");
+    assert_eq!(Some(route), control_input::parse_key("down"));
+    assert!(
+        sessionless_front_key_event("down", None, true, NativeControlPrincipal::Owner).is_none(),
+        "a terminal front retains the established session/PTY key path",
+    );
+    assert!(
+        sessionless_front_key_event(
+            "down",
+            Some(&Selector::Local(7)),
+            false,
+            NativeControlPrincipal::Owner,
+        )
+        .is_none(),
+        "an explicit selector remains an exact terminal-session target",
+    );
+    assert_eq!(
+        sessionless_front_key_event("down", None, false, NativeControlPrincipal::Edge),
+        Some(Err("ERR denied\n")),
+    );
+    assert_eq!(
+        sessionless_front_key_event("no-such-key", None, false, NativeControlPrincipal::Owner),
+        Some(Err(control_input::KEY_USAGE)),
+    );
+}
+
 /// The px form of `resize` names the window, so a native front tab (which has no
 /// `ActiveSession`) must still be resizable from the socket, reaching the compact
 /// and phone Settings layouts.
@@ -6702,6 +6736,7 @@ fn session_on(local_id: u64, master: i32) -> crate::session_store::SessionHandle
         generation_look: Default::default(),
         reset_lane: Default::default(),
         update_parked: Default::default(),
+        fenced_writes: Default::default(),
     });
     SessionHandle {
         sid,
@@ -7291,6 +7326,7 @@ fn cross_session_resize_targets_term_only() {
         generation_look: Default::default(),
         reset_lane: Default::default(),
         update_parked: Default::default(),
+        fenced_writes: Default::default(),
     });
     let before = ctx.cast.lock().unwrap().event_count();
 
@@ -7554,6 +7590,7 @@ fn test_ctx() -> Arc<crate::SessionCtx> {
         generation_look: Default::default(),
         reset_lane: Default::default(),
         update_parked: Default::default(),
+        fenced_writes: Default::default(),
     })
 }
 
@@ -7784,6 +7821,9 @@ fn required_op_classifies_each_verb() {
             "title",
             "cwd",
             "colors",
+            // `theme` / `theme list` read the live theme; the preview and
+            // write sub-forms are their own rows below.
+            "theme",
             "search",
             // `find` drives the bar `search` answers without; Read like
             // `scroll`/`select`, since find mode diverts keystrokes away from the
@@ -7791,6 +7831,9 @@ fn required_op_classifies_each_verb() {
             // position `search` already answers.
             "find",
             "selection",
+            // `harness policy` reads the session's `[harness]` policy (an
+            // edge reads only `effective=`).
+            "harness",
             "blocks",
             "blocktext",
             "image",
@@ -7813,6 +7856,10 @@ fn required_op_classifies_each_verb() {
             // WriteInput via `escalated_op`.
             "meta",
             "timeline",
+            // `log` and `brief` read the session log under the timeline's
+            // lock; `brief all` escalates to Owner via `escalated_op`.
+            "log",
+            "brief",
             // `resizes` OBSERVES the resize ledger: the engine's journal and
             // the verdicts read from it. It resizes nothing.
             "resizes",
@@ -7889,6 +7936,9 @@ fn required_op_classifies_each_verb() {
             // `invoke`'s own class, since it finishes `invoke`'s gesture.
             "confirm",
             "rain",
+            // `theme preview|revert`: the transient theme lane, runtime-only
+            // like `rain` (nothing durable is written).
+            "theme preview",
             // `kitty wear` changes the user's own cursor and stamps the durable
             // collection: not `ReadScreen` (it changes something), not `ConfigWrite`
             // (reserved for `aterm.toml` and security knobs); the `rain`/`fx` class.
@@ -7896,6 +7946,9 @@ fn required_op_classifies_each_verb() {
             // `fx` arms a celebration the session's next keyed edge spends: a runtime
             // latch, no PTY bytes or durable config, like `rain`'s override.
             "fx",
+            // `appearance dark|light` (a development build) injects an OS flip that
+            // re-themes every session: a runtime override, the `rain`/`fx` class.
+            "appearance",
             "hover",
             "turn",
             "spawn",
@@ -7910,6 +7963,7 @@ fn required_op_classifies_each_verb() {
             "post",
             "deliver",
             "link",
+            "hello",
             "hold",
             "outbox sent",
             // `appnotice` mutates the pull-down, so it is write-class; `OwnerOnly`
@@ -7921,6 +7975,10 @@ fn required_op_classifies_each_verb() {
             // `story` mutates the presence band's phase slot: write-class, and
             // `OwnerOnly` keeps a child edge from writing `✓ approved`.
             "story",
+            // `devtools hand-over` can put System Settings in front of the owner
+            // (or aterm's panel beside it): write-class, with the orthogonal
+            // `OwnerOnly` gate.
+            "devtools",
             // The manual reset mutates terminal modes (and with `flush` drops the
             // input queue): write-class like `resize`, though it writes no PTY input.
             "reset",
@@ -7933,7 +7991,12 @@ fn required_op_classifies_each_verb() {
     // `restart` ends the tab's agent (its stamp first, then SIGTERM, then the
     // act's SIGKILL for a survivor): the signal class, as `signal` is.
     assert_set(Some(Op::Signal), vec!["signal", "restart"], "Signal set");
-    assert_set(Some(Op::ConfigWrite), vec!["settings"], "ConfigWrite set");
+    // `theme set|commit` rewrite `aterm.toml` through the `settings set` lane.
+    assert_set(
+        Some(Op::ConfigWrite),
+        vec!["settings", "theme set"],
+        "ConfigWrite set",
+    );
     assert_set(Some(Op::ClipboardWrite), vec!["copy"], "ClipboardWrite set");
     // None (OpClass::Owner): privilege/identity + build-meta verbs, gated before the
     // op check. Every one default-DENIES for an Edge (no op edge reaches them).
@@ -7944,6 +8007,9 @@ fn required_op_classifies_each_verb() {
             "update",
             "help",
             "verbs",
+            // The sudo askpass relay: Owner-class privilege, gated before the op
+            // check and intercepted in `serve_request_line`.
+            "askpass",
             "operator",
             "operator-propose-bin",
             // The bridge supervisor of a running instance: Owner-only, no op
@@ -8040,6 +8106,31 @@ fn find_is_gated_by_conjunction_and_never_by_escalation() {
             escalated_op("find", rest),
             None,
             "find {rest:?} must not escalate — escalation would drop its read gate"
+        );
+    }
+}
+
+/// `theme` reads with its base class; its preview lane needs `WriteInput` and
+/// the forms that rewrite `aterm.toml` need `ConfigWrite`, whatever follows the
+/// sub-form word. Negative control: the read forms add nothing.
+#[test]
+fn control_theme_sub_forms_escalate_to_the_class_they_need() {
+    use Escalation::Op as EOp;
+    for rest in ["", "status", "list"] {
+        assert_eq!(escalated_op("theme", rest), None, "{rest:?} is a read");
+    }
+    for rest in ["preview Nord", "preview GitHub Light ttl=5", "revert"] {
+        assert_eq!(
+            escalated_op("theme", rest),
+            Some(EOp(Op::WriteInput)),
+            "{rest:?}"
+        );
+    }
+    for rest in ["set Nord", "commit", "bogus", "SET Nord"] {
+        assert_eq!(
+            escalated_op("theme", rest),
+            Some(EOp(Op::ConfigWrite)),
+            "{rest:?} fails closed to the write class"
         );
     }
 }
@@ -8243,6 +8334,26 @@ fn escalated_op_fences_invoke_and_open_indirect_seams() {
     );
     assert_eq!(escalated_op("meta", ""), None);
     assert_eq!(escalated_op("timeline", "10 since=3"), None);
+    // `log` is a plain read whatever it asks for (`tier=content` included: the
+    // OSC title `text` and `timeline` already show at ReadScreen); `brief`
+    // reads its target, and `brief all` the whole roster, Owner-only.
+    assert_eq!(escalated_op("log", "tier=content --json"), None);
+    assert_eq!(escalated_op("brief", "t3 budget=100"), None);
+    assert_eq!(escalated_op("brief", "all"), Some(Escalation::OwnerOnly));
+    // `all` may stand anywhere among `brief`'s arguments (its parser takes it
+    // there), so the gate escalates it there too.
+    assert_eq!(
+        escalated_op("brief", "budget=100 all"),
+        Some(Escalation::OwnerOnly)
+    );
+    assert_eq!(escalated_op("brief", "budget=100 r1"), None);
+    assert_eq!(escalated_op("brief", ""), None);
+    // Fail-closed: what the parser does not read as a target's brief is
+    // Owner-only (it answers its usage line to the Owner alone).
+    assert_eq!(
+        escalated_op("brief", "budget=x all"),
+        Some(Escalation::OwnerOnly)
+    );
 
     // The full dispatch decision (`dispatch_authorized`): effective op = base op
     // escalated by the argument, Owner short-circuiting. Not the verb-only
@@ -8383,6 +8494,9 @@ fn escalated_op_fences_invoke_and_open_indirect_seams() {
         ("controls", "connections"),
         ("window", "connections"),
         ("spawn", "connected=controller of=s-abc"),
+        ("brief", "all"),
+        // `all` anywhere among the arguments, as `brief`'s parser takes it.
+        ("brief", "budget=100 all"),
     ] {
         assert!(
             !dispatch_allows(edge_write, verb, rest, &ctx),
@@ -8400,6 +8514,10 @@ fn escalated_op_fences_invoke_and_open_indirect_seams() {
     assert!(
         dispatch_allows(edge_read, "controls", "front", &ctx),
         "read edge keeps benign controls targets"
+    );
+    assert!(
+        dispatch_allows(edge_read, "brief", "budget=100", &ctx),
+        "read edge keeps its own target's brief"
     );
     assert!(
         dispatch_allows(edge_write, "spawn", "cwd=/tmp", &ctx),
@@ -8513,6 +8631,131 @@ fn real_native_settings_front_is_explicitly_fenced_while_owner_open_still_works(
         None,
         "Owner keeps the established input path"
     );
+}
+
+/// SETTINGS ▸ HARNESS'S SESSION PRESSES ARE OWNER-ONLY, like `meta set autopilot`:
+/// a press writes a session's Autopilot word (Off to Cruise puts the harness's hands
+/// back on a session its owner took them off), which the Settings fine op must not
+/// reach.
+///
+/// END TO END NO EDGE REACHES THE PAGE TODAY, whatever it holds: `act` (like
+/// `settings`) is an App-target verb, which `dispatch_before_session` answers `ERR
+/// denied` for every Edge (`native_control_decision`'s App arm) before `escalated_op`
+/// is asked; and an Edge's flagless `key`/`mouse`/`paste` are pinned to the session
+/// its token was checked against (`front_routed`), which `input_to_session` hands to
+/// that session and never to `native_input_event`. That gate is asserted first. The
+/// two fences below are DEFENCE IN DEPTH, read at their own predicates (the main-
+/// thread hop and the dispatcher need an event loop): on the semantic `act` path and
+/// on input keyed at the front Settings surface while it shows the page, a ConfigWrite
+/// edge is denied a session's press and Owner passes. NEGATIVE CONTROLS: at the same
+/// predicates, that edge's Refresh and other Settings controls, and its input on any
+/// other route, are the ordinary ConfigWrite fence; and Owner's App verdict is the
+/// sessionless lane.
+#[test]
+fn harness_session_presses_are_owner_only_on_both_paths() {
+    use super::{
+        NativeControlDecision, NativeControlTarget, front_routed, native_control_decision,
+    };
+    let ctx = test_ctx();
+    let config_edge = edge_granted(Op::ConfigWrite, &ctx);
+    let owner = Scope::Owner;
+
+    // The gate in front of both fences: every Edge is refused an App-target verb,
+    // whatever its token, and its flagless input is pinned to its session.
+    for verb in ["act", "settings"] {
+        assert_eq!(
+            aterm_types::control_verbs::spec(verb).map(|spec| spec.target),
+            Some(aterm_types::control_verbs::Target::App),
+            "{verb} is an App-target verb"
+        );
+    }
+    assert_eq!(
+        native_control_decision(
+            true,
+            true,
+            NativeControlPrincipal::Edge,
+            NativeControlTarget::App
+        ),
+        NativeControlDecision::Denied,
+        "an Edge's `act` is ERR denied before escalated_op"
+    );
+    assert_eq!(
+        native_control_decision(
+            true,
+            true,
+            NativeControlPrincipal::Owner,
+            NativeControlTarget::App
+        ),
+        NativeControlDecision::WithoutSession,
+        "Owner's `act` takes the sessionless lane"
+    );
+    assert!(
+        front_routed(false, false, Some(7), 7) && front_routed(false, false, None, 7),
+        "an Edge's flagless input is pinned to its session, never the page"
+    );
+
+    // The semantic path: `act` on a session's Autopilot button.
+    let press = "app/v1 view 42 harness/session/7/autopilot/cruise \
+                 harness/session/7/autopilot/cruise";
+    assert_eq!(escalated_op("act", press), Some(Escalation::OwnerOnly));
+    assert!(
+        !dispatch_authorized(config_edge, "act", press, &ctx),
+        "a ConfigWrite edge is DENIED a session's Autopilot press"
+    );
+    assert!(
+        dispatch_authorized(owner, "act", press, &ctx),
+        "Owner presses"
+    );
+    for rest in [
+        "app/v1 view 42 harness/refresh harness/refresh",
+        "app/v1 view 42 settings/control/harness.enabled settings/set/harness.enabled false",
+    ] {
+        assert_eq!(
+            escalated_op("act", rest),
+            Some(Escalation::Op(Op::ConfigWrite)),
+            "{rest}"
+        );
+        assert!(
+            dispatch_authorized(config_edge, "act", rest, &ctx),
+            "{rest}"
+        );
+    }
+
+    // The front path: keys and clicks at the Settings tab while it shows the page.
+    let mut app = crate::App::headless_for_test();
+    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Harness));
+    assert_eq!(
+        app.front_control_surface(),
+        FrontControlSurface::HarnessSettings
+    );
+    for verb in ["key", "mouse", "paste"] {
+        let need = front_drive_escalation(config_edge, verb, app.front_control_surface())
+            .expect("the page replaces the base input authority");
+        assert_eq!(need, Escalation::OwnerOnly, "{verb}");
+        assert!(
+            !scope_holds_escalation(config_edge, need, &ctx),
+            "a ConfigWrite edge is DENIED {verb} on the Harness page"
+        );
+        assert!(scope_holds_escalation(owner, need, &ctx));
+        assert_eq!(
+            front_drive_escalation(owner, verb, app.front_control_surface()),
+            None,
+            "Owner drives the page"
+        );
+    }
+    assert_eq!(
+        front_drive_denial(FrontControlSurface::HarnessSettings),
+        "ERR native settings harness open (owner-only while open)\n"
+    );
+    // Another route of the same Settings tab is the ordinary Settings fence.
+    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Security));
+    assert_eq!(
+        app.front_control_surface(),
+        FrontControlSurface::NativeSettings
+    );
+    let need = front_drive_escalation(config_edge, "key", app.front_control_surface())
+        .expect("native Settings");
+    assert!(scope_holds_escalation(config_edge, need, &ctx));
 }
 
 /// Copy-on-select exfil fence (the decision): a scoped-edge `mouse` gesture has its
@@ -9242,6 +9485,7 @@ fn read_paths_preserve_combining_and_zwj_clusters() {
         AbsRow::Text(t) => t,
         AbsRow::Evicted => panic!("search row {abs_row} unexpectedly evicted"),
         AbsRow::OutOfRange => panic!("search row {abs_row} out of range"),
+        AbsRow::Unreadable => panic!("search row {abs_row} unreadable"),
     };
     assert!(
         row_text.contains(&family_sel),
@@ -9393,6 +9637,7 @@ fn registered_session(local_id: u64, master: i32, seed: &[u8]) -> SessionHandle 
         generation_look: Default::default(),
         reset_lane: Default::default(),
         update_parked: Default::default(),
+        fenced_writes: Default::default(),
     });
     SessionHandle {
         sid,
@@ -9789,7 +10034,9 @@ fn meta_questions_is_a_closed_set_stored_case_folded_and_read_last() {
     store.write().unwrap().register(h.clone());
     let (read0, _) = cmd_meta(&h.term, &store, 0, &h.ctx, "");
     assert!(
-        read0.ends_with(" supervisor=- questions=- agent_cwd=-\n"),
+        read0.ends_with(
+            " supervisor=- supervisor_proven=0 questions=- agent_cwd=- autopilot=- land_at=-\n"
+        ),
         "appended after supervisor=, unset reads -: {read0}"
     );
 
@@ -9823,7 +10070,7 @@ fn meta_questions_is_a_closed_set_stored_case_folded_and_read_last() {
     assert!(c);
     let (read1, _) = cmd_meta(&h.term, &store, 0, &h.ctx, "");
     assert!(
-        read1.ends_with(" questions=recommended agent_cwd=-\n"),
+        read1.ends_with(" questions=recommended agent_cwd=- autopilot=- land_at=-\n"),
         "{read1}"
     );
     assert!(
@@ -9839,7 +10086,10 @@ fn meta_questions_is_a_closed_set_stored_case_folded_and_read_last() {
     let (_, moved) = cmd_meta(&h.term, &store, 0, &h.ctx, "set questions ASK");
     assert!(moved);
     let (read2, _) = cmd_meta(&h.term, &store, 0, &h.ctx, "");
-    assert!(read2.ends_with(" questions=ask agent_cwd=-\n"), "{read2}");
+    assert!(
+        read2.ends_with(" questions=ask agent_cwd=- autopilot=- land_at=-\n"),
+        "{read2}"
+    );
     // The priority words, case folded like the rest.
     for (typed, stored) in [("Long-Term", "long-term"), ("short-term", "short-term")] {
         let (r, c) = cmd_meta(
@@ -9853,7 +10103,9 @@ fn meta_questions_is_a_closed_set_stored_case_folded_and_read_last() {
         assert!(c, "{typed}");
         let (read, _) = cmd_meta(&h.term, &store, 0, &h.ctx, "");
         assert!(
-            read.ends_with(&format!(" questions={stored} agent_cwd=-\n")),
+            read.ends_with(&format!(
+                " questions={stored} agent_cwd=- autopilot=- land_at=-\n"
+            )),
             "{read}"
         );
     }
@@ -9862,7 +10114,10 @@ fn meta_questions_is_a_closed_set_stored_case_folded_and_read_last() {
     assert_eq!(r, "OK\n");
     assert!(c);
     let (read3, _) = cmd_meta(&h.term, &store, 0, &h.ctx, "");
-    assert!(read3.ends_with(" questions=- agent_cwd=-\n"), "{read3}");
+    assert!(
+        read3.ends_with(" questions=- agent_cwd=- autopilot=- land_at=-\n"),
+        "{read3}"
+    );
     assert!(
         cmd_sessions(&h.ctx, &store, None)
             .lines()
@@ -9907,6 +10162,121 @@ fn a_questions_write_is_owner_only() {
             None,
             "{rest:?} is not a questions write"
         );
+    }
+}
+
+/// The Autopilot word on the wire (the Autopilot design, §2.1): the
+/// supervisor's three modes and the owner's words for two of them, stored as
+/// the mode's word, read back by key as the LAST field of every bare `meta` —
+/// `autopilot=-` while unset, so the supervisor's loop knows the window keeps
+/// it — counted by `ls meta=1`, cleared by `unset` (back to `[harness]
+/// autopilot`). NEGATIVE CONTROLS: anything else, an on/off switch word
+/// other than `off` included, is the one usage line and stores nothing.
+#[test]
+fn meta_autopilot_is_a_closed_set_stored_as_the_modes_word_and_read_last() {
+    const USAGE: &str = "ERR usage: meta set autopilot cruise|land|off\n";
+    let store = session_store::new_store();
+    let h = registered_session(0, -1, b"");
+    store.write().unwrap().register(h.clone());
+    let (read0, _) = cmd_meta(&h.term, &store, 0, &h.ctx, "");
+    assert!(
+        read0.ends_with(" autopilot=- land_at=-\n"),
+        "always named: {read0}"
+    );
+    for bad in [
+        "set autopilot",
+        "set autopilot   ",
+        "set autopilot on",
+        "set autopilot true",
+        "set autopilot cruising",
+        "set autopilot land it",
+    ] {
+        let (r, c) = cmd_meta(&h.term, &store, 0, &h.ctx, bad);
+        assert_eq!(r, USAGE, "{bad:?}");
+        assert!(!c, "a refusal moves nothing: {bad:?}");
+    }
+    assert_eq!(h.ctx.meta.lock().unwrap().autopilot, None);
+    for (typed, stored) in [
+        ("Off", "off"),
+        ("wrap-up", "land"),
+        ("INFINITY", "cruise"),
+        ("land", "land"),
+    ] {
+        let (r, _) = cmd_meta(
+            &h.term,
+            &store,
+            0,
+            &h.ctx,
+            &format!("set autopilot {typed}"),
+        );
+        assert_eq!(r, "OK\n", "{typed}");
+        let (read, _) = cmd_meta(&h.term, &store, 0, &h.ctx, "");
+        assert!(
+            read.ends_with(&format!(" autopilot={stored} land_at=-\n")),
+            "{read}"
+        );
+    }
+    let (_, again) = cmd_meta(&h.term, &store, 0, &h.ctx, "set autopilot wrap");
+    assert!(!again, "the owner's word for land is the same value");
+    assert!(
+        cmd_sessions(&h.ctx, &store, None)
+            .lines()
+            .nth(1)
+            .unwrap()
+            .contains(" meta=1 "),
+        "an Autopilot word alone is user metadata -> meta=1"
+    );
+    let (r, c) = cmd_meta(&h.term, &store, 0, &h.ctx, "unset autopilot");
+    assert_eq!(r, "OK\n");
+    assert!(c);
+    let (read, _) = cmd_meta(&h.term, &store, 0, &h.ctx, "");
+    assert!(read.ends_with(" autopilot=- land_at=-\n"), "{read}");
+    // `land_at=` follows it (the Autopilot design, §9.3.5): a timed Cruise's
+    // instant as stored, in unix seconds — printed only, no field of its own.
+    h.ctx.meta.lock().unwrap().autopilot = Some("cruise".into());
+    h.ctx.meta.lock().unwrap().land_at = Some(1_792_249_200_000);
+    let (read, _) = cmd_meta(&h.term, &store, 0, &h.ctx, "");
+    assert!(
+        read.ends_with(" autopilot=cruise land_at=1792249200\n"),
+        "{read}"
+    );
+    let (r, _) = cmd_meta(&h.term, &store, 0, &h.ctx, "set land_at 18:00");
+    assert!(r.starts_with("ERR "), "no field of its own: {r}");
+    h.ctx.meta.lock().unwrap().autopilot = None;
+    h.ctx.meta.lock().unwrap().land_at = None;
+    let (r, _) = cmd_meta(&h.term, &store, 0, &h.ctx, "set colour red");
+    assert!(
+        r.contains("|questions|autopilot)"),
+        "the closed field list names it: {r}"
+    );
+}
+
+/// Writing `autopilot` is Owner-only, as `questions` is: an edge — even one
+/// granted write on the session — must not put the harness's hands back on a
+/// session its owner took them off. Reading it stays open.
+#[test]
+fn an_autopilot_write_is_owner_only() {
+    use super::control_session::meta_questions_denied as denied;
+    let h = registered_session(0, -1, b"");
+    let writer = edge_granted(Op::WriteInput, &h.ctx);
+    for rest in [
+        "set autopilot cruise",
+        "unset autopilot",
+        " set autopilot off",
+    ] {
+        assert_eq!(
+            denied(writer, rest),
+            Some(("ERR denied\n".to_string(), false)),
+            "{rest:?}"
+        );
+        assert_eq!(
+            denied(Scope::Owner, rest),
+            None,
+            "an Owner's write proceeds"
+        );
+    }
+    for rest in ["", "set autopilotx off", "set title autopilot"] {
+        assert_eq!(denied(writer, rest), None, "{rest:?} is no autopilot write");
     }
 }
 
@@ -10397,7 +10767,7 @@ fn topic_is_owner_class_and_names_its_session() {
             None,
         )
     };
-    assert_eq!(owner_ls("ls"), "OK 0\n");
+    assert_eq!(owner_ls("ls"), "OK 0 seen=0\n");
     assert_eq!(
         owner_ls("add build.failed"),
         "OK build.failed since=head added=1\n"
@@ -10408,7 +10778,7 @@ fn topic_is_owner_class_and_names_its_session() {
     );
     assert_eq!(
         owner_ls("ls"),
-        "OK 2\ntopic build.failed since=head\ntopic sat-comp since=@42\n"
+        "OK 2 seen=0\ntopic build.failed since=head\ntopic sat-comp since=@42\n"
     );
     // A repeated add does not rewind: the answer says nothing was added and the
     // stored `since` is the first add's.
@@ -10500,7 +10870,7 @@ fn an_adopted_session_answers_the_carried_topics() {
     };
     assert_eq!(
         owner("ls"),
-        "OK 2\ntopic build.failed since=head\ntopic sat-comp since=@42\n"
+        "OK 2 seen=0\ntopic build.failed since=head\ntopic sat-comp since=@42\n"
     );
     assert_eq!(owner("add fresh"), "OK fresh since=head added=1\n");
     assert!(
@@ -10557,7 +10927,7 @@ fn a_session_opts_into_at_most_the_topic_bound() {
     let full = format!("ERR topics full (max {MAX_TOPICS}): drop one first\n");
     assert_eq!(owner("add task-over"), full);
     assert_eq!(pushed(&h_ctx), before, "a refused add pushes nothing");
-    assert!(owner("ls").starts_with(&format!("OK {MAX_TOPICS}\n")));
+    assert!(owner("ls").starts_with(&format!("OK {MAX_TOPICS} seen=0\n")));
     assert!(!owner("ls").contains("task-over"));
     // A topic already held still answers as one.
     assert_eq!(owner("add task-0"), "OK task-0 since=head added=0\n");
@@ -10573,7 +10943,7 @@ fn a_session_opts_into_at_most_the_topic_bound() {
     h_ctx
         .fabric
         .set_topics(crate::fabric::parse_topics(&carried));
-    assert!(owner("ls").starts_with(&format!("OK {}\n", MAX_TOPICS + 5)));
+    assert!(owner("ls").starts_with(&format!("OK {} seen=0\n", MAX_TOPICS + 5)));
     assert_eq!(owner("add fresh"), full);
     for n in 0..6 {
         assert_eq!(
@@ -10691,6 +11061,13 @@ fn subscribe_mail_pushes_one_metadata_line_per_row_and_never_a_body() {
                 "the ack follows the watch's registration"
             );
 
+            // A broadcast reaches only a session that holds its topic.
+            for t in deliveries
+                .iter()
+                .filter_map(|(_, _, extra)| extra.trim().strip_prefix("topic="))
+            {
+                let _ = h.ctx.fabric.topic_add(t, "head", &h.ctx.timeline);
+            }
             for (n, (from, kind, extra)) in deliveries.iter().enumerate() {
                 let off = 500 + n as u64;
                 let reply = crate::fabric::cmd_deliver(
@@ -16057,6 +16434,13 @@ fn the_accept_loop_backs_off_on_descriptor_exhaustion_only() {
 /// refusal is the observable (`no-bridge=1` before, `queued=1` after), since that
 /// token is what an agent acts on.
 ///
+/// And it arms only what the instance's config names: an argv of the caller's
+/// own, with none configured or another configured, is refused and arms
+/// nothing — the Owner token every in-session client holds does not choose the
+/// process that holds `Scope::Bridge`. What aterm.toml names is the test's to
+/// say (`fabric_launch::set_command_on_disk_for_tests`), never the developer's
+/// own file.
+///
 /// The armed thread outlives the test (no stop handle); with no `BRIDGE_CONTEXT`
 /// published in a test process it serves nothing and only re-spawns `true` under
 /// the launcher's back-off.
@@ -16078,12 +16462,19 @@ fn fabric_attach_body() {
         dispatch_fabric_verb(rest, selector.as_ref(), scope, &store)
     };
     let post = || crate::fabric::cmd_post(&ctx, "to=@s-peer kind=ask --wait=0 on?", None);
+    // What `fabric status` says about a bridge that has not attached.
+    let unattached = format!(
+        "build={} bridge_lane=- bridge_build=- lane_faults=0",
+        aterm_types::version::build_id()
+    );
 
     // A fresh instance: nothing armed or configured, and `post` says nothing will
     // drain the outbox.
     assert_eq!(
         run(Scope::Owner, "fabric status"),
-        "OK state=absent supervised=0 command=- reason=- rtt_ms=- link_age_ms=-\n"
+        format!(
+            "OK state=absent supervised=0 command=- reason=- rtt_ms=- link_age_ms=- {unattached}\n"
+        )
     );
     assert_eq!(post(), "ERR fabric absent id=1 no-bridge=1\n");
     assert_eq!(
@@ -16091,6 +16482,16 @@ fn fabric_attach_body() {
         "ERR fabric no command\n",
         "no argv and no launch config"
     );
+    // An argv of the caller's choosing, with nothing configured: refused, and
+    // nothing armed.
+    assert_eq!(
+        run(Scope::Owner, "fabric attach /usr/bin/true --fleet lab"),
+        format!(
+            "ERR fabric not configured command={}\n",
+            pct_encode("/usr/bin/true --fleet lab")
+        )
+    );
+    assert!(!crate::fabric::bridge_supervised(), "nothing armed");
     assert_eq!(run(Scope::Owner, "fabric"), FABRIC_USAGE);
     assert_eq!(run(Scope::Owner, "fabric status extra"), FABRIC_USAGE);
 
@@ -16116,10 +16517,18 @@ fn fabric_attach_body() {
     );
 
     // Pre-flight: a program that cannot run is refused before the latch closes
-    // (reply names it, nothing armed, `post`'s advice unchanged), so a typo does
-    // not wedge the one attach slot.
+    // (reply names it, nothing armed, `post`'s advice unchanged), so a typo in
+    // aterm.toml does not wedge the one attach slot.
+    let words = |line: &str| {
+        line.split_whitespace()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+    crate::fabric_launch::set_command_on_disk_for_tests(Some(words(
+        "/nonexistent/aterm-link serve",
+    )));
     assert_eq!(
-        run(Scope::Owner, "fabric attach /nonexistent/aterm-link serve"),
+        run(Scope::Owner, "fabric attach"),
         format!(
             "ERR fabric not executable program={} reason=not-found\n",
             pct_encode("/nonexistent/aterm-link")
@@ -16127,7 +16536,9 @@ fn fabric_attach_body() {
     );
     assert_eq!(
         run(Scope::Owner, "fabric status"),
-        "OK state=absent supervised=0 command=- reason=- rtt_ms=- link_age_ms=-\n",
+        format!(
+            "OK state=absent supervised=0 command=- reason=- rtt_ms=- link_age_ms=- {unattached}\n"
+        ),
         "a refused attach records nothing"
     );
     assert_eq!(post(), "ERR fabric absent id=2 no-bridge=1\n");
@@ -16138,6 +16549,20 @@ fn fabric_attach_body() {
         .find(|p| std::path::Path::new(p).exists())
         .expect("a `true` binary");
     let command = pct_encode(&format!("{program} --fleet lab"));
+    crate::fabric_launch::set_command_on_disk_for_tests(Some(words(&format!(
+        "{program} --fleet lab"
+    ))));
+    // Another program than the one configured is still not the caller's to
+    // choose...
+    assert_eq!(
+        run(Scope::Owner, "fabric attach /usr/bin/false --fleet lab"),
+        format!(
+            "ERR fabric not configured command={}\n",
+            pct_encode("/usr/bin/false --fleet lab")
+        )
+    );
+    assert!(!crate::fabric::bridge_supervised(), "nothing armed");
+    // ...and the configured one, named as `aterm fabric on` names it, arms.
     assert_eq!(
         run(
             Scope::Owner,
@@ -16147,7 +16572,9 @@ fn fabric_attach_body() {
     );
     assert_eq!(
         run(Scope::Owner, "fabric status"),
-        format!("OK state=absent supervised=1 command={command} reason=- rtt_ms=- link_age_ms=-\n"),
+        format!(
+            "OK state=absent supervised=1 command={command} reason=- rtt_ms=- link_age_ms=- {unattached}\n"
+        ),
         "the bridge connects asynchronously; the SUPERVISOR is what attached"
     );
     // ...and the endpoint's advice flipped at the same moment.
@@ -16165,7 +16592,9 @@ fn fabric_attach_body() {
     );
     assert_eq!(
         run(Scope::Owner, "fabric status"),
-        format!("OK state=absent supervised=1 command={command} reason=- rtt_ms=- link_age_ms=-\n")
+        format!(
+            "OK state=absent supervised=1 command={command} reason=- rtt_ms=- link_age_ms=- {unattached}\n"
+        )
     );
 }
 
@@ -16174,7 +16603,11 @@ fn fabric_attach_body() {
     let store = session_store::new_store();
     assert_eq!(
         dispatch_fabric_verb("status", None, Scope::Owner, &store),
-        "OK state=absent supervised=0 command=- reason=- rtt_ms=- link_age_ms=-\n"
+        format!(
+            "OK state=absent supervised=0 command=- reason=- rtt_ms=- link_age_ms=- build={} \
+             bridge_lane=- bridge_build=- lane_faults=0\n",
+            aterm_types::version::build_id()
+        )
     );
     assert_eq!(
         dispatch_fabric_verb("attach x", None, Scope::Owner, &store),
@@ -16269,9 +16702,114 @@ fn the_bridge_verbs_refuse_every_scope_but_the_bridge_body() {
         .as_deref(),
         Some("ERR denied\n")
     );
+    // Every BridgeOnly row of the table reaches a handler (bare, so each answers
+    // its usage or an empty read, never the `no_handler` refusal).
+    for spec in aterm_types::control_verbs::VERBS {
+        if spec.access == aterm_types::control_verbs::Access::BridgeOnly {
+            assert_ne!(
+                run(Scope::Bridge, spec.name),
+                Some(no_handler(spec.name)),
+                "bridge-only {:?} has no dispatch arm",
+                spec.name
+            );
+        }
+    }
     // Everything else falls through untouched.
     assert!(run(Scope::Bridge, "text").is_none());
     assert!(run(Scope::Owner, "inbox").is_none());
+}
+
+/// THE BRIDGE NAMES ITS LANE AND BUILD, AND THE INSTANCE REPORTS BOTH. A
+/// bridge's `hello` is recorded for the incarnation that owns the link and
+/// answered with this instance's own lane and build; `fabric status` then
+/// prints the two builds side by side, so a bridge of another build than its
+/// instance is named rather than inferred. A `hello` from a ghost lane records
+/// nothing, malformed input is refused, and every bridge-plane line this
+/// endpoint cannot parse — here a `deliver` carrying a field from a later lane
+/// — is counted as a lane fault for the incarnation that sent it.
+#[test]
+fn a_bridges_hello_and_its_unparsed_lines_are_reported_for_its_incarnation() {
+    crate::fabric::with_link_reset(a_bridges_hello_and_its_unparsed_lines_body);
+}
+
+fn a_bridges_hello_and_its_unparsed_lines_body() {
+    let store = session_store::new_store();
+    let handle = crate::session_store::test_handle(1);
+    let sid = handle.sid.as_str().to_string();
+    store.write().unwrap().register(handle);
+    let run = |line: &str| {
+        let (selector, verb, rest) = request_head(line);
+        dispatch_bridge_verb(verb, rest, selector.as_ref(), Scope::Bridge, &store)
+            .expect("a bridge-plane verb")
+    };
+    let own = aterm_types::version::build_id();
+    let lane = aterm_types::control_verbs::BRIDGE_LANE;
+    let ghost = crate::fabric::next_bridge_generation();
+    let generation = crate::fabric::next_bridge_generation();
+    crate::fabric::bridge_attached(generation);
+    let tail = |bridge_lane: &str, bridge_build: &str, faults: u64| {
+        format!(
+            "build={own} bridge_lane={bridge_lane} bridge_build={bridge_build} \
+             lane_faults={faults}\n"
+        )
+    };
+    assert!(
+        fabric_status_line().ends_with(&tail("-", "-", 0)),
+        "a fresh attach has said nothing: {}",
+        fabric_status_line()
+    );
+
+    crate::fabric::set_lane_generation(ghost);
+    assert_eq!(
+        run("hello lane=1 build=9.9.0+gghost"),
+        format!("OK stale=1 lane={lane} build={own}\n")
+    );
+    crate::fabric::set_lane_generation(generation);
+    assert!(fabric_status_line().ends_with(&tail("-", "-", 0)));
+    assert_eq!(
+        run("hello lane=1 build=9.9.0+g0123456789ab later=1"),
+        format!("OK lane={lane} build={own}\n")
+    );
+    assert!(
+        fabric_status_line().ends_with(&tail("1", "9.9.0+g0123456789ab", 0)),
+        "the bridge's build beside the instance's: {}",
+        fabric_status_line()
+    );
+
+    // Input is checked: each is refused, and each refusal is a line this
+    // endpoint could not parse.
+    for bad in [
+        "hello",
+        "hello build=x",
+        "hello lane=one",
+        "hello lane=1 stray",
+        "hello lane=1 build=a%20b",
+    ] {
+        assert_eq!(
+            run(bad),
+            "ERR usage: hello lane=<n> [build=<token>]\n",
+            "{bad}"
+        );
+    }
+    assert!(fabric_status_line().ends_with(&tail("1", "9.9.0+g0123456789ab", 5)));
+    // A row carrying a field this endpoint does not parse is a lane fault too;
+    // a recipient's verdict (`no such session`) is not one.
+    assert!(
+        run(&format!(
+            "deliver {sid} off=1 from=h-a kind=note trust=human shiny=1 text=x"
+        ))
+        .starts_with("ERR usage: deliver")
+    );
+    assert_eq!(
+        run("deliver s-nobody off=2 from=h-a kind=note text=x"),
+        "ERR no such session\n"
+    );
+    assert!(fabric_status_line().ends_with(&tail("1", "9.9.0+g0123456789ab", 6)));
+
+    // A new incarnation starts over.
+    let next = crate::fabric::next_bridge_generation();
+    crate::fabric::bridge_attached(next);
+    assert!(fabric_status_line().ends_with(&tail("-", "-", 0)));
 }
 
 /// The local Owner may halt its own session and never touch a fleet hold.
@@ -16279,10 +16817,11 @@ fn the_bridge_verbs_refuse_every_scope_but_the_bridge_body() {
 /// Owner sets a local hold (`origin=local`, the only origin it may name): the
 /// PTY-reaching verbs answer `ERR halted … origin=local`, `status`'s leaf read and
 /// the `inbox` header show `hold=1`, and Owner's `hold off` lifts it. An edge token
-/// and a selector are refused, and an Owner act against a standing `origin=fleet`
-/// hold is refused, `on` and `off` alike, so an injected agent holding Owner cannot
-/// lift the halt meant to stop it. The bridge sets fleet holds by default and its
-/// `off` lifts whatever stands. Drives the decision function both entries call.
+/// and a selector are refused, and an Owner `off` that finds only a standing
+/// `origin=fleet` hold is refused, so an injected agent holding Owner cannot lift
+/// the halt meant to stop it; an Owner `on` beside it sets the owner's own slot
+/// and leaves the fleet's standing. The bridge sets fleet holds by default and its
+/// `off` lifts only a fleet one. Drives the decision function both entries call.
 #[test]
 fn the_local_owner_may_hold_its_session_and_never_a_fleet_hold_inbox_hold() {
     // A bridge-issued `hold` records the session as bridge-governed in the
@@ -16384,10 +16923,14 @@ fn the_local_owner_may_hold_its_session_and_never_a_fleet_hold_body() {
         run(Scope::Owner, &format!("hold {sid} off")),
         crate::fabric::HOLD_DENIED
     );
+    // The owner's own hold beside it: its slot, not a replacement…
     assert_eq!(
         run(Scope::Owner, &format!("hold {sid} on reason=mine")),
-        crate::fabric::HOLD_DENIED
+        "OK hold=1\n"
     );
+    assert_eq!(ctx.fabric.holds().origins(), "fleet,local");
+    // …and the owner's `off` lifts that and nothing else.
+    assert_eq!(run(Scope::Owner, &format!("hold {sid} off")), "OK hold=1\n");
     assert_eq!(
         crate::fabric::halt_refusal(&ctx, "turn").as_deref(),
         Some("ERR halted reason=main%20broken origin=fleet\n"),
@@ -16397,8 +16940,8 @@ fn the_local_owner_may_hold_its_session_and_never_a_fleet_hold_body() {
         crate::fabric::touched_contains(&sid),
         "the BRIDGE's hold did make the session bridge-governed"
     );
-    // The bridge lifts; the owner can hold again; and the bridge's `off`
-    // lifts a local hold too — the rule the code had, kept.
+    // The bridge lifts; the owner can hold again; and the bridge's fleet
+    // `off` leaves that local hold standing — the owner's `off` lifts it.
     assert_eq!(
         run(Scope::Bridge, &format!("hold {sid} off")),
         "OK hold=0\n"
@@ -16409,8 +16952,13 @@ fn the_local_owner_may_hold_its_session_and_never_a_fleet_hold_body() {
     );
     assert_eq!(
         run(Scope::Bridge, &format!("hold {sid} off")),
-        "OK hold=0\n"
+        "OK hold=1\n"
     );
+    assert_eq!(
+        crate::fabric::halt_refusal(&ctx, "turn").as_deref(),
+        Some("ERR halted reason=mine origin=local\n")
+    );
+    assert_eq!(run(Scope::Owner, &format!("hold {sid} off")), "OK hold=0\n");
     assert!(crate::fabric::halt_refusal(&ctx, "turn").is_none());
 }
 
@@ -18414,7 +18962,8 @@ fn keyed_attention_on_the_wire_is_per_owner_and_the_bare_form_still_works() {
     assert!(line.contains(" attention=check%20the%20deploy "), "{line}");
     assert!(
         line.ends_with(
-            " attention_owner=human attention_owners=2 supervisor=- questions=- agent_cwd=-\n"
+            " attention_owner=human attention_owners=2 supervisor=- supervisor_proven=0 questions=- \
+             agent_cwd=- autopilot=- land_at=-\n"
         ),
         "{line}"
     );
@@ -18498,19 +19047,25 @@ fn the_supervisor_key_is_owner_only_shown_in_the_roster_and_released_with_its_co
     let store = session_store::new_store();
     let h = registered_session(0, -1, b"");
     store.write().unwrap().register(h.clone());
-    // The row up to `supervisor=`; the owner's columns
-    // (`path_evidence= copy= upgrade=`) follow it.
+    // The row up to `supervisor=`; `autopilot=` (`-`: no agent runs here),
+    // the owner's columns (`path_evidence= copy= upgrade=`) and the harness's
+    // `land_at= task=` follow it.
     let row = || {
         let body = control_session::cmd_sessions_store(&store, None);
         let line = body.lines().nth(1).expect("one row");
         let (head, owner) = line.split_once(" path_evidence=").expect("owner columns");
-        assert!(owner.ends_with(" copy=- upgrade=-"), "{line}");
-        head.to_string()
+        assert!(
+            owner.ends_with(" copy=- upgrade=- land_at=- task=-"),
+            "{line}"
+        );
+        head.strip_suffix(" autopilot=-")
+            .unwrap_or_else(|| panic!("autopilot= beside supervisor=: {line}"))
+            .to_string()
     };
     assert!(row().ends_with(" supervisor=-"), "{}", row());
 
     let sup = |scope: Scope, conn: Option<u64>, rest: &str| {
-        control_session::cmd_meta_supervisor(&h.ctx, scope, conn, rest)
+        control_session::cmd_meta_supervisor(&h.ctx, scope, conn, &|_| None, rest)
     };
     // Not a supervisor write: falls through to `meta`.
     assert_eq!(sup(Scope::Owner, Some(1), "set title x"), None);
@@ -18526,11 +19081,9 @@ fn the_supervisor_key_is_owner_only_shown_in_the_roster_and_released_with_its_co
         Some(("OK\n".to_string(), true))
     );
     assert!(row().ends_with(" supervisor=sup-a"), "{}", row());
-    assert!(
-        cmd_meta(&h.term, &store, 0, &h.ctx, "")
-            .0
-            .ends_with(" supervisor=sup-a questions=- agent_cwd=-\n")
-    );
+    assert!(cmd_meta(&h.term, &store, 0, &h.ctx, "").0.ends_with(
+        " supervisor=sup-a supervisor_proven=0 questions=- agent_cwd=- autopilot=- land_at=-\n"
+    ));
     assert_eq!(
         sup(Scope::Owner, Some(42), "set supervisor sup-b"),
         Some(("ERR busy supervisor=sup-a\n".to_string(), false))

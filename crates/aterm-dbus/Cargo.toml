@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-dbus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "First-party D-Bus for aterm: the wire format, SASL EXTERNAL and a blocking unix-socket client, written against the specification and held to bytes recorded from zbus/zvariant"
+
+[dependencies]
+# hex for the SASL line and address escapes.
+aterm-codec = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+# The socket (`CtlStream`, std's UnixStream on unix) and geteuid(2) for EXTERNAL.
+aterm-uds = { workspace = true }
+libc = { workspace = true }
+
+[dev-dependencies]
+# The mutation sweep's generator (`aterm_spec::rng::XorShift`, the house one).
+aterm-spec = { workspace = true }
+# The live round trip's scratch directory for its private dbus-daemon.
+aterm-tempfile = { workspace = true }
+
+# No zbus or zvariant here, not even as dev-dependencies: their recorded bytes
+# under tests/recorded/ are the oracle (docs/AUDIT-third-party-2026-10-15.md,
+# a11y decision 5), so the lock never carries them for this crate.
+
+[lints]
+workspace = true

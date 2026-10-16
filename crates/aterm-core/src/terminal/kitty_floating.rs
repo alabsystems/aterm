@@ -39,9 +39,9 @@ pub(super) struct FloatingTile {
     pub(super) col: u16,
     /// The placement: its index in `kitty_floating`.
     pub(super) index: usize,
-    /// Which tile of the placement's footprint the cell shows.
+    /// Which footprint row the cell shows.
     pub(super) cell_row: u16,
-    /// Which tile of the placement's footprint the cell shows.
+    /// Which footprint column the cell shows.
     pub(super) cell_col: u16,
 }
 

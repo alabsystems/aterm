@@ -1,0 +1,51 @@
+# codex-cli 0.163.0 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (144x50, aterm 0.105.0) running the real Codex, launched by path with a scratch `CODEX_HOME`, the lab provider `base_url=http://127.0.0.1:<port>/v1`, `wire_api = "responses"`, a fake `env_key` (a local stub of the Responses API, crates/aterm-lab) · after one ok turn, an answer (200) with x-codex-primary-used-percent 92 (300 min), secondary 10 (10080 min), credits has=false: the usage warning, then the Approaching rate limits box
+
+  >_ OpenAI Codex (v0.163.0)
+     /private/tmp/at.IVwZ/proj
+
+
+› hi
+
+
+• Hi! I am the local lab stub, not a model. (reply 1)
+
+  Worked for <1s • 11:15 AM
+
+
+› carry on with the task
+
+
+• Hi! I am the local lab stub, not a model. (reply 2)
+
+⚠ Heads up, you have less than 10% of your 5h limit left. Run /status for a breakdown.
+
+  Worked for <1s • 11:15 AM
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  Approaching rate limits
+  Switch to gpt-6-luna for lower credit usage?
+
+
+› 1. Switch to gpt-6-luna                   Fast and affordable model for easier tasks.
+  2. Keep current model
+  3. Keep current model (never show again)  Hide future rate limit reminders about switching models
+
+  enter select · esc back

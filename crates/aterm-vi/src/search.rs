@@ -44,13 +44,6 @@ impl ViSearchState {
         self.matches = matches;
     }
 
-    /// Clear all matches and reset focus.
-    #[cfg(test)]
-    pub fn clear(&mut self) {
-        self.matches.clear();
-        self.focused = None;
-    }
-
     /// Number of matches.
     #[must_use]
     #[cfg(test)]
@@ -58,30 +51,11 @@ impl ViSearchState {
         self.matches.len()
     }
 
-    /// Whether there are any matches.
-    #[must_use]
-    #[cfg(test)]
-    pub fn is_empty(&self) -> bool {
-        self.matches.is_empty()
-    }
-
     /// Currently focused match index.
     #[must_use]
     #[cfg(test)]
     pub fn focused_index(&self) -> Option<usize> {
         self.focused
-    }
-
-    /// Currently focused match position.
-    #[must_use]
-    #[cfg(test)]
-    pub fn focused_point(&self) -> Option<ViPoint> {
-        // Written as a match (not `and_then`) so the verifier does not have
-        // to model a `&self`-capturing closure aggregate (unsupported MIR).
-        match self.focused {
-            Some(i) => self.matches.get(i).copied(),
-            None => None,
-        }
     }
 
     /// Focus the next match after `after`. Wraps to the first match
@@ -118,20 +92,6 @@ impl ViSearchState {
 
         self.focused = Some(idx);
         self.matches.get(idx).copied()
-    }
-
-    /// Check if a point is a match start position.
-    #[must_use]
-    #[cfg(test)]
-    pub fn is_match(&self, point: ViPoint) -> bool {
-        self.matches.binary_search(&point).is_ok()
-    }
-
-    /// Check if a point is the currently focused match.
-    #[must_use]
-    #[cfg(test)]
-    pub fn is_focused(&self, point: ViPoint) -> bool {
-        self.focused_point() == Some(point)
     }
 }
 
@@ -241,41 +201,6 @@ mod tests {
         let mut s = ViSearchState::new();
         assert_eq!(s.focus_next(ViPoint::new(0, 0)), None);
         assert_eq!(s.focus_prev(ViPoint::new(0, 0)), None);
-        assert_eq!(s.focused_index(), None);
-    }
-
-    #[test]
-    fn test_is_match() {
-        let mut s = ViSearchState::new();
-        s.set_matches(sample_matches());
-
-        assert!(s.is_match(ViPoint::new(0, 5)));
-        assert!(s.is_match(ViPoint::new(3, 20)));
-        assert!(!s.is_match(ViPoint::new(0, 6)));
-        assert!(!s.is_match(ViPoint::new(2, 0)));
-    }
-
-    #[test]
-    fn test_is_focused() {
-        let mut s = ViSearchState::new();
-        s.set_matches(sample_matches());
-
-        assert!(!s.is_focused(ViPoint::new(0, 5)));
-
-        s.focus_next(ViPoint::new(0, 0));
-        assert!(s.is_focused(ViPoint::new(0, 5)));
-        assert!(!s.is_focused(ViPoint::new(1, 10)));
-    }
-
-    #[test]
-    fn test_clear_resets_state() {
-        let mut s = ViSearchState::new();
-        s.set_matches(sample_matches());
-        s.focus_next(ViPoint::new(0, 0));
-
-        s.clear();
-        assert!(s.is_empty());
-        assert_eq!(s.match_count(), 0);
         assert_eq!(s.focused_index(), None);
     }
 

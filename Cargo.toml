@@ -3,38 +3,72 @@
 
 [workspace]
 members = ["crates/*"]
+# What a bare `targo --unverified build|check|test` at the root builds: every member
+# but the publication tools (the cutter, the Windows signer, the atpkg producer and keys,
+# the forge) and the check runners (aterm-verify, aterm-census, the libc and Win32 oracles, the perf
+# harnesses, the real-Claude lab), which run from source under their own aliases, and the
+# contract probe, which `verify test -p aterm-contract-probe` names. `--workspace` (what
+# `verify --all` and `verify release` pass) and `-p` reach every member. A new crate is
+# listed here unless it is one of those tools.
+default-members = [
+    "crates/aterm", "crates/aterm-agent", "crates/aterm-alloc", "crates/aterm-arrayvec",
+    "crates/aterm-bidi", "crates/aterm-bits", "crates/aterm-buffer", "crates/aterm-bumpalo",
+    "crates/aterm-cap",
+    "crates/aterm-cfg-if", "crates/aterm-cli", "crates/aterm-codec",
+    "crates/aterm-conformance", "crates/aterm-containment", "crates/aterm-control",
+    "crates/aterm-core", "crates/aterm-ctl",
+    "crates/aterm-dbus", "crates/aterm-digest", "crates/aterm-dirfd", "crates/aterm-document-features",
+    "crates/aterm-effects", "crates/aterm-font", "crates/aterm-getrandom", "crates/aterm-gpu",
+    "crates/aterm-gpu-web", "crates/aterm-grapheme", "crates/aterm-grid",
+    "crates/aterm-gui", "crates/aterm-hash", "crates/aterm-http", "crates/aterm-json",
+    "crates/aterm-keeper", "crates/aterm-lexicon", "crates/aterm-libc", "crates/aterm-libm",
+    "crates/aterm-link", "crates/aterm-log", "crates/aterm-log-shim", "crates/aterm-lz4",
+    "crates/aterm-macro-support", "crates/aterm-messages", "crates/aterm-net", "crates/aterm-objc",
+    "crates/aterm-observe", "crates/aterm-once-cell", "crates/aterm-parser",
+    "crates/aterm-phase", "crates/aterm-png", "crates/aterm-policy", "crates/aterm-predict",
+    "crates/aterm-primer", "crates/aterm-profiling", "crates/aterm-provenance",
+    "crates/aterm-pty", "crates/aterm-regex", "crates/aterm-render", "crates/aterm-rle",
+    "crates/aterm-rustix-compat", "crates/aterm-sandbox", "crates/aterm-scene", "crates/aterm-scrollback",
+    "crates/aterm-search", "crates/aterm-selection", "crates/aterm-serde", "crates/aterm-serde-derive",
+    "crates/aterm-session", "crates/aterm-shell-integration", "crates/aterm-sixel", "crates/aterm-slog",
+    "crates/aterm-smallvec", "crates/aterm-spec", "crates/aterm-spec-macros",
+    "crates/aterm-spec-models", "crates/aterm-sysprobe", "crates/aterm-tempfile",
+    "crates/aterm-time", "crates/aterm-toml", "crates/aterm-tracing",
+    "crates/aterm-tracing-attributes", "crates/aterm-types", "crates/aterm-uds",
+    "crates/aterm-unicode-width", "crates/aterm-update", "crates/aterm-update-core",
+    "crates/aterm-vi", "crates/aterm-wasm", "crates/aterm-wasm-abi", "crates/aterm-wasm-abi-macros",
+    "crates/aterm-win32", "crates/aterm-window",
+    "crates/aterm-windows-sys-052", "crates/aterm-winit-keymap", "crates/aterm-winres",
+    "crates/aterm-zstd", "crates/atpkg",
+]
 # vendor/astream is a submodule with its own workspace; its crates are path
 # dependencies of aterm-link and inherit package fields from its root manifest.
-exclude = ["vendor/astream"]
+#
+# crates/aterm-windows-sys is excluded because it is the package `windows-sys`
+# 0.61.2 and crates/aterm-windows-sys-052 is `windows-sys` 0.52.0: cargo refuses
+# two members of one name. It is its own root (a `[workspace]` stub, as a
+# vendored fork has), and the `windows-sys` patch row reaches it by path.
+exclude = ["vendor/astream", "crates/aterm-windows-sys"]
 resolver = "2"
 
-# The AUTHORITATIVE atpkg surface for the `aterm` program (tools/atpkg-pack.sh reads both;
-# EXPOSE(env) > this declaration > name-token heuristic). `expose` = bins atpkg SHIMS onto the
-# user's PATH; `bundle` = bins SHIPPED in the tarball but NOT shimmed. ONE command lands on PATH
-# — `aterm` — the single front door an AI learns; `aterm help` reveals the rest. The siblings are
-# BUNDLED (not exposed) so `aterm <verb>` dispatch (aterm ctl/pkg/fleet/drive) resolves them via
-# current_exe from the same store bin/ — they ride along, attested by the same signature, without
-# adding names to PATH. The producer/dev/signing bins (atpkg-keys — "never shipped to clients",
-# aterm-release, xtask) are in NEITHER list. Every name must be a bin the
-# release build produces, or the pack fails closed.
+# The executable surface read by `atpkg-publish pack`: `expose` names commands
+# shimmed onto PATH; `bundle` names additional executables shipped without shims.
+# aterm dispatches its verbs in-process, so no sibling executable is bundled.
+# Producer, signing and check-runner binaries are development tools only.
 [workspace.metadata.atpkg]
 expose = ["aterm"]
 bundle = []
-# GitHub owner of atpkg's signed package index, stamped into
-# ATERM_ATPKG_INDEX_OWNER by crates/aterm-update-core/build.rs. The index is
-# verified against the pinned root key wherever it is hosted.
-account = "alabsystems"
 
-# The public OWNER/REPO installed copies read for app updates, stamped into
-# ATERM_DEFAULT_OWNER/REPO by crates/aterm-update-core/build.rs and published to
-# by the release cutter. Distinct from `repository`, the private source repo.
-# Authenticity comes from the pinned keys in aterm-update-core::pins, not from
-# where the bytes are hosted.
+# The public OWNER/REPO the release cutter publishes to. Installed copies read
+# the same slug from aterm_update_core::DEFAULT_OWNER/DEFAULT_REPO, which
+# aterm-release's channel tests hold equal to this key. Distinct from
+# `repository`, the private source repo. Authenticity comes from the pinned keys
+# in aterm-update-core::pins, not from where the bytes are hosted.
 [workspace.metadata.aterm]
 update_channel = "alabsystems/aterm"
 
 [workspace.package]
-version = "0.104.0"
+version = "0.105.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/alabsystems/aterm"
@@ -42,50 +76,39 @@ authors = ["Andrew Yates"]
 description = "aterm — a fast, hardened terminal engine"
 
 [workspace.dependencies]
-proc-macro2 = "1.0.106"
-quote = "1.0.45"
-syn = { version = "2", features = ["full", "extra-traits"] }
-serde = { version = "1", features = ["derive"] }   # optional feature in aterm-types
-# aterm-scrollback cold-tier compression (+ atpkg's .tar.zst payloads).
-# DEFAULT FEATURES OFF. zstd's default set is ["legacy", "arrays", "zdict_builder"];
-# the omitted arms are `legacy` and `zdict_builder`, and only `arrays` is kept.
-# COST: 0 packages / 0 .rs lines on ALL FOUR cells — this one is invisible to the
-# forge metric (rs-physical-all-files-v1) BY CONSTRUCTION, because neither feature
-# gates a Rust package. What it actually removes is C: 31,618 lines of vendored
-# libzstd that stop compiling into every binary on every cell.
-#   * `legacy`  -> zstd/lib/legacy, 15 files / 26,295 lines (the v0.1-v0.7 frame
-#     decoders). zstd-sys-2.0.16/build.rs:67-70 adds that include dir and defines
-#     ZSTD_LEGACY_SUPPORT=1 only under the feature; :204-205 defines it to 0
-#     otherwise, and :114-115 is what adds the directory to the compile.
-#   * `zdict_builder` -> zstd/lib/dictBuilder, 5,323 lines (cover.c + fastcover.c +
-#     divsufsort.c + zdict.c + zdict.h), added at build.rs:112-113 and :251, with
-#     the bindgen header at :11-12 and :216.
-# WHY THE ARMS ARE DEAD HERE: on the Rust side `zdict_builder` gates only
-# zstd-0.13.3/src/dict.rs (the from_samples/EncoderDictionary/DecoderDictionary
-# builders) and two fns in zstd-safe-7.2.4/src/lib.rs:2284-2308; `legacy` gates
-# only a test (zstd-0.13.3/src/stream/tests.rs:192). NOTHING in this tree touches
-# either: a grep for from_samples / EncoderDictionary / DecoderDictionary /
-# with_dictionary / zstd::dict across crates/ and apps/ returns ZERO, and every
-# call site is plain `zstd::encode_all` / `zstd::Encoder::new` / `zstd::Decoder::new`
-# (aterm-scrollback codec.rs:99 and :134, disk_memory.rs:398, disk_compaction.rs:128;
-# atpkg extract.rs:997 and :1048, install.rs:863, flow.rs:3144, cli.rs:9406).
-# `arrays` is KEPT: it is pure-Rust API (zstd-safe `arrays = []`, it forwards
-# nothing to zstd-sys) and costs nothing.
-# Small live-arm caveat: `legacy` is what lets libzstd DECODE pre-1.0 (2015-era)
-# frames. Nothing aterm or atpkg emits them, but a hand-supplied ancient .zst
-# would stop decoding.
-zstd = { version = "0.13", default-features = false, features = ["arrays"] }
+# First-party serde (docs/AUDIT-third-party-2026-10-15.md SP.6): the traits, the
+# std impls aterm's models use and the Content buffer behind tag/untagged/flatten
+# (crates/aterm-serde, carved from serde_core + serde 1.0.228), and the syn-free
+# derive over aterm's closed attribute set (crates/aterm-serde-derive on
+# crates/aterm-macro-support). Every member still writes `serde` and
+# `use serde::{Deserialize, Serialize}`; the rename is this row's alone. It is a
+# workspace row, never a [patch.crates-io] one: on linux zbus/zvariant keep
+# registry serde until A11Y.5, and no type crosses between the two.
+# The row carries no `derive`: a member that writes `#[derive(Serialize)]` asks
+# for it on its own row (`features = ["derive"]`), so a crate that only
+# implements or drives the traits (aterm-json, aterm-toml) keeps the derive's
+# proc macro out of its normal closure, which Trust's loader (PM-1) refuses
+# (docs/PLAN-pm1-proc-macro-reach-2026-10-16.md, increment 1).
+# Optional feature in aterm-types and aterm-core.
+serde = { package = "aterm-serde", path = "crates/aterm-serde" }
 # Resolves to crates/aterm-libc through [patch.crates-io] below.
 libc = "0.2"
 # TLS for aterm-http and aterm-net; `ring` backend, no aws-lc C build.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-# Distributed-slice collection across crates: the #[refines]/#[spec_unmodeled]
-# anchor emitters submit RefinementEntry/Waiver records into an inventory slice
-# that the spec_xref_closure gate collects at test time (TRUST_NATIVE_TLA, Phase 0).
-inventory = "0.3"
-# Patched to vendor/winit. Used by aterm-gui and aterm-winit-keymap only; never
-# an optional dependency of a platform-free crate.
-winit = "0.30"
+# ring: the bridge half of the KEEP pair under rustls
+# (docs/AUDIT-third-party-2026-10-15.md). One row, one version floor, for every
+# direct edge. DEFAULT FEATURES OFF: each member names what its edge needs
+# (verify-only edges none, atpkg `alloc` for RSA, the signing tool and the test
+# builds `default`).
+ring = { version = "0.17.14", default-features = false }
+# crates/aterm-window, aterm's own windowing crate (absorbed from upstream winit
+# 0.30.13; see NOTICE). Its package is still named `winit` because accesskit_winit,
+# a registry crate, requires a crate of that name: the [patch.crates-io] row below
+# hands it this one, and the rename waits for the a11y glue that replaces
+# accesskit_winit (docs/AUDIT-third-party-2026-10-15.md, winit-core steps 4 and 7).
+# Used by aterm-gui and aterm-winit-keymap only; never an optional dependency of a
+# platform-free crate.
+winit = { path = "crates/aterm-window" }
 
 # --- internal aterm crates ---
 # The workspace clock (retired `web-time`): EXACTLY `std::time` on native — a
@@ -97,6 +120,10 @@ winit = "0.30"
 aterm-time = { path = "crates/aterm-time" }
 aterm-observe = { path = "crates/aterm-observe" }
 aterm-phase = { path = "crates/aterm-phase" }
+# The session log's engine (docs/DESIGN-session-log-2026-10-15.md): records,
+# the bounded per-session ring, the turn tracker, the fold and `brief`. No
+# clock, file, thread or socket: the host hands it a `Stamp`.
+aterm-slog = { path = "crates/aterm-slog" }
 aterm-agent = { path = "crates/aterm-agent" }
 aterm-net = { path = "crates/aterm-net" }
 aterm-uds = { path = "crates/aterm-uds" }
@@ -129,8 +156,12 @@ aterm-grapheme = { path = "crates/aterm-grapheme" }
 aterm-lexicon = { path = "crates/aterm-lexicon" }
 aterm-types = { path = "crates/aterm-types" }
 aterm-winit-keymap = { path = "crates/aterm-winit-keymap" }
-aterm-spec = { path = "crates/aterm-spec" }
+aterm-spec = { path = "crates/aterm-spec", features = ["anchors"] }
 aterm-spec-macros = { path = "crates/aterm-spec-macros" }
+# The syn-free parser and template layer aterm's proc macros share, and the
+# first-party serde derive on it (docs/AUDIT-third-party-2026-10-15.md SP.5).
+aterm-macro-support = { path = "crates/aterm-macro-support" }
+aterm-serde-derive = { path = "crates/aterm-serde-derive" }
 aterm-spec-models = { path = "crates/aterm-spec-models" }
 aterm-provenance = { path = "crates/aterm-provenance" }
 aterm-tempfile = { path = "crates/aterm-tempfile" }
@@ -145,6 +176,13 @@ aterm-winres = { path = "crates/aterm-winres" }
 aterm-dirfd = { path = "crates/aterm-dirfd" }
 aterm-bidi = { path = "crates/aterm-bidi" }
 aterm-lz4 = { path = "crates/aterm-lz4" }
+# First-party Zstandard: XXH64 and the raw-block frame writer atpkg's test
+# fixtures use (docs/AUDIT-third-party-2026-10-15.md ZC.3), and the decoder
+# carved from ruzstd 0.8.3 (ZC.4) that atpkg's extractor reads .tar.zst with
+# (ZC.5) and atpkg-publish reads every pack back through. It replaced the
+# zstd / zstd-safe / zstd-sys family, whose workspace row left at ZC.6; the
+# packs themselves are compressed by the `zstd` CLI.
+aterm-zstd = { path = "crates/aterm-zstd" }
 aterm-rle = { path = "crates/aterm-rle" }
 aterm-codec = { path = "crates/aterm-codec" }
 # First-party JSON: a serde Deserializer/Serializer plus the untyped `Value`
@@ -159,6 +197,15 @@ aterm-json = { path = "crates/aterm-json" }
 # + `adler2`), most of it a SECOND compression stack beside the inflate aterm
 # already owned.
 aterm-png = { path = "crates/aterm-png" }
+# First-party font reader and shaper (docs/AUDIT-third-party-2026-10-15.md
+# TF.3, TF.5 and TF.6): the sfnt tables aterm-render reads, carved from
+# ttf-parser 0.25.1, and the GSUB shaper it shapes runs with, carved from
+# rustybuzz 0.20.1; aterm-render names neither upstream crate. ttf-parser
+# stays in the linux cells only, under sctk-adwaita's ab_glyph. Default
+# features off: its `hint` feature (the TF.4 autohinter, carved from skrifa
+# 0.46.2) is on by default for the crate's own tests, and a consumer asks for
+# it where it grid-fits (aterm-render, on Linux and Windows).
+aterm-font = { path = "crates/aterm-font", default-features = false }
 # First-party HTTP/1.1 client. Retired `ureq` and the stack behind it
 # (ureq-proto, http, bytes, httparse, utf8-zero, percent-encoding, webpki-roots)
 # — 8 packages, 69,546 lines — from the shipped graph. Certificates verify
@@ -168,6 +215,10 @@ aterm-http = { path = "crates/aterm-http" }
 aterm-bits = { path = "crates/aterm-bits" }
 aterm-hash = { path = "crates/aterm-hash" }
 aterm-digest = { path = "crates/aterm-digest" }
+# First-party D-Bus (A11Y.3): the wire format, SASL EXTERNAL and a blocking unix
+# client, held to bytes recorded once from zbus/zvariant. Replaces zbus for the
+# AT-SPI publisher (A11Y.4); nothing consumes it yet.
+aterm-dbus = { path = "crates/aterm-dbus" }
 # The workspace regular-expression engine: parse → NFA → bounded Pike VM,
 # first-party and dependency-free. Replaces `regex`, the largest single import
 # left in the shipped graph at 4 packages / 158,471 lines of third-party source
@@ -203,10 +254,10 @@ aterm-regex = { path = "crates/aterm-regex" }
 # fewer piece of third-party code this repository must keep reviewing forever
 # in order to read a config file.
 #
-# serde STAYS, deliberately: 168 `from_str` call sites stand on 161
-# `#[derive(Deserialize)]` models, so the replacement had to BE a
-# `Deserializer`. serde_derive is a proc macro and contributes no machine code
-# to the shipped binary.
+# It is a serde `Deserializer`, deliberately: the `from_str` call sites stand on
+# `#[derive(Deserialize)]` models (about 325 derive sites today), so the
+# replacement had to BE one. serde itself is first-party since SP.6 (the
+# `serde` row at the top of this table).
 aterm-toml = { path = "crates/aterm-toml" }
 aterm-log = { path = "crates/aterm-log" }
 aterm-alloc = { path = "crates/aterm-alloc" }
@@ -215,7 +266,18 @@ aterm-update-core = { path = "crates/aterm-update-core" }
 atpkg = { path = "crates/atpkg" }
 atpkg-keys = { path = "crates/atpkg-keys" }
 aterm-sixel = { path = "crates/aterm-sixel" }
+# The host boundary of the two wasm modules, with no third-party dependency:
+# the `console.error` panic hook (docs/AUDIT-third-party-2026-10-15.md, WP.3)
+# and the export layer that replaces wasm-bindgen, with its syn-free
+# `#[export]` (WP.6).
+aterm-wasm-abi = { path = "crates/aterm-wasm-abi" }
+aterm-wasm-abi-macros = { path = "crates/aterm-wasm-abi-macros" }
+# The Win32 declarations aterm's Windows graph reads, generated from
+# windows-sys 0.61.2 at upstream's paths with no dependency; the `windows-sys`
+# row below re-exports them (docs/AUDIT-third-party-2026-10-15.md, WB.3).
+aterm-win32 = { path = "crates/aterm-win32" }
 aterm-census = { path = "crates/aterm-census" }
+aterm-forge = { path = "crates/aterm-forge" }
 aterm-verify = { path = "crates/aterm-verify" }
 # First-party replacements published under the upstream package names; third-party
 # crates reach them through [patch.crates-io]. A root row lets a member write
@@ -234,35 +296,43 @@ cfg-if = { path = "crates/aterm-cfg-if" }
 # ever wants the shim can write `arrayvec = { workspace = true }` without
 # tripping the census's hard error on a `workspace = true` edge with no root row.
 arrayvec = { path = "crates/aterm-arrayvec" }
-core_maths = { path = "crates/aterm-core-maths" }
 once_cell = { path = "crates/aterm-once-cell" }
 log = { path = "crates/aterm-log-shim" }
+# crates/aterm-smallvec is package `smallvec`: upstream's `SmallVec<[T; N]>`
+# over `aterm_alloc::SmallVec<T, N>`. Consumers reach it through
+# [patch.crates-io]; the row is here for the same reason as `arrayvec`'s.
+smallvec = { path = "crates/aterm-smallvec" }
 
 # The tree is kept clean under
 # `targo-tippy --workspace --all-targets --keep-going -- -D warnings`.
+# Lints warn, never deny: `verify lint` (-D warnings) enforces them, so a build
+# or a test run never fails on one.
 [workspace.lints.rust]
-unsafe_op_in_unsafe_fn = "deny"
+# Already the edition-2024 default; set for the 2021-edition members.
+unsafe_op_in_unsafe_fn = "warn"
 # Centralized known-cfg superset (was declared per-crate). Verification/fuzzing
 # tools gate code behind these cfgs (loom interleavings, miri, fuzz harnesses,
 # the Trust lanes). Declaring the union here keeps `unexpected_cfgs` honest in
 # every crate from one place — an undeclared cfg name warns, which `-D warnings`
-# makes an error.
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(miri)', 'cfg(fuzzing)', 'cfg(trust_verify)', 'cfg(clean_islands)', 'cfg(trust_seals)'] }
+# makes an error. `clean_islands` is not here: a crate declares it from its
+# build script (crates/aterm-log/clean_islands.rs), so a crate that uses it
+# without asking the compiler warns.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(miri)', 'cfg(fuzzing)', 'cfg(trust_verify)', 'cfg(trust_seals)', 'cfg(trust_binding)'] }
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
 ignore_without_reason = "warn"
 
 # Line tables keep file:line backtraces with much smaller test binaries.
-# build-override below matches (crates/aterm-verify/tests/profile_pin.rs).
+# build-override below matches.
 [profile.dev]
 debug = "line-tables-only"
 
 # THE SPEED ROWS BELOW ARE THE TEST LOOP'S, NEVER THE TRUST LANE'S (2026-10-01).
-# `targo trust check` (tools/trust-gate-all.sh, every caller of it) compiles
+# `targo trust check` (`ship trust run`, aterm-release trust_lane.rs) compiles
 # under its own profile, `trust-lane`: dev at opt-level 0 with every
-# `[profile.dev.package.<name>]` row here zeroed by name — tools/trust-gate-specs.py
-# reads them from this file, so a row added below needs nothing else. Optimized,
+# `[profile.dev.package.<name>]` row here zeroed by name — the lane reads them
+# from this file, so a row added below needs nothing else. Optimized,
 # rustc's MIR inliner pastes std's slice-iterator and NonNull internals into
 # every caller and the verifier loses proofs with no source changed (aterm-spec
 # 146 -> 76 proved at opt-level 1, aterm-png 285 -> 221 at 2), and a custom
@@ -282,15 +352,26 @@ opt-level = 2
 [profile.dev.package.aterm-png]
 opt-level = 2
 
-# THE FONT TABLE READER AT OPT-LEVEL 2 IN DEV (2026-09-30, gate speed). Every
-# chrome text measurement in aterm-gui's tests goes through `ttf-parser`'s kern
-# lookups (`tray_raster::ui_text_width_for`), and `sample` put 85% of the
-# Dynamic Type settings tests' child CPU in that unoptimized third-party code.
-# A profile row: no source replaced, only opt-level. Measured A then B twice,
-# same machine and load class: the two Dynamic Type tests 19.6 / 18.5 s ->
-# 6.8-7.0 / 8.1-8.2 s; the whole `-p aterm-gui --lib` run 255 -> 187 CPU-s
-# (6886 passed). Cost: a one-time 67 s rebuild of what sits above it.
-[profile.dev.package.ttf-parser]
+# THE FONT TABLE READER AT OPT-LEVEL 2 IN DEV (gate speed). Only opt-level
+# moves; debug assertions and overflow checks stay on, and the trust lane zeroes
+# the row. Two measurements put it here, each the same machine and load class:
+# - 2026-09-30, when the reader was ttf-parser (under its own row): every chrome
+#   text measurement in aterm-gui's tests goes through the reader's kern lookups
+#   (`tray_raster::ui_text_width_for`), and `sample` put 85% of the Dynamic Type
+#   settings tests' child CPU in that unoptimized code. Measured A then B twice:
+#   the two Dynamic Type tests 19.6 / 18.5 s -> 6.8-7.0 / 8.1-8.2 s; the whole
+#   `-p aterm-gui --lib` run 255 -> 187 CPU-s (6886 passed). Cost: a one-time
+#   67 s rebuild of what sits above it.
+# - 2026-10-15 (TF.3 of docs/AUDIT-third-party-2026-10-15.md): aterm-font's own
+#   suite replays the TF.1 reader corpus over every face the host has (every
+#   glyph's outline at every recorded instance) and mutation-fuzzes a face per
+#   outline format with overflow checks on. `-p aterm-font`: font_suite 71.8 ->
+#   2.9 s, and at 2 the never-panic fuzz still reports a planted overflow
+#   (upstream's unchecked CFF stack pop: "attempt to subtract with overflow").
+# TF.5 moved the renderer's reads (those kern lookups among them) here and TF.6
+# the shaper, so TF.7 deleted the ttf-parser row: ttf-parser is left only on
+# Linux, where sctk-adwaita's ab_glyph reads it for Wayland decoration titles.
+[profile.dev.package.aterm-font]
 opt-level = 2
 
 # THE RENDERER AT OPT-LEVEL 2 IN DEV (2026-10-05, gate speed). The gate's
@@ -326,6 +407,17 @@ opt-level = 2
 [profile.dev.package.aterm-spec]
 opt-level = 1
 
+# THE PAINT SCANNER AND ITS PNG INFLATE AT OPT-LEVEL 2 IN DEV (gate speed).
+# The MEASURE rows decode and scan every frame of a take (a recorded row is
+# ~500 frames) inside the test binary. Measured on one 507-frame take at a load
+# of ~80: decode 5.4 s -> 0.4 s (aterm-codec's inflate) and scan 6.7 s -> 0.7 s
+# (aterm-conformance). Cost: the vt suite builds in 2.5 s instead of 1.4.
+[profile.dev.package.aterm-conformance]
+opt-level = 2
+
+[profile.dev.package.aterm-codec]
+opt-level = 2
+
 [profile.test.package.aterm-effects]
 opt-level = 1
 
@@ -354,8 +446,7 @@ opt-level = "z"
 [profile.release.package.aterm-gpu-web]
 opt-level = "z"
 
-# Release semantics without LTO, for gate lanes that only need an optimized build
-# (pinned by crates/aterm-verify/tests/profile_pin.rs).
+# Release semantics without LTO, for lanes that only need an optimized build.
 [profile.gate]
 inherits = "release"
 lto = false
@@ -370,11 +461,11 @@ debug = 1
 # Reviewed vendored forks (vendor/forge.toml records why each is patched) and
 # first-party replacements for third-party dependencies of our dependencies.
 [patch.crates-io]
-winit = { path = "vendor/winit" }
-libm = { path = "vendor/libm" }
+# The one absorbed crate: upstream source aterm now owns as a workspace member,
+# its NOTICE line and Apache-2.0 §4(b) notices held by `forge attest`. The row
+# exists for accesskit_winit's `winit` requirement (see the workspace row above).
+winit = { path = "crates/aterm-window" }
 indexmap = { path = "vendor/indexmap" }
-pkg-config = { path = "vendor/pkg-config" }
-smol_str = { path = "vendor/smol_str" }
 tracing = { path = "crates/aterm-tracing" }
 profiling = { path = "crates/aterm-profiling" }
 cfg-if = { path = "crates/aterm-cfg-if" }
@@ -414,7 +505,7 @@ arrayvec = { path = "crates/aterm-arrayvec" }
 #
 # THE VERSION IS A CONTRACT AND IT MUST NOT DRIFT DOWN. The strictest
 # requirement in the graph is `^0.2.182` (rustix 1.1.4), then `^0.2.172`
-# (wgpu-hal) and `^0.2.171` (jobserver); the lock held 0.2.186. A shim numbered
+# (wgpu-hal) and `^0.2.161` (rustix 0.38); the lock held 0.2.186. A shim numbered
 # below any of those makes the row silently inert — cargo emits no warning,
 # `targo --unverified forge check` does; the `arrayvec` row above says the same.
 #
@@ -422,29 +513,27 @@ arrayvec = { path = "crates/aterm-arrayvec" }
 # build edge can need items (and features such as `extra_traits`) that nothing
 # shipped touches, and the crate must declare them all.
 #
-# SIX CELLS, NOT FOUR. The original survey missed two architectures the tree
-# builds: x86_64-apple-darwin, the compat slice `lipo`d into the universal
-# binary, and aarch64-unknown-linux-gnu, the Linux arm64 release target. Neither is a copy of its sibling: the mac compat slice
-# has 12 linker-symbol redirections, while arm64 Linux has different open flags,
-# syscall numbers, layouts, and HWCAP declarations required by cpufeatures and
-# ring. WHO DECIDES EACH CELL, since 2026-09-20: libc-oracle/run.sh — the
-# type-level oracle plus gen/symgate.py's emitted-source and symbol gates —
-# decides ONE cell per merge-gate run, the one the box is native to, under
-# Trust alone (no rustup, no stock toolchain: the owner's direction), so a
-# cell is covered exactly when a fleet box hosts its triple —
-# FLEET_HOST_TRIPLES in crates/xtask/src/gate.rs: aarch64-apple-darwin,
-# x86_64-apple-darwin, x86_64-unknown-linux-gnu. aarch64-unknown-linux-gnu has
-# no fleet host, and neither do x86_64-pc-windows-msvc and
-# wasm32-unknown-unknown, so those three cells are decided by NO gate until a
-# box hosts them or Trust ships their std. What still pins their SOURCE:
-# symgate.py's sibling-body check holds each same-OS pair's hand-written body
-# section byte-identical (text, so it runs on every box; it binds arm64 Linux
-# to the body x86_64 Linux executes, and does not decide that cell), and
-# libc-oracle/conformance/src/lib.rs's cell_zero pins Windows and wasm to the
-# primitive-only surface — the 14 unconditional `core::ffi` aliases and no
-# generated, target-specific libc ABI declaration — for whatever does compile
-# it, which today is nothing in the merge contract. The oracle never claimed a
-# live compile of every Windows/wasm `--all-targets` consumer: existing
+# SIX CELLS, NOT FOUR: two of the architectures the tree builds are easy to
+# miss — x86_64-apple-darwin, the compat slice `lipo`d into the universal
+# binary, and aarch64-unknown-linux-gnu, the Linux arm64 release target.
+# Neither is a copy of its sibling: the mac compat slice has 12 linker-symbol
+# redirections, while arm64 Linux has different open flags, syscall numbers,
+# layouts, and HWCAP declarations required by cpufeatures and ring. WHO
+# DECIDES EACH CELL: `verify libc` (crates/aterm-libc-oracle, driving
+# libc-oracle/: the type-level oracle plus its emitted-source and symbol
+# phases) decides ONE cell per run, the one the box is native to, under Trust
+# alone (no rustup, no stock toolchain), so a cell is covered exactly when a
+# box hosts its triple. aarch64-unknown-linux-gnu, x86_64-pc-windows-msvc and
+# wasm32-unknown-unknown have no fleet host, so those three cells are decided
+# by NO check until a box hosts them or Trust ships their std. What still pins
+# their SOURCE: the gate's sibling-body check holds each same-OS pair's
+# hand-written body section byte-identical (text, so it runs on every box; it
+# binds arm64 Linux to the body x86_64 Linux executes, and does not decide
+# that cell), and libc-oracle/conformance/src/lib.rs's cell_zero pins Windows
+# and wasm to the primitive-only surface — the 14 unconditional `core::ffi`
+# aliases and no generated, target-specific libc ABI declaration — for
+# whatever does compile it, which today is no check. The oracle never claimed
+# a live compile of every Windows/wasm `--all-targets` consumer: existing
 # platform-only tests and native C build dependencies stop those complete
 # graphs on this host before every consumer can emit an artifact.
 libc = { path = "crates/aterm-libc" }
@@ -459,37 +548,169 @@ libc = { path = "crates/aterm-libc" }
 # nothing is IDENTICAL in behaviour rather than an approximation. Re-check with
 # `grep -rn 'log::set_logger' crates/ tools/ apps/ --include='*.rs'` == 0, and
 # RETIRE this entry the day something installs one, or third-party diagnostics
-# go quietly empty. Every consumer is third-party (naga, the wgpu crates and
-# rustybuzz everywhere; gpu-allocator on win+linux; calloop, sctk-adwaita,
+# go quietly empty. Every consumer is third-party (naga and the wgpu crates
+# wherever wgpu compiles; gpu-allocator on win+linux; calloop, sctk-adwaita,
 # smithay-client-toolkit, tiny-skia, wayland-sys and xkbcommon-dl on Linux;
-# gl_generator as a Windows build-dep), which is why the patch table is the
-# lever and editing any one consumer is not.
+# gl_generator in the lock only, as the build-dep of wgpu-hal's Windows GL
+# backend, which no cell turns on), which is why the patch table is the lever
+# and editing any one consumer is not. rustybuzz, the one consumer on every
+# cell, left at TF.6.
 log = { path = "crates/aterm-log-shim" }
 
-# `core_maths` is the entry whose PRIZE IS SOMEBODY ELSE'S FORK. The package is
-# 1,221 lines of extension trait; what it drags in is `libm`, which this
-# repository VENDORS (vendor/libm — 19,867 lines and a build script, forked
-# because upstream carried an `i64::abs` overflow at MIN that Trust refuses to
-# compile). `core_maths` is libm's SOLE parent on mac-arm and on wasm-cpu, so
-# retiring it takes 2 packages / 21,088 lines / 1 build script off each of those
-# two cells; linux, win and wasm-gpu keep libm through naga and num-traits and
-# lose only core_maths itself.
-#
-# THE SWAP MOVES NO CODE THAT RUNS, and that is measured rather than hoped. The
-# string `core_maths` appears exactly four times in the two consumers' sources —
-# rustybuzz's face.rs, aat_layout_trak_table.rs and ot_layout_gpos_table.rs, and
-# ttf-parser's lib.rs — and every one is a `use core_maths::CoreFloat;` sitting
-# directly under `#[cfg(not(feature = "std"))]`. `std` is ON for both crates in
-# all five cells (rustybuzz defaults to it; `std = ["ttf-parser/std"]` forwards
-# it), so the trait is never imported and rustybuzz's eleven `.round()` calls
-# and ttf-parser's `.sin()`/`.cos()`/`.tan()`/`.abs()` already resolve to std's
-# inherent methods. crates/aterm-core-maths therefore replaces a crate that is
-# LINKED AND NEVER CALLED.
-#
-# The replacement forwards to `std` where upstream forwards to `libm`, which is
-# a real divergence for a genuine no_std build and no divergence at all for
-# aterm (every cell has std, wasm32 included). `powi` is copied from upstream
-# verbatim instead, because libm has no `powi` and std's is an LLVM intrinsic
-# that may round differently. Full fidelity table in the crate's header.
-core_maths = { path = "crates/aterm-core-maths" }
 once_cell = { path = "crates/aterm-once-cell" }
+
+# `smallvec` is the second data structure in this table after `arrayvec`, and
+# like it the implementation was already aterm's: crates/aterm-smallvec
+# (package `smallvec` 1.15.1) gives `aterm_alloc::SmallVec<T, N>` upstream's
+# `SmallVec<[T; N]>` spelling through an `Array` trait whose associated type
+# names the storage, so no `generic_const_exprs` is needed and the crate
+# forbids `unsafe`. Five consumers reach it since rustybuzz, its sixth and the
+# one on every cell, left at TF.6: parking_lot_core, wgpu, wgpu-core and
+# wgpu-hal wherever wgpu compiles; and wayland-backend on Linux, which
+# re-exports it to wayland-client and smithay-client-toolkit. It replaced
+# 1 package / 4,183 lines on every cell
+# (docs/AUDIT-third-party-2026-10-15.md, shared-build-lock step 1). Its tests
+# replay a transcript recorded from the registry crate and run a `Vec` model
+# of upstream's contract; the crate header lists where it differs (heap
+# growth schedule, `size_of`, a leaked `Drain`). As with `arrayvec`, the
+# shim's version must stay >= every other `1.x` in the graph.
+smallvec = { path = "crates/aterm-smallvec" }
+
+# `getrandom` 0.2 is the seed source under ring's SystemRandom: every TLS nonce
+# and ephemeral key. crates/aterm-getrandom (package `getrandom` 0.2.17)
+# forwards it to `aterm_uds::rand::fill`, the workspace's one entropy surface,
+# which already minted aterm's own tokens from the same OS calls (getentropy(2)
+# on Unix, BCryptGenRandom on Windows) and carries getrandom's /dev/random
+# readiness poll before its /dev/urandom fallback. 1 package / 1,997 lines off
+# all six native cells, and `wasi` 0.11 leaves the lock
+# (docs/AUDIT-third-party-2026-10-15.md, CT.5).
+#
+# THE VERSION IS A CONTRACT: ring 0.17.14 asks `^0.2.10`, astream-aead (aterm's
+# `sealed` feature) `^0.2`. A shim numbered below the highest 0.2.x anything
+# asks for leaves the row replacing NOTHING, silently; `targo --unverified
+# forge check` [OB-12] fails it. getrandom 0.3 is another major, stays a
+# registry package (lock-only: tempfile, whose 0.4 was pinned down to it,
+# A11Y.1; jobserver left with zstd-sys, ZC.6), and is in no shipped cell (an
+# unpatched copy beside this one in a cell is an [OB-12] failure too).
+#
+# No `[workspace.dependencies]` row, unlike the shims above: no aterm crate may
+# take `getrandom`. deny.toml bans it everywhere but under ring (forge check
+# [OB-18]); aterm's own code calls aterm_uds::rand.
+getrandom = { path = "crates/aterm-getrandom" }
+
+# `libm` RETIRED THE FORK the `core_maths` facade (deleted when rustybuzz left,
+# TF.6) starved on two cells: vendor/libm (19,867 lines and a build script) is
+# gone. naga and num-traits are
+# its consumers and name 68 functions between them (num-traits' libm-backed
+# `Float` impls, which ARE live on every cell with naga because no edge turns
+# num-traits' `std` on; naga's constant folder adds `asinh`, `rint`, `rintf`).
+# crates/aterm-libm forwards each to the std method computing the same thing:
+# the IEEE-exact ones are bit-identical and the transcendentals (all but
+# `atanh`, which std computes itself) are the platform's libm instead of musl's
+# (upstream's own code on wasm32, where std's math symbols come from
+# compiler-builtins). tests/recorded.rs holds the shim to
+# answers recorded from the fork before the switch. It retires with naga
+# (docs/AUDIT-third-party-2026-10-15.md, gpu-wgpu).
+libm = { path = "crates/aterm-libm" }
+
+# `document-features` is a proc macro whose two consumers, wgpu and wgpu-core,
+# call it once each, in `#![doc = ...]`: upstream renders their Cargo.toml
+# feature comments into rustdoc text aterm never builds. crates/aterm-document-features
+# expands to `""`, and litrs (its parser) leaves with it. Retires with wgpu.
+document-features = { path = "crates/aterm-document-features" }
+
+# `unicode-width` has one consumer, codespan-reporting (naga's diagnostics),
+# which calls `char::width` to align carets under a shader error.
+# crates/aterm-unicode-width answers it from aterm-grapheme's tables, the ones
+# the terminal grid uses; the tables differ from upstream's on 56,741 scalar
+# values (56,398 of them unassigned), which only moves a caret in an error
+# message aterm's shaders never produce. This reverses the REFUSED
+# verdict (docs/THIRD_PARTY_SURFACE_PLAN.md) for this narrow use: aterm-grapheme
+# no longer holds unicode-width as an oracle. Retires with naga.
+unicode-width = { path = "crates/aterm-unicode-width" }
+
+# `rustix` 0.38 is the syscall crate under the Linux windowing stack's older
+# half: calloop 0.13.0, calloop-wayland-source 0.3.0, smithay-client-toolkit
+# 0.19.2 and crates/aterm-window (package `winit`). crates/aterm-rustix-compat
+# (package `rustix` 0.38.44) gives them the ~25 items they call over
+# aterm-libc, and rustix 0.38 and linux-raw-sys 0.4.15 leave both Linux cells
+# (2 packages / 396,195 lines; docs/AUDIT-third-party-2026-10-15.md, LW.2). On
+# Windows rustix 0.38 was lock-only, so windows-sys 0.59 leaves the lock with it.
+#
+# THE VERSION IS A CONTRACT: the strictest edge is sctk's `^0.38.15`. rustix
+# 1.x is another major, which this row does not reach: it stays a registry
+# package (x11rb, wayland-*, softbuffer, polling, gethostname and the a11y
+# zbus and async-* crates) and is the facade's differential oracle. The
+# renamed row claims its own version line through forge's general RowScope
+# policy. The facade is Linux-only and goes with the move to the first-party
+# protocol crates (LW.7).
+#
+# No `[workspace.dependencies]` row, as with `getrandom`: aterm's own code calls
+# aterm-libc and aterm-dirfd, never rustix.
+rustix-038 = { package = "rustix", path = "crates/aterm-rustix-compat" }
+
+# `windows-sys` 0.52 is the one package ring itself pulls onto a Windows cell,
+# and only on aarch64 (win-arm): ring 0.17.14 reads ONE function and ONE
+# constant from it (src/cpu/arm/windows.rs:16-30, the ARMv8 crypto-extension
+# probe), and upstream brought windows-targets and a 5.2 MB prebuilt import
+# library (windows_aarch64_msvc, with a build script) to link them.
+# crates/aterm-windows-sys-052 (package `windows-sys` 0.52.0) declares those
+# items at upstream's paths and imports kernel32.dll with raw-dylib, the way
+# windows-link does for the 0.61 line. Its tests/oracle/ const-asserts every
+# type, value and signature against the registry 0.52.0 on both Windows
+# triples and compares the imported symbol and DLL, with a planted mismatch of
+# each kind (docs/AUDIT-third-party-2026-10-15.md, WB.1). win-arm loses 3
+# packages / 384,578 lines / 1 build script and then equals win.
+#
+# THE ROW IS RENAMED, and that is how one manifest patches two majors of one
+# name: cargo matches a `[patch]` row on the `package` it names, never on its
+# key. The 0.61 facade below is a second renamed row (WB.3), and forge reads a
+# renamed row as claiming its own version line only, so neither facade is the
+# other's unpatched sibling (aterm_forge::policy::in_row_scope). The version is a contract as above:
+# every ring 0.17.x asks `^0.52`, and 0.52.0 is the line's only release.
+windows-sys-052 = { package = "windows-sys", path = "crates/aterm-windows-sys-052" }
+
+# `windows-sys` 0.61 is the Win32 binding layer of four packages on both
+# Windows cells: winit (crates/aterm-window, 657 of the names), softbuffer (17),
+# aterm-http's crypt32 verifier (42) and aterm-net's WSAPoll (5). Upstream is
+# 334,283 generated lines and 168,401 names; those packages name 714 of them,
+# and with every declaration those name, 837. crates/aterm-win32 holds exactly
+# that closure, generated by aterm-win32-oracle from the registry source at
+# upstream's module paths, with no dependency (its own raw-dylib `link!`, as
+# windows-link writes it). crates/aterm-windows-sys (package `windows-sys`
+# 0.61.2) re-exports it, so no consumer changes a line. win32-oracle/ is its
+# own workspace with no patch table, and checks every layout, value, signature
+# and import against the registry 0.61.2 on both Windows triples, with planted
+# mismatches (docs/AUDIT-third-party-2026-10-15.md, WB.3). win and win-arm
+# each lose 1 package / 334,283 lines.
+#
+# THE ROW IS RENAMED too, like the 0.52 row: cargo patches only the semver line
+# a replacement's version is in, and forge reads a renamed row the same way
+# (aterm_forge::policy::in_row_scope). The lock-only 0.59.0 under rustix 0.38
+# is another line, which LW.2 takes out with rustix 0.38; under the plain key
+# forge would report it as a copy this facade fails to reach. Its version is a
+# contract as above: winit and softbuffer ask `^0.61.2`, and 0.61.2 is what
+# the lock held.
+#
+# The crate is NOT A WORKSPACE MEMBER: cargo refuses two members named
+# `windows-sys`, and the 0.52 facade is one (`exclude` at the top says so). The
+# Trust lane checks it as a path fork, and names the two facades by their
+# specs (`windows-sys@0.52.0`, `windows-sys@0.61.2`), so each has its own floor.
+windows-sys-061 = { package = "windows-sys", path = "crates/aterm-windows-sys" }
+
+# `bumpalo` has one consumer, wasm-bindgen-macro-support, whose interner holds
+# a `Bump`, builds it with `Bump::new` and copies each string the
+# `#[wasm_bindgen]` encoder emits into it with `alloc_str`
+# (wasm-bindgen-macro-support-0.2.108/src/encode.rs:44,65,81).
+# crates/aterm-bumpalo (package `bumpalo` 3.20.3) gives those two items over a
+# leaked `Box<str>`, with no `unsafe`; the compiler process that runs the proc
+# macro holds the strings until it exits. Before and after the switch
+# (docs/AUDIT-third-party-2026-10-15.md, WP.1), both web modules' pre-bind
+# `__wasm_bindgen_unstable` sections held the same records, reordered by
+# codegen-unit link order; the pinned CLI's .js/.d.ts were identical for
+# aterm-wasm and, for aterm-gpu-web, once the mangled `h<hash>` closure-shim
+# names are masked. wasm-cpu and wasm-gpu each lose 1 package / 10,771 lines. No
+# `[workspace.dependencies]` row: no aterm crate takes it. Since WP.7 only
+# aterm-gpu-web's build reaches it (aterm-wasm has no wasm-bindgen); it retires
+# with wasm-bindgen-macro-support at GW.4 + WP.8.
+bumpalo = { path = "crates/aterm-bumpalo" }

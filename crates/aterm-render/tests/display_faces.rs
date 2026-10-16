@@ -17,6 +17,7 @@ use aterm_render::{
 /// Violating it is not a cosmetic problem — an overrunning glyph paints over its
 /// NEIGHBOUR, which is how `pixel` came out as "m ncraft" in Luckiest Guy
 /// (cell from `M` at 0.79 em, `m` drawn at 0.91 em, the `i` buried in the ink).
+/// The cell is still that `M` cell; the `m` is squeezed into it.
 ///
 /// Scoped to fitted faces on purpose. An UNFITTED face is one this policy
 /// promises to leave exactly as it found it, and Monocraft — which has been
@@ -27,10 +28,7 @@ use aterm_render::{
 fn no_fitted_display_glyph_can_overrun_its_cell() {
     for font in DISPLAY_FACES {
         let bytes = display_face_bytes(font.id).expect("registry id resolves");
-        if display_face_fit(bytes)
-            .and_then(|fit| fit.cell_advance_em)
-            .is_none()
-        {
+        if !display_face_fit(bytes).is_some_and(|fit| fit.proportional) {
             continue;
         }
         // Several sizes: the fit is an em fraction, the cell an integer, so the
@@ -71,14 +69,13 @@ fn no_fitted_display_glyph_can_overrun_its_cell() {
 }
 
 /// The monospaced bundled face takes the IDENTITY fit. Monocraft (`pixel`) was
-/// already correct in a fixed grid — the policy must not touch its size, its
+/// already correct in a fixed grid — the policy must not touch its glyphs, its
 /// cell, or its weight, so the face the user likes cannot regress.
 #[test]
 fn the_monospaced_display_face_is_left_exactly_alone() {
     let fit =
         display_face_fit(display_face_bytes("pixel").unwrap()).expect("bundled face has a fit");
-    assert_eq!(fit.cell_advance_em, None, "no cell override");
-    assert!((fit.px_scale - 1.0).abs() < f32::EPSILON, "no size change");
+    assert!(!fit.proportional, "no squeeze or centring");
     assert!(!fit.embolden, "no weight change");
 
     // And end to end: the fitted renderer agrees with a raw one, cell for cell.
@@ -113,17 +110,91 @@ fn a_non_bundled_face_is_never_fitted() {
 fn proportional_display_faces_are_fitted() {
     for id in ["chunky", "engraved", "bubble"] {
         let fit = display_face_fit(display_face_bytes(id).unwrap()).expect("bundled");
-        let em = fit
-            .cell_advance_em
-            .unwrap_or_else(|| panic!("{id} is proportional and must carry a cell override"));
-        // A plausibility band, not a pinned measurement: a display face's
-        // widest printable-ASCII extent lands well inside it, and anything
-        // outside is a broken measurement rather than an unusual design.
-        assert!(
-            (0.5..=1.6).contains(&em),
-            "{id}: implausible cell advance {em} em"
-        );
-        assert!(fit.px_scale < 1.0, "{id}: a fitted face rasterizes smaller");
+        assert!(fit.proportional, "{id} is proportional and takes the fit");
+    }
+}
+
+/// A display face is drawn at the size asked for, in its own `M` cell: turning
+/// one on costs no more columns than that face's `M`, and its rows are never
+/// shorter than the font size. The earlier fit cut the cell to the widest ink
+/// of any glyph (Cinzel's `Q` tail set every cell, 17px at 12px against an
+/// 11px `M`) and shrank the glyphs 0.87 to win it back, so the letters sat
+/// small in cells 33-55% too wide, and Luckiest Guy's rows (10px) fell under
+/// a 12px font.
+#[test]
+fn a_display_face_keeps_its_size_and_its_own_m_cell() {
+    for font in DISPLAY_FACES {
+        let bytes = display_face_bytes(font.id).expect("registry id resolves");
+        let face = aterm_render::font::Font::from_bytes(bytes, Default::default()).unwrap();
+        for px in [12.0_f32, 16.0, 24.0] {
+            let mut renderer = Renderer::from_bytes(bytes, px, Theme::default()).unwrap();
+            let (cell_w, cell_h) = renderer.cell_size();
+            let m = face.metrics('M', px).advance_width.round().max(1.0) as usize;
+            assert_eq!(cell_w, m, "{} at {px}px: the cell is its own M", font.id);
+            assert!(
+                cell_h as f32 >= px,
+                "{} at {px}px: a {cell_h}px row is under the font size",
+                font.id
+            );
+            // And the glyphs are drawn at that size: an `H` stands at least as
+            // tall as the face draws it at `px` (a platform rasterizer may pad
+            // its box), not 13% shorter.
+            let key = renderer.glyph_key('H');
+            let drawn = renderer.glyph_image(key).height() as f32;
+            let authored = face.metrics('H', px).height as f32;
+            assert!(
+                drawn >= authored - 1.0,
+                "{} at {px}px: H is {drawn}px tall, the face draws {authored}px",
+                font.id
+            );
+        }
+    }
+}
+
+/// A display face's capitals rise past its own cell (Luckiest Guy's above a
+/// 0.70 em ascent), which the terminal's window padding absorbs but a frame
+/// with nothing above its first row cuts off. `display_ink_headroom` names the
+/// band that keeps every printable glyph of the first row whole; an ordinary
+/// font needs none.
+#[test]
+fn display_ink_headroom_holds_the_first_row_whole() {
+    let mut any = false;
+    for font in DISPLAY_FACES {
+        let bytes = display_face_bytes(font.id).expect("registry id resolves");
+        for px in [12.0_f32, 16.0, 24.0] {
+            let mut renderer = Renderer::from_bytes(bytes, px, Theme::default()).unwrap();
+            let head = renderer.display_ink_headroom(px, 1.0, 0) as i32;
+            let baseline = renderer.baseline();
+            any |= head > 0;
+            for invalid in [f32::NAN, f32::NEG_INFINITY, f32::INFINITY, f32::MAX] {
+                assert_eq!(renderer.display_ink_headroom(invalid, 1.0, 0), 0);
+                assert_eq!(renderer.display_ink_headroom(px, invalid, 0), 0);
+            }
+            for ch in '!'..='~' {
+                let key = renderer.glyph_key(ch);
+                if !matches!(key.source, aterm_render::FaceId::Primary) {
+                    continue;
+                }
+                let img = renderer.glyph_image(key);
+                if img.height() == 0 {
+                    continue;
+                }
+                let top = baseline - (img.height() as i32 + img.ymin());
+                assert!(
+                    top + head >= 0,
+                    "{} at {px}px: {ch:?} rises {} px above its cell, headroom {head}",
+                    font.id,
+                    -top
+                );
+            }
+        }
+    }
+    assert!(any, "a title face's capitals do rise past its cell");
+    #[cfg(feature = "embedded-font")]
+    {
+        let plain =
+            Renderer::from_bytes(aterm_render::embedded_font(), 16.0, Theme::default()).unwrap();
+        assert_eq!(plain.display_ink_headroom(16.0, 1.0, 0), 0);
     }
 }
 
@@ -390,6 +461,49 @@ fn mixed_renderer_routes_characters_across_faces() {
     assert!(primary > 0, "some letters stay on the primary face");
 }
 
+/// Ligatures on (the default) under a display face, alone or mixed, never put
+/// `.notdef` on screen: Monocraft's operator ligatures shape to glyph 0, so
+/// those runs must stay on the per-cell path and draw `=` and
+/// `>` themselves.
+#[test]
+fn display_face_operators_never_shape_to_notdef() {
+    let operators = "a => b -> c != d <= e >= f";
+    let families = DISPLAY_FACES
+        .iter()
+        .map(|face| format!("{DISPLAY_FACE_SCHEME}{}", face.id))
+        .chain([format!("{DISPLAY_FACE_SCHEME}pixel+engraved+bubble")]);
+    for family in families {
+        let mut renderer = Renderer::from_system_with_family(Some(&family), 16.0, Theme::default())
+            .unwrap_or_else(|| panic!("{family} constructs"));
+        let mut terminal = aterm_core::terminal::Terminal::new(1, operators.len() as u16);
+        terminal.process(format!("\x1b[?25l{operators}").as_bytes());
+        let input = terminal.cell_frame(1, operators.len());
+        let mut plan = Vec::new();
+        renderer.row_glyph_plan(&input, 0, &[], &mut plan);
+        for (col, glyph) in plan.iter().enumerate() {
+            let gid = match glyph {
+                aterm_render::ColumnGlyph::PerCell => continue,
+                aterm_render::ColumnGlyph::Ligated(gid)
+                | aterm_render::ColumnGlyph::LigatedSlice { gid, .. } => *gid,
+            };
+            assert_ne!(
+                gid,
+                0,
+                "{family}: column {col} ({:?}) would draw .notdef",
+                operators.as_bytes()[col] as char
+            );
+        }
+        // The per-cell glyph of every operator character is a real one.
+        for ch in ['=', '>', '-', '!', '<'] {
+            let key = renderer.glyph_key(ch);
+            assert!(
+                renderer.glyph_image(key).width() > 0,
+                "{family}: {ch:?} draws nothing"
+            );
+        }
+    }
+}
+
 /// THE LICENCE GATE, as a test as well as a build failure.
 ///
 /// `build.rs` already refuses to compile the crate when an asset in
@@ -440,8 +554,8 @@ fn every_registry_face_has_an_open_licence_notice() {
 /// holds. Every rebuild path rebuilds from a copy — `rebuild_from_admitted` goes
 /// through `shared_parsed_face`'s `Arc::from(bytes)`, `fork_semantic_surface`
 /// calls it, and the config worker copies twice more — so each silently dropped
-/// the WHOLE policy: px_scale, widest-advance cell, ink centring, embolden
-/// headroom.
+/// the WHOLE policy (then a px scale and a widest-ink cell; now the squeeze and
+/// the centring), and the weight boost with it.
 ///
 /// It was reachable in the shipped GUI through `rebuild_backend_with_prepared`,
 /// which the config/theme hot-reload calls: a user with `display_font` set got
@@ -491,12 +605,11 @@ fn the_fit_survives_a_rebuild_and_a_copy_of_the_bytes() {
 }
 
 /// A VARIATION CHANGE IS NOT AN EXCUSE TO FORGET THE FIT. `refresh_variations`
-/// re-derived the cell with the bare `cell_w_from_advance` — the one derivation
-/// that ignores FONT-DISPLAY-FIT — while every sibling site (the constructor,
-/// `set_px`, `activate_px`, both `cell_geometry` arms) goes through
-/// `fitted_cell_w`. On a fitted face it therefore threw away the widest-advance
-/// cell: measured for `engraved` at 16 px, cell 21 -> 13 against a 22 px widest
-/// raster.
+/// once re-derived the cell differently from every sibling site (the
+/// constructor, `set_px`, `activate_px`, both `cell_geometry` arms), which on
+/// the widest-ink fit of the time threw the cell away: measured for `engraved`
+/// at 16 px, cell 21 -> 13 against a 22 px widest raster. Every site now takes
+/// the same `M` cell, and the squeeze keeps a heavier instance's ink inside it.
 ///
 /// It is reachable on the one generation that carries a live fit — STARTUP:
 /// `apply_font_config_to_backend` calls `set_font_variations` immediately after
@@ -546,15 +659,14 @@ fn a_variation_change_keeps_the_fit_and_the_pure_read_agrees() {
 /// A FACE SWAP RE-PROBES THE FIT. `set_primary_font` re-probes the new bytes'
 /// ligature features, OS/2 typo metrics and decoration tables, but left
 /// `display_fit` holding the face that had just been replaced — so a swap
-/// carried the previous face's px_scale, widest-advance cell, ink centring and
-/// embolden headroom onto bytes they were never measured from.
+/// carried the previous face's fit onto bytes it was never measured from.
 ///
 /// Both directions, because the defect is symmetric and each has a distinct
-/// failure: leaving a fit behind makes the new face render at 0.87 px in a cell
-/// sized for someone else, and failing to pick one up reopens the overrun the
-/// policy exists to prevent. The comparison is against a renderer CONSTRUCTED
-/// from the same bytes, which is the definition of right here — a swap must land
-/// exactly where a fresh construction would.
+/// failure: leaving a fit behind squeezes and recentres an ordinary font, and
+/// failing to pick one up reopens the overrun the policy exists to prevent.
+/// The comparison is against a renderer CONSTRUCTED from the same bytes, which
+/// is the definition of right here — a swap must land exactly where a fresh
+/// construction would.
 #[cfg(feature = "embedded-font")]
 #[test]
 fn a_primary_swap_reprobes_the_fit_for_the_new_face() {

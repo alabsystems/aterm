@@ -33,6 +33,10 @@
 // Off Windows the resource half returns at once: no .rc, no resource compiler,
 // and NO link arg — a macOS or Linux binary is byte-identical to one built
 // without this file.
+#![allow(
+    clippy::disallowed_types,
+    reason = "never linked into the shipped binary: a build script"
+)]
 
 /// Ordinal shared by the icon and the manifest.
 ///
@@ -474,8 +478,8 @@ mod build_stamp {
     /// The git files whose change means the commit stamp may be stale, resolved
     /// through git so a linked worktree (whose `.git` is a file) and the main
     /// checkout both work. Only EXISTING paths are returned: cargo reruns a build
-    /// script on every build while a watched path is missing. Modelled on
-    /// `git_watch_paths` in crates/aterm-release/build.rs, minus the index.
+    /// script on every build while a watched path is missing. The index is not
+    /// watched: `git add` moves no commit.
     ///
     /// WHAT THIS WATCH COSTS WHEN IT IS NOT PINNED: the paths hang off the COMMON
     /// git dir, shared by every linked worktree, so a `fetch`, `gc` or `pack-refs` in

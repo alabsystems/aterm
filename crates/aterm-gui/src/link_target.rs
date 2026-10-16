@@ -876,15 +876,8 @@ mod tests {
     #[test]
     fn the_sites_own_labels_are_the_only_run_at_full_contrast() {
         for name in aterm_types::scheme::builtin_names() {
-            let parts = aterm_types::scheme::builtin(name)
-                .expect("listed scheme exists")
-                .to_theme_parts();
-            let theme = Theme {
-                fg: parts.fg,
-                bg: parts.bg,
-                cursor: parts.cursor,
-                selection: parts.selection,
-            };
+            let theme =
+                Theme::from(&aterm_types::scheme::builtin(name).expect("listed scheme exists"));
             let c = chrome_band::band_colors(theme);
             assert_ne!(
                 c.value, c.label,

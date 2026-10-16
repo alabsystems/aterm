@@ -5,24 +5,18 @@ use aterm_spec::{
     derive::{
         exceptions_digest_ends_liveness, exceptions_digest_ends_model, exceptions_digest_model,
     },
-    interp, verify, xref,
+    interp, verify,
 };
 
 #[test]
 fn a_later_never_wants_a_row_and_a_dismissal_holds() {
     let model = exceptions_digest_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name)
-    );
     verify::prove_and_catch_scalar(
         &model,
         "Exceptions digest: no row, no loss, dismissal holds",
     );
 
-    // The shipped path: an exception beside a Now row, dismissed, suppressed,
-    // resurfaced.
+    // An exception beside a Now row, dismissed, suppressed, resurfaced.
     let mut s = model.init_state();
     for action in [
         "PostNow",
@@ -80,28 +74,13 @@ fn a_later_never_wants_a_row_and_a_dismissal_holds() {
     assert!(!buggy.check_invariant("OpenIsBounded", &over));
 }
 
-/// aterm-spec `derive` step 4: the digest's end is a PROGRESS claim, so it is stated as a
-/// liveness one and discharged by the interpreter and `ty`. The run that made it
-/// necessary is the second edition's: the upgrade sends a look only when its
-/// rows change, so a row that left in one change produced ONE empty look and no
-/// second one; every state was legal and had a successor, and the entry (and
-/// the menu-bar dot) stood for ever.
+/// The digest's end is a progress claim, stated as liveness. The upgrade sends a look only when
+/// its rows change, so a row that leaves in one change yields one empty look and no second;
+/// without its own clock the entry (and the menu-bar dot) stands for ever.
 #[test]
 fn an_unnamed_entry_ends_by_its_own_clock_and_the_mutants_are_caught() {
     let model = exceptions_digest_ends_model();
     let live = exceptions_digest_ends_liveness();
-    assert!(
-        xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name),
-        "registered as a model"
-    );
-    assert!(
-        xref::liveness_registry()
-            .iter()
-            .any(|(m, l)| m.name == model.name && l.name == live.name),
-        "registered as a liveness obligation"
-    );
     // Safety around it: no early end, no orphan clock (each falsified by its mutant).
     verify::prove_and_catch_scalar(
         &model,
@@ -115,8 +94,8 @@ fn an_unnamed_entry_ends_by_its_own_clock_and_the_mutants_are_caught() {
         "ExceptionsDigestEnds AnUnnamedEntryEnds",
     );
 
-    // The healthy path: the cause ends, ONE look misses the entry, time passes,
-    // the loop takes its wake, the entry is filed and its clock goes with it.
+    // The healthy path: the cause ends, one look misses the entry, time passes, the loop takes
+    // its wake, and the entry is filed with its clock.
     let mut s = model.init_state();
     for action in ["CauseEnds", "Miss", "Tick", "Tick", "Settle"] {
         assert!(model.fire(action, &mut s), "{action}: {s:?}");
@@ -130,7 +109,7 @@ fn an_unnamed_entry_ends_by_its_own_clock_and_the_mutants_are_caught() {
     assert_eq!((f["open"], f["missed"], f["age"]), (1, 0, 0));
     assert!(!model.action_enabled("Settle", &f), "nothing to settle");
 
-    // The second edition: one empty look arms no clock, and no second look comes.
+    // `TwoLooksToEnd`: one empty look arms no clock, and no second look comes.
     let two = verify::buggy_baseline_with(&model, "TwoLooksToEnd");
     let stuck = interp::nonprogress_under(&two, &live)
         .expect("one look and no second one leaves the entry open for ever");

@@ -3,7 +3,7 @@
 
 //! The seam's constants, `_Static_assert`ed against the SDK on BOTH arches.
 //!
-//! `vendor/winit/src/platform_impl/macos/aterm_objc_seam.rs`'s `consts` module
+//! `crates/aterm-window/src/platform_impl/macos/aterm_objc_seam.rs`'s `consts` module
 //! carries AppKit and Foundation values, and its header gives the recipe:
 //!
 //! ```text
@@ -44,9 +44,8 @@ use crate::sdk_consts::{as_c_literal, green_verdict, inverted_verdict, parse_con
 ///
 /// The SDK name is written out rather than derived from the Rust name by
 /// un-snake-casing it. A derivation would be a second guess — and it would be
-/// wrong for `NS_APPKIT_VERSION_NUMBER_10_12`, `NS_CRITICAL_REQUEST` and
-/// `NS_WINDOW_ABOVE`, none of which is the mechanical camel-case of its Rust
-/// spelling.
+/// wrong for `NS_APPKIT_VERSION_NUMBER_10_12` and `NS_CRITICAL_REQUEST`, neither
+/// of which is the mechanical camel-case of its Rust spelling.
 //
 // `rustfmt::skip`, as `winit_seam.rs`'s row table does and for the same reason:
 // one row per line is what makes a lookup table checkable by eye against the
@@ -54,30 +53,11 @@ use crate::sdk_consts::{as_c_literal, green_verdict, inverted_verdict, parse_con
 #[rustfmt::skip]
 const ROWS: &[(&str, &str)] = &[
     // ---- NSWindowStyleMask ----
-    ("NS_WINDOW_STYLE_MASK_BORDERLESS", "NSWindowStyleMaskBorderless"),
     ("NS_WINDOW_STYLE_MASK_TITLED", "NSWindowStyleMaskTitled"),
     ("NS_WINDOW_STYLE_MASK_CLOSABLE", "NSWindowStyleMaskClosable"),
     ("NS_WINDOW_STYLE_MASK_MINIATURIZABLE", "NSWindowStyleMaskMiniaturizable"),
     ("NS_WINDOW_STYLE_MASK_RESIZABLE", "NSWindowStyleMaskResizable"),
-    ("NS_WINDOW_STYLE_MASK_FULL_SIZE_CONTENT_VIEW", "NSWindowStyleMaskFullSizeContentView"),
-    // ---- NSApplicationPresentationOptions ----
-    ("NS_APPLICATION_PRESENTATION_AUTO_HIDE_DOCK", "NSApplicationPresentationAutoHideDock"),
-    ("NS_APPLICATION_PRESENTATION_HIDE_DOCK", "NSApplicationPresentationHideDock"),
-    ("NS_APPLICATION_PRESENTATION_AUTO_HIDE_MENU_BAR", "NSApplicationPresentationAutoHideMenuBar"),
-    ("NS_APPLICATION_PRESENTATION_HIDE_MENU_BAR", "NSApplicationPresentationHideMenuBar"),
-    ("NS_APPLICATION_PRESENTATION_FULL_SCREEN", "NSApplicationPresentationFullScreen"),
-    // ---- NSWindowButton ----
-    ("NS_WINDOW_CLOSE_BUTTON", "NSWindowCloseButton"),
-    ("NS_WINDOW_MINIATURIZE_BUTTON", "NSWindowMiniaturizeButton"),
-    ("NS_WINDOW_ZOOM_BUTTON", "NSWindowZoomButton"),
-    ("NS_WINDOW_FULL_SCREEN_BUTTON", "NSWindowFullScreenButton"),
-    // ---- NSWindowSharingType ----
-    ("NS_WINDOW_SHARING_NONE", "NSWindowSharingNone"),
-    ("NS_WINDOW_SHARING_READ_ONLY", "NSWindowSharingReadOnly"),
     // ---- the singles ----
-    ("NS_WINDOW_TITLE_HIDDEN", "NSWindowTitleHidden"),
-    ("NS_WINDOW_TABBING_MODE_PREFERRED", "NSWindowTabbingModePreferred"),
-    ("NS_WINDOW_ABOVE", "NSWindowAbove"),
     ("NS_WINDOW_OCCLUSION_STATE_VISIBLE", "NSWindowOcclusionStateVisible"),
     // ---- NSRequestUserAttentionType ----
     ("NS_CRITICAL_REQUEST", "NSCriticalRequest"),
@@ -98,7 +78,6 @@ const ROWS: &[(&str, &str)] = &[
     ("NS_EVENT_SUBTYPE_WINDOW_EXPOSED", "NSEventSubtypeWindowExposed"),
     // ---- view.rs ----
     ("NS_EVENT_PHASE_BEGAN", "NSEventPhaseBegan"),
-    ("NS_EVENT_PHASE_CHANGED", "NSEventPhaseChanged"),
     ("NS_EVENT_PHASE_ENDED", "NSEventPhaseEnded"),
     ("NS_EVENT_PHASE_CANCELLED", "NSEventPhaseCancelled"),
     ("NS_EVENT_PHASE_MAY_BEGIN", "NSEventPhaseMayBegin"),
@@ -110,21 +89,10 @@ const ROWS: &[(&str, &str)] = &[
     ("NS_APPLICATION_ACTIVATION_POLICY_PROHIBITED", "NSApplicationActivationPolicyProhibited"),
     // ---- app.rs's swizzled -sendEvent: ----
     //
-    // The eleven `NSEventType` enumerators the fork matches on. `objc2-app-kit`
-    // generated them as a Rust `enum`; the numbering is NOT dense across the
-    // mouse types (1..7 then 25..27), which is exactly the kind of gap a
-    // transcription gets wrong and a `_Static_assert` does not.
-    ("NS_EVENT_TYPE_LEFT_MOUSE_DOWN", "NSEventTypeLeftMouseDown"),
-    ("NS_EVENT_TYPE_LEFT_MOUSE_UP", "NSEventTypeLeftMouseUp"),
-    ("NS_EVENT_TYPE_RIGHT_MOUSE_DOWN", "NSEventTypeRightMouseDown"),
-    ("NS_EVENT_TYPE_RIGHT_MOUSE_UP", "NSEventTypeRightMouseUp"),
-    ("NS_EVENT_TYPE_MOUSE_MOVED", "NSEventTypeMouseMoved"),
-    ("NS_EVENT_TYPE_LEFT_MOUSE_DRAGGED", "NSEventTypeLeftMouseDragged"),
-    ("NS_EVENT_TYPE_RIGHT_MOUSE_DRAGGED", "NSEventTypeRightMouseDragged"),
+    // The `NSEventType` enumerator the override matches on. It matched eleven
+    // until winit-core step 5 (2026-10-15) took its device-event dispatch, and
+    // the ten mouse types with it.
     ("NS_EVENT_TYPE_KEY_UP", "NSEventTypeKeyUp"),
-    ("NS_EVENT_TYPE_OTHER_MOUSE_DOWN", "NSEventTypeOtherMouseDown"),
-    ("NS_EVENT_TYPE_OTHER_MOUSE_UP", "NSEventTypeOtherMouseUp"),
-    ("NS_EVENT_TYPE_OTHER_MOUSE_DRAGGED", "NSEventTypeOtherMouseDragged"),
 ];
 
 fn repo() -> PathBuf {
@@ -132,7 +100,7 @@ fn repo() -> PathBuf {
 }
 
 fn seam() -> PathBuf {
-    repo().join("vendor/winit/src/platform_impl/macos/aterm_objc_seam.rs")
+    repo().join("crates/aterm-window/src/platform_impl/macos/aterm_objc_seam.rs")
 }
 
 /// `(name, literal)` for every `const` in the seam, at any visibility.
@@ -164,9 +132,7 @@ fn compile(arch: &str, body: &str, tag: &str) -> Result<(), String> {
 /// **No row in this seam is compound today**, so this probe is not vacuous and
 /// never has been. It would become so the moment someone writes a mask as
 /// `A | B` — which is exactly how `aterm-gui`'s twin of this file spells two of
-/// its rows, where the shape was found and MEASURED
-/// (`gui_appkit_constants::an_unparenthesised_compound_literal_would_be_vacuous`
-/// builds a wrong value both ways and proves the bare form is accepted). The
+/// its rows, where the shape was found. The
 /// parentheses and the `-Werror -Wparentheses` in [`compile`] are the fix
 /// applied here BEFORE the row that needs it exists, because a guard that only
 /// starts working after the defect lands is not a guard.
@@ -208,9 +174,16 @@ fn every_seam_constant_has_a_row_and_every_row_names_a_seam_constant() {
         "these rows name constants the seam no longer has:\n  {stale:?}"
     );
     assert_eq!(seam.len(), ROWS.len());
+    // A non-vacuity floor at the measured count: 42 when this was written, 39
+    // since winit-core step 5 (2026-10-15) carved the backend code that read
+    // seventeen of them, 34 since its window-control carve (2026-10-16) took the
+    // borderless mask, the zoom button, both sharing types and the
+    // parent-window ordering, and 29 since its exclusive-fullscreen carve took
+    // the five presentation options.
     assert!(
-        seam.len() >= 42,
-        "the seam had 42 constants when this was written"
+        seam.len() >= 29,
+        "the seam has {} constants; it had 29 when the floor was last measured",
+        seam.len()
     );
 }
 

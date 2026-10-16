@@ -1,7 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The live install-progress protocol: `progress.json` v1 + the `bump` file.
+//! The live install-progress protocol: `progress.json` v1 + the `bump` file, and the
+//! promise of a pass that has not begun yet (`pass-owed.json`, [`pass_owed`]).
 //!
 //! **This module holds the TYPES, constants and format contract only.** The writer (a
 //! `ProgressSink` threaded through `install_default_set_with_path` / `vendor_pass` /
@@ -52,7 +53,8 @@
 //!
 //! `<prefix>/bump` is the priority-queue channel: **plain text, one program name per
 //! line, append-only by writers** (stubs append the name of the program the user just
-//! ran), consumed by the installer between items. The installer reads it capped at
+//! ran — followed by [`UNATTENDED_BUMP`] when a script ran it, not a person:
+//! [`Asker`]), consumed by the installer between items. The installer reads it capped at
 //! [`BUMP_READ_CAP`] (same symlink discipline), parses each line through the
 //! `store::ToolName` gate, and **intersects with the set it already planned** from the
 //! signed index. Unknown names, installed names, removed names, garbage and oversized
@@ -166,6 +168,16 @@ pub struct ProgramProgress {
     pub error: Option<String>,
 }
 
+impl ProgramProgress {
+    /// A download whose every byte is in, waiting for the pass to stage it: the set
+    /// completion fetches archives ahead of the program it is staging. Nothing moves for it,
+    /// so a reader naming what the pass is doing now names a row that is moving first.
+    #[must_use]
+    pub fn downloaded(&self) -> bool {
+        self.phase == Phase::Download && self.bytes_total > 0 && self.bytes_done >= self.bytes_total
+    }
+}
+
 /// The `progress.json` snapshot: everything a reader needs to render the pass, in one
 /// atomically-replaced file.
 ///
@@ -194,6 +206,12 @@ pub struct ProgressFile {
     /// Unix seconds when the pass started.
     #[serde(default)]
     pub started_unix: u64,
+    /// An opaque per-pass identity, minted once and retained in the terminal
+    /// snapshot. Unix seconds alone cannot distinguish consecutive short passes.
+    /// Older writers (or unavailable OS entropy) leave this absent; readers then
+    /// require a live-pass observation instead of guessing from an ended timestamp.
+    #[serde(default)]
+    pub generation: Option<String>,
     /// Unix seconds of the last write; the staleness input for
     /// [`HEARTBEAT_STALE_SECS`]. Defaults to 0 when absent — epoch-stale, which fails
     /// to the safe "not running" state.
@@ -239,9 +257,6 @@ struct SinkState {
     /// (download → extract), while the overall bar's denominator must stay the signed
     /// asset sums the plan fixed.
     dl: BTreeMap<String, (u64, u64)>,
-    /// Which program the in-process extract loop is currently crediting (the loop
-    /// itself cannot know — see [`extract_tick`]).
-    extract_program: Option<String>,
     /// When the last snapshot hit disk — the ≤10 Hz rate cap's clock.
     last_write: Option<Instant>,
     /// Whether the snapshot changed since the last write.
@@ -255,10 +270,10 @@ struct SinkState {
 /// The live-progress writer: one per pass, held by the process with the store flock.
 ///
 /// Cheap to clone (an `Arc` over one mutex). Every mutation funnels through
-/// [`SinkState`] and lands on disk via the `status.rs` atomic temp+rename discipline,
-/// rate-capped to [`WRITE_MIN_INTERVAL_MS`] and heartbeat-refreshed at least every
-/// [`HEARTBEAT_MIN_INTERVAL_SECS`] (the download poller guarantees the cadence during
-/// long transfers).
+/// [`SinkState`] and lands on disk via the `status.rs` atomic temp+rename discipline.
+/// Ordinary meters are rate-capped to [`WRITE_MIN_INTERVAL_MS`] and heartbeat-refreshed
+/// at least every [`HEARTBEAT_MIN_INTERVAL_SECS`] (the download poller guarantees the
+/// cadence during long transfers); the plan and terminal snapshot land immediately.
 #[derive(Clone)]
 pub struct ProgressSink {
     inner: Arc<Mutex<SinkState>>,
@@ -302,6 +317,7 @@ impl ProgressSink {
                 pid: Some(std::process::id()),
                 pass: pass.to_string(),
                 started_unix: now,
+                generation: aterm_uds::rand::hex_token::<16>().ok(),
                 heartbeat_unix: now,
                 overall: Overall::default(),
                 queue: Vec::new(),
@@ -309,7 +325,6 @@ impl ProgressSink {
                 ended_unix: None,
             },
             dl: BTreeMap::new(),
-            extract_program: None,
             last_write: None,
             dirty: true,
             disabled: false,
@@ -335,30 +350,47 @@ impl ProgressSink {
 
     /// Fix the pass's plan: the queue order and each planned program's signed asset
     /// size. This is what makes the overall denominator honest and FIXED — already-
-    /// current programs are simply not in the plan and contribute zero.
-    pub fn plan(&self, planned: &[(String, u64)]) {
-        self.with(|s| {
-            s.file.queue = planned.iter().map(|(n, _)| n.clone()).collect();
-            s.file.overall.programs_total = u32::try_from(planned.len()).unwrap_or(u32::MAX);
-            let mut total = 0u64;
-            for (name, size) in planned {
-                total = total.saturating_add(*size);
-                s.dl.insert(name.clone(), (0, *size));
-                s.file.programs.insert(
-                    name.clone(),
-                    ProgramProgress {
-                        phase: Phase::Queued,
-                        bytes_done: 0,
-                        bytes_total: *size,
-                        build: None,
-                        bumped: false,
-                        error: None,
-                    },
-                );
-            }
-            s.file.overall.bytes_total = total;
-            s.dirty = true;
-        });
+    /// current programs are simply not in the plan and contribute zero. Publish
+    /// it before returning, bypassing the ordinary meter's write cap: a caller
+    /// may stop promising the pass only once its actual rows are readable.
+    /// Returns whether this publication landed.
+    pub fn plan(&self, planned: &[(String, u64)]) -> bool {
+        let Ok(mut s) = self.inner.lock() else {
+            return false;
+        };
+        s.file.queue = planned.iter().map(|(n, _)| n.clone()).collect();
+        s.file.overall.programs_total = u32::try_from(planned.len()).unwrap_or(u32::MAX);
+        let mut total = 0u64;
+        for (name, size) in planned {
+            total = total.saturating_add(*size);
+            s.dl.insert(name.clone(), (0, *size));
+            s.file.programs.insert(
+                name.clone(),
+                ProgramProgress {
+                    phase: Phase::Queued,
+                    bytes_done: 0,
+                    bytes_total: *size,
+                    build: None,
+                    bumped: false,
+                    error: None,
+                },
+            );
+        }
+        s.file.overall.bytes_total = total;
+        s.dirty = true;
+        write_now(&mut s)
+    }
+
+    /// Transfer a default-set pass's promise to its live planned rows. A stub reads
+    /// those rows from here on, including when the plan leaves its program out.
+    pub(crate) fn plan_promised_pass(
+        &self,
+        layout: &crate::store::Layout,
+        planned: &[(String, u64)],
+    ) {
+        if self.plan(planned) {
+            retire_promise(layout);
+        }
     }
 
     /// Move `program` to `phase` (label-only phases included — verify and link are
@@ -426,35 +458,30 @@ impl ProgressSink {
         });
     }
 
-    /// Begin crediting the in-process extract loop's bytes to `program` (denominator:
-    /// the signed `disk_installed` size, 0 ⇒ unmetered). See [`extract_tick`] for why
-    /// the loop cannot name the program itself.
+    /// Size `program`'s extract meter (denominator: the signed `disk_installed` size,
+    /// 0 ⇒ unmetered) as its extract begins ([`extract_scope`]).
     pub fn extract_begin(&self, program: &str, total: u64) {
         self.with(|s| {
-            s.extract_program = Some(program.to_string());
             if let Some(row) = s.file.programs.get_mut(program) {
                 row.bytes_total = total;
             }
         });
     }
 
-    /// Credit `n` freshly-extracted bytes to the current extract program, flipping its
-    /// row to [`Phase::Extract`] on the first tick (the verify→extract boundary lives
-    /// inside `verify_and_stage`, which this module deliberately does not modify — the
-    /// first written byte IS that boundary).
-    pub fn extract_add(&self, n: u64) {
+    /// Credit `n` freshly-extracted bytes to `program`, flipping its row to
+    /// [`Phase::Extract`] on the first tick (the verify→extract boundary lives inside
+    /// `verify_and_stage`, which this module deliberately does not modify — the first
+    /// written byte IS that boundary).
+    pub fn extract_add(&self, program: &str, n: u64) {
         self.with(|s| {
-            let Some(program) = s.extract_program.clone() else {
-                return;
-            };
             // A download credit for this program is complete the moment extraction
             // starts (the asset fully landed before its sha256 could pass).
-            if let Some(credit) = s.dl.get_mut(&program)
+            if let Some(credit) = s.dl.get_mut(program)
                 && credit.1 > 0
             {
                 credit.0 = credit.1;
             }
-            if let Some(row) = s.file.programs.get_mut(&program) {
+            if let Some(row) = s.file.programs.get_mut(program) {
                 if row.phase != Phase::Extract {
                     row.phase = Phase::Extract;
                     row.bytes_done = 0;
@@ -462,13 +489,6 @@ impl ProgressSink {
                 row.bytes_done = row.bytes_done.saturating_add(n);
                 s.dirty = true;
             }
-        });
-    }
-
-    /// Stop crediting the extract loop (the scope guard's other half).
-    pub fn extract_end(&self) {
-        self.with(|s| {
-            s.extract_program = None;
         });
     }
 
@@ -485,11 +505,22 @@ impl ProgressSink {
         });
     }
 
-    /// Replace the remaining-order queue (front first).
+    /// Replace the remaining-order queue (front first). A second lane may have finished
+    /// a row since the caller assembled its order: retire terminal rows under this same
+    /// lock, so reordering cannot put one back in the queue.
     pub fn queue(&self, order: &[String]) {
         self.with(|s| {
+            let order: Vec<String> = order
+                .iter()
+                .filter(|name| {
+                    !s.file.programs.get(name.as_str()).is_some_and(|row| {
+                        matches!(row.phase, Phase::Done | Phase::Failed | Phase::Skipped)
+                    })
+                })
+                .cloned()
+                .collect();
             if s.file.queue != order {
-                s.file.queue = order.to_vec();
+                s.file.queue = order;
                 s.dirty = true;
             }
         });
@@ -565,9 +596,9 @@ fn maybe_write(s: &mut SinkState) {
 /// destination is checked with `symlink_metadata` FIRST — a non-regular file at the
 /// path (symlink, FIFO) disables the sink rather than being followed or written
 /// through. Best-effort: progress is diagnostics, never load-bearing.
-fn write_now(s: &mut SinkState) {
+fn write_now(s: &mut SinkState) -> bool {
     if s.disabled {
-        return;
+        return false;
     }
     let mut done = 0u64;
     for (d, _) in s.dl.values() {
@@ -578,12 +609,12 @@ fn write_now(s: &mut SinkState) {
     match std::fs::symlink_metadata(&s.path) {
         Ok(m) if !m.file_type().is_file() => {
             s.disabled = true;
-            return;
+            return false;
         }
         _ => {}
     }
     let Ok(text) = aterm_json::to_string(&s.file) else {
-        return;
+        return false;
     };
     let tmp = s
         .path
@@ -591,8 +622,10 @@ fn write_now(s: &mut SinkState) {
     if std::fs::write(&tmp, text).is_ok() && std::fs::rename(&tmp, &s.path).is_ok() {
         s.last_write = Some(Instant::now());
         s.dirty = false;
+        true
     } else {
         let _ = std::fs::remove_file(&tmp);
+        false
     }
 }
 
@@ -857,10 +890,11 @@ static GLOBAL_ENABLED: AtomicBool = AtomicBool::new(false);
 /// diagnostics.
 ///
 /// Thread affinity is truthful, not defensive convenience: a real pass runs the
-/// whole install pipeline on the one thread that holds the store flock (the `.part`
-/// pollers carry their own sink clone and never come back through here), so
-/// [`active`] answering only that thread costs production nothing — and keeps a
-/// concurrently-running test's installs from crediting a pass they are not part of.
+/// install pipeline on the thread that holds the store flock (the `.part` pollers carry
+/// their own sink clone and never come back through here), and a lane thread it starts
+/// inside the pass is handed the pass explicitly ([`lend`]), so [`active`] answering
+/// only those threads costs production nothing — and keeps a concurrently-running test's
+/// installs from crediting a pass they are not part of.
 pub fn begin_pass(path: &Path, pass: &str) -> bool {
     let Ok(mut g) = GLOBAL_SINK.lock() else {
         return false;
@@ -897,18 +931,63 @@ pub fn end_pass() {
     }
 }
 
-/// The live pass's sink — for the OWNING thread only (see [`begin_pass`]). One
-/// relaxed load answers "no pass anywhere" for free.
+/// The live pass's sink — for the OWNING thread (see [`begin_pass`]), and for a lane
+/// thread that owner started and LENT it to ([`lend`]). One relaxed load answers "no pass
+/// anywhere" for free.
 #[must_use]
 pub fn active() -> Option<ProgressSink> {
     if !GLOBAL_ENABLED.load(Ordering::Acquire) {
         return None;
     }
-    GLOBAL_SINK.lock().ok().and_then(|g| {
-        g.as_ref().and_then(|(sink, owner, _)| {
-            (*owner == std::thread::current().id()).then(|| sink.clone())
+    GLOBAL_SINK
+        .lock()
+        .ok()
+        .and_then(|g| {
+            g.as_ref().and_then(|(sink, owner, _)| {
+                (*owner == std::thread::current().id()).then(|| sink.clone())
+            })
         })
-    })
+        .or_else(|| LENT.with(|lent| lent.borrow().clone()))
+}
+
+thread_local! {
+    /// The pass a lane thread was lent ([`Lent::adopt`]): what [`active`] answers on it.
+    static LENT: std::cell::RefCell<Option<ProgressSink>> = const { std::cell::RefCell::new(None) };
+    /// The program THIS thread's extract loop credits ([`extract_scope`]): two lanes of one
+    /// pass extract at once, each into its own row.
+    static EXTRACTING: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The live pass, as its owning thread hands it to a lane thread it starts — one that lands
+/// programs beside the owner's own, inside the pass and under its store lock. Empty when no
+/// pass is live, or off the owning thread.
+#[derive(Clone)]
+pub struct Lent(Option<ProgressSink>);
+
+/// On the pass-owning thread: the live pass, to lend a lane thread ([`Lent::adopt`]).
+#[must_use]
+pub fn lend() -> Lent {
+    Lent(active())
+}
+
+impl Lent {
+    /// Credit this thread's flow hooks to the lent pass until the guard drops. The owner
+    /// joins the thread before it ends the pass, and an ended pass is credited by no one
+    /// ([`active`]'s first load).
+    #[must_use]
+    pub fn adopt(self) -> Adopted {
+        LENT.with(|lent| *lent.borrow_mut() = self.0);
+        Adopted(())
+    }
+}
+
+/// Ends a lane thread's adoption of a lent pass on drop ([`Lent::adopt`]).
+pub struct Adopted(());
+
+impl Drop for Adopted {
+    fn drop(&mut self) {
+        LENT.with(|lent| *lent.borrow_mut() = None);
+    }
 }
 
 /// The live pass's snapshot, from ANY thread — [`active`] answers only the pass's own
@@ -940,23 +1019,37 @@ pub fn note_build(program: &str, build: u64) {
     }
 }
 
-/// Flow hook: credit `n` extracted bytes to the current extract program. Called from
-/// `write_capped`'s 64 KiB loop — the one in-process byte loop — so the disabled
-/// path must stay one atomic load.
+/// Flow hook: `program`'s download of `total` signed bytes is complete, and its row waits
+/// for the stage at that whole size ([`ProgramProgress::downloaded`]) — the set completion's
+/// download-ahead lane finishes archives the pass reaches later.
+pub fn note_downloaded(program: &str, total: u64) {
+    if let Some(sink) = active() {
+        sink.download_bytes(program, total, total);
+    }
+}
+
+/// Flow hook: credit `n` extracted bytes to this thread's extract program (the loop
+/// itself cannot name it). Called from `write_capped`'s 64 KiB loop — the one in-process
+/// byte loop — so the disabled path must stay one atomic load.
 pub fn extract_tick(n: u64) {
     if !GLOBAL_ENABLED.load(Ordering::Relaxed) {
         return;
     }
     if let Some(sink) = active() {
-        sink.extract_add(n);
+        EXTRACTING.with(|program| {
+            if let Some(program) = program.borrow().as_deref() {
+                sink.extract_add(program, n);
+            }
+        });
     }
 }
 
-/// Flow hook: scope guard crediting the extract loop to `program` while alive.
+/// Flow hook: scope guard crediting this thread's extract loop to `program` while alive.
 #[must_use]
 pub fn extract_scope(program: &str, total: u64) -> ExtractScope {
     if let Some(sink) = active() {
         sink.extract_begin(program, total);
+        EXTRACTING.with(|current| *current.borrow_mut() = Some(program.to_string()));
         ExtractScope { live: true }
     } else {
         ExtractScope { live: false }
@@ -971,10 +1064,8 @@ pub struct ExtractScope {
 
 impl Drop for ExtractScope {
     fn drop(&mut self) {
-        if self.live
-            && let Some(sink) = active()
-        {
-            sink.extract_end();
+        if self.live {
+            EXTRACTING.with(|current| *current.borrow_mut() = None);
         }
     }
 }
@@ -1092,41 +1183,12 @@ pub fn pass_running(layout: &crate::store::Layout, now_unix: u64) -> bool {
     read_progress(layout).is_some_and(|file| snapshot_running(&file, now_unix))
 }
 
-/// Best-effort pid liveness: ONE `kill(pid, 0)` — no signal is delivered, the kernel
-/// only answers whether the pid is addressable.
-///
-/// This used to fork `/bin/kill -0 <pid>` and wait for it, "keeping atpkg's non-test
-/// code `unsafe`-free". That reason had already lapsed — this very file calls
-/// `libc::poll` and `libc::dup2` a few hundred lines up — while the cost was real and
-/// repeated: [`snapshot_running`] runs on every `__pending` stub invocation while a pass is live,
-/// and the GUI tailer's foreign-pid probe calls it every 2 s for as long as ANOTHER
-/// installer holds the store lock (a multi-GB pass queued behind `--wait-lock` for 40
-/// minutes = ~1200 fork+execs on a GUI worker thread) to learn a fact one syscall
-/// returns in microseconds.
-///
-/// `ESRCH` is the only "no". A pid we may not signal (`EPERM` — a pass owned by another
-/// user, e.g. one run under `sudo`) EXISTS, and the subprocess spelling used to read it
-/// as a DEAD installer because `/bin/kill` exits non-zero there. A pid wider than
-/// `pid_t` cannot name a process and stays dead, as it read before. Any other errno —
-/// the probe could not answer — still falls back to `true`: the heartbeat window is the
-/// authoritative staleness gate and covers that case within [`HEARTBEAT_STALE_SECS`].
+/// Shared kernel pid liveness: Unix signal-zero and Windows process-handle probes
+/// both distinguish a dead owner from an existing process we may not query. A
+/// promise ends with its owner on either platform, without spawning a child.
 #[must_use]
 pub(crate) fn pid_alive(pid: u32) -> bool {
-    #[cfg(unix)]
-    {
-        let Ok(pid) = libc::pid_t::try_from(pid) else {
-            return false;
-        };
-        // SAFETY: `kill` with signal 0 delivers nothing and touches no memory of ours;
-        // it only asks the kernel whether the pid is addressable.
-        let rc = unsafe { libc::kill(pid, 0) };
-        rc == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        true
-    }
+    aterm_uds::process::pid_alive(pid)
 }
 
 /// Strip control characters (terminal escape-sequence injection) and cap length
@@ -1145,14 +1207,38 @@ pub fn sanitize_for_tty(s: &str, cap: usize) -> String {
     out
 }
 
-/// Append `program` to `<prefix>/bump` — the stub's whole write privilege. The path
-/// is refused unless absent or a regular non-link file (`symlink_metadata` before
-/// open, `O_NOFOLLOW` on the open itself where the OS has it), and the name arrives
+/// Who asked for a program the bump file names ([`append_bump`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Asker {
+    /// A person at a terminal: the stub's stdin and stderr are both terminals. A plain name
+    /// line, the only line the file ever held, so an older reader and an older writer agree.
+    Person,
+    /// A script, a pipe or an agent's tool call: the name and [`UNATTENDED_BUMP`] on one
+    /// line. An older reader takes the line for a name no pass plans, and ignores it.
+    Script,
+}
+
+/// What follows a name on a bump line written for a script ([`Asker::Script`]).
+pub const UNATTENDED_BUMP: &str = " unattended";
+
+/// One program the bump file asks for, in first-mention order ([`read_bumps`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Bump {
+    /// The admitted program name.
+    pub program: String,
+    /// Whether a person asked for it on any of its lines ([`Asker::Person`]).
+    pub person: bool,
+}
+
+/// Append `program` to `<prefix>/bump` — the stub's whole write privilege — as `asker`'s
+/// line. The path is refused unless absent or a regular non-link file (`symlink_metadata`
+/// before open, `O_NOFOLLOW` on the open itself where the OS has it), and the name arrives
 /// as an already-admitted [`crate::store::ToolName`] so nothing shim-refused can be
 /// written. Append-only: the installer is the only consumer and deleter.
 pub fn append_bump(
     layout: &crate::store::Layout,
     program: &crate::store::ToolName,
+    asker: Asker,
 ) -> std::io::Result<()> {
     // A machine whose prefix does not exist yet still gets its wish recorded — the
     // very first provisioning pass is exactly the one a fresh install's bump should
@@ -1179,39 +1265,196 @@ pub fn append_bump(
     let mut f = opts.open(&path)?;
     use std::io::Write as _;
     let mut line = String::from(program.as_str());
+    if asker == Asker::Script {
+        line.push_str(UNATTENDED_BUMP);
+    }
     line.push('\n');
     f.write_all(line.as_bytes())
 }
 
-/// Read the bump file's admitted names, in file order, first mention wins:
-/// size-capped ([`BUMP_READ_CAP`], oversize ⇒ absent), symlink-refusing, each line
-/// gated through [`crate::store::ToolName`]. Garbage lines are ignored. The caller
-/// STILL intersects with its own planned work — this returns candidate names, never
-/// authority.
+/// Read the bump file's admitted names, in file order, first mention wins, each with
+/// whether a person asked for it on any line: size-capped ([`BUMP_READ_CAP`], oversize ⇒
+/// absent), symlink-refusing, each name gated through [`crate::store::ToolName`]. Garbage
+/// lines are ignored. The caller STILL intersects with its own planned work — this
+/// returns candidate names, never authority.
 #[must_use]
-pub fn read_bump(layout: &crate::store::Layout) -> Vec<String> {
+pub fn read_bumps(layout: &crate::store::Layout) -> Vec<Bump> {
     let cap = usize::try_from(BUMP_READ_CAP).unwrap_or(usize::MAX);
     let Ok(text) = crate::metadata_io::read_bounded_regular_utf8(&layout.bump_file(), cap) else {
         return Vec::new();
     };
-    let mut out: Vec<String> = Vec::new();
+    let mut out: Vec<Bump> = Vec::new();
     for line in text.lines() {
         let line = line.trim();
-        if line.is_empty() {
+        let (name, person) = match line.strip_suffix(UNATTENDED_BUMP) {
+            Some(name) => (name.trim_end(), false),
+            None => (line, true),
+        };
+        if name.is_empty() {
             continue;
         }
-        if let Some(tool) = crate::store::ToolName::new(line)
-            && !out.iter().any(|n| n == tool.as_str())
-        {
-            out.push(tool.as_str().to_string());
+        let Some(tool) = crate::store::ToolName::new(name) else {
+            continue;
+        };
+        match out.iter_mut().find(|b| b.program == tool.as_str()) {
+            Some(seen) => seen.person |= person,
+            None => out.push(Bump {
+                program: tool.as_str().to_string(),
+                person,
+            }),
         }
     }
     out
 }
 
+/// The bump file's admitted names, whoever asked ([`read_bumps`]): what reorders a pass's
+/// remaining work and wakes a window's pass.
+#[must_use]
+pub fn read_bump(layout: &crate::store::Layout) -> Vec<String> {
+    read_bumps(layout).into_iter().map(|b| b.program).collect()
+}
+
 /// Delete the bump file — the clean-pass-end consumption step.
 pub fn clear_bump(layout: &crate::store::Layout) {
     let _ = std::fs::remove_file(layout.bump_file());
+}
+
+// ---------------------------------------------------------------------------
+// The promise: `pass-owed.json`.
+//
+// `progress.json` appears only once a pass begins, seconds into a first launch: the
+// window's seed lays the pending stubs and the shell hooks within milliseconds, and the
+// update it spawns next resolves the index and plans before it writes a plan. A stub run
+// in between used to find nothing installing and exit 127. The promise says a default-set
+// pass is coming and has not planned yet: written under the store lock by whoever knows
+// it is owed — the window's seed on a first run, its process the owner; a whole update
+// that completes the set on a first install or over a promise it finds, itself the owner —
+// and retired by that update once its plan lands or it ends (an update retires only its own
+// promise or its spawner's, [`retire_promise_of`]). A promise names a deadline and an owner
+// — its pid and, where it can be read, its start time — and lapses at either. No
+// other reader looks at it: to every `progress.json` reader nothing is running until the
+// pass begins.
+// ---------------------------------------------------------------------------
+
+/// Read cap for `pass-owed.json`; a larger file reads as no promise.
+pub const PROMISE_READ_CAP: usize = 1024;
+
+/// How long the window's seed promises the update it spawns next (the login shell's PATH
+/// is that update's only wait, five seconds at most).
+pub const SEED_PROMISE_SECS: u64 = 60;
+
+/// How long a whole update promises its own plan: its index resolve, vendor lane and
+/// manifest prefetch come first. It retires the promise itself, and its death breaks it —
+/// a pid a crash freed for another process included ([`PassPromise::born`]) — so this bounds
+/// only an owner that hangs before it plans, or one whose start time no reader could read.
+pub const PASS_PROMISE_SECS: u64 = 10 * 60;
+
+/// `pass-owed.json`: the process the promise rides on and when it lapses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PassPromise {
+    /// Schema version ([`PROGRESS_VERSION`]); any other reads as no promise.
+    pub v: u32,
+    /// The pid whose death breaks the promise: the window that will spawn the pass, or
+    /// the pass itself.
+    pub owner: u32,
+    /// Unix seconds after which the promise is broken.
+    pub until_unix: u64,
+    /// The owner's start time as the writer read it ([`crate::platform::process_birth`]): a
+    /// process that took over the pid of an owner that died does not keep the promise. A
+    /// field an older reader ignores, so it keeps reading the promise by the pid alone; a
+    /// promise without it (an older writer's, or one whose writer could not read it) is read
+    /// that way too, and so is one whose READER cannot ([`same_owner`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub born: Option<u64>,
+}
+
+/// Promise a default-set pass on `layout`'s store until `owner` dies or `secs` pass. The
+/// caller holds the store lock. Lands atomically (temp + rename, `0600`), never through a
+/// symlink or anything else that is not a regular file. Best-effort: a promise that
+/// cannot be written leaves a stub where it was before (exit 127).
+pub fn promise_pass(layout: &crate::store::Layout, owner: u32, secs: u64) {
+    let path = layout.pass_owed_file();
+    if std::fs::symlink_metadata(&path).is_ok_and(|m| !m.file_type().is_file()) {
+        return;
+    }
+    let promise = PassPromise {
+        v: PROGRESS_VERSION,
+        owner,
+        until_unix: unix_now().saturating_add(secs),
+        born: crate::platform::process_birth(owner).at(),
+    };
+    let Ok(text) = aterm_json::to_string(&promise) else {
+        return;
+    };
+    let tmp = path.with_file_name(format!("pass-owed.json.tmp-{}", std::process::id()));
+    // Only a newly created temp belongs to this call. A colliding entry may be
+    // a FIFO or a hardlink to unrelated metadata; never open or remove it.
+    let Ok(mut file) = crate::platform::create_private_new(&tmp) else {
+        return;
+    };
+    use std::io::Write as _;
+    let wrote = file.write_all(text.as_bytes());
+    drop(file);
+    if wrote.is_err() || std::fs::rename(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// Retire the promise: the pass it was for has planned, or ended.
+pub fn retire_promise(layout: &crate::store::Layout) {
+    let _ = std::fs::remove_file(layout.pass_owed_file());
+}
+
+/// Retire the promise only when one of `holders` owns it: an update ending retires the
+/// promise it wrote, or the seed's of the window that spawned it — never one another
+/// window's seed wrote for the update that window spawns next. The caller holds the store
+/// lock, as every writer does, so nothing replaces the file between the read and the
+/// removal. An unreadable promise is left as it is (it promises nothing).
+pub fn retire_promise_of(layout: &crate::store::Layout, holders: &[u32]) {
+    if read_promise(layout).is_some_and(|promise| holders.contains(&promise.owner)) {
+        retire_promise(layout);
+    }
+}
+
+/// `pass-owed.json` as written, bounded and symlink-refusing ([`PROMISE_READ_CAP`]).
+fn read_promise(layout: &crate::store::Layout) -> Option<PassPromise> {
+    let text =
+        crate::metadata_io::read_bounded_regular_utf8(&layout.pass_owed_file(), PROMISE_READ_CAP)
+            .ok()?;
+    aterm_json::from_str::<PassPromise>(&text).ok()
+}
+
+/// Whether a promised pass is still coming at `now_unix`: a readable promise (bounded,
+/// symlink-refusing, [`PROMISE_READ_CAP`]) whose deadline has not passed — nor lies
+/// further ahead than any writer promises, a clock that stepped back — and whose owner is
+/// alive ([`pid_alive`]) and, when the writer read its start time, the same process that
+/// wrote it ([`same_owner`]): a pid a crash freed and another process took promises nothing.
+#[must_use]
+pub fn pass_owed(layout: &crate::store::Layout, now_unix: u64) -> bool {
+    let Some(promise) = read_promise(layout) else {
+        return false;
+    };
+    promise.v == PROGRESS_VERSION
+        && now_unix <= promise.until_unix
+        && promise.until_unix <= now_unix.saturating_add(PASS_PROMISE_SECS)
+        && pid_alive(promise.owner)
+        && same_owner(promise.born, crate::platform::process_birth(promise.owner))
+}
+
+/// Whether the process under a promise's owner pid, whose start time reads `now`, is the one
+/// the writer read as `born`: no recorded start time ⇒ the pid alone answers; another start
+/// time, or nothing under the pid (a zombie), ⇒ another process, or none; a start time the
+/// reader cannot read — a stub run in a sandbox that denies process-info, where `kill(pid, 0)`
+/// still answers ([`pid_alive`]) — says nothing, and the pid alone answers, as it does for
+/// `EPERM` there. Pure for the test.
+#[must_use]
+pub fn same_owner(born: Option<u64>, now: crate::platform::Birth) -> bool {
+    use crate::platform::Birth;
+    match (born, now) {
+        (None, _) | (Some(_), Birth::Unreadable) => true,
+        (Some(born), Birth::At(now)) => born == now,
+        (Some(_), Birth::Gone) => false,
+    }
 }
 
 #[cfg(test)]
@@ -1286,6 +1529,10 @@ mod tests {
 }
 
 #[cfg(test)]
+#[path = "progress_plan_publication_tests.rs"]
+mod plan_publication_tests;
+
+#[cfg(test)]
 mod writer_tests {
     use super::*;
 
@@ -1350,12 +1597,14 @@ mod writer_tests {
         let l = layout("finish");
         let path = l.progress_file();
         let sink = ProgressSink::create(&path, "net").unwrap();
+        let generation = read_file(&path).generation.expect("this pass is tagged");
         sink.plan(&[("ty".into(), 7)]);
         sink.finished("ty", Phase::Done, None);
         sink.finish();
         let file = read_file(&path);
         assert_eq!(file.pid, None, "a clean end clears the pid");
         assert!(file.ended_unix.is_some());
+        assert_eq!(file.generation.as_deref(), Some(generation.as_str()));
         assert_eq!(file.programs["ty"].phase, Phase::Done);
         assert_eq!(file.overall.programs_done, 1);
         assert!(file.queue.is_empty(), "a finished program leaves the queue");
@@ -1537,9 +1786,9 @@ mod writer_tests {
         let l = layout("bump");
         let trust = crate::store::ToolName::new("trust").unwrap();
         let ty = crate::store::ToolName::new("ty").unwrap();
-        append_bump(&l, &trust).unwrap();
-        append_bump(&l, &ty).unwrap();
-        append_bump(&l, &trust).unwrap(); // duplicate: first mention wins
+        append_bump(&l, &trust, Asker::Person).unwrap();
+        append_bump(&l, &ty, Asker::Person).unwrap();
+        append_bump(&l, &trust, Asker::Person).unwrap(); // duplicate: first mention wins
         assert_eq!(read_bump(&l), vec!["trust".to_string(), "ty".to_string()]);
         // Garbage lines: ignored, never a crash, never a name.
         std::fs::write(l.bump_file(), "sudo\n../evil\na/b\ntrust\n\n").unwrap();
@@ -1556,6 +1805,37 @@ mod writer_tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
+    /// A script's bump names its program as a person's does, for every reader that orders
+    /// work by it, and says nobody at a terminal asked: a person's line for the same name,
+    /// before or after it, makes it a person's. A line an older writer wrote is a person's.
+    #[test]
+    fn a_bump_says_whether_a_person_asked() {
+        let l = layout("bump-asker");
+        let codex = crate::store::ToolName::new("codex").unwrap();
+        let claude = crate::store::ToolName::new("claude").unwrap();
+        append_bump(&l, &codex, Asker::Script).unwrap();
+        append_bump(&l, &claude, Asker::Person).unwrap();
+        assert_eq!(bump_contents(&l), "codex unattended\nclaude\n");
+        assert_eq!(read_bump(&l), ["codex", "claude"]);
+        let bump = |program: &str, person| Bump {
+            program: program.to_string(),
+            person,
+        };
+        assert_eq!(read_bumps(&l), [bump("codex", false), bump("claude", true)]);
+        append_bump(&l, &codex, Asker::Person).unwrap();
+        append_bump(&l, &claude, Asker::Script).unwrap();
+        assert_eq!(
+            read_bumps(&l),
+            [bump("codex", true), bump("claude", true)],
+            "a person's line makes it a person's, in first-mention order"
+        );
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    fn bump_contents(l: &crate::store::Layout) -> String {
+        std::fs::read_to_string(l.bump_file()).unwrap_or_default()
+    }
+
     /// Symlink refusal on the bump paths (unix): append refuses, read refuses.
     #[cfg(unix)]
     #[test]
@@ -1566,7 +1846,7 @@ mod writer_tests {
         std::os::unix::fs::symlink(&victim, l.bump_file()).unwrap();
         let trust = crate::store::ToolName::new("trust").unwrap();
         assert!(
-            append_bump(&l, &trust).is_err(),
+            append_bump(&l, &trust, Asker::Person).is_err(),
             "append must not follow a link"
         );
         assert!(read_bump(&l).is_empty(), "read must not follow a link");
@@ -1588,8 +1868,8 @@ mod writer_tests {
     /// cannot come back inside this test at all, and one that wakes the thread
     /// comes back however loaded the machine is. The stopwatch this replaced —
     /// four drops under 80 ms, `end_pass` under 150 ms — timed two thread wakes
-    /// per drop and an APFS write+rename as much as the stop, and a loaded gate
-    /// failed a correct `end_pass` at 220 ms (e65705bf2) against a regression
+    /// per drop and an APFS write+rename as much as the stop, and a loaded machine
+    /// failed a correct `end_pass` at 220 ms against a regression
     /// worth ~250 ms: no clock separates the two. The 60 s below is only the
     /// fail-safe for that hour: a regression fails there, a slow machine never
     /// does. That no tick lands after the terminal snapshot is structural:
@@ -1685,6 +1965,269 @@ mod writer_tests {
         assert_eq!(ended.pid, None);
         assert!(!snapshot_running(&ended, unix_now()));
         let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// A LANE THREAD CREDITS THE PASS IT WAS LENT, and no other thread does: `active`
+    /// answers the owner and the thread that adopted the pass, never a bystander. Two lanes
+    /// extracting at once each credit their own row — one pass-wide extract slot handed
+    /// both lanes' bytes to whichever began last.
+    #[test]
+    fn a_lent_pass_credits_its_lane_and_each_lane_extracts_into_its_own_row() {
+        let _gate = PASS_TEST_GATE.lock().unwrap_or_else(|e| e.into_inner());
+        let l = layout("lent");
+        assert!(begin_pass(&l.progress_file(), "net"));
+        active()
+            .expect("the owner")
+            .plan(&[("codex".to_string(), 10), ("trust".to_string(), 10)]);
+        let both_open = std::sync::Barrier::new(2);
+        let both_ticked = std::sync::Barrier::new(2);
+        std::thread::scope(|s| {
+            assert!(
+                s.spawn(|| active().is_none()).join().unwrap(),
+                "a thread nobody lent the pass credits nothing"
+            );
+            let lent = lend();
+            let (both_open, both_ticked) = (&both_open, &both_ticked);
+            let lane = s.spawn(move || {
+                let _adopted = lent.adopt();
+                let _codex = extract_scope("codex", 100);
+                both_open.wait();
+                extract_tick(7);
+                both_ticked.wait();
+            });
+            let _trust = extract_scope("trust", 100);
+            both_open.wait();
+            extract_tick(3);
+            both_ticked.wait();
+            lane.join().unwrap();
+        });
+        let file = live_snapshot().expect("the pass is live");
+        end_pass();
+        let credited = |p: &str| (file.programs[p].phase, file.programs[p].bytes_done);
+        assert_eq!(credited("codex"), (Phase::Extract, 7));
+        assert_eq!(credited("trust"), (Phase::Extract, 3));
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// The promise holds while its owner lives and its deadline is ahead, and not a moment
+    /// longer: retired, past its deadline, from a clock that stepped back (a deadline
+    /// further ahead than any writer promises), of another version, oversized or malformed,
+    /// it promises nothing. It lands `0600`, and never through a symlink.
+    #[test]
+    fn a_promise_holds_only_while_its_owner_lives_and_its_deadline_is_ahead() {
+        let l = layout("promise");
+        let now = unix_now();
+        let me = std::process::id();
+        assert!(!pass_owed(&l, now), "no promise");
+        promise_pass(&l, me, SEED_PROMISE_SECS);
+        let written: PassPromise =
+            aterm_json::from_str(&std::fs::read_to_string(l.pass_owed_file()).unwrap()).unwrap();
+        assert_eq!(written.owner, me);
+        assert!(
+            (now + SEED_PROMISE_SECS..=unix_now() + SEED_PROMISE_SECS)
+                .contains(&written.until_unix),
+            "{written:?}"
+        );
+        assert!(pass_owed(&l, now), "a live owner, a deadline ahead");
+        assert!(pass_owed(&l, written.until_unix), "up to the deadline");
+        assert!(!pass_owed(&l, written.until_unix + 1), "not past it");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(l.pass_owed_file())
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        retire_promise(&l);
+        assert!(!pass_owed(&l, now), "retired");
+        let write = |body: String| std::fs::write(l.pass_owed_file(), body).unwrap();
+        write(format!(
+            "{{\"v\":1,\"owner\":{me},\"until_unix\":{}}}",
+            now + PASS_PROMISE_SECS + 60
+        ));
+        assert!(!pass_owed(&l, now), "a deadline no writer promises");
+        write(format!(
+            "{{\"v\":2,\"owner\":{me},\"until_unix\":{}}}",
+            now + 5
+        ));
+        assert!(!pass_owed(&l, now), "another version");
+        write("{not json".to_string());
+        assert!(!pass_owed(&l, now), "malformed");
+        write(" ".repeat(PROMISE_READ_CAP + 1));
+        assert!(!pass_owed(&l, now), "oversized");
+        #[cfg(unix)]
+        {
+            let victim = l.prefix.join("victim.json");
+            let honest = format!("{{\"v\":1,\"owner\":{me},\"until_unix\":{}}}", now + 5);
+            std::fs::write(&victim, &honest).unwrap();
+            let _ = std::fs::remove_file(l.pass_owed_file());
+            std::os::unix::fs::symlink(&victim, l.pass_owed_file()).unwrap();
+            assert!(!pass_owed(&l, now), "a symlink is never followed");
+            promise_pass(&l, me, SEED_PROMISE_SECS);
+            assert_eq!(
+                std::fs::read_to_string(&victim).unwrap(),
+                honest,
+                "nor written through"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// A promise records its owner's start time, and a process that took over the owner's
+    /// pid — another start time — keeps nothing: the stub stops waiting for a pass that is
+    /// not coming. A promise with no start time (an older writer's) is read by the pid alone.
+    #[test]
+    fn a_promise_ends_when_its_owners_pid_is_another_process() {
+        let l = layout("promise-born");
+        let now = unix_now();
+        let me = std::process::id();
+        promise_pass(&l, me, SEED_PROMISE_SECS);
+        let written: PassPromise =
+            aterm_json::from_str(&std::fs::read_to_string(l.pass_owed_file()).unwrap()).unwrap();
+        if cfg!(any(target_os = "macos", target_os = "linux")) {
+            assert_eq!(written.born, crate::platform::process_birth(me).at());
+            assert!(written.born.is_some(), "{written:?}");
+        }
+        assert!(pass_owed(&l, now), "its writer's own process");
+        if let Some(born) = written.born {
+            let reused = PassPromise {
+                born: Some(born + 1),
+                ..written.clone()
+            };
+            std::fs::write(l.pass_owed_file(), aterm_json::to_string(&reused).unwrap()).unwrap();
+            assert!(!pass_owed(&l, now), "the same pid, another process");
+        }
+        std::fs::write(
+            l.pass_owed_file(),
+            format!("{{\"v\":1,\"owner\":{me},\"until_unix\":{}}}", now + 5),
+        )
+        .unwrap();
+        assert!(pass_owed(&l, now), "no start time: the pid alone");
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// The owner's start time decides only when the reader can read it: another start time,
+    /// or nothing under the pid, breaks the promise; a start time the kernel will not give
+    /// this reader (a sandbox denying process-info) leaves the pid to answer, as a promise
+    /// recorded without one does.
+    #[test]
+    fn an_owner_start_time_the_reader_cannot_read_leaves_the_pid_to_answer() {
+        use crate::platform::Birth;
+        assert!(same_owner(Some(7), Birth::At(7)), "the owner it recorded");
+        assert!(!same_owner(Some(7), Birth::At(8)), "another process");
+        assert!(!same_owner(Some(7), Birth::Gone), "none: a zombie");
+        assert!(
+            same_owner(Some(7), Birth::Unreadable),
+            "the reader cannot say"
+        );
+        for now in [Birth::At(8), Birth::Gone, Birth::Unreadable] {
+            assert!(same_owner(None, now), "no start time recorded: {now:?}");
+        }
+    }
+
+    /// An update ending retires only a promise its own process or its spawner holds: a
+    /// promise another window's seed wrote stays for the update that window spawns.
+    #[test]
+    fn a_promise_is_retired_only_by_its_holders() {
+        let l = layout("promise-holders");
+        let me = std::process::id();
+        promise_pass(&l, me, SEED_PROMISE_SECS);
+        retire_promise_of(&l, &[me.wrapping_add(1)]);
+        assert!(
+            pass_owed(&l, unix_now()),
+            "another holder's ending leaves it"
+        );
+        retire_promise_of(&l, &[me.wrapping_add(1), me]);
+        assert!(
+            !l.pass_owed_file().exists(),
+            "its holder's ending retires it"
+        );
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_promise_does_not_publish_a_preexisting_fifo_temp() {
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::{FileTypeExt as _, OpenOptionsExt as _};
+
+        let l = layout("promise-fifo-temp");
+        promise_pass(&l, std::process::id(), SEED_PROMISE_SECS);
+        let path = l.pass_owed_file();
+        let before = std::fs::read(&path).unwrap();
+        let tmp = path.with_file_name(format!("pass-owed.json.tmp-{}", std::process::id()));
+        let fifo = std::ffi::CString::new(tmp.as_os_str().as_bytes()).unwrap();
+        // SAFETY: the path is NUL-terminated and belongs to this private fixture.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        // Keep both ends open so even the defective writer returns without waiting.
+        let _fifo = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(&tmp)
+            .unwrap();
+
+        promise_pass(&l, std::process::id(), PASS_PROMISE_SECS);
+
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_file(),
+            "a colliding FIFO must not replace the regular promise"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(
+            pass_owed(&l, unix_now()),
+            "the original promise remains live"
+        );
+        assert!(
+            std::fs::symlink_metadata(&tmp)
+                .unwrap()
+                .file_type()
+                .is_fifo()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_promise_does_not_truncate_a_preexisting_hardlinked_temp() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let l = layout("promise-hardlink-temp");
+        promise_pass(&l, std::process::id(), SEED_PROMISE_SECS);
+        let path = l.pass_owed_file();
+        let before = std::fs::read(&path).unwrap();
+        let victim = l.prefix.join("other-metadata");
+        std::fs::write(&victim, b"preserve this metadata").unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let tmp = path.with_file_name(format!("pass-owed.json.tmp-{}", std::process::id()));
+        std::fs::hard_link(&victim, &tmp).unwrap();
+
+        promise_pass(&l, std::process::id(), PASS_PROMISE_SECS);
+
+        assert_eq!(std::fs::read(&victim).unwrap(), b"preserve this metadata");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(tmp.exists(), "an unowned colliding entry is left untouched");
+
+        // With no collision, an ordinary refresh still replaces the promise.
+        std::fs::remove_file(&tmp).unwrap();
+        promise_pass(&l, std::process::id(), PASS_PROMISE_SECS);
+        let refreshed: PassPromise =
+            aterm_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(
+            refreshed.until_unix
+                > aterm_json::from_slice::<PassPromise>(&before)
+                    .unwrap()
+                    .until_unix
+        );
+        assert!(pass_owed(&l, unix_now()));
     }
 
     #[test]

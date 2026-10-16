@@ -97,8 +97,8 @@ fn the_gate_admits_exactly_what_the_ladder_owes() {
                     expected,
                     "{mode:?} {phase:?} with {facts:?} disagreed with the rule"
                 );
-                // And the park's refusal is the ENTRY's refusal, word for
-                // word: one predicate, two instants.
+                // And the park's refusal is the entry's, word for word: one predicate, two
+                // instants.
                 if mode.is_automatic() && facts.masters_quiet {
                     let entry = automatic_park_refusal(phase, a);
                     match gate(facts) {
@@ -189,9 +189,8 @@ fn a_keystroke_inside_the_typing_gap_holds_every_automatic_phase_but_land() {
     );
 }
 
-/// An agent streaming into a focused pane, never pausing its output: it waits
-/// through the first two phases and lands in the third, with the user's hands
-/// off the keys (owner, 2026-09-18).
+/// An agent streaming into a focused pane, never pausing its output, waits through the first
+/// two phases and lands in the third, with the user's hands off the keys.
 #[test]
 fn a_focused_never_quiet_stream_lands_in_the_keys_only_phase() {
     let streaming = |phase| ParkGateFacts {
@@ -279,12 +278,9 @@ fn the_hold_cap_stands_down_and_never_admits_again() {
     );
 }
 
-/// What a re-park buys: a park that missed its budget re-parks on the next rung
-/// with the successor holding, climbing the whole freeze ladder (20, 80,
-/// 250 ms) before giving the successor back; past the last rung it stands down
-/// in the activity lane (no physical budget, no latch). Pins the disposition at
-/// every miss count, the stand-down outcome, and the lane the shipping
-/// classifier puts it in.
+/// What a re-park buys: a park that missed its budget re-parks on the next rung with the
+/// successor holding, climbing the whole freeze ladder (20, 80, 250 ms); past the last rung it
+/// stands down in the activity lane (no physical budget, no latch).
 #[test]
 fn a_park_miss_buys_the_ladders_next_rung_without_a_relaunch() {
     use super::{
@@ -323,8 +319,8 @@ fn a_park_miss_buys_the_ladders_next_rung_without_a_relaunch() {
             }
         }
     }
-    // The last rung missed: the successor is stood down as ACTIVITY, and the
-    // shipping classifier keeps it out of every physical shape.
+    // The last rung missed: the successor is stood down as activity, and the shipping
+    // classifier keeps it out of every physical shape.
     let ParkMissDisposition::StandDown(stand_down) =
         park_miss_disposition(PRELAUNCH_MAX_PARK_MISSES, "capture exceeded 250 ms".into())
     else {
@@ -371,12 +367,9 @@ fn a_park_miss_buys_the_ladders_next_rung_without_a_relaunch() {
     );
 }
 
-/// A hung-up master is not output and is not parked over: the gate waits in
-/// every automatic phase with a reason saying so; a person's apply still parks
-/// at once.
-///
-/// Unbounded here, bounded one level up: exited `--hold` panes are not among the
-/// masters the gate sees (`App::handoff_live_sessions`, pinned by
+/// A hung-up master is never parked over: the gate waits in every automatic phase with its own
+/// reason, while a person's apply parks at once. The wait is unbounded here because exited
+/// `--hold` panes never reach the gate (`App::handoff_live_sessions` leaves them out, pinned by
 /// `an_exited_held_pane_is_not_handed_and_does_not_hold_the_park`).
 #[test]
 fn a_dead_master_holds_every_automatic_phase_with_its_own_reason() {
@@ -450,11 +443,9 @@ fn a_relaxed_land_policy_parks_over_queued_output_at_land_and_nowhere_else() {
     }
 }
 
-/// Bytes waiting unread on a master hold every automatic lane in every phase,
-/// and at `Land` only for `PRELAUNCH_LAND_MAX_WAITS` consecutive waits, after
-/// which the park proceeds: a producer faster than the parser keeps `POLLIN`
-/// set, and the successor replays kernel-queued bytes after Commit. Earlier
-/// phases still prefer a clean instant.
+/// Unread bytes on a master hold every automatic phase, and `Land` only for
+/// `PRELAUNCH_LAND_MAX_WAITS` consecutive waits: a producer faster than the parser keeps
+/// `POLLIN` set, and the successor replays kernel-queued bytes after Commit.
 #[test]
 fn unconsumed_master_output_holds_until_the_bound_has_waited_long_enough() {
     for mode in [ApplyMode::Automatic, ApplyMode::AutomaticPastGrace] {

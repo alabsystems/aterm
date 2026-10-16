@@ -2,93 +2,30 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Back-removal operations for [`WarmTier`].
-//!
-//! Extracted from `tier.rs` for file-size compliance.
-//! These methods support `remove_newest` (#5918).
+//! Back-removal for [`WarmTier`], backing `remove_newest`.
 
 use super::{WarmBlock, WarmTier};
 
 impl WarmTier {
-    /// Pre-validate that `truncate_back_lines(n)` will succeed.
-    ///
-    /// Tries to decompress the boundary block (if any) without modifying state.
-    /// Call this before committing cross-tier removal to ensure error safety.
-    // Skip: the reverse block walk drives a std iterator whose `next` is an
-    // absent body (generic trait path). Pure validation; ARENA-SCROLL tested.
-    #[cfg_attr(trust_verify, trust::skip)]
-    pub(crate) fn pre_validate_truncate_back(
-        &self,
-        n: usize,
-    ) -> Result<(), crate::ScrollbackError> {
-        if n == 0 || n >= self.line_count {
-            return Ok(()); // No boundary block; whole-block removal is infallible.
-        }
-        let mut remaining = n;
-        let mut whole_blocks = 0;
-        for block in self.blocks.iter().rev() {
-            // saturating index/arith: `whole_blocks < blocks.len()` on every
-            // iteration (it counts blocks already consumed) and
-            // `remaining >= available` guards the sub — neither ever actually
-            // saturates; this only discharges the obligations the verifier
-            // cannot chain through the loop. Identical on every real path.
-            let actual_idx = self
-                .blocks
-                .len()
-                .saturating_sub(1)
-                .saturating_sub(whole_blocks);
-            let available = if actual_idx == 0 {
-                block.line_count().saturating_sub(self.front_offset)
-            } else {
-                block.line_count()
-            };
-            if remaining >= available {
-                remaining = remaining.saturating_sub(available);
-                whole_blocks = whole_blocks.saturating_add(1);
-            } else {
-                break;
-            }
-        }
-        if remaining > 0 && whole_blocks < self.blocks.len() {
-            let boundary_idx = self
-                .blocks
-                .len()
-                .saturating_sub(1)
-                .saturating_sub(whole_blocks);
-            // `get` (not index): the guard above proves the bound, but it does
-            // not reach the index in the verifier's model; the None arm is
-            // unreachable and returns the same Ok.
-            if let Some(b) = self.blocks.get(boundary_idx) {
-                b.decompress()?;
-            }
-        }
-        Ok(())
-    }
-
     /// Remove the newest `n` lines from the back of the warm tier.
     ///
     /// Drops whole blocks from the back without decompression. For the
     /// boundary block (partially within the remove range), decompresses it,
     /// trims the consumed lines from the back, and re-compresses the survivors.
     ///
-    /// Error safety (#4638): the boundary block is decompressed before any state
-    /// is modified. On decompression failure, state is unchanged.
+    /// Error safety: the boundary block is decompressed before any state is
+    /// modified, so a decompression failure leaves the state unchanged.
     ///
     /// # Panics
     ///
     /// Debug-asserts that `n <= self.line_count`.
-    // Skip. Re-measured 2026-09-27 on seal 321aaeda7 with it removed (`targo
-    // trust check -p aterm-scrollback --lib --allow-l0-gaps`): VIOLATIONS, 7
-    // obligations. 1 proved. 1 refuted, falsely: the slice bound of
-    // `&lines[..keep]` (counterexample `keep = 1`) — the verifier does not
-    // relate `keep = lines.len().saturating_sub(boundary_trim)` to the Vec
-    // `decompress()` returned. 5 unknown: Overflow(Add) in the `.sum()` closures
-    // (2), the front trim's `pop_front().expect` (2 rows) and the global-alloc
-    // dealloc contract. The phase-1 arithmetic is saturating and raises no row.
-    // ARENA-SCROLL tested. Needed from $HOME/trust, in a promoted seal: a slice
-    // bound that follows a local derived from the slice's own `len()`,
-    // Overflow(Add) inside an iterator `sum` closure, and `Option::expect`
-    // panic-freedom from the `front()` guard that precedes it; then drop this.
+    // Skip: with it removed the check falsely refutes `&lines[..keep]` (the
+    // verifier does not relate `keep`, derived from `lines.len()`, to the Vec
+    // `decompress()` returned) and leaves Overflow(Add) in the `.sum()`
+    // closures, the front trim's `pop_front().expect` and the dealloc contract
+    // unknown. Drop it once Trust follows a slice bound through a local derived
+    // from the slice's own `len()`, Overflow(Add) inside a `sum` closure, and
+    // `Option::expect` panic-freedom from a preceding `front()` guard.
     #[cfg_attr(trust_verify, trust::skip)]
     pub(crate) fn truncate_back_lines(&mut self, n: usize) -> Result<(), crate::ScrollbackError> {
         if n == 0 {
@@ -104,9 +41,8 @@ impl WarmTier {
         let mut whole_blocks = 0;
         let mut remaining = n;
         for block in self.blocks.iter().rev() {
-            // saturating index/arith — the exact twin of the validate path
-            // above: the guards prove the bounds but do not reach the ops in
-            // the verifier's model. Identical on every real path.
+            // Saturating: the loop bounds `whole_blocks` and the available-line
+            // guard bounds each subtraction.
             let actual_idx = self
                 .blocks
                 .len()

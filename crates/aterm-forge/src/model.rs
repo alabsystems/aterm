@@ -1,25 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The shared vocabulary: a package identity, a resolved graph, a target cell,
-//! and the per-package facts every verb reports on.
+//! The shared vocabulary: a package identity, a resolved graph, a target cell, and the
+//! per-package facts every verb reports on.
 //!
-//! Two rules are encoded in these types:
-//!
-//!   1. A package is `(name, version)`, never a bare name: `cargo pkgid -p
-//!      <name>` errors as ambiguous once a second major version is in the
-//!      graph.
-//!   2. Cost is a dominator, not a subtree, since subtrees double-bill shared
-//!      dependencies. [`crate::dominator`] is the only sanctioned way to answer
-//!      "what does this edge cost".
+//! A package is `(name, version)`, never a bare name: `cargo pkgid -p <name>` errors as ambiguous
+//! once a second major version is in the graph. Cost is a dominator, not a subtree, since
+//! subtrees double-bill shared dependencies; [`crate::dominator`] computes it.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-/// A resolved package identity. Ordering is (name, version) so reports are
-/// stable and two versions of one crate sort adjacently.
-///
-/// `Default` is derived only so [`Graph`] can derive it; an empty `PkgId` is
-/// never a legal package.
+/// A resolved package identity. Ordering is (name, version) so reports are stable and two
+/// versions of one crate sort adjacently. `Default` exists only so [`Graph`] can derive it; an
+/// empty `PkgId` is never a legal package.
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PkgId {
     pub name: String,
@@ -46,11 +39,8 @@ impl std::fmt::Display for PkgId {
     }
 }
 
-/// One (triple, root package) measurement cell.
-///
-/// Resolve cells are mandatory and offline (resolution needs no installed
-/// std). Build cells are best-effort: a missing std is a skip, counted and
-/// named, never a pass.
+/// One (triple, root package) measurement cell. Resolution is offline and needs no installed
+/// std; a cell that cannot resolve is named, never passed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Cell {
     /// Short handle used in reports and policy (`mac-arm`, `linux`, …).
@@ -70,9 +60,8 @@ pub struct Graph {
 }
 
 impl Graph {
-    /// Packages reachable from the root, optionally with one node blocked.
-    /// Blocking is how [`crate::dominator`] computes a counterfactual without
-    /// mutating anything.
+    /// Packages reachable from the root, optionally with one node blocked (the counterfactual
+    /// [`crate::dominator`] needs).
     pub fn reach(&self, blocked: Option<&PkgId>) -> BTreeSet<PkgId> {
         let mut seen = BTreeSet::new();
         if Some(&self.root) == blocked {
@@ -105,13 +94,13 @@ pub struct PkgFacts {
     /// `\bunsafe\b` tokens, not `unsafe {` blocks: macro-generated FFI emits
     /// `unsafe` without blocks.
     pub unsafe_tokens: u64,
-    /// A build script is code the compiler executes, and `targo trust` marks
-    /// every one `-Ztrust-verify=off`, so it is a first-class budget row.
+    /// A build script is code the compiler executes, and `targo trust` marks every one
+    /// `-Ztrust-verify=off`, so it is a budget row of its own.
     pub has_build_rs: bool,
     pub is_proc_macro: bool,
     pub license: String,
-    /// `true` when the package's manifest is NOT under `crates/`. The six
-    /// `[patch.crates-io]` path packages count as third-party, which they are.
+    /// `false` for aterm's own code ([`crate::provenance::is_first_party`]); `[patch.crates-io]`
+    /// path forks count as third-party.
     pub is_third_party: bool,
     /// Absolute path to the package's manifest directory, when known.
     pub root_dir: Option<std::path::PathBuf>,

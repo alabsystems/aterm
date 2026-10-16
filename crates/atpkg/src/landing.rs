@@ -1,30 +1,20 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! THE LANDING HAND-OVER, RETIRED TO A PASS-THROUGH (Phase 2 of
-//! `docs/DESIGN-atpkg-vendor-direct-updates-2026-09-22.md`, 2026-09-22).
+//! The retired landing hand-over, now a pass-through.
 //!
-//! From 2026-09-16 an update pass wrote `<prefix>/landing/<program>` while it fetched a
-//! newer agent build, and the `agents/` twin handed a `claude` typed meanwhile to
-//! `atpkg __landing`, which waited up to 45 s and printed progress lines on stderr. Owner,
-//! 2026-09-22: updates must be *"non-interrupting (ideally silent)"*. The wait bought
-//! nothing the flip does not: activation re-lays `bin/` and the twin atomically, so the
-//! next invocation already runs the new build, and one typed during the transfer runs
-//! the build the user had.
+//! An older client's `agents/` twin hands a typed agent command to `atpkg __landing` while
+//! a `<prefix>/landing/<program>` marker stands. No wait is needed: activation re-lays
+//! `bin/` and the twin atomically, so the next invocation runs the new build.
 //!
-//! What remains, and why:
-//!
-//! * **No pass writes a marker**, and every pass SWEEPS `landing/` ([`sweep`], run where
-//!   the pass takes the store lock): that pass is the only one, so a marker there is an
-//!   older client's leftover, and a twin that still tests for it then runs its own `exec`.
-//!   The same sweep takes `optin/`, the extras opt-in markers an older client recorded
-//!   (design §5.3(c), retired 2026-09-24), which nothing reads any more.
-//! * **The hidden verb stays** ([`HIDDEN_VERB`], `cli::cmd_landing`): a twin laid by an
-//!   older client still hands over to it while such a marker stands. It `exec`s the
-//!   current `bin/<program>` at once with the arguments verbatim ([`HandOver`],
-//!   [`shim_command`]) and prints nothing.
-//! * **New twins carry no landing prelude** (`crate::platform::twin_prelude`), so the
-//!   next pass re-lays an older twin without it; the self-update block stays.
+//! * No pass writes a marker, and every pass sweeps `landing/` and `optin/` (an older
+//!   client's extras opt-in markers, read by nothing) under the store lock ([`sweep`]); an
+//!   older twin that finds no marker runs its own `exec`.
+//! * The hidden verb ([`HIDDEN_VERB`], `cli::cmd_landing`) `exec`s the current
+//!   `bin/<program>` at once with the arguments verbatim ([`HandOver`], [`shim_command`])
+//!   and prints nothing.
+//! * New twins carry no landing prelude (`crate::platform::twin_prelude`), so the next pass
+//!   re-lays an older twin without it; the self-update block stays.
 
 use std::path::PathBuf;
 
@@ -41,18 +31,17 @@ pub const HIDDEN_VERB: &str = "__landing";
 pub struct HandOver<'a> {
     /// The agent program the twin stands for (`claude`), not yet `ToolName`-vetted.
     pub program: &'a str,
-    /// The PREFIX operand the twin's prelude passes (absolute), so the store is found
-    /// with no `HOME`; `None` from a twin laid before the operand existed.
+    /// The absolute prefix operand the twin passes, so the store is found with no `HOME`;
+    /// `None` from a twin laid before the operand existed.
     pub prefix: Option<PathBuf>,
-    /// The user's arguments, verbatim, with the ONE `--` the twin inserted stripped.
+    /// The user's arguments, verbatim, with the one `--` the twin inserted stripped.
     pub args: &'a [String],
 }
 
 impl<'a> HandOver<'a> {
-    /// `None` only with no program at all. The prefix is taken when the next operand is
-    /// an ABSOLUTE path (a relative one is the user's first argument, as is `--`); the
-    /// twin inserts exactly one `--` of its own, so exactly one is stripped and a user's
-    /// own leading `--` survives.
+    /// `None` only with no program. The next operand is the prefix when it is an absolute
+    /// path (a relative one, or `--`, is the user's). The twin inserts exactly one `--`, so
+    /// exactly one is stripped and a user's own leading `--` survives.
     #[must_use]
     pub fn parse(rest: &'a [String]) -> Option<Self> {
         let (program, rest) = rest.split_first()?;
@@ -75,33 +64,34 @@ impl<'a> HandOver<'a> {
     }
 }
 
-/// The command the verb runs: the CURRENT `bin/<program>` shim ([`Layout::shim`] —
-/// `bin/claude` on Unix, `bin\claude.cmd` on Windows), never the `agents/` twin (its
-/// prelude would hand over here again), with `args` verbatim. Built here, apart from the
-/// `exec`, so the argument vector is pinned on every platform; `cli::cmd_landing` hands
-/// it to [`crate::platform::exec_or_run`].
+/// The command the verb runs: the current `bin/<program>` shim ([`Layout::shim`]), never
+/// the `agents/` twin (its prelude would hand over here again), with `args` verbatim. Built
+/// apart from the `exec` so the argument vector is pinned on every platform;
+/// `cli::cmd_landing` hands it to [`crate::platform::exec_or_run`]. A self-update's forward
+/// uses it too, and the warm pass strips it itself (`warm::warm_command`).
 ///
-/// Raw, not `aterm_uds::spawnfd::command`: the landing verb and a self-update's forward
-/// become the tool's shim, so their caller's descriptors are the tool's (B27's
-/// allow-list; the warm pass strips the command itself, `warm::warm_command`). They
-/// `exec` it on Unix, which keeps the whole table on every std; SPAWNED, a `std` command
-/// hands its child stdio alone under Trust's std since SP-1, so a pass-through that waits
-/// on its program spawns with `aterm_uds::spawnfd::transparent` instead. Its
-/// Windows console is decided here all the same (`aterm_uds::spawn::set_flags`,
-/// `Console::Quiet`, B28): it shares the console the verb runs in, and a caller with
-/// none gets a windowless one, never a visible console window.
+/// Raw, not `aterm_uds::spawnfd::command`: the verb becomes the tool's shim, so its
+/// caller's descriptors are the tool's, and on Unix it `exec`s, keeping the whole table.
+/// Spawned instead, a `std` command hands its child stdio alone under Trust's std, so a
+/// pass-through that waits on its program spawns with `aterm_uds::spawnfd::transparent`.
+/// The Windows console flags are set all the same (`aterm_uds::spawn::set_flags`): the
+/// child shares the verb's console, and a caller with none gets a windowless one.
 #[must_use]
+#[expect(
+    clippy::disallowed_types,
+    reason = "a pass-through by exec: its caller's descriptors are the program's"
+)]
 pub fn shim_command(layout: &Layout, tool: &ToolName, args: &[String]) -> std::process::Command {
     let mut command = std::process::Command::new(layout.shim(tool));
-    aterm_uds::spawn::set_flags(&mut command, aterm_uds::spawn::Console::Quiet, 0);
+    aterm_uds::spawn::set_flags(&mut command, 0);
     command.args(args);
     command
 }
 
-/// Remove `<prefix>/landing/` and `<prefix>/optin/` and everything in them — silent,
-/// best-effort. Run by every pass once it holds the store lock: no other pass is running,
-/// and no pass of this client writes either. A link or a file standing at either name is
-/// unlinked, never followed (`remove_dir_all` does not follow links either).
+/// Remove `<prefix>/landing/` and `<prefix>/optin/` and everything in them, silently and
+/// best-effort. Every pass runs it once it holds the store lock, so no other pass is
+/// running and none writes either. A link or file at either name is unlinked, never
+/// followed.
 pub fn sweep(layout: &Layout) {
     for dir in [layout.landing_dir(), layout.prefix.join("optin")] {
         match std::fs::symlink_metadata(&dir) {
@@ -121,10 +111,8 @@ pub fn sweep(layout: &Layout) {
 mod pure_tests {
     use super::*;
 
-    /// THE VERB'S OPERANDS AND WHAT IT RUNS (pinned on every platform, 2026-09-17): the
-    /// program, the absolute prefix operand, exactly one `--` stripped, the user's own
-    /// `--` and everything after it verbatim; and the command is the `bin/` shim of the
-    /// platform (`.cmd` on Windows) with those arguments — never the `agents/` twin.
+    /// The program, the absolute prefix operand, exactly one `--` stripped and the rest
+    /// verbatim; the command is the platform's `bin/` shim, never the `agents/` twin.
     #[test]
     fn the_hand_over_parses_its_operands_and_runs_the_bin_shim_verbatim() {
         let a = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
@@ -184,9 +172,8 @@ mod tests {
         crate::testdir::layout(&format!("atpkg-landing-{label}-"))
     }
 
-    /// EVERY MARKER GOES, WHOEVER WROTE IT (Phase 2, 2026-09-22): a live pid's marker in
-    /// the 2026-09-16 format, garbage, a stray temp — the sweep leaves no `landing/` at
-    /// all, and a second sweep over nothing is silent.
+    /// Every marker goes, whoever wrote it (a live pid's marker, garbage, a stray temp), and
+    /// a second sweep over nothing is silent.
     #[test]
     fn the_sweep_removes_every_marker_and_the_directory() {
         let l = temp_layout("sweep");
@@ -200,7 +187,7 @@ mod tests {
         std::fs::write(dir.join("claude"), live).unwrap();
         std::fs::write(dir.join("codex"), b"junk\n").unwrap();
         std::fs::write(dir.join(".claude.tmp-4242"), b"").unwrap();
-        // An older client's extras opt-in markers (§5.3(c)) go with them.
+        // An older client's extras opt-in markers go too.
         let optin = l.prefix.join("optin");
         std::fs::create_dir_all(&optin).unwrap();
         std::fs::write(optin.join("vendorx"), b"# opted in\n").unwrap();
@@ -212,8 +199,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// A LINK AT `landing/` IS UNLINKED, NEVER FOLLOWED: the directory it names keeps
-    /// every file.
+    /// A link at `landing/` is unlinked, never followed: its target keeps every file.
     #[test]
     fn the_sweep_never_follows_a_link_at_landing() {
         let l = temp_layout("sweep-link");
@@ -235,9 +221,8 @@ mod tests {
     }
 }
 
-/// THE VERB'S HAND-OVER ON WINDOWS — compiled and run ONLY on a Windows host, which no
-/// machine of this repo is: the `bin/<program>.cmd` shim runs as a child and its REAL
-/// exit code comes back. UNVERIFIED until a Windows box runs it.
+/// The hand-over on Windows: the `bin/<program>.cmd` shim runs as a child and its real exit
+/// code comes back. Runs only on a Windows host.
 #[cfg(all(test, windows))]
 mod windows_tests {
     use super::*;

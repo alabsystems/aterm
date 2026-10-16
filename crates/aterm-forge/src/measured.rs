@@ -58,8 +58,11 @@ pub struct Baseline {
     pub duplicate_names: usize,
 }
 
-// The winit rows measure the vendored fork as it compiles, including its local
-// patches (attest.rs counts the markers), among them:
+// Until 2026-10-15 the winit rows measured the vendored fork as it compiled,
+// including its local patches; since its re-home (crates/aterm-window, a
+// workspace member, docs/AUDIT-third-party-2026-10-15.md winit-core step 4) they
+// are under these ceilings by its 48,572 lines, which the workspace now owns.
+// Its patches, among them:
 //   - monitor.rs: no `expect` on a display that vanished (LOCAL PATCH)
 //   - window_delegate.rs: no `unwrap` on a gone screen in full screen (LOCAL PATCH)
 //   - raw sends through aterm_objc (RcBlock, fullscreen state) (LOCAL PATCH)
@@ -68,34 +71,37 @@ pub struct Baseline {
 //   - observer.rs: the waker is `aterm_objc::WakeTimer` (LOCAL PATCH)
 //   - macos/headless.rs and event_loop.rs: the display-free `--headless` loop,
 //     no NSApplication (LOCAL PATCH)
+//   - monitor.rs, observer.rs and friends: CoreFoundation/CoreGraphics through
+//     `aterm_objc::cf`/`cg`, not the core-foundation/core-graphics crates
+//     (LOCAL PATCH)
 pub const MAC_ARM: Baseline = Baseline {
     cell: "mac-arm",
-    resolved: 124,
-    workspace: 77,
-    third_party: 47,
-    third_party_loc: 442_113,
-    build_scripts: 10,
-    proc_macros: 2,
-    duplicate_names: 1,
+    resolved: 103,
+    workspace: 71,
+    third_party: 32,
+    third_party_loc: 376_785,
+    build_scripts: 9,
+    proc_macros: 1,
+    duplicate_names: 0,
 };
 
 pub const LINUX: Baseline = Baseline {
     cell: "linux",
-    resolved: 274,
-    workspace: 79,
-    third_party: 195,
-    third_party_loc: 2_790_322,
-    build_scripts: 32,
+    resolved: 261,
+    workspace: 73,
+    third_party: 188,
+    third_party_loc: 2_741_471,
+    build_scripts: 31,
     proc_macros: 16,
     duplicate_names: 6,
 };
 
 pub const WIN: Baseline = Baseline {
     cell: "win",
-    resolved: 161,
-    workspace: 73,
+    resolved: 154,
+    workspace: 66,
     third_party: 88,
-    third_party_loc: 3_204_104,
+    third_party_loc: 3_204_122,
     build_scripts: 18,
     proc_macros: 7,
     duplicate_names: 0,
@@ -105,8 +111,8 @@ pub const WIN: Baseline = Baseline {
 /// `aterm-render` rasterizer, blitted with `putImageData`.
 pub const WASM_CPU: Baseline = Baseline {
     cell: "wasm-cpu",
-    resolved: 62,
-    workspace: 40,
+    resolved: 57,
+    workspace: 35,
     third_party: 22,
     third_party_loc: 221_029,
     build_scripts: 6,
@@ -121,8 +127,8 @@ pub const WASM_CPU: Baseline = Baseline {
 /// edges from `aterm-gpu-web`.
 pub const WASM_GPU: Baseline = Baseline {
     cell: "wasm-gpu",
-    resolved: 103,
-    workspace: 43,
+    resolved: 99,
+    workspace: 39,
     third_party: 60,
     third_party_loc: 952_607,
     build_scripts: 16,
@@ -142,24 +148,25 @@ pub const WASM_GPU: Baseline = Baseline {
 /// every field.
 pub const MAC_X64: Baseline = Baseline {
     cell: "mac-x64",
-    resolved: 124,
-    workspace: 77,
-    third_party: 47,
-    third_party_loc: 442_113,
-    build_scripts: 10,
-    proc_macros: 2,
-    duplicate_names: 1,
+    resolved: 103,
+    workspace: 71,
+    third_party: 32,
+    third_party_loc: 376_785,
+    build_scripts: 9,
+    proc_macros: 1,
+    duplicate_names: 0,
 };
 
-/// ARM Linux — the triple tools/linux-auto-atpkg.sh cross-packs beside x86_64.
+/// ARM Linux — the triple the Linux lane (`atpkg-publish lane run linux`) cross-packs
+/// beside x86_64.
 /// Identical to [`LINUX`] in every field.
 pub const LINUX_ARM: Baseline = Baseline {
     cell: "linux-arm",
-    resolved: 274,
-    workspace: 79,
-    third_party: 195,
-    third_party_loc: 2_790_322,
-    build_scripts: 32,
+    resolved: 261,
+    workspace: 73,
+    third_party: 188,
+    third_party_loc: 2_741_471,
+    build_scripts: 31,
     proc_macros: 16,
     duplicate_names: 6,
 };
@@ -169,10 +176,10 @@ pub const LINUX_ARM: Baseline = Baseline {
 /// CPU-feature probe still resolves here.
 pub const WIN_ARM: Baseline = Baseline {
     cell: "win-arm",
-    resolved: 164,
-    workspace: 73,
+    resolved: 157,
+    workspace: 66,
     third_party: 91,
-    third_party_loc: 3_588_682,
+    third_party_loc: 3_588_700,
     build_scripts: 19,
     proc_macros: 7,
     duplicate_names: 1,
@@ -185,9 +192,9 @@ pub const CELLS: [Baseline; 8] = [
 ];
 
 /// The names duplicated in the mac-arm cell, pinned as names because which
-/// crate is doubled is the actionable fact. `bitflags` is 1.3.2 under
-/// core-graphics beside 2.x elsewhere.
-pub const MAC_ARM_DUPLICATE_NAMES: [&str; MAC_ARM.duplicate_names] = ["bitflags"];
+/// crate is doubled is the actionable fact. None: the last, `bitflags` 1.3.2
+/// under core-graphics, left with the CF/CG carve (`aterm_objc::cf`/`cg`).
+pub const MAC_ARM_DUPLICATE_NAMES: [&str; MAC_ARM.duplicate_names] = [];
 
 /// `hashbrown`'s resolved version count on mac-arm (none of its parents are in
 /// that graph). Counted over resolved versions rather than looked up in the

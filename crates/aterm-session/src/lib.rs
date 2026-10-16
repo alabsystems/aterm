@@ -122,15 +122,15 @@ pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     // No `std::hint::black_box`, unlike aterm's other constant-time comparators:
     // it is a Rust-ABI callee with no body in the verification bundle, which
     // would cost this crate proofs against its floor in
-    // `tools/trust-gate-ratchet.tsv`. The loop compiles branch-free (it exits
+    // aterm-release's `trust/floors.tsv`. The loop compiles branch-free (it exits
     // only on the index bound); if that stops holding, add the barrier and
     // re-measure the proved count.
     diff == 0
 }
 
 /// Fill `buf` with cryptographically secure random bytes from the OS CSPRNG,
-/// via [`aterm_uds::rand::fill`], the workspace's one audited entropy surface
-/// (`tools/grep_guard.sh` B4). Panics only if the OS RNG is unavailable.
+/// via [`aterm_uds::rand::fill`], the workspace's one audited entropy surface.
+/// Panics only if the OS RNG is unavailable.
 // Skip: bottoms out in the `getentropy(2)` FFI call the verifier cannot see; the
 // only panic is the deliberate `expect` on a missing OS RNG. Verify-only.
 #[cfg_attr(trust_verify, trust::skip)]

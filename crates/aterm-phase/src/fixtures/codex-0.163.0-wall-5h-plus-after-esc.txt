@@ -1,0 +1,51 @@
+# codex-cli 0.163.0 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (144x50, aterm 0.105.0) running the real Codex, launched by path with a scratch `CODEX_HOME`, the lab provider `base_url=http://127.0.0.1:<port>/v1`, `wire_api = "responses"`, a fake `env_key` (a local stub of the Responses API, crates/aterm-lab) · the stub's five_hour limit, a 429 {error:{type:usage_limit_reached, resets_at, limit_window_minutes:300, plan_type plus}}, x-codex-primary-used-percent 100 (300 min), after one ok turn; after one Esc
+
+  >_ OpenAI Codex (v0.163.0)
+     /private/tmp/at.GPUN/proj
+
+
+› hi
+
+
+• Hi! I am the local lab stub, not a model. (reply 1)
+
+  Worked for <1s • 11:13 AM
+
+
+› carry on with the task
+
+
+■ You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/settings/usage to purchase more
+credits or try again at 11:23 AM.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                       ⚠ 5h limit: only <1% left · resets at 11:23 AM · /status
+
+› Ask Codex to do anything
+
+  GPT-6.1-Sol default · /private/tmp/at.GPUN/proj · lab stub
+  ? for shortcuts

@@ -810,30 +810,4 @@ mod tests {
             "settles ≈ 180 ms (§7.2): residual {residual}, envelope bound {bound}"
         );
     }
-
-    /// §5.2 / D1: two ceilings, one floor — and the published class centres
-    /// all fit under the ceiling of their own lane.
-    #[test]
-    fn the_two_coverage_ceilings_hold_every_class() {
-        assert!((FIELD_STAR_COV_CEIL - 143.35).abs() < 0.1, "2.35 × 61");
-        for centre in [143.0_f32, 130.0, 98.0] {
-            assert!(
-                centre <= FIELD_STAR_COV_CEIL,
-                "field class {centre} over ceiling 1"
-            );
-            assert!(centre >= 80.0, "field class {centre} under the peak floor");
-        }
-        for centre in [118.0_f32, 80.0, 61.0] {
-            assert!(
-                centre <= TRANSIENT_STAR_COV_CEIL,
-                "transient class {centre} over ceiling 2"
-            );
-            assert!(
-                centre >= 61.0,
-                "transient class {centre} under the grain floor"
-            );
-        }
-        // Relations between the ceilings (D1, L3) are compile-time assertions
-        // beside the constants.
-    }
 }

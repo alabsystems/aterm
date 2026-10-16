@@ -2,8 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! ClaudeFooterModel, Tier-1: which model the Claude Code footer names
-//! (`harness::footer`), driven from every reachable state of the derived
-//! model and projected back onto it.
+//! (`harness::footer`), driven from the states of the derived model within
+//! [`WALK_DEPTH`] actions of its start and projected back onto it.
 //!
 //! Driven: every `Read` is the real `footer::session_of_pid`, then
 //! `footer::facts_for_entry_at` at the world's clock (the floor, the transcript
@@ -18,23 +18,16 @@
 //! `Clear` and `Resume`/`ResumeLate` rewrite `sessions/<pid>.json` as Claude
 //! does.
 //!
-//! Transcribed, not driven: the host's card memo, the resolver's thread and
-//! cadence (a switch waits for a read of the session it leaves, `known == 1`),
-//! and the argv/environment read.
+//! Transcribed, not driven: the host's card memo, the resolver's thread and cadence
+//! (a switch waits for a read of the session it leaves, `known == 1`), and the
+//! argv/environment read.
 //!
-//! Projection: model 1 is `claude-opus-5-5`, model 2 `claude-fable-5-1`;
-//! `shown` is the footer's model, `0` for none.
+//! Projection: model 1 is `claude-opus-5-5`, model 2 `claude-fable-5-1`; `shown` is
+//! the footer's model, `0` for none.
 //!
-//! Negative controls, each caught by the same enumeration: a forged `shown`;
-//! and the defective readers of [`Reader`] (no floor, no model results, a fixed
-//! tail window, nothing kept across a switch, resume-blind, restore-no-pin,
-//! floor-only).
-//!
-//! TWO TIERS. The land tier walks the states within [`LAND_DEPTH`] actions of
-//! the model's start; the walk of every reachable state, and the controls over
-//! it, are `#[ignore]`d (their commands are in their doc comments). The sample
-//! is proven to bite, not assumed to: each of the model's `Buggy` behaviours,
-//! put into the real reader, turns the land walk red (`LAND_DEPTH`'s doc).
+//! Negative controls, each caught by the same enumeration: a forged `shown`, and the
+//! defective readers of [`Reader`]. The walk is a sample by depth; [`WALK_DEPTH`]
+//! says why it bites.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::Write as _;
@@ -71,8 +64,7 @@ enum Reader {
     NoResults,
     /// A fixed tail window: no carry and no look past a huge row.
     TailWindow,
-    /// The real chain with a cache that forgets the process at a session
-    /// switch (the reader before the process's own facts).
+    /// The real chain with a cache that forgets the process at a session switch.
     NoCarry,
     /// The real chain, the resumed conversations' rows before the floor
     /// hidden from it: every switch reads as a `/clear`.
@@ -97,7 +89,6 @@ struct World {
     transcript: PathBuf,
     /// The next session id a `Clear` takes (1 and 2 are A and B).
     next_session: u32,
-    /// The process's argv.
     argv: Vec<String>,
     launch: LaunchFacts,
     /// The model the launch card names, when one is drawn.
@@ -236,8 +227,8 @@ impl World {
                 ],
             );
         }
-        // D: begun and answered by ANOTHER process at the floor — after this
-        // one started, before the reader first saw it.
+        // D: begun and answered by another process at the floor, after this one
+        // started and before the reader first saw it.
         let at_floor = stamp(START);
         std::fs::write(
             project.join(format!("{}.jsonl", session_id(LATE))),
@@ -337,8 +328,8 @@ impl World {
                 ]);
             }
             "ChooseUnread" => {
-                // A switch that MOVES the model, its result unreadable: the
-                // model named without the quotes every build puts on it.
+                // A switch that moves the model, its result unreadable: the model
+                // named without the quotes every build puts on it.
                 self.runs = if self.runs == 1 { 2 } else { 1 };
                 self.chose = true;
                 let at = self.next_stamp();
@@ -532,7 +523,7 @@ fn stdout_row(at: &str, text: &str) -> String {
     )
 }
 
-/// Every reachable state of a model with the shortest path to it.
+/// [`paths`]'s result.
 type Space = Vec<(Vars, Vec<&'static str>)>;
 
 /// Every reachable state of `model` with the shortest path to it.
@@ -556,11 +547,8 @@ fn paths(model: &Model) -> Space {
     seen.into_iter().collect()
 }
 
-/// The derived model and every state it reaches with its shortest path
-/// ([`paths`]), built once per process. Both are pure functions of the
-/// `ty_model!` constructor, and the walk and the eight controls each rebuilt
-/// them: 135 ms of debug-build breadth-first search per call, nine calls per
-/// run (measured 2026-10-05).
+/// The derived model and every state it reaches with its shortest path ([`paths`]),
+/// built once per process for the walk and every control.
 fn footer() -> &'static (Model, Space) {
     static FOOTER: std::sync::OnceLock<(Model, Space)> = std::sync::OnceLock::new();
     FOOTER.get_or_init(|| {
@@ -579,16 +567,10 @@ struct Last {
     after: Vars,
 }
 
-/// Judge `last` by both tiers ([`verify::validate_transition_tiered`]). The
-/// first disagreement is the `Err`.
-///
-/// The same transition is met many times — a `Flood` moves the world, not
-/// the model, so the `Read` after one is the plain `Read` of the state it
-/// reaches, and a state's forged successors are the same whichever path
-/// reached it — and every meeting is judged again: the interpreter re-checks
-/// it and the two tiers' agreement is asserted. Only the `ty` process is not
-/// run again: `verify` keeps `ty`'s verdict on the exact spec, cfg and trace
-/// for the life of the process.
+/// Judge `last` by both tiers ([`verify::validate_transition_tiered`]); the first
+/// disagreement is the `Err`. A transition met many times (a `Flood` moves the world,
+/// not the model) is judged at every meeting; only the `ty` process is not run again,
+/// as `verify` keeps `ty`'s verdict on the exact spec, cfg and trace.
 fn judge_last(model: &Model, last: &Last) -> Result<(), String> {
     let Last {
         path,
@@ -610,7 +592,7 @@ fn judge_last(model: &Model, last: &Last) -> Result<(), String> {
              {before:?} -> {after:?}\n{diagnostics}"
         ));
     }
-    // A FORGED successor — any other model shown — is refused.
+    // A forged successor (any other model shown) is refused.
     for forged in [0, 1, 2].into_iter().filter(|v| *v != after["shown"]) {
         let mut lie = after.clone();
         lie.insert("shown", forged);
@@ -629,14 +611,11 @@ fn judge_last(model: &Model, last: &Last) -> Result<(), String> {
     Ok(())
 }
 
-/// Replay `path` on a fresh world through `reader`; every `Read` is checked
-/// against the model. Returns the first disagreement.
-///
-/// The last `Read` is judged by both tiers (`validate_transition_tiered`, the
-/// interpreter and `ty`, forged successors refused) via `last`; earlier ones
-/// by the interpreter alone. Paths are breadth-first, so every earlier `Read`
-/// is some prefix's last and is judged by both tiers there. A defective
-/// reader's catch is judged by both tiers too.
+/// Replay `path` on a fresh world through `reader`; every `Read` is checked against
+/// the model, and the first disagreement returned. The last `Read` is judged by both
+/// tiers via `last` (a defective reader's only when the interpreter refuses it),
+/// earlier ones by the interpreter alone: paths are breadth-first, so every earlier
+/// `Read` is some prefix's last and is judged by both tiers there.
 fn replay(
     model: &Model,
     path: &[&'static str],
@@ -677,41 +656,21 @@ fn replay(
     Ok(reads)
 }
 
-/// Every reachable state whose path `keep` takes, reached and read, and read
-/// again after a flood.
+/// Every reachable state whose path `keep` takes, reached and read, and read again
+/// after a flood. A path is replayed once: a state just read was reached by its
+/// breadth-first parent's `Read`, and a flood out of a state just read is the plain
+/// read of the state it reaches, so replaying such a path again repeats its checks.
 ///
-/// A path is replayed once. A state just read was reached by its
-/// breadth-first parent's `Read`, so reading it "now" is that parent's
-/// replay, path for path; a flood out of a state just read is likewise the
-/// plain read of the state the flood reaches, when that is its shortest
-/// path. The world is deterministic, so replaying such a path again (626 of
-/// the 6,060) repeats every check it made.
-///
-/// The replays run on a pool ([`POOL`]), each on a world of its own and each
-/// judging its own last `Read` ([`Judging`]); their outcomes come back to the
-/// calling thread, which takes them in walk order ([`in_walk_order`]). Each
-/// replay is deterministic and shares nothing with another, so the first
-/// disagreement in walk order is the `Err`, as when they ran one after
-/// another, and an old reader's catch still ends the walk where it did: the
-/// pool stops taking paths, and what it did past the catch is dropped. A
-/// replay's panic is raised at its place in walk order. When the calling
-/// thread has an evidence window open ([`bind`]'s), each pool thread opens one
-/// of its own and hands it back into the caller's
-/// (`xref::take_entered_anchors`, `xref::merge_entered_anchors`), so the bind
-/// sees every anchor its walk entered, and only those.
-///
-/// WHY A POOL, MEASURED 2026-10-05. One replay after another, the walk and
-/// the judge each waited in turn: the walk on its worlds (a directory,
-/// transcripts, a 600 KiB flood each; timed in the gate, it ended at
-/// 25.7-61.2 s with the judge 0.1 s behind it), the judge on one `ty` process
-/// per distinct transition (this machine's `ty` 0.13.0 answers no
-/// `capabilities`, so there is no co-process, and judging one after another
-/// took 12.5 s of a 12.6 s bind at load 22). The pool spreads both. Medians
-/// of interleaved runs of the whole `agent_suite` binary: 26.9 s to 13.6 s at
-/// load ~46 (58.8 and 56.0 CPU-s with the `ty` children), and 23.9 s to
-/// 11.1 s under 14 `yes` loops (57.7 and 57.3 CPU-s); this file's two tests
-/// alone at load 19-29, the bind 12.2 s to 6.2 s and the controls 4.4 s to
-/// 1.6 s.
+/// The replays run on a pool ([`POOL`]), each on its own world and judging its own
+/// last `Read` ([`Judging`]), because both the worlds (directories, transcripts, a
+/// 600 KiB flood each) and the judge (one `ty` process per distinct transition) are
+/// slow. The calling thread takes the outcomes in walk order ([`in_walk_order`]), so
+/// the first disagreement in walk order is the `Err` and a panic is raised at its
+/// place, as if the replays ran in sequence; after a catch the pool stops taking
+/// paths. When the calling thread has an evidence window open ([`bind`]'s), each pool
+/// thread opens its own and hands it back (`xref::take_entered_anchors`,
+/// `xref::merge_entered_anchors`), so the bind sees every anchor its walk entered,
+/// and only those.
 fn enumerate(reader: Reader, keep: impl Fn(&[&'static str]) -> bool) -> Result<usize, String> {
     let (model, space) = footer();
     let mut replayed = BTreeSet::new();
@@ -788,23 +747,15 @@ fn enumerate(reader: Reader, keep: impl Fn(&[&'static str]) -> bool) -> Result<u
     })
 }
 
-/// The most replay threads one [`enumerate`] runs (half the cores, at most
-/// this). WHY 4, MEASURED 2026-10-05 on 14 cores: every world is directories
-/// made and removed, and those calls do not scale. The replays alone,
-/// unjudged, took 5.3 s on one thread, 1.3-1.6 s on 4 and 3.0 s on 7, with
-/// 1.8, 2.4-3.3 and 8.2 s of kernel time; the bind, medians of five
-/// interleaved runs, 15.0 s, 8.4 s and 7.8 s for 16.7, 18.2 and 21.9 CPU-s
-/// (its own and its `ty` children's).
+/// The most replay threads one [`enumerate`] runs (half the cores, at most this).
+/// Every world is directories made and removed, which does not scale: on 14 cores
+/// the replays took 1.3-1.6 s on 4 threads and 3.0 s on 7.
 const POOL: usize = 4;
 
-/// [`judge_last`] on many threads, one `before` state at a time. Every
-/// judgement of a `before` asks `ty` of the same three successors (the real
-/// one and the forged ones are the `Read` out of it with each model shown), so
-/// a second judgement waits for the first and takes `verify`'s memo rather
-/// than running the same `ty` processes beside it: without this, the bind on
-/// 4 threads spent 16.3 CPU-s in `ty` instead of 10.2, and 16.2 s instead of
-/// 8.4 (measured 2026-10-05). Judging still happens at every meeting, as
-/// [`judge_last`] says.
+/// [`judge_last`] on many threads, one `before` state at a time: every judgement of a
+/// `before` asks `ty` about the same three successors (the real one and the forged
+/// ones), so a second waits for the first and takes `verify`'s memo instead of
+/// running the same `ty` processes beside it. Every meeting is still judged.
 #[derive(Default)]
 struct Judging(std::sync::Mutex<BTreeMap<Vars, std::sync::Arc<std::sync::Mutex<()>>>>);
 
@@ -862,51 +813,34 @@ const READERS: [&str; 5] = [
     "scan",
 ];
 
-/// The land tier's walk: every state within this many actions of the
-/// model's start (the breadth-first depth `paths` reaches it at), each read —
-/// and read again after a flood — by the real chain and judged by both tiers.
+/// The walk: every state within this many actions of the model's start (its
+/// breadth-first depth in [`paths`]), each read, and read again after a flood, by the
+/// real chain and judged by both tiers.
 ///
-/// WHY 5, MEASURED 2026-09-30. Each of the model's `Buggy` behaviours, put
-/// into the real reader one at a time (temporary hooks in `footer.rs`, not
-/// committed: a readable choice voided, no floor, a resume read as a clear, no
-/// carry across a switch, the tail window, a restore taken for no pin, the
-/// floor-only judge, and two more — a launch `--resume`'s restore not shown,
-/// the `--model` flag ignored), turns this walk red, at the shallowest depth
-/// of 1 (no floor, no restore, the launch's restore, the flag), 2 (the choice,
-/// the tail window), 3 (no carry, the floor-only judge) or 4 (no pin). The
-/// deepest shortest counterexample of an old reader the controls below keep is
-/// 5: the one that took a restore for no pin, in a process not launched onto a
-/// conversation (3 in one that was). So 5 is the controls' reach and one past
-/// the real reader's deepest.
-///
-/// WHAT IT COSTS. 707 of the 3,260 reachable states (2,551 reads): the walk
-/// takes a fifth of the whole space's CPU (12.8 s against 62.6 s, measured
-/// 2026-10-01 at a load of 36 to 42), so this file's default tier runs in
-/// ~10 s on an idle machine where the whole of it used to take ~45 s. Seconds
-/// move with the machine's load, that ratio does not. The rest of the space,
-/// to depth 10, is
-/// [`the_footer_names_the_running_model_from_every_reachable_state`].
-const LAND_DEPTH: usize = 5;
+/// Why 5: each of the model's `Buggy` behaviours put into the real reader turns this
+/// walk red within 4 actions, and the deepest shortest counterexample the controls
+/// below keep is 5 (a restore taken for no pin, in a process not launched onto a
+/// conversation). That is 707 of the 3,260 reachable states (2,551 reads), about a
+/// fifth of the whole space's cost; the rest of the space, to depth 10, is not walked.
+const WALK_DEPTH: usize = 5;
 
-/// The paths of at most `depth` actions: a prefix-closed part of the space,
-/// so `enumerate`'s argument that nothing goes unjudged by `ty` holds in it.
+/// The paths of at most `depth` actions: a prefix-closed part of the space, so
+/// [`replay`]'s argument that every `Read` is judged by both tiers holds in it.
 fn within(depth: usize) -> impl Fn(&[&'static str]) -> bool {
     move |path| path.len() <= depth
 }
 
-/// The real reader's bind over the states within `depth` actions: the walk,
-/// then the anchors — linked, naming the one projection, and ENTERED by it.
-/// (The evidence window is per thread, so two binds on two test threads never
-/// share one; the walk's replay threads hand theirs back into this one's.)
+/// The real reader's bind over the states within `depth` actions: the walk, then the
+/// anchors, linked, naming the one projection, and entered by it. The evidence window
+/// is per thread; the walk's replay threads hand theirs back into this one's.
 fn bind(depth: usize) {
     assert!(xref::reset_entered_anchors(), "the evidence window opens");
     let model = &footer().0;
     let reads = enumerate(Reader::Real, within(depth)).unwrap_or_else(|e| panic!("{e}"));
     assert!(reads >= 60, "the bind must read the model's space: {reads}");
 
-    // The anchors are linked, name the one projection, and were ENTERED by
-    // the walk; every other action — Claude Code's, a person's — is waived
-    // by name.
+    // The anchors are linked, name the one projection, and were entered by the
+    // walk; every other action (Claude Code's, a person's) is waived by name.
     let mut anchored: Vec<&str> = xref::refinements()
         .filter(|a| a.machine == "ClaudeFooterModel")
         .map(|a| {
@@ -933,22 +867,11 @@ fn bind(depth: usize) {
     assert_eq!(waived, actions, "every other action waived, `Read` not");
 }
 
-/// THE LAND TIER: the real reader names the running model from every state
-/// within [`LAND_DEPTH`] actions ([`bind`]).
+/// The real reader names the running model from every state within
+/// [`WALK_DEPTH`] actions ([`bind`]).
 #[test]
 fn the_footer_names_the_running_model_from_every_state_within_five_actions() {
-    bind(LAND_DEPTH);
-}
-
-/// THE EXHAUSTIVE WALK: every one of the model's reachable states, which the
-/// land tier samples by depth. Ignored for its cost — 8,064 `ty` runs, five
-/// times the land walk's CPU and the longest test of the crate by far; run it
-/// when the footer reader's cache, floor, restore or switch logic changes:
-/// `targo --unverified test -p aterm-agent --test agent_suite -- --ignored conformance_footer_model::`.
-#[test]
-#[ignore = "the whole reachable space (8,064 ty runs, ~5x the land walk); the default run walks the states within 5 actions"]
-fn the_footer_names_the_running_model_from_every_reachable_state() {
-    bind(usize::MAX);
+    bind(WALK_DEPTH);
 }
 
 /// A path of a process launched onto a resumed conversation.
@@ -964,7 +887,7 @@ fn late(path: &[&'static str]) -> bool {
 /// Negative controls: each defect the model's `Buggy` branches describe, put
 /// into the reader, is caught by the same enumeration in the part of the space
 /// where that defect lives, so no control passes on another's catch. Over the
-/// states within `depth` actions; each is caught within [`LAND_DEPTH`].
+/// states within `depth` actions; each is caught within [`WALK_DEPTH`].
 fn old_readers_are_caught(depth: usize) {
     let inside = within(depth);
     let fresh = |p: &[&'static str]| !launch_resumed(p) && !late(p) && inside(p);
@@ -996,15 +919,5 @@ fn old_readers_are_caught(depth: usize) {
 
 #[test]
 fn the_bind_catches_each_old_reader() {
-    old_readers_are_caught(LAND_DEPTH);
-}
-
-/// [`old_readers_are_caught`] over the whole space (about 1.7x the land
-/// controls' CPU): the controls at the reach they had before the land tier
-/// sampled the space:
-/// `targo --unverified test -p aterm-agent --test agent_suite -- --ignored conformance_footer_model::`.
-#[test]
-#[ignore = "the controls over the whole reachable space (~1.7x the land controls); the default run takes the states within 5 actions"]
-fn the_bind_catches_each_old_reader_over_the_whole_space() {
-    old_readers_are_caught(usize::MAX);
+    old_readers_are_caught(WALK_DEPTH);
 }

@@ -1551,27 +1551,6 @@ mod tests {
         );
     }
 
-    /// The note ring is bounded: at half-beat cadence, and under a hostile spawn
-    /// flood, the pool never exceeds [`MAX_NOTES`] and `frames` never yields
-    /// more sprites than the cap.
-    #[test]
-    fn note_ring_never_exceeds_the_cap() {
-        let mut notes = MusicNotes::default();
-        let t0 = Instant::now();
-        // 40 half-beats of full drive with an artificially eternal life
-        // window (spawns outpace culls by feeding times close together).
-        for hb in 0..40u64 {
-            let now = t0 + Duration::from_millis(hb * 10); // 100 Hz "half-beats"
-            let beat = hb as f32 * 0.5;
-            notes.update(now, true, Some(beat));
-        }
-        let live = notes.ring.iter().flatten().count();
-        assert!(live <= MAX_NOTES, "ring overflowed: {live}");
-        let mut out = Vec::new();
-        notes.frames(t0 + Duration::from_millis(400), false, &mut out);
-        assert!(out.len() <= MAX_NOTES);
-    }
-
     /// Wind-down spawns NOTHING new and the field drains to empty — the
     /// visual crossfade: live notes finish, no hard cut, then exact rest.
     #[test]

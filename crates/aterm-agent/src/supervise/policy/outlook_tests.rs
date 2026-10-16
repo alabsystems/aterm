@@ -10,9 +10,8 @@ fn cfg() -> SupervisorConfig {
     SupervisorConfig::default()
 }
 
-/// Every kind of wall has an outlook — the compiler makes it so — and the ones
-/// a person can lift say so: a bucket with no reset asks, one with a reset does
-/// not; a lost login is a person's; a switched-off key is nobody's.
+/// A bucket with no reset asks a person, one with a reset does not; a lost
+/// login is a person's; a switched-off key is nobody's.
 #[test]
 fn every_wall_kind_has_an_outlook() {
     let c = cfg();
@@ -72,11 +71,8 @@ fn every_wall_kind_has_an_outlook() {
     );
 }
 
-/// WHO ANSWERS A WALL, for the surfaces that show it (the presence row and tab
-/// chip: a wall the harness answers is a record, only a wall nobody answers is
-/// a stop). A critical-memory banner and a login are nobody's whatever the
-/// switches say; a reset-less bucket or spend limit is resumed slowly and names
-/// the ONE action; an unsupervised session answers nothing.
+/// Memory and login walls are nobody's whatever the switches say; a reset-less
+/// bucket or spend limit resumes slowly and names the one action.
 #[test]
 fn a_wall_is_answered_by_the_harness_or_by_nobody() {
     let on = SupervisorConfig::default();

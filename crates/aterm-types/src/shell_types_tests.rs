@@ -45,15 +45,3 @@ fn command_mark_succeeded_only_on_zero() {
     mark.exit_code = Some(1);
     assert!(!mark.succeeded());
 }
-
-// =========================================================================
-// current_time_ms
-// =========================================================================
-
-#[test]
-fn current_time_ms_returns_some() {
-    let ts = current_time_ms();
-    assert!(ts.is_some());
-    // Should be a reasonable value (after 2020-01-01)
-    assert!(ts.unwrap() > 1_577_836_800_000);
-}

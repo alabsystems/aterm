@@ -1,20 +1,20 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Vendor-direct agents (`docs/DESIGN-atpkg-vendor-direct-updates-2026-09-22.md`, Phase 1):
-//! `claude` and `codex` are fetched from their vendors, authenticated by compiled anchors,
-//! and never wait on the ALab index. This module is the pure core — the table, the
-//! version ↔ build id map, the decision, the small durable records the lane keeps, and the
-//! head watch ([`watch`]) the window runs — or, with no window open, one terminal session.
+//! Vendor-direct agents (`docs/DESIGN-atpkg-vendor-direct-updates-2026-09-22.md`): the agent
+//! programs ([`VENDORS`]) are fetched from their vendors, authenticated by compiled anchors, and
+//! never wait on the ALab index. This module holds the table, the version ↔ build id map, the
+//! decision, the lane's durable records, and the head watch ([`watch`]) the window runs (or, with
+//! no window open, one terminal session).
 //!
-//! The index keeps exactly one power over these programs: a signed yank (`policy`),
-//! which can deny the installed version but never supply bytes.
+//! The index keeps one power over these programs: a signed yank (`policy`), which can deny the
+//! installed version but never supply bytes.
 
 pub(crate) mod decide;
 pub(crate) mod digests;
 pub(crate) mod durable;
 pub(crate) mod lane;
-pub(crate) mod policy;
+pub mod policy;
 mod record;
 pub(crate) mod resolve;
 mod stamp;
@@ -26,7 +26,10 @@ pub use record::{
     RECORD_SCHEMA, RECORD_SUFFIX, VendorRecord, complete_record, read_record, record_path,
 };
 pub use stamp::{ProgramStamp, stamp_path};
-pub use table::{Anchor, DocPin, VENDORS, VendorSpec, is_vendor, spec};
+pub use table::{
+    AccountState, Anchor, DocPin, NEVER_INDEX_PINNED, VENDORS, VendorSpec, Warm, is_vendor,
+    served_here, spec,
+};
 pub use version::{BuildDate, VENDOR_BUILD_BASE, Version, is_vendor_build};
 
 /// How a line names `program`'s store `build`: `claude 2.1.280` for a vendor-direct build
@@ -51,13 +54,11 @@ pub fn build_words(build: u64) -> String {
     s
 }
 
-/// What a person HAS, for a line that names `program`'s active build OFFLINE (the
-/// self-update announce, `selfupdate::announce_line`): the version a vendor-direct build
-/// id carries; for a legacy index build, the version an earlier pass recorded for it in
-/// the program stamp (`ProgramStamp::legacy_version_of` — the verdict line's own source,
-/// so the announce and the verdict agree on a `.vendor`-recorded install), else
-/// [`build_words`]'s `build N`; `(no version recorded)` when there is no active build.
-/// Nothing is fetched and nothing is run to learn it.
+/// What a person has, for a line that names `program`'s active build offline (the self-update
+/// announce, `selfupdate::announce_line`): a vendor-direct build id's version; for a legacy index
+/// build, the version the program stamp recorded for it (`ProgramStamp::legacy_version_of`, the
+/// verdict line's source too, so the two agree), else [`build_words`]; `(no version recorded)`
+/// with no active build. Nothing is fetched or run.
 #[must_use]
 pub fn have_words(layout: &crate::store::Layout, program: &str, build: Option<u64>) -> String {
     let Some(build) = build else {
@@ -79,7 +80,7 @@ pub fn have_words(layout: &crate::store::Layout, program: &str, build: Option<u6
 #[must_use]
 pub fn build_label(build: u64) -> String {
     match Version::from_build_id(build) {
-        Some(v) => format!("{}.{}.{}", v.major(), v.minor(), v.patch()),
+        Some(v) => v.to_string(),
         None => build.to_string(),
     }
 }
@@ -89,73 +90,21 @@ fn is_hex64(s: &str) -> bool {
     aterm_codec::hex::is_lower(s, 64)
 }
 
-/// The index-program words no line about a vendor-direct program may carry (design
-/// §1.7): the index pin itself and the index as its update source. This crate still
-/// prints both for index programs — `managed <build> — pinned by index <N>`
-/// (`state::managed`) and doctor's fix-line `… (updates arrive with the ALab index)` — so
-/// a vendor row routed through either renderer would say them.
-#[cfg(test)]
-pub(crate) const INDEX_PROGRAM_WORDS: &[&str] =
-    &["pinned by index", "updates arrive with the ALab index"];
-
-/// `Some(what)` when `line` carries an [`INDEX_PROGRAM_WORDS`] entry or a 19-digit number
-/// — a vendor store id used as a label. A run right after `/` is a store directory in a
-/// path, which is where that id belongs.
-#[cfg(test)]
-pub(crate) fn retired_wording(line: &str) -> Option<String> {
-    if let Some(words) = INDEX_PROGRAM_WORDS.iter().find(|w| line.contains(*w)) {
-        return Some((*words).to_string());
-    }
-    let bytes = line.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if !bytes[i].is_ascii_digit() {
-            i += 1;
-            continue;
-        }
-        let start = i;
-        while i < bytes.len() && bytes[i].is_ascii_digit() {
-            i += 1;
-        }
-        if i - start >= 19 && (start == 0 || bytes[start - 1] != b'/') {
-            return Some(line[start..i].to_string());
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod wording_tests {
     use super::*;
 
-    /// The checker finds each index-program phrase and a bare store id and passes a
-    /// store path — the non-vacuity of every test that screens vendor lines with it —
-    /// and the display words render versions.
+    /// The display words render a vendor build as its version and an index build as
+    /// its number.
     #[test]
-    fn the_retired_wording_checker_finds_labels_and_passes_paths() {
+    fn the_display_words_render_versions() {
         let id = Version::parse("2.1.280").unwrap().build_id();
-        assert_eq!(
-            retired_wording("claude 2.1.280 is Anthropic's latest"),
-            None
-        );
-        assert_eq!(
-            retired_wording(&format!("in /p/store/claude/{id}/bin (e.g. claude)")),
-            None
-        );
-        assert_eq!(
-            retired_wording(&format!("managed {id} — Anthropic latest")),
-            Some(id.to_string())
-        );
-        for words in INDEX_PROGRAM_WORDS {
-            assert_eq!(
-                retired_wording(&format!("managed 2.1.280 — x {words} y")).as_deref(),
-                Some(*words)
-            );
-        }
         assert_eq!(build_label(id), "2.1.280");
         assert_eq!(build_words(id), "2.1.280");
         assert_eq!(build_words(4790), "build 4790");
         assert_eq!(display_build("claude", id), "claude 2.1.280");
         assert_eq!(display_build("trust", 4790), "trust build 4790");
+        let muse = Version::parse("1.4.9-R6297.1").unwrap().build_id();
+        assert_eq!(display_build("muse", muse), "muse 1.4.9-R6297.1");
     }
 }

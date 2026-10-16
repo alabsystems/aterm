@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE ONE BAND DRIVER, tested where it lives (design ruling 338): the step's
-//! order and its freeze, the afford arithmetic, the idle law, the memo's key
-//! and cost law, the past guard, the look-change due, and the paint key —
-//! including the High Contrast toggle a theme-only key misses (ruling 337).
+//! Test-only: the band driver ([`crate::drive`]): the step's order and its freeze, the
+//! afford arithmetic, the idle law, the memo's key and cost law, the past guard, the
+//! look-change due, and the paint key, including the High Contrast toggle a theme-only
+//! key misses.
 
 use crate::drive::{self, Commit, Lay, LookIn, View};
 use crate::ink::{self, BandInks, BarBase, ForcedPalette, ThemeInks};
@@ -416,10 +416,8 @@ fn the_paint_key_moves_with_every_term_it_paints_from() {
             .is_some(),
         "inks"
     );
-    // THE HIGH CONTRAST TOGGLE (ruling 337): the palette the host derives
-    // from the SAME theme becomes the OS's, and the rows must follow. A key
-    // that hashed the theme — equal across the toggle — would keep the stale
-    // rows; this key hashes what the rows are painted with.
+    // The High Contrast toggle: the palette the host derives from the same theme becomes
+    // the OS's, and the rows must follow, so the key hashes the inks, not the theme.
     let before = view
         .paint(&center, 80, None, g, false, &|| dark)
         .expect("painted");
@@ -437,9 +435,8 @@ fn the_paint_key_moves_with_every_term_it_paints_from() {
         &hc,
     );
     assert_eq!(after, fresh, "the drive paints what a fresh paint draws");
-    // NEGATIVE CONTROL: a theme key — bg/fg/cursor in place of the inks —
-    // is the same number on both sides of the toggle, so a cache on it would
-    // present `before`, which is not `fresh`.
+    // Negative control: a theme key (bg/fg/cursor in place of the inks) is the same on
+    // both sides of the toggle, so a cache on it would present `before`, not `fresh`.
     let theme_key = |t: ThemeInks| {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -522,14 +519,11 @@ fn step_floored(
     c
 }
 
-/// THE WINDOWS' CHROME REGROW FLOOR (ruling 414): the band's QUIET shrink also
-/// waits the floor the host hands in, and its state deadline names the later of
-/// the two, so the host's timer never wakes for a shrink the commit declines.
-/// Measured: a presence row born 4–6 ms before this shrink made a net-zero pair
-/// that shifted a busy alternate screen. NEGATIVE CONTROL: with no floor the
-/// shrink lands at its quiet's end — that measured pair. The WINDOW's shrink
-/// (the afford fell below the count) is not floored, and a rise is never
-/// delayed.
+/// The band's quiet shrink also waits the floor the host hands in, and its state
+/// deadline names the later of the two, so the host's timer never wakes for a shrink
+/// the commit declines. Unfloored, a presence row born a few ms before the shrink makes
+/// a net-zero re-grid pair (the negative control). The window's own shrink (the afford
+/// fell below the count) is not floored, and a rise is never delayed.
 #[test]
 fn the_bands_quiet_shrink_waits_the_windows_regrow_floor() {
     use crate::chrome::CHROME_REGROW_SETTLE;
@@ -569,19 +563,19 @@ fn the_bands_quiet_shrink_waits_the_windows_regrow_floor() {
     let c = step_floored(&mut center, &mut gate, floor_at, MAX_ROWS, floor);
     assert_eq!(c.regrid, Some(0), "at the floor, the shrink");
     assert_eq!(drive::state_deadline(&center, &gate, false), None, "idle");
-    // NEGATIVE CONTROL: no floor, the shrink lands 5 ms after the birth.
+    // Negative control: no floor, the shrink lands 5 ms after the birth.
     let (mut center, mut gate, due, _) = run(false);
     let c = step_floored(&mut center, &mut gate, due, MAX_ROWS, None);
     assert_eq!(c.regrid, Some(0));
-    // THE WINDOW'S SHRINK: a window that can no longer afford the row gets
-    // it back at once, inside the floor.
+    // The window's own shrink: a window that can no longer afford the row gets it back
+    // at once, inside the floor.
     let (mut center, mut gate, due, floor) = run(true);
     let c = step_floored(&mut center, &mut gate, due, 0, floor);
     assert_eq!(c.regrid, Some(0), "the window's own shrink is not floored");
 }
 
-/// A freeze keeps the floor it was handed for the next step's deadline, and
-/// arms no shrink meanwhile (holds only, as before).
+/// A freeze keeps the floor it was handed for the next step's deadline, and arms no
+/// shrink meanwhile.
 #[test]
 fn a_frozen_step_hands_the_floor_and_arms_no_shrink() {
     use crate::chrome::CHROME_REGROW_SETTLE;

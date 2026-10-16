@@ -1,19 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// Whole-row scroll blit on the GPU: byte-identity gate.
-//
-// `compute_dirty_rows` returns `FullRepaint` for scrollback navigation even
-// though the grid slid by a known row delta. Like the CPU backend, the GPU
-// consults `scroll_blit_plan` and shifts the offscreen's grid band with a
-// staged texture-to-texture copy, re-rastering only the exposed strip.
-//
-// A rescued frame must be byte-identical to a fresh full GPU repaint of the
-// same input (the `scissor_repaint.rs` oracle). The fixture targets the two
-// hard seams: upward glyph overshoot at the exposed/retained boundary (the
-// OVERSHOOT_APRON_ROWS reconciliation; hence parentheses, pipes, underscores,
-// descenders) and wide (CJK) cells riding the shift. Both directions are
-// swept: into history (top strip exposed) and back (bottom strip exposed).
+// Whole-row scroll blit on the GPU: byte-identity gate. `compute_dirty_rows`
+// returns `FullRepaint` for scrollback navigation even though the grid slid by a
+// known row delta; like the CPU, the GPU consults `scroll_blit_plan`, shifts the
+// offscreen's grid band with a staged texture-to-texture copy and re-rasters
+// only the exposed strip. A rescued frame must equal a fresh full repaint. The
+// fixture targets upward glyph overshoot at the exposed/retained boundary
+// (`OVERSHOOT_APRON_ROWS`; hence parentheses, pipes, underscores, descenders)
+// and wide cells riding the shift, in both directions.
 //
 // No GPU or no system font: no-op.
 
@@ -29,29 +24,25 @@ const COLS: usize = 32;
 /// A fresh GpuRenderer (or skip-marker), with lazy fallback parses settled so
 /// every renderer rasterizes CJK identically, and the wall-clock heat shimmer
 /// off so two renders of one input can agree.
-fn fresh_gpu() -> Option<GpuRenderer> {
-    let mut g = common::gpu_or_skip(18.0, Theme::default())?;
+fn fresh_gpu() -> GpuRenderer {
+    let mut g = common::gpu(18.0, Theme::default());
     g.debug_block_on_lazy_fallbacks();
     g.set_shimmer(false);
-    Some(g)
+    g
 }
 
-/// The ground truth: a brand-new GpuRenderer renders `input` with a FULL repaint
+/// The ground truth: a brand-new GpuRenderer renders `input` with a full repaint
 /// (Clear + every row) and reads it back.
 fn fresh_render(input: &RenderInput) -> Vec<u32> {
-    let mut g = fresh_gpu().expect("GPU was available a moment ago");
+    let mut g = fresh_gpu();
     let mut win = WindowGpu::new();
     g.render_input(&mut win, input, None).pixels
 }
 
 /// Deep scrollback whose rows carry overshooting glyphs and wide cells.
-///
-/// `hide_cursor` does not decide rescuability: `RenderInput::cursor_row` is
-/// the live grid's viewport row and does not change with `display_offset`, so
-/// a plain scroll is rescued with the cursor visible. The planner still
-/// handles the cursor's pixels moving with the band (re-stamp row and ghost
-/// row `input.cursor_row - da`); hiding it only removes those rows from the
-/// dirty set.
+/// `hide_cursor` does not decide rescuability (`RenderInput::cursor_row` does not
+/// change with `display_offset`); hiding it only drops the cursor's re-stamp and
+/// ghost rows from the dirty set.
 fn scrollback_term(hide_cursor: bool) -> Terminal {
     let mut term = Terminal::new(ROWS as u16, COLS as u16);
     if hide_cursor {
@@ -65,7 +56,7 @@ fn scrollback_term(hide_cursor: bool) -> Terminal {
 
 #[test]
 fn history_scroll_is_rescued_and_stays_byte_identical_to_a_full_repaint() {
-    let Some(mut gpu) = fresh_gpu() else { return };
+    let mut gpu = fresh_gpu();
     let mut term = scrollback_term(true);
     let mut win = WindowGpu::new();
     // Warm the window at the bottom: no prior frame ⇒ a full repaint.
@@ -110,7 +101,7 @@ fn history_scroll_is_rescued_and_stays_byte_identical_to_a_full_repaint() {
 
 #[test]
 fn a_cursor_that_really_moves_still_refuses_the_scroll_rescue() {
-    let Some(mut gpu) = fresh_gpu() else { return };
+    let mut gpu = fresh_gpu();
     // Move the cursor for real (a CUP in the same frame that scrolls, as when
     // a scroll lands on the same tick as shell output). The frame must fall
     // back to a full repaint and still match one.
@@ -138,7 +129,7 @@ fn a_cursor_that_really_moves_still_refuses_the_scroll_rescue() {
 
 #[test]
 fn a_visible_cursor_rides_the_rescue_and_stays_byte_identical() {
-    let Some(mut gpu) = fresh_gpu() else { return };
+    let mut gpu = fresh_gpu();
     // With the cursor shown, every rescued frame must erase the blitted ghost
     // at `cursor_row - da` and re-stamp the cursor at `cursor_row`.
     let mut term = scrollback_term(false);
@@ -174,22 +165,18 @@ fn a_visible_cursor_rides_the_rescue_and_stays_byte_identical() {
     eprintln!("gpu scroll-blit (cursor shown): {rescued} notches rescued");
 }
 
-/// On the armed Metal arm the rescue's band copies ride the armed encode's
-/// own command buffer ahead of the scissored pass (Submit A), so a rescued
-/// present never waits on a command buffer of its own. The whole-row rescue
-/// fires once per row crossed while scrolling.
-///
-/// Both halves are asserted: the inline-park count stays flat across the
-/// sweep, and `encode_band_shifts` grows by exactly the rescues taken. The
-/// byte-identity oracle catches a copy that landed after the pass or on the
-/// wrong frame.
+/// On the armed Metal arm the rescue's band copies ride the armed encode's own
+/// command buffer ahead of the scissored pass (Submit A), so a rescued present
+/// never waits on a command buffer of its own: the inline-wait count stays flat
+/// and `metal_encode_band_shifts` grows by exactly the rescues taken. The
+/// byte-identity oracle catches a copy that landed after the pass.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_rescued_scroll_present_parks_on_no_command_buffer_of_its_own() {
-    let Some(mut gpu) = fresh_gpu() else { return };
+    let mut gpu = fresh_gpu();
     let mut term = scrollback_term(true);
     let mut win = WindowGpu::new();
-    // Warm at the bottom (a full repaint), then take the baselines AFTER it —
+    // Warm at the bottom (a full repaint), then take the baselines after it:
     // the warm frame is not a rescue and must not be charged to the sweep.
     let input = term.cell_frame(ROWS, COLS);
     let warm = gpu.present_input_readback(&mut win, &input);

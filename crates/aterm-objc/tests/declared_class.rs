@@ -575,7 +575,7 @@ fn the_main_thread_witness_refuses_a_worker_and_a_spawned_thread() {
 /// because every other encoding check in this crate starts from a selector
 /// somebody typed. Such a check cannot see a row it was not told about, and it
 /// cannot see that the list it holds has gone stale — which is not a
-/// hypothesis: an argument retyped `Id` -> `Bool` in `vendor/winit`'s ported
+/// hypothesis: an argument retyped `Id` -> `Bool` in `crates/aterm-window`'s ported
 /// delegate left `cargo build` at 0 and the seam census at 6/6.
 ///
 /// What is asserted is the property the auditor rests on: the table is the
@@ -656,7 +656,7 @@ fn the_whole_registered_table_comes_back_with_its_encodings() {
 /// [`class_protocols`](aterm_objc::class_protocols) reports the class's OWN
 /// conformance claim — the half no encoding check can see.
 ///
-/// Deleting `NSWindowDelegate` from `vendor/winit`'s `protocols:` list left
+/// Deleting `NSWindowDelegate` from `crates/aterm-window`'s `protocols:` list left
 /// every registered encoding correct, the build green and the driven event log
 /// byte-identical; the class simply stopped saying it was a window delegate.
 /// This is the accessor that reports it.

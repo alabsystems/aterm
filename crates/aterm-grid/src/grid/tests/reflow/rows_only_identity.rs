@@ -42,13 +42,12 @@ fn full_screen_shrink_grow_round_trip_is_identity() {
     assert_eq!(before_view, ["LINE0", "LINE1", "LINE2", "LINE3", "LINE4"]);
 
     grid.resize(3, 20);
-    // Shrink anchors at the cursor: its line (LINE4) stays visible, the top
-    // rows transit to history in reading order.
+    // Shrink anchors at the cursor: the top rows move to history in reading order.
     assert_eq!(viewport_texts(&grid), ["LINE2", "LINE3", "LINE4"]);
     assert_eq!(history_trimmed(&grid), ["LINE0", "LINE1"]);
 
     grid.resize(5, 20);
-    // Grow pulls the same rows back to the top — the exact inverse.
+    // Grow pulls the same rows back: the exact inverse.
     assert_eq!(viewport_texts(&grid), before_view, "round trip is identity");
     assert_eq!(
         (grid.cursor_row(), grid.cursor_col()),
@@ -121,8 +120,7 @@ fn extras_survive_the_round_trip_through_ring_history() {
     for col in 0..4u16 {
         grid.cell_extra_mut(3, col).set_hyperlink(Some(url.clone()));
     }
-    // Cursor sits on the bottom row, so the shrink demotes the top rows —
-    // f0/f1 — and a deeper shrink would take the emoji and link rows too.
+    // The cursor is on the bottom row, so the shrink demotes the top rows.
     grid.resize(2, 20);
     assert_eq!(viewport_texts(&grid), ["link", "bottom"]);
     grid.resize(5, 20);
@@ -143,8 +141,8 @@ fn extras_survive_the_round_trip_through_ring_history() {
     grid.assert_invariants();
 }
 
-/// A full non-blank screen with the cursor on the top row: nothing is lost and
-/// the cursor's line stays visible (the one shape that still bottom-pushes).
+/// A full screen with the cursor on the top row: nothing is lost and the cursor's line stays
+/// visible (the one shape that pushes from the bottom).
 #[test]
 fn cursor_near_top_shrink_preserves_all_content() {
     let mut grid = Grid::with_scrollback(5, 20, 100);
@@ -166,25 +164,18 @@ fn cursor_near_top_shrink_preserves_all_content() {
     grid.assert_invariants();
 }
 
-/// ABSOLUTE-ROW HONESTY across a rows-only resize: EVERY retained row keeps
-/// its key.
+/// Every retained row keeps its absolute key across a rows-only resize.
 ///
-/// `oldest_absolute_row()` is `absolute_row_counter − visible − scrollback`.
-/// Moving rows ACROSS the live/history boundary keeps the retained total fixed
-/// (the relabel the resize is designed around); adding blank rows at the
-/// BOTTOM (a grow with no history to reveal) or trimming trailing blanks (a
-/// shrink) changes it, and the counter moves WITH those rows, so neither
-/// slides a key and there is nothing to renumber (2026-10-01). The slide this
-/// replaced moved every OSC 133 mark off its prompt, since a mark keeps its
-/// key; and where nothing had been evicted it could not slide at all —
-/// `oldest_absolute_row()` saturated at 0 — so the read map (`oldest +
-/// scrollback + r`, what `line`/`blocks` read through) and the write map
-/// (`visible_to_absolute`, what a mark is recorded with) named different rows
-/// from then on: tab #1's prompt mark read back as the line above it.
+/// `oldest_absolute_row()` is `absolute_row_counter - visible - scrollback`. Moving rows across
+/// the live/history boundary keeps the retained total fixed; appending blank rows at the bottom
+/// or trimming trailing blanks changes it, and the counter moves with those rows, so no key
+/// slides. A slide would move every OSC 133 mark off its prompt, and where nothing had been
+/// evicted (`oldest_absolute_row()` saturated at 0) the read map (`oldest + scrollback + r`) and
+/// the write map (`visible_to_absolute`) would name different rows.
 #[test]
 fn a_rows_only_resize_keeps_every_absolute_key() {
-    // The `clear` fixture: real absolute numbering (rows have scrolled), then
-    // `ED 3` takes the history away — so a later grow has nothing to reveal.
+    // Real absolute numbering (rows have scrolled), then `ED 3` takes the history away, so a
+    // later grow has nothing to reveal.
     let cleared = |rows: u16| {
         let mut grid = Grid::with_scrollback(rows, 20, 100);
         let names: Vec<String> = (0..20).map(|i| format!("old {i}")).collect();
@@ -206,7 +197,7 @@ fn a_rows_only_resize_keeps_every_absolute_key() {
         (0..grid.rows()).all(|r| grid.visible_to_absolute(r) == base + u64::from(r))
     };
 
-    // GROW with nothing to reveal: blank rows are appended at the bottom.
+    // A grow with nothing to reveal: blank rows are appended at the bottom.
     let mut grid = cleared(5);
     write_lines(&mut grid, &["a", "b", "c"]);
     let before = grid.oldest_absolute_row();
@@ -229,7 +220,7 @@ fn a_rows_only_resize_keeps_every_absolute_key() {
     assert!(maps_agree(&grid));
     grid.assert_invariants();
 
-    // GROW that reveals history instead: a pure relabel, no slide, no bump.
+    // A grow that reveals history: a pure relabel, no slide, no epoch bump.
     let mut grid = Grid::with_scrollback(3, 20, 4);
     let names: Vec<String> = (0..20).map(|i| format!("h{i}")).collect();
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
@@ -252,7 +243,7 @@ fn a_rows_only_resize_keeps_every_absolute_key() {
     assert!(maps_agree(&grid));
     grid.assert_invariants();
 
-    // SHRINK that only trims trailing blanks: no slide either way.
+    // A shrink that only trims trailing blanks.
     let mut grid = cleared(8);
     write_lines(&mut grid, &["a", "b"]);
     let before = grid.oldest_absolute_row();
@@ -270,10 +261,8 @@ fn a_rows_only_resize_keeps_every_absolute_key() {
     assert!(maps_agree(&grid));
     grid.assert_invariants();
 
-    // THE INCIDENT'S SHAPE: a grid that has evicted nothing (a fresh tab, a
-    // seamless update's adopted grid) grows before it holds any history. The
-    // two maps must still agree — then, and after output scrolls rows into
-    // history (a fixed counter left `counter < rows + scrollback` for good).
+    // A grid that has evicted nothing (a fresh tab, an adopted grid) grows before it holds any
+    // history: the maps agree then, and after output scrolls rows into history.
     let mut grid = Grid::with_scrollback(5, 20, 100);
     assert_eq!(grid.oldest_absolute_row(), 0);
     grid.resize(6, 20);

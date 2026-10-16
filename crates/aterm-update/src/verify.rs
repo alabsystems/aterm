@@ -9,6 +9,7 @@
 //! fails CLOSED: any error, non-zero exit, or unparseable output is a
 //! rejection.
 
+use aterm_uds::deadline::RunError;
 use aterm_uds::spawnfd::Command;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -30,34 +31,26 @@ use std::time::{Duration, Instant};
 /// reaching 30 s would need reads under ~27 MB/s across the payload.
 const HELPER_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The CEILING on the child-exit poll interval (see [`HELPER_POLL_MIN`]).
-const HELPER_POLL: Duration = Duration::from_millis(25);
-
 /// How long a timed-out helper is given to be reaped after its SIGKILL.
 const HELPER_REAP: Duration = Duration::from_millis(250);
-
-/// The first child-exit poll interval, doubled up to [`HELPER_POLL`].
-///
-/// A fixed 25 ms tick put a 25 ms floor on every helper (the first `try_wait`
-/// runs right after `spawn`), while `PlistBuddy` measures 6 ms and `codesign`
-/// 35-70 ms on the launch/apply critical path. Backing off from 1 ms removes that
-/// floor and keeps the steady-state tick for a genuinely slow child.
-const HELPER_POLL_MIN: Duration = Duration::from_millis(1);
 
 /// The AGGREGATE ceiling on one apply's verification work — see [`ApplyBudget`].
 ///
 /// [`HELPER_TIMEOUT`] bounds ONE helper. It does not bound an apply, and an apply
-/// is not one helper: a staged swap runs sixteen of them in series (three
-/// `verified_bundle_identity` calls at five each, plus the start probe), because
-/// the staged, the fixed and the installed bundle are each re-verified at the
-/// point of use. Every one of those is fail-closed, so timeouts cannot actually
-/// accumulate — the first one aborts the apply — but that is a property of the
-/// callers, argued across four files; this states the ceiling as one number.
+/// is not one helper: a staged swap runs eleven of them (two
+/// `verified_bundle_identity` calls at five each — the staged and the installed
+/// bundle, each re-verified at the point of use; a cross-volume install adds the
+/// copied one — plus the start probe). Every one of those is fail-closed, so
+/// timeouts cannot actually accumulate — the first one aborts the apply — but that
+/// is a property of the callers, argued across four files; this states the
+/// ceiling as one number.
 ///
 /// 8s is that number. Measured against the real signed bundle the whole sequence
-/// is ~1.1s wall (codesign -R 0.101s, codesign -d 0.050s, spctl 0.193s,
-/// PlistBuddy 0.004s, the start probe 0.026s), so 8s is ~7x headroom over a
-/// healthy machine and still short enough that a user who double-clicked does not
+/// is well under a second (one bundle's five helpers run at once,
+/// [`check_bundle`]: codesign -R 0.074s, codesign -d 0.017s, spctl 0.080s,
+/// PlistBuddy 0.003s; the start probe ~0.008s once the stage ran it,
+/// [`probe_staged_bundle_starts`]), so 8s is many times the headroom of a healthy
+/// machine and still short enough that a user who double-clicked does not
 /// conclude the app is broken. Expiry defers the apply: the window opens on the
 /// build already installed, and the next launch tries again.
 pub const APPLY_BUDGET: Duration = Duration::from_secs(8);
@@ -171,8 +164,10 @@ fn stop_helper_before(child: &mut impl HelperChild, deadline: Instant) -> bool {
 /// volume.
 ///
 /// The stream is drained on its own thread, so a child that writes more than the
-/// pipe holds cannot wedge against this poll loop; only the tail is kept. The
-/// returned string is empty when the child said nothing.
+/// pipe holds cannot wedge against the wait; only the tail is kept. The wait
+/// ends at the child's exit as the kernel reports it
+/// ([`aterm_uds::deadline::ExitWait`]). The returned string is empty when the
+/// child said nothing.
 pub(crate) fn status_bounded_with_stderr_observed(
     cmd: &mut Command,
     what: &str,
@@ -221,13 +216,13 @@ pub(crate) fn status_bounded_with_stderr_observed(
     } else {
         None
     };
+    let mut exit = aterm_uds::deadline::ExitWait::new(&child);
     let status = loop {
         let message = match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {
                 if Instant::now() < work_deadline {
-                    let remaining = work_deadline.saturating_duration_since(Instant::now());
-                    std::thread::sleep(HELPER_POLL.min(remaining));
+                    exit.wait(work_deadline.saturating_duration_since(Instant::now()));
                     continue;
                 }
                 // A copy that outran its own ceiling says the disk was slow
@@ -282,8 +277,76 @@ pub(crate) fn last_stderr_line(stderr: &str) -> Option<&str> {
 /// Bounded like every other helper here, and FAIL-CLOSED: a probe that times out,
 /// crashes, or prints the wrong build refuses the apply. The machine keeps the build
 /// it has, which is always a safe outcome; a bricked app is not.
+///
+/// The stage ran it once already ([`probe_staged_bundle_starts`]), so on the
+/// same-volume path this run finds the first-exec assessment done.
 #[cfg(target_os = "macos")]
 pub fn probe_bundle_starts(app: &Path, expected_build: u64) -> Result<(), String> {
+    probe_starts(app, expected_build, |exe| aterm_uds::spawnfd::command(exe))
+}
+
+/// [`probe_bundle_starts`] at STAGE time, on the checker thread, before the ready
+/// marker: the same run, its child clamped to utility QoS (`taskpolicy -c utility`,
+/// which execs it in place) because nobody is waiting on it.
+///
+/// WHY START IT TWICE. The first exec of a binary this machine has never run pays
+/// syspolicyd's assessment — measured 0.75 s (0.75-0.95, n=5) for the 90 MB `aterm`
+/// against ~8 ms for every exec after, and that on a cdhash syspolicyd had already
+/// seen; a genuinely new release also gets the XProtect scan — and nothing else
+/// here warms it: `codesign -R` and `spctl` passing do not. The verdict follows the
+/// executable's inode through a rename (measured: 8 ms after renaming the bundle),
+/// and the same-volume apply moves the staged inode by exactly a rename and an
+/// exchange. So the assessment is paid here, off every path a person waits on,
+/// instead of in the apply's own probe — before the successor's window in the
+/// switch, before any window in a cold launch's boot apply. That probe still runs:
+/// it is the TOCTOU check, now at the warm cost. A cross-volume install copies the
+/// bundle (new inodes) and pays at its apply, as before.
+///
+/// Only after the stage's whole gate has passed (codesign, team, Gatekeeper, the
+/// sealed build and commit rebinds): nothing of the candidate is executed before
+/// that. `--version` answers before any lane starts, so the candidate never reaches
+/// its updater, trial counters or state roots.
+#[cfg(target_os = "macos")]
+pub(crate) fn probe_staged_bundle_starts(app: &Path, expected_build: u64) -> Result<(), String> {
+    probe_starts(app, expected_build, utility_clamped)
+}
+
+/// Non-macOS: there is no bundle to start.
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn probe_staged_bundle_starts(_app: &Path, _expected_build: u64) -> Result<(), String> {
+    Ok(())
+}
+
+/// `taskpolicy`, which runs a program clamped to a QoS class by execing it in place
+/// (same pid, the program's own exit status).
+#[cfg(target_os = "macos")]
+const TASKPOLICY: &str = "/usr/sbin/taskpolicy";
+
+/// A command for the absolute executable `exe` behind `taskpolicy -c utility` when
+/// that tool is there to run, else `exe` bare: a missing clamp costs priority,
+/// never the probe.
+#[cfg(target_os = "macos")]
+fn utility_clamped(exe: &Path) -> Command {
+    use std::os::unix::fs::PermissionsExt as _;
+    let runnable = std::fs::metadata(TASKPOLICY)
+        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0);
+    if runnable && exe.is_absolute() {
+        let mut cmd = aterm_uds::spawnfd::command(TASKPOLICY);
+        cmd.args(["-c", "utility"]).arg(exe);
+        cmd
+    } else {
+        aterm_uds::spawnfd::command(exe)
+    }
+}
+
+/// Start `app`'s executable with `--version` through `command` (its launcher) and
+/// require a clean exit naming `expected_build`.
+#[cfg(target_os = "macos")]
+fn probe_starts(
+    app: &Path,
+    expected_build: u64,
+    command: impl FnOnce(&Path) -> Command,
+) -> Result<(), String> {
     let exe = app.join("Contents/MacOS/aterm");
     if !exe.is_file() {
         return Err(format!("no executable at {}", exe.display()));
@@ -291,7 +354,7 @@ pub fn probe_bundle_starts(app: &Path, expected_build: u64) -> Result<(), String
     let out = output_bounded(
         // `--version` answers before any lane starts, so the candidate never reaches
         // its updater: no switch is needed to keep the probe inert.
-        aterm_uds::spawnfd::command(&exe).arg("--version"),
+        command(&exe).arg("--version"),
         "candidate --version probe",
     )?;
     if !out.status.success() {
@@ -420,9 +483,9 @@ pub(crate) fn lock_wait_refusal(what: &str, error: &std::io::Error) -> String {
 /// Fails CLOSED like every other check here: a timeout is an `Err`, i.e. a
 /// rejection, never a pass. `what` names the helper for the error text.
 ///
-/// The output of these helpers is a few hundred bytes at most, so collecting it
-/// after the child exits cannot deadlock on a full pipe. Do not reuse this for a
-/// child that streams volume.
+/// Both streams are drained while the child runs and their tails kept
+/// ([`aterm_uds::deadline::outputs_until`]), so a chatty child cannot wedge on a
+/// full pipe; these helpers print a few hundred bytes at most.
 fn output_bounded(cmd: &mut Command, what: &str) -> Result<std::process::Output, String> {
     output_until(cmd, what, || {
         let (deadline, bound_by_budget) = helper_deadline();
@@ -435,8 +498,7 @@ fn output_bounded(cmd: &mut Command, what: &str) -> Result<std::process::Output,
 /// longer than a verification helper's, but must still end — `hdiutil attach`
 /// verifies a whole image's checksums; `hdiutil detach -force` of a wedged mount
 /// can wait on the disk arbitration daemon indefinitely. A timeout is an `Err`
-/// and the child is killed and reaped. Same output caveat as [`output_bounded`]:
-/// for helpers that print a few lines at most.
+/// and the child is killed and reaped.
 ///
 /// A limit run out is PASSING ([`mark_passing`]), like
 /// [`timed_out`]: a helper that did not finish says the machine was slow at that
@@ -458,63 +520,187 @@ pub(crate) fn output_within(
     })
 }
 
-/// Spawn `cmd` and collect its output, killing and reaping it at the deadline
-/// `bound` names once the child is running; `bound` also gives the timeout's
-/// error text.
+/// Run `cmd` to its output by the deadline `bound` names, killing it there and
+/// reaping it within [`HELPER_REAP`]; `bound` also gives the timeout's error text.
 fn output_until(
     cmd: &mut Command,
     what: &str,
     bound: impl FnOnce() -> (Instant, String),
 ) -> Result<std::process::Output, String> {
-    use aterm_uds::spawnfd::Stdio;
-    let mut child = cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| spawn_refusal(what, &e))?;
     let (deadline, timeout) = bound();
-    let mut poll = HELPER_POLL_MIN;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    // Kill it and reap it, within a short reserve: a helper still
-                    // wedged in the kernel past SIGKILL is left to exit on its own
-                    // rather than parking this thread on it, which is the whole
-                    // point of the bound. A timeout is a rejection either way, so
-                    // nothing is swapped past a helper that may still hold a file.
-                    let _ = stop_helper_before(&mut child, Instant::now() + HELPER_REAP);
-                    return Err(timeout);
-                }
-                // Clamp the sleep to the remaining budget so the 30s ceiling
-                // stays exact, then back off toward the steady-state tick.
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                std::thread::sleep(poll.min(remaining));
-                poll = (poll * 2).min(HELPER_POLL);
-            }
-            Err(e) => return Err(format!("wait for {what}: {e}")),
-        }
+    aterm_uds::deadline::outputs_until(&mut [cmd], deadline, HELPER_REAP)
+        .pop()
+        .unwrap_or(Err(RunError::TimedOut))
+        .map_err(|error| run_refusal(what, error, timeout))
+}
+
+/// What one helper run gave: its output, or why there is none.
+type Run = Result<std::process::Output, RunError>;
+
+/// The refusal for helper `what` that gave no output: `timeout` for one past its
+/// deadline — killed, and a rejection ([`timed_out`]) whether or not its reap was
+/// seen within [`HELPER_REAP`]: a helper still wedged in the kernel past SIGKILL is
+/// left to exit on its own rather than parking this thread on it, which is the
+/// whole point of the bound, and nothing is swapped past a helper that may still
+/// hold a file.
+fn run_refusal(what: &str, error: RunError, timeout: String) -> String {
+    match error {
+        RunError::Spawn(e) => spawn_refusal(what, &e),
+        RunError::Wait(e) => format!("wait for {what}: {e}"),
+        RunError::TimedOut => timeout,
     }
-    child
-        .wait_with_output()
-        .map_err(|e| format!("collect {what} output: {e}"))
+}
+
+/// A bundle's policy gate and its sealed reads, with every helper started at once.
+///
+/// The gate asked one helper at a time — `codesign -R`, `codesign -d`, `spctl`,
+/// then `PlistBuddy` for each read — and waited for each: the sum (~185 ms for
+/// one bundle on a quiet machine; codesign -R 74 ms and spctl 80 ms of it).
+/// Started together and reaped together under one deadline, on this thread with
+/// no other started ([`aterm_uds::deadline::outputs_until`]), they cost the slowest
+/// of them.
+///
+/// THE ANSWERS ARE THE SERIAL GATE'S. Each field is what its own helper says, and
+/// every caller reads them in the serial order — [`Self::policy`] first — so the
+/// first refusal it meets is the one the serial gate would have returned, wording
+/// and passing classification included. A read that ran beside the gate instead of
+/// after it read the same bytes: nothing writes the bundle while it is verified (a
+/// private staging parent and the apply lock, the same exclusion the serial order
+/// rested on between its verify and its read), and an Info.plist value is still
+/// sealed evidence only once [`Self::policy`] is `Ok`. A helper that outlives the
+/// deadline is killed and refused ([`timed_out`]) like a serial one.
+#[derive(Debug)]
+pub struct BundleChecks {
+    /// [`verify_bundle_policy`]'s verdict.
+    pub policy: Result<(), String>,
+    /// [`bundle_build_number`]'s answer.
+    pub build: Result<u64, String>,
+    /// The sealed `ATermGitCommit` ([`git_commit_from`]).
+    pub commit: Result<String, String>,
+    /// [`team_id`]'s answer when a Team ID is pinned (the gate reads it); `None` in
+    /// the structural tier.
+    pub team: Option<Result<String, String>>,
+    /// [`bundle_short_version`]'s answer, when asked for.
+    pub short_version: Option<Result<String, String>>,
+}
+
+/// [`BundleChecks`] of `app` under `expected_team` (the tier [`verify_bundle_policy`]
+/// takes), reading `CFBundleShortVersionString` too when `short_version`.
+pub fn check_bundle(app: &Path, expected_team: &str, short_version: bool) -> BundleChecks {
+    const BUILD: &str = "CFBundleVersion";
+    const COMMIT: &str = "ATermGitCommit";
+    const VERSION: &str = "CFBundleShortVersionString";
+    let pinned = (!expected_team.is_empty()).then_some(expected_team);
+    let keys: &[&str] = if short_version {
+        &[BUILD, COMMIT, VERSION]
+    } else {
+        &[BUILD, COMMIT]
+    };
+    let gate = gate_and_read(app, pinned, keys);
+    let mut reads = gate.reads.into_iter();
+    let mut next = || {
+        reads
+            .next()
+            .unwrap_or_else(|| Err("the read did not run".to_string()))
+    };
+    BundleChecks {
+        policy: gate.policy,
+        build: next().and_then(build_number_from),
+        commit: next().and_then(git_commit_from),
+        team: gate.team,
+        short_version: short_version.then(|| next().and_then(short_version_from)),
+    }
+}
+
+/// One run of the policy gate beside `PlistBuddy` reads of `keys`.
+struct Gate {
+    policy: Result<(), String>,
+    team: Option<Result<String, String>>,
+    /// Each key's `PlistBuddy` output, in `keys`' order.
+    reads: Vec<Result<std::process::Output, String>>,
+}
+
+/// The policy gate — `codesign -R`, `codesign -d` (the team) and `spctl` for a
+/// `pinned` Team ID, else the structural `codesign --verify` — and a `PlistBuddy`
+/// read of each of `keys`, every helper started at once under one
+/// [`helper_deadline`]. The verdict composes the helpers' answers in
+/// [`verify_bundle`]'s serial order: the seal, then the team (and its pin), then
+/// Gatekeeper.
+fn gate_and_read(app: &Path, pinned: Option<&str>, keys: &[&str]) -> Gate {
+    use aterm_update_core::codesign::{developer_id_command, developer_id_verdict};
+    const TEAM: &str = "codesign -d (team id)";
+    const SPCTL: &str = "spctl assessment";
+    let mut seal = match pinned {
+        // A pin that cannot make a requirement is refused before anything runs.
+        Some(team) => match developer_id_command(app, team, true) {
+            Ok(cmd) => cmd,
+            Err(error) => {
+                let refusal = codesign_refusal(error, false);
+                return Gate {
+                    policy: Err(refusal.clone()),
+                    team: None,
+                    reads: keys.iter().map(|_| Err(refusal.clone())).collect(),
+                };
+            }
+        },
+        None => structural_command(app),
+    };
+    let mut display = pinned.map(|_| display_command(app));
+    let mut spctl = pinned.map(|_| spctl_command(app));
+    let mut plist: Vec<Command> = keys.iter().map(|key| plist_command(app, key)).collect();
+    let mut cmds: Vec<&mut Command> = vec![&mut seal];
+    cmds.extend(display.as_mut());
+    cmds.extend(spctl.as_mut());
+    cmds.extend(plist.iter_mut());
+    let (deadline, bound_by_budget) = helper_deadline();
+    let mut runs = aterm_uds::deadline::outputs_until(&mut cmds, deadline, HELPER_REAP).into_iter();
+    let mut next = || runs.next().unwrap_or(Err(RunError::TimedOut));
+    let output = |run: Run, what: &str| {
+        run.map_err(|error| run_refusal(what, error, timed_out(what, bound_by_budget)))
+    };
+    let seal_run = next();
+    let (policy, team) = match pinned {
+        Some(expected_team) => {
+            let seal = developer_id_verdict(seal_run)
+                .map_err(|error| codesign_refusal(error, bound_by_budget));
+            let team = output(next(), TEAM)
+                .and_then(|out| display_from(TEAM, &out))
+                .and_then(|text| parse_team_id(&text));
+            let spctl = output(next(), SPCTL).and_then(|out| spctl_from(&out));
+            let policy = seal
+                .and_then(|()| match &team {
+                    Ok(team) if team == expected_team => Ok(()),
+                    Ok(team) => Err(format!(
+                        "Team ID mismatch: bundle is signed by {team:?}, expected \
+                         {expected_team:?}"
+                    )),
+                    Err(error) => Err(error.clone()),
+                })
+                .and(spctl);
+            (policy, Some(team))
+        }
+        None => (
+            output(seal_run, STRUCTURAL).and_then(|out| structural_from(&out)),
+            None,
+        ),
+    };
+    let reads = keys
+        .iter()
+        .map(|key| output(next(), &format!("PlistBuddy {key}")))
+        .collect();
+    Gate {
+        policy,
+        team,
+        reads,
+    }
 }
 
 /// Full apply-/stage-time gate: structural codesign seal, Team-ID pin, and
 /// Gatekeeper/notarization acceptance. `expected_team` is [`crate::PINNED_TEAM_ID`].
-/// Returns `Ok(())` only if every check passes.
+/// Returns `Ok(())` only if every check passes. The three helpers run at once
+/// ([`check_bundle`] says why the verdict is the serial one).
 pub fn verify_bundle(app: &Path, expected_team: &str) -> Result<(), String> {
-    codesign_verify(app, expected_team)?;
-    let team = team_id(app)?;
-    if team != expected_team {
-        return Err(format!(
-            "Team ID mismatch: bundle is signed by {team:?}, expected {expected_team:?}"
-        ));
-    }
-    spctl_assess(app)?;
-    Ok(())
+    gate_and_read(app, Some(expected_team), &[]).policy
 }
 
 /// Tiered bundle-authenticity gate (see the crate trust model). When a Team ID is
@@ -526,33 +712,47 @@ pub fn verify_bundle(app: &Path, expected_team: &str) -> Result<(), String> {
 /// in `github.rs`), not from the Apple chain. Fails CLOSED on any codesign error.
 pub fn verify_bundle_policy(app: &Path, expected_team: &str) -> Result<(), String> {
     if expected_team.is_empty() {
-        codesign_structural(app)
+        gate_and_read(app, None, &[]).policy
     } else {
         verify_bundle(app, expected_team)
     }
 }
 
+/// The structural lane's name in its refusals.
+const STRUCTURAL: &str = "codesign --verify (structural)";
+
 /// `codesign --verify --deep --strict` with NO designated requirement: proves the
 /// signature seal is intact and nothing in the bundle changed since signing, but does
 /// not constrain the signer (an ad-hoc signature passes). The default-tier check.
-fn codesign_structural(app: &Path) -> Result<(), String> {
-    let out = output_bounded(
-        aterm_uds::spawnfd::command("/usr/bin/codesign")
-            .args(["--verify", "--deep", "--strict", "--verbose=2"])
-            .arg(app),
-        "codesign --verify (structural)",
-    )?;
+fn structural_command(app: &Path) -> Command {
+    let mut cmd = aterm_uds::spawnfd::command("/usr/bin/codesign");
+    cmd.args(["--verify", "--deep", "--strict", "--verbose=2"])
+        .arg(app);
+    cmd
+}
+
+/// What one ended [`structural_command`] run says.
+fn structural_from(out: &std::process::Output) -> Result<(), String> {
     if out.status.success() {
         Ok(())
     } else {
         Err(codesign_exit_refusal(
-            "codesign --verify (structural)",
+            STRUCTURAL,
             aterm_update_core::codesign::CodesignError::Refused {
                 code: out.status.code(),
                 stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
             },
         ))
     }
+}
+
+/// `PlistBuddy -c "Print :<key>"` of `app`'s `Contents/Info.plist`.
+fn plist_command(app: &Path, key: &str) -> Command {
+    let mut cmd = aterm_uds::spawnfd::command("/usr/libexec/PlistBuddy");
+    cmd.arg("-c")
+        .arg(format!("Print :{key}"))
+        .arg(app.join("Contents/Info.plist"));
+    cmd
 }
 
 /// Read `CFBundleVersion` (the monotonic build number) from a staged `.app`'s
@@ -565,13 +765,14 @@ fn codesign_structural(app: &Path) -> Result<(), String> {
 /// a rejection. The plist value is signed-in (codesign seals `Contents/`), so reading
 /// it after `verify_bundle` means it can't have been tampered post-signing.
 pub fn bundle_build_number(app: &Path) -> Result<u64, String> {
-    let plist = app.join("Contents/Info.plist");
-    let out = output_bounded(
-        aterm_uds::spawnfd::command("/usr/libexec/PlistBuddy")
-            .args(["-c", "Print :CFBundleVersion"])
-            .arg(&plist),
+    build_number_from(output_bounded(
+        &mut plist_command(app, "CFBundleVersion"),
         "PlistBuddy CFBundleVersion",
-    )?;
+    )?)
+}
+
+/// What one `PlistBuddy` read of `CFBundleVersion` says ([`bundle_build_number`]).
+fn build_number_from(out: std::process::Output) -> Result<u64, String> {
     if !out.status.success() {
         return Err(format!(
             "read CFBundleVersion: {}",
@@ -588,13 +789,15 @@ pub fn bundle_build_number(app: &Path) -> Result<u64, String> {
 /// `Contents/Info.plist` — display only (the update screen names the build it is about
 /// to activate); authority is always the build number and the sealed commit.
 pub fn bundle_short_version(app: &Path) -> Result<String, String> {
-    let plist = app.join("Contents/Info.plist");
-    let out = output_bounded(
-        aterm_uds::spawnfd::command("/usr/libexec/PlistBuddy")
-            .args(["-c", "Print :CFBundleShortVersionString"])
-            .arg(&plist),
+    short_version_from(output_bounded(
+        &mut plist_command(app, "CFBundleShortVersionString"),
         "PlistBuddy CFBundleShortVersionString",
-    )?;
+    )?)
+}
+
+/// What one `PlistBuddy` read of `CFBundleShortVersionString` says
+/// ([`bundle_short_version`]).
+fn short_version_from(out: std::process::Output) -> Result<String, String> {
     if !out.status.success() {
         return Err(format!(
             "read CFBundleShortVersionString: {}",
@@ -611,17 +814,11 @@ pub fn bundle_short_version(app: &Path) -> Result<String, String> {
     Ok(version)
 }
 
-/// Read the codesign-sealed source provenance from `ATermGitCommit` in Info.plist.
-/// Callers compare it through [`crate::commit_matches`]; this reader only enforces a
-/// small, valid UTF-8 value so process output cannot become an allocation surface.
-pub fn bundle_git_commit(app: &Path) -> Result<String, String> {
-    let plist = app.join("Contents/Info.plist");
-    let out = output_bounded(
-        aterm_uds::spawnfd::command("/usr/libexec/PlistBuddy")
-            .args(["-c", "Print :ATermGitCommit"])
-            .arg(&plist),
-        "PlistBuddy ATermGitCommit",
-    )?;
+/// What one `PlistBuddy` read of `ATermGitCommit` says: the codesign-sealed source
+/// provenance in Info.plist ([`BundleChecks::commit`]). Callers compare it through
+/// [`crate::commit_matches`]; this reader only enforces a small, valid UTF-8 value so
+/// process output cannot become an allocation surface.
+fn git_commit_from(out: std::process::Output) -> Result<String, String> {
     if !out.status.success() {
         return Err(format!(
             "read ATermGitCommit: {}",
@@ -640,24 +837,17 @@ pub fn bundle_git_commit(app: &Path) -> Result<String, String> {
     Ok(commit.to_string())
 }
 
-/// `codesign --verify --deep --strict` PLUS a `-R` designated requirement that pins
-/// the **Apple anchor + Developer-ID chain + our Team ID** — the one requirement text,
-/// [`aterm_update_core::codesign`]. The requirement makes codesign itself reject anything
-/// not signed by a genuine Apple-issued Developer-ID Application cert whose Team (OU)
-/// equals `expected_team`, so the authenticity anchor does not rest solely on
-/// `spctl`/Gatekeeper, which a Gatekeeper-disabled machine turns into a no-op (F1).
-/// Fails CLOSED on any codesign error, bounded like every helper here.
-fn codesign_verify(app: &Path, expected_team: &str) -> Result<(), String> {
-    use aterm_update_core::codesign::verify_developer_id_until;
-    let (deadline, bound_by_budget) = helper_deadline();
-    verify_developer_id_until(app, expected_team, true, deadline)
-        .map_err(|e| codesign_refusal(e, bound_by_budget))
-}
-
-/// The refusal a failed [`codesign_verify`] reports, split out so its classification
-/// is provable without a codesign that misbehaves on cue: always a rejection, and a
-/// PASSING one ([`mark_passing`]) only when codesign knowably reached no verdict on the
-/// bytes ([`codesign_exit_refusal`]).
+/// The refusal a failed team-pinned `codesign --verify` reports — `codesign -R` with
+/// the **Apple anchor + Developer-ID chain + our Team ID** requirement, the one
+/// requirement text, [`aterm_update_core::codesign`]. The requirement makes codesign
+/// itself reject anything not signed by a genuine Apple-issued Developer-ID
+/// Application cert whose Team (OU) equals the pin, so the authenticity anchor does
+/// not rest solely on `spctl`/Gatekeeper, which a Gatekeeper-disabled machine turns
+/// into a no-op (F1).
+///
+/// Split out so its classification is provable without a codesign that misbehaves on
+/// cue: always a rejection, and a PASSING one ([`mark_passing`]) only when codesign
+/// knowably reached no verdict on the bytes ([`codesign_exit_refusal`]).
 pub(crate) fn codesign_refusal(
     error: aterm_update_core::codesign::CodesignError,
     bound_by_budget: bool,
@@ -744,12 +934,18 @@ pub fn signing_identifier(app: &Path) -> Result<String, String> {
 /// `codesign -d --verbose=4 <app>`'s text, both streams (it prints to stderr
 /// whether or not it succeeds), bounded like every helper here.
 fn codesign_display(app: &Path, what: &str) -> Result<String, String> {
-    let out = output_bounded(
-        aterm_uds::spawnfd::command("/usr/bin/codesign")
-            .args(["-d", "--verbose=4"])
-            .arg(app),
-        what,
-    )?;
+    display_from(what, &output_bounded(&mut display_command(app), what)?)
+}
+
+/// `codesign -d --verbose=4 <app>`.
+fn display_command(app: &Path) -> Command {
+    let mut cmd = aterm_uds::spawnfd::command("/usr/bin/codesign");
+    cmd.args(["-d", "--verbose=4"]).arg(app);
+    cmd
+}
+
+/// What one ended [`display_command`] run (`what`) printed, or its refusal.
+fn display_from(what: &str, out: &std::process::Output) -> Result<String, String> {
     // A run that ended on a MOMENT — a signal, or a file it could not read just then —
     // reached no verdict, and its output is no evidence of a missing TeamIdentifier.
     if !out.status.success() {
@@ -800,13 +996,14 @@ fn parse_team_id(text: &str) -> Result<String, String> {
 /// `spctl -a -t exec` — Gatekeeper/notarization acceptance for a *runnable app*
 /// (`-t exec`, not the DMG-install `-t install`). Reads the stapled notarization
 /// ticket from the bundle, so it succeeds offline.
-fn spctl_assess(app: &Path) -> Result<(), String> {
-    let out = output_bounded(
-        aterm_uds::spawnfd::command("/usr/sbin/spctl")
-            .args(["-a", "-t", "exec", "-vvv"])
-            .arg(app),
-        "spctl assessment",
-    )?;
+fn spctl_command(app: &Path) -> Command {
+    let mut cmd = aterm_uds::spawnfd::command("/usr/sbin/spctl");
+    cmd.args(["-a", "-t", "exec", "-vvv"]).arg(app);
+    cmd
+}
+
+/// What one ended [`spctl_command`] run says ([`spctl_verdict`]).
+fn spctl_from(out: &std::process::Output) -> Result<(), String> {
     spctl_verdict(out.status, &String::from_utf8_lossy(&out.stderr))
 }
 
@@ -1217,14 +1414,14 @@ mod tests {
     #[test]
     fn codesign_verify_keeps_its_refusal_wording() {
         assert_eq!(
-            codesign_verify(Path::new("/nonexistent"), "AB\"CD").unwrap_err(),
+            verify_bundle(Path::new("/nonexistent"), "AB\"CD").unwrap_err(),
             "refusing to verify: pinned team id \"AB\\\"CD\" is not alphanumeric"
         );
         // Judging Apple's `/bin/ls` waits on trustd.
         if aterm_uds::deadline::trust_service_silent() {
             return;
         }
-        let refused = codesign_verify(Path::new("/bin/ls"), "ABCDE12345").unwrap_err();
+        let refused = verify_bundle(Path::new("/bin/ls"), "ABCDE12345").unwrap_err();
         assert!(
             refused.starts_with("codesign --verify (team-pinned requirement) failed: "),
             "{refused}"
@@ -1392,5 +1589,149 @@ mod tests {
         let refusal = team_id(&root.path().join("aterm.app")).expect_err("no team id");
         assert!(refusal.contains("TeamIdentifier not set"), "{refusal}");
         assert!(!crate::is_passing_refusal(&refusal), "{refusal}");
+    }
+
+    /// An ad-hoc-signed `aterm.app` under `root` whose Info.plist carries `plist`
+    /// (the `<dict>` body) and whose executable is a script exiting 0.
+    #[cfg(target_os = "macos")]
+    fn ad_hoc_bundle(root: &Path, plist: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let app = root.join("aterm.app");
+        let exe = app.join("Contents/MacOS/aterm");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(
+            app.join("Contents/Info.plist"),
+            format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict>\
+                 <key>CFBundleExecutable</key><string>aterm</string>\
+                 <key>CFBundleIdentifier</key><string>com.aterm.fixture</string>\
+                 {plist}</dict></plist>\n"
+            ),
+        )
+        .unwrap();
+        aterm_uds::deadline::sign_ad_hoc(&app);
+        app
+    }
+
+    /// EVERY HELPER OF A BUNDLE CHECK ANSWERS FOR ITSELF, AND THE VERDICT IS THE
+    /// SERIAL ONE. The helpers run at once, so each field is its own helper's
+    /// answer whatever the others said; the policy still reports the first refusal
+    /// in the serial order — the seal before the team before Gatekeeper — and a
+    /// read that failed refuses only itself.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn each_helper_of_a_bundle_check_answers_for_itself_and_the_verdict_is_the_serial_one() {
+        // Signing and judging a bundle wait on trustd.
+        if aterm_uds::deadline::trust_service_silent() {
+            return;
+        }
+        let root = aterm_tempfile::Builder::new()
+            .prefix("aterm-check-bundle-")
+            .tempdir()
+            .unwrap();
+        let app = ad_hoc_bundle(
+            root.path(),
+            "<key>CFBundleVersion</key><string>777</string>\
+             <key>ATermGitCommit</key><string>0123456789abcdef0123456789abcdef01234567</string>\
+             <key>CFBundleShortVersionString</key><string>1.2.3</string>",
+        );
+        // The structural tier: the seal holds, and every read answers.
+        let checks = check_bundle(&app, "", true);
+        assert_eq!(checks.policy, Ok(()));
+        assert_eq!(checks.build, Ok(777));
+        assert_eq!(
+            checks.commit.as_deref(),
+            Ok("0123456789abcdef0123456789abcdef01234567")
+        );
+        assert_eq!(checks.short_version, Some(Ok("1.2.3".to_string())));
+        assert!(checks.team.is_none(), "the structural tier reads no team");
+        // Pinned, the same bundle fails all three gate helpers at once: the verdict
+        // is the seal's, as the serial gate's was, while the team's own answer and
+        // the reads stand beside it.
+        let pinned = check_bundle(&app, "ABCDE12345", false);
+        let policy = pinned.policy.expect_err("an ad-hoc bundle fails the pin");
+        assert!(
+            policy.starts_with("codesign --verify (team-pinned requirement) failed: "),
+            "{policy}"
+        );
+        assert!(!crate::is_passing_refusal(&policy), "{policy}");
+        let team = pinned.team.expect("a pinned check reads the team");
+        assert!(
+            team.expect_err("ad hoc has no team")
+                .contains("TeamIdentifier not set"),
+            "the team helper ran and answered"
+        );
+        assert_eq!(pinned.build, Ok(777));
+        assert_eq!(pinned.short_version, None, "not asked for");
+        // A read that fails refuses itself, not the gate.
+        let unreadable = ad_hoc_bundle(
+            &root.path().join("unreadable"),
+            "<key>CFBundleVersion</key><string>seven</string>",
+        );
+        let checks = check_bundle(&unreadable, "", false);
+        assert_eq!(checks.policy, Ok(()));
+        let build = checks.build.expect_err("not an integer");
+        assert!(build.contains("is not an integer"), "{build}");
+        assert!(
+            checks
+                .commit
+                .expect_err("absent")
+                .starts_with("read ATermGitCommit")
+        );
+    }
+
+    /// A HELPER OF A BUNDLE CHECK THAT NEVER ANSWERS ends at the deadline, as a
+    /// passing refusal naming the budget, and the call comes back: here every
+    /// `PlistBuddy` blocks opening an Info.plist that is a FIFO nobody writes.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_bundle_check_helper_that_never_answers_is_a_passing_refusal_at_the_budget() {
+        let root = aterm_tempfile::Builder::new()
+            .prefix("aterm-check-bundle-fifo-")
+            .tempdir()
+            .unwrap();
+        let app = root.path().join("aterm.app");
+        std::fs::create_dir_all(app.join("Contents")).unwrap();
+        let plist = std::ffi::CString::new(
+            app.join("Contents/Info.plist")
+                .into_os_string()
+                .into_encoded_bytes(),
+        )
+        .unwrap();
+        // SAFETY: a NUL-terminated path that outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(plist.as_ptr(), 0o600) }, 0);
+        let begun = Instant::now();
+        let checks = {
+            let _budget = ApplyBudget::start(Duration::from_secs(2));
+            check_bundle(&app, "", false)
+        };
+        assert!(
+            begun.elapsed() < aterm_spec::wait::MUST_HAPPEN,
+            "the check did not come back"
+        );
+        for read in [checks.build.map(drop), checks.commit.map(drop)] {
+            let refusal = read.expect_err("a read that never answered is a refusal");
+            assert!(refusal.contains("verification budget"), "{refusal}");
+            assert!(crate::is_passing_refusal(&refusal), "{refusal}");
+        }
+    }
+
+    /// A helper that prints more than a pipe holds is read while it runs, so it
+    /// ends and is collected rather than stalling against the wait until its
+    /// deadline.
+    #[cfg(unix)]
+    #[test]
+    fn a_helper_printing_more_than_a_pipe_holds_is_collected() {
+        let out = output_bounded(
+            Command::new("/bin/sh")
+                .arg("-c")
+                .arg("head -c 300000 /dev/zero; head -c 300000 /dev/zero >&2"),
+            "a chatty helper",
+        )
+        .expect("a chatty helper runs to its exit");
+        assert!(out.status.success());
+        assert_eq!((out.stdout.len(), out.stderr.len()), (300_000, 300_000));
     }
 }

@@ -1,33 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE NO-SECOND-SPELLING GUARD.
+//! The no-second-spelling guard: `src/pipeline_table.rs` is the one declaration
+//! of every render pipeline aterm builds, and both backends read it. This test
+//! scans the renderer's source for the spellings a re-inlined descriptor would
+//! need and fails if any appears. It is a source scan because a wgpu descriptor
+//! is a plain struct literal: no type forbids a second spelling beside a table
+//! lookup.
 //!
-//! `crates/aterm-gpu/src/pipeline_table.rs` is the one declaration of every
-//! render pipeline aterm builds, and both backends read it. That makes drift
-//! between them impossible — but only for as long as nobody writes a pipeline's
-//! state down a second time. This test is what stops that: it scans the
-//! renderer's source for the spellings that a re-inlined descriptor would need,
-//! and fails if any of them come back.
-//!
-//! # Why this is a source scan and not a type
-//!
-//! Nothing in Rust's type system forbids `write_mask: wgpu::ColorWrites::ALL`
-//! next to a table lookup — the descriptor is a plain struct literal and always
-//! will be. The defect this file guards against is not a type error; it is
-//! somebody adding a nineteenth pipeline the honest-looking way, by copying the
-//! forty lines above it. The scan is the only thing that can see that.
-//!
-//! It is armed like every other guard here: re-inline ONE literal at ONE
-//! construction site and this test goes red.
-//!
-//! # What it deliberately does not cover
-//!
-//! `metal/mod.rs`'s `StateProbe` harness calls `set_color_attachment` with
-//! arbitrary masks and blend factors on purpose — it exists to prove on the GPU
-//! that the FFI's write mask and blend setters are honoured, which needs states
-//! no shipping pipeline uses. It is test-only and is not scanned. The shipping
-//! Metal path (`metal/blit.rs`) is.
+//! `metal/mod.rs`'s test-only `StateProbe` harness sets arbitrary masks and
+//! blend factors on purpose (it proves the FFI setters on the GPU), so it is not
+//! scanned; the shipping Metal path (`metal/blit.rs`) is.
 
 /// The renderer, as text. `include_str!` rather than a file read so the test
 /// binary cannot be run against a stale or missing tree.
@@ -50,14 +33,13 @@ fn forbid(src: &str, file: &str, needle: &str, why: &str) {
     );
 }
 
-/// THE GUARD. Every piece of pipeline state a `wgpu` descriptor can carry has
-/// exactly one spelling in this crate, and it is in `pipeline_table.rs`.
+/// Every piece of pipeline state a `wgpu` descriptor can carry has exactly one
+/// spelling in this crate, in `pipeline_table.rs`.
 #[test]
 fn the_renderer_spells_no_pipeline_state_of_its_own() {
-    // POSITIVE CONTROL FIRST. A scan that reads the wrong file, or a file whose
-    // shape changed out from under it, passes trivially — so prove the text is
-    // the renderer and that it still builds pipelines at all before concluding
-    // anything from an absence.
+    // Positive control: a scan of the wrong file passes trivially, so prove the
+    // text is the renderer and still builds pipelines before concluding anything
+    // from an absence.
     assert!(
         RENDERER.len() > 100_000,
         "the renderer source did not load (got {} bytes)",
@@ -70,9 +52,8 @@ fn the_renderer_spells_no_pipeline_state_of_its_own() {
          pipelines the way it describes"
     );
 
-    // ONE construction site. Every pipeline in the crate is built by
-    // `build_table_pipeline`, which is the only function that may assemble a
-    // `RenderPipelineDescriptor`.
+    // One construction site: `build_table_pipeline` is the only function that
+    // assembles a `RenderPipelineDescriptor`.
     let sites = RENDERER.matches("create_render_pipeline(").count();
     assert_eq!(
         sites, 1,
@@ -82,8 +63,8 @@ fn the_renderer_spells_no_pipeline_state_of_its_own() {
          defect this crate's pipeline table exists to make impossible."
     );
 
-    // The literals a re-inlined descriptor needs. Each is a state THE PIPELINE
-    // TABLE declares, and each has a documented drift to its name.
+    // The literals a re-inlined descriptor needs, each a state the pipeline table
+    // declares.
     for (needle, why) in [
         (
             "wgpu::BlendState",
@@ -151,10 +132,9 @@ fn the_renderer_spells_no_pipeline_state_of_its_own() {
         forbid(RENDERER, "src/renderer.rs", needle, why);
     }
 
-    // Entry points, specifically. `entry_point:` itself is legitimate — it is
-    // how `build_table_pipeline` passes `spec.vs` / `spec.fs` — so what is
-    // forbidden is a STRING LITERAL in that slot. This is the drift that let
-    // `renderer.rs` ask for `vs_fs` while the MSL defined `vs_fs_bloom`.
+    // Entry points: `entry_point:` itself is legitimate (`build_table_pipeline`
+    // passes `spec.vs` / `spec.fs`), so what is forbidden is a string literal in
+    // that slot.
     forbid(
         RENDERER,
         "src/renderer.rs",

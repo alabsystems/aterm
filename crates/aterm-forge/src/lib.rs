@@ -42,12 +42,18 @@
 //! | [`budget`] | `tools/forge-budget.tsv` — the lower-only ratchet |
 //! | [`attest`] | provenance, license and `[patch]`-liveness obligations |
 //! | [`check`] | the gate reporter: all of the above, no compilation |
+//! | [`serde_attrs`] | every `#[serde(...)]` key and form: the first-party derive's closed set |
 //! | `measured` | test-only: the pinned per-cell baseline, in ONE place |
+#![allow(
+    clippy::disallowed_types,
+    reason = "never linked into the shipped binary: the third-party survey behind targo --unverified forge"
+)]
 
 pub mod attest;
 pub mod blame;
 pub mod budget;
 pub mod check;
+pub mod deny;
 mod direct_vendor;
 pub mod dominator;
 pub mod loc;
@@ -72,13 +78,14 @@ pub mod model;
 pub mod policy;
 pub mod provenance;
 pub mod resolve;
+pub mod serde_attrs;
 pub mod survey;
 
-/// Exit codes, matching `aterm-verify`'s set so one convention covers the gates.
+/// Exit codes, matching `aterm-verify`'s set so one convention covers every check.
 pub mod exit {
     /// Every obligation held.
     pub const PASS: u8 = 0;
-    /// A policy obligation failed — the gate is RED.
+    /// A policy obligation failed — the check is RED.
     pub const FAIL: u8 = 1;
     /// The command line was wrong.
     pub const USAGE: u8 = 2;
@@ -87,7 +94,7 @@ pub mod exit {
 }
 
 /// The house verdict shape, mirroring `aterm_census::CensusOutcome`: the log is
-/// returned rather than printed so each consumer routes it (xtask → stderr,
+/// returned rather than printed so each consumer routes it (verify → its log,
 /// build gate → compile error).
 pub struct Outcome {
     pub ok: bool,

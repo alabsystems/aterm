@@ -1,0 +1,297 @@
+// Copyright 2026 Andrew Yates
+// SPDX-License-Identifier: Apache-2.0
+
+//! The tar writer, proven by the client: every archive it writes extracts through
+//! `atpkg::extract_tar_zst` under the client's own caps, to a tree whose `tree_root` is
+//! the stage's, with hard links kept as one file; and the signed `disk_installed` covers
+//! a small-file tree whose structure outweighs its content. Every pack here runs the
+//! `zstd` CLI, which must be on `PATH` (see the suite's docs).
+
+use std::path::Path;
+
+use atpkg_publish::artifact::tarwrite;
+
+use super::fixture::{put, put_exe, scratch, set_mode};
+
+/// The client's extraction cap for a signed `disk_installed` (`atpkg::install`'s
+/// `size_cap`) and its entry ceiling.
+fn client_cap(disk_installed: u64) -> u64 {
+    disk_installed.saturating_mul(2).max(1 << 20)
+}
+const MAX_ENTRIES: u64 = 4_000_000;
+
+fn extract(asset: &Path, dest: &Path, disk_installed: u64) {
+    std::fs::create_dir_all(dest).expect("mkdir dest");
+    set_mode(dest, 0o700);
+    atpkg::extract_tar_zst(asset, dest, client_cap(disk_installed), MAX_ENTRIES)
+        .unwrap_or_else(|e| panic!("the client refuses what was signed: {e:?}"));
+}
+
+#[cfg(unix)]
+fn ino(p: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt as _;
+    std::fs::metadata(p).expect("stat").ino()
+}
+
+/// A stage with everything a sysroot carries: nested dirs, an executable and a data
+/// file at odd modes, a three-name hard-link group, a path past ustar's 100 bytes that
+/// splits into prefix/name, one whose last component alone is past 100 (a PAX record),
+/// and an empty directory.
+fn stage(root: &Path) {
+    put(&root.join("bin/trustc"), b"\x7fELF compiler bytes");
+    set_mode(&root.join("bin/trustc"), 0o700);
+    put(&root.join("share/doc/README"), b"read me\n");
+    set_mode(&root.join("share/doc/README"), 0o600);
+    put(
+        &root.join("lib/librustc_driver-0123.so"),
+        &vec![7u8; 70_000],
+    );
+    std::fs::create_dir_all(root.join("lib/rustlib/aarch64-unknown-linux-gnu/lib")).expect("mkdir");
+    std::fs::hard_link(
+        root.join("lib/librustc_driver-0123.so"),
+        root.join("lib/rustlib/aarch64-unknown-linux-gnu/lib/librustc_driver-0123.so"),
+    )
+    .expect("link");
+    std::fs::hard_link(root.join("bin/trustc"), root.join("bin/rustc")).expect("link");
+    let deep = format!("lib/rustlib/src/rust/{}/{}", "d".repeat(60), "f".repeat(70));
+    put(&root.join(&deep), b"deep\n");
+    let long = format!("lib/rustlib/{}", "n".repeat(120));
+    put(&root.join(long), b"long\n");
+    std::fs::create_dir_all(root.join("libexec")).expect("mkdir empty");
+}
+
+#[test]
+#[cfg(unix)]
+fn what_it_writes_the_client_extracts_to_the_same_tree_root_with_links_kept() {
+    let tmp = scratch("tar-roundtrip");
+    let root = tmp.path().join("stage");
+    stage(&root);
+    let asset = tmp.path().join("x.tar.zst");
+    let packed = tarwrite::write(&root, &asset).expect("pack");
+    assert_eq!(
+        packed.tree_root,
+        atpkg::tree_root(&root).expect("stage root")
+    );
+    let out = tmp.path().join("out");
+    extract(&asset, &out, packed.disk_installed);
+    assert_eq!(
+        atpkg::tree_root(&out).expect("extracted root"),
+        packed.tree_root,
+        "the signed root is the one every client recomputes"
+    );
+    assert_eq!(ino(&out.join("bin/rustc")), ino(&out.join("bin/trustc")));
+    assert_eq!(
+        ino(&out.join("lib/librustc_driver-0123.so")),
+        ino(&out.join("lib/rustlib/aarch64-unknown-linux-gnu/lib/librustc_driver-0123.so")),
+        "a hard-link group ships once"
+    );
+    assert!(
+        packed.stream_bytes < 2 * 70_000,
+        "the 70 kB driver is stored once, not per name ({} B stream)",
+        packed.stream_bytes
+    );
+    assert!(out.join("libexec").is_dir(), "an empty directory survives");
+    assert_eq!(packed.sha256, atpkg::sha256_file(&asset).expect("hash"));
+    assert_eq!(packed.size, std::fs::metadata(&asset).expect("stat").len());
+}
+
+#[test]
+#[cfg(unix)]
+fn the_archive_is_deterministic_whatever_the_stage_path_or_its_modes() {
+    let tmp = scratch("tar-determinism");
+    let (a, b) = (tmp.path().join("one/stage"), tmp.path().join("two/x"));
+    stage(&a);
+    stage(&b);
+    set_mode(&b.join("bin/trustc"), 0o755);
+    let pa = tarwrite::write(&a, &tmp.path().join("a.tar.zst")).expect("pack a");
+    let pb = tarwrite::write(&b, &tmp.path().join("b.tar.zst")).expect("pack b");
+    assert_eq!(pa.sha256, pb.sha256);
+    assert_eq!(pa.tree_root, pb.tree_root);
+}
+
+#[test]
+#[cfg(unix)]
+fn a_symlink_or_an_empty_tree_is_refused() {
+    let tmp = scratch("tar-refusals");
+    let root = tmp.path().join("stage");
+    put(&root.join("bin/trustc"), b"x");
+    std::os::unix::fs::symlink("trustc", root.join("bin/rustc")).expect("symlink");
+    let err = tarwrite::write(&root, &tmp.path().join("l.tar.zst")).expect_err("a link");
+    assert!(err.to_string().contains("symlink"), "{err}");
+    let empty = tmp.path().join("empty");
+    std::fs::create_dir_all(empty.join("bin")).expect("mkdir");
+    let err = tarwrite::write(&empty, &tmp.path().join("e.tar.zst")).expect_err("empty");
+    assert!(err.to_string().contains("no file"), "{err}");
+}
+
+/// 1,500 × 100 B is 150 kB of content in a ~1.5 MB stream: content alone would sign a
+/// 1 MiB cap (the floor), under the structure the client must read.
+#[test]
+fn a_small_file_tree_is_signed_by_its_stream_and_an_ordinary_one_by_its_content() {
+    let tmp = scratch("tar-size");
+    let small = tmp.path().join("small");
+    for i in 0..1500 {
+        put(&small.join(format!("share/f{i}")), &[0u8; 100]);
+    }
+    let packed = tarwrite::write(&small, &tmp.path().join("small.tar.zst")).expect("pack");
+    assert_eq!(packed.content_bytes, 150_000);
+    assert!(
+        packed.stream_bytes > 1 << 20,
+        "the fixture no longer outweighs its content ({} B)",
+        packed.stream_bytes
+    );
+    assert!(2 * packed.disk_installed >= packed.stream_bytes);
+    extract(
+        &packed.asset,
+        &tmp.path().join("small-out"),
+        packed.disk_installed,
+    );
+
+    let big = tmp.path().join("big");
+    put(&big.join("share/blob"), &vec![0u8; 400_000]);
+    put(&big.join("share/note"), b"x");
+    let packed = tarwrite::write(&big, &tmp.path().join("big.tar.zst")).expect("pack");
+    assert_eq!(packed.disk_installed, 400_001);
+}
+
+#[test]
+fn disk_installed_is_the_larger_of_content_and_half_the_stream() {
+    assert_eq!(tarwrite::disk_installed(10, 100), 50);
+    assert_eq!(tarwrite::disk_installed(10, 101), 51);
+    assert_eq!(tarwrite::disk_installed(400, 100), 400);
+}
+
+/// The pack trusts no compressor's word: one that fails, or exits 0 having written a
+/// stream other than the archive (or one without the content checksum), fails the pack.
+/// The control: the real `zstd` CLI through the same entry point packs the same tree.
+#[test]
+#[cfg(unix)]
+fn a_compressor_that_fails_or_writes_another_stream_fails_the_pack() {
+    use aterm_zstd::frame::{self, Checksum};
+    use std::ffi::OsStr;
+
+    let tmp = scratch("tar-compressor");
+    let root = tmp.path().join("stage");
+    put(&root.join("bin/tool"), b"tool bytes\n");
+    let frame_of = |name: &str, checksum| {
+        let mut zst = Vec::new();
+        frame::write_raw(&mut zst, b"hello", checksum).expect("frame");
+        let path = tmp.path().join(name);
+        put(&path, &zst);
+        path
+    };
+    let other = frame_of("other.zst", Checksum::Xxh64);
+    let unchecked = frame_of("unchecked.zst", Checksum::Omitted);
+    let stand_in = |name: &str, body: String| {
+        put_exe(
+            &tmp.path().join(name),
+            format!("#!/bin/sh\n{body}").as_bytes(),
+        )
+    };
+    for (compressor, want) in [
+        (tmp.path().join("missing-compressor"), "did not start"),
+        (
+            stand_in("fails", "echo 'zstd: boom' >&2\nexit 3\n".into()),
+            "failed (exit status: 3): zstd: boom",
+        ),
+        (
+            stand_in(
+                "other",
+                format!("cat > /dev/null\ncat '{}'\n", other.display()),
+            ),
+            "decodes to 5 bytes",
+        ),
+        (
+            stand_in(
+                "unchecked",
+                format!("cat > /dev/null\ncat '{}'\n", unchecked.display()),
+            ),
+            "no content checksum",
+        ),
+    ] {
+        let asset = tmp.path().join("x.tar.zst");
+        let err = tarwrite::write_with(&root, &asset, compressor.as_os_str())
+            .expect_err("a stand-in's stream");
+        assert!(
+            err.to_string().contains(want),
+            "{}: {err}",
+            compressor.display()
+        );
+    }
+    let asset = tmp.path().join("real.tar.zst");
+    let packed = tarwrite::write_with(&root, &asset, OsStr::new(tarwrite::COMPRESSOR))
+        .expect("the real compressor");
+    extract(&asset, &tmp.path().join("out"), packed.disk_installed);
+}
+
+/// The probe a lane runs before any build ([`atpkg_publish::api::Packer::can_pack`]): an
+/// unset or empty `PATH`, or one whose `zstd` is not executable, has no compressor; a
+/// directory holding an executable `zstd` has that one.
+#[test]
+#[cfg(unix)]
+fn the_compressor_probe_finds_only_an_executable_zstd() {
+    use std::ffi::OsStr;
+
+    for path in [None, Some(OsStr::new(""))] {
+        let e = tarwrite::compressor_in(path).expect_err("no PATH, no zstd");
+        assert!(e.contains("no `zstd` on this builder's PATH"), "{e}");
+    }
+    let tmp = scratch("tar-probe");
+    let dir = tmp.path().join("bin");
+    put(&dir.join("zstd"), b"#!/bin/sh\n");
+    tarwrite::compressor_in(Some(dir.as_os_str())).expect_err("not executable");
+    set_mode(&dir.join("zstd"), 0o755);
+    let joined = std::env::join_paths([tmp.path().join("none"), dir.clone()]).expect("join");
+    assert_eq!(
+        tarwrite::compressor_in(Some(&joined)).expect("an executable zstd"),
+        dir.join("zstd")
+    );
+}
+
+/// A compressor that fills its stderr pipe before it reads a stream larger than its stdin
+/// pipe still packs: the pack drains stderr while it writes, rather than waiting on a
+/// compressor that waits on it. One minute is the hang detector.
+#[test]
+#[cfg(unix)]
+fn a_compressor_loud_on_stderr_before_it_reads_still_packs() {
+    const CHILD: &str = "ATERM_PUBLISH_LOUD_COMPRESSOR_CHILD";
+    const TEST: &str =
+        "artifact::tarwrite::a_compressor_loud_on_stderr_before_it_reads_still_packs";
+    let Some(path) = std::env::var_os(CHILD) else {
+        // The parent owns the scratch directory even if the child must be killed.
+        // `output_until` owns a new process group, kills the complete group at the
+        // minute hang detector, and reaps the libtest child before returning.
+        let tmp = scratch("tar-loud");
+        let mut command =
+            aterm_uds::spawnfd::command(std::env::current_exe().expect("test binary"));
+        command.args(["--exact", TEST, "--nocapture"]);
+        command.env(CHILD, tmp.path());
+        let output = aterm_uds::deadline::output_until(
+            &mut command,
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+        )
+        .expect("the owned pack child hung or could not run");
+        assert!(
+            output.status.success(),
+            "pack child: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read(tmp.path().join("packed")).expect("the exact test ran"),
+            b"packed\n"
+        );
+        return;
+    };
+    let tmp = std::path::PathBuf::from(path);
+    let root = tmp.join("stage");
+    put(&root.join("share/blob"), &vec![7u8; 1 << 20]);
+    let loud = put_exe(
+        &tmp.join("loud"),
+        b"#!/bin/sh\nhead -c 1048576 /dev/zero >&2\nexec zstd \"$@\"\n",
+    );
+    let asset = tmp.join("loud.tar.zst");
+    let packed = tarwrite::write_with(&root, &asset, loud.as_os_str()).expect("the pack");
+    extract(&asset, &tmp.join("out"), packed.disk_installed);
+    std::fs::write(tmp.join("packed"), b"packed\n").expect("case completed");
+}

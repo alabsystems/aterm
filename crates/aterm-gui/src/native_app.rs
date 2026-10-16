@@ -233,6 +233,10 @@ pub(crate) struct EditorViewState {
     /// Retained Manual diagnostics are navigable without moving the document
     /// caret. The semantic modeline announces the complete selected message.
     pub(crate) config_diagnostic_selected: usize,
+    /// What Settings ▸ Manual's reveal did ("… added at its default"): the
+    /// footer says it ahead of a standing config warning until the next edit
+    /// or caret move, so the person sees the next step they were sent for.
+    pub(crate) reveal_status: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1453,7 +1457,6 @@ mod recovery_tests {
                         motion: ViewMotionCx::default(),
                         terminal_font_px: 13.0,
                         terminal_scale: 1.0,
-                        terminal_theme: aterm_render::Theme::default(),
                         semantic_font: None,
                         document: None,
                     },
@@ -1753,6 +1756,11 @@ pub(crate) enum AppEvent {
         visible_lines: usize,
     },
     ScrollLines(i32),
+    /// Up (`-1`) / Down (`1`) in Settings: the keyboard moves to the control
+    /// before or after the focused one in the page's list and the list
+    /// follows; with no control of the list focused, the list scrolls a row.
+    /// Only Settings is sent this; the wheel stays `ScrollLines`.
+    StepFocus(i32),
     /// Page Up (`-1`) / Page Down (`1`) in Settings: the reducer moves by the
     /// page its last render showed (design ruling 267) — a fixed line count
     /// skipped rows of a six-row list. Only Settings is sent this; every
@@ -1792,6 +1800,13 @@ pub(crate) enum AppEvent {
     MessagesChanged {
         revision: u64,
     },
+    /// The Settings ▸ Harness projection advanced (opened, refreshed, a
+    /// session's Autopilot written, the policy adopted, the ledgers read, a
+    /// host note); every Settings view repaints from the shared controller
+    /// snapshot (the `PackagesChanged` twin).
+    HarnessChanged {
+        revision: u64,
+    },
     DocumentChanged {
         document: DocumentId,
         revision: u64,
@@ -1813,6 +1828,11 @@ pub(crate) enum AppEvent {
     ExternalOpenFinished {
         operation: OperationId,
         outcome: ExternalOpenOutcome,
+    },
+    /// The host performed (or could not perform) a [`ThemesRequest`].
+    ThemesFinished {
+        operation: OperationId,
+        outcome: ThemesOutcome,
     },
     UpdateFinished {
         operation: OperationId,
@@ -1968,9 +1988,11 @@ pub(crate) enum DamageRegion {
     },
 }
 
+/// What a Settings edit expects its key to hold. Every write says, so a file
+/// changed underneath it conflicts instead of being overwritten unseen, and
+/// the status can name the value a change replaced.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ExpectedConfigValue {
-    Any,
     Exact(Option<String>),
 }
 
@@ -2016,6 +2038,56 @@ pub(crate) struct ExternalOpenRequest {
     pub(crate) user_initiated: bool,
 }
 
+/// What Settings' theme picker asks the host to do with the themes folder.
+/// The view names a theme by its catalog id, never by a path: the host
+/// resolves the folder ([`aterm_types::scheme::user_theme_dir`]) itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ThemesRequest {
+    /// Show the themes folder (created first, so there is somewhere to drop
+    /// a file).
+    OpenFolder,
+    /// Show the file behind the catalog row `id`; the folder when no such
+    /// file is there (an unreadable name, or a file since removed).
+    OpenFile { id: String },
+    /// Ask for a theme file in the platform file picker and import it as a
+    /// new theme ([`aterm_types::scheme_install::install_theme_file_as_new`]).
+    Import,
+    /// Settings ▸ Themes' "Save as theme…": write `text` (a native theme
+    /// file the view serialized and read back) into the themes folder as
+    /// `<id>.conf`, never over an existing theme. The view names the id; the
+    /// host resolves the folder.
+    Save { id: String, text: String },
+    /// Settings ▸ Themes' Trash on a card of the person's own: move the file
+    /// behind catalog id `id` to the Trash (recoverable). The host refuses a
+    /// built-in's name and an id that names no regular file in the folder;
+    /// the view refuses the theme in use before asking.
+    Trash { id: String },
+}
+
+/// How a [`ThemesRequest`] went.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ThemesOutcome {
+    Opened,
+    /// Imported as `id`; `dropped` keys had no place in aterm's format.
+    Imported {
+        id: String,
+        dropped: usize,
+    },
+    /// Saved as theme `id` (a [`ThemesRequest::Save`]).
+    Saved {
+        id: String,
+    },
+    /// Theme `id`'s file went to the Trash (a [`ThemesRequest::Trash`]).
+    Trashed {
+        id: String,
+    },
+    /// The person dismissed the file picker.
+    Cancelled,
+    Failed {
+        message: String,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ExternalOpenOutcome {
     Opened,
@@ -2029,12 +2101,12 @@ pub(crate) enum ConfigEditorOutcome {
 }
 
 /// Path-authority-free intent carried from Settings to the canonical Manual
-/// editor. The host resolves only its own aterm.toml capability; this value can
-/// choose text inside that document but can never redirect the filesystem open.
+/// editor: the key to reveal, or to offer to add. The host resolves only its own
+/// aterm.toml capability; this value can choose text inside that document but
+/// can never redirect the filesystem open.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ConfigEditorTarget {
     Key(String),
-    Search(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2042,6 +2114,32 @@ pub(crate) enum UpdateRequest {
     Check,
     InstallAndRelaunch,
     Retry,
+}
+
+/// What Settings ▸ Harness asks of the host (`AppEffect::Harness`). The
+/// reducer names a session by its local id and a mode, never a path or a
+/// store: the host re-resolves the session and writes its word through the
+/// App's one writer (`App::set_session_autopilot`). Neither has a reply — the
+/// page converges on the republished projection (`AppEvent::HarnessChanged`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HarnessRequest {
+    /// Read the harness's ledgers again, off the event loop, and republish
+    /// (the page's Refresh, and the route's arrival).
+    Refresh,
+    /// Write session `session`'s own Autopilot word (a press on its row's
+    /// Cruise, Land or Off).
+    Autopilot {
+        session: u64,
+        word: aterm_agent::supervise::Autopilot,
+    },
+    /// Look at the AI CLIs again, off the event loop, and republish (Settings
+    /// ▸ Harness ▸ AI CLIs' Refresh, and the route's arrival).
+    AiLook,
+    /// Open a tab that runs one AI CLI's fix: `aterm ai login <id>`, or `aterm
+    /// pkg install <id>` for one not installed (a press on its row's Sign in
+    /// or Install). The host re-reads the row from its newest look; it types
+    /// the line into a fresh shell as the operator's launch line is typed.
+    AiSignIn { id: &'static str },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2254,6 +2352,17 @@ pub(crate) enum AppEffect {
     OpenLogFolder {
         reply: ReplyToken<ExternalOpenOutcome>,
     },
+    /// Settings ▸ Harness's Refresh, its route's arrival, or a session's
+    /// Autopilot press ([`HarnessRequest`]): performed by the host, answered
+    /// by the republished projection.
+    Harness(HarnessRequest),
+    /// Settings' theme picker footer and Needs-attention rows: open the
+    /// themes folder or one theme file, or import a theme. Identity only, no
+    /// path (the `OpenConfigEditor` rule); answers `ThemesFinished`.
+    Themes {
+        request: ThemesRequest,
+        reply: ReplyToken<ThemesOutcome>,
+    },
     InvalidateOwnPresentation,
     RepaintSelf(DamageRegion),
 }
@@ -2273,6 +2382,10 @@ pub(crate) struct ViewMotionCx {
     /// not yet redeemed. Settings states GPU-backed availability from it, injected
     /// like every other host fact here, never read from a process global.
     pub(crate) backend_gpu: bool,
+    /// The cat this window's cursor companion wears now (the pinned
+    /// favourite, else the tenured program cat, else the launch kitty), so
+    /// the Cursor Styles preview draws the coat this terminal draws.
+    pub(crate) companion_look: aterm_effects::kitty_registry::KittyLook,
 }
 
 impl Default for ViewMotionCx {
@@ -2284,6 +2397,7 @@ impl Default for ViewMotionCx {
             system_dark: false,
             serious: false,
             backend_gpu: false,
+            companion_look: aterm_effects::kitty_registry::KittyLook::default(),
         }
     }
 }
@@ -2304,10 +2418,6 @@ pub(crate) struct ViewCx<'a> {
     /// Device pixels per logical native pixel; previews convert their selected
     /// physical size before native paint applies this scale.
     pub(crate) terminal_scale: f32,
-    /// The renderer's actually-applied terminal palette. Settings may layer an
-    /// uncommitted built-in theme or color draft over this value without
-    /// recoloring its own chrome or consulting platform APIs.
-    pub(crate) terminal_theme: aterm_render::Theme,
     /// One exact host-prepared semantic renderer source for this view pass.
     /// Semantic compile and paint only consume this immutable snapshot; they
     /// never request, poll, or lock the candidate service.
@@ -2442,10 +2552,22 @@ impl UpdateCx<'_> {
         self.effects.push(AppEffect::OpenPackagesLog);
     }
 
+    /// Ask the host for a Settings ▸ Harness act ([`AppEffect::Harness`]).
+    pub(crate) fn harness(&mut self, request: HarnessRequest) {
+        self.effects.push(AppEffect::Harness(request));
+    }
+
     pub(crate) fn open_log_folder(&mut self) -> OperationId {
         let reply = self.view_reply();
         let operation = reply.operation;
         self.effects.push(AppEffect::OpenLogFolder { reply });
+        operation
+    }
+
+    pub(crate) fn themes(&mut self, request: ThemesRequest) -> OperationId {
+        let reply = self.view_reply();
+        let operation = reply.operation;
+        self.effects.push(AppEffect::Themes { request, reply });
         operation
     }
 
@@ -2680,6 +2802,23 @@ impl NativeRuntime {
             return false;
         };
         settings.replace_messages(messages, revision);
+        true
+    }
+
+    /// Replace the process-global Settings ▸ Harness projection (the harness
+    /// analogue of [`Self::replace_settings_packages`]).
+    pub(crate) fn replace_settings_harness(
+        &mut self,
+        harness: crate::harness_screen::HarnessState,
+        revision: u64,
+    ) -> bool {
+        let Some(settings) = self.instances.values_mut().find_map(|app| match app {
+            NativeApp::Settings(settings) => Some(settings),
+            NativeApp::Markdown(_) | NativeApp::Editor(_) | NativeApp::Recovery(_) => None,
+        }) else {
+            return false;
+        };
+        settings.replace_harness(harness, revision);
         true
     }
 
@@ -5357,27 +5496,28 @@ fn bounded_middle_label_to_width_for_face(
     }
 }
 
-/// Preserve the complete metadata-derived help in accessibility/status
-/// semantics while expressing verbose platform constraints compactly in the
-/// one-line visual strip. Every operational distinction remains visible.
-fn config_visual_help(help: &str) -> String {
-    help.replace(
-        "GPU rendering (restart) · gpu · true / false · default true · Applies next launch · ",
-        "GPU rendering · ",
-    )
-    .replace("default 1.0 (solid)", "default 1.0")
-    .replace(
-        "macOS GPU window path only; CPU and non-macOS GPU grids stay solid",
-        "macOS GPU; CPU/other GPU solid",
-    )
-    .replace(
-        "translucent backgrounds enforce at least 4.5:1 text contrast",
-        "translucency ≥4.5:1 contrast",
-    )
-    .replace(
-        "a launch --cpu or --gpu overrides this value (the last one given wins)",
-        "last --cpu/--gpu > config",
-    )
+/// A toolbar row's buttons at their own (label) widths where the row holds
+/// them, else sharing the row equally, so no label is cut to keep a width.
+fn toolbar_row_widths(
+    mut buttons: Vec<crate::native_ui::UiNode>,
+    row_width: f32,
+    gap: f32,
+) -> Vec<crate::native_ui::UiNode> {
+    use crate::native_ui::Length;
+    let natural = buttons
+        .iter()
+        .map(|button| match button.layout.width {
+            Length::Fixed(width) => width,
+            _ => 0.0,
+        })
+        .sum::<f32>()
+        + gap * buttons.len().saturating_sub(1) as f32;
+    if natural > row_width {
+        for button in &mut buttons {
+            button.layout.width = Length::Fill;
+        }
+    }
+    buttons
 }
 
 /// Compact editor controller seam. The editor module owns commands/edit
@@ -5652,14 +5792,37 @@ impl NativeAppModel for EditorApp {
         })
         .flatten()
         .filter(|(context, _)| view.config_completion_dismissed != Some(*context))
-        .filter(|(_, assist)| assist.help.is_some() || !assist.completions.is_empty());
+        // Suggestions show while a name is partly typed, or once asked for
+        // (Ctrl-Space, Tab): a caret merely resting on a line lists nothing,
+        // and keeps only the one line of help for the key under it.
+        // The third field: suggestions are there, waiting to be asked for.
+        .map(|(context, mut assist)| {
+            let listed = assist.typed || view.config_completion_interaction == Some(context);
+            let waiting = !listed && !assist.completions.is_empty();
+            if !listed {
+                assist.completions.clear();
+                assist.help = assist.resting_help.take();
+            }
+            (context, assist, waiting, listed)
+        })
+        .filter(|(_, assist, _, _)| assist.help.is_some() || !assist.completions.is_empty());
+        // The panel over the file: a list where one is asked for (or typed
+        // into), and the help line alone, with no row under it, where the
+        // caret only rests on a key.
         let completion_count = command_completion.as_ref().map_or_else(
             || {
-                config_assist
-                    .as_ref()
-                    .map_or(0, |(_, assist)| assist.completions.len().max(1))
+                config_assist.as_ref().map_or(
+                    crate::native_ui::EditorPalette::None,
+                    |(_, assist, _, listed)| {
+                        if *listed {
+                            crate::native_ui::EditorPalette::Rows(assist.completions.len().max(1))
+                        } else {
+                            crate::native_ui::EditorPalette::Help
+                        }
+                    },
+                )
             },
-            |(_, candidates, _)| candidates.len().max(1),
+            |(_, candidates, _)| crate::native_ui::EditorPalette::Rows(candidates.len().max(1)),
         );
         let shell = crate::native_ui::editor_shell_metrics(cx.viewport, completion_count);
         let outer_padding = shell.outer_padding;
@@ -5676,7 +5839,13 @@ impl NativeAppModel for EditorApp {
         let editor_rect =
             crate::native_ui::editor_text_viewport_rect_with_palette(cx.viewport, completion_count);
         let editor_geometry = crate::native_ui::text_viewport_geometry(editor_rect);
+        // Caret reveal keeps to the rows shown whole; the painter projects
+        // the part row too.
         let line_capacity = crate::native_ui::editor_visible_line_capacity_with_palette(
+            cx.viewport,
+            completion_count,
+        );
+        let painted_capacity = crate::native_ui::editor_painted_line_capacity_with_palette(
             cx.viewport,
             completion_count,
         );
@@ -5704,7 +5873,7 @@ impl NativeAppModel for EditorApp {
                 crate::native_editor::project_viewport_with(
                     &lines,
                     &effective,
-                    line_capacity,
+                    painted_capacity,
                     column_capacity,
                 )
             })
@@ -5791,11 +5960,20 @@ impl NativeAppModel for EditorApp {
         } else {
             0
         };
+        // A toolbar button is as wide as its label, as Settings' buttons are,
+        // so the bar reads as buttons rather than a row of equal fields. A row
+        // whose buttons do not fit at their own widths shares the bar equally
+        // ([`toolbar_row_widths`]).
+        let in_row =
+            if compact_commands { 3 } else { 6 } + if config_diagnostic_count > 0 { 2 } else { 0 };
+        let bar_width = (cx.viewport.width - outer_padding * 2.0).max(0.0);
+        let slot_width = ((bar_width - command_gap * (in_row - 1) as f32) / in_row as f32).max(0.0);
         let command_button = |key: &'static str,
                               visual_label: &'static str,
                               label: &'static str,
                               action: &'static str,
                               enabled: bool| {
+            let natural = crate::native_ui::native_button_label_width(visual_label) + 28.0;
             UiNode::new(
                 key,
                 UiContent::Button(
@@ -5811,7 +5989,11 @@ impl NativeAppModel for EditorApp {
                     .style(StyleRef::Secondary),
                 ),
             )
-            .layout(Layout::default().width(Length::Fill).height(Length::Fill))
+            .layout(
+                Layout::default()
+                    .width(Length::Fixed(natural.max(56.0)))
+                    .height(Length::Fill),
+            )
         };
         let save = || {
             command_button(
@@ -5849,10 +6031,20 @@ impl NativeAppModel for EditorApp {
                 buffer_ready,
             )
         };
+        // Plain words on the toolbar, the Emacs chords in the spoken label:
+        // the long form where the row's equal slots hold it, else the short.
+        let slot_label_room = slot_width - 28.0;
+        let plain = |long: &'static str, short: &'static str| {
+            if crate::native_ui::native_button_label_width(long) <= slot_label_room {
+                long
+            } else {
+                short
+            }
+        };
         let goto_line = || {
             command_button(
                 "editor/goto-line-button",
-                "Line",
+                plain("Go to Line", "Go to…"),
                 "Go to line (M-g g)",
                 "editor/goto-line",
                 buffer_ready,
@@ -5861,8 +6053,8 @@ impl NativeAppModel for EditorApp {
         let commands = || {
             command_button(
                 "editor/commands-button",
-                "M-x",
-                "Execute command (M-x)",
+                plain("Commands", "Run…"),
+                "Run a command by name (M-x)",
                 "editor/commands",
                 buffer_ready,
             )
@@ -5936,7 +6128,11 @@ impl NativeAppModel for EditorApp {
                         .width(Length::Fill)
                         .height(Length::Fill),
                 )
-                .children(vec![save(), undo(), redo()]),
+                .children(toolbar_row_widths(
+                    vec![save(), undo(), redo()],
+                    bar_width,
+                    command_gap,
+                )),
                 UiNode::new(
                     "editor/command-row-navigation",
                     UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
@@ -5947,7 +6143,11 @@ impl NativeAppModel for EditorApp {
                         .width(Length::Fill)
                         .height(Length::Fill),
                 )
-                .children(navigation_commands),
+                .children(toolbar_row_widths(
+                    navigation_commands,
+                    bar_width,
+                    command_gap,
+                )),
             ])
         } else {
             let mut commands = vec![
@@ -5971,7 +6171,7 @@ impl NativeAppModel for EditorApp {
                     .width(Length::Fill)
                     .height(Length::Fixed(command_bar_height)),
             )
-            .children(commands)
+            .children(toolbar_row_widths(commands, bar_width, command_gap))
         };
         let command_palette = command_completion.as_ref().and_then(
             |(query, candidates, selected)| {
@@ -6103,8 +6303,8 @@ impl NativeAppModel for EditorApp {
                 )
             },
         );
-        let config_palette = config_assist.as_ref().and_then(|(context, assist)| {
-            if shell.palette_visible_rows == 0 {
+        let config_palette = config_assist.as_ref().and_then(|(context, assist, waiting, listed)| {
+            if shell.palette_height <= 0.0 {
                 return None;
             }
             let text_scale = crate::native_appearance::text_scale();
@@ -6144,31 +6344,54 @@ impl NativeAppModel for EditorApp {
                 )
             } else if total > 0 {
                 format!("{help} · Tab or Ctrl-Space choose · ↑/↓ move · Enter/Tab insert")
+            } else if *waiting {
+                format!("{help} · Ctrl-Space lists suggestions")
             } else {
                 help.to_string()
             };
-            // Keep the complete help in the status semantics, while the
-            // visible one-line LSP strip uses compact, still-actionable key
-            // guidance. Measure it with the exact regular/caption typography
-            // that TextSpec paints; the title-oriented semibold helper can
-            // disagree materially with the proportional regular face.
-            let concise_help = config_visual_help(help);
-            let visual_status = if total > capacity {
-                format!(
-                    "{concise_help} · {}–{end}/{total} · Ctrl-Space · ↑↓ select · Enter/Tab insert",
-                    start + 1
-                )
-            } else if total > 0 {
-                format!("{concise_help} · Ctrl-Space · ↑↓ select · Enter/Tab insert")
+            // The strip paints the same metadata-built words the status
+            // semantics carry (name · key · values · default · timing · what
+            // limits it), cut at its end where it is short, never re-worded.
+            // Measure it with the exact regular/caption typography that
+            // TextSpec paints; the title-oriented semibold helper can disagree
+            // materially with the proportional regular face.
+            let concise_help = help.to_string();
+            // Where the strip is short, the key hints go first, then the
+            // count; the help itself is cut at its end, never in the middle,
+            // where the key and its values are.
+            let range = (total > capacity).then(|| format!("{}–{end}/{total}", start + 1));
+            // Suggestions waiting to be asked for say how, on the help line
+            // itself: the resting panel has no row under it.
+            let hints = if total > 0 {
+                Some("Ctrl-Space · ↑↓ select · Enter/Tab insert")
+            } else if *waiting {
+                Some("Ctrl-Space lists suggestions")
             } else {
-                concise_help
+                None
             };
-            let visual_help = bounded_middle_label_to_width_for_face(
-                &visual_status,
-                available_width,
-                13.0 * text_scale,
-                crate::widget::TextFace::Ui,
-            );
+            let help_px = 13.0 * text_scale;
+            let fits = |text: &str| {
+                crate::tray_raster::ui_text_width_for(crate::widget::TextFace::Ui, text, help_px)
+                    <= available_width
+            };
+            let ladder = [
+                [Some(concise_help.as_str()), range.as_deref(), hints],
+                [Some(concise_help.as_str()), range.as_deref(), None],
+                [Some(concise_help.as_str()), None, None],
+            ]
+            .map(|parts| parts.into_iter().flatten().collect::<Vec<_>>().join(" · "));
+            let visual_help = ladder
+                .iter()
+                .find(|candidate| fits(candidate))
+                .cloned()
+                .unwrap_or_else(|| {
+                    crate::native_ui::elide_text_label(
+                        &concise_help,
+                        available_width,
+                        help_px,
+                        crate::widget::TextFace::Ui,
+                    )
+                });
             let mut children = vec![
                 UiNode::new(
                     "editor/config-help",
@@ -6196,12 +6419,14 @@ impl NativeAppModel for EditorApp {
                     .paint_only(),
                 ]),
             ];
-            if assist.completions.is_empty() {
+            if !*listed {
+                // The help line alone.
+            } else if assist.completions.is_empty() {
                 children.push(
                     UiNode::new(
                         "editor/config-completion-empty",
                         UiContent::Text(crate::native_ui::TextSpec {
-                            text: "Context help · no value completion at this caret".to_string(),
+                            text: "Nothing to suggest here".to_string(),
                             role: SemanticRole::Status,
                             style: StyleRef::Plain,
                         }),
@@ -6648,6 +6873,8 @@ fn editor_status_message(
         blocked.to_string()
     } else if let Some(recovery) = app.recovery_status.as_deref() {
         format!("Recovery · {recovery}")
+    } else if let Some(revealed) = view.reveal_status.as_deref() {
+        revealed.to_string()
     } else if let Some(summary) = app
         .config_analysis
         .as_ref()
@@ -7195,7 +7422,6 @@ mod markdown_reader_tests {
                     motion: ViewMotionCx::default(),
                     terminal_font_px: 12.0,
                     terminal_scale: 1.0,
-                    terminal_theme: aterm_render::Theme::default(),
                     semantic_font: None,
                     document: Some(&snapshot),
                 },
@@ -7265,7 +7491,6 @@ mod markdown_reader_tests {
                     motion: ViewMotionCx::default(),
                     terminal_font_px: 12.0,
                     terminal_scale: 1.0,
-                    terminal_theme: aterm_render::Theme::default(),
                     semantic_font: None,
                     document: None,
                 },
@@ -7351,7 +7576,6 @@ mod markdown_reader_tests {
                     motion: ViewMotionCx::default(),
                     terminal_font_px: 12.0,
                     terminal_scale: 1.0,
-                    terminal_theme: aterm_render::Theme::default(),
                     semantic_font: None,
                     document: None,
                 },
@@ -7491,7 +7715,6 @@ mod markdown_reader_tests {
                     motion: ViewMotionCx::default(),
                     terminal_font_px: 12.0,
                     terminal_scale: 1.0,
-                    terminal_theme: aterm_render::Theme::default(),
                     semantic_font: None,
                     document: Some(&snapshot),
                 },
@@ -7543,7 +7766,6 @@ mod markdown_reader_tests {
                     motion: ViewMotionCx::default(),
                     terminal_font_px: 12.0,
                     terminal_scale: 1.0,
-                    terminal_theme: aterm_render::Theme::default(),
                     semantic_font: None,
                     document: Some(&snapshot),
                 },
@@ -7697,7 +7919,6 @@ mod markdown_reader_tests {
                         motion: ViewMotionCx::default(),
                         terminal_font_px: 12.0,
                         terminal_scale: 1.0,
-                        terminal_theme: aterm_render::Theme::default(),
                         semantic_font: None,
                         document: None,
                     },
@@ -7746,7 +7967,6 @@ mod markdown_reader_tests {
                     motion: ViewMotionCx::default(),
                     terminal_font_px: 12.0,
                     terminal_scale: 1.0,
-                    terminal_theme: aterm_render::Theme::default(),
                     semantic_font: None,
                     document: None,
                 },
@@ -7780,7 +8000,6 @@ mod markdown_reader_tests {
                     motion: ViewMotionCx::default(),
                     terminal_font_px: 12.0,
                     terminal_scale: 1.0,
-                    terminal_theme: aterm_render::Theme::default(),
                     semantic_font: None,
                     document: None,
                 },
@@ -7831,7 +8050,6 @@ mod markdown_reader_tests {
                     motion: ViewMotionCx::default(),
                     terminal_font_px: 12.0,
                     terminal_scale: 1.0,
-                    terminal_theme: aterm_render::Theme::default(),
                     semantic_font: None,
                     document: None,
                 },
@@ -7891,7 +8109,6 @@ mod markdown_reader_tests {
                     motion: ViewMotionCx::default(),
                     terminal_font_px: 12.0,
                     terminal_scale: 1.0,
-                    terminal_theme: aterm_render::Theme::default(),
                     semantic_font: None,
                     document: None,
                 },
@@ -7919,7 +8136,6 @@ mod markdown_reader_tests {
                     motion: ViewMotionCx::default(),
                     terminal_font_px: 12.0,
                     terminal_scale: 1.0,
-                    terminal_theme: aterm_render::Theme::default(),
                     semantic_font: None,
                     document: None,
                 },
@@ -7982,7 +8198,6 @@ mod markdown_reader_tests {
                         motion: ViewMotionCx::default(),
                         terminal_font_px: 12.0,
                         terminal_scale: 1.0,
-                        terminal_theme: aterm_render::Theme::default(),
                         semantic_font: None,
                         document: None,
                     },
@@ -8200,7 +8415,6 @@ mod markdown_reader_tests {
                         motion: ViewMotionCx::default(),
                         terminal_font_px: 12.0,
                         terminal_scale: 1.0,
-                        terminal_theme: aterm_render::Theme::default(),
                         semantic_font: None,
                         document: Some(&snapshot),
                     },
@@ -8246,7 +8460,8 @@ mod markdown_reader_tests {
                 0,
             ));
         let viewport = LogicalRect::new(0.0, 0.0, 320.0, 300.0);
-        let capacity = crate::native_ui::editor_shell_metrics(viewport, 8).palette_visible_rows;
+        let capacity =
+            crate::native_ui::editor_shell_metrics(viewport, 8_usize).palette_visible_rows;
         assert!(capacity > 0 && capacity < assist.completions.len());
         let mut reachable = std::collections::BTreeSet::new();
 
@@ -8261,7 +8476,6 @@ mod markdown_reader_tests {
                         motion: ViewMotionCx::default(),
                         terminal_font_px: 12.0,
                         terminal_scale: 1.0,
-                        terminal_theme: aterm_render::Theme::default(),
                         semantic_font: None,
                         document: Some(&snapshot),
                     },
@@ -8324,6 +8538,126 @@ mod markdown_reader_tests {
         );
     }
 
+    /// The caret line is painted WHOLE above the footer, wherever the caret
+    /// goes: caret reveal counts only the rows the editor shows whole, never
+    /// the part row the footer cuts (or the reveal-ahead row under it). At
+    /// 80x24 (584x348) and 102x29 (738x418), with the caret on the last line
+    /// of a 31-line aterm.toml, and with the resting help panel up or not.
+    #[test]
+    fn the_caret_line_is_painted_whole_above_the_footer() {
+        let mut source = String::new();
+        for index in 1..=31 {
+            source.push_str(&format!("# note {index}\n"));
+        }
+        for (width, height) in [(584.0, 348.0), (738.0, 418.0)] {
+            for config_editor in [true, false] {
+                let (mut app, mut view, snapshot) = editor_fixture(&source, "aterm.toml");
+                app.config_editor = config_editor;
+                app.config_analysis = Some(crate::native_config_language::analyze(&source));
+                app.config_analysis_revision = snapshot.seq.0;
+                let caret = source.trim_end().len();
+                let buffer = view.buffer.as_mut().expect("editor buffer");
+                buffer.selections = vec![crate::native_editor::Selection::caret(caret)];
+                buffer.primary = 0;
+                let viewport = LogicalRect::new(0.0, 0.0, width, height);
+                let compiled = app
+                    .view(
+                        &view,
+                        &ViewCx {
+                            viewport,
+                            animation_phase_ms: 720,
+                            motion: ViewMotionCx::default(),
+                            terminal_font_px: 12.0,
+                            terminal_scale: 1.0,
+                            semantic_font: None,
+                            document: Some(&snapshot),
+                        },
+                    )
+                    .compile(viewport)
+                    .unwrap();
+                let rect = compiled
+                    .semantic(&UiKey::new("editor/buffer"))
+                    .expect("the buffer")
+                    .rect;
+                let geometry = crate::native_ui::text_viewport_geometry(rect);
+                let projection = editor_spec(&compiled)
+                    .projection
+                    .as_ref()
+                    .expect("document projection");
+                let row = projection
+                    .lines
+                    .iter()
+                    .position(|line| !line.carets.is_empty())
+                    .unwrap_or_else(|| panic!("{width}x{height}: the caret line is projected"));
+                let bottom = geometry.body_y + (row + 1) as f32 * geometry.line_h;
+                assert!(
+                    bottom <= geometry.body_y + geometry.body_h + 0.01,
+                    "{width}x{height} config={config_editor}: the caret line (row {row}) ends at \
+                     {bottom}, under the footer at {}",
+                    geometry.body_y + geometry.body_h
+                );
+            }
+        }
+    }
+
+    /// The help line for the key under a resting caret is a panel of its own
+    /// height, with no row under it ("Nothing to suggest here" or "Ctrl-Space
+    /// lists suggestions"): the file keeps that room. The way to the list is
+    /// said on the help line.
+    #[test]
+    fn resting_help_is_one_line_with_no_row_under_it() {
+        let source = "gpu = true\n";
+        let (mut app, view, snapshot) = editor_fixture(source, "aterm.toml");
+        app.config_editor = true;
+        app.config_analysis = Some(crate::native_config_language::analyze(source));
+        app.config_analysis_revision = snapshot.seq.0;
+        let viewport = LogicalRect::new(0.0, 0.0, 584.0, 348.0);
+        let compiled = app
+            .view(
+                &view,
+                &ViewCx {
+                    viewport,
+                    animation_phase_ms: 720,
+                    motion: ViewMotionCx::default(),
+                    terminal_font_px: 12.0,
+                    terminal_scale: 1.0,
+                    semantic_font: None,
+                    document: Some(&snapshot),
+                },
+            )
+            .compile(viewport)
+            .unwrap();
+        let assist = compiled
+            .semantic(&UiKey::new("editor/config-assist"))
+            .expect("the help line for the key under the caret");
+        let shell =
+            crate::native_ui::editor_shell_metrics(viewport, crate::native_ui::EditorPalette::Help);
+        assert_eq!(
+            assist.rect.height,
+            shell.palette_padding * 2.0 + shell.palette_header_height,
+            "the help line and its padding, nothing more"
+        );
+        assert!(
+            compiled
+                .semantic(&UiKey::new("editor/config-completion-empty"))
+                .is_none(),
+            "no row under the help line"
+        );
+        // The host sizes the file for the same panel the view draws.
+        assert_eq!(
+            crate::native_ui::editor_text_viewport_rect_with_palette(
+                viewport,
+                crate::native_ui::EditorPalette::Help
+            )
+            .height,
+            compiled
+                .semantic(&UiKey::new("editor/buffer"))
+                .expect("the buffer")
+                .rect
+                .height
+        );
+    }
+
     /// The Manual's LANDING FRAME, end to end, at the geometry a default 80x24
     /// window presents (viewport 744x420): caret at Ln 1 Col 1, where opening
     /// the page leaves it, which is a key position, so the assist offers all
@@ -8354,7 +8688,6 @@ mod markdown_reader_tests {
                     motion: ViewMotionCx::default(),
                     terminal_font_px: 12.0,
                     terminal_scale: 1.0,
-                    terminal_theme: aterm_render::Theme::default(),
                     semantic_font: None,
                     document: Some(&snapshot),
                 },
@@ -8364,7 +8697,15 @@ mod markdown_reader_tests {
 
         let assist = compiled
             .semantic(&UiKey::new("editor/config-assist"))
-            .expect("unrequested config assist on the landing frame");
+            .expect("the help line for the key under the caret");
+        // Nothing was typed or asked for: no list of suggestions opens.
+        assert!(
+            compiled
+                .semantics
+                .iter()
+                .all(|node| !node.key.as_str().starts_with("editor/config-completion/")),
+            "an unrequested completion list on the landing frame"
+        );
         let buffer = compiled
             .semantic(&UiKey::new("editor/buffer"))
             .expect("config editor buffer");
@@ -8431,7 +8772,6 @@ mod markdown_reader_tests {
                     motion: ViewMotionCx::default(),
                     terminal_font_px: 12.0,
                     terminal_scale: 1.0,
-                    terminal_theme: aterm_render::Theme::default(),
                     semantic_font: None,
                     document: Some(&snapshot),
                 },
@@ -8461,8 +8801,7 @@ mod markdown_reader_tests {
             "number",
             "default 1.0",
             "range 0–1",
-            "macOS GPU",
-            "CPU",
+            "macOS GPU rendering only",
             "4.5:1",
         ] {
             assert!(semantic.label.contains(expected), "{}", semantic.label);
@@ -8483,60 +8822,73 @@ mod markdown_reader_tests {
     #[test]
     fn manual_gpu_completion_help_fits_the_live_wide_editor_path() {
         let source = "";
-        let (mut app, view, snapshot) = editor_fixture(source, "aterm.toml");
+        let (mut app, mut view, snapshot) = editor_fixture(source, "aterm.toml");
         app.config_editor = true;
         app.config_analysis = Some(crate::native_config_language::analyze(source));
         app.config_analysis_revision = snapshot.seq.0;
-        let viewport = LogicalRect::new(0.0, 0.0, 1_200.0, 822.0);
-        let compiled = app
-            .view(
-                &view,
-                &ViewCx {
-                    viewport,
-                    animation_phase_ms: 720,
-                    motion: ViewMotionCx::default(),
-                    terminal_font_px: 12.0,
-                    terminal_scale: 1.0,
-                    terminal_theme: aterm_render::Theme::default(),
-                    semantic_font: None,
-                    document: Some(&snapshot),
-                },
-            )
-            .compile(viewport)
-            .unwrap();
-        let semantic = compiled
-            .semantic(&UiKey::new("editor/config-help"))
-            .expect("complete completion help semantics");
-        assert!(
-            compiled
-                .semantic(&UiKey::new("editor/config-help/visual"))
-                .is_none()
-        );
-        let visual = compiled
-            .paint
-            .iter()
-            .find(|node| node.key == UiKey::new("editor/config-help/visual"))
-            .and_then(|node| match &node.content {
-                UiContent::Text(spec) => Some(spec.text.as_str()),
-                _ => None,
-            })
-            .expect("visible completion help");
+        // On an empty line the list waits to be asked for (Ctrl-Space).
+        view.config_completion_interaction =
+            Some(crate::native_config_language::ConfigCompletionContext::new(
+                snapshot.id.get(),
+                snapshot.seq.0,
+                0,
+            ));
+        // The strip says what the semantics say, in the same plain words, whole:
+        // at the live wide editor the key hints yield to the help, and a wider
+        // one holds both.
+        for (width, hints) in [(1_200.0, false), (1_600.0, true)] {
+            let viewport = LogicalRect::new(0.0, 0.0, width, 822.0);
+            let compiled = app
+                .view(
+                    &view,
+                    &ViewCx {
+                        viewport,
+                        animation_phase_ms: 720,
+                        motion: ViewMotionCx::default(),
+                        terminal_font_px: 12.0,
+                        terminal_scale: 1.0,
+                        semantic_font: None,
+                        document: Some(&snapshot),
+                    },
+                )
+                .compile(viewport)
+                .unwrap();
+            let semantic = compiled
+                .semantic(&UiKey::new("editor/config-help"))
+                .expect("complete completion help semantics");
+            assert!(
+                compiled
+                    .semantic(&UiKey::new("editor/config-help/visual"))
+                    .is_none()
+            );
+            let visual = compiled
+                .paint
+                .iter()
+                .find(|node| node.key == UiKey::new("editor/config-help/visual"))
+                .and_then(|node| match &node.content {
+                    UiContent::Text(spec) => Some(spec.text.as_str()),
+                    _ => None,
+                })
+                .expect("visible completion help");
 
-        assert!(semantic.label.contains("a launch --cpu or --gpu"));
-        for expected in [
-            "GPU rendering",
-            "last --cpu/--gpu > config",
-            "Ctrl-Space",
-            "↑↓ select",
-            "Enter/Tab insert",
-        ] {
-            assert!(visual.contains(expected), "{visual}");
+            assert!(semantic.label.contains("a launch --cpu or --gpu"));
+            for expected in [
+                "GPU rendering · gpu · true / false · default true",
+                "a launch --cpu or --gpu overrides this value",
+            ] {
+                assert!(visual.contains(expected), "{width}: {visual}");
+                assert!(semantic.label.contains(expected), "{}", semantic.label);
+            }
+            for expected in ["Ctrl-Space", "↑↓ select", "Enter/Tab insert"] {
+                assert_eq!(visual.contains(expected), hints, "{width}: {visual}");
+            }
+            assert!(!visual.contains('…'), "{width}: {visual}");
+            assert!(compiled.paint_audit_lines().iter().any(|line| {
+                line.contains("key=\"editor/config-help/visual\"")
+                    && line.contains("overflow=false")
+            }));
+            compiled.validate_parity().unwrap();
         }
-        assert!(!visual.contains('…'), "{visual}");
-        assert!(compiled.paint_audit_lines().iter().any(|line| {
-            line.contains("key=\"editor/config-help/visual\"") && line.contains("overflow=false")
-        }));
-        compiled.validate_parity().unwrap();
     }
 
     #[test]
@@ -8663,7 +9015,6 @@ mod markdown_reader_tests {
                     motion: ViewMotionCx::default(),
                     terminal_font_px: 12.0,
                     terminal_scale: 1.0,
-                    terminal_theme: aterm_render::Theme::default(),
                     semantic_font: None,
                     document: Some(&snapshot),
                 },
@@ -8699,7 +9050,6 @@ mod markdown_reader_tests {
                         motion: ViewMotionCx::default(),
                         terminal_font_px: 12.0,
                         terminal_scale: 1.0,
-                        terminal_theme: aterm_render::Theme::default(),
                         semantic_font: None,
                         document: Some(&snapshot),
                     },
@@ -8715,7 +9065,7 @@ mod markdown_reader_tests {
                 (
                     "editor/commands-button",
                     "editor/commands",
-                    "Execute command",
+                    "Run a command by name",
                 ),
             ] {
                 let semantic = compiled.semantic(&UiKey::new(key)).unwrap();
@@ -8727,6 +9077,33 @@ mod markdown_reader_tests {
                         .hits
                         .iter()
                         .any(|hit| { hit.key.as_str() == key && hit.action.as_str() == action })
+                );
+            }
+            // Plain words on glass, never Emacs chords: the long form where
+            // the row's slots hold it, the short where they do not.
+            let painted = |key: &str| {
+                compiled
+                    .paint
+                    .iter()
+                    .find(|node| node.key.as_str() == key)
+                    .and_then(|node| match &node.content {
+                        UiContent::Button(control) => control.spec.visual_label.clone(),
+                        _ => None,
+                    })
+                    .unwrap_or_default()
+            };
+            let goto = painted("editor/goto-line-button");
+            let commands = painted("editor/commands-button");
+            if compact {
+                assert!(["Go to Line", "Go to…"].contains(&goto.as_str()), "{goto}");
+                assert!(
+                    ["Commands", "Run…"].contains(&commands.as_str()),
+                    "{commands}"
+                );
+            } else {
+                assert_eq!(
+                    (goto.as_str(), commands.as_str()),
+                    ("Go to Line", "Commands")
                 );
             }
             let audit = compiled.paint_audit_lines();
@@ -8772,7 +9149,6 @@ mod markdown_reader_tests {
                     motion: ViewMotionCx::default(),
                     terminal_font_px: 12.0,
                     terminal_scale: 1.0,
-                    terminal_theme: aterm_render::Theme::default(),
                     semantic_font: None,
                     document: Some(&snapshot),
                 },
@@ -8837,7 +9213,6 @@ mod markdown_reader_tests {
                         motion: ViewMotionCx::default(),
                         terminal_font_px: 12.0,
                         terminal_scale: 1.0,
-                        terminal_theme: aterm_render::Theme::default(),
                         semantic_font: None,
                         document: Some(&snapshot),
                     },
@@ -8893,7 +9268,6 @@ mod markdown_reader_tests {
                     motion: ViewMotionCx::default(),
                     terminal_font_px: 12.0,
                     terminal_scale: 1.0,
-                    terminal_theme: aterm_render::Theme::default(),
                     semantic_font: None,
                     document: Some(&snapshot),
                 },
@@ -8980,7 +9354,6 @@ mod markdown_reader_tests {
                     motion: ViewMotionCx::default(),
                     terminal_font_px: 12.0,
                     terminal_scale: 1.0,
-                    terminal_theme: aterm_render::Theme::default(),
                     semantic_font: None,
                     document: Some(&snapshot),
                 },
@@ -9010,7 +9383,6 @@ mod markdown_reader_tests {
                     motion: ViewMotionCx::default(),
                     terminal_font_px: 12.0,
                     terminal_scale: 1.0,
-                    terminal_theme: aterm_render::Theme::default(),
                     semantic_font: None,
                     document: Some(&snapshot),
                 },
@@ -9061,7 +9433,6 @@ mod markdown_reader_tests {
                     motion: ViewMotionCx::default(),
                     terminal_font_px: 12.0,
                     terminal_scale: 1.0,
-                    terminal_theme: aterm_render::Theme::default(),
                     semantic_font: None,
                     document: Some(&snapshot),
                 },
@@ -9104,7 +9475,6 @@ mod markdown_reader_tests {
                     motion: ViewMotionCx::default(),
                     terminal_font_px: 12.0,
                     terminal_scale: 1.0,
-                    terminal_theme: aterm_render::Theme::default(),
                     semantic_font: None,
                     document: Some(&snapshot),
                 },
@@ -9158,7 +9528,6 @@ mod markdown_reader_tests {
                             motion: ViewMotionCx::default(),
                             terminal_font_px: 12.0,
                             terminal_scale: 1.0,
-                            terminal_theme: aterm_render::Theme::default(),
                             semantic_font: None,
                             document: Some(&snapshot),
                         },
@@ -9224,7 +9593,6 @@ mod markdown_reader_tests {
                             motion: ViewMotionCx::default(),
                             terminal_font_px: 12.0,
                             terminal_scale: 1.0,
-                            terminal_theme: aterm_render::Theme::default(),
                             semantic_font: None,
                             document: Some(&snapshot),
                         },
@@ -9304,7 +9672,6 @@ mod markdown_reader_tests {
                         motion: ViewMotionCx::default(),
                         terminal_font_px: 12.0,
                         terminal_scale: 1.0,
-                        terminal_theme: aterm_render::Theme::default(),
                         semantic_font: None,
                         document: None,
                     },
@@ -9349,7 +9716,6 @@ mod markdown_reader_tests {
                         motion: ViewMotionCx::default(),
                         terminal_font_px: 12.0,
                         terminal_scale: 1.0,
-                        terminal_theme: aterm_render::Theme::default(),
                         semantic_font: None,
                         document: None,
                     },

@@ -1,25 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The band under Codex's composer is one run, on every frame, through word
-//! hops and edits.
+//! The band under Codex's composer is one run, on every frame, through word hops and edits.
 //!
-//! Codex (ratatui, per-cell diff) paints an ambient Braille particle field
-//! into the blank cells of its composer on every ~150 ms frame (`⠁ ⠄ ⠈ ⢀`,
-//! dim grey, inside a `?2026` synchronized-update bracket). The particles
-//! drift, so a space the user typed flips `' '` → `'⠈'` → `' '` while the
-//! words either side stand unchanged; the caret parking on such a cell (an
-//! Alt+Right word hop lands on the space after the word) clears the particle
-//! and the next frame paints it back. A typed space can even be echoed as a
-//! particle, because Codex draws the particle in the cell the moment it is
-//! blank.
+//! Codex (ratatui, per-cell diff) paints an ambient Braille particle field (`⠁ ⠄ ⠈ ⢀`, dim
+//! grey) into its composer's blank cells every ~150 ms inside a `?2026` bracket. The particles
+//! drift, so a typed space flips `' '` → `'⠈'` → `' '` while the words either side stand; a
+//! caret parked on such a cell (an Alt+Right hop lands on the space after the word) clears the
+//! particle and the next frame paints it back, and a typed space can even echo as a particle.
 //!
-//! This file replays Codex's real bytes
-//! (`fixtures/codex-particles-2026-09-16.ptylog`: type a line, Alt+Left ×3,
-//! type a word, Alt+Right ×3, type two letters) through a real [`Terminal`],
-//! sampled as `app_render.rs`'s frame hold samples it, fed to [`CursorGlow`]
-//! with the hints the app stamps for those keys, and censuses the plan's
-//! coverage on the composer row every 8 ms.
+//! This file replays Codex's real bytes (`fixtures/codex-particles-2026-09-16.ptylog`: a line,
+//! Alt+Left ×3, a word, Alt+Right ×3, two letters) through a real [`Terminal`] sampled as
+//! `app_render.rs`'s frame hold samples it, fed to [`CursorGlow`] with the app's hints, and
+//! censuses the plan's coverage on the composer row every 8 ms.
 
 use crate::common::{
     LIT_COV, caret_sample, coverage, geom, holes_of, is_arrow, note_blink, observe_caret_row,
@@ -51,8 +44,7 @@ const WRAPPED_FIXTURE: &str = include_str!("fixtures/codex-wrapped-composer-2026
 /// `a` was 391 ms old at the 10.0 s frame while the trailing space was fresh.
 const STALLED_WRAPPED_FIXTURE: &str =
     include_str!("fixtures/codex-wrapped-composer-stalled-2026-09-22.ptylog");
-/// The optimized glass take whose ordinary 22:2→3 admission left only `a`
-/// dark on the first resumed frame until that re-anchor's cache handoff.
+/// A take whose ordinary 22:2→3 `a` admission must stay cached for the first resumed frame.
 const FIRST_FRAME_FIXTURE: &str =
     include_str!("fixtures/codex-wrapped-composer-first-frame-2026-09-22.ptylog");
 
@@ -87,8 +79,7 @@ fn events(fixture: &str) -> Vec<(u64, Event)> {
         .collect()
 }
 
-/// The owner's config as the take ran it: rainbow kitty, tall body, the
-/// default intensity 1.0, dark.
+/// The config the take ran: rainbow kitty, tall body, intensity 1.0, dark.
 fn cfg() -> GlowConfig {
     GlowConfig {
         duration: Duration::from_millis(260),
@@ -175,8 +166,7 @@ impl Host {
         self.now.saturating_duration_since(self.t0).as_millis() as u64
     }
 
-    /// EXACTLY the host's own order: `sync_cursor_effect_scroll`, then LOCK
-    /// A's samples, then the tick.
+    /// The host's order: `sync_cursor_effect_scroll`, the frame's samples, then the tick.
     fn frame(&mut self) {
         sync_scroll(&self.term, &mut self.glow, &mut self.scroll, self.now);
         let (c, cur) = caret_sample(&self.term);
@@ -315,7 +305,7 @@ impl Host {
         }
     }
 
-    /// This frame's census of the PLAN's coverage on the composer row.
+    /// This frame's census of the plan's coverage on the composer row.
     fn record(&mut self, caret_row: u16, caret_col: u16) {
         let Some(row) = self.composer_row else { return };
         let cov = coverage(&self.glow, self.g, row);
@@ -670,13 +660,10 @@ fn coalesced_wrapped_prefix_keeps_first_key_and_refuses_particle() {
     );
 }
 
-/// Start from the captured Codex wrapped-composer screen, just before its first
-/// `a`, then let the same synchronized-update protocol paint one longer echo.
-/// The host's 5 Hz frame train samples the blank row immediately before the
-/// keys and misses every intermediate echo. The first key is older than the
-/// short hint window at the one frame that finally sees the phrase; its last
-/// key is fresh. This is the loaded-host shape that a four-cell replay cannot
-/// exercise.
+/// The captured wrapped-composer screen just before its first `a`, then one longer
+/// synchronized echo. The 5 Hz train samples the blank row before the keys and misses every
+/// intermediate echo, so at the frame that sees the phrase the first key is past the hint
+/// window and the last is fresh.
 fn long_wrapped_batch(
     typed: &str,
     painted: &str,
@@ -942,12 +929,10 @@ fn ordinary_first_a_reanchor_is_cached_for_the_first_resumed_frame() {
     }
 }
 
-/// The `and ` prefix was typed on the wrapped row and lit on its first
-/// frames. After a 1.74 s key gap its swoosh removed those cells, yet Codex
-/// left their exact text on the same row; the first resumed key rejoins
-/// that text on its own frame. Five hertz and two rendered warm-up frames
-/// match the live glass cadence; presenting each PTY packet would hide the
-/// expiry transition under extra frames.
+/// The `and ` prefix, lit on the wrapped row, swooshes out after a 1.74 s key gap while Codex
+/// leaves its text in place; the first resumed key rejoins that text on its own frame. The
+/// 5 Hz train with two warm-up frames matches the live cadence: presenting each PTY packet
+/// would hide the expiry under extra frames.
 #[test]
 fn codex_same_row_continuation_restores_the_exact_retired_prefix() {
     let separate_turns = wrapped_with_licence_clear();
@@ -1003,7 +988,6 @@ fn dormant_typed_run_adds_no_idle_work_after_natural_exit() {
 /// bursts. Content evidence survives that boundary, and still requires a
 /// fresh typed echo to rejoin it.
 fn wrapped_with_licence_clear() -> String {
-    // `turn` fences both the first measured burst and its continuation.
     let fixture = WRAPPED_FIXTURE
         .replacen("8893 I 61\n", "8880 C\n8893 I 61\n", 1)
         .replacen("10887 I 69\n", "10870 C\n10887 I 69\n", 1);

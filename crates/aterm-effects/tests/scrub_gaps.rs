@@ -3,31 +3,21 @@
 
 //! Scrubbing back and forth by word never damages the band.
 //!
-//! Driven at the host seam: a real `aterm_core::terminal::Terminal` driven
-//! byte for byte, its rows sampled as `app_render.rs`'s frame hold samples
-//! them, fed to `CursorGlow` and ticked through `CursorGlow::tick` on a
-//! 16 ms frame train, on a 30 × 56 grid. A line is typed at 12 cps, then
-//! Option+Left ×4, Option+Right ×4, Option+Left ×2 at 150 ms, through two
-//! composers:
+//! At the host seam: a real `aterm_core` [`Terminal`] driven byte for byte, its rows sampled as
+//! `app_render.rs`'s frame hold samples them, [`CursorGlow`] ticked on a 16 ms train, on a
+//! 30 × 56 grid. A line is typed at 12 cps, then Option+Left ×4, Option+Right ×4, Option+Left ×2
+//! at 150 ms, through two composers:
 //!
-//! * zsh: a word key moves the caret with one `CUB`/`CUF`, visibly, in one
-//!   frame;
-//! * an Ink-shaped composer (`docs/design/repro/inkish.py`): every key and
-//!   every hop redraws the whole line inside a DECTCEM bracket, split so a
-//!   present lands while the caret is hidden; the hop reaches the engine
-//!   through the nav hide-bridge, and the witness sees the same text put
-//!   back.
+//! * zsh: a word key moves the caret with one `CUB`/`CUF`, visibly, in one frame;
+//! * an Ink-shaped composer (`docs/design/repro/inkish.py`): every key and hop redraws the line
+//!   inside a DECTCEM bracket, split so a present lands while the caret is hidden; the hop
+//!   reaches the engine through the nav hide-bridge, and the witness sees the same text put back.
 //!
-//! The band's cells are censused on every frame: the identity of the cell
-//! that owns each column and the coverage the plan puts inside it. A gap is
-//! a column under the line whose light is gone or is another cell's. The
-//! laws: zero gap columns on every frame, and the census after the tenth
-//! hop byte-identical to the census before the first.
-//!
-//! The classic trail is driven through the same frames beside the kitty,
-//! against a twin never told a key was pressed: a scrub mints and clears
-//! nothing there (`CursorTrail::spawn`'s nav arm), so its frames are
-//! byte-identical to the twin's.
+//! Every frame censuses each column's owning cell and planned coverage; a gap is a column whose
+//! light is gone or is another cell's. The laws: no gap on any frame, and the census after the
+//! tenth hop equal to the one before the first. The classic trail runs beside the kitty against
+//! a twin never told a key was pressed: a scrub mints and clears nothing there
+//! (`CursorTrail::spawn`'s nav arm), so their frames are byte-identical.
 
 use aterm_core::render::{GlowQuad, TrailCell};
 use aterm_core::terminal::Terminal;
@@ -41,7 +31,7 @@ const ROWS: usize = 30;
 const COLS: usize = 56;
 const CW: usize = 8;
 const CH: usize = 16;
-/// The owner's line — 44 cells.
+/// The line, 44 cells.
 const LINE: &str = "the quick brown fox jumps over the lazy dogs";
 /// The row the line is typed on (Ink draws it on its third row).
 const ROW: u16 = 2;
@@ -68,7 +58,7 @@ fn geom() -> Geom {
     }
 }
 
-/// The owner's config: rainbow kitty, intensity 0.70, dark.
+/// Rainbow kitty, intensity 0.70, dark.
 fn cfg() -> GlowConfig {
     GlowConfig {
         classic_mono: false,
@@ -203,10 +193,9 @@ impl Host {
         self.now.saturating_duration_since(self.t0).as_millis() as u64
     }
 
-    /// The frame hold, then the tick: sample the cursor, the repaint blink,
-    /// the caret row's probe and the rows the resident ribbon occupies, all
-    /// from the terminal after the last `process`, then advance every
-    /// engine one frame.
+    /// The frame hold, then the tick: the cursor, the repaint blink, the caret
+    /// row's probe and the ribbon's rows sampled after the last `process`, then
+    /// every engine one frame on.
     fn frame(&mut self) {
         let c = self.term.cursor();
         let cur = self.term.cursor_visible().then_some((c.row, c.col));
@@ -407,10 +396,8 @@ impl Host {
             .collect()
     }
 
-    /// Everything a cohort's own cells' light is a function of (the clock,
-    /// the price, the stamps), so "the scrub left them as they were" is a
-    /// byte comparison, not a coverage threshold a corridor above them could
-    /// satisfy by accident.
+    /// `cohort`'s cells as [`CellPrint`]s, so "the scrub left them as they were" is a byte
+    /// comparison, not a coverage threshold a corridor above them could meet by accident.
     fn cells_of(&self, cohort: u32) -> Vec<CellPrint> {
         self.ribbon()
             .cells()
@@ -430,7 +417,7 @@ impl Host {
             .collect()
     }
 
-    /// The frame train up to the frame BEFORE an event `ms` after the last,
+    /// The frame train up to the frame before an event `ms` after the last,
     /// and the census on it.
     fn census_before(&mut self, ms: u64) -> Vec<Column> {
         let t = self.last_event + Duration::from_millis(ms);
@@ -439,10 +426,9 @@ impl Host {
     }
 }
 
-/// Everything about one cell that its light is a function of, beside the
-/// cohort clock — the column, the two birth stamps, the life, the price and
-/// the two stamps that end it. Two of these equal is two cells the engine
-/// will draw identically.
+/// Everything one cell's light is a function of beside the cohort clock: the column, the two
+/// birth stamps, the life, the price and the two stamps that end it. Two equal prints draw
+/// identically.
 type CellPrint = (
     u16,
     Instant,
@@ -578,8 +564,8 @@ fn scrub(composer: Composer) {
         after, before,
         "{composer:?}: the census after the tenth hop is the census before the first"
     );
-    // The band leaves one swoosh after the hand's LAST hop — held by the
-    // scrub, not by the last key.
+    // The band leaves one swoosh after the last hop, held by the scrub, not
+    // by the last key.
     h.idle(700);
     assert!(
         gaps(&before, &h.census()).is_empty(),
@@ -612,9 +598,8 @@ fn a_word_scrub_through_an_ink_repaint_leaves_no_gap_and_both_engines_agree() {
 /// +350 ms `CUB 31` (31 → 0: W2 takes W1 over and lies over all of A as an
 /// overlay, §2.3); +200 ms `CUF 2` (0 → 2 over W2's live cells: a scrub).
 /// The corridor's columns resolve to W2 the layer-blind way `Ribbon::scrub`
-/// reads an owner, so the hold reads W2. A keeps its clock, its abandon and
-/// its retract target, every one of A's own cells is byte-identical across
-/// the scrub, and A is pruned when its own swoosh ends.
+/// reads an owner, so the hold reads W2; A keeps its clock, abandon, retract
+/// target and every cell byte for byte, and is pruned when its swoosh ends.
 #[test]
 fn a_scrub_over_holes_a_hop_filled_leaves_an_abandoned_band_alone_at_the_host_seam() {
     let mut h = Host::new(Composer::Zsh);
@@ -641,9 +626,8 @@ fn a_scrub_over_holes_a_hop_filled_leaves_an_abandoned_band_alone_at_the_host_se
         !a_cols.is_empty(),
         "the setup: A still owns cells on its own layer: {a_cols:?}"
     );
-    // ...and the corridor's own columns resolve, the layer-blind way
-    // `Ribbon::scrub` reads an owner, to the wake and not to A: A is
-    // shadowed under the corridor, so the hold must not reach it.
+    // ...and the corridor's columns resolve, the layer-blind way
+    // `Ribbon::scrub` reads an owner, to the wake, not to A.
     assert!(
         (0..2u16).all(|col| {
             let rib = h.ribbon();
@@ -695,12 +679,10 @@ fn a_scrub_over_holes_a_hop_filled_leaves_an_abandoned_band_alone_at_the_host_se
     );
 }
 
-/// A scrub never raises a cell's light. `the quick`; +150 ms `CUF 6`
-/// (9 → 15: a hop, its 0.55 s cold stub at 9..15); +600 ms `CUB 5`
-/// (15 → 10) back over the stub, deep inside its melt. No column is
-/// brighter on the landing frame than on the frame before, the stub's
-/// cohort keeps its clock, the band beside the corridor keeps its own, and
-/// the stub is out within the time it had left.
+/// A scrub never raises a cell's light. `the quick`; +150 ms `CUF 6` (9 → 15: a hop, its cold
+/// stub at 9..15); +500 ms `CUB 5` (15 → 10) back over the stub, deep inside its melt. No column
+/// is brighter on the landing frame than on the frame before, the stub's cohort keeps its clock,
+/// the band beside the corridor keeps its own, and the stub is out within the time it had left.
 #[test]
 fn a_hop_back_over_a_melting_stub_raises_no_cell_s_light_at_the_host_seam() {
     let mut h = Host::new(Composer::Zsh);

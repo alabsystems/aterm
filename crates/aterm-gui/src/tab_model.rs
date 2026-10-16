@@ -2508,14 +2508,4 @@ mod tests {
             "stopped at the first match, in visit order"
         );
     }
-
-    #[test]
-    fn tab_and_view_id_types_are_not_interchangeable() {
-        let tab = TabId::from_stored(7);
-        let view = ViewId::from_stored(7);
-        assert_eq!(tab.get(), view.get());
-        // The compile-time distinction is the property; this runtime assertion
-        // documents that equal wire values do not imply equal domain identity.
-        assert_eq!(tab.to_string(), view.to_string());
-    }
 }

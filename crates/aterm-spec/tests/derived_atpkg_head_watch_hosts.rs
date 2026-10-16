@@ -3,18 +3,12 @@
 
 use aterm_spec::{derive::atpkg_head_watch_hosts_model, interp, verify};
 
-/// Who watches the vendor heads (gap #28) proves over the whole bounded space — a window
-/// and a session never both, one session at most, no seat outliving its holder — and
-/// catches the three designs the rendezvous replaced.
+/// Who watches the vendor heads (gap #28) proves over the whole bounded space (a window and a
+/// session never both, one session at most, no seat outliving its holder) and catches the three
+/// buggy designs.
 #[test]
 fn a_window_or_one_session_watches_never_both() {
     let model = atpkg_head_watch_hosts_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name),
-        "the host rendezvous must stay enrolled in the spec-link registry"
-    );
     verify::prove_and_catch_scalar(&model, "atpkg head watch hosts");
 
     // The healthy path: a session watches, a window opening mid-round is refused, takes
@@ -50,7 +44,7 @@ fn a_window_or_one_session_watches_never_both() {
     }
     assert_eq!(s["s2"], 3);
 
-    // NEGATIVE CONTROLS, one per claim, under the replaced designs.
+    // Negative controls, one per claim, under the buggy designs.
     let buggy = interp::with_buggy(&model, 1);
     let mut probed = buggy.init_state();
     for action in [

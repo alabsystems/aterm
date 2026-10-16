@@ -1,19 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The tmux-seam gate: procedural glyphs in ADJACENT cells must meet exactly.
-//!
-//! Box-drawing borders (tmux panes), powerline half-blocks and shaded bars
-//! only look right if a stroke leaving one cell continues at the exact same
-//! pixels in the next — no gap column, no jogged/overlapping pixels. Each
-//! fixture composes neighbouring cells' coverage into one image and asserts
-//! that, at every interior cell boundary, the lit pixels on both sides of the
-//! seam are IDENTICAL (and non-empty). Runs at several odd AND even cell
-//! sizes, since centring rounding is exactly where seams historically break.
+//! Procedural glyphs in adjacent cells meet exactly: composed cells (tmux pane
+//! borders, half-blocks, shaded bars) have identical, non-empty lit pixels on
+//! both sides of every interior seam, at odd and even cell sizes, where
+//! centring rounding breaks seams.
 
 use aterm_render::procedural;
 
-/// Odd/even mixes; both orientations of "long axis"; a squat size.
+/// Odd and even cell sizes.
 const SIZES: &[(usize, usize)] = &[(7, 15), (8, 16), (9, 19), (10, 20), (11, 21), (12, 22)];
 
 /// A composed multi-cell image of hard-coverage bits. `' '` composes as an
@@ -65,9 +60,8 @@ impl Grid {
             .collect()
     }
 
-    /// The seam between cell (r, c) and its RIGHT neighbour: the lit rows in
-    /// the last column of (r, c) must equal the lit rows in the first column
-    /// of (r, c+1), and be non-empty — zero gap, zero jog/overlap.
+    /// The seam between cell (r, c) and its right neighbour: the lit rows of the
+    /// boundary columns are equal and non-empty (no gap, no jog).
     fn assert_h_seam(&self, r: usize, c: usize, what: &str) {
         let left = self.col_rows((c + 1) * self.cw - 1, r);
         let right = self.col_rows((c + 1) * self.cw, r);
@@ -83,7 +77,7 @@ impl Grid {
         );
     }
 
-    /// The seam between cell (r, c) and the cell BELOW it (column sets of the
+    /// The seam between cell (r, c) and the cell below it (column sets of the
     /// boundary rows, in cell-local x).
     fn assert_v_seam(&self, r: usize, c: usize, what: &str) {
         let upper: Vec<usize> = (0..self.cw)
@@ -105,9 +99,8 @@ impl Grid {
     }
 }
 
-/// A run of the same horizontal-stroke glyph: EVERY column of the composed
-/// image (not just the seam) carries the identical lit-row set, i.e. the line
-/// is perfectly uniform across cells — no gap or overlap columns anywhere.
+/// A run of the same horizontal-stroke glyph: every column of the composed
+/// image, not just the seam, carries the identical lit-row set.
 #[test]
 fn horizontal_runs_are_column_uniform() {
     for &(cw, ch) in SIZES {
@@ -234,8 +227,7 @@ fn double_box_grid_seams_are_exact() {
 fn block_adjacency_seams_are_exact() {
     for &(cw, ch) in SIZES {
         let what = format!("blocks at {cw}x{ch}");
-        // ▐▌: the right half of cell 0 meets the left half of cell 1 — the
-        // boundary columns are both full-height.
+        // ▐▌: both boundary columns are full-height.
         let g = compose(&[&['▐', '▌']], cw, ch);
         g.assert_h_seam(0, 0, &what);
         assert_eq!(
@@ -256,9 +248,8 @@ fn block_adjacency_seams_are_exact() {
     }
 }
 
-/// Diagonals chain corner-to-corner: ╲ stacked above ╲ continues through the
-/// cell corner (and the same for a row of ╲), so diagonal ASCII-art lines
-/// don't break at cell boundaries.
+/// Diagonals light both cell corners they run between, so a chain of them
+/// continues through the cell corners.
 #[test]
 fn diagonals_meet_cell_corners() {
     for &(cw, ch) in SIZES {

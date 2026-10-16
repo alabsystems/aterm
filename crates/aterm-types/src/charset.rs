@@ -2,24 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Character set support (G0-G3, GL/GR, SI/SO, SS2/SS3).
-//!
-//! Pure data types with no dependencies on aterm-core internals.
+//! Character set support (G0-G3, GL/GR, SI/SO, SS2/SS3) as plain data types.
 
-// CharacterSet (1 byte) and CharsetState (6 bytes) are trivially copyable
-// but use &self for consistency with the rest of the terminal API.
+// The charset types are small `Copy` values but take `&self` like the rest of the terminal API.
 #![allow(clippy::trivially_copy_pass_by_ref)]
 
-// ============================================================================
-// Character Set Designations
-// ============================================================================
-
-/// Character set designations.
-///
-/// Based on VT510 character set support. The most commonly used sets are:
-/// - `Ascii`: Standard US ASCII (default for G0)
-/// - `DecLineDrawing`: DEC Special Graphics (box drawing characters)
-/// - `DecSupplemental`: DEC Supplemental (default for G1 on VT220+)
+/// 94-character set designations (VT510), each with its SCS final byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(u8)]
@@ -56,9 +44,7 @@ pub enum CharacterSet {
 }
 
 impl CharacterSet {
-    /// Create a character set from the SCS final byte.
-    ///
-    /// Returns `None` for unrecognized final bytes.
+    /// The character set for an SCS final byte, or `None` if unrecognized.
     pub fn from_final_byte(byte: u8) -> Option<Self> {
         match byte {
             b'B' | b'1' => Some(Self::Ascii), // '1' = Alternate ROM Standard (VT100)
@@ -79,14 +65,10 @@ impl CharacterSet {
         }
     }
 
-    /// Translate a character using this character set.
-    ///
-    /// For most character sets, only certain characters in the 0x60-0x7E range
-    /// are remapped. Characters outside this range pass through unchanged.
+    /// Translate a character using this character set. Only ASCII positions are remapped;
+    /// U+0080 and above pass through.
     #[inline]
     pub fn translate(&self, c: char) -> char {
-        // Non-ASCII characters (U+0080+) are never remapped by any charset.
-        // DEC line drawing maps 0x60-0x7E, UK maps 0x23 — all ASCII range.
         if (c as u32) >= 0x80 {
             return c;
         }
@@ -111,9 +93,7 @@ impl CharacterSet {
         }
     }
 
-    /// Translate a character using DEC Special Graphics (line drawing).
-    ///
-    /// Maps characters 0x60-0x7E to box drawing and other special characters.
+    /// Translate using DEC Special Graphics: 0x5F-0x7E become line-drawing and other symbols.
     fn translate_dec_line_drawing(c: char) -> char {
         match c {
             '_' => ' ', // Blank (U+0020, per xterm; DEC spec says U+00A0)
@@ -152,15 +132,9 @@ impl CharacterSet {
         }
     }
 
-    /// Translate using DEC Supplemental (ISO Latin-1 supplement subset).
-    ///
-    /// DEC Supplemental maps a handful of positions in 0x20-0x7E differently
-    /// from ASCII. In practice, most characters pass through unchanged.
+    /// Translate using DEC Supplemental. Only `$` (general currency sign) is remapped; apps rely
+    /// on UTF-8 and rarely activate this set.
     fn translate_dec_supplemental(c: char) -> char {
-        // DEC Supplemental remaps very few ASCII-range positions.
-        // The main distinction is that 0x24 maps to a general currency sign
-        // and a few positions map to diacritical marks. Most apps rely on
-        // UTF-8 and never activate this set, so a minimal mapping suffices.
         match c {
             '$' => '\u{00A4}', // Currency sign
             _ => c,
@@ -333,13 +307,7 @@ impl CharacterSet {
     }
 }
 
-// ============================================================================
-// GL Mapping and Single Shift
-// ============================================================================
-
 /// Which G-set is currently mapped to GL (left half, 0x20-0x7F).
-///
-/// All four G-sets are defined by the VT220 spec.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
@@ -379,9 +347,8 @@ impl From<GlMapping> for u8 {
     }
 }
 
-/// Which G-set is currently mapped to GR (right half, 0xA0-0xFF).
-///
-/// Per VT220 spec, GR defaults to G2. Only G1-G3 can be invoked into GR.
+/// Which G-set is currently mapped to GR (right half, 0xA0-0xFF). Only G1-G3 can be invoked
+/// into GR; G2 is the VT220 default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
@@ -416,10 +383,8 @@ impl From<GrMapping> for u8 {
     }
 }
 
-/// Single shift state for SS2/SS3.
-///
-/// When active, the next printable character uses the specified G-set
-/// instead of the GL mapping, then the state clears automatically.
+/// Single shift state for SS2/SS3: the next printable character uses that G-set instead of
+/// GL, then the shift clears.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum SingleShift {
@@ -432,13 +397,7 @@ pub enum SingleShift {
     Ss3,
 }
 
-// ============================================================================
-// 96-Character Set Designations
-// ============================================================================
-
-/// 96-character set designations (ISO 2022).
-///
-/// These sets map all 96 positions (0x20-0x7F) when invoked into GL/GR.
+/// 96-character set designations (ISO 2022), mapping all 96 positions when invoked into GL/GR.
 /// Designated via ESC - (G1), ESC . (G2), ESC / (G3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -457,9 +416,7 @@ pub enum CharacterSet96 {
 }
 
 impl CharacterSet96 {
-    /// Create a 96-character set from the SCS final byte.
-    ///
-    /// Returns `None` for unrecognized final bytes.
+    /// The 96-character set for an SCS final byte, or `None` if unrecognized.
     pub fn from_final_byte(byte: u8) -> Option<Self> {
         match byte {
             b'A' => Some(Self::IsoLatin1Supplemental),
@@ -471,18 +428,14 @@ impl CharacterSet96 {
         }
     }
 
-    /// Translate a 96-character set offset (0-95) to a Unicode codepoint.
-    /// Offset 0 = position 0xA0, offset 95 = position 0xFF.
-    /// Returns U+FFFD REPLACEMENT CHARACTER for out-of-range offsets.
+    /// Translate a 96-character set offset (0-95, for positions 0xA0-0xFF) to a codepoint;
+    /// U+FFFD for an out-of-range offset.
     pub fn translate(&self, offset: u8) -> char {
         if offset >= 96 {
             return '\u{FFFD}';
         }
-        // Trust L0: `table.get` instead of `table[..]` — the native model
-        // checker falsely refutes the bounds check even though the guard
-        // above proves `offset < 96`. `get` is total (no panic path, no
-        // bounds obligation); the `None` arm is unreachable and returns the
-        // same replacement char as the out-of-range guard.
+        // `get`, not indexing: the Trust model checker cannot see that the guard above bounds
+        // `offset`. The `None` arm is unreachable.
         let idx = usize::from(offset);
         let lookup = |table: &'static [char; 96]| match table.get(idx) {
             Some(c) => *c,
@@ -498,9 +451,7 @@ impl CharacterSet96 {
     }
 }
 
-// ============================================================================
-// ISO 8859 translation tables (96 entries each, positions 0xA0-0xFF) (#7695)
-// ============================================================================
+// ISO 8859 translation tables: 96 entries each, positions 0xA0-0xFF.
 
 /// ISO 8859-2 (Latin-2): Central European. Positions 0xA0-0xFF → Unicode.
 #[rustfmt::skip]
@@ -570,16 +521,8 @@ static ISO_8859_9_TABLE: [char; 96] = [
     '\u{00F8}', '\u{00F9}', '\u{00FA}', '\u{00FB}', '\u{00FC}', '\u{0131}', '\u{015F}', '\u{00FF}',
 ];
 
-// ============================================================================
-// Character Set State
-// ============================================================================
-
-/// Complete character set state.
-///
-/// Tracks:
-/// - G0-G3 character set designations
-/// - Which G-set is mapped to GL (via SI/SO)
-/// - Any pending single shift (SS2/SS3)
+/// Complete character set state: G0-G3 designations, the GL and GR mappings and any pending
+/// single shift.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct CharacterSetState {
@@ -595,13 +538,13 @@ pub struct CharacterSetState {
     pub gl: GlMapping,
     /// Pending single shift
     pub single_shift: SingleShift,
-    /// Which G-set is mapped to GR (right half, 0xA0-0xFF) (#7546)
+    /// Which G-set is mapped to GR (right half, 0xA0-0xFF)
     pub gr: GrMapping,
-    /// G1 96-character set override (#7547)
+    /// G1 96-character set override
     g1_96: Option<CharacterSet96>,
-    /// G2 96-character set override (#7547)
+    /// G2 96-character set override
     g2_96: Option<CharacterSet96>,
-    /// G3 96-character set override (#7547)
+    /// G3 96-character set override
     g3_96: Option<CharacterSet96>,
 }
 
@@ -631,11 +574,8 @@ impl CharacterSetState {
         Self::default()
     }
 
-    /// Get the effective character set for translation.
-    ///
-    /// If a single shift is active, returns that G-set (the caller clears the
-    /// shift with `clear_single_shift`).
-    /// Otherwise returns the GL-mapped G-set.
+    /// The effective character set: the single-shifted G-set if a shift is pending (the caller
+    /// clears it with `clear_single_shift`), else the GL-mapped one.
     #[must_use]
     pub fn effective_charset(&self) -> CharacterSet {
         match self.single_shift {
@@ -655,14 +595,8 @@ impl CharacterSetState {
         self.single_shift = SingleShift::None;
     }
 
-    /// Check if charset is ASCII passthrough (no translation needed).
-    ///
-    /// Returns true when:
-    /// - GL maps to G0
-    /// - G0 is ASCII (or equivalent - passes ASCII unchanged)
-    /// - No single shift pending
-    ///
-    /// This allows skipping charset translation for ASCII bulk writes.
+    /// Whether ASCII passes through untranslated (GL is G0, G0 is ASCII, no single shift
+    /// pending), so bulk ASCII writes can skip translation.
     #[must_use]
     #[inline]
     pub fn is_ascii_passthrough(&self) -> bool {
@@ -671,12 +605,8 @@ impl CharacterSetState {
             && self.g0 == CharacterSet::Ascii
     }
 
-    /// Check if GR-range characters (U+00A0-U+00FF) pass through unchanged.
-    ///
-    /// Returns true when the GR-mapped G-set has no 96-character set
-    /// designation and its 94-character set is ASCII (which passes GR
-    /// characters unchanged). When false, characters in U+00A0-U+00FF
-    /// must go through `translate()` for correct GR mapping.
+    /// Whether U+00A0-U+00FF pass through unchanged: the GR-mapped G-set has no 96-character
+    /// designation and is ASCII. Otherwise they must go through `translate()`.
     #[must_use]
     #[inline]
     pub fn gr_is_passthrough(&self) -> bool {
@@ -688,10 +618,7 @@ impl CharacterSetState {
         cs96.is_none() && cs94 == CharacterSet::Ascii
     }
 
-    /// Get the effective 96-character set override, if any.
-    ///
-    /// Returns `Some(cs96)` when the active GL G-set (or single-shifted G-set)
-    /// has a 96-character set designated.
+    /// The 96-character override of the active GL (or single-shifted) G-set, if any.
     #[must_use]
     fn effective_96(&self) -> Option<CharacterSet96> {
         match self.single_shift {
@@ -706,36 +633,28 @@ impl CharacterSetState {
         }
     }
 
-    /// Translate a character using the effective character set.
-    ///
-    /// This also clears any single shift state.
+    /// Translate a character using the effective character set, consuming any single shift.
     #[inline]
     pub fn translate(&mut self, c: char) -> char {
         let cp = c as u32;
 
-        // GR range (U+00A0-U+00FF): route through GR-mapped G-set (#7546).
-        // Check 96-character set designation first (#7547), then fall back
-        // to the 94-character set.
+        // GR range: the GR-mapped G-set's 96-character designation first, else its
+        // 94-character set.
         if (0xA0..=0xFF).contains(&cp) {
             self.clear_single_shift();
-            // Check if the GR-mapped G-set has a 96-char designation.
             let cs96 = match self.gr {
                 GrMapping::G1 => self.g1_96,
                 GrMapping::G2 => self.g2_96,
                 GrMapping::G3 => self.g3_96,
             };
             if let Some(cs96) = cs96 {
-                // 96-char sets map positions 0xA0-0xFF as offsets 0-95. Mask to
-                // a byte before the cast so the Trust gate sees the narrowing is
-                // lossless, and use `wrapping_sub` so it sees the subtraction
-                // cannot underflow (`cp` is 0xA0..=0xFF here — the enclosing
-                // `contains` check — so neither the `- 0xA0` nor the `& 0xFF`
-                // ever changes the value).
+                // Offsets 0-95 for 0xA0-0xFF. `wrapping_sub` and the byte mask let the
+                // Trust gate see the narrowing is lossless; with `cp` in 0xA0..=0xFF neither
+                // changes the value.
                 let offset = (cp.wrapping_sub(0xA0) & 0xFF) as u8;
                 return cs96.translate(offset);
             }
-            // Same discharge as above: `cp >= 0xA0 > 0x80`, so `wrapping_sub`
-            // never wraps and the mask is identity.
+            // As above: `cp >= 0xA0`, so `wrapping_sub` never wraps and the mask is identity.
             let masked = (cp.wrapping_sub(0x80) & 0xFF) as u8;
             let charset = match self.gr {
                 GrMapping::G1 => self.g1,
@@ -748,15 +667,13 @@ impl CharacterSetState {
             return charset.translate(masked as char);
         }
 
-        // Non-ASCII characters above 0xFF are never remapped — skip charset
-        // lookup entirely. Single shift must still be consumed.
+        // Above 0xFF nothing is remapped, but the single shift is still consumed.
         if cp >= 0x80 {
             self.clear_single_shift();
             return c;
         }
 
-        // 96-character set check: if the active GL G-set has a 96-char override,
-        // use it for the full 0x20-0x7F range (#7547).
+        // A 96-character override on the active GL G-set covers all of 0x20-0x7F.
         if let Some(cs96) = self.effective_96() {
             self.clear_single_shift();
             if (0x20..=0x7F).contains(&cp) {
@@ -771,10 +688,8 @@ impl CharacterSetState {
         charset.translate(c)
     }
 
-    /// Designate a character set to a G-set.
-    ///
-    /// This also clears any 96-character set override on the same G-set,
-    /// since 94-char and 96-char designations are mutually exclusive.
+    /// Designate a character set to a G-set, clearing that G-set's 96-character override
+    /// (94- and 96-character designations are mutually exclusive).
     pub fn designate(&mut self, g_set: u8, charset: CharacterSet) {
         match g_set {
             0 => self.g0 = charset,
@@ -794,9 +709,7 @@ impl CharacterSetState {
         }
     }
 
-    /// Designate a 96-character set to a G-set (#7547).
-    ///
-    /// G0 cannot hold 96-character sets per ISO 2022.
+    /// Designate a 96-character set to G1-G3; G0 cannot hold one (ISO 2022).
     pub fn designate_96(&mut self, g_set: u8, charset: CharacterSet96) {
         match g_set {
             0 => {} // G0 cannot hold 96-char sets

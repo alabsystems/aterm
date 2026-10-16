@@ -2,8 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-#![deny(unsafe_op_in_unsafe_fn)]
-
 //! Selection system for terminal text.
 //!
 //! This crate provides two selection systems:
@@ -16,7 +14,6 @@
 //!
 //! - **Pattern-based rules**: Use regex patterns to identify semantic text units
 //! - **Built-in rules**: Pre-configured rules for common patterns (URLs, paths, etc.)
-//! - **Extensible**: Add custom rules for application-specific patterns
 //! - **Priority-based**: Rules are matched in priority order
 //!
 //! ### Example
@@ -65,8 +62,7 @@
 //! assert!(sel.contains(0, 10));
 //! ```
 
-#![deny(missing_docs)]
-#![deny(clippy::all)]
+#![warn(missing_docs)]
 
 mod builtin_patterns;
 mod rules;

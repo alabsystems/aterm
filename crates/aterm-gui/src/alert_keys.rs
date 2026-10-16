@@ -117,6 +117,8 @@ pub(crate) fn confirm_key(
 }
 
 #[cfg(target_os = "macos")]
+pub(crate) use macos::{ConfirmKeyWatch as PasswordKeyWatch, watch_password_keys};
+#[cfg(target_os = "macos")]
 pub(crate) use macos::{PasteConfirm, next_confirm_id, watch_alert_keys};
 
 #[cfg(target_os = "macos")]
@@ -352,6 +354,92 @@ mod macos {
                 handler.as_block_ptr(),
             );
             Obj::retain(token)
+        }?;
+        Some(ConfirmKeyWatch { monitor })
+    }
+
+    /// Keep a newly attached secure field out of unrelated typing until its
+    /// own mouse hit. The same owned monitor and exact attached-window scope
+    /// used by confirmation keys keeps retirement and other windows inert.
+    pub(crate) fn watch_password_keys(
+        panel: &Obj,
+        parent: &Obj,
+        field: &Obj,
+        input: std::sync::Arc<crate::askpass::PasswordInput>,
+    ) -> Option<ConfirmKeyWatch> {
+        // SAFETY: these are retained live native objects borrowed on the main
+        // thread; the block needs independent owners for its full lifetime.
+        let (panel, parent, field) = unsafe {
+            (
+                Obj::retain(panel.id())?,
+                Obj::retain(parent.id())?,
+                Obj::retain(field.id())?,
+            )
+        };
+        let handler = move |event: Id| -> Id {
+            let Some(mtm) = MainThread::new() else {
+                return Id::NIL;
+            };
+            if event.is_null() {
+                return event;
+            }
+            match aterm_objc::contain("password input monitor", || {
+                let owns = confirmation_owns_event(event, panel.id(), Some(parent.id()), mtm);
+                // SAFETY: NSEvent accessors run in a native local monitor on
+                // the main thread; the mask admits only mouseDown/keyDown.
+                unsafe {
+                    let kind = appkit::send_usize(event, sel!(type));
+                    if owns && kind == 1 && appkit::send_id(event, sel!(window)) == panel.id() {
+                        let point: unsafe extern "C-unwind" fn(Id, Sel) -> aterm_objc::CGPoint =
+                            aterm_objc::msg();
+                        let convert: unsafe extern "C-unwind" fn(
+                            Id,
+                            Sel,
+                            aterm_objc::CGPoint,
+                            Id,
+                        )
+                            -> aterm_objc::CGPoint = aterm_objc::msg();
+                        let hit = convert(
+                            field.id(),
+                            sel!(convertPoint:fromView:),
+                            point(event, sel!(locationInWindow)),
+                            Id::NIL,
+                        );
+                        let bounds = appkit::send_rect(field.id(), sel!(bounds));
+                        if hit.x >= bounds.origin.x
+                            && hit.y >= bounds.origin.y
+                            && hit.x < bounds.origin.x + bounds.size.width
+                            && hit.y < bounds.origin.y + bounds.size.height
+                        {
+                            input.field_clicked();
+                        }
+                    }
+                    if kind == 10
+                        && !input.key_allowed(owns, appkit::send_u16(event, sel!(keyCode)))
+                    {
+                        Id::NIL
+                    } else {
+                        event
+                    }
+                }
+            }) {
+                Ok(answer) => answer,
+                // A failed decision cannot release keystrokes into the field.
+                Err(_) => Id::NIL,
+            }
+        };
+        // SAFETY: the local monitor's block is NSEvent *(^)(NSEvent *), matching
+        // this guarded (Id)->Id closure; AppKit copies it and returns +0 token.
+        let handler = unsafe { RcBlock::new1(handler) }?;
+        let monitor = unsafe {
+            let add: unsafe extern "C-unwind" fn(Id, Sel, usize, BlockPtr) -> Id =
+                aterm_objc::msg();
+            Obj::retain(add(
+                aterm_objc::class(c"NSEvent").as_id(),
+                sel!(addLocalMonitorForEventsMatchingMask:handler:),
+                NS_EVENT_MASK_KEY_DOWN | (1 << 1),
+                handler.as_block_ptr(),
+            ))
         }?;
         Some(ConfirmKeyWatch { monitor })
     }

@@ -1,0 +1,51 @@
+# codex-cli 0.163.0 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (144x50, aterm 0.105.0) running the real Codex, launched by path with a scratch `CODEX_HOME`, a composed fake ChatGPT `auth.json` (user@example.com) and the lab provider `base_url=http://127.0.0.1:<port>/v1` with `requires_openai_auth` (a local stub of the Responses API, crates/aterm-lab) · a composed fake ChatGPT login (plus); after one ok turn every request is answered 401 {error:{code:token_expired}} and the refresh (CODEX_REFRESH_TOKEN_URL_OVERRIDE, the stub) 401 {error:{code:refresh_token_reused}}
+
+  >_ OpenAI Codex (v0.163.0)
+     /private/tmp/at.omzB/proj
+
+
+› hi
+
+
+• Hi! I am the local lab stub, not a model. (reply 1)
+
+  Worked for <1s • 11:15 AM
+
+
+› carry on with the task
+
+
+■ Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+› Ask Codex to do anything
+
+  GPT-6.1-Sol default · /private/tmp/at.omzB/proj · lab stub
+  ? for shortcuts

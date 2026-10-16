@@ -6,9 +6,9 @@
 //! Eight test files carried a copy of this function, and every copy turned the
 //! two ways the PRODUCT can fail to start — the child exits before its control
 //! socket listens, or the socket never listens — into `SKIP` and a green test:
-//! `targo test -p aterm` reported green on exactly the startup crash the verify
-//! gate's own headless smoke (`aterm-verify` `smoke_stages.rs` `bring_up`)
-//! reports red. Here both PANIC with the log tail, as the smoke fails them.
+//! `targo --unverified test -p aterm` reported green on exactly the startup crash
+//! `verify smoke` (`aterm-verify` `smoke_stages.rs` `bring_up`) reports red. Here
+//! both PANIC with the log tail, as the smoke fails them.
 //!
 //! A headless instance opens no window, and it is no WindowServer client. Until
 //! 2026-09-26 it was one on macOS: `--headless` built the real AppKit event
@@ -16,7 +16,7 @@
 //! seconds (AGENTS.md) — so for that while a login with NO GUI session
 //! (an ssh shell, a CI box) made AppKit log its refusal to connect, and a child
 //! that exited with that in its log was a `SKIP`. Headless now runs winit's
-//! display-free loop (`vendor/winit/src/platform_impl/macos/headless.rs`: no
+//! display-free loop (`crates/aterm-window/src/platform_impl/macos/headless.rs`: no
 //! `NSApplication`, no connection), so that refusal in a child's log means the
 //! instance ASKED for the connection — a door reopened
 //! ([`window_server_refused`]) — and the boot FAILS naming it, never skips.
@@ -27,7 +27,9 @@
 //! before or around the launch and say nothing about the product: no scratch
 //! base short enough for `sun_path`, a log file that cannot be created, a
 //! `spawn` that fails, and a control-socket `bind` the OS refuses with
-//! `EPERM`/`EACCES` (a sandboxed runner).
+//! `EPERM`/`EACCES` (a sandboxed runner). A lane held to "a skip is not a
+//! pass" boots with [`boot_or_refuse`], which turns the same refusals into
+//! `verify`'s COULD NOT RUN.
 //!
 //! Each file keeps its own scratch prefix (so parallel test binaries never
 //! share a directory), its own launch arguments and its own readiness extras;
@@ -37,6 +39,10 @@
 //! `launch_isolation` and `support/child_output.rs` as `child_output` too.
 
 #![allow(dead_code)]
+#![allow(
+    clippy::disallowed_types,
+    reason = "test code: a stand-in child may inherit descriptors"
+)]
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -280,6 +286,24 @@ pub fn boot_with(
     await_ready(&mut inst, |i| &mut i.child, &sock_path, &log, ready).then_some(inst)
 }
 
+/// [`boot_with`] for a lane held to "a skip is not a pass": an environment
+/// refusal ends the test as COULD NOT RUN (`aterm_spec::host::could_not_run`),
+/// so `verify` records the lane as not run instead of green. The `SKIP:` line
+/// above names why.
+#[track_caller]
+pub fn boot_or_refuse(
+    prefix: &str,
+    configure: impl FnOnce(&Path, &mut Command),
+    ready: impl Fn(&Instance) -> bool,
+) -> Instance {
+    boot_with(prefix, configure, ready).unwrap_or_else(|| {
+        aterm_spec::host::could_not_run(
+            "this machine refused the headless instance (the SKIP line above names why); \
+             nothing was decided",
+        )
+    })
+}
+
 /// Wait for a spawned headless instance — `inst`, whose child `child` reaches —
 /// to listen on `sock` and satisfy `ready`: `true` once it does, `false`
 /// (announced `SKIP`) when its log names an environment refusal (the OS refused
@@ -363,9 +387,9 @@ pub fn client_command(inst: &Instance, args: &[&str]) -> Command {
 /// [`aterm_spec::wait::MUST_HAPPEN`]. `aterm ctl` gives the accept phase 10 s
 /// (`ACCEPT_DEADLINE`, which `--timeout` can only shorten) and then exits 2
 /// with "the instance took no request, so none was sent" — nothing ran, so
-/// asking again cannot run anything twice. A loaded merge gate saw a live
-/// instance miss those 10 s once (`host_live_program`, 2026-10-05); a correctness
-/// test's wait for a listener that must answer is a hang detector, not a budget.
+/// asking again cannot run anything twice. On a loaded machine a live instance
+/// can miss those 10 s (`host_live_program`); a correctness test's wait for a
+/// listener that must answer is a hang detector, not a budget.
 pub fn ctl(inst: &Instance, args: &[&str]) -> Output {
     until_accepted(|| {
         let child = client_command(inst, args).spawn().expect("spawn aterm ctl");
@@ -419,18 +443,17 @@ pub fn ctl_ok(inst: &Instance, args: &[&str]) -> String {
 ///
 /// WHY. macOS assesses an executable file at its FIRST exec — per inode, one
 /// file at a time machine-wide — and every later exec of it, from any
-/// program and through any link, takes milliseconds (0.2 s idle and 6.6 s
-/// under a loaded gate, 2026-09-26; links to a file already run skip it,
-/// 2026-09-30). A first exec the PRODUCT made paid it where a test could not
-/// wait for it: the host's version probe of a fake twin (bounded at 5 s,
+/// program and through any link, takes milliseconds (the first one 0.2 s idle
+/// and 6.6 s on a loaded machine; links to a file already run skip it). A first
+/// exec the PRODUCT made paid it where a test could not wait for it: the host's
+/// version probe of a fake twin (bounded at 5 s,
 /// `aterm_agent::harness::upgrade_drive`'s `VERSION_WAIT`), and a `/bin/sh`
 /// script still running from a path its replacement was renamed onto
 /// stopped at its next exec until that check ended (5.2 s to 8.5 s at a load
-/// of 15 to 50, 2026-10-04). So a test ran each fake it wrote once before
-/// the product met it — and wrote every fake anew: `host_live` paid the
-/// check 50 times a run for six texts, 0.15 s to 2.7 s each with its tests
-/// started together at a load of 10 to 30, three times in each upgrade test
-/// (measured 2026-10-05).
+/// of 15 to 50). So a test ran each fake it wrote once before the product met
+/// it — and wrote every fake anew: `host_live` paid the check 50 times a run
+/// for six texts, 0.15 s to 2.7 s each with its tests started together at a
+/// load of 10 to 30, three times in each upgrade test.
 ///
 /// So every text a test writes the same way is one inode, checked once: by
 /// the first run of this build tree that met it, and run here once per

@@ -1,0 +1,8 @@
+# muse 1.4.9-R6297.1 · MEASURED 2026-10-16, `aterm ctl text --json` of a private headless aterm 120x40 (aterm 0.105.0 098c216c7), the atpkg-managed muse (Meta latest) launched through its shim with a scratch HOME, `--provider echo --echo-delay-ms 8000` (Meta's offline echo provider: no login, no model), harness off · idle at its composer: the `Muse Code 1.4.9` banner, a top rule carrying `Voice input (⌥ + v to start)` (4b4f55 rule, 8a9098 label), the caret `❯` (5aa0ff) at col 0 with the cursor at col 2 and no placeholder, a full rule, and the footer `echo · <workspace> · Auto-review` (provider · path · approval review) · cursor=4,2 (visible) · account and scratch path redacted at equal length
+
+  Muse Code 1.4.9
+
+── Voice input (⌥ + v to start) ────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  echo · /private/tmp/at.XXXXXX/mwork · Auto-review

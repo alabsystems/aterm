@@ -8,19 +8,14 @@
 
 //! `atpkg` — the aterm toolchain package manager.
 //!
-//! **The manager is complete and shipped.** The signature anchor ([`sig`]),
+//! The signature anchor ([`sig`]),
 //! discovery ([`manifest`] schema parsers + [`discovery`] account resolution), the
 //! per-program store, tar-slip-safe staging ([`extract`], [`install`]), the
 //! all-or-nothing coherence-group apply ([`apply`]), activation ([`activate`]),
 //! locking/pinning ([`lock`], [`pin`]), retention ([`gc`]) and the dev-link lane
-//! ([`linkmode`]) are all implemented and exercised. It ships as an argv0 alias on
-//! the one `aterm` binary, and the GUI drives `seed` once plus `update` on an
-//! interval.
-//!
-//! (This paragraph previously read "Phases 1–2 are present … the remaining
-//! install/update machinery arrives in later phases." That was left behind by the
-//! phases it describes and is no longer true — the modules it called future are
-//! listed above. Fix the sentence, not the reader's expectations, if it drifts again.)
+//! ([`linkmode`]) compose the package lifecycle. The manager runs in-process as
+//! `aterm pkg` or through the `atpkg` argv0 alias. The GUI drives `seed` once
+//! and `update` on an interval.
 //!
 //! # ONE ROOT
 //!
@@ -38,11 +33,8 @@
 //!                            index --names--> program repos, channels, pins
 //! ```
 //!
-//! There used to be a SECOND root here — a `PKG_ROOT_PUBKEY` whose secret half lived at
-//! `~/.config/atpkg/root.key`, signing an `index.toml` that in turn delegated a rotatable
-//! release key. Both tiers are retired. The roster supplies the grant AND the deny, and
-//! supplies the deny in minutes (bump the roster) rather than at index-republish latency.
-//! One thing on paper, one revocation story, one document to audit.
+//! The roster controls both authorization and revocation; revoking a machine does
+//! not require republishing the index.
 //!
 //! 1. The roster is verified under the pinned master over its **exact raw bytes**, then
 //!    admitted against a durable `roster_seq` ratchet and its own freshness window.
@@ -61,15 +53,8 @@
 //! [`enabled`] is false, [`select_index`] selects nothing (and observes nothing) before
 //! touching a candidate, and
 //! every roster admission returns [`sig::Reject::Disabled`] before any crypto runs.
-//! That is the state a FORK starts from, and what shipped before v0.21.0.
-//!
-//! **THIS tree is ARMED** (2026-08-15, `atpkg-keys setup --id m3`):
-//! [`PKG_TRUST_ANCHORS`] carries one master key, so a build from this source installs,
-//! verifies and activates signed toolchains for real — see
-//! `docs/RELEASE-KEYS.md`, which says so too. (This paragraph claimed the
-//! opposite while the same file's [`enabled`] doc, 130 lines down, already said
-//! ARMED; a reviewer who believed it would think running the manager could not
-//! touch the fleet.)
+//! The committed [`PKG_TRUST_ANCHORS`] enables installation and activation of
+//! signed toolchains. See `docs/RELEASE-KEYS.md` for the key policy.
 
 // EVERY LINE atpkg PRINTS STEPS AROUND THE TERMINAL METER ([`meter`]). These shadow the
 // standard `println!` and `eprintln!` for the whole crate — declared before every module,
@@ -78,6 +63,13 @@
 // pipe; under a person's typed verb the meter's line is cleared first and redrawn below.
 // atpkg prints no partial line: its one `print!`, the extras' consent prompt, went with
 // the extras (2026-09-24).
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_types,
+        reason = "test code: a stand-in child may inherit descriptors"
+    )
+)]
 macro_rules! println {
     () => {
         $crate::meter::println(::std::format_args!(""))
@@ -98,6 +90,9 @@ macro_rules! eprintln {
 pub mod activate;
 #[cfg(target_os = "macos")]
 pub mod activation_notice;
+/// Whether this machine consents to the unattended adoption of the ALab toolset: the one
+/// predicate the first-launch seed and the window both ask ([`adoption_consented`]).
+pub mod adoption;
 pub mod apply;
 pub mod build_cache;
 pub mod cache;
@@ -196,6 +191,9 @@ pub mod select;
 /// update` typed on the MANAGED name are answered by the standard `aterm pkg update` —
 /// the roster, the classification and every line, pure; the verb is `cli::cmd_selfupdate`.
 pub mod selfupdate;
+/// Recorded answers for the index, manifests and `status.toml` (the serde corpus).
+#[cfg(test)]
+mod serde_corpus_tests;
 pub mod shim_env;
 pub mod sig;
 /// The CANONICAL per-program state spellings (`managed <build> — pinned by index <N>`,
@@ -215,8 +213,8 @@ mod test_programs;
 /// Unit-test scratch directories, removed when the test ends however it ends.
 #[cfg(test)]
 pub(crate) mod testdir;
-/// THE toolchain resolution order (`aterm help rust`, the gates). Std-only:
-/// `aterm-verify` compiles this same file.
+/// THE toolchain resolution order (`aterm help rust`, `verify`, the release
+/// cutter). Std-only: `aterm-verify` compiles this same file.
 pub mod toolchain;
 pub mod tree;
 pub mod upstream_identity;
@@ -233,6 +231,7 @@ pub mod verify;
 pub mod warm;
 
 pub use activate::{Aliases, activate_build, atomic_symlink, install_shims};
+pub use adoption::{Adoption, adoption_consented, session_bin_dir};
 pub use apply::{Group, TxnOutcome, plan_groups};
 pub use cache::IndexCache;
 pub use config::{LinkTarget, PackagesConfig, classify_link, repo_overrides};

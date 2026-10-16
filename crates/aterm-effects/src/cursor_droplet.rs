@@ -1,27 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The liquid droplet cursor: under the `water` trail style the block cursor is
-//! water. A cool aqua fill under an additive bead that swallows the cell, lit by
-//! a glassy specular glint, with drips beading off its belly and flattened
-//! ripple rings spreading across the waterline below. It all breathes off one
-//! surge number (typing heat / jump flare, from
-//! [`crate::cursor_glow::CursorGlow::blaze`]), so droplet, wave wake and splash
-//! are one body of water:
+//! The droplet cursor (`water` trail style): the block cursor is a cool aqua
+//! fill under an additive bead with a specular glint, drips beading off its
+//! belly and ripple rings spreading below. It breathes off the aurora's blaze
+//! ([`crate::cursor_glow::CursorGlow::blaze`]): calm at rest, sloshing and
+//! dripping under the keys, splashing on a jump flare.
 //!
-//! * at rest: a calm deep-aqua bead with a lazy caustic shimmer and one slow
-//!   drip forming;
-//! * under the keys: the bead swells and sloshes, the fill brightens toward
-//!   foam, drips fall faster and ripple rings chase outward;
-//! * on a jump: the flare slams the surge to full and the landing cursor
-//!   splashes (foam-white bead, widest rings), then calms.
-//!
-//! Text-safe as [`crate::cursor_rainbow`] is: the fill goes through the
-//! renderer's `floor_cursor_fill` contrast floor, and bead, drips and rings are
-//! additive [`GlowQuad`] light with capped coverage. Clockless (pure in the
-//! injected `now`), it settles to inactive when the surge dies (the still bead
-//! then rides the blink cadence), and emits identical premultiplied quads on
-//! CPU and Metal. Nothing here is a beam.
+//! Text-safe: the fill goes through the renderer's `floor_cursor_fill` contrast
+//! floor, and bead, drips and rings are additive [`GlowQuad`] light with capped
+//! coverage. Pure in the injected `now`; it settles to inactive when the surge
+//! dies, then rides the blink cadence.
 
 use aterm_time::Instant;
 
@@ -29,71 +18,59 @@ use aterm_render::{GlowQuad, premul_rgb};
 
 use crate::cursor_glow::{Geom, push_ripple_ring};
 use crate::effect_util::water_ramp;
-// Window-absolute: this light lands in `cursor_glow_add`, whose quads are window
-// px (the producer folds in the grid origin; the renderer adds no offset), the
-// stream `cursor_momentum`, `cursor_beam`, `cursor_phaser` and `cursor_glow`
-// also push into.
+// Window px: this light lands in `cursor_glow_add` (see `push_fx_rect`).
 use crate::effect_util::push_fx_rect as push_rect;
 
-/// Slosh rate in turns/second: a glassy sway at rest, a churning slosh at full
-/// surge. The phase advances only when frames render, so a settled bead sways
-/// at the blink cadence.
+/// Slosh rate in turns/second, at rest and at full surge. The phase advances
+/// only on rendered frames, so a settled bead sways at the blink cadence.
 const SLOSH_IDLE: f32 = 0.9;
 const SLOSH_ACTIVE: f32 = 4.2;
 
-/// Bead radius in cell-heights: the bead must swallow the block (diameter at
-/// least the cell height) or the block's corners poke out and it reads as a
-/// rectangle. Still under a cell of reach past the cell edge.
+/// Bead radius in cell-heights: the diameter must cover the cell height, or
+/// the block's corners poke out and it reads as a rectangle.
 const RADIUS_IDLE: f32 = 0.52;
 const RADIUS_MAX: f32 = 0.78;
 
-/// Innermost-core coverage (pre-intensity), still water to foaming heart. The
-/// concentric discs scale down from it, and every push is also clamped by
-/// [`COV_CAP`] so the stacked light never buries a neighbouring glyph.
+/// Innermost-disc coverage before intensity, at rest and at full surge. The
+/// outer discs scale down from it, each clamped by [`COV_CAP`].
 const COV_IDLE: f32 = 60.0;
 const COV_MAX: f32 = 148.0;
-/// Per-quad additive coverage ceiling, the light rod's text-safety band. Inner
-/// discs saturate here (over the cursor cell); rim quads and ripple rings that
-/// overlap neighbouring glyphs run at a fraction of the core and stay a tint.
+/// Per-quad additive coverage ceiling: inner discs saturate here over the
+/// cursor cell; rim quads and rings over neighbouring glyphs stay a tint.
 const COV_CAP: f32 = 92.0;
 
-/// Ripple cadence in rings/second: a barely moving ring at rest (also faded out
-/// by the surge-scaled envelope), a lively chase at full surge. Two rings run
-/// half a cycle apart so the water keeps rolling.
+/// Ripple cadence in rings/second, at rest and at full surge. Two rings run
+/// half a cycle apart.
 const RIPPLE_IDLE: f32 = 0.35;
 const RIPPLE_ACTIVE: f32 = 1.15;
 /// How far a ring rolls out, in bead-radii, over its life (`u` 0→1).
 const RIPPLE_REACH: f32 = 2.2;
 
-/// Drip cadence in drops/second/lane: a slow faucet-bead at rest, rain off the
-/// belly at full surge. Lanes unlock with surge (see [`DRIP_LANES`]).
+/// Drip cadence in drops/second/lane, at rest and at full surge.
 const DRIP_IDLE: f32 = 0.45;
 const DRIP_ACTIVE: f32 = 1.8;
-/// Drip lanes: horizontal offset from the bead's centre (× cell width), phase
-/// offset (so drips never fall in lock-step), and the surge at which the lane
-/// wakes. One lazy drip at rest; rain under the keys.
+/// Drip lanes: x offset from the bead centre (× cell width), phase offset, and
+/// the surge at which the lane wakes.
 const DRIP_LANES: [(f32, f32, f32); 3] =
     [(-0.26, 0.00, 0.0), (0.06, 0.37, 0.30), (0.30, 0.71, 0.62)];
 /// How far a drop falls, in cell-heights, before it has fully faded.
 const DRIP_FALL: f32 = 1.05;
 
-/// Below this surge the droplet is settled: it reports inactive so the host
-/// stops the 60 fps tick and the still bead rides the blink cadence.
+/// Below this surge the droplet reports inactive, so the host stops the tick.
 const SETTLED_SURGE: f32 = 0.02;
 
 /// Resolved per-frame inputs (Copy so the host reads it out before borrowing state).
 #[derive(Clone, Copy, Debug)]
 pub struct DropletConfig {
-    /// Master on/off (the `water` style opted in AND the cursor is a focused,
-    /// visible block).
+    /// On when the `water` style is chosen and the cursor is a focused, visible
+    /// block.
     pub enabled: bool,
-    /// Overall scale `0..1` — the reduced-motion / load-shed amplitude, folded in
-    /// by the host exactly like the aurora. 0 ⇒ fully inert (plain themed cursor).
+    /// Overall scale `0..1` (reduced motion / load shed); 0 is fully inert.
     pub intensity: f32,
 }
 
-/// What a tick produced: the liquid block FILL to hand the renderer (it floors it
-/// for contrast) and a fingerprint that changes on every visible step (0 when off).
+/// What a tick produced: the liquid block fill (the renderer floors it for
+/// contrast) and a fingerprint that changes on every visible step (0 when off).
 #[derive(Clone, Copy, Debug)]
 pub struct DropletFrame {
     /// The liquid block-fill colour `0x00RRGGBB`, or `None` when the droplet is
@@ -103,8 +80,8 @@ pub struct DropletFrame {
     pub fp: u64,
 }
 
-/// Per-window droplet animation state — a slosh phase, a ripple phase, a drip
-/// phase, the last clock reading, and a latched surge. Tiny + Copy-cheap.
+/// Per-window droplet state: slosh, ripple and drip phases, the last clock
+/// reading, and a latched surge.
 #[derive(Default)]
 pub struct CursorDroplet {
     /// Rolling slosh (caustic shimmer) phase in turns `0..1`.
@@ -115,24 +92,22 @@ pub struct CursorDroplet {
     /// Rolling drip phase in drop-lives `0..1` (each lane adds its own offset).
     drip: f32,
     last: Option<Instant>,
-    /// Latched surge at the last tick (so [`Self::is_active`] answers without a clock).
+    /// Latched surge at the last tick, so [`Self::is_active`] needs no clock.
     surge: f32,
 }
 
 impl CursorDroplet {
-    /// Whether the host must keep arming the animation tick: only while the water
-    /// is surging (typing, or a splash calming). Once settled the still bead
-    /// rides the blink cadence.
+    /// Whether the host must keep arming the animation tick: only while the
+    /// water is surging (typing, or a splash calming).
     #[must_use]
     pub fn is_active(&self) -> bool {
         self.surge > SETTLED_SURGE
     }
 
-    /// Advance one frame at `now` with the water's `surge` (`0..1`, read from
-    /// [`crate::cursor_glow::CursorGlow::blaze`] after the aurora tick), the
-    /// block cursor cell `cur` (`None`: hidden), grid `geom` and resolved `cfg`.
-    /// Appends the additive droplet to `out` and returns the block fill and a
-    /// fingerprint. Pure: no wall clock.
+    /// Advance one frame at `now` with the water's `surge` (`0..1`, the aurora's
+    /// blaze read after its tick), the block cursor cell `cur` (`None`: hidden),
+    /// grid `geom` and `cfg`. Appends the additive droplet to `out`; returns the
+    /// block fill and a fingerprint.
     pub fn tick(
         &mut self,
         cur: Option<(u16, u16)>,
@@ -143,9 +118,8 @@ impl CursorDroplet {
         out: &mut Vec<GlowQuad>,
     ) -> DropletFrame {
         let e = (surge.clamp(0.0, 1.0) * cfg.intensity.clamp(0.0, 1.0)).clamp(0.0, 1.0);
-        // Inert (equal to the plain themed cursor) when off, with degenerate
-        // geometry, or at zero amplitude (reduced motion / load shed), like the
-        // rainbow block.
+        // Inert (the plain themed cursor) when off, with degenerate geometry,
+        // or at zero intensity.
         if !cfg.enabled || geom.cw == 0 || geom.ch == 0 || cfg.intensity <= 0.0 {
             self.surge = 0.0; // inert: report settled so the host disarms the tick
             self.last = Some(now);
@@ -153,8 +127,7 @@ impl CursorDroplet {
         }
         self.surge = e;
 
-        // Advance the phases by real dt (clamped so a long stall — e.g. the
-        // window slept — doesn't fling them). Livelier the harder it surges.
+        // Advance by real dt, clamped so a long stall doesn't fling the phases.
         let dt = self
             .last
             .map(|t| now.saturating_duration_since(t).as_secs_f32())
@@ -169,10 +142,9 @@ impl CursorDroplet {
         // shimmer never reads as a metronome pulse.
         let shimmer = 0.5 + 0.35 * phase.sin() + 0.15 * (phase * 2.7 + 1.3).sin();
 
-        // The block fill: deep still water at rest, bright azure at full surge,
-        // shimmering with the caustics. Capped below the additive heart's foam
-        // so the round bead, not the rectangle, is the brightest thing; the
-        // renderer floors it against the cell bg, so the glyph stays sharp.
+        // Block fill: deep still water at rest, bright azure at full surge,
+        // kept below the bead heart's foam. The renderer floors it against the
+        // cell bg, so the glyph stays sharp.
         let fill = water_ramp(0.36 + 0.42 * e + 0.05 * (shimmer - 0.5));
 
         // The additive droplet, drawn only over a visible in-grid cursor cell.
@@ -200,8 +172,8 @@ impl CursorDroplet {
     }
 
     /// Emit the bead, glint, ripple rings and drips as premultiplied additive
-    /// quads. Bounded: ≤ ~4 discs × (2·radius / slab) slabs, two rings × a few
-    /// slab rows, three drips, two glints.
+    /// quads: ≤ ~4 discs × (2·radius / slab) slabs, two rings, three drips,
+    /// two glints.
     #[allow(
         clippy::too_many_arguments,
         reason = "cursor cell + surge/shimmer/phase + geometry/config; one internal call site"
@@ -218,18 +190,16 @@ impl CursorDroplet {
         out: &mut Vec<GlowQuad>,
     ) {
         let (cw, ch) = (geom.cw as f32, geom.ch as f32);
-        // Bead centre: mid-cell, floated slightly high so the drips and the
-        // waterline have headroom below the glyph row. Window px: the grid
-        // origin is folded in here, once; 0.46 (not 0.5) is the bead's float.
+        // Bead centre in window px (the grid origin is folded in here, once),
+        // floated to 0.46 of the cell so drips and waterline have headroom.
         let cx = f32::from(geom.origin_x) + (cc as f32 + 0.5) * cw;
         let cy = f32::from(geom.origin_y) + (cr as f32 + 0.46) * ch;
         let radius = (RADIUS_IDLE + (RADIUS_MAX - RADIUS_IDLE) * e) * ch;
         let cov_core =
             (COV_IDLE + (COV_MAX - COV_IDLE) * e) * cfg.intensity * (0.84 + 0.16 * shimmer);
 
-        // Concentric discs, outermost first: misty rim, deep body, bright azure,
-        // then the foam-white heart as the surge climbs. Additive overlap builds
-        // the radial gradient.
+        // Concentric discs, outermost first (misty rim to foam-white heart);
+        // additive overlap builds the radial gradient.
         let discs: [(f32, f32, f32); 4] = [
             // (radius ×, coverage ×, water_ramp t)
             (1.00, 0.30, 0.24 + 0.06 * e),
@@ -256,16 +226,14 @@ impl CursorDroplet {
                 // Sample the bead's half-width at the slab's vertical centre.
                 let ym = dy as f32 + h as f32 * 0.5;
                 let base = (r * r - ym * ym).max(0.0).sqrt();
-                // Droplet taper: the upper half pinches toward the point a drop
-                // hangs from and the lower half bulges with the water's weight.
+                // Taper: the upper half pinches, the lower half bulges.
                 let taper = if ym < 0.0 {
                     1.0 + 0.34 * ym / r
                 } else {
                     1.0 + 0.08 * ym / r
                 };
-                // Slosh: shear each slab sideways with a travelling wave down the
-                // bead so the liquid rocks in place, gentle at rest and churning
-                // at full surge.
+                // Slosh: shear each slab sideways with a wave travelling down
+                // the bead, gentle at rest, churning at full surge.
                 let shear = (phase + ym / r * 1.8).sin() * r * 0.10 * (0.30 + 0.70 * e);
                 let hw = (base * taper) as i32;
                 if hw >= 1 {
@@ -283,16 +251,15 @@ impl CursorDroplet {
             }
         }
 
-        // The specular glint: an off-centre highlight high on the bead's
-        // shoulder (plus a tiny echo below), flickering with the caustics, which
-        // makes the bead read as liquid. Near-foam hue at the text-safety cap.
+        // Specular glint: an off-centre highlight high on the bead's shoulder
+        // plus a small echo below, flickering with the caustics.
         let glint_cov = (cov_core * (0.80 + 0.20 * shimmer)).min(COV_CAP) as u8;
         if glint_cov > 0 {
             let gx = cx - radius * 0.30 + (phase.sin() * radius * 0.05);
             let gy = cy - radius * 0.34;
             let gw = ((radius * 0.24) as i32).max(2);
             let gh = (slab / 2).max(2);
-            // Aqua-tinged, never glacial white — a wet gleam, not a glare of ice.
+            // Aqua-tinged, not glacial white: a wet gleam.
             let glint = premul_rgb(0x00B4_EAF0, glint_cov);
             push_rect(out, geom, gx as i32 - gw / 2, gy as i32, gw, gh, glint);
             // The echo: a pinprick lower-right, half the size, half the light.
@@ -308,9 +275,8 @@ impl CursorDroplet {
             );
         }
 
-        // Ripple rings: two flattened ellipses rolling out across the waterline,
-        // half a life apart. Surge-scaled: invisible on still water, chasing
-        // wide on a splash.
+        // Ripple rings: two flattened ellipses half a life apart, scaled by the
+        // surge (invisible on still water).
         for half in [0.0f32, 0.5] {
             let u = (self.ripple + half).fract();
             let env = (1.0 - u) * (1.0 - u).sqrt() * e;
@@ -326,10 +292,9 @@ impl CursorDroplet {
             push_ripple_ring(out, geom, (cx, y0), (rx, ry), thick, ring);
         }
 
-        // Drips bead off the belly and fall, each lane on its own offset. One
-        // lazy drip at rest, full rain as the surge wakes the outer lanes. A drop
-        // spends the first third of its life growing on the belly, then detaches
-        // and accelerates down, fading.
+        // Drips: one lazy drip at rest, rain as the surge wakes the outer lanes.
+        // A drop grows on the belly for the first 30% of its life, then
+        // detaches and accelerates down, fading.
         let belly = cy + radius * 0.80;
         for &(dx, off, wake) in &DRIP_LANES {
             if e < wake && wake > 0.0 {
@@ -412,9 +377,7 @@ mod tests {
         }
     }
 
-    /// Disabled, or zero intensity (reduced motion / load shed) at full
-    /// strength: fully inert (no fill, no bead, fp 0, settled), equal to the
-    /// plain cursor.
+    /// Disabled or zero intensity: fully inert (no fill, no bead, fp 0, settled).
     #[test]
     fn disabled_or_zero_intensity_is_inert() {
         for (why, config) in [
@@ -443,8 +406,7 @@ mod tests {
         }
     }
 
-    /// A hidden cursor draws no bead, but the fill stays resolved (harmless — the
-    /// renderer draws no cursor to fill) and the water still reports its state.
+    /// A hidden cursor draws no bead; the fill stays resolved.
     #[test]
     fn hidden_cursor_draws_no_bead() {
         let mut d = CursorDroplet::default();
@@ -454,8 +416,7 @@ mod tests {
         assert!(f.fill.is_some());
     }
 
-    /// Full surge swells the bead and shines far brighter than still water — the
-    /// progressive-splash read.
+    /// Full surge swells the bead and shines far brighter than still water.
     #[test]
     fn surge_swells_and_brightens() {
         let g = geom();
@@ -485,8 +446,8 @@ mod tests {
         );
     }
 
-    /// At full surge the water leaves the bead: drips fall well BELOW the cursor
-    /// cell and ripple rings roll well WIDER than the bead — the splash read.
+    /// At full surge drips fall below the cursor cell and ripple rings roll
+    /// wider than the bead.
     #[test]
     fn surge_drips_below_and_ripples_wide() {
         let g = geom();
@@ -612,8 +573,7 @@ mod tests {
         }
     }
 
-    /// Surging ⇒ active (host keeps the tick armed); settled surge ⇒ inactive so
-    /// the still bead rides the blink cadence at no extra wakeup cost.
+    /// Surging keeps the tick armed; a dead surge settles to inactive.
     #[test]
     fn settles_to_inactive_when_surge_dies() {
         let g = geom();
@@ -634,8 +594,7 @@ mod tests {
         assert!(!d.is_active(), "still water idles on the blink cadence");
     }
 
-    /// The per-frame quad budget is bounded by construction (discs + rings +
-    /// drips + glints), far under the aurora's MAX_QUADS defence.
+    /// The quad count is bounded by construction (discs + rings + drips + glints).
     #[test]
     fn quad_count_is_bounded() {
         let g = Geom {
@@ -667,10 +626,8 @@ mod tests {
         );
     }
 
-    /// The bead surrounds the caret in a real window. The quads land in the
-    /// window-px `cursor_glow_add` stream, so the producer must fold in the grid
-    /// origin. This geometry (pad 24, head 80 + pad_top 4) tells window from
-    /// grid-relative placement, which the origin (0,0) tests cannot.
+    /// The bead surrounds the caret in a padded, headed window: the producer
+    /// folds in the grid origin, which the origin (0,0) tests cannot tell.
     #[test]
     fn bead_surrounds_the_caret_in_a_padded_headed_window() {
         let t0 = Instant::now();

@@ -1,0 +1,5 @@
+{
+  "_comment": "aterm RESTORE-BENCH baseline (E0): serialize->fresh-engine replay rate over a 10k-line SGR-mixed snapshot (the product's cold-restore path). BIGGER-IS-BETTER. Re-record with targo --unverified verify perf --record restore. Recorded 2026-07-22 on the M5 Max (conservative min-of-2 medians).",
+  "restore_median_hz": 1917.546,
+  "pass_ratio": 0.450
+}

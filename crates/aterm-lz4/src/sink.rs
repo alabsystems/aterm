@@ -13,8 +13,10 @@ pub trait Sink {
     /// Pushes a byte to the end of the Sink.
     fn push(&mut self, byte: u8);
 
+    #[cfg_attr(trust_verify, trust::panic_free)]
     fn pos(&self) -> usize;
 
+    #[cfg_attr(trust_verify, trust::panic_free)]
     fn capacity(&self) -> usize;
 
     fn extend_with_fill(&mut self, byte: u8, len: usize);

@@ -226,7 +226,7 @@ impl PackedColors {
 }
 
 /// Single-colour packed form, `0xTT_RRGGBB` where TT is the type:
-/// - `0x00_INDEX__`: indexed colour (0-255)
+/// - `0x00_0000II`: indexed colour (0-255)
 /// - `0x01_RRGGBB`: truecolor RGB
 /// - `0xFF_______`: default colour
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -372,9 +372,6 @@ mod tests {
 
     #[test]
     fn packed_colors_every_fg_bg_and_extras_state() {
-        // The default value, indexed fg/bg/both at 0, mid and 255, the RGB
-        // markers, a mode switch clearing the previous mode, index round trips,
-        // fg/bg independence, and the HAS_EXTRAS bit leaving the colours alone.
         assert_eq!(PackedColors::DEFAULT.0, 0);
         assert_eq!(PackedColors::new(), PackedColors::DEFAULT);
         assert_eq!(PackedColors::default(), PackedColors::DEFAULT);

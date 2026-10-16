@@ -9,6 +9,10 @@
 //! deadline. Unit tests cover the other local metadata seams independently.
 
 #![cfg(unix)]
+#![allow(
+    clippy::disallowed_types,
+    reason = "test code: a stand-in child may inherit descriptors"
+)]
 
 use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};

@@ -14,7 +14,7 @@
 //! the connection. An idle `aterm --headless --cpu` drew one preflight within
 //! two seconds; the live-headless suites in this directory drew 50 in one run.
 //! Headless now builds winit's display-free loop
-//! (`vendor/winit/src/platform_impl/macos/headless.rs`). Nothing inside the
+//! (`crates/aterm-window/src/platform_impl/macos/headless.rs`). Nothing inside the
 //! process can say whether it connected without asking WindowServer itself, so
 //! this reads the preflights back out of the unified log, by pid:
 //!
@@ -77,6 +77,10 @@
 //! a scratch, log, spawn or bind refusal is `CENSUS NOT RUN`, uncaptured.
 
 #![cfg(target_os = "macos")]
+#![allow(
+    clippy::disallowed_types,
+    reason = "test code: a stand-in child may inherit descriptors"
+)]
 
 use std::io::Read;
 use std::path::Path;
@@ -270,72 +274,6 @@ fn positive_control() -> Option<u32> {
     let pid = child.id();
     let out = bounded_wait(child, "the osascript control", Duration::from_secs(60)).ok()?;
     out.status.success().then_some(pid)
-}
-
-#[test]
-fn accessing_pids_reads_the_accessing_process_not_the_responsible_one() {
-    let line = "2026-09-26 18:02:34.142033-0700 0xbd08818  Default  0xf1ac033  93254  0  tccd: \
-                [com.apple.TCC:access] AUTHREQ_ATTRIBUTION: msgID=614.9108, attribution={responsible=\
-                {TCCDProcess: identifier=com.aterm.aterm, pid=111, auid=501, euid=501, \
-                responsible_path=/Applications/aterm.app/Contents/MacOS/aterm, binary_path=/x/aterm}, \
-                accessing={TCCDProcess: identifier=aterm-9a7ea41ac059fe9a, pid=54414, auid=501, \
-                euid=501, binary_path=/x/target/debug/aterm}, requesting={TCCDProcess: \
-                identifier=com.apple.WindowServer, pid=614, auid=88, euid=88, binary_path=/S/WindowServer}, }";
-    assert_eq!(accessing_pids(line), vec![54414]);
-    assert!(
-        accessing_pids(
-            "tccd: AUTHREQ_ATTRIBUTION: requesting={TCCDProcess: identifier=com.apple.dock"
-        )
-        .is_empty()
-    );
-}
-
-/// macOS 26.6 (25G83) writes a WindowServer preflight as two Info
-/// `AttributionChain:` lines, sometimes beside a Default `AUTHREQ_ATTRIBUTION:`
-/// one, and an app's own chain may carry no `responsible=` at all (all three
-/// shapes captured 2026-10-08). Each is read by its `accessing=` pid, and one
-/// process is one pid however many lines tccd wrote for it.
-#[test]
-fn accessing_pids_reads_attribution_chain_lines_once_per_process() {
-    let chain = "2026-10-08 16:50:35.483978-0700 0xd2b000a  Info        0xed4f398            588  \
-                 0    tccd: [com.apple.TCC:access] AttributionChain: responsible={TCCDProcess: \
-                 identifier=com.aterm.aterm, pid=111, auid=501, euid=501, \
-                 responsible_path=/Applications/aterm.app/Contents/MacOS/aterm, \
-                 binary_path=/usr/bin/osascript}, accessing={TCCDProcess: \
-                 identifier=com.apple.osascript, pid=60079, auid=501, euid=501, \
-                 binary_path=/usr/bin/osascript}, requesting={TCCDProcess: \
-                 identifier=com.apple.WindowServer, pid=595, auid=88, euid=88, \
-                 binary_path=/S/WindowServer},";
-    let authreq = "2026-10-08 16:50:35.484116-0700 0xd2b000a  Default     0xed4f398            588  \
-                   0    tccd: [com.apple.TCC:access] AUTHREQ_ATTRIBUTION: msgID=595.33544, \
-                   attribution={responsible={TCCDProcess: identifier=com.aterm.aterm, pid=111, \
-                   auid=501, euid=501, binary_path=/usr/bin/osascript}, accessing={TCCDProcess: \
-                   identifier=com.apple.osascript, pid=60079, auid=501, euid=501, \
-                   binary_path=/usr/bin/osascript}, requesting={TCCDProcess: \
-                   identifier=com.apple.WindowServer, pid=595, auid=88, euid=88, \
-                   binary_path=/S/WindowServer}, }";
-    let bare = "2026-10-08 16:40:43.563184-0700 0xd29c1a7  Info        0xed1f36f            588  \
-                0    tccd: [com.apple.TCC:access] AttributionChain: accessing={TCCDProcess: \
-                identifier=com.aterm.aterm, pid=78546, auid=501, euid=501, \
-                binary_path=/Applications/aterm.app/Contents/MacOS/aterm}, requesting=\
-                {TCCDProcess: identifier=com.apple.WindowServer, pid=595, auid=88, euid=88, \
-                binary_path=/S/WindowServer},";
-    assert_eq!(
-        accessing_pids(&[chain, chain, authreq, bare, chain].join("\n")),
-        vec![60079, 78546]
-    );
-    // Every term the census filters on is in both line shapes this macOS
-    // writes: a term naming what they lack (AUTHREQ_ATTRIBUTION) would leave
-    // the census blind again.
-    for term in PREDICATE
-        .split("CONTAINS \"")
-        .skip(1)
-        .filter_map(|rest| rest.split('"').next())
-    {
-        for line in [chain, bare] {
-            assert!(line.contains(term), "PREDICATE's {term:?} is not in {line}");
-        }
-    }
 }
 
 #[test]

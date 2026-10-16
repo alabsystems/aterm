@@ -429,10 +429,11 @@ pub fn link(
         return Err(LinkError::Io(e.to_string()));
     }
     // A DEV LINK HAS TO WIN ON PATH. For an agent program (`crate::stub::AGENT_PROGRAMS`)
-    // `agents/<tool>` goes FIRST on every PATH and names the STORE build directly, so a
-    // link that re-pointed only `bin/<tool>` left the dev checkout unreachable — `claude`
-    // kept running the installed copy with nothing to say why. The reconcile lays no twin
-    // for a primary that resolves outside the store; its sweep drops the one standing.
+    // `agents/<tool>` goes FIRST on every PATH, so a link that re-pointed only `bin/<tool>`
+    // left the dev checkout unreachable — `claude` kept running the installed copy with
+    // nothing to say why. The reconcile lays the twin onto the link's own target (a primary
+    // inside the recorded checkout, now the marker is written), so `codex` typed inside
+    // aterm runs the linked build (the native harness contract §8).
     crate::activate::reconcile_agents(layout);
     Ok(LinkOutcome { linked, refused })
 }
@@ -475,8 +476,8 @@ pub fn unlink(layout: &Layout, program: &str) -> Result<(), LinkError> {
         }
     }
     let _ = fs::remove_file(&marker_path);
-    // Symmetrically: the shims just removed were the only thing that could vouch for a
-    // twin. The cli's unlink restores the installed build's shims after this — and
+    // Symmetrically: the shims just removed, and the marker, were the only things that
+    // could vouch for the link's twin, which the sweep now removes. The cli's unlink restores the installed build's shims after this — and
     // reconciles through `install_tools_env` — but only when there IS an installed build
     // and a name to put back; this is what keeps `agents/` from outliving `bin/` otherwise.
     crate::activate::reconcile_agents(layout);
@@ -978,10 +979,13 @@ mod tests {
     }
 
     /// A DEV LINK MUST WIN AT THE FRONT OF PATH. For an agent program, `agents/<tool>` is
-    /// laid beside `bin/<tool>` and goes FIRST on every PATH — naming the store build
-    /// directly — so a `link` that re-pointed only `bin/claude` left the dev checkout
-    /// unreachable: typing `claude` still ran the installed copy. `unlink` is the mirror:
-    /// the shims it removes were the only thing vouching for a twin.
+    /// laid beside `bin/<tool>` and goes FIRST on every PATH, so a `link` that re-pointed
+    /// only `bin/claude` left the dev checkout unreachable: typing `claude` still ran the
+    /// installed copy. So the link's twin names the link's target (the native harness
+    /// contract §8: `aterm pkg link codex <pkgdir> bin/codex` wins inside aterm), carries
+    /// no self-update block, and leaves `bin/` as the link laid it. `unlink` is the mirror:
+    /// the shims and the marker it removes were the only things vouching for that twin.
+    /// NEGATIVE CONTROL: a twin onto a checkout no marker records is swept.
     #[test]
     fn link_and_unlink_sweep_the_front_of_path_agents_twin() {
         let l = layout("agents-twin");
@@ -1007,10 +1011,46 @@ mod tests {
             co.join("target/release/claude"),
             "fixture: bin/claude is the dev link"
         );
+        assert_eq!(
+            crate::platform::resolve_shim(&l.agent_shim(&claude)),
+            Some(co.join("target/release/claude")),
+            "the twin at the front of PATH runs the dev link"
+        );
+        assert_eq!(
+            crate::platform::resolve_shim(&shim_of(&l, "claude")),
+            Some(co.join("target/release/claude")),
+            "bin/ stays the link as laid"
+        );
+        #[cfg(unix)]
+        assert!(
+            !fs::read_to_string(l.agent_shim(&claude))
+                .unwrap()
+                .contains("__selfupdate"),
+            "a dev link's twin hands no verb to atpkg's self-update"
+        );
+        // A second pass rewrites nothing and keeps it.
+        crate::activate::reconcile_agents(&l);
+        crate::activate::sweep_agents_dir(&l);
+        assert!(fs::symlink_metadata(l.agent_shim(&claude)).is_ok());
+        // Negative control: the same shape onto a checkout no marker records (a hand-made
+        // `bin/claude` into another tree) earns no twin, and the one standing is swept.
+        let stray = checkout("agents-twin-stray", &["claude"]);
+        let stray_bin = stray.join("target/release/claude");
+        crate::platform::install_shim_to(&shim_of(&l, "claude"), &stray_bin).unwrap();
+        crate::platform::install_shim_to(&l.agent_shim(&claude), &stray_bin).unwrap();
+        crate::activate::sweep_agents_dir(&l);
         assert!(
             fs::symlink_metadata(l.agent_shim(&claude)).is_err(),
-            "no twin shadows the dev link at the front of PATH"
+            "a twin onto an unrecorded checkout is swept"
         );
+        crate::activate::reconcile_agents(&l);
+        assert!(
+            fs::symlink_metadata(l.agent_shim(&claude)).is_err(),
+            "and never laid"
+        );
+        crate::platform::install_shim_to(&shim_of(&l, "claude"), &co.join("target/release/claude"))
+            .unwrap();
+        let _ = fs::remove_dir_all(&stray);
 
         // A twin an older client laid before the link goes on unlink too — the cli's
         // restore reconciles only when there is an installed build and an owned name to

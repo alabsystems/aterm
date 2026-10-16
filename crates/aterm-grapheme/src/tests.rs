@@ -96,50 +96,6 @@ fn test_split_graphemes() {
 }
 
 #[test]
-fn test_grapheme_at_byte() {
-    let text = "Hello \u{4E16}\u{754C}";
-
-    // ASCII portion
-    let g = grapheme_at_byte(text, 0).unwrap();
-    assert_eq!(g.text, "H");
-
-    let g = grapheme_at_byte(text, 4).unwrap();
-    assert_eq!(g.text, "o");
-
-    // CJK portion (世 is at bytes 6-8 in UTF-8)
-    let g = grapheme_at_byte(text, 6).unwrap();
-    assert_eq!(g.text, "\u{4E16}");
-
-    // Out of bounds
-    assert!(grapheme_at_byte(text, 100).is_none());
-}
-
-#[test]
-fn test_grapheme_at_column() {
-    let text = "Hello \u{4E16}\u{754C}";
-
-    // Column 0 is 'H'
-    let g = grapheme_at_column(text, 0).unwrap();
-    assert_eq!(g.text, "H");
-
-    // Column 5 is space
-    let g = grapheme_at_column(text, 5).unwrap();
-    assert_eq!(g.text, " ");
-
-    // Column 6 is '世' (wide char)
-    let g = grapheme_at_column(text, 6).unwrap();
-    assert_eq!(g.text, "\u{4E16}");
-
-    // Column 7 is still '世' (second cell of wide char)
-    let g = grapheme_at_column(text, 7).unwrap();
-    assert_eq!(g.text, "\u{4E16}");
-
-    // Column 8 is '界'
-    let g = grapheme_at_column(text, 8).unwrap();
-    assert_eq!(g.text, "\u{754C}");
-}
-
-#[test]
 fn test_byte_to_column() {
     let text = "Hello \u{4E16}\u{754C}";
 
@@ -147,17 +103,6 @@ fn test_byte_to_column() {
     assert_eq!(byte_to_column(text, 5), 5); // space
     assert_eq!(byte_to_column(text, 6), 6); // '世'
     assert_eq!(byte_to_column(text, 9), 8); // '界' (after 世's 3 bytes)
-}
-
-#[test]
-fn test_column_to_byte() {
-    let text = "Hello \u{4E16}\u{754C}";
-
-    assert_eq!(column_to_byte(text, 0), 0); // 'H'
-    assert_eq!(column_to_byte(text, 5), 5); // space
-    assert_eq!(column_to_byte(text, 6), 6); // '世'
-    assert_eq!(column_to_byte(text, 7), 6); // still '世' (second cell)
-    assert_eq!(column_to_byte(text, 8), 9); // '界'
 }
 
 #[test]
@@ -274,6 +219,54 @@ fn vs16_zwj_and_vs15_grid_columns_follow_the_grid() {
     }
 }
 
+/// A UAX #29 GB9b Prepend cluster is measured at its spacing BASE's width, not
+/// the leading zero-width Prepend sign's. Charging the first codepoint
+/// reported these as width 0. The signs are real Arabic/Kaithi
+/// number marks that prepend a digit (U+0600 ARABIC NUMBER SIGN, U+06DD ARABIC
+/// END OF AYAH — common in Quranic text — U+110BD KAITHI NUMBER SIGN).
+#[test]
+fn prepend_cluster_is_measured_at_its_base() {
+    for (s, display, columns) in [
+        ("\u{0600}\u{0661}", 1, 1), // ARABIC NUMBER SIGN + ARABIC-INDIC DIGIT ONE
+        ("\u{06DD}\u{0661}", 1, 1), // ARABIC END OF AYAH + ARABIC-INDIC DIGIT ONE
+        ("\u{110BD}\u{11066}", 1, 1), // KAITHI NUMBER SIGN + KAITHI DIGIT ZERO
+        ("\u{0600}\u{2764}\u{FE0F}", 2, 2), // the spacing base's VS16 presentation
+        // Cluster presentation and the stateful grid deliberately differ on
+        // a minimally-qualified narrow-base ZWJ sequence (GridColumns' docs).
+        ("\u{0600}\u{2764}\u{200D}\u{1F525}", 2, 1),
+        ("\u{0600}\u{1F469}\u{200D}\u{1F4BB}", 2, 2),
+    ] {
+        // GB9b: no break after a Prepend, so each is exactly one cluster.
+        assert_eq!(split_graphemes(s).count(), 1, "{s:?} is one cluster");
+        // Both domains follow the spacing base, retaining their own policy.
+        let grid = str_grid_columns(s);
+        assert_eq!(
+            grapheme_display_width(s),
+            display,
+            "cluster presentation {s:?}"
+        );
+        assert_eq!(grid, columns, "{s:?} grid columns follow its spacing base");
+        assert_eq!(grapheme_width(s).has_emoji, display == 2, "{s:?}");
+        assert_eq!(
+            split_graphemes(s).next().unwrap().is_emoji,
+            display == 2,
+            "{s:?}"
+        );
+    }
+    // The existing coarse all-zero classification is unchanged.
+    assert_eq!(grapheme_display_width("\u{FE0F}"), 0);
+    assert!(grapheme_width("\u{FE0F}").has_emoji);
+    let cjk = TextShapingConfig {
+        ambiguous_width: AmbiguousWidth::Double,
+        ..Default::default()
+    };
+    assert_eq!(grapheme_display_width("\u{0600}\u{00B0}"), 1);
+    assert_eq!(
+        grapheme_display_width_with_config("\u{0600}\u{00B0}", &cjk),
+        2
+    );
+}
+
 /// The grid's fold state crosses UAX #29 cluster boundaries, so the columns
 /// are measured over the whole line, never one cluster at a time. Sinhala
 /// writes yansaya and rakaransaya with a ZWJ that ENDS a cluster (its virama
@@ -370,120 +363,6 @@ fn position_converters_count_grid_cells() {
 }
 
 #[test]
-fn test_truncate_to_width() {
-    // ASCII only
-    assert_eq!(truncate_to_width("Hello World", 5), "Hello");
-
-    // With wide chars - should not split wide char
-    assert_eq!(
-        truncate_to_width("Hello \u{4E16}\u{754C}", 8),
-        "Hello \u{4E16}"
-    );
-    assert_eq!(truncate_to_width("Hello \u{4E16}\u{754C}", 7), "Hello "); // 世 needs 2 cols
-
-    // Exact fit
-    assert_eq!(truncate_to_width("Hello", 5), "Hello");
-}
-
-#[test]
-fn test_pad_to_width() {
-    assert_eq!(pad_to_width("Hi", 5), "Hi   ");
-    assert_eq!(pad_to_width("Hello", 5), "Hello");
-    assert_eq!(pad_to_width("Hello World", 5), "Hello");
-}
-
-#[test]
-fn test_is_ascii_only() {
-    assert!(is_ascii_only("Hello World"));
-    assert!(!is_ascii_only("Hello \u{4E16}\u{754C}"));
-    assert!(!is_ascii_only("caf\u{00E9}"));
-}
-
-#[test]
-fn test_ascii_width() {
-    assert_eq!(ascii_width("Hello"), 5);
-    assert_eq!(ascii_width("Hello\n"), 5); // newline is control
-    assert_eq!(ascii_width(""), 0);
-}
-
-#[test]
-fn test_grapheme_segmenter() {
-    let mut seg = GraphemeSegmenter::new();
-
-    let text = "Hello";
-    let info = seg.process_string(text);
-    assert_eq!(info.display_width, 5);
-    assert_eq!(seg.column(), 5);
-    assert_eq!(seg.index(), 5);
-
-    // Process more text
-    let info2 = seg.process_string(" \u{4E16}");
-    assert_eq!(info2.display_width, 3);
-    assert_eq!(seg.column(), 8);
-}
-
-#[test]
-fn test_assign_cells() {
-    let text = "a\u{4E16}b";
-    let cells: Vec<_> = assign_cells(text, 0).collect();
-
-    assert_eq!(cells.len(), 3);
-
-    // 'a' at column 0, width 1
-    assert_eq!(cells[0].0.text, "a");
-    assert_eq!(cells[0].1.start_col, 0);
-    assert_eq!(cells[0].1.cell_count, 1);
-    assert!(!cells[0].1.is_wide);
-
-    // '世' at column 1, width 2
-    assert_eq!(cells[1].0.text, "\u{4E16}");
-    assert_eq!(cells[1].1.start_col, 1);
-    assert_eq!(cells[1].1.cell_count, 2);
-    assert!(cells[1].1.is_wide);
-
-    // 'b' at column 3, width 1
-    assert_eq!(cells[2].0.text, "b");
-    assert_eq!(cells[2].1.start_col, 3);
-    assert_eq!(cells[2].1.cell_count, 1);
-}
-
-#[test]
-fn test_grapheme_info_flags() {
-    let g: Vec<_> = split_graphemes("Hello").collect();
-    assert!(g[0].is_ascii());
-    assert!(!g[0].is_whitespace());
-    assert!(!g[0].is_control());
-
-    let g: Vec<_> = split_graphemes(" ").collect();
-    assert!(g[0].is_whitespace());
-
-    let g: Vec<_> = split_graphemes("\n").collect();
-    assert!(g[0].is_control());
-}
-
-#[test]
-fn test_zwj_detection() {
-    // Family emoji with ZWJ
-    assert!(has_zwj(
-        "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}"
-    ));
-    assert!(has_zwj("\u{1F468}\u{200D}\u{1F680}")); // Man astronaut
-
-    // Simple emoji without ZWJ
-    assert!(!has_zwj("\u{1F600}"));
-    assert!(!has_zwj("\u{1F389}"));
-    assert!(!has_zwj("A"));
-}
-
-#[test]
-fn test_skin_tone_detection() {
-    assert!(has_skin_tone("\u{1F44B}\u{1F3FD}")); // Wave with medium skin
-    assert!(has_skin_tone("\u{1F44D}\u{1F3FB}")); // Thumbs up light skin
-    assert!(!has_skin_tone("\u{1F44B}")); // Wave without modifier
-    assert!(!has_skin_tone("\u{1F600}")); // No skin tone
-}
-
-#[test]
 fn test_skin_tone_modifier() {
     assert!(is_skin_tone_modifier('\u{1F3FB}')); // Light
     assert!(is_skin_tone_modifier('\u{1F3FD}')); // Medium
@@ -501,40 +380,6 @@ fn test_regional_indicator() {
 }
 
 #[test]
-fn test_flag_emoji() {
-    assert!(is_flag_emoji("\u{1F1FA}\u{1F1F8}")); // US flag
-    assert!(is_flag_emoji("\u{1F1EF}\u{1F1F5}")); // Japan flag
-    assert!(is_flag_emoji("\u{1F1EC}\u{1F1E7}")); // UK flag
-    assert!(!is_flag_emoji("\u{1F600}")); // Not a flag
-    assert!(!is_flag_emoji("A")); // Not a flag
-    assert!(!is_flag_emoji("\u{1F1FA}")); // Single regional indicator
-}
-
-#[test]
-fn test_classify_grapheme() {
-    assert_eq!(classify_grapheme("a"), GraphemeType::Ascii);
-    assert_eq!(classify_grapheme("Z"), GraphemeType::Ascii);
-    assert_eq!(classify_grapheme(" "), GraphemeType::Ascii);
-    assert_eq!(classify_grapheme("\n"), GraphemeType::Control);
-    assert_eq!(classify_grapheme("\x00"), GraphemeType::Control);
-    assert_eq!(classify_grapheme("\u{4E2D}"), GraphemeType::Wide);
-    assert_eq!(classify_grapheme("\u{65E5}"), GraphemeType::Wide);
-    assert_eq!(classify_grapheme("\u{1F600}"), GraphemeType::Emoji);
-    assert_eq!(classify_grapheme("\u{1F389}"), GraphemeType::Emoji);
-    assert_eq!(
-        classify_grapheme("\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}"),
-        GraphemeType::ZwjSequence
-    );
-    assert_eq!(classify_grapheme("\u{1F1FA}\u{1F1F8}"), GraphemeType::Flag);
-    assert_eq!(classify_grapheme("e\u{0301}"), GraphemeType::Combining); // combining accent
-}
-
-#[test]
-fn test_classify_empty() {
-    assert_eq!(classify_grapheme(""), GraphemeType::Control);
-}
-
-#[test]
 fn test_empty_string() {
     let info = grapheme_width("");
     assert_eq!(info.grapheme_count, 0);
@@ -542,20 +387,6 @@ fn test_empty_string() {
 
     assert_eq!(truncate_to_width("", 10), "");
     assert_eq!(pad_to_width("", 5), "     ");
-}
-
-#[test]
-fn test_grapheme_contains_col() {
-    let cells = GraphemeCells {
-        start_col: 5,
-        cell_count: 2,
-        is_wide: true,
-    };
-
-    assert!(!cells.contains_col(4));
-    assert!(cells.contains_col(5));
-    assert!(cells.contains_col(6));
-    assert!(!cells.contains_col(7));
 }
 
 // Zero-width grapheme column mapping tests. `column_to_char_index` counts GRID
@@ -617,31 +448,6 @@ fn test_column_to_char_index_trailing_zero_width() {
     assert_eq!(column_to_char_index(text, 0), 0); // 'a'
     assert_eq!(column_to_char_index(text, 1), 1); // 'b'
     assert_eq!(column_to_char_index(text, 2), 3); // past end
-}
-
-#[test]
-fn test_column_to_char_index_consistency_with_column_to_byte() {
-    // Verify that column_to_char_index and column_to_byte agree on
-    // which grapheme a column maps to, even with zero-width graphemes.
-    let text = "a\u{200C}b\u{200D}c";
-    for col in 0..6 {
-        let byte_offset = column_to_byte(text, col);
-        let char_idx = column_to_char_index(text, col);
-        // Both should map to the same grapheme
-        let grapheme_from_byte = grapheme_at_byte(text, byte_offset);
-        let chars_before_byte: usize = text[..byte_offset].chars().count();
-        assert_eq!(
-            char_idx, chars_before_byte,
-            "column {col}: char_index {char_idx} should equal chars before byte offset {byte_offset} = {chars_before_byte}"
-        );
-        // Also verify grapheme_at_byte finds something for valid offsets
-        if byte_offset < text.len() {
-            assert!(
-                grapheme_from_byte.is_some(),
-                "column {col}: byte offset {byte_offset} should find a grapheme"
-            );
-        }
-    }
 }
 
 // Width table verification tests

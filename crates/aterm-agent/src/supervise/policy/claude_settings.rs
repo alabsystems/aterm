@@ -1,89 +1,56 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Where a Claude Code agent's OWN settings live, and the two things the
+//! Where a Claude Code agent's own settings live, and the two things the
 //! supervisor reads from them: the `env` its Bash tool gets
-//! ([`super::git_config::WorkerEnv::settings_env`]) and its BARE-TOOL ask
-//! rules ([`bare_asks`]), which send every call of a tool to a person.
+//! ([`WorkerEnv::settings_env`]) and what may send a tool call to a person
+//! ([`owner_asks`]): its ask rules and its PreToolUse hooks.
 //!
-//! **The chain** ([`sources`]), as Claude Code reads it (its bundle's
-//! settings-path switch, read 2026-10-09 on 2.1.295 and 2026-10-14 on
-//! 2.1.299 and 2.1.300): the managed file and its `managed-settings.d`
-//! drop-ins in [`MANAGED_DIR`]; a `--settings` the agent was launched with
-//! (inline JSON, or a file relative to where it was launched); the
-//! project's `.claude/settings.local.json` in the launch directory AND in
-//! the repository's main worktree, where Claude Code keeps it for every
-//! subdirectory and linked worktree of a repository the user owns (its
-//! `localSettings` "consent store": both are read, a superset);
-//! the project's `.claude/settings.json` in the launch directory — both
-//! project files under the root a `--project-config-root` names instead,
-//! where the agent was launched with one (2.1.300 refuses to start on a
-//! relative one; it is read against the launch directory here); and the
-//! user's `settings.json` (`cowork_settings.json` under a true
-//! `CLAUDE_CODE_USE_COWORK_PLUGINS`) in the agent's Claude Code directory,
-//! resolved as Claude Code resolves it ([`WorkerEnv::claude_dir`]). A file
-//! that is not there sets nothing, and one that is empty or only white
-//! space sets nothing too (Claude Code reads it as `{}`); a leading
-//! byte-order mark is dropped before parsing, as Claude Code drops it. One
-//! that is there but cannot be read whole or does not parse, and a user
-//! directory that cannot be named, is reported, never skipped, so its
-//! readers fail closed — and so is every document named from the agent's
-//! directory where that directory is not known (a relative `launch`), and,
-//! for the reader that fences them ("The file-provider fence" below), one
-//! that is there inside a file-provider domain of this process's home,
-//! which is never opened (nor is a linked worktree's git file there, read to
-//! find its main worktree: that worktree's local file is then reported).
-//! Read as a superset:
-//! a `--setting-sources` that leaves the project's or the user's files out
-//! (they are read all the same). Not read: a `--managed-settings`, the SDK
-//! parent's policy JSON (the real-Claude lab, 2026-10-14: an interactive
-//! 2.1.300 session launched with one naming a base URL did not take it);
-//! an organisation's settings helper, its server-delivered settings, a WSL
-//! session's Windows chain, and its MDM profile, which
-//! [`managed_preferences`] reports, unparsed, where it is there.
+//! **The chain** ([`sources`]), in Claude Code's order: the managed file and
+//! its `managed-settings.d` drop-ins in [`MANAGED_DIR`]; each `--settings`
+//! (inline JSON, or a file relative to the launch directory); the project's
+//! `.claude/settings.local.json` in the launch directory and in the
+//! repository's main worktree (Claude Code keeps it there for every
+//! subdirectory and linked worktree; both are read, a superset); the
+//! project's `.claude/settings.json` in the launch directory (both project
+//! files under `--project-config-root` instead, where given, a relative root
+//! read against the launch directory); and the user's `settings.json`
+//! (`cowork_settings.json` under a true `CLAUDE_CODE_USE_COWORK_PLUGINS`) in
+//! the agent's Claude Code directory ([`WorkerEnv::claude_dir`]).
 //!
-//! **Its readers** — the readers of the `env` block and the ask rules,
-//! which read this chain through its one parse ([`parse`]) and no list of
-//! their own: the approval lane's ([`bare_asks`], and the Bash tool's `env`
-//! through [`WorkerEnv::settings_env`]), and the API route's and the stored
-//! login's (`crate::harness::netwatch::RouteFacts`, gathered by aterm-gui's
-//! `harness_netprobe` from [`sources_under`] and [`managed_preferences`],
-//! which those two take as a document they cannot see), and the upgrade's
-//! model half (`crate::harness::upgrade_drive`'s `agent_settings`: the saved
-//! `model` and `availableModels`, each from the highest document that sets
-//! it, through [`sources_under`] fenced at the user's home; until round
-//! eighteen it read a Claude home's `settings.json` alone, so a managed or
-//! project `availableModels` or `model` was not its). One other reader of
-//! Claude Code's settings is NOT this chain's: aterm-primer edits the
-//! user's `settings.json` with an order-keeping parser of its own (a
-//! writer, not a reader of what Claude Code takes).
+//! A missing file sets nothing; an empty or blank one reads as `{}` and a
+//! leading byte-order mark is dropped, as in Claude Code ([`parse`]). A file
+//! that is there but cannot be read whole or does not parse, a user directory
+//! that cannot be named, and every document named from an unknown (relative)
+//! launch directory are reported, never skipped, so readers fail closed. A
+//! `--setting-sources` that leaves files out is ignored (a superset). Not
+//! read: `--managed-settings`, an SDK parent's policy JSON (an interactive
+//! session does not take it), an organisation's settings helper or
+//! server-delivered settings, a WSL session's Windows chain, and the MDM
+//! profile, which [`managed_preferences`] reports unparsed.
 //!
-//! **The file-provider fence is the route's** (ruling 2026-10-14, the review
-//! of f71bc6de9). A document that is NOT there sets nothing for every reader:
-//! whether it is there is a `stat`, which no consent gates
-//! (docs/DESIGN-macos-tcc-prompts-2026-08-30.md §1.5). One that IS there
-//! inside a file-provider domain of this process's home (iCloud Drive, a sync
-//! provider's folder) is reported, never opened, by the route's and the
-//! stored login's gather ([`sources_under`] given that home): one thread
-//! every session shares, which an unanswered consent dialog — it has no
-//! timeout — would park for all of them. The approval lane ([`sources`])
-//! opens it. It reads for one session, on that session's own thread, and
-//! only once the agent shows a box: by then the agent, which macOS
-//! attributes to this aterm (the same consent subject), has read the same
-//! documents itself at its start, so the domain's answer is given (a
-//! FileProviderDomain answer persists, allowed or denied: the TCC.db survey,
-//! §1.6a there), and a denial reads as a document that cannot be read, which
-//! escalates. Fenced there, every read-only Bash box and git read of a
-//! project in such a folder escalated wherever a `.claude/settings.local.json`
-//! was there, and a git read's own probe runs `git` in that folder anyway.
-//! Live (the real-Claude lab, Claude Code 2.1.300, `approve = "safe"`, a
-//! project under the instance home's `Library/CloudStorage/<provider>` folder): on
-//! f71bc6de9 a read-only `wc -l /etc/hosts` box escalated, "a command whose
-//! Bash tool's settings (…/proj/.claude/settings.local.json) lie in a
-//! file-provider domain …, never opened", with no `.claude` there at all, and
-//! so did one with a quiet local file; on the fix both were pressed
-//! (`read-only@classify-v3`), and one whose local file names `BASH_ENV`
-//! escalated naming it (read, not unknown).
+//! **Its readers** all take the chain through [`parse`] and keep no list of
+//! their own: the approval lane ([`owner_asks`], [`WorkerEnv::settings_env`]),
+//! the API route and stored login (`crate::harness::netwatch::RouteFacts`,
+//! gathered by aterm-gui's `harness_netprobe` from [`sources_under`] and
+//! [`managed_preferences`]), and the upgrade's model half
+//! (`crate::harness::upgrade_drive`'s `agent_settings`, fenced at the user's
+//! home). aterm-primer edits the user's `settings.json` with its own
+//! order-keeping parser: a writer, not a reader.
+//!
+//! **The file-provider fence is the route's.** Whether a document is there is
+//! a `stat`, which no consent gates (docs/DESIGN-macos-tcc-prompts-2026-08-30.md
+//! §1.5). The route's gather ([`sources_under`] given this process's home)
+//! reports, never opens, one that is there inside a file-provider domain of
+//! that home (iCloud Drive, a sync provider's folder): it runs on one thread
+//! every session shares, which an unanswered consent dialog (it has no
+//! timeout) would park for all of them. The approval lane ([`sources`]) opens
+//! it: it reads for one session, on that session's thread, only once the agent
+//! shows a box, by when the agent (the same consent subject) has read the same
+//! documents, so the domain's persisted answer is given; a denial reads as a
+//! document that cannot be read, which escalates. Fencing it there would
+//! escalate every read-only Bash box in such a folder, and a git read's probe
+//! runs `git` in that folder anyway.
 
 use std::path::{Path, PathBuf};
 
@@ -91,10 +58,9 @@ use aterm_json::Value;
 
 use super::git_config::WorkerEnv;
 
-/// Claude Code's managed (system-wide) settings directory on this platform
-/// (2.1.300's `tb()`): its `managed-settings.json`, and the
-/// `managed-settings.d` drop-ins beside it. On WSL Claude Code can also be
-/// told to read the Windows machine's; that is not read here.
+/// Claude Code's managed (system-wide) settings directory on this platform:
+/// its `managed-settings.json`, and the `managed-settings.d` drop-ins beside
+/// it. A WSL session's Windows directory is not read.
 #[cfg(target_os = "macos")]
 pub const MANAGED_DIR: Option<&str> = Some("/Library/Application Support/ClaudeCode");
 /// Claude Code's managed (system-wide) settings directory on this platform.
@@ -114,9 +80,9 @@ const MANAGED_FILE: &str = "managed-settings.json";
 /// `*.json` in it is a managed settings document too.
 const DROP_INS: &str = "managed-settings.d";
 
-/// Where macOS keeps managed preference domains: Claude Code (2.1.282 on;
-/// 2.1.300's `cBs`) reads its `com.anthropic.claudecode` domain there, the
-/// account's and the device's ([`managed_preferences`]).
+/// Where macOS keeps managed preference domains: Claude Code reads its
+/// `com.anthropic.claudecode` domain there, the account's and the device's
+/// ([`managed_preferences`]).
 pub const MANAGED_PREFERENCES_DIR: &str = "/Library/Managed Preferences";
 
 /// The managed preference domain's file name.
@@ -142,10 +108,9 @@ pub struct Source {
 }
 
 /// The agent's settings documents, for an agent launched in `launch`, in
-/// Claude Code's order (module header, "The chain"): THE CHAIN, with the
-/// managed documents of this platform's [`MANAGED_DIR`], every document that
-/// is there opened (the approval lane's: module header, "The file-provider
-/// fence is the route's").
+/// Claude Code's order (module doc, "The chain"), with this platform's
+/// [`MANAGED_DIR`] and every document that is there opened (the approval
+/// lane's read).
 #[must_use]
 pub fn sources(worker: &WorkerEnv, launch: &Path) -> Vec<Source> {
     sources_under(worker, launch, MANAGED_DIR.map(Path::new), None)
@@ -260,11 +225,10 @@ pub fn sources_under(
 /// Claude Code's managed preference domains for `worker`, in `dir`
 /// ([`MANAGED_PREFERENCES_DIR`]; a scratch tree for a test): the account's,
 /// under its name, and the device's. Claude Code names the account by
-/// `os.userInfo().username`; it is read here from the worker's `USER`, else
-/// its `LOGNAME` (the worker is this process's uid). Each is a plist this
-/// module does not parse, and none is opened: one that is there is reported
-/// as a document whose contents are unknown, one that is not is left out.
-/// Not part of [`sources`] (module header, "Its readers").
+/// `os.userInfo().username`, read here from the worker's `USER`, else
+/// `LOGNAME` (the worker is this process's uid). Each is a plist this module
+/// neither opens nor parses: one that is there is reported as a document of
+/// unknown contents, one that is not is left out. Not part of [`sources`].
 #[must_use]
 pub fn managed_preferences(worker: &WorkerEnv, dir: &Path) -> Vec<Source> {
     let account = ["USER", "LOGNAME"]
@@ -325,16 +289,12 @@ pub(crate) fn parsed(
         .collect()
 }
 
-/// A settings document's text as Claude Code's settings loader reads it
-/// (2.1.295 and 2.1.299): text that trims to nothing is `{}` (JavaScript's
-/// `trim`, which takes a byte-order mark as white space), and otherwise one
-/// leading byte-order mark is dropped before the JSON is parsed. `Err` (`do
-/// not parse`) for anything else that is not JSON. Every READER of a
-/// settings document takes its text through it: the chain's (module header,
-/// "Its readers"), the route's (`crate::harness::netwatch::settings_of`) and
-/// the upgrade's model half
-/// (`crate::harness::upgrade_models::parse_user_settings`); aterm-primer's
-/// editor keeps its own.
+/// A settings document's text as Claude Code's settings loader reads it: text
+/// that trims to nothing is `{}` (JavaScript's `trim`, which takes a
+/// byte-order mark as white space), and otherwise one leading byte-order mark
+/// is dropped before the JSON is parsed. `Err` (`do not parse`) for anything
+/// else that is not JSON. Every reader of a settings document takes its text
+/// through it (module doc, "Its readers").
 pub fn parse(text: &str) -> Result<Value, String> {
     if text
         .trim_matches(|c: char| c.is_whitespace() || c == '\u{feff}')
@@ -346,45 +306,131 @@ pub fn parse(text: &str) -> Result<Value, String> {
     aterm_json::from_str::<Value>(text).map_err(|_| "do not parse".to_string())
 }
 
-/// A bare-tool ask rule of the agent's own settings: every call of `tool` is
-/// put to a person, whatever its input.
+/// What one entry of the agent's own settings is ([`OwnerAsk`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AskRule {
-    /// The tool, as Claude Code names it (`Write`, `Edit`, `Read`).
-    pub tool: String,
-    /// The rule as written (`Write`, `Write(*)`).
-    pub rule: String,
+pub enum AskKind {
+    /// A `permissions.ask` rule naming `tool` ([`rule_tool`]). A `bare` one
+    /// (`Write`, `Write()`, `Write(*)`) puts every call of the tool to a
+    /// person; one with a specifier (`Bash(sed:*)`, `Edit(src/**)`) the calls
+    /// its matcher takes, which is Claude Code's to evaluate, never this
+    /// reader's.
+    Rule {
+        /// The tool, as Claude Code names it (`Write`, `Bash`).
+        tool: String,
+        /// No specifier: every call of the tool.
+        bare: bool,
+    },
+    /// A `hooks.PreToolUse` entry: a program Claude Code runs before a call
+    /// of every tool its matcher can match ([`hook_may_match`]), whose answer
+    /// (`ask` among them) is unknown until it runs.
+    Hook {
+        /// Its `matcher` as written; `None` where it has none (every tool).
+        matcher: Option<String>,
+    },
+}
+
+/// Something in the agent's own settings that may put a tool call to a
+/// person ([`owner_asks`]): an ask rule or a PreToolUse hook, where it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerAsk {
+    /// What it is.
+    pub kind: AskKind,
+    /// As written: the rule (`Bash(sed:*)`), or the hook's matcher (`*`;
+    /// `(none)` for a hook with none), for a reason or a log line.
+    pub text: String,
     /// The settings document it is in.
     pub source: String,
 }
 
-/// Every bare-tool rule in `permissions.ask` along the agent's settings chain
-/// ([`sources`]), launched in `launch` ([`bare_tool`]). `Err` names the first
-/// document that is there but cannot be read whole or does not parse, or
-/// whose `permissions.ask` is not a list of strings: what it asks is unknown.
-/// A rule with a specifier (`Write(src/**)`) is not returned: its matcher is
-/// Claude Code's, and no reader here evaluates it.
-pub fn bare_asks(worker: &WorkerEnv, launch: &Path) -> Result<Vec<AskRule>, String> {
+impl OwnerAsk {
+    /// Whether it puts every call of `tool` to a person: a bare ask rule for
+    /// it.
+    #[must_use]
+    pub fn asks_every(&self, tool: &str) -> bool {
+        matches!(&self.kind, AskKind::Rule { tool: t, bare: true } if t == tool)
+    }
+
+    /// Whether it may put a call of `tool` to a person: an ask rule for it,
+    /// with or without a specifier, or a PreToolUse hook whose matcher can
+    /// match it ([`hook_may_match`]).
+    #[must_use]
+    pub fn may_ask(&self, tool: &str) -> bool {
+        match &self.kind {
+            AskKind::Rule { tool: t, .. } => t == tool,
+            AskKind::Hook { matcher } => hook_may_match(matcher.as_deref(), tool),
+        }
+    }
+}
+
+/// Everything along the agent's settings chain ([`sources`]), launched in
+/// `launch`, that may put a tool call to a person: every well-formed rule in
+/// `permissions.ask` ([`rule_tool`]), and every `hooks.PreToolUse` entry that
+/// names a hook (an empty `hooks` list runs nothing). Which of them holds which
+/// box is the approval policy's (`settings_ask` in `approval.rs`). `Err` names
+/// the first document that cannot be read whole or parsed, or whose
+/// `permissions.ask`, `hooks`, `hooks.PreToolUse` or a matcher has the wrong
+/// type: what it asks is unknown.
+///
+/// Read as a superset, fail-closed: a hook's `if` condition, a
+/// `disableAllHooks` or `allowManagedHooksOnly`, and a regex matcher leave the
+/// hook in. Not read: hooks a plugin, a skill, a subagent's definition or an
+/// SDK host brings.
+pub fn owner_asks(worker: &WorkerEnv, launch: &Path) -> Result<Vec<OwnerAsk>, String> {
     let mut out = Vec::new();
     for (source, value) in parsed(worker, launch) {
         let unread = |why: &str| format!("its settings ({source}) {why}");
         let Some(value) = value.map_err(|why| unread(&why))? else {
             continue;
         };
-        let Some(asks) = value.get("permissions").and_then(|p| p.get("ask")) else {
-            continue;
-        };
-        let rules = asks
-            .as_array()
-            .ok_or_else(|| unread("hold a `permissions.ask` that is no list"))?;
-        for rule in rules {
-            let rule = rule
-                .as_str()
-                .ok_or_else(|| unread("hold a `permissions.ask` entry that is no string"))?;
-            if let Some(tool) = bare_tool(rule) {
-                out.push(AskRule {
-                    tool: tool.to_string(),
-                    rule: rule.to_string(),
+        if let Some(asks) = value.get("permissions").and_then(|p| p.get("ask")) {
+            let rules = asks
+                .as_array()
+                .ok_or_else(|| unread("hold a `permissions.ask` that is no list"))?;
+            for rule in rules {
+                let rule = rule
+                    .as_str()
+                    .ok_or_else(|| unread("hold a `permissions.ask` entry that is no string"))?;
+                if let Some((tool, bare)) = rule_tool(rule) {
+                    out.push(OwnerAsk {
+                        kind: AskKind::Rule {
+                            tool: tool.to_string(),
+                            bare,
+                        },
+                        text: rule.to_string(),
+                        source: source.clone(),
+                    });
+                }
+            }
+        }
+        if let Some(hooks) = value.get("hooks") {
+            let events = hooks
+                .as_object()
+                .ok_or_else(|| unread("hold a `hooks` that is no object"))?;
+            let Some(pre) = events.get("PreToolUse") else {
+                continue;
+            };
+            let entries = pre
+                .as_array()
+                .ok_or_else(|| unread("hold a `hooks.PreToolUse` that is no list"))?;
+            for entry in entries {
+                let matcher = match entry.get("matcher") {
+                    None | Some(Value::Null) => None,
+                    Some(m) => Some(
+                        m.as_str()
+                            .ok_or_else(|| unread("hold a PreToolUse matcher that is no string"))?
+                            .to_string(),
+                    ),
+                };
+                if entry
+                    .get("hooks")
+                    .and_then(Value::as_array)
+                    .is_some_and(Vec::is_empty)
+                {
+                    continue;
+                }
+                out.push(OwnerAsk {
+                    text: matcher.clone().unwrap_or_else(|| "(none)".to_string()),
+                    kind: AskKind::Hook { matcher },
                     source: source.clone(),
                 });
             }
@@ -393,21 +439,45 @@ pub fn bare_asks(worker: &WorkerEnv, launch: &Path) -> Result<Vec<AskRule>, Stri
     Ok(out)
 }
 
-/// The tool a permission rule names when it names one with NO specifier, as
-/// Claude Code 2.1.295 parses a rule (its bundle's rule parser, read
-/// 2026-10-09): `Write`, and `Write()` and `Write(*)`, which it reads as the
-/// bare tool. `None` for a rule with a specifier (`Edit(src/**)`) and for a
-/// malformed one (`Write(x`, which names no tool).
+/// The tool a permission rule names, and whether it names it bare, as Claude
+/// Code parses a rule: no parentheses is the bare tool (`Write`);
+/// `Tool(content)`, the `)` last and none in the name, is the tool, bare where
+/// the content is empty or `*` (`Write()`, `Write(*)`) and with a specifier
+/// otherwise (`Bash(sed:*)`). `None` for a malformed rule (`Write(x`, `(*)`,
+/// ``), which names no tool.
 #[must_use]
-pub fn bare_tool(rule: &str) -> Option<&str> {
+pub fn rule_tool(rule: &str) -> Option<(&str, bool)> {
     if !rule.contains(['(', ')']) {
-        return (!rule.is_empty()).then_some(rule);
+        return (!rule.is_empty()).then_some((rule, true));
     }
     let open = rule.find('(')?;
     let tool = &rule[..open];
     let content = rule[open + 1..].strip_suffix(')')?;
     let well_formed = !tool.is_empty() && !tool.contains(')');
-    (well_formed && matches!(content, "" | "*")).then_some(tool)
+    well_formed.then_some((tool, matches!(content, "" | "*")))
+}
+
+/// Whether a PreToolUse hook whose matcher is `matcher` (`None`: none) can
+/// run for a call of `tool`, as Claude Code matches a hook: none, an empty one
+/// and `*` match every tool; one of names alone (letters, digits, `_`, `|`,
+/// `,`, space and `-`) matches a tool it names, split at `|` and `,` and each
+/// trimmed; any other is a JavaScript regular expression, not evaluated here,
+/// so it can match (fail-closed: `mcp__.*` is taken to match `Bash`).
+#[must_use]
+pub fn hook_may_match(matcher: Option<&str>, tool: &str) -> bool {
+    let Some(matcher) = matcher.filter(|m| !m.is_empty() && *m != "*") else {
+        return true;
+    };
+    let names_only = matcher
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '|' | ',' | ' ' | '-'));
+    if names_only {
+        return matcher
+            .split(['|', ','])
+            .map(str::trim)
+            .any(|name| name == tool);
+    }
+    true
 }
 
 /// The main worktree of the repository `dir` is in: the directory holding its
@@ -469,15 +539,12 @@ fn drop_ins(dir: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(out)
 }
 
-/// Whether the chain opens `path`, the one gate of every open it makes (a
-/// settings document, [`read_settings_in`]; a git file, [`main_worktree`]):
-/// `Ok(false)` where nothing is there, asked by a `stat`, which no consent
-/// gates (docs/DESIGN-macos-tcc-prompts-2026-08-30.md §1.5); `Err`, saying
-/// so, where it is there inside a file-provider domain of the home `fence`
-/// names (`footer::under_file_provider_domain`: atpkg's lexical predicate fed
-/// the resolved paths), which is then never opened — the open can raise a
-/// system consent dialog that has no timeout, on whichever thread reads it
-/// (module header, "The file-provider fence is the route's"); else `Ok(true)`.
+/// Whether the chain opens `path`, the one gate of every open it makes
+/// ([`read_settings_in`], [`main_worktree`]): `Ok(false)` where nothing is
+/// there (a `stat`); `Err`, saying so, where it is there inside a
+/// file-provider domain of the home `fence` names
+/// (`footer::under_file_provider_domain`), which is then never opened (module
+/// doc, "The file-provider fence"); else `Ok(true)`.
 fn opens(fence: Option<&Path>, path: &Path) -> Result<bool, &'static str> {
     if let Err(e) = std::fs::symlink_metadata(path)
         && e.kind() == std::io::ErrorKind::NotFound
@@ -493,11 +560,9 @@ fn opens(fence: Option<&Path>, path: &Path) -> Result<bool, &'static str> {
 }
 
 /// A settings file's text: `Ok(None)` where there is none, `Err` naming why
-/// where one is there but cannot be read whole — not a regular file (a FIFO
-/// planted there is never opened to block on), larger than
-/// [`MAX_SETTINGS_BYTES`], or unreadable — and, where `fence` names a home,
-/// where it is there inside a file-provider domain of that home, which is
-/// then never opened ([`opens`]).
+/// where one is there but cannot be read whole: not a regular file (a planted
+/// FIFO is never opened to block on), larger than [`MAX_SETTINGS_BYTES`],
+/// unreadable, or fenced ([`opens`]).
 fn read_settings_in(fence: Option<&Path>, path: &Path) -> Result<Option<String>, String> {
     if !opens(fence, path).map_err(|why| format!("lie in {why}"))? {
         return Ok(None);

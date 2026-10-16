@@ -1,14 +1,9 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! SCR-1 absolute-content pinning over random volumes.
-//!
-//! Generalizes `scrolled_back_viewport_pins_during_live_output`
-//! (src/terminal/processing.rs) over random prefill / scroll-back / live
-//! volumes: while the user is scrolled into history, incremental live output
-//! must keep the SAME ABSOLUTE row at the viewport top, and `display_offset`
-//! must advance by exactly the number of lines that entered scrollback. This is
-//! the engine invariant the renderer's scroll-restore relies on.
+//! SCR-1 scroll pinning over random prefill / scroll-back / live volumes: while scrolled
+//! into history, live output keeps the same absolute row at the viewport top and advances
+//! `display_offset` by exactly the lines that entered scrollback.
 
 use crate::terminal::TerminalBuilder;
 use aterm_spec::rng::XorShift;
@@ -25,8 +20,7 @@ fn scrollback_pin_preserves_absolute_top_during_live_output() {
             .size(6, 40)
             .ring_buffer_size(4000)
             .build();
-        // Each prefill line is unique ("L#####") so the top-row content
-        // identifies an ABSOLUTE buffer line, not a relative position.
+        // Unique prefill lines, so the top row identifies an absolute buffer line.
         for i in 0..prefill {
             term.process(format!("L{i:05}\r\n").as_bytes());
         }
@@ -48,7 +42,7 @@ fn scrollback_pin_preserves_absolute_top_during_live_output() {
             top_after, top_before,
             "case {case}: pinned content moved under live output"
         );
-        // 2) display_offset advanced by EXACTLY the lines that entered scrollback.
+        // 2) display_offset advanced by exactly the lines that entered scrollback.
         assert_eq!(
             term.grid().display_offset(),
             offset_before + live,

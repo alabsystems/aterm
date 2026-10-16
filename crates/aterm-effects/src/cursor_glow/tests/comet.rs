@@ -136,7 +136,8 @@ fn comet_bridge_attaches_window_absolute() {
     // Re-emit the beam stream alone (no crown/ring/particle quads).
     let mut beam = Vec::new();
     let mut halos = Vec::new();
-    glow.emit_comet(t, &c, g, Some((2, 14)), &mut beam, &mut halos);
+    let mut under = Vec::new();
+    glow.emit_comet(t, &c, g, Some((2, 14)), &mut beam, &mut halos, &mut under);
     assert!(!beam.is_empty(), "a typing run draws a beam");
     let reach = beam
         .iter()

@@ -19,7 +19,7 @@
 //! was first written `1` (it is `3`) — wrong values no run-time test sees.
 //!
 //! [`winit_seam_constants.rs`](../winit_seam_constants.rs) is the twin over
-//! `vendor/winit`'s seam: same parser grammar, same probe, same coverage. Two
+//! `crates/aterm-window`'s seam: same parser grammar, same probe, same coverage. Two
 //! differences:
 //!
 //! 1. **The literal is PARENTHESISED in the assertion.** `|` binds LOOSER than
@@ -36,9 +36,12 @@
 //! shells out to `clang`, so it need not link the `aterm-gui` library.
 
 #![cfg(target_os = "macos")]
+#![allow(
+    clippy::disallowed_types,
+    reason = "test code: a stand-in child may inherit descriptors"
+)]
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use crate::sdk_consts;
 use crate::sdk_consts::{as_c_literal, green_verdict, inverted_verdict, parse_const_decl};
@@ -112,6 +115,33 @@ const ROWS: &[(&str, &str)] = &[
         "NS_ACTIVITY_USER_INITIATED_ALLOWING_IDLE_SYSTEM_SLEEP",
         "NSActivityUserInitiatedAllowingIdleSystemSleep",
     ),
+    // ---- the Developer Tools helper panel ----
+    (
+        "NS_WINDOW_STYLE_MASK_UTILITY_PANEL",
+        "(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskUtilityWindow | NSWindowStyleMaskNonactivatingPanel)",
+    ),
+    ("NS_BACKING_STORE_BUFFERED",             "NSBackingStoreBuffered"),
+    ("NS_FLOATING_WINDOW_LEVEL",              "NSFloatingWindowLevel"),
+    (
+        "NS_WINDOW_COLLECTION_BEHAVIOR_ALL_SPACES_AUXILIARY",
+        "(NSWindowCollectionBehaviorCanJoinAllSpaces | NSWindowCollectionBehaviorFullScreenAuxiliary)",
+    ),
+    ("NS_DRAG_OPERATION_NONE",                "NSDragOperationNone"),
+    ("NS_DRAG_OPERATION_COPY",                "NSDragOperationCopy"),
+    ("NS_BEZEL_STYLE_PUSH",                   "NSBezelStylePush"),
+    (
+        "NS_APPLICATION_ACTIVATE_ALL_WINDOWS_IGNORING_OTHER_APPS",
+        "(NSApplicationActivateAllWindows | NSApplicationActivateIgnoringOtherApps)",
+    ),
+    (
+        "NS_APPLICATION_ACTIVATION_POLICY_PROHIBITED",
+        "NSApplicationActivationPolicyProhibited",
+    ),
+    (
+        "CG_WINDOW_LIST_ON_SCREEN_NON_DESKTOP",
+        "(kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements)",
+    ),
+    ("CG_NULL_WINDOW_ID",                     "kCGNullWindowID"),
 ];
 
 fn repo() -> PathBuf {
@@ -354,25 +384,32 @@ fn every_gui_constant_equals_the_sdk_on_both_arches() {
     }
 }
 
-/// …and the same probe with ONE row inverted must fail on BOTH arches.
-///
-/// The row picked is `NS_COLOR_RENDERING_INTENT_PERCEPTUAL` — the row this
-/// instrument caught on its first run, and the profile of every constant it
-/// exists for: an implicit enumerator whose wrong value produces different
-/// pixels rather than a failure.
+/// Both scalar and compound-mask value errors must be rejected on both arches.
+/// The mask arm exercises the same probe's grouping of `SDK == (a | b | c)`;
+/// a wrong compound value must not turn into a truthy bitwise expression.
 #[test]
 fn the_assertion_is_load_bearing_on_both_arches() {
-    let body = probe(Some("NS_COLOR_RENDERING_INTENT_PERCEPTUAL"));
-    for arch in ["arm64", "x86_64"] {
-        inverted_verdict(
-            arch,
-            "NS_COLOR_RENDERING_INTENT_PERCEPTUAL",
-            compile(arch, &body, "inverted"),
-            &format!(
-                "an INVERTED constant compiled cleanly on {arch}: this test is passing for \
-                 the wrong reason and proves nothing about the other one"
-            ),
-        );
+    for row in [
+        "NS_COLOR_RENDERING_INTENT_PERCEPTUAL",
+        "NS_TRACKING_HOVER_IN_VISIBLE_RECT",
+    ] {
+        let body = probe(Some(row));
+        for arch in ["arm64", "x86_64"] {
+            let result = compile(arch, &body, "inverted");
+            if let Err(stderr) = &result {
+                assert!(
+                    stderr.contains(&format!("\"{row}\"")),
+                    "the failed {arch} probe did not name its planted assertion {row}:\n{stderr}"
+                );
+                eprintln!("SDK rejected planted value error for {row} on {arch}:\n{stderr}");
+            }
+            inverted_verdict(
+                arch,
+                row,
+                result,
+                &format!("an inverted {row} compiled cleanly on {arch}"),
+            );
+        }
     }
 }
 
@@ -404,55 +441,4 @@ fn the_arch_split_row_is_checked_on_the_arch_it_belongs_to() {
             &format!("the arch-split constant's {arch} arm is not really checked on {arch}"),
         );
     }
-}
-
-/// THE PARENTHESES ARE LOAD-BEARING, measured rather than argued.
-///
-/// `|` binds looser than `==` in C, so an unparenthesised compound literal makes
-/// the assertion `(SDK == first) | rest` — non-zero whatever `SDK` is. This
-/// builds the WRONG value for a real `|`-composed row both ways and requires the
-/// unparenthesised form to be accepted (with only a warning, which is why
-/// [`compile`] passes `-Werror -Wparentheses`) and the parenthesised form to be
-/// rejected. Without this, the two masks in [`ROWS`] would be decoration.
-#[test]
-fn an_unparenthesised_compound_literal_would_be_vacuous() {
-    let sdk =
-        "(NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways | NSTrackingInVisibleRect)";
-    // The real value is `0x01 | 0x80 | 0x200`; `0x02` is wrong in the first term.
-    let wrong = "0x02 | 0x80 | 0x200";
-    let bare = format!(
-        "#import <Cocoa/Cocoa.h>\n_Static_assert({sdk} == {wrong}, \"\");\nint main(void){{return 0;}}\n"
-    );
-    let wrapped = format!(
-        "#import <Cocoa/Cocoa.h>\n_Static_assert({sdk} == ({wrong}), \"\");\nint main(void){{return 0;}}\n"
-    );
-    // Unparenthesised: clang warns, and WITHOUT `-Werror` it would compile —
-    // which is the vacuity. Compiled here with a plain `cc` to show that.
-    let dir = aterm_tempfile::Builder::new()
-        .prefix("aterm-gui-consts-vacuity-")
-        .tempdir()
-        .expect("a scratch directory");
-    let path = dir.path().join("c.m");
-    std::fs::write(&path, &bare).expect("writable");
-    let out = Command::new("cc")
-        .args(["-arch", "arm64", "-fsyntax-only"])
-        .arg(&path)
-        .output()
-        .expect("`cc` must be runnable");
-    assert!(
-        out.status.success(),
-        "the unparenthesised form was rejected, so the premise of the \
-         parenthesisation has changed — re-derive it:\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("lower precedence"),
-        "clang no longer warns about `==` before `|`; the only thing standing \
-         behind these two rows is the parenthesisation, so say so here"
-    );
-    // Parenthesised: rejected, as a wrong value must be.
-    assert!(
-        compile("arm64", &wrapped, "vacuity-wrapped").is_err(),
-        "a WRONG parenthesised value compiled: the assertion proves nothing"
-    );
 }

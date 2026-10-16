@@ -706,6 +706,9 @@ pub(crate) struct HeraldNotice {
     pub title: &'static str,
     /// `<tab title>: <what>`.
     pub body: String,
+    /// Private: only the herald builds a notice, so
+    /// [`crate::notify::NotifyMsg::herald`] posts nothing it did not decide.
+    decided: (),
 }
 
 /// What one [`Herald::note`] decided.
@@ -1028,6 +1031,7 @@ impl Herald {
                 session,
                 title: esc.headline,
                 body: esc.body.clone(),
+                decided: (),
             }),
             transition,
             owed,
@@ -1777,7 +1781,7 @@ mod macos {
         /// under `--test-threads=1`). The real `menuNeedsUpdate:` body is not
         /// run by any test either: it paints through `+[NSMenuItem
         /// separatorItem]`, which opens a WindowServer connection from a test
-        /// binary (`tools/grep_guard.sh` B9f). An earlier version of this
+        /// binary (the aterm-census guard `test-appkit-door`). An earlier version of this
         /// sentence named a test that does not exist and claimed AppKit's
         /// dispatch; in a campaign whose stated trap is "compiles, does
         /// nothing, reports success", an overstated proof is the defect that
@@ -2098,7 +2102,7 @@ mod macos {
         /// is what makes it a fair stand-in: everything under test is the
         /// macro's output, not the relay. (The real `menuNeedsUpdate:` paints
         /// through `+separatorItem`, which a unit test may not reach:
-        /// `tools/grep_guard.sh` B9f.)
+        /// the aterm-census guard `test-appkit-door`.)
         static DISPATCHES: AtomicUsize = AtomicUsize::new(0);
 
         aterm_objc::declare_class! {

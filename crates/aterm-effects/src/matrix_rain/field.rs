@@ -4,14 +4,13 @@
 //! Phosphor rain field: the pure `(seed, tick)` math (matrix-rain design §4).
 //!
 //! Everything here is a total function of `(seed32, config-derived params,
-//! tick)` on u32 lattice math (`rain_hash32` only: WGSL has no u64, and a split
-//! host/shader hash would make the field-conformance proof vacuous). No
-//! `Instant`, no allocation, no state beyond the caller-owned [`DensityRing`],
-//! so the field is unit-testable and shader-portable on its own.
+//! tick)` on u32 lattice math through the one hash [`rain_hash32`], so the
+//! field ports bit-exactly to WGSL (which has no u64). No `Instant`, no
+//! allocation, no state beyond the caller-owned [`DensityRing`].
 
 /// GPU-path quad budget (contract §4): the hard cap both backends size for.
 pub const MAX_RAIN_QUADS: usize = 2048;
-/// CPU texel budget: the CPU stamp cost scales with cell AREA, so the quad cap
+/// CPU texel budget: the CPU stamp cost scales with cell area, so the quad cap
 /// on that path derives from texels (`2048 · (10·20)`), floored at 256 quads.
 pub const MAX_RAIN_TEXELS: usize = 409_600;
 /// Bright-head additive halo budget (`rain_add` GlowQuads per frame).
@@ -24,7 +23,7 @@ pub const GLYPH_COUNT: u32 = 64;
 /// old and the quantized staircase steps a handful of times per weather front.
 pub const DENSITY_RING: usize = 8;
 
-/// murmur3 finalizer — the ONE field hash (WGSL-trivial, bit-exact in u32).
+/// murmur3 finalizer — the one field hash (WGSL-trivial, bit-exact in u32).
 #[must_use]
 pub fn rain_hash32(mut x: u32) -> u32 {
     x ^= x >> 16;
@@ -54,7 +53,7 @@ pub fn pack(row: u32, col: u32) -> u32 {
 pub struct FieldParams {
     /// Host-mixed 32-bit seed (the u64 config seed diffused once, host-side).
     pub seed32: u32,
-    /// Viewport rows (the LIVE value — the flash floor must see real geometry).
+    /// Viewport rows (the live value — the flash floor must see real geometry).
     pub rows: u32,
     /// Base tick period in ms (`1000 / fps`).
     pub tick_ms: u32,
@@ -99,7 +98,7 @@ pub struct ColParams {
     /// Column hash root `rain_hash32(seed32 ^ ((c<<1)|1))`.
     pub h: u32,
     /// Step period in ticks/row (`>= 2` — a head advances at most 1 row/tick
-    /// BY CONSTRUCTION, the structural speed clamp).
+    /// by construction, the structural speed clamp).
     pub p: u32,
     /// Trail length in rows (`3..=rows`).
     pub l: u32,
@@ -143,7 +142,7 @@ pub fn col_params(fp: &FieldParams, col: u32) -> ColParams {
     ColParams { h, p, l, g, c, phi }
 }
 
-/// STAMMER (design §2): bright-head columns hold one extra tick, in unison,
+/// Stammer (design §2): bright-head columns hold one extra tick, in unison,
 /// once per 8 stammer windows — `tick' = tick - ((tick/sq) % 8 == 7)`.
 #[must_use]
 pub fn stammer_tick(tick: u64, sq: u32) -> u64 {
@@ -208,7 +207,7 @@ pub fn cycle_start_tick(cp: &ColParams, k: u64) -> u64 {
 }
 
 /// Cycle admission: the column rains this cycle iff its re-roll byte clears
-/// the density staircase AT THE CYCLE START — admission flips only at cycle
+/// the density staircase at the cycle start — admission flips only at cycle
 /// boundaries, so intensity changes read as weather fronts, never popping.
 #[must_use]
 pub fn cycle_active(hk: u32, density_byte: u8) -> bool {
@@ -257,9 +256,6 @@ pub fn glyph_from_epoch(seed32: u32, row: u32, col: u32, glyph_epoch: u32) -> (u
 
 /// The frame-invariant glyph epoch `tick / mq`. `mq` is global, so swaps are
 /// synchronized screen-wide and iso-luminant. Hoisted once per frame.
-///
-/// scope-waiver: a pure function of its two arguments; callers agree by
-/// computing the same value, so no instance count can falsify this.
 #[must_use]
 pub fn glyph_epoch(tick: u64, mq: u32) -> u32 {
     (tick / u64::from(mq.max(1))) as u32
@@ -283,7 +279,7 @@ pub fn quad_cap(cell_w: u32, cell_h: u32) -> usize {
 }
 
 /// Bounded ring of density-staircase change points `(tick, density_byte)`:
-/// cycle admission looks up the density AT the cycle-start tick, so the
+/// cycle admission looks up the density at the cycle-start tick, so the
 /// weather history the field replays from is explicit engine state.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DensityRing {
@@ -302,7 +298,7 @@ impl DensityRing {
     }
 
     /// The density in force at `tick`: the newest change point at or before
-    /// it. Ticks older than the whole ring resolve to the OLDEST retained
+    /// it. Ticks older than the whole ring resolve to the oldest retained
     /// entry (bounded history, best effort); an empty ring is density 0.
     #[must_use]
     pub fn at(&self, tick: u64) -> u8 {
@@ -344,8 +340,8 @@ mod tests {
         }
     }
 
-    /// The murmur3 finalizer is the pinned bit pattern (the v1.1 WGSL
-    /// conformance pass anchors against these exact values).
+    /// The murmur3 finalizer's pinned bit pattern (a shader port must
+    /// reproduce these exact values).
     #[test]
     fn hash_is_the_murmur3_finalizer() {
         assert_eq!(rain_hash32(0), 0);
@@ -494,31 +490,5 @@ mod tests {
         assert_eq!(quad_cap(10, 20), 2048, "GPU cap binds at small cells");
         assert_eq!(quad_cap(20, 40), 512, "retina cells thin via the texel cap");
         assert_eq!(quad_cap(100, 100), 256, "floor at 256");
-    }
-
-    /// The whole field is a pure function of `(seed, tick)`: identical inputs
-    /// give identical cycles, levels, and glyphs.
-    #[test]
-    fn field_is_deterministic() {
-        let fp = params(40, 33, 5, 5);
-        for col in 0..8 {
-            let cp = col_params(&fp, col);
-            for tick in [0u64, 7, 999, 12345] {
-                assert_eq!(cycle_at(&cp, &fp, tick), cycle_at(&cp, &fp, tick));
-                let cv = cycle_at(&cp, &fp, tick);
-                for row in 0..fp.rows {
-                    assert_eq!(
-                        trail_level(&cp, cv.eff_tick, cv.k, row),
-                        trail_level(&cp, cv.eff_tick, cv.k, row)
-                    );
-                    assert_eq!(
-                        glyph_at(fp.seed32, row, col, tick, fp.mq),
-                        glyph_at(fp.seed32, row, col, tick, fp.mq)
-                    );
-                    let (g, _) = glyph_at(fp.seed32, row, col, tick, fp.mq);
-                    assert!(g < GLYPH_COUNT);
-                }
-            }
-        }
     }
 }

@@ -10,8 +10,8 @@
 //! output, and holding the whole decompressed stream beside it (twice the
 //! output for 16-bit samples) would double that for no gain — and make a fixed
 //! cap on that intermediate, not the caller's own budget, decide which images
-//! load. So the caller's output buffer is the only allocation that scales with
-//! the image.
+//! load. So the caller's output buffer is the only decoded allocation that
+//! scales with the image; the buffered encoded source has its own ceiling.
 //!
 //! Adam7 is the one place that shape bends: an interlaced pass row's pixels land
 //! at scattered (x, y) positions, so each pixel is written individually — which
@@ -63,12 +63,22 @@ impl<R: Read> Decoder<R> {
     /// # Errors
     /// [`DecodingError`] for a bad signature, a truncated or CRC-failing chunk,
     /// an illegal header, a structure PNG does not allow, or an output buffer
-    /// larger than the configured [`Limits`].
+    /// or encoded input larger than the configured [`Limits`].
     pub fn read_info(mut self) -> Result<Reader, DecodingError> {
+        // The pixel limit cannot protect a read-to-EOF of a hostile source:
+        // ancillary chunks, empty DEFLATE blocks and bytes after IEND can all
+        // grow without adding a pixel. Preserve the output budget separately,
+        // allowing encoded overhead even when it is exactly one pixel's size.
+        let input_limit = self.limits.encoded_bytes();
         let mut bytes = Vec::new();
         self.source
+            .by_ref()
+            .take((input_limit as u64).saturating_add(1))
             .read_to_end(&mut bytes)
             .map_err(|e| DecodingError::Io(e.kind()))?;
+        if bytes.len() > input_limit {
+            return Err(DecodingError::LimitsExceeded);
+        }
         Reader::parse(&bytes, self.limits, self.transformations)
     }
 }

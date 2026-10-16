@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Thin wrapper over [`aterm_lz4`] for scrollback compression (#7943).
+//! Thin wrapper over [`aterm_lz4`] for scrollback compression.
 //!
 //! Keeps the scrollback-facing [`Lz4Error`] surface and adds the
 //! scrollback-layer caps (the 64 MiB page cap on output, 512 : 1 claimed
@@ -10,8 +10,7 @@
 
 use std::fmt;
 
-/// Error type for LZ4 decompression failures. The regression tests (#7934)
-/// `matches!` on these variants.
+/// Error type for LZ4 decompression failures.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Lz4Error {
     /// Input is too short to contain valid data (shorter than the 4-byte
@@ -37,10 +36,8 @@ pub enum Lz4Error {
     /// Compressed data ended unexpectedly mid-sequence, or was otherwise
     /// rejected by the decoder for a reason not covered by the other variants.
     UnexpectedEof,
-    /// The claimed decompressed size implies a compression ratio that exceeds
-    /// [`MAX_COMPRESSION_RATIO`] — interpreted as a potential compression bomb
-    /// (corrupted or adversarial size prefix inflating a tiny payload).
-    /// #7940 §09 compression-bomb ceiling.
+    /// The claimed decompressed size implies a compression ratio over
+    /// [`MAX_COMPRESSION_RATIO`]: a corrupt or adversarial size prefix.
     CompressionBombSuspected {
         /// Claimed decompressed size (from the 4-byte LE prefix).
         claimed_size: usize,
@@ -50,11 +47,9 @@ pub enum Lz4Error {
 }
 
 impl Lz4Error {
-    /// Render the exact `Display` message without going through
-    /// `format_args!`: the `write!` expansion embeds an unsafe
-    /// `fmt::Arguments` construction the strict Trust gate cannot lower and
-    /// fails closed on (`dec_string` renders decimals exactly like `usize`'s
-    /// `Display`).
+    /// Render the `Display` message without `format_args!`, whose expansion
+    /// embeds an unsafe `fmt::Arguments` construction the strict Trust gate
+    /// fails closed on (`dec_string` renders decimals like `usize`'s `Display`).
     pub(crate) fn to_message(&self) -> String {
         use crate::error::dec_string;
         match self {
@@ -105,35 +100,18 @@ impl std::error::Error for Lz4Error {}
 
 /// Maximum safe decompressed size: the scrollback page cap
 /// ([`MAX_DECOMPRESSED_SCROLLBACK_PAGE_BYTES`](crate::codec::MAX_DECOMPRESSED_SCROLLBACK_PAGE_BYTES)),
-/// the same limit the warm tier's writer pages its blocks by, so no block it
-/// stores is refused here. Prevents allocation bombs from corrupt size
-/// prefixes. This cap is enforced here (not in the shared [`aterm_lz4`] crate)
-/// because it is a scrollback-layer policy, not an LZ4 format constraint.
+/// the limit the warm tier pages its blocks by, so no block it stores is
+/// refused. A scrollback policy against allocation bombs, not an LZ4 format
+/// constraint, so it lives here rather than in [`aterm_lz4`].
 const MAX_DECOMPRESSED_SIZE: usize = crate::codec::MAX_DECOMPRESSED_SCROLLBACK_PAGE_BYTES;
 
-/// Maximum acceptable compression ratio (output bytes ÷ compressed bytes).
+/// Maximum acceptable claimed compression ratio (prefix size ÷ compressed body).
 ///
-/// #7940 §09 compression-bomb ceiling: the absolute `MAX_DECOMPRESSED_SIZE`
-/// cap alone is not enough — a 4-byte size prefix claiming 64 MiB expands a
-/// ~5-byte payload into 64 MiB of allocation, which on systems that don't
-/// bound memory tightly amplifies attacker bytes 13 000 000 : 1 before the
-/// allocation-bomb cap even engages.
-///
-/// LZ4 block format has a theoretical maximum ratio of 255 : 1 (the longest
-/// single match token); real scrollback pages compress at 1 : 1 to ~40 : 1.
-/// We set the guardrail at 512 : 1 — well above any realistic scrollback
-/// workload, but catches "1 MB of decompressed zeroes from 16 bytes of
-/// input" style amplifications where a corrupted or adversarial size prefix
-/// claims orders of magnitude more than the payload can legitimately hold.
-///
-/// This is a ceiling on *claimed* ratio (prefix_size / compressed_body_len),
-/// checked before decompression actually runs, so an attacker cannot force
-/// a cap-sized allocation from a 4-byte LZ4 block.
+/// The absolute cap alone lets a 4-byte prefix turn a ~5-byte payload into a
+/// 64 MiB allocation. LZ4's block format tops out near 255 : 1 and real
+/// scrollback pages compress at 1 : 1 to ~40 : 1, so 512 : 1 only catches a
+/// corrupt or adversarial prefix. Checked before decompression runs.
 const MAX_COMPRESSION_RATIO: usize = 512;
-
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
 
 /// Compress `input` using LZ4 block format, prepending the original size as
 /// a 4-byte little-endian prefix.
@@ -143,9 +121,7 @@ const MAX_COMPRESSION_RATIO: usize = 512;
 /// Returns `Err` if `input.len()` exceeds `u32::MAX` (the 4-byte size prefix
 /// cannot represent the original size).
 pub fn compress_prepend_size(input: &[u8]) -> Result<Vec<u8>, Lz4Error> {
-    // The underlying `aterm_lz4::compress_prepend_size` takes `&[u8]` and
-    // returns `Vec<u8>`; it does not validate that `input.len()` fits in a
-    // `u32`. Do that check here so the 4-byte LE prefix is always honest.
+    // `aterm_lz4` does not check that `input.len()` fits the u32 prefix.
     u32::try_from(input.len()).map_err(|_| Lz4Error::OutputTooLarge(input.len()))?;
     Ok(aterm_lz4::compress_prepend_size(input))
 }
@@ -170,16 +146,9 @@ pub fn decompress_size_prepended(input: &[u8]) -> Result<Vec<u8>, Lz4Error> {
     if original_size == 0 && input.len() == 4 {
         return Ok(Vec::new());
     }
-    // #7940 §09 compression-bomb ceiling: reject claimed sizes that imply a
-    // ratio far outside the LZ4 format's theoretical maximum. A corrupted or
-    // adversarial prefix is the only way claimed_size / body_len can exceed
-    // 512 : 1 in normal use. Checked *before* the decoder runs so we do not
-    // allocate even a scratch buffer for a suspected bomb.
-    //
-    // The body length is input.len() - 4 (strip the size prefix). We know
-    // input.len() >= 5 at this point: the `< 4` guard rejected shorter
-    // inputs, and the `original_size == 0 && input.len() == 4` fast path
-    // returned above.
+    // Compression-bomb ceiling (see MAX_COMPRESSION_RATIO), checked before the
+    // decoder allocates anything. `input.len() >= 4` (guard above), so the
+    // subtraction cannot underflow.
     let compressed_body_len = input.len() - 4;
     if original_size > compressed_body_len.saturating_mul(MAX_COMPRESSION_RATIO) {
         return Err(Lz4Error::CompressionBombSuspected {
@@ -187,14 +156,7 @@ pub fn decompress_size_prepended(input: &[u8]) -> Result<Vec<u8>, Lz4Error> {
             compressed_body_len,
         });
     }
-    // Delegate the actual decode to `aterm_lz4`. Its `DecompressError`
-    // distinguishes offset-out-of-bounds, literal-out-of-bounds, expected-
-    // another-byte, and output-too-small — all of which we collapse to
-    // `UnexpectedEof` here (except the one case that maps cleanly to
-    // `InvalidOffset`). The scrollback call sites only care about
-    // `InputTooShort` and `OutputTooLarge`; everything else flows through
-    // `Display` and gets formatted into the surrounding
-    // `ScrollbackError::Decompression` context.
+    // Callers wrap the error's message into `ScrollbackError::Decompression`.
     match aterm_lz4::decompress_size_prepended(input) {
         Ok(output) => {
             if output.len() != original_size {
@@ -219,17 +181,11 @@ fn map_decompress_error(err: aterm_lz4::DecompressError) -> Lz4Error {
             offset: 0,
             output_pos: 0,
         },
-        // `DecompressError` is `#[non_exhaustive]` upstream, so any variant
-        // we don't call out explicitly is collapsed to `UnexpectedEof`. That
-        // matches the "decoder ran out of input or encountered something it
-        // couldn't finish" semantics the scrollback layer cares about.
+        // `DecompressError` is `#[non_exhaustive]`; every other variant means the
+        // decoder could not finish.
         _ => Lz4Error::UnexpectedEof,
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -252,13 +208,10 @@ mod tests {
         }
     }
 
-    /// THE ANTI-DOS LAW ON THE WARM TIER'S ADVERSARIAL INPUT: whatever the
-    /// body, a decode that succeeds returns exactly the length its prefix
-    /// claims, so a peer cannot make the decoder emit more (or fewer) bytes
-    /// than it was told. Every claim 0..=16 × every body of 0, 1 or 2 bytes
-    /// (1.1M inputs) — the bodies the decoder can read a token, a literal and
-    /// a match offset from — and every input shorter than the prefix is
-    /// `InputTooShort`.
+    /// A decode that succeeds returns exactly the length its prefix claims, so a
+    /// peer cannot make the decoder emit more or fewer bytes than declared.
+    /// Covers every claim 0..=16 × every body of 0–2 bytes (1.1M inputs); every
+    /// input shorter than the prefix is `InputTooShort`.
     #[test]
     fn small_claims_decode_to_their_claim_or_fail() {
         let mut bodies: Vec<Vec<u8>> = vec![Vec::new()];
@@ -317,10 +270,8 @@ mod tests {
 
     #[test]
     fn test_compression_bomb_rejected_under_limit() {
-        // Craft a prefix claiming a size that fits in MAX_DECOMPRESSED_SIZE
-        // but implies an impossible compression ratio from the body length.
-        // Claim 1 MiB from a 100-byte body (~10,485 : 1 ratio, far above the
-        // 512 : 1 ceiling).
+        // Claim 1 MiB, under MAX_DECOMPRESSED_SIZE, from a 100-byte body:
+        // ~10,485 : 1, far above the 512 : 1 ceiling.
         let claimed: u32 = 1024 * 1024;
         let mut data = claimed.to_le_bytes().to_vec();
         data.extend(std::iter::repeat_n(0u8, 100));
@@ -356,7 +307,6 @@ mod tests {
         let input = vec![0u8; 8 * 1024]; // 8 KiB zeros
         let compressed = compress_prepend_size(&input).unwrap();
         let ratio = input.len() / (compressed.len() - 4);
-        // Sanity check: this workload should be under the 512 ceiling.
         assert!(
             ratio < MAX_COMPRESSION_RATIO,
             "test assumes 8 KiB zeros compresses with ratio < {MAX_COMPRESSION_RATIO}; got {ratio}"
@@ -368,18 +318,15 @@ mod tests {
 
     #[test]
     fn test_ratio_boundary_exactly_at_limit_accepted() {
-        // claimed = MAX_COMPRESSION_RATIO * body_len is accepted;
-        // claimed = MAX_COMPRESSION_RATIO * body_len + 1 is rejected.
-        // We construct an artificial input that will fail decode (since we're
-        // not building a real LZ4 block), but the ratio check runs first and
-        // should not fire at the boundary.
+        // claimed = MAX_COMPRESSION_RATIO * body_len passes the ratio check; the
+        // garbage body then fails the decode, but not as a bomb.
         let body_len = 64usize;
         let claimed = MAX_COMPRESSION_RATIO * body_len; // exactly at limit
         let claimed_u32 = u32::try_from(claimed).expect("test claim fits in u32");
         let mut data = claimed_u32.to_le_bytes().to_vec();
         data.extend(std::iter::repeat_n(0u8, body_len));
         let err = decompress_size_prepended(&data).expect_err("garbage payload fails decode");
-        // Must NOT be the bomb error — we're at the boundary, not over it.
+        // Not the bomb error: the claim is at the boundary, not over it.
         assert!(
             !matches!(err, Lz4Error::CompressionBombSuspected { .. }),
             "ratio exactly at MAX_COMPRESSION_RATIO must be accepted by the bomb gate; got {err:?}"

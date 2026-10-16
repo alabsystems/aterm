@@ -72,6 +72,9 @@ impl App {
             return;
         };
         let shown = self.is_visible_session(session);
+        if !shown && self.kitty_animations.next.get(&session) == Some(&None) {
+            return;
+        }
         let Ok(mut term) = term.try_lock() else {
             if let Some(Some(at)) = self.kitty_animations.next.get_mut(&session) {
                 *at = (*at).max(now + LOCK_RETRY);

@@ -186,7 +186,9 @@ pub struct TerminalConfig {
     /// SGR 2 (dim/faint): the fraction of the foreground retained, `0.0..=1.0`.
     /// The fg is blended toward the cell background in linear light
     /// (`color_resolve::dim_toward_bg`), so faint text recedes on dark and light
-    /// themes. Default `0.5` (config `faint_opacity`).
+    /// themes, keeping at least this share of the fg's contrast (in log space)
+    /// so dark ink on a light ground never sinks into the mid-greys. Default
+    /// `0.5` (config `faint_opacity`).
     pub faint_opacity: f32,
 
     // === BiDi Settings ===

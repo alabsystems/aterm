@@ -42,13 +42,19 @@
 //! human's own credential, `hold=1` was always described as a human's halt, and
 //! a human at the glass who cannot stop the drivers on their own machine has
 //! been given less than the fleet has. So `hold` is `Access::OwnerOnly` and
-//! [`cmd_hold`] refuses an Owner-issued act, `on` or `off`, against a standing
-//! fleet hold, and refuses `origin=fleet` from Owner outright. The check runs
+//! [`cmd_hold`] refuses `origin=fleet` from Owner outright. The check runs
 //! under the fabric lock ([`apply_hold`]), so a fleet hold landing between an
 //! Owner's read and its write is still the one that stands. And the local hold
 //! is the owner's STOP SIGNAL, not a containment stop: Owner is the scope every
 //! in-session client holds, so the halted session's own agent can lift it —
 //! which is exactly why the fleet hold is a different origin it cannot touch.
+//!
+//! A SESSION HOLDS A SET OF ORIGINS ([`Holds`]), one slot each: the fleet's
+//! halt and the owner's stop stand side by side, each set and lifted on its
+//! own, and the session is held while either stands. A fleet halt landing on
+//! the owner's local hold used to REPLACE it, and the fleet's lift then left
+//! the session unheld — the owner's stop silently gone. Now the fleet's lift
+//! leaves it standing, and an Owner act never touches the fleet's slot.
 //!
 //! ## A dead bridge: an advisory by default, fail closed on request
 //!
@@ -63,14 +69,17 @@
 //! connection closes — the child exited, was killed, or the fd was closed —
 //! [`bridge_lost`] applies `hold on reason=fabric-lost origin=fleet` to every
 //! session that bridge ever delivered to or held. Killing the bridge therefore
-//! HALTS the sessions it was governing; it does not free them.
+//! HALTS the sessions it was governing; it does not free them. The sweep fills
+//! the FLEET slot only: an owner's local hold stands beside it, and stays when
+//! a reconnecting bridge lifts the sweep's.
 //!
 //! THE ONLY LIFT OF A FLEET HOLD IS A RECONNECTING BRIDGE, and that is a
 //! narrower promise than this header used to make. [`apply_hold`] has exactly
 //! two production callers — [`cmd_hold`] and [`bridge_lost`] — and there is no
 //! menu item, key binding, palette action or config path that clears a hold. The
 //! Owner token's `hold off` lifts a LOCAL hold and nothing else: against
-//! `origin=fleet` it is `ERR denied`. DESIGN §11.2 and an earlier version of
+//! `origin=fleet`, or with only a fleet hold standing, it is `ERR denied`.
+//! DESIGN §11.2 and an earlier version of
 //! this header both said "a human lifts it at the GUI"; no such path exists, so
 //! the sentence is WITHDRAWN rather than left standing as a promise the code
 //! does not keep. An operator whose bridge cannot come back (a deleted cap file,
@@ -80,9 +89,9 @@
 //!
 //! ## A seamless update is not a restart
 //!
-//! It CARRIES every standing hold, either origin, onto the adopted session
-//! ([`render_hold`] into the handoff record, [`parse_hold`] and
-//! [`SessionFabric::seed_hold`] in the successor, before the session can take
+//! It CARRIES every standing hold, both origins, onto the adopted session
+//! ([`render_holds`] into the handoff record, [`parse_holds`] and
+//! [`SessionFabric::seed_holds`] in the successor, before the session can take
 //! a single control verb). Before that carry an automatic update lifted every
 //! halt in the process, silently, minutes after it was set (the round-four
 //! plan, item 3). A carried FLEET hold keeps the fleet's rule in the
@@ -93,6 +102,36 @@
 //! not see it. From the instant the Commit reads that serial to its `_exit`,
 //! a hold transition waits instead ([`SessionFabric::fence_hold`]): nothing
 //! compares the serial again, so one answered in that stretch would be lost.
+//!
+//! Nor is a PTY keeper's crash recovery, whose sessions keep their sid and
+//! their running agents: the session's keeper META carries its holds, its
+//! topics and an id lease ([`KeeperCarry`]) from the last sample delivered to
+//! the keeper, which may be older than the pump's quarter-second interval.
+//! The recovered session is held again before it
+//! answers a verb. A quit is still an end: its BYE closes the sessions, so a
+//! relaunch after one carries nothing.
+//!
+//! ## An end nobody chose carries the OWNER's hold, never the fleet's
+//!
+//! A crash, or the quit of a restart, a logout or a shutdown, leaves the next
+//! launch a layout that names each tab's standing holds
+//! (`restore::TerminalLeafRestore::holds`, [`render_holds`]; ruling 23 of the
+//! robustness handoff, LC-8 of ATERM-KI-1015-1). The cold restore relaunches
+//! no agent of a held tab, whatever the origin, and puts the owner's
+//! (`origin=local`) slot back on the reopened tab ([`SessionFabric::seed_holds`]
+//! with [`Holds::of_origin`], `carried=1`), lifted as any local hold is:
+//! Fabric > Lift Hold, or the Owner's `hold <sid> off` (the session is the
+//! argument; a selector is refused). A FLEET hold is not put back on a fresh
+//! shell: it stays the process's, so quitting and relaunching remains the
+//! recovery from a stuck one (above). A shell the PTY keeper gave back is no
+//! fresh shell: it carries its own holds, both origins, from its keeper META
+//! (above), and the layout adds the owner's where that carry has none. Neither
+//! sample can be ordered before the other (the journal captures at most every
+//! two seconds; the META is the last one delivered), so the owner's stop
+//! stands if either says it did — the fail-closed direction the keeper carry
+//! itself takes ([`KeeperCarry`]'s "sampled, not journaled") — and the fleet's
+//! slot is the META's alone. A person's own quit carries no hold at all, as it
+//! carries no agent.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::sync::atomic::AtomicU64;
@@ -101,6 +140,11 @@ use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
 
 use aterm_control::wire::pct_encode;
 use aterm_session::SessionId;
+// The fabric's word grammar, defined once for the bridge, this endpoint and
+// the supervisor. The endpoint still CHECKS every word on a `deliver` line —
+// the bridge is a separate process and its output is still input — it just no
+// longer keeps its own spelling of the rule.
+use aterm_types::fabric_grammar::{KINDS, VERDICTS, is_principal, is_topic, via_ok};
 
 use crate::SessionCtx;
 use crate::session_store::{SessionStore, Store};
@@ -230,26 +274,9 @@ pub(crate) fn fabric_event_wire_kind(kind: &str) -> Option<&'static str> {
     FABRIC_EVENT_KINDS.iter().copied().find(|k| *k == kind)
 }
 
-/// The kinds `deliver` accepts, and the `await inbox` vocabulary. Closed: a kind
-/// outside this set is refused at `deliver`, so nothing an agent reads carries a
-/// kind token the endpoint never classified.
-///
-/// NOT the set a SENDER may claim — that is [`POSTABLE`], and the difference
-/// between the two lists is the whole reason there are two.
-pub(crate) const KINDS: &[&str] = &[
-    "ask",
-    "answer",
-    "task",
-    "report",
-    "note",
-    "control",
-    "ack",
-    "expired",
-    "undeliverable",
-];
-
-/// The kinds a SENDER may claim on `post`: [`KINDS`] minus the two a bridge
-/// RECORDS on a sender's behalf.
+/// The kinds a SENDER may claim on `post`: [`KINDS`] (the set `deliver`
+/// accepts, and the `await inbox` vocabulary) minus the two a bridge RECORDS on
+/// a sender's behalf.
 ///
 /// TWO LISTS BECAUSE THERE ARE TWO QUESTIONS. `deliver` must accept everything
 /// that can arrive off the bus, `expired` and `undeliverable` included, because
@@ -277,12 +304,6 @@ const TRUSTS: &[&str] = &["human", "agent", "relayed", "screen"];
 /// The kinds `await inbox` latches on when the caller lists none: everything but
 /// `note`. A note is the class that must never wake anybody by itself.
 const AWAIT_DEFAULT_SKIP: &str = "note";
-
-/// The three words `inbox seen <id> <verdict>` accepts, which are the three a
-/// receipt (`kind=ack … verdict=`) may carry back to a sender (R8). CLOSED at
-/// both doors: `deliver` refuses any other `verdict=`, so the row an agent
-/// reads carries a word this endpoint classified.
-const VERDICTS: &[&str] = &["handled", "refused", "deferred"];
 
 /// How many `inbox get @<off>` reads one session may have PARKED for the
 /// bridge at once, and how long one waits. The bridge answers each with one
@@ -404,6 +425,14 @@ pub(crate) struct InboxRow {
     /// Whether a non-peek `inbox` has listed this row. Unlisted rows are what the
     /// quota counts and what an eviction reports.
     pub listed: bool,
+    /// A BROADCAST the delivering bridge OFFERS AGAIN to a successor that keeps
+    /// this sid while it is unhandled — it said `refill=…say` in its `hello`
+    /// ([`bridge_refills_broadcasts`]), and keeps the row's refill floor in its
+    /// state dir. A seamless update counts an unhandled broadcast in `dropped=`
+    /// only when this is false ([`FabricCarry::broadcasts_refilled`]). Always
+    /// false on an addressed row, and cleared by a `topic drop` of its topic,
+    /// which takes the floor with it ([`cmd_topic`]).
+    pub refill: bool,
 }
 
 impl InboxRow {
@@ -463,9 +492,13 @@ impl MailFilter {
 /// One `MAIL` frame's fields — METADATA ONLY.
 ///
 /// There is no body field and there is no `text=`: the ring's bodies are not
-/// read to build this, so the push stream cannot carry one by mistake. That is
-/// the same rule the hook's metadata block follows, for the same reason — a
-/// peer's words must reach an agent only through a drain it ran itself.
+/// read to build this, so the push stream cannot carry one by mistake. Every
+/// wake surface follows the same rule — the events digest's `EVENT <sid>
+/// inbox` row and the manager lane's `MAIL` line print an id, an offset,
+/// `from=` and a kind, never a body — for the same reason: a peer's words must
+/// reach an agent only through a drain it ran itself. `from` is the sender's
+/// full principal for every row, accepted or not; [`valid_principal`] is all
+/// that bounds it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MailLine {
     pub id: u64,
@@ -511,6 +544,9 @@ pub(crate) struct PostRow {
     pub kind: String,
     /// The offset the record landed at, once the bridge says so.
     pub off: Option<u64>,
+    /// The endpoint log clock when `off` was reported. An unlanded post has
+    /// no record reference yet; its clock is set at retirement, not enqueue.
+    landed_epoch: u64,
     /// The offset this post ANSWERS, carried through to the bridge so the
     /// published record's body can say `re=`.
     pub re: Option<u64>,
@@ -558,7 +594,7 @@ pub(crate) struct PostRow {
     pub body: String,
 }
 
-/// The standing halt on one session.
+/// One standing halt on one session: one origin's slot of its [`Holds`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Hold {
     /// Pct-encoded reason, or `-`.
@@ -566,9 +602,134 @@ pub(crate) struct Hold {
     /// `fleet` (a human's halt through the bridge, or a lost bridge) or `local`
     /// (the instance Owner's own halt, over the local control socket). The origin
     /// is what [`cmd_hold`] gates an Owner-issued act on: a `fleet` hold is not
-    /// the owner's to replace or lift.
+    /// the owner's to set or lift.
     pub origin: String,
 }
+
+/// THE STANDING HALTS ON ONE SESSION: one slot per origin, each set and lifted
+/// on its own ([`apply_hold`]). The session is held while ANY slot stands.
+///
+/// TWO SLOTS, AND IT USED TO BE ONE. A fleet halt landing on a session the
+/// owner had held locally REPLACED the owner's hold, and when the fleet lifted
+/// its halt the session was left UNHELD: the owner's own stop was silently
+/// gone, with nothing refused and nothing said. The `[fabric]
+/// hold_on_bridge_lost = true` sweep did the same with `reason=fabric-lost`,
+/// so a reconnecting bridge freed every session the owner had stopped. Now the
+/// fleet's halt and the owner's stand side by side: the bridge sets and lifts
+/// the fleet's slot, the owner the local one, and neither act touches the
+/// other's.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Holds {
+    /// The fleet's hold (`origin=fleet`): its reason.
+    fleet: Option<String>,
+    /// The owner's own hold (`origin=local`): its reason.
+    local: Option<String>,
+}
+
+impl Holds {
+    /// The slot an origin names. Anything but `fleet` is the local slot, as
+    /// [`parse_hold`] reads an origin it does not know.
+    fn slot_mut(&mut self, origin: &str) -> &mut Option<String> {
+        if origin == "fleet" {
+            &mut self.fleet
+        } else {
+            &mut self.local
+        }
+    }
+
+    /// Whether a hold of `origin` stands.
+    pub(crate) fn has(&self, origin: &str) -> bool {
+        if origin == "fleet" {
+            self.fleet.is_some()
+        } else {
+            self.local.is_some()
+        }
+    }
+
+    /// Whether any hold stands: the session is halted.
+    pub(crate) fn is_held(&self) -> bool {
+        self.fleet.is_some() || self.local.is_some()
+    }
+
+    /// The hold of `origin` alone, the other slot empty: what a cold restore
+    /// puts back of a layout's holds (the owner's, ruling 23).
+    pub(crate) fn of_origin(&self, origin: &str) -> Holds {
+        if origin == "fleet" {
+            Holds {
+                fleet: self.fleet.clone(),
+                local: None,
+            }
+        } else {
+            Holds {
+                fleet: None,
+                local: self.local.clone(),
+            }
+        }
+    }
+
+    /// Every standing hold, the fleet's first.
+    pub(crate) fn standing(&self) -> impl Iterator<Item = Hold> + '_ {
+        [("fleet", &self.fleet), ("local", &self.local)]
+            .into_iter()
+            .filter_map(|(origin, reason)| {
+                reason.as_ref().map(|reason| Hold {
+                    reason: reason.clone(),
+                    origin: origin.to_string(),
+                })
+            })
+    }
+
+    /// The hold a one-hold surface names — `ERR halted reason= origin=`, the
+    /// menu's halt pair, the `hold` event's `reason=`/`origin=`: the FLEET's
+    /// when it stands, because that is the one the session's own agent cannot
+    /// lift (lifting the owner's leaves the session held), else the owner's.
+    pub(crate) fn first(&self) -> Option<Hold> {
+        self.standing().next()
+    }
+
+    /// The standing origins as `hold_origin=` prints them: comma-joined, the
+    /// fleet's first (`fleet`, `local`, `fleet,local`), `-` for none.
+    pub(crate) fn origins(&self) -> String {
+        let words: Vec<String> = self.standing().map(|h| h.origin).collect();
+        if words.is_empty() {
+            "-".to_string()
+        } else {
+            words.join(",")
+        }
+    }
+
+    /// Set `hold`'s slot — a seed's only act: it never lifts. The first hold
+    /// of an origin wins, so a carry naming one origin twice keeps a halt and
+    /// cannot replace it with another.
+    fn seed(&mut self, hold: Hold) {
+        let slot = self.slot_mut(&hold.origin);
+        if slot.is_none() {
+            *slot = Some(hold.reason);
+        }
+    }
+
+    /// The `hold` timeline event's payload for these holds, after a
+    /// transition: `<held> reason=<r> origin=<o> hold_origin=<origins>`, with
+    /// `reason=`/`origin=` the hold [`Self::first`] names, so a reader of the
+    /// last event alone (`aterm fabric`, the bridge) reads what stands. When
+    /// nothing stands it is `0 reason=- origin=<the origin just lifted>`.
+    fn event(&self, lifted: &str) -> String {
+        match self.first() {
+            Some(first) => format!(
+                "1 reason={} origin={} hold_origin={}",
+                first.reason,
+                first.origin,
+                self.origins()
+            ),
+            None => format!("0 reason=- origin={lifted} hold_origin=-"),
+        }
+    }
+}
+
+/// The `reason=` of the fleet hold a lost bridge leaves under `[fabric]
+/// hold_on_bridge_lost = true` ([`bridge_lost`]): a hold no person set, which
+/// a reconnecting bridge lifts and `aterm fabric halt … off` cannot.
+pub(crate) const FABRIC_LOST: &str = "fabric-lost";
 
 impl PostRow {
     /// The bytes this row keeps alive whose SIZE THE CALLER CHOSE — the quantity
@@ -579,7 +740,7 @@ impl PostRow {
     /// small: it is one whitespace-free token on the `post` request line, so a
     /// single post could carry ~64 KiB of it and 128 of them ~8 MiB, twice over a
     /// 4 MiB bound whose own doc says it exists because "there are two ways to
-    /// overflow". `via` is bounded at the door now ([`valid_via`]), and it is
+    /// overflow". `via` is bounded at the door now ([`via_ok`]), and it is
     /// counted here as well so the number this fold produces is the number the
     /// constant names.
     ///
@@ -624,6 +785,11 @@ fn caller_sized_bytes(body: &str, via: Option<&str>) -> usize {
 struct Inbox {
     rows: VecDeque<InboxRow>,
     posts: VecDeque<PostRow>,
+    /// The last drain that exposed a post from this session. This schedules
+    /// peeks only: it retires nothing and is not carried across a handoff.
+    /// Sessions omitted by a byte or row bound keep their older turn and lead
+    /// the next drain, even while every earlier head stays refused.
+    outbox_turn: u64,
     last_msg_id: u64,
     next_post_id: u64,
     /// The HANDLED watermark: moved only by `inbox seen`.
@@ -648,10 +814,17 @@ struct Inbox {
     /// can be.
     ///
     /// Monotone: `inbox` reports it, so a drop is always visible to the next
-    /// drain even if the agent missed the one it happened on.
+    /// drain even if the agent missed the one it happened on — across a
+    /// seamless update too, which carries it and adds the unread broadcasts it
+    /// cannot carry ([`FabricCarry::dropped`],
+    /// [`FabricCarry::broadcasts_uncarried`]).
     dropped: u64,
     /// The highest offset ever delivered here.
     bus_head: u64,
+    /// The highest ADDRESSED (topic-less) offset ever delivered here — what
+    /// [`addressed_floor`] reports once no unhandled addressed row is left in
+    /// the ring. A maximum over deliveries, so an eviction never lowers it.
+    addressed_head: Option<u64>,
     /// The LOWEST offset ever delivered (or fetched) here — the header's
     /// `oldest_on_bus=@<off>`. Every one of THIS SESSION's records from it to
     /// `bus_head` is on the broker's log whether or not the ring still holds it
@@ -662,7 +835,8 @@ struct Inbox {
     /// Offsets already delivered, newest last, capped at [`DEDUP_CAP`].
     dedup: VecDeque<u64>,
     dedup_set: HashSet<u64>,
-    hold: Option<Hold>,
+    /// The standing halts, one slot per origin ([`Holds`]).
+    holds: Holds,
     /// THE HALT A LOST BRIDGE DID NOT MAKE ([`bridge_lost`] under the default
     /// since 2026-09-29): the hold it would have applied, and the bridge
     /// incarnation it was lost under. Read by `status hold_advisory=` only
@@ -699,6 +873,18 @@ struct Inbox {
     /// second bus read). Bounded at [`FETCH_SLOTS`]: an answered slot is
     /// evicted to make room, a pending one never is.
     fetches: VecDeque<(u64, FetchSlot)>,
+    /// The highest row id this session had handed out when the
+    /// bridge said the bus log changed (`link log`, [`Inbox::forget_bus_offsets`]):
+    /// a row at or below it carries an offset on an EARLIER log, and
+    /// no offset this endpoint is handed now can name it. Zero until a log
+    /// changed under this process.
+    log_floor: u64,
+    /// Changes whenever this endpoint learns that its broker log changed.
+    /// Waiters retain the clock of the record they wait for, not just its offset.
+    log_epoch: u64,
+    /// The log this session's clock names. Carried through seamless restart;
+    /// `None` with live offset references is an unknown historical clock.
+    bus_log: Option<String>,
     /// The receipts this session OWES a sender (R8), oldest first, bounded at
     /// [`RECEIPTS_OWED_MAX`]: listed on every `outbox` peek as `receipt sid=
     /// rid= off= verdict= kind= from=` until the bridge retires one with
@@ -750,10 +936,23 @@ struct OwedReceipt {
     kind: String,
     /// The row's `from=` token — what addresses the receipt.
     from: String,
+    /// `off` names a record of a log EARLIER than the one the bridge reads
+    /// now: the row was delivered before `link log` said the log changed
+    /// ([`Inbox::forget_bus_offsets`]). Listed `log=earlier`, and the bridge
+    /// retires the receipt `unacked … reason=log-replaced` rather than put
+    /// `re=<off>` on a log where that number is another record.
+    earlier_log: bool,
 }
 
 /// Queue one receipt, handing out its `rid` and keeping the bound.
-fn owe_receipt(inbox: &mut Inbox, off: u64, verdict: &str, kind: &str, from: &str) {
+fn owe_receipt(
+    inbox: &mut Inbox,
+    off: u64,
+    verdict: &str,
+    kind: &str,
+    from: &str,
+    earlier_log: bool,
+) {
     inbox.outbox_moves += 1;
     inbox.next_receipt_id += 1;
     let rid = inbox.next_receipt_id;
@@ -763,6 +962,7 @@ fn owe_receipt(inbox: &mut Inbox, off: u64, verdict: &str, kind: &str, from: &st
         verdict: verdict.to_string(),
         kind: kind.to_string(),
         from: from.to_string(),
+        earlier_log,
     });
     while inbox.receipts.len() > RECEIPTS_OWED_MAX {
         inbox.receipts.pop_front();
@@ -824,6 +1024,10 @@ fn owe_receipt(inbox: &mut Inbox, off: u64, verdict: &str, kind: &str, from: &st
 /// post, retired dead) — never the manifest.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct FabricCarry {
+    /// The log the carried receipts and reply references name. Missing in an
+    /// older carry: its live offset references remain unverified until attach.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bus_log: Option<String>,
     /// The last inbox row id this session handed out ([`Inbox::last_msg_id`]).
     #[serde(default)]
     pub last_msg_id: u64,
@@ -839,6 +1043,11 @@ pub(crate) struct FabricCarry {
     /// The receipts still owed, oldest first.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub receipts: Vec<ReceiptCarry>,
+    /// Receipts whose offsets name an earlier log. Kept apart so an older
+    /// successor that ignores this key cannot publish them as current receipts.
+    /// They share the normal receipts' count and byte bounds.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub earlier_receipts: Vec<ReceiptCarry>,
     /// Waiting posts this handoff could not carry, by id.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub uncarried: Vec<u64>,
@@ -847,6 +1056,34 @@ pub(crate) struct FabricCarry {
     /// comes); the successor logs the count.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub receipts_uncarried: u64,
+    /// The session's `dropped=` at the draw ([`Inbox::dropped`]). The counter
+    /// is monotone so that a drop is visible to the next drain even when the
+    /// agent missed the one it happened on; a successor that started it at 0
+    /// erased every drop counted before the update.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub dropped: u64,
+    /// The BROADCASTS this session held unhandled at the draw (`topic=`, id
+    /// past `seen`). The ring is not carried, so none of them is in the
+    /// successor's ring; [`Self::broadcasts_refilled`] of them come back by
+    /// the bridge's refill, and the successor adds the rest to `dropped=` and
+    /// logs the count. Every unhandled one, whoever refills it: a successor
+    /// from before the refill reads this key alone, and its bridge refills no
+    /// broadcast, so it counts each of them lost — as it is.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub broadcasts_uncarried: u64,
+    /// Of [`Self::broadcasts_uncarried`], the ones the successor's bridge
+    /// OFFERS AGAIN, which are therefore not lost: delivered by a bridge that
+    /// refills broadcasts ([`InboxRow::refill`]), on a topic this session
+    /// still takes (a successor refuses another `ERR not-subscribed`) and has
+    /// not dropped since (the drop took the floor), from the log the bridge
+    /// reads now, and young enough that the bridge's bound on what it
+    /// remembers cannot have dropped it ([`SessionFabric::handoff_carry`]).
+    /// That bridge kept each one's topic floor in its state dir, and the
+    /// successor's bridge rewinds the topic's cursor to it
+    /// ([`INBOX_ID_RESERVE`]). Never more than `broadcasts_uncarried`; an
+    /// older successor reads past it and counts them all.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub broadcasts_refilled: u64,
 }
 
 /// `skip_serializing_if` for a zero count.
@@ -893,7 +1130,7 @@ pub(crate) const CARRY_MAIL_BYTES: usize = 256 * 1024;
 
 /// What one carried row costs the manifest beyond its escaped strings: its
 /// table header, its keys, its integers and their punctuation — an upper
-/// bound for [`PostCarry`] (eight keys) and [`ReceiptCarry`] (five).
+/// bound for [`PostCarry`] (eight keys) and [`ReceiptCarry`] (six).
 const CARRY_ROW_OVERHEAD: usize = 256;
 
 /// What `s` costs the manifest as TOML writes it: one byte per byte, plus one
@@ -925,22 +1162,35 @@ const CARRY_INT_MAX: u64 = i64::MAX as u64;
 /// reserve, so no id is ever handed to two rows (round seven's review of group
 /// J, item 2).
 ///
-/// WHAT REACHES THE SUCCESSOR AGAIN IS THE ADDRESSED LANE. The ring is not
-/// carried: the successor's bridge refills each session's ADDRESSED mail from
-/// its `seen` offset, so an addressed row taken in the overlap is listed there
-/// again under an id of its own, and an `inbox seen <old id>` there names no
-/// row rather than a wrong one. A BROADCAST is not refilled — the bridge moves
-/// the session's topic cursor past it on the `OK` and resumes the successor
-/// from there — so a broadcast this process answered and its agent has not yet
-/// read is not in the new aterm's inbox, whether it came before the draw or in
-/// the overlap (round seven's review of group J, open problem 201). Under the
+/// WHAT REACHES THE SUCCESSOR AGAIN IS EVERY ROW ITS AGENT HAS NOT HANDLED.
+/// The ring is not carried: the successor's bridge refills each session's
+/// ADDRESSED mail from the floor `inbox seen` last reported
+/// ([`addressed_floor`]: the lowest unhandled addressed offset), so an
+/// addressed row taken in the overlap is listed there again under an id of
+/// its own, and an `inbox seen <old id>` there names no row rather than a
+/// wrong one. A BROADCAST comes back the same way from a bridge that refills
+/// them (`hello … refill=in,say`, [`InboxRow::refill`]; round seven's review
+/// of group J, open problem 201): the bridge moves the topic cursor past a
+/// broadcast on the `OK`, but first writes down the topic's REFILL FLOOR —
+/// the lowest offset the ring took and `inbox seen` has not passed — and the
+/// successor's bridge rewinds the cursor to it and offers the stretch again,
+/// whether the row came before the draw or in the overlap. The floor is one
+/// offset per topic, so the walk also offers a broadcast the quota refused
+/// between two unhandled ones, which the successor then takes after the old
+/// process counted it: `dropped=` can over-report across an update, never
+/// under. One a bridge that does not refill answered is lost, and one unread
+/// at the draw is SAID: the successor counts it in `dropped=` and logs the
+/// count ([`FabricCarry::broadcasts_uncarried`] less
+/// [`FabricCarry::broadcasts_refilled`]); one such a bridge answered in the
+/// overlap, after the manifest was written, is not in that count. Under the
 /// Commit's fence a broadcast is therefore never answered: it waits for the
 /// attempt ([`SessionFabric::wait_fenced_delivery`]), the `_exit` drops the
 /// bridge's lane with the cursor unmoved, and the successor's bridge offers it
-/// again. Between the draw and the fence it is answered as usual. Standing the
-/// Commit down for it would not keep it — the next update that lands drops it
-/// the same way if it is still unread — and would spend the automatic lane's
-/// activity retries on mail from outside the desk.
+/// again, whatever the bridge. Between the draw and the fence it is answered
+/// as usual. Standing the Commit down for it would not keep it from a bridge
+/// that does not refill — the next update that lands drops it the same way if
+/// it is still unread — and would spend the automatic lane's activity retries
+/// on mail from outside the desk.
 ///
 /// Inbound mail is NOT activity that vetoes an update: only a process that
 /// numbers more than this many rows in one overlap stands its Commit down (a
@@ -951,11 +1201,11 @@ pub(crate) const INBOX_ID_RESERVE: u64 = 1 << 12;
 
 /// How often a delivery waiting on a committing update — one past
 /// [`INBOX_ID_RESERVE`], or a broadcast — logs that it is still waiting
-/// ([`SessionFabric::wait_fenced_delivery`]). Short under test, so a test
-/// drives several rounds of the wait's timeout arm and sees that none of them
-/// answers.
+/// ([`SessionFabric::wait_fenced_delivery`]): a cadence, never a bound. Short
+/// under test, so a test drives several rounds of the wait's timeout arm and
+/// sees that none of them answers.
 #[cfg(not(test))]
-const MSG_ROOM_NOTICE_EVERY: std::time::Duration = HOLD_FENCE_WAIT;
+const MSG_ROOM_NOTICE_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
 #[cfg(test)]
 const MSG_ROOM_NOTICE_EVERY: std::time::Duration = std::time::Duration::from_millis(40);
 
@@ -971,7 +1221,12 @@ impl FabricCarry {
         self.posts
             .iter()
             .map(PostCarry::cost)
-            .chain(self.receipts.iter().map(ReceiptCarry::cost))
+            .chain(
+                self.receipts
+                    .iter()
+                    .chain(&self.earlier_receipts)
+                    .map(ReceiptCarry::cost),
+            )
             .fold(0, usize::saturating_add)
     }
 
@@ -979,24 +1234,195 @@ impl FabricCarry {
     /// when the manifest is over its cap with nothing else optional left
     /// (round seven's review, item 1): every carried post is named in
     /// `uncarried` instead (the successor retires it dead, `not-carried`),
-    /// every receipt is counted in `receipts_uncarried`. The id counters stay:
-    /// they are a few bytes, and they are what keeps the successor's ids above
-    /// the old process's. `false` when there was nothing to shed.
+    /// every receipt is counted in `receipts_uncarried`. The id counters stay,
+    /// and so do the loss counts (`dropped`, `broadcasts_uncarried`,
+    /// `broadcasts_refilled`): they are a few bytes, and they are what keeps
+    /// the successor's ids above the old process's and its `dropped=` honest. `false` when there was nothing to
+    /// shed.
     pub(crate) fn shed(&mut self) -> bool {
-        if self.posts.is_empty() && self.receipts.is_empty() {
+        if self.posts.is_empty() && self.receipts.is_empty() && self.earlier_receipts.is_empty() {
             return false;
         }
         self.uncarried.extend(self.posts.drain(..).map(|p| p.id));
         self.uncarried.sort_unstable();
         self.uncarried.dedup();
-        let dropped = u64::try_from(self.receipts.len()).unwrap_or(u64::MAX);
+        let dropped = u64::try_from(
+            self.receipts
+                .len()
+                .saturating_add(self.earlier_receipts.len()),
+        )
+        .unwrap_or(u64::MAX);
         self.receipts.clear();
+        self.earlier_receipts.clear();
         self.receipts_uncarried = self
             .receipts_uncarried
             .saturating_add(dropped)
             .min(CARRY_INT_MAX);
         true
     }
+
+    /// The counters a PTY keeper recovery starts from: the lease its META
+    /// carried ([`KeeperCarry::ids`]), each held where a later update's
+    /// manifest can carry it on, and no rows.
+    #[cfg(unix)]
+    pub(crate) fn leased([msg, post, rid]: [u64; 3]) -> Self {
+        Self {
+            last_msg_id: msg.min(CARRY_INT_MAX),
+            last_post_id: post.min(CARRY_INT_MAX),
+            last_receipt_id: rid.min(CARRY_INT_MAX),
+            ..Self::default()
+        }
+    }
+
+    /// THE FENCE FOR A KEPT SID WITH NO LEASE: the counters a session the PTY
+    /// keeper recovered starts from when its META carried no id lease
+    /// ([`KeeperCarry::ids`]) — one an older window sent, or none because the
+    /// crash came before the first. The sid survives the recovery and so do the
+    /// bridge's sequence pins keyed by it, so counting from zero again could
+    /// meet one ([`KeeperCarry`]); a fresh random base in `[2^32, 2^52]`,
+    /// above anything a window counts to from zero or a lease, keeps the ids
+    /// apart from every earlier window's, a second fence's included, but for
+    /// a one-in-a-million draw. Far under [`CARRY_INT_MAX`], so a later
+    /// update carries it on.
+    #[cfg(unix)]
+    pub(crate) fn fenced() -> Self {
+        let hex = aterm_session::LaunchNonce::generate().to_hex();
+        let draw = hex
+            .get(..5)
+            .and_then(|digits| u64::from_str_radix(digits, 16).ok())
+            .unwrap_or(0);
+        let base = (draw + 1) << 32;
+        Self {
+            last_msg_id: base,
+            last_post_id: base,
+            last_receipt_id: base,
+            ..Self::default()
+        }
+    }
+}
+
+/// THE FABRIC A PTY KEEPER RECOVERY CARRIES (the fabric audit's fourth round,
+/// findings 2-5): what a session's keeper META says of its fabric beside the
+/// screen's scalars ([`SessionFabric::keeper_carry`],
+/// `seamless::keeper_meta_of`), read back by `seamless::recovered_fabric`
+/// into the [`FabricCarry`], topics and hold `spawn::seed_adopted_fabric`
+/// puts back. A session the keeper kept through a crash or a Force Quit keeps
+/// its sid, and its agent keeps running; it used to come back as a fresh
+/// mailbox under that sid.
+///
+/// * THE HOLDS ([`render_holds`]): a keeper recovery is not a lift. The
+///   owner's stop signal and a fleet halt stand again, each in its own slot,
+///   before the recovered session answers a verb, as an update carries them;
+///   a carried fleet hold is lifted only by a bridge whose broker shows no
+///   standing halt (`converge_hold`), so with the broker or the bridge away
+///   it stands, and the owner's stays through that lift.
+/// * THE ID LEASE ([`id_lease`]): each counter rounded up past the next
+///   [`INBOX_ID_RESERVE`] block. The bridge's durable `(sid, post id)` and
+///   `(sid, rid)` sequence pins outlive both processes: counting from zero
+///   again published a new post at an old one's sequence, which the broker
+///   deduplicated into the old record and answered as landed, and an `inbox
+///   seen <id>` the agent learned before the crash decided another row.
+///   Numbered from the lease, every id the recovered session hands out is
+///   above every one the dead process did, and an old id names no row. A
+///   lease moves once a block, so mail does not churn the META.
+/// * THE TOPIC ROWS ([`render_topics`]): broadcast consent. Lost, the new
+///   bridge's first `topic ls` read `OK 0` as the session's own answer and
+///   deleted the durable cursors each topic resumes from.
+/// * THE QUEUED POST IDS AND THE OWED RECEIPTS' COUNT. The posts and receipts
+///   stay with the dead process — a 4 KiB META cannot hold them, and a
+///   sample cannot say which the bridge published since — but the recovered
+///   session retires each queued id dead, `reason=not-carried`, with its
+///   timeline row, and logs the receipts, as for an update that could not
+///   carry them ([`SessionFabric::seed_carry`]). Said, never silent.
+/// * THE LOSS COUNT, `dropped=` ([`Self::dropped`]): monotone across an update
+///   ([`FabricCarry::dropped`]), and so across a recovery too, where it read 0
+///   again and an agent that watches it for gaps saw none. A META from before
+///   it carries none and reads 0, as before.
+///
+/// SAMPLED, NOT JOURNALED: the pump attempts a changed META every
+/// `keeper_link::META_POLL`; lock contention, a full queue or a failed link can
+/// leave the keeper with an older sample. A hold lifted after that sample
+/// comes back held (the fail-closed direction: `hold off` lifts it again);
+/// a hold set, a topic added or a post queued after it can still be lost, as
+/// can ids minted beyond its stored lease before a newer META arrives.
+///
+/// BOUNDED: the holds, the lease and the two counts always fit beside the
+/// most a META sheds to; the lists give way to their counts when nothing
+/// else will fit ([`Self::rungs`]), and the recovery logs what they named.
+#[cfg(unix)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct KeeperCarry {
+    /// The first standing hold, as [`render_hold`] writes it — the fleet's
+    /// when it stands ([`render_holds`]) — under the key every META reader
+    /// since the keeper carry reads, so a build from before the two slots
+    /// still recovers the stronger halt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hold: Option<String>,
+    /// Every other standing hold, one row each: the owner's, when the fleet's
+    /// stands too. An older reader reads past the key.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub more_holds: Vec<String>,
+    /// The id lease: inbox row, post, receipt.
+    pub ids: [u64; 3],
+    /// The broadcast opt-ins, as [`render_topics`] writes them.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub topics: Vec<String>,
+    /// Opt-ins the META had no room to name ([`Self::rungs`]).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub topics_lost: u64,
+    /// The posts still waiting for a bridge, by id, oldest first.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub queued: Vec<u64>,
+    /// Waiting posts the META had no room to name.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub queued_lost: u64,
+    /// The receipts still owed.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub owed: u64,
+    /// The session's `dropped=` at the sample ([`Inbox::dropped`]), which the
+    /// recovered session goes on counting from. At most `i64::MAX`, as the
+    /// update's carry holds it.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub dropped: u64,
+}
+
+#[cfg(unix)]
+impl KeeperCarry {
+    /// The carry as the META's cap tries it, most first: whole; the queued
+    /// post ids given up for their count; and the topic rows too. The holds,
+    /// the lease, the receipt count and the drop count are in every rung.
+    ///
+    /// Past those, the holds' REASONS give way, never the holds: first every
+    /// reason but the first hold's, then that one too, each read back as
+    /// [`REASON_NOT_CARRIED`]. Two holds whose reasons are 128 bytes that JSON
+    /// doubles do not fit beside the widest scalars a session can reach; the
+    /// halts they are, origin by origin, always do.
+    pub(crate) fn rungs(&self) -> [Self; 5] {
+        let count = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
+        let mut unnamed = self.clone();
+        unnamed.queued_lost = unnamed.queued_lost.saturating_add(count(self.queued.len()));
+        unnamed.queued.clear();
+        let mut bare = unnamed.clone();
+        bare.topics_lost = bare.topics_lost.saturating_add(count(self.topics.len()));
+        bare.topics.clear();
+        let shed = |row: &str| format!("{} {REASON_NOT_CARRIED}", parse_hold(row).origin);
+        let mut terse = bare.clone();
+        terse.more_holds = bare.more_holds.iter().map(|row| shed(row)).collect();
+        let mut tersest = terse.clone();
+        tersest.hold = terse.hold.as_deref().map(shed);
+        [self.clone(), unnamed, bare, terse, tersest]
+    }
+}
+
+/// A counter's LEASE ([`KeeperCarry::ids`]): `n` rounded up past the next
+/// [`INBOX_ID_RESERVE`] block, so it is at least a whole block above every id
+/// handed out when it was taken and changes only when a block is crossed.
+#[cfg(unix)]
+fn id_lease(n: u64) -> u64 {
+    (n / INBOX_ID_RESERVE)
+        .saturating_add(2)
+        .saturating_mul(INBOX_ID_RESERVE)
+        .min(CARRY_INT_MAX)
 }
 
 impl PostCarry {
@@ -1027,7 +1453,7 @@ impl PostCarry {
                 .bytes()
                 .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
             && POSTABLE.contains(&self.kind.as_str())
-            && self.via.as_deref().is_none_or(valid_via)
+            && self.via.as_deref().is_none_or(via_ok)
             && self.key.as_deref().is_none_or(valid_key)
             && self.body.len() <= BODY_MAX.saturating_mul(3)
     }
@@ -1146,6 +1572,66 @@ impl Fetched {
 }
 
 impl Inbox {
+    /// FORGET EVERY BUS OFFSET THIS SESSION HOLDS: the bridge says the log
+    /// they index is not the one it reads now ([`cmd_link_log`]), and astream
+    /// gives another log's records the same numbers. So the `off=` dedup goes
+    /// (a new record at an old offset would be answered `OK <old id>` and
+    /// lost), the `bus_head=`/`oldest_on_bus=` span and the addressed refill
+    /// floor ([`addressed_floor`]) start again, every read
+    /// answered from the old log goes and every one still parked fails
+    /// `reason=log-replaced` (the bridge would answer it from the new log),
+    /// and the rows held so far are marked as an earlier log's
+    /// ([`Inbox::log_floor`]): no `re=` threads to old posts by offset and no
+    /// `inbox get @<off>` answers one. The rows themselves stay: they were
+    /// delivered, and what they say is still what was sent. So do the receipts
+    /// owed for them, each marked as an earlier log's
+    /// ([`OwedReceipt::earlier_log`]) — as is one a later verdict owes — so a
+    /// bridge that understands the mark retires it rather than publish its
+    /// `re=` here. Older bridges are not offered those receipts.
+    fn forget_bus_offsets(&mut self) -> Vec<u64> {
+        for r in &mut self.receipts {
+            r.earlier_log = true;
+        }
+        self.dedup.clear();
+        self.dedup_set.clear();
+        self.bus_head = 0;
+        self.addressed_head = None;
+        self.oldest_on_bus = None;
+        self.log_floor = self.last_msg_id;
+        self.log_epoch += 1;
+        // A queued new message can land on the new log. A queued reply cannot:
+        // its `re` names a record of the old log. Report that distinction as an
+        // explicit retirement instead of silently rebinding the reference.
+        let mut retired = Vec::new();
+        for post in &mut self.posts {
+            if post.off.is_none() && !post.dead && post.re.is_some() {
+                post.dead = true;
+                post.dead_reason = "log-replaced".to_string();
+                post.body.clear();
+                post.body.shrink_to_fit();
+                post.via = None;
+                post.key = None;
+                retired.push(post.id);
+            }
+        }
+        self.outbox_moves += 1;
+        self.trim_retired_posts();
+        self.fetches
+            .retain(|(_, slot)| matches!(slot, FetchSlot::Pending | FetchSlot::Partial(_)));
+        for (_, slot) in &mut self.fetches {
+            *slot = FetchSlot::Failed("log-replaced".to_string());
+        }
+        retired
+    }
+
+    /// The ring row delivered at `off` on the log the bridge reads NOW — never
+    /// one of an earlier log's ([`Inbox::log_floor`]).
+    fn row_at(&self, off: u64) -> Option<&InboxRow> {
+        self.rows
+            .iter()
+            .find(|r| r.id > self.log_floor && r.off == off)
+    }
+
     /// The outbound load `post` is refused against: how many posts still wait for
     /// the bridge, and how many CALLER-SIZED bytes they hold between them
     /// ([`PostRow::caller_sized_bytes`], which is body + `via`).
@@ -1154,7 +1640,7 @@ impl Inbox {
     /// `via` is a single whitespace-free token on the same request line and was
     /// bounded by nothing at all, so 128 queued posts could pin ~8 MiB above a
     /// stated 4 MiB bound whose own doc says "TWO BOUNDS BECAUSE THERE ARE TWO
-    /// WAYS TO OVERFLOW". It is bounded at the door now ([`valid_via`]) AND
+    /// WAYS TO OVERFLOW". It is bounded at the door now ([`via_ok`]) AND
     /// counted here, because a bound that folds one of a row's two caller-sized
     /// fields has to be re-derived by hand every time a field is added — which is
     /// how this one came to be wrong.
@@ -1209,7 +1695,10 @@ pub(crate) struct TopicEntry {
 /// append to the ring in one order and record their `EVENT`s in the other. The
 /// condvar is signalled under the same guard, which is what makes `await inbox`
 /// and `post --wait` event-driven instead of polled — no sleep anywhere in this
-/// module. `topics` nests the same way ([`SessionFabric::topic_add`]).
+/// module. `topics` nests the same way ([`SessionFabric::topic_add`]), and under
+/// `inbox` when it is taken with it: `topic add|drop` hold the `inbox` guard
+/// across the change and `deliver` reads the set under it
+/// ([`SessionFabric::opted_into`]), so the order is inbox → topics → timeline.
 #[derive(Default)]
 pub(crate) struct SessionFabric {
     inbox: Mutex<Inbox>,
@@ -1228,7 +1717,10 @@ pub(crate) struct SessionFabric {
     /// `say/<topic>` reaches a session only because that session asked for the
     /// topic, so a fleet-wide shout cannot put anything in front of an agent
     /// that did not want it. Empty by default, and an empty set receives
-    /// NOTHING.
+    /// NOTHING — enforced HERE: `deliver` refuses a `topic=` row whose topic
+    /// this set does not hold (`ERR not-subscribed`), so the bridge's copy is a
+    /// routing hint, and a `drop` takes effect at this endpoint the moment it
+    /// answers.
     ///
     /// Its own lock, not the ring's: the bridge reads it (`topic ls`) once per
     /// session and after a `GAP`, and the ring is a leaf taken under `deliver`,
@@ -1261,11 +1753,45 @@ pub(crate) struct SessionFabric {
     /// ([`Self::note_direct_reset`]): on a parked session it lands after the
     /// carry was taken, the same change-the-successor-would-not-see a hold is.
     hold_serial: std::sync::atomic::AtomicU64,
+    /// A test's own bound for every fenced wait ([`Self::fence_wait`]).
+    #[cfg(test)]
+    fence_wait: Mutex<Option<std::time::Duration>>,
 }
 
 impl SessionFabric {
     fn lock(&self) -> std::sync::MutexGuard<'_, Inbox> {
         self.inbox.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// The bound every fenced verb on this session waits for a committing
+    /// update before it answers [`HOLD_BUSY`], or a test's own
+    /// ([`Self::set_fence_wait`]), so a test of what outlasts the bound need
+    /// not sit out the real one. The only door to it: a path that capped a
+    /// wait with the real bound directly would escape every test's own.
+    ///
+    /// The fenced stretch is the successor's activation, the Commit's
+    /// answers, the identity markers, the harness suspend and one pipe write —
+    /// milliseconds — and, when those answers took real time, one more
+    /// input-dispatch fence the Commit holds its claim through (round eight of
+    /// the update audit, #18): up to the drain gate's deadline
+    /// (`HANDOFF_INPUT_DRAIN_DEADLINE`, 3 s), across turns of the main
+    /// thread's run loop. This is the bound for a Commit that is stuck, so a
+    /// control connection never waits on one for good. The main thread never
+    /// waits at all: it alone raises and lifts the fence, so the menu's Hold
+    /// answers [`HOLD_BUSY`] at once (`App::menu_hold`).
+    pub(crate) fn fence_wait(&self) -> std::time::Duration {
+        const HOLD_FENCE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+        #[cfg(test)]
+        if let Some(wait) = *self.fence_wait.lock().unwrap_or_else(|p| p.into_inner()) {
+            return wait;
+        }
+        HOLD_FENCE_WAIT
+    }
+
+    /// Set this session's [`Self::fence_wait`].
+    #[cfg(test)]
+    pub(crate) fn set_fence_wait(&self, wait: std::time::Duration) {
+        *self.fence_wait.lock().unwrap_or_else(|p| p.into_inner()) = Some(wait);
     }
 
     /// The session ended: its program exited or its tab closed. Every waiter
@@ -1342,6 +1868,18 @@ impl SessionFabric {
             .collect()
     }
 
+    /// Whether this session holds `topic` in its opt-in set — what
+    /// [`deliver_row`] asks of every `topic=` row, under the `inbox` guard
+    /// (inbox → topics, the order `topic add|drop` already take). Not named
+    /// `holds` or `contains`: the lock-order census resolves a call by its
+    /// name.
+    pub(crate) fn opted_into(&self, topic: &str) -> bool {
+        self.topics
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key(topic)
+    }
+
     /// Add a topic with the `since=` token to resume it from. `Ok(true)` when it
     /// was not already there, `Ok(false)` when it was, and `Err(TopicsFull)`
     /// when it was not and the set already holds [`MAX_TOPICS`].
@@ -1415,9 +1953,15 @@ impl SessionFabric {
     }
 
     /// The session's standing halt, if any — the one read `status` and the
-    /// dispatch gate both take.
+    /// dispatch gate both take. With both origins standing it is the fleet's
+    /// ([`Holds::first`]); [`Self::holds`] has both.
     pub(crate) fn hold(&self) -> Option<Hold> {
-        self.lock().hold.clone()
+        self.lock().holds.first()
+    }
+
+    /// Every standing halt on the session, one slot per origin.
+    pub(crate) fn holds(&self) -> Holds {
+        self.lock().holds.clone()
     }
 
     /// THE HALT A LOST BRIDGE DID NOT MAKE on this session, while it still
@@ -1429,7 +1973,7 @@ impl SessionFabric {
         let current = *LINK.generation.lock().unwrap_or_else(|p| p.into_inner());
         let inbox = self.lock();
         match &inbox.advisory {
-            Some((hold, lost_under)) if *lost_under == current && inbox.hold.is_none() => {
+            Some((hold, lost_under)) if *lost_under == current && !inbox.holds.is_held() => {
                 Some(hold.clone())
             }
             _ => None,
@@ -1514,18 +2058,23 @@ impl SessionFabric {
     ///   ([`Inbox::msg_id_ceiling`]) — the successor hands that id out too;
     /// * ANY BROADCAST (`topic=`), whatever its id (round seven's review of
     ///   group J, open problem 201). The bridge refills a relaunched session's
-    ///   ADDRESSED lane from its `seen` offset, but it moves a topic's cursor
-    ///   past a broadcast on the `OK` and resumes the successor from there, so
-    ///   a broadcast answered under the fence would land only in the ring the
-    ///   `_exit` discards. Left unanswered, the `_exit` drops the bridge's lane
-    ///   with the cursor unmoved (`Delivery::Unaccounted` in aterm-link) and
-    ///   the successor's bridge offers it again.
+    ///   ADDRESSED lane from its refill floor ([`addressed_floor`]), but it
+    ///   moves a topic's cursor past a broadcast on the `OK` and resumes the
+    ///   successor from there, so a broadcast answered under the fence would
+    ///   land only in the ring the `_exit` discards. Left unanswered, the
+    ///   `_exit` drops the bridge's lane with the cursor unmoved
+    ///   (`Delivery::Unaccounted` in aterm-link) and the successor's bridge
+    ///   offers it again.
     ///
     /// NO DEADLINE OF ITS OWN, on purpose: the only caller is the bridge's
-    /// `deliver`, and any answer but `OK` is a verdict it books
-    /// (`Delivery::Accounted` in aterm-link — the record refused to its
-    /// sender, a broadcast dropped, the cursor committed past it), so a
-    /// timeout would lose the message. The fence's own end is the deadline —
+    /// `deliver`, which books `ERR quota`, `ERR too large`, `ERR no such
+    /// session` and `ERR not-subscribed` as the recipient's verdict
+    /// (`Delivery::Accounted` in
+    /// aterm-link — the record refused to its sender, a broadcast dropped, the
+    /// cursor committed past it), so a timeout spelled as one of those would
+    /// lose the message; any other answer is a lane fault that holds the
+    /// session back (`Delivery::Owed`), which a busy fence is not either. The
+    /// fence's own end is the deadline —
     /// the update lands (`_exit`, and the successor's bridge delivers the
     /// record again) or stands down (the fence lifts and it lands here) — and
     /// every [`MSG_ROOM_NOTICE_EVERY`] spent waiting is a WARN in `aterm.log`
@@ -1590,6 +2139,7 @@ impl SessionFabric {
             if left.is_zero() {
                 return None;
             }
+            note_fence_block();
             inbox = self
                 .changed
                 .wait_timeout(inbox, left)
@@ -1673,10 +2223,49 @@ impl SessionFabric {
             .saturating_add(INBOX_ID_RESERVE)
             .min(CARRY_INT_MAX);
         inbox.msg_id_ceiling = Some(carried_msg_id);
+        let unread_broadcasts = inbox
+            .rows
+            .iter()
+            .filter(|r| r.topic.is_some() && r.id > inbox.seen)
+            .count();
+        // THE ONES THE SUCCESSOR'S BRIDGE OFFERS AGAIN: a refilling bridge
+        // took them, on this log, and the session still takes the topic. The
+        // topic set is read under the inbox guard (inbox → topics, the order
+        // `topic add|drop` take).
+        //
+        // AND THE BRIDGE STILL REMEMBERS THEM. It keeps a session's newest
+        // [`RING_CAP`] unhandled broadcasts and drops the oldest past that
+        // (aterm-link's `UNHANDLED_KEEP`), so a row this ring kept ahead of
+        // newer ones it evicted — a person's, or one left unlisted while newer
+        // ones were listed — can be gone from the floor while still held
+        // here, and no successor is offered it. Dropping a row takes that many
+        // entries newer than it, each a row minted here after it, so a row
+        // with fewer than [`RING_CAP`] rows minted after it is still
+        // remembered; one with more is counted lost — once too often, when
+        // the bridge kept it after all, never once too few.
+        let remembered = |r: &InboxRow| {
+            inbox
+                .last_msg_id
+                .checked_sub(r.id)
+                .and_then(|n| usize::try_from(n).ok())
+                .is_some_and(|n| n < RING_CAP)
+        };
+        let refilled_broadcasts = inbox
+            .rows
+            .iter()
+            .filter(|r| r.refill && r.id > inbox.seen && r.id > inbox.log_floor)
+            .filter(|r| remembered(r))
+            .filter(|r| r.topic.as_deref().is_some_and(|t| self.opted_into(t)))
+            .count();
+        let count = |n: usize| u64::try_from(n).unwrap_or(u64::MAX).min(CARRY_INT_MAX);
         let mut carry = FabricCarry {
+            bus_log: inbox.bus_log.clone(),
             last_msg_id: carried_msg_id,
             last_post_id: inbox.next_post_id.min(CARRY_INT_MAX),
             last_receipt_id: inbox.next_receipt_id.min(CARRY_INT_MAX),
+            dropped: inbox.dropped.min(CARRY_INT_MAX),
+            broadcasts_uncarried: count(unread_broadcasts),
+            broadcasts_refilled: count(refilled_broadcasts),
             ..FabricCarry::default()
         };
         for post in inbox.posts.iter().filter(|p| p.off.is_none() && !p.dead) {
@@ -1711,7 +2300,11 @@ impl SessionFabric {
             let writable = row.rid <= CARRY_INT_MAX && row.off <= CARRY_INT_MAX;
             if writable && row.cost() <= *budget {
                 *budget -= row.cost();
-                carry.receipts.push(row);
+                if r.earlier_log || inbox.bus_log.is_none() {
+                    carry.earlier_receipts.push(row);
+                } else {
+                    carry.receipts.push(row);
+                }
             } else {
                 carry.receipts_uncarried = carry.receipts_uncarried.saturating_add(1);
             }
@@ -1719,8 +2312,41 @@ impl SessionFabric {
         carry
     }
 
+    /// What this session's keeper META carries of its fabric ([`KeeperCarry`]):
+    /// the topics under their lock, then the hold, the lease, the queued post
+    /// ids, the owed count and `dropped=` under the leaf guard — never nested.
+    /// Read by the keeper link's META pump with no other lock held.
+    #[cfg(unix)]
+    pub(crate) fn keeper_carry(&self) -> KeeperCarry {
+        let topics = render_topics(&self.topics());
+        let inbox = self.lock();
+        let mut holds = render_holds(&inbox.holds).into_iter();
+        KeeperCarry {
+            hold: holds.next(),
+            more_holds: holds.collect(),
+            ids: [
+                id_lease(inbox.last_msg_id),
+                id_lease(inbox.next_post_id),
+                id_lease(inbox.next_receipt_id),
+            ],
+            topics,
+            topics_lost: 0,
+            queued: inbox
+                .posts
+                .iter()
+                .filter(|p| p.off.is_none() && !p.dead)
+                .map(|p| p.id)
+                .collect(),
+            queued_lost: 0,
+            owed: u64::try_from(inbox.receipts.len()).unwrap_or(u64::MAX),
+            dropped: inbox.dropped.min(CARRY_INT_MAX),
+        }
+    }
+
     /// Put back what a SEAMLESS UPDATE carried of this session's mailbox — the
-    /// handoff's carry, and nothing else ([`FabricCarry`]). Called by
+    /// handoff's carry ([`FabricCarry`]), or what a PTY keeper recovery read
+    /// off the session's META (counters and queued ids, never rows:
+    /// [`KeeperCarry`]). Called by
     /// `spawn_session` with the hold and the topics, before the adopted session
     /// is registered, so the bridge's first `outbox` drain here already lists
     /// the carried posts and receipts, and every id this session hands out from
@@ -1741,9 +2367,34 @@ impl SessionFabric {
             return;
         }
         let mut inbox = self.lock();
+        inbox.bus_log = carry
+            .bus_log
+            .as_ref()
+            .filter(|log| is_log_identity(log))
+            .cloned();
         inbox.last_msg_id = inbox.last_msg_id.max(carry.last_msg_id);
         inbox.next_post_id = inbox.next_post_id.max(carry.last_post_id);
         inbox.next_receipt_id = inbox.next_receipt_id.max(carry.last_receipt_id);
+        // `dropped=` GOES ON COUNTING, and the update's own loss is counted in
+        // it: the old process's drops and the broadcasts it held unhandled
+        // that no bridge offers again are both mail this session will not be
+        // shown again. The refilled ones are not lost: this session's bridge
+        // offers them again ([`FabricCarry::broadcasts_refilled`]), and
+        // counting them as well would say so twice.
+        //
+        // BOUNDED AS THE CARRY THAT WROTE IT IS ([`CARRY_INT_MAX`]): a keeper
+        // META is read leniently and its count can be any `u64`, and from
+        // `u64::MAX` the ring's next `+= 1` (`evict_for`) panics under overflow
+        // checks or wraps to `dropped=0` — the reset the count is carried to
+        // prevent.
+        let lost_broadcasts = carry
+            .broadcasts_uncarried
+            .saturating_sub(carry.broadcasts_refilled);
+        inbox.dropped = inbox
+            .dropped
+            .saturating_add(carry.dropped)
+            .saturating_add(lost_broadcasts)
+            .min(CARRY_INT_MAX);
         let mut dead: Vec<u64> = carry.uncarried.clone();
         let mut seen_ids = HashSet::new();
         for post in &carry.posts {
@@ -1759,6 +2410,7 @@ impl SessionFabric {
                 to: post.to.clone(),
                 kind: post.kind.clone(),
                 off: None,
+                landed_epoch: 0,
                 re: post.re,
                 dl: post.dl,
                 via: post.via.clone(),
@@ -1781,6 +2433,7 @@ impl SessionFabric {
                 to: "-".to_string(),
                 kind: "note".to_string(),
                 off: None,
+                landed_epoch: 0,
                 re: None,
                 dl: None,
                 via: None,
@@ -1793,7 +2446,13 @@ impl SessionFabric {
             tl.record("post-landed", format!("{id} off=- reason={NOT_CARRIED}"));
         }
         let mut rids = HashSet::new();
-        for r in &carry.receipts {
+        let unknown_log = inbox.bus_log.is_none();
+        for (r, earlier_log) in carry
+            .earlier_receipts
+            .iter()
+            .map(|r| (r, true))
+            .chain(carry.receipts.iter().map(|r| (r, false)))
+        {
             if r.valid(carry.last_receipt_id) && rids.insert(r.rid) {
                 inbox.receipts.push_back(OwedReceipt {
                     rid: r.rid,
@@ -1801,17 +2460,38 @@ impl SessionFabric {
                     verdict: r.verdict.clone(),
                     kind: r.kind.clone(),
                     from: r.from.clone(),
+                    earlier_log: earlier_log || unknown_log,
                 });
             }
         }
+        // The carry separates clocks for older readers, not queue order.
+        // Restore the shared oldest-first bound even when a later verdict on
+        // an old row was owed after a receipt of the current log.
+        inbox.receipts.make_contiguous().sort_by_key(|r| r.rid);
         while inbox.receipts.len() > RECEIPTS_OWED_MAX {
             inbox.receipts.pop_front();
         }
         if carry.receipts_uncarried > 0 {
             aterm_log::warn!(
-                "seamless update: {} receipt(s) this session owed were not carried (the \
-                 handoff's mailbox budget); their senders wait out their own deadlines",
+                "fabric: {} receipt(s) this session owed were not carried (the handoff's \
+                 mailbox budget, or a crash the PTY keeper recovered the session from); their \
+                 senders wait out their own deadlines",
                 carry.receipts_uncarried
+            );
+        }
+        if lost_broadcasts > 0 {
+            aterm_log::warn!(
+                "seamless update: {lost_broadcasts} broadcast(s) this session had not handled \
+                 when the update was drawn were not carried (its bridge does not offer \
+                 broadcasts again, or the session dropped their topic); counted in its \
+                 inbox's dropped="
+            );
+        }
+        if carry.broadcasts_refilled > 0 {
+            aterm_log::info!(
+                "seamless update: {} broadcast(s) this session had not handled when the \
+                 update was drawn are offered again by its bridge",
+                carry.broadcasts_refilled.min(carry.broadcasts_uncarried)
             );
         }
         drop(tl);
@@ -1831,29 +2511,50 @@ impl SessionFabric {
         self.changed.notify_all();
     }
 
-    /// Put back the hold a SEAMLESS UPDATE carried — the handoff's carry, and
-    /// nothing else ([`parse_hold`] already made it one).
+    /// Put back the holds another process carried ([`parse_holds`] already
+    /// made them holds): a SEAMLESS UPDATE's and a PTY keeper's recovery's,
+    /// each origin's slot, so the owner's stop and the fleet's halt both stand
+    /// again, apart, as they stood; and a cold restore layout's, the owner's
+    /// slot alone, also filling an absent owner slot on a keeper's recovered
+    /// shell (this module's header).
     ///
-    /// Called by `spawn_session` on the adopted session before
-    /// `register_session`, so before any control verb can resolve the session,
-    /// let alone drive it: there is no instant at which the adopted shell is
-    /// reachable unhalted. Recorded on the timeline under this guard, like
-    /// every hold transition, as `1 reason=… origin=… carried=1` — the
-    /// `carried=1` says the halt was not set in this process, which is the
-    /// question a reader of `events` after an update asks. Never refused: a
-    /// seed only ever halts, and the origin it carries is the origin the
-    /// fleet fence reads from here on.
-    pub(crate) fn seed_hold(
+    /// A seamless update's and a keeper recovery's are seeded by
+    /// `spawn_session` on the adopted session before `register_session`, so
+    /// before any control verb can resolve the session, let alone drive it:
+    /// there is no instant at which the adopted shell is reachable unhalted. A
+    /// cold restore's is seeded as its reopened tab takes the leaf
+    /// (`App::carry_restored_identity`): a window's first tab, its shell
+    /// started at launch, is reachable before that (ruling 23's residual).
+    /// Recorded on the timeline under this guard, like every hold transition,
+    /// as one `1 reason=… origin=… hold_origin=… carried=1` ([`Holds::event`])
+    /// — the `carried=1` says the halt was not set in this process, which is
+    /// the question a reader of `events` after an update or a restore asks.
+    /// Never refused and never a lift: a seed only ever halts, and the origin
+    /// it carries is the origin the fleet fence reads from here on. Nothing
+    /// carried, or nothing moved (every slot it carried already stood),
+    /// records nothing.
+    pub(crate) fn seed_holds(
         &self,
-        hold: Hold,
+        carried: Holds,
         timeline: &Mutex<crate::session_timeline::SessionTimeline>,
     ) {
+        if !carried.is_held() {
+            return;
+        }
         let mut inbox = self.lock();
-        timeline.lock().unwrap_or_else(|p| p.into_inner()).record(
-            "hold",
-            format!("1 reason={} origin={} carried=1", hold.reason, hold.origin),
-        );
-        inbox.hold = Some(hold);
+        let before = inbox.holds.clone();
+        for hold in carried.standing() {
+            inbox.holds.seed(hold);
+        }
+        if inbox.holds == before {
+            // Every slot it carried already stood: a second carry of one hold
+            // (a cold restore's layout over a keeper's META) moves nothing.
+            return;
+        }
+        timeline
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .record("hold", format!("{} carried=1", inbox.holds.event("local")));
         self.hold_serial.fetch_add(1, Ordering::AcqRel);
         drop(inbox);
         self.changed.notify_all();
@@ -1932,7 +2633,7 @@ impl SessionFabric {
             .rows
             .iter()
             .any(|r| r.id > seen && r.dl.is_some_and(|dl| now_ms > r.t_ms.saturating_add(dl)));
-        (unseen, overdue, inbox.hold.is_some())
+        (unseen, overdue, inbox.holds.is_held())
     }
 }
 
@@ -2042,6 +2743,23 @@ struct LinkReport {
     /// than a count so that a second post while one is already owed does not
     /// restart the clock — the bridge has been silent since the FIRST one.
     owed_since: Option<std::time::Instant>,
+    /// What THIS incarnation said it is in `hello` ([`cmd_hello`]): its lane
+    /// grammar and its build. `None` for a bridge from before the handshake,
+    /// and before the first `hello` of a fresh attach.
+    hello: Option<BridgeHello>,
+    /// How many of THIS incarnation's bridge-only lines this endpoint answered
+    /// `ERR usage` — a line it could not parse ([`note_lane_fault`]). A matched
+    /// pair writes none, so any count is the two not reading the lane alike.
+    lane_faults: u64,
+}
+
+/// A bridge's `hello`: the lane grammar it reads and writes, its build, and
+/// whether it refills a kept session's broadcasts (`refill=…say`).
+#[derive(Clone)]
+struct BridgeHello {
+    lane: u32,
+    build: Option<String>,
+    refills_broadcasts: bool,
 }
 
 /// The instance's view of its bridge. Process-global because the bridge is
@@ -2103,6 +2821,15 @@ struct FabricLink {
     /// interleave: a `link up` from a ghost lane landing between a newer attach's
     /// compare and its store is the exact shape [`BridgeGeneration`] closes.
     link: Mutex<LinkReport>,
+    /// The identity of the bus log the owning bridge last said its offsets
+    /// index (`link log <identity>`, astream's `<id>.<generation>`). `None`
+    /// until a bridge has said one; a change is a log switch, and every
+    /// session forgets its offsets ([`cmd_link_log`]).
+    log: Mutex<Option<String>>,
+    /// Orders a complete log switch before another bridge incarnation can
+    /// attach or a newly registered session can become visible. Taken before
+    /// the registry, session and link locks, never under any of them.
+    log_transition: Mutex<()>,
     /// `[fabric] hold_on_bridge_lost` ([`set_hold_on_bridge_lost`]): whether a
     /// lost bridge HALTS every session it governed (`true`, the fail-closed
     /// sweep as it was before 2026-09-29) or leaves them running with an
@@ -2119,6 +2846,8 @@ static LINK: FabricLink = FabricLink {
     supervised: AtomicBool::new(false),
     #[cfg(any(unix, test))]
     hold_on_loss: AtomicBool::new(false),
+    log: Mutex::new(None),
+    log_transition: Mutex::new(()),
     link: Mutex::new(LinkReport {
         up: false,
         reason: String::new(),
@@ -2127,8 +2856,67 @@ static LINK: FabricLink = FabricLink {
         stalled_at: None,
         reported: false,
         owed_since: None,
+        hello: None,
+        lane_faults: 0,
     }),
 };
+
+/// Publish a newly created or adopted session into the registry. The callback
+/// takes the registry lock only after this session's fabric is ready for readers.
+///
+/// A `link log` sweep snapshots the registry under this same transition lock:
+/// either it includes this session, or registration first reconciles the session
+/// with its completed result. Carried offsets are never exposed between those
+/// two steps. This runs before publication, so no Commit can have fenced the
+/// newly created context's carry yet.
+pub(crate) fn register_on_log<T>(ctx: &SessionCtx, publish: impl FnOnce() -> T) -> T {
+    let _transition = LINK
+        .log_transition
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let current = {
+        // Parallel tests own different instances; use the same isolation as
+        // fabric_state_seen rather than importing another test's clock.
+        #[cfg(test)]
+        let section = LINK_SECTION.lock().unwrap_or_else(|p| p.into_inner());
+        #[cfg(test)]
+        let foreign = section.is_some_and(|owner| owner != std::thread::current().id());
+        #[cfg(not(test))]
+        let foreign = false;
+        if foreign {
+            None
+        } else {
+            LINK.log.lock().unwrap_or_else(|p| p.into_inner()).clone()
+        }
+    };
+    if let Some(ident) = current {
+        let mut inbox = ctx.fabric.lock();
+        let forget = inbox.bus_log.as_deref().map_or_else(
+            || {
+                inbox.oldest_on_bus.is_some()
+                    || !inbox.receipts.is_empty()
+                    || !inbox.fetches.is_empty()
+                    || inbox
+                        .posts
+                        .iter()
+                        .any(|p| p.off.is_some() || (!p.dead && p.re.is_some()))
+            },
+            |was| was != ident,
+        );
+        if forget {
+            for id in inbox.forget_bus_offsets() {
+                ctx.timeline
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .record("post-landed", format!("{id} off=- reason=log-replaced"));
+            }
+        }
+        inbox.bus_log = Some(ident);
+        drop(inbox);
+        ctx.fabric.changed.notify_all();
+    }
+    publish()
+}
 
 thread_local! {
     /// The [`BridgeGeneration`] the CURRENT THREAD's bridge lane was served
@@ -2524,6 +3312,10 @@ pub(crate) fn fabric_status_tail() -> String {
 /// first delivery or landing does ([`link_evidence`]).
 #[cfg(any(unix, test))]
 pub(crate) fn bridge_attached(generation: BridgeGeneration) {
+    let _transition = LINK
+        .log_transition
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let mut owner = LINK.generation.lock().unwrap_or_else(|p| p.into_inner());
     if generation.0 <= *owner {
         return;
@@ -2549,6 +3341,9 @@ pub(crate) fn bridge_attached(generation: BridgeGeneration) {
         // `&Store` to reconcile against and does not need one, because an
         // attach is `stalled` and `stale` is only read from `connected`.
         link.owed_since = None;
+        // And has said nothing about itself yet ([`cmd_hello`]).
+        link.hello = None;
+        link.lane_faults = 0;
     }
     LINK.state.store(FABRIC_STALLED, Ordering::Relaxed);
 }
@@ -2702,7 +3497,145 @@ fn wake_presence(store: &Store) {
     }
 }
 
-const LINK_USAGE: &str = "ERR usage: link up rtt=<ms> | link down reason=<token> [rtt=<ms>]\n";
+/// Whether the bridge that owns the link said, in its `hello`, that it offers
+/// a kept session's unhandled broadcasts again after a relaunch (`refill=…say`).
+/// Read at each broadcast's delivery ([`InboxRow::refill`]): a bridge from
+/// before the key, one that has not said `hello` yet, and no bridge at all
+/// answer `false`, which keeps the update counting the row.
+pub(crate) fn bridge_refills_broadcasts() -> bool {
+    #[cfg(test)]
+    if link_section_is_foreign() {
+        return false;
+    }
+    LINK.link
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .hello
+        .as_ref()
+        .is_some_and(|h| h.refills_broadcasts)
+}
+
+const HELLO_USAGE: &str = "ERR usage: hello lane=<n> [build=<token>]\n";
+
+/// The most bytes a `build=` token may carry: `<version>+g<12 hex>-dirty` with
+/// room to spare.
+const BUILD_TOKEN_MAX: usize = 64;
+
+/// `hello lane=<n> [build=<token>] [refill=<lanes>]` — the bridge naming the
+/// lane grammar it reads and writes, the build it is and what it refills, from
+/// the lane whose generation `generation` is
+/// (`aterm_types::control_verbs::BRIDGE_LANE`). Answered with this instance's
+/// own, `OK lane=<n> build=<b>`, so each side speaks the older lane of the
+/// two. `refill=in,say` says the bridge offers a kept session's unhandled
+/// broadcasts again after a relaunch ([`bridge_refills_broadcasts`]); a bridge
+/// that does not say so leaves a seamless update counting them lost.
+///
+/// RECORDED, AND COMPARED, NEVER REFUSED ON: the bridge binary is whatever
+/// `[fabric] command` names — a sealed build a second host needs, a dev
+/// build, the installed CLI an update replaced — so a build other than this
+/// instance's is a fact `fabric status` reports and the log says once, not a
+/// reason to turn the bridge away. The lane is what decides what each side may
+/// write, and the bridge acts on the number it is answered.
+///
+/// A bridge is a separate process and its output is still input: `lane=` is a
+/// number and `build=` one bounded token of `[0-9A-Za-z.+-]`, or the line is
+/// refused. Any other `key=value` is read past, so a later bridge can say more
+/// to this endpoint. Accepted only for the incarnation that owns the link, like
+/// `link`; a ghost lane's is answered `OK stale=1` and recorded nowhere.
+pub(crate) fn cmd_hello(rest: &str, generation: Option<BridgeGeneration>) -> String {
+    let mut lane: Option<u32> = None;
+    let mut build: Option<String> = None;
+    let mut refills_broadcasts = false;
+    for tok in rest.split_whitespace() {
+        if let Some(v) = kv(tok, "refill") {
+            // WHAT THE BRIDGE OFFERS AGAIN to a session a relaunch keeps, as a
+            // comma list of lanes; `say` is the broadcast topics, which is all
+            // this endpoint asks. An unknown lane in the list is read past.
+            refills_broadcasts = v.split(',').any(|lane| lane == "say");
+        } else if let Some(v) = kv(tok, "lane") {
+            match v.parse::<u32>() {
+                Ok(n) => lane = Some(n),
+                Err(_) => return HELLO_USAGE.to_string(),
+            }
+        } else if let Some(v) = kv(tok, "build") {
+            let token = !v.is_empty()
+                && v.len() <= BUILD_TOKEN_MAX
+                && v.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '-'));
+            if !token {
+                return HELLO_USAGE.to_string();
+            }
+            build = Some(v.to_string());
+        } else if !tok.split_once('=').is_some_and(|(k, _)| !k.is_empty()) {
+            return HELLO_USAGE.to_string();
+        }
+    }
+    let Some(lane) = lane else {
+        return HELLO_USAGE.to_string();
+    };
+    let own = aterm_types::version::build_id();
+    let answer = format!(
+        "lane={} build={own}",
+        aterm_types::control_verbs::BRIDGE_LANE
+    );
+    let recorded = {
+        let owner = LINK.generation.lock().unwrap_or_else(|p| p.into_inner());
+        if !generation.is_some_and(|g| g.0 == *owner) || *owner == 0 {
+            false
+        } else {
+            let mut link = LINK.link.lock().unwrap_or_else(|p| p.into_inner());
+            link.hello = Some(BridgeHello {
+                lane,
+                build: build.clone(),
+                refills_broadcasts,
+            });
+            true
+        }
+    };
+    if !recorded {
+        return format!("OK stale=1 {answer}\n");
+    }
+    if build.as_deref() != Some(own.as_str()) {
+        aterm_log::warn!(
+            "fabric bridge is build {} under this instance's {own} (lane {lane}, this instance's \
+             {}): [fabric] command names another aterm than this one",
+            build.as_deref().unwrap_or("-"),
+            aterm_types::control_verbs::BRIDGE_LANE
+        );
+    }
+    format!("OK {answer}\n")
+}
+
+/// The endpoint answered one of `generation`'s bridge-only lines `ERR usage`:
+/// count it for `fabric status`'s `lane_faults=` ([`LinkReport::lane_faults`]).
+/// Only for the incarnation that owns the link.
+pub(crate) fn note_lane_fault(generation: Option<BridgeGeneration>) {
+    #[cfg(test)]
+    if link_section_is_foreign() {
+        return;
+    }
+    let owner = LINK.generation.lock().unwrap_or_else(|p| p.into_inner());
+    if !generation.is_some_and(|g| g.0 == *owner) || *owner == 0 {
+        return;
+    }
+    let mut link = LINK.link.lock().unwrap_or_else(|p| p.into_inner());
+    link.lane_faults = link.lane_faults.saturating_add(1);
+}
+
+/// What the attached bridge said about itself and how its lane has gone, as
+/// `fabric status` prints it: `(bridge_lane, bridge_build, lane_faults)` —
+/// the first two `None` before its `hello` (or for a bridge from before it).
+pub(crate) fn fabric_bridge_facts() -> (Option<u32>, Option<String>, u64) {
+    let link = LINK.link.lock().unwrap_or_else(|p| p.into_inner());
+    let (lane, build) = link
+        .hello
+        .as_ref()
+        .map_or((None, None), |h| (Some(h.lane), h.build.clone()));
+    (lane, build, link.lane_faults)
+}
+
+const LINK_USAGE: &str =
+    "ERR usage: link up rtt=<ms> | link down reason=<token> [rtt=<ms>] | link log <identity>\n";
 
 /// `link up rtt=<ms>` / `link down reason=<token> [rtt=<ms>]`, from the bridge
 /// lane whose generation `generation` is. See [`link_report`].
@@ -2711,6 +3644,13 @@ pub(crate) fn cmd_link(store: &Store, rest: &str, generation: Option<BridgeGener
     let up = match toks.next() {
         Some("up") => true,
         Some("down") => false,
+        Some("log") => {
+            let ident = toks.next();
+            if toks.next().is_some() {
+                return LINK_USAGE.to_string();
+            }
+            return cmd_link_log(store, ident, generation);
+        }
         _ => return LINK_USAGE.to_string(),
     };
     let mut rtt: Option<u64> = None;
@@ -2740,6 +3680,106 @@ pub(crate) fn cmd_link(store: &Store, rest: &str, generation: Option<BridgeGener
     } else {
         "OK stale=1\n".to_string()
     }
+}
+
+/// `link log <identity>` — WHICH BUS LOG the offsets the bridge hands this
+/// endpoint index: astream's log identity, `<32 lowercase hex>.<generation>`,
+/// told on every attach before any row is delivered. A CHANGE from the one
+/// the owning bridge said before is a log switch — bus.log deleted and
+/// recreated, repaired, restored, or another host's broker — and astream gives
+/// another log's records the same numbers, so every live session forgets the
+/// offsets it holds ([`Inbox::forget_bus_offsets`]) and the reply says
+/// `forgot=1`. An empty session's first identity forgets nothing. A carried
+/// identity must match; live references without one are an unknown old clock
+/// and are retired conservatively. From a bridge that no
+/// longer owns the link, `OK stale=1` and nothing changes.
+fn cmd_link_log(
+    store: &Store,
+    ident: Option<&str>,
+    generation: Option<BridgeGeneration>,
+) -> String {
+    let Some(ident) = ident.filter(|i| is_log_identity(i)) else {
+        return LINK_USAGE.to_string();
+    };
+    // A new incarnation cannot deliver on a newer log while this incarnation
+    // is still sweeping the old one. This lock is above both fabric and link
+    // locks; the per-session wait below releases its fabric guard at the fence.
+    let _transition = LINK
+        .log_transition
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let previous = {
+        let owner = LINK.generation.lock().unwrap_or_else(|p| p.into_inner());
+        if !generation.is_some_and(|g| g.0 == *owner) || *owner == 0 {
+            return "OK stale=1\n".to_string();
+        }
+        LINK.log.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    };
+    let mut changed = previous.as_deref().is_some_and(|was| was != ident);
+    let live: Vec<_> = {
+        let g = store.read().unwrap_or_else(|p| p.into_inner());
+        g.live_handles().map(|h| h.ctx.clone()).collect()
+    };
+    for ctx in &live {
+        let mut inbox = ctx.fabric.lock();
+        if inbox.bus_log.as_deref() == Some(ident) {
+            continue;
+        }
+        // A partial busy sweep may already have applied this identity to some
+        // sessions. Their own witnesses, not the global one, make retries
+        // idempotent. A legacy carry with live references has an UNKNOWN old
+        // clock; the first identity cannot simply claim those references.
+        let forget = inbox.bus_log.as_deref().map_or_else(
+            || {
+                changed
+                    || inbox.oldest_on_bus.is_some()
+                    || !inbox.receipts.is_empty()
+                    || !inbox.fetches.is_empty()
+                    || inbox
+                        .posts
+                        .iter()
+                        .any(|p| p.off.is_some() || (!p.dead && p.re.is_some()))
+            },
+            |was| was != ident,
+        );
+        if forget {
+            let wait = ctx.fabric.fence_wait();
+            let Some(guard) = ctx.fabric.wait_unfenced_retirement(inbox, wait) else {
+                return HOLD_BUSY.to_string();
+            };
+            inbox = guard;
+            let retired = inbox.forget_bus_offsets();
+            for id in retired {
+                ctx.timeline
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .record("post-landed", format!("{id} off=- reason=log-replaced"));
+            }
+            changed = true;
+        }
+        inbox.bus_log = Some(ident.to_string());
+        drop(inbox);
+        ctx.fabric.changed.notify_all();
+    }
+    // Only a fully applied transition becomes the global witness. A busy
+    // session keeps the old global witness and will be retried before delivery.
+    *LINK.log.lock().unwrap_or_else(|p| p.into_inner()) = Some(ident.to_string());
+    if changed { "OK forgot=1\n" } else { "OK\n" }.to_string()
+}
+
+/// astream's log identity as text: 32 lowercase hex digits, a dot, and a
+/// generation in decimal — exactly that, so nothing else is taken for one.
+fn is_log_identity(s: &str) -> bool {
+    s.split_once('.').is_some_and(|(id, generation)| {
+        id.len() == 32
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            && !generation.is_empty()
+            && generation.len() <= 20
+            && generation.bytes().all(|b| b.is_ascii_digit())
+            && generation.parse::<u64>().is_ok()
+    })
 }
 
 /// A `link down reason=` token, kept to the shape every reader prints
@@ -2857,8 +3897,11 @@ fn note_bridge_touched(store: &Store, sid: &str) {
 ///
 /// Fail CLOSED. THE HOLD SWEEP IS UNCONDITIONAL: a halt that a `kill -9` lifts
 /// is not a halt, so it does not ask whether a hold was standing, whether the
-/// bridge exited cleanly, or whether anything is coming back. A reconnecting
-/// bridge lifts what it wants lifted with `hold off`. NOTHING ELSE LIFTS IT —
+/// bridge exited cleanly, or whether anything is coming back. It fills the
+/// FLEET slot ([`Holds`]) and only that: an owner's local hold stands beside
+/// it, so a reconnecting bridge, which lifts what it wants lifted with `hold
+/// off origin=fleet`, leaves the owner's stop where it was — one slot, and
+/// the sweep's halt used to replace the owner's. NOTHING ELSE LIFTS IT —
 /// see the module header; the "a human lifts it at the GUI" this doc used to end
 /// with names a path that does not exist.
 ///
@@ -2910,7 +3953,7 @@ pub(crate) fn bridge_lost(store: &Store, generation: BridgeGeneration) -> usize 
         };
         if let Some(ctx) = ctx {
             let lost = Hold {
-                reason: "fabric-lost".to_string(),
+                reason: FABRIC_LOST.to_string(),
                 origin: "fleet".to_string(),
             };
             if halts {
@@ -2918,7 +3961,7 @@ pub(crate) fn bridge_lost(store: &Store, generation: BridgeGeneration) -> usize 
                 // one that must not be dropped, and the fence ends with the
                 // Commit — in `_exit`, which ends this sweep too, or in the
                 // attempt standing down, which lets it land.
-                apply_hold(&ctx, Some(lost), HoldIssuer::Bridge, None);
+                apply_hold(&ctx, HoldAct::Set(lost), HoldIssuer::Bridge, None);
             } else if advise(&ctx, lost, generation) {
                 advised += 1;
             }
@@ -2969,7 +4012,7 @@ pub(crate) fn holds_on_bridge_lost() -> bool {
 #[cfg(any(unix, test))]
 fn advise(ctx: &SessionCtx, lost: Hold, generation: BridgeGeneration) -> bool {
     let mut inbox = ctx.fabric.lock();
-    if inbox.hold.is_some() {
+    if inbox.holds.is_held() {
         return false;
     }
     let record = format!("1 reason={} origin={}", lost.reason, lost.origin);
@@ -3144,6 +4187,10 @@ pub(crate) fn is_pty_reaching(verb: &str) -> bool {
             | "tab"
             | "confirm"
             | "operator-propose-bin"
+            // The sudo askpass relay: a held session must not escalate to root.
+            // Intercepted before dispatch, so the intercept enforces this itself
+            // (via the attributed session's hold) rather than the generic gate.
+            | "askpass"
     )
 }
 
@@ -3209,104 +4256,19 @@ pub(crate) fn app_halt_refusal(store: &Store, verb: &str) -> Option<String> {
 // Small wire helpers
 // ---------------------------------------------------------------------------
 
-/// The name half of a principal, in bytes: §3.2 of the fabric design fixes the
-/// grammar at a class prefix plus `[a-z0-9-]{1,32}`.
-///
-/// THE SAME NUMBER AS THE OTHER TWO SPELLINGS OF THIS GRAMMAR, and it was not.
-/// `aterm-link`'s `subject::NAME_MAX` is 32 and exports `PRINCIPAL_MAX = 34` so
-/// that `body::VIA_MAX_BYTES` cannot drift from it; astream's `Grant::parse`
-/// refuses a principal outside the same `{1,32}`. This copy admitted 40 — laxer
-/// in the safe direction TODAY only because every `from=` the endpoint renders
-/// comes from a cap-forced subject segment, but a writer and a reader with two
-/// different limits for one field is the split-bound shape that produced this
-/// project's worst finding: a line one side builds and the other refuses, with
-/// no test failing because neither number was pinned to the other. Widening this
-/// back is a design change to §3.2, not a local one.
-///
-/// `aterm-gui` does not depend on `aterm-link`, so the pin is the design section
-/// plus `inbox_hold::the_principal_grammar_is_section_3_2s`, which walks the
-/// boundary rather than restating the constant.
-const PRINCIPAL_NAME_MAX: usize = 32;
-
-/// A BROADCAST TOPIC: `[a-z0-9][a-z0-9._-]{0,31}`, one subject segment.
-///
-/// The same rule `aterm_link::subject::is_topic` enforces on the publish side,
-/// spelled here because the endpoint refuses a bad address at the `post` rather
-/// than letting the bridge retire it as unroutable — a sender who mistyped a
-/// topic learns it from the reply, not from an `off=-` row it may never read.
-pub(crate) fn is_topic(t: &str) -> bool {
-    let mut cs = t.chars();
-    cs.next()
-        .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
-        && t.len() <= 32
-        && cs.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'))
-}
-
-/// A principal segment: class prefix + a bounded lowercase name, optionally
-/// `@<node>` for a session behind a node. Nothing a sender types reaches this on
-/// the INBOUND side — the bridge renders `from=` from the delivered subject — but
-/// the endpoint validates it anyway, so a compromised bridge cannot smuggle a
-/// sentence into a `from=` field an agent reads as identity. On the OUTBOUND side
-/// a sender DOES choose `to=` and `via=`, and this is the whole grammar those are
-/// held to.
+/// A principal ADDRESS: a bare principal ([`is_principal`]), or
+/// `<owner>@<node>` for a session behind a node, both halves bare. Nothing a
+/// sender types reaches this on the INBOUND side — the bridge renders `from=`
+/// from the delivered subject — but the endpoint validates it anyway, so a
+/// compromised bridge cannot smuggle a sentence into a `from=` field an agent
+/// reads as identity. On the OUTBOUND side a sender DOES choose `to=`, and this
+/// is the grammar it is held to. A `via=` hop is never this wider form: that is
+/// [`via_ok`], which the bridge re-checks on the line this endpoint writes.
 pub(crate) fn valid_principal(p: &str) -> bool {
-    let ok_one = |s: &str| {
-        let mut it = s.splitn(2, '-');
-        let (Some(class), Some(name)) = (it.next(), it.next()) else {
-            return false;
-        };
-        matches!(class, "s" | "n" | "h" | "a")
-            && (1..=PRINCIPAL_NAME_MAX).contains(&name.len())
-            && name
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-    };
     match p.split_once('@') {
-        Some((owner, node)) => ok_one(owner) && ok_one(node),
-        None => ok_one(p),
+        Some((owner, node)) => is_principal(owner) && is_principal(node),
+        None => is_principal(p),
     }
-}
-
-/// The relay chain `post via=` and `deliver via=` accept, BOUNDED WHERE THE TWO
-/// SIDES MEET.
-///
-/// `aterm-link`'s `body::via_ok` is the wire rule — at most 16 comma hops, at
-/// most `16 * (PRINCIPAL_MAX + 1)` bytes, every hop a BARE principal
-/// (`subject::is_principal`, which has no `@<node>` form). Round 2 put it there
-/// so that "the inbound `deliver` line and the outbound `post` line bound it by
-/// one number", and this end — the WRITER of that outbound line — went on
-/// accepting `via=` as one unbounded whitespace-free token: a single `post` could
-/// carry ~64 KiB of it (`control::MAX_REQUEST_LINE`), which no bound here counted
-/// and which the bridge would then refuse, per hop, as a verdict.
-///
-/// SAME TWO NUMBERS, COMPUTED THE SAME WAY, so they cannot drift: the byte cap is
-/// derived from the hop cap and the principal grammar rather than written down
-/// beside it. `aterm-gui` does not depend on `aterm-link`, so the pin is
-/// `inbox_hold::the_via_bound_is_the_wires_bound`, which walks the boundary.
-const VIA_MAX_HOPS: usize = 16;
-const VIA_MAX_BYTES: usize = VIA_MAX_HOPS * (PRINCIPAL_CLASS_PREFIX_LEN + PRINCIPAL_NAME_MAX + 1);
-
-/// The two bytes of class prefix every principal carries (`s-`/`n-`/`h-`/`a-`).
-const PRINCIPAL_CLASS_PREFIX_LEN: usize = 2;
-
-/// Whether a `via=` chain may be accepted — on the way IN (`deliver`) or on the
-/// way OUT (`post`), because it is one field and one grammar.
-///
-/// A HOP IS A BARE PRINCIPAL, not [`valid_principal`]'s `<owner>@<node>` form.
-/// `from=` legitimately names a session behind a node; a `via=` hop is a relayer
-/// on the bus, which is what `subject::is_principal` admits and what the bridge's
-/// `body::via_ok` will re-check. Accepting the wider form here built a line this
-/// endpoint's own bridge refuses.
-///
-/// An EMPTY chain is refused for the reason `via_ok` refuses it: it is a relay
-/// claim naming no relay, and it still demotes the record's kind.
-fn valid_via(via: &str) -> bool {
-    !via.is_empty()
-        && via.len() <= VIA_MAX_BYTES
-        && via.split(',').count() <= VIA_MAX_HOPS
-        && via
-            .split(',')
-            .all(|hop| !hop.contains('@') && valid_principal(hop))
 }
 
 /// The most bytes a `post key=` may carry.
@@ -3361,32 +4323,42 @@ fn reason_token(raw: &str) -> String {
 const HOLD_USAGE: &str = "ERR usage: hold <sid> on|off [reason=<pct>] [origin=fleet|local]\n";
 
 /// The refusal an Owner-issued `hold` gets for a fleet-origin act — naming
-/// `origin=fleet`, or setting, replacing or lifting a standing fleet hold. It
-/// says whose hold it is, which tells a caller nothing it could not learn from
-/// `status hold=`. Named so the dispatch can audit-log exactly this refusal
-/// without matching prose, and so the menu can tell it from the bare `ERR
-/// denied` of an edge token or a selector.
+/// `origin=fleet`, or an `off` that finds only a fleet hold standing (nothing
+/// of the owner's to lift). It says whose hold it is, which tells a caller
+/// nothing it could not learn from `sessions status hold_origin=`. Named so
+/// the dispatch can audit-log exactly this refusal without matching prose,
+/// and so the menu can tell it from the bare `ERR denied` of an edge token or
+/// a selector.
 pub(crate) const HOLD_DENIED: &str = "ERR denied: only the fleet sets or lifts a fleet hold\n";
 
 /// The answer to a `hold` that arrived while a seamless update was committing
-/// the session and waited [`HOLD_FENCE_WAIT`] without the update either
-/// landing or standing down. Nothing moved: `ERR busy` is the transient class
+/// the session and waited its [`SessionFabric::fence_wait`] without the update
+/// either landing or standing down. Nothing moved: `ERR busy` is the transient class
 /// a driver already retries, and the retry reaches whichever process then
 /// owns the session.
 pub(crate) const HOLD_BUSY: &str = "ERR busy update-committing\n";
 
-/// How long a `hold` verb waits for a committing update
-/// ([`SessionFabric::fence_hold`]) before it answers [`HOLD_BUSY`]. The fenced
-/// stretch is the successor's activation, the Commit's answers, the identity
-/// markers, the harness suspend and one pipe write — milliseconds — and, when
-/// those answers took real time, one more input-dispatch fence the Commit
-/// holds its claim through (round eight of the update audit, #18): up to the
-/// drain gate's deadline (`HANDOFF_INPUT_DRAIN_DEADLINE`, 3 s), across turns
-/// of the main thread's run loop. This is the bound for a Commit that is
-/// stuck, so a control connection never waits on one for good. The main
-/// thread never waits at all: it alone raises and lifts the fence, so the
-/// menu's Hold answers [`HOLD_BUSY`] at once (`App::menu_hold`).
-pub(crate) const HOLD_FENCE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Count, on this thread, one block on a committing update's fence: a test
+/// reads [`fence_blocks_on_this_thread`] to see that a path never waited,
+/// without a clock.
+#[cfg(test)]
+fn note_fence_block() {
+    FENCE_BLOCKS.with(|n| n.set(n.get() + 1));
+}
+
+#[cfg(not(test))]
+fn note_fence_block() {}
+
+#[cfg(test)]
+thread_local! {
+    static FENCE_BLOCKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times this thread has blocked on a hold fence ([`note_fence_block`]).
+#[cfg(test)]
+pub(crate) fn fence_blocks_on_this_thread() -> u64 {
+    FENCE_BLOCKS.with(std::cell::Cell::get)
+}
 
 /// Who is issuing a `hold` — the whole of what the two owner-class scopes that
 /// may run it differ in. The dispatch maps `Scope::Bridge` to [`Self::Bridge`]
@@ -3395,40 +4367,83 @@ pub(crate) const HOLD_FENCE_WAIT: std::time::Duration = std::time::Duration::fro
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum HoldIssuer {
     /// The inherited bridge connection: the fleet's hand. `origin=fleet` by
-    /// default, either origin accepted, and `off` lifts whatever stands — the
-    /// rule the code had before the local halt, kept as it was.
+    /// default and either origin accepted; each act sets or lifts the slot of
+    /// the origin it names and no other, so the fleet's lift leaves the
+    /// owner's local hold standing.
     Bridge,
     /// The instance Owner token over the local control socket: `origin=local`
-    /// only, and no act at all — `on` or `off` — against a standing fleet hold.
+    /// only, so its acts set and lift the owner's own slot and never the
+    /// fleet's; an `off` that finds only a fleet hold standing is refused.
     Owner,
+}
+
+/// One act on a session's holds ([`apply_hold`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum HoldAct<'a> {
+    /// Set the slot of `hold.origin`, or move its reason.
+    Set(Hold),
+    /// Lift the slot of this origin, and only it.
+    Lift(&'a str),
+    /// Lift every slot: the test door's lift ([`apply_hold_for_test`]), never
+    /// a `hold` verb's.
+    #[cfg(test)]
+    LiftAll,
+}
+
+impl HoldAct<'_> {
+    /// The one origin this act moves, `None` for [`Self::LiftAll`].
+    fn origin(&self) -> Option<&str> {
+        match self {
+            Self::Set(hold) => Some(hold.origin.as_str()),
+            Self::Lift(origin) => Some(origin),
+            #[cfg(test)]
+            Self::LiftAll => None,
+        }
+    }
 }
 
 /// What [`apply_hold`] did.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Applied {
-    /// The hold flag or its record moved, and the event was recorded.
-    Changed,
-    /// The requested state already stood; nothing recorded.
-    Unchanged,
-    /// An Owner-issued act met a standing `origin=fleet` hold and was refused
-    /// without touching it. Never answered to [`HoldIssuer::Bridge`].
+    /// A slot moved, and the event was recorded. `held`: whether any hold
+    /// stands after it — the `OK hold=` the act is answered with.
+    Changed { held: bool },
+    /// The slot already stood as asked; nothing recorded. `held` as above: a
+    /// lift of an origin that was not standing answers `OK hold=1` while the
+    /// other origin's hold stands, since the session is still halted.
+    Unchanged { held: bool },
+    /// An Owner-issued act named the fleet's slot, or an Owner `off` found
+    /// only a fleet hold standing: refused without touching it. Never
+    /// answered to [`HoldIssuer::Bridge`].
     FleetHeld,
     /// A seamless update was committing the session for the whole of the wait
     /// the caller allowed ([`SessionFabric::fence_hold`]); nothing moved.
     Fenced,
 }
 
-/// Apply (or lift) a hold and record the transition. Records the timeline event
-/// WHILE holding the fabric guard — the sanctioned fabric → timeline nesting —
-/// so a watcher's `EVENT hold` order can never invert against the stored flag.
-/// Signals the condvar so a parked `await inbox … kinds=hold` wakes at once.
+/// Apply one act to a session's holds and record the transition. Records the
+/// timeline event WHILE holding the fabric guard — the sanctioned fabric →
+/// timeline nesting — so a watcher's `EVENT hold` order can never invert
+/// against the stored slots. Signals the condvar so a parked `await inbox …
+/// kinds=hold` wakes at once.
 ///
-/// THE FLEET FENCE IS DECIDED UNDER THE SAME LOCK. An Owner-issued act is
-/// refused while a fleet hold stands, and the standing hold is read inside the
-/// guard the write takes, so a `hold on origin=fleet` from the bridge that lands
-/// between an Owner's check and its write cannot be replaced or lifted by that
-/// write: whichever hold is there when the guard is taken is the one the rule
-/// sees.
+/// ONE SLOT PER ORIGIN ([`Holds`]). A set fills the slot of the origin it
+/// names, a lift empties it, and neither touches the other origin's: a fleet
+/// halt landing on the owner's local hold stands beside it, and the fleet's
+/// lift leaves the owner's hold where it was — the session still held. That
+/// is what keeps the owner's stop through every lift the bridge writes — an
+/// attach that finds no fleet halt writes `hold off origin=fleet` to every
+/// session it hosts, so does a person's lift, and so does a reconnect after
+/// the `[fabric] hold_on_bridge_lost` sweep — without the bridge having to
+/// know, between its read and its write, which sessions the owner has held.
+///
+/// THE FLEET FENCE IS DECIDED UNDER THE SAME LOCK. An Owner-issued act may
+/// name only the local slot, and its `off` is refused when only a fleet hold
+/// stands ([`Applied::FleetHeld`]: there was nothing of the owner's to lift,
+/// and the hold that stands is not the owner's). The standing slots are read
+/// inside the guard the write takes, so a `hold on origin=fleet` from the
+/// bridge that lands between an Owner's check and its write is the one that
+/// rule sees.
 ///
 /// AND SO IS THE COMMIT FENCE ([`SessionFabric::fence_hold`]): while a
 /// seamless update is committing the session, the transition waits on the
@@ -3439,7 +4454,7 @@ enum Applied {
 /// wait it answers [`Applied::Fenced`] with nothing moved.
 fn apply_hold(
     ctx: &SessionCtx,
-    hold: Option<Hold>,
+    act: HoldAct<'_>,
     issuer: HoldIssuer,
     fence_wait: Option<std::time::Duration>,
 ) -> Applied {
@@ -3447,16 +4462,19 @@ fn apply_hold(
     let deadline = fence_wait.map(|wait| std::time::Instant::now() + wait);
     while inbox.hold_fenced {
         inbox = match deadline {
-            None => ctx
-                .fabric
-                .changed
-                .wait(inbox)
-                .unwrap_or_else(|p| p.into_inner()),
+            None => {
+                note_fence_block();
+                ctx.fabric
+                    .changed
+                    .wait(inbox)
+                    .unwrap_or_else(|p| p.into_inner())
+            }
             Some(deadline) => {
                 let left = deadline.saturating_duration_since(std::time::Instant::now());
                 if left.is_zero() {
                     return Applied::Fenced;
                 }
+                note_fence_block();
                 ctx.fabric
                     .changed
                     .wait_timeout(inbox, left)
@@ -3465,29 +4483,43 @@ fn apply_hold(
             }
         };
     }
-    if issuer == HoldIssuer::Owner && inbox.hold.as_ref().is_some_and(|h| h.origin != "local") {
-        return Applied::FleetHeld;
+    if issuer == HoldIssuer::Owner {
+        // Not the owner's slot to name at all (`cmd_hold` refuses it first;
+        // this keeps the rule where the slots are).
+        if act.origin() != Some("local") {
+            return Applied::FleetHeld;
+        }
+        // An `off` with nothing of the owner's standing, against the fleet's
+        // halt: the hold it meant is the fleet's.
+        if matches!(act, HoldAct::Lift(_)) && !inbox.holds.has("local") && inbox.holds.has("fleet")
+        {
+            return Applied::FleetHeld;
+        }
     }
-    let changed = inbox.hold != hold;
+    let before = inbox.holds.clone();
+    match &act {
+        HoldAct::Set(hold) => *inbox.holds.slot_mut(&hold.origin) = Some(hold.reason.clone()),
+        HoldAct::Lift(origin) => *inbox.holds.slot_mut(origin) = None,
+        #[cfg(test)]
+        HoldAct::LiftAll => inbox.holds = Holds::default(),
+    }
+    let held = inbox.holds.is_held();
+    let changed = inbox.holds != before;
     if changed {
-        let (flag, reason, origin) = match &hold {
-            Some(h) => (1, h.reason.clone(), h.origin.clone()),
-            None => (0, "-".to_string(), "local".to_string()),
-        };
-        inbox.hold = hold;
+        let lifted = act.origin().unwrap_or("local");
         ctx.fabric.hold_serial.fetch_add(1, Ordering::AcqRel);
         ctx.timeline
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .record("hold", format!("{flag} reason={reason} origin={origin}"));
+            .record("hold", inbox.holds.event(lifted));
     }
     drop(inbox);
     if changed {
         ctx.fabric.changed.notify_all();
         crate::presence::post_fabric_changed(&ctx.self_id);
-        Applied::Changed
+        Applied::Changed { held }
     } else {
-        Applied::Unchanged
+        Applied::Unchanged { held }
     }
 }
 
@@ -3562,6 +4594,7 @@ pub(crate) fn with_link_reset<T>(f: impl FnOnce() -> T) -> T {
         LINK.supervised.store(false, Ordering::Relaxed);
         LINK.hold_on_loss.store(false, Ordering::Relaxed);
         *LINK.generation.lock().unwrap_or_else(|p| p.into_inner()) = 0;
+        *LINK.log.lock().unwrap_or_else(|p| p.into_inner()) = None;
         {
             let mut link = LINK.link.lock().unwrap_or_else(|p| p.into_inner());
             link.up = false;
@@ -3570,6 +4603,8 @@ pub(crate) fn with_link_reset<T>(f: impl FnOnce() -> T) -> T {
             link.acked_at = None;
             link.stalled_at = None;
             link.owed_since = None;
+            link.hello = None;
+            link.lane_faults = 0;
         }
         LINK.touched
             .lock()
@@ -3648,10 +4683,15 @@ pub(crate) fn touched_contains(sid: &str) -> bool {
 
 /// [`apply_hold`] for a caller that already holds the ctx — the `status` test's
 /// door into the same state the bridge writes, without a registry round trip.
-/// Bridge-issued, so it is never refused; `true` when the state moved.
+/// Bridge-issued, so it is never refused: `Some` sets that hold's origin's
+/// slot, `None` lifts every slot. `true` when the state moved.
 #[cfg(test)]
 pub(crate) fn apply_hold_for_test(ctx: &SessionCtx, hold: Option<Hold>) -> bool {
-    apply_hold(ctx, hold, HoldIssuer::Bridge, Some(HOLD_FENCE_WAIT)) == Applied::Changed
+    let act = hold.map_or(HoldAct::LiftAll, HoldAct::Set);
+    matches!(
+        apply_hold(ctx, act, HoldIssuer::Bridge, Some(ctx.fabric.fence_wait())),
+        Applied::Changed { .. }
+    )
 }
 
 /// `hold <sid> on|off [reason=<pct>] [origin=fleet|local]` — the drive halt,
@@ -3659,43 +4699,53 @@ pub(crate) fn apply_hold_for_test(ctx: &SessionCtx, hold: Option<Hold>) -> bool 
 /// out, selector rejected); this is the handler, and [`HoldIssuer`] is the one
 /// thing it needs from the dispatch that the table cannot say.
 ///
+/// A HOLD IS A SET OF ORIGINS ([`Holds`]): `on` sets the slot of the origin
+/// the act names, `off` lifts that slot and no other, and the session is held
+/// while either stands. The answer is `OK hold=<0|1>` for the session AFTER
+/// the act — a lift that leaves the other origin's hold standing answers
+/// `OK hold=1`, because the session is still halted.
+///
 /// THE ORIGIN RULE, ALL OF IT:
 ///
-/// * A bridge-issued act is what it always was — `origin=fleet` unless the line
-///   says otherwise, and `off` lifts whatever stands. The code never modelled
-///   "a fleet hold needs a fleet off" for the bridge, and this change does not
-///   invent it: the bridge is the fleet's hand and lifting a local hold is
-///   within its power exactly as it was the day before.
+/// * A bridge-issued act is `origin=fleet` unless the line says otherwise. The
+///   bridge is the fleet's hand, and the fleet's halt and lift are no act on
+///   the owner's stop: every attach that finds no fleet halt writes `hold off
+///   origin=fleet` to every session, and that used to free each one the owner
+///   had held; a fleet halt landing on a local hold used to REPLACE it, so its
+///   lift freed the session too.
 /// * An Owner-issued act is `origin=local` — the default, and the only value
 ///   accepted: `origin=fleet` from Owner is [`HOLD_DENIED`] before any session
-///   is looked up. And it may not touch a standing fleet hold at all: `on`
-///   would replace it with one the owner could then lift, `off` would lift it,
-///   and both are the "lift a fleet halt locally" a prompt-injected agent
-///   holding Owner must never be able to do. [`apply_hold`] answers
-///   [`Applied::FleetHeld`] for either, under the lock, and this returns
-///   [`HOLD_DENIED`]. `off` with nothing standing is `OK hold=0`, as for the
-///   bridge — there is nothing to refuse.
+///   is looked up. It sets and lifts the owner's own slot, beside a fleet hold
+///   as well as without one, and never touches the fleet's: lifting or
+///   replacing a fleet halt is the "lift a fleet halt locally" a
+///   prompt-injected agent holding Owner must never be able to do. An `off`
+///   that finds nothing of the owner's and a fleet hold standing is
+///   [`HOLD_DENIED`] ([`Applied::FleetHeld`], under the lock): the hold it
+///   meant is the fleet's. `off` with nothing standing is `OK hold=0`, as for
+///   the bridge — there is nothing to refuse.
 ///
 /// An Owner-issued act does NOT mark the session bridge-governed
 /// ([`note_bridge_touched`]): see that function for why.
 ///
 /// A SEAMLESS UPDATE COMMITTING THE SESSION holds the answer back
-/// ([`SessionFabric::fence_hold`]) for up to [`HOLD_FENCE_WAIT`]: an attempt
+/// ([`SessionFabric::fence_hold`]) for up to its [`SessionFabric::fence_wait`]: an attempt
 /// that stands down lets the act land and answers it as usual; one that lands
 /// takes this process with it, so the caller sees its connection close with
 /// no answer and its retry reaches the successor — never an `OK` for a halt
 /// the successor did not adopt. Past the wait it is [`HOLD_BUSY`].
 pub(crate) fn cmd_hold(store: &Store, rest: &str, issuer: HoldIssuer) -> String {
-    cmd_hold_within(store, rest, issuer, HOLD_FENCE_WAIT)
+    cmd_hold_within(store, rest, issuer, None)
 }
 
-/// [`cmd_hold`] with the wait for a committing update as an argument, so a
-/// test can reach the [`HOLD_BUSY`] answer without sitting out the real bound.
+/// [`cmd_hold`] with the wait for a committing update as an argument — `None`
+/// is the session's own [`SessionFabric::fence_wait`] — so the menu can
+/// answer at once and a test can reach the [`HOLD_BUSY`] answer without
+/// sitting out the real bound.
 pub(crate) fn cmd_hold_within(
     store: &Store,
     rest: &str,
     issuer: HoldIssuer,
-    fence_wait: std::time::Duration,
+    fence_wait: Option<std::time::Duration>,
 ) -> String {
     let mut toks = rest.split_whitespace();
     let (Some(sid), Some(state)) = (toks.next(), toks.next()) else {
@@ -3741,16 +4791,24 @@ pub(crate) fn cmd_hold_within(
     if issuer == HoldIssuer::Bridge {
         note_bridge_touched(store, sid);
     }
-    let hold = on.then(|| Hold {
-        reason: reason_token(&reason),
-        origin,
-    });
-    match apply_hold(&ctx, hold, issuer, Some(fence_wait)) {
-        Applied::FleetHeld => return HOLD_DENIED.to_string(),
-        Applied::Fenced => return HOLD_BUSY.to_string(),
-        Applied::Changed | Applied::Unchanged => {}
+    let act = if on {
+        HoldAct::Set(Hold {
+            reason: reason_token(&reason),
+            origin,
+        })
+    } else {
+        HoldAct::Lift(&origin)
+    };
+    let fence_wait = fence_wait.unwrap_or_else(|| ctx.fabric.fence_wait());
+    match apply_hold(&ctx, act, issuer, Some(fence_wait)) {
+        Applied::FleetHeld => HOLD_DENIED.to_string(),
+        Applied::Fenced => HOLD_BUSY.to_string(),
+        // The session's state after the act: a lift that left the other
+        // origin's hold standing is still a halt, which the answer says.
+        Applied::Changed { held } | Applied::Unchanged { held } => {
+            format!("OK hold={}\n", u8::from(held))
+        }
     }
-    format!("OK hold={}\n", u8::from(on))
 }
 
 // ---------------------------------------------------------------------------
@@ -3851,7 +4909,7 @@ fn deliver_receipt(ctx: &SessionCtx, toks: &[&str]) -> String {
     // [`retire_post`]): the successor carries the receipt as owed.
     let Some(mut inbox) = ctx
         .fabric
-        .wait_unfenced_retirement(ctx.fabric.lock(), HOLD_FENCE_WAIT)
+        .wait_unfenced_retirement(ctx.fabric.lock(), ctx.fabric.fence_wait())
     else {
         return HOLD_BUSY.to_string();
     };
@@ -4110,7 +5168,7 @@ fn parse_deliver_fields(toks: &[&str], len_max: usize) -> Result<DeliverFields, 
             }
             f.demoted = Some(v.to_string());
         } else if let Some(v) = kv(tok, "via") {
-            if !valid_via(v) {
+            if !via_ok(v) {
                 return Err(DELIVER_USAGE.to_string());
             }
             f.via = Some(v.to_string());
@@ -4214,10 +5272,11 @@ fn retire_post(
     // under the same sid, and a pin left standing would swallow its post.
     let Some(mut inbox) = ctx
         .fabric
-        .wait_unfenced_retirement(ctx.fabric.lock(), HOLD_FENCE_WAIT)
+        .wait_unfenced_retirement(ctx.fabric.lock(), ctx.fabric.fence_wait())
     else {
         return Err(HOLD_BUSY.to_string());
     };
+    let epoch = inbox.log_epoch;
     let Some(row) = inbox.posts.iter_mut().find(|p| p.id == post_id) else {
         return Err("ERR no such post\n".to_string());
     };
@@ -4227,6 +5286,9 @@ fn retire_post(
     };
     match off {
         Some(n) => {
+            if row.off.is_none() {
+                row.landed_epoch = epoch;
+            }
             row.off = Some(n);
             // STICKY, like the offset: a retirement retried without the flag
             // (a bridge that died between `outbox sent` and its reply) must
@@ -4273,7 +5335,7 @@ fn retire_post(
 // outbox / outbox sent
 // ---------------------------------------------------------------------------
 
-const OUTBOX_USAGE: &str = "ERR usage: outbox [<max>] | outbox sent <sid> <post-id> off=<n|-> \
+const OUTBOX_USAGE: &str = "ERR usage: outbox [<max>] [earlier-receipts=1] | outbox sent <sid> <post-id> off=<n|-> \
                             [dup=1] [reason=<word>]\n";
 
 /// The verdict a bare `off=-` carries, and the only one A2 could express.
@@ -4297,7 +5359,7 @@ pub(crate) fn cmd_outbox_verb(store: &Store, rest: &str) -> String {
     }
 }
 
-/// `outbox [<max>]` — drain every session's queued outbound posts WITH their
+/// `outbox [<max>] [earlier-receipts=1]` — drain every session's queued outbound posts WITH their
 /// bodies, as one length-prefixed frame. BRIDGE-ONLY (the dispatch gates it).
 ///
 /// A PEEK, on purpose. It moves no watermark and removes nothing: a bridge that
@@ -4330,38 +5392,90 @@ pub(crate) fn cmd_outbox_verb(store: &Store, rest: &str) -> String {
 /// in one place.
 pub(crate) fn cmd_outbox(store: &Store, rest: &str) -> String {
     let mut max = usize::MAX;
+    let mut earlier_receipts = false;
     for tok in rest.split_whitespace() {
+        if tok == "earlier-receipts=1" {
+            earlier_receipts = true;
+            continue;
+        }
         match tok.parse::<usize>() {
             Ok(n) => max = n,
             Err(_) => return OUTBOX_USAGE.to_string(),
         }
     }
-    // Sessions in `local_id` order, posts in queue order: the drain a bridge sees
-    // is the order the endpoint accepted them in, which is the order the bus must
-    // see them in for a per-sender stream to mean anything.
+    // EACH SESSION'S POSTS IN QUEUE ORDER, the sessions TAKEN IN TURN: one post
+    // from every session, then the next one from each, until
+    // the budget binds. Per sender, the drain a bridge sees is the order the
+    // endpoint accepted the posts in, which is the order the bus must see them in
+    // for a per-sender stream to mean anything; ACROSS senders nothing is
+    // promised, and taking them in turn is what keeps one session from spending
+    // every drain. The bridge holds a sender whose post it could not publish
+    // and moves on to the others (`Bridge::drain_outbox`), and a session ahead
+    // in `local_id` order whose queue alone filled the budget — a full 4 MiB of
+    // posts the broker cannot take now — used to be the whole of every drain,
+    // so no later session's post was ever listed. Now each session's head post
+    // is listed before any session's second, as far as the budget reaches.
+    // Across drains, the least recently listed sessions go first (`local_id`
+    // breaks ties). Otherwise sixteen refused maximum-sized heads fill every
+    // drain and a seventeenth sender is never even offered to the bridge.
+    //
+    // A session is read under its own lock once per turn, so between turns a
+    // post may be retired or queued: each turn resumes at the first queued post
+    // AFTER the id last listed for that session, never at a position, so the
+    // per-sender order holds whatever moved in between.
     let handles = {
         let g = store.read().unwrap_or_else(|p| p.into_inner());
         g.snapshot()
     };
+    let mut turns: Vec<_> = handles
+        .into_iter()
+        .map(|h| {
+            let turn = h.ctx.fabric.lock().outbox_turn;
+            (turn, h)
+        })
+        .collect();
+    let turn = turns
+        .iter()
+        .map(|(turn, _)| *turn)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1);
+    turns.sort_by_key(|(turn, h)| (*turn, h.local_id));
+    let handles: Vec<_> = turns.into_iter().map(|(_, h)| h).collect();
     let mut payload = String::new();
     let mut sent = 0usize;
-    for h in &handles {
-        if sent >= max || payload.len() >= OUTBOX_DRAIN_BYTES_MAX {
-            break;
-        }
-        let sid = h.sid.as_str().to_string();
-        let inbox = h.ctx.fabric.lock();
-        for post in inbox.posts.iter().filter(|p| p.off.is_none() && !p.dead) {
+    let mut listed: Vec<Option<u64>> = vec![None; handles.len()];
+    let mut exhausted = vec![false; handles.len()];
+    'turns: loop {
+        let mut took = false;
+        for (i, h) in handles.iter().enumerate() {
+            if exhausted[i] {
+                continue;
+            }
             // AFTER the first post, never before it: a single body may legally be
             // as large as `BODY_MAX`, and a budget that could refuse the post at
             // the head of the queue would strand it forever behind a bound it can
             // never fit under.
             if sent >= max || (sent > 0 && payload.len() >= OUTBOX_DRAIN_BYTES_MAX) {
-                break;
+                break 'turns;
             }
+            let mut inbox = h.ctx.fabric.lock();
+            let after = listed[i];
+            let Some(post) = inbox
+                .posts
+                .iter()
+                .filter(|p| p.off.is_none() && !p.dead)
+                .find(|p| after.is_none_or(|last| p.id > last))
+            else {
+                exhausted[i] = true;
+                continue;
+            };
             payload.push_str(&format!(
-                "post sid={sid} id={} to={} kind={}",
-                post.id, post.to, post.kind
+                "post sid={} id={} to={} kind={}",
+                h.sid.as_str(),
+                post.id,
+                post.to,
+                post.kind
             ));
             if let Some(re) = post.re {
                 payload.push_str(&format!(" re={re}"));
@@ -4377,13 +5491,24 @@ pub(crate) fn cmd_outbox(store: &Store, rest: &str) -> String {
             }
             payload.push_str(&format!(" len={}\n", post.body.len()));
             payload.push_str(&post.body);
+            listed[i] = Some(post.id);
+            inbox.outbox_turn = turn;
             sent += 1;
+            took = true;
+        }
+        if !took {
+            break;
         }
     }
     // THE OWED RECEIPTS AND THE PARKED READS, AFTER EVERY POST: one bodiless
-    // `receipt sid=<sid> rid=<n> off=<n> verdict=<v> kind=<k> from=<p>` line
-    // per receipt this session owes (R8; the bridge publishes the `ack` and
-    // retires it with `deliver <sid> receipt=<rid>`), and one `fetch sid=<sid>
+    // `receipt sid=<sid> rid=<n> off=<n> verdict=<v> kind=<k> from=<p>
+    // [log=earlier]` line per receipt this session owes (R8; the bridge
+    // publishes the `ack` and retires it with `deliver <sid> receipt=<rid>`;
+    // `log=earlier` is a row of a log before the one it reads now,
+    // [`OwedReceipt::earlier_log`], which it retires unsent). These old-log
+    // receipts are listed only for `earlier-receipts=1`, an explicit promise
+    // that the requester understands their mark; older bridges ignore unknown
+    // receipt columns. Also one `fetch sid=<sid>
     // off=<n>` line per `inbox get @<off>` waiting on the bridge. After, so a
     // bridge from before this rung — whose parser stops at the first line
     // without a `len=` — still drains every post. Not counted against `<max>`
@@ -4393,9 +5518,19 @@ pub(crate) fn cmd_outbox(store: &Store, rest: &str) -> String {
         let sid = h.sid.as_str();
         let inbox = h.ctx.fabric.lock();
         for r in &inbox.receipts {
+            // Older bridges ignore unknown receipt fields. They must never
+            // publish an old log's offset merely because they skipped its tag.
+            if r.earlier_log && !earlier_receipts {
+                continue;
+            }
             payload.push_str(&format!(
-                "receipt sid={sid} rid={} off={} verdict={} kind={} from={}\n",
-                r.rid, r.off, r.verdict, r.kind, r.from
+                "receipt sid={sid} rid={} off={} verdict={} kind={} from={}{}\n",
+                r.rid,
+                r.off,
+                r.verdict,
+                r.kind,
+                r.from,
+                if r.earlier_log { " log=earlier" } else { "" }
             ));
         }
         for (off, slot) in &inbox.fetches {
@@ -4501,22 +5636,31 @@ fn deliver_row(ctx: &SessionCtx, toks: &[&str]) -> String {
     // (round seven's review of group J, item 2): the manifest carried the last
     // id plus [`INBOX_ID_RESERVE`], so a delivery between the park's draw and
     // the `_exit` lands here as ever. An ADDRESSED row reaches the successor
-    // again — its bridge refills the session's addressed lane from the `seen`
-    // offset — under an id of its own; a BROADCAST does not (see
-    // [`INBOX_ID_RESERVE`]). While the Commit's fence stands, a row that would
-    // pass that ceiling, and every broadcast, waits for the attempt to land or
-    // stand down ([`SessionFabric::wait_fenced_delivery`]); neither is ever
-    // answered an `ERR` the bridge would book as a verdict (the review's item
-    // 1). Before the fence, passing the ceiling stands the Commit down
+    // again — its bridge refills the session's addressed lane from the floor
+    // `inbox seen` reported ([`addressed_floor`]) — under an id of its own,
+    // and so does an unhandled BROADCAST from a bridge that refills them (its
+    // topic's refill floor, see [`INBOX_ID_RESERVE`]). While the Commit's
+    // fence stands, a row that would pass that ceiling, and every broadcast,
+    // waits for the attempt to land or stand down
+    // ([`SessionFabric::wait_fenced_delivery`]); neither is ever answered an
+    // `ERR` the bridge would book as a verdict (the review's item 1). Before
+    // the fence, passing the ceiling stands the Commit down
     // ([`SessionFabric::past_handoff_ceiling`]).
+    //
+    // Whether the bridge refills a broadcast is read BEFORE the inbox guard:
+    // it takes the link's lock, and nothing here needs the two held together.
+    let refill = topic.is_some() && bridge_refills_broadcasts();
     let mut inbox =
         ctx.fabric
             .wait_fenced_delivery(ctx.fabric.lock(), ctx.self_id.as_str(), topic.as_deref());
     // IDEMPOTENCY, before anything else: the offset decides, and a duplicate
     // answers the id it first got without touching the ring, the quota or the
-    // events digest.
-    if inbox.dedup_set.contains(&off) {
-        let existing = inbox.rows.iter().find(|r| r.off == off).map(|r| r.id);
+    // events digest. A row the RING still holds is a duplicate too, after the
+    // dedup window ([`DEDUP_CAP`]) has forgotten its offset: a bridge that
+    // starts re-offers every broadcast its session had not handled
+    // ([`InboxRow::refill`]), however long ago the ring took it.
+    if inbox.dedup_set.contains(&off) || inbox.row_at(off).is_some() {
+        let existing = inbox.row_at(off).map(|r| r.id);
         return match existing {
             Some(id) => format!("OK {id}\n"),
             // Delivered before, then evicted or pruned: the row is gone but the
@@ -4524,6 +5668,21 @@ fn deliver_row(ctx: &SessionCtx, toks: &[&str]) -> String {
             // a bridge that re-reads it learns the endpoint kept nothing.
             None => "OK 0\n".to_string(),
         };
+    }
+    // CONSENT IS CHECKED WHERE IT IS HELD. Receiver-side opt-in is the whole
+    // safety story of broadcast, and this endpoint holds the set; the bridge's
+    // copy of it is a routing hint that lags a `topic drop` — the rest of a
+    // catch-up page already in flight, a session past the watch cap read once
+    // per roster round, a `topic ls` that failed. Read under the inbox guard
+    // (inbox → topics, the order `topic add|drop` take under the same guard), so
+    // once `drop` answers OK no row on that topic is appended here. After the
+    // dedup, so the offset still decides a redelivery; before the quota, so a
+    // declined topic is not counted in `dropped=` — the session said no, it lost
+    // nothing. The bridge books the refusal as accounted and moves its cursor on.
+    if let Some(t) = topic.as_deref()
+        && !ctx.fabric.opted_into(t)
+    {
+        return "ERR not-subscribed\n".to_string();
     }
     // PER-PEER QUOTA. Counted over UNLISTED rows only — a peer that has already
     // had its say and been read is not holding the ring hostage — and keyed on
@@ -4540,15 +5699,31 @@ fn deliver_row(ctx: &SessionCtx, toks: &[&str]) -> String {
         // A BROADCAST HAS NOBODY TO TELL BUT THE RECIPIENT — see
         // [`Inbox::dropped`]. The addressed lane's refusal rides back to the
         // sender on their own lane; this one is counted here or it is nowhere.
+        //
+        // AND COUNTED ONCE: its offset is remembered as delivered, so a bridge
+        // that starts and walks this topic again from an earlier unhandled row
+        // ([`InboxRow::refill`]) is answered `OK 0` — taken once, held no
+        // more — rather than refused, and counted, a second time.
         if topic.is_some() {
             inbox.dropped += 1;
+            remember_offset(&mut inbox, off);
         }
         return "ERR quota\n".to_string();
     }
 
     inbox.last_msg_id += 1;
     let id = inbox.last_msg_id;
-    let re_id = re.and_then(|r| inbox.posts.iter().find(|p| p.off == Some(r)).map(|p| p.id));
+    // Threaded by offset only to a post that landed on THIS log
+    // ([`Inbox::log_floor`]): an earlier log's post at the same number is
+    // another record.
+    let re_id = re.and_then(|r| {
+        inbox
+            .posts
+            .iter()
+            .find(|p| p.landed_epoch == inbox.log_epoch && p.off == Some(r))
+            .map(|p| p.id)
+    });
+    let is_addressed = topic.is_none();
     let row = InboxRow {
         id,
         off,
@@ -4568,10 +5743,14 @@ fn deliver_row(ctx: &SessionCtx, toks: &[&str]) -> String {
         body,
         topic,
         listed: false,
+        refill,
     };
     evict_for(&mut inbox);
     inbox.rows.push_back(row);
     inbox.bus_head = inbox.bus_head.max(off);
+    if is_addressed {
+        inbox.addressed_head = Some(inbox.addressed_head.map_or(off, |h| h.max(off)));
+    }
     inbox.oldest_on_bus = Some(inbox.oldest_on_bus.map_or(off, |o| o.min(off)));
     remember_offset(&mut inbox, off);
     ctx.timeline
@@ -4681,7 +5860,12 @@ pub(crate) fn cmd_topic(ctx: &SessionCtx, rest: &str) -> (String, bool) {
                 return (TOPIC_USAGE.to_string(), false);
             }
             let topics = ctx.fabric.topics();
-            let mut out = format!("OK {}\n", topics.len());
+            // `seen=` is the handled watermark ([`cmd_inbox_seen_waking`]'s
+            // event carries it too): a bridge reads it here, on every read of
+            // the set, as the backstop for an `inbox-seen` it never heard, so
+            // a broadcast the agent handled is not offered again.
+            let seen = ctx.fabric.lock().seen;
+            let mut out = format!("OK {} seen={seen}\n", topics.len());
             for (t, e) in topics {
                 out.push_str(&format!("topic {t} since={}\n", e.since));
             }
@@ -4711,7 +5895,9 @@ pub(crate) fn cmd_topic(ctx: &SessionCtx, rest: &str) -> (String, bool) {
             // park drew, and the Commit compares it again under this fence
             // (`App::carried_claims_held`), so a change that took the inbox
             // guard first stands that Commit down, and one after it waits.
-            let Some(unfenced) = ctx.fabric.wait_unfenced(ctx.fabric.lock(), HOLD_FENCE_WAIT)
+            let Some(unfenced) = ctx
+                .fabric
+                .wait_unfenced(ctx.fabric.lock(), ctx.fabric.fence_wait())
             else {
                 return (HOLD_BUSY.to_string(), false);
             };
@@ -4741,11 +5927,30 @@ pub(crate) fn cmd_topic(ctx: &SessionCtx, rest: &str) -> (String, bool) {
                 return (TOPIC_USAGE.to_string(), false);
             }
             // Held back by a committing update, as `add` is.
-            let Some(unfenced) = ctx.fabric.wait_unfenced(ctx.fabric.lock(), HOLD_FENCE_WAIT)
+            let Some(mut unfenced) = ctx
+                .fabric
+                .wait_unfenced(ctx.fabric.lock(), ctx.fabric.fence_wait())
             else {
                 return (HOLD_BUSY.to_string(), false);
             };
             let dropped = ctx.fabric.topic_drop(t, &ctx.timeline);
+            // THE BRIDGE FORGETS THIS TOPIC'S REFILL FLOOR WITH THE DROP
+            // (aterm-link's `Bridge::forget_unhandled_topic`), so no successor
+            // is offered the rows the ring still holds on it — not even after
+            // a `topic add` of the same name, which resumes from a new cursor.
+            // Each of them is therefore one no bridge refills
+            // ([`InboxRow::refill`]): an update counts it lost in `dropped=`
+            // rather than as carried. Under the guard the drop was made under,
+            // so no draw reads the set without the rows.
+            if dropped {
+                for row in unfenced
+                    .rows
+                    .iter_mut()
+                    .filter(|r| r.topic.as_deref() == Some(t))
+                {
+                    row.refill = false;
+                }
+            }
             drop(unfenced);
             ctx.fabric.changed.notify_all();
             (format!("OK {t} dropped={}\n", u8::from(dropped)), dropped)
@@ -4801,11 +6006,39 @@ pub(crate) fn parse_topics(rows: &[String]) -> Vec<(String, TopicEntry)> {
 /// The reason [`parse_hold`] gives a carried hold it could not read.
 pub(crate) const CARRIED_UNREADABLE: &str = "carried-unreadable";
 
+/// The reason a keeper META gives a carried hold whose own reason it had no
+/// room for ([`KeeperCarry::rungs`]): the halt crossed, the words did not.
+#[cfg(unix)]
+pub(crate) const REASON_NOT_CARRIED: &str = "not-carried";
+
+/// Every standing hold as the carries write them ([`render_hold`] rows), the
+/// fleet's first. A handoff record's `hold` and a keeper META's `hold` take
+/// the first row, `more_holds` the rest: a reader from before the two slots
+/// reads the stronger halt where it always read the one, and reads past the
+/// other. The durable layouts carry them all, on the leaf of a held tab
+/// (`restore::TerminalLeafRestore::holds`, LC-8), on every platform.
+pub(crate) fn render_holds(holds: &Holds) -> Vec<String> {
+    holds.standing().map(|hold| render_hold(&hold)).collect()
+}
+
+/// The inverse of [`render_holds`], FAIL-CLOSED as [`parse_hold`] is: every
+/// row is a hold of the origin it reads as, and the first row of an origin is
+/// the one that stands. One row — every carry from before the two slots — is
+/// exactly that one hold, of that origin.
+pub(crate) fn parse_holds<'a>(rows: impl IntoIterator<Item = &'a str>) -> Holds {
+    let mut holds = Holds::default();
+    for row in rows {
+        holds.seed(parse_hold(row));
+    }
+    holds
+}
+
 /// The standing hold as the HANDOFF MANIFEST carries it
 /// (`SessionRecord::hold`): `"<origin> <reason>"`, both already wire tokens —
 /// the origin is `fleet` or `local` and the reason [`reason_token`]'s output,
-/// which holds no space.
-#[cfg(any(unix, test))]
+/// which holds no space. The durable layouts carry its rows too
+/// ([`render_holds`]), on the leaf of a held tab
+/// (`restore::TerminalLeafRestore::holds`, LC-8).
 pub(crate) fn render_hold(hold: &Hold) -> String {
     format!("{} {}", hold.origin, hold.reason)
 }
@@ -4885,10 +6118,18 @@ const INBOX_USAGE: &str = "ERR usage: inbox [<n>] [since=<id>] [--peek] [--meta]
 /// `inbox` — the whole keyword, sub-forms included. The three forms split HERE
 /// rather than in the router's `match verb`, so the router keeps one arm per
 /// keyword and the sub-keywords never look like verbs of their own.
-pub(crate) fn cmd_inbox_verb(ctx: &SessionCtx, rest: &str) -> String {
+///
+/// `wake` is the session's subscriber notify, as for [`cmd_post_waking`]: the
+/// two forms that record a row the BRIDGE acts on — `inbox seen` (its
+/// `inbox-seen` event persists the refill floor and prompts a receipt's
+/// drain) and a parked `inbox get @<off>` (its `fetch` event prompts the
+/// bridge's read) — run it once that row is recorded, so the push lane
+/// carries the event now rather than on its 250 ms tick. The listing and
+/// `inbox get <id>` record nothing and never run it.
+pub(crate) fn cmd_inbox_verb(ctx: &SessionCtx, rest: &str, wake: &dyn Fn()) -> String {
     match rest.split_once(' ') {
-        Some(("get", tail)) => cmd_inbox_get(ctx, tail),
-        Some(("seen", tail)) => cmd_inbox_seen(ctx, tail),
+        Some(("get", tail)) => cmd_inbox_get_waking(ctx, tail, wake),
+        Some(("seen", tail)) => cmd_inbox_seen_waking(ctx, tail, wake),
         // A bare sub-keyword with no argument: usage, never a silent listing.
         _ if matches!(rest.trim(), "get" | "seen") => INBOX_USAGE.to_string(),
         _ => cmd_inbox(ctx, rest),
@@ -4935,7 +6176,7 @@ pub(crate) fn cmd_inbox(ctx: &SessionCtx, rest: &str) -> String {
 
     let holder = holder_token(ctx);
     let mut inbox = ctx.fabric.lock();
-    let hold_flag = u8::from(inbox.hold.is_some());
+    let hold_flag = u8::from(inbox.holds.is_held());
     // `<n>` keeps the NEWEST n, the `history`/`timeline` grammar: ids rise in
     // ring order, one row each, so that is every selected row past the first
     // `selected - n`.
@@ -5079,14 +6320,17 @@ fn render_row_into(out: &mut String, row: &InboxRow, meta_only: bool) {
 /// `count_after_ok` both read exactly that), so the marker rides in the tail
 /// without changing the framing. `glance.rs` established `"truncated": true` as
 /// this crate's way of saying an answer is not a complete one.
-pub(crate) fn cmd_inbox_get(ctx: &SessionCtx, rest: &str) -> String {
+///
+/// `wake` runs only for a read by offset that PARKS, once its `fetch` row is
+/// recorded and before the park ([`inbox_get_at`]).
+pub(crate) fn cmd_inbox_get_waking(ctx: &SessionCtx, rest: &str, wake: &dyn Fn()) -> String {
     let mut toks = rest.split_whitespace();
     let (Some(arg), None) = (toks.next(), toks.next()) else {
         return INBOX_USAGE.to_string();
     };
     if let Some(off) = arg.strip_prefix('@') {
         return match off.parse::<u64>() {
-            Ok(off) => inbox_get_at(ctx, off),
+            Ok(off) => inbox_get_at(ctx, off, wake),
             Err(_) => INBOX_USAGE.to_string(),
         };
     }
@@ -5104,6 +6348,13 @@ pub(crate) fn cmd_inbox_get(ctx: &SessionCtx, rest: &str) -> String {
         Some(row) => format!("OK {}\n{}", row.body.len(), row.body),
         None => "ERR no such message\n".to_string(),
     }
+}
+
+/// [`cmd_inbox_get_waking`] with nothing to wake — the unit tests' spelling.
+/// A production seam must name its wake, so this exists only under `cfg(test)`.
+#[cfg(test)]
+pub(crate) fn cmd_inbox_get(ctx: &SessionCtx, rest: &str) -> String {
+    cmd_inbox_get_waking(ctx, rest, &|| {})
 }
 
 /// `inbox get @<off>` — one record BY BROKER OFFSET, from the ring when it
@@ -5135,9 +6386,19 @@ pub(crate) fn cmd_inbox_get(ctx: &SessionCtx, rest: &str) -> String {
 /// row parks like an evicted one; only when no bridge can answer is the cut
 /// row the answer, still marked `truncated=1`, because it is then the most
 /// this endpoint holds.
-fn inbox_get_at(ctx: &SessionCtx, off: u64) -> String {
+///
+/// A NEWLY PARKED READ WAKES THE PUSH LANE BEFORE IT PARKS. The `fetch` row is
+/// what becomes `EVENT <local> fetch`, the bridge's prompt to drain the
+/// `outbox` peek, and the bridge has no idle poll: without `wake` the event
+/// left on the push loop's next 250 ms tick, or on the 2 s roster round. A
+/// flag returned to the caller could not do it — the call parks until the
+/// very answer that event starts. Run with the fabric lock released, as
+/// [`cmd_post_waking`] runs its own, so the subscriber registry's lock never
+/// nests inside this one.
+fn inbox_get_at(ctx: &SessionCtx, off: u64, wake: &dyn Fn()) -> String {
+    let mut announced = false;
     let mut inbox = ctx.fabric.lock();
-    if let Some(row) = inbox.rows.iter().find(|r| r.off == off)
+    if let Some(row) = inbox.row_at(off)
         && (row.len <= row.body.len() || wait_is_futile())
     {
         return Fetched::from_row(row).render();
@@ -5167,13 +6428,20 @@ fn inbox_get_at(ctx: &SessionCtx, off: u64) -> String {
             }
             inbox.fetches.push_back((off, FetchSlot::Pending));
             // The bridge's idle outbox poll is gone. A parked fetch is work
-            // owed now, so announce it through the same push lane that wakes
-            // posts and receipts. The roster round still finds a lost event.
+            // owed now: the record is the push lane's `fetch` event, and the
+            // wake below sends it now. The roster round still finds a lost
+            // event.
             ctx.timeline
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .record("fetch", format!("off={off}"));
+            announced = true;
         }
+    }
+    if announced {
+        drop(inbox);
+        wake();
+        inbox = ctx.fabric.lock();
     }
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(FETCH_WAIT_MS);
     loop {
@@ -5219,7 +6487,7 @@ fn inbox_get_at(ctx: &SessionCtx, off: u64) -> String {
 /// path while the ring holds it, so this is never a whole row passed off as
 /// a failure's answer.
 fn unfetched(inbox: &Inbox, off: u64, why: String) -> String {
-    match inbox.rows.iter().find(|r| r.off == off) {
+    match inbox.row_at(off) {
         Some(row) => Fetched::from_row(row).render(),
         None => why,
     }
@@ -5258,7 +6526,13 @@ fn fetch_failure(why: &str, off: u64) -> String {
 /// row per CHANGE: the same word again records the plain event (the watermark
 /// still moves), a different word (`deferred`, later `handled`) is a new
 /// receipt. A `--peek` records nothing and so acks nothing.
-pub(crate) fn cmd_inbox_seen(ctx: &SessionCtx, rest: &str) -> String {
+///
+/// `wake` runs once for an answered `OK`, after the `inbox-seen` row is
+/// recorded and the fabric lock released ([`cmd_inbox_verb`]): that event is
+/// what the bridge persists the refill floor from and drains a receipt on, so
+/// without it a `--wait-ack` sender waited out the push loop's 250 ms tick. A
+/// bare `inbox seen` wakes too — it moves the floor.
+pub(crate) fn cmd_inbox_seen_waking(ctx: &SessionCtx, rest: &str, wake: &dyn Fn()) -> String {
     let mut toks = rest.split_whitespace();
     let Some(id) = toks.next().and_then(|t| t.parse::<u64>().ok()) else {
         return INBOX_USAGE.to_string();
@@ -5276,7 +6550,7 @@ pub(crate) fn cmd_inbox_seen(ctx: &SessionCtx, rest: &str) -> String {
     // park drew it: held back until the attempt lands or stands down, like a
     // post ([`SessionFabric::wait_unfenced`]).
     if verdict.is_some() {
-        match ctx.fabric.wait_unfenced(inbox, HOLD_FENCE_WAIT) {
+        match ctx.fabric.wait_unfenced(inbox, ctx.fabric.fence_wait()) {
             Some(guard) => inbox = guard,
             None => return HOLD_BUSY.to_string(),
         }
@@ -5285,19 +6559,22 @@ pub(crate) fn cmd_inbox_seen(ctx: &SessionCtx, rest: &str) -> String {
         return "ERR no such message\n".to_string();
     };
     let off = inbox.rows[at].off;
+    // A row delivered before the bridge said the log changed: its `off` is an
+    // earlier log's ([`Inbox::log_floor`]), and so is its receipt's `re=`.
+    let earlier_log = inbox.rows[at].id <= inbox.log_floor;
     let decided = verdict.filter(|v| inbox.rows[at].decision.as_deref() != Some(v));
-    let mut payload = format!("{id} off={off}");
+    let mut verdict_tail = String::new();
     if let Some(v) = decided {
         let row = &mut inbox.rows[at];
         row.decision = Some(v.to_string());
-        payload.push_str(&format!(" verdict={v} kind={} from={}", row.kind, row.from));
+        verdict_tail = format!(" verdict={v} kind={} from={}", row.kind, row.from);
         // OWED, NOT MERELY ANNOUNCED. The event is the bridge's prompt trigger;
         // the queue is what survives a broker outage or a bridge relaunch
         // between this moment and the publish (see [`OwedReceipt`]). Only the
         // kinds that wait earn one — a demoted task is a `note` row here.
         if matches!(row.kind.as_str(), "ask" | "task") {
             let (kind, from) = (row.kind.clone(), row.from.clone());
-            owe_receipt(&mut inbox, off, v, &kind, &from);
+            owe_receipt(&mut inbox, off, v, &kind, &from, earlier_log);
         }
     }
     // MONOTONE: the watermark never goes backwards, so acknowledging an older row
@@ -5309,6 +6586,15 @@ pub(crate) fn cmd_inbox_seen(ctx: &SessionCtx, rest: &str) -> String {
         }
     }
     let seen = inbox.seen;
+    // `off=` is the NAMED row's offset (a broadcast's included); `floor=` is
+    // what the bridge refills this session's addressed lane from
+    // ([`addressed_floor`]), and the only one of the two it persists. `seen=`
+    // is the WATERMARK — every row at or below it is handled, whichever lane
+    // it came on — which is what releases a broadcast's refill floor
+    // (`aterm-link`'s `Bridge::unhandled`). It is not `<id>`: acknowledging
+    // an older row out of order leaves the watermark where it was.
+    let floor = addressed_floor(&inbox).map_or_else(|| "-".to_string(), |f| f.to_string());
+    let payload = format!("{id} off={off} floor={floor} seen={seen}{verdict_tail}");
     ctx.timeline
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -5316,7 +6602,50 @@ pub(crate) fn cmd_inbox_seen(ctx: &SessionCtx, rest: &str) -> String {
     drop(inbox);
     ctx.fabric.changed.notify_all();
     crate::presence::post_fabric_changed(&ctx.self_id);
+    wake();
     format!("OK seen={seen}\n")
+}
+
+/// THE ADDRESSED LANE'S REFILL FLOOR, as `inbox seen` reports it on its
+/// `inbox-seen` event (`floor=`): the offset the bridge refills this session's
+/// ring from when a relaunch keeps the sid but not the ring — a seamless
+/// update (its bridge persists `floor - 1` as `seen/<sid>`). `None` (`floor=-`)
+/// when this ring was never delivered an addressed row, so there is nothing to
+/// say and the bridge persists nothing.
+///
+/// THE LOWEST OFFSET OF AN UNHANDLED ADDRESSED ROW (`topic` none, id past
+/// `seen`), else one past the highest addressed offset ever delivered here.
+/// So it never passes an addressed row the agent has not handled while the
+/// ring holds it (one the ring evicted unhandled is counted in `dropped=` and
+/// still fetchable by `inbox get @<off>`), and a BROADCAST never moves it.
+///
+/// IT USED TO BE THE NAMED ROW'S OWN OFFSET, which was a safe floor only while
+/// ids and offsets rose together — true on the addressed lane alone, which
+/// one subscription delivers in offset order and a relaunch refills before
+/// that subscription opens. Broadcasts share the id counter but not the
+/// order: they arrive on a second subscription, which nothing orders against
+/// the first, and through the topic catch-up, which delivers OLDER offsets
+/// later. So acknowledging a broadcast could lift the floor past an unhandled
+/// addressed row of a lower offset (lost at the next update, uncounted) or
+/// leave it below a handled one of a higher offset (offered again as fresh
+/// unread mail, and decided twice).
+fn addressed_floor(inbox: &Inbox) -> Option<u64> {
+    // Only THIS log's rows: an earlier log's offset is no floor here
+    // ([`Inbox::log_floor`]), and its rows cannot be refilled from this log.
+    inbox
+        .rows
+        .iter()
+        .filter(|r| r.topic.is_none() && r.id > inbox.seen && r.id > inbox.log_floor)
+        .map(|r| r.off)
+        .min()
+        .or_else(|| inbox.addressed_head.map(|h| h.saturating_add(1)))
+}
+
+/// [`cmd_inbox_seen_waking`] with nothing to wake — the unit tests' spelling.
+/// A production seam must name its wake, so this exists only under `cfg(test)`.
+#[cfg(test)]
+pub(crate) fn cmd_inbox_seen(ctx: &SessionCtx, rest: &str) -> String {
+    cmd_inbox_seen_waking(ctx, rest, &|| {})
 }
 
 // ---------------------------------------------------------------------------
@@ -5527,7 +6856,7 @@ pub(crate) fn cmd_post_waking(
         return POST_USAGE.to_string();
     }
     if let Some(v) = &via
-        && !valid_via(v)
+        && !via_ok(v)
     {
         return POST_USAGE.to_string();
     }
@@ -5586,7 +6915,10 @@ pub(crate) fn cmd_post_waking(
     // the successor carries the outbox the park drew, so a post queued here
     // after the Commit's reading would be answered `OK` and lost with this
     // process.
-    let Some(mut inbox) = ctx.fabric.wait_unfenced(ctx.fabric.lock(), HOLD_FENCE_WAIT) else {
+    let Some(mut inbox) = ctx
+        .fabric
+        .wait_unfenced(ctx.fabric.lock(), ctx.fabric.fence_wait())
+    else {
         return HOLD_BUSY.to_string();
     };
     // REFUSED AT THE DOOR. A full outbox is answered, not absorbed: see
@@ -5611,6 +6943,7 @@ pub(crate) fn cmd_post_waking(
         to: to_tok.clone(),
         kind: kind.clone(),
         off: None,
+        landed_epoch: 0,
         re,
         dl,
         via: via.clone(),
@@ -5663,7 +6996,7 @@ pub(crate) fn cmd_post_waking(
     }
     let deadline = std::time::Instant::now()
         + std::time::Duration::from_millis(wait.unwrap_or(WAIT_DEFAULT_MS));
-    let (off, dup) = match wait_landing(ctx, id, deadline) {
+    let (off, dup, epoch) = match wait_landing(ctx, id, deadline) {
         Ok(landed) => landed,
         Err(reply) => return reply,
     };
@@ -5683,7 +7016,7 @@ pub(crate) fn cmd_post_waking(
         None => dl.map_or(WAIT_DEFAULT_MS, |d| d.saturating_add(expiry_grace_ms())),
     }
     .min(WAIT_MAX_MS);
-    wait_receipt(ctx, id, off, dup, bound)
+    wait_receipt_on_log(ctx, id, off, dup, epoch, bound)
 }
 
 /// [`cmd_post_waking`] with nothing to wake — the unit tests' spelling. A
@@ -5693,26 +7026,24 @@ pub(crate) fn cmd_post(ctx: &SessionCtx, rest: &str, body: Option<Vec<u8>>) -> S
     cmd_post_waking(ctx, rest, body, &|| {})
 }
 
-/// Park until the post `id` LANDS: `Ok((off, " dup=1" | ""))`, or the reply to
+/// Park until the post `id` LANDS: its offset, duplicate flag and log clock, or the reply to
 /// give instead — a verdict, a futile link, or the timeout.
 fn wait_landing(
     ctx: &SessionCtx,
     id: u64,
     deadline: std::time::Instant,
-) -> Result<(u64, &'static str), String> {
+) -> Result<(u64, &'static str, u64), String> {
     let mut guard = ctx.fabric.lock();
     loop {
         let row = guard.posts.iter().find(|p| p.id == id);
-        if let Some(off) = row.and_then(|p| p.off) {
+        if let Some(row) = row
+            && let Some(off) = row.off
+        {
             // `dup=1` IS THE BRIDGE'S REPORT of the broker's verdict: this post
             // re-used a sequence an earlier `key=` reserved, the broker deduped
             // it, and `off` is the ORIGINAL record's. One record on the bus.
-            let dup = if row.is_some_and(|p| p.dup) {
-                " dup=1"
-            } else {
-                ""
-            };
-            return Ok((off, dup));
+            let dup = if row.dup { " dup=1" } else { "" };
+            return Ok((off, dup, row.landed_epoch));
         }
         // A post the bridge retired as undeliverable releases its wait with a
         // verdict, not a timeout: the caller learns the difference between "the
@@ -5774,17 +7105,40 @@ fn wait_landing(
 /// off=<n>`. A timeout and a futile link both name the offset, because the
 /// post DID land: `await inbox re=<off>` picks the wait up later, and nothing
 /// here is a reason to re-post.
+#[cfg(test)]
 fn wait_receipt(ctx: &SessionCtx, id: u64, off: u64, dup: &str, bound_ms: u64) -> String {
+    let epoch = {
+        let inbox = ctx.fabric.lock();
+        inbox
+            .posts
+            .iter()
+            .find(|p| p.id == id)
+            .map_or(inbox.log_epoch, |p| p.landed_epoch)
+    };
+    wait_receipt_on_log(ctx, id, off, dup, epoch, bound_ms)
+}
+
+fn wait_receipt_on_log(
+    ctx: &SessionCtx,
+    id: u64,
+    off: u64,
+    dup: &str,
+    epoch: u64,
+    bound_ms: u64,
+) -> String {
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(bound_ms);
     let mut guard = ctx.fabric.lock();
     loop {
+        if guard.log_epoch != epoch {
+            return format!("ERR log-replaced id={id} off={off}\n");
+        }
         // The NEWEST word wins: `deferred` then `handled` is two receipts, and
         // the later one is the recipient's current answer.
-        let reply = guard
-            .rows
-            .iter()
-            .rev()
-            .find(|r| r.re == Some(off) && matches!(r.kind.as_str(), "ack" | "expired"));
+        let reply = guard.rows.iter().rev().find(|r| {
+            r.id > guard.log_floor
+                && r.re == Some(off)
+                && matches!(r.kind.as_str(), "ack" | "expired")
+        });
         if let Some(row) = reply {
             if row.kind == "expired" {
                 return format!("ERR expired id={id} off={off}\n");
@@ -5969,19 +7323,29 @@ pub(crate) fn cmd_await_inbox(ctx: &SessionCtx, args: &[&str], timeout_ms: u64) 
     if since > guard.last_msg_id {
         return format!("ERR bad since high={}\n", guard.last_msg_id);
     }
-    let hold_at_arm = guard.hold.is_some();
+    let hold_at_arm = guard.holds.is_held();
+    let epoch = guard.log_epoch;
     loop {
+        if let Some(off) = re
+            && guard.log_epoch != epoch
+        {
+            return format!("ERR log-replaced re={off}\n");
+        }
         if let Some(id) = guard
             .rows
             .iter()
-            .filter(|r| r.id > since && accepts(&r.kind) && re.is_none_or(|n| r.re == Some(n)))
+            .filter(|r| {
+                r.id > since
+                    && accepts(&r.kind)
+                    && re.is_none_or(|n| r.id > guard.log_floor && r.re == Some(n))
+            })
             .map(|r| r.id)
             .max()
         {
             return format!("OK inbox {id}\n");
         }
-        if watch_hold && guard.hold.is_some() != hold_at_arm {
-            return format!("OK inbox hold={}\n", u8::from(guard.hold.is_some()));
+        if watch_hold && guard.holds.is_held() != hold_at_arm {
+            return format!("OK inbox hold={}\n", u8::from(guard.holds.is_held()));
         }
         // Mail that came first is still answered; after it, the end.
         if guard.closed {
@@ -6005,47 +7369,7 @@ pub(crate) fn cmd_await_inbox(ctx: &SessionCtx, args: &[&str], timeout_ms: u64) 
 
 #[cfg(test)]
 mod topic_tests {
-    use super::{TopicEntry, is_topic, parse_topics, render_topics};
-
-    /// **THE TOPIC GRAMMAR IS ONE BOUNDED LOWERCASE SEGMENT, and the refusals
-    /// are the point.**
-    ///
-    /// A topic becomes the LAST SEGMENT of a subject and a `topic=` token on a
-    /// `deliver` line and on a `msg` row — three grammars, and the intersection
-    /// is narrow. `a/b` would invent a subject segment, `has space` a second
-    /// field on the row, `a*` a wildcard in a filter, and a leading `.` or `-`
-    /// a token that reads as a relative path or a flag. This asserts the
-    /// REFUSALS, not the acceptances: a widened predicate passes an
-    /// accept-only test unchanged.
-    #[test]
-    fn the_topic_grammar_refuses_everything_that_is_not_one_segment() {
-        for good in [
-            "say",
-            "build.failed",
-            "sat-comp",
-            "a",
-            "0",
-            "a_b",
-            &"z".repeat(32),
-        ] {
-            assert!(is_topic(good), "`{good}` is a topic");
-        }
-        for bad in [
-            "",
-            "Build",
-            ".dot",
-            "-lead",
-            "_lead",
-            "a/b",
-            "has space",
-            "a:b",
-            "a*",
-            "a>",
-            &"z".repeat(33),
-        ] {
-            assert!(!is_topic(bad), "`{bad}` must not be a topic");
-        }
-    }
+    use super::{TopicEntry, parse_topics, render_topics};
 
     /// **THE HANDOFF CARRY RE-VALIDATES EVERY ROW IT READS.**
     ///
@@ -6100,6 +7424,7 @@ mod inbox_hold {
 
     use super::*;
     use crate::session_store::{Store, new_store, test_handle};
+    use aterm_types::fabric_grammar::{PRINCIPAL_MAX, PRINCIPAL_NAME_MAX, VIA_MAX_HOPS};
 
     /// The instance bridge link is process-global (one bridge per instance), so
     /// every test that reads or moves it goes through [`with_link_reset`] and
@@ -6158,6 +7483,18 @@ mod inbox_hold {
         cmd_deliver(
             store,
             &format!("{sid} off={off} from={from} kind={kind} trust=agent text={text}"),
+        )
+    }
+
+    /// A broadcast delivery, as the bridge sends one to a subscribed session.
+    /// The session must hold `topic` ([`SessionFabric::topic_add`]), or the
+    /// endpoint refuses it `ERR not-subscribed`.
+    pub(super) fn broadcast(store: &Store, sid: &str, off: u64, topic: &str, text: &str) -> String {
+        cmd_deliver(
+            store,
+            &format!(
+                "{sid} off={off} from=s-peer@n-lab kind=note trust=agent topic={topic} text={text}"
+            ),
         )
     }
 
@@ -6333,7 +7670,7 @@ mod inbox_hold {
                 &store,
                 &format!("{sid} on reason=stop"),
                 HoldIssuer::Owner,
-                std::time::Duration::from_millis(50),
+                Some(std::time::Duration::from_millis(50)),
             ),
             HOLD_BUSY
         );
@@ -6345,7 +7682,7 @@ mod inbox_hold {
             std::thread::spawn(move || {
                 apply_hold(
                     &ctx,
-                    Some(Hold {
+                    HoldAct::Set(Hold {
                         reason: "fabric-lost".to_string(),
                         origin: "fleet".to_string(),
                     }),
@@ -6358,7 +7695,10 @@ mod inbox_hold {
         assert!(!waiter.is_finished(), "the sweep waits out the Commit");
         assert_eq!(ctx.fabric.hold(), None);
         ctx.fabric.lift_hold_fence();
-        assert_eq!(waiter.join().expect("the sweep"), Applied::Changed);
+        assert_eq!(
+            waiter.join().expect("the sweep"),
+            Applied::Changed { held: true }
+        );
         assert_eq!(
             ctx.fabric.hold().map(|hold| hold.origin),
             Some("fleet".to_string())
@@ -6375,43 +7715,44 @@ mod inbox_hold {
         let help = aterm_types::control_verbs::spec("hold")
             .expect("the hold verb")
             .help_line();
+        let store = new_store();
+        let (_, ctx) = registered(&store);
         assert!(
-            help.contains(&format!("past {} s", HOLD_FENCE_WAIT.as_secs())),
+            help.contains(&format!("past {} s", ctx.fabric.fence_wait().as_secs())),
             "{help}"
         );
         assert!(help.contains(HOLD_BUSY.trim_end()), "{help}");
     }
 
-    /// ONE PRINCIPAL GRAMMAR, AND IT IS §3.2's.
+    /// `post` AND `deliver` HOLD THEIR WORDS TO THE FABRIC'S ONE GRAMMAR.
     ///
-    /// §3.2 fixes it at a class prefix plus `[a-z0-9-]{1,32}`; `aterm-link`'s
-    /// `subject::is_principal` enforces 32 and exports `PRINCIPAL_MAX = 34` so
-    /// `body::VIA_MAX_BYTES` cannot drift from it; astream's `Grant::parse`
-    /// refuses anything outside the same grammar. This end admitted 1..=40 — a
-    /// third number for one field, in the direction that lets the endpoint BUILD
-    /// an outbound line its own bridge refuses, which is the split-bound shape
-    /// that produced this project's worst finding. `aterm-gui` does not depend on
-    /// `aterm-link`, so the pin is the boundary walked here rather than a
-    /// constant restated.
+    /// The grammar is `aterm_types::fabric_grammar`'s, walked at its edges
+    /// there. What is pinned here is that this endpoint APPLIES it at both
+    /// seams, because each is one field on both: the outbound `post` line the
+    /// endpoint WRITES and the inbound `deliver` line it READS. This end once
+    /// kept a spelling of its own that admitted a 40-byte principal name against
+    /// §3.2's 32 and an unbounded `via=` — lines its own bridge then refused.
     #[test]
-    fn the_principal_grammar_is_section_3_2s() {
-        assert_eq!(PRINCIPAL_NAME_MAX, 32, "§3.2, and `subject::NAME_MAX`");
+    fn post_and_deliver_hold_their_words_to_the_fabric_grammar() {
         let name = |n: usize| "a".repeat(n);
-        for class in ["s", "n", "h", "a"] {
-            assert!(valid_principal(&format!("{class}-{}", name(1))));
-            assert!(valid_principal(&format!(
-                "{class}-{}",
-                name(PRINCIPAL_NAME_MAX)
-            )));
-            assert!(
-                !valid_principal(&format!("{class}-{}", name(PRINCIPAL_NAME_MAX + 1))),
-                "{class}- with a 33-byte name parses here and is refused at the bridge"
-            );
-            assert!(!valid_principal(&format!("{class}-")));
-        }
-        assert!(!valid_principal("x-ok"), "only the four §3.2 classes");
-        assert!(!valid_principal("s-Upper"), "lowercase, digits and dashes");
-        // The `<owner>@<node>` form bounds BOTH halves by the same number.
+        let store = new_store();
+        let (sid, ctx) = registered(&store);
+
+        // A principal one byte past §3.2's name bound, as `to=` and as `from=`.
+        let long = format!("h-{}", name(PRINCIPAL_NAME_MAX + 1));
+        assert_eq!(
+            cmd_post(&ctx, &format!("to={long} kind=note hi"), None),
+            POST_USAGE
+        );
+        assert_eq!(
+            cmd_deliver(
+                &store,
+                &format!("{sid} off=1 from={long} kind=note trust=human text=x")
+            ),
+            DELIVER_USAGE
+        );
+        // The `<owner>@<node>` address — this endpoint's own wider form — bounds
+        // BOTH halves by the same number.
         assert!(valid_principal(&format!(
             "s-{}@n-{}",
             name(PRINCIPAL_NAME_MAX),
@@ -6422,73 +7763,10 @@ mod inbox_hold {
             name(PRINCIPAL_NAME_MAX),
             name(PRINCIPAL_NAME_MAX + 1)
         )));
-        // And it is the grammar `post to=` and `deliver from=` are held to.
-        let store = new_store();
-        let (sid, ctx) = registered(&store);
-        assert_eq!(
-            cmd_post(
-                &ctx,
-                &format!("to=h-{} kind=note hi", name(PRINCIPAL_NAME_MAX + 1)),
-                None
-            ),
-            POST_USAGE
-        );
-        assert_eq!(
-            cmd_deliver(
-                &store,
-                &format!(
-                    "{sid} off=1 from=h-{} kind=note trust=human text=x",
-                    name(PRINCIPAL_NAME_MAX + 1)
-                )
-            ),
-            DELIVER_USAGE
-        );
-    }
 
-    /// THE `via=` BOUND IS THE WIRE'S BOUND, ON BOTH SIDES OF IT.
-    ///
-    /// `aterm-link`'s `body::via_ok` refuses a chain past 16 hops or
-    /// `16 * (PRINCIPAL_MAX + 1)` bytes, every hop a BARE principal, and it is
-    /// applied on the WRITER of both lines — the bridge's `deliver` and the
-    /// mirror's `post`. The endpoint accepted `via=` as one unbounded
-    /// whitespace-free token whose only rule was "every comma element is a
-    /// principal", by a `valid_principal` that also admits `<owner>@<node>`. So
-    /// the endpoint could hold ~64 KiB of `via` per post that no outbox bound
-    /// counted, and could accept a chain shape its own bridge would refuse.
-    #[test]
-    fn the_via_bound_is_the_wires_bound() {
-        // The byte cap is COMPUTED from the hop cap and the principal grammar,
-        // exactly as `body::VIA_MAX_BYTES` is, so the two cannot drift.
-        assert_eq!(VIA_MAX_HOPS, 16);
-        assert_eq!(VIA_MAX_BYTES, VIA_MAX_HOPS * (2 + PRINCIPAL_NAME_MAX + 1));
-
-        let hop = format!("s-{}", "a".repeat(PRINCIPAL_NAME_MAX));
-        let full = vec![hop.clone(); VIA_MAX_HOPS].join(",");
-        assert_eq!(
-            full.len(),
-            VIA_MAX_BYTES - 1,
-            "the longest legal chain fits"
-        );
-        assert!(valid_via(&full));
-        assert!(
-            !valid_via(&vec![hop.as_str(); VIA_MAX_HOPS + 1].join(",")),
-            "seventeen hops"
-        );
-        assert!(
-            !valid_via(""),
-            "a relay claim naming no relay still demotes"
-        );
-        assert!(
-            !valid_via("s-a@n-b"),
-            "a hop is a BARE principal: `subject::is_principal` has no `@node` \
-             form, so the bridge refuses what this used to build"
-        );
-        assert!(valid_via("s-a,n-b,h-c"));
-
-        // BOTH SEAMS, because it is one field: the outbound `post` line the
-        // endpoint WRITES and the inbound `deliver` line it READS.
-        let store = new_store();
-        let (sid, ctx) = registered(&store);
+        // A chain one hop past the bound, and a hop in the address form: a
+        // `via=` hop is a BARE principal, and the bridge re-checks the line.
+        let hop = format!("s-{}", name(PRINCIPAL_NAME_MAX));
         let over = vec![hop.as_str(); VIA_MAX_HOPS + 1].join(",");
         assert_eq!(
             cmd_post(&ctx, &format!("to=@s-b kind=note via={over} x"), None),
@@ -6596,7 +7874,7 @@ mod inbox_hold {
         assert_eq!(inbox.posts.len(), 4, "the two padded ones never queued");
         for row in &inbox.posts {
             assert!(
-                row.to.len() <= 2 * (PRINCIPAL_CLASS_PREFIX_LEN + PRINCIPAL_NAME_MAX) + 2,
+                row.to.len() <= 2 * PRINCIPAL_MAX + 2,
                 "`to` is bounded by the principal grammar: {}",
                 row.to.len()
             );
@@ -6739,6 +8017,214 @@ mod inbox_hold {
         // A different offset is a different message.
         assert_eq!(deliver(&store, &sid, 90313, "h-a", "ask", "next"), "OK 2\n");
         assert_eq!(rows(&cmd_inbox(&ctx, "--peek")).len(), 2);
+    }
+
+    /// **A ROW THE RING HOLDS IS A DUPLICATE PAST THE DEDUP WINDOW, AND A
+    /// BROADCAST THE QUOTA REFUSED IS COUNTED ONCE.** A bridge that starts
+    /// rewinds each topic to the oldest broadcast its session has not handled
+    /// and walks it again (aterm-link's `Bridge::load_persisted_topics`) — on a
+    /// ring that, after a restart of the bridge alone, still holds those rows,
+    /// however many deliveries ago it took them. So a row the ring holds
+    /// answers the id it got even once [`DEDUP_CAP`] newer offsets have pushed
+    /// its offset out of the window, and a broadcast the quota refused answers
+    /// `OK 0` (taken once, held no more) instead of being refused and counted
+    /// again. NEGATIVE CONTROLS: an offset neither the ring nor the window
+    /// holds is a new row, and an ADDRESSED refusal is still re-judged — its
+    /// sender was told, and the addressed refill exists to offer it again.
+    ///
+    /// FAILS WITHOUT THE FIX: the old human row comes back as a second row,
+    /// and the re-offered refusal moves `dropped=` to 2.
+    #[test]
+    fn a_walk_again_neither_duplicates_a_held_row_nor_counts_a_refusal_twice() {
+        let store = new_store();
+        let (sid, ctx) = registered(&store);
+        assert_eq!(
+            ctx.fabric.topic_add("news", "head", &ctx.timeline),
+            Ok(true)
+        );
+        assert_eq!(deliver(&store, &sid, 1, "h-a", "task", "keep"), "OK 1\n");
+        // A person's row outlives every agent's in the ring ([`evict_for`]),
+        // so DEDUP_CAP agent rows from distinct peers (one quota each) push
+        // its offset out of the window while the ring keeps it.
+        let cap = u64::try_from(DEDUP_CAP).unwrap();
+        for i in 0..cap {
+            let from = format!("s-x@n-p{i}");
+            assert!(deliver(&store, &sid, 100 + i, &from, "note", "n").starts_with("OK "));
+        }
+        assert!(
+            !ctx.fabric.lock().dedup_set.contains(&1),
+            "the window forgot it"
+        );
+        assert_eq!(
+            deliver(&store, &sid, 1, "h-a", "task", "keep"),
+            "OK 1\n",
+            "the ring still holds it: the id it got, no second row"
+        );
+        assert_eq!(
+            ctx.fabric.lock().rows.iter().filter(|r| r.off == 1).count(),
+            1
+        );
+
+        // SENDER_QUOTA broadcasts from one peer, then one more: refused.
+        let fresh = new_store();
+        let (bsid, bctx) = registered(&fresh);
+        assert_eq!(
+            bctx.fabric.topic_add("news", "head", &bctx.timeline),
+            Ok(true)
+        );
+        let quota = u64::try_from(SENDER_QUOTA).unwrap();
+        for off in 0..quota {
+            assert!(broadcast(&fresh, &bsid, 5000 + off, "news", "b").starts_with("OK "));
+        }
+        let refused = 5000 + quota;
+        assert_eq!(
+            broadcast(&fresh, &bsid, refused, "news", "b"),
+            "ERR quota\n"
+        );
+        assert_eq!(bctx.fabric.lock().dropped, 1);
+        assert_eq!(
+            broadcast(&fresh, &bsid, refused, "news", "b"),
+            "OK 0\n",
+            "a walk again: taken once, held no more"
+        );
+        assert_eq!(bctx.fabric.lock().dropped, 1, "counted once");
+        assert_eq!(broadcast(&fresh, &bsid, 5000, "news", "b"), "OK 1\n");
+        assert_eq!(
+            broadcast(&fresh, &bsid, refused + 1, "news", "b"),
+            "ERR quota\n",
+            "an offset neither holds is judged as new"
+        );
+        // An addressed refusal is re-judged, as the addressed refill needs.
+        for off in 0..quota {
+            let reply = deliver(&fresh, &bsid, 9000 + off, "s-peer@n-far", "note", "a");
+            assert!(reply.starts_with("OK "), "{reply}");
+        }
+        let addressed = 9000 + quota;
+        for _ in 0..2 {
+            assert_eq!(
+                deliver(&fresh, &bsid, addressed, "s-peer@n-far", "note", "a"),
+                "ERR quota\n"
+            );
+        }
+        assert_eq!(
+            bctx.fabric.lock().dropped,
+            2,
+            "the second broadcast refusal"
+        );
+    }
+
+    /// **A BRIDGE SAYS IN ITS `hello` WHETHER IT REFILLS BROADCASTS, AND EACH
+    /// BROADCAST ROW CARRIES WHAT ITS DELIVERING BRIDGE SAID.** A seamless
+    /// update counts an unhandled broadcast as lost only when no bridge offers
+    /// it again ([`FabricCarry::broadcasts_refilled`]), and only the bridge
+    /// knows whether it will. NEGATIVE CONTROLS: before any `hello`, after a
+    /// `hello` with no `refill=`, and with a `refill=` that names only the
+    /// addressed lane, a broadcast row is not marked; an addressed row never is.
+    #[test]
+    fn a_broadcast_row_is_marked_refilled_only_under_a_bridge_that_said_so() {
+        with_link(|| {
+            let store = new_store();
+            let (sid, ctx) = registered(&store);
+            assert_eq!(
+                ctx.fabric.topic_add("news", "head", &ctx.timeline),
+                Ok(true)
+            );
+            let generation = next_bridge_generation();
+            attach_up(&store, generation);
+            let refill_of = |off: u64| {
+                ctx.fabric
+                    .lock()
+                    .rows
+                    .iter()
+                    .find(|r| r.off == off)
+                    .map(|r| r.refill)
+            };
+            assert!(broadcast(&store, &sid, 10, "news", "b").starts_with("OK "));
+            assert!(cmd_hello("lane=2 build=x", Some(generation)).starts_with("OK "));
+            assert!(broadcast(&store, &sid, 11, "news", "b").starts_with("OK "));
+            assert!(cmd_hello("lane=2 refill=in", Some(generation)).starts_with("OK "));
+            assert!(broadcast(&store, &sid, 12, "news", "b").starts_with("OK "));
+            assert!(cmd_hello("lane=2 refill=in,say,later", Some(generation)).starts_with("OK "));
+            assert!(broadcast(&store, &sid, 13, "news", "b").starts_with("OK "));
+            assert!(deliver(&store, &sid, 14, "h-a", "note", "a").starts_with("OK "));
+            assert_eq!(
+                [10, 11, 12, 13, 14].map(refill_of),
+                [
+                    Some(false),
+                    Some(false),
+                    Some(false),
+                    Some(true),
+                    Some(false)
+                ]
+            );
+            assert!(bridge_refills_broadcasts());
+            let stale = next_bridge_generation();
+            assert!(cmd_hello("lane=2", Some(stale)).starts_with("OK stale=1"));
+            assert!(
+                bridge_refills_broadcasts(),
+                "a ghost lane's hello is recorded nowhere"
+            );
+        });
+    }
+
+    /// **A BROADCAST REACHES ONLY A SESSION THAT HOLDS ITS TOPIC, AND A `drop`
+    /// TAKES EFFECT HERE THE MOMENT IT ANSWERS.** The endpoint holds the
+    /// opt-in set; the bridge's copy lags a drop (the rest of a catch-up page,
+    /// a session past the watch cap, a failed `topic ls`), so `deliver`
+    /// checks the set itself. A refusal is not a loss — the session said no —
+    /// so `dropped=` does not move, and the offset is not remembered: a later
+    /// `topic add since=@<off>` still replays it. NEGATIVE CONTROLS: the same
+    /// row is taken while the topic is held, a redelivery of a taken offset
+    /// still answers its id after the drop (the offset decides first), and an
+    /// addressed row is untouched by the set.
+    ///
+    /// FAILS WITHOUT THE FIX: the first and the post-drop broadcast both
+    /// answer `OK` and land in the ring.
+    #[test]
+    fn a_broadcast_on_a_topic_the_session_does_not_hold_is_refused() {
+        let store = new_store();
+        let (sid, ctx) = registered(&store);
+        assert_eq!(
+            broadcast(&store, &sid, 10, "news", "unasked"),
+            "ERR not-subscribed\n",
+            "an empty set receives nothing"
+        );
+        assert_eq!(
+            ctx.fabric.topic_add("news", "head", &ctx.timeline),
+            Ok(true)
+        );
+        assert_eq!(broadcast(&store, &sid, 11, "news", "wanted"), "OK 1\n");
+        assert_eq!(
+            broadcast(&store, &sid, 12, "other", "elsewhere"),
+            "ERR not-subscribed\n",
+            "one topic held is not every topic"
+        );
+        assert!(ctx.fabric.topic_drop("news", &ctx.timeline));
+        assert_eq!(
+            broadcast(&store, &sid, 13, "news", "after-the-drop"),
+            "ERR not-subscribed\n"
+        );
+        assert_eq!(
+            broadcast(&store, &sid, 11, "news", "wanted"),
+            "OK 1\n",
+            "a redelivered offset still answers the id it first got"
+        );
+        assert_eq!(
+            deliver(&store, &sid, 14, "h-a", "task", "addressed"),
+            "OK 2\n",
+            "the set gates broadcasts, not addressed mail"
+        );
+        let header = cmd_inbox(&ctx, "--peek");
+        assert!(
+            header.starts_with("OK 2 ") && header.contains(" dropped=0 "),
+            "the two taken rows and no loss counted for the refusals: {header}"
+        );
+        // The refused offset was never remembered: re-adding from it replays it.
+        assert_eq!(ctx.fabric.topic_add("news", "@13", &ctx.timeline), Ok(true));
+        assert_eq!(
+            broadcast(&store, &sid, 13, "news", "after-the-drop"),
+            "OK 3\n"
+        );
     }
 
     /// TWO WATERMARKS, and the difference is the whole ergonomics of the drain: a
@@ -7962,21 +9448,27 @@ mod inbox_hold {
         });
     }
 
-    /// THE FLEET HOLD STAYS THE BRIDGE'S. Owner scope is what every in-session
-    /// client already holds, so an Owner-issued act that could lift or replace a
-    /// fleet hold would be the "lift a fleet halt locally" the bridge-only gate
-    /// existed to prevent. So: `origin=fleet` from Owner is refused before any
-    /// session is named; `off` against a standing fleet hold is refused and the
-    /// hold stands; `on` against it is refused too (a replacement would be a
-    /// local hold the owner could then lift); and the bridge's own rule is what
-    /// it was — its `off` lifts whatever stands, a local hold included, because
-    /// the code never modelled "a fleet off for a fleet hold" and this change
-    /// does not invent it.
+    /// THE FLEET HOLD STAYS THE BRIDGE'S, AND THE OWNER'S STAYS THE OWNER'S.
+    /// Owner scope is what every in-session client already holds, so an
+    /// Owner-issued act that could lift or replace a fleet hold would be the
+    /// "lift a fleet halt locally" the bridge-only gate existed to prevent.
+    /// So: `origin=fleet` from Owner is refused before any session is named;
+    /// an Owner `off` that finds only a fleet hold is refused and the hold
+    /// stands; an Owner `on` beside it fills the owner's own slot and leaves
+    /// the fleet's as it was, and the owner's `off` then lifts its own and
+    /// nothing else. And the other way round: the bridge's acts move the slot
+    /// of the origin they name, so its fleet lift leaves the owner's local
+    /// hold standing and says so (`OK hold=1`), and its `on` stands beside one.
     #[test]
     fn an_owner_act_never_touches_a_fleet_hold() {
         with_link(|| {
             let store = new_store();
             let (sid, ctx) = registered(&store);
+            let hold = |reason: &str, origin: &str| Hold {
+                reason: reason.to_string(),
+                origin: origin.to_string(),
+            };
+            let standing = || ctx.fabric.holds().standing().collect::<Vec<_>>();
 
             // No hold standing: the fleet ORIGIN is still not the owner's to
             // claim, on or off.
@@ -7990,48 +9482,103 @@ mod inbox_hold {
             );
             assert!(halt_refusal(&ctx, "turn").is_none(), "nothing was applied");
 
-            let fleet = Some(Hold {
-                reason: "main%20broken".to_string(),
-                origin: "fleet".to_string(),
-            });
             assert_eq!(
                 bridge_hold(&store, &format!("{sid} on reason=main%20broken")),
                 "OK hold=1\n"
             );
-            assert_eq!(ctx.fabric.hold(), fleet);
+            let fleet = vec![hold("main%20broken", "fleet")];
+            assert_eq!(standing(), fleet);
             assert_eq!(owner_hold(&store, &format!("{sid} off")), HOLD_DENIED);
-            assert_eq!(ctx.fabric.hold(), fleet, "the fleet hold stands");
-            assert_eq!(
-                owner_hold(&store, &format!("{sid} on reason=mine")),
-                HOLD_DENIED
-            );
-            assert_eq!(ctx.fabric.hold(), fleet, "and was not replaced");
-            assert_eq!(
-                halt_refusal(&ctx, "turn").as_deref(),
-                Some("ERR halted reason=main%20broken origin=fleet\n")
-            );
-            // The one refusal `apply_hold` answers to the Owner, stated as itself.
-            assert_eq!(
-                apply_hold(&ctx, None, HoldIssuer::Owner, Some(HOLD_FENCE_WAIT)),
-                Applied::FleetHeld
-            );
-
-            // The bridge lifts it; then the owner's local hold; then the BRIDGE
-            // lifts that too — the rule the code had, kept.
-            assert_eq!(bridge_hold(&store, &format!("{sid} off")), "OK hold=0\n");
+            assert_eq!(standing(), fleet, "the fleet hold stands");
+            // The refusals `apply_hold` answers to the Owner, stated as
+            // themselves: an `off` with only the fleet's standing, and any act
+            // naming the fleet's slot.
+            for act in [
+                HoldAct::Lift("local"),
+                HoldAct::Lift("fleet"),
+                HoldAct::Set(hold("mine", "fleet")),
+            ] {
+                assert_eq!(
+                    apply_hold(
+                        &ctx,
+                        act.clone(),
+                        HoldIssuer::Owner,
+                        Some(ctx.fabric.fence_wait())
+                    ),
+                    Applied::FleetHeld,
+                    "{act:?}"
+                );
+            }
+            assert_eq!(standing(), fleet, "and nothing moved");
+            // An Owner `on` beside it is the owner's OWN slot: the fleet's
+            // stands, unreplaced, and is the one a refused verb names.
             assert_eq!(
                 owner_hold(&store, &format!("{sid} on reason=mine")),
                 "OK hold=1\n"
             );
             assert_eq!(
+                standing(),
+                [hold("main%20broken", "fleet"), hold("mine", "local")]
+            );
+            assert_eq!(
+                halt_refusal(&ctx, "turn").as_deref(),
+                Some("ERR halted reason=main%20broken origin=fleet\n")
+            );
+            // …and the owner's `off` lifts its own and nothing else: the
+            // session is still held, and the answer says so.
+            assert_eq!(owner_hold(&store, &format!("{sid} off")), "OK hold=1\n");
+            assert_eq!(standing(), fleet, "the fleet's halt stands");
+
+            // The bridge lifts it; then the owner's local hold, which the
+            // FLEET's lift — the default and the spelled-out one — leaves
+            // standing, and says so: it is the owner's stop, not the fleet's.
+            assert_eq!(bridge_hold(&store, &format!("{sid} off")), "OK hold=0\n");
+            assert_eq!(
+                owner_hold(&store, &format!("{sid} on reason=mine")),
+                "OK hold=1\n"
+            );
+            let local = vec![hold("mine", "local")];
+            let serial = ctx.fabric.hold_serial();
+            for lift in [format!("{sid} off"), format!("{sid} off origin=fleet")] {
+                assert_eq!(bridge_hold(&store, &lift), "OK hold=1\n", "{lift}");
+                assert_eq!(standing(), local, "{lift}");
+            }
+            assert_eq!(ctx.fabric.hold_serial(), serial, "nothing moved");
+            assert_eq!(
                 halt_refusal(&ctx, "turn").as_deref(),
                 Some("ERR halted reason=mine origin=local\n")
             );
-            assert_eq!(bridge_hold(&store, &format!("{sid} off")), "OK hold=0\n");
+            // A lift that names the local origin is that origin's; the owner's
+            // own `off` is the ordinary one.
+            assert_eq!(
+                bridge_hold(&store, &format!("{sid} off origin=local")),
+                "OK hold=0\n"
+            );
             assert!(halt_refusal(&ctx, "turn").is_none());
+            assert_eq!(
+                owner_hold(&store, &format!("{sid} on reason=mine")),
+                "OK hold=1\n"
+            );
+            assert_eq!(owner_hold(&store, &format!("{sid} off")), "OK hold=0\n");
+            assert!(halt_refusal(&ctx, "turn").is_none());
+            // And a local-origin lift leaves a FLEET hold standing.
+            assert_eq!(
+                bridge_hold(&store, &format!("{sid} on reason=stop")),
+                "OK hold=1\n"
+            );
+            assert_eq!(
+                bridge_hold(&store, &format!("{sid} off origin=local")),
+                "OK hold=1\n"
+            );
+            assert_eq!(
+                halt_refusal(&ctx, "turn").as_deref(),
+                Some("ERR halted reason=stop origin=fleet\n")
+            );
+            assert_eq!(bridge_hold(&store, &format!("{sid} off")), "OK hold=0\n");
 
-            // A bridge `on` over a standing LOCAL hold is a replacement, and the
-            // fleet hold then stands against the owner exactly as above.
+            // A bridge `on` over a standing LOCAL hold stands BESIDE it: the
+            // fleet's is the one named and the owner cannot lift it, and the
+            // fleet's lift leaves the owner's where it was.
             assert_eq!(
                 owner_hold(&store, &format!("{sid} on reason=mine")),
                 "OK hold=1\n"
@@ -8040,10 +9587,189 @@ mod inbox_hold {
                 bridge_hold(&store, &format!("{sid} on reason=fabric-lost")),
                 "OK hold=1\n"
             );
-            assert_eq!(owner_hold(&store, &format!("{sid} off")), HOLD_DENIED);
+            assert_eq!(
+                standing(),
+                [hold("fabric-lost", "fleet"), hold("mine", "local")]
+            );
             assert_eq!(
                 halt_refusal(&ctx, "turn").as_deref(),
                 Some("ERR halted reason=fabric-lost origin=fleet\n")
+            );
+            assert_eq!(bridge_hold(&store, &format!("{sid} off")), "OK hold=1\n");
+            assert_eq!(standing(), local);
+            assert_eq!(owner_hold(&store, &format!("{sid} off")), "OK hold=0\n");
+        });
+    }
+
+    /// The single-slot rule the endpoint kept until the two slots: an `on`
+    /// replaced whatever stood, and an `off` lifted what stood unless it was
+    /// of another origin. The NEGATIVE CONTROL for
+    /// [`a_fleet_lift_leaves_the_owners_stop_standing`]: the same acts,
+    /// replayed through this, end with the owner's stop gone.
+    fn single_slot(standing: Option<Hold>, act: &HoldAct<'_>) -> Option<Hold> {
+        match act {
+            HoldAct::Set(hold) => Some(hold.clone()),
+            HoldAct::Lift(origin) => standing.filter(|hold| hold.origin != *origin),
+            HoldAct::LiftAll => None,
+        }
+    }
+
+    /// **A FLEET HALT NEVER COSTS THE OWNER'S STOP.** The owner holds a
+    /// session (`origin=local`), the fleet halts it, the fleet lifts its halt
+    /// — and the session is STILL HELD, by the owner's hold, with the owner's
+    /// reason, on every surface: the dispatch gate, the `inbox` header,
+    /// `status`'s fabric leaf, and the last `hold` event a reader of the
+    /// timeline alone (`aterm fabric`, the bridge) reads. In between, both
+    /// stand, and the events say so (`hold_origin=fleet,local`).
+    ///
+    /// NEGATIVE CONTROL, on the old rule: the same three acts replayed through
+    /// the single slot ([`single_slot`]) end UNHELD — this sequence is exactly
+    /// the one that silently dropped the owner's stop.
+    #[test]
+    fn a_fleet_lift_leaves_the_owners_stop_standing() {
+        with_link(|| {
+            let store = new_store();
+            let (sid, ctx) = registered(&store);
+            let mine = Hold {
+                reason: "mine".to_string(),
+                origin: "local".to_string(),
+            };
+            let stop = Hold {
+                reason: "stop".to_string(),
+                origin: "fleet".to_string(),
+            };
+            let acts = [
+                HoldAct::Set(mine.clone()),
+                HoldAct::Set(stop.clone()),
+                HoldAct::Lift("fleet"),
+            ];
+            assert_eq!(
+                acts.iter().fold(None, single_slot),
+                None,
+                "NEGATIVE CONTROL: one slot loses the owner's stop to this sequence"
+            );
+
+            assert_eq!(
+                owner_hold(&store, &format!("{sid} on reason=mine")),
+                "OK hold=1\n"
+            );
+            assert_eq!(
+                bridge_hold(&store, &format!("{sid} on reason=stop")),
+                "OK hold=1\n"
+            );
+            assert_eq!(
+                ctx.fabric.holds().standing().collect::<Vec<_>>(),
+                [stop, mine.clone()],
+                "both stand"
+            );
+            assert_eq!(
+                ctx.fabric.holds().origins(),
+                "fleet,local",
+                "`hold_origin=` names both"
+            );
+            assert_eq!(
+                bridge_hold(&store, &format!("{sid} off")),
+                "OK hold=1\n",
+                "the fleet's lift answers that the session is still held"
+            );
+
+            assert_eq!(ctx.fabric.hold(), Some(mine), "the owner's stop stands");
+            assert_eq!(ctx.fabric.holds().origins(), "local");
+            assert_eq!(
+                halt_refusal(&ctx, "send").as_deref(),
+                Some("ERR halted reason=mine origin=local\n")
+            );
+            assert!(cmd_inbox(&ctx, "--peek").starts_with("OK 0 hold=1 "));
+            let events: Vec<String> = ctx
+                .timeline
+                .lock()
+                .unwrap()
+                .since(None)
+                .filter(|e| e.kind == "hold")
+                .map(|e| e.payload.clone())
+                .collect();
+            assert_eq!(
+                events,
+                [
+                    "1 reason=mine origin=local hold_origin=local",
+                    "1 reason=stop origin=fleet hold_origin=fleet,local",
+                    "1 reason=mine origin=local hold_origin=local",
+                ],
+                "every event says what stands after it"
+            );
+            // The owner lifts its own: free, and the event says the origin.
+            assert_eq!(owner_hold(&store, &format!("{sid} off")), "OK hold=0\n");
+            assert!(halt_refusal(&ctx, "send").is_none());
+            let last = ctx
+                .timeline
+                .lock()
+                .unwrap()
+                .since(None)
+                .rfind(|e| e.kind == "hold")
+                .map(|e| e.payload.clone());
+            assert_eq!(
+                last.as_deref(),
+                Some("0 reason=- origin=local hold_origin=-")
+            );
+        });
+    }
+
+    /// **THE BRIDGE-LOST SWEEP NEVER COSTS THE OWNER'S STOP EITHER**
+    /// (`[fabric] hold_on_bridge_lost = true`). The sweep fills the FLEET slot
+    /// of every session the bridge governed; a session the owner had held
+    /// keeps the owner's hold beside it, and the reconnecting bridge's lift —
+    /// `hold off origin=fleet`, which `apply_fleet_halts` writes to every
+    /// session it hosts — leaves it held, the owner's reason intact.
+    /// NEGATIVE CONTROL: the session beside it, with no hold of the owner's,
+    /// is freed by the same lift.
+    #[test]
+    fn a_reconnect_after_the_sweep_leaves_the_owners_stop_standing() {
+        with_link(|| {
+            set_hold_on_bridge_lost(true);
+            let store = new_store();
+            let (sid, ctx) = registered(&store);
+            let other = test_handle(2);
+            let (other_sid, other_ctx) = (other.sid.as_str().to_string(), other.ctx.clone());
+            store
+                .write()
+                .unwrap_or_else(|p| p.into_inner())
+                .register(other);
+            let generation = next_bridge_generation();
+            bridge_attached(generation);
+            // Both governed by the bridge; one held by its owner.
+            for s in [&sid, &other_sid] {
+                assert_eq!(bridge_hold(&store, &format!("{s} off")), "OK hold=0\n");
+            }
+            assert_eq!(
+                owner_hold(&store, &format!("{sid} on reason=mine")),
+                "OK hold=1\n"
+            );
+
+            assert_eq!(bridge_lost(&store, generation), 2, "two governed sessions");
+            assert_eq!(ctx.fabric.holds().origins(), "fleet,local");
+            assert_eq!(
+                halt_refusal(&ctx, "send").as_deref(),
+                Some("ERR halted reason=fabric-lost origin=fleet\n")
+            );
+            assert_eq!(other_ctx.fabric.holds().origins(), "fleet");
+
+            // The reconnect: a bridge that finds no fleet halt lifts the
+            // sweep's from every session it hosts.
+            let next = next_bridge_generation();
+            bridge_attached(next);
+            assert_eq!(bridge_hold(&store, &format!("{sid} off")), "OK hold=1\n");
+            assert_eq!(
+                bridge_hold(&store, &format!("{other_sid} off")),
+                "OK hold=0\n"
+            );
+            assert_eq!(
+                halt_refusal(&ctx, "send").as_deref(),
+                Some("ERR halted reason=mine origin=local\n"),
+                "the owner's stop survived the sweep and its lift"
+            );
+            assert!(
+                halt_refusal(&other_ctx, "send").is_none(),
+                "NEGATIVE CONTROL: the same lift frees a session with no hold of the owner's"
             );
         });
     }
@@ -8286,6 +10012,195 @@ mod inbox_hold {
                 "OK\n"
             );
             assert_eq!(poster.join().expect("the poster finished"), "OK 2 off=42\n");
+        });
+    }
+
+    /// **`inbox seen` REPORTS THE ADDRESSED LANE'S REFILL FLOOR, AND NO
+    /// BROADCAST EVER MOVES IT.** The bridge persists `floor - 1` and refills
+    /// the session's addressed lane from it when a seamless update keeps the
+    /// sid but not the ring, so the floor must never pass an addressed row the
+    /// agent has not handled, nor stay below one it has. Broadcasts share the
+    /// id counter but arrive on another subscription and through the topic
+    /// catch-up, so their ids are out of offset order with the addressed
+    /// lane's:
+    ///
+    /// * LOSS: a live broadcast at 1100 is numbered before an addressed task
+    ///   at 900 still in flight; acknowledging the broadcast must keep the
+    ///   floor at 900, not lift it to 1100 past the unhandled task.
+    /// * DUPLICATE: a catch-up broadcast at 1200 is numbered after a handled
+    ///   task at 2000; acknowledging it must put the floor past 2000, not at
+    ///   1201, which would offer the handled task again after the update.
+    ///
+    /// FAILS WITHOUT THE FIX: the event carried only the named row's `off=`
+    /// (1100 and 1200 here), which the bridge persisted as the floor.
+    #[test]
+    fn inbox_seen_reports_the_addressed_floor_and_no_broadcast_moves_it() {
+        let store = new_store();
+        let (sid, ctx) = registered(&store);
+        assert_eq!(ctx.fabric.topic_add("t", "head", &ctx.timeline), Ok(true));
+        let last_seen = || {
+            ctx.timeline
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .since(None)
+                .rfind(|e| e.kind == "inbox-seen")
+                .map(|e| e.payload.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(broadcast(&store, &sid, 1000, "t", "b0"), "OK 1\n");
+        assert_eq!(cmd_inbox_seen(&ctx, "1"), "OK seen=1\n");
+        assert_eq!(
+            last_seen(),
+            "1 off=1000 floor=- seen=1",
+            "no addressed row yet: no floor to say"
+        );
+
+        assert_eq!(broadcast(&store, &sid, 1100, "t", "b1"), "OK 2\n");
+        assert_eq!(deliver(&store, &sid, 900, "h-a", "task", "a1"), "OK 3\n");
+        assert_eq!(cmd_inbox_seen(&ctx, "2"), "OK seen=2\n");
+        assert_eq!(
+            last_seen(),
+            "2 off=1100 floor=900 seen=2",
+            "the unhandled task holds the floor below the broadcast's offset"
+        );
+        assert_eq!(cmd_inbox_seen(&ctx, "3 handled"), "OK seen=3\n");
+        assert_eq!(
+            last_seen(),
+            "3 off=900 floor=901 seen=3 verdict=handled kind=task from=h-a"
+        );
+
+        assert_eq!(deliver(&store, &sid, 2000, "h-a", "task", "a2"), "OK 4\n");
+        assert_eq!(broadcast(&store, &sid, 1200, "t", "b2"), "OK 5\n");
+        assert_eq!(cmd_inbox_seen(&ctx, "5"), "OK seen=5\n");
+        assert_eq!(
+            last_seen(),
+            "5 off=1200 floor=2001 seen=5",
+            "the handled task at 2000 is behind the floor, whatever the broadcast's offset"
+        );
+    }
+
+    /// **`inbox seen` WAKES ITS WATCHERS ONCE, AFTER ITS `inbox-seen` ROW AND
+    /// WITH THE FABRIC LOCK RELEASED; A FORM THAT RECORDS NOTHING NEVER
+    /// DOES.** The bridge persists the refill floor and drains a receipt on
+    /// that event, and the push lane is the only road it takes — the bridge
+    /// has no idle poll — so without the wake a `--wait-ack` sender waited
+    /// out the push loop's 250 ms tick. Woken before the row, the woken pass
+    /// would find nothing and the row would wait for the tick again; woken
+    /// under the lock, the registry's lock would nest inside the fabric's.
+    ///
+    /// FAILS WITHOUT THE FIX: the seam took no wake, and `seen` woke nobody.
+    #[test]
+    fn inbox_seen_wakes_its_watchers_after_its_row_and_a_refused_form_never() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let store = new_store();
+        let (sid, ctx) = registered(&store);
+        assert_eq!(
+            deliver(&store, &sid, 10, "h-andrew", "task", "one"),
+            "OK 1\n"
+        );
+        let wakes = AtomicUsize::new(0);
+        let wake = || {
+            assert!(
+                ctx.fabric.inbox.try_lock().is_ok(),
+                "woken with the fabric lock held"
+            );
+            let last = ctx
+                .timeline
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .since(None)
+                .next_back()
+                .map(|e| e.kind);
+            assert_eq!(
+                last,
+                Some("inbox-seen"),
+                "woken before the row it announces"
+            );
+            wakes.fetch_add(1, Ordering::SeqCst);
+        };
+        for (form, reply) in [
+            ("seen 9", "ERR no such message\n".to_string()),
+            ("seen x", INBOX_USAGE.to_string()),
+            ("seen 1 later", INBOX_USAGE.to_string()),
+            ("get 1", "OK 3\none".to_string()),
+            ("--peek", cmd_inbox(&ctx, "--peek")),
+        ] {
+            assert_eq!(cmd_inbox_verb(&ctx, form, &wake), reply, "{form}");
+        }
+        assert_eq!(
+            wakes.load(Ordering::SeqCst),
+            0,
+            "nothing recorded, nobody woken"
+        );
+        assert_eq!(cmd_inbox_verb(&ctx, "seen 1", &wake), "OK seen=1\n");
+        assert_eq!(
+            wakes.load(Ordering::SeqCst),
+            1,
+            "a bare seen moves the floor: one wake"
+        );
+        assert_eq!(cmd_inbox_verb(&ctx, "seen 1 handled", &wake), "OK seen=1\n");
+        assert_eq!(
+            wakes.load(Ordering::SeqCst),
+            2,
+            "a verdict owes a receipt: one wake"
+        );
+    }
+
+    /// **A PARKED `inbox get @<off>` WAKES ITS WATCHERS AFTER QUEUEING ITS
+    /// FETCH AND BEFORE IT PARKS; ONE ANSWERED FROM THE RING NEVER DOES.** The
+    /// `fetch` row is the bridge's prompt to read the bus; the call parks
+    /// until that read is answered, so a wake that came after the park would
+    /// come only after the very answer it was to start — here, after the
+    /// read's own 10 s bound, as `ERR timeout`. The test answers the read
+    /// only once the wake has arrived, from inside it the outbox already lists
+    /// the fetch, and the fabric lock is free.
+    ///
+    /// FAILS WITHOUT THE FIX: no wake arrives, and the hang detector fires
+    /// (or, with the wake after the park, the read answers `ERR timeout`).
+    #[test]
+    fn a_parked_fetch_wakes_its_watchers_before_it_parks_and_a_ring_read_never() {
+        with_link(|| {
+            let store = new_store();
+            let (sid, ctx) = registered(&store);
+            attach_up(&store, next_bridge_generation());
+            assert_eq!(
+                deliver(&store, &sid, 10, "h-andrew", "task", "one"),
+                "OK 1\n"
+            );
+            assert_eq!(
+                cmd_inbox_verb(&ctx, "get @10", &|| panic!("a ring read woke the bridge")),
+                "OK 3 off=10 from=h-andrew kind=task trust=agent\none"
+            );
+
+            let (woke, heard) = std::sync::mpsc::channel();
+            let reader = {
+                let (ctx, store, sid) = (ctx.clone(), store.clone(), sid.clone());
+                std::thread::spawn(move || {
+                    let probe = ctx.clone();
+                    cmd_inbox_verb(&ctx, "get @7", &move || {
+                        // The lock first: listing the outbox under it would
+                        // deadlock this thread rather than fail the test.
+                        let unlocked = probe.fabric.inbox.try_lock().is_ok();
+                        let queued = unlocked
+                            && cmd_outbox(&store, "").contains(&format!("fetch sid={sid} off=7\n"));
+                        let _ = woke.send((unlocked, queued));
+                    })
+                })
+            };
+            let (unlocked, queued) = heard
+                .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                .expect("a parked fetch woke its watchers");
+            assert!(unlocked, "woken with the fabric lock held");
+            assert!(queued, "woken before the fetch was on the outbox peek");
+            assert_eq!(
+                cmd_deliver(&store, &format!("{sid} fetched=7 err=no-record")),
+                "OK\n"
+            );
+            assert_eq!(
+                reader.join().expect("the reader finished"),
+                "ERR no such record off=7\n",
+                "the wake came before the park, so the park took the answer"
+            );
         });
     }
 
@@ -8532,11 +10447,14 @@ mod inbox_hold {
             // event already put on the digest, never a body.
             assert_eq!(
                 by("inbox-seen"),
-                "1 off=11 verdict=handled kind=task from=h-andrew"
+                "1 off=11 floor=12 seen=1 verdict=handled kind=task from=h-andrew"
             );
             assert_eq!(by("post"), "1 to=h-a kind=note");
             assert_eq!(by("post-landed"), "1 off=90");
-            assert_eq!(by("hold"), "1 reason=main%20broken origin=fleet");
+            assert_eq!(
+                by("hold"),
+                "1 reason=main%20broken origin=fleet hold_origin=fleet"
+            );
         });
     }
 
@@ -8573,11 +10491,13 @@ mod inbox_hold {
             assert_eq!(
                 seen,
                 [
-                    "2 off=11",
-                    "3 off=12 verdict=handled kind=note from=h-andrew",
-                    "3 off=12",
-                    "2 off=11 verdict=deferred kind=ask from=s-peer@n-lab",
-                    "2 off=11 verdict=handled kind=ask from=s-peer@n-lab",
+                    "2 off=11 floor=12 seen=2",
+                    "3 off=12 floor=13 seen=3 verdict=handled kind=note from=h-andrew",
+                    "3 off=12 floor=13 seen=3",
+                    // An older row acknowledged out of order: its own id and
+                    // offset, and the watermark where it was.
+                    "2 off=11 floor=13 seen=3 verdict=deferred kind=ask from=s-peer@n-lab",
+                    "2 off=11 floor=13 seen=3 verdict=handled kind=ask from=s-peer@n-lab",
                 ],
                 "one verdict per row per CHANGE; the bare form and a repeat carry none"
             );
@@ -9190,6 +11110,655 @@ mod inbox_hold {
                 reader.join().expect("the reader finished"),
                 "OK 6 off=5001 from=s-peer@n-lab kind=note trust=agent truncated=1 len=40\nprefix"
             );
+        });
+    }
+
+    /// **AFTER A LOG SWITCH THE REFILL FLOOR IS THE NEW LOG'S** (r2-01).
+    /// `inbox seen`'s `floor=` is what the bridge persists as the session's
+    /// refill watermark, so an earlier log's unhandled row must not set it:
+    /// its offset names another record here. On log A two rows land (7, 900)
+    /// and the first is handled; on log B one lands at 950. The floor is B's
+    /// row, not A's unhandled 900, and once B's row is handled it is one past
+    /// it. Negative control: counted with A's rows, the floor reads 900.
+    #[test]
+    fn after_a_log_switch_the_refill_floor_is_the_new_logs() {
+        with_link(|| {
+            let store = new_store();
+            let (sid, ctx) = registered(&store);
+            let generation = next_bridge_generation();
+            attach_up(&store, generation);
+            let tell = |ident: String| cmd_link(&store, &format!("log {ident}"), Some(generation));
+            let last_seen = || {
+                ctx.timeline
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .since(None)
+                    .rfind(|e| e.kind == "inbox-seen")
+                    .map(|e| e.payload.clone())
+                    .unwrap_or_default()
+            };
+            assert_eq!(tell(format!("{}.0", "aa".repeat(16))), "OK\n");
+            assert_eq!(deliver(&store, &sid, 7, "h-a", "note", "a0"), "OK 1\n");
+            assert_eq!(deliver(&store, &sid, 900, "h-a", "note", "a1"), "OK 2\n");
+            assert_eq!(cmd_inbox_seen(&ctx, "1"), "OK seen=1\n");
+            assert_eq!(last_seen(), "1 off=7 floor=900 seen=1");
+            assert_eq!(tell(format!("{}.0", "bb".repeat(16))), "OK forgot=1\n");
+            assert_eq!(deliver(&store, &sid, 950, "h-a", "note", "b0"), "OK 3\n");
+            assert_eq!(cmd_inbox_seen(&ctx, "1"), "OK seen=1\n");
+            assert_eq!(
+                last_seen(),
+                "1 off=7 floor=950 seen=1",
+                "A's unhandled row is no floor on B"
+            );
+            assert_eq!(cmd_inbox_seen(&ctx, "3"), "OK seen=3\n");
+            assert_eq!(last_seen(), "3 off=950 floor=951 seen=3");
+        });
+    }
+
+    /// **A NEW BUS LOG IS NOT DEDUPED INTO THE OLD ONE** (r2-01). astream gives
+    /// another log's records the same offsets, and the endpoint's `off=`
+    /// dedup, `inbox get @<off>` and `re=` threading key on bare offsets. Told
+    /// log A, a row lands at 7; a second delivery at 7 on A is the same record.
+    /// Told log B, every session forgets A's offsets (`OK forgot=1`): B's
+    /// record at 7 is a row of its own, `inbox get @7` answers B's, and a
+    /// read parked for A's offset fails rather than being answered from B.
+    /// The same identity again forgets nothing; a bridge that no longer owns
+    /// the link changes nothing; anything but an identity is a usage error.
+    /// Negative control: without the switch, B's record at 7 is answered with
+    /// A's row id and never appended.
+    #[test]
+    fn a_log_switch_forgets_every_offset_the_endpoint_holds() {
+        with_link(|| {
+            let store = new_store();
+            let (sid, ctx) = registered(&store);
+            let generation = next_bridge_generation();
+            attach_up(&store, generation);
+            let a = format!("{}.0", "aa".repeat(16));
+            let b = format!("{}.3", "bb".repeat(16));
+            let tell = |ident: &str| cmd_link(&store, &format!("log {ident}"), Some(generation));
+            assert_eq!(tell(&a), "OK\n", "the first log forgets nothing");
+            assert_eq!(
+                deliver(&store, &sid, 7, "s-peer@n-lab", "note", "on-a"),
+                "OK 1\n"
+            );
+            assert_eq!(
+                deliver(&store, &sid, 7, "s-peer@n-lab", "note", "on-a"),
+                "OK 1\n",
+                "on one log an offset is one record"
+            );
+            assert_eq!(tell(&a), "OK\n", "the same log again forgets nothing");
+            // A read of an A offset parked for the bridge.
+            let parked = {
+                let ctx = ctx.clone();
+                std::thread::spawn(move || cmd_inbox_get(&ctx, "@1000"))
+            };
+            let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+            while !cmd_outbox(&store, "").contains(&format!("fetch sid={sid} off=1000\n")) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the read never parked"
+                );
+                std::thread::yield_now();
+            }
+
+            assert_eq!(tell(&b), "OK forgot=1\n");
+            assert_eq!(
+                parked.join().expect("the reader finished"),
+                "ERR fetch failed reason=log-replaced off=1000\n"
+            );
+            assert_eq!(
+                deliver(&store, &sid, 7, "s-peer@n-lab", "note", "on-b"),
+                "OK 2\n",
+                "B's record at 7 is not A's"
+            );
+            assert_eq!(
+                cmd_inbox_get(&ctx, "@7"),
+                "OK 4 off=7 from=s-peer@n-lab kind=note trust=agent\non-b"
+            );
+            assert!(
+                cmd_inbox(&ctx, "0 --peek --meta").contains(" bus_head=7 oldest_on_bus=@7 "),
+                "the span is B's"
+            );
+
+            assert_eq!(cmd_link(&store, "log nope", Some(generation)), LINK_USAGE);
+            assert_eq!(
+                cmd_link(&store, &format!("log {a} extra"), Some(generation)),
+                LINK_USAGE
+            );
+            let stale = next_bridge_generation();
+            assert_eq!(
+                cmd_link(&store, &format!("log {a}"), Some(stale)),
+                "OK stale=1\n"
+            );
+            assert_eq!(
+                deliver(&store, &sid, 7, "s-peer@n-lab", "note", "on-b"),
+                "OK 2\n",
+                "a stale lane forgot nothing"
+            );
+        });
+    }
+
+    #[test]
+    fn log_switch_retires_old_receipt_debt_without_erasing_the_mail() {
+        with_link(|| {
+            let store = new_store();
+            let (sid, ctx) = registered(&store);
+            let generation = next_bridge_generation();
+            attach_up(&store, generation);
+            let tell = |hex: &str| {
+                cmd_link(
+                    &store,
+                    &format!("log {}.0", hex.repeat(32)),
+                    Some(generation),
+                )
+            };
+            assert_eq!(tell("a"), "OK\n");
+            assert_eq!(
+                deliver(&store, &sid, 7, "s-peer@n-lab", "ask", "old"),
+                "OK 1\n"
+            );
+            assert_eq!(cmd_inbox_seen(&ctx, "1 handled"), "OK seen=1\n");
+            assert!(cmd_outbox(&store, "").contains("receipt sid="));
+            assert_eq!(tell("b"), "OK forgot=1\n");
+            assert!(
+                !cmd_outbox(&store, "").contains("receipt sid="),
+                "A's receipt cannot acknowledge an unrelated record at that offset on B"
+            );
+            assert_eq!(
+                cmd_inbox_get(&ctx, "1"),
+                "OK 3\nold",
+                "historical mail remains readable"
+            );
+            assert_eq!(
+                ctx.fabric.lock().rows[0].decision.as_deref(),
+                Some("handled")
+            );
+            assert_eq!(
+                deliver(&store, &sid, 7, "s-peer@n-lab", "ask", "new"),
+                "OK 2\n"
+            );
+            assert_eq!(cmd_inbox_seen(&ctx, "2 handled"), "OK seen=2\n");
+            assert!(
+                cmd_outbox(&store, "")
+                    .contains(&format!("receipt sid={sid} rid=2 off=7 verdict=handled")),
+                "B's receipt remains owed"
+            );
+        });
+    }
+
+    #[test]
+    fn log_switch_a_later_historical_verdict_is_local() {
+        with_link(|| {
+            let store = new_store();
+            let (sid, ctx) = registered(&store);
+            let generation = next_bridge_generation();
+            attach_up(&store, generation);
+            let tell = |hex: &str| {
+                cmd_link(
+                    &store,
+                    &format!("log {}.0", hex.repeat(32)),
+                    Some(generation),
+                )
+            };
+            assert_eq!(tell("a"), "OK\n");
+            assert_eq!(
+                deliver(&store, &sid, 7, "s-peer@n-lab", "task", "old"),
+                "OK 1\n"
+            );
+            assert_eq!(tell("b"), "OK forgot=1\n");
+            assert_eq!(cmd_inbox_seen(&ctx, "1 handled"), "OK seen=1\n");
+            assert!(
+                !cmd_outbox(&store, "").contains("receipt sid="),
+                "deciding historical mail must not publish a receipt on the new log"
+            );
+            assert_eq!(
+                ctx.fabric.lock().rows[0].decision.as_deref(),
+                Some("handled")
+            );
+            assert_eq!(
+                deliver(&store, &sid, 8, "s-peer@n-lab", "task", "new"),
+                "OK 2\n"
+            );
+            assert_eq!(cmd_inbox_seen(&ctx, "2 handled"), "OK seen=2\n");
+            assert!(cmd_outbox(&store, "").contains("off=8 verdict=handled"));
+        });
+    }
+
+    #[test]
+    fn log_switch_receipt_waits_do_not_match_another_logs_offset() {
+        with_link(|| {
+            let store = new_store();
+            let (sid, ctx) = registered(&store);
+            let generation = next_bridge_generation();
+            attach_up(&store, generation);
+            let tell = |hex: &str| {
+                cmd_link(
+                    &store,
+                    &format!("log {}.0", hex.repeat(32)),
+                    Some(generation),
+                )
+            };
+            let ack = || {
+                cmd_deliver(
+                    &store,
+                    &format!(
+                        "{sid} off=20 from=s-peer@n-lab kind=ack trust=agent re=7 verdict=handled text=receipt"
+                    ),
+                )
+            };
+            assert_eq!(tell("a"), "OK\n");
+            assert_eq!(cmd_post(&ctx, "to=@s-peer kind=note old", None), "OK 1\n");
+            assert_eq!(cmd_outbox_sent(&store, &format!("{sid} 1 off=7")), "OK\n");
+            assert_eq!(ack(), "OK 1\n");
+            assert_eq!(
+                wait_receipt(&ctx, 1, 7, "", 0),
+                "OK 1 off=7 ack=handled msg=1\n",
+                "same-log receipt is valid"
+            );
+            assert_eq!(tell("b"), "OK forgot=1\n");
+            assert_eq!(cmd_post(&ctx, "to=@s-peer kind=note new", None), "OK 2\n");
+            assert_eq!(cmd_outbox_sent(&store, &format!("{sid} 2 off=7")), "OK\n");
+            assert_eq!(
+                wait_receipt(&ctx, 2, 7, "", 0),
+                "ERR timeout id=2 off=7\n",
+                "A's receipt cannot satisfy B's post"
+            );
+            assert_eq!(
+                cmd_await_inbox(&ctx, &["re=7"], 0),
+                "OK timeout\n",
+                "offset lookup is scoped to the current log too"
+            );
+            assert_eq!(ack(), "OK 2\n");
+            assert_eq!(
+                wait_receipt(&ctx, 2, 7, "", 0),
+                "OK 2 off=7 ack=handled msg=2\n"
+            );
+            assert_eq!(
+                wait_receipt(&ctx, 1, 7, "", 0),
+                "ERR log-replaced id=1 off=7\n",
+                "B's receipt cannot satisfy A's post"
+            );
+        });
+    }
+
+    #[test]
+    fn log_switch_keeps_a_queued_posts_new_log_thread() {
+        with_link(|| {
+            let store = new_store();
+            let (sid, ctx) = registered(&store);
+            let generation = next_bridge_generation();
+            attach_up(&store, generation);
+            let tell = |hex: &str| {
+                cmd_link(
+                    &store,
+                    &format!("log {}.0", hex.repeat(32)),
+                    Some(generation),
+                )
+            };
+            assert_eq!(tell("a"), "OK\n");
+            assert_eq!(
+                cmd_post(&ctx, "to=@s-peer kind=note queued", None),
+                "OK 1\n"
+            );
+            assert_eq!(tell("b"), "OK forgot=1\n");
+            assert!(
+                cmd_outbox(&store, "").contains("post sid="),
+                "an unlanded new message remains queued"
+            );
+            assert_eq!(cmd_outbox_sent(&store, &format!("{sid} 1 off=7")), "OK\n");
+            assert_eq!(
+                cmd_deliver(
+                    &store,
+                    &format!(
+                        "{sid} off=8 from=s-peer@n-lab kind=answer trust=agent re=7 text=reply"
+                    )
+                ),
+                "OK 1\n"
+            );
+            assert_eq!(
+                ctx.fabric.lock().rows.back().unwrap().re_id,
+                Some(1),
+                "the post landed on B even though it was queued while A was connected"
+            );
+        });
+    }
+
+    #[test]
+    fn log_switch_a_queued_reply_cannot_reuse_a_historical_reference() {
+        with_link(|| {
+            let store = new_store();
+            let (sid, ctx) = registered(&store);
+            let generation = next_bridge_generation();
+            attach_up(&store, generation);
+            let tell = |hex: &str| {
+                cmd_link(
+                    &store,
+                    &format!("log {}.0", hex.repeat(32)),
+                    Some(generation),
+                )
+            };
+            assert_eq!(tell("a"), "OK\n");
+            assert_eq!(
+                deliver(&store, &sid, 7, "s-peer@n-lab", "ask", "old"),
+                "OK 1\n"
+            );
+            assert_eq!(
+                cmd_post(&ctx, "to=@s-peer kind=answer re=7 queued-reply", None),
+                "OK 1\n"
+            );
+            assert_eq!(tell("b"), "OK forgot=1\n");
+            assert_eq!(
+                wait_landing(&ctx, 1, std::time::Instant::now()),
+                Err("ERR log-replaced id=1\n".to_string()),
+                "the queued reply is reported dead, not published as a reply to B's unrelated offset"
+            );
+            assert!(!cmd_outbox(&store, "").contains("post sid="));
+            assert_eq!(cmd_inbox_get(&ctx, "1"), "OK 3\nold");
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn log_switch_waits_for_the_commit_receipt_fence_and_retries() {
+        with_link(|| {
+            let store = new_store();
+            let (sid, ctx) = registered(&store);
+            let generation = next_bridge_generation();
+            attach_up(&store, generation);
+            let tell = |hex: &str| {
+                cmd_link(
+                    &store,
+                    &format!("log {}.0", hex.repeat(32)),
+                    Some(generation),
+                )
+            };
+            assert_eq!(tell("a"), "OK\n");
+            assert_eq!(
+                deliver(&store, &sid, 7, "s-peer@n-lab", "ask", "old"),
+                "OK 1\n"
+            );
+            assert_eq!(cmd_inbox_seen(&ctx, "1 handled"), "OK seen=1\n");
+            let before = ctx.fabric.carry_serial();
+            ctx.fabric.fence_hold(true);
+            assert_eq!(
+                tell("b"),
+                HOLD_BUSY,
+                "a committing successor still owns the carried receipt"
+            );
+            assert_eq!(
+                ctx.fabric.carry_serial(),
+                before,
+                "no carried state changed under the fence"
+            );
+            assert!(cmd_outbox(&store, "").contains("receipt sid="));
+            ctx.fabric.lift_hold_fence();
+            assert_eq!(
+                tell("b"),
+                "OK forgot=1\n",
+                "the same identity retries the unapplied switch"
+            );
+            assert!(!cmd_outbox(&store, "").contains("receipt sid="));
+            assert_eq!(tell("b"), "OK\n", "a completed switch is idempotent");
+        });
+    }
+
+    #[test]
+    fn log_switch_a_successors_first_attach_checks_the_carried_log() {
+        let carry = with_link(|| {
+            let store = new_store();
+            let (sid, ctx) = registered(&store);
+            let generation = next_bridge_generation();
+            attach_up(&store, generation);
+            assert_eq!(
+                cmd_link(
+                    &store,
+                    &format!("log {}.0", "a".repeat(32)),
+                    Some(generation)
+                ),
+                "OK\n"
+            );
+            assert_eq!(
+                deliver(&store, &sid, 7, "s-peer@n-lab", "ask", "old"),
+                "OK 1\n"
+            );
+            assert_eq!(cmd_inbox_seen(&ctx, "1 handled"), "OK seen=1\n");
+            assert_eq!(
+                cmd_post(&ctx, "to=@s-peer kind=answer re=7 reply", None),
+                "OK 1\n"
+            );
+            assert_eq!(
+                cmd_post(&ctx, "to=@s-peer kind=note independent", None),
+                "OK 2\n"
+            );
+            let mut budget = CARRY_MAIL_BYTES;
+            ctx.fabric.handoff_carry(&mut budget)
+        });
+        let wire = aterm_toml::to_string(&carry).expect("outgoing carry");
+        let legacy = wire
+            .lines()
+            .filter(|l| !l.starts_with("bus_log ="))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let invalid = format!("bus_log = \"not-an-identity\"\n{legacy}");
+        for (name, source, hex, switched) in [
+            ("same log", wire.as_str(), "a", false),
+            ("different log", wire.as_str(), "b", true),
+            ("legacy unknown log", legacy.as_str(), "a", true),
+            ("invalid carried log", invalid.as_str(), "a", true),
+        ] {
+            let carried: FabricCarry = aterm_toml::from_str(source).expect("incoming carry");
+            // The process-wide link starts fresh; the real outbound carry is
+            // seeded before that process's first bridge attaches.
+            with_link(|| {
+                let store = new_store();
+                let (_sid, ctx) = registered(&store);
+                ctx.fabric.seed_carry(&carried, &ctx.timeline);
+                let generation = next_bridge_generation();
+                attach_up(&store, generation);
+                assert_eq!(
+                    cmd_link(
+                        &store,
+                        &format!("log {}.0", hex.repeat(32)),
+                        Some(generation)
+                    ),
+                    if switched { "OK forgot=1\n" } else { "OK\n" },
+                    "{name}"
+                );
+                let outbox = cmd_outbox(&store, "");
+                assert_eq!(
+                    outbox.contains("receipt sid="),
+                    !switched,
+                    "{name}: {outbox}"
+                );
+                assert_eq!(outbox.contains("id=1 "), !switched, "{name}: {outbox}");
+                assert!(
+                    outbox.contains("id=2 ") && outbox.contains("independent"),
+                    "unreferenced carried mail stays queued ({name}): {outbox}"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn log_switch_a_late_fresh_session_keeps_same_log_receipts_and_dedup() {
+        with_link(|| {
+            let store = new_store();
+            registered(&store);
+            let generation = next_bridge_generation();
+            attach_up(&store, generation);
+            let tell = || {
+                cmd_link(
+                    &store,
+                    &format!("log {}.0", "a".repeat(32)),
+                    Some(generation),
+                )
+            };
+            assert_eq!(tell(), "OK\n");
+            let late = test_handle(2);
+            let sid = late.sid.as_str().to_string();
+            let ctx = late.ctx.clone();
+            register_on_log(&ctx, || {
+                store
+                    .write()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .register(late);
+            });
+            assert_eq!(
+                deliver(&store, &sid, 7, "s-peer@n-lab", "ask", "live"),
+                "OK 1\n"
+            );
+            assert_eq!(cmd_inbox_seen(&ctx, "1 handled"), "OK seen=1\n");
+            assert_eq!(
+                cmd_post(&ctx, "to=@s-peer kind=answer re=7 reply", None),
+                "OK 1\n"
+            );
+            assert_eq!(tell(), "OK\n", "reattaching to A keeps A's live references");
+            let outbox = cmd_outbox(&store, "");
+            assert!(outbox.contains("off=7 verdict=handled"), "{outbox}");
+            assert!(
+                outbox.contains("re=7") && outbox.contains("reply"),
+                "{outbox}"
+            );
+            assert_eq!(
+                deliver(&store, &sid, 7, "s-peer@n-lab", "ask", "live"),
+                "OK 1\n"
+            );
+            assert_eq!(
+                ctx.fabric.lock().rows.len(),
+                1,
+                "same-log replay is deduplicated"
+            );
+            assert_eq!(
+                cmd_inbox_get(&ctx, "@7"),
+                "OK 4 off=7 from=s-peer@n-lab kind=ask trust=agent\nlive"
+            );
+        });
+    }
+
+    #[test]
+    fn log_switch_a_late_adoption_checks_carry_before_its_first_outbox() {
+        let carry = with_link(|| {
+            let store = new_store();
+            let (sid, ctx) = registered(&store);
+            let generation = next_bridge_generation();
+            attach_up(&store, generation);
+            assert_eq!(
+                cmd_link(
+                    &store,
+                    &format!("log {}.0", "a".repeat(32)),
+                    Some(generation)
+                ),
+                "OK\n"
+            );
+            assert_eq!(
+                deliver(&store, &sid, 7, "s-peer@n-lab", "ask", "old"),
+                "OK 1\n"
+            );
+            assert_eq!(cmd_inbox_seen(&ctx, "1 handled"), "OK seen=1\n");
+            assert_eq!(
+                cmd_post(&ctx, "to=@s-peer kind=answer re=7 reply", None),
+                "OK 1\n"
+            );
+            assert_eq!(
+                cmd_post(&ctx, "to=@s-peer kind=note independent", None),
+                "OK 2\n"
+            );
+            ctx.fabric.handoff_carry(&mut CARRY_MAIL_BYTES.clone())
+        });
+        let wire = aterm_toml::to_string(&carry).expect("outgoing carry");
+        let legacy = wire
+            .lines()
+            .filter(|line| !line.starts_with("bus_log ="))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for (name, source, target, same) in [
+            ("same known log", wire.as_str(), "a", true),
+            ("replacement log", wire.as_str(), "b", false),
+            ("unknown legacy log", legacy.as_str(), "b", false),
+        ] {
+            with_link(|| {
+                let store = new_store();
+                registered(&store);
+                let generation = next_bridge_generation();
+                attach_up(&store, generation);
+                assert_eq!(
+                    cmd_link(
+                        &store,
+                        &format!("log {}.0", target.repeat(32)),
+                        Some(generation)
+                    ),
+                    "OK\n"
+                );
+                let late = test_handle(2);
+                let ctx = late.ctx.clone();
+                let incoming: FabricCarry = aterm_toml::from_str(source).expect("incoming carry");
+                ctx.fabric.seed_carry(&incoming, &ctx.timeline);
+                register_on_log(&ctx, || {
+                    store
+                        .write()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .register(late);
+                });
+                // No second `link log` runs before this first real drain.
+                let outbox = cmd_outbox(&store, "");
+                assert_eq!(outbox.contains("receipt sid="), same, "{name}: {outbox}");
+                assert_eq!(outbox.contains("re=7"), same, "{name}: {outbox}");
+                assert!(outbox.contains("independent"), "{name}: {outbox}");
+                assert_eq!(
+                    wait_landing(&ctx, 1, std::time::Instant::now()),
+                    if same {
+                        Err("ERR timeout id=1\n".to_string())
+                    } else {
+                        Err("ERR log-replaced id=1\n".to_string())
+                    },
+                    "{name}"
+                );
+            });
+        }
+    }
+
+    /// **A POST QUEUED ACROSS A LOG SWITCH LANDS ON THE NEW LOG, AND A REPLY TO
+    /// IT STILL THREADS** (r2-01). A post's offset is fixed when it LANDS, not
+    /// when it is queued: post 1 lands on log A at 70; post 2 is still queued
+    /// when the bridge says the log changed, and lands on the new one — at 70
+    /// too, since a new log numbers its records again. The new log's reply
+    /// `re=70` answers post 2 (`re-id=2`), never post 1, whose 70 named
+    /// another log's record. Negative control, run: marked by an id floor taken
+    /// at the switch, post 2 counts as an earlier log's and the reply carries
+    /// no `re-id=`.
+    #[test]
+    fn a_post_queued_across_a_log_switch_threads_its_reply_on_the_new_log() {
+        with_link(|| {
+            let store = new_store();
+            let (sid, ctx) = registered(&store);
+            let generation = next_bridge_generation();
+            attach_up(&store, generation);
+            let tell = |ident: String| cmd_link(&store, &format!("log {ident}"), Some(generation));
+            assert_eq!(tell(format!("{}.0", "aa".repeat(16))), "OK\n");
+            assert_eq!(cmd_post(&ctx, "to=@s-peer kind=note on a", None), "OK 1\n");
+            assert_eq!(
+                cmd_deliver(&store, &format!("{sid} landed=1 off=70")),
+                "OK\n"
+            );
+            assert_eq!(cmd_post(&ctx, "to=@s-peer kind=note on b", None), "OK 2\n");
+            assert_eq!(tell(format!("{}.1", "aa".repeat(16))), "OK forgot=1\n");
+            assert_eq!(
+                cmd_deliver(&store, &format!("{sid} landed=2 off=70")),
+                "OK\n"
+            );
+            assert_eq!(
+                cmd_deliver(
+                    &store,
+                    &format!("{sid} off=71 from=s-peer@n-lab kind=note re=70 trust=agent text=re")
+                ),
+                "OK 1\n"
+            );
+            let listing = cmd_inbox(&ctx, "--peek --meta");
+            let reply = listing
+                .lines()
+                .find(|l| l.contains(" re=70"))
+                .unwrap_or_else(|| panic!("no reply row: {listing}"));
+            assert!(reply.contains(" re=70 re-id=2 "), "{reply}");
         });
     }
 
@@ -9829,8 +12398,7 @@ mod inbox_hold {
     /// invisible to it FROM THE NEXT REPLY ON. (The reply that moves the watermark
     /// still counts correctly, because `pending` is computed before the move; it is
     /// every drain after it that lies, which is the worse shape — the agent's next
-    /// turn is told `pending=0` over mail it has never seen.) That number is also
-    /// what `hook run session-start` injects into a model's context.
+    /// turn is told `pending=0` over mail it has never seen.)
     ///
     /// So the second assertion below is the discriminating one.
     #[test]
@@ -10144,9 +12712,9 @@ mod inbox_hold {
     /// The bridge cuts a body that will not fit one control request line and names
     /// the true size in `len=`. `inbox get`'s help promised "the FULL body" and its
     /// reply carried no marker at all, so an agent that followed the documented
-    /// route — the route the hook banner prints — read three quarters of a report
-    /// as the whole of it. The rest is on the bus, which the recipient cannot
-    /// reach, so the answer has to SAY SO; it cannot fetch it.
+    /// route read three quarters of a report as the whole of it. The rest is on
+    /// the bus, which the recipient cannot reach, so the answer has to SAY SO; it
+    /// cannot fetch it.
     #[test]
     fn a_bridge_truncated_body_says_so_in_the_row_and_in_inbox_get() {
         let store = new_store();
@@ -10304,6 +12872,93 @@ mod inbox_hold {
         );
     }
 
+    /// ONE SESSION'S FULL QUEUE IS NOT EVERY DRAIN: the sessions are taken in
+    /// turn, so a later session's post is listed beside an earlier session's
+    /// queue that alone fills the byte budget — the queue a bridge holds while
+    /// the broker cannot take that session's head post now, and must not hold
+    /// any other session's mail behind. Per sender the order stays the queue's.
+    #[test]
+    fn a_full_queue_ahead_in_drain_order_does_not_hide_a_later_sessions_post() {
+        let store = new_store();
+        let body = vec![b'x'; BODY_MAX];
+        let (sid_a, ctx_a) = registered_as(&store, 1);
+        for _ in 0..(OUTBOX_BYTES_MAX / BODY_MAX) {
+            assert!(
+                cmd_post(&ctx_a, "to=@s-peer kind=note", Some(body.clone())).starts_with("OK "),
+                "A's queue takes its own {OUTBOX_BYTES_MAX} bytes"
+            );
+        }
+        let (sid_b, ctx_b) = registered_as(&store, 2);
+        assert_eq!(cmd_post(&ctx_b, "to=h-x kind=note from-b", None), "OK 1\n");
+        let (_, posts) = parse_outbox(&cmd_outbox(&store, ""));
+        assert!(
+            posts
+                .iter()
+                .any(|(line, body)| line.contains(&format!("sid={sid_b} ")) && body == "from-b"),
+            "B's post is listed although A's queue alone fills the budget"
+        );
+        let ids: Vec<u64> = posts
+            .iter()
+            .filter(|(line, _)| line.contains(&format!("sid={sid_a} ")))
+            .map(|(line, _)| {
+                line.split_whitespace()
+                    .find_map(|t| t.strip_prefix("id="))
+                    .and_then(|n| n.parse().ok())
+                    .expect("id=")
+            })
+            .collect();
+        assert!(!ids.is_empty(), "A's head post is listed too");
+        assert!(
+            ids.windows(2).all(|w| w[1] == w[0] + 1) && ids[0] == 1,
+            "A's posts in its own queue order, from its head: {ids:?}"
+        );
+    }
+
+    /// The heads of several refused senders can fill a whole drain too.
+    /// Keep every post queued, as a transient broker refusal does: another
+    /// drain must expose the later sender without retiring anyone else's head.
+    #[test]
+    fn repeated_outbox_peeks_do_not_starve_a_session_past_the_byte_budget() {
+        let store = new_store();
+        let body = vec![b'x'; BODY_MAX];
+        let mut queued = Vec::new();
+        for local in 1..=16 {
+            let (sid, ctx) = registered_as(&store, local);
+            assert_eq!(
+                cmd_post(&ctx, "to=h-x kind=note", Some(body.clone())),
+                "OK 1\n"
+            );
+            queued.push((sid, ctx));
+        }
+        let (last, ctx) = registered_as(&store, 17);
+        assert_eq!(cmd_post(&ctx, "to=h-x kind=note allowed", None), "OK 1\n");
+        queued.push((last.clone(), ctx));
+
+        let mut exposed = BTreeSet::new();
+        for _ in 0..2 {
+            let drain = cmd_outbox(&store, "");
+            assert!(drain.len() <= OUTBOX_DRAIN_BYTES_MAX + BODY_MAX + 4096);
+            let (_, posts) = parse_outbox(&drain);
+            for (line, _) in posts {
+                let sid = line
+                    .split_whitespace()
+                    .find_map(|word| word.strip_prefix("sid="))
+                    .expect("post sid=");
+                exposed.insert(sid.to_string());
+            }
+        }
+        assert!(
+            exposed.contains(&last.to_string()) && exposed.len() == queued.len(),
+            "every sender is exposed although the earlier heads stay queued: {exposed:?}"
+        );
+        for (_, ctx) in queued {
+            let inbox = ctx.fabric.lock();
+            assert_eq!(inbox.posts.len(), 1, "a peek retires no post");
+            assert_eq!(inbox.posts[0].id, 1);
+            assert!(inbox.posts[0].off.is_none() && !inbox.posts[0].dead);
+        }
+    }
+
     /// THE HALT SET IS DERIVED FROM THE VERB TABLE — the test
     /// [`super::is_pty_reaching`]'s doc cites, carrying the name it cites, beside
     /// the set it derives.
@@ -10388,6 +13043,12 @@ mod inbox_hold {
                  mail is not moving under the halt",
             ),
             (
+                "hello",
+                "the bridge naming its lane grammar and build; it puts no bytes on a PTY \
+                 and reaches no session, and refusing it under a halt would leave the \
+                 instance unable to say which bridge is serving it",
+            ),
+            (
                 "outbox sent",
                 "retires an outbound post the bridge already published; refusing it \
                  would strand the body and re-publish it forever",
@@ -10407,6 +13068,26 @@ mod inbox_hold {
                  no bytes on a PTY and retires no session",
             ),
             ("rain", "a visual effect on the window"),
+            (
+                "theme preview",
+                "draws another theme's colours for a while (`revert` ends it): a LOOK, \
+                 the class of `rain`. It puts no bytes on a PTY, retires no session, \
+                 and a program's own colour sets survive it",
+            ),
+            (
+                "theme set",
+                "writes `theme` to `aterm.toml` through the `settings set` lane, the \
+                 exemption `settings` has: no bytes on a PTY, no session retired",
+            ),
+            (
+                "appearance",
+                "reads which OS light/dark appearance the theme follows. Its one \
+                 write form exists only in a development build (`dev-seams`), \
+                 where it stands in for a desktop light/dark flip, which a halt \
+                 does not stop either: it types nothing, retires no session, and \
+                 what it can put on a PTY is the advisory `CSI ? 997 ; Ps n` that \
+                 same OS flip sends a mode-2031 subscriber",
+            ),
             (
                 "kitty",
                 "chooses which collected cat rides the cursor. It puts no bytes on \
@@ -10445,6 +13126,18 @@ mod inbox_hold {
                  grid); it puts no bytes on a PTY and retires no session, it is \
                  Owner-only at the socket besides, and a held worker's window is \
                  exactly the one whose story (`exit`, `timeout`) must still arrive",
+            ),
+            (
+                "devtools",
+                "asks the window to bring the owner to System Settings' Developer \
+                 Tools list, or to show aterm's panel beside it (chrome and \
+                 another app, not the grid): it puts no bytes on a PTY, retires no \
+                 session, never puts aterm on the list or turns a switch on there \
+                 (only the owner does, with their password; an empty list gains \
+                 Terminal, switched off, so the page appears), the window holds it \
+                 to its own hand-over's rules, and it is Owner-only at the socket \
+                 besides — the class of `raise`, which moves the human's focus \
+                 too",
             ),
             (
                 "spawn",
@@ -10734,7 +13427,7 @@ mod handoff_carry {
     use super::*;
     use crate::session_store::{SessionHandoff, Store, new_store, test_handle};
 
-    use super::inbox_hold::{deliver, registered_as as registered};
+    use super::inbox_hold::{broadcast, deliver, registered_as as registered};
     use super::with_link_reset as with_link;
 
     /// The outgoing store drawn into a manifest and read back as the
@@ -10753,13 +13446,229 @@ mod handoff_carry {
                 &h.ctx.fabric,
                 &h.ctx.timeline,
                 &rec.topics,
-                rec.hold.as_deref(),
+                &rec.hold_rows(),
                 &rec.fabric,
             );
             adopted.push((h.sid.as_str().to_string(), h.ctx.clone()));
             successor.write().unwrap().register(h);
         }
         (successor, adopted)
+    }
+
+    /// **`dropped=` SURVIVES A SEAMLESS UPDATE, AND THE UNREAD BROADCASTS THE
+    /// UPDATE DROPS ARE COUNTED IN IT AND LOGGED.** The ring is not carried,
+    /// and under a bridge that does not refill broadcasts (no `hello`, as
+    /// here) every broadcast a session held unhandled at the draw is gone from
+    /// the successor's inbox; the counter is monotone so that a loss is
+    /// visible to the next drain, and the successor used to start it at 0 —
+    /// erasing the update's own loss and every drop counted before it.
+    /// NEGATIVE CONTROLS: a session that handled its broadcasts before the
+    /// draw keeps only its earlier drops, and an unhandled ADDRESSED row
+    /// (refilled from the floor) is never counted. The refilling bridge's
+    /// case is the next test.
+    ///
+    /// FAILS WITHOUT THE FIX: both successors report `dropped=0`.
+    #[test]
+    fn a_seamless_update_keeps_dropped_and_counts_the_unread_broadcasts_it_drops() {
+        crate::test_log::install();
+        with_link(|| {
+            let store = new_store();
+            let (sid, ctx) = registered(&store, 1);
+            let (bsid, bctx) = registered(&store, 2);
+            for (s, c) in [(&sid, &ctx), (&bsid, &bctx)] {
+                assert_eq!(c.fabric.topic_add("news", "head", &c.timeline), Ok(true));
+                c.fabric.lock().dropped = 2;
+                for off in 10..13 {
+                    assert!(broadcast(&store, s, off, "news", "b").starts_with("OK "));
+                }
+                assert_eq!(
+                    deliver(&store, s, 20, "h-andrew", "task", "t"),
+                    "OK 4\n",
+                    "an addressed row is refilled, so it is not counted"
+                );
+            }
+            // Session 2 handled all three broadcasts before the draw; session 1
+            // handled none of them.
+            assert_eq!(cmd_inbox_seen(&bctx, "3"), "OK seen=3\n");
+
+            let (_successor, adopted) = hand_over(&store);
+            let header = |c: &SessionCtx| {
+                cmd_inbox(c, "--peek")
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            let (_, unread) = &adopted[0];
+            let (_, handled) = &adopted[1];
+            assert!(
+                header(unread).contains(" dropped=5 "),
+                "the two drops counted before the update, and the three unread \
+                 broadcasts it could not carry: {}",
+                header(unread)
+            );
+            assert!(
+                header(handled).contains(" dropped=2 "),
+                "handled broadcasts are not lost, and the earlier drops are kept: {}",
+                header(handled)
+            );
+            let said = crate::test_log::containing(
+                "3 broadcast(s) this session had not handled when the update was drawn",
+            );
+            assert!(
+                said.iter().any(|n| n.level == aterm_log::Level::Warn),
+                "the successor says what the update dropped: {said:?}"
+            );
+        });
+    }
+
+    /// **A BROADCAST ITS BRIDGE OFFERS AGAIN IS NOT COUNTED LOST.** Under a
+    /// bridge that said `refill=…say`, the successor's bridge rewinds each
+    /// topic to its oldest unhandled broadcast and offers it again, so
+    /// counting it in `dropped=` as well would report a loss that did not
+    /// happen. The carry says both numbers, so a successor from before the
+    /// refill (whose own bridge refills nothing) still counts every one.
+    /// NEGATIVE CONTROLS, each counted: a row a bridge from before the key
+    /// delivered (its floor was never written), and a row on a topic the
+    /// session dropped before the draw (a successor refuses it
+    /// `ERR not-subscribed`). A carry from an older aterm, with no
+    /// `broadcasts_refilled`, counts all of them.
+    ///
+    /// FAILS WITHOUT THE FIX: the successor reports `dropped=6`, every unread
+    /// broadcast counted though four come back.
+    #[test]
+    fn a_seamless_update_does_not_count_the_broadcasts_its_bridge_offers_again() {
+        crate::test_log::install();
+        with_link(|| {
+            let store = new_store();
+            let (sid, ctx) = registered(&store, 1);
+            for t in ["news", "gone"] {
+                assert_eq!(ctx.fabric.topic_add(t, "head", &ctx.timeline), Ok(true));
+            }
+            ctx.fabric.lock().dropped = 2;
+            // Delivered by a bridge from before `refill=`.
+            assert_eq!(broadcast(&store, &sid, 10, "news", "b"), "OK 1\n");
+            let generation = next_bridge_generation();
+            bridge_attached(generation);
+            assert!(cmd_hello("lane=2 refill=in,say", Some(generation)).starts_with("OK "));
+            for off in 11..15 {
+                assert!(broadcast(&store, &sid, off, "news", "b").starts_with("OK "));
+            }
+            assert_eq!(broadcast(&store, &sid, 15, "gone", "b"), "OK 6\n");
+            assert!(ctx.fabric.topic_drop("gone", &ctx.timeline));
+
+            let mut budget = CARRY_MAIL_BYTES;
+            let carry = ctx.fabric.handoff_carry(&mut budget);
+            assert_eq!(
+                (carry.broadcasts_uncarried, carry.broadcasts_refilled),
+                (6, 4)
+            );
+
+            let (_successor, adopted) = hand_over(&store);
+            let (_, kept) = &adopted[0];
+            let header = cmd_inbox(kept, "--peek")
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            assert!(
+                header.contains(" dropped=4 "),
+                "the two earlier drops and the two no bridge offers again: {header}"
+            );
+            assert!(
+                crate::test_log::containing("2 broadcast(s) this session had not handled")
+                    .iter()
+                    .any(|n| n.level == aterm_log::Level::Warn),
+                "the loss is said"
+            );
+            assert!(
+                !crate::test_log::containing("are offered again by its bridge").is_empty(),
+                "and so is what comes back"
+            );
+
+            // An older aterm's carry: no `broadcasts_refilled`.
+            let older = FabricCarry {
+                broadcasts_refilled: 0,
+                ..carry
+            };
+            let fresh = new_store();
+            let (_, old_ctx) = registered(&fresh, 9);
+            old_ctx.fabric.seed_carry(&older, &old_ctx.timeline);
+            assert_eq!(old_ctx.fabric.lock().dropped, 2 + 6);
+        });
+    }
+
+    /// **A BROADCAST ITS REFILLING BRIDGE HAS LET GO OF IS COUNTED LOST.** Two
+    /// ways that bridge stops holding the refill floor of a row this ring
+    /// still holds unhandled, and no successor is offered it: a `topic drop`
+    /// takes the topic's floor with it (aterm-link's
+    /// `Bridge::forget_unhandled_topic`) — and a `topic add` of the same name
+    /// resumes from a new cursor, so the topic being held again at the draw
+    /// says nothing about the old rows; and the bridge remembers a session's
+    /// newest [`RING_CAP`] unhandled broadcasts only (`UNHANDLED_KEEP`), so a
+    /// person's broadcast the ring keeps ahead of that many newer agent ones
+    /// (evicting those instead) is gone from the floor. Each is counted in
+    /// `dropped=`, not carried. NEGATIVE CONTROLS: the broadcast taken after
+    /// the re-add is carried, and the person's is carried while fewer than
+    /// [`RING_CAP`] rows came after it — the bridge still holds it then.
+    ///
+    /// FAILS WITHOUT THE FIX: both are counted as offered again, so the
+    /// successor's `dropped=` misses them.
+    #[test]
+    fn a_broadcast_its_refilling_bridge_let_go_of_is_counted_lost() {
+        with_link(|| {
+            let store = new_store();
+            let (sid, ctx) = registered(&store, 1);
+            let (psid, pctx) = registered(&store, 2);
+            let generation = next_bridge_generation();
+            bridge_attached(generation);
+            assert!(cmd_hello("lane=2 refill=in,say", Some(generation)).starts_with("OK "));
+            let carried = |c: &SessionCtx| {
+                let mut budget = CARRY_MAIL_BYTES;
+                let carry = c.fabric.handoff_carry(&mut budget);
+                (carry.broadcasts_uncarried, carry.broadcasts_refilled)
+            };
+
+            // DROPPED AND ADDED AGAIN, through the verb.
+            assert!(cmd_topic(&ctx, "add news").0.contains("added=1"));
+            assert_eq!(broadcast(&store, &sid, 10, "news", "b"), "OK 1\n");
+            assert!(cmd_topic(&ctx, "drop news").0.contains("dropped=1"));
+            assert!(cmd_topic(&ctx, "add news").0.contains("added=1"));
+            assert_eq!(broadcast(&store, &sid, 11, "news", "b"), "OK 2\n");
+            assert_eq!(carried(&ctx), (2, 1), "only the row taken since the add");
+
+            // A PERSON'S BROADCAST, then agents' from distinct peers (one
+            // quota each): the ring evicts the agents' first.
+            assert!(cmd_topic(&pctx, "add news").0.contains("added=1"));
+            let shout = |off: u64, from: &str| {
+                cmd_deliver(
+                    &store,
+                    &format!(
+                        "{psid} off={off} from={from} kind=note trust=agent topic=news text=b"
+                    ),
+                )
+            };
+            assert_eq!(shout(20, "h-andrew"), "OK 1\n");
+            let cap = u64::try_from(RING_CAP).unwrap();
+            for i in 1..cap {
+                assert!(shout(100 + i, &format!("s-x@n-p{i}")).starts_with("OK "));
+            }
+            assert_eq!(
+                carried(&pctx),
+                (cap, cap),
+                "fewer than the bound came after it"
+            );
+            assert!(shout(100 + cap, &format!("s-x@n-p{cap}")).starts_with("OK "));
+            assert!(
+                pctx.fabric.lock().rows.iter().any(|r| r.id == 1),
+                "the ring keeps the person's row"
+            );
+            assert_eq!(
+                carried(&pctx),
+                (cap, cap - 1),
+                "the bridge's bound let it go: counted lost"
+            );
+        });
     }
 
     /// FINDING 6: a post still queued and a receipt still owed at the park are
@@ -10778,6 +13687,16 @@ mod handoff_carry {
         with_link(|| {
             let store = new_store();
             let (sid, ctx) = registered(&store, 1);
+            let generation = next_bridge_generation();
+            bridge_attached(generation);
+            assert_eq!(
+                cmd_link(
+                    &store,
+                    &format!("log {}.0", "aa".repeat(16)),
+                    Some(generation)
+                ),
+                "OK\n"
+            );
             assert_eq!(
                 deliver(&store, &sid, 10, "s-peer@n-lab", "ask", "one"),
                 "OK 1\n"
@@ -10846,6 +13765,117 @@ mod handoff_carry {
         });
     }
 
+    /// **A RECEIPT FOR A ROW OF AN EARLIER LOG IS LISTED AS ONE, AND STAYS
+    /// ONE ACROSS AN UPDATE** (r2-01's residual). Told log A, two asks land at
+    /// 10 and 11 and the first is decided. Told log B, both of A's rows'
+    /// receipts — the one owed at the switch and the one a verdict on A's
+    /// second row owes after it — are listed `log=earlier`, which the bridge
+    /// retires rather than put `re=` on B; an ask B delivers at A's offset 10
+    /// owes a plain receipt. The successor lists each as the old process did.
+    /// Negative control, run: without the mark all three are listed as B's.
+    #[test]
+    fn a_receipt_for_a_row_of_an_earlier_log_is_listed_as_one_across_an_update() {
+        with_link(|| {
+            let store = new_store();
+            let (sid, ctx) = registered(&store, 1);
+            let generation = next_bridge_generation();
+            bridge_attached(generation);
+            let tell = |ident: String| cmd_link(&store, &format!("log {ident}"), Some(generation));
+            assert_eq!(tell(format!("{}.0", "aa".repeat(16))), "OK\n");
+            for (off, text, row) in [(10, "a0", "OK 1\n"), (11, "a1", "OK 2\n")] {
+                assert_eq!(deliver(&store, &sid, off, "s-peer@n-lab", "ask", text), row);
+            }
+            assert_eq!(cmd_inbox_seen(&ctx, "1 handled"), "OK seen=1\n");
+            assert_eq!(tell(format!("{}.0", "bb".repeat(16))), "OK forgot=1\n");
+            assert_eq!(cmd_inbox_seen(&ctx, "2 deferred"), "OK seen=2\n");
+            assert_eq!(
+                deliver(&store, &sid, 10, "s-peer@n-lab", "ask", "b0"),
+                "OK 3\n"
+            );
+            assert_eq!(cmd_inbox_seen(&ctx, "3 handled"), "OK seen=3\n");
+            let receipts = |store: &Store| -> Vec<String> {
+                cmd_outbox(store, "earlier-receipts=1")
+                    .lines()
+                    .filter(|l| l.starts_with("receipt "))
+                    .map(str::to_string)
+                    .collect()
+            };
+            let want = |sid: &str| {
+                [
+                    format!(
+                        "receipt sid={sid} rid=1 off=10 verdict=handled kind=ask \
+                         from=s-peer@n-lab log=earlier"
+                    ),
+                    format!(
+                        "receipt sid={sid} rid=2 off=11 verdict=deferred kind=ask \
+                         from=s-peer@n-lab log=earlier"
+                    ),
+                    format!(
+                        "receipt sid={sid} rid=3 off=10 verdict=handled kind=ask from=s-peer@n-lab"
+                    ),
+                ]
+            };
+            assert_eq!(receipts(&store), want(&sid));
+            let legacy_drain = cmd_outbox(&store, "");
+            assert!(!legacy_drain.contains("rid=1 "), "{legacy_drain}");
+            assert!(!legacy_drain.contains("rid=2 "), "{legacy_drain}");
+            assert!(legacy_drain.contains("rid=3 "), "{legacy_drain}");
+
+            let carry = ctx.fabric.handoff_carry(&mut CARRY_MAIL_BYTES.clone());
+            assert_eq!((carry.receipts.len(), carry.earlier_receipts.len()), (1, 2));
+            #[derive(serde::Deserialize)]
+            struct LegacyCarry {
+                #[serde(default)]
+                receipts: Vec<ReceiptCarry>,
+            }
+            let wire = aterm_toml::to_string(&carry).expect("outgoing carry");
+            let legacy: LegacyCarry = aterm_toml::from_str(&wire).expect("older reader");
+            assert_eq!(
+                legacy.receipts.len(),
+                1,
+                "old receipts cannot lose their provenance"
+            );
+            assert_eq!(legacy.receipts[0].rid, 3);
+            // Both lists spend one shared budget, and both are counted on shed.
+            let mut budget = carry.receipts[0].cost();
+            let mut limited = ctx.fabric.handoff_carry(&mut budget);
+            assert_eq!(limited.receipts.len() + limited.earlier_receipts.len(), 1);
+            assert_eq!(limited.receipts_uncarried, 2);
+            assert_eq!(budget, 0);
+            assert!(limited.shed());
+            assert_eq!(limited.rows_cost(), 0);
+            assert_eq!(limited.receipts_uncarried, 3);
+
+            let (successor, adopted) = hand_over(&store);
+            assert_eq!(receipts(&successor), want(&adopted[0].0));
+        });
+    }
+
+    #[test]
+    fn unknown_carried_receipts_stay_fenced_before_the_first_log_report() {
+        with_link(|| {
+            let store = new_store();
+            let (_, ctx) = registered(&store, 1);
+            let carry = FabricCarry {
+                last_receipt_id: 1,
+                receipts: vec![ReceiptCarry {
+                    rid: 1,
+                    off: 7,
+                    verdict: "handled".to_string(),
+                    kind: "ask".to_string(),
+                    from: "s-peer@n-lab".to_string(),
+                }],
+                ..FabricCarry::default()
+            };
+            ctx.fabric.seed_carry(&carry, &ctx.timeline);
+            assert!(!cmd_outbox(&store, "").contains("receipt "));
+            assert!(cmd_outbox(&store, "earlier-receipts=1").contains(" log=earlier\n"));
+            let carried = ctx.fabric.handoff_carry(&mut CARRY_MAIL_BYTES.clone());
+            assert!(carried.receipts.is_empty());
+            assert_eq!(carried.earlier_receipts.len(), 1);
+        });
+    }
+
     /// A POST PAST THE CARRY'S BUDGET IS RETIRED DEAD, SAID — never dropped
     /// silently: its id is named on the record and the successor records
     /// `post-landed <id> off=- reason=not-carried`.
@@ -10879,6 +13909,292 @@ mod handoff_carry {
                 fresh.ctx.fabric.lock().queued_load().0,
                 0,
                 "nothing is queued"
+            );
+        });
+    }
+
+    /// A PTY KEEPER RECOVERY IS NOT A FRESH MAILBOX (the fabric audit's fourth
+    /// round, findings 2-5). A session the keeper kept through a crash keeps
+    /// its sid and its agent, and comes back from its META's fabric: HELD
+    /// again before it answers a verb, its broadcast opt-in listed (so the new
+    /// bridge keeps the topic's cursor), every id above the dead window's (an
+    /// old inbox id names no row, and no post or receipt meets a sequence pin
+    /// the crash left), and each post it was told is queued retired dead
+    /// `not-carried`, said on its timeline. NEGATIVE CONTROL: a META without
+    /// the fabric (an older window's) carries no hold or topic, and its
+    /// counters are fenced far above any window's, not restarted.
+    ///
+    /// FAILS WITHOUT THE FIX: the recovery's `Adopted` held `hold: None`,
+    /// `topics: []` and an empty carry — `send` went through, `topic ls` read
+    /// `OK 0` and the next post was id 1.
+    #[cfg(unix)]
+    #[test]
+    fn a_keeper_recovery_holds_resubscribes_and_counts_above_the_dead_window() {
+        with_link(|| {
+            let store = new_store();
+            let (sid, ctx) = registered(&store, 1);
+            deliver(&store, &sid, 10, "s-peer@n-lab", "ask", "one");
+            deliver(&store, &sid, 11, "h-andrew", "task", "two");
+            for (n, text) in [(1, "landed"), (2, "queued"), (3, "queued-too")] {
+                assert_eq!(
+                    cmd_post(&ctx, &format!("to=@s-peer kind=note {text}"), None),
+                    format!("OK {n}\n")
+                );
+            }
+            assert_eq!(
+                cmd_outbox_verb(&store, &format!("sent {sid} 1 off=70")),
+                "OK\n"
+            );
+            assert_eq!(cmd_inbox_seen(&ctx, "1 handled"), "OK seen=1\n");
+            assert_eq!(
+                ctx.fabric.topic_add("builds", "@5", &ctx.timeline),
+                Ok(true)
+            );
+            let stop = Hold {
+                reason: "stop%20driving".to_string(),
+                origin: "local".to_string(),
+            };
+            assert!(apply_hold_for_test(&ctx, Some(stop.clone())));
+            // …and the fleet's halt over it, which stands beside it.
+            let halt = Hold {
+                reason: "main%20broken".to_string(),
+                origin: "fleet".to_string(),
+            };
+            assert!(apply_hold_for_test(&ctx, Some(halt.clone())));
+
+            let screen =
+                aterm_core::terminal::Terminal::new(24, 80).carry_meta_abandoning_partial();
+            let carry = ctx.fabric.keeper_carry();
+            assert_eq!(
+                (carry.hold.as_deref(), carry.more_holds.as_slice()),
+                (
+                    Some("fleet main%20broken"),
+                    &["local stop%20driving".to_string()][..]
+                ),
+                "the fleet's first, where an older reader looks"
+            );
+            let meta =
+                crate::seamless::keeper_meta_of(screen.clone(), Some(&carry)).expect("a META");
+            let recovered = crate::seamless::recovered_fabric(&meta);
+            let successor = new_store();
+            let fresh = test_handle(1);
+            let new_sid = fresh.sid.as_str().to_string();
+            crate::spawn::seed_adopted_fabric(
+                &fresh.ctx.fabric,
+                &fresh.ctx.timeline,
+                &recovered.topics,
+                &recovered.holds,
+                &recovered.carry,
+            );
+            let new_ctx = fresh.ctx.clone();
+            successor.write().unwrap().register(fresh);
+
+            assert_eq!(
+                new_ctx.fabric.holds().standing().collect::<Vec<_>>(),
+                [halt, stop.clone()],
+                "held again, both origins"
+            );
+            assert!(halt_refusal(&new_ctx, "send").is_some(), "send is refused");
+            assert_eq!(
+                cmd_topic(&new_ctx, "ls").0,
+                "OK 1 seen=0\ntopic builds since=@5\n",
+                "the opt-in is listed, so the bridge keeps its cursor"
+            );
+            let rows: Vec<(String, String)> = new_ctx
+                .timeline
+                .lock()
+                .unwrap()
+                .since(None)
+                .map(|e| (e.kind.to_string(), e.payload.clone()))
+                .collect();
+            for id in [2, 3] {
+                assert!(
+                    rows.contains(&(
+                        "post-landed".to_string(),
+                        format!("{id} off=- reason={NOT_CARRIED}")
+                    )),
+                    "queued post {id} is retired dead, said: {rows:?}"
+                );
+            }
+            assert!(
+                !rows
+                    .iter()
+                    .any(|(_, payload)| payload.starts_with("1 off=")),
+                "the landed post is not: {rows:?}"
+            );
+            // Every id is above the dead window's: the next of each kind
+            // starts past the lease.
+            let lease = 2 * INBOX_ID_RESERVE;
+            assert_eq!(
+                cmd_inbox_seen(&new_ctx, "2 handled"),
+                "ERR no such message\n",
+                "an id the agent learned before the crash names no row"
+            );
+            assert_eq!(
+                deliver(&successor, &new_sid, 12, "s-peer@n-lab", "ask", "three"),
+                format!("OK {}\n", lease + 1)
+            );
+            assert_eq!(
+                cmd_post(&new_ctx, "to=@s-peer kind=note next", None),
+                format!("OK {}\n", lease + 1)
+            );
+            assert_eq!(
+                cmd_inbox_seen(&new_ctx, &format!("{} handled", lease + 1)),
+                format!("OK seen={}\n", lease + 1)
+            );
+            assert!(
+                cmd_outbox(&successor, "").contains(&format!("rid={} off=12", lease + 1)),
+                "the next receipt is past the lease"
+            );
+
+            // NEGATIVE CONTROL: the same screen, no fabric.
+            let bare = crate::seamless::keeper_meta_of(screen, None).expect("a META");
+            let recovered = crate::seamless::recovered_fabric(&bare);
+            assert_eq!((recovered.holds, recovered.topics.len()), (Vec::new(), 0));
+            let fence = 1 << 32;
+            assert!(
+                recovered.carry.last_msg_id >= fence
+                    && recovered.carry.last_post_id >= fence
+                    && recovered.carry.last_receipt_id >= fence
+                    && recovered.carry.uncarried.is_empty(),
+                "fenced, not restarted: {:?}",
+                recovered.carry
+            );
+            // A fabric no window writes is read as a halt, never as none.
+            let unreadable = Hold {
+                reason: CARRIED_UNREADABLE.to_string(),
+                origin: "local".to_string(),
+            };
+            for garbled in [&br#"{"fabric":{"hold":7}}"#[..], br#"{"fabric":[]}"#] {
+                let holds = crate::seamless::recovered_fabric(garbled).holds;
+                assert_eq!(
+                    parse_holds(holds.iter().map(String::as_str))
+                        .standing()
+                        .collect::<Vec<_>>(),
+                    std::slice::from_ref(&unreadable)
+                );
+            }
+            // So is a `more_holds` that does not read, beside a fleet hold
+            // that does: both stand.
+            for garbled in [
+                &br#"{"fabric":{"hold":"fleet x","more_holds":7}}"#[..],
+                br#"{"fabric":{"hold":"fleet x","more_holds":[7]}}"#,
+            ] {
+                let holds = crate::seamless::recovered_fabric(garbled).holds;
+                let fleet = Hold {
+                    reason: "x".to_string(),
+                    origin: "fleet".to_string(),
+                };
+                assert_eq!(
+                    parse_holds(holds.iter().map(String::as_str))
+                        .standing()
+                        .collect::<Vec<_>>(),
+                    [fleet, unreadable.clone()]
+                );
+            }
+            // A META from before the two slots carries `hold` alone: exactly
+            // that hold, of that origin.
+            let holds = crate::seamless::recovered_fabric(
+                br#"{"fabric":{"hold":"local stop%20driving","ids":[1,1,1]}}"#,
+            )
+            .holds;
+            assert_eq!(
+                parse_holds(holds.iter().map(String::as_str))
+                    .standing()
+                    .collect::<Vec<_>>(),
+                [stop]
+            );
+        });
+    }
+
+    /// `dropped=` GOES ON COUNTING ACROSS A PTY KEEPER RECOVERY (audit r3-07,
+    /// the keeper half), as it does across an update: the META carries the
+    /// session's count and the recovered session's `inbox` header reads it,
+    /// then counts on from it. NEGATIVE CONTROL: the same session's META from
+    /// a window before the count (no `dropped` member) reads `dropped=0`, which
+    /// is what every recovery read before — the reader, not the default, is
+    /// what carries it. FAILS WITHOUT THE FIX: the carry had no such member and
+    /// the recovered header read `dropped=0`. AND THE COUNT IS BOUNDED as the
+    /// writer bounds it: a META naming more than `i64::MAX` (no window writes
+    /// one; the reader is lenient) recovers at `i64::MAX`, from which the
+    /// ring's next eviction counts on, where `u64::MAX` overflowed it.
+    #[cfg(unix)]
+    #[test]
+    fn a_keeper_recovery_goes_on_counting_dropped() {
+        with_link(|| {
+            let store = new_store();
+            let (_sid, ctx) = registered(&store, 1);
+            ctx.fabric.lock().dropped = 7;
+            let carry = ctx.fabric.keeper_carry();
+            assert_eq!(carry.dropped, 7);
+            let screen =
+                aterm_core::terminal::Terminal::new(24, 80).carry_meta_abandoning_partial();
+            let meta =
+                crate::seamless::keeper_meta_of(screen.clone(), Some(&carry)).expect("a META");
+            let older = crate::seamless::keeper_meta_of(
+                screen,
+                Some(&KeeperCarry {
+                    dropped: 0,
+                    ..carry.clone()
+                }),
+            )
+            .expect("a META");
+            assert!(
+                !String::from_utf8_lossy(&older).contains("\"dropped\""),
+                "PRECONDITION: a zero count writes no member, as an older window's META"
+            );
+            let recover = |meta: &[u8]| {
+                let recovered = crate::seamless::recovered_fabric(meta);
+                let fresh = test_handle(1);
+                crate::spawn::seed_adopted_fabric(
+                    &fresh.ctx.fabric,
+                    &fresh.ctx.timeline,
+                    &recovered.topics,
+                    &recovered.holds,
+                    &recovered.carry,
+                );
+                let ctx = fresh.ctx.clone();
+                let sid = fresh.sid.as_str().to_string();
+                let successor = new_store();
+                successor.write().unwrap().register(fresh);
+                (successor, ctx, sid)
+            };
+            let (_store, recovered, _) = recover(&meta);
+            let header = cmd_inbox(&recovered, "--peek");
+            assert!(header.contains(" dropped=7 "), "{header}");
+            // NEGATIVE CONTROL: the META without the member.
+            let (_store, older, _) = recover(&older);
+            let header = cmd_inbox(&older, "--peek");
+            assert!(header.contains(" dropped=0 "), "{header}");
+            // PAST THE BOUND: the count past any carry's `i64::MAX`.
+            let past = crate::seamless::keeper_meta_of(
+                aterm_core::terminal::Terminal::new(24, 80).carry_meta_abandoning_partial(),
+                Some(&KeeperCarry {
+                    dropped: u64::MAX,
+                    ..carry
+                }),
+            )
+            .expect("a META");
+            assert!(
+                String::from_utf8_lossy(&past).contains(&format!("\"dropped\":{}", u64::MAX)),
+                "PRECONDITION: the META names u64::MAX"
+            );
+            let (store, past, sid) = recover(&past);
+            let header = cmd_inbox(&past, "--peek");
+            assert!(
+                header.contains(&format!(" dropped={} ", i64::MAX)),
+                "{header}"
+            );
+            // And the ring's next eviction counts on from it. One sender per
+            // row keeps the per-sender quota out of it.
+            for off in 1..=u64::try_from(RING_CAP).expect("cap fits") + 1 {
+                let from = format!("a-svc{off}");
+                assert!(deliver(&store, &sid, off, &from, "note", "x").starts_with("OK "));
+            }
+            let header = cmd_inbox(&past, "--peek");
+            assert!(
+                header.contains(&format!(" dropped={} ", i64::MAX.unsigned_abs() + 1)),
+                "{header}"
             );
         });
     }
@@ -10982,6 +14298,16 @@ mod handoff_carry {
         with_link(|| {
             let store = new_store();
             let (sid, ctx) = registered(&store, 1);
+            let generation = next_bridge_generation();
+            bridge_attached(generation);
+            assert_eq!(
+                cmd_link(
+                    &store,
+                    &format!("log {}.0", "aa".repeat(16)),
+                    Some(generation)
+                ),
+                "OK\n"
+            );
             let coloured = "\u{1b}[31mred\u{1b}[0m \"q\" \\ ".repeat(20);
             assert_eq!(
                 cmd_post(
@@ -11151,43 +14477,52 @@ mod handoff_carry {
         });
     }
 
-    /// A broadcast delivery, as the bridge sends one to a subscribed session.
-    #[cfg(unix)] // its tests raise the update fence, which is unix-only
-    fn broadcast(store: &Store, sid: &str, off: u64, topic: &str, text: &str) -> String {
-        cmd_deliver(
-            store,
-            &format!(
-                "{sid} off={off} from=s-peer@n-lab kind=note trust=agent topic={topic} text={text}"
-            ),
-        )
-    }
-
-    /// Watch deliveries waiting on the Commit's fence until past the LONGEST
-    /// bound any fenced path waits for — [`HOLD_FENCE_WAIT`], after which a
-    /// `hold`, a post and a retirement answer [`HOLD_BUSY`] — and a few
-    /// rounds of the notice's timeout arm beyond it, failing the moment one
-    /// answers. Anything shorter passes a wait that times out into `ERR busy`
-    /// (round seven's review of group J, open problem 202).
+    /// Watch deliveries waiting on the Commit's fence until each of `sids`
+    /// has logged a WARN whose own `waited` is past `bound` — those sessions'
+    /// [`SessionFabric::fence_wait`], the longest any fenced path on them waits
+    /// before a `hold`, a post and a retirement answer [`HOLD_BUSY`] — failing
+    /// the moment one answers. A watch that ended inside the bound would pass a
+    /// wait that times out into `ERR busy` (round seven's review of group J,
+    /// open problem 202). The minute is a hang detector, never a budget.
     #[cfg(unix)] // the update fence (`lift_hold_fence`) is unix-only
     fn still_waiting_past_every_fenced_bound(
         waiters: Vec<std::thread::JoinHandle<String>>,
+        sids: &[&str],
+        bound: std::time::Duration,
     ) -> Vec<std::thread::JoinHandle<String>> {
-        let until = std::time::Instant::now() + HOLD_FENCE_WAIT + MSG_ROOM_NOTICE_EVERY * 4;
-        loop {
-            if let Some(i) = waiters
+        // The WARN prints `waited` to a tenth of a second, so a printed value a
+        // tenth past the bound is past it whatever the rounding.
+        let past = bound.as_secs_f64() + 0.1;
+        let waited_past = |sid: &str| {
+            crate::test_log::containing(&format!("for session {sid} has waited "))
                 .iter()
-                .position(std::thread::JoinHandle::is_finished)
-            {
+                .filter(|n| n.level == aterm_log::Level::Warn)
+                .filter_map(|n| {
+                    let (_, rest) = n.message.split_once(" has waited ")?;
+                    rest.split_once(" s ")?.0.parse::<f64>().ok()
+                })
+                .any(|waited| waited >= past)
+        };
+        let watched =
+            aterm_spec::wait::within(aterm_spec::wait::MUST_HAPPEN, MSG_ROOM_NOTICE_EVERY, || {
+                if let Some(i) = waiters
+                    .iter()
+                    .position(std::thread::JoinHandle::is_finished)
+                {
+                    return Some(Err(i));
+                }
+                sids.iter().all(|sid| waited_past(sid)).then_some(Ok(()))
+            });
+        match watched {
+            Some(Ok(())) => waiters,
+            Some(Err(i)) => {
                 let reply = waiters
                     .into_iter()
                     .nth(i)
                     .map(std::thread::JoinHandle::join);
                 panic!("fenced delivery {i} was answered under the fence: {reply:?}");
             }
-            if std::time::Instant::now() >= until {
-                return waiters;
-            }
-            std::thread::sleep(MSG_ROOM_NOTICE_EVERY);
+            None => panic!("no WARN past the {bound:?} bound for every one of {sids:?}"),
         }
     }
 
@@ -11198,31 +14533,29 @@ mod handoff_carry {
     /// record refused to its sender, a broadcast dropped) and commits its
     /// cursor past it. Two such deliveries, on two sessions: an addressed row
     /// that would pass the carried id, and a broadcast well inside it. Both
-    /// still wait past [`HOLD_FENCE_WAIT`] — the bound every other fenced path
-    /// answers `ERR busy` at — and each round of each wait is a WARN naming its
-    /// session (a notice in `aterm.log`, not on the GUI's stderr). Once the
-    /// attempt stands down each lands under the next id. NEGATIVE CONTROL: a
-    /// redelivery of the same offset answers the id it first got.
+    /// still wait past [`SessionFabric::fence_wait`] — the bound every other
+    /// fenced path answers `ERR busy` at, and the only door to it — until each
+    /// session's own WARN (a notice in `aterm.log`, not on the GUI's stderr)
+    /// says it has waited past it. The bound is the sessions' own
+    /// ([`SessionFabric::set_fence_wait`]), so the watch is a few notice rounds
+    /// long. Once the attempt stands down each lands under the next id.
+    /// NEGATIVE CONTROL: a redelivery of the same offset answers the id it
+    /// first got.
     ///
     /// FAILS WITHOUT THE FIX: the first pass answered the row `ERR busy
-    /// update-committing` after `HOLD_FENCE_WAIT`, which the bridge refused to
+    /// update-committing` after the fence wait, which the bridge refused to
     /// the sender for good; the broadcast was answered `OK` at once, and lost
     /// with the `_exit`; and the wait's notice went to stderr, which nobody
-    /// reads. The test used to lift the fence after 320 ms, well inside the
-    /// 10 s bound, so it passed against the first pass as well (open problem
-    /// 202).
+    /// reads. A watch that ends inside the bound passes against the first pass
+    /// as well (open problem 202).
     ///
     /// NO LINK SECTION ([`with_link_reset`]), unlike its siblings: nothing here
     /// reads or writes the bridge link. The fence, the carry and both waits are
     /// the sessions' own state, the deliveries speak for no bridge (no lane
     /// generation: [`link_evidence`] returns before it writes), and `deliver`
     /// outside the section is the schedule-proof shape 27 `inbox_hold` tests
-    /// already use ([`touched_contains`]). Inside it, its 10 s wait held the
-    /// section's mutex, and every link test the runner started meanwhile parked
-    /// a test thread on it: measured 2026-09-30, `-p aterm-gui --lib` at
-    /// `RUST_TEST_THREADS=7`, five siblings of this module each took 10.0 to
-    /// 10.4 s there — six of the seven threads held for 10 s — and 0.001 to
-    /// 0.21 s once it let go.
+    /// already use ([`touched_contains`]); inside it, the wait would hold the
+    /// section's mutex and park every link test the runner started meanwhile.
     #[cfg(unix)] // the update fence (`lift_hold_fence`) is unix-only
     #[test]
     fn a_fenced_delivery_waits_past_every_bound_and_is_never_refused() {
@@ -11230,12 +14563,23 @@ mod handoff_carry {
         let store = new_store();
         let (sid, ctx) = registered(&store, 1);
         let (bsid, bctx) = registered(&store, 2);
+        // A broadcast reaches only a session that asked for its topic.
+        assert_eq!(
+            bctx.fabric.topic_add("news", "head", &bctx.timeline),
+            Ok(true)
+        );
         for s in [&sid, &bsid] {
             assert_eq!(deliver(&store, s, 10, "h-andrew", "task", "one"), "OK 1\n");
         }
         let carried = ctx.fabric.handoff_carry(&mut CARRY_MAIL_BYTES.clone());
         let _ = bctx.fabric.handoff_carry(&mut CARRY_MAIL_BYTES.clone());
         ctx.fabric.lock().last_msg_id = carried.last_msg_id;
+        // Every fenced path on these sessions answers busy past a bound of a
+        // few notice rounds, not the real ten seconds.
+        let bound = MSG_ROOM_NOTICE_EVERY * 5;
+        for fabric in [&ctx.fabric, &bctx.fabric] {
+            fabric.set_fence_wait(bound);
+        }
         let _ = ctx.fabric.fence_hold(true);
         let _ = bctx.fabric.fence_hold(true);
         let row = {
@@ -11248,7 +14592,9 @@ mod handoff_carry {
             let bsid = bsid.clone();
             std::thread::spawn(move || broadcast(&store, &bsid, 11, "news", "shout"))
         };
-        let mut waiters = still_waiting_past_every_fenced_bound(vec![row, shout]).into_iter();
+        let mut waiters =
+            still_waiting_past_every_fenced_bound(vec![row, shout], &[&sid, &bsid], bound)
+                .into_iter();
         let (row, shout) = (waiters.next().unwrap(), waiters.next().unwrap());
         assert!(!ctx.fabric.past_handoff_ceiling(), "the row minted nothing");
         assert_eq!(bctx.fabric.lock().last_msg_id, 1, "nor did the broadcast");

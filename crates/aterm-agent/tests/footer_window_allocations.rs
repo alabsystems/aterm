@@ -1,13 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! One test binary and one test (as `transcript_allocations.rs`, so no other
-//! test pollutes the global allocator): the Claude Code footer's reader
-//! allocates each [`footer::TAIL_BYTES`] window of a transcript it walks back
-//! once. Both window walks (`TailCache`'s fresh read and `rows_back` under
-//! `conversation_model`) join each window to the head of the row the newer
-//! window cut, so the buffer must be sized for both up front rather than
-//! grown.
+//! One test in its own binary (as `transcript_allocations.rs`), so nothing else
+//! touches the counting allocator: the footer's reader allocates each
+//! [`footer::TAIL_BYTES`] window it walks back once. Both walks (`TailCache`'s fresh
+//! read and `rows_back` under `conversation_model`) join each window to the head of
+//! the row the newer window cut, so the buffer is sized for both up front.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::io::Write as _;
@@ -20,8 +18,7 @@ use aterm_agent::harness::footer::{self, TailCache};
 static COUNTING: AtomicBool = AtomicBool::new(false);
 /// Blocks of at least half a window allocated fresh.
 static WINDOWS: AtomicUsize = AtomicUsize::new(0);
-/// Blocks of at least half a window GROWN after they were filled: a
-/// window's buffer reallocated.
+/// Blocks of at least half a window grown after they were filled.
 static GROWN: AtomicUsize = AtomicUsize::new(0);
 /// Every byte asked for, fresh or grown.
 static BYTES: AtomicUsize = AtomicUsize::new(0);
@@ -96,12 +93,10 @@ fn user_row(n: usize, at: u64) -> String {
     )
 }
 
-/// A Claude directory holding process [`PID`]'s registry entry and its
-/// session's transcript: a conversation resumed from before the process's
-/// start (a question and an answer by `claude-opus-5-5`, an hour before
-/// [`START`]), then about 3.75 windows of the process's own messages. The
-/// footer names the restored model: the answer at the file's head, which both
-/// walks reach only through every window.
+/// A Claude directory holding process [`PID`]'s registry entry and its session's
+/// transcript: a conversation resumed from before [`START`] (an answer by
+/// `claude-opus-5-5` an hour earlier), then about 3.75 windows of the process's own
+/// messages, so both walks reach the restored model only through every window.
 fn resumed_conversation(root: &Path) -> (std::path::PathBuf, u64) {
     let claude = root.join("claude");
     let project = claude.join("projects").join("-w-repo");
@@ -174,8 +169,7 @@ fn each_window_the_footer_walks_back_is_allocated_once() {
 
     // Both walks reached the head: the restored answer is named.
     assert_eq!(facts.model.as_deref(), Some("Opus 5.5"), "{facts:?}");
-    // The tail read afresh and the walk back to the answer: every window of
-    // each allocated, once.
+    // The fresh tail read and the walk back to the answer: each window once.
     assert_eq!(fresh, 2 * windows, "one block per window per walk");
     assert_eq!(grown, 0, "no window's buffer grown after its read");
     std::fs::remove_dir_all(&root).unwrap();

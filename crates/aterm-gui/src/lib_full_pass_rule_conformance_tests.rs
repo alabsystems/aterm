@@ -60,10 +60,9 @@ fn stamp(unix: i64) -> String {
     aterm_types::rfc3339::format_rfc3339(unix.unsigned_abs())
 }
 
-/// `state`'s record laid down at `now` in a scratch store by atpkg's own writers, as its
-/// conformance lays it: the success, and — `records_pass_end` — each pass's recorded end
-/// (else the writer of before `last_pass`, a failed pass a bare write); a vendor row
-/// written after the last pass.
+/// Lays down `state`'s record at `now` with atpkg's own writers: the success; each pass's end
+/// when `records_pass_end` (else a failed pass is a bare `updated_at` write, with no
+/// `last_pass`); and a vendor row written after the last pass.
 fn realize(
     dir: &std::path::Path,
     state: &State,
@@ -116,8 +115,8 @@ fn realize(
     layout
 }
 
-/// The previous stamp readers, as the negative control: attempt is `updated_at` else
-/// the success; a failure is an attempt after the success; no hold.
+/// Negative control, the stamp readers without `last_pass`: attempt is `updated_at` else the
+/// success; a failure is an attempt after the success; no hold.
 fn legacy_stamps(layout: &atpkg::store::Layout, now: i64) -> Stamps {
     let status = atpkg::status::read(layout).unwrap_or_default();
     let unix = |stamp: &str| aterm_update_core::pkg_check::rfc3339_to_unix(stamp.trim());
@@ -152,11 +151,10 @@ fn legacy_launch_park(stamps: &Stamps, now: i64) -> Option<Duration> {
     (age < FULL_PASS_INTERVAL_SECS).then(|| Duration::from_secs(FULL_PASS_INTERVAL_SECS - age))
 }
 
-/// Tier-1 of `AtpkgFullPassRule`, the window's half: over every record the model
-/// reaches at `Buggy=0`, written by atpkg's own writers, [`scheduled_pass_gate`] over
-/// [`pass_stamps`] runs a pass exactly when `WindowWalk` does, and a launch exactly
-/// when `WindowLaunch` does. Negative control: [`legacy_stamps`] over `Buggy=1`'s
-/// records is `Buggy=1`'s window.
+/// `AtpkgFullPassRule`, the window's half: over every `Buggy=0` record, written by atpkg's own
+/// writers, [`scheduled_pass_gate`] over [`pass_stamps`] runs a pass exactly when `WindowWalk`
+/// does and a launch exactly when `WindowLaunch` does. Negative control: [`legacy_stamps`] over
+/// `Buggy=1`'s records is `Buggy=1`'s window.
 #[test]
 fn the_windows_gate_and_launch_conform_to_the_full_pass_rule() {
     let model = atpkg_full_pass_rule_model();
@@ -214,7 +212,7 @@ fn the_windows_gate_and_launch_conform_to_the_full_pass_rule() {
             "{state:?} {stamps:?}"
         );
     }
-    // The replayed defect: a success three hours old, the head watch's row since.
+    // A success three hours old with the head watch's row written since: the launch parks.
     let defect = walk(
         &model,
         &[

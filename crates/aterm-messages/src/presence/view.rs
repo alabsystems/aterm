@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The per-window VIEW: what the frame path reads, allocation-free — the
-//! level, the rim, the row's words, the change seed the repaint key folds
+//! The per-window view the frame path reads without allocating: the level,
+//! the rim, the row's words, the change seed the repaint key folds
 //! ([`View::fp`]), the edge ripple and the words' own clock.
 
 use std::collections::HashMap;
@@ -17,14 +17,13 @@ use crate::{Duration, Instant};
 /// path reads is plain data; the words are recomposed only on change.
 #[derive(Clone, Debug)]
 pub struct View {
-    /// The story watermarks, one per SESSION shown in this window: the newest
-    /// story seq the human has seen of that session here (moved by the fold
-    /// law, never by focus alone or a timer). Per session, not per window:
-    /// reading one tab's story must not fold another's, and a story read once
-    /// must not return after the human reads a second tab.
+    /// The story watermarks, one per session shown in this window: the newest
+    /// story seq the human has seen of that session here, moved only by the
+    /// fold law. Per session, so reading one tab's story neither folds
+    /// another's nor brings back one already read.
     pub watermarks: HashMap<u64, u64>,
-    /// The row count COMMITTED to this window's geometry (0 or 1) — moved
-    /// only by the host's re-grid.
+    /// The row count committed to this window's geometry (0 or 1), moved only
+    /// by the host's re-grid.
     pub rows: u16,
     /// The level shown.
     pub level: Level,
@@ -36,40 +35,34 @@ pub struct View {
     /// Never 0 once anything has shown, but `fp` maps a quiet window to 0.
     pub seed: u64,
     /// A turn submit's edge ripple: when it started, `None` when none runs
-    /// (and always `None` under reduced motion — amplitude 0 means the ripple
-    /// never STARTS, so the frame is the steady image).
+    /// (always `None` under reduced motion: the ripple never starts).
     pub ripple_at: Option<Instant>,
-    /// The running ripple is a CHOICE PULSE: the harness answered a question
-    /// box in the session this window's FRONT tab shows. It paints in the
-    /// story tone and paints on a window with NO rim — the one ripple a quiet
-    /// window shows. Reset with `ripple_at`.
+    /// The running ripple is a choice pulse: the harness answered a question
+    /// box in the session this window's front tab shows. It paints in the
+    /// story tone, even on a window with no rim. Reset with `ripple_at`.
     pub ripple_chose: bool,
-    /// When the words' `since` figures next move — the row's own text clock
-    /// ([`words_step`]: 1 s while they print seconds, 60 s after); `None`
-    /// until the first tick of a row. The host recomposes a window only when
-    /// this is due, so another owner's wakes never re-read presence facts at
-    /// their own rate (audit 2026-09-24).
+    /// When the words' `since` figures next move ([`words_step`]: 1 s while
+    /// they print seconds, 60 s after); `None` until a row's first tick. The
+    /// host recomposes a window only when this is due, so other wakes never
+    /// re-read presence facts at their own rate.
     pub words_due: Option<Instant>,
-    /// Since when the committed row has wanted NO row (its words went away)
-    /// while [`FOLD_QUIET`](super::FOLD_QUIET) holds its fold back — the row
+    /// Since when the committed row has wanted no row (its words went away)
+    /// while [`FOLD_QUIET`](super::FOLD_QUIET) holds its fold back. The row
     /// stays committed and paints blank meanwhile, and the wire reports it
-    /// with no words (`band=""`, `sentence=""`), which is what the human sees.
-    /// `None` when no fold is pending; a want that returns clears it.
+    /// with no words (`band=""`, `sentence=""`), as the human sees it. `None`
+    /// when no fold is pending; a want that returns clears it.
     pub fold_since: Option<Instant>,
-    /// The pending fold is a person's READ (the fold law's keystroke; a
-    /// switch to a tab whose session wants no row is NOT one — the switch
-    /// back would re-bear the row on the same call, a net-zero re-grid of
-    /// every pane): it does not wait out
-    /// [`FOLD_QUIET`](super::FOLD_QUIET) from the want's drop, only the row's
-    /// own minimum life from its birth ([`Self::born_at`]). Sticky until the
-    /// fold commits or the want returns, so a read under a hold folds as the
-    /// hold lifts rather than waiting a fresh quiet.
+    /// The pending fold is a person's read (the fold law's keystroke; a tab
+    /// switch is not one, since switching back would re-bear the row, a
+    /// net-zero re-grid): it skips [`FOLD_QUIET`](super::FOLD_QUIET) from the
+    /// want's drop and waits only the row's minimum life from
+    /// [`Self::born_at`]. Sticky until the fold commits or the want returns,
+    /// so a read under a hold folds as the hold lifts.
     pub fold_read: bool,
-    /// When the committed row was BORN (its last 0 -> 1 re-grid); `None`
+    /// When the committed row was born (its last 0 -> 1 re-grid); `None`
     /// before it ever was. A read folds a row only once it has stood
-    /// [`FOLD_QUIET`](super::FOLD_QUIET): a story told while a person types
-    /// is born, and their next key would otherwise fold it milliseconds later
-    /// — the incident's net-zero pair, with the key's echo between.
+    /// [`FOLD_QUIET`](super::FOLD_QUIET): a story born while a person types
+    /// would otherwise fold on their next key, a net-zero re-grid pair.
     pub born_at: Option<Instant>,
 }
 
@@ -146,18 +139,17 @@ impl View {
         if elapsed >= RIPPLE {
             return None;
         }
-        // To the nanosecond, as the deadline below is: whole milliseconds
-        // left the step behind the instant `ripple_deadline` named for it
-        // (round 43, ruling 415 (u)).
+        // In nanoseconds, as `ripple_deadline` computes: whole milliseconds
+        // would leave the step behind the instant the deadline names for it.
         let step = elapsed.as_nanos() * u128::from(RIPPLE_STEPS) / RIPPLE.as_nanos();
         // `elapsed < RIPPLE`, so `step < RIPPLE_STEPS`: the conversion is exact.
         Some(u32::try_from(step).map_or(RIPPLE_STEPS - 1, |s| s.min(RIPPLE_STEPS - 1)))
     }
 
-    /// The repaint-key term: **exactly 0 on a quiet window** (no rim, no row,
-    /// no ripple), else a nonzero fold of the seed (floored at 1, so the fold
-    /// is never 0) and the ripple step (0 = none, else `step + 1`). No clock is
-    /// read unless a ripple is live, and no allocation ever.
+    /// The repaint-key term: exactly 0 on a quiet window (no rim, no row, no
+    /// ripple), else a nonzero fold of the seed (floored at 1) and the ripple
+    /// step (0 = none, else `step + 1`). No clock is read unless a ripple is
+    /// live, and nothing allocates.
     #[must_use]
     pub fn fp(&self, now: Instant) -> u64 {
         if self.rows == 0 && matches!(self.rim, Rim::None) && self.ripple_at.is_none() {
@@ -170,9 +162,9 @@ impl View {
         (self.seed.max(1) << 8) | step
     }
 
-    /// The next instant this view's PIXELS change on their own — only while a
-    /// ripple runs. Steady rims and rows have no deadline (the change-driven
-    /// law); the row's `since` text ticks through the host's deadline fold.
+    /// The next instant this view's pixels change on their own, only while a
+    /// ripple runs. Steady rims and rows have no deadline; the row's `since`
+    /// text ticks through the host's deadline fold.
     #[must_use]
     pub fn ripple_deadline(&self, now: Instant) -> Option<Instant> {
         let t0 = self.ripple_at?;
@@ -181,18 +173,17 @@ impl View {
             return Some(now);
         }
         let step = self.ripple_step(now).unwrap_or(0);
-        // The first nanosecond of the next step, rounded UP: the step has
-        // moved there, and it is after `now` (round 43, ruling 415 (u)).
+        // The first nanosecond of the next step, rounded up, so it is after
+        // `now`.
         let next = (u128::from(step + 1) * RIPPLE.as_nanos()).div_ceil(u128::from(RIPPLE_STEPS));
         let next = Duration::from_nanos(u64::try_from(next).unwrap_or(u64::MAX));
         Some((t0 + next).min(end))
     }
 
-    /// The rim at `now` as the frame path draws it — plain field reads and
-    /// arithmetic, no allocation; `None` on a quiet window. `rim_on` is the
-    /// host's rim toggle (a CHOICE PULSE is a rim flash, so it too needs it);
-    /// `tones` are read only when a rim or a pulse paints, so a quiet frame
-    /// answers before the host derives them.
+    /// The rim at `now` as the frame path draws it, with no allocation; `None`
+    /// on a quiet window. `rim_on` is the host's rim toggle (a choice pulse is
+    /// a rim flash, so it needs it too); `tones` are read only when a rim or a
+    /// pulse paints, so a quiet frame answers before the host derives them.
     #[must_use]
     pub fn rim_glow(
         &self,
@@ -237,8 +228,8 @@ impl View {
 }
 
 /// How often a row's words move: every second while any `since` clause
-/// prints SECONDS (`12s`, `3m12s`, `since 3m12s`, `held 1m00s, resumed 40s
-/// ago`), once a minute when it prints only minutes, hours or days.
+/// prints seconds (`12s`, `3m12s`, `held 1m00s, resumed 40s ago`), once a
+/// minute when it prints only minutes, hours or days.
 #[must_use]
 pub fn words_step(words: &Words) -> Duration {
     if words.since.iter().any(|c| prints_seconds(c)) {
@@ -261,7 +252,7 @@ pub(crate) fn prints_seconds(clause: &str) -> bool {
         })
 }
 
-/// The chip level the host's existing indicator bits spell: `Wait`.
+/// The chip level an attention bit spells: `Wait` when set, else `Off`.
 #[must_use]
 pub const fn chip_of_attention(attention: bool) -> ChipLevel {
     if attention {

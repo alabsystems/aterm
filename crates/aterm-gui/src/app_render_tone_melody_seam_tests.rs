@@ -27,9 +27,7 @@ fn key(character: char) -> InputEvent {
 /// (`keystroke_click_audible`), so a sealed host would short-circuit them.
 fn app_with_capturing_audio() -> (App, WindowId) {
     let mut app = App::headless_for_test();
-    // Enable the trail explicitly: its default is platform-split
-    // (`DEFAULT_DECORATIVE_EFFECTS`), and the audio seam must behave the same
-    // everywhere once on.
+    // The trail's default is platform-split (`DEFAULT_DECORATIVE_EFFECTS`): turn it on.
     app.config.cursor_trail = Some(true);
     app.trail_audio = TrailAudio::capturing_for_test();
     assert!(app.trail_audio.is_live(), "the capturing host reports live");
@@ -76,8 +74,7 @@ fn a_typed_mood_reaches_the_audio_host_on_every_trail_event() {
     // The line comes from the committed training distribution, so a miss is
     // a broken seam, not a model change.
     type_line(&mut app, wid, "why is this broken again ugh");
-    // The verdict lands at the next frame's drain (P06: never in the key
-    // handler) — exactly when the first cue that could carry it is stamped.
+    // The verdict lands at the next frame's drain (P06: never in the key handler).
     tick(&mut app, wid);
     assert_eq!(
         app.windows[&wid].fx.companions().tone_tracker.current(),
@@ -146,21 +143,16 @@ fn a_disabled_knob_stamps_the_neutral_identity_over_a_cached_verdict() {
     );
 }
 
-/// EVERY drain seam resolves its tone through the ONE helper. Single-pane,
-/// composed, and split-pane rendering now share one cursor-effects tick and
-/// therefore one drain policy; a second construction here is a new seam and
-/// must be pinned explicitly. A behavioural test can only reach the route
-/// its fixture happens to drive, so the source-level census keeps that
-/// centralization honest.
-///
-/// It refuses two specific regressions: a policy literal that stops taking
-/// the tracker's answer (a hardcoded `Tone::Technical`, the silent revert),
-/// and one that reads `current()` directly, which would keep stamping a
-/// stale mood after the knob was switched off.
+/// Every drain seam resolves its tone through the one helper. Single-pane, composed and
+/// split rendering share one cursor-effects tick and so one drain policy; a behavioural
+/// test reaches only the route its fixture drives, so this source census keeps that
+/// honest. It refuses a policy literal that stops taking the tracker's answer (a hardcoded
+/// `Tone::Technical`) and one that reads `current()`, which would keep stamping a stale
+/// mood after the knob is switched off.
 #[test]
 fn every_trail_sound_policy_takes_its_tone_from_the_tracker() {
-    // Scan the CODE only: this module's own prose mentions both spellings,
-    // and a test that matches itself proves nothing.
+    // Scan only the code above this module's doc in `app_render.rs`, whose prose spells
+    // `let tone = …`. The split marker is that doc's first line and must keep its spelling.
     let source = include_str!("app_render.rs");
     let code = source
         .split("/// THE TONE-MELODY SEAM")
@@ -202,10 +194,9 @@ fn every_trail_sound_policy_takes_its_tone_from_the_tracker() {
              toggle-off: {binding:?}",
         );
     }
-    // …AND THE SECOND SEAM, which does not live in this file. The KEY-TIME
-    // typing click reaches the synth from `app_input` without a drain, so a
-    // scan of this file alone would report full coverage while the hottest
-    // audio path stamped whatever it liked. Same two refusals, same helper.
+    // The second seam lives in `app_input`: the key-time typing click reaches the synth
+    // without a drain, so a scan of `app_render.rs` alone would miss the hottest audio
+    // path. Same two refusals, same helper.
     let key_seam = include_str!("app_input.rs");
     let key_policies: Vec<&str> = key_seam
         .match_indices("TrailSoundPolicy {")

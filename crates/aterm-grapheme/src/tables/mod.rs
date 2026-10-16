@@ -9,12 +9,16 @@
 //! Modules:
 //! - [`width`] — East Asian Width / zero-width classification (UAX #11).
 //! - [`gcb`] — Grapheme_Cluster_Break property + UAX #29 break matrix.
+//! - [`props`] — `Script` and `General_Category` run tables
+//!   (`tables/gen_props.py`, read through [`crate::script`] and
+//!   [`crate::general_category`]).
 //!
 //! Only `width`'s API is exported from the crate; `gcb` is `pub(crate)` because
 //! the segmentation state machine lives in [`crate::grapheme_iter`] and
 //! consumes the GCB tables directly.
 
 pub(crate) mod gcb;
+pub(crate) mod props;
 pub(crate) mod width;
 
 // Re-export commonly used functions

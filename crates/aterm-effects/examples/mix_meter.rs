@@ -3,28 +3,24 @@
 
 //! `mix_meter`: measures the trail-sound loudness ladder.
 //!
-//! The ladder in `trail_sound.rs` is written in dBFS: tier 1 (a keystroke) is
-//! the floor at −21.0 dBFS and every other gesture is placed against it.
-//! `palette_trim`, the per-style constant that lands each palette on that
-//! floor, is fitted, and the byte-pin oracle only proves the two DSP copies
-//! agree. This tool renders real events through the real `TrailSynth` and
-//! reports each one's delivered peak, so a retune can be fitted against a
-//! measurement.
+//! The ladder in `trail_sound.rs` puts tier 1 (a keystroke) at −21.0 dBFS and
+//! every other gesture against it; `palette_trim`, which lands each palette on
+//! that floor, is fitted, not derived. This renders real events through the real
+//! `TrailSynth` and reports each one's delivered peak, so a retune is fitted
+//! against a measurement.
 //!
 //! ```text
-//! cargo run -q -p aterm-effects --example mix_meter
-//! cargo run -q -p aterm-effects --example mix_meter -- rainbow kitty
-//! cargo run -q -p aterm-effects --example mix_meter -- --voice typewriter
-//! cargo run -q -p aterm-effects --example mix_meter -- --voice droplet lumen
+//! targo --unverified run -q -p aterm-effects --example mix_meter
+//! targo --unverified run -q -p aterm-effects --example mix_meter -- rainbow kitty
+//! targo --unverified run -q -p aterm-effects --example mix_meter -- --voice typewriter
+//! targo --unverified run -q -p aterm-effects --example mix_meter -- --voice droplet lumen
 //! ```
 //!
-//! `--voice <name>` selects the typing-sound voice (`SoundVoice::parse`;
-//! default `auto`); the bare style argument selects the look the events ride,
-//! which matters only under `auto`.
-//!
-//! Levels are reported at the host's default `trail_sound_volume` (0.4) and
-//! normalized to `gain = 1.0`, so the palette's trim can be judged
-//! independently of the volume knob.
+//! `--voice <name>` selects the typing-sound voice (`SoundVoice::parse`; default
+//! `auto`); the bare style argument selects the look the events ride, which
+//! matters only under `auto`. Peaks are reported at the host's default
+//! `trail_sound_volume` (0.4) and at `gain = 1.0`, so a palette's trim is judged
+//! apart from the volume knob.
 
 use aterm_effects::cursor_glow::GlowStyle;
 use aterm_effects::tone::Tone;
@@ -115,8 +111,7 @@ fn main() {
         }
     };
 
-    // Every discrete gesture, plus the two composed ones (a riff bar, and a
-    // keystroke measured at a typing-flood rate rather than in isolation).
+    // Every discrete gesture; the riff bar is measured after.
     let gestures: [(&str, SoundGesture); 9] = [
         ("Typed", SoundGesture::Trail(SoundKind::Typed)),
         ("Backspace", SoundGesture::Trail(SoundKind::Backspace)),
@@ -159,9 +154,8 @@ fn main() {
         );
     }
 
-    // The sing-along riff: measured on its loudest authored bar (the chorus
-    // push at bar 4 of the 8-bar form) rather than bar 0, so the ladder is
-    // read at the peak the listener actually meets.
+    // The riff on its loudest bar (the chorus push, bar 4 of the 8-bar form):
+    // the peak a listener meets.
     let riff = peak_of(
         voice,
         style,

@@ -1538,7 +1538,7 @@ fn note_cjk_head(heads: &mut FxHashMap<char, usize>, surface: &str) {
 /// the winner's species, a same-class union keeps the FIRST claimant's species
 /// (TOML order is the tiebreak; the data discipline is one surface → one
 /// species, pinned by the conflicts channel
-/// (`embedded_lexicon_parses_and_has_no_conflicts`)).
+/// (`tests/animal_multilingual.rs::expanded_builtin_stays_conflict_free`)).
 fn insert_class(
     map: &mut FxHashMap<String, PendingHit>,
     key: String,
@@ -1827,17 +1827,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn embedded_lexicon_parses_and_has_no_conflicts() {
-        let lx = lex();
-        assert!(
-            lx.conflicts().is_empty(),
-            "lexicon conflicts: {:?}",
-            lx.conflicts()
-        );
-        assert!(lx.spaced_form_count() > 50);
-    }
-
     /// LANGUAGE-COLLISION REGRESSION: Romanian `fut` / `futu` must remain
     /// recognizable in Romanian/all-language configurations, but every scan
     /// reports them as cursor-deferrable collisions. The renderer can therefore
@@ -2055,7 +2044,8 @@ mod tests {
         assert_eq!(lx.classify_token("qwxstem0qwxsuf0"), None);
 
         // The tiny embedded builtin is unaffected: it still builds cleanly and its
-        // known surfaces remain present (mirrors embedded_lexicon_parses_* above).
+        // known surfaces remain present (as in
+        // tests/animal_multilingual.rs::expanded_builtin_stays_conflict_free).
         let builtin = Lexicon::with_languages(&["all"]);
         assert!(
             builtin.conflicts().is_empty(),

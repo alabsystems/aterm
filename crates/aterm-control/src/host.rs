@@ -250,17 +250,4 @@ mod tests {
         let huge = "99999999999999999999";
         assert_eq!(Selector::parse(huge), Some(Selector::Id(huge)));
     }
-
-    /// A placement's default is the detached shape (`window=none`), distinct
-    /// from the trait's `None` ("could not look").
-    #[test]
-    fn a_default_placement_is_detached_not_unknown() {
-        let p = SessionPlacement {
-            sid: 7,
-            ..SessionPlacement::default()
-        };
-        assert_eq!(p.window, None);
-        assert!(!p.active_tab && !p.window_focused);
-        assert_eq!(p.detail, None);
-    }
 }

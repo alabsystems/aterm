@@ -30,25 +30,21 @@ pub(crate) const YELLOW_EXIT_PERCENT: usize = 50;
 
 /// Compute an absolute byte threshold from a percentage and a budget.
 ///
-/// `saturating_mul` instead of `*`: both operands are `< 2^64`, so the u128
-/// product can never saturate and the result is identical — but the plain
-/// multiply carries a 128-bit overflow obligation whose bit-vector encoding
-/// the strict gate's solver grinds on without terminating (observed as a
-/// multi-CPU-minute hang), while the saturating form has no panic path at all.
+/// `saturating_mul`: the u128 product of two values `< 2^64` cannot saturate,
+/// but the plain multiply's 128-bit overflow obligation makes the strict gate's
+/// bit-vector solver hang, while the saturating form has no panic path.
 pub(crate) fn threshold_bytes(percent: usize, budget: usize) -> usize {
     let threshold = (budget as u128).saturating_mul(percent as u128) / 100;
-    // `.min(usize::MAX)` before the narrowing cast: the quotient is always
-    // <= budget (callers clamp percent to 1..=100) so the clamp can never
-    // change the value — it just makes the cast provably lossless for the
+    // The quotient is <= budget (callers clamp percent to 1..=100), so the `min`
+    // never changes it; it makes the narrowing cast provably lossless for the
     // strict gate, which cannot carry the division bound.
     threshold.min(usize::MAX as u128) as usize
 }
 
 /// Recompute watermark level from current budgeted bytes vs thresholds.
 ///
-/// Shared implementation for [`Scrollback`] and [`DiskBackedScrollback`].
-/// Uses hysteresis: Yellow→Green requires dropping below `yellow_exit_threshold`,
-/// not just below `yellow_threshold`.
+/// Shared by `Scrollback` and `DiskBackedScrollback`. Hysteresis: Yellow→Green
+/// requires dropping below `yellow_exit_threshold`, not just `yellow_threshold`.
 #[inline]
 pub(crate) fn recompute_watermark(
     current: WatermarkLevel,

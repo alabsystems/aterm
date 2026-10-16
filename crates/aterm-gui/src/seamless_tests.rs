@@ -29,7 +29,8 @@ pub(super) struct RestoreVar {
     prior: Option<std::ffi::OsString>,
 }
 impl RestoreVar {
-    pub(super) fn new(key: &'static str) -> Self {
+    pub(super) fn new(key: impl Into<&'static str>) -> Self {
+        let key = key.into();
         Self {
             key,
             prior: std::env::var_os(key),
@@ -115,7 +116,7 @@ impl ScratchEnv {
         let restore = vars
             .iter()
             .map(|var| {
-                let restore = RestoreVar::new(var);
+                let restore = RestoreVar::new(*var);
                 aterm_log::env::set(var, &path);
                 restore
             })
@@ -145,8 +146,8 @@ impl Drop for ScratchEnv {
 /// it stands at the spawn, so the spawns happen under the lock: no sibling's
 /// scratch HOME or published handoff can be in it. The waits are not, and
 /// several children run side by side. A child's output is said only when it
-/// failed: its own `test result:` line in the parent's would read, to the
-/// gate's log readers, as a binary of its own.
+/// failed: its own `test result:` line in the parent's would read, to
+/// `verify test`'s reading of the log, as a binary of its own.
 pub(crate) fn run_in_children(marker: &str, children: usize) -> Vec<String> {
     let spawned: Vec<crate::test_alone::Running> = {
         let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
@@ -490,7 +491,7 @@ fn no_shipped_parent_is_sent_75_for_a_refused_intake() {
 fn the_exit_capability_is_declared_on_both_lanes_and_taken_by_the_successor() {
     let published = outgoing_parent_env();
     assert!(
-        published.contains(&(ENV_EXIT_CAPS, EXIT_CAPS_PASSING.to_string())),
+        published.contains(&ENV_EXIT_CAPS.pair(EXIT_CAPS_PASSING)),
         "the parent declares it: {published:?}"
     );
     assert_eq!(
@@ -514,19 +515,23 @@ fn the_exit_capability_is_declared_on_both_lanes_and_taken_by_the_successor() {
     assert!(
         lanes.contains(
             "for (key, value) in crate::seamless::outgoing_parent_env() {\n        \
-             environment.push((key.into(), value.into()));"
+             environment.push((key, value));"
         ),
         "the launched lane publishes it in the launch environment"
     );
     // The successor: carried across the re-exec, then taken.
     let mut env = HandoffEnv::default();
     for (key, value) in &published {
-        env.set(key, value.clone());
+        let name = crate::handoff_env::HANDOFF_ENV_KEYS
+            .iter()
+            .find(|name| name.name() == *key)
+            .expect("a published name is a handoff name");
+        env.set(*name, value.clone());
     }
     assert!(
         env.exec_env()
             .iter()
-            .any(|(key, _)| key.as_os_str() == ENV_EXIT_CAPS),
+            .any(|(key, _)| key.as_os_str() == ENV_EXIT_CAPS.name()),
         "the boot apply's re-exec carries it onto the new image"
     );
     assert!(take_parent_reads_passing_exit_from(&mut env));
@@ -885,10 +890,12 @@ fn exact_legacy_layout(ids: &[u64]) -> RestoreManifest {
                     role: None,
                     attention: None,
                     questions: None,
+                    autopilot: None,
                     identity: None,
                     agent: None,
                     supervised: None,
                     held: false,
+                    holds: Vec::new(),
                 })),
                 focused_path: Vec::new(),
                 zoomed: false,
@@ -1709,21 +1716,31 @@ fn carried_history_can_exhaust_the_aggregate_that_visible_only_admits() {
 
 /// A POOL OVER THE META BUDGET ON COLOUR STACKS ALONE STILL COMMITS (round
 /// eight of the update audit, finding 51): tabs that pushed the kitty colour
-/// stack and never popped it carry 256 palette entries per push, with no
-/// OSC 133 mark to shed, and the settle refused the whole pool. Their stacks
-/// give way; their screens do not.
+/// stack and never popped it carry up to 256 palette entries per push (each
+/// entry is the program's diff from the theme, so a base16-style program that
+/// recoloured the whole palette costs the most), with no OSC 133 mark to
+/// shed, and the settle refused the whole pool. Their stacks give way; their
+/// screens do not.
 #[test]
 fn colour_stacks_past_the_meta_budget_are_shed_not_refused() {
+    let recolour_all: Vec<u8> = (0..=u8::MAX)
+        .flat_map(|i| format!("\x1b]4;{i};rgb:{i:02x}/{:02x}/01\x07", 255 - i).into_bytes())
+        .collect();
     let mut pool = Vec::new();
     for local_id in 0..28 {
         let mut terminal = aterm_core::terminal::Terminal::new(24, 80);
+        terminal.apply_config(&aterm_core::config::TerminalConfig {
+            allow_palette_reconfigure: true,
+            ..aterm_core::config::TerminalConfig::default()
+        });
         terminal.process(b"$ some output\r\n");
+        terminal.process(&recolour_all);
         for _ in 0..16 {
             terminal.process(b"\x1b]30001\x07");
         }
         let checkpoint = terminal.checkpoint_carry(0).expect("parser is Ground");
         assert!(
-            !checkpoint.color.stack.is_empty() && checkpoint.shell.command_marks.is_empty(),
+            checkpoint.color.has_stack() && checkpoint.shell.command_marks.is_empty(),
             "PRECONDITION: a pushed stack and no marks"
         );
         pool.push(WireCarry {
@@ -1923,14 +1940,13 @@ fn metas_past_every_shed_lower_screens_instead_of_refusing() {
 /// RED before the fix: the self-check had no meta budget, and the writer,
 /// with no held pane left to drop, wrote the oversized manifest anyway.
 ///
-/// IN A CHILD PROCESS ([`run_in_children`], 2026-09-30, gate speed). The
+/// IN A CHILD PROCESS ([`run_in_children`], test-run speed). The
 /// forty tabs' manifest is written and settled under [`ENV_LOCK`] (its
 /// control dir is the scratch HOME's): 3.7 s alone, every test of this
-/// module the runner started meanwhile parked on the lock — measured the
-/// same day in the gate's `-p aterm-gui --lib` binary at
-/// `RUST_TEST_THREADS=7`, three siblings took 3.0 to 3.8 s there against
-/// 0.001 to 0.003 s alone. The child runs this body unchanged, over an
-/// environment of its own.
+/// module the runner starts meanwhile parks on the lock — in the
+/// `-p aterm-gui --lib` binary at `RUST_TEST_THREADS=7`, three siblings
+/// took 3.0 to 3.8 s there against 0.001 to 0.003 s alone. The child runs
+/// this body unchanged, over an environment of its own.
 #[test]
 #[cfg(unix)]
 fn an_oversized_manifest_degrades_sessions_instead_of_being_written() {
@@ -2009,14 +2025,17 @@ fn an_oversized_manifest_degrades_sessions_instead_of_being_written() {
                 history_withheld: false,
                 history_lost: 0,
                 hold: None,
+                more_holds: Vec::new(),
                 supervisor: None,
                 claim_known: false,
                 attention_owners: Vec::new(),
                 viewport_from_bottom: None,
                 render_debt: None,
                 questions: None,
+                autopilot: None,
                 fabric: Default::default(),
                 timeline_id: 0,
+                log_ids: None,
                 journal_key: None,
             })
             .collect(),
@@ -2198,14 +2217,17 @@ fn a_refused_grid_write_carries_its_io_error_kind_out() {
             history_withheld: false,
             history_lost: 0,
             hold: None,
+            more_holds: Vec::new(),
             supervisor: None,
             claim_known: false,
             attention_owners: Vec::new(),
             viewport_from_bottom: None,
             render_debt: None,
             questions: None,
+            autopilot: None,
             fabric: Default::default(),
             timeline_id: 0,
+            log_ids: None,
             journal_key: None,
         }],
         next_turn_id: None,
@@ -2298,14 +2320,17 @@ fn a_manifest_past_the_cap_on_connections_sheds_them_instead_of_being_refused() 
             history_withheld: false,
             history_lost: 0,
             hold: None,
+            more_holds: Vec::new(),
             supervisor: None,
             claim_known: false,
             attention_owners: Vec::new(),
             viewport_from_bottom: None,
             render_debt: None,
             questions: None,
+            autopilot: None,
             fabric: Default::default(),
             timeline_id: 0,
+            log_ids: None,
             journal_key: None,
         }],
         next_turn_id: None,
@@ -2437,14 +2462,17 @@ fn connections_give_way_before_held_panes_and_the_mailbox() {
                 history_withheld: false,
                 history_lost: 0,
                 hold: None,
+                more_holds: Vec::new(),
                 supervisor: None,
                 claim_known: false,
                 attention_owners: Vec::new(),
                 viewport_from_bottom: None,
                 render_debt: None,
                 questions: None,
+                autopilot: None,
                 fabric,
                 timeline_id: 0,
+                log_ids: None,
                 journal_key: None,
             }],
             next_turn_id: None,
@@ -2605,14 +2633,17 @@ fn connections_that_cannot_cover_the_excess_measured_are_kept() {
             history_withheld: false,
             history_lost: 0,
             hold: None,
+            more_holds: Vec::new(),
             supervisor: None,
             claim_known: false,
             attention_owners: Vec::new(),
             viewport_from_bottom: None,
             render_debt: None,
             questions: None,
+            autopilot: None,
             fabric: Default::default(),
             timeline_id: 0,
+            log_ids: None,
             journal_key: None,
         }],
         next_turn_id: None,
@@ -4331,6 +4362,7 @@ fn stage_outgoing_handoff_full(
             role: None,
             attention: None,
             questions: None,
+            autopilot: None,
             control: None,
             frozen_path: false,
             identity: None,
@@ -4349,6 +4381,7 @@ fn stage_outgoing_handoff_full(
             history_withheld: false,
             history_lost: 0,
             hold: None,
+            more_holds: Vec::new(),
             supervisor: None,
             claim_known: false,
             attention_owners: Vec::new(),
@@ -4364,6 +4397,7 @@ fn stage_outgoing_handoff_full(
             }),
             fabric: Default::default(),
             timeline_id: 0,
+            log_ids: None,
             journal_key: None,
         });
         live.push((local_id, master, 4000 + index as i32));
@@ -4953,7 +4987,8 @@ pub(super) fn restage_session(
 /// through the spawn's own seams (`hydrate_adopted_engine`,
 /// `seed_adopted_title`, `seed_adopted_fabric`):
 ///
-/// * session 0 was halted by the FLEET and runs a program that titled its
+/// * session 0 was halted by the FLEET over its owner's own hold (both
+///   come back, each in its own slot) and runs a program that titled its
 ///   tab, named its icon and pushed its caller's title — all of it comes
 ///   back, the pop included;
 /// * session 1 was halted by its OWNER and arrives as a producer from
@@ -5016,6 +5051,8 @@ fn a_hold_and_the_titles_cross_the_real_wire() {
     let (file_nonce, toml) = body.split_once('\n').expect("nonce header");
     let mut published = SessionHandoff::from_toml(toml).expect("parse the manifest");
     published.sessions[0].hold = Some("fleet fabric-lost".to_string());
+    // …beside the owner's own stop, which a fleet halt never replaces.
+    published.sessions[0].more_holds = vec!["local mine".to_string()];
     published.sessions[1].hold = Some("local stop%20driving".to_string());
     std::fs::write(
         &staged.manifest_path,
@@ -5048,16 +5085,14 @@ fn a_hold_and_the_titles_cross_the_real_wire() {
         "the proof covers the retitled wire it was recomputed over, and no hold"
     );
 
+    let hold = |reason: &str, origin: &str| crate::fabric::Hold {
+        reason: reason.to_string(),
+        origin: origin.to_string(),
+    };
     let expected_hold = [
-        Some(crate::fabric::Hold {
-            reason: "fabric-lost".to_string(),
-            origin: "fleet".to_string(),
-        }),
-        Some(crate::fabric::Hold {
-            reason: "stop%20driving".to_string(),
-            origin: "local".to_string(),
-        }),
-        None,
+        vec![hold("fabric-lost", "fleet"), hold("mine", "local")],
+        vec![hold("stop%20driving", "local")],
+        vec![],
     ];
     for (a, want_hold) in adopted.iter_mut().zip(expected_hold) {
         let term = std::sync::Mutex::new(aterm_core::terminal::Terminal::new(24, 80));
@@ -5073,14 +5108,13 @@ fn a_hold_and_the_titles_cross_the_real_wire() {
         let seeded = crate::spawn::seed_adopted_title(&term, a.checkpoint.as_ref(), &a.title);
         let fabric = crate::fabric::SessionFabric::default();
         let timeline = std::sync::Mutex::new(crate::session_timeline::SessionTimeline::default());
-        crate::spawn::seed_adopted_fabric(
-            &fabric,
-            &timeline,
-            &a.topics,
-            a.hold.as_deref(),
-            &a.fabric,
+        crate::spawn::seed_adopted_fabric(&fabric, &timeline, &a.topics, &a.holds, &a.fabric);
+        assert_eq!(
+            fabric.holds().standing().collect::<Vec<_>>(),
+            want_hold,
+            "session {}",
+            a.local_id
         );
-        assert_eq!(fabric.hold(), want_hold, "session {}", a.local_id);
         let mut engine = term.lock().unwrap();
         match a.local_id {
             0 => {
@@ -5301,10 +5335,12 @@ fn an_older_producers_tab_takes_its_park_title_not_the_records_stale_copy() {
                 role: None,
                 attention: None,
                 questions: None,
+                autopilot: None,
                 identity: None,
                 agent: None,
                 supervised: None,
                 held: false,
+                holds: Vec::new(),
             },
         )))
     };

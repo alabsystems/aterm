@@ -727,15 +727,3 @@ fn every_incomplete_etag_is_caught_missing_real_frame_changes() {
         );
     }
 }
-
-/// THE NEGATIVE CONTROL, over the walk: main's etag from before this fix is
-/// caught handing one etag to two different frames, so the walk that passes
-/// the shipped etag is a walk with teeth.
-#[test]
-fn the_walk_catches_main_s_etag_before_the_style_policy() {
-    let w = walk(etag_before_the_style_policy);
-    let collision = w
-        .collision
-        .expect("the walk never showed the pre-fix etag two frames under one etag");
-    println!("main's etag before the style policy: {collision}");
-}

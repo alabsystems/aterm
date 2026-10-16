@@ -5,11 +5,10 @@
 //! Darwin's `POSIX_SPAWN_CLOEXEC_DEFAULT`, which marks every descriptor the
 //! caller did not name close-on-exec inside the spawn, atomically.
 //!
-//! The PTY keeper holds a custody copy of every terminal's master, and the one
-//! program it starts is `/usr/bin/open -a <its own bundle>`. A master leaking
-//! into that child would be a holder no scan was asked about; a `fork` + strip
-//! in `pre_exec` leaves a window for a concurrently opened descriptor, this
-//! flag does not. The child's stdin/stdout/stderr are `/dev/null`.
+//! The PTY keeper holds a custody copy of every terminal's master, and the one program it
+//! starts is `/usr/bin/open -a <its own bundle>`. A master leaking into that child would be a
+//! holder no scan was asked about; a `fork` + strip in `pre_exec` leaves a window for a
+//! concurrently opened descriptor, this flag does not.
 //!
 //! Darwin only; elsewhere [`spawn_cloexec_default`] answers `Unsupported`.
 
@@ -147,12 +146,10 @@ pub fn spawn_cloexec_default(_program: &str, _args: &[&str]) -> io::Result<u32> 
 mod tests {
     use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 
-    /// A descriptor this process holds without close-on-exec, at a number no
-    /// shell touches (200), does not reach the child. Control: the same probe
-    /// started by a deliberately leaky `posix_spawn` (no
-    /// `POSIX_SPAWN_CLOEXEC_DEFAULT`, `spawnfd::test_support`) sees it. Not a
-    /// `std` `Command`: Trust's std no longer hands a child anything above
-    /// stdio (SP-1), so it could not show the leak this flag prevents.
+    /// An inheritable descriptor at a number no shell touches (200) does not reach the child.
+    /// Control: the same probe started by a `posix_spawn` without the flag
+    /// (`spawnfd::test_support`) sees it. Not a std `Command`: Trust's std hands a child
+    /// nothing above stdio, so it could not show the leak.
     #[test]
     fn the_child_inherits_nothing_but_stdio() {
         unsafe extern "C" {

@@ -42,7 +42,14 @@
 //! [`read_bounded`], one [`READ_CAP`]-byte stack buffer, never to EOF: a
 //! device path that never ends would take the machine down.
 
-#![deny(missing_docs)]
+#![warn(missing_docs)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_types,
+        reason = "test code: a stand-in child may inherit descriptors"
+    )
+)]
 
 use std::collections::HashMap;
 use std::io::Read as _;
@@ -254,15 +261,21 @@ pub fn group_memory(pid: u32) -> Option<GroupMemory> {
     }
 }
 
-/// The machine's physical memory in MiB (`hw.memsize`), `None` where
-/// unknown (every platform but macOS).
+/// The machine's physical memory in MiB (`hw.memsize` on macOS, `MemTotal` in
+/// `/proc/meminfo` on Linux), `None` where unknown.
 #[must_use]
 pub fn physical_memory_mib() -> Option<u64> {
     #[cfg(target_os = "macos")]
     {
         macos::physical_memory_mib()
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        let text = read_bounded(Path::new("/proc/meminfo"))?;
+        let m = linux::meminfo(&text)?;
+        (m.total_kib >= 1024).then_some(m.total_kib / 1024)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         None
     }
@@ -279,17 +292,28 @@ pub struct MachineMemory {
     pub used_mib: u64,
 }
 
-/// The machine's memory available and in use now (one
-/// `host_statistics64(HOST_VM_INFO64)` and one `sysctl`), `None` where
-/// unknown (every platform but macOS). What the memory ceiling moves with
-/// (`aterm_agent::supervise::memory`).
+/// The machine's memory available and in use now (`HOST_VM_INFO64` on macOS,
+/// `/proc/meminfo` on Linux), `None` where unknown. What the memory ceiling
+/// moves with (`aterm_agent::supervise::memory`).
 #[must_use]
 pub fn machine_memory() -> Option<MachineMemory> {
     #[cfg(target_os = "macos")]
     {
         macos::machine_memory()
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        let text = read_bounded(Path::new("/proc/meminfo"))?;
+        let m = linux::meminfo(&text)?;
+        let total_mib = m.total_kib / 1024;
+        let available_mib = (m.available_kib / 1024).min(total_mib);
+        let used_mib = m.total_kib.saturating_sub(m.available_kib) / 1024;
+        Some(MachineMemory {
+            available_mib,
+            used_mib,
+        })
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         None
     }
@@ -332,17 +356,32 @@ pub fn memory_pressure() -> Option<MemoryLevel> {
 }
 
 /// KiB swapped in plus out since boot (`HOST_VM_INFO64` swapins plus
-/// swapouts, times `vm.pagesize`; one host statistics call and one
-/// `sysctl`): the counter whose rate the strain row prints as `swap N MB/s`
-/// ([`Reading::swap_pages`] is the same count in pages). A [`SwapMeter`]
-/// turns it into a rate. `None` where unknown (every platform but macOS).
+/// swapouts times `vm.pagesize` on macOS, `/proc/vmstat` `pswpin` plus
+/// `pswpout` times the page size on Linux): the counter whose rate the strain
+/// row prints as `swap N MB/s` ([`Reading::swap_pages`] is the same count in
+/// pages). A [`SwapMeter`] turns it into a rate. `None` where unknown.
 #[must_use]
 pub fn swapped_kib() -> Option<u64> {
     #[cfg(target_os = "macos")]
     {
         macos::swapped_kib()
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        static PAGE_KIB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let page_kib = *PAGE_KIB.get_or_init(|| {
+            read_bounded_bytes(Path::new("/proc/self/auxv"))
+                .ok()
+                .and_then(|b| linux::auxv_value(&b, 6))
+                .map(|b| (b / 1024) as u64)
+                .filter(|k| *k > 0)
+                .unwrap_or(4)
+        });
+        let text = read_bounded(Path::new("/proc/vmstat"))?;
+        let pages = linux::swap_pages(&text)?;
+        Some(pages.saturating_mul(page_kib))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         None
     }

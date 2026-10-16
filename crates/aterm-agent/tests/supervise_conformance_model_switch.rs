@@ -1,40 +1,31 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! TIER-1 for `SupervisorModelSwitch` (aterm-spec
-//! `supervisor_model_switch_model`): the REAL turn-end decider
-//! (`decide_turn_end`, with the real `TurnEndState` and its `observe`,
-//! `acted` and `restarted`) driven along EVERY reachable state of the model,
-//! so the answer to a model limit — the fallback asked for until the host can
-//! make it, the continuation first at the reset, a return only at a named
-//! reset that was ahead when the switch was made (the 240 relaunches in the
-//! five days of 2026-09-22 to 09-27) — is the model's, state for state.
+//! Tier-1 for `SupervisorModelSwitch` (aterm-spec `supervisor_model_switch_model`):
+//! the real turn-end decider (`decide_turn_end`, with `TurnEndState`'s `observe`,
+//! `acted` and `restarted`) driven along every reachable state of the model, so the
+//! answer to a model limit (the fallback asked for until the host can make it, the
+//! continuation first at the reset, a return only at a named reset that was ahead
+//! when the switch was made) is the model's, state for state.
 //!
-//! Each model action is mirrored on the real side. The agent's own jobs
-//! (`JobsStart`, `JobsEnd`) are invisible to the decider: they are the HOST's
-//! word, so the walk plays the host — a relaunch asked for while `jobs = 1`
-//! is refused with `wait:changed` (the loop decides again after its pause and
-//! never calls `restarted`), one asked for with `jobs = 0` is made
-//! (`restarted(.., true, ..)`, as the loop's `restart_agent` records it). A
-//! wall appearing is the point `observe`d with the turn's work; time is the
-//! real clock moved a minute per tick with the grace and jitter at zero, so a
-//! reset `ResetAt` ticks off is the decider's `reset_at`. At every state the
-//! model's invariants hold and the real verdict is checked against it:
+//! The agent's own jobs (`JobsStart`, `JobsEnd`) are the host's word, invisible to the
+//! decider, so the walk plays the host: a relaunch asked for while `jobs = 1` is
+//! refused with `wait:changed` (the loop decides again and never calls `restarted`),
+//! one asked for with `jobs = 0` is made (`restarted(.., true, ..)`, as
+//! `restart_agent` records it). Time is the real clock moved a minute per tick with
+//! grace and jitter at zero. At every state the model's invariants hold, and:
 //!
-//! * at a wall that shows on the bucket's model (`bucket = 1`, `on = 0`) the
-//!   decider TYPES the continuation exactly where `Continue` is enabled, and
-//!   asks the host for the fallback exactly where `AskFallback` is;
+//! * at a wall on the bucket's model (`bucket = 1`, `on = 0`) the decider types the
+//!   continuation exactly where `Continue` is enabled, and asks the host for the
+//!   fallback exactly where `AskFallback` is;
 //! * on the fallback (`on = 1`) at an idle point it asks for the return
-//!   (`Restart::ModelBack`) exactly where the switch owes one and its reset
-//!   has come (the host permitting is the model's `Return`), and never
-//!   otherwise;
+//!   (`Restart::ModelBack`) exactly where the switch owes one and its reset has come
+//!   (the host permitting is the model's `Return`), and never otherwise;
 //! * on the bucket's model with no wall it asks for nothing.
 //!
-//! NEGATIVE CONTROLS: the `Buggy = 1` model (a return guessed a tick after a
-//! switch nothing scheduled a return for) disagrees with the real decider —
-//! which never returns from an unscheduled switch — and the old rule (a
-//! `ModelSwitch` seeded with a guessed half hour's `back_at`) is caught by
-//! the same comparison, so a green walk is not vacuous.
+//! Negative controls: the `Buggy = 1` model (a return guessed a tick after an
+//! unscheduled switch) and a `ModelSwitch` seeded with a guessed half hour's
+//! `back_at` are each caught by the same comparison.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
@@ -48,6 +39,8 @@ use aterm_agent::supervise::policy::turn_end::{
 use aterm_phase::WallKind;
 use aterm_spec::derive::{Model, supervisor_model_switch_model};
 
+use crate::common::cnst;
+
 type State = BTreeMap<&'static str, i64>;
 
 const MIN: Duration = Duration::from_secs(60);
@@ -55,16 +48,8 @@ const REAL_WORK: Duration = Duration::from_secs(30 * 60);
 const WALL: &str =
     "You've reached your Fable limit. Run /usage-credits to continue or switch models with /model.";
 
-fn cnst(m: &Model, name: &str) -> i64 {
-    m.consts
-        .iter()
-        .find(|(n, _)| *n == name)
-        .map(|(_, v)| *v)
-        .unwrap_or_else(|| panic!("no const {name}"))
-}
-
-/// The real policy's clocks, scaled so one model tick is one minute and the
-/// reset is acted on AT the reset.
+/// The real policy's clocks, scaled so one model tick is one minute and the reset
+/// is acted on at the reset.
 fn timing() -> TurnEndTiming {
     TurnEndTiming {
         reset_grace: Duration::ZERO,
@@ -109,6 +94,10 @@ fn base_reading() -> TurnEndReading {
         thread_model: None,
         upgrade_goal: false,
         account: None,
+        autopilot: aterm_agent::supervise::Autopilot::Cruise,
+        login_label: None,
+        login_superseded: false,
+        login_notice: None,
     }
 }
 
@@ -179,9 +168,8 @@ fn expected(m: &Model, st: &State) -> Verdict {
             Verdict::Other
         }
     } else if st["on"] == 1 && st["back"] == 1 && st["clock"] >= cnst(m, "ResetAt") {
-        // The switch owes its return and the reset has come; whether the HOST
-        // can make it now is the model's `Return` guard (`jobs`), not the
-        // decider's.
+        // The switch owes its return and the reset has come; whether the host
+        // can make it now is the model's `Return` guard (`jobs`), not the decider's.
         Verdict::Return
     } else {
         Verdict::Other
@@ -263,9 +251,8 @@ fn mirror(
                 real.st.observe(&again, now);
             }
         }
-        // The defects: not the real code's moves. The real side does NOTHING
-        // where the model's defect acts, and the comparison at the state the
-        // model reaches is the disagreement the negative control asks for.
+        // The model's defects: the real side does nothing, and the comparison at
+        // the state reached is the negative control's disagreement.
         "GuessedReturn" | "GivesUp" | "ReturnBlocks" => {}
         other => panic!("an action this bind does not mirror: {other}"),
     }
@@ -292,8 +279,8 @@ fn walk(m: &Model, strict: bool) -> (usize, Vec<State>) {
                 assert!(m.check_invariant(inv.name, &st), "{} at {st:?}", inv.name);
             }
         }
-        // The walk asks the decider at EVERY state, as the loop does at each
-        // change that can move its answer (a tick, a screen, a host's word).
+        // The decider is asked at every state, as the loop asks at each change
+        // that can move its answer (a tick, a screen, a host's word).
         let mut at = real.st.clone();
         let here = reading(m, &st, real.appeared, None);
         at.observe(&here, real.now);
@@ -328,11 +315,10 @@ fn tier1_the_real_decider_switches_and_returns_exactly_where_the_model_allows() 
     assert!(states > 50, "{states}");
 }
 
-/// NEGATIVE CONTROLS: the `Buggy = 1` model (a return guessed at a switch
-/// nothing scheduled one for) is not the real decider, which asks for no
-/// return there; and the old rule — a switch seeded with a guessed half
-/// hour's `back_at` — makes the real decider return where the model's
-/// committed switch owes none.
+/// Negative controls: the `Buggy = 1` model (a return guessed at a switch nothing
+/// scheduled one for) is not the real decider; and a switch seeded with a guessed
+/// half hour's `back_at` makes the real decider return where the committed switch
+/// owes none.
 #[test]
 fn the_guessed_return_and_the_old_half_hour_disagree_with_the_real_code() {
     let m = supervisor_model_switch_model();
@@ -344,7 +330,7 @@ fn the_guessed_return_and_the_old_half_hour_disagree_with_the_real_code() {
         off.len()
     );
 
-    // The old rule, on the real side: a switch with a guessed `back_at`.
+    // The guessed rule, on the real side: a switch with a guessed `back_at`.
     let cfg = SupervisorConfig::default();
     let t = Instant::now() + Duration::from_secs(3600);
     let mut st = TurnEndState::new(timing());

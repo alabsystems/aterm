@@ -39,8 +39,8 @@
 //! SELF-CONTAINED ON PURPOSE: std only, nothing from the rest of this crate. `asb`
 //! reads `--cap-file` in its DEFAULT build too — a malformed line is a usage error
 //! there as well, and only the attach itself needs the MAC — but a default broker
-//! does not depend on `astream-cap` (it would pull sha2 into a zero-third-party
-//! build), so `asb` compiles THIS FILE into itself by path. Keep it free of
+//! does not depend on `astream-cap` (capabilities are its opt-in `cap` feature),
+//! so `asb` compiles THIS FILE into itself by path. Keep it free of
 //! `crate::` items and of every dependency: one source, two builds, and no second
 //! reader to drift from the first.
 
@@ -54,12 +54,24 @@ const TAG_BYTES: usize = 32;
 const HEX: &[u8; 16] = b"0123456789abcdef";
 
 /// One capability line: the grant and the tag that seals it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Its `Debug` output names the grant but redacts the tag, as `Capability`'s does:
+/// the tag IS the bearer secret, and debug output ends up in logs.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Line {
     /// The grant, byte for byte as it was minted — the string the tag is over.
     pub grant: String,
     /// The HMAC-SHA256 tag, decoded from the line's 64 hex digits.
     pub tag: [u8; TAG_BYTES],
+}
+
+impl fmt::Debug for Line {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Line")
+            .field("grant", &self.grant)
+            .field("tag", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Why one line is not a capability line.
@@ -145,12 +157,17 @@ impl std::error::Error for ReadError {}
 /// its end, is fine: that is what splitting at the last whitespace is for.
 #[must_use]
 pub fn format_line(grant: &str, tag: &[u8; TAG_BYTES]) -> String {
-    let mut line = String::with_capacity(grant.len() + 1 + TAG_BYTES * 2);
-    line.push_str(grant);
+    // The copy of `grant` sizes itself; only the constant-size tail is reserved,
+    // so no length sum of ours can overflow.
+    const TAIL: usize = 1 + TAG_BYTES * 2;
+    let mut line = grant.to_owned();
+    line.reserve(TAIL);
     line.push(' ');
-    for b in tag {
-        line.push(char::from(HEX[usize::from(b >> 4)]));
-        line.push(char::from(HEX[usize::from(b & 0x0f)]));
+    for &b in tag {
+        // Both nibbles are < 16 == HEX.len(). (`as usize`, a widening cast the
+        // verifier models, where `usize::from` is an opaque call to it.)
+        line.push(char::from(HEX[(b >> 4) as usize]));
+        line.push(char::from(HEX[(b & 0x0f) as usize]));
     }
     line
 }
@@ -189,7 +206,10 @@ pub fn parse_text(path: &str, text: &str) -> Result<Vec<Line>, Malformed> {
             parse_line(raw)
                 .map_err(|error| Malformed {
                     path: path.to_string(),
-                    line: n + 1,
+                    // `n` indexes a line of `text`, so it is far below
+                    // `usize::MAX`: saturating never engages; it only makes the
+                    // 1-based line number total.
+                    line: n.saturating_add(1),
                     error,
                 })
                 .transpose()
@@ -229,8 +249,11 @@ fn decode_tag(hex: &[u8]) -> Result<[u8; TAG_BYTES], Error> {
     }
     let mut tag = [0u8; TAG_BYTES];
     for (i, (out, pair)) in tag.iter_mut().zip(hex.as_chunks::<2>().0).enumerate() {
-        let hi = nibble(pair[0]).ok_or(Error::TagNotHex(2 * i))?;
-        let lo = nibble(pair[1]).ok_or(Error::TagNotHex(2 * i + 1))?;
+        // `i < TAG_BYTES`, so the byte offsets `2i` and `2i + 1` are < 64:
+        // saturating never engages; it only makes the offset arithmetic total.
+        let at = i.saturating_mul(2);
+        let hi = nibble(pair[0]).ok_or(Error::TagNotHex(at))?;
+        let lo = nibble(pair[1]).ok_or(Error::TagNotHex(at.saturating_add(1)))?;
         *out = (hi << 4) | lo;
     }
     Ok(tag)
@@ -252,6 +275,33 @@ mod tests {
 
     fn hex_of(tag: &[u8; TAG_BYTES]) -> String {
         tag.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[test]
+    fn debug_output_names_the_grant_but_never_the_tag() {
+        let line = Line {
+            grant: "ro:/f/F/>".to_string(),
+            tag: tag_from(0xa0),
+        };
+        assert_eq!(
+            format!("{line:?}"),
+            r#"Line { grant: "ro:/f/F/>", tag: "<redacted>" }"#
+        );
+    }
+
+    /// The tag is written as lowercase hex, high nibble first, every byte two
+    /// digits — pinned on bytes that exercise every nibble value in both halves.
+    #[test]
+    fn format_line_writes_the_tag_as_two_lowercase_hex_digits_per_byte() {
+        let mut tag = [0u8; TAG_BYTES];
+        for (i, b) in tag.iter_mut().enumerate() {
+            *b = u8::try_from(i * 0x11 % 256).unwrap() ^ 0x0f;
+        }
+        tag[TAG_BYTES - 1] = 0xff;
+        let line = format_line("ro:/f/>", &tag);
+        let want: String = tag.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(line, format!("ro:/f/> {want}"));
+        assert_eq!(parse_line(&line).unwrap().unwrap().tag, tag);
     }
 
     /// What a mint prints is what the reader reads — for a grant holding a space,

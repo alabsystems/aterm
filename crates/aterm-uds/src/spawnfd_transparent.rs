@@ -10,7 +10,7 @@
 //! in `MAKEFLAGS`, a `3>file` redirect, a number handed down in the
 //! environment — so dropping them would break the program, not protect it.
 //! Every other child is built by [`super::command`], which hands on its stdio
-//! and nothing else (`tools/grep_guard.sh` B27).
+//! and nothing else (clippy.toml: one child constructor).
 //!
 //! WHY IT IS NOT `std`'s `Command`: Trust's std (SP-1, trust 6eb03c9a18) hands
 //! a `Command` child fds 0-2 plus what `CommandExt::inherit_fd` names, and a
@@ -41,7 +41,7 @@
 //! An `exec` needs none of this: an exec keeps the whole table on every std
 //! (SP-1 leaves `CommandExt::exec` as upstream has it), so the pass-throughs
 //! that become their program (`aterm pkg run`, the reroutes, the landing
-//! shim) still `exec` a `std::process::Command`, B27's allow-listed rows.
+//! shim) still `exec` a `std::process::Command`, each a reviewed `#[expect]`.
 
 use super::{Image, LaneChild, Placement, platform};
 use std::ffi::{OsStr, OsString};

@@ -1,0 +1,17 @@
+schema = 2
+program = "claude"
+version = "2026092601"
+build_number = 2026092601
+exposes = ["claude"]
+
+[[artifact]]
+target = "aarch64-apple-darwin"
+kind = "binary"
+url = "claude-2026092601-aarch64-apple-darwin.tar.zst"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[[artifact]]
+target = "x86_64-apple-darwin"
+kind = "binary"
+url = "claude-2026092601-x86_64-apple-darwin.tar.zst"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"

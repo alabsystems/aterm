@@ -186,7 +186,15 @@ pub(crate) fn unavailable(
     let Some(snap) = snap else {
         return Some("not-the-hosts-agent");
     };
-    if !aterm_agent::harness::relaunch::carries_restart(&snap) {
+    // A self-supervised agent comes back on the line aterm's copy of its own
+    // record validated (the crash rule, §4), never on the lane's plan.
+    let relaunchable = match crate::self_claim::copy_of_tab(ctx.self_id.as_str())
+        .filter(|copy| copy.pid == snap.pid && copy.start == snap.start)
+    {
+        Some(copy) => copy.resume.is_ok(),
+        None => aterm_agent::harness::relaunch::carries_restart(&snap),
+    };
+    if !relaunchable {
         return Some("not-relaunchable");
     }
     crate::input_stall::host_hand_refusal(ctx, now_us)
@@ -245,11 +253,7 @@ pub(crate) struct Offer {
 pub(crate) fn offered(ctx: &SessionCtx, leader: Option<i32>, now_us: u64) -> Option<Offer> {
     let snap = crate::harness_host::published_snapshot(ctx.self_id.as_str())?;
     let pid = i32::try_from(snap.pid).ok()?;
-    let agent = if snap.codex.is_some() {
-        aterm_phase::Program::Codex
-    } else {
-        aterm_phase::Program::Claude
-    };
+    let agent = snap.agent().program();
     let in_front = || {
         let tl = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
         crate::harness_host::agent_of(tl.agent()) == Some(agent)
@@ -871,12 +875,18 @@ impl Drop for Listed {
 /// names, or one the outgoing instance's claim still names — a successor's
 /// carrier's case, which must finish.
 pub(crate) fn another_hand(ctx: &SessionCtx, now_us: u64) -> bool {
+    // A PROVEN SELF-CLAIM is no other hand (the self-claim contract, §4):
+    // it is the very program the act ends, which cannot restart itself out of
+    // a stall — the remedy aterm keeps for it.
     let claimed = ctx
         .meta
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .live_supervisor(now_us)
-        .is_some_and(|holder| !aterm_agent::harness::upgrade_drive::is_host_holder(holder));
+        .live_claim(now_us)
+        .is_some_and(|claim| {
+            claim.proven.is_none()
+                && !aterm_agent::harness::upgrade_drive::is_host_holder(&claim.holder)
+        });
     if claimed || ctx.fabric.hold().is_some() {
         return true;
     }

@@ -28,6 +28,24 @@ use aterm_uds::CtlStream;
 /// provisioned into.
 pub(crate) fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::MetadataExt;
+    // A directory that already IS what this returns success for — a
+    // directory, exactly `0700`, passing the SEC-3 predicate below on a fresh
+    // stat — needs nothing created or written: one `stat(2)`, where the full
+    // path below is four (`mkdir`, the `EEXIST` stat, two more). Every spawn
+    // asks for the control dir and its subdirs about eight times. Nothing is
+    // remembered between calls, so a directory removed or loosened since is
+    // seen at once and takes the full path.
+    if let Ok(meta) = std::fs::metadata(dir)
+        && meta.is_dir()
+        && meta.mode() & 0o7777 == 0o700
+        && aterm_types::fs_restricted::dir_safe_for_private_write(
+            our_uid(),
+            meta.uid(),
+            meta.mode(),
+        )
+    {
+        return Ok(());
+    }
     std::fs::create_dir_all(dir)?;
     // Only a mode that is not already `0700` is written: a `chmod(2)` to the
     // mode a directory already has still moves its `st_ctime` (APFS), and
@@ -153,11 +171,10 @@ mod ctime_tests {
     /// so its `st_ctime` does not move — while a drifted mode is still forced back
     /// to `0700`. A same-mode chmod moves the ctime on APFS, and tippy snapshots the
     /// ctime of every ancestor of the executable it runs and aborts on a change
-    /// ("ancestor … changed identity or contents"). This copy of the rule kept the
-    /// unconditional chmod after aterm-update-core's copy dropped it on 2026-09-15,
-    /// and on 2026-09-24 a merge-contract run lost its whole tippy stage to it:
-    /// `~/Library/Application Support/aterm`, the control-socket directory and an
-    /// ancestor of the atpkg store, had its ctime moved mid-compile.
+    /// ("ancestor … changed identity or contents"): an unconditional chmod here
+    /// loses a whole tippy run, since `~/Library/Application Support/aterm`, the
+    /// control-socket directory, is an ancestor of the atpkg store and has its
+    /// ctime moved mid-compile. aterm-update-core's copy of the rule is the same.
     #[cfg(unix)]
     #[test]
     fn an_already_private_dir_keeps_its_ctime_and_a_drifted_one_is_hardened() {
@@ -177,6 +194,11 @@ mod ctime_tests {
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         ensure_private_dir(&dir).unwrap();
         assert_eq!(stamp().2, 0o700, "a drifted mode is hardened");
+        // Nothing is remembered from the calls above: a directory removed since
+        // is made again, private.
+        std::fs::remove_dir(&dir).unwrap();
+        ensure_private_dir(&dir).unwrap();
+        assert_eq!(stamp().2, 0o700, "a removed directory is made again");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

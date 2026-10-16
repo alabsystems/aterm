@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Test-only: how a row ends (design ruling 267) — a row aterm quits under is recorded
-//! as cut off by the quit with where its work was, a script's first load is
-//! its declaration, and a finished record offers no dead intent on the wire.
+//! How a row ends: a row aterm quits under is recorded as cut off by the
+//! quit with where its work was, a script's first load is its declaration,
+//! and a finished record offers no dead intent on the wire.
 
 use crate::Outcome;
 use crate::center::MessageCenter;
@@ -32,13 +32,9 @@ fn sweep(c: &mut MessageCenter, now: Instant) {
     c.commit_rows(now, 3);
 }
 
-/// ATERM QUITTING IS NOT THE REPORTER GOING SILENT (ruling 267). Day two:
-/// a script's `Rendering the video` at 28 % and a held `Disk nearly full`
-/// warning were open when aterm quit; after the relaunch the log read the
-/// render as `stopped reporting` with no percent, and the warning as the
-/// same. The graceful exit now retires every open row `Quit`: the words
-/// stand, the determinate row says where it was, and the lines survive the
-/// codec so the next launch reads exactly that.
+/// aterm quitting is not the reporter going silent: the graceful exit
+/// retires every open row `Quit`, so the words stand, a determinate row says
+/// where it was, and the lines survive the codec for the next launch.
 #[test]
 fn a_row_open_when_aterm_quits_is_recorded_as_cut_off_with_its_percent() {
     let t0 = Instant::now();
@@ -120,18 +116,15 @@ fn a_row_open_when_aterm_quits_is_recorded_as_cut_off_with_its_percent() {
     assert!(replayed.retired_unix_ms.is_some());
 }
 
-/// A SCRIPT'S FIRST LOAD IS ITS DECLARATION (ruling 267). Day two: a wire
-/// row posted with `load=disk` reserved the widest words of all four loads
-/// (`network busy`), so at 60 columns the row dropped its `Details ›` and
-/// its words with cells to spare, and the words stayed off until 80. It
-/// reserves its own load's words now, and a different load later widens
-/// the slot once (ruling 221).
+/// A script's first load is its declaration: a wire row posted with
+/// `load=disk` reserves only its own load's words, not the widest of all
+/// four, and a different load later widens the slot once.
 #[test]
 fn a_scripts_first_load_is_its_declaration_and_reserves_only_its_words() {
     let t0 = Instant::now();
     let mut c = MessageCenter::new(MessageLog::empty(), t0);
     let mut g = WireGate::default();
-    // Day two's band: the ALab tools check above, the script's row under it.
+    // A toolchain check above, the script's row under it.
     let alab = c
         .post(
             Message::new(tags::TOOLCHAIN, Severity::Info, "Updating ALab tools")
@@ -161,9 +154,8 @@ fn a_scripts_first_load_is_its_declaration_and_reserves_only_its_words() {
     let live = c.live_rows().find(|l| l.id != alab).expect("the row");
     assert_eq!(live.msg.loads, Loads::NONE.with(Load::Disk));
     assert_eq!(live.load_slot, Loads::NONE.with(Load::Disk));
-    // At 60 columns the cells the widest words held empty come back: the
-    // row keeps its `Details ›` (before, it lost it AND the words), and the
-    // ETA still outranks the load words (ruling 229).
+    // At 60 columns the row keeps its `Details ›`, and the ETA still
+    // outranks the load words.
     let p = c.presentation(60, &char_width, None, Links::Painted);
     assert_eq!(p.rows.len(), 2, "{p:?}");
     assert_eq!(p.rows[0].kind, crate::glass::RowKind::Message(alab));
@@ -171,8 +163,7 @@ fn a_scripts_first_load_is_its_declaration_and_reserves_only_its_words() {
     assert!(row.eta.is_some(), "{row:?}");
     assert_eq!(row.capsules.len(), 1, "{row:?}");
     assert_eq!(row.capsules[0].full_label, "Details \u{203a}");
-    // At 70 the disk words show — where the widest reservation kept them
-    // off until 80.
+    // At 70 the disk words show.
     let p = c.presentation(70, &char_width, None, Links::Painted);
     let row = &p.rows[1];
     assert_eq!(
@@ -196,10 +187,8 @@ fn a_scripts_first_load_is_its_declaration_and_reserves_only_its_words() {
     );
 }
 
-/// THE WIRE OFFERS NO DEAD INTENT (ruling 267, the page's ruling 265): day
-/// two's `messages` listed `actions="Stop paste"` on the finished `Paste
-/// stopped` records while the page offered nothing. A live row still lists
-/// it; its record does not.
+/// The wire offers no dead intent: a live row lists its `actions=`; its
+/// finished record does not.
 #[test]
 fn a_finished_records_row_lists_no_intent_that_ended_with_it() {
     let t0 = Instant::now();

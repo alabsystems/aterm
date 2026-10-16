@@ -24,6 +24,9 @@
 //! ([`Session::attention_ours`]) only tells a box's badge from a limit's. A
 //! loop watching behind another supervisor's claim writes none.
 
+use super::super::journal::{
+    ATTENTION_KEPT, ATTENTION_SKIPPED, CLEARED_BOX, ESCALATED_BEHIND, MAIL_ADOPTED, MAIL_RETRY,
+};
 use super::*;
 
 /// How much of the subject (command, path, question) the attention carries,
@@ -85,10 +88,17 @@ fn question_above(rows: &[String], first: usize) -> Option<&str> {
 /// reader: a question's last row; at an idle point the turn-end policy
 /// escalated, the wall it ended on (`wall`) or the worker's last words
 /// (`idle`); a box's command, path or question. Another program's point
-/// (Codex's) is named from its reading alone ([`kind_and_subject_read`]).
+/// (Codex's, agy's, Muse Code's) is named from its reading alone
+/// ([`kind_and_subject_read`]).
 fn kind_and_subject(reader: &dyn ScreenReader, point: &Turn) -> (String, String) {
-    if reader.program() != aterm_phase::Program::Claude {
-        return kind_and_subject_read(reader, point);
+    match reader.program() {
+        aterm_phase::Program::Claude => {}
+        aterm_phase::Program::Codex
+        | aterm_phase::Program::Agy
+        | aterm_phase::Program::Muse
+        | aterm_phase::Program::Generic => {
+            return kind_and_subject_read(reader, point);
+        }
     }
     let rows = &point.screen.rows;
     if point.phase == Phase::Idle {
@@ -270,7 +280,7 @@ impl<C: Ctl> Session<'_, C> {
     /// The same episode opened again (`again`, [`Retry`]) or adopted from a
     /// previous watcher sets the attention and posts nothing (`mail=skipped:
     /// …`), as does a missing manager or fabric. While a stall is in hand an
-    /// ask raises no badge ([`Self::withhold_badge`], [`stall::ASK_WITHHELD`]).
+    /// ask raises no badge ([`Self::withhold_badge`], [`stall::WITHHELD`]).
     pub(super) fn escalate(
         &mut self,
         seq: u64,
@@ -281,7 +291,7 @@ impl<C: Ctl> Session<'_, C> {
     ) -> Result<(), Fail> {
         if let Some(holder) = self.claim.watching_behind() {
             review.note(&format!(
-                "ESCALATED seq={seq} attention=skipped: another supervisor ({holder}) answers \
+                "ESCALATED seq={seq} {ATTENTION_SKIPPED}{ESCALATED_BEHIND} ({holder}) answers \
                  this session mail=skipped: the same"
             ));
             return Ok(());
@@ -302,14 +312,12 @@ impl<C: Ctl> Session<'_, C> {
         let attention_said = reply_word(&r);
         let adopted = kind == "control" && std::mem::take(&mut self.adopted_limit);
         let mail_said = match (again, self.manager.clone()) {
-            (Some(of), _) => {
-                format!("skipped: the retry hit the wall again, the episode of seq={of}")
-            }
-            _ if adopted => "skipped: adopted from a previous watcher".to_string(),
+            (Some(of), _) => format!("{MAIL_RETRY}, the episode of seq={of}"),
+            _ if adopted => MAIL_ADOPTED.to_string(),
             (None, None) => "skipped: no --inbox and no $ATERM_PARENT_SESSION_ID".to_string(),
             (None, Some(to)) => match self.fabric_state()?.as_str() {
                 "connected" if kind == "ask" && self.stall_in_hand(review) => {
-                    stall::ASK_WITHHELD.to_string()
+                    format!("skipped: {}", stall::WITHHELD)
                 }
                 "connected" => {
                     let to = format!("to={to}");
@@ -404,7 +412,7 @@ impl<C: Ctl> Session<'_, C> {
                 }
                 reply_word(&r)
             }
-            Some(_) => "kept".to_string(),
+            Some(_) => ATTENTION_KEPT.to_string(),
             None => "none".to_string(),
         })
     }
@@ -418,7 +426,7 @@ impl<C: Ctl> Session<'_, C> {
             return Ok(());
         }
         let said = self.unset_if_ours(|t| !t.starts_with(ATTENTION_PREFIX))?;
-        review.note(&format!("CLEARED seq={seq} box attention={said}"));
+        review.note(&format!("CLEARED seq={seq} {CLEARED_BOX} attention={said}"));
         Ok(())
     }
 
@@ -440,6 +448,48 @@ impl<C: Ctl> Session<'_, C> {
         let said = self.unset_if_ours(|t| t.starts_with(ATTENTION_PREFIX))?;
         review.note(&format!("CLEARED seq={seq} attention={said} {why}"));
         Ok(())
+    }
+
+    /// A limit's badge adopted from a previous loop ([`Session::adopted_limit`])
+    /// is taken down while it is still this loop's entry, its marker
+    /// untouched: journaled as an episode's close is, `CLEARED seq=<n>
+    /// attention=<said> <why>`. Nothing while the entry is no `limited:` badge
+    /// of the loop's (an episode's close took it down already).
+    pub(super) fn lower_adopted_limit(
+        &mut self,
+        seq: u64,
+        why: &str,
+        review: &mut dyn Review,
+    ) -> Result<(), Fail> {
+        if !self
+            .attention_ours
+            .as_deref()
+            .is_some_and(|t| t.starts_with(ATTENTION_PREFIX))
+        {
+            return Ok(());
+        }
+        let said = self.unset_if_ours(|t| t.starts_with(ATTENTION_PREFIX))?;
+        review.note(&format!("CLEARED seq={seq} attention={said} {why}"));
+        Ok(())
+    }
+
+    /// The worker answered on a point that is not the limit's notice (a look's
+    /// point, or a read of an Off park), with no episode open: the limit a
+    /// previous loop's badge was adopted for ([`Session::adopted_limit`]) is
+    /// over. Its marker goes, so a later limit is a new episode, mailed — never
+    /// `mail=skipped: adopted …` for a wall nobody was told of — and its badge,
+    /// if still up, goes with it ([`Self::lower_adopted_limit`]). Nothing
+    /// while an episode is open: its close is the episode's.
+    pub(super) fn adopted_limit_over(
+        &mut self,
+        seq: u64,
+        why: &str,
+        review: &mut dyn Review,
+    ) -> Result<(), Fail> {
+        if self.limit.is_some() || !std::mem::take(&mut self.adopted_limit) {
+            return Ok(());
+        }
+        self.lower_adopted_limit(seq, why, review)
     }
 }
 
@@ -643,6 +693,97 @@ mod tests {
         let old = fit_reason(&label, &reason(&flagged));
         assert!(
             old.contains("then resume with claude --") && !old.contains(ID),
+            "{old}"
+        );
+    }
+
+    /// A CODEX'S MEMORY ESCALATION names its thread whole or not at all, as
+    /// Claude Code's names its conversation: its line
+    /// ([`crate::harness::resume::codex_command`]) steps down to its sandbox
+    /// flag alone, then to `codex resume <thread>`, beside the same label.
+    ///
+    /// Negative control: the cutting renderer alone ([`fit_reason`]) names the
+    /// command and cuts its thread away.
+    #[test]
+    fn a_codex_memory_escalation_names_its_thread_whole_or_not_at_all() {
+        const THREAD: &str = "019a0b1c-2d3e-7f40-8a5b-6c7d8e9f0a1b";
+        const CODEX: &dyn ScreenReader = &aterm_phase::CodexReader;
+        let mut rows = aterm_phase::prompt::fixtures::bash_one_row();
+        let at = rows
+            .iter()
+            .position(|r| r == "   git log --oneline -5")
+            .expect("row");
+        rows[at] = format!("   echo {}", "x".repeat(200));
+        let point = turn(Phase::Prompt, rows);
+        let banner = format!("{} (140.4GB)", aterm_phase::anchor_text("wall.memory"));
+        let line = |words: &[&str]| {
+            let argv: Vec<String> = words.iter().map(|w| (*w).to_string()).collect();
+            crate::harness::resume::codex_command(&argv, THREAD, None).expect("a line")
+        };
+        let reason = |line: &str| {
+            format!(
+                "memory critical: restart it{}{line}: {banner}",
+                crate::harness::resume::THEN_RESUME_WITH
+            )
+        };
+        let bypass = line(&["codex", "--dangerously-bypass-approvals-and-sandbox"]);
+        let sandboxed = line(&[
+            "codex",
+            "-m",
+            "gpt-5-codex",
+            "-c",
+            "model_reasoning_effort=high",
+            "-s",
+            "read-only",
+        ]);
+        // Every command named is whole: each `resume with codex` runs to the
+        // whole thread, and the thread's head is nowhere but in it.
+        let whole_or_absent = |t: &str| {
+            t.match_indices("resume with codex")
+                .all(|(i, _)| t[i..].contains(THREAD))
+                && t.match_indices(&THREAD[..8])
+                    .all(|(i, _)| t[i..].starts_with(THREAD))
+        };
+        let label = point_label(CODEX, &point);
+        // Behind a failed restart's prefix not even the bare line fits: the
+        // clause goes whole.
+        for (name, reason, says) in [
+            (
+                "bypassed",
+                reason(&bypass),
+                Some(format!("codex resume {THREAD}")),
+            ),
+            (
+                "sandboxed",
+                reason(&sandboxed),
+                Some(format!("codex resume -s read-only {THREAD}")),
+            ),
+            (
+                "behind a failed restart",
+                format!(
+                    "the restart could not be made (failed:signal-refused): {}",
+                    reason(&bypass)
+                ),
+                None,
+            ),
+        ] {
+            let t = attention_text(CODEX, &point, &reason);
+            assert!(t.len() <= ATTENTION_BYTES, "{name}: {}", t.len());
+            assert!(whole_or_absent(&t), "{name}: a cut thread: {t}");
+            assert!(t.starts_with(&label), "{name}: {t}");
+            match says {
+                Some(says) => assert!(
+                    t.contains(&format!("then resume with {says}")),
+                    "{name}: {t}"
+                ),
+                None => assert!(!t.contains("resume with"), "{name}: {t}"),
+            }
+        }
+        // Negative control: the cutting renderer alone cuts the command; it
+        // is named, and its thread is not.
+        let old = fit_reason(&label, &reason(&bypass));
+        assert!(
+            old.contains("then resume with codex resume") && !old.contains(THREAD),
             "{old}"
         );
     }

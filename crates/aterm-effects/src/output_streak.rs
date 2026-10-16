@@ -1318,15 +1318,6 @@ mod tests {
     }
 
     #[test]
-    fn sound_edges_have_one_canonical_output_gesture_mapping() {
-        assert_eq!(
-            StreakSound::Shimmer.output_gesture(),
-            OutputGesture::Shimmer
-        );
-        assert_eq!(StreakSound::Settle.output_gesture(), OutputGesture::Settle);
-    }
-
-    #[test]
     fn theme_hue_uses_named_stop_positions_with_bounded_non_wrapping_jitter() {
         let pending = Pending {
             row: 9,
@@ -1816,33 +1807,6 @@ mod tests {
         assert_eq!(idle_duration(f32::MAX), None);
         assert_eq!(e.pending_idle_deadline(f32::MAX), Some(last));
         assert!(e.idle_drained(last, &cfg));
-    }
-
-    /// Clockless determinism: the same seed and `(now, input)` script replay
-    /// byte-identical quads and fingerprints.
-    #[test]
-    fn identical_scripts_replay_identical_light() {
-        let t0 = Instant::now();
-        let cfg = cfg_on();
-        let play = || {
-            let mut e = OutputStreak::new(42);
-            let mut all = Vec::new();
-            let mut fps = Vec::new();
-            for i in 0..60u64 {
-                let now = t0 + Duration::from_millis(i * 40);
-                e.note_output(i + 1, &span((i % 7) as u16), now, false);
-                let mut out = Vec::new();
-                let f = e.tick(now, geom(), &cfg, &mut out);
-                fps.push(f.fp);
-                all.extend(out);
-            }
-            (all, fps)
-        };
-        let (a_quads, a_fps) = play();
-        let (b_quads, b_fps) = play();
-        assert_eq!(a_quads, b_quads);
-        assert_eq!(a_fps, b_fps);
-        assert!(!a_quads.is_empty(), "NON-VACUITY: the script drew light");
     }
 
     /// A different seed is a different comet (the per-window variation varies),

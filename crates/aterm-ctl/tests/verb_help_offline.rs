@@ -8,6 +8,10 @@
 //!
 //! No live aterm session is discovered or addressed: the socket named does not
 //! exist, and the child runs with every inherited `ATERM_*` variable removed.
+#![allow(
+    clippy::disallowed_types,
+    reason = "test code: a stand-in child may inherit descriptors"
+)]
 
 use std::process::{Command, Output, Stdio};
 

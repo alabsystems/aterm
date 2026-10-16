@@ -16,6 +16,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::document_store::{DocumentId, DocumentSnapshot};
@@ -372,6 +373,15 @@ pub(crate) struct DocumentPersistenceStore {
 struct DocumentPersistence {
     grant: DocumentGrantId,
     save: SaveReducer,
+    // Fingerprints correlate effects and versions, but cannot prove byte
+    // equality. A prior version's image remains a reconciliation candidate,
+    // but cannot authorize a clean checkpoint of the current version.
+    observed_image: Option<ObservedDocumentImage>,
+}
+
+struct ObservedDocumentImage {
+    version: ObservedFileVersion,
+    bytes: Arc<[u8]>,
 }
 
 #[derive(Clone, Debug)]
@@ -393,6 +403,7 @@ impl DocumentPersistenceStore {
         document: DocumentId,
         grant: DocumentGrantId,
         observed: ObservedFileVersion,
+        text: &str,
     ) -> Result<(), PersistenceError> {
         if let Some(existing) = self.documents.get(&document) {
             return (existing.grant == grant)
@@ -404,6 +415,10 @@ impl DocumentPersistenceStore {
             DocumentPersistence {
                 grant,
                 save: SaveReducer::new(document, observed),
+                observed_image: observed.exists.then(|| ObservedDocumentImage {
+                    version: observed,
+                    bytes: Arc::from(text.as_bytes()),
+                }),
             },
         );
         Ok(())
@@ -437,13 +452,54 @@ impl DocumentPersistenceStore {
             .documents
             .get_mut(&document)
             .ok_or(PersistenceError::UnknownDocument)?;
-        Ok(persistence.save.complete(generation, result))
+        let pending_bytes = persistence
+            .save
+            .pending()
+            .filter(|plan| plan.generation == generation)
+            .map(|plan| Arc::clone(&plan.bytes));
+        let reduction = persistence.save.complete(generation, result);
+        match &reduction {
+            SaveReduction::Durable(_) => {
+                persistence.observed_image = pending_bytes.map(|bytes| ObservedDocumentImage {
+                    version: persistence.save.observed(),
+                    bytes,
+                });
+            }
+            // A fingerprint-only rebind does not retag the prior exact image.
+            // It can confirm a fresh read, but not checkpoint the new version.
+            SaveReduction::ReboundEquivalent(_)
+            | SaveReduction::Conflict(_)
+            | SaveReduction::Failed { .. }
+            | SaveReduction::ReconcileRequired { .. }
+            | SaveReduction::Cancelled
+            | SaveReduction::Stale => {}
+        }
+        Ok(reduction)
     }
 
     pub(crate) fn observed(&self, document: DocumentId) -> Option<ObservedFileVersion> {
         self.documents
             .get(&document)
             .map(|persistence| persistence.save.observed())
+    }
+
+    pub(crate) fn observed_text_matches(&self, document: DocumentId, text: &str) -> bool {
+        self.documents.get(&document).is_some_and(|persistence| {
+            persistence.save.observed().exists
+                && persistence.observed_image.as_ref().is_some_and(|image| {
+                    image.version == persistence.save.observed()
+                        && image.bytes.as_ref() == text.as_bytes()
+                })
+        })
+    }
+
+    pub(crate) fn last_observed_text_matches(&self, document: DocumentId, text: &str) -> bool {
+        self.documents.get(&document).is_some_and(|persistence| {
+            persistence
+                .observed_image
+                .as_ref()
+                .is_some_and(|image| image.bytes.as_ref() == text.as_bytes())
+        })
     }
 
     pub(crate) fn save_in_flight(&self, document: DocumentId) -> bool {
@@ -462,6 +518,7 @@ impl DocumentPersistenceStore {
         &mut self,
         document: DocumentId,
         observed: ObservedFileVersion,
+        text: &str,
     ) -> Result<(), PersistenceError> {
         let persistence = self
             .documents
@@ -470,7 +527,12 @@ impl DocumentPersistenceStore {
         persistence
             .save
             .accept_observation(observed)
-            .map_err(PersistenceError::Save)
+            .map_err(PersistenceError::Save)?;
+        persistence.observed_image = observed.exists.then(|| ObservedDocumentImage {
+            version: observed,
+            bytes: Arc::from(text.as_bytes()),
+        });
+        Ok(())
     }
 }
 
@@ -2361,10 +2423,10 @@ mod tests {
         // test's subject. What it guards is that opening a writerless FIFO does not block
         // FOR EVER, so the second wait starts when the child says it got there — the marker
         // it writes as its first act. Timing the child's whole life instead conflated the
-        // block with the cost of spawning a fresh copy of this test binary (measured
-        // 2026-09-17: a loaded gate failed a 3 s bound on that cost alone). Each is a hang
-        // detector, never a latency budget, and says what it means when it fires: a child
-        // that never reaches the calls is a different defect from one that hangs in them.
+        // block with the cost of spawning a fresh copy of this test binary (a loaded
+        // machine failed a 3 s bound on that cost alone). Each is a hang detector, never a
+        // latency budget, and says what it means when it fires: a child that never reaches
+        // the calls is a different defect from one that hangs in them.
         let marker = started_marker(&path);
         crate::test_alone::until_or_ended("the child reaches the FIFO calls", &mut child, || {
             marker.exists()
@@ -2872,7 +2934,7 @@ mod tests {
         let snapshot = documents.snapshot(document).unwrap();
         let mut persistence = DocumentPersistenceStore::default();
         persistence
-            .register(document, opened.grant.id, opened.observed)
+            .register(document, opened.grant.id, opened.observed, &opened.text)
             .unwrap();
         let pending = persistence.begin(&snapshot).unwrap();
 
@@ -3211,11 +3273,11 @@ mod tests {
     fn cross_process_same_baseline_has_one_winner_and_no_temp_collision() {
         const CHILD: &str = "ATERM_CONFIG_COMMIT_TEST_CHILD";
         // Every wait below is for something that must happen — a child test
-        // process of this whole binary starting (seconds of exec under a
-        // loaded gate), the parent's go, the peer's lock hold ending — so each
-        // is a hang detector, never a latency budget (they were 10 s and 3 s,
-        // and all three cross-process tests went red together under a 24-way
-        // CPU load on 2026-09-29).
+        // process of this whole binary starting (seconds of exec on a loaded
+        // machine), the parent's go, the peer's lock hold ending — so each is
+        // a hang detector, never a latency budget (bounds of 10 s and 3 s
+        // failed all three cross-process tests together under a 24-way CPU
+        // load).
         const HANG: std::time::Duration = std::time::Duration::from_secs(60);
         if let Ok(role) = std::env::var(CHILD) {
             let path = PathBuf::from(std::env::var("ATERM_CONFIG_COMMIT_TEST_PATH").unwrap());

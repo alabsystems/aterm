@@ -4,20 +4,11 @@
 
 //! Token-bucket rate limiter for PTY response sequences.
 //!
-//! # Threat model
-//!
-//! A malicious PTY peer can spam queries (DSR, DA, DECRQSS, color queries,
-//! XTGETTCAP, title reports) to force response bytes. The 1 MiB
-//! [`MAX_RESPONSE_BUFFER_SIZE`] bounds memory but not rate: a host draining in
-//! a tight loop still pays CPU and bandwidth for every reply.
-//! [`ResponseRateLimiter`] gates `send_response` with a token bucket and drops
-//! the excess, as a full buffer does.
-//!
-//! # Tuning
-//!
-//! Shell startup emits at most a few hundred bytes/s of replies; the
-//! defaults ([`DEFAULT_REFILL_BYTES_PER_SEC`], [`DEFAULT_BURST_BYTES`]) sit
-//! far above that, so legitimate traffic never trips them.
+//! A malicious PTY peer can spam queries (DSR, DA, DECRQSS, color queries, XTGETTCAP,
+//! title reports) to force replies. The 1 MiB [`MAX_RESPONSE_BUFFER_SIZE`] bounds memory
+//! but not rate, so [`ResponseRateLimiter`] gates `send_response` and drops the excess, as
+//! a full buffer does. The defaults sit far above the few hundred bytes/s of replies a
+//! shell startup emits.
 //!
 //! [`MAX_RESPONSE_BUFFER_SIZE`]: super::MAX_RESPONSE_BUFFER_SIZE
 
@@ -26,19 +17,15 @@
 use aterm_time::Instant;
 use std::time::Duration;
 
-/// Default refill rate in bytes/sec. 100 KiB/s is far above the peak
-/// legitimate response traffic (shell-startup probes are <1 KiB total)
-/// while still reducing amplification relative to the 1 MiB buffer cap.
+/// Default refill rate in bytes/sec: far above legitimate traffic (shell-startup probes
+/// are under 1 KiB in all), while still limiting amplification against the 1 MiB cap.
 pub(crate) const DEFAULT_REFILL_BYTES_PER_SEC: u64 = 100 * 1024;
 
-/// Default burst capacity in bytes. Absorbs startup bursts (DECRQSS batteries,
-/// DA/DA2/XTVERSION queries, OSC palette probes) and carries the largest
-/// response the terminal will send.
-///
-/// Sized on the wire, not the payload: an OSC 52 query answers in base64, so
-/// the [`MAX_OSC52_QUERY_RESPONSE_BYTES`] the handler admits is about 1.34x
-/// larger on the wire, and `try_consume` refuses anything above capacity
-/// outright.
+/// Default burst capacity in bytes: absorbs startup bursts (DECRQSS batteries,
+/// DA/DA2/XTVERSION, OSC palette probes) and carries the largest response. Sized on the
+/// wire: an OSC 52 query answers in base64, about 1.34x the
+/// [`MAX_OSC52_QUERY_RESPONSE_BYTES`] the handler admits, and `try_consume` refuses
+/// anything above capacity.
 ///
 /// [`MAX_OSC52_QUERY_RESPONSE_BYTES`]: super::MAX_OSC52_QUERY_RESPONSE_BYTES
 pub(crate) const DEFAULT_BURST_BYTES: u64 = 96 * 1024;
@@ -56,18 +43,19 @@ pub(crate) struct SystemTime;
 
 impl TimeSource for SystemTime {
     #[inline]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "response-rate gating only: throttles when reply bytes go out, never feeds grid, cursor or mode state"
+    )]
     fn now(&self) -> Instant {
-        Instant::now() // CLOCK-EXEMPT: response-RATE gating only; throttles when reply BYTES are emitted, never feeds hydrated grid/cursor/mode state, so Terminal::process() stays deterministic.
+        Instant::now()
     }
 }
 
-/// Token-bucket rate limiter for PTY response bytes.
-///
-/// [`try_consume`][Self::try_consume] deducts `n` tokens; on success the
-/// response is allowed, otherwise it is silently dropped. Tokens refill at
-/// `refill_bytes_per_sec` up to `capacity_bytes`. Responses larger than the
-/// capacity are always dropped, so the capacity is sized on the largest
-/// encoded response (see [`DEFAULT_BURST_BYTES`]).
+/// Token-bucket rate limiter for PTY response bytes: tokens refill at
+/// `refill_bytes_per_sec` up to `capacity_bytes`, and a response that finds too few is
+/// dropped silently. One larger than the capacity is always dropped, so the capacity is
+/// sized on the largest encoded response ([`DEFAULT_BURST_BYTES`]).
 #[derive(Debug, Clone)]
 pub(crate) struct ResponseRateLimiter {
     /// Current token count. Saturates at `capacity_bytes` after refill.
@@ -87,11 +75,8 @@ impl ResponseRateLimiter {
         Self::with_limits(DEFAULT_REFILL_BYTES_PER_SEC, DEFAULT_BURST_BYTES)
     }
 
-    /// Create a rate limiter with custom limits.
-    ///
-    /// `capacity_bytes = 0` disables the limiter (every response is dropped —
-    /// useful as a kill switch). `refill_bytes_per_sec = 0` freezes tokens
-    /// at the initial capacity (no replenishment).
+    /// A rate limiter with custom limits. `capacity_bytes = 0` drops every response (a
+    /// kill switch); `refill_bytes_per_sec = 0` never replenishes the initial capacity.
     pub(crate) fn with_limits(refill_bytes_per_sec: u64, capacity_bytes: u64) -> Self {
         Self {
             #[allow(
@@ -105,35 +90,15 @@ impl ResponseRateLimiter {
         }
     }
 
-    /// Reconfigure the limiter in place, preserving current token count
-    /// up to the new capacity.
-    #[cfg(test)]
-    pub(crate) fn reconfigure(&mut self, refill_bytes_per_sec: u64, capacity_bytes: u64) {
-        self.refill_bytes_per_sec = refill_bytes_per_sec;
-        self.capacity_bytes = capacity_bytes;
-        #[allow(
-            clippy::cast_precision_loss,
-            reason = "capacity is bytes, precision loss at u64 extremes is not observable"
-        )]
-        let cap = capacity_bytes as f64;
-        if self.tokens > cap {
-            self.tokens = cap;
-        }
-    }
-
-    /// Attempt to deduct `bytes` tokens using the given time source.
-    ///
-    /// Returns `true` if the response is permitted, `false` if it must be
-    /// dropped. Uses `f64` internally so sub-millisecond refill intervals
-    /// accumulate correctly (important when a shell emits a burst of tiny
-    /// DSR responses back-to-back).
+    /// Deduct `bytes` tokens: `true` if the response may go, `false` if it is dropped.
+    /// `f64` tokens let sub-millisecond refill intervals accumulate (a burst of tiny DSR
+    /// replies back to back).
     pub(crate) fn try_consume<T: TimeSource>(&mut self, bytes: usize, clock: &T) -> bool {
-        // A limiter with zero capacity is a hard block — no refill can help.
         if self.capacity_bytes == 0 {
             return false;
         }
-        // Responses larger than capacity can never fit; drop without
-        // deducting so a single pathological call doesn't drain the bucket.
+        // Larger than capacity can never fit: drop without deducting, so one pathological
+        // call does not drain the bucket.
         if bytes as u64 > self.capacity_bytes {
             return false;
         }
@@ -157,8 +122,7 @@ impl ResponseRateLimiter {
     /// Refill tokens based on elapsed time since last refill.
     fn refill(&mut self, now: Instant) {
         let Some(last) = self.last_refill else {
-            // First call: seed the clock but don't grant extra tokens —
-            // the bucket already starts at full capacity.
+            // First call: seed the clock; the bucket already starts full.
             self.last_refill = Some(now);
             return;
         };
@@ -182,25 +146,6 @@ impl ResponseRateLimiter {
         self.tokens = (self.tokens + earned).min(cap);
         self.last_refill = Some(now);
     }
-
-    /// Current token balance (rounded down to bytes). Intended for tests
-    /// and diagnostic assertions only.
-    #[cfg(test)]
-    pub(crate) fn tokens(&self) -> u64 {
-        #[allow(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            reason = "tokens are clamped to [0, capacity] which fits in u64"
-        )]
-        let t = self.tokens as u64;
-        t
-    }
-
-    /// Current burst capacity.
-    #[cfg(test)]
-    pub(crate) fn capacity(&self) -> u64 {
-        self.capacity_bytes
-    }
 }
 
 impl Default for ResponseRateLimiter {
@@ -214,7 +159,7 @@ mod tests {
     use super::*;
     use std::cell::Cell;
 
-    /// Test clock: advances only when explicitly `advance()`d.
+    /// Advances only when `advance()`d.
     struct FakeClock {
         now: Cell<Instant>,
     }
@@ -239,9 +184,6 @@ mod tests {
 
     #[test]
     fn test_response_rate_below_limit_all_delivered() {
-        // 1000 bytes/sec, 500-byte burst. Ten 40-byte responses spaced at
-        // 200ms each consume 400 bytes total and earn 200 bytes back before
-        // the first deduction catches up — well below the limit.
         let mut limiter = ResponseRateLimiter::with_limits(1000, 500);
         let clock = FakeClock::new();
 
@@ -256,9 +198,7 @@ mod tests {
 
     #[test]
     fn test_response_rate_above_limit_excess_dropped() {
-        // 100 bytes/sec refill, 200-byte burst. Fire 10 responses of 40
-        // bytes with no time advancing: first 5 (= 200 bytes) succeed,
-        // remaining 5 must be dropped.
+        // No time passes: the 200-byte burst admits five 40-byte responses.
         let mut limiter = ResponseRateLimiter::with_limits(100, 200);
         let clock = FakeClock::new();
 
@@ -281,44 +221,34 @@ mod tests {
 
     #[test]
     fn test_response_rate_replenishes_after_cooldown() {
-        // Drain the bucket entirely, then advance time and confirm tokens
-        // return at the configured refill rate.
         let mut limiter = ResponseRateLimiter::with_limits(1000, 100);
         let clock = FakeClock::new();
 
-        // Drain all 100 tokens in one shot.
         assert!(limiter.try_consume(100, &clock));
-        // Now dry — even a 1-byte request should fail.
         assert!(!limiter.try_consume(1, &clock));
 
-        // Advance 50ms: at 1000 bytes/sec that earns 50 tokens back.
+        // 50 ms at 1000 bytes/sec earns 50 tokens back.
         clock.advance(Duration::from_millis(50));
         assert!(
             limiter.try_consume(50, &clock),
             "tokens should replenish after cooldown"
         );
-        // One more byte beyond what we earned should fail.
         assert!(!limiter.try_consume(1, &clock));
     }
 
     #[test]
     fn test_response_burst_capacity_caps_at_configured_max() {
-        // Refill at 10_000/sec into a tiny 100-byte bucket, then idle for
-        // a long time: the bucket must cap at 100, not accumulate forever.
         let mut limiter = ResponseRateLimiter::with_limits(10_000, 100);
         let clock = FakeClock::new();
 
-        // Drain the initial 100 tokens.
         assert!(limiter.try_consume(100, &clock));
 
-        // Idle for 10 seconds: would earn 100_000 tokens uncapped, but
-        // cap keeps us at 100.
+        // Ten idle seconds would earn 100_000 tokens uncapped.
         clock.advance(Duration::from_secs(10));
         assert!(
             limiter.try_consume(100, &clock),
             "full burst should be available after idle"
         );
-        // Can't exceed capacity — next byte denied.
         assert!(
             !limiter.try_consume(1, &clock),
             "bucket must cap at configured capacity"
@@ -327,7 +257,6 @@ mod tests {
 
     #[test]
     fn test_response_oversized_always_dropped() {
-        // A single response larger than capacity cannot fit.
         let mut limiter = ResponseRateLimiter::with_limits(1000, 100);
         let clock = FakeClock::new();
 
@@ -335,8 +264,7 @@ mod tests {
             !limiter.try_consume(101, &clock),
             "response larger than capacity must be dropped"
         );
-        // But the bucket should not have been drained — subsequent
-        // well-sized calls still succeed.
+        // Nor is the bucket drained by it.
         assert!(limiter.try_consume(100, &clock));
     }
 
@@ -349,23 +277,8 @@ mod tests {
     }
 
     #[test]
-    fn test_response_reconfigure_preserves_tokens_under_new_cap() {
-        let mut limiter = ResponseRateLimiter::with_limits(1000, 500);
-        let clock = FakeClock::new();
-        // Spend 200 tokens → 300 remaining.
-        assert!(limiter.try_consume(200, &clock));
-        assert_eq!(limiter.tokens(), 300);
-
-        // Shrink capacity below current balance: tokens must be clamped.
-        limiter.reconfigure(1000, 100);
-        assert_eq!(limiter.capacity(), 100);
-        assert!(limiter.tokens() <= 100);
-    }
-
-    #[test]
     fn test_response_defaults_are_permissive() {
-        // Sanity-check that the production default permits a realistic
-        // startup burst (say, 64 DSR/DA responses of 16 bytes each = 1 KiB).
+        // A realistic startup burst: 64 DSR/DA responses of 16 bytes.
         let mut limiter = ResponseRateLimiter::new();
         let clock = FakeClock::new();
         for _ in 0..64 {

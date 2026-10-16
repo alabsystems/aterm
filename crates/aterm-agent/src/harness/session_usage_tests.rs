@@ -93,10 +93,9 @@ fn a_reread_reads_only_the_appended_bytes() {
     assert_eq!(cursor.offset(), (first.len() + more.len()) as u64);
 }
 
-/// A file whose size, mtime and inode have not moved is not even OPENED: a
-/// finished subagent transcript costs one `stat` a read. Proved by taking
-/// the read permission away — an open would fail — and then, as the
-/// control, by an append, which must open (and here, fail).
+/// A file whose size, mtime and inode have not moved is not even opened: a finished subagent
+/// transcript costs one `stat` a read. Proved by taking the read permission away (an open would
+/// fail) and then, as the control, by an append, which must open (and here, fail).
 #[cfg(unix)]
 #[test]
 fn an_unchanged_file_is_not_opened() {
@@ -108,7 +107,7 @@ fn an_unchanged_file_is_not_opened() {
     cursor.advance(BIG).expect("reads");
     fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).expect("chmod");
     let unchanged = cursor.advance(BIG);
-    // The control must see a CHANGED file: set the mtime far from now.
+    // The control must see a changed file: set the mtime far from now.
     append_keeping_mode(&path, &row("m2", "claude-opus-5-5", 1, 7));
     let changed = cursor.advance(BIG);
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("chmod");
@@ -127,10 +126,8 @@ fn append_keeping_mode(path: &Path, text: &str) {
     fs::set_permissions(path, fs::Permissions::from_mode(mode)).expect("chmod");
 }
 
-/// Between reads a cursor holds the bytes of a torn last line and no line
-/// buffer: a row that spans read chunks is assembled in one, and it is let go
-/// when the read ends — hundreds of finished subagent cursors must not each
-/// pin one.
+/// Between reads a cursor holds the bytes of a torn last line and no line buffer: a row that spans
+/// read chunks is assembled in one, let go when the read ends.
 #[test]
 fn no_line_buffer_is_kept_between_reads() {
     let dir = TestDir::new("buffer");
@@ -230,11 +227,9 @@ fn a_truncated_file_starts_the_fold_over() {
     assert_eq!(output_of(cursor.fold(), "claude-haiku-4-5"), 7);
 }
 
-/// Rotated: another file renamed over the path is a new inode, and the fold
-/// starts over rather than reading on from an offset into someone else's
-/// bytes — even when the new file is longer and its byte under the old
-/// boundary is a newline too (its first row is exactly as long as the old
-/// one's), so only the file's identity can tell.
+/// Rotated: another file renamed over the path is a new inode, and the fold starts over, even when
+/// the new file is longer and its byte under the old boundary is a newline too, so only the file's
+/// identity can tell.
 #[cfg(unix)]
 #[test]
 fn a_rotated_file_starts_the_fold_over() {
@@ -313,8 +308,8 @@ fn a_budget_bounds_one_read_and_the_next_carries_on() {
     assert_eq!(cursor.fold().rows, 20);
 }
 
-/// PROPERTY: however the appends fall — mid-line, mid-character — the
-/// incremental fold ends equal to one streaming pass over the whole file.
+/// However the appends fall (mid-line, mid-character), the incremental fold ends equal to one
+/// streaming pass over the whole file.
 #[test]
 fn any_split_of_the_appends_folds_to_the_one_pass_result() {
     let dir = TestDir::new("splits");
@@ -466,8 +461,8 @@ fn a_session_sums_its_subagent_transcripts_and_nothing_else() {
     assert_eq!(total.assistant_rows, 4);
 }
 
-/// A subagent still BEHIND is a prefix: the session is not caught up while
-/// the transcript is, and it is once the subagent is read to its end.
+/// A subagent still behind is a prefix: the session is not caught up while the transcript is, and
+/// it is once the subagent is read to its end.
 #[test]
 fn a_subagent_behind_keeps_the_session_from_catching_up() {
     let dir = TestDir::new("behind");
@@ -498,12 +493,10 @@ fn a_subagent_behind_keeps_the_session_from_catching_up() {
     );
 }
 
-/// A FINISHED subagent file keeps its totals and a few ids — not its whole
-/// dedupe set, not a line buffer — and stays followed: when a continued
-/// agent appends to it again (its file is fixed per agent id), the fold
-/// reads on from where it stopped. Its earlier total is carried, nothing is
-/// counted twice (a streamed repeat of its newest message is raised), and
-/// nothing is left unread.
+/// A finished subagent file keeps its totals and a few ids (not its whole dedupe set, not a line
+/// buffer) and stays followed: when a continued agent appends to it again (its file is fixed per
+/// agent id), the fold reads on from where it stopped. Its earlier total is carried, nothing is
+/// counted twice (a streamed repeat of its newest message is raised), and nothing is left unread.
 #[test]
 fn a_finished_subagent_keeps_its_totals_and_grows_on() {
     let dir = TestDir::new("finished");
@@ -560,10 +553,8 @@ fn set_age(path: &Path, secs_ago: u64) {
         .expect("mtime");
 }
 
-/// At the bound, new files are unread — said, never guessed at: within the
-/// read that crosses it the newest are followed; past it every new file
-/// (a running subagent's included) is counted `unread`, and a followed file
-/// is never dropped — it keeps growing in the totals.
+/// At the bound, new files are unread, never guessed at: within the read that crosses it the newest
+/// are followed; past it every new file is counted `unread`, and a followed file is never dropped.
 #[test]
 fn at_the_bound_new_files_are_unread() {
     let dir = TestDir::new("bound");
@@ -647,9 +638,9 @@ fn a_file_that_cannot_be_followed_is_counted_as_unread() {
     assert!(!r.complete());
 }
 
-/// The walk that stops at its entry bound is SAID end to end: the fold is
-/// not complete, and the footer reads `+? unread` (a `0` would read as
-/// nothing missing) — or `+N+ unread` beside files it could not count.
+/// The walk that stops at its entry bound is said end to end: the fold is not complete, and the
+/// footer reads `+? unread` (a `0` would read as nothing missing), or `+N+ unread` beside files it
+/// could not count.
 #[test]
 fn a_walk_cut_short_is_said_on_the_glass() {
     let dir = TestDir::new("walk");
@@ -712,11 +703,10 @@ fn a_walk_cut_short_is_said_on_the_glass() {
     );
 }
 
-/// What a refresh now could find is known from a few `stat`s: the fold
-/// behind with progress to make, the transcript, a new file in the subagent
-/// directory, or a RUNNING subagent's file growing — the main transcript can
-/// sit still for minutes while its subagents spend. A fold behind whose last
-/// read moved nothing is left alone until a file changes.
+/// What a refresh now could find is known from a few `stat`s: the fold behind with progress to
+/// make, the transcript, a new file in the subagent directory, or a running subagent's file growing
+/// (the main transcript can sit still for minutes while its subagents spend). A fold behind whose
+/// last read moved nothing is left alone until a file changes.
 #[test]
 fn moved_sees_subagent_growth_and_an_unfinished_fold() {
     let dir = TestDir::new("moved");
@@ -753,11 +743,9 @@ fn moved_sees_subagent_growth_and_an_unfinished_fold() {
     assert!(session.moved(), "the transcript grew");
 }
 
-/// `moved` checks every followed file, not only the most recently written:
-/// with ten parallel agents, the one whose file was written longest ago (an
-/// agent in a long tool call) appending its final message is seen at once,
-/// as the newest growing is — and a followed file deleted since is not a
-/// change to read.
+/// `moved` checks every followed file, not only the most recently written: of ten parallel agents,
+/// the one written longest ago appending its final message is seen at once, and a followed file
+/// deleted since is not a change to read.
 #[test]
 fn moved_watches_every_followed_file() {
     let dir = TestDir::new("recent");
@@ -891,8 +879,8 @@ fn an_unreadable_subagent_is_unread_and_nothing_else() {
         session.total_fold().per_model()["claude-haiku-4-5"].output,
         30
     );
-    // A HELD file that turns unreadable with new rows: its earlier tokens
-    // stay in the totals, and it is counted once — unread, not also folded.
+    // A followed file that turns unreadable with new rows: its earlier tokens stay in the
+    // totals, and it is counted once, unread, not also folded.
     append(&locked, &row("b2", "claude-haiku-4-5", 1, 5));
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).expect("chmod");
     let r = session.refresh(BIG);
@@ -991,11 +979,9 @@ fn rewrite_in_place(path: &Path, text: &str) {
     f.write_all(text.as_bytes()).expect("write");
 }
 
-/// A quiet file's ids are released, so what it held can no longer be told
-/// apart from a rewrite: a plain append is read on and counted, and any other
-/// change — shrunk, replaced by another file, rewritten in place — leaves it
-/// unread, its earlier totals standing: never re-read from its first byte,
-/// never counted twice. A file that is not quiet still starts over.
+/// A quiet file's ids are released: a plain append is read on and counted, and any other change
+/// (shrunk, replaced, rewritten in place) leaves it unread with its earlier totals standing, never
+/// re-read from its first byte nor counted twice. A file that is not quiet still starts over.
 #[test]
 fn a_released_file_changed_but_appended_is_unread() {
     let dir = TestDir::new("released");
@@ -1070,10 +1056,9 @@ fn a_released_file_changed_but_appended_is_unread() {
     assert_eq!(haiku(&session), 1204);
 }
 
-/// A QUIET file still BEHIND is not released: its ids are what raise the
-/// rest of a streamed message instead of counting it again. Read to a cut
-/// between the two rows of one message, the file keeps them, and the
-/// message counts once, at its final 349.
+/// A quiet file still behind is not released: its ids are what raise the rest of a streamed
+/// message instead of counting it again. Read to a cut between the two rows of one message, the
+/// file keeps them, and the message counts once, at its final 349.
 #[test]
 fn a_quiet_file_behind_is_not_released() {
     let dir = TestDir::new("behind-quiet");
@@ -1167,7 +1152,7 @@ fn the_wall_stands_until_its_reset() {
         None,
         "read the next day: day 0's 3pm, long passed"
     );
-    // The NEWEST row decides, whichever window it names.
+    // The newest row decides, whichever window it names.
     let both = notices(&[
         ("five_hour", Some("3pm (UTC)"), two_pm),
         ("seven_day", Some("Oct 1 at 9am (UTC)"), two_pm + 600),
@@ -1312,9 +1297,8 @@ fn another_zones_clock_keeps_its_zone() {
     );
 }
 
-/// A SPAN (`in 3h`) counts from the notice, so it is said as the local clock
-/// time it names — `in 3h` read hours later would be false — with the date
-/// once it is a day or more off.
+/// A span (`in 3h`) counts from the notice, so it is said as the local clock time it names (`in
+/// 3h` read hours later would be false), with the date once it is a day or more off.
 #[test]
 fn a_span_is_said_as_the_local_clock() {
     let two_pm = DAY + 14 * 3600;
@@ -1346,6 +1330,7 @@ fn spend(input: u64, output: u64, cache_write: u64, cache_read: u64) -> ModelSpe
         input,
         output,
         cache_write,
+        cache_write_1h: 0,
         cache_read,
         messages: 1,
     }
@@ -1471,11 +1456,10 @@ fn a_routed_model_id_is_named_as_its_model() {
     assert_eq!(more.models, 1, "opus5.5, gathered");
 }
 
-/// The `Σ` text at each grain: the footer's TOTAL — runtime, then every
-/// model's tokens in and out merged into one pair (the gathered ones
-/// included), no model named — and its runtime alone; `harness usage`'s
-/// PER MODEL — a model named only where two or more spent, the models past
-/// [`NAMED_MODELS`] counted. The wall is its own segment's text.
+/// The `Σ` text at each grain: the footer's total (runtime, then every model's tokens merged into
+/// one pair, the gathered ones included, no model named) and its runtime alone; `harness usage`'s
+/// per model (a model named only where two or more spent, the models past [`NAMED_MODELS`]
+/// counted). The wall is its own segment's text.
 #[test]
 fn the_segment_says_runtime_and_tokens_at_each_grain() {
     let opus = ModelTokens {
@@ -1547,8 +1531,8 @@ fn the_segment_says_runtime_and_tokens_at_each_grain() {
     }
 }
 
-/// What is left out of the totals is SAID even while no tokens are shown
-/// (the fold not caught up yet): `+2 unread`, beside a wall or alone.
+/// What is left out of the totals is said even while no tokens are shown (the fold not caught up
+/// yet): `+2 unread`, beside a wall or alone.
 #[test]
 fn unread_is_said_with_no_tokens_shown() {
     let left_out = Refresh {

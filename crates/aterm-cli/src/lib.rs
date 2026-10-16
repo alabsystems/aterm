@@ -31,7 +31,15 @@
 // The macOS consent tier (docs/DESIGN-macos-tcc-prompts-2026-08-30.md §3.3):
 // owns the prompt-free Full Disk Access probe, the in-bundle fence that keeps
 // headless paths away from `tccd`, and every protected-folder path literal
-// (grep_guard B13). `doctor` threads its verdict into the pure report.
+// (the aterm-census guard `protected-folder`). `doctor` threads its verdict
+// into the pure report.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_types,
+        reason = "test code: a stand-in child may inherit descriptors"
+    )
+)]
 use aterm_containment::consent::{
     DEBUGGER_ACCESS_REVERT, DebuggerMember, DebuggerMode, DebuggerProbe, DebuggerProbeLabel,
     DrClass, FdaState, ProbeGate, ProbeLabel, SelfHardening,
@@ -48,6 +56,14 @@ mod driver;
 
 // The manual behind `aterm help [topic]`.
 mod manual;
+
+// `aterm theme`: the theme listing (`list`, also `aterm list-themes`), theme
+// authoring (`check`, `new`, `export`, `schema`) and another terminal's theme
+// into the themes folder (`import`).
+mod theme_author;
+mod theme_cmd;
+pub use theme_cmd::main_entry as theme_main_entry;
+pub use theme_cmd::{ThemeHost, ThemeListFormat, ThemeListRequest, list_themes_alias};
 
 // The wt-shaped windowing grammar (`new-tab` / `new-window` / `split-pane`) and
 // its `windowing_behavior` routing policy: pure parse + pure decision,
@@ -143,7 +159,8 @@ const HELP_HEAD: &str = concat!(
     "                              exit 1 only when the shell cannot start.\n",
     "    list-fonts                List available font families.\n",
     "    show-face <family>        Show a font family's file and cell metrics.\n",
-    "    list-themes               List the built-in colour schemes.\n",
+    "    list-themes               List the built-in and custom themes (the same as\n",
+    "                              `aterm theme list`).\n",
     "    list-kitty-commands       List the words the cursor cat obeys, by language.\n",
     "    exceptions [--all]        What needs a look but not now, and what was filed.\n",
     "\n",
@@ -201,6 +218,10 @@ pub enum Verb {
     Update,
     /// `aterm agents` — the coding-agent primer installer.
     Agents,
+    /// `aterm ai` — this machine's AI CLIs: one working login each, the doctor
+    /// that signs in what needs it, and reviews one AI asks of another
+    /// (docs/DESIGN-ai-connections-2026-10-16.md).
+    Ai,
     /// `aterm harness` — the Claude Code harness's read views, the accounts
     /// roster (docs/DESIGN-claude-accounts-2026-10-01.md) and the live agent
     /// upgrade (docs/DESIGN-aterm-wrapper-2026-09-17.md §0.4). `aterm drive`
@@ -210,6 +231,9 @@ pub enum Verb {
     /// per-login holder of a custody copy of every terminal's master
     /// (docs/DESIGN-pty-keeper-2026-09-26.md). Opt-in via `[keeper] enabled`.
     Keeper,
+    /// `aterm theme` — list, validate, create, export and import themes, and
+    /// inspect the native theme schema.
+    Theme,
     /// `aterm new-tab` — a tab, routed by `windowing_behavior` (S12 / design §5).
     NewTab,
     /// `aterm new-window` — a window, unconditionally (the `attach` escape hatch).
@@ -231,8 +255,10 @@ impl Verb {
         Verb::Ship,
         Verb::Update,
         Verb::Agents,
+        Verb::Ai,
         Verb::Harness,
         Verb::Keeper,
+        Verb::Theme,
         Verb::NewTab,
         Verb::NewWindow,
         Verb::SplitPane,
@@ -251,8 +277,10 @@ impl Verb {
             Verb::Ship => "ship",
             Verb::Update => "update",
             Verb::Agents => "agents",
+            Verb::Ai => "ai",
             Verb::Harness => "harness",
             Verb::Keeper => "keeper",
+            Verb::Theme => "theme",
             // Hyphenated, exactly like Windows Terminal's — the whole value of a
             // familiar grammar is that the words are the same words.
             Verb::NewTab => "new-tab",
@@ -282,8 +310,10 @@ impl Verb {
             Verb::Ship
             | Verb::Update
             | Verb::Agents
+            | Verb::Ai
             | Verb::Harness
             | Verb::Keeper
+            | Verb::Theme
             | Verb::NewTab
             | Verb::NewWindow
             | Verb::SplitPane => None,
@@ -311,8 +341,10 @@ impl Verb {
             | Verb::Ship
             | Verb::Update
             | Verb::Agents
+            | Verb::Ai
             | Verb::Harness
-            | Verb::Keeper => false,
+            | Verb::Keeper
+            | Verb::Theme => false,
         }
     }
 
@@ -329,8 +361,10 @@ impl Verb {
             Verb::Ship => "aterm ship <args>",
             Verb::Update => "aterm update [<cmd>]",
             Verb::Agents => "aterm agents [<cmd>]",
+            Verb::Ai => "aterm ai [<cmd>]",
             Verb::Harness => "aterm harness <cmd>",
             Verb::Keeper => "aterm keeper <cmd>",
+            Verb::Theme => "aterm theme <cmd>",
             // `[-d dir]` rather than `[-d <dir>]`: the synopsis column is 26
             // wide and the blurb is pinned to column 30.
             Verb::NewTab => "aterm new-tab [-d dir]",
@@ -359,8 +393,9 @@ impl Verb {
                 &["The fabric bridge: carry inbox/post between this instance and the bus."]
             }
             Verb::Fabric => &[
-                "The fabric: mail between sessions and hosts (status | tail |",
-                "on | off | doctor | mint-for | join); `status` is the default.",
+                "The fabric: mail between sessions, people and hosts (status |",
+                "tail | on | off | doctor | mint-for | join | halt | inbox |",
+                "post); `status` is the default.",
             ],
             Verb::Drive => &[
                 "Drive an agent (prompt | read | await | shot) and supervise",
@@ -376,6 +411,11 @@ impl Verb {
                 "install | remove | primer); `agents_auto_prime = false` stops",
                 "the window re-installing it.",
             ],
+            Verb::Ai => &[
+                "This machine's AI CLIs (claude, codex, agy, muse): one working",
+                "login each (doctor | login), and reviews one AI asks of another",
+                "(review). `aterm ai` alone is the doctor, read-only.",
+            ],
             Verb::Harness => &[
                 "Claude Code's spend, limits and accounts, the disk, the ledger",
                 "(usage | limits | accounts | disk | ledger); `upgrade` moves a",
@@ -384,6 +424,11 @@ impl Verb {
             Verb::Keeper => &[
                 "The PTY keeper: hold every terminal's master so a crashed",
                 "window's shells live on (start | stop | status | serve). macOS, opt-in.",
+            ],
+            Verb::Theme => &[
+                "List every theme (list); write and test your own (new, check,",
+                "export, schema); convert another terminal's theme (kitty, Ghostty,",
+                "Alacritty, iTerm2, Windows Terminal, base16) into it (import).",
             ],
             Verb::NewTab => &[
                 "Open a terminal tab. Where it opens is the",
@@ -488,17 +533,28 @@ pub const DIAG_COMMANDS: &[(&str, &str)] = &[
     ("show-face", "Show a font family's file and cell metrics."),
     (
         "list-themes",
-        "List the built-in colour schemes and their descriptions.",
+        "List the built-in themes and the themes folder's, each with its appearance, pair and status (`aterm theme list`).",
     ),
     (
         "list-kitty-commands",
-        "List the words the cursor cat obeys when typed (one row per trick and language).",
+        "List the words the cursor cat obeys when typed, language by language.",
     ),
     (
         "exceptions",
         "List what needs a look but not now, and what was filed (--all: every filed entry in the newest MiB of the log).",
     ),
 ];
+
+/// `aterm <diag> --help`'s usage line for a diagnostic subcommand: its operand or
+/// flag where it takes one. Pure.
+fn diag_usage(cmd: &str) -> String {
+    match cmd {
+        "show-face" => format!("aterm {cmd} <family>"),
+        "doctor" => format!("aterm {cmd} [--read-only]"),
+        "exceptions" => format!("aterm {cmd} [--all]"),
+        _ => format!("aterm {cmd}"),
+    }
+}
 
 /// The refusal for `aterm show-face` with no family (exit 2).
 const SHOW_FACE_NEEDS_FAMILY: &str =
@@ -518,7 +574,9 @@ fn diag_report(cmd: &str, arg: Option<&str>) -> Option<(String, i32)> {
         "doctor" => Some(doctor_report(arg != Some("--read-only"))),
         "list-fonts" => Some((list_fonts_report(), 0)),
         "show-face" => Some(show_face_report(arg)),
-        "list-themes" => Some((list_themes_report(), 0)),
+        // `list-themes` is not answered here: the listing needs the theme
+        // catalog, so the front door routes it to `aterm theme list`
+        // ([`list_themes_alias`]) before this parser runs.
         "list-kitty-commands" => Some((list_kitty_commands_report(), 0)),
         "exceptions" => Some((exceptions_report(arg == Some("--all")), 0)),
         _ => None,
@@ -639,7 +697,7 @@ const WINDOWS_CONFIG_PARAGRAPH: &str = "\n\
 /// every change is undoable by one printed line.
 #[cfg(not(windows))]
 const MACHINE_CONFIG_PARAGRAPH: &str = "\n\
-     [machine] — macOS host settings (aterm.toml; applied by the co-located atpkg):\n\
+     [machine] — macOS host settings (aterm.toml; applied by `aterm pkg`):\n\
      \x20 universal_control       \"off\" (default) | \"leave\". Off writes the two per-host keys\n\
      \x20                         that stop the cursor and keyboard roaming to other Macs and\n\
      \x20                         iPads on the same Apple account; leave never touches them.\n\
@@ -647,8 +705,8 @@ const MACHINE_CONFIG_PARAGRAPH: &str = "\n\
      \x20 first window or interactive terminal session, and by a package pass (update,\n\
      \x20 seed, install) when the [machine] table changed since it was last applied;\n\
      \x20 `aterm pkg machine` reads the measured state, and Settings ▸ Security shows it\n\
-     \x20 with the switch and an Apply now button. A saved change lands on the next\n\
-     \x20 package pass, or on Apply now. `defaults` writes\n\
+     \x20 with the switch and an Apply Now button. A saved change lands on the next\n\
+     \x20 ALab tools check, or on Apply Now. `defaults` writes\n\
      \x20 the ACCOUNT's per-host domain regardless of $HOME, so an apply under a redirected\n\
      \x20 HOME is refused and says so, as is one whose aterm.toml does not parse (fix it\n\
      \x20 with `aterm --window --validate-config`). Undo Universal Control with the\n\
@@ -753,19 +811,6 @@ fn show_face_report(family: Option<&str>) -> (String, i32) {
             1,
         ),
     }
-}
-
-/// `aterm list-themes` — the built-in colour schemes + one-line descriptions.
-/// Data: [`aterm_types::scheme::builtin_themes`].
-fn list_themes_report() -> String {
-    let mut out = String::from("Built-in colour schemes:\n\n");
-    for (name, desc) in aterm_types::scheme::builtin_themes() {
-        out.push_str(&format!("{name:<18} {desc}\n"));
-    }
-    out.push_str(
-        "\nSet one in aterm.toml: theme = \"Nord\" (or \"dark:Nord,light:GitHub Light\" to follow the OS).\n",
-    );
-    out
 }
 
 /// How much of `messages.log`'s tail the reader takes: the window's own launch load
@@ -904,12 +949,17 @@ fn read_exceptions_log(path: &std::path::Path) -> ExceptionsRead {
     }
 }
 
-/// The local zone's offset from UTC in seconds at `unix_s`, from `date +%z` (the
-/// offset daylight saving gave THAT instant). `0` where `date` cannot say (Windows,
-/// or no `date`): the times then read as UTC. One subprocess, in the print-and-exit
-/// path only.
-#[cfg(unix)]
+/// The local zone's offset from UTC in seconds at `unix_s` ([`local_offset_at`]),
+/// `0` where `date` cannot say (Windows, or no `date`): the times then read as UTC.
 fn local_offset_s(unix_s: i64) -> i64 {
+    local_offset_at(unix_s).unwrap_or(0)
+}
+
+/// The local zone's offset from UTC in seconds at `unix_s`, from `date +%z` (the
+/// offset daylight saving gave THAT instant), or `None` where `date` cannot say.
+/// One subprocess, in the print-and-exit path only.
+#[cfg(unix)]
+fn local_offset_at(unix_s: i64) -> Option<i64> {
     // The system's own `date` by its path, never whichever one a PATH names.
     let mut date = aterm_uds::spawnfd::command("/bin/date");
     if cfg!(any(
@@ -928,12 +978,11 @@ fn local_offset_s(unix_s: i64) -> i64 {
         .ok()
         .filter(|o| o.status.success())
         .and_then(|o| parse_zone_offset(String::from_utf8_lossy(&o.stdout).trim()))
-        .unwrap_or(0)
 }
 
 #[cfg(not(unix))]
-fn local_offset_s(_unix_s: i64) -> i64 {
-    0
+fn local_offset_at(_unix_s: i64) -> Option<i64> {
+    None
 }
 
 /// `+0100` / `-0530` (what `date +%z` prints) as seconds east of UTC.
@@ -1033,8 +1082,8 @@ fn exceptions_row(facts: &ExceptionsFacts) -> (Mark, String) {
 }
 
 /// `aterm list-kitty-commands` — every word the cursor cat obeys when it is TYPED
-/// at the terminal, one row per (trick, language), then each language's names
-/// for the pet and its filler words. Data: [`aterm_lexicon::TrickLexicon::all_rows`]
+/// at the terminal, language by language: its trick rows, then its names for the
+/// pet, then its filler words. Data: [`aterm_lexicon::TrickLexicon::all_rows`]
 /// — the embedded vocabulary the window's typed-line listener compiles, every
 /// language, gated rows included (`gated=1` marks a row that loads only when
 /// `[sparkle_words] languages` lists its language).
@@ -1474,8 +1523,9 @@ fn unix_shell(env_shell: Option<&str>) -> (&str, Option<&'static str>) {
 /// With `fix` (every run but `--read-only`; owner ruling 2026-10-14) it also
 /// handles what aterm can: stale copies of aterm go to the Trash
 /// ([`atpkg::copies::prune`]), and when aterm is not on the Developer Tools
-/// list the pane is opened for the owner ([`atpkg::devtools::hand_to_owner`]),
-/// then re-read. The report says what it did.
+/// list the owner is brought to it — through the running aterm window, whose
+/// panel explains it beside System Settings, or by doctor itself when no window
+/// answers ([`devtools_hand_over`]) — then re-read. The report says what it did.
 fn doctor_report(fix: bool) -> (String, i32) {
     std::thread::scope(|scope| {
         // The Developer Tools read (one `sqlite3` and one `log show`, up to 8 s)
@@ -1557,13 +1607,12 @@ fn machine_facts(fix: bool) -> MachineFacts {
 }
 
 /// Read the Developer Tools list ([`atpkg::devtools::facts`]) and, with `fix`
-/// and aterm `not_granted`, bring the owner to the switch: list Terminal first
-/// on an empty list (so the pane exists), open the pane, wait up to two minutes
-/// for the switch when a person is at this terminal, and read the list again.
-/// Never over ssh (no pane can open on the Mac's screen from there), and at
-/// most once per [`atpkg::devtools::REOPEN_AFTER_S`] when no person is at the
-/// terminal (an agent may run doctor in a loop). A test binary reads nothing:
-/// the probes refuse outside an app bundle, so nothing is opened.
+/// and aterm `not_granted`, bring the owner to the switch through the running
+/// aterm window when one answers ([`devtools_hand_over`]), so the owner gets
+/// aterm's helper panel beside System Settings, and read the list again when
+/// this run opened the page. Never over ssh (no pane can open on the Mac's
+/// screen from there). A test binary reads nothing: the probes refuse outside an
+/// app bundle, so nothing is asked or opened.
 fn devtools_facts(fix: bool) -> DevtoolsFacts {
     let (facts, did) = devtools_read_and_hand_over(fix);
     DevtoolsFacts { facts, did }
@@ -1589,44 +1638,372 @@ fn devtools_read_and_hand_over(fix: bool) -> (Option<atpkg::devtools::Facts>, Op
         );
     }
     let person = std::io::stdout().is_terminal();
-    if !person && let Some(ago) = dt::opened_recently() {
+    let subject = facts.subject.clone().unwrap_or_default();
+    let version = aterm_types::version::app_version();
+    let reach = DevtoolsReach {
+        ask_window: &ask_window_for_devtools,
+        list_terminal: &dt::list_terminal,
+        open_pane: &dt::open_pane,
+        opened_within: &dt::opened_within,
+        note_opened: &|| dt::note_opened(version),
+        declined_at: &|| dt::declined_until().map(|declined| declined.at),
+        await_on: &|| {
+            let list = dt::await_switch(&subject, std::time::Duration::from_secs(120), |id| {
+                aterm_containment::probe_devtool_list(aterm_containment::ProbeGate::on(), id)
+            });
+            list.listing == aterm_containment::DevToolListing::On
+        },
+        local_day: &|at| local_day_words(at, i64::try_from(at).ok().and_then(local_offset_at)),
+        say: &|words| eprintln!("{words}"),
+    };
+    let (did, opened) = devtools_hand_over(&facts, person, &reach);
+    // Re-read: the row says what holds now, not what held before the hand-over.
+    let facts = if opened {
+        dt::facts().unwrap_or(facts)
+    } else {
+        facts
+    };
+    (Some(facts), Some(did))
+}
+
+/// What the running aterm window answered `devtools hand-over`, as `aterm
+/// doctor` acts on it ([`ask_window_for_devtools`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WindowAnswer {
+    /// No aterm instance answers: none runs, or the request never went out (the
+    /// connect phase failed, or refused it: `ERR auth`, `ERR control server
+    /// busy`). Doctor opens the page itself.
+    Unreachable,
+    /// The request reached the window and no reply came (the words say how): the
+    /// window may still act, so doctor opens nothing.
+    Unanswered(String),
+    /// The window's reply line (`OK …` / `ERR …`).
+    Reply(String),
+}
+
+/// Ask the aterm instance this shell reaches (`aterm ctl`'s flagless rule, a
+/// live socket) for the Developer Tools hand-over: `devtools hand-over`, or with
+/// `now` for a person at this terminal. The window holds the ask to its own
+/// rules (the verb's help).
+fn ask_window_for_devtools(now: bool) -> WindowAnswer {
+    let Some(sock) = aterm_ctl::front_door_instance() else {
+        return WindowAnswer::Unreachable;
+    };
+    let request = if now {
+        "devtools hand-over now\n"
+    } else {
+        "devtools hand-over\n"
+    };
+    window_answer(aterm_ctl::front_door_send(&sock, request))
+}
+
+/// What one [`aterm_ctl::front_door_send`] of the hand-over came to. A line the
+/// connect phase returned in place of an answer (`ERR auth; …`, `ERR control
+/// server busy; retry`) means the request never went out, so nothing was
+/// decided about it: no instance answered, as when the connect itself failed.
+/// An error after the request was written is the window's silence: it may
+/// still act. Pure.
+fn window_answer(sent: std::io::Result<String>) -> WindowAnswer {
+    match sent {
+        Ok(reply) if aterm_ctl::front_door_refused(&reply) => WindowAnswer::Unreachable,
+        Ok(reply) => WindowAnswer::Reply(reply),
+        Err(error) if aterm_ctl::front_door_delivered(&error) => {
+            WindowAnswer::Unanswered(error.to_string())
+        }
+        Err(_) => WindowAnswer::Unreachable,
+    }
+}
+
+/// What `aterm doctor`'s Developer Tools hand-over reaches beyond the facts it
+/// read: the window, atpkg's two acts, the shared markers, the wait and the
+/// terminal. Injected, so a test asks, runs, opens, writes, waits for and prints
+/// nothing.
+struct DevtoolsReach<'a> {
+    /// Ask the running aterm window ([`ask_window_for_devtools`]); the argument
+    /// is `now` (a person at this terminal).
+    ask_window: &'a dyn Fn(bool) -> WindowAnswer,
+    /// [`atpkg::devtools::list_terminal`].
+    list_terminal: &'a dyn Fn() -> Result<(), String>,
+    /// [`atpkg::devtools::open_pane`]: `/usr/bin/open`, the path measured to work
+    /// from a foreground command line.
+    open_pane: &'a dyn Fn() -> Result<(), String>,
+    /// [`atpkg::devtools::opened_within`]: seconds since aterm last opened the
+    /// pane, when under the window.
+    opened_within: &'a dyn Fn(u64) -> Option<u64>,
+    /// [`atpkg::devtools::note_opened`] for this version.
+    note_opened: &'a dyn Fn(),
+    /// When the owner said Not now to the panel (unix seconds), while it holds
+    /// ([`atpkg::devtools::declined_until`]).
+    declined_at: &'a dyn Fn() -> Option<u64>,
+    /// Wait up to two minutes for aterm's switch: `true` once it reads on.
+    await_on: &'a dyn Fn() -> bool,
+    /// A unix time as the calendar day it fell on here ([`local_day_words`]).
+    local_day: &'a dyn Fn(u64) -> String,
+    /// Where the banner and the wait line go (stderr: the report itself goes to
+    /// stdout only at the end).
+    say: &'a dyn Fn(&str),
+}
+
+/// The line printed while doctor waits for the switch. ctrl-c ends doctor, not
+/// only the wait (doctor installs no handler), so it says that.
+const DEVTOOLS_WAIT_LINE: &str = "aterm doctor: waiting up to 2 min for aterm's switch to read on \
+                                  in Developer Tools (ctrl-c stops doctor)\u{2026}";
+
+/// THE HAND-OVER FROM `aterm doctor` (owner ask 2026-10-15): ask the running
+/// window first, so the owner gets aterm's panel beside System Settings, and act
+/// on what it answers. `(did, opened)`: what this run did, in the report's
+/// words, and whether doctor opened the page (the list is read again then).
+///
+/// * No window answers (none runs, or the request never went out: the connect
+///   phase failed or refused it), or one too old to know the verb: doctor opens
+///   the page itself, as before — when no person is at the terminal (an agent may
+///   run doctor in a loop) never while the owner's Not now holds and at most once
+///   per [`atpkg::devtools::REOPEN_AFTER_S`], with the whole banner first when a
+///   person is here.
+/// * `OK shown` (a person here, `now`): the panel is up; doctor opens the page
+///   (the window's `now` form never does) after a short banner naming the panel.
+///   `OK unshown`: no panel, so the whole banner, then the page.
+/// * The request went out with a person here and no reply came: the window's
+///   `now` form never opens the page, so doctor opens it, with the whole banner.
+///   With no person here (the bare form) the window may still bring the page up
+///   at a quiet moment, so doctor opens nothing.
+/// * `OK queued` (no person here): the window brings the page up itself at a
+///   quiet moment. Doctor opens nothing.
+/// * `OK granted` or `OK unknown` with a person here contradicts the
+///   `not_granted` doctor itself read a moment ago: the window answers from a
+///   verdict it took earlier (it reads again on a focus gain, and only while it
+///   awaits the owner), so doctor opens the page itself, with the whole banner.
+/// * Anything else is the window's decision that nothing opens — granted or
+///   unknown with nobody here, declined, unstable, recent, headless or an error
+///   — and doctor opens nothing either, saying why.
+///
+/// With a person here and the list readable, doctor then waits up to two
+/// minutes for the switch.
+fn devtools_hand_over(
+    facts: &atpkg::devtools::Facts,
+    person: bool,
+    reach: &DevtoolsReach<'_>,
+) -> (String, bool) {
+    use atpkg::devtools as dt;
+    let reply = match (reach.ask_window)(person) {
+        WindowAnswer::Unreachable => {
+            return devtools_open_here(facts, person, reach, true, !person);
+        }
+        // `now` shows at most the panel, never the page: a person here gets it
+        // from doctor whatever the window did.
+        WindowAnswer::Unanswered(_) if person => {
+            return devtools_open_here(facts, person, reach, true, false);
+        }
+        WindowAnswer::Unanswered(why) => {
+            return (
+                format!(
+                    "did nothing: asked the aterm window for the page and it did not answer \
+                     ({why}); it may still bring the page up at a quiet moment, so doctor \
+                     opened nothing"
+                ),
+                false,
+            );
+        }
+        WindowAnswer::Reply(reply) => reply,
+    };
+    let no_window_press = format!(
+        "{} \u{25b8} Open Developer Tools\u{2026} opens the page",
+        dt::STATUS_PAGE
+    );
+    let did = match reply.as_str() {
+        "OK shown" => return devtools_open_here(facts, person, reach, false, false),
+        "OK unshown" => return devtools_open_here(facts, person, reach, true, false),
+        // The window's verdict is older than doctor's own read, which says
+        // not_granted (doctor asks only then): a person here gets the page from
+        // doctor, with the whole banner, as with no window.
+        "OK granted" | "OK unknown" if person => {
+            return devtools_open_here(facts, person, reach, true, false);
+        }
+        // A window older than the verb: it cannot hand anything over, so this is
+        // the no-window path (it raised nothing, so nothing opens twice).
+        _ if reply.starts_with("ERR unknown verb") => {
+            return devtools_open_here(facts, person, reach, true, !person);
+        }
+        "OK queued" => format!(
+            "asked the aterm window to show the owner the page at a quiet moment (status: {})",
+            dt::STATUS_PAGE
+        ),
+        // `now`'s `recent` is the window's minute, which its own last answer to a
+        // `now` also starts (the shared marker moves only when a page opens), so
+        // no time read from the marker is promised for it.
+        "OK recent" if person => format!(
+            "did nothing: within the last minute aterm opened the page, or the aterm window \
+             answered a request for it; {no_window_press}"
+        ),
+        "OK recent" => match (reach.opened_within)(dt::REOPEN_AFTER_S) {
+            Some(ago) => format!(
+                "did nothing: aterm opened the pane {}",
+                opened_ago_words(ago)
+            ),
+            None => format!(
+                "did nothing: the aterm window says aterm opened the page within the last {} \
+                 minutes",
+                dt::REOPEN_AFTER_S / 60
+            ),
+        },
+        "OK declined" => format!(
+            "did nothing: you said Not now{}; {no_window_press}",
+            (reach.declined_at)()
+                .map_or_else(String::new, |at| format!(" on {}", (reach.local_day)(at)))
+        ),
+        "OK granted" => format!(
+            "did nothing: the aterm window's last reading has aterm on the list and switched \
+             on; {no_window_press}"
+        ),
+        "OK unknown" => format!(
+            "did nothing: the aterm window could not tell from its last reading whether aterm \
+             is on the list, so it leaves the list alone; {no_window_press}"
+        ),
+        "OK listed" => format!(
+            "did nothing: the aterm window reads aterm's row on while macOS still checks its \
+             new programs, so the page holds nothing to add; {no_window_press}"
+        ),
+        "OK unstable" => format!(
+            "did nothing: this aterm is an ad hoc or dev build, whose grant the next build \
+             would lose, so the window brings nothing up by itself; {no_window_press}"
+        ),
+        _ if reply.starts_with("ERR headless") => {
+            "did nothing: the aterm instance doctor reached is headless, so no page opens"
+                .to_string()
+        }
+        _ => format!("did nothing: the aterm window answered `{reply}`"),
+    };
+    (did, false)
+}
+
+/// Doctor's own open (no window answered, or the window showed its panel and
+/// leaves the page to doctor): atpkg's hand-over, with the banner printed just
+/// before the page opens when a person is here — the whole banner with `full`,
+/// two lines naming the panel without — and the wait. `rate_limited` (no
+/// person here, no window that judged it): refuse while the owner's Not now
+/// holds, as the window's own hand-over does, and within
+/// [`atpkg::devtools::REOPEN_AFTER_S`] of the last opening.
+fn devtools_open_here(
+    facts: &atpkg::devtools::Facts,
+    person: bool,
+    reach: &DevtoolsReach<'_>,
+    full: bool,
+    rate_limited: bool,
+) -> (String, bool) {
+    use atpkg::devtools as dt;
+    if rate_limited && let Some(at) = (reach.declined_at)() {
         return (
-            Some(facts),
-            Some(format!(
-                "did nothing: aterm opened the pane {} min ago",
-                ago / 60
-            )),
+            format!(
+                "did nothing: you said Not now on {}; {} \u{25b8} Open Developer Tools\u{2026} \
+                 opens the page",
+                (reach.local_day)(at),
+                dt::STATUS_PAGE
+            ),
+            false,
         );
     }
+    if rate_limited && let Some(ago) = (reach.opened_within)(dt::REOPEN_AFTER_S) {
+        return (
+            format!(
+                "did nothing: aterm opened the pane {}",
+                opened_ago_words(ago)
+            ),
+            false,
+        );
+    }
+    // Whether `spctl` added Terminal, for the banner's word on which switch matters.
+    let listed = std::cell::Cell::new(false);
+    let list_terminal = || {
+        let outcome = (reach.list_terminal)();
+        listed.set(outcome.is_ok());
+        outcome
+    };
+    let open_pane = || {
+        if person {
+            (reach.say)(&devtools_banner(facts, full, listed.get()));
+        }
+        (reach.open_pane)()
+    };
     let handled = dt::hand_to_owner(
-        &facts,
+        facts,
         &dt::Reach {
-            list_terminal: &dt::list_terminal,
-            open_pane: &dt::open_pane,
+            list_terminal: &list_terminal,
+            open_pane: &open_pane,
         },
     );
     let mut did = dt::handled_words(&handled);
     if !matches!(handled, dt::Handled::Opened { .. }) {
-        return (Some(facts), Some(did));
+        return (did, false);
     }
-    dt::note_opened(aterm_types::version::app_version());
+    (reach.note_opened)();
     if person && facts.list.label == aterm_containment::DevToolListLabel::Read {
-        let subject = facts.subject.clone().unwrap_or_default();
-        eprintln!(
-            "aterm doctor: waiting up to 2 min for aterm to be switched on in Developer Tools \
-             (ctrl-c ends the wait)…"
-        );
-        let list = dt::await_switch(&subject, std::time::Duration::from_secs(120), |id| {
-            aterm_containment::probe_devtool_list(aterm_containment::ProbeGate::on(), id)
-        });
-        did.push_str(if list.listing == aterm_containment::DevToolListing::On {
+        (reach.say)(DEVTOOLS_WAIT_LINE);
+        did.push_str(if (reach.await_on)() {
             "; you switched it on"
         } else {
             "; not switched on within 2 min"
         });
     }
-    // Re-read: the row says what holds now, not what held before the hand-over.
-    (dt::facts().or(Some(facts)), Some(did))
+    (did, true)
+}
+
+/// The calendar day `at` (unix seconds) fell on in the local zone, for a
+/// did-line: `YYYY-MM-DD` at `offset_s` east of UTC, or the UTC day marked
+/// `(UTC)` when the zone could not be read. Pure.
+fn local_day_words(at: u64, offset_s: Option<i64>) -> String {
+    let shifted = |offset: i64| {
+        let at = i64::try_from(at).unwrap_or(i64::MAX).saturating_add(offset);
+        u64::try_from(at.max(0)).unwrap_or(0)
+    };
+    let mut day = aterm_types::rfc3339::format_rfc3339(shifted(offset_s.unwrap_or(0)));
+    day.truncate(10);
+    if offset_s.is_none() {
+        day.push_str(" (UTC)");
+    }
+    day
+}
+
+/// How long ago aterm opened the pane, `ago` seconds back, for a did-line.
+fn opened_ago_words(ago: u64) -> String {
+    if ago < 60 {
+        "under a minute ago".to_string()
+    } else {
+        format!("{} min ago", ago / 60)
+    }
+}
+
+/// The banner a person at doctor's terminal reads as System Settings opens, in
+/// atpkg's one spelling: with `full`, the title, why, how (by what the list
+/// holds of aterm: [`atpkg::devtools::Step`]), which switch matters
+/// (`listed_terminal`: this run's `spctl` added Terminal), the trade and where
+/// the status lives; without, two lines naming aterm's panel, which says the
+/// rest beside the list — and, when this run's `spctl` added Terminal, that
+/// Terminal stays off (the panel was shown before `spctl` ran, so it cannot
+/// say so). Pure.
+fn devtools_banner(facts: &atpkg::devtools::Facts, full: bool, listed_terminal: bool) -> String {
+    use atpkg::devtools as dt;
+    let skips = aterm_containment::SpikeEvidence::UNMEASURED.devtool_skips_first_run_check;
+    let status = format!("  {}", dt::STATUS_LINK);
+    if !full {
+        let mut short = format!(
+            "aterm doctor: {}: aterm's panel beside System Settings shows how.",
+            dt::HELPER_TITLE
+        );
+        if listed_terminal {
+            short.push_str(&format!("\n  {}", dt::only_aterm(true)));
+        }
+        return format!("{short}\n{status}");
+    }
+    let how = dt::Step::of(&facts.list).how();
+    [
+        format!("aterm doctor: {}", dt::HELPER_TITLE),
+        format!("  {}", dt::why(skips)),
+        format!("  {how}"),
+        format!("  {}", dt::only_aterm(listed_terminal)),
+        format!("  {}", dt::trade(skips)),
+        status,
+    ]
+    .join("\n")
 }
 
 /// The `copies:` row, pure over the facts: atpkg's words and weights, never a
@@ -2205,15 +2582,8 @@ pub fn parse_args(argv: Vec<std::ffi::OsString>) -> bool {
                 .find(|(name, _)| *name == cmd)
                 .map(|(_, d)| *d)
                 .unwrap_or("");
-            let usage = if cmd == "show-face" {
-                format!("aterm {cmd} <family>")
-            } else if cmd == "exceptions" {
-                format!("aterm {cmd} [--all]")
-            } else {
-                format!("aterm {cmd}")
-            };
             println!("{cmd} — {desc}");
-            println!("usage: {usage}");
+            println!("usage: {}", diag_usage(&cmd));
             std::process::exit(0);
         }
         CliAction::Diag { cmd, arg } => {
@@ -2566,7 +2936,7 @@ fn session_path_env(
 /// dispatch. False for no operand, an empty token, a flag, any front-door verb
 /// ([`Verb::from_operand`]), `help`, and any diagnostic subcommand, so a
 /// co-distributed tool can never shadow aterm's own surface. `true` means only
-/// "candidate"; the co-located `atpkg` decides whether it is installed. Pure.
+/// "candidate"; the package dispatcher decides whether it is installed. Pure.
 pub fn is_tool_candidate(first: Option<&str>) -> bool {
     match first {
         None => false,
@@ -2673,8 +3043,10 @@ pub fn session_main(quiet: bool) -> ! {
     // `env_add` (`docs/DESIGN-toolchain-reroute-2026-09-07.md` §"Reaching
     // PATH"): the reroute dir (so a bare `cargo`/`rustc` is announced or
     // signposted), the managed `agents/` (`managed_agents_dir`), aterm's own
-    // binary dir, then the inherited PATH. `--no-reroute` means no reroute
-    // prepend and no export.
+    // binary dir, then the inherited PATH, which the front door has already
+    // given the managed `bin/` at its end where the machine consents
+    // (`atpkg::session_bin_dir`). `--no-reroute` means no reroute prepend and
+    // no export.
     //
     // This holds only until the login shell's startup files run (see
     // `managed_agents_dir`). The reroute and agents dirs are re-exported
@@ -2750,7 +3122,7 @@ mod tests {
         PrivacyFacts, ProbeLabel, REROUTE_DIR_ENV, RecoveryFacts, SelfHardening, ShellCheck,
         VERB_BLURB_COLUMN, Verb, agents_dir_mode, decide_args, diag_report, doctor_checks,
         doctor_checks_with_origin, doctor_report, exceptions_report_at, explain_config_report,
-        help_text, is_tool_candidate, list_fonts_report, list_themes_report, managed_agents_dir,
+        help_text, is_tool_candidate, list_fonts_report, list_themes_alias, managed_agents_dir,
         parse_zone_offset, prepend_path, read_exceptions_log, reroute_dir_from_values,
         session_limits, session_path_env, show_face_report, verb_help_block, version_text,
     };
@@ -2852,7 +3224,6 @@ mod tests {
             "show-config",
             "explain-config",
             "list-fonts",
-            "list-themes",
             "list-kitty-commands",
         ] {
             match decide(&[cmd, "--json"]) {
@@ -2905,6 +3276,11 @@ mod tests {
                 other => panic!("{argv:?} must be a usage error, got {other:?}"),
             }
         }
+        // `aterm doctor --help` states the same grammar as the refusal.
+        assert_eq!(super::diag_usage("doctor"), "aterm doctor [--read-only]");
+        assert_eq!(super::diag_usage("exceptions"), "aterm exceptions [--all]");
+        assert_eq!(super::diag_usage("show-face"), "aterm show-face <family>");
+        assert_eq!(super::diag_usage("list-fonts"), "aterm list-fonts");
     }
 
     /// `aterm exceptions` takes one optional flag, `--all`; anything else is a
@@ -3288,8 +3664,9 @@ mod tests {
                     .any(|l| l.trim_start().starts_with(name)),
                 "subcommand {name:?} is not advertised as a --help line"
             );
+            // `list-themes` is dispatched as `aterm theme list`.
             assert!(
-                diag_report(name, None).is_some(),
+                diag_report(name, None).is_some() || list_themes_alias(name, &[]).is_some(),
                 "subcommand {name:?} is in the registry but has no dispatch"
             );
             // And it must actually be recognized by the parser (`show-face`
@@ -3370,31 +3747,6 @@ mod tests {
         );
         // aterm's own `help` must never be shadowed by a co-distributed tool named `help`.
         assert!(!is_tool_candidate(Some("help")));
-    }
-
-    /// `--help` names the shell the session runs (`$SHELL` on Unix, the
-    /// platform default on Windows), right under the origin line.
-    #[test]
-    fn help_names_the_shell_the_session_runs() {
-        let help = help_text();
-        let after_origin = format!("{}\n\n", aterm_types::identity::ORIGIN_LINE);
-        let session = help
-            .split_once(after_origin.as_str())
-            .map(|(_, rest)| rest.split("\n\n").next().unwrap_or_default())
-            .unwrap_or_else(|| panic!("no origin line in\n{help}"));
-        if cfg!(windows) {
-            assert_eq!(
-                session,
-                "Runs pwsh (else Windows PowerShell, else %COMSPEC%) in a ConPTY and passes its\n\
-                 bytes through unchanged."
-            );
-            assert!(!help.contains("$SHELL"), "{help}");
-        } else {
-            assert_eq!(
-                session,
-                "Runs your $SHELL in a PTY and passes its bytes through unchanged."
-            );
-        }
     }
 
     #[test]
@@ -3665,6 +4017,51 @@ mod tests {
         );
     }
 
+    /// The managed `bin/` the front door APPENDED to the inherited PATH
+    /// (`crates/aterm/src/main.rs`, `atpkg::session_bin_dir`) stays last and
+    /// single behind reroute, agents and the front door, as the window's spawn
+    /// seam places it; composing again moves nothing.
+    #[test]
+    fn session_path_keeps_the_appended_bin_dir_last_and_single() {
+        let sep = if cfg!(windows) { ';' } else { ':' };
+        let join = |parts: &[&str]| parts.join(&sep.to_string());
+        let reroute = "/Users//u/Library/Application Support/aterm/pkg/reroute";
+        let agents = "/Users//u/Library/Application Support/aterm/pkg/agents";
+        let managed_bin = "/Users//u/Library/Application Support/aterm/pkg/bin";
+        let front_door = "/opt/aterm/bin";
+        let inherited = atpkg::store::append_bin_to_path(
+            Some(std::ffi::OsStr::new(&join(&[
+                "/opt/homebrew/bin",
+                "/usr/bin",
+            ]))),
+            std::path::Path::new(managed_bin),
+        );
+        let inherited = inherited.to_str().expect("utf-8");
+        let (_, value) = session_path_env(
+            Some(reroute),
+            Some(agents),
+            Some(front_door),
+            Some(inherited),
+        )
+        .expect("injects");
+        assert_eq!(
+            value,
+            join(&[
+                reroute,
+                agents,
+                front_door,
+                "/opt/homebrew/bin",
+                "/usr/bin",
+                managed_bin
+            ])
+        );
+        let (_, again) =
+            session_path_env(Some(reroute), Some(agents), Some(front_door), Some(&value))
+                .expect("injects");
+        assert_eq!(again, value);
+        assert_eq!(value.matches(managed_bin).count(), 1);
+    }
+
     /// The derived agents dir is atpkg's `Layout::agents_dir` for the prefix of
     /// `$ATERM_REROUTE_DIR` (pinned against the real layout), and the
     /// derivation ensures it exists (`0700`), so a fresh machine's first
@@ -3790,19 +4187,14 @@ mod tests {
                 "{name}: TERM_PROGRAM is user-settable, not a marker: {body}"
             );
         }
-        // The shell integration (every dialect, and the macOS bundle's copies)
-        // must not read the handoff either: it keys hook-sourcing on
-        // `$ATPKG_AGENTS` being unset. Read as files, since those crates do not
-        // depend on this one.
+        // The shell integration (every dialect) must not read the handoff
+        // either: it keys hook-sourcing on `$ATPKG_AGENTS` being unset. Read as
+        // files, since that crate does not depend on this one.
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("crates/aterm-cli sits under crates/");
-        let workspace = root.parent().expect("crates/ sits under the workspace");
         let mut scripts = Vec::new();
-        for dir in [
-            root.join("aterm-shell-integration/src/scripts"),
-            workspace.join("apps/aterm-mac/Sources/ATermMac/Resources/ShellIntegration"),
-        ] {
+        for dir in [root.join("aterm-shell-integration/src/scripts")] {
             for entry in
                 std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
             {
@@ -3816,10 +4208,7 @@ mod tests {
                 }
             }
         }
-        assert!(
-            scripts.len() >= 7,
-            "four dialects plus the three bundled copies: {scripts:?}"
-        );
+        assert!(scripts.len() >= 4, "four dialects: {scripts:?}");
         for script in scripts {
             let body = std::fs::read_to_string(&script).expect("a shell integration script");
             assert!(
@@ -4606,32 +4995,6 @@ mod tests {
         );
     }
 
-    /// Windows `explain-config` names the starter-file command and the `shell`
-    /// and `font_px` keys.
-    #[cfg(windows)]
-    #[test]
-    fn windows_explain_config_names_the_starter_shell_and_font_px() {
-        let r = explain_config_report();
-        for needle in [
-            "\n  `aterm --window --write-config` writes a documented starter.\n",
-            "\n  shell ",
-            "\n  font_px ",
-            "with --shell uses that instead",
-            "with --font-px uses that instead",
-            "pwsh, then powershell, then %COMSPEC%, then cmd.exe",
-            // The console image's spelling: `aterm-gui` is the GUI-subsystem
-            // image, which a pwsh prompt does not wait for.
-            "`aterm --window --write-config`",
-            "doctor` names the program this machine resolves it to",
-        ] {
-            assert!(r.contains(needle), "explain-config missing {needle:?}\n{r}");
-        }
-        assert!(
-            !r.contains("~/.config/aterm"),
-            "no Unix literal for the Windows config path:\n{r}"
-        );
-    }
-
     /// The four `privacy:` states (§3.8): a `note` never moves the exit code,
     /// while a real `Fail` elsewhere still exits 1.
     #[test]
@@ -4965,8 +5328,13 @@ mod tests {
                 &machine,
             )
         };
-        let did = "opened System Settings \u{25b8} Privacy & Security \u{25b8} Developer Tools: \
-                   press +, choose aterm, switch it on (macOS asks for your password)";
+        // atpkg's own words for the hand-over, so this pins where they land, not their
+        // spelling (atpkg's devtools tests pin that).
+        let did = atpkg::devtools::handled_words(&atpkg::devtools::Handled::Opened {
+            listed_terminal: None,
+            step: atpkg::devtools::Step::SwitchOn,
+        });
+        let did = did.as_str();
         let (r, code) = report(&devtools(DevToolListing::Off, Some(did)));
         assert_eq!(code, 0, "a warning never fails: {r}");
         assert_eq!(mark_of(&r, "devtools:"), "warn", "{r}");
@@ -4996,6 +5364,436 @@ mod tests {
         // No Developer Tools list here: no row at all.
         let (r, _) = report(&no_devtools());
         assert!(!r.contains("devtools:"), "{r}");
+    }
+
+    /// A scripted [`super::DevtoolsReach`] for doctor's Developer Tools hand-over:
+    /// the window answers `answer`, the opened marker reads `opened_ago`, a decline
+    /// on record dates `declined_at`, and every act is logged in order instead of
+    /// done (nothing is asked, run, opened, written, waited for or printed).
+    struct Scripted {
+        answer: super::WindowAnswer,
+        opened_ago: Option<u64>,
+        declined_at: Option<u64>,
+        log: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl Scripted {
+        fn new(answer: super::WindowAnswer) -> Self {
+            Self {
+                answer,
+                opened_ago: None,
+                declined_at: None,
+                log: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+
+        /// Run the hand-over for `facts` with a person at the terminal or not:
+        /// `(did, opened, log)`.
+        fn run(&self, facts: &atpkg::devtools::Facts, person: bool) -> (String, bool, Vec<String>) {
+            let note = |entry: String| self.log.borrow_mut().push(entry);
+            let reach = super::DevtoolsReach {
+                ask_window: &|now| {
+                    note(format!("ask now={now}"));
+                    self.answer.clone()
+                },
+                list_terminal: &|| {
+                    note("spctl".to_string());
+                    Ok(())
+                },
+                open_pane: &|| {
+                    note("open".to_string());
+                    Ok(())
+                },
+                opened_within: &|window| self.opened_ago.filter(|ago| *ago < window),
+                note_opened: &|| note("marker".to_string()),
+                declined_at: &|| self.declined_at,
+                await_on: &|| {
+                    note("wait".to_string());
+                    true
+                },
+                local_day: &|at| super::local_day_words(at, Some(0)),
+                say: &|words| note(format!("say {words}")),
+            };
+            let (did, opened) = super::devtools_hand_over(facts, person, &reach);
+            (did, opened, self.log.take())
+        }
+    }
+
+    /// Facts for aterm not on the list: `list` as read, tccd's log silent.
+    fn devtools_facts_with(list: aterm_containment::DevToolList) -> atpkg::devtools::Facts {
+        use aterm_containment::consent::{DevToolProbe, DevToolProbeLabel};
+        atpkg::devtools::Facts {
+            subject: Some("com.aterm.aterm".to_string()),
+            list,
+            log: DevToolProbe::refused(DevToolProbeLabel::NoRecentRequest),
+            other_responsible: None,
+        }
+    }
+
+    /// A list read whole, `rows` long, with aterm's row `listing`.
+    fn read_list(
+        listing: aterm_containment::DevToolListing,
+        rows: u32,
+    ) -> aterm_containment::DevToolList {
+        aterm_containment::DevToolList {
+            listing,
+            label: aterm_containment::DevToolListLabel::Read,
+            modified_at_s: Some(1),
+            rows: Some(rows),
+        }
+    }
+
+    /// THE HAND-OVER FROM `aterm doctor` (owner ask 2026-10-15) asks the running
+    /// window first, so the owner gets aterm's panel beside System Settings, and
+    /// opens the page itself only where the window leaves it to doctor: `OK shown`
+    /// (a person here: a short banner naming the panel, then the page), `OK
+    /// unshown`, no window to ask, or a window too old to know the verb (the whole
+    /// banner, then the page). The banner is printed before the page opens and
+    /// after `spctl`, so it can say whose Terminal row that is. Every other answer
+    /// is the window's decision that nothing opens, and doctor opens nothing
+    /// either — the negative control for each — nor after a request that reached
+    /// the window and got no reply. The bare form (no person) waits for the
+    /// window's quiet moment; only the no-window path keeps doctor's own ten
+    /// minutes.
+    #[test]
+    fn doctor_asks_the_window_first_and_opens_only_where_the_window_leaves_it() {
+        use super::{DEVTOOLS_WAIT_LINE, WindowAnswer};
+        use aterm_containment::DevToolListing;
+        use atpkg::devtools as dt;
+        let skips = aterm_containment::SpikeEvidence::UNMEASURED.devtool_skips_first_run_check;
+        let absent = devtools_facts_with(read_list(DevToolListing::Absent, 2));
+        let reply = |line: &str| WindowAnswer::Reply(line.to_string());
+        let said = |log: &[String]| -> String {
+            log.iter()
+                .filter_map(|entry| entry.strip_prefix("say "))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let opened_words = dt::handled_words(&dt::Handled::Opened {
+            listed_terminal: None,
+            step: dt::Step::Add,
+        });
+
+        // No window: the whole banner, then the page, the marker and the wait.
+        let (did, opened, log) = Scripted::new(WindowAnswer::Unreachable).run(&absent, true);
+        assert!(opened);
+        assert_eq!(did, format!("{opened_words}; you switched it on"));
+        let banner = said(&log);
+        for words in [
+            dt::HELPER_TITLE,
+            dt::why(skips),
+            dt::HELPER_HOW,
+            dt::only_aterm(false),
+            dt::trade(skips),
+            "Status: aterm Settings \u{25b8} Security",
+            DEVTOOLS_WAIT_LINE,
+        ] {
+            assert!(banner.contains(words), "{words:?} in\n{banner}");
+        }
+        let at = |what: &str| {
+            log.iter()
+                .position(|entry| entry.starts_with(what))
+                .unwrap_or_else(|| panic!("{what} in {log:?}"))
+        };
+        assert_eq!(log[0], "ask now=true", "a person here asks with `now`");
+        assert!(
+            at("say aterm doctor: Add") < at("open"),
+            "the banner first: {log:?}"
+        );
+        assert!(
+            at("open") < at("marker") && at("marker") < at("wait"),
+            "{log:?}"
+        );
+
+        // The window's panel is up: two lines naming it, then doctor's own open,
+        // whatever the marker says (the window judged that).
+        let mut shown = Scripted::new(reply("OK shown"));
+        shown.opened_ago = Some(5);
+        let (did, opened, log) = shown.run(&absent, true);
+        assert!(opened, "{did}");
+        let banner = said(&log);
+        assert!(
+            banner.contains("aterm's panel beside System Settings"),
+            "{banner}"
+        );
+        assert!(
+            !banner.contains(dt::HELPER_HOW),
+            "the panel says how: {banner}"
+        );
+        assert!(log.contains(&"open".to_string()), "{log:?}");
+
+        // No panel could be shown, or the window is older than the verb: the
+        // whole banner and the page.
+        for answer in ["OK unshown", "ERR unknown verb (try: help)"] {
+            let (_, opened, log) = Scripted::new(reply(answer)).run(&absent, true);
+            assert!(opened, "{answer}");
+            assert!(said(&log).contains(dt::HELPER_HOW), "{answer}: {log:?}");
+        }
+
+        // No person here: the bare form, which the window holds for a quiet
+        // moment; doctor opens nothing.
+        let (did, opened, log) = Scripted::new(reply("OK queued")).run(&absent, false);
+        assert!(!opened);
+        assert_eq!(log, ["ask now=false"]);
+        assert!(did.contains("at a quiet moment"), "{did}");
+
+        // No window and no person: doctor's own ten minutes still hold.
+        let mut looped = Scripted::new(WindowAnswer::Unreachable);
+        looped.opened_ago = Some(120);
+        let (did, opened, log) = looped.run(&absent, false);
+        assert_eq!(
+            (did.as_str(), opened),
+            ("did nothing: aterm opened the pane 2 min ago", false)
+        );
+        assert_eq!(log, ["ask now=false"]);
+        // No window and no person: the owner's Not now holds it too, as it holds
+        // the window's own hand-over; a person here still gets the page.
+        for answer in [
+            WindowAnswer::Unreachable,
+            reply("ERR unknown verb (try: help)"),
+        ] {
+            let mut declined_here = Scripted::new(answer.clone());
+            declined_here.declined_at = Some(1_790_812_800); // 2026-10-01
+            let (did, opened, log) = declined_here.run(&absent, false);
+            assert_eq!(
+                (did.as_str(), opened),
+                (
+                    "did nothing: you said Not now on 2026-10-01; aterm Settings \u{25b8} \
+                     Security \u{25b8} Open Developer Tools\u{2026} opens the page",
+                    false
+                ),
+                "{answer:?}"
+            );
+            assert_eq!(log, ["ask now=false"], "{answer:?}");
+            let mut person_here = Scripted::new(answer);
+            person_here.declined_at = Some(1_790_812_800);
+            let (did, opened, _) = person_here.run(&absent, true);
+            assert!(opened, "a person asked: {did}");
+        }
+        let (_, opened, log) = Scripted::new(WindowAnswer::Unreachable).run(&absent, false);
+        assert!(opened);
+        assert!(said(&log).is_empty(), "nobody to read a banner: {log:?}");
+        assert!(
+            !log.contains(&"wait".to_string()),
+            "nobody to wait for: {log:?}"
+        );
+
+        // The request went out and no reply came. A person here asked with `now`,
+        // which never opens the page: doctor opens it, with the whole banner. With
+        // nobody here the bare form may still bring it up at a quiet moment, so
+        // doctor opens nothing.
+        let silent = || {
+            Scripted::new(WindowAnswer::Unanswered(
+                "did not answer within 10s".to_string(),
+            ))
+        };
+        let (did, opened, log) = silent().run(&absent, true);
+        assert!(opened, "{did}");
+        assert!(said(&log).contains(dt::HELPER_HOW), "{log:?}");
+        let (did, opened, log) = silent().run(&absent, false);
+        assert!(
+            !opened && did.contains("may still bring the page up"),
+            "{did}"
+        );
+        assert_eq!(log, ["ask now=false"]);
+
+        // `recent`: for `now` the window's own minute, which its last answer to a
+        // `now` starts too, so no age read from the marker is claimed; for the
+        // bare form the marker's age, or the window's word when the marker says
+        // otherwise.
+        for (person, opened_ago, words) in [
+            (
+                true,
+                Some(30),
+                "within the last minute aterm opened the page, or the aterm window",
+            ),
+            (
+                true,
+                None,
+                "within the last minute aterm opened the page, or the aterm window",
+            ),
+            (
+                false,
+                Some(120),
+                "did nothing: aterm opened the pane 2 min ago",
+            ),
+            (
+                false,
+                None,
+                "the aterm window says aterm opened the page within the last 10",
+            ),
+        ] {
+            let mut recent = Scripted::new(reply("OK recent"));
+            recent.opened_ago = opened_ago;
+            let (did, opened, log) = recent.run(&absent, person);
+            assert!(!opened && did.contains(words), "{words:?} in {did}");
+            assert_eq!(log.len(), 1, "asked, nothing else: {log:?}");
+        }
+
+        // `granted` or `unknown` with a person here contradicts doctor's own read
+        // a moment ago (not granted): the window's verdict is older, so doctor
+        // opens the page itself, with the whole banner. With nobody here they are
+        // the window's word, and nothing opens.
+        for answer in ["OK granted", "OK unknown"] {
+            let (did, opened, log) = Scripted::new(reply(answer)).run(&absent, true);
+            assert!(opened, "{answer}: {did}");
+            assert!(said(&log).contains(dt::HELPER_HOW), "{answer}: {log:?}");
+            let (did, opened, log) = Scripted::new(reply(answer)).run(&absent, false);
+            assert!(
+                !opened && did.starts_with("did nothing: "),
+                "{answer}: {did}"
+            );
+            assert!(did.contains("last reading"), "{answer}: {did}");
+            assert_eq!(log, ["ask now=false"], "{answer}");
+        }
+
+        // Everything else is the window's decision: nothing opens here.
+        let mut declined = Scripted::new(reply("OK declined"));
+        declined.declined_at = Some(1_790_812_800); // 2026-10-01
+        for (script, words) in [
+            (
+                declined,
+                "did nothing: you said Not now on 2026-10-01; aterm Settings \u{25b8} Security \
+                 \u{25b8} Open Developer Tools\u{2026} opens the page",
+            ),
+            (Scripted::new(reply("OK unstable")), "ad hoc or dev build"),
+            (Scripted::new(reply("OK listed")), "nothing to add"),
+            (
+                Scripted::new(reply("ERR headless: no page")),
+                "the aterm instance doctor reached is headless",
+            ),
+            (
+                Scripted::new(reply("ERR main thread stalled 4s; retry")),
+                "stalled",
+            ),
+        ] {
+            let (did, opened, log) = script.run(&absent, true);
+            assert!(!opened, "{did}");
+            assert!(did.starts_with("did nothing: "), "{did}");
+            assert!(did.contains(words), "{words:?} in {did}");
+            assert_eq!(log, ["ask now=true"], "{did}");
+        }
+    }
+
+    /// A line the front door's CONNECT PHASE returned in place of the window's
+    /// answer (`ERR auth`, `ERR control server busy`) means the request never
+    /// went out: no window answered, so doctor takes the no-window path. A line
+    /// the window wrote — `OK …` or an `ERR` of its own — is its answer; an
+    /// error before the request was written is no window; only an error after it
+    /// is the window's silence (`aterm_ctl::front_door_delivered`).
+    #[test]
+    fn a_refused_connect_is_no_window_and_a_reply_is_the_windows() {
+        use super::{WindowAnswer, window_answer};
+        for refused in [
+            "ERR auth",
+            "ERR auth; the server refused the token in /tmp/aterm/token; re-run",
+            "ERR control server busy; retry",
+        ] {
+            assert_eq!(
+                window_answer(Ok(refused.to_string())),
+                WindowAnswer::Unreachable,
+                "{refused}"
+            );
+        }
+        for answered in [
+            "OK queued",
+            "OK recent",
+            "ERR headless: a headless instance brings no System Settings page up",
+            "ERR usage: devtools hand-over [now]",
+            "ERR main thread stalled 4s; retry",
+        ] {
+            assert_eq!(
+                window_answer(Ok(answered.to_string())),
+                WindowAnswer::Reply(answered.to_string()),
+                "{answered}"
+            );
+        }
+        assert_eq!(
+            window_answer(Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "took no connection within 10 s; the request was not sent",
+            ))),
+            WindowAnswer::Unreachable
+        );
+    }
+
+    /// The day a decline is dated: the local calendar day, or the UTC one said
+    /// to be UTC when the zone could not be read.
+    #[test]
+    fn a_decline_is_dated_by_the_local_day() {
+        let at = 1_790_812_800; // 2026-10-01T00:00:00Z
+        assert_eq!(super::local_day_words(at, Some(0)), "2026-10-01");
+        assert_eq!(super::local_day_words(at, Some(-7 * 3_600)), "2026-09-30");
+        assert_eq!(
+            super::local_day_words(at + 3_600, Some(2 * 3_600)),
+            "2026-10-01"
+        );
+        assert_eq!(super::local_day_words(at, None), "2026-10-01 (UTC)");
+    }
+
+    /// The banner's words follow what doctor read and did: on an empty list
+    /// `spctl` runs first and the banner says whose Terminal row that is; for an
+    /// aterm listed switched off it asks for the switch, never a drag; and with
+    /// the list unreadable (tccd's answer decided) nothing is waited for.
+    #[test]
+    fn the_doctor_banner_follows_the_list_it_read() {
+        use super::WindowAnswer;
+        use aterm_containment::consent::{DevToolProbe, DevToolProbeLabel, DevToolState};
+        use aterm_containment::{DevToolList, DevToolListLabel, DevToolListing};
+        use atpkg::devtools as dt;
+        let said = |log: &[String]| -> String {
+            log.iter()
+                .filter_map(|entry| entry.strip_prefix("say "))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let empty = devtools_facts_with(read_list(DevToolListing::Absent, 0));
+        let (_, opened, log) = Scripted::new(WindowAnswer::Unreachable).run(&empty, true);
+        assert!(opened);
+        let spctl = log.iter().position(|e| e == "spctl").expect("spctl ran");
+        let banner = log
+            .iter()
+            .position(|e| e.starts_with("say aterm doctor: Add"))
+            .expect("the banner");
+        assert!(spctl < banner, "{log:?}");
+        assert!(said(&log).contains(dt::only_aterm(true)), "{log:?}");
+        // The window's panel is up (shown before `spctl` ran, so it cannot say
+        // whose Terminal row that is): the short banner says it. NEGATIVE CONTROL:
+        // with no `spctl`, the short banner speaks of no Terminal.
+        let (_, opened, log) =
+            Scripted::new(WindowAnswer::Reply("OK shown".to_string())).run(&empty, true);
+        assert!(opened);
+        assert!(said(&log).contains(dt::only_aterm(true)), "{log:?}");
+        let absent = devtools_facts_with(read_list(DevToolListing::Absent, 2));
+        let (_, _, log) =
+            Scripted::new(WindowAnswer::Reply("OK shown".to_string())).run(&absent, true);
+        assert!(!said(&log).contains("Terminal"), "{log:?}");
+
+        let off = devtools_facts_with(read_list(DevToolListing::Off, 2));
+        let (_, _, log) = Scripted::new(WindowAnswer::Unreachable).run(&off, true);
+        let banner = said(&log);
+        assert!(banner.contains(dt::HELPER_SWITCH_ON), "{banner}");
+        assert!(!banner.contains("Drag"), "aterm is listed: {banner}");
+        assert!(!log.contains(&"spctl".to_string()), "{log:?}");
+
+        let mut unread =
+            devtools_facts_with(DevToolList::refused(DevToolListLabel::NoFullDiskAccess));
+        unread.log = DevToolProbe {
+            state: DevToolState::Unlisted,
+            label: DevToolProbeLabel::Observed,
+            requests: Some(3),
+            not_allowed: Some(3),
+            answered_at_ms: Some(1),
+        };
+        assert_eq!(unread.grant(), aterm_containment::DevToolGrant::NotGranted);
+        let (_, opened, log) = Scripted::new(WindowAnswer::Unreachable).run(&unread, true);
+        assert!(opened);
+        assert!(said(&log).contains(dt::HELPER_HOW), "{log:?}");
+        assert!(
+            !log.contains(&"wait".to_string()),
+            "an unread list is not waited on: {log:?}"
+        );
     }
 
     /// §4.6 of the debugger-access design: the `debugger:` row shares
@@ -5111,15 +5909,6 @@ mod tests {
     }
 
     #[test]
-    fn list_themes_includes_default_and_named() {
-        let r = list_themes_report();
-        for name in ["Default", "Dracula", "Nord", "Solarized Dark"] {
-            assert!(r.contains(name), "list-themes missing {name:?}\n{r}");
-        }
-        assert!(r.contains("Set one in aterm.toml: theme = "), "{r}");
-    }
-
-    #[test]
     fn tool_dispatch_never_shadows_aterm_surface() {
         // Absence, empty, and flags are never tool candidates (aterm owns those).
         assert!(!is_tool_candidate(None));
@@ -5156,7 +5945,7 @@ mod tests {
             );
         }
         // Bare, tool-shaped operands are candidates. Whether they are actually installed is
-        // decided later by the co-located atpkg — this predicate only screens aterm's surface.
+        // decided later by the package dispatcher; this predicate only screens aterm's surface.
         for tool in ["ay", "ty", "trust", "trust-mc", "clean", "ny"] {
             assert!(
                 is_tool_candidate(Some(tool)),

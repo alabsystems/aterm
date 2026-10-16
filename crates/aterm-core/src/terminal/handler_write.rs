@@ -54,8 +54,7 @@ fn char_width(c: char, cjk: bool) -> usize {
         // BMP Misc Symbols + Dingbats (✨ U+2728, ⚡ U+26A1, zodiac, etc.).
         bmp_emoji_width(cp, cjk)
     } else if (0x20000..0x2FA20).contains(&cp) || (0x30000..0x323B0).contains(&cp) {
-        // CJK Extension B through Compat Ideographs Supp (U+20000-U+2FA1F): all width 2.
-        // CJK Extensions G (U+30000-U+3134F) and H (U+31350-U+323AF): all width 2.
+        // CJK Extensions B-H and the Compatibility Ideographs Supplement.
         2
     } else if cjk {
         aterm_grapheme::char_width_cjk(c)
@@ -85,8 +84,8 @@ fn smp_emoji_width(cp: u32) -> usize {
     if SMP_EMOJI_WIDTH2[idx / 8] & (1 << (idx % 8)) != 0 {
         2
     } else {
-        // Rare text-presentation symbols: fall through for correctness.
-        // SAFETY: cp is guaranteed to be a valid Unicode codepoint (U+1F300-U+1F6FF).
+        // A text-presentation symbol: the table decides.
+        // SAFETY: cp is in U+1F300-U+1F6FF, all valid scalar values.
         aterm_grapheme::char_width(unsafe { char::from_u32_unchecked(cp) }).max(1)
     }
 }
@@ -112,7 +111,7 @@ fn bmp_emoji_width(cp: u32, cjk: bool) -> usize {
     if BMP_EMOJI_WIDTH2[idx / 8] & (1 << (idx % 8)) != 0 {
         2
     } else {
-        // SAFETY: cp is guaranteed to be a valid Unicode codepoint (U+2600-U+27BF).
+        // SAFETY: cp is in U+2600-U+27BF, all valid scalar values.
         let c = unsafe { char::from_u32_unchecked(cp) };
         if cjk {
             aterm_grapheme::char_width_cjk(c).max(1)
@@ -123,14 +122,8 @@ fn bmp_emoji_width(cp: u32, cjk: bool) -> usize {
 }
 
 impl TerminalHandler<'_> {
-    /// Write a character to the grid with the current style.
-    ///
-    /// This one print path is both the altscreen model's `WriteMain` and
-    /// `Scribble` action, depending on the active buffer. The conformance test
-    /// writes on each buffer and checks the main cells survive the round trip
-    /// (`MainRestoredAfterRoundTrip`).
-    // Projection: a `write_char` onto the model's `mainCell`/`altCell` and
-    // `cursor`, via `aterm_core::terminal::project_altscreen`.
+    /// Write a character to the grid with the current style: the altscreen
+    /// model's `WriteMain` or `Scribble`, depending on the active buffer.
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
         aterm_spec::refines(
@@ -159,70 +152,51 @@ impl TerminalHandler<'_> {
     /// `write_char` without the output-damage bracket; split so every early
     /// return below stays inside the bracket.
     fn write_char_body(&mut self, c: char) {
-        // Translate character through the active character set
         let translated = self.charset.translate(c);
 
         let width = char_width(translated, self.modes.ambiguous_width_double);
 
         if width == 0 {
-            // Track whether this combining character is a ZWJ for fast-path skipping.
             self.transient.last_combining_was_zwj = translated == '\u{200D}';
             self.add_combining_to_previous_cell(translated);
-            // VS16 (U+FE0F): emoji presentation selector widens eligible base
-            // characters from 1 cell to 2 cells, matching kitty/WezTerm/foot.
+            // VS16 (U+FE0F) widens an eligible base to 2 cells, as kitty, WezTerm
+            // and foot do.
             if translated == '\u{FE0F}' {
                 self.widen_previous_cell_for_vs16();
             }
-            // VS15 (U+FE0E): text presentation selector narrows emoji from
-            // 2 cells to 1 cell, the inverse of VS16.
+            // VS15 (U+FE0E) narrows a wide emoji to 1 cell.
             if translated == '\u{FE0E}' {
                 self.narrow_previous_cell_for_vs15();
             }
             return;
         }
 
-        // For REP (CSI b), track only width > 0 graphic characters (combining
-        // marks and ZWJ are not "preceding graphic characters", ECMA-48
-        // §8.3.103). Track the raw received char: xterm re-translates it through
-        // the current GL charset at REP time.
-        //
-        // Ruling 2026-10-10 (r15 C3): REP repeats the last graphic character
-        // received, even one the grid folds into the cell before it (a skin-tone
-        // modifier, a flag's second regional indicator, a glyph after a ZWJ):
-        // ECMA-48 names "the preceding character in the data stream", and xterm
-        // repeats `lastchar`, the last printable it was handed. The repeat then
-        // lays out as that character would (a modifier joins its toned emoji,
-        // UAX #29 GB9: no break before Extend). `write_unicode_bulk` records it
-        // the same way, so what REP repeats does not depend on whether the
-        // emoji arrived in one read, across two, or under an extras pen.
+        // REP (CSI b) repeats the last graphic character received (ECMA-48
+        // §8.3.103; xterm's `lastchar`): width > 0 only, untranslated (xterm
+        // re-translates it through the current GL charset at REP time), and
+        // even when the grid folds it into the cell before it (a skin-tone
+        // modifier, a flag's second RI, a glyph after a ZWJ). The repeat then
+        // lays out as that character would. `write_unicode_bulk` records it the
+        // same way, so REP does not depend on how the input was chunked.
         self.transient.last_graphic_char = Some(c);
 
-        // Emoji skin tone modifiers (U+1F3FB-U+1F3FF) should combine with the
-        // preceding emoji base rather than rendering as separate 2-cell characters.
+        // A skin-tone modifier (U+1F3FB-U+1F3FF) joins the preceding emoji base.
         if is_emoji_skin_tone_modifier(translated)
             && self.try_combine_skin_tone_modifier(translated)
         {
             return;
         }
 
-        // A regional-indicator pair (U+1F1E6-U+1F1FF) forms one flag glyph:
-        // fold the second RI into the first RI's cell (a single 2-cell grapheme).
+        // The second RI of a pair folds into the first RI's cell (one flag).
         if is_regional_indicator(translated) && self.try_combine_regional_indicator(translated) {
             return;
         }
 
-        // ZWJ sequence continuation: combine with previous cell for emoji sequences.
-        // Fast-path: skip the expensive grid lookup unless the last combining char was ZWJ.
-        //
-        // Never printable ASCII (ruling 2026-10-10, r15 C5): UAX #29 GB11 joins a
-        // ZWJ only to Extended_Pictographic, and no ASCII character is one, so
-        // `a`ZWJ`x` is two clusters; `aterm_grapheme::GridColumns` (find, copy and
-        // selection's column measurer) opens a cell for it, and so does the
-        // ASCII run writer. Without this, the run writer and this per-character
-        // path (IRM, DECAWM off, a national charset that leaves the byte ASCII,
-        // the rest of a VT52 address run) laid the same bytes out a column
-        // apart. A translated glyph (DEC graphics `x` is `│`) is not ASCII and
-        // folds as any other non-ASCII glyph after a ZWJ does.
+        // ZWJ continuation, looked up only when the last combining char was a
+        // ZWJ. Never for printable ASCII: UAX #29 GB11 joins a ZWJ only to
+        // Extended_Pictographic, so `a`ZWJ`x` is two clusters, as
+        // `aterm_grapheme::GridColumns` and the ASCII run writer lay it out. A
+        // translated glyph (DEC graphics `x` is `│`) is not ASCII and folds.
         if self.transient.last_combining_was_zwj
             && !translated.is_ascii()
             && self.should_combine_with_previous_zwj()
@@ -261,33 +235,25 @@ impl TerminalHandler<'_> {
             }
             return;
         }
-        // Clear single_shift once for the entire batch.
         self.charset.clear_single_shift();
 
-        // Cache ambiguous-width mode for the entire bulk run.
         let cjk = self.modes.ambiguous_width_double;
 
-        // DECSLRM (a partial left/right margin span) turns the wide-run batchers
-        // off: they derive the row's margin-clamped column limit once per row,
-        // while the per-char writers re-derive it per glyph, and a run that starts
-        // left of the margin and crosses into it would write past `margins.right`
-        // in batched form. Using the batchers only without margins keeps chunked
-        // processing equivalent. Read from the grid's maintained
-        // `has_horizontal_margins` flag.
+        // A partial left/right margin span (DECSLRM) turns the wide-run batchers
+        // off: they derive the margin-clamped column limit once per row, the
+        // per-char writers per glyph, and a batched run crossing into the margin
+        // would write past `margins.right`.
         let margins_active = self.grid.has_horizontal_margins();
 
-        // Pre-compute style state once for the entire run.
         let colors = self.style.cached_colors();
         let flags = if self.style.protected {
             self.style.flags.union(CellFlags::PROTECTED)
         } else {
             self.style.flags
         };
-        // Pre-compute complex flags for non-BMP emoji (hoisted from inner loop).
         let complex_flags = flags.union(CellFlags::COMPLEX);
 
-        // Track last graphic char across the bulk run for REP (CSI b).
-        // Only updated for width > 0 characters.
+        // REP's last graphic char across the run (width > 0 only).
         let mut last_graphic: Option<char> = None;
 
         let mut i = 0;
@@ -295,18 +261,12 @@ impl TerminalHandler<'_> {
             let c = chars[i];
             let cp = c as u32;
 
-            // Inline width classification: CJK Unified Ideographs and Hangul
-            // Syllables are width 2; U+3000-U+4DFF is mixed and uses the table;
+            // CJK Unified, Hangul and the width-2 cells of U+3000-U+4DFF lead a
+            // wide run, the same three families the run extends across;
             // U+00A0-U+02FF is width 1; everything else takes the per-char path.
-            // The wide-run batcher leads on the same three width-2 families it
-            // extends across (CJK Unified, width-2 U+3000-U+4DFF, Hangul), so the
-            // lead gate matches the run-extension predicate. With DECSLRM armed the
-            // per-glyph writer is used instead (see `margins_active`).
             if (0x3000..0xA000).contains(&cp) || (0xAC00..0xD7A4).contains(&cp) {
-                // U+3000-U+4DFF is mixed-width: classify individually via
-                // `char_width` (honoring `cjk`) and fold only width-2 cells into the
-                // batched run. Spelled as a closed range so it stays correct if the
-                // lead gate grows below U+3000.
+                // U+3000-U+4DFF is mixed-width: classify each char (honoring
+                // `cjk`) and batch only width-2 cells.
                 if (0x3000..0x4E00).contains(&cp) {
                     match char_width(c, cjk) {
                         0 => {
@@ -359,7 +319,6 @@ impl TerminalHandler<'_> {
                 self.transient.last_combining_was_zwj = false;
                 continue;
             } else if cp > 0xFFFF {
-                // Non-BMP (emoji, math symbols, etc.)
                 let width = char_width(c, cjk);
                 if width == 0 {
                     self.transient.last_combining_was_zwj = c == '\u{200D}';
@@ -368,9 +327,8 @@ impl TerminalHandler<'_> {
                     continue;
                 }
                 if width == 2 {
-                    // A folded glyph is still the last graphic character REP
-                    // repeats, as `write_char` records it before folding.
-                    // ZWJ continuation: combine with previous cell for emoji sequences.
+                    // A folded glyph is still REP's last graphic character, as in
+                    // `write_char`.
                     if self.transient.last_combining_was_zwj
                         && self.should_combine_with_previous_zwj()
                     {
@@ -380,14 +338,12 @@ impl TerminalHandler<'_> {
                         i += 1;
                         continue;
                     }
-                    // Skin tone modifiers combine with previous emoji base.
                     if is_emoji_skin_tone_modifier(c) && self.try_combine_skin_tone_modifier(c) {
                         self.transient.last_combining_was_zwj = false;
                         last_graphic = Some(c);
                         i += 1;
                         continue;
                     }
-                    // Regional-indicator pairs form one flag glyph (see write_char).
                     if is_regional_indicator(c) && self.try_combine_regional_indicator(c) {
                         self.transient.last_combining_was_zwj = false;
                         last_graphic = Some(c);
@@ -448,10 +404,9 @@ impl TerminalHandler<'_> {
                 // Rare: width-1 non-BMP (some math symbols)
                 self.write_char_core(c, width);
             } else if !cjk && (0xA0..0x300).contains(&cp) {
-                // U+00A0-U+02FF: width 1 outside CJK mode (checked above).
+                // U+00A0-U+02FF: width 1 outside CJK mode.
                 self.grid.write_narrow_autowrap_fast(c, colors, flags);
             } else {
-                // BMP non-CJK: compute width and use standard path
                 let width = char_width(c, cjk);
                 if width == 0 {
                     self.transient.last_combining_was_zwj = c == '\u{200D}';
@@ -477,8 +432,6 @@ impl TerminalHandler<'_> {
                     }
                     continue;
                 }
-                // Width-1 BMP chars (Greek, Cyrillic, etc.)
-                // or width-2 BMP chars outside CJK main blocks
                 if width == 2 {
                     self.grid.write_wide_autowrap_fast(c, colors, flags);
                 } else {
@@ -490,7 +443,6 @@ impl TerminalHandler<'_> {
             i += 1;
         }
 
-        // Update last_graphic_char for REP (CSI b): only width > 0 chars.
         if let Some(c) = last_graphic {
             self.transient.last_graphic_char = Some(c);
         }
@@ -500,24 +452,20 @@ impl TerminalHandler<'_> {
     /// (hyperlinks, non-BMP overflow, underline colors, RGB) are applied before
     /// the cursor advances, since an autowrap scroll would move the written row.
     fn write_char_core(&mut self, c: char, width: usize) {
-        // Colors/flags come straight from CurrentStyle, kept in sync by
-        // `apply_style_change()` and its siblings on SGR changes.
         let mut flags = if self.style.protected {
             self.style.flags.union(CellFlags::PROTECTED)
         } else {
             self.style.flags
         };
 
-        // Non-BMP characters (emoji, math symbols, etc.) need overflow storage.
-        // Pre-set the COMPLEX flag so readers know to look up the actual codepoint.
+        // COMPLEX tells readers a non-BMP codepoint is in the ring.
         let is_non_bmp = (c as u32) > 0xFFFF;
         if is_non_bmp {
             flags = flags.union(CellFlags::COMPLEX);
         }
 
-        // Whether this character needs the CellExtras map. Non-BMP chars use the
-        // dense ring buffer and do not need HAS_EXTRAS. The cached booleans are
-        // updated at mutation time (SGR, OSC 8), not per character.
+        // Non-BMP chars use the ring, not the CellExtras map; the cached booleans
+        // update on SGR and OSC 8, not per character.
         let needs_style_extras =
             self.transient.has_transient_extras || self.style.has_style_extras();
 
@@ -533,10 +481,8 @@ impl TerminalHandler<'_> {
         // pre-wrap, write, damage and advance in one Grid call.
         if width == 2 && self.modes.auto_wrap && !self.modes.insert_mode && !needs_style_extras {
             if is_non_bmp {
-                // Non-BMP emoji: combined write + ring-buffer codepoint store (no Arc)
                 self.grid.write_emoji_autowrap_fast(c, colors, flags);
             } else {
-                // BMP CJK: combined write (no ring buffer needed)
                 self.grid.write_wide_autowrap_fast(c, colors, flags);
             }
             return;
@@ -579,7 +525,6 @@ impl TerminalHandler<'_> {
             (ok, ecols)
         } else {
             if self.modes.insert_mode {
-                // IRM insert must respect horizontal margins like ICH.
                 self.grid
                     .insert_chars_margin(row_u16(width), self.modes.left_right_margin_mode);
             }
@@ -591,13 +536,11 @@ impl TerminalHandler<'_> {
             return;
         }
 
-        // Apply extras. The cursor is still on the written character,
-        // so cursor_row/col are the write coordinates.
+        // The cursor is still on the written character.
         let row = self.grid.cursor_row();
         let col = self.grid.cursor_col();
 
-        // Non-BMP: store the codepoint in the ring buffer (the COMPLEX flag was
-        // set in phase 1).
+        // Non-BMP: store the codepoint in the ring (COMPLEX was set above).
         if is_non_bmp {
             self.grid.set_complex_char_ring(row, col, c);
         }
@@ -607,8 +550,7 @@ impl TerminalHandler<'_> {
             self.apply_cell_extras_preflagged(row, col, width);
         }
 
-        // Advance cursor (may trigger autowrap + scroll).
-        // Wide chars reuse the pre-computed ecols to avoid a third ring-buffer lookup.
+        // Wide chars reuse the pre-computed ecols (no third ring-buffer lookup).
         if width == 2 {
             if self.modes.auto_wrap {
                 self.grid.advance_cursor_wide_wrap_ecols(ecols);
@@ -656,7 +598,6 @@ impl TerminalHandler<'_> {
             return;
         }
 
-        // Apply to primary cell and optional wide continuation
         let cols = if width == 2 && col + 1 < self.grid.cols() {
             2
         } else {
@@ -693,19 +634,13 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// The cell a zero-width mark attaches to: always some cell.
-    ///
-    /// Normally [`Self::preceding_cell`]. With no preceding cell (column 0 of a
-    /// row that is not a soft-wrapped continuation) it is the cell under the
-    /// cursor, as in xterm (`use_col = char_was_written ? last_written_col :
-    /// cur_col`, and cursor motion clears `char_was_written`). So after
-    /// `printf 'abc\r'` a U+0301 accents the 'a' instead of being discarded;
-    /// Unicode (§3 D57) allows presenting a base-less combining mark as if it
-    /// were a base character.
-    ///
-    /// Only the attach point for marks changes. Folding a visible, advancing
-    /// character into an existing cell (ZWJ continuation, skin-tone modifier,
-    /// regional-indicator pair, VS16/VS15) still asks [`Self::preceding_cell`].
+    /// The cell a zero-width mark attaches to: [`Self::preceding_cell`], or with
+    /// none (column 0 of a row that is not a soft-wrap continuation) the cell
+    /// under the cursor, as in xterm (`use_col = char_was_written ?
+    /// last_written_col : cur_col`). So after `printf 'abc\r'` a U+0301 accents
+    /// the `a`; Unicode §3 D57 allows presenting a base-less mark as a base.
+    /// Folding a visible character (ZWJ continuation, skin tone, RI pair,
+    /// VS16/VS15) still asks [`Self::preceding_cell`].
     fn combining_target_cell(&self) -> (u16, u16) {
         self.preceding_cell()
             .unwrap_or((self.grid.cursor_row(), self.grid.cursor_col()))
@@ -766,10 +701,9 @@ impl TerminalHandler<'_> {
     fn add_combining_to_previous_cell(&mut self, combining: char) {
         let (row, col) = self.combining_target_cell();
         self.grid.cell_extra_mut(row, col).add_combining(combining);
-        // A mark attached to a cell writes it (`Row::len`'s one rule, ruling
-        // 2026-10-10, r15 C4): a mark on a printed blank, or on the cell under
-        // the cursor with nothing before it, is part of the line, so the render
-        // frame, copy and search reach it.
+        // A mark writes the cell it attaches to (`Row::len`'s rule): a mark on a
+        // printed blank, or on the cell under the cursor with nothing before it,
+        // is part of the line, so the render frame, copy and search reach it.
         if let Some(r) = self.grid.row_mut(row) {
             r.update_len(col.saturating_add(1));
         }
@@ -831,17 +765,13 @@ impl TerminalHandler<'_> {
             return;
         }
 
-        // Snapshot the base cell's raw data so we can reconstruct it with WIDE.
         let char_data = cell.char_data();
         let colors = cell.colors();
         let base_flags = cell.flags();
 
-        // Determine where the continuation cell goes. The cursor is already
-        // past the base cell (at col+1) unless pending_wrap is set.
         let cont_col = col + 1;
 
-        // Check that the continuation column is within bounds.
-        // Use effective_cols_for_row to handle DECDWL lines.
+        // `effective_cols_for_row` accounts for DECDWL lines.
         if cont_col >= self.grid.effective_cols_for_row(row) {
             return;
         }
@@ -901,15 +831,13 @@ impl TerminalHandler<'_> {
         // same way.
         self.mirror_vs16_spacer_extras(row, col, cont_col);
 
-        // Mark all affected cells as damaged.
         if let Some(oc) = orphan_col {
             self.grid.damage_mut().mark_cell(row, oc);
         }
         self.grid.damage_mut().mark_cell(row, col);
         self.grid.damage_mut().mark_cell(row, cont_col);
 
-        // Advance cursor: the continuation cell consumed the column the cursor
-        // was sitting on, so we need to move forward by 1. Handle wrap state.
+        // The spacer took the column the cursor was on: advance past it.
         if self.grid.pending_wrap() {
             // The base was written at the last column (pending_wrap set); the
             // continuation would be past end-of-line, so keep pending_wrap.
@@ -927,11 +855,9 @@ impl TerminalHandler<'_> {
     /// in the spacer's `PackedColors`, copied from the base.
     fn mirror_vs16_spacer_extras(&mut self, row: u16, lead: u16, spacer: u16) {
         // Ring-aware: the RGB hot path stores into a dense ring, the rest into
-        // the map, and these accessors read both in that order. Only the
-        // channels the lead's colours mark truecolor: the ring keeps a cell's
-        // bytes after a later SGR made it indexed, and which writer left them
-        // there depends on the read boundaries, so carrying them gave the spacer
-        // an entry (and its HAS_EXTRAS claim) by chunking.
+        // the map, and these accessors read both. Only the channels the lead's
+        // colours mark truecolor: the ring keeps a cell's bytes after a later SGR
+        // made it indexed, and which writer left them depends on read boundaries.
         let lead_cell = self.grid.cell(row, lead).copied();
         let fg = lead_cell
             .is_some_and(|c| c.fg_needs_overflow())
@@ -970,7 +896,6 @@ impl TerminalHandler<'_> {
             return;
         };
 
-        // Only narrow if the previous cell is currently wide.
         let Some(cell) = self.grid.cell(row, col) else {
             return;
         };
@@ -978,18 +903,15 @@ impl TerminalHandler<'_> {
             return;
         }
 
-        // Snapshot the base cell's raw data so we can reconstruct without WIDE.
         let char_data = cell.char_data();
         let colors = cell.colors();
         let base_flags = cell.flags();
 
-        // The continuation cell is always at col + 1.
         let cont_col = col + 1;
         if cont_col >= self.grid.effective_cols_for_row(row) {
             return;
         }
 
-        // Rebuild the base cell without the WIDE flag.
         let narrow_base = crate::grid::Cell::from_raw_parts(
             char_data,
             colors,
@@ -1004,11 +926,10 @@ impl TerminalHandler<'_> {
         self.grid
             .drop_unclaimed_extras(row, cont_col..cont_col.saturating_add(1));
 
-        // Mark affected cells as damaged.
         self.grid.damage_mut().mark_cell(row, col);
         self.grid.damage_mut().mark_cell(row, cont_col);
 
-        // Cursor position does not change — VS15 is a zero-width selector.
+        // The cursor stays: VS15 is a zero-width selector.
     }
 
     /// Combine an emoji skin tone modifier (U+1F3FB-U+1F3FF) into the previous
@@ -1018,7 +939,6 @@ impl TerminalHandler<'_> {
             return false;
         };
 
-        // Check if the previous cell contains an emoji base.
         let Some(cell) = self.grid.cell(row, col) else {
             return false;
         };
@@ -1028,7 +948,6 @@ impl TerminalHandler<'_> {
             return false;
         }
 
-        // Resolve the base character to verify it's an emoji modifier base.
         let base_char = if cell.is_complex() {
             self.grid.resolved_char(row, col).unwrap_or('\u{FFFD}')
         } else {
@@ -1039,13 +958,12 @@ impl TerminalHandler<'_> {
             return false;
         }
 
-        // The cell must be wide by emoji presentation (the default-width
-        // table, or a VS16 that widened it), not by `ambiguous_width = "wide"`
-        // alone: ⛹ (U+26F9) is East Asian Ambiguous, so wide mode gives it two
-        // cells while it stays text presentation, and `⛹🏽` is 2 + 2 cells as
-        // wcwidth counts it, like narrow mode's 1 + 2. The stored-text replay
-        // (`aterm-grid`'s `advance_grapheme_unit_scan`) decides the fold by
-        // this same rule, so the row keeps its layout through history,
+        // Wide by emoji presentation (the default-width table, or a VS16 that
+        // widened it), not by `ambiguous_width = "wide"` alone: ⛹ (U+26F9) is
+        // East Asian Ambiguous, so wide mode gives it two cells while it stays
+        // text presentation, and `⛹🏽` is 2 + 2 cells as wcwidth counts it. The
+        // stored-text replay (`aterm-grid`'s `advance_grapheme_unit_scan`)
+        // decides the fold by this same rule, so the layout survives history,
         // reflow and a checkpoint carry.
         if aterm_grapheme::char_width(base_char) < 2
             && !self.grid.cell_extra(row, col).is_some_and(|e| {
@@ -1059,7 +977,6 @@ impl TerminalHandler<'_> {
             return false;
         }
 
-        // Combine the skin tone modifier as a combining character on the base.
         self.add_combining_to_previous_cell(modifier);
         true
     }
@@ -1082,13 +999,11 @@ impl TerminalHandler<'_> {
         if !is_regional_indicator(base) {
             return false;
         }
-        // Already a complete pair (the grapheme holds two RIs)? Then this RI
-        // begins a new pair in its own cell rather than extending the old one.
-        // A live write keeps the second RI among the combining marks, but a
-        // cell rebuilt from a `Line` (a checkpoint restore) holds the pair
-        // whole in its complex string (`aterm_grid`'s `scroll_fill`), with no
-        // marks, so both are counted: a park can fall right after a flag. The
-        // base, known to be an RI, counts once when it is inline.
+        // Already a complete pair? Then this RI begins a new pair in its own
+        // cell. A live write keeps the second RI among the marks, but a cell
+        // rebuilt from a `Line` (a checkpoint restore) holds the pair whole in
+        // its complex string (`aterm_grid`'s `scroll_fill`), so both are counted.
+        // The base, known to be an RI, counts once when it is inline.
         let already_paired = self.grid.cell_extra(row, col).is_some_and(|e| {
             let in_base = e.complex_char().map_or(1, |s| {
                 s.chars().filter(|&c| is_regional_indicator(c)).count()
@@ -1320,11 +1235,8 @@ mod tests {
     }
 
     /// Exhaustive parity guard for the CJK fast path over U+3000..U+A000:
-    /// `char_width` must agree with the `aterm_grapheme` table for every
-    /// codepoint in both ambiguous-width modes, since reflow/materialize/fill
-    /// recompute width from the table. Covers the Yijing hexagrams, U+303F, the
-    /// ambiguous run U+3248-U+324F, the tone marks U+302E/U+302F and the narrow
-    /// gaps.
+    /// `char_width` agrees with the `aterm_grapheme` table in both ambiguous-width
+    /// modes, since reflow/materialize/fill recompute width from the table.
     #[test]
     fn fast_path_width_matches_table_cjk_block() {
         for cp in 0x3000u32..0xA000 {
@@ -1362,18 +1274,12 @@ mod tests {
         }
     }
 
-    /// Exhaustive parity guard for the Hangul blocks: the hardcoded
-    /// `(0xAC00..0xD7A4) => 2` arm against the table.
-    ///
-    /// Catches the arm's width drifting from 2, and its upper bound widening
-    /// past U+D7A3 (U+D7A4..U+D7AF is narrow, and Hangul Jamo Extended-B's
-    /// vowels U+D7B0..U+D7C6 and finals U+D7CB..U+D7FB are zero-width).
-    /// Hangul Jamo (U+1100..U+11FF) is swept too: U+1100..115F are wide and
-    /// U+1160..11FF zero-width, both via the generic tail.
-    ///
-    /// Cannot catch narrowing the arm (the generic tail uses the same table),
-    /// hence the absolute-width pins below. The `write_unicode_bulk` copies of
-    /// the literal decide batching, not width, and are not covered.
+    /// Exhaustive parity guard for the hardcoded `(0xAC00..0xD7A4) => 2` Hangul
+    /// arm against the table: catches its width drifting from 2 and its bound
+    /// widening past U+D7A3 (U+D7A4..U+D7AF is narrow; Jamo Extended-B's vowels
+    /// U+D7B0..U+D7C6 and finals U+D7CB..U+D7FB are zero-width). Hangul Jamo
+    /// (U+1100..U+11FF) is swept too. Parity cannot catch the arm narrowing (the
+    /// generic tail uses the same table), hence the absolute pins below.
     #[test]
     fn fast_path_width_matches_table_hangul_blocks() {
         // (block, half-open range) — Jamo, Jamo Extended-A, the Syllables plus
@@ -1418,11 +1324,10 @@ mod tests {
         }
     }
 
-    /// Pin specific fast-path divergences so they cannot silently return even
-    /// if the table changes.
+    /// Absolute widths at the fast path's edge cases, independent of the table.
     #[test]
     fn known_cjk_width_regressions() {
-        // U+4DC0-U+4DFF Yijing Hexagram Symbols: East Asian Wide = 2 (was 1).
+        // U+4DC0-U+4DFF Yijing Hexagram Symbols: East Asian Wide = 2.
         assert_eq!(char_width('\u{4DC0}', false), 2);
         assert_eq!(char_width('\u{4DC0}', true), 2);
         assert_eq!(char_width('\u{4DFF}', false), 2);
@@ -1437,7 +1342,7 @@ mod tests {
         assert_eq!(char_width('\u{324F}', false), 1);
         assert_eq!(char_width('\u{324F}', true), 2);
 
-        // U+302E/U+302F Hangul tone marks: East Asian Wide = 2 (were wrongly 0).
+        // U+302E/U+302F Hangul tone marks: East Asian Wide = 2.
         assert_eq!(char_width('\u{302E}', false), 2);
         assert_eq!(char_width('\u{302F}', false), 2);
 
@@ -1455,8 +1360,8 @@ mod tests {
 
     /// Exhaustive parity guard for the Miscellaneous Symbols and Dingbats arm
     /// (U+2600..U+27BF, the `BMP_EMOJI_WIDTH2` bitmap) in both ambiguous-width
-    /// modes. The block holds 80 East Asian Ambiguous symbols (★ ☆ ♠ ♥ ♪ ☎
-    /// ❶ …) that a bitmap miss once measured narrow in wide mode too.
+    /// modes; its 80 East Asian Ambiguous symbols (★ ☆ ♠ ♥ ♪ ☎ ❶ …) must
+    /// measure wide in wide mode on a bitmap miss.
     #[test]
     fn fast_path_width_matches_table_misc_symbols_and_dingbats() {
         for cp in 0x2600u32..0x27C0 {
@@ -1500,13 +1405,11 @@ mod tests {
         assert_eq!(term.cursor().col, 2);
     }
 
-    /// A skin tone folds only onto a base wide by emoji presentation, never
-    /// onto one `ambiguous_width = "wide"` widened: ⛹ (U+26F9, East Asian
-    /// Ambiguous, an emoji modifier base) + 🏽 is 2 + 2 cells in wide mode, as
-    /// 1 + 2 in narrow mode, and the row keeps that layout through a
-    /// checkpoint carry, whose stored-text replay decides the fold from the
-    /// default-width table and VS16. A VS16 base, and 👍 (wide in the table),
-    /// fold in both modes.
+    /// A skin tone folds only onto a base wide by emoji presentation, never onto
+    /// one `ambiguous_width = "wide"` widened: ⛹🏽 (U+26F9 is East Asian
+    /// Ambiguous and an emoji modifier base) is 2 + 2 cells in wide mode, as 1 + 2
+    /// in narrow, and keeps that layout through a checkpoint carry and history. A
+    /// VS16 base and 👍 (wide in the table) fold in both modes.
     #[test]
     fn skin_tone_folds_onto_an_emoji_presentation_base_in_both_width_modes() {
         use crate::config::TerminalConfig;
@@ -1556,7 +1459,7 @@ mod tests {
                 });
                 assert_eq!(back, Some(bar), "history {text:?} wide={wide}");
             }
-            // A carry that lands BETWEEN a VS16-widened non-BMP base and its
+            // A carry that lands between a VS16-widened non-BMP base and its
             // skin tone: the restored base is a complex cell holding the VS16,
             // and the tone still folds (🖐️🏽 is 2 cells either side of the carry).
             let mut live = Terminal::new(1, 20);

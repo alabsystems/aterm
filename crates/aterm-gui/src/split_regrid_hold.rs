@@ -5,7 +5,7 @@
 //! pre-split grid until the shrink has stood [`SPLIT_REGRID_QUIET`].
 //!
 //! The incident (2026-09-29, two independent skeptics): an agent runs
-//! `@<claude> spawn split=h`, which answers only after `install_split_pane`
+//! `@<claude> spawn split=h`, which answers only after `install_split_session`
 //! re-gridded the Claude pane N -> ~N/2 (engine and PTY), then `@<new> close`
 //! straight away — a probe that opens a scratch pane and tears it down, or a
 //! split whose shell exits at once. `apply_close_outcome` grew the sibling back
@@ -27,7 +27,7 @@
 //!
 //! Who is held: only the panes that existed BEFORE the split. The newborn
 //! pane is spawned at the window's full grid, a size its program never drew
-//! (`install_split_pane`: "the initial size is transient"), so its resize away
+//! (`App::open_off_loop`: "its landing sizes every pane"), so its resize away
 //! from it is no shrink worth holding: closing the ORIGINAL pane at once grows
 //! the newborn to the full rect straight away.
 //!

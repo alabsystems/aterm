@@ -60,6 +60,10 @@
 //! of the client NuGet package. Every decision is pure and tested against a
 //! fake [`Host`]; [`RealHost`] reaches the machine — except that `sign` unlinks
 //! its temporary metadata file through `std::fs` directly.
+#![allow(
+    clippy::disallowed_types,
+    reason = "never linked into the shipped binary: Authenticode signing behind targo --unverified winsign"
+)]
 
 use std::collections::BTreeMap;
 use std::fmt;

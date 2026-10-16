@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Keyboard input encoding for terminal emulators.
+//! Keyboard input encoding: legacy VT100/xterm sequences and the Kitty keyboard protocol.
 //!
-//! Encodes key presses into terminal escape sequences, supporting both legacy
-//! VT100/xterm encoding and the Kitty keyboard protocol.
+//! The encoders are `trust::skip`: they build bytes with Vec push/extend and table lookups,
+//! std bodies the prover does not model; `encode_tests.rs` pins the bytes to the specs.
 
 #[path = "encode_legacy.rs"]
 mod encode_legacy;
@@ -13,44 +13,28 @@ mod encode_legacy;
 use super::{Key, KeyEventType, KeyboardMode, Modifiers, NamedKey};
 use encode_legacy::{ctrl_character, encode_character_legacy, encode_named_legacy};
 
-/// Encode a key press into terminal escape sequence bytes.
-///
-/// Automatically selects between legacy encoding and Kitty keyboard protocol
-/// based on the terminal mode flags.
+/// Encode a key press into terminal bytes, legacy or Kitty protocol as `mode` says.
 #[must_use]
-// Skip: the key encoders build byte sequences via Vec push/extend and
-// table lookups — absent std bodies (alloc + iterator class). The encoded
-// bytes are exhaustively unit-tested against the kitty/xterm specs.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn encode_key(key: &Key, modifiers: Modifiers, mode: KeyboardMode) -> Vec<u8> {
     encode_key_with_event(key, modifiers, mode, KeyEventType::Press)
 }
 
-/// Encode a key event with event type information.
-///
-/// Extends `encode_key` to support key repeat and release events
-/// when using the Kitty keyboard protocol.
+/// Encode a key event with its event type (repeat and release report under the Kitty
+/// protocol).
 ///
 /// Progressive Kitty enhancements:
-/// - `REPORT_ALL_KEYS_AS_ESC` forces CSI-u encoding for keys that would
-///   otherwise use legacy escapes.
-/// - `REPORT_ALTERNATE_KEYS` emits `unicode:alternate` in the first CSI
-///   parameter when a shifted alternate codepoint is known.
-/// - `REPORT_ASSOCIATED_TEXT` appends text-as-codepoints as the third CSI
-///   parameter when paired with `REPORT_ALL_KEYS_AS_ESC`.
+/// - `REPORT_ALL_KEYS_AS_ESC` sends text keys and Enter/Tab/Backspace as CSI u too
+///   (functional keys keep their legacy CSI forms).
+/// - `REPORT_ALTERNATE_KEYS` emits `unicode:alternate` in the first CSI parameter when a
+///   shifted alternate codepoint is known.
+/// - `REPORT_ASSOCIATED_TEXT` appends the text's codepoint as the third CSI parameter when
+///   paired with `REPORT_ALL_KEYS_AS_ESC`.
 ///
-/// A MODIFIER key's own bit follows kitty, which reports the state the event
-/// leaves: a press or repeat sets it whatever `modifiers` says, and on a
-/// release `modifiers` IS that state — the bit set only while the key's other
-/// side is still held ([`NamedKey::modifier_twin`]; both Shifts down, one let
-/// go, `shift` is still in force). The window states it from its
-/// physical-press record; a controller's `key … type=release` names it with
-/// `mods=`.
+/// A modifier key's own bit follows kitty, which reports the state the event leaves: a press
+/// or repeat sets it, and on a release `modifiers` is that state (set only while the key's
+/// other side is still held, [`NamedKey::modifier_twin`]).
 #[must_use]
-// Skip: the keyboard encoder family — byte-sequence building (Vec
-// push/extend) and key-table lookups over absent std bodies. The
-// encoded bytes are exhaustively unit-tested against the kitty/xterm
-// specs (encode_tests.rs).
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn encode_key_with_event(
     key: &Key,
@@ -61,20 +45,11 @@ pub fn encode_key_with_event(
     encode_key_with_layout(key, modifiers, mode, event_type, None)
 }
 
-/// Encode a key event with optional `base_layout_key` for Kitty protocol.
-///
-/// The `base_layout_key` is the character that the physical key would produce
-/// on a US QWERTY layout, regardless of the user's active keyboard layout.
-/// When `REPORT_ALTERNATE_KEYS` mode is active, this is emitted as the third
-/// colon-delimited value in the first CSI parameter: `key[:shifted[:base_layout]]`.
-///
-/// Pass `None` when the platform cannot determine the base layout key or when
-/// the base layout key is the same as the primary key.
+/// Encode a key event with an optional `base_layout_key`: the character the physical key types
+/// on US QWERTY, whatever the active layout. Under `REPORT_ALTERNATE_KEYS` it is the third
+/// colon-delimited value of the first CSI parameter (`key[:shifted[:base_layout]]`), sent only
+/// when it differs from the key. `None` when the platform cannot tell.
 #[must_use]
-// Skip: the keyboard encoder family — byte-sequence building (Vec
-// push/extend) and key-table lookups over absent std bodies. The
-// encoded bytes are exhaustively unit-tested against the kitty/xterm
-// specs (encode_tests.rs).
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn encode_key_with_layout(
     key: &Key,
@@ -86,32 +61,20 @@ pub fn encode_key_with_layout(
     encode_key_with_text(key, modifiers, mode, event_type, base_layout_key, None)
 }
 
-/// [`encode_key_with_layout`] plus `layout_text`: the character the user's
-/// ACTIVE layout typed for this press, when the host knows it.
+/// [`encode_key_with_layout`] plus `layout_text`: the character the user's active layout
+/// typed for this press, when the host knows it.
 ///
-/// `key` is the layout's UNSHIFTED key (winit's `key_without_modifiers`), and
-/// without a layout the engine can only re-derive what Shift and Caps Lock
-/// make of it from the US table ([`typed_character`]). That guess is wrong on
-/// every other layout — German Shift+2 types `"`, not `@`; AZERTY Shift+&
-/// types `1`; Russian Shift+ф types `Ф`; Caps Lock + a types `A` — and the
-/// host already holds the answer (the OS's composed text). So when it is
-/// given, a TEXT press writes it: the legacy and text-preserving kitty modes
-/// put it on the wire as UTF-8 in place of the derived glyph, kitty
-/// `REPORT_ALTERNATE_KEYS` reports it as the shifted key while Shift is held
-/// (the spec's "shifted version, in the currently active keyboard layout"),
-/// and `REPORT_ASSOCIATED_TEXT` carries it as the text. The kitty key CODE
-/// stays `key`'s, the layout's unshifted key, as kitty reports it.
+/// `key` is the layout's unshifted key (winit's `key_without_modifiers`). Without layout text
+/// the engine derives Shift and Caps Lock from the US table ([`typed_character`]), which is
+/// wrong elsewhere (German Shift+2 types `"`, Russian Shift+ф types `Ф`). Given, a TEXT press
+/// writes it: as UTF-8 in the legacy and text-preserving kitty modes, as the shifted key under
+/// `REPORT_ALTERNATE_KEYS` while Shift is held, and as `REPORT_ASSOCIATED_TEXT`'s text. The
+/// kitty key code stays `key`'s.
 ///
-/// It is honoured only for a `Key::Character` press with no Ctrl, Alt, Meta,
-/// Hyper or Super — a TEXT press. A chord keeps its own encoding from the
-/// base key (Ctrl+c is 0x03 and Alt+a is `ESC a` on every layout), and a
-/// control character is never text. `None` (a controller-built key, a host
-/// with no layout text) keeps the US derivation.
+/// Honoured only for a `Key::Character` press with no Ctrl, Alt, Meta, Hyper or Super: a chord
+/// keeps its base-key encoding (Ctrl+c is 0x03 on every layout), and a control character is
+/// never text.
 #[must_use]
-// Skip: the keyboard encoder family — byte-sequence building (Vec
-// push/extend) and key-table lookups over absent std bodies. The
-// encoded bytes are exhaustively unit-tested against the kitty/xterm
-// specs (encode_tests.rs).
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn encode_key_with_text(
     key: &Key,
@@ -122,44 +85,14 @@ pub fn encode_key_with_text(
     layout_text: Option<char>,
 ) -> Vec<u8> {
     let layout_text = text_press_glyph(key, modifiers, layout_text);
-    // Kitty folds keypad keys onto their non-keypad equivalents unless the
-    // app opted into telling them apart (disambiguate) or into the dedicated
-    // KP numbers report-all-keys uses — the spec's legacy rule: "All keypad
-    // keys are reported as their equivalent non-keypad keys. To distinguish
-    // these, use the disambiguate flag." `Key::main_block_twin` is that fold,
-    // digits and operators included: a physical KP_5 reaches this encoder as
-    // `Numpad5` now, and under a kitty mode without disambiguate it must be
-    // the `5` kitty sends (a text press, a text repeat), not a dedicated
-    // `CSI 57404 u`. The fold applies ONLY inside kitty semantics: with no
-    // kitty flag active the legacy encoder owns keypad keys (DECKPAM SS3
-    // forms), which the fold must not disturb.
+    // Kitty folds keypad keys onto their main-block twins ([`Key::main_block_twin`]) unless
+    // the app asked to tell them apart: disambiguate, report-all, or DECKPAM (the legacy
+    // spelling of that request). With no kitty flag the legacy encoder owns keypad keys.
     //
-    // …AND NOT UNDER DECKPAM, whichever flags are set. The fold answers "the
-    // app has not asked to tell the keypad from the main block" — but setting
-    // application keypad mode IS that request, spelled in the legacy encoding
-    // the fold is folding INTO. Folding there threw the mode away and sent the
-    // main row's `5` for a KP_5 an SS3-reading application had explicitly
-    // asked to hear as `ESC O u`; the legacy encoder, not the fold, owns a
-    // keypad key while DECKPAM is set. (SHIFT still cancels application keypad
-    // mode inside that encoder, so a Shift+KP_5 is the same `5` either way.)
-    //
-    // …AND THE FOLD REACHES THE KITTY ENCODER ONLY. A KEYPAD KEY DOES NOT
-    // COMPOSE. The twin is the kitty NAME for the key — the code and the text
-    // the CSI-u report carries — not a re-spelling of the press for the legacy
-    // encoder. Handed to `encode_legacy`, the folded `Key::Character('5')` runs
-    // the MAIN ROW's shift/ctrl tables (`shifted_character`, `ctrl_character`)
-    // and Shift+KP_5 came out `%`, Ctrl+KP_5 came out 0x1D — glyphs no keypad
-    // has ever typed, and only because an unrelated kitty REPORTING flag was
-    // on. On the keypad SHIFT selects the other level (xkb's KEYPAD type is
-    // `map[Shift] = Level2`, so a NumLock-OFF Shift+KP_5 IS KP_5 and arrives
-    // here as `Numpad5` + SHIFT), and xterm's rule is that SHIFT only cancels
-    // application keypad mode — it never composes a keypad glyph. So the
-    // legacy fallback keeps the ORIGINAL keypad key and `encode_numpad` owns
-    // its bytes, which is the same rule `associated_text_codepoints` states
-    // for the twin's glyph one screen down. `modifiers` is passed through
-    // UNTOUCHED on both paths: the kitty modifier field still carries the
-    // SHIFT bit (`CSI 53;6u` for Ctrl+Shift+KP_5), and the legacy keypad
-    // encoder wants SHIFT to cancel DECKPAM.
+    // The fold reaches only the kitty encoder: the twin is the key's kitty name, and the
+    // legacy encoder's main-row tables would make Shift+KP_5 `%`. A keypad key does not
+    // compose (Shift picks a level and cancels DECKPAM), so the legacy fallback keeps the
+    // original key, and `modifiers` passes through untouched on both paths.
     let folded = if mode.intersects(KeyboardMode::KITTY_PROTOCOL_FLAGS)
         && !mode.contains(KeyboardMode::DISAMBIGUATE_ESC_CODES)
         && !mode.contains(KeyboardMode::REPORT_ALL_KEYS_AS_ESC)
@@ -171,25 +104,12 @@ pub fn encode_key_with_text(
     };
     let kitty_key = folded.as_ref().unwrap_or(key);
 
-    // ConPTY win32-input-mode (DEC 9001): a key conhost cannot read from legacy
-    // VT goes out as the INPUT_RECORD pair conhost asked for — the Enter chords
-    // and the ESC keys [`win32_key_record`] names — and it goes out FIRST, ahead
-    // of the kitty gate and of xterm modifyOtherKeys, because under ConPTY
-    // conhost is the only reader there is. Measured (scratch
-    // CreatePseudoConsole, conhost 10.0.26200): an application's `CSI > 1 u`
-    // push and its `CSI > 4;2 m` reach this terminal verbatim through the
-    // pipe, so the kitty flags and the xterm level really do get set here — but
-    // conhost's input parser then DROPS the `CSI 13;2 u` and the
-    // `CSI 27;2;13 ~` the terminal writes back (no INPUT_RECORD at all reached
-    // a `ReadKey` loop; a byte fed after them arrived fine), while the win32
-    // pair arrives as `Enter+Shift`; likewise for Escape's own
-    // `CSI 27 u` and Ctrl+['s `CSI 27;5;91 ~`, both dropped the same way.
-    // Letting the application's push outrank the record would therefore kill
-    // the key for exactly the applications that asked for it (Claude Code
-    // pushes disambiguate). Unix is untouched: 9001 is never set there. The
-    // RELEASE of a routed key encodes to nothing whatever the kitty flags say
-    // — the pair already carries its key-up, and a kitty release report would
-    // be dropped by conhost anyway.
+    // ConPTY win32-input-mode (DEC 9001): a key conhost cannot read from legacy VT goes out
+    // as its INPUT_RECORD pair ([`win32_key_record`]), ahead of the kitty gate and xterm
+    // modifyOtherKeys, because conhost is the only reader: an application's kitty push and
+    // modifyOtherKeys reach this terminal, but conhost drops the `CSI 13;2 u`, `CSI 27;2;13 ~`
+    // and `CSI 27 u` written back. A routed key's release encodes to nothing: the pair carries
+    // its key-up. 9001 is never set on Unix.
     if mode.contains(KeyboardMode::WIN32_INPUT)
         && let Some(record) = win32_key_record(key, modifiers, mode, base_layout_key)
     {
@@ -211,25 +131,18 @@ pub fn encode_key_with_text(
         );
     }
 
-    // For release events without Kitty protocol, return nothing
     if event_type == KeyEventType::Release {
         return Vec::new();
     }
 
-    // Ctrl on a NON-LATIN layout: the layout's letter (Russian 'с') has no
-    // control byte, so Ctrl+С fell through to the plain glyph and wrote 'с'
-    // where every macOS terminal writes ETX — Ctrl+C could not interrupt on
-    // a Cyrillic, Greek or Hebrew layout. The physical key's US letter
-    // (`base_layout_key`, 'c') names the control byte. Kitty is untouched
-    // above: it reports the layout's key (`CSI 1089;5u`) with the US key in
-    // its base-layout field, and the application resolves it there.
+    // Ctrl on a non-Latin layout: the layout's letter (Russian 'с') has no control byte, so
+    // the physical key's US letter (`base_layout_key`, 'c') names it, as macOS terminals do.
+    // Kitty, above, reports the layout's key with the US key in its base-layout field.
     let ctrl_twin = ctrl_layout_twin(key, modifiers, base_layout_key);
     let key = ctrl_twin.as_ref().unwrap_or(key);
 
-    // The kitty protocol supersedes xterm modifyOtherKeys: an app that pushed
-    // kitty flags (agent TUIs can push CSI > ... u AND set modifyOtherKeys=2)
-    // negotiated kitty semantics, so a key the kitty gate deliberately left
-    // as text (Shift+a -> 'A') must not be re-escaped in the xterm dialect.
+    // The kitty protocol supersedes xterm modifyOtherKeys (an app may set both): a key the
+    // kitty gate left as text (Shift+a -> 'A') is not re-escaped in the xterm dialect.
     if !mode.intersects(KeyboardMode::KITTY_PROTOCOL_FLAGS)
         && let Some(bytes) = encode_xterm_other_keys(key, modifiers, mode, layout_text)
     {
@@ -259,13 +172,10 @@ fn text_press_glyph(key: &Key, modifiers: Modifiers, layout_text: Option<char>) 
     layout_text.filter(|glyph| !glyph.is_control())
 }
 
-/// The US letter a Ctrl chord on a non-Latin layout stands for: `Some('c')`
-/// for Ctrl + Russian 'с' (physical C), so the chord sends the C0 byte
-/// Terminal.app and iTerm2 send for it. Only a LETTER the control table does
-/// not know, on a physical key whose US twin is a letter: a Latin layout's
-/// own letters keep their bytes, and a letter on a US digit or symbol key
-/// (AZERTY 'é' on the 2 key, German 'ö' on the ; key) stays as it is rather
-/// than turning into an unrelated control byte.
+/// The US letter a Ctrl chord on a non-Latin layout stands for: `Some('c')` for Ctrl + Russian
+/// 'с' (physical C), the C0 byte Terminal.app and iTerm2 send. Only for a letter the control
+/// table does not know, on a key whose US twin is a letter: a Latin layout keeps its bytes,
+/// and a letter on a US digit or symbol key (AZERTY 'é' on 2) stays as it is.
 #[cfg_attr(trust_verify, trust::skip)]
 fn ctrl_layout_twin(key: &Key, modifiers: Modifiers, base_layout_key: Option<char>) -> Option<Key> {
     let Key::Character(c) = key else {
@@ -283,20 +193,10 @@ fn ctrl_layout_twin(key: &Key, modifiers: Modifiers, base_layout_key: Option<cha
         .map(Key::Character)
 }
 
-/// Modifier and lock keys, mirroring kitty's `is_modifier_key`: the spec
-/// reports events for these ONLY under REPORT_ALL_KEYS_AS_ESC ("Additionally,
-/// with this mode, events for pressing modifier keys are reported"). kitty
-/// also gates ISO_LEVEL3/5_SHIFT here; add them if NamedKey ever grows those.
-///
-/// SELECTION CUSTODY (R1) shares this ONE list. A key in it expresses no
-/// typing intent — holding Command to reach ⌘-C, or Shift to extend a click,
-/// is not "the user asked to be taken to the prompt" — so the GUI's press path
-/// runs no viewport snap and no selection clear for it. Keeping the Kitty
-/// report gate and the inert-press gate on the same predicate means "keys only
-/// Kitty reports" and "keys that do not disturb reading" cannot drift apart.
-/// The encoding is UNAFFECTED: a modifier still reports under
-/// REPORT_ALL_KEYS_AS_ESC exactly as before.
-// Skip: slice `contains`/iterator absent std bodies.
+/// Modifier and lock keys, mirroring kitty's `is_modifier_key` (kitty also gates
+/// ISO_LEVEL3/5_SHIFT, which `NamedKey` lacks). Kitty reports these only under
+/// REPORT_ALL_KEYS_AS_ESC, and the GUI's press path runs no viewport snap or selection clear
+/// for them (holding Command or Shift is not typing): one list keeps the two gates together.
 #[cfg_attr(trust_verify, trust::skip)]
 #[must_use]
 pub fn is_modifier_or_lock_key(key: &Key) -> bool {
@@ -322,10 +222,6 @@ pub fn is_modifier_or_lock_key(key: &Key) -> bool {
     )
 }
 
-// Skip: the keyboard encoder family — byte-sequence building (Vec
-// push/extend) and key-table lookups over absent std bodies. The
-// encoded bytes are exhaustively unit-tested against the kitty/xterm
-// specs (encode_tests.rs).
 #[cfg_attr(trust_verify, trust::skip)]
 fn should_encode_kitty_event(
     key: &Key,
@@ -333,38 +229,27 @@ fn should_encode_kitty_event(
     mode: KeyboardMode,
     event_type: KeyEventType,
 ) -> bool {
-    // Kitty spec: RELEASE events are reported ONLY when the app negotiated
-    // REPORT_EVENT_TYPES — no other enhancement flag opts into them. Encoding
-    // one anyway is worse than a fidelity leak: `encode_kitty` gates the `:3`
-    // event-type subfield on REPORT_EVENT_TYPES, so the release bytes come out
-    // IDENTICAL to a press (release of 'a' → `ESC[97u`), and an app that
-    // pushed only DISAMBIGUATE (`CSI > 1 u`) sees every key
-    // twice. Standing down here falls through to the legacy release path,
-    // which encodes nothing.
+    // Releases report only under REPORT_EVENT_TYPES. Without it `encode_kitty` drops the `:3`
+    // subfield, so a release would encode identical to a press and a DISAMBIGUATE-only app
+    // would see every key twice; the legacy release path encodes nothing.
     if event_type == KeyEventType::Release && !mode.contains(KeyboardMode::REPORT_EVENT_TYPES) {
         return false;
     }
 
-    // Modifier and lock keys are reported ONLY under REPORT_ALL_KEYS_AS_ESC
-    // (spec: "Additionally, with this mode, events for pressing modifier keys
-    // are reported"). Under 0b1/0b10/0b11 kitty emits nothing for a bare
-    // Shift/Ctrl/CapsLock press OR release; legacy encodes them to nothing
-    // already, so standing down here is exact parity.
+    // Modifier and lock keys report only under REPORT_ALL_KEYS_AS_ESC; legacy encodes them to
+    // nothing, so standing down is exact parity.
     if is_modifier_or_lock_key(key) {
         return mode.contains(KeyboardMode::REPORT_ALL_KEYS_AS_ESC);
     }
 
-    // REPORT_ALL_KEYS_AS_ESC forces every key through the CSI-u encoder.
+    // REPORT_ALL_KEYS_AS_ESC sends every key through `encode_kitty`.
     if mode.contains(KeyboardMode::REPORT_ALL_KEYS_AS_ESC) {
         return true;
     }
 
-    // Without REPORT_ALL_KEYS_AS_ESC, an event that produces text stays plain
-    // UTF-8 and therefore has NO representable release event. This includes a
-    // bare/Shift-only Character or Space. Enter/Tab/Backspace are an explicit
-    // reset escape hatch and have no release events in ANY modifier form until
-    // report-all is set. Other non-text events (Esc, arrows, function keys,
-    // Ctrl/Alt chords) still carry the requested `:3`.
+    // Without REPORT_ALL_KEYS_AS_ESC, a text-producing event (a bare or Shift-only Character
+    // or Space) stays UTF-8 and has no release. Enter/Tab/Backspace, the reset escape hatch,
+    // have no release in any modifier form. Other non-text events carry the `:3`.
     if event_type == KeyEventType::Release {
         if is_reset_escape_hatch_key(key) {
             return false;
@@ -372,11 +257,8 @@ fn should_encode_kitty_event(
         return key_event_needs_csi_u(key, modifiers);
     }
 
-    // Press/Repeat under DISAMBIGUATE (with or without event types): only
-    // genuinely ambiguous chords escape; text-producing events stay text.
-    // kitty delivers presses AND repeats of plain/shifted text keys as plain
-    // UTF-8 in these modes — the event-type subfield only ever decorates
-    // events that already needed an escape form.
+    // Press/Repeat under DISAMBIGUATE: only ambiguous chords escape; kitty sends presses and
+    // repeats of plain and shifted text keys as plain UTF-8.
     if mode.contains(KeyboardMode::DISAMBIGUATE_ESC_CODES) {
         return key_event_needs_csi_u(key, modifiers);
     }
@@ -411,17 +293,11 @@ fn is_reset_escape_hatch_key(key: &Key) -> bool {
     )
 }
 
-/// Whether a key PRESS/REPEAT needs the CSI-u escape form under kitty modes
-/// that keep text as text (disambiguate, and event-types-only repeats).
-///
-/// Kitty's disambiguation list is exactly "the Esc, alt+key, ctrl+key,
-/// ctrl+alt+key, shift+alt+key keys" — a bare or SHIFT-only chord on a
-/// text-producing key composes text ('A' for Shift+a, '@' for Shift+2,
-/// ' ' for Shift+Space) and is NOT ambiguous. The legacy text keys
-/// (Enter/Tab/Backspace) keep their bytes only UNMODIFIED: Shift+Enter →
-/// `ESC[13;2u` is precisely how kitty-protocol apps detect that chord.
-// Skip: the `Key` inspection walks table slices / iterators (absent std
-// bodies). Exhaustively unit-tested against the kitty/xterm specs.
+/// Whether a key press/repeat needs the CSI-u form under kitty modes that keep text as text
+/// (disambiguate, and event-types-only repeats). Kitty disambiguates "Esc, alt+key, ctrl+key,
+/// ctrl+alt+key, shift+alt+key"; a bare or Shift-only text key composes text and is not
+/// ambiguous. Enter/Tab/Backspace keep their bytes only unmodified: Shift+Enter is
+/// `ESC[13;2u`.
 #[cfg_attr(trust_verify, trust::skip)]
 fn key_event_needs_csi_u(key: &Key, modifiers: Modifiers) -> bool {
     let effective_mods = modifiers & CHORD_MODIFIERS;
@@ -438,19 +314,10 @@ fn key_event_needs_csi_u(key: &Key, modifiers: Modifiers) -> bool {
     }
 }
 
-/// Encode using the Kitty keyboard protocol.
-///
-/// Per the Kitty spec, functional keys with legacy CSI forms in the
-/// functional-key table (arrows, Home/End, Insert/Delete, Page Up/Down,
-/// F1-F12, KP_BEGIN) retain that format in EVERY kitty mode — including
-/// `REPORT_ALL_KEYS_AS_ESC`. Keys without legacy representations (Escape,
-/// Enter, Tab, Backspace, Space, modifier keys, media keys, dedicated numpad
-/// keys, F13+) use the CSI u format:
-/// `CSI unicode [; modifiers [: event-type]] u`.
-// Skip: the keyboard encoder family — byte-sequence building (Vec
-// push/extend) and key-table lookups over absent std bodies. The
-// encoded bytes are exhaustively unit-tested against the kitty/xterm
-// specs (encode_tests.rs).
+/// Encode using the Kitty keyboard protocol. Functional keys with a legacy CSI form (arrows,
+/// Home/End, Insert/Delete, Page Up/Down, F1-F12, KP_BEGIN) keep it in every mode, report-all
+/// included (kitty's encode_function_key, #7474: an arrow release is `ESC[1;1:3A`); the rest
+/// use `CSI unicode [; modifiers [: event-type]] u`.
 #[cfg_attr(trust_verify, trust::skip)]
 fn encode_kitty(
     key: &Key,
@@ -462,11 +329,6 @@ fn encode_kitty(
 ) -> Vec<u8> {
     let kitty_modifiers = kitty_modifiers_for_event(key, modifiers, event_type);
 
-    // Functional keys with legacy CSI representations retain their legacy
-    // format UNCONDITIONALLY — kitty's encode_function_key rewrite table is
-    // not gated on REPORT_ALL_KEYS_AS_ESC (#7474): even full-mode kitty sends
-    // `ESC[A` for an arrow press and `ESC[1;1:3A` for its release. The PUA
-    // numbers (57344+) are wire codes only for keys with no legacy form.
     if let Some(legacy) = encode_kitty_legacy_functional(key, kitty_modifiers, mode, event_type) {
         return legacy;
     }
@@ -515,20 +377,12 @@ fn encode_kitty(
     buf
 }
 
-/// For named keys with legacy CSI representations, encode using the legacy
-/// format with Kitty modifier encoding (1+mods). Returns `None` for keys
-/// that have no legacy representation and should use CSI u.
+/// For a named key with a legacy CSI form, that form with kitty's modifier value (1+mods);
+/// `None` for keys that use CSI u.
 ///
-/// Legacy formats preserved under Kitty protocol:
-/// - Arrows: CSI [1;{mod}] A/B/C/D
-/// - Home/End: CSI [1;{mod}] H/F
-/// - Insert/Delete/PageUp/PageDown: CSI {num} [;{mod}] ~
-/// - F1-F4: CSI [1;{mod}] P/Q/R/S (or SS3 P/Q/R/S without mods)
-/// - F5-F24: CSI {num} [;{mod}] ~
-// Skip: the keyboard encoder family — byte-sequence building (Vec
-// push/extend) and key-table lookups over absent std bodies. The
-// encoded bytes are exhaustively unit-tested against the kitty/xterm
-// specs (encode_tests.rs).
+/// - Arrows, Home/End, KP_BEGIN: CSI [1;{mod}] A/B/C/D, H/F, E
+/// - F1, F2, F4: CSI [1;{mod}] P/Q/S
+/// - Insert/Delete/PageUp/PageDown, F3, F5-F12: CSI {num} [;{mod}] ~
 #[cfg_attr(trust_verify, trust::skip)]
 fn encode_kitty_legacy_functional(
     key: &Key,
@@ -543,11 +397,6 @@ fn encode_kitty_legacy_functional(
 
     let report_events = mode.contains(KeyboardMode::REPORT_EVENT_TYPES);
     let mod_value = modifiers.kitty_encoded();
-    // `Some(event)` exactly when the former `include_event_type` bool was
-    // true (REPORT_EVENT_TYPES negotiated and the event is not a plain
-    // press); the hoisted helpers below recover `has_modifiers_or_event` as
-    // `mod_value > 1 || event.is_some()`, the same expression it was
-    // computed from here.
     let event = if report_events && event_type != KeyEventType::Press {
         Some(event_type)
     } else {
@@ -555,31 +404,25 @@ fn encode_kitty_legacy_functional(
     };
 
     Some(match named {
-        // Arrows
         NamedKey::ArrowUp => letter_final(b'A', mod_value, event),
         NamedKey::ArrowDown => letter_final(b'B', mod_value, event),
         NamedKey::ArrowRight => letter_final(b'C', mod_value, event),
         NamedKey::ArrowLeft => letter_final(b'D', mod_value, event),
-        // Home/End, and KP_BEGIN's dedicated letter form ("KP_BEGIN | 1 E").
         NamedKey::Home => letter_final(b'H', mod_value, event),
         NamedKey::End => letter_final(b'F', mod_value, event),
         NamedKey::NumpadBegin => letter_final(b'E', mod_value, event),
-        // Insert/Delete/PageUp/PageDown
         NamedKey::Insert => tilde_final(2, mod_value, event),
         NamedKey::Delete => tilde_final(3, mod_value, event),
         NamedKey::PageUp => tilde_final(5, mod_value, event),
         NamedKey::PageDown => tilde_final(6, mod_value, event),
-        // F1/F2/F4 (letter finals). F3 is tilde-only: the spec REMOVED its
-        // original `CSI R` letter form because it collides with the Cursor
-        // Position Report ("F3 | 13 ~", spec note) — kitty emits 13;m~.
+        // F3 is tilde-only: the spec dropped `CSI R`, which collides with the Cursor Position
+        // Report.
         NamedKey::F1 => letter_final(b'P', mod_value, event),
         NamedKey::F2 => letter_final(b'Q', mod_value, event),
         NamedKey::F3 => tilde_final(13, mod_value, event),
         NamedKey::F4 => letter_final(b'S', mod_value, event),
-        // F5-F12 (tilde finals). F13-F24 have NO legacy alternative in the
-        // spec's functional table (unlike F1 "1 P or 11 ~") — kitty sends
-        // their dedicated CSI-u numbers (57376+) in every mode, so they must
-        // fall through to the CSI-u path, not borrow xterm's 25~..38~ forms.
+        // F13-F24 have no legacy form in kitty's table: they take their CSI-u numbers
+        // (57376+) in every mode, not xterm's 25~..38~.
         NamedKey::F5 => tilde_final(15, mod_value, event),
         NamedKey::F6 => tilde_final(17, mod_value, event),
         NamedKey::F7 => tilde_final(18, mod_value, event),
@@ -592,19 +435,7 @@ fn encode_kitty_legacy_functional(
     })
 }
 
-// The three helpers below were capturing closures inside
-// `encode_kitty_legacy_functional` (`append_mod_event`, `letter_final`,
-// `tilde_final`). Hoisted to named fns with the captures passed explicitly:
-// the Trust gate verifies fn items directly, whereas a capturing closure
-// lowers to an opaque environment it cannot model. `event` is `Some`
-// exactly when the old `include_event_type` bool was true, and
-// `mod_value > 1 || event.is_some()` is the old `has_modifiers_or_event`,
-// so every byte written is unchanged.
-
 /// Build the modifier suffix ";{mod}[:event]" portion.
-// Skip: the key encoders build byte sequences via Vec push/extend and
-// table lookups — absent std bodies (alloc + iterator class). The encoded
-// bytes are exhaustively unit-tested against the kitty/xterm specs.
 #[cfg_attr(trust_verify, trust::skip)]
 fn append_mod_event(buf: &mut Vec<u8>, mod_value: u8, event: Option<KeyEventType>) {
     if mod_value > 1 || event.is_some() {
@@ -619,9 +450,6 @@ fn append_mod_event(buf: &mut Vec<u8>, mod_value: u8, event: Option<KeyEventType
 
 /// Letter-final keys: CSI [1;{mod}[:event]] {letter}
 /// Without modifiers/event: CSI {letter}
-// Skip: the key encoders build byte sequences via Vec push/extend and
-// table lookups — absent std bodies (alloc + iterator class). The encoded
-// bytes are exhaustively unit-tested against the kitty/xterm specs.
 #[cfg_attr(trust_verify, trust::skip)]
 fn letter_final(letter: u8, mod_value: u8, event: Option<KeyEventType>) -> Vec<u8> {
     let mut buf = Vec::with_capacity(12);
@@ -635,8 +463,6 @@ fn letter_final(letter: u8, mod_value: u8, event: Option<KeyEventType>) -> Vec<u
 }
 
 /// Tilde-final keys: CSI {num} [;{mod}[:event]] ~
-// Skip: the key-table lookup drives absent std iterator/slice bodies; an
-// unknown key returns None (fail-closed).
 #[cfg_attr(trust_verify, trust::skip)]
 fn tilde_final(num: u8, mod_value: u8, event: Option<KeyEventType>) -> Vec<u8> {
     let mut buf = Vec::with_capacity(12);
@@ -647,7 +473,6 @@ fn tilde_final(num: u8, mod_value: u8, event: Option<KeyEventType>) -> Vec<u8> {
     buf
 }
 
-// Skip: iterator/slice absent std bodies.
 #[cfg_attr(trust_verify, trust::skip)]
 fn kitty_modifiers_for_event(
     key: &Key,
@@ -661,15 +486,9 @@ fn kitty_modifiers_for_event(
         return modifiers;
     };
 
-    // Spec: the bit reflects the state INCLUDING the current event. A press or
-    // repeat sets it. A release leaves it as the caller states it, because only
-    // the caller can know the answer: kitty keeps the bit while the key's other
-    // side is still held (both Shifts down, one released) and clears it
-    // otherwise, and `modifiers` on a release is that post-event state — the
-    // window reads it from its physical-press record (`release_physical_press`),
-    // a controller names it. The SIDE is not lost either: the window maps a
-    // right-side press to the *Right key (`aterm_winit_keymap::sided_modifier`),
-    // whose code kitty reports.
+    // The bit reflects the state including this event (spec). A press or repeat sets it; on a
+    // release `modifiers` already is the post-event state, which only the caller knows (kitty
+    // keeps the bit while the key's other side is still held).
     let mut adjusted = modifiers;
     if event_type != KeyEventType::Release {
         adjusted.insert(modifier_flag);
@@ -677,10 +496,6 @@ fn kitty_modifiers_for_event(
     adjusted
 }
 
-// Skip: the keyboard encoder family — byte-sequence building (Vec
-// push/extend) and key-table lookups over absent std bodies. The
-// encoded bytes are exhaustively unit-tested against the kitty/xterm
-// specs (encode_tests.rs).
 #[cfg_attr(trust_verify, trust::skip)]
 fn kitty_key_codes(
     key: &Key,
@@ -714,10 +529,6 @@ fn kitty_key_codes(
     }
 }
 
-// Skip: the keyboard encoder family — byte-sequence building (Vec
-// push/extend) and key-table lookups over absent std bodies. The
-// encoded bytes are exhaustively unit-tested against the kitty/xterm
-// specs (encode_tests.rs).
 #[cfg_attr(trust_verify, trust::skip)]
 fn associated_text_codepoints(
     key: &Key,
@@ -740,12 +551,8 @@ fn associated_text_codepoints(
 
     match key {
         Key::Character(c) => {
-            // Kitty embeds the text the OS produced: the layout's when the
-            // host gave it, else the derivation, in which CapsLock composes
-            // uppercase letters exactly like Shift on macOS (caps OR shift →
-            // uppercase; caps+shift stays uppercase). The shift table alone
-            // missed caps: `caps+a` reported text 'a' while the modifier field
-            // correctly said caps.
+            // The text the OS produced: the layout's when given, else the derivation, in
+            // which Caps Lock uppercases a letter like Shift does.
             let text = layout_text.unwrap_or_else(|| typed_character(*c, modifiers));
             if text.is_control() {
                 None
@@ -753,44 +560,12 @@ fn associated_text_codepoints(
                 Some(text as u32)
             }
         }
-        // A KEYPAD GLYPH KEY REPORTS THE TEXT IT TYPES. `REPORT_ASSOCIATED_TEXT`
-        // answers "what did this press put on the screen", and for KP_5, KP_.
-        // and KP_+ that is `5`, `.` and `+` — the main-block twin's character.
-        // They used to arrive from the hosts as `Key::Character` and reported
-        // their glyph; since the winit seam resolves the physical keypad they
-        // arrive as `Key::Named(Numpad5)` and fell to this arm's `None`, so the
-        // keypad's text silently vanished from the report while its dedicated
-        // `CSI 57404 u` number stayed. Only the TEXT field consults the twin —
-        // the key code stays the keypad's own, which is the whole point of the
-        // mode that turned this on.
-        //
-        // The twin's glyph is reported AS IS, with no shift/caps table: those
-        // compose a MAIN-BLOCK character key (`'5'` under Shift is `'%'`), and
-        // no keypad key composes. SHIFT on the keypad picks a LEVEL, not a
-        // glyph: with NumLock ON a shifted keypad 5 is KP_Begin, a different
-        // key, which this arm then answers `None` for because `NumpadBegin`
-        // has no twin; with NumLock OFF the same press is KP_5 itself (xkb's
-        // KEYPAD type is `map[Shift] = Level2`, the level that holds the
-        // digit) and reports `5`. Either way the shift table never runs — the
-        // rule `encode_key_with_layout` keeps by handing the legacy encoder
-        // the keypad key rather than this twin. The keypad's named keys
-        // (`NumpadEnter`, `NumpadEnd`) fold to named twins and carry no text,
-        // exactly as `Enter` and `End` do.
-        //
-        // …AND A NAMED KEY THAT TYPES A CHARACTER ITSELF ANSWERS FIRST. The
-        // twin is the KEYPAD fold, and asking it alone silenced the SPACEBAR:
-        // `Space` is a main-block key, so it has no twin, and the one key
-        // whose glyph IS its own key code reported no text at all (`ESC[32u`
-        // where kitty sends `ESC[32;1;32u`). A client that inserts strictly
-        // from the associated-text field — the field's whole purpose, since
-        // that is how a non-US layout or an IME delivers the character
-        // actually typed — typed every letter, digit, symbol and keypad glyph
-        // but never a space. `named_key_text` is that "what does this key
-        // type" question, and the SAME control-code filter the `Character`
-        // arm applies decides the rest, exactly as the spec's single
-        // exclusion does ("code points below U+0020"): Enter's `\r`, Tab's
-        // `\t` and Backspace's `\x7f` are dropped BY THE RULE rather than by
-        // never being asked, and U+0020, which is not below U+0020, survives.
+        // A named key reports the text it types: its own character ([`named_key_text`];
+        // Space reports 32), else its keypad twin's glyph (KP_5 → `5`) while the key code
+        // stays the keypad's. The twin's glyph goes out as is, with no shift/caps table: Shift
+        // on the keypad picks a level, never a glyph (NumLock on, Shift+KP_5 is KP_Begin, which
+        // has no twin; NumLock off it is KP_5). The control-code filter drops Enter, Tab and
+        // Backspace.
         Key::Named(named) => {
             let text = named_key_text(*named).or(match key.main_block_twin() {
                 Some(Key::Character(glyph)) => Some(glyph),
@@ -804,23 +579,12 @@ fn associated_text_codepoints(
     }
 }
 
-/// The character a NAMED key types — the text its press puts on the screen,
-/// before any control-code filter. `None` for the keys that type nothing
-/// (arrows, nav, F-keys, modifiers) and for the dedicated keypad keys, whose
-/// glyph comes from [`Key::main_block_twin`] instead.
-///
-/// The list is the named keys with an ASCII code point rather than a kitty PUA
-/// functional number: Space (`' '`), and the legacy text keys Enter (`'\r'`),
-/// Tab (`'\t'`) and Backspace (`'\x7f'`). The three control codes are listed
-/// HONESTLY, not omitted — `associated_text_codepoints` drops them with the
-/// same `is_control` test it applies to a character key, which is the kitty
-/// spec's one exclusion ("the associated text must not contain control
-/// codes … code points below U+0020"). Spelling them as "types nothing" would
-/// hide the rule that must keep U+0020 in while keeping U+000D out.
-///
-/// Backspace's WIRE byte swaps with DECBKM (`0x7f`/`0x08`); both are control
-/// codes, so the filter answers the same for either and this table need not
-/// know the mode.
+/// The character a named key types, before any control-code filter: Space, Enter (`'\r'`),
+/// Tab (`'\t'`) and Backspace (`'\x7f'`). `None` for the keys that type nothing and for the
+/// keypad keys, whose glyph comes from [`Key::main_block_twin`]. The control codes are listed
+/// so `associated_text_codepoints` drops them by the spec's one exclusion (code points below
+/// U+0020), which keeps U+0020 in. Backspace's DECBKM byte (0x7f/0x08) does not matter here:
+/// both are control codes.
 #[must_use]
 fn named_key_text(named: NamedKey) -> Option<char> {
     Some(match named {
@@ -832,15 +596,12 @@ fn named_key_text(named: NamedKey) -> Option<char> {
     })
 }
 
-/// The Shift LEVEL a layout's typed glyph stands for, for kitty's shifted
-/// key: the glyph itself, except that a lowercase letter typed with Shift held
-/// is Caps Lock's doing — xkb's Lock cancels Shift on a letter, so Caps Lock +
-/// Shift + a types 'a' — and the level, which no lock touches, is its capital
-/// ('A', as kitty reports it). Its caller reads a glyph this way only when it
-/// IS the unshifted key: a layout may put another lowercase letter on its
-/// Shift level (Swiss German Shift+ö is é, French Linux Shift+* is µ), and
-/// that letter is the level as it is. A capital that is not one character
-/// ('ß') leaves the glyph as it is.
+/// The Shift level a layout's typed glyph stands for, for kitty's shifted key: the glyph,
+/// except that a lowercase letter typed with Shift held is Caps Lock's doing (xkb's Lock
+/// cancels Shift on a letter), so the level is its capital. The caller asks only when the
+/// glyph is the unshifted key itself: a layout's Shift level may hold another lowercase
+/// letter (Swiss German Shift+ö is é), which is the level as it is. A capital that is not one
+/// character ('ß') leaves the glyph as it is.
 #[cfg_attr(trust_verify, trust::skip)]
 fn shift_level(glyph: char) -> char {
     if !glyph.is_lowercase() {
@@ -853,13 +614,11 @@ fn shift_level(glyph: char) -> char {
     }
 }
 
-/// The character a TEXT press of base key `c` types when no layout says
-/// otherwise: Shift through the US table ([`shifted_character`]), and Caps
-/// Lock upper-casing a letter — caps OR shift gives the capital, as macOS
-/// composes it and as kitty's associated text reports it. The fallback for a
-/// key that carries no layout text (a controller's `key a mods=caps`); a
-/// window press hands the encoder the layout's own character instead
-/// ([`encode_key_with_text`]), and asks this function whether it differs.
+/// The character a TEXT press of base key `c` types when no layout says otherwise: Shift
+/// through the US table ([`shifted_character`]), and Caps Lock upper-casing a letter (caps OR
+/// shift gives the capital, as macOS composes it and kitty's associated text reports it).
+/// The fallback for a key with no layout text (a controller's `key a mods=caps`); the window
+/// asks it whether the layout's own character differs.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn typed_character(c: char, modifiers: Modifiers) -> char {
@@ -876,13 +635,9 @@ pub fn typed_character(c: char, modifiers: Modifiers) -> char {
 }
 
 /// The glyph SHIFT composes from base key `c` on the US layout (`'h'`→`'H'`, `'2'`→`'@'`,
-/// `'/'`→`'?'`), or `None` when SHIFT is not held / does not change `c`. The single source
-/// of truth the legacy encoder uses to pick the byte it sends — reused by predictive echo
-/// so a predicted glyph matches what the shell will echo.
-// Skip: the keyboard encoder family — byte-sequence building (Vec
-// push/extend) and key-table lookups over absent std bodies. The
-// encoded bytes are exhaustively unit-tested against the kitty/xterm
-// specs (encode_tests.rs).
+/// `'/'`→`'?'`; `c` itself when Shift does not change it), or `None` when SHIFT is not held.
+/// The legacy encoder picks its byte from this, and the GUI's predicted echo reaches it
+/// through [`typed_character`], so a predicted glyph matches the shell's echo.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn shifted_character(c: char, modifiers: Modifiers) -> Option<char> {
     if !modifiers.contains(Modifiers::SHIFT) {
@@ -916,56 +671,34 @@ pub fn shifted_character(c: char, modifiers: Modifiers) -> Option<char> {
     }
 }
 
-/// ConPTY win32-input-mode: `VK_RETURN` (13) and its PS/2 scan code (0x1C = 28)
-/// — the `wVirtualKeyCode` / `wVirtualScanCode` of BOTH Enter keys on a Windows
-/// keyboard. The keypad's Enter is the same pair behind the E0 prefix, which a
-/// real `INPUT_RECORD` reports as `ENHANCED_KEY` in `dwControlKeyState`.
+/// ConPTY win32-input-mode: `VK_RETURN` (13) and scan code 0x1C (28), shared by both Enter
+/// keys; the keypad's is flagged `ENHANCED_KEY` in `dwControlKeyState`.
 const WIN32_VK_RETURN: u32 = 13;
 const WIN32_SC_RETURN: u32 = 28;
-/// `VK_ESCAPE` / scan 0x01 and `VK_BACK` / scan 0x0E, with the `UnicodeChar`
-/// a Windows keyboard gives each: ESC (0x1B) and BS (0x08). BS, not the DEL
-/// aterm's legacy Backspace writes: it is the char conhost itself put in the
-/// Alt+Backspace record it decoded from `ESC DEL` (measured 2026-09-27,
-/// `Backspace MODS=Alt CHAR=0x8`), so the record keeps what applications saw.
+/// `VK_ESCAPE` / scan 0x01 and `VK_BACK` / scan 0x0E, with the `UnicodeChar` a Windows
+/// keyboard gives each: ESC (0x1B) and BS (0x08). BS, not the DEL aterm's legacy Backspace
+/// writes: conhost puts BS in the Alt+Backspace record it decodes from `ESC DEL`.
 const WIN32_VK_ESCAPE: u32 = 0x1b;
 const WIN32_SC_ESCAPE: u32 = 0x01;
 const WIN32_ESCAPE_CHAR: u32 = 0x1b;
 const WIN32_VK_BACK: u32 = 0x08;
 const WIN32_SC_BACK: u32 = 0x0e;
 const WIN32_BACK_CHAR: u32 = 0x08;
-/// `dwControlKeyState` bits (wincon.h): `SHIFT_PRESSED`, `LEFT_CTRL_PRESSED`,
-/// `LEFT_ALT_PRESSED`, `ENHANCED_KEY`. The host cannot tell a left modifier
-/// from a right one once winit has canonicalized the chord, so the LEFT bits
-/// are reported — what conhost itself synthesizes for a modifier it cannot
-/// side-attribute.
+/// `dwControlKeyState` bits (wincon.h). The LEFT modifier bits stand for either side: once
+/// winit has canonicalized the chord the host cannot tell them apart, and conhost reports the
+/// same for a modifier it cannot side-attribute.
 const WIN32_SHIFT_PRESSED: u32 = 0x10;
 const WIN32_LEFT_CTRL_PRESSED: u32 = 0x08;
 const WIN32_LEFT_ALT_PRESSED: u32 = 0x02;
 const WIN32_ENHANCED_KEY: u32 = 0x100;
-/// The `UnicodeChar` of an Enter-chord record: what a PHYSICAL chord carries
-/// under Windows Terminal, so every ReadConsoleInput reader (.NET `ReadKey`,
-/// libuv's `tty.c`, the MSYS runtime, cmd.exe's cooked reader) sees under aterm
-/// exactly the record it sees under WT, and every WT-tuned workaround an
-/// application ships keeps working. WT copies the field from the OS's own
-/// `ToUnicode` translation of the chord: Shift+Enter is CR, and Enter with
-/// CTRL held — with or without Shift — is LF (the same translation conhost
-/// applies in reverse when it reads a bare 0x0A as Ctrl+Enter). Measured
-/// 2026-09-22 (conhost 10.0.26200, records fed into a ConPTY tab):
-/// `[Console]::ReadKey` reports `Enter MODS=Shift CHAR=13` for the shift
-/// record and `Enter MODS=Control CHAR=10` / `MODS=Shift, Control CHAR=10` for
-/// the ctrl ones; PSReadLine, which binds by key and modifiers, runs AddLine on
-/// the shift record (`>>` continuation, both lines executed on the next
-/// Enter); cmd.exe's cooked reader runs the pending line on it, as it does
-/// under WT.
+/// The `UnicodeChar` of an Enter-chord record: what the physical chord carries under Windows
+/// Terminal (the OS's `ToUnicode` of it), so every ReadConsoleInput reader (.NET `ReadKey`,
+/// libuv, MSYS, cmd.exe) sees the record it sees under WT. Shift+Enter is CR; Enter with CTRL
+/// held, with or without Shift, is LF (conhost reads a bare 0x0A as Ctrl+Enter).
 ///
-/// Deliberately NOT aterm's Unix Shift+Enter policy (`encode_legacy.rs`, the
-/// `Enter` arm: LF, so a LF-honouring reader gets a newline unnegotiated).
-/// Carrying that LF inside the shift record was tried and rejected: no Windows
-/// keyboard produces `Shift+Enter, UnicodeChar 10`, so a reader that keys on
-/// the char sees a chord that exists nowhere else — cmd.exe's cooked reader
-/// stayed inert on the LF record where it runs the line on the CR one (both
-/// measured), and a reader that emits the char gets a '\n' WT would never
-/// have sent it. The Unix policy is untouched, since 9001 is never set there.
+/// Not aterm's Unix Shift+Enter LF (`encode_legacy.rs`, the `Enter` arm): no Windows keyboard
+/// makes `Shift+Enter, UnicodeChar 10`, and cmd.exe's cooked reader ignores that record where
+/// it runs the line on the CR one.
 const WIN32_SHIFT_ENTER_CHAR: u32 = 13;
 const WIN32_CTRL_ENTER_CHAR: u32 = 10;
 
@@ -979,14 +712,10 @@ struct Win32KeyRecord {
     cs: u32,
 }
 
-/// The win32-input-mode record for a key conhost cannot read from legacy VT,
-/// or `None` for every key it reads correctly, which keeps its legacy bytes.
-/// Two families, both measured against conhost 10.0.26200: the Enter chords
-/// legacy VT has no byte for ([`win32_enter_chord`]), and the keys whose
-/// legacy bytes conhost stops reading once it has seen one record
-/// ([`win32_escape_record`]).
-// Skip: `Option::or_else` over two table lookups — absent std bodies; both
-// halves are exhaustively unit-tested against the measured records.
+/// The win32-input-mode record for a key conhost cannot read from legacy VT, or `None` for a
+/// key it reads correctly, which keeps its legacy bytes: the Enter chords legacy VT has no
+/// byte for ([`win32_enter_chord`]) and the keys whose legacy bytes conhost holds once it has
+/// read a record ([`win32_escape_record`]).
 #[cfg_attr(trust_verify, trust::skip)]
 fn win32_key_record(
     key: &Key,
@@ -998,21 +727,13 @@ fn win32_key_record(
         .or_else(|| win32_escape_record(key, modifiers, mode, base_layout_key))
 }
 
-/// The win32-input-mode record for an Enter chord — `Some` only for an
-/// Enter (main block or keypad) with SHIFT and/or CTRL (ALT may ride along),
-/// `None` for everything else so the caller falls through to the legacy bytes:
-/// plain Enter stays CR and Alt+Enter stays `ESC CR`, both of which conhost
-/// already translates correctly (measured 2026-09-22, and again 2026-09-27
-/// after a record had switched its parser — see
-/// [`conhost_holds_once_switched`]). The keypad Enter is the
-/// same VK/scan pair flagged `ENHANCED_KEY`, as a real record for the
-/// E0-prefixed key is; it must be routed here too, because the legacy keypad
-/// arm falls back to the main Enter's bare LF, which is precisely the byte
-/// conhost reads as Ctrl+Enter. DECKPAM is not consulted: the record names the
-/// physical key, and conhost applies the application's keypad mode itself when
-/// the application reads in VT mode.
-// Skip: bitflags `contains` and a `match` over a table enum — absent std
-// bodies; the mapping is exhaustively unit-tested against the spec.
+/// The win32-input-mode record for an Enter chord: `Some` only for Enter (main block or
+/// keypad) with SHIFT and/or CTRL, ALT riding along. Plain Enter (CR) and Alt+Enter (`ESC CR`)
+/// keep their legacy bytes, which conhost reads correctly even after
+/// [`conhost_holds_once_switched`]'s switch. The keypad Enter is the same VK/scan pair flagged
+/// `ENHANCED_KEY`; it is routed too because the legacy keypad arm writes the main Enter's
+/// Shift+Enter LF, which conhost reads as Ctrl+Enter. DECKPAM is not consulted: the record
+/// names the physical key, and conhost applies keypad mode itself.
 #[cfg_attr(trust_verify, trust::skip)]
 fn win32_enter_chord(key: &Key, modifiers: Modifiers) -> Option<Win32KeyRecord> {
     let mut cs = match key {
@@ -1049,35 +770,23 @@ fn win32_enter_chord(key: &Key, modifiers: Modifiers) -> Option<Win32KeyRecord> 
     })
 }
 
-/// Whether conhost's input parser, once it has read a win32-input-mode record,
-/// HOLDS these legacy key bytes instead of delivering the key they spell.
+/// Whether conhost's input parser, once it has read a win32-input-mode record, holds these
+/// legacy key bytes instead of delivering the key they spell (conhost 10.0.26200).
 ///
-/// Before the first record, conhost settles an ambiguous tail by the end of
-/// the read that carried it: a read ending in a lone ESC is the Escape key, and
-/// a read ending in `ESC [` is Alt+[. The first record switches that flush off
-/// for the rest of the session — a terminal speaking win32-input-mode never
-/// sends a bare ESC, so a trailing ESC must be a sequence split across reads —
-/// and aterm's first Shift+Enter IS a record. Measured 2026-09-27 (conhost
-/// 10.0.26200; every ESC pair fed raw into a ConPTY tab running a `ReadKey`
-/// loop, each followed by `z`, before and after one Shift+Enter record):
+/// Before the first record conhost settles an ambiguous tail at the end of a read: a lone ESC
+/// is Escape, `ESC [` is Alt+[. The first record turns that flush off for the session (a
+/// win32-input-mode terminal never sends a bare ESC), and aterm's first Shift+Enter is a
+/// record. After it:
 ///
-/// - `ESC` alone: nothing, even after 6 s idle, and the next `z` read as
-///   Alt+Z. This is Escape — PSReadLine's RevertLine, vim's leave-insert,
-///   Claude Code's Esc-to-interrupt — and Ctrl+[.
-/// - `ESC ESC`, `ESC DEL`: the second byte vanished and the ESC stayed pending
-///   (`z` → Alt+Z): Alt+Escape, Ctrl+Alt+[, Alt+Backspace.
-/// - `ESC [`, `ESC O`, `ESC P`, `ESC ]`, `ESC X`, `ESC ^`, `ESC _`: each opens a
-///   CSI / SS3 / DCS / OSC / SOS / PM / APC that swallowed the `z` (the string
-///   forms swallow everything up to BEL or ST): Alt+[, Alt+Shift+O, ….
+/// - `ESC` alone stays pending and the next key reads as Alt+key: Escape and Ctrl+[.
+/// - `ESC ESC`, `ESC DEL` lose the second byte and the ESC stays pending: Alt+Escape,
+///   Ctrl+Alt+[, Alt+Backspace.
+/// - `ESC [`, `ESC O`, `ESC P`, `ESC ]`, `ESC X`, `ESC ^`, `ESC _` open a CSI / SS3 / DCS /
+///   OSC / SOS / PM / APC that swallows what follows: Alt+[, Alt+Shift+O, ….
 ///
-/// Everything else arrived intact after the switch, so it keeps its bytes:
-/// ESC + every other printable, ESC + every other C0 (Alt+Enter, Alt+Tab,
-/// Ctrl+Alt+letter), ESC + non-ASCII, and every complete CSI/SS3 sequence
-/// (arrows, Home/End, F-keys, Shift+Tab and their modified forms). Before the
-/// switch the held forms arrived intact too, which is why this is a win32-mode
-/// rule and not a legacy one. (`ESC ESC [ E`, Alt+keypad-5 with NumLock off, is
-/// dropped by conhost before the switch and after it alike and poisons
-/// nothing, so it is outside this rule.)
+/// Every other ESC pair and every complete CSI/SS3 sequence arrives intact, so it keeps its
+/// bytes. (`ESC ESC [ E`, Alt+keypad-5 with NumLock off, is dropped before and after the
+/// switch alike, so it is outside this rule.)
 fn conhost_holds_once_switched(legacy: &[u8]) -> bool {
     match legacy {
         [0x1b] => true,
@@ -1089,44 +798,23 @@ fn conhost_holds_once_switched(legacy: &[u8]) -> bool {
     }
 }
 
-/// The record for a key whose legacy bytes [`conhost_holds_once_switched`]:
-/// Escape (any modifiers), Alt+Backspace, and a character chord that legacy
-/// spells as one of those forms (Ctrl+[ and Ctrl+3 are a lone ESC, Alt+[ is
-/// `ESC [`, Ctrl+Alt+8 is `ESC DEL`, …). `None` for every other key, and for a
-/// character no US-QWERTY key types — every held form is ASCII, so that is out
-/// of a keyboard's reach and the legacy bytes are the only spelling left.
+/// The record for a key whose legacy bytes [`conhost_holds_once_switched`]: Escape (any
+/// modifiers), Alt+Backspace, and a character chord legacy spells as one of those forms
+/// (Ctrl+[ and Ctrl+3 are a lone ESC, Alt+[ is `ESC [`, Ctrl+Alt+8 is `ESC DEL`). `None` for
+/// every other key, and for a character no US-QWERTY key types: every held form is ASCII, so
+/// the legacy bytes are its only spelling.
 ///
-/// The record states what the legacy bytes stated, re-spelled so conhost
-/// cannot mis-split it. `Uc` is the byte after the Alt prefix (ESC for Escape
-/// and Ctrl+[, `[` for Alt+[, DEL for Ctrl+Alt+8), except Backspace, whose
-/// Windows char is BS. `LEFT_ALT_PRESSED` is set exactly when the legacy form
-/// carried the ESC prefix, which is what conhost decoded that prefix to (`ESC
-/// a` → `A MODS=Alt`). `Vk`/`Sc` name the PHYSICAL key: the US identity the
-/// host resolved from the scan code (`base_layout_key`), else the character's
-/// own US key, which also contributes SHIFT for a shifted glyph (`_` is
-/// Shift+-). Measured after the switch, each record reads back as the key it
-/// names: Escape `27;1;27` → `Escape CHAR=0x1B`, Alt+Backspace `8;14;8;…;2` →
-/// `Backspace MODS=Alt CHAR=0x8` and Alt+[ `219;26;91;…;2` → `Oem4 MODS=Alt`
-/// (both exactly what conhost decoded from the legacy pair before it), and
-/// Ctrl+[ `219;26;27;…;8` → `Oem4 MODS=Control CHAR=0x1B`.
+/// The record re-spells what the legacy bytes said. `Uc` is the byte after the Alt prefix (BS
+/// for Backspace). `LEFT_ALT_PRESSED` is set exactly when the legacy form carried the ESC
+/// prefix. `Vk`/`Sc` name the physical key: `base_layout_key`'s US identity, else the
+/// character's own US key, which adds SHIFT for a shifted glyph (`_` is Shift+-).
 ///
-/// Ctrl+[ is the one key whose identity moves. Before the switch conhost read
-/// its lone ESC as the Escape key; the record is the one a Windows keyboard
-/// makes for that key (the US layout gives `VK_OEM_4` with Ctrl the char
-/// 0x1B), the record a console window hands its reader when Ctrl+[ is pressed
-/// on it directly. So vim, which reads the char, leaves insert mode on it as
-/// before (measured, Git's vim), while PSReadLine's Windows mode, which binds
-/// by key and has nothing on Ctrl+[, now inserts `^[` where it used to revert
-/// the line (measured). Sending the Escape key instead would keep that revert
-/// but name a key nobody pressed; Escape itself reverts the line.
-///
-/// Ctrl+Escape and Alt+Escape go out as their records too, and conhost drops
-/// them (measured: nothing reached `ReadKey`, and the next key arrived plain) —
-/// its own rule for the shell's Start-menu and window-cycling keys, which it
-/// applies to a record whichever terminal sent it. The legacy alternative is
-/// worse: after the switch it swallows the key typed next.
-// Skip: slice pattern matching and a table lookup — absent std bodies; the
-// mapping is exhaustively unit-tested against the measured records.
+/// Ctrl+[ is the one key whose identity moves: it goes out as the record a Windows keyboard
+/// makes for it (`VK_OEM_4`, char 0x1B), not the Escape key conhost read its lone ESC as
+/// before the switch, which would name a key nobody pressed. vim, which reads the char, still
+/// leaves insert mode; PSReadLine, which binds by key, inserts `^[`. Ctrl+Escape and
+/// Alt+Escape go out as records too and conhost drops them (its rule for the Start-menu and
+/// window-cycling keys); the legacy bytes would swallow the next key instead.
 #[cfg_attr(trust_verify, trust::skip)]
 fn win32_escape_record(
     key: &Key,
@@ -1165,13 +853,10 @@ fn win32_escape_record(
     Some(Win32KeyRecord { vk, sc, uc, cs })
 }
 
-/// The US-QWERTY main-block key that types `c`: its `wVirtualKeyCode`, its
-/// set-1 scan code, and whether `c` is that key's SHIFTED glyph. Scan codes
-/// are physical positions, the same on every layout; the VK is the US one,
-/// which is what conhost's own `VkKeyScan` answered for these characters
-/// before the switch (`ESC _` → `OemMinus MODS=Alt, Shift`, `ESC ^` → `D6
-/// MODS=Alt, Shift`). `None` for anything the US main block cannot type.
-// Skip: a table scan (slice iterator) — absent std bodies; unit-tested.
+/// The US-QWERTY main-block key that types `c`: its `wVirtualKeyCode`, its set-1 scan code (a
+/// physical position, the same on every layout), and whether `c` is its shifted glyph. The VK
+/// is the US one, as conhost's own `VkKeyScan` answers for these characters. `None` for
+/// anything the US main block cannot type.
 #[cfg_attr(trust_verify, trust::skip)]
 fn us_physical_key(c: char) -> Option<(u32, u32, bool)> {
     // Set-1 scan codes of A..Z.
@@ -1214,22 +899,11 @@ fn us_physical_key(c: char) -> Option<(u32, u32, bool)> {
         .map(|&(plain, _, vk, sc)| (u32::from(vk), u32::from(sc), c != plain))
 }
 
-/// The win32-input-mode `INPUT_RECORD` pair (key-down, then key-up) for a
-/// routed key.
-///
-/// Format (microsoft/terminal doc/specs/#4999-win32-input-mode.md):
-/// `CSI Vk ; Sc ; Uc ; Kd ; Cs ; Rc _`, every field spelled (Windows Terminal's
-/// own `_GenerateWin32KeySequence` writes all six). `Uc` and `Cs` are the SAME
-/// on both halves (the modifier is still held when the key comes back up);
-/// `Kd` is 1 then 0; `Rc` is 1.
-///
-/// Both halves are emitted from the PRESS. Windows applications key on the
-/// key-down and the host keeps no per-key state, so a self-contained pair per
-/// press is what makes the key atomic; the caller's release path emits
-/// nothing for this key, so no second key-up ever follows.
-// Skip: the key encoders build byte sequences via Vec push/extend and
-// table lookups — absent std bodies (alloc + iterator class). The encoded
-// bytes are exhaustively unit-tested against the win32-input-mode spec.
+/// The win32-input-mode `INPUT_RECORD` pair (key-down, then key-up) for a routed key:
+/// `CSI Vk ; Sc ; Uc ; Kd ; Cs ; Rc _` with all six fields spelled, as Windows Terminal writes
+/// them (microsoft/terminal doc/specs/#4999-win32-input-mode.md). `Uc` and `Cs` match on both
+/// halves, `Kd` is 1 then 0, `Rc` is 1. Both halves come from the press: the host keeps no
+/// per-key state, so the release path emits nothing for a routed key.
 #[cfg_attr(trust_verify, trust::skip)]
 fn encode_win32_record_pair(record: &Win32KeyRecord) -> Vec<u8> {
     let mut buf = Vec::with_capacity(48);
@@ -1250,9 +924,6 @@ fn encode_win32_record_pair(record: &Win32KeyRecord) -> Vec<u8> {
 }
 
 /// Encode using legacy terminal sequences.
-// Skip: the key encoders build byte sequences via Vec push/extend and
-// table lookups — absent std bodies (alloc + iterator class). The encoded
-// bytes are exhaustively unit-tested against the kitty/xterm specs.
 #[cfg_attr(trust_verify, trust::skip)]
 fn encode_legacy(
     key: &Key,
@@ -1260,33 +931,24 @@ fn encode_legacy(
     mode: KeyboardMode,
     layout_text: Option<char>,
 ) -> Vec<u8> {
-    // Caps Lock is read once, for TEXT: Caps Lock + a types 'A' (xterm's
-    // XLookupString applies Lock; kitty and Terminal.app send the OS text).
-    // A window press brings the layout's own character; a controller key
-    // carries none, so the text press derives it ([`typed_character`]).
+    // Caps Lock matters only for TEXT (Caps Lock + a types 'A'): a window press brings the
+    // layout's character, a controller key derives it ([`typed_character`]).
     let caps_lock = modifiers.contains(Modifiers::CAPS_LOCK);
-    // Caps Lock is a LOCK state, never a chord modifier in legacy xterm encoding —
-    // it belongs only to the Kitty modifier byte (which still reports it). Left in,
-    // it makes `has_modifiers` true with Caps Lock engaged, so arrows / Home-End /
-    // PageUp-Down / F-keys would emit the modified `ESC[1;1A` form (and lose the
-    // SS3 app-cursor `ESC OA`) instead of the plain `ESC[A`, breaking readline / vim
-    // / less / fzf navigation. xterm itself ignores Caps Lock here, so drop it
-    // unconditionally before any encoding decision.
+    // Caps Lock is a lock, not a chord modifier, in xterm's encoding; left in, arrows and
+    // F-keys would take the modified `ESC[1;1A` form and lose SS3 `ESC OA`. Only the kitty
+    // modifier byte reports it.
     let modifiers = modifiers & !Modifiers::CAPS_LOCK;
-    // DEC private mode 1035 (xterm `numLock`): when reset the terminal advertises
-    // `NO_SPECIAL_MODIFIERS`, so NumLock is no longer treated as a real modifier
-    // and is dropped before any encoding decision is made (both the character and
-    // named paths see the normalized set).
+    // DEC private mode 1035 (xterm `numLock`) reset sets `NO_SPECIAL_MODIFIERS`: NumLock
+    // is then no modifier either.
     let modifiers = if mode.contains(KeyboardMode::NO_SPECIAL_MODIFIERS) {
         modifiers & !Modifiers::NUM_LOCK
     } else {
         modifiers
     };
     match key {
-        // A TEXT press writes the character it types: the layout's when the
-        // window gave it (only a Shift/lock press carries one), else Caps
-        // Lock's capital. A chord, and Shift with no lock, are the legacy
-        // encoder's own (its Shift table, its control and ESC forms).
+        // A TEXT press writes the character it types: the layout's when given, else Caps
+        // Lock's capital. Everything else is the legacy encoder's (Shift table, control and
+        // ESC forms).
         Key::Character(c) => match layout_text.or_else(|| {
             (caps_lock && !modifiers.intersects(NON_TEXT_MODIFIERS))
                 .then(|| typed_character(*c, modifiers | Modifiers::CAPS_LOCK))
@@ -1301,8 +963,6 @@ fn encode_legacy(
     }
 }
 
-// Skip: the `Key` inspection walks table slices / iterators (absent std
-// bodies). Exhaustively unit-tested against the kitty/xterm specs.
 #[cfg_attr(trust_verify, trust::skip)]
 fn encode_xterm_other_keys(
     key: &Key,
@@ -1327,18 +987,14 @@ fn encode_xterm_other_keys(
         _ => return None,
     };
 
-    // xterm's modifyOtherKeys decision is key-sensitive. In particular, level
-    // 1 preserves the established Shift/Ctrl encodings where they are
-    // unambiguous, and Backspace keeps its DECBKM/Ctrl toggle. Treating the
-    // levels as simply "Alt" and "any modifier" fabricates CSI packets for
-    // keys xterm sends through its legacy path (notably Alt+Backspace and
-    // Ctrl+Backspace). Keypad keys are excluded above because xterm classifies
-    // them under modifyKeypadKeys, never modifyOtherKeys.
+    // xterm's modifyOtherKeys decision is key-sensitive: level 1 keeps the unambiguous
+    // Shift/Ctrl encodings and Backspace's DECBKM/Ctrl toggle, so Alt+Backspace and
+    // Ctrl+Backspace stay on the legacy path. Keypad keys never get here: xterm files them
+    // under modifyKeypadKeys.
     //
-    // Level 2 escapes a Shift-only character whose SHIFTED keysym is in
-    // '@'..DEL, and that keysym is the LAYOUT's when the host gave it: German
-    // Shift+2 is `"`, ordinary text, where the US table's '@' is escaped.
-    // Decided here, beside the verified level-2 rule, which reads the table.
+    // Level 2 escapes a Shift-only character whose shifted keysym is in '@'..DEL, and that
+    // keysym is the layout's when the host gave it: German Shift+2 is `"`, plain text, where
+    // the US table's '@' is escaped.
     let apply = match (level, key, layout_text) {
         (1, ..) => xterm_modify_other_keys_level1_applies(key, effective_mods),
         (2, Key::Character(_), Some(glyph)) if effective_mods == Modifiers::SHIFT => {
@@ -1415,11 +1071,9 @@ fn xterm_modify_other_keys_level2_applies(key: &Key, modifiers: Modifiers) -> bo
         Key::Named(NamedKey::Backspace) => !(modifiers & !Modifiers::CTRL).is_empty(),
         Key::Named(NamedKey::Space) => true,
         Key::Character(c) if modifiers == Modifiers::SHIFT => {
-            // xterm checks the shifted keysym. Shift-only characters below '@'
-            // remain ordinary text (`1` -> `!`, `=` -> `+`, `,` -> `<`, etc.);
-            // the ASCII control-input range '@'..DEL is escaped. Space is the
-            // one explicit exception and is represented by NamedKey::Space in
-            // the native/DOM mappings.
+            // xterm checks the shifted keysym: Shift-only characters below '@' stay text
+            // (`1` -> `!`, `,` -> `<`); the control-input range '@'..DEL is escaped. Space,
+            // the one exception, is NamedKey::Space in the native/DOM mappings.
             let shifted = shifted_character(*c, modifiers).unwrap_or(*c) as u32;
             (u32::from(b'@')..=u32::from(0x7f_u8)).contains(&shifted)
         }
@@ -1428,39 +1082,28 @@ fn xterm_modify_other_keys_level2_applies(key: &Key, modifiers: Modifiers) -> bo
 }
 
 /// Write a u8 as decimal digits to a buffer.
-// Skip: the key encoders build byte sequences via Vec push/extend and
-// table lookups — absent std bodies (alloc + iterator class). The encoded
-// bytes are exhaustively unit-tested against the kitty/xterm specs.
 #[cfg_attr(trust_verify, trust::skip)]
 fn write_u8(buf: &mut Vec<u8>, val: u8) {
     write_u32(buf, u32::from(val));
 }
 /// Write a u32 as decimal digits to a buffer.
-// Skip: the key encoders build byte sequences via Vec push/extend and
-// table lookups — absent std bodies (alloc + iterator class). The encoded
-// bytes are exhaustively unit-tested against the kitty/xterm specs.
 #[cfg_attr(trust_verify, trust::skip)]
 fn write_u32(buf: &mut Vec<u8>, val: u32) {
     if val == 0 {
         buf.push(b'0');
         return;
     }
-    // Extract decimal digits least-significant-first into a fixed 16-slot
-    // scratch (u32::MAX is 10 digits), then append most-significant-first. This
-    // uses only the literal divisor 10 (no runtime-divisor division for the
-    // Trust gate to guard against a zero divisor), masks every scratch index
-    // into the array's 0..=15 range, and forms each byte with `wrapping_add`
-    // (the digit is 0..=9, so it never actually wraps) — so there is no
-    // div-by-zero, index-out-of-bounds, or `b'0' + digit` overflow obligation.
+    // Digits go least-significant-first into a 16-slot scratch (u32::MAX has 10), then out
+    // in reverse. A literal divisor, masked indices and `wrapping_add` on a 0..=9 digit leave
+    // the Trust gate no div-by-zero, bounds or overflow obligation.
     let mut digits = [0u8; 16];
     let mut n = val;
     let mut count = 0usize;
     while n > 0 && count < 10 {
         digits[count & 15] = b'0'.wrapping_add((n % 10) as u8);
         n /= 10;
-        // saturating: `count < 10` guards the increment and `count > 0` the
-        // decrement — exact on every path; the verifier cannot chain either
-        // loop condition into the arithmetic.
+        // Saturating is exact (`count < 10`, `count > 0`); the verifier cannot carry the
+        // loop conditions into the arithmetic.
         count = count.saturating_add(1);
     }
     while count > 0 {

@@ -121,7 +121,7 @@ pub fn native_updater_model() -> Model {
                 close_preflight = 0;
                 reexec_count = 0;
             }
-            invariant SingleFlight: active_work <= 1;
+            bound SingleFlight: active_work <= 1;
             invariant CurrentStagedArtifact:
                 if phase == 4 {
                     verified == 1 && artifact_generation == request_generation &&
@@ -137,7 +137,7 @@ pub fn native_updater_model() -> Model {
                     request_generation <= MaxGeneration
                 };
             invariant OneLiveApplyAuthority: reexec_count <= 1;
-            invariant GenerationBounded: request_generation <= MaxGeneration;
+            bound GenerationBounded: request_generation <= MaxGeneration;
         }
     }
 }
@@ -340,7 +340,7 @@ pub fn release_durable_post_intent_model() -> Model {
                 };
             invariant UploadConvergenceRequiresVisibility:
                 if upload_converged == 1 { upload_visible == 1 } else { upload_visible <= 1 };
-            invariant DurableIntentStateBounded:
+            bound DurableIntentStateBounded:
                 attached <= 1 && create_intent <= 1 && create_post_authority <= 1 &&
                 create_permit_lost <= 1 &&
                 create_posts <= MaxPosts && create_visible <= 1 &&
@@ -594,7 +594,7 @@ pub fn roster_pair_redo_model() -> Model {
                 };
             invariant ForeignBytesAreNeverOverwritten: foreign_overwritten == 0;
             invariant ReadOnlyNeverWrites: readonly_writes == 0;
-            invariant StateBounded:
+            bound StateBounded:
                 body <= MaxIdentity && signature <= MaxIdentity && redo <= 1 &&
                 writer_lock <= 1 && snapshot_checked <= 1 && result <= 2 &&
                 writer_writes <= MaxWrites && readonly_checked <= 1 &&
@@ -912,7 +912,7 @@ pub fn release_channel_floor_model() -> Model {
                 };
             invariant LeaseCannotBeBypassed: lease_bypassed == 0;
             invariant UnlockCannotBeBypassed: unlock_bypassed == 0;
-            invariant FloorStateBounds:
+            bound FloorStateBounds:
                 phase <= 7 && operator_floor <= MaxFloor &&
                 observed_floor <= MaxFloor && claimed_build <= MaxFloor &&
                 frozen_floor <= MaxFloor && journal_floor <= MaxFloor &&
@@ -1160,7 +1160,7 @@ pub fn release_journal_prefix_model() -> Model {
                 };
             invariant CorruptJournalCannotResume: corruption_bypassed == 0;
             invariant ResumeCannotSkipOrderedMutation: ordering_bypassed == 0;
-            invariant JournalPrefixBounds:
+            bound JournalPrefixBounds:
                 phase <= 2 && done_lock <= 1 && done_prepare <= 1 &&
                 done_visible <= 1 && done_unlock <= 1 && unknown_step <= 1 &&
                 duplicate_step <= 1 && version_valid <= 1 && owner_valid <= 1 &&
@@ -1493,7 +1493,7 @@ pub fn release_publisher_fence_model() -> Model {
             invariant StoppedProofIsPerProcess: stale_stop_reused == 0;
             invariant IncoherentSuccessorCannotConverge:
                 incoherent_accepted == 0;
-            invariant FenceStateBounds:
+            bound FenceStateBounds:
                 remote_token <= 2 && remote_fence_owner <= 2 &&
                 local_a_token <= 1 && local_b_token <= 2 &&
                 old_process_stopped <= 1 && lease_owner <= 2 &&
@@ -1737,7 +1737,7 @@ pub fn release_historical_recovery_model() -> Model {
                 };
             invariant CompletionReleasesOwner:
                 if phase > 1 { owner_held == 0 } else { owner_held == 1 };
-            invariant HistoricalRecoveryBounds:
+            bound HistoricalRecoveryBounds:
                 phase <= 3 && owner_held <= 1 && signature_required <= 1 &&
                 selected_key <= CurrentKey && publication_mutation <= 1 &&
                 wrong_key_bypassed <= 1 && create_knowledge <= 2 &&
@@ -1866,7 +1866,7 @@ pub fn release_published_identity_model() -> Model {
                 };
             invariant TargetDriftCannotBeBypassed: target_drift_bypassed == 0;
             invariant TagDriftCannotBeBypassed: tag_drift_bypassed == 0;
-            invariant PublishedIdentityBounds:
+            bound PublishedIdentityBounds:
                 snapshot_target <= ShaTarget && observed_target <= ShaTarget &&
                 resolved_tag_commit <= ManifestCommit && history_accepted <= 1 &&
                 delete_authorized <= 1 && deleted <= 1 && refused <= 1 &&
@@ -2245,7 +2245,7 @@ pub fn release_yank_successor_first_model() -> Model {
             invariant ReleaseFirstOrderingIsForbidden: release_first_bypassed == 0;
             invariant EarlySessionReleaseIsForbidden:
                 early_session_release_bypassed == 0;
-            invariant YankStateBounds:
+            bound YankStateBounds:
                 bad_release_present <= 1 && bad_tag_present <= 1 &&
                 target_identity_valid <= 1 && target_known <= 1 &&
                 successor_order <= SuccessorOrder &&
@@ -2447,7 +2447,7 @@ pub fn release_claim_landing_model() -> Model {
                 section == 0 || foreign == 1 || mode == 2 || phase == 0 || phase > 2;
             invariant OwnSectionIsNeverCutElsewhere: elsewhere == 0 || foreign == 1;
             invariant NoClaimAfterPublish: after_publish == 0;
-            invariant ClaimStateBounds:
+            bound ClaimStateBounds:
                 peers <= MaxPeers && rivals <= MaxRivals && foreign <= 1 &&
                 seq <= MaxSeq && published <= 1 && main_code <= MaxPeers &&
                 main_lines <= MaxSeq + 1 && tail <= MaxSeq + 1 && section <= 1 &&

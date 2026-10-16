@@ -4,31 +4,28 @@
 //! Ink wrap seam trace: a trailing rainbow streak follows Claude Code's and
 //! Codex's composer onto a new line.
 //!
-//! A headless replay of Ink's composer wrap at the seam, modelled on
-//! `a_line_still_being_typed_has_no_dark_cell_inside_its_live_span`: keys at
-//! 70 ms, each echo observed 9 ms later, ticks at 60 Hz, the caret typed from
-//! Ink's inset column 2 to column 78 on the composer's bottom row. The wrap key
-//! makes Ink re-wrap: the last word (`pers`) moves down a row and the box grows
-//! one row. Shapes replayed:
+//! A headless replay of Ink's composer wrap at the seam: keys at 70 ms, each
+//! echo observed 9 ms later, ticks at 60 Hz, the caret typed from Ink's inset
+//! column 2 to column 78 on the composer's bottom row. The wrap key makes Ink
+//! re-wrap: the last word (`pers`) moves down a row and the box grows one row.
+//! Shapes replayed:
 //!
-//! * `ScrolledOneMove`: Claude Code's shape with the box at the screen's
-//!   bottom (`classify_move`'s box-growth wrap): the box grows a row up, the
-//!   screen scrolls one line in the same repaint, the caret's terminal row is
-//!   constant. The host sees `note_scroll(1)` then the caret at `(row, 6)`, so
-//!   after `translate_scroll_state` the move is `(row−1, 78) → (row, 6)`.
+//! * `ScrolledOneMove`: Claude Code's box at the screen's bottom
+//!   (`classify_move`'s box-growth wrap): the box grows a row up and the screen
+//!   scrolls one line in the same repaint. The host sees `note_scroll(1)` then
+//!   the caret at `(row, 6)`, so after `translate_scroll_state` the move is
+//!   `(row−1, 78) → (row, 6)`.
 //! * `ScrolledTwoMove`: the same, observed as Ink's two-move rewrite (caret
 //!   first at the inset `(row, 2)`, one tick later at `(row, 6)`).
-//! * `BoxGrowsUpNoScroll`: the box not at the bottom (or the alt screen): no
-//!   scroll, the old text moved up a row without the host being told, so the
-//!   move is the same-row `(row, 78) → (row, 6)`.
+//! * `BoxGrowsUpNoScroll`: the box above the bottom (or the alt screen): no
+//!   scroll, the old text moves up without the host being told, so the move is
+//!   the same-row `(row, 78) → (row, 6)`.
 //!
-//! Each frame prints the v2 cells per row (`v2_cols`) from just before the
-//! wrap to 3 s after, and the seam's ring rows (with `licence=`). Asserted:
-//! the band spans the wrap (a second later the row wrapped off still carries
-//! its typed light); that light is gone within ~2 s while typing continues on
-//! the new row; nothing stays lit on the old row past its last glyph (moved
-//! cells leave with their text); and the new row's cells are contiguous from
-//! the inset column while typed.
+//! Asserted: the band spans the wrap (a second later the row wrapped off still
+//! carries its typed light); that light is gone within ~2 s while typing
+//! continues on the new row; nothing stays lit on the old row past its last
+//! glyph; and the new row's cells are contiguous from the inset column while
+//! typed.
 
 use super::*;
 use std::collections::BTreeSet;
@@ -37,8 +34,8 @@ use std::collections::BTreeSet;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WrapShape {
     ScrolledOneMove,
-    /// The scrolled shape with a ONE-letter wrapped word: the landing at
-    /// col 3 from col 78 of an 80-cell pane is inside the seam's
+    /// The scrolled shape with a one-letter wrapped word: the landing at col 3
+    /// from col 78 of an 80-cell pane is inside the seam's
     /// `coalesced_fold_shape` (landing 1..=3, origin within 4 of the edge).
     ScrolledShortWord,
     ScrolledTwoMove,
@@ -95,8 +92,8 @@ fn ranges(set: &BTreeSet<u16>) -> String {
     out
 }
 
-/// One pending echo: the caret the host will observe at `at`, and whether
-/// this echo is the WRAP frame (a scroll may precede the caret).
+/// One pending echo: the caret the host observes at `at`, after `scroll` rows
+/// of scroll (nonzero only on the wrap frame).
 #[derive(Clone, Copy)]
 struct Echo {
     at: Instant,
@@ -110,8 +107,8 @@ struct Replay {
 }
 
 fn replay(shape: WrapShape) -> Replay {
-    // An 80-column pane, the measured instance's width: Ink's box ends at
-    // col 78, two cells short of the pane's edge.
+    // An 80-column pane: Ink's box ends at col 78, two cells short of the
+    // pane's edge.
     let g = Geom {
         cw: 8,
         ch: 16,
@@ -157,7 +154,7 @@ fn replay(shape: WrapShape) -> Replay {
     };
     let new_row = ROW;
 
-    // key → (echo(s)).
+    // key → its echoes as (delay ms, caret, scroll rows).
     type ScheduledEcho = (u64, (u16, u16), u16);
     let keys: Vec<(char, Vec<ScheduledEcho>)> = {
         let mut v = Vec::new();
@@ -167,7 +164,8 @@ fn replay(shape: WrapShape) -> Replay {
             v.push((ch, vec![(ECHO_MS, (ROW, col), 0)]));
         }
         assert_eq!(col, 78, "the caret stands at col 78 before the wrap key");
-        // THE WRAP KEY: Ink moves `pers` down; the caret lands at INSET + 4.
+        // The wrap key: Ink moves the last word down; the caret lands at
+        // `INSET + wrapped`.
         let landing = (ROW, INSET + wrapped);
         let wrap_echoes = match shape {
             WrapShape::ScrolledOneMove | WrapShape::ScrolledShortWord => {
@@ -283,7 +281,6 @@ fn replay(shape: WrapShape) -> Replay {
             ));
         }
 
-        // THE ASSERTIONS (what should hold).
         if let Some(w) = wrap_echo {
             let since = now.saturating_duration_since(w);
             let hand_on_new_row = keys_iter.peek().is_some() || now <= last_echo;
@@ -291,11 +288,10 @@ fn replay(shape: WrapShape) -> Replay {
                 WrapShape::ScrolledOneMove
                 | WrapShape::ScrolledShortWord
                 | WrapShape::ScrolledTwoMove => {
-                    // (2) nothing stays lit on the old row past its last
-                    // glyph (`it's` ends at col 73; 74..=77 are blank after
-                    // Ink's re-wrap) once a retract could have run.
-                    // The moved word's cells and the space the wrap ate:
-                    // `78 - wrapped ..= 77` on the old row are blank now.
+                    // (2) Once a retract could have run, nothing stays lit on
+                    // the old row past its last glyph: the moved word's cells
+                    // and the space the wrap ate (`78 - wrapped ..= 77`) are
+                    // blank.
                     let first_blank = 78 - wrapped;
                     if since >= Duration::from_millis(1000) {
                         let past: Vec<u16> =
@@ -311,7 +307,7 @@ fn replay(shape: WrapShape) -> Replay {
                     // (0) The band spans the wrap: a second later, with typing
                     // on the new row, the row wrapped off still carries its
                     // light (wrapping continues one input; those glyphs did
-                    // not move) (owner, 2026-09-15).
+                    // not move).
                     if (Duration::from_millis(1000)..Duration::from_millis(1200)).contains(&since)
                         && old.is_empty()
                         && law_hits[3] < 4
@@ -428,30 +424,22 @@ fn run(shape: WrapShape) {
     );
 }
 
-/// The measured Claude Code shape: the bottom-anchored box grows a row up,
-/// the screen scrolls one line in the same repaint, one observed move.
 #[test]
 fn an_ink_wrap_observed_as_one_scrolled_move_lets_the_streak_follow_the_caret_down() {
     run(WrapShape::ScrolledOneMove);
 }
 
-/// The scrolled shape with a one-letter wrapped word (landing col 3).
 #[test]
 fn an_ink_wrap_of_a_one_letter_word_observed_as_one_scrolled_move_lets_the_streak_follow_the_caret_down()
  {
     run(WrapShape::ScrolledShortWord);
 }
 
-/// Ink's two-move rewrite across the wrap (end → inset column, then inset
-/// column → the wrapped word's end).
 #[test]
 fn an_ink_wrap_observed_as_two_scrolled_moves_lets_the_streak_follow_the_caret_down() {
     run(WrapShape::ScrolledTwoMove);
 }
 
-/// The box grows up without a scroll (the box above the screen's bottom, or
-/// the alt screen): the caret's terminal row is constant and the old text
-/// moved up without the host being told.
 #[test]
 fn an_ink_wrap_observed_as_a_same_row_re_anchor_keeps_the_light_under_the_text() {
     run(WrapShape::BoxGrowsUpNoScroll);

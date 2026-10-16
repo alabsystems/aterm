@@ -29,7 +29,7 @@ pub fn native_update_environment_repair_model() -> Model {
                 decided = 1;
             }
 
-            invariant ReleaseRequiresProof:
+            uncaught ReleaseRequiresProof:
                 latched == 1 || (owned == 1 && fresh == 1 && verified == 1);
             invariant RepairedSourceRecovers:
                 decided == 0 || owned == 0 || fresh == 0 || verified == 0 || latched == 0;

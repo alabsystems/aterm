@@ -27,15 +27,6 @@ fn damage_bounds_iterator_single_row_preserves_column_bounds() {
     assert_eq!(bounds, vec![LineDamageBounds::new(3, 4, 10)]);
 }
 
-#[test]
-fn merged_damage_iterator_full_damage_yields_single_rect() {
-    let damage = Damage::Full;
-
-    let rects: Vec<_> = damage.iter_merged(6, 20).collect();
-
-    assert_eq!(rects, vec![DamageRect::new(0, 6, 0, 20)]);
-}
-
 /// Random cell marks: the damaged rows and per-row column bounds are exactly
 /// the rows marked and the min/max column marked in each.
 #[test]

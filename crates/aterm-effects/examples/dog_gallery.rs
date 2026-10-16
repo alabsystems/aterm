@@ -1,13 +1,13 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `dog_gallery` — dog-roster contact sheets for human / visual-LLM QA, the
-//! breed twin of `kitty_gallery`. Bakes every authored breed through the REAL
-//! bake path ([`aterm_effects::dog_baker::bake_breed`]) on a light and a dark
-//! ground, at reference and terminal-small art heights, plus one coat sweep.
+//! `dog_gallery` — dog-roster contact sheets for visual QA, the breed twin of
+//! `kitty_gallery`. Bakes every breed through the real bake path
+//! ([`aterm_effects::dog_baker::bake_breed`]) on a light and a dark ground, at
+//! reference and terminal-small art heights, plus one coat sweep.
 //!
 //! ```text
-//! cargo run -q -p aterm-effects --example dog_gallery -- [out_dir]
+//! targo --unverified run -q -p aterm-effects --example dog_gallery -- [out_dir]
 //! (default out_dir: target/dog_gallery)
 //! ```
 

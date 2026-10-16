@@ -1,0 +1,984 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+use super::*;
+
+/// A due read is already in flight when the owner switches Codex off. Its
+/// answer cannot start an upgrade or become a step the loop applies; Claude's
+/// worker continues under the same policy. Channels order the edit and answer.
+#[test]
+fn switching_one_agent_off_fences_an_inflight_idle_read() {
+    switch_off_during_idle(false);
+}
+
+/// An upgrade already begun may finish its request, but its late answer must
+/// not update the loop, schedule another step, or regain ownership after off.
+#[test]
+fn switching_one_agent_off_discards_an_inflight_upgrade_result() {
+    switch_off_during_idle(true);
+}
+
+fn release_after_edit(release: &(Mutex<bool>, Condvar), entered: &std::sync::mpsc::Sender<()>) {
+    entered.send(()).unwrap();
+    let (lock, wake) = release;
+    let (open, timeout) = wake
+        .wait_timeout_while(lock.lock().unwrap(), Duration::from_secs(60), |open| !*open)
+        .unwrap();
+    assert!(
+        *open && !timeout.timed_out(),
+        "the test releases the in-flight operation"
+    );
+}
+
+fn switch_off_during_idle(in_step: bool) {
+    let world = Arc::new(World::default());
+    world.set(&[("codex", Program::Codex), ("claude", Program::Claude)]);
+    let reading = Arc::new(AtomicBool::new(false));
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let advance = Arc::new(AtomicBool::new(false));
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (claude_tx, claude_rx) = std::sync::mpsc::channel();
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let steps = Arc::new(Mutex::new(Vec::new()));
+    let body: Arc<BodyFn> = {
+        let reading = Arc::clone(&reading);
+        let advance = Arc::clone(&advance);
+        Arc::new(move |job| {
+            let me = std::thread::current();
+            let parked = me.clone();
+            *job.interrupt.lock().unwrap() = Some(Box::new(move || parked.unpark()));
+            if job.agent == Program::Codex {
+                reading.store(true, Ordering::SeqCst);
+            } else {
+                claude_tx.send(me).unwrap();
+                while !advance.load(Ordering::SeqCst) && !job.stop.load(Ordering::SeqCst) {
+                    std::thread::park();
+                }
+            }
+            let answer = job.opts.idle_host.as_ref().unwrap().at_idle();
+            result_tx.send((job.sid.clone(), answer.is_some())).unwrap();
+            while !job.stop.load(Ordering::SeqCst) {
+                std::thread::park();
+            }
+            BodyEnd::Stopped
+        })
+    };
+    let mut h = hooks(&world, body);
+    h.acts.due = {
+        let release = Arc::clone(&release);
+        let entered = entered_tx.clone();
+        Arc::new(move |sid| {
+            if sid == "codex" {
+                if !reading.load(Ordering::SeqCst) {
+                    return Due::No;
+                }
+                if !in_step {
+                    release_after_edit(&release, &entered);
+                }
+            }
+            Due::Yes
+        })
+    };
+    h.acts.step = {
+        let steps = Arc::clone(&steps);
+        let release = Arc::clone(&release);
+        Arc::new(move |sid, _| {
+            steps.lock().unwrap().push(sid.to_string());
+            if sid == "codex" && in_step {
+                release_after_edit(&release, &entered_tx);
+            }
+            "wait:point".to_string()
+        })
+    };
+    let host = HostHandle::start(on(), false, false, h);
+    entered_rx.recv_timeout(Duration::from_secs(60)).unwrap();
+    let claude = claude_rx.recv_timeout(Duration::from_secs(60)).unwrap();
+    let mut cfg = on();
+    cfg.set("codex.enabled", "false").unwrap();
+    host.set_config(cfg);
+    let stops: Vec<_> = host
+        .shared
+        .lock()
+        .stops
+        .iter()
+        .map(|s| (s.agent, s.stop.load(Ordering::SeqCst)))
+        .collect();
+    advance.store(true, Ordering::SeqCst);
+    claude.unpark();
+    {
+        let (lock, wake) = &*release;
+        *lock.lock().unwrap() = true;
+        wake.notify_all();
+    }
+    let results: HashMap<_, _> = (0..2)
+        .map(|_| result_rx.recv_timeout(Duration::from_secs(60)).unwrap())
+        .collect();
+    host.shutdown_and_join();
+    assert!(
+        stops.contains(&(Program::Codex, true)),
+        "off synchronously stops Codex"
+    );
+    assert!(
+        stops.contains(&(Program::Claude, false)),
+        "Claude's existing worker keeps running"
+    );
+    let steps = steps.lock().unwrap();
+    assert_eq!(
+        steps.iter().filter(|s| *s == "codex").count(),
+        usize::from(in_step),
+        "a late read starts no upgrade; an already-started request runs once"
+    );
+    assert_eq!(
+        steps.iter().filter(|s| *s == "claude").count(),
+        1,
+        "the other agent can still take its next idle step"
+    );
+    assert_eq!(
+        results.get("codex"),
+        Some(&false),
+        "Codex's late result is discarded"
+    );
+    assert_eq!(
+        results.get("claude"),
+        Some(&true),
+        "Claude still applies its step"
+    );
+}
+
+/// Even the harness's own restart is no permission to relaunch after the
+/// agent was switched off while the exit's status read waited. Turning it
+/// back on admits fresh work; it cannot revive the stopped worker's claim.
+#[test]
+fn switching_off_revokes_a_restart_exit_read_already_inflight() {
+    for commit in [false, true] {
+        revoke_exit_read(commit);
+    }
+}
+
+fn revoke_exit_read(commit: bool) {
+    let a = Arc::new(Acting::default());
+    a.open.lock().unwrap().insert("exit".to_string());
+    a.set(&[("exit", Program::Claude)]);
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let carries = Arc::new(AtomicUsize::new(0));
+    let mut h = a.hooks();
+    h.acts.restarted = Arc::new(|_, _, _| true);
+    h.acts.status = {
+        let release = Arc::clone(&release);
+        Arc::new(move |_| {
+            release_after_edit(&release, &entered_tx);
+            Some("OK hold=0 hand=- human_ms=- supervisor=-".to_string())
+        })
+    };
+    h.acts.carry = {
+        let carries = Arc::clone(&carries);
+        Arc::new(move |_, _, _, _| {
+            carries.fetch_add(1, Ordering::SeqCst);
+            "done".to_string()
+        })
+    };
+    let host = HostHandle::start(on(), false, false, h);
+    a.attached(&host, "exit");
+    a.set(&[]);
+    entered_rx.recv_timeout(Duration::from_secs(60)).unwrap();
+    if commit {
+        host.suspend();
+    }
+    let mut off = on();
+    off.set("claude.enabled", "false").unwrap();
+    host.set_config(off);
+    host.set_config(on());
+    if commit {
+        host.resume();
+    }
+    {
+        let (lock, wake) = &*release;
+        *lock.lock().unwrap() = true;
+        wake.notify_all();
+    }
+    until("the revoked exit worker is reaped", || {
+        host.live().is_empty()
+    });
+    host.shutdown_and_join();
+    assert_eq!(
+        carries.load(Ordering::SeqCst),
+        0,
+        "no restart override after revocation"
+    );
+    assert!(a.relaunched.lock().unwrap().is_empty());
+}
+
+/// A restored attempt is also a claim. Its account read may return after an
+/// off/on edit, but the removed queue entry can never type a relaunch line.
+#[test]
+fn switching_off_revokes_a_cold_relaunch_read_already_inflight() {
+    let world = Arc::new(World::default());
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let relaunched = Arc::new(AtomicUsize::new(0));
+    let mut h = hooks(&world, parking_body(&world));
+    h.acts.account_cold = {
+        let release = Arc::clone(&release);
+        Arc::new(move |_| {
+            release_after_edit(&release, &entered_tx);
+            None
+        })
+    };
+    h.acts.relaunch_restored = {
+        let relaunched = Arc::clone(&relaunched);
+        Arc::new(move |_, _, _| {
+            relaunched.fetch_add(1, Ordering::SeqCst);
+            "done".to_string()
+        })
+    };
+    let host = HostHandle::start(on(), false, false, h);
+    host.relaunch_restored(vec![restored("cold", "in tab 1")]);
+    entered_rx.recv_timeout(Duration::from_secs(60)).unwrap();
+    let mut off = on();
+    off.set("claude.enabled", "false").unwrap();
+    host.set_config(off);
+    host.set_config(on());
+    {
+        let (lock, wake) = &*release;
+        *lock.lock().unwrap() = true;
+        wake.notify_all();
+    }
+    until("the revoked restored queue is finished", || {
+        host.restored_worker_ended()
+    });
+    host.shutdown_and_join();
+    assert_eq!(
+        relaunched.load(Ordering::SeqCst),
+        0,
+        "the revoked read starts no relaunch"
+    );
+}
+
+/// The worker life boundaries are driven directly so the host cannot reap
+/// between the handover, edit, and late body return. These are the real
+/// hand_over/set_config/stopped paths, with no timing-dependent absence check.
+#[test]
+fn an_off_on_edit_revokes_a_policy_handover_before_the_body_returns() {
+    for revoke in [false, true] {
+        let (host, job, workers, hooks) = revocation_fixture();
+        workers.0["revoked"].hand_over();
+        assert!(job.handover.load(Ordering::SeqCst));
+        if revoke {
+            off_and_on(&host);
+        }
+        stopped(&job, &hooks);
+        let exits = unwatched_exits(
+            &host.shared,
+            &Workers::default(),
+            &HashMap::new(),
+            &OffSessions::default(),
+            &hooks,
+        );
+        let handed_over = job.handover.load(Ordering::SeqCst);
+        end_exit_watches(&host.shared, EVERY_WATCH, |_| true);
+        host.shutdown_and_join();
+        assert_eq!(
+            exits.is_empty(),
+            revoke,
+            "only an ordinary handover leaves an exit claim"
+        );
+        assert_eq!(
+            handed_over, !revoke,
+            "revocation also lets the old loop clear its badges"
+        );
+    }
+}
+
+/// A relaunch request began before off and returns a live new snapshot after
+/// on. That old worker cannot create a fresh landing watch from its answer.
+#[test]
+fn an_off_on_edit_revokes_an_inflight_exit_attempt_result() {
+    let (host, job, _workers, mut hooks) = revocation_fixture();
+    job.left.hand();
+    with_kept(&job, |k| {
+        k.owed = Some(OwedRelaunch {
+            snap: snap("revoked"),
+            asked: None,
+        })
+    });
+    hooks.acts.snapshot = Arc::new(|sid| {
+        Some(Snapshot {
+            pid: 5151,
+            ..snap(sid)
+        })
+    });
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let released = Arc::clone(&release);
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let kept = Arc::clone(&job.kept);
+    let run = std::thread::spawn(move || {
+        relaunch_until(
+            &job,
+            &hooks,
+            Duration::ZERO,
+            &|| OnExit::Restarted,
+            true,
+            || {
+                release_after_edit(&released, &entered_tx);
+                "adopted".to_string()
+            },
+        );
+    });
+    entered_rx.recv_timeout(Duration::from_secs(60)).unwrap();
+    off_and_on(&host);
+    {
+        let (lock, wake) = &*release;
+        *lock.lock().unwrap() = true;
+        wake.notify_all();
+    }
+    run.join().unwrap();
+    let rearmed = with_kept_of(&kept, |k| {
+        k.unwatched.is_some()
+            || k.exit_watch
+                .as_ref()
+                .is_some_and(|watch| watch.hands.is_some())
+    });
+    end_exit_watches(&host.shared, EVERY_WATCH, |_| true);
+    host.shutdown_and_join();
+    assert!(
+        !rearmed,
+        "the late result cannot rearm the revoked exit claim"
+    );
+}
+
+/// A landing's watch can outlive its worker. Revocation must visit that kept
+/// claim too; there is no live StopHandle left to revoke for it.
+#[test]
+fn an_off_on_edit_revokes_an_orphaned_landing_claim() {
+    let (host, job, _workers, hooks) = revocation_fixture();
+    runs_again(&job, &hooks, true);
+    publish_workers(&mut host.shared.lock(), &Workers::default());
+    assert!(with_kept(&job, |k| k
+        .exit_watch
+        .as_ref()
+        .is_some_and(|w| w.hands.is_some())));
+    off_and_on(&host);
+    let rearmed = with_kept(&job, |k| {
+        k.unwatched.is_some()
+            || k.exit_watch
+                .as_ref()
+                .is_some_and(|watch| watch.hands.is_some())
+    });
+    end_exit_watches(&host.shared, EVERY_WATCH, |_| true);
+    host.shutdown_and_join();
+    assert!(
+        !rearmed,
+        "off revokes kept claims after their worker was reaped"
+    );
+}
+
+/// A removed restored attempt cannot reclaim its landing after the landing's
+/// snapshot read, begun before off, returns after on.
+#[test]
+fn an_off_on_edit_revokes_an_inflight_restored_landing_read() {
+    let world = Arc::new(World::default());
+    let mut hooks = hooks(&world, Arc::new(|_| BodyEnd::Stopped));
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let released = Arc::clone(&release);
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    hooks.acts.relaunch_restored = Arc::new(|_, _, _| "adopted".to_string());
+    hooks.acts.exited = Arc::new(|_, _| true);
+    hooks.acts.snapshot = Arc::new(move |sid| {
+        release_after_edit(&released, &entered_tx);
+        Some(Snapshot {
+            pid: 5151,
+            ..snap(sid)
+        })
+    });
+    let host = HostHandle::start(on(), false, true, hooks);
+    host.relaunch_restored(vec![restored("landing", "in tab 1")]);
+    entered_rx.recv_timeout(Duration::from_secs(60)).unwrap();
+    off_and_on(&host);
+    {
+        let (lock, wake) = &*release;
+        *lock.lock().unwrap() = true;
+        wake.notify_all();
+    }
+    until("the revoked restored landing read is finished", || {
+        host.restored_worker_ended()
+    });
+    let rearmed = host.shared.kept.lock().unwrap().values().any(|kept| {
+        with_kept_of(kept, |k| {
+            k.exit_watch.as_ref().is_some_and(|w| w.hands.is_some())
+        })
+    });
+    end_exit_watches(&host.shared, EVERY_WATCH, |_| true);
+    host.shutdown_and_join();
+    assert!(
+        !rearmed,
+        "a removed restored attempt cannot rearm from its late snapshot"
+    );
+}
+
+/// A successor can load a different policy from the outgoing process. Its
+/// handoff snapshot is not permission to watch an agent disabled at launch.
+#[test]
+fn a_handed_snapshot_cannot_admit_an_agent_disabled_at_startup() {
+    let world = Arc::new(World::default());
+    let mut hooks = hooks(&world, Arc::new(|_| BodyEnd::Stopped));
+    hooks.acts.exited = Arc::new(|_, _| true);
+    let mut off = on();
+    off.off.push(Program::Claude);
+    let host = HostHandle::start(off, false, true, hooks);
+    host.watch_handed(vec![("handed".to_string(), snap("handed"))]);
+    host.set_config(on());
+    let admitted = host.shared.kept.lock().unwrap().values().any(|kept| {
+        with_kept_of(kept, |k| {
+            k.unwatched.is_some() || k.exit_watch.as_ref().is_some_and(|w| w.hands.is_some())
+        })
+    });
+    end_exit_watches(&host.shared, EVERY_WATCH, |_| true);
+    host.shutdown_and_join();
+    assert!(
+        !admitted,
+        "a disabled handoff snapshot leaves no future exit claim"
+    );
+}
+
+/// CLAUDE CODE SWITCHED OFF TURNS THE ACCOUNTS OFF ([`Switches::set`]):
+/// its logins are what they are for ([`accounts_for`]), so neither the
+/// rotation nor the login lifecycle acts, and nothing of the accounts is
+/// read ([`Switches::accounts_live`]). NEGATIVE CONTROL: Codex switched off
+/// leaves both as they were.
+#[test]
+fn claude_code_switched_off_turns_the_accounts_off() {
+    let under = |cfg: &SupervisorConfig| {
+        let s = Switches::default();
+        s.set(cfg, false);
+        (s.accounts(), s.logins(), s.accounts_live())
+    };
+    let switched_off = |agent: Program| {
+        let mut cfg = on();
+        cfg.off.push(agent);
+        cfg
+    };
+    let full = under(&on());
+    assert!(
+        full.0 != accounts::Mode::Off && full.1 && full.2,
+        "{full:?}"
+    );
+    assert_eq!(
+        under(&switched_off(Program::Claude)),
+        (accounts::Mode::Off, false, false)
+    );
+    assert_eq!(under(&switched_off(Program::Codex)), full);
+}
+
+/// THE REOPENED LAYOUT'S ROW ASKS THE ADMISSION OF EACH AGENT IT CARRIED
+/// ([`HostHandle::relaunches_restored_of`]): with Codex switched off, a
+/// restored Claude Code is relaunched and a restored Codex is not, as the
+/// restored queue decides ([`restored_allowed`]). NEGATIVE CONTROLS: with
+/// both on, both are; with `[harness] relaunch = false`, neither is.
+#[test]
+fn the_reopened_row_asks_each_agents_admission() {
+    use aterm_agent::harness::upgrade::Agent;
+    let of = |cfg: SupervisorConfig| {
+        let world = Arc::new(World::default());
+        let host = HostHandle::start(cfg, false, true, hooks(&world, parking_body(&world)));
+        let told = [Agent::Claude, Agent::Codex].map(|agent| host.relaunches_restored_of(agent));
+        host.shutdown_and_join();
+        told
+    };
+    let mut codex_off = on();
+    codex_off.off.push(Program::Codex);
+    assert_eq!(of(codex_off), [true, false]);
+    assert_eq!(of(on()), [true, true]);
+    let mut limited = on();
+    limited.set("relaunch", "false").unwrap();
+    assert_eq!(of(limited), [false, false]);
+}
+
+/// AN AGENT SWITCHED OFF IN THE TAB ENDS THE EXIT LEFT TO THE HOST: a
+/// Claude Code's worker is ended by a Commit's stop with its agent's exit
+/// left to the host ([`Kept::unwatched`]), and the person starts a Codex,
+/// switched off, in that tab before the Commit fails. The Codex is in no
+/// pass's `wanted`, so the exit is handed ([`unwatched_exits`]) and read as
+/// a crash (the Claude Code's record survives: a Codex's start sweeps
+/// none), its relaunch waiting for the shell's prompt; the program-change
+/// stop ends that read ([`host_pass`]). When the Codex exits, nothing is
+/// relaunched into the tab the person moved on in: no worker, no mark.
+///
+/// FAILS WITHOUT THE FIX: that stop passed over a worker whose `stop` was
+/// set already, and the Claude Code was relaunched once the Codex exited
+/// (left `(1, false)`).
+///
+/// NEGATIVE CONTROL: the Claude Code gone and nothing started in the tab —
+/// the exit is read and relaunched once.
+#[test]
+fn an_agent_switched_off_in_the_tab_ends_the_exit_left_to_the_host() {
+    for codex in [true, false] {
+        let a = Arc::new(Acting::default());
+        a.only_claude_sweeps.store(true, Ordering::SeqCst);
+        a.open.lock().unwrap().insert("s-a".to_string());
+        a.set(&[("s-a", Program::Claude)]);
+        let mut h = a.hooks();
+        h.acts.relaunch_restored = Arc::new(|_, _, _| "refused:inert".to_string());
+        // The line types nothing while another program holds the tab, as the
+        // live one waits for its shell's prompt.
+        let (world, line) = (Arc::clone(&a), Arc::clone(&h.acts.relaunch));
+        h.acts.relaunch = Arc::new(move |sid, pid, snap, left, upgrade, asked| {
+            if world.agent_in(sid).is_some_and(|(now, _)| now != snap.pid) {
+                return "wait:shell-prompt".to_string();
+            }
+            line(sid, pid, snap, left, upgrade, asked)
+        });
+        let mut codex_off = on();
+        codex_off.off.push(Program::Codex);
+        let host = HostHandle::start(codex_off, false, false, h);
+        until("attached", || {
+            host.live() == ["s-a"] && a.runs.load(Ordering::SeqCst) == 1
+        });
+        let marked = || {
+            let kept = host.shared.kept.lock().unwrap().get("s-a").cloned();
+            kept.is_some_and(|k| k.lock().unwrap().unwatched.is_some())
+        };
+        let passes = |n: usize, what: &str, idle: bool| {
+            let from = a.passes.load(Ordering::SeqCst);
+            until(what, || {
+                ring();
+                a.passes.load(Ordering::SeqCst) >= from + n && (!idle || host.live().is_empty())
+            });
+        };
+        host.pause_restored();
+        host.suspend();
+        until("the Commit's stop left the exit to the host", || {
+            host.live().is_empty() && marked()
+        });
+        *a.holds.lock().unwrap() = Some(false);
+        if codex {
+            a.set(&[("s-a", Program::Codex)]);
+        } else {
+            a.set(&[]);
+        }
+        host.resume();
+        host.resume_restored();
+        host.relaunch_stranded(&|_| "in tab 1".to_string());
+        if codex {
+            // A whole pass after the exit's read, the Codex still named.
+            until("the exit read", || a.exit_looks.load(Ordering::SeqCst) > 0);
+            passes(2, "two passes with the Codex in front", false);
+            // The Codex exits.
+            a.set(&[]);
+            passes(2, "two passes after it exits, no worker left", true);
+            assert_eq!(
+                (a.relaunched.lock().unwrap().len(), marked()),
+                (0, false),
+                "(relaunched, marked)"
+            );
+        } else {
+            until("the exit relaunched, its worker ended", || {
+                !a.relaunched.lock().unwrap().is_empty() && host.live().is_empty()
+            });
+            assert_eq!(
+                (
+                    a.exit_looks.load(Ordering::SeqCst) > 0,
+                    a.relaunched.lock().unwrap().len()
+                ),
+                (true, 1),
+                "(an exit read, relaunched)"
+            );
+        }
+        host.shutdown_and_join();
+    }
+}
+
+fn off_and_on(host: &HostHandle) {
+    let cfg = host.shared.lock().cfg.clone();
+    let mut off = cfg.clone();
+    off.off.push(Program::Claude);
+    host.set_config(off);
+    host.set_config(cfg);
+}
+
+fn revocation_fixture() -> (HostHandle, WorkerJob, Workers, Hooks) {
+    let world = Arc::new(World::default());
+    let mut hooks = hooks(&world, Arc::new(|_| BodyEnd::Stopped));
+    hooks.acts.open = Arc::new(|_| true);
+    hooks.acts.exited = Arc::new(|_, _| true);
+    // No automatic host thread: each life boundary below is called by the
+    // test, under the same policy and stop handles as a real worker.
+    let host = HostHandle::start(on(), false, true, hooks.clone());
+    let mut worker = idle_worker();
+    worker.agent = Program::Claude;
+    let job = WorkerJob {
+        revoked: Arc::clone(&worker.revoked),
+        sid: "revoked".to_string(),
+        agent: Program::Claude,
+        opts: SuperviseOpts::hosted(),
+        stop: Arc::clone(&worker.stop),
+        interrupt: Arc::clone(&worker.interrupt),
+        handover: Arc::clone(&worker.handover),
+        clear_badge: false,
+        faults: Arc::default(),
+        park: Arc::clone(&worker.park),
+        look_at: Arc::clone(&worker.look_at),
+        left: Arc::clone(&worker.left),
+        left_at_commit: Arc::clone(&worker.left_at_commit),
+        acting: Arc::clone(&worker.acting),
+        switches: Arc::clone(&host.shared.switches),
+        kept: Arc::clone(&worker.kept),
+        note: Arc::clone(&worker.note),
+        group: Arc::clone(&worker.group),
+        host: Arc::downgrade(&host.shared),
+        watch_until: None,
+        beside: Arc::default(),
+    };
+    with_kept(&job, |k| k.snapshot = Some(snap("revoked")));
+    host.shared
+        .kept
+        .lock()
+        .unwrap()
+        .insert(job.sid.clone(), Arc::clone(&job.kept));
+    let workers = Workers(HashMap::from([(job.sid.clone(), worker)]));
+    publish_workers(&mut host.shared.lock(), &workers);
+    (host, job, workers, hooks)
+}
+
+/// AN AGENT ITS OWN SWITCH LEAVES UNSUPERVISED STILL RAN IN ITS TAB
+/// ([`note_agents_in_restored_tabs`]): a restored relaunch queued for a tab
+/// the roster names a Codex in, under Codex switched off, is marked
+/// overtaken ([`RestoredAttempt::agent_seen`]) as for an agent the host
+/// supervises — no worker is that Codex's, but a person started it there,
+/// and the relaunch typed once it exits would bring back a conversation
+/// that person moved on from. NEGATIVE CONTROL: with nothing named in the
+/// tab, the same passes mark nothing.
+#[test]
+fn an_agent_switched_off_overtakes_a_restored_relaunch_of_its_tab() {
+    for named in [true, false] {
+        let a = Arc::new(Acting::default());
+        a.open.lock().unwrap().insert("s-a".to_string());
+        let mut h = a.hooks();
+        h.acts.relaunch_restored = Arc::new(|_, _, _| "wait:shell-prompt".to_string());
+        let mut codex_off = on();
+        codex_off.off.push(Program::Codex);
+        let host = HostHandle::start(codex_off, false, false, h);
+        host.relaunch_restored(vec![restored("s-a", "in tab 1")]);
+        until("the relaunch between its steps, its retry put off", || {
+            let mut queue = host.shared.restored.lock().unwrap();
+            match queue.attempts.front_mut() {
+                Some(attempt) if !attempt.acting && attempt.tried >= 1 => {
+                    attempt.due = Instant::now() + Duration::from_secs(3600);
+                    true
+                }
+                _ => false,
+            }
+        });
+        if named {
+            a.set(&[("s-a", Program::Codex)]);
+        }
+        let passes = a.passes.load(Ordering::SeqCst);
+        until("two passes", || {
+            ring();
+            a.passes.load(Ordering::SeqCst) >= passes + 2
+        });
+        let seen = host
+            .shared
+            .restored
+            .lock()
+            .unwrap()
+            .attempts
+            .front()
+            .map(|attempt| attempt.agent_seen);
+        host.shutdown_and_join();
+        assert_eq!(seen, Some(named), "named: {named}");
+    }
+}
+
+/// AN AGENT ENDED WHILE ITS OWN SWITCH HOLDS IT OFF IS FORGOTTEN, as one
+/// ended under Off is ([`forget_left_while_switched_off`]): switching Claude
+/// Code off revokes its worker without handing it the exit, so no worker's
+/// exit path forgets what was read of it. Once the roster names no agent in
+/// the tab and its process holds the tab no more (the person's `/exit`, the
+/// shell back), the host forgets the kept snapshot and its publication —
+/// what the crash journal and the restart, logout and shutdown layouts put
+/// on the tab's leaf. FAILS WITHOUT THE FIX: the ended conversation stayed
+/// published, and the next launch with Claude Code switched on again resumed
+/// it. NEGATIVE CONTROLS: while the switched-off agent still runs in its
+/// tab, and while a pass cannot name it but it still holds the tab (a
+/// misread), both stand.
+#[test]
+fn an_agent_ended_while_switched_off_is_forgotten() {
+    const SID: &str = "s-ended-switched-off";
+    let a = Arc::new(Acting::default());
+    a.open.lock().unwrap().insert(SID.to_string());
+    a.set(&[(SID, Program::Claude)]);
+    let host = HostHandle::start(on(), false, false, a.hooks());
+    a.attached(&host, SID);
+    until("its snapshot published", || {
+        published_snapshot(SID).is_some()
+    });
+
+    let mut claude_off = on();
+    claude_off.off.push(Program::Claude);
+    host.set_config(claude_off);
+    until("its worker revoked", || host.live().is_empty());
+    let kept = Arc::clone(&host.shared.kept.lock().unwrap()[SID]);
+    a.passes();
+    // NEGATIVE CONTROL: its agent runs, switched off: what was read stands.
+    assert!(published_snapshot(SID).is_some(), "published while it runs");
+    assert!(
+        kept.lock().unwrap().snapshot.is_some(),
+        "kept while it runs"
+    );
+    // NEGATIVE CONTROL: a pass that cannot name it while it still holds its
+    // tab (a misread) forgets nothing.
+    *a.holds.lock().unwrap() = Some(true);
+    a.set(&[]);
+    a.passes();
+    assert!(
+        published_snapshot(SID).is_some(),
+        "a misread forgets nothing"
+    );
+
+    // The person ended it; the tab is at its shell.
+    *a.holds.lock().unwrap() = Some(false);
+    a.passes();
+    assert!(published_snapshot(SID).is_none(), "unpublished");
+    assert!(kept.lock().unwrap().snapshot.is_none(), "forgotten");
+
+    // Switched on again on the bare shell: nothing to relaunch.
+    host.set_config(on());
+    a.passes();
+    assert!(host.live().is_empty(), "no agent, no worker");
+    assert!(published_snapshot(SID).is_none(), "still unpublished");
+    assert!(
+        a.relaunched.lock().unwrap().is_empty(),
+        "not relaunched: {:?}",
+        a.relaunched.lock().unwrap()
+    );
+    host.shutdown_and_join();
+}
+
+/// THE HOST'S ADMISSION IS THE POLICY'S, AGENT BY AGENT
+/// ([`Admission::of`]): every agent the master switch admits but those their
+/// own tables switch off, built from the off list alone, so a new
+/// [`Program`] is admitted with no list of agents in the host. Every
+/// program is read ([`Program::ALL`]), each agent switched off alone, and
+/// every agent at once. NEGATIVE CONTROLS: the master switch off admits
+/// none, and switching one agent off leaves the others admitted.
+#[test]
+fn the_hosts_admission_is_the_policys_agent_by_agent() {
+    let agents: Vec<Program> = Program::ALL
+        .into_iter()
+        .filter(|p| p.supervisable())
+        .collect();
+    let mut every_off = on();
+    every_off.off = agents.clone();
+    let mut master_off = on();
+    master_off.enabled = false;
+    let alone = agents.iter().map(|agent| {
+        let mut cfg = on();
+        cfg.off.push(*agent);
+        cfg
+    });
+    let cfgs: Vec<_> = [on(), every_off, master_off]
+        .into_iter()
+        .chain(alone)
+        .collect();
+    for cfg in cfgs {
+        let admission = Admission::of(&cfg);
+        for agent in Program::ALL {
+            assert_eq!(
+                admission.admits(agent),
+                cfg.on_for(agent),
+                "{agent:?} under off={:?} enabled={}",
+                cfg.off,
+                cfg.enabled
+            );
+        }
+    }
+    assert_eq!(
+        Admission::default(),
+        Admission::of(&{
+            let mut off = on();
+            off.enabled = false;
+            off
+        })
+    );
+}
+
+/// AN AGENT THAT LEFT A TAB A SWITCHED-OFF AGENT NOW RUNS IN IS FORGOTTEN
+/// ([`forget_left_while_switched_off`]): with Codex switched off, a Claude
+/// Code's conversation stays kept and published after the person replaces it
+/// in its tab with a Codex — no worker of the Codex is admitted to follow it
+/// — so the restart and crash layouts would carry the Claude Code into a tab
+/// the person moved on in, resumed at the next launch. With its worker gone
+/// and nothing of it left to read, the pass forgets it. NEGATIVE CONTROLS:
+/// the same snapshot stands under a tab the roster names its own agent in,
+/// under an unnamed tab no process holds while its own agent is admitted
+/// (only another agent is switched off), while an exit of it is still left
+/// to the host to read, while a watch on its process has read no exit (it
+/// may live, suspended behind the agent in front) and while a watch read one
+/// it still hands.
+#[test]
+fn an_agent_that_left_for_a_switched_off_one_is_forgotten() {
+    const SID: &str = "s-left-for-codex";
+    // The host's state alone: its thread is ended first, so no pass of its
+    // own reads the kept map this test writes.
+    let host = HostHandle::for_supervised_test(Vec::new(), Arc::new(|_| BodyEnd::Stopped));
+    host.shutdown_and_join();
+    let a = Arc::new(Acting::default());
+    a.open.lock().unwrap().insert(SID.to_string());
+    let hooks = a.hooks();
+    let snapshot = snap(SID);
+    publish_snapshot_for_test(SID, Some(&snapshot));
+    let kept = Arc::new(Mutex::new(Kept {
+        snapshot: Some(snapshot),
+        ..Kept::default()
+    }));
+    host.shared
+        .kept
+        .lock()
+        .unwrap()
+        .insert(SID.to_string(), Arc::clone(&kept));
+    let named = |agent: Program| HashMap::from([(SID.to_string(), agent)]);
+    let forget = |named_off: &HashMap<String, Program>, off: Program| {
+        forget_left_while_switched_off(
+            &host.shared,
+            &Workers::default(),
+            &HashMap::new(),
+            named_off,
+            |agent| agent != off,
+            &hooks,
+        );
+    };
+    let standing = || kept.lock().unwrap().snapshot.is_some();
+
+    // NEGATIVE CONTROL: the roster names Claude Code's own switched-off self.
+    forget(&named(Program::Claude), Program::Claude);
+    assert!(standing(), "its own agent runs");
+    // NEGATIVE CONTROL: unnamed and not held, but only Codex is switched off:
+    // an admitted agent's exit is its worker's to read, never forgotten here.
+    *a.holds.lock().unwrap() = Some(false);
+    forget(&HashMap::new(), Program::Codex);
+    assert!(standing(), "Claude Code is admitted");
+    // NEGATIVE CONTROL: an exit of it still left to the host to read.
+    kept.lock().unwrap().unwatched = Some(Unwatched {
+        agent: Program::Claude,
+        group: 4242,
+    });
+    forget(&named(Program::Codex), Program::Codex);
+    assert!(standing(), "its exit is read first");
+    kept.lock().unwrap().unwatched = None;
+    let watch = |read: bool, hands: bool| ExitWatched {
+        pid: 4242,
+        start: "Sat Sep 27 01:02:03 2026".to_string(),
+        arming: 1,
+        hands: hands.then_some(Unwatched {
+            agent: Program::Claude,
+            group: 4242,
+        }),
+        read: read.then_some(ExitRecord::Unread),
+    };
+    // NEGATIVE CONTROL: a watch on its process that has read no exit.
+    kept.lock().unwrap().exit_watch = Some(watch(false, false));
+    forget(&named(Program::Codex), Program::Codex);
+    assert!(standing(), "its process may live");
+    // NEGATIVE CONTROL: a watch that read its exit and still hands it.
+    kept.lock().unwrap().exit_watch = Some(watch(true, true));
+    forget(&named(Program::Codex), Program::Codex);
+    assert!(standing(), "its exit is handed first");
+    // Its watch read the exit and hands nothing: the process is gone.
+    kept.lock().unwrap().exit_watch = Some(watch(true, false));
+
+    // A switched-off Codex runs where the Claude Code was.
+    forget(&named(Program::Codex), Program::Codex);
+    assert!(!standing(), "forgotten");
+    assert!(published_snapshot(SID).is_none(), "unpublished");
+}
+
+/// The process probe runs outside Kept. A new handoff watch on that same
+/// process is a new claim, even though its PID and start stamp did not move.
+#[test]
+fn a_same_process_handoff_watch_armed_during_forget_is_kept() {
+    forget_after_switch_edit(true);
+}
+
+/// The old pass's off decision cannot erase a snapshot after its agent is
+/// enabled again, even before a new worker or watch has taken it up.
+#[test]
+fn an_agent_enabled_during_forget_keeps_its_published_snapshot() {
+    forget_after_switch_edit(false);
+}
+
+fn forget_after_switch_edit(arm_watch: bool) {
+    for edit_during_probe in [false, true] {
+        let sid = format!("s-forget-late-{arm_watch}-{edit_during_probe}");
+        let world = Arc::new(World::default());
+        let hooks = hooks(&world, Arc::new(|_| BodyEnd::Stopped));
+        let mut off = on();
+        off.off.push(Program::Claude);
+        // No host loop races this fixture: only the actual public handoff
+        // writer below arms a watch. Suspended is the handoff's normal state.
+        let host = HostHandle::start(off, false, true, hooks.clone());
+        let snapshot = snap(&sid);
+        let kept = Arc::new(Mutex::new(Kept {
+            snapshot: Some(snapshot.clone()),
+            ..Kept::default()
+        }));
+        host.shared
+            .kept
+            .lock()
+            .unwrap()
+            .insert(sid.clone(), Arc::clone(&kept));
+        publish_snapshot_for_test(&sid, Some(&snapshot));
+        let mut probing = hooks;
+        let writer = host.clone();
+        let handed = snapshot.clone();
+        let watched = Arc::clone(&kept);
+        probing.acts.holds = Arc::new(move |sid, _| {
+            if edit_during_probe {
+                writer.set_config(on());
+                if arm_watch {
+                    writer.watch_handed(vec![(sid.to_string(), handed.clone())]);
+                    assert!(
+                        watched
+                            .lock()
+                            .unwrap()
+                            .exit_watch
+                            .as_ref()
+                            .is_some_and(|watch| watch.names(&handed)),
+                        "the real handoff writer armed the same process"
+                    );
+                }
+            }
+            Some(false)
+        });
+        forget_left_while_switched_off(
+            &host.shared,
+            &Workers::default(),
+            &HashMap::new(),
+            &HashMap::new(),
+            |agent| host.admits(agent),
+            &probing,
+        );
+        let (snapshot_kept, watch_kept) = {
+            let kept = kept.lock().unwrap();
+            (
+                kept.snapshot.is_some(),
+                kept.exit_watch
+                    .as_ref()
+                    .is_some_and(|watch| watch.names(&snapshot)),
+            )
+        };
+        let published = published_snapshot(&sid).is_some();
+        // Disarm the owned watch before any assertion can fail.
+        host.shutdown_and_join();
+        publish_snapshot_for_test(&sid, None);
+        assert_eq!(
+            (snapshot_kept, watch_kept, published),
+            (
+                edit_during_probe,
+                edit_during_probe && arm_watch,
+                edit_during_probe,
+            ),
+            "edit={edit_during_probe} handoff_watch={arm_watch}; the control with no edit must forget"
+        );
+    }
+}

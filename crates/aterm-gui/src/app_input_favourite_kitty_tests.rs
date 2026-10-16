@@ -22,7 +22,7 @@ fn favourite_promotes_the_launch_kitty() {
     );
     let now = std::time::Instant::now();
 
-    // Collect something ELSE first: a discovery must not become the pin
+    // Collect something else first: a discovery must not become the pin
     // and must not be what the favourite promotes.
     let other = KittyLook {
         variant: aterm_effects::cat_glyphs_gen::CatGlyphId::SpecWitch,
@@ -97,21 +97,14 @@ fn favourite_promotes_the_launch_kitty() {
     assert_eq!(frame.look, look, "and the hello wears the promoted cat");
 }
 
-/// A menu arm that declines must say so, because `invoke` answers for it:
-/// `dispatch_menu_action` returns `()`, but `invoke <Action>` over the
-/// control socket reaches the same arms and would otherwise answer
-/// `OK invoked <Action>` for a no-op.
-///
-/// This pins the half a headless test can reach: the refusal exists as a
-/// value where the arm reads it. The arms hand it to
-/// `pending_action_refusal`, which `invoke_menu_action_by_name` returns as
-/// its `Err`.
+/// A declining cat action leaves its refusal in `pending_action_refusal`, which
+/// `invoke_reply` turns into `Err` so `invoke` never answers `OK` for a no-op.
 #[test]
 fn a_declining_cat_action_produces_a_refusal_rather_than_silence() {
     let wid = WindowId(0);
     let now = std::time::Instant::now();
 
-    // FELINE OFF: cats do not exist, so both actions must refuse in WORDS.
+    // Feline off: cats do not exist, so both actions refuse in words.
     let mut app = App::headless_for_test();
     app.config.sparkle_words = Some(crate::app_config::SparkleWordsConfig {
         feline: Some(crate::app_config::SparkleFelineConfig {
@@ -128,9 +121,8 @@ fn a_declining_cat_action_produces_a_refusal_rather_than_silence() {
         .favourite_kitty_checked(wid, now)
         .expect_err("feline off must refuse, not silently do nothing");
     assert!(pinned.contains("feline"), "{pinned:?}");
-    // The walk refuses too. Its message names the empty collection rather
-    // than the family, because it checks what there is to walk to first;
-    // either way it is a refusal in words, not a silent OK.
+    // The walk refuses too (its message names the empty collection, which it
+    // checks first).
     let worn = app
         .wear_next_kitty(wid, now)
         .expect_err("and so must the walk");
@@ -146,7 +138,7 @@ fn a_declining_cat_action_produces_a_refusal_rather_than_silence() {
     assert!(empty.contains("collected"), "{empty:?}");
 
     // The channel starts clean, so a refusal can never be reported against
-    // a LATER invocation than the one that raised it.
+    // a later invocation than the one that raised it.
     assert!(app.pending_action_refusal.is_none());
 }
 
@@ -193,12 +185,8 @@ fn an_invoke_that_asks_first_answers_ok_pending_and_a_second_is_refused() {
     );
 }
 
-/// Menu arms that decline report why, and `invoke_menu_action_by_name`
-/// turns that into an `Err` rather than an `OK` a driver would read as
-/// "the action happened".
-///
-/// Each refusal is paired with the state in which the arm must act, since
-/// a function that always refuses would satisfy a refusal check trivially.
+/// Window and search arms that decline refuse in words. Each refusal is paired
+/// with the state in which the arm must act, so an always-refusing arm fails.
 #[test]
 fn a_declining_window_or_search_action_refuses_in_words() {
     let mut app = App::headless_for_test();
@@ -238,11 +226,9 @@ fn a_declining_window_or_search_action_refuses_in_words() {
         .expect("a remembered query resumes, it does not refuse");
 }
 
-/// Wearing a cat by name makes the switch the pin path cannot:
-/// `favourite_kitty_checked` promotes the cat that would ride anyway (the
-/// tenured program cat, else the launch kitty), never a third one. Pin the
-/// program cat so the collection holds two rows, then wear the other by key
-/// and watch the verdict move to it, with the `on_collect` hello.
+/// Wearing a cat by name makes the switch the pin path cannot (the pin promotes
+/// the cat that would ride anyway, never a third): with two cats collected,
+/// wearing the other by key moves the verdict to it, with the `on_collect` hello.
 #[test]
 fn wearing_a_collected_cat_by_name_switches_the_companion() {
     use aterm_effects::companion_look::{AppIdentity, TENURE};
@@ -367,7 +353,7 @@ fn next_kitty_walks_the_collection_and_comes_back_round() {
         "an empty collection has no next"
     );
 
-    // Collect two cats with DIFFERENT heads (the roster is keyed by head).
+    // Collect two cats with different heads (the roster is keyed by head).
     app.launch_kitty = KittyLook::for_app("python");
     let a = app.promotable_kitty(wid);
     app.favourite_kitty_checked(wid, t0)
@@ -544,12 +530,9 @@ fn favourite_respects_the_sparkle_master_and_feline_gates() {
 }
 
 /// Real OSC 133/633 bytes walk the pane through prompt → `claude` running →
-/// prompt again. The base cat is the launch kitty; the claude cat arrives
-/// only after `TENURE` and lingers after claude exits, the base cat
-/// returning only after `RELEASE`; at every step the capture splice dresses
-/// exactly what `App::companion_verdict` says (glass and capture resolve
-/// through one seam). A favourite pin outranks all of it
-/// (owner, 2026-08-17).
+/// prompt again. The claude cat arrives after `TENURE` and lingers after claude
+/// exits until `RELEASE`; at every step the capture splice dresses exactly what
+/// `App::companion_verdict` says. A favourite pin outranks all of it.
 #[test]
 fn program_cats_arrive_by_tenure_linger_and_the_capture_seam_agrees() {
     use aterm_effects::companion_look::{RELEASE, TENURE};
@@ -615,7 +598,7 @@ fn program_cats_arrive_by_tenure_linger_and_the_capture_seam_agrees() {
         "…and the capture seam agrees"
     );
 
-    // claude exits, back at the prompt: the claude cat LINGERS.
+    // claude exits, back at the prompt: the claude cat lingers.
     let t3 = t2 + std::time::Duration::from_secs(60);
     {
         let mut t = crate::term_lock(&term);
@@ -645,7 +628,7 @@ fn program_cats_arrive_by_tenure_linger_and_the_capture_seam_agrees() {
         claude,
         "home: still lingering"
     );
-    // Settled at the prompt for RELEASE: the base cat returns.
+    // Settled at the prompt for `RELEASE`: the base cat returns.
     let t6 = t5 + RELEASE;
     assert_eq!(
         app.companion_verdict(wid, session, t6),

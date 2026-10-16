@@ -23,6 +23,63 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 use crate::input::{self, InputEvent, InputOutcome, ScrollIntent, Source};
 use crate::{App, FONT_ZOOM_STEP, Wake, WindowId, keybinding, keymap, menu, pane, term_lock};
 
+#[cfg(clean_islands)]
+macro_rules! trust_island {
+    ($($item:item)*) => {
+        $($item)*
+    };
+}
+
+#[cfg(not(clean_islands))]
+macro_rules! trust_island {
+    ($($tt:tt)*) => {};
+}
+
+trust_island! {
+    clean {
+        namespace InputPressLockDiscipline
+
+        -- Model of OutputEchoWrite::finish publishing (key_at, sent_at) in one
+        -- atomic hold vs two separate holds (publish then publish_delivery).
+        structure EchoSlot where
+          seq : Nat
+          hasKeyAt : Bool
+          hasSentAt : Bool
+
+        def publishCoalesced (seq : Nat) (drained : Bool) : EchoSlot :=
+          EchoSlot.mk seq true drained
+
+        def publishSplitStep1 (seq : Nat) : EchoSlot :=
+          EchoSlot.mk seq true false
+
+        def publishSplitStep2 (slot : EchoSlot) (drained : Bool) : EchoSlot :=
+          EchoSlot.mk slot.seq slot.hasKeyAt drained
+
+        -- Coalesced publish never exposes an intermediate state where hasKeyAt is
+        -- true but hasSentAt is false for an already-drained direct write.
+        theorem coalesced_direct_write_immediately_has_sent_at (seq : Nat) :
+            (publishCoalesced seq true).hasSentAt = true := rfl
+
+        -- Negative control: split publish exposes hasSentAt = false between Hold 1
+        -- and Hold 2 even when the write drained directly to the kernel.
+        theorem split_direct_write_exposes_missing_sent_at_between_holds (seq : Nat) :
+            (publishSplitStep1 seq).hasSentAt = false := rfl
+
+        -- Model of PTY reader batch cap selection (8 KiB interactive vs 64 KiB bulk)
+        -- when note_window_input (inputPending) runs before vs after term_lock_ui.
+        def ptyBatchCap (inputPending : Bool) : Nat :=
+          if inputPending = true then 8192 else 65536
+
+        theorem pre_lock_input_pending_caps_pty_slice_at_8k :
+            ptyBatchCap true = 8192 := rfl
+
+        theorem post_lock_unmarked_input_leaves_pty_slice_at_64k :
+            ptyBatchCap false = 65536 := rfl
+
+        end InputPressLockDiscipline
+    }
+}
+
 /// The wheel reducer's one clock read ([`App::scroll_wheel_animated_with`]).
 /// Production reads the wall clock; a test may pin it ([`pin_wheel_clock`]) so two
 /// deltas land on one synthetic timeline, since a tracked band starts settling
@@ -342,38 +399,6 @@ impl OutputEchoTracker {
         self.begin(OutputEchoInput::of(ev))
     }
 
-    /// Publishes one ticketed delivery, from the writer thread after `publish`
-    /// returns, taking the `published` lock a second time. Not atomic with it: a
-    /// `sample()` or `deliveries_after` in between sees the acceptance a frame
-    /// before its receipt, which the engine's late-receipt path (`PendingHop`)
-    /// covers. The receipt's instant is the sink's acceptance when the spill is
-    /// drained, else pending until the reader sees it drain.
-    ///
-    /// Writer threads only, so the spill is probed with the parking predicate: a
-    /// contended mutex is not bytes in the spill, and a receipt wrongly held would
-    /// resolve at an unrelated later redraw and arm a licence long after its echo.
-    /// Spill holds are microseconds, so this never waits behind the kernel. Probed
-    /// before `published` so the prelude's blocking read is never behind it.
-    fn publish_delivery(&self, ticket: DeliveryTicket, stamp: u64, sink: &SinkWriter) {
-        let drained = sink.egress_drained_to_kernel();
-        let mut published = self
-            .published
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        published.delivery_serial += 1;
-        if drained {
-            published.settle_held_receipts(stamp);
-        }
-        let receipt = DeliveryReceipt {
-            serial: published.delivery_serial,
-            delivered_us: if drained { stamp } else { 0 },
-            ticket,
-        };
-        let head = published.delivery_head;
-        published.deliveries[head] = Some(receipt);
-        published.delivery_head = (head + 1) % DELIVERY_RING;
-    }
-
     /// The render prelude's read: every delivery newer than `after`, oldest first,
     /// placed on the frame's clock ([`stamp_on_frame_clock`]). A receipt still in the
     /// spill is resolved once the sink reports the spill drained
@@ -512,48 +537,69 @@ impl OutputEchoTracker {
         }
     }
 
-    /// Publish one state-affecting acceptance in sink order. A writer may be
-    /// descheduled after the sink accepts its bytes and before it reaches this
-    /// method; the opaque sink token makes a late older completion a no-op.
+    /// Publish one state-affecting acceptance in sink order, along with its
+    /// optional delivery ticket under the same `published` lock hold. A writer
+    /// may be descheduled after the sink accepts its bytes and before it reaches
+    /// this method; the opaque sink token makes a late older completion a no-op.
     fn publish(
         &self,
         order: AcceptedOrder,
         kind: OutputEchoInput,
         stamp: u64,
         direct: bool,
+        ticket: Option<DeliveryTicket>,
         sink: &SinkWriter,
     ) {
+        let delivery_drained = ticket
+            .is_some()
+            .then(|| direct || sink.egress_drained_to_kernel());
         let mut published = self
             .published
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        if published.order.is_some_and(|current| current >= order) {
-            return;
-        }
-        published.order = Some(order);
-        match kind {
-            OutputEchoInput::Echoable => {
+        if !published.order.is_some_and(|current| current >= order) {
+            published.order = Some(order);
+            match kind {
+                OutputEchoInput::Echoable => {
+                    published.last_accepted_us = stamp;
+                    published.spill_debt = Some(true);
+                }
+                OutputEchoInput::TurnBoundary => {
+                    // Bare Enter submits a turn. Its response is authored output,
+                    // not editor echo, so it clears the direct shadow. The false
+                    // debt stays hot only while accepted bytes remain spilled.
+                    published.last_boundary_us = stamp;
+                    published.last_accepted_us = 0;
+                    published.spill_debt = Some(false);
+                }
+                OutputEchoInput::Ignored => unreachable!("ignored input has no echo publication"),
+            }
+            // A frame that went WHOLE to the kernel on the direct lane needs no
+            // spill-mutex probe to know it is drained: the sink's receipt says so.
+            // Only a spilled/split/legacy frame asks (non-parking `try_lock`).
+            if published.spill_debt.is_some()
+                && (direct
+                    || delivery_drained == Some(true)
+                    || sink.try_egress_drained_to_kernel() == Some(true))
+                && published.spill_debt.take() == Some(true)
+            {
                 published.last_accepted_us = stamp;
-                published.spill_debt = Some(true);
             }
-            OutputEchoInput::TurnBoundary => {
-                // Bare Enter submits a turn. Its response is authored output,
-                // not editor echo, so it clears the direct shadow. The false
-                // debt stays hot only while accepted bytes remain spilled.
-                published.last_boundary_us = stamp;
-                published.last_accepted_us = 0;
-                published.spill_debt = Some(false);
-            }
-            OutputEchoInput::Ignored => unreachable!("ignored input has no echo publication"),
         }
-        // A frame that went WHOLE to the kernel on the direct lane needs no
-        // spill-mutex probe to know it is drained: the sink's receipt says so.
-        // Only a spilled/split/legacy frame asks (non-parking `try_lock`).
-        if published.spill_debt.is_some()
-            && (direct || sink.try_egress_drained_to_kernel() == Some(true))
-            && published.spill_debt.take() == Some(true)
-        {
-            published.last_accepted_us = stamp;
+        if let Some(ticket) = ticket {
+            let drained = delivery_drained.unwrap_or(false);
+            published.delivery_serial += 1;
+            if drained {
+                published.settle_held_receipts(stamp);
+            }
+            let receipt = DeliveryReceipt {
+                serial: published.delivery_serial,
+                delivered_us: if drained { stamp } else { 0 },
+                ticket,
+            };
+            let head = published.delivery_head;
+            published.deliveries[head] = Some(receipt);
+            published.delivery_head = (head + 1) % DELIVERY_RING;
         }
     }
 }
@@ -567,13 +613,12 @@ impl OutputEchoWrite<'_> {
             && let Some(order) = receipt.accepted_order()
         {
             let stamp = crate::metrics::now_us().max(1);
+            // The delivery edge rides the same `published` lock hold as the
+            // acceptance publication: a zero-byte or failed write publishes
+            // no receipt, so a swallowed queued key stays revoked.
+            let ticket = self.ticket.take();
             self.tracker
-                .publish(order, self.kind, stamp, receipt.is_direct(), sink);
-            // The delivery edge: the bytes are on the wire. A zero-byte or failed
-            // write publishes no receipt, so a swallowed queued key stays revoked.
-            if let Some(ticket) = self.ticket.take() {
-                self.tracker.publish_delivery(ticket, stamp, sink);
-            }
+                .publish(order, self.kind, stamp, receipt.is_direct(), ticket, sink);
         }
         self.release();
     }
@@ -1046,6 +1091,7 @@ const fn native_binding_allowed(action: keybinding::Action) -> bool {
             | Action::ToggleMatrixRain
             | Action::ToggleSeriousMode
             | Action::OpenPalette
+            | Action::ChooseTheme
             | Action::ToggleFullscreen
     )
 }
@@ -1063,6 +1109,8 @@ const _: () = {
     assert!(native_binding_allowed(Action::Find));
     assert!(native_binding_allowed(Action::ScrollPageDown));
     assert!(native_binding_allowed(Action::ToggleSettings));
+    // Choosing a theme owes the terminal nothing either.
+    assert!(native_binding_allowed(Action::ChooseTheme));
     // F11 is a WINDOW command — it owes the terminal nothing, so it keeps
     // working over a Settings or markdown tab.
     assert!(native_binding_allowed(Action::ToggleFullscreen));
@@ -2523,7 +2571,8 @@ struct PressClass<'ev> {
     /// text, so the prompt that returns is empty. At a prompt they are ignored and
     /// every shell keeps the half-typed line, so a reset there could let `sit␣` fire
     /// inside `sotsit `. The listener therefore resets on these only when its line
-    /// is empty, and treats them as a break otherwise.
+    /// is provably empty (unpoisoned, nothing counted), and treats them as a break
+    /// otherwise.
     job_chord: bool,
     /// ⌃L (Ctrl alone): the screen clear, which prompts and line editors answer by
     /// redrawing the line intact. The listener ignores it, so a clear right before a
@@ -2819,6 +2868,15 @@ fn classify_press(ev: &InputEvent) -> PressClass<'_> {
                 }
                 TKey::Named(TNamed::Space) => Some((Some(' '), false)),
                 TKey::Named(TNamed::Backspace) => Some((None, true)),
+                _ => None,
+            }
+        }
+        InputEvent::Text(s) => {
+            let mut chars = s.chars();
+            match (chars.next(), chars.next()) {
+                (Some(c), None) if !c.is_control() && aterm_grapheme::char_width(c) == 1 => {
+                    Some((Some(c), false))
+                }
                 _ => None,
             }
         }
@@ -3235,14 +3293,23 @@ impl PressKind {
 /// A person's hands were on `ctx`'s session (typing, pasting, clicking, dragging,
 /// scrolling, composing): stamps its person clock
 /// ([`crate::human_input::HumanInputStamp`], `human_ms=`) and records the `human`
-/// timeline event (`EVENT <local> human`) when this opens a burst. One atomic swap
-/// per event; the timeline's leaf lock is taken once per burst.
+/// timeline event (`EVENT <local> human`) and the session log's `mark - human`
+/// when this opens a burst. One atomic swap per event; the timeline's leaf lock
+/// is taken once per burst.
+///
+/// Between bursts the session log's turn tracker still hears of every input, for
+/// the `by=human` of a turn opening within 5 s of it, through a `try_lock`: an
+/// input never waits on the timeline, and one that finds it held is attributed
+/// by the next (a person's Enter follows the keys before it).
 pub(crate) fn note_person(ctx: &crate::SessionCtx) {
     if ctx.human_input.note(crate::metrics::now_us()) {
-        ctx.timeline
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .record("human", String::new());
+        let mut tl = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+        tl.record("human", String::new());
+        let at = tl.slog().now();
+        tl.slog_mut().human_input(true, at);
+    } else if let Ok(mut tl) = ctx.timeline.try_lock() {
+        let at = tl.slog().now();
+        tl.slog_mut().human_input(false, at);
     }
 }
 
@@ -3404,8 +3471,8 @@ impl TrickPress<'_> {
     /// The press ends the listener's line, judged or not: Enter (a submit, or a
     /// no-echo prompt's reset), controller bytes ending in a newline, an abort chord,
     /// ⌃U. What the host remembered about the line's fire is then stale. A job chord
-    /// on a line with text poisons rather than ends it and is counted too, since a
-    /// poisoned line has nothing left to confirm.
+    /// on a line not provably empty poisons rather than ends it and is counted too,
+    /// since a poisoned line has nothing left to confirm.
     fn line_ended(self) -> bool {
         self.enter_like || self.keyed_enter || self.line_abort || self.kills_line()
     }
@@ -3425,11 +3492,10 @@ impl TrickPress<'_> {
 ///                             the line that ran was never judged (`sit`
 ///                             typed, `send 'xyz\n'`: the shell got `sitxyz`)
 /// ⌃C, ⌃J, ⌃M, ⌃U              note_line_reset
-/// ⌃Z, ⌃\                      the line empty: note_line_reset (a program
-///                             went to the background; the prompt that comes
-///                             back is fresh) — text on it: note_break (at a
-///                             prompt every shell KEEPS the line; under a
-///                             program the tty flushed it: unknown either way)
+/// ⌃Z, ⌃\                      note_job_chord: a provably empty line stays
+///                             fresh, any other is a break (at a prompt every
+///                             shell KEEPS the line; under a program the tty
+///                             flushed it: unknown either way)
 /// ⌃W / ⌥⌫ / ⌃⌫                note_word_kill
 /// ⌃K, ⌥D, forward Delete      nothing: on an unpoisoned line the caret is
 ///                             at its end, so a forward kill removes nothing
@@ -3470,14 +3536,9 @@ fn feed_trick_listener<'w>(
         return listener.note_line_reset();
     }
     if press.job_chord {
-        // The count, not the poison, decides: a poisoned empty line (Esc inside the
-        // editor that just went to the background) ended with the program, and the
-        // prompt after it must not be deaf.
-        return if listener.line_chars() == 0 {
-            listener.note_line_reset()
-        } else {
-            listener.note_break()
-        };
+        // The price of never resetting a poisoned line: after Esc in an editor
+        // ⌃Z backgrounds, the prompt stays deaf until Enter, ⌃C or ⌃U.
+        return listener.note_job_chord();
     }
     if press.kill_key {
         return if press.kill_word && press.kill_moves {
@@ -3591,7 +3652,7 @@ fn note_refused_report(receipt: input::EgressReceipt) {
 
 /// A report the UI thread writes to a session outside [`App::input`] (the focus delta
 /// addressed by session id, [`App::write_focus_report`]; the DEC 2031 colour-scheme
-/// report, `App::apply_os_color_scheme`), by the one report route
+/// report, `App::install_colors`), by the one report route
 /// ([`paste_order::report_ordered_or_inline`]): behind whatever the ordered writer
 /// holds, always through it on Windows, otherwise inline through the non-parking
 /// egress. A refusal is counted silently ([`note_refused_report`]).
@@ -3961,12 +4022,16 @@ impl App {
         Ok(format!(
             "config_enabled={enabled} sound_key={sound} motion_animates={animate} \
              focused={raw_focused} fx_focused={fx_focused} serious_sound={serious} \
-             sounds_master={master} volume={volume} engine={engine} panes={panes} \
+             serious_visual={serious_visual} sounds_master={master} volume={volume} \
+             engine={engine} panes={panes} \
              active={active} intensity={intensity} tail={tail} max_streaks={max} \
              idle_secs={idle}",
             serious = self
                 .serious_mode_policy()
                 .allows(crate::motion::SeriousEffect::TerminalSound),
+            serious_visual = self
+                .serious_mode_policy()
+                .allows(crate::motion::SeriousEffect::OutputStreak),
             master = self.config.trail_sounds_or_default(),
             volume = self.config.trail_sound_volume(),
             intensity = self.config.output_streak_intensity_or_default(),
@@ -4373,11 +4438,12 @@ impl App {
         let Some(session) = self.pool.get(target_session) else {
             return InputOutcome::Ok;
         };
-        let (term, modes, sink, echo) = (
+        let (term, modes, sink, echo, ui_waiting) = (
             session.term.clone(),
             session.ctx.modes.clone(),
             session.ctx.sink.clone(),
             session.ctx.output_echo.clone(),
+            session.ctx.ui_waiting.clone(),
         );
         // The same custody gate the seam applies, through the same helper. A hidden
         // session is reached only by a held key whose press established ownership, so
@@ -4406,6 +4472,7 @@ impl App {
         // repeat rate. In exchange a background session's custody record is as real as
         // a front one's, including the three inert classes.
         let press_kind = PressKind::of(is_release, is_repeat, inert_modifier);
+        let site = crate::metrics::TermWaitSite::Press;
         if let InputEvent::Paste(text, _) = &ev {
             let bytes = text.len() as u64;
             let meter = aterm_messages::waits::paste_is_watched(bytes)
@@ -4421,7 +4488,9 @@ impl App {
                 meter.clone(),
             ) {
                 Ok(()) => {
-                    let _ = apply_press_custody(&mut term_lock(&term), press_kind);
+                    let mut terminal = crate::term_lock_ui(&term, &ui_waiting, site);
+                    let _ = apply_press_custody(&mut terminal, press_kind);
+                    drop(terminal);
                     if let Some(meter) = meter {
                         self.watch_paste(
                             target_session,
@@ -4440,7 +4509,7 @@ impl App {
             };
         }
         {
-            let mut terminal = term_lock(&term);
+            let mut terminal = crate::term_lock_ui(&term, &ui_waiting, site);
             let _ = apply_press_custody(&mut terminal, press_kind);
         }
         // A press refused by a full input queue reports `WriteFailed` here and
@@ -4969,8 +5038,8 @@ impl App {
                     );
                     // The synth policy the click carries, resolved on the App side and only
                     // when a click could sound. `click_audible` covered every mute term,
-                    // so the gain is the volume, as `trail_sound_gain` resolves for the
-                    // frame drain (a physical keypress satisfies its focus term).
+                    // so the gain is the volume, as `voice_gain` resolves for the frame
+                    // drain (a physical keypress satisfies its focus term).
                     let click_synth = click_audible.then(|| KeyClickSynth {
                         style: self.glow_style(),
                         // The trail-gesture voice, the same read the frame drain
@@ -4990,6 +5059,18 @@ impl App {
                             self.glow_style(),
                             crate::cursor_glow::GlowStyle::RainbowKitty
                         );
+                    // Keystroke-priority frame pacing and `input_pending()` signal:
+                    // stamped BEFORE acquiring `term_lock_ui` so a PTY reader currently
+                    // mid-batch observes `input_pending() == true` at its next slice
+                    // boundary (switching from 64 KiB to 8 KiB chunks) and so the
+                    // `metrics` input→present slice includes any `term_lock_ui` wait.
+                    let hardware_key = self.hw_key_dispatch;
+                    if !inert_modifier && let Some(ws) = self.windows.get_mut(&wid) {
+                        ws.input_hot = true;
+                        ws.input_hot_until = Some(input_now + INPUT_HOT_WINDOW);
+                        ws.last_key_at = Some(input_now);
+                        crate::metrics::note_window_input(&mut ws.pending_input, hardware_key);
+                    }
                     // One term-lock scope for every press-path terminal touch: the
                     // viewport snap, the typing-deselects clear, and the predictor's
                     // cursor/cols/alt sample, each of which would otherwise queue behind
@@ -5095,22 +5176,7 @@ impl App {
                     {
                         w.request_redraw();
                     }
-                    // Keystroke-priority frame pacing: the next output burst (likely this
-                    // key's echo) presents immediately instead of waiting out the
-                    // bulk-output cap (`Wake::Output`). State only, for both sources,
-                    // outside any term lock.
-                    // Whether this key came through the winit `KeyboardInput` arm (a
-                    // physical key or `ctl hwkey`'s real NSEvent): a metric attribution
-                    // for the strain engine, never a byte decision.
-                    let hardware_key = self.hw_key_dispatch;
                     if let Some(ws) = self.windows.get_mut(&wid) {
-                        // A bare modifier is not a keystroke: it must not admit the next
-                        // output frame at the half-interval floor, stamp the
-                        // input→present slice or heat the cadence. It reaches this arm
-                        // only under kitty report-all or from a controller verb.
-                        if !inert_modifier {
-                            ws.input_hot = true;
-                        }
                         // A newer press of a different class closes the older licence
                         // term (each class re-stamps its own licence below; raw input
                         // leaves both dark). A typed-glyph press keeps the banked typed
@@ -5150,29 +5216,6 @@ impl App {
                         } else {
                             ws.fx.cursor_mut().glow.clear_typed(input_now);
                             ws.fx.cursor_mut().trail.clear_typed();
-                        }
-                        // Echo-correlation deadline: clearing the bypass on the first
-                        // content present after the key would let a streaming session's
-                        // next frame spend it, pacing the real echo a full interval
-                        // later. Every key re-arms the deadline, so it covers the whole
-                        // typing burst, and it fails open after the window, so a key that
-                        // never echoes (a password prompt, a swallowed chord) cannot pin
-                        // it. Still half-interval paced (`WindowState::content_pace_floor`),
-                        // so presents stay bounded at 2x refresh.
-                        if !inert_modifier {
-                            ws.input_hot_until = Some(input_now + INPUT_HOT_WINDOW);
-                        }
-                        // The classifier's typing evidence: a plain stamp, not a pacing
-                        // deadline (`WindowState::last_key_at`). A bare modifier is not
-                        // typing: this stamp also arms the cursor-effect typed wake
-                        // (`cursor_fx_focus`), and the modifier opening a Cmd-Tab
-                        // switcher would otherwise re-arm effects on the window being
-                        // left.
-                        if !inert_modifier {
-                            ws.last_key_at = Some(input_now);
-                            // Per-window: only this window's content present may
-                            // close the key's input→present slice.
-                            crate::metrics::note_window_input(&mut ws.pending_input, hardware_key);
                         }
                         // Stamp the arrival for the `metrics` verb's input→present slice,
                         // the latency typing feels. The same stamp drives
@@ -5646,7 +5689,8 @@ impl App {
                     // while the app enabled Kitty `REPORT_EVENT_TYPES`, at key-up rates.
                     // `apply_press_custody` disturbs nothing for `Release`.
                     {
-                        let mut t = term_lock(&term);
+                        let site = crate::metrics::TermWaitSite::Press;
+                        let mut t = crate::term_lock_ui(&term, &ui_waiting, site);
                         let _ = apply_press_custody(&mut t, press_kind);
                     }
                 };
@@ -5978,14 +6022,18 @@ impl App {
                                     Some(TrickEvent::Fire {
                                         trick,
                                         word,
+                                        commands,
                                         back_chars,
                                         addressed,
                                     }) => {
                                         // Admission is decided here, once, and remembered
                                         // for a later confirmation or revoke (neither
-                                        // carries the word).
-                                        let admitted =
-                                            live && !self.config.kitty_trick_ignored(word);
+                                        // carries the word). The ignore list reads the
+                                        // word and its command: `坐下` holds back `猫咪坐下`.
+                                        let admitted = live
+                                            && !self
+                                                .config
+                                                .kitty_trick_ignored(word, commands.iter());
                                         ws.trick_fire = if admitted {
                                             TrickLineFire::Admitted { session, addressed }
                                         } else {
@@ -9224,12 +9272,10 @@ impl App {
             let lc = s.to_ascii_lowercase();
             match lc.as_str() {
                 "n" => {
-                    // Cmd-N opens a real in-process window. `on_key` has no
-                    // `ActiveEventLoop`, so post a `Wake::CreateWindow`; the
-                    // `user_event` arm runs the creation.
-                    if let Some(proxy) = self.proxy.as_ref() {
-                        let _ = proxy.send_event(Wake::CreateWindow);
-                    }
+                    // Cmd-N opens a real in-process window, booked in this turn
+                    // like Cmd-T's tab (`tab_spawn`), so the keys after it wait
+                    // for it.
+                    self.open_new_window();
                     return true;
                 }
                 "t" => {
@@ -10269,15 +10315,9 @@ impl App {
                     ws.pending_close = true;
                 }
             }
-            Action::NewWindow => {
-                // In-process, like the hardcoded Cmd-N and the menu (a new
-                // window lives in this process). dispatch_action has no
-                // `ActiveEventLoop`, so post Wake::CreateWindow; user_event runs
-                // create_window_internal.
-                if let Some(proxy) = self.proxy.as_ref() {
-                    let _ = proxy.send_event(Wake::CreateWindow);
-                }
-            }
+            // In-process, like the hardcoded Cmd-N and the menu (a new window
+            // lives in this process), booked in this turn as Cmd-N is.
+            Action::NewWindow => self.open_new_window(),
             Action::NextTab => self.cycle_tab(true),
             Action::PrevTab => self.cycle_tab(false),
             // 1-based as the user wrote it → 0-based index (Cmd-1..Cmd-9 parity).
@@ -10383,6 +10423,7 @@ impl App {
                 self.user_toggle_serious_mode();
             }
             Action::OpenPalette => self.toggle_palette(),
+            Action::ChooseTheme => self.open_theme_palette(),
             Action::ToggleViMode => self.toggle_vi_mode(wid),
             // Opens the inline pin editor over the ACTIVE tab of the window the
             // chord landed in — the keyboard face of the double-click.
@@ -11013,10 +11054,14 @@ impl App {
             MenuAction::Help => menu::open_help_url(),
             MenuAction::Quit => self.on_quit_requested(el),
             // File ------------------------------------------------------------
-            // Window ▸ New Window opens a real in-process window. `dispatch_menu_action`
-            // already has `el`, so create it directly (no Wake round-trip needed).
+            // Window ▸ New Window opens a real in-process window, its first shell
+            // spawned off the loop (`tab_spawn`); the window is made when it lands.
             MenuAction::NewWindow => {
-                self.create_window_internal(el, None, None);
+                self.open_window_off_loop(
+                    crate::tab_spawn::SpawnAsk::default(),
+                    None,
+                    crate::tab_spawn::TabSpawnThen::Nothing,
+                );
             }
             MenuAction::NewTab => self.open_tab(),
             MenuAction::OpenMarkdown => {
@@ -11064,7 +11109,7 @@ impl App {
                     aterm_log::info!("connected spawn {action:?} dropped: no focused session");
                     return;
                 };
-                self.spawn_connected_preset(el, action, &origin);
+                self.spawn_connected_preset(action, &origin);
             }
             // Connection ids (`docs/design/SESSION_CONNECTIONS.md` §2.3):
             // invoked without a tab context (palette / `invoke`), the subject
@@ -11286,8 +11331,22 @@ impl App {
             MenuAction::Messages => {
                 self.open_settings_tab(crate::native_settings::SettingsRoute::Messages);
             }
+            // …and at the Harness route — the bar and palette path to the
+            // coding agent harness's page (the footer's `⚙` chip opens it in
+            // the window it was pressed in: `App::open_harness_settings`).
+            MenuAction::HarnessSettings => {
+                if let Some(wid) = self.frontmost_window {
+                    self.open_harness_settings(wid);
+                }
+            }
             // Toggle the own-rendered, cross-platform command palette.
             MenuAction::OpenPalette => self.toggle_palette(),
+            // The same palette, scoped to its Theme section.
+            MenuAction::ChooseTheme => self.open_theme_palette(),
+            // …and Settings ▸ Themes, the Theme Showcase.
+            MenuAction::BrowseThemes => {
+                self.open_settings_tab(crate::native_settings::SettingsRoute::Themes);
+            }
             // Window ----------------------------------------------------------
             MenuAction::NextTab => self.cycle_tab(true),
             MenuAction::PrevTab => self.cycle_tab(false),
@@ -11398,7 +11457,7 @@ impl App {
                     aterm_log::info!("connected spawn {action:?} dropped: the tab has no session");
                     return;
                 };
-                self.spawn_connected_preset(el, action, &origin);
+                self.spawn_connected_preset(action, &origin);
             }
             other => self.dispatch_menu_action(el, other),
         }
@@ -11420,7 +11479,6 @@ impl App {
     /// from `origin`; failures are logged — a menu click has no reply channel.
     fn spawn_connected_preset(
         &mut self,
-        el: &ActiveEventLoop,
         action: menu::MenuAction,
         origin: &aterm_session::SessionId,
     ) {
@@ -11433,9 +11491,12 @@ impl App {
             MenuAction::NewControllerTab => (Kind::Controller, Place::Tab),
             _ => return,
         };
-        if let Err(e) = self.spawn_connected_session(el, kind, place, origin, None, "ui", None) {
-            aterm_log::warn!("connected spawn {action:?} failed: {e}");
-        }
+        let logged = Box::new(move |_: &mut Self, spawned: Result<String, String>| {
+            if let Err(e) = spawned {
+                aterm_log::warn!("connected spawn {action:?} failed: {e}");
+            }
+        });
+        self.spawn_connected_session(kind, place, origin, None, "ui", None, logged);
     }
 
     /// Dispatch one per-peer CONNECTION row click from a tab's context menu —

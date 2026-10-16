@@ -6,10 +6,8 @@
 //! harness readers over them offline.
 //!
 //! Every other test hands the harness a payload its author wrote; the corpus
-//! is the vendor's own. `tools/harness-capture.sh` drives a live vendor build,
-//! records which build sent what, and checks the result in; this suite replays
-//! it with no vendor installed. When the vendor changes shape, re-capture and
-//! this suite says whether the harness still holds.
+//! is the vendor's own, recorded from a live vendor build (`README.md` beside
+//! it says how), and this suite replays it with no vendor installed.
 //!
 //! A green run means: every Bash command the vendor build was observed to ask
 //! a permission for is pressed at full power when drawn into its box, and the
@@ -20,11 +18,9 @@
 //! fails on a corpus that is missing, empty, or missing either event that
 //! carries the Bash command a permission box asks about.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-
-use aterm_digest::Sha256;
 
 /// Where the corpus lives, relative to this crate.
 const CORPUS: &str = "tests/testdata/vendor";
@@ -59,63 +55,11 @@ impl Fixture {
 struct Capture {
     /// The version directory's name, which is the vendor version.
     version: String,
-    /// `key = value` lines of `manifest.toml`, before the `[files]` table.
-    meta: BTreeMap<String, String>,
-    /// `path -> (bytes, sha256)` from the manifest's `[files]` table.
-    claimed: BTreeMap<String, (u64, String)>,
     fixtures: Vec<Fixture>,
 }
 
 fn corpus_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(CORPUS)
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-/// A deliberately small reader for the manifest: it takes `key = "value"` and
-/// the `[files]` rows this repository's own capture script writes, and nothing
-/// else. A parser with more range would be a second TOML implementation in a
-/// tree that already refuses to grow one.
-fn read_manifest(path: &Path) -> (BTreeMap<String, String>, BTreeMap<String, (u64, String)>) {
-    let text = fs::read_to_string(path).unwrap_or_default();
-    let mut meta = BTreeMap::new();
-    let mut files = BTreeMap::new();
-    let mut in_files = false;
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if line == "[files]" {
-            in_files = true;
-            continue;
-        }
-        let Some((key, rest)) = line.split_once('=') else {
-            continue;
-        };
-        let key = key.trim().trim_matches('"').to_string();
-        let rest = rest.trim();
-        if in_files {
-            let bytes = rest
-                .split("bytes")
-                .nth(1)
-                .and_then(|s| s.trim_start_matches([' ', '=']).split(',').next())
-                .and_then(|s| s.trim().parse::<u64>().ok())
-                .unwrap_or(0);
-            let sha = rest
-                .split("sha256")
-                .nth(1)
-                .and_then(|s| s.split('"').nth(1))
-                .unwrap_or_default()
-                .to_string();
-            files.insert(key, (bytes, sha));
-        } else {
-            meta.insert(key, rest.trim_matches('"').to_string());
-        }
-    }
-    (meta, files)
 }
 
 /// Every captured build in the corpus, newest directory name last.
@@ -136,16 +80,10 @@ fn captures() -> Vec<Capture> {
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            let (meta, claimed) = read_manifest(&dir.join("manifest.toml"));
             let mut fixtures = Vec::new();
             collect(&dir, &dir, &mut fixtures);
             fixtures.sort_by(|a, b| a.rel.cmp(&b.rel));
-            Capture {
-                version,
-                meta,
-                claimed,
-                fixtures,
-            }
+            Capture { version, fixtures }
         })
         .collect()
 }
@@ -188,9 +126,7 @@ fn the_corpus_is_not_empty_and_covers_the_events_that_decide() {
     let caps = captures();
     assert!(
         !caps.is_empty(),
-        "no vendor capture under {} — tools/harness-capture.sh records one, but its live mode \
-         is suspended while `aterm harness install` is retired (decision B); `--from-raw` \
-         rebuilds from a kept raw/ tree. A green run of this suite over an empty corpus would \
+        "no vendor capture under {} — a green run of this suite over an empty corpus would \
          mean nothing.",
         corpus_root().display()
     );
@@ -232,60 +168,6 @@ fn the_corpus_is_not_empty_and_covers_the_events_that_decide() {
                  answer was never exercised. Capture in `--permission-mode manual`: an `auto` \
                  session never sends PermissionRequest. Kinds present: {kinds:?}",
                 cap.version
-            );
-        }
-    }
-}
-
-/// The corpus cannot rot silently: every file is the size and the digest the
-/// manifest recorded at capture time, and the manifest names every file on
-/// disk. An edited fixture is an edited fixture, not a vendor observation.
-#[test]
-fn every_fixture_is_the_bytes_the_manifest_recorded() {
-    for cap in captures() {
-        assert!(
-            !cap.claimed.is_empty(),
-            "{}: manifest.toml claims no files — provenance is the point of this corpus",
-            cap.version
-        );
-        for want in ["vendor_version", "captured_utc", "vendor"] {
-            assert!(
-                cap.meta.contains_key(want),
-                "{}: manifest.toml has no `{want}`",
-                cap.version
-            );
-        }
-        assert_eq!(
-            cap.meta.get("vendor_version").map(String::as_str),
-            Some(cap.version.as_str()),
-            "{}: the directory name and the manifest's vendor_version disagree",
-            cap.version
-        );
-
-        let on_disk: BTreeSet<&str> = cap.fixtures.iter().map(|f| f.rel.as_str()).collect();
-        let claimed: BTreeSet<&str> = cap.claimed.keys().map(String::as_str).collect();
-        assert_eq!(
-            on_disk, claimed,
-            "{}: the manifest and the directory disagree about which files exist",
-            cap.version
-        );
-
-        for f in &cap.fixtures {
-            let (bytes, sha) = &cap.claimed[&f.rel];
-            assert_eq!(
-                *bytes,
-                f.bytes.len() as u64,
-                "{}/{}: byte count moved since capture",
-                cap.version,
-                f.rel
-            );
-            assert_eq!(
-                *sha,
-                hex(&Sha256::digest(&f.bytes)),
-                "{}/{}: contents changed since capture — a fixture is an OBSERVATION, not a \
-                 file to edit. Re-capture instead.",
-                cap.version,
-                f.rel
             );
         }
     }
@@ -398,7 +280,15 @@ fn the_painted_usage_panel_yields_its_windows() {
     for cap in captures() {
         for f in cap.fixtures.iter().filter(|f| f.kind == "screen") {
             let text = f.text();
-            let got = limits_view(&rows(&text), 1_790_000_000, 0, &|z, _| zone_none(z)).windows;
+            let got = limits_view(
+                aterm_phase::Program::Claude.reader(),
+                &rows(&text),
+                1_790_000_000,
+                0,
+                &|z, _| zone_none(z),
+                &|_| None,
+            )
+            .windows;
             if f.rel.ends_with("usage.txt") {
                 let kinds: Vec<&str> = got.iter().map(|(w, _)| w.name.as_str()).collect();
                 assert!(

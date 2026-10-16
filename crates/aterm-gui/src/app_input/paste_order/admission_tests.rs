@@ -92,8 +92,8 @@ fn admission_bounds_and_reserved_key_room_follow_the_model() {
             assert!(model.check_invariant("PasteLeavesInputRoom", &state));
         }
     }
-    // Historical unbounded admission accepts a third paste: the real
-    // guard declines it while the model's mutant violates both claims.
+    // Negative control: an unbounded admission would accept a third paste; the
+    // real guard declines it while the model's mutant violates both claims.
     let budget = Budget::new(limits);
     assert!(budget.claim(2, true));
     assert!(budget.claim(2, true));
@@ -295,8 +295,8 @@ fn stalled_sink_case(hidden: bool) {
     expected.extend_from_slice(b"\x1b[200~");
     expected.resize(expected.len() + body, b'p');
     expected.extend_from_slice(b"\x1b[201~\x1b[200~second\x1b[201~K");
-    // A broad watchdog releases the owned socket even if historical
-    // synchronous fallback regresses. It is not a latency benchmark.
+    // A hang detector: the watchdog releases the owned socket should a paste
+    // ever fall back to a synchronous write. Not a latency benchmark.
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let drain = std::thread::spawn(move || {
         let returned_without_drain = ready_rx.recv_timeout(aterm_spec::wait::MUST_HAPPEN).is_ok();

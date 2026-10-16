@@ -1,18 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-//! The animal-roster art gates, over the asset TOML SOURCES (like
-//! `cat_art_quality`, so review works pre-codegen). Every species head in
-//! `art/animal/` is held to one shared bar — the roster is authored by many
-//! hands and must read as one species of art:
+//! The animal-roster art gates, over the asset TOML sources (like `cat_art_quality`, so review
+//! works before codegen). Every species head in `art/animal/` meets one shared bar:
 //!
-//! * semantic + bounded: one dark outline first, all-`fixed` recolors, layer
-//!   and path-command budgets, sane anchors and aspect;
-//! * legible at terminal size: silhouette and eye coverage floors at a 16 px
-//!   bake, and pairwise distinctness (a zebra must not alias a horse);
-//! * complete: the lexicon's species tags and the authored assets are the SAME
-//!   set — every animal word the scanner can match has art to show, and no
-//!   orphan art ships untriggerable.
+//! * semantic and bounded: one dark outline first, all-`fixed` recolors, layer and path-command
+//!   budgets, sane anchors and aspect;
+//! * legible at terminal size: silhouette and eye coverage floors at a 16 px bake, and pairwise
+//!   distinctness (a zebra must not alias a horse);
+//! * complete: the lexicon's species tags and the authored assets are the same set.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -118,8 +114,8 @@ fn render_roles(asset: &Asset, wanted: &[&str], height: u32) -> Tile {
     tile
 }
 
-/// Render every layer in its authored `ref_fill` (all animal layers are
-/// `fixed`, so this IS the shipped palette up to outline context ink).
+/// Render every layer in its authored `ref_fill`: all animal layers are `fixed`, so this is the
+/// shipped palette up to outline context ink.
 fn render_species_colors(asset: &Asset, height: u32) -> Tile {
     let scale = height as f32 / asset.viewbox.1;
     let width = (asset.viewbox.0 * scale).round().max(1.0) as u32;
@@ -189,10 +185,9 @@ fn animal_heads_are_semantic_bounded_and_species_true() {
             "{id}: aspect {aspect} outside the head band"
         );
         let (eye_y, center_x, word_top) = a.anchor;
-        // Wider than the cat heads' band on purpose: the roster has honest
-        // eyes-on-top shapes (frog, crocodile) and whole-body reads whose
-        // face is a top bump (ladybug). The animal render path never squashes
-        // toward the eye line, so the anchor is descriptive, not load-bearing.
+        // Wider than the cat heads' band: eyes-on-top shapes (frog, crocodile) and whole-body reads
+        // (ladybug). The animal render path never squashes toward the eye line, so the anchor is
+        // descriptive, not load-bearing.
         assert!(
             (0.18..=0.68).contains(&eye_y),
             "{id}: eye_y {eye_y} outside the portrait band"
@@ -256,11 +251,9 @@ fn species_heads_do_not_alias_each_other_at_sprite_size() {
     let masks: Vec<(String, Vec<u16>)> = assets
         .iter()
         .map(|a| {
-            // Color-aware, coarsely quantized: at sprite size the palette IS
-            // part of a species' signature (a white eagle head and a red
-            // parrot head may share a bird silhouette), but the 3-bit
-            // channels keep near-identical palettes from excusing identical
-            // shapes.
+            // Colour-aware, coarsely quantized: at sprite size the palette is part of a species'
+            // signature (a white eagle and a red parrot may share a bird silhouette), but 3-bit
+            // channels keep near-identical palettes from excusing identical shapes.
             let tile = render_species_colors(a, 16);
             let mask = tile
                 .pixels()
@@ -293,11 +286,9 @@ fn species_heads_do_not_alias_each_other_at_sprite_size() {
     }
 }
 
-/// Completeness: every species tag the builtin lexicon can attach to a word
-/// has authored art, and every authored head is reachable from a word. The
-/// `dog` head has no species tag because dog words are
-/// [`aterm_lexicon::Class::Canine`], which the Occurrence resolver pins to
-/// species `dog`; that path is asserted too.
+/// Every species tag the builtin lexicon can attach to a word has authored art, and every
+/// authored head is reachable from a word. The `dog` head has no species tag: dog words are
+/// [`aterm_lexicon::Class::Canine`], which the resolver maps to `dog`.
 #[test]
 fn lexicon_species_and_authored_roster_are_the_same_set() {
     let authored: BTreeSet<String> = load_all().into_iter().map(|a| a.id).collect();
@@ -306,8 +297,7 @@ fn lexicon_species_and_authored_roster_are_the_same_set() {
         .iter()
         .cloned()
         .collect();
-    // The canine seam: `dog` is summonable iff the builtin lexicon classifies
-    // a dog word as Canine (the resolver maps Canine → species "dog").
+    // `dog` is summonable iff the builtin lexicon classifies a dog word as Canine.
     assert_eq!(
         aterm_lexicon::Lexicon::builtin().classify_token("dog"),
         Some(aterm_lexicon::Class::Canine),
@@ -322,9 +312,8 @@ fn lexicon_species_and_authored_roster_are_the_same_set() {
     );
 }
 
-/// The generated roster stays in lock-step with the sources (the include-level
-/// drift test lives in `cat_glyphs_codegen`; this cross-checks the compiled
-/// lookup the renderer actually uses).
+/// Every authored head resolves through the compiled lookup the renderer uses (the source drift
+/// test is `cat_glyphs_codegen`'s `animal_glyphs_gen_matches_assets`).
 #[test]
 fn every_authored_head_resolves_through_the_compiled_lookup() {
     for a in load_all() {

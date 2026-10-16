@@ -4,18 +4,12 @@
 
 //! Kitty graphics Unicode placeholder decoding.
 //!
-//! A virtual Kitty placement is drawn by writing [`PLACEHOLDER`] (U+10EEEE)
-//! into text cells. Each cell carries up to three combining diacritics
-//! encoding the image row, the image column and the high byte of the image id;
-//! the low 24 bits of the id come from the foreground colour, and the
-//! underline colour names the virtual placement (`p=`, `0` lets the terminal
-//! pick). An image can so flow through a pager or multiplexer as text.
-//!
-//! [`decode_cell`] maps a cell's char, marks and colours to image, placement
-//! and tile. The engine decodes at render time into the shared-image path
-//! (`render_cells::images_row_into`); the handler decodes to damage the cells
-//! an image change repaints. The diacritic table is Kitty's
-//! `rowcolumn-diacritics` list (297 entries, sorted, index = encoded value).
+//! A virtual Kitty placement is drawn as [`PLACEHOLDER`] (U+10EEEE) text cells, so an image can
+//! flow through a pager or multiplexer as text. Up to three combining diacritics encode the
+//! image row, column and the id's high byte; the foreground colour carries the id's low 24 bits
+//! and the underline colour the placement id (`p=`; `0` lets the terminal pick). [`decode_cell`]
+//! serves the renderer (`render_cells::images_row_into`) and the handler, which damages the
+//! cells an image change repaints.
 
 use aterm_grid::{CellExtra, Grid};
 
@@ -83,8 +77,8 @@ fn rgb_id([r, g, b]: [u8; 3]) -> u32 {
     (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b)
 }
 
-/// The encoded value of a row/column/high diacritic = its index in this table, or
-/// `None` if the codepoint is not a Kitty rowcolumn diacritic. Sorted by codepoint.
+/// The encoded value of a row/column/high diacritic (its index in `DIACRITICS`), or `None` for
+/// any other codepoint.
 pub(crate) fn diacritic_value(c: char) -> Option<u32> {
     DIACRITICS
         .binary_search(&c)

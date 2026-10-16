@@ -54,6 +54,23 @@
 //!   is a syllable of someone's prose far more often than a command.
 //! * A surface longer than [`TrickLexicon::MAX_SURFACE_CHARS`] is skipped: the
 //!   listener's token window could never hold it, so it would never fire.
+//! * `unglued` names surfaces of its OWN no-space row; anything else listed
+//!   there is recorded and ignored.
+//!
+//! # A name glued to a command
+//!
+//! In a script written without spaces the listener may read one unknown run
+//! as a name and a command (`猫咪坐下`), asking about each half with
+//! [`TrickLexicon::classify_glued_half`]. That reading is a guess, and a row's
+//! `unglued` list keeps out the surfaces that make it a bad one; they still
+//! classify whole:
+//!
+//! * a NAME that is also an everyday word: `宝宝` is a baby, Thai `หนู` and
+//!   `น้อง` pronouns, so `宝宝睡觉` is a sentence about a baby;
+//! * a command word that is a THING: after the animal's name `玩具`, `じゃらし`
+//!   or Thai `ขนม` make a compound noun (`猫咪玩具`, a cat toy);
+//! * a command word that, glued to the name, spells another word: `喂猫咪` is
+//!   feed the kitty, Thai `แมวมอง` a talent scout.
 //!
 //! Nothing on this module's compile path touches the sparkle lexicon's cached
 //! accessor; the cross-table collision laws are test-side
@@ -243,6 +260,9 @@ pub struct TrickRow {
     /// `true`: a no-space script row — surfaces are RAW keys and the whole
     /// typed run must equal one.
     pub cjk: bool,
+    /// Surfaces of this row that are never half of a glued name + command run
+    /// (module docs). Not part of [`row_line`]: it changes no role.
+    pub unglued: Vec<String>,
 }
 
 /// THE one listing formatter — the CLI prints exactly these lines and the
@@ -338,6 +358,8 @@ struct RawTrickRow {
     gated: bool,
     #[serde(default)]
     cjk: bool,
+    #[serde(default)]
+    unglued: Vec<String>,
     /// Reviewer prose in the TOML; type-checked (`deny_unknown_fields`), never read.
     #[serde(default, rename = "notes")]
     _notes: String,
@@ -353,6 +375,8 @@ struct RawWordRow {
     gated: bool,
     #[serde(default)]
     cjk: bool,
+    #[serde(default)]
+    unglued: Vec<String>,
     /// Reviewer prose in the TOML; type-checked (`deny_unknown_fields`), never read.
     #[serde(default, rename = "notes")]
     _notes: String,
@@ -372,6 +396,8 @@ struct TrickEntry {
     /// A one-character no-space surface. [`effective_role`] forces
     /// `needs_vocative` for it, whichever list it was authored in.
     single_cjk: bool,
+    /// Never half of a glued run ([`TrickLexicon::classify_glued_half`]).
+    unglued: bool,
 }
 
 /// The role a lookup reports: the authored role, with the lone-ideograph law
@@ -491,6 +517,21 @@ impl TrickLexicon {
     /// a miss: the fold answers a held key, it does not forgive a typo.
     #[must_use]
     pub fn classify(&self, token: &str, scratch: &mut String) -> Option<TrickRole> {
+        self.lookup(token, scratch).map(effective_role)
+    }
+
+    /// [`classify`](Self::classify) for one HALF of a run read as a name glued
+    /// to a command (module docs): the same lookup, and `None` as well for a
+    /// surface its row lists as `unglued`.
+    #[must_use]
+    pub fn classify_glued_half(&self, token: &str, scratch: &mut String) -> Option<TrickRole> {
+        self.lookup(token, scratch)
+            .filter(|entry| !entry.unglued)
+            .map(effective_role)
+    }
+
+    /// The entry behind one isolated token, the marks-required gate applied.
+    fn lookup(&self, token: &str, scratch: &mut String) -> Option<&TrickEntry> {
         let entry = if is_no_space_surface(token) {
             self.table.get(token)?
         } else {
@@ -505,7 +546,7 @@ impl TrickLexicon {
         if entry.marks_required && !fold::has_foldable_marks(token) {
             return None;
         }
-        Some(effective_role(entry))
+        Some(entry)
     }
 
     /// The elongation fold's retry (see [`classify`](Self::classify)).
@@ -656,6 +697,7 @@ fn ordered_rows(raw: RawTricks, conflicts: &mut Vec<String>) -> Vec<TrickRow> {
                 address: r.address,
                 gated: r.gated,
                 cjk: r.cjk,
+                unglued: r.unglued,
             },
         );
     }
@@ -674,6 +716,7 @@ fn ordered_rows(raw: RawTricks, conflicts: &mut Vec<String>) -> Vec<TrickRow> {
                     address: Vec::new(),
                     gated: r.gated,
                     cjk: r.cjk,
+                    unglued: r.unglued,
                 },
             );
         }
@@ -709,7 +752,7 @@ fn stage_row(rows: &mut Vec<TrickRow>, conflicts: &mut Vec<String>, mut row: Tri
         conflicts.push(msg);
         return;
     }
-    for list in [&mut row.words, &mut row.address] {
+    for list in [&mut row.words, &mut row.address, &mut row.unglued] {
         for surface in list.iter_mut() {
             *surface = surface.trim().to_string();
         }
@@ -735,6 +778,18 @@ fn push_kind_label(msg: &mut String, kind: RowKind) {
 fn compile(rows: &[TrickRow], langs: &Langs, mut conflicts: Vec<String>) -> TrickLexicon {
     let mut table: FxHashMap<String, TrickEntry> = FxHashMap::default();
     for row in rows {
+        // An `unglued` entry the row does not hold, or on a spaced row, marks
+        // nothing: a typo, said out loud.
+        for surface in &row.unglued {
+            if !row.cjk || !(row.words.contains(surface) || row.address.contains(surface)) {
+                push_surface_conflict(
+                    &mut conflicts,
+                    surface,
+                    &row.lang,
+                    "listed as unglued, but it is no surface of this no-space row: ignored",
+                );
+            }
+        }
         if row.gated {
             if row.lang == "en" {
                 // English is the priority language: a gated English row would
@@ -805,6 +860,7 @@ fn claim_surface(
                 // Raw keys are never folded, so no mark is ever lost.
                 marks_required: false,
                 single_cjk: chars == 1,
+                unglued: row.unglued.iter().any(|listed| listed == surface),
             },
         )
     } else {
@@ -831,6 +887,7 @@ fn claim_surface(
                 role,
                 marks_required,
                 single_cjk: false,
+                unglued: false,
             },
         )
     };
@@ -841,6 +898,8 @@ fn claim_surface(
             // listing the BARE spelling makes the key typeable without marks:
             // explicit data is consent (the `scheisse` beside `scheiße` law).
             prev.marks_required &= entry.marks_required;
+            // One claimant keeping it out of the glued reading keeps it out.
+            prev.unglued |= entry.unglued;
         }
         Some(_) => push_surface_conflict(
             conflicts,

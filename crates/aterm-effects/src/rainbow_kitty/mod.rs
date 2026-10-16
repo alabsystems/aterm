@@ -19,7 +19,7 @@
 //! | # | `CursorGlow` seam | v2 |
 //! |---|---|---|
 //! | 1 | `spawn`, after the licence gate and `classify_move` | [`Event::Move`] |
-//! | 2 | `note_typed` / `note_erase` / `note_kill` / `note_return` | [`Engine::on_event`] |
+//! | 2 | `note_typed` / `note_backspace` / `note_kill` / `note_return` | [`Engine::on_event`] |
 //! | 3 | the emit phase | [`Engine::tick`] |
 //! | 4 | `rainbow_field` | [`Engine::field`] / [`Engine::field_at`] |
 //! | 5 | `rainbow_head_rgb` | [`Engine::head_rgb`] |
@@ -29,48 +29,46 @@
 //! | 9 | `next_change_deadline` | [`Engine::next_change_deadline`] |
 //! | 10 | `take_cursor_cat_motion_pulse` | [`Engine::take_companion_impulse`] |
 //! | 11 | `drain_sound_cues` / `take_key_cue` | [`Frame::cues`] / [`Engine::drain_sound_cues`] |
-//! | 12 | `reset` / `translate_scroll_state` / `trail_status` | [`Engine::reset`] / [`Engine::translate_scroll`] / [`Engine::status`] |
+//! | 12 | `reset` / `translate_scroll_state` / `v2_status` | [`Engine::reset`] / [`Engine::translate_scroll`] / [`Engine::status`] |
 //!
 //! `is_active` follows the v2 fingerprint when engaged. The caret block is
 //! ticked by the host; v2 supplies only [`CaretSeam`] (§7.1).
 //!
 //! ## Diagnostics: the hole tripwire
 //!
-//! [`Engine::trace_holes`] arms a sensor that makes one record per dark
-//! column inside a lit typed line — the engine's state on the frame the hole
-//! opened — for the host to take with [`Engine::drain_hole_records`]
-//! (`holes.rs` has the walk and the record's fields). `aterm-gui` arms it
-//! under the development seam `ATERM_TRACE_TRAIL_HOLES` and prints the
-//! records to stderr; a shipped binary never does.
+//! [`Engine::trace_holes`] (`holes.rs`) records the engine's state on the frame
+//! a dark column opens inside a lit typed line, drained with
+//! [`Engine::drain_hole_records`]. `aterm-gui` arms it under the development
+//! seam `ATERM_TRACE_TRAIL_HOLES`.
 //!
 //! ## Module layout (§17.1)
 //!
-//! * [`timing`]: the shared numbers ([`timing::flight_ms`], the `FLIGHT_*`
-//!   constants, [`timing::shed_n`], [`timing::FAN_HERO_N`], the `GLINT_*`
-//!   bucket constants, the named curves, the two coverage ceilings).
+//! * [`timing`]: the shared numbers, named curves and coverage ceilings.
 //! * [`spine`]: one momentum integrator and one display follower (§19.1).
 //! * [`ribbon`]: the ribbon, the per-row `col → t` field index, the hot edge.
 //! * [`stardust`]: the sky: magnitude classes, birth zones, the token bucket.
 //! * [`meteor`]: the flight, its own arc, and the landing.
-//! * palette: `crate::spectrum`. C1: the seven-stop ROYGBIV is the only colour
-//!   law.
+//! * [`companion`]: the kitty's two bodies and the one impulse (§7.2).
+//! * [`witness`]: the content witness that retires ribbon cells by glyph.
+//! * Palette: `crate::spectrum`; the seven-stop ROYGBIV is the only colour law
+//!   (C1).
 //!
 //! ## Invariants
 //!
-//! * **T1, no keystroke, no light.** Geometry is born only on an observed,
+//! * T1, no keystroke, no light: geometry is born only on an observed,
 //!   licensed cursor move; a keydown never pre-draws.
-//! * **T2, the frame-0 law.** Everything an event owns exists, at full
+//! * T2, the frame-0 law: everything an event owns exists, at full
 //!   brightness, on the frame the caret is first observed at its landing.
-//! * **T6, idle → zero.** [`Engine::needs_frame_cadence`] is `false` and
+//! * T6, idle → zero: [`Engine::needs_frame_cadence`] is `false` and
 //!   [`Engine::next_change_deadline`] is `None` when nothing is live, and the
 //!   fingerprint is `0` when nothing is on glass.
-//! * **T7, wall-clock, not frame-count.** Every curve takes `now`.
-//! * **Determinism.** Every seed is hashed from `(row, col, born)` at the
-//!   spawn edge; there is no per-frame RNG; a frame at the same `now` is
+//! * T7, wall-clock, not frame-count: every curve takes `now`.
+//! * Determinism: every seed is hashed from `(row, col, born)` at the spawn
+//!   edge; there is no per-frame RNG; a frame at the same `now` is
 //!   byte-identical on CPU and GPU (§18).
-//! * **No allocation on the steady-state frame path.** Fixed pools and
-//!   resident `Vec`s that are cleared, never rebuilt.
-//! * **No `unsafe`** anywhere in this tree.
+//! * No allocation on the steady-state frame path: fixed pools and resident
+//!   `Vec`s that are cleared, never rebuilt.
+//! * No `unsafe` anywhere in this tree.
 
 pub mod companion;
 pub mod meteor;
@@ -158,10 +156,8 @@ impl Dir {
     }
 }
 
-/// Why a move was admitted: the verdict the licence gate
-/// (`CursorGlow::move_licensed`) and `classify_move` reached before seam point
-/// 1 hands the move here. v2 never re-derives a licence, so T1 lives entirely
-/// upstream of this enum.
+/// Why a move was admitted, as the licence gate (`CursorGlow::move_licensed`)
+/// and `classify_move` decided upstream; v2 never re-derives a licence (T1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Licence {
     /// A fresh typed-glyph hint licensed the move (`type_hint`).
@@ -173,51 +169,42 @@ pub enum Licence {
     Return,
     /// A scripted preview / example / benchmark (`note_synthetic_move`).
     Synthetic,
-    /// A delivered insert (a file drop, a paste, a Tab completion, a ⌃V):
-    /// licensed at delivery (the host's completed write) and handed over
-    /// behind its own `Sweep` of the whole span. An echo like `Typed`
-    /// ([`Licence::is_echo`]); it differs only at the echo ledger, which pays a
-    /// hole before the insert from the older presses and charges the insert's
-    /// own span to nothing.
+    /// A delivered insert (a file drop, a paste, a Tab completion, a ⌃V),
+    /// licensed at delivery and handed over behind its own `Sweep` of the
+    /// span. An echo like `Typed`, except at the echo ledger, which pays a hole
+    /// before the insert from older presses and charges the span to nothing.
     Insert,
-    /// **NO credit** — program-driven motion under an arm that admits it, such
-    /// as a PTY line-feed cascade (§8.2's "PTY line feed (no credit)", D18).
-    /// Draws its meteor under the 2-cap and the retire law; its audio rides
-    /// the cascade lane's 1-voice / 180 ms exclusivity.
+    /// No credit: program-driven motion an arm admits, such as a PTY line-feed
+    /// cascade (§8.2, D18). Draws its meteor; its audio is the cascade lane.
     Pty,
 }
 
 impl Licence {
-    /// The hand's own echo — a typed key's or a delivered insert's. Inert
-    /// everywhere `Typed` is inert: no wake, no abandon, no meteor, no
-    /// mini-fan, no nav tick, no star deal; only the echo ledger tells the
-    /// two apart.
+    /// The hand's own echo, a typed key's or a delivered insert's: no wake,
+    /// abandon, meteor, mini-fan, nav tick or star deal. Only the echo ledger
+    /// tells the two apart.
     #[must_use]
     pub fn is_echo(self) -> bool {
         matches!(self, Self::Typed | Self::Insert)
     }
 
-    /// A keyed jump or hop — an arrow, a word motion, a scripted preview:
-    /// the licences that earn a wake, a scrub, a meteor cue and the nav
-    /// tick.
+    /// A keyed jump or hop (an arrow, a word motion, a scripted preview): the
+    /// licences that earn a wake, a scrub, a meteor cue and the nav tick.
     #[must_use]
     pub fn is_keyed_nav(self) -> bool {
         matches!(self, Self::Nav | Self::Synthetic)
     }
 }
 
-/// What kind of glyph an [`Event::Typed`] carried: what the glow needs to deal
-/// a star (§5.8's earned-hero set). D7: heroes are capitals, `!`, kitty
-/// Delight, the landing fan's own m1, and the 1-in-12 deal; the glow cannot
-/// see the synth's `walk`.
+/// What kind of glyph an [`Event::Typed`] carried, for the hero deal (§5.8,
+/// D7).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TypedClass {
     /// An ordinary printable glyph.
     Glyph,
     /// A capital (by Shift or Caps Lock; the glyph is asked): earns an m1 at
-    /// the glyph's cell (§5.8) and, at the synth, the octave ring at +60 ms,
-    /// −6 dB, and the ×4 sparkle (§10.4). The keyed seam's `click_shifted`
-    /// agrees.
+    /// the glyph's cell (§5.8) and, at the synth, the octave ring and the ×4
+    /// sparkle (§10.4).
     Capital,
     /// `!` — earns an m1 (§5.8).
     Bang,
@@ -226,10 +213,8 @@ pub enum TypedClass {
     Space,
 }
 
-/// The scale of a kill chord: a word going, or a clause going. §5.6 prices
-/// the erase population per 3 cells of the kill (cap 8) and §8.2 gives the
-/// scales different sounds (`KillWord`'s poof, `Kill`'s swoosh). The spine
-/// drains identically for both (§19.1).
+/// The scale of a kill chord. §8.2 gives the scales different sounds
+/// (`KillWord`'s poof, `Kill`'s swoosh); the spine drains identically.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KillScope {
     /// `^W`, Alt-D, Alt/Ctrl-Backspace — one word.
@@ -238,17 +223,13 @@ pub enum KillScope {
     Line,
 }
 
-/// One engine event (§17.1): everything the host tells v2. `Copy`, because
-/// events are buffered on a resident queue and replayed to the producers twice
-/// per tick (once to ingest, once to deal births against the ribbon's planned
-/// bands) without allocating.
+/// One engine event (§17.1). `Copy`: buffered on a resident queue and replayed
+/// twice per tick (ingest, then the deal against the planned bands).
 #[derive(Clone, Copy, Debug)]
 pub enum Event {
-    /// A typed glyph echoed forward. `cells` is how many cells the echo
-    /// advanced (a coalesced burst may carry several); `shifted` rides through
-    /// to `SoundCue::shifted`; `class` decides the hero deal.
-    ///
-    /// Seam point 2 (`note_typed`). The only event that builds momentum.
+    /// A typed key (seam point 2, `note_typed`), the only event that builds
+    /// momentum. `cells` is the echo's advance (a coalesced burst may carry
+    /// several).
     Typed {
         /// Cells the echo advanced.
         cells: u16,
@@ -257,9 +238,9 @@ pub enum Event {
         /// What kind of glyph it was (§5.8).
         class: TypedClass,
     },
-    /// One Backspace. Seam point 2 (`note_erase`). Drains the spine, retracts
-    /// a ribbon cell, throws 3 m3 + 1 m2, and keeps the classic smoke poof
-    /// unchanged (§5.6). Unpitched: no erase chimes (§19.2).
+    /// One Backspace. Seam point 2 (`note_backspace`). Drains the spine,
+    /// retracts a ribbon cell, throws 3 m3 + 1 m2, and keeps the classic smoke
+    /// poof (§5.6). Unpitched (§19.2).
     Erase,
     /// A kill chord. Seam point 2 (`note_kill`). The ribbon drains
     /// farthest-first at `12·n + 240` ms; 1 star per 3 cells, cap 8.
@@ -269,14 +250,11 @@ pub enum Event {
         /// Word or line scale (§8.2).
         scope: KillScope,
     },
-    /// An observed, licensed cursor move, handed over after the licence gate
-    /// and `classify_move` have run (seam point 1). This is the only event
-    /// that can mint a meteor, and T1 is exactly the statement that geometry
-    /// is born here and nowhere else.
+    /// An observed, licensed cursor move (seam point 1): the only event that
+    /// can mint a meteor (T1).
     Move {
-        /// `(row, col)` the caret left: the host's last observed cell,
-        /// licensed or not. The engine's mirror advances only on licensed
-        /// moves, and [`Engine::echo_bridge`] reads the hop between the two,
+        /// `(row, col)` the caret left: the host's last observed cell, licensed
+        /// or not. [`Engine::echo_bridge`] reads the hop from the mirror to it,
         /// so anything but the observed origin would invent holes.
         from: (u16, u16),
         /// `(row, col)` the caret was observed at — the landing, and `t = 0`.
@@ -286,44 +264,31 @@ pub enum Event {
         /// Travel direction, dominant axis.
         dir: Dir,
     },
-    /// A keyed Enter, the key only (seam point 2, `note_return`). Inert in
-    /// every producer (T1: a keypress is not a move; the shell may swallow
-    /// it). The Enter's flight arrives as the caret's observed motion, an
-    /// [`Event::Move`] with [`Licence::Return`]: the meteor along the true
-    /// vector with `T = flight_ms(cells)`, a landing sized by rows (5-7 m3 +
-    /// 1 m2, reach 1.6 `ch`, no burst, hero or rain, D8), the pin, and the
-    /// [`SoundKind::Enter`] cue.
+    /// A keyed Enter, the key only (seam point 2, `note_return`): inert (T1:
+    /// the shell may swallow it). Its flight arrives as an [`Event::Move`] with
+    /// [`Licence::Return`].
     Return,
     /// A composer line break (Shift+Enter), stamped at the key before its
-    /// repaint. Like `Return`, this starts a fresh ribbon walk without
-    /// minting a flight. Its own typed stamp has the same clock and must not
-    /// spend the fresh-line gate before the first character on that line.
+    /// repaint: starts a fresh ribbon walk without a flight. Its own typed
+    /// stamp shares the clock and must not spend the fresh-line gate before
+    /// the line's first character.
     ComposerNewline,
-    /// A later non-typing gesture superseded a composer break before its
-    /// caret home was observed. The ribbon drops only that pending gate;
-    /// this key edge mints no light or movement of its own.
+    /// A later non-typing gesture superseded a composer break before its caret
+    /// home was observed: the ribbon drops that pending gate, nothing more.
     CancelComposerNewline,
     /// Window focus changed. On loss the ribbon embers out in 300 ms on
     /// `spend` and the stars die; nothing sounds (§8.2).
     Focus(bool),
-    /// The host's reduced-motion posture changed. Under it every mark is
-    /// static and takes the theme's one linear fade,
-    /// [`timing::REDUCED_MOTION_FADE_MS`] (§2.5, §6.11).
+    /// The host's reduced-motion posture changed: every mark is static and
+    /// takes [`timing::REDUCED_MOTION_FADE_MS`] (§2.5, §6.11).
     ReducedMotion(bool),
-    /// A typed echo's glyph cells (seam point 1): the classifier licensed the
-    /// same-row echo `col0 → col1` on `row` as typing, one key's glyph or
-    /// several the PTY delivered in one frame on banked press credits. A
-    /// `Typed` key lays at the caret the tick replays with, so it owns its
-    /// glyph cell only when its echo shares its tick; a batched echo's earlier
-    /// cells and a late echo's glyph come from this sweep alone. The ribbon
-    /// lays the cells of `col0..col1` that no live cell owns, as typing, born
-    /// at the echo. Nothing else reads it: no spine advance, star, meteor or
-    /// cue.
-    ///
-    /// The engine mints one itself for a late echo (a key's cells the seam
-    /// refused because the echo came after its `0.25 s` window), from the
-    /// mirror to the next licensed typed move, paid press by press from the
-    /// [`EchoLedger`] ([`Engine::echo_bridge`]).
+    /// A typed echo's glyph cells (seam point 1): the same-row echo
+    /// `col0 → col1` on `row`, licensed as typing. A `Typed` key lays at the
+    /// replay's caret, so it owns its glyph cell only when its echo shares its
+    /// tick; a batched echo's earlier cells and a late echo's glyph come from
+    /// this sweep alone. The ribbon lays the cells no live cell owns; nothing
+    /// else reads it. The engine mints one itself for a late echo, paid from
+    /// the [`EchoLedger`] ([`Engine::echo_bridge`]).
     Sweep {
         /// The echoed row.
         row: u16,
@@ -332,15 +297,12 @@ pub enum Event {
         /// The landing (exclusive): the caret the echo left the row at.
         col1: u16,
     },
-    /// The insert's rewrite (seam point 1): the program pulled the caret back
-    /// inside a span a delivered insert laid (for example an agent replacing
-    /// a dropped image path with `[Image #1] `; `CursorGlow::insert_span`).
-    /// The ribbon retracts the row's suffix from `col` farthest-first at
-    /// `12·n + 240` ms, the kill's law, and moves its caret; the sky finishes
-    /// the retracted cells' field stars on the same span; the engine's caret
-    /// mirror moves. Nothing is born, winces or sounds; the spine and the echo
-    /// ledger are untouched (T1, T5). Minted only by the seam's insert-scoped
-    /// rewrite arm, never from a key.
+    /// The insert's rewrite (seam point 1, `CursorGlow::insert_rewrite`): the
+    /// program pulled the caret back inside a delivered insert's span (an agent
+    /// replacing a dropped image path with `[Image #1] `). The ribbon retracts
+    /// the row's suffix from `col` on the kill's law, the sky finishes those
+    /// cells' field stars, the caret mirror moves. Nothing is born or sounds,
+    /// and the spine and echo ledger are untouched (T1, T5).
     Rewrite {
         /// The rewritten row.
         row: u16,
@@ -370,16 +332,15 @@ pub struct Config {
     /// does not scale [`timing::flight_ms`]: the meteor's clock is a shared
     /// coupling number, not a taste dial.
     pub duration: Duration,
-    /// The shipped `tall` ribbon spelling (`RAINBOW_TALL_UP 1.10 ch`, spine at
-    /// the row bottom) vs `underline`. D16: this is why star birth zones are
-    /// defined against the ribbon's top edge and not in cell coordinates.
+    /// The shipped `tall` ribbon spelling (`ribbon::TALL_UP_CH` above a spine
+    /// at the row bottom) vs `underline`. D16: why star birth zones are defined
+    /// against the ribbon's top edge and not in cell coordinates.
     pub ribbon_tall: bool,
-    /// The explicit `... flat` spelling (`GlowConfig::ribbon_flat`): the flat
-    /// body instead of the default comet body and its vivid rail
-    /// (`RAINBOW-KITTY-V2.md` §30). Read by the ribbon alone.
+    /// The `... flat` spelling: the flat body instead of the default comet body
+    /// and its vivid rail (§30). Read by the ribbon alone.
     pub ribbon_flat: bool,
-    /// Theme foreground — the ink colour of the light fork and the ledger's
-    /// `rainbow_ink_lift_max(fg)` input (L2).
+    /// Theme foreground: the ink colour of the light fork and the input to
+    /// `ribbon::bed_luma_budget` (L2).
     pub theme_fg: u32,
     /// Theme background.
     pub theme_bg: u32,
@@ -406,54 +367,37 @@ impl Config {
     }
 }
 
-/// The caret seam (§7.1). v2 does not own the caret block fill; the host ticks
-/// the caret (`tick_with_family_phase`, after the ledger) and copies this
-/// record into `RainbowConfig`.
+/// The caret seam (§7.1): v2 does not own the caret block fill; the host copies
+/// this into `RainbowConfig`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CaretSeam {
-    /// The instant a meteor's frame-0 flare fired, if one did. The block fills
-    /// `#FFFFFF` for one frame, then mixes toward its field stop on
-    /// `spring-snap` ([`timing::spring_snap`], response 0.18 s); the halo rings
-    /// pop radius ×1.4 on the same edge and relax τ 120 ms.
-    ///
-    /// Set only by a credited spawn, never a [`Licence::Pty`] line feed (§8.2)
-    /// and never under reduced motion (§6.11). Cleared once the relax has
-    /// settled ([`timing::SPRING_SNAP_RESPONSE_S`] after the edge), so `Some`
-    /// is always a live relax.
+    /// The instant a credited spawn's frame-0 flare fired (never a
+    /// [`Licence::Pty`] feed or under reduced motion): one `#FFFFFF` frame, then
+    /// a mix to the field stop on [`timing::spring_snap`]. `Some` only while
+    /// the relax is live.
     pub flare_at: Option<Instant>,
-    /// The caret's position in the field (C2): the ribbon head, the caret and
-    /// a star's halo on that cell read this one number and so share a colour.
-    /// Sampled after the frame's events are laid and the ribbon has planned,
-    /// so it equals [`Engine::field`] on the same frame. The raw walk `t`,
-    /// unbounded past `1.0`; a host folds it through [`meteor::tri`] before
-    /// `spectrum` (D4).
+    /// The caret's field position (C2), equal to [`Engine::field`] on the same
+    /// frame, so the head, the caret and a star's halo share a colour. The raw
+    /// walk `t`, unbounded past `1.0`; a host folds it through [`meteor::tri`]
+    /// before `spectrum` (D4).
     pub field_t: f32,
-    /// The caret's paint level, 0..1: the display spine
-    /// ([`Engine::momentum_display`]) floored by the landing re-light. A
-    /// credited spawn lifts it to exactly `1.0` on the landing frame, holds it
-    /// through the flare's relax and cools it on [`timing::half_life`] with the
-    /// flare's constant (`RELIGHT_LIFE_S`): the caret is never dimmed at the
-    /// destination (§7.1).
-    ///
-    /// The host copies this into `RainbowConfig::paint`, consumed as
-    /// `max(paint, energy)`: the host cadence's 220 ms `energy` gives the fast
-    /// attack (§7.1's "cool: τ 220 ms") and this number owns the release, on
-    /// the ribbon's own τ 0.85 s. [`Engine::caret_paint`] is the same number
-    /// as a pure read at the host's own `now`.
+    /// The caret's paint level, 0..1: the display spine floored by the landing
+    /// re-light, which lifts it to exactly `1.0` on a credited landing, holds
+    /// through the flare's relax and cools on the flare's constant (§7.1). The
+    /// host consumes it as `max(paint, energy)`: its 220 ms cadence `energy`
+    /// is the attack, this the release. [`Engine::caret_paint`] is the pure
+    /// read.
     pub paint: f32,
 }
 
-/// One impulse, two bodies (D13, §7.2): v2 emits a single impulse and
-/// whichever body `CompanionDuty` says owns the frame consumes it. Identity
-/// never changes; no new sprite frames; no facing flip beyond `facing_left`.
+/// One impulse, two bodies (D13, §7.2): whichever body `CompanionDuty` says
+/// owns the frame consumes it. No new sprite frames.
 #[derive(Clone, Copy, Debug)]
 pub enum CompanionImpulse {
-    /// A meteor was born. The flying head takes the frame-0 teleport
-    /// (placement snaps), `disp = max(disp, 0.97)`, a `lead = −0.30` cell whip
-    /// springing to `+0.22` on `timing::spring_whip`, and
-    /// `land_at = t0 + t_flight`. The resident pet is only offered this: it
-    /// keeps its own pounce (no teleport) and may use `t0 + t_flight` as its
-    /// perk edge (owner, 2026-09-05).
+    /// A meteor was born. The flying head takes the frame-0 teleport, a
+    /// `lead = −0.30` cell whip springing to `+0.22` on `timing::spring_whip`,
+    /// and `land_at = t0 + t_flight`; the resident pet keeps its own pounce and
+    /// may use `t0 + t_flight` as its perk edge.
     Meteor {
         /// Flight direction — the existing `facing_left` bank.
         dir: Dir,
@@ -463,10 +407,8 @@ pub enum CompanionImpulse {
         t_flight: Duration,
     },
     /// A landing with no flight behind it: a credited spawn under reduced
-    /// motion (§6.11 — the head is at the landing, there was no flight to
-    /// follow). Both bodies take the existing landing pose as an edge; the
-    /// animator applies its own reduced-motion posture to it, because v2
-    /// owns no sprite.
+    /// motion (§6.11). Both bodies take the landing pose; the animator applies
+    /// its own reduced-motion posture.
     Land,
     /// An erase or a kill — the existing "oops" pose (§8.2's Backspace and
     /// `^W`/`^U`/`^K` rows). Minted on the event edge; a meteor minted on
@@ -478,10 +420,8 @@ pub enum CompanionImpulse {
     Delight,
 }
 
-/// One tick's output (§17.1). The three pixel streams and the cue sink are
-/// borrowed host scratch (seam point 3: the same `under` / `out` / `halos` the
-/// other styles use), so the frame allocates nothing (§18). The small outputs
-/// ([`Frame::caret`], [`Frame::companion`], [`Frame::fp`]) are owned values.
+/// One tick's output (§17.1). The pixel streams and the cue sink are borrowed
+/// host scratch (seam point 3), so the frame allocates nothing (§18).
 pub struct Frame<'a> {
     /// `glow_under`: composited beneath glyph ink, never blooms. Carries the
     /// ribbon body and the meteor's colour train, so "where I came from" reads
@@ -498,29 +438,24 @@ pub struct Frame<'a> {
     /// Reused polyline scratch for `aterm_render::comet_beam` (the hot edge,
     /// the ring). Held by the host so no producer allocates one per frame.
     pub beams: &'a mut Vec<BeamVertex>,
-    /// The frame's sound cues, appended in mint order (seam point 11). The
-    /// host drains this exactly as it drains `CursorGlow`'s today.
+    /// The frame's sound cues, appended in mint order (seam point 11).
     pub cues: &'a mut Vec<SoundCue>,
     /// What the host must copy into `RainbowConfig` for the caret (§7.1).
     pub caret: CaretSeam,
-    /// The impulse minted on this frame, if any (§7.2). A report: the impulse
-    /// stays pending until [`Engine::take_companion_impulse`] consumes it, and
-    /// only the take transfers ownership.
+    /// The impulse pending on this frame (§7.2), a report: only
+    /// [`Engine::take_companion_impulse`] consumes it.
     pub companion: Option<CompanionImpulse>,
-    /// The frame fingerprint. **Exactly `0` when nothing is on glass** (T6) —
-    /// that is the whole contract, and `is_active` follows it when engaged.
+    /// The frame fingerprint: exactly `0` when nothing is on glass (T6), and
+    /// `is_active` follows it when engaged.
     pub fp: u64,
 }
 
-/// The mend mark for this tick (§23 "The mend"): the typed key this frame
-/// carries is a typo fix, within [`spine::MEND_WINDOW_S`] of a Backspace run of
-/// at most [`spine::MEND_MAX_DELETES`] deletes ([`spine::Spine::mend`]). `Some`
-/// only on the tick that births the fix.
-///
-/// Consumers: the ribbon prices the fix's births at `max(birth_disp, disp)`
-/// ([`Ctx::birth_disp`] floored by [`Mend::disp`]); stardust may birth the
-/// fix's m2 from the erased cell's sky position. The meteor and the caret
-/// ignore it: a mend is a birth price, not a gesture.
+/// The mend mark (§23 "The mend"): the typed key this tick births is a typo
+/// fix, within [`spine::MEND_WINDOW_S`] of a run of at most
+/// [`spine::MEND_MAX_DELETES`] Backspaces ([`spine::Spine::mend`]). The ribbon
+/// prices the fix's births at `max(birth_disp, disp)`; stardust may birth the
+/// fix's m2 from the erased cell's sky position; the meteor and the caret
+/// ignore it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Mend {
     /// The last delete's edge ([`spine::EraseMark::at`]).
@@ -528,21 +463,17 @@ pub struct Mend {
     /// The birth spine the deleting interrupted ([`spine::EraseMark::disp`])
     /// — what the fix is born at when the live `birth_disp` is lower.
     pub disp: f32,
-    /// The erased cell's row: the caret's row as observed on the last
-    /// delete's tick.
+    /// The erased cell's row: the caret's row on the last delete's tick.
     pub row: u16,
-    /// The erased cell's column — the cell the last Backspace emptied, which
-    /// is the cell the fix key re-lights. With `deletes` 2 the run emptied
-    /// `col..col + 2`.
+    /// The erased cell's column: the cell the last Backspace emptied, which
+    /// the fix key re-lights. With `deletes` 2 the run emptied `col..col + 2`.
     pub col: u16,
     /// How many deletes the run counted (1 or 2 — a mend never carries more).
     pub deletes: u8,
 }
 
-/// The per-tick read-only context handed to every producer. One struct, so
-/// everything born on a frame is priced by one evaluation of the spine
-/// (§17.1: ribbon width, star counts, meteor width, caret paint and the kitty
-/// bank all read it).
+/// The per-tick read-only context handed to every producer, so everything born
+/// on a frame is priced by one evaluation of the spine (§17.1).
 #[derive(Clone, Copy)]
 pub struct Ctx<'a> {
     /// The frame's present time. Every curve in the theme takes it (T7).
@@ -564,24 +495,18 @@ pub struct Ctx<'a> {
     /// The caret's own field `t` — §6.4's `t_land`, the meteor's phase lock,
     /// and C2's shared colour.
     pub caret_t: f32,
-    /// The band's walk at the caret, `(d, t_zero)` of the cohort that owns the
-    /// caret's cell ([`ribbon::Ribbon::walk_origin_at`]): the walk's distance
-    /// at the caret cell and its `t` at distance zero. Set beside
-    /// [`Ctx::caret_t`] on a move's own ctx only; `None` elsewhere and where
-    /// nothing is laid at the landing. It carries the band's pace past the
-    /// landing cell (`d/16` within the first sixteen cells, `1/36` after),
-    /// which the landing's marks continue (`meteor::LandingWalk`).
+    /// The band's walk at the landing, `(d, t_zero)` of the cohort that owns
+    /// it ([`ribbon::Ribbon::walk_origin_at`]), so the landing's marks continue
+    /// the band's pace (`meteor::LandingWalk`). Set on a move's own ctx only.
     pub caret_walk: Option<(f32, f32)>,
     /// The mend mark, on the one tick that births a typo fix (see [`Mend`]).
     pub mend: Option<Mend>,
-    /// [`spine::Spine::surge`] — how much of the crisp edge's stretch the
-    /// last typed key bought, 0..1. A birth price, like [`Ctx::birth_disp`]:
-    /// only [`ribbon::edge_cells`] reads it, and only where a key lays.
+    /// [`spine::Spine::surge`]: a birth price read only by
+    /// [`ribbon::edge_cells`], where a key lays.
     pub surge: f32,
-    /// The flow state ([`spine::Spine::flow`]): the run, its high-water mark
-    /// and the open ramp. Flow draws nothing of its own; every consumer lerps
-    /// from identity at `heat == 0`, so a cold-hand frame is byte-identical to
-    /// one with no flow.
+    /// The flow state ([`spine::Spine::flow`]). Every consumer lerps from
+    /// identity at `heat == 0`, so a cold-hand frame is byte-identical to one
+    /// with no flow.
     pub flow: Flow,
 }
 
@@ -598,42 +523,27 @@ pub struct Status {
     pub meteors: u32,
     /// Live ribbon cells.
     pub cells: u32,
-    /// `v2_bridged=`: cells the echo ledger has laid since engagement that the
-    /// host's sweeps did not (a refused late echo's glyphs, relit by the next
-    /// licensed one, [`Engine::echo_bridge`]). The admission ring still reads
-    /// `declined no-fresh-hint` for the late move; this row says a hole was
-    /// repaired. Cumulative.
+    /// `v2_bridged=`: cells the echo ledger laid that the host's sweeps did not
+    /// ([`Engine::echo_bridge`]), though the admission ring still reads
+    /// `declined no-fresh-hint` for the late move. Cumulative until a reset.
     pub bridged: u32,
-    /// `ribbon_retired=`: ribbon cells taken off by content over this
-    /// engine's life. The host's witness saw the glyph under them replaced
-    /// (fast melt) or gone (the swoosh) ([`Engine::witness_rows`]).
-    /// Cumulative across [`Engine::reset`], unlike `bridged`, so a
-    /// control-socket reader can tell "its text moved or went" from "the band
-    /// expired".
+    /// `ribbon_retired=`: ribbon cells taken off because the witness saw their
+    /// glyph replaced or gone ([`Engine::witness_rows`]). Cumulative across
+    /// [`Engine::reset`].
     pub retired: u64,
-    /// `ribbon_followed=`: ribbon cells carried with their text over this
-    /// engine's life: to another row by the follow pass (the run's glyphs
-    /// stand a row away as a block, as when a bottom-anchored composer grows
-    /// without a scroll; [`Engine::follow_rows`],
-    /// [`ribbon::Ribbon::translate_run`]), or along their own row by the shift
-    /// pass when a mid-line insert pushes the tail right
+    /// `ribbon_followed=`: ribbon cells carried with their text, across rows
+    /// ([`ribbon::Ribbon::translate_run`]) or along one
     /// ([`ribbon::Ribbon::shift_run`]). Cumulative across [`Engine::reset`].
     pub followed: u64,
-    /// `ribbon_follow_missed=`: the follow pass's misses over this engine's
-    /// life: armed cells whose glyphs left their row while the run's text
-    /// arrived on a neighbouring row the pass did not carry
-    /// ([`witness::FollowScore::missed`]). Each is then judged by the content
-    /// witness where it stood. The healthy number is `0`. Arrivals are weighed
-    /// as the follow weighs them, with twins and a word a wrap relaid at the
-    /// start of the run's row left out ([`witness::Witness::follow_runs`])
-    /// (owner, 2026-09-23).
+    /// `ribbon_follow_missed=`: armed cells whose text arrived on a neighbouring
+    /// row the follow pass did not carry ([`witness::FollowScore::missed`]);
+    /// the content witness then judges each where it stood. Healthy is `0`.
     /// Cumulative across [`Engine::reset`].
     pub follow_missed: u64,
     /// The eased spine.
     pub disp: f32,
-    /// The flow row (`flow=` / `combo=` / `combo_best=`): what a turn-based
-    /// agent reads off the control socket to tell that the human is mid-flow
-    /// and hold its turn.
+    /// The flow row (`flow=` / `combo=` / `combo_best=`), which a turn-based
+    /// agent reads to hold its turn while the human is mid-flow.
     pub flow: Flow,
     /// Glint tokens on hand.
     pub tokens: f32,
@@ -645,13 +555,9 @@ pub struct Status {
 // Cadence — what a producer may ask the host for (§18, T6)
 // ===========================================================================
 
-/// The frame cadence: what a producer asks for while brisk light is live
-/// (something on glass moves every frame: a head in flight, a thrown star, a
-/// mark retracting into the caret, the ribbon head cell's 18 ms `edge-in`).
-/// The design's reference tick (§18, 120 Hz); the host substitutes its own
-/// present interval through seam point 8 ([`Engine::needs_frame_cadence`]), so
-/// this is what engine-level laws are measured against, not a rate the host
-/// must run at.
+/// The frame cadence a producer asks for while something on glass moves every
+/// frame: the design's 120 Hz reference tick (§18); the host substitutes its
+/// own present interval.
 pub const FRAME_CADENCE: Duration = Duration::from_micros(8_333);
 
 /// The tail floor: the soonest a producer may ask to be woken while only
@@ -769,41 +675,31 @@ pub(crate) fn level_step_spend(peak: f32, u: f32, span_s: f32) -> Option<f32> {
 // The echo ledger
 // ===========================================================================
 
-/// The echo patience, seconds: how long a press waits on the ledger for its
-/// echo before it is forgotten as swallowed. An alias of the host's in-flight
-/// patience (`CursorGlow::IN_FLIGHT_PATIENCE_S`), so one press has one
-/// patience whichever layer is asked.
+/// The echo patience, seconds, before a press is forgotten as swallowed: the
+/// host's in-flight patience, so one press has one patience in every layer.
 pub const ECHO_PATIENCE_S: f32 = crate::cursor_glow::IN_FLIGHT_PATIENCE_S;
 
-/// The most cells one observed move may lay from the ledger — the host's
-/// coalesced-sweep cap by alias (`TYPED_STAMP_DEPTH`): more presses than one
-/// move can pair with are presses no move can spend, so the ledger never
-/// holds more either.
+/// The most cells one observed move may lay from the ledger: the host's
+/// coalesced-sweep cap (`TYPED_STAMP_DEPTH`), since presses beyond what one
+/// move can pair with are presses no move can spend.
 pub const ECHO_LEDGER_DEPTH: usize = crate::cursor_glow::TYPED_STAMP_DEPTH;
 
 /// The ribbon's birth floor, seconds. A host sweep is dated at its licensing
 /// key's clock (for a stalled batch, the oldest unpaid press) because the
 /// ledger partitions by it, but the ribbon is born no earlier than one stamp
-/// window before the echo (the host's `TYPE_HINT_FRESH`); otherwise a batch
-/// could be born already faded into a stale cohort. A per-key sweep's key is
-/// inside the window, so `max` is a no-op there.
+/// window (`TYPE_HINT_FRESH`) before the echo, so a batch is never born
+/// already faded.
 pub const SWEEP_BIRTH_FLOOR_S: f32 = crate::cursor_glow::CursorGlow::TYPE_HINT_FRESH;
 
 /// The echo ledger: typed presses whose caret advance the engine has not seen
-/// yet, oldest first, each `(press, cells)`.
-///
-/// One press is one cell of ribbon: a licensed typed move spends the ledger,
-/// oldest first, for every cell it or the host lays ([`Engine::echo_bridge`]),
-/// and a press the caret never answers inside [`ECHO_PATIENCE_S`] is dropped
-/// as swallowed. Fixed-size and `Copy`, like the host's `TypedStamps`, so the
-/// frame path allocates nothing (§18); [`ECHO_LEDGER_DEPTH`] is the most
-/// presses one move could pair with.
+/// yet, oldest first, each `(press, cells)`. One press is one cell of ribbon
+/// ([`Engine::echo_bridge`]); a press unanswered inside [`ECHO_PATIENCE_S`] is
+/// dropped as swallowed. Fixed-size and `Copy` (§18).
 #[derive(Clone, Copy, Debug)]
 pub struct EchoLedger {
     /// Packed oldest-first: every `Some` precedes every `None`.
     slots: [Option<(Instant, u16)>; ECHO_LEDGER_DEPTH],
-    /// The Tier-1 projection of `EchoLedgerBridge`'s tallies — test-only, so
-    /// the shipping frame path carries nothing for it.
+    /// The Tier-1 projection of `EchoLedgerBridge`'s tallies (test-only).
     #[cfg(test)]
     tally: LedgerTally,
 }
@@ -970,14 +866,11 @@ impl EchoLedger {
 // The engine
 // ===========================================================================
 
-/// The v2 engine (§17.1): the object `CursorGlow` delegates to at the twelve
-/// seam points. Deterministic and clockless: every entry point takes an
-/// injected `now`, and there is no per-frame RNG (§18).
+/// The v2 engine (§17.1) `CursorGlow` delegates to at the twelve seam points.
+/// Every entry point takes an injected `now`; no per-frame RNG (§18).
 #[derive(Clone, Debug)]
 pub struct Engine {
-    /// Whether this engine owns the frame at all — the `if self.v2.engaged()`
-    /// of every seam point. False for the other nine styles, and false for
-    /// rainbow kitty while the migration flag is off (§17.3 phase 3).
+    /// Whether this engine owns the frame (the gate of every seam point).
     engaged: bool,
     /// Reduced-motion posture, mirrored into [`Ctx::cfg`] each tick.
     reduced_motion: bool,
@@ -995,106 +888,76 @@ pub struct Engine {
     /// observation's), the cell a `Typed` key lays against.
     caret: (u16, u16),
     /// Whether the mirror has been learned from an observed move since the
-    /// last [`Engine::reset`]. Until then the ledger reads no hole and pays
-    /// only a same-row echo's own advance, from the host's `from`
-    /// ([`Engine::echo_bridge`]).
+    /// last [`Engine::reset`]; until then the ledger reads no hole.
     caret_known: bool,
-    /// A caret the host observed on another row without a licence
-    /// ([`Engine::observe_caret`]), waiting for the end of the tick it was
-    /// reported in: the events buffered before it were typed at the caret
-    /// the engine held then, and are laid there.
+    /// A caret observed on another row without a licence
+    /// ([`Engine::observe_caret`]), applied at the end of the tick so the
+    /// events buffered before it lay at the caret they were typed at.
     caret_seen: Option<(u16, u16)>,
     /// The echo ledger (see [`EchoLedger`]).
     echo: EchoLedger,
     /// Cells the ledger has laid that the host did not sweep — [`Status::bridged`].
     bridged: u32,
-    /// The clock of the host's own sweep for the last observed move — the
-    /// licensing key the ledger partitioned by — or `None` when the host
-    /// sent none. Test-only: the Tier-1 twin asserts it IS the key's clock
-    /// on every move, so the partition it projects is the engine's own.
+    /// The clock of the host's sweep for the last observed move, the key the
+    /// ledger partitioned by (test-only, for the Tier-1 twin).
     #[cfg(test)]
     last_host_sweep_at: Option<Instant>,
-    /// Every [`Event::Kill`] received. Test-only: the seam's one-kill-one-
-    /// `Kill` pin counts them.
+    /// Every [`Event::Kill`] received (test-only).
     #[cfg(test)]
     kills: u32,
-    /// The cell the last Backspace emptied — the caret as of that erase's
-    /// tick (the ribbon's and the sky's own reading of it) — published as
-    /// [`Mend::row`] / [`Mend::col`] when a fix key mends the run.
+    /// The cell the last Backspace emptied (the caret as of that erase's tick),
+    /// published as [`Mend::row`] / [`Mend::col`].
     erased: (u16, u16),
-    /// The erase mark a typed key just spent ([`spine::Spine::mend`] read on
-    /// its edge), waiting for the tick that births the key to publish it as
-    /// [`Ctx::mend`]. Taken by that tick.
+    /// The erase mark a typed key just spent, published as [`Ctx::mend`] by
+    /// the tick that births the key.
     mend: Option<spine::EraseMark>,
-    /// The focused pane's `(first column, width)` in grid cells, when the
-    /// host has told us (`CursorGlow::note_pane_columns`); a typed fold
-    /// wraps at its edges, never the grid's. Survives `reset` — it is the
-    /// host's layout, not the engine's state.
+    /// The focused pane's `(first column, width)` (`CursorGlow::note_pane_columns`):
+    /// a typed fold wraps at its edges. The host's layout, so it survives a reset.
     pane: Option<(u16, u16)>,
-    /// The focused pane's `(first row, rows)` — the companion to
-    /// [`Engine::pane`], for the reach below a row
-    /// ([`ribbon::Ribbon::pane_rows`]). Stored whether or not engaged.
+    /// The focused pane's `(first row, rows)`, bounding the reach below a row.
     pane_rows: Option<(u16, u16)>,
-    /// Events buffered since the last tick, with their own edges. Resident and
-    /// reused (`clear()` keeps capacity), so the steady path allocates nothing
-    /// (§18).
-    ///
-    /// Buffered because a birth needs geometry: `on_event` has no `Geom`, and
-    /// §5.4's zones are relative to the ribbon's planned top edge. Seam points
-    /// 1 and 2 run inside the host's tick before seam point 3, so a buffered
-    /// event is still drawn on the frame the caret was observed (T2).
+    /// Events buffered since the last tick, with their own edges; resident
+    /// (§18). Buffered because a birth needs geometry `on_event` lacks; seam
+    /// points 1 and 2 run inside the host's tick before point 3, so a
+    /// buffered event still draws on the frame the caret was observed (T2).
     events: Vec<(Event, Instant)>,
-    /// The frame's first one-shot move (a move whose licence is not an echo,
-    /// or an erase's retreat, [`Engine::is_erase_retreat`]) as `(its index in
-    /// events, the caret before it)`. A `Typed` buffered before it (type-ahead
-    /// before the response landed) is replayed at that caret
-    /// ([`Engine::replay_events`]). The caret is `None` when no licensed move
-    /// has seeded the mirror ([`Engine::caret_known`]); such a key is held
-    /// with no cell. The index follows the buffer (a bridge sweep inserted at
-    /// the front shifts it) and the caret follows the text: it is translated at
-    /// the scroll and band seams and forgotten when its row goes
-    /// ([`Engine::translate_pre_move`]). Taken every tick, cleared by
-    /// [`Engine::reset`].
+    /// The frame's first one-shot move (a non-echo licence, or an erase's
+    /// retreat) as `(its index in events, the caret before it)`. A `Typed`
+    /// buffered before it replays at that caret ([`Engine::replay_events`]),
+    /// or is held with no cell when the caret is `None`. The index shifts with
+    /// a sweep inserted at the front ([`Engine::lay_bridge`]) and the caret
+    /// follows the text ([`Engine::translate_pre_move`]). Taken every tick.
     pre_move: Option<(usize, Option<(u16, u16)>)>,
-    /// Heroes the host earned since the last tick (the kitty's Delight edge,
-    /// `(cell, edge)`), dealt in pass 2 beside the events because a birth
-    /// needs the planned bands. Resident and reused, like `events`.
+    /// Heroes the host earned since the last tick, `(cell, edge)`, dealt in
+    /// pass 2 because a birth needs the planned bands.
     earned: Vec<((u16, u16), Instant)>,
-    /// Cues minted and not yet flushed into a [`Frame`] — see
-    /// [`Engine::drain_sound_cues`]. Resident; `append` keeps capacity.
+    /// Cues minted and not yet flushed into a [`Frame`].
     pending_cues: Vec<SoundCue>,
     /// The impulse awaiting [`Engine::take_companion_impulse`].
     companion: Option<CompanionImpulse>,
-    /// A bar fan or drop fan the host asked for this frame (§27) —
-    /// `(edge, stars, ring)` — dealt to the meteor pool on the next
-    /// [`Engine::tick`] against that frame's `Ctx`. Like `earned`, it is
-    /// not a cursor event.
+    /// A bar or drop fan the host asked for this frame (§27), `(edge, stars,
+    /// ring)`, dealt to the meteor pool on the next [`Engine::tick`].
     party: Option<(Instant, u8, bool)>,
-    /// The last credited landing the caret's re-light floors its paint from
-    /// (§7.1, [`CaretSeam::paint`]). Never a typed echo (typing paint is the
-    /// spine's); `None` once the re-light has run its `RELIGHT_LIFE_S`.
+    /// The last credited landing, which floors the caret's paint (§7.1) until
+    /// `RELIGHT_LIFE_S` has run.
     paint_at: Option<Instant>,
     /// The last frame's fingerprint — `is_active` follows it (§17.2).
     fp: u64,
     /// The last frame's counters (seam point 12).
     status: Status,
-    /// Whether the last frame drawn carried brisk light (per-frame motion on
-    /// glass), the answer [`Engine::needs_frame_cadence`] gives. Cached at the
-    /// end of [`Engine::tick`] because seam point 8 takes no clock and the
-    /// host asks right after the tick; false whenever nothing is live (T6).
+    /// Whether the last frame carried per-frame motion, cached at the end of
+    /// [`Engine::tick`] for [`Engine::needs_frame_cadence`], which takes no
+    /// clock.
     brisk: bool,
     /// The content witness ([`witness`]): what glyph each resident ribbon cell
     /// was first seen over, so an overwrite or a blanking can retire it
     /// ([`Engine::witness_rows`]).
     witness: Witness,
-    /// The cells one witness walk named for retirement, by identity
-    /// (`(row, col, born)` — a position can hold a stale cell under a fresh
-    /// one) — resident scratch, cleared by the walk, so a frame that
-    /// retires nothing allocates nothing (§18).
+    /// The cells one witness walk retires, by identity `(row, col, born)` (a
+    /// position can hold a stale cell under a fresh one); resident scratch.
     retire_scratch: Vec<(u16, u16, Instant)>,
-    /// The witness's other verdict, resident beside it: the cells whose
-    /// glyph went and nothing replaced it, released to the swoosh
-    /// ([`Engine::witness_rows`], [`ribbon::Ribbon::release_cells`]).
+    /// The cells whose glyph went with nothing in its place, released to the
+    /// swoosh ([`ribbon::Ribbon::release_cells`]); scratch.
     release_scratch: Vec<(u16, u16, Instant)>,
     restore_scratch: Vec<(u32, Option<Instant>)>,
     restored_scratch: Vec<u32>,
@@ -1104,19 +967,14 @@ pub struct Engine {
     followed: u64,
     /// [`Status::follow_missed`]'s tally. Survives [`Engine::reset`].
     follow_missed: u64,
-    /// The follow pass's verdicts this tick ([`Engine::follow_rows`]) —
-    /// resident scratch, cleared by the search.
+    /// The follow pass's verdicts this tick ([`Engine::follow_rows`]); scratch.
     follow_scratch: Vec<witness::FollowRun>,
-    /// The shift pass's verdicts this tick ([`Engine::follow_rows`], the
-    /// band following its text along its row) — resident scratch, cleared
-    /// by the search.
+    /// The shift pass's verdicts this tick (along a row); scratch.
     shift_scratch: Vec<witness::ShiftRun>,
-    /// The identities the follow pass moved this tick, for the witness's
-    /// re-keying — resident scratch.
+    /// The identities the follow pass moved, for the witness's re-keying.
     moved_scratch: Vec<(u16, u16, Instant)>,
-    /// The rows the host was asked for this frame and did not deliver —
-    /// the first `withheld_n` ([`Engine::follow_rows`] finds them,
-    /// [`Engine::witness_rows`] hands them to the walk and clears them).
+    /// The first `withheld_n` are rows asked for this frame and not delivered
+    /// ([`Engine::follow_rows`]), consumed by [`Engine::witness_rows`].
     withheld: [u16; witness::WITNESS_ROWS + witness::ARMING_ROWS],
     withheld_n: usize,
     /// The grid's row count as of the last tick, so
@@ -1125,35 +983,24 @@ pub struct Engine {
     /// A held park's clock while its flush is being judged
     /// ([`Engine::set_flush_clock`], [`Engine::on_event`]).
     flush_clock: Option<Instant>,
-    /// The soft-wrapped caret the seam judged this frame, with its key's clock
-    /// ([`Engine::note_soft_wrap`]); taken by the replay.
+    /// The seam's soft-wrap verdict and its key's clock
+    /// ([`Engine::note_soft_wrap`]).
     soft_wrap: Option<(ribbon::SoftWrap, Option<Instant>)>,
-    /// The lifted word the seam judged this frame, with its key's clock
-    /// ([`Engine::note_lift`]); taken by the replay.
+    /// The seam's lift verdict and its key's clock ([`Engine::note_lift`]).
     lift: Option<(ribbon::Lift, Option<Instant>)>,
-    /// The seam's verdict that the soft-wrapped word came down, for the `Move`
-    /// from the carry's landing to `.1` ([`Engine::note_reflow`]); taken by
-    /// the replay.
+    /// The seam's reflow verdict ([`Engine::note_reflow`]); taken by the replay.
     reflow: Option<(ribbon::SoftWrap, (u16, u16))>,
-    /// The revive: the seam's verdict that the `Sweep` it pushed re-lays a
-    /// retired typed run, with that run's walk ([`Engine::note_revive`]);
-    /// taken by the replay.
+    /// The seam's revive verdict ([`Engine::note_revive`]); taken by the replay.
     revive: Option<ribbon::Revive>,
-    /// Hidden for one frame ([`Engine::hide_next_frame`]): the next tick runs
-    /// every clock and writes nothing while the viewport shows history. Taken
-    /// by the tick.
+    /// Hidden for one frame ([`Engine::hide_next_frame`]); taken by the tick.
     hidden: bool,
-    /// **THE HOLE TRIPWIRE** (the module doc's diagnostics): `None` unless
-    /// a host armed it ([`Engine::trace_holes`]) — so the frame path pays
-    /// nothing for it but one `is_some` per tick. Survives
-    /// [`Engine::reset`]: arming is the host's choice, not frame state.
+    /// The hole tripwire, `None` unless a host armed it
+    /// ([`Engine::trace_holes`]). Survives [`Engine::reset`].
     holes: Option<Box<holes::HoleTrace>>,
 }
 
 impl Default for Engine {
-    /// The same engine [`Engine::new`] builds — there is one constructor
-    /// contract, so a caller reaching this through `Default` gets the full
-    /// glint bucket a session starts with and not a silent first capital.
+    /// [`Engine::new`]: a full glint bucket, so the first capital chimes.
     fn default() -> Self {
         Self::new()
     }
@@ -1221,20 +1068,16 @@ impl Engine {
 
     // -- the seam's gate ---------------------------------------------------
 
-    /// The gate: `true` when this engine owns the frame. Every one of the
-    /// twelve delegation points is one `if self.v2.engaged()` (D14); when
-    /// `false`, `CursorGlow` behaves as it does for the other styles.
+    /// `true` when this engine owns the frame: the `if self.v2.engaged()` of
+    /// every seam point (D14).
     #[must_use]
     pub fn engaged(&self) -> bool {
         self.engaged
     }
 
-    /// Engage or disengage. Disengaging drops everything live (marks, the
-    /// spine, and events buffered since the last tick) through
-    /// [`Engine::reset`]: a style switch hands its residue to the crossfade
-    /// ghost. An event reported but not ticked before the switch is discarded
-    /// (its light was never drawn, so no sound is minted; see
-    /// [`Engine::drain_sound_cues`]).
+    /// Engage or disengage. A change drops everything live, buffered events
+    /// included, through [`Engine::reset`]; an event not ticked before the
+    /// switch mints no sound (its light was never drawn).
     pub fn set_engaged(&mut self, on: bool) {
         if self.engaged != on {
             self.engaged = on;
@@ -1244,27 +1087,18 @@ impl Engine {
 
     // -- seam points 1 and 2: events ---------------------------------------
 
-    /// Seam points 1 and 2: everything the host tells v2. Point 1 is `spawn`,
-    /// after the licence gate and `classify_move`, handing over an
-    /// [`Event::Move`]; point 2 is `note_typed` / `note_erase` / `note_kill` /
-    /// `note_return`.
+    /// Seam points 1 and 2: point 1 is `spawn` handing over an [`Event::Move`];
+    /// point 2 is `note_typed` / `note_backspace` / `note_kill` / `note_return`.
     ///
-    /// The event is buffered and applied at the next [`Engine::tick`], which is
-    /// the same frame (T2). The spine's metric moves here, immediately, since
-    /// it is geometry-free and this frame's births must be priced by it; its
-    /// display follower advances once, in `tick`.
+    /// The event is buffered and applied at the next [`Engine::tick`], the same
+    /// frame (T2). The spine's metric moves here, since this frame's births are
+    /// priced by it; its display follower advances once, in `tick`. Cues carry
+    /// the display spine, so all are minted in `tick`; only the kitty's Wince
+    /// (§8.2) is minted on the edge.
     ///
-    /// No sound cue is minted here: a cue carries `heat` (the display spine),
-    /// and minting on the edge would price it by last frame's follower while
-    /// the light is priced by this frame's. Every cue is minted in
-    /// [`Engine::tick`] after the one `Spine::update`. Only the kitty's Wince
-    /// on an erase or kill (§8.2) is minted on the edge: a pose, priced by
-    /// nothing.
-    ///
-    /// The mend is read on the edge (§23): a typed key asks the spine whether
-    /// it is a typo fix ([`spine::Spine::mend`]) before advancing the metric
-    /// (which closes the erase run), and a `Some` is held for the tick that
-    /// births the key, which publishes it as [`Ctx::mend`].
+    /// A typed key asks [`spine::Spine::mend`] whether it is a typo fix before
+    /// advancing the metric (which closes the erase run); a `Some` is held for
+    /// the tick that births the key, published as [`Ctx::mend`] (§23).
     pub fn on_event(&mut self, ev: Event, now: Instant) {
         if !self.engaged {
             return;
@@ -1313,20 +1147,13 @@ impl Engine {
             | Event::CancelComposerNewline
             | Event::Sweep { .. } => {}
         }
-        // A flushed park's events belong before the keys pressed since. The
-        // park is judged on the tick of the next key, whose `Typed` was banked
-        // at its press, before the flush's `Move` and landing `Sweep` were
-        // minted. Replayed in bank order, a Space after the wrap would re-anchor
-        // the moved word from the wrong space and drop the landing cell the
-        // flush swept (`tests/composer_box_growth_wrap.rs`). The flush's events
-        // go in before the first `Typed` pressed after the park's clock.
-        //
-        // Consequence: a key whose echo was a parked one-cell retreat replays
-        // after it, finds no echo in the frame and is held
-        // ([`Engine::replay_events`]), so the witness sees the row's last glyph
-        // blank under an armed cell and releases it
-        // (`tests/wrapped_composer_band.rs`, `c2_bs`). A partial release takes
-        // no space from between standing letters (`Witness::walk`).
+        // A flushed park's events go before the keys pressed since: the park
+        // is judged on the next key's tick, after that key's `Typed` was
+        // banked. In bank order a Space after the wrap would re-anchor the
+        // moved word from the wrong space and drop the landing cell
+        // (`tests/composer_box_growth_wrap.rs`). So a key whose echo was a
+        // parked one-cell retreat replays after it and is held, and the witness
+        // releases the row's last glyph (`tests/wrapped_composer_band.rs`).
         if let Some(park) = self.flush_clock
             && let Some(i) = self
                 .events
@@ -1402,11 +1229,7 @@ impl Engine {
     }
 
     /// A licensed move, seam point 1's own event. The ledger reads the mirror
-    /// before the move lands on it, and the mirror follows the landing at the
-    /// end. In order: the host's sweep ([`Engine::host_sweep_for`]), what the
-    /// hole owes ([`Engine::echo_bridge`]), the birth floor, the bridge
-    /// ([`Engine::lay_bridge`]), the type-ahead record
-    /// ([`Engine::record_pre_move`]), then the mirror.
+    /// before the move lands on it; the mirror follows the landing last.
     fn on_move(&mut self, from: (u16, u16), to: (u16, u16), licence: Licence, now: Instant) {
         let host_sweep = self.host_sweep_for(from, to);
         #[cfg(test)]
@@ -1414,9 +1237,7 @@ impl Engine {
             self.last_host_sweep_at = host_sweep;
         }
         let bridge = self.echo_bridge(from, to, licence, host_sweep, now);
-        // The ribbon's birth floor ([`SWEEP_BIRTH_FLOOR_S`]): born no earlier
-        // than one stamp window before the echo, whatever clock the ledger
-        // partitioned by.
+        // The birth floor ([`SWEEP_BIRTH_FLOOR_S`]).
         let floor = now
             .checked_sub(Duration::from_secs_f32(SWEEP_BIRTH_FLOOR_S))
             .unwrap_or(now);
@@ -1670,51 +1491,31 @@ impl Engine {
     /// The late echo's cells: what a licensed typed move owes the presses
     /// before it.
     ///
-    /// The seam licenses a caret move only within `0.25 s` of a keypress and
-    /// refuses a later echo (it cannot tell one from program output), so a key
-    /// a stalled TUI echoed late would leave a dark hole in the rainbow. This
-    /// engine can tell: every [`Event::Typed`] is a real press, banked on the
-    /// [`EchoLedger`] until a caret advance pays for it, and every licensed
-    /// move carries the host's `from` (the last observed cell) beside the
-    /// engine's mirror (the last licensed one). When a licensed typed move
-    /// lands forward on the mirror's row with `from` past the mirror, and the
-    /// hop plus the move's own advance is paid cell for cell by ledger presses,
-    /// those cells are laid as one [`Event::Sweep`] from the mirror to the
-    /// landing, on the move's own clock (T2), joining their cohort. The same
-    /// sweep covers a licensed multi-cell echo the host did not sweep itself.
+    /// The seam licenses a caret move only within `0.25 s` of a keypress, so a
+    /// key a stalled TUI echoed late would leave a dark hole. When a licensed
+    /// typed move lands forward on the mirror's row and the hop plus the move's
+    /// advance is paid cell for cell by banked presses, those cells are laid as
+    /// one [`Event::Sweep`] from the mirror on the move's own clock (T2); the
+    /// same sweep covers a multi-cell echo the host did not sweep itself.
     ///
-    /// Limits:
-    ///
-    /// * T1 holds: geometry is born only on this observed, licensed move.
-    /// * A cell is laid only against a press that could have produced it. The
-    ///   host's sweep rides the licensing press's clock (`typed_at`); younger
-    ///   presses' glyphs lie right of its cell, so the hole to its left is
-    ///   paid only by older presses, exactly.
-    /// * A hop the older presses do not explain exactly (vim's `w`, a mouse
-    ///   click, program output, a swallowed key beside a real hole) buys
-    ///   nothing and forgets the ledger, so a swallowed press never rolls
-    ///   forward as a phantom credit.
-    /// * An unswept move is laid from the oldest presses only when it starts
-    ///   at the mirror.
+    /// * A cell is laid only against a press that could have produced it: the
+    ///   host's sweep rides the licensing press's clock, so the hole to its
+    ///   left is paid only by older presses, exactly.
+    /// * A hop the presses do not explain exactly (vim's `w`, a click, program
+    ///   output, a swallowed key) buys nothing and forgets the ledger, so a
+    ///   swallowed press never rolls forward as a phantom credit.
+    /// * An unswept move is paid by the oldest presses only when it starts at
+    ///   the mirror.
     /// * An unset mirror ([`Engine::caret_known`]) measures no hole: the first
-    ///   licensed same-row echo is read from its own `from` and paid by the
-    ///   presses in flight, so a composer's coalesced first repaint is laid; a
-    ///   cold backward move keeps the presses waiting; a cold `Insert` returns
-    ///   `Some(from.1)` with `spend(0)`.
-    /// * The bound is the host's coalesce cap ([`ECHO_LEDGER_DEPTH`]); a press
-    ///   older than [`ECHO_PATIENCE_S`] was swallowed and buys nothing.
+    ///   same-row echo is read from its own `from`; a cold backward move keeps
+    ///   the presses waiting.
     /// * A non-typed licence, an erase or kill, a focus loss, a row change, a
     ///   scroll and a reset all clear the ledger.
     ///
-    /// A stalled batch is swept by the host on its oldest press's clock, so the
-    /// whole batch is spent; a batch drained across two frames keeps its tail
-    /// here for the next key. The ribbon's birth is floored separately
-    /// ([`SWEEP_BIRTH_FLOOR_S`], in [`Engine::on_move`]).
-    ///
     /// `key_at` is the host sweep's clock when the host swept this move.
-    /// Returns the first cell of a sweep from there to the landing when the
-    /// ledger paid, or `None`. The ribbon lays only what no live cell owns, so
-    /// overlapping the host's sweep lays nothing twice and keeps one cohort.
+    /// Returns the sweep's first cell when the ledger paid. The ribbon lays
+    /// only what no live cell owns, so overlapping the host's sweep lays
+    /// nothing twice.
     fn echo_bridge(
         &mut self,
         from: (u16, u16),
@@ -1724,10 +1525,9 @@ impl Engine {
         now: Instant,
     ) -> Option<u16> {
         self.echo.expire(now);
-        // The cold start: a mirror nobody has set measures no hole, so the
-        // hop is read from the host's own `from` (the move's advance only) and
-        // paid as an unswept move starting at the mirror is. This keeps a
-        // composer's coalesced first keys lit.
+        // The cold start: an unset mirror measures no hole, so the hop is read
+        // from the host's own `from` and paid like an unswept move at the
+        // mirror, which keeps a composer's coalesced first keys lit.
         let known = self.caret_known;
         let (mrow, mcol) = if known { self.caret } else { from };
         let insert = licence == Licence::Insert;
@@ -1788,9 +1588,8 @@ impl Engine {
     }
 
     /// The focused pane's `(first column, width)`, or `None` for the whole
-    /// grid — the edges a typed fold wraps at: folded at the grid edge, a
-    /// split pane's wrap lit a cell in the neighbouring pane. Stored whether
-    /// or not the engine is engaged.
+    /// grid: the edges a typed fold wraps at, so a split pane's wrap never
+    /// lights a cell in the neighbouring pane. Stored whether or not engaged.
     pub fn set_pane(&mut self, pane: Option<(u16, u16)>) {
         self.pane = pane;
     }
@@ -1802,21 +1601,14 @@ impl Engine {
         self.pane_rows = pane_rows;
     }
 
-    /// The mirror follows the observed caret across a row. A caret relocation
-    /// the licence gate declines (a TUI re-laying its input box a row up with
-    /// no key behind it, a hidden→visible warp) moves the caret mirror, so the
-    /// next key lays on the row under the hand.
-    ///
-    /// Row changes only: the same-row hop is the echo ledger's
-    /// ([`Engine::echo_bridge`]), which needs the mirror to measure a refused
-    /// echo's hole. A row change is where the ledger forgets anyway, so the
-    /// presses are forgotten with the move ([`EchoLedger::forget`]).
-    ///
-    /// No event is buffered, no licence minted, no light born, no clock moved
-    /// (T1). The mirror moves at the end of the tick this is reported in
-    /// ([`Engine::tick`]), so a `Typed` already buffered is laid at the caret
-    /// it was typed at. Inert while disengaged and until a licensed move has
-    /// seeded the mirror.
+    /// The mirror follows the observed caret across a row. A relocation the
+    /// licence gate declines (a TUI re-laying its input box a row up, a
+    /// hidden→visible warp) moves the caret mirror, so the next key lays on the
+    /// row under the hand; the same-row hop is the echo ledger's
+    /// ([`Engine::echo_bridge`]). Nothing is buffered, licensed or born (T1).
+    /// The mirror moves at the end of the tick this is reported in, so a
+    /// `Typed` already buffered lays at the caret it was typed at. Inert until
+    /// a licensed move has seeded the mirror.
     pub fn observe_caret(&mut self, to: (u16, u16)) {
         if !self.engaged || !self.caret_known || to.0 == self.caret.0 {
             return;
@@ -1825,23 +1617,15 @@ impl Engine {
     }
 
     /// The content witness's walk ([`witness`]): read every resident ribbon
-    /// cell against this frame's `rows` (sampled under the terminal lock after
-    /// the PTY batch), arm cells first seen over a glyph, then act on the two
-    /// verdicts: cells whose glyph was replaced (or whose run was judged
-    /// moved) are retired on the fast melt ([`ribbon::Ribbon::retire_cells`]),
-    /// and cells whose glyph went are released to the swoosh
-    /// ([`ribbon::Ribbon::release_cells`]).
+    /// cell against this frame's `rows`, arm cells first seen over a glyph,
+    /// retire on the fast melt the cells whose glyph was replaced (or whose run
+    /// was judged moved, [`ribbon::Ribbon::retire_cells`]), and release to the
+    /// swoosh the cells whose glyph went ([`ribbon::Ribbon::release_cells`]).
     ///
     /// Run right after [`Engine::tick`], so a cell laid this tick is armed on
-    /// the frame it is born. Each cell is counted once on [`Status::retired`]
-    /// (re-verdicts on a released cell that is then overwritten are taken off
-    /// the count). Returns how many cells were newly retired or released; 0
-    /// while disengaged or with no rows. The ledger is untouched.
-    ///
-    /// Runs moved as a block a row or two away were already carried by
-    /// [`Engine::follow_rows`] at the start of the tick, and are read here on
-    /// their new row; a row whose text is intact under a caret that warped
-    /// away is not retired.
+    /// the frame it is born. Returns how many cells were newly retired or
+    /// released (each counts once on [`Status::retired`]); 0 while disengaged
+    /// or with no rows.
     pub fn witness_rows(&mut self, rows: &[RowSample<'_>], now: Instant) -> u32 {
         // This frame's withheld rows ([`Engine::follow_rows`]) are read once.
         let withheld_n = std::mem::take(&mut self.withheld_n);
@@ -1898,27 +1682,18 @@ impl Engine {
     /// while disengaged; allocates nothing.
     ///
     /// * The bands' rows fill at most the first [`witness::WITNESS_ROWS`]
-    ///   slots: the hand's run and the rows above and below it first, then
-    ///   other resident rows and their neighbours (deduped, within the grid).
-    ///   The neighbours let the follow pass see where text went when a
-    ///   bottom-anchored box grew a row. Counted per cohort, matching the
-    ///   walk; past the budget the surplus keeps its own clocks. The focused
-    ///   row is the cohort on the caret's row, else the most recently alive.
-    /// * The arming rows follow, up to [`witness::ARMING_ROWS`] more: the row
-    ///   a waiting key will lay its cell on this frame (`arming`, known to the
-    ///   host from `CursorGlow::ribbon_rows`) and the rows one above and below
-    ///   it, so a copy of its glyph there is seen as a twin at once
-    ///   (`tests/erased_under_its_twin.rs`). They have their own slots, so the
-    ///   two groups never crowd each other out; the host gives
-    ///   [`crate::cursor_glow::CURSOR_WITNESS_ROWS`] slots (eight bands', three
-    ///   arming, the caret's row).
+    ///   slots: the focused cohort's row (the caret's, else the most recently
+    ///   alive) and its neighbours first, then other resident rows and their
+    ///   neighbours, so the follow pass can see where text went when a
+    ///   bottom-anchored box grew a row.
+    /// * The arming rows follow in their own [`witness::ARMING_ROWS`] slots:
+    ///   the row a waiting key will lay on this frame (`arming`) and the rows
+    ///   above and below it, so a copy of its glyph there is seen as a twin at
+    ///   once (`tests/erased_under_its_twin.rs`).
     ///
     /// No row two away is named: a copy of the line two rows off (a re-sorted
     /// fzf list, a quoted composer) must not be taken for where it went
-    /// (`tests/copies_are_not_moves.rs`). Such a row is still sampled when it
-    /// is the caret's or another band's neighbour. The host records the list
-    /// it handed out, and [`Engine::follow_rows`] counts as withheld only rows
-    /// of that list.
+    /// (`tests/copies_are_not_moves.rs`).
     pub fn ribbon_rows_for(&self, arming: Option<u16>, out: &mut [u16]) -> usize {
         if !self.engaged {
             return 0;
@@ -1986,37 +1761,26 @@ impl Engine {
     }
 
     /// The follow pass: the band follows its text. Run by the host at the
-    /// start of the tick on this frame's samples (the rows
-    /// [`Engine::ribbon_rows_for`] named), before the tick replays the frame's
-    /// events and so before a composer's re-anchor
-    /// ([`ribbon::Ribbon::re_anchor`]) stamps the old row.
+    /// start of the tick on the rows [`Engine::ribbon_rows_for`] named, before
+    /// the replay (so before a composer's re-anchor stamps the old row).
     ///
-    /// * Along the row first: a mid-line insert that pushed the tail right on
-    ///   its own row ([`witness::Witness::shift_runs`]) moves its light with
-    ///   it ([`ribbon::Ribbon::shift_run`]), so a shifted tail is never
-    ///   mistaken for text that left.
-    /// * Then across rows: every run whose armed glyphs left their row and
-    ///   stand one row away at their own columns as a block
-    ///   ([`witness::Witness::follow_runs`]) is translated there with every
-    ///   clock, price and `t` intact ([`ribbon::Ribbon::translate_run`]). A
-    ///   run carried away from the caret's row is set flowing
-    ///   ([`ribbon::Cohort::flow`]), as a shell wrap does; a flowing run
-    ///   carried back onto the caret's row is re-wet, and one carried back
-    ///   onto the new-line seam's row takes the seam with it.
+    /// * Along the row first: a mid-line insert that pushed the tail right
+    ///   ([`witness::Witness::shift_runs`]) moves its light with it
+    ///   ([`ribbon::Ribbon::shift_run`]), so a shifted tail is never mistaken
+    ///   for text that left.
+    /// * Then across rows: a run whose armed glyphs stand one row away at their
+    ///   own columns as a block ([`witness::Witness::follow_runs`]) is
+    ///   translated there with every clock, price and `t` intact
+    ///   ([`ribbon::Ribbon::translate_run`]). A run carried off the caret's row
+    ///   is set flowing ([`ribbon::Cohort::flow`]); one carried back onto it is
+    ///   re-wet; one carried onto the new-line seam's row takes the seam along.
     ///
-    /// Both passes count on [`Status::followed`]; arrivals no offset named are
-    /// counted on [`Status::follow_missed`]. Returns how many cells moved.
-    /// Deterministic in `(records, samples)`; allocates nothing on the steady
-    /// path.
-    ///
-    /// `asked` is the list the host was asked for this frame (recorded by
-    /// `CursorGlow::ribbon_rows`). Before either pass, rows of it missing from
-    /// `rows` but inside the grid and the focused pane are kept as withheld,
-    /// and [`Engine::witness_rows`] defers judging runs beside them for one
-    /// walk (`witness::Witness::find_deferred_runs`); a composed host can drop
-    /// rows when a PTY chunk lands between its locks. A run the shift pass
-    /// carried stands under its glyphs and is not deferred. A content-proved
-    /// short held park may borrow the move of its source row.
+    /// Both count on [`Status::followed`]; arrivals no offset named count on
+    /// [`Status::follow_missed`]. Returns how many cells moved. Rows in `asked`
+    /// but missing from `rows` while inside the grid and the focused pane (a
+    /// composed host can drop rows when a PTY chunk lands between its locks)
+    /// are withheld, and [`Engine::witness_rows`] defers runs beside them for
+    /// one walk.
     pub fn follow_rows(&mut self, rows: &[RowSample<'_>], asked: &[u16], now: Instant) -> u32 {
         self.follow_rows_with_park(rows, asked, now, None).0
     }
@@ -2085,11 +1849,11 @@ impl Engine {
             }
             return (n, false);
         }
-        // Read the park's source run once, before any follow mutates the
-        // ribbon. A composer may carry only its short kept prefix to another
-        // row while its long trailing word stays for the parked echo to
-        // relay. The moved span can therefore be far from the caret, but it
-        // must share the live run of the glyph immediately behind the park.
+        // Read the park's source run before any follow mutates the ribbon. A
+        // composer may carry only its short kept prefix to another row while its
+        // long trailing word stays for the parked echo to relay, so the moved
+        // span may lie far from the caret but must share the live run of the
+        // glyph immediately behind the park.
         let park_owner = park.and_then(|(from, to)| {
             if from.0 != to.0 || !(1..=2).contains(&from.1.saturating_sub(to.1)) {
                 return None;
@@ -2128,11 +1892,9 @@ impl Engine {
             self.witness
                 .translate_cells(&mut self.moved_scratch, run.dr);
             // The echo that crossed with its text: a key typed as the composer
-            // grew a row in the same frame arrives as the cross-row move
-            // `(R, c) → (R+dr, c')`, so neither the host's sweep nor the
-            // bridge laid it. In the text's own frame it is the same-row
-            // advance `c → c'` on the row the run now stands on; that sweep is
-            // laid here, on the move's clock (owner, 2026-09-27).
+            // grew a row arrives as `(R, c) → (R+dr, c')`, which neither the
+            // host's sweep nor the bridge laid; in the text's frame it is the
+            // same-row advance `c → c'`.
             if self.caret_known && self.caret.0 == target {
                 self.lay_crossed_echo(run, target);
             }
@@ -2235,14 +1997,10 @@ impl Engine {
         }
     }
 
-    /// The verdict: a shell command came back green after a long run, reported
-    /// by the host on the OSC 133/633 `D` it already dedupes. Not a cursor
-    /// event, so not an [`Event`].
-    ///
-    /// No light is born here: every light has a keystroke behind it. This only
-    /// opens [`spine::Spine::note_verdict`]'s door, so the first key typed
-    /// inside [`spine::VERDICT_WINDOW_S`] is born at full momentum. Gated on
-    /// `engaged`.
+    /// The verdict: a shell command came back green after a long run (the
+    /// host's deduped OSC 133/633 `D`). Draws nothing: it opens
+    /// [`spine::Spine::note_verdict`]'s door, so the first key typed inside
+    /// [`spine::VERDICT_WINDOW_S`] is born at full momentum.
     pub fn note_verdict(&mut self, now: Instant) {
         if !self.engaged {
             return;
@@ -2250,12 +2008,10 @@ impl Engine {
         self.spine.note_verdict(now);
     }
 
-    /// The kitty's Delight edge, reported by the host (not a cursor event).
-    /// §5.8 lists Delight among the things that earn a hero: this mints
-    /// [`CompanionImpulse::Delight`] and buffers the heroes
-    /// [`companion::heroes_earned`] says it earns, at `(row, col)`, to be dealt
-    /// on the next [`Engine::tick`]. An earned hero is always an m1; it chimes
-    /// only if a token is available (D5).
+    /// The kitty's Delight edge, reported by the host: mints
+    /// [`CompanionImpulse::Delight`] and buffers the m1 heroes
+    /// [`companion::heroes_earned`] grants at `(row, col)` for the next
+    /// [`Engine::tick`] (§5.8); each chimes only if a token is available (D5).
     pub fn earn_hero(&mut self, now: Instant, row: u16, col: u16) {
         if !self.engaged {
             return;
@@ -2268,9 +2024,8 @@ impl Engine {
     }
 
     /// Pin the spine to at least `floor` while a sing-along is armed: the one
-    /// momentum bypass (§7.2's celebration arm), routed through the same
-    /// follower so every legibility cap holds. Gated like every seam point
-    /// (D14).
+    /// momentum bypass (§7.2), routed through the same follower so every
+    /// legibility cap holds.
     pub fn celebrate(&mut self, now: Instant, floor: f32) {
         if !self.engaged {
             return;
@@ -2280,10 +2035,8 @@ impl Engine {
 
     /// The party (§27): the host reports a sing-along bar (or the armed
     /// celebration's drop), `n` stars fanned ROYGBIV from the caret with the
-    /// burst `ring` on every fourth bar, and the next tick mints it at the
-    /// caret ([`meteor::Meteors::party`]). One per frame (a later call wins);
-    /// inert unless engaged. The keystroke behind it is the one that armed the
-    /// sing-along.
+    /// burst `ring` on every fourth bar, minted at the caret on the next tick
+    /// ([`meteor::Meteors::party`]). One per frame (a later call wins).
     pub fn party(&mut self, now: Instant, n: u8, ring: bool) {
         if !self.engaged {
             return;
@@ -2348,9 +2101,8 @@ impl Engine {
             self.reflow = None;
             self.revive = None;
             self.earned.clear();
-            // A bar banked while the style was live is a fact about a surface
-            // that is gone: dropped with the events, so re-engaging can never
-            // open on a celebration nobody is still holding a key for.
+            // A banked bar belongs to a surface that is gone: re-engaging never
+            // opens on a celebration nobody is holding a key for.
             self.party = None;
             self.mend = None;
             self.caret_seen = None;
@@ -2433,10 +2185,9 @@ impl Engine {
         self.ribbon.plan(&ctx);
         ctx.caret_t = self.ribbon.field_at_caret();
 
-        // The hand's floor (`ribbon::Ribbon::hand_floor`), read once per frame
-        // after the ribbon replayed this frame's events (so it includes the
-        // jump's own relocation): the landing minted below is bounded by where
-        // the hand has been on that row (`meteor::spark_room`).
+        // The hand's floor, read after the replay (so it includes the jump's
+        // own relocation): the landing minted below is bounded by where the
+        // hand has been on that row (`meteor::spark_room`).
         self.meteor.set_hand_floor(self.ribbon.hand_floor_cell());
 
         // Pass 1b: the meteor classifies each move against this frame's field;
@@ -2517,9 +2268,8 @@ impl Engine {
         self.earned.clear();
         // An unlicensed caret observation on another row
         // ([`Engine::observe_caret`]) takes effect now that this tick's events
-        // are laid at the caret they were typed at. The presses waiting for
-        // their echo were typed on the row it left and are forgotten, as a
-        // licensed row change forgets them.
+        // are laid; the presses waiting for an echo were typed on the row it
+        // left and are forgotten.
         if let Some(seen) = self.caret_seen.take() {
             self.caret = seen;
             self.echo.forget(now);
@@ -2605,9 +2355,8 @@ impl Engine {
             ),
             Licence::Return => (SoundKind::Enter { cells }, 0),
             Licence::Pty => (SoundKind::Jump, 0),
-            // A typed echo never flies (§6.1) and the meteor never spawns on
-            // one — nor on a delivered insert; if it ever did, nothing here
-            // may fire — the keystroke's own cue is the host's.
+            // A typed echo or a delivered insert never flies (§6.1); the
+            // keystroke's own cue is the host's.
             Licence::Typed | Licence::Insert => return,
         };
         let credited = licence != Licence::Pty;
@@ -2654,8 +2403,8 @@ impl Engine {
         self.ribbon.field_at_caret()
     }
 
-    /// Seam point 4 (`rainbow_field_at`): the field at an arbitrary cell, or
-    /// `None` where no ribbon light is laid. O(1) in columns (§18).
+    /// Seam point 4: the field at an arbitrary cell, or `None` where no ribbon
+    /// light is laid. O(1) in columns (§18).
     #[must_use]
     pub fn field_at(&self, row: u16, col: u16) -> Option<f32> {
         self.ribbon.field_at(row, col)
@@ -2685,7 +2434,7 @@ impl Engine {
 
     /// `trail status`'s `ribbon_drawn=` while v2 owns the frame: how many of
     /// the last frame's quads composite to band ink by the glass census
-    /// ([`Ribbon::ink_quads`]), measured on the pixels beside
+    /// ([`Ribbon::ink_quad_count`]), the measured twin of
     /// [`Engine::ribbon_segments`]'s modelled claim.
     #[must_use]
     pub fn ribbon_drawn(&self) -> usize {
@@ -2706,9 +2455,8 @@ impl Engine {
         self.ribbon.live_cells()
     }
 
-    /// The caret mirror (the last licensed move's landing) — the cell a
-    /// `Typed` key lays against; what a test reads to pin where the ledger
-    /// and the keys' replay stand.
+    /// The caret mirror (the last licensed move's landing), the cell a `Typed`
+    /// key lays against.
     #[cfg(test)]
     pub(crate) fn caret_mirror(&self) -> (u16, u16) {
         self.caret
@@ -2750,9 +2498,8 @@ impl Engine {
         &self.spine
     }
 
-    /// The one glint bucket (§8.1 no. 2, §13). §17.1 lists `budget` among the
-    /// engine's fields; it lives on [`Stardust`] because only stardust spends
-    /// it, and this is the accessor that name refers to.
+    /// The one glint bucket (§8.1 no. 2, §13), kept on [`Stardust`] because
+    /// only stardust spends it.
     #[must_use]
     #[cfg(test)]
     pub fn budget(&self) -> &StarBudget {
@@ -2794,13 +2541,11 @@ impl Engine {
 
     // -- seam points 8 and 9: the idle contract -----------------------------
 
-    /// Seam point 8: whether this engine needs the frame cadence. `true` while
-    /// the last frame carried brisk light: per-frame motion (a head in flight,
-    /// a landing's pin or burst, a thrown or dragged star, a mark retracting
-    /// into the caret, a cell inside its 18 ms `edge-in`). Tails (half-life
-    /// fades, the swoosh, a twinkling star past its hold, the spine settling)
-    /// are paced by [`Engine::next_change_deadline`] instead, no sooner than
-    /// [`TAIL_FLOOR`]. `false` is T6's first half and lets the host idle.
+    /// Seam point 8: whether this engine needs the frame cadence — `true` while
+    /// the last frame carried per-frame motion (a head in flight, a landing's
+    /// pin or burst, a thrown star, a mark retracting into the caret, a cell
+    /// inside its 18 ms `edge-in`). Tails are paced by
+    /// [`Engine::next_change_deadline`]. `false` lets the host idle (T6).
     #[must_use]
     pub fn needs_frame_cadence(&self) -> bool {
         self.engaged && self.brisk
@@ -2858,12 +2603,9 @@ impl Engine {
     /// if let Some(star) = pet.note_v2_offer(&offer) { v2.catch_star(star, now); }
     /// ```
     ///
-    /// A pure read that arms nothing: every field is state a producer already
-    /// owns this frame, so an idle engine offers `PetOffer::default()` (T6).
-    /// The cost is one scan of the ≤ 48-slot star pool, no allocation (§18).
-    ///
-    /// `pet` is the cat as its own last frame published it, or `None`. v2
-    /// never derives a pet position (§7.2(b): the pet seats itself).
+    /// A pure read: an idle engine offers `PetOffer::default()` (T6); one scan
+    /// of the ≤ 48-slot star pool, no allocation (§18). `pet` is the cat as
+    /// its own last frame published it; v2 never derives a pet position.
     #[must_use]
     pub fn pet_offer(&self, geom: Geom, pet: Option<companion::PetOnGlass>) -> companion::PetOffer {
         let perk_at = self.companion.and_then(|imp| {
@@ -2883,11 +2625,9 @@ impl Engine {
         let mote_t = u16::try_from(mote_cell)
             .ok()
             .and_then(|col| self.ribbon.field_at(pet.row, col));
-        // §5.3's 15 % gold crossed with §5.6's 1-in-12 m1 IS the panel's
-        // "about one key in eighty"; the sky deals it on a keystroke and this
-        // scan only notices it. The newest match wins — the panel's offer is
-        // made to a star as it is born, and a cat that has been ignoring one
-        // for 300 ms should be offered the fresh one instead.
+        // §5.3's 15 % gold times §5.6's 1-in-12 m1 is the panel's "about one
+        // key in eighty". The newest match wins: a cat that has ignored one
+        // star for 300 ms is offered the fresh one.
         let catch = pet.contented().then(|| {
             self.stardust
                 .live_iter()
@@ -2914,29 +2654,20 @@ impl Engine {
         }
     }
 
-    /// The cat catches the star: spend the offered star's remaining life on
-    /// the frame the paw lands, on the sky's 40 ms finish
-    /// ([`stardust::CATCH_FINISH_MS`]). Returns whether the star was still
-    /// there.
-    ///
-    /// `star` is the value [`Engine::pet_offer`] handed over and `at` is the
-    /// paw's landing instant, on the pet's clock. The star is found by identity
-    /// and finished once ([`stardust::Stardust::catch`]); a stale offer, dead
-    /// star or second call does nothing. No light is born (T1).
+    /// The cat catches the star: finish the offered star on the sky's 40 ms
+    /// finish ([`stardust::CATCH_FINISH_MS`]) at `at`, the paw's landing on
+    /// the pet's clock. The star is found by identity and finished once; a
+    /// stale offer, a dead star or a second call does nothing and returns
+    /// `false`. No light is born (T1).
     pub fn catch_star(&mut self, star: companion::StarCatch, at: Instant) -> bool {
         self.stardust.catch(star.x, star.y, star.born, at)
     }
 
     /// Seam point 11 (`drain_sound_cues`): drain cues minted but not yet
-    /// flushed into a [`Frame`].
-    ///
-    /// Empty between ticks by construction: every cue is minted inside
-    /// [`Engine::tick`], after the frame's one `Spine::update` (see
-    /// [`Engine::on_event`]), and the same tick appends the queue to
-    /// [`Frame::cues`]. A non-ticking path (style switch, [`Engine::reset`],
-    /// shutdown) therefore drops nothing minted; an event reported but never
-    /// ticked has neither light nor sound. Kept as seam point 11's twin and so
-    /// tests can prove the queue empty after a reset.
+    /// flushed into a [`Frame`]. Empty between ticks: every cue is minted in
+    /// [`Engine::tick`] and the same tick appends the queue to [`Frame::cues`],
+    /// so a non-ticking path (style switch, reset, shutdown) drops nothing
+    /// minted.
     pub fn drain_sound_cues(&mut self) -> std::vec::Drain<'_, SoundCue> {
         self.pending_cues.drain(..)
     }
@@ -2995,26 +2726,28 @@ impl Engine {
 
     /// Hide the next frame: the viewport is showing history, whose rows are
     /// not the rows the ribbon was laid on. The next [`Engine::tick`] runs
-    /// every clock and writes nothing (no quad, no halo, a zero fingerprint);
-    /// state is kept, so on return the band is where its clocks say.
+    /// every clock and writes nothing (zero fingerprint); state is kept, so on
+    /// return the band is where its clocks say.
     ///
     /// Arm it only where a tick follows in the same frame: the flag survives
     /// to whatever tick comes next. [`Engine::reset`] and [`Engine::curtain`]
-    /// drop an un-taken arm, and the host's non-ticking history path checks
-    /// [`Engine::engaged`] instead (`TornBandLaw::Keep`).
+    /// drop an un-taken arm.
     pub fn hide_next_frame(&mut self) {
         if self.engaged {
             self.hidden = true;
         }
     }
 
-    /// Whether a hide is armed and not yet taken — the twins' witness for
-    /// the paragraph above.
+    /// Whether a hide is armed and not yet taken.
     #[must_use]
     pub fn hide_armed(&self) -> bool {
         self.hidden
     }
 
+    /// Seam point 12 (`reset`): a coordinate-space cut. Drops every mark, the
+    /// spine, the caret mirror, the ledger (and `bridged`) and the buffered
+    /// events; the retire and follow tallies, the pane and the hole tripwire
+    /// survive.
     pub fn reset(&mut self) {
         // A hide armed and not yet taken belongs to a frame that is not
         // coming (see [`Engine::hide_next_frame`]).
@@ -3025,7 +2758,7 @@ impl Engine {
         self.meteor.reset();
         self.caret_seam = CaretSeam::default();
         // The caret is learned from the next observed move; a key before it
-        // lays nowhere rather than at a cell the reset forgot the meaning of.
+        // lays nowhere.
         self.caret = (0, 0);
         self.caret_known = false;
         self.caret_seen = None;
@@ -3041,17 +2774,14 @@ impl Engine {
         self.reflow = None;
         self.revive = None;
         self.earned.clear();
-        // …and a banked bar, for the same reason this seam forgets the caret
-        // two lines up: `reset` is the coordinate-space cut, so a party held
-        // across it would mint at `(0, 0)` in the new space — a fan, and
-        // every fourth bar a shockwave, in the corner, with no key behind it.
+        // …and a banked bar, which would mint at `(0, 0)` in the new space.
         self.party = None;
         self.pending_cues.clear();
         self.companion = None;
         self.paint_at = None;
         self.fp = 0;
-        // The witness's records are about cells that are gone with the
-        // coordinate space; its tally is the window's, like `spawns`.
+        // The witness's records name cells of the old space; the retire and
+        // follow tallies survive.
         self.witness.clear();
         self.retire_scratch.clear();
         self.status = Status {
@@ -3083,9 +2813,8 @@ impl Engine {
         self.witness.translate(rows, bottom);
         self.meteor.translate_scroll(rows, cell_h);
         self.stardust.translate_scroll(rows, cell_h);
-        // The caret is a position, not a mark: it cannot be dropped, and the
-        // host observes it again on its next move. The presses waiting for
-        // their echo were on a row that just moved: forgotten, not shifted.
+        // The caret is a position, not a mark: saturated, never dropped. The
+        // waiting presses were on a row that just moved: forgotten.
         self.caret.0 = self.caret.0.saturating_sub(rows);
         self.echo.clear();
         self.translate_events(|r| r.checked_sub(rows), |r| r.saturating_sub(rows));
@@ -3115,19 +2844,12 @@ impl Engine {
         });
     }
 
-    /// The pre-move record is a cell, so it rides the seams too.
-    /// [`Engine::pre_move`] holds `(index, the caret before the frame's first
-    /// one-shot move)` and [`Engine::replay_events`] lays every `Typed`
-    /// buffered before that index at that caret. `CursorGlow::note_scroll`
-    /// flushes a park it cannot carry before it translates, so the record can
-    /// hold a pre-scroll caret.
-    ///
-    /// A record carried off is forgotten, not clamped (the mark law, as in
-    /// [`ribbon::Ribbon::translate_scroll`]): nobody re-observes it, so a
-    /// saturated one would replay the key onto a line nobody typed. It keeps
-    /// its index and the key is held with no cell until its echo pays for it;
-    /// dropping the whole record would let the keys fall through to the
-    /// post-move caret.
+    /// The pre-move record ([`Engine::pre_move`]) holds a caret, so it rides
+    /// the seams too (`CursorGlow::note_scroll` can flush a park it cannot
+    /// carry first, leaving a pre-scroll caret). A caret carried off is
+    /// forgotten, not clamped: a saturated one would replay the key onto a
+    /// line nobody typed. The index stays, so the key is held with no cell
+    /// until its echo pays, rather than falling through to the post-move caret.
     fn translate_pre_move(&mut self, mark: impl Fn(u16) -> Option<u16>) {
         if let Some((_, caret)) = &mut self.pre_move
             && let Some((row, col)) = *caret
@@ -3139,17 +2861,13 @@ impl Engine {
     /// Seam point 12 (`translate_band_state`), the band twin of
     /// [`Engine::translate_scroll`]: screen rows `top..=bottom` moved by
     /// `delta` ([`crate::cursor_glow::band_row`]), so every live mark on those
-    /// rows moves with its text (ribbon cells, cohorts and field index;
-    /// meteors, landings and sown fans; stars and veils), marks outside stand
-    /// still, and marks carried past the band's edge are dropped. The caret
-    /// and the erased cell are positions ([`crate::cursor_glow::band_pos`]),
-    /// saturated at the edge. Earned cells follow the mark law.
+    /// rows moves with its text, marks outside stand still, and marks carried
+    /// past the band's edge are dropped. The caret and the erased cell are
+    /// positions ([`crate::cursor_glow::band_pos`]), saturated at the edge.
     ///
     /// The spine is untouched: a program scrolling lines past the composer
-    /// while the hand types must not reset momentum. The buffered events ride
-    /// the band ([`Engine::translate_events`]) and the glyph probe is dropped
-    /// as on a scroll; the host re-probes the caret's rows before the next
-    /// deal.
+    /// while the hand types must not reset momentum. The glyph probe is
+    /// dropped as on a scroll; the host re-probes before the next deal.
     pub fn translate_band(
         &mut self,
         top: u16,
@@ -3161,9 +2879,7 @@ impl Engine {
         if !self.engaged || delta == 0 || top > bottom {
             return;
         }
-        // Banked presses have no row identity, so they cannot be translated
-        // with this band. Retire them exactly as on a whole-view scroll;
-        // located light, buffered keys and the spine keep their own state.
+        // Banked presses have no row identity: retired as on a scroll.
         self.echo.clear();
         self.ribbon.translate_band(top, bottom, delta);
         self.witness.translate_band(top, bottom, delta);
@@ -3188,8 +2904,7 @@ impl Engine {
         self.translate_pre_move(|r| band_row(r, top, bottom, delta));
     }
 
-    /// Seam point 12 (`trail_status`): the `v2_quads=` / `v2_halos=` /
-    /// `v2_stars=` rows.
+    /// Seam point 12 (`v2_status`): the frame's `trail status` counters.
     #[must_use]
     pub fn status(&self) -> Status {
         self.status
@@ -3198,16 +2913,14 @@ impl Engine {
 
 /// Locate the last Space in an exactly accounted, same-row typed echo.
 ///
-/// Every key is replayed against the final frame caret. A Space followed by
-/// another key in that frame therefore cannot use `caret.col - 1` as its
-/// position: that is the later glyph. The ordered keys immediately before a
-/// sweep supply widths, and the immediately following typed move authenticates
-/// its endpoints. Only an exact match can refine the ribbon's word boundary.
-/// Partial echoes, inserts, navigation, intervening edits, and unmatched widths
-/// retain the ordinary path; none gains guessed glyph positions or credit.
-///
-/// This reads frame-local events, allocates nothing and retains no new state.
-/// Each sweep visits only its preceding typed run, so the frame pass is linear.
+/// Every key replays against the frame's final caret, so a Space followed by
+/// another key in the same frame cannot use `caret.col - 1` (that is the later
+/// glyph). The typed keys immediately before a sweep supply widths, and the
+/// typed move right after it authenticates the endpoints; only an exact match
+/// refines the ribbon's word boundary. Anything else (a partial echo, an
+/// insert, navigation, an intervening edit, unmatched widths) returns `None`.
+/// Allocates nothing; each sweep visits only its preceding typed run, so the
+/// frame pass is linear.
 fn swept_space_cell(events: &[(Event, Instant)], index: usize) -> Option<(u16, u16)> {
     let Event::Sweep { row, col0, col1 } = events.get(index)?.0 else {
         return None;
@@ -3336,11 +3049,9 @@ mod swept_space_tests {
 
 /// A same-row keyed hop under the flight floor (§11, §12.3): `1..8` cells on
 /// one row under a `Nav` or `Synthetic` licence (an arrow, a word motion, a
-/// short Home/End); the nav tick's trigger. It reads the same
-/// [`timing::JUMP_MIN_CELLS`] as the meteor's classifier, so light and sound
-/// agree on the floor. A `Typed` echo is the host's keystroke and a `Return`
-/// changes row. A `Pty` hop is silent (§12.3); the meteor still draws its
-/// mini-fan, since `Meteors::on_move` excludes only echo licences.
+/// short Home/End), the nav tick's trigger. It reads the meteor classifier's
+/// [`timing::JUMP_MIN_CELLS`], so light and sound agree on the floor. A `Pty`
+/// hop is silent (§12.3), though the meteor still draws its mini-fan.
 fn sub_floor_hop(from: (u16, u16), to: (u16, u16), licence: Licence) -> bool {
     if !licence.is_keyed_nav() || from.0 != to.0 {
         return false;
@@ -3348,13 +3059,10 @@ fn sub_floor_hop(from: (u16, u16), to: (u16, u16), licence: Licence) -> bool {
     (1..JUMP_MIN_CELLS).contains(&to.1.abs_diff(from.1))
 }
 
-/// The frame's liveness (§18, T6): `0` exactly when nothing was appended, and
-/// a fixed non-zero sentinel otherwise. Every consumer only asks `== 0` or
-/// `!= 0` (`is_active`, the idle early-out, the status row), so a content
-/// hash would be wasted work on the frame path.
+/// The frame's liveness (§18, T6): `0` exactly when nothing was appended, else
+/// `1`. Every consumer only asks `== 0` (`is_active`, the idle early-out, the
+/// status row), so a content hash would be wasted work on the frame path.
 fn liveness(under: &[GlowQuad], out: &[GlowQuad], halos: &[RainHalo]) -> u64 {
-    // The low bit is set for the same reason the fold forced it: a live frame
-    // can never collide with the idle sentinel.
     u64::from(!(under.is_empty() && out.is_empty() && halos.is_empty()))
 }
 
@@ -3415,10 +3123,9 @@ mod tests {
         }
     }
 
-    /// §20.1 `rainbow_kitty_v2_decays_to_exactly_nothing_and_idles_free`, at
-    /// the contract level: with nothing live the engine writes nothing, its
-    /// fingerprint is exactly zero, it asks for no cadence and it names no
-    /// deadline. T6.
+    /// §20.1's idle-zero row at the contract level: with nothing live the
+    /// engine writes nothing, fingerprints 0, asks for no cadence and names no
+    /// deadline (T6).
     #[test]
     fn rainbow_kitty_v2_idles_at_exactly_zero() {
         let t0 = Instant::now();
@@ -3448,9 +3155,7 @@ mod tests {
         assert_eq!(eng.status().halos, 0);
     }
 
-    /// The gate: a disengaged engine is inert at every seam point, which is
-    /// the structural half of "the other nine styles are byte-identical"
-    /// (D14).
+    /// A disengaged engine is inert at every seam point (D14).
     #[test]
     fn a_disengaged_engine_is_inert_at_every_seam_point() {
         let t0 = Instant::now();
@@ -3496,9 +3201,7 @@ mod tests {
         assert!(eng.drain_sound_cues().next().is_none());
     }
 
-    /// `Engine::default()` and `Engine::new()` are one constructor: a caller
-    /// that reaches the engine through `Default` starts with the full glint
-    /// bucket a session starts with, so its first capital chimes (§13).
+    /// `Default` is `new`: the full glint bucket, so the first capital chimes.
     #[test]
     fn default_and_new_build_the_same_engine() {
         let d = Engine::default();
@@ -3508,8 +3211,7 @@ mod tests {
         assert!(!d.engaged() && !n.engaged());
     }
 
-    /// An engaged engine with a blank probe over `rows`, so sky stars may be
-    /// born anywhere (§5.4's gate answers `Some(false)` on every probed row).
+    /// A fresh engaged engine.
     fn engaged() -> Engine {
         let mut eng = Engine::new();
         eng.set_engaged(true);
@@ -3595,17 +3297,10 @@ mod tests {
         eng.drain_hole_records().collect()
     }
 
-    /// **THE HOLE TRIPWIRE RECORDS THE FIRST FRAME OF A HOLE**
-    /// (`holes.rs`; written 2026-09-21, ported 2026-09-30): three typed
-    /// cells, the middle one retired by identity and melted — a column no
-    /// typing cell owns between two lit typing cells. One record, on the
-    /// frame the hole opens, its header naming the frame's density
-    /// (`slabs=3` here), with the cohort table, the row's cells, the
-    /// witness and the events with their licences; the next frame adds
-    /// nothing. NEGATIVE CONTROLS: a whole lit line is no hole, and neither
-    /// is its LAST cell gone dark — the line ends there, nothing lit
-    /// beyond; an engine nobody armed keeps nothing. The one-slab
-    /// configuration is the test after this one.
+    /// The tripwire (`holes.rs`) records a hole (an unowned column between two
+    /// lit typing cells) once, on the frame it opens, with the frame's density,
+    /// cohorts, row cells, witness and licensed events. Negative controls: a
+    /// whole lit line, its last cell dark, and an unarmed engine record nothing.
     #[test]
     fn the_hole_tripwire_records_the_first_frame_of_a_hole_inside_a_lit_typed_line() {
         let ms = Duration::from_millis;
@@ -3679,12 +3374,9 @@ mod tests {
         assert!(eng.holes.is_none(), "disarming drops it");
     }
 
-    /// A geometry that forces the long-line clamp with three cells: a cell
-    /// 1000 px tall prices the tall body at ~1460 device rows a slab, so
-    /// four cells (three and the attach) overrun `RIBBON_QUAD_BUDGET` at
-    /// two slabs and `Ribbon::slabs_for` clamps to ONE — the density a
-    /// ~78-cell retina composer line plans at (`ribbon.rs`, the one-slab
-    /// pin), reached here by height instead of length.
+    /// A geometry that forces the long-line clamp with three cells: a 1000 px
+    /// cell overruns `RIBBON_QUAD_BUDGET` at two slabs, so `Ribbon::slabs_for`
+    /// clamps to one, the density a long retina composer line plans at.
     fn one_slab_geom() -> Geom {
         Geom {
             cw: 9,
@@ -3699,17 +3391,9 @@ mod tests {
         }
     }
 
-    /// **THE HOLE TRIPWIRE FIRES AT ONE SLAB PER CELL** (2026-09-21, the
-    /// review: blind at one slab). At `slabs_per_cell() == 1` a run's only
-    /// vertices sit on the cell edges — no interior sample — and a census
-    /// that dropped edge-aligned samples read every column dark and could
-    /// never fire on exactly the long composer lines it exists for. A
-    /// sample belongs to the column whose `[x0, x1)` holds it, and at one
-    /// slab the OWNER census decides: a column no non-leaving typing cell
-    /// owns, between two owned columns, is a hole (the census rule itself is
-    /// [`at_one_slab_the_owner_census_alone_decides_a_hole`]'s). The same
-    /// gesture as the three-slab test in a geometry that clamps to one slab:
-    /// one record, its header saying `slabs=1`.
+    /// The tripwire still fires at one slab per cell, where a run's only
+    /// vertices sit on the cell edges: the three-slab test's gesture, its
+    /// header saying `slabs=1`.
     #[test]
     fn the_hole_tripwire_records_a_hole_at_one_slab_per_cell() {
         let ms = Duration::from_millis;
@@ -3785,14 +3469,9 @@ mod tests {
         );
     }
 
-    /// **AT ONE SLAB THE OWNER CENSUS ALONE DECIDES A HOLE** (`holes.rs`,
-    /// `row_holes`): three owned columns whose middle one holds no light are
-    /// a whole line at one slab per cell, where a column's one sample sits on
-    /// its edge, and a hole above one slab, where a column's samples say what
-    /// it shows. NEGATIVE CONTROLS, at both densities: a column no typing cell
-    /// owns between two owned ones is a hole, its light or none; a lit owned
-    /// line is none; the line's last column unowned is none (nothing owned
-    /// beyond it).
+    /// `holes::row_holes`: at one slab per cell (a column's one sample sits on
+    /// its edge) the owner census alone decides; above one slab the light
+    /// census decides too. Negative controls at both densities.
     #[test]
     fn at_one_slab_the_owner_census_alone_decides_a_hole() {
         fn census(cov: &[u8], slabs: usize, owned: &[usize]) -> Vec<usize> {
@@ -3849,10 +3528,10 @@ mod tests {
         aterm_spec::verify::prove_and_catch_scalar(&model, model.name);
     }
 
-    /// Bind the small retirement contract to the genuine typed-press ledger
-    /// and band transform. Geometry and earned momentum survive; unlocated
-    /// pre-scroll credits cannot fund a later program nudge. The negative
-    /// control restores only that old ledger after the same real transform.
+    /// Binds `EchoBandFence` to the real ledger and band transform: geometry
+    /// and earned momentum survive, banked pre-band credits cannot fund a later
+    /// program nudge. The negative control restores the old ledger after the
+    /// same transform.
     #[test]
     fn real_band_transforms_retire_echo_credits_without_resetting_earned_light() {
         let model = echo_band_fence_model();
@@ -3982,13 +3661,9 @@ mod tests {
         assert_eq!(negative_controls, 4);
     }
 
-    /// A key whose echo the seam refused is relit by the next licensed echo
-    /// ([`Engine::echo_bridge`]). A key echoed about 300 ms after its press is
-    /// refused (`no-fresh-hint`); the next licensed echo carries `from` one
-    /// past the engine's mirror, the press on the ledger pays for that cell,
-    /// and it joins its cohort (the walk continues a sixteenth per cell). The
-    /// control is the same hop with no press behind it (program output), which
-    /// lays nothing (T1).
+    /// A refused echo's press pays for its cell when the next licensed echo
+    /// lands one past the mirror, continuing the cohort's walk. Control: the
+    /// same hop with no press (program output) lays nothing (T1).
     #[test]
     fn a_key_whose_echo_the_seam_refused_is_relit_by_the_next_licensed_echo() {
         let ms = Duration::from_millis;
@@ -4049,10 +3724,7 @@ mod tests {
         );
     }
 
-    /// Three keys typed into a stall are relit together: keys echoed with a
-    /// stalled key in one refused move leave a three-cell hole; the next
-    /// licensed echo's `from` sits three past the mirror and three presses pay
-    /// for three cells.
+    /// Three presses pay for the three-cell hole a refused batched echo left.
     #[test]
     fn three_keys_typed_into_a_stall_are_relit_together() {
         let ms = Duration::from_millis;
@@ -4097,14 +3769,9 @@ mod tests {
         );
     }
 
-    /// A cold engine's first coalesced echo lays the keys it held. A composer
-    /// under load coalesces the line's first two keys into one repaint: the
-    /// keys are typed at a caret the engine never learned and held with no
-    /// cell ([`Engine::replay_events`]), and the echo is one licensed two-cell
-    /// move the host does not sweep. The move's advance is paid from `from` by
-    /// the presses in flight, so the line's first cells are laid
-    /// (`tests/phrase_pause_gaps.rs`). The controls keep T1 and one press per
-    /// cell: no press lays nothing, one press cannot pay two cells.
+    /// Keys held at a caret the engine never learned are paid from the
+    /// unswept echo's `from` (`tests/phrase_pause_gaps.rs`). Controls: no
+    /// press lays nothing; one press cannot pay two cells.
     #[test]
     fn a_cold_engine_s_first_coalesced_echo_lays_the_keys_it_held() {
         let ms = Duration::from_millis;
@@ -4158,13 +3825,9 @@ mod tests {
         assert_eq!(short.status().bridged, 0);
     }
 
-    /// A cold backward typed echo keeps the press. A fresh engine with one
-    /// press banked sees a same-row backward `Typed` move, (5,4) → (5,3): a
-    /// retreat is not an echo, so the press keeps waiting (`total() == 1`).
-    /// The unswept forward move that follows, (5,3) → (5,4), is laid from the
-    /// ledger (`bridged == 1`). Control: after the same backward move, a
-    /// two-cell forward hop one press cannot pay for is refused and clears the
-    /// ledger.
+    /// A cold same-row retreat is not an echo: the press waits for the forward
+    /// move after it. Control: a two-cell hop one press cannot pay is refused
+    /// and clears the ledger.
     #[test]
     fn a_cold_backward_typed_echo_keeps_the_press_for_the_forward_move_after_it() {
         let ms = Duration::from_millis;
@@ -4216,10 +3879,7 @@ mod tests {
         assert_eq!(eng.echo.total(), 0, "…and the ledger is cleared");
     }
 
-    /// A licensed echo the host did not sweep is laid from its presses: a
-    /// two-cell echo licensed but unswept (a non-coalesced re-anchor, or a
-    /// batch its press credits could not pay for) gets both cells from the
-    /// engine's ledger.
+    /// An unswept two-cell licensed echo gets both cells from the ledger.
     #[test]
     fn a_licensed_echo_the_host_did_not_sweep_is_laid_from_its_presses() {
         let ms = Duration::from_millis;
@@ -4250,11 +3910,8 @@ mod tests {
         );
     }
 
-    /// A stale press cannot fund a later stray hop (the anti-stray law). A
-    /// refused press survives on the ledger, then the caret hops five cells
-    /// with no press behind it (vim's `w`, a click): the hop buys nothing and
-    /// forgets the press. A later one-cell program nudge followed by a key's
-    /// echo therefore stays dark.
+    /// An unexplained hop (vim's `w`, a click) forgets a refused press, so a
+    /// later program nudge stays dark.
     #[test]
     fn a_stale_press_cannot_fund_a_later_stray_hop() {
         let ms = Duration::from_millis;
@@ -4309,8 +3966,7 @@ mod tests {
         assert!(eng.field_at(3, 12).is_some());
     }
 
-    /// A press older than the echo patience buys no cell: a swallowed key is
-    /// not a late one.
+    /// A swallowed key is not a late one.
     #[test]
     fn a_press_older_than_the_echo_patience_buys_no_cell() {
         let ms = Duration::from_millis;
@@ -4341,9 +3997,7 @@ mod tests {
         assert!(eng.field_at(3, 6).is_some());
     }
 
-    /// A navigation licence, a row change and a reset forget the presses:
-    /// afterwards a one-cell unlicensed nudge followed by a licensed key is
-    /// not paid for by the press that was waiting.
+    /// After each, a keyless one-cell nudge is not paid by the waiting press.
     #[test]
     fn a_navigation_licence_a_row_change_and_a_reset_forget_the_presses() {
         let ms = Duration::from_millis;
@@ -4372,10 +4026,9 @@ mod tests {
             );
             assert!(eng.field_at(3, col).is_some());
         };
-        // Navigation: press at 5 refused, an arrow hop 6 → 8 licensed Nav.
-        // (The hop lays its own wake over the corridor it crossed — R5 —
-        // so the dark-cell check belongs to the two arms below; here the
-        // ledger's counter is the witness.)
+        // Navigation: press at 5 refused, an arrow hop 6 → 8 licensed Nav. The
+        // hop lays its own wake over the corridor, so the ledger's counter is
+        // the witness here.
         let mut eng = engaged();
         let t = three_typed_cells(&mut eng, t0) + ms(100);
         eng.on_event(typed(1), t);
@@ -4422,12 +4075,8 @@ mod tests {
         );
     }
 
-    /// Presses younger than the licensing key never pay for a cell to its
-    /// left. Program output nudges the caret one cell (no press), then three
-    /// keys come fast. The first key's echo lands one past the mirror with two
-    /// presses in flight behind it; their glyphs are to the right, so counting
-    /// them would light the program's cell. Only presses older than the host
-    /// sweep's clock may pay, and there are none.
+    /// Only presses older than the host sweep's clock may pay a hole: keys
+    /// typed after a program nudge never light the nudge's cell.
     #[test]
     fn presses_younger_than_the_licensing_key_never_pay_for_a_cell_to_its_left() {
         let ms = Duration::from_millis;
@@ -4466,9 +4115,8 @@ mod tests {
         }
     }
 
-    /// A swallowed press never rolls forward as a phantom credit: the next
-    /// ordinary echo finds a press older than its own key with no hole to
-    /// explain, and forgets it.
+    /// The next ordinary echo forgets a press older than its key that no hole
+    /// explains.
     #[test]
     fn a_swallowed_press_never_rolls_forward_as_a_phantom_credit() {
         let ms = Duration::from_millis;
@@ -4503,11 +4151,8 @@ mod tests {
         assert!(eng.field_at(3, 7).is_some());
     }
 
-    /// The insert's rewrite ([`Event::Rewrite`]): the program pulled the caret
-    /// back inside a delivered insert's span. No impulse (no Wince), no spine
-    /// drain, no star, no cue, the echo ledger kept, the caret mirror moved
-    /// (so the next typed echo bridges nothing), and the ribbon retracts the
-    /// suffix.
+    /// A rewrite moves the mirror and retracts the suffix; nothing winces,
+    /// drains, throws, sounds or touches the ledger.
     #[test]
     fn a_rewrite_offers_no_impulse_drains_no_spine_throws_no_star_and_keeps_the_ledger() {
         let ms = Duration::from_millis;
@@ -4556,8 +4201,7 @@ mod tests {
             eng.field_at(3, 3).is_none() && eng.field_at(3, 4).is_none(),
             "the cells right of the rewrite's caret are retracted"
         );
-        // The next typed echo from the new caret: mirror (3,3), from (3,3) —
-        // gap 0, nothing to bridge, the press pays for its own cell.
+        // The next echo starts at the mirror: nothing to bridge.
         let bridged = eng.status().bridged;
         let t = type_key_at(&mut eng, done + ms(50), 3);
         tick_at(&mut eng, t);
@@ -4572,8 +4216,7 @@ mod tests {
         );
     }
 
-    /// A rewrite's retract completes and the engine idles free — the §18
-    /// idle → zero law with a [`Event::Rewrite`] in the stream.
+    /// A rewrite's retract ends at idle zero (T6).
     #[test]
     fn a_rewrite_retract_completes_and_the_engine_idles_free() {
         let ms = Duration::from_millis;
@@ -4607,12 +4250,9 @@ mod tests {
         );
     }
 
-    /// A host sweep under a typed move beside banked presses the hop does not
-    /// explain: the whole span (`5..67`) is laid as one sweep behind an inert
-    /// typed move, the older presses are forfeited by the ledger's mismatch
-    /// rule, and nothing is bridged. (A delivered insert uses
-    /// `Licence::Insert`, which pays such a hole:
-    /// `an_inserts_sweep_pays_the_hole_a_late_key_left_before_it`.)
+    /// A typed sweep beside presses the hop does not explain lays the whole
+    /// span, forfeits the presses and bridges nothing (an insert pays such a
+    /// hole: `an_inserts_sweep_pays_the_hole_a_late_key_left_before_it`).
     #[test]
     fn a_delivered_insert_sweep_beside_banked_presses_forfeits_them_and_bridges_nothing() {
         let ms = Duration::from_millis;
@@ -4644,12 +4284,8 @@ mod tests {
         assert_eq!(eng.caret, (3, 67));
     }
 
-    /// A delivered insert's sweep pays the hole a late key left before it: a
-    /// key pressed just before the drop, whose echo was not laid, leaves the
-    /// mirror one cell behind the insert's origin. Under `Licence::Insert` the
-    /// ledger pays that cell from the key's press and charges the insert's span
-    /// nothing; under `Typed` the mismatch would forget the ledger and the cell
-    /// would stay dark.
+    /// Under `Licence::Insert` the ledger pays the hole a late key left before
+    /// the insert from that key's press and charges the span nothing.
     #[test]
     fn an_inserts_sweep_pays_the_hole_a_late_key_left_before_it() {
         let ms = Duration::from_millis;
@@ -4684,8 +4320,8 @@ mod tests {
         assert_eq!(eng.status().bridged, 1, "one bridged cell — the key's");
         assert_eq!(eng.echo.total(), 0, "the press is spent");
         assert_eq!(eng.caret, (3, 17));
-        // Control: the same shape under `Typed` forgets the ledger and
-        // leaves the hole (the seam's typed sweep charges its span to presses).
+        // Control: under `Typed` the sweep's span is charged to presses, so
+        // the mismatch forgets the ledger and leaves the hole.
         let mut typed_eng = engaged();
         let t = three_typed_cells(&mut typed_eng, t0);
         let key = t + ms(100);
@@ -4706,11 +4342,8 @@ mod tests {
         assert_eq!(typed_eng.echo.total(), 0, "…and the press is forfeited");
     }
 
-    /// A sweep on the origin row before a fold move (a stalled key whose echo
-    /// wraps the row): the seam sweeps the origin row's last column, then
-    /// hands the fold's `Move`. The sweep is on a different row, so the bridge
-    /// treats the row change as usual (ledger cleared, nothing bridged), the
-    /// ribbon lays the swept cell, and the mirror lands on the new row.
+    /// A stalled key's echo that wraps the row: the seam's sweep lays the
+    /// origin row's last column and the row change clears the ledger.
     #[test]
     fn a_sweep_on_the_origin_row_before_a_fold_move_lays_the_last_column_and_clears_the_ledger() {
         let ms = Duration::from_millis;
@@ -4742,23 +4375,16 @@ mod tests {
         assert_eq!(eng.caret, (4, 0), "the mirror lands on the new row");
     }
 
-    /// Tier-1 conformance for the echo ledger: the real `Engine`, driven
-    /// through the shapes `EchoLedgerBridge` names (a refused echo relit on the
-    /// press's clock, the program-nudge-then-burst break, the swallowed-press
-    /// phantom, the unswept batch, fresh and stale retreats, the navigation
-    /// hop, vim's `w`, patience whole and per press, and the three in-place
-    /// clears), with every observed step validated as a model transition and
-    /// a forged step at each law the model must refuse.
+    /// Tier-1 conformance for the echo ledger: the real `Engine` driven through
+    /// the shapes `EchoLedgerBridge` names, every observed step validated as a
+    /// model transition and a forged step at each law refused.
     ///
-    /// Every projected term is read off the engine: the ledger's buckets
-    /// through its own partition by the licensing key's clock, its four
-    /// tallies, its mirror against the host's caret (the hole),
-    /// `Status::bridged`, and the clock the engine partitioned by
-    /// (`last_host_sweep_at`), which must be the key's. `laid_hole` is the
-    /// bridged delta less the cells an unswept move laid at and past `from`.
-    /// `stale_gone` is `expired + stale` by definition; its law
-    /// (`ExpiredPressesBuyNothing`) is enforced per transition (the forged
-    /// stale-press-pays control).
+    /// Every projected term is read off the engine: the ledger's partition by
+    /// the licensing key's clock, its four tallies, the hole (host caret minus
+    /// mirror), `Status::bridged`, and `last_host_sweep_at`, which must be the
+    /// key's. `laid_hole` is the bridged delta less the cells an unswept move
+    /// laid at and past `from`; `stale_gone` is `expired + stale` by definition,
+    /// so its law is enforced per transition (the forged stale-press control).
     #[test]
     fn the_real_engine_conforms_to_the_echo_ledger_model() {
         let model = aterm_spec::derive::echo_ledger_bridge_model();
@@ -4818,8 +4444,8 @@ mod tests {
             );
             assert!(!ok, "{label}: the model must refuse this step");
         };
-        // An engine whose mirror was learned at `(3, col)` by a licensed move
-        // — the seed is not a step, exactly as the licence twin's seed tick.
+        // An engine whose mirror was learned at `(3, col)` by a licensed move;
+        // the seed is not a step.
         let seeded = |t0: Instant, col: u16| -> Engine {
             let mut eng = engaged();
             eng.on_event(mv((3, 0), (3, col), Licence::Typed), t0);
@@ -4888,7 +4514,7 @@ mod tests {
             }
         };
 
-        // ---- the screenshot: press, echo, a refused echo, and the relight ----
+        // ---- press, echo, a refused echo, and the relight ----
         let t0 = Instant::now();
         let mut eng = seeded(t0, 2);
         let mut last = Last::default();
@@ -4994,7 +4620,7 @@ mod tests {
             "Engine one-older-press-two-cells control",
         );
 
-        // ---- the adversary's break: a program nudge, then a fast burst ----
+        // ---- a program nudge, then a fast burst ----
         let u0 = Instant::now();
         let mut eng = seeded(u0, 5);
         let mut last = Last::default();
@@ -5241,10 +4867,9 @@ mod tests {
         bind(&a7, &a8, "LedgerClearedInPlace", "Engine focus loss");
 
         // ---- vim's `w`: a typed re-anchor the host does not sweep ----
-        // In the real host a printable key beside a >2-cell same-row hop is a
-        // typed re-anchor: it reaches the engine as `Licence::Typed` with NO
-        // host sweep. One press cannot explain a three-cell hop; refused,
-        // and the press is forfeited.
+        // A printable key beside a >2-cell same-row hop reaches the engine as
+        // `Licence::Typed` with no host sweep. One press cannot explain a
+        // three-cell hop: refused, and the press is forfeited.
         let z0 = Instant::now();
         let mut eng = seeded(z0, 5);
         let mut last = Last::default();
@@ -5324,7 +4949,7 @@ mod tests {
         let g2 = project(&eng, f2, f2, 5, last);
         assert_eq!((g2["older"], g2["younger"], g2["stale"]), (1, 1, 0));
         bind(&g1, &g2, "KeyPressed", "Engine key before a partial expiry");
-        // 2.1 s after the first press: it is stale, the key is not.
+        // Past the first press's patience: it is stale, the key is not.
         let f3 = f1 + patience + ms(100);
         let g3 = project(&eng, f3, f2, 5, last);
         assert_eq!((g3["older"], g3["younger"], g3["stale"]), (0, 1, 1));
@@ -5549,12 +5174,10 @@ mod tests {
         );
     }
 
-    /// The mirror follows a declined row change, after the tick's ingest. A
-    /// composer re-lays its input box a row up with no key behind it; the
-    /// seam declines and reports the caret (`Engine::observe_caret`). A key
-    /// buffered before the observation is held at the old caret; the next
-    /// key's echo lays at the caret's true cell on the new row, and nothing
-    /// at the box's inset marker left of it.
+    /// A declined row change (a composer re-laying its box a row up) moves the
+    /// mirror after the tick's ingest: a key buffered before it is held, and
+    /// the next key lays at its own cell on the new row, not at the box's inset
+    /// marker.
     #[test]
     fn a_declined_row_change_moves_the_mirror_after_the_ingest_and_the_next_key_lays_on_the_new_row()
      {
@@ -5589,9 +5212,8 @@ mod tests {
             "from the next tick the mirror is the observed caret"
         );
         assert_eq!(eng.echo.total(), 0, "the press was forgotten with the row");
-        // The next key: held until its echo, which lays at the true caret
-        // on row 5 — never at the marker's cell `(5, 1)`, never at the
-        // abandoned row.
+        // The next key: held until its echo, which lays at the true caret on
+        // row 5, never at the marker's cell `(5, 1)`.
         let t2 = t1 + Duration::from_millis(100);
         eng.on_event(typed(1), t2);
         tick_at(&mut eng, t2);
@@ -5627,10 +5249,8 @@ mod tests {
         );
     }
 
-    /// A same-row unlicensed hop is the echo ledger's to explain, so an
-    /// observation on the mirror's own row moves nothing: the next licensed
-    /// echo still measures the hole from the mirror and pays it from the older
-    /// press.
+    /// A same-row observation moves nothing: the ledger measures that hop and
+    /// the next licensed echo pays it from the older press.
     #[test]
     fn a_same_row_observation_leaves_the_mirror_for_the_ledger_to_measure() {
         let t0 = Instant::now();
@@ -5673,10 +5293,8 @@ mod tests {
         assert!(eng.field_at(3, 5).is_some(), "…at the hole");
     }
 
-    /// A fresh engine ignores an observed caret until a licensed move has
-    /// seeded the mirror: a key struck before the first licensed move lays
-    /// nothing (`Engine::reset`'s law), and a mirror seeded from an
-    /// observation at column 0 would fold that key's neighbour cell onto
+    /// A key struck before the first licensed move lays nothing, observation
+    /// or not: a mirror seeded at column 0 would fold its neighbour cell onto
     /// the row above.
     #[test]
     fn a_fresh_engine_ignores_an_observed_caret_until_a_licensed_move_seeds_the_mirror() {
@@ -5695,9 +5313,8 @@ mod tests {
         );
     }
 
-    /// The witness's engine half: retirement counts on `Status::retired`,
-    /// survives a reset, and a ledger payout beside a retired cell lays a
-    /// fresh cell without reviving the retired one.
+    /// A retirement counts on `Status::retired`, survives a reset, and is not
+    /// revived by a ledger payout beside it.
     #[test]
     fn a_witness_retirement_is_counted_survives_a_reset_and_is_never_undone_by_a_payout() {
         let t0 = Instant::now();
@@ -5708,17 +5325,15 @@ mod tests {
         for col in 2..5u16 {
             t = type_key_at(&mut eng, t + Duration::from_millis(100), col);
         }
-        // The three swept glyph cells 2..=4 — and nothing at column 1: a
-        // key is held until its echo, never laid at caret−1
-        // on the frame it was typed.
+        // A key is held until its echo, never laid at caret−1.
         assert_eq!(eng.status().cells, 3, "three cells: `abc`");
         assert!(
             eng.field_at(3, 1).is_none(),
             "no neighbour cell before the run"
         );
-        // The witness sees `abc`, then the `c` overwritten (the run's last
-        // cell, a suffix): a change strictly inside a standing run is not
-        // evidence (`Witness::shape_verdicts`).
+        // The witness sees `abc`, then the run's last cell overwritten: a
+        // suffix change counts, one strictly inside a standing run would not
+        // (`Witness::shape_verdicts`).
         let abc: Vec<char> = "  abc".chars().collect();
         let axc: Vec<char> = "  abX".chars().collect();
         let seen_abc = [RowSample { row: 3, cols: &abc }];
@@ -5756,9 +5371,8 @@ mod tests {
             vec![4],
             "`c` is on the melt; `a` and `b` stand"
         );
-        // A press whose echo the seam refused, then the licensed echo of
-        // the next key: the ledger pays the hole at (3, 5) — a fresh cell
-        // beside the melting ones, which stay on their clock.
+        // A refused press, then the next key's licensed echo: the ledger pays
+        // the hole at (3, 5) beside the melting cell, which keeps its clock.
         let p1 = fired + Duration::from_millis(10);
         eng.on_event(typed(1), p1);
         tick_at(&mut eng, p1);
@@ -5799,7 +5413,6 @@ mod tests {
                 && eng.field_at(3, 5).is_some(),
             "…while `a`, `b` and the paid cell stand"
         );
-        // The tally survives a reset; the records do not.
         eng.reset();
         assert_eq!(
             eng.status().retired,
@@ -5809,11 +5422,9 @@ mod tests {
         assert!(eng.witness.is_empty());
     }
 
-    /// Three short, disjoint typed runs need nine distinct content samples:
-    /// each run's own row and both possible one-row landing rows. The third
-    /// run is the one under the hand. If the fixed sample budget drops its
-    /// lower neighbor, a composer rewrite that moves its text down one row
-    /// leaves the ribbon on the old row instead of carrying it with the text.
+    /// Three disjoint runs want nine samples; the budget must keep the hand's
+    /// lower neighbour so a composer moving its text down a row carries the
+    /// ribbon with it.
     #[test]
     fn three_disjoint_cohorts_keep_the_hands_lower_follow_row_in_the_witness() {
         let ms = Duration::from_millis;
@@ -5827,9 +5438,8 @@ mod tests {
             "the hand's run on row 11 needs row 12 to follow its text; requested {:?}",
             &wanted[..n]
         );
-        // Arm the three runs on the rows the engine asked for, as the host
-        // samples them: row 12 is seen blank, so text found there later
-        // arrived.
+        // Arm the runs as the host samples them; row 12 is seen blank, so
+        // text found there later arrived.
         let original = wanted[..n]
             .iter()
             .map(|&row| RowSample {
@@ -5861,9 +5471,8 @@ mod tests {
         );
     }
 
-    /// A held one-cell park may borrow a text follow only when the moved
-    /// run belonged to the caret's short retreat. A separate run far to the
-    /// left can move off the same source row without proving this park.
+    /// A held one-cell park borrows a text follow only when the moved run is
+    /// the caret's own short retreat, not a distant run on the same row.
     #[test]
     fn an_unrelated_follow_on_the_parked_row_does_not_prove_the_park() {
         let model = aterm_spec::derive::rainbow_short_wrap_park_model();
@@ -5966,9 +5575,8 @@ mod tests {
         }
     }
 
-    /// An engaged engine with a typed two-cell ribbon run on each of `rows`
-    /// (the caret moved to each row by observation, then two keys echoed at
-    /// columns 2 and 3), and the instant of the last echo.
+    /// An engaged engine with a typed two-cell run at columns 2..4 on each of
+    /// `rows` (later rows reached by observation), and the last echo's instant.
     fn typed_runs(rows: &[u16]) -> (Engine, Instant) {
         let ms = Duration::from_millis;
         let t0 = Instant::now();
@@ -6006,14 +5614,10 @@ mod tests {
         (eng, t)
     }
 
-    /// A waiting key's arming rows have their own slots
-    /// ([`Engine::ribbon_rows_for`]). Four runs on rows 3, 7, 11 and 15 want
-    /// twelve samples against the bands' [`witness::WITNESS_ROWS`]; a key
-    /// waiting to lay on row 19 adds rows 19, 18 and 20 in the
-    /// [`witness::ARMING_ROWS`] slots after the bands' eight. A caller with
-    /// only eight slots gets the bands' rows and no arming row. No row two
-    /// away from the arming row is named, and an arming row on the grid's
-    /// last row names nothing past the grid.
+    /// [`Engine::ribbon_rows_for`]: four runs fill the bands'
+    /// [`witness::WITNESS_ROWS`]; a key waiting on row 19 adds 19, 18 and 20 in
+    /// the [`witness::ARMING_ROWS`] slots after them. An eight-slot caller gets
+    /// only the bands' rows; the grid's last row names nothing past the grid.
     #[test]
     fn a_waiting_key_s_arming_rows_have_slots_of_their_own() {
         let (eng, _) = typed_runs(&[3, 7, 11, 15]);
@@ -6059,9 +5663,8 @@ mod tests {
         );
     }
 
-    /// No row two away is named ([`Engine::ribbon_rows_for`]): one band on
-    /// row 10 names its row and its neighbours, and a key waiting on row 10
-    /// adds nothing two away (`tests/copies_are_not_moves.rs`).
+    /// `tests/copies_are_not_moves.rs`: neither a band nor a waiting key names
+    /// a row two away.
     #[test]
     fn no_row_two_away_is_named() {
         let (eng, _) = typed_runs(&[10]);
@@ -6072,10 +5675,8 @@ mod tests {
         assert_eq!(&out[..n], &[10, 9, 11]);
     }
 
-    /// Withheld means asked for and not delivered ([`Engine::follow_rows`]).
-    /// Delivering every row of the asked list withholds nothing; one missing
-    /// row of it is withheld. A row outside the focused pane or past the grid
-    /// is not withheld, delivered or not.
+    /// Withheld means asked for, inside the grid and the focused pane, and not
+    /// delivered ([`Engine::follow_rows`]).
     #[test]
     fn withheld_is_what_the_host_was_asked_for_and_did_not_deliver() {
         let (mut eng, t) = typed_runs(&[3, 7, 11, 15]);
@@ -6137,10 +5738,9 @@ mod tests {
         );
     }
 
-    /// §12, §8.1 no. 1 and §6.7 at the seam: a licensed nav jump mints exactly
-    /// one `Meteor` cue on the spawn frame, at the landing column, carrying the
-    /// direction the pixels flew and a `cells` whose `flight_ms` is the
-    /// `t_flight` the kitty's `land_at` (and the pin and fan) read.
+    /// §12, §8.1 no. 1, §6.7: a licensed nav jump mints one `Meteor` cue on the
+    /// spawn frame at the landing column, whose `cells` give the kitty's
+    /// `t_flight`.
     #[test]
     fn a_licensed_jump_mints_one_meteor_cue_on_the_shared_clock() {
         let t0 = Instant::now();
@@ -6183,12 +5783,9 @@ mod tests {
         assert_eq!(sc.cues.len(), 1);
     }
 
-    /// D9 / §12.3: a Return-licensed move flies the meteor but sounds the
-    /// cadence (exactly one `Enter { cells }` cue, no `Meteor`, no `Jump`), and
-    /// a PTY line feed sounds the cascade lane's `Jump` with no kitty, flare or
-    /// paint (§8.2). The Enter's vector is diagonal (`√(60² + 2²) = 60.03`), so
-    /// the cue must carry the integer the meteor flew, and `flight_ms` of it
-    /// must equal the kitty's `t_flight`.
+    /// D9 / §12.3: a Return flies the meteor but sounds one `Enter { cells }`
+    /// cue, whose `flight_ms` equals the kitty's `t_flight` on a diagonal path;
+    /// a PTY line feed sounds `Jump` with no kitty, flare or paint (§8.2).
     #[test]
     fn a_return_is_the_cadence_and_a_pty_feed_is_the_cascade() {
         let t0 = Instant::now();
@@ -6237,19 +5834,17 @@ mod tests {
     }
 
     /// D17 / §11 / §12.3: a same-row keyed hop under the flight floor sounds
-    /// one `Navigation` cue on the frame its light (a mini-fan at 2-7 cells,
-    /// nothing at 1) is born, priced by that frame's spine and coloured by its
-    /// field at the landing (§17.1). A no-op is silent (D11), and a
-    /// program-driven hop is silent (see `sub_floor_hop`).
+    /// one `Navigation` cue on its light's frame (a mini-fan at 2-7 cells,
+    /// nothing at 1), priced by that frame's spine and coloured by the landing
+    /// cell. A no-op, a `Pty` hop and a typed echo are silent.
     #[test]
     fn a_sub_floor_hop_is_one_nav_tick_and_a_no_op_is_silent() {
         let t0 = Instant::now();
         let cfg = config();
         let ms = Duration::from_millis;
 
-        // Warm: 20 keys lay 20 cells and light the spine; the hop back onto
-        // laid column 15 on the next frame must carry that frame's spine —
-        // which the update at the hop's `now` moved — and column 15's stop.
+        // Warm: 20 keys light the spine; the hop back onto laid column 15
+        // must carry the hop frame's own spine and column 15's stop.
         let mut eng = engaged();
         let mut sc = Scratch::default();
         let mut t = t0;
@@ -6341,9 +5936,8 @@ mod tests {
         }
     }
 
-    /// §8.2's kitty column: an erase or a kill is an "oops" (`Wince`), and a
-    /// meteor minted on the same frame — or already pending — outranks it,
-    /// because the meteor carries the arrival edge the body must not lose.
+    /// §8.2: an erase or a kill winces the kitty, and a meteor minted on the
+    /// same frame or already pending outranks it.
     #[test]
     fn an_erase_winces_the_kitty_and_a_meteor_outranks_it() {
         let t0 = Instant::now();
@@ -6385,8 +5979,7 @@ mod tests {
             fr.companion,
             Some(CompanionImpulse::Meteor { dir: Dir::Left, .. })
         ));
-        // Pending meteor, then an erase before the host takes it: still the
-        // meteor.
+        // Pending meteor, then an erase before the host takes it: still the meteor.
         eng.on_event(Event::Erase, t0 + Duration::from_millis(1));
         assert!(matches!(
             eng.take_companion_impulse(),
@@ -6397,9 +5990,8 @@ mod tests {
     /// One 120 Hz tick — the design's reference cadence (§18).
     const TICK: Duration = Duration::from_micros(8_333);
 
-    /// Drive `eng` through the tick indices `ticks` at 120 Hz on `t0`'s
-    /// clock, reporting the events scheduled on a tick before that tick, as
-    /// the host's seam does (T2: an event and its frame share a `now`).
+    /// Drive `eng` through the tick indices `ticks` at 120 Hz on `t0`'s clock,
+    /// reporting each tick's scheduled events before that tick (T2).
     fn drive_ticks(
         eng: &mut Engine,
         sc: &mut Scratch,
@@ -6420,9 +6012,8 @@ mod tests {
 
     // -- §23's addendum "Flow state": the counter, the entry, the exits ----
 
-    /// Type `keys` keys on row 3 from column 4 at `period_ms`, ticking the
-    /// engine at 120 Hz exactly as the host does, and return one row per key:
-    /// `(seconds since the first key, the flow after that key's frame)`.
+    /// Type `keys` keys on row 3 from column 4 at `period_ms`, ticking at
+    /// 120 Hz, and return `(seconds since the first key, flow)` per key.
     fn flow_run(
         eng: &mut Engine,
         sc: &mut Scratch,
@@ -6454,13 +6045,11 @@ mod tests {
         out
     }
 
-    /// A run of fast clean keys opens the theme and a delete closes it (§23
-    /// "Flow state"), on the real engine at the design's two cadences. The run
-    /// counts only keys born at [`spine::FLOW_KEY_DISP`] or above, so entry
-    /// lands [`spine::FLOW_ENTRY_KEYS`] keys after the hand is at speed.
-    /// `heat` is exactly zero for the first twenty of those keys, eases over
-    /// the last four, and is exactly 1.0 from the 24th. One Backspace takes the
-    /// combo and heat to zero on the same edge and leaves the high-water mark.
+    /// §23 "Flow state" on the real engine at the design's two cadences: only
+    /// keys born at [`spine::FLOW_KEY_DISP`] or above count; `heat` is exactly
+    /// 0 through combo 20, eases over the last four, and is exactly 1.0 from
+    /// the 24th. A Backspace, a kill or a sub-floor key zeroes combo and heat
+    /// on its own edge and leaves the high-water mark.
     #[test]
     fn a_run_of_fast_clean_keys_opens_the_theme_and_a_delete_closes_it() {
         let cfg = config();
@@ -6557,8 +6146,7 @@ mod tests {
                 "{label}: a kill must break the run"
             );
 
-            // The third exit: a key after a long silence is born cold, and a
-            // cold key breaks the run rather than extending it.
+            // The third exit: a key after a long silence is born cold.
             let cold = t2 + Duration::from_secs(30);
             eng.on_event(typed(1), cold);
             let mut fr = sc.frame();
@@ -6571,10 +6159,8 @@ mod tests {
         }
     }
 
-    /// Flow draws nothing of its own: with the hand off the keys, an open
-    /// theme is byte-identical to a cold one (nothing written, fingerprint
-    /// zero, no cadence, no deadline), while `heat` is still 1.0 because the
-    /// run is unbroken. No keystroke, no light.
+    /// With the hand off the keys an open theme is byte-identical to a cold
+    /// one, while `heat` stays 1.0 because the run is unbroken.
     #[test]
     fn flow_draws_nothing_of_its_own() {
         let cfg = config();
@@ -6587,8 +6173,7 @@ mod tests {
             "the fixture must reach flow first"
         );
 
-        // The hand lifts. Run out to five seconds of silence: everything the
-        // keys bought retires, and the frames go to the idle frame.
+        // The hand lifts for five seconds: the frames go to the idle frame.
         let last_key = t0 + Duration::from_millis(83) * 44;
         let mut dark_from = None;
         let mut t = last_key;
@@ -6635,10 +6220,9 @@ mod tests {
             "the run is unbroken through the silence — that is what an agent holds its turn on: {held:?}"
         );
 
-        // The twin, at heat 0 on the same events: a celebration drive whose
-        // floor is under the live metric holds the combo at zero without
-        // changing the spine, so the only difference is the run. Once both are
-        // dark their cadence and deadline agree.
+        // The twin at heat 0 on the same events: a celebration floor under the
+        // live metric holds the combo at zero without changing the spine.
+        // Once both are dark their cadence and deadline agree.
         let t1 = Instant::now();
         let mut cold = engaged();
         let mut sc1 = Scratch::default();
@@ -6697,9 +6281,8 @@ mod tests {
         );
     }
 
-    /// One frame at `now`, read back as the `RainbowExitSampling` model sees
-    /// it: whether it put any light on glass, and whether the engine then asks
-    /// the host for another frame (a cadence or a named deadline).
+    /// One frame at `now` as `RainbowExitSampling` sees it: `(visible, active)`,
+    /// where active is a cadence or a named deadline.
     fn exit_sample(eng: &mut Engine, now: Instant) -> (i64, i64) {
         let mut sc = Scratch::default();
         let mut fr = sc.frame();
@@ -6714,8 +6297,7 @@ mod tests {
         (i64::from(visible), i64::from(active))
     }
 
-    /// A fault injected into the engine at the late observation's instant,
-    /// just before that frame runs — or none.
+    /// A fault injected just before the late observation's frame.
     type ExitFault = fn(&mut Engine, Instant);
 
     /// A real typing shape: drive it from a start instant, return its last key's.
@@ -6724,20 +6306,15 @@ mod tests {
     /// The shipped engine, untouched.
     fn no_exit_fault(_: &mut Engine, _: Instant) {}
 
-    /// The model's `Buggy = 1`, injected into the real engine: a lifecycle that
-    /// advances per callback rather than by time restarts every swoosh that ran
-    /// out unobserved at the first late observation
-    /// (`Ribbon::restart_unobserved_swooshes`), and the real frame then lays
-    /// the reach and arms the retract from there.
+    /// The model's `Buggy = 1` in the real engine: a per-callback lifecycle
+    /// restarts every unobserved swoosh at the first late observation.
     fn callback_relative_swoosh(eng: &mut Engine, late: Instant) {
         eng.ribbon.restart_unobserved_swooshes(late);
     }
 
-    /// Walk `model`'s whole space on the real engine, from three real typing
-    /// shapes (a single key, a slow three-key word, a 44-key flow run) and
-    /// three silences past the whole swoosh (5 s, 30 s, 10 min): the ribbon is
-    /// lit at the last key, logical time passes with NO callback, and one
-    /// late tick is observed — with `fault` injected into the engine at it.
+    /// Walk `model`'s space on the real engine: three typing shapes times three
+    /// silences past the whole swoosh (5 s, 30 s, 10 min), with no callback
+    /// until one late tick, `fault` injected at it.
     fn exit_sampling_walk(
         model: &aterm_spec::derive::Model,
         fault: ExitFault,
@@ -6775,8 +6352,7 @@ mod tests {
                         at(&lit)
                     ));
                 }
-                // Logical time passes the whole grace + reach + retract with no
-                // callback at all: nothing on the engine moves.
+                // Logical time passes the whole swoosh with no callback.
                 let mut elapsed = lit.clone();
                 elapsed.insert("logical_done", 1);
                 if model.successors("ElapseDone", &lit) != vec![elapsed.clone()] {
@@ -6807,17 +6383,13 @@ mod tests {
         Ok(observed)
     }
 
-    /// Tier-1 conformance for `RainbowExitSampling`
-    /// (`aterm_spec::derive::rainbow_exit_sampling_model`): the exit swoosh is
-    /// a function of time, not of callbacks. A live ribbon whose whole
+    /// Tier-1 conformance for `RainbowExitSampling`: the exit swoosh is a
+    /// function of time, not of callbacks. A live ribbon whose whole
     /// `grace + reach + retract + fade` passes with no frame is settled at the
-    /// one late tick (nothing on glass, nothing armed), on the real engine, for
-    /// every typing shape and silence.
-    ///
-    /// Negative control: the model's `Buggy = 1` injected into the same engine
-    /// (every unobserved swoosh restarts at the late tick) is refused by the
-    /// healthy model and matches the buggy one; the shipped engine is refused
-    /// by the buggy model.
+    /// one late tick, for every typing shape and silence. Negative control:
+    /// the model's `Buggy = 1` injected into the engine is refused by the
+    /// healthy model and matches the buggy one, which refuses the shipped
+    /// engine.
     #[test]
     fn a_late_tick_samples_the_settled_exit_swoosh() {
         let model = aterm_spec::derive::rainbow_exit_sampling_model();
@@ -6844,10 +6416,10 @@ mod tests {
             .copied()
     }
 
-    /// The typo script (§23 "The mend"): eight keys at 8 cps from column 4 of
-    /// row 3 (every 15th tick), a Backspace one key-slot later, then the fix
-    /// key one slot after that. Returns the schedule and the ticks of the erase
-    /// and the fix.
+    /// The typo script (§23 "The mend"): eight keys at 8 cps from (3, 4) (every
+    /// 15th tick), `deletes` Backspaces from `erase_after` ticks after the last
+    /// key, then the fix key `fix_after` ticks after the last delete. Returns
+    /// the schedule and the ticks of the last erase and the fix.
     fn typo_script(
         erase_after: u64,
         deletes: u16,
@@ -6855,8 +6427,7 @@ mod tests {
     ) -> (Vec<(u64, Event)>, u64, u64) {
         let mut out = Vec::new();
         let mut col = 4u16;
-        // The key, then its echo: a `Typed` with no move after it in the
-        // frame is held, not laid.
+        // The key, then its echo: a `Typed` with no move after it is held.
         for k in 0..8u64 {
             out.push((15 * k, typed(1)));
             out.push((15 * k, mv((3, col), (3, col + 1), Licence::Typed)));
@@ -6876,14 +6447,11 @@ mod tests {
         (out, last_erase, fix)
     }
 
-    /// The mend (§23 "The mend"): momentum resumes after a typo fix rather
-    /// than starting over. Eight keys at 8 cps, a Backspace, then the fix key
-    /// one slot later, 500 ms later, and after a 250 ms pause with two
-    /// deletes: the fix cell is born at the momentum the deleting interrupted
-    /// (the birth spine on the frame before the first Backspace), so its
-    /// `cov0` and life match the run it re-joins and the bed shows no dip.
-    /// The erased cell's retract still starts on the erase edge (T5), the fix
-    /// key owns its light on its own frame, and the mark is spent by the fix.
+    /// §23 "The mend": a fix key one slot, 500 ms, or a 250 ms pause and two
+    /// deletes after a typo is born at the birth spine the deleting
+    /// interrupted, so its `cov0` and life match the run it re-joins. The
+    /// erased cell still retracts on the erase edge (T5) and the fix spends
+    /// the mark.
     #[test]
     fn a_typo_fixed_within_a_breath_is_born_at_the_momentum_it_interrupted() {
         for (label, erase_after, deletes, fix_after) in [
@@ -6954,9 +6522,8 @@ mod tests {
         }
     }
 
-    /// The mend's two edges: a typed key 2 s after the Backspace, or after
-    /// three deletes, is not a fix; it is priced at the live `birth_disp`, and
-    /// the mark (still there as a value) is not a mend when the key reads it.
+    /// A key 2 s after the Backspace, or after three deletes, is not a fix: it
+    /// is priced at the live `birth_disp`.
     #[test]
     fn a_slow_correction_is_not_a_mend() {
         for (label, deletes, fix_after) in [("2 s later", 1u16, 240u64), ("three deletes", 3, 15)] {
@@ -7000,12 +6567,9 @@ mod tests {
         }
     }
 
-    /// A value, not a timer (T6 at the mark): one key, one Backspace, and the
-    /// glass goes dark inside the mend window; while the mend is live the
-    /// engine asks for no cadence, names no deadline and fingerprints zero,
-    /// and nothing wakes when the window closes. A key typed over the dark
-    /// glass inside the window is mended: born at the mark, above the live
-    /// price.
+    /// T6 at the mark: after one key and one Backspace the glass goes dark
+    /// inside the mend window with no cadence, deadline or wake at its close;
+    /// a key over the dark glass inside the window is still mended.
     #[test]
     fn the_mend_mark_is_a_value_not_a_timer() {
         let t0 = Instant::now();
@@ -7092,9 +6656,8 @@ mod tests {
         assert_eq!(eng.spine().mend(t_past), None, "…and not a mend any more");
     }
 
-    /// §6.11 / §7.1: under reduced motion a credited spawn is a landing with
-    /// no flight behind it — the kitty gets `Land`, the caret gets no flash —
-    /// and the sound is unchanged (§8.2: "Reduced motion … unchanged").
+    /// §6.11 / §7.1: under reduced motion a credited spawn is `Land` with no
+    /// flash; the sound is unchanged (§8.2).
     #[test]
     fn reduced_motion_lands_the_kitty_without_a_flight_or_a_flash() {
         let t0 = Instant::now();
@@ -7112,10 +6675,8 @@ mod tests {
         assert!(matches!(sc.cues[0].kind, SoundKind::Meteor { .. }));
     }
 
-    /// §7.1: the flare is one edge. It rides out as `Some(t₀)` on the spawn
-    /// frame and through the spring-snap relax, then is cleared once the
-    /// relax has settled — so the host can never mistake a stale edge for a
-    /// fresh one.
+    /// §7.1: the flare rides out as `Some(t₀)` through the spring-snap relax,
+    /// then clears, so a stale edge never reads as fresh.
     #[test]
     fn the_caret_flare_is_one_edge_that_ages_out() {
         let t0 = Instant::now();
@@ -7139,14 +6700,11 @@ mod tests {
         );
     }
 
-    /// §7.1 / §17.1: the caret's paint is the display spine. After a burst and
-    /// 220 ms of silence it reads `momentum_display()` to the bit (≥ 70 % of
-    /// its typing value, on the ribbon's τ 0.85 s release), not the 0.5 a
-    /// private 220 ms half-life would give. A typed key does not lift it above
-    /// the spine. A credited landing floors it at exactly `1.0` on the landing
-    /// frame, holds it through the flare's relax, cools it on the flare's
-    /// constant, and hands it back to the bare spine (exactly `0` on a cold
-    /// engine) at its life.
+    /// §7.1 / §17.1: the caret's paint is the display spine (after 220 ms of
+    /// silence still ≥ 70 % on the spine's τ 0.85 s release), and a typed key
+    /// does not lift it. A credited landing floors it at exactly `1.0`, holds
+    /// through the flare's relax, cools on the flare's constant and returns to
+    /// the bare spine at its life.
     #[test]
     fn the_caret_paint_is_the_display_spine_floored_by_the_landing_relight() {
         let t0 = Instant::now();
@@ -7173,7 +6731,7 @@ mod tests {
         assert!(typing > 0.3, "sustained typing lit the spine: {typing}");
         assert_eq!(while_typing, typing, "while typing, paint is the spine");
 
-        // 220 ms of silence — the number a private caret cool would halve on.
+        // 220 ms of silence.
         let quiet = t + ms(220);
         let mut fr = sc.frame();
         eng.tick(quiet, geom(), &cfg, &mut fr);
@@ -7186,8 +6744,7 @@ mod tests {
             "220 ms into a τ 0.85 s release keeps ≥ 70 %: {disp} of {typing}"
         );
 
-        // One key on a cold engine does not lift the paint above the spine
-        // (the old hand-edge law read 0.95 here).
+        // One key on a cold engine does not lift the paint above the spine.
         let mut eng = engaged();
         let mut sc = Scratch::default();
         eng.on_event(typed(1), t0);
@@ -7231,10 +6788,8 @@ mod tests {
         assert_eq!(eng.caret_paint(dead), 0.0);
     }
 
-    /// §5.8 / §7.2 / D5 at the seam: the kitty's Delight earns one m1 at the
-    /// reported cell and mints the `Delight` impulse; each hero chimes once
-    /// while the bucket has a token and is still born when it does not —
-    /// light is never rationed, only sound.
+    /// §5.8 / §7.2 / D5: Delight earns one m1 and the `Delight` impulse; a hero
+    /// chimes only with a token but is always born.
     #[test]
     fn delight_earns_one_hero_that_chimes_only_with_a_token() {
         let t0 = Instant::now();
@@ -7274,10 +6829,8 @@ mod tests {
         }
     }
 
-    /// The party reaches the sky (§27): a bar reported through
-    /// [`Engine::party`] mints its fan on the next tick. Three-sided, for the
-    /// three ways this can be wrong: a silent no-op, a fan nobody asked for,
-    /// and a fan in a coordinate space the caret no longer means anything in.
+    /// §27: a bar reported through [`Engine::party`] mints its fan on the next
+    /// tick, and not across a reset or before the caret is known.
     #[test]
     fn a_reported_bar_mints_its_fan_and_a_withdrawn_one_mints_nothing() {
         let t0 = Instant::now();
@@ -7306,9 +6859,7 @@ mod tests {
             "the host's bar minted NOTHING: stars {before} -> {after}"
         );
 
-        // B. The same bar across a coordinate-space cut mints nothing: `reset`
-        // forgets the caret, so a bar held across it would fan at (0, 0) in
-        // the new space with no key behind it.
+        // B. The same bar across a `reset` mints nothing.
         let mut eng = engaged();
         for row in 0..26u16 {
             blank_row(&mut eng, row);
@@ -7325,8 +6876,8 @@ mod tests {
         for row in 0..26u16 {
             blank_row(&mut eng, row);
         }
-        // …and the caret is learned again in the new space, so without the
-        // clear at the `reset` seam the stale bar would fan at it.
+        // …and the caret is learned again in the new space, where a stale bar
+        // would otherwise fan.
         eng.on_event(
             mv((9, 40), (9, 41), Licence::Typed),
             t0 + Duration::from_millis(2),
@@ -7340,8 +6891,8 @@ mod tests {
             "a bar banked before a space cut fanned into the new space"
         );
 
-        // C. A bar with no observed caret mints nothing either (the law
-        // `earn_hero` obeys), so B holds even without the `reset` clear.
+        // C. A bar with no observed caret mints nothing either, so B holds
+        // even without the `reset` clear.
         let mut eng = engaged();
         for row in 0..26u16 {
             blank_row(&mut eng, row);
@@ -7356,9 +6907,8 @@ mod tests {
         );
     }
 
-    /// §5.4 at the seam: with NO probe data a cell is unknown, and an unknown
-    /// sky bears no star — the host must have looked (D16). The same hero
-    /// over a probed-blank row is born.
+    /// §5.4 / D16: an unprobed sky bears no star; the same hero over a
+    /// probed-blank row is born.
     #[test]
     fn an_unprobed_sky_bears_no_star() {
         let t0 = Instant::now();
@@ -7380,13 +6930,10 @@ mod tests {
     }
 
     /// Seam point 12, the band path: a band move is a coordinate transform,
-    /// never a reset. Six cells typed on row 3 with the caret at (3, 6) ride
-    /// a band `[2..10]` down to row 4 with the field intact (`field_at(4, 5)`
-    /// answers what `field_at(3, 5)` did; the vacated cell answers nothing),
-    /// the erased cell and earned heroes move with their rows, and the spine
-    /// is untouched (the control is a reset, which restarts momentum). A band
-    /// outside the caret's row leaves everything alone; a band the caret's
-    /// row leaves saturates the caret at its edge and drops the light.
+    /// never a reset. Cells, field, erased cell and earned heroes ride the band
+    /// and the spine is untouched (the control is a reset). A band outside the
+    /// caret's row leaves everything alone; one the caret's row leaves
+    /// saturates the caret at its edge and drops the light.
     #[test]
     fn a_band_move_moves_the_caret_with_its_band_and_keeps_the_spine() {
         let t0 = Instant::now();
@@ -7450,7 +6997,7 @@ mod tests {
             "the ribbon is lit on the moved row"
         );
 
-        // Control: the reset this path replaces restarts the momentum.
+        // Control: a reset restarts the momentum.
         let mut reset = engaged();
         lay(&mut reset);
         reset.reset();
@@ -7505,10 +7052,8 @@ mod tests {
         let mut sc = Scratch::default();
         let ms = Duration::from_millis;
 
-        // A hero over row 3 and six laid cells (columns 0-5) on one frame;
-        // on the next, the caret stepped back onto laid column 5 by a
-        // one-cell hop — which draws no light of its own, so every quad
-        // compared below is a star's or the ribbon's.
+        // A hero over row 3 and six laid cells; next frame a one-cell hop back
+        // onto column 5, which draws no light of its own.
         blank_row(&mut eng, 2);
         eng.earn_hero(t0, 3, 5);
         eng.on_event(mv((3, 0), (3, 6), Licence::Typed), t0);
@@ -7520,9 +7065,8 @@ mod tests {
         let mut sc = Scratch::default();
         let mut fr = sc.frame();
         eng.tick(t0, g, cfg, &mut fr);
-        // The hero plus whatever strike stars the deal put over the two typed
-        // cells: how many is the sky's law, not this one's — what this test
-        // pins is that every one of them moves and none is lost.
+        // The hero plus whatever strike stars the deal put over the typed
+        // cells: the count is the sky's law; this pins that none is lost.
         let live = eng.status().stars;
         assert!(live >= 1, "{theme}: the earned hero is on glass");
         let quads: Vec<(u16, u16)> = sc.out.iter().map(|q| (q.row, q.y)).collect();
@@ -7547,10 +7091,8 @@ mod tests {
             "the two laid cells differ, so a stale caret would read the other"
         );
 
-        // The viewport moves; the clock does not (T7 makes a same-`now`
-        // frame legal), so the only difference between the two frames is the
-        // scroll — a mark still ramping in would otherwise cross a rounding
-        // step on its own between two instants and fake a one-pixel drift.
+        // The viewport moves, the clock does not (T7 makes a same-`now` frame
+        // legal), so a mark still ramping in cannot fake a one-pixel drift.
         eng.translate_scroll(1, g.ch as u16);
         let mut sc2 = Scratch::default();
         let mut fr = sc2.frame();
@@ -7664,9 +7206,9 @@ mod tests {
         );
         eng.on_event(typed(1), ms(fell, 30));
         // The fall is staggered (`ribbon::CURTAIN_STAGGER_S`): the cell
-        // farthest from the hand starts at the curtain's instant and the one
-        // under the hand at half of `CURTAIN_S`, so the band's total light,
-        // not its peak, falls from the first frame.
+        // farthest from the hand starts at once and the one under the hand
+        // last, so the band's total light, not its peak, falls from the first
+        // frame.
         let band = |eng: &mut Engine, at: Instant| -> (u8, u32) {
             let mut sc = Scratch::default();
             let mut f = sc.frame();
@@ -7712,9 +7254,8 @@ mod tests {
         );
     }
 
-    /// An un-taken hide is dropped, never carried: [`Engine::hide_next_frame`]
-    /// is taken by the tick, so a style switch, teardown or curtain between
-    /// the arm and the tick must drop it.
+    /// [`Engine::hide_next_frame`] is taken by one tick; a reset or curtain
+    /// before that tick drops it.
     #[test]
     fn a_hide_is_taken_by_one_frame_and_an_un_taken_one_is_dropped_by_a_reset_or_a_curtain() {
         let cfg = config();
@@ -7764,12 +7305,10 @@ mod tests {
         );
     }
 
-    /// The status verb tells the truth while the curtain falls.
-    /// `ribbon_segments` is floored at `ribbon::STATUS_LIT_COV`, a bound on
-    /// what the row may claim, so it reaches zero while dim quads are still
-    /// composited. `ribbon_drawn` answers per stop against each boundary's own
-    /// composite, and `ribbon_curtain_ms` says why the claim is under its
-    /// floor.
+    /// The status verb tells the truth while the curtain falls: the
+    /// `ribbon_segments` claim is floored at `ribbon::STATUS_LIT_COV` and
+    /// reaches zero while dim quads still composite, so `ribbon_drawn` answers
+    /// from each frame's composite and `ribbon_curtain_ms` says why.
     #[test]
     fn a_falling_curtain_is_reported_drawn_on_every_frame_it_composites() {
         let cfg = config();
@@ -7777,10 +7316,9 @@ mod tests {
         let t0 = Instant::now();
         let mut eng = engaged();
         let t = three_typed_cells(&mut eng, t0);
-        // `(quads emitted, does any of them composite to something the glass
-        // census would count as band ink)` — the second read straight off the
-        // frame's own pixels, through the same predicate the status row uses,
-        // so the pin compares the verb with the pixels and not with itself.
+        // `(quads emitted, any composites to band ink)`, the second read off
+        // the frame's own pixels through the status row's predicate, so the pin
+        // compares the verb with the pixels.
         let quads = |eng: &mut Engine, at: Instant| -> (usize, bool) {
             let mut sc = Scratch::default();
             let mut f = sc.frame();
@@ -7806,10 +7344,8 @@ mod tests {
                     "+{at} ms: {n} quads composited and the row says no curtain is falling"
                 );
             }
-            // The law: the row answers `ribbon_drawn=0` only when the pixels
-            // it is answering about do not read as band ink. A frame whose
-            // own composite the census would count, reported as nothing, is
-            // the bound returned as a fact.
+            // The law: the row answers `ribbon_drawn=0` only when the pixels it
+            // answers about do not read as band ink.
             if ink {
                 if drawn == 0 {
                     lied.push((at, n));
@@ -7883,11 +7419,9 @@ mod tests {
         assert!(eng.drain_sound_cues().next().is_none());
     }
 
-    /// C2 at the seam, and D4: `Frame.caret.field_t` is this frame's field at
-    /// this frame's caret — sampled after the events are laid and the ribbon
-    /// has planned — so it equals `field()` on the same frame, and a meteor
-    /// landing on a laid cell locks its phase (the cue's `hue`) to that cell,
-    /// not to the cell the caret left.
+    /// C2 / D4: `Frame.caret.field_t` is this frame's field at this frame's
+    /// caret, equal to `field()`, and a meteor landing on a laid cell locks
+    /// its cue's `hue` to that cell, not the one the caret left.
     #[test]
     fn the_caret_seam_reports_this_frames_field_at_the_landing() {
         let t0 = Instant::now();
@@ -7928,7 +7462,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // panel #10 — the pet and the sky (D13's wiring gap, and two offers more)
+    // Panel #10: the pet and the sky (D13)
     // -----------------------------------------------------------------------
 
     /// A resident pet as its own frame publishes it: six cells wide, feet on
@@ -7944,11 +7478,9 @@ mod tests {
         }
     }
 
-    /// Panel #10(a), D13: `Engine::pet_offer` reads `BodyImpulse::Perk { at }`
-    /// minted for every credited meteor, and the instant it hands the resident
-    /// is the landing's (the same `Instant` as the pin, the arrival flash, the
-    /// caret's flare and the audio bell, §6.7, §8.1 no. 3). A settled pet perks
-    /// exactly there and is not moved.
+    /// Panel #10(a), D13: `Engine::pet_offer` hands the resident the credited
+    /// meteor's perk at the landing's own instant (the pin's, the flare's, the
+    /// bell's: §6.7, §8.1 no. 3), and does not move it.
     #[test]
     fn the_meteor_s_perk_reaches_the_resident_at_the_landing_s_own_instant() {
         let t0 = Instant::now();
@@ -7984,8 +7516,7 @@ mod tests {
             "the perk is the LANDING's instant, never the launch's"
         );
 
-        // …and it is the landing pin's own instant, on the frame the pin is
-        // born. One `Instant`, four marks (§6.7).
+        // …and it is the landing pin's instant, on the frame the pin is born.
         let mut t = t0;
         let mut pinned = None;
         for _ in 0..16 {
@@ -8011,9 +7542,7 @@ mod tests {
             "fixture: the caret's own edge is live for the same landing"
         );
 
-        // The offer is the router's answer: the same impulse routed with
-        // `Body::Pet` says the same thing and still refuses to relocate the
-        // cat (no teleport).
+        // The router says the same for `Body::Pet`, and never relocates the cat.
         assert_eq!(
             companion::impulse_for(companion::Body::Pet, imp),
             companion::BodyImpulse::Perk { at: arrival }
@@ -8043,12 +7572,9 @@ mod tests {
         );
     }
 
-    /// Panel #10(b), the cat catches a star. A gold m1 (about one key in
-    /// eighty) born within [`companion::CATCH_REACH_CELLS`] of a settled,
-    /// contented cat is offered to it; on the paw's landing frame that one
-    /// star's life is spent on the sky's 40 ms finish. The star is still
-    /// keystroke-born (T1), the cat's reaching draws nothing, and exactly one
-    /// life moves.
+    /// Panel #10(b): a gold m1 within [`companion::CATCH_REACH_CELLS`] of a
+    /// settled, contented cat is offered to it, and the paw's landing spends
+    /// exactly that star's life on the sky's 40 ms finish; nothing is born.
     #[test]
     fn a_gold_star_near_a_contented_cat_is_offered_and_caught() {
         let t0 = Instant::now();
@@ -8058,9 +7584,8 @@ mod tests {
         let ms = Duration::from_millis;
         blank_row(&mut eng, 2);
 
-        // Earn heroes along row 3 until the deal hands out a gold one. The
-        // deal is deterministic (`cell_hash(row, col, minted)`), so this is a
-        // fixed search, not a die roll.
+        // Earn heroes along row 3 until the deal hands out a gold one; the
+        // deal is a deterministic hash, so this is a fixed search.
         let mut gold_col = None;
         for col in (6u16..90).step_by(4) {
             let at = t0 + ms(u64::from(col));
@@ -8175,8 +7700,8 @@ mod tests {
         assert_eq!(sc.cues.len(), cues, "the catch minted a sound");
         assert!(sc.out.len() >= q && sc.halos.len() >= h, "scratch shrank");
 
-        // … and NO wake was bought: a life that ends sooner can only bring
-        // the sky's next deadline forward, never push it out.
+        // … and no wake was bought: a life that ends sooner can only bring the
+        // sky's next deadline forward.
         if let (Some(before), Some(after)) = (deadline_before, eng.next_change_deadline(paw)) {
             assert!(
                 after <= before,
@@ -8196,10 +7721,9 @@ mod tests {
         );
     }
 
-    /// Panel #10(c), C2 extended to the cat: a contented resident's ♪ and ♥
-    /// take the ribbon's field at the cat's cell, snapped (C1: a mote is a
-    /// point mark). Where no ribbon light is under the cat the offer is `None`
-    /// and the pet keeps its own colour.
+    /// Panel #10(c), C2 for the cat: a contented resident's notes take the
+    /// ribbon's field at the cat's cell, snapped to a stop (C1); with no ribbon
+    /// under the cat the offer is `None`.
     #[test]
     fn the_purr_notes_wear_the_ribbon_s_colour_under_the_cat() {
         let t0 = Instant::now();
@@ -8275,9 +7799,8 @@ mod tests {
         );
     }
 
-    /// The scratch is the host's and is reused: a tick must never assume it
-    /// starts empty, and the fingerprint must fold only what this tick wrote
-    /// (§18, and the reason `is_active` can follow it).
+    /// The scratch is the host's and reused: the fingerprint folds only what
+    /// this tick wrote (§18), which is why `is_active` can follow it.
     #[test]
     fn the_fingerprint_folds_only_this_ticks_own_marks() {
         let t0 = Instant::now();
@@ -8355,9 +7878,8 @@ mod tests {
 
     // -- §18 cadence: what the engine asks the host for ---------------------
 
-    /// The sim's own no-busy-loop guard. [`ARM_MIN`] is under test, so the sim
-    /// cannot lean on it: a deadline at or before `now` is stepped past by this
-    /// much and counted, as a host booking `deadline_arms_by_owner` would.
+    /// The sim's own no-busy-loop step ([`ARM_MIN`] is under test): a deadline
+    /// at or before `now` is stepped past by this much.
     const SIM_MIN: Duration = Duration::from_millis(1);
 
     /// The typing row of the scripted gestures; its neighbours are probed
@@ -8385,8 +7907,7 @@ mod tests {
         Duration::from_secs_f32(s)
     }
 
-    /// 12 cps prose from column 4 of [`SIM_ROW`]: a `Typed` move and a
-    /// `Typed` echo per key, as the host's seam reports them.
+    /// 12 cps prose from column 4 of [`SIM_ROW`], a `Typed` move and key each.
     fn prose_script(t0: Instant, keys: usize) -> Vec<(Instant, Event)> {
         const TEXT: &[u8] = b"The quick brown fox jumps over the lazy dog and keeps on going ";
         let mut out = Vec::with_capacity(keys * 2);
@@ -8436,9 +7957,8 @@ mod tests {
     }
 
     /// A host loop in miniature: wakes at every scripted event and at the
-    /// deadline `ask` names, ticks the engine on each wake as the host does,
-    /// and records one turn per wake (a `Some` deadline is one booked arm).
-    /// Stops at `until`, or when nothing is scripted and no deadline is named.
+    /// deadline `ask` names, ticking on each wake and recording one turn (a
+    /// `Some` deadline is one booked arm), until `until` or nothing is pending.
     fn drive(
         eng: &mut Engine,
         cfg: &Config,
@@ -8490,9 +8010,8 @@ mod tests {
             .count()
     }
 
-    /// The tail law (§18): after the last key, while only fades are live, the
-    /// engine asks for no more than about 25 wakes a second ([`TAIL_FLOOR`]
-    /// plus a twinkle step), and once idle it asks for nothing and stays so.
+    /// §18's tail law: after the last key, while only fades are live, the
+    /// engine asks for about 25 wakes a second at most, and once idle nothing.
     #[test]
     fn a_settling_sky_asks_for_no_more_frames_than_its_light_can_show() {
         let cfg = config();
@@ -8511,8 +8030,7 @@ mod tests {
             "grace tail: {grace} arms in 250 ms (budget {})",
             budget(0.50, 0.75)
         );
-        // The swoosh's fade is its last 0.24 s (`RETRACT_FADE_S`), wherever
-        // the phrase rest puts the swoosh's end.
+        // The swoosh's fade is its last 0.24 s (`RETRACT_FADE_S`).
         let (f0, f1) = (ribbon::SWOOSH_TOTAL_S - 0.24, ribbon::SWOOSH_TOTAL_S);
         let fade = arms_in(&turns, last, f0, f1);
         assert!(
@@ -8520,8 +8038,7 @@ mod tests {
             "swoosh fade: {fade} arms in 240 ms (budget {})",
             budget(f0, f1)
         );
-        // No arm is ever booked for a deadline at or before the turn it was
-        // named on (no busy re-arm).
+        // No busy re-arm.
         for (t, d, _) in &turns {
             if let Some(d) = d {
                 assert!(
@@ -8532,8 +8049,7 @@ mod tests {
                 );
             }
         }
-        // Idle → zero, and it holds: the next ask a second later is still
-        // `None`, the cadence is off, the pools are empty.
+        // Idle → zero, and it holds.
         let idle_at = turns
             .iter()
             .find(|(t, d, _)| *t >= last && d.is_none())
@@ -8554,10 +8070,8 @@ mod tests {
         assert_eq!((st.stars, st.cells, st.meteors), (0, 0, 0));
     }
 
-    /// The fold ([`Cadence`]): brisk answers the next frame whatever else was
-    /// offered; a tail is never sooner than [`TAIL_FLOOR`] and keeps its own
-    /// later step; a past edge is not a next change; a past tail instant is
-    /// the floor; nothing offered is `None`.
+    /// [`Cadence`]: brisk is the next frame; a tail is floored at
+    /// [`TAIL_FLOOR`]; a past edge is ignored and a past tail is the floor.
     #[test]
     fn the_cadence_fold_floors_tails_and_ignores_past_edges() {
         let now = Instant::now();
@@ -8592,9 +8106,8 @@ mod tests {
         );
     }
 
-    /// The flight law (T2, T7, §6.2): from the spawn frame through the landing
-    /// pin's close (`T .. T + 150`) the engine asks for every frame, each wake
-    /// exactly [`FRAME_CADENCE`] after the last, with seam point 8 agreeing.
+    /// T2 / T7 / §6.2: from the spawn frame through the pin's close the engine
+    /// asks for every frame, [`FRAME_CADENCE`] apart, and seam point 8 agrees.
     #[test]
     fn a_flight_asks_for_every_frame() {
         let cfg = config();
@@ -8627,13 +8140,9 @@ mod tests {
         );
     }
 
-    /// A batched echo sweeps every glyph cell it skipped (seam point 1,
-    /// [`Event::Sweep`]): three keys land before the PTY echoes once, three
-    /// cells at a time (SSH, a busy shell). Keys lay at the landing, so the
-    /// two cells before it come from the sweep (or from the ledger when the
-    /// host sends none, [`Engine::echo_bridge`]). The per-key path is
-    /// untouched. The control is the same batch with no presses behind it
-    /// (program output), which lays nothing.
+    /// One echo for three keys (SSH, a busy shell): the cells before the
+    /// landing come from the host's sweep, or from the ledger when it sends
+    /// none; control: the same batch with no presses lays nothing.
     #[test]
     fn a_batched_echo_sweeps_every_glyph_cell_it_skipped() {
         let t0 = Instant::now();
@@ -8643,8 +8152,7 @@ mod tests {
         let drive = |sweep: bool, pressed: bool| -> Engine {
             let mut eng = engaged();
             blank_row(&mut eng, 2);
-            // A first key, then its echo onto column 2 (a key with no move
-            // after it in the frame is held, not laid).
+            // A first key, then its echo onto column 2.
             if pressed {
                 eng.on_event(typed(1), t0);
             }
@@ -8702,11 +8210,9 @@ mod tests {
         }
     }
 
-    /// A typed fold wraps at the pane's edge, not the grid's: in a split pane
-    /// twelve columns in and forty wide, the key that wraps its line lands at
-    /// `(3, 12)` and its glyph is the previous row's last pane cell, `(2, 51)`.
-    /// Without [`Engine::set_pane`] the ribbon would light `(3, 11)` in the
-    /// neighbouring pane (the control).
+    /// In a split pane twelve columns in and forty wide, the wrapping key's
+    /// glyph is the previous row's last pane cell `(2, 51)`; control: without
+    /// [`Engine::set_pane`] the fold lights `(3, 11)` in the neighbouring pane.
     #[test]
     fn a_typed_fold_wraps_at_the_pane_edge_not_the_grid_edge() {
         let t0 = Instant::now();
@@ -8748,12 +8254,9 @@ mod tests {
         );
     }
 
-    /// A key whose echo lands a frame late still lights its glyph
-    /// ([`Event::Sweep`] for a one-cell echo). The key is held on the frame
-    /// it is typed rather than re-laying the previous cell, and its cell comes
-    /// from the echo's sweep; a key whose echo shares its tick is untouched.
-    /// The ledger also pays it without the host's sweep, so the control is a
-    /// one-cell move with no press behind it.
+    /// A key echoed a frame late is held on its own frame and gets its cell
+    /// from the echo's sweep (or the ledger); control: the same move with no
+    /// press lays nothing.
     #[test]
     fn a_key_whose_echo_lands_a_frame_late_still_lights_its_glyph() {
         let ms = Duration::from_millis;
@@ -8763,8 +8266,7 @@ mod tests {
         let drive = |sweep: bool, pressed: bool| -> Engine {
             let mut eng = engaged();
             blank_row(&mut eng, 2);
-            // A first key, then its echo onto column 2 (a key with no move
-            // after it in the frame is held, not laid).
+            // A first key, then its echo onto column 2.
             if pressed {
                 eng.on_event(typed(1), t0);
             }
@@ -8772,9 +8274,7 @@ mod tests {
             let mut sc = Scratch::default();
             let mut fr = sc.frame();
             eng.tick(t0, g, &cfg, &mut fr);
-            // The key, echoed a frame later: held on the frame it is typed
-            // (its cell comes with the echo below), never laid at the
-            // previous glyph's cell.
+            // The key, echoed a frame later: held on the frame it is typed.
             if pressed {
                 eng.on_event(typed(1), t0 + ms(8));
             }
@@ -8820,10 +8320,8 @@ mod tests {
         );
     }
 
-    /// A press waits on the ledger for the whole patience: a key refused at
-    /// the seam and the next key nine seconds later (inside
-    /// `ECHO_PATIENCE_S`), with the host's sweep on its clock; the stalled
-    /// press pays for its cell.
+    /// A stalled press still pays for its cell nine seconds later, inside
+    /// [`ECHO_PATIENCE_S`].
     #[test]
     fn a_press_waits_on_the_ledger_for_the_whole_patience() {
         let ms = Duration::from_millis;
@@ -8856,9 +8354,7 @@ mod tests {
         assert_eq!(eng.status().bridged, 1);
     }
 
-    /// Forty presses typed into a stall fit the ledger: forty `Typed` banked,
-    /// the host's sweep 5..45 on the oldest press's clock and the move from
-    /// the mirror; the ledger spends forty (tallied as spent, not forfeited).
+    /// Forty stalled presses all fit the ledger and are spent, none forfeited.
     #[test]
     fn forty_presses_typed_into_a_stall_fit_the_ledger() {
         let ms = Duration::from_millis;
@@ -8894,9 +8390,8 @@ mod tests {
         }
     }
 
-    /// A batch sweep on the oldest press's clock is born no earlier than the
-    /// birth floor: one stamp window before the echo, so the echoing frame
-    /// and the next both show the run lit.
+    /// [`SWEEP_BIRTH_FLOOR_S`]: a batch swept on its oldest press's clock is
+    /// still lit on the echoing frame and the next.
     #[test]
     fn a_batch_sweep_on_the_oldest_press_clock_is_born_no_earlier_than_the_birth_floor() {
         let ms = Duration::from_millis;
@@ -8938,17 +8433,9 @@ mod tests {
 
     // ───────────── `pre_move` and the held Space ─────────────
 
-    /// A scroll carries the pre-move caret with the text it names.
-    /// [`Engine::pre_move`] holds the caret the frame's type-ahead keys replay
-    /// at, and `CursorGlow::note_scroll` can flush a park (recording the
-    /// pre-scroll mirror) before it translates, so the record must be
-    /// translated with the events ([`Engine::translate_pre_move`]). The shape:
-    /// a glyph typed before an arrow's hop lands, then the PTY's one-row
-    /// scroll before their frame. The seed lays no cell of its own, so the
-    /// `typing` cell asserted is the replayed key.
-    ///
-    /// A band move (`[0..=10] −1`, moving row 3 to row 2 as the scroll does)
-    /// carries it too; one fixture, a row per seam.
+    /// [`Engine::translate_pre_move`]: a glyph typed before an arrow's hop,
+    /// then a one-row scroll or band move (`[0..=10] −1`) before their frame;
+    /// the replayed key rides with its text to `(2, 4)`.
     #[test]
     fn a_scroll_or_a_band_move_carries_the_pre_move_caret_with_the_text_it_names() {
         /// The seam, and the move it makes before the buffered frame.
@@ -8990,10 +8477,9 @@ mod tests {
         }
     }
 
-    /// A pre-move caret carried off the top is forgotten, not clamped (the
-    /// mark law): the key is held with no cell until its echo pays for it,
-    /// and the record keeps its index so the key does not fall through to the
-    /// post-move caret. Four rows, so the mirror's row 3 is off the top.
+    /// A pre-move caret scrolled off the top is forgotten, not clamped: the key
+    /// is held with no cell rather than replayed at row 0 or the post-move
+    /// caret.
     #[test]
     fn a_pre_move_caret_carried_off_the_top_is_forgotten_not_clamped() {
         let ms = Duration::from_millis;
@@ -9015,7 +8501,7 @@ mod tests {
         );
     }
 
-    /// The cells the hand's own keys laid, for the three assertions above.
+    /// The cells the hand's own keys laid.
     fn typing_cells(eng: &Engine) -> Vec<(u16, u16)> {
         eng.ribbon()
             .cells()
@@ -9025,11 +8511,9 @@ mod tests {
             .collect()
     }
 
-    /// The pre-move index survives a bridge's insert: a later typed move in
-    /// the same frame whose echo the ledger pays inserts its bridge `Sweep`
-    /// at index 0. The shape: a glyph typed before an arrow's hop lands, then
-    /// a second glyph whose one-cell echo the host did not sweep, in one
-    /// frame; the first glyph replays at the caret before the hop, `(3, 4)`.
+    /// The pre-move index survives a later bridge `Sweep` inserted at index 0
+    /// in the same frame: the glyph typed before the hop still replays at
+    /// `(3, 4)`.
     #[test]
     fn a_bridge_sweep_inserted_after_a_one_shot_move_does_not_shift_the_pre_move_caret() {
         let ms = Duration::from_millis;
@@ -9055,9 +8539,8 @@ mod tests {
         );
     }
 
-    /// A reset or a curtain forgets the pre-move caret with the events it
-    /// indexed, so a key typed in the new coordinate space is never replayed
-    /// at the old space's caret. One fixture, a row per seam.
+    /// A reset or a curtain forgets the pre-move caret, so a key in the new
+    /// space is never replayed at the old space's caret.
     #[test]
     fn a_reset_or_a_curtain_forgets_the_pre_move_caret_with_the_events_it_indexed() {
         let ms = Duration::from_millis;
@@ -9065,8 +8548,7 @@ mod tests {
         type Seam = (&'static str, fn(&mut Engine, Instant), u64);
         let seams: [Seam; 2] = [
             ("reset", |eng, _| eng.reset(), 200),
-            // Well past the curtain's own easing, so nothing it draws can
-            // answer for the assertion below.
+            // Well past the curtain's own easing.
             (
                 "curtain",
                 |eng, t0| eng.curtain(t0 + Duration::from_millis(120)),
@@ -9079,8 +8561,7 @@ mod tests {
             blank_row(&mut eng, 2);
             eng.on_event(mv((3, 0), (3, 5), Licence::Typed), t0);
             tick_at(&mut eng, t0);
-            // A key and a one-shot move buffered, then the seam before their
-            // frame.
+            // A key and a one-shot move buffered, then the seam.
             eng.on_event(typed(1), t0 + ms(100));
             eng.on_event(mv((3, 5), (3, 20), Licence::Nav), t0 + ms(110));
             forget(&mut eng, t0);
@@ -9100,11 +8581,9 @@ mod tests {
         }
     }
 
-    /// A key typed at a caret the engine never learned is held: before the
-    /// first licensed move since a reset the record carries no caret, and the
-    /// `Typed` before the one-shot move is held, never replayed at the unset
-    /// mirror or the post-move caret's neighbour. Its cell comes with its
-    /// echo, from the seam's sweep.
+    /// Before the first licensed move since a reset, a key typed before a
+    /// one-shot move is held (no unset-mirror or post-move cell) and lays with
+    /// its echo's sweep.
     #[test]
     fn a_key_typed_before_the_first_licensed_move_is_held_not_laid_at_an_unset_mirror() {
         let ms = Duration::from_millis;
@@ -9141,11 +8620,10 @@ mod tests {
         );
     }
 
-    /// A held Space remembers its own cell: a Space held a frame before its
-    /// echo stands on the mirror, not left of it, and the echo's sweep cannot
-    /// correct `last_space` (`swept_space_cell` reads only the frame's own
-    /// keys). The shape: `ab`, a Space echoed a frame late, `cd`, and the wrap
-    /// key that moves `cd` down; `cd` must be relaid as a two-cell word.
+    /// A Space held a frame before its echo stands on the mirror, not left of
+    /// it (`swept_space_cell` sees only the frame's own keys), so the word a
+    /// composer wrap moves is measured from the Space's own cell: `cd`, two
+    /// cells.
     #[test]
     fn a_held_space_measures_the_word_the_composer_moves_from_its_own_cell() {
         let ms = Duration::from_millis;
@@ -9186,8 +8664,8 @@ mod tests {
             t += ms(100);
             t = type_key_at(&mut eng, t, col);
         }
-        // The wrap key: `cd` moves down with the caret, which lands after
-        // `cde` at `(4, 5)`; the word is relaid from the Space's measure.
+        // The wrap key: `cd` moves down and the caret lands after `cde` at
+        // `(4, 5)`.
         let k = t + ms(100);
         eng.on_event(typed(1), k);
         eng.on_event(mv((3, 7), (4, 5), Licence::Typed), k + ms(8));
@@ -9202,12 +8680,10 @@ mod tests {
         );
     }
 
-    /// The pool is handed the ribbon's floor (the wiring half of
-    /// `meteor::spark_room`; the law itself is
-    /// `the_shower_stops_where_the_hand_stopped`). The hand types row 6 from
-    /// column 28 and presses `^A`: on the tick that carries the jump the pool
-    /// already holds `(6, 28)`, since the ribbon replays the frame's events
-    /// before the meteor classifies them.
+    /// The wiring half of `meteor::spark_room` (the law is
+    /// `the_shower_stops_where_the_hand_stopped`): on the tick that carries a
+    /// `^A` the pool already holds the hand's floor, since the ribbon replays
+    /// the frame before the meteor classifies it.
     #[test]
     fn the_meteor_pool_is_handed_the_hand_s_floor() {
         let t0 = Instant::now();
@@ -9255,22 +8731,12 @@ mod tests {
     }
 
     /// The new line's first key, pressed before its row change was seen,
-    /// starts the walk again through the engine's own replay
-    /// (`ribbon::Ribbon::fresh_line`). Thirty keys on row 3 from column 2,
-    /// then the key that starts a new line (a main-screen Return,
-    /// [`Event::Return`], or a composer's newline via the move-only fallback),
-    /// the next glyph pressed and held, the box's `Licence::Return` move
-    /// `(3, 32) → (4, 2)` observed after it, and the glyph's echo; then
-    /// eighteen more keys. Timings: the Return with the key at +40 ms and the
-    /// move at +60 ms; the newline with the key at +120 ms and the move at
-    /// +150 ms. Row 4 starts its walk on the colour row 3 reached (`d0 = 0`),
-    /// every cell `t_next + walk_t(col − 2)`, `1/16` a cell on the fast leg,
-    /// whatever the repaint latency.
-    ///
-    /// The newline here is a top-anchored box's, which changes row. A
-    /// bottom-anchored composer's same-row newline is pinned by `ribbon`'s
-    /// `a_new_line_after_a_same_row_composer_newline_continues_the_colour_on_the_fast_leg`
-    /// and `tests/composer_box_growth_wrap.rs`.
+    /// restarts the walk through the engine's replay (`ribbon::Ribbon::fresh_line`):
+    /// after a Return ([`Event::Return`]) or a top-anchored composer's newline,
+    /// row 4 continues row 3's colour with `d0 = 0`, every cell
+    /// `t_next + walk_t(col − 2)`, whatever the repaint latency; the controls
+    /// see the move before the key. A bottom-anchored composer's same-row
+    /// newline is pinned in `ribbon` and `tests/composer_box_growth_wrap.rs`.
     #[test]
     fn a_new_line_s_first_key_pressed_before_the_row_change_was_seen_starts_the_walk_again() {
         fn key_on(eng: &mut Engine, t: Instant, row: u16, col: u16) -> Instant {

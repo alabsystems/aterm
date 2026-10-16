@@ -27,6 +27,8 @@ aterm-toml = { workspace = true }
 aterm-census = { workspace = true }
 # Parses cargo's metadata JSON.
 aterm-json = { workspace = true }
+# Descriptor-safe children, delegated to verify's cancellation scope when embedded.
+aterm-uds = { workspace = true }
 
 [dev-dependencies]
 # Fixture workspaces removed on drop.

@@ -95,10 +95,9 @@ fn assert_cursor_companion_owner_transition(
     }
 }
 
-/// A copy reads the terminal the gesture was addressed to, not `frontmost_window` (which
-/// can move ahead of OS focus): the ⌘-C arm and `Action::Copy` both route through
-/// `copy_selection_in(wid)`. Asserts only the "nothing to copy" paths (test builds'
-/// `pbcopy` goes to a thread-local board), which is where the window scoping shows.
+/// A copy reads the terminal the gesture was addressed to (`copy_selection_in(wid)`, for both
+/// the ⌘-C arm and `Action::Copy`), not `frontmost_window`, which can move ahead of OS focus.
+/// Test builds' `pbcopy` goes to a thread-local board, so only "nothing to copy" is asserted.
 #[test]
 fn a_copy_resolves_the_routed_window_not_the_frontmost_one() {
     use aterm_core::selection::SelectionSide;
@@ -106,7 +105,6 @@ fn a_copy_resolves_the_routed_window_not_the_frontmost_one() {
     let mut app = App::headless_for_test();
     let wid_a = WindowId(0);
 
-    // Select in window A.
     let term_a = app.front_terminal(wid_a).expect("terminal A").term.clone();
     {
         let mut t = term_lock(&term_a);
@@ -118,7 +116,6 @@ fn a_copy_resolves_the_routed_window_not_the_frontmost_one() {
         assert!(t.selection_to_string().is_some_and(|s| !s.is_empty()));
     }
 
-    // A second window arrives and becomes frontmost — the divergence.
     let sid = app.next_session_id;
     let wid_b = app.insert_logical_window(stub_session(sid), 24, 80);
     assert_eq!(wid_b, WindowId(1));
@@ -128,18 +125,14 @@ fn a_copy_resolves_the_routed_window_not_the_frontmost_one() {
         "the new window is frontmost while A still holds the selection"
     );
 
-    // The frontmost-window form reads the wrong terminal and finds nothing.
     assert!(
         !app.copy_selection(),
         "the frontmost form resolves window B, which has no selection"
     );
-    // Window-scoped and honest about it: asked for B, it reports B.
     assert!(
         !app.copy_selection_in(wid_b),
         "copy_selection_in must resolve the window it was asked for"
     );
-    // …while A's selection is still right there, which is what a copy routed by
-    // the originating `wid` would have found.
     assert!(
         term_lock(&term_a)
             .selection_to_string()
@@ -182,7 +175,6 @@ fn on_resize_never_yields_a_degenerate_or_wedged_grid() {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
 
-    // A generous window: some real grid.
     app.on_resize(wid, PhysicalSize::new(1600, 1000));
     let (big_rows, big_cols) = {
         let Some(ws) = app.windows.get(&wid) else {
@@ -195,8 +187,7 @@ fn on_resize_never_yields_a_degenerate_or_wedged_grid() {
         "sane grid: {big_rows}x{big_cols}"
     );
 
-    // A spurious 1×1 "Resized" (the class of bad payload that caused the scrunch)
-    // must clamp to ≥1×1 — never a zero-dimension grid, never a panic.
+    // A spurious 1×1 `Resized`.
     app.on_resize(wid, PhysicalSize::new(1, 1));
     {
         let Some(ws) = app.windows.get(&wid) else {
@@ -210,7 +201,6 @@ fn on_resize_never_yields_a_degenerate_or_wedged_grid() {
         );
     }
 
-    // A subsequent normal size recovers a full grid — the small size never wedges.
     app.on_resize(wid, PhysicalSize::new(1600, 1000));
     {
         let Some(ws) = app.windows.get(&wid) else {
@@ -258,7 +248,7 @@ fn the_composed_band_is_sealed_on_the_row_that_meets_the_terminal() {
             .all(|c| c.underline == aterm_core::terminal::UnderlineStyle::None)
     };
 
-    // PADDED: two rows committed, one dismissed inside the shrink quiet.
+    // Padded: two rows committed, one dismissed inside the shrink quiet.
     let mut app = App::headless_for_test();
     app.post_message(Message::new(tags::SESSION, Severity::Info, "first"));
     let second = app.post_message(Message::new(tags::SESSION, Severity::Info, "second"));
@@ -271,8 +261,7 @@ fn the_composed_band_is_sealed_on_the_row_that_meets_the_terminal() {
     );
     compose_band_for_test(&mut app);
     let cells = &app.windows[&WindowId(0)].input_scratch.cells;
-    // The row above keeps only the stack's DIVIDER, never
-    // the seam's ink.
+    // The row above keeps only the stack's divider, never the seam's ink.
     let colors = crate::chrome_band::band_colors(aterm_render::Theme::default());
     let divider = crate::chrome_band::mix3(
         colors.bar_bg,
@@ -370,23 +359,20 @@ fn native_tab_install_and_close_are_atomic_without_a_pty_mirror() {
     assert!(app.structural_invariants_ok());
 }
 
-/// The oracle for the multi-window flip: from one headless window, create a
-/// 2nd (real `create`/`install` bookkeeping, stub session), confirm it lands as
-/// a strictly-greater frontmost window with its own pooled session and intact
-/// structural invariants; then close the NON-frontmost (survives, `Stay`,
-/// frontmost re-points to a live window) and finally the last (`Exit`, empty).
+/// A second window (real `create`/`install` bookkeeping, stub session) lands as a strictly
+/// greater frontmost id with its own pooled session and intact invariants; closing the
+/// non-frontmost one is `Stay` and re-points frontmost to a live window; closing the last
+/// is `Exit`.
 #[test]
 fn multi_window_lifecycle() {
     let mut app = App::headless_for_test();
-    // Start: exactly one window (WindowId(0)), one pooled session (id 0).
     assert_eq!(app.windows.len(), 1);
     assert_eq!(app.frontmost_window, Some(WindowId(0)));
     assert_eq!(app.pool.iter().count(), 1);
     assert!(app.structural_invariants_ok());
 
-    // --- Create a 2nd window. The stub session's id must match the App's next
-    // session id (insert_logical_window asserts this), mirroring how
-    // create_window_logical pairs the minted session id with the spawned tab.
+    // The stub session's id must be the App's next session id (`insert_logical_window`
+    // asserts it), as `create_window_logical` pairs them.
     let sid1 = app.next_session_id; // 1
     let wid1 = app.insert_logical_window(stub_session(sid1), 24, 80);
     assert_eq!(app.windows.len(), 2, "a 2nd window now exists");
@@ -399,7 +385,6 @@ fn multi_window_lifecycle() {
     assert_eq!(app.pool.iter().count(), 2, "the pool owns both sessions");
     assert!(app.structural_invariants_ok());
 
-    // A third window mints a strictly greater id; ids are monotonic, never reused.
     let sid2 = app.next_session_id; // 2
     let wid2 = app.insert_logical_window(stub_session(sid2), 24, 80);
     assert!(
@@ -410,9 +395,6 @@ fn multi_window_lifecycle() {
     assert_eq!(app.frontmost_window, Some(wid2));
     assert_eq!(app.pool.iter().count(), 3);
 
-    // --- Close the NON-frontmost window (WindowId(0)). It must survive the rest,
-    // the pool drops only its session, and frontmost is untouched (still wid2,
-    // which was not the one closed) — but it must always name a live window.
     let outcome = app.close_window_logical(WindowId(0));
     assert_eq!(
         outcome,
@@ -433,8 +415,6 @@ fn multi_window_lifecycle() {
     );
     assert!(app.structural_invariants_ok());
 
-    // --- Close the current frontmost (wid2): frontmost must RE-POINT to the one
-    // remaining live window (wid1), still Stay, invariants hold.
     let outcome = app.close_window_logical(wid2);
     assert_eq!(outcome, CloseOutcome::Stay, "a sibling remains → app stays");
     assert_eq!(app.windows.len(), 1);
@@ -449,7 +429,6 @@ fn multi_window_lifecycle() {
     );
     assert!(app.structural_invariants_ok());
 
-    // --- Close the last window: now the app must exit and no windows remain.
     let outcome = app.close_window_logical(wid1);
     assert_eq!(
         outcome,
@@ -460,15 +439,13 @@ fn multi_window_lifecycle() {
     assert_eq!(app.frontmost_window, None, "frontmost is None once empty");
     assert_eq!(app.pool.iter().count(), 0, "every session detached");
 
-    // Closing an already-gone / unknown WindowId is a fail-closed no-op (Stay),
-    // never a panic — the stale-event discipline the routing relies on.
+    // An unknown WindowId closes as a no-op `Stay`, never a panic: stale events are harmless.
     assert_eq!(app.close_window_logical(WindowId(999)), CloseOutcome::Stay);
 }
 
-/// An OS light↔dark switch with a `dark:…,light:…` split `theme` re-resolves
-/// aterm's own rendered theme: a simulated switch to Light flips `self.theme` to
-/// the light side and pins the engine factory bg; reverting restores the dark
-/// side; a redundant same-appearance call is a guarded no-op.
+/// An OS light↔dark switch re-resolves a `dark:…,light:…` split `theme`: Light moves
+/// `self.theme` and the engine factory bg to the light side, Dark restores the dark side,
+/// and a repeated appearance is a no-op.
 #[test]
 fn os_appearance_switch_retthemes_split_theme() {
     let mut app = App::headless_for_test();
@@ -479,7 +456,6 @@ fn os_appearance_switch_retthemes_split_theme() {
     app.theme = app.config.theme_for(aterm_types::Appearance::Dark);
     let dark_bg = app.theme.bg;
 
-    // OS toggles to Light → aterm switches to the light side (GitHub Light = white).
     app.sync_app_theme_to_appearance(aterm_types::Appearance::Light);
     assert_eq!(app.os_appearance, aterm_types::Appearance::Light);
     assert_eq!(
@@ -497,12 +473,10 @@ fn os_appearance_switch_retthemes_split_theme() {
         aterm_types::Rgb::new(0xff, 0xff, 0xff)
     );
 
-    // OS toggles back to Dark → the dark side is restored exactly.
     app.sync_app_theme_to_appearance(aterm_types::Appearance::Dark);
     assert_eq!(app.os_appearance, aterm_types::Appearance::Dark);
     assert_eq!(app.theme.bg, dark_bg);
 
-    // A redundant same-appearance event is a no-op (the early-return guard).
     app.sync_app_theme_to_appearance(aterm_types::Appearance::Dark);
     assert_eq!(app.theme.bg, dark_bg);
 }
@@ -524,19 +498,15 @@ fn os_appearance_switch_noop_for_plain_theme() {
     );
 }
 
-/// "Move Tab to New Window" (Step 10a): detaching the front window's active tab
-/// MOVES the view out into a brand-new window — the source loses the tab (active
-/// clamped), a fresh frontmost window holds exactly that tab, and the pool's
-/// session count is unchanged (the view moved, not duplicated or dropped). A
-/// single-tab source is a no-op.
+/// "Move Tab to New Window" moves the front window's active tab into a new frontmost
+/// window: the source loses it (active clamped), the pool's session count is unchanged,
+/// and a single-tab source is a no-op.
 #[test]
 fn detach_active_tab_moves_view_to_new_window() {
     let mut app = App::headless_for_test();
-    // Stage a 2-tab front window: window 0 starts with tab (session 0); push a
-    // 2nd tab (session 1) and switch to it (now the active tab).
+    // Window 0 gets a second tab (session 1), which becomes active.
     let sid1 = app.next_session_id; // 1
     app.push_stub_tab(WindowId(0), stub_session(sid1));
-    // Front window now has 2 tabs [0, 1], active = index 1 (session 1).
     assert_eq!(app.windows.len(), 1);
     let pool_before = app.pool.iter().count();
     assert_eq!(pool_before, 2, "two pooled sessions before the detach");
@@ -562,13 +532,11 @@ fn detach_active_tab_moves_view_to_new_window() {
     }
     assert!(app.structural_invariants_ok());
 
-    // --- Detach the active tab (session 1) of the front window. The LOGICAL
-    // half is headless-testable (no OS window attach); it returns the new id.
+    // The logical half of the detach (no OS window attach) returns the new id.
     let wid_b = app
         .detach_active_tab_logical()
         .expect("a 2-tab source detaches its active tab");
 
-    // The new window is frontmost and is strictly-greater than the source.
     assert!(wid_b > WindowId(0), "minted a strictly-increasing WindowId");
     assert_eq!(
         app.frontmost_window,
@@ -577,7 +545,6 @@ fn detach_active_tab_moves_view_to_new_window() {
     );
     assert_eq!(app.windows.len(), 2, "windows grew by one");
 
-    // The source window lost the moved tab: len-1, active clamped into range.
     {
         let Some(ws0) = app.windows.get(&WindowId(0)) else {
             panic!("source survives")
@@ -596,7 +563,6 @@ fn detach_active_tab_moves_view_to_new_window() {
         );
     }
 
-    // The new window holds exactly the moved tab, and displays it.
     {
         let Some(ws_b) = app.windows.get(&wid_b) else {
             panic!("the new window exists")
@@ -626,8 +592,6 @@ fn detach_active_tab_moves_view_to_new_window() {
         "moving a view never retires its identity"
     );
 
-    // The view MOVED: the pool session count is unchanged (not duplicated, not
-    // dropped) — the moved session keeps its single view.
     assert_eq!(
         app.pool.iter().count(),
         pool_before,
@@ -639,8 +603,6 @@ fn detach_active_tab_moves_view_to_new_window() {
     );
     assert!(app.structural_invariants_ok());
 
-    // --- Detaching when the (now front) window has a single tab is a no-op:
-    // window B holds only `sid1`, so detach is refused and nothing changes.
     let windows_before = app.windows.len();
     let front_before = app.frontmost_window;
     assert_eq!(
@@ -671,7 +633,7 @@ fn detach_active_tab_moves_view_to_new_window() {
 /// source is closed without double-detaching the view. Fewer than two windows is a no-op.
 #[test]
 fn migrate_active_tab_moves_view_to_next_window() {
-    // --- No-op with one window: nothing to move it to. ------------------------
+    // One window: nothing to move the tab to.
     {
         let mut app = App::headless_for_test();
         assert_eq!(app.windows.len(), 1);
@@ -691,19 +653,15 @@ fn migrate_active_tab_moves_view_to_next_window() {
         assert!(app.structural_invariants_ok());
     }
 
-    // --- Case 1: the source survives (front window has two tabs). ------------
+    // Case 1: a two-tab source survives.
     {
         let mut app = App::headless_for_test();
-        // A 2nd existing window (WindowId(1), session 1). `insert_logical_window`
-        // makes it frontmost; we re-focus WindowId(0) below.
         let sid1 = app.next_session_id; // 1
         let wid_b = app.insert_logical_window(stub_session(sid1), 24, 80);
         assert_eq!(wid_b, WindowId(1));
-        // Stage WindowId(0) with two tabs [0, sid2], its active = the appended one.
         let sid2 = app.next_session_id; // 2
         app.push_stub_tab(WindowId(0), stub_session(sid2));
-        // Re-focus the (lower-id) front window so it is the migration source; the
-        // next window after it in id order is WindowId(1).
+        // Window 0 is the source; the next window after it in id order is WindowId(1).
         app.frontmost_window = Some(WindowId(0));
         app.sync_active_session();
         assert_eq!(app.windows.len(), 2);
@@ -725,10 +683,8 @@ fn migrate_active_tab_moves_view_to_next_window() {
         }
         assert!(app.structural_invariants_ok());
 
-        // Move WindowId(0)'s active tab (sid2) into the next window (WindowId(1)).
         let _ = app.migrate_active_tab_to_next_window();
 
-        // The move did not change the window count; the destination is frontmost.
         assert_eq!(
             app.windows.len(),
             2,
@@ -740,7 +696,6 @@ fn migrate_active_tab_moves_view_to_next_window() {
             "focus follows the moved tab to B"
         );
 
-        // The source lost the moved tab; active clamped onto its surviving tab.
         {
             let Some(ws0) = app.windows.get(&WindowId(0)) else {
                 panic!("source survives")
@@ -758,7 +713,6 @@ fn migrate_active_tab_moves_view_to_next_window() {
                 "source re-mirrored onto its surviving tab"
             );
         }
-        // The destination GAINED the moved tab as its active (last) tab.
         {
             let Some(ws_b) = app.windows.get(&wid_b) else {
                 panic!("destination exists")
@@ -776,8 +730,6 @@ fn migrate_active_tab_moves_view_to_next_window() {
                 "B displays the moved tab"
             );
         }
-        // Pure view-move: the pool's session count is unchanged (not dropped or
-        // duplicated); the moved session is still pooled.
         assert_eq!(
             app.pool.iter().count(),
             pool_before,
@@ -790,25 +742,21 @@ fn migrate_active_tab_moves_view_to_next_window() {
         assert!(app.structural_invariants_ok());
     }
 
-    // --- Case 2: the source empties and closes (front window has one tab). ---
+    // Case 2: a single-tab source empties and closes.
     {
         let mut app = App::headless_for_test();
-        // A 2nd existing window; WindowId(0) keeps its single tab (session 0).
         let sid1 = app.next_session_id; // 1
         let wid_b = app.insert_logical_window(stub_session(sid1), 24, 80);
         assert_eq!(wid_b, WindowId(1));
-        // Re-focus the single-tab front window as the migration source.
+        // The single-tab window 0 is the source.
         app.frontmost_window = Some(WindowId(0));
         app.sync_active_session();
         assert_eq!(app.windows.len(), 2);
         let pool_before = app.pool.iter().count();
         assert_eq!(pool_before, 2, "two pooled sessions before the migrate");
 
-        // Move WindowId(0)'s only tab (session 0) into the next window. Window 0
-        // becomes empty and is CLOSED.
         let _ = app.migrate_active_tab_to_next_window();
 
-        // The emptied source window was closed: only the destination remains.
         assert_eq!(app.windows.len(), 1, "the emptied source window is closed");
         assert!(
             !app.windows.contains_key(&WindowId(0)),
@@ -819,7 +767,6 @@ fn migrate_active_tab_moves_view_to_next_window() {
             Some(wid_b),
             "the destination is frontmost"
         );
-        // The destination holds both its own tab and the moved one (moved last/active).
         {
             let Some(ws_b) = app.windows.get(&wid_b) else {
                 panic!("destination exists")
@@ -837,8 +784,6 @@ fn migrate_active_tab_moves_view_to_next_window() {
                 "B displays the moved tab"
             );
         }
-        // Pure view-move with NO double-detach when the source is closed: the pool's
-        // session count is unchanged and the moved session is still pooled.
         assert_eq!(
             app.pool.iter().count(),
             pool_before,
@@ -852,42 +797,35 @@ fn migrate_active_tab_moves_view_to_next_window() {
     }
 }
 
-/// "Open Active Session in New Window" adds a view: both windows show the same pooled
-/// session (views 1→2) and `windows_displaying` yields both. Closing one viewer keeps
-/// the session; closing the last drops it and exits the app. `window_of_session`
-/// prefers the front window, else the lowest id (the `ls` roster rule).
+/// `window_of_session` prefers the front window, else the lowest id (the `ls` roster rule).
 #[test]
 fn window_of_session_prefers_the_front_window_then_the_lowest_id() {
     let mut app = App::headless_for_test();
-    // Only window 0 holds session 0.
     assert_eq!(app.window_of_session(0), Some(WindowId(0)));
 
-    // Share it into a new window, which becomes frontmost.
     let front = app
         .open_active_session_in_new_window_logical()
         .expect("the front window has an active session to share");
     assert!(front > WindowId(0), "a strictly-greater new window");
     assert_eq!(app.frontmost_window, Some(front));
 
-    // The session now lives in both windows; the front one wins — not the
-    // lower id, window 0 (the roster's rule, so `@<sid> spawn` and `ls`
-    // agree).
+    // The roster's rule, so `@<sid> spawn` and `ls` agree.
     assert_eq!(
         app.window_of_session(0),
         Some(front),
         "the front window containing the session wins over the lower id"
     );
 
-    // With no front window that holds it, fall back to the lowest id that
-    // does — window 0.
+    // With no front window holding it, the lowest id that does.
     app.frontmost_window = None;
     assert_eq!(app.window_of_session(0), Some(WindowId(0)));
 }
 
+/// "Open Active Session in New Window" adds a view: both windows show one pooled session
+/// (views 1→2); closing one viewer keeps it, and closing the last drops it and exits.
 #[test]
 fn open_active_session_in_new_window_shares_one_session_across_two_windows() {
     let mut app = App::headless_for_test();
-    // Start: exactly one window (WindowId(0)) showing session 0, one view.
     assert_eq!(app.windows.len(), 1);
     assert_eq!(app.frontmost_window, Some(WindowId(0)));
     assert_eq!(app.pool.iter().count(), 1, "one pooled session at start");
@@ -908,13 +846,10 @@ fn open_active_session_in_new_window_shares_one_session_across_two_windows() {
     }
     assert!(app.structural_invariants_ok());
 
-    // --- Open the active session in a new window (the logical half is
-    // headless-testable: no OS attach). It returns the new window's id.
     let new_wid = app
         .open_active_session_in_new_window_logical()
         .expect("the front window has an active session to open in a new window");
 
-    // A new window exists, strictly-greater, and is now frontmost.
     assert!(
         new_wid > WindowId(0),
         "minted a strictly-increasing WindowId"
@@ -926,7 +861,6 @@ fn open_active_session_in_new_window_shares_one_session_across_two_windows() {
     );
     assert_eq!(app.windows.len(), 2, "windows grew by one");
 
-    // Both windows display the same session 0 (the same live grid in two windows).
     {
         let Some(ws0) = app.windows.get(&WindowId(0)) else {
             panic!("source survives")
@@ -953,8 +887,6 @@ fn open_active_session_in_new_window_shares_one_session_across_two_windows() {
         );
     }
 
-    // The pool still has exactly one session (id 0) — not duplicated — but its
-    // view-count went 1→2 (a second window now displays it).
     assert_eq!(
         app.pool.iter().count(),
         1,
@@ -963,8 +895,7 @@ fn open_active_session_in_new_window_shares_one_session_across_two_windows() {
     assert!(app.pool.get(0).is_some(), "session 0 is still pooled");
     assert_eq!(app.pool.views(0), Some(2), "two windows now view session 0");
 
-    // The output fan-out now yields both viewing windows: a shared session's
-    // output repaints every window that can see it.
+    // A shared session's output repaints every window that shows it.
     {
         let mut displaying: Vec<WindowId> = app.windows_displaying(0).collect();
         displaying.sort();
@@ -974,8 +905,7 @@ fn open_active_session_in_new_window_shares_one_session_across_two_windows() {
     }
     assert!(app.structural_invariants_ok());
 
-    // --- Close one viewer (the new window). Its single tab detaches one view, so
-    // the session survives (views 2→1) and the original window still shows it.
+    // Closing one viewer releases one view: the session and its PTY survive.
     assert_eq!(
         app.close_window_logical(new_wid),
         CloseOutcome::Stay,
@@ -1001,7 +931,6 @@ fn open_active_session_in_new_window_shares_one_session_across_two_windows() {
             "the original window still shows session 0"
         );
     }
-    // Now only the original window displays session 0.
     assert_eq!(
         app.windows_displaying(0).collect::<Vec<_>>(),
         vec![WindowId(0)],
@@ -1009,9 +938,7 @@ fn open_active_session_in_new_window_shares_one_session_across_two_windows() {
     );
     assert!(app.structural_invariants_ok());
 
-    // --- Close the last viewer (the original window). The last view leaves
-    // (views→0), the session is dropped (its PTY would close), and — being the
-    // last window — the app exits.
+    // Closing the last viewer drops the session and, as the last window, exits the app.
     assert_eq!(
         app.close_window_logical(WindowId(0)),
         CloseOutcome::Exit,
@@ -1027,10 +954,9 @@ fn open_active_session_in_new_window_shares_one_session_across_two_windows() {
     assert_eq!(app.pool.iter().count(), 0, "the pool is empty");
 }
 
-/// `sync_window`'s shared re-fit gate: a NEVER-shared pool keeps the gate closed
-/// (no O(tabs × panes) `resize_panes` walk per tab switch / pane focus), a share
-/// latches it open via the creation-path sync, and the share ENDING does not
-/// unlatch it — the survivor's next sync must still grow its grid back from the
+/// `sync_window`'s shared re-fit gate stays closed for a never-shared pool (no
+/// O(tabs × panes) `resize_panes` walk per tab switch), latches open when a share is
+/// created, and stays latched after the share ends so the survivor grows back from the
 /// foreground-min.
 #[test]
 fn sync_window_refit_gate_latches_once_a_share_exists() {
@@ -1077,7 +1003,7 @@ fn copy_on_select_fires_only_on_completed_drag_when_enabled() {
         ws.sel_dragged = true;
     }
 
-    // Off (explicit opt-out): a completed drag does not auto-copy.
+    // Off.
     let mut app = App::headless_for_test();
     app.copy_on_select = false;
     arm_drag(&mut app);
@@ -1086,7 +1012,7 @@ fn copy_on_select_fires_only_on_completed_drag_when_enabled() {
         "copy-on-select must NOT fire when the toggle is off"
     );
 
-    // ON: a completed drag auto-copies, and the highlight survives the copy.
+    // On.
     let mut app = App::headless_for_test();
     app.copy_on_select = true;
     arm_drag(&mut app);
@@ -1107,7 +1033,7 @@ fn copy_on_select_fires_only_on_completed_drag_when_enabled() {
         );
     }
 
-    // On, but a plain click: the selection clears and nothing is copied.
+    // On, a plain click.
     let mut app = App::headless_for_test();
     app.copy_on_select = true;
     {
@@ -1182,9 +1108,6 @@ fn shared_session_exit_closes_every_viewer_not_just_the_first() {
         app.close_window_logical(*wid);
     }
 
-    // No viewer is left pinned to the dead session: every view released (refcount
-    // drained to 0, so the pool dropped + the registry deregistered it), and no
-    // window still shows it.
     assert_eq!(
         app.pool.views(0),
         None,
@@ -1205,13 +1128,12 @@ fn shared_session_exit_closes_every_viewer_not_just_the_first() {
     );
 }
 
-/// Closing the frontmost window re-points to the most-recently-FOCUSED survivor
-/// (the window the OS raises), not blindly the lowest WindowId — but with NO
-/// focus history (headless) it falls back to the lowest live id, the
-/// deterministic choice automation relies on. Both halves in one test.
+/// Closing the frontmost window re-points to the most recently focused survivor (the one
+/// the OS raises); with no focus history (headless) it falls back to the lowest live id,
+/// the deterministic choice automation relies on.
 #[test]
 fn close_front_repoints_to_mru_survivor_else_lowest_id() {
-    // --- No focus history (headless): deterministic lowest-id fallback. ---
+    // No focus history (headless): the lowest live id.
     let mut app = App::headless_for_test();
     let s1 = app.next_session_id;
     let _w1 = app.insert_logical_window(stub_session(s1), 24, 80);
@@ -1226,7 +1148,6 @@ fn close_front_repoints_to_mru_survivor_else_lowest_id() {
         app.focus_order.is_empty(),
         "no OS focus events fired in headless"
     );
-    // Close the front (w2). With no focus history, the survivor is the LOWEST id.
     assert_eq!(app.close_window_logical(w2), CloseOutcome::Stay);
     assert_eq!(
         app.frontmost_window,
@@ -1234,7 +1155,7 @@ fn close_front_repoints_to_mru_survivor_else_lowest_id() {
         "no focus history → lowest live id survivor (deterministic)",
     );
 
-    // --- With focus history: re-point follows the MRU survivor. ---
+    // With focus history: the most recently focused survivor.
     let mut app = App::headless_for_test();
     let s1 = app.next_session_id;
     let w1 = app.insert_logical_window(stub_session(s1), 24, 80);
@@ -1245,8 +1166,6 @@ fn close_front_repoints_to_mru_survivor_else_lowest_id() {
     app.note_window_focused(w1);
     app.note_window_focused(w2);
     assert_eq!(app.frontmost_window, Some(w2));
-    // Close the front (w2). The most-recently-focused SURVIVOR is w1 (focused
-    // after window 0), so frontmost re-points to w1 — not the lowest id (0).
     assert_eq!(app.close_window_logical(w2), CloseOutcome::Stay);
     assert_eq!(
         app.frontmost_window,
@@ -1260,8 +1179,8 @@ fn close_front_repoints_to_mru_survivor_else_lowest_id() {
     assert!(app.structural_invariants_ok());
 }
 
-/// A pane-space mutation retires departed panes only: zoom removes no pane, so each
-/// pane keeps its episodes; width changes arm their own resize settle.
+/// A pane-space mutation retires departed panes only: zoom removes no pane, so each pane keeps
+/// its episodes.
 #[test]
 fn pane_space_change_retires_only_departed_panes() {
     let mut app = App::headless_for_test();
@@ -1306,9 +1225,8 @@ fn pane_space_change_retires_only_departed_panes() {
         !app.windows[&wid].fx.decos().needs_rescan(epoch),
         "a zoom toggle must not wipe a pane that is still in the layout"
     );
-    // CLOSING a pane retires it. `sid` is the pane the loop left BOUND, so
-    // its departure is observable right here: the engine drops the live
-    // binding and falls back to needing a fresh scan.
+    // Closing a pane retires it: `sid` is the pane the loop left bound, so the engine
+    // drops that binding and needs a fresh scan.
     app.toggle_pane_zoom(); // unzoom, so the close path runs on the real split
     app.close_session(wid, sid);
     assert!(
@@ -1317,10 +1235,8 @@ fn pane_space_change_retires_only_departed_panes() {
     );
 }
 
-/// A split that cannot fit is refused before anything is spawned: `next_session_id`,
-/// pool, registry and tree are untouched. Control: at 24x80 the same call passes the
-/// size gate (and stops at the harness's missing event loop), so the gate refuses on
-/// size alone.
+/// A split that cannot fit is refused before anything is spawned: `next_session_id`, pool,
+/// registry and tree are untouched.
 #[test]
 fn a_split_that_cannot_fit_is_refused_before_any_shell_is_spawned() {
     use crate::pane;
@@ -1360,7 +1276,6 @@ fn a_split_that_cannot_fit_is_refused_before_any_shell_is_spawned() {
         "and the size it needed: {refusal}"
     );
 
-    // Nothing was created (no leaked shell).
     assert_eq!(
         app.pool.iter().count(),
         sessions_before,
@@ -1385,9 +1300,7 @@ fn a_split_that_cannot_fit_is_refused_before_any_shell_is_spawned() {
         "the tree is untouched — no invisible pane"
     );
 
-    // And the person is TOLD, the way every impossible gesture here answers:
-    // a short band row titled in a few words, the whole reason behind Details
-    // (R14).
+    // The refusal posts a band row: a short title, the whole reason behind Details.
     let row = app
         .messages
         .live_rows()
@@ -1443,8 +1356,8 @@ fn a_zoomed_pane_is_measured_unzoomed_so_zoom_cannot_smuggle_a_split_through() {
         Some(1),
         "zoom really is showing one full-window pane"
     );
-    // …and 40 columns WOULD clear the 33-column bar, so a gate reading the
-    // zoomed geometry lets this split through. It must not.
+    // …and 40 columns would clear the 33-column bar, so a gate reading the zoomed
+    // geometry would let this split through.
     assert!(
         pane::split_fits_in(pane::SplitDir::Vertical, 24, 40),
         "the zoomed rect is big enough — this is the temptation"
@@ -1581,7 +1494,6 @@ fn close_window_with_split_tab_detaches_every_pane() {
     );
     assert!(app.pool.get(0).is_some() && app.pool.get(split_sid).is_some());
 
-    // Close window 0: both of its split panes' sessions detach (pool drops by 2).
     assert_eq!(app.close_window_logical(WindowId(0)), CloseOutcome::Stay);
     assert!(
         app.pool.get(0).is_none(),
@@ -1609,7 +1521,6 @@ fn divider_drag_resizes_split_headless() {
     let new_sid = app.split_active_stub_tab(WindowId(0)); // 1 | 2 vertical, divider @ col 40
     let wid = WindowId(0);
 
-    // The fresh split is 50/50: left pane is 40 cols wide.
     let left_before = app
         .active_tree(wid)
         .unwrap()
@@ -1620,7 +1531,6 @@ fn divider_drag_resizes_split_headless() {
         .cols;
     assert_eq!(left_before, 40, "fresh split is 50/50");
 
-    // A press off the divider (inside a pane) does not arm a drag.
     if let Some(ws) = app.windows.get_mut(&wid) {
         ws.last_mouse_window_cell = (5, 10);
     }
@@ -1630,7 +1540,6 @@ fn divider_drag_resizes_split_headless() {
     );
     assert!(app.windows[&wid].divider_drag.is_none());
 
-    // A press ON the divider column (40) arms the drag.
     if let Some(ws) = app.windows.get_mut(&wid) {
         ws.last_mouse_window_cell = (5, 40);
     }
@@ -1640,7 +1549,6 @@ fn divider_drag_resizes_split_headless() {
     );
     assert!(app.windows[&wid].divider_drag.is_some());
 
-    // Drag LEFT to column 20: the left pane shrinks toward ~20 cols.
     if let Some(ws) = app.windows.get_mut(&wid) {
         ws.last_mouse_window_cell = (5, 20);
     }
@@ -1655,7 +1563,6 @@ fn divider_drag_resizes_split_headless() {
         .cols;
     assert_eq!(left_mid, 20, "drag to col 20 moved the boundary to 20 cols");
 
-    // The dragged pane's engine was relaid out to its new sub-rect.
     {
         let t = super::term_lock(&app.pool.get(0).unwrap().term);
         assert_eq!(
@@ -1674,7 +1581,6 @@ fn divider_drag_resizes_split_headless() {
         assert!(r.cols >= 1, "clamp keeps every pane non-empty: {r:?}");
     }
 
-    // Release ends the drag; a second release is a no-op.
     assert!(app.finish_divider_drag(wid), "release ends the active drag");
     assert!(app.windows[&wid].divider_drag.is_none());
     assert!(
@@ -1685,16 +1591,15 @@ fn divider_drag_resizes_split_headless() {
     assert!(app.structural_invariants_ok());
 }
 
-/// Every committed resize is a coordinate-space reset. Even a hand-authored
-/// drag cannot truthfully connect old cell geometry to the reflowed grid, so
-/// mid-drag, settled-drag, and out-of-band commits all remain dark.
+/// Every committed resize resets coordinate space: no gesture can connect old cell geometry to
+/// the reflowed grid, so mid-drag, settled and out-of-band commits all stay dark.
 #[test]
 fn every_resize_commit_retires_reflow_provenance_regardless_of_gesture_age() {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
 
-    // MID-DRAG: an interactive `Resized` landed just now, so the settle that
-    // follows it immediately is a continuation, not the end of the gesture.
+    // Mid-drag: an interactive `Resized` just landed, so the settle after it is a
+    // continuation, not the end of the gesture.
     app.windows.get_mut(&wid).unwrap().last_resized_event_at = Some(Instant::now());
     assert!(
         app.apply_term_resize(wid, 30, 100),
@@ -1724,8 +1629,8 @@ fn every_resize_commit_retires_reflow_provenance_regardless_of_gesture_age() {
     assert!(!app.windows[&wid].fx.cursor().glow.is_active());
     assert!(!app.windows[&wid].fx.cursor().trail.is_active());
 
-    // OUT-OF-BAND (control-socket `resize`, font zoom, scale change) is the
-    // same hard reset even without an interactive stamp.
+    // Out-of-band (control-socket `resize`, font zoom, scale change): the same hard reset
+    // without an interactive stamp.
     let mut fresh = App::headless_for_test();
     assert!(fresh.windows[&wid].last_resized_event_at.is_none());
     let term = fresh.pool.get(0).unwrap().term.clone();
@@ -1743,11 +1648,9 @@ fn every_resize_commit_retires_reflow_provenance_regardless_of_gesture_age() {
     assert!(!fresh.windows[&wid].fx.cursor().trail.is_active());
 }
 
-/// A committed resize changes the coordinate meaning of every retained
-/// endpoint, even when reflow leaves the focused cursor at the same numeric
-/// cell. Both engines retire before the new layout can seed; an authored
-/// moving landing may arm a one-shot, but an unseeded first tick consumes it
-/// dark rather than borrowing geometry from the old layout.
+/// A committed resize changes what every retained endpoint means, even when the cursor keeps
+/// its numeric cell: both engines retire before the new layout seeds, and a moving landing's
+/// one-shot is consumed dark by the unseeded first tick.
 #[test]
 fn committed_resize_retires_geometry_and_cannot_leak_its_reflow_licence() {
     use std::time::Duration;
@@ -1902,10 +1805,9 @@ fn committed_resize_retires_geometry_and_cannot_leak_its_reflow_licence() {
         "an unseeded reflow landing cannot bridge old and new layouts"
     );
 
-    // Tier 1: the shipping same-cell completion projects onto the licence
-    // model's swallow disposition — an armed class whose owned landing is
-    // proven not to occur is cleared at the boundary, exactly like a key
-    // this window swallowed. Retaining the stamp is the negative control.
+    // Tier 1: the same-cell completion projects onto the licence model's swallow
+    // disposition (an armed class whose landing provably never occurs clears at the
+    // boundary, as for a swallowed key). Retaining the stamp is the negative control.
     let model = aterm_spec::derive::cursor_hint_license_model();
     let mut armed = model.init_state();
     armed.insert("hint", 1);
@@ -1937,11 +1839,10 @@ fn committed_resize_retires_geometry_and_cannot_leak_its_reflow_licence() {
     assert!(!ok, "same-cell resize may not retain a reflow licence");
 }
 
-/// An all-tabs width settle across a multi-tab, multi-pane window gives every pane its
-/// off-screen history back, whatever the worker order or concurrency. A job dropped
-/// without `finish_resize_offload` / `abort_resize_offload` would leave
-/// `scrollback_detached_for_reflow` latched and history invisible. Quiescence is polled
-/// per session, since other tests submit reflow jobs concurrently.
+/// An all-tabs width settle over a multi-tab, multi-pane window gives every pane its
+/// off-screen history back, whatever the worker order or concurrency: a job dropped without
+/// `finish_resize_offload`/`abort_resize_offload` leaves the history detached. Quiescence is
+/// polled per session, since other tests submit reflow jobs concurrently.
 #[test]
 fn an_all_tabs_width_settle_returns_every_panes_history() {
     fn history(app: &App, id: u64) -> usize {
@@ -2005,7 +1906,7 @@ fn an_all_tabs_width_settle_returns_every_panes_history() {
         "every pane must own real off-screen history before the settle"
     );
 
-    // The SETTLE: one eager AllTabs WIDTH change over all six panes.
+    // The settle: one eager all-tabs width change over every pane.
     if let Some(ws) = app.windows.get_mut(&wid) {
         ws.cols = 72;
     }
@@ -2034,20 +1935,17 @@ fn an_all_tabs_width_settle_returns_every_panes_history() {
     assert!(app.structural_invariants_ok());
 }
 
-/// Hoisting the `active_only` filter above the layout keeps the same panes reached:
-/// shared (`views > 1`) sessions stay eager on every tab (`any_leaf(views > 1)`). The
-/// active tab reflows, a plain background tab defers, and a shared session in a
-/// background tab is still sized to its foreground viewers' minimum.
+/// A live-drag (`active_only`) pass reflows the active tab and defers a plain background tab,
+/// but still sizes a shared (`views > 1`) session in a background tab to its foreground
+/// viewers' minimum.
 #[test]
 fn a_scoped_resize_still_reaches_a_shared_background_tab() {
     let mut app = App::headless_for_test(); // window 0 = 24x80, tab 0 = session 0
     let wid = WindowId(0);
     app.push_stub_tab(wid, stub_session(1)); // tab 1 = session 1 (plain)
     app.push_stub_tab(wid, stub_session(2)); // tab 2 = session 2
-    // Share TAB 0's session into a second window (views 1 -> 2) and give
-    // that window a DISTINCT grid, so the shared min-geometry is a real
-    // observable target rather than "unchanged" (which a deferred tab and a
-    // reached one would look identical under).
+    // Share tab 0's session into a second window with a distinct grid, so the shared
+    // minimum is an observable target rather than "unchanged".
     app.switch_tab_in(wid, 0);
     let other = app
         .open_active_session_in_new_window_logical()
@@ -2101,8 +1999,7 @@ fn an_early_out_discards_stamps_that_predate_its_compose_and_keeps_later_ones() 
     let wid = WindowId(0);
     app.push_stub_tab(wid, stub_session(1));
     app.switch_tab_in(wid, 0); // session 0 is what this glass shows
-    // Age the epoch so a stamp 10 ms in the past is non-zero (a zero stamp
-    // reads as UNARMED — see the sibling test).
+    // Age the epoch so a stamp 10 ms back is non-zero (zero reads as unarmed).
     while (app.lat_epoch.elapsed().as_nanos() as u64) <= 20_000_000 {
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
@@ -2214,8 +2111,7 @@ fn a_revealed_panes_stale_output_stamp_is_discarded_not_booked() {
         "a stamp that aged through an unwatched interval must be discarded \
          at the reveal, not booked as a second of render latency"
     );
-    // ...and the pane keeps working: a burst arriving while it IS on the
-    // glass is booked normally.
+    // ...and the pane keeps working: a burst while it is on the glass books normally.
     arm(&app, 1, 3_000_000);
     let dt = app.present_latency_ns(wid);
     assert!(
@@ -2234,9 +2130,7 @@ fn an_occlusion_reveal_discards_the_stale_output_stamp_not_books_it() {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     let arm = |app: &App, age_ns: u64| {
-        // The epoch must be older than the simulated age, or `now - age`
-        // saturates to the walk's "unarmed" zero sentinel (see the MPT-3
-        // test above).
+        // As in the sibling test above: the epoch must be older than the simulated age.
         while (app.lat_epoch.elapsed().as_nanos() as u64) <= age_ns {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
@@ -2250,9 +2144,8 @@ fn an_occlusion_reveal_discards_the_stale_output_stamp_not_books_it() {
     // Establish the visible set with one present-time walk.
     assert_eq!(app.present_latency_ns(wid), 0, "nothing armed yet");
 
-    // Occluded but not yet revealed: a present that does happen while
-    // hidden still books (the content did reach a surface) — the fix is
-    // scoped to the reveal edge, not to every occluded frame.
+    // Occluded, not yet revealed: a present while hidden still books (the content
+    // reached a surface); only the reveal edge discards.
     app.on_occlusion_changed(wid, true);
     arm(&app, 2_000_000);
     let dt = app.present_latency_ns(wid);
@@ -2261,9 +2154,8 @@ fn an_occlusion_reveal_discards_the_stale_output_stamp_not_books_it() {
         "an occlusion edge alone must not delete a real sample (got {dt} ns)"
     );
 
-    // The ARTIFACT: output arrives, the window stays hidden ~1 s with no
-    // present, then is revealed. Same pane, same tab — the MPT-3 membership
-    // compare alone sees no reveal.
+    // Output arrives, the window stays hidden ~1 s with no present, then is revealed:
+    // same pane, same tab, so the visible-set membership compare alone sees no reveal.
     arm(&app, 1_000_000_000);
     app.on_occlusion_changed(wid, false);
     assert_eq!(
@@ -2272,7 +2164,7 @@ fn an_occlusion_reveal_discards_the_stale_output_stamp_not_books_it() {
         "a stamp that aged while the window was off glass must be discarded \
          at the reveal present, not booked as a second of render latency"
     );
-    // ...and the window keeps measuring: a burst while it IS on glass books.
+    // ...and the window keeps measuring: a burst while it is on glass books.
     arm(&app, 3_000_000);
     let dt = app.present_latency_ns(wid);
     assert!(
@@ -2304,16 +2196,14 @@ fn the_status_gate_never_defers_a_classification_the_scan_would_make() {
         !app.session_status.due(0, inside),
         "a just-classified session is rate-limited for one interval"
     );
-    // GATED: nothing is due, so the sweep answers empty — the same answer
-    // the O(sessions) scan gave, in O(1).
+    // Nothing is due, so the sweep answers empty, as the O(sessions) scan would, in O(1).
     assert!(
         app.observe_session_statuses(inside).is_empty(),
         "a sweep inside the interval publishes nothing"
     );
 
-    // A BRAND-NEW session must be classified on the very next wake, not one
-    // interval later: its insert moves the pool epoch, which forces the
-    // gate open even though every KNOWN slot is still rate-limited.
+    // A new session is classified on the very next wake: its insert moves the pool epoch,
+    // which opens the gate though every known slot is still rate-limited.
     app.push_stub_tab(wid, stub_session(1));
     let after = inside + std::time::Duration::from_millis(1);
     assert!(
@@ -2337,9 +2227,8 @@ fn the_status_gate_never_defers_a_classification_the_scan_would_make() {
     );
 }
 
-/// A session skipped because its terminal lock was held (`try_lock`) still has no slot,
-/// so the gate must retry it on the next wake rather than bank the pool epoch. Pinned
-/// with a genuinely held lock.
+/// A session skipped because its terminal lock was held (`try_lock`) still has no slot, so the
+/// gate retries it on the next wake rather than bank the pool epoch.
 #[test]
 fn the_status_gate_stays_open_over_a_session_it_could_not_classify() {
     let mut app = App::headless_for_test();
@@ -2366,8 +2255,7 @@ fn the_status_gate_stays_open_over_a_session_it_could_not_classify() {
     );
     drop(held);
 
-    // The GUARD: the very next wake must still reach it, exactly as the
-    // whole-pool scan would have.
+    // The next wake must still reach it, as the whole-pool scan would.
     let t2 = t1 + std::time::Duration::from_millis(1);
     let _ = app.observe_session_statuses(t2);
     assert!(
@@ -2385,9 +2273,8 @@ fn the_title_drift_gate_fires_for_a_newly_labeling_window_and_not_otherwise() {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     let t0 = Instant::now();
-    // One flush puts the gate in its steady state: the App-level consumed
-    // epoch equals the live one, so the cheap first disjunct is false and
-    // the per-window conjunction is what decides — exactly the flood case.
+    // One flush reaches the steady state: the App-level consumed epoch equals the live one,
+    // so the per-window conjunction decides.
     app.observe_title_drift(0, t0);
     let live = {
         let t = super::term_lock(&app.pool.get(0).expect("pooled session").term);
@@ -2430,10 +2317,9 @@ fn the_title_drift_gate_fires_for_a_newly_labeling_window_and_not_otherwise() {
     );
 }
 
-/// Live window-drag scope (perf #28): a mid-drag reflow (`resize_live_drag`)
-/// sizes only the active tab's panes; a background tab defers until the trailing
-/// settle or the tab-switch flush `redraw_window` performs. Drives the scope
-/// directly (`resize_panes_scoped`) — the two apply paths the throttle routes to.
+/// A mid-drag reflow (`resize_live_drag`) sizes only the active tab's panes; a background tab
+/// defers until the trailing settle or the tab-switch flush `redraw_window` performs. Drives
+/// `resize_panes_scoped`, the scope both apply paths route to.
 #[test]
 fn live_drag_resize_scopes_to_active_tab_then_flushes_on_switch() {
     let mut app = App::headless_for_test(); // window 0 = 24x80, session 0, tab 0
@@ -2470,9 +2356,8 @@ fn live_drag_resize_scopes_to_active_tab_then_flushes_on_switch() {
         "a deferred background tab marks the window panes_stale"
     );
 
-    // Switching to the deferred tab flushes IT — what `redraw_window`'s backstop
-    // does before presenting a switched-to tab (a plain `switch_tab_in` does not
-    // reflow non-shared panes, so the scoped flush is what corrects it).
+    // Switching to the deferred tab does not reflow it (a plain `switch_tab_in` leaves
+    // non-shared panes alone); the scoped flush `redraw_window` runs before presenting it does.
     app.switch_tab_in(wid, 1);
     assert_eq!(
         size(&app, 1),
@@ -2528,10 +2413,8 @@ fn divider_drag_coalesces_and_release_flushes_final_size() {
     assert_eq!(left_cols(&app), 30, "leading-edge move applies immediately");
     assert_eq!(engine_cols(&app), 30, "…and reflows the engine with it");
 
-    // A second move inside the throttle window is coalesced: no ratio move, no
-    // reflow. (Guarded by the clock so a pathological scheduler stall past the
-    // throttle window skips the strict check instead of flaking; the flush
-    // assertions below hold either way.)
+    // A second move inside the throttle window is coalesced, checked only while the clock
+    // confirms it (a scheduler stall past the window skips it; the flush below holds anyway).
     if let Some(ws) = app.windows.get_mut(&wid) {
         ws.last_mouse_window_cell = (5, 20);
     }
@@ -2569,10 +2452,8 @@ fn focus_loss_scrubs_stale_modifiers_without_breaking_real_chords() {
         let mode = KeyboardMode::DISAMBIGUATE_ESC_CODES
             | KeyboardMode::REPORT_EVENT_TYPES
             | KeyboardMode::REPORT_ALTERNATE_KEYS;
-        // The same source the headless `App` under test uses
-        // (`lock_modifiers: keymap::no_lock_modifiers`): a unit test never
-        // consults the platform's Caps Lock, so the bytes are pinned
-        // exactly, on every machine.
+        // Lock modifiers as the headless `App` reads them (`keymap::no_lock_modifiers`),
+        // so the bytes do not depend on the machine's Caps Lock.
         encode_key_with_event(
             &Key::Character('l'),
             crate::keymap::modifiers_from_winit(mods) | crate::keymap::no_lock_modifiers(),
@@ -2670,9 +2551,7 @@ fn focus_loss_scrubs_stale_modifiers_without_breaking_real_chords() {
     state = next;
     assert_eq!(app.windows[&wid].mods, ModifiersState::empty());
 
-    // With no subsequent report, FocusIn retains the clean cache and l is
-    // plain. This is the exact defense the reset owns—no broader causality
-    // claim about backend event ordering is needed.
+    // With no later report, FocusIn keeps the clean cache and `l` is plain.
     app.on_focus(wid, true);
     let next = project_focus_modifier_cache(&app, wid, 0, 0);
     assert_conforms(&model, "FocusIn", &state, &next);
@@ -2849,8 +2728,7 @@ fn attached_window_adopts_os_focus_without_waiting_for_an_event() {
     app.adopt_initial_focus(wid, None);
     assert_eq!(project_focus_modifier_cache(&app, wid, 0, 0), after);
 
-    // Historical negative control: retaining the constructor seed cannot
-    // satisfy the OS blur transition.
+    // Negative control: keeping the constructor seed cannot satisfy the OS blur transition.
     let (ok, _) = aterm_spec::verify::validate_transition_tiered(
         &model,
         &[],
@@ -3382,9 +3260,8 @@ fn screen_buffer_switches_retire_coordinates_and_preserve_companion_identity_and
         );
         assert!(ws.fx.companions().music_notes.is_active());
         assert_eq!(ws.fx.companions().sing_riff_bar, Some(7));
-        // The owner edge forgot the old stream's completion latch: its next
-        // completion is a silent baseline, never news. (Without the edge the
-        // latch still holds seq 7, and seq 8 would read as a completion.)
+        // The owner edge forgot the old stream's latch: its next completion is a silent
+        // baseline (without the edge, seq 8 would read as a completion).
         let ws = app.windows.get_mut(&wid).expect("test window");
         let probe =
             crate::app_render::pet_prepare_for_test(ws, now, session, None, Some((8, 1, None)));
@@ -3550,7 +3427,6 @@ fn migrate_to_different_size_window_reflows_moved_session() {
     app.push_stub_tab(WindowId(0), stub_session(s2));
     app.frontmost_window = Some(WindowId(0));
     app.sync_active_session();
-    // The stub session starts at 24x80 (the source window's size).
     {
         let s = app.pool.get(s2).expect("s2 pooled");
         let t = super::term_lock(&s.term);
@@ -3560,14 +3436,12 @@ fn migrate_to_different_size_window_reflows_moved_session() {
             "s2 starts at the source geometry"
         );
     }
-    // Move window 0's active tab (s2) into window B (40x120).
     let _ = app.migrate_active_tab_to_next_window();
     assert_eq!(
         app.frontmost_window,
         Some(wid_b),
         "focus follows the moved tab"
     );
-    // resize_panes(B) reflowed the moved session to B's grid (single-pane = full).
     {
         let s = app.pool.get(s2).expect("s2 still pooled (pure view-move)");
         let t = super::term_lock(&s.term);
@@ -3590,13 +3464,11 @@ fn close_active_last_tab_reports_the_frontmost_window() {
     let w1 = app.insert_logical_window(stub_session(s1), 24, 80);
     app.frontmost_window = Some(WindowId(0));
     app.sync_active_session();
-    // Closing window 0's only tab reports window 0 (the frontmost) for escalation.
     assert_eq!(
         app.close_active_tab(),
         Some(WindowId(0)),
         "the LAST tab of the frontmost window → escalate-close THAT window",
     );
-    // A surviving multi-tab window returns None (no escalation).
     let s2 = app.next_session_id;
     app.push_stub_tab(w1, stub_session(s2)); // w1 now has 2 tabs
     app.frontmost_window = Some(w1);
@@ -3620,8 +3492,8 @@ fn detach_rollback_returns_the_moved_session_no_data_loss() {
     let pool_before = app.pool.iter().count();
     assert_eq!(pool_before, 2);
 
-    // Detach the active tab (s1) into a new window B — a pure view-move (no pool
-    // churn): s1 is now B's SOLE view.
+    // Detach the active tab (s1) into a new window B, a pure view-move: s1 is now B's only
+    // view.
     let wid_b = app
         .detach_active_tab_logical()
         .expect("detach moves the active tab to B");
@@ -3636,7 +3508,6 @@ fn detach_rollback_returns_the_moved_session_no_data_loss() {
     // Simulate the GPU-attach failure → rollback.
     app.detach_rollback_logical(Some(WindowId(0)), wid_b);
 
-    // The session SURVIVED (not detached/dropped) and the tab is back in A; B gone.
     assert!(
         app.pool.get(s1).is_some(),
         "rollback PRESERVES the moved session — no data loss"
@@ -3675,7 +3546,6 @@ fn shared_target_geometry_uses_foreground_viewers_only() {
         ws.rows = 60;
         ws.cols = 200;
     }
-    // Both windows show S in their active tab → min of A(24x80) and B(60x200).
     assert_eq!(
         app.shared_target_geometry(0),
         (24, 80),
@@ -3685,7 +3555,6 @@ fn shared_target_geometry_uses_foreground_viewers_only() {
     // Background S in window 0 (a new tab there becomes active).
     let s2 = app.next_session_id;
     app.push_stub_tab(WindowId(0), stub_session(s2));
-    // Only B shows S in its active tab, so the grid follows B (60x200), not window 0.
     assert_eq!(
         app.shared_target_geometry(0),
         (60, 200),
@@ -3709,8 +3578,8 @@ fn pending_close_flag_lands_on_the_frontmost_for_escalation() {
     if let Some(ws) = app.windows.get_mut(&closed) {
         ws.pending_close = true;
     }
-    // The escalation scan (mirrors `escalate_pending_close`) finds the FLAGGED
-    // window (0), not the OS-event window — and closing it leaves w1.
+    // The escalation scan (as in `escalate_pending_close`) finds the flagged window (0), not
+    // the OS-event window, and closing it leaves w1.
     let flagged: Vec<WindowId> = app
         .windows
         .iter()
@@ -3726,14 +3595,12 @@ fn pending_close_flag_lands_on_the_frontmost_for_escalation() {
     assert_eq!(app.windows.keys().copied().collect::<Vec<_>>(), vec![w1]);
 }
 
-/// `App::move_tab` (the drag-to-reorder model op behind `tab move <from> <to>` and
-/// the native mouse-drag gesture): it permutes the window's `layouts` Vec and FIXES
-/// `tabs.active` so the same session stays selected through the move, preserving the
-/// `count == layouts.len()` / `active < count` invariants.
+/// `App::move_tab` (behind `tab move <from> <to>` and the native mouse drag) permutes the
+/// window's `layouts` and fixes `tabs.active` so the same session stays selected, keeping
+/// `count == layouts.len()` and `active < count`.
 #[test]
 fn move_tab_reorders_and_tracks_active() {
     let mut app = App::headless_for_test();
-    // Window 0 starts with one tab (session 0); push two more → tabs [0,1,2].
     let s1 = app.next_session_id;
     app.push_stub_tab(WindowId(0), stub_session(s1));
     let s2 = app.next_session_id;
@@ -3746,7 +3613,6 @@ fn move_tab_reorders_and_tracks_active() {
             .collect::<Vec<_>>()
     };
     assert_eq!(order(&app), vec![0, s1, s2], "three tabs in append order");
-    // After the two pushes, the last tab (session s2, index 2) is active.
     assert_eq!(app.windows[&WindowId(0)].tabs.active, 2);
 
     // Move the active tab (index 2) to the front (index 0): the session follows,
@@ -3818,8 +3684,7 @@ fn active_handle_follows_front_tab_append_and_close() {
     };
     assert_eq!(active(&app), 0, "starts on session 0");
 
-    // Append a tab on the front window → the global handle follows to it
-    // (pre-fix `push_stub_tab` synced only the per-window mirror).
+    // Append a tab on the front window → the global handle follows to it.
     let s1 = app.next_session_id;
     app.push_stub_tab(WindowId(0), stub_session(s1));
     assert_eq!(
@@ -3833,8 +3698,7 @@ fn active_handle_follows_front_tab_append_and_close() {
         "global handle follows the appended front tab"
     );
 
-    // Close the active tab (Cmd-W) → switches to tab 0; the handle follows back
-    // (pre-fix `apply_close_outcome` synced only the per-window mirror).
+    // Close the active tab (Cmd-W) → switches to tab 0; the handle follows back.
     app.close_active_tab();
     assert_eq!(
         app.windows[&WindowId(0)].tabs.active,

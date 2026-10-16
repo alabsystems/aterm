@@ -1,78 +1,35 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE CONTAINER DRIVE: `aterm_objc::MainThreadBound`, and the UNSOUND version
-//! of it, compiled and measured side by side.
+//! `aterm_objc::MainThreadBound` and an unsound twin, measured side by side.
 //!
-//! # Why this is a `harness = false` test
+//! The container's third obligation (the value is dropped on the main thread) is discharged by
+//! [`aterm_objc::run_on_main`] inside `Drop`, which libtest cannot exercise: it runs each test
+//! on a worker and parks its main thread joining them. So this target is `harness = false` and
+//! its `main` is the process main thread. It answers libtest's argv as one test named
+//! `main_thread_bound_drive` ([`asked`]): a filter that does not match, a matching `--skip`,
+//! `--ignored` or `--bench` runs nothing and passes, and `--list` names it. Off macOS it passes
+//! without running; on macOS a NOT RUN (`2`: no main thread, no witness, no probe class) is a
+//! failing exit.
 //!
-//! `MainThreadBound`'s third obligation — *the value is dropped on the main
-//! thread* — is discharged by [`aterm_objc::run_on_main`] inside `Drop`, and
-//! `run_on_main` cannot be exercised by libtest in either direction: libtest
-//! runs each test on a worker (so the direct branch is never taken) and parks
-//! its main thread joining those workers (so the dispatched branch blocks for
-//! ever). `tests/main_thread_bound.rs` holds the half that can be held on a
-//! worker and opens by saying so. This file holds the rest.
+//! The drop obligation has no type-system half, so the counterexample is not a `compile_fail`
+//! doctest but `NaiveBound<T>`: the same `unsafe impl<T> Send` and witnessed `new`, with a drop
+//! in place. Stage 3 measures where its `T`'s destructor runs against `MainThreadBound`'s;
+//! stage 4 does the same with a `Retained` of a declared class whose ivar has a destructor
+//! (`S3`'s release end in the crate's soundness list), which `NaiveBound` lets `-dealloc` run on
+//! a spawned thread through safe code.
 //!
-//! So this target has no libtest harness (`harness = false` in Cargo.toml):
-//! its `main` IS the process main thread, and `targo test` runs it like any
-//! other suite. It answers libtest's argv as ONE test named
-//! `main_thread_bound_drive` ([`asked`]): a filter that does not match, a
-//! matching `--skip`, `--ignored` or `--bench` runs nothing and passes, and
-//! `--list` names it — so the workspace test run and the measuring stage
-//! select it exactly as they would a `#[test]`. Off macOS there is no
-//! libdispatch main queue to measure, and it passes without running. On
-//! macOS a NOT RUN (`2`: no main thread, no witness, no probe class) is a
-//! failing exit, never a pass. This test is the drive's only runner.
-//!
-//! # THE PROOF OBLIGATION, and why an argument would not have discharged it
-//!
-//! The `Send` and `Sync` impls on `MainThreadBound<T>` are **unconditional in
-//! `T`**. Two of the four obligations that pay for them are enforced by the
-//! type system and their counterexamples are `compile_fail` doctests whose
-//! error text was read rather than assumed. The third — the drop — has **no
-//! type-system half at all**. Nothing about `unsafe impl<T> Send` makes the
-//! `Drop` impl exist, and a reader has no way to tell a container that
-//! reschedules from one that does not by looking at either type's signature.
-//!
-//! So the counterexample here is not a program that fails to compile. It is
-//! [`NaiveBound<T>`]: a container declared **in this file**, with the same
-//! `unsafe impl<T> Send`, the same witness on `new`, the same accessors — and
-//! an ordinary derived drop. It compiles. It is what a reasonable person writes.
-//! Stage 3 measures the thread its `T`'s destructor runs on, against
-//! `MainThreadBound`'s, with the same `T`, the same worker and the same run
-//! loop. One lands on the main thread and one does not.
-//!
-//! Stage 4 does it again with the payload that actually matters: an
-//! `aterm_objc::Retained` of a [`declare_class!`][aterm_objc::declare_class]
-//! class whose Rust ivar has a destructor. That is `S3` in the crate's
-//! soundness list — *`dealloc` runs on whatever thread performs the last
-//! release* — recorded there as CLOSED at its birth end and **open at its
-//! release end**. For a value inside this container it is closed, and stage 4
-//! is the measurement; `NaiveBound` is the same measurement with the closure
-//! removed, and it runs a declared class's `-dealloc` and its Rust ivar
-//! destructor on a spawned thread through 100% safe code.
-//!
-//! # WHICH STAGES CAN FAIL — plant-verified, two plants
-//!
-//! | plant | what fails |
-//! |---|---|
-//! | `Drop` drops in place instead of rescheduling | stage 2 (the destructor lands on the worker), stage 4 (a declared class's `-dealloc` lands there), and stage 5 — the needs-drop child stops hanging, because there is no dispatch left to block on |
-//! | the `needs_drop` short-circuit removed | stage 5's second half: the drop-less child HANGS from the same position the real one returns from |
-//!
-//! Stages 3 and 4b are the counterexample's own arms and are expected to report
-//! the WORKER; they fail if `NaiveBound` ever stops being unsound, which would
-//! mean the comparison had lost its subject.
-//!
-//! # The `needs_drop` short-circuit is a GUARANTEE, not an optimisation
-//!
-//! `Drop` skips the dispatch entirely when `T` has no destructor. Stage 5
-//! proves that is load-bearing with a child-process differential, because the
-//! failure it prevents is a HANG and a hang cannot be asserted from inside the
-//! thing that is hanging: the child drops a container of a needs-drop `T` on a
-//! worker while its main thread is parked (a libtest binary's exact shape) and
-//! must never return, and the same child dropping a drop-less `T` from the same
-//! position must exit 0.
+//! A `Drop` that drops in place instead of rescheduling fails stages 2 and 4 (the destructor
+//! lands on the worker) and stage 5's needs-drop child (it stops hanging); removing the
+//! `needs_drop` short-circuit makes stage 5's drop-less child hang. Stages 3 and 4b are the
+//! counterexample's arms and expect the worker: they fail if `NaiveBound` stops being unsound.
+//! Stage 5 is a child-process differential because the failure the short-circuit prevents is a
+//! hang: a child dropping a needs-drop container on a worker with its main thread parked must
+//! never return, and the same child with a drop-less `T` must exit 0.
+#![allow(
+    clippy::disallowed_types,
+    reason = "test code: a stand-in child may inherit descriptors"
+)]
 
 /// The name libtest's argv selects this target by: its `[[test]] name`.
 const TEST_NAME: &str = "main_thread_bound_drive";
@@ -106,12 +63,9 @@ enum Asked {
     Nothing,
 }
 
-/// Read libtest's argv the way libtest would for a single test named
-/// [`TEST_NAME`]. Positional filters and `--skip` match by substring, or
-/// whole under `--exact`; options that take a value consume it, so
-/// `--skip measuring::` is a skip and never a filter. An option libtest does
-/// not have is an error, as it is to libtest, rather than a value that could
-/// be misread as a filter and silently select nothing.
+/// Read libtest's argv as libtest would for one test named [`TEST_NAME`]: filters and `--skip`
+/// match by substring (whole under `--exact`), options that take a value consume it, and an
+/// unknown option is an error rather than a filter that silently selects nothing.
 fn asked(args: impl IntoIterator<Item = String>) -> Result<Asked, String> {
     let (mut filters, mut skips) = (Vec::new(), Vec::new());
     let (mut list, mut exact, mut ignored, mut bench) = (false, false, false, false);
@@ -186,21 +140,14 @@ const NOT_RUN: i32 = 2;
 #[cfg(target_os = "macos")]
 const MODE: &str = "ATERM_OBJC_BOUND_DRIVE_MODE";
 
-/// How long stage 5's needs-drop child, which must NEVER return, is watched
-/// before it counts as hung. It always costs this whole window. The planted
-/// defect it exists to catch (a `Drop` that does not reschedule) returns from
-/// the same position in milliseconds.
+/// How long stage 5's needs-drop child, which must never return, is watched before it counts as
+/// hung; it always costs this whole window. A `Drop` that does not reschedule returns in
+/// milliseconds.
 #[cfg(target_os = "macos")]
 const HANG_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// How long anything that MUST complete — a dispatched drop, a `get_on_main`,
-/// the drop-less child — may take before it is called hung: a hang detector
-/// (a minute), never a latency budget.
-///
-/// Generous on purpose, and free when the code is right, because every such
-/// wait returns the moment it completes: this runs in the workspace test run
-/// beside other lanes' compiles, and a FALSE "it hung" would be the worst
-/// outcome this file could produce.
+/// A hang detector, never a latency budget, for anything that must complete: a dispatched drop,
+/// a `get_on_main`, the drop-less child. Each wait returns the moment it completes.
 #[cfg(target_os = "macos")]
 const WATCHDOG: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -234,21 +181,16 @@ mod macos {
 
     use super::{FAIL, HANG_WINDOW, MODE, NOT_RUN, PASS, WATCHDOG};
 
-    // SAFETY: CoreFoundation is a system framework, always present. The main
-    // thread has to SERVICE its queue or every dispatched drop blocks; that is
-    // what this is for.
+    // SAFETY: CoreFoundation is a system framework, always present, and these are its
+    // declarations. The main thread must service its queue or every dispatched drop blocks.
     #[link(name = "CoreFoundation", kind = "framework")]
     unsafe extern "C" {
         static kCFRunLoopDefaultMode: *const c_void;
         fn CFRunLoopRunInMode(mode: *const c_void, seconds: f64, return_after_source: u8) -> i32;
     }
 
-    /// Whether this thread is the process main thread, asked of Foundation
-    /// directly rather than through the crate's own witness.
-    ///
-    /// Deliberately independent of [`MainThread`]: a stage that used the same
-    /// witness the capability uses could not catch the capability being wrong
-    /// about the thread.
+    /// Whether this thread is the process main thread, asked of Foundation directly: a stage that
+    /// used the crate's own [`MainThread`] witness could not catch the witness being wrong.
     fn is_main_thread() -> bool {
         // SAFETY: `+[NSThread isMainThread]` is a side-effect-free class-method
         // `BOOL` query and the cast is exactly `-(BOOL)(id, SEL)`.
@@ -258,28 +200,16 @@ mod macos {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // THE COUNTEREXAMPLE. It compiles. It is what a reasonable person writes,
-    // and it is unsound in exactly one place.
-    // -----------------------------------------------------------------------
+    // -- The counterexample ----------------------------------------------
 
-    /// `MainThreadBound`'s twin, WITHOUT the rescheduling drop.
-    ///
-    /// Everything else is identical: the witness on `new`, the witness on
-    /// `get`, the same `unsafe impl<T> Send` with a SAFETY comment that is true
-    /// of two of its three clauses. The third clause — "and the value is
-    /// dropped on the main thread" — is the one that has nothing behind it, and
-    /// nothing in the type system notices.
-    ///
-    /// This is the point of the file: the compiler cannot tell these two apart.
+    /// `MainThreadBound`'s twin without the rescheduling drop: the same witnessed `new` and the
+    /// same `unsafe impl<T> Send`, whose SAFETY argument holds for two of its three clauses. The
+    /// compiler cannot tell the two apart.
     struct NaiveBound<T>(ManuallyDrop<T>);
 
-    // SAFETY: THIS COMMENT IS FALSE, DELIBERATELY, AND THAT IS THE
-    // MEASUREMENT. Two of its three clauses hold — the value is born on the
-    // main thread (`new` takes a witness) and read only there (`get` takes
-    // one) — and the third does not: there is no `Drop` impl, so `T`'s
-    // destructor runs wherever the container happens to die. Nothing in this
-    // file's compilation objects. Stage 3 is what objects.
+    // SAFETY: deliberately false; that is the measurement. The value is born on the main thread
+    // (`new` takes a witness) and never read, but `Drop` destroys it wherever the container
+    // dies. The compiler does not object; stage 3 does.
     unsafe impl<T> Send for NaiveBound<T> {}
 
     impl<T> NaiveBound<T> {
@@ -290,17 +220,14 @@ mod macos {
 
     impl<T> Drop for NaiveBound<T> {
         fn drop(&mut self) {
-            // SAFETY: the container's own drop, so the value is destroyed
-            // exactly once and never read again. What is missing is not a
-            // safety condition on THIS line; it is the thread this line runs
-            // on.
+            // SAFETY: the container's own drop: the value is destroyed exactly once and never
+            // read again. What is missing is not a safety condition on this line but the thread
+            // it runs on.
             unsafe { ManuallyDrop::drop(&mut self.0) };
         }
     }
 
-    // -----------------------------------------------------------------------
-    // The payloads whose destructors report where they ran.
-    // -----------------------------------------------------------------------
+    // -- The payloads whose destructors report where they ran ------------
 
     /// 1 if the destructor ran on the main thread, 2 if it did not, 0 if it has
     /// not run.
@@ -314,9 +241,8 @@ mod macos {
         }
     }
 
-    /// The ivars of the declared class stage 4 uses: a destructor that records
-    /// the thread `-dealloc` ran on, plus a `Cell` so the type is `!Send` for
-    /// the same structural reason the real ones are.
+    /// Stage 4's ivars: a destructor that records the thread `-dealloc` ran on, and a `Cell` so
+    /// the type is `!Send` as real ivars are.
     struct DeallocWatch {
         _calls: Cell<i64>,
         /// Held for its `Drop`, which is the observation stage 4 makes.
@@ -360,14 +286,10 @@ mod macos {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // THE CHILD PROBES — stage 5's differential, which cannot be written any
-    // other way because the failure it guards against is a hang.
-    // -----------------------------------------------------------------------
+    // -- The child probes: stage 5's differential (the failure it guards is a hang) --
 
-    /// A container of a needs-drop `T`, dropped on a worker, main thread
-    /// PARKED. This must never return: it is `run_on_main`'s first documented
-    /// hang, reached through `Drop`, and it is the shape a libtest binary has.
+    /// A needs-drop container dropped on a worker with the main thread parked, as in a libtest
+    /// binary: `run_on_main`'s first documented hang, through `Drop`. Must never return.
     pub fn child_drop_with_destructor() -> i32 {
         assert!(is_main_thread(), "the probe must start on the main thread");
         // SAFETY: this process's main thread is where `main` is running.
@@ -379,8 +301,7 @@ mod macos {
             drop(bound);
             println!("HANG-CHILD-RETURNED");
         });
-        // The main thread PARKS here rather than pumping — exactly what a
-        // libtest binary's main thread does while joining its workers.
+        // Parks rather than pumping, as a libtest main thread does joining its workers.
         let _ = worker.join();
         println!("HANG-CHILD-JOINED");
         PASS
@@ -402,8 +323,6 @@ mod macos {
         PASS
     }
 
-    // -----------------------------------------------------------------------
-
     pub fn parent() -> i32 {
         let mut failures: Vec<String> = Vec::new();
         let mut check = |ok: bool, what: &str| {
@@ -424,7 +343,7 @@ mod macos {
             return NOT_RUN;
         };
 
-        // -- STAGE 1: the direct path -------------------------------------
+        // -- Stage 1: the direct path -------------------------------------
         eprintln!("stage 1: dropped ON the main thread, the destructor runs there and does not");
         eprintln!("         dispatch (which from this position would be the SIGTRAP re-entrancy)");
         let flag = std::sync::Arc::new(AtomicU32::new(0));
@@ -435,7 +354,7 @@ mod macos {
             "stage1: the destructor ran on the main thread",
         );
 
-        // -- STAGE 2: the reschedule --------------------------------------
+        // -- Stage 2: the reschedule --------------------------------------
         eprintln!("stage 2: dropped on a WORKER, the destructor still runs on the MAIN thread");
         let flag = std::sync::Arc::new(AtomicU32::new(0));
         let bound = MainThreadBound::new(WhereDidIDie(flag.clone()), mt);
@@ -457,7 +376,7 @@ mod macos {
             "stage2: and the destructor still ran on the MAIN thread",
         );
 
-        // -- STAGE 3: THE COUNTEREXAMPLE ----------------------------------
+        // -- Stage 3: the counterexample ----------------------------------
         eprintln!("stage 3: the SAME program with `NaiveBound` — same `unsafe impl Send`, no");
         eprintln!("         reschedule. It compiles, and it lands somewhere else.");
         let flag = std::sync::Arc::new(AtomicU32::new(0));
@@ -482,7 +401,7 @@ mod macos {
              distinguishes them",
         );
 
-        // -- STAGE 4: S3's release end, on a real declared class -----------
+        // -- Stage 4: S3's release end, on a real declared class -----------
         eprintln!("stage 4: an aterm_objc::Retained of a declared class — S3's release end");
         let flag = std::sync::Arc::new(AtomicU32::new(0));
         let Some(obj): Option<Retained<Watched>> = Watched::alloc_init(
@@ -495,10 +414,9 @@ mod macos {
             eprintln!("objc-bound-drive: NOT RUN — the probe class could not be instantiated.");
             return NOT_RUN;
         };
-        // Message it once, so the instance is demonstrably live and the class
-        // demonstrably registered before anything is said about its death.
-        // SAFETY: `-ping` is registered `v@:` by the macro above and `obj` owns
-        // a live +1.
+        // Messaged once, so the instance is live and the class registered before its death
+        // is measured.
+        // SAFETY: `-ping` is registered `v@:` by the macro above and `obj` owns a live +1.
         unsafe {
             let send: unsafe extern "C-unwind" fn(Id, Sel) = msg();
             send(obj.as_id(), sel!(ping));
@@ -507,9 +425,7 @@ mod macos {
         let (tx, rx) = mpsc::channel::<bool>();
         let worker = std::thread::spawn(move || {
             let off_main = !is_main_thread();
-            // The last release happens HERE, on a worker, through 100% safe
-            // code: no `unsafe` token, no misuse, just a `Window` moved into a
-            // thread.
+            // The last release happens here, on a worker, through safe code.
             drop(bound);
             let _ = tx.send(off_main);
         });
@@ -564,7 +480,7 @@ mod macos {
              thread — the hole `MainThreadBound`'s Drop exists to close",
         );
 
-        // -- STAGE 5: the needs_drop short-circuit, by differential --------
+        // -- Stage 5: the needs_drop short-circuit, by differential --------
         eprintln!(
             "stage 5: the `needs_drop` skip is a GUARANTEE — proved against the hang it avoids"
         );
@@ -608,14 +524,14 @@ mod macos {
             }
         }
 
-        // -- STAGE 6: get_on_main from a worker ---------------------------
+        // -- Stage 6: get_on_main from a worker ---------------------------
         eprintln!("stage 6: get_on_main from a worker reaches the value ON the main thread");
         let bound = std::sync::Arc::new(MainThreadBound::new(Cell::new(41_i64), mt));
         let (tx, rx) = mpsc::channel::<(i64, bool)>();
         let shared = std::sync::Arc::clone(&bound);
         let worker = std::thread::spawn(move || {
-            // `Arc<MainThreadBound<Cell<i64>>>` requires `Sync`, and `Cell` is
-            // not — so this line is the `Sync` impl being used, not asserted.
+            // Sharing `Arc<MainThreadBound<Cell<i64>>>` needs `Sync`, which `Cell` is not:
+            // this line uses the `Sync` impl.
             let got = shared.get_on_main(|cell| {
                 cell.set(cell.get() + 1);
                 (cell.get(), is_main_thread())
@@ -646,9 +562,7 @@ mod macos {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // CHILD-PROCESS PLUMBING
-    // -----------------------------------------------------------------------
+    // -- Child-process plumbing ------------------------------------------
 
     #[derive(Debug)]
     enum ProbeOutcome {

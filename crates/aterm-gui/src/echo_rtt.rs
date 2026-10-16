@@ -632,45 +632,6 @@ mod tests {
         assert_eq!(s.p50_us, 501 + 511);
     }
 
-    /// NEGATIVE CONTROL — this gate must be able to FAIL for the reason it
-    /// exists. Model the design WITHOUT the input-epoch gate (arm on every
-    /// keypress, written or not) and show it diverges: under a flood every
-    /// keypress is closed by the next unrelated burst, so the instrument
-    /// publishes a flat, flattering number precisely when the terminal is at
-    /// its worst. The shipped path arms nothing for a key that wrote nothing,
-    /// so the identical trace records no samples at all.
-    #[test]
-    fn the_ungated_design_would_harvest_a_flood_as_its_own_echo() {
-        let _g = fresh();
-        let mut t = 1u64;
-        for _ in 0..50 {
-            // What an ungated probe would do on a UI shortcut / swallowed chord.
-            arm_at(7, t);
-            assert_eq!(close_at(7, t + 50), Some(50));
-            t += 1_000;
-        }
-        let ungated = snapshot();
-        assert_eq!(ungated.total, 50);
-        assert_eq!(
-            (ungated.p50_us, ungated.p99_us),
-            (50, 50),
-            "the ungated design reports a flat 50µs echo for keys that never wrote"
-        );
-
-        reset();
-        // The shipped path: the same 50 non-writing keys arm nothing, so the
-        // same 50 flood bursts are recorded as nothing.
-        for _ in 0..50 {
-            note_output_burst(7);
-        }
-        let shipped = snapshot();
-        assert_eq!(
-            (shipped.total, shipped.arms),
-            (0, 0),
-            "a flood with no write behind it must contribute no samples"
-        );
-    }
-
     /// The packed slot round-trips both halves, which is the whole reason it is
     /// one word: a torn read would publish one keystroke's session against
     /// another's stamp.

@@ -5,8 +5,8 @@
 //! `HOME`.
 //!
 //! A build script that builds its own workspace (by `$CARGO`, and by `targo` through the
-//! shim) finishes under the shim: the setting is on the command line, not inherited. With
-//! it exported as `CARGO_BUILD_BUILD_DIR` the nested build waited on the outer build's
+//! shim) finishes under the shim: the setting is on the command line, not inherited —
+//! exported as `CARGO_BUILD_BUILD_DIR`, the nested build would wait on the outer build's
 //! lock forever. Needs real `targo` (the one building this test); no network.
 //!
 //! `atpkg __reroute cargo …` hands a cargo the setting only where the command builds and
@@ -208,7 +208,8 @@ fn cargo_in_a_session_gets_the_cache_only_where_it_builds_and_reads_it() {
         "build\n"
     );
     assert_eq!(run("1.85.0", &["build"], &[]), "build\n");
-    // Trust's own cargo is targo: its verified lane as typed, `--unverified` gets it.
+    // Trust's own cargo (targo): its verified lane runs as typed; `--unverified` gets the
+    // setting.
     assert_eq!(run("trust", &["check"], &[]), "check\n");
     assert_eq!(
         run("trust", &["build", "--unverified"], &[]),

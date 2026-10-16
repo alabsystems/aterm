@@ -13,16 +13,10 @@
 //! the editing ops with an explicit xterm `ResetWrap` (ICH/DCH/ECH/IL/DL and
 //! the ED/EL-right family) cancel it.
 //!
-//! Row-to-line conversion helpers are in [`super::scroll_convert`].
-
-//!
-//! ## Ring Buffer Design
-//!
-//! The grid uses a ring buffer for O(1) display scrolling. When scrolling up:
-//! - If not at capacity, new rows are appended
-//! - If at capacity, oldest row is reused (optionally pushed to scrollback first)
-//!
-//! The `ring_head` index tracks the oldest row in the buffer.
+//! The rows live in a ring buffer (`ring_head` is the oldest row): below
+//! capacity a scroll appends rows, at capacity it reuses the oldest (after
+//! staging it to history when a store keeps one). Row-to-line conversion is in
+//! [`super::scroll_convert`].
 
 use crate::damage::compute_display_offset_damage;
 use crate::row::LineSize;
@@ -32,16 +26,12 @@ use super::row_u16;
 use crate::Row;
 
 impl Grid {
-    /// Reset display_offset to 0 with targeted damage.
+    /// Reset display_offset to 0, damaging only the newly exposed bottom rows
+    /// (as `scroll_display` does for a down-scroll): for `scroll_to_bottom` and
+    /// for operations whose row arithmetic needs `display_offset == 0`.
     ///
-    /// Marks only the newly exposed bottom rows (as `scroll_display` does for a
-    /// down-scroll) instead of `mark_full()`. Used by `scroll_to_bottom` and by
-    /// operations whose row arithmetic needs `display_offset == 0`.
-    ///
-    /// Machine motion, so it does not bump `reader_live_bottom_gen`; most
-    /// callers (IL/DL, ED, the unscroll, the `scroll_up` family) are forcing
-    /// their own precondition. The reader's End press is `scroll_to_bottom`,
-    /// which bumps for itself.
+    /// Machine motion: it does not bump `reader_live_bottom_gen`; the reader's
+    /// End press is `scroll_to_bottom`, which bumps for itself.
     pub(crate) fn reset_display_offset_with_damage(&mut self) {
         let old_offset = self.storage.display_offset;
         if old_offset == 0 {
@@ -53,28 +43,19 @@ impl Grid {
     }
 
     /// Mark scroll damage: targeted rows for small scrolls, full for large.
-    ///
-    /// This is the content-bearing `scroll_up` path (rows move into scrollback,
-    /// `absolute_row_counter += rows`), so it bumps `content_gen` via
-    /// `mark_content_scroll`. Pure viewport scrolls (`scroll_display` /
-    /// `apply_display_offset_damage`) do not come here and leave `content_gen`
-    /// unchanged.
+    /// Rows moved into scrollback, so this bumps `content_gen`; pure viewport
+    /// scrolls (`scroll_display`) do not come here.
     fn mark_scroll_damage(&mut self, n: usize) {
         let visible_rows = self.storage.visible_rows;
         self.storage.mark_content_scroll(visible_rows, n);
     }
 
-    /// Record that the reader just brought the viewport down to the live bottom.
-    ///
-    /// The one bump site for `reader_live_bottom_gen` (see its field doc).
-    /// Called with the offset read just before a reader-facing viewport
-    /// primitive ran; advances on a non-zero to zero transition, as used by
-    /// [`crate::grid::scrollback_offload`]'s re-attach.
-    ///
-    /// `before != 0`: an End at a viewport already at the live bottom moved
-    /// nothing and is not evidence of a choice. `after == 0`: a reader who
-    /// scrolled up did not choose the live bottom, so if the machine later puts
-    /// them there it must not be mistaken for their choice.
+    /// Record that the reader just brought the viewport down to the live
+    /// bottom: the one bump site for `reader_live_bottom_gen`, advancing when
+    /// `before` (the offset just before a reader-facing viewport primitive ran)
+    /// was non-zero and the offset is now zero. An End already at the live
+    /// bottom moved nothing, and the machine putting a reader there is not
+    /// their choice. `scrollback_offload`'s re-attach reads the count.
     fn note_reader_descent_to_live_bottom(&mut self, before: usize) {
         if before != 0 && self.storage.display_offset == 0 {
             self.storage.reader_live_bottom_gen += 1;
@@ -84,30 +65,25 @@ impl Grid {
     /// Force the viewport to the live bottom for the duration of an output
     /// batch, undone by [`Self::repin_display_offset`].
     ///
-    /// Same motion as [`Self::scroll_to_bottom`] but a separate entry point:
-    /// this is the machine satisfying the `display_offset == 0` precondition of
-    /// the VT row arithmetic downstream of `row_index`, and it re-pins the
-    /// reader afterwards, so it must not touch `reader_live_bottom_gen`.
-    /// Otherwise every output batch arriving while someone reads history
-    /// (`tail -f`) would look like the reader pressing End.
+    /// The motion of [`Self::scroll_to_bottom`], but the machine satisfying the
+    /// `display_offset == 0` precondition of the VT row arithmetic, so it must
+    /// not touch `reader_live_bottom_gen`: otherwise every output batch arriving
+    /// while someone reads history would look like the reader pressing End.
     pub fn pin_viewport_to_live_for_output_batch(&mut self) {
         self.reset_display_offset_with_damage();
         debug_assert_eq!(self.storage.display_offset, 0);
     }
 
-    /// Scroll the display by delta lines.
-    ///
-    /// Positive delta = scroll up (show older content).
-    /// Negative delta = scroll down (show newer content).
-    ///
-    /// Reader motion: bumps `reader_live_bottom_gen` when it lands the viewport on
-    /// the live bottom from above (see `note_reader_descent_to_live_bottom`).
+    /// Scroll the display by `delta` lines: positive shows older content,
+    /// negative newer. Reader motion: bumps `reader_live_bottom_gen` when it
+    /// lands on the live bottom from above (`note_reader_descent_to_live_bottom`).
     ///
     /// ENSURES: self.storage.display_offset <= self.storage.scrollback_lines()
     pub fn scroll_display(&mut self, delta: i32) {
         let max_offset = self.storage.scrollback_lines();
         let old_offset = self.storage.display_offset;
-        // display_offset <= MAX_SCROLLBACK_LINES (1M), which fits in i32.
+        // display_offset <= scrollback_lines(); a history longer than i32
+        // reaches saturates here rather than wrapping.
         let current: i32 = self.storage.display_offset.try_into().unwrap_or(i32::MAX);
         let clamped = current.saturating_add(delta).max(0);
         let new_offset = usize::try_from(clamped).unwrap_or(0);
@@ -117,7 +93,7 @@ impl Grid {
             compute_display_offset_damage(old_offset, self.storage.display_offset, self.rows());
         self.storage.damage.apply_display_offset_damage(dmg);
         self.note_reader_descent_to_live_bottom(old_offset);
-        // Ruling 238: while the history is away, the reader's ask is kept.
+        // While the history is detached, the reader's ask is kept.
         self.note_detached_reader_motion(
             super::scrollback_offload::ReaderMotion::By(delta),
             old_offset,
@@ -125,18 +101,11 @@ impl Grid {
         debug_assert!(self.storage.display_offset <= self.storage.scrollback_lines());
     }
 
-    /// Re-pin the viewport after a batch of output.
-    ///
-    /// `prev_offset` is the user's display_offset before processing reset it to
-    /// 0; `lines_added` is the number of lines that entered scrollback during
-    /// processing (the rise in `absolute_row_counter`). To keep the same content
-    /// in view, the new offset is `prev_offset + lines_added`, clamped to
-    /// `scrollback_lines()` so `display_offset <= scrollback_lines()` holds even
-    /// when eviction discarded some of those lines.
-    ///
-    /// Machine motion (the epilogue of
-    /// [`Self::pin_viewport_to_live_for_output_batch`]), so it does not bump
-    /// `reader_live_bottom_gen`.
+    /// Re-pin the viewport after a batch of output: `prev_offset` is the
+    /// reader's offset before the batch reset it, `lines_added` the rise in
+    /// `absolute_row_counter`. The new offset keeps the same content in view,
+    /// clamped to `scrollback_lines()` in case eviction discarded some lines.
+    /// Machine motion: does not bump `reader_live_bottom_gen`.
     ///
     /// ENSURES: self.storage.display_offset <= self.storage.scrollback_lines()
     pub fn repin_display_offset(&mut self, prev_offset: usize, lines_added: u64) {
@@ -154,14 +123,8 @@ impl Grid {
         debug_assert!(self.storage.display_offset <= self.storage.scrollback_lines());
     }
 
-    /// Scroll to the top of scrollback.
-    ///
-    /// Uses targeted row-level damage when the scroll delta is smaller than
-    /// visible rows: only the top N rows are marked dirty. Falls back to
-    /// `mark_full()` for large scrolls.
-    ///
-    /// Reader motion: bumps `reader_live_bottom_gen` when it lands the viewport on
-    /// the live bottom from above (see `note_reader_descent_to_live_bottom`).
+    /// Scroll to the top of scrollback, with targeted damage. Reader motion
+    /// (see `note_reader_descent_to_live_bottom`).
     ///
     /// ENSURES: self.storage.display_offset == self.storage.scrollback_lines()
     pub fn scroll_to_top(&mut self) {
@@ -176,14 +139,11 @@ impl Grid {
         debug_assert_eq!(self.storage.display_offset, self.storage.scrollback_lines());
     }
 
-    /// Scroll to live position (bottom).
-    ///
-    /// Uses targeted row-level damage instead of `mark_full()`:
-    /// only the newly-exposed bottom rows are marked dirty.
+    /// Scroll to live position (bottom), damaging only the newly exposed rows.
     ///
     /// Reader motion (the End press): bumps `reader_live_bottom_gen` only when
     /// the viewport was not already at the live bottom. The machine's identical
-    /// motion uses [`Self::pin_viewport_to_live_for_output_batch`] or
+    /// motion is [`Self::pin_viewport_to_live_for_output_batch`] or
     /// [`Self::reset_display_offset_with_damage`].
     ///
     /// ENSURES: self.storage.display_offset == 0
@@ -196,30 +156,24 @@ impl Grid {
         debug_assert_eq!(self.storage.display_offset, 0);
     }
 
-    /// Scroll the viewport so `target_abs_row` (an absolute row number, e.g. a
-    /// command mark's `prompt_start_row`) sits at the top visible line, clamped
-    /// to the valid history range: prompt-to-prompt navigation. A target at or
-    /// below the live top clamps to the live bottom (offset 0); one older than
-    /// the oldest retained line clamps to the top of scrollback. Same targeted
-    /// damage as [`scroll_display`](Self::scroll_display); no damage when the
-    /// offset is unchanged.
+    /// Scroll the viewport so `target_abs_row` (e.g. a command mark's
+    /// `prompt_start_row`) sits at the top visible line, clamped to the history
+    /// range: prompt-to-prompt navigation. No damage when the offset is
+    /// unchanged.
     ///
-    /// Reader motion: bumps `reader_live_bottom_gen` when it lands the viewport on
-    /// the live bottom from above (see `note_reader_descent_to_live_bottom`).
-    ///
-    /// Its one machine caller, a rows-only resize re-anchoring the viewport
-    /// (`reflow.rs`), cannot descend to the live bottom: `Grid::resize` zeroes
-    /// `display_offset` first, so the re-anchor can only move the viewport up.
+    /// Reader motion (see `note_reader_descent_to_live_bottom`). Its one machine
+    /// caller, a rows-only resize re-anchoring the viewport, cannot descend to
+    /// the live bottom: the resize zeroes `display_offset` first.
     ///
     /// ENSURES: self.storage.display_offset <= self.storage.scrollback_lines()
     pub fn scroll_to_absolute_row(&mut self, target_abs_row: u64) {
-        // The absolute row shown at the top of the LIVE (offset 0) viewport.
+        // The absolute row at the top of the live (offset 0) viewport.
         let live_top = self
             .storage
             .absolute_row_counter
             .saturating_sub(u64::from(self.storage.visible_rows));
-        // How far ABOVE the live top `target_abs_row` sits = the offset that
-        // lifts it to the top. A target at/below the live top saturates to 0.
+        // How far above the live top the target sits is the offset that lifts
+        // it to the top; a target at or below the live top saturates to 0.
         let want = live_top.saturating_sub(target_abs_row);
         let max_offset = self.storage.scrollback_lines();
         let new_offset = usize::try_from(want).unwrap_or(usize::MAX).min(max_offset);
@@ -234,16 +188,9 @@ impl Grid {
         debug_assert!(self.storage.display_offset <= self.storage.scrollback_lines());
     }
 
-    /// Clamp display_offset to valid bounds.
-    ///
-    /// Call this after operations that may reduce scrollback size
-    /// (e.g., truncation) to maintain the DisplayOffsetValid invariant.
-    ///
-    /// Machine motion (history went away under the viewport), so it does not
-    /// bump `reader_live_bottom_gen`.
-    ///
-    /// Uses targeted row-level damage when the clamping delta is smaller than
-    /// visible rows: only the bottom N rows are marked dirty.
+    /// Clamp display_offset to valid bounds (`DisplayOffsetValid`) after an
+    /// operation that may shrink the scrollback, with targeted damage. Machine
+    /// motion: does not bump `reader_live_bottom_gen`.
     ///
     /// ENSURES: self.storage.display_offset <= self.storage.scrollback_lines()
     pub fn clamp_display_offset(&mut self) {
@@ -259,15 +206,10 @@ impl Grid {
 
     /// Scroll content up by n lines (new empty lines at bottom).
     ///
-    /// When a scrollback is attached and the ring buffer is at capacity,
-    /// the oldest row is converted to a [`Line`] and pushed to the scrollback
-    /// before being overwritten.
-    ///
-    /// O(n × cols): each scrolled line is converted to a scrollback line
-    /// (`row_to_line_with_stored_extras`) and the reused row is cleared and
-    /// resized (`scroll_up_linear_time`, `scroll_up_handles_many_rows`).
-    /// Batched: rows to add vs reuse are computed up front, growth capacity is
-    /// reserved once, and counters update in bulk.
+    /// When the ring is at capacity, the oldest row is staged into the lazy
+    /// buffer (when a store keeps history, `stages_evicted_rows`) and reused.
+    /// O(n × cols), batched: rows to add vs reuse are computed up front, growth
+    /// capacity is reserved once, and counters update in bulk.
     ///
     /// REQUIRES: self.storage.visible_rows > 0
     /// ENSURES: self.storage.rows.len() <= (self.storage.visible_rows as usize) + self.storage.max_scrollback
@@ -297,7 +239,6 @@ impl Grid {
         let capacity = (self.storage.visible_rows as usize) + self.storage.max_scrollback;
         let cols = self.storage.cols;
 
-        // Pre-calculate: how many rows can we add before hitting capacity?
         let rows_until_capacity = capacity.saturating_sub(self.storage.total_lines);
         let rows_to_add = n.min(rows_until_capacity);
         let rows_to_reuse = n.saturating_sub(rows_to_add);
@@ -320,12 +261,10 @@ impl Grid {
     }
 
     /// The append arm of `scroll_up`: the ring is below its cap, so the rows
-    /// scrolling off are kept and `rows_to_add` fresh rows are pushed as the
-    /// new bottom. The push addresses the ring's logical end as the Vec's end,
-    /// so a wrapped ring is linearized first: a rows-only grow's reveal or a
-    /// ring-only limit raise leaves a full, wrapped ring below a lifted cap
-    /// (`GridStorage::linearize_ring`). Once per such raise: the ring then
-    /// stays linear until it fills again.
+    /// scrolling off are kept and `rows_to_add` fresh rows are pushed as the new
+    /// bottom. The push treats the Vec's end as the ring's logical end, so a
+    /// wrapped ring (a rows-only grow's reveal or a ring-only limit raise leaves
+    /// one below a lifted cap) is linearized first, once per such raise.
     fn grow_scrollback_ring(&mut self, rows_to_add: usize, cols: u16) {
         debug_assert!(
             !self.storage.rows.is_empty(),
@@ -360,8 +299,8 @@ impl Grid {
                 // SAFETY: New rows are stored in the same `GridStorage` that owns
                 // `pages`, and rows drop before the backing pages.
                 let mut row = unsafe { Row::new(cols, pages) };
-                // Apply BCE fill so new bottom rows inherit the current SGR
-                // background color per VT420/xterm spec.
+                // BCE: new bottom rows inherit the current SGR background
+                // (VT420/xterm).
                 if needs_fill {
                     row.erase_with(fill);
                 }
@@ -399,10 +338,8 @@ impl Grid {
             );
         }
 
-        // Drain lazy buffer to tiered scrollback when threshold is exceeded.
-        // This amortizes the materialization cost over many scroll operations.
-        // Callers that need all lines in tiered storage (unscroll, reflow)
-        // drain explicitly via drain_lazy_buffer().
+        // Drain the lazy buffer past its threshold, amortizing materialization
+        // over many scrolls; unscroll and reflow drain explicitly.
         if self.storage.lazy_buffer.should_drain() {
             // During an off-thread reflow the store is detached and drain is
             // suppressed (staged lines must survive), so cap the buffer here to
@@ -411,15 +348,11 @@ impl Grid {
                 self.bound_detached_lazy_buffer();
             } else if self.storage.compress_offload_active {
                 // An off-thread compression worker owns the drain: leave the
-                // backlog staged (readable and accounted in the lazy buffer) for
-                // it to promote in bounded batches, off the PTY reader's path.
-                //
-                // Backpressure: past the staging cap the worker has fallen behind
-                // (under a sustained flood it only trickles one batch a second).
-                // The reader must never pay LZ4/zstd inline, which would collapse
-                // flood throughput, so it drops the oldest staged lines instead
-                // (O(1)). The cap is `flood_overflow`; how the loss is accounted
-                // is `drop_flood_overflow`.
+                // backlog staged for it to promote in bounded batches. Past the
+                // staging cap it has fallen behind; the reader must never pay
+                // LZ4 inline (flood throughput would collapse), so it drops the
+                // oldest staged lines instead (`flood_overflow`,
+                // `drop_flood_overflow`).
                 let over = self.flood_overflow();
                 if over > 0 {
                     self.drop_flood_overflow(over);
@@ -488,8 +421,7 @@ impl Grid {
             // SAFETY: The reused row remains stored in `storage.rows`, and
             // `storage.pages` continues to outlive that owner.
             unsafe { storage.rows[oldest].resize(cols, pages) };
-            // One fused BCE fill: reused bottom rows inherit the current SGR
-            // background (VT420/xterm).
+            // One fused BCE fill.
             storage.rows[oldest].reset_with(fill);
         }
         self.storage.ring_head = (self.storage.ring_head + 1) % row_count;
@@ -504,15 +436,11 @@ impl Grid {
         ring_sb: usize,
         has_scrollback: bool,
     ) {
-        // The reused bottom rows inherit the current SGR background (BCE fill);
-        // nothing below mutates it before use.
+        // The reused bottom rows inherit the current SGR background (BCE).
         let fill = self.storage.cursor_template;
 
-        // Single-row fast path (every newline once the ring is full): extract
-        // the entering row's extras directly. With `ring_head` unadvanced there
-        // is no cross-iteration ordering to preserve, so the general path's
-        // 1-element Vec is skipped. Same behaviour as the loop below with
-        // `rows_to_reuse == 1`.
+        // Single-row fast path (every newline once the ring is full): no
+        // cross-iteration ordering to preserve, so skip the 1-element Vec.
         if rows_to_reuse == 1 {
             let phys = (self.storage.ring_head + ring_sb) % row_count;
             let new_extras = Self::extract_row_extras(
@@ -572,12 +500,8 @@ impl Grid {
         // the box is dropped below.
         let extras = self.storage.ring_extras.pop_front().flatten();
 
-        // Lazy scrollback promotion: snapshot the row as a DeferredLine (O(cells)
-        // memcpy) instead of converting it; the line materializes on first read.
-        //
-        // `push_row` fills a recycled cell body from the lazy buffer's pool
-        // rather than allocating: this runs once per newline inside the PTY
-        // reader's `term_lock` hold, which the UI's keystroke echo waits on.
+        // Snapshot the row as a DeferredLine: a copy into a pooled body
+        // (`CellPool`), materialized on first read.
         if has_scrollback {
             self.storage
                 .lazy_buffer
@@ -592,8 +516,7 @@ impl Grid {
             // SAFETY: The reused row remains stored in `storage.rows`, and
             // `storage.pages` continues to outlive that owner.
             unsafe { storage.rows[oldest].resize(cols, pages) };
-            // One fused BCE fill: reused bottom rows inherit the current SGR
-            // background (VT420/xterm).
+            // One fused BCE fill.
             storage.rows[oldest].reset_with(fill);
         }
         self.storage.ring_head = (self.storage.ring_head + 1) % row_count;
@@ -605,19 +528,15 @@ impl Grid {
     const DETACHED_LAZY_CAP: usize = 50_000;
 
     /// Bound the lazy buffer while the tiered store is detached for an
-    /// off-thread reflow. Normally [`drain_lazy_buffer`](Self::drain_lazy_buffer)
-    /// moves staged lines into the store, but during the reflow window the store
-    /// is gone and draining is suppressed, so heavy streaming would grow the
-    /// buffer without bound. Drop the oldest staged window output beyond the
-    /// cap. With the store in the job, it cannot be known which of those lines
-    /// the scrollback limit would have kept, so every one is counted and marked
-    /// as a cut.
+    /// off-thread reflow: draining is suppressed then, so heavy streaming would
+    /// grow it without bound. Drop the oldest staged window output beyond the
+    /// cap; with the store in the job, which of those lines the scrollback
+    /// limit would have kept is unknowable, so each counts and is marked as a
+    /// cut.
     ///
-    /// Logged per WINDOW, not per drop: once at the cap, a stream drops one
-    /// line for every line it prints, on the PTY reader under the terminal
-    /// lock, so a line per drop let one resize during a flood roll
-    /// `aterm.log` over in under a second, audit lines and all. The window's
-    /// first drop is written here and its total when it closes
+    /// Logged per window, not per drop (at the cap a stream drops a line per
+    /// line printed, on the PTY reader under the terminal lock): the first drop
+    /// here, the total when the window closes
     /// ([`close_reflow_window_cap_run`](Self::close_reflow_window_cap_run)).
     fn bound_detached_lazy_buffer(&mut self) {
         let len = self.storage.lazy_buffer.len();
@@ -661,30 +580,21 @@ impl Grid {
     /// [`flood_overflow`](Self::flood_overflow) for the cap itself.
     pub(crate) const ASYNC_COMPRESS_BACKPRESSURE: usize = 20_000;
 
-    /// How many of the oldest staged rows the flood path must drop now, so the
-    /// backlog fits both of its limits, never going below the floor
+    /// How many of the oldest staged rows the flood path must drop now so the
+    /// backlog fits both its limits, never going below the floor
     /// ([`ASYNC_COMPRESS_BACKPRESSURE`](Self::ASYNC_COMPRESS_BACKPRESSURE)):
     /// * the store's line share (`line_limit`): rows past it are the configured
-    ///   limit's to evict, which
-    ///   [`drop_flood_overflow`](Self::drop_flood_overflow) does silently;
-    /// * the store's unused memory budget: the staged rows, weighed as held
-    ///   (the lazy buffer's running byte sum of occupied cells, not the window
-    ///   width), may use no more than the budget has left.
+    ///   limit's to evict, which [`drop_flood_overflow`](Self::drop_flood_overflow)
+    ///   does silently;
+    /// * the store's unused memory budget, which the staged rows (weighed by
+    ///   occupied cells) may not exceed.
     ///
-    /// A fixed line cap bounds memory in the wrong unit and, under a flood the
-    /// worker cannot keep up with, drops lines from the middle of a history the
-    /// user configured to be much deeper. The memory headroom is the one
-    /// statement of how much this scrollback may use (the engine's
-    /// `memory_budget`), and the staged rows are headed for that same store.
-    /// At the defaults (100k lines, 100 MB) it covers the whole configured
-    /// limit for rows of up to ~110 occupied cells; wider floods are cut and
-    /// marked. The cost is a peak: the worker's post-burst drain returns the
-    /// bodies (the pool keeps at most 512 KiB) and releases the deque spine
-    /// ([`LazyBuffer::release_spine_slack`](super::scroll_convert::LazyBuffer::release_spine_slack)).
-    /// Materialized text of staged rows (built only on reads) is not weighed.
-    ///
-    /// Cost on the reader's per-newline path: O(1) within both limits; past
-    /// the memory one, one step per row dropped.
+    /// Memory, not a line count, is the unit: a line cap would cut the middle of
+    /// a history configured much deeper. At the defaults (100k lines, 100 MB)
+    /// the headroom covers the whole limit for rows of up to ~110 occupied
+    /// cells; wider floods are cut and marked. Materialized text of staged rows
+    /// is not weighed. O(1) per newline within both limits; past the memory
+    /// one, one step per row dropped.
     pub(crate) fn flood_overflow(&self) -> usize {
         let buffer = &self.storage.lazy_buffer;
         let floor = Self::ASYNC_COMPRESS_BACKPRESSURE;
@@ -704,35 +614,21 @@ impl Grid {
         by_lines.max(buffer.front_rows_over(headroom, floor))
     }
 
-    /// Drop `over` of the oldest staged rows because the backlog is over its
-    /// cap ([`flood_overflow`](Self::flood_overflow)), and account for them.
-    ///
-    /// Two kinds of drop:
-    /// * Ordinary eviction: rows the configured line limit would not hold
-    ///   anyway. Retention takes the oldest first, store before staged, so this
-    ///   applies it now in that order (store rows via `truncate_oldest`, whole
-    ///   blocks, no decompression; then staged rows). No hole opens; the top of
-    ///   history moves silently. A flood into a configured limit ends holding
-    ///   exactly the newest `limit` lines with no marker.
-    /// * A flood cut: rows the limit would have kept, because the memory
-    ///   headroom ran out first. Counted in `flood_truncated_lines` and marked
-    ///   in place by the lazy buffer's cut, which readers materialize as one
-    ///   dim `— aterm dropped N lines here …` row (the counter is fed from the
-    ///   marker's own count).
+    /// Drop `over` of the oldest staged rows (the backlog is over its cap,
+    /// [`flood_overflow`](Self::flood_overflow)) and account for them:
+    /// * ordinary eviction: rows the configured line limit would not hold
+    ///   anyway, oldest first, store before staged (`truncate_oldest`). No hole
+    ///   opens, so a flood into a limit ends holding exactly its newest lines;
+    /// * a flood cut: rows the limit would have kept, lost because the memory
+    ///   headroom ran out first, counted in `flood_truncated_lines` and marked
+    ///   in place by the lazy buffer's cut (one dim marker row).
     ///
     /// The split is decided against the history as it would stand had nothing
-    /// been dropped, oldest first: stored rows, rows the open cut names, rows
-    /// dropped now, remaining staged rows. The limit's share holds the newest
-    /// `share` of that; everything older is ordinary. So the marker names
-    /// exactly the lines inside the configured limit that are missing, and
-    /// stops growing (or shrinks) as the window slides past the hole. The
-    /// counter, which only grows, adds each cut's peak.
-    ///
-    /// While a cut is open every drop moves or grows the marker under a key a
-    /// content row held (and a cut below stored rows renumbers them, since a
-    /// retained row's key is `oldest + i`), so it bumps the renumber epoch like
-    /// other total-moving mutations (see `history_renumber_epoch`). Ordinary
-    /// eviction with no cut keeps every survivor's key and bumps nothing.
+    /// been dropped: the newest `share` of it is the limit's, everything older
+    /// ordinary, so the marker names exactly the missing lines inside the limit
+    /// and shrinks as the window slides past the hole; the counter adds each
+    /// cut's peak. While a cut is open every drop moves the marker under a key
+    /// a content row held, so it bumps the renumber epoch.
     fn drop_flood_overflow(&mut self, over: usize) {
         let staged = self.storage.lazy_buffer.staged_rows();
         let over = over.min(staged);
@@ -794,20 +690,14 @@ impl Grid {
     }
 
     /// One bounded drain opportunity for a host polling while output may still
-    /// flood in (the GUI compression worker's once-a-second trickle, the wasm
-    /// hosts' per-frame drain). It is
-    /// [`drain_lazy_bounded`](Self::drain_lazy_bounded), except that it skips
-    /// the batch (returning the unchanged backlog) while a flood cut is open
-    /// and at least `max_lines` rows were staged since the previous
-    /// opportunity.
-    ///
-    /// Skip then: a batch promotes the marker and the rows after it, and a
-    /// stream delivering a batch or more per opportunity refills the backlog
-    /// past its cap, so the next drop would open a new hole (one marker per
-    /// batch instead of one per flood). Only then: a slower stream is one a
-    /// batch outruns, so promoting it ends the loss, while skipping would keep
-    /// dropping a slow tail. Arrivals, not drops, are the measure, so a cut
-    /// opened just before the opportunity is judged by the stream's rate.
+    /// flood in (the GUI worker's once-a-second trickle, the wasm hosts'
+    /// per-frame drain): [`drain_lazy_bounded`](Self::drain_lazy_bounded),
+    /// except that it skips the batch while a flood cut is open and at least
+    /// `max_lines` rows arrived since the previous opportunity. Such a stream
+    /// refills the backlog past its cap, so promoting the marker would only open
+    /// a new hole; a slower one is outrun by a batch, so promoting ends the
+    /// loss. Arrivals, not drops, are the measure, so a cut opened just before
+    /// the opportunity is judged by the stream's rate.
     pub fn trickle_lazy_bounded(&mut self, max_lines: usize) -> usize {
         let arrived = self.storage.lazy_buffer.take_arrivals();
         if self.storage.lazy_buffer.cut_open()
@@ -821,21 +711,18 @@ impl Grid {
     /// Attach/detach the off-thread compression worker for this grid. While
     /// attached, the reader-thread ingest path defers lazy-buffer draining to the
     /// worker (which calls [`drain_lazy_bounded`](Self::drain_lazy_bounded) in
-    /// bounded batches), keeping the LZ4/zstd promotion spike off the PTY-drain
+    /// bounded batches), keeping the LZ4 promotion spike off the PTY-drain
     /// critical path. Idempotent; set once at session setup.
     pub fn set_compress_offload_active(&mut self, active: bool) {
         self.storage.compress_offload_active = active;
     }
 
     /// Drain up to `max_lines` of the oldest staged lines into the tiered
-    /// store (LZ4/zstd promotion for just that batch), then enforce the budget.
-    /// Returns the number of lines still staged, so the worker can loop. A
-    /// no-op (returns 0) with no backlog or no store; while the store is
-    /// detached for a reflow the staged lines are kept for the re-attach flush
-    /// (like [`drain_lazy_buffer`](Self::drain_lazy_buffer)).
-    ///
-    /// The caller must hold the term lock, like every `&mut Grid` mutation;
-    /// batches keep each hold short.
+    /// store (LZ4 promotion for just that batch) and return how many are still
+    /// staged, so the worker can loop. A no-op with no backlog; with no store
+    /// the staged lines are discarded, and while the store is detached for a
+    /// reflow they are kept for the re-attach flush. The caller holds the term
+    /// lock; batches keep each hold short.
     pub fn drain_lazy_bounded(&mut self, max_lines: usize) -> usize {
         // A drain is an opportunity too: the next trickle measures the stream
         // from here (see `trickle_lazy_bounded`).
@@ -891,12 +778,9 @@ impl Grid {
     }
 
     /// Epilogue for any bulk `push_line` sequence into tiered scrollback
-    /// (lazy-buffer drain, scrollback-reflow restore): enforce the memory
-    /// budget, then re-clamp the display offset.
+    /// (lazy-buffer drain, scrollback-reflow restore): `push_line` can evict
+    /// (line limit or memory pressure), so re-clamp the display offset.
     pub(crate) fn enforce_scrollback_budget_and_clamp(&mut self) {
-        // push_line can evict (line limit or memory pressure), so a scrolled-back
-        // display_offset may now exceed scrollback_lines(); clamp to keep the
-        // DisplayOffsetValid invariant.
         self.clamp_display_offset();
     }
 
@@ -906,19 +790,15 @@ impl Grid {
         self.mark_scroll_damage(n);
     }
 
-    /// Scroll content down by n lines (new empty lines at top).
-    ///
-    /// Shifts all visible rows down by `n` — test convenience wrapper
-    /// over [`scroll_region_down`]. Production code uses `scroll_region_down` directly.
+    /// Scroll content down by n lines (new empty lines at top): a test wrapper
+    /// over [`scroll_region_down`](Self::scroll_region_down).
     #[cfg(test)]
     pub(crate) fn scroll_down(&mut self, n: usize) {
         self.scroll_region_down(n);
     }
 
-    /// Scroll within scroll region: move content up (blank line at bottom of region).
-    ///
-    /// This is used when cursor is at bottom of scroll region and line feed is issued.
-    /// Only lines within the scroll region are affected.
+    /// Scroll the region's content up by `n` (blank lines at its bottom): a line
+    /// feed at the region's bottom. Only rows within the region move.
     ///
     /// REQUIRES: self.storage.scroll_region.top <= self.storage.scroll_region.bottom
     /// REQUIRES: self.storage.scroll_region.bottom < self.storage.visible_rows
@@ -926,25 +806,14 @@ impl Grid {
         if n == 0 {
             return;
         }
-        // Full-screen scrolls, including 1-row terminals, enter scrollback.
-        // Only non-full degenerate regions are no-ops.
-        //
-        // The fresh-session blank gate below does not apply to this full-screen
-        // path: archiving every scrolled row is xterm parity, and the Tier-1
+        // Full-screen scrolls, 1-row terminals included, enter scrollback with
+        // no fresh-session blank gate (that is the top-anchored region path's):
+        // archiving every scrolled row is xterm parity, and the conformance
         // bindings (`conformance_retention.rs`, `conformance_offload.rs`) model
-        // each full-screen scroll as one retained line
-        // (`ring_extras_len_equals_ring_buffer_scrollback` pins the ring growth).
-        // So a fresh session padding a blank screen with LFs mints blank
-        // scrollback here, as xterm does; the top-anchored region path gets
-        // the gate.
-        //
-        // The count is clamped to the screen, as xterm's `xtermScroll` and
-        // Alacritty's `scroll_up_relative` clamp it to the region: a scroll of
-        // a screenful or more leaves the screen blank and archives exactly that
-        // screenful. Unclamped, `CSI 65535 S` (8 bytes, the parser's ceiling)
-        // archived 65,535 rows, ~4 ms under the terminal lock each, so 16 KiB of
-        // program output held the lock — and the window's redraw — for seconds
-        // (hunt 7, 2026-10-09).
+        // each full-screen scroll as one retained line. The count is clamped to
+        // the screen, as xterm's `xtermScroll` clamps it to the region:
+        // unclamped, `CSI 65535 S` (8 bytes) would archive 65,535 rows at ~4 ms
+        // each under the lock.
         if self
             .storage
             .scroll_region
@@ -971,19 +840,13 @@ impl Grid {
         let n = n.min(region_size);
 
         // A full-width region rooted at row zero is a viewport with fixed rows
-        // below it (e.g. Codex's inline-history renderer). Rows displaced through
-        // the physical top still belong in primary-screen history.
-        //
+        // below it (e.g. Codex's inline-history renderer): rows displaced
+        // through the physical top still belong in primary-screen history.
         // `max_scrollback == 0` with no tiered store is the alternate-screen
-        // shape, where output stays ephemeral. A tiered grid may use a
-        // zero-sized ring, so store presence also enables archival.
-        //
-        // The one exception is the fresh-session blank band (see
-        // `fresh_session_blank_prefix`): while the grid holds no history, a
-        // leading run of blank displaced rows carries no transcript, and
-        // archiving it would create blank history a later rows-grow reveals as
-        // a dead band. Blank rows after the first written row, or once any
-        // history exists, are transcript and archive like any other row.
+        // shape, where output stays ephemeral; a tiered grid may use a
+        // zero-sized ring, so store presence also enables archival. The
+        // exception is the fresh-session blank band
+        // (`fresh_session_blank_prefix`).
         let history_enabled = self.storage.max_scrollback > 0
             || self.storage.scrollback.is_some()
             || self.storage.scrollback_detached_for_reflow;
@@ -1011,18 +874,14 @@ impl Grid {
     /// The non-archival region scroll: shift rows `[top..=bottom]` up by `n`
     /// within the viewport, BCE-fill the vacated bottom rows, and shift the
     /// region's `CellExtras`; history and `absolute_row_counter` are untouched.
-    /// The interior-region / history-free / fresh-session-blank path; the
-    /// archival top-anchored path is
-    /// [`Self::scroll_top_anchored_region_up_with_history`].
+    /// The archival path is [`Self::scroll_top_anchored_region_up_with_history`].
     ///
     /// REQUIRES: 0 < n <= bottom - top + 1, bottom < visible_rows,
-    /// display_offset == 0 (callers reset via
-    /// `reset_display_offset_with_damage`).
+    /// display_offset == 0.
     fn scroll_region_up_history_free(&mut self, top: usize, bottom: usize, n: usize) {
         debug_assert!(n > 0 && n <= bottom - top + 1);
         debug_assert!(bottom < usize::from(self.storage.visible_rows));
 
-        // Shift rows up within the region using pre-computed physical indices.
         self.storage.shift_visible_rows_up(top, bottom, n);
 
         // Clear the bottom n rows of the region with BCE fill, resetting line
@@ -1045,24 +904,19 @@ impl Grid {
         // Fill BCE RGB in vacated bottom rows after shift.
         self.fill_bce_rgb_rows(row_u16(bottom + 1 - n)..bottom_u16.saturating_add(1));
 
-        // Only the region's rows moved: record that band, and a selection is
-        // cleared iff it overlaps it (one anchored in scrollback survives).
-        // History and `absolute_row_counter` are untouched.
-        //
-        // The band record also carries the numbers: the region's rows went up
-        // by `n` and its top `n` rows left the band (see `RowBandMove`). An `n`
-        // past `i16` poisons the record rather than recording a wrong
-        // displacement.
+        // Only the region's rows moved: record that band (its rows went up by
+        // `n`, its top `n` rows left it; an `n` past `i16` poisons the record),
+        // and a selection is cleared iff it overlaps it (one anchored in
+        // scrollback survives).
         self.record_row_band_move_or_poison(top_u16, bottom_u16, n, false);
         self.damage_selection_visible_rows_ext(top_u16, bottom_u16, true);
-        // Mark only the scroll region rows as dirty, not the full screen.
         self.storage
             .mark_content_rows(top_u16, bottom_u16.saturating_add(1));
     }
 
-    /// Record rows `top..=bottom` moving by `n` rows — DOWN the screen when `down`,
-    /// UP otherwise — on this batch's band record, or poison the record when `n`
-    /// does not fit an `i16` displacement (see
+    /// Record rows `top..=bottom` moving by `n` rows (down the screen when
+    /// `down`) on this batch's band record, or poison the record when `n` does
+    /// not fit an `i16` displacement (see
     /// `GridPresentationState::record_row_band_move`).
     fn record_row_band_move_or_poison(&mut self, top: u16, bottom: u16, n: usize, down: bool) {
         match i16::try_from(n) {
@@ -1078,16 +932,13 @@ impl Grid {
 
     /// Length of the leading run of blank rows among the `n` viewport rows a
     /// scroll would displace through the physical top (rows `0..n`), but only
-    /// while the grid holds no history at all (`scrollback_lines() == 0`,
-    /// covering ring, lazy staging and tiered store); otherwise 0.
+    /// while the grid holds no history at all; otherwise 0.
     ///
-    /// `Row::len == 0` means blank, not never-written: a row erased with the
-    /// default background, or a separator a TUI prints as nothing, is also
-    /// len 0. Blank lines between written lines are transcript, so blankness
-    /// must never drop a row once anything has been archived. The safe case
-    /// is a brand-new grid scrolling before anything was archived: its
-    /// leading blanks separate nothing, and archiving them would create blank
-    /// history that a later rows-grow reveals above the content.
+    /// `Row::len == 0` means blank, not never-written: blank lines between
+    /// written lines are transcript, so blankness must never drop a row once
+    /// anything has been archived. A brand-new grid's leading blanks separate
+    /// nothing, and archived they would become blank history a later rows-grow
+    /// reveals above the content.
     fn fresh_session_blank_prefix(&self, n: usize) -> usize {
         if self.storage.scrollback_lines() > 0 {
             return 0;
@@ -1151,38 +1002,29 @@ impl Grid {
         self.storage
             .presentation
             .record_absolute_row_splice(insertion_at, u64::try_from(n).unwrap_or(u64::MAX));
-        // On screen this is one band move: rows `0..=bottom` went up by `n` (the
-        // top `n` entered history), the footer below `bottom` did not move. The
-        // splice above carries the history insertion point for absolute-row
-        // metadata; this carries the screen-row transform cursor-effects hosts
-        // need.
+        // On screen this is one band move: rows `0..=bottom` went up by `n`,
+        // the footer did not move. The splice above carries the history
+        // insertion point for absolute-row metadata; this carries the
+        // screen-row transform cursor-effects hosts need.
         self.record_row_band_move_or_poison(0, row_u16(bottom), n, false);
 
-        // The whole-grid archival step cannot be presented as a hardware scroll:
-        // the footer was restored in place. Force ordinary content invalidation.
-        // Selection remapping is piecewise for this path: content before the
-        // footer moves toward history while footer content stays at its screen
-        // row. `record_absolute_row_splice` retained an independent update for
-        // Terminal post-processing, so do not install the generic region-scroll
-        // clear sentinel here.
+        // The footer was restored in place, so this cannot be presented as a
+        // hardware scroll: plain content invalidation. Selection remapping is
+        // piecewise here and rides `record_absolute_row_splice`, so no
+        // region-scroll clear sentinel.
         self.storage
             .mark_content_rows(0, row_u16(bottom).saturating_add(1));
     }
 
-    /// Shift rows down within a region (backwards to avoid overwriting).
-    ///
-    /// Copies `n` rows downward within `[top..=bottom]`. Does NOT clear vacated
-    /// rows or shift extras — callers handle those steps.
-    /// Uses pre-computed physical indices for sequential access.
-    /// REQUIRES: display_offset == 0 (callers guarantee via reset_display_offset_with_damage).
+    /// Copy rows `[top..=bottom]` down by `n` (backwards, so nothing is
+    /// overwritten); callers clear the vacated rows and shift extras.
+    /// REQUIRES: display_offset == 0 (callers reset it first).
     pub(super) fn shift_rows_down(&mut self, top: usize, bottom: usize, n: usize) {
         self.storage.shift_visible_rows_down(top, bottom, n);
     }
 
-    /// Scroll within scroll region: move content down (blank line at top of region).
-    ///
-    /// This is used when cursor is at top of scroll region and reverse line feed is issued.
-    /// Only lines within the scroll region are affected.
+    /// Scroll the region's content down by `n` (blank lines at its top): a
+    /// reverse line feed at the region's top. Only rows within the region move.
     ///
     /// REQUIRES: self.storage.scroll_region.top <= self.storage.scroll_region.bottom
     /// REQUIRES: self.storage.scroll_region.bottom < self.storage.visible_rows
@@ -1225,24 +1067,18 @@ impl Grid {
         // Fill BCE RGB in vacated top rows after shift.
         self.fill_bce_rgb_rows(top_u16..row_u16(top + n));
 
-        // The region's rows are the selection damage; a reverse region scroll
-        // adds nothing to history, so the counter is untouched.
-        //
-        // The band record: the region's rows went down by `n`, its bottom `n`
-        // rows left the band. Consecutive reverse indices at a region top
-        // compose into one entry.
+        // A reverse region scroll adds nothing to history, so the counter is
+        // untouched. The band record: the region's rows went down by `n`, its
+        // bottom `n` rows left the band; consecutive reverse indices at a
+        // region top compose into one entry.
         self.record_row_band_move_or_poison(top_u16, bottom_u16, n, true);
         self.damage_selection_visible_rows_ext(top_u16, bottom_u16, true);
-        // Mark only the scroll region rows as dirty, not the full screen.
         self.storage
             .mark_content_rows(top_u16, bottom_u16.saturating_add(1));
     }
 
-    /// Rectangular scroll up within horizontal margins (DECLRMM + SU).
-    ///
-    /// When DECLRMM is active, SU only scrolls the cells within the horizontal
-    /// margin region on each row, leaving cells outside the margins untouched.
-    /// Blank cells fill the vacated positions at the bottom of the margin region.
+    /// Rectangular scroll up within horizontal margins (DECLRMM + SU): only the
+    /// cells inside the margins move, and blanks fill the vacated bottom.
     pub fn scroll_region_up_margined(&mut self, n: usize, left: u16, right: u16) {
         if n == 0 {
             return;
@@ -1261,31 +1097,34 @@ impl Grid {
         let right_usize = usize::from(right);
         let width = right_usize + 1 - left_usize;
 
-        // Copy cells from row (src_row) to row (dst_row) within [left, right].
-        // Process top-to-bottom so we don't overwrite source data.
-        // Hoist buffer outside loop to avoid per-row heap allocation.
+        // Top to bottom, so no source row is overwritten before it is read; one
+        // buffer serves every row.
         let cols = self.storage.cols as usize;
         let mut buf = vec![super::Cell::EMPTY; width];
         for dst_offset in 0..(region_size - n) {
             let dst_row = row_u16(top + dst_offset);
             let src_row = row_u16(top + dst_offset + n);
             buf.fill(super::Cell::EMPTY);
-            if let Some(src) = self.row(src_row) {
+            let src_hole = if let Some(src) = self.row(src_row) {
                 for (i, col) in (left_usize..=right_usize).enumerate() {
                     if let Some(c) = src.get(row_u16(col)) {
                         buf[i] = *c;
                     }
                 }
-            }
+                src.has_early_wrap_hole()
+            } else {
+                false
+            };
             if let Some(dst) = self.row_mut(dst_row) {
                 dst.overwrite_span(left_usize, &buf);
-                // Wide char fixup at rectangle boundaries. Whole-row rect copy:
-                // no per-cell authoritative signal, so keep the char==' ' spacer
-                // heuristic (true).
+                if right_usize + 1 >= cols {
+                    dst.set_early_wrap_hole(src_hole);
+                }
+                // Wide char fixup at the rectangle's edges: a whole-row copy has
+                // no per-cell signal, so the `char == ' '` spacer heuristic.
                 dst.fixup_wide_boundary(left_usize, right_usize, cols, true);
-                // The span copy bypasses len maintenance: blank source cells
-                // copied over the dst tail leave len stale-high (phantom trailing
-                // spaces). Recompute per modified row (never over-shrinks).
+                // The span copy bypasses len maintenance: blank source cells over
+                // the tail leave it stale-high, so recompute (never over-shrinks).
                 dst.recompute_len();
             }
         }
@@ -1294,6 +1133,9 @@ impl Grid {
         for clear_offset in (region_size - n)..region_size {
             let clear_row = row_u16(top + clear_offset);
             if let Some(r) = self.row_mut(clear_row) {
+                if right_usize + 1 >= cols {
+                    r.set_early_wrap_hole(false);
+                }
                 for col in left_usize..=right_usize {
                     if let Some(c) = r.get_mut(row_u16(col)) {
                         *c = fill;
@@ -1301,9 +1143,8 @@ impl Grid {
                 }
                 // Wide char fixup at rectangle boundaries.
                 r.fixup_wide_boundary(left_usize, right_usize, cols, true);
-                // The BCE fill via get_mut bypasses len maintenance: an empty
-                // cursor_template can orphan the tail, a colored one extends it.
-                // Recompute the true extent.
+                // The fill bypasses len maintenance (an empty template can
+                // orphan the tail, a coloured one extends it): recompute.
                 r.recompute_len();
             }
         }
@@ -1316,36 +1157,30 @@ impl Grid {
         self.storage
             .extras
             .shift_rect_up_by(top_u16, bottom_u16, left, right, row_u16(n));
-        // Fill BCE RGB in vacated bottom-right rect after shift.
+        // Fill BCE RGB in the vacated bottom rows of the rectangle.
         self.fill_bce_rgb_rect(
             row_u16(top + region_size - n)..bottom_u16.saturating_add(1),
             left..right.saturating_add(1),
         );
 
-        // The halves of pairs the rectangle's edges bisected, blanked by
-        // `fixup_wide_boundary`, drop their extras.
+        // Halves of pairs the rectangle's edges bisected (blanked by
+        // `fixup_wide_boundary`) drop their extras.
         for row in top_u16..=bottom_u16 {
             self.drop_unclaimed_extras(row, left.saturating_sub(1)..right.saturating_add(2));
         }
 
-        // A margined region scroll moves a rectangle, but the selection lattice
-        // is row-granular, so the band is the region's rows (wider than the
-        // rectangle, which is the safe direction).
-        //
-        // A rectangle is not a row translate (cells outside the margins
-        // stayed), so the band record is poisoned and hosts see a plain
-        // invalidation.
+        // The selection lattice is row-granular, so the band is the region's
+        // rows (wider than the rectangle: the safe direction). A rectangle is
+        // not a row translate, so the band record is poisoned and hosts see a
+        // plain invalidation.
         self.storage.presentation.poison_row_band_moves();
         self.damage_selection_visible_rows_ext(top_u16, bottom_u16, true);
         self.storage
             .mark_content_rows(top_u16, bottom_u16.saturating_add(1));
     }
 
-    /// Rectangular scroll down within horizontal margins (DECLRMM + SD).
-    ///
-    /// When DECLRMM is active, SD only scrolls the cells within the horizontal
-    /// margin region on each row, leaving cells outside the margins untouched.
-    /// Blank cells fill the vacated positions at the top of the margin region.
+    /// Rectangular scroll down within horizontal margins (DECLRMM + SD): only
+    /// the cells inside the margins move, and blanks fill the vacated top.
     pub fn scroll_region_down_margined(&mut self, n: usize, left: u16, right: u16) {
         if n == 0 {
             return;
@@ -1364,31 +1199,31 @@ impl Grid {
         let right_usize = usize::from(right);
         let width = right_usize + 1 - left_usize;
 
-        // Copy cells from row (src_row) to row (dst_row) within [left, right].
-        // Process bottom-to-top so we don't overwrite source data.
-        // Hoist buffer outside loop to avoid per-row heap allocation.
+        // Bottom to top, so no source row is overwritten before it is read.
         let cols = self.storage.cols as usize;
         let mut buf = vec![super::Cell::EMPTY; width];
         for dst_offset in (n..region_size).rev() {
             let dst_row = row_u16(top + dst_offset);
             let src_row = row_u16(top + dst_offset - n);
             buf.fill(super::Cell::EMPTY);
-            if let Some(src) = self.row(src_row) {
+            let src_hole = if let Some(src) = self.row(src_row) {
                 for (i, col) in (left_usize..=right_usize).enumerate() {
                     if let Some(c) = src.get(row_u16(col)) {
                         buf[i] = *c;
                     }
                 }
-            }
+                src.has_early_wrap_hole()
+            } else {
+                false
+            };
             if let Some(dst) = self.row_mut(dst_row) {
                 dst.overwrite_span(left_usize, &buf);
-                // Wide char fixup at rectangle boundaries. Whole-row rect copy:
-                // no per-cell authoritative signal, so keep the char==' ' spacer
-                // heuristic (true).
+                if right_usize + 1 >= cols {
+                    dst.set_early_wrap_hole(src_hole);
+                }
+                // The `char == ' '` spacer heuristic, as in the up scroll.
                 dst.fixup_wide_boundary(left_usize, right_usize, cols, true);
-                // The span copy bypasses len maintenance: blank source cells
-                // copied over the dst tail leave len stale-high (phantom trailing
-                // spaces). Recompute per modified row (never over-shrinks).
+                // Recompute the len the span copy left stale.
                 dst.recompute_len();
             }
         }
@@ -1397,16 +1232,16 @@ impl Grid {
         for clear_offset in 0..n {
             let clear_row = row_u16(top + clear_offset);
             if let Some(r) = self.row_mut(clear_row) {
+                if right_usize + 1 >= cols {
+                    r.set_early_wrap_hole(false);
+                }
                 for col in left_usize..=right_usize {
                     if let Some(c) = r.get_mut(row_u16(col)) {
                         *c = fill;
                     }
                 }
-                // Wide char fixup at rectangle boundaries.
                 r.fixup_wide_boundary(left_usize, right_usize, cols, true);
-                // The BCE fill via get_mut bypasses len maintenance: an empty
-                // cursor_template can orphan the tail, a colored one extends it.
-                // Recompute the true extent.
+                // The fill bypasses len maintenance: recompute the extent.
                 r.recompute_len();
             }
         }
@@ -1418,22 +1253,16 @@ impl Grid {
         self.storage
             .extras
             .shift_rect_down_by(top_u16, bottom_u16, left, right, row_u16(n));
-        // Fill BCE RGB in vacated top-left rect after shift.
+        // Fill BCE RGB in the vacated top rows of the rectangle.
         self.fill_bce_rgb_rect(top_u16..row_u16(top + n), left..right.saturating_add(1));
 
-        // The halves of pairs the rectangle's edges bisected, blanked by
-        // `fixup_wide_boundary`, drop their extras.
+        // Halves of pairs the rectangle's edges bisected drop their extras.
         for row in top_u16..=bottom_u16 {
             self.drop_unclaimed_extras(row, left.saturating_sub(1)..right.saturating_add(2));
         }
 
-        // A margined region scroll moves a rectangle, but the selection lattice
-        // is row-granular, so the band is the region's rows (wider than the
-        // rectangle, which is the safe direction).
-        //
-        // A rectangle is not a row translate (cells outside the margins
-        // stayed), so the band record is poisoned and hosts see a plain
-        // invalidation.
+        // Row-granular band and a poisoned band record, as in
+        // `scroll_region_up_margined`.
         self.storage.presentation.poison_row_band_moves();
         self.damage_selection_visible_rows_ext(top_u16, bottom_u16, true);
         self.storage
@@ -1458,8 +1287,8 @@ mod flood_cut_tests {
     const DEFAULT_BUDGET: usize = 100 * 1024 * 1024;
 
     /// A budget whose headroom holds fewer staged `L<n>` rows than the 20k
-    /// floor, so the staging cap IS the floor and a test-sized flood reaches
-    /// the drop path — the memory-bound case, where a cut is a loss (each test
+    /// floor, so the staging cap is the floor and a test-sized flood reaches
+    /// the drop path: the memory-bound case, where a cut is a loss (each test
     /// checks it with [`assert_floor_is_the_cap`]).
     const FLOOR_BUDGET: usize = 2 * 1024 * 1024;
 
@@ -1541,16 +1370,16 @@ mod flood_cut_tests {
         (total - 2).saturating_sub(limit)
     }
 
-    /// A LOWER bound on what one staged `L<n>` row weighs (`feed`'s rows run
-    /// 2..=7 cells; a recycled body can be larger, never smaller): what a
-    /// test budget is sized against, erring toward MORE rows fitting.
+    /// A lower bound on what one staged `L<n>` row weighs (`feed`'s rows run
+    /// 2..=7 cells; a recycled body can be larger, never smaller): what a test
+    /// budget is sized against, erring toward more rows fitting.
     fn staged_row_bytes() -> usize {
         std::mem::size_of::<super::super::scroll_convert::DeferredLine>()
             + 7 * std::mem::size_of::<crate::Cell>()
     }
 
     /// Precondition for the memory-bound tests: the store's headroom holds
-    /// fewer staged `L<n>` rows than the floor, so the FLOOR is the cap and a
+    /// fewer staged `L<n>` rows than the floor, so the floor is the cap and a
     /// test-sized flood reaches the drop path well inside the 100k limit.
     fn assert_floor_is_the_cap(grid: &Grid) {
         let store = grid.scrollback().expect("a tiered store");
@@ -1626,8 +1455,8 @@ mod flood_cut_tests {
         grid.assert_invariants();
     }
 
-    /// Write `n` numbered FULL-WIDTH rows `L{start}----…` (every cell
-    /// occupied), CR + text + LF each.
+    /// Write `n` numbered full-width rows `L{start}----…` (every cell occupied),
+    /// CR + text + LF each.
     fn feed_wide(grid: &mut Grid, start: usize, n: usize, cols: u16) {
         for i in start..start + n {
             grid.carriage_return();
@@ -1765,7 +1594,7 @@ mod flood_cut_tests {
             newest(25_000, 1).last().map(String::as_str),
             "the history still ends at the newest line"
         );
-        // Rendered as system chrome, not program output: DIM.
+        // Dim: system chrome, not program output.
         let marker = grid.get_history_line(BATCH).expect("marker row");
         assert!(
             marker.get_attr(0).flags & CellFlags::DIM.bits() != 0,
@@ -1782,11 +1611,9 @@ mod flood_cut_tests {
 
     #[test]
     fn a_cut_deeper_than_the_limit_names_only_what_the_limit_would_keep() {
-        // Memory-bound (the floor is the cap), flooding well past a 30k limit,
-        // with one batch promoted before the worker falls behind. The limit
-        // keeps the newest 30k lines, so the promoted batch and the oldest
-        // dropped lines are ordinary eviction: the batch leaves the store, and
-        // the marker (now the top) names only the missing lines inside the
+        // Memory-bound, flooding well past a 30k limit with one batch promoted
+        // first: the batch and the oldest dropped lines are ordinary eviction,
+        // and the marker (now the top) names only the lines missing inside the
         // limit.
         const LIMIT: usize = 30_000;
         const TOTAL: usize = 60_000;
@@ -1871,7 +1698,7 @@ mod flood_cut_tests {
             300
         );
 
-        // The flood resumes: a NEW cut opens behind the promoted lines, and the
+        // The flood resumes: a new cut opens behind the promoted lines, and the
         // two markers together are the whole loss.
         feed_numbered_lines(&mut grid, 22_000, 2_000);
         let hist = history_trimmed(&grid);
@@ -1892,10 +1719,10 @@ mod flood_cut_tests {
 
     #[test]
     fn ordinary_top_eviction_is_neither_counted_nor_marked() {
-        // A flood into a SMALL configured limit, the floor (20k) far above the
-        // store's share: every drop is a row the limit was always going to
-        // trim — including the batch the worker promoted mid-flood, which is
-        // evicted from the store's front rather than left above a hole.
+        // A flood into a small configured limit, the 20k floor far above the
+        // store's share: every drop is a row the limit would trim anyway, the
+        // batch promoted mid-flood included (evicted from the store's front,
+        // not left above a hole).
         let mut grid = flooded_grid(80, 8, FLOOR_BUDGET);
         assert_floor_is_the_cap(&grid);
         grid.set_scrollback_line_limit(Some(5_000));
@@ -2034,7 +1861,7 @@ mod flood_cut_tests {
         let (lost, markers) = slow_tail(50, false);
         assert_eq!(lost, 0, "the tail loses nothing once a batch outruns it");
         assert_eq!(markers.len(), 1, "one flood, one cut: {markers:?}");
-        // Negative control: the rule it replaces keeps dropping the tail.
+        // Negative control: the skip-while-cut rule keeps dropping the tail.
         let (lost, _) = slow_tail(50, true);
         assert_eq!(lost, 19 * 50, "skipping while cut drops every tail line");
     }

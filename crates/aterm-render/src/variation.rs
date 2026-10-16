@@ -14,8 +14,8 @@
 //! the user's `font_variation` / `font_weight` config, and apply the ONE
 //! resulting coordinate list everywhere a face is consumed — the CoreText
 //! descriptor (`kCTFontVariationAttribute`, via
-//! `CTFontDescriptorCreateCopyWithVariation`), the rustybuzz shaping face
-//! (`Face::set_variations`), and the ttf-parser metrics derivation
+//! `CTFontDescriptorCreateCopyWithVariation`), the run shaper's face
+//! (`aterm_font::Face::set_variation`), and the aterm-font metrics derivation
 //! (`Face::set_variation`, HVAR/MVAR-aware) — so raster, shaping and cell
 //! geometry can never disagree about which instance is on screen.
 //!
@@ -31,7 +31,7 @@
 //!
 //! PORTABLE RASTER (FONT-2): fontdue has no variation API, so the portable path
 //! (non-macOS, and `ATERM_RASTERIZER=fontdue`) cannot ask fontdue for an instance.
-//! [`varied_glyph_raster`] closes that gap: ttf-parser applies the resolved coords to
+//! [`varied_glyph_raster`] closes that gap: aterm-font applies the resolved coords to
 //! the glyph OUTLINE and a [`crate::raster`] coverage fill (nonzero winding + AA)
 //! rasterizes it, so the portable path now draws the RESOLVED instance — not the `fvar`
 //! default — matching the CoreText path's instance (grid geometry + shaping already
@@ -54,7 +54,7 @@ pub const BOLD_WGHT: f32 = 700.0;
 /// already on by default, remains its weight compensation).
 pub const DARK_NUDGE_ADVANCE_TOL_PX: f32 = 0.25;
 
-/// One `fvar` axis, normalized like ttf-parser does at parse: `min <= def <=
+/// One `fvar` axis, normalized like aterm-font does at parse: `min <= def <=
 /// max` by construction (`min = min(min, def)`, `max = max(max, def)`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct VfAxis {
@@ -191,16 +191,16 @@ pub fn dark_nudge_permitted(adv_nudged_px: f32, adv_default_px: f32) -> bool {
 }
 
 /// Parse face `index` of `bytes` for its variation facts: the `fvar` axes
-/// (via ttf-parser, which normalizes `min <= def <= max`) plus the `Regular`
+/// (via aterm-font, which normalizes `min <= def <= max`) plus the `Regular`
 /// named instance's coords (parsed from the raw `fvar` instance records —
-/// ttf-parser exposes axes only — with the subfamily name resolved through
+/// aterm-font exposes axes only — with the subfamily name resolved through
 /// the `name` table, case-insensitive). `None` for a non-variable or
 /// malformed face; a malformed INSTANCE array degrades to `regular_coords:
 /// None` (the wght=400 clamp then applies), never a panic — every read is
 /// bounds-checked.
 #[must_use]
 pub fn probe(bytes: &[u8], index: u32) -> Option<VfProbe> {
-    let face = ttf_parser::Face::parse(bytes, index).ok()?;
+    let face = aterm_font::Face::parse(bytes, index).ok()?;
     let axes: Vec<VfAxis> = face
         .variation_axes()
         .into_iter()
@@ -224,10 +224,10 @@ pub fn probe(bytes: &[u8], index: u32) -> Option<VfProbe> {
 /// The design-space coords of the named instance whose subfamily name is
 /// "Regular", from the raw `fvar` table (bounds-checked; `None` on any
 /// structural inconsistency).
-fn regular_instance_coords(face: &ttf_parser::Face<'_>, axis_count: usize) -> Option<Vec<f32>> {
+fn regular_instance_coords(face: &aterm_font::Face<'_>, axis_count: usize) -> Option<Vec<f32>> {
     let data = face
         .raw_face()
-        .table(ttf_parser::Tag::from_bytes(b"fvar"))?;
+        .table(aterm_font::Tag::from_bytes(b"fvar"))?;
     let u16_at = |off: usize| -> Option<u16> {
         Some(u16::from_be_bytes([*data.get(off)?, *data.get(off + 1)?]))
     };
@@ -272,7 +272,7 @@ fn regular_instance_coords(face: &ttf_parser::Face<'_>, axis_count: usize) -> Op
 
 /// Whether `name` record `name_id` decodes to "Regular" (case-insensitive,
 /// trimmed) in any Unicode-encoded entry.
-fn name_is_regular(face: &ttf_parser::Face<'_>, name_id: u16) -> bool {
+fn name_is_regular(face: &aterm_font::Face<'_>, name_id: u16) -> bool {
     face.names().into_iter().any(|n| {
         n.name_id == name_id
             && n.is_unicode()
@@ -281,7 +281,7 @@ fn name_is_regular(face: &ttf_parser::Face<'_>, name_id: u16) -> bool {
     })
 }
 
-/// Coordinate-applied face metrics in device px, derived through ttf-parser
+/// Coordinate-applied face metrics in device px, derived through aterm-font
 /// with every `(tag, value)` coord set (HVAR advances; MVAR / typo-aware
 /// vertical metrics — `Face::ascender` prefers the OS/2 typo metrics when
 /// the face sets `USE_TYPO_METRICS`, the same law `geometry_metrics`
@@ -297,10 +297,70 @@ pub struct VariedMetricsPx {
     pub m_advance: f32,
 }
 
+/// The same metrics in the face's own units, before any size is applied:
+/// what [`VariedMetricsPx`] is derived from at every px
+/// ([`VariedMetricsUnits::at_px`]). Two instances with EQUAL units have equal
+/// px metrics at every px — the one derivation of equal inputs — so a cell box
+/// derived from them is the same at every size a window can ask for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VariedMetricsUnits {
+    pub units_per_em: u16,
+    pub ascent: i16,
+    /// NEGATIVE below the baseline.
+    pub descent: i16,
+    pub line_gap: i16,
+    pub m_advance: u16,
+}
+
+impl VariedMetricsUnits {
+    /// These metrics at `px`. `None` for a degenerate `units_per_em` or a
+    /// non-finite size.
+    #[must_use]
+    pub fn at_px(self, px: f32) -> Option<VariedMetricsPx> {
+        let upem = f32::from(self.units_per_em);
+        if upem <= 0.0 || !px.is_finite() {
+            return None;
+        }
+        let scale = px / upem;
+        Some(VariedMetricsPx {
+            ascent: f32::from(self.ascent) * scale,
+            descent: f32::from(self.descent) * scale,
+            line_gap: f32::from(self.line_gap) * scale,
+            m_advance: f32::from(self.m_advance) * scale,
+        })
+    }
+}
+
+/// Measure [`VariedMetricsUnits`] for face `index` of `bytes` with `coords`
+/// applied. `None` when the face is malformed or has no `'M'`.
+#[must_use]
+pub fn varied_metrics_units(
+    bytes: &[u8],
+    index: u32,
+    coords: &[(u32, f32)],
+) -> Option<VariedMetricsUnits> {
+    let mut face = aterm_font::Face::parse(bytes, index).ok()?;
+    for &(tag, value) in coords {
+        // `None` here means "not variable / no such axis" — the axis list the
+        // coords were resolved against came from this same face, so ignore a
+        // (theoretically unreachable) miss rather than failing the metrics.
+        let _ = face.set_variation(aterm_font::Tag(tag), value);
+    }
+    let gid = face.glyph_index('M')?;
+    Some(VariedMetricsUnits {
+        units_per_em: face.units_per_em(),
+        ascent: face.ascender(),
+        descent: face.descender(),
+        line_gap: face.line_gap(),
+        m_advance: face.glyph_hor_advance(gid)?,
+    })
+}
+
 /// Measure [`VariedMetricsPx`] for face `index` of `bytes` at `px` with
-/// `coords` applied. `None` when the face is malformed, has no `'M'`, or a
-/// degenerate `units_per_em` — the caller falls back to the unvaried
-/// (fontdue) metrics, so this is always a safe enhancement.
+/// `coords` applied: [`varied_metrics_units`] at `px`. `None` when the face
+/// is malformed, has no `'M'`, or a degenerate `units_per_em` — the caller
+/// falls back to the unvaried (fontdue) metrics, so this is always a safe
+/// enhancement.
 #[must_use]
 pub fn varied_metrics_px(
     bytes: &[u8],
@@ -308,26 +368,7 @@ pub fn varied_metrics_px(
     coords: &[(u32, f32)],
     px: f32,
 ) -> Option<VariedMetricsPx> {
-    let mut face = ttf_parser::Face::parse(bytes, index).ok()?;
-    for &(tag, value) in coords {
-        // `None` here means "not variable / no such axis" — the axis list the
-        // coords were resolved against came from this same face, so ignore a
-        // (theoretically unreachable) miss rather than failing the metrics.
-        let _ = face.set_variation(ttf_parser::Tag(tag), value);
-    }
-    let upem = f32::from(face.units_per_em());
-    if upem <= 0.0 || !px.is_finite() {
-        return None;
-    }
-    let scale = px / upem;
-    let gid = face.glyph_index('M')?;
-    let m_advance = f32::from(face.glyph_hor_advance(gid)?) * scale;
-    Some(VariedMetricsPx {
-        ascent: f32::from(face.ascender()) * scale,
-        descent: f32::from(face.descender()) * scale,
-        line_gap: f32::from(face.line_gap()) * scale,
-        m_advance,
-    })
+    varied_metrics_units(bytes, index, coords)?.at_px(px)
 }
 
 /// FONT-2: rasterize glyph `gid` of face `index` at `px` with `coords` (the resolved
@@ -335,7 +376,7 @@ pub fn varied_metrics_px(
 /// `(width, height, xmin, ymin, advance_width, coverage)`. This closes the portable
 /// raster's variation gap — fontdue has no variation API, so off macOS (or under
 /// `ATERM_RASTERIZER=fontdue`) a variable primary would draw only its `fvar` DEFAULT
-/// instance; here ttf-parser applies the coords to the OUTLINE and a coverage
+/// instance; here aterm-font applies the coords to the OUTLINE and a coverage
 /// rasterizer (nonzero winding + AA) fills it, so text renders at the resolved weight.
 ///
 /// Metrics match fontdue's convention so the tuple drops into the raster path: `xmin`
@@ -358,10 +399,10 @@ pub fn varied_glyph_raster(
 /// A face parsed ONCE with its variation coords applied — the amortized form of
 /// [`varied_glyph_raster`] for a caller that rasters MANY glyphs of one instance
 /// (a shaped label, a specimen line): one `Face::parse` + coord replay per run
-/// instead of per glyph, without the caller taking a `ttf_parser` dependency of
+/// instead of per glyph, without the caller taking an `aterm_font` dependency of
 /// its own. Each raster is byte-identical to the byte-slice wrapper's.
 pub struct VariedFace<'a> {
-    face: ttf_parser::Face<'a>,
+    face: aterm_font::Face<'a>,
 }
 
 impl<'a> VariedFace<'a> {
@@ -370,9 +411,9 @@ impl<'a> VariedFace<'a> {
     /// malformed face.
     #[must_use]
     pub fn parse(bytes: &'a [u8], index: u32, coords: &[(u32, f32)]) -> Option<Self> {
-        let mut face = ttf_parser::Face::parse(bytes, index).ok()?;
+        let mut face = aterm_font::Face::parse(bytes, index).ok()?;
         for &(tag, value) in coords {
-            let _ = face.set_variation(ttf_parser::Tag(tag), value);
+            let _ = face.set_variation(aterm_font::Tag(tag), value);
         }
         Some(Self { face })
     }
@@ -388,6 +429,35 @@ impl<'a> VariedFace<'a> {
     ) -> Option<(usize, usize, i32, i32, f32, Vec<u8>)> {
         varied_glyph_raster_with_face(&self.face, gid, px)
     }
+
+    /// Glyph `gid`'s LINEAR advance at `px` on this instance: exactly the bits
+    /// [`Self::glyph_raster`] reports for it, which is what lets the grid-fitted
+    /// raster ([`crate::hinted`]) report an advance identical to the unhinted
+    /// one at the same instance. `None` on a degenerate size.
+    #[cfg(any(
+        all(unix, not(target_os = "macos")),
+        windows,
+        all(test, feature = "embedded-font", target_os = "macos")
+    ))]
+    pub(crate) fn linear_advance(&self, gid: u16, px: f32) -> Option<f32> {
+        let scale = px_scale(&self.face, px)?;
+        Some(linear_advance(&self.face, aterm_font::GlyphId(gid), scale))
+    }
+}
+
+/// `px / units_per_em`: the one scale every unhinted raster and linear advance
+/// in this module multiplies design units by. `None` for a degenerate size or
+/// `units_per_em`.
+fn px_scale(face: &aterm_font::Face, px: f32) -> Option<f32> {
+    let upem = f32::from(face.units_per_em());
+    (upem > 0.0 && px.is_finite() && px > 0.0).then(|| px / upem)
+}
+
+/// Glyph `g`'s linear advance at `scale`: the face's `hmtx` advance (with
+/// `HVAR` applied at the face's coordinates; `0` past the table) times `scale`
+/// — the same product `font::Font` reports for a static face.
+fn linear_advance(face: &aterm_font::Face, g: aterm_font::GlyphId, scale: f32) -> f32 {
+    f32::from(face.glyph_hor_advance(g).unwrap_or(0)) * scale
 }
 
 /// [`varied_glyph_raster`] on an ALREADY-PARSED face — the hot-path form. The
@@ -401,17 +471,13 @@ impl<'a> VariedFace<'a> {
 /// `ligature_shaping::RowShaper::new`.)
 #[must_use]
 pub fn varied_glyph_raster_with_face(
-    face: &ttf_parser::Face,
+    face: &aterm_font::Face,
     gid: u16,
     px: f32,
 ) -> Option<(usize, usize, i32, i32, f32, Vec<u8>)> {
-    let upem = f32::from(face.units_per_em());
-    if upem <= 0.0 || !px.is_finite() || px <= 0.0 {
-        return None;
-    }
-    let scale = px / upem;
-    let g = ttf_parser::GlyphId(gid);
-    let advance = f32::from(face.glyph_hor_advance(g).unwrap_or(0)) * scale;
+    let scale = px_scale(face, px)?;
+    let g = aterm_font::GlyphId(gid);
+    let advance = linear_advance(face, g, scale);
     // No bounding box ⇒ a blank glyph (e.g. space): 0×0 raster, advance only.
     let Some(bbox) = face.glyph_bounding_box(g) else {
         return Some((0, 0, 0, 0, advance, Vec::new()));
@@ -518,7 +584,7 @@ pub(crate) fn crop_padded_coverage(ras: &crate::raster::Rasterizer, w: usize, h:
     cov
 }
 
-/// Feeds a ttf-parser glyph outline (design units, y-UP) into a [`crate::raster`]
+/// Feeds an aterm-font glyph outline (design units, y-UP) into a [`crate::raster`]
 /// coverage grid (pixels, y-DOWN, origin at the ink box's top-left).
 struct OutlineToRaster<'a> {
     ras: &'a mut crate::raster::Rasterizer,
@@ -544,7 +610,7 @@ impl OutlineToRaster<'_> {
     }
 }
 
-impl ttf_parser::OutlineBuilder for OutlineToRaster<'_> {
+impl aterm_font::OutlineSink for OutlineToRaster<'_> {
     fn move_to(&mut self, x: f32, y: f32) {
         self.close_contour();
         let p = self.map(x, y);
@@ -574,46 +640,32 @@ impl ttf_parser::OutlineBuilder for OutlineToRaster<'_> {
     }
 }
 
-/// TEST-ONLY candidacy scan shared by the two FONT-2 variation tests (here and the
-/// end-to-end fontdue-path test in `lib.rs`): find a wght-axis variable font AND a
-/// common glyph that actually LAYS INK at the axis-min instance. A font qualifying on
-/// the axis alone is NOT enough — macOS ships special-purpose VFs (e.g.
-/// `ADTNumeric.ttc`) whose cmap maps letters to BLANK glyphs, so a first-axis-hit pick
-/// would assert weight-variation on a glyph with no outline (a legitimate 0×0 raster
-/// at every instance). Returns `(bytes, wght, char, gid)` of the first font whose
-/// candidate glyph inks.
+/// TEST-ONLY: the checked-in variable face (`assets/game/Cinzel-var.ttf`, OFL) with
+/// its `wght` axis and a common glyph that LAYS INK at the axis-min instance, for the
+/// FONT-2 variation tests (here and the end-to-end fontdue-path test in `lib.rs`): the
+/// same face on every host, so no test depends on what the machine has installed.
+/// Returns `(bytes, wght, char, gid)`.
 #[cfg(test)]
-pub(crate) fn inked_wght_font() -> Option<(Vec<u8>, VfAxis, char, u16)> {
-    for path in crate::font_files() {
-        if std::fs::metadata(&path).map_or(u64::MAX, |m| m.len()) > 16 * 1024 * 1024 {
-            continue;
-        }
-        let Ok(bytes) = std::fs::read(&path) else {
-            continue;
-        };
-        let Some(p) = probe(&bytes, 0) else { continue };
-        let Some(ax) = p.axes.iter().find(|a| a.tag == WGHT_TAG).copied() else {
-            continue;
-        };
-        if ax.max <= ax.min {
-            continue;
-        }
-        let Ok(face) = ttf_parser::Face::parse(&bytes, 0) else {
-            continue;
-        };
-        for c in ['M', 'o', 'n', '0'] {
-            let Some(gid) = face.glyph_index(c).map(|g| g.0).filter(|&g| g != 0) else {
-                continue;
-            };
-            // Candidacy: the min-instance raster must exist AND carry ink.
-            if varied_glyph_raster(&bytes, 0, &[(WGHT_TAG, ax.min)], gid, 64.0)
+pub(crate) fn inked_wght_font() -> (Vec<u8>, VfAxis, char, u16) {
+    let bytes = include_bytes!("../assets/game/Cinzel-var.ttf").to_vec();
+    let ax = probe(&bytes, 0)
+        .and_then(|p| p.axes.iter().find(|a| a.tag == WGHT_TAG).copied())
+        .expect("Cinzel-var carries a wght axis");
+    assert!(
+        ax.max > ax.min,
+        "Cinzel-var's wght axis spans a range: {ax:?}"
+    );
+    let inked = {
+        let face = aterm_font::Face::parse(&bytes, 0).expect("Cinzel-var parses");
+        ['M', 'o', 'n', '0'].into_iter().find_map(|c| {
+            let gid = face.glyph_index(c).map(|g| g.0).filter(|&g| g != 0)?;
+            varied_glyph_raster(&bytes, 0, &[(WGHT_TAG, ax.min)], gid, 64.0)
                 .is_some_and(|(_, _, _, _, _, cov)| cov.iter().any(|&b| b > 0))
-            {
-                return Some((bytes, ax, c, gid));
-            }
-        }
-    }
-    None
+                .then_some((c, gid))
+        })
+    };
+    let (c, gid) = inked.expect("Cinzel-var lays ink at its wght minimum");
+    (bytes, ax, c, gid)
 }
 
 #[cfg(test)]
@@ -623,22 +675,15 @@ mod tests {
     /// FONT-2: the portable outline raster ACTUALLY applies the variation coords — the
     /// `wght`-min and `wght`-max instances of the same glyph produce DIFFERENT coverage.
     /// (The pre-FONT-2 fontdue path drew the `fvar` default regardless, so the two would
-    /// be byte-identical.) Host-portable: skips cleanly if no variable font with an
-    /// INKED common glyph is installed (see [`inked_wght_font`] — a blank-glyph VF like
-    /// ADTNumeric must not be picked; its 0×0-at-every-instance raster is correct).
+    /// be byte-identical.) Over the checked-in variable face ([`inked_wght_font`]).
     #[test]
     fn varied_raster_reflects_the_weight_axis() {
-        let Some((bytes, wght, _, gid)) = inked_wght_font() else {
-            eprintln!("SKIP: no variable font with a wght axis + an inked glyph on this host");
-            return;
-        };
+        let (bytes, wght, _, gid) = inked_wght_font();
         let px = 64.0;
-        let light = varied_glyph_raster(&bytes, 0, &[(WGHT_TAG, wght.min)], gid, px);
-        let heavy = varied_glyph_raster(&bytes, 0, &[(WGHT_TAG, wght.max)], gid, px);
-        let (Some(l), Some(h)) = (light, heavy) else {
-            eprintln!("SKIP: raster declined for this font");
-            return;
-        };
+        let l = varied_glyph_raster(&bytes, 0, &[(WGHT_TAG, wght.min)], gid, px)
+            .expect("the light instance rasters");
+        let h = varied_glyph_raster(&bytes, 0, &[(WGHT_TAG, wght.max)], gid, px)
+            .expect("the heavy instance rasters");
         // Different instance ⇒ different raster (dims and/or coverage). This is the whole
         // point of FONT-2: the coords reach the OUTLINE, not just the metrics.
         let differ = (l.0, l.1) != (h.0, h.1) || l.5 != h.5;
@@ -723,7 +768,7 @@ mod tests {
     fn varied_raster_is_invariant_to_grid_slack() {
         const SLACK: usize = 4;
         let bytes = crate::embedded_font();
-        let face = ttf_parser::Face::parse(bytes, 0).expect("the bundled face parses");
+        let face = aterm_font::Face::parse(bytes, 0).expect("the bundled face parses");
         let upem = f32::from(face.units_per_em());
         let mut checked = 0usize;
         for pxi in 12..=40u32 {
@@ -795,31 +840,19 @@ mod tests {
     }
 
     /// A blank glyph (no outline) rasters to a 0x0 tile carrying just the advance —
-    /// never a panic or a phantom bitmap.
+    /// never a panic or a phantom bitmap. Over the bundled JetBrains Mono's space.
     #[test]
     fn varied_raster_blank_glyph_is_zero_sized() {
-        // Build the request against whatever variable font exists; assert the space
-        // glyph (if present) yields an empty raster with a positive advance.
-        for path in crate::font_files() {
-            if std::fs::metadata(&path).map_or(u64::MAX, |m| m.len()) > 16 * 1024 * 1024 {
-                continue;
-            }
-            let Ok(bytes) = std::fs::read(&path) else {
-                continue;
-            };
-            let Ok(face) = ttf_parser::Face::parse(&bytes, 0) else {
-                continue;
-            };
-            let Some(sp) = face.glyph_index(' ').filter(|g| g.0 != 0) else {
-                continue;
-            };
-            if let Some((w, h, _, _, adv, cov)) = varied_glyph_raster(&bytes, 0, &[], sp.0, 32.0) {
-                assert_eq!((w, h), (0, 0), "space has no ink box");
-                assert!(cov.is_empty(), "no coverage for a blank glyph");
-                assert!(adv >= 0.0, "advance is finite and non-negative");
-                return; // one real font is enough
-            }
-        }
-        eprintln!("SKIP: no font with a space glyph to probe");
+        let bytes = include_bytes!("../assets/bundled/JetBrainsMono-Regular.ttf");
+        let face = aterm_font::Face::parse(bytes, 0).expect("the bundled face parses");
+        let sp = face
+            .glyph_index(' ')
+            .filter(|g| g.0 != 0)
+            .expect("the bundled face maps a space");
+        let (w, h, _, _, adv, cov) =
+            varied_glyph_raster(bytes, 0, &[], sp.0, 32.0).expect("the space rasters");
+        assert_eq!((w, h), (0, 0), "space has no ink box");
+        assert!(cov.is_empty(), "no coverage for a blank glyph");
+        assert!(adv >= 0.0, "advance is finite and non-negative");
     }
 }

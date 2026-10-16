@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Test-only: the strain engine's invariants (design §10.14, rulings
-//! 206–212) — FELT, HEAVY with its hysteresis, NAMED over the grouped
-//! sweep, NOT OWN, the episode's state machine, the quiet periods, the record
-//! cap, the closed words, and the level meter on the glass.
+//! Test-only: the strain engine's invariants: felt, heavy with its
+//! hysteresis, named over the grouped sweep, not own, the episode's state
+//! machine, the quiet periods, the record cap, the closed words, and the level
+//! meter on the glass.
 
 use std::collections::HashMap;
 
@@ -330,11 +330,11 @@ impl Sim {
 const EVERY: u64 = 150;
 /// A key under load.
 const SLOW: u32 = 120;
-/// A key on this m1 today: its measured p95.
+/// A key at an unloaded Mac's measured p95.
 const FAST: u32 = 23;
 
-/// The machine as it was when the spec was written: `fileproviderd` at 1.3
-/// cores, a load average of 4.4 (never an input), keys at their p95.
+/// An ordinary busy machine: `fileproviderd` at 1.3 cores, a load average of
+/// 4.4 (never an input), keys at their p95.
 #[test]
 fn todays_snapshot_raises_nothing() {
     let mut s = Sim::new();
@@ -354,10 +354,9 @@ fn a_lone_hitch_never_leaves_calm() {
     s.run(6000, &World::calm(), Some((EVERY, FAST)));
     assert_eq!(s.t.state_word(), "calm");
     assert!(s.outs.is_empty());
-    // ONE stall is one hitch however it is seen: a 900
-    // ms freeze with a key typed into it — the key's arrival-to-present
-    // slice waited out that same turn — and two keys typed into one 600 ms
-    // stall, freeze and all, never leave calm.
+    // One stall is one hitch however it is seen: a 900 ms freeze with a key
+    // typed into it, and two keys typed into one 600 ms stall, freeze and
+    // all, never leave calm.
     s.run(10_000, &World::calm(), Some((EVERY, FAST)));
     s.t.note_freeze(s.at(10_000), 900, "window_event");
     s.t.note_key(s.at(10_010), 900);
@@ -372,7 +371,7 @@ fn a_lone_hitch_never_leaves_calm() {
     s.t.note_freeze(s.at(20_000), 600, "window_event");
     assert_eq!(s.t.state_word(), "calm", "two keys in one stall");
     assert!(s.outs.is_empty(), "{:?}", s.outs);
-    // A short turn is no hitch at all; two long ones in the window are FELT.
+    // A short turn is no hitch at all; two long ones in the window are felt.
     s.run(30_000, &World::calm(), Some((EVERY, FAST)));
     s.t.note_freeze(s.at(30_000), FREEZE_MS - 1, "x");
     s.t.note_freeze(s.at(30_500), FREEZE_MS - 1, "x");
@@ -451,7 +450,7 @@ fn posts_after_onset_and_two_heavy_readings_not_before() {
         "one navigation to the program the title names (ruling 243)"
     );
 
-    // One heavy reading is not HEAVY: a two-second spike under slow typing
+    // One heavy reading is not heavy: a two-second spike under slow typing
     // raises nothing.
     let mut s = Sim::new();
     s.run(4000, &World::calm(), Some((EVERY, SLOW)));
@@ -501,7 +500,7 @@ fn missing_fields_never_imply_heavy() {
     s.run(60_000, &w, Some((EVERY, SLOW)));
     assert_eq!(s.t.verdict(), None);
     assert!(s.posts().is_empty(), "{:?}", s.outs);
-    // The episode ends as FELT with nothing heavy.
+    // The episode ends as felt with nothing heavy.
     s.run(80_000, &w, Some((EVERY, FAST)));
     let recs = s.records();
     assert_eq!(recs.len(), 1, "{:?}", s.outs);
@@ -713,7 +712,7 @@ fn culprit_swap_needs_two_scans() {
     let chrome = World::loaded(vec![app(700, "Google Chrome", 7800, 2)], 1000);
     let start = s.ms;
     s.run(start + 4000, &chrome, Some((EVERY, SLOW)));
-    // The first sweep after the change: Chrome leads once.
+    // Through the first sweep after the change the title is still `yes`'s.
     let titles: Vec<String> = s.restates().iter().map(|(_, m)| m.title.clone()).collect();
     assert!(
         titles.iter().all(|t| t == "Typing slowed by 'yes'"),
@@ -731,8 +730,7 @@ fn culprit_swap_needs_two_scans() {
         "two sweeps: {}",
         swapped[0].0 - start
     );
-    // The sweep that straddled the change credited `yes`'s vanished time to
-    // the services once; one lead is not a swap.
+    // The services never lead in between, and one lead is not a swap.
     assert!(
         s.restates()
             .iter()
@@ -802,10 +800,9 @@ fn only_escalation_breaks_quiet() {
     );
 }
 
-/// Ruling 247: a memory row claims only what was read.
-/// An episode entered on Critical pressure alone — no swap, no used figure
-/// (`Reading::mem_used_mib` is `None`) — never says `memory full ·
-/// swapping`; with a used figure it says that; swapping says swapping.
+/// A memory row claims only what was read: an episode entered on Critical
+/// pressure alone (no swap, no `Reading::mem_used_mib`) says nothing, never
+/// `memory full · swapping`; a used figure says the figure; swapping says so.
 #[test]
 fn memory_stats_claim_only_what_was_measured() {
     let stats_of = |used: Option<u16>, swap: u64| {
@@ -877,7 +874,7 @@ fn glass_cap_two_minutes_min_six_seconds() {
 }
 
 /// The measured level on the glass: the whole row, no percent, no ETA, no
-/// glint; it glides up AND down; it never completes (a resolve is refused,
+/// glint; it glides up and down; it never completes (a resolve is refused,
 /// every echo is a Vanish); and it is never carried.
 #[test]
 fn a_level_meter_glides_both_ways_and_never_completes() {
@@ -927,7 +924,7 @@ fn a_level_meter_glides_both_ways_and_never_completes() {
         );
     }
     // Down, then up: each restate glides from the fill shown, over a span
-    // that scales with the distance (ruling 245).
+    // that scales with the distance.
     let restate = |c: &mut MessageCenter, pm: u16, at: Instant| {
         c.restate(
             id,
@@ -1248,7 +1245,7 @@ fn the_switch_off_parks_and_arms_nothing() {
     assert_eq!(s.t.next_sample(now, OPEN), None);
 }
 
-/// With the glass off (the records-only rollout) an episode is a record.
+/// With the glass off an episode is a record.
 #[test]
 fn records_only_writes_the_episode_and_posts_nothing() {
     let mut s = Sim::with(StrainConfig {
@@ -1299,8 +1296,8 @@ fn grouping_follows_the_first_match() {
     assert_eq!(find(&Culprit::App("Google Chrome".into())), Some(12));
     assert_eq!(find(&Culprit::Family(Family::FileSync)), Some(3));
     assert_eq!(find(&Culprit::Services), Some(2));
-    // Tab 2's foreground `yes` is not what burns there: `cc` under `make`
-    // is, and the session is named by it (ruling 207, amended live).
+    // Tab 2's foreground `yes` is not what burns there: `cc` under `make` is,
+    // and the session is named by it.
     assert_eq!(
         find(&Culprit::Session {
             program: "cc".into(),
@@ -1318,14 +1315,12 @@ fn grouping_follows_the_first_match() {
     assert_eq!(Load::Memory.words(), "memory full");
 }
 
-/// The live gate's own scenario (found live on this m1, 2026-09-24): twelve
-/// `yes &` at a zsh prompt leave zsh as tab 2's FOREGROUND program, and the
-/// band said `Typing slowed by zsh in tab 2` — an idle shell blamed. A
-/// session is named by what is heavy under it: the foreground program when
+/// A session is named by what is heavy under it: the foreground program when
 /// the heaviest process is it or runs under it (`cargo`, not its `rustc`),
-/// else the heaviest process itself (`yes`; a background build under a
-/// foreground editor is `rustc`, never `vim`). Two panes of one tab that
-/// come to say the same words are one group.
+/// else the heaviest process itself (twelve `yes &` at a zsh prompt are
+/// `yes`, never the idle `zsh`; a background build under a foreground editor
+/// is `rustc`, never `vim`). Two panes of one tab that come to say the same
+/// words are one group.
 #[test]
 fn a_session_is_named_by_what_is_heavy_under_it() {
     let at_prompt = |program: &str| {
@@ -1395,7 +1390,7 @@ fn a_session_is_named_by_what_is_heavy_under_it() {
     ]);
     assert_eq!(named(&two, &panes), [("yes".to_string(), 1300)]);
 
-    // End to end: the tracker titles the prompt's load `'yes'` (its tab is the capsule's).
+    // End to end: the tracker titles the prompt's load `'yes'`.
     let mut s = Sim::new();
     s.sessions = at_prompt("zsh");
     let calm = World::calm();
@@ -1407,14 +1402,9 @@ fn a_session_is_named_by_what_is_heavy_under_it() {
     assert_eq!(posts[0].1.title, "Typing slowed by 'yes'");
 }
 
-/// Found live (2026-09-24): twelve `yes` killed between two sweeps took
-/// their window's time with them, the services' subtraction took it, and
-/// the live row read `top: macOS services 7.5 cores` under `Typing slowed
-/// by 'yes' (tab 2)`; the episode's record then carried the calm machine's
-/// last sweep (`macOS services 0.6 cores · aterm 0.2`), which never named
-/// what slowed the typing. A sweep that busy processes exited inside is a
-/// baseline only, and a clearing machine's sweeps never replace a loaded
-/// one's `top:` line.
+/// Busy processes exiting inside a sweep's window never hand their time to
+/// the services: such a sweep is a baseline only, and a clearing machine's
+/// sweeps never replace a loaded one's `top:` line on the row or the record.
 #[test]
 fn exits_never_hand_the_services_the_culprits_time() {
     let mut s = Sim::new();
@@ -1453,11 +1443,10 @@ fn exits_never_hand_the_services_the_culprits_time() {
     );
 }
 
-/// A build's compilers start and exit every sweep. The
-/// exits' time is credited, at their last rate, to the group they belonged
-/// to — never thrown away with the whole sweep (the build was never named:
-/// `Typing slowed by CPU load`), never handed to the services. A steady
-/// stream of one-core children under `cargo` in tab 2 names `cargo`.
+/// A build's compilers start and exit every sweep: the exits' time is credited
+/// at their last rate to their own group, never thrown away with the whole
+/// sweep, never handed to the services. A steady stream of one-core children
+/// under `cargo` in tab 2 names `cargo`.
 #[test]
 fn churning_children_still_name_their_session() {
     let mut s = Sim::new();
@@ -1492,10 +1481,9 @@ fn churning_children_still_name_their_session() {
     }
 }
 
-/// A leader whose share hovers at the NAMED line (1 core
-/// and 40 % of the busy time) never flips the title between the culprit and
-/// the resource scan by scan: while a row shows, NAMED changes like a
-/// culprit does — after two scans that agree.
+/// A leader whose share hovers at the named line never flips the title
+/// between the culprit and the resource scan by scan: while a row shows, the
+/// flag changes as a culprit does, after two scans that agree.
 #[test]
 fn the_named_flag_changes_only_after_two_scans() {
     let c = Culprit::Process("yes".into());
@@ -1520,10 +1508,9 @@ fn the_named_flag_changes_only_after_two_scans() {
     assert_eq!(l.now, Some((c, false)));
 }
 
-/// A Suspect always outlives [`STRAIN_RECORD_AFTER`]
-/// before it ends, so the record's line is how long typing was FELT slow: a
-/// blip felt for under five seconds writes nothing (and spends none of the
-/// cap); one felt longer writes its record.
+/// A Suspect always outlives [`STRAIN_RECORD_AFTER`], so the record's line is
+/// how long typing was felt slow: a blip felt for under five seconds writes
+/// nothing (and spends none of the cap); one felt longer writes its record.
 #[test]
 fn a_suspect_felt_under_five_seconds_writes_no_record() {
     let mut s = Sim::new();
@@ -1547,10 +1534,9 @@ fn a_suspect_felt_under_five_seconds_writes_no_record() {
     assert!(!recs[0].title.contains("for 0 s"), "{}", recs[0].title);
 }
 
-/// Memory stays heavy while pressure sits at Warn (it
-/// clears only at Normal) after the swapping stops; a CPU kind that is
-/// pegged and RISING still opens the row, and the row does not turn into
-/// `low memory` a reading later.
+/// Memory stays heavy while pressure sits at Warn after the swapping stops; a
+/// CPU kind that is pegged and rising still opens the row, and the row does
+/// not turn into `low memory` a reading later.
 #[test]
 fn a_heavy_kind_no_longer_rising_never_blocks_a_rising_one() {
     let mut s = Sim::new();
@@ -1574,10 +1560,9 @@ fn a_heavy_kind_no_longer_rising_never_blocks_a_rising_one() {
     }
 }
 
-/// Two panes of one tab both at a `zsh` prompt, `yes`
-/// under pane B. The session is named from pane B's OWN shell — never by
-/// looking a session up again by its words, which could find pane A and
-/// walk past B's `zsh` to blame the idle shell.
+/// Two panes of one tab both at a `zsh` prompt, `yes` under pane B. The
+/// session is named from pane B's own shell, never by looking a session up
+/// again by its words (which could find pane A and blame its idle shell).
 #[test]
 fn split_panes_name_the_pane_that_is_heavy() {
     let row = |pid: u32, ppid: u32, name: &str, ns: u64| {
@@ -1623,13 +1608,11 @@ fn split_panes_name_the_pane_that_is_heavy() {
     assert_eq!(g[0].cpu_ns, 991);
 }
 
-/// The window loses focus with the row open; the host
-/// takes no readings (the idle law) and the row fades. When a reading comes
-/// an hour later, the episode ends where sampling STOPPED: its record never
-/// counts the hour away as time on the glass, and the quiet period starts
-/// then too. [`StrainTracker::lapsed`] ends it the same way on any loop turn
-/// once no reading has come for [`STALE_STRAIN`], so an unfocused tracker is
-/// calm again without anything armed.
+/// The window loses focus with the row open, so the host takes no readings
+/// and the row fades. When a reading comes an hour later, the episode ends
+/// where sampling stopped: its record never counts the hour away as time on
+/// the glass. [`StrainTracker::lapsed`] ends it the same way on any loop turn
+/// once no reading has come for [`STALE_STRAIN`].
 #[test]
 fn a_gap_folds_where_sampling_stopped() {
     let yes = World::loaded(yes12(200), 1000);
@@ -1670,8 +1653,8 @@ fn a_gap_folds_where_sampling_stopped() {
     }
 }
 
-/// An episode that ends as a Suspect after the window
-/// lost focus counts its felt span to its last reading, never the time away.
+/// An episode that ends as a Suspect after the window lost focus counts its
+/// felt span to its last reading, never the time away.
 #[test]
 fn a_suspect_gap_ends_at_the_last_reading() {
     let mut s = Sim::new();
@@ -1701,11 +1684,9 @@ fn a_suspect_gap_ends_at_the_last_reading() {
     assert_eq!(s.t.state_word(), "calm");
 }
 
-/// `begin` takes every per-episode figure fresh
-/// from the FEEL_WINDOW at its start, and `felt_no_heavy` promises "the turn
-/// that held the loop longest" of what the person felt THEN: a lone freeze
-/// noted while calm, forty minutes before the episode, is no part of its
-/// record.
+/// `begin` takes every per-episode figure fresh from the window at its start:
+/// a lone freeze noted while calm, forty minutes before the episode, is no
+/// part of its record.
 #[test]
 fn a_calm_freeze_never_leaks_into_a_later_episodes_record() {
     let mut s = Sim::new();
@@ -1732,13 +1713,11 @@ fn a_calm_freeze_never_leaks_into_a_later_episodes_record() {
     );
 }
 
-/// Ruling 209: a fold withdraws the row and that log entry BECOMES the
-/// episode's record. An episode that saw critical memory pressure records
-/// Warn (`record_severity`); when a later calmer reading restated its row
-/// Info, the one entry the fold leaves still reads the record's Warn, as it
-/// does when no row is live and the record is posted whole
-/// (`MessageCenter::withdraw_as_record`, ruling 441 (c)). Mirrors the host's
-/// `perform_strain`.
+/// A fold withdraws the row and that log entry becomes the episode's record.
+/// An episode that saw critical memory pressure records Warn; when a later
+/// calmer reading restated its row Info, the one entry the fold leaves still
+/// reads the record's Warn (`MessageCenter::withdraw_as_record`). Mirrors the
+/// host's `perform_strain`.
 #[test]
 fn the_episodes_one_entry_reads_the_records_severity() {
     let mut s = Sim::new();

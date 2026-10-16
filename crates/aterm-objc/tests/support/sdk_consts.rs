@@ -1,23 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE ONE `_Static_assert` PROBE behind both constant censuses:
-//! `winit_seam_constants.rs` (the vendored fork's seam) and
-//! `gui_appkit_constants.rs` (`aterm-gui`'s `consts`). The two files are one
-//! instrument over two subjects — same parser grammar, same both-arches probe,
-//! same verdicts — so the grammar, the compiler call and the verdicts live
-//! here once, and each file keeps its own table, its own scope and its own
-//! probe source.
+//! The `_Static_assert` probe behind both constant censuses, `winit_seam_constants.rs` (the
+//! vendored fork's seam) and `gui_appkit_constants.rs` (`aterm-gui`'s `consts`): the parser
+//! grammar, the compiler call and the verdicts live here once; each census keeps its own table,
+//! scope and probe source.
+#![allow(
+    clippy::disallowed_types,
+    reason = "test code: a stand-in child may inherit descriptors"
+)]
 
 use std::process::Command;
 
-/// A `const` declaration's body, whatever VISIBILITY it is spelled with.
-///
-/// Written against the GRAMMAR — `pub`, `pub(crate)`, `pub(super)`,
-/// `pub(in path)` or nothing — not one spelling: a parser that matched only
-/// `pub(crate) const ` let a `pub const` with a WRONG value pass every census
-/// test, coverage included. [`the_parser_reads_every_visibility_spelling`]
-/// proves it reads all of them.
+/// A `const` declaration's body, at any visibility (`pub`, `pub(crate)`, `pub(super)`,
+/// `pub(in path)` or none): a parser that matched one spelling would let a constant spelled
+/// another way pass every census test unparsed.
 fn strip_const_decl(line: &str) -> Option<&str> {
     let mut s = line.trim();
     if let Some(rest) = s.strip_prefix("pub") {
@@ -54,15 +51,12 @@ pub fn as_c_literal(rust: &str) -> String {
     rust.replace('_', "")
 }
 
-/// Compile `body` as Objective-C for `arch`, syntax only, in a fresh scratch
-/// directory labelled with `scratch`, `tag` and `arch` and removed afterwards
-/// (the two censuses run concurrently and share tags). `Ok(())` if clang
-/// accepted it, `Err(stderr)` if it did not.
+/// Compile `body` as Objective-C for `arch`, syntax only, in a fresh scratch directory labelled
+/// with `scratch`, `tag` and `arch` and removed afterwards (the two censuses run concurrently
+/// and share tags). `Ok(())` if clang accepted it, `Err(stderr)` if not.
 ///
-/// A `cc` that cannot even be started panics: a missing compiler is a broken
-/// box, and an oracle that cannot run on a broken box is not a pass. A `cc`
-/// that runs but cannot fold a `static const` is a narrower case with its own
-/// rule, on one measured host only: [`green_verdict`] and [`inverted_verdict`].
+/// A `cc` that cannot start panics: an oracle that cannot run is not a pass. A `cc` that cannot
+/// fold a `static const` is [`green_verdict`]'s and [`inverted_verdict`]'s case.
 pub fn compile(scratch: &str, arch: &str, body: &str, tag: &str) -> Result<(), String> {
     let dir = aterm_tempfile::Builder::new()
         .prefix(&format!("{scratch}-{tag}-{arch}-"))
@@ -72,13 +66,9 @@ pub fn compile(scratch: &str, arch: &str, body: &str, tag: &str) -> Result<(), S
     std::fs::write(&path, body).expect("the probe is writable");
     let out = Command::new("cc")
         .args(["-arch", arch, "-fsyntax-only"])
-        // A wrong-but-vacuous assertion WARNS before it passes, so THAT
-        // warning is made fatal — and only that one. A blanket `-Werror` was
-        // tried first and broke the seam's green arm on an unrelated
-        // diagnostic: `NSWindowFullScreenButton` is deprecated, so the whole
-        // probe failed for a reason that has nothing to do with any constant's
-        // value. `-Wparentheses` is the exact diagnostic clang emits for
-        // `SDK == a | b`, which is the shape both probes parenthesise against.
+        // A wrong-but-vacuous `SDK == a | b` assertion warns `-Wparentheses`, so that one
+        // warning is fatal; a blanket `-Werror` fails the probe on unrelated deprecations
+        // (`NSWindowFullScreenButton`).
         .arg("-Werror=parentheses")
         .arg(&path)
         .output()
@@ -94,23 +84,17 @@ pub fn compile(scratch: &str, arch: &str, body: &str, tag: &str) -> Result<(), S
     }
 }
 
-/// The diagnostic Apple clang 14.0.3 gives for every `static const` row —
-/// `NSNotFound`, `NSModalResponseOK`, `NSAppKitVersionNumber10_12`,
-/// `NSVariableStatusItemLength`, `NSAlertFirstButtonReturn`,
-/// `NSWindowFullScreenButton` — when asked to fold it into `_Static_assert`.
-/// It is the HOST compiler's limit, not the target's: the fold fails for both
-/// `-arch` arms on that clang (measured 2026-09-06 and again 2026-09-16 on an
-/// Intel MacBook Pro running macOS 13.7.8 with the Command Line Tools' clang
-/// 14.0.3; the enum rows fold fine). A newer clang folds them all.
+/// The diagnostic Apple clang 14.0.3 (Command Line Tools on an Intel Mac, macOS 13) gives for
+/// every `static const` row (`NSNotFound`, `NSModalResponseOK`, `NSVariableStatusItemLength`, …)
+/// asked to fold into `_Static_assert`. It is the host compiler's limit, on both `-arch` arms;
+/// enum rows fold fine, and a newer clang folds them all.
 #[cfg(all(target_arch = "x86_64", target_os = "macos"))]
 const FOLD_DIAGNOSTIC: &str = "static_assert expression is not an integral constant expression";
 
-/// The rows clang could not fold, in the order it named them — `Some` only
-/// when EVERY `error:` line in `stderr` is [`FOLD_DIAGNOSTIC`]. Any other
-/// error (a value disagreement reads `static assertion failed due to
-/// requirement`), or no `error:` line at all, is `None`: not classified, so
-/// the caller keeps its verdict. The row is the quoted name on the source line
-/// clang prints under the diagnostic.
+/// The rows clang could not fold, in the order it named them: `Some` only when every `error:`
+/// line in `stderr` is [`FOLD_DIAGNOSTIC`]. Any other error (a value disagreement), or no
+/// `error:` line, is `None` and the caller keeps its verdict. The row is the quoted name on the
+/// source line clang prints under the diagnostic.
 #[cfg(all(target_arch = "x86_64", target_os = "macos"))]
 fn unfolded_rows(stderr: &str) -> Option<Vec<String>> {
     let lines: Vec<&str> = stderr.lines().collect();
@@ -150,15 +134,11 @@ pub fn green_verdict(arch: &str, what: &str, result: Result<(), String>) {
     }
 }
 
-/// x86_64 macOS — the one host measured with a clang that cannot fold a
-/// `static const` (see [`FOLD_DIAGNOSTIC`]): a compile whose every error is that
-/// diagnostic is REPORTED, one stderr line naming the rows, and is not a
-/// failure; every other row in the same probe was asserted by the same
-/// compile. An error that is not the fold diagnostic, or an unclassifiable
-/// failure, panics exactly as on every other target. The waiver keys on clang's
-/// text, never on the cfg: an Intel Mac with a folding clang asserts every
-/// row, and an Apple silicon Mac with clang 14.0.3 stays red by design — only
-/// this host was measured.
+/// x86_64 macOS, the one host measured with a clang that cannot fold a `static const` (see
+/// [`FOLD_DIAGNOSTIC`]): a compile whose every error is that diagnostic is reported in one
+/// stderr line naming the rows, not failed; every other row was asserted by the same compile.
+/// Any other error panics as on every other target. The waiver keys on clang's text: an Intel
+/// Mac with a folding clang asserts every row.
 #[cfg(all(target_arch = "x86_64", target_os = "macos"))]
 #[track_caller]
 pub fn green_verdict(arch: &str, what: &str, result: Result<(), String>) {
@@ -171,9 +151,8 @@ pub fn green_verdict(arch: &str, what: &str, result: Result<(), String>) {
     }
 }
 
-/// The inverted arm's verdict: the probe with one row flipped must FAIL for
-/// that row's VALUE on `arch`. On every target but x86_64 macOS any failure is
-/// the pass, as it always was.
+/// The inverted arm's verdict: the probe with one row flipped must fail for that row's value on
+/// `arch`. On every target but x86_64 macOS any failure is the pass.
 #[cfg(not(all(target_arch = "x86_64", target_os = "macos")))]
 #[track_caller]
 pub fn inverted_verdict(arch: &str, row: &str, result: Result<(), String>, vacuous: &str) {
@@ -181,11 +160,10 @@ pub fn inverted_verdict(arch: &str, row: &str, result: Result<(), String>, vacuo
     assert!(result.is_err(), "{vacuous}");
 }
 
-/// x86_64 macOS: a clang that cannot fold makes the inverted probe fail
-/// whatever the values are, so "it failed" proves nothing here. The pass is
-/// clang's value diagnostic — `static_assert failed due to requirement …` (`static assertion` on a newer clang) —
-/// on the inverted `row` itself; the fold errors on the other rows are reported
-/// and never counted.
+/// x86_64 macOS: a clang that cannot fold makes the inverted probe fail whatever the values
+/// are, so the pass is clang's value diagnostic (`static_assert failed due to requirement …`,
+/// `static assertion` on a newer clang) on the inverted `row` itself; fold errors on the other
+/// rows are reported and never counted.
 #[cfg(all(target_arch = "x86_64", target_os = "macos"))]
 #[track_caller]
 pub fn inverted_verdict(arch: &str, row: &str, result: Result<(), String>, vacuous: &str) {
@@ -223,12 +201,9 @@ pub fn inverted_verdict(arch: &str, row: &str, result: Result<(), String>, vacuo
     }
 }
 
-/// The one line an x86_64 macOS run prints per probe with unfolded rows: which
-/// rows, which clang, and why they are not asserted here. Written to the
-/// stderr handle rather than through `eprintln!`, which libtest captures and
-/// drops for a passing test: a waived row must show in every run. The line
-/// names the census's own file: every caller is `#[track_caller]` back to the
-/// test that ran the probe.
+/// The one line an x86_64 macOS run prints per probe with unfolded rows. It goes to the stderr
+/// handle, not `eprintln!` (which libtest drops for a passing test), so a waived row shows in
+/// every run; `#[track_caller]` makes it name the census's own file.
 #[cfg(all(target_arch = "x86_64", target_os = "macos"))]
 #[track_caller]
 fn report_unfolded(arch: &str, rows: &[String]) {
@@ -256,15 +231,8 @@ fn report_unfolded(arch: &str, rows: &[String]) {
     let _ = std::io::stderr().write_all(line.as_bytes());
 }
 
-/// THE PARSER READS EVERY VISIBILITY SPELLING, not just the one either subject
-/// uses.
-///
-/// Every live declaration in both subjects is spelled `pub(crate) const`, so
-/// without this [`strip_const_decl`] could regress to a single `strip_prefix`
-/// and every other test in both censuses would stay green: the coverage tests
-/// cannot notice a constant they never parsed — a row they do not see is not
-/// "missing", it is invisible. So the spellings are exercised against a
-/// synthetic source rather than against either subject; it runs once, in the
+/// The parser reads every visibility spelling, not only the `pub(crate) const` both subjects
+/// use: the coverage tests cannot notice a constant they never parsed. It runs once, in the
 /// `objc_static_suite` binary both censuses share.
 #[test]
 fn the_parser_reads_every_visibility_spelling() {
@@ -274,7 +242,7 @@ fn the_parser_reads_every_visibility_spelling() {
         ("    pub(crate) const C: usize = 3;", Some(("C", "3"))),
         ("pub(super) const D: usize = 4;", Some(("D", "4"))),
         ("pub(in crate::x) const E: usize = 5;", Some(("E", "5"))),
-        // …and things that are NOT a constant declaration stay unparsed.
+        // Not a constant declaration: unparsed.
         ("let id = (r as *const T).cast_mut();", None),
         ("pub(super) static F: Id;", None),
         ("pubconst G: usize = 7;", None),

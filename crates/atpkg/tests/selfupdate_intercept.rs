@@ -25,7 +25,10 @@
 //! manager, the prefix cross-check, the usage line, the tool-name gate and a `bin/`
 //! shim that cannot be exec'd (126) — are pinned in-process by `cli.rs`'s test where a
 //! plan exists and re-driven here so the exec, the exit code and the byte on the glass
-//! are the binary's, not the plan's.
+//! are the binary's, not the plan's — all but two: a declined shape's refusal is driven
+//! on the binary by `tests/run_is_the_managed_name.rs` (`atpkg run` settles the same
+//! plan through the same refusal arm), and the disabled line is a build with no root
+//! key's alone.
 //!
 //! WHAT CANNOT BE DRIVEN HERE: an up-to-date child (`atpkg: claude already current
 //! (build N)`, exit 0). The binary verifies a `dir:` registry under the COMMITTED paper
@@ -99,7 +102,7 @@ impl Fixture {
         }
     }
 
-    fn row() -> &'static atpkg::selfupdate::Row {
+    fn row() -> &'static atpkg::vendor_direct::VendorSpec {
         atpkg::selfupdate::row_for("claude").expect("claude is rostered")
     }
 
@@ -309,7 +312,7 @@ const UNREACHABLE_LINE: &str =
     "atpkg: claude — Anthropic's release channel is unreachable; keeping build 2026091601";
 
 /// A hang detector, not a latency budget: the grace itself is 2 s, and the first exec
-/// of a freshly linked binary has been measured at 26 s under a loaded gate.
+/// of a freshly linked binary has been measured at 26 s on a loaded machine.
 const ANNOUNCE_WITHIN: Duration = Duration::from_secs(60);
 
 /// The stdout lines a pass may carry that are not the wait lane's markers: what the
@@ -539,62 +542,6 @@ fn help_forwards_to_the_vendor_after_one_note_and_takes_no_lock() {
         "handed to the verb once, by the managed name: {shown}"
     );
     assert!(!fx.lock_held(), "help takes no lock");
-}
-
-/// DECLINED SHAPES: `install stable`, `install 2.1.200` and `update --foo` exit 2 with
-/// their exact line, nothing on stdout, the fake never run, no lock — and no
-/// environment can change that: there is no escape hatch, so the vendor's installer is
-/// never run through the managed name.
-#[test]
-fn a_declined_shape_exits_2_with_its_line_and_runs_nothing() {
-    use atpkg::selfupdate::{Decline, declined_line};
-    let fx = Fixture::new("declined");
-    fx.fake_shim("claude");
-    let row = Fixture::row();
-    let rest = vec![String::from("--foo")];
-    for (typed, line) in [
-        (
-            &["install", "stable"][..],
-            declined_line(
-                row,
-                &Decline::NotAChannel {
-                    verb: "install",
-                    target: "stable",
-                },
-            ),
-        ),
-        (
-            &["install", "2.1.200"],
-            declined_line(
-                row,
-                &Decline::Version {
-                    verb: "install",
-                    target: "2.1.200",
-                },
-            ),
-        ),
-        (
-            &["update", "--foo"],
-            declined_line(
-                row,
-                &Decline::Shape {
-                    verb: "update",
-                    rest: &rest,
-                },
-            ),
-        ),
-    ] {
-        let out = fx.selfupdate("claude", typed, &[]);
-        let shown = describe(&out);
-        assert_eq!(out.status.code(), Some(2), "{typed:?}: {shown}");
-        assert_eq!(text(&out.stderr), format!("{line}\n"), "{typed:?}: {shown}");
-        assert_eq!(text(&out.stdout), "", "{typed:?}: {shown}");
-        assert!(
-            !text(&out.stderr).contains("ATPKG_"),
-            "no line names an environment variable: {shown}"
-        );
-    }
-    assert!(!fx.lock_held());
 }
 
 /// AN UNROSTERED PROGRAM (a twin laid by a newer roster than this binary's) forwards to

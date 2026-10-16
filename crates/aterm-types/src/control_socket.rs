@@ -813,12 +813,6 @@ mod tests {
         assert_eq!(stale, vec!["aterm-100.sock", "aterm-200.sock"]);
     }
 
-    /// The margin is one day, and the constant is what the hosts pass.
-    #[test]
-    fn the_stale_margin_is_one_day() {
-        assert_eq!(STALE_SOCK_MIN_AGE_SECS, 86_400);
-    }
-
     #[test]
     fn symlink_ownership_matches_pid_in_target() {
         assert!(symlink_targets_pid("aterm-42.sock", 42));

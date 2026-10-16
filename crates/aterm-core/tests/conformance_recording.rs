@@ -2,17 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Tier-1 conformance for hydration faithfulness: binds `recording_model` to
-//! the real engine.
-//!
-//! A keyframe from [`Terminal::checkpoint`] at `t0`, plus the recorded deltas
-//! `t0 -> t1` replayed through [`Terminal::process`] on a
-//! [`Terminal::from_checkpoint`]-hydrated terminal, reproduces the live
-//! terminal's checkpoint at `t1` exactly (grid, cursor, region, wrap, tabs,
-//! modes, style, charset, keyboards; the deferred grouped/clock-domain fields
-//! are outside the projection, see `checkpoint.rs`).
-//!
-//! Negative control: dropping one delta chunk on replay makes the projections
+//! Tier-1 conformance for hydration faithfulness (`recording_model`): a keyframe from
+//! [`Terminal::checkpoint`] at `t0` plus the deltas `t0 -> t1` replayed on a
+//! [`Terminal::from_checkpoint`]-hydrated terminal reproduces the live terminal's
+//! checkpoint at `t1` exactly. Negative control: dropping one delta chunk makes them
 //! diverge.
 
 use aterm_core::terminal::Terminal;
@@ -87,8 +80,7 @@ fn replay_from_checkpoint_matches_live_engine() {
 
 #[test]
 fn replay_negative_control_dropped_delta_diverges() {
-    // Drop one delta chunk on replay: the projections must diverge (the
-    // analogue of the model's Buggy=1 dropped-event counterexample).
+    // The analogue of the model's Buggy=1 dropped-event counterexample.
     let (rows, cols) = (10u16, 40u16);
     const DROP_IDX: usize = 2; // the "scroll1/2/3" chunk — perturbs the grid
 

@@ -126,13 +126,11 @@ fn a_line_wheel_event_takes_exactly_one_terminal_lock() {
     );
 }
 
-/// Direct manipulation: how a chained delta joins an in-flight glide
-/// depends on its kind. A precise (trackpad) delta tracks: the band moves
-/// by exactly its pixels now, and the glide becomes a rest-settle to the
-/// nearest whole row (`end() == now + TRACK_REST_MS + TRACK_SETTLE_MS`). A
-/// notch retargets it (a fresh 180 ms). Both land exactly and self-disarm.
-/// Every delta, notch and tick is placed on one synthetic clock
-/// (`scroll_wheel_animated_at`).
+/// Direct manipulation: a chained precise (trackpad) delta tracks, moving the
+/// band by exactly its pixels and turning the glide into a rest-settle to the
+/// nearest whole row (`end() == now + TRACK_REST_MS + TRACK_SETTLE_MS`); a
+/// chained notch retargets (a fresh `GLIDE_MS` ease). Both land exactly and
+/// self-disarm, on one synthetic clock (`scroll_wheel_animated_at`).
 #[test]
 fn a_precise_chained_delta_tracks_the_finger_and_a_notch_retargets() {
     use crate::scroll_motion::{TRACK_REST_MS, TRACK_SETTLE_MS};
@@ -149,7 +147,7 @@ fn a_precise_chained_delta_tracks_the_finger_and_a_notch_retargets() {
             .expect("a glide is armed")
     };
 
-    // PRECISE chain: a third of a row, then another third.
+    // Precise chain: a third of a row, then another third.
     let third = (cell_h / 3) as f64;
     let before = std::time::Instant::now();
     app.scroll_wheel_animated_at(wid, &term, 0, None, Some(third), before);
@@ -183,7 +181,7 @@ fn a_precise_chained_delta_tracks_the_finger_and_a_notch_retargets() {
         cell_h - 2 * (third as i64),
         "the second delta moved the band by exactly its pixels — no ease"
     );
-    // Two thirds is nearer the NEXT row when cell_h/3*2 > cell_h/2.
+    // Two thirds is nearer the next row when cell_h/3*2 > cell_h/2.
     let expect_target = crate::scroll_motion::nearest_row_px(2 * (third as i64), cell_h);
     assert_eq!(
         target_after, expect_target,
@@ -202,7 +200,7 @@ fn a_precise_chained_delta_tracks_the_finger_and_a_notch_retargets() {
         "…and disarms there"
     );
 
-    // NOTCH chain: the ease restarts (the deadline moves out with it). The
+    // Notch chain: the ease restarts (the deadline moves out with it). The
     // first notch comes after the settle landed; the second 5 ms later.
     let landed = term_lock(&term).grid().display_offset() as i64;
     let notch_at = end_after + Duration::from_millis(2);
@@ -222,13 +220,11 @@ fn a_precise_chained_delta_tracks_the_finger_and_a_notch_retargets() {
     assert!(app.windows[&wid].scroll_glide.is_none());
 }
 
-/// Direct manipulation through the winit handler: a precise delta smaller
-/// than a row moves the band before the seam banks a whole row. The engine
-/// sits at the ceil row with the remainder in `scroll_frac_px`, the seam's
-/// bank still holds the fraction (its bytes for a tracking app are
-/// unchanged), and the engine paid one lock for the row landing plus one
-/// for the gesture-start route probe; a second sub-row delta inside the
-/// same row pays none.
+/// Direct manipulation through the winit handler: a sub-row precise delta moves
+/// the band before the seam banks a whole row. The engine sits at the ceil row
+/// with the remainder in `scroll_frac_px` while the seam's bank keeps the
+/// fraction; the gesture start pays at most two locks (route probe, row
+/// landing), and a second sub-row delta inside the same row pays none.
 #[test]
 fn a_sub_row_precise_delta_moves_the_band_before_a_whole_row_banks() {
     use winit::dpi::PhysicalPosition;
@@ -279,7 +275,7 @@ fn a_sub_row_precise_delta_moves_the_band_before_a_whole_row_banks() {
         "the ceil pairing parks the engine one row deeper"
     );
 
-    // A second sub-row delta within the SAME row: no engine lock at all.
+    // A second sub-row delta within the same row: no engine lock at all.
     let before = acq();
     app.on_mouse_wheel(
         wid,
@@ -295,7 +291,7 @@ fn a_sub_row_precise_delta_moves_the_band_before_a_whole_row_banks() {
         cell_h - dy as i64 - 1
     );
     assert_eq!(term_lock(&term).grid().display_offset(), 1);
-    // And a finger that RESTS past the rest window settles: the same second
+    // And a finger that rests past the rest window settles: the same second
     // delta sent after `TRACK_REST_MS` finds the band part-way home.
     crate::app_input::pin_wheel_clock(Some(
         t0 + std::time::Duration::from_millis(crate::scroll_motion::TRACK_REST_MS + 60),
@@ -313,11 +309,9 @@ fn a_sub_row_precise_delta_moves_the_band_before_a_whole_row_banks() {
     );
 }
 
-/// The card owns the wheel, whatever device made it. The seam swallows a
-/// whole row while the tab context menu is up; the sub-notch half of
-/// direct manipulation answers before the seam, so it declines the same
-/// way: sub-row trackpad deltas under an open card arm no band, shift
-/// nothing, scroll nothing, take no engine lock, and leave the card up.
+/// The card owns the wheel, whatever device made it: sub-row trackpad deltas
+/// under the tab context menu (answered before the seam) arm no band, shift and
+/// scroll nothing, take no engine lock, and leave the card up.
 #[test]
 fn a_sub_row_precise_delta_under_the_tab_menu_is_swallowed_like_a_notch() {
     use winit::dpi::PhysicalPosition;
@@ -421,13 +415,11 @@ fn tab_menu_discards_banked_wheel_fractions_at_both_boundaries() {
     assert_eq!(app.windows[&wid].scroll_residual_x, 0.5);
 }
 
-/// Direct manipulation: a 120 Hz precise stream at a constant 1 row per
-/// 100 ms through the winit handler moves the presented position (engine
-/// row × cell_h − frac) evenly: per-event motion `max <= 2 * min`, no
-/// zero-motion event after the first, and the band within a pixel of the
-/// finger throughout. The handler reads the real clock, so only a stall
-/// longer than `TRACK_REST_MS` between events could start a settle
-/// mid-stream.
+/// Direct manipulation: a 120 Hz precise stream at 1 row per 100 ms through the
+/// winit handler moves the presented position (engine row × cell_h − frac)
+/// evenly (`max <= 2 * min`, no zero-motion event after the first) and within a
+/// pixel of the finger. The handler reads the real clock, so only a stall longer
+/// than `TRACK_REST_MS` between events could start a settle mid-stream.
 #[test]
 fn a_constant_speed_precise_stream_moves_the_band_evenly() {
     use winit::dpi::PhysicalPosition;
@@ -515,9 +507,8 @@ fn a_gesture_end_starts_the_rest_settle_at_once() {
         end_after <= std::time::Instant::now() + std::time::Duration::from_millis(TRACK_SETTLE_MS),
         "…it is exactly one settle away"
     );
-    // …and the wake the loop arms moved with it: the glide's armed wake is
-    // one panel period out, not the old rest boundary (which would present
-    // almost the whole settle in one frame).
+    // …and the loop's armed wake moved with it: one panel period out, not the
+    // rest boundary (which would present almost the whole settle in one frame).
     let iv = app.windows[&wid]
         .frame_interval
         .unwrap_or(app.frame_interval);
@@ -531,12 +522,11 @@ fn a_gesture_end_starts_the_rest_settle_at_once() {
     );
 }
 
-/// The fence the direct-manipulation path must not cross: under a tracking
-/// app a precise stream produces exactly the seam's bytes (one wheel report
-/// per whole banked row, byte-identical to the engine's own encoder) and
-/// moves no band: no glide, no residual, `display_offset` untouched.
-/// Sub-row motion is display-only and exists only on the tracking-off
-/// route; this keeps `bytes_human_eq_controller` true on the sub-notch path.
+/// The fence the direct-manipulation path must not cross: under a tracking app
+/// a precise stream produces exactly the seam's bytes (one wheel report per
+/// whole banked row, the engine's own encoding) and moves no band. Sub-row
+/// motion exists only on the tracking-off route, which keeps
+/// `bytes_human_eq_controller` true on the sub-notch path.
 #[cfg(unix)]
 #[test]
 fn a_precise_stream_under_a_tracking_app_reports_whole_rows_only_and_moves_no_band() {
@@ -602,13 +592,11 @@ fn a_precise_stream_under_a_tracking_app_reports_whole_rows_only_and_moves_no_ba
     }
 }
 
-/// A band parked on the live bottom, pushed further, takes no lock. A flick
-/// to live keeps delivering momentum deltas after the band has landed. The
-/// gesture's first delta probes the route once and parks the band on live
-/// with the bounce released; every further downward delta (sub-row or
-/// whole-row) takes no lock and keeps the bounce (up: a positive shift) and
-/// the position. Reversing off the bound pans into history through the
-/// ordinary crossing path: one lock for the row it enters.
+/// A band parked on the live bottom, pushed further (a flick's momentum tail),
+/// takes no lock: the gesture's first delta probes the route once and parks the
+/// band on live with the bounce released, and every further downward delta keeps
+/// the bounce (a positive shift) and the position lock-free. Reversing off the
+/// bound pans into history with one lock for the row it enters.
 #[test]
 fn a_precise_push_past_the_live_bottom_takes_no_lock_once_parked() {
     use winit::dpi::PhysicalPosition;
@@ -712,11 +700,9 @@ fn a_precise_push_past_the_top_of_history_takes_no_lock_once_parked() {
     crate::app_input::pin_wheel_clock(None);
 }
 
-/// The bound the lock-free arm keeps: a band parked on live when a pager
-/// comes up (the alternate screen with DEC 1007) is no longer aterm's
-/// viewport to bounce. The published mode word says so without the lock,
-/// so the rows the finger banks reach the seam as the pager's arrow keys,
-/// one per banked row.
+/// A band parked on live when a pager comes up (alt screen + DEC 1007) is no
+/// longer aterm's to bounce: the lock-free mode word says so, and each banked
+/// row reaches the seam as the pager's arrow key.
 #[cfg(unix)]
 #[test]
 fn a_pager_that_comes_up_under_a_parked_band_still_gets_its_arrows() {
@@ -777,12 +763,9 @@ fn a_pager_that_comes_up_under_a_parked_band_still_gets_its_arrows() {
     }
 }
 
-/// The bounce owns the band at a history end. A finger pushed past the top
-/// keeps its tracked glide parked at the edge (frac 0) beside a live
-/// overscroll spring, each on its own anchored phase. Every served instant
-/// while the spring lives must present the spring's displacement (not the
-/// glide snapped to rest), and at least one pass must be the glide alone,
-/// or this proves nothing.
+/// The bounce owns the band at a history end: with a tracked glide parked at
+/// the top beside a live spring, every served instant presents the spring's
+/// displacement. Non-vacuous: at least one pass serves the glide alone.
 #[test]
 fn a_glide_tick_at_a_history_end_never_snaps_a_live_bounce() {
     let mut app = App::headless_for_test();
@@ -856,11 +839,9 @@ fn a_small_delta_at_a_history_end_keeps_the_bounce_presented() {
     }
 }
 
-/// …and a tracked band a partial drop lands on live. A tracked band's rest
-/// target rounds half a cell toward history, so a drop of exactly its
-/// target's rows leaves the target on live while the parked start sinks
-/// below it; that start must not present as a lift of the live screen with
-/// no row under it.
+/// …and a tracked band that a partial history drop lands on live presents at
+/// rest: its rest target rounds half a cell toward history, so the parked start
+/// can sink below live, and must not lift the live screen with no row under it.
 #[test]
 fn a_partial_drop_that_lands_a_tracked_band_on_live_presents_it_at_rest() {
     let mut app = App::headless_for_test();
@@ -894,11 +875,9 @@ fn a_partial_drop_that_lands_a_tracked_band_on_live_presents_it_at_rest() {
     );
 }
 
-/// …but a bounce belongs to its own edge. A top bounce sags the band
-/// (negative frac), a live-bottom one lifts it (positive). One precise
-/// delta that crosses the whole history lands the band on the other end,
-/// where the top bounce's sag must not be presented. An exact landing (no
-/// excess) and an overshoot that resists to a zero impulse both end it.
+/// …but a bounce belongs to its own edge: one precise delta that crosses the
+/// whole history from a sagging top bounce lands at rest on live, whether it
+/// lands exactly or overshoots.
 #[test]
 fn a_delta_that_crosses_the_history_ends_the_other_edges_bounce() {
     for overshoot in [0.0, 2.0] {
@@ -940,12 +919,10 @@ fn a_delta_that_crosses_the_history_ends_the_other_edges_bounce() {
     }
 }
 
-/// Alt over a main-screen tracking app scrolls locally, all of the finger.
-/// Option/Alt is the selection-custody override: the seam routes the wheel
-/// to the local viewport on the main screen even while an app tracks the
-/// mouse, so sub-row deltas must track too (not only Shift is excluded
-/// from tier 1 of `track_precise_scroll`). Four quarter-row deltas present
-/// one whole row of motion.
+/// Alt over a main-screen tracking app scrolls locally, all of the finger: Alt
+/// is the selection-custody override that routes the wheel to the local
+/// viewport, so sub-row deltas track too (tier 1 of `track_precise_scroll`
+/// exempts Alt as well as Shift). Four quarter-row deltas present one row.
 #[test]
 fn alt_over_a_main_screen_tracking_app_tracks_every_pixel() {
     use winit::dpi::PhysicalPosition;
@@ -978,8 +955,8 @@ fn alt_over_a_main_screen_tracking_app_tracks_every_pixel() {
 }
 
 /// The other fence: the controller `mouse` verb has no pixel field, so its
-/// wheel is a notch: the glide retargets (a fresh 180 ms per verb), its
-/// target is whole-row, and `wheel_precise_px` is never set on that path.
+/// wheel is a notch: the glide retargets (a fresh `GLIDE_MS` ease per verb),
+/// its target is whole-row, and `wheel_precise_px` is never set.
 #[test]
 fn the_mouse_verb_wheel_is_a_notch_and_never_tracks() {
     use crate::input::Source;
@@ -987,9 +964,8 @@ fn the_mouse_verb_wheel_is_a_notch_and_never_tracks() {
     let wid = WindowId(0);
     let term = seed_history(&app, wid);
     let cell_h = app.win_cell_size(wid).1.max(1) as i64;
-    // Exactly the event the `mouse wheelup … lines=N` verb parses into
-    // (`control::control_input::parse_mouse`): its grammar has no pixel
-    // field, so the seam-facing event is a whole-row notch.
+    // The event `mouse wheelup … lines=N` parses into
+    // (`control::control_input::parse_mouse`): a whole-row notch.
     let verb = |lines: i32| crate::input::InputEvent::Wheel {
         dir: aterm_types::mouse::WheelDir::Up,
         lines,
@@ -1069,12 +1045,9 @@ fn output_mid_glide_shifts_the_glide_instead_of_scrolling_the_reader_back() {
 }
 
 /// Tier-1 binding for `scroll_glide_model::Output`: output that re-pins the
-/// viewport under a glide bound into history projects onto the model's
-/// `Output` successor (the viewport and the glide's target move by the
-/// machine's row: `Glide::shift`, found through `engine_row` at the next
-/// wake), and the landing is the aimed content, `aim + drift`
-/// (`TargetIsAnchored`). Negative control: the model's Buggy `Output`
-/// (target left behind) violates the invariant.
+/// viewport under a history-bound glide moves the viewport and the target by the
+/// machine's row (`Glide::shift` at the next wake), and the landing is
+/// `aim + drift` (`TargetIsAnchored`). Negative control: the Buggy `Output`.
 #[test]
 fn output_mid_glide_conforms_to_scroll_glide_model() {
     let mut app = App::headless_for_test();
@@ -1141,11 +1114,9 @@ fn output_mid_glide_conforms_to_scroll_glide_model() {
     assert!(!buggy.check_invariant("TargetIsAnchored", &left_behind));
 }
 
-/// A glide bound for live lands on live. The relative law above is right
-/// for a history target, which is content; the live bottom is a
-/// destination. Both ways a glide ends (its landing tick, and the settle a
-/// policy edge or a snap runs) must finish on live with output arriving
-/// mid-ease, rather than `lines_added` rows above it.
+/// A glide bound for live lands on live, not `lines_added` rows above it, with
+/// output arriving mid-ease: the re-pin is right for a history target (content),
+/// but live is a destination. Covers the landing tick and the settle.
 #[test]
 fn a_glide_bound_for_live_lands_on_live_while_output_streams() {
     for settle in [false, true] {
@@ -1238,16 +1209,12 @@ fn a_live_bound_glide_follows_a_cleared_history_instead_of_climbing_it() {
     assert!(app.windows[&wid].scroll_glide.is_none());
 }
 
-/// The anchor. A notch glide's tick is armed once, one panel period after
-/// the arm; a chained notch (a fresh 180 ms retarget) leaves it where it
-/// was; the tick advances it phase-locked from the slot that fired (a tick
-/// served late by a redraw does not drift the cadence; one more than a
-/// period late re-phases from `now`); and a precise delta parks the band,
-/// so the one wake it then owes is its rest-settle start.
-///
-/// Every instant is a fixed offset from one origin, handed to the
-/// clock-injected reducer (`scroll_wheel_animated_at`) and to the tick
-/// alike, so load cannot reorder the chain and the served tick.
+/// The anchor: a notch glide's tick is armed once, one panel period after the
+/// arm; a chained notch (a fresh `GLIDE_MS` retarget) leaves it where it was;
+/// the tick advances phase-locked from the slot that fired (one more than a
+/// period late re-phases from `now`); and a precise delta parks the band, so
+/// its one wake is the rest-settle start. Every instant is a fixed offset from
+/// one origin handed to `scroll_wheel_animated_at` and the tick alike.
 #[test]
 fn a_chained_notch_leaves_the_anchored_tick_alone_and_a_precise_delta_parks_it() {
     use crate::scroll_motion::{GLIDE_MS, TRACK_REST_MS};
@@ -1282,8 +1249,8 @@ fn a_chained_notch_leaves_the_anchored_tick_alone_and_a_precise_delta_parks_it()
         deadline, tick,
         "…and it is the wake the glide owes (its end is far later)"
     );
-    // A notch chained 5 ms later: before the tick is due, the order a live
-    // loop presents them in (the premise the real clock could not keep).
+    // A notch chained 5 ms later, before the tick is due (the order a live loop
+    // presents them in).
     let chain = t0 + Duration::from_millis(5);
     assert!(chain < tick, "fixture: the chain precedes the tick");
     app.scroll_wheel_animated_at(wid, &term, 1, None, None, chain);
@@ -1318,7 +1285,7 @@ fn a_chained_notch_leaves_the_anchored_tick_alone_and_a_precise_delta_parks_it()
         "a stalled tick re-phases from now"
     );
 
-    // A precise delta PARKS the band: its one wake is the rest boundary.
+    // A precise delta parks the band: its one wake is the rest boundary.
     let precise_at = late + Duration::from_millis(1);
     app.scroll_wheel_animated_at(wid, &term, 0, None, Some(3.0), precise_at);
     let (parked_tick, parked_deadline, _) = tick_of(&app);
@@ -1330,18 +1297,14 @@ fn a_chained_notch_leaves_the_anchored_tick_alone_and_a_precise_delta_parks_it()
     );
 }
 
-/// The glide ticks at panel cadence through a dense wake stream. A park
-/// that re-derived `end.min(Instant::now() + interval)` on every wake,
-/// ticking only on `ResumeTimeReached`, would never tick when wakes (the
-/// trackpad's `PixelDelta` stream, a PTY burst) come closer than one
-/// period plus a redraw: the glide would freeze until its 180 ms end and
-/// land in one jump.
-///
-/// This drives the loop the way winit does (a wake every 8 ms, a 2 ms
-/// redraw per wake, the every-wake service `service_due_scroll_motion`, and
-/// the park's re-read) and pins real intermediate motion and that a park
-/// never arms a past instant. The sliding law is computed alongside as the
-/// witness that this stream is adversarial: under it only the end ticks.
+/// The glide ticks at panel cadence through a wake stream denser than one period
+/// plus a redraw (the trackpad's `PixelDelta` stream, a PTY burst). Driven as
+/// winit does (a wake every 8 ms, a 2 ms redraw, the every-wake
+/// `service_due_scroll_motion`, the park's re-read); pins intermediate motion
+/// and that a park never arms a past instant. A sliding
+/// `end.min(now + interval)` park, ticked only on `ResumeTimeReached`, is
+/// computed alongside as the witness that the stream is adversarial: under it
+/// only the end ticks.
 #[test]
 fn a_panel_rate_wake_stream_cannot_starve_the_glide() {
     let mut app = App::headless_for_test();
@@ -1371,8 +1334,8 @@ fn a_panel_rate_wake_stream_cannot_starve_the_glide() {
     loop {
         turns += 1;
         assert!(turns < 64, "the glide must disarm within its 180 ms");
-        // The loop wakes for whichever comes first: the armed timer or the
-        // next external event — and judges the anchored tick EITHER way.
+        // The loop wakes for whichever comes first, the armed timer or the next
+        // external event, and judges the anchored tick either way.
         let wake = armed.min(next_event);
         if wake == next_event {
             next_event += wake_gap;
@@ -1442,11 +1405,9 @@ fn a_panel_rate_wake_stream_cannot_starve_the_glide() {
     );
 }
 
-/// The every-wake service is a level judge: a wake a microsecond before the
-/// anchored tick ticks nothing, and a wake that finds the slot long passed
-/// (a redraw outlasting two panel periods) ticks it and re-phases the
-/// anchor strictly ahead of `now`, so the park's fold never sees a past
-/// instant. The bounce, released at a history end, is served the same way.
+/// The every-wake service is a level judge: a wake just before the anchored
+/// tick ticks nothing, and one long past it ticks and re-phases the anchor
+/// strictly ahead of `now`. The bounce is served the same way.
 #[test]
 fn the_every_wake_service_ticks_only_due_anchors_and_never_leaves_a_past_one() {
     let mut app = App::headless_for_test();
@@ -1539,7 +1500,7 @@ fn wheel_scroll_glides_and_lands_exactly() {
             "no instant jump — the ease moves the viewport"
         );
     }
-    // A chained notch retargets the SAME ease (2 more rows into history).
+    // A chained notch retargets the same ease (2 more rows into history).
     let chained_at = t0 + Duration::from_millis(5);
     app.scroll_wheel_animated_at(wid, &term, 2, None, None, chained_at);
     let end = {
@@ -1642,11 +1603,10 @@ fn reduced_motion_tick_defensively_lands_instead_of_sampling() {
     assert_eq!(app.windows[&wid].scroll_frac_px, 0);
 }
 
-/// Tier-1 binding for `scroll_glide_model::SetReduced`: a config
-/// Full→Reduced edge on the shipping App reducer projects to the model's
-/// atomic `{pos=target, armed=0, reduced=1}` successor. The cancel-only
-/// mutant is an explicit negative control: dropping the state at the old row
-/// violates `ReducedSettled`, so this test cannot pass vacuously.
+/// Tier-1 binding for `scroll_glide_model::SetReduced`: a config Full→Reduced
+/// edge projects to the model's atomic `{pos=target, armed=0, reduced=1}`.
+/// Negative control: cancel-only (dropping the state at the old row) violates
+/// `ReducedSettled`.
 #[test]
 fn reduced_motion_settle_conforms_to_scroll_glide_model() {
     let mut app = App::headless_for_test();
@@ -1678,8 +1638,8 @@ fn reduced_motion_settle_conforms_to_scroll_glide_model() {
         "negative control: cancel-without-landing must be rejected"
     );
 
-    // This is the exact reconciliation invoked immediately after config
-    // generation admission in `apply_prepared_config_generation_unfenced`.
+    // The per-window reconciliation `apply_prepared_config_generation_unfenced`
+    // runs (through `settle_reduced_scroll_motion`) after config admission.
     app.config.motion = Some("reduced".into());
     assert!(app.settle_scroll_motion_if_reduced(wid, t0 + Duration::from_millis(20)));
     let mut actual = before;
@@ -1718,13 +1678,9 @@ fn typing_snap_cancels_glide_tail() {
 }
 
 /// The glide tick banks a sub-row residual (`scroll_frac_px`) so scrolling
-/// glides by the pixel. Across the ease into history: (1) the residual is
-/// always in `[0, cell_h)`; (2) when it is nonzero the engine sits at the
-/// ceil offset and `offset*cell_h - frac` stays a valid eased point in
-/// `[0, target]`, monotone non-decreasing; (3) some tick banks a nonzero
-/// residual (non-vacuity); (4) the final tick lands on the whole-row target
-/// with the residual back at 0. The samples run through `end` itself, and
-/// the glide must disarm there.
+/// glides by the pixel: the residual stays in `[0, cell_h)` with the engine at
+/// the ceil offset, `offset*cell_h - frac` never retreats, some tick banks a
+/// nonzero residual, and the tick at `end` lands whole-row and disarms.
 #[test]
 fn glide_banks_sub_row_residual_and_lands_whole_row() {
     let mut app = App::headless_for_test();
@@ -1761,7 +1717,7 @@ fn glide_banks_sub_row_residual_and_lands_whole_row() {
             (0..cell_h).contains(&frac),
             "residual out of [0,cell_h): {frac}"
         );
-        // The shift-up pairing: content position = engine offset shifted UP by
+        // The shift-up pairing: content position = engine offset shifted up by
         // frac. It must stay a valid eased point and never retreat.
         let pos = offset * cell_h - frac;
         assert!(
@@ -1892,10 +1848,8 @@ fn edge_notch_arms_no_glide_but_shows_pill() {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     let term = seed_history(&app, wid);
-    // Already at the live bottom; a downward notch has nowhere to go. The
-    // notch is placed at `before` and the pill asked at `before`, so the
-    // assertion holds exactly when a touch happened, with no wall-clock
-    // window a deschedule could cross.
+    // Already at the live bottom; a downward notch has nowhere to go. Notch and
+    // pill query share the instant `before`, so no deschedule can cross them.
     let before = std::time::Instant::now();
     app.scroll_wheel_animated_at(wid, &term, -3, None, None, before);
     let ws = app.windows.get(&wid).unwrap();
@@ -1914,12 +1868,10 @@ fn edge_notch_arms_no_glide_but_shows_pill() {
     );
 }
 
-/// Elastic overscroll: a wheel notch past a history end releases a
-/// rubber-band bounce that feeds the signed `scroll_frac_px` and
-/// self-disarms: (1) at the live bottom a downward notch bounces the band
-/// up (positive frac); (2) at the scrollback top an upward notch bounces it
-/// down (negative frac); (3) neither moves the engine (display-only); (4)
-/// frame-paced ticks decay the bounce and drop the spring (frac back to 0).
+/// Elastic overscroll: a notch past a history end releases a display-only bounce
+/// in the signed `scroll_frac_px` (live bottom: up, positive; scrollback top:
+/// down, negative) that frame-paced ticks decay and disarm. Reduced motion never
+/// arms one.
 #[test]
 fn overscroll_bounce_springs_and_self_disarms() {
     use std::time::Instant;
@@ -1974,7 +1926,7 @@ fn overscroll_bounce_springs_and_self_disarms() {
         "a settled bounce rests whole-row (no residual)"
     );
 
-    // (2) TOP edge: scrolled to the top, an upward notch bounces DOWN (−frac).
+    // (2) Top edge: scrolled to the top, an upward notch bounces down (−frac).
     term_lock(&term).scroll_to_top();
     let top = term_lock(&term).grid().display_offset();
     assert!(top > 0, "test needs the viewport parked in history");

@@ -1,54 +1,55 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! WHERE AN UPDATE'S SUCCESSOR REBUILDS ITS LAYOUT (warm successor P3, the
-//! parallel attach, 2026-09-29; `docs/DESIGN-warm-successor-2026-09-29.md`).
+//! Where an update's successor rebuilds its layout (the parallel attach;
+//! `docs/DESIGN-warm-successor-2026-09-29.md`). The rebuild is
+//! `App::apply_pending_restore`; where it runs is `restore_pass_due`. A cold launch runs it
+//! at a park after the first present, so window 0 paints its shell before N shell forks.
+//! On the handoff lane every window stays hidden until its own first present and the
+//! adoption proof waits for all of them, so the pass runs in window 0's `resumed`: windows
+//! 1..N do not wait a second time for a hidden window's first drawable (about 30 ms after
+//! the turn that created it).
 //!
-//! A launch that restores a layout attaches window 0 in `resumed` and rebuilds
-//! the rest (windows 1..N, their tabs, the handed-off shells) in one pass,
-//! `App::apply_pending_restore`. A COLD launch keeps RESTORE-1: the pass waits
-//! for the first present and runs at a park, so window 0 paints its shell
-//! before N shell forks. On the HANDOFF lane every window stays hidden until
-//! its own first present, and the adoption proof waits for all of them, so the
-//! pass runs in the same `resumed` as window 0's attach. A hidden window's
-//! first drawable arrives about 30 ms after the event-loop turn that created
-//! it, so windows 1..N no longer pay that wait a second time behind window 0.
+//! A cold rebuild runs in slices, one per park (`restore_pass_sliced`), with input and
+//! presents between them, so a window that has painted is not frozen for every fork. A
+//! rebuild that places handed-off shells (a handoff, proving or degraded) runs whole.
 
 use super::{Liveness, Model, and_, eq, int, or_, var};
 
-/// The successor's layout rebuild and its adoption proof, as
-/// `aterm-gui`'s `restore_pass_due` and `App::maybe_signal_handoff_ready`
-/// decide them.
+/// The successor's layout rebuild and its adoption proof, as `restore_pass_due`,
+/// `restore_pass_sliced` and `App::maybe_signal_handoff_ready` decide them.
 ///
-/// State: `lane` — 0 not started, 1 an update's successor that can still
-/// prove, 2 a cold launch (or a degraded handoff, which never proves).
-/// `many` — the layout has windows beyond window 0. `phase` — 0 before
-/// `resumed`, 1 inside the `resumed` that attached window 0 and started its
-/// first present, 2 at the parks after it. `queued` — the rebuild is still
-/// owed. `extras` — windows 1..N exist. `kicked` — the rebuild started each
-/// extra window's direct first present (a hidden macOS window is not reliably
-/// sent `RedrawRequested`). `painted0` / `painted_extras` — window 0 / every
+/// State: `lane` — 0 not started, 1 an update's successor that can still prove, 2 a cold
+/// launch (or a degraded handoff, which never proves). `handed` — the rebuild places
+/// handed-off shells (a handoff, proving or degraded). `draining` — a cold rebuild has run
+/// a slice and owes the rest. `many` — the layout has windows beyond window 0. `phase` — 0
+/// before `resumed`, 1 inside the `resumed` that attached window 0, 2 at the parks after
+/// it. `queued` — the rebuild is still owed. `extras` — windows 1..N exist. `kicked` — the
+/// rebuild started each extra window's direct first present (a hidden macOS window is not
+/// reliably sent `RedrawRequested`). `painted0` / `painted_extras` — window 0 / every
 /// extra window has presented. `proved` — the adoption proof is written.
 ///
-/// Invariants, each caught by its own `Buggy = 1` action, so none masks
-/// another: `ColdRestoreAfterFirstPaint` — a cold launch never rebuilds
-/// before a window has presented (RESTORE-1); `RebuildAtAttachCold` runs the
-/// attach pass on the cold lane. `HandoffAttachesInOnePass` — the handoff
-/// lane never leaves window 0's attach with the rebuild still owed;
-/// `LeaveResumeOwing` waits for the park, as before P3.
-/// `ProofNeedsDrainedAndPainted` — the proof needs the rebuild drained and
-/// every window, window 0 and each extra, painted; `ProveAtFirstPresent`
-/// proves at window 0's first present alone (the multi-window trap: the parent
-/// exits while windows 2..N have no replacement).
+/// Invariants, each caught by its own `Buggy = 1` action:
+/// * `ColdRestoreAfterFirstPaint` — a cold launch never rebuilds before a window has
+///   presented; broken by `RebuildAtAttachCold`.
+/// * `HandoffAttachesInOnePass` — the handoff lane never leaves window 0's attach with the
+///   rebuild owed; broken by `LeaveResumeOwing`.
+/// * `ProofNeedsDrainedAndPainted` — the proof needs the rebuild drained and every window
+///   painted; broken by `ProveAtFirstPresent` (the parent would exit while windows 2..N
+///   have no replacement).
+/// * `EveryRebuiltWindowPresents` — broken by `RebuildWithoutKick`, which is also the
+///   liveness mutant: extras never present, so the proof never comes.
+/// * `HandedRebuildsWhole` — a rebuild that places handed-off shells never runs in
+///   slices; broken by `RebuildSliceHanded`, which slices a degraded handoff's.
+/// * `ColdSlicesAfterFirstPaint` — no slice runs before a window has presented (a slice
+///   leaves the rebuild owed, so `ColdRestoreAfterFirstPaint` does not see it); broken by
+///   `RebuildSliceBeforePaint`.
 ///
-/// `EveryRebuiltWindowPresents` — the rebuild starts the first present of
-/// every extra window it creates; `RebuildWithoutKick` creates them without.
+/// `extras` turns only at a drain's last slice, though the real slices create windows
+/// earlier: the proof is what waits on them, and a cold launch never proves.
 ///
-/// Liveness (`TheSuccessorProves`, [`native_update_successor_attach_liveness`]):
-/// a handoff proves, and a cold launch ends rebuilt and painted, under weak
-/// fairness of the app's steps and of the window server's first drawables.
-/// Mutant: `RebuildWithoutKick`, extra windows created without their direct
-/// first present, which never present and so never let the proof through.
+/// Liveness (`TheSuccessorProves`, [`native_update_successor_attach_liveness`]) holds under
+/// weak fairness of the app's steps and the window server's first drawables.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_update_successor_attach_model() -> Model {
@@ -64,15 +65,24 @@ pub fn native_update_successor_attach_model() -> Model {
             var painted0 = 0;
             var painted_extras = 0;
             var proved = 0;
+            var handed = 0;
+            var draining = 0;
             // The layout the boot restores has windows beyond window 0.
             action Widen when (lane == 0 && many == 0) {
                 many = 1;
             }
             action StartHandoff when (lane == 0) {
                 lane = 1;
+                handed = 1;
             }
             action StartCold when (lane == 0) {
                 lane = 2;
+            }
+            // A handoff that degraded before its rebuild: the cold lane's
+            // order, with handed-off shells to place.
+            action StartDegraded when (lane == 0) {
+                lane = 2;
+                handed = 1;
             }
             // `resumed`: window 0 attached hidden, its direct first present
             // started.
@@ -89,13 +99,22 @@ pub fn native_update_successor_attach_model() -> Model {
             action LeaveResume when (phase == 1 && (queued == 0 || lane == 2)) {
                 phase = 2;
             }
-            // `restore_pass_due(Park, ..)`: after a window has presented.
+            // `restore_pass_due(Park, ..)`: after a window has presented. The
+            // whole pass, or a drain's last slice.
             action RebuildAtPark when (
                 phase == 2 && queued == 1 && painted0 + painted_extras > 0
             ) {
                 queued = 0;
                 extras = many;
                 kicked = many;
+                draining = 0;
+            }
+            // `restore_pass_sliced(Park, ..)`: a slice that leaves the rest of
+            // a cold rebuild owed to the next park.
+            action RebuildSliceAtPark when (
+                phase == 2 && queued == 1 && painted0 + painted_extras > 0 && handed == 0
+            ) {
+                draining = 1;
             }
             // The window server hands a hidden window its first drawable.
             action Present0 when (phase > 0 && painted0 == 0) {
@@ -111,7 +130,7 @@ pub fn native_update_successor_attach_model() -> Model {
             ) {
                 proved = 1;
             }
-            // MUTANT: the attach pass on the cold lane too.
+            // Mutant: the attach pass on the cold lane too.
             action RebuildAtAttachCold when (
                 Buggy == 1 && phase == 1 && queued == 1 && lane == 2
             ) {
@@ -119,20 +138,34 @@ pub fn native_update_successor_attach_model() -> Model {
                 extras = many;
                 kicked = many;
             }
-            // MUTANT: the handoff lane leaves `resumed` with its rebuild owed.
+            // Mutant: the handoff lane leaves `resumed` with its rebuild owed.
             action LeaveResumeOwing when (
                 Buggy == 1 && phase == 1 && queued == 1 && lane == 1
             ) {
                 phase = 2;
             }
-            // MUTANT: the proof at window 0's first present alone.
+            // Mutant: the proof at window 0's first present alone.
             action ProveAtFirstPresent when (
                 Buggy == 1 && lane == 1 && proved == 0 && painted0 == 1
             ) {
                 proved = 1;
             }
-            // MUTANT (liveness): the rebuild creates the extra windows but
-            // starts none of their first presents.
+            // Mutant: a degraded handoff's rebuild in slices.
+            action RebuildSliceHanded when (
+                Buggy == 1 && phase == 2 && queued == 1 &&
+                painted0 + painted_extras > 0 && handed == 1
+            ) {
+                draining = 1;
+            }
+            // Mutant: a cold slice before any window has presented.
+            action RebuildSliceBeforePaint when (
+                Buggy == 1 && phase == 1 && queued == 1 && handed == 0 &&
+                painted0 + painted_extras == 0
+            ) {
+                draining = 1;
+            }
+            // Mutant (liveness): the rebuild creates the extra windows but starts none of
+            // their first presents.
             action RebuildWithoutKick when (
                 Buggy == 1 && phase == 1 && queued == 1 && lane == 1 && many == 1
             ) {
@@ -147,6 +180,9 @@ pub fn native_update_successor_attach_model() -> Model {
             invariant EveryRebuiltWindowPresents: kicked == extras;
             invariant ProofNeedsDrainedAndPainted:
                 proved == 0 || (queued == 0 && painted0 == 1 && painted_extras == extras);
+            invariant HandedRebuildsWhole: handed == 0 || draining == 0;
+            invariant ColdSlicesAfterFirstPaint:
+                draining == 0 || painted0 + painted_extras > 0;
         }
     }
 }
@@ -156,6 +192,7 @@ pub fn native_update_successor_attach_model() -> Model {
 /// painted.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
+#[crate::liveness(crate::derive::native_update_successor_attach_model)]
 pub fn native_update_successor_attach_liveness() -> Liveness {
     Liveness {
         name: "TheSuccessorProves",

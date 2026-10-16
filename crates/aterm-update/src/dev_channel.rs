@@ -37,7 +37,7 @@ use aterm_update_core::{HeadAnswer, HttpError};
 pub(crate) const APPCAST_ASSET: &str = "aterm-appcast.toml";
 
 /// How often a running dev build asks again: daily, the channel's release cadence;
-/// the updater's ten-minute cadence buys a dev build nothing.
+/// the updater's two-minute cadence buys a dev build nothing.
 pub const RECHECK_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Where a dev build stands against the newest release on the public channel.

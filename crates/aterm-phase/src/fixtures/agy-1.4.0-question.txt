@@ -1,0 +1,30 @@
+# agy 1.4.0 · MEASURED 2026-10-16, `aterm ctl text --json` of a private headless aterm 120x40 (aterm 0.105.0 098c216c7), the atpkg-managed agy (Google latest) launched through its shim under the owner's signed-in account (Gemini 4 Argon, medium), scratch ATERM_STATE_HOME/XDG dirs, harness off · agy's ask-the-user tool: a `? <question>` row, the `Question` title (bold f1fa8c) over a rule, `Question 1/1: …`, options `> 1. Red`, `2. Green`, `3. Blue`, `4. Write-in...`, the key row `↑/↓ Navigate · enter Select · esc Skip`, footer `esc to cancel`, cursor hidden; digit 3 answers at once · cursor=28,0 (hidden) · account and scratch path redacted at equal length
+  a fail-safe visual backup when electronics fail. Today, historic lighthouses are cherished worldwide as cultural
+  landmarks, museums, and enduring symbols of human resilience against the sea.
+
+────────────────────────────────────────────────────────────
+> Edit the file x.txt so it contains the single line: hi
+
+● Edited 1 file (x.txt) (ctrl+o to expand)
+
+Create file
+  ⎿  User declined the tool call
+
+────────────────────────────────────────────────────────────
+> I want to pick a color for a logo. Use your tool for asking the user a question (if you have one) to ask me to choose
+  between red, green and blue. Do nothing else.
+
+? Which color would you like to choose for the logo?
+
+Question
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+Question 1/1: Which color would you like to choose for the logo?
+
+> 1. Red
+  2. Green
+  3. Blue
+  4. Write-in...
+
+  ↑/↓ Navigate · enter Select · esc Skip
+esc to cancel                                                                                    Gemini 4 Argon · medium

@@ -1,27 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! M1 PROVE (4) — RASTER INVARIANCE of smooth scrolling at `frac == 0`: a frame
-//! whose viewport was reached by INCREMENTAL row steps (exactly what the M1
-//! wheel glide's ticks apply — `scroll_motion::decompose(eased_px, cell_h)`
-//! row deltas via `scroll_display`) is BYTE-IDENTICAL to the same viewport
-//! reached by a single row-jump. Text stays raster-exact while moving: the
-//! glide perturbs only WHICH rows show, never how any glyph rasterizes, and
-//! the damage-tracked cache retains no residue from the intermediate frames.
+//! Raster invariance of smooth scrolling at `frac == 0`: a viewport reached by
+//! incremental row steps (the wheel glide's `scroll_motion::decompose` row
+//! deltas via `scroll_display`) is byte-identical to the same viewport reached
+//! by one row-jump, on the stateless renderer (`render_input`) and on the
+//! damage-cached path (`render_input_cached`), where one cache sees every
+//! intermediate frame and a fresh one jumps straight there.
 //!
-//! Two lanes prove it:
-//! * the STATELESS renderer (`render_input`): pure-function equality of the
-//!   destination viewport;
-//! * the DAMAGE-CACHED path (`render_input_cached`, the windowed frontend's
-//!   present lane): path A renders EVERY intermediate frame of a step-by-step
-//!   scroll into one persistent cache (the glide's real access pattern),
-//!   path B jumps straight to the destination in a fresh cache — the final
-//!   framebuffers must match byte-for-byte.
-//!
-//! (The full decomposition law `rows*cell_h + frac == px`, `frac ∈ [0, cell_h)`
-//! is lattice-proven in aterm-gui's `scroll_motion` module + the ScrollGlide
-//! ty model; this test pins the render half at the `frac == 0` anchor every
-//! glide passes through and ends on.)
+//! The decomposition law `rows*cell_h + frac == px`, `frac ∈ [0, cell_h)` is
+//! proven in aterm-gui's `scroll_motion` and the `ScrollGlide` model; this pins
+//! the render half at the `frac == 0` anchor every glide passes through.
 
 use aterm_core::terminal::Terminal;
 use aterm_render::{Renderer, Theme, WindowCpu};
@@ -52,8 +41,7 @@ fn stepped_scroll_matches_row_jump_stateless() {
     let mut r = Renderer::from_system(16.0, Theme::default())
         .expect("no font: build with aterm-render's default embedded-font feature");
 
-    // Path A: step one row at a time (the glide's tick pattern), rendering
-    // every intermediate frame (the animation's real workload).
+    // Path A: one row at a time (the glide's ticks), rendering every frame.
     let mut stepped = seeded_terminal();
     let mut last = None;
     for _ in 0..TARGET_OFFSET {
@@ -76,7 +64,7 @@ fn stepped_scroll_matches_row_jump_stateless() {
         stepped_frame.pixels, jumped_frame.pixels,
         "a viewport reached by row-steps must be byte-identical to the row-jump"
     );
-    // NON-VACUITY: the scroll genuinely changed the picture (offset 0 differs).
+    // Non-vacuity: the scrolled viewport differs from offset 0.
     let live = r.render_input(&seeded_terminal().cell_frame(ROWS, COLS));
     assert_ne!(
         live.pixels, jumped_frame.pixels,
@@ -89,12 +77,11 @@ fn stepped_scroll_matches_row_jump_damage_cached() {
     let mut r = Renderer::from_system(16.0, Theme::default())
         .expect("no font: build with aterm-render's default embedded-font feature");
 
-    // Path A: ONE persistent per-window cache sees every intermediate frame —
-    // any row-reuse bug (stale rows surviving a scroll) would leave residue in
-    // the final framebuffer.
+    // Path A: one persistent cache sees every intermediate frame, so stale
+    // rows surviving a scroll would leave residue.
     let mut wc_stepped = WindowCpu::new();
     let mut stepped = seeded_terminal();
-    // Seed the cache with the live frame first (the real present sequence).
+    // Seed the cache with the live frame first, as a real present does.
     let _ = r.render_input_cached(&mut wc_stepped, &stepped.cell_frame(ROWS, COLS));
     for _ in 0..TARGET_OFFSET {
         stepped.scroll_display(1);

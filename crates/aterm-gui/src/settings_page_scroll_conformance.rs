@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance for Settings' bounded semantic-page cursor.
+//! Tier-1 conformance for a Settings list's bounded scroll cursor.
 //!
 //! Every shipping reducer path calls `settings_page_scroll_transition`; this test
-//! projects that genuine seam onto the derived Previous/Next/Absolute and signed
-//! line-scroll actions, including limit shrink and stale-offset recovery.
+//! projects that genuine seam onto the derived row-step, Absolute and signed
+//! multi-row actions, including limit shrink and stale-offset recovery.
 
 use crate::native_settings::{SettingsPageScrollCommand, settings_page_scroll_transition};
 use aterm_spec::derive::{Model, settings_page_scroll_model};
@@ -58,8 +58,8 @@ fn shipping_page_scroll_commands_conform_over_complete_bounded_lattice() {
     for limit in 0..=MODEL_MAX {
         for cursor in 0..=limit {
             for (command, action) in [
-                (SettingsPageScrollCommand::Previous, "PreviousPage"),
-                (SettingsPageScrollCommand::Next, "NextPage"),
+                (SettingsPageScrollCommand::Lines(-1), "RowBack"),
+                (SettingsPageScrollCommand::Lines(1), "RowForward"),
                 (SettingsPageScrollCommand::Lines(-2), "ScrollBackward"),
                 (SettingsPageScrollCommand::Lines(2), "ScrollForward"),
             ] {
@@ -122,14 +122,6 @@ fn independent_transition(
 ) -> usize {
     let clamped = current.min(limit);
     match command {
-        SettingsPageScrollCommand::Previous => clamped.saturating_sub(1),
-        SettingsPageScrollCommand::Next => {
-            if clamped < limit {
-                clamped + 1
-            } else {
-                limit
-            }
-        }
         SettingsPageScrollCommand::Absolute(target) => target.min(limit),
         SettingsPageScrollCommand::Lines(lines) if lines < 0 => {
             clamped.saturating_sub(lines.unsigned_abs() as usize)
@@ -149,15 +141,6 @@ fn shipping_helper_clamps_stale_offsets_and_arbitrary_line_deltas() {
 
     for limit in 0..=MODEL_MAX {
         for current in currents {
-            for command in [
-                SettingsPageScrollCommand::Previous,
-                SettingsPageScrollCommand::Next,
-            ] {
-                let actual = settings_page_scroll_transition(current, limit, command);
-                assert_eq!(actual, independent_transition(current, limit, command));
-                assert!(actual <= limit);
-                cases += 1;
-            }
             for target in targets {
                 let command = SettingsPageScrollCommand::Absolute(target);
                 let actual = settings_page_scroll_transition(current, limit, command);
@@ -175,11 +158,11 @@ fn shipping_helper_clamps_stale_offsets_and_arbitrary_line_deltas() {
         }
     }
 
-    assert_eq!(cases, 504);
+    assert_eq!(cases, 448);
 }
 
 #[test]
-fn unclamped_next_negative_control_is_rejected() {
+fn unclamped_row_forward_negative_control_is_rejected() {
     let model = settings_page_scroll_model();
     let mut rejected = 0usize;
 
@@ -191,7 +174,7 @@ fn unclamped_next_negative_control_is_rejected() {
             i64::try_from(limit + 1).expect("bounded mutant cursor"),
         );
         assert_ne!(
-            model.successors("NextPage", &before).as_slice(),
+            model.successors("RowForward", &before).as_slice(),
             std::slice::from_ref(&forged),
         );
         assert!(!model.check_invariant("CursorBounded", &forged));

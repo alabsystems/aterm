@@ -17,21 +17,18 @@ autotests = false
 [features]
 default = ["disk-tier"]
 # Disk-backed scrollback cold tier, forwarded to aterm-grid and aterm-scrollback.
-# A wasm consumer disables it (--no-default-features) to drop libc/zstd-sys.
+# A wasm consumer disables it (--no-default-features) to drop libc.
 disk-tier = ["aterm-grid/disk-tier", "aterm-scrollback/disk-tier"]
 # Serde on the CheckpointMeta seam (seamless-update screen carry): derives on the
 # checkpoint's scalar projections only — grid bodies stay on the binary Line codec.
 serde = ["dep:serde", "aterm-types/serde"]
 # Heavyweight stress/stability tests (tests/stress_stability.rs).
 long-tests = []
-# Deterministic fault injection (src/fault.rs) for downstream tests; without it
-# `triggered()` is a const false. Unit tests get the registry via cfg(test).
-fault-injection = []
 # UAX #9 BiDi visual reordering (terminal/bidi_reorder.rs):
 # `Terminal::bidi_visual_order`. Applying the permutation is the renderer's job.
 bidi = ["dep:aterm-bidi"]
 # Compile the `#[refines]`/`#[spec_unmodeled]` anchors into the library so
-# aterm-gui's `spec_xref_closure` test can collect them via `inventory`. Off in
+# aterm-gui's `spec_xref_closure` test can collect them via `aterm_spec::registry`. Off in
 # production: no `aterm-spec` in the closure.
 spec-anchors = ["dep:aterm-spec"]
 # Sixel graphics: decode a sixel DCS into an inline image (the OSC 1337 `File=`
@@ -41,7 +38,7 @@ sixel = ["dep:aterm-sixel"]
 
 [dependencies]
 # Library dependency only under `spec-anchors` (the anchors emit
-# `::aterm_spec::inventory::submit!`).
+# `::aterm_spec::registry::submit!`).
 aterm-spec = { workspace = true, optional = true }
 aterm-log = { workspace = true }
 aterm-hash = { workspace = true }
@@ -51,7 +48,7 @@ aterm-codec = { workspace = true }
 # frames, which composes pixels.
 aterm-png = { workspace = true }
 aterm-types = { workspace = true }
-serde = { workspace = true, optional = true }
+serde = { workspace = true, optional = true, features = ["derive"] }
 aterm-provenance = { workspace = true }
 aterm-grapheme = { workspace = true }
 # Path, not `workspace = true`, so default-features = false stays local; this
@@ -74,12 +71,6 @@ aterm-sixel = { workspace = true, optional = true }
 
 [dev-dependencies]
 aterm-spec = { workspace = true }
-# aterm-grid's testing-gated items (ExtendedStyleInfo, DamageRect,
-# is_combining_mark, …) that `grid/mod.rs` re-exports under cfg(test).
-aterm-grid = { path = "../aterm-grid", default-features = false, features = ["alacritty-compat", "testing"] }
-# The scrollback corruption seam (`inject_corrupted_warm_block`) for the search
-# index's dense-history conformance tests.
-aterm-scrollback = { workspace = true, features = ["testing"] }
 
 [lints]
 workspace = true

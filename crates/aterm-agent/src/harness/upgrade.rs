@@ -202,10 +202,11 @@ pub struct SessionFile {
     pub claude_dir: Option<PathBuf>,
     /// THE PROFILE CLAUDE CODE KEEPS FOR THE HOME THIS RECORD WAS READ UNDER
     /// (its global config, where the login's model caches are), where the
-    /// directory alone does not name it: a `CLAUDE_CONFIG_DIR` set and EMPTY
-    /// files its records in the directory the process runs in and keeps its
-    /// profile in `$HOME/.claude.json` (`upgrade_drive::profile_apart`). Set
-    /// by the readers that know the home's raw value
+    /// directory alone does not name it (`upgrade_drive::profile_apart`): a
+    /// `CLAUDE_CONFIG_DIR` set and EMPTY files its records in the directory
+    /// the process runs in and keeps its profile in `$HOME/.claude.json`, and
+    /// one naming the user's own `~/.claude` keeps it inside, not beside, it.
+    /// Set by the readers that know the home's raw value
     /// (`upgrade_drive::Records`); `None` for every other home, whose profile
     /// is read by `claude_dir` (beside the user's `~/.claude`, inside any
     /// other).
@@ -300,22 +301,43 @@ impl Agent {
         }
     }
 
-    /// [`Self::word`] read back; anything but `codex` is Claude's.
+    /// [`Self::word`] read back, and Claude's own name for its lane. `None`
+    /// for any other word: a record a newer build wrote for an agent this one
+    /// has no lane for, which is never driven as another agent's.
     #[must_use]
-    pub fn parse(word: &str) -> Self {
-        if word == "codex" {
-            Agent::Codex
-        } else {
-            Agent::Claude
+    pub fn parse(word: &str) -> Option<Self> {
+        match word {
+            "" | "claude" => Some(Agent::Claude),
+            "codex" => Some(Agent::Codex),
+            _ => None,
         }
     }
 
-    /// The product's name, as the owner reads it.
+    /// The product's name, as the owner reads it ([`aterm_phase::Program::product`]).
     #[must_use]
     pub fn product(self) -> &'static str {
+        self.program().product()
+    }
+
+    /// The program whose screen reader reads this agent's tab.
+    #[must_use]
+    pub fn program(self) -> aterm_phase::Program {
         match self {
-            Agent::Claude => "Claude Code",
-            Agent::Codex => "Codex",
+            Agent::Claude => aterm_phase::Program::Claude,
+            Agent::Codex => aterm_phase::Program::Codex,
+        }
+    }
+
+    /// The lane that moves `program`'s agent; `None` for a program no lane
+    /// moves (agy, Muse Code, any other).
+    #[must_use]
+    pub fn of(program: aterm_phase::Program) -> Option<Self> {
+        match program {
+            aterm_phase::Program::Claude => Some(Agent::Claude),
+            aterm_phase::Program::Codex => Some(Agent::Codex),
+            aterm_phase::Program::Agy
+            | aterm_phase::Program::Muse
+            | aterm_phase::Program::Generic => None,
         }
     }
 }
@@ -480,6 +502,10 @@ const FLAGS: &[(&str, Arity, Fate)] = &[
     ("--safe-mode", Arity::None, Fate::Keep),
     ("--session-id", Arity::One, Fate::Drop),
     ("--setting-sources", Arity::One, Fate::Keep),
+    // Kept verbatim — all but aterm's own usage tap, exactly
+    // (`super::tap::is_ours`), which [`carried`] sheds: a relaunch adds it
+    // again where its gate still holds (`super::tap::gate`), so a stale path
+    // or a tap switched off leaves at the next relaunch.
     ("--settings", Arity::One, Fate::Keep),
     ("--strict-mcp-config", Arity::None, Fate::Keep),
     ("--system-prompt", Arity::One, Fate::Keep),
@@ -565,17 +591,42 @@ pub(crate) fn permission_argv(argv: &[String]) -> Vec<String> {
 
 /// Every flag [`rewrite_argv`] carries, in argv order: its name and its tokens
 /// as the CLI parsed them (`--model=<v>` is one token, `--model <v>` two).
+/// A `--settings` whose value is EXACTLY aterm's usage tap
+/// (`super::tap::is_ours`, either spelling) is not carried: it is aterm's
+/// to add again, never a person's.
 fn carried(argv: &[String]) -> Result<Vec<(&str, &[String])>, ArgvRefusal> {
     let mut out = Vec::new();
     for (name, fate, tokens) in parsed(argv) {
         match fate {
             None => return Err(ArgvRefusal::UnknownFlag(name.to_string())),
             Some(Fate::Refuse) => return Err(ArgvRefusal::NotResumable(name.to_string())),
+            Some(Fate::Keep) if name == "--settings" && tap_tokens(tokens) => {}
             Some(Fate::Keep) => out.push((name, tokens)),
             Some(Fate::Drop) => {}
         }
     }
     Ok(out)
+}
+
+/// Whether a `--settings` flag's tokens (`--settings v` or `--settings=v`)
+/// carry aterm's usage tap ([`super::tap::is_ours`]).
+fn tap_tokens(tokens: &[String]) -> bool {
+    let value = match tokens {
+        [flag, value] if flag == "--settings" => Some(value.as_str()),
+        [one] => one.strip_prefix("--settings="),
+        _ => None,
+    };
+    value.is_some_and(super::tap::is_ours)
+}
+
+/// The NAMES of the flags [`rewrite_argv`] carries from `argv`, in argv
+/// order (aterm's usage tap shed): what the tap's gate asks of a launch
+/// (`super::tap::gate`: no `--settings` of a person's, no `--bare`).
+///
+/// # Errors
+/// As [`rewrite_argv`].
+pub(super) fn carried_names(argv: &[String]) -> Result<Vec<&str>, ArgvRefusal> {
+    Ok(carried(argv)?.into_iter().map(|(name, _)| name).collect())
 }
 
 /// Every flag in `argv` as Claude's parser reads it, in argv order: its name,
@@ -2305,6 +2356,47 @@ pub struct StandingWall {
     /// text names (`five_hour` or `seven_day`, `usage::notice_window`); else
     /// `None`.
     pub window: Option<String>,
+    /// What the row says of the account's usage credits
+    /// (`quotaLimits.overageStatus`): `None` where it says nothing.
+    pub credits: Option<CreditsWord>,
+}
+
+/// What a limit row says of the account's usage credits
+/// (`quotaLimits.overageStatus`, `overageDisabledReason`, `overageResetsAt`;
+/// the keys MEASURED on this machine's rows, `"overageStatus":"rejected",
+/// "overageDisabledReason":"org_level_disabled"`, the others' values READ in
+/// the 2.1.300 bundle).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CreditsWord {
+    /// `allowed` or `allowed_warning`: credits are on.
+    On,
+    /// `rejected`: off — the vendor's reason (`out_of_credits`,
+    /// `org_level_disabled`, …) and when they come back, where it names them.
+    Off {
+        reason: Option<String>,
+        until: Option<u64>,
+    },
+}
+
+impl CreditsWord {
+    /// The word of a row's `quotaLimits`, if it says one.
+    fn of(quota: &Value) -> Option<CreditsWord> {
+        match quota.get("overageStatus").and_then(Value::as_str)? {
+            "allowed" | "allowed_warning" => Some(CreditsWord::On),
+            "rejected" => Some(CreditsWord::Off {
+                reason: quota
+                    .get("overageDisabledReason")
+                    .and_then(Value::as_str)
+                    .filter(|word| is_limit_type(word))
+                    .map(str::to_owned),
+                until: quota
+                    .get("overageResetsAt")
+                    .and_then(Value::as_u64)
+                    .filter(|&at| at > 0),
+            }),
+            _ => None,
+        }
+    }
 }
 
 /// THE QUOTA WALL THE SESSION STANDS AT, by its transcript (`jsonl`, a tail):
@@ -2353,6 +2445,7 @@ pub fn transcript_standing_wall(jsonl: &str) -> Option<StandingWall> {
             window: named
                 .or_else(|| row_texts(v).find_map(super::usage::notice_window))
                 .map(str::to_owned),
+            credits: CreditsWord::of(quota),
         })
     })
 }
@@ -2392,6 +2485,35 @@ fn standing_limit<T>(jsonl: &str, read: impl Fn(&Value) -> Option<T>) -> Option<
         }
     }
     until
+}
+
+/// WHEN THE SESSION'S NEWEST ANSWER CAME, by its transcript (`jsonl`, a
+/// tail), of those that came by the second `by`: the latest `timestamp`, unix
+/// seconds, no later than `by`, of an assistant row that is an API response —
+/// the model's own (`message.model` a model id, a sidechain's included) or a
+/// limit's rejection ([`is_limit_row`]). What Claude Code's notices of usage
+/// beside the composer were true at: it draws them from the newest answer's
+/// rate-limit headers, and leaves them standing at rest however long the tab
+/// idles; `by` is where a screen read can have been drawn after an answer
+/// (`accounts::UsageSaid::at`). `None`: no such row in the tail. It reads; it
+/// records nothing.
+#[must_use]
+pub fn transcript_last_answer(jsonl: &str, by: u64) -> Option<u64> {
+    jsonl
+        .lines()
+        .filter(|line| line.contains("assistant"))
+        .filter_map(|line| {
+            let v = super::transcript::conversation(line).ok()?;
+            let answer = v.get("type").and_then(Value::as_str) == Some("assistant")
+                && (is_limit_row(&v)
+                    || v.get("message")
+                        .and_then(|m| m.get("model"))
+                        .and_then(Value::as_str)
+                        .is_some_and(is_model_id));
+            answer.then(|| row_time(&v)).flatten()
+        })
+        .filter(|at| *at <= by)
+        .max()
 }
 
 /// The command Claude Code records for its usage-limit dialog: it submits
@@ -2526,17 +2648,17 @@ pub fn transcript_login(phase: &Phase, marker: &str, tail: &str) -> TranscriptLo
     }
 }
 
-/// The login fact ([`Facts::login`]) of a screen of `agent`'s, by the one
-/// recogniser the supervisor reads walls with ([`aterm_phase::wall`]):
-/// Claude Code's `⏺ Login expired · Please run /login` or `Not logged in ·
-/// …`, Codex's login notice ([`aterm_phase::codex::wall`]).
+/// The login fact ([`Facts::login`]) of a screen of `agent`'s, by the
+/// agent's reader the supervisor reads walls with
+/// ([`aterm_phase::ScreenReader::wall`]): Claude Code's `⏺ Login expired ·
+/// Please run /login` or `Not logged in · …`, Codex's login notice.
 #[must_use]
 pub fn login_wall(agent: Agent, rows: &[String]) -> bool {
-    let wall = match agent {
-        Agent::Claude => aterm_phase::wall(rows),
-        Agent::Codex => aterm_phase::codex::wall(rows),
-    };
-    wall.is_some_and(|w| w.kind == aterm_phase::WallKind::Auth)
+    agent
+        .program()
+        .reader()
+        .wall(rows)
+        .is_some_and(|w| w.kind == aterm_phase::WallKind::Auth)
 }
 
 /// The ask number of the next notice ([`Step::Announce`]) of an upgrade in
@@ -4364,18 +4486,14 @@ pub fn own_draft(draft: &str) -> bool {
 /// the process the notice reached, never over direction taken up after its
 /// last answer (`upgrade_drive::release`, [`directed_since_ready`]). `agent`
 /// names the product (`Claude Code`).
-#[must_use]
-pub fn release_prompt(agent: Agent) -> String {
-    release_prompt_as(agent, false)
-}
-
-/// [`release_prompt`] under the flow the next round runs in: `quiet`
+///
+/// It is said under the flow the next round runs in: `quiet`
 /// ([`Facts::quiet`], the default) makes no promise to ask first — the round
 /// after it moves the session at a genuinely idle point and asks nothing
 /// ([`quiet_step`]), so "nothing will restart this session without asking you
 /// again first" would be false there. Both say the notice no longer applies, and to carry on.
 #[must_use]
-pub fn release_prompt_as(agent: Agent, quiet: bool) -> String {
+pub fn release_prompt(agent: Agent, quiet: bool) -> String {
     if quiet {
         return format!(
             "{RELEASE_HEAD}The {} upgrade is off for now, and nothing the notice asked of you \

@@ -420,6 +420,39 @@ mod imp {
             Ok(())
         }
 
+        /// Move into an exclusively owned recovery directory without replacing
+        /// any destination or unlinking a subsequently replaced source path.
+        /// An identity change around rename is reported; moved bytes remain in
+        /// the recovery directory even when its final validation/sync fails.
+        pub(crate) fn move_to_recovery(self, target: &PinnedDir, name: &OsStr) -> io::Result<()> {
+            validate_component(name)?;
+            self.validate_path_identity()?;
+            target.validate_path_identity()?;
+            #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+            {
+                let identity = self.identity()?;
+                renameat_with(
+                    self.dir.leaf(),
+                    &self.name,
+                    target.leaf(),
+                    name,
+                    RenameFlags::NOREPLACE,
+                )
+                .map_err(io::Error::from)?;
+                identity.validate_at_retained(target, name)?;
+                self.dir.sync()?;
+                target.sync()?;
+                target.validate_path_identity()
+            }
+            #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
+            {
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "exclusive recovery move is unavailable",
+                ))
+            }
+        }
+
         fn replace_as(mut self, name: &OsStr) -> io::Result<Self> {
             validate_component(name)?;
             if let Err(error) = self.validate_path_identity() {
@@ -1567,6 +1600,23 @@ mod imp {
 
         pub(crate) fn remove_exact(self) -> io::Result<()> {
             dispose_file_handle(&self.file)
+        }
+
+        /// Handle-based exclusive recovery move; no source pathname is ever
+        /// conditionally unlinked after another file may have replaced it.
+        pub(crate) fn move_to_recovery(self, target: &PinnedDir, name: &OsStr) -> io::Result<()> {
+            validate_component(name)?;
+            self.validate_path_identity()?;
+            target.validate_path_identity()?;
+            let outgoing = open_disposable(&self.dir.path.join(&self.name))?;
+            if !same_identity(&outgoing, &self.file) {
+                return Err(identity_changed());
+            }
+            rename_file_handle(&outgoing, &target.path, name, false)?;
+            self.identity()?.validate_at_retained(target, name)?;
+            self.dir.sync()?;
+            target.sync()?;
+            target.validate_path_identity()
         }
 
         fn replace_as(mut self, name: &OsStr) -> io::Result<Self> {

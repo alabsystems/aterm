@@ -1,44 +1,43 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! STRAIN — explaining very heavy system use on the band (design §10.14,
-//! rulings 206–212). §10.6 covers aterm's OWN heavy jobs; this is a machine
-//! loaded by something else.
+//! Strain: explaining very heavy system use on the band, a machine loaded by
+//! something other than aterm's own jobs.
 //!
-//! # The rule (ruling 206)
+//! # The rule
 //!
 //! The glass carries a strain row only while all four hold:
 //!
-//! 1. **FELT** — aterm measured slow HARDWARE input in a focused, on-screen
+//! 1. **Felt**: aterm measured slow hardware input in a focused, on-screen
 //!    window ([`StrainTracker::note_key`], [`StrainTracker::note_freeze`],
 //!    [`StrainTracker::felt`]).
-//! 2. **HEAVY** — a resource is past its enter line in two consecutive
+//! 2. **Heavy**: a resource is past its enter line in two consecutive
 //!    readings ([`StrainTracker::observe`], [`StrainTracker::verdict`]).
-//! 3. **NAMED** — the cause is named from what was measured ([`group`]).
-//! 4. **NOT OWN** — the cause is not the session receiving the keys, not an
+//! 3. **Named**: the cause is named from what was measured ([`group`]).
+//! 4. **Not own**: the cause is not the session receiving the keys, not an
 //!    aterm job that already has a row, and never aterm itself.
 //!
 //! Anything else is a record ([`Hold::LogOnly`]) or nothing. Load average and
-//! swap totals are never inputs. Nothing is sampled until FELT is suspected:
+//! swap totals are never inputs. Nothing is sampled until felt is suspected:
 //! a calm tracker schedules nothing ([`StrainTracker::next_sample`]).
 //!
 //! # Split
 //!
-//! This module is the whole policy — pure, clockless (every instant is the
+//! This module is the whole policy: pure, clockless (every instant is the
 //! host's), integer-only and platform-free. The samplers (`aterm-sysprobe`)
 //! read the machine into a [`Reading`] and a list of [`ProcRow`]s; the host
 //! (`strain_host.rs`) feeds typing samples, arms the one deadline
-//! [`StrainTracker::next_sample`] names, and performs the [`StrainOut`]:
-//! a post, a restate, a fold (a withdraw — a Vanish, never ✓ — then its
-//! record) or a record.
+//! [`StrainTracker::next_sample`] names, and performs the [`StrainOut`]: a
+//! post, a restate, a fold (a withdraw, a Vanish and never ✓, then its record)
+//! or a record.
 //!
 //! # Honest names
 //!
-//! An unprivileged process cannot read another user's CPU time (on this m1
-//! 224 of 506 pids answer EPERM: `mds_stores`, `WindowServer`, `kernel_task`
-//! among them). Such time is never pinned on a daemon: it is the machine's
-//! busy time minus everything visible, and its name is
-//! [`StrainConfig::services_noun`] — `macOS services`.
+//! An unprivileged process cannot read another user's CPU time (on macOS
+//! about half of all pids answer EPERM, `mds_stores`, `WindowServer` and
+//! `kernel_task` among them). Such time is never pinned on a daemon: it is
+//! the machine's busy time minus everything visible, and its name is
+//! [`StrainConfig::services_noun`] (`macOS services`).
 
 use std::cmp::Reverse;
 use std::collections::{HashMap, VecDeque};
@@ -126,7 +125,7 @@ pub struct Psi {
 }
 
 /// One reading of the machine. Every field a platform cannot read is `None`,
-/// and a `None` field is never heavy. Counters are CUMULATIVE: the tracker
+/// and a `None` field is never heavy. Counters are cumulative: the tracker
 /// takes the deltas between readings.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Reading {
@@ -140,9 +139,9 @@ pub struct Reading {
     pub busy_ticks: Option<(u64, u64)>,
     /// The kernel's pressure level.
     pub pressure: Option<MemoryLevel>,
-    /// The memory gauge, permille: how little the kernel has left
-    /// (`1000 − 10·memorystatus_level` — that level is the share still
-    /// FREE, so this is a pressure gauge, not a count of bytes in use).
+    /// The memory gauge, permille: how little the kernel has left (`1000 −
+    /// 10·memorystatus_level`; that level is the share still free, so this is
+    /// a pressure gauge, not a count of bytes in use).
     pub mem_used_pm: Option<u16>,
     /// Memory in use, MiB, as Activity Monitor counts it (app memory +
     /// wired + compressed; Linux: total − available). The words `N GB` and
@@ -217,7 +216,7 @@ pub struct SessionRef {
     /// In another window than the focused one.
     pub elsewhere: bool,
     /// The host's id of the window it is in: where `Show tab N` goes, from
-    /// whichever window's band it is pressed (ruling 247).
+    /// whichever window's band it is pressed.
     pub window: u64,
 }
 
@@ -392,7 +391,7 @@ impl StrainKind {
 /// focused and on screen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Gate {
-    /// `explain_heavy_load` (ruling 212).
+    /// The `explain_heavy_load` setting.
     pub enabled: bool,
     /// Some window is focused and its band is on screen.
     pub focused_on_screen: bool,
@@ -443,7 +442,7 @@ pub enum StrainOut {
 }
 
 /// Why an episode did not reach the glass: the closed list its record's
-/// `not shown:` line reads from (ruling 209).
+/// `not shown:` line reads from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum NotShown {
     /// Nobody was typing.
@@ -458,7 +457,7 @@ pub(crate) enum NotShown {
     NoHeavyCause,
     /// aterm itself was the load: a defect, never explained.
     AtermItself,
-    /// The glass is off (the records-only rollout).
+    /// The glass is off (records only).
     RecordsOnly,
 }
 
@@ -488,8 +487,8 @@ impl NotShown {
 const LOADED_BUSY_PM: u16 = 450;
 /// The ppid chain is walked at most this far.
 const CHAIN_HOPS: usize = 16;
-/// A sweep is TORN — a baseline only — when processes that burned at least
-/// this much (milli-cores, at the last sweep) exited inside its window…
+/// A sweep is torn (a baseline only) when processes that burned at least this
+/// much (milli-cores, at the last sweep) exited inside its window…
 const TORN_SWEEP_MC: u32 = 500;
 /// …and that is at least this share (percent) of the machine's busy time:
 /// the load itself went away. Less than that is churn (a build starting
@@ -525,7 +524,7 @@ fn app_name(path: &str) -> Option<&str> {
 /// Which group `row` belongs to — the first match wins: a session (the ppid
 /// chain reaches its shell), an aterm job with a row, aterm itself, another
 /// user's process (the services), an app bundle, a known family, the lone
-/// process. A session's match also says WHICH session (its index), so the
+/// process. A session's match also says which session (its index), so the
 /// session is named from its own shell, never looked up again by its words.
 fn classify(
     row: &ProcRow,
@@ -667,12 +666,11 @@ fn group_members(
     (merged, of_pid)
 }
 
-/// What a session's load is called (ruling 207): its foreground program
-/// when the heaviest process under the shell is that program or runs under
-/// it (`cargo`, not the `rustc` it spawned); otherwise the heaviest process
-/// itself — twelve `yes &` at a zsh prompt are `yes`, never the idle `zsh`
-/// that happens to hold the terminal, and a background build under a
-/// foreground editor is the build, not the editor.
+/// What a session's load is called: its foreground program when the heaviest
+/// process under the shell is that program or runs under it (`cargo`, not the
+/// `rustc` it spawned); otherwise the heaviest process itself. Twelve `yes &`
+/// at a zsh prompt are `yes`, never the idle `zsh`, and a background build
+/// under a foreground editor is the build.
 fn heavy_name(top: &ProcRow, s: &SessionRef, by_pid: &HashMap<u32, &ProcRow>) -> String {
     let program = clip(&s.program, COMM_CHARS);
     let mut pid = top.pid;
@@ -700,7 +698,7 @@ fn heavy_name(top: &ProcRow, s: &SessionRef, by_pid: &HashMap<u32, &ProcRow>) ->
 }
 
 // ---------------------------------------------------------------------------
-// Words (closed lists; ruling 207).
+// Words (closed lists).
 // ---------------------------------------------------------------------------
 
 /// The title's fixed head.
@@ -709,7 +707,7 @@ const TITLE_HEAD: &str = "Typing slowed by ";
 const CAUSE_WORDS: usize = GLASS_TITLE_WORDS - 3;
 /// …in characters.
 const CAUSE_CHARS: usize = GLASS_TITLE_CHARS - TITLE_HEAD.len();
-/// Words a strain title never says (the grep guard's list, ruling 207).
+/// Words a strain title never says.
 const BLATHER: [&str; 5] = ["may", "detected", "consider", "fyi", "usage"];
 
 /// Whether `s` says anything from the blather list: one of its words, a
@@ -733,8 +731,8 @@ fn safe_name(raw: &str, words: usize, chars: usize) -> Option<String> {
         .map(|c| match c {
             ':' | ';' | '%' => ' ',
             '\u{2014}' => '-',
-            // The title quotes a measured name (ruling 243): a quote inside
-            // it would end the quote early.
+            // The title quotes a measured name: a quote inside it would end
+            // the quote early.
             '\'' => '\u{2019}',
             c => c,
         })
@@ -751,15 +749,14 @@ fn safe_name(raw: &str, words: usize, chars: usize) -> Option<String> {
 }
 
 /// The words for a culprit, `None` where none may be said (an own job, aterm,
-/// the resource, or a name that did not survive [`safe_name`]). A MEASURED
-/// NAME is quoted, so it reads as the culprit and not as English (`Typing
-/// slowed by 'yes'`, design ruling 243). On the live row the tab it runs in
-/// is the row's `Show tab 2` capsule ([`culprit_tab`]), never the title's as
-/// well (ruling 259: `(tab 2)` beside `Show tab 2` said it twice); where no
-/// capsule names it — a record, a Details line — it is words, `in tab 2`,
+/// the resource, or a name that did not survive [`safe_name`]). A measured
+/// name is quoted so it reads as the culprit and not as English (`Typing
+/// slowed by 'yes'`). On the live row (`capsule`) the tab it runs in is the
+/// row's `Show tab 2` capsule ([`culprit_tab`]), never the title's too; where
+/// no capsule names it (a record, a Details line) it is words, `in tab 2`,
 /// and a tab in another window is `in another window` (`elsewhere` on the
-/// live row, which keeps to six words), never a parenthesis.
-/// A family or the services noun is words of ours, unquoted.
+/// live row, which keeps to six words). A family or the services noun is
+/// words of ours, unquoted.
 fn culprit_words(c: &Culprit, cfg: &StrainConfig, capsule: bool) -> Option<String> {
     let quoted = |name: String| format!("'{name}'");
     match c {
@@ -770,7 +767,7 @@ fn culprit_words(c: &Culprit, cfg: &StrainConfig, capsule: bool) -> Option<Strin
             ..
         } => {
             // `elsewhere` on the live row: `in another window` would make the
-            // title seven words (ruling 76's six).
+            // title seven words.
             let tail = if *elsewhere && capsule {
                 " elsewhere".to_string()
             } else if *elsewhere {
@@ -795,17 +792,12 @@ fn culprit_words(c: &Culprit, cfg: &StrainConfig, capsule: bool) -> Option<Strin
     }
 }
 
-/// The navigation to the tab a named culprit runs in, when that tab is in
-/// the focused window — the strain row's `Show tab N` capsule (design
-/// rulings 243 and 247). It names the window as well as the tab: the band is
-/// app-wide, so a press from another window's band still lands on this
-/// tab. `None` for every other culprit, and for a tab in another window
-/// (the title cannot say which window).
-///
-/// scope-waiver: "app-wide" describes where the derived navigation may be
-/// shown. This pure projection copies the culprit's window and tab into an
-/// intent; copying that result does not multiply a budget or change its
-/// destination, and this function owns no scope-enforcing state.
+/// The navigation to the tab a named culprit runs in, when that tab is in the
+/// focused window: the strain row's `Show tab N` capsule. It names the window
+/// as well as the tab, since the band is shown in every window and a press
+/// from another window's band must still land on this tab. `None` for every
+/// other culprit, and for a tab in another window (the title cannot say
+/// which window).
 #[must_use]
 pub fn culprit_tab(c: &Culprit) -> Option<Intent> {
     match c {
@@ -868,9 +860,9 @@ fn mib_words(mib: u64) -> String {
     }
 }
 
-/// Why a message may not carry a LEVEL meter: a measured level is admitted
-/// on the strain row alone (tag `system`, key [`STRAIN_KEY`]) — the host's
-/// `attention` reads this (ruling 208).
+/// Why a message may not carry a level meter: a measured level is admitted on
+/// the strain row alone (tag `system`, key [`STRAIN_KEY`]). The host's
+/// `attention` reads this.
 #[must_use]
 pub fn level_fault(msg: &Message) -> Option<&'static str> {
     let level = msg.meter.as_ref().is_some_and(|m| m.level);
@@ -916,16 +908,15 @@ impl KindState {
     }
 }
 
-/// A leading group, swapped only after a challenger leads two scans. While
-/// a row shows (`sticky`), the leader's NAMED flag moves the same way: it
-/// is a change of cause (culprit ↔ resource words, the load slot, the
-/// accessible name), so a share hovering at the line never flips the title
-/// scan by scan.
+/// A leading group, swapped only after a challenger leads two scans. While a
+/// row shows (`sticky`), the leader's named flag moves the same way: it is a
+/// change of cause (culprit ↔ resource words, the load slot, the accessible
+/// name), so a share hovering at the line never flips the title scan by scan.
 #[derive(Clone, Debug, Default)]
 struct Leader {
     now: Option<(Culprit, bool)>,
     challenger: Option<(Culprit, u8)>,
-    /// Consecutive scans the leader's NAMED flag has read the other way.
+    /// Consecutive scans the leader's named flag has read the other way.
     flip: u8,
 }
 
@@ -1013,7 +1004,7 @@ struct Quiet {
     cause: Culprit,
 }
 
-/// The strain engine: FELT from typing samples, HEAVY from readings, NAMED
+/// The strain engine: felt from typing samples, heavy from readings, named
 /// from sweeps, one row and its records out. Clockless and integer-only;
 /// bounded (a [`FEEL_RING`]-sample ring, a record window of
 /// [`STRAIN_RECORDS_PER_WINDOW`], the last sweep's groups).
@@ -1040,7 +1031,7 @@ pub struct StrainTracker {
     last_reading_at: Option<Instant>,
     readings: u32,
     kinds: [KindState; 5],
-    /// Each kind is past its ENTER line on the latest reading.
+    /// Each kind is past its enter line on the latest reading.
     entering: [bool; 5],
     busy_pm: Option<u16>,
     swap_kib_s: Option<u32>,
@@ -1079,10 +1070,10 @@ fn since(a: Instant, b: Instant) -> Duration {
     a.saturating_duration_since(b)
 }
 
-/// Memory's enter line on a Mac whose kernel says WARN: the machine swaps
+/// Memory's enter line on a Mac whose kernel says Warn: the machine swaps
 /// at least this many KiB/s (in plus out, 4 MB/s). The supervisor's memory
-/// ceiling reads a thrash off the same line
-/// (`aterm_agent::supervise::memory::THRASH_SWAP_KIB_S`, pinned equal).
+/// ceiling reads a thrash off the same line (it re-exports this one as
+/// `aterm_agent::supervise::memory::THRASH_SWAP_KIB_S`).
 pub const WARN_SWAP_ENTER_KIB_S: u32 = 4096;
 
 /// A permille delta ratio, clamped to 1000.
@@ -1147,7 +1138,7 @@ impl StrainTracker {
         }
     }
 
-    /// One closed HARDWARE key: `lag_ms` from its arrival to its window's
+    /// One closed hardware key: `lag_ms` from its arrival to its window's
     /// present. `ctl send`, `feed`, a tainted present and a remote session's
     /// keys are never samples (the host filters them).
     pub fn note_key(&mut self, at: Instant, lag_ms: u32) {
@@ -1193,7 +1184,7 @@ impl StrainTracker {
         self.head = (self.head + 1) % FEEL_RING;
     }
 
-    /// Calm → Suspect when FELT; else keep the FELT clock. Returns FELT.
+    /// Calm → Suspect when felt; else keep the felt clock. Returns felt.
     fn after_note(&mut self, at: Instant) -> bool {
         let felt = self.felt(at);
         if felt {
@@ -1209,11 +1200,11 @@ impl StrainTracker {
     /// The samples in the window ending at `now`: `(keys, slow, hitches,
     /// worst key)`.
     ///
-    /// A hitch is one STALL, counted once: each freeze spans `[end − ms,
-    /// end]` and each key of at least [`HITCH_MS`] its `[arrival, present]`,
-    /// and overlapping spans are one hitch. A key typed into a frozen turn
-    /// waits out that same turn — the key and the freeze (or two keys in one
-    /// stall) are one event, never the two a lone stall would need for FELT.
+    /// A hitch is one stall, counted once: each freeze spans `[end − ms, end]`
+    /// and each key of at least [`HITCH_MS`] its `[arrival, present]`, and
+    /// overlapping spans are one hitch. A key typed into a frozen turn waits
+    /// out that same turn, so the key and the freeze (or two keys in one
+    /// stall) are one event, never the two a lone stall would need for felt.
     fn window(&self, now: Instant) -> (usize, usize, usize, u32) {
         let mut out = (0, 0, 0, 0);
         let mut spans = [(now, now); FEEL_RING];
@@ -1250,7 +1241,7 @@ impl StrainTracker {
         out
     }
 
-    /// FELT at `now`: at least [`FEEL_MIN_KEYS`] keys in the trailing
+    /// Felt at `now`: at least [`FEEL_MIN_KEYS`] keys in the trailing
     /// [`FEEL_WINDOW`] with at least half of them slow, or at least
     /// [`FEEL_MIN_HITCHES`] hitches.
     #[must_use]
@@ -1272,10 +1263,10 @@ impl StrainTracker {
     /// A new episode: Suspect, every measurement fresh.
     fn begin(&mut self, at: Instant) {
         let (keys, slow, _, worst) = self.window(at);
-        // The longest pause is the episode's own, taken from the window as
-        // the key figures are: a freeze noted while calm, long
-        // before, is no part of it. The owner (which only aterm.log's stall
-        // line names) is kept when it is that freeze.
+        // The longest pause is the episode's own, taken from the window as the
+        // key figures are: a freeze noted while calm, long before, is no part
+        // of it. The owner (which only aterm.log's stall line names) is kept
+        // when it is that freeze.
         let turn = self.worst_freeze(at);
         self.worst_turn = self
             .worst_turn
@@ -1323,11 +1314,11 @@ impl StrainTracker {
         self.last_reading_at = None;
     }
 
-    /// When the host should take the next reading — `Some` only while
-    /// Suspect or Open with the gate open (the first at once, then every
+    /// When the host should take the next reading: `Some` only while Suspect
+    /// or Open with the gate open (the first at once, then every
     /// [`STRAIN_SAMPLE_EVERY`]); a calm tracker arms nothing.
     ///
-    /// A Suspect's reading lands ON its onset ([`STRAIN_ONSET`] after FELT
+    /// A Suspect's reading lands on its onset ([`STRAIN_ONSET`] after felt
     /// began) when the cadence would pass it, so a row that may show shows
     /// then, not up to a reading later.
     #[must_use]
@@ -1362,7 +1353,7 @@ impl StrainTracker {
             .find(|k| self.kinds[k.index()].heavy)
     }
 
-    /// The highest-priority kind that is heavy AND still past its enter
+    /// The highest-priority kind that is heavy and still past its enter
     /// line on the latest reading. A kind that is heavy only by its
     /// hysteresis (memory at Warn after the swapping stopped) never blocks
     /// a lower kind that is rising.
@@ -1433,10 +1424,9 @@ impl StrainTracker {
             .map(|(_, mc)| *mc)
             .fold(0, u32::saturating_add);
         self.rates = rates;
-        // A TORN sweep: the load itself exited (measured live: twelve `yes`
-        // killed mid-window read `macOS services 7.5 cores` under a title
-        // that named `yes`). Its window says nothing about who loads the
-        // machine now: a baseline only.
+        // A torn sweep: the load itself exited, and its time would read as
+        // the services'. Its window says nothing about who loads the machine
+        // now: a baseline only.
         if vanished_mc >= TORN_SWEEP_MC
             && u64::from(vanished_mc) * 100 >= u64::from(TORN_SHARE_PCT) * u64::from(self.busy_mc())
         {
@@ -1470,9 +1460,8 @@ impl StrainTracker {
         });
         held.sort_by_key(|h| Reverse(h.mc));
         // A sweep names a leader only while its resource is loaded: the
-        // sweeps of a machine that is clearing would otherwise crown
-        // whatever a calm machine runs (its services at 1.9 of 2 busy cores
-        // are "named") in the seconds before the fold.
+        // sweeps of a machine that is clearing would otherwise crown whatever
+        // a calm machine runs (its services) in the seconds before the fold.
         let sticky = matches!(self.state, State::Open { .. });
         let cpu_loaded = self.busy_pm.is_some_and(|b| b >= LOADED_BUSY_PM);
         if cpu_loaded {
@@ -1589,8 +1578,8 @@ impl StrainTracker {
     /// No reading for [`STALE_STRAIN`] (the gate closed, or the probe went
     /// quiet): the episode ends at its last reading, and the tracker is calm
     /// again with nothing armed. The host calls this on any turn of its loop
-    /// — it arms nothing for it — so an unfocused window's episode does not
-    /// sit Open until the person comes back.
+    /// (it arms nothing for it), so an unfocused window's episode does not sit
+    /// Open until the person comes back.
     pub fn lapsed(&mut self, now: Instant) -> StrainOut {
         let last = self.last_reading_at.or(self.episode_start);
         match last {
@@ -1599,16 +1588,14 @@ impl StrainTracker {
         }
     }
 
-    /// End the episode NOW where sampling stopped, as [`Self::lapsed`] ends
-    /// it (at its last reading), without waiting out [`STALE_STRAIN`] from
-    /// that reading. For the host whose band is about to retire the row for
-    /// silence (ruling 441 (u)): the row's own staleness cap runs from its
-    /// last restatement, up to [`STRAIN_KEEPALIVE`] before the last reading,
-    /// so it falls before the lapse, and the band settles before the
-    /// engine's turn. The row would go Stale (a `⚠ … stopped` entry) and the
-    /// lapse then post the record beside it. Ended here, the row becomes the
-    /// record (rulings 209 and 211: one entry per episode). Nothing while
-    /// calm.
+    /// End the episode now where sampling stopped, as [`Self::lapsed`] ends it
+    /// (at its last reading), without waiting out [`STALE_STRAIN`]. For a host
+    /// whose band is about to retire the row for silence: the row's own
+    /// staleness cap runs from its last restatement, up to [`STRAIN_KEEPALIVE`]
+    /// before the last reading, so it falls before the lapse, and the band
+    /// settles before the engine's turn. The row would go Stale (a `⚠ …
+    /// stopped` entry) with the lapse's record beside it; ended here, the row
+    /// becomes the record: one entry per episode. Nothing while calm.
     pub fn end_where_sampling_stopped(&mut self) -> StrainOut {
         match self.last_reading_at.or(self.episode_start) {
             Some(t) if self.state != State::Calm => self.lapse(t),
@@ -1776,7 +1763,7 @@ impl StrainTracker {
         if !held {
             return StrainOut::None;
         }
-        // HEAVY, and still past its enter line NOW: a machine that is
+        // Heavy, and still past its enter line now: a machine that is
         // clearing never opens a row (nor names a cause for its record).
         let Some(kind) = self.rising() else {
             return StrainOut::None;
@@ -1809,7 +1796,7 @@ impl StrainTracker {
         StrainOut::Post(msg)
     }
 
-    /// A Suspect ends at `now`: one record when typing was FELT slow for at
+    /// A Suspect ends at `now`: one record when typing was felt slow for at
     /// least [`STRAIN_RECORD_AFTER`] (a Suspect always lasts longer than
     /// that before it ends, so the felt span is the line; a lone blip is no
     /// episode and spends none of the record cap).
@@ -1895,9 +1882,8 @@ impl StrainTracker {
                 return self.fold(now);
             }
         }
-        // The kind: a higher one at once (while it is rising — one heavy
-        // only by its hysteresis is not news), a lower one after two
-        // readings.
+        // The kind: a higher one at once (while it is rising; one heavy only
+        // by its hysteresis is not news), a lower one after two readings.
         let (kind, pending_lower) = match (self.rising(), verdict) {
             (Some(v), _) if v.rank() > kind.rank() => (v, 0),
             (_, Some(v)) if v != kind && !self.kinds[kind.index()].heavy => {
@@ -1909,9 +1895,9 @@ impl StrainTracker {
             }
             _ => (kind, 0),
         };
-        // The culprit: the leader (swapped after two scans by `scanned`),
-        // never a suppressed one — the person switching to the loaded tab
-        // makes it their own command, and the row goes.
+        // The culprit: the leader (swapped after two scans by `scanned`), never
+        // a suppressed one: the person switching to the loaded tab makes it
+        // their own command, and the row goes.
         let next = self.cause(kind);
         let cause = if let Some(reason) = self.suppressed(&next) {
             if on >= STRAIN_MIN_GLASS {
@@ -2049,11 +2035,11 @@ impl StrainTracker {
         }
     }
 
-    /// The stats beside the rail, in PLAIN words (design ruling 243): how
-    /// many cores are busy (`6 of 8 cores`), how much memory is used (`23 of
-    /// 24 GB used`, or `memory full · swapping` once it swaps; nothing when
-    /// neither was measured), `waiting on disk`. The exact figures — an I/O stall's percent, a swap rate — are
-    /// Details' and the log's ([`Self::details`]). Never spoken.
+    /// The stats beside the rail, in plain words: how many cores are busy (`6
+    /// of 8 cores`), how much memory is used (`23 of 24 GB used`, or `memory
+    /// full · swapping` once it swaps; nothing when neither was measured),
+    /// `waiting on disk`. The exact figures (an I/O stall's percent, a swap
+    /// rate) are Details' and the log's ([`Self::details`]). Never spoken.
     fn stats(&self, kind: StrainKind) -> String {
         let cores = self.last.as_ref().map_or(0, |r| r.cores);
         let whole = self.busy_mc().saturating_add(500) / 1000;
@@ -2080,7 +2066,7 @@ impl StrainTracker {
                     (true, ..) => format!("memory full{PIECE_SEP}swapping"),
                     // Neither measured (an episode entered on Critical
                     // pressure or PSI with no swap, and no used figure):
-                    // nothing is claimed (ruling 247).
+                    // nothing is claimed.
                     (false, None, _) => String::new(),
                 }
             }
@@ -2150,7 +2136,7 @@ impl StrainTracker {
         if let Some(l) = self.typing_line() {
             lines.push(l);
         }
-        // The exact disk figure the row's plain words leave out (ruling 243).
+        // The exact disk figure the row's plain words leave out.
         if kind == StrainKind::Disk
             && let Some(pm) = self
                 .last
@@ -2209,9 +2195,7 @@ impl StrainTracker {
         // The row declares the one load its kind explains, so its slot is
         // sized to those words (`CPU busy`, not `network busy`) and its stats
         // keep their cells at 80 columns; a later kind's load widens the slot
-        // once (design ruling 221).
-        // The navigation to the program the title names, when it runs in a
-        // tab of the focused window (ruling 243).
+        // once.
         let show = culprit_tab(cause);
         let msg = Message::new(tags::SYSTEM, severity, format!("{TITLE_HEAD}{words}"))
             .key(STRAIN_KEY)
@@ -2276,7 +2260,7 @@ fn credit_exits(
     credit
 }
 
-/// The CPU leader of a sweep: the heaviest group, NAMED when it uses at
+/// The CPU leader of a sweep: the heaviest group, named when it uses at
 /// least a core and [`STRAIN_NAMED_SHARE_PCT`] of the busy core-time.
 fn lead_cpu(held: &[Held], busy_mc: u32) -> Option<(Culprit, bool)> {
     let top = held.iter().max_by_key(|h| h.mc)?;
@@ -2285,7 +2269,7 @@ fn lead_cpu(held: &[Held], busy_mc: u32) -> Option<(Culprit, bool)> {
     Some((top.culprit.clone(), named))
 }
 
-/// The memory leader: the largest footprint, NAMED past
+/// The memory leader: the largest footprint, named past
 /// [`STRAIN_NAMED_MEMORY_PCT`] of the RAM.
 fn lead_mem(held: &[Held], mem_mib: u32) -> Option<(Culprit, bool)> {
     let top = held

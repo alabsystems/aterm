@@ -2,17 +2,12 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Which operations DECSLRM's horizontal margins bound, and which they do not.
+//! Which operations DECSLRM's horizontal margins bound. VT510 splits them: in-place erases (EL,
+//! ECH, ED) "work inside or outside the scrolling margins"; sideways shifts (ICH, DCH) have "no
+//! effect outside the scrolling margins". xterm, Ghostty, iTerm2 and WezTerm do the same.
 //!
-//! VT510 splits them: in-place erases (EL, ECH, ED) "work inside or outside the
-//! scrolling margins", while sideways shifts (ICH, DCH) have "no effect outside
-//! the scrolling margins". xterm, Ghostty, iTerm2 and WezTerm implement exactly
-//! that split (xterm's `ClearRight`/`ClearLeft`/`ClearLine` never consult
-//! `ScrnLeftMargin`; `ScrnInsertChar`/`ScrnDeleteChar` open with both margins).
-//!
-//! These tests pin both halves: EL, DECSEL, ECH and ED are unbounded; ICH/DCH
-//! and DECIC/DECDC keep their margins. IL/DL's rectangular shift is pinned in
-//! `scroll_region::region_ops`, and autowrap to the left margin in
+//! EL, DECSEL, ECH and ED are unbounded; ICH/DCH and DECIC/DECDC keep their margins. IL/DL's
+//! rectangular shift is pinned in `scroll_region::region_ops`, autowrap to the left margin in
 //! aterm-conformance `vt_categories3::declrmm_autowrap_wraps_to_left_margin`.
 
 use super::super::*;
@@ -42,8 +37,7 @@ fn assert_kept(grid: &Grid, col: u16, why: &str) {
 
 // EL: the in-place erase class, not bounded by DECSLRM.
 
-/// EL 0 runs to the row's edge, past the right margin (xterm `ClearRight`
-/// bounded by `MaxCols`; Ghostty and iTerm2 likewise).
+/// EL 0 runs to the row's edge, past the right margin.
 #[test]
 fn el0_erases_past_the_right_margin() {
     let mut grid = filled_row_with_margins();
@@ -56,7 +50,7 @@ fn el0_erases_past_the_right_margin() {
     assert_blank(&grid, 19, "EL 0 runs to the end of the row");
 }
 
-/// EL 1 starts at column 0, not at the left margin (xterm `ClearLeft`).
+/// EL 1 starts at column 0, not at the left margin.
 #[test]
 fn el1_erases_left_of_the_left_margin() {
     let mut grid = filled_row_with_margins();
@@ -84,8 +78,7 @@ fn el2_erases_the_whole_row_not_the_margin_span() {
 
 // DECSEL: the same spans, with protection honoured inside them.
 
-/// DECSEL 0 shares EL 0's span: xterm reaches `ClearRight` for both, the
-/// protection split happening inside `ClearInLine2`, not in the bounds.
+/// DECSEL 0 shares EL 0's span; protection is honoured inside it, not in the bounds.
 #[test]
 fn decsel0_erases_past_the_right_margin() {
     let mut grid = filled_row_with_margins();
@@ -117,10 +110,9 @@ fn decsel2_erases_the_whole_row_not_the_margin_span() {
     assert_blank(&grid, 19, "DECSEL 2 reaches right of the right margin");
 }
 
-// ECH: the same class (xterm's `do_erase_char` calls `ClearRight`).
+// ECH: the same class.
 
-/// ECH erases `count` cells from the cursor regardless of the right margin
-/// (VT510: "ECH works inside or outside the scrolling margins").
+/// ECH erases `count` cells from the cursor regardless of the right margin.
 #[test]
 fn ech_erases_past_the_right_margin() {
     let mut grid = filled_row_with_margins();
@@ -134,7 +126,7 @@ fn ech_erases_past_the_right_margin() {
     assert_kept(&grid, 16, "and exactly ten: the eleventh cell survives");
 }
 
-/// A count past the row's edge is clipped by the ROW, not by the margin.
+/// A count past the row's edge is clipped by the row, not by the margin.
 #[test]
 fn ech_count_is_clipped_by_the_row_edge() {
     let mut grid = filled_row_with_margins();

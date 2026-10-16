@@ -28,7 +28,7 @@ test = false
 # (atpkg) deliberately uses `default-features = false` (verify-only, no RNG/alloc); this
 # tool is owner-only and never shipped, so it carries the full crate. At/above the
 # deny.toml ring floor, so no ban is tripped.
-ring = "0.17.14"
+ring = { workspace = true, features = ["default"] }
 # Encode the 32-byte raw public keys of the paper master and the machine keys (the pins.rs
 # anchor, the roster entries).
 # Standard padded Base64 — first-party and zero-dependency. `decode_strict` is
@@ -55,8 +55,10 @@ atpkg = { path = "../atpkg" }
 # Tier-1 binds the real roster pair redo/snapshot-CAS filesystem transaction to
 # the same derived model that `cargo test -p aterm-spec` proves exhaustively.
 aterm-spec = { workspace = true }
-# The owner→client integration test builds a real `.tar.zst` to drive the client install.
-zstd = { workspace = true }
+# The owner→client integration test builds a real `.tar.zst` to drive the client install:
+# one raw-block zstd frame from the first-party writer (docs/AUDIT-third-party-2026-10-15.md
+# ZC.3), which atpkg's extractor decodes.
+aterm-zstd = { workspace = true }
 # Fixture directories removed on drop.
 aterm-tempfile = { workspace = true }
 # The real terminal the setup/join tests run the binary on (tests/pty.rs): both ends

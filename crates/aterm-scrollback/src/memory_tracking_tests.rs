@@ -41,7 +41,7 @@ fn scrollback_incremental_bytes_used_matches_recomputed() {
 }
 
 // =========================================================================
-// Budget/diagnostic split tests (#5881)
+// Budget/diagnostic split tests
 // =========================================================================
 
 #[test]

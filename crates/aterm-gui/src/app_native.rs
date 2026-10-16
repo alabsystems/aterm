@@ -55,7 +55,7 @@ pub(crate) fn native_ui_compile_count() -> u64 {
 static NEXT_CONTROL_SETTINGS_REQUEST: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
 
-fn next_control_settings_request() -> u64 {
+pub(crate) fn next_control_settings_request() -> u64 {
     NEXT_CONTROL_SETTINGS_REQUEST.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
@@ -400,9 +400,10 @@ pub(crate) enum NativeUpdateReconcilePurpose {
     StageAvailable,
     ApplyControl,
     /// Re-read the ledger with no announcement semantics: the background
-    /// check's health hook fired (a persistent failure streak), or the user
-    /// opened Settings ▸ Software Update. The screen shows the current verdict,
-    /// not the last one a stage or startup imported.
+    /// check's health hook fired (a persistent failure streak), or Settings
+    /// opened (on any page: Software Update, Modified and search all say what
+    /// the update switches do in this copy). The screen shows the current
+    /// verdict, not the last one a stage or startup imported.
     Refresh,
 }
 
@@ -1853,6 +1854,14 @@ pub(crate) enum NativeConfigWork {
         key: String,
         value: Option<String>,
     },
+    /// A theme chosen in the command palette: `theme` becomes the value
+    /// [`crate::prefs::theme_choice_value`] gives against the newest service
+    /// revision at the lane head, so a Follow-system pair keeps its other
+    /// side even when an earlier write in the lane changed it.
+    ThemeChoice {
+        id: String,
+        side: aterm_types::Appearance,
+    },
 }
 
 /// Completion authority for the one serialized config lane. Native Settings
@@ -1864,6 +1873,9 @@ pub(crate) enum NativeConfigOrigin {
         instance: crate::tab_model::AppInstanceId,
         view: crate::tab_model::ViewId,
         reply: crate::native_app::ReplyToken<ConfigPatchOutcome>,
+        /// Real host request identity for a theme edit, independent of view
+        /// liveness and ordered with control/palette preview intent.
+        theme_request: Option<Box<(u64, String)>>,
     },
     SeriousMode {
         desired: bool,
@@ -1875,6 +1887,15 @@ pub(crate) enum NativeConfigOrigin {
     Presence {
         key: &'static str,
         desired: bool,
+    },
+    /// A theme chosen in the command palette (`App::palette_choose_theme`):
+    /// `id` is the row's theme. Its preview stands
+    /// ([`PreviewHold::Committing`](crate::control_theme::PreviewHold)) until
+    /// this completion: an applied write adopts the durable `theme` and draws
+    /// it, a refused one reverts the preview and says why.
+    ThemeChoice {
+        request_id: u64,
+        id: String,
     },
     /// Completion sink for the `settings set|unset` wire command. The control
     /// thread blocks on this one-shot while the main loop stays free. Non-success
@@ -2046,7 +2067,7 @@ impl App {
         let Some(wid) = self.frontmost_window else {
             return crate::control::FrontControlSurface::None;
         };
-        let Some((instance, _)) = self.active_native_view(wid) else {
+        let Some((instance, view)) = self.active_native_view(wid) else {
             return crate::control::FrontControlSurface::None;
         };
         if self
@@ -2054,7 +2075,12 @@ impl App {
             .app(instance)
             .is_some_and(|app| app.kind() == crate::native_app::AppKind::Settings)
         {
-            crate::control::FrontControlSurface::NativeSettings
+            // Settings ▸ Harness's session buttons write Autopilot words.
+            if self.harness_page_in(view) {
+                crate::control::FrontControlSurface::HarnessSettings
+            } else {
+                crate::control::FrontControlSurface::NativeSettings
+            }
         } else {
             crate::control::FrontControlSurface::OtherNative
         }
@@ -2583,10 +2609,11 @@ impl App {
         self.theme.bg.hash(&mut paint);
         self.theme.cursor.hash(&mut paint);
         self.theme.selection.hash(&mut paint);
-        // The chrome-resolved palette is a second paint input (Linux
-        // `window_theme` can force it off the terminal theme); hashing the
-        // resolved fields re-lowers retained pages exactly when their pixels move.
-        let chrome_theme = self.chrome_palette_theme();
+        // The page palette is a second paint input (`window_theme` can force
+        // it off the terminal theme, and color overrides do not reach it);
+        // hashing the resolved fields re-lowers retained pages exactly when
+        // their pixels move.
+        let chrome_theme = self.native_page_palette_theme();
         chrome_theme.fg.hash(&mut paint);
         chrome_theme.bg.hash(&mut paint);
         chrome_theme.cursor.hash(&mut paint);
@@ -2707,7 +2734,6 @@ impl App {
                     motion: self.native_view_motion_cx(wid, view),
                     terminal_font_px: self.win_font_px(wid),
                     terminal_scale: self.windows[&wid].scale.max(f64::EPSILON) as f32,
-                    terminal_theme: self.theme,
                     semantic_font,
                     document: document.as_ref(),
                 },
@@ -2753,6 +2779,16 @@ impl App {
             system_dark: self.os_appearance == aterm_types::Appearance::Dark,
             serious: self.serious_mode_enabled(),
             backend_gpu: self.gpu_capable(),
+            // The companion verdict's three rungs, read without advancing the
+            // tenure gate (`promotable_kitty`'s read).
+            companion_look: aterm_effects::companion_look::companion_precedence(
+                self.kitty_log.favourite_look_loaded(),
+                self.windows
+                    .get(&wid)
+                    .and_then(|ws| ws.fx.look().tenure().worn().map(|i| i.look)),
+                self.launch_kitty,
+            )
+            .0,
         }
     }
 
@@ -2942,6 +2978,42 @@ impl App {
         (artifact.view == focused).then_some((x, y))
     }
 
+    /// The aterm.toml completion panel the editor view draws (the same rule
+    /// as `EditorApp::view`), so the host sizes the text for what is really
+    /// left and the caret line stays on screen.
+    fn shown_config_assist_rows(
+        &self,
+        instance: crate::tab_model::AppInstanceId,
+        view: crate::tab_model::ViewId,
+    ) -> Option<crate::native_ui::EditorPalette> {
+        let crate::native_app::AppViewState::Editor(state) =
+            self.native_runtime.view_state(view)?
+        else {
+            return None;
+        };
+        let buffer = state.buffer.as_ref()?;
+        if buffer.minibuffer_active() || buffer.chord_pending() {
+            return None;
+        }
+        let (context, assist) = self.editor_config_assist(instance, view)?;
+        if state.config_completion_dismissed == Some(context) {
+            return None;
+        }
+        let listed = assist.typed || state.config_completion_interaction == Some(context);
+        if listed {
+            // A list asked for with nothing to list and no help draws no
+            // panel, as the view filters it out.
+            (assist.help.is_some() || !assist.completions.is_empty())
+                .then(|| crate::native_ui::EditorPalette::Rows(assist.completions.len().max(1)))
+        } else {
+            // Resting on a key: the help line alone, as the view draws it.
+            assist
+                .resting_help
+                .is_some()
+                .then_some(crate::native_ui::EditorPalette::Help)
+        }
+    }
+
     /// Dispatch through the active app reducer, execute every typed effect, then
     /// refresh tab chrome. Shared by pointer/keyboard input and the control
     /// `act` path.
@@ -2967,12 +3039,18 @@ impl App {
                 _ => None,
             })
             .and_then(|buffer| match &buffer.minibuffer {
+                // The view lists "No matching command" in a row of its own.
                 crate::native_editor::Minibuffer::Command { query, .. } => {
-                    Some(crate::native_editor::command_completions(query).len())
+                    Some(crate::native_ui::EditorPalette::Rows(
+                        crate::native_editor::command_completions(query)
+                            .len()
+                            .max(1),
+                    ))
                 }
                 _ => None,
             })
-            .unwrap_or(0);
+            .or_else(|| self.shown_config_assist_rows(instance, view))
+            .unwrap_or(crate::native_ui::EditorPalette::None);
         let visible_lines = crate::native_ui::editor_visible_line_capacity_with_palette(
             self.native_ui_viewport(wid)?,
             palette_candidates,
@@ -3243,6 +3321,7 @@ impl App {
             editor_config_completion_interacting,
             editor_config_assist_present,
             editor_config_assist_dismissed,
+            editor_config_assist_drawn,
         ) = if editor_active && !editor_minibuffer_active && !editor_chord_pending {
             self.editor_config_assist(instance, active_view)
                 .and_then(|(context, assist)| {
@@ -3260,6 +3339,11 @@ impl App {
                     };
                     let count = assist.completions.len();
                     let present = assist.help.is_some() || count > 0;
+                    // What the view draws: the help line, and the
+                    // suggestions only while typed or asked for.
+                    let listed = assist.typed || interacting;
+                    let drawn = (listed && (assist.help.is_some() || count > 0))
+                        || assist.resting_help.is_some();
                     Some((
                         count,
                         selected,
@@ -3267,16 +3351,17 @@ impl App {
                         interacting,
                         present,
                         dismissed,
+                        drawn,
                     ))
                 })
-                .unwrap_or((0, 0, None, false, false, false))
+                .unwrap_or((0, 0, None, false, false, false, false))
         } else {
-            (0, 0, None, false, false, false)
+            (0, 0, None, false, false, false, false)
         };
         let editor_config_completion_active =
             !editor_config_assist_dismissed && editor_config_completion_count > 0;
         let editor_config_assist_visible =
-            !editor_config_assist_dismissed && editor_config_assist_present;
+            !editor_config_assist_dismissed && editor_config_assist_drawn;
         let settings_active = self
             .native_runtime
             .app(instance)
@@ -3428,6 +3513,8 @@ impl App {
                 event_type: KeyEventType::Press,
                 ..
             } = event
+            // A font list being searched takes Space as part of the name.
+            && !(matches!(key, NamedKey::Space) && self.native_space_types_into_search(wid))
         {
             if self.activate_native_focus(wid).unwrap_or(false) {
                 return true;
@@ -3705,6 +3792,12 @@ impl App {
                         Key::Named(NamedKey::Escape) => {
                             Some(AppEvent::TextInput(TextInputEvent::Cancel))
                         }
+                        Key::Named(NamedKey::ArrowUp) if settings_active => {
+                            Some(AppEvent::StepFocus(-1))
+                        }
+                        Key::Named(NamedKey::ArrowDown) if settings_active => {
+                            Some(AppEvent::StepFocus(1))
+                        }
                         Key::Named(NamedKey::ArrowUp) => Some(AppEvent::ScrollLines(-1)),
                         Key::Named(NamedKey::ArrowDown) => Some(AppEvent::ScrollLines(1)),
                         Key::Named(NamedKey::PageUp) if markdown_active => {
@@ -3729,6 +3822,14 @@ impl App {
                         }
                         Key::Named(NamedKey::PageUp) => Some(AppEvent::ScrollLines(-8)),
                         Key::Named(NamedKey::PageDown) => Some(AppEvent::ScrollLines(8)),
+                        // Settings: a text field's caret, else the list's
+                        // top or bottom (the view decides which).
+                        Key::Named(NamedKey::Home) if settings_active && !command => {
+                            Some(AppEvent::TextInput(TextInputEvent::Home { extend }))
+                        }
+                        Key::Named(NamedKey::End) if settings_active && !command => {
+                            Some(AppEvent::TextInput(TextInputEvent::End { extend }))
+                        }
                         Key::Named(NamedKey::Home) if markdown_active || command => {
                             Some(AppEvent::ScrollLines(-10_000))
                         }
@@ -3796,8 +3897,9 @@ impl App {
         let current = self
             .native_runtime
             .view_state(view)
-            .and_then(|state| state.common().last_focus.as_ref());
+            .and_then(|state| state.common().last_focus.clone());
         let next = current
+            .as_ref()
             .and_then(|key| {
                 compiled
                     .focus_order
@@ -3822,7 +3924,26 @@ impl App {
                     }
                 },
             );
-        let key = compiled.focus_order[next].clone();
+        let mut key = compiled.focus_order[next].clone();
+        // The Settings sidebar is one Tab stop: Tab leaves it for the page
+        // in one step, and entering it lands on the selected row (its arrow
+        // keys move between rows).
+        if let Some(crate::native_app::AppViewState::Settings(state)) =
+            self.native_runtime.view_state(view)
+            && let Some(target) =
+                state.tab_past_navigation(current.as_ref(), &key, !backwards, &compiled.focus_order)
+        {
+            key = target;
+        }
+        // A Settings list goes on past its screen: Tab from the last control
+        // it shows moves to its next one, which the list scrolls into view.
+        if let Some(current) = current.as_ref()
+            && let Some(crate::native_app::AppViewState::Settings(state)) =
+                self.native_runtime.view_state(view)
+            && let Some(beyond) = state.tab_past_screen(current, &key, !backwards)
+        {
+            key = beyond;
+        }
         self.invalidate_native_view_cache(wid, view, DamageRegion::All);
         let outcome = self
             .native_runtime
@@ -3836,6 +3957,19 @@ impl App {
         }
         self.request_redraw_all_windows();
         Ok(())
+    }
+
+    /// Whether the active Settings view's font list is being searched, so
+    /// Space types a space into the search instead of pressing a font.
+    fn native_space_types_into_search(&self, wid: WindowId) -> bool {
+        let Some((_, view)) = self.active_native_view(wid) else {
+            return false;
+        };
+        matches!(
+            self.native_runtime.view_state(view),
+            Some(crate::native_app::AppViewState::Settings(state))
+                if state.font_picker_takes_space()
+        )
     }
 
     fn native_text_field_has_focus(&self, wid: WindowId) -> bool {
@@ -3916,15 +4050,56 @@ impl App {
     ) -> Result<(), String> {
         match effect {
             AppEffect::ConfigPatch { patch, reply } => {
+                let theme_request = patch
+                    .edits
+                    .iter()
+                    .find(|edit| edit.key == crate::prefs::EDIT_THEME)
+                    .map(|edit| {
+                        let request_id = next_control_settings_request();
+                        let keeping = self.native_runtime.view_state(view).and_then(|state| {
+                            let crate::native_app::AppViewState::Settings(state) = state else {
+                                return None;
+                            };
+                            match &state.showcase.trial {
+                                crate::native_settings::showcase_page::ShowcaseTrial::Keeping {
+                                    id,
+                                    operation,
+                                } if *operation == reply.operation => Some(id.clone()),
+                                _ => None,
+                            }
+                        });
+                        if let Some(id) = keeping {
+                            self.bind_theme_preview_commit(&id, request_id);
+                        }
+                        (
+                            request_id,
+                            edit.value
+                                .clone()
+                                .unwrap_or_else(|| crate::prefs::UNSET_THEME_LABEL.to_string()),
+                        )
+                    })
+                    .map(Box::new);
+                let theme_request_id = theme_request.as_deref().map(|(id, _)| *id);
                 self.native_config_pending.push_back(NativeConfigRequest {
                     origin: NativeConfigOrigin::View {
                         instance,
                         view,
                         reply,
+                        theme_request,
                     },
                     work: NativeConfigWork::Patch(patch),
                 });
-                self.pump_native_config()?;
+                if let Err(error) = self.pump_native_config() {
+                    if let Some(request_id) = theme_request_id
+                        && let Some(at) = self.native_config_pending.iter().position(|request| {
+                            matches!(&request.origin, NativeConfigOrigin::View { theme_request: Some(theme), .. } if theme.0 == request_id)
+                        })
+                        && let Some(request) = self.native_config_pending.remove(at)
+                    {
+                        self.publish_native_config_origin(request.origin, ConfigPatchOutcome::Rejected { message: error.clone() }, None, false, None);
+                    }
+                    return Err(error);
+                }
             }
             AppEffect::ConfigUndo { token, reply } => {
                 self.native_config_pending.push_back(NativeConfigRequest {
@@ -3932,6 +4107,7 @@ impl App {
                         instance,
                         view,
                         reply,
+                        theme_request: None,
                     },
                     work: NativeConfigWork::Undo(token),
                 });
@@ -4094,7 +4270,7 @@ impl App {
                 // versioned lane as control `settings set`, so the image is
                 // re-decoded and every Settings view converges on one verdict.
                 if let Some(path) =
-                    crate::menu::choose_local_file("Choose a wallpaper image", "Set Wallpaper")
+                    crate::menu::choose_local_image("Choose a wallpaper image", "Set Wallpaper")
                 {
                     let value = path.to_string_lossy().into_owned();
                     let (reply, outcome) = std::sync::mpsc::channel();
@@ -4143,6 +4319,30 @@ impl App {
                     )?;
                 }
             }
+            AppEffect::Themes { request, reply } => {
+                // The themes folder is the host's to resolve: the view named
+                // a catalog id at most (`settings_themes_host`).
+                let outcome = crate::settings_themes_host::perform(&request);
+                if matches!(
+                    outcome,
+                    crate::native_app::ThemesOutcome::Saved { .. }
+                        | crate::native_app::ThemesOutcome::Imported { .. }
+                        | crate::native_app::ThemesOutcome::Trashed { .. }
+                ) {
+                    self.rediscover_themes_now();
+                }
+                if self.native_runtime.completion_is_current(&reply) {
+                    self.dispatch_native_completion(
+                        wid,
+                        instance,
+                        view,
+                        AppEvent::ThemesFinished {
+                            operation: reply.operation,
+                            outcome,
+                        },
+                    )?;
+                }
+            }
             AppEffect::OpenPackagesLog => {
                 // atpkg's own resolution of where it writes — never a path from the view.
                 match atpkg::packages_log::log_path() {
@@ -4153,6 +4353,14 @@ impl App {
                     None => aterm_log::warn!("the package log has no directory to live in"),
                 }
             }
+            // Settings ▸ Harness: the page named a request; the host performs it
+            // and the page converges on the republished projection.
+            // An AI CLI's Sign in opens its tab in the Settings view's own
+            // window.
+            AppEffect::Harness(crate::native_app::HarnessRequest::AiSignIn { id }) => {
+                self.ai_sign_in(wid, id);
+            }
+            AppEffect::Harness(request) => self.execute_native_harness(request),
             AppEffect::InvalidateOwnPresentation => {
                 self.refresh_native_presentation(wid, instance, view);
             }
@@ -4184,28 +4392,55 @@ impl App {
         value: Option<String>,
         reply: std::sync::mpsc::Sender<Result<String, String>>,
     ) {
+        let _ = self.queue_control_settings_field_admitted(
+            key,
+            value,
+            reply,
+            next_control_settings_request(),
+        );
+    }
+
+    /// The queue handoff's request identity, when preflight and dispatch admit
+    /// it. The caller's reply remains owned by the same serialized lane.
+    pub(crate) fn queue_control_settings_field_admitted(
+        &mut self,
+        key: String,
+        value: Option<String>,
+        reply: std::sync::mpsc::Sender<Result<String, String>>,
+        request_id: u64,
+    ) -> Option<u64> {
         let Some(canonical_key) = crate::prefs::editable_fields(&self.config)
             .into_iter()
             .find(|field| field.key == key)
             .map(|field| field.key.to_string())
         else {
-            let _ = reply.send(Err(format!(
-                "unknown key {key:?} (search Settings or use Manual for the complete schema)"
-            )));
-            return;
+            // A key the file still loads but nothing reads (retired, or kept for
+            // compatibility) gets the band's and Manual's own story, never
+            // "unknown": a script that set it before its feature went is told
+            // why it no longer can, not sent to a Settings search that finds
+            // nothing.
+            let message = if crate::native_config_language::is_compatibility_only_key(&key) {
+                crate::native_config_language::compatibility_only_message(&key)
+            } else {
+                format!(
+                    "unknown key {key:?} (search Settings or use Manual for the complete schema)"
+                )
+            };
+            let _ = reply.send(Err(message));
+            return None;
         };
         if self.proxy.is_none() {
             let _ = reply.send(Err(
                 "save failed: config persistence needs an event-loop proxy".to_string(),
             ));
-            return;
+            return None;
         }
         if let Err(error) = native_config_queue() {
             let _ = reply.send(Err(format!("save failed: {error}")));
-            return;
+            return None;
         }
 
-        let request_id = self.enqueue_control_settings_field_intent(canonical_key, value, reply);
+        self.enqueue_control_settings_field_intent_with_id(canonical_key, value, reply, request_id);
         if let Err(error) = self.pump_native_config()
             && let Some(position) = self.native_config_pending.iter().position(|request| {
                 matches!(
@@ -4226,9 +4461,12 @@ impl App {
             // thread gets a bounded ERR; older UI intents stay queued for retry.
             let _ = reply.send(Err(format!("save failed: {error}")));
             self.refresh_serious_mode_queued_projection();
+            return None;
         }
+        Some(request_id)
     }
 
+    #[cfg(test)]
     fn enqueue_control_settings_field_intent(
         &mut self,
         canonical_key: String,
@@ -4236,6 +4474,17 @@ impl App {
         reply: std::sync::mpsc::Sender<Result<String, String>>,
     ) -> u64 {
         let request_id = next_control_settings_request();
+        self.enqueue_control_settings_field_intent_with_id(canonical_key, value, reply, request_id);
+        request_id
+    }
+
+    fn enqueue_control_settings_field_intent_with_id(
+        &mut self,
+        canonical_key: String,
+        value: Option<String>,
+        reply: std::sync::mpsc::Sender<Result<String, String>>,
+        request_id: u64,
+    ) {
         let serious_mode_intent = control_serious_mode_intent(&canonical_key, value.as_deref());
         self.native_config_pending.push_back(NativeConfigRequest {
             origin: NativeConfigOrigin::Control {
@@ -4256,7 +4505,6 @@ impl App {
         if let Some(desired) = serious_mode_intent {
             self.serious_mode_queued_projection = Some(desired);
         }
-        request_id
     }
 
     /// Enqueue the menu/keybinding/palette Serious Mode command in the versioned
@@ -4305,7 +4553,9 @@ impl App {
                     NativeConfigOrigin::Control { key, value, .. } => {
                         control_serious_mode_intent(key, value.as_deref())
                     }
-                    NativeConfigOrigin::View { .. } | NativeConfigOrigin::Presence { .. } => None,
+                    NativeConfigOrigin::View { .. }
+                    | NativeConfigOrigin::Presence { .. }
+                    | NativeConfigOrigin::ThemeChoice { .. } => None,
                 });
     }
 
@@ -4383,6 +4633,129 @@ impl App {
         self.pump_native_config()
     }
 
+    /// Queue the durable `theme` write for a theme chosen in the command
+    /// palette, through the lane and OCC materialization the presence toggles
+    /// use. The value is the Settings pickers' ([`crate::prefs::theme_choice_value`]):
+    /// over a plain name, the name itself — Default too, which stays dark on
+    /// a light OS; while `theme` is a `dark:…,light:…` pair, the pair with
+    /// only the side on screen replaced; while it is unset (following the
+    /// OS), a pair with the name on the side on screen and its partner on the
+    /// other, so the choice keeps following the OS.
+    pub(crate) fn queue_theme_choice(&mut self, id: &str) -> Result<(), String> {
+        self.proxy
+            .as_ref()
+            .ok_or_else(|| "config persistence needs an event-loop proxy".to_string())?;
+        let _ = native_config_queue()?;
+        let request_id = self.enqueue_theme_choice(id);
+        if let Err(error) = self.pump_native_config() {
+            if let Some(at) = self.native_config_pending.iter().position(|request| {
+                matches!(&request.origin, NativeConfigOrigin::ThemeChoice { request_id: queued, .. }
+                    if *queued == request_id)
+            }) {
+                self.native_config_pending.remove(at);
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// The queue half of [`Self::queue_theme_choice`]: one request, no pump.
+    pub(crate) fn enqueue_theme_choice(&mut self, id: &str) -> u64 {
+        let request_id = next_control_settings_request();
+        self.bind_theme_preview_commit(id, request_id);
+        self.native_config_pending.push_back(NativeConfigRequest {
+            origin: NativeConfigOrigin::ThemeChoice {
+                request_id,
+                id: id.to_string(),
+            },
+            work: NativeConfigWork::ThemeChoice {
+                id: id.to_string(),
+                side: self.os_appearance,
+            },
+        });
+        request_id
+    }
+
+    /// A palette theme choice's durable write completed. Applied: the durable
+    /// `theme` is adopted into `self.config` at once (the watcher's reload of
+    /// the same text then changes nothing), the choice's preview ends, and the
+    /// configured theme — now the chosen one — is installed, so the screen
+    /// never falls back to the old theme in between. Refused: the preview
+    /// reverts to the configured theme and the band says why.
+    fn publish_theme_choice_completion(
+        &mut self,
+        request_id: u64,
+        id: &str,
+        outcome: &ConfigPatchOutcome,
+        authoritative: Option<&crate::native_config_service::ConfigSnapshot>,
+        notify: bool,
+    ) {
+        let owning = |preview: &crate::control_theme::ThemePreview| {
+            preview.commit_request == Some(request_id)
+        };
+        if matches!(
+            outcome,
+            ConfigPatchOutcome::Applied { .. } | ConfigPatchOutcome::Conflict { .. }
+        ) && let Some(snapshot) = authoritative
+        {
+            self.config.theme.clone_from(&snapshot.config.theme);
+            if matches!(outcome, ConfigPatchOutcome::Applied { .. })
+                && self
+                    .theme_preview
+                    .as_ref()
+                    .is_some_and(|p| p.generation <= request_id)
+            {
+                self.theme_preview = None;
+            }
+            if self.theme_preview.is_some() {
+                let restore = self
+                    .config
+                    .resolved_colors(self.os_appearance, &self.config_assets.themes, None)
+                    .id;
+                if let Some(preview) = self.theme_preview.as_mut() {
+                    preview.restore = restore;
+                }
+            }
+        }
+        let feedback = match outcome {
+            ConfigPatchOutcome::Applied { .. } if authoritative.is_some() => {
+                self.install_resolved_colors(crate::app_colorscheme::ThemeChange::Preview);
+                None
+            }
+            ConfigPatchOutcome::Applied { .. } => Some((
+                "the save completed, but its theme could not be verified".to_string(),
+                true,
+            )),
+            ConfigPatchOutcome::Conflict { .. } => Some((
+                "aterm.toml changed first; its current value was kept".to_string(),
+                false,
+            )),
+            ConfigPatchOutcome::Indeterminate { message } => Some((message.clone(), true)),
+            other => Some((
+                control_settings_completion_reply(crate::prefs::EDIT_THEME, Some(id), other, None)
+                    .err()
+                    .unwrap_or_else(|| "the write was refused".to_string()),
+                false,
+            )),
+        };
+        if let Some((cause, indeterminate)) = feedback {
+            self.end_theme_preview_if(owning);
+            if !notify {
+                return;
+            }
+            let label = self
+                .config_assets
+                .themes
+                .meta(id)
+                .map_or_else(|| id.to_string(), |meta| meta.display_name);
+            self.post_message(crate::message_reporters::theme_not_saved(
+                &label,
+                &cause,
+                indeterminate,
+            ));
+        }
+    }
+
     /// Build the compare-and-swap request for a Serious Mode intent at dequeue
     /// time, when every earlier request has reduced into the service and the
     /// base revision and expected value are current.
@@ -4419,6 +4792,31 @@ impl App {
         })
     }
 
+    /// Build the `theme` compare-and-swap for a palette choice at dequeue
+    /// time, from the raw value and catalog of the newest revision.
+    fn theme_choice_patch_request(
+        &self,
+        id: &str,
+        side: aterm_types::Appearance,
+    ) -> Result<crate::native_app::ConfigPatch, String> {
+        let snapshot = self.native_config_service.snapshot();
+        let expected = snapshot.values()?.remove(crate::prefs::EDIT_THEME);
+        let (value, _) = crate::prefs::theme_choice_value(
+            expected.as_deref(),
+            side,
+            id,
+            &snapshot.assets.themes,
+        );
+        Ok(crate::native_app::ConfigPatch {
+            base_revision: snapshot.revision,
+            edits: vec![crate::native_app::ConfigEdit {
+                key: crate::prefs::EDIT_THEME.to_string(),
+                expected: ExpectedConfigValue::Exact(expected),
+                value,
+            }],
+        })
+    }
+
     fn reduce_native_config_work(
         &mut self,
         work: NativeConfigWork,
@@ -4430,6 +4828,9 @@ impl App {
             NativeConfigWork::ControlField { key, value } => {
                 NativeConfigWork::Patch(self.control_field_patch_request(key, value)?)
             }
+            NativeConfigWork::ThemeChoice { id, side } => {
+                NativeConfigWork::Patch(self.theme_choice_patch_request(&id, side)?)
+            }
             work => work,
         };
         Ok(match work {
@@ -4439,13 +4840,13 @@ impl App {
                     edits: patch
                         .edits
                         .into_iter()
-                        .map(|edit| ConfigKeyEdit {
-                            key: edit.key,
-                            expected: match edit.expected {
-                                ExpectedConfigValue::Any => ExpectedValue::Any,
-                                ExpectedConfigValue::Exact(value) => ExpectedValue::Exact(value),
-                            },
-                            value: edit.value,
+                        .map(|edit| {
+                            let ExpectedConfigValue::Exact(expected) = edit.expected;
+                            ConfigKeyEdit {
+                                key: edit.key,
+                                expected: ExpectedValue::Exact(expected),
+                                value: edit.value,
+                            }
                         })
                         .collect(),
                 })
@@ -4453,7 +4854,9 @@ impl App {
             NativeConfigWork::Undo(token) => self
                 .native_config_service
                 .undo(crate::native_config_service::UndoToken::from_stored(token)),
-            NativeConfigWork::SeriousMode(_) | NativeConfigWork::ControlField { .. } => {
+            NativeConfigWork::SeriousMode(_)
+            | NativeConfigWork::ControlField { .. }
+            | NativeConfigWork::ThemeChoice { .. } => {
                 unreachable!("semantic config work is materialized above")
             }
         })
@@ -5041,6 +5444,18 @@ impl App {
         // The running config mirrors the cell, for Settings and for the next
         // reload's comparison.
         self.config.harness = running;
+        // An agent that answers for itself re-reads `harness policy` on its
+        // `subscribe` stream's `harness-policy gen=<n>` (no clock).
+        self.announce_harness_policy();
+        // Every session's effective Autopilot reads the policy in force: the
+        // roster's readers off this thread are told (`autopilot=`), and every
+        // footer's chip repaints.
+        self.publish_harness_posture();
+        // Every session's A/B arm reads the posture: the stretch so far goes
+        // to the arm that was in force; Settings ▸ Harness shows the policy.
+        self.note_harness_arms();
+        self.harness_screen_moved();
+        self.request_redraw_all_windows();
     }
 
     /// The native config lane's own error (an observation that was not TOML, a
@@ -5108,13 +5523,26 @@ impl App {
                 instance,
                 view,
                 reply,
-            } => self.publish_native_config_completion(
-                instance,
-                view,
-                reply,
-                outcome,
-                reconciled_changed,
-            ),
+                theme_request,
+            } => {
+                if let Some(theme_request) = theme_request {
+                    let (request_id, id) = *theme_request;
+                    self.publish_theme_choice_completion(
+                        request_id,
+                        &id,
+                        &outcome,
+                        authoritative.as_ref(),
+                        false,
+                    );
+                }
+                self.publish_native_config_completion(
+                    instance,
+                    view,
+                    reply,
+                    outcome,
+                    reconciled_changed,
+                );
+            }
             NativeConfigOrigin::SeriousMode { desired } => self.publish_serious_mode_completion(
                 desired,
                 outcome,
@@ -5124,19 +5552,63 @@ impl App {
             NativeConfigOrigin::Presence { key, desired } => {
                 self.publish_presence_completion(key, desired, &outcome, authoritative.as_ref());
             }
+            NativeConfigOrigin::ThemeChoice { request_id, id } => {
+                self.publish_theme_choice_completion(
+                    request_id,
+                    &id,
+                    &outcome,
+                    authoritative.as_ref(),
+                    true,
+                );
+            }
             NativeConfigOrigin::Control {
-                key, value, reply, ..
+                request_id,
+                key,
+                value,
+                reply,
             } => {
                 let serious_mode = key == crate::prefs::EDIT_SERIOUS_MODE;
                 if serious_mode && let Some(snapshot) = authoritative.as_ref() {
                     self.apply_serious_mode_config_snapshot(snapshot);
                 }
-                let response = control_settings_completion_reply(
+                let mut response = control_settings_completion_reply(
                     &key,
                     value.as_deref(),
                     &outcome,
                     synchronization_error.as_deref(),
                 );
+                if key == crate::prefs::EDIT_THEME {
+                    // Keep actual saved truth even when a newer preview stands;
+                    // only this request's own committing hold may be retired.
+                    self.publish_theme_choice_completion(
+                        request_id,
+                        value.as_deref().unwrap_or(crate::prefs::UNSET_THEME_LABEL),
+                        &outcome,
+                        authoritative.as_ref(),
+                        false,
+                    );
+                    if matches!(outcome, ConfigPatchOutcome::Applied { .. })
+                        && authoritative.is_none()
+                    {
+                        response =
+                            Err("the save completed, but its theme could not be verified"
+                                .to_string());
+                    }
+                }
+                // A saved `theme` the admitted catalog cannot draw (or a selector
+                // with grammar issues) is said in the reply, not only on the band
+                // the caller cannot see: `settings set theme Nrod` is not a quiet OK.
+                if key == crate::prefs::EDIT_THEME
+                    && let Ok(status) = response.as_mut()
+                    && let Some(snapshot) = authoritative.as_ref()
+                {
+                    for miss in
+                        crate::app_config::theme_misses(&snapshot.config, &snapshot.assets.themes)
+                    {
+                        status.push_str("; ");
+                        status.push_str(&miss);
+                    }
+                }
                 self.refresh_serious_mode_queued_projection();
                 let _ = reply.send(response);
                 if key == crate::prefs::EDIT_ROBI {
@@ -5380,7 +5852,7 @@ impl App {
         let person = person_verb(&request);
         let Some(atpkg) = atpkg else {
             return PackagesOutcome::Failed {
-                message: "no co-located atpkg binary beside this executable".to_string(),
+                message: "the package tool is not installed beside aterm".to_string(),
             };
         };
         if !machine_apply && !atpkg::manager_enabled() {
@@ -5889,9 +6361,32 @@ impl App {
         self.dispatch_to_settings_views(&AppEvent::PackagesChanged { revision });
     }
 
+    /// Publish the Settings ▸ Harness projection (`App::harness_state`) to the
+    /// Settings controller and fan the revision out to every Settings view (the
+    /// packages twin). A no-op with no Settings instance: nothing is built.
+    pub(crate) fn publish_native_harness_state(&mut self) {
+        if self
+            .native_runtime
+            .instance_by_kind(crate::native_app::AppKind::Settings)
+            .is_none()
+        {
+            return;
+        }
+        let state = self.harness_state();
+        self.harness_screen.revision = self.harness_screen.revision.saturating_add(1);
+        let revision = self.harness_screen.revision;
+        if !self
+            .native_runtime
+            .replace_settings_harness(state, revision)
+        {
+            return;
+        }
+        self.dispatch_to_settings_views(&AppEvent::HarnessChanged { revision });
+    }
+
     /// Deliver `event` to every Settings view and repaint every window that shows one — the
     /// fan-out after a shared Settings projection (packages, the log) was replaced.
-    fn dispatch_to_settings_views(&mut self, event: &AppEvent) {
+    pub(crate) fn dispatch_to_settings_views(&mut self, event: &AppEvent) {
         let setting_views = self.dispatch_settings_event(event);
         for ws in self.windows.values_mut() {
             let shows_settings = ws
@@ -5927,7 +6422,23 @@ impl App {
                 })
                 .collect::<Vec<_>>();
         for &(instance, view) in &views {
-            let _ = self.native_runtime.dispatch(instance, view, event.clone());
+            let Ok(outcome) = self.native_runtime.dispatch(instance, view, event.clone()) else {
+                continue;
+            };
+            // A shared projection can complete a view's own pending work —
+            // Settings ▸ Themes selects a saved theme once the published
+            // catalog lists it — so its effects run as any reducer's do.
+            // Dropped, that select's config patch never ran and stayed
+            // pending: the page said "Selected" and nothing was written.
+            if outcome.effects.is_empty() {
+                continue;
+            }
+            let Ok((wid, _)) = self.locate_native_view(view) else {
+                continue;
+            };
+            for effect in outcome.effects {
+                let _ = self.execute_native_effect(wid, instance, view, effect);
+            }
         }
         views.into_iter().map(|(_, view)| view).collect()
     }
@@ -9743,8 +10254,8 @@ impl App {
     /// itself raises no decision row.
     ///
     /// No restart prompt: nothing on the update lane asks for a restart
-    /// (`update_words`' guards and `tools/grep_guard.sh` B12); the Version
-    /// menu's apply is the in-place remedy (owner, 2026-08-30).
+    /// (`update_words`' guards); the Version menu's apply is the in-place
+    /// remedy (owner, 2026-08-30).
     pub(crate) fn announce_automatic_apply_stranded(
         &mut self,
         build: u64,
@@ -10598,7 +11109,7 @@ impl App {
                 "Wait: {pending_checkpoints} document checkpoint(s) are still running"
             ));
         }
-        if self.pending_restore.is_some() || !self.seamless_adopt.is_empty() {
+        if self.restore_pass_queued() {
             blockers.push(Self::RESTORE_IN_FLIGHT_BLOCKS_APPLY.to_string());
         }
         if blockers.is_empty() {
@@ -10983,7 +11494,7 @@ fn launch_native_machine_read(
     proxy: winit::event_loop::EventLoopProxy<Wake>,
 ) -> Result<(), String> {
     let atpkg = crate::co_located_atpkg()
-        .ok_or_else(|| "no co-located atpkg binary beside this executable".to_string())?;
+        .ok_or_else(|| "the package tool is not installed beside aterm".to_string())?;
     spawn_native_machine_read(proxy, atpkg)
         .map_err(|error| format!("could not start the machine read: {error}"))
 }
@@ -11181,9 +11692,9 @@ fn machine_command_output_bounded(
         let cleanup_deadline = deadline.min(Instant::now() + reserve);
         if !stop_machine_read_child(&mut child, cleanup_deadline) {
             error.push_str("; child exit could not be confirmed within the cleanup budget");
-            // Killed but not yet collected: the process-wide reaper waits for it,
-            // so it never stays a zombie of the window.
-            aterm_pty::reap_in_background(child);
+            // Killed but not yet collected: dropping it hands it to the
+            // process-wide reaper, so it never stays a zombie of the window.
+            drop(child);
         }
         error
     })

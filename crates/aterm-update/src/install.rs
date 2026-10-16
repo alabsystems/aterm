@@ -13,7 +13,6 @@
 //! ([`checked_zip_extraction_claim`]).
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use aterm_update_core::{FileLock, LaunchName, Sentinel, ensure_private_dir, same_volume};
 
@@ -541,7 +540,14 @@ fn rearm_or_close_handoff_fd(fd: i32) {
 /// leaves it there when the exec fails, and the rollback arm that follows a failed exec
 /// carries on in this process, which would then die on its next write to a peer that has
 /// gone.
-fn exec_preserving_handoff_fds(command: &mut Command, handoff_fds: &[i32]) -> std::io::Error {
+#[expect(
+    clippy::disallowed_types,
+    reason = "the boot re-exec of this image keeps what this launch was handed (a lifeline fd, the handoff descriptors)"
+)]
+fn exec_preserving_handoff_fds(
+    command: &mut std::process::Command,
+    handoff_fds: &[i32],
+) -> std::io::Error {
     let mut exact = handoff_fds.to_vec();
     exact.sort_unstable();
     if exact.iter().any(|fd| *fd < 3) || exact.windows(2).any(|pair| pair[0] == pair[1]) {
@@ -583,13 +589,17 @@ use crate::relaunch::window_successor_args;
 ///
 /// `ATERM_UPDATED_FROM` names the build this image was: the successor's `main`
 /// reads it for the post-update notice and clears it.
+#[expect(
+    clippy::disallowed_types,
+    reason = "the boot re-exec of this image keeps what this launch was handed (a lifeline fd, the handoff descriptors)"
+)]
 fn boot_reexec_command(
     new_exe: &std::path::Path,
     reexec_value: &str,
     updated_from: u64,
     handoff_env: &[(std::ffi::OsString, std::ffi::OsString)],
-) -> Command {
-    let mut reexec = Command::new(new_exe);
+) -> std::process::Command {
+    let mut reexec = std::process::Command::new(new_exe);
     reexec
         // The swap re-exec targets the canonical Mach-O, losing any argv0 alias, and
         // only runs from the window entry, so pin the mode for the one-binary router
@@ -1944,12 +1954,18 @@ fn verified_bundle_identity(app: &Path) -> Result<(u64, String), String> {
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err("bundle path is not a non-symlink directory".to_string());
     }
-    verify::verify_bundle_policy(app, crate::effective_team_id())
+    // The five helpers run at once; their answers are read in the serial order
+    // (`verify::check_bundle`), so the first refusal is the serial gate's.
+    let checks = verify::check_bundle(app, crate::effective_team_id(), false);
+    checks
+        .policy
         .map_err(|error| format!("bundle policy: {error}"))?;
-    let build =
-        verify::bundle_build_number(app).map_err(|error| format!("sealed build: {error}"))?;
-    let commit =
-        verify::bundle_git_commit(app).map_err(|error| format!("sealed commit: {error}"))?;
+    let build = checks
+        .build
+        .map_err(|error| format!("sealed build: {error}"))?;
+    let commit = checks
+        .commit
+        .map_err(|error| format!("sealed commit: {error}"))?;
     let clean_commit = commit.trim();
     if !(7..=40).contains(&clean_commit.len())
         || !clean_commit.bytes().all(|byte| byte.is_ascii_hexdigit())
@@ -2427,13 +2443,17 @@ pub fn preverify_staged_handoff_candidate(
 pub const ROLLBACK_SOURCE_REFUSAL_KEY: &str = "cannot be the rollback source";
 
 /// The one sentence that names the way out of an unverifiable install.
-pub const ROLLBACK_SOURCE_REMEDY: &str = "this install cannot update itself: reinstall the      signed release (tools/install.sh, or drag it from the release DMG) — or, for a local      build, mark it ATermDevBuild (tools/dev-app.sh) so the updater leaves it alone";
+pub const ROLLBACK_SOURCE_REMEDY: &str = "this install cannot update itself: reinstall the \
+     signed release (tools/install.sh, or drag it from the release DMG) — or, for a local \
+     build, build it with `targo --unverified ship dev-app`, whose ATermDevBuild mark the \
+     updater leaves alone";
 
 /// The refusal both apply lanes mint when the INSTALLED bundle cannot be the
 /// swap's rollback source, with the remedy attached.
 pub fn rollback_source_refusal(installed: &Path, error: &str) -> String {
     format!(
-        "the installed bundle at {} {ROLLBACK_SOURCE_REFUSAL_KEY} the swap installs: {error};          {ROLLBACK_SOURCE_REMEDY}",
+        "the installed bundle at {} {ROLLBACK_SOURCE_REFUSAL_KEY} the swap installs: {error}; \
+         {ROLLBACK_SOURCE_REMEDY}",
         installed.display()
     )
 }
@@ -2941,34 +2961,9 @@ fn publish_verified_stage_within(
     // does not back a healthy, verified build off.
     let _publish_lock = FileLock::acquire_within(&staging.apply_lock, lock_wait)
         .map_err(|error| verify::lock_wait_refusal("publish lock", &error))?;
-    // UNDER THE LOCK THE CRASH-LOOP REVERT HOLDS. This
-    // stage was decided before the download — minutes ago — and a revert may have
-    // quarantined this very artifact since: then it is not published. The other
-    // order is safe too: a revert after this publish retires the stage.
-    if crate::manifest::artifact_quarantined(staging, ready.build_number, &ready.dmg_sha256) {
-        return Err(format!(
-            "stage refused: build {} ({}) is quarantined — it crash-looped on this machine \
-             and was reverted while this check was downloading it",
-            ready.build_number, ready.dmg_sha256
-        ));
-    }
-    // …AND UNDER THE LOCK THE FLOOR'S READERS AND THE CHECK LANE'S RETIREMENT HOLD.
-    // The roster generation was judged before the
-    // download, minutes ago; a sibling's check may since have admitted a roster that
-    // REVOKES this build's signer (or seen a yank), recorded it in the floor, and
-    // found no published stage to retire. Publishing now would arm this process's
-    // apply lane for a withdrawn machine's build. Either order is safe: a withdrawal
-    // recorded after this publish finds the stage and retires it.
-    // A floor that could not be read is no floor's word that the build is still
-    // admitted: refused as a moment, and the next check publishes it.
-    if let Some(why) = crate::manifest::Floor::read_for_gate(&staging.floor())
-        .map_err(|refusal| format!("stage refused: {refusal}"))?
-        .withdraws(ready.build_number, ready.machine_id.as_deref())
-    {
-        return Err(format!(
-            "stage refused: {why} — withdrawn while this check was downloading it"
-        ));
-    }
+    // Under the lock the crash-loop revert, the floor's readers and the check lane's
+    // retirement hold (`stage_withdrawn`).
+    stage_withdrawn(staging, ready)?;
 
     // Invalidate the old generation first. Lock-free status readers may briefly
     // observe "absent", but never an old marker paired with the new bundle.
@@ -2982,6 +2977,43 @@ fn publish_verified_stage_within(
     // installed receipt (`ensure_current_trial_receipt` falls back to it), so a
     // zero-length one after a kernel panic would strand that repair.
     crate::manifest::write_durable(&staging.ready, &marker, "ready marker")
+}
+
+/// Why the stage of `ready` may no longer be published, as of the records on disk:
+/// `Ok` while they still admit it. The publish asks under the apply lock, where the
+/// answer is the authority; the stage's start probe asks first, without it, so a
+/// build those records already withdrew is never started.
+///
+/// THE CRASH-LOOP REVERT. This stage was decided before the download — minutes ago —
+/// and a revert may have quarantined this very artifact since: then it is not
+/// published. The other order is safe too: a revert after the publish retires the
+/// stage.
+///
+/// THE FLOOR. The roster generation was judged before the download, minutes ago; a
+/// sibling's check may since have admitted a roster that REVOKES this build's signer
+/// (or seen a yank), recorded it in the floor, and found no published stage to
+/// retire. Publishing now would arm this process's apply lane for a withdrawn
+/// machine's build. Either order is safe: a withdrawal recorded after the publish
+/// finds the stage and retires it. A floor that could not be read is no floor's word
+/// that the build is still admitted: refused as a moment, and the next check
+/// publishes it.
+fn stage_withdrawn(staging: &Staging, ready: &Ready) -> Result<(), String> {
+    if crate::manifest::artifact_quarantined(staging, ready.build_number, &ready.dmg_sha256) {
+        return Err(format!(
+            "stage refused: build {} ({}) is quarantined — it crash-looped on this machine \
+             and was reverted while this check was downloading it",
+            ready.build_number, ready.dmg_sha256
+        ));
+    }
+    if let Some(why) = crate::manifest::Floor::read_for_gate(&staging.floor())
+        .map_err(|refusal| format!("stage refused: {refusal}"))?
+        .withdraws(ready.build_number, ready.machine_id.as_deref())
+    {
+        return Err(format!(
+            "stage refused: {why} — withdrawn while this check was downloading it"
+        ));
+    }
+    Ok(())
 }
 
 /// Stages a verified copy of the bundle from a downloaded (SHA-256-checked) DMG:
@@ -3571,9 +3603,10 @@ fn staging_manifest_commit(manifest: &Manifest) -> Result<String, String> {
 
 /// Verifies an already-extracted incoming bundle and publishes it as the staged
 /// update. This is the whole security gate of staging: codesign policy, the
-/// manifest↔sealed CFBundleVersion rebind, the sealed-commit rebind, then the ready
-/// marker written last. The single copy shared by [`stage_from_dmg`] and
-/// [`stage_from_zip`], so the container can never change what is proved.
+/// manifest↔sealed CFBundleVersion rebind, the sealed-commit rebind, the start
+/// probe, then the ready marker written last. The single copy shared by
+/// [`stage_from_dmg`] and [`stage_from_zip`], so the container can never change what
+/// is proved.
 ///
 /// Every failure path removes `incoming`, so a refused candidate leaves no
 /// half-staged bundle.
@@ -3591,15 +3624,17 @@ fn verify_and_publish_incoming(
 ) -> Result<(), String> {
     // Verify the extracted bundle before publishing it (tiered: full Developer-ID
     // check when a Team ID is pinned, else structural-only — see the crate trust model).
-    if let Err(e) = verify::verify_bundle_policy(incoming, expected_team) {
+    // Its helpers and the sealed reads run at once, and are read in this order.
+    let checks = verify::check_bundle(incoming, expected_team, false);
+    if let Err(e) = checks.policy {
         let _ = std::fs::remove_dir_all(incoming);
         return Err(format!("staged bundle failed verification: {e}"));
     }
     // Bind the (unauthenticated) manifest build_number to the number inside the
     // signed bundle, or a manifest could claim a high build_number while pointing at
     // an old genuine signed bundle (downgrade/replay via repo write). CFBundleVersion
-    // is codesign-sealed, so reading it after verify_bundle is sound.
-    let bundle_build = match verify::bundle_build_number(incoming) {
+    // is codesign-sealed, so taking it once the policy above has passed is sound.
+    let bundle_build = match checks.build {
         Ok(n) => n,
         Err(e) => {
             let _ = std::fs::remove_dir_all(incoming);
@@ -3614,7 +3649,7 @@ fn verify_and_publish_incoming(
             manifest.build_number
         ));
     }
-    let sealed_commit = match verify::bundle_git_commit(incoming) {
+    let sealed_commit = match checks.commit {
         Ok(commit) => commit,
         Err(error) => {
             let _ = std::fs::remove_dir_all(incoming);
@@ -3627,8 +3662,10 @@ fn verify_and_publish_incoming(
             "staged bundle ATermGitCommit {sealed_commit:?} does not match manifest commit"
         ));
     }
-    let team = verify::team_id(incoming).unwrap_or_else(|_| expected_team.to_string());
-
+    let team = match checks.team {
+        Some(Ok(team)) => team,
+        _ => verify::team_id(incoming).unwrap_or_else(|_| expected_team.to_string()),
+    };
     let ready = staged_ready_marker(
         manifest,
         manifest_commit,
@@ -3636,6 +3673,26 @@ fn verify_and_publish_incoming(
         &now_rfc3339(),
         roster_read_at,
     );
+    // Start it once, now that every check above has passed, so its first exec's
+    // Gatekeeper assessment is paid here and not by the apply's probe, before a
+    // window (`verify::probe_staged_bundle_starts`). A candidate that cannot start
+    // is refused like any other stage verdict, before a marker exists; a probe that
+    // could not run to an answer (timed out on a loaded machine, refused a spawn
+    // just then) is no verdict and publishes: the apply's probe still gates the swap.
+    // A build the records already withdrew (`stage_withdrawn`) is not started: the
+    // publish refuses it under its lock, with these words.
+    if stage_withdrawn(staging, &ready).is_ok()
+        && let Err(error) = verify::probe_staged_bundle_starts(incoming, bundle_build)
+    {
+        if stage_failure_is_a_verdict(&error) {
+            let _ = std::fs::remove_dir_all(incoming);
+            return Err(format!("staged bundle cannot start: {error}"));
+        }
+        crate::warn(&format!(
+            "staged bundle start probe did not finish: {error}; publishing, and the \
+             apply probes it again"
+        ));
+    }
     publish_verified_stage(staging, incoming, &ready)
 }
 
@@ -4529,12 +4586,16 @@ fn check_boot_health_with_lock_wait(
 /// restore postdates the router (d2a29b6c7, an ancestor of v0.21.0) and strips
 /// the pin: a rollback slot holds the build that applied the update, and installs
 /// older than the router cannot update.
+#[expect(
+    clippy::disallowed_types,
+    reason = "the crash-loop revert's re-exec of the restored build, under boot_reexec_command's rule"
+)]
 fn rollback_reexec_command(
     restored_exe: &Path,
     args: impl Iterator<Item = std::ffi::OsString>,
     handoff_env: &[(std::ffi::OsString, std::ffi::OsString)],
-) -> Command {
-    let mut reexec = Command::new(restored_exe);
+) -> std::process::Command {
+    let mut reexec = std::process::Command::new(restored_exe);
     for (key, value) in handoff_env {
         reexec.env(key, value);
     }
@@ -6223,3 +6284,7 @@ mod tests;
 #[cfg(all(test, target_os = "macos"))]
 #[path = "install_copy_tests.rs"]
 mod copy_tests;
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "install_stage_probe_tests.rs"]
+mod stage_probe_tests;

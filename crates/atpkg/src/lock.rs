@@ -23,7 +23,7 @@
 //! holder instead, behind a spinner, up to ten minutes (2026-09-23). MACHINE lanes
 //! — the window's launch-time `seed` and `update` children — opt into a BOUNDED WAIT
 //! instead with `--wait-lock <secs>` ([`lock_store_waiting`]): the same try, then a
-//! 500 ms poll until the holder exits or the deadline passes, announced once on
+//! 50 ms poll until the holder exits or the deadline passes, announced once on
 //! stdout as the `lock-waiting:` marker after a short grace. That is what makes a
 //! second aterm process mid-install — the macOS Full Disk Access grant, which quits
 //! the app and opens it again; a self-update re-exec; a second window opened by
@@ -155,6 +155,165 @@ impl std::ops::DerefMut for Flock {
 impl Drop for Flock {
     fn drop(&mut self) {
         let _ = self.0.unlock();
+    }
+}
+
+/// A holder's exclusive lock on a file that CARRIES A RECORD other processes read while
+/// the holder lives — a lease's "who" line ([`crate::lease`]), the head watch seat's pid
+/// ([`crate::vendor_direct::watch`]). Released on drop, like [`Flock`].
+///
+/// Unix uses the advisory whole-file lock. Windows byte-range locks also deny
+/// ordinary reads from other handles, so the record remains outside the locked
+/// range `[record, u64::MAX)`. Whole-file liveness probes still overlap that range.
+#[derive(Debug)]
+pub(crate) struct RecordLock {
+    file: File,
+    /// The record's length: where the held range starts (Windows).
+    #[cfg(windows)]
+    record: u64,
+}
+
+impl RecordLock {
+    /// Take `file`'s exclusive lock without blocking, leaving its first `record` bytes
+    /// readable by other handles on Windows ([`RecordLock`]).
+    pub(crate) fn try_lock(file: File, record: u64) -> Result<Self, std::fs::TryLockError> {
+        // The census's File evidence, as in `Flock::try_lock`.
+        let file: std::fs::File = file;
+        #[cfg(windows)]
+        {
+            record_range::try_lock(&file, record)?;
+            Ok(Self { file, record })
+        }
+        #[cfg(not(windows))]
+        {
+            // `flock` has no ranges, and needs none: it is advisory.
+            let _ = record;
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "the record guard's own take: its Drop releases by LOCK_UN"
+            )]
+            file.try_lock()?;
+            Ok(Self { file })
+        }
+    }
+
+    /// Let the lock go, keeping the file open — what the kernel does for a holder that
+    /// dies. The drop does it too.
+    pub(crate) fn unlock(&self) {
+        #[cfg(windows)]
+        record_range::unlock(&self.file, self.record);
+        #[cfg(not(windows))]
+        {
+            let _ = self.file.unlock();
+        }
+    }
+}
+
+impl std::ops::Deref for RecordLock {
+    type Target = File;
+    fn deref(&self) -> &File {
+        &self.file
+    }
+}
+
+impl std::ops::DerefMut for RecordLock {
+    fn deref_mut(&mut self) -> &mut File {
+        &mut self.file
+    }
+}
+
+impl Drop for RecordLock {
+    fn drop(&mut self) {
+        self.unlock();
+    }
+}
+
+/// [`RecordLock`]'s Windows range: `LockFileEx`/`UnlockFileEx` over `[record, u64::MAX)`.
+#[cfg(windows)]
+mod record_range {
+    use std::ffi::c_void;
+    use std::fs::File;
+    use std::os::windows::io::AsRawHandle as _;
+
+    /// `OVERLAPPED`: the offset names the range; the API may also update its status fields.
+    #[repr(C)]
+    struct Overlapped {
+        internal: usize,
+        internal_high: usize,
+        offset: u32,
+        offset_high: u32,
+        event: *mut c_void,
+    }
+
+    const LOCKFILE_FAIL_IMMEDIATELY: u32 = 0x0000_0001;
+    const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x0000_0002;
+    /// `LockFileEx`'s answer when another handle holds part of the range.
+    const ERROR_LOCK_VIOLATION: i32 = 33;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn LockFileEx(
+            file: *mut c_void,
+            flags: u32,
+            reserved: u32,
+            bytes_low: u32,
+            bytes_high: u32,
+            overlapped: *mut Overlapped,
+        ) -> i32;
+        fn UnlockFileEx(
+            file: *mut c_void,
+            reserved: u32,
+            bytes_low: u32,
+            bytes_high: u32,
+            overlapped: *mut Overlapped,
+        ) -> i32;
+    }
+
+    /// The `OVERLAPPED` naming `record` as the start, and the range's length split into
+    /// its low and high halves.
+    fn range(record: u64) -> (Overlapped, u32, u32) {
+        let len = u64::MAX - record;
+        let overlapped = Overlapped {
+            internal: 0,
+            internal_high: 0,
+            offset: record as u32,
+            offset_high: (record >> 32) as u32,
+            event: std::ptr::null_mut(),
+        };
+        (overlapped, len as u32, (len >> 32) as u32)
+    }
+
+    pub(super) fn try_lock(file: &File, record: u64) -> Result<(), std::fs::TryLockError> {
+        let (mut overlapped, low, high) = range(record);
+        // SAFETY: `file` is an open handle for the call; `overlapped` is a live, initialised
+        // `OVERLAPPED` available for the call's input/output. The handle is synchronous
+        // and FAIL_IMMEDIATELY refuses contention rather than parking a request.
+        let ok = unsafe {
+            LockFileEx(
+                file.as_raw_handle(),
+                LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                0,
+                low,
+                high,
+                &mut overlapped,
+            )
+        };
+        if ok != 0 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(ERROR_LOCK_VIOLATION) {
+            Err(std::fs::TryLockError::WouldBlock)
+        } else {
+            Err(std::fs::TryLockError::Error(err))
+        }
+    }
+
+    pub(super) fn unlock(file: &File, record: u64) {
+        let (mut overlapped, low, high) = range(record);
+        // SAFETY: as in `try_lock`. A range this handle does not hold is refused, which
+        // changes nothing.
+        let _ = unsafe { UnlockFileEx(file.as_raw_handle(), 0, low, high, &mut overlapped) };
     }
 }
 
@@ -364,9 +523,12 @@ pub const CONTENDED_EXIT: u8 = 75;
 /// `setxattr` bumps ctime on APFS (measured 2026-09-13), and a poll that repeated
 /// the first attempt's hardening made a half-hour wait ~3,600 journaled metadata
 /// writes, each an FSEvents change for the backup watchers the attribute keeps
-/// away. An `lstat`, an open and a `try_lock` every half second are nothing
-/// against a wait that is idle by definition.
-const WAIT_POLL: Duration = Duration::from_millis(500);
+/// away. An `lstat`, an open and a `try_lock` are nothing against a wait that is
+/// idle by definition, so the poll is as quick as the wait's END needs: the pass
+/// behind a holder starts within 50 ms of the release, where a half-second poll
+/// started it up to 500 ms late (250 on average) — a person's typed verb queued
+/// behind a background pass, a window's pass behind a session's.
+const WAIT_POLL: Duration = Duration::from_millis(50);
 
 /// How long a waiter stays SILENT before it announces the wait to its caller
 /// (`on_first_contention`). Every window's no-op update tick holds the lock for the
@@ -732,6 +894,77 @@ mod tests {
         let _ = std::fs::remove_dir_all(&a.prefix);
     }
 
+    /// A record stays readable while whole-file probes and another holder are refused.
+    #[test]
+    fn a_record_lock_leaves_its_record_readable_and_refuses_a_whole_file_probe() {
+        use std::io::{Read as _, Write as _};
+        let a = temp_layout("record");
+        std::fs::create_dir_all(&a.prefix).expect("prefix");
+        let path = a.prefix.join("record.lock");
+        let open = || {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)
+                .expect("open")
+        };
+        let mut held = RecordLock::try_lock(open(), 64).expect("free");
+        held.write_all(b"4242\n")
+            .expect("the holder writes its record");
+        let mut record = String::new();
+        open()
+            .take(64)
+            .read_to_string(&mut record)
+            .expect("another handle reads the record while the lock stands");
+        assert_eq!(record, "4242\n");
+        assert!(matches!(
+            Flock::try_lock(open()),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        assert!(matches!(
+            Flock::try_lock_shared(open()),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        assert!(
+            matches!(
+                RecordLock::try_lock(open(), 64),
+                Err(std::fs::TryLockError::WouldBlock)
+            ),
+            "a second holder is refused"
+        );
+        held.unlock();
+        assert!(Flock::try_lock(open()).is_ok(), "free once let go");
+        drop(held);
+        let _ = std::fs::remove_dir_all(&a.prefix);
+    }
+
+    #[test]
+    fn a_dropped_record_lock_is_free_while_a_copy_of_its_file_lives() {
+        let a = temp_layout("record-drop-copy");
+        std::fs::create_dir_all(&a.prefix).expect("prefix");
+        let path = a.prefix.join("record.lock");
+        let open = || {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)
+                .expect("open")
+        };
+        let held = RecordLock::try_lock(open(), 64).expect("first holder");
+        let copy = held.try_clone().expect("a live copy of the open file");
+        assert!(matches!(
+            RecordLock::try_lock(open(), 64),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        drop(held);
+        let again = RecordLock::try_lock(open(), 64).expect("free while its file copy lives");
+        drop((again, copy));
+    }
+
     /// A DROPPED STORE LOCK IS FREE AT ONCE, whatever else holds its descriptor. A child
     /// another thread is spawning holds a copy of every open descriptor until it execs, and
     /// a lock released only by the close stayed held for that long: under a loaded suite the
@@ -1061,7 +1294,7 @@ mod tests {
     /// would follow a link a same-uid actor swapped in mid-wait and take the lock
     /// on whatever directory it points at — through the link, on a file the real
     /// store never sees. Every poll now lstats the prefix first (one metadata read
-    /// per 500 ms and no write), and anything but a real directory goes to the full
+    /// per poll and no write), and anything but a real directory goes to the full
     /// acquisition, which refuses the link with the F16 error at that poll rather
     /// than at the bound.
     ///

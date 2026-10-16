@@ -12,7 +12,9 @@
 //! - **Generated-input tests**: `src/tests/generated.rs`
 //! - **Fuzz-shaped tests** are ordinary integration tests in the `core_fuzz`
 //!   binary (`tests/fuzz_process_never_panics.rs`, `tests/fuzz_alt_screen.rs`).
-//!   The workspace's one `cargo-fuzz` target is `crates/aterm-scrollback/fuzz`.
+//!   The workspace's `cargo-fuzz` targets are `crates/aterm-scrollback/fuzz`,
+//!   `crates/aterm-font/fuzz`, `crates/aterm-zstd/fuzz` and
+//!   `crates/aterm-dbus/fuzz`.
 //!
 //! ## Components
 //!
@@ -34,12 +36,10 @@
 //! off-by-default `sixel` feature: decodes a sixel DCS into an inline image and
 //! advertises DA1 code 4), `vt_level`, and `aterm-vi` for vi-mode navigation.
 
-#![forbid(unsafe_op_in_unsafe_fn)]
-#![deny(missing_docs)]
-#![deny(clippy::all)]
-#![deny(clippy::pedantic)]
+#![warn(missing_docs)]
+#![warn(clippy::pedantic)]
 // Test code (compiled via --all-targets) is exempt from strict clippy.
-// Production code is still checked: `targo tippy -p aterm-core --lib` enforces all + pedantic.
+// Production code is still checked: `verify lint` (tippy -D warnings) enforces all + pedantic.
 #![cfg_attr(test, allow(clippy::all, clippy::pedantic))]
 #![allow(
     unexpected_cfgs,

@@ -2,48 +2,37 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Policy-engine bridge for the capability-module mint paths.
+//! Policy-engine bridge for the capability gates.
 //!
-//! A [`PolicyEngine`] on [`super::Terminal`] evaluates policy-bearing
-//! dispatches alongside the `TerminalModes::allow_*` booleans. Every capability
-//! module (`response_capability`, `clipboard_auth`, `window_auth`,
-//! `shell_integration_auth`) uses the same decision tree, factored into
-//! [`engine_decision`]:
+//! A [`PolicyEngine`] on [`super::Terminal`] decides policy-bearing dispatches alongside the
+//! `TerminalModes::allow_*` booleans through one decision tree, [`engine_decision`] (the fixed
+//! gates read its verdicts as `policy_gates` compiled them once per policy):
 //!
-//! * no engine: [`BridgeDecision::Fallback`] (the `allow_*` bool decides);
+//! * no engine, or no matching rule (`defaults.unmatched`): [`BridgeDecision::Fallback`], and
+//!   the `allow_*` bool decides;
 //! * a matching rule with [`Response::Execute`]: [`BridgeDecision::Allow`];
-//! * a matching rule with any other response (`Drop`, `Warn`, `Ask`,
-//!   `Rewrite`): [`BridgeDecision::Deny`], whatever the bool says;
-//! * no matching rule (`defaults.unmatched`): [`BridgeDecision::Fallback`].
+//! * a matching rule with any other response (`Drop`, `Warn`, `Ask`, `Rewrite`):
+//!   [`BridgeDecision::Deny`], whatever the bool says.
 //!
 //! Deny-by-default sinks that a broad wildcard allow must not reopen use
 //! [`engine_decision_deny_by_default_capability`].
 
 use aterm_policy::{OriginTag, Response, engine::PolicyEngine, selector::DispatchedSequence};
 
-/// Decision returned by [`engine_decision`]. Mirrors the three mutually
-/// exclusive branches of the bridge decision tree described in the
-/// module docs.
+/// The verdict of [`engine_decision`] (see the module docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum BridgeDecision {
-    /// The engine matched a rule whose response was [`Response::Execute`].
-    /// The mint may proceed regardless of the legacy bool.
+    /// A rule matched with [`Response::Execute`]: the mint proceeds, whatever the legacy bool.
     Allow,
-    /// The engine matched a rule whose response was **not**
-    /// [`Response::Execute`] (i.e. `Drop` / `Warn` / `Ask` / `Rewrite`).
-    /// The mint must fail, regardless of the legacy bool.
+    /// A rule matched with any other response: the mint fails, whatever the legacy bool.
     Deny,
-    /// No rule matched, or no engine was installed. The caller should
-    /// consult the legacy `allow_*` / `authorized` boolean.
+    /// No rule matched, or no engine is installed: the legacy `allow_*` / `authorized` bool
+    /// decides.
     Fallback,
 }
 
 impl BridgeDecision {
-    /// Resolve the bridge decision against the caller's legacy boolean.
-    ///
-    /// Returns `true` when the mint should proceed, `false` when it
-    /// should fail. This is the canonical one-line consumer for sites
-    /// that do not need to distinguish the three branches explicitly.
+    /// Resolve against the caller's legacy boolean: `true` when the mint should proceed.
     #[inline]
     #[must_use]
     pub(super) fn resolve(self, legacy_allow: bool) -> bool {
@@ -55,9 +44,8 @@ impl BridgeDecision {
     }
 }
 
-/// Consult the installed [`PolicyEngine`] (if any) for `sequence` at `origin`
-/// and return the bridge decision; the one way capability modules consult the
-/// engine. Never panics or allocates; `Fallback` when `engine` is `None`.
+/// Consult the installed [`PolicyEngine`] (if any) for `sequence` at `origin`. Never panics or
+/// allocates; `Fallback` when `engine` is `None`.
 #[inline]
 #[must_use]
 pub(super) fn engine_decision(
@@ -83,10 +71,9 @@ pub(super) fn engine_decision_deny_by_default_capability(
     engine_decision_with_wildcard_execute_fallback(engine, sequence, origin, true)
 }
 
-// Test-only count of entries into the engine bridge. Fixed capability gates
-// read verdicts compiled once per policy into `PolicyGates`; the compiled
-// and live verdicts agree on every input, so only this count can show a gate
-// that evaluates per dispatch again.
+// Test-only count of entries into the engine bridge. Fixed capability gates read verdicts
+// compiled once per policy into `PolicyGates`, which agree with the live verdicts on every
+// input, so only this count shows a gate that evaluates per dispatch again.
 #[cfg(test)]
 thread_local! {
     static ENGINE_DECISIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -259,11 +246,8 @@ mod tests {
 
     #[test]
     fn decision_origin_gate_failure_falls_through_to_wildcard() {
-        // Standard profile has a `response any` wildcard with
-        // origin_min=NetworkUntrusted → every origin matches it → Execute.
-        // An OSC 52 set probe from Pty fails the OSC 52 set rule's
-        // origin gate (User-or-higher) but the wildcard catches it →
-        // the engine returns a matched decision with Execute.
+        // An OSC 52 set from Pty fails the Standard set rule's User-or-higher origin gate, but
+        // the `response any = Execute` wildcard (origin_min NetworkUntrusted) catches it.
         let engine = PolicyEngine::new(profiles::standard());
         let seq = DispatchedSequence::osc(52, ["c".to_owned(), "SGVsbG8=".to_owned()]);
         assert_eq!(
@@ -320,10 +304,10 @@ mod tests {
         assert!(!BridgeDecision::Fallback.resolve(false));
     }
 
-    // --- Response-injection suppression at the single `send_response` sink ---
+    // Response suppression at the single `send_response` sink.
 
-    /// A host installing `response any = Drop` suppresses every PTY-origin reply
-    /// (DA1/DSR/DECRQSS/...) at the one sink, via the engine-consulting mint gate.
+    /// `response any = Drop` suppresses every PTY-origin reply (DA1, DSR, DECRQSS, …) at the
+    /// sink.
     #[test]
     fn drop_policy_suppresses_response_at_the_sink() {
         use crate::terminal::Terminal;
@@ -340,7 +324,7 @@ mod tests {
         );
     }
 
-    /// With no policy engine the reply is emitted unchanged (default-allow).
+    /// With no policy engine the reply is emitted (default-allow).
     #[test]
     fn no_engine_still_replies() {
         use crate::terminal::Terminal;
@@ -352,9 +336,7 @@ mod tests {
         );
     }
 
-    /// The Kitty `a=q` support-probe reply flows through the same
-    /// `send_response` sink as every other PTY reply (policy, rate and
-    /// buffer-cap gates), so `response any = Drop` suppresses it.
+    /// The Kitty `a=q` probe reply goes through the same `send_response` sink as every PTY reply.
     #[test]
     fn drop_policy_suppresses_kitty_query_reply() {
         use crate::terminal::Terminal;
@@ -372,8 +354,7 @@ mod tests {
         );
     }
 
-    /// Sanity: with no policy engine the a=q probe still replies (default-allow),
-    /// proving the reply is produced and only the Drop gate suppresses it.
+    /// Control: with no policy engine the a=q probe replies.
     #[test]
     fn no_engine_kitty_query_replies() {
         use crate::terminal::Terminal;

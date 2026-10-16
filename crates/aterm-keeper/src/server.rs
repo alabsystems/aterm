@@ -1,19 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE KEEPER'S LOOP: [`crate::core::KeeperCore`] over a real socket, real
-//! descriptors and the real kernel.
+//! The keeper's loop: [`crate::core::KeeperCore`] over a real socket, real descriptors and the
+//! kernel.
 //!
-//! One thread, one `poll(2)` over the listener, every connection and every
-//! exit watch, so no descriptor can leak through a concurrent spawn (the Darwin
-//! race `aterm-uds/src/lifeline.rs` records). The loop owns every custody copy
-//! (`custody`, keyed by rdev) and does exactly what the core decides with them:
-//! keep, close, or send a duplicate in an OFFER. It never reads, writes,
-//! ioctls or changes the file-status flags of a master (those flags are shared
-//! by every duplicate of the description); `fstat` for the rdev is the one call
-//! it makes on one. It never signals anything. The only program it ever starts
-//! is the relaunch: `/usr/bin/open -a <its own bundle>`, inheriting nothing
-//! (`aterm_uds::pspawn`).
+//! One thread and one `poll(2)` over the listener, every connection and every exit watch, so no
+//! descriptor can leak through a concurrent spawn (the Darwin race `aterm-uds/src/lifeline.rs`
+//! records). The loop owns every custody copy (`custody`, keyed by rdev) and does exactly what
+//! the core decides with them: keep, close, or send a duplicate in an OFFER. It never reads,
+//! writes, ioctls or changes the file-status flags of a master (those flags are shared by every
+//! duplicate of the description); `fstat` for the rdev is the one call it makes on one. It
+//! signals nothing. The only program it starts is the relaunch, `/usr/bin/open -a <its own
+//! bundle>`, inheriting nothing (`aterm_uds::pspawn`).
 
 use std::collections::BTreeMap;
 use std::io;
@@ -37,11 +35,10 @@ use crate::wire::{Birth, Frame, MarkerRef, MasterHeader, PROTO};
 pub enum Relauncher {
     /// Never: this keeper runs outside an app bundle.
     Unavailable,
-    /// `/usr/bin/open -a <bundle>` — the only production form.
+    /// `/usr/bin/open -a <bundle>`: the only production form.
     OpenBundle(PathBuf),
-    /// A TEST SEAM, reachable from the library only (no flag spells it): run
-    /// this argv instead, so a test can count relaunches without launching an
-    /// app.
+    /// A test seam, reachable from the library only (no flag spells it): run this argv instead,
+    /// so a test can count relaunches without launching an app.
     TestCommand(Vec<String>),
 }
 
@@ -56,9 +53,8 @@ pub struct ServeConfig {
     pub relaunch: Relauncher,
     /// The keeper's version string (WELCOME, status).
     pub version: String,
-    /// A TEST SEAM, library-only: close every registered master at once
-    /// instead of keeping it — the negative control that shows the custody
-    /// copy is what keeps a shell alive.
+    /// A test seam, library-only: close every registered master at once instead of keeping it,
+    /// the negative control that shows the custody copy keeps a shell alive.
     pub test_drop_custody: bool,
 }
 
@@ -88,20 +84,19 @@ pub struct Server {
     started: Instant,
     own_pid: u32,
     refused_dials: u64,
-    /// Why the last dial refused UNCHECKED was, as last printed: printed once
-    /// per reason, not once per dial, and forgotten at the next admitted dial.
+    /// Why the last dial was refused unchecked, as last printed: printed once per reason, and
+    /// forgotten at the next admitted dial.
     unchecked_said: Option<String>,
     /// Frames read after their writer's exit had already arrived, before the
     /// exit was recorded ([`Server::drain_pid`]).
     frames_behind_exit: u64,
     /// Frames the keeper could not write to their peer ([`Server::send`]).
     replies_lost: u64,
-    /// A TEST SEAM (unit tests only): the next OFFER's duplicate fails as
-    /// `EMFILE` would.
+    /// A test seam (unit tests only): the next OFFER's duplicate fails as `EMFILE` would.
     #[cfg(test)]
     test_fail_next_dup: bool,
-    /// A TEST SEAM: every reason a dial was turned away unchecked, never
-    /// cleared ([`Server::test_unchecked_ever`]).
+    /// A test seam: every reason a dial was turned away unchecked, never cleared
+    /// ([`Server::test_unchecked_ever`]).
     #[cfg(test)]
     test_unchecked_ever: Vec<String>,
 }
@@ -145,7 +140,7 @@ impl KeeperEnv for Env<'_> {
     fn holders(&mut self, rdev: Rdev) -> Holders {
         self.holders_of(&[rdev]).pop().unwrap_or(Holders::Unknown)
     }
-    /// ONE walk of the uid's processes for the whole set, none for an empty one.
+    /// One walk of the uid's processes for the whole set, none for an empty one.
     fn holders_of(&mut self, rdevs: &[Rdev]) -> Vec<Holders> {
         match aterm_uds::holders::scan_holders_of(rdevs, &[self.own_pid]) {
             Ok(scans) => scans.into_iter().map(|scan| self.verdict(scan)).collect(),
@@ -166,15 +161,13 @@ impl KeeperEnv for Env<'_> {
     }
 }
 
-/// What the crash marker of window `pid` says now (§5.4 row 3). The keeper
-/// builds the file names itself from the KERNEL's pid for the connection and
-/// the start the HELLO named — `crash-marker-<pid>-<nanos>-<app|other>.log`
-/// (an update's candidate renames `-other` to `-app` at its Commit), and the
-/// `.seen` name a later start gives a dead marker it has read — so a window
-/// can point the keeper at nothing but its own marker. Only an absolute
-/// directory of ours counts: a marker "missing" from a directory the keeper
-/// cannot see is no evidence. Nothing is written, and a found marker is opened
-/// read-only, never following a symlink, only to try its lock.
+/// What the crash marker of window `pid` says now (§5.4 row 3). The keeper builds the file names
+/// itself from the kernel's pid for the connection and the start the HELLO named: both
+/// `crash-marker-<pid>-<nanos>-<app|other>.log` (an update's candidate renames `-other` to `-app`
+/// at its Commit) and the `.seen` name a later start gives a dead marker it read. So a window can
+/// point the keeper at nothing but its own marker. Only an absolute directory of ours counts: a
+/// marker missing from a directory the keeper cannot see is no evidence. Nothing is written, and
+/// a found marker is opened read-only, never following a symlink, only to try its lock.
 #[must_use]
 pub fn read_marker(pid: u32, marker: &MarkerRef) -> MarkerEvidence {
     use std::os::unix::ffi::OsStrExt as _;
@@ -462,19 +455,14 @@ impl Server {
         self.apply(outs);
     }
 
-    /// STREAM ORDER (§5.3 step 4, "K reads BYE and then EOF"): every frame a
-    /// peer wrote before it died — a claim, its BYE — is read before its death
-    /// is recorded. The exit watch is a descriptor of its own, so a turn can
-    /// read the exit while frames written before it still wait on the
-    /// connection: a turn reads one frame per connection, and the every-turn
-    /// sweep reads exits the `poll` never reported. The core refuses a claim
-    /// from a peer whose exit it has recorded, so a claim read after the exit
-    /// left its master Offered to a dead window — back to Orphaned, the custody
-    /// copy kept, the shell never hung up by the quit (measured 2026-09-29:
-    /// `kernel_custody`'s quit under load, the keeper the master's only
-    /// holder). A dead peer's buffer is finite and ends in EOF, and the
-    /// zero-timeout `poll` never waits; [`DRAIN_MAX_FRAMES`] only stops a
-    /// connection some live process still writes on.
+    /// Stream order (§5.3 step 4, "K reads BYE and then EOF"): every frame a peer wrote before it
+    /// died (a claim, its BYE) is read before its death is recorded. The exit watch is a
+    /// descriptor of its own, so a turn can read the exit while earlier frames still wait on the
+    /// connection (a turn reads one frame per connection, and the every-turn sweep reads exits
+    /// `poll` never reported). The core refuses a claim from a peer whose exit it has recorded,
+    /// so a claim read after the exit would leave its master orphaned after a quit. A dead peer's
+    /// buffer is finite and ends in EOF, and the zero-timeout `poll` never waits;
+    /// [`DRAIN_MAX_FRAMES`] only stops a connection some live process still writes on.
     fn drain_pid(&mut self, pid: u32) {
         let ids: Vec<ConnId> = self
             .conns
@@ -556,7 +544,7 @@ impl Server {
                 self.send(id, &Frame::Status { text }, None);
                 Vec::new()
             }
-            // P5's frame, accepted and not yet acted on.
+            // Accepted; nothing acts on it yet.
             Frame::RestartWhenSafe => Vec::new(),
             // Keeper-to-window kinds from a window: a protocol error.
             Frame::Welcome { .. }
@@ -661,16 +649,11 @@ impl Server {
         }
     }
 
-    /// Write one frame to `conn`. A write that fails — the peer has died or
-    /// closed its end, or took nothing for [`IO_TIMEOUT`] — ends the keeper's
-    /// WRITING to that connection, never its READING: what the peer wrote
-    /// before is still read, in order, through its EOF (§5.3 step 4). A dead
-    /// peer's frames are read after its death (`drain_pid`), so the answer to
-    /// one of them — the WELCOME for a HELLO or an ADOPT — cannot be written,
-    /// and dropping the connection then lost every frame behind it: a claim,
-    /// the BYE. The write half is shut, so a live peer reads EOF and
-    /// reconnects; a gone peer's EOF follows its last frame, and that EOF is
-    /// what drops the connection.
+    /// Write one frame to `conn`. A failed write (the peer died or closed its end, or took nothing
+    /// for [`IO_TIMEOUT`]) ends the keeper's writing to that connection, never its reading: what
+    /// the peer wrote before is still read, in order, through its EOF (§5.3 step 4). A dead peer's
+    /// frames are read after its death (`drain_pid`), so the answer to one cannot be written, and
+    /// dropping the connection would lose every frame behind it (a claim, the BYE).
     fn send(&mut self, conn: ConnId, frame: &Frame, fd: Option<&OwnedFd>) {
         let Some(c) = self.conns.get(&conn) else {
             return;
@@ -680,15 +663,11 @@ impl Server {
         }
     }
 
-    /// One frame for `conn` was not written: a write failed ([`Self::send`]),
-    /// or an OFFER's duplicate of the custody copy could not be made
-    /// (`EMFILE`), so its frame cannot tell the recipient the truth. Either
-    /// way the WRITING to `conn` ends — its write half is shut, so a live peer
-    /// reads EOF and reconnects — and its READING goes on through its EOF:
-    /// dropping the connection here lost every frame the peer wrote behind
-    /// the one being answered (a claim, the BYE). An offer not written stays
-    /// Offered to `conn` until the core judges its end, and returns to
-    /// Orphaned then.
+    /// One frame for `conn` was not written: a write failed ([`Self::send`]), or an OFFER's
+    /// duplicate of the custody copy could not be made (`EMFILE`). Writing to `conn` ends (its
+    /// write half is shut, so a live peer reads EOF and reconnects) and reading goes on through
+    /// its EOF. An offer not written stays Offered to `conn` until that EOF, then returns to
+    /// Orphaned ([`KeeperCore::eof`]).
     fn end_writing(&mut self, conn: ConnId) {
         let Some(c) = self.conns.get_mut(&conn) else {
             return;
@@ -737,7 +716,7 @@ impl Server {
         ];
         lines.extend(self.core.status_lines());
         let mut text = lines.join("\n");
-        text.truncate(crate::wire::MAX_STATUS);
+        text.truncate(text.floor_char_boundary(crate::wire::MAX_STATUS));
         text
     }
 
@@ -753,13 +732,10 @@ impl Server {
         self.custody.contains_key(&rdev)
     }
 
-    /// A TEST SEAM: end every connection as a read error or a failed write
-    /// does (a stalled link, a malformed frame) while the peers' processes
-    /// live on. Each socket is SHUT DOWN before it is dropped: with a mere
-    /// close, 4 of 8 whole-suite runs left the connection open — the link's
-    /// next write succeeded into a socket nobody read (another holder of the
-    /// descriptor, most likely a child a concurrent test spawned while it was
-    /// not yet close-on-exec); serially, never.
+    /// A test seam: end every connection as a read error or a failed write does, while the peers'
+    /// processes live on. Each socket is shut down before it is dropped: a mere close leaves the
+    /// connection open while another process still holds the descriptor (a concurrent test's
+    /// child spawned before it was close-on-exec).
     #[cfg(test)]
     pub(crate) fn test_drop_connections(&mut self) {
         let ids: Vec<ConnId> = self.conns.keys().copied().collect();
@@ -829,13 +805,34 @@ mod tests {
     use crate::core::RecordState;
     use crate::wire::{CAP_SENDS_BYE, PeerClass};
 
-    /// A WRITE THAT FAILS ENDS THE WRITING, NEVER THE READING. A peer that
-    /// wrote HELLO, a claim and BYE and then closed its end before the keeper
-    /// read any of them: the WELCOME for the HELLO cannot be written, and the
-    /// claim and the BYE behind it are still read. Its EOF then drops the
-    /// connection — none is kept for a peer that is gone. (The peer is this
-    /// test process, alive, so its end is an EOF and not a death: the claim
-    /// stays, with the BYE recorded.)
+    #[test]
+    fn a_status_limit_inside_a_multibyte_character_keeps_valid_utf8() {
+        let dir = std::env::temp_dir().join(format!("akk-unit-{}-status-utf8", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut server = Server::bind(ServeConfig {
+            socket: dir.join("k.sock"),
+            identity: Identity::same_uid(),
+            relaunch: Relauncher::Unavailable,
+            version: "test".into(),
+            test_drop_custody: false,
+        })
+        .expect("bind");
+        let prefix = format!("keeper=running\npid={} version=", server.own_pid);
+        server.version = format!(
+            "{}é",
+            "x".repeat(crate::wire::MAX_STATUS - prefix.len() - 1)
+        );
+        let text = server.status_text();
+        assert_eq!(text.len(), crate::wire::MAX_STATUS - 1);
+        assert!(text.starts_with(&prefix));
+        assert!(Frame::Status { text }.encode().is_ok());
+        drop(server);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A peer wrote HELLO, a claim and BYE, then closed its end before the keeper read any: the
+    /// WELCOME is lost, the claim and the BYE are still read, and the EOF drops the connection.
+    /// The peer is this live process, so its end is an EOF, not a death: the claim stays.
     #[test]
     fn a_failed_write_ends_the_writing_never_the_reading() {
         let dir = std::env::temp_dir().join(format!("akk-unit-{}-unwritable", std::process::id()));
@@ -879,10 +876,9 @@ mod tests {
             write_frame(&client, frame, fd).expect("write");
         }
         drop(client);
-        // The peer's end is closed only when every copy of it is: a child a
-        // sibling test thread has forked and not yet exec'd holds one for a
-        // while, and a write still succeeds until then (measured 2026-09-29,
-        // a flake under load). Wait for the kernel's hang-up, not the drop.
+        // The peer's end closes only when every copy of it does, and a child a sibling test
+        // thread forked and has not yet exec'd holds one for a while: wait for the kernel's
+        // hang-up, not the drop.
         let fd = server
             .conns
             .values()
@@ -928,15 +924,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A fresh PTY master (a device no other process holds) and its rdev,
-    /// from aterm-pty's `open_pty_pair`. Close-on-exec from the open: a child
-    /// a sibling test spawns must not inherit it, or that child holds it for
-    /// its life and the keeper rightly offers it to no one. A `/dev/ptmx`
-    /// open that lost XNU's race for a pty minor to another opener, in this
-    /// process or any other (`EREDRIVEOPEN`, -6), is redriven there: a bare
-    /// open of the device failed this module's tests with it, 3 runs in 2,000
-    /// beside a parallel opener. The slave is closed at once; the keeper
-    /// holds and offers masters only.
+    /// A fresh PTY master no other process holds, and its rdev (`aterm_pty::open_pty_pair`:
+    /// close-on-exec from the open, so a sibling test's child cannot hold it, and redriven when
+    /// XNU's `/dev/ptmx` race answers `-6`). The slave is closed at once; the keeper holds and
+    /// offers masters only.
     fn a_pty_master() -> (OwnedFd, Rdev) {
         use std::os::fd::FromRawFd as _;
         let (master, slave) = aterm_pty::open_pty_pair().expect("a fresh PTY pair");
@@ -1036,10 +1027,9 @@ mod tests {
         let mut env = server.env();
         let outs = server.core.peer_exit(me, 9, now, &mut env);
         server.apply(outs);
-        // A crashed: its master is an orphan. (A sibling test's child, between
-        // its fork and its exec, holds every descriptor of this process for a
-        // moment; seen by the death's holder scan it makes the death a
-        // handoff, and the hold's rescan orphans the master once it is gone.)
+        // A crashed: its master is an orphan. (A sibling test's child, between its fork and
+        // exec, can briefly hold this process's descriptors: the death's holder scan then makes
+        // it a handoff, and the hold's rescan orphans the master once the child is gone.)
         let started = Instant::now();
         while server.core().records()[&orphan_rdev].state != RecordState::Orphaned {
             assert!(started.elapsed() < HANG, "A's master never orphaned");
@@ -1120,17 +1110,9 @@ mod tests {
         seen
     }
 
-    /// AN OFFER THAT CANNOT BE DUPLICATED ENDS THE WRITING, NEVER THE READING.
-    /// The keeper cannot make the descriptor an OFFER carries (`EMFILE`): its
-    /// recipient reads the WELCOME and then EOF, and the frames it wrote
-    /// behind the HELLO being answered — its claim, its BYE — are still read;
-    /// the connection is dropped at its EOF, not before, and the offer
-    /// returns to Orphaned at that EOF (nothing registers on a connection that
-    /// is gone). Dropping the connection at the
-    /// failed duplicate lost the claim and the BYE: a quit then reads as a
-    /// crash, its shells kept.
-    /// NEGATIVE CONTROL: the same run with the duplicate made delivers the
-    /// OFFER, carrying the orphan's master, after the WELCOME.
+    /// The duplicate fails as `EMFILE` would: the recipient reads the WELCOME then EOF, its claim
+    /// and BYE are still read, and the offer returns to Orphaned at its EOF. Negative control:
+    /// with the duplicate made, the OFFER carrying the orphan's master follows the WELCOME.
     #[test]
     fn an_offer_that_cannot_be_duplicated_ends_the_writing_never_the_reading() {
         let failed = offer_to_a_second_window(true);

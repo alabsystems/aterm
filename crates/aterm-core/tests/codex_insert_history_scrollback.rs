@@ -13,9 +13,8 @@ const CODEX_INSERT: &[u8] = b"\x1b[1;3r\x1b[3;1H\r\nX\x1b[r";
 fn codex_top_anchored_decstbm_output_enters_scrollback() {
     let mut term = Terminal::new(5, 10);
 
-    // Seed five visible rows, then replay the byte sequence emitted by Codex
-    // 0.144.6's insert_history implementation for a three-row history area:
-    // DECSTBM 1..3, CUP to its bottom, CRLF to make room, print, reset margins.
+    // Seed five rows, then replay Codex's insert_history bytes for a three-row history
+    // area: DECSTBM 1..3, CUP to its bottom, CRLF to make room, print, reset margins.
     term.process(SEED_ROWS);
     term.process(CODEX_INSERT);
 
@@ -203,10 +202,8 @@ fn codex_scroll_repins_viewport_and_piecewise_reanchors_active_selection() {
     );
 }
 
-/// Codex streams "A", a blank separator line, then "B" through its
-/// insert-history protocol, one scroll per line. Once "A" is archived the
-/// blank separator is displaced alone and must follow it into history as an
-/// empty line.
+/// A blank separator line streamed through Codex's insert-history protocol, one scroll
+/// per line, follows the line before it into history as an empty line.
 #[test]
 fn codex_streamed_blank_separator_line_is_archived() {
     let mut term = Terminal::new(5, 10);
@@ -215,9 +212,8 @@ fn codex_streamed_blank_separator_line_is_archived() {
         term.process(seq.as_bytes());
     }
 
-    // The first three scrolls displace the fresh-session blank band (rows
-    // never written on a brand-new screen) — dropped. The next three
-    // displace A, the separator, and B in order.
+    // The first three scrolls displace never-written rows (dropped); the next three
+    // displace A, the separator and B, in order.
     assert_eq!(
         term.grid().scrollback_lines(),
         3,
@@ -239,9 +235,7 @@ fn codex_streamed_blank_separator_line_is_archived() {
     }
 }
 
-/// Fullscreen grow, half 1: a fresh Codex session scrolls its top-anchored
-/// region while the top rows are never-written; those displaced blank rows
-/// must not mint history.
+/// Insert-history scrolls that displace never-written rows mint no history.
 #[test]
 fn codex_fresh_session_never_written_scrolls_mint_no_history() {
     let mut term = Terminal::new(24, 80);
@@ -256,10 +250,9 @@ fn codex_fresh_session_never_written_scrolls_mint_no_history() {
     );
 }
 
-/// Fullscreen grow, half 2: a running Codex session grows rows. The reveal
-/// surfaces the real transcript at the top with no blank band, and the cursor
-/// rides its content line down so post-SIGWINCH repaints and CPR answers
-/// anchor correctly.
+/// A rows-only grow reveals the archived transcript at the top with no blank band, and
+/// the cursor rides its content line down, so post-SIGWINCH repaints and CPR answers
+/// anchor on it.
 #[test]
 fn codex_fullscreen_grow_reveals_transcript_not_blanks_and_cursor_rides() {
     let mut term = Terminal::new(24, 80);
@@ -294,9 +287,8 @@ fn codex_fullscreen_grow_reveals_transcript_not_blanks_and_cursor_rides() {
     // Window -> fullscreen: rows-only grow.
     term.resize(72, 80);
 
-    // The reveal surfaces the real transcript at the top: revealed rows
-    // hold the archived lines, in order, starting at visual row 0 — no
-    // blank band above the content.
+    // The revealed rows hold the archived lines in order from visual row 0, with no
+    // blank band above them.
     for (row, expected) in ["codex-banner", "model: gpt", "dir: ~/aterm"]
         .into_iter()
         .enumerate()

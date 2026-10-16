@@ -1,24 +1,27 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! THE WARM OF A LANDED AGENT BUILD at the REAL process edge (2026-09-23, `atpkg::warm`):
-//! the dev `atpkg` binary driven as `__warm claude <prefix> <build>`, the way a pass that
-//! landed that build starts it, over a temp store whose `claude` is a fake that records
-//! its argv, its environment, its working directory and whether its stdin is a terminal.
+//! The warm of a landed agent build (`atpkg::warm`) at the real process edge: the dev
+//! `atpkg` binary driven as `__warm claude <prefix> <build>`, as a pass that landed that
+//! build starts it, over a temp store whose `claude` is a fake that records its argv,
+//! environment, working directory and whether its stdin is a terminal.
 //!
-//! What is pinned here and nowhere else: the verb says NOTHING and exits 0 whatever the
-//! program does; it runs the `bin/` shim, so the shim's `DISABLE_AUTOUPDATER=1` reaches the
-//! program, with the table's argv verbatim, from HOME, on a stdin that is no terminal, with
-//! no variable of a parent Claude session but with the user's own config home; a stale
-//! build, an opted-out user and an account that never ran claude run nothing; and each warm
-//! that ran or was declined is one `warm` line in the package log. The deadline (30 s, no
-//! knob to shorten it) is pinned in-process by `warm.rs`'s own test, which injects short
-//! bounds.
+//! Pinned here: the verb says nothing and exits 0 whatever the program does; it runs the
+//! `bin/` shim (so the shim's `DISABLE_AUTOUPDATER=1` reaches the program) with the table's
+//! argv verbatim, from HOME, on a stdin that is no terminal, with no variable of a parent
+//! Claude session but with the user's own config home; a stale build, an opted-out user and
+//! an account that never ran claude run nothing; and each warm that ran or was declined is
+//! one `warm` line in the package log. The 30 s deadline is pinned in-process by
+//! `warm.rs`'s own test.
 //!
-//! NEVER THE REAL STORE OR THE REAL LOG: HOME, the config dir and the state dir are temp
+//! Never the real store or log: HOME, the config dir and the state dir are temp
 //! directories, and the store is the default prefix under that HOME.
 
 #![cfg(unix)]
+#![allow(
+    clippy::disallowed_types,
+    reason = "test code: a stand-in child may inherit descriptors"
+)]
 
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
@@ -28,8 +31,8 @@ use std::time::Duration;
 use aterm_spec::wait::{MUST_HAPPEN, within};
 
 /// AI variables that must not reach the warm, set on the verb's own environment: a parent
-/// Claude session's markers (a session exports the first four — measured in one,
-/// 2026-09-23), the switch that would turn claude's warm into `--bare`, and an API key.
+/// Claude session's markers (a session exports the first four), the switch that would turn
+/// claude's warm into `--bare`, and an API key.
 const SESSION_VARS: &[(&str, &str)] = &[
     ("CLAUDECODE", "1"),
     ("CLAUDE_CODE_ENTRYPOINT", "cli"),
@@ -130,10 +133,9 @@ impl Fixture {
             Some(&build),
             "fixture: the build is active"
         );
-        // Establish that each fresh executable can enter before the real warm starts
-        // its unchanged 30 s product deadline. Prepare the stand-in first, then its real
-        // shim, so two macOS first-exec assessments do not share one setup hang detector.
-        // The readiness branch records nothing: never-runs cases still detect a warm.
+        // Pay each fresh executable's first exec before the real warm starts its 30 s
+        // deadline: the stand-in first, then its shim, so two macOS first-exec assessments
+        // do not share one hang detector. The readiness branch records nothing.
         for ready_exe in [exe, layout.shim(&tool)] {
             let mut ready = Command::new(&ready_exe)
                 .arg("--fixture-ready")
@@ -259,7 +261,7 @@ fn the_warm_runs_the_bin_shim_silently_with_the_table_argv_and_no_session_variab
         .lines()
         .map(str::to_string)
         .collect();
-    assert_eq!(args, spec.warm, "the table's argv, verbatim");
+    assert_eq!(args, spec.warm.unwrap().argv, "the table's argv, verbatim");
     let env = fx.recorded("env").unwrap();
     let vars: Vec<&str> = env.lines().collect();
     // Over the sentinels the verb was given: only the shim and the warm set these.
@@ -332,13 +334,10 @@ fn a_stale_build_or_a_malformed_request_runs_nothing() {
     assert_eq!(fx.warm_lines().len(), 1);
 }
 
-/// The user's own config home reaches the warm (it is where the caches the warm refreshes
-/// live), and is where the warm looks for claude's state.
-///
-/// AND KEPT ONLY IN THE PERSON'S SHELL RC, warmed from the window (no `ATPKG_BIN`; review
-/// of the 2026-10-02 fix): the config home and a variable the program honours itself
-/// (`DISABLE_TELEMETRY`, the reason [`atpkg::warm`] leaves it out of its opt-outs) reach
-/// the program from their login shell, as they reach their next `claude`.
+/// The user's own config home reaches the warm (the caches it refreshes live there) and is
+/// where the warm looks for claude's state — also when kept only in the person's shell rc
+/// and warmed from the window (no `ATPKG_BIN`), together with a variable the program
+/// honours itself (`DISABLE_TELEMETRY`).
 #[test]
 fn the_users_own_config_home_reaches_the_warm() {
     let fx = Fixture::new("config-home");
@@ -379,14 +378,9 @@ fn the_users_own_config_home_reaches_the_warm() {
 }
 
 /// The user's opt-out of claude's non-essential traffic, and an account that never ran
-/// claude (a default-set install nobody launched): nothing runs, silently, and the warm's
-/// line says why.
-///
-/// AND THE OPT-OUT KEPT IN THE PERSON'S SHELL RC (audit 2026-10-02): most builds land from
-/// the window's head watch, and a window started from the Dock carries launchd's
-/// environment — no `ATPKG_BIN`, nothing the person's rc exports — so the warm read no
-/// opt-out there and ran claude anyway. It now reads the person's login shell, the way
-/// their next `claude` gets its environment.
+/// claude: nothing runs, silently, and the warm's line says why — also for an opt-out kept
+/// only in the person's shell rc and warmed from the window (launchd's environment, no
+/// `ATPKG_BIN`).
 #[test]
 fn an_opted_out_or_never_run_claude_is_not_run() {
     let fx = Fixture::new("declined");
@@ -424,13 +418,12 @@ fn an_opted_out_or_never_run_claude_is_not_run() {
         fx.recorded("args").is_none(),
         "opted out in the rc: nothing ran"
     );
-    // AND AN RC THE WARM COULD NOT READ (audit round 2, 2026-10-02): unread is not unset.
-    // Each shape gives the person's own terminal the opt-out (tmux and the exec'd shell
-    // inherit the export, ksh reads `.profile`) and the warm's probe no environment of
-    // theirs: an rc that auto-starts tmux, which refuses with no terminal (exit 1); one that
-    // greets and execs another shell, which reads the empty stdin and exits 0 having
-    // printed only the greeting; a `$SHELL` the warm does not ask; no `$SHELL` at all.
-    // Before, claude ran in every one (`exit=0`). An opt-out already in hand says so.
+    // An rc the warm could not read: unread is not unset. Each shape gives the person's own
+    // terminal the opt-out (tmux and the exec'd shell inherit the export, ksh reads
+    // `.profile`) and the warm's probe no environment of theirs: an rc that auto-starts
+    // tmux, which refuses with no terminal; one that greets and execs another shell, which
+    // reads the empty stdin and exits 0 having printed only the greeting; a `$SHELL` the
+    // warm does not ask; no `$SHELL` at all. An opt-out already in hand says so.
     let tmux = fx.root.path().join("tmux");
     std::fs::write(
         &tmux,

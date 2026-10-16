@@ -1,44 +1,32 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Scoping: what this run actually built and tested.
-//!
-//! Three kinds, and the whole workspace is only one of them: `--scope <crate>`
-//! narrows to `-p <crate>`, `--changed` narrows to the diff's crates closed under
-//! reverse dependency ([`crate::changed`]), and everything else is whole-tree.
-//!
-//! Three consequences, and all three are decisions, not formatting:
-//!  * the driver flags and the ladder label are derived from ONE value, so a
-//!    stage can never claim `--workspace` in its label while running `-p`;
-//!  * a stage that is one crate's feature-enabled run (the sealed fabric lane,
-//!    `aterm-link --features sealed`) is switched OFF by a scope without that
-//!    crate: removed entirely rather than skipped, because it has nothing to run;
-//!  * EVERY narrowing forfeits the merge contract. [`Scope::narrowing`] returns
-//!    the sentence the verdict prints instead of the claim, and it is `Some` for
-//!    exactly the variants [`Scope::is_workspace`] rejects — a new narrowing that
-//!    forgot to forfeit would have to break that pairing to exist, and the test
-//!    below is what refuses it.
+//! What the checks that read a selection (lint, test, doc, trust) build and
+//! test: the whole workspace (`--all`), the packages `-p` named, or the change
+//! cone ([`crate::changed`]). The driver flags and the label derive from one
+//! value, so a check can never print `--workspace` while running `-p`.
 
-/// A change-scoped selection: the crates `--changed` chose, and what it needs to
-/// remember about them.
+/// The change cone: the crates whose files changed since `base`, closed under
+/// reverse dependency.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Changed {
-    /// The ref the diff was taken against (`--base`, default `main`).
+    /// The ref the diff was taken against.
     pub base: String,
-    /// The selected crates, sorted. Legitimately EMPTY when the diff touched no
-    /// workspace crate at all.
+    /// The selected crates, sorted; empty when the change touched no workspace
+    /// crate.
     pub crates: Vec<String>,
-    /// Does any selected crate have a library target? `cargo test --doc` is a
-    /// hard error on an all-binary selection, which is an ordinary outcome here.
+    /// Does any selected crate have a library target? `cargo test --doc` is an
+    /// error on an all-binary selection.
     pub any_lib: bool,
 }
 
-/// What the run is narrowed to.
+/// What a selection-reading check runs over.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub enum Scope {
     #[default]
     Workspace,
-    Crate(String),
+    /// `-p <crate>`, once or more.
+    Packages(Vec<String>),
     Changed(Changed),
 }
 
@@ -48,9 +36,19 @@ impl Scope {
         Self::Workspace
     }
 
+    /// `-p` for each of `names`; none is the workspace.
+    #[must_use]
+    pub fn packages(names: &[String]) -> Self {
+        if names.is_empty() {
+            Self::Workspace
+        } else {
+            Self::Packages(names.to_vec())
+        }
+    }
+
     #[must_use]
     pub fn crate_only(name: impl Into<String>) -> Self {
-        Self::Crate(name.into())
+        Self::Packages(vec![name.into()])
     }
 
     #[must_use]
@@ -63,29 +61,19 @@ impl Scope {
     }
 
     #[must_use]
-    pub fn from_option(name: Option<String>) -> Self {
-        name.map_or(Self::Workspace, Self::Crate)
-    }
-
-    /// The ONLY shape that can discharge the merge contract. The verdict reads
-    /// this; see [`crate::verdict::discharges_merge_contract`].
-    #[must_use]
     pub fn is_workspace(&self) -> bool {
         matches!(self, Self::Workspace)
     }
 
-    /// The selection is legitimately EMPTY: compile nothing.
-    ///
-    /// Only `--changed` can produce it (a docs-only branch), and the stages that
-    /// compile must ask BEFORE they build a command — see [`Scope::args`].
+    /// The selection is empty: a cone no crate is in. The checks that compile ask
+    /// before they build a command ([`Scope::args`]).
     #[must_use]
     pub fn selects_nothing(&self) -> bool {
         matches!(self, Self::Changed(c) if c.crates.is_empty())
     }
 
-    /// Does the selection contain a package with a library target? Always yes
-    /// unless `--changed` proved otherwise, because an unanswerable question
-    /// must leave the doctest stage RUNNING.
+    /// Does the selection hold a package with a library target? Yes unless the
+    /// cone proved otherwise: an unanswerable question leaves doctests running.
     #[must_use]
     pub fn has_lib_target(&self) -> bool {
         match self {
@@ -94,113 +82,46 @@ impl Scope {
         }
     }
 
-    /// The ladder label, which is also the script's `$SCOPE_LABEL`.
+    /// The crates `-p` names, the cone's, or none for the workspace.
+    #[must_use]
+    pub fn crates(&self) -> &[String] {
+        match self {
+            Self::Workspace => &[],
+            Self::Packages(p) => p,
+            Self::Changed(c) => &c.crates,
+        }
+    }
+
+    /// `--workspace`, `-p a -p b`, or `<no crates selected>` for the empty cone.
     #[must_use]
     pub fn label(&self) -> String {
         match self {
-            Self::Workspace => "--workspace".to_string(),
-            Self::Crate(c) => format!("-p {c}"),
             Self::Changed(c) if c.crates.is_empty() => "<no crates selected>".to_string(),
-            Self::Changed(c) => c
-                .crates
-                .iter()
-                .map(|n| format!("-p {n}"))
-                .collect::<Vec<_>>()
-                .join(" "),
+            _ => self.args().join(" "),
         }
     }
 
-    /// The driver flags, which are the script's `${CARGO_SCOPE[@]}`.
-    ///
-    /// The empty selection answers `--workspace` and NOT an empty argument list,
-    /// for the script's reason: a bare `targo build` builds the whole default
-    /// workspace, so if the [`Scope::selects_nothing`] guard were ever dropped the
-    /// fallback would compile MORE than the selection rather than compile the
-    /// whole tree under a narrow label. Wrong, and loudly wrong, beats wrong and
-    /// silent.
+    /// The driver flags. The empty cone answers `--workspace`, never an empty
+    /// list: a dropped [`Scope::selects_nothing`] guard then builds too much and
+    /// is noticed, rather than building everything under a narrow label.
     #[must_use]
     pub fn args(&self) -> Vec<String> {
-        match self {
-            Self::Workspace => vec!["--workspace".to_string()],
-            Self::Crate(c) => vec!["-p".to_string(), c.clone()],
-            Self::Changed(c) if c.crates.is_empty() => vec!["--workspace".to_string()],
-            Self::Changed(c) => c
-                .crates
-                .iter()
-                .flat_map(|n| ["-p".to_string(), n.clone()])
-                .collect(),
+        if matches!(self, Self::Workspace) || self.selects_nothing() {
+            return vec!["--workspace".to_string()];
         }
+        self.crates()
+            .iter()
+            .flat_map(|n| ["-p".to_string(), n.clone()])
+            .collect()
     }
 
-    /// The word the verdict prints for `scope=…` — the script's `$SCOPE_DESC`.
-    #[must_use]
-    pub fn desc(&self) -> String {
-        match self {
-            Self::Workspace => "workspace".to_string(),
-            Self::Crate(c) => c.clone(),
-            Self::Changed(c) => format!("changed:{}", c.crates.len()),
-        }
-    }
-
-    /// The receipt's `scope` value: `workspace`, `crate:<name>`, or
-    /// `changed:<base>` — the ref the diff was taken against, as the run named
-    /// it (until 2026-09-26 a bare `changed`, which left a reader no way to
-    /// say what a change-scoped run was scoped against).
-    #[must_use]
-    pub fn receipt_word(&self) -> String {
-        match self {
-            Self::Workspace => "workspace".to_string(),
-            Self::Crate(c) => format!("crate:{c}"),
-            Self::Changed(c) => format!("changed:{}", c.base),
-        }
-    }
-
-    /// Why this run proved less than the merge contract, in the verdict's words.
-    /// `None` for — and only for — the whole-tree run.
-    #[must_use]
-    pub fn narrowing(&self) -> Option<String> {
-        match self {
-            Self::Workspace => None,
-            Self::Crate(c) => Some(format!(
-                "scoped to -p {c}: the per-crate test, doctest and lint stages covered no other \
-                 crate"
-            )),
-            Self::Changed(c) if c.crates.is_empty() => Some(format!(
-                "change-scoped against {} and NO workspace crate changed: the per-crate test, \
-                 doctest and lint stages were skipped",
-                c.base
-            )),
-            Self::Changed(c) => Some(format!(
-                "change-scoped against {} to {} crate(s) ({}): the per-crate test, doctest and \
-                 lint stages covered no other crate",
-                c.base,
-                c.crates.len(),
-                c.crates.join(" ")
-            )),
-        }
-    }
-
-    /// Would this selection compile `name`? `--workspace` selects everything;
-    /// the narrowings select exactly what they name.
-    ///
-    /// The whole-tree answer is TRUE rather than "unanswerable" on purpose: a
-    /// pass that keys off this decides whether it has anything to run, and a
-    /// whole-tree run always does.
+    /// Would this selection compile `name`?
     #[must_use]
     pub fn includes_crate(&self, name: &str) -> bool {
         match self {
             Self::Workspace => true,
-            Self::Crate(c) => c == name,
-            Self::Changed(c) => c.crates.iter().any(|n| n == name),
+            _ => self.crates().iter().any(|n| n == name),
         }
-    }
-
-    /// Whether the sealed fabric lane has anything to run: it tests
-    /// `aterm-link` under `--features sealed`, so a scope without that crate
-    /// has nothing for it.
-    #[must_use]
-    pub fn includes_sealed_lane(&self) -> bool {
-        self.includes_crate("aterm-link")
     }
 }
 
@@ -210,148 +131,52 @@ mod tests {
 
     fn changed(crates: &[&str]) -> Scope {
         Scope::changed(
-            "main",
+            "origin/main",
             crates.iter().map(|s| (*s).to_string()).collect(),
             true,
         )
     }
 
     #[test]
-    fn whole_tree_scoping_is_the_workspace() {
-        let s = Scope::workspace();
-        assert_eq!(s.label(), "--workspace");
-        assert_eq!(s.args(), ["--workspace"]);
-        assert_eq!(s.desc(), "workspace");
-        assert!(s.is_workspace());
-        assert!(!s.selects_nothing());
-    }
-
-    #[test]
-    fn a_narrowed_scope_becomes_dash_p_everywhere_at_once() {
-        let s = Scope::crate_only("aterm-grid");
-        assert_eq!(s.label(), "-p aterm-grid");
-        assert_eq!(s.args(), ["-p", "aterm-grid"]);
-        assert_eq!(s.desc(), "aterm-grid");
-        assert!(!s.is_workspace());
-    }
-
-    #[test]
-    fn a_change_scope_becomes_one_dash_p_per_selected_crate() {
-        let s = changed(&["aterm-grid", "aterm-gui"]);
-        assert_eq!(s.label(), "-p aterm-grid -p aterm-gui");
-        assert_eq!(s.args(), ["-p", "aterm-grid", "-p", "aterm-gui"]);
-        assert_eq!(s.desc(), "changed:2");
-        assert!(!s.is_workspace());
-        assert!(!s.selects_nothing());
-    }
-
-    #[test]
     fn the_label_and_the_flags_can_never_disagree() {
-        // Both derive from the same value: a stage cannot print `--workspace`
-        // while running `-p aterm-grid`, which is how a narrowed run would look
-        // like a whole-tree one in a scrollback.
         for s in [
             Scope::workspace(),
             Scope::crate_only("aterm-pty"),
+            Scope::packages(&["aterm-grid".into(), "aterm-gui".into()]),
             changed(&["aterm-pty"]),
             changed(&["aterm-grid", "aterm-gui", "aterm-cli"]),
         ] {
             assert_eq!(s.label(), s.args().join(" "));
         }
+        assert_eq!(
+            Scope::packages(&["a".into(), "b".into()]).args(),
+            ["-p", "a", "-p", "b"]
+        );
+        assert_eq!(Scope::packages(&[]), Scope::Workspace);
     }
 
     #[test]
-    fn the_empty_selection_says_so_and_falls_back_wider_never_narrower() {
-        // The one case where the label and the flags differ, deliberately: the
-        // label states the truth ("nothing"), and the flags are the WIDEST
-        // fallback, so a dropped guard would build too much and be noticed rather
-        // than build everything while printing a narrow label.
+    fn the_empty_cone_says_so_and_falls_back_wider_never_narrower() {
         let s = changed(&[]);
         assert!(s.selects_nothing());
         assert_eq!(s.label(), "<no crates selected>");
         assert_eq!(s.args(), ["--workspace"]);
-        assert_eq!(s.desc(), "changed:0");
-        assert!(!s.is_workspace(), "empty is not whole-tree");
+        assert!(!s.is_workspace());
     }
 
     #[test]
-    fn every_narrowing_forfeits_the_contract_and_says_why() {
-        // THE pairing: `is_workspace()` decides the claim, `narrowing()` decides
-        // the words, and a scope kind that answered one without the other would
-        // either claim the contract silently or refuse it mutely.
-        for s in [
-            Scope::crate_only("aterm-grid"),
-            changed(&[]),
-            changed(&["aterm-grid"]),
-        ] {
-            assert!(!s.is_workspace());
-            assert!(s.narrowing().is_some(), "{s:?} narrows but does not say so");
-        }
-        assert_eq!(Scope::workspace().narrowing(), None);
-    }
-
-    /// The receipt names what a narrowed run was narrowed to: the crate, or
-    /// the base a change-scoped run diffed against (never a bare `changed`,
-    /// which left a reader nothing to check the cone against).
-    #[test]
-    fn the_receipt_word_names_the_crate_or_the_base_a_run_was_narrowed_to() {
-        assert_eq!(Scope::workspace().receipt_word(), "workspace");
-        assert_eq!(
-            Scope::crate_only("aterm-grid").receipt_word(),
-            "crate:aterm-grid"
-        );
-        assert_eq!(changed(&["aterm-grid"]).receipt_word(), "changed:main");
-        assert_eq!(
-            Scope::changed("origin/main", Vec::new(), false).receipt_word(),
-            "changed:origin/main",
-            "an empty selection still names its base"
-        );
+    fn a_selection_includes_exactly_what_it_names() {
+        assert!(Scope::workspace().includes_crate("aterm-link"));
+        assert!(Scope::crate_only("aterm-link").includes_crate("aterm-link"));
+        assert!(!Scope::crate_only("aterm-grid").includes_crate("aterm-link"));
+        assert!(changed(&["aterm-grid", "aterm-link"]).includes_crate("aterm-link"));
+        assert!(!changed(&[]).includes_crate("aterm-link"));
     }
 
     #[test]
-    fn the_narrowing_sentence_names_the_base_and_the_crates() {
-        assert_eq!(
-            changed(&["aterm-grid", "aterm-gui"]).narrowing().unwrap(),
-            "change-scoped against main to 2 crate(s) (aterm-grid aterm-gui): \
-             the per-crate test, doctest and lint stages covered no other crate"
-        );
-        assert_eq!(
-            Scope::changed("origin/main", vec![], true)
-                .narrowing()
-                .unwrap(),
-            "change-scoped against origin/main and NO workspace crate changed: \
-             the per-crate test, doctest and lint stages were skipped"
-        );
-        assert_eq!(
-            Scope::crate_only("aterm-grid").narrowing().unwrap(),
-            "scoped to -p aterm-grid: the per-crate test, doctest and lint stages covered no \
-             other crate"
-        );
-    }
-
-    #[test]
-    fn the_sealed_lane_follows_aterm_link_only() {
-        assert!(Scope::workspace().includes_sealed_lane());
-        assert!(Scope::crate_only("aterm-link").includes_sealed_lane());
-        assert!(!Scope::crate_only("aterm-grid").includes_sealed_lane());
-        // …and a change scope narrows it the same way, which is the point of
-        // asking the SCOPE rather than asking `--scope`.
-        assert!(changed(&["aterm-grid", "aterm-link"]).includes_sealed_lane());
-        assert!(!changed(&["aterm-grid", "aterm-gui"]).includes_sealed_lane());
-        assert!(!changed(&[]).includes_sealed_lane());
-    }
-
-    #[test]
-    fn only_a_change_scope_can_report_that_nothing_has_a_library() {
+    fn only_the_cone_can_report_that_nothing_has_a_library() {
         assert!(Scope::workspace().has_lib_target());
-        assert!(Scope::crate_only("xtask").has_lib_target());
-        assert!(changed(&["aterm-grid"]).has_lib_target());
-        assert!(!Scope::changed("main", vec!["xtask".into()], false).has_lib_target());
-    }
-
-    #[test]
-    fn from_option_round_trips_the_cli_value() {
-        assert_eq!(Scope::from_option(None), Scope::workspace());
-        assert_eq!(Scope::from_option(Some("x".into())), Scope::crate_only("x"));
+        assert!(Scope::crate_only("aterm-lab").has_lib_target());
+        assert!(!Scope::changed("main", vec!["aterm-lab".into()], false).has_lib_target());
     }
 }

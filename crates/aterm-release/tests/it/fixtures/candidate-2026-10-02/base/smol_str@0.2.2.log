@@ -1,0 +1,11 @@
+ ERROR ay_dpll::executor::proof::check::internal internal proof checker rejected UNSAT proof, error=proof validation cancelled by the caller (interrupt, deadline, or memory limit), checked_steps=1, skipped_hole_steps=0, total_steps=1
+ ERROR ay_dpll::executor::proof::check::internal internal proof checker rejected UNSAT proof, error=proof validation cancelled by the caller (interrupt, deadline, or memory limit), checked_steps=366, skipped_hole_steps=1, total_steps=367
+ ERROR ay_dpll::executor::proof::check::internal internal proof checker rejected UNSAT proof, error=proof validation cancelled by the caller (interrupt, deadline, or memory limit), checked_steps=366, skipped_hole_steps=1, total_steps=367
+ ERROR ay_dpll::executor::proof::check::internal internal proof checker rejected UNSAT proof, error=proof validation cancelled by the caller (interrupt, deadline, or memory limit), checked_steps=46, skipped_hole_steps=1, total_steps=47
+ ERROR ay_dpll::executor::proof::check::internal internal proof checker rejected UNSAT proof, error=proof validation cancelled by the caller (interrupt, deadline, or memory limit), checked_steps=46, skipped_hole_steps=1, total_steps=47
+ ERROR ay_dpll::executor::proof::check::internal internal proof checker rejected UNSAT proof, error=proof validation cancelled by the caller (interrupt, deadline, or memory limit), checked_steps=24, skipped_hole_steps=1, total_steps=25
+ ERROR ay_dpll::executor::proof::check::internal internal proof checker rejected UNSAT proof, error=proof validation cancelled by the caller (interrupt, deadline, or memory limit), checked_steps=28, skipped_hole_steps=1, total_steps=29
+ ERROR ay_dpll::executor::proof::check::internal internal proof checker rejected UNSAT proof, error=proof validation cancelled by the caller (interrupt, deadline, or memory limit), checked_steps=24, skipped_hole_steps=1, total_steps=25
+ ERROR ay_dpll::executor::proof::check::internal internal proof checker rejected UNSAT proof, error=proof validation cancelled by the caller (interrupt, deadline, or memory limit), checked_steps=64, skipped_hole_steps=1, total_steps=65
+Summary: 137 proved, 145 failed, 0 runtime-checked, 0 assumed, 3 mandated, 0 contract-panic, 85 inconclusive (370 total)
+Coverage: 76/76 eligible function bodies verified (complete)

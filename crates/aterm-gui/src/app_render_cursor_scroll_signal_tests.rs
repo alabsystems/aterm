@@ -6,13 +6,10 @@ use crate::{App, WindowId};
 use aterm_core::terminal::{ContentScrollDelta, ContentScrollState, Terminal, TerminalBuilder};
 use std::time::{Duration, Instant};
 
-/// An erase does not reach `cursor_glow.reset()`, on a real terminal and
-/// window: `ESC[J` → `moves_coordinates` → `coordinates_invalidated` →
-/// `ContentScrollState::invalidation_epoch` → `delta_since` → `Invalidate` →
-/// `EffectsPipeline::sync_scroll`'s glow reset would otherwise kill the
-/// earned ribbon at every shell prompt redraw. The reset itself stays for
-/// real grid motion (it stops phantom comets), and the scroll below is this
-/// test's vacuity control (owner, 2026-09-10).
+/// An erase rewrites cells in place, so it is not a coordinate change and must not reach the glow
+/// reset in `EffectsPipeline::sync_scroll`, which would kill the earned ribbon at every shell
+/// prompt redraw. The reset stays for real grid motion (it stops phantom comets); the mixed
+/// scroll batch below is the vacuity control.
 #[test]
 fn an_erase_does_not_reset_the_cursor_effects_and_the_ribbon_survives_it() {
     let mut app = App::headless_for_test();
@@ -35,8 +32,6 @@ fn an_erase_does_not_reset_the_cursor_effects_and_the_ribbon_survives_it() {
     // when the real present arrives.
     let t0 = Instant::now() - Duration::from_millis(500);
 
-    // A terminal with a line on it, and a window whose ribbon is earned by
-    // typing that line.
     let mut term = Terminal::new(10, 40);
     term.process(b"the quick brown fox");
     let ws = app.windows.get_mut(&WindowId(0)).expect("test window");
@@ -60,8 +55,7 @@ fn an_erase_does_not_reset_the_cursor_effects_and_the_ribbon_survives_it() {
     let earned = ws.fx.cursor_mut().glow.ribbon_segments();
     assert!(earned > 0, "the take must start with a ribbon to lose");
 
-    // The REFRESH: a bare erase-in-display, exactly what a zsh prompt redraw
-    // writes. Nothing else happens — no key, no caret move, no resize.
+    // A bare erase, exactly what a zsh prompt redraw writes, with no key, caret move or resize.
     for spelling in [
         &b"\x1b[J"[..],
         &b"\x1b[1J"[..],
@@ -134,9 +128,8 @@ fn an_erase_does_not_reset_the_cursor_effects_and_the_ribbon_survives_it() {
     );
     let change = sync_cursor_effect_scroll(ws, term.content_scroll_state());
     assert!(change.invalidated);
-    // The retirement that stops a phantom comet is a 0.24 s curtain: the band
-    // is drawn into the caret it last stood under. Both halves are asserted:
-    // the curtain is armed now and the light is exactly gone by its end.
+    // The retirement is a 0.24 s curtain into the caret the band last stood under: armed now,
+    // exactly gone by its end.
     assert!(
         ws.fx
             .cursor_mut()
@@ -176,10 +169,9 @@ fn an_erase_does_not_reset_the_cursor_effects_and_the_ribbon_survives_it() {
 }
 
 /// Seventeen band moves between two presents overflow the ring
-/// ([`CONTENT_SCROLL_BAND_RING`](aterm_core::terminal::CONTENT_SCROLL_BAND_RING)
-/// = 16, about one `SYNC_HOLD_CAP` of streamed lines at their fastest). A
-/// present stall longer than a hold takes the wholesale retirement, never a
-/// replay of overwritten slots.
+/// ([`CONTENT_SCROLL_BAND_RING`](aterm_core::terminal::CONTENT_SCROLL_BAND_RING) = 16, about one
+/// `SYNC_HOLD_CAP` of streamed lines at their fastest), so a present stall longer than a hold
+/// takes the wholesale retirement, never a replay of overwritten slots.
 #[test]
 fn seventeen_band_moves_between_presents_fall_back_to_invalidate() {
     let mut app = App::headless_for_test();
@@ -197,9 +189,7 @@ fn seventeen_band_moves_between_presents_fall_back_to_invalidate() {
         win_h: 320,
         head: 0,
     };
-    // The invalidation seam stamps its curtain from the wall clock, so the
-    // script runs 500 ms in the past: the band is earned and inside its grace
-    // when the real present arrives.
+    // 500 ms in the past, as above: the curtain is stamped from the wall clock.
     let t0 = Instant::now() - Duration::from_millis(500);
 
     // One interior-region line feed per parser batch: 16 of them, with the
@@ -258,8 +248,7 @@ fn seventeen_band_moves_between_presents_fall_back_to_invalidate() {
     let change = sync_cursor_effect_scroll(ws, seventeen);
     assert!(change.invalidated);
     assert_eq!(change.band_moves, 0);
-    // The overflow takes the wholesale retirement (the 0.24 s curtain):
-    // armed here, exactly gone at its end, never a replayed band.
+    // The overflow takes the 0.24 s curtain: armed here, exactly gone at its end.
     assert!(
         ws.fx
             .cursor_mut()
@@ -283,23 +272,18 @@ fn seventeen_band_moves_between_presents_fall_back_to_invalidate() {
     );
 }
 
-/// Codex streaming a ~40-line answer, replayed byte for byte from a real
-/// capture (57×151 window, microsecond timestamps). Both phases:
+/// Codex streaming a ~40-line answer, replayed byte for byte from a real 57×151 capture:
 ///
 /// * Phase A (viewport not yet at the screen bottom):
-///   `ESC[{vt};57r ESC[{vt};1H RI ESC[r ESC[1;{vt}r …`, a reverse index at an
-///   interior region top: nothing archived, no splice, and band
-///   `{vt-1, 56, +1}` carries the composer and its ribbon down one row.
-///   Momentum keeps decaying; unpaid echo credits retire at the coordinate
-///   fence.
-/// * Phase B (viewport at the bottom): `ESC[1;52r ESC[52;1H \r\n`, a
-///   top-anchored archival scroll: band `{0, 51, -1}`, with the composer at
-///   row 54 outside it and unmoved.
+///   `ESC[{vt};57r ESC[{vt};1H RI ESC[r ESC[1;{vt}r …` is a reverse index at an interior region
+///   top: nothing archived, and band `{vt-1, 56, +1}` carries the composer and its ribbon down
+///   one row.
+/// * Phase B (viewport at the bottom): `ESC[1;52r ESC[52;1H \r\n` is a top-anchored archival
+///   scroll: band `{0, 51, -1}`, with the composer at row 54 outside it and unmoved.
 ///
-/// Every batch decides `Bands`: earned cells age like an unmoved ribbon,
-/// without reset or renewed lifetime. One record ends mid-block, so there
-/// are 39 moves over 105 records. The human's own keystrokes in the capture
-/// are fed as bytes with no key-time licence, so they must mint nothing.
+/// Every batch decides `Bands`: earned cells age like an unmoved ribbon, with no reset or renewed
+/// lifetime, and momentum keeps decaying. The capture's keystrokes arrive as bytes with no
+/// key-time licence, so they mint nothing.
 #[test]
 fn a_codex_shaped_terminal_keeps_its_ribbon_through_both_phases() {
     /// `(milliseconds after record 642, the bytes of that record)`.
@@ -503,10 +487,8 @@ fn a_codex_shaped_terminal_keeps_its_ribbon_through_both_phases() {
             spawns,
             "record {k}: program output minted light (T1)"
         );
-        // The same earned ribbon, held still, is the ageing reference.
-        // A 2.4-second answer may outlive its light; a band must neither
-        // kill it early nor renew it. This catches a reset on record zero,
-        // while preserving the authored lifetime after typing stops.
+        // The same earned ribbon held still is the ageing reference: a band must neither kill it
+        // early nor renew it (a 2.4 s answer may outlive its light).
         unmoved.tick(Some((26, 9)), at, &cfg, geom, &mut unmoved_out);
         let reference_cells = unmoved.v2_status().expect("reference engaged").cells;
         if k == 0 {

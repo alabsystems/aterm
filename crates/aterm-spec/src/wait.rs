@@ -4,29 +4,21 @@
 
 //! Bounded polls: the one loop behind every "wait until it holds" in the tests.
 //!
-//! A wait for something that MUST happen is a hang detector, never a latency
-//! budget (`AGENTS.md`): a correct run leaves the moment the probe answers, and
-//! the budget only decides how long a wedged run takes to be named. So the
-//! default budget is [`MUST_HAPPEN`], a minute, and a caller that needs a
-//! different one states it.
+//! A wait for something that must happen is a hang detector, never a latency budget: a correct run
+//! leaves the moment the probe answers, and the budget only decides how long a wedged run takes to
+//! be named. The default is [`MUST_HAPPEN`].
 //!
-//! [`within`] is the loop and never panics; [`until_within`] is its panicking
-//! form, naming what was being waited for. A caller with a failure message of
-//! its own (the last reading, a context dump) builds it on [`within`].
+//! [`within`] is the loop and never panics; [`until_within`] panics naming what it waited for.
+//! [`first_exec`] pays the system's first-exec wait on a just-built binary once, unclocked, before
+//! the launch a hang detector times.
 //!
-//! A hang detector on a just-built binary's launch also meets the system's
-//! first-exec wait, which is no part of what it detects: [`first_exec`] pays
-//! that wait once, unclocked, right before the launch.
-//!
-//! Compiled out on `wasm32-unknown-unknown`, where `std::thread::sleep` and
-//! `std::time::Instant::now` panic.
+//! Compiled out on `wasm32-unknown-unknown`, where `std::thread::sleep` and `Instant::now` panic.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-/// The budget for a wait on something that must happen: a minute, a hang
-/// detector (`AGENTS.md`). A loaded host only slows what is awaited; a defect
-/// that never delivers still fails, at the minute.
+/// The budget for a wait on something that must happen. A hang detector: a loaded host only slows
+/// what is awaited, and a defect that never delivers still fails.
 pub const MUST_HAPPEN: Duration = Duration::from_secs(60);
 
 /// The gap [`until_within`] leaves between observations. Not a synchronisation
@@ -74,45 +66,31 @@ pub fn until_within<T>(budget: Duration, what: &str, probe: impl FnMut() -> Opti
     }
 }
 
-/// How long [`first_exec`]'s one run may take before it is killed: ten
-/// minutes, a hang detector of its own, never a latency budget. The wait it
-/// absorbs is the system's, and long under load: measured 2026-10-07/08, a
-/// freshly built 167 MB debug `aterm-gui` took 64 s to its first exec and
-/// 0.13 s to its next, and a fresh two-line script's first run took 103 s to
-/// 600 s while syspolicyd was backed up.
+/// How long [`first_exec`]'s run may take before it is killed: a hang detector of its own. The
+/// system's first-exec wait is long under load: a fresh 167 MB debug `aterm-gui` took 64 s to its
+/// first exec (0.13 s to its next), and a fresh two-line script up to 600 s while syspolicyd was
+/// backed up.
 pub const FIRST_EXEC: Duration = Duration::from_secs(10 * 60);
 
-/// RUN THE EXECUTABLE AT `path` ONCE, UNCLOCKED, RIGHT BEFORE A CALLER
-/// LAUNCHES IT UNDER A HANG DETECTOR.
+/// Runs the executable at `path` once, unclocked, right before a caller launches it under a hang
+/// detector.
 ///
-/// macOS assesses an executable file the first time it runs and caches the
-/// verdict per inode, and that first exec can take a minute ([`FIRST_EXEC`]
-/// has the measurements). A test that launches a just-built binary and then
-/// waits a minute for it ([`MUST_HAPPEN`]) went red on that wait, not on a
-/// defect. The wait cannot be paid at build time: on this Mac cargo COPIES
-/// each binary into `<target>/debug` on every invocation, rebuilt or not
-/// (measured 2026-10-08: two no-op builds, two inodes; a re-copied binary
-/// that had already run took 4.3 s and 13 s again, its same inode 20 ms), so
-/// a run before the last cargo invocation warms a file that is gone by the
-/// launch. This runs at the launch: the file at `path` now, which is the one
-/// the caller starts next.
+/// macOS assesses an executable the first time it runs and caches the verdict per inode, and that
+/// first exec can outlast [`MUST_HAPPEN`]. It cannot be paid at build time: cargo copies each
+/// binary into `<target>/debug` on every invocation, rebuilt or not, and the new inode is assessed
+/// again. So this runs the file at `path` now, the one the caller starts next.
 ///
-/// ONCE PER FILE PER PROCESS, keyed by (device, inode) — off Unix by the
-/// path, length and modification time. A caller that finds the file being
-/// run waits for that run instead of starting its own; a file cargo replaced
-/// since is a new key and is run again.
+/// Once per file per process, keyed by (device, inode), off Unix by path, length and mtime. A
+/// caller that finds the file being run waits for that run; a file replaced since is run again.
 ///
-/// `args` must make the program print and exit before any setup: a `--help`
-/// or a `--version` read off its `main`. Every stdio is null, and the
-/// environment is `PATH` alone plus `HOME` and `TMPDIR` in a scratch
-/// directory of its own under the temp dir (the temp dir itself when one
-/// cannot be made), removed afterwards: no `ATERM_*` session, capability,
-/// handoff or update authority, and nothing of the person's, reaches it. A
-/// run still going at [`FIRST_EXEC`] is killed.
+/// `args` must make the program print and exit before any setup (a `--help` or `--version` read
+/// off its `main`). Stdio is null and the environment is `PATH` plus `HOME` and `TMPDIR` in a
+/// scratch directory (the temp dir when one cannot be made) removed afterwards, so no `ATERM_*`
+/// authority and nothing of the person's reaches it. A run still going at [`FIRST_EXEC`] is
+/// killed.
 ///
-/// It decides nothing and never panics: a path that does not exist is no
-/// call at all, and a spawn that fails or an exit that is not 0 is the
-/// launch's to meet. The caller keeps its hang detector.
+/// It never panics: a missing path is a no-op, and a failed spawn or nonzero exit is the launch's
+/// to meet.
 pub fn first_exec(path: &Path, args: &[&str]) {
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex, OnceLock, PoisonError};
@@ -228,14 +206,9 @@ mod tests {
         until_within::<()>(Duration::ZERO, "the never", || None);
     }
 
-    /// ONE RUN PER FILE, IN A SCRATCH ENVIRONMENT: a second call for the same
-    /// file runs nothing; the run saw `PATH`, a scratch `HOME` and `TMPDIR`
-    /// and its shell's own variables, nothing else, and the scratch is gone
-    /// after it; a path that does not exist is no call at all. The program is
-    /// `/bin/sh`, not a fresh stand-in, so the test waits on no first-exec
-    /// assessment ([`FIRST_EXEC`]: a fresh script's took up to 600 s). No
-    /// other test here hands `/bin/sh` to [`first_exec`], whose memory is the
-    /// process's.
+    /// One run per file, in a scratch environment of `PATH`, `HOME`, `TMPDIR` and the shell's own
+    /// variables, removed after. `/bin/sh` needs no first-exec assessment; no other test here hands
+    /// it to [`first_exec`], whose memory is per process.
     #[cfg(unix)]
     #[test]
     fn first_exec_runs_a_file_once_in_a_scratch_environment() {
@@ -280,8 +253,7 @@ mod tests {
         first_exec(&absent, &["--help"]);
         assert_eq!(file_id(&absent), None);
 
-        // A file replaced by rename (cargo re-copies a binary on every
-        // invocation) is a new key, so it is warmed again.
+        // A file replaced by rename, as cargo re-copies a binary, is a new key.
         let binary = dir.path().join("binary");
         std::fs::write(&binary, "same bytes").unwrap();
         let before = file_id(&binary).expect("a file");

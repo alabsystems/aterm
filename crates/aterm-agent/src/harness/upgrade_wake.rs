@@ -7,17 +7,7 @@
 //! A newer build arrives two ways, each watched: atpkg atomically replaces a
 //! marker after a pass repoints `agents/claude` or `agents/codex`
 //! (`atpkg::activation_notice`), and Claude's native updater repoints
-//! `~/.local/bin/claude` into `~/.local/share/claude/versions`. The owner's
-//! word (`aterm harness upgrade <sid> --now|--defer|--skip`) replaces a marker
-//! of its own ([`super::upgrade_drive::word_marker`],
-//! [`ActivationWake::with_word`]), so the tab's worker takes it at its next
-//! idle point.
-//!
-//! On macOS one kqueue watches the directory holding each, and a change wakes
-//! only when the thing itself moved (the marker's identity, the link's target).
-//! The wake is a hint: the host re-reads the builds before acting
-//! ([`super::upgrade_drive::due`]). A user event on the same kqueue wakes the
-//! parked thread at shutdown ([`WakeTrigger`]).
+//! `~/.local/bin/claude` into `~/.local/share/claude/versions`.
 //!
 //! And the OWNER'S WORD on an upgrade (`aterm harness upgrade <sid>
 //! --now|--defer|--skip`, from another process) replaces a marker of its own

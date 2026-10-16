@@ -1,0 +1,63 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0 AND (MIT OR Apache-2.0)
+#
+# This crate is a modified, std-only subset of the upstream `serde_core` and
+# `serde` crates, version 1.0.228 (https://github.com/serde-rs/serde, by Erick
+# Tryzelaar and David Tolnay, dual-licensed MIT OR Apache-2.0). See
+# `LICENSE-MIT` and `LICENSE-APACHE` in this directory for the upstream
+# licenses. The derived files keep upstream's layout (`src/de/*.rs`,
+# `src/ser/*.rs`, `src/private/*.rs`) and each names the file it came from.
+#
+# docs/AUDIT-third-party-2026-10-15.md, SP.4 (serde-procmacro ruling, step 4):
+# aterm keeps spelling `serde`. Since SP.6 the workspace row is
+# `serde = { package = "aterm-serde", path = "crates/aterm-serde" }`, so every
+# member that writes `serde = { workspace = true }` gets this crate under that
+# name, with no call-site edits; a member that derives adds
+# `features = ["derive"]` to its own row (Trust PM-1,
+# docs/PLAN-pm1-proc-macro-reach-2026-10-16.md). Registry serde is left only on
+# linux, where zbus and zvariant pull it in.
+
+[package]
+name = "aterm-serde"
+description = "First-party serde for aterm: the Serialize/Deserialize traits, the std impls aterm's models use, and the support surface the derive targets. Derived from serde 1.0.228; MIT OR Apache-2.0 upstream."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "Apache-2.0 AND (MIT OR Apache-2.0)"
+# Integration tests are declared below, not discovered.
+autotests = false
+
+[lib]
+# `serde` is what every model writes (`use serde::Deserialize`), and what the
+# derive's output names (`use ::serde as _serde`). The workspace row's
+# `package = "aterm-serde"` gives dependents that name; this crate's own tests
+# reach it as `aterm_serde` and alias it to `serde` at their root.
+name = "aterm_serde"
+path = "src/lib.rs"
+# No unit tests live in src/ (the suite is tests/serde_suite.rs), so the lib's
+# libtest harness would run 0 tests while still being linked and executed.
+# Off; doctests are governed separately and still run.
+test = false
+
+[features]
+# `#[derive(Serialize, Deserialize)]`, re-exported from the crate root as
+# upstream's `derive` feature does: crates/aterm-serde-derive (SP.5), which
+# generates code against `__private` (src/lib.rs).
+derive = ["dep:aterm-serde-derive"]
+
+[dependencies]
+aterm-serde-derive = { workspace = true, optional = true }
+
+[dev-dependencies]
+# The ported suite's derives. tests/serde_suite.rs names this crate
+# `serde_derive` at its root, so each ported file keeps upstream's
+# `use serde_derive::...`.
+aterm-serde-derive = { workspace = true }
+
+[lints]
+workspace = true
+
+[[test]]
+name = "serde_suite"
+path = "tests/serde_suite.rs"

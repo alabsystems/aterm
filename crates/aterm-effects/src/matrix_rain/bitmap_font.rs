@@ -3,36 +3,21 @@
 
 //! The 8x8 bitmap glyph table phosphor's literal material mode draws with.
 //!
-//! # Provenance
+//! The 499 glyphs come from the public-domain `font8x8` collection (Marcel
+//! Sondaar's 8x8 monochrome font, packaged as `dhepper/font8x8`); no license
+//! obligation applies. A copied table, because the crate is ~10.6k lines in
+//! every platform's graph for a handful of scripts.
 //!
-//! These 499 glyphs come from the classic `font8x8` collection (Marcel
-//! Sondaar's 8x8 monochrome bitmap font, packaged as `dhepper/font8x8`),
-//! released to the public domain; no license obligation applies. The lookup
-//! and everything that reads it are original.
+//! The table is the first-hit union of the crate's Basic, Latin, Greek, box
+//! drawing, block elements, Hiragana and misc tables, in that order, with blank
+//! glyphs omitted (an omitted entry and a filtered blank are the same `None`).
+//! It answers as the crate does for every code point; `the_table_is_pinned`
+//! holds it there.
 //!
-//! # Why a table, not a dependency
-//!
-//! The sampler needs only "what does this character look like at 8x8" for a
-//! handful of scripts; the crate is ~10.6k lines in the shipped graph on
-//! every platform including wasm.
-//!
-//! # Same answers as the crate
-//!
-//! The table is the FIRST-HIT union of the seven tables the previous lookup
-//! consulted, in the same order — Basic, Latin, Greek, box drawing, block
-//! elements, Hiragana, misc — with blank glyphs omitted, because the old
-//! lookup filtered those out anyway and an omitted entry and a filtered one
-//! are the same `None`. The copy was checked against the retired crate for
-//! EVERY code point in Unicode, and `the_table_is_pinned` holds it there.
-//!
-//! # The U+00B2 exception
-//!
-//! The crate's `LATIN_UNICODE` table has three consecutive entries keyed
-//! `U+00B2` (`LATIN_LEGACY[18]`, `[19]`, `[20]`; U+00B3/U+00B4 are missing and
-//! the keys slid). `UnicodeFonts::get_font` resolves them with
-//! `binary_search_by_key`, which on duplicate keys is unspecified and on the
-//! current std lands on index 20, so index 20's glyph is pinned here, not the
-//! first hit (`[0x1C, 0x30, 0x18, 0x0C, 0x3C, …]`).
+//! One exception: the crate's `LATIN_UNICODE` keys three consecutive entries
+//! `U+00B2` (`LATIN_LEGACY[18]`..`[20]`; the U+00B3/U+00B4 keys slid). Its
+//! `binary_search_by_key` lookup lands on index 20, so that glyph is kept, not
+//! the first hit.
 
 /// Every glyph, sorted by code point for binary search.
 ///
@@ -543,9 +528,7 @@ static GLYPHS: [(u32, [u8; 8]); 499] = [
     (0x309E, [0x20, 0x40, 0x14, 0x24, 0x08, 0x18, 0x06, 0x00]),
 ];
 
-/// The 8x8 bitmap for `c`, or `None` when no supported family covers it. The
-/// material sampler skips an unsupported code point rather than substituting
-/// a different-looking character.
+/// The 8x8 bitmap for `c`, or `None` when no supported family covers it.
 #[must_use]
 pub(crate) fn bitmap(c: char) -> Option<[u8; 8]> {
     let cp = c as u32;
@@ -571,8 +554,7 @@ mod tests {
         assert_eq!(format!("{h:016x}"), "b0ad38513edb5cea");
     }
 
-    /// The binary search is only correct on a sorted table, and the table is
-    /// generated — so the ordering is asserted here rather than trusted.
+    /// The binary search needs a sorted table, so the ordering is asserted.
     #[test]
     fn the_table_is_sorted_and_has_no_duplicates() {
         for pair in GLYPHS.windows(2) {
@@ -593,9 +575,8 @@ mod tests {
         }
     }
 
-    /// Spot checks that survive a regenerated table: the families the material
-    /// sampler advertises are all actually present, and something outside them
-    /// is absent.
+    /// Every family the material sampler advertises is present, and something
+    /// outside them is absent.
     #[test]
     fn every_advertised_family_is_present() {
         for (label, ch) in [

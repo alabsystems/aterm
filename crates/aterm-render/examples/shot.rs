@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// Headless screenshot: feed bytes (or a built-in colourful demo) into the engine
-// and write the rendered screen to a PNG. This is aterm's own `read_image` used
-// as a screen-capturing env — no display required.
+// Headless screenshot: render a built-in colourful demo through the engine to a PNG,
+// no display required.
 //
-//   cargo run -p aterm-render --example shot -- /tmp/aterm_shot.png
+//   targo --unverified run -p aterm-render --example shot -- /tmp/aterm_shot.png
 
 use aterm_core::terminal::Terminal;
 use aterm_render::{Renderer, Theme};

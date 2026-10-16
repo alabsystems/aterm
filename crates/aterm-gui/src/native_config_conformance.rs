@@ -130,8 +130,8 @@ fn manual_completion_selection_and_responsive_window_conform_to_the_model() {
     assert_eq!(real["selected"], 3);
     assert_eq!(real["window_start"], 3);
 
-    // Negative control: the historical fixed-first-page projection can select
-    // result four while leaving it outside the compiled responsive window.
+    // Negative control: a fixed first-page projection can select result four while
+    // leaving it outside the compiled responsive window.
     let mut before_page = model.successors("EnterSelection", &initial)[0].clone();
     before_page = model.successors("MoveNext", &before_page)[0].clone();
     before_page = model.successors("MoveNext", &before_page)[0].clone();
@@ -244,10 +244,20 @@ fn settings_manual_handoff_conforms_for_selection_fallback_reuse_and_path_author
     let AppViewState::Editor(editor) = app.native_runtime.view_state(reused_view).unwrap() else {
         panic!("Manual editor view");
     };
+    // The absent key is in the buffer, unsaved, its value selected, and no
+    // Search was started.
+    let document = app.native_runtime.document_id(instance).unwrap();
+    let text = app.document_store.snapshot(document).unwrap().text;
+    let added = crate::native_config_language::config_key_source_range(&text, "gpu")
+        .expect("the absent key was added");
     assert!(matches!(
         editor.buffer.as_ref().unwrap().minibuffer,
-        Minibuffer::Search { ref query, .. } if query == "gpu"
+        Minibuffer::Inactive
     ));
+    assert_eq!(
+        editor.buffer.as_ref().unwrap().primary_selection().range(),
+        added
+    );
     assert!(app.native_runtime.config_editor_enabled(instance));
 
     let mut fallback = selected.clone();
@@ -255,32 +265,9 @@ fn settings_manual_handoff_conforms_for_selection_fallback_reuse_and_path_author
     fallback.insert("request_kind", 2);
     fallback.insert("outcome", 2);
     fallback.insert("selected_exact", 0);
-    fallback.insert("search_exact", 1);
+    fallback.insert("added_exact", 1);
     fallback.insert("completion_ready", 1);
-    assert_transition(&model, &selected, &fallback, "SeedAbsentKey");
-
-    // The third action is bound separately because the model caps a trace at two
-    // requests. Search targets use the shipping host resolver and exact bytes.
-    let decision = crate::app_documents::config_editor_reveal_decision(
-        source,
-        &ConfigEditorTarget::Search("Nord".to_string()),
-    )
-    .unwrap();
-    assert!(matches!(
-        decision,
-        crate::app_documents::ConfigEditorRevealDecision::Select {
-            ref requested,
-            ref range,
-        } if requested == "Nord" && &source[range.clone()] == "Nord"
-    ));
-    let mut searched = initial.clone();
-    searched.insert("requests", 1);
-    searched.insert("request_kind", 3);
-    searched.insert("outcome", 1);
-    searched.insert("selected_exact", 1);
-    searched.insert("editor_instances", 1);
-    searched.insert("focused", 1);
-    assert_transition(&model, &initial, &searched, "RevealMatchingSearch");
+    assert_transition(&model, &selected, &fallback, "AddAbsentKey");
 
     // Negative control: a target-supplied path or a duplicate second editor is
     // not a transition admitted by the shipping model.

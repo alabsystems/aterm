@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! Hand-rolled `std::env::args` parsing with a `USAGE` const and a typed
-//! `ParseError` — the shape `xtask`, `aterm-verify`, `aterm-release` and
+//! `ParseError` — the shape `aterm-verify`, `aterm-release` and
 //! `aterm-ctl` all use. No third-party argument crate: a program whose entire
 //! purpose is to shrink the dependency surface does not get to add one.
 
@@ -37,10 +37,17 @@ USAGE
 
   targo --unverified forge check [--cell NAME]...
         THE GATE VERB. attest + patch-liveness + census cross-check, with no
-        compilation and no network. Wired as `xtask gate forge`.
+        compilation and no network. Run by `verify forge`.
         What it does not prove: [OB-11] scores path forks forward only (each
         needs a reviewed row; the reverse is attest [OB-1] and the census scan
         set).
+
+  targo --unverified forge serde-attrs [PATH]...
+        Every #[serde(...)] key and form under crates/ (crates/aterm-serde,
+        the implementation and its suite, left out), as TSV on stdout: the
+        closed set the first-party derive accepts (AUDIT-third-party SP.5).
+        PATHs, relative to the workspace root, list those trees instead.
+        Read-only.
 
 OPTIONS
   --root PATH      Workspace root (default: discovered from CWD)
@@ -72,6 +79,9 @@ pub enum Cmd {
     Check {
         cells: Vec<String>,
     },
+    SerdeAttrs {
+        paths: Vec<PathBuf>,
+    },
     Help,
 }
 
@@ -98,7 +108,9 @@ impl ParseError {
         match self {
             Self::NoVerb => "no verb given — try `targo --unverified forge survey`".into(),
             Self::UnknownVerb(v) => {
-                format!("unknown verb `{v}` — expected survey, blame, budget, attest or check")
+                format!(
+                    "unknown verb `{v}` — expected survey, blame, budget, attest, check or serde-attrs"
+                )
             }
             Self::MissingValue(flag) => format!("`{flag}` needs a value"),
             Self::BadNumber(s) => format!("`{s}` is not a number"),
@@ -116,7 +128,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Invocation, Pars
     let mut json: Option<PathBuf> = None;
     let mut update = false;
     let mut allow_regress: Option<String> = None;
-    let mut operand: Option<String> = None;
+    let mut operands: Vec<String> = Vec::new();
 
     let verb = loop {
         let Some(a) = it.next() else {
@@ -153,14 +165,16 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Invocation, Pars
             "--update" => update = true,
             "--allow-regress" => allow_regress = Some(next(&mut it, "--allow-regress")?),
             other if other.starts_with('-') => return Err(ParseError::UnexpectedArg(other.into())),
-            other => operand = Some(other.to_string()),
+            other => operands.push(other.to_string()),
         }
     }
 
     let cmd = match verb.as_str() {
         "survey" => Cmd::Survey { cells, top, json },
         "blame" => Cmd::Blame {
-            pkg: operand.ok_or(ParseError::MissingOperand("a package name"))?,
+            pkg: operands
+                .pop()
+                .ok_or(ParseError::MissingOperand("a package name"))?,
             cells,
         },
         "budget" => Cmd::Budget {
@@ -169,6 +183,9 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Invocation, Pars
         },
         "attest" => Cmd::Attest,
         "check" => Cmd::Check { cells },
+        "serde-attrs" => Cmd::SerdeAttrs {
+            paths: operands.into_iter().map(PathBuf::from).collect(),
+        },
         other => return Err(ParseError::UnknownVerb(other.to_string())),
     };
     Ok(Invocation { root, cmd })
@@ -227,6 +244,22 @@ mod tests {
         assert_eq!(
             p(&["survey", "--top"]).unwrap_err(),
             ParseError::MissingValue("--top")
+        );
+    }
+
+    #[test]
+    fn serde_attrs_takes_any_number_of_paths() {
+        assert_eq!(
+            p(&["serde-attrs"]).unwrap().cmd,
+            Cmd::SerdeAttrs { paths: vec![] }
+        );
+        assert_eq!(
+            p(&["serde-attrs", "crates/aterm-serde", "crates/x"])
+                .unwrap()
+                .cmd,
+            Cmd::SerdeAttrs {
+                paths: vec!["crates/aterm-serde".into(), "crates/x".into()]
+            }
         );
     }
 

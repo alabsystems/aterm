@@ -1,24 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! An `NSException` raised inside a declared method is CONTAINED — every Rust
-//! `Drop` between the raise and the trampoline runs, the method answers its
-//! inert zero, the containment is reported against the selector, and the
-//! process continues — while a Rust panic still aborts with the named message,
-//! an `@abort_on_exception` method still aborts on a raise, and `-dealloc`
-//! always does.
+//! An `NSException` raised inside a declared method is contained: every Rust `Drop` between the
+//! raise and the trampoline runs, the method answers its inert zero, the containment is reported
+//! against the selector, and the process continues. A Rust panic still aborts with the named
+//! message, an `@abort_on_exception` method still aborts on a raise, and `-dealloc` always does.
 //!
-//! The raise is a real one: `+[NSException exceptionWithName:reason:userInfo:]`
-//! then `-raise`, thrown by Foundation through `objc_exception_throw`, which is
-//! the same path AppKit's `NSInternalInconsistencyException` takes. No AppKit
-//! is needed for that, so this runs in the crate's own test binary; the AppKit
-//! shape — `-[NSEvent keyCode]` on a mouse event — is the gate in
-//! `crates/aterm-gui/examples/objc_event_drive.rs`.
-//!
-//! The abort cases re-run this binary as a child (the pattern `adversary_w2.rs`
-//! established) and read the signal and stderr.
+//! The raise is real (`+[NSException exceptionWithName:reason:userInfo:]` then `-raise`, thrown
+//! through `objc_exception_throw`, AppKit's path too) and needs no AppKit; the AppKit shape is
+//! gated in `crates/aterm-gui/examples/objc_event_drive.rs`. The abort cases re-run this binary
+//! as a child and read the signal and stderr.
 
 #![cfg(target_os = "macos")]
+#![allow(
+    clippy::disallowed_types,
+    reason = "test code: a stand-in child may inherit descriptors"
+)]
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -154,15 +151,15 @@ aterm_objc::declare_class! {
             42
         }
 
-        /// A Rust panic under containment — must still ABORT with the named
-        /// message, because `@catch (id)` does not swallow a Rust panic.
+        /// A Rust panic under containment still aborts with the named message: `@catch (id)`
+        /// does not swallow a Rust panic.
         @sel(rustPanic)
         fn rust_panic(&self) {
             let _local = Tell(Arc::clone(&self.ivars().drops));
             panic!("a Rust panic inside a contained method");
         }
 
-        /// Opted OUT of containment: a raise here aborts as it did before.
+        /// Opted out of containment: a raise here aborts.
         @sel(raiseUncontained)
         @abort_on_exception
         fn raise_uncontained(&self) -> i64 {
@@ -208,9 +205,8 @@ fn a_raise_inside_a_declared_method_is_contained_and_every_drop_runs() {
         3,
         "the method's local and both deeper frames' locals were dropped by the unwind"
     );
-    // Other tests in this binary contain concurrently, so the global count is
-    // only known to have MOVED; the exact once-per-raise is the record's
-    // ordinal below.
+    // Other tests in this binary contain concurrently, so the global count is only known to
+    // have moved; the exact once-per-raise is the record's ordinal below.
     assert!(contained_count() > before, "the containment was counted");
 
     // The process continues: the same object still answers.

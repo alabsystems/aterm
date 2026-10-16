@@ -33,8 +33,8 @@ fn claude_code_wrap_reanchors_all_styles() {
         // A scripted typed candidate exercises the post-admission
         // re-anchor morphology without treating its timestamp as proof.
         glow.note_synthetic_typed(t0 + Duration::from_millis(5), 1);
-        // …and the Ink repaint re-anchors the caret one row down, LEFT of
-        // its launch column (dr=1, dc=-33 — the shape detector misses).
+        // …and the Ink repaint re-anchors the caret one row down, left of
+        // its launch column (dr=1, dc=-33, which the shape detector misses).
         glow.tick(
             Some((5, 3)),
             t0 + Duration::from_millis(10),
@@ -91,7 +91,7 @@ fn claude_code_wrap_reanchors_all_styles() {
     }
 }
 
-/// HIDE-BRIDGE LAW under explicit candidates: a ConPTY-bridged move is
+/// The hide-bridge law under explicit candidates: a ConPTY-bridged move is
 /// chebyshev ≤ 2, and the re-anchor's `raw_dist > 2` guard keeps generic and
 /// typed synthetic morphology byte-identical frame for frame.
 #[test]
@@ -156,7 +156,7 @@ fn box_growth_preview_reanchors_but_cold_output_stays_dark() {
     );
     assert!(glow.flare < 0.5, "no flare slam on the wrap");
 
-    // The SAME shape with no key behind it stays wholly dark.
+    // The same shape with no key behind it stays wholly dark.
     let mut cold = CursorGlow::default();
     cold.note_context(true);
     cold.tick(Some((5, 36)), t0, &c, g, &mut out);
@@ -191,8 +191,8 @@ fn synthetic_alt_without_blink_keeps_the_jump() {
         "admitted alt-screen preview + no blink: the fire meteor still flies"
     );
 
-    // Rainbow kitty's meteor has its own admission laws in
-    // `rainbow_kitty::meteor`.
+    // With a fresh repaint blink the same typed wrap re-anchors. (Rainbow
+    // kitty's meteor has its own admission laws in `rainbow_kitty::meteor`.)
     let mut cc = CursorGlow::default();
     cc.note_context(true);
     cc.tick(Some((4, 36)), t0, &cfg(GlowStyle::Fire, true), g, &mut out);

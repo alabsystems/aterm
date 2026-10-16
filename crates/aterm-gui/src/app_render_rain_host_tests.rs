@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Phosphor host-side wiring: the hidden-cursor damage band and the tab-strip
-//! splice shifting the rain channels with the grid.
+//! Phosphor host-side wiring: pane translation, the shell-execute edge, the
+//! literal reload, the hidden-cursor damage band and the tab-strip splice
+//! shifting the rain channels with the grid.
 
 use super::{prepend_strip_rows, rain_refresh_needed, update_rain_hidden_band};
 use crate::matrix_rain::{EffectGeom, MatrixRain, RainConfig, RainSignal, RainTickInput};
@@ -310,7 +311,7 @@ fn hidden_band_tracks_recent_damage() {
     update_rain_hidden_band(&mut band, &dmg, 30);
     assert_eq!(band, vec![5, 29, 28, 27]);
 
-    // Re-damaging a resident row DEDUPES (promote, don't duplicate).
+    // Re-damaging a resident row promotes it rather than duplicating it.
     let mut dmg = Damage::Partial(DamageTracker::new(30));
     dmg.mark_rows(28, 29);
     update_rain_hidden_band(&mut band, &dmg, 30);
@@ -436,7 +437,7 @@ fn strip_splice_shifts_every_grid_relative_channel() {
             cy: 40,
             rx: 6,
             ry: 8,
-            // Defaulted `mode: HaloMode::Add` — the historical light.
+            // `mode` defaults to `HaloMode::Add`.
             ..Default::default()
         });
         input.fire_halo.push(aterm_render::FireHaloCell {

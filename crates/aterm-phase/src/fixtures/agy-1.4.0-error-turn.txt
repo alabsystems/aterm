@@ -1,0 +1,18 @@
+# agy 1.4.0 · MEASURED 2026-10-16, `aterm ctl text --json` of a private headless aterm 120x40 (aterm 0.105.0 098c216c7), the atpkg-managed agy (Google latest) launched through its shim under the owner's signed-in account (Gemini 4 Argon, medium), scratch ATERM_STATE_HOME/XDG dirs, harness off · a turn that failed (launched with HTTPS_PROXY and HTTP_PROXY at a dead port, so the model list never loaded): `⚠ failed to construct executor: …` in e06c75 and an `Error ID:` row (8a8f99), then the idle composer; the footer has no model while the model list is unknown · cursor=14,2 (visible) · account and scratch path redacted at equal length
+
+      ▄▀▀▄        Antigravity CLI 1.4.0
+     ▀▀▀▀▀▀       redacted-user@example.test
+    ▀▀▀▀▀▀▀▀      /tmp/at.XXXXXX/work
+   ▄▀▀    ▀▀▄
+  ▄▀▀      ▀▀▄
+
+────────────────────────────────────────────────────────────
+> Say hello.
+
+⚠ failed to construct executor: plan model not specified; you must specify a valid model
+Error ID: e85592f1-3c96-43a3-9843-826cfa2918db-1
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+>
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+? for shortcuts

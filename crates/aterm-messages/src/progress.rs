@@ -1,16 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The ETA estimator and the time words (design §10.4.4). A live determinate
-//! row whose reporter supplies an [`Amount`] feeds a [`ProgressTrack`]; the
-//! band reads back an honest [`Eta`] — the secant across a window, shown only
-//! once several projections agree, counting down between reads, re-anchored
-//! only on a real change, "stalled" ten seconds after bytes stop (a count
-//! after several of its own gaps between advances), and
-//! blank once it has run out with nothing new ([`ETA_OVERDUE_MIN`]). All of
-//! the math is integer (milliseconds, u64/u128): no floats, so native and wasm
-//! agree to the millisecond, and the crate's clock fence holds — every method
-//! takes `now`.
+//! The ETA estimator and the time words. A live determinate row whose
+//! reporter supplies an [`Amount`] feeds a [`ProgressTrack`]; the band reads
+//! back an honest [`Eta`]: the secant across a window, shown only once
+//! several projections agree, counting down between reads, re-anchored only
+//! on a real change, "stalled" [`STALL_AFTER`] after bytes stop (a count
+//! after several of its own gaps between advances), and blank once it has
+//! run out with nothing new ([`ETA_OVERDUE_MIN`]). The math is integer
+//! milliseconds, so native and wasm agree exactly, and every method takes
+//! `now`.
 
 use std::collections::VecDeque;
 
@@ -68,8 +67,7 @@ pub struct ProgressTrack {
     /// When the series began (its first reading), and how many readings
     /// since moved `done` forward: a count's own pace ([`COUNT_STALL_GAPS`]).
     /// Every held phase's span is added to `began` when the phase ends, so the
-    /// pace is the count's own and never the plateau it sat through (ruling
-    /// 266).
+    /// pace never includes a plateau.
     began: Option<Instant>,
     advances: u32,
     /// When the held phase now running began (its first held reading).
@@ -83,7 +81,7 @@ pub struct ProgressTrack {
 
 impl ProgressTrack {
     /// Feed one reading. A different series or unit, or a `done` that went
-    /// BACKWARDS, starts over; a different `total` keeps the samples but drops
+    /// backwards, starts over; a different `total` keeps the samples but drops
     /// the projections and the latch (the deliverable changed size). A sample
     /// is kept at most every [`SAMPLE_MIN_GAP`], so a 10 Hz stream keeps its
     /// time base; the projection is voted only when a sample is kept.
@@ -102,10 +100,9 @@ impl ProgressTrack {
             self.projections.clear();
             self.anchor = None;
         }
-        // A held phase ended (ruling 266): the count's patience restarts
-        // here, so the plateau it sat through is not read as a stall — nor
-        // folded into the count's pace, which would stretch its patience by
-        // the plateau for every phase the pass holds.
+        // A held phase ended: the count's patience restarts here, so the
+        // plateau is neither read as a stall nor folded into the count's pace
+        // (which would stretch its patience by every plateau the pass holds).
         if self.unit == Some(Unit::HeldSteps) && a.unit != Unit::HeldSteps {
             self.last_advance = Some(now);
             if let Some(from) = self.held_from.take() {
@@ -269,18 +266,17 @@ impl ProgressTrack {
     }
 
     /// When the stream reads "stalled" if nothing arrives, once it has moved
-    /// at all: bytes [`STALL_AFTER`] after the last advance; a COUNT (steps,
+    /// at all: bytes [`STALL_AFTER`] after the last advance; a count (steps,
     /// items) after [`COUNT_STALL_GAPS`] of its own mean gaps between
-    /// advances, never sooner than bytes (design ruling 265), so a stopped
-    /// count says it stalled instead of counting down to `<5 s left` and
-    /// going blank.
+    /// advances, never sooner than bytes, so a stopped count says it stalled
+    /// instead of counting down to `<5 s left` and going blank.
     fn stall_at(&self) -> Option<Instant> {
         if !self.advanced {
             return None;
         }
         let last = self.last_advance?;
         let after = match self.unit? {
-            // A phase that holds the fill by plan never stalls (ruling 266).
+            // A phase that holds the fill by plan never stalls.
             Unit::HeldSteps => return None,
             Unit::Bytes => STALL_AFTER,
             Unit::Items | Unit::Steps => {
@@ -291,11 +287,11 @@ impl ProgressTrack {
         last.checked_add(after)
     }
 
-    /// A QUICK projection of the time left, for the reveal (design ruling
-    /// 265): the secant from the oldest kept reading to the newest, less the
-    /// time since the newest — `None` until `done` has moved. Coarser than
-    /// the ETA (no votes, no latch); it only decides whether a row about to
-    /// be revealed would be on the glass long enough to read.
+    /// A quick projection of the time left, for the reveal: the secant from
+    /// the oldest kept reading to the newest, less the time since the newest;
+    /// `None` until `done` has moved. Coarser than the ETA (no votes, no
+    /// latch); it only decides whether a row about to be revealed would be on
+    /// the glass long enough to read.
     #[must_use]
     pub(crate) fn quick_left(&self, now: Instant) -> Option<Duration> {
         let newest = self.newest?;
@@ -310,7 +306,7 @@ impl ProgressTrack {
         Some(left.saturating_sub(now.saturating_duration_since(newest.at)))
     }
 
-    /// The next instant the ETA's WORDS change with no new reading: the
+    /// The next instant the ETA's words change with no new reading: the
     /// countdown's next boundary, the latch running out, or the stall.
     /// `None` when nothing will change on its own.
     #[must_use]
@@ -333,10 +329,10 @@ impl ProgressTrack {
         self.stall_onset(now).into_iter().chain(word).min()
     }
 
-    /// When a stream that has moved turns "stalled" if nothing arrives —
-    /// the one change a bar with no ETA slot still DRAWS (its dim
-    /// [`crate::Tone::STALLED`] ink); `None` before the first advance and
-    /// once the stall has begun.
+    /// When a stream that has moved turns "stalled" if nothing arrives: the
+    /// one change a bar with no ETA slot still draws (its dim
+    /// [`crate::Tone::STALLED`] ink); `None` before the first advance and once
+    /// the stall has begun.
     #[must_use]
     pub(crate) fn stall_onset(&self, now: Instant) -> Option<Instant> {
         let newest = self.newest?;
@@ -390,7 +386,7 @@ fn secs_up(d: Duration) -> u64 {
 /// The words for `s` whole seconds left; `None` past a day. Under five
 /// seconds the honest word is `<5 s left` (`5 s` beside 0.5 s left reads as a
 /// promise of five more seconds). Every form ends in `left`, which already
-/// says it is an estimate, so no `~` (design ruling 241).
+/// says it is an estimate, so no `~`.
 fn eta_words_secs(s: u64, short: bool) -> Option<String> {
     let (n, long_unit, short_unit) = if s < 5 {
         return Some(if short { "<5s left" } else { "<5 s left" }.to_string());
@@ -418,10 +414,10 @@ pub fn eta_words(remaining: Duration) -> Option<String> {
     eta_words_secs(secs_up(remaining), false)
 }
 
-/// [`eta_words`] in the slot's SHORT form ([`crate::ETA_SHORT_W`] cells):
+/// [`eta_words`] in the slot's short form ([`crate::ETA_SHORT_W`] cells):
 /// `<5s left`, `5s left` … `55s left`, `1m left` … `59m left`, `1h left` …
-/// `24h left` — the same numbers, so the words change at exactly the
-/// instants [`eta_word_change`] names for the long form.
+/// `24h left`, the same numbers, so the words change at exactly the instants
+/// [`eta_word_change`] names for the long form.
 #[must_use]
 pub(crate) fn eta_words_short(remaining: Duration) -> Option<String> {
     eta_words_secs(secs_up(remaining), true)
@@ -488,13 +484,12 @@ pub fn eta_spoken(eta: Eta) -> Option<String> {
     }
 }
 
-/// How long busy work has run, LABELLED (design ruling 241): nothing under
-/// [`ELAPSED_AFTER`], then `for 12 s` … `for 59 s`, `for 1 min` … `for 59
-/// min`, `for 1 h` … `for 999 h` — floored. Never a bare clock: `0:41` next
-/// to a time slot that later says `30 s left` reads as seconds LEFT, not
-/// gone. `short` is the
-/// slot's sacrifice form ([`crate::ELAPSED_SHORT_W`] cells): `for 12s`,
-/// `for 3m`, `for 2h` — the same numbers, changing at the same instants.
+/// How long busy work has run, labelled: nothing under [`ELAPSED_AFTER`],
+/// then `for 12 s` … `for 59 s`, `for 1 min` … `for 59 min`, `for 1 h` …
+/// `for 999 h`, floored. Never a bare clock: `0:41` beside a slot that later
+/// says `30 s left` reads as seconds left, not gone. `short` is the slot's
+/// sacrifice form ([`crate::ELAPSED_SHORT_W`] cells): `for 12s`, `for 3m`,
+/// `for 2h`, the same numbers changing at the same instants.
 #[must_use]
 pub(crate) fn elapsed_words(e: Duration, short: bool) -> Option<String> {
     (e >= ELAPSED_AFTER).then(|| ran_words(e, short))
@@ -565,27 +560,25 @@ pub fn clock_spoken(e: Duration) -> Option<String> {
     Some(format!("running for {n} {unit}{plural}"))
 }
 
-/// WHO WAITS on a piece of work — the one question that decides whether it
-/// takes an animated row (design rulings 220 and 224). A host answers it
-/// from what started the work (a press, a menu item, a typed verb, or a
-/// background loop) and passes the answer; the rule itself is here, once,
-/// for every lane and every platform.
+/// Who waits on a piece of work: the one question that decides whether it
+/// takes an animated row. A host answers it from what started the work (a
+/// press, a menu item, a typed verb, or a background loop); the rule is
+/// here, once, for every lane and platform.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Waiter {
     /// A person started it and is waiting for what it delivers.
     Person,
     /// Nobody: work the person did not ask for (a background check, a
-    /// scheduled pass). R3: "seamless, non-interrupting (ideally silent)".
+    /// scheduled pass), which stays silent.
     Nobody,
 }
 
 impl Waiter {
-    /// Whether the work takes its animated row (after the progress grace,
+    /// Whether the work takes its animated row (after
     /// [`crate::PROGRESS_GRACE`], so work that ends inside it never touches
-    /// the glass): a person's always — they asked, and the row says how long
-    /// and for what; nobody's only while it is very heavy system use that
-    /// needs explaining (design §10.6), and otherwise it is silent and its end
-    /// a record.
+    /// the glass): a person's always, since they asked; nobody's only while it
+    /// is very heavy system use that needs explaining, and otherwise it is
+    /// silent and its end a record.
     #[must_use]
     pub const fn takes_row(self, very_heavy: bool) -> bool {
         matches!(self, Self::Person) || very_heavy
@@ -602,8 +595,8 @@ impl Waiter {
 mod tests {
     use super::*;
 
-    /// WHO WAITS DECIDES THE ROW (rulings 220, 224): a person's work always
-    /// takes its row; nobody's only while it is very heavy.
+    /// Who waits decides the row: a person's work always takes its row;
+    /// nobody's only while it is very heavy.
     #[test]
     fn who_waits_decides_the_row() {
         assert!(Waiter::Person.takes_row(false));
@@ -652,14 +645,11 @@ mod tests {
         assert_eq!(t.rate_per_min(), Some(600_000_000));
     }
 
-    /// A steady rate is latched at 5 s — the first valid rate is at 3 s,
-    /// and three projections spanning STABLE_MIN agree by 5 s. A stream that
-    /// arrives in two-second BURSTS (its rate swinging between nothing and
-    /// twice its mean) does not latch while its projections disagree past the
-    /// tolerance: nothing shows until the window has averaged the bursts, and
-    /// what then shows is within 10 % of the truth. (A swing faster than the
-    /// 20 s window is averaged by the secant — which is the point of the
-    /// secant — so "never" holds only while the window still sees the swing.)
+    /// A steady rate latches at 5 s (the first valid rate is at 3 s, and three
+    /// projections spanning STABLE_MIN agree by 5 s). A stream that arrives in
+    /// two-second bursts does not latch while its projections disagree past
+    /// the tolerance: nothing shows until the window has averaged the bursts,
+    /// and what then shows is within 10 % of the truth.
     #[test]
     fn eta_latches_only_when_three_projections_agree_over_two_seconds() {
         let base = t0();
@@ -703,10 +693,10 @@ mod tests {
         );
     }
 
-    /// Between reads a latched ETA COUNTS DOWN, one for one; it never jumps
-    /// back up unless it re-anchors; and a real change of rate moves the
-    /// anchor only in the change's direction — never flapping — until it
-    /// settles on the new pace once the window holds only it.
+    /// Between reads a latched ETA counts down one for one; it never jumps
+    /// back up unless it re-anchors, and a real change of rate moves the
+    /// anchor only in the change's direction until it settles on the new
+    /// pace.
     #[test]
     fn eta_counts_down_between_reads_and_reanchors_once_on_a_real_change() {
         let base = t0();
@@ -731,7 +721,7 @@ mod tests {
         };
         assert_eq!(r0 - r1, Duration::from_millis(1500), "a countdown, 1:1");
         assert_eq!(t.next_change(now), Some(now + eta_word_change(r0).unwrap()));
-        // The rate halves: the anchor moves LATER each time it moves, never
+        // The rate halves: the anchor moves later each time it moves, never
         // back, and lands on the new pace.
         let mut anchors: Vec<Instant> = Vec::new();
         for k in 61..=400u64 {
@@ -884,8 +874,8 @@ mod tests {
         }
     }
 
-    /// Bytes that stop for STALL_AFTER read "stalled" — only once they have
-    /// moved at all, and never for a count of items.
+    /// Bytes that stop for STALL_AFTER read "stalled", only once they have
+    /// moved at all; a count stalls after its own patience.
     #[test]
     fn stalled_after_ten_seconds_of_no_bytes_and_a_counts_own_patience() {
         let base = t0();
@@ -912,9 +902,9 @@ mod tests {
                 },
             );
         }
-        // A COUNT may sit still for its own patience (ruling 265): four of
-        // its mean gaps (here 1 s each), never under the bytes' ten
-        // seconds — and then it says so.
+        // A count may sit still for its own patience: four of its mean gaps
+        // (here 1 s each), never under the bytes' ten seconds, and then it
+        // says so.
         assert_eq!(
             items.eta(at(base, 4_000 + 9_999)),
             Eta::Hidden,
@@ -947,12 +937,10 @@ mod tests {
         assert_eq!(done.next_change(base), None);
     }
 
-    /// A PHASE THAT HOLDS THE FILL IS NOT A STALL (ruling 266): the ALab
-    /// toolchain's fill advanced at 10 Hz through a download, then holds at
-    /// its program's 500‰ share through a minute of verify. Declared
-    /// [`Unit::HeldSteps`] it never reads stalled and arms no deadline; the
-    /// estimator keeps its readings across the switch; and when the phase
-    /// ends the count's patience starts over — a count that then really
+    /// A phase that holds the fill is not a stall: declared
+    /// [`Unit::HeldSteps`] it never reads stalled and arms no deadline, the
+    /// estimator keeps its readings across the switch, and when the phase
+    /// ends the count's patience starts over, so a count that then really
     /// stops still says so.
     #[test]
     fn a_held_phase_never_reads_stalled_and_its_end_restarts_the_patience() {
@@ -966,8 +954,7 @@ mod tests {
             t.observe(at(base, k * 100), steps(k * 10, Unit::Steps));
         }
         let samples = t.samples.len();
-        // Verify: the fill holds at 500‰ for a minute, atpkg's heartbeat
-        // re-feeding it every 2 s.
+        // The fill holds at 500‰ for a minute, re-fed every 2 s.
         for k in 0..=30u64 {
             let now = at(base, 5_000 + k * 2_000);
             t.observe(now, steps(500, Unit::HeldSteps));
@@ -1053,9 +1040,9 @@ mod tests {
         assert!(burst.samples_len() <= SAMPLES_CAP);
     }
 
-    /// Elapsed words (design ruling 241): nothing under ten seconds, then
-    /// `for N s`, `for N min`, `for N h` — never a bare clock — changing
-    /// exactly at each boundary, the short form at the same instants.
+    /// Elapsed words: nothing under ten seconds, then `for N s`, `for N min`,
+    /// `for N h` (never a bare clock), changing exactly at each boundary, the
+    /// short form at the same instants.
     #[test]
     fn elapsed_words_are_labelled_and_follow_their_cadence() {
         let w = |s: u64| elapsed_words(Duration::from_secs(s), false);

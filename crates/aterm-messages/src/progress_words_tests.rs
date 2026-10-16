@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Test-only: progress words (design ruling 265) — a percent row says how long is
-//! left, a count that stops says it stalled, a script's finished words read
-//! as every reporter's do, work about to end at its grace never flashes, and
-//! a withdrawn row's record reads as ended.
+//! Progress words: a percent row says how long is left, a count that stops
+//! says it stalled, a script's finished words read as every reporter's do,
+//! work about to end at its grace never flashes, and a withdrawn row's record
+//! reads as ended.
 
 use crate::animate::Look;
 use crate::center::{EchoKind, MessageCenter};
@@ -41,9 +41,8 @@ fn eta_words(c: &MessageCenter, now: Instant) -> Option<String> {
     c.motion(&p, now, Look::MOVING).rows.first()?.eta.clone()
 }
 
-/// THE OWNER'S "HOW LONG TO WAIT" FOR `pct=` (ruling 265): a script that says
-/// only its percent at a steady 5 %/s gets an ETA slot and an estimate, as a
-/// `done=` script does — the day's `Building aterm 25%` said no time at all.
+/// A script that says only its percent (`pct=`) at a steady 5 %/s gets an
+/// ETA slot and an estimate, as a `done=` script does.
 #[test]
 fn a_percent_row_says_how_long_is_left() {
     let t0 = Instant::now();
@@ -68,10 +67,9 @@ fn a_percent_row_says_how_long_is_left() {
     assert_eq!(words, "10 s left");
 }
 
-/// A COUNT THAT STOPS SAYS SO (ruling 265): a `done=` steps job that stops
-/// reporting at 11 of 40 no longer counts its estimate down to `<5 s left`
-/// at a frozen fill and then goes blank; it says `stalled` four of its own
-/// gaps (never under ten seconds) after its last step.
+/// A count that stops says so: a `done=` steps job that stops reporting at 11
+/// of 40 does not count down to `<5 s left` and go blank; it says `stalled`
+/// four of its own gaps (never under ten seconds) after its last step.
 #[test]
 fn a_count_that_stops_says_stalled_not_less_than_five_seconds() {
     let t0 = Instant::now();
@@ -112,11 +110,10 @@ fn a_count_that_stops_says_stalled_not_less_than_five_seconds() {
     );
 }
 
-/// ONE ECHO FOR EVERY REPORTER (ruling 265): `done build ok Built aterm`
-/// declares the finished words, so the echo is `✓ Built aterm` with its
-/// percent blank — as `✓ ALab tools updated` — never `✓ Built aterm 100%`;
-/// the record is `Built aterm` under ✓ Success with no in-flight frame, filed
-/// under the script's own tag.
+/// One echo for every reporter: `done build ok Built aterm` declares the
+/// finished words, so the echo is `✓ Built aterm` with its percent blank,
+/// never `✓ Built aterm 100%`; the record is `Built aterm` under ✓ Success
+/// with no in-flight frame, filed under the script's own tag.
 #[test]
 fn a_scripts_finished_words_echo_like_every_reporters() {
     let t0 = Instant::now();
@@ -153,10 +150,9 @@ fn a_scripts_finished_words_echo_like_every_reporters() {
     );
 }
 
-/// A WITHDRAWN ROW READS AS ENDED (ruling 265): `done index withdraw` on a
-/// busy `Indexing docs` is logged `Indexing ended`, its live title the first
-/// detail line, under the ℹ of its severity — never the live title that read
-/// as still running.
+/// A withdrawn row reads as ended: `done index withdraw` on a busy `Indexing
+/// docs` is logged `Indexing ended` under ℹ, its live title the first detail
+/// line.
 #[test]
 fn a_withdrawn_rows_record_reads_as_ended() {
     let t0 = Instant::now();
@@ -177,11 +173,9 @@ fn a_withdrawn_rows_record_reads_as_ended() {
     assert_eq!((rec.severity, rec.glyph.ch()), (Severity::Info, '\u{2139}'));
 }
 
-/// A SCRIPT'S OWN ENDING WORDS STAND (ruling 266): `done <key> withdraw
-/// <words>` and `done <key> warn <words>` say how the work ended, so the
-/// record keeps them — never `Indexing ended` / `Indexing stopped` over them
-/// with the script's sentence pushed into the detail. The mark still says
-/// how it ended.
+/// A script's own ending words stand: `done <key> withdraw <words>` and
+/// `done <key> warn <words>` are the record's title, never `Indexing ended` /
+/// `Indexing stopped` over them; the mark still says how it ended.
 #[test]
 fn a_scripts_own_ending_words_are_its_record() {
     let t0 = Instant::now();
@@ -213,7 +207,7 @@ fn a_scripts_own_ending_words_are_its_record() {
         assert!(rec.detail.is_empty(), "{rec:?}");
         assert_eq!(rec.severity, sev, "{rec:?}");
     }
-    // Without words the table still speaks (ruling 265).
+    // Without words the table still speaks.
     notice(
         &mut c,
         &mut g,
@@ -258,11 +252,10 @@ fn restate(c: &mut MessageCenter, id: crate::model::MessageId, done: u64, total:
     );
 }
 
-/// NO FLASH AT THE GRACE'S END (ruling 265): a row whose work projects to
-/// end within REVEAL_MIN_LEFT when its grace runs out is held back and, when
-/// the work does end, never reaches the glass — no row for under a second,
-/// no echo. A projection that keeps promising and is wrong still reaches the
-/// glass by the cap.
+/// No flash at the grace's end: a row whose work projects to end within
+/// REVEAL_MIN_LEFT when its grace runs out is held back and, if the work then
+/// ends, never reaches the glass (no row, no echo). A projection that keeps
+/// promising and is wrong still reaches the glass by the cap.
 #[test]
 fn work_about_to_end_at_its_grace_never_flashes() {
     let t0 = Instant::now();
@@ -304,10 +297,9 @@ fn work_about_to_end_at_its_grace_never_flashes() {
     assert!(c.on_glass().next().is_some(), "revealed by the cap");
 }
 
-/// The session wait holds its row back the same way (ruling 265): a rewrap
-/// the person asks after at 2.9 s, three quarters done, would show for under
-/// a second — it is not posted, it is sampled at the row's pace, and it ends
-/// silently; one asked early with most of it ahead is posted at once.
+/// The session wait holds its row back the same way: a rewrap asked after at
+/// 2.9 s, three quarters done, is not posted, is sampled at the row's pace
+/// and ends silently; one asked early with most of it ahead is posted at once.
 #[test]
 fn a_session_wait_about_to_end_is_not_posted() {
     let sample = |done: u64, ms_: u64, end| WaitSample {

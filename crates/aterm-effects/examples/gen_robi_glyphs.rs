@@ -6,12 +6,11 @@
 //! Reads every pose asset TOML under `crates/aterm-effects/art/robi/` and writes
 //! `crates/aterm-effects/src/robi_glyphs_gen.rs`. Run it after touching any pose;
 //! the `robi_glyphs_gen_matches_assets` drift test fails until the checked-in
-//! file matches. The cat twin of this generator is `gen_cat_glyphs`, the pet twin
-//! `gen_pet_glyphs` — same parser, separate rosters (the robot poses must never
-//! land in the collectible `GLYPHS` table).
+//! file matches. Same parser as `gen_cat_glyphs`, separate roster: the robot poses
+//! must never land in the collectible `GLYPHS` table.
 //!
 //! ```text
-//! cargo run -p aterm-effects --example gen_robi_glyphs
+//! targo --unverified run -p aterm-effects --example gen_robi_glyphs
 //! ```
 
 use std::path::Path;

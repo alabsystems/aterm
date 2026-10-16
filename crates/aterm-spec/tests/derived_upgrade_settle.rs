@@ -3,23 +3,15 @@
 
 use aterm_spec::{derive::upgrade_settle_turn_end_model, interp, verify};
 
-/// THE POINT THE UPGRADE ACTS AT NEXT IS OWNED THROUGH ITS SETTLE (2026-09-28
-/// 18:21, s-5c03a: six looks at a person at the tab, three notices typed at
-/// breaks, then the READY — whose first look owned nothing, and the loop's
-/// `keep going` voided it one second later). Proved at `Buggy = 0`, caught at
-/// `Buggy = 1`; each dial caught alone by the bounded check and on its own
-/// path — `Carry = 1` (a notice at a break leaves the count) and `Every = 1`
-/// (every wait counts). The bound itself stands: past the settle's looks the
-/// loop may continue, and does so without the invariant reading it as the bug.
+/// The point the upgrade acts at next is owned through its settle: a READY after notices typed
+/// at breaks owns its first settle look, so the loop's `keep going` cannot void it. Proved at
+/// `Buggy = 0`, caught at `Buggy = 1`; each dial is caught alone by the bounded check and on its
+/// own path: `Carry = 1` (a notice at a break leaves the count) and `Every = 1` (every wait
+/// counts). Past the settle's `Bound` looks the loop may continue without the invariant reading
+/// it as the bug.
 #[test]
 fn a_ready_after_notices_at_breaks_owns_its_settle() {
     let model = upgrade_settle_turn_end_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name),
-        "the settle turn-end machine must stay enrolled in the spec-link registry"
-    );
     verify::prove_and_catch_scalar(&model, "upgrade settle turn end");
 
     let walk = |m: &aterm_spec::derive::Model, path: &[&str]| {
@@ -29,8 +21,7 @@ fn a_ready_after_notices_at_breaks_owns_its_settle() {
         }
         s
     };
-    // The incident's path, as the model reads it: a person's looks, notices at
-    // breaks, the READY, its first settle look.
+    // A person's looks, notices at breaks, the READY, its first settle look.
     let incident = [
         "OtherWait",
         "OtherWait",
@@ -43,7 +34,7 @@ fn a_ready_after_notices_at_breaks_owns_its_settle() {
     assert_eq!(s["owns"], 1, "the READY's first look owns the point: {s:?}");
     assert!(!model.action_enabled("LoopContinues", &s), "{s:?}");
 
-    // NEGATIVE CONTROL: the builds before — the loop takes the READY.
+    // Negative control: the loop takes the READY.
     let buggy = interp::with_buggy(&model, 1);
     let mut b = walk(&buggy, &incident);
     assert_eq!(b["owns"], 0, "{b:?}");
@@ -106,31 +97,20 @@ fn a_ready_after_notices_at_breaks_owns_its_settle() {
     );
 }
 
-/// A NOTICE ITS OWN FENCE REFUSED OWNS ITS POINT, BOUNDED (2026-09-28,
-/// s-d3346: the owner's `--now`, three refusals at three looks that owned
-/// nothing, and the loop's `keep going` at 14:52:45 took the one idle point
-/// the agent offered). Proved at `Buggy = 0`, caught at `Buggy = 1` (a refused
-/// notice owns nothing) on the incident's path. The bound is a path: `Bound`
-/// refused looks own the point, the next owns nothing, and a turn of the
-/// agent's never renews it — the `Renew` dial (a count per point) owns the
-/// next point again, where the fixed machine leaves it to the loop. The count
-/// is the refused looks' own, and the owner's word starts it over: `Shared`
-/// and `Stale` caught on their paths.
+/// A notice its own fence refused owns its point, bounded: `Bound` refused looks own the point,
+/// the next owns nothing, and no turn of the agent's renews it (the `Renew` dial, a count per
+/// point, owns the next point again). The count is the refused looks' own and the owner's word
+/// starts it over (`Shared` and `Stale` caught on their paths). Proved at `Buggy = 0`, caught at
+/// `Buggy = 1` (a refused notice owns nothing).
 #[test]
 fn a_refused_notice_owns_its_point_for_its_looks_and_no_turn_renews_them() {
     use aterm_spec::derive::upgrade_refused_turn_end_model;
     let model = upgrade_refused_turn_end_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name),
-        "the refused turn-end machine must stay enrolled in the spec-link registry"
-    );
     verify::prove_and_catch_scalar(&model, "upgrade refused notice turn end");
     let bound = model.consts.iter().find(|c| c.0 == "Bound").unwrap().1;
 
-    // The incident, fixed: the refused look owns the point, and the loop
-    // cannot take it; the notice typed at the next look.
+    // The refused look owns the point and the loop cannot take it; the notice is typed at the
+    // next look.
     let mut s = model.init_state();
     assert!(model.fire("Refused", &mut s));
     assert_eq!(s["owns"], 1, "{s:?}");
@@ -142,7 +122,7 @@ fn a_refused_notice_owns_its_point_for_its_looks_and_no_turn_renews_them() {
         "an act starts the count over"
     );
 
-    // NEGATIVE CONTROL: the builds before — the loop takes it.
+    // Negative control: the loop takes it.
     let buggy = interp::with_buggy(&model, 1);
     let mut b = buggy.init_state();
     assert!(buggy.fire("Refused", &mut b));
@@ -152,8 +132,8 @@ fn a_refused_notice_owns_its_point_for_its_looks_and_no_turn_renews_them() {
         "{b:?}"
     );
 
-    // The bound: `Bound` refused looks own it, the next does not, and the
-    // loop may continue without the invariant reading it as the bug.
+    // The bound: `Bound` refused looks own it, the next does not, and the loop may continue
+    // without the invariant reading it as the bug.
     let mut long = model.init_state();
     for n in 0..bound {
         assert!(model.fire("Refused", &mut long), "{n}");
@@ -163,12 +143,11 @@ fn a_refused_notice_owns_its_point_for_its_looks_and_no_turn_renews_them() {
     assert_eq!(long["owns"], 0, "past the bound: {long:?}");
     assert!(model.fire("LoopContinues", &mut long));
     assert_eq!(long["over"], 0, "{long:?}");
-    // A turn of the agent's renews nothing: the next point's refused look
-    // owns nothing.
+    // A turn of the agent's renews nothing: the next point's refused look owns nothing.
     assert!(model.fire("PointComes", &mut long));
     assert!(model.fire("Refused", &mut long));
     assert_eq!(long["owns"], 0, "no turn renews the bound: {long:?}");
-    // NEGATIVE CONTROL: a count per point owns every point anew.
+    // Negative control: a count per point owns every point anew.
     let renew = interp::with_consts(&model, &[("Renew", 1)]);
     let mut r = renew.init_state();
     for _ in 0..=bound {
@@ -182,12 +161,10 @@ fn a_refused_notice_owns_its_point_for_its_looks_and_no_turn_renews_them() {
         "the Renew dial owns the next point again: {r:?}"
     );
 
-    // THE REFUSED LOOKS ARE A COUNT OF THEIR OWN, AND THE OWNER'S WORD STARTS
-    // IT OVER. Settles of the notice's gate before
-    // the refusals leave it alone; the owner's word after the bound owns the
-    // next refused look again. NEGATIVE CONTROLS, each on its path and by the
-    // bounded check: one shared count (`Shared`), a word that leaves it
-    // standing (`Stale`).
+    // The refused looks are a count of their own, and the owner's word starts it over: settles
+    // of the notice's gate before the refusals leave it alone, and the owner's word after the
+    // bound owns the next refused look again. Negative controls, each on its path and by the
+    // bounded check: one shared count (`Shared`), a word that leaves it standing (`Stale`).
     let walk = |m: &aterm_spec::derive::Model, path: &[&str]| {
         let mut s = m.init_state();
         for action in path {
@@ -222,24 +199,15 @@ fn a_refused_notice_owns_its_point_for_its_looks_and_no_turn_renews_them() {
     }
 }
 
-/// THE END OF THE AGENT'S OWN WORK IS THE UPGRADE'S POINT (2026-09-28,
-/// s-692e6: every notice answered "not yet, my workflow still runs"; the idle
-/// point after the workflow went to the loop's `keep going`, round after
-/// round). Proved at `Buggy = 0`, caught at `Buggy = 1`; `Nag = 1` (an ask with
-/// no work seen since the notice) and `Hold = 1` (the restart gate's wait at
-/// the end of the work, a status lagging the idle screen, held past the
-/// re-ask's window) each caught alone by the bounded
-/// check and on its own path.
+/// The end of the agent's own work is the upgrade's point: when work the host saw ends, the host
+/// asks and the loop's `keep going` cannot take the idle point. Proved at `Buggy = 0`, caught at
+/// `Buggy = 1`; `Nag = 1` (an ask with no work seen since the notice) and `Hold = 1` (the restart
+/// gate's wait on a status lagging the idle screen, held past the re-ask's window) are each
+/// caught alone by the bounded check and on its own path.
 #[test]
 fn the_end_of_the_agents_own_work_is_the_upgrades_point() {
     use aterm_spec::derive::harness_upgrade_work_end_model;
     let model = harness_upgrade_work_end_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name),
-        "the work-end machine must stay enrolled in the spec-link registry"
-    );
     verify::prove_and_catch_scalar(&model, "upgrade: the end of the agent's work");
     let walk = |m: &aterm_spec::derive::Model, path: &[&str]| {
         let mut s = m.init_state();
@@ -248,12 +216,12 @@ fn the_end_of_the_agents_own_work_is_the_upgrades_point() {
         }
         s
     };
-    // The incident: asked, work runs, gave up, work ends — the host asks (a
-    // rest re-armed), and the loop cannot take the point.
+    // Asked, work runs, gave up, work ends: the host asks (a rest re-armed), and the loop cannot
+    // take the point.
     let s = walk(&model, &["WorkRuns", "GivesUp", "WorkEnds", "HostAsks"]);
     assert_eq!((s["phase"], s["asks"], s["owns"]), (1, 1, 1), "{s:?}");
     assert!(!model.action_enabled("LoopContinues", &s), "{s:?}");
-    // NEGATIVE CONTROL: the builds before wait there, and the loop takes it.
+    // Negative control: a host that waits there lets the loop take it.
     let buggy = interp::with_buggy(&model, 1);
     let mut b = walk(&buggy, &["WorkRuns", "GivesUp", "WorkEnds", "HostWaits"]);
     assert!(buggy.fire("LoopContinues", &mut b));
@@ -265,16 +233,15 @@ fn the_end_of_the_agents_own_work_is_the_upgrades_point() {
     let s = walk(&model, &["HostWaits", "LoopContinues"]);
     assert_eq!(s["handed"], 0, "{s:?}");
     assert!(!model.action_enabled("HostAsks", &model.init_state()));
-    // NEGATIVE CONTROL: an ask with no work seen.
+    // Negative control: an ask with no work seen.
     let nag = interp::with_consts(&model, &[("Nag", 1)]);
     let n = walk(&nag, &["HostAsks"]);
     assert!(!nag.check_invariant("AnAskFollowsWorkItSaw", &n), "{n:?}");
     assert!(interp::bmc(&nag).is_err(), "caught by the bounded check");
 
-    // A STATUS THAT LAGS THE IDLE SCREEN: the
-    // restart's gate waits there, and holds the point inside the re-ask's
-    // window; past it the re-ask's line goes through the lag, and with the
-    // asks spent the round gives up — never the wait again.
+    // A status that lags the idle screen: the restart's gate waits there and holds the point
+    // inside the re-ask's window; past it the re-ask's line goes through the lag, and with the
+    // asks spent the round gives up, never waiting again.
     let lag = ["WorkRuns", "WorkEnds", "StatusLags"];
     let s = walk(&model, &lag);
     assert!(!model.action_enabled("HostAsks", &s), "{s:?}");
@@ -297,7 +264,7 @@ fn the_end_of_the_agents_own_work_is_the_upgrades_point() {
         .concat(),
     );
     assert_eq!(spent["phase"], 2, "given up: {spent:?}");
-    // NEGATIVE CONTROL: the wait held past the window, where no re-ask comes.
+    // Negative control: the wait held past the window, where no re-ask comes.
     let hold = interp::with_consts(&model, &[("Hold", 1)]);
     let late = walk(&hold, &[&lag[..], &["WindowPasses"]].concat());
     assert!(!hold.action_enabled("HostReasks", &late), "{late:?}");

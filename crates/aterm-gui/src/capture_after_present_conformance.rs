@@ -1,11 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance for native screenshot present ordering.
-//!
-//! The shipping pure decision is exhausted over every reachable one-based attempt
-//! and both present outcomes. The complete bounded production loop is also driven
-//! over its outcome lattice and projected action-by-action onto the derived model.
+//! Tier-1 conformance for native screenshot present ordering: the pure decision is exhausted
+//! over every reachable attempt and both present outcomes, and the bounded production loop is
+//! driven over its outcome lattice and projected step by step onto the derived model.
 
 use crate::{
     CaptureAfterPresentDecision, NATIVE_CAPTURE_PRESENT_ATTEMPT_LIMIT,
@@ -63,8 +61,8 @@ fn shipping_decision(input: Inputs) -> CaptureAfterPresentDecision {
     )
 }
 
-/// Historical mutant: a dropped present falls through to compositor capture,
-/// returning the pixels from before the native control mutation.
+/// Negative control: a dropped present falls through to compositor capture, returning the
+/// pixels from before the native control mutation.
 fn stale_capture_mutant(_input: Inputs) -> CaptureAfterPresentDecision {
     CaptureAfterPresentDecision::Capture
 }

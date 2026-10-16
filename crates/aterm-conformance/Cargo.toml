@@ -7,28 +7,41 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "aterm VT conformance + integration tests, founded on the engine read API (feed -> read screen -> assert). The screen-reading oracle IS the introspection API."
+description = "aterm VT conformance tests (feed -> read screen -> assert, the engine read API as the oracle), and the MEASURE instruments that pixel-check and spin-check a release binary."
 # Every tests/*.rs is either a `mod` of the `vt` suite (tests/vt.rs) or one of
 # the explicit [[test]] targets below; with autotests off, a file that is
 # neither silently never compiles.
 autotests = false
 
 [dependencies]
-# Enable the `sixel` feature so the conformance binary compiles the decode +
-# inline-image placement path AND advertises DA1 code 4. This flips the whole
-# crate to the rendering path: the sixel locks below assert ACTUAL rendering
-# (cursor moves in scrolling mode, image is observable), not consume-only.
+# `sixel` compiles the decode + inline-image placement path and advertises DA1
+# code 4, so the sixel tests assert real rendering, not consume-only.
 aterm-core = { workspace = true, features = ["sixel"] }
+# The paint scanner decodes captured frames with the workspace's one PNG
+# decoder, and reads a recording's index.json with its one JSON parser.
+aterm-png = { workspace = true }
+aterm-json = { workspace = true }
+
+# The measuring drivers: a headless instance launched without inherited
+# descriptors and on a lifeline, and the stand-in TUI's raw terminal.
+[target.'cfg(unix)'.dependencies]
+aterm-uds = { workspace = true }
+libc = { workspace = true }
+# The scratch world each take runs in, made exclusively under /tmp.
+aterm-tempfile = { workspace = true }
 
 [dev-dependencies]
 aterm-types = { workspace = true }
+# Scratch directories for the scanner's end-to-end PNG test.
+aterm-tempfile = { workspace = true }
 
 [lints]
 workspace = true
 
-[lib]
-# No unit tests live in src/, so this lib's libtest harness ran 0 tests in every
-# gate while still being linked and executed. Doctests are a separate switch.
+# The stand-in TUI the paint and spin scenes type into (dev-only, never shipped).
+[[bin]]
+name = "fake-tui"
+path = "src/bin/fake-tui.rs"
 test = false
 
 # The engine-read conformance files, one binary: pure feed -> read -> assert
@@ -37,15 +50,13 @@ test = false
 name = "vt"
 path = "tests/vt.rs"
 
-# Isolated: launches the RELEASE binary headless and pixel-checks timed takes
-# behind its own serial lock; the MEASURE tier's `measuring tests` stage
-# (tools/verify.sh --measure <APP>) runs it.
+# The paint rows: ignored by default, run with `-- --ignored` and the release
+# binary in ATERM_PAINT_BIN; each takes its turn on a process-wide lock.
 [[test]]
 name = "paint"
 path = "tests/paint.rs"
 
-# Isolated: measures an idle instance's event loop over a timed window;
-# the MEASURE tier's `measuring tests` stage runs it.
+# The spin rows: as `paint`, with ATERM_SPIN_BIN (or ATERM_PAINT_BIN).
 [[test]]
 name = "spin"
 path = "tests/spin.rs"

@@ -425,8 +425,10 @@ impl ConfigFamily {
             Self::CursorTrail => "Cursor trail applied".to_string(),
             Self::Fonts if one => "Font applied".to_string(),
             Self::Fonts => format!("{n} fonts applied"),
-            Self::Assets if one => "Image loaded".to_string(),
-            Self::Assets => format!("{n} images loaded"),
+            // A fixed image row may have been fixed by detaching it, not by a
+            // decode that worked, so the words hold either way.
+            Self::Assets if one => "Image problem fixed".to_string(),
+            Self::Assets => format!("{n} image problems fixed"),
             Self::SecureKeyboard => "Secure Keyboard Entry changed".to_string(),
             Self::Restart | Self::RetiredKeys => return None,
         })
@@ -580,7 +582,15 @@ fn unknown_key_excerpt(sentence: &str) -> Option<String> {
 /// behind Details, where the sentence is kept whole. `None` for a sentence in
 /// another shape.
 fn font_excerpt(sentence: &str) -> Option<String> {
-    let (head, _) = sentence.split_once(" is not an admissible font")?;
+    // The font catalog's own sentences: `font_family: "X" does not resolve
+    // to a font file; …` and `emoji_font "X" was not admitted`.
+    let head = [
+        " is not an admissible font",
+        " does not resolve to a font file",
+        " was not admitted",
+    ]
+    .into_iter()
+    .find_map(|tail| sentence.split_once(tail).map(|(head, _)| head))?;
     let (_, quoted) = head.split_once('"')?;
     let name = quoted
         .rsplit_once('"')
@@ -1326,9 +1336,11 @@ pub(crate) const KEY_RESTORED_AGENTS: &str = "harness.restored";
 pub(crate) const KEY_HARNESS_NO_SOCKET: &str = "harness.no-socket";
 
 /// What a window with no control socket cannot do, the clause
-/// [`harness_without_socket`] puts after every cause.
+/// [`harness_without_socket`] puts after every cause. It names no agent: it
+/// holds for every one the harness supervises, as the master switch's row
+/// ("Supervise coding agents") does.
 pub(crate) const HARNESS_BOXES_UNANSWERED: &str =
-    "aterm cannot answer Claude Code's or Codex's permission boxes here";
+    "aterm cannot answer its coding agents' permission boxes here";
 
 /// The fix for a launch that found no folder for its control socket: the
 /// variables `aterm_uds::control_socket_dir` reads, or the flag that names a
@@ -1353,8 +1365,8 @@ pub(crate) const SOCKET_DIR_UNUSABLE_FIX: &str =
 pub(crate) const SOCKET_DIR_UNUSABLE_FIX: &str =
     "set TMP to a folder you own, or pass --control-sock <path>";
 
-/// The window's `[harness]` policy would supervise its Claude Code and Codex
-/// sessions, but it has no control socket — the one interface the
+/// The window's `[harness]` policy would supervise its agent sessions, but
+/// it has no control socket — the one interface the
 /// supervisor's workers speak — so nothing answers their permission boxes.
 /// `cause` is why the launch has none (`launched with the control socket
 /// off`), said with [`HARNESS_BOXES_UNANSWERED`] on the first line; `fix`,
@@ -1664,13 +1676,39 @@ pub(crate) fn presence_not_saved(
     .key(format!("fabric.presence-save.{leaf}").as_str())
 }
 
+/// A theme chosen in the command palette (Enter on a Theme row, View ▸
+/// Choose Theme…) did not reach aterm.toml: the write was refused, conflicted
+/// with a hand edit, or could not be confirmed. The preview it left standing
+/// has reverted to the configured theme, so the screen already shows the
+/// truth; this says why.
+pub(crate) fn theme_not_saved(label: &str, detail: &str, indeterminate: bool) -> Message {
+    let (severity, title) = if indeterminate {
+        (Severity::Warn, "Couldn't confirm the theme was saved")
+    } else {
+        (Severity::Error, "Couldn't save the theme")
+    };
+    gesture_failure(
+        tags::CONFIG,
+        severity,
+        title,
+        &format!("{label}: {detail}"),
+        Then::step("Choose the theme again"),
+    )
+    .key("config.theme-save")
+}
+
 /// R10 — the person's Hold press met a standing FLEET hold (`HOLD_DENIED`,
 /// which the bridge lifts, not this window). Pressing Hold (`on`) asked for
 /// what already is — the session is held — so that is a RECORD (`Session
 /// already held`); pressing Release failed, a gesture failure the person sees
-/// (`Hold not lifted`). Titled with the outcome, not a state (review
+/// (`Couldn't release the hold`). Titled with the outcome, not a state (review
 /// 2026-09-24).
-pub(crate) fn fleet_hold(on: bool) -> Message {
+///
+/// `reason` is the standing hold's, and it picks the step: a person's halt is
+/// withdrawn by that person's own command, while the hold a lost bridge left
+/// ([`crate::fabric::FABRIC_LOST`]) lifts when a bridge reconnects, so the
+/// step is the command that says why none has.
+pub(crate) fn fleet_hold(on: bool, reason: &str) -> Message {
     const WHY: &str = "the fleet holds it";
     if on {
         Message::new(tags::FABRIC, Severity::Info, "Session already held")
@@ -1678,12 +1716,17 @@ pub(crate) fn fleet_hold(on: bool) -> Message {
             .record()
             .key(KEY_FABRIC_HOLD)
     } else {
+        let step = if reason == crate::fabric::FABRIC_LOST {
+            "Run `aterm fabric doctor` to see why the bridge is down"
+        } else {
+            "Run `aterm fabric halt --cap-file <their cap> off` as the person who set it"
+        };
         gesture_failure(
             tags::FABRIC,
             Severity::Warn,
             "Couldn't release the hold",
             WHY,
-            Then::step("Lift the hold from the fleet"),
+            Then::step(step),
         )
         .key(KEY_FABRIC_HOLD)
     }
@@ -2067,9 +2110,9 @@ pub(crate) const NO_CONNECTION: &str = "this tab has no connection";
 const SPLIT_FAILED: &str = "Couldn't split the pane";
 
 /// R14 — keystrokes typed while a seamless update finished overflowed the
-/// pre-Commit queue and were dropped: the person typed them, so they hear it
-/// — and `detail[0]` says what to do, as an instruction, not a clause.
-#[cfg(any(unix, test))]
+/// pre-Commit queue and were dropped, or were typed for a new tab that never
+/// started (`tab_spawn`): the person typed them, so they hear it — and
+/// `detail[0]` says what to do, as an instruction, not a clause.
 pub(crate) fn keystrokes_dropped(dropped: u32) -> Message {
     let what = if dropped == 1 {
         "retype the last key".to_string()
@@ -2392,6 +2435,11 @@ pub(crate) const KEY_FOLDER_NOT_FOUND: &str = "spawn.folder-not-found";
 /// because their folder could not be entered ([`folder_row`]).
 pub(crate) const KEY_FOLDER_NOT_OPENED: &str = "spawn.folder-not-opened";
 
+/// The supersede key of the row that says shells started in the home folder
+/// because their folder, on a volume that is not local, did not answer
+/// ([`folder_row`]).
+pub(crate) const KEY_FOLDER_NOT_ANSWERING: &str = "spawn.folder-not-answering";
+
 /// The most folders [`folder_row`] names one per line; the rest are counted
 /// on the line after them.
 const FOLDERS_NAMED: usize = DETAIL_LINES_CAP - 2;
@@ -2407,11 +2455,13 @@ pub(crate) const fn folder_row_key(fault: crate::spawn_folder::Fault) -> &'stati
     match fault {
         crate::spawn_folder::Fault::Missing => KEY_FOLDER_NOT_FOUND,
         crate::spawn_folder::Fault::Shut => KEY_FOLDER_NOT_OPENED,
+        crate::spawn_folder::Fault::Unresponsive => KEY_FOLDER_NOT_ANSWERING,
     }
 }
 
 /// Fresh shells started in the home folder because the folder each was asked
-/// to start in was not there, or could not be entered — a restored pane's
+/// to start in was not there, could not be entered, or did not answer from a
+/// volume that is not local (`Couldn't reach`) — a restored pane's
 /// saved folder, the one a New Tab inherited, a profile's (audit #7 finding
 /// 48; [`crate::spawn_folder`]). ONE row per fault for every such folder while
 /// it is up (`App::fold_folder_faults`, keyed [`folder_row_key`]). A failure
@@ -2428,6 +2478,7 @@ pub(crate) fn folder_row(
     let verb = match fault {
         crate::spawn_folder::Fault::Missing => "find",
         crate::spawn_folder::Fault::Shut => "open",
+        crate::spawn_folder::Fault::Unresponsive => "reach",
     };
     let total = named.dirs.len() + named.unnamed;
     let msg = match named.dirs.as_slice() {
@@ -2691,6 +2742,110 @@ fn tab_led(place: &str, text: &str) -> String {
     }
 }
 
+/// What the record of a held tab says of the agent it ran
+/// ([`restored_agent_held`]).
+pub(crate) struct HeldAgent<'a> {
+    /// The agent as a person names it (`restore::AgentRestore::name`), read
+    /// only where [`Self::stopped_by_hold`]: a relaunch was owed, so its lane
+    /// is known.
+    pub(crate) name: &'static str,
+    /// The line that resumes it on its conversation in the tab
+    /// (`restore::AgentRestore::resume_line`), when one can be said.
+    pub(crate) resume: Option<&'a str>,
+    /// The cold restore would have relaunched it but for the hold (a host
+    /// that relaunches restored agents, and a conversation to resume): the
+    /// hold is said as the reason only then.
+    pub(crate) stopped_by_hold: bool,
+    /// The fleet's hold stood alone, which a new aterm does not put back on
+    /// a fresh shell; else the owner's came back (beside a fleet's or not).
+    pub(crate) fleet: bool,
+}
+
+/// LC-8 (ATERM-KI-1015-1), RULING 23 OF THE ROBUSTNESS HANDOFF: THE AGENT OF
+/// A TAB THAT WAS HELD WHEN ATERM ENDED IS NOT RELAUNCHED. The tab reopened
+/// at its shell (`place`, its session `sid`). Where the hold is what kept its
+/// agent down ([`HeldAgent::stopped_by_hold`]) the record says so, with the
+/// line that resumes it — the person's to type — and whose hold it was; else
+/// (the harness off: nothing would have relaunched it) it says only that the
+/// owner's hold came back, and a fleet's tab says nothing (`None`). The lift
+/// it names is the Owner's `hold <sid> off`, whose session is its argument (a
+/// selector is refused), and the Fabric menu's Lift Hold. A
+/// `harness`-tagged RECORD: the person held the tab themselves and nothing is
+/// asked of them — the reopened row (`journal_reopened_message`) already
+/// counts the agent as not come back. Keyed per tab.
+pub(crate) fn restored_agent_held(
+    sid: &str,
+    place: &str,
+    agent: &HeldAgent<'_>,
+) -> Option<Message> {
+    let line =
+        |text: &str| atpkg::progress::sanitize_for_tty(text, aterm_messages::DETAIL_LINE_CAP);
+    // The Owner's lift: `hold` takes its session as the argument.
+    let lift = |lead: &str| {
+        format!(
+            "{lead} with the Fabric menu's Lift Hold, or aterm ctl hold {sid} off, when drivers \
+             may type there again"
+        )
+    };
+    let message = if agent.stopped_by_hold {
+        let name = agent.name;
+        let message = Message::new(
+            tags::HARNESS,
+            Severity::Info,
+            atpkg::progress::sanitize_for_tty(
+                &tab_led(
+                    place,
+                    &format!(
+                        "{name} was not restarted because the tab was held when aterm stopped"
+                    ),
+                ),
+                200,
+            ),
+        );
+        // The line alone on its row, never cut: a cut command would run
+        // something nobody said.
+        let message = match agent
+            .resume
+            .filter(|resume| resume.chars().count() <= aterm_messages::DETAIL_LINE_CAP)
+        {
+            Some(resume) => message
+                .line("To pick its conversation up, type in the tab:")
+                .line(line(resume)),
+            None => message.line(line(&format!(
+                "To pick its conversation up, start {} there again",
+                match name {
+                    "Claude" => "Claude Code",
+                    other => other,
+                }
+            ))),
+        };
+        message.line(line(&if agent.fleet {
+            "The fleet's hold did not carry over: a fleet hold lasts as long as the aterm that \
+             took it"
+                .to_string()
+        } else {
+            lift("Your hold came back on the tab: lift it")
+        }))
+    } else if agent.fleet {
+        return None;
+    } else {
+        Message::new(
+            tags::HARNESS,
+            Severity::Info,
+            atpkg::progress::sanitize_for_tty(
+                &tab_led(place, "your hold on the tab came back after aterm stopped"),
+                200,
+            ),
+        )
+        .line(line(&lift("Lift it")))
+    };
+    Some(
+        message
+            .record()
+            .key(format!("harness.restored-held.{sid}").as_str()),
+    )
+}
+
 /// A SESSION SUPERVISOR'S INFORMATION (`aterm_agent::supervise::IdleHost::
 /// inform`, from the window's own supervise loop for session `sid`): a
 /// `harness`-tagged RECORD, never a row — nothing is asked of the person.
@@ -2712,6 +2867,55 @@ pub(crate) fn supervisor_note(sid: &str, place: &str, text: &str) -> Message {
     .key(format!("harness.supervisor.{sid}").as_str())
 }
 
+/// A SESSION'S AUTOPILOT, SET FROM THE WINDOW (the chip, Settings ▸ Harness:
+/// `App::set_session_autopilot`; `docs/DESIGN-harness-autopilot-2026-10-15.md`
+/// §2): a `harness`-tagged RECORD, never a row — the person set it, so nothing
+/// is asked of them — titled with the mode the session now runs under
+/// (`view`, its effective one), its first line led by the tab it is about
+/// and saying what that mode does, its second whether the mode is the
+/// session's own word (`own`) or the table's default it was handed back to.
+/// Keyed per session: the next one replaces it.
+pub(crate) fn autopilot_set(
+    sid: &str,
+    place: &str,
+    view: crate::autopilot::AutopilotView,
+    own: bool,
+) -> Message {
+    use crate::autopilot::AutopilotView;
+    let (title, what) = match view {
+        AutopilotView::Cruise => (
+            "Autopilot set to cruise",
+            "the harness keeps the work moving",
+        ),
+        AutopilotView::Land => (
+            "Autopilot set to land",
+            "the harness wraps the work up, then stops",
+        ),
+        AutopilotView::Off => ("Autopilot set to off", "the harness keeps its hands off"),
+        AutopilotView::MasterOff => (
+            "Autopilot set, harness off",
+            "the harness is off in Settings, so nothing is supervised",
+        ),
+        AutopilotView::Unhosted => (
+            "Autopilot set, harness off",
+            "this aterm has no control socket, so nothing is supervised",
+        ),
+    };
+    let whose = if own {
+        "this session's own setting"
+    } else {
+        "back to the default, [harness] autopilot"
+    };
+    Message::new(tags::HARNESS, Severity::Info, title)
+        .line(atpkg::progress::sanitize_for_tty(
+            &tab_led(place, what),
+            aterm_messages::DETAIL_LINE_CAP,
+        ))
+        .line(whose)
+        .record()
+        .key(format!("harness.autopilot.{sid}").as_str())
+}
+
 /// A SESSION SUPERVISOR'S WARNING (`aterm_agent::supervise::IdleHost::warn`,
 /// from the window's own supervise loop for session `sid`): a warning ROW on
 /// the band — something the person may want to act on, nothing asked of
@@ -2719,20 +2923,28 @@ pub(crate) fn supervisor_note(sid: &str, place: &str, text: &str) -> Message {
 /// direction 2026-09-29: past the ceiling is a warning, not a restart), and
 /// again whenever what it says comes next changes (the Mac falling into
 /// trouble or recovering, another agent now the larger): its text names the
-/// footprint, the Mac's state and the tab's own `claude --resume <id>`, kept
-/// whole in the detail. Keyed per session: the next one replaces it, so the
-/// row never says `a warning only` while aterm restarts the agent; it leaves
-/// on the severity's hold.
+/// footprint, the Mac's state and the tab's own resume line (`claude --resume
+/// <id>`, `codex resume <thread>`), kept whole on one detail line: the
+/// detail is judged as the row lays it out (400 characters, split into
+/// lines at its joints), and a line that would be cut or split steps down
+/// whole, else is named not at all
+/// ([`aterm_agent::supervise::memory::never_cut`]). Keyed per session: the
+/// next one replaces it, so the row never says `a warning only` while aterm
+/// restarts the agent; it leaves on the severity's hold.
 pub(crate) fn supervisor_warning(sid: &str, place: &str, text: &str) -> Message {
+    let detail = aterm_agent::supervise::memory::never_cut(text, |text| {
+        aterm_messages::text::split_sentence(
+            &atpkg::progress::sanitize_for_tty(&tab_led(place, text), 400),
+            aterm_messages::DETAIL_LINE_CAP,
+        )
+        .join("\n")
+    });
     Message::new(
         tags::HARNESS,
         Severity::Warn,
         "Agent memory past its ceiling",
     )
-    .sentence(atpkg::progress::sanitize_for_tty(
-        &tab_led(place, text),
-        400,
-    ))
+    .lines(detail.lines().map(str::to_string))
     .key(format!("harness.memory.{sid}").as_str())
 }
 
@@ -3174,16 +3386,21 @@ pub(crate) fn agent_upgrade_stalled(
         Some(Remedy::Waits) if row.wait == aterm_agent::harness::upgrade::NEXT_POINT => {
             (skip.clone(), "--skip")
         }
-        // ITS AGENT NOT IN FRONT IN ITS TAB, OR THE TAB UNDER ANOTHER
-        // SUPERVISOR'S CLAIM (`Row::aside`, the review of 2026-09-30): no
-        // worker of aterm's runs there, so none of its steps or looks comes;
-        // what moves it is the hand that holds it.
+        // ITS AGENT NOT IN FRONT IN ITS TAB, THE TAB UNDER ANOTHER
+        // SUPERVISOR'S CLAIM (`Row::aside`, the review of 2026-09-30), OR ITS
+        // AUTOPILOT OFF (the review of a295792e4): no worker of aterm's runs
+        // there, so none of its steps or looks comes; what moves it is the
+        // hand that holds it.
         Some(Remedy::Waits) if row.wait == aterm_agent::harness::upgrade_drive::NOT_FOREGROUND => (
             format!("it moves once it is back in front in its tab (fg there); {skip}"),
             "--skip",
         ),
         Some(Remedy::Waits) if row.wait == aterm_agent::harness::upgrade_drive::CLAIMED => (
             format!("it moves once the supervisor holding its tab lets it go; {skip}"),
+            "--skip",
+        ),
+        Some(Remedy::Waits) if row.wait == aterm_agent::harness::upgrade_drive::AUTOPILOT_OFF => (
+            format!("it moves once its autopilot is cruise or land again; {skip}"),
             "--skip",
         ),
         // A QUIET ROUND ITS AGENT'S OWN WORK GAVE UP ON (`Row::rests_on_own_work`,
@@ -3636,11 +3853,7 @@ pub(crate) fn agent_upgrade_key(tab: &str) -> String {
 /// `harness.upgrades.codex`. Never a tab's key: [`agent_upgrade_key_tab`] reads
 /// `None` for it, so the per-tab sweeps leave it alone.
 pub(crate) fn agent_upgrade_group_key(agent: aterm_agent::harness::upgrade::Agent) -> String {
-    let name = match agent {
-        aterm_agent::harness::upgrade::Agent::Claude => "claude",
-        aterm_agent::harness::upgrade::Agent::Codex => "codex",
-    };
-    format!("{KEY_AGENT_UPGRADE}s.{name}")
+    format!("{KEY_AGENT_UPGRADE}s.{}", agent.program().name())
 }
 
 /// Whether `key` is an agent's one row for its stalled tabs
@@ -3648,7 +3861,8 @@ pub(crate) fn agent_upgrade_group_key(agent: aterm_agent::harness::upgrade::Agen
 pub(crate) fn agent_upgrade_group_key_is(key: &str) -> bool {
     key.strip_prefix(KEY_AGENT_UPGRADE)
         .and_then(|rest| rest.strip_prefix("s."))
-        .is_some_and(|agent| matches!(agent, "claude" | "codex"))
+        .and_then(aterm_agent::harness::upgrade::Agent::parse)
+        .is_some_and(|agent| agent_upgrade_group_key(agent) == key)
 }
 
 /// The STALLS an agent's one row named, read back from its detail's shell
@@ -4546,35 +4760,70 @@ pub(crate) const DEVTOOLS_KEY: &str = "privacy.devtools.not-granted";
 /// (`aterm_containment::consent::devtool_grant` over the switch's row and
 /// tccd's answers; owner ruling 2026-10-14): every new program aterm starts
 /// waits for macOS's first-run check, so builds and tests wait. The switch is
-/// the owner's — macOS asks for their password, and aterm never presses it —
-/// and one press opens the pane it is made in. A digest line, never a band
-/// row: dismissing it files it for 30 days, then 90 ([`Resurface::CHOICE`]),
-/// and a reading that finds aterm on the list ends it.
-pub(crate) fn devtools_entry() -> Entry {
-    Entry::new(
+/// the owner's — macOS asks for their password, and aterm never presses it.
+/// A digest line, never a band row, in `atpkg::devtools`' words (one
+/// spelling with the helper panel, Settings ▸ Security and `aterm doctor`):
+///
+/// * its title and its step follow what the list holds of aterm
+///   (`atpkg::devtools::Step`, as the panel, the card and doctor do): ONE
+///   action ([`atpkg::devtools::Step::action`]) — the drag for an aterm the
+///   list does not hold, with the route through `+` riding the details beside
+///   the path; aterm's switch for a row switched off; and, for a row on while
+///   macOS still checks, a look at the row with the causes in the details — a
+///   step with ` or ` fails `Step::fault`, and an entry that fails it is
+///   recorded, not raised;
+/// * its press opens the Developer Tools pane, and the message center files
+///   the line ANSWERED for it (`MessageCenter::act_digest`: the owner did the
+///   one action), quiet for 30 days, then 90 ([`Resurface::CHOICE`]), as a
+///   dismissal is; a reading that finds aterm on the list ends the line, or
+///   forgets its filing (`App::except_clear`), so aterm leaving the list later
+///   is news again. On a list read empty the page waits for `spctl
+///   developer-mode enable-terminal`, so the line is filed before the page is
+///   known to open: when it then does not, the line comes back
+///   (`App::settle_devtools_waiting`);
+/// * its second capsule, `Security`, opens aterm's own Settings ▸ Security,
+///   where the list's state stays readable after the line is put away. A
+///   navigation: pressing it leaves the line.
+pub(crate) fn devtools_entry(step: atpkg::devtools::Step) -> Entry {
+    use atpkg::devtools::Step;
+    let skips = aterm_containment::SpikeEvidence::UNMEASURED.devtool_skips_first_run_check;
+    let (title, why) = match step {
+        Step::Add => (
+            "aterm is not in Developer Tools",
+            "only you can add aterm to the Developer Tools list in System Settings",
+        ),
+        Step::SwitchOn => (
+            "aterm is off in Developer Tools",
+            "only you can switch on aterm's row in Developer Tools in System Settings",
+        ),
+        Step::ListedOn => (
+            "macOS still checks programs aterm starts",
+            "only you can change aterm's row in the Developer Tools list in System Settings",
+        ),
+    };
+    let path = crate::menu::privacy_settings_path_words(crate::menu::PrivacyPane::DeveloperTools);
+    let entry = Entry::new(
         Family::Privacy,
         "devtools",
         "not-granted",
-        "aterm is not in Developer Tools",
-        Why::OnlyYou(Reason::new(
-            "only you can add aterm to the Developer Tools list in System Settings",
-        )),
-        Then::press(
-            Mover::open_system_pane(PANE_DEVELOPER_TOOLS),
-            "Press + and switch aterm on under Developer Tools",
-        ),
+        title,
+        Why::OnlyYou(Reason::new(why)),
+        Then::press(Mover::open_system_pane(PANE_DEVELOPER_TOOLS), step.action()),
     )
+    .show(Intent::OpenSettings {
+        route: SettingsRoute::Security.path().to_string(),
+    })
     .severity(Severity::Warn)
     .resurface(Resurface::CHOICE)
-    .more(
-        "macOS checks each new program aterm starts before its first run, one at a time, so \
-         builds and tests wait",
-    )
-    .more(crate::menu::privacy_settings_path_words(
-        crate::menu::PrivacyPane::DeveloperTools,
-    ))
-    .more("It applies to the next program aterm starts.")
-    .log_line("devtools not-granted")
+    .more(atpkg::devtools::why(skips));
+    let entry = match step {
+        Step::Add => entry.more(format!("{path} ({})", atpkg::devtools::PLUS_ROUTE)),
+        Step::SwitchOn => entry.more(path),
+        Step::ListedOn => entry.more(atpkg::devtools::HELPER_LISTED_ON).more(path),
+    };
+    entry
+        .more("It applies to the next program aterm starts.")
+        .log_line("devtools not-granted")
 }
 
 /// The live upgrade cannot run (its state folder cannot hold the lock): the
@@ -4666,11 +4915,17 @@ pub(crate) fn accounts_signed_out_entry(labels: &[String]) -> Option<Entry> {
 }
 
 /// The detail of [`accounts_signed_out_entry`]: `Signed out: a, b, …` on the
-/// lines an entry keeps. A label joins the line while the line stays within
-/// [`ACCOUNTS_LABELS_FILL`] characters and starts the next otherwise, whole;
-/// the labels the last line has no room for are counted at its end.
+/// lines an entry keeps ([`labels_lines`]).
 fn accounts_signed_out_lines(labels: &[String]) -> Vec<String> {
-    let mut lines = vec![ACCOUNTS_LABELS_LEAD.to_string()];
+    labels_lines(ACCOUNTS_LABELS_LEAD, labels)
+}
+
+/// `lead` and the labels, `a, b, …`, on the lines an entry keeps. A label
+/// joins the line while the line stays within [`ACCOUNTS_LABELS_FILL`]
+/// characters and starts the next otherwise, whole; the labels the last line
+/// has no room for are counted at its end.
+fn labels_lines(lead: &str, labels: &[String]) -> Vec<String> {
+    let mut lines = vec![lead.to_string()];
     let mut starts = true;
     let mut named = 0;
     for label in labels {
@@ -4709,6 +4964,216 @@ pub(crate) fn accounts_signed_out_first(detail: &[String]) -> Option<&str> {
         .filter(|label| !label.is_empty())
 }
 
+/// The key of [`accounts_credits_entry`]: one line for every account usage
+/// credits carry.
+pub(crate) const ACCOUNTS_CREDITS_KEY: &str = "harness.accounts.credits";
+
+/// The key of [`accounts_window_full_entry`].
+pub(crate) const ACCOUNTS_WINDOW_FULL_KEY: &str = "harness.accounts.window-full";
+
+/// USAGE CREDITS CARRY A CLAUDE ACCOUNT'S SESSIONS past a limit (`labels`, in
+/// roster order: `aterm_agent::harness::accounts::credits_noted`, an episode
+/// that began on a day no other did), or `None` for none: ONE line of
+/// [`Family::Accounts`] (accounts v2 §5.4: once per account per day). Credits
+/// are work going on, paid for: nothing waits on the owner, and the one thing
+/// only they do is the cap. The labels are the owner's own words, so they are
+/// in the detail, never the reason.
+pub(crate) fn accounts_credits_entry(labels: &[String]) -> Option<Entry> {
+    labels.first()?;
+    Some(
+        Entry::new(
+            Family::Accounts,
+            "",
+            "credits",
+            "Claude is running on usage credits",
+            Why::OnlyYou(Reason::new(
+                "Credits are billed to you, and only you set their monthly cap",
+            )),
+            Then::step("Review the usage credit cap in claude.ai settings"),
+        )
+        .severity(Severity::Info)
+        .resurface(Resurface::WAIT)
+        .more(format!("On credits: {}", labels.join(", ")))
+        .log_line(format!("accounts need=credits n={}", labels.len())),
+    )
+}
+
+/// A CLAUDE ACCOUNT'S WEEK IS NEARLY USED AND ITS CREDITS ARE OFF (`full`, in
+/// roster order, each with the vendor's word for why its credits are off:
+/// `aterm_agent::harness::accounts::windows_full`), or `None` for none: ONE
+/// line of [`Family::Accounts`] (accounts v2 §3.3). A session that reaches
+/// the limit then stops until the week resets, a day or more off; credits
+/// would carry it, and only the owner turns them on — or raises their cap,
+/// where the vendor said they ran out (`out_of_credits`).
+pub(crate) fn accounts_window_full_entry(full: &[(String, String)]) -> Option<Entry> {
+    full.first()?;
+    let spent = full.iter().any(|(_, why)| why == "out_of_credits");
+    let then = if spent {
+        "Raise the usage credit cap in claude.ai settings"
+    } else {
+        "Turn on usage credits in claude.ai settings"
+    };
+    let labels: Vec<&str> = full.iter().map(|(label, _)| label.as_str()).collect();
+    Some(
+        Entry::new(
+            Family::Accounts,
+            "",
+            "window-full",
+            "Weekly Claude limit nearly used",
+            Why::OnlyYou(Reason::new(
+                "With credits off, a session that reaches the limit stops until the week resets",
+            )),
+            Then::step(then),
+        )
+        .severity(Severity::Info)
+        .resurface(Resurface::WAIT)
+        .more(format!("Nearly used: {}", labels.join(", ")))
+        .log_line(format!(
+            "accounts need=window-full n={} spent={spent}",
+            full.len()
+        )),
+    )
+}
+
+/// The key of [`accounts_due_entry`]: one line for every due login.
+pub(crate) const ACCOUNTS_DUE_KEY: &str = "harness.accounts.due";
+
+/// The key of [`accounts_none_soon_entry`].
+pub(crate) const ACCOUNTS_NONE_SOON_KEY: &str = "harness.accounts.none-soon";
+
+/// The key of [`accounts_wrong_entry`].
+pub(crate) const ACCOUNTS_WRONG_KEY: &str = "harness.accounts.wrong-account";
+
+/// The one step of the due lines: the whole batch, every machine's.
+const ACCOUNTS_RENEW_DUE: &str = "Run aterm harness accounts renew --due";
+
+/// THE MACHINE'S LOGINS DUE FOR RENEWAL (`labels`, in roster order:
+/// `aterm_agent::harness::accounts::renew_due` — forecast to end within five
+/// days, or ended), or `None` for none: ONE Info line of
+/// [`Family::Accounts`], named in its detail, whose one step renews them all
+/// in one sitting (and every other machine's, under `[harness]
+/// hosts`). A fact worth a look, never an ask: nothing has stopped yet
+/// (a session stopped on an ended login is its own ask, [`renew_ask`]).
+pub(crate) fn accounts_due_entry(labels: &[String]) -> Option<Entry> {
+    labels.first()?;
+    let what = match labels.len() {
+        1 => "Claude login due for renewal".to_string(),
+        n => format!("{n} Claude logins due for renewal"),
+    };
+    let mut entry = Entry::new(
+        Family::Accounts,
+        "",
+        "due",
+        &what,
+        Why::OnlyYou(Reason::new(
+            "A login ends on a date Anthropic sets, and only a sign-in in your browser renews it",
+        )),
+        Then::step(ACCOUNTS_RENEW_DUE),
+    )
+    .severity(Severity::Info)
+    .resurface(Resurface::WAIT);
+    for line in labels_lines("Due: ", labels) {
+        entry = entry.more(line);
+    }
+    Some(entry.log_line(format!("accounts need=due n={}", labels.len())))
+}
+
+/// NO RENEWABLE LOGIN IS LEFT WORKING WITHIN A DAY
+/// (`aterm_agent::harness::accounts::none_working_within`): every login this
+/// machine's sessions can be relaunched onto is ended or forecast to end by
+/// then. A Warn line, never an ask: nothing has stopped yet.
+pub(crate) fn accounts_none_soon_entry() -> Entry {
+    Entry::new(
+        Family::Accounts,
+        "",
+        "none-soon",
+        "No Claude login lasts past tomorrow",
+        Why::OnlyYou(Reason::new(
+            "Every Claude login on this machine ends within a day, and only you can renew one",
+        )),
+        Then::step(ACCOUNTS_RENEW_DUE),
+    )
+    .severity(Severity::Warn)
+    .resurface(Resurface::WAIT)
+    .log_line("accounts need=none-working-within-a-day")
+}
+
+/// RENEWALS THAT SIGNED IN ANOTHER ACCOUNT (`labels`:
+/// `aterm_agent::harness::accounts::wrong_accounts`), or `None`: nothing
+/// live changed, and the row's login renews only in the account's own
+/// browser profile. Named by label alone.
+pub(crate) fn accounts_wrong_entry(labels: &[String]) -> Option<Entry> {
+    let first = labels.first()?;
+    let named = format!("Run aterm harness accounts renew {first}");
+    let then = if named.chars().count() <= aterm_messages::need::STEP_CAP {
+        named
+    } else {
+        "Run aterm harness accounts renew with the first label under Details".to_string()
+    };
+    let mut entry = Entry::new(
+        Family::Accounts,
+        "",
+        "wrong-account",
+        "Claude renewal signed in another account",
+        Why::OnlyYou(Reason::new(
+            "The browser held another account, so nothing changed and only you can sign in",
+        )),
+        Then::step(then),
+    )
+    .severity(Severity::Info)
+    .resurface(Resurface::WAIT);
+    for line in labels_lines("Wrong account: ", labels) {
+        entry = entry.more(line);
+    }
+    Some(entry.log_line(format!("accounts need=wrong-account n={}", labels.len())))
+}
+
+/// The key of [`renew_ask`]: ONE per machine, whatever stopped.
+pub(crate) const RENEW_ASK_KEY: &str = "harness.accounts.renew-ask";
+
+/// THE ONE ASK OF A MACHINE WHOSE SESSIONS STOPPED ON ENDED LOGINS
+/// (`labels`, in order; `places`, the tabs stopped): the loop's Now that no
+/// escalation of its own carries, for a renewable login
+/// (`aterm_agent::supervise::policy::exception::RENEW_STEP`) — every such
+/// tab's in one standing ask, keyed per machine ([`RENEW_ASK_KEY`]), whose
+/// one step renews the dead logins. The owner is needed now, aterm cannot
+/// settle it (no sign-in is made for them), and one step changes the
+/// outcome: each tab is relaunched on the renewed login with its own
+/// continuation. It stands while a tab is stopped so.
+pub(crate) fn renew_ask(labels: &[String], places: &[String]) -> Message {
+    let named = format!(
+        "{}{}",
+        aterm_agent::supervise::policy::exception::RENEW_STEP,
+        labels.join(" ")
+    );
+    let step = if named.chars().count() <= aterm_messages::need::STEP_CAP {
+        named
+    } else {
+        ACCOUNTS_RENEW_DUE.to_string()
+    };
+    let why = "A Claude login has ended, and only a renewal in your browser restores it";
+    let title = match places {
+        [one] => fitted_title("Claude's login ended", one),
+        _ => format!("Claude's login ended in {} tabs", places.len()),
+    };
+    let mut message = Message::new(tags::HARNESS, Severity::Warn, title)
+        .line(atpkg::progress::sanitize_for_tty(why, 160))
+        .line(atpkg::progress::sanitize_for_tty(&step, 160));
+    if places.len() > 1 {
+        message = message.line(atpkg::progress::sanitize_for_tty(
+            &format!("Stopped: {}", places.join(", ")),
+            240,
+        ));
+    }
+    message
+        .line("aterm relaunches each stopped tab on the renewed login, with its own continuation")
+        .now(Ask::standing(
+            StandingWhy::OnlyYou(Reason::new(why)),
+            Then::step(step),
+        ))
+        .key(RENEW_ASK_KEY)
+}
+
 /// The roster of Claude Code accounts does not admit as written
 /// ([`Family::Accounts`], `harness.accounts.refused`): no account can be named
 /// and no `accounts login` runs until the file is mended, so this line stands
@@ -4730,6 +5195,31 @@ pub(crate) fn accounts_refused_entry() -> Entry {
     .severity(Severity::Info)
     .resurface(Resurface::WAIT)
     .log_line("accounts need=roster-refused")
+}
+
+/// The key of [`usage_tap_silent_entry`].
+pub(crate) const USAGE_TAP_SILENT_KEY: &str = "harness.accounts.no-tap";
+
+/// A SESSION aterm PUT ITS USAGE TAP ON WROTE NO READING after a turn it
+/// served (`aterm_agent::harness::tap::Silence`): ONE line of
+/// [`Family::Accounts`] for the machine, whatever the number of tabs, raised
+/// at most once a day while `[harness] usage_tap` is on. A fact worth a look
+/// later: a reading moves no session, and nothing waits on one.
+pub(crate) fn usage_tap_silent_entry() -> Entry {
+    Entry::new(
+        Family::Accounts,
+        "",
+        "no-tap",
+        "A Claude usage tap is silent",
+        Why::OnlyYou(Reason::new(
+            "Claude Code ran no status line for a tapped session, so its usage figures go unread",
+        )),
+        Then::step("Run aterm harness tap --help for what stops a tap"),
+    )
+    .severity(Severity::Info)
+    .resurface(Resurface::WAIT)
+    .more("An untrusted folder, disableAllHooks, a managed statusLine or a moved aterm stops it")
+    .log_line("accounts need=no-tap")
 }
 
 /// A repaint the render stream gave up on: the tab may be drawn one row off
@@ -4791,13 +5281,42 @@ pub(crate) fn render_unrepaired_key(sid: &str) -> String {
     digest_key(Family::Render, sid, "unrepaired")
 }
 
+/// A program set palette colours (OSC 4, numeric OSC 21) and the owner's own
+/// `allow_palette_reconfigure = false` refused them (`terminal.palette-refused`,
+/// an EVENT of [`Family::Terminal`]): the commonest theming tools (base16-shell,
+/// pywal, `theme.sh`) then do nothing with no sign why. One line for every tab,
+/// raised at a session's first refusal, never on screen; the gate stays off
+/// until the owner turns it on, so a dismissal is their choice
+/// ([`Resurface::CHOICE`]).
+pub(crate) fn palette_refused_entry() -> Entry {
+    Entry::new(
+        Family::Terminal,
+        "",
+        "palette-refused",
+        "Program colours were refused",
+        Why::Configured {
+            key: Reason::new("allow_palette_reconfigure = false"),
+            reason: Reason::new("a program tried to set terminal palette colours"),
+        },
+        Then::press(
+            Mover::open_settings(SettingsRoute::Security.path()),
+            "Turn on Allow programs to set indexed colors",
+        ),
+    )
+    .severity(Severity::Info)
+    .resurface(Resurface::CHOICE)
+    .more("Theme tools such as base16-shell and pywal set colours this way (OSC 4).")
+    .log_line("terminal palette-refused key=allow_palette_reconfigure")
+}
+
 /// THE RESUME LOOP'S PART OF THE EXCEPTIONS DIGEST (owner rules, 2026-09-28:
 /// "there needs to be some clear reason why the user must be engaged and what
 /// the user should do"; a wait is never an exception). What the loop of each
 /// tab found only a person can answer ([`Exception`], told through
 /// `IdleHost::exception`) and that can wait for their next look (`Later`; a
-/// lost login is `Now` and stays the supervisor's own escalation, never an
-/// entry) becomes an [`Entry`] of [`Family::Resume`]:
+/// lost login is `Now`, never an entry: the loop's own escalation where the
+/// point escalated it, else the owner's ask on the glass, [`resume_ask`])
+/// becomes an [`Entry`] of [`Family::Resume`]:
 ///
 /// * a limit, a cleared goal, a wall that will not lift: ONE entry per KIND
 ///   (`harness.resume.<kind>`), naming every tab that has it, since the action
@@ -4841,8 +5360,8 @@ pub(crate) fn resume_exceptions(standing: &[(String, Exception, UpgradeSpot)]) -
             ExceptionKind::Bucket => "Model limit stops Claude",
             ExceptionKind::GoalCleared => "Claude lost its goal",
             ExceptionKind::Futile => "Limit still holds Claude",
-            // A login is the supervisor's; a stall, a dialog and a context are a
-            // tab's own.
+            // A login is `Now` (the loop's escalation, or the glass's ask); a
+            // stall, a dialog and a context are a tab's own.
             ExceptionKind::Login
             | ExceptionKind::Stalled
             | ExceptionKind::Dialog
@@ -4891,6 +5410,46 @@ pub(crate) fn resume_exceptions(standing: &[(String, Exception, UpgradeSpot)]) -
         entries.push(entry);
     }
     entries
+}
+
+/// The stem of [`resume_ask_key`]: never [`Family::Resume`]'s, whose keys are
+/// the digest's.
+pub(crate) const RESUME_ASK_KEY: &str = "harness.resume-ask";
+
+/// The key of a tab's [`resume_ask`]: `harness.resume-ask.<tab>`, the session
+/// id cleaned as the rows print it.
+pub(crate) fn resume_ask_key(sid: &str) -> String {
+    format!(
+        "{RESUME_ASK_KEY}.{}",
+        atpkg::progress::sanitize_for_tty(sid, 64)
+    )
+}
+
+/// THE RESUME LOOP'S NOW THAT NO ESCALATION OF ITS OWN CARRIES
+/// ([`Exception::escalated`] false, [`Urgency::Now`]): the tab is stopped on
+/// a lost login its own account move landed it on, the roster has no other
+/// account to move it to, and nothing ends that but the owner signing that
+/// login in. The owner is needed now, aterm cannot settle it, and one step
+/// changes the outcome, so it is a STANDING ASK on the glass (the alert
+/// rule), in the loop's words: its `why` and its one action, `Run aterm
+/// harness accounts login <label>.` Keyed per tab ([`resume_ask_key`]); it
+/// stands until the loop says the point no longer holds it — the move onto
+/// the signed-in login asked, another account to move to, the agent working,
+/// the loop or its worker ended.
+pub(crate) fn resume_ask(sid: &str, spot: &UpgradeSpot, exception: &Exception) -> Message {
+    Message::new(
+        tags::HARNESS,
+        Severity::Warn,
+        fitted_title("Claude's login lost", &spot.place),
+    )
+    .line(atpkg::progress::sanitize_for_tty(&exception.why, 160))
+    .line(atpkg::progress::sanitize_for_tty(&exception.action, 160))
+    .line("aterm moves the tab back onto that login once it is signed in")
+    .now(Ask::standing(
+        StandingWhy::OnlyYou(Reason::new(&exception.why)),
+        Then::step(&exception.action),
+    ))
+    .key(&resume_ask_key(sid))
 }
 
 /// A tab's OWN entry (`harness.resume.<tab>.<kind>`) for what the owner does IN

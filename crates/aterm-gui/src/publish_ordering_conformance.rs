@@ -2,36 +2,25 @@
 // Copyright 2026 Andrew Yates
 
 //! Tier-1 bind for `PublishOrdering` (`aterm_spec::derive::publish_ordering_model`,
-//! published ⟹ bound): a discovery graph entry must never name a socket that is
-//! not yet listening, because `proxy::sweep_stale_graph` deletes exactly such
-//! entries — the sibling-respawn race.
+//! published ⟹ bound): a discovery graph entry never names a socket that is not yet
+//! listening, because `proxy::sweep_stale_graph` deletes exactly such entries.
 //!
-//! Each entry is one instance of the model, projected from the real filesystem
-//! and socket, not from any flag the code keeps:
+//! Each entry is one model instance, projected from the real filesystem and socket:
+//! `bound` is whether a dial of the socket the entry names (before it exists, the
+//! one it will name) succeeds, the liveness the sweep reads; `published` is whether
+//! its `graph/<sid>` file exists. The run drives the real bind
+//! (`bind_control_listener`), publication (`publish_discovery`, `publish_session`)
+//! and sweep for three entries: the root session's, one registered before the bind
+//! (published from the snapshot) and one registered after.
 //!
-//! * `bound` — a DIAL of the socket the entry NAMES succeeds (the liveness the
-//!   sweep itself reads; before the entry exists, the socket it will name);
-//! * `published` — the entry's `graph/<sid>` file exists.
+//! `control::spawn` needs the event loop and is not driven; its order is fixed by
+//! types: `publish_discovery` consumes the `BoundControl` only the bind produces and
+//! returns the listener `spawn` serves on, so `spawn` cannot publish before its bind,
+//! name another socket, or serve without publishing. What the types cannot say, that
+//! publishing writes the entries and only for a listening socket, is what this checks.
 //!
-//! The run drives the real bind (`bind_control_listener`) and the real
-//! publication (`publish_discovery`, the register seam's `publish_session`, the
-//! sweep) for three entries — the root session's, a session registered BEFORE
-//! the bind (published from the snapshot), and one registered after (published
-//! by itself) — and validates every step against the model.
-//!
-//! `control::spawn` itself needs the event loop, so it is not driven. Its order
-//! is not left to it: `publish_discovery` CONSUMES the `BoundControl` only the
-//! bind produces and hands back the listener `spawn` serves on, and reads the
-//! path every entry names from that same value. So `spawn` cannot publish before
-//! its bind, cannot name a socket other than the one it bound, and cannot reach
-//! its accept loop without publishing — each of those is a compile error, not a
-//! runtime ordering. What that type cannot say — that publishing writes the
-//! entries, and only for a listening socket — is what this bind checks.
-//!
-//! NEGATIVE CONTROL: the original main-thread write (an entry published before
-//! the bind) is rejected by the committed model and admitted by `Buggy = 1` —
-//! and the real sweep then deletes that entry, which is the race the model
-//! exists to forbid.
+//! Negative control: an entry published before the bind is rejected by the model,
+//! admitted by `Buggy = 1`, and deleted by the real sweep.
 
 use std::collections::BTreeMap;
 use std::sync::RwLock;
@@ -204,7 +193,7 @@ fn discovery_entries_are_published_only_after_the_bind() {
     drop(listener);
 }
 
-/// The defect from a REAL state: an entry written before the bind.
+/// An entry written before the bind, from a real state: the `Buggy = 1` step.
 #[test]
 fn an_entry_published_before_the_bind_is_the_buggy_step_and_gets_swept() {
     let model = publish_ordering_model();

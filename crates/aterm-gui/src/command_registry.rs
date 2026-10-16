@@ -89,7 +89,7 @@ pub(crate) const fn menu_command(action: menu::MenuAction) -> CommandSpec {
         M::SoftwareUpdate => spec("app.settings.updates", S::App, A::UpdateStage, C::Any),
         M::Version => spec("app.settings.version", S::App, A::Observe, C::Any),
         M::ApplyUpdate => spec("update.apply", S::Process, A::UpdateApply, C::Any),
-        // Keep the stable command identity: the source now opens in native Manual.
+        // A stable id; the config source opens in native Manual.
         M::Preferences => spec("config.open_source", S::Process, A::ConfigMutate, C::Any),
         M::Quit => spec("app.quit", S::Process, A::LocalUi, C::Any),
         M::NewWindow => spec("window.new", S::Process, A::LocalUi, C::Any),
@@ -106,12 +106,10 @@ pub(crate) const fn menu_command(action: menu::MenuAction) -> CommandSpec {
             A::LocalUi,
             C::Terminal,
         ),
-        // Session-connection spawn presets (design §2.3): peer/place ride as
-        // reducer parameters never id names (`command_registry.rs` rule — one
-        // fieldless id per parameterless act). `A::Owner` because each MINTS
-        // standing session-connection authority over the focused session (the
-        // OwnerOnly `invoke` fence twin); terminal content because the origin
-        // is the FOCUSED session.
+        // Session-connection spawn presets: peer and place are reducer parameters, never id
+        // names (one fieldless id per parameterless act). Owner because each mints standing
+        // session-connection authority over the focused session; terminal content because the
+        // origin is the focused session.
         M::NewControlledWindow => spec(
             "session.connect_controlled_window",
             S::Process,
@@ -136,17 +134,14 @@ pub(crate) const fn menu_command(action: menu::MenuAction) -> CommandSpec {
             A::Owner,
             C::Terminal,
         ),
-        // The connection PICKER (§2.5; parameterless — the chosen peer is a
-        // reducer parameter) and the instance-wide MAP (§5). Owner for the
-        // same mint-standing-authority / aggregated-disclosure reasons as the
-        // presets and the `flows` verb.
+        // The connection picker (the chosen peer is a reducer parameter) and the instance-wide
+        // map: Owner, as they mint standing authority / aggregate disclosure like the presets and
+        // the `flows` verb.
         M::ConnectToSession => spec("session.connect_to", S::Window, A::Owner, C::Terminal),
         M::ShowConnectionMap => spec("view.connections", S::App, A::Owner, C::Any),
-        // Configure/disconnect an EXISTING connection (§2.3): the peer is a
-        // reducer parameter (the picker/sheet resolve it), never an id name.
-        // Owner because both rewrite/dissolve standing session-connection
-        // authority; terminal content because the subject is the focused (or
-        // clicked-tab) session.
+        // Configure/disconnect an existing connection: the peer is a reducer parameter, never an
+        // id name. Owner because both rewrite or dissolve standing session-connection authority;
+        // terminal content because the subject is the focused (or clicked-tab) session.
         M::ConfigureConnection => spec(
             "session.configure_connection",
             S::Window,
@@ -154,13 +149,11 @@ pub(crate) const fn menu_command(action: menu::MenuAction) -> CommandSpec {
             C::Terminal,
         ),
         M::DisconnectSession => spec("session.disconnect", S::Window, A::Owner, C::Terminal),
-        // Compatibility spelling: the shipping action still closes the focused
-        // pane/view. New UI uses `tab.close_tree` for whole-tree close.
+        // `CloseTab` closes the focused pane/view, hence the view id.
         M::CloseTab => spec("view.close_focused", S::View, A::LocalUi, C::Any),
         M::Copy => spec("selection.copy", S::View, A::Clipboard, C::Any),
-        // Tab-context copies (session-metadata stage 2): session identity / cwd
-        // text onto the pasteboard — clipboard authority, terminal content only
-        // (a native tab owns no session to copy from).
+        // Tab-context copies of session identity / cwd: clipboard authority, terminal content
+        // only (a native tab owns no session).
         M::CopySessionId => spec("session.copy_id", S::Tab, A::Clipboard, C::Terminal),
         M::CopyCwd => spec("session.copy_cwd", S::Tab, A::Clipboard, C::Terminal),
         M::Paste => spec("selection.paste", S::View, A::Clipboard, C::Any),
@@ -175,12 +168,10 @@ pub(crate) const fn menu_command(action: menu::MenuAction) -> CommandSpec {
         M::SplitVertical => spec("view.split_vertical", S::View, A::LocalUi, C::Any),
         M::SplitHorizontal => spec("view.split_horizontal", S::View, A::LocalUi, C::Any),
         M::ToggleMatrixRain => spec("effects.rain.toggle", S::Process, A::LocalUi, C::Any),
-        // Promotes the front window's promotable kitty (its tenured program
-        // cat, else the LAUNCH kitty) into the durable registry and pins it.
-        // Process-scoped and context-free: the launch kitty is one cat for
-        // the whole process (owner ruling, 2026-08-17), so it needs no
-        // focused leaf and no terminal; `LocalUi` because the only durable
-        // write is the machine-owned toy ledger, not config.
+        // Promotes the front window's promotable kitty (its tenured program cat, else the launch
+        // kitty) into the durable registry and pins it. Process-scoped and context-free: the
+        // launch kitty is one cat for the whole process. `LocalUi` because the only durable write
+        // is the machine-owned toy ledger, not config.
         M::FavouriteKitty => spec("effects.kitty.favourite", S::Process, A::LocalUi, C::Any),
         M::NextKitty => spec("effects.kitty.next", S::Process, A::LocalUi, C::Any),
         M::ToggleSeriousMode => spec(
@@ -190,37 +181,42 @@ pub(crate) const fn menu_command(action: menu::MenuAction) -> CommandSpec {
             C::Any,
         ),
         M::ToggleSettings => spec("app.settings.open", S::App, A::ConfigMutate, C::Any),
-        // Settings opened AT the Packages route — same surface class as
-        // ToggleSettings (it raises the durable-config Settings tab; the page's
-        // own switches do the actual [packages] writes through the OCC editor).
+        // Settings at the Packages route: the class of ToggleSettings (it raises the
+        // durable-config Settings tab; the page's switches write [packages] through the OCC
+        // editor).
         M::Packages => spec("app.settings.packages", S::App, A::ConfigMutate, C::Any),
-        // Settings opened AT the Messages route — the same surface class as
-        // Packages: it raises the durable-config Settings tab.
+        // Settings at the Messages route: the same class as Packages.
         M::Messages => spec("app.settings.messages", S::App, A::ConfigMutate, C::Any),
+        // Settings ▸ Harness (the Autopilot design): the same Settings tab at
+        // its Harness route, the same class as its siblings.
+        M::HarnessSettings => spec("app.settings.harness", S::App, A::ConfigMutate, C::Any),
         M::OpenPalette => spec("palette.open", S::Window, A::Owner, C::Any),
+        // The palette scoped to its Theme section: its Enter writes `theme`,
+        // so it carries the config-write ceiling, not the gateway's Owner one.
+        M::ChooseTheme => spec("palette.choose_theme", S::Window, A::ConfigMutate, C::Any),
+        // Settings ▸ Themes, the Theme Showcase: the same Settings tab at its
+        // Themes route, the same class as its siblings.
+        M::BrowseThemes => spec("app.settings.themes", S::App, A::ConfigMutate, C::Any),
         M::Minimize => spec("window.minimize", S::Window, A::LocalUi, C::Any),
         M::Zoom => spec("window.maximize", S::Window, A::LocalUi, C::Any),
         M::NextTab => spec("tab.next", S::Window, A::LocalUi, C::Any),
         M::PrevTab => spec("tab.previous", S::Window, A::LocalUi, C::Any),
-        // The inline pin editor. Scoped to
-        // the Tab because the gesture names a tab and the editor is tab chrome;
-        // the WRITE it eventually performs targets that tab's FOCUSED session.
-        // `LocalUi` (not `ConfigMutate`) for the same reason the control layer
-        // classifies `meta set` as `WriteInput`: nothing durable on disk moves.
+        // The inline pin editor. Tab-scoped because the gesture names a tab and the editor is
+        // tab chrome (the write targets that tab's focused session); `LocalUi` because nothing
+        // durable on disk moves, as the control layer classifies `meta set` as `WriteInput`.
         M::RenameSession => spec("session.rename", S::Tab, A::LocalUi, C::Terminal),
         // Same identity as the pin's face, one field over: the role is session
         // metadata written through the same typed API (`meta set role`).
         M::SetRole => spec("session.set_role", S::Tab, A::LocalUi, C::Terminal),
-        // Round 18's identity rows. Showing a session's identity discloses the
-        // same roster row the `identities` verb does (Owner-only on the wire);
-        // the two spawns may CREATE an identity, which only `spawn identity=`
-        // (Owner) may do. Neither spawn needs a focused session.
+        // Identity rows: showing a session's identity discloses the roster row the `identities`
+        // verb does (Owner-only on the wire); the two spawns may create an identity, which only
+        // `spawn identity=` (Owner) may do. Neither spawn needs a focused session.
         M::ShowIdentity => spec("session.identity.show", S::Tab, A::Owner, C::Terminal),
         M::NewWindowWithIdentity => spec("window.new_with_identity", S::App, A::Owner, C::Any),
         M::NewTabWithIdentity => spec("tab.new_with_identity", S::Window, A::Owner, C::Any),
         M::Help => spec("app.help.open", S::App, A::ExternalOpen, C::Any),
-        // THE FABRIC MENU (round 19, SPEC19 §9). A session's mail metadata on the human's screen: Owner (the same
-        // class as the map), terminal content (the inbox is a session's).
+        // The fabric menu: a session's mail metadata on screen is Owner (the class of the map),
+        // terminal content (the inbox is a session's).
         M::Inbox => spec("session.inbox.open", S::Tab, A::Owner, C::Terminal),
         // Converges on `App::open_session_ledger`.
         M::LedgerForSession => spec("session.ledger.open", S::Tab, A::ExternalOpen, C::Terminal),
@@ -236,9 +232,8 @@ pub(crate) const fn menu_command(action: menu::MenuAction) -> CommandSpec {
         // Serious Mode class.
         M::TogglePresenceBand => spec("presence.band.toggle", S::Process, A::ConfigMutate, C::Any),
         M::TogglePresenceRim => spec("presence.rim.toggle", S::Process, A::ConfigMutate, C::Any),
-        // The manual reset (2026-09-26): the focused view's terminal back to
-        // its host defaults. Runtime engine state only — `LocalUi`, the class
-        // of the font zoom — and it needs a terminal leaf.
+        // The manual reset of the focused view's terminal to its host defaults: runtime engine
+        // state only (`LocalUi`, the class of the font zoom), and it needs a terminal leaf.
         M::ResetTerminal => spec("terminal.reset", S::View, A::LocalUi, C::Terminal),
     }
 }
@@ -380,11 +375,8 @@ mod tests {
             menu_command(menu::MenuAction::SplitVertical).content,
             ContentRequirement::Any
         );
-        // The session-connection presets: one fieldless id per parameterless
-        // act (peer/place are parameters, never id names — the §2.3 [v5]
-        // command-id rule), Owner authority (they mint standing
-        // session-connection authority), terminal content (the origin is the
-        // focused session).
+        // The session-connection presets: one fieldless id each, Owner (they mint standing
+        // authority), terminal content (the origin is the focused session).
         for (action, id) in [
             (
                 menu::MenuAction::NewControlledWindow,
@@ -412,17 +404,14 @@ mod tests {
             );
             assert_eq!(spec.content, ContentRequirement::Terminal);
         }
-        // The picker/map ids (§2.3 [v5]): stable fieldless identities, Owner
-        // authority (the picker mints, the map aggregates).
+        // The picker/map ids: stable, Owner (the picker mints, the map aggregates).
         let connect_to = menu_command(menu::MenuAction::ConnectToSession);
         assert_eq!(connect_to.id.as_str(), "session.connect_to");
         assert_eq!(connect_to.authority, ActionAuthority::Owner);
         let map = menu_command(menu::MenuAction::ShowConnectionMap);
         assert_eq!(map.id.as_str(), "view.connections");
         assert_eq!(map.authority, ActionAuthority::Owner);
-        // The configure/disconnect ids (§2.3): the peer stays a parameter —
-        // one stable fieldless id each — and both are Owner (they rewrite or
-        // dissolve standing session-connection authority).
+        // The configure/disconnect ids: the peer stays a parameter, and both are Owner.
         let configure = menu_command(menu::MenuAction::ConfigureConnection);
         assert_eq!(configure.id.as_str(), "session.configure_connection");
         assert_eq!(configure.authority, ActionAuthority::Owner);

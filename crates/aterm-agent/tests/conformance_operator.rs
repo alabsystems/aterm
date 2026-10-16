@@ -1,14 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 bindings for the durable operator's delivery, actuator-WAL,
-//! fleet-fault, and leadership machines.
-//!
-//! These tests drive `DurableQueue`, including its real file lock and WAL replay,
-//! then project each observed transition onto the same derived models checked at
-//! Tier 0. Every transition is admitted by the in-process interpreter and, when
-//! installed, by `ty trace validate`. Each machine also carries a deliberately
-//! forged successor that the model must reject, so a green binding is non-vacuous.
+//! Tier-1 bindings for the durable operator's delivery, actuator-WAL, fleet-fault
+//! and leadership machines: `DurableQueue`, with its real file lock and WAL replay,
+//! is driven and each observed transition is projected onto the derived model and
+//! validated on every installed tier. Each machine also offers a forged successor
+//! the model must reject, so a green binding is non-vacuous.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -99,8 +96,8 @@ fn delivery_config() -> QueueConfig {
         capacity: 8,
         visibility_timeout: Duration::from_millis(10),
         max_cumulative_extension: Duration::from_millis(100),
-        // The bounded model deliberately uses two rather than the production
-        // default of three so the cap is reachable in a short trace.
+        // Two, not the production default of three, so the cap is reachable in a
+        // short trace.
         redelivery_cap: 2,
         max_wal_bytes: 2 * 1024 * 1024,
     }
@@ -243,8 +240,8 @@ fn operator_event_delivery_real_claim_cas_matches_model() {
         "operator delivery stale claimant refusal",
     );
 
-    // Negative control: reproduce the forbidden stale-token resolution. This is
-    // exactly the `Buggy=1` successor and must not be admitted by healthy Next.
+    // Negative control: the stale-token resolution, exactly the `Buggy=1`
+    // successor, is refused by the healthy model.
     let forged_stale_resolution = state_after(
         &claimed_second,
         &[
@@ -478,9 +475,8 @@ fn operator_wal_core_orphan_recovery_and_human_reconciliation_match_model() {
         "operator ack of an in-flight action",
     );
 
-    // Simulate process loss after intent but before the actuator is known to have
-    // run. This is only the durable queue's recovery binding; the genuine
-    // `MutateOnce` binding lives beside the shipping GUI transaction helper.
+    // Process loss after intent, before the actuator is known to have run. This is
+    // the queue's recovery binding only; `MutateOnce` is bound in aterm-gui.
     drop(queue);
     let reopened = DurableQueue::open(directory.path(), 2, wal_config()).unwrap();
     assert!(
@@ -744,16 +740,12 @@ fn operator_fleet_fault_real_gate_and_human_clear_match_model() {
     );
 }
 
-/// `latch_fault_at` writes the marker before the WAL record and stops if the
-/// write fails. The marker path is occupied by a directory, so
-/// `ensure_fault_marker` fails before writing anything; the queue must then
-/// commit no fault. A latch that swallowed that error would commit a WAL fault
-/// no marker owns, which this projection shows as `(phase 2, marker 0)`.
-///
-/// `marker` is measured while the directory still blocks the path, as whether a
-/// regular marker file is there. It reads 0 in the healthy run and in the
-/// slipped one alike (the blocked path cannot hold a marker), so `phase`, read
-/// off the reopened WAL, is what tells the two apart.
+/// `latch_fault_at` writes the marker before the WAL record and stops if the write
+/// fails. A directory occupies the marker path, so `ensure_fault_marker` fails and
+/// the queue must commit no fault; a latch that swallowed the error would commit a
+/// WAL fault no marker owns, projected as `(phase 2, marker 0)`. `marker` reads 0 in
+/// both runs (the blocked path holds no marker), so `phase`, read off the reopened
+/// WAL, tells them apart.
 #[test]
 fn operator_fleet_fault_failed_marker_write_commits_no_fault() {
     let directory = TestDir::new("fleet-fault-marker-failure");

@@ -8,34 +8,24 @@
 //! owns ignition times, the flash limiter and the one-nova-per-episode guard;
 //! this module turns a time offset into pixels:
 //!
-//! * **Phase machine** (§6.1): `Armed → Dip → Flash → Ring → Debris → Ember →
+//! * Phase machine (§6.1): `Armed → Dip → Flash → Ring → Debris → Ember →
 //!   Settled`, windows fixed except the genome duration `D ∈ 1000..=1400 ms`.
-//! * **Ring and rays** (§6.3): the ring is a circle rasterized as exactly
-//!   [`RING_BANDS`] row-band chord slabs (band *i* spans
-//!   `[round(2r·i/30), round(2r·(i+1)/30))`, a fixed count so the closed form
-//!   holds at every cell size), one uniform-coverage quad per chord per band
-//!   (coverage × AA fraction quantized once into `premul_rgb`). A chromatic
-//!   fringe ring at `R + chroma` rides the same bands at 0.55 coverage; the
-//!   sink splits every quad at cell-row boundaries. Rays step exactly
-//!   [`RAY_SAMPLES`] fixed samples along their major axis with `comet_beam`'s
-//!   2.5→1 px taper folded into per-sample coverage/width. Closed form:
-//!   `Q ≤ 392` at every cell size, pinned by `nova_budget_geometry_invariant`.
-//! * **Spend order** (§6.3): ring first, then rays inner→outer (a binding cap
-//!   drops outer slices), then the crown only if it fits whole, so the ring is
-//!   never gapped.
-//! * **Magic variants** (§3.5/§6.1): **Quasar** replaces the rays with 2
-//!   vertical jets at double length (30 samples each); **Singularity**
-//!   time-reverses every radius (the ring contracts, debris falls inward) and
-//!   adds a ≤ 20-cell Over-blend `RingArc` darkening ring, ending in a dim violet
-//!   ember.
-//! * **Blast coupling** (§6.5): `crossing_ms`/`pulse_env`/`constant_lum_toward`
-//!   give neighbouring ink a one-shot ~150 ms chroma pulse at near-constant
-//!   relative luminance; |ΔL| ≤ 5% holds by construction (a luminance-matching
-//!   bisection), tested over all 8 palettes × every 4-bit hue-nudge code.
+//! * Ring and rays (§6.3): the fixed [`RING_BANDS`] chord bands and
+//!   [`RAY_SAMPLES`] samples per ray bound a nova to `Q ≤ 392` quads at every
+//!   cell size, pinned by `nova_budget_geometry_invariant`. Spend order is the
+//!   ring, then rays inner→outer, then the crown only if it fits whole, so the
+//!   ring is never gapped.
+//! * Magic variants (§3.5/§6.1): Quasar replaces the rays with 2 vertical jets
+//!   at double length; Singularity time-reverses every radius (the ring
+//!   contracts, debris falls inward) and adds a ≤ 20-cell Over-blend `RingArc`
+//!   darkening ring, ending in a dim violet ember.
+//! * Blast coupling (§6.5): `crossing_ms`/`pulse_env`/`constant_lum_toward`
+//!   give neighbouring ink a one-shot ~150 ms chroma pulse with |ΔL| ≤ 5% by
+//!   construction (a luminance-matching bisection).
 //!
 //! Parity: quads are premultiplied `0x00RRGGBB` [`GlowQuad`]s (`premul_rgb`
 //! once host-side, `add_sat` equal to GPU One/One on the Unorm view); debris
-//! and the Singularity ring ride the wdeco Add/Over parity machinery.
+//! and the Singularity ring ride the word-decoration Add/Over parity machinery.
 
 use aterm_render::{DecoBlend, DecoGlyph, GlowQuad, WordDecoration, premul_rgb};
 use aterm_scene::{mix_rgb, smoothstep};
@@ -167,7 +157,7 @@ pub struct NovaEnv {
     /// Hue-nudged palette endpoints (§6.2 + the genome ink-pair window).
     pub core: u32,
     pub fringe: u32,
-    /// Config profanity intensity (v1 key, reused as the nova brightness).
+    /// Config profanity intensity, used as the nova brightness.
     pub intensity: f32,
     /// The occurrence seed — the §6.1 randomness root (debris ballistics).
     pub seed: u64,
@@ -188,9 +178,9 @@ pub struct NovaCounts {
 }
 
 /// A budgeted, grid-clamped, row-band-splitting [`GlowQuad`] sink (the
-/// `cursor_glow::push_rect` idiom) with the quad budget enforced at the single
-/// push point, so truncation order is emission order. The budget branch stays
-/// a live guard; `nova_budget_geometry_invariant` checks it never binds.
+/// `effect_util::push_fx_rect` idiom) with the quad budget enforced at the
+/// single push point, so truncation order is emission order. The budget branch
+/// stays a live guard; `nova_budget_geometry_invariant` checks it never binds.
 struct QuadSink<'a> {
     out: &'a mut Vec<GlowQuad>,
     grid_w: i32,
@@ -225,7 +215,7 @@ impl QuadSink<'_> {
                 w: (x1 - x0) as u16,
                 h: (band_end - yy) as u16,
                 color: premul,
-                // ADDITIVE light — this emitter has no other mode (see
+                // Additive light: this emitter has no other mode (see
                 // [`GlowQuad::alpha`]).
                 alpha: 0,
                 color2: premul,
@@ -325,7 +315,7 @@ pub fn emit_nova(t_ms: u64, env: &NovaEnv, budget: usize, out: &mut Vec<GlowQuad
                 counts.rays = sink.out.len() - n0;
             }
         }
-        // The crown is funded LAST in the spend order: it emits only when it
+        // The crown is funded last in the spend order: it emits only when it
         // fits whole under the remaining budget (crown drops first, §6.3).
         NovaPhase::Flash if sink.budget >= CROWN_QUADS => {
             let n0 = sink.out.len();
@@ -556,7 +546,7 @@ pub fn emit_debris(t_ms: u64, env: &NovaEnv, out: &mut Vec<WordDecoration>, cap:
         if out.len() >= cap {
             break;
         }
-        // Per-mote constants from the seeded stream (NOT per frame: ballistics
+        // Per-mote constants from the seeded stream (not per frame: ballistics
         // need frozen launch parameters; only `t` animates).
         let s = mix(env.seed ^ u64::from(m).wrapping_mul(0xA24B_AED4_963E_E407));
         let r0 = (s & 0xffff) as f32 / 65535.0;
@@ -905,7 +895,7 @@ mod tests {
         assert_eq!(c.ring, counts.ring, "the ring is never gapped by a cap");
         assert_eq!(c.rays, 10, "rays truncate to the remaining budget");
         assert_eq!(c.crown, 0);
-        // The surviving ray quads are the INNERMOST slices (emission order is
+        // The surviving ray quads are the innermost slices (emission order is
         // inner→outer per ray, so truncation drops the tips).
         assert_eq!(
             capped[..counts.ring],
@@ -1015,7 +1005,7 @@ mod tests {
                         dl <= 0.05,
                         "|ΔL| {dl:.4} > 5% for anchor {anchor:06x} → fringe {fringe:06x}"
                     );
-                    // …and so does the APPLIED pulse at every amplitude the
+                    // …and so does the applied pulse at every amplitude the
                     // envelope can reach (the deployed color, §6.4 item 7).
                     for amp in [0.1f32, 0.2, PULSE_AMP] {
                         let mixed = pulse_color(anchor, fringe, amp);

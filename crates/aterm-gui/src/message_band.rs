@@ -2057,12 +2057,12 @@ mod tests {
         let row = crate::toolchain_words::held_row(&msg);
         app.post_message(row.hold(Hold::For(aterm_messages::HOLD_WARN)));
         let excerpt = |cols: usize| app.band_presentation(cols).rows[0].detail.clone();
-        // The title is three cells shorter than it was (`are current`, ruling
-        // 261): every threshold with it.
+        // The title names each program by its product (`Codex CLI`, four cells
+        // longer than `Codex`): every threshold moves with it.
         assert_eq!(excerpt(77), None, "drops whole at 77 cols");
         assert_eq!(
             excerpt(107).map(|(_, d)| d),
-            Some("`. ~/.aterm/shell.d/00-atp\u{2026}".to_string()),
+            Some("`. ~/.aterm/shell.d/00\u{2026}".to_string()),
             "at 107 the room is narrower than the command: its head, from the backtick"
         );
         assert_eq!(
@@ -2072,7 +2072,7 @@ mod tests {
         );
         assert_eq!(
             excerpt(140).map(|(_, d)| d),
-            Some(format!("1 tab from before this\u{2026} {command}")),
+            Some(format!("1 tab from before\u{2026} {command}")),
             "the count and the whole command"
         );
         let mut whole_from = None;
@@ -2113,7 +2113,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(whole_from, Some(113));
+        assert_eq!(whole_from, Some(117));
         // The shaper alone, at the caps the row reaches: sentence first, then
         // the command's own words, then the command's head.
         let long = "what `claude` and `codex` run in every aterm tab \u{00b7} 1 tab from before \
@@ -2979,15 +2979,8 @@ mod paint_parity_tests {
         let builtin: Vec<(&str, ThemeInks)> = aterm_types::scheme::builtin_names()
             .into_iter()
             .map(|name| {
-                let parts = aterm_types::scheme::builtin(name)
-                    .expect("a listed scheme")
-                    .to_theme_parts();
-                let theme = Theme {
-                    fg: parts.fg,
-                    bg: parts.bg,
-                    cursor: parts.cursor,
-                    selection: parts.selection,
-                };
+                let theme =
+                    Theme::from(&aterm_types::scheme::builtin(name).expect("a listed scheme"));
                 themes.push(theme);
                 (name, inks(theme))
             })
@@ -3004,7 +2997,7 @@ mod paint_parity_tests {
         let digest = text.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
             (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
         });
-        assert_eq!(digest, 0x973b_e822_c486_d59b, "{text}");
+        assert_eq!(digest, 0xe8a6_78ba_9a5f_dc64, "{text}");
         if cfg!(not(target_os = "linux")) {
             for theme in themes {
                 assert_eq!(
@@ -3169,14 +3162,8 @@ mod paint_parity_tests {
         let mut grounds: Vec<[u8; 3]> = Vec::new();
         for name in aterm_types::scheme::builtin_names() {
             let s = aterm_types::scheme::builtin(name).expect("a listed scheme");
-            let parts = s.to_theme_parts();
             let c = chrome_band::BandPalette {
-                theme: Theme {
-                    fg: parts.fg,
-                    bg: parts.bg,
-                    cursor: parts.cursor,
-                    selection: parts.selection,
-                },
+                theme: Theme::from(&s),
                 ansi: Some(chrome_band::MeterAnsi::of_scheme(&s)),
             }
             .colors();

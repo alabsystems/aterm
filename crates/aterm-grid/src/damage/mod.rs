@@ -5,8 +5,8 @@
 //! Damage tracking: only cells changed since the last frame are re-rendered.
 //!
 //! Damaged rows are bitsets (O(1) marking, iteration skipping clean rows via
-//! `trailing_zeros()`), with per-row column bounds and rectangle merging for
-//! the GPU; resize, scroll and clear use full damage.
+//! `trailing_zeros()`) with per-row column bounds. Resize uses full damage; a
+//! scroll smaller than the screen marks only the rows it exposes.
 //!
 //! ```rust,ignore
 //! use aterm_grid::Damage;
@@ -34,9 +34,9 @@ pub use iter::{BitsetRowIterator, DamageBoundsIterator, DamagedRowIterator};
 pub use rect::LineDamageBounds;
 pub use tracker::{DamageTracker, RowDamageBounds};
 
-#[cfg(any(test, feature = "testing"))]
+#[cfg(any(test, debug_assertions))]
 pub use iter::MergedDamageIterator;
-#[cfg(any(test, feature = "testing"))]
+#[cfg(any(test, debug_assertions))]
 pub use rect::DamageRect;
 
 #[cfg(test)]
@@ -114,9 +114,8 @@ impl Damage {
         matches!(self, Damage::Full)
     }
 
-    /// This session's mark-call clock, or `None` under [`Damage::Full`], which
-    /// keeps no tracker. `None` means the clock cannot answer, so callers must
-    /// re-stamp unconditionally. See [`DamageTracker::mark_seq`].
+    /// The mark-call clock, or `None` under [`Damage::Full`] (no tracker), where
+    /// callers re-stamp unconditionally. See [`DamageTracker::mark_seq`].
     #[must_use]
     #[inline]
     pub(crate) fn mark_seq(&self) -> Option<u64> {

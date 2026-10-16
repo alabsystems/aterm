@@ -1,84 +1,47 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! PER OBLIGATION (D27): what the candidate gate
-//! ([`crate::trust_compare`]) compares when it holds a candidate toolchain to
-//! the published seal — each obligation the seal proved, not a library's count.
+//! Per obligation: what the candidate gate ([`crate::trust_compare`]) compares when it
+//! holds a candidate toolchain to the published seal.
 //!
-//! WHY NOT THE COUNT. The published seal 321aaeda7 issues kernel-certified
-//! FALSE proofs (trust `docs`: the 2026-09-30 vcgen findings), and the fixes that
-//! retract them make a correct candidate prove FEWER obligations: a count rule
-//! refuses it for ever. And a count hides a real loss behind a gain in the same
-//! library — on 2026-10-02 trust main lost 147 of aterm-grid's seal-proved
-//! obligations and gained 87, which a count reads as -60, in 93 functions, five
-//! of which lost and gained at once. So the gate compares obligation by
-//! obligation, and a loss is excused only by an audited row of the RETRACTION
-//! LEDGER (`tools/trust-gate-retractions.tsv`, [`Ledger`]).
+//! Not a library's count: the seal issues kernel-certified false proofs, and the fixes that
+//! retract them make a correct candidate prove fewer obligations, which a count rule refuses
+//! for ever; a count also hides a loss behind a gain. So each obligation the seal proved is
+//! compared, and a loss is excused only by an audited row of the retraction ledger
+//! ([`LEDGER_PATH`], [`Ledger`]).
 //!
-//! WHERE THE IDENTITY COMES FROM. The check's terminal log names no function on
-//! its flat rows (two functions printed the identical kind, description and
-//! location with opposite verdicts on the 2026-10-07 probe), drops columns, and
-//! prints the standard library's paths one way under the seal and another under
-//! a scratch stage2. `targo trust check --report-dir DIR` writes
-//! `report.ndjson` (`trust.report.ndjson.v2`): per function, each obligation's
-//! kind, description, location and status — about 150 KB an obligation, so the
-//! lane ([`reduce`], `trust obligations`) reduces it at once to a RECORD,
-//! `<spec>.log.oblig.tsv` ([`Record`]), and deletes the report. The record's
-//! counts must be the report footer's and, when compared, the log Summary's.
+//! The obligations come from `report.ndjson` ([`REPORT_SCHEMA`], written by `targo trust
+//! check --report-dir`), never the terminal log: its rows name no function (two functions
+//! can print identical rows with opposite verdicts), drop columns, and print the standard
+//! library's paths one way under the seal and another under a scratch stage2. A report runs
+//! to about 150 KB an obligation, so the lane ([`write_record`]) reduces it at once to a
+//! [`Record`] (`<spec>.log.oblig.tsv`), whose counts must be the report footer's and, when
+//! compared, the log Summary's, and deletes it. [`reduce`] normalises each obligation's
+//! function, file ([`Obligation::file`]), description ([`norm_desc`]) and anchor
+//! ([`anchor_of`]).
 //!
-//! THE KEYS. Each obligation is normalised by [`reduce`]: the function without
-//! its `cargo-target(…)::` unit prefix; the report's kind; the file repo-relative,
-//! or `@sysroot/<crate>/…` for the standard library (the seal prints
-//! `alloc/src/…`, a scratch stage2 `/<checkout>/library/alloc/src/…`), or
-//! `@registry/…`, or `@none` for an obligation the report gives no location
-//! (measured 2026-10-07: astream-cap's three `assertion: native-verification-gap`
-//! rows, whole-function markers, so keyed by function, kind and description);
-//! the description with whitespace collapsed (the record keeps it so), and as
-//! the keys compare it, MIR locals (`` `_7` ``) as `` `_` `` and interned hashes
-//! (`@<8+ hex>`) as `@#` ([`norm_desc`]); and the ANCHOR, the source text of an
-//! in-tree span ([`anchor_of`]).
+//! - The exact key ([`Exact`]) compares the seal's run with the candidate's on one tree;
+//!   an out-of-tree site drops its position, which differs between two standard
+//!   libraries. Losses are never summed against gains.
+//! - Twins share an exact key: `(vec![0u8; x], vec![0u8; y])` reports both allocations at
+//!   one `alloc/src/macros.rs` span, one proved and one failed, and a count per key would
+//!   pass a candidate that swaps them. Twins are told apart by what else both runs report
+//!   of them ([`Obligation::twin`]); twins still not told apart are one cell, held to its
+//!   worst case ([`cell_lost`]).
+//! - The ledger key ([`Key`]) names a seal obligation by its rank among look-alikes
+//!   (`nth/of`), which holds only in the tree it was audited in: an edit that keeps the
+//!   group's size can hand the row to an obligation nobody audited. So a row also records
+//!   the aterm commit, the seal and the obligation's site at the audit, and applies only
+//!   where both runs measured that commit's tree but for the ledger
+//!   ([`AtermRepo::audited_tree`]), the base run is that seal, and the obligation is at
+//!   that site; anywhere else it is NOT-APPLIED. The whole tree, not one file: an
+//!   obligation in a macro's body, an inlined callee or the standard library sits in a
+//!   file its function's edit leaves alone.
 //!
-//! * The EXACT key ([`Exact`]: function, kind, `file:l0:c0-l1:c1`, normalised
-//!   description; an out-of-tree file without its position, which differs
-//!   between two standard libraries) compares the seal's run with the
-//!   candidate's: same tree, same commit. Losses are never summed against gains.
-//! * TWINS: obligations at ONE exact key — on the
-//!   seal, `(vec![0u8; x], vec![0u8; y])` reports both allocations at
-//!   `alloc/src/macros.rs:47:8-47:41`, `_8`'s proved and `_10`'s failed;
-//!   `|j| v[j] + v[j]` reports two `slice bounds check`s at one span. A count of
-//!   statuses per key would let a candidate that fails `_8`'s and proves `_10`'s
-//!   through. So the key's obligations are first told apart by what else their
-//!   report says ([`Obligation::twin`]: an out-of-tree position, and the locals
-//!   and hashes the description names), only when both runs report the same set
-//!   of those; what is still not told apart is one CELL, held to its WORST case
-//!   ([`cell_lost`]): any seal-proved obligation in it may be any candidate one,
-//!   so the cell loses as many as the candidate's unproved (or absent) ones could
-//!   hide. One obligation a side is the ordinary case: lost iff the seal proved
-//!   it and the candidate does not.
-//! * The LEDGER key ([`Key`]: function, kind, file, anchor, nth/of, description)
-//!   names a seal obligation among its look-alikes — `nth` orders the seal's
-//!   obligations that share every other field by position (22 of aterm-grid's
-//!   147 losses share one with another), and `of` is how many share them: a
-//!   row audited when its group was another size applies to nothing.
-//! * A rank among look-alikes names the AUDITED obligation only in the tree it
-//!   was audited in (delete the audited `a + 1` and add
-//!   another, or swap two, and the group keeps its size while `nth` hands the
-//!   row to an obligation nobody audited, whose loss it then excused). So a
-//!   ledger row (v3) also records the aterm commit it was audited at, the
-//!   published seal it was audited against and the seal's site of the
-//!   obligation then, and applies only where the aterm tree both runs measured
-//!   is that commit's tree but for the ledger itself
-//!   ([`AtermRepo::audited_tree`]), the base run is that seal (another may
-//!   order look-alikes at one site otherwise), and the obligation its key names
-//!   is at that site. Not one file's identity: an obligation in a macro's body,
-//!   an inlined callee's or the standard library's is located in a file its
-//!   function's edit leaves alone, so only the whole tree pins which obligation
-//!   a rank names. Anywhere else the row is NOT-APPLIED, and excuses nothing.
-//!
-//! Never the report's `obligation_id` (`vc:<fn>:<category>:<ordinal>`): the
-//! ordinal is a per-function sequence, renumbered by any earlier obligation a
-//! toolchain adds or drops. Never `target/trust-cache/verification.json`: it
-//! holds results from before the publication boundary.
+//! Never the report's `obligation_id` (`vc:<fn>:<category>:<ordinal>`): any added or
+//! dropped obligation renumbers its function's ordinals. Never
+//! `target/trust-cache/verification.json`: it holds results from before the publication
+//! boundary.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -103,7 +66,7 @@ pub const LEDGER_MAGIC: &str = "# aterm trust-gate retractions v3";
 const LEDGER_V2_MAGIC: &str = "# aterm trust-gate retractions v2";
 /// Where the ledger is committed in the aterm tree: the one path a row's
 /// audited tree may differ in from the tree measured (adding the row changes it).
-pub const LEDGER_PATH: &str = "tools/trust-gate-retractions.tsv";
+pub const LEDGER_PATH: &str = "crates/aterm-release/trust/retractions.tsv";
 /// The file of an obligation the report gives no location.
 pub const NO_LOCATION: &str = "@none";
 /// What the record of `<spec>.log` is called, beside it.
@@ -134,9 +97,8 @@ const SYSROOT: &[&str] = &[
     "rustc-std-workspace-std",
 ];
 
-/// Where an obligation is, as the report gives it: 1-based lines, 0-based
-/// CHARACTER (not byte) columns, the end exclusive — measured on the 2026-10-07
-/// probe, where a span after `"éé—"` reported column 32, its byte offset 36.
+/// Where an obligation is, as the report gives it: 1-based lines, 0-based character (not
+/// byte) columns, the end exclusive.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Span {
     pub l0: u32,
@@ -177,10 +139,8 @@ impl Obligation {
         norm_desc(&self.desc)
     }
 
-    /// What tells it from a TWIN at its exact key, when both runs report the
-    /// same of it: its position out of the tree (the exact key drops it), and
-    /// the MIR locals and hashes its description names (`_8` and `_10`: the two
-    /// `vec![0u8; n]` the seal reported at one place of `alloc/src/macros.rs`).
+    /// What tells it from a twin at its exact key: its position out of the tree (the exact
+    /// key drops it), and the MIR locals and hashes its description names.
     #[must_use]
     pub fn twin(&self) -> (Option<Span>, String) {
         (
@@ -564,7 +524,7 @@ fn valid_status(s: &str) -> std::result::Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
-// The reduction: report.ndjson -> the record (`trust obligations`)
+// The reduction: report.ndjson -> the record ([`write_record`])
 // ---------------------------------------------------------------------------
 
 /// One line of `report.ndjson`, only what the record keeps: serde skips the
@@ -788,10 +748,10 @@ fn collapse(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// THE ANCHOR: the source text of an in-tree span — on one line the span's
-/// characters; over several, the first line's from the start column and the
-/// last's to the end column, joined ` … `; whitespace collapsed; over 100
-/// characters, its first 80, `…#` and 12 hex of the whole text's sha256.
+/// The anchor: the source text of an in-tree span. On one line the span's characters; over
+/// several, the first line's from the start column and the last's to the end column, joined
+/// ` … `; whitespace collapsed; over 100 characters, its first 80, `…#` and 12 hex of the
+/// whole text's sha256.
 ///
 /// # Errors
 /// A span past its file's lines or a line's characters.
@@ -884,20 +844,15 @@ fn erase(d: &str) -> (String, Vec<String>) {
     (out, erased)
 }
 
-/// THE REDUCTION (`trust obligations`, run by the lane after each check):
-/// read `report.ndjson` and make the check's [`Record`] — or say why not, and
-/// the comparison refuses that side ([`crate::trust_compare`]).
+/// Reads `report.ndjson` into the check's [`Record`] ([`write_record`] runs it after each
+/// check of the lane), or says why not, and the comparison refuses that side.
 ///
-/// It refuses: an unreadable report, a line that is not a record, a header
-/// that is not first or of another schema or another package, a record of a
-/// type it does not read (a transport record), a function outside the unit, a
-/// function reported twice (its obligations would be counted twice — measured
-/// 2026-10-07: two impl blocks' same-name methods are `W::<u8>::inc` and
-/// `W::<u16>::inc`, so no two functions of one unit share a path), a
-/// span that ends before it starts, a kind, status or path of no form it knows,
-/// a span past its source, a function record or footer whose counts are not
-/// its rows', and a report with no footer (cut short). An obligation with no
-/// location is keyed [`NO_LOCATION`].
+/// It refuses what the record could not vouch for: a line that is not a record, a header
+/// not first or of another schema or package, a record type it does not read (transport),
+/// a function outside the unit or reported twice (same-name methods of two impl blocks
+/// report distinct paths such as `W::<u8>::inc`), a kind, status, path or span of no form
+/// it knows or past its source, counts that are not the rows', and a report with no footer
+/// (cut short).
 ///
 /// # Errors
 /// Why there is no record, in one line.
@@ -1114,7 +1069,7 @@ fn obligation(
     })
 }
 
-/// `trust obligations`'s inputs.
+/// [`write_record`]'s inputs.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReduceArgs {
     pub report: PathBuf,
@@ -1125,12 +1080,14 @@ pub struct ReduceArgs {
     pub out: PathBuf,
 }
 
-/// Run `trust obligations`: write the record (whole, or nothing) and answer
-/// 0, or say why there is none on stderr and answer 1.
-pub fn run_reduce(args: &ReduceArgs) -> i32 {
+/// Reduce one check's report and write its record (whole, or nothing).
+///
+/// # Errors
+/// Why the check's report gives no record it can vouch for.
+pub fn write_record(args: &ReduceArgs) -> std::result::Result<Record, String> {
     // A record an earlier run left must not read as this one's.
     let _ = fs::remove_file(&args.out);
-    let made = reduce(
+    reduce(
         &args.report,
         &args.package,
         &args.repo,
@@ -1142,33 +1099,16 @@ pub fn run_reduce(args: &ReduceArgs) -> i32 {
             .and_then(|()| fs::rename(&tmp, &args.out))
             .map_err(|e| format!("{}: {e}", args.out.display()))
             .map(|()| rec)
-    });
-    match made {
-        Ok(rec) => {
-            println!(
-                "obligations: {} of {} proved in {} functions -> {}",
-                rec.proved(),
-                rec.total(),
-                rec.functions,
-                args.out.display()
-            );
-            0
-        }
-        Err(why) => {
-            eprintln!("{}: no per-obligation record: {why}", args.report.display());
-            1
-        }
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
-// The retraction ledger, `tools/trust-gate-retractions.tsv`
+// The retraction ledger, `crates/aterm-release/trust/retractions.tsv`
 // ---------------------------------------------------------------------------
 
-/// One audited retraction: a seal obligation (by its ledger [`Key`], of the
-/// seal and in the aterm tree it was audited against, at the site it was
-/// audited at) that a trust commit stops proving because the seal's proof of
-/// it was FALSE.
+/// One audited retraction: a seal obligation (by its ledger [`Key`], of the seal and aterm
+/// tree it was audited against, at the site it was audited at) that a trust commit stops
+/// proving because the seal's proof of it was false.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Retraction {
     /// Its line in the ledger.
@@ -1271,16 +1211,14 @@ fn site_of(s: &str, file: &str) -> Option<Span> {
     valid_span(span, file).ok().map(|()| span)
 }
 
-/// Read the ledger: `# aterm trust-gate retractions v3`, `#` comments, and rows
-/// of exactly thirteen tab-separated, non-empty fields — library, function,
-/// kind, file, anchor, nth (`<place>/<of>`), description, site (the seal's
-/// `<file>:<l0>:<c0>-<l1>:<c1>` of the obligation when audited), aterm commit
-/// (the one it was audited at), seal (the published seal's trust commit it was
-/// audited against), trust commit, reproducer, reviewed. A row of a library
-/// neither plan names, two rows naming one obligation (whatever their `of`),
-/// or a field out of its form is an error, and the comparison cannot be made
-/// on an erroneous ledger. A v2 ledger, whose rows record none of the site,
-/// the aterm commit and the seal, is refused whole, with its remedy.
+/// Read the ledger: [`LEDGER_MAGIC`], `#` comments, and rows of exactly thirteen
+/// tab-separated, non-empty fields: library, function, kind, file, anchor, nth
+/// (`<place>/<of>`), description, site (the seal's `<file>:<l0>:<c0>-<l1>:<c1>` of the
+/// obligation when audited), aterm commit and seal (the published seal's trust commit) it
+/// was audited at, the trust commit that retracts it, reproducer, reviewed. A row of a
+/// library neither plan names, two rows naming one obligation (whatever their `of`), or a
+/// field out of its form is an error, and no comparison is made on an erroneous ledger. A
+/// v2 ledger is refused whole, with its remedy.
 #[must_use]
 #[allow(clippy::too_many_lines)]
 pub fn parse_ledger(text: &str, path: &str, libraries: &BTreeSet<String>) -> Ledger {
@@ -1453,7 +1391,7 @@ fn hardened(
     runner.git(&all).map_err(|e| e.to_string())
 }
 
-/// `git <what>` in `shown` exited `rc`, as one line.
+/// `git <what>` in `shown` failed with `out`, as one line.
 fn git_failed(shown: &str, what: &str, out: &crate::ledger::RunOut) -> String {
     format!(
         "git {what} in {shown} exited {}: {}",
@@ -1474,15 +1412,14 @@ impl TrustRepo<'_> {
         hardened(self.git, args)
     }
 
-    /// `git <what>` in the repository exited `rc`, as one line.
+    /// `git <what>` in the repository failed with `out`, as one line.
     fn failed(&self, what: &str, out: &crate::ledger::RunOut) -> String {
         git_failed(&self.shown, what, out)
     }
 
-    /// Why ancestry cannot be read here, if it cannot: a SHALLOW repository
-    /// (its cut history answers "no" for a commit that is an ancestor: a seal
-    /// fetched at depth 1 reads a fix it holds as not in it), or a graft file,
-    /// which rewrites parents.
+    /// Why ancestry cannot be read here, if it cannot: a shallow repository (its cut
+    /// history reads a fix a depth-1 seal holds as not in it), or a graft file, which
+    /// rewrites parents.
     #[must_use]
     pub fn unfit(&self) -> Option<String> {
         match self.run(&["rev-parse", "--is-shallow-repository"]) {
@@ -1658,18 +1595,13 @@ pub struct AtermRepo<'a> {
 }
 
 impl AtermRepo<'_> {
-    /// Whether the tree of aterm `measured` is the tree of `audited` but for
-    /// the ledger itself ([`LEDGER_PATH`]; the seal is the caller's to hold to
-    /// the row): every other path's entry, its mode
-    /// and object id, the same — a submodule's gitlink included, whatever
-    /// `.gitmodules` or the repository's config says to ignore. Read from the
-    /// two trees (`git diff-tree`, plumbing that applies no attribute, textconv
-    /// or external diff), never from `git diff --quiet`, which a `.gitmodules`
-    /// `ignore = all` or a `diff.ignoreSubmodules` quiets about a submodule
-    /// bump. No repository there, or either commit not in it, cannot be told.
-    ///
-    /// # Errors
-    /// git did not answer (it could not run, a tree the repository lacks).
+    /// Whether the tree of aterm `measured` is the tree of `audited` but for the ledger
+    /// ([`LEDGER_PATH`]): every other path's entry, mode and object id the same, a
+    /// submodule's gitlink included whatever `.gitmodules` or config says to ignore. Read
+    /// with `git diff-tree` (plumbing: no attribute, textconv or external diff), never `git
+    /// diff --quiet`, which `ignore = all` or `diff.ignoreSubmodules` quiets about a
+    /// submodule bump. No repository, or either commit missing from it, cannot be told.
+    /// The seal is the caller's to hold to the row.
     pub fn audited_tree(
         &self,
         audited: &str,
@@ -1757,11 +1689,9 @@ impl AtermRepo<'_> {
     }
 }
 
-/// The git the gate reads the trust repository with (and the aterm one a
-/// ledger row's audited commit is read in, [`AtermRepo`]):
-/// [`crate::ledger::object_git`] — no `GIT_*` variable, system or global config
-/// steering it, replace refs ignored, no lazy fetch and no prompt. (A graft file,
-/// which no variable turns off quietly, [`TrustRepo::unfit`] refuses.)
+/// The git the gate reads the trust repository (and [`AtermRepo`]) with:
+/// [`crate::ledger::object_git`]. A graft file, which no variable turns off quietly,
+/// [`TrustRepo::unfit`] refuses.
 pub struct TrustGit {
     repo: PathBuf,
 }
@@ -1853,14 +1783,9 @@ pub struct LibCmp {
     /// Obligations the candidate proves beyond the seal — said, never set
     /// against a loss.
     pub gained: u64,
-    /// Retractions of this library that excused nothing, and why (UNUSED: it
-    /// names nothing the seal proved, prune it once a seal without it is
-    /// published; NOT-APPLIED: the seal or the aterm tree measured is not the
-    /// one it was audited against, or that cannot be told, the obligation its key names is not
-    /// at the site it was audited at, its group in the seal is no longer the
-    /// size it was audited at, its obligation is MISSING or one of twins the
-    /// comparison cannot tell apart, or the candidate lacks its fix, or that
-    /// cannot be told).
+    /// Retractions of this library that excused nothing, and why: UNUSED (it names nothing
+    /// the seal proved; prune it once a seal without it is published) or NOT-APPLIED (a
+    /// condition [`compare_lib`] sets for an excuse fails, or cannot be told).
     pub notes: Vec<(usize, &'static str, String)>,
     /// Retractions the candidate contradicts: it holds the fix and still
     /// proves the obligation. The ledger is wrong for it; refused.
@@ -1915,8 +1840,8 @@ pub fn ledger_keys(rec: &Record) -> Vec<Key> {
         .collect()
 }
 
-/// A CELL: the seal's and the candidate's obligations that nothing either
-/// report says tells apart (row indices of each record).
+/// A cell: the seal's and the candidate's obligations that nothing either report says
+/// tells apart (row indices of each record).
 #[derive(Clone, Debug, Default)]
 struct Cell {
     base: Vec<usize>,
@@ -1963,26 +1888,24 @@ fn cells(base: &Record, cand: &Record) -> Vec<Cell> {
     out
 }
 
-/// THE WORST CASE of a cell of `n` seal and `m` candidate obligations, `p` and
-/// `q` of them proved: any seal-proved one may be any candidate one, so as many
-/// are lost as the candidate's unproved ones, and the seal's beyond the
-/// candidate's count, can hide — never more than the seal proved. One a side is
-/// the ordinary case: lost iff the seal proved it and the candidate does not.
+/// The worst case of a cell of `n` seal and `m` candidate obligations, `p` and `q` of them
+/// proved: any seal-proved one may be any candidate one, so as many are lost as the
+/// candidate's unproved ones, and the seal's beyond the candidate's count, can hide, never
+/// more than the seal proved. One a side is the ordinary case: lost iff the seal proved it
+/// and the candidate does not.
 #[must_use]
 pub fn cell_lost(n: u64, m: u64, p: u64, q: u64) -> u64 {
     p.min(m.saturating_sub(q) + n.saturating_sub(m))
 }
 
-/// Compare one library's records: every obligation the seal proved must be
-/// proved by the candidate, cell by cell at its worst ([`cell_lost`]), except
-/// what a retraction excuses — one whose key names the obligation it was
-/// audited for (the seal and the aterm tree measured are the ones it was
-/// audited against, [`Audited::Same`] from `audited`; the obligation is at the
-/// site it was audited at; its group the size it was), whose fix the candidate holds
-/// ([`Contains::Yes`] from `contains`), and which the candidate does not prove,
-/// as only a cell that tells it apart can say (one obligation a side, or twins
-/// none of which the candidate proves). A seal obligation the candidate
-/// reports nothing at (MISSING) no retraction excuses; gains offset nothing.
+/// Compares one library's records: every obligation the seal proved must be proved by the
+/// candidate, cell by cell at its worst ([`cell_lost`]), except what a retraction excuses:
+/// one audited against this seal and aterm tree ([`Audited::Same`] from `audited`), whose
+/// obligation is at the audited site in a group of the audited size, whose fix the
+/// candidate holds ([`Contains::Yes`] from `contains`), and whose obligation the candidate
+/// does not prove, as only a cell that tells it apart can say (one obligation a side, or
+/// twins none of which the candidate proves). A seal obligation the candidate reports
+/// nothing at (MISSING) no retraction excuses; gains offset nothing.
 #[must_use]
 #[allow(clippy::too_many_lines)]
 pub fn compare_lib(
@@ -2047,10 +1970,9 @@ pub fn compare_lib(
     }
     for r in retractions {
         let found = keys.iter().position(|k| k.names(&r.key));
-        // In any tree but the one it was audited in, or another seal's record,
-        // its key's place among look-alikes may name another obligation than
-        // the audited one, at the same group size and even at the same site:
-        // it names nothing for certain there, so it applies to nothing.
+        // In any tree but the one it was audited in, or another seal's record, its rank
+        // among look-alikes may name another obligation, even at the same group size and
+        // site: it names nothing for certain there, so it applies to nothing.
         match audited(r) {
             Audited::Same => {}
             Audited::Changed(why) | Audited::Unknown(why) => {
@@ -2104,9 +2026,9 @@ pub fn compare_lib(
             not_applied(&mut out, &mut named, r, i, why);
             continue;
         }
-        // Whether the candidate proves THIS obligation: told when it proves
-        // every one of the cell's (so this one too) or none of them (nor this
-        // one), with no fewer than the seal reported there.
+        // Whether the candidate proves this obligation: told when it proves every one
+        // of the cell's (so this one too) or none of them (nor this one), with no fewer
+        // than the seal reported there.
         let still = q == m && m >= n;
         let not_now = q == 0 && m >= n;
         if !still && !not_now {
@@ -2232,7 +2154,7 @@ mod tests {
         .iter()
         .map(|s| (*s).to_string())
         .collect();
-        // The probe's real span: column 32 in characters (36 in bytes).
+        // Column 32 counts characters; its byte offset is 36.
         let one = Span {
             l0: 2,
             c0: 32,
@@ -2489,9 +2411,8 @@ mod tests {
         );
         assert_eq!(rec.rows[0].twin(), (None, String::new()));
         assert_eq!(Record::parse(&rec.to_text()).unwrap(), rec);
-        // An obligation the report gives no location (astream-cap's three
-        // `native-verification-gap` rows, 2026-10-07) is keyed by its function,
-        // kind and description.
+        // An obligation the report gives no location is keyed by its function, kind
+        // and description.
         let none = probe_report().replacen(
             r#""location":{"file":"src/lib.rs","line_start":3,"col_start":4,"line_end":3,"col_end":9},"#,
             "",
@@ -2741,15 +2662,14 @@ mod tests {
     #[test]
     fn twins_nothing_tells_apart_lose_at_their_worst_and_a_missing_key_is_lost() {
         let lost = |b: &Record, c: &Record| compare_lib(b, c, &[], &mut here, &mut no_ledger);
-        // [failed, failed] under the seal, [failed, proved] under trust main: a
+        // [failed, failed] under the seal, [failed, proved] under the candidate: a
         // gain, no loss.
         let c = lost(&site("failed", "failed"), &site("failed", "proved"));
         assert!(c.lost.is_empty() && c.gained == 1, "{c:?}");
         let c = lost(&site("proved", "proved"), &site("failed", "proved"));
         assert_eq!((c.lost.len(), c.lost[0].key.nth), (1, 1), "{c:?}");
-        // THE REFUTATION (2026-10-07): the seal proves one, the candidate the
-        // other — a count of statuses says nothing was lost; which one the
-        // candidate proves cannot be told, so one is lost.
+        // The seal proves one, the candidate the other: a count of statuses sees no
+        // loss, but which one the candidate proves cannot be told, so one is lost.
         let c = lost(&site("proved", "failed"), &site("failed", "proved"));
         assert_eq!(c.lost.len(), 1, "{c:?}");
         assert!(
@@ -2806,8 +2726,8 @@ mod tests {
 
     #[test]
     fn twins_are_told_apart_by_what_both_runs_report_of_them() {
-        // MEASURED on the seal 2026-10-07: `(vec![0u8; x], vec![0u8; y])` reports
-        // both at `alloc/src/macros.rs:47:8-47:41`, `_8`'s proved, `_10`'s failed.
+        // The seal reports `(vec![0u8; x], vec![0u8; y])`'s two allocations at
+        // `alloc/src/macros.rs:47:8-47:41`, `_8`'s proved, `_10`'s failed.
         let zeros = |s8: &str, s10: &str, at: u32| {
             let one = |st: &str, local: &str| Obligation {
                 function: "zeros".into(),
@@ -3094,9 +3014,9 @@ mod tests {
         assert_eq!((c.lost.len(), c.excused.len(), c.stale.len()), (0, 0, 1));
     }
 
-    /// REVIEW 31 (2026-10-07): a row audited for X, the first of two `a + 1` in
-    /// `f` (X at line 3, Z at line 7: `1/2`), after an edit that keeps the group
-    /// at two. Its rank then names an obligation nobody audited.
+    /// A row audited for X, the first of two `a + 1` in `f` (X at line 3, Z at line 7:
+    /// `1/2`), after an edit that keeps the group at two: its rank then names an
+    /// obligation nobody audited.
     #[test]
     fn a_retraction_applies_only_in_the_tree_and_at_the_site_it_was_audited_at() {
         let add = |w: (u32, &str), z: (u32, &str)| {
@@ -3113,8 +3033,8 @@ mod tests {
         fn changed(_: &Retraction) -> Audited {
             Audited::Changed("src/lib.rs changed since the audit".into())
         }
-        // CONTROL, in the tree it was audited in: the candidate loses X, and the
-        // row excuses it.
+        // Control, in the tree it was audited in: the candidate loses X, and the row
+        // excuses it.
         let c = compare_lib(
             &audited,
             &add((3, "failed"), (7, "proved")),
@@ -3123,10 +3043,9 @@ mod tests {
             &mut yes,
         );
         assert_eq!((c.lost.len(), c.excused.len()), (0, 1), "{c:?}");
-        // REPLACED: X deleted and W added at line 2, the group still two. The
-        // candidate genuinely loses W, which nobody audited: W is not at the
-        // audited site, so the row does not apply even where the tree reads as
-        // the audited one…
+        // Replaced: X deleted and W added at line 2, the group still two. The candidate
+        // loses W, which nobody audited: W is not at the audited site, so the row does
+        // not apply even where the tree reads as the audited one…
         let replaced = add((2, "proved"), (7, "proved"));
         let lose_w = add((2, "failed"), (7, "proved"));
         let c = compare_lib(&replaced, &lose_w, &[&r], &mut here, &mut yes);
@@ -3144,9 +3063,8 @@ mod tests {
                 .contains("retraction line 4 does not apply: src/lib.rs changed since the audit"),
             "{c:?}"
         );
-        // REORDERED: Z moved above X (Z at 3, X at 7). The row's rank and site
-        // now name Z, which the candidate loses while it still proves X: the
-        // site cannot tell, only the tree can.
+        // Reordered: Z moved above X (Z at 3, X at 7). The row's rank and site now name
+        // Z, which the candidate loses while it still proves X: only the tree can tell.
         let reordered = add((3, "proved"), (7, "proved"));
         let lose_z = add((3, "failed"), (7, "proved"));
         let c = compare_lib(&reordered, &lose_z, &[&r], &mut changed, &mut yes);
@@ -3173,17 +3091,15 @@ mod tests {
             &mut yes,
         );
         assert_eq!((c.lost.len(), c.excused.len()), (1, 0), "{c:?}");
-        // DELETED AND ADDED AGAIN, 1/1: the one `a + 1` replaced by another at
-        // the same place. Rank, size and site all agree; the tree does not.
+        // Deleted and added again, 1/1: the one `a + 1` replaced by another at the same
+        // place. Rank, size and site all agree; the tree does not.
         let alone = rec(&[("f", ADD, "src/lib.rs", 3, "proved", "a + 1", "add")]);
         let one = retraction(5, ledger_keys(&alone)[0].clone(), 3, FIX);
         let lost = rec(&[("f", ADD, "src/lib.rs", 3, "failed", "a + 1", "add")]);
         let c = compare_lib(&alone, &lost, &[&one], &mut changed, &mut yes);
         assert_eq!((c.lost.len(), c.excused.len()), (1, 0), "{c:?}");
-        // A row naming nothing in a changed tree is NOT-APPLIED, never UNUSED
-        // (which would say to prune it), and a row naming an obligation the
-        // seal did not prove, in its own tree at another site, is not UNUSED
-        // either.
+        // NOT-APPLIED, never UNUSED (which would say to prune it): a row naming nothing in a
+        // changed tree, and one naming an unproved obligation at another site in its own tree.
         let mut none = r.key.clone();
         none.nth = 2;
         none.of = 2;
@@ -3245,7 +3161,7 @@ mod tests {
         let d = tmpdir();
         let root = d.path().join("aterm");
         fs::create_dir_all(root.join("src")).unwrap();
-        fs::create_dir_all(root.join("tools")).unwrap();
+        fs::create_dir_all(root.join(LEDGER_PATH).parent().unwrap()).unwrap();
         let g = |args: &[&str]| fixture_git(&root, args);
         let commit = |path: &str, text: &str, msg: &str| {
             fs::write(root.join(path), text).unwrap();
@@ -3270,7 +3186,7 @@ mod tests {
             "pub fn f(b: u8) -> u8 {\n    b + 1\n}\n",
             "an edit",
         );
-        let runner = crate::ledger::testing::Git::new(root.join("tools"));
+        let runner = crate::ledger::testing::Git::new(root.join(LEDGER_PATH).parent().unwrap());
         let repo = AtermRepo {
             git: &runner,
             shown: "the aterm repository".into(),
@@ -3303,9 +3219,9 @@ mod tests {
             Ok(Audited::Changed(_))
         ));
         g(&["replace", "-d", &edited]);
-        // A SUBMODULE BUMP that `.gitmodules` (`ignore = all`) and the
-        // repository's config (`diff.ignoreSubmodules`) both say to ignore —
-        // `git diff --quiet` calls the trees the same — is a change.
+        // A submodule bump that `.gitmodules` (`ignore = all`) and the repository's
+        // config (`diff.ignoreSubmodules`) both say to ignore, so that `git diff --quiet`
+        // calls the trees the same, is a change.
         let gitlink = |sha: &str, msg: &str| {
             g(&[
                 "update-index",

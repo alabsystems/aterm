@@ -6,13 +6,8 @@
 
 use super::super::*;
 
-/// Unit test for `advance_grapheme_unit` with orphan ZWJ mid-text.
-///
-/// Ruling 2026-10-11 (r15 search-columns review): printable ASCII after a ZWJ
-/// opens a unit of its own, as the live grid draws `A` ZWJ `B` in two cells
-/// (`print_ascii_bulk` never folds); a non-ASCII char after it still folds,
-/// as the grid folds it. This test pinned the old three-char unit since the
-/// 2026-06-07 bootstrap.
+/// Printable ASCII after an orphan ZWJ opens a unit of its own, as the live grid draws `A` ZWJ `B`
+/// in two cells (`print_ascii_bulk` never folds); a non-ASCII char after it still folds.
 #[test]
 fn advance_grapheme_unit_orphan_zwj_mid_text() {
     use crate::grid::scroll_materialize::advance_grapheme_unit;
@@ -36,14 +31,10 @@ fn advance_grapheme_unit_orphan_zwj_mid_text() {
     assert_eq!(byte_idx, text.len());
 }
 
-/// A regional indicator folds onto a unit whose base is a lone one, past a
-/// mark between them, as the live grid folds it (`try_combine_regional_indicator`
-/// reads the cell's base and counts the indicators it holds) and as
-/// `aterm_grapheme::GridColumns` lays a line out; a flag's third indicator
-/// starts a unit, and so does one after an indicator a ZWJ joined to another
-/// base. Ruling 2026-10-11 (r16 selection-stride review): the scan tested the
-/// scalar absorbed last, so on origin/main `🇺́🇸` was two units, drawn on a
-/// history row as two cells where the screen drew one flag.
+/// A regional indicator folds onto a unit whose base is a lone one, past a mark between them, as
+/// the live grid folds it (`try_combine_regional_indicator` reads the cell's base) and as
+/// `aterm_grapheme::GridColumns` lays a line out: `🇺́🇸` is one unit. A flag's third indicator
+/// starts a unit, and so does one after an indicator a ZWJ joined to another base.
 #[test]
 fn advance_grapheme_unit_folds_a_flag_half_onto_its_base_past_a_mark() {
     use crate::grid::scroll_materialize::advance_grapheme_unit;
@@ -81,7 +72,7 @@ fn advance_grapheme_unit_folds_a_flag_half_onto_its_base_past_a_mark() {
     }
 }
 
-/// Unit test for consecutive combining marks.
+/// Consecutive combining marks join the base.
 #[test]
 fn advance_grapheme_unit_consecutive_combining_marks() {
     use crate::grid::scroll_materialize::advance_grapheme_unit;
@@ -97,7 +88,7 @@ fn advance_grapheme_unit_consecutive_combining_marks() {
     assert_eq!(byte_idx, text.len());
 }
 
-/// Variation selector after emoji: char + VS16 should be one grapheme unit.
+/// An emoji plus VS16 is one unit.
 #[test]
 fn advance_grapheme_unit_variation_selector() {
     use crate::grid::scroll_materialize::advance_grapheme_unit;
@@ -113,7 +104,7 @@ fn advance_grapheme_unit_variation_selector() {
     assert_eq!(byte_idx, text.len());
 }
 
-/// Single ASCII char: advance_grapheme_unit should consume exactly 1 char.
+/// A single ASCII char is one unit of one byte.
 #[test]
 fn advance_grapheme_unit_single_ascii() {
     use crate::grid::scroll_materialize::advance_grapheme_unit;
@@ -141,7 +132,7 @@ fn advance_grapheme_unit_wide_vs16_widens_narrow_emoji() {
     assert_eq!(chars, 2, "heart + VS16 is one unit");
     assert!(wide, "VS16 widens the text-presentation heart to 2 cells");
 
-    // A NON-emoji-capable base is not widened by a stray VS16.
+    // A stray VS16 does not widen a non-emoji-capable base.
     let text = "A\u{FE0F}";
     let mut byte_idx = 0;
     let u = advance_grapheme_unit_wide(text, &mut byte_idx);
@@ -196,8 +187,7 @@ fn advance_grapheme_unit_wide_skin_tone_fold_gates_on_effective_width() {
         "a standalone Fitzpatrick modifier renders as its own wide cell"
     );
 
-    // VS16-widened base: the modifier folds, exactly like the live cell that
-    // was widened before the modifier arrived.
+    // VS16-widened base: the modifier folds, as on a live cell widened before it arrived.
     let text = "\u{261D}\u{FE0F}\u{1F3FD}Z";
     let mut byte_idx = 0;
     let u = advance_grapheme_unit_wide(text, &mut byte_idx);
@@ -206,7 +196,7 @@ fn advance_grapheme_unit_wide_skin_tone_fold_gates_on_effective_width() {
     assert!(wide, "the folded unit keeps the VS16-widened 2-cell width");
 }
 
-/// ZWJ emoji sequence: 👨‍👩‍👧 should be consumed as one grapheme unit.
+/// A ZWJ family emoji is one unit.
 #[test]
 fn advance_grapheme_unit_zwj_emoji_sequence() {
     use crate::grid::scroll_materialize::advance_grapheme_unit;
@@ -229,22 +219,20 @@ fn advance_grapheme_unit_zwj_emoji_sequence() {
 fn advance_grapheme_unit_bounds_pathological_zwj_chain() {
     use crate::grid::scroll_materialize::advance_grapheme_unit;
 
-    // 100k repetitions of "emoji + ZWJ" — ~800 KiB of one "grapheme" if unbounded.
+    // 700 KB of one "grapheme" if unbounded.
     let unit = "\u{1F600}\u{200D}"; // 4-byte emoji + 3-byte ZWJ = 7 bytes
     let text = unit.repeat(100_000);
 
     let mut byte_idx = 0;
     let consumed = advance_grapheme_unit(&text, &mut byte_idx);
-    // Bounded: the first unit stops at the ceiling (< 256 + one 4-byte char), not
-    // the whole ~800 KiB string.
+    // The first unit stops at the ceiling (< 256 bytes plus one 4-byte char).
     assert!(
         byte_idx <= 256 + 4,
         "unit is bounded to the ceiling, got {byte_idx} bytes"
     );
     assert!(consumed > 0, "still makes forward progress");
 
-    // The whole string is still consumable as a SEQUENCE of bounded units (forward
-    // progress, no infinite loop, total bytes conserved).
+    // The whole string is consumed as a sequence of bounded units.
     let mut idx = 0;
     let mut units = 0;
     while idx < text.len() {
@@ -262,7 +250,7 @@ fn advance_grapheme_unit_bounds_pathological_zwj_chain() {
     );
 }
 
-/// Materialize round-trip for consecutive combining marks.
+/// Consecutive combining marks materialize into one cell.
 #[test]
 fn materialize_consecutive_combining_marks() {
     use crate::grid::scroll_materialize::materialize_from_line;
@@ -288,14 +276,12 @@ fn materialize_consecutive_combining_marks() {
     assert_eq!(row.cells[1].char(), 'X', "col 1 should be 'X'");
 }
 
-/// A wide char that cannot fit at the last column stops materialization rather
-/// than scanning the rest of the line with `col` stuck: with cols=1 the leading
-/// wide emoji does not fit and the following 'X' is not placed.
+/// A wide char that cannot fit at the last column stops materialization rather than scanning the
+/// rest of the line with `col` stuck.
 #[test]
 fn materialize_stops_when_wide_char_cannot_fit_at_last_column() {
     use crate::grid::scroll_materialize::materialize_from_line;
 
-    // Wide emoji (2 cols) then a narrow 'X', into a 1-column row.
     let text = "\u{1F600}X";
     let attr_count = text.chars().count();
     let attrs: Rle<CellAttrs> = std::iter::repeat_n(CellAttrs::DEFAULT, attr_count).collect();
@@ -308,8 +294,7 @@ fn materialize_stops_when_wide_char_cannot_fit_at_last_column() {
         "the unfittable wide char is dropped and the scan stops — 'X' is NOT scanned in"
     );
 
-    // A pathologically long all-wide line into a 1-col row must terminate and yield
-    // a bounded (1-col) row rather than scanning every unit.
+    // A pathologically long all-wide line still yields a 1-col row.
     let big = "\u{1F600}".repeat(200_000);
     let attrs2: Rle<CellAttrs> =
         std::iter::repeat_n(CellAttrs::DEFAULT, big.chars().count()).collect();
@@ -322,9 +307,8 @@ fn materialize_stops_when_wide_char_cannot_fit_at_last_column() {
     );
 }
 
-/// Materialize round-trip for orphan ZWJ between visible chars: the ZWJ stays
-/// in `A`'s cell and `B` has a cell of its own, as the live grid drew them
-/// (ruling 2026-10-11, see `advance_grapheme_unit_orphan_zwj_mid_text`).
+/// An orphan ZWJ between visible chars stays in `A`'s cell and `B` gets its own, as the live grid
+/// draws them.
 #[test]
 fn materialize_orphan_zwj_between_visible_chars() {
     use crate::grid::scroll_materialize::materialize_from_line;

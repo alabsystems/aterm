@@ -21,7 +21,8 @@ use crate::input::InputEvent;
 use crate::session_edge_audit::{self, EdgeAction};
 use crate::session_store::{ExitActor, SessionHandle, SessionState, Store};
 use crate::session_timeline::{
-    MetaEdit, MetaField, MetaWriteError, QUESTIONS_USAGE, apply_meta_value, write_session_meta,
+    AUTOPILOT_USAGE, MetaEdit, MetaField, MetaWriteError, QUESTIONS_USAGE, apply_meta_value,
+    write_session_meta,
 };
 use crate::{SessionCtx, term_lock};
 
@@ -29,15 +30,31 @@ use crate::{SessionCtx, term_lock};
 /// session, sorted by local id: `<local> <sid> <parent|-> <state> <title> meta=<1|0>
 /// window=<id|none|-> active=<1|0|-> wfocus=<1|0|-> detail=<pct|-> identity=<name|->
 /// path=<frozen|live> program=<name|-> agent=<word|-> agent_detail=<pct|->
-/// agent_rev=<n> agent_since_ms=<ms> … supervisor=<holder|->
+/// agent_rev=<n> agent_since_ms=<ms> … supervisor=<holder|-> autopilot=<off|cruise|land|->
 /// path_evidence=<measured:<ms>|unconfirmed:<ms>|carried|-> copy=<managed|foreign|->
-/// upgrade=<-|<state>/<to>/<why>/<age>>`.
+/// upgrade=<-|<state>/<to>/<why>/<age>> land_at=<unix s|-> task=<open|landed|done|spent|theirs|->`.
+///
+/// `land_at= task=` (2026-10-16, `docs/DESIGN-harness-autopilot-2026-10-15.md`
+/// §9.3.5, §9.4.1), appended last: for an agent session, the instant its
+/// timed Cruise lands (unix seconds) and its task's face under Land as its
+/// loop last told this window's host — `task=` only while that host holds
+/// the session's live claim — and `-` otherwise
+/// ([`crate::autopilot::land_at_field`], [`crate::autopilot::task_field`]).
+///
+/// `autopilot=` (2026-10-15), right after `supervisor=`: the session's
+/// EFFECTIVE Autopilot when it runs an agent the harness supervises — its own
+/// word, else `[harness] autopilot`, and `off` under the master switch or
+/// with no host ([`crate::autopilot::wire_field`]) — and `-` for any other
+/// session. Read under the snapshot's registry guard (the window's posture,
+/// [`crate::session_store::SessionStore::harness_posture`]) and the one meta
+/// and timeline read of each row.
+///
 /// On a single-session window this is exactly one line == the lone session (the
 /// zero-regression base case). The store snapshot is cloned out before formatting,
 /// so this never holds the registry lock across a `Terminal` lock.
 ///
 /// `meta=<1|0>` (session-metadata stage 1) is a TRAILING additive token: `1` iff
-/// any USER metadata (`meta set title|description|icon|role|attention|questions`) is set, so a fleet
+/// any USER metadata (`meta set title|description|icon|role|attention|questions|autopilot`) is set, so a fleet
 /// driver knows which sessions to `@<sid> meta` without N round-trips. Safe to
 /// append: the title token before it is pct-encoded (never contains a space) and
 /// the one shipping parser (aterm-ctl `ls`) prints the line verbatim, keying only
@@ -108,7 +125,7 @@ pub(crate) fn cmd_sessions(
 pub(crate) fn cmd_sessions_store(store: &Store, proxy: Option<&EventLoopProxy<Wake>>) -> String {
     // The frozen-path marks are read under the SAME guard as the snapshot, so a
     // session cannot be listed with a mark taken from a different registry state.
-    let (snapshot, frozen) = {
+    let (snapshot, frozen, posture) = {
         let g = store.read().unwrap_or_else(|p| p.into_inner());
         let snapshot = g.snapshot();
         let frozen: std::collections::HashSet<u64> = snapshot
@@ -116,7 +133,7 @@ pub(crate) fn cmd_sessions_store(store: &Store, proxy: Option<&EventLoopProxy<Wa
             .filter(|h| g.has_frozen_path(h.local_id))
             .map(|h| h.local_id)
             .collect();
-        (snapshot, frozen)
+        (snapshot, frozen, g.harness_posture())
     };
     // An empty roster needs no window rows; skipping the hop keeps `OK 0` as
     // cheap as it was, and answerable before the event loop is up.
@@ -127,7 +144,7 @@ pub(crate) fn cmd_sessions_store(store: &Store, proxy: Option<&EventLoopProxy<Wa
     };
     // A failed hop costs the window columns (`-`) whatever its reason.
     let rows = rows.as_deref().map_err(|_| "placement hop failed");
-    sessions_lines(&snapshot, rows, |id| frozen.contains(&id))
+    sessions_lines(&snapshot, rows, posture, |id| frozen.contains(&id))
 }
 
 /// `sessions bridge`: the same local-id, stable-sid and launch-nonce triples
@@ -311,10 +328,11 @@ fn roster_title(h: &SessionHandle) -> String {
 /// the engine's, so it is answered either way; so is the title
 /// ([`roster_title`]). `frozen_path` answers the registry's adoption mark per
 /// local id (`path=frozen` when true) — a registry fact, so it is answered
-/// either way too.
+/// either way too; so is `autopilot=`, under the window's `posture`.
 pub(crate) fn sessions_lines(
     snapshot: &[SessionHandle],
     rows: Result<&[SessionWindowRow], &str>,
+    posture: crate::autopilot::HarnessPosture,
     frozen_path: impl Fn(u64) -> bool,
 ) -> String {
     use std::fmt::Write as _;
@@ -327,17 +345,21 @@ pub(crate) fn sessions_lines(
         let title = pct_encode(&roster_title(h));
         // One read of the session's metadata for every column after the title
         // (which [`roster_title`] resolves on its own): the `meta=` bit, the
-        // live supervisor claim, and the typed role, attention and user title a
-        // fleet reader classifies by.
-        let (has_meta, supervisor, role, attention, user_title) = {
+        // live supervisor claim, the typed role, attention and user title a
+        // fleet reader classifies by, and the session's Autopilot word.
+        let (has_meta, supervisor, role, attention, user_title, word, land_at, claimed_here) = {
             let meta = h.ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
             let opt = |v: Option<&str>| v.map_or_else(|| "-".to_string(), pct_encode);
+            let live = meta.live_supervisor(crate::metrics::now_us());
             (
                 u8::from(meta.any_set()),
-                opt(meta.live_supervisor(crate::metrics::now_us())),
+                opt(live),
                 opt(meta.role.as_deref()),
                 opt(meta.attention.as_deref()),
                 opt(meta.user_title.as_deref()),
+                meta.autopilot_word(),
+                meta.land_at,
+                live == Some(crate::autopilot::own_holder()),
             )
         };
         let (window, active, wfocus, detail) = match rows {
@@ -368,15 +390,25 @@ pub(crate) fn sessions_lines(
         // five fields `status` prints — so a fleet read names every agent tab
         // and what it waits on, adopted tabs included. From the same read,
         // `path=` itself — MEASURED where a child of the shell was read, else
-        // the carried mark — and the owner's columns that close the row
-        // (`path_evidence= copy= upgrade=`, gap audit 2026-09-24).
-        let (agent, (path, owner)) = {
+        // the carried mark — and the owner's columns after `autopilot=`
+        // (`path_evidence= copy= upgrade=`, gap audit 2026-09-24), which
+        // `land_at= task=` follow.
+        let (agent, (path, owner), supervised_agent, face) = {
             let timeline = h.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
             (
                 timeline.agent().wire_fields(),
                 timeline.owner_columns(frozen_path(h.local_id), crate::upgrade_host::now_s()),
+                crate::harness_host::agent_of(timeline.agent()),
+                timeline.task_face().map(|(face, _)| face),
             )
         };
+        let autopilot = crate::autopilot::wire_field(posture, word, supervised_agent);
+        // `land_at= task=` (design §9.3.5, §9.4.1), appended last: a timed
+        // Cruise's instant and the task's face for an agent session, from
+        // the same two reads.
+        let land_at =
+            crate::autopilot::land_at_field(land_at.filter(|_| supervised_agent.is_some()));
+        let task = crate::autopilot::task_field(face, claimed_here, supervised_agent);
         // `human_ms=<ms|->`: how long since a PERSON last had a hand on the
         // session through a window — the same atomic `status` reads.
         let human = h.ctx.human_input.wire(crate::metrics::now_us());
@@ -384,13 +416,14 @@ pub(crate) fn sessions_lines(
         // set and the operator a fleet glance needs, in the roster itself rather
         // than one `@sid meta` hop per session) and `supervisor=<holder|->`, the
         // live supervisor claim, so a fleet read shows which agent tabs something
-        // is answering for — all from the one meta read above.
+        // is answering for — all from the one meta read above — and beside it
+        // `autopilot=`, the agent tab's effective Autopilot.
         let _ = writeln!(
             out,
             "{} {} {} {} {} meta={has_meta} nonce={nonce} window={window} active={active} \
              wfocus={wfocus} detail={detail} identity={identity} path={path} {agent} \
              human_ms={human} role={role} attention={attention} user_title={user_title} \
-             supervisor={supervisor} {owner}",
+             supervisor={supervisor} autopilot={autopilot} {owner} land_at={land_at} task={task}",
             h.local_id,
             h.sid.as_str(),
             parent,
@@ -2776,6 +2809,26 @@ pub(crate) fn cmd_turn_guarded(
         let error = error.trim_end_matches(['\r', '\n']);
         return format!("ERR {error}\n");
     }
+    // THE SESSION LOG: the turn this exchange opens carries `by=` (the driving
+    // session, else `ctl`) and `ledger=<id>`; a turn at rest closes. Noted when
+    // the exchange's input is handed to the seam — its first key or paste,
+    // after the yield and the `if-gen=`/`if-rows=` check, and again at each
+    // Enter, its last byte — so the tracker's 5 s attribution window runs
+    // from the exchange's own input: a person's keys during the yield cannot
+    // take the turn, and a typed text longer than the window still opens it
+    // as this exchange's. The timeline's leaf lock is taken there with no other
+    // held (the ledger and lease locks above are released, and no terminal
+    // guard lives across a delivery): it is held under none.
+    let slog_by = io
+        .driver
+        .as_ref()
+        .and_then(|sid| aterm_slog::ShortId::new(sid.as_str()))
+        .map_or(aterm_slog::Actor::Ctl, aterm_slog::Actor::Sid);
+    let note_ctl_input = || {
+        let mut timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+        let at = timeline.slog().now();
+        let _ = timeline.slog_mut().ctl_turn(slog_by, turn_id, at);
+    };
 
     let now0 = Instant::now();
     let started_ms = crate::turn_ledger::now_ms();
@@ -2938,6 +2991,9 @@ pub(crate) fn cmd_turn_guarded(
                         Err(why) => return typed_cut(term, why, typed_keys, 0, turn_id),
                     }
                 }
+                if typed_keys == 0 {
+                    note_ctl_input();
+                }
                 if !(io.key)(ev) {
                     return "ERR key delivery failed\n".to_string();
                 }
@@ -2952,14 +3008,19 @@ pub(crate) fn cmd_turn_guarded(
                     return typed_cut(term, why, typed_keys, 0, turn_id);
                 }
                 pasted_graphemes = remainder.graphemes().count();
+                if typed_keys == 0 {
+                    note_ctl_input();
+                }
                 if !(io.paste)(remainder) {
                     return "ERR paste delivery failed\n".to_string();
                 }
                 committed.get_or_insert_with(crate::control::CommittedInput::enter);
             }
-        } else if !(io.paste)(text) {
-            return "ERR paste delivery failed\n".to_string();
         } else {
+            note_ctl_input();
+            if !(io.paste)(text) {
+                return "ERR paste delivery failed\n".to_string();
+            }
             committed = Some(crate::control::CommittedInput::enter());
         }
         // Echo settle: the editor ingested + painted the burst. Cap the phase so
@@ -3050,6 +3111,9 @@ pub(crate) fn cmd_turn_guarded(
                 let error = error.trim_end_matches(['\r', '\n']);
                 return format!("ERR {error}\n");
             }
+            // The Enter is the exchange's last byte: the turn it starts is
+            // attributed from here (the session log, above).
+            note_ctl_input();
             if let Some(guard) = submit_matcher.as_deref() {
                 // THE GUARDED SUBMIT: Enter only while `<re>` still matches,
                 // decided and written under one terminal lock hold, on the
@@ -3405,10 +3469,15 @@ pub(crate) fn cmd_history(ctx: &SessionCtx, rest: &str) -> String {
 ///   title, reported cwd, lifecycle state) with the USER identity (`meta set`
 ///   fields) — `OK title=<pct> user_title=<pct|-> description=<pct|-> icon=<pct|->
 ///   role=<pct|-> attention=<pct|-> cwd=<pct|-> state=<s>`, then the additive
-///   tail `attention_owner= attention_owners= supervisor= questions=`. Every
-///   free-text value is pct-encoded so the reply is always ONE line; `-` marks
-///   an unset optional. Readers find a field BY KEY.
-/// * `meta set <title|description|icon|role|attention|questions> <text...>`
+///   tail `attention_owner= attention_owners= supervisor= questions= agent_cwd=
+///   autopilot= land_at=` (`land_at=`: the instant a timed Cruise lands, unix
+///   seconds, `-` while none). Every free-text value is pct-encoded so the reply is always
+///   ONE line; `-` marks an unset optional. Readers find a field BY KEY.
+///   `autopilot=` is printed on EVERY bare `meta`, set or `-`: the supervisor's
+///   loop reads the session's word only off a reply that names the field
+///   (`aterm_agent::supervise`'s `AutopilotWord`), so a host that kept the word
+///   and printed it only when set would read as an older build's.
+/// * `meta set <title|description|icon|role|attention|questions|autopilot> <text...>`
 ///   (write-escalated by the dispatch gate): stamp the operator's identity on
 ///   the session. Byte caps (after trim): title ≤ 120, description ≤ 1024,
 ///   icon ≤ 64, role ≤ 64, attention ≤ 256 — over-cap is a hard ERR, never a
@@ -3426,9 +3495,19 @@ pub(crate) fn cmd_history(ctx: &SessionCtx, rest: &str) -> String {
 ///   the worker's own choice under that policy); any other value is `ERR
 ///   usage: meta set questions …`
 ///   ([`QUESTIONS_USAGE`]). Writing it is Owner-only
-///   ([`meta_questions_denied`], answered before this handler).
+///   ([`meta_questions_denied`], answered before this handler). `autopilot` is
+///   the other CLOSED set: `cruise|land|off` (the owner's words `forever`,
+///   `infinity`, `wrap-up`, `wrapup` and `wrap` admitted, case folded, stored
+///   as the mode's word) — how far the window's harness carries this session's
+///   work, over `[harness] autopilot` (`cruise` keeps it moving, `land` wraps
+///   it up and stops, `off` keeps the harness's hands off: the host stops the
+///   session's worker); any other value is `ERR usage: meta set autopilot …`
+///   ([`AUTOPILOT_USAGE`]). Writing it is Owner-only too
+///   ([`meta_questions_denied`]), and a write that moves it rings the host
+///   ([`crate::session_timeline::apply_meta_value`]).
 /// * `meta unset <field>` — clear a field (labels fall back down the chain;
-///   `meta unset questions` hands the session back to the global setting).
+///   `meta unset questions` hands the session back to the global setting, and
+///   `meta unset autopilot` to `[harness] autopilot`).
 ///
 /// Returns `(reply, changed)`: `changed` is `true` only when a stored value
 /// ACTUALLY moved — the dispatch arm keys its side-effects (tab-strip repaint
@@ -3447,19 +3526,10 @@ pub(crate) fn cmd_meta(
         None => (meta_status(term, store, session, ctx), false),
         Some("set") => {
             let Some(field) = toks.next() else {
-                return (
-                    "ERR usage: meta set <title|description|icon|role|attention|questions> \
-                     <text...>\n"
-                        .to_string(),
-                    false,
-                );
+                return (meta_set_usage(), false);
             };
             let Some(typed) = MetaField::parse(field) else {
-                return (
-                    "ERR unknown meta field (title|description|icon|role|attention|questions)\n"
-                        .to_string(),
-                    false,
-                );
+                return (meta_unknown_field(), false);
             };
             // The VALUE is the raw remainder after the field token (single-space
             // grammar like `turn`) — token iteration would collapse interior
@@ -3498,12 +3568,12 @@ pub(crate) fn cmd_meta(
                 Err(MetaWriteError::Empty) if typed == MetaField::Questions => {
                     (format!("ERR {QUESTIONS_USAGE}\n"), false)
                 }
-                Err(MetaWriteError::Empty) => (
-                    "ERR usage: meta set <title|description|icon|role|attention|questions> \
-                     <text...>\n"
-                        .to_string(),
-                    false,
-                ),
+                // …and so does a bare `meta set autopilot`.
+                Err(MetaWriteError::NotAnAutopilot) => (format!("ERR {AUTOPILOT_USAGE}\n"), false),
+                Err(MetaWriteError::Empty) if typed == MetaField::Autopilot => {
+                    (format!("ERR {AUTOPILOT_USAGE}\n"), false)
+                }
+                Err(MetaWriteError::Empty) => (meta_set_usage(), false),
                 Err(MetaWriteError::ForbiddenFormatting) => (
                     format!(
                         "ERR {field} must be single-line and contain no control, bidi, or invisible formatting characters\n"
@@ -3520,11 +3590,7 @@ pub(crate) fn cmd_meta(
                 return ("ERR usage: meta unset <field>\n".to_string(), false);
             };
             let Some(field) = MetaField::parse(field) else {
-                return (
-                    "ERR unknown meta field (title|description|icon|role|attention|questions)\n"
-                        .to_string(),
-                    false,
-                );
+                return (meta_unknown_field(), false);
             };
             // `meta unset attention owner=<k>` clears only owner `<k>`'s entry;
             // the bare form clears the bare owner's, and a keyed owner's
@@ -3557,6 +3623,18 @@ pub(crate) fn cmd_meta(
     }
 }
 
+/// `ERR usage: meta set <field> <text...>`, naming the closed field list
+/// ([`MetaField::NAMES`]).
+fn meta_set_usage() -> String {
+    format!("ERR usage: meta set <{}> <text...>\n", MetaField::NAMES)
+}
+
+/// `ERR unknown meta field (…)`, naming the closed field list
+/// ([`MetaField::NAMES`]).
+fn meta_unknown_field() -> String {
+    format!("ERR unknown meta field ({})\n", MetaField::NAMES)
+}
+
 /// A LEADING `owner=<k>` token on an attention value, and the text after it.
 /// `None` when the value does not lead with one (the bare form). `Err` carries
 /// the refusal for a malformed key — named before anything is stored.
@@ -3584,11 +3662,13 @@ fn attention_owned_reply(
     use crate::session_timeline::AttentionWriteError;
     match result {
         Ok(changed) => ("OK\n".to_string(), changed),
-        // `NotAQuestionsPolicy` is the `questions` field's refusal and never
-        // comes out of the attention ladder; it reads as the usage line here
-        // rather than a panic, should that ever change.
+        // `NotAQuestionsPolicy` and `NotAnAutopilot` are the closed fields'
+        // refusals and never come out of the attention ladder; each reads as
+        // the usage line here rather than a panic, should that ever change.
         Err(AttentionWriteError::Meta(
-            MetaWriteError::Empty | MetaWriteError::NotAQuestionsPolicy,
+            MetaWriteError::Empty
+            | MetaWriteError::NotAQuestionsPolicy
+            | MetaWriteError::NotAnAutopilot,
         )) => (
             "ERR usage: meta set attention owner=<k> <text...>\n".to_string(),
             false,
@@ -3625,10 +3705,20 @@ fn attention_owned_reply(
 /// A bare unset clears any holder's claim; `holder=<h>` clears it only while
 /// `<h>` holds it (`OK` either way). Returns `(reply, changed)` like
 /// [`cmd_meta`].
+///
+/// THE PROVEN SELF-CLAIM ([`crate::self_claim`]): `prove` reads the proof of
+/// a set's holder from the connection and the session (the kernel's peer pid,
+/// the live foreground group, the process's image) — only for a set with no
+/// `ttl=`, as a self-claim is connection-bound; a proven `codex-alab@<pid>` claim replaces the
+/// window host's and a proven claim whose process is gone
+/// ([`crate::session_timeline::claim_rule`]), and the host is told at once
+/// ([`crate::harness_host::self_claimed`]). Every other replacement is
+/// `ERR busy supervisor=<holder>`, as before.
 pub(crate) fn cmd_meta_supervisor(
     ctx: &SessionCtx,
     scope: Scope,
     conn: Option<u64>,
+    prove: &dyn Fn(&str) -> Option<crate::self_claim::Proven>,
     rest: &str,
 ) -> Option<(String, bool)> {
     const USAGE: &str = "ERR usage: meta set supervisor <holder> [ttl=<ms>] | meta unset supervisor \
@@ -3681,12 +3771,30 @@ pub(crate) fn cmd_meta_supervisor(
         Some(ms) => (None, Some(now.saturating_add(ms.saturating_mul(1000)))),
         None => (conn, None),
     };
-    match crate::session_timeline::claim_supervisor(ctx, holder, bound, expires_us, now) {
-        Ok(changed) => {
+    // A self-claim is connection-bound: a `ttl=` lease outlives the
+    // connection (and an `execve` into another image), so it is never proven.
+    let proven = if ttl_ms.is_some() {
+        None
+    } else {
+        prove(holder)
+    };
+    let proof = proven.clone();
+    match crate::session_timeline::claim_supervisor_as(ctx, holder, bound, expires_us, proven, now)
+    {
+        Ok(claimed) => {
             if bound.is_some() {
                 super::note_connection_claim();
             }
-            Some(("OK\n".to_string(), changed))
+            if let Some(proven) = proof {
+                crate::self_claim::claimed(
+                    ctx,
+                    &proven,
+                    claimed.revision,
+                    claimed.changed,
+                    claimed.replaced.as_deref(),
+                );
+            }
+            Some(("OK\n".to_string(), claimed.changed))
         }
         Err(other) => Some((
             format!("ERR busy supervisor={}\n", pct_encode(&other)),
@@ -3695,20 +3803,98 @@ pub(crate) fn cmd_meta_supervisor(
     }
 }
 
-/// `meta set questions …` / `meta unset questions` from a connection that is
-/// not Owner-class: `ERR denied`. `None` for every other form, so the caller
-/// falls through to [`cmd_meta`], which validates and stores it.
+/// `meta set harness_act <act>` — an agent that supervises itself records an
+/// act it took on the session (the native harness contract §5, law 5: who is
+/// driving a session is seen per session). `None` for every other form, so
+/// the caller falls through.
+///
+/// Only the holder of the session's live PROVEN self-claim may: the request
+/// arrives on the connection the claim is bound to, or the kernel proves it
+/// again (`prove`: the peer pid of this direct connection is the claim's pid
+/// and leads the foreground group). Anyone else is `ERR denied`, an unproven
+/// claim's holder included. `<act>` is one owner token (1..64 bytes of
+/// `[A-Za-z0-9._:@/-]`), else `ERR usage: meta set harness_act <act>`. The
+/// act is one `harness-act` row on the session's timeline (`act=<act>
+/// holder=<holder>`) and `status last_act=<act>`; it counts as a change, so
+/// a proven claim's record copy is read again with it
+/// ([`crate::self_claim::meta_changed`]).
+pub(crate) fn cmd_meta_harness_act(
+    ctx: &SessionCtx,
+    conn: Option<u64>,
+    prove: &dyn Fn(&str) -> Option<crate::self_claim::Proven>,
+    rest: &str,
+) -> Option<(String, bool)> {
+    const USAGE: &str = "ERR usage: meta set harness_act <act>\n";
+    let mut toks = rest.split_whitespace();
+    let sub = toks.next()?;
+    if !matches!(sub, "set" | "unset") || toks.next() != Some("harness_act") {
+        return None;
+    }
+    if sub == "unset" {
+        return Some((USAGE.to_string(), false));
+    }
+    let (Some(act), None) = (toks.next(), toks.next()) else {
+        return Some((USAGE.to_string(), false));
+    };
+    if !crate::session_timeline::valid_owner_token(act) {
+        return Some((USAGE.to_string(), false));
+    }
+    let holder = {
+        let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+        meta.live_claim(crate::metrics::now_us()).and_then(|claim| {
+            let proven = claim.proven.as_ref()?;
+            let bound = conn.is_some() && claim.conn == conn;
+            Some((
+                claim.holder.clone(),
+                proven.clone(),
+                bound,
+                meta.supervisor_revision,
+            ))
+        })
+    };
+    // The proof is read outside the meta lock (it reads the kernel).
+    let allowed = holder
+        .filter(|(holder, proven, bound, _)| *bound || prove(holder).as_ref() == Some(proven));
+    let Some((holder, proven, _, revision)) = allowed else {
+        return Some(("ERR denied\n".to_string(), false));
+    };
+    // The kernel look runs off-lock. A release, renewal or replacement while
+    // it ran invalidates admission, even if the next claim spells the same
+    // holder. Hold meta through the timeline commit, in the usual lock order.
+    let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+    if meta.supervisor_revision != revision
+        || meta
+            .live_claim(crate::metrics::now_us())
+            .and_then(|claim| claim.proven.as_ref())
+            != Some(&proven)
+    {
+        return Some(("ERR denied\n".to_string(), false));
+    }
+    ctx.timeline
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .note_harness_act(act, &holder);
+    Some(("OK\n".to_string(), true))
+}
+
+/// `meta set questions|autopilot …` / `meta unset questions|autopilot` from a
+/// connection that is not Owner-class: `ERR denied`. `None` for every other
+/// form, so the caller falls through to [`cmd_meta`], which validates and
+/// stores it.
 ///
 /// The question policy decides whether the in-window supervisor answers
 /// Claude Code's question box FOR the person — the same authority class as
 /// the supervisor claim ([`cmd_meta_supervisor`]), and for the same reason:
 /// an edge token — even a write edge granted on the session — must not be
 /// able to switch the session's questions from `ask` to answered-without-you.
-/// Reading it (`meta`) stays open to every scope that reads metadata.
+/// The Autopilot word is the same authority over the whole session: it decides
+/// whether the harness answers and types at all (`off` to `cruise` puts the
+/// harness's hands back on a session its owner took them off). Reading either
+/// (`meta`) stays open to every scope that reads metadata.
 pub(crate) fn meta_questions_denied(scope: Scope, rest: &str) -> Option<(String, bool)> {
     let mut toks = rest.split_whitespace();
     let sub = toks.next()?;
-    if !matches!(sub, "set" | "unset") || toks.next() != Some("questions") {
+    if !matches!(sub, "set" | "unset") || !matches!(toks.next(), Some("questions" | "autopilot")) {
         return None;
     }
     (!scope.is_owner_class()).then(|| ("ERR denied\n".to_string(), false))
@@ -3769,12 +3955,19 @@ fn meta_status(
     };
     // After `state=`, additive: which owner's entry `attention=` shows (the bare
     // owner prints `%2D` by the rule above), how many owners hold one, the
-    // live supervisor, the session's question policy word (2026-09-24), and
-    // the foreground program's own working directory (2026-09-27) — each
-    // appended LAST: every in-tree reader keys, none counts.
+    // live supervisor, the session's question policy word (2026-09-24), the
+    // foreground program's own working directory (2026-09-27), and the
+    // session's Autopilot word (2026-10-15; ALWAYS named, `-` while unset: the
+    // supervisor's loop reads the word only off a reply that names it), and
+    // after it the instant a timed Cruise lands (`land_at=`, unix seconds,
+    // 2026-10-16; `-` while unset) — each appended LAST: every in-tree reader
+    // keys, none counts. Beside `supervisor=`, `supervisor_proven=<0|1>`
+    // (2026-10-16): whether the live claim is a PROVEN self-claim
+    // ([`crate::self_claim`]), the pair the self-claim contract names (§1).
     format!(
         "OK title={} user_title={} description={} icon={} role={} attention={} cwd={} state={state} \
-         attention_owner={} attention_owners={} supervisor={} questions={} agent_cwd={}\n",
+         attention_owner={} attention_owners={} supervisor={} supervisor_proven={} questions={} \
+         agent_cwd={} autopilot={} land_at={}\n",
         pct_encode(&title),
         opt(meta.user_title.as_deref()),
         opt(meta.description.as_deref()),
@@ -3785,8 +3978,11 @@ fn meta_status(
         opt(attention_owner(&meta)),
         attention_owners(&meta),
         opt(meta.live_supervisor(crate::metrics::now_us())),
+        u8::from(meta.supervisor_proven(crate::metrics::now_us())),
         opt(meta.questions.as_deref()),
         opt(agent_cwd.as_deref()),
+        opt(meta.autopilot.as_deref()),
+        crate::autopilot::land_at_field(meta.land_at),
     )
 }
 
@@ -3847,6 +4043,86 @@ pub(crate) fn cmd_timeline(ctx: &SessionCtx, rest: &str) -> String {
         ));
     }
     out
+}
+
+/// `log [<node>] [lvl=] [since=<seq> ep=<epoch>] [n=] [kinds=] [class=turn]
+/// [tier=content] [--json]`: the target session's SESSION LOG
+/// ([`crate::session_log`]), a pure reader of the ctx's timeline lock like
+/// `timeline`, cross-session correct. `OK <n> v=2 as_of=<seq> ep=<e>
+/// oldest=<seq>[ lost=<n>][ more=<k>]`, then a `gap why= lost= resync_to=`
+/// line when the reader's cursor fell behind the ring or names another epoch,
+/// then one record per line ([`crate::session_log::render_log_copy`]). The
+/// default reply stops at the host tier; `tier=content` adds the content tier
+/// (the OSC title), under the same `ReadScreen` authority `text` and
+/// `timeline` already answer that content with. Only the records shown are
+/// copied under the timeline's leaf lock; the reply is encoded after it is
+/// released, so a long read never holds the lock the status sweep takes.
+pub(crate) fn cmd_log(ctx: &SessionCtx, rest: &str) -> String {
+    let query = match crate::session_log::LogQuery::parse(rest) {
+        Ok(q) => q,
+        Err(usage) => return usage.to_string(),
+    };
+    let copy = {
+        let tl = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+        crate::session_log::LogCopy::copied_from(tl.slog().log(), &query)
+    };
+    crate::session_log::render_log_copy(&copy, &query)
+}
+
+/// `log --json` (the dispatcher's `--json`/`json` route, the flag already
+/// taken off `rest`): [`cmd_log`] with one JSON object per body line, the
+/// cursor's gap included (`{"op":"gap","why":…,"lost":…,"resync_to":…}`).
+pub(crate) fn cmd_log_json(ctx: &SessionCtx, rest: &str) -> String {
+    cmd_log(ctx, &format!("{rest} --json"))
+}
+
+/// `brief [<node>] [budget=<tokens>] [since=<seq> ep=<epoch>]`: the target
+/// session's token-budgeted rollup for an AI reader (design §7.4), from its
+/// session log; `brief all [budget=]` is the instance's, every session's in
+/// turn within one budget (Owner-only, escalated by `control::escalated_op`,
+/// like `sessions`). The store guard is dropped before any timeline is locked,
+/// and each timeline's lock is held only to copy what its brief reads.
+pub(crate) fn cmd_brief(ctx: &SessionCtx, store: &Store, rest: &str) -> String {
+    let query = match crate::session_log::BriefQuery::parse(rest) {
+        Ok(q) => q,
+        Err(usage) => return usage.to_string(),
+    };
+    if query.all {
+        let handles = store.read().unwrap_or_else(|p| p.into_inner()).snapshot();
+        let budget = query.budget.unwrap_or(aterm_slog::INSTANCE_BUDGET);
+        let parts: Vec<crate::session_log::BriefPart> = handles
+            .iter()
+            .map(|h| {
+                let tl = h.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+                crate::session_log::BriefPart {
+                    sid: h.sid.as_str().to_string(),
+                    copy: crate::session_log::BriefCopy::copied_from(
+                        tl.slog().log(),
+                        aterm_slog::Node::SESSION,
+                        None,
+                    ),
+                    now_wall: tl.slog().now().wall_ms,
+                }
+            })
+            .collect();
+        return crate::session_log::render_brief_all(&parts, budget);
+    }
+    let (copy, now) = {
+        let tl = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+        (
+            crate::session_log::BriefCopy::copied_from(tl.slog().log(), query.node, query.cursor),
+            tl.slog().now().wall_ms,
+        )
+    };
+    let mut text = copy
+        .brief(
+            ctx.self_id.as_str(),
+            query.budget.unwrap_or(aterm_slog::DEFAULT_BUDGET),
+            now,
+        )
+        .text;
+    text.push('\n');
+    text
 }
 
 /// `cast` -> `OK <nbytes>\n` then the session's full asciicast v2 recording as
@@ -5058,6 +5334,7 @@ mod tests {
             generation_look: Default::default(),
             reset_lane: Default::default(),
             update_parked: Default::default(),
+            fenced_writes: Default::default(),
         });
         SessionHandle {
             sid,
@@ -5084,9 +5361,11 @@ mod tests {
 
     /// The published program / agent columns, `human_ms=` (2026-09-24), the
     /// typed `role=`/`attention=`/`user_title=` (2026-09-25), `supervisor=`
-    /// (2026-09-23) and the owner's columns, elided by [`tail`] and pinned on their own by
+    /// (2026-09-23), `autopilot=` (2026-10-15), the owner's columns and the
+    /// harness's `land_at=`/`task=` after them (2026-10-16), elided by
+    /// [`tail`] and pinned on their own by
     /// [`the_roster_carries_the_published_program_and_agent_verdict`].
-    const AGENT_COLUMNS: [&str; 15] = [
+    const AGENT_COLUMNS: [&str; 18] = [
         "program=",
         "agent=",
         "agent_detail=",
@@ -5099,9 +5378,12 @@ mod tests {
         "attention=",
         "user_title=",
         "supervisor=",
+        "autopilot=",
         "path_evidence=",
         "copy=",
         "upgrade=",
+        "land_at=",
+        "task=",
     ];
 
     /// The tail every line carries, after the sid and with the per-launch
@@ -5139,8 +5421,8 @@ mod tests {
             ]
         );
         // Against the words the server really publishes.
-        let overloaded = crate::presence::wall_word(aterm_phase::WallKind::Overloaded);
-        let session = crate::presence::wall_word(aterm_phase::WallKind::UsageSession);
+        let overloaded = aterm_phase::WallKind::Overloaded.wire();
+        let session = aterm_phase::WallKind::UsageSession.wire();
         assert!(words[1].matches(overloaded));
         assert!(words[2].matches(session));
         assert!(!words[2].matches(overloaded));
@@ -5178,7 +5460,12 @@ mod tests {
             m.set("attention", Some("stuck on CI".into()));
             m.set("title", Some("my build".into()));
         }
-        let out = sessions_lines(std::slice::from_ref(&h), Ok(&[]), |_| false);
+        let out = sessions_lines(
+            std::slice::from_ref(&h),
+            Ok(&[]),
+            crate::autopilot::HarnessPosture::default(),
+            |_| false,
+        );
         let line = out.lines().nth(1).unwrap();
         assert!(
             line.contains(
@@ -5202,16 +5489,21 @@ mod tests {
         let t0 = Arc::new(Mutex::new(Terminal::new(24, 80)));
         let h = handle(0, &t0);
         let line = |h: &SessionHandle| {
-            sessions_lines(std::slice::from_ref(h), Err("no event loop"), |_| true)
-                .lines()
-                .nth(1)
-                .unwrap()
-                .to_string()
+            sessions_lines(
+                std::slice::from_ref(h),
+                Err("no event loop"),
+                crate::autopilot::HarnessPosture::default(),
+                |_| true,
+            )
+            .lines()
+            .nth(1)
+            .unwrap()
+            .to_string()
         };
         let carried = line(&h);
         assert!(carried.contains(" path=frozen program=- "), "{carried}");
         assert!(
-            carried.ends_with(" path_evidence=carried copy=- upgrade=-"),
+            carried.ends_with(" path_evidence=carried copy=- upgrade=- land_at=- task=-"),
             "{carried}"
         );
         {
@@ -5222,7 +5514,7 @@ mod tests {
         let late = line(&h);
         assert!(
             late.contains(" path=frozen program=- ")
-                && late.ends_with(" path_evidence=carried copy=- upgrade=-"),
+                && late.ends_with(" path_evidence=carried copy=- upgrade=- land_at=- task=-"),
             "a late reading for another group changes nothing: {late}"
         );
         {
@@ -5245,7 +5537,9 @@ mod tests {
         );
         assert!(measured.contains(" path_evidence=measured:"), "{measured}");
         assert!(
-            measured.ends_with(" copy=foreign upgrade=pending/2.1.282/not-idle:busy/2m"),
+            measured.ends_with(
+                " copy=foreign upgrade=pending/2.1.282/not-idle:busy/2m land_at=- task=-"
+            ),
             "{measured}"
         );
         // A live reading lowers the mark once, for the sweep to apply; a
@@ -5266,12 +5560,23 @@ mod tests {
 
     /// The five published columns ride every row LAST, after `path=`, read
     /// from the session timeline the status sweep writes (`-` until it has).
+    /// `autopilot=` beside `supervisor=` is `-` until the session runs an agent
+    /// the harness supervises, then its effective Autopilot.
     #[test]
     fn the_roster_carries_the_published_program_and_agent_verdict() {
         let t0 = Arc::new(Mutex::new(Terminal::new(24, 80)));
         let h = handle(0, &t0);
-        let out = sessions_lines(std::slice::from_ref(&h), Ok(&[]), |_| false);
+        let out = sessions_lines(
+            std::slice::from_ref(&h),
+            Ok(&[]),
+            crate::autopilot::HarnessPosture::default(),
+            |_| false,
+        );
         let line = out.lines().nth(1).unwrap();
+        assert!(
+            line.contains(" supervisor=- autopilot=- "),
+            "no agent: {line}"
+        );
         let (_, cols) = line.split_once(" path=live ").expect("after path=");
         assert!(
             cols.starts_with("program=- agent=- agent_detail=- agent_rev=0 agent_since_ms="),
@@ -5296,7 +5601,12 @@ mod tests {
                 },
             );
         }
-        let out = sessions_lines(std::slice::from_ref(&h), Err("no event loop"), |_| false);
+        let out = sessions_lines(
+            std::slice::from_ref(&h),
+            Err("no event loop"),
+            crate::autopilot::HarnessPosture::default(),
+            |_| false,
+        );
         let line = out.lines().nth(1).unwrap();
         assert!(
             line.contains(
@@ -5309,18 +5619,25 @@ mod tests {
             line.contains(" agent_gen=2.40 agent_fp=00000000000000ab "),
             "the verdict's stamp rides the row: {line}"
         );
-        // `human_ms=`, the typed metadata, `supervisor=`, then the owner's
-        // three columns, close the row: no person has typed…
+        // `human_ms=`, the typed metadata, `supervisor=` and `autopilot=` —
+        // `off` for a supervisable agent with no host to supervise it — then
+        // the owner's three columns and the harness's `land_at=`/`task=` (no
+        // timer, no face told) close the row: no person has typed…
         assert!(
             line.ends_with(
-                " human_ms=- role=- attention=- user_title=- supervisor=- path_evidence=- \
-                 copy=- upgrade=-"
+                " human_ms=- role=- attention=- user_title=- supervisor=- autopilot=off \
+                 path_evidence=- copy=- upgrade=- land_at=- task=-"
             ),
             "{line}"
         );
         // …and once one has, the row says how long ago.
         crate::app_input::note_person(&h.ctx);
-        let out = sessions_lines(std::slice::from_ref(&h), Err("no event loop"), |_| false);
+        let out = sessions_lines(
+            std::slice::from_ref(&h),
+            Err("no event loop"),
+            crate::autopilot::HarnessPosture::default(),
+            |_| false,
+        );
         let line = out.lines().nth(1).unwrap();
         let human = line
             .split_whitespace()
@@ -5328,8 +5645,36 @@ mod tests {
             .unwrap();
         assert!(human.parse::<u64>().is_ok(), "{line}");
         assert!(
-            line.ends_with(" supervisor=- path_evidence=- copy=- upgrade=-"),
+            line.ends_with(
+                " supervisor=- autopilot=off path_evidence=- copy=- upgrade=- land_at=- task=-"
+            ),
             "{line}"
+        );
+        // Under a host that supervises, the agent tab's EFFECTIVE Autopilot:
+        // the table's default, then the session's own word.
+        let cruise =
+            crate::autopilot::HarnessPosture::On(aterm_agent::supervise::Autopilot::Cruise);
+        let autopilot = |posture| {
+            let out = sessions_lines(std::slice::from_ref(&h), Ok(&[]), posture, |_| false);
+            out.lines()
+                .nth(1)
+                .unwrap()
+                .split_whitespace()
+                .find_map(|t| t.strip_prefix("autopilot="))
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(autopilot(cruise), "cruise");
+        h.ctx
+            .meta
+            .lock()
+            .unwrap()
+            .set("autopilot", Some("land".into()));
+        assert_eq!(autopilot(cruise), "land");
+        assert_eq!(
+            autopilot(crate::autopilot::HarnessPosture::MasterOff),
+            "off",
+            "the master switch wins over the word"
         );
     }
 
@@ -5343,7 +5688,12 @@ mod tests {
         let t2 = Arc::new(Mutex::new(Terminal::new(24, 80)));
         let snapshot = vec![handle(0, &t0), handle(1, &t1), handle(2, &t2)];
         let rows = vec![row(0, 0, true, false), row(1, 3, false, true)];
-        let out = sessions_lines(&snapshot, Ok(&rows), |_| false);
+        let out = sessions_lines(
+            &snapshot,
+            Ok(&rows),
+            crate::autopilot::HarnessPosture::default(),
+            |_| false,
+        );
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines[0], "OK 3");
         assert_eq!(
@@ -5399,7 +5749,12 @@ mod tests {
             handle(4, &named),
         ];
         snapshot[4].ctx.meta.lock().unwrap().user_title = Some("ops shell".to_string());
-        let out = sessions_lines(&snapshot, Err("no event loop"), |_| false);
+        let out = sessions_lines(
+            &snapshot,
+            Err("no event loop"),
+            crate::autopilot::HarnessPosture::default(),
+            |_| false,
+        );
         let titles: Vec<&str> = out
             .lines()
             .skip(1)
@@ -5424,7 +5779,12 @@ mod tests {
         let mut empty = handle(6, &fresh);
         empty.title.clear();
         let held = fresh.lock().unwrap();
-        let out = sessions_lines(&[stale, empty], Err("no event loop"), |_| false);
+        let out = sessions_lines(
+            &[stale, empty],
+            Err("no event loop"),
+            crate::autopilot::HarnessPosture::default(),
+            |_| false,
+        );
         drop(held);
         let titles: Vec<&str> = out
             .lines()
@@ -5461,7 +5821,12 @@ mod tests {
             Some(format!("self {} alive /srv/demo-cwd", h.sid.as_str()).as_str()),
             "{family}"
         );
-        let sessions = sessions_lines(&[h], Err("no event loop"), |_| false);
+        let sessions = sessions_lines(
+            &[h],
+            Err("no event loop"),
+            crate::autopilot::HarnessPosture::default(),
+            |_| false,
+        );
         assert_eq!(
             sessions
                 .lines()
@@ -5486,6 +5851,7 @@ mod tests {
         let out = sessions_lines(
             &snapshot,
             Err("main-thread reply did not arrive within 30s"),
+            crate::autopilot::HarnessPosture::default(),
             |_| false,
         );
         let lines: Vec<&str> = out.lines().collect();
@@ -5514,7 +5880,12 @@ mod tests {
         let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
         let h = handle(0, &term);
         let expect = h.nonce.to_hex();
-        let out = sessions_lines(&[h], Err("no event loop"), |_| false);
+        let out = sessions_lines(
+            &[h],
+            Err("no event loop"),
+            crate::autopilot::HarnessPosture::default(),
+            |_| false,
+        );
         let row = out.lines().nth(1).expect("one session row");
         assert!(
             row.contains(&format!(" nonce={expect} ")),
@@ -5593,7 +5964,12 @@ mod tests {
         );
         let snapshot = vec![handle(0, &term)];
         let rows = vec![row(0, 0, true, true)];
-        let out = sessions_lines(&snapshot, Ok(&rows), |_| false);
+        let out = sessions_lines(
+            &snapshot,
+            Ok(&rows),
+            crate::autopilot::HarnessPosture::default(),
+            |_| false,
+        );
         assert!(
             out.contains(" window=0 active=1 wfocus=1 detail=targo%20test identity=- path=live "),
             "{out}"
@@ -5604,7 +5980,12 @@ mod tests {
         );
 
         let held = term.lock().unwrap();
-        let out = sessions_lines(&snapshot, Ok(&rows), |_| false);
+        let out = sessions_lines(
+            &snapshot,
+            Ok(&rows),
+            crate::autopilot::HarnessPosture::default(),
+            |_| false,
+        );
         assert!(
             out.contains(" detail=- identity=- path=live "),
             "contended reads `-` (and the published columns need no terminal lock): {out}"
@@ -5612,7 +5993,12 @@ mod tests {
         drop(held);
 
         term.lock().unwrap().process(b"done\n\x1b]133;D;0\x07");
-        let out = sessions_lines(&snapshot, Ok(&rows), |_| false);
+        let out = sessions_lines(
+            &snapshot,
+            Ok(&rows),
+            crate::autopilot::HarnessPosture::default(),
+            |_| false,
+        );
         assert!(
             out.contains(" detail=- identity=- path=live "),
             "complete reads `-`: {out}"
@@ -5633,7 +6019,12 @@ mod tests {
         worker.identity = Some(Arc::from("worker"));
         let snapshot = vec![worker, handle(1, &t1)];
         let rows = vec![row(0, 0, true, true), row(1, 0, false, true)];
-        let out = sessions_lines(&snapshot, Ok(&rows), |_| false);
+        let out = sessions_lines(
+            &snapshot,
+            Ok(&rows),
+            crate::autopilot::HarnessPosture::default(),
+            |_| false,
+        );
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines[0], "OK 2");
         assert_eq!(
@@ -5669,7 +6060,12 @@ mod tests {
         }
         // The failed-hop arm carries it too: the label is a handle field, not
         // a main-thread answer.
-        let out = sessions_lines(&snapshot, Err("no event loop"), |_| false);
+        let out = sessions_lines(
+            &snapshot,
+            Err("no event loop"),
+            crate::autopilot::HarnessPosture::default(),
+            |_| false,
+        );
         assert!(
             out.lines()
                 .nth(1)
@@ -5690,7 +6086,12 @@ mod tests {
         let t1 = Arc::new(Mutex::new(Terminal::new(24, 80)));
         let snapshot = vec![handle(0, &t0), handle(1, &t1)];
         let rows = vec![row(0, 0, true, true), row(1, 0, false, true)];
-        let out = sessions_lines(&snapshot, Ok(&rows), |id| id == 0);
+        let out = sessions_lines(
+            &snapshot,
+            Ok(&rows),
+            crate::autopilot::HarnessPosture::default(),
+            |id| id == 0,
+        );
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(
             tail(lines[1]),
@@ -5700,7 +6101,12 @@ mod tests {
             tail(lines[2]),
             "1 - alive tab-1 meta=0 window=0 active=0 wfocus=1 detail=- identity=- path=live"
         );
-        let out = sessions_lines(&snapshot, Err("no event loop"), |id| id == 0);
+        let out = sessions_lines(
+            &snapshot,
+            Err("no event loop"),
+            crate::autopilot::HarnessPosture::default(),
+            |id| id == 0,
+        );
         assert!(
             out.lines()
                 .nth(1)
@@ -5788,6 +6194,7 @@ mod tests {
             generation_look: Default::default(),
             reset_lane: Default::default(),
             update_parked: Default::default(),
+            fenced_writes: Default::default(),
         }
     }
 
@@ -6423,6 +6830,11 @@ mod update_anchor_tests {
             &adopted.ctx.temporal,
             Some(7),
             read.sessions[0].timeline_id,
+            read.sessions[0]
+                .log_ids
+                .as_deref()
+                .and_then(crate::session_log::LogCarry::parse),
+            false,
         );
         adopted
             .ctx

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-use super::super::phase::{has_composer_frame, worker_phase};
+use super::super::phase::{context_left, has_composer_frame, survey_open, worker_phase};
 use super::super::prompt::fixtures::{
     bash_multi_row, bash_multi_row_with_note, bash_one_row, composer, read_box, rows, trust_box,
     workflow_box,
@@ -240,6 +240,10 @@ struct Mock {
     /// `"null"` for no person ever, a number for its age; empty sends
     /// none (a host before the person stamp).
     human: Vec<&'static str>,
+    /// `text --json`'s `"human_ms"` for every read of the script's screen at
+    /// an index, ahead of [`Self::human`]: a person who typed into that
+    /// screen's turn, however often the loop reads it.
+    human_on: BTreeMap<usize, &'static str>,
     /// Every `text` read as served: the script index of its screen and
     /// the `"human_ms"` it carried (`""` none) — what a Tier-1 bind
     /// projects a read onto.
@@ -357,6 +361,17 @@ struct Mock {
     /// (1-based, the start-up reconcile read counted): a word changed
     /// while a dialog is answered.
     questions_at: Vec<(usize, Option<&'static str>)>,
+    /// The session's `autopilot` meta word, appended after `questions` in
+    /// the bare `meta` reply (`None`: a build whose meta has no such field;
+    /// `Some("-")`: the field unset).
+    autopilot: Option<&'static str>,
+    /// The word `autopilot` becomes from the `n`-th bare `meta` read on
+    /// (1-based, the start-up reconcile read counted): the owner's chip
+    /// clicked while the loop runs.
+    autopilot_at: Vec<(usize, Option<&'static str>)>,
+    /// The owner's word becomes this just after the script's screen at an
+    /// index is read, independently of whether the loop asks for metadata.
+    autopilot_on: BTreeMap<usize, Option<&'static str>>,
     /// How many bare `meta` reads were served.
     metas: usize,
     /// `status`'s input fields (`input= input_bytes= input_wait_ms=
@@ -481,7 +496,8 @@ struct PanelShared {
 ///   the screen as it is (`await seq` latches once it has moved, `await
 ///   gone` once no row matches, each timing out after a short nap
 ///   otherwise) and counts nothing toward [`Mock::vanish_after`]: the
-///   probe's own waits never end a run.
+///   probe's own waits never end a run (a test's [`Mock::exit_when`]
+///   does, as anywhere).
 ///
 /// Every write of the probe's is recorded with the world it arrived in
 /// ([`PanelProbe`]).
@@ -1030,6 +1046,7 @@ impl Mock {
             gen_fence: false,
             sends_gen: false,
             human: Vec::new(),
+            human_on: BTreeMap::new(),
             reads: Vec::new(),
             uncounted: 0,
             idle_never: false,
@@ -1065,6 +1082,9 @@ impl Mock {
             questions: None,
             questions_after_badge: None,
             questions_at: Vec::new(),
+            autopilot: None,
+            autopilot_at: Vec::new(),
+            autopilot_on: BTreeMap::new(),
             metas: 0,
             input: INPUT_CLEAR,
             input_after: Vec::new(),
@@ -1102,10 +1122,13 @@ impl Mock {
         let questions = self
             .questions
             .map_or_else(String::new, |w| format!(" questions={w}"));
+        let autopilot = self
+            .autopilot
+            .map_or_else(String::new, |w| format!(" autopilot={w}"));
         format!(
             "OK title=- user_title=- description=- icon=- role=- attention={attention} \
              cwd={cwd} state=alive attention_owner={owner} attention_owners={owners} \
-             supervisor=-{questions} agent_cwd={agent_cwd}\n"
+             supervisor=-{questions}{autopilot} agent_cwd={agent_cwd}\n"
         )
     }
     /// The `status` reply: the fields the loop reads.
@@ -1248,10 +1271,11 @@ impl Mock {
         } else {
             10
         };
-        let stamp = match self.human.len() {
-            0 => "",
-            1 => self.human[0],
-            _ => self.human.remove(0),
+        let stamp = match (self.human_on.get(&i), self.human.len()) {
+            (Some(&on), _) => on,
+            (None, 0) => "",
+            (None, 1) => self.human[0],
+            (None, _) => self.human.remove(0),
         };
         self.reads.push((i, stamp));
         let mut human = if stamp.is_empty() {
@@ -1537,8 +1561,13 @@ impl Mock {
         }
     }
 
-    /// A wait while the world holds the screen ([`Self::panel_holds`]).
+    /// A wait while the world holds the screen ([`Self::panel_holds`]). A
+    /// test's [`Self::exit_when`] ends the session here as at any sitting
+    /// wait: a world whose panel never closes ends on what happened.
     fn panel_wait(&mut self, tail: &[&str]) -> CtlReply {
+        if self.exit_when.is_some_and(|done| done(self)) {
+            return err("exited");
+        }
         let asked = tail
             .iter()
             .position(|a| *a == "timeout")
@@ -2070,7 +2099,11 @@ impl Mock {
                 if self.panel_read() || self.reset_read() {
                     return Ok(closed());
                 }
+                let before = self.served;
                 let body = self.screen_json(rows);
+                if let Some(word) = self.autopilot_on.get(&before) {
+                    self.autopilot = *word;
+                }
                 self.panel_seen();
                 self.reset_seen();
                 self.after_gone.push(after_gone);
@@ -2473,6 +2506,11 @@ impl Mock {
                         self.questions = word;
                     }
                 }
+                for &(n, word) in &self.autopilot_at {
+                    if self.metas == n {
+                        self.autopilot = word;
+                    }
+                }
                 Ok(ok(&self.meta_line()))
             }
             "status" => {
@@ -2860,6 +2898,55 @@ fn a_busy_row_the_guard_could_not_read_is_still_up() {
     assert!(s.busy_up("esc to interrupt", &busy_screen()));
     assert!(!s.busy_up("esc to interrupt", &idle_screen()));
 }
+
+/// EACH AGENT'S BUSY GUARD, COMPILED BY THE SERVER'S OWN MATCHER (`await
+/// gone`, [`Session::busy_up`]), IS UP ON ITS MEASURED BUSY SCREENS AND ON
+/// NOTHING ELSE: agy's spinner row, a regex aterm-phase compiles nowhere, and
+/// Muse Code's status row. NEGATIVE CONTROLS: each is down on its program's
+/// idle composer, its draft and its end of turn, and agy's on a box and a
+/// menu, whose footer says `esc to cancel` with no turn running.
+#[test]
+fn each_agents_busy_guard_is_up_on_its_busy_row_alone() {
+    use aterm_phase::prompt::fixtures::screen;
+    use aterm_phase::{agy::fixtures as a, muse::fixtures as u};
+    let mut m = Mock::new(true, Vec::new());
+    let mut s = session(&mut m, None);
+    let cases: [(Program, &[&str], &[&str]); 2] = [
+        (
+            Program::Agy,
+            &[a::BUSY, a::BUSY_TIP],
+            &[
+                a::IDLE,
+                a::DRAFT,
+                a::END_OF_TURN,
+                a::BOX_EXEC,
+                a::QUESTION,
+                a::SLASH_MENU,
+            ],
+        ),
+        (
+            Program::Muse,
+            &[u::BUSY],
+            &[u::IDLE, u::DRAFT, u::END_OF_TURN, u::SLASH_MENU],
+        ),
+    ];
+    for (program, busy, idle) in cases {
+        let guard = program.reader().busy_guard().expect("a busy row");
+        assert!(
+            aterm_observe::row_matcher(&guard).is_ok(),
+            "{program:?}: {guard}"
+        );
+        for text in busy {
+            assert!(s.busy_up(&guard, &screen(text)), "{program:?} busy: {text}");
+        }
+        for text in idle {
+            assert!(
+                !s.busy_up(&guard, &screen(text)),
+                "{program:?} idle: {text}"
+            );
+        }
+    }
+}
 fn idle_screen() -> Vec<String> {
     let mut r = rows(&["⏺ Done.", "", "✻ Cogitated for 4s · done 2:41 PM", ""]);
     r.extend(composer("  ? for shortcuts"));
@@ -2899,9 +2986,11 @@ fn auto(max_s: u64, notes: Option<PathBuf>) -> SuperviseOpts {
         // is a person's, `rm_breaker_ask`), and every turn-end act limited
         // except a usage limit's resume, which only a test that sets it
         // reaches ([`resuming`]): these tests pin the approval loop, and a
-        // turn's end types nothing here.
+        // turn's end types nothing here. The captured trust dialog's folder
+        // is under a trust root, as a person names one: none is by default.
         policy: SupervisorConfig {
             approve: Approve::Safe,
+            trust_roots: vec!["/private/tmp/claude-502/scratch/work*".to_string()],
             rm_breaker_ask: true,
             dismiss_surveys: false,
             answer_questions: false,
@@ -2918,11 +3007,15 @@ fn auto(max_s: u64, notes: Option<PathBuf>) -> SuperviseOpts {
 }
 
 /// Every power the owner's policy has, taken away (each key at its
-/// limit): the loop reads and reports, and answers nothing.
+/// limit): the loop reads and reports, and answers nothing. All but the
+/// autopilot's: at its limit (`off`) the loop parks and reports nothing
+/// either (`an_autopilot_off_parks_the_loop_until_the_word_changes`).
 fn powerless() -> SupervisorConfig {
     let mut p = SupervisorConfig::default();
     for key in super::super::config::KEYS {
-        p.limit(key);
+        if *key != "autopilot" {
+            p.limit(key);
+        }
     }
     p
 }
@@ -3733,6 +3826,169 @@ fn decisions(lines: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// The reader a caller with no session reads a turn by: the one its screen
+/// names ([`aterm_phase::identify`]).
+fn by_screen(turn: &Turn) -> &'static dyn ScreenReader {
+    aterm_phase::identify(None, &turn.screen.rows)
+}
+
+/// A Codex fixture's rows, its footer naming `42% context left` when `context`.
+fn codex_screen(text: &str, context: bool) -> Vec<String> {
+    aterm_phase::prompt::fixtures::screen(text)
+        .into_iter()
+        .map(|r| {
+            if context {
+                r.replace(
+                    "GPT-5.6-Luna low · ",
+                    "GPT-5.6-Luna low · 42% context left · ",
+                )
+            } else {
+                r
+            }
+        })
+        .collect()
+}
+
+/// `aterm drive phase` on a CODEX worker (`status program=codex`): the turn and every line
+/// it prints go by Codex's reader — its question's kind, question, numbered answers and
+/// token (`answer --box`), its busy rule (the status row; the answer streaming, with no end
+/// row under it), and its footer's `<n>% context left`. Measured fixtures (0.156.1).
+/// Negative control: the same screens read by Claude Code's grammar (the session named
+/// `claude`, the grammar `phase` printed every worker by before) say none of it.
+#[test]
+fn drive_phase_reads_a_codex_worker_by_its_own_grammar() {
+    use aterm_phase::codex::fixtures as cx;
+    let question = codex_screen(cx::QUESTION, false);
+    let token = prompt_box_token(
+        &Program::Codex
+            .reader()
+            .prompt(&question)
+            .expect("the question"),
+    )
+    .expect("its token");
+    let cases = [
+        (
+            question,
+            format!(
+                "prompt\nkind question\ndescription What should the new subtraction function be \
+                 called?\noption 1 subtract (Recommended)\noption 2 sub\noption 3 None of the \
+                 above\ninterrupt esc\nbox {token}\n"
+            ),
+        ),
+        (
+            codex_screen(cx::BUSY, false),
+            "busy\nreason status row: esc to interrupt\n".to_string(),
+        ),
+        (
+            codex_screen(cx::STREAMING, false),
+            "busy\nreason transcript: the last message has no end row under it\n".to_string(),
+        ),
+        (
+            codex_screen(cx::END_OF_TURN, true),
+            "idle\ncontext 42%\n".to_string(),
+        ),
+    ];
+    for (rows, want) in cases {
+        let phase = |program| {
+            let mut m = Mock::new(true, vec![rows.clone()]);
+            m.program = program;
+            let mut s = session(&mut m, Some("@s-1".to_string()));
+            let (turn, reader) = s.phase_now().expect("a read");
+            render_phase_and_survey(&turn, reader, &[])
+        };
+        assert_eq!(phase("codex"), want, "{rows:#?}");
+        assert_ne!(phase("claude"), want, "{rows:#?}");
+    }
+}
+
+/// `aterm drive phase` says what ESC does on a Codex box, by its footer: on the question
+/// (`esc to interrupt`) Esc ends the whole turn (`■ Conversation interrupted`, measured on
+/// 0.156.1 and in the lab on 0.163.0) and declines nothing, so the line is `interrupt esc`,
+/// never Claude Code's `cancel esc`. Negative controls: the exec and patch boxes (`esc to
+/// cancel`, their refusal) and the plan box (`esc back`) keep `cancel esc`, and so does every
+/// Claude Code box (the trust box's Esc exits, by its convention).
+#[test]
+fn drive_phase_says_esc_interrupts_a_codex_questions_turn() {
+    use aterm_phase::codex::fixtures as cx;
+    let esc_of = |rows: Vec<String>, program: &'static str| {
+        let mut m = Mock::new(true, vec![rows]);
+        m.program = program;
+        let mut s = session(&mut m, Some("@s-1".to_string()));
+        let (turn, reader) = s.phase_now().expect("a read");
+        let out = render_phase_and_survey(&turn, reader, &[]);
+        out.lines()
+            .find(|l| l.ends_with(" esc"))
+            .map(str::to_string)
+    };
+    for text in [cx::QUESTION, cx::QUESTION_0157] {
+        assert_eq!(
+            esc_of(codex_screen(text, false), "codex").as_deref(),
+            Some("interrupt esc")
+        );
+    }
+    for text in [
+        cx::BOX_EXEC,
+        cx::BOX_PATCH,
+        cx::BOX_EXEC_0_163,
+        cx::BOX_PATCH_0_163,
+        cx::PLAN,
+    ] {
+        assert_eq!(
+            esc_of(codex_screen(text, false), "codex").as_deref(),
+            Some("cancel esc"),
+            "{}",
+            text.lines().next().unwrap_or_default()
+        );
+    }
+    use aterm_phase::prompt::fixtures as f;
+    for text in [f::QUESTION_ONE, f::TRUST, f::BOX_BASH_TOUCH] {
+        assert_eq!(
+            esc_of(f::screen(text), "claude").as_deref(),
+            Some("cancel esc")
+        );
+    }
+}
+
+/// `aterm drive await-turn` on a CODEX worker names its program before the wait (`status`),
+/// so the first wait is for Codex's busy row to leave (`esc to interrupt)`, the status row's
+/// tail) and the lines it prints are Codex's (its footer's context). Negative control: the
+/// wait as `await-turn` ran it before (no program named) arms Claude Code's `esc to
+/// interrupt`, the fallback before any read.
+#[test]
+fn drive_await_turn_names_a_codex_workers_program_before_the_wait() {
+    use aterm_phase::codex::fixtures as cx;
+    let screens = || {
+        vec![
+            codex_screen(cx::BUSY, false),
+            codex_screen(cx::END_OF_TURN, true),
+        ]
+    };
+    let mut m = Mock::new(true, screens());
+    m.program = "codex";
+    let mut s = session(&mut m, Some("@s-1".to_string()));
+    let (turn, reader) = s.await_phase(Duration::from_secs(30)).expect("a turn");
+    assert_eq!(
+        render_phase_and_survey(&turn, reader, &[]),
+        "idle\ncontext 42%\n"
+    );
+    assert_eq!(m.requests[0], "@s-1 status", "{:#?}", m.requests);
+    assert_eq!(
+        m.requests[1], "@s-1 await gone esc.to.interrupt\\) timeout 3000",
+        "{:#?}",
+        m.requests
+    );
+
+    let mut m = Mock::new(true, screens());
+    m.program = "codex";
+    let mut s = session(&mut m, Some("@s-1".to_string()));
+    s.await_turn(Duration::from_secs(30)).expect("a turn");
+    assert_eq!(
+        m.requests[0], "@s-1 await gone esc.to.interrupt timeout 3000",
+        "{:#?}",
+        m.requests
+    );
+}
+
 /// `phase` says WHY busy is busy, and what a limit notice says.
 #[test]
 fn render_phase_names_the_busy_rule_and_the_limit() {
@@ -3745,7 +4001,7 @@ fn render_phase_names_the_busy_rule_and_the_limit() {
         timed_out: false,
     };
     assert_eq!(
-        render_phase(&busy, &[]),
+        render_phase(&busy, by_screen(&busy), &[]),
         "busy\nreason status row: spinner\n"
     );
     let rows = limited_screen();
@@ -3758,7 +4014,7 @@ fn render_phase_names_the_busy_rule_and_the_limit() {
         timed_out: false,
     };
     assert_eq!(
-        render_phase(&limited, &[]),
+        render_phase(&limited, by_screen(&limited), &[]),
         "limited\nmessage You've hit your session limit · resets 7:30pm \
          (America/Los_Angeles)\nreset 7:30pm (America/Los_Angeles)\n"
     );
@@ -3780,7 +4036,7 @@ fn render_prompt_prints_the_notes_after_the_description_and_before_classify() {
     };
     let turn = turn_for(bash_multi_row_with_note());
     assert_eq!(turn.phase, Phase::Prompt);
-    let out = render_phase(&turn, &[]);
+    let out = render_phase(&turn, by_screen(&turn), &[]);
     let lines: Vec<&str> = out.lines().collect();
     assert_eq!(lines[0], "prompt", "{out}");
     assert_eq!(lines[1], "kind bash", "{out}");
@@ -3814,7 +4070,8 @@ fn render_prompt_prints_the_notes_after_the_description_and_before_classify() {
         "{event}"
     );
 
-    let out = render_phase(&turn_for(bash_multi_row()), &[]);
+    let turn = turn_for(bash_multi_row());
+    let out = render_phase(&turn, by_screen(&turn), &[]);
     assert!(
         out.starts_with(
             "prompt\nkind bash\ncommand cd ~/ay && git status --short --branch && git pull 2>&1 | tail -20\n\
@@ -3824,7 +4081,8 @@ fn render_prompt_prints_the_notes_after_the_description_and_before_classify() {
         "{out}"
     );
 
-    let out = render_phase(&turn_for(bash_one_row()), &[]);
+    let turn = turn_for(bash_one_row());
+    let out = render_phase(&turn, by_screen(&turn), &[]);
     assert!(!out.contains("\nnote "), "{out}");
 }
 
@@ -4442,7 +4700,7 @@ fn a_frameless_screen_still_changing_is_busy_until_it_settles() {
         timed_out: true,
     };
     assert_eq!(
-        render_phase(&streaming, &[]),
+        render_phase(&streaming, by_screen(&streaming), &[]),
         "busy\nreason whole screen, no composer frame: output still changing\n"
     );
 }
@@ -4565,7 +4823,7 @@ fn phase_does_not_name_a_key_for_a_card_the_loop_withholds() {
         timed_out: false,
     };
     assert_eq!(
-        render_phase_and_survey(&turn, &[]),
+        render_phase_and_survey(&turn, by_screen(&turn), &[]),
         "idle\nsurvey withheld (an unrecognised card without the vendor's (optional) mark)\n"
     );
 }
@@ -4584,10 +4842,13 @@ fn phase_names_the_key_that_dismisses_an_open_survey() {
         timed_out: false,
     };
     let open = turn(with_survey(idle_screen()));
-    assert_eq!(render_phase_and_survey(&open, &[]), "idle\nsurvey 0\n");
+    assert_eq!(
+        render_phase_and_survey(&open, by_screen(&open), &[]),
+        "idle\nsurvey 0\n"
+    );
     let busy = turn(with_survey(busy_screen()));
     assert_eq!(
-        render_phase_and_survey(&busy, &[]),
+        render_phase_and_survey(&busy, by_screen(&busy), &[]),
         "busy\nreason status row: spinner\nsurvey 0\n"
     );
     let quoted = turn(framed(&[
@@ -4596,11 +4857,14 @@ fn phase_names_the_key_that_dismisses_an_open_survey() {
         "    1: Bad    2: Fine   3: Good   0: Dismiss",
         "",
     ]));
-    assert_eq!(render_phase_and_survey(&quoted, &[]), "idle\n");
+    assert_eq!(
+        render_phase_and_survey(&quoted, by_screen(&quoted), &[]),
+        "idle\n"
+    );
     let plain = turn(idle_screen());
     assert_eq!(
-        render_phase_and_survey(&plain, &[]),
-        render_phase(&plain, &[])
+        render_phase_and_survey(&plain, by_screen(&plain), &[]),
+        render_phase(&plain, by_screen(&plain), &[])
     );
 }
 
@@ -6375,6 +6639,31 @@ fn a_draft_of_more_than_one_row_is_typed() {
     assert!(!typed_draft(&aterm_phase::ClaudeReader, &off));
 }
 
+/// A composer with NO PLACEHOLDER (agy's, [`ScreenReader::placeholder`]):
+/// every word on its caret row was typed, the cursor at column 2 of that
+/// row included (a draft whose cursor was moved home); its empty composer
+/// holds nothing. NEGATIVE CONTROL: read as a program that draws one, the
+/// same row under the same cursor is the placeholder.
+#[test]
+fn every_word_in_a_composer_with_no_placeholder_is_typed() {
+    use aterm_phase::agy::fixtures as a;
+    let ended = aterm_phase::prompt::fixtures::screen(a::END_OF_TURN);
+    let caret = aterm_phase::agy::composer(&ended).expect("the composer");
+    let at_home = |rows: &[String]| Screen {
+        rows: rows.to_vec(),
+        cursor_row: caret,
+        cursor_col: 2,
+        ..Screen::default()
+    };
+    let mut drafted = ended.clone();
+    drafted[caret] = "> hello there".to_string();
+    let agy = &aterm_phase::AgyReader;
+    assert!(typed_draft(agy, &at_home(&drafted)));
+    assert!(!typed_draft(agy, &at_home(&ended)));
+    let composer = agy.composer(&drafted);
+    assert!(!typed_draft_in(composer.as_ref(), true, &at_home(&drafted)));
+}
+
 // ---- the context indicator: running low, and compacted ---------------
 
 /// `r` with Claude Code's context indicator, `<left>% until
@@ -6420,18 +6709,24 @@ fn phase_ends_with_the_context_left() {
         timed_out: false,
     };
     let low = turn(with_context(idle_screen(), 7));
-    assert_eq!(render_phase_and_survey(&low, &[]), "idle\ncontext 7%\n");
+    assert_eq!(
+        render_phase_and_survey(&low, by_screen(&low), &[]),
+        "idle\ncontext 7%\n"
+    );
     let both = turn(with_context(with_survey(busy_screen()), 1));
     assert_eq!(
-        render_phase_and_survey(&both, &[]),
+        render_phase_and_survey(&both, by_screen(&both), &[]),
         "busy\nreason status row: spinner\nsurvey 0\ncontext 1%\n"
     );
     let quoted = turn(framed(&["⏺ It reads:", "  ⎿  7% until auto-compact", ""]));
-    assert_eq!(render_phase_and_survey(&quoted, &[]), "idle\n");
+    assert_eq!(
+        render_phase_and_survey(&quoted, by_screen(&quoted), &[]),
+        "idle\n"
+    );
     let plain = turn(idle_screen());
     assert_eq!(
-        render_phase_and_survey(&plain, &[]),
-        render_phase(&plain, &[])
+        render_phase_and_survey(&plain, by_screen(&plain), &[]),
+        render_phase(&plain, by_screen(&plain), &[])
     );
 }
 
@@ -6644,7 +6939,10 @@ fn a_narrowed_pane_is_not_a_compaction() {
         },
         timed_out: false,
     };
-    assert_eq!(render_phase_and_survey(&turn, &[]), "idle\ncontext 8%\n");
+    assert_eq!(
+        render_phase_and_survey(&turn, by_screen(&turn), &[]),
+        "idle\ncontext 8%\n"
+    );
     let mut m = Mock::new(
         true,
         vec![
@@ -6766,6 +7064,101 @@ fn the_context_watch_is_inclusive_and_needs_the_frame() {
         .expect("said");
         assert_eq!(said, want, "read {seq}");
     }
+}
+
+/// A CODEX WHOSE SCREEN DRAWS NO CONTEXT FIGURE is watched by its rollout's
+/// ([`codex_usage::CodexSeen::context_left`]): Codex 0.163.0's default footer
+/// draws none (measured 2026-10-16 from 6% to 99.6% used), so `EVENT
+/// context` comes from the records look, and the compaction is the figure's
+/// rise (a compacted thread reads 100% left). NEGATIVE CONTROLS: a figure the
+/// look could not read is no compaction, though the frame is up with no box
+/// (Codex's own item stays drawn through one); with no figure in the records
+/// the same screens say nothing at all; a figure Codex DOES draw (an empty
+/// `tui.status_line`) is read off the screen first, and while a box covers
+/// it the records' figure is not weighed against it (no false compaction).
+#[test]
+fn a_codex_without_a_drawn_context_figure_is_watched_by_its_rollouts() {
+    use aterm_phase::codex::fixtures as cx;
+    let idle = aterm_phase::prompt::fixtures::screen(cx::END_OF_TURN_0_163);
+    let reader: &dyn ScreenReader = &aterm_phase::CodexReader;
+    assert_eq!(reader.context(&idle), None, "the default footer draws none");
+    assert!(reader.composer(&idle).is_some());
+    let drawn: Vec<String> = idle
+        .iter()
+        .map(|r| {
+            // As 0.163.0 draws the item with an empty `tui.status_line` (the
+            // lab's capture at 0%: left of the warning).
+            if r.trim_start().starts_with("? for shortcuts") {
+                format!(
+                    "  ? for shortcuts{}8% context left    ⚠ 1 warning · f2 to view",
+                    " ".repeat(80)
+                )
+            } else {
+                r.clone()
+            }
+        })
+        .collect();
+    assert_eq!(
+        reader.context(&drawn),
+        Some(8),
+        "an empty status line draws it"
+    );
+    let run = |records: &[Option<u8>], screens: &[&Vec<String>]| {
+        let mut m = Mock::new(true, vec![]);
+        let mut s = session(&mut m, None);
+        s.context_warn = 10;
+        let mut said: Vec<String> = Vec::new();
+        for (k, (left, rows)) in records.iter().zip(screens).enumerate() {
+            s.set_codex_records(crate::supervise::codex_usage::CodexSeen {
+                context_left: *left,
+                ..crate::supervise::codex_usage::CodexSeen::default()
+            });
+            let screen = Screen {
+                rows: (*rows).clone(),
+                seq: k as u64 + 1,
+                ..Screen::default()
+            };
+            s.watch_context(&screen, reader, &mut |line| {
+                said.push(line.to_string());
+                Ok(())
+            })
+            .expect("said");
+        }
+        said
+    };
+    let five = [&idle, &idle, &idle, &idle, &idle];
+    assert_eq!(
+        run(&[Some(11), Some(9), None, Some(8), Some(100)], &five),
+        [
+            "EVENT context seq=2 9% until auto-compact",
+            "EVENT compacted seq=5"
+        ]
+    );
+    assert_eq!(
+        run(&[None, None, None, None, None], &five),
+        Vec::<String>::new()
+    );
+    // The screen's own figure first: 8% drawn though the records say 50%.
+    assert_eq!(
+        run(&[Some(50)], &[&drawn]),
+        ["EVENT context seq=1 8% until auto-compact"]
+    );
+    // A box up covers the drawn figure: the records' older 50% is no rise
+    // over the 8% the screen drew, so no compaction is said; with the box
+    // gone the screen's own figure reads on.
+    let boxed = aterm_phase::prompt::fixtures::screen(cx::BOX_EXEC_0_163);
+    assert!(reader.prompt(&boxed).is_some(), "a box up");
+    assert_eq!(reader.context(&boxed), None, "it covers the figure");
+    assert_eq!(
+        run(&[Some(50), Some(50), Some(50)], &[&drawn, &boxed, &drawn]),
+        ["EVENT context seq=1 8% until auto-compact"]
+    );
+    // Under a box the records' 9% is not read; the next read, no box up,
+    // reads their 100%: neither warns.
+    assert_eq!(
+        run(&[Some(9), Some(100)], &[&boxed, &idle]),
+        Vec::<String>::new()
+    );
 }
 
 // ---- an outage: an aterm self-update's handoff ------------------------
@@ -7550,7 +7943,7 @@ fn a_budget_spent_in_an_outage_is_the_timeout() {
         .expect("turn");
     assert!(turn.timed_out);
     assert_eq!(
-        render_phase(&turn, &[]),
+        render_phase(&turn, by_screen(&turn), &[]),
         "busy\nreason no screen: no read answered before the timeout\n"
     );
 }
@@ -8309,7 +8702,6 @@ const INBOX_LANDED: &str = "OK 2 hold=0 holder=- seen=3 bus_head=91 dropped=0 pe
                             msg 5 off=90 t=2000 from=h-owner kind=ask trust=human re=70 len=7\n\
                             msg 6 off=91 t=2100 from=s-1@n-1 kind=report trust=agent len=40\n";
 const REPORT_BODY: &str = "Suite green.\n987 passed, 0 failed.\nNothing left.\n";
-const KINDS: &str = "kinds=ask,answer,task,report,note,control,ack,expired,undeliverable";
 
 fn mail_opts(window: Duration, grace: Duration) -> SuperviseOpts {
     SuperviseOpts {
@@ -8387,10 +8779,16 @@ fn watch_mail_folds_the_workers_report_into_its_turn() {
         lane.asked(),
         [
             "@self inbox 1 --peek --meta".to_string(),
-            format!("@self await inbox since=4 {KINDS}"),
+            format!(
+                "@self await inbox since=4 {}",
+                super::super::mail::mail_kinds_arg()
+            ),
             "@self inbox since=4 --peek --meta".to_string(),
             "@self inbox get 6".to_string(),
-            format!("@self await inbox since=6 {KINDS}"),
+            format!(
+                "@self await inbox since=6 {}",
+                super::super::mail::mail_kinds_arg()
+            ),
         ]
     );
     let (records, _) = journal_records(&path);
@@ -9379,6 +9777,9 @@ struct ProbeHost {
     /// It asks for a point of its own ([`IdleHost::wants`]); the step it
     /// then takes ([`IdleHost::at_idle`], kept as `at-idle`) is none.
     wanting: AtomicBool,
+    /// It relaunches an agent the stall's remedy ends
+    /// ([`IdleHost::relaunches_after_stall`]): the remedy may restart it.
+    relaunches: AtomicBool,
     said: Mutex<Vec<String>>,
     /// Each sample handed over, with the world's `pan` and the person's
     /// hand as they stood then ([`PanelShared`]).
@@ -9433,6 +9834,9 @@ impl IdleHost for ProbeHost {
     fn can_restart(&self) -> bool {
         true
     }
+    fn relaunches_after_stall(&self) -> bool {
+        self.relaunches.load(Ordering::SeqCst)
+    }
     fn restart(&self, why: &super::super::policy::turn_end::Restart) -> Option<String> {
         use super::super::policy::turn_end::Restart;
         let what = match why {
@@ -9451,6 +9855,7 @@ impl IdleHost for ProbeHost {
     fn account(&self, point: AccountPoint) -> Option<AccountAdvice> {
         let at = match point {
             AccountPoint::Wall { kind } => format!("account:wall:{}", kind.name()),
+            AccountPoint::LoginEnded => "account:login-ended".to_string(),
             AccountPoint::TurnEnd => "account:turn-end".to_string(),
         };
         self.said.lock().unwrap().push(at);
@@ -11087,6 +11492,13 @@ mod engine {
 mod turn_end {
     use super::*;
     include!("turn_end_loop_tests.rs");
+}
+
+/// The session's Autopilot in the loop (`autopilot_loop_tests.rs`): Land's
+/// instruction, Off's park.
+mod autopilot_loop {
+    use super::*;
+    include!("autopilot_loop_tests.rs");
 }
 
 /// The wall confirmed by the transcript before it is acted on

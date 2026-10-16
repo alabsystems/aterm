@@ -327,17 +327,16 @@ fn terminal_worker_refusal(latch: &LossLatch) -> AcquireRefusal {
     AcquireRefusal::LatchLost
 }
 
-/// The window view's backing `CALayer` from a raw-window-handle target: the
-/// parent [`MetalWindowSurface::attached`] attaches under. `None` for a
-/// non-AppKit handle or a layerless view. Main thread only.
-pub(crate) fn parent_layer_of<W: raw_window_handle::HasWindowHandle>(target: &W) -> Option<Obj> {
-    let raw = target.window_handle().ok()?.as_raw();
-    let raw_window_handle::RawWindowHandle::AppKit(h) = raw else {
+/// The window view's backing `CALayer` from the target's content view: the
+/// parent [`MetalWindowSurface::attached`] attaches under. `None` for a target
+/// with no view (nil off the main thread) or a layerless view. Main thread only.
+pub(crate) fn parent_layer_of<W: aterm_objc::HasNsView>(target: &W) -> Option<Obj> {
+    let view: ffi::Id = target.ns_view().as_ptr();
+    if view.is_null() {
         return None;
-    };
-    let view: ffi::Id = h.ns_view.as_ptr().cast();
-    // SAFETY: `ns_view` is a live NSView pointer for the attach call; `layer`
-    // is a +0 property read retained to +1 by `Obj::retain`.
+    }
+    // SAFETY: `view` is a live NSView while `target` is borrowed (`HasNsView`);
+    // `layer` is a +0 property read retained to +1 by `Obj::retain`.
     unsafe {
         let f: unsafe extern "C" fn(ffi::Id, ffi::Sel) -> ffi::Id = ffi::msg();
         Obj::retain(f(view, ffi::sel(c"layer")))
@@ -346,8 +345,8 @@ pub(crate) fn parent_layer_of<W: raw_window_handle::HasWindowHandle>(target: &W)
 
 /// The EDR potential of the target window's screen
 /// (`NSScreen.maximumPotentialExtendedDynamicRangeColorComponentValue`, 1.0 on
-/// an SDR-only screen). `None` for a non-AppKit handle, a view with no window,
-/// or a window on no screen.
+/// an SDR-only screen). `None` for a target with no view, a view with no
+/// window, or a window on no screen.
 ///
 /// The attach gates the `Rgba16Float` pick through
 /// `format_plan::hdr_swapchain_wants_f16_on_screen`, where `None` keeps the
@@ -357,16 +356,13 @@ pub(crate) fn parent_layer_of<W: raw_window_handle::HasWindowHandle>(target: &W)
 /// afresh. A not-yet-ordered-front window already reports its screen. Main
 /// thread only.
 #[cfg(not(wgpu_arm))]
-pub(crate) fn screen_edr_potential_of<W: raw_window_handle::HasWindowHandle>(
-    target: &W,
-) -> Option<f32> {
-    let raw = target.window_handle().ok()?.as_raw();
-    let raw_window_handle::RawWindowHandle::AppKit(h) = raw else {
+pub(crate) fn screen_edr_potential_of<W: aterm_objc::HasNsView>(target: &W) -> Option<f32> {
+    let view: ffi::Id = target.ns_view().as_ptr();
+    if view.is_null() {
         return None;
-    };
-    let view: ffi::Id = h.ns_view.as_ptr().cast();
-    // SAFETY: `ns_view` is live while `target` is borrowed (the window handle
-    // borrows it). Callers run on the main thread. `-window` and `-screen` are
+    }
+    // SAFETY: `view` is live while `target` is borrowed (`HasNsView`). Callers
+    // run on the main thread. `-window` and `-screen` are
     // +0 reads, nil-checked. The potential getter exists on macOS 10.15+ (the
     // app requires 11.0) and returns a `CGFloat` in the FP register plain
     // `objc_msgSend` returns. Nothing is retained.
@@ -794,7 +790,7 @@ mod tests {
     /// returns `false` every time and the scale must still follow the parent.
     #[test]
     fn the_no_drift_reconcile_still_tracks_the_parents_contents_scale() {
-        let Some(dev) = device() else { return };
+        let dev = device();
         let _test_pool = ffi::AutoreleasePool::new();
         let parent = parent_at_scale(2.0);
         let config = SwapchainConfig {
@@ -903,7 +899,7 @@ mod tests {
     ///   acquire.
     #[test]
     fn acquire_refusals_map_to_the_wgpu_failure_contract() {
-        let Some(dev) = device() else { return };
+        let dev = device();
         let latch = Arc::new(LossLatch::new());
         let config = SwapchainConfig {
             format: PixelFormat::Bgra8Unorm,
@@ -1013,7 +1009,7 @@ mod tests {
     /// and polled to terminal; the latch stays healthy.
     #[test]
     fn the_present_arm_cycles_reconciles_and_crowns_on_the_drawable() {
-        let Some(dev) = device() else { return };
+        let dev = device();
         let _pool = ffi::AutoreleasePool::new();
         const W: usize = 32;
         const H: usize = 24;

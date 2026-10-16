@@ -71,6 +71,7 @@ impl Terminal {
             shell: ShellIntegrationState::new(),
             marks_state: MarksState::new(),
             taskbar_progress: None,
+            program_state: super::program_state::ProgramStateReport::default(),
             kitty_keyboard: KittyKeyboardState::new(),
             xterm_keyboard: XtermKeyboardState::new(),
             mode_mirror: std::sync::Arc::default(),

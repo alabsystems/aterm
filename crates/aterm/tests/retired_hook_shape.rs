@@ -19,6 +19,10 @@
 //! * `…/aterm-link hook run <event> …` — the argv0 alias symlink.
 
 #![cfg(unix)]
+#![allow(
+    clippy::disallowed_types,
+    reason = "test code: a stand-in child may inherit descriptors"
+)]
 
 use std::io::Write as _;
 use std::path::Path;

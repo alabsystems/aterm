@@ -4,8 +4,9 @@
 
 //! Capability enums for the three axes.
 //!
-//! A higher discriminant means more access; the discriminants are pinned by the
-//! tests below and by `policy.rs`'s `test_numeric_policy_table`.
+//! A higher discriminant means more access; the order is stated by the
+//! `policy-monotone-minimal` spec (`SPECS.md`) and the discriminants are pinned
+//! by `policy.rs`'s `test_numeric_policy_table`.
 //!
 //! Readers: `network` selects the Seatbelt profile
 //! ([`crate::sbpl::profile_for`]); `fs` scopes its file rules and moves
@@ -61,42 +62,4 @@ pub enum ProcessCapability {
     Restricted = 1,
     /// Unrestricted process creation. Master/User mode.
     Full = 2,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_network_ordering() {
-        assert!(NetworkCapability::Full > NetworkCapability::None);
-    }
-
-    #[test]
-    fn test_fs_ordering() {
-        assert!(FsCapability::Full > FsCapability::HomeReadWrite);
-        assert!(FsCapability::HomeReadWrite > FsCapability::ProjectReadWrite);
-        assert!(FsCapability::ProjectReadWrite > FsCapability::TmpOnly);
-    }
-
-    #[test]
-    fn test_repr_encoding() {
-        assert_eq!(NetworkCapability::None as u8, 0);
-        assert_eq!(NetworkCapability::Full as u8, 1);
-
-        assert_eq!(FsCapability::TmpOnly as u8, 0);
-        assert_eq!(FsCapability::ProjectReadWrite as u8, 1);
-        assert_eq!(FsCapability::HomeReadWrite as u8, 2);
-        assert_eq!(FsCapability::Full as u8, 3);
-
-        assert_eq!(ProcessCapability::NoFork as u8, 0);
-        assert_eq!(ProcessCapability::Restricted as u8, 1);
-        assert_eq!(ProcessCapability::Full as u8, 2);
-    }
-
-    #[test]
-    fn test_process_ordering() {
-        assert!(ProcessCapability::Full > ProcessCapability::Restricted);
-        assert!(ProcessCapability::Restricted > ProcessCapability::NoFork);
-    }
 }

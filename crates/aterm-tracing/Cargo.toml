@@ -15,16 +15,21 @@ description = "First-party no-op `tracing` facade for aterm (replaces tracing + 
 
 [dependencies]
 # Optional; off on mac, windows and wasm. Renamed so the implicit feature is
-# spelled `tracing-attributes`, as upstream's: on Linux zbus takes default
-# features and the resolver enables `attributes, default, std,
-# tracing-attributes`.
+# spelled `tracing-attributes`, as upstream's. On Linux and the BSDs aterm-gui
+# turns on `attributes` for zbus (which writes `#[instrument]` but takes
+# `tracing` with default features only).
 tracing-attributes = { package = "aterm-tracing-attributes", path = "../aterm-tracing-attributes", optional = true }
 
 [features]
 # Upstream's feature table. Only `default`, `std`, `attributes` and
-# `tracing-attributes` are reachable today (Linux, via zbus); the rest are
-# no-ops declared so a transitive `tracing/log` request still resolves.
-default = ["std", "attributes"]
+# `tracing-attributes` are reachable today; the rest are no-ops declared so a
+# transitive `tracing/log` request still resolves. `default` leaves out
+# `attributes` (upstream's has it): nothing outside the shim writes
+# `#[instrument]`, and the proc macro in the closure is what Trust's loader
+# refuses (PM-1, docs/PLAN-pm1-proc-macro-reach-2026-10-16.md). zbus does
+# write it and asks only for `default`, so aterm-gui's Linux/BSD target row
+# turns `attributes` on there.
+default = ["std"]
 attributes = ["tracing-attributes"]
 # Ignored: the shim is `no_std` regardless.
 std = []

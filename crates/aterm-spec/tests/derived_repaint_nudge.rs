@@ -27,8 +27,8 @@ fn the_repaint_nudge_never_strands_a_tab_and_always_ends() {
     }
     assert_eq!((s["healed"], s["held"], s["debt"]), (1, 0, 0));
 
-    // A SILENT app: the driver still lets go and gives up within its budget,
-    // after ONE try, and the PTY was held, never the engine.
+    // A silent app: the driver still lets go and gives up within its budget, after one try,
+    // and the PTY was held, never the engine.
     let mut s = model.init_state();
     for a in [
         "Debt", "Arm", "Tick", "Tick", "Hold", "Tick", "Tick", "Release", "Tick", "Tick", "GiveUp",
@@ -41,11 +41,11 @@ fn the_repaint_nudge_never_strands_a_tab_and_always_ends() {
     );
     assert_eq!(s["engine"], 0);
 
-    // A flap during the hold that the app never saw: the driver forgets the
-    // hold (the PTY is the layout's) and, nothing answered, gives up out loud.
-    // A resize that LASTS gave the app a size of its own: superseded, never a
-    // give-up; one that comes back after the wait is the window's give-up. The
-    // shipped bugs dropped the first at once, and the last unwatched, silently.
+    // A flap during the hold that the app never saw: the driver forgets the hold (the PTY is
+    // the layout's) and, nothing answered, gives up out loud. A resize that lasts gave the app
+    // a size of its own: superseded, never a give-up; one that comes back after the wait is
+    // the window's give-up. `DropOnFlap` and `ReturnUnwatched` end the first and the last
+    // silently.
     let mut s = model.init_state();
     for a in [
         "Debt", "Arm", "Quiet", "Hold", "Flap", "Forget", "Tick", "Tick", "GiveUp",
@@ -85,8 +85,8 @@ fn the_repaint_nudge_never_strands_a_tab_and_always_ends() {
         "{s:?}"
     );
 
-    // The mutants: a retry without a budget breaks OneTryPerEpoch; a hold that
-    // resizes the ENGINE breaks NudgeNeverTouchesTheEngine.
+    // The mutants: a retry without a budget breaks OneTryPerEpoch; a hold that resizes the
+    // engine breaks NudgeNeverTouchesTheEngine.
     let old = interp::with_buggy(&model, 1);
     let mut s = old.init_state();
     for a in [

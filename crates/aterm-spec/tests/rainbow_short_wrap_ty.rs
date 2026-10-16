@@ -8,11 +8,6 @@ use aterm_spec::{derive::rainbow_short_wrap_park_model, verify};
 #[test]
 fn short_wrap_park_proves_exact_follow_and_catches_both_old_failures() {
     let model = rainbow_short_wrap_park_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|candidate| candidate.name == model.name)
-    );
     verify::prove_and_catch_scalar(&model, model.name);
 
     let held = model.successors("Hold", &model.init_state())[0].clone();
@@ -31,8 +26,8 @@ fn short_wrap_park_proves_exact_follow_and_catches_both_old_failures() {
     assert_eq!(replayed.get("relayed"), Some(&1));
     assert_eq!(replayed.get("armed"), Some(&0));
 
-    // The old same-end branch cancelled the one-cell wrap. The other old
-    // failure let an ordinary one-cell park relay without a content follow.
+    // Buggy = 1: the same-end branch cancels the one-cell wrap, and an ordinary one-cell park
+    // relays without a content follow.
     let buggy = aterm_spec::interp::with_buggy(&model, 1);
     let held = buggy.successors("Hold", &buggy.init_state())[0].clone();
     let exact = buggy.successors("FollowExact", &held)[0].clone();

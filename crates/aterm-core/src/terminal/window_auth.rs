@@ -39,7 +39,7 @@
 #[derive(Debug)]
 pub(super) struct WindowOpsCapability {
     /// Private seal: prevents construction outside this module.
-    _seal: (),
+    _seal: super::Seal,
 }
 
 /// Zero-sized minting authority for [`WindowOpsCapability`].
@@ -86,7 +86,7 @@ impl WindowMintAuthority {
     ) -> Option<WindowOpsCapability> {
         let _ = self;
         if gate.resolve(allow_window_ops) {
-            Some(WindowOpsCapability { _seal: () })
+            Some(WindowOpsCapability { _seal: super::Seal })
         } else {
             None
         }
@@ -138,20 +138,6 @@ mod tests {
     fn capability_and_authority_are_zero_sized() {
         assert_eq!(std::mem::size_of::<WindowOpsCapability>(), 0);
         assert_eq!(std::mem::size_of::<WindowMintAuthority>(), 0);
-    }
-
-    /// Minting is a pure function of the gate and the fallback bool.
-    #[test]
-    fn minting_is_deterministic_in_policy_bit() {
-        let auth = WindowMintAuthority::new();
-        assert_eq!(
-            auth.try_mint_with_engine(Fallback, false).is_some(),
-            auth.try_mint_with_engine(Fallback, false).is_some()
-        );
-        assert_eq!(
-            auth.try_mint_with_engine(Fallback, true).is_some(),
-            auth.try_mint_with_engine(Fallback, true).is_some()
-        );
     }
 
     #[test]

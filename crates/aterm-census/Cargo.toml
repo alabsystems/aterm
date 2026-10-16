@@ -1,9 +1,9 @@
 # Copyright 2026 Andrew Yates
 # SPDX-License-Identifier: Apache-2.0
 #
-# The L0 censuses (main-loop, lock-order, wasm, scope, lazy-init) as one library,
-# shared by the `aterm-census` runner and tools/freeze-safety-gate/build.rs so
-# the manual run and the build-blocking gate cannot diverge.
+# The L0 censuses (main-loop, lock order, wasm, scope, lazy-init) and the source
+# guards as one std-only library, and the `aterm-census` runner over it (bare =
+# all of them).
 
 [package]
 name = "aterm-census"
@@ -11,17 +11,18 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Main-loop completeness census (L0 freeze class) + lock-order census (L0-DEADLOCK): shared by the aterm-census runner and the freeze-safety-gate build"
+description = "The L0 censuses (main-loop reach, lock order, wasm reach, scope cardinality, lazy-init reentrancy), the source guards and the aterm-census runner"
 
 [[bin]]
 name = "aterm-census"
 path = "src/main.rs"
 
 [dependencies]
-# None — pure std, so the census stays offline-capable inside a build script.
+# None: pure std, so the censuses run offline and build in seconds.
 
 [dev-dependencies]
-# None — tests use only std (synthetic trees under a temp dir).
+# None: tests use only std (synthetic trees under a temp dir, and the
+# live_tree_* tests over this checkout).
 
 [lints]
 workspace = true

@@ -1,17 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The `softbuffer`-backed CPU presenter: linux, windows, and every cell that
-//! is not macOS.
+//! The `softbuffer`-backed CPU presenter, for every cell that is not macOS.
 //!
-//! This is a THIN adapter, deliberately. It exists so those cells keep exactly
-//! the behaviour they shipped with while the macOS cell moves to a first-party
-//! presenter — same crate, same calls, same order, same errors. The only real
-//! work it does is translate the seam's first-party [`DamageRect`] back into
-//! `softbuffer::Rect`, and it does that through a scratch buffer owned by the
-//! presenter so a damage-bounded present keeps its steady-state zero-allocation
-//! property (the whole point of the frontend's own
-//! `WindowState::cpu_damage_rect_scratch`).
+//! A thin adapter. Its only work is translating [`DamageRect`] into
+//! `softbuffer::Rect` through a presenter-owned scratch, so a damage-bounded
+//! present stays allocation-free in steady state.
 
 use std::num::NonZeroU32;
 use std::ops::{Deref, DerefMut};
@@ -21,11 +15,8 @@ use winit::window::Window;
 
 use super::{CpuFrameBuffer, CpuPresenter, DamageRect};
 
-/// A `softbuffer` surface plus the display context that must outlive it.
-///
-/// The context is stored only to keep it alive: on X11/Wayland it owns the
-/// shared display connection the surface was built against. Nothing reads it,
-/// which is exactly why it does not appear on the seam.
+/// A `softbuffer` surface plus the display context that must outlive it: on
+/// X11/Wayland the context owns the shared display connection. Nothing reads it.
 pub(crate) struct SoftbufferPresenter {
     surface: softbuffer::Surface<Arc<Window>, Arc<Window>>,
     /// Scratch for the [`DamageRect`] -> `softbuffer::Rect` translation, owned
@@ -34,9 +25,8 @@ pub(crate) struct SoftbufferPresenter {
     _context: softbuffer::Context<Arc<Window>>,
 }
 
-/// One acquired `softbuffer` buffer, paired with the presenter's damage
-/// scratch (a disjoint field borrow, so acquiring the buffer does not lock the
-/// scratch away).
+/// One acquired `softbuffer` buffer plus the presenter's damage scratch (a
+/// disjoint field borrow).
 pub(crate) struct SoftbufferFrame<'a> {
     buffer: softbuffer::Buffer<'a, Arc<Window>, Arc<Window>>,
     damage_scratch: &'a mut Vec<softbuffer::Rect>,
@@ -64,8 +54,7 @@ impl CpuPresenter for SoftbufferPresenter {
     }
 
     fn buffer_mut(&mut self) -> Result<Self::Buffer<'_>, Self::Error> {
-        // Split the borrow by field: the buffer borrows `surface`, the
-        // translation scratch is a sibling field, so both can be live at once.
+        // Split the borrow by field so the buffer and the scratch are live at once.
         let Self {
             surface,
             damage_scratch,

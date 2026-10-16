@@ -27,8 +27,7 @@ fn asymmetric_row_fit_is_the_inverse_of_visible_frame_height() {
         }
     }
 
-    // The old symmetric inverse immediately loses a row at the new exact
-    // default frame height, proving this test distinguishes the two laws.
+    // Negative control: the symmetric `pad_split` inverse loses a row at this height.
     let exact = 24 * 14 + 2 + 12;
     assert_eq!(asymmetric_pad_cells(exact, 2, 12, 14), 24);
     assert_eq!(aterm_render::pad_split(exact, 12, 14).cells, 23);
@@ -73,18 +72,16 @@ fn gpu_crop_alignment_is_exact_for_every_parity_and_crop_direction() {
     assert_eq!((pad - pad_top).div_ceil(2), 5);
 }
 
-/// Tier-1: drive the real clamp + frame-crop helpers over the model's entire
-/// bounded environment, project the resulting dimensions back into the state
-/// machine, and pin one transition through the tiered conformance validator.
+/// Drives the real clamp and crop helpers over the model's whole bounded lattice and validates
+/// one Crop transition through the tiered conformance validator.
 #[test]
 fn visible_pad_crop_shipping_helpers_conform_to_model() {
     let model = aterm_spec::derive::visible_pad_crop_model();
     let buggy = aterm_spec::interp::with_buggy(&model, 1);
     let choices = model.successors("ChooseGeometry", &model.init_state());
     assert_eq!(choices.len(), 4 * 5 * 4 * 3, "complete bounded lattice");
-    // The renderer whose clamp the projected `pad_top` observes: the CPU
-    // backend itself, and the GPU renderer's inner renderer, which its
-    // `pad_top`/`set_pad_top` delegate to.
+    // The projected `pad_top` is this renderer's clamp: the CPU backend's own, and the one
+    // the GPU renderer's `pad_top`/`set_pad_top` delegate to.
     let Some(mut renderer) =
         aterm_render::Renderer::from_system(16.0, aterm_render::Theme::default())
     else {
@@ -166,8 +163,7 @@ fn visible_pad_crop_shipping_helpers_conform_to_model() {
             );
             assert!(ok, "real Crop transition must conform\n{evidence}");
 
-            // Non-vacuous negative control: expose the unmodified raw frame.
-            // The resulting 2*pad-top bottom is exactly the shipped defect.
+            // Negative control: the uncropped raw frame leaves a `2*pad - top` bottom.
             let exposed_raw = project_visible_pad_crop(
                 pad,
                 request,
@@ -192,10 +188,8 @@ fn visible_pad_crop_shipping_helpers_conform_to_model() {
             validated_fixture = true;
         }
 
-        // Negative control for `VisibleTopMatchesRendererTop`: replay a slipped
-        // `clamp_visible_pad_top` (returning the raw request) through the real
-        // GPU path; the renderer draws at its clamped top while nothing is
-        // cropped — the `Buggy=1` Crop.
+        // Negative control for `VisibleTopMatchesRendererTop` (the `Buggy=1` Crop): an
+        // unclamped top through the real GPU path, where the renderer still clamps.
         if pad == 2 && request == 4 && grid == 1 && head == 0 {
             let slipped_top = request;
             renderer.set_pad_top(slipped_top);
@@ -256,7 +250,6 @@ fn gpu_effect_shift_covers_only_absolute_streams_and_restores_exactly() {
     }];
     input.glow_under = vec![GlowQuad {
         y: 21,
-        // Additive light (see `GlowQuad::alpha`).
         alpha: 0,
         ..GlowQuad::default()
     }];
@@ -273,7 +266,6 @@ fn gpu_effect_shift_covers_only_absolute_streams_and_restores_exactly() {
     // Renderer-offset/grid-relative streams must not be double-shifted.
     input.nova_add = vec![GlowQuad {
         y: 30,
-        // Additive light (see `GlowQuad::alpha`).
         alpha: 0,
         ..GlowQuad::default()
     }];
@@ -308,7 +300,6 @@ fn gpu_effect_shift_covers_only_absolute_streams_and_restores_exactly() {
     let mut invalid = RenderInput::empty();
     invalid.cursor_glow_add = vec![GlowQuad {
         y: u16::MAX,
-        // Additive light (see `GlowQuad::alpha`).
         alpha: 0,
         ..GlowQuad::default()
     }];

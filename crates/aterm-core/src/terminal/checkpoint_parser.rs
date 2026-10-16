@@ -12,13 +12,10 @@
 //! [`aterm_parser::Parser::restore_carry`]'s decision, made in
 //! `Terminal::restore_checkpoint`.
 //!
-//! The carry crosses builds in both directions, so a carry an older build
-//! would refuse rides in the form that build reads, with the exact one beside
-//! it under [`ParserRepr::exact`] (ruling 2026-10-10): a DCS header, carried as
-//! itself since then, goes out as `{"state":"DcsIgnore","exact":{…}}`. A build
-//! before the key reads the `DcsIgnore` it wrote itself for a header, and
-//! ignores the key; this build reads `exact`. An older producer's `DcsIgnore`
-//! reads here as it was meant.
+//! The carry crosses builds in both directions, so a carry an older build would
+//! refuse rides in the form that build reads, with the exact one under
+//! [`ParserRepr::exact`]: a DCS header goes out as `{"state":"DcsIgnore","exact":{…}}`.
+//! An older build reads the `DcsIgnore` and ignores the key; this build reads `exact`.
 
 use aterm_parser::{ParserCarry, State};
 
@@ -57,18 +54,15 @@ pub struct ParserRepr {
     /// The length of the character `utf8_tail` begins.
     #[serde(default, skip_serializing_if = "is_zero_u8")]
     pub utf8_expected: u8,
-    /// The head of a split UTF-8 character a DCS or APC string's payload
-    /// ends in, hex. A build before it ignores it (and reads the string's
-    /// next `0x9C` as its ST); one after it reads its absence as no head.
+    /// The head of a split UTF-8 character a DCS or APC string's payload ends in,
+    /// hex. An older build ignores it (and reads the string's next `0x9C` as its ST).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub string_utf8_tail: String,
-    /// The carry itself, when the fields beside it are the coarser form a
-    /// build that predates it reads in its place
-    /// ([`ParserCarry::for_older_builds`]): a DCS header, which such a build
-    /// refuses (it would resume at Ground and print the string), rides there
-    /// as the `DcsIgnore` that build wrote itself. Such a build ignores the
-    /// key; this one reads only it, one level deep (an `exact` inside it is
-    /// not read).
+    /// The carry itself, when the fields beside it are the coarser form an older
+    /// build reads instead ([`ParserCarry::for_older_builds`]): a DCS header, which
+    /// such a build refuses (it would resume at Ground and print the string), rides
+    /// beside a `DcsIgnore`. Older builds ignore the key; this one reads only it, one
+    /// level deep.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exact: Option<Box<ParserRepr>>,
 }
@@ -240,14 +234,9 @@ mod tests {
         assert_eq!(repr.to_carry(), Some(string));
     }
 
-    /// A DCS HEADER CROSSES BUILDS BOTH WAYS (round fifteen, R15-PARSER-P1;
-    /// ruling 2026-10-10). Carried as itself, it rides under `exact`, beside
-    /// the fields a build before the key reads: the `DcsIgnore` holding
-    /// nothing that such a build wrote for every header, which its
-    /// `restore_carry` accepts (without the key, which its `ParserRepr` does
-    /// not have and serde drops, it reads exactly that). This build reads the
-    /// header. An older producer's `DcsIgnore` reads here as it was meant, and
-    /// a carry an older build reads as it is crosses with no `exact`.
+    /// A DCS header rides under `exact` beside the empty `DcsIgnore` an older build
+    /// reads and restores; this build reads the header. An older producer's
+    /// `DcsIgnore` reads as meant, and a carry an older build reads as-is has no `exact`.
     #[test]
     fn a_dcs_header_rides_beside_the_form_an_older_build_reads() {
         let header = ParserCarry {

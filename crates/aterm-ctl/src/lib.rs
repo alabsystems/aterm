@@ -114,6 +114,13 @@
 //! its bytes where it is meant to go; on a terminal there is no parser to
 //! keep them for, and the rendering is the identity on what an honest server
 //! sends — so one rule covers every verb, and no verb can be forgotten.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_types,
+        reason = "test code: a stand-in child may inherit descriptors"
+    )
+)]
 
 use std::collections::HashSet;
 use std::env;
@@ -124,6 +131,10 @@ use std::process::ExitCode;
 use aterm_types::control_socket;
 use aterm_uds::CtlStream;
 
+/// The `aterm-askpass` role: the `SUDO_ASKPASS` helper for macOS sessions
+/// (`docs/DESIGN-sudo-askpass-2026-10-15.md`).
+pub mod askpass;
+pub use askpass::main_entry as askpass_main_entry;
 pub mod census;
 mod conn;
 pub use conn::conn_main_entry;
@@ -359,8 +370,10 @@ CLIENT VERBS (answered by aterm-ctl itself, no server round-trip):
                   agent_detail=<pct|-> agent_rev=<n> agent_since_ms=<ms> agent_gen=<e.s|->
                   agent_fp=<hex16|-> human_ms=<ms|-> role=<pct|-> attention=<pct|->
                   user_title=<pct|-> supervisor=<holder|->
+                  autopilot=<off|cruise|land|->
                   path_evidence=<measured:<ms>|unconfirmed:<ms>|carried|->
-                  copy=<managed|foreign|-> upgrade=<-|<state>/<to>/<why>/<age>>[ *]
+                  copy=<managed|foreign|-> upgrade=<-|<state>/<to>/<why>/<age>>
+                  land_at=<unix-s|-> task=<open|landed|done|spent|theirs|->[ *]
                   (* = the calling terminal's own session; window= is the
                   hosting window — a headless instance reports its one logical
                   window 0; none = a session no window holds; - = the instance
@@ -377,11 +390,14 @@ CLIENT VERBS (answered by aterm-ctl itself, no server round-trip):
                   run aterm's managed builds: frozen = a foreign copy (a
                   native install, a brew cask) wins its PATH. Measured from a
                   program the shell itself started where one has run, else
-                  the mark the shell was adopted with; the row's closing
+                  the mark the shell was adopted with; the row's
                   path_evidence=, copy= and upgrade= columns say which, which
-                  build an agent in front runs, and its live upgrade — `help
-                  sessions` has them. A tab whose foreground is an agent is
-                  never the place to type a shell line: it is a prompt there).
+                  build an agent in front runs, and its live upgrade;
+                  autopilot=, land_at= and task= say how the harness carries
+                  an agent tab — its Autopilot, a timed Cruise's landing
+                  instant and the task's face — `help sessions` has them. A
+                  tab whose foreground is an agent is never the place to type
+                  a shell line: it is a prompt there).
     instances     one line per live same-user instance:
                   <pid> <session-count> <sock>[ self]
                   (self = the instance hosting the calling terminal).
@@ -928,6 +944,16 @@ pub fn front_door_delivered(e: &io::Error) -> bool {
     e.get_ref().is_some_and(|inner| inner.is::<Delivered>())
 }
 
+/// Whether a line [`front_door_send`] returned is the CONNECT PHASE's refusal
+/// (`ERR auth`, with or without the token file it names, or `ERR control server
+/// busy; retry`) rather than the instance's answer to the request: the request
+/// was never sent, so nothing was decided about it and the caller acts as if no
+/// instance answered.
+#[must_use]
+pub fn front_door_refused(line: &str) -> bool {
+    is_connection_refusal(line) || line.starts_with("ERR auth;")
+}
+
 /// Windows: hand our right to set the foreground window to the instance we
 /// forward to, so its `SetForegroundWindow` raises the window instead of
 /// flashing the taskbar button.
@@ -1383,7 +1409,11 @@ fn targets_own_session_implicitly(parts: &[String], sock: Option<&str>, pid: Opt
     let Some(first) = parts.first() else {
         return false;
     };
-    if addresses_no_session(first) {
+    let verb_idx = usize::from(first.starts_with('@'));
+    if parts
+        .get(verb_idx)
+        .is_some_and(|verb| addresses_no_session(verb))
+    {
         return false;
     }
     // `subscribe` carries its selector second; every other verb takes an
@@ -2178,21 +2208,12 @@ fn probe_exchange(
     let Some(count) = stream_count(tail) else {
         return Probe::Other(malformed_header_error(status));
     };
-    let mut lines = Vec::with_capacity(count);
-    for _ in 0..count {
-        let mut line = String::new();
-        match probe_read_bounded_line(&mut reader, &mut line, deadline) {
-            Err(e) => return io_probe(e),
-            Ok(0) => {
-                return Probe::Other(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "the server closed before the complete discovery response",
-                ));
-            }
-            Ok(_) => lines.push(line.trim_end_matches(['\r', '\n']).to_string()),
-        }
+    match collect_reply_lines(count, MAX_BODY_BYTES, |line| {
+        probe_read_bounded_line(&mut reader, line, deadline)
+    }) {
+        Ok(lines) => Probe::Answered(lines),
+        Err(e) => io_probe(e),
     }
-    Probe::Answered(lines)
 }
 
 /// Map a failed `connect()` to its [`Probe`] class. `ECONNREFUSED` is a stale
@@ -3840,6 +3861,10 @@ fn is_unanswered(e: &io::Error) -> bool {
     e.get_ref().is_some_and(|inner| inner.is::<Unanswered>())
 }
 
+fn is_ok_reply(header: &str) -> bool {
+    header == "OK" || header.starts_with("OK ")
+}
+
 /// Read the reply's status line via [`read_bounded_line`], marking a deadline
 /// that fires here [`Unanswered`]. Every [`converse`] conversation reads its
 /// status line through this.
@@ -4232,7 +4257,7 @@ fn help_on(stream: CtlStream, name: &str, local: &LocalVerbs) -> io::Result<Exit
         return Ok(ExitCode::FAILURE);
     };
     let n = stream_count(tail).ok_or_else(|| malformed_header_error(status))?;
-    let rows = drift::read_lines(&mut reader, n)?;
+    let rows = read_reply_lines(&mut reader, n)?;
     let mut reply = format!("OK {}\n", rows.len());
     for row in &rows {
         reply.push_str(row);
@@ -4998,15 +5023,21 @@ fn stream_count(tail: &str) -> Option<usize> {
     (count <= MAX_STREAM_LINES).then_some(count)
 }
 
+/// The note [`search_incomplete_note`] prints for the depth cap: history OLDER
+/// than the rows searched was not searched, and nothing else was missed.
+pub const SEARCH_DEPTH_NOTE: &str = "older history not searched (search_history_lines)";
+
 /// What `search`'s ` incomplete` header marker means, for stderr: one note per
 /// cause token after it, joined with `; `, or the depth cap when there is none.
 /// The server names every cause that applies (` older` is the depth cap beside
 /// another cause, ruling 2026-10-11), so the note names them all rather than
 /// the first. An older server sends a bare ` incomplete` at the match limit
 /// too, so a bare marker at 100000 names the limit. `None` for a header
-/// without the marker.
-fn search_incomplete_note(tail: &str) -> Option<String> {
-    const DEPTH: &str = "older history not searched (search_history_lines)";
+/// without the marker. `tail` is the header after its `OK `. Public for the
+/// supervisor's persistent connection, which prints a reply as this client
+/// does (`aterm-agent`'s `transport::render`).
+pub fn search_incomplete_note(tail: &str) -> Option<String> {
+    const DEPTH: &str = SEARCH_DEPTH_NOTE;
     const LIMIT: &str = "results stop at 100000 matches";
     let mut words = tail.split_whitespace();
     let count = words.next().and_then(|n| n.parse::<usize>().ok());
@@ -5018,11 +5049,13 @@ fn search_incomplete_note(tail: &str) -> Option<String> {
         let said = match cause {
             "capped" => LIMIT,
             "rewrapping" => "screen only: the history is rewrapping",
+            "changed" => "the terminal changed while the search ran",
             "long-line" => {
                 "a long line was not searched to its end: the regex ran out of scan budget there"
             }
             "older" => DEPTH,
-            _ => continue,
+            word if word.starts_with("screen_first=") => continue,
+            _ => "the server reported an unrecognized search completeness cause",
         };
         if !note.is_empty() {
             note.push_str("; ");
@@ -5061,9 +5094,10 @@ fn byte_count(tail: &str) -> Option<usize> {
     (n <= MAX_BODY_BYTES).then_some(n)
 }
 
-/// Upper bound on a peer-supplied byte-framed body (`cast`/`temporal`), far
-/// above any legitimate body. The body is streamed through `Read::take`, so
-/// this bounds output and time, not memory.
+/// Upper bound on a peer-supplied byte-framed body (`cast`/`temporal`) or
+/// line-framed body. The CLI streams byte bodies through `Read::take` and
+/// charges line bodies against the same aggregate ceiling: a consumer may
+/// retain stdout, and count/per-line ceilings alone allow terabytes.
 const MAX_BODY_BYTES: usize = 256 << 20; // 256 MiB
 
 /// Upper bound on one reply line's bytes, enforced by [`read_bounded_line`] on
@@ -5380,6 +5414,62 @@ fn read_bounded_line<R: BufRead>(reader: &mut R, line: &mut String) -> io::Resul
             "stream did not contain valid UTF-8",
         )),
     }
+}
+
+/// Collect one line-framed reply, with its wire bytes bounded in aggregate
+/// as well as per line. Shared by discovery, conn, help and cast drift so a
+/// peer cannot multiply the per-line allowance by the 200,000-line ceiling.
+fn read_reply_lines<R: BufRead>(reader: &mut R, count: usize) -> io::Result<Vec<String>> {
+    collect_reply_lines(count, MAX_BODY_BYTES, |line| {
+        read_bounded_line(reader, line)
+    })
+}
+
+/// The collector's read seam preserves discovery's absolute deadline checks
+/// before and after every line, including lines already buffered in memory.
+fn collect_reply_lines(
+    count: usize,
+    max_bytes: usize,
+    mut read_line: impl FnMut(&mut String) -> io::Result<usize>,
+) -> io::Result<Vec<String>> {
+    if count > MAX_STREAM_LINES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "reply line count exceeds the bound",
+        ));
+    }
+    let mut bytes_left = max_bytes;
+    let mut lines = Vec::with_capacity(count.min(4096));
+    for _ in 0..count {
+        let mut line = String::new();
+        if read_line(&mut line)? == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "server hung up before the complete line-framed response",
+            ));
+        }
+        charge_reply_bytes(&mut bytes_left, line.len())?;
+        if line.ends_with('\n') {
+            line.pop();
+        }
+        if line.ends_with('\r') {
+            line.pop();
+        }
+        lines.push(line);
+    }
+    Ok(lines)
+}
+
+/// Charge bytes before retaining or forwarding them. The caller chooses its
+/// initial allowance; subtraction also refuses an arithmetic overrun.
+fn charge_reply_bytes(bytes_left: &mut usize, len: usize) -> io::Result<()> {
+    *bytes_left = bytes_left.checked_sub(len).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "reply body exceeds the 256 MiB aggregate bound",
+        )
+    })?;
+    Ok(())
 }
 
 /// Connect to the control socket at `path` and read the token for that
@@ -5864,6 +5954,7 @@ fn print_payload(reader: &mut BufReader<&CtlStream>, count: usize) -> io::Result
     // `subscribe` relay (`redial::relay_subscription`) flushes per frame
     // instead.
     let mut out = StdoutSink::new(io::BufWriter::new(stdout.lock()));
+    let mut bytes_left = MAX_BODY_BYTES;
     for _ in 0..count {
         let mut line = String::new();
         if read_bounded_line(reader, &mut line)? == 0 {
@@ -5872,6 +5963,7 @@ fn print_payload(reader: &mut BufReader<&CtlStream>, count: usize) -> io::Result
                 "server hung up before the complete line-framed response",
             ));
         }
+        charge_reply_bytes(&mut bytes_left, line.len())?;
         // Normalize the line ending; preserve the row's content verbatim.
         let line = line.strip_suffix('\n').unwrap_or(&line);
         let line = line.strip_suffix('\r').unwrap_or(line);
@@ -6316,8 +6408,11 @@ fn exchange_on(
         // stderr ("worked, no results"). Some headers carry facts the rows need
         // and always go to stderr: `inbox` (hold/seen/dropped/pending),
         // `offscreen` (`last=` is the next `since=`, `screen_rows=` splits archive
-        // from screen, `lost=`/`breaks=`; `aterm drive report` reads it here) and
-        // `resizes` (`render=`, `flaps=`, `unledgered=`, `lost=`).
+        // from screen, `lost=`/`breaks=`; `aterm drive report` reads it here),
+        // `resizes` (`render=`, `flaps=`, `unledgered=`, `lost=`), `log`
+        // (`as_of=` and `ep=` are the next `since=` and `ep=`, `lost=`, `more=`)
+        // `brief` (`sid=`, `as_of=`, `ep=`, `budget=`, `used=`), and `search`
+        // (completeness qualifiers a caller must not infer from the hit rows).
         if drift::is_drift_request(verb, frame_request) {
             // Every `cast drift` is dispatched to the `drift` module before any
             // exchange; this is a backstop. A server predating the verb answers
@@ -6339,7 +6434,10 @@ fn exchange_on(
             print_stdout_line(status_line)?;
         } else if verb == "inbox"
             || verb == "offscreen"
+            || verb == "search"
             || verb == "resizes"
+            || verb == "log"
+            || verb == "brief"
             // `history`'s header carries ` unheld_below=<id>` when an update could
             // not carry the ledger whole.
             || (verb == "history" && tail.split_whitespace().nth(1).is_some())
@@ -6427,11 +6525,9 @@ fn answer_replacement(
             waited,
             by_deadline,
         } => {
-            stderr_line(&redial::gone_note(
-                server,
-                waited,
-                by_deadline,
-                redial.unfollowed(),
+            stderr_line(&redial::gone_request_note(
+                redial::gone_note(server, waited, by_deadline, redial.unfollowed()),
+                request_parts,
             ))?;
             Ok(ExitCode::from(redial::EXIT_REPLACED))
         }

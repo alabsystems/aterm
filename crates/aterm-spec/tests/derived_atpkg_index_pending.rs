@@ -6,14 +6,9 @@ use aterm_spec::{derive::atpkg_index_pending_park_model, interp, verify};
 #[test]
 fn one_index_probe_can_overlap_a_vendor_hint_without_losing_ready_priority() {
     let model = atpkg_index_pending_park_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name)
-    );
     verify::prove_and_catch_scalar(&model, "atpkg index pending park");
     assert_eq!(
-        verify::audit_dead_negative_controls(&model, &[]),
+        verify::audit_dead_negative_controls(std::slice::from_ref(&model)),
         Ok(0),
         "a rejected extra-start attempt is live at the committed dial"
     );

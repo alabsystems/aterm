@@ -49,6 +49,8 @@ use aterm_agent::supervise::{QuestionPriority, SupervisorConfig};
 use aterm_phase::WallKind;
 use aterm_spec::derive::{Model, supervisor_turn_end_model};
 
+use crate::common::cnst;
+
 type State = BTreeMap<&'static str, i64>;
 
 /// Work a turn did that counts, and work that does not.
@@ -56,14 +58,6 @@ const LONG: Duration = Duration::from_secs(3 * 60);
 const SHORT: Duration = Duration::from_secs(10);
 /// A person's keystroke well inside the grace.
 const JUST_TYPED: Duration = Duration::from_secs(1);
-
-fn cnst(m: &Model, name: &str) -> i64 {
-    m.consts
-        .iter()
-        .find(|(n, _)| *n == name)
-        .map(|(_, v)| *v)
-        .unwrap_or_else(|| panic!("no const {name}"))
-}
 
 /// A turn that ends on a report, and one that ends on a choice.
 const REPORT: &str = "Stage done.";
@@ -175,6 +169,10 @@ fn reading(
         thread_model: None,
         upgrade_goal: false,
         account: None,
+        autopilot: aterm_agent::supervise::Autopilot::Cruise,
+        login_label: None,
+        login_superseded: false,
+        login_notice: None,
     }
 }
 

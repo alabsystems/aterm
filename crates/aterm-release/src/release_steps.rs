@@ -2,15 +2,14 @@
 // Copyright 2026 Andrew Yates
 
 //! The real [`crate::release::Backend`]: what `targo --unverified ship release` asks of
-//! git, the publication engine, the receipt stores, the release cache, the children it
-//! runs (the trust lane, the one build, the MEASURE run, `pub stage`/`pub publish`, the
-//! cut, the site hook), the channel and the owner's aterm.
+//! git, the publication engine, verification records, the release cache,
+//! the children it runs (the build, `verify release`, `pub stage`/`pub
+//! publish`, the cut, the site hook), the channel and the owner's aterm.
 //!
-//! Every child is built with the release's ONE build environment: each variable the
-//! gate records on a receipt's `build-env` line (`aterm_verify::differential::
-//! build_env_records`) and `CARGO_TARGET_DIR`/`CARGO_BUILD_TARGET_DIR` are removed —
-//! no caller's `RUSTFLAGS`, wrapper or profile reaches the trust lane, MEASURE's
-//! compiles or the public gate `pub stage` runs — `TRUST_STAGE2_BIN` names the release's prover
+//! Every child is built with the release's ONE build environment: each variable that
+//! steers a build ([`clears`]) is removed — no caller's `RUSTFLAGS`, wrapper, profile or
+//! target directory reaches the build, `verify release` or the public gate `pub
+//! stage` runs — `TRUST_STAGE2_BIN` names the release's prover
 //! and `PUBLICATION_ENGINE` the one engine the release judges (`--engine`), so the cut
 //! and `pub publish`'s pre-promote read the ledger the release read. Every child the
 //! release waits on that can take long — a step's, the preflight's, git, gh or curl
@@ -19,50 +18,36 @@
 //! says why), so it can never stop on the terminal, and an interrupt is handed to its
 //! group (never to a trustd in it) while the release waits for it. A step's output
 //! goes to the step's log (`~/.local/state/aterm-release/logs/<stamp>-<pid>/
-//! <nn>-<step>.log`), and to the terminal too, as it arrives, under `--verbose`.
+//! <nn>-<step>.log`), and to the terminal too, as it arrives, under `--verbose` — and
+//! always for `verify release`, whose one line per check is the step's progress.
 
+use aterm_uds::spawnfd::{Command, Stdio, command};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
+use crate::gates::{Outcome, Precheck, PrecheckGate};
 use crate::ledger::{GitCli, GitRunner};
 use crate::provision::{AskWords, Finding};
 use crate::release::{
-    AfterCut, Answer, Artifact, Backend, Candidate, CutState, EngineRows, Facts, Prover,
-    RELEASE_COMMAND, RUNNING_CHILD_FILE, Ran, Refusal, Reservation, Step,
+    AfterCut, Answer, Artifact, Backend, Beside, Besides, Built, Candidate, CutState, EngineNow,
+    EngineRows, Facts, Prover, RELEASE_COMMAND, Ran, Refusal, Reservation, Step,
 };
 
-/// Where the preflight keeps what it leaves behind (the engine dry run's scratch clone
-/// and log, the wasm32 check's source copy, target directory and log): `preflight/` of
-/// the clone's ONE release cache, `<clone>-release.noindex` ([`crate::snapshot::
-/// CacheRoot`]) — outside the clone, so nothing the preflight does makes the tree
-/// dirty; persistent, so a re-run is warm; private and `.noindex`, so Spotlight never
-/// indexes the source copies.
+/// Where `ship check`'s export and wasm32 gates keep what they leave behind (each run's
+/// own [`Scratch`] under `runs/`, the shared wasm32 target directory): `preflight/` of
+/// the clone's ONE release cache, `<clone>-release.noindex`
+/// ([`crate::snapshot::CacheRoot`]) — outside the clone, so nothing a check does makes
+/// the tree dirty; persistent, so the wasm32 build is warm; private and `.noindex`, so
+/// Spotlight never indexes the source copies.
 fn preflight_cache(repo: &Path) -> Result<PathBuf, String> {
     let dir = crate::snapshot::CacheRoot::for_repo(repo)?.preflight();
     std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     Ok(dir)
 }
 
-/// Every input `tools/trust-gate-all.sh` reads from its environment, pinned empty (the
-/// script's default) for the release's lane: an exported one would narrow the run,
-/// move its memory record, aim its trustd probe at another socket, shorten its wait,
-/// turn off its refused-path check, or move how often it samples the load.
-const TRUST_LANE_INPUTS: [&str; 13] = [
-    "ATERM_GATE_ONLY",
-    "ATERM_GATE_RATCHET",
-    "ATERM_GATE_FORKS",
-    "ATERM_GATE_SCOPE",
-    "ATERM_GATE_MEMORY",
-    "ATERM_GATE_HOST_MEMORY",
-    "ATERM_GATE_LOGDIR",
-    "ATERM_GATE_COSTS",
-    "ATERM_GATE_LOAD_EVERY",
-    "ATERM_GATE_MACHINE",
-    "ATERM_GATE_TRUSTD",
-    "ATERM_GATE_TRUSTD_WAIT",
-    "ATERM_GATE_NO_PATH_CHECK",
-];
+/// The variable `publish/pre-promote` reads for the running release's own cutter: set
+/// on `pub publish`, whose engine passes it through to the hook.
+pub const RELEASE_CUTTER_ENV: &str = "ATERM_RELEASE_CUTTER";
 
 /// THE INTERRUPT: SIGINT (Ctrl-C), SIGTERM (`kill <pid>`) and SIGHUP (a closed
 /// terminal) are caught, never fatal — each one this process did not inherit IGNORED:
@@ -77,9 +62,9 @@ const TRUST_LANE_INPUTS: [&str; 13] = [
 /// from trust `41f912aa5f4` (2026-09-22) on, but the store seal of 2026-10 (321aaeda7)
 /// predates it, so a trustd a step's `targo trust check` starts (`pub stage`'s public
 /// clone gate runs one) lives in that step's group — and a signalled trustd records
-/// DIRTY, after which targo starts none until an operator attests no solver survives
+/// DIRTY, after which targo starts none until someone attests no solver survives
 /// (AGENTS.md: never signal a trustd). So no signal goes to a group as a whole. The
-/// release then sees the step end, lets its lock go and says its INTERRUPTED line.
+/// release then sees the step end and says its INTERRUPTED line.
 #[cfg(unix)]
 pub(crate) mod interrupt {
     use std::sync::Arc;
@@ -190,10 +175,10 @@ pub(crate) mod interrupt {
     fn signal_group(group: i32, sig: i32) {
         let passes = if sig == SIGKILL { 2 } else { 1 };
         for _ in 0..passes {
-            let listing = std::process::Command::new("/bin/ps")
+            let listing = aterm_uds::spawnfd::command("/bin/ps")
                 .args(["-A", "-o", "pid=,ppid=,pgid=,comm="])
-                .stdin(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
+                .stdin(aterm_uds::spawnfd::Stdio::null())
+                .stderr(aterm_uds::spawnfd::Stdio::null())
                 .output()
                 .ok()
                 .filter(|o| o.status.success())
@@ -284,30 +269,72 @@ pub fn group_members(listing: &str, group: i32) -> Vec<i32> {
 fn detach(cmd: &mut Command) {
     cmd.env("GIT_TERMINAL_PROMPT", "0");
     #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt as _;
-        unsafe extern "C" {
-            fn setsid() -> i32;
+    cmd.setsid(true);
+}
+
+/// Write `step`'s child `pid`'s note in `release` ([`crate::release::child_note`]): the
+/// note's path.
+fn note_child_in(release: &Path, step: Step, pid: u32) -> PathBuf {
+    let started = started_of(pid).unwrap_or_default();
+    let note = crate::release::child_note(release, pid);
+    let _ = std::fs::create_dir_all(release);
+    let _ = std::fs::write(
+        &note,
+        format!("pid {pid}\nstarted {started}\nstep {}\n", step.name()),
+    );
+    note
+}
+
+/// The release's child rules for a step that runs in this process — the after-cut
+/// step's site sync: every child it starts, git's included, is started as
+/// [`Real::spawn_forwarded`] starts a step's (none once interrupted, a session of its
+/// own with git's prompt off, the interrupt handed to it, noted while it runs).
+pub(crate) struct StepChildren {
+    /// Where the running child is noted, and under which step; `None` on a dry run.
+    pub(crate) noted: Option<(PathBuf, Step)>,
+}
+
+impl crate::site::Launch for StepChildren {
+    fn interrupted(&self) -> Option<i32> {
+        interrupt::caught()
+    }
+
+    fn spawn(
+        &self,
+        cmd: &mut aterm_uds::spawnfd::Command,
+    ) -> std::io::Result<(aterm_uds::spawnfd::Child, crate::site::Guard)> {
+        if interrupt::caught().is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "not started: the release was interrupted",
+            ));
         }
-        // SAFETY: the closure runs in the forked child before its exec and calls only
-        // `setsid`, which is async-signal-safe and touches no memory of ours.
-        unsafe {
-            cmd.pre_exec(|| {
-                if setsid() == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+        // [`detach`]'s session, as this spawn path spells it (no pre_exec)
+        cmd.env("GIT_TERMINAL_PROMPT", "0").setsid(true);
+        let child = cmd.spawn()?;
+        let running = interrupt::Running::enter(child.id());
+        let note = self
+            .noted
+            .as_ref()
+            .map(|(release, step)| note_child_in(release, *step, child.id()));
+        Ok((
+            child,
+            Box::new(Forwarded {
+                _running: running,
+                note,
+            }),
+        ))
     }
 }
 
 /// A pid's start time (`ps -o lstart=`), `None` when no such process lives.
 fn started_of(pid: u32) -> Option<String> {
-    let out = Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "lstart="])
-        .output()
-        .ok()?;
+    let out = {
+        command("ps")
+            .args(["-p", &pid.to_string(), "-o", "lstart="])
+            .output()
+            .ok()?
+    };
     let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
     (out.status.success() && !s.is_empty()).then_some(s)
 }
@@ -327,7 +354,6 @@ pub struct Real {
     origin_tags: String,
     /// The local UTC offset, in seconds, read once (`date +%z`).
     offset: i64,
-    lock: Option<aterm_verify::snapshot::MachineHold>,
     /// The step the run is at ([`Backend::entered`]): what a child is noted under.
     step: Step,
     /// This process's arguments (after the program) with every path flag's value
@@ -337,7 +363,7 @@ pub struct Real {
 }
 
 /// A forwarded child's guard ([`Real::spawn_forwarded`]): while it lives, the interrupt
-/// is handed to the child's group and [`RUNNING_CHILD_FILE`] names the child.
+/// is handed to the child's group and its note ([`crate::release::child_note`]) names it.
 struct Forwarded {
     _running: interrupt::Running,
     note: Option<PathBuf>,
@@ -385,7 +411,7 @@ impl Real {
             |cwd| crate::release::anchor(&engine, &cwd),
         );
         let state = home.join(".local/state/aterm-release");
-        let stamp = Command::new("date")
+        let stamp = command("date")
             .arg("+%Y%m%dT%H%M%S")
             .output()
             .ok()
@@ -403,7 +429,7 @@ impl Real {
                 .join(format!("{stamp}-{}", std::process::id()))
         };
         std::fs::create_dir_all(&logs).map_err(|e| format!("create {}: {e}", logs.display()))?;
-        let offset = Command::new("date")
+        let offset = command("date")
             .arg("+%z")
             .output()
             .ok()
@@ -429,7 +455,6 @@ impl Real {
             verbose,
             origin_tags: String::new(),
             offset,
-            lock: None,
             step: Step::Checks,
             argv: std::env::args_os().skip(1).collect(),
         })
@@ -446,14 +471,14 @@ impl Real {
 
     /// `git -C <clone>` that talks to origin (a fetch, `ls-remote`): forwarded.
     fn remote_git(&self, args: &[&str]) -> std::io::Result<std::process::Output> {
-        let mut cmd = Command::new("git");
+        let mut cmd = command("git");
         cmd.arg("-C").arg(&self.repo).args(args);
         self.output_forwarded(&mut cmd)
     }
 
     /// `git -C <engine>` (its fetch and push among them): forwarded.
     fn engine_git(&self, args: &[&str]) -> Option<String> {
-        let mut cmd = Command::new("git");
+        let mut cmd = command("git");
         cmd.arg("-C").arg(&self.engine).args(args);
         let out = self.output_forwarded(&mut cmd).ok()?;
         out.status
@@ -461,15 +486,49 @@ impl Real {
             .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
+    /// `git -C <engine> <args>` whose exit code is its answer: the code and the output,
+    /// `Err` when git did not run or was ended by a signal.
+    fn engine_git_code(&self, args: &[&str]) -> Result<(i32, std::process::Output), String> {
+        let e = self.engine.display();
+        let mut cmd = command("git");
+        cmd.arg("-C").arg(&self.engine).args(args);
+        let out = self
+            .output_forwarded(&mut cmd)
+            .map_err(|err| format!("git -C {e} {}: {err}", args.join(" ")))?;
+        let code = out
+            .status
+            .code()
+            .ok_or_else(|| format!("git -C {e} {} was ended by a signal", args.join(" ")))?;
+        Ok((code, out))
+    }
+
+    /// `rev` in the engine, as the full sha of a commit it holds: `Ok(None)` when it holds
+    /// no such commit (`rev-parse --verify -q` exits 1 and says nothing), `Err` when git
+    /// could not answer (any other exit: not a repository, a broken object store).
+    fn engine_commit(&self, rev: &str) -> Result<Option<String>, String> {
+        let e = self.engine.display();
+        let spec = format!("{rev}^{{commit}}");
+        let (code, out) = self.engine_git_code(&["rev-parse", "--verify", "-q", &spec])?;
+        let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        match code {
+            0 if !sha.is_empty() => Ok(Some(sha)),
+            1 if sha.is_empty() => Ok(None),
+            _ => Err(format!(
+                "git -C {e} rev-parse {spec} exited {code}: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )),
+        }
+    }
+
     /// THE ONE SPAWN PATH for a child the release waits on: an interrupted release
     /// starts none (`ErrorKind::Interrupted`); the child is [`detach`]ed (its own
-    /// session and group, no terminal), named in [`RUNNING_CHILD_FILE`] while it runs
-    /// (a real run), and the interrupt is handed to its group
-    /// ([`interrupt::Running`]) until the guard returned with it drops.
+    /// session and group, no terminal), named in a note of its own while it runs
+    /// ([`crate::release::child_note`], a real run), and the interrupt is handed to its
+    /// group ([`interrupt::Running`]) until the guard returned with it drops.
     fn spawn_forwarded(
         &self,
         cmd: &mut Command,
-    ) -> std::io::Result<(std::process::Child, Forwarded)> {
+    ) -> std::io::Result<(aterm_uds::spawnfd::Child, Forwarded)> {
         if interrupt::caught().is_some() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Interrupted,
@@ -509,7 +568,7 @@ impl Real {
     /// `program` with the release's environment: the build-steering variables and the
     /// launcher's own removed ([`scrub`]), the one engine named.
     fn scrubbed(&self, program: impl AsRef<std::ffi::OsStr>) -> Command {
-        let mut cmd = Command::new(program);
+        let mut cmd = command(program);
         scrub(&mut cmd);
         cmd.env("PUBLICATION_ENGINE", &self.engine);
         cmd
@@ -534,11 +593,34 @@ impl Real {
         cmd
     }
 
+    /// `pub publish aterm --repo-path <this clone>`, a child with the release's prover and
+    /// engine. `publish/pre-promote` asks R's own cutter whether a cut of R would pass its
+    /// pre-claim gates, and this binary IS R's own cutter (the release re-ran as it): it
+    /// is named in [`RELEASE_CUTTER_ENV`], which the engine passes through to the hook,
+    /// so the hook runs its `check` instead of building another in a throwaway worktree.
+    fn publish_command(&self, prover: &Prover) -> Command {
+        let mut cmd = self.child(self.engine.join("bin/pub"), Some(prover));
+        // the site follows the cut (the after-cut step), so the promote's own site hook
+        // has nothing to do: skipped, it costs no cutter build of the clone
+        cmd.args(["publish", "aterm", "--skip-site", "--repo-path"])
+            .arg(&self.repo);
+        if let Ok(exe) = std::env::current_exe() {
+            cmd.env(RELEASE_CUTTER_ENV, exe);
+        }
+        cmd
+    }
+
     /// Run `cmd` as a step's child, through [`Real::spawn_forwarded`] — its output
     /// into `step`'s log (and, as it arrives, to the terminal under `--verbose`). An
     /// interrupted release starts no child.
-    pub(crate) fn logged(&mut self, step: Step, cmd: &mut Command) -> Ran {
-        let log = self.log_path(step);
+    pub(crate) fn logged(&self, step: Step, cmd: &mut Command) -> Ran {
+        let stream = self.verbose;
+        self.logged_to(step, cmd, stream)
+    }
+
+    /// [`Real::logged`], its output on the terminal too when `stream`.
+    fn logged_to(&self, step: Step, cmd: &mut Command, stream: bool) -> Ran {
+        let log = self.step_log(step);
         let mut file = match std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -561,10 +643,11 @@ impl Real {
             return not_started();
         }
         cmd.stdin(Stdio::null());
-        // `--verbose`: ONE pipe for both streams, as `2>&1 | tee` had it — every line
+        // Streamed: ONE pipe for both streams, as `2>&1 | tee` had it — every line
         // reaches the log and the terminal as it is written, in the order written.
-        let pipe = if self.verbose {
-            match std::io::pipe().and_then(|(r, w)| Ok((r, w.try_clone()?, w))) {
+        let pipe = if stream {
+            let made = std::io::pipe().and_then(|(r, w)| Ok((r, w.try_clone()?, w)));
+            match made {
                 Ok((reader, out, err)) => {
                     cmd.stdout(out).stderr(err);
                     Some(reader)
@@ -631,30 +714,30 @@ impl Real {
         }
     }
 
-    /// [`RUNNING_CHILD_FILE`]: the step's child, while it runs (a real run only); the
-    /// note's path, for the guard that removes it.
+    /// [`crate::release::child_note`]: the step's child, while it runs (a real run only),
+    /// one note per child — a step runs several beside each other; the note's path, for
+    /// the guard that removes it.
     fn note_child(&self, pid: u32) -> Option<PathBuf> {
-        if self.scratch_logs {
-            return None;
-        }
-        let started = started_of(pid).unwrap_or_default();
-        let note = self.release.join(RUNNING_CHILD_FILE);
-        let _ = std::fs::create_dir_all(&self.release);
-        let _ = std::fs::write(
-            &note,
-            format!("pid {pid}\nstarted {started}\nstep {}\n", self.step.name()),
-        );
-        Some(note)
+        (!self.scratch_logs).then(|| note_child_in(&self.release, self.step, pid))
     }
 
-    fn step_log_text(&mut self, step: Step) -> String {
-        std::fs::read_to_string(self.log_path(step)).unwrap_or_default()
+    /// `step`'s log: `<logs>/<nn>-<step>.log`.
+    fn step_log(&self, step: Step) -> PathBuf {
+        self.logs
+            .join(format!("{:02}-{}.log", step.number(), step.name()))
+    }
+
+    /// The log of the child named `what` that `step` runs beside its main one, beside
+    /// the step's own: `<logs>/<nn>-<step>-<what>.log`.
+    fn side_log(&self, step: Step, what: &str) -> PathBuf {
+        self.logs
+            .join(format!("{:02}-{}-{what}.log", step.number(), step.name()))
     }
 
     /// THE ENGINE AT ITS OWN origin/main, its appended audit rows kept (the pub-sync
     /// pattern): `pub stage` refuses an engine that is not exactly its origin/main, and
     /// every dry run and stage appends a row to the tracked `verification-log.jsonl`.
-    fn engine_sync(&mut self) -> Result<(), Refusal> {
+    fn engine_sync(&self) -> Result<(), Refusal> {
         let e = self.engine.display().to_string();
         if self.engine_git(&["fetch", "-q", "origin"]).is_none() {
             return Err(Refusal::new(
@@ -742,29 +825,57 @@ impl Real {
             .any(|l| !l.ends_with(" verification-log.jsonl"))
     }
 
-    fn submodule_sync(&mut self, step: Step) -> Result<(), Refusal> {
-        let mut cmd = Command::new("git");
+    /// The submodule at its gitlink, and that gitlink on the branch `.gitmodules`
+    /// declares for it ([`crate::gates::submodules_on_declared_branch`]): at the sync
+    /// and at every commit move, so before anything is staged or published.
+    fn submodule_sync(&self, step: Step) -> Result<(), Refusal> {
+        let mut cmd = command("git");
         cmd.args(["submodule", "update", "--init", "vendor/astream"])
             .current_dir(&self.repo);
         let ran = self.logged(step, &mut cmd);
-        if ran.code == 0 {
-            Ok(())
-        } else {
-            Err(Refusal::new(
+        if ran.code != 0 {
+            return Err(Refusal::new(
                 "git submodule update --init vendor/astream failed — the workspace does not \
                  resolve without it",
                 "check access to the astream repository, then re-run",
             )
-            .detail(ran.detail))
+            .detail(ran.detail));
         }
+        crate::gates::submodules_on_declared_branch(&self.git()).map_err(|e| {
+            Refusal::new(
+                e.to_string(),
+                "land the astream change on astream's main and bump vendor/astream to that \
+                 commit (vendor/README-astream.md), then re-run",
+            )
+        })
     }
 
-    /// The ONE clean-tree judge: `aterm_verify::identity::dirty_against`, the Trust
-    /// lane's own rule (the tracked `.gitignore` files, never `.git/info/exclude` or
-    /// `core.excludesFile`) — so the release and the lane cannot disagree on whether
-    /// this clone is clean. `Err` when git could not answer.
+    /// The ONE clean-tree judge ([`crate::clean`]): the tree's own `.gitignore` rules,
+    /// never `.git/info/exclude` or `core.excludesFile`. `Err` when git could not answer.
     fn dirty(&self) -> Result<Vec<String>, String> {
         crate::gates::dirty_paths(&self.repo).map_err(|e| e.to_string())
+    }
+
+    /// Why the clone is not at `commit`'s tree and clean — what a verified record vouches
+    /// for — or `None` when it is.
+    fn off_tree(&self, commit: &str) -> Option<Vec<String>> {
+        let want = self.git_out(&["rev-parse", &format!("{commit}^{{tree}}")]);
+        let head = self.git_out(&["rev-parse", "HEAD^{tree}"]);
+        if want.is_none() || want != head {
+            return Some(vec![format!(
+                "HEAD's tree is {}, {}'s is {}",
+                head.as_deref().map_or("unresolved", short),
+                short(commit),
+                want.as_deref().map_or("unresolved", short)
+            )]);
+        }
+        match self.dirty() {
+            Ok(dirty) if dirty.is_empty() => None,
+            Ok(dirty) => Some(dirty.into_iter().take(5).collect()),
+            Err(why) => Some(vec![format!(
+                "the clean-tree judge could not answer: {why}"
+            )]),
+        }
     }
 
     /// This clone's main to `rev`: a fast-forward, or — only when every commit it would
@@ -772,7 +883,7 @@ impl Real {
     fn main_to(&mut self, rev: &str) -> Result<(), Refusal> {
         let head = self.head();
         let ancestor = |s: &mut Self, a: &str, b: &str| s.is_ancestor(a, b);
-        let mut cmd = Command::new("git");
+        let mut cmd = command("git");
         cmd.current_dir(&self.repo);
         if ancestor(self, &head, rev) {
             cmd.args(["merge", "-q", "--ff-only", rev]);
@@ -796,54 +907,190 @@ impl Real {
         }
     }
 
-    // -- the preflight ----------------------------------------------------------
+    // -- the publication pre-flight: the export guards and the wasm32 engine -------
 
-    /// STEP 0 — THE ENGINE'S OWN DRY RUN: `pub stage aterm --dry-run --no-check --commit
-    /// R`, every export guard the stage runs, in one pass, over a SCRATCH CLONE of this
-    /// checkout (never this checkout's `publish/.out`, where a real stage's attestation
-    /// waits for `pub publish`). It is never skipped: a step 0 that cannot run is a block.
-    /// The export it leaves, for the wasm32 check.
-    fn engine_dry_run(&mut self, r: &str, blocks: &mut Vec<(bool, Refusal)>) -> Option<PathBuf> {
-        let cache = match preflight_cache(&self.repo) {
-            Ok(cache) => cache,
-            Err(why) => {
-                blocks.push((
-                    false,
-                    Refusal::new(
-                        format!("the engine's dry run has no place to run: {why}"),
-                        "fix what that names, then re-run",
-                    ),
-                ));
-                return None;
-            }
-        };
-        let name = self
-            .repo
-            .file_name()
-            .map_or_else(|| "aterm".into(), |n| n.to_os_string());
-        let root = cache.join("dry-run").join(name);
-        let log = cache.join("dry-run.log");
-        let _ = std::fs::create_dir_all(&cache);
-        if let Err(why) = self.dry_clone(&cache, &root, r) {
-            blocks.push((
-                false,
+    /// No engine at its path (no checkout, no `bin/pub`), with the fix.
+    fn no_engine(&self) -> Option<Refusal> {
+        let e = self.engine.display().to_string();
+        (!self.engine.join(".git").exists() || !self.engine.join("bin/pub").is_file()).then(|| {
+            Refusal::new(
+                format!("no publication engine at {e} (bin/pub)"),
+                "clone it there, or name one: --engine <path> (or PUBLICATION_ENGINE)",
+            )
+        })
+    }
+
+    /// Why the engine cannot stage at all — none at its path, not on `main`, changes
+    /// besides its audit log — or `None`. What a release's step 4 asks of the engine it
+    /// syncs and drives.
+    fn engine_unready(&self) -> Option<Refusal> {
+        if let Some(why) = self.no_engine() {
+            return Some(why);
+        }
+        let e = self.engine.display().to_string();
+        if self
+            .engine_git(&["rev-parse", "--abbrev-ref", "HEAD"])
+            .is_none_or(|b| b.trim() != "main")
+        {
+            return Some(Refusal::new(
+                format!("the engine {e} is not on main — stage and publish run from its main"),
+                format!("git -C {e} switch main"),
+            ));
+        }
+        self.engine_dirty().then(|| {
+            Refusal::new(
+                format!("the engine {e} has local changes besides its audit log"),
+                format!("commit or discard them there: git -C {e} status --short"),
+            )
+        })
+    }
+
+    /// THE ENGINE A READ-ONLY RUN DRIVES: a `git clone --shared` of the engine in the
+    /// run's own scratch directory, at its origin's main (fetched now), origin set to
+    /// the engine's own — what a release's sync would bring the engine to. The copy
+    /// passes the engine's own checks (on main, clean, exactly its origin's main), and
+    /// its audit row and repo lock land in the copy: the engine's checkout is never
+    /// written, and no read-only run contends with a release or another check. `Err` is
+    /// a could-not-run with its fix.
+    fn scratch_engine(&self, scratch: &Scratch) -> Result<PathBuf, Refusal> {
+        if let Some(why) = self.no_engine() {
+            return Err(why);
+        }
+        let e = self.engine.display().to_string();
+        let origin = self
+            .engine_git(&["remote", "get-url", "origin"])
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
                 Refusal::new(
-                    format!(
-                        "the engine's dry run could not lay {} out, so no export guard has run: \
-                         {why}",
-                        short(r)
-                    ),
-                    format!(
-                        "fix what that names, then re-run (git's own words: {})",
-                        cache.join("dry-run-clone.log").display()
-                    ),
+                    format!("the engine {e} names no origin"),
+                    format!("git -C {e} remote add origin <the engine's repository>"),
+                )
+            })?;
+        let copy = scratch.dir.join("engine");
+        let _ = std::fs::remove_dir_all(&copy);
+        let copy_s = copy.display().to_string();
+        let ran = |cmd: &mut Command| self.output_forwarded(cmd).is_ok_and(|o| o.status.success());
+        let in_copy = |args: &[&str]| {
+            let mut cmd = command("git");
+            cmd.arg("-C").arg(&copy).args(args);
+            cmd
+        };
+        if !ran(command("git").args(["clone", "--quiet", "--shared", "--no-checkout", &e, &copy_s]))
+        {
+            return Err(Refusal::new(
+                format!("git could not copy the engine {e} into {copy_s}"),
+                "fix what keeps it from being written, then run it again",
+            ));
+        }
+        if !ran(&mut in_copy(&["remote", "set-url", "origin", &origin]))
+            || !ran(&mut in_copy(&[
+                "fetch",
+                "--quiet",
+                "--no-tags",
+                "origin",
+                "refs/heads/main",
+            ]))
+        {
+            return Err(Refusal::new(
+                format!("cannot fetch the main of the engine's origin ({origin})"),
+                format!("check the network: git -C {e} ls-remote origin"),
+            ));
+        }
+        if !ran(&mut in_copy(&[
+            "checkout",
+            "--quiet",
+            "-B",
+            "main",
+            "FETCH_HEAD",
+        ])) {
+            return Err(Refusal::new(
+                format!("git could not check the engine's origin main out in {copy_s}"),
+                "fix what keeps it from being written, then run it again",
+            ));
+        }
+        Ok(copy)
+    }
+
+    /// Why the engine's cargo-metadata guard cannot run here — it runs `rustup run
+    /// trust targo metadata` — or `None`.
+    fn metadata_toolchain(&self) -> Option<Refusal> {
+        let Some(dir) = rustup_dir() else {
+            return Some(Refusal::new(
+                "no rustup (on PATH, in $CARGO_HOME/bin or in ~/.cargo/bin) — the engine's \
+                 cargo-metadata guard runs `rustup run trust targo metadata`",
+                "install rustup, then run it again",
+            ));
+        };
+        let found = self
+            .output_forwarded(
+                command(dir.join("rustup"))
+                    .args(["which", "--toolchain", "trust", "targo"])
+                    .env("PATH", path_with(&dir)),
+            )
+            .is_ok_and(|o| o.status.success());
+        (!found).then(|| {
+            Refusal::new(
+                "rustup has no `trust` toolchain with a targo — the engine's cargo-metadata \
+                 guard runs `rustup run trust targo metadata`",
+                "aterm pkg doctor, then aterm pkg repair (atpkg keeps ~/.rustup/toolchains/trust)",
+            )
+        })
+    }
+
+    /// THE EXPORT GUARDS, `ship check --export`: the engine's own dry run, `pub stage
+    /// aterm --dry-run --no-check --commit R --repo-path <scratch clone>` — every export
+    /// guard `pub stage` runs (forbidden content, private references, gitleaks, the cargo
+    /// metadata closure, README versions, dead links) in one pass, over a scratch clone
+    /// of R, never this checkout's `publish/.out`, where a real stage's attestation waits
+    /// for `pub publish`, and on a [`Real::scratch_engine`] copy, so the engine's
+    /// checkout is never written (a release's step 4 runs the real `pub stage`). The
+    /// engine stages only a commit on its origin's main and reads its remotes, so
+    /// unpushed work, or no network, is a could-not-run, never a pass. Returns the
+    /// export the guards judged, for the wasm32 engine.
+    pub(crate) fn export_gate(&mut self, scratch: &Scratch, r: &str) -> (Outcome, Option<PathBuf>) {
+        let not_run = |why: Refusal| (Outcome::CouldNotRun(why), None);
+        if !self.is_ancestor(r, "refs/remotes/origin/main") {
+            return not_run(Refusal::new(
+                format!(
+                    "{} is not on origin/main (as this clone last fetched it) — the engine \
+                     stages only mainline commits, so unpushed work is not judged",
+                    short(r)
+                ),
+                "push it (or `git fetch origin`, when it is there already), then run it again",
+            ));
+        }
+        let engine = match self.scratch_engine(scratch) {
+            Ok(engine) => engine,
+            Err(why) => return not_run(why),
+        };
+        let root = scratch.dir.join("dry-run").join("aterm");
+        let log = scratch.dir.join("dry-run.log");
+        if let Err(why) = self.dry_clone(&scratch.dir, &root, r) {
+            return not_run(Refusal::new(
+                format!(
+                    "the engine's dry run could not lay {} out, so no export guard has run: \
+                     {why}",
+                    short(r)
+                ),
+                format!(
+                    "fix what that names, then run it again (git's own words: {})",
+                    scratch.dir.join("dry-run-clone.log").display()
                 ),
             ));
-            return None;
         }
-        let pubbin = self.engine.join("bin/pub");
+        let toolchain = self.metadata_toolchain();
+        let pubbin = engine.join("bin/pub");
         let mut stage = self.scrubbed(&pubbin);
         stage
+            .env("PUBLICATION_ENGINE", &engine)
+            .env(
+                "PATH",
+                rustup_dir().map_or_else(
+                    || std::env::var_os("PATH").unwrap_or_default(),
+                    |dir| path_with(&dir),
+                ),
+            )
             .args([
                 "stage",
                 "aterm",
@@ -854,8 +1101,7 @@ impl Real {
                 "--repo-path",
             ])
             .arg(&root);
-        let out = self.output_forwarded(&mut stage);
-        let (code, text) = match out {
+        let (code, text) = match self.output_forwarded(&mut stage) {
             Ok(o) => (
                 o.status.code().unwrap_or(-1),
                 format!(
@@ -867,35 +1113,46 @@ impl Real {
             Err(e) => (-1, format!("cannot run {}: {e}", pubbin.display())),
         };
         let _ = std::fs::write(&log, &text);
-        let export = root.join("publish/.out/export");
-        let (verdict, export) = engine_dry_run_verdict(code, &text, short(r), export.is_dir());
-        for refusal in verdict {
-            blocks.push((
-                false,
-                refusal.detail([format!("the whole run: {}", log.display())]),
-            ));
+        let mut run = EngineRun::read(code, &text);
+        let out = root.join("publish/.out");
+        let export = out.join("export");
+        for (name, at) in &mut run.failed {
+            if let Some(report) = gitleaks_report(name) {
+                let json = std::fs::read_to_string(report).unwrap_or_default();
+                *at = gitleaks_locations(&json, &export);
+            }
         }
-        export.then_some(root.join("publish/.out/export"))
+        let reports = scratch.dir.join("reports");
+        keep_reports(&out, &reports);
+        // a guard's verdict means the transforms finished: only then is the export the
+        // tree `pub stage` would publish, for the wasm32 engine to compile
+        let judged = !run.passed.is_empty() || !run.failed.is_empty();
+        let left = (judged && export.is_dir()).then_some(export);
+        (
+            export_outcome(&run, r, toolchain.as_ref(), &log, &reports),
+            left,
+        )
     }
 
-    /// R laid out at `root` the way `pub stage --repo-path` needs a checkout: `git clone
-    /// --shared` of this checkout (objects borrowed), R checked out, origin set to this
-    /// checkout's origin, each submodule cloned the same way at its gitlink.
-    fn dry_clone(&self, cache: &Path, root: &Path, r: &str) -> Result<(), String> {
-        let log = cache.join("dry-run-clone.log");
+    /// R laid out at `root` (under `base`'s `dry-run/`) the way `pub stage --repo-path`
+    /// needs a checkout: `git clone --shared` of this checkout (objects borrowed), R
+    /// checked out, origin set to this checkout's origin, each submodule cloned the same
+    /// way at its gitlink.
+    fn dry_clone(&self, base: &Path, root: &Path, r: &str) -> Result<(), String> {
+        let log = base.join("dry-run-clone.log");
         let _ = std::fs::write(&log, "");
-        let _ = std::fs::remove_dir_all(cache.join("dry-run"));
-        if cache.join("dry-run").exists() {
+        let _ = std::fs::remove_dir_all(base.join("dry-run"));
+        if base.join("dry-run").exists() {
             return Err(format!(
                 "the last run's clone at {} cannot be removed",
-                cache.join("dry-run").display()
+                base.join("dry-run").display()
             ));
         }
         let origin = self
             .git_out(&["remote", "get-url", "origin"])
             .ok_or("this checkout names no origin")?;
         let git = |dir: &Path, args: &[&str]| -> bool {
-            let out = self.output_forwarded(Command::new("git").arg("-C").arg(dir).args(args));
+            let out = self.output_forwarded(command("git").arg("-C").arg(dir).args(args));
             if let Ok(o) = &out
                 && let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&log)
             {
@@ -905,7 +1162,7 @@ impl Real {
         };
         let (repo, root_s) = (self.repo.display().to_string(), root.display().to_string());
         if !git(
-            cache,
+            base,
             &[
                 "clone",
                 "--quiet",
@@ -932,9 +1189,11 @@ impl Real {
                 short(r)
             ));
         }
-        for (rev, path) in gitlinks(&self.git_out(&["ls-tree", "-r", r]).unwrap_or_default()) {
+        for (rev, path) in
+            crate::gates::gitlinks(&self.git_out(&["ls-tree", "-r", r]).unwrap_or_default())
+        {
             let sub = self.repo.join(&path);
-            let own = Command::new("git")
+            let own = command("git")
                 .arg("-C")
                 .arg(&sub)
                 .args(["rev-parse", "--show-toplevel"])
@@ -953,7 +1212,7 @@ impl Real {
             let _ = std::fs::remove_dir_all(&dest);
             let (sub_s, dest_s) = (sub.display().to_string(), dest.display().to_string());
             if !git(
-                cache,
+                base,
                 &[
                     "clone",
                     "--quiet",
@@ -974,69 +1233,61 @@ impl Real {
     }
 
     /// THE WASM32 ENGINE: the site's /terminal engine type-checked on the public
-    /// toolchain pin, with `publish/config.sh`'s own wasm32 clause (read out of
-    /// `CHECK_CMD_DEFAULT`, never restated), over the export step 0 left — else a `git
-    /// archive` of R without `.cargo/` — copied outside every checkout, in a scrubbed
-    /// environment. v0.91.0 was refused there by the site build AFTER its promote.
-    fn wasm32(&mut self, r: &str, export: Option<&Path>, blocks: &mut Vec<(bool, Refusal)>) {
-        let config =
-            std::fs::read_to_string(self.repo.join("publish/config.sh")).unwrap_or_default();
+    /// toolchain pin, with R's own `publish/config.sh` wasm32 clause (read out of its
+    /// `CHECK_CMD_DEFAULT`, never restated), over the export the export guards judged —
+    /// else a `git archive` of R without `.cargo/` — copied outside every checkout, in a
+    /// scrubbed environment. v0.91.0 was refused there by the site build AFTER its
+    /// promote; `pub stage`'s public-clone gate runs the same clause.
+    pub(crate) fn wasm32_gate(
+        &mut self,
+        scratch: &Scratch,
+        r: &str,
+        export: Option<&Path>,
+    ) -> Outcome {
+        let config = self
+            .git_out(&["show", &format!("{r}:publish/config.sh")])
+            .unwrap_or_default();
         let shape = match wasm_clause(&config) {
             Ok(shape) => shape,
-            Err(r) => {
-                blocks.push((false, r));
-                return;
-            }
+            Err(why) => return Outcome::Refuse(why),
         };
-        let cache = match preflight_cache(&self.repo) {
-            Ok(cache) => cache,
-            Err(why) => {
-                blocks.push((
-                    false,
-                    Refusal::new(
-                        format!("the wasm32 check has no place to run: {why}"),
-                        "fix what that names, then re-run",
-                    ),
-                ));
-                return;
-            }
+        let not_run = |why: String, fix: String| Outcome::CouldNotRun(Refusal::new(why, fix));
+        let Some(rustup) = rustup_dir() else {
+            return not_run(
+                "no rustup (on PATH, in $CARGO_HOME/bin or in ~/.cargo/bin) — the wasm32 pin \
+                 is a stock channel rustup installs"
+                    .into(),
+                "install rustup, then run it again".into(),
+            );
         };
-        let src = cache.join("wasm-src");
-        let log = cache.join("wasm-check.log");
+        let src = scratch.dir.join("wasm-src");
+        let log = scratch.dir.join("wasm-check.log");
         let _ = std::fs::remove_dir_all(&src);
         let laid = std::fs::create_dir_all(&src).is_ok()
             && match export {
                 Some(export) => self
-                    .output_forwarded(
-                        Command::new("/bin/cp")
-                            .arg("-R")
-                            .arg(export.join("."))
-                            .arg(&src),
-                    )
+                    .output_forwarded(command("/bin/cp").arg("-R").arg(export.join(".")).arg(&src))
                     .is_ok_and(|o| o.status.success()),
                 None => self.archive_into(r, &src),
             };
         if !laid {
-            self.say(&format!(
-                "        note: could not lay out {} in {} — the wasm32 check did not run \
-                 (`pub stage`'s public-clone gate runs the same clause)",
-                short(r),
-                src.display()
-            ));
-            return;
+            return not_run(
+                format!("could not lay {} out in {}", short(r), src.display()),
+                "fix what keeps it from being written, then run it again".into(),
+            );
         }
-        let mut env: Vec<(String, String)> = vec![
+        let mut env: Vec<(String, std::ffi::OsString)> = vec![
             (
                 "CARGO_TARGET_DIR".into(),
-                cache.join("wasm-target").display().to_string(),
+                scratch.cache.join("wasm-target").into_os_string(),
             ),
             (
                 "TERM".into(),
-                std::env::var("TERM").unwrap_or_else(|_| "dumb".into()),
+                std::env::var_os("TERM").unwrap_or_else(|| "dumb".into()),
             ),
+            ("PATH".into(), path_with(&rustup)),
         ];
         for keep in [
-            "PATH",
             "HOME",
             "LANG",
             "LC_ALL",
@@ -1048,16 +1299,16 @@ impl Real {
             "SSL_CERT_FILE",
             "SSL_CERT_DIR",
         ] {
-            if let Ok(v) = std::env::var(keep) {
+            if let Some(v) = std::env::var_os(keep) {
                 env.push((keep.into(), v));
             }
         }
-        let scrubbed = |program: &str| {
-            let mut cmd = Command::new(program);
+        let scrubbed = |program: &Path| {
+            let mut cmd = command(program);
             cmd.env_clear().envs(env.iter().cloned()).current_dir(&src);
             cmd
         };
-        let add = self.output_forwarded(scrubbed("rustup").args([
+        let add = self.output_forwarded(scrubbed(&rustup.join("rustup")).args([
             "target",
             "add",
             "--toolchain",
@@ -1078,32 +1329,20 @@ impl Real {
         };
         if !added {
             let _ = std::fs::write(&log, &text);
-            if add.is_err() {
-                self.say(
-                    "        note: no rustup on PATH — the wasm32 check did not run (`pub stage`'s \
-                     public-clone gate runs the same clause through rustup)",
-                );
-                return;
-            }
-            blocks.push((
-                false,
-                Refusal::new(
-                    format!(
-                        "rustup could not add wasm32-unknown-unknown to the wasm32 pin {}, so the \
-                         wasm32 clause did not run — `pub stage` would fail the same way",
-                        shape.pin
-                    ),
-                    format!(
-                        "rustup toolchain install {} --target wasm32-unknown-unknown (full log: \
-                         {})",
-                        shape.pin,
-                        log.display()
-                    ),
+            return not_run(
+                format!(
+                    "rustup could not add wasm32-unknown-unknown to the wasm32 pin {}",
+                    shape.pin
                 ),
-            ));
-            return;
+                format!(
+                    "rustup toolchain install {} --target wasm32-unknown-unknown (full log: {})",
+                    shape.pin,
+                    log.display()
+                ),
+            );
         }
-        let checked = self.output_forwarded(scrubbed("/bin/sh").args(["-c", &shape.clause]));
+        let checked =
+            self.output_forwarded(scrubbed(Path::new("/bin/sh")).args(["-c", &shape.clause]));
         let ok = match &checked {
             Ok(o) => {
                 text.push_str(&String::from_utf8_lossy(&o.stdout));
@@ -1117,18 +1356,28 @@ impl Real {
         };
         let _ = std::fs::write(&log, &text);
         if ok {
-            return;
+            return Outcome::Pass(format!(
+                "wasm32 engine: aterm-wasm compiles for wasm32-unknown-unknown on {}",
+                shape.pin
+            ));
         }
-        let errors: Vec<String> = text
-            .lines()
-            .filter(|l| l.starts_with("error"))
-            .take(6)
-            .map(str::to_string)
-            .collect();
-        let missing_target = text.contains("can't find crate for `core`")
-            || text.contains("target may not be installed");
-        blocks.push((
-            false,
+        if checked.is_err()
+            || text.contains("can't find crate for `core`")
+            || text.contains("target may not be installed")
+        {
+            return not_run(
+                format!(
+                    "the wasm32 clause did not run on {} (its target is missing)",
+                    shape.pin
+                ),
+                format!(
+                    "rustup target add --toolchain {} wasm32-unknown-unknown (full log: {})",
+                    shape.pin,
+                    log.display()
+                ),
+            );
+        }
+        Outcome::Refuse(
             Refusal::new(
                 format!(
                     "aterm-wasm does NOT compile for wasm32-unknown-unknown on the wasm32 pin {} \
@@ -1136,22 +1385,19 @@ impl Real {
                      engine from it",
                     shape.pin
                 ),
-                if missing_target {
-                    format!(
-                        "rustup target add --toolchain {} wasm32-unknown-unknown (rustup did not \
-                         add the pin's listed target by itself here)",
-                        shape.pin
-                    )
-                } else {
-                    format!(
-                        "fix the source — a cfg(not(target_os = \"macos\")) arm no host build \
-                         compiles is the usual culprit; full log: {}",
-                        log.display()
-                    )
-                },
+                format!(
+                    "fix the source — a cfg(not(target_os = \"macos\")) arm no host build \
+                     compiles is the usual culprit; full log: {}",
+                    log.display()
+                ),
             )
-            .detail(errors),
-        ));
+            .detail(
+                text.lines()
+                    .filter(|l| l.starts_with("error"))
+                    .take(6)
+                    .map(str::to_string),
+            ),
+        )
     }
 
     /// `git archive` of `r` into `dest`, without `.cargo/`, each submodule written from
@@ -1159,7 +1405,7 @@ impl Real {
     fn archive_into(&self, r: &str, dest: &Path) -> bool {
         // one forwarded child for the pipe: the archive and the tar share its group
         let tar = |repo: &Path, rev: &str, into: &Path| -> bool {
-            let mut pipe = Command::new("/bin/sh");
+            let mut pipe = command("/bin/sh");
             pipe.args([
                 "-c",
                 "set -o pipefail 2>/dev/null; git -C \"$1\" archive \"$2\" | tar -x -C \"$3\"",
@@ -1175,12 +1421,201 @@ impl Real {
             return false;
         }
         let _ = std::fs::remove_dir_all(dest.join(".cargo"));
-        gitlinks(&self.git_out(&["ls-tree", "-r", r]).unwrap_or_default())
+        crate::gates::gitlinks(&self.git_out(&["ls-tree", "-r", r]).unwrap_or_default())
             .into_iter()
             .all(|(rev, path)| {
                 let into = dest.join(&path);
                 std::fs::create_dir_all(&into).is_ok() && tar(&self.repo.join(&path), &rev, &into)
             })
+    }
+
+    // -- what stage and build run, each child with a log of its own ---------------
+
+    /// `pub stage aterm --commit R --repo-path <this clone>`, the engine synced before
+    /// and after it (the stage appends its audit row: recorded then, or the step
+    /// refuses), into the current step's log: step 4's, or the publish's when the engine
+    /// that staged R moved since.
+    fn stage_run(&self, c: &Candidate, prover: &Prover) -> Result<Ran, Refusal> {
+        self.engine_sync()?;
+        let mut cmd = self.child(self.engine.join("bin/pub"), Some(prover));
+        cmd.args(["stage", "aterm", "--commit", &c.commit, "--repo-path"])
+            .arg(&self.repo);
+        let ran = self.logged(self.step, &mut cmd);
+        self.engine_sync()?;
+        Ok(ran)
+    }
+
+    /// A forwarded child with the release's build environment and its prover, its two
+    /// streams captured and appended to `log`: the runner the guard, the censuses and
+    /// the fixture generator are handed.
+    fn captured(
+        &self,
+        prover: &Prover,
+        log: &Path,
+        cmd: &mut Command,
+    ) -> std::io::Result<std::process::Output> {
+        scrub(cmd);
+        cmd.env("TRUST_STAGE2_BIN", &prover.bin);
+        let out = self.output_forwarded(cmd)?;
+        append_output(log, &out);
+        Ok(out)
+    }
+
+    /// The handoff fixture guard in the clone at R (`gates::handoff_fixture_guard_with`,
+    /// the prover's `targo`, its own target directory), its output into `log`.
+    fn fixture_guard_run(&self, prover: &Prover, log: &Path) -> Result<String, Refusal> {
+        let filter = crate::gates::HANDOFF_FIXTURE_GUARD_FILTER;
+        let mut run = |cmd: &mut Command| self.captured(prover, log, cmd);
+        crate::gates::handoff_fixture_guard_with(&prover.bin.join("targo"), &self.repo, &mut run)
+            .map(|n| format!("the handoff fixture guard passes ({n} test(s), {filter})"))
+            .map_err(|e| {
+                let text = e.to_string();
+                Refusal::new(
+                    format!(
+                        "the handoff fixture guard ({filter}) refuses: {} — this build's \
+                         consumer would refuse a shipped producer's handoff",
+                        text.lines().next().unwrap_or("")
+                    ),
+                    format!(
+                        "fix the CONSUMER on main, never a fixture (targo --unverified test -p \
+                         aterm-gui --lib -- {filter}), then {RELEASE_COMMAND} --commit origin/main"
+                    ),
+                )
+                .detail(text.lines().skip(1).take(8).map(str::to_string))
+                .detail([format!("the whole run: {}", log.display())])
+            })
+    }
+
+    /// The L0 censuses over the clone at R (`gates::census_gate`, the prover's `targo`,
+    /// the clone's own target directory), their output into `log`: a finding refuses, a
+    /// census that could not run is a resumable stop.
+    fn census_run(&self, prover: &Prover, log: &Path) -> Result<String, Refusal> {
+        let mut run =
+            |cmd: &mut Command| self.captured(prover, log, cmd).map(|out| out.status.code());
+        crate::gates::census_gate(&prover.bin.join("targo"), &self.repo, &mut run)
+            .map(|()| {
+                "the L0 censuses and the source guards pass (main-loop · lock-order · \
+                 wasm-process · scope-cardinality · lazy-init reentrancy · guards)"
+                    .to_string()
+            })
+            .map_err(|e| {
+                let text = e.to_string();
+                let census = Refusal::new(
+                    text.lines().next().unwrap_or("").to_string(),
+                    format!("fix it on main, then {RELEASE_COMMAND} --commit origin/main"),
+                )
+                .detail(tail(log, 8))
+                .detail([format!("the whole run: {}", log.display())]);
+                if text.contains("L0 CENSUS FINDING") {
+                    census
+                } else {
+                    census.could_not_run()
+                }
+            })
+    }
+
+    /// The release's own handoff fixtures for its reserved identity, written by the
+    /// in-tree generator in the clone into the release cache unless staged already
+    /// (`fixtures::stage`), its output into `log`.
+    fn stage_fixtures_run(
+        &self,
+        c: &Candidate,
+        reserved: &Reservation,
+        prover: &Prover,
+        log: &Path,
+    ) -> Result<String, Refusal> {
+        let pins = fixture_pins(c, reserved);
+        let root = fixture_root(&self.repo)?;
+        let mut run = |cmd: &mut Command| self.captured(prover, log, cmd);
+        crate::fixtures::stage(
+            &prover.bin.join("targo"),
+            &self.repo,
+            &root,
+            &pins,
+            &mut run,
+        )
+        .map(|staged| staged.words(&pins))
+        .map_err(|e| {
+            let text = e.to_string();
+            Refusal::new(
+                text.lines().next().unwrap_or("").to_string(),
+                format!(
+                    "fix it on main (targo --unverified test -p aterm-gui --lib -- {} with \
+                         the pins {} names), then {RELEASE_COMMAND} --commit origin/main",
+                    crate::fixtures::generator_args().join(" "),
+                    crate::gates::HANDOFF_FIXTURE_README
+                ),
+            )
+            .detail(text.lines().skip(1).take(8).map(str::to_string))
+        })
+    }
+
+    /// `ship build` as the build step's child — R's own cutter (this binary): it reads the
+    /// journal's reservation and builds its bundle once into the release cache — and the
+    /// COMPLETE entry it left, read back by the key it built under.
+    fn build_run(
+        &self,
+        c: &Candidate,
+        reserved: &Reservation,
+        prover: &Prover,
+    ) -> Result<Artifact, Refusal> {
+        let mut cmd = self.cut_command(&["build".to_string()], prover);
+        let ran = self.logged(Step::Build, &mut cmd);
+        if ran.code != 0 {
+            return Err(Refusal::new(
+                format!("the build did not finish (ship build exited {})", ran.code),
+                format!(
+                    "read its log; a red build is fixed on main, then {RELEASE_COMMAND} \
+                     --commit origin/main (nothing was claimed)"
+                ),
+            )
+            .detail(ran.detail));
+        }
+        let identity = crate::artifact::Identity {
+            version: c.version.clone(),
+            build: reserved.build,
+            commit: reserved.commit.clone(),
+        };
+        // The key the child built under: its trustc is the release's prover (the
+        // child's TRUST_STAGE2_BIN), its rustc this machine's upstream stable.
+        let found = crate::buildplan::stable_rustc_commit()
+            .map(|rustc| {
+                crate::artifact::key(
+                    &identity,
+                    &crate::artifact::Compilers {
+                        trustc: prover.commit.clone(),
+                        rustc,
+                    },
+                )
+            })
+            .and_then(|key| {
+                let store = crate::artifact::store(&self.repo)?;
+                crate::artifact::read(&store, &key).map(|c| c.map(|c| (store, c)))
+            });
+        match found {
+            Ok(Some((store, complete))) if complete.trustc == prover.commit => Ok(Artifact {
+                app: complete.app(&store),
+                key: complete.key,
+                macho_sha256: complete.macho_sha256,
+                build: complete.build,
+            }),
+            Ok(Some((_, complete))) => Err(Refusal::new(
+                format!(
+                    "the build ran with trustc {}, not this release's prover {}",
+                    complete.trustc, prover.commit
+                ),
+                format!("{RELEASE_COMMAND} (it builds with the release's prover)"),
+            )),
+            Ok(None) => Err(Refusal::new(
+                "the build ended, and the release cache holds no COMPLETE bundle for it",
+                format!("read its log, then {RELEASE_COMMAND}"),
+            )
+            .detail(ran.detail)),
+            Err(e) => Err(Refusal::new(
+                format!("the built bundle cannot be read back: {e}"),
+                format!("read its log, then {RELEASE_COMMAND}"),
+            )),
+        }
     }
 
     // -- after the cut --------------------------------------------------------
@@ -1190,7 +1625,7 @@ impl Real {
     fn release_json(&self, slug: &str, tag: &str) -> Result<aterm_json::Value, String> {
         let out = self
             .output_forwarded(
-                Command::new("gh").args(["api", &format!("repos/{slug}/releases/tags/{tag}")]),
+                command("gh").args(["api", &format!("repos/{slug}/releases/tags/{tag}")]),
             )
             .map_err(|e| format!("cannot run gh: {e}"))?;
         if !out.status.success() {
@@ -1226,7 +1661,7 @@ impl Real {
         {
             return Ok(vec![problem]);
         }
-        let served = self.output_forwarded(Command::new("curl").args([
+        let served = self.output_forwarded(command("curl").args([
             "-fsSL",
             "--proto-redir",
             "=https",
@@ -1248,12 +1683,13 @@ impl Real {
         Ok(appcast_problems(&text, slug, tag, version))
     }
 
-    /// The release alab.systems would link: `publish/site-sync.py choose-download`
-    /// over the channel's release list (through the authenticated `gh`).
+    /// The release alab.systems would link: the site's own election of the macOS
+    /// download ([`crate::site::releases::elect_mac`]) over the channel's release list
+    /// (through the authenticated `gh`).
     fn site_tag(&self, slug: &str) -> Result<String, String> {
         let list = self
             .output_forwarded(
-                Command::new("gh").args(["api", &format!("repos/{slug}/releases?per_page=30")]),
+                command("gh").args(["api", &format!("repos/{slug}/releases?per_page=30")]),
             )
             .map_err(|e| format!("cannot run gh: {e}"))?;
         if !list.status.success() {
@@ -1262,48 +1698,93 @@ impl Real {
                 String::from_utf8_lossy(&list.stderr).trim()
             ));
         }
-        let (mut chooser, forwarded) = self
-            .spawn_forwarded(
-                Command::new("python3")
-                    .arg(self.repo.join("publish/site-sync.py"))
-                    .args(["choose-download", "--slug", slug])
-                    .current_dir(&self.repo)
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped()),
-            )
-            .map_err(|e| format!("cannot run publish/site-sync.py: {e}"))?;
-        if let Some(mut stdin) = chooser.stdin.take() {
-            let _ = stdin.write_all(&list.stdout);
-        }
-        let out = chooser
-            .wait_with_output()
-            .map_err(|e| format!("publish/site-sync.py: {e}"))?;
-        drop(forwarded);
-        let facts =
-            aterm_json::from_str::<aterm_json::Value>(&String::from_utf8_lossy(&out.stdout))
-                .ok()
-                .filter(|_| out.status.success());
-        facts
-            .as_ref()
-            .and_then(|f| f.get("tag"))
-            .and_then(aterm_json::Value::as_str)
-            .map(str::to_string)
-            .ok_or_else(|| {
-                format!(
-                    "publish/site-sync.py choose-download could not tell which release the site \
-                     would link on {slug} ({})",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                )
-            })
+        let catalog = crate::site::releases::parse_releases(&String::from_utf8_lossy(&list.stdout))
+            .map_err(|e| format!("the release list for {slug} is not release JSON ({e})"))?;
+        crate::site::releases::elect_mac(&catalog, slug, &mut Vec::new())
+            .map(|(mac, _)| mac.tag)
+            .map_err(|e| format!("the site could not tell which release to link on {slug} ({e})"))
     }
 
+    /// `ship site --latest`, in this process: its transcript into the step's log (and the
+    /// terminal under `--verbose`), every child it starts without the release's scrub list
+    /// and under the release's child rules ([`StepChildren`]).
     fn site(&mut self, slug: &str) -> Result<AfterCut, Refusal> {
-        let hook = self.repo.join("publish/post-promote");
-        let mut cmd = self.child(&hook, None);
-        cmd.arg("--latest").env("PUB_REPO_SLUG", slug);
-        let ran = self.logged(Step::AfterCut, &mut cmd);
-        site_outcome(ran)
+        if interrupt::caught().is_some() {
+            return Err(Refusal::new(
+                "not started: the release was interrupted",
+                format!("{RELEASE_COMMAND} again"),
+            ));
+        }
+        let log = self.log_path(Step::AfterCut);
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log)
+            .map_err(|e| {
+                Refusal::new(
+                    format!("cannot open {}: {e}", log.display()),
+                    format!("{RELEASE_COMMAND} again once it is writable"),
+                )
+                .could_not_run()
+            })?;
+        let mut out = StepLog {
+            file,
+            echo: self.verbose,
+        };
+        let _ = writeln!(out, "$ ship site --latest ({slug}, in process)");
+        let env = crate::site::Env::from_process(&self.repo, Some(slug)).map_err(|e| {
+            Refusal::new(
+                format!("the site settings cannot be read: {e}"),
+                format!("fix publish/site.toml, then {RELEASE_COMMAND}"),
+            )
+        })?;
+        let mut world = crate::site::Real {
+            unset: std::env::vars_os()
+                .filter_map(|(k, _)| k.into_string().ok())
+                .filter(|k| clears(k) || launcher_env(k))
+                .collect(),
+            launch: std::rc::Rc::new(StepChildren {
+                noted: (!self.scratch_logs).then(|| (self.release.clone(), self.step)),
+            }),
+        };
+        let opts = crate::site::Options {
+            latest: true,
+            ..crate::site::Options::default()
+        };
+        let ended = crate::site::sync(&opts, &env, &mut world, &mut out);
+        match &ended {
+            Ok(crate::site::Outcome::NoCheckout(line)) => {
+                let _ = writeln!(out, "ship site: {line}");
+            }
+            Err(crate::site::Failure(msg)) => {
+                let _ = writeln!(out, "ship site: FAIL: {msg}");
+            }
+            Ok(_) => {}
+        }
+        site_outcome(&ended, tail(&log, 8))
+    }
+}
+
+/// A step's log, and the terminal too when `echo`.
+struct StepLog {
+    file: std::fs::File,
+    echo: bool,
+}
+
+impl std::io::Write for StepLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.echo {
+            let _ = std::io::stdout().write_all(buf);
+        }
+        self.file.write_all(buf)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if self.echo {
+            let _ = std::io::stdout().flush();
+        }
+        self.file.flush()
     }
 }
 
@@ -1332,47 +1813,60 @@ pub fn shape_refusal(slug: &str, tag: &str, problems: Vec<String>) -> Refusal {
     .detail(problems)
 }
 
-/// What `publish/post-promote --latest` ending with `ran` means for the after-cut step.
-/// Exit 3 is a machine with no usable site checkout (none found, or one without its
-/// build and deploy scripts), said in the hook's line, kept here, before the hook
-/// touched anything: a hand step on a machine that has one, recorded, never a stop — a
-/// re-run here could only meet it again ([`AfterCut::site_deferred`]).
+/// What `ship site --latest` ending with `ended` means for the after-cut step; `detail`
+/// is the end of its transcript. No usable site checkout here (none configured or found,
+/// or one without its build and deploy scripts) touched nothing: a hand step on a
+/// machine that has one, recorded, never a stop — a re-run here could only meet it
+/// again ([`AfterCut::site_deferred`]).
 ///
 /// # Errors
-/// Every other failure: 4 (deployed, the live site not agreeing yet) and the rest.
-pub fn site_outcome(ran: Ran) -> Result<AfterCut, Refusal> {
-    match ran.code {
-        0 => Ok(AfterCut {
-            note: "alab.systems brought to the release (publish/post-promote --latest)".into(),
+/// A deployed site the live site does not show yet, and every failure of the sync.
+pub fn site_outcome(
+    ended: &Result<crate::site::Outcome, crate::site::Failure>,
+    detail: Vec<String>,
+) -> Result<AfterCut, Refusal> {
+    use crate::site::Outcome;
+    let note = |s: &str| {
+        Ok(AfterCut {
+            note: s.into(),
             site_deferred: false,
-        }),
-        3 => {
-            // the hook's own line: where it looked, or what the checkout there lacks
-            let why = ran
-                .detail
-                .iter()
-                .rev()
-                .find_map(|l| l.trim().strip_prefix("post-promote: "))
-                .unwrap_or("its log says why");
-            Ok(AfterCut {
-                note: format!("publish/post-promote said: {why}"),
-                site_deferred: true,
-            })
+        })
+    };
+    match ended {
+        Ok(Outcome::Synced { deployed: true }) => {
+            note("alab.systems brought to the release and deployed (ship site --latest)")
         }
-        4 => Err(Refusal::new(
-            "the site is deployed, but the live site does not agree yet (publish/post-promote \
-             exited 4)",
+        Ok(Outcome::Synced { deployed: false }) => {
+            note("alab.systems already shows the release (ship site --latest)")
+        }
+        Ok(Outcome::NoDeploy) => note(
+            "alab.systems committed and pushed for the release but NOT deployed: SITE_NO_DEPLOY \
+             asked for no deploy (deploy with the site's deploy.sh)",
+        ),
+        Ok(Outcome::NotDeployed) => note(
+            "alab.systems committed and pushed for the release but NOT deployed: Firebase's \
+             login here is missing or expired (deploy with the site's deploy.sh)",
+        ),
+        Ok(Outcome::Skipped | Outcome::Deferred | Outcome::Planned { .. }) => {
+            note("alab.systems left as it is (ship site --latest did not sync)")
+        }
+        Ok(Outcome::NoCheckout(why)) => Ok(AfterCut {
+            note: format!("ship site said: {why}"),
+            site_deferred: true,
+        }),
+        Ok(Outcome::LiveDisagrees { .. }) => Err(Refusal::new(
+            "the site is deployed, but the live site does not agree yet (ship site exited 4)",
             format!("{RELEASE_COMMAND} again in a few minutes"),
         )
-        .detail(ran.detail)),
-        code => Err(Refusal::new(
-            format!("the release is well shaped, but the site hook exited {code}"),
+        .detail(detail)),
+        Err(crate::site::Failure(why)) => Err(Refusal::new(
+            format!("the release is well shaped, but the site sync failed: {why}"),
             format!(
                 "read its log (a failed push leaves its site commit on this machine), then \
                  {RELEASE_COMMAND}"
             ),
         )
-        .detail(ran.detail)),
+        .detail(detail)),
     }
 }
 
@@ -1435,18 +1929,52 @@ fn parse_offset(z: &str) -> Option<i64> {
     Some(sign * (h * 3600 + m * 60))
 }
 
-/// The variables cleared from every child: what the gate records on a receipt's
-/// `build-env` line, and the target directory overrides — said on the checks line —
-/// and, silently, what `targo run` handed this
-/// process as its launcher (`CARGO`, `CARGO_MANIFEST_*`, `CARGO_PKG_*`, their `TARGO_*`
-/// twins, `TRUST_TARGO_FRONTEND`, `DYLD_FALLBACK_LIBRARY_PATH`): every step runs as it
-/// would from the operator's shell, never as a child of the alias.
-fn clears(name: &str) -> bool {
-    matches!(name, "CARGO_TARGET_DIR" | "CARGO_BUILD_TARGET_DIR")
-        || aterm_verify::differential::build_env_records(name)
+/// The variables cleared from every child: every one that steers what a build compiles or
+/// how a test decides — each `RUST*` and `CARGO*` but the inert knobs (job count,
+/// incremental, logging, backtraces, cargo's terminal output), and the C toolchain's (the
+/// `cc` crate's names, also as `<NAME>_<target>`, `TARGET_<NAME>`, `HOST_<NAME>`) — so
+/// every step builds what the operator's shell would. The target directory overrides go
+/// with them.
+pub(crate) fn clears(name: &str) -> bool {
+    const INERT: [&str; 8] = [
+        "CARGO_BUILD_JOBS",
+        "CARGO_MAKEFLAGS",
+        "CARGO_INCREMENTAL",
+        "CARGO_LOG",
+        "RUST_BACKTRACE",
+        "RUST_LIB_BACKTRACE",
+        "RUST_LOG",
+        "RUST_TEST_THREADS",
+    ];
+    const NATIVE: [&str; 8] = [
+        "CC", "CXX", "AR", "CFLAGS", "CXXFLAGS", "CPPFLAGS", "LDFLAGS", "ARFLAGS",
+    ];
+    if name.starts_with("RUST") || name.starts_with("CARGO") {
+        return !INERT.contains(&name) && !name.starts_with("CARGO_TERM_");
+    }
+    if matches!(
+        name,
+        "MACOSX_DEPLOYMENT_TARGET" | "SDKROOT" | "CRATE_CC_NO_DEFAULTS"
+    ) {
+        return true;
+    }
+    let bare = name
+        .strip_prefix("TARGET_")
+        .or_else(|| name.strip_prefix("HOST_"))
+        .unwrap_or(name);
+    NATIVE.iter().any(|n| {
+        bare == *n
+            || bare
+                .strip_prefix(n)
+                .is_some_and(|rest| rest.starts_with('_'))
+    })
 }
 
-fn launcher_env(name: &str) -> bool {
+/// What `targo run` handed this process as its launcher (`CARGO`, `CARGO_MANIFEST_*`,
+/// `CARGO_PKG_*`, their `TARGO_*` twins, `TRUST_TARGO_FRONTEND`,
+/// `DYLD_FALLBACK_LIBRARY_PATH`): cleared too, silently — every step runs as it would
+/// from the operator's shell, never as a child of the alias.
+pub(crate) fn launcher_env(name: &str) -> bool {
     matches!(
         name,
         "CARGO" | "CARGO_PRIMARY_PACKAGE" | "TRUST_TARGO_FRONTEND" | "DYLD_FALLBACK_LIBRARY_PATH"
@@ -1489,27 +2017,59 @@ fn fixture_root(repo: &Path) -> Result<PathBuf, Refusal> {
         })
 }
 
+/// A child run beside another, joined: what it answered — or, its thread having
+/// panicked (a bug in the release), a resumable stop naming it.
+fn joined(
+    handle: std::thread::ScopedJoinHandle<'_, Result<String, Refusal>>,
+    what: &str,
+) -> Result<String, Refusal> {
+    handle.join().unwrap_or_else(|_| {
+        Err(Refusal::new(
+            format!("{what} stopped unexpectedly (its thread panicked)"),
+            format!("read its log, then run {RELEASE_COMMAND} again to resume"),
+        )
+        .could_not_run())
+    })
+}
+
+/// One of the cut's own gates, refusing in its own words, as a refusal: its first line
+/// named by the gate, its `fix:` line the remedy, the rest the detail.
+fn cut_refusal(gate: &str, why: &str) -> Refusal {
+    let first = why.lines().next().unwrap_or("");
+    let fix = why
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("fix:"))
+        .map_or_else(
+            || "the cut's own remedy, above".to_string(),
+            |f| f.trim().to_string(),
+        );
+    Refusal::new(format!("{gate} — {first}"), fix).detail(
+        why.lines()
+            .skip(1)
+            .filter(|l| !l.trim().starts_with("fix:"))
+            .map(str::to_string),
+    )
+}
+
+/// A captured child's output appended to `log`, both streams (a write that fails loses
+/// only the log's copy: the verdict is the child's exit).
+fn append_output(log: &Path, out: &std::process::Output) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log)
+    {
+        let _ = f.write_all(&out.stdout);
+        let _ = f.write_all(&out.stderr);
+    }
+}
+
 fn tail(path: &Path, n: usize) -> Vec<String> {
     let text = std::fs::read_to_string(path).unwrap_or_default();
     let lines: Vec<&str> = text.lines().collect();
     lines[lines.len().saturating_sub(n)..]
         .iter()
         .map(|l| (*l).to_string())
-        .collect()
-}
-
-/// Every gitlink (`160000`) of an `ls-tree -r` listing: (rev, path).
-fn gitlinks(listing: &str) -> Vec<(String, String)> {
-    listing
-        .lines()
-        .filter_map(|l| {
-            let (meta, path) = l.split_once('\t')?;
-            let mut f = meta.split_whitespace();
-            (f.next()? == "160000").then(|| {
-                let _kind = f.next();
-                Some((f.next()?.to_string(), path.to_string()))
-            })?
-        })
         .collect()
 }
 
@@ -1540,90 +2100,379 @@ pub fn audit_rows_merged(text: &str, kept: &[String]) -> String {
     out
 }
 
-/// What the engine's dry run said, as blocks: `(blocks, the export exists)`.
-/// `exported`: the export directory exists.
+/// Where one `ship check` lays its sources out: its own `runs/<pid>-<n>` inside the
+/// [`preflight_cache`], so no two runs share one and none waits for another. A run's
+/// sources go when it ends; its logs and the engine's reports stay for reading until
+/// the next run, which removes every run whose process is gone. The wasm32 target
+/// directory is the cache's (cargo locks it itself).
+pub(crate) struct Scratch {
+    pub(crate) dir: PathBuf,
+    pub(crate) cache: PathBuf,
+}
+
+impl Scratch {
+    /// A run's own directory, the runs whose process is gone removed first.
+    pub(crate) fn read_only(repo: &Path) -> Result<Self, String> {
+        static NTH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let cache = preflight_cache(repo)?;
+        let runs = cache.join("runs");
+        let me = std::process::id();
+        for entry in std::fs::read_dir(&runs).into_iter().flatten().flatten() {
+            let pid = entry
+                .file_name()
+                .to_str()
+                .and_then(|n| n.split('-').next())
+                .and_then(|p| p.parse::<u32>().ok());
+            if pid.is_some_and(|pid| pid != me && started_of(pid).is_none()) {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+        let nth = NTH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = runs.join(format!("{me}-{nth}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+        Ok(Self { dir, cache })
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        for sources in ["dry-run", "engine", "wasm-src"] {
+            let _ = std::fs::remove_dir_all(self.dir.join(sources));
+        }
+    }
+}
+
+/// Where rustup is for the engine's children: the PATH entry that has it, else
+/// `$CARGO_HOME/bin`, else `~/.cargo/bin` — where its installer puts it, which a
+/// shell's PATH can leave out.
+fn rustup_dir() -> Option<PathBuf> {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    std::env::split_paths(&path)
+        .chain(std::env::var_os("CARGO_HOME").map(|h| PathBuf::from(h).join("bin")))
+        .chain(std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cargo/bin")))
+        .find(|d| d.join("rustup").is_file())
+}
+
+/// This process's PATH with `dir` appended when it is not on it — appended, so
+/// nothing PATH already finds is shadowed.
+fn path_with(dir: &Path) -> std::ffi::OsString {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let mut dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
+    if !dirs.iter().any(|d| d == dir) {
+        dirs.push(dir.to_path_buf());
+    }
+    std::env::join_paths(dirs).unwrap_or(path)
+}
+
+/// The engine's report files (its `.out`'s top level: the hits, the gitleaks reports,
+/// the metadata error) copied to `to`, which outlives a read-only run's sources.
+fn keep_reports(out: &Path, to: &Path) {
+    let _ = std::fs::remove_dir_all(to);
+    if std::fs::create_dir_all(to).is_err() {
+        return;
+    }
+    for entry in std::fs::read_dir(out).into_iter().flatten().flatten() {
+        if entry.file_type().is_ok_and(|t| t.is_file()) {
+            let _ = std::fs::copy(entry.path(), to.join(entry.file_name()));
+        }
+    }
+}
+
+/// The report a failing gitleaks guard names (`gitleaks findings (see <report>)`).
+fn gitleaks_report(guard: &str) -> Option<&str> {
+    guard
+        .strip_prefix("gitleaks findings (see ")?
+        .strip_suffix(')')
+}
+
+/// Up to six gitleaks findings as `<path in the export>:<line> <rule>` — never the
+/// matched text or the secret.
 #[must_use]
-pub fn engine_dry_run_verdict(
-    code: i32,
-    text: &str,
-    r: &str,
-    exported: bool,
-) -> (Vec<Refusal>, bool) {
-    let n_ok = text
-        .lines()
-        .filter(|l| l.starts_with("== guard ok"))
-        .count();
-    let fails: Vec<&str> = text
-        .lines()
-        .filter(|l| l.starts_with("== GUARD FAIL"))
-        .collect();
-    let export = n_ok + fails.len() > 0 && exported;
-    if code == 0 && n_ok > 0 {
-        return (Vec::new(), export);
-    }
-    let fix_source = "fix the SOURCE, never the export — patterns: the engine's \
-                      baseline/forbidden-content.txt + publish/forbidden-extra.txt; the engine's \
-                      reports are in the scratch clone's publish/.out";
-    if code == 0 {
-        return (
-            vec![
-                Refusal::new(
-                    format!(
-                        "the engine's dry run exited 0 without reporting a single guard over {r} — \
-                     no export guard is known to have run"
-                    ),
-                    "read the whole run and teach this step the engine's words",
-                )
-                .detail(last_lines(text, 3)),
-            ],
-            export,
-        );
-    }
-    if !fails.is_empty() {
-        let mut out = Vec::new();
+pub fn gitleaks_locations(report: &str, export: &Path) -> Vec<String> {
+    let Ok(aterm_json::Value::Array(findings)) = aterm_json::from_str(report) else {
+        return Vec::new();
+    };
+    findings
+        .iter()
+        .take(6)
+        .map(|f| {
+            let file = f
+                .get("File")
+                .and_then(aterm_json::Value::as_str)
+                .unwrap_or("?");
+            let file = Path::new(file)
+                .strip_prefix(export)
+                .map_or_else(|_| file.to_string(), |p| p.display().to_string());
+            let line = f
+                .get("StartLine")
+                .and_then(aterm_json::Value::as_u64)
+                .unwrap_or(0);
+            let rule = f
+                .get("RuleID")
+                .and_then(aterm_json::Value::as_str)
+                .unwrap_or("?");
+            format!("{file}:{line} {rule}")
+        })
+        .collect()
+}
+
+/// What the engine's dry run printed, read in the engine's own words: `== guard ok: …`
+/// per passing guard, `== GUARD FAIL: …` per failing one (its indented lines its
+/// locations), `FAIL: …` per refusal.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct EngineRun {
+    pub code: i32,
+    pub passed: Vec<String>,
+    /// Each failing guard and up to six of its location lines.
+    pub failed: Vec<(String, Vec<String>)>,
+    pub refusals: Vec<String>,
+    /// The run's last three lines, for a run that said nothing else.
+    pub tail: Vec<String>,
+}
+
+impl EngineRun {
+    /// The run that exited `code` and printed `text`.
+    #[must_use]
+    pub fn read(code: i32, text: &str) -> Self {
         let lines: Vec<&str> = text.lines().collect();
-        for (i, l) in lines.iter().enumerate() {
-            if let Some(what) = l.strip_prefix("== GUARD FAIL: ") {
-                let detail: Vec<String> = lines[i + 1..]
+        let mut run = Self {
+            code,
+            tail: lines[lines.len().saturating_sub(3)..]
+                .iter()
+                .map(|l| (*l).to_string())
+                .collect(),
+            ..Self::default()
+        };
+        for (i, line) in lines.iter().enumerate() {
+            if let Some(what) = line.strip_prefix("== guard ok: ") {
+                run.passed.push(what.to_string());
+            } else if let Some(what) = line.strip_prefix("== GUARD FAIL: ") {
+                let at = lines[i + 1..]
                     .iter()
                     .take_while(|d| d.starts_with("  "))
                     .take(6)
                     .map(|d| d.trim().to_string())
                     .collect();
-                out.push(Refusal::new(what.to_string(), fix_source).detail(detail));
+                run.failed.push((what.to_string(), at));
+            } else if let Some(why) = line.strip_prefix("FAIL: ") {
+                run.refusals.push(why.to_string());
             }
         }
-        return (out, export);
+        run
     }
-    let refusals: Vec<&str> = text
-        .lines()
-        .filter_map(|l| l.strip_prefix("FAIL: "))
-        .filter(|l| *l != "transforms failed")
-        .collect();
-    let refusal = match refusals.first() {
-        Some(first) => Refusal::new(
-            format!("the engine refuses to stage {r} before any guard ran (exit {code}): {first}"),
-            "fix the source the refusal names (never the export)",
-        )
-        .detail(refusals[1..].iter().take(2).map(|l| (*l).to_string())),
-        None => Refusal::new(
-            format!(
-                "the engine's dry run stopped without a guard verdict (exit {code}) and printed no \
-                 refusal"
-            ),
-            "read the whole run",
-        )
-        .detail(last_lines(text, 3)),
-    };
-    (vec![refusal], export)
 }
 
-fn last_lines(text: &str, n: usize) -> Vec<String> {
-    let lines: Vec<&str> = text.lines().collect();
-    lines[lines.len().saturating_sub(n)..]
+/// Why the engine refused, read from its `FAIL:` line: the commit's tree, or the
+/// machine's — something that decided nothing about the tree. A refusal is the tree's
+/// unless the engine's words name one of the machine's ([`MACHINE_REFUSALS`]),
+/// wherever in the run it came.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineCause {
+    /// The tree's own (its manifest, its config, its transforms, its version): a
+    /// refusal of the commit.
+    Tree,
+    /// gitleaks is not on PATH: the engine stops at that fail-closed guard.
+    NoGitleaks,
+    /// gitleaks crashed or timed out.
+    GitleaksBroke,
+    /// A remote (the origins, the staging repository, the public tags) could not be
+    /// read, or moved while it was.
+    Network,
+    /// The engine's own checkout, records or lock.
+    Engine,
+    /// The commit is not on its origin's main, or the source clone is not one the
+    /// engine stages.
+    Source,
+}
+
+/// The engine's words for each refusal of the machine's (a substring of its `FAIL:`
+/// line); every other refusal is the tree's.
+const MACHINE_REFUSALS: [(&str, EngineCause); 17] = [
+    ("gitleaks not installed", EngineCause::NoGitleaks),
+    ("gitleaks crashed", EngineCause::GitleaksBroke),
+    ("release notes: cannot ", EngineCause::Network),
+    ("cannot query ", EngineCause::Network),
+    ("cannot fetch ", EngineCause::Network),
+    (" fetch failed", EngineCause::Network),
+    ("fetch for pin failed", EngineCause::Network),
+    ("while fetching", EngineCause::Network),
+    ("publication engine ", EngineCause::Engine),
+    ("another publication operation", EngineCause::Engine),
+    ("mappings.json", EngineCause::Engine),
+    ("mapping history", EngineCause::Engine),
+    ("append-only violation", EngineCause::Engine),
+    ("--commit ", EngineCause::Source),
+    ("--repo-path", EngineCause::Source),
+    ("source override", EngineCause::Source),
+    ("source origin", EngineCause::Source),
+];
+
+impl EngineCause {
+    /// The cause of the engine's refusal `line` (its `FAIL:` line, without the prefix).
+    #[must_use]
+    pub fn of(line: &str) -> Self {
+        MACHINE_REFUSALS
+            .iter()
+            .find(|(words, _)| line.contains(words))
+            .map_or(Self::Tree, |(_, cause)| *cause)
+    }
+
+    fn remedy(self) -> &'static str {
+        match self {
+            Self::Tree => "fix the source the refusal names (never the export)",
+            Self::NoGitleaks => "brew install gitleaks",
+            Self::GitleaksBroke => {
+                "run `gitleaks version` to see why it cannot scan, then run it again"
+            }
+            Self::Network => {
+                "check the network and access to the remote it names (ssh for a git@ remote), \
+                 then run it again"
+            }
+            Self::Engine => {
+                "fix the publication engine's checkout or records it names, then run it again"
+            }
+            Self::Source => {
+                "push the commit to origin/main (the engine stages only mainline commits), or \
+                 fix the source clone it names, then run it again"
+            }
+        }
+    }
+}
+
+/// The export guards' [`Outcome`] from the engine's dry run of `r` (`toolchain`: why
+/// the cargo-metadata guard cannot run here, if it cannot; `log`: the whole run;
+/// `reports`: the engine's report files). Sorted by cause, not by where in the run it
+/// came: a failing guard or a refusal of the tree refuses, whatever else happened —
+/// its finding stands; else a refusal of the machine's (or a metadata guard that
+/// failed for want of its toolchain) could not run, with its fix; a clean exit that
+/// heard its guards passes; anything else decided nothing, so it could not run.
+#[must_use]
+pub fn export_outcome(
+    run: &EngineRun,
+    r: &str,
+    toolchain: Option<&Refusal>,
+    log: &Path,
+    reports: &Path,
+) -> Outcome {
+    let whole = format!("the whole run: {}", log.display());
+    let heard = (!run.passed.is_empty())
+        .then(|| format!("the guards that passed first: {}", run.passed.join("; ")));
+    let machine_guard =
+        |name: &str| toolchain.is_some() && name.starts_with("targo metadata failed");
+    let findings: Vec<&(String, Vec<String>)> = run
+        .failed
         .iter()
-        .map(|l| (*l).to_string())
-        .collect()
+        .filter(|(name, _)| !machine_guard(name))
+        .collect();
+    // `guards failed` is the engine's summary of the guards above it, not a refusal
+    let refusals: Vec<(&str, EngineCause)> = run
+        .refusals
+        .iter()
+        .map(String::as_str)
+        .filter(|l| !l.starts_with("guards failed"))
+        .map(|l| (l, EngineCause::of(l)))
+        .collect();
+    let tree: Vec<&str> = refusals
+        .iter()
+        .filter(|(_, cause)| *cause == EngineCause::Tree)
+        .map(|(line, _)| *line)
+        .collect();
+    // a transform's own words before the engine's summary of them
+    let first_tree = tree
+        .iter()
+        .find(|l| **l != "transforms failed")
+        .or(tree.first())
+        .copied();
+    let machine = refusals
+        .iter()
+        .find(|(_, cause)| *cause != EngineCause::Tree)
+        .copied();
+    if !findings.is_empty() || first_tree.is_some() {
+        let why = if findings.is_empty() {
+            format!(
+                "the engine refuses to stage {}: {}",
+                short(r),
+                first_tree.unwrap_or_default()
+            )
+        } else {
+            let names: Vec<&str> = findings.iter().map(|(name, _)| name.as_str()).collect();
+            format!(
+                "the engine's export guards refuse {}: {}",
+                short(r),
+                names.join("; ")
+            )
+        };
+        let guards = findings.iter().flat_map(|(name, at)| {
+            std::iter::once(format!("GUARD FAIL: {name}"))
+                .chain(at.iter().map(|l| format!("  {l}")))
+        });
+        let others = tree
+            .iter()
+            .filter(|l| !findings.is_empty() || Some(**l) != first_tree)
+            .take(3)
+            .map(|l| format!("FAIL: {l}"));
+        let stopped = machine.map(|(line, cause)| {
+            format!(
+                "then the engine stopped, judging nothing more: {line} (fix: {})",
+                cause.remedy()
+            )
+        });
+        return Outcome::Refuse(
+            Refusal::new(
+                why,
+                "fix the SOURCE, never the export — patterns: the engine's \
+                 baseline/forbidden-content.txt + publish/forbidden-extra.txt",
+            )
+            .detail(
+                guards
+                    .chain(others)
+                    .chain(stopped)
+                    .chain(std::iter::once(format!(
+                        "the engine's reports: {}",
+                        reports.display()
+                    )))
+                    .chain(std::iter::once(whole)),
+            ),
+        );
+    }
+    if let Some((line, cause)) = machine {
+        return Outcome::CouldNotRun(
+            Refusal::new(
+                format!("the engine could not judge {}: {line}", short(r)),
+                cause.remedy(),
+            )
+            .detail(heard.into_iter().chain(std::iter::once(whole))),
+        );
+    }
+    if let Some(toolchain) = toolchain
+        && run.failed.iter().any(|(name, _)| machine_guard(name))
+    {
+        return Outcome::CouldNotRun(
+            toolchain
+                .clone()
+                .detail(heard.into_iter().chain(std::iter::once(whole))),
+        );
+    }
+    if run.code == 0 && !run.passed.is_empty() {
+        return Outcome::Pass(format!(
+            "export guards: the engine's dry run of {} passed {} guard(s): {}",
+            short(r),
+            run.passed.len(),
+            run.passed.join("; ")
+        ));
+    }
+    Outcome::CouldNotRun(
+        Refusal::new(
+            format!(
+                "the engine's dry run of {} ended (exit {}) without a guard verdict",
+                short(r),
+                run.code
+            ),
+            "read the whole run, and teach this gate the engine's words if they changed",
+        )
+        .detail(run.tail.iter().cloned().chain(std::iter::once(whole))),
+    )
 }
 
 /// The wasm32 clause of `publish/config.sh`'s `CHECK_CMD_DEFAULT` and the stock
@@ -1698,6 +2547,33 @@ pub fn wasm_clause(config: &str) -> Result<WasmClause, Refusal> {
         clause: clause.to_string(),
         pin,
     })
+}
+
+/// The source manifest pair a completed `pub publish` leaves on the channel. Its
+/// ledger row precedes sign-release, so it cannot stand in for these live assets.
+fn source_attestation_findings(release: &aterm_json::Value) -> Vec<String> {
+    crate::channel::SOURCE_ATTESTATION_ASSETS
+        .into_iter()
+        .filter_map(|name| {
+            let count = release
+                .get("assets")
+                .and_then(aterm_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|a| a.get("name").and_then(aterm_json::Value::as_str) == Some(name))
+                .count();
+            match count {
+                1 => None,
+                0 => Some(format!(
+                    "{name} is missing — the signed source manifest `pub publish` attaches \
+                     (`pub sign-release aterm` attaches it to a published release)"
+                )),
+                _ => Some(format!(
+                    "{name} is duplicated — the source manifest must be unambiguous"
+                )),
+            }
+        })
+        .collect()
 }
 
 /// The lean-download shape of a published release, from what GitHub serves (its
@@ -1782,14 +2658,7 @@ pub fn release_shape(release: &aterm_json::Value, version: &str) -> Vec<String> 
             "aterm-appcast.toml is missing — installed copies read it to find this release".into(),
         );
     }
-    for name in crate::channel::SOURCE_ATTESTATION_ASSETS {
-        if !assets.contains_key(name) {
-            bad.push(format!(
-                "{name} is missing — the signed source manifest `pub publish` attaches \
-                 (`pub sign-release aterm` attaches it to a published release)"
-            ));
-        }
-    }
+    bad.extend(source_attestation_findings(release));
     let retired: Vec<&String> = assets
         .keys()
         .filter(|n| {
@@ -2030,8 +2899,7 @@ impl Backend for Real {
     }
 
     fn log_path(&mut self, step: Step) -> PathBuf {
-        self.logs
-            .join(format!("{:02}-{}.log", step.number(), step.name()))
+        self.step_log(step)
     }
 
     fn me(&mut self) -> (u32, String) {
@@ -2083,8 +2951,7 @@ impl Backend for Real {
             let mut source = "the cut's own toolchain resolution".to_string();
             if let Some(j) = journaled {
                 source.push_str(&format!(
-                    " — the prover this release started with ({j}) is gone, and its receipts \
-                     with it"
+                    " — the prover this release started with ({j}) is gone; resolving a replacement"
                 ));
             }
             (found, source)
@@ -2125,7 +2992,7 @@ impl Backend for Real {
     fn cleared_env(&mut self) -> Vec<String> {
         let mut names: Vec<String> = std::env::vars_os()
             .filter_map(|(k, _)| k.into_string().ok())
-            .filter(|k| clears(k))
+            .filter(|k| clears(k) && !launcher_env(k))
             .collect();
         names.sort();
         names
@@ -2165,33 +3032,13 @@ impl Backend for Real {
                 "free space, then re-run",
             ));
         }
-        let e = self.engine.display().to_string();
-        if !self.engine.join(".git").exists() || !self.engine.join("bin/pub").is_file() {
-            out.push(Refusal::new(
-                format!("no publication engine at {e} (bin/pub)"),
-                "clone it there, or pass --engine <path>",
-            ));
-        } else if self
-            .engine_git(&["rev-parse", "--abbrev-ref", "HEAD"])
-            .is_none_or(|b| b.trim() != "main")
-        {
-            out.push(Refusal::new(
-                format!("the engine {e} is not on main — stage and publish run from its main"),
-                format!("git -C {e} switch main"),
-            ));
-        } else if self.engine_dirty() {
-            out.push(Refusal::new(
-                format!("the engine {e} has local changes besides its audit log"),
-                format!("commit or discard them there: git -C {e} status --short"),
-            ));
-        }
+        out.extend(self.engine_unready());
         match self.dirty() {
             Ok(dirty) if dirty.is_empty() => {}
             Ok(dirty) => out.push(
                 Refusal::new(
                     format!(
-                        "this clone ({}) is not clean — the trust lane files facts only for a \
-                         clean tree",
+                        "this clone ({}) is not clean — a release needs its own clean checkout",
                         self.repo.display()
                     ),
                     "commit or remove what it lists: a release runs in a clone of its own",
@@ -2323,6 +3170,126 @@ impl Backend for Real {
         engine_rows_in(&text, commit)
     }
 
+    /// THE ENGINE THAT PUBLISHES IS THE ENGINE THAT STAGED: its HEAD at its origin/main
+    /// (as the sync step left it), a fast-forward of `staged`, and no path changed since
+    /// `staged` but the engine's own data plane — the set its stage's drift check
+    /// (`revalidate_push_inputs`) lets move: `verification-log.jsonl` (every stage and dry
+    /// run appends to it, the sync commits it), `mappings.json` (every publish of any
+    /// repository appends to it) and `handoff/`. A `staged` the engine no longer holds, or
+    /// one its origin/main does not contain, is code that moved: the stage runs again
+    /// (`pub stage` clears publish/.out and attests anew); only git not answering is an
+    /// `Err`. Read-only: no fetch (step 2's sync fetched it), no checkout.
+    fn engine_now(&mut self, staged: &str) -> Result<EngineNow, String> {
+        let e = self.engine.display().to_string();
+        let head = self.engine_commit("HEAD")?;
+        let origin = self.engine_commit("origin/main")?;
+        let (Some(head), Some(origin)) = (head, origin) else {
+            return Ok(EngineNow::Off(format!(
+                "the engine {e} has no HEAD or no origin/main commit — pub stage and pub \
+                 publish refuse such an engine"
+            )));
+        };
+        if head != origin {
+            return Ok(EngineNow::Off(format!(
+                "the engine {e} is at {}, not its origin/main {} — pub stage and pub publish \
+                 refuse such an engine",
+                short(&head),
+                short(&origin)
+            )));
+        }
+        let Some(staged) = self.engine_commit(staged)? else {
+            return Ok(EngineNow::Moved(format!(
+                "the engine no longer holds the commit that staged ({}); its origin/main is {}",
+                short(staged),
+                short(&head)
+            )));
+        };
+        if staged == head {
+            return Ok(EngineNow::Same(format!(
+                "the engine is the one that staged ({}, its origin/main)",
+                short(&head)
+            )));
+        }
+        let (from, to) = (staged.as_str(), head.as_str());
+        let (code, out) = self.engine_git_code(&["merge-base", "--is-ancestor", from, to])?;
+        match code {
+            0 => {}
+            1 => {
+                return Ok(EngineNow::Moved(format!(
+                    "the engine's origin/main {} does not contain the commit that staged ({}): \
+                     its history was rewritten",
+                    short(to),
+                    short(from)
+                )));
+            }
+            _ => {
+                return Err(format!(
+                    "git -C {e} merge-base --is-ancestor {} {} exited {code}: {}",
+                    short(from),
+                    short(to),
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ));
+            }
+        }
+        // its data plane, as the engine's own drift check names it
+        let (code, out) = self.engine_git_code(&[
+            "diff",
+            "--quiet",
+            from,
+            to,
+            "--",
+            ".",
+            ":(exclude)verification-log.jsonl",
+            ":(exclude)mappings.json",
+            ":(exclude)handoff/",
+        ])?;
+        match code {
+            0 => Ok(EngineNow::Same(format!(
+                "the engine at its origin/main {} has the code that staged ({}; only its data \
+                 plane moved)",
+                short(to),
+                short(from)
+            ))),
+            1 => Ok(EngineNow::Moved(format!(
+                "the engine's code moved since it staged: {}..{} (its origin/main)",
+                short(from),
+                short(to)
+            ))),
+            _ => Err(format!(
+                "git -C {e} diff {}..{} exited {code}: {}",
+                short(from),
+                short(to),
+                String::from_utf8_lossy(&out.stderr).trim()
+            )),
+        }
+    }
+
+    /// `git ls-remote --refs <staging.remote> refs/heads/main` against the attestation's
+    /// `staging.attested_rev`, as `pub promote` asks it before it promotes.
+    fn staging_moved(&mut self) -> Result<Option<String>, String> {
+        let path = self.repo.join("publish/.out/attestation.json");
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        let Some((remote, attested)) = attested_staging(&text) else {
+            return Ok(Some(format!(
+                "{} names no staging tier (staging.remote, staging.attested_rev)",
+                path.display()
+            )));
+        };
+        let out = self
+            .remote_git(&["ls-remote", "--refs", &remote, "refs/heads/main"])
+            .map_err(|e| format!("git ls-remote {remote}: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "git ls-remote {remote} refs/heads/main exited {}: {}",
+                out.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        let listing = String::from_utf8_lossy(&out.stdout);
+        Ok(staging_moved_from(&listing, &attested))
+    }
+
     fn cut_journal(&mut self) -> Option<CutState> {
         let header =
             crate::publish::JournalHeader::read(&self.repo.join("dist/cut-state.toml")).ok()??;
@@ -2444,7 +3411,7 @@ impl Backend for Real {
                 .detail(moved));
             }
             let msg = format!("release: {to} — the version and the lockfile move together");
-            let mut commit = Command::new("git");
+            let mut commit = command("git");
             commit
                 .args(["commit", "-q", "-m", &msg, "--", "Cargo.toml", "Cargo.lock"])
                 .current_dir(&self.repo);
@@ -2454,7 +3421,7 @@ impl Backend for Real {
                     "read the commit step's log",
                 ));
             }
-            let mut push = Command::new("git");
+            let mut push = command("git");
             push.args(["push", "-q", "origin", "HEAD:main"])
                 .current_dir(&self.repo);
             if self.logged(Step::Commit, &mut push).code == 0 {
@@ -2489,7 +3456,7 @@ impl Backend for Real {
         }
     }
 
-    fn own_cutter(&mut self, commit: &str) -> Result<String, String> {
+    fn own_cutter(&mut self, commit: &str) -> Result<String, crate::cutter::NotOwn> {
         crate::gates::own_cutter(&self.git(), commit)
     }
 
@@ -2503,7 +3470,6 @@ impl Backend for Real {
             .current_dir(&self.repo);
         #[cfg(unix)]
         {
-            use std::os::unix::process::CommandExt as _;
             let e = cmd.exec();
             Refusal::new(
                 format!("cannot re-run as R's own cutter ({e})"),
@@ -2529,27 +3495,23 @@ impl Backend for Real {
                 Answer::no(words)
             }
         };
-        let trusted = match crate::trust_facts::verdict_for(
-            &git,
-            &crate::trust_facts::Prover::at(&prover.bin),
-            &c.commit,
-        ) {
-            Ok((yes, words)) => answer(yes, words),
-            Err(e) => Answer::unanswered(format!("the trust judge did not answer: {e}")),
-        };
         let built = built_answer(&self.repo, artifact, prover);
-        let measured = match artifact.filter(|_| built.yes) {
-            None => Answer::no("its bundle is not built yet (step 7)"),
-            Some(a) => match crate::gates::receipt_store(&git)
-                .and_then(|store| crate::gates::measured(&store, &a.macho_sha256, &c.commit))
-            {
+        let verified = match artifact.filter(|_| built.yes) {
+            None => Answer::no("its bundle is not built yet (step 5)"),
+            Some(a) => match crate::gates::verified(&git, &c.commit, &a.macho_sha256) {
                 Ok((yes, words)) => answer(yes, words),
-                Err(e) => Answer::unanswered(format!("the MEASURE judge did not answer: {e}")),
+                Err(e) => Answer::unanswered(format!("the verified judge did not answer: {e}")),
             },
         };
-        let attested = std::fs::read_to_string(self.repo.join("publish/.out/attestation.json"))
-            .ok()
-            .is_some_and(|t| attestation_promotes(&t, &c.commit));
+        let attestation =
+            std::fs::read_to_string(self.repo.join("publish/.out/attestation.json")).ok();
+        let attested = attestation
+            .as_deref()
+            .is_some_and(|t| attestation_promotes(t, &c.commit));
+        let staged_by = attestation
+            .as_deref()
+            .filter(|_| attested)
+            .and_then(attested_engine);
         let fixtures = match crate::fixtures::on_commit(&git, "origin/main", &c.version) {
             Ok(Some(found)) => Answer::yes(format!(
                 "v{}'s handoff fixtures are on main ({} desks)",
@@ -2563,15 +3525,15 @@ impl Backend for Real {
             cut: self.cut_journal(),
             engine: self.engine_rows(Some(&c.commit)),
             attested,
-            trusted,
+            staged_by,
             built,
-            measured,
+            verified,
             fixtures,
         }
     }
 
     fn disk(&mut self) -> (Option<u64>, bool) {
-        let free = Command::new("df")
+        let free = command("df")
             .arg("-Pk")
             .arg(&self.repo)
             .output()
@@ -2584,33 +3546,28 @@ impl Backend for Real {
                     .and_then(|f| f.parse::<u64>().ok())
             })
             .map(|kib| kib / (1024 * 1024));
-        let twin = PathBuf::from(format!("{}-verify.noindex", self.repo.display()));
-        let warm = std::fs::read_dir(&twin).is_ok_and(|entries| {
-            entries.flatten().any(|e| {
-                let name = e.file_name().to_string_lossy().into_owned();
-                (name == "target" || name.starts_with("target-"))
-                    && e.file_type().is_ok_and(|t| t.is_dir())
-            })
-        });
+        // `verify release` builds in the clone's own target directory
+        let warm = self.repo.join("target/debug").is_dir();
         (free, warm)
     }
 
-    fn preflight(&mut self, c: &Candidate, dry: bool, again: bool) -> Vec<(bool, Refusal)> {
-        let mut blocks: Vec<(bool, Refusal)> = Vec::new();
+    fn commit_gates(&mut self, c: &Candidate, dry: bool) -> Vec<Refusal> {
+        let mut blocks: Vec<Refusal> = Vec::new();
         // R's own pre-claim gates that read only the commit — the changelog, the
         // predecessor's handoff fixtures, the handoff policy — judged for the
         // release's version: a bump not made yet is judged on its parent with the
         // version it will declare, which is all a bump changes. A real run is R's own
         // cutter (it re-execs as R's); a dry run says when it is not.
         let git = self.git();
-        if dry && let Err(why) = crate::gates::own_cutter(&git, &c.commit) {
+        if dry && let Err(not) = crate::gates::own_cutter(&git, &c.commit) {
             self.say(&format!(
                 "        note: R's pre-claim gates asked of this cutter, not yet R's own (a real \
-                 run re-execs as R's): {why}"
+                 run re-execs as R's): {}",
+                not.why
             ));
         }
         let (commit, version) = (c.commit.as_str(), c.version.as_str());
-        let gates: [(&str, crate::ledger::Result<()>); 3] = [
+        let gates: [(&str, crate::ledger::Result<()>); 4] = [
             (
                 "changelog",
                 crate::gates::changelog_gate_at(&git, commit, version).map(|_| ()),
@@ -2623,133 +3580,97 @@ impl Backend for Real {
                 "handoff policy",
                 crate::gates::handoff_policy_gate_at(&git, commit, version).map(|_| ()),
             ),
+            // the committed Cargo.lock resolves the workspace offline, unchanged — read
+            // in the clone, which a real run has put at R (step 3)
+            (
+                "locked metadata",
+                crate::gates::locked_metadata_gate(&self.repo),
+            ),
         ];
         for (name, outcome) in gates {
             if let Err(e) = outcome {
-                let why = e.to_string();
-                blocks.push((
-                    false,
-                    Refusal::new(
-                        format!("{name} — {}", why.lines().next().unwrap_or("")),
-                        why.lines()
-                            .find_map(|l| l.trim().strip_prefix("fix:"))
-                            .map_or_else(
-                                || "the cut's own remedy, above".to_string(),
-                                |f| f.trim().to_string(),
-                            ),
-                    )
-                    .detail(
-                        why.lines()
-                            .skip(1)
-                            .filter(|l| !l.trim().starts_with("fix:"))
-                            .map(str::to_string),
-                    ),
-                ));
+                blocks.push(cut_refusal(name, &e.to_string()));
             }
         }
-        // the engine
+        // the engine: `pub stage`, right after this, dies at its gitleaks guard without it
         let path = std::env::var_os("PATH").unwrap_or_default();
         let gitleaks = std::env::split_paths(&path).any(|d| d.join("gitleaks").is_file());
         if !gitleaks {
-            blocks.push((
-                false,
-                Refusal::new(
-                    "gitleaks is not installed — every stage dies at the guard",
-                    "brew install gitleaks",
-                ),
+            blocks.push(Refusal::new(
+                "gitleaks is not installed — every stage dies at the guard",
+                "brew install gitleaks",
             ));
         }
+        // the stage comes before the long steps, so for hours publish/.out holds a
+        // promotable attestation of an R not yet verified: the pre-promote
+        // hook (it asks R's verify record) is then the one guard between
+        // that attestation and public main for a `pub publish` by hand — an engine that
+        // would skip it silently is refused before it stages, in seconds
         let seam = std::fs::read_to_string(self.engine.join("bin/pub"))
             .is_ok_and(|t| t.contains("run_pre_promote_hook"));
         if !seam {
-            self.say(
-                "        note: this engine has no pre-promote seam: `pub publish` will not run \
-                 publish/pre-promote — the release asked R's own pre-claim gates above itself",
-            );
+            blocks.push(Refusal::new(
+                format!(
+                    "the engine {} has no pre-promote seam (`run_pre_promote_hook` in its \
+                     bin/pub): `pub publish` would not run publish/pre-promote, and a publish \
+                     by hand would promote R's attestation before it is verified",
+                    self.engine.display()
+                ),
+                "use a publication engine whose main carries the seam (on its main since \
+                 2026-09-29: git -C <engine> pull --ff-only), or name one with --engine",
+            ));
         }
-        // A dry run reads only. Asked AGAIN (step 9), R's gates and the engine's
-        // readiness are what can have moved: the engine's dry run and the wasm32
-        // compile judged THIS R's objects at step 4, and `pub stage`, the step after,
-        // runs both again as its own gates before anything is public — a third run
-        // between them decides nothing new.
-        if dry || again {
-            return blocks;
-        }
-        // step 0, the engine's own dry run (it appends an audit row), then the wasm32
-        // engine over the export it left; the engine synced around it
-        if let Err(r) = self.engine_sync() {
-            blocks.push((false, r));
-            return blocks;
-        }
-        if blocks.iter().any(|(_, r)| r.why.starts_with("gitleaks")) {
-            return blocks;
-        }
-        let export = self.engine_dry_run(&c.commit, &mut blocks);
-        if let Err(r) = self.engine_sync() {
-            blocks.push((false, r));
-        }
-        self.wasm32(&c.commit, export.as_deref(), &mut blocks);
         blocks
     }
 
     fn cut_gates(&mut self, c: &Candidate, creds: &Path) -> Vec<Refusal> {
-        crate::publish::pre_publish_gates(&self.repo, &c.version, creds)
+        let gates = crate::publish::pre_publish_gates(&self.repo, &c.version, creds);
+        let mut found: Vec<Refusal> = gates
             .into_iter()
-            .map(|(gate, why)| {
-                let first = why.lines().next().unwrap_or("").to_string();
-                let fix = why
-                    .lines()
-                    .find_map(|l| l.trim().strip_prefix("fix:"))
-                    .map_or_else(
-                        || "the cut's own remedy, above".to_string(),
-                        |f| f.trim().to_string(),
-                    );
-                Refusal::new(format!("{gate} — {first}"), fix).detail(
-                    why.lines()
-                        .skip(1)
-                        .filter(|l| !l.trim().starts_with("fix:"))
-                        .map(str::to_string),
-                )
-            })
-            .collect()
+            .map(|(gate, why)| cut_refusal(gate, &why))
+            .collect();
+        // the two of R's commit-only gates that also read origin: the predecessor is the
+        // newest release whose tag is on origin, and a version tagged while the long
+        // steps ran is a new one — asked again with the rest, as the cut asks them
+        let git = self.git();
+        let (commit, version) = (c.commit.as_str(), c.version.as_str());
+        if let Err(e) = crate::gates::handoff_fixture_gate_at(&git, commit, version) {
+            found.push(cut_refusal("handoff fixtures", &e.to_string()));
+        }
+        if let Err(e) = crate::gates::handoff_policy_gate_at(&git, commit, version) {
+            found.push(cut_refusal("handoff policy", &e.to_string()));
+        }
+        found
     }
 
-    fn fixture_guard(&mut self, prover: &Prover) -> Result<String, Refusal> {
-        let log = self.log_path(Step::PreflightEarly);
+    /// BESIDE EACH OTHER: the guard and the censuses each on a thread of their own, the
+    /// stage on this one, every child forwarded and noted as a step's child is. Each has
+    /// its own target directory — the stage its export clone's, the guard
+    /// `target-fixture-guard`, the censuses the clone's `target/` — and its own log.
+    fn stage_beside(&mut self, c: &Candidate, prover: &Prover, beside: Beside) -> Besides {
+        let guard_log = self.side_log(Step::Stage, "fixture-guard");
+        let census_log = self.side_log(Step::Stage, "census");
         let this = &*self;
-        // a cold build of minutes: a forwarded child, as every step's is
-        let mut run = |cmd: &mut Command| -> std::io::Result<std::process::Output> {
-            scrub(cmd);
-            cmd.env("TRUST_STAGE2_BIN", &prover.bin);
-            let out = this.output_forwarded(cmd)?;
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&log)
-            {
-                let _ = f.write_all(&out.stdout);
-                let _ = f.write_all(&out.stderr);
+        std::thread::scope(|s| {
+            let guard = if beside.guard {
+                let log = &guard_log;
+                Some(s.spawn(move || this.fixture_guard_run(prover, log)))
+            } else {
+                None
+            };
+            let census = if beside.census {
+                let log = &census_log;
+                Some(s.spawn(move || this.census_run(prover, log)))
+            } else {
+                None
+            };
+            let stage = beside.stage.then(|| this.stage_run(c, prover));
+            Besides {
+                stage,
+                guard: guard.map(|h| joined(h, "the handoff fixture guard")),
+                census: census.map(|h| joined(h, "the L0 censuses")),
             }
-            Ok(out)
-        };
-        let filter = crate::gates::HANDOFF_FIXTURE_GUARD_FILTER;
-        crate::gates::handoff_fixture_guard_with(&prover.bin.join("targo"), &this.repo, &mut run)
-            .map(|n| format!("the handoff fixture guard passes ({n} test(s), {filter})"))
-            .map_err(|e| {
-                let text = e.to_string();
-                Refusal::new(
-                    format!(
-                        "the handoff fixture guard ({filter}) refuses: {} — the cut runs it \
-                         before its claim, after the publish",
-                        text.lines().next().unwrap_or("")
-                    ),
-                    format!(
-                        "fix the CONSUMER on main, never a fixture (targo --unverified test -p \
-                         aterm-gui --lib -- {filter}), then {RELEASE_COMMAND} --commit origin/main"
-                    ),
-                )
-                .detail(text.lines().skip(1).take(8).map(str::to_string))
-            })
+        })
     }
 
     fn stage_fixtures(
@@ -2758,46 +3679,8 @@ impl Backend for Real {
         reserved: &Reservation,
         prover: &Prover,
     ) -> Result<String, Refusal> {
-        let pins = fixture_pins(c, reserved);
-        let root = fixture_root(&self.repo)?;
-        let log = self.log_path(self.step);
-        let this = &*self;
-        // a cold build of minutes, as the guard's: a forwarded child
-        let mut run = |cmd: &mut Command| -> std::io::Result<std::process::Output> {
-            scrub(cmd);
-            cmd.env("TRUST_STAGE2_BIN", &prover.bin);
-            let out = this.output_forwarded(cmd)?;
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&log)
-            {
-                let _ = f.write_all(&out.stdout);
-                let _ = f.write_all(&out.stderr);
-            }
-            Ok(out)
-        };
-        crate::fixtures::stage(
-            &prover.bin.join("targo"),
-            &this.repo,
-            &root,
-            &pins,
-            &mut run,
-        )
-        .map(|staged| staged.words(&pins))
-        .map_err(|e| {
-            let text = e.to_string();
-            Refusal::new(
-                text.lines().next().unwrap_or("").to_string(),
-                format!(
-                    "fix it on main (targo --unverified test -p aterm-gui --lib -- {} with \
-                         the pins {} names), then {RELEASE_COMMAND} --commit origin/main",
-                    crate::fixtures::generator_args().join(" "),
-                    crate::gates::HANDOFF_FIXTURE_README
-                ),
-            )
-            .detail(text.lines().skip(1).take(8).map(str::to_string))
-        })
+        let log = self.step_log(self.step);
+        self.stage_fixtures_run(c, reserved, prover, &log)
     }
 
     fn land_fixtures(
@@ -2872,104 +3755,6 @@ impl Backend for Real {
         notice(&["notice", "done"], &format!("{key} withdraw"))
     }
 
-    fn trust_pending(&mut self, c: &Candidate, prover: &Prover) -> Vec<String> {
-        crate::trust_facts::pending_for(
-            &self.git(),
-            &crate::trust_facts::Prover::at(&prover.bin),
-            &c.commit,
-        )
-        .ok()
-        .and_then(Result::ok)
-        .unwrap_or_default()
-    }
-
-    fn trust_lane(&mut self, prover: &Prover, remeasure: bool) -> Ran {
-        // The prover first on PATH for the lane alone (it runs the first `targo` on PATH;
-        // a global change would hand the stock-pinned public-clone gate the Trust cargo).
-        // --stop-if-narrowed: a host whose verifier ceiling cannot verify every library
-        // is refused in minutes, before any check (exit 4, NARROWED BY MEMORY).
-        let path = std::env::var_os("PATH").unwrap_or_default();
-        let joined = std::env::join_paths(
-            std::iter::once(prover.bin.clone()).chain(std::env::split_paths(&path)),
-        )
-        .unwrap_or(path);
-        let mut cmd = self.child(self.repo.join("tools/trust-gate-all.sh"), Some(prover));
-        cmd.env("PATH", joined);
-        for k in TRUST_LANE_INPUTS {
-            cmd.env(k, "");
-        }
-        if remeasure {
-            cmd.arg("--remeasure");
-        }
-        cmd.arg("--stop-if-narrowed");
-        let mut ran = self.logged(Step::Trust, &mut cmd);
-        let text = self.step_log_text(Step::Trust);
-        let wanted: Vec<String> = if ran.code == 4 {
-            text.lines()
-                .filter(|l| {
-                    l.starts_with("trust-gate-all: ")
-                        && (l.contains(" not verified here: ") || l.contains("NARROWED BY MEMORY"))
-                })
-                .map(str::to_string)
-                .collect()
-        } else {
-            let summary = [
-                "FACTS",
-                "VERDICT",
-                "TOTAL",
-                "NO FLOOR",
-                "BUDGET",
-                "DRIVER",
-                "MEMORY",
-                "NOT VERIFIED",
-            ];
-            let lines: Vec<String> = text
-                .lines()
-                .filter(|l| summary.iter().any(|s| l.starts_with(s)))
-                .map(str::to_string)
-                .collect();
-            lines[lines.len().saturating_sub(8)..].to_vec()
-        };
-        if !wanted.is_empty() {
-            ran.detail = wanted;
-        }
-        ran
-    }
-
-    /// This machine's gate lock, in its line — a wait of up to three hours that an
-    /// interrupt ends within a fraction of a second (`hold_machine_unless`), so the
-    /// run's INTERRUPTED line follows at once.
-    fn lock(&mut self, caller: &str) -> Result<String, Refusal> {
-        let dir = aterm_verify::snapshot::machine_lock_dir(None);
-        let who = PathBuf::from(format!("{} ({caller})", self.repo.display()));
-        let mut interrupted = || interrupt::caught().is_some();
-        match aterm_verify::snapshot::hold_machine_unless(&who, dir.as_deref(), &mut interrupted) {
-            Ok(hold) => {
-                self.lock = Some(hold);
-                Ok(format!(
-                    "held {} — peers' gates wait in line until this release ends",
-                    dir.map_or_else(
-                        || "(no lock dir)".into(),
-                        |d| d.join("lock").display().to_string()
-                    )
-                ))
-            }
-            // nothing about R was decided: a resumable stop
-            Err(why) => Err(Refusal::new(
-                format!("could not take this machine's gate lock: {why}"),
-                format!(
-                    "wait for the gate named there (or stop it if it is wedged), then \
-                     {RELEASE_COMMAND}"
-                ),
-            )
-            .could_not_run()),
-        }
-    }
-
-    fn unlock(&mut self) {
-        self.lock = None;
-    }
-
     fn origin_tail(&mut self) -> Option<u64> {
         let text = self.git_out(&["show", "origin/main:RELEASES.ledger"])?;
         crate::ledger::tail(&text).ok().map(|r| r.build)
@@ -3007,120 +3792,115 @@ impl Backend for Real {
         })
     }
 
+    /// BESIDE EACH OTHER: the fixture generator on a thread of its own (its own target
+    /// directory, `target-fixture-guard`, and log), `ship build` on this one (the release
+    /// cache's target directories).
     fn build(
         &mut self,
         c: &Candidate,
         reserved: &Reservation,
         prover: &Prover,
-    ) -> Result<Artifact, Refusal> {
-        // R's own cutter (this binary), as a step's child: `ship build` reads the
-        // journal's reservation and builds its bundle once into the release cache.
-        let mut cmd = self.cut_command(&["build".to_string()], prover);
-        let ran = self.logged(Step::Build, &mut cmd);
-        if ran.code != 0 {
-            return Err(Refusal::new(
-                format!("the build did not finish (ship build exited {})", ran.code),
-                format!(
-                    "read its log; a red build is fixed on main, then {RELEASE_COMMAND} \
-                     --commit origin/main (nothing was claimed)"
-                ),
-            )
-            .detail(ran.detail));
-        }
-        let identity = crate::artifact::Identity {
-            version: c.version.clone(),
-            build: reserved.build,
-            commit: reserved.commit.clone(),
-        };
-        // The key the child built under: its trustc is the release's prover (the
-        // child's TRUST_STAGE2_BIN), its rustc this machine's upstream stable.
-        let found = crate::buildplan::stable_rustc_commit()
-            .map(|rustc| {
-                crate::artifact::key(
-                    &identity,
-                    &crate::artifact::Compilers {
-                        trustc: prover.commit.clone(),
-                        rustc,
-                    },
-                )
-            })
-            .and_then(|key| {
-                let store = crate::artifact::store(&self.repo)?;
-                crate::artifact::read(&store, &key).map(|c| c.map(|c| (store, c)))
-            });
-        match found {
-            Ok(Some((store, complete))) if complete.trustc == prover.commit => Ok(Artifact {
-                app: complete.app(&store),
-                key: complete.key,
-                macho_sha256: complete.macho_sha256,
-                build: complete.build,
-            }),
-            Ok(Some((_, complete))) => Err(Refusal::new(
-                format!(
-                    "the build ran with trustc {}, not this release's prover {}",
-                    complete.trustc, prover.commit
-                ),
-                format!("{RELEASE_COMMAND} (it builds with the release's prover)"),
-            )),
-            Ok(None) => Err(Refusal::new(
-                "the build ended, and the release cache holds no COMPLETE bundle for it",
-                format!("read its log, then {RELEASE_COMMAND}"),
-            )
-            .detail(ran.detail)),
-            Err(e) => Err(Refusal::new(
-                format!("the built bundle cannot be read back: {e}"),
-                format!("read its log, then {RELEASE_COMMAND}"),
-            )),
-        }
+        fixtures: bool,
+    ) -> Built {
+        let fixtures_log = self.side_log(Step::Build, "fixtures");
+        let this = &*self;
+        std::thread::scope(|s| {
+            let staged = if fixtures {
+                let log = &fixtures_log;
+                Some(s.spawn(move || this.stage_fixtures_run(c, reserved, prover, log)))
+            } else {
+                None
+            };
+            let artifact = this.build_run(c, reserved, prover);
+            Built {
+                artifact,
+                fixtures: staged.map(|h| joined(h, "the handoff fixture generator")),
+            }
+        })
     }
 
-    fn measure(&mut self, prover: &Prover, app: &Path) -> (Ran, bool) {
-        // Under the release's lock; the gate takes a lock of its own. It judges the
-        // bundle step 7 built — the bytes the cut signs — and builds no aterm of its own.
-        let mut cmd = self.child(self.repo.join("tools/verify.sh"), Some(prover));
-        cmd.arg("--measure")
-            .arg(app)
-            .arg("--machine-lock-dir")
-            .arg(self.state.join("gate-lock"));
-        let mut ran = self.logged(Step::Measure, &mut cmd);
-        let text = self.step_log_text(Step::Measure);
-        let lines: Vec<String> = text
-            .lines()
-            .filter(|l| {
-                l.contains("MEASURE")
-                    || l.contains("VERIFY:")
-                    || l.contains("verify: COULD NOT RUN")
-            })
-            .map(str::to_string)
-            .collect();
-        if !lines.is_empty() {
-            ran.detail = lines[lines.len().saturating_sub(6)..].to_vec();
+    fn verify(
+        &mut self,
+        c: &Candidate,
+        prover: &Prover,
+        artifact: &Artifact,
+    ) -> Result<Ran, Refusal> {
+        // The record vouches for R's tree, and the checks run in place: the clone is at
+        // R's tree and clean when they start and still is when they pass, or nothing is
+        // recorded.
+        let r = short(&c.commit).to_string();
+        let fix = format!(
+            "put the clone back at {r} and clean (git -C {} status), then {RELEASE_COMMAND}",
+            self.repo.display()
+        );
+        if let Some(off) = self.off_tree(&c.commit) {
+            return Err(Refusal::new(
+                format!("the clone is not at {r}'s tree and clean, so `verify release` would not judge it"),
+                fix,
+            )
+            .detail(off)
+            .could_not_run());
         }
-        let stage_starved = text.lines().any(|l| {
-            l.contains("MEASURE tier — NOT MEASURED: `")
-                && l.split_once("NOT MEASURED: `")
-                    .is_some_and(|(_, rest)| rest.contains("` could not run:"))
-        });
-        (ran, stage_starved)
+        // As an agent runs it, in the clone at R: the release's prover and build
+        // environment, the clone's own target directory, the bundle `build` built.
+        let mut cmd = self.child(prover.bin.join("targo"), Some(prover));
+        cmd.args(crate::release::VERIFY_ARGS)
+            .arg("--app")
+            .arg(&artifact.app);
+        let mut ran = self.logged_to(Step::Verify, &mut cmd, true);
+        if ran.code != 0 {
+            return Ok(ran);
+        }
+        if let Some(off) = self.off_tree(&c.commit) {
+            return Err(Refusal::new(
+                format!(
+                    "the clone moved during `verify release`, so its pass is not {r}'s — \
+                     nothing was recorded"
+                ),
+                fix,
+            )
+            .detail(off)
+            .could_not_run());
+        }
+        if let Err(e) =
+            crate::gates::record_verified(&self.git(), &c.commit, &artifact.macho_sha256)
+        {
+            ran.detail.push(format!("its record was not written: {e}"));
+        }
+        Ok(ran)
     }
 
     fn stage(&mut self, c: &Candidate, prover: &Prover) -> Result<Ran, Refusal> {
-        self.engine_sync()?;
-        let mut cmd = self.child(self.engine.join("bin/pub"), Some(prover));
-        cmd.args(["stage", "aterm", "--commit", &c.commit, "--repo-path"])
-            .arg(&self.repo);
-        let ran = self.logged(Step::Stage, &mut cmd);
-        // the stage appended its audit row: recorded now, or the step refuses
-        self.engine_sync()?;
-        Ok(ran)
+        self.stage_run(c, prover)
     }
 
     fn publish(&mut self, prover: &Prover) -> Result<Ran, Refusal> {
         self.engine_sync()?;
-        let mut cmd = self.child(self.engine.join("bin/pub"), Some(prover));
-        cmd.args(["publish", "aterm", "--repo-path"])
-            .arg(&self.repo);
+        let mut cmd = self.publish_command(prover);
         Ok(self.logged(Step::Publish, &mut cmd))
+    }
+
+    fn source_publication(&mut self, c: &Candidate) -> Result<(), Refusal> {
+        let slug = self.slug();
+        let tag = format!("v{}", c.version);
+        let release = self.release_json(&slug, &tag).map_err(|why| {
+            Refusal::new(
+                why,
+                format!("run {RELEASE_COMMAND} again once the channel answers"),
+            )
+            .could_not_run()
+        })?;
+        let missing = source_attestation_findings(&release);
+        if missing.is_empty() {
+            return Ok(());
+        }
+        Err(Refusal::new(
+            format!(
+                "the source publication of {tag} is incomplete: {}",
+                missing.join("; ")
+            ),
+            format!("finish pub sign-release aterm, then {RELEASE_COMMAND} (nothing was claimed)"),
+        ))
     }
 
     fn cut(&mut self, args: &[String], prover: &Prover) -> Ran {
@@ -3145,8 +3925,8 @@ impl Backend for Real {
             self.pointer_problems(&slug, &tag, version),
         )?);
         // The site links the newest stable release carrying its DMG, not a named tag —
-        // as `publish/site-sync.py choose-download` elects it, asked here, never
-        // restated: when that is another release, its shape is checked too.
+        // as the site's own election picks it, asked here, never restated: when that is
+        // another release, its shape is checked too.
         let site_tag = match self.site_tag(&slug) {
             Ok(t) => t,
             Err(why) => {
@@ -3195,7 +3975,7 @@ impl Backend for Real {
     fn latest(&mut self) -> Result<String, String> {
         let slug = self.slug();
         let out = self
-            .output_forwarded(Command::new("gh").args([
+            .output_forwarded(command("gh").args([
                 "api",
                 &format!("repos/{slug}/releases/latest"),
                 "--jq",
@@ -3213,12 +3993,14 @@ impl Backend for Real {
 /// `aterm ctl <verb> <line>` — the owner's aterm, from this shell: `Ok(its reply)` only
 /// when it answered `OK` (the row is up, or resolved), else why not.
 fn notice(verb: &[&str], line: &str) -> Result<String, String> {
-    let out = Command::new("aterm")
-        .arg("ctl")
-        .args(verb)
-        .args(line.split(' '))
-        .stdin(Stdio::null())
-        .output();
+    let out = {
+        command("aterm")
+            .arg("ctl")
+            .args(verb)
+            .args(line.split(' '))
+            .stdin(Stdio::null())
+            .output()
+    };
     match out {
         Ok(o) => {
             let reply = String::from_utf8_lossy(&o.stdout).trim().to_string();
@@ -3272,7 +4054,10 @@ pub fn engine_rows_in(mappings: &str, commit: Option<&str>) -> EngineRows {
 }
 
 /// A promotable attestation of `commit`: its source is `commit`, and `pub publish`
-/// would promote it (`public_clone` passed, or skipped on a source-only repo).
+/// would promote it (`public_clone` passed, or skipped on a source-only repo) — it names
+/// the engine commit that staged it ([`attested_engine`]), which promote requires too
+/// ("names an unavailable or incompatible engine commit"), so an attestation that names
+/// none is staged again rather than carried to a publish that refuses it.
 #[must_use]
 pub fn attestation_promotes(json: &str, commit: &str) -> bool {
     let Ok(a) = aterm_json::from_str::<aterm_json::Value>(json) else {
@@ -3289,6 +4074,64 @@ pub fn attestation_promotes(json: &str, commit: &str) -> bool {
     let mode = a.get("release_mode").and_then(aterm_json::Value::as_str);
     source == Some(commit)
         && (gate == Some("pass") || (gate == Some("skipped") && mode == Some("source-only")))
+        && attested_engine(json).is_some()
+}
+
+/// The engine commit an attestation names (`engine.commit`): the engine that staged it.
+#[must_use]
+pub fn attested_engine(json: &str) -> Option<String> {
+    let a = aterm_json::from_str::<aterm_json::Value>(json).ok()?;
+    a.get("engine")?
+        .get("commit")?
+        .as_str()
+        .filter(|c| !c.is_empty())
+        .map(str::to_string)
+}
+
+/// The staging tier an attestation names, and the commit of its main it attested
+/// (`staging.remote`, `staging.attested_rev`): what `pub promote` asks again before it
+/// promotes.
+#[must_use]
+pub fn attested_staging(json: &str) -> Option<(String, String)> {
+    let a = aterm_json::from_str::<aterm_json::Value>(json).ok()?;
+    let staging = a.get("staging")?;
+    let field = |key: &str| {
+        staging
+            .get(key)
+            .and_then(aterm_json::Value::as_str)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    };
+    Some((field("remote")?, field("attested_rev")?))
+}
+
+/// Why the staging tier's main in `listing` (`git ls-remote --refs <staging>
+/// refs/heads/main`) is not the `attested` commit — `pub promote` refuses the
+/// attestation then — or `None` when it is.
+#[must_use]
+pub fn staging_moved_from(listing: &str, attested: &str) -> Option<String> {
+    let mains: Vec<&str> = listing
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let (sha, name) = (fields.next()?, fields.next()?);
+            (name == "refs/heads/main" && fields.next().is_none()).then_some(sha)
+        })
+        .collect();
+    match mains.as_slice() {
+        [now] if now.eq_ignore_ascii_case(attested) => None,
+        [now] => Some(format!(
+            "the staging tier's main moved since R was attested ({}..{}: a peer's pub stage), \
+             and pub promote refuses that attestation",
+            short(attested),
+            short(now)
+        )),
+        [] => Some("the staging tier has no main".to_string()),
+        many => Some(format!(
+            "the staging tier answered {} copies of its main",
+            many.len()
+        )),
+    }
 }
 
 /// Run a release in the clone at `repo`; the exit code.
@@ -3313,9 +4156,218 @@ pub fn run(repo: &Path, opts: &crate::release::ReleaseOptions) -> i32 {
     crate::release::run_with(&mut real, &opts, &home).code
 }
 
+/// What `ship check` asks: of which commit, with which engine, and which of its three
+/// sections — `--cut`, `--export`, `--wasm32`; none named is all three.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CheckOptions {
+    pub commit: Option<String>,
+    pub engine: Option<PathBuf>,
+    pub cut: bool,
+    pub export: bool,
+    pub wasm32: bool,
+}
+
+impl CheckOptions {
+    /// The sections asked: `(cut, export, wasm32)`.
+    #[must_use]
+    pub fn sections(&self) -> (bool, bool, bool) {
+        if self.cut || self.export || self.wasm32 {
+            (self.cut, self.export, self.wasm32)
+        } else {
+            (true, true, true)
+        }
+    }
+}
+
+/// `targo --unverified ship check`: would a release of the commit pass — the cut's
+/// pre-claim gates that read only the commit and this clone's records
+/// ([`crate::gates::precheck`]), the publication engine's export guards
+/// ([`Real::export_gate`]) and the wasm32 engine ([`Real::wasm32_gate`]), each line
+/// printed as its gate ends, then the verdict. Read-only: nothing public, nothing in
+/// this checkout or the engine's. Exit 0 every gate passed, 1 one would refuse, 2 the
+/// commit names no release (no commit, no release version), 3 none refused but one
+/// could not run, 130 interrupted.
+#[must_use]
+pub fn check(repo: &Path, opts: &CheckOptions) -> i32 {
+    interrupt::install();
+    let found = match checked(repo, opts) {
+        Ok(found) => found,
+        Err(e) => {
+            eprintln!("aterm-release check: {e}");
+            return 2;
+        }
+    };
+    println!("{}", found.verdict());
+    if interrupt::caught().is_some() {
+        return 130;
+    }
+    found.exit_code()
+}
+
+/// [`check`]'s sections for the commit `opts` names, each gate's lines printed as it
+/// ends.
+///
+/// # Errors
+/// The commit names no commit, or its `Cargo.toml` carries no release version.
+fn checked(repo: &Path, opts: &CheckOptions) -> Result<Precheck, String> {
+    let rev = opts.commit.as_deref().unwrap_or("HEAD");
+    let git = GitCli::new(repo);
+    let (cut, export, wasm32) = opts.sections();
+    let found = if cut {
+        crate::gates::precheck(&git, rev)
+    } else {
+        Precheck::of(&git, rev)
+    };
+    let mut found = found.map_err(|e| e.to_string())?;
+    print!("{}", found.header());
+    for gate in &found.gates {
+        print!("{}", Precheck::gate_lines(gate));
+    }
+    let add = |found: &mut Precheck, name: &'static str, outcome: Outcome| {
+        let gate = PrecheckGate { name, outcome };
+        print!("{}", Precheck::gate_lines(&gate));
+        let _ = std::io::stdout().flush();
+        found.gates.push(gate);
+    };
+    if !(export || wasm32) {
+        return Ok(found);
+    }
+    let commit = found.commit.clone();
+    let ready = Real::new(repo, opts.engine.as_deref(), true, false)
+        .and_then(|real| Ok((real, Scratch::read_only(repo)?)))
+        .map_err(|why| {
+            Refusal::new(
+                format!("the engine's gates have no place to run: {why}"),
+                "fix what that names, then run it again",
+            )
+        });
+    match ready {
+        Ok((mut real, scratch)) => {
+            let mut left = None;
+            if export {
+                let (outcome, export) = real.export_gate(&scratch, &commit);
+                left = export;
+                add(&mut found, EXPORT_GATE, outcome);
+            }
+            if wasm32 {
+                let outcome = real.wasm32_gate(&scratch, &commit, left.as_deref());
+                add(&mut found, WASM32_GATE, outcome);
+            }
+        }
+        Err(why) => {
+            for (asked, name) in [(export, EXPORT_GATE), (wasm32, WASM32_GATE)] {
+                if asked {
+                    add(&mut found, name, Outcome::CouldNotRun(why.clone()));
+                }
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// `ship check`'s name for the engine's dry run.
+pub const EXPORT_GATE: &str = "export guards";
+/// `ship check`'s name for the wasm32 compile.
+pub const WASM32_GATE: &str = "wasm32 engine";
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Hold the vulnerable pipe/fcntl interval open deterministically. Neither a
+    /// detached step nor the snapshot's git may carry that unrelated descriptor.
+    #[cfg(unix)]
+    #[test]
+    fn forwarded_steps_and_object_git_exclude_an_unflagged_descriptor() {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+        unsafe extern "C" {
+            fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+        }
+        let file = std::fs::File::open("/dev/null").unwrap();
+        // SAFETY: F_DUPFD creates a fresh descriptor without FD_CLOEXEC.
+        let fd = unsafe { fcntl(file.as_raw_fd(), 0, 200) };
+        assert!(fd >= 200);
+        let _held = unsafe { OwnedFd::from_raw_fd(fd) };
+        let probe = format!("test ! -e /dev/fd/{fd}");
+        // CONTROL: an intentional pass-through does hand on this same descriptor.
+        let control = aterm_uds::spawnfd::transparent("/bin/sh")
+            .args(["-c", &probe])
+            .status()
+            .unwrap();
+        assert_eq!(control.code(), Some(1));
+
+        let repo = std::env::current_dir().unwrap();
+        let real = Real::new(&repo, None, true, false).unwrap();
+        let out = real
+            .output_forwarded(command("/bin/sh").args(["-c", &probe]))
+            .unwrap();
+        assert!(out.status.success(), "detached step inherited fd {fd}");
+
+        let alias = format!("alias.fd-proof=!{probe}");
+        let out = crate::ledger::object_git(&repo)
+            .args(["-c", &alias, "fd-proof"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "object git inherited fd {fd}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// THE SITE SYNC'S CHILDREN KEEP THE RELEASE'S RULES: each leads a session and group of
+    /// its own (where the interrupt is forwarded, and no terminal it could stop on), git's
+    /// prompt is off, and it is named in the running-child note while it runs — the note
+    /// gone once it has ended.
+    #[cfg(unix)]
+    #[test]
+    fn the_site_syncs_children_keep_the_releases_rules() {
+        use crate::site::Launch as _;
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("aterm-step-children-")
+            .tempdir()
+            .unwrap();
+        let children = StepChildren {
+            noted: Some((dir.path().to_path_buf(), Step::AfterCut)),
+        };
+        assert_eq!(children.interrupted(), None);
+        let mut sh = aterm_uds::spawnfd::command("/bin/sh");
+        sh.args([
+            "-c",
+            "echo \"$$ $(ps -o pgid= -p $$ | tr -d ' ') ${GIT_TERMINAL_PROMPT-unset}\"",
+        ]);
+        let out = crate::site::output(&children, &mut sh).unwrap();
+        let said = String::from_utf8_lossy(&out.stdout);
+        let fields: Vec<&str> = said.split_whitespace().collect();
+        assert_eq!(fields.len(), 3, "{said}");
+        assert_eq!(
+            fields[0], fields[1],
+            "the child leads its own group: {said}"
+        );
+        assert_eq!(fields[2], "0", "git's prompt is off: {said}");
+        assert!(
+            crate::release::child_notes(dir.path()).is_empty(),
+            "the note goes with the child"
+        );
+        // while it runs, the note names it and the step
+        let mut sleeper = aterm_uds::spawnfd::command("/bin/sh");
+        sleeper
+            .args(["-c", "read line"])
+            .stdin(aterm_uds::spawnfd::Stdio::piped());
+        let (mut child, guard) = children.spawn(&mut sleeper).unwrap();
+        let note =
+            std::fs::read_to_string(crate::release::child_note(dir.path(), child.id())).unwrap();
+        assert!(
+            note.starts_with(&format!("pid {}\n", child.id()))
+                && note.ends_with("step after-cut\n"),
+            "{note}"
+        );
+        // its stdin closed, `read` ends and so does the child
+        drop(child.stdin.take());
+        child.wait().unwrap();
+        drop(guard);
+        assert!(crate::release::child_notes(dir.path()).is_empty());
+    }
 
     /// The pointer's first hop: only a 404 or a 302 elsewhere is the release's
     /// SHAPE (the refusal whose remedy ends a published release); an answer that
@@ -3386,6 +4438,20 @@ mod tests {
         ]
     }
 
+    #[test]
+    fn source_publication_requires_one_manifest_and_one_signature_before_binary_assets() {
+        let pair = [("SHA256SUMS", 100), ("SHA256SUMS.sig", 64)];
+        assert!(source_attestation_findings(&release(&pair, "")).is_empty());
+        for assets in [
+            vec![],
+            vec![pair[0]],
+            vec![pair[1]],
+            vec![pair[0], pair[0], pair[1]],
+        ] {
+            assert!(!source_attestation_findings(&release(&assets, "")).is_empty());
+        }
+    }
+
     /// The outside look's every check (check-release-shape's, ported): the lean shape
     /// passes; each way a release is out of shape is named.
     #[test]
@@ -3440,30 +4506,375 @@ mod tests {
         );
     }
 
-    /// Step 0's verdicts: guards ok; a run that heard no guard; one block per refusing
-    /// guard with its location lines; a refusal before any guard.
+    /// The engine's dry run, read in its own words: each guard's verdict with its
+    /// location lines, and its refusals.
     #[test]
-    fn the_engines_dry_run_is_read_as_its_own_verdict() {
-        let ok = "== guard ok: forbidden content\n== guard ok: gitleaks\n";
-        assert_eq!(engine_dry_run_verdict(0, ok, "r", true), (vec![], true));
-        let (silent, _) = engine_dry_run_verdict(0, "exported\n", "r", false);
-        assert!(silent[0].why.contains("without reporting a single guard"));
-        let fails = "== guard ok: x\n== GUARD FAIL: forbidden content (2 hits)\n  a.rs:3\n  b.rs:9\n\
-                     == GUARD FAIL: private references\n  c.md:1\nFAIL: guards failed\n";
-        let (blocks, export) = engine_dry_run_verdict(1, fails, "r", true);
-        assert!(export);
-        assert_eq!(blocks.len(), 2);
-        assert_eq!(blocks[0].why, "forbidden content (2 hits)");
-        assert_eq!(blocks[0].detail, ["a.rs:3", "b.rs:9"]);
-        let early = "FAIL: the export does not pin the Trust toolchain the dev commit pins\n\
-                     FAIL: transforms failed\n";
-        let (blocks, export) = engine_dry_run_verdict(1, early, "r", false);
-        assert!(!export);
-        assert!(
-            blocks[0]
-                .why
-                .contains("before any guard ran (exit 1): the export does not pin")
+    fn the_engines_dry_run_is_read_in_its_own_words() {
+        let text = "== exported 5807 of 7058 tracked files from abc\n\
+                    == guard ok: no forbidden content\n\
+                    == GUARD FAIL: private references (2)\n  a.rs:3\n  b.md:9\n\
+                    FAIL: guards failed — nothing was pushed\n";
+        let run = EngineRun::read(1, text);
+        assert_eq!(run.passed, ["no forbidden content"]);
+        assert_eq!(
+            run.failed,
+            [(
+                "private references (2)".to_string(),
+                vec!["a.rs:3".to_string(), "b.md:9".to_string()]
+            )]
         );
+        assert_eq!(run.refusals, ["guards failed — nothing was pushed"]);
+        assert_eq!(EngineRun::read(0, "").tail, Vec::<String>::new());
+    }
+
+    /// Every engine refusal is the tree's unless its words name the machine's,
+    /// wherever in the run it came: a manifest or config refusal before the export and
+    /// a transform's after it are the tree's; a remote, the engine's own state, the
+    /// commit's place and gitleaks are the machine's.
+    #[test]
+    fn an_engine_refusal_is_sorted_by_its_cause() {
+        for line in [
+            "malformed manifest line (bare '!'): '!'",
+            "empty manifest",
+            "captured aterm commit has no publish/manifest.txt",
+            "publication policy contains a symlink, which could escape immutable inputs: x",
+            "CHECK_TIMEOUT_SECONDS_DEFAULT must be a positive integer",
+            "vendor/astream is not a gitlink in abc",
+            "transforms failed",
+            "the export does not pin the Trust toolchain the dev commit pins",
+            "detected version '1.2' is not a semver string",
+            "no staging remote configured",
+            "staging remote must identify alabsystems/aterm-staging, found 'x'",
+        ] {
+            assert_eq!(EngineCause::of(line), EngineCause::Tree, "{line}");
+        }
+        for (line, cause) in [
+            (
+                "gitleaks not installed — a fail-closed guard cannot be skipped",
+                EngineCause::NoGitleaks,
+            ),
+            (
+                "gitleaks crashed/timed out — aborting rather than fail open",
+                EngineCause::GitleaksBroke,
+            ),
+            (
+                "release notes: cannot read the public tags of alabsystems/aterm: git \
+                 ls-remote failed",
+                EngineCause::Network,
+            ),
+            (
+                "release notes: cannot fetch the previous public release v0.1.0",
+                EngineCause::Network,
+            ),
+            (
+                "cannot query aterm origin/main: fatal: unable to access",
+                EngineCause::Network,
+            ),
+            (
+                "astream public release main fetch failed: Host key verification failed.",
+                EngineCause::Network,
+            ),
+            (
+                "publication engine HEAD a does not exactly match queried origin/main b",
+                EngineCause::Engine,
+            ),
+            (
+                "another publication operation for aterm is running; cannot stage",
+                EngineCause::Engine,
+            ),
+            (
+                "--commit abc is not an ancestor of origin/main def",
+                EngineCause::Source,
+            ),
+        ] {
+            assert_eq!(EngineCause::of(line), cause, "{line}");
+        }
+    }
+
+    /// The export guards' outcome, by cause: a finding or a refusal of the tree refuses
+    /// whatever stopped the run after it; a refusal of the machine's, or a metadata
+    /// guard that failed for want of its toolchain, could not run; a clean exit that
+    /// heard its guards passes; a run that judged nothing could not run.
+    #[test]
+    fn the_export_guards_pass_refuse_or_could_not_run() {
+        let (log, reports) = (Path::new("/c/dry-run.log"), Path::new("/c/reports"));
+        let outcome = |code: i32, text: &str, toolchain: Option<&Refusal>| {
+            export_outcome(&EngineRun::read(code, text), "r", toolchain, log, reports)
+        };
+        let refused = |code: i32, text: &str, toolchain: Option<&Refusal>| match outcome(
+            code, text, toolchain,
+        ) {
+            Outcome::Refuse(r) => r,
+            other => panic!("{text:?}: {other:?}"),
+        };
+        let not_run = |code: i32, text: &str, toolchain: Option<&Refusal>| match outcome(
+            code, text, toolchain,
+        ) {
+            Outcome::CouldNotRun(r) => r,
+            other => panic!("{text:?}: {other:?}"),
+        };
+        let no_toolchain = Refusal::new("no rustup", "install rustup");
+        let exported = "== exported 1 of 1 tracked files from r\n";
+        let ok =
+            format!("{exported}== guard ok: no forbidden content\n== guard ok: gitleaks clean\n");
+        assert!(matches!(outcome(0, &ok, None), Outcome::Pass(_)));
+        assert!(matches!(
+            outcome(0, &ok, Some(&no_toolchain)),
+            Outcome::Pass(_)
+        ));
+        // a finding stands, whatever stopped the run after it
+        let hit =
+            format!("{exported}== GUARD FAIL: forbidden content (1 hits; first 5):\n  x.rs:1\n");
+        for after in [
+            "FAIL: guards failed — nothing was pushed\n",
+            "FAIL: gitleaks not installed — a fail-closed guard cannot be skipped\n",
+            "FAIL: gitleaks crashed/timed out — aborting rather than fail open\n",
+        ] {
+            let r = refused(1, &format!("{hit}{after}"), None);
+            assert!(r.detail.iter().any(|l| l == "  x.rs:1"), "{r:?}");
+        }
+        // the tree's refusal, before the export or after it, gitleaks or not
+        for (text, line) in [
+            (
+                "FAIL: malformed manifest line (bare '!'): '!'\n".to_string(),
+                "malformed manifest line (bare '!'): '!'",
+            ),
+            (
+                format!(
+                    "{exported}FAIL: vendor/astream is not a gitlink in abc\nFAIL: transforms \
+                     failed\n"
+                ),
+                "vendor/astream is not a gitlink in abc",
+            ),
+        ] {
+            assert!(refused(1, &text, None).why.contains(line), "{text}");
+        }
+        // the machine's, before the export and after it
+        for (text, line) in [
+            (
+                "FAIL: cannot query aterm origin/main: fatal: unable to access\n".to_string(),
+                "cannot query aterm origin/main",
+            ),
+            (
+                format!(
+                    "{exported}== guard ok: no forbidden content\nFAIL: gitleaks not installed \
+                     — a fail-closed guard cannot be skipped\n"
+                ),
+                "gitleaks not installed",
+            ),
+            (
+                format!(
+                    "{exported}== guard ok: no forbidden content\nFAIL: gitleaks crashed/timed \
+                     out — aborting rather than fail open\n"
+                ),
+                "gitleaks crashed",
+            ),
+            (
+                format!(
+                    "{exported}FAIL: release notes: cannot read the public tags of \
+                     alabsystems/aterm: git ls-remote failed\n"
+                ),
+                "release notes: cannot read the public tags",
+            ),
+        ] {
+            assert!(not_run(1, &text, None).why.contains(line), "{text}");
+        }
+        // the metadata guard is the tree's finding, unless its toolchain is missing here
+        let metadata = format!(
+            "{exported}== guard ok: gitleaks clean\n== GUARD FAIL: targo metadata failed (see \
+             cargo-metadata.err)\nFAIL: guards failed — nothing was pushed\n"
+        );
+        refused(1, &metadata, None);
+        assert_eq!(
+            not_run(1, &metadata, Some(&no_toolchain)).why,
+            no_toolchain.why
+        );
+        // a run that said nothing judged nothing
+        for (code, text) in [
+            (0, exported),
+            (1, exported),
+            (-1, "cannot run /e/bin/pub: No such file or directory"),
+        ] {
+            not_run(code, text, None);
+        }
+    }
+
+    /// A gitleaks finding is named by its place in the export and its rule, never by
+    /// what it matched.
+    #[test]
+    fn a_gitleaks_finding_is_named_by_place_and_rule_never_by_its_secret() {
+        let report = r#"[{"File":"/x/export/a/b.rs","StartLine":7,"RuleID":"generic-api-key","Match":"key=hunter2","Secret":"hunter2"}]"#;
+        assert_eq!(
+            gitleaks_locations(report, Path::new("/x/export")),
+            ["a/b.rs:7 generic-api-key"]
+        );
+        assert!(gitleaks_locations("not json", Path::new("/x")).is_empty());
+        assert_eq!(
+            gitleaks_report("gitleaks findings (see /o/gitleaks-adjudicated.json)"),
+            Some("/o/gitleaks-adjudicated.json")
+        );
+        assert_eq!(gitleaks_report("private references (2)"), None);
+    }
+
+    /// `ship check --export` end to end, offline: a stub engine whose `bin/pub` prints
+    /// what its commit says, its origin and the candidate's origin local. The check
+    /// drives a scratch copy of the engine at its ORIGIN's main (the local engine may
+    /// lag), never writes the engine's checkout, judges only a commit on origin/main,
+    /// and maps each answer to its exit.
+    #[test]
+    fn ship_check_export_drives_a_scratch_copy_of_the_engine_at_its_origins_main() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let git = |cwd: &Path, args: &[&str]| -> String {
+            let out = command("git")
+                .current_dir(cwd)
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let (engine, engine_origin) = (root.join("publication"), root.join("publication.git"));
+        let (repo, origin) = (root.join("aterm"), root.join("aterm.git"));
+        for bare in [&engine_origin, &origin] {
+            git(
+                &root,
+                &[
+                    "init",
+                    "-q",
+                    "--bare",
+                    "-b",
+                    "main",
+                    &bare.display().to_string(),
+                ],
+            );
+        }
+        for (dir, remote) in [(&engine, &engine_origin), (&repo, &origin)] {
+            std::fs::create_dir_all(dir).unwrap();
+            git(dir, &["init", "-q", "-b", "main"]);
+            git(
+                dir,
+                &["remote", "add", "origin", &remote.display().to_string()],
+            );
+        }
+        // the stub engine: it appends an audit row to its own checkout, refuses any
+        // arguments but the dry run's, and prints `say`
+        let stub = |say: &str, code: i32| {
+            std::fs::create_dir_all(engine.join("bin")).unwrap();
+            let pubbin = engine.join("bin/pub");
+            std::fs::write(
+                &pubbin,
+                format!(
+                    "#!/bin/sh\nhere=$(cd \"$(dirname \"$0\")/..\" && pwd)\necho '{{\"row\":1}}' \
+                     >> \"$here/verification-log.jsonl\"\n[ \"$1 $2 $3 $4\" = 'stage aterm \
+                     --dry-run --no-check' ] || exit 9\nprintf '%s' '{say}'\nexit {code}\n"
+                ),
+            )
+            .unwrap();
+            let mut perms = std::fs::metadata(&pubbin).unwrap().permissions();
+            std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+            std::fs::set_permissions(&pubbin, perms).unwrap();
+            std::fs::write(engine.join("verification-log.jsonl"), "").unwrap();
+            git(&engine, &["add", "-A"]);
+            git(&engine, &["commit", "-q", "-m", "stub"]);
+            git(&engine, &["push", "-q", "--force", "origin", "main"]);
+        };
+        std::fs::write(
+            repo.join("Cargo.toml"),
+            "[workspace.package]\nversion = \"0.2.0\"\n",
+        )
+        .unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-q", "-m", "c"]);
+        git(&repo, &["push", "-q", "origin", "main"]);
+        git(&repo, &["fetch", "-q", "origin"]);
+        let opts = |commit: &str, engine: &Path| CheckOptions {
+            commit: Some(commit.to_string()),
+            engine: Some(engine.to_path_buf()),
+            export: true,
+            ..CheckOptions::default()
+        };
+        let export = |commit: &str| {
+            let found = checked(&repo, &opts(commit, &engine)).expect("a release");
+            let gate = found.gates.last().expect("the export gate");
+            assert_eq!(gate.name, EXPORT_GATE);
+            (gate.outcome.clone(), found.exit_code())
+        };
+        let exported = "== exported 1 of 1 tracked files from r\n";
+        stub(&format!("{exported}== guard ok: no forbidden content\n"), 0);
+        let (outcome, code) = export("HEAD");
+        assert!(matches!(outcome, Outcome::Pass(_)), "{outcome:?}");
+        assert_eq!(code, 0);
+        // the engine's checkout is as it was: its audit row went to the copy
+        assert_eq!(
+            std::fs::read_to_string(engine.join("verification-log.jsonl")).unwrap(),
+            ""
+        );
+        assert_eq!(git(&engine, &["status", "--porcelain"]), "");
+        // a refusal of the tree, from the engine's origin main while the local engine lags
+        stub("FAIL: malformed manifest line (bare !): !\n", 1);
+        git(&engine, &["reset", "-q", "--hard", "HEAD~1"]);
+        let (outcome, code) = export("HEAD");
+        assert!(matches!(outcome, Outcome::Refuse(_)), "{outcome:?}");
+        assert_eq!(code, 1);
+        // the machine's
+        stub(
+            "FAIL: cannot query aterm origin/main: fatal: unable to access\n",
+            1,
+        );
+        let (outcome, code) = export("HEAD");
+        assert!(matches!(outcome, Outcome::CouldNotRun(_)), "{outcome:?}");
+        assert_eq!(code, 3);
+        // unpushed work is not judged; nor is anything without an engine
+        stub(&format!("{exported}== guard ok: no forbidden content\n"), 0);
+        std::fs::write(repo.join("new.rs"), "\n").unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-q", "-m", "unpushed"]);
+        let (outcome, code) = export("HEAD");
+        assert!(matches!(outcome, Outcome::CouldNotRun(_)), "{outcome:?}");
+        assert_eq!(code, 3);
+        let found = checked(&repo, &opts("HEAD~1", &root.join("none"))).unwrap();
+        assert!(matches!(
+            found.gates.last().map(|g| &g.outcome),
+            Some(Outcome::CouldNotRun(_))
+        ));
+        // a name that is no commit is no release to judge (exit 2)
+        assert!(checked(&repo, &opts("no-such-commit", &engine)).is_err());
+    }
+
+    /// `ship check`'s exit: a refusal outranks a gate that could not run, which
+    /// outranks a pass.
+    #[test]
+    fn a_refusal_outranks_a_gate_that_could_not_run() {
+        let gate = |outcome: Outcome| PrecheckGate { name: "g", outcome };
+        let pass = || gate(Outcome::Pass("ok".into()));
+        let refuse = || gate(Outcome::Refuse(Refusal::new("no", "fix")));
+        let not_run = || gate(Outcome::CouldNotRun(Refusal::new("no tool", "install")));
+        for (gates, code) in [
+            (vec![pass()], 0),
+            (vec![pass(), not_run()], 3),
+            (vec![not_run(), refuse(), pass()], 1),
+            (vec![refuse(), not_run()], 1),
+        ] {
+            let found = Precheck {
+                commit: "c".repeat(40),
+                version: "0.2.0".into(),
+                gates,
+            };
+            assert_eq!(found.exit_code(), code);
+        }
     }
 
     #[test]
@@ -3527,7 +4938,7 @@ mod tests {
         let attestation = |gate: &str, mode: &str| {
             format!(
                 "{{\"source\":{{\"commit\":\"{a}\"}},\"guards\":{{\"public_clone\":\"{gate}\"}},\
-                 \"release_mode\":\"{mode}\"}}"
+                 \"release_mode\":\"{mode}\",\"engine\":{{\"commit\":\"{b}\"}}}}"
             )
         };
         assert!(attestation_promotes(&attestation("pass", "full"), &a));
@@ -3537,11 +4948,47 @@ mod tests {
         ));
         assert!(!attestation_promotes(&attestation("skipped", "full"), &a));
         assert!(!attestation_promotes(&attestation("pass", "full"), &b));
+        // the engine that staged, as a PREPARED release's visible half asks it again
+        assert_eq!(
+            attested_engine(&attestation("pass", "full")).as_deref(),
+            Some(b.as_str())
+        );
+        // one that names no engine commit is not promotable: promote refuses it
+        let engineless =
+            attestation("pass", "full").replace(&format!(",\"engine\":{{\"commit\":\"{b}\"}}"), "");
+        assert_eq!(attested_engine(&engineless), None);
+        assert!(!attestation_promotes(&engineless, &a));
+    }
+
+    /// The staging tier as `pub promote` asks it again: its main, by `git ls-remote
+    /// --refs`, against the commit the attestation names.
+    #[test]
+    fn a_staging_tier_that_moved_since_the_attestation_is_named() {
+        let (s, t) = ("5".repeat(40), "6".repeat(40));
+        let json = format!(
+            "{{\"staging\":{{\"remote\":\"git@gh:o/aterm-staging.git\",\
+             \"attested_rev\":\"{s}\"}}}}"
+        );
+        assert_eq!(
+            attested_staging(&json),
+            Some(("git@gh:o/aterm-staging.git".to_string(), s.clone()))
+        );
+        assert_eq!(attested_staging("{\"staging\":{\"remote\":\"r\"}}"), None);
+        assert_eq!(attested_staging("not json"), None);
+        let main = |sha: &str| format!("{sha}\trefs/heads/main\n");
+        assert_eq!(staging_moved_from(&main(&s), &s), None);
+        assert_eq!(staging_moved_from(&main(&s.to_uppercase()), &s), None);
+        let moved = staging_moved_from(&main(&t), &s).unwrap();
+        assert!(moved.contains("555555555..666666666"), "{moved}");
+        assert!(staging_moved_from("", &s).unwrap().contains("no main"));
+        let twice = format!("{}{}", main(&s), main(&t));
+        let twice = staging_moved_from(&twice, &s).unwrap();
+        assert!(twice.contains("2 copies"), "{twice}");
     }
 
     /// `--engine` reaches every child: the cut, the stage and `pub publish`'s
-    /// pre-promote (`ship check`) read the one engine ledger the release judged, never
-    /// `~/publication` by default.
+    /// pre-promote (`ship check`, by R's own cutter: the running release's binary) read
+    /// the one engine ledger the release judged, never `~/publication` by default.
     #[test]
     fn the_engine_the_release_judges_is_the_one_every_child_reads() {
         let dir = aterm_tempfile::tempdir().unwrap();
@@ -3573,6 +5020,27 @@ mod tests {
         );
         let stage = real.child("/other/publication/bin/pub", Some(&prover));
         assert!(stage.get_envs().any(|kv| kv == engine));
+        // `pub publish`'s pre-promote is handed R's own cutter, this very binary: it runs
+        // that binary's `check`, and builds no cutter of its own
+        let publish = real.publish_command(&prover);
+        assert_eq!(
+            publish.get_program(),
+            std::ffi::OsStr::new("/other/publication/bin/pub")
+        );
+        assert!(
+            publish.get_args().any(|a| a == "--skip-site"),
+            "the site follows the cut, not the promote"
+        );
+        let envs: Vec<_> = publish.get_envs().collect();
+        assert!(envs.contains(&engine), "{envs:?}");
+        let exe = std::env::current_exe().unwrap();
+        assert!(
+            envs.contains(&(
+                std::ffi::OsStr::new(RELEASE_CUTTER_ENV),
+                Some(exe.as_os_str())
+            )),
+            "{envs:?}"
+        );
         let edit = real.scrubbed("/other/publication/bin/pub-bump-edit");
         assert!(edit.get_envs().any(|kv| kv == engine));
     }
@@ -3643,11 +5111,11 @@ mod tests {
         let probe = |nohup: bool, mode: &str| {
             let exe = std::env::current_exe().unwrap();
             let mut cmd = if nohup {
-                let mut cmd = Command::new("nohup");
+                let mut cmd = command("nohup");
                 cmd.arg(exe);
                 cmd
             } else {
-                Command::new(exe)
+                command(exe)
             };
             let out = cmd
                 .args([
@@ -3694,17 +5162,12 @@ mod tests {
     }
 
     #[test]
-    fn kept_audit_rows_go_back_in_time_order_and_gitlinks_are_listed() {
+    fn kept_audit_rows_go_back_in_time_order() {
         let text = "{\"at\":\"1\"}\n{\"at\":\"3\"}\n";
         let kept = vec!["{\"at\":\"2\"}".to_string(), "{\"at\":\"3\"}".to_string()];
         assert_eq!(
             audit_rows_merged(text, &kept),
             "{\"at\":\"1\"}\n{\"at\":\"2\"}\n{\"at\":\"3\"}\n"
-        );
-        let listing = "100644 blob 1111\tCargo.toml\n160000 commit abcd\tvendor/astream\n";
-        assert_eq!(
-            gitlinks(listing),
-            [("abcd".to_string(), "vendor/astream".to_string())]
         );
         assert_eq!(parse_offset("+0200"), Some(7200));
         assert_eq!(parse_offset("-0730"), Some(-27000));

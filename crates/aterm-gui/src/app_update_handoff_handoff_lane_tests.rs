@@ -34,7 +34,7 @@ fn each_fact_alone_decides_the_out_of_band_lane() {
             },
             Some("this platform has no LaunchServices launcher"),
         ),
-        // A dev build, `cargo run` and the test harness reach the seamless lane
+        // A dev build, `targo run` and the test harness reach the seamless lane
         // without a bundle, so LaunchServices has nothing to start.
         (
             "unbundled",
@@ -169,10 +169,8 @@ fn only_a_removal_that_would_remove_something_disqualifies_the_launch() {
         "only real assignments travel; a vacuous removal contributes nothing"
     );
 
-    // The removal now names a variable this process carries, set through the
-    // lock-scoped env helper so no concurrent test observes it.
+    // A removal of a variable this process carries, set under the lock-scoped env helper.
     crate::test_env::scoped("ATERM_LANE_TEST_PRESENT_KEY", "set", || {
-        // std on purpose: never spawned; read by the shipped `launch_environment`.
         let mut command = std::process::Command::new("/bin/echo");
         command.env_remove("ATERM_LANE_TEST_PRESENT_KEY");
         assert!(
@@ -182,8 +180,8 @@ fn only_a_removal_that_would_remove_something_disqualifies_the_launch() {
     });
 }
 
-/// The bundle root is `<bundle>.app/Contents/MacOS/<bin>` and the `.app`
-/// suffix is CHECKED — a dev binary also sits three levels below something.
+/// The bundle root is `<bundle>.app/Contents/MacOS/<bin>`, and the `.app` suffix is checked:
+/// a dev binary also sits three levels below something.
 #[test]
 fn only_a_dot_app_three_levels_up_is_a_bundle_root() {
     let temp = std::env::temp_dir().join(format!("aterm-lane-{}", std::process::id()));

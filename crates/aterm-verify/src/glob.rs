@@ -20,7 +20,7 @@
 //! the smokes decide, so the glob is ported instead.
 
 /// Match `text` against a shell glob supporting `*` (any run, including empty).
-/// There are no other metacharacters in any pattern this gate uses.
+/// There are no other metacharacters in any pattern this run uses.
 #[must_use]
 pub fn glob_match(pattern: &str, text: &str) -> bool {
     let p: Vec<char> = pattern.chars().collect();

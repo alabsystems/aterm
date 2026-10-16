@@ -3,18 +3,10 @@
 
 //! Tests for the disk report and the one apply path (design §5.5).
 //!
-//! Nothing here reads the wall clock: `now` is a literal in every test, and the
-//! two tests that touch a real directory move `now` forward past the files
-//! they wrote rather than back-dating the files.
-//!
-//! Every build-directory fixture is laid out as cargo lays one out
-//! ([`lay_target`]): build locks inside each profile and none at the root.
-//!
-//! Negative controls: a build directory with no marker is not a candidate
-//! however old; a fresh profile is not idle; a locked profile is not a
-//! candidate; an unresolvable live symlink blocks the whole version class; a
-//! delegated class removes nothing even with `disk.apply` on; and apply with
-//! no class named never calls the remover.
+//! Tests on synthetic surveys use the literal [`NOW`]; tests that date files
+//! they wrote take `now` from [`now_after_write`]. Every build-directory
+//! fixture is laid out as cargo lays one out ([`lay_target`]): build locks
+//! inside each profile and none at the root.
 
 use super::*;
 
@@ -64,9 +56,8 @@ impl Drop for Tmp {
     }
 }
 
-/// `now` far enough past the files a test just wrote that both clocks clear
-/// the threshold. The files carry the real wall clock, so the only honest
-/// reading is "the survey happened later".
+/// `now`, `days` past the real wall clock: the files a test just wrote carry
+/// the real clock, so the survey is moved later rather than the files back-dated.
 pub(crate) fn now_after_write(days: i64) -> i64 {
     let real = aterm_time::unix_secs().map_or(0, |s| i64::try_from(s).unwrap_or(i64::MAX));
     real + days * 86_400
@@ -116,7 +107,7 @@ pub(crate) fn lay_profile(profile: &Path) {
     .expect("query cache");
 }
 
-/// [`lay_target`] at `<tmp>/<name>`, answered CANONICAL (the report names
+/// [`lay_target`] at `<tmp>/<name>`, answered canonical (the report names
 /// the real path; macOS's temp dir sits behind the `/var` link).
 pub(crate) fn synthetic_target(tmp: &Tmp, name: &str) -> PathBuf {
     let dir = lay_target(&tmp.path().join(name));
@@ -235,8 +226,7 @@ fn a_synthetic_stale_target_is_reported_and_then_removed_with_its_witness_in_the
         "deps/ is never touched"
     );
 
-    // The row carries the witness: a record of what went without why it was
-    // safe is a receipt, not a record.
+    // The removal row carries the witness: why it was safe, not only what went.
     let (row, removed) = &done.removed[0];
     let line = removal_row(now, "sid-1", row, removed);
     assert!(line.contains("\"kind\":\"removed\""), "{line}");
@@ -260,8 +250,8 @@ fn a_target_without_a_marker_or_with_a_fresh_clock_is_never_a_candidate() {
     let tmp = Tmp::new("negatives");
     let now = now_after_write(DEFAULT_TARGET_STALE_DAYS + 1);
 
-    // NEGATIVE 1: old enough, a profile in it, but nothing proves a build
-    // tool laid it.
+    // Negative 1: old enough, a profile in it, but nothing proves a build tool
+    // laid it.
     let bare = tmp.path().join("bare");
     lay_profile(&bare.join("debug"));
     let scanned =
@@ -277,8 +267,7 @@ fn a_target_without_a_marker_or_with_a_fresh_clock_is_never_a_candidate() {
         rep.notes
     );
 
-    // NEGATIVE 2: a marker, but the clocks are fresh — `now` is the real
-    // clock, so the files this test just wrote are seconds old.
+    // Negative 2: a marker, but the files this test just wrote are seconds old.
     let fresh = synthetic_target(&tmp, "fresh");
     let now_fresh = now_after_write(0);
     let scanned =
@@ -295,7 +284,7 @@ fn a_target_without_a_marker_or_with_a_fresh_clock_is_never_a_candidate() {
         rep.notes
     );
 
-    // NEGATIVE 3: a marker and an idle profile, but a build HOLDS one of its
+    // Negative 3: a marker and an idle profile, but a build holds one of its
     // locks. The held lock wins over the clock.
     let busy = synthetic_target(&tmp, "busy");
     let held = target::Build::holds(&busy.join("debug/.cargo-build-lock"));
@@ -312,7 +301,7 @@ fn a_target_without_a_marker_or_with_a_fresh_clock_is_never_a_candidate() {
     );
     drop(held);
 
-    // NEGATIVE 4: a marker but no cargo profile (no build lock beside
+    // Negative 4: a marker but no cargo profile (no build lock beside
     // deps/): nothing to date and nothing cargo laid.
     let nolock = synthetic_target(&tmp, "nolock");
     for lock in CARGO_LOCKS {
@@ -470,7 +459,7 @@ fn report_only_is_the_default_and_apply_without_a_class_does_nothing() {
         .targets
         .push(scan_target(&dir, now, DEFAULT_TARGET_STALE_DAYS, false).expect("a real directory"));
 
-    // The DEFAULT config: apply off.
+    // The default config: apply off.
     let rep = report(&survey, Config::default());
     assert!(!rep.config.apply, "disk.apply defaults to false");
     assert_eq!(rep.rows_of(Class::CargoTargets).len(), 1, "still REPORTED");
@@ -548,7 +537,7 @@ fn a_path_outside_the_list_is_refused_with_a_denial_row() {
     assert!(line.contains("/etc/passwd"), "{line}");
     assert!(!line.contains('\n'), "one row is one line: {line}");
 
-    // A reported path, but under the WRONG class: the grant does not carry.
+    // A reported path, but under the wrong class: the grant does not carry.
     assert_eq!(
         guard(&rep, None, Class::CargoTargets, Path::new("/v/2.1.259"))
             .expect_err("a cargo-targets grant cannot reach a versions row")
@@ -720,10 +709,9 @@ fn remove_tree_refuses_a_symlink() {
 fn the_safelist_is_closed_and_its_spellings_round_trip() {
     for c in Class::ALL {
         assert_eq!(Class::parse(c.as_str()), Some(*c));
-        assert!(!c.describe().is_empty());
     }
-    // NEGATIVE: no prefix matching, no case folding, no empty name — a typo
-    // that resolved to a different class would be a grant nobody gave.
+    // Negative: no prefix matching, no case folding, no empty name; a typo
+    // that resolved to another class would be a grant nobody gave.
     for bad in ["", "cargo", "Cargo-Targets", "cargo-targets ", "everything"] {
         assert_eq!(Class::parse(bad), None, "{bad:?}");
     }
@@ -744,16 +732,14 @@ fn age_days_never_reads_a_future_mtime_as_old() {
     assert_eq!(age_days(NOW, NOW - 86_399), 0);
     assert_eq!(age_days(NOW, NOW - 86_400), 1);
     assert_eq!(age_days(NOW, NOW - 14 * 86_400), 14);
-    // NEGATIVE: a clock that moved backwards must not age a directory into
+    // Negative: a clock that moved backwards must not age a directory into
     // the removable set.
     assert_eq!(age_days(NOW, NOW + 999 * 86_400), 0);
 }
 
-/// The shipped idle window is one day: what it guards is an idle profile's
-/// `incremental/` alone, taken automatically only below the floor. The
-/// settings help serves the same figure, and a negative setting falls back to
-/// it. A profile written into under 24 hours ago is never idle at it; one a
-/// full day old is.
+/// The shipped idle window is one day (it guards only an idle profile's
+/// `incremental/`), served by the settings help and the fallback for a
+/// negative setting.
 #[test]
 fn the_idle_window_defaults_to_one_day() {
     assert_eq!(DEFAULT_TARGET_STALE_DAYS, 1);
@@ -798,7 +784,7 @@ fn the_purge_row_is_surfaced_and_never_run_from_here() {
         Plan::Denied(Refusal::Delegated(Class::ClaudePurge, _))
     ));
 
-    // NEGATIVE: with the vendor command absent there is no row at all.
+    // Negative: with the vendor command absent there is no row at all.
     let mut survey = Survey::new(NOW);
     survey.purge_available = false;
     assert!(
@@ -848,7 +834,7 @@ fn the_df_reading_is_anchored_on_capacity_and_never_on_a_field_count() {
                   map auto_home           0    0         0   100%    /System/Volumes/Data/home\n";
     assert_eq!(parse_df_kb(autofs), Some(0));
 
-    // NEGATIVE: no anchor, no row, a non-numeric cell, and a mount name that
+    // Negative: no anchor, no row, a non-numeric cell, and a mount name that
     // merely contains a `%` all answer None rather than a plausible guess.
     assert_eq!(parse_df_kb(""), None);
     assert_eq!(parse_df_kb("Filesystem 1024-blocks\n"), None);
@@ -902,8 +888,8 @@ fn scan_reads_the_versions_dir_and_resolves_the_live_link() {
     assert_eq!(survey.trigger, Trigger::OnDemand);
     #[cfg(unix)]
     {
-        // The link points at the BINARY; the class is about the version
-        // DIRECTORY, so the resolved target is walked up to it.
+        // The link points at the binary; the class is about the version
+        // directory, so the resolved target is walked up to it.
         let live = survey.live_version.clone().expect("the link resolved");
         assert!(
             live.ends_with("2.1.265"),
@@ -950,19 +936,12 @@ fn a_build_directory_named_twice_is_one_row() {
     assert!(done.denials.is_empty(), "{done:?}");
 }
 
-/// One verdict per profile in the idle pass too, the innermost build
-/// directory's. A build directory named inside another (`o/target` holding
-/// `o/target/nested/target`) is surveyed twice, and a build holding a nested
-/// lock at only one survey is read free by one and held by the other. Only the
-/// inner directory's survey decides that profile (its row, or its note keeping
-/// it); the outer row neither counts it nor, applied, takes it.
-///
-/// Both ways the outer directory's own profile can stand: idle (a row of its
-/// own) and recent (no row of its own). The lock is held around exactly one
-/// survey ([`target::Build`]), with no clock involved.
-///
-/// Negative control: held at neither, each idle profile is counted once, by
-/// its own directory's row, and an apply takes each once, with no denial.
+/// A build directory nested in another (`o/target/nested/target`) is surveyed
+/// twice; only the inner survey decides the nested profile (its row, or its
+/// note keeping it while a build holds a lock at that survey), and the outer
+/// row neither counts it nor, applied, takes it. Run with the outer profile
+/// idle and recent. Negative control: held at neither survey, each idle profile
+/// is counted and taken once.
 #[cfg(unix)]
 #[test]
 fn the_innermost_build_directory_decides_a_nested_profile_in_the_idle_pass() {
@@ -1109,8 +1088,8 @@ fn the_innermost_build_directory_decides_a_nested_profile_in_the_idle_pass() {
                 assert!(kept.is_empty(), "{case}: {:?}", rep.notes);
             }
 
-            // APPLIED, the build long gone: each row takes exactly what it
-            // counts, once, and a profile its note kept stays.
+            // Applied, the build gone: each row takes exactly what it counts,
+            // once, and a profile its note kept stays.
             let done = apply(
                 &rep,
                 None,

@@ -1,31 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The ambient animal-word roster's bake path: one authored species head
-//! ([`crate::animal_glyphs_gen::ANIMAL_GLYPHS`]) rasterized into one exact-size
-//! straight-alpha RGBA8 tile, cached in a small LRU, and handed to the shared
-//! cat atlas through [`CatBaker::host_tile`](crate::cat_baker::CatBaker::host_tile).
+//! Bake path for the ambient animal-word roster: one species head
+//! ([`crate::animal_glyphs_gen::ANIMAL_GLYPHS`]) rasterized into an exact-size
+//! straight-alpha RGBA8 tile, cached in an LRU and handed to the shared cat atlas
+//! through [`CatBaker::host_tile`](crate::cat_baker::CatBaker::host_tile).
 //!
-//! The twin of [`crate::pet_baker`] (same rasterizer [`fill_path_fixed`], same
-//! fill resolution [`resolve_layer`] over [`ResolvedFills`], same budgets, no
-//! patch strip or eyes axis), minus:
-//!
-//! * **Coat/iris key axes.** Every animal layer is `Recolor::Fixed`
-//!   (species-true paint), so only the outline's contrast ink and
-//!   mixed-background underlay, via [`CatColorKey`], can change a texel. The
-//!   ramp indices the resolver wants are pinned to 0 and never reach a pixel.
-//! * **The eye-dot LOD rig.** Species heads are two-row portraits whose art
-//!   contract (`art/animal/README.md`, pinned by `animal_art_quality`) requires
-//!   features bold enough for a 16 px bake. Below [`FINE_DETAIL_MIN_H`] the
-//!   sub-pixel charm roles are culled.
-//!
-//! Budgets are the shared [`ExactTileBaker`](crate::pet_baker::ExactTileBaker)'s:
-//! [`MAX_SLOTS`](crate::cat_baker::MAX_SLOTS) resident tiles,
-//! [`MAX_ATLAS_BYTES`](crate::cat_baker::MAX_ATLAS_BYTES) resident texels,
-//! [`MAX_BAKES_PER_FRAME`](crate::cat_baker::MAX_BAKES_PER_FRAME) cold bakes
-//! per frame, wholesale clear on cell-metric change. The emitter's per-frame
-//! animal cap bounds distinct species on screen, so 32 slots hold a busy
-//! screen without thrashing.
+//! It is [`crate::pet_baker`]'s path with no coat/iris key axes (every animal layer
+//! is `Recolor::Fixed`, so only [`CatColorKey`] can change a texel) and no eye-dot
+//! LOD: heads are authored bold enough for a 16 px bake (`art/animal/README.md`),
+//! so below [`FINE_DETAIL_MIN_H`] only the sub-pixel charm roles are culled.
 
 use aterm_scene::{PathTransform, Tile, fill_path_fixed};
 
@@ -34,18 +18,14 @@ use crate::cat_baker::{CatColorKey, ResolvedFills, paint_outline_halo, resolve_l
 use crate::cat_glyphs_gen::GlyphRole;
 use crate::pet_baker::{ExactTileBaker, ExactTileKey, host_tile_id};
 
-/// Below this tile height (device px) the fine charm roles — whisker, blush,
-/// pattern, catch-light, detail — are culled: at a 2-row bake under small cell
-/// metrics they rasterize to sub-pixel noise that muddies the silhouette the
-/// 16 px review bar protects. Eyes, nose, mouth and muzzle always paint — the
-/// art contract authors them bold enough to survive.
+/// Below this tile height (device px) the fine charm roles (whisker, blush,
+/// pattern, catch-light, detail) are culled: at small cell metrics they
+/// rasterize to sub-pixel noise that muddies the silhouette. Eyes, nose, mouth
+/// and muzzle always paint.
 pub const FINE_DETAIL_MIN_H: u32 = 40;
 
 /// Bake-cache key for one animal tile: everything that can change a texel, and
-/// nothing that cannot. All-integer by construction (the
-/// [`BakeKey`](crate::cat_baker::BakeKeyV4) discipline) — the resolved outline
-/// ink is derived from [`CatColorKey`] at bake time and never stored in a
-/// hashed key.
+/// nothing that cannot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct AnimalBakeKey {
     /// The authored species head.
@@ -53,15 +33,15 @@ pub struct AnimalBakeKey {
     /// Quantized local terminal palette (accent family + background band):
     /// drives the outline contrast ink and the mixed-background underlay.
     pub colors: CatColorKey,
-    /// Tile width in px. The tile is EXACTLY this wide — no patch strip.
+    /// Tile width in px (exact: no patch strip).
     pub w: u16,
     /// Tile height in px.
     pub h: u16,
 }
 
 impl AnimalBakeKey {
-    /// Resolve the local palette into concrete bake fills. The coat/iris ramp
-    /// indices are pinned (no animal layer consumes them — see module docs).
+    /// Resolve the local palette into bake fills; the coat/iris ramp indices are
+    /// pinned to 0 (no animal layer reads them).
     #[must_use]
     pub fn fills(&self) -> ResolvedFills {
         ResolvedFills::from_context(0, 0, self.colors)
@@ -78,11 +58,9 @@ impl AnimalBakeKey {
         )
     }
 
-    /// A stable `u64` identity for
-    /// [`CatBaker::host_tile`](crate::cat_baker::CatBaker::host_tile): FNV-1a
-    /// over the key's integer fields (not `DefaultHasher`, so the id survives
-    /// restarts and std releases). High bit set, like the pet's, to avoid small
-    /// hand-assigned host ids; the salt separates it from pet tiles.
+    /// A stable `u64` id for [`CatBaker::host_tile`](crate::cat_baker::CatBaker::host_tile):
+    /// FNV-1a over the key's fields, so it survives restarts and std releases. The
+    /// salt separates it from pet tiles.
     #[must_use]
     pub fn host_id(&self) -> u64 {
         const ANIMAL_SALT: u64 = 0xA111_3A15;
@@ -97,14 +75,8 @@ impl AnimalBakeKey {
     }
 }
 
-/// Rasterize one authored species head into a fresh `w × h` [`Tile`], painter
-/// order = layer order, each layer's colour resolved by [`resolve_layer`] and
-/// its fixed-point frame mapped onto the tile by [`PathTransform::fit`].
+/// Rasterize one species head into a fresh `w × h` [`Tile`] in layer order.
 /// Deterministic, so the LRU is a pure function of its key.
-///
-/// As in the pet bake, when [`ResolvedFills::outline_underlay`] is `Some` the
-/// outline gets a compact pale keyline underneath, so the silhouette clears
-/// contrast across the light/dark crossover.
 #[must_use]
 pub fn bake_species(species: AnimalGlyphId, fills: &ResolvedFills, w: u32, h: u32) -> Tile {
     let mut tile = Tile::new(w, h);
@@ -145,17 +117,14 @@ impl ExactTileKey for AnimalBakeKey {
     }
 }
 
-/// Host-side LRU of exact-size animal tiles — the
-/// [`crate::pet_baker::PetBaker`] structure itself (see the module docs for
-/// budgets).
+/// Host-side LRU of exact-size animal tiles.
 pub type AnimalBaker = ExactTileBaker<AnimalBakeKey>;
 
 impl AnimalBaker {
     /// The authored aspect (width ÷ height) of a species head, from its asset
-    /// viewbox. Callers size the destination box from THIS so a long camel
-    /// face and a round penguin dome both keep the shape their artist drew.
-    /// Clamped away from zero so a degenerate asset cannot produce a NaN/∞
-    /// destination rect.
+    /// viewbox; callers size the destination box from it so each head keeps
+    /// its drawn shape. Clamped away from zero so a degenerate asset cannot
+    /// produce a NaN/∞ destination rect.
     #[must_use]
     pub fn aspect(species: AnimalGlyphId) -> f32 {
         (f32::from(ANIMAL_GLYPHS[species as usize].aspect_x1000) / 1000.0).max(0.001)

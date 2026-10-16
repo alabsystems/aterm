@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+#
+# The gate over libc-oracle/, the nested reference workspace. The driver lives in
+# THIS workspace and not in that one: the oracle workspace must stay the two
+# packages whose resolution reaches the registry libc (no [patch] table), and the
+# mutation controls copy it whole, so a third member there would be copied,
+# resolved and built with every control. Here it is linted, formatted and tested
+# like every other crate. Binary-only: nothing links it.
+
+[package]
+name = "aterm-libc-oracle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "The libc conformance oracle's gate and generator: decides crates/aterm-libc against the pinned reference libc on this host's native ABI cell, and regenerates it"
+
+[[bin]]
+name = "aterm-libc-oracle"
+path = "src/main.rs"
+
+[dependencies]
+aterm-json = { workspace = true }
+aterm-tempfile = { workspace = true }
+aterm-uds = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+
+[dev-dependencies]
+aterm-spec = { workspace = true }
+
+[lints]
+workspace = true

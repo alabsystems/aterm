@@ -53,21 +53,17 @@ target-trust
 # covers `target/**/debug`.
 !vendor/**/debug/
 
-# Sibling target dirs at the root (2026-09-13): the merge gate's per-lane dirs
-# (target-xtask, target-drivers), its own `target-gate`, and the
-# `target-tippy` lint dir, which is often a SYMLINK. No trailing slash on
-# purpose: `/target-*/` matches directories only, and `git check-ignore` measured
-# it leaving a `target-tippy` symlink untracked. Nothing tracked starts with
+# Root-level target dirs (`target-trust`, and `target-tippy`/`target-xtask`/
+# `target-drivers`/`target-gate` left by the retired gate; safe to delete), files or
+# symlinks: no trailing slash, so a symlink matches too. Nothing tracked starts with
 # `target` at the root.
 /target-*
-# Folders a retired pass made (it renamed a cargo target dir, at any depth, to
-# `<dir>.noindex` behind a `<dir>` link, which the unanchored `target` rule above
-# already ignores) are left on disk. The rule is kept for them, tracked because the
-# Trust lane's clean test (tools/trust-gate-all.sh `tree_clean`) and the merge gate's
-# clean-tree judge read only tracked .gitignore files. No trailing slash, as above.
+# `<dir>.noindex` folders a retired pass left behind a `<dir>` link. Tracked here
+# because the release's clean-tree judge (aterm-release clean.rs, which the Trust
+# lane's filing reads too) reads only tracked .gitignore files.
 target.noindex
 
-# The merge gate's snapshot lock and trash (crates/aterm-verify).
+# Logs and locks the retired gate kept at the root; `verify` writes under target/.
 /.aterm-verify/
 
 # One-shot Trust/verification campaign scratch — raw sweep logs and gap dumps are
@@ -93,8 +89,8 @@ trustc-ice-*.txt
 # The epoch-2 update-signing key + its config live on the release machine
 # only (~/.aterm/, Keychain recovery item; see docs/RELEASING.md "Signing
 # authority"). These patterns are a last-ditch stop against an accidental
-# in-repo copy ever being staged; tools/grep_guard.sh B6 backstops tracked
-# content the same way.
+# in-repo copy ever being staged; the export's secret scan backstops
+# published content the same way.
 update-v2.key
 release.conf
 *.ed25519

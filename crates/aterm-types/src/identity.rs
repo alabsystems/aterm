@@ -1,10 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! WHO MAKES aterm — the origin every user-facing surface prints under its title
-//! (`aterm --help`, `aterm --version`, the manual's front page and agent brief,
-//! `atpkg help`, Settings ▸ About), so a person who meets the program cold knows
-//! where it comes from. ONE definition, so no surface can drift.
+//! Who makes aterm: the origin every user-facing surface prints under its title
+//! (`aterm --help`, `--version`, the manual, `atpkg help`, Settings ▸ About), defined once.
 
 /// The author.
 pub const AUTHOR: &str = "Andrew Yates";
@@ -15,7 +13,7 @@ pub const COMPANY: &str = "ALab";
 /// The project site, as printed (no scheme).
 pub const SITE: &str = "alab.systems";
 
-/// The ONE origin line every text surface prints under its title.
+/// The origin line every text surface prints under its title.
 pub const ORIGIN_LINE: &str = "by Andrew Yates \u{00b7} ALab \u{00b7} alab.systems";
 
 #[cfg(test)]

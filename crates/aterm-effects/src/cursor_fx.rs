@@ -377,7 +377,7 @@ fn finite_clamp_or_off(value: f32, min: f32, max: f32) -> f32 {
 }
 
 /// Brighten a packed `0x00RRGGBB` by `factor` (the auto-accent law).
-pub(crate) fn brighten(color: u32, factor: f32) -> u32 {
+pub fn brighten(color: u32, factor: f32) -> u32 {
     let channel = |shift: u32| ((((color >> shift) & 0xff) as f32) * factor).min(255.0) as u32;
     (channel(16) << 16) | (channel(8) << 8) | channel(0)
 }
@@ -447,6 +447,55 @@ pub fn resolve_glow_config(
         ribbon_flat: spelling.ribbon_flat,
         classic_mono: spelling.classic_mono,
     }
+}
+
+/// The colour `style` keeps for its own when `cursor_trail_color` is unset,
+/// and its plain name: Laser's storm violet. Every other style's automatic
+/// colour follows the live cursor colour ([`follow_live_cursor`]), so
+/// Settings can say which one a row's default is.
+#[must_use]
+pub fn own_trail_color(style: GlowStyle) -> Option<(u32, &'static str)> {
+    matches!(style, GlowStyle::Laser).then_some((crate::cursor_glow::LASER_DEFAULT_COLOR, "Violet"))
+}
+
+/// AUTOMATIC TRAIL COLOURS FOLLOW THE LIVE CURSOR — the one step every host
+/// runs between [`resolve_glow_config`] and the tick (a native window, its
+/// Settings preview), so a preview draws the colour the terminal does. With
+/// no explicit `cursor_trail_color` (`color_pinned` false) the glow and the
+/// comet body take the live cursor colour (OSC 12, else the theme's), and,
+/// with no explicit accent, a brightened accent; a style with a colour of
+/// its own ([`own_trail_color`]) keeps it, and an explicit colour stays.
+pub fn follow_live_cursor(
+    glow: &mut GlowConfig,
+    trail: &mut TrailConfig,
+    live_cursor: u32,
+    color_pinned: bool,
+    accent_pinned: bool,
+) {
+    if color_pinned || own_trail_color(glow.style).is_some() {
+        return;
+    }
+    let live = live_cursor & 0x00FF_FFFF;
+    glow.color = live;
+    trail.color = live;
+    if !accent_pinned {
+        glow.accent = brighten(live, 1.5);
+    }
+}
+
+/// A body's additive light on a light ground (the comet's coma, the beam's
+/// rod): it cannot show on the paper and would only bleach the letters and
+/// the trail's ink around the caret, so the quads it appended from `from` on
+/// are dropped there; the body's block fill is kept.
+fn drop_additive_from(scratch: &mut Vec<GlowQuad>, from: usize) {
+    let mut keep = from;
+    for i in from..scratch.len() {
+        if scratch[i].alpha > 0 {
+            scratch.swap(keep, i);
+            keep += 1;
+        }
+    }
+    scratch.truncate(keep);
 }
 
 /// A BLOCK cursor shape — the one every block body needs.
@@ -729,6 +778,7 @@ impl CursorFx {
         let glow_fp = glow_fp ^ momentum_frame.fp.rotate_left(53);
         // Comet nucleus cursor (the `comet` body), riding the aurora's blaze in
         // the post-OSC-12 glow colours.
+        let comet_from = self.glow_scratch.len();
         let comet_frame = self.comet.tick(
             cur,
             now,
@@ -742,6 +792,9 @@ impl CursorFx {
             },
             &mut self.glow_scratch,
         );
+        if !dark {
+            drop_additive_from(&mut self.glow_scratch, comet_from);
+        }
         let glow_fp = glow_fp ^ comet_frame.fp.rotate_left(29);
         // Phaser emitter cursor: the block is the emitter, its fill locked to
         // the beam's rolling hue over the same pinned-or-white base as the
@@ -788,6 +841,7 @@ impl CursorFx {
             }
             _ => (glow_cfg.color, (glow_cfg.color >> 1) & 0x007F_7F7F),
         };
+        let beamrod_from = self.glow_scratch.len();
         let beamrod_frame = self.beamrod.tick(
             cur,
             now,
@@ -805,6 +859,9 @@ impl CursorFx {
             },
             &mut self.glow_scratch,
         );
+        if !dark {
+            drop_additive_from(&mut self.glow_scratch, beamrod_from);
+        }
         let glow_fp = glow_fp ^ beamrod_frame.fp.rotate_left(17);
         // Lightning-bolt cursor (the `laser` block): a jagged bolt in the beam's
         // hue, whitened by typing heat and the strike flare, cooling as it
@@ -1108,5 +1165,48 @@ mod tests {
         assert_eq!(head_dx_for(CursorStyle::BlinkingBar), 0.08);
         assert_eq!(head_dx_for(CursorStyle::SteadyBlock), 0.5);
         assert_eq!(head_dx_for(CursorStyle::BlinkingUnderline), 0.5);
+    }
+
+    /// Automatic trail colours follow the live cursor, as a window and its
+    /// Settings preview both run them: the glow, the comet body and the
+    /// brightened accent take the cursor colour. Laser keeps its own violet,
+    /// and an explicit colour (or accent) stays as it was set.
+    #[test]
+    fn automatic_trail_colours_follow_the_live_cursor() {
+        let live = 0x0050_FA7B;
+        for style in [
+            GlowStyle::Comet,
+            GlowStyle::Beam,
+            GlowStyle::Sparkle,
+            GlowStyle::Lumen,
+        ] {
+            let (mut glow, mut trail) = classic_cfg(true);
+            glow.style = style;
+            glow.color = 0x009E_D6FF;
+            trail.color = 0x009E_D6FF;
+            follow_live_cursor(&mut glow, &mut trail, live, false, false);
+            assert_eq!((glow.color, trail.color), (live, live), "{style:?}");
+            assert_eq!(glow.accent, brighten(live, 1.5), "{style:?}");
+        }
+        // Laser keeps its own colour.
+        let (mut glow, mut trail) = classic_cfg(true);
+        glow.style = GlowStyle::Laser;
+        glow.color = crate::cursor_glow::LASER_DEFAULT_COLOR;
+        follow_live_cursor(&mut glow, &mut trail, live, false, false);
+        assert_eq!(glow.color, crate::cursor_glow::LASER_DEFAULT_COLOR);
+        assert!(own_trail_color(GlowStyle::Laser).is_some());
+        assert!(own_trail_color(GlowStyle::Comet).is_none());
+        // An explicit colour stays; an explicit accent stays.
+        let (mut glow, mut trail) = classic_cfg(true);
+        glow.style = GlowStyle::Comet;
+        glow.color = 0x00E0_218A;
+        trail.color = 0x00E0_218A;
+        follow_live_cursor(&mut glow, &mut trail, live, true, false);
+        assert_eq!((glow.color, trail.color), (0x00E0_218A, 0x00E0_218A));
+        let (mut glow, mut trail) = classic_cfg(true);
+        glow.style = GlowStyle::Comet;
+        glow.accent = 0x0012_3456;
+        follow_live_cursor(&mut glow, &mut trail, live, false, true);
+        assert_eq!((glow.color, glow.accent), (live, 0x0012_3456));
     }
 }

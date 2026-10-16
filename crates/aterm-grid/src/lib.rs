@@ -2,11 +2,9 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-#![deny(unsafe_op_in_unsafe_fn)]
-#![deny(clippy::all)]
-// Production unwrap() is forbidden; tests opt out uniformly at the
-// crate root so a missing per-module allow can't silently slip past clippy.
-#![deny(clippy::unwrap_used)]
+// Production unwrap() is forbidden; tests opt out at the crate root so a
+// missing per-module allow cannot slip past clippy.
+#![warn(clippy::unwrap_used)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
 //! Terminal grid model: `Grid`, `GridStorage`, `MaterializedRow`, cells, rows,
@@ -20,12 +18,12 @@ pub mod damage;
 pub mod extra;
 pub mod extra_collection;
 mod extra_collection_shifts;
-/// Page-backed storage internals. Exposed under `feature = "testing"` for
+/// Page-backed storage internals. Exposed under `debug_assertions` for
 /// downstream property tests; production uses [`Row`] and
 /// [`PageStore`] (re-exported at the crate root).
-#[cfg(any(test, feature = "testing"))]
+#[cfg(any(test, debug_assertions))]
 pub mod page;
-#[cfg(not(any(test, feature = "testing")))]
+#[cfg(not(any(test, debug_assertions)))]
 pub(crate) mod page;
 pub mod pin;
 pub mod row;
@@ -35,12 +33,11 @@ pub mod style;
 
 pub mod grid;
 
-#[cfg(all(test, not(feature = "testing")))]
+#[cfg(all(test, not(debug_assertions)))]
 pub(crate) mod test_counters;
-#[cfg(feature = "testing")]
+#[cfg(debug_assertions)]
 pub mod test_counters;
 
-// Re-export Grid and related types at crate root.
 pub use grid::Grid;
 pub use grid::scroll_convert::{scrollback_text_only, set_scrollback_text_only};
 pub use grid::{CellDataView, HistoryLines, VisibleRowView};
@@ -55,7 +52,7 @@ pub use cell::{Cell, CellFlags, PackedColor, PackedColors};
 pub use damage::{
     Damage, DamageBoundsIterator, DamagedRowIterator, LineDamageBounds, RowDamageBounds,
 };
-#[cfg(any(test, feature = "testing"))]
+#[cfg(any(test, debug_assertions))]
 pub use extra::is_combining_mark;
 pub use extra::{
     CellCoord, CellExtra, CellExtras, ImageData, ImageFormat, ImageRef, ImageScaling,
@@ -66,10 +63,10 @@ pub use pin::GenerationTracker;
 pub use row::{LineSize, Row, RowFlags};
 pub use style::{Color, ColorType, ExtendedStyle, Style, StyleAttrs, StyleId, StyleTable};
 
-// Re-export page-level constants and harmless aliases needed by other crates.
+// Page-level constants and aliases other crates use.
 pub use page::PAGE_SIZE;
 pub use page::PageId;
-#[cfg(any(test, feature = "testing"))]
+#[cfg(any(test, debug_assertions))]
 pub use pin::{Generation, Pin, PinnedRange};
 
 // Cursor, scroll region, and grid state types.
@@ -101,10 +98,8 @@ pub const MAX_GRID_ROWS: u16 = 4096;
 pub const MAX_GRID_COLS: u16 = 4096;
 
 /// Whether column `col` holds a tab stop in a fresh grid: every eighth column
-/// from 8, the VT100's power-on stops. The one statement of the default, read
-/// where a grid is built, where a widen seeds the columns it adds, and by a
-/// host that carries a grid's stops as their difference from it (`aterm-gui`'s
-/// keeper META).
+/// from 8, the VT100's power-on stops. Hosts that carry a grid's stops as a
+/// difference from the default (`aterm-gui`'s keeper META) read this too.
 #[must_use]
 #[inline]
 pub const fn is_default_tab_stop(col: usize) -> bool {

@@ -1,0 +1,17 @@
+# agy 1.4.0 · MEASURED 2026-10-16, `aterm ctl text --json` of a private headless aterm 120x40 (aterm 0.105.0 098c216c7), the atpkg-managed agy (Google latest) launched through its shim under the owner's signed-in account (Gemini 4 Argon, medium), scratch ATERM_STATE_HOME/XDG dirs, harness off · a typed, unsent draft `hello there` (d0d0d0, the caret 5c5cff): the footer's left side is blank while a draft is held (`? for shortcuts` returns when it is empty); ctrl+u clears it, esc does not · cursor=13,13 (visible) · account and scratch path redacted at equal length
+$ cd /tmp/at.XXXXXX/work && agy
+^[P>|aterm(0.105.0)^[\^[[?64;6;22;28;4c
+
+      ▄▀▀▄        Antigravity CLI 1.4.0
+     ▀▀▀▀▀▀       redacted-user@example.test (Google AI Ultra)
+    ▀▀▀▀▀▀▀▀      Gemini 4 Argon (Medium)
+   ▄▀▀    ▀▀▄     /tmp/at.XXXXXX/work
+  ▄▀▀      ▀▀▄
+
+⚠ Warning
+  ⎿  "Gemini 3.5 Flash (High)" is no longer available. Using "Gemini 4 Argon (Medium)".
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+> hello there
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+                                                                                                 Gemini 4 Argon · medium

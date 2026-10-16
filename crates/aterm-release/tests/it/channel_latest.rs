@@ -1,26 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE CUT PUBLISHES ONCE, AND OWNS `latest` — proved against a fake GitHub.
+//! The cut publishes once and owns `latest`, proved against a fake GitHub.
 //!
-//! `pub publish` creates aterm's vX.Y.0 release on the public channel as a SOURCE
-//! prerelease (never `latest`); the cut's `publish` step ADOPTS it — the one release
-//! object of the version. Every credential-less updater finds the channel head with
-//! one request, `releases/latest/download/aterm-appcast.toml`, so whichever release
-//! GitHub calls `latest` IS the channel head. Two bugs this replays: a source release
-//! created as a full release took `latest` before it carried any appcast, so every
-//! updater was sent to a release with nothing to install (v0.79.0 .. v0.91.0), and an adopt path that sent no
-//! `make_latest` passed its pointer gate only because of that steal.
+//! `pub publish` creates the vX.Y.0 release on the public channel as a source prerelease
+//! (never `latest`); the cut's `publish` step adopts it, the one release object of the
+//! version. Credential-less updaters find the channel head with one request,
+//! `releases/latest/download/aterm-appcast.toml`, so whichever release GitHub calls `latest`
+//! is the channel head, and it must never name a release with nothing to install.
 //!
 //! [`channel::publish_on_channel`] sends one guarded head PATCH ([`channel::HEAD_PATCH`]:
-//! `draft=false`, `prerelease=false`, `make_latest=true`) on every path, after the
-//! appcast pair is up and the release's exact asset set is proved. The fake models
-//! the three GitHub rules that decide `latest` — a newly published full release takes
-//! it, a prerelease never can, `make_latest=true` on a full release takes it — applies
-//! exactly the PATCH fields the cutter's own table sends, and records every moment at
-//! which `latest` named a release a client could not install from. The pointer
-//! verdict is the cutter's own gate, [`publish::prove_pointer_serves`], fed from the
-//! fake.
+//! `draft=false`, `prerelease=false`, `make_latest=true`) on every path, after the appcast pair
+//! is up and the release's exact asset set is proved. The fake models GitHub's three rules
+//! for `latest` (a newly published full release takes it, a prerelease never can,
+//! `make_latest=true` on a full release takes it), applies exactly the PATCH fields sent, and
+//! records every moment `latest` named a release a client could not install from. The pointer
+//! verdict is the cutter's own gate, [`publish::prove_pointer_serves`], fed from the fake.
 
 use crate::{channel, ledger, manifest_out, publish, verify};
 
@@ -47,8 +42,8 @@ fn download_url(tag: &str, name: &str) -> String {
         .expect("canonical names build a download URL")
 }
 
-/// A valid appcast for `version`, whose `url` binds it to its tag and DMG exactly as
-/// the web-lane client demands.
+/// A valid appcast for `version`, its `url` binding it to its tag and DMG as the web-lane
+/// client demands.
 fn appcast(version: &str, build: u64) -> Vec<u8> {
     let tag = format!("v{version}");
     let dmg = channel::dmg_asset_name(version);
@@ -66,7 +61,7 @@ struct Release {
     tag: String,
     draft: bool,
     prerelease: bool,
-    /// `DELETE /releases/{id}` — only a negative control ever sets it.
+    /// `DELETE /releases/{id}`, set only by a negative control.
     deleted: bool,
     assets: BTreeMap<String, Vec<u8>>,
 }
@@ -77,10 +72,9 @@ struct FakeGithub {
     releases: Vec<Release>,
     /// Index into `releases` of the release GitHub calls `latest`.
     latest: Option<usize>,
-    /// The pre-fix adopt path: the cutter sends no head PATCH at all.
+    /// Negative control: the cutter sends no head PATCH at all.
     drop_head_patch: bool,
-    /// The head PATCH body, when a test replaces the cutter's own
-    /// [`channel::HEAD_PATCH`] (a negative control).
+    /// A replacement for [`channel::HEAD_PATCH`] (a negative control).
     head_fields: Option<Vec<(&'static str, HeadPatchValue)>>,
     /// Every time the cut bound its channel release.
     binds: usize,
@@ -94,20 +88,18 @@ struct FakeGithub {
     journal_release: Option<usize>,
     /// The machine-roster generation the fleet has observed on the channel.
     roster_seq: u64,
-    /// GitHub's `releases/latest` cache: while set, the pointer still names this release
-    /// whatever `latest` is (v0.93.0: five minutes after the PATCH landed).
+    /// GitHub's `releases/latest` cache: while set, the pointer names this release whatever
+    /// `latest` is.
     stale_pointer: Option<usize>,
-    /// NEGATIVE CONTROL: a resume that does not ask whether its head PATCH landed — the
-    /// sequence before 2026-09-26.
+    /// Negative control: a resume that does not ask whether its head PATCH landed.
     forget_head: bool,
     /// The next upload POST of this name fails, once, the way [`UploadFailure`] says.
     fail_upload_once: Option<(String, UploadFailure)>,
-    /// The journal's durable upload intents (`Journal::upload_intents`): persisted
-    /// before every upload POST, retracted only when the live cutter's own verdict
-    /// ([`publish::post_outcome`]) says the POST created nothing.
+    /// The journal's durable upload intents (`Journal::upload_intents`): persisted before every
+    /// upload POST, retracted only when [`publish::post_outcome`] says it created nothing.
     upload_intents: Vec<String>,
-    /// NEGATIVE CONTROL: a bind that adopts whatever release is under the tag, a FULL
-    /// source release included — the cutter before it asked the release's flag.
+    /// Negative control: a bind that adopts whatever release is under the tag, a full source
+    /// release included.
     adopt_unchecked: bool,
 }
 
@@ -118,11 +110,10 @@ enum UploadFailure {
     NeverSent,
     /// The server answered 422: understood, refused, nothing created.
     Refused,
-    /// A 502 from the edge: whether GitHub stored the object is unknowable to the cutter
-    /// (here it did not).
+    /// A 502 from the edge: whether GitHub stored the object is unknowable (here it did not).
     ServerError,
-    /// The server answered 422 — `already_exists`, for an object nobody journaled that the
-    /// pre-POST probe could not see yet: the POST created nothing, and the object is there.
+    /// 422 `already_exists` for an unjournaled object the pre-POST probe could not see yet:
+    /// the POST created nothing, and the object is there.
     RefusedButStored,
     /// A 502 that hid a POST GitHub did store: the object landed, only the answer was lost.
     ServerErrorButStored,
@@ -159,8 +150,8 @@ impl FakeGithub {
         github
     }
 
-    /// `atpkg-keys join`: the fleet's roster moves to the next generation, and the join
-    /// re-dresses the channel head with the new pair — no lease, no re-signed manifest.
+    /// `atpkg-keys join`: the fleet's roster moves to the next generation and the join
+    /// re-dresses the channel head with the new pair, with no lease or re-signed manifest.
     fn roster_join(&mut self) {
         self.roster_seq += 1;
         let bytes = format!("roster generation {}", self.roster_seq).into_bytes();
@@ -176,8 +167,8 @@ impl FakeGithub {
         }
     }
 
-    /// Is this release the channel's PUBLISHED app release — what only a head PATCH makes
-    /// of an adopted prerelease or a draft (`verify::ReleaseState::Published`)?
+    /// Is this the channel's published app release, which only a head PATCH makes of an
+    /// adopted prerelease or a draft (`verify::ReleaseState::Published`)?
     fn published(&self, id: usize) -> bool {
         let release = &self.releases[id];
         !release.draft
@@ -186,9 +177,8 @@ impl FakeGithub {
             && release.assets.contains_key(manifest_out::MANIFEST_ASSET)
     }
 
-    /// What the cutter's own classifier ([`verify::classify_release_state`], the one
-    /// `--abandon` and `head_made` read) makes of release `id`, over the row
-    /// `release_metadata_listing` would emit for it.
+    /// What [`verify::classify_release_state`] (read by `--abandon` and `head_made`) makes of
+    /// release `id`, over the row `release_metadata_listing` would emit.
     fn release_state(&self, id: usize) -> verify::ReleaseState {
         let release = &self.releases[id];
         let appcast = usize::from(release.assets.contains_key(manifest_out::MANIFEST_ASSET));
@@ -199,7 +189,7 @@ impl FakeGithub {
         verify::classify_release_state(&row, &release.tag).expect("a well-formed row")
     }
 
-    /// A complete app release, published as a full release — so it takes `latest`.
+    /// A complete app release, published as a full release, so it takes `latest`.
     fn app_release(&mut self, version: &str, build: u64) -> usize {
         let mut assets = BTreeMap::new();
         for name in channel::required_asset_names(version, true, true) {
@@ -223,8 +213,8 @@ impl FakeGithub {
         id
     }
 
-    /// `POST /releases`. GitHub's rule: a release published as a full release (not a
-    /// draft, not a prerelease) takes `latest` (`make_latest` defaults to `"true"`).
+    /// `POST /releases`. GitHub's rule: a full release (not a draft or prerelease) takes
+    /// `latest` (`make_latest` defaults to `"true"`).
     fn create(&mut self, tag: &str, draft: bool, prerelease: bool, assets: &[&str]) -> usize {
         self.releases.push(Release {
             tag: tag.into(),
@@ -244,9 +234,8 @@ impl FakeGithub {
         id
     }
 
-    /// `pub publish`'s sign-release: the source release, with its attestation pair and
-    /// the roster pair it re-uploads. `prerelease` is the engine's reading of
-    /// `BINARY_CUT_FOLLOWS_DEFAULT` in the published tree's `publish/config.sh`.
+    /// `pub publish`'s sign-release: the source release with its attestation and roster pairs.
+    /// `prerelease` is the engine's reading of `BINARY_CUT_FOLLOWS_DEFAULT`.
     fn source_release(&mut self, prerelease: bool) -> usize {
         self.create(
             TAG,
@@ -261,9 +250,9 @@ impl FakeGithub {
         )
     }
 
-    /// `PATCH /releases/{id}` with exactly the fields the cutter sends — its own
-    /// [`channel::HEAD_PATCH`] unless a test replaced it. GitHub's rule: `make_latest=true`
-    /// makes a FULL release `latest`, and moves nothing for a draft or a prerelease.
+    /// `PATCH /releases/{id}` with exactly the fields sent ([`channel::HEAD_PATCH`] unless a
+    /// test replaced it). GitHub's rule: `make_latest=true` makes a full release `latest` and
+    /// moves nothing for a draft or a prerelease.
     fn head_patch(&mut self, id: usize) {
         let fields = self
             .head_fields
@@ -306,8 +295,8 @@ impl FakeGithub {
         }
     }
 
-    /// What `releases/latest/download/aterm-appcast.toml` answers a stranger, read the
-    /// way the deployed client reads it (a tag outside its grammar is not an app).
+    /// What `releases/latest/download/aterm-appcast.toml` answers a stranger, read as the
+    /// deployed client reads it (a tag outside its grammar is not an app).
     fn pointer(&self) -> PointerProbe {
         match self.stale_pointer.or(self.latest) {
             Some(id) => {
@@ -346,9 +335,8 @@ impl FakeGithub {
     }
 }
 
-/// The cut's view of its channel release, through the same trait the real step drives.
-/// `id` is the release the bind will find; like the live step, every release call
-/// before the bind is refused.
+/// The cut's view of its channel release, through the trait the real step drives. `id` is the
+/// release the bind will find; as live, every release call before the bind is refused.
 struct FakeChannel<'a> {
     github: &'a mut FakeGithub,
     id: usize,
@@ -374,8 +362,7 @@ impl<'a> FakeChannel<'a> {
         }
     }
 
-    /// The head half of the ratchet, decided by the cutter's own function over what the
-    /// fake serves a stranger.
+    /// The head half of the ratchet, by the cutter's own function over what the fake serves.
     fn head_half(&self) -> Result<()> {
         let github = &*self.github;
         publish::prove_channel_head_is_older(
@@ -387,9 +374,8 @@ impl<'a> FakeChannel<'a> {
         )
     }
 
-    /// The roster half, decided by the cutter's own floor: this cut's generation against
-    /// the one the fleet has observed. (The lineage-fork half reads signed roster
-    /// documents; `machine_roster.rs` owns its proofs.)
+    /// The roster half, by the cutter's own floor: this cut's generation against the fleet's.
+    /// (The lineage-fork half is proved in `machine_roster.rs`.)
     fn roster_half(&self) -> Result<()> {
         publish::roster_floor_covered(Some(CARRIED_ROSTER), Some(self.github.roster_seq))
     }
@@ -417,9 +403,8 @@ impl ChannelRelease for FakeChannel<'_> {
     }
 
     fn bind(&mut self) -> Result<()> {
-        // A visible release the journal holds no intent for is adopted only as the
-        // engine's source PRERELEASE — the cutter's own two verdicts, as the live bind
-        // asks them (`adoptable_channel_release`).
+        // A visible release the journal holds no intent for is adopted only as the engine's
+        // source prerelease, by the live bind's two verdicts (`adoptable_channel_release`).
         let release = &self.github.releases[self.id];
         if !release.draft
             && self.github.journal_release != Some(self.id)
@@ -477,8 +462,7 @@ impl ChannelRelease for FakeChannel<'_> {
             .take_if(|(failing, _)| *failing == name)
             .map(|(_, failure)| failure);
         if let Some(failure) = failure {
-            // The cutter's own verdict on what this POST's outcome proves, and the
-            // cutter's own decision on what to do about it (`upload_channel_asset`).
+            // The cutter's own verdict on the outcome and decision on what to do about it.
             let out = failure.out();
             let outcome = publish::post_outcome(&out);
             if matches!(
@@ -496,8 +480,8 @@ impl ChannelRelease for FakeChannel<'_> {
             let stored = self.github.releases[self.id].assets.contains_key(&name);
             match publish::after_upload_post(outcome, || Ok(stored))? {
                 publish::AfterUploadPost::Converge { journal } => {
-                    // Its bytes are ours by construction; the journal names it again when
-                    // the retraction had dropped it.
+                    // Its bytes are ours by construction; the journal names it again if the
+                    // retraction dropped it.
                     if journal {
                         self.github.upload_intents.push(name.clone());
                     }
@@ -578,8 +562,8 @@ fn dist() -> (aterm_tempfile::TempDir, Vec<PathBuf>, Vec<u8>) {
         std::fs::write(&path, bytes).unwrap();
         files.push(path);
     }
-    // The order `required_asset_names` returns is alphabetical — appcast before its
-    // signature, and before most binaries. The sequence must reorder it.
+    // `required_asset_names` is alphabetical (the appcast before its signature and most
+    // binaries); the sequence must reorder it.
     assert!(
         files
             .iter()
@@ -599,10 +583,9 @@ fn position(uploads: &[String], name: &str) -> usize {
         .unwrap_or_else(|| panic!("{name} was never uploaded: {uploads:?}"))
 }
 
-/// THE PROOF. The engine's prerelease source release never takes `latest`; the cut
-/// adopts it, uploads the appcast signature and then the appcast LAST, sends the head
-/// PATCH once both are up, and the cutter's own pointer gate then passes — with
-/// `latest` never once naming a release a client could not install from.
+/// The engine's prerelease source release never takes `latest`; the cut adopts it, uploads the
+/// appcast signature and then the appcast last, sends the head PATCH once both are up, and the
+/// pointer gate passes, with `latest` never naming a release a client could not install from.
 #[test]
 fn the_adopted_source_release_takes_latest_only_after_its_appcast_pair() {
     let mut github = FakeGithub::with_previous_release();
@@ -644,8 +627,7 @@ fn the_adopted_source_release_takes_latest_only_after_its_appcast_pair() {
     );
 }
 
-/// This cut's upload names in the order the sequence sends them (the rank sort, stable
-/// like the live one).
+/// This cut's upload names in the order the sequence sends them (the stable rank sort).
 fn ranked_upload_names(files: &[PathBuf]) -> Vec<String> {
     let mut names: Vec<String> = files
         .iter()
@@ -655,12 +637,10 @@ fn ranked_upload_names(files: &[PathBuf]) -> Vec<String> {
     names
 }
 
-/// The first pass of the adopt path, dying on the appcast signature's upload POST the
-/// way `failure` says — every binary already on the adopted prerelease, the appcast pair
-/// not. Whatever the failure, until the PATCH nothing about the channel head has moved:
-/// `latest` and the evergreen pointer still name the previous app release, no PATCH was
-/// sent, the source release is still a prerelease no client can elect, and the appcast
-/// never went up. Returns the uploads the pass attempted.
+/// The adopt path's first pass, dying on the appcast signature's upload POST as `failure`
+/// says, with every binary already up. Until the PATCH nothing about the head has moved:
+/// `latest` and the evergreen pointer name the previous release, the source release is still a
+/// prerelease, and the appcast never went up. Returns the uploads the pass attempted.
 fn first_pass_dies_on_the_signature(
     github: &mut FakeGithub,
     id: usize,
@@ -715,21 +695,13 @@ fn first_pass_dies_on_the_signature(
     first_pass
 }
 
-/// A FAILURE BEFORE THE HEAD PATCH COSTS THE FLEET NOTHING, AND WHEN THE POST PROVABLY
-/// CREATED NOTHING THE RESUME FLIPS ONCE. Two failures the cutter can prove created no
-/// object — curl refusing its own arguments (exit 2, nothing sent) and an answered 4xx —
-/// retract the durable upload intent (`publish::post_outcome`, the verdict the live
-/// `upload_channel_asset` settles by). The resume re-binds the same release, re-sends
-/// the whole ranked sequence (every earlier upload a same-bytes no-op, never a second
-/// object), puts the pair up signature-first, and sends the head PATCH exactly once over
-/// both passes.
+/// A failure before the head PATCH costs the fleet nothing, and when the POST provably created
+/// nothing (curl's exit 2, an answered 4xx) its intent is retracted and the resume flips once:
+/// it re-binds the same release, re-sends the ranked sequence (same-bytes no-ops), puts the
+/// pair up signature-first and sends one head PATCH over both passes.
 ///
-/// NEGATIVE CONTROL: a 5xx can hide a stored object, so its intent stands and the resume
-/// refuses a duplicate POST (`durable_post_decision(true, false)`) — the fake is capable
-/// of the wedge, so the rows above are earned by the verdict, not by a fake that
-/// re-POSTs whatever it is asked. The wedge is as harmless to the fleet as the rest: no
-/// PATCH, `latest` and the pointer stay on the previous release, and `--abandon`
-/// (`an_abandon_withdraws_the_cuts_assets_and_leaves_the_source_release`) is the exit.
+/// Negative control: a 5xx can hide a stored object, so its intent stands and every resume
+/// refuses a duplicate POST, with nothing moved; `--abandon` is the exit.
 #[test]
 fn a_failure_before_the_head_patch_leaves_latest_and_a_provable_one_flips_once_on_resume() {
     for failure in [UploadFailure::NeverSent, UploadFailure::Refused] {
@@ -784,7 +756,7 @@ fn a_failure_before_the_head_patch_leaves_latest_and_a_provable_one_flips_once_o
         assert!(github.exposures.is_empty(), "{:?}", github.exposures);
     }
 
-    // The control: a 5xx keeps the intent, so no resume re-POSTs — and nothing moves.
+    // The control: a 5xx keeps the intent, so no resume re-POSTs, and nothing moves.
     let mut github = FakeGithub::with_previous_release();
     let id = github.source_release(true);
     let (_dir, files, local_appcast) = dist();
@@ -817,18 +789,11 @@ fn a_failure_before_the_head_patch_leaves_latest_and_a_provable_one_flips_once_o
     }
 }
 
-/// AN UPLOAD THE SERVER REFUSED CAN STILL FIND ITS OBJECT THERE, AND THEN THE JOURNAL
-/// MUST NAME IT. `422 already_exists` is a 4xx, so the cutter retracts the intent of a
-/// refused POST before it probes (`CutCtx::settle_upload_intent`) — and an object that is
-/// nevertheless on the release, one nobody journaled, would be an app asset no intent names:
-/// `--abandon` (`channel::withdrawable_assets`, over the journal's intents) could not take it
-/// back, and a recut would refuse the release for carrying it. `after_upload_post` — the
-/// cutter's own decision, read by this fake — converges on it and has the journal name it
-/// again. A 5xx that hid a stored object converges the same way with no journal write at
-/// all: its intent was never retracted.
-///
-/// Whatever the failure, the cut then completes, and EVERY app asset on the release is one
-/// `--abandon` withdraws — the property that makes an unnamed object a defect.
+/// A refused upload can still find its object there, and the journal must then name it:
+/// `422 already_exists` is a 4xx, so the refused POST's intent is retracted before the probe,
+/// and an unjournaled object could not be withdrawn by `--abandon`. `after_upload_post`
+/// converges on it and re-journals it; a 5xx that hid a stored object converges with its intent
+/// never retracted. Either way every app asset on the release is one `--abandon` withdraws.
 #[test]
 fn a_refused_upload_whose_object_is_there_is_converged_and_still_named_by_the_journal() {
     for failure in [
@@ -876,11 +841,9 @@ fn a_refused_upload_whose_object_is_there_is_converged_and_still_named_by_the_jo
     }
 }
 
-/// GitHub recomputes `latest` behind a cache: on v0.93.0 the pointer still named the
-/// previous release after the ten anonymous probes and named the cut a minute later, so a
-/// release already live failed its own gate. The pointer gate waits on its own bound —
-/// a lag past the old ten attempts converges — and a pointer that never moves is still
-/// refused, after exactly that bound.
+/// GitHub recomputes `latest` behind a cache, so the pointer gate waits on its own bound
+/// (`POINTER_PROBE_ATTEMPTS`): a lag past ten probes converges, and a pointer that never moves
+/// is refused after exactly that bound.
 #[test]
 fn a_pointer_github_recomputes_slowly_is_waited_for_within_its_own_bound() {
     let mut github = FakeGithub::with_previous_release();
@@ -935,9 +898,8 @@ fn a_pointer_github_recomputes_slowly_is_waited_for_within_its_own_bound() {
     assert_eq!(slept.len(), publish::POINTER_PROBE_ATTEMPTS as usize - 1);
 }
 
-/// NEGATIVE CONTROL — the adopt path as it was: no head PATCH. The prerelease stays
-/// a prerelease, the pointer stays on the previous release, and the cutter's gate
-/// refuses: the adopt path passed only because of the steal.
+/// Negative control: an adopt path with no head PATCH leaves the prerelease a prerelease and
+/// the pointer on the previous release, and the pointer gate refuses.
 #[test]
 fn without_the_head_patch_the_pointer_gate_refuses() {
     let mut github = FakeGithub::with_previous_release();
@@ -955,13 +917,10 @@ fn without_the_head_patch_the_pointer_gate_refuses() {
     assert!(github.releases[id].prerelease);
 }
 
-/// Why the engine creates the source release as a prerelease: as a full release it
-/// takes `latest` at creation, before the cut has put anything on it — the window
-/// every updater 302'd into. The exposure detector sees it (non-vacuity). The cutter
-/// does not trust the engine to have read `BINARY_CUT_FOLLOWS_DEFAULT`: it REFUSES to
-/// adopt a full source release (`channel::unclaimed_source_is_prerelease`), before the
-/// bind — nothing bound, uploaded or patched. The remedy the refusal names (mark it a
-/// prerelease, the pointer returns to the previous release) lets the resume converge.
+/// A full source release takes `latest` at creation, before the cut has put anything on it
+/// (hence the engine's prerelease). The cutter refuses to adopt one
+/// (`channel::unclaimed_source_is_prerelease`) before the bind, and after the remedy the
+/// refusal names (mark it a prerelease) the resume converges.
 #[test]
 fn a_full_source_release_steals_latest_before_the_cut_and_the_cut_refuses_to_adopt_it() {
     let mut github = FakeGithub::with_previous_release();
@@ -985,8 +944,7 @@ fn a_full_source_release_steals_latest_before_the_cut_and_the_cut_refuses_to_ado
     );
     assert!(github.head_patches.is_empty());
 
-    // The remedy: mark it a prerelease; GitHub hands `latest` back to the newest full
-    // release, the previous app release.
+    // The remedy: mark it a prerelease, and GitHub hands `latest` back to the previous release.
     github.releases[id].prerelease = true;
     github.latest = Some(0);
     let mut channel = FakeChannel::new(&mut github, id, local_appcast, files);
@@ -995,15 +953,10 @@ fn a_full_source_release_steals_latest_before_the_cut_and_the_cut_refuses_to_ado
     assert_eq!(github.latest, Some(id));
 }
 
-/// WHAT THAT REFUSAL PROTECTS — the negative control, over the cutter's own classifier.
-/// Adopted anyway, a FULL source release is the channel's PUBLISHED app release
-/// ([`verify::ReleaseState::Published`]: not a prerelease, carrying an appcast) the moment
-/// the appcast lands — with every upload of the cut done, and no proof of them, no second
-/// floor read and no head PATCH yet. That is the state `--abandon` refuses (a floor
-/// refusal after it can no longer be withdrawn) and the state a resume's `head_made`
-/// reads as "the head is made" (it would skip the proof and the floor). The prerelease
-/// the engine makes holds [`verify::ReleaseState::Unpublished`] through the same uploads,
-/// until the PATCH.
+/// What that refusal protects: adopted anyway, a full source release is
+/// [`verify::ReleaseState::Published`] the moment the appcast lands, before any proof, second
+/// floor read or head PATCH, a state `--abandon` refuses and `head_made` reads as made. The
+/// engine's prerelease stays [`verify::ReleaseState::Unpublished`] until the PATCH.
 #[test]
 fn adopting_a_full_source_release_would_publish_it_before_any_proof() {
     for prerelease in [true, false] {
@@ -1050,9 +1003,8 @@ fn the_prerelease_flag_parses_exactly() {
     }
 }
 
-/// NEGATIVE CONTROL for the ordering: a head PATCH sent before the appcast pair is up
-/// exposes a head with nothing to install, and the pointer gate cannot fetch an
-/// appcast that is not there.
+/// Negative control for the ordering: a head PATCH before the appcast pair is up exposes a head
+/// with nothing to install, and the pointer gate cannot fetch the missing appcast.
 #[test]
 fn a_head_patch_before_the_appcast_pair_exposes_an_empty_head() {
     let mut github = FakeGithub::with_previous_release();
@@ -1080,8 +1032,8 @@ fn a_head_patch_before_the_appcast_pair_exposes_an_empty_head() {
     );
 }
 
-/// The draft path — a channel with no source release (a repo without `pub publish`)
-/// — runs the same sequence and the same PATCH, and the draft is invisible until it.
+/// The draft path (no source release, a repo without `pub publish`) runs the same sequence and
+/// PATCH, and the draft is invisible until it.
 #[test]
 fn a_draft_this_cut_created_becomes_latest_through_the_same_patch() {
     let mut github = FakeGithub::with_previous_release();
@@ -1095,12 +1047,10 @@ fn a_draft_this_cut_created_becomes_latest_through_the_same_patch() {
     assert!(github.exposures.is_empty(), "{:?}", github.exposures);
 }
 
-/// The head ratchet's table, over the fake: an older head passes, this cut passes
-/// (an idempotent re-send), an empty channel passes; a newer tag, an equal tag
-/// order, or an older tag carrying a build that is not lower all refuse. A cut OWNS
-/// `latest`, so it must never take it from a NEWER release (`make_latest` obeys no
-/// version order); the whole cut refusing there, before the bind, is
-/// `a_newer_head_conforms_as_the_models_refusal`.
+/// The head ratchet's table: an older head, this cut (an idempotent re-send) and an empty
+/// channel pass; a newer tag, an equal tag order, or an older tag with a build not lower
+/// refuse. `make_latest` obeys no version order, so a cut must never take `latest` from a newer
+/// release.
 #[test]
 fn the_head_ratchet_orders_by_tag_and_by_build() {
     let decide = |github: &FakeGithub| {
@@ -1139,20 +1089,19 @@ fn the_head_ratchet_orders_by_tag_and_by_build() {
     let err = decide(&higher_build).expect_err("an older tag with a build not below ours");
     assert!(err.to_string().contains("not below this cut's"), "{err}");
 
-    // An older source-only FULL release left holding `latest` (a publish before source
-    // releases were prereleases, with no cut after it) serves no appcast: no app head.
+    // An older source-only full release holding `latest` serves no appcast: no app head.
     let mut stranded = FakeGithub::with_previous_release();
     stranded.create("v0.90.5", false, false, &["SHA256SUMS", "SHA256SUMS.sig"]);
     decide(&stranded).expect("an older release with no appcast is no head to protect");
-    // …but a NEWER one is refused on its tag before anything is fetched.
+    // …but a newer one is refused on its tag before anything is fetched.
     let mut stranded_newer = FakeGithub::with_previous_release();
     stranded_newer.create("v0.92.0", false, false, &["SHA256SUMS", "SHA256SUMS.sig"]);
     decide(&stranded_newer).expect_err("a newer tag is refused whatever it carries");
 }
 
-/// A cut whose first pass fails after its head PATCH: the pointer gate's bound runs out
-/// while GitHub's `releases/latest` cache still names the previous release (v0.93.0).
-/// Returns the release's asset bytes as the PATCH left them.
+/// A first pass that fails after its head PATCH: the pointer gate's bound runs out while
+/// GitHub's `releases/latest` cache still names the previous release. Returns the release's
+/// asset bytes as the PATCH left them.
 fn first_pass_fails_at_the_pointer_gate(
     github: &mut FakeGithub,
     id: usize,
@@ -1173,11 +1122,9 @@ fn first_pass_fails_at_the_pointer_gate(
     github.releases[id].assets.clone()
 }
 
-/// A HEAD THE CUT MADE IS FINISHED, NEVER REFUSED. The first pass's PATCH landed and its
-/// pointer gate ran out; a roster join since re-dressed the head with generation N+1,
-/// and this cut's signed appcast carries N. The resume sees its head is made: no roster
-/// floor read to refuse it, no upload to roll the join's roster back — only the PATCH,
-/// re-sent (idempotent), and the read side — and it passes.
+/// A head the cut made is finished, never refused: after its PATCH landed and the pointer gate
+/// ran out, a roster join re-dressed the head with a newer generation. The resume reads no
+/// floor and uploads nothing; it re-sends the idempotent PATCH, proves the read side, and passes.
 #[test]
 fn a_resume_after_the_head_patch_uploads_nothing_and_reads_no_roster_floor() {
     let mut github = FakeGithub::with_previous_release();
@@ -1204,9 +1151,9 @@ fn a_resume_after_the_head_patch_uploads_nothing_and_reads_no_roster_floor() {
     assert!(github.exposures.is_empty(), "{:?}", github.exposures);
 }
 
-/// NEGATIVE CONTROL — the resume before 2026-09-26, which re-entered the write half over
-/// a head it made: the floors read again refuse a release the fleet already runs, and
-/// with `--abandon` refusing a published release nothing could release the lease.
+/// Negative control: a resume that re-enters the write half over a head it made has the floors
+/// refuse a release the fleet already runs, and `--abandon` refuses a published release, so
+/// nothing could release the lease.
 #[test]
 fn a_resume_that_forgets_its_head_is_refused_by_the_join_since() {
     let mut github = FakeGithub::with_previous_release();
@@ -1228,10 +1175,9 @@ fn a_resume_that_forgets_its_head_is_refused_by_the_join_since() {
     );
 }
 
-/// A non-app release holding `latest` (an `atpkg-index-<n>` cut published as a full
-/// release) leaves the channel with no app head: the head ratchet lets the cut take
-/// `latest` from it, and the pointer gate — which demands the pointer name THIS cut —
-/// refuses it until the cut has.
+/// A non-app release holding `latest` (an `atpkg-index-<n>` full release) is no app head: the
+/// head ratchet lets the cut take `latest` from it, and the pointer gate, which demands this
+/// cut, refuses until it has.
 #[test]
 fn a_non_app_release_holding_latest_is_taken_over() {
     let mut github = FakeGithub::with_previous_release();
@@ -1258,9 +1204,7 @@ fn a_non_app_release_holding_latest_is_taken_over() {
     assert_eq!(github.latest, Some(id));
 }
 
-// ---------------------------------------------------------------------------
-// The head PATCH body, as sent
-// ---------------------------------------------------------------------------
+// --- the head PATCH body, as sent ------------------------------------------
 
 /// The live PATCH's argv, byte for byte: `-F` for the two JSON booleans, `-f` for
 /// `make_latest`, which GitHub types as a string enum.
@@ -1283,11 +1227,9 @@ fn the_live_head_patch_sends_exactly_the_table() {
     );
 }
 
-/// NEGATIVE CONTROL for the PATCH BODY. The fake applies only the fields it is sent,
-/// so the cutter's table minus `prerelease=false` leaves the adopted source release a
-/// prerelease, GitHub moves nothing, and the cutter's own pointer gate refuses the cut.
-/// A draft this cut created is no prerelease, so the same body still passes there: the
-/// field exists for the adopt path, which is the path every aterm cut takes.
+/// Negative control for the PATCH body: without `prerelease=false` the adopted source release
+/// stays a prerelease, GitHub moves nothing, and the pointer gate refuses the cut. A draft this
+/// cut created is no prerelease, so the same body passes there.
 #[test]
 fn without_prerelease_false_the_adopted_release_never_becomes_latest() {
     let without_prerelease: Vec<_> = channel::HEAD_PATCH
@@ -1321,12 +1263,11 @@ fn without_prerelease_false_the_adopted_release_never_becomes_latest() {
     assert_eq!(github.latest, Some(id));
 }
 
-/// THE OPT-IN TRAVELS WITH THE CUTTER. The engine creates the source release as a
-/// prerelease only for a tree whose committed `publish/config.sh` declares
-/// `BINARY_CUT_FOLLOWS_DEFAULT="true"`, read at the commit it publishes; what makes that
-/// prerelease safe is this tree's head PATCH flipping it. So this tree holds both: the
-/// declaration, in the one form the engine reads (`^KEY_DEFAULT="value"$`), and a PATCH
-/// that sends `prerelease=false`. Dropping either half fails here.
+/// The opt-in travels with the cutter: the engine creates the source release as a prerelease
+/// only for a tree whose committed `publish/config.sh` declares
+/// `BINARY_CUT_FOLLOWS_DEFAULT="true"`, and this tree's head PATCH is what flips it. This tree
+/// holds both halves: the declaration in the one form the engine reads (`^KEY_DEFAULT="value"$`)
+/// and a PATCH sending `prerelease=false`.
 #[test]
 fn the_tree_that_declares_binary_cut_follows_flips_the_prerelease() {
     fn declared(config: &str) -> Vec<&str> {
@@ -1344,8 +1285,7 @@ fn the_tree_that_declares_binary_cut_follows_flips_the_prerelease() {
         channel::HEAD_PATCH.contains(&("prerelease", HeadPatchValue::Bool(false))),
         "a tree that opts in must flip the prerelease it is given"
     );
-    // The matcher is not vacuous: a config without the line declares nothing, and
-    // any other value reads back as itself.
+    // The matcher is not vacuous.
     assert!(
         declared("STAGING_REMOTE_DEFAULT=\"x\"\n# BINARY_CUT_FOLLOWS_DEFAULT=\"true\"\n")
             .is_empty()
@@ -1356,16 +1296,12 @@ fn the_tree_that_declares_binary_cut_follows_flips_the_prerelease() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Adopting a release the journal holds no intent for
-// ---------------------------------------------------------------------------
+// --- adopting a release the journal holds no intent for --------------------
 
-/// The adoption table. A release under this cut's tag that the journal holds no intent
-/// for is adopted ONLY as the engine's source release — with or without its roster pair,
-/// or still empty. NEGATIVE rows, each another cut's release that must never be adopted:
-/// a complete app release under this tag (every name this cut publishes, which no
-/// journal of this cut claims), a partial one, another version's DMG, and a retired
-/// container. Refused by name, before a byte is fetched.
+/// The adoption table: a release under this cut's tag that the journal holds no intent for is
+/// adopted only as the engine's source release (with or without its roster pair, or empty).
+/// The negative rows (another cut's complete or partial app release, another version's DMG, a
+/// retired container) are refused by name before a byte is fetched.
 #[test]
 fn an_unclaimed_release_is_adopted_only_as_the_source_release() {
     let elected = channel::required_asset_names(VERSION, true, true);
@@ -1429,14 +1365,11 @@ fn an_unclaimed_release_is_adopted_only_as_the_source_release() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tier-1: the real sequence, stepped through the derived `ReleasePublishOnce`
-// ---------------------------------------------------------------------------
+// --- Tier-1: the real sequence, stepped through the derived `ReleasePublishOnce` ---
 
-/// [`FakeChannel`] with every call the real sequence makes stepped through the derived
-/// model, and the fake GitHub's state projected onto the model's variables after every
-/// step and every stutter. A call the model does not enable, or a projection that
-/// disagrees with the model, is recorded and fails the call.
+/// [`FakeChannel`] with every call stepped through the derived model and the fake's state
+/// projected onto the model's variables after each step and stutter; a call the model does not
+/// enable, or a projection that disagrees, fails the call.
 struct ModelBound<'g> {
     inner: FakeChannel<'g>,
     model: aterm_spec::derive::Model,
@@ -1539,8 +1472,7 @@ impl ModelBound<'_> {
 impl ChannelRelease for ModelBound<'_> {
     fn head_made(&mut self) -> Result<bool> {
         let made = self.inner.head_made()?;
-        // The real predicate against the model's history, both ways: the resume finishes
-        // exactly the heads the cut made.
+        // The real predicate against the model's history, both ways.
         if made != (self.state["headed"] == 1) {
             return Err(Error::new(format!(
                 "Tier-1: head_made answered {made}, but the model has headed={}",
@@ -1599,8 +1531,8 @@ impl ChannelRelease for ModelBound<'_> {
 
     fn make_head(&mut self) -> Result<()> {
         self.inner.make_head()?;
-        // One PATCH, two model actions: the head PATCH, or — over a head this cut
-        // already made (`head_made` agreed with the model's `headed`) — its re-send.
+        // One PATCH, two model actions: the head PATCH, or its re-send over a head this cut
+        // already made.
         if self.state["headed"] == 1 {
             self.step("ReassertHead")
         } else {
@@ -1648,11 +1580,9 @@ fn model_bound<'g>(
     bound
 }
 
-/// TIER-1. The real `publish_on_channel`, against the fake, conforms to the derived
-/// model step for step: the ratchet, the bind, the signature, the appcast, the proof,
-/// the ratchet again, the head PATCH, the stranger's view — every one enabled where it
-/// was taken, and the fake's `latest`, prerelease flag, release, journal, roster and
-/// appcast pair equal to the model's after each.
+/// Tier-1: the real `publish_on_channel` against the fake conforms to the derived model step
+/// for step, each step enabled where taken and the fake's `latest`, prerelease flag, release,
+/// journal, roster and appcast pair equal to the model's after each.
 #[test]
 fn the_real_sequence_conforms_to_the_derived_head_model() {
     let mut github = FakeGithub::with_previous_release();
@@ -1676,8 +1606,8 @@ fn the_real_sequence_conforms_to_the_derived_head_model() {
     assert_eq!(bound.state["phase"], 6);
 }
 
-/// TIER-1, the refusal: a newer release holding `latest` is the model's
-/// `RefuseNewer`, taken by the real ratchet on its first call.
+/// Tier-1, the refusal: a newer release holding `latest` is the model's `RefuseNewer`, taken by
+/// the real ratchet on its first call.
 #[test]
 fn a_newer_head_conforms_as_the_models_refusal() {
     let mut github = FakeGithub::with_previous_release();
@@ -1692,13 +1622,10 @@ fn a_newer_head_conforms_as_the_models_refusal() {
     assert_eq!(github.binds, 0, "the refused cut bound nothing");
 }
 
-/// TIER-1, THE RESUME AFTER THE HEAD. The first pass is the model's up to `MakeHead`;
-/// its pointer gate runs out (no model step: the cut stops, the journal stays at
-/// `publish`); an `atpkg-index` full release takes `latest` (`OtherTakesLatest`) and a
-/// join re-dresses the channel (`RosterJoin` in phase 3); and the resume — a new process,
-/// the model's state carried over — answers `head_made` exactly as the model's `headed`
-/// does, and takes `ReassertHead` and `ProveHead` alone. NEGATIVE CONTROL: the resume
-/// that forgets its head disagrees with the model at the first question it asks.
+/// Tier-1, the resume after the head: the first pass runs to `MakeHead` and its pointer gate
+/// runs out; a full release takes `latest` (`OtherTakesLatest`) and a join re-dresses the
+/// channel (`RosterJoin`); the resume answers `head_made` as the model's `headed` and takes
+/// `ReassertHead` and `ProveHead` alone. Negative control: a resume that forgets its head.
 #[test]
 fn a_resume_after_the_head_conforms_as_the_models_proof_alone() {
     for forget_head in [false, true] {
@@ -1748,12 +1675,10 @@ fn a_resume_after_the_head_conforms_as_the_models_proof_alone() {
     }
 }
 
-/// TIER-1, THE SECOND FLOOR READ. A join lands while the cut uploads (after the
-/// signature, before the appcast); the read after the proof is the model's
-/// `RefuseFloor`, from a release carrying every upload but not yet the head. The
-/// `--abandon` that follows withdraws exactly those uploads — the real
-/// `channel::withdrawable_assets` over the fake's upload log — and conforms to the
-/// model's `Abandon` from the refusal, the engine's release left as it made it.
+/// Tier-1, the second floor read: a join lands while the cut uploads (after the signature,
+/// before the appcast), so the read after the proof is the model's `RefuseFloor`. The
+/// `--abandon` that follows withdraws exactly those uploads (`channel::withdrawable_assets`
+/// over the fake's upload log) and conforms to the model's `Abandon`.
 #[test]
 fn a_join_during_the_uploads_is_refused_by_the_second_read_and_withdrawn() {
     let mut github = FakeGithub::with_previous_release();
@@ -1800,17 +1725,10 @@ fn a_join_during_the_uploads_is_refused_by_the_second_read_and_withdrawn() {
     assert!(bound.inner.github.releases[id].prerelease);
 }
 
-/// NEGATIVE CONTROLS: the binding catches what it exists to catch.
-/// * the bind before the floors (the adopt path before 2026-09-23 persisted the
-///   adoption and bound the release first) takes a `Bind` the model disables;
-/// * the upload order the sequence would have without its rank sort (alphabetical:
-///   the appcast before its signature) takes an `UploadToml` the model disables;
-/// * a head PATCH over bytes nothing proved — what the origin's verify stood in front
-///   of while a cut published twice — takes a `MakeHead` the model disables;
-/// * a head PATCH on the floor read BEFORE the uploads, a join having landed since,
-///   takes a `MakeHead` the model disables;
-/// * the adopt path before 2026-09-23 (no head PATCH reaching GitHub) leaves the fake's
-///   `latest` where the model says the head PATCH moved it.
+/// Negative controls: the binding refuses the bind before the floors (`Bind`), the appcast
+/// uploaded before its signature (`UploadToml`), a head PATCH over unproved bytes or on a floor
+/// read a join has since overtaken (`MakeHead`), and a head PATCH that never reaches GitHub
+/// (the fake's `latest` disagrees with the model's).
 #[test]
 fn the_tier1_binding_refuses_the_pre_fix_orders() {
     let (_dir, files, local_appcast) = dist();
@@ -1897,13 +1815,11 @@ fn the_tier1_binding_refuses_the_pre_fix_orders() {
     );
 }
 
-/// TIER-1, the abandon. A cut that never made its release the head withdraws exactly
-/// what it uploaded — the real `channel::withdrawable_assets` over its journal's upload
-/// intents — and the fake then projects onto the model's `Abandon`: the engine's release
-/// is still there, still a prerelease, and carries none of the cut's app assets (the
-/// source shapes stay). NEGATIVE CONTROL: deleting the release instead — what abandon
-/// did to the private origin's draft while a cut published twice — leaves the fake with
-/// no release where the model keeps the engine's.
+/// Tier-1, the abandon: a cut that never made its release the head withdraws exactly what it
+/// uploaded (`channel::withdrawable_assets` over its journal's upload intents), and the fake
+/// projects onto the model's `Abandon`: the engine's release is still there, still a
+/// prerelease, with only its source shapes. Negative control: deleting the release instead
+/// leaves no release where the model keeps the engine's.
 #[test]
 fn an_abandon_withdraws_the_cuts_assets_and_leaves_the_source_release() {
     for delete_instead in [false, true] {

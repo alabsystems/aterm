@@ -9,35 +9,35 @@ use crate::line::{
 use crate::{ScrollbackError, decompress_lz4_bounded};
 
 impl WarmTier {
-    /// Resolve a PHYSICAL line index to `(block_idx, line_in_block)`.
-    ///
-    /// The single home for the cumulative-index geometry, shared by the
-    /// random-access read path (`get_line`) and the block-streaming bulk
+    /// Resolve a physical line index to `(block_idx, line_in_block)`: the one
+    /// home of the cumulative-index geometry, shared by `get_line` and the bulk
     /// path (`take_lines_from`/`segment_len_at`) so the two cannot drift.
-    // Skip: same guarded-index class as `get_line`, which this was factored
-    // from. total `get` + saturating: `find_block` returned an in-range
-    // index and `block_start <= physical_idx` by construction; the verifier
-    // cannot chain either fact. The unreachable arms yield the same values.
+    // Skip: same guarded-index class as `get_line`. `find_block` returned an
+    // in-range index and `block_start <= physical_idx` by construction; the
+    // verifier cannot chain either fact, so `get` + saturating stand in.
     #[cfg_attr(trust_verify, trust::skip)]
     pub(super) fn locate(&self, physical_idx: usize) -> Option<(usize, usize)> {
         let block_idx = self.find_block(physical_idx)?;
         let block_start = if block_idx == 0 {
-            0
+            self.cumulative_base
         } else {
-            self.cumulative_lines
+            self.live_cumulative()
                 .get(block_idx.saturating_sub(1))
                 .copied()
-                .unwrap_or(0)
+                .unwrap_or(self.cumulative_base)
         };
-        Some((block_idx, physical_idx.saturating_sub(block_start)))
+        Some((
+            block_idx,
+            physical_idx
+                .saturating_add(self.cumulative_base)
+                .saturating_sub(block_start),
+        ))
     }
 
-    /// Decode the block containing logical line `idx` and return OWNED lines
-    /// from `idx` through the end of that block — the bulk-walk primitive
-    /// (ST-6). One decode per block, splitting only a partial prefix: no
-    /// per-line binary search or `Line` clone, and NO touch of the render-path
-    /// block cache. Quarantined blocks error without a doomed decode,
-    /// exactly like `get_line`.
+    /// Decode the block containing logical line `idx` and return owned lines
+    /// from `idx` to the end of that block: the bulk-walk primitive. One decode
+    /// per block, no per-line search or clone, and no touch of the render-path
+    /// block cache. A quarantined block errors without a decode, like `get_line`.
     ///
     /// Returns an empty vec for an out-of-bounds `idx`.
     // Skip: the block lookup + decode path — same class as `get_line`.
@@ -46,8 +46,7 @@ impl WarmTier {
         if idx >= self.line_count {
             return Ok(Vec::new());
         }
-        // Saturating: bounded by the tier's line totals — exact on every
-        // real path (see get_line).
+        // Saturating: bounded by the tier's line totals, so exact on real paths.
         let physical_idx = idx.saturating_add(self.front_offset);
         let Some((block_idx, line_in_block)) = self.locate(physical_idx) else {
             return Err(ScrollbackError::Io(std::io::Error::new(
@@ -67,9 +66,8 @@ impl WarmTier {
             return Err(ScrollbackError::Quarantined(block.line_count()));
         }
         let mut lines = block.decompress()?;
-        // A sequential walk enters every full block at zero. Move the decoded
-        // buffer straight out: split_off(0) preserves the source capacity and
-        // allocates a spare buffer that this function immediately discards.
+        // A sequential walk enters every full block at zero: hand back the
+        // decoded buffer as is (`split_off(0)` would allocate a spare).
         if line_in_block == 0 {
             return Ok(lines);
         }
@@ -80,10 +78,9 @@ impl WarmTier {
         Ok(lines.split_off(split_at))
     }
 
-    /// Logical lines from `idx` through the end of its containing block —
-    /// how far a bulk walk skips when that block fails to decode (its whole
-    /// remaining span, matching the per-line skip total of the old
-    /// line-at-a-time walk). Zero when out of bounds. Never decodes.
+    /// Logical lines from `idx` to the end of its containing block: how far a
+    /// bulk walk skips when that block fails to decode. Zero when out of bounds.
+    /// Never decodes.
     // Skip: same guarded-index class as `locate`.
     #[cfg_attr(trust_verify, trust::skip)]
     pub(crate) fn segment_len_at(&self, idx: usize) -> usize {
@@ -94,9 +91,14 @@ impl WarmTier {
         let Some((block_idx, _)) = self.locate(physical_idx) else {
             return 0;
         };
-        let block_end = self.cumulative_lines.get(block_idx).copied().unwrap_or(0);
+        let block_end = self
+            .live_cumulative()
+            .get(block_idx)
+            .copied()
+            .unwrap_or(self.cumulative_base)
+            .saturating_sub(self.cumulative_base);
         // Physical block end -> logical, clamped by the tier's logical count
-        // (the last block's physical end IS the logical end), minus `idx`.
+        // (the last block's physical end is the logical end), minus `idx`.
         block_end
             .saturating_sub(self.front_offset)
             .min(self.line_count)
@@ -112,10 +114,8 @@ impl WarmBlock {
                 "warm block serialized payload too short for count header",
             )));
         }
-        // Constant indexing under the dominating `len < 4` guard above:
-        // identical bytes to the previous `serialized[..4].try_into().expect(..)`
-        // (whose expect the strict gate cannot prove away and whose `try_into`
-        // it cannot lower).
+        // Constant indexing under the dominating `len < 4` guard: the strict
+        // gate can neither prove away an `expect` nor lower `try_into`.
         Ok(
             u32::from_le_bytes([serialized[0], serialized[1], serialized[2], serialized[3]])
                 as usize,
@@ -151,14 +151,10 @@ impl WarmBlock {
 
         let trimmed = stored_line_count.saturating_sub(self.line_count);
         if trimmed > 0 {
-            // After a corrupt front-offset materialization we preserve the
-            // surviving logical suffix by shrinking line_count. If the block
-            // later decodes again, drop the consumed prefix lazily here.
-            // lines.len() == stored_line_count (checked above) and
-            // trimmed = stored_line_count - self.line_count <= stored_line_count,
-            // so the `.min(lines.len())` clamp never engages and the call is
-            // behavior-identical to `split_off(trimmed)`; it discharges the
-            // split_off out-of-bounds panic obligation.
+            // After a corrupt front-offset materialization the surviving suffix
+            // is kept by shrinking line_count; if the block decodes again, the
+            // consumed prefix drops here. `trimmed <= lines.len()` (checked
+            // above), so the `min` only discharges split_off's panic obligation.
             let split_at = trimmed.min(lines.len());
             lines = lines.split_off(split_at);
         }
@@ -187,16 +183,11 @@ impl WarmBlock {
         self.logical_suffix(&decompressed, stored_line_count)
     }
 
-    /// Decompress to the SERIALIZED page bytes ready for cold re-compression,
-    /// without re-serializing on every warm→cold eviction. Runs the
-    /// SAME framing validation + failure bookkeeping as [`Self::decompress`] (the
-    /// counter increments on any error; `logical_suffix` resets it + trims on
-    /// success), then: with NO front-offset trim (`stored_line_count ==
-    /// self.line_count`, the normal path) the LZ4 `decompressed` bytes ALREADY are the
-    /// serialized form of the logical lines — they just round-tripped through
-    /// `logical_suffix`'s deserialize — so reuse them; only a trimmed suffix needs a
-    /// fresh `serialize_lines`. Correctness-preserving: the reused bytes are a valid
-    /// serialization of the same lines (the cold tier deserializes them identically).
+    /// Decompress to the serialized page bytes for cold re-compression, with the
+    /// same framing validation and failure bookkeeping as [`Self::decompress`].
+    /// With no front-offset trim (the normal path) the LZ4 output already is the
+    /// serialization of the logical lines and is reused; only a trimmed suffix
+    /// is re-serialized.
     pub(crate) fn decompress_serialized_page(&self) -> Result<Vec<u8>, ScrollbackError> {
         let result = self.try_decompress_serialized();
         if result.is_err() {
@@ -210,24 +201,13 @@ impl WarmBlock {
         let decompressed = decompress_lz4_bounded(&self.compressed)?;
         let stored_line_count = Self::stored_line_count(&decompressed)?;
         if stored_line_count == self.line_count {
-            // No trim ⇒ `decompressed` ALREADY is the serialization of this
-            // block's logical lines, so the only thing wanted from them is the
-            // framing VALIDATION `logical_suffix` performs — never the
-            // `Vec<Line>` it materialized to get there and this arm then
-            // dropped. Counting complete records instead removes one full
-            // `Line` construct+destruct (heap content copy, boxed attrs `Rle`,
-            // boxed hyperlink `SmallVec`) per line, and at the default tier
-            // limits an eviction fires once per 100 pushed lines, so that
-            // amortized to a wasted malloc/free chain for EVERY line aging out
-            // of the warm tier — on the output thread.
-            //
-            // Byte-identical outcome: `count_page_lines` runs the SAME framing
-            // walk with the SAME acceptance predicate (`walk_records` +
-            // `Line::record_is_valid`, pinned to `Line::deserialize` by a
-            // debug_assert in the decoder), under the same page cap; the
-            // `stored_line_count < self.line_count` rejection is unreachable on
-            // this branch; and the error text and the `decompress_failures`
-            // reset are reproduced exactly.
+            // No trim: `decompressed` already is this block's serialization, so
+            // only the framing validation is wanted. Counting records skips a
+            // full `Line` build and drop for every line aging out of warm, on
+            // the output thread. `count_page_lines` runs the same walk and
+            // acceptance predicate as `logical_suffix`'s decode (`walk_records`,
+            // `Line::record_is_valid`) under the same page cap, with the same
+            // error text and failure-counter reset.
             let counted = count_page_lines(&decompressed, MAX_DECODE_PAGE_LINES);
             if counted != stored_line_count {
                 return Err(ScrollbackError::Io(std::io::Error::new(

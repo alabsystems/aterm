@@ -1,0 +1,28 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+#
+# docs/AUDIT-third-party-2026-10-15.md, SP.5 (serde-procmacro ruling, step 5):
+# the syn-free parser aterm's proc macros share: aterm-serde-derive's, and
+# aterm-spec-macros' since SP.8.
+
+[package]
+name = "aterm-macro-support"
+description = "A syn-free toolkit for aterm's proc macros: a token cursor, a derive-input parser, string literals, nested meta, a type reader for bound inference, and string templates that keep spans"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+# A normal library over the compiler's `proc_macro` crate. Most of it calls
+# the proc_macro bridge, which exists only while a macro runs, so the parser is
+# exercised through aterm-serde-derive's integration tests; the unit tests here
+# cover the parts that are plain string work.
+path = "src/lib.rs"
+
+[dependencies]
+# None: std `proc_macro` only. No syn, proc-macro2 or quote.
+
+[lints]
+workspace = true

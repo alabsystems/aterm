@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Test-only: decision buttons and the comet (design rulings 249–252) — a
-//! row's decision buttons pinned to the right edge with `Details ›` last at
-//! every width (ruling 252), and a moving comet that leaves the glyph cell
-//! to the row's own glyph (ruling 251).
+//! Decision buttons and the comet: a row's decision buttons pinned to the
+//! right edge with `Details ›` last at every width, and a moving comet that
+//! leaves the glyph cell to the row's own glyph.
 
 use crate::animate::{Anim, Look};
 use crate::center::MessageCenter;
@@ -54,10 +53,10 @@ fn rows_with_buttons() -> Vec<Message> {
     ]
 }
 
-/// PINNED RIGHT (ruling 252, the owner: "Pinned right"): on every width a
-/// row's buttons end exactly at the right margin, in their authored order,
-/// with `Details ›` LAST whenever it is painted — a wide window never lets
-/// them drift toward the words, and a narrow one sheds from the words first.
+/// Pinned right: on every width a row's buttons end exactly at the right
+/// margin, in their authored order, with `Details ›` last whenever it is
+/// painted; a wide window never lets them drift toward the words, and a
+/// narrow one sheds from the words first.
 #[test]
 fn a_rows_buttons_are_pinned_right_with_details_last_at_every_width() {
     for msg in rows_with_buttons() {
@@ -102,8 +101,8 @@ fn a_rows_buttons_are_pinned_right_with_details_last_at_every_width() {
 }
 
 /// A moving comet leaves the glyph cell to the row's own glyph, on every
-/// width and at every frame of a crossing (ruling 251): the comet already
-/// says the work moves, and the painter draws that glyph as an icon.
+/// width and at every frame of a crossing: the comet already says the work
+/// moves, and the painter draws that glyph as an icon.
 #[test]
 fn a_moving_comet_keeps_the_rows_own_glyph() {
     let now = Instant::now();

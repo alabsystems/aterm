@@ -1,0 +1,9 @@
+{
+  "_comment": "aterm PATHOLOGICAL-BENCH baseline: per-corpus median MB/s of Terminal::process under hostile input (yes-flood / escape-storm / style-churn / long-escapes / wide-unicode). Re-record with targo --unverified verify perf --record pathological. Each corpus fails independently iff measured < recorded * pass_ratio. Recorded 2026-07-08 on the M2 Air (dev box) — conservative for the faster bench machines; re-record on m3/m4 only with the machine idle.",
+  "yes_flood_median_mbps": 53.337,
+  "escape_storm_median_mbps": 165.828,
+  "style_churn_median_mbps": 289.338,
+  "long_escapes_median_mbps": 88.514,
+  "wide_unicode_median_mbps": 111.806,
+  "pass_ratio": 0.450
+}

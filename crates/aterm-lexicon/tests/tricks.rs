@@ -1289,6 +1289,7 @@ fn row_line_is_stable() {
         address: address.iter().map(|s| (*s).to_string()).collect(),
         gated,
         cjk: false,
+        unglued: Vec::new(),
     };
     assert_eq!(
         row_line(&row(
@@ -1325,6 +1326,8 @@ fn row_line_is_stable() {
         address: vec![],
         gated: false,
         cjk: true,
+        // It changes no role, so the listing leaves it out.
+        unglued: vec!["お座り".to_string()],
     };
     assert_eq!(
         row_line(&ja),
@@ -1839,4 +1842,112 @@ fn the_exported_code_context_set_is_the_one_the_scanner_uses() {
     for prose in ['.', ',', '!', '?', '\'', '"', '(', ')', ' ', 'a', '5'] {
         assert!(!is_code_adjacent_punct(prose), "{prose:?}");
     }
+}
+
+// ------------------------------------------- law 11: the glued reading ----
+
+#[test]
+fn an_unglued_surface_is_a_word_whole_and_no_half_of_a_run() {
+    let lex = compile(
+        r#"
+[[trick]]
+id      = "play"
+lang    = "zh"
+words   = ["玩耍", "玩具"]
+cjk     = true
+unglued = ["玩具"]
+
+[[vocative]]
+lang    = "zh"
+words   = ["猫咪", "宝宝"]
+cjk     = true
+unglued = ["宝宝"]
+"#,
+        &["all"],
+    );
+    assert!(lex.conflicts().is_empty(), "{:?}", lex.conflicts());
+    let mut scratch = String::new();
+    assert_eq!(classify(&lex, "玩具"), plain(Trick::Play));
+    assert_eq!(classify(&lex, "宝宝"), Some(TrickRole::Vocative));
+    assert_eq!(lex.classify_glued_half("玩具", &mut scratch), None);
+    assert_eq!(lex.classify_glued_half("宝宝", &mut scratch), None);
+    assert_eq!(
+        lex.classify_glued_half("玩耍", &mut scratch),
+        plain(Trick::Play)
+    );
+    assert_eq!(
+        lex.classify_glued_half("猫咪", &mut scratch),
+        Some(TrickRole::Vocative)
+    );
+    // The embedded file's third kind: a command word that, glued to the
+    // name, spells another word (`喂猫咪` feed the kitty, `แมวมอง` a scout).
+    let shipped = TrickLexicon::with_languages(&["all"]);
+    for word in ["喂", "มอง"] {
+        assert_eq!(classify(&shipped, word), address(Trick::Look), "{word}");
+        assert_eq!(
+            shipped.classify_glued_half(word, &mut scratch),
+            None,
+            "{word}"
+        );
+    }
+}
+
+#[test]
+fn an_unglued_entry_that_names_nothing_in_its_row_is_a_conflict() {
+    let lex = compile(
+        r#"
+[[trick]]
+id      = "play"
+lang    = "zh"
+words   = ["玩具"]
+cjk     = true
+unglued = ["玩县"]
+
+[[trick]]
+id      = "sit"
+lang    = "en"
+words   = ["sit"]
+unglued = ["sit"]
+"#,
+        &["all"],
+    );
+    assert!(
+        conflict_naming(&lex, "玩县").is_some(),
+        "{:?}",
+        lex.conflicts()
+    );
+    assert!(
+        conflict_naming(&lex, "\"sit\"").is_some(),
+        "a spaced row has no glued reading: {:?}",
+        lex.conflicts()
+    );
+    assert_eq!(
+        lex.classify_glued_half("玩具", &mut String::new()),
+        plain(Trick::Play),
+        "the typo marked nothing"
+    );
+}
+
+#[test]
+fn one_claimant_keeping_a_surface_out_of_the_glued_reading_keeps_it_out() {
+    let lex = compile(
+        r#"
+[[trick]]
+id      = "paw"
+lang    = "zh"
+words   = ["握手"]
+cjk     = true
+
+[[trick]]
+id      = "paw"
+lang    = "ja"
+words   = ["握手"]
+cjk     = true
+unglued = ["握手"]
+"#,
+        &["all"],
+    );
+    assert!(lex.conflicts().is_empty(), "{:?}", lex.conflicts());
+    assert_eq!(classify(&lex, "握手"), plain(Trick::Paw));
+    assert_eq!(lex.classify_glued_half("握手", &mut String::new()), None);
 }

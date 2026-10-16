@@ -39,7 +39,7 @@ static FLOOR: OnceLock<Mutex<HashMap<u64, Bucket>>> = OnceLock::new();
 /// floor is exhausted. Refills from the wall clock since the last call.
 #[must_use]
 pub(crate) fn allow(session: u64, nbytes: usize) -> bool {
-    let now = Instant::now(); // CLOCK-EXEMPT: control-layer rate limiter, not engine state
+    let now = Instant::now(); // control-layer rate limiter, not engine state
     // A named local so the lock-order census resolves this acquisition to the
     // `floor` identity (`forget` uses the same name).
     let floor = FLOOR.get_or_init(|| Mutex::new(HashMap::new()));

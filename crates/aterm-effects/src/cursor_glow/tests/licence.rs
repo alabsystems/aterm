@@ -80,12 +80,12 @@ fn rainbow_ribbon_survives_a_three_per_frame_mash() {
     for frame in 0..4usize {
         let base_col = (frame * 3) as u16;
         let frame_t = t0 + Duration::from_millis(frame as u64 * 16 + 1);
-        // THREE presses inside one frame slip, each banking its own cell
+        // Three presses inside one frame slip, each banking its own cell
         // credit at the input boundary.
         for k in 0..3usize {
             glow.note_typed_cells(frame_t + Duration::from_millis(k as u64 * 3), 1);
         }
-        // ONE coalesced echo batch materializes all three glyphs and one
+        // One coalesced echo batch materializes all three glyphs and one
         // rendered frame observes it.
         stored.extend_from_slice(&glyphs[frame * 3..frame * 3 + 3]);
         let probe_at = frame_t + Duration::from_millis(12);
@@ -109,7 +109,7 @@ fn rainbow_ribbon_survives_a_three_per_frame_mash() {
         tally.licensed, 4,
         "each frame's coalesced echo is one licensed move. Observed: [{observed}]"
     );
-    // The ribbon CLIMBS across the mash: every frame ends with more live
+    // The ribbon climbs across the mash: every frame ends with more live
     // typing sparks than the one before, and 12 presses leave a long band.
     for pair in segments_by_frame.windows(2) {
         assert!(
@@ -290,8 +290,8 @@ fn the_real_glow_engine_conforms_to_the_licence_model() {
     assert_eq!(seeded["resident"], 0, "and no light");
     assert_eq!(seeded["spawns"], 0, "a seed tick is not a move");
 
-    // PRESS: the host prices the keystroke at the input boundary; the stamp
-    // it writes IS the licence.
+    // Press: the host prices the keystroke at the input boundary; the stamp
+    // it writes is the licence.
     let press_at = t0 + Duration::from_millis(4);
     glow.note_typed_cells(press_at, 1);
     let armed = project(&glow, press_at, 1, 0, 0);
@@ -299,8 +299,8 @@ fn the_real_glow_engine_conforms_to_the_licence_model() {
     assert_eq!(armed["spent"], 0, "the press's credit is in flight");
     bind(&seeded, &armed, "PressArmsLicense", "CursorGlow press");
 
-    // ECHO: the child echoes the glyph, the caret advances, and the move is
-    // licensed — light is born and the stamp is spent (one hint, one echo).
+    // Echo: the child echoes the glyph, the caret advances, and the move is
+    // licensed; light is born and the stamp is spent (one hint, one echo).
     let echo_at = press_at + Duration::from_millis(8);
     glow.tick(Some((2, 1)), echo_at, &c, g, &mut out);
     let echoed = project(&glow, echo_at, 1, 1, 0);
@@ -481,11 +481,9 @@ fn the_real_glow_engine_conforms_to_the_licence_model() {
     );
 
     // ---- A stale stamp with no press in flight on a fresh engine ----
-    // One press, then a keyless backward hop the echo shape refuses: the pool
-    // is forgotten, and the following +1 finds a stale stamp over an empty pool
-    // (`StaleStampMoveDeclines`). The backward hop is first held as a park
-    // candidate for one stamp window, so the forget lands past
-    // `TYPE_HINT_FRESH` (`past_park_window()`).
+    // One press, then a keyless backward hop the echo shape refuses (judged past
+    // the park window): the pool is forgotten, and the following +1 finds a stale
+    // stamp over an empty pool (`StaleStampMoveDeclines`).
     let s0 = Instant::now();
     let mut stale = CursorGlow::default();
     stale.tick(Some((2, 5)), s0, &c, g, &mut out);
@@ -574,9 +572,7 @@ fn the_real_glow_engine_conforms_to_the_licence_model() {
     in_flight.insert("superseded", 1);
     in_flight.insert("expired", 1);
     hop.tick(Some((2, 2)), hop_at, &c, g, &mut out);
-    // The backward hop is held as a park candidate for one stamp window and
-    // judged on the next tick past it, so the forget lands past
-    // `TYPE_HINT_FRESH` (`past_park_window()`).
+    // Held as a park candidate first: judged past the park window.
     let hop_at = hop_at + past_park_window();
     hop.tick(Some((2, 2)), hop_at, &c, g, &mut out);
     assert_eq!(
@@ -606,17 +602,11 @@ fn the_real_glow_engine_conforms_to_the_licence_model() {
     );
 }
 
-/// Typing while a program streams: a `less`/`vi`/ESC 7-ESC 8 streamer parks its
-/// caret, writes a status line elsewhere and restores, several times a second,
-/// while the user types in the same window.
-///
-/// Driven at the real frame cadence: the streamer's save/park/status/restore
-/// lands inside one parser batch, so its frame shows the caret where the
-/// restore left it plus a probe of the row it wrote. Per key: press, streamer
-/// batch (no caret delta), echo; plus a cold streamer caret walk between keys,
-/// which must be declined and destroy nothing. A batch moving no caret runs no
-/// spawn, so the press's stamp survives to its echo; the ribbon grows across
-/// the run.
+/// Typing while a program streams: a `less`/`vi`/ESC 7-ESC 8 streamer saves,
+/// parks, writes a status line elsewhere and restores inside one parser batch,
+/// several times a second, while the user types. A batch moving no caret runs
+/// no spawn, so each press's stamp survives to its echo and the ribbon grows; a
+/// cold streamer caret walk between keys is declined and destroys nothing.
 #[test]
 fn typing_paints_through_the_esc7_esc8_streamer_cadence() {
     let g = geom();
@@ -638,7 +628,7 @@ fn typing_paints_through_the_esc7_esc8_streamer_cadence() {
         let col = i as u16;
         let at = t0 + Duration::from_millis(i as u64 * 120 + 1);
 
-        // THE PRESS.
+        // The press.
         glow.note_typed_cells(at, 1);
 
         // Before its echo, a whole streamer batch (ESC 7, park, status write,
@@ -648,7 +638,7 @@ fn typing_paints_through_the_esc7_esc8_streamer_cadence() {
         glow.observe_row_with_trust(0, 12, &status, streamed, ProbeTrust::ContentOnly);
         glow.tick(Some((row, col)), streamed, &c, g, &mut scratch);
 
-        // THE ECHO, on the row the user is typing into.
+        // The echo, on the row the user is typing into.
         typed.push(ch);
         let echo = at + Duration::from_millis(40);
         glow.observe_row_with_trust(row, col + 1, &typed, echo, ProbeTrust::ContentOnly);
@@ -751,7 +741,7 @@ fn an_unlicensed_move_mints_nothing_and_retires_nothing_in_every_style() {
         warmth: 0.0,
     };
 
-    // CLAUSE 1 — a cold engine stays cold, whatever the shape or style.
+    // Clause 1: a cold engine stays cold, whatever the shape or style.
     for style in styles {
         let mut c = cfg(style, true);
         if style == GlowStyle::Custom {
@@ -899,7 +889,7 @@ fn content_only_probes_never_license_a_kill_poof() {
         glow.vapor.is_empty(),
         "the caret fallback must refuse a ContentOnly probe too"
     );
-    // NON-VACUITY: the identical gesture over FULL-trust probes (primary
+    // Non-vacuity: the identical gesture over full-trust probes (primary
     // screen / blinking TUI) still answers with smoke.
     let mut glow = CursorGlow::default();
     glow.observe_row(2, 7, &row("$ hello world"), t0);
@@ -914,10 +904,8 @@ fn content_only_probes_never_license_a_kill_poof() {
 }
 
 /// Momentum is decoupled from admission: the spine advances on the press-hint
-/// half of a typing-shaped echo, so a burst of real keystrokes whose candidates
-/// all retire (the streaming-collision cadence of a busy TUI) still climbs the
-/// metric and the starfield density sees `disp` rise. Amplitude, never
-/// provenance: every denied spawn mints no light, and program output without
+/// half of a typing-shaped echo, so a burst of real keystrokes climbs the
+/// metric and the starfield density sees `disp` rise. Program output without
 /// presses stays at zero (`program_output_alone_builds_no_momentum`).
 #[test]
 fn momentum_climbs_through_streaming_collisions_that_retire_every_candidate() {

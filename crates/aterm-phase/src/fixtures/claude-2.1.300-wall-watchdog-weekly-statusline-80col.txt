@@ -1,0 +1,21 @@
+# claude-code 2.1.300 · MEASURED 2026-10-15, `aterm ctl text` of a private headless aterm (80x32, aterm 0.103.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake claude.ai OAuth token (`claude --subscriber`) and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, tools/real-claude-lab) · the weekly limit under CLAUDE_CODE_RETRY_WATCHDOG=1 with a statusLine configured: the vendor's retry row (stub: limit seven_day, reset 25 h out), 80x32
+ ▐▛███▛█   Claude Code v2.1.300
+▝▜██████▀  Sonnet 5.5 · Claude API
+ ▝▝   ▝▝   /private/tmp/at.P9Ki/proj
+
+
+❯ hi
+
+⏺ Hi! I am the local lab stub, not a model. (reply 1)
+
+✻ Cooked for 0s · done 8:49 AM
+
+❯ carry on with the task
+
+✻ Weekly limit reached · Retrying in 5h (Oct 16 at 9:49am) · attempt 1/300
+
+────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────
+  lab statusline                                            ◐ medium · /effort
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents

@@ -22,16 +22,12 @@
 
 use crate::app_config::{
     Config, DEFAULT_TAB_STATUS_DWELL_MS, DEFAULT_TAB_STATUS_QUIET_AFTER_MS,
-    DEFAULT_TITLE_SUMMARY_CONTEXT_LINES, DEFAULT_TITLE_SUMMARY_INTERVAL_SECONDS,
-    DEFAULT_TITLE_SUMMARY_MODEL, DEFAULT_TITLE_SUMMARY_TIMEOUT_SECONDS,
-    EXAMPLE_EXPLICIT_OLLAMA_TITLE_SUMMARY_ENDPOINT, MAX_TAB_STATUS_DWELL_MS,
-    MAX_TAB_STATUS_QUIET_AFTER_MS, MAX_TITLE_SUMMARY_CONTEXT_LINES,
-    MAX_TITLE_SUMMARY_INTERVAL_SECONDS, MAX_TITLE_SUMMARY_TIMEOUT_SECONDS, MIN_TAB_STATUS_DWELL_MS,
-    MIN_TAB_STATUS_QUIET_AFTER_MS, MIN_TITLE_SUMMARY_CONTEXT_LINES,
-    MIN_TITLE_SUMMARY_INTERVAL_SECONDS, MIN_TITLE_SUMMARY_TIMEOUT_SECONDS,
+    MAX_TAB_STATUS_DWELL_MS, MAX_TAB_STATUS_QUIET_AFTER_MS, MIN_TAB_STATUS_DWELL_MS,
+    MIN_TAB_STATUS_QUIET_AFTER_MS,
 };
 use aterm_effects::cursor_glow::GlowStyle;
 use aterm_effects::trail_sound::SoundVoice;
+use aterm_phase::Program;
 
 /// The TOML keys the settings model edits, paired with how each should be TYPED
 /// when written back ([`apply_prefs_edits`]). The order matches the on-screen row order
@@ -39,9 +35,10 @@ use aterm_effects::trail_sound::SoundVoice;
 /// followed by a reload round-trips through serde (see [`crate::app_config::Config`]).
 pub(crate) const EDIT_FONT_PX: &str = "font_px";
 pub(crate) const EDIT_FONT_FAMILY: &str = "font_family";
-/// The bundled display-face selector (`display_font`) — one of
-/// [`DISPLAY_FONT_OPTIONS`], cleared = the normal font selection. Driven by the
-/// Settings "Display Faces" page's mutually-exclusive toggles.
+/// The bundled display-face selector (`display_font`): up to
+/// `aterm_render::DISPLAY_FACE_MIX_MAX` `+`-joined [`DISPLAY_FONT_OPTIONS`] ids,
+/// cleared = the normal font selection. Driven by the Text & Fonts page's
+/// Display Faces card.
 pub(crate) const EDIT_DISPLAY_FONT: &str = "display_font";
 
 /// The DEPRECATED spelling of [`EDIT_DISPLAY_FONT`]. It is still parsed (a
@@ -68,7 +65,7 @@ pub(crate) const EDIT_CURSOR_MOMENTUM_GLOW: &str = "cursor_momentum_glow";
 /// [`crate::app_config::DEFAULT_DECORATIVE_EFFECTS`]: an opt-OUT everywhere except
 /// Windows, where the resident walking cat the default style rides makes it an
 /// opt-IN. Settings seeds this row from the RESOLVED config, so the row and every
-/// "Inactive · Cursor trail Off" disclosure below it are platform-correct for free —
+/// "Inactive: cursor effects off" disclosure below it are platform-correct for free —
 /// never re-derive the default from a typed `true`.
 pub(crate) const EDIT_CURSOR_TRAIL: &str = "cursor_trail";
 pub(crate) const EDIT_CURSOR_TRAIL_STYLE: &str = "cursor_trail_style";
@@ -169,6 +166,12 @@ pub(crate) const EDIT_SPARKLE_BONK_DETONATION: &str = "sparkle_words.profanity.b
 /// `output_streak.enabled` off this key cannot make a sound at all
 /// (`Config::output_streak_warning` says so at `--validate-config` time).
 pub(crate) const EDIT_OUTPUT_STREAK_SOUND: &str = "output_streak.sound";
+/// PRISM WAKE's own switch (`[output_streak] enabled`): the comet over new
+/// program output. Its absent-key default is platform-split
+/// ([`crate::app_config::DEFAULT_DECORATIVE_EFFECTS`]), and Settings seeds the
+/// row from the resolver that owns it. Appearance's Effects box, beside Matrix
+/// rain and Robi; the pip's row names it while it is Off.
+pub(crate) const EDIT_OUTPUT_STREAK_ENABLED: &str = "output_streak.enabled";
 
 /// PRESENCE (round 19, SPEC19 §9): the two `[presence]` leaves the View menu's
 /// checkables write — the band row under the tab bar and the colour rim. Both
@@ -181,11 +184,11 @@ pub(crate) const EDIT_PRESENCE_RIM: &str = "presence.rim";
 /// THE SOUND MENU (owner ask: "add the volume and SFX menu to settings").
 ///
 /// Every config key that changes what aterm SOUNDS like, and nothing else. One
-/// list drives [`section_of`] (they all land in the same pane), [`group_of`]
-/// (they all land in the same "Sound" box), and the native Advanced audit, so a
-/// new audible knob cannot be added to one and forgotten in the others — the
-/// exact drift that left `tone_melody`, `trail_sound_bed` and both bonk keys
-/// reachable only by hand-editing `aterm.toml`.
+/// list drives [`section_of`] (they all land on the Sound page), [`group_of`]
+/// (the synth voices in one box, the bell in its own), and the native Advanced
+/// audit, so a new audible knob cannot be added to one and forgotten in the
+/// others — the exact drift that left `tone_melody`, `trail_sound_bed` and both
+/// bonk keys reachable only by hand-editing `aterm.toml`.
 ///
 /// DELIBERATELY ABSENT — and each exclusion is a JUDGEMENT, recorded here so a
 /// later reader can check the reasoning rather than guess at an omission:
@@ -221,6 +224,24 @@ pub(crate) const SOUND_MENU_KEYS: &[&str] = &[
     EDIT_SPARKLE_BONK_DETONATION,
     EDIT_OUTPUT_STREAK_SOUND,
 ];
+/// The tuning a cursor style can read. The Cursor Styles page shows the ones
+/// the selected style uses (`native_settings::trail_style_uses`); HDR glow and
+/// SDR boost stay Manual-only, since what they do depends on the display.
+pub(crate) const CURSOR_STYLE_TUNING_KEYS: &[&str] = &[
+    EDIT_CURSOR_TRAIL_INTENSITY,
+    EDIT_CURSOR_TRAIL_MS,
+    EDIT_CURSOR_TRAIL_LENGTH,
+    EDIT_CURSOR_TRAIL_RADIUS,
+    EDIT_CURSOR_TRAIL_RING,
+    EDIT_CURSOR_TRAIL_COLOR,
+    EDIT_CURSOR_TRAIL_ACCENT,
+    EDIT_CURSOR_TRAIL_BLOOM,
+    EDIT_CURSOR_TRAIL_BLOOM_STRENGTH,
+    EDIT_CURSOR_TRAIL_BLOOM_RADIUS,
+    EDIT_CURSOR_FIRE_SHIMMER,
+    EDIT_HDR_GLOW,
+    EDIT_CURSOR_GLOW_SDR_BOOST,
+];
 pub(crate) const EDIT_CURSOR_TRAIL_COLOR: &str = "cursor_trail_color";
 pub(crate) const EDIT_CURSOR_TRAIL_ACCENT: &str = "cursor_trail_accent";
 /// The rainbow kitty's user sprite. KEEPS the `nyan` spelling — unlike the
@@ -242,6 +263,22 @@ pub(crate) const EDIT_CURSOR_TRAIL_BLOOM_RADIUS: &str = "cursor_trail_bloom_radi
 pub(crate) const EDIT_CURSOR_FIRE_SHIMMER: &str = "cursor_fire_shimmer";
 pub(crate) const EDIT_HDR_GLOW: &str = "hdr_glow";
 pub(crate) const EDIT_CURSOR_GLOW_SDR_BOOST: &str = "cursor_glow_sdr_boost";
+/// What the theme field shows when `theme` is unset: it follows the OS
+/// (`app_config::UNSET_THEME`), as the picker's reset row says.
+pub(crate) const UNSET_THEME_LABEL: &str = "Follow system";
+
+/// How every surface that names the theme drawn (the preview badges, the
+/// Appearance row's notices) names an unset `theme`: [`UNSET_THEME_LABEL`],
+/// then the theme it draws on the side shown, so "Follow system" and
+/// "Default" never stand for the same state on two surfaces.
+pub(crate) fn unset_theme_label(drawn: &str) -> String {
+    let drawn = drawn.trim();
+    if drawn.is_empty() {
+        UNSET_THEME_LABEL.to_string()
+    } else {
+        format!("{UNSET_THEME_LABEL} \u{b7} {drawn}")
+    }
+}
 pub(crate) const EDIT_FOREGROUND: &str = "foreground";
 pub(crate) const EDIT_BACKGROUND: &str = "background";
 pub(crate) const EDIT_CURSOR_COLOR: &str = "cursor_color";
@@ -346,42 +383,6 @@ pub(crate) fn display_font_id_is_accepted(id: &str) -> bool {
     let id = id.trim();
     aterm_render::display_face_canonical_id(id).is_some() || LEGACY_DISPLAY_FONT_IDS.contains(&id)
 }
-/// Smart-title controls. These names deliberately match the public `aterm.toml`
-/// schema exactly; in particular, credentials are represented only by a FILE PATH.
-/// The Settings surface deliberately defines no separate raw-token value.
-pub(crate) const EDIT_DESCRIPTIVE_TITLES: &str = "descriptive_titles";
-pub(crate) const EDIT_TITLE_SUMMARY_PROVIDER: &str = "title_summary_provider";
-pub(crate) const EDIT_TITLE_SUMMARY_MODEL: &str = "title_summary_model";
-pub(crate) const EDIT_TITLE_SUMMARY_ENDPOINT: &str = "title_summary_endpoint";
-pub(crate) const EDIT_TITLE_SUMMARY_TOKEN_FILE: &str = "title_summary_token_file";
-pub(crate) const EDIT_TITLE_SUMMARY_TIMEOUT_SECONDS: &str = "title_summary_timeout_seconds";
-pub(crate) const EDIT_TITLE_SUMMARY_PROXY_MODE: &str = "title_summary_proxy_mode";
-pub(crate) const EDIT_TITLE_SUMMARY_CA_FILE: &str = "title_summary_ca_file";
-pub(crate) const EDIT_TITLE_SUMMARY_INTERVAL_SECONDS: &str = "title_summary_interval_seconds";
-pub(crate) const EDIT_TITLE_SUMMARY_CONTEXT_LINES: &str = "title_summary_context_lines";
-pub(crate) const EDIT_TITLE_SUMMARY_INCLUDE_OUTPUT: &str = "title_summary_include_output";
-pub(crate) const EDIT_TITLE_SUMMARY_ALLOW_REMOTE: &str = "title_summary_allow_remote";
-pub(crate) const EDIT_TAB_TITLE_FORMAT: &str = "tab_title_format";
-pub(crate) const EDIT_WINDOW_TITLE_FORMAT: &str = "window_title_format";
-/// Complete Smart Titles settings roster. Consumers that need to invalidate a
-/// runtime-health observation use this list rather than maintaining another
-/// copy that can drift from the Settings group.
-pub(crate) const SMART_TITLE_KEYS: &[&str] = &[
-    EDIT_DESCRIPTIVE_TITLES,
-    EDIT_TITLE_SUMMARY_PROVIDER,
-    EDIT_TITLE_SUMMARY_MODEL,
-    EDIT_TITLE_SUMMARY_ENDPOINT,
-    EDIT_TITLE_SUMMARY_TOKEN_FILE,
-    EDIT_TITLE_SUMMARY_TIMEOUT_SECONDS,
-    EDIT_TITLE_SUMMARY_PROXY_MODE,
-    EDIT_TITLE_SUMMARY_CA_FILE,
-    EDIT_TITLE_SUMMARY_INTERVAL_SECONDS,
-    EDIT_TITLE_SUMMARY_CONTEXT_LINES,
-    EDIT_TITLE_SUMMARY_INCLUDE_OUTPUT,
-    EDIT_TITLE_SUMMARY_ALLOW_REMOTE,
-    EDIT_TAB_TITLE_FORMAT,
-    EDIT_WINDOW_TITLE_FORMAT,
-];
 /// Tab Subject & Status (RFC §12). `EDIT_TAB_STATUS` is the master switch; the
 /// other three are inert while it is off, which [`crate::native_settings`]
 /// discloses rather than leaving the reader to infer.
@@ -455,8 +456,8 @@ pub(crate) const RETIRED_PACKAGES_AUTO_UPDATE: &str = "packages.auto_update";
 /// The retired `[packages] seed_install`: read as [`EDIT_PACKAGES_AUTO_INSTALL`] while that
 /// is unset.
 pub(crate) const RETIRED_PACKAGES_SEED_INSTALL: &str = "packages.seed_install";
-/// `[update] enabled` — "Check for updates automatically" (Settings ▸ Software Update's
-/// Automatic updates card, Settings ▸ Terminal ▸ Updates, and Search), default ON. It
+/// `[update] enabled` — "Check for aterm updates automatically" (Settings ▸ Software
+/// Update's Automatic updates card, Search and Modified), default ON. It
 /// replaces `$ATERM_NO_AUTO_UPDATE` (2026-09-23): off stops the background checker only
 /// (Check for Updates and Update Now still work), read once per process, so it applies
 /// from the next launch.
@@ -478,6 +479,33 @@ pub(crate) const EDIT_REROUTE_ANNOUNCE: &str = "reroute.announce";
 /// and able only to LIMIT it (owner, 2026-09-24); they are written in the
 /// file (Manual) and the row says which are (`HarnessPolicy::words`).
 pub(crate) const EDIT_HARNESS_ENABLED: &str = "harness.enabled";
+/// `[harness] autopilot` — THE DEFAULT AUTOPILOT
+/// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §2.1): how far the harness
+/// carries a session that has no Autopilot word of its own. An Enum of the
+/// supervisor's own words in the chip's cycle order ([`HARNESS_AUTOPILOT_WORDS`],
+/// `aterm_agent::supervise::Autopilot::ALL`), `cruise` by default (full
+/// power), registered through [`NESTED_LEAVES`] beside the master switch, so
+/// it is a Settings row, a Search hit and a Manual key at once.
+///
+/// `cruise`: every point answered and the work continued until the agent's
+/// clear final statement. `land`: the work wrapped up cleanly — the land
+/// instruction once, at most two nudges, then nothing typed but the land
+/// answer to a question asked in prose, which the nudges' bound does not
+/// cover. `off`: the harness keeps its hands off (plain Claude Code; the
+/// window's host stops the session's worker). Each step down takes power
+/// away, so `land` and `off` are limits. A session's own word (the footer's
+/// chip, Settings ▸ Harness, `aterm ctl @<sid> meta set autopilot …`)
+/// decides over it; the master switch off wins over both. The row seeds
+/// from the SUPERVISOR's resolved mode ([`Config::harness`]), the default
+/// its placeholder.
+pub(crate) const EDIT_HARNESS_AUTOPILOT: &str = "harness.autopilot";
+/// [`EDIT_HARNESS_AUTOPILOT`]'s options: `aterm_agent::supervise::Autopilot`'s
+/// three words in the order the chip cycles them, read off `Autopilot::ALL`.
+pub(crate) const HARNESS_AUTOPILOT_WORDS: [&str; 3] = {
+    use aterm_agent::supervise::Autopilot;
+    let [a, b, c] = Autopilot::ALL;
+    [a.word(), b.word(), c.word()]
+};
 /// `[harness] approve` — what the supervisor answers a permission box with
 /// (owner, 2026-09-24: *"all such dialogs must be approved by default unless
 /// there is a setting added later by the user explicitly to NOT do this"*,
@@ -489,10 +517,14 @@ pub(crate) const EDIT_HARNESS_ENABLED: &str = "harness.enabled";
 /// `all`: every box its answer — a permission box its one-shot allow
 /// (`allow-once@v1`; never a standing grant, never a purchase). `safe`: only
 /// what the safe rules prove (owner decision 1: a read-only command, an rm
-/// under a scratch root in bypass, a Read outside the secrets, the trust
-/// dialog under a trust root). `none`: every box is the owner's. The row
-/// seeds from the SUPERVISOR's resolved level ([`Config::harness_policy`]),
-/// so a refused value reads as the limit the reader took it for.
+/// under a scratch root in bypass, a Read under an allowed root outside the
+/// secrets, the trust dialog under a trust root) — they judge Claude Code's
+/// boxes and Codex's folder-trust gate, so every other Codex box is the
+/// owner's. `none`: every box is the owner's. One level for every agent: no
+/// key but `enabled` is per agent. The row seeds from the SUPERVISOR's
+/// resolved level ([`Config::harness`]), so a value reads as the reader took
+/// it: an off spelling `none`, any other value that is no level no setting
+/// (`all`).
 pub(crate) const EDIT_HARNESS_APPROVE: &str = "harness.approve";
 /// `[harness] answer_questions` — the supervisor's QUESTION ANSWER (owner
 /// directive of 2026-09-25: *"the harness must not stall on escalating to
@@ -515,8 +547,8 @@ pub(crate) const EDIT_HARNESS_APPROVE: &str = "harness.approve";
 /// every question goes to the menu bar, whatever the priority says.
 /// Independent of [`EDIT_HARNESS_APPROVE`] both ways: a question is no
 /// permission. The row seeds from the SUPERVISOR's resolved bit
-/// ([`Config::harness`]), so a refused value reads OFF here exactly as the
-/// reader limits it.
+/// ([`Config::harness`]), so it reads a value as the reader takes it: an off
+/// spelling is OFF, and a value that is neither on nor off is no setting (ON).
 pub(crate) const EDIT_HARNESS_ANSWER_QUESTIONS: &str = "harness.answer_questions";
 /// `[harness] question_priority` — HOW the supervisor answers a question
 /// dialog while [`EDIT_HARNESS_ANSWER_QUESTIONS`] is on (2026-09-25). An Enum,
@@ -530,10 +562,65 @@ pub(crate) const EDIT_HARNESS_ANSWER_QUESTIONS: &str = "harness.answer_questions
 /// one the text would not fit, gets its recommended option). Never WHETHER:
 /// with the answer switch off every question goes to the menu bar whatever
 /// this row says. A session's own `aterm ctl @<sid> meta set questions …`
-/// word decides over it. A refused value turns the answer switch off (the
-/// reader's fail-closed, [`Config::harness`]), and this row then seeds
-/// nothing.
+/// word decides over it. A refused value is no setting: the reader
+/// ([`Config::harness`]) keeps `recommended` and leaves the answer switch as
+/// written, and this row seeds nothing.
 pub(crate) const EDIT_HARNESS_QUESTION_PRIORITY: &str = "harness.question_priority";
+/// `[harness.claude] enabled` — whether Claude Code's sessions are
+/// supervised, under the master switch ([`EDIT_HARNESS_ENABLED`]). A Bool, ON
+/// by default; `false` puts Claude Code in the supervisor's `off` list. The
+/// row seeds from that list ([`Config::harness_agent_enabled`]), never from
+/// the master switch, which is its own row. The window's host enforces it
+/// when saved ([`HARNESS_AGENT_TIMING`]).
+pub(crate) const EDIT_HARNESS_CLAUDE_ENABLED: &str = "harness.claude.enabled";
+/// `[harness.codex] enabled` — [`EDIT_HARNESS_CLAUDE_ENABLED`] for Codex.
+pub(crate) const EDIT_HARNESS_CODEX_ENABLED: &str = "harness.codex.enabled";
+/// `[harness.agy] enabled` — [`EDIT_HARNESS_CLAUDE_ENABLED`] for agy.
+pub(crate) const EDIT_HARNESS_AGY_ENABLED: &str = "harness.agy.enabled";
+
+/// The agent a `harness.<agent>.enabled` row switches, read from its key: a
+/// supervisable [`Program`] by its own name. Every per-agent arm of a row
+/// (its seed, timing, live effect, keywords, note, inactive state and
+/// Settings' effect) answers through this, so a new agent's switch is its
+/// [`NESTED_LEAVES`] row and its Manual table header
+/// (`native_config_language`), nothing else.
+pub(crate) fn agent_switch(key: &str) -> Option<Program> {
+    let word = key.strip_prefix("harness.")?.strip_suffix(".enabled")?;
+    aterm_phase::program_of(word).filter(|p| p.supervisable() && p.name() == word)
+}
+
+/// The name a row is searched by as its OWN, beside its label and key
+/// (`native_config_language::query_match_rank`): an agent's switch answers
+/// to its agent's word (`claude`, `codex`), which its label says only
+/// mid-sentence ("Supervise Claude Code sessions") and its key only
+/// mid-path, so a search for the agent finds its switch before the rows
+/// that list the word as a synonym ([`keywords_of`]).
+pub(crate) fn own_name_of(key: &str) -> Option<&'static str> {
+    agent_switch(key).map(Program::name)
+}
+
+/// `[ai] enabled` — whether the window looks at the AI CLIs aterm manages
+/// and says, in Messages, which one needs a person
+/// (docs/DESIGN-ai-connections-2026-10-16.md §7.3). A Bool, ON by default,
+/// read by the AI layer's own reader ([`crate::app_config::AiPolicy`]); OFF,
+/// no look runs and the AI lines end. The `aterm ai` verbs always work.
+pub(crate) const EDIT_AI_ENABLED: &str = "ai.enabled";
+/// `[ai] preferred` — this machine's main AI CLI (§6.1): the one that asks
+/// when a review names none, and the doctor's first row. An Enum over every
+/// connection's id ([`aterm_agent::ai::connector::IDS`]); its default is the
+/// first CLI this platform has a build of. A choice, not a grant, so a
+/// Settings row; a fleet document may set it too, and the row says so.
+pub(crate) const EDIT_AI_PREFERRED: &str = "ai.preferred";
+
+/// The AI CLI an `ai.<id>.use` row switches, read from its key: a connection
+/// by its own id (`aterm_agent::ai::connector`). Every per-CLI arm of a row
+/// (its seed, note, keywords and the AI CLIs page's placement) answers through
+/// this, so a fifth CLI's switch is its [`NESTED_LEAVES`] row and its Manual
+/// table header (`native_config_language`), nothing else.
+pub(crate) fn ai_use_switch(key: &str) -> Option<&'static aterm_agent::ai::connector::Connector> {
+    let id = key.strip_prefix("ai.")?.strip_suffix(".use")?;
+    aterm_agent::ai::connector::connector(id)
+}
 
 /// `[machine] universal_control` — `"off"` (default) disables macOS Universal Control
 /// for this host whenever the `[machine]` settings are applied (`aterm pkg machine apply`,
@@ -572,22 +659,6 @@ pub(crate) const UNIVERSAL_CONTROL_POLICIES: &[&str] = &["off", "leave"];
 pub(crate) const WINDOW_THEMES: &[&str] = &["auto", "light", "dark"];
 pub(crate) const BIDI_MODES: &[&str] = &["implicit", "disabled", "explicit"];
 pub(crate) const AMBIGUOUS_WIDTHS: &[&str] = &["narrow", "wide"];
-/// Closed domain for the live title summarizer. `builtin` never sends terminal
-/// contents over the network; the network providers remain subject to the separate
-/// `title_summary_allow_remote` privacy gate in the runtime.
-pub(crate) const TITLE_SUMMARY_PROVIDERS: &[&str] =
-    &["builtin", "ollama", "openai-compatible", "off"];
-/// Closed remote-provider proxy policy. An attested, aterm-owned Ollama child always
-/// bypasses proxies; OpenAI-compatible providers apply this exact choice.
-pub(crate) const TITLE_SUMMARY_PROXY_MODES: &[&str] = &["environment", "direct"];
-/// Closed domain for how the program-supplied title and live description are composed
-/// in the tab strip and native window title.
-pub(crate) const TITLE_FORMATS: &[&str] = &[
-    "title",
-    "description",
-    "title-description",
-    "description-title",
-];
 /// Closed domain for `predictive_echo` (the canonical names; `PredictMode::parse`
 /// also accepts aliases like auto/on/force from a hand-edited file). Exposing it as
 /// an Enum means the overlay cycles a valid value and Save rejects a typo, instead
@@ -631,6 +702,12 @@ pub(crate) const EDIT_GPU: &str = "gpu";
 /// index) — a [`LIST_KEYS`] row (comma-separated text ⇄ TOML array; entries
 /// hex-validated at Save like the [`EditKind::Color`] rows).
 pub(crate) const EDIT_PALETTE: &str = "palette";
+/// Sparse indexed palette slots (`Config::palette_overrides`, a table of
+/// `#RRGGBB` by slot index applied over `palette`). The patch lane writes one
+/// slot as the dotted key `palette_overrides.<index>`
+/// ([`crate::resolved_colors::palette_override_key`]), hex-validated as an
+/// [`EditKind::Color`]; the whole table is removed by this key.
+pub(crate) const EDIT_PALETTE_OVERRIDES: &str = "palette_overrides";
 /// Trail Pack manifest paths (`Config::cursor_trail_packs`) — a [`LIST_KEYS`] row.
 pub(crate) const EDIT_CURSOR_TRAIL_PACKS: &str = "cursor_trail_packs";
 /// Trail sound level 0..=1 (`Config::trail_sound_volume`, default 0.4).
@@ -710,21 +787,15 @@ pub(crate) fn config_asset_source_key(key: &str) -> bool {
 }
 
 /// Values intentionally edited only in Manual: lossless collections,
-/// host-backed asset sources that require off-thread preparation, and legacy
-/// feline controls that have no honest native choice surface. `style = "paw"`
-/// remains a supported compatibility mode, but it is ink-only in cat-art v4;
-/// the other four feline keys are parsed no-effect compatibility data.
+/// host-backed asset sources that require off-thread preparation, and the
+/// legacy feline style, which has no honest native choice surface:
+/// `style = "paw"` remains a supported compatibility mode, but it is ink-only
+/// in cat-art v4. (Keys that do nothing are not registry rows at all; Manual
+/// types them from `native_config_language`'s compatibility metadata.)
 pub(crate) fn manual_only_key(key: &str) -> bool {
     manual_collection_key(key)
         || config_asset_source_key(key)
-        || matches!(
-            key,
-            "sparkle_words.feline.style"
-                | "sparkle_words.feline.idle"
-                | "sparkle_words.feline.gaze"
-                | "sparkle_words.feline.color"
-                | "sparkle_words.feline.intensity"
-        )
+        || key == "sparkle_words.feline.style"
 }
 
 /// One SCALAR leaf of a nested config table (`[net]` / `[update]` /
@@ -747,23 +818,23 @@ pub(crate) struct NestedLeaf {
 /// (`net.connections`, `sparkle_words.languages`/`toy_packs`/`deny`, the per-class
 /// `extra_words`/`ignore_words`/`palette`, `[[sparkle_words.custom]]`) are
 /// deliberately NOT here: only scalar leaves are registered, and those tables'
-/// arrays remain hand-edit/TOML-native (see `DEFERRED_CONFIG_KEYS`' rationale
-/// class — no faithful single-text shape).
+/// arrays remain hand-edit/TOML-native (no faithful single-text shape, so a
+/// lossy encoding could corrupt them on a Save round-trip).
 pub(crate) const NESTED_LEAVES: &[NestedLeaf] = &[
     // [net] — the L3 opt-in TLS drive listener (env vars still override).
     NestedLeaf {
         key: "net.listen",
-        label: "Net: listener numeric IP and port",
+        label: "Listener address (IP and port)",
         kind: EditKind::Text,
     },
     NestedLeaf {
         key: "net.cert",
-        label: "Net: server certificate path",
+        label: "Server certificate (path)",
         kind: EditKind::Text,
     },
     NestedLeaf {
         key: "net.key",
-        label: "Net: server key path",
+        label: "Server key (path)",
         kind: EditKind::Text,
     },
     // [update] — whether the self-updater runs, and its apply policy. The channel
@@ -771,27 +842,59 @@ pub(crate) const NESTED_LEAVES: &[NestedLeaf] = &[
     // a shipped build reads its compiled channel and pin, so they are not rows here.
     NestedLeaf {
         key: EDIT_UPDATE_ENABLED,
-        label: "Update: check for updates automatically",
+        label: "Check for aterm updates automatically",
         kind: EditKind::Bool,
     },
     NestedLeaf {
         key: "update.auto_apply",
-        label: "Update: install updates automatically",
+        label: "Install aterm updates automatically",
         kind: EditKind::Bool,
     },
     // [reroute] — the upstream-Rust signpost line (atpkg reads it).
     NestedLeaf {
         key: EDIT_REROUTE_ANNOUNCE,
-        label: "Toolchain: announce upstream cargo/rustc",
+        label: "Show a note when cargo or rustc is rerouted",
         kind: EditKind::Bool,
     },
-    // [harness] — the supervisor's master switch, the one key with a row.
-    // The finer keys only limit it and are written in Manual; the row's note
-    // names each one written (`HarnessPolicy::words`).
+    // [harness] — the supervisor's master switch, the first of its rows.
+    // The keys with no row here only limit it and are written in Manual; the
+    // row's words name each limit written, by its row where it has one
+    // (`HarnessPolicy::words`, which reads this registry for them).
     NestedLeaf {
         key: EDIT_HARNESS_ENABLED,
-        label: "Harness",
+        label: "Supervise coding agents",
         kind: EditKind::Bool,
+    },
+    // [harness.<agent>] — one switch per supervisable agent, under the
+    // master switch (`docs/DESIGN-harness-plugins-2026-10-15.md` §4),
+    // labelled "Supervise <product> sessions" (the product name is
+    // `Program::product`) as the master switch is "Supervise coding agents":
+    // the row turns the harness's hold on that agent off, never the agent
+    // itself.
+    NestedLeaf {
+        key: EDIT_HARNESS_CLAUDE_ENABLED,
+        label: "Supervise Claude Code sessions",
+        kind: EditKind::Bool,
+    },
+    NestedLeaf {
+        key: EDIT_HARNESS_CODEX_ENABLED,
+        label: "Supervise Codex sessions",
+        kind: EditKind::Bool,
+    },
+    NestedLeaf {
+        key: EDIT_HARNESS_AGY_ENABLED,
+        label: "Supervise Antigravity CLI sessions",
+        kind: EditKind::Bool,
+    },
+    // The default Autopilot (the Autopilot design, 2026-10-15): how far the
+    // harness carries a session with no word of its own — `cruise`, `land`
+    // or `off`, each step down a limit.
+    NestedLeaf {
+        key: EDIT_HARNESS_AUTOPILOT,
+        label: "Default autopilot",
+        kind: EditKind::Enum {
+            options: &HARNESS_AUTOPILOT_WORDS,
+        },
     },
     // The supervisor's approval level (owner, 2026-09-24): `all` answers
     // every box; `safe` is decision 1's proven rules; `none` answers none.
@@ -820,25 +923,63 @@ pub(crate) const NESTED_LEAVES: &[NestedLeaf] = &[
             options: &aterm_agent::supervise::QuestionPriority::WORDS,
         },
     },
+    // [ai] — the AI CLIs aterm keeps a login to (docs/DESIGN-ai-connections-
+    // 2026-10-16.md §10): this machine's preferred CLI, the look's switch, and
+    // one "Use on this machine" switch per CLI. Drawn by Settings ▸ Harness ▸
+    // AI CLIs (`native_settings_ai.rs`). The grant (`reviewers`) and the
+    // fleet keys (`machine`, `fleet`) are Manual rows only: a registry row is
+    // drivable by `aterm ctl settings set`.
+    NestedLeaf {
+        key: EDIT_AI_PREFERRED,
+        label: "Preferred AI CLI",
+        kind: EditKind::Enum {
+            options: &aterm_agent::ai::connector::IDS,
+        },
+    },
+    NestedLeaf {
+        key: EDIT_AI_ENABLED,
+        label: "Look for AI CLI problems",
+        kind: EditKind::Bool,
+    },
+    NestedLeaf {
+        key: "ai.claude.use",
+        label: "Use Claude Code on this machine",
+        kind: EditKind::Bool,
+    },
+    NestedLeaf {
+        key: "ai.codex.use",
+        label: "Use Codex CLI on this machine",
+        kind: EditKind::Bool,
+    },
+    NestedLeaf {
+        key: "ai.agy.use",
+        label: "Use Antigravity CLI on this machine",
+        kind: EditKind::Bool,
+    },
+    NestedLeaf {
+        key: "ai.muse.use",
+        label: "Use Muse Code on this machine",
+        kind: EditKind::Bool,
+    },
     // [sparkle_words] — master + top-level scalars.
     NestedLeaf {
         key: "sparkle_words.enabled",
-        label: "Sparkle words",
+        label: "All word effects",
         kind: EditKind::Bool,
     },
     NestedLeaf {
         key: "sparkle_words.reduced_motion",
-        label: "Sparkle: force static (no twinkle)",
+        label: "Static sparkles (no twinkle)",
         kind: EditKind::Bool,
     },
     NestedLeaf {
         key: "sparkle_words.suppress_in_alt_screen",
-        label: "Sparkle: suppress in alt screen",
+        label: "Hide sparkles in full-screen apps",
         kind: EditKind::Bool,
     },
     NestedLeaf {
         key: "sparkle_words.lexicon",
-        label: "Sparkle: extra lexicon path",
+        label: "Extra word list (path)",
         kind: EditKind::Text,
     },
     // [sparkle_words.profanity]
@@ -861,7 +1002,7 @@ pub(crate) const NESTED_LEAVES: &[NestedLeaf] = &[
     },
     NestedLeaf {
         key: "sparkle_words.profanity.magic",
-        label: "Profanity rare variants (magic)",
+        label: "Rare sparkle variants",
         kind: EditKind::Bool,
     },
     NestedLeaf {
@@ -891,12 +1032,12 @@ pub(crate) const NESTED_LEAVES: &[NestedLeaf] = &[
     // and one pane away from it.
     NestedLeaf {
         key: EDIT_SPARKLE_BONK,
-        label: "Curse bonk (typed)",
+        label: "Bonk when you type a swear word",
         kind: EditKind::Bool,
     },
     NestedLeaf {
         key: EDIT_SPARKLE_BONK_DETONATION,
-        label: "Curse bonk on supernova",
+        label: "Bonk when a sparkle word bursts",
         kind: EditKind::Bool,
     },
     // [sparkle_words.feline]
@@ -907,49 +1048,29 @@ pub(crate) const NESTED_LEAVES: &[NestedLeaf] = &[
     },
     NestedLeaf {
         key: "sparkle_words.feline.style",
-        label: "Feline graphic mode (Manual only)",
+        label: "Keyword kitty look",
         kind: EditKind::Enum {
             options: SPARKLE_FELINE_STYLES,
         },
     },
     NestedLeaf {
-        key: "sparkle_words.feline.idle",
-        label: "Retired feline idle animation",
-        kind: EditKind::Bool,
-    },
-    NestedLeaf {
-        key: "sparkle_words.feline.gaze",
-        label: "Retired feline gaze tracking",
-        kind: EditKind::Bool,
-    },
-    NestedLeaf {
         key: "sparkle_words.feline.magic",
-        label: "Feline rare variants (magic)",
+        label: "Rare kitty variants",
         kind: EditKind::Bool,
-    },
-    NestedLeaf {
-        key: "sparkle_words.feline.color",
-        label: "Retired feline tint",
-        kind: EditKind::Color,
-    },
-    NestedLeaf {
-        key: "sparkle_words.feline.intensity",
-        label: "Retired feline opacity",
-        kind: EditKind::Float,
     },
     NestedLeaf {
         key: "sparkle_words.feline.allow_bare_cat",
-        label: "Feline: decorate bare \"cat\"",
+        label: "Decorate a bare \"cat\"",
         kind: EditKind::Bool,
     },
     NestedLeaf {
         key: "sparkle_words.feline.cjk_single_char",
-        label: "Feline: decorate lone CJK cat",
+        label: "Decorate a lone CJK cat character",
         kind: EditKind::Bool,
     },
     NestedLeaf {
         key: "sparkle_words.feline.log",
-        label: "Feline: record Kitty Log",
+        label: "Record the Kitty Log",
         kind: EditKind::Bool,
     },
     // [sparkle_words.ink] / [sparkle_words.emphasis]
@@ -978,8 +1099,9 @@ pub(crate) const NESTED_LEAVES: &[NestedLeaf] = &[
         label: "Emphasis ink class",
         kind: EditKind::Bool,
     },
-    // [matrix_rain] — every scalar knob (the `enabled` master included; the
-    // v1-inert keys are still real settings the loader parses + persists).
+    // [matrix_rain] — every scalar knob with an effect (the `enabled` master
+    // included). The v1 keys that do nothing still parse, and Manual types
+    // them, but they are not rows.
     NestedLeaf {
         key: "matrix_rain.enabled",
         label: "Matrix rain",
@@ -1034,12 +1156,7 @@ pub(crate) const NESTED_LEAVES: &[NestedLeaf] = &[
     },
     NestedLeaf {
         key: "matrix_rain.suppress_in_alt_screen",
-        label: "Rain: suppress in alt screen",
-        kind: EditKind::Bool,
-    },
-    NestedLeaf {
-        key: "matrix_rain.materialize",
-        label: "Rain materialize (v1 inert)",
+        label: "Hide rain in full-screen apps",
         kind: EditKind::Bool,
     },
     NestedLeaf {
@@ -1063,38 +1180,29 @@ pub(crate) const NESTED_LEAVES: &[NestedLeaf] = &[
         kind: EditKind::Bool,
     },
     NestedLeaf {
-        key: "matrix_rain.ink_text",
-        label: "Rain ink text (v1 inert)",
-        kind: EditKind::Bool,
-    },
-    NestedLeaf {
-        key: "matrix_rain.phosphor",
-        label: "Rain phosphor layer (v1 inert)",
-        kind: EditKind::Bool,
-    },
-    NestedLeaf {
         key: "matrix_rain.seed",
         label: "Rain field seed",
         kind: EditKind::Integer,
     },
-    // [output_streak] — PRISM WAKE. ONE leaf is registered, on purpose: the
-    // pip, because design §7 owes it a Sound-menu row in the same commit that
-    // adds the key. The table's five VISUAL keys (`enabled`, `intensity`,
-    // `tail`, `max_streaks`, `idle_secs`) are config-file surface for now and
-    // are NOT registered here — they need an Appearance group box and a
-    // preview-or-exemption ruling apiece, which is the settings rung of the
-    // design §10 ladder, not this one. That deferral is SAFE rather than
-    // silent: registering one of them without also giving `output_streak.` a
-    // `section_of`/`group_of` prefix arm fails
-    // `nested_leaves_have_agreeing_rows_and_serde_round_trip` loudly on the
-    // General catch-all, so the next hand cannot land half of it.
+    // [output_streak] — PRISM WAKE. Two leaves are rows: its switch, in
+    // Appearance's Effects box beside Matrix rain and Robi (its preview ruling
+    // is the pip's: the workbench scene has no program output to answer), and
+    // the pip, in the Sound menu (design §7). The four tuning keys
+    // (`intensity`, `tail`, `max_streaks`, `idle_secs`) shape a sub-second
+    // comet no Settings preview can show, so they stay Manual's, as HDR glow
+    // and SDR boost do; `native_config_language` lists them there.
     //
-    // The label is written for the SOUND MENU the row appears in, not for the
-    // table it lives in — the bonk keys' law: a row two boxes away from the
+    // The pip's label is written for the SOUND MENU the row appears in, not for
+    // the table it lives in — the bonk keys' law: a row two boxes away from the
     // volume slider has to say what it sounds like.
     NestedLeaf {
+        key: EDIT_OUTPUT_STREAK_ENABLED,
+        label: "Output streak",
+        kind: EditKind::Bool,
+    },
+    NestedLeaf {
         key: EDIT_OUTPUT_STREAK_SOUND,
-        label: "Output streak pip",
+        label: "Note when a program starts printing",
         kind: EditKind::Bool,
     },
     // [presence] (round 19) — the two surfaces a window shows who is driving
@@ -1118,149 +1226,6 @@ pub(crate) const NESTED_LEAVES: &[NestedLeaf] = &[
 pub(crate) fn nested_leaf(key: &str) -> Option<&'static NestedLeaf> {
     NESTED_LEAVES.iter().find(|l| l.key == key)
 }
-
-/// The EXPLICIT allowlist of `Config` serde fields deliberately NOT in the
-/// settings registry, each with its rationale. The
-/// `every_config_field_is_registered_or_deferred` exhaustiveness test fails any
-/// field that is neither registered (directly or via dotted-leaf rows) nor
-/// listed here — so a future `Config` field cannot silently skip the
-/// introspection surface; deferring it requires writing the reason down.
-#[cfg(test)]
-pub(crate) const DEFERRED_CONFIG_KEYS: &[(&str, &str)] = &[
-    (
-        "claude_footer",
-        "the Claude Code footer's Σ switch ([claude_footer] usage, owner 2026-09-30), on by \
-         default and read live. The footer answers a live Claude Code session, which the \
-         Settings preview cannot show; the Manual completes and explains the key",
-    ),
-    (
-        "render",
-        "the repaint nudge's mode ([render] repaint_nudge = on|log|off), read once at launch. A \
-         repair for one program (Claude Code) after a resize left its tab drawn one row off, \
-         on by default since a real-Claude run measured it (`log` only writes what it would do \
-         to aterm.log, `off` does nothing). The key is read once at launch, so a change \
-         applies next launch and a Settings toggle would have to say so; the Manual \
-         completes and explains the key and `aterm help config` documents it",
-    ),
-    (
-        "keeper",
-        "the PTY keeper's opt-in ([keeper] enabled, P3 of docs/DESIGN-pty-keeper-2026-09-26.md), \
-         read once at launch: while it is opt-in and needs `aterm keeper start` beside it, a \
-         Settings toggle would offer half a feature. P4 makes it the default and gives it its \
-         row; until then the Manual completes and explains the key",
-    ),
-    (
-        "privacy",
-        "the macOS consent posture ([privacy] enabled/check/notice/warmup/observer/…). It has \
-         its OWN purpose-built surface — the \"macOS access\" block on Settings > Security, \
-         which renders the live probe states (Full Disk Access and debugger access), the System \
-         Settings route, the warm-up gesture and the denied-state repair together. Registering \
-         the raw keys here would create a second, competing surface for the same facts, and two \
-         of them cannot be scalar rows at all: \
-         `protected_roots` and `warmup_folders` are lists (the same no-lossy-encoding rationale \
-         as keybindings). `auto_accept` is RESERVED and refused on purpose — an editable toggle \
-         would advertise a capability aterm deliberately does not have (it emits a \
-         --validate-config warning saying so). See docs/DESIGN-macos-tcc-prompts-2026-08-30.md",
-    ),
-    (
-        "agents_auto_prime",
-        "the coding-agent auto-prime opt-out, read off the UI thread by the spawn seam \
-         (spawn.rs `prime_agents_if_due`); a Settings row belongs with an Agents section \
-         that does not exist yet — `aterm agents status` names the key and what it stops",
-    ),
-    (
-        "fabric",
-        "the `aterm-link serve …` child this instance launches with `Scope::Bridge` over two \
-         inherited descriptors — a LAUNCHER INTENT (which program gets the bridge authority), \
-         not a preference, and deliberately not one click away in a Settings page that an \
-         Owner-scope client can drive through `settings set`: the whole point of putting \
-         `deliver`/`hold` behind a descriptor is that no token unlocks them. An Owner-scope \
-         client can already arm a bridge it names on an instance that has none (`fabric \
-         attach <argv>`, once per process: the latch); a writable `fabric.command` would make \
-         its choice the program EVERY later launch arms, past that latch. Edit `[fabric] \
-         command` in aterm.toml (validated by --validate-config), or run `aterm fabric on`",
-    ),
-    (
-        "operator",
-        "the EXPERIMENTAL embedded operator's launch switch ([operator] enabled, read once \
-         at launch): an agent-infrastructure opt-in behind `aterm fleet manage`, not a \
-         preference, and off by default because a new profile's allowlist is empty — a \
-         Settings toggle an Owner-scope client can drive would put a resident observer in \
-         every process one click away. Edit `[operator] enabled = true` in aterm.toml \
-         (docs/OPERATOR-EMBEDDED.md)",
-    ),
-    (
-        "keybindings",
-        "a chord→action TABLE, not a scalar: no faithful single-field shape exists, and a \
-         lossy string encoding could corrupt user bindings on a Save round-trip; edit the \
-         [keybindings] table in aterm.toml (validated by --validate-config)",
-    ),
-    (
-        "key_sequences",
-        "a chord→raw-bytes TABLE whose values carry escape sequences that require TOML \
-         literal-string quoting; the same no-lossy-encoding rationale as keybindings",
-    ),
-    (
-        "right_click",
-        "the grid right-button gesture (copy_paste|off, platform-defaulted: the conhost/WT \
-         copy-if-selection-else-paste convention on Windows, off elsewhere); Settings has no \
-         Mouse section yet, and seeding this one key as an orphan enum row would misfile a \
-         platform-semantics choice under an unrelated page — it joins the registry with the \
-         Mouse section (wheel bypass, link modifier, middle-click) as one coherent block",
-    ),
-    (
-        "tab_menu_chord",
-        "the keyboard spelling of the tab context menu on the in-grid-strip platforms, \
-         Windows and Linux (on|menu_key|off, defaulting to menu_key so Shift+F10 stays the \
-         application's terminfo kf22): a key-OWNERSHIP escape hatch, not a preference — \
-         its whole purpose is to say which of Menu / Shift+F10 the terminal may claim, a \
-         Keyboard-section concern the registry has no page for yet; it joins the registry \
-         with that section rather than sitting as an orphan enum row on an unrelated page",
-    ),
-    (
-        "font_hinting",
-        "the glyph grid-fitting mode (full|light|native|off, R2) — LIVE on Linux and \
-         Windows, inert on macOS, where CoreText applies its own grid discipline. This \
-         registry has no platform-gated-row precedent yet: a knob that visibly does nothing \
-         on the platform this Settings surface is authored on would read as broken. It is a \
-         full config key (aterm.toml, hot-reload); it joins the \
-         Typography section when per-platform row visibility exists",
-    ),
-    (
-        "font_subpixel",
-        "the Linux subpixel-RGB text mode (off|rgb|bgr, RFC-linux-subpixel-text stage 1) — \
-         the same platform-gated-row deferral as font_hinting, compounded: this stage is \
-         CPU-compositor-only (the default GPU backend renders grayscale regardless), so a \
-         Settings row would visibly do nothing for most users on ALL THREE platforms. It \
-         is a full config key (aterm.toml, hot-reload); it \
-         joins the Typography section with font_hinting when per-platform (and \
-         per-backend) row visibility exists",
-    ),
-    (
-        "tab_band_height",
-        "the in-grid tab band's height policy (compact|standard, platform-defaulted: standard \
-         on Windows, compact elsewhere). It is INERT on macOS — the platform this Settings \
-         surface is authored and screenshotted on puts tabs in the native toolbar and never \
-         paints the band — so a live row here would read as a control that does nothing, the \
-         exact dishonesty the Updates page is already criticised for; it joins the registry \
-         with the Windows chrome block (caption tint, band height, strip focus dim) once \
-         Settings has a page whose rows are all live on the reader's platform",
-    ),
-    (
-        "windowing_behavior",
-        "where a NEW terminal opens when one is already running (new_window|attach); this is \
-         the only Config key no running window ever reads — the FRONT DOOR \
-         (crates/aterm/src/main.rs) consults it before a window exists, and the Windows jump \
-         list reads it to decide whether a 'New Tab' taskbar row would tell the truth. \
-         Settings' whole contract is live, previewable, this-window state (uncommitted values \
-         project into the workbench scene), and a launch-routing choice has neither a preview \
-         nor any effect on the window you changed it in; Settings has no Launch section to \
-         file it under, so seeding it as an orphan enum row on the Window page would promise \
-         an in-window effect it cannot have. It joins the registry with a Launch/Startup \
-         section. Reachable meanwhile from Manual (it is in native_config_language's \
-         MANUAL_SCHEMA) and from aterm.toml",
-    ),
-];
 
 /// Every setting whose uncommitted value must have a renderer-native visual
 /// projection. This production registry is deliberately explicit: the Settings
@@ -1303,16 +1268,15 @@ pub(crate) const VISUAL_PREVIEW_KEYS: &[&str] = &[
     EDIT_STEM_GAMMA,
     EDIT_FONT_WEIGHT,
     EDIT_FONT_VARIATION,
-    // Cursor Kitty (2) — the cat's own page; both preview through the SAME
-    // cursor scene as the Cursor & Motion block below it. It was three until
-    // `cursor_trail_wake_ms` was retired (2026-09-16): a preview key must move
-    // something on the glass, and that dial had not moved anything since the
-    // v1 wake walk was deleted.
+    // Cursor Styles — the style list's page leads with its own key, so a page
+    // preview with nothing focused shows the style; everything below previews
+    // through the same cursor scene.
     EDIT_CURSOR_TRAIL_STYLE,
     EDIT_CURSOR_NYAN_SPRITE,
-    // Cursor & Motion (17)
+    // Cursor & Motion, and the shape and tuning on Cursor Styles
     EDIT_CURSOR_STYLE,
     EDIT_CURSOR_BLINK,
+    EDIT_CURSOR_MOMENTUM_GLOW,
     EDIT_CURSOR_TRAIL,
     EDIT_CURSOR_TRAIL_MS,
     EDIT_CURSOR_TRAIL_LENGTH,
@@ -1329,18 +1293,13 @@ pub(crate) const VISUAL_PREVIEW_KEYS: &[&str] = &[
     EDIT_CURSOR_GLOW_SDR_BOOST,
     EDIT_MOTION,
     EDIT_LOAD_ADAPTIVE_MOTION,
-    // Window & Tabs (4)
-    EDIT_COLUMNS,
-    EDIT_LINES,
-    EDIT_TAB_STRIP_ROWS,
-    EDIT_SHOW_BUILD_BADGE,
 ];
 
 /// Visual-section registry rows WITHOUT a renderer-native preview projection —
-/// the explicit allowlist twin of [`VISUAL_PREVIEW_KEYS`], same discipline as
-/// [`DEFERRED_CONFIG_KEYS`]: the preview-coverage gate fails any visual-section
-/// field that is in neither list, so a new field cannot silently ship a dead
-/// preview. Every entry documents why no projection exists yet:
+/// the explicit allowlist twin of [`VISUAL_PREVIEW_KEYS`]: the preview-coverage
+/// gate fails any visual-section field that is in neither list, so a new field
+/// cannot silently ship a dead preview. Every entry documents why no projection
+/// exists yet:
 ///   * `EDIT_TRAIL_SOUNDS` / `EDIT_TRAIL_SOUND_VOLUME` / `EDIT_TONE_MELODY`
 ///     / `EDIT_TRAIL_SOUND_BED` — aural, no pixels;
 ///   * the decorative overlay tables (`sparkle_words.*`, `matrix_rain.*`) —
@@ -1353,9 +1312,6 @@ pub(crate) const VISUAL_PREVIEW_KEYS: &[&str] = &[
 ///     compositor/present-path facts a virtual preview cannot honestly show;
 ///   * `restore_session` / `window_padding` / `window_padding_top` — session
 ///     and window-geometry knobs pending the workbench geometry rework;
-///   * Smart Titles — live runtime/provider state has its own truthful status
-///     card; a synthetic terminal preview cannot attest network locality,
-///     installed models, errors, or a session-authored Description;
 ///   * `font_weight_dark_nudge` / `stream_fade` / `stream_fade_ms` — theme-
 ///     conditional / temporal effects deferred with the preview-matrix
 ///     campaign (KNOWN INCOMPLETE, documented at the migration commit).
@@ -1396,9 +1352,12 @@ pub(crate) const VISUAL_PREVIEW_EXEMPT_KEYS: &[&str] = &[
     // streak to answer in the first place. Listed BY NAME rather than covered
     // by a prefix: this leaf routes to the Sound box, not to an
     // `output_streak.` table box, and the coverage gate's prefix escape hatch
-    // names only the two decorative tables. Whoever registers the table's
-    // visual keys owes them the same choice, one by one.
+    // names only the two decorative tables.
     EDIT_OUTPUT_STREAK_SOUND,
+    // PRISM WAKE's switch: the comet answers program output, and the
+    // workbench scene has no PTY, so there is none for it to answer (the pip's
+    // reason); the comet is previewed by the thing itself, on the next output.
+    EDIT_OUTPUT_STREAK_ENABLED,
     // The presence band and rim (round 19) answer a SESSION'S facts — a peer's
     // turn lease, a hold, unread mail on the fabric — and the workbench scene
     // has no session, no fabric and no peer to drive it; the surfaces are
@@ -1407,12 +1366,11 @@ pub(crate) const VISUAL_PREVIEW_EXEMPT_KEYS: &[&str] = &[
     // the preview-matrix campaign with the other live-input rows.
     EDIT_PRESENCE_BAND,
     EDIT_PRESENCE_RIM,
-    // The typing-momentum glow answers YOUR keystroke rate and cools when you
-    // stop; the workbench scene has no keystrokes to answer, so it is previewed
-    // by the thing itself — type, and the cursor warms (owner, 2026-09-08). A
-    // synthetic-typing projection joins the preview-matrix campaign with the
-    // other live-input rows.
-    EDIT_CURSOR_MOMENTUM_GLOW,
+    // Manual-only window geometry and chrome: no Settings row to preview.
+    EDIT_COLUMNS,
+    EDIT_LINES,
+    EDIT_TAB_STRIP_ROWS,
+    EDIT_SHOW_BUILD_BADGE,
     EDIT_PALETTE,
     EDIT_CURSOR_TRAIL_PACKS,
     EDIT_FONT_FEATURES,
@@ -1430,20 +1388,6 @@ pub(crate) const VISUAL_PREVIEW_EXEMPT_KEYS: &[&str] = &[
     EDIT_RESTORE_SESSION,
     EDIT_WINDOW_PADDING,
     EDIT_WINDOW_PADDING_TOP,
-    EDIT_DESCRIPTIVE_TITLES,
-    EDIT_TITLE_SUMMARY_PROVIDER,
-    EDIT_TITLE_SUMMARY_MODEL,
-    EDIT_TITLE_SUMMARY_ENDPOINT,
-    EDIT_TITLE_SUMMARY_TOKEN_FILE,
-    EDIT_TITLE_SUMMARY_TIMEOUT_SECONDS,
-    EDIT_TITLE_SUMMARY_PROXY_MODE,
-    EDIT_TITLE_SUMMARY_CA_FILE,
-    EDIT_TITLE_SUMMARY_INTERVAL_SECONDS,
-    EDIT_TITLE_SUMMARY_CONTEXT_LINES,
-    EDIT_TITLE_SUMMARY_INCLUDE_OUTPUT,
-    EDIT_TITLE_SUMMARY_ALLOW_REMOTE,
-    EDIT_TAB_TITLE_FORMAT,
-    EDIT_WINDOW_TITLE_FORMAT,
     // Tab-chrome state (a busy dot, an attention mark) has no workbench scene to
     // project into: the preview draws a grid, not a tab strip, and the bits come
     // from a live classifier rather than from any property of a rendered cell.
@@ -1503,12 +1447,10 @@ pub(crate) const DEFAULT_CURSOR_TRAIL_STYLE: &str = "rainbow kitty pet";
 /// companion and geometry. This table is also the save-time and introspection domain.
 pub(crate) const CURSOR_TRAIL_STYLES: &[&str] = &[
     "phaser",
-    "rainbow kitty",
     "rainbow kitty pet",
     "rainbow dog pet",
     "rainbow kitty flying",
     "rainbow kitty underline",
-    "rainbow kitty tall",
     // THE FLAT BODY (2026-09-13): the owner's A/B control against the default
     // comet body and its vivid rail (`docs/design/RAINBOW-KITTY-V2.md` §30) —
     // the same ribbon, the same resident pet, the body as it was before.
@@ -1622,7 +1564,7 @@ pub(crate) const CURSOR_TRAIL_STYLE_ALIASES: &[(&str, &str)] = &[
     ("rainbow", "rainbow kitty flying"),
     ("flying kitty", "rainbow kitty flying"),
     ("kitty flying", "rainbow kitty flying"),
-    ("kitty", "rainbow kitty"),
+    ("kitty", "rainbow kitty pet"),
     ("kitty pet", "rainbow kitty pet"),
     ("pet kitty", "rainbow kitty pet"),
     ("dog pet", "rainbow dog pet"),
@@ -1631,9 +1573,14 @@ pub(crate) const CURSOR_TRAIL_STYLE_ALIASES: &[(&str, &str)] = &[
     ("rainbow underline", "rainbow kitty underline"),
     ("underline rainbow", "rainbow kitty underline"),
     ("nyan underline", "rainbow kitty underline"),
-    ("rainbow tall", "rainbow kitty tall"),
-    ("tall rainbow", "rainbow kitty tall"),
-    ("nyan tall", "rainbow kitty tall"),
+    // The bare name and the `… tall` spellings draw exactly what the default
+    // draws (the tall body is the default geometry), so they are spellings of
+    // it rather than entries of their own.
+    ("rainbow kitty", "rainbow kitty pet"),
+    ("rainbow kitty tall", "rainbow kitty pet"),
+    ("rainbow tall", "rainbow kitty pet"),
+    ("tall rainbow", "rainbow kitty pet"),
+    ("nyan tall", "rainbow kitty pet"),
     ("rainbow flat", "rainbow kitty flat"),
     ("flat rainbow", "rainbow kitty flat"),
     ("nyan flat", "rainbow kitty flat"),
@@ -1661,12 +1608,12 @@ pub(crate) const CURSOR_TRAIL_STYLE_ALIASES: &[(&str, &str)] = &[
     // v1`, `nyan v1`, `rainbow v1`) died with the engine they named, so they
     // are unknown words now — refused by the validator, and at load they fall
     // back to the default with the same reported `Unknown` issue as any typo.
-    ("rainbow kitty v2", "rainbow kitty"),
+    ("rainbow kitty v2", "rainbow kitty pet"),
     ("rainbow kitty v2 pet", "rainbow kitty pet"),
     ("rainbow kitty v2 flying", "rainbow kitty flying"),
     ("rainbow kitty v2 underline", "rainbow kitty underline"),
-    ("rainbow kitty v2 tall", "rainbow kitty tall"),
-    ("kitty v2", "rainbow kitty"),
+    ("rainbow kitty v2 tall", "rainbow kitty pet"),
+    ("kitty v2", "rainbow kitty pet"),
     ("nyan v2", "rainbow kitty flying"),
     ("rainbow v2", "rainbow kitty flying"),
 ];
@@ -1722,7 +1669,7 @@ pub(crate) enum EditKind {
     Theme,
     /// An `RRGGBB`/`#RRGGBB` colour string (`foreground`, `cursor_color`, …). Edited via
     /// the in-panel text editor like [`EditKind::Text`], but [`typed_item`] REJECTS a
-    /// value that doesn't parse as a hex colour ([`crate::app_config::parse_hex_color`]),
+    /// value that doesn't parse as a hex colour ([`aterm_types::scheme::parse_hex`]),
     /// so a malformed colour can't be saved (it would otherwise be ignored at load).
     /// The overlay opens the COLOUR WHEEL popover on these rows instead of the
     /// free-text editor (design §7); commits still funnel through this validation.
@@ -1734,6 +1681,14 @@ pub(crate) enum EditKind {
 /// shared by the window (which builds the controls) and the writer (which types them).
 pub(crate) fn edit_kind(key: &str) -> EditKind {
     if COLOR_KEYS.contains(&key) {
+        return EditKind::Color;
+    }
+    if key
+        .strip_prefix(EDIT_PALETTE_OVERRIDES)
+        .and_then(|rest| rest.strip_prefix('.'))
+        .and_then(crate::resolved_colors::palette_override_index)
+        .is_some()
+    {
         return EditKind::Color;
     }
     if SECURITY_BOOL_KEYS.contains(&key) {
@@ -1788,15 +1743,6 @@ pub(crate) fn edit_kind(key: &str) -> EditKind {
         EDIT_DISPLAY_FONT => EditKind::Enum {
             options: DISPLAY_FONT_OPTIONS,
         },
-        EDIT_TITLE_SUMMARY_PROVIDER => EditKind::Enum {
-            options: TITLE_SUMMARY_PROVIDERS,
-        },
-        EDIT_TITLE_SUMMARY_PROXY_MODE => EditKind::Enum {
-            options: TITLE_SUMMARY_PROXY_MODES,
-        },
-        EDIT_TAB_TITLE_FORMAT | EDIT_WINDOW_TITLE_FORMAT => EditKind::Enum {
-            options: TITLE_FORMATS,
-        },
         EDIT_FONT_PX
         | EDIT_LINE_HEIGHT
         | EDIT_MINIMUM_CONTRAST
@@ -1820,9 +1766,6 @@ pub(crate) fn edit_kind(key: &str) -> EditKind {
         | EDIT_COLUMNS
         | EDIT_LINES
         | EDIT_TAB_STRIP_ROWS
-        | EDIT_TITLE_SUMMARY_TIMEOUT_SECONDS
-        | EDIT_TITLE_SUMMARY_INTERVAL_SECONDS
-        | EDIT_TITLE_SUMMARY_CONTEXT_LINES
         | EDIT_TAB_STATUS_QUIET_AFTER_MS
         | EDIT_TAB_STATUS_DWELL_MS
         | EDIT_SEARCH_HISTORY_LINES
@@ -1853,9 +1796,6 @@ pub(crate) fn edit_kind(key: &str) -> EditKind {
         | EDIT_BOLD_IS_BRIGHT
         | EDIT_FONT_THICKEN
         | EDIT_SHOW_BUILD_BADGE
-        | EDIT_DESCRIPTIVE_TITLES
-        | EDIT_TITLE_SUMMARY_INCLUDE_OUTPUT
-        | EDIT_TITLE_SUMMARY_ALLOW_REMOTE
         | EDIT_TAB_STATUS
         | EDIT_TAB_STATUS_BADGE
         | EDIT_TAB_CONNECTION_BADGE
@@ -1898,6 +1838,615 @@ pub(crate) fn edit_kind(key: &str) -> EditKind {
     }
 }
 
+/// How the Settings theme card is set: one theme for every OS appearance, or a
+/// light/dark pair that follows the OS. Read off the value itself (a
+/// `dark:…,light:…` split, or no value at all, is Follow system), so the card
+/// opens in the mode the file is in and no hidden flag can disagree with
+/// `aterm.toml` or with what the terminal draws.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ThemeMode {
+    /// One theme whatever the OS appearance: a plain name.
+    Always,
+    /// The OS appearance picks the side: a `dark:…,light:…` split, or an
+    /// unset or blank `theme`, which draws
+    /// [`crate::app_config::UNSET_THEME`]'s pair.
+    FollowSystem,
+}
+
+/// The mode a configured `theme` value (`None` when unset) is in, by the one
+/// selector grammar ([`aterm_types::scheme::ThemeSelector::parse`]). An unset
+/// or blank value reads as [`crate::app_config::UNSET_THEME`], the split it
+/// draws.
+pub(crate) fn theme_mode(raw: Option<&str>) -> ThemeMode {
+    use aterm_types::scheme::ThemeSelector;
+    let raw = raw
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty())
+        .unwrap_or(crate::app_config::UNSET_THEME);
+    match ThemeSelector::parse(raw).0 {
+        ThemeSelector::Split { .. } => ThemeMode::FollowSystem,
+        ThemeSelector::Single(_) => ThemeMode::Always,
+    }
+}
+
+/// The name an unset `theme` draws.
+const DEFAULT_THEME_NAME: &str = "Default";
+
+/// The `(dark, light)` pair `name` seeds when Follow system is turned on: the
+/// name keeps the side it is drawn for (declared or measured, as the catalog
+/// admitted it), so turning the mode on never changes what is drawn on that
+/// side, and the other side is its catalog pair, or aterm's own theme for
+/// that side (Default, Default Light) when it has none, so the switch that
+/// now reads On really follows the system. A name the catalog does not know
+/// stays on the dark side.
+fn theme_pair_seed(name: &str, themes: &crate::app_config::ThemeCatalog) -> (String, String) {
+    let meta = themes.meta(name);
+    let appearance = meta
+        .as_ref()
+        .map_or(aterm_types::Appearance::Dark, |meta| meta.appearance);
+    let opposite = match appearance {
+        aterm_types::Appearance::Dark => aterm_types::Appearance::Light,
+        aterm_types::Appearance::Light => aterm_types::Appearance::Dark,
+    };
+    let other = meta
+        .and_then(|meta| meta.pair)
+        .unwrap_or_else(|| crate::app_config::unset_theme_name(opposite).to_string());
+    match appearance {
+        aterm_types::Appearance::Dark => (name.to_string(), other),
+        aterm_types::Appearance::Light => (other, name.to_string()),
+    }
+}
+
+/// What the Follow-system card's Dark and Light slots show for a configured
+/// value, as `(dark, light)`. A split shows exactly what the runtime draws on
+/// each side ([`aterm_types::scheme::ThemeSelector::name_for`], so a side the
+/// value leaves out shows the named side's built-in pair, and no side at all
+/// is Default). A plain name, or no value, shows the pair turning the mode on
+/// would write.
+pub(crate) fn theme_slots(
+    raw: Option<&str>,
+    themes: &crate::app_config::ThemeCatalog,
+) -> (String, String) {
+    use aterm_types::scheme::ThemeSelector;
+    let raw = raw.map(str::trim).filter(|raw| !raw.is_empty());
+    let Some(raw) = raw else {
+        return theme_pair_seed(DEFAULT_THEME_NAME, themes);
+    };
+    match ThemeSelector::parse(raw).0 {
+        ThemeSelector::Single(name) => theme_pair_seed(&name, themes),
+        selector @ ThemeSelector::Split { .. } => {
+            let side = |appearance| {
+                selector
+                    .name_for(appearance)
+                    .unwrap_or(DEFAULT_THEME_NAME)
+                    .to_string()
+            };
+            (
+                side(aterm_types::Appearance::Dark),
+                side(aterm_types::Appearance::Light),
+            )
+        }
+    }
+}
+
+/// The `(dark, light)` themes a Follow-system `theme` value draws, read off
+/// the value alone: a side the value leaves out is what the runtime draws
+/// there ([`aterm_types::scheme::ThemeSelector::name_for`], else the unset
+/// rule's). `None` for a value that is not a split.
+pub(crate) fn theme_pair_names(raw: &str) -> Option<(String, String)> {
+    use aterm_types::scheme::ThemeSelector;
+    let (selector, _) = ThemeSelector::parse(raw.trim());
+    if !matches!(selector, ThemeSelector::Split { .. }) {
+        return None;
+    }
+    let side = |appearance| {
+        selector
+            .name_for(appearance)
+            .unwrap_or_else(|| crate::app_config::unset_theme_name(appearance))
+            .to_string()
+    };
+    Some((
+        side(aterm_types::Appearance::Dark),
+        side(aterm_types::Appearance::Light),
+    ))
+}
+
+/// How a Follow-system `theme` value reads on a control: the theme each side
+/// draws, dark first, then that it follows the OS ("Aterm Night / Aterm Day
+/// · follows system"), never the raw `dark:…,light:…` text. A split that
+/// draws one theme on both sides (a light theme kept over an unset value on
+/// a dark OS) does not change with the OS, so it reads as that one name.
+/// `None` for a value that is not a split (a plain name reads as itself).
+pub(crate) fn theme_pair_label(raw: &str) -> Option<String> {
+    theme_pair_names(raw).map(|(dark, light)| {
+        if dark == light {
+            dark
+        } else {
+            format!("{dark} / {light} \u{b7} follows system")
+        }
+    })
+}
+
+/// [`theme_pair_label`] without its tail, for a control too narrow for the
+/// whole of it: the two names are what the reader needs, and a pair of them
+/// already says the value changes with the OS.
+pub(crate) fn theme_pair_short_label(raw: &str) -> Option<String> {
+    theme_pair_names(raw).map(|(dark, light)| {
+        if dark == light {
+            dark
+        } else {
+            format!("{dark} / {light}")
+        }
+    })
+}
+
+/// The `theme` value for a `(dark, light)` pair, in the selector grammar's
+/// spelling.
+pub(crate) fn theme_split_value(dark: &str, light: &str) -> String {
+    format!("dark:{dark},light:{light}")
+}
+
+/// What a `(dark, light)` pair writes: no `theme` key at all (`None`) for the
+/// pair an unset theme draws ([`crate::app_config::UNSET_THEME`]), so
+/// following the system with aterm's own themes is the default and never an
+/// override; any other pair as its split.
+pub(crate) fn theme_pair_value(dark: &str, light: &str) -> Option<String> {
+    let unset = crate::app_config::unset_theme_name;
+    let is_unset = dark.eq_ignore_ascii_case(unset(aterm_types::Appearance::Dark))
+        && light.eq_ignore_ascii_case(unset(aterm_types::Appearance::Light));
+    (!is_unset).then(|| theme_split_value(dark, light))
+}
+
+/// The value turning Follow system on writes: the configured name on its own
+/// side and its pair on the other (`None`, no key, when that is the pair an
+/// unset theme draws). A value already following the system is returned as
+/// written.
+pub(crate) fn theme_follow_system_value(
+    raw: Option<&str>,
+    themes: &crate::app_config::ThemeCatalog,
+) -> Option<String> {
+    if theme_mode(raw) == ThemeMode::FollowSystem {
+        return raw.map(str::to_string);
+    }
+    let (dark, light) = theme_slots(raw, themes);
+    theme_pair_value(&dark, &light)
+}
+
+/// The value choosing `name` in the `side` slot writes: that side changes,
+/// and the other keeps what its slot shows (written out, so a side the value
+/// left implicit does not move when its partner changes). The pair an unset
+/// theme draws writes no key ([`theme_pair_value`]).
+pub(crate) fn theme_with_side(
+    raw: Option<&str>,
+    side: aterm_types::Appearance,
+    name: &str,
+    themes: &crate::app_config::ThemeCatalog,
+) -> Option<String> {
+    let (dark, light) = theme_slots(raw, themes);
+    match side {
+        aterm_types::Appearance::Dark => theme_pair_value(name.trim(), &light),
+        aterm_types::Appearance::Light => theme_pair_value(&dark, name.trim()),
+    }
+}
+
+/// Whether a configured `theme` value draws what an unset one does
+/// ([`crate::app_config::UNSET_THEME`]): no value, a blank one, or one that
+/// names no theme on either side. Such a value follows the OS without
+/// spelling it, so nothing the owner chose sits on the other side.
+pub(crate) fn theme_is_unset(raw: Option<&str>) -> bool {
+    let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
+        return true;
+    };
+    let (selector, _) = aterm_types::scheme::ThemeSelector::parse(raw);
+    selector.name_for(aterm_types::Appearance::Dark).is_none()
+        && selector.name_for(aterm_types::Appearance::Light).is_none()
+}
+
+/// The Follow-system pair choosing `id` on the `side` the OS shows writes
+/// when nothing was configured: `id` on that side, so what was chosen is
+/// what is drawn, and on the other side the partner made for it. A theme
+/// made for the shown side brings its catalog pair (Aterm Night brings Aterm
+/// Day) when the catalog can draw it, else the other side stays the unset
+/// rule's ([`crate::app_config::unset_theme_name`]). A theme made for the
+/// other appearance (a light theme chosen on a dark OS) is already that
+/// side's, so it takes both. A name the catalog does not know (a theme just
+/// saved) counts as made for the shown side, with no pair.
+fn theme_unset_choice_value(
+    side: aterm_types::Appearance,
+    id: &str,
+    themes: &crate::app_config::ThemeCatalog,
+) -> String {
+    use aterm_types::Appearance;
+    let other_side = match side {
+        Appearance::Dark => Appearance::Light,
+        Appearance::Light => Appearance::Dark,
+    };
+    let meta = themes.meta(id);
+    let made_for = meta.as_ref().map_or(side, |meta| meta.appearance);
+    let other = if made_for == side {
+        meta.and_then(|meta| meta.pair)
+            .filter(|pair| themes.meta(pair).is_some())
+            .unwrap_or_else(|| crate::app_config::unset_theme_name(other_side).to_string())
+    } else {
+        id.to_string()
+    };
+    match side {
+        Appearance::Dark => theme_split_value(id, &other),
+        Appearance::Light => theme_split_value(&other, id),
+    }
+}
+
+/// The `theme` value choosing theme `id` writes, the one rule every picker
+/// that is not tied to one side shares (the command palette, Settings ▸
+/// Themes' Keep and Save as, the Appearance theme picker): while the value is
+/// a Follow-system split only the `side` slot changes ([`theme_with_side`]);
+/// while it is unset, which follows the OS too, the choice keeps following it
+/// with `id`'s own pair ([`theme_unset_choice_value`]); either way the side is
+/// returned. A split that draws one theme on both sides (what a light theme
+/// chosen on a dark OS writes) is one choice, not two: a theme made for the
+/// other appearance replaces it on both sides, as it would over an unset
+/// value, and one made for the shown side takes that side alone. A plain name
+/// is replaced by `id` itself, for every appearance. Never a reset: choosing
+/// Default over a plain name writes `Default`, which stays dark on a light
+/// OS. A theme the catalog does not know counts as made for `side`. A choice
+/// that leaves the pair an unset theme draws writes no key (`None`), as every
+/// slot edit does ([`theme_pair_value`]).
+pub(crate) fn theme_choice_value(
+    raw: Option<&str>,
+    side: aterm_types::Appearance,
+    id: &str,
+    themes: &crate::app_config::ThemeCatalog,
+) -> (Option<String>, Option<aterm_types::Appearance>) {
+    let id = id.trim();
+    let one_theme_pair = raw
+        .and_then(theme_pair_names)
+        .is_some_and(|(dark, light)| dark.eq_ignore_ascii_case(&light));
+    let made_for_other_side = themes.meta(id).is_some_and(|meta| meta.appearance != side);
+    if theme_is_unset(raw) {
+        let written = theme_unset_choice_value(side, id, themes);
+        let value = theme_pair_names(&written)
+            .and_then(|(dark, light)| theme_pair_value(&dark, &light))
+            .or_else(|| theme_pair_names(&written).is_none().then_some(written));
+        (value, Some(side))
+    } else if one_theme_pair && made_for_other_side {
+        (Some(theme_split_value(id, id)), Some(side))
+    } else if theme_mode(raw) == ThemeMode::FollowSystem {
+        (theme_with_side(raw, side, id, themes), Some(side))
+    } else {
+        (Some(id.to_string()), None)
+    }
+}
+
+/// The value turning Follow system off writes: the theme the `visible` side
+/// shows, as one name for both appearances, so what is on screen stays.
+pub(crate) fn theme_always_value(
+    raw: Option<&str>,
+    visible: aterm_types::Appearance,
+    themes: &crate::app_config::ThemeCatalog,
+) -> String {
+    let (dark, light) = theme_slots(raw, themes);
+    match visible {
+        aterm_types::Appearance::Dark => dark,
+        aterm_types::Appearance::Light => light,
+    }
+}
+
+#[cfg(test)]
+mod theme_pair_tests {
+    use super::{
+        ThemeMode, theme_always_value, theme_choice_value, theme_follow_system_value,
+        theme_is_unset, theme_mode, theme_slots, theme_with_side,
+    };
+    use aterm_types::Appearance::{Dark, Light};
+
+    fn builtins() -> std::sync::Arc<crate::app_config::ThemeCatalog> {
+        crate::app_config::ThemeCatalog::empty()
+    }
+
+    #[test]
+    fn the_mode_is_read_off_the_value() {
+        // Unset (and blank) draws UNSET_THEME's pair, so it follows the
+        // system; a plain name is one theme always.
+        assert_eq!(theme_mode(None), ThemeMode::FollowSystem);
+        assert_eq!(theme_mode(Some("")), ThemeMode::FollowSystem);
+        assert_eq!(theme_mode(Some("  ")), ThemeMode::FollowSystem);
+        assert_eq!(theme_mode(Some("Nord")), ThemeMode::Always);
+        assert_eq!(
+            theme_mode(Some("dark:Nord,light:Nord Light")),
+            ThemeMode::FollowSystem
+        );
+        assert_eq!(
+            theme_mode(Some("light:Nord Light")),
+            ThemeMode::FollowSystem
+        );
+    }
+
+    #[test]
+    fn turning_follow_system_on_seeds_the_other_side_from_the_pair() {
+        let themes = builtins();
+        assert_eq!(
+            theme_follow_system_value(Some("Gruvbox Dark"), &themes).as_deref(),
+            Some("dark:Gruvbox Dark,light:Gruvbox Light")
+        );
+        // A light theme keeps the light side.
+        assert_eq!(
+            theme_follow_system_value(Some("Gruvbox Light"), &themes).as_deref(),
+            Some("dark:Gruvbox Dark,light:Gruvbox Light")
+        );
+        // Default's pair is the one an unset theme draws: turning the mode
+        // on from Default (or Default Light) removes the key, and unset is
+        // already following, so it stays unset.
+        assert_eq!(theme_follow_system_value(Some("Default"), &themes), None);
+        assert_eq!(
+            theme_follow_system_value(Some("Default Light"), &themes),
+            None
+        );
+        assert_eq!(theme_follow_system_value(None, &themes), None);
+        // A theme with no pair keeps its own side, and the other side gets
+        // aterm's own theme for it, so the mode really follows the system
+        // (never the same theme twice); one the catalog does not know stays
+        // on the dark side.
+        let unpaired = aterm_types::scheme::builtin_theme_list()
+            .into_iter()
+            .filter(|theme| theme.pair.is_none())
+            .collect::<Vec<_>>();
+        for appearance in [Dark, Light] {
+            let theme = unpaired
+                .iter()
+                .find(|theme| theme.appearance == appearance)
+                .expect("a built-in without a pair on each side");
+            let expected = match appearance {
+                Dark => format!("dark:{},light:Default Light", theme.name),
+                Light => format!("dark:Default,light:{}", theme.name),
+            };
+            assert_eq!(
+                theme_follow_system_value(Some(theme.name), &themes),
+                Some(expected)
+            );
+        }
+        assert_eq!(
+            theme_follow_system_value(Some("Nord"), &themes).as_deref(),
+            Some("dark:Nord,light:Default Light")
+        );
+        assert_eq!(
+            theme_follow_system_value(Some("GitHub Light"), &themes).as_deref(),
+            Some("dark:Default,light:GitHub Light")
+        );
+        assert_eq!(
+            theme_follow_system_value(Some("Office Missing"), &themes).as_deref(),
+            Some("dark:Office Missing,light:Default Light")
+        );
+        // An existing split is never replaced.
+        assert_eq!(
+            theme_follow_system_value(Some("dark:Dracula,light:Nord"), &themes).as_deref(),
+            Some("dark:Dracula,light:Nord")
+        );
+    }
+
+    #[test]
+    fn a_choice_keeps_a_pair_and_writes_a_name_otherwise() {
+        let themes = builtins();
+        let pair = Some("dark:Gruvbox Dark,light:Gruvbox Light");
+        assert_eq!(
+            theme_choice_value(pair, Light, "Nord", &themes),
+            (
+                Some("dark:Gruvbox Dark,light:Nord".to_string()),
+                Some(Light)
+            )
+        );
+        assert_eq!(
+            theme_choice_value(pair, Dark, "Default", &themes),
+            (
+                Some("dark:Default,light:Gruvbox Light".to_string()),
+                Some(Dark)
+            )
+        );
+        // A plain name is not a pair: the name is written as is, Default
+        // included (never a reset, which would follow the OS).
+        for side in [Dark, Light] {
+            assert_eq!(
+                theme_choice_value(Some("Dracula"), side, "Default", &themes),
+                (Some("Default".to_string()), None)
+            );
+        }
+    }
+
+    #[test]
+    fn a_choice_from_an_unset_theme_keeps_following_the_os_with_its_pair() {
+        let themes = builtins();
+        // Every spelling of "nothing configured" draws the unset pair.
+        for raw in [None, Some(""), Some("  "), Some("dark:,light:")] {
+            assert!(theme_is_unset(raw), "{raw:?}");
+            assert_eq!(
+                theme_choice_value(raw, Dark, "Aterm Night", &themes),
+                (
+                    Some("dark:Aterm Night,light:Aterm Day".to_string()),
+                    Some(Dark)
+                ),
+                "{raw:?}"
+            );
+            assert_eq!(
+                theme_choice_value(raw, Light, "Aterm Day", &themes),
+                (
+                    Some("dark:Aterm Night,light:Aterm Day".to_string()),
+                    Some(Light)
+                ),
+                "{raw:?}"
+            );
+        }
+        // Negative control: a value that names a theme is not unset, so a
+        // plain name is still replaced by a plain name.
+        for raw in [Some("Dracula"), Some("dark:Dracula")] {
+            assert!(!theme_is_unset(raw), "{raw:?}");
+        }
+        assert_eq!(
+            theme_choice_value(Some("Dracula"), Dark, "Aterm Night", &themes),
+            (Some("Aterm Night".to_string()), None)
+        );
+        // Unpaired themes: one made for the shown side leaves the other side
+        // the unset rule's; one made for the other appearance takes both.
+        let unpaired = |appearance| {
+            aterm_types::scheme::builtin_theme_list()
+                .into_iter()
+                .find(|theme| {
+                    theme.pair.is_none()
+                        && aterm_types::scheme::ThemeMeta::of_builtin(*theme).appearance
+                            == appearance
+                })
+                .expect("an unpaired built-in for each appearance")
+                .name
+        };
+        let (dark, light) = (unpaired(Dark), unpaired(Light));
+        assert_eq!(
+            theme_choice_value(None, Dark, dark, &themes).0,
+            Some(format!("dark:{dark},light:Default Light"))
+        );
+        assert_eq!(
+            theme_choice_value(None, Light, light, &themes).0,
+            Some(format!("dark:Default,light:{light}"))
+        );
+        assert_eq!(
+            theme_choice_value(None, Dark, light, &themes).0,
+            Some(format!("dark:{light},light:{light}"))
+        );
+        // A name the catalog does not know yet (a theme just saved) sits on
+        // the shown side beside the unset rule's other side.
+        assert_eq!(
+            theme_choice_value(None, Light, "Harbor Dusk", &themes)
+                .0
+                .as_deref(),
+            Some("dark:Default,light:Harbor Dusk")
+        );
+        // Law over every built-in on both sides: the written value follows
+        // the OS and draws the chosen theme on the side that was shown.
+        for theme in aterm_types::scheme::builtin_theme_list() {
+            for side in [Dark, Light] {
+                // The pair an unset theme draws writes no key at all.
+                let (written, kept) = theme_choice_value(None, side, theme.name, &themes);
+                assert_eq!(kept, Some(side), "{written:?}");
+                assert_eq!(
+                    theme_mode(written.as_deref()),
+                    ThemeMode::FollowSystem,
+                    "{written:?}"
+                );
+                let drawn = written.as_deref().map_or_else(
+                    || Some(crate::app_config::unset_theme_name(side).to_string()),
+                    |written| crate::app_config::resolve_theme_name_value(Some(written), side),
+                );
+                assert_eq!(drawn.as_deref(), Some(theme.name), "{written:?}");
+            }
+        }
+    }
+
+    /// A pair that draws one theme on both sides is one choice: a theme made
+    /// for the other appearance replaces it on both sides (as over an unset
+    /// value), one made for the shown side takes that side alone. A pair
+    /// with two themes (the control) only ever changes the shown side.
+    #[test]
+    fn a_choice_over_a_one_theme_pair_follows_the_unset_rule() {
+        let themes = builtins();
+        let same = Some("dark:Aterm Day,light:Aterm Day");
+        assert_eq!(
+            theme_choice_value(same, Dark, "Linen", &themes),
+            (Some("dark:Linen,light:Linen".to_string()), Some(Dark))
+        );
+        assert_eq!(
+            theme_choice_value(same, Dark, "Hearth", &themes),
+            (Some("dark:Hearth,light:Aterm Day".to_string()), Some(Dark))
+        );
+        // A name the catalog does not know counts as made for the shown side.
+        assert_eq!(
+            theme_choice_value(same, Light, "Harbor Day", &themes)
+                .0
+                .as_deref(),
+            Some("dark:Aterm Day,light:Harbor Day")
+        );
+        let two = Some("dark:Nord,light:Aterm Day");
+        assert_eq!(
+            theme_choice_value(two, Dark, "Linen", &themes).0.as_deref(),
+            Some("dark:Linen,light:Aterm Day")
+        );
+        // A slot edit names its side and never takes both.
+        assert_eq!(
+            theme_with_side(same, Dark, "Linen", &themes).as_deref(),
+            Some("dark:Linen,light:Aterm Day")
+        );
+    }
+
+    #[test]
+    fn the_unset_theme_is_named_follow_system_with_the_side_drawn() {
+        let named = super::unset_theme_label("Default Light");
+        assert!(named.starts_with(super::UNSET_THEME_LABEL), "{named}");
+        assert!(named.ends_with("Default Light"), "{named}");
+        assert_eq!(super::unset_theme_label(" "), super::UNSET_THEME_LABEL);
+    }
+
+    #[test]
+    fn a_slot_edit_keeps_the_other_side() {
+        let themes = builtins();
+        let raw = Some("dark:Gruvbox Dark,light:Gruvbox Light");
+        assert_eq!(
+            theme_with_side(raw, Light, "Solarized Light", &themes).as_deref(),
+            Some("dark:Gruvbox Dark,light:Solarized Light")
+        );
+        assert_eq!(
+            theme_with_side(raw, Dark, "Nord", &themes).as_deref(),
+            Some("dark:Nord,light:Gruvbox Light")
+        );
+        // A side edit that leaves the pair an unset theme draws removes the
+        // key; one that leaves any other pair writes it.
+        let unset_pair = Some("dark:Nord,light:Default Light");
+        assert_eq!(theme_with_side(unset_pair, Dark, "Default", &themes), None);
+        assert_eq!(theme_with_side(None, Dark, "Default", &themes), None);
+        assert_eq!(
+            theme_with_side(None, Light, "GitHub Light", &themes).as_deref(),
+            Some("dark:Default,light:GitHub Light")
+        );
+        // A side the value leaves implicit is written out as the slot shows
+        // it, so it does not move with its partner.
+        let implicit = Some("dark:Gruvbox Dark");
+        assert_eq!(
+            theme_slots(implicit, &themes),
+            ("Gruvbox Dark".to_string(), "Gruvbox Light".to_string())
+        );
+        assert_eq!(
+            theme_with_side(implicit, Dark, "Nord", &themes).as_deref(),
+            Some("dark:Nord,light:Gruvbox Light")
+        );
+        // Every slot edit parses back to the side it named and the side it
+        // kept (law over a sweep of built-ins).
+        for theme in aterm_types::scheme::builtin_theme_list() {
+            for side in [Dark, Light] {
+                let written = theme_with_side(raw, side, theme.name, &themes);
+                let (dark, light) = theme_slots(written.as_deref(), &themes);
+                let (edited, kept, kept_was) = match side {
+                    Dark => (dark, light, "Gruvbox Light"),
+                    Light => (light, dark, "Gruvbox Dark"),
+                };
+                assert_eq!(edited, theme.name, "{written:?}");
+                assert_eq!(kept, kept_was, "{written:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn turning_follow_system_off_writes_the_visible_side() {
+        let themes = builtins();
+        let raw = Some("dark:Dracula,light:GitHub Light");
+        assert_eq!(theme_always_value(raw, Dark, &themes), "Dracula");
+        assert_eq!(theme_always_value(raw, Light, &themes), "GitHub Light");
+        // On and off again round-trips the name it started from on its side.
+        let on = theme_follow_system_value(Some("Gruvbox Dark"), &themes);
+        assert_eq!(
+            theme_always_value(on.as_deref(), Dark, &themes),
+            "Gruvbox Dark"
+        );
+        // Off from unset keeps what an unset theme draws on that side.
+        assert_eq!(theme_always_value(None, Dark, &themes), "Default");
+        assert_eq!(theme_always_value(None, Light, &themes), "Default Light");
+    }
+}
+
 /// An error from [`apply_prefs_edits`]: either the existing file is not valid TOML
 /// (so a non-destructive edit can't be performed safely), or a supplied value does not
 /// parse as the key's declared type. Both are surfaced (logged) by the caller, which
@@ -1908,8 +2457,14 @@ pub(crate) enum PrefsEditError {
     /// edit is refused so a malformed file is never overwritten.
     Parse(String),
     /// A control value did not parse as its key's declared [`EditKind`] (e.g. a
-    /// non-numeric font size). Carries the offending `(key, raw)` for the message.
-    BadValue { key: String, raw: String },
+    /// non-numeric font size). Carries the offending `(key, raw)` for the message,
+    /// and what the value must be where the writer can say ([`integer_requirement`]
+    /// for an Integer key).
+    BadValue {
+        key: String,
+        raw: String,
+        expected: Option<String>,
+    },
     /// A value that parses but that the resolver would IGNORE at load: `font_px`
     /// outside `FONT_PX_MIN..=FONT_PX_MAX` (or not finite). `resolve_font_px`
     /// admits only that range and falls through to the default rather than
@@ -1917,25 +2472,24 @@ pub(crate) enum PrefsEditError {
     /// `font_px = 0.0`, and change nothing on screen (`dims` stayed at 16.00 —
     /// measured 2026-09-22). Carries the range the reply must name.
     OutOfRange { key: String, range: String },
-    /// A credential-adjacent control contained an invalid value. The raw input is
-    /// deliberately not retained: this error is logged and shown in Settings, so
-    /// carrying a pasted secret here would turn a successful rejection into a
-    /// diagnostic disclosure.
-    SensitiveBadValue { key: String, expected: &'static str },
 }
 
 impl std::fmt::Display for PrefsEditError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PrefsEditError::Parse(e) => write!(f, "existing aterm.toml is not valid TOML: {e}"),
-            PrefsEditError::BadValue { key, raw } => {
-                write!(f, "invalid value for {key}: {raw:?}")
-            }
+            PrefsEditError::BadValue {
+                key,
+                raw,
+                expected: None,
+            } => write!(f, "invalid value for {key}: {raw:?}"),
+            PrefsEditError::BadValue {
+                key,
+                raw,
+                expected: Some(expected),
+            } => write!(f, "invalid value for {key}: {raw:?}; it must be {expected}"),
             PrefsEditError::OutOfRange { key, range } => {
                 write!(f, "invalid value for {key}: must be {range}")
-            }
-            PrefsEditError::SensitiveBadValue { key, expected } => {
-                write!(f, "invalid value for {key}: expected {expected}")
             }
         }
     }
@@ -1962,12 +2516,14 @@ impl std::error::Error for PrefsEditError {}
 /// DOTTED KEYS (`"table.key"`, e.g. `matrix_rain.enabled`, or deeper like
 /// `sparkle_words.profanity.enabled`): the edit walks the table chain to the
 /// leaf — missing tables are created, an existing table is edited in place
-/// (comments + sibling keys survive). Removal removes ONLY the leaf: parent
-/// tables are left in place even when emptied (deleting `[matrix_rain]`
-/// outright would also take its comments, and an empty table parses to the
-/// same defaults). A dotted edit REFUSES (fail-closed `Parse` error) when any
-/// step of the chain is not a table (e.g. `matrix_rain = 5`): silently
-/// clobbering a hand-authored scalar would destroy user data.
+/// (comments + sibling keys survive). A removal takes the leaf, then each
+/// parent table it left with no entries and no comment of its own
+/// ([`aterm_toml::edit::DocumentMut::remove_path_pruning`]): an empty table
+/// parses to the same defaults as an absent one, so a reset leaves no bare
+/// `[matrix_rain]` header behind, while a table that keeps a comment stays. A
+/// dotted edit REFUSES (fail-closed `Parse` error) when any step of the chain
+/// is not a table (e.g. `matrix_rain = 5`): silently clobbering a
+/// hand-authored scalar would destroy user data.
 ///
 /// Every OTHER key, every comment, and the document's formatting are PRESERVED, because
 /// the edit goes through `aterm-toml`'s format-preserving DOM, not a re-serialize. Only
@@ -1993,7 +2549,7 @@ pub(crate) fn apply_prefs_edits(
             let parts: Vec<&str> = key.split('.').collect();
             match value {
                 None => {
-                    doc.remove_path(&parts);
+                    doc.remove_path_pruning(&parts);
                 }
                 Some(raw) => {
                     let item = typed_item(key, raw)?;
@@ -2007,7 +2563,7 @@ pub(crate) fn apply_prefs_edits(
             for (retired, current) in RETIRED_PACKAGES_SPELLINGS {
                 if current == key {
                     let retired: Vec<&str> = retired.split('.').collect();
-                    doc.remove_path(&retired);
+                    doc.remove_path_pruning(&retired);
                 }
             }
             continue;
@@ -2031,6 +2587,35 @@ pub(crate) fn apply_prefs_edits(
         }
     }
 
+    Ok(doc.to_string())
+}
+
+/// The TOML item a Settings row writes for `key` from `raw` (the same
+/// conversion as [`apply_prefs_edits`]).
+pub(crate) fn typed_toml_item(
+    key: &str,
+    raw: &str,
+) -> Result<aterm_toml::edit::Item, PrefsEditError> {
+    typed_item(key, raw)
+}
+
+/// `existing` with `key` set to `item` where TOML reads it: a top-level key
+/// among the root keys, ahead of every table; a dotted key in its table,
+/// created where missing. Formatting and comments elsewhere are kept.
+pub(crate) fn with_toml_item(
+    existing: &str,
+    key: &str,
+    item: aterm_toml::edit::Item,
+) -> Result<String, PrefsEditError> {
+    let mut doc = existing
+        .parse::<aterm_toml::edit::DocumentMut>()
+        .map_err(|e| PrefsEditError::Parse(e.to_string()))?;
+    if key.contains('.') {
+        let parts: Vec<&str> = key.split('.').collect();
+        set_nested_key(&mut doc, &parts, item)?;
+    } else {
+        doc[key] = item;
+    }
     Ok(doc.to_string())
 }
 
@@ -2112,11 +2697,11 @@ fn set_nested_key(
 /// serde-representable range of the key's `Config` field type, not the resolver's
 /// semantic clamp range ([`range_of`] mirrors those for sliders; an in-domain value
 /// beyond a resolver clamp still saves and is clamped at load, unchanged behaviour).
-/// Smart-title request controls are the deliberate exception: their operational
+/// Tab-status policy controls are the deliberate exception: their operational
 /// bounds are part of the Settings/control-socket contract, so their writable domain
-/// is the narrower resolver range and a saved value always equals the worker's value.
-/// [`typed_item`] rejects a write outside this domain because it would either be valid
-/// TOML that serde rejects wholesale, or a Smart Title value the resolver immediately
+/// is the narrower resolver range and a saved value always equals the classifier's
+/// value. [`typed_item`] rejects a write outside this domain because it would either be
+/// valid TOML that serde rejects wholesale, or a value the resolver immediately
 /// replaces. In the first case the live reload only warns and keeps the old config
 /// (the Save looks like it succeeded), and the NEXT launch falls back to
 /// `Config::default()`, silently discarding the user's entire configuration until the
@@ -2132,30 +2717,9 @@ fn set_nested_key(
 /// so an arm can never drift from its field type.
 fn integer_domain(key: &str) -> std::ops::RangeInclusive<i64> {
     match key {
-        // Smart-title request policy: unlike ordinary sliders, these bounds are
-        // enforced by every Settings writer so reload never silently substitutes a
-        // different timeout, cadence, or context size than the value just saved.
-        EDIT_TITLE_SUMMARY_TIMEOUT_SECONDS => {
-            i64::try_from(MIN_TITLE_SUMMARY_TIMEOUT_SECONDS)
-                .expect("smart-title timeout floor fits i64")
-                ..=i64::try_from(MAX_TITLE_SUMMARY_TIMEOUT_SECONDS)
-                    .expect("smart-title timeout ceiling fits i64")
-        }
-        EDIT_TITLE_SUMMARY_INTERVAL_SECONDS => {
-            i64::try_from(MIN_TITLE_SUMMARY_INTERVAL_SECONDS)
-                .expect("smart-title interval floor fits i64")
-                ..=i64::try_from(MAX_TITLE_SUMMARY_INTERVAL_SECONDS)
-                    .expect("smart-title interval ceiling fits i64")
-        }
-        EDIT_TITLE_SUMMARY_CONTEXT_LINES => {
-            i64::try_from(MIN_TITLE_SUMMARY_CONTEXT_LINES)
-                .expect("smart-title context floor fits i64")
-                ..=i64::try_from(MAX_TITLE_SUMMARY_CONTEXT_LINES)
-                    .expect("smart-title context ceiling fits i64")
-        }
-        // Tab-status policy: same rule as the smart-title trio — the writer
-        // enforces the RESOLVER's domain, so a saved value is exactly the value
-        // the next reload classifies with.
+        // Tab-status policy: unlike ordinary sliders, the writer enforces the
+        // RESOLVER's domain, so a saved value is exactly the value the next
+        // reload classifies with.
         EDIT_TAB_STATUS_QUIET_AFTER_MS => {
             i64::try_from(MIN_TAB_STATUS_QUIET_AFTER_MS).expect("tab-status quiet floor fits i64")
                 ..=i64::try_from(MAX_TAB_STATUS_QUIET_AFTER_MS)
@@ -2194,95 +2758,63 @@ fn integer_domain(key: &str) -> std::ops::RangeInclusive<i64> {
     }
 }
 
-fn title_summary_path_has_url_authority(value: &str) -> bool {
-    // Reject an authority-bearing URI without banning Windows drive paths or
-    // ordinary relative filenames containing a colon.
-    value.split_once("://").is_some_and(|(scheme, rest)| {
-        let mut chars = scheme.chars();
-        chars
-            .next()
-            .is_some_and(|first| first.is_ascii_alphabetic())
-            && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
-            && scheme.len() >= 2
-            && !rest.is_empty()
-    })
+/// Would the writer take `raw` for `key`? Its own check ([`typed_item`]), for
+/// a caller that refuses a value before it reaches the file.
+pub(crate) fn check_edit_value(key: &str, raw: &str) -> Result<(), PrefsEditError> {
+    typed_item(key, raw).map(|_| ())
 }
 
-/// Lexical fail-closed guard for the Smart Titles bearer-token FILE field.
+/// What a whole number for Integer `key` must be, worded for `raw`, a value
+/// the writer refused ([`integer_domain`]): the end it passed, or, when it is
+/// not a whole number at all, the whole numbers the key takes. The words
+/// follow "must be": the Settings row and the control socket's refusal say
+/// the same thing.
 ///
-/// This is deliberately not a filesystem existence check: Settings must accept a
-/// path before its file is provisioned, and relative paths are part of the public
-/// config contract. It only rejects values that are unmistakably pasted credential
-/// material rather than paths (authorization headers, common API-key prefixes,
-/// compact JWTs, and URL-shaped values). Keeping the check here, immediately before
-/// [`typed_item`] constructs TOML, covers the overlay, native Settings service, and
-/// control-socket writers that all converge on [`apply_prefs_edits`].
-fn title_summary_token_file_looks_like_path(value: &str) -> bool {
-    if value.is_empty() || value.chars().any(char::is_control) {
-        return false;
+/// Classified by spelling, then by sign: a whole number is what the writer's
+/// parse admits (`[+-]?digits`), so digits too long for `i64` are still a
+/// whole number, past the end their sign points at (not "not a number").
+pub(crate) fn integer_requirement(key: &str, raw: &str) -> String {
+    let (start, end) = integer_domain(key).into_inner();
+    let raw = raw.trim();
+    let digits = raw.strip_prefix(['+', '-']).unwrap_or(raw);
+    if !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        let above = raw
+            .parse::<i64>()
+            .map_or(!raw.starts_with('-'), |value| value > end);
+        return if above {
+            format!("at most {}", grouped_digits(end))
+        } else if start == 0 {
+            "0 or more".to_string()
+        } else {
+            format!("at least {}", grouped_digits(start))
+        };
     }
-
-    let lower = value.to_ascii_lowercase();
-    if lower.starts_with("bearer ")
-        || lower.starts_with("authorization:")
-        || lower.starts_with("authorization=")
-    {
-        return false;
+    if start == 0 && end >= 1_000_000 {
+        "a whole number, 0 or more".to_string()
+    } else {
+        format!(
+            "a whole number from {} to {}",
+            grouped_digits(start),
+            grouped_digits(end)
+        )
     }
-
-    if title_summary_path_has_url_authority(value) {
-        return false;
-    }
-
-    // A compact JWT is three base64url segments. Requiring the canonical JSON
-    // header prefix avoids mistaking a legitimate dotted relative filename for a
-    // token (for example `provider-token.with-dots.jwt`).
-    let mut jwt = value.split('.');
-    let looks_like_jwt = match (jwt.next(), jwt.next(), jwt.next(), jwt.next()) {
-        (Some(header), Some(payload), Some(signature), None) => {
-            let base64url = |segment: &str| {
-                !segment.is_empty()
-                    && segment
-                        .bytes()
-                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-            };
-            header.starts_with("eyJ")
-                && header.len() >= 8
-                && signature.len() >= 8
-                && base64url(header)
-                && base64url(payload)
-                && base64url(signature)
-        }
-        _ => false,
-    };
-    if looks_like_jwt {
-        return false;
-    }
-
-    // Shared prompt/output detection covers fixed provider prefixes, compact JWTs,
-    // and long opaque token shapes. Apply it to single-component values only:
-    // paths such as `secrets/sk_prod-token` remain valid relative paths.
-    let is_single_component = !value.contains('/') && !value.contains('\\');
-    if is_single_component && crate::title_summary::looks_like_raw_credential(value) {
-        return false;
-    }
-
-    true
 }
 
-/// Lexical guard for the custom CA-bundle FILE field. A path may be provisioned
-/// after Settings is saved, so this deliberately performs no filesystem check. It
-/// rejects controls, URLs, and unmistakable inline PEM armor before any certificate
-/// or private-key material can be persisted or copied into a diagnostic.
-fn title_summary_ca_file_looks_like_path(value: &str) -> bool {
-    if value.is_empty()
-        || value.chars().any(char::is_control)
-        || title_summary_path_has_url_authority(value)
-    {
-        return false;
+/// `1234567` as `1,234,567`.
+pub(crate) fn grouped_digits(value: i64) -> String {
+    let digits = value.unsigned_abs().to_string();
+    let mut grouped = String::new();
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(digit);
     }
-    let upper = value.to_ascii_uppercase();
-    !upper.contains("-----BEGIN ") && !upper.contains("-----END ")
+    if value < 0 {
+        format!("-{grouped}")
+    } else {
+        grouped
+    }
 }
 
 /// Whether a `font_px` value is one the resolver ADMITS: finite and inside
@@ -2304,32 +2836,97 @@ fn font_px_range() -> String {
 /// [`PrefsEditError::BadValue`] so a Save never writes a value the reload parser
 /// would reject, and a `font_px` the resolver would ignore is a
 /// [`PrefsEditError::OutOfRange`].
+/// `raw` as a structured TOML value: an array or inline table as written,
+/// or the body of a header table (`12 = "#88c0d0"` lines, the config
+/// service's spelling of a `[palette_overrides]` section) as an inline table.
+fn structured_value(raw: &str) -> Option<aterm_toml::edit::Value> {
+    use aterm_toml::edit::{DocumentMut, InlineTable, Item, TableLike, Value};
+    if let Ok(value) = raw.parse::<Value>() {
+        return (value.is_array() || value.as_inline_table().is_some()).then(|| {
+            let mut value = value;
+            value.decor_mut().clear();
+            value
+        });
+    }
+    let body = raw.parse::<DocumentMut>().ok()?;
+    // A comment is a valid empty document, but is not a table value. The
+    // config service projects an authored empty table as `{}` (and older
+    // empty header-table projections as an empty string).
+    if body.iter().next().is_none() && !raw.trim().is_empty() {
+        return None;
+    }
+    let mut table = InlineTable::new();
+    for (key, item) in body.iter() {
+        let mut value = item.as_value()?.clone();
+        value.decor_mut().clear();
+        table.insert(key, Item::Value(value));
+    }
+    Some(Value::InlineTable(table))
+}
+
 fn typed_item(key: &str, raw: &str) -> Result<aterm_toml::edit::Item, PrefsEditError> {
     use aterm_toml::edit::{Item, Value};
     let bad = || PrefsEditError::BadValue {
         key: key.to_string(),
         raw: raw.to_string(),
+        expected: None,
     };
     let trimmed = raw.trim();
-    if key == EDIT_TITLE_SUMMARY_TOKEN_FILE && !title_summary_token_file_looks_like_path(trimmed) {
-        return Err(PrefsEditError::SensitiveBadValue {
-            key: key.to_string(),
-            expected: "a file path",
-        });
-    }
-    if key == EDIT_TITLE_SUMMARY_CA_FILE && !title_summary_ca_file_looks_like_path(trimmed) {
-        return Err(PrefsEditError::SensitiveBadValue {
-            key: key.to_string(),
-            expected: "a file path",
-        });
-    }
-    if key == EDIT_TITLE_SUMMARY_ENDPOINT
-        && !crate::title_summary::endpoint_is_credential_free_absolute_url(trimmed)
-    {
-        return Err(PrefsEditError::SensitiveBadValue {
-            key: key.to_string(),
-            expected: "a credential-free absolute HTTP(S) URL without a query or fragment",
-        });
+    // The whole palette slot table, or a list given as its TOML array (the
+    // semantic value the config service reports, which Undo writes back after
+    // a Save as cleared it): written as the TOML it is, never as a string the
+    // reload would refuse.
+    let structured = if key == EDIT_PALETTE_OVERRIDES {
+        Some(structured_value(trimmed).ok_or_else(bad)?)
+    } else if LIST_KEYS.contains(&key) && trimmed.starts_with('[') {
+        // A compatibility list member can itself start with a bracket (a
+        // path such as `[packs]/trail.toml`, or a shell argument). Only an
+        // actual TOML array selects structured interpretation; otherwise the
+        // original comma-list writer below preserves those literal members.
+        trimmed
+            .parse::<Value>()
+            .ok()
+            .filter(Value::is_array)
+            .map(|mut value| {
+                value.decor_mut().clear();
+                value
+            })
+    } else {
+        None
+    };
+    if let Some(value) = structured {
+        let colour = |v: &Value| {
+            v.as_str()
+                .and_then(aterm_types::scheme::parse_hex)
+                .is_some()
+        };
+        // Authored empty arrays/tables are valid typed values too. An actual
+        // reset uses None; Undo must be able to restore Some(empty collection).
+        let fits = match &value {
+            Value::InlineTable(table) => {
+                key == EDIT_PALETTE_OVERRIDES
+                    && aterm_toml::edit::TableLike::iter(table).all(|(slot, item)| {
+                        crate::resolved_colors::palette_override_index(slot).is_some()
+                            && item.as_value().is_some_and(colour)
+                    })
+            }
+            Value::Array(array) => {
+                key != EDIT_PALETTE_OVERRIDES
+                    && array.iter().all(|v| {
+                        if key == EDIT_PALETTE {
+                            colour(v)
+                        } else {
+                            v.as_str().is_some()
+                        }
+                    })
+            }
+            _ => false,
+        };
+        return if fits {
+            Ok(Item::Value(value))
+        } else {
+            Err(bad())
+        };
     }
     // LIST-valued keys (see [`LIST_KEYS`]): the one-line comma form is split
     // into a real TOML ARRAY — these fields deserialize as `Vec<String>`, so a
@@ -2349,7 +2946,7 @@ fn typed_item(key: &str, raw: &str) -> Result<aterm_toml::edit::Item, PrefsEditE
         if key == EDIT_PALETTE
             && entries
                 .iter()
-                .any(|e| crate::app_config::parse_hex_color(e).is_none())
+                .any(|e| aterm_types::scheme::parse_hex(e).is_none())
         {
             return Err(bad());
         }
@@ -2377,13 +2974,18 @@ fn typed_item(key: &str, raw: &str) -> Result<aterm_toml::edit::Item, PrefsEditE
         // TOML, but the reload's serde model rejects the whole file over it —
         // the exact corruption this function's contract forbids — so an
         // out-of-domain integer dies here as a BadValue, never in the file.
-        EditKind::Integer => {
-            let n = trimmed.parse::<i64>().map_err(|_| bad())?;
-            if !integer_domain(key).contains(&n) {
-                return Err(bad());
+        EditKind::Integer => match trimmed.parse::<i64>() {
+            Ok(n) if integer_domain(key).contains(&n) => Value::from(n),
+            // The refusal names the bound it broke, so `settings set` says
+            // what to type instead.
+            _ => {
+                return Err(PrefsEditError::BadValue {
+                    key: key.to_string(),
+                    raw: raw.to_string(),
+                    expected: Some(integer_requirement(key, trimmed)),
+                });
             }
-            Value::from(n)
-        }
+        },
         EditKind::Bool => Value::from(trimmed.parse::<bool>().map_err(|_| bad())?),
         // An enum value must be one of the allowed options (case-insensitive). Store the
         // CANONICAL spelling from `options` so the file + introspection read cleanly; an
@@ -2450,13 +3052,13 @@ fn typed_item(key: &str, raw: &str) -> Result<aterm_toml::edit::Item, PrefsEditE
         }
         // Strings keep the user's text verbatim (trimmed of surrounding whitespace) —
         // a multi-word family round-trips unchanged. `Theme` is written the same way (a
-        // free string) so the `dark:…,light:…` split form survives; the picker only ever
-        // supplies a valid built-in name, but a hand-typed split theme is preserved too.
+        // free string) so the `dark:…,light:…` split form survives, whether the Settings
+        // Follow-system pair editor wrote it or it was typed by hand.
         EditKind::Text | EditKind::Theme => Value::from(trimmed),
         // A colour must parse as RRGGBB/#RRGGBB; reject a malformed value at Save
         // rather than write a string the config loader would silently ignore.
         EditKind::Color => {
-            if crate::app_config::parse_hex_color(trimmed).is_none() {
+            if aterm_types::scheme::parse_hex(trimmed).is_none() {
                 return Err(bad());
             }
             Value::from(trimmed)
@@ -2534,47 +3136,75 @@ fn nested_seed_placeholder(cfg: &Config, key: &str) -> (Option<String>, String) 
         "net.listen" => txt(net.and_then(|n| n.listen.as_deref()), "off (no listener)"),
         "net.cert" => txt(net.and_then(|n| n.cert.as_deref()), "none"),
         "net.key" => txt(net.and_then(|n| n.key.as_deref()), "none"),
-        // DERIVED, never a literal: these placeholders show the compiled-in default
-        // update channel, which moved to the public mirror when
-        // `[workspace.metadata.aterm] update_channel` landed. A hard-coded owner here
-        // silently became a lie the moment the channel was repointed, telling the
-        // user their updates come from a repo they are not actually reading.
         EDIT_UPDATE_ENABLED => boolean(upd.and_then(|u| u.enabled), true),
         "update.auto_apply" => boolean(upd.and_then(|u| u.auto_apply), true),
         EDIT_REROUTE_ANNOUNCE => boolean(cfg.reroute.as_ref().and_then(|r| r.announce), true),
         // Seeded through the RESOLVER that owns the default, never a literal
         // `true` re-typed here — the streak pip's rule, so the switch and the
         // harness can never start in different positions.
-        EDIT_HARNESS_ENABLED => boolean(Some(cfg.harness_enabled()), true),
-        // The same law: the supervisor's own resolved switch, so a refused
-        // value shows the limit the reader took it for — and the full-power
-        // default beside it, which Manual's help names (`default true`) as
-        // it does for every key that limits.
+        EDIT_HARNESS_ENABLED => boolean(Some(cfg.harness.policy.enabled), true),
+        // The supervisor's own resolved mode, so a refused value shows the
+        // default the reader kept; the full-power default is the placeholder,
+        // never a seed (a seed is a written override).
+        EDIT_HARNESS_AUTOPILOT => {
+            let mode = cfg.harness.policy.autopilot;
+            (
+                (mode != aterm_agent::supervise::Autopilot::Cruise)
+                    .then(|| mode.word().to_string()),
+                "cruise".to_string(),
+            )
+        }
+        // The same law: the supervisor's own resolved switch, so a value
+        // shows as the reader took it (an off its limit, a refused one no
+        // setting) — and the full-power default beside it, which Manual's
+        // help names (`default true`) as it does for every key that limits.
         EDIT_HARNESS_ANSWER_QUESTIONS => (
             Some(cfg.harness.policy.answer_questions.to_string()),
             "true".to_string(),
         ),
-        // The supervisor's own resolved level, so a refused value shows the
-        // limit the reader took it for; the full-power default is the
-        // placeholder, never a seed (a seed is a written override).
+        // The supervisor's own resolved level, so a value shows as the reader
+        // took it (an off its limit, a refused one no setting); the
+        // full-power default is the placeholder, never a seed (a seed is a
+        // written override).
         EDIT_HARNESS_APPROVE => {
-            let level = cfg.harness_approve();
+            let level = cfg.harness.policy.approve.word();
             (
                 (level != "all").then(|| level.to_string()),
                 "all".to_string(),
             )
         }
         // The word the supervisor reads, the default its placeholder (a
-        // seed is a written override): a refused word is read as the
-        // default, and answers no question at all — its answer switch says
-        // so (OFF).
+        // seed is a written override): a refused word is no setting, read as
+        // the default, and the answer switch is left as written.
         EDIT_HARNESS_QUESTION_PRIORITY => {
-            let word = cfg.harness_question_priority();
+            let word = cfg.harness.policy.question_priority;
             (
                 (word != aterm_agent::supervise::QuestionPriority::Recommended)
                     .then(|| word.word().to_string()),
                 "recommended (default)".to_string(),
             )
+        }
+        // The agent's own table, apart from the master switch above it.
+        k if let Some(agent) = agent_switch(k) => {
+            boolean(Some(cfg.harness_agent_enabled(agent)), true)
+        }
+        // [ai]: seeded from the AI layer's RESOLVED value, the fleet document
+        // included (`AiPolicy::settings`), so a choice the fleet makes is the
+        // row's state; Settings ▸ Harness ▸ AI CLIs says where it came from,
+        // and Reset removes only this machine's key.
+        EDIT_AI_ENABLED => boolean(Some(cfg.ai.enabled()), true),
+        EDIT_AI_PREFERRED => {
+            let (cli, from) = cfg.ai.settings().preferred;
+            (
+                (from != aterm_agent::ai::config::From::Default).then(|| cli.id.to_string()),
+                format!(
+                    "{} (default)",
+                    aterm_agent::ai::config::default_preferred().id
+                ),
+            )
+        }
+        k if let Some(cli) = ai_use_switch(k) => {
+            boolean(Some(cfg.ai.settings().wants(cli.id)), true)
         }
         "sparkle_words.enabled" => boolean(sw.and_then(|s| s.enabled), true),
         "sparkle_words.reduced_motion" => boolean(sw.and_then(|s| s.reduced_motion), false),
@@ -2602,13 +3232,7 @@ fn nested_seed_placeholder(cfg: &Config, key: &str) -> (Option<String>, String) 
         }
         "sparkle_words.feline.enabled" => boolean(fel.and_then(|f| f.enabled), true),
         "sparkle_words.feline.style" => txt(fel.and_then(|f| f.style.as_deref()), "cat (default)"),
-        "sparkle_words.feline.idle" => boolean(fel.and_then(|f| f.idle), true),
-        "sparkle_words.feline.gaze" => boolean(fel.and_then(|f| f.gaze), true),
         "sparkle_words.feline.magic" => boolean(fel.and_then(|f| f.magic), true),
-        "sparkle_words.feline.color" => {
-            txt(fel.and_then(|f| f.color.as_deref()), "#f7a8b8 (default)")
-        }
-        "sparkle_words.feline.intensity" => num(fel.and_then(|f| f.intensity), "0.7 (default)"),
         "sparkle_words.feline.allow_bare_cat" => boolean(fel.and_then(|f| f.allow_bare_cat), true),
         "sparkle_words.feline.cjk_single_char" => {
             boolean(fel.and_then(|f| f.cjk_single_char), false)
@@ -2632,13 +3256,10 @@ fn nested_seed_placeholder(cfg: &Config, key: &str) -> (Option<String>, String) 
         "matrix_rain.suppress_in_alt_screen" => {
             boolean(mr.and_then(|m| m.suppress_in_alt_screen), false)
         }
-        "matrix_rain.materialize" => boolean(mr.and_then(|m| m.materialize), false),
         "matrix_rain.output_material" => boolean(mr.and_then(|m| m.output_material), true),
         "matrix_rain.turn_wave" => boolean(mr.and_then(|m| m.turn_wave), true),
         "matrix_rain.bell_alert" => boolean(mr.and_then(|m| m.bell_alert), true),
         "matrix_rain.exit_tint" => boolean(mr.and_then(|m| m.exit_tint), true),
-        "matrix_rain.ink_text" => boolean(mr.and_then(|m| m.ink_text), false),
-        "matrix_rain.phosphor" => boolean(mr.and_then(|m| m.phosphor), false),
         "matrix_rain.seed" => num(mr.and_then(|m| m.seed), "0 (stable per-window)"),
         // PRISM WAKE's pip seeds its RESOLVED state through the resolver that
         // owns the default, never a literal `true` re-typed here: the owner's
@@ -2646,6 +3267,12 @@ fn nested_seed_placeholder(cfg: &Config, key: &str) -> (Option<String>, String) 
         // (`Config::output_streak_sound_or_default`), so the switch and the
         // engine can never start in different positions.
         EDIT_OUTPUT_STREAK_SOUND => boolean(Some(cfg.output_streak_sound_or_default()), true),
+        // PRISM WAKE's switch, from the resolver that owns its platform-split
+        // default, so the row starts where the engine does.
+        EDIT_OUTPUT_STREAK_ENABLED => boolean(
+            Some(cfg.output_streak_enabled_or_default()),
+            crate::app_config::DEFAULT_DECORATIVE_EFFECTS,
+        ),
         // The presence surfaces seed their RESOLVED state through the resolvers
         // that own the default (both ON), the streak pip's rule.
         EDIT_PRESENCE_BAND => boolean(Some(cfg.presence_band_enabled()), true),
@@ -2663,22 +3290,17 @@ fn nested_seed_placeholder(cfg: &Config, key: &str) -> (Option<String>, String) 
 pub(crate) enum Section {
     Appearance,
     Cursor,
-    /// The CURSOR KITTY's own pane (owner ask, 2026-08-10: "fix the settings and
-    /// add a page for this"). The companion that walks the line is the shipped
-    /// default now ([`DEFAULT_CURSOR_TRAIL_STYLE`]), and it was reachable only
-    /// through a ten-option popup buried in a page that also owns bloom radius
-    /// and the whole Sound menu. This section holds the keys that belong to the
-    /// CAT and nothing else: which companion you get and the sprite art it
-    /// wears. The third — how long its rainbow wake runs
-    /// (`cursor_trail_wake_ms`) — was retired 2026-09-16 because nothing read
-    /// it, so this section's whole content is the companion showcase card.
-    CursorKitty,
+    /// The Cursor Styles page's keys: the cursor's style (the page's list)
+    /// and the tuning a style reads. The page draws its own rows.
+    CursorStyles,
     Typography,
-    /// Window sizing, tabs, smart titles, and chrome.
+    /// Window sizing, tabs, tab status, and chrome.
     Window,
     /// Keyboard & clipboard behavior (copy-on-select, paste safety, Option-as-Meta,
     /// predictive echo).
     Input,
+    /// Keys with no ordinary page: the renderer, focus and recording switches
+    /// are Manual-only, and Explain heavy load renders on Settings ▸ Messages.
     Performance,
     Terminal,
     Security,
@@ -2688,53 +3310,67 @@ pub(crate) enum Section {
     /// the Modified review only.
     Packages,
     /// The aterm WRAPPER's own page (design
-    /// `docs/DESIGN-aterm-wrapper-2026-09-17.md` §4.6.2). Like
-    /// [`Section::Packages`] above, it is a SPECIAL page: the durable master
-    /// switch `harness.enabled` and the approval level `harness.approve`
-    /// (2026-09-24) are its rows, and the finer `[harness]` keys — each able
-    /// only to limit — are written in Manual, where the config language lists
-    /// them with their full-power defaults. Search and the Modified review
-    /// reach both rows through the registry, the master switch's note naming
-    /// every limit the table writes.
+    /// `docs/DESIGN-aterm-wrapper-2026-09-17.md` §4.6.2), Settings ▸ Harness
+    /// (`SettingsRoute::Harness`, `docs/DESIGN-harness-autopilot-2026-10-15.md`
+    /// §4). Its rows are FIVE `[harness]` keys — the durable master switch
+    /// `harness.enabled`, the default Autopilot `harness.autopilot`
+    /// (2026-10-15), the approval level `harness.approve` (2026-09-24), the
+    /// question answer `harness.answer_questions` and how it answers,
+    /// `harness.question_priority` (2026-09-25) — and one switch per
+    /// supervisable agent, `harness.<agent>.enabled`
+    /// (`docs/DESIGN-harness-plugins-2026-10-15.md` §4). The finer `[harness]` keys —
+    /// each able only to limit — are written in Manual, where the config
+    /// language lists them with their full-power defaults. Search and the
+    /// Modified review reach every row through the registry, the master
+    /// switch's note naming every limit the table writes. The route renders
+    /// them on its special page (`native_settings_harness.rs`), the SUPERVISION
+    /// card among STATUS, SESSIONS, WHAT THE HARNESS DID, EFFECT OF EACH
+    /// AUTOPILOT and SETTINGS IN ATERM.TOML.
     Harness,
-    /// The read-only Kitty Log collection book (§F4.6): no editable keys ever
-    /// map here ([`section_of`] never returns it), so the content pane paints
-    /// the book instead of group-boxes and every row is non-activatable.
-    KittyLog,
+    /// aterm's own updater switches (`[update]`). Settings ▸ Software Update
+    /// is a SPECIAL page that draws these rows itself, so no ordinary
+    /// registry page owns this section; Search and Modified find them.
+    Updates,
+    /// Every key that changes what aterm sounds like ([`SOUND_MENU_KEYS`]).
+    Sound,
 }
 
 impl Section {
     /// Display order of the section headers (top → bottom).
-    pub(crate) const ORDER: [Section; 12] = [
+    pub(crate) const ORDER: [Section; 13] = [
         Section::Appearance,
         Section::Cursor,
-        Section::CursorKitty,
+        Section::CursorStyles,
+        Section::Sound,
         Section::Typography,
         Section::Window,
         Section::Input,
         Section::Terminal,
         Section::Performance,
         Section::Security,
+        // aterm's own updater before the ALab tools, as the sidebar has them:
+        // "automatic updates" finds aterm's switches first.
+        Section::Updates,
         Section::Packages,
         Section::Harness,
-        Section::KittyLog,
     ];
 
     /// The header label shown above the section's controls.
     pub(crate) fn label(self) -> &'static str {
         match self {
             Section::Appearance => "Appearance",
-            Section::Cursor => "Cursor",
-            Section::CursorKitty => "Cursor Kitty",
-            Section::Typography => "Typography",
-            Section::Window => "Window & Tabs",
-            Section::Input => "Input",
+            Section::Cursor => "Cursor & Motion",
+            Section::CursorStyles => "Cursor Styles",
+            Section::Typography => "Text & Fonts",
+            Section::Window => "Window",
+            Section::Input => "Keyboard & Input",
             Section::Performance => "Performance",
             Section::Terminal => "Terminal",
             Section::Security => "Security",
             Section::Packages => "Packages",
             Section::Harness => "Harness",
-            Section::KittyLog => "Kitty Log",
+            Section::Updates => "Software Update",
+            Section::Sound => "Sound",
         }
     }
 
@@ -2751,40 +3387,40 @@ pub(crate) fn section_of(key: &str) -> Section {
         return Section::Security;
     }
     if matches!(key, EDIT_CURSOR_TRAIL_COLOR | EDIT_CURSOR_TRAIL_ACCENT) {
-        return Section::Cursor;
+        return Section::CursorStyles;
     }
     if COLOR_KEYS.contains(&key) {
         return Section::Appearance;
     }
     // Nested tables route by PREFIX (one arm per table, not per leaf): the
     // network drive is a remote-access surface (Security, beside the opt-ins);
-    // updates are app plumbing (Terminal); the two costume tables are screen
-    // decorations (Appearance).
+    // the updater's switches are Software Update's; the two costume tables are
+    // screen decorations (Appearance).
     if key.starts_with("net.") {
         return Section::Security;
     }
     if key.starts_with("update.") {
-        return Section::Terminal;
+        return Section::Updates;
     }
-    // The wrapper's master switch answers to the Harness page and to nothing
-    // else — it is not an update, a package or a terminal knob.
-    if key.starts_with("harness.") {
+    // The supervisor's rows answer to the Harness page and to nothing else —
+    // they are not an update, a package or a terminal knob. So do the AI
+    // CLIs' rows: Settings ▸ Harness ▸ AI CLIs is its sub-page, which draws
+    // them (the Harness page's own cards leave them to it).
+    if key.starts_with("harness.") || key.starts_with("ai.") {
         return Section::Harness;
     }
-    // THE SOUND MENU (owner ask: "add the volume and SFX menu to settings").
-    // Every audible knob in the product answers to ONE pane, so the box below
-    // reads as a menu instead of rows scattered across unrelated sections. The
-    // curse BONK is the exception that proves it: it lives under
-    // `[sparkle_words.profanity]` in the file, but it is an SFX, so it is
-    // routed here BEFORE the decorative-table prefix rule below — otherwise the
-    // single loudest sparkle-words gesture would sit two panes away from the
-    // volume slider that scales it. PRISM WAKE's pip
-    // ([`EDIT_OUTPUT_STREAK_SOUND`]) is the same shape and rides the same
-    // early return: an `[output_streak]` leaf in the file, an SFX on screen.
+    // THE SOUND PAGE (owner ask: "add the volume and SFX menu to settings").
+    // Every audible knob in the product answers to ONE page. The curse BONK
+    // lives under `[sparkle_words.profanity]` in the file, but it is a sound,
+    // so it is routed here BEFORE the decorative-table prefix rule below; the
+    // output streak's pip (an `[output_streak]` leaf) rides the same return.
     if SOUND_MENU_KEYS.contains(&key) {
-        return Section::Cursor;
+        return Section::Sound;
     }
-    if key.starts_with("sparkle_words.") || key.starts_with("matrix_rain.") {
+    if key.starts_with("sparkle_words.")
+        || key.starts_with("matrix_rain.")
+        || key.starts_with("output_streak.")
+    {
         return Section::Appearance;
     }
     // The presence band and rim are WINDOW CHROME — the row under the tab bar
@@ -2798,23 +3434,26 @@ pub(crate) fn section_of(key: &str) -> Section {
     if key == EDIT_ROBI {
         return Section::Appearance;
     }
-    // THE CURSOR KITTY'S OWN PANE, ahead of the generic cursor arms below: these
-    // two keys answer to the CAT, not to the trail engine. `cursor_trail_style`
-    // is the choice between the walking pet (the shipped default), the flying
-    // head, another look entirely, and off; `cursor_nyan_sprite` is the kitty's
-    // ART (it is Manual-only, so it never paints a row here — it rides this
-    // section for Search/Modified grouping and the preview registry). The third
-    // was `cursor_trail_wake_ms`, retired 2026-09-16; the page's content is the
-    // companion showcase card, which is what it was always for.
-    if matches!(key, EDIT_CURSOR_TRAIL_STYLE | EDIT_CURSOR_NYAN_SPRITE) {
-        return Section::CursorKitty;
+    // THE CURSOR STYLES PAGE: the style list and the tuning a style reads
+    // (the page shows the selected style's own knobs). `cursor_nyan_sprite`,
+    // HDR glow and SDR boost are Manual-only; they ride this section for
+    // Search and Modified. The cursor's shape is the cursor's own, on Cursor
+    // & Motion beside its blink.
+    if matches!(
+        key,
+        EDIT_CURSOR_TRAIL
+            | EDIT_CURSOR_TRAIL_STYLE
+            | EDIT_CURSOR_NYAN_SPRITE
+            | EDIT_CURSOR_TRAIL_PACKS
+    ) || CURSOR_STYLE_TUNING_KEYS.contains(&key)
+    {
+        return Section::CursorStyles;
     }
     match key {
         EDIT_THEME | EDIT_WINDOW_THEME | EDIT_WINDOW_COLORSPACE => Section::Appearance,
         // W5/SGR text-appearance knobs sit beside Theme + Colors: they all answer
         // "how does color behave on my screen", so Appearance is their matched tab.
         EDIT_SELECTION_INACTIVE
-        | EDIT_SPLIT_FOCUS_MARK
         | EDIT_MINIMUM_CONTRAST
         | EDIT_BOLD_IS_BRIGHT
         | EDIT_FAINT_OPACITY => Section::Appearance,
@@ -2827,29 +3466,17 @@ pub(crate) fn section_of(key: &str) -> Section {
         | EDIT_WALLPAPER_DIM
         | EDIT_WALLPAPER_TEXT_TINT => Section::Appearance,
         // Window sizing + chrome: the initial grid, the tab strip, the version
-        // pill, the interior padding, and what a fresh launch reopens.
+        // pill, the selected tab and split pane marks, the interior padding,
+        // and what a fresh launch reopens.
         EDIT_COLUMNS
         | EDIT_LINES
         | EDIT_TAB_STRIP_ROWS
         | EDIT_SHOW_BUILD_BADGE
-        | EDIT_ACTIVE_TAB_COLOR => Section::Window,
+        | EDIT_ACTIVE_TAB_COLOR
+        | EDIT_SPLIT_FOCUS_MARK => Section::Window,
         EDIT_WINDOW_PADDING | EDIT_WINDOW_PADDING_TOP | EDIT_RESTORE_SESSION => Section::Window,
-        // Descriptive-title controls live alongside the tab/window chrome they label.
-        EDIT_DESCRIPTIVE_TITLES
-        | EDIT_TITLE_SUMMARY_PROVIDER
-        | EDIT_TITLE_SUMMARY_MODEL
-        | EDIT_TITLE_SUMMARY_ENDPOINT
-        | EDIT_TITLE_SUMMARY_TOKEN_FILE
-        | EDIT_TITLE_SUMMARY_TIMEOUT_SECONDS
-        | EDIT_TITLE_SUMMARY_PROXY_MODE
-        | EDIT_TITLE_SUMMARY_CA_FILE
-        | EDIT_TITLE_SUMMARY_INTERVAL_SECONDS
-        | EDIT_TITLE_SUMMARY_CONTEXT_LINES
-        | EDIT_TITLE_SUMMARY_INCLUDE_OUTPUT
-        | EDIT_TITLE_SUMMARY_ALLOW_REMOTE
-        | EDIT_TAB_TITLE_FORMAT
-        | EDIT_WINDOW_TITLE_FORMAT
-        | EDIT_TAB_STATUS
+        // Tab-status controls live alongside the tab/window chrome they mark.
+        EDIT_TAB_STATUS
         | EDIT_TAB_STATUS_QUIET_AFTER_MS
         | EDIT_TAB_STATUS_DWELL_MS
         | EDIT_TAB_STATUS_BADGE
@@ -2878,23 +3505,11 @@ pub(crate) fn section_of(key: &str) -> Section {
         }
         // The [machine] host setting lives on the Security page, beside the
         // permissions it resembles: a switch about what this Mac lets happen to it,
-        // and the page's "This Mac" card confirms the measured state.
+        // with the measured state shown under it.
         EDIT_MACHINE_UNIVERSAL_CONTROL => Section::Security,
         EDIT_CURSOR_STYLE
         | EDIT_CURSOR_BLINK
         | EDIT_CURSOR_MOMENTUM_GLOW
-        | EDIT_CURSOR_TRAIL
-        | EDIT_CURSOR_TRAIL_MS
-        | EDIT_CURSOR_TRAIL_LENGTH
-        | EDIT_CURSOR_TRAIL_INTENSITY
-        | EDIT_CURSOR_TRAIL_RADIUS
-        | EDIT_CURSOR_TRAIL_RING
-        | EDIT_CURSOR_TRAIL_BLOOM
-        | EDIT_CURSOR_TRAIL_BLOOM_STRENGTH
-        | EDIT_CURSOR_TRAIL_BLOOM_RADIUS
-        | EDIT_CURSOR_FIRE_SHIMMER
-        | EDIT_HDR_GLOW
-        | EDIT_CURSOR_GLOW_SDR_BOOST
         | EDIT_MOTION
         | EDIT_SERIOUS_MODE
         // The update-celebration sparkles ride the FX page beside serious
@@ -2902,11 +3517,8 @@ pub(crate) fn section_of(key: &str) -> Section {
         // terminal allowed to have" questions already live.
         | EDIT_NOTICE_SPARKLE
         | EDIT_LOAD_ADAPTIVE_MOTION => Section::Cursor,
-        // The rest of the trail/aurora surface (packs — the colour overrides
-        // route via the early trail-colour return above) + the stream-fade
-        // motion pair live with the cursor FX. The sound level moved to the
-        // Sound menu with its siblings (see [`SOUND_MENU_KEYS`]).
-        EDIT_CURSOR_TRAIL_PACKS | EDIT_STREAM_FADE | EDIT_STREAM_FADE_MS => Section::Cursor,
+        // How new output appears is the terminal's, not the cursor's.
+        EDIT_STREAM_FADE | EDIT_STREAM_FADE_MS => Section::Terminal,
         // The shell program + argv are terminal-session settings.
         EDIT_SHELL | EDIT_SHELL_ARGS => Section::Terminal,
         EDIT_FONT_PX
@@ -2944,27 +3556,22 @@ pub(crate) fn section_of(key: &str) -> Section {
 /// (fields keep their [`editable_fields`] build order within a group). Callers that
 /// include an ungrouped key place it in a trailing per-section "General" box.
 pub(crate) fn group_of(key: &str) -> (&'static str, u8) {
-    // THE SOUND MENU, before every prefix rule below: the owner asked for ONE
-    // coherent Sound surface — "the master volume slider plus the SFX toggles,
-    // GROUPED so it reads as a menu rather than rows scattered across unrelated
-    // boxes". This box IS that menu. It opens right after "Trail effect" (order
-    // 2) because the keystroke palette is the aural half of the trail, and the
-    // motion/colour/GPU boxes shift down one to make room.
+    // THE SOUND PAGE, before every prefix rule below: the synth voices under
+    // the Music effects switch, then the system bell, which that switch and the
+    // volume never reach.
+    if key == EDIT_BELL_SOUND {
+        return ("Terminal bell", 1);
+    }
     if SOUND_MENU_KEYS.contains(&key) {
-        return ("Sound", 2);
+        return ("Sound effects", 0);
     }
     if matches!(key, EDIT_CURSOR_TRAIL_COLOR | EDIT_CURSOR_TRAIL_ACCENT) {
         return ("Trail color", 4);
     }
-    // The Cursor Kitty pane. "Companion" is the picker's own caption — the page
-    // paints that row as its showcase card (the key is a Top Setting, so the
-    // ordinary registry never draws it), and this entry only orders it first in
-    // Search and Modified. "Kitty art" is Manual-only and likewise never
-    // paints. The page therefore paints NO ordinary group box: its content is
-    // the showcase card. "Rainbow wake" was the one box it had until
-    // `cursor_trail_wake_ms` was retired (2026-09-16).
+    // The Cursor Styles page draws its own rows; these captions group its keys
+    // in Search and Modified.
     if key == EDIT_CURSOR_TRAIL_STYLE {
-        return ("Companion", 0);
+        return ("Cursor style", 0);
     }
     if key == EDIT_CURSOR_NYAN_SPRITE {
         return ("Kitty art", 2);
@@ -2984,16 +3591,25 @@ pub(crate) fn group_of(key: &str) -> (&'static str, u8) {
         return ("Network drive", 1);
     }
     if key.starts_with("update.") {
-        return ("Updates", 3);
+        return ("Automatic updates", 3);
     }
+    // The Harness page draws its own rows, in its SUPERVISION card: Search
+    // and Modified name the same card, with the page's name in it, since
+    // neither shows the page around it.
     if key.starts_with("harness.") {
-        return ("Harness", 0);
+        return ("Harness supervision", 0);
+    }
+    // The AI CLIs page's rows: one box, the page's own name.
+    if key.starts_with("ai.") {
+        return ("AI CLIs", 1);
     }
     if key.starts_with("sparkle_words.") {
         return ("Sparkle words", 4);
     }
-    if key.starts_with("matrix_rain.") {
-        return ("Matrix rain", 5);
+    // Appearance's effects: Matrix rain, the output streak and Robi share
+    // one box.
+    if key.starts_with("matrix_rain.") || key.starts_with("output_streak.") {
+        return ("Effects", 5);
     }
     // Window › the presence surfaces, beside Tab Status (both answer "what does
     // this window say about who is driving its session").
@@ -3001,7 +3617,7 @@ pub(crate) fn group_of(key: &str) -> (&'static str, u8) {
         return ("Presence", 2);
     }
     if key == EDIT_ROBI {
-        return ("Robi the robot", 6);
+        return ("Effects", 5);
     }
     match key {
         EDIT_THEME | EDIT_WINDOW_THEME | EDIT_WINDOW_COLORSPACE => ("Theme", 0),
@@ -3011,11 +3627,10 @@ pub(crate) fn group_of(key: &str) -> (&'static str, u8) {
         // brightness/faintness) — beside Theme + Colors, its matched tab.
         EDIT_MINIMUM_CONTRAST
         | EDIT_SELECTION_INACTIVE
-        | EDIT_SPLIT_FOCUS_MARK
         | EDIT_BOLD_IS_BRIGHT
         | EDIT_FAINT_OPACITY => ("Text & Contrast", 2),
-        // M5 window glass (opacity + vibrancy material).
-        EDIT_BACKGROUND_OPACITY | EDIT_BACKGROUND_MATERIAL => ("Transparency", 3),
+        // The window behind the text: M5 glass (opacity + vibrancy material).
+        EDIT_BACKGROUND_OPACITY | EDIT_BACKGROUND_MATERIAL => ("Background", 3),
         // The terminal-tab backdrop image, its legibility dim, and the
         // backdrop-hue glyph tint.
         EDIT_WALLPAPER | EDIT_WALLPAPER_DIM | EDIT_WALLPAPER_TEXT_TINT => ("Wallpaper", 4),
@@ -3030,6 +3645,8 @@ pub(crate) fn group_of(key: &str) -> (&'static str, u8) {
         | EDIT_CURSOR_TRAIL_RADIUS
         | EDIT_CURSOR_TRAIL_RING => ("Trail effect", 1),
         EDIT_MOTION | EDIT_LOAD_ADAPTIVE_MOTION => ("Motion", 3),
+        // Terminal › how new output appears.
+        EDIT_STREAM_FADE | EDIT_STREAM_FADE_MS => ("Output", 4),
         // The extended trail surface rides the same box, after the basics
         // (colour identity and the GPU light knobs get their own boxes below).
         // The sound rows left for the "Sound" menu box above.
@@ -3039,69 +3656,54 @@ pub(crate) fn group_of(key: &str) -> (&'static str, u8) {
         | EDIT_CURSOR_TRAIL_BLOOM_RADIUS
         | EDIT_CURSOR_FIRE_SHIMMER
         | EDIT_HDR_GLOW
-        | EDIT_CURSOR_GLOW_SDR_BOOST => ("Light & GPU", 5),
-        // M2 stream fade is its own motion pair, not part of the trail.
-        EDIT_STREAM_FADE | EDIT_STREAM_FADE_MS => ("Stream fade", 6),
-        // Typography splits into four scannable boxes (was one 22-row "Font" wall):
-        // which faces / how glyphs join / where lines sit / how stems rasterize.
+        | EDIT_CURSOR_GLOW_SDR_BOOST => ("Bloom & glow", 5),
+        // Typography: the face and its size first, then how glyphs are drawn,
+        // then the per-style and fallback families few people change.
         EDIT_FONT_FAMILY
         | EDIT_FONT_PX
         | EDIT_DISPLAY_FONT
-        | EDIT_FONT_FAMILY_BOLD
+        | EDIT_LINE_HEIGHT
+        | EDIT_ADJUST_BASELINE
+        | EDIT_ADJUST_UNDERLINE_POSITION
+        | EDIT_ADJUST_UNDERLINE_THICKNESS
+        | EDIT_UNDERLINE_SKIP_DESCENDERS
+        | EDIT_FONT_WEIGHT
+        | EDIT_FONT_VARIATION
+        | EDIT_FONT_WEIGHT_DARK_NUDGE => ("Font", 0),
+        EDIT_LIGATURES
+        | EDIT_CURSOR_BREAK_LIGATURES
+        | EDIT_MERGED_LIGATURES
+        | EDIT_FONT_FEATURES
+        | EDIT_TEXT_BLENDING
+        | EDIT_FONT_THICKEN
+        | EDIT_STEM_GAMMA => ("Rendering", 1),
+        EDIT_FONT_FAMILY_BOLD
         | EDIT_FONT_FAMILY_ITALIC
         | EDIT_FONT_FAMILY_BOLD_ITALIC
         | EDIT_FONT_SYNTHETIC_STYLE
         | EDIT_FALLBACK_FONTS
         | EDIT_SYMBOL_FONT
-        | EDIT_EMOJI_FONT => ("Font", 0),
-        EDIT_LIGATURES | EDIT_CURSOR_BREAK_LIGATURES | EDIT_MERGED_LIGATURES => ("Shaping", 1),
-        EDIT_LINE_HEIGHT
-        | EDIT_ADJUST_BASELINE
-        | EDIT_ADJUST_UNDERLINE_POSITION
-        | EDIT_ADJUST_UNDERLINE_THICKNESS
-        | EDIT_UNDERLINE_SKIP_DESCENDERS => ("Line layout", 2),
-        EDIT_TEXT_BLENDING | EDIT_FONT_THICKEN | EDIT_STEM_GAMMA | EDIT_FONT_WEIGHT
-        | EDIT_FONT_VARIATION => ("Rendering", 3),
-        // OpenType features join Shaping (they drive the shaper like ligatures);
-        // the dark-theme weight nudge is a rasterization knob like `font_weight`.
-        EDIT_FONT_FEATURES => ("Shaping", 1),
-        EDIT_FONT_WEIGHT_DARK_NUDGE => ("Rendering", 3),
-        // Window › sizing, Smart Titles, tab status, interior padding, chrome,
-        // then session. Tab Status sits next to Smart Titles because both answer
-        // "what does this tab say about its session".
+        | EDIT_EMOJI_FONT => ("Styles & fallbacks", 2),
+        // Window › sizing, tab status, interior padding, chrome, then session.
         EDIT_COLUMNS | EDIT_LINES | EDIT_TAB_STRIP_ROWS => ("Size", 0),
-        EDIT_DESCRIPTIVE_TITLES
-        | EDIT_TITLE_SUMMARY_PROVIDER
-        | EDIT_TITLE_SUMMARY_MODEL
-        | EDIT_TITLE_SUMMARY_ENDPOINT
-        | EDIT_TITLE_SUMMARY_TOKEN_FILE
-        | EDIT_TITLE_SUMMARY_TIMEOUT_SECONDS
-        | EDIT_TITLE_SUMMARY_PROXY_MODE
-        | EDIT_TITLE_SUMMARY_CA_FILE
-        | EDIT_TITLE_SUMMARY_INTERVAL_SECONDS
-        | EDIT_TITLE_SUMMARY_CONTEXT_LINES
-        | EDIT_TITLE_SUMMARY_INCLUDE_OUTPUT
-        | EDIT_TITLE_SUMMARY_ALLOW_REMOTE
-        | EDIT_TAB_TITLE_FORMAT
-        | EDIT_WINDOW_TITLE_FORMAT => ("Smart Titles", 1),
         EDIT_TAB_STATUS
         | EDIT_TAB_STATUS_QUIET_AFTER_MS
         | EDIT_TAB_STATUS_DWELL_MS
         | EDIT_TAB_STATUS_BADGE
         | EDIT_TAB_CONNECTION_BADGE => ("Tab Status", 2),
-        EDIT_WINDOW_PADDING | EDIT_WINDOW_PADDING_TOP => ("Window padding", 2),
-        EDIT_SHOW_BUILD_BADGE | EDIT_ACTIVE_TAB_COLOR => ("Chrome", 3),
+        EDIT_WINDOW_PADDING | EDIT_WINDOW_PADDING_TOP => ("Padding", 2),
+        // How the window marks where you are: the selected tab and the focused
+        // split pane.
+        EDIT_ACTIVE_TAB_COLOR | EDIT_SPLIT_FOCUS_MARK => ("Tabs & panes", 3),
+        EDIT_SHOW_BUILD_BADGE => ("Build badge", 5),
         EDIT_RESTORE_SESSION => ("Session", 4),
-        // Input › clipboard then keyboard.
-        EDIT_COPY_ON_SELECT => ("Clipboard", 0),
-        EDIT_CONFIRM_MULTILINE_PASTE => ("Paste safety", 0),
+        // Input › clipboard (copy and paste) then keyboard.
+        EDIT_COPY_ON_SELECT | EDIT_CONFIRM_MULTILINE_PASTE => ("Clipboard", 0),
         EDIT_OPTION_AS_META | EDIT_PREDICTIVE_ECHO => ("Keyboard", 1),
         // Performance › focus-linked QoS, launch-time renderer choice, and replay.
-        // …and the band's account of a loaded machine (rendered on Settings ▸
-        // Messages; found here by Search and Modified).
-        EDIT_FOCUS_BOOST | EDIT_GPU | EDIT_TEMPORAL_RECORDING | EDIT_EXPLAIN_HEAVY_LOAD => {
-            ("System", 1)
-        }
+        EDIT_FOCUS_BOOST | EDIT_GPU | EDIT_TEMPORAL_RECORDING => ("System", 1),
+        // The band's account of a loaded machine, drawn on Settings ▸ Messages.
+        EDIT_EXPLAIN_HEAVY_LOAD => ("Heavy load", 2),
         // Security › aterm's own desktop notifications, under the permissions.
         EDIT_DESKTOP_ALERTS => ("Notifications", 2),
         // Packages › the ALab tools switches ride together.
@@ -3116,135 +3718,244 @@ pub(crate) fn group_of(key: &str) -> (&'static str, u8) {
     }
 }
 
-/// The macOS-style FOOTNOTE under a group box, by its [`group_of`] caption (design
-/// §3.2). `None` for groups the design leaves silent — footnotes explain consequences,
-/// they never restate the control.
-pub(crate) fn group_footnote(caption: &str) -> Option<&'static str> {
-    Some(match caption {
-        "Colors" => "Blank uses the theme's color.",
-        // Short on purpose: at 2× Dynamic Type on a 320-wide page the footnote
-        // shares the page with one row. The revert lines live in `aterm pkg
-        // machine` and `aterm explain-config`.
-        "This Mac" => {
-            "Every package pass applies this first; Apply now applies it here. Off keeps \
-             the cursor on this Mac."
+/// The Sound page's two notes: the one fact its rows cannot state. Every row but
+/// [`EDIT_BELL_SOUND`] is a synth voice under `trail_sounds`, scaled by
+/// `trail_sound_volume` (the voice table, `aterm_effects::sound_policy::
+/// voice_gain`); the bell is the system alert sound (`lib.rs::on_bell`),
+/// which reads neither. Every other caveat is a per-row disclosure
+/// (`native_settings::setting_effect_projection`).
+const SOUND_NOTE: &str =
+    "Music effects turns these on or off together; Sound volume sets how loud they are.";
+
+/// What one Sound voice does, for its own row ([`footnote_of`]). `None` for
+/// the master switch and the volume, which share [`SOUND_NOTE`].
+fn sound_voice_note(key: &str) -> Option<&'static str> {
+    Some(match key {
+        EDIT_TRAIL_SOUND_STYLE => {
+            "Follow the trail plays your cursor style\u{2019}s own sound; any other choice \
+             plays that one sound whatever the style."
         }
-        "Text & Contrast" => {
-            "Minimum contrast 1.0 leaves opaque colors unchanged. Translucent backgrounds enforce at least a 4.5:1 ratio."
+        EDIT_TONE_MELODY => {
+            "The typing melody shifts a little with the mood of what you type, worked out on \
+             this computer."
         }
-        "Transparency" => {
-            "Opacity requires macOS GPU rendering; other renderers stay solid. Text over translucent backgrounds uses at least 4.5:1 contrast."
+        EDIT_TRAIL_SOUND_BED => "A soft background sound that swells while you type fast.",
+        EDIT_TRAIL_SOUND_RIFF => {
+            "The song that plays while you hold down one key with a companion cursor style, \
+             such as Rainbow kitty; the dance still shows when this is off."
         }
-        "Paste safety" => {
-            "Asks before pasting text with a line break into a program that does not use bracketed paste."
+        EDIT_CHOICE_SOUND => "A short chime when aterm answers a coding agent\u{2019}s question.",
+        EDIT_SPARKLE_BONK => "A cartoon bonk as you type a swear word, in any program.",
+        EDIT_SPARKLE_BONK_DETONATION => {
+            "A bonk when a swear word in a program\u{2019}s output bursts into sparkles."
         }
-        "Motion" => "Automatic also reduces motion under heavy load; turn that off in Manual.",
-        "Keyboard" => {
-            "Predictive echo: Adaptive shows typed text early on a slow connection, never at a password prompt. Always, set in Manual, can show a password."
-        }
-        "Scrollback" => {
-            "Scrollback limit 0 keeps every line. Find searches the newest Searchable scrollback lines; set it to 0 to search only the screen."
-        }
-        "Text direction & width" => {
-            "Bidirectional mode reorders right-to-left text. Ambiguous width uses one or two cells and affects new text, not existing cells."
-        }
-        "Stream fade" => {
-            "New output fades in. It is instant with Reduce Motion, an unfocused window, full-screen apps, scrollback, input, or Serious Mode."
-        }
-        // The Sound box's consequence copy states the ONE fact its rows cannot:
-        // this box holds TWO independent audio paths, not one. Every row except
-        // [`EDIT_BELL_SOUND`] is a SYNTH voice — cue-borne, subordinate to
-        // `trail_sounds` and scaled by `trail_sound_volume` (see
-        // `app_render::{trail_sound_gain, sing_riff_gain, bonk_sound_gain}`).
-        // The bell is the OS alert sound, emitted from `lib.rs::on_bell`, which
-        // reads NEITHER of those keys — so the master switch and the volume
-        // both stop at the box's edge, and a user who mutes Music effects
-        // expecting silence would still be beeped at.
-        //
-        // Earlier copy said only that Volume misses the bell and called Music
-        // effects "the master switch" flatly; that overclaimed the master, which
-        // is why the scope is now spelled out.
-        //
-        // THE CURSE BONK USED TO BE A SECOND, UNDISCLOSED EXCEPTION (skeptic's
-        // finding, 2026-08-09): `app_render::bonk_sound_gain` took no
-        // `trail_sounds` input at all, so muting Music effects and typing
-        // profanity still bonked. Two honest laws were available — name the
-        // bonk here as a second exception, or make the code match the sentence
-        // — and the code was changed, because the bonk is a synth voice by
-        // every other measure (same `TrailAudio` host, same `trail_sound_volume`
-        // scaling, same `SoundVoice` register) and a user who mutes "Music
-        // effects" is asking for silence. The sentence below is therefore now
-        // literally true of every voice, and the bell is the only exception
-        // left. Pinned behaviourally by
-        // `app_render::curse_bonk_drain_tests::music_effects_off_*` — the old
-        // wiring test only grepped source text for accessor names and could
-        // never have seen this.
-        //
-        // Every other caveat (silent with
-        // the trail off, with the window unfocused, under Serious Mode, or on a
-        // platform without audio) already has a per-row disclosure
-        // (`native_settings::setting_effect_projection`), and this string is
-        // budgeted: a long footnote can consume a whole 320 pt page at 2× text
-        // and leave no room for a control
-        // (`advanced_group_footnotes_are_native_semantic_and_fit_responsive_layouts`).
-        "Sound" => {
-            "Music effects in Top Settings is the master switch for the synth voices; Volume scales them. Neither reaches the terminal bell's system alert sound."
-        }
-        // THE "Rainbow wake" FOOTNOTE IS GONE with the row it belonged to
-        // (`cursor_trail_wake_ms`, retired 2026-09-16). Its copy — "How much
-        // recent typing shows as a plume; 0 hides the plume and keeps the cat.
-        // Rainbow styles only." — was the most confident sentence in Settings
-        // about a value nothing read, and it cited a proof
-        // (`cursor_glow::rainbow_wake_persistence_is_a_host_dial_that_fails_off`)
-        // that had not existed since the v1 wake walk was deleted. There is no
-        // replacement caption: the Cursor Kitty page paints no ordinary group
-        // box now, only its companion showcase card.
-        "Trail color" => {
-            "Blank colors follow the active terminal theme; Nyan uses its built-in sprite."
-        }
-        "Light & GPU" => {
-            "Bloom, shimmer, and HDR gracefully fall back when the display path cannot provide them."
-        }
-        "Rendering" => "Variable font weight needs a variable font; other fonts ignore it.",
-        "Matrix rain" => {
-            "Rain follows activity and drains when idle. View ▸ Matrix Rain overrides one session. Serious Mode and Reduce Motion disable it."
-        }
-        // LIVE, and says so (review of Phase 4, 2026-09-23): the window's package loop reads
-        // `[packages] enabled` (the retired `auto_update` folded in) before every pass and
-        // every few seconds of a park. This caption said it applied "next launch" — and
-        // Search and Modified render it under exactly the row it was wrong about.
-        // Install ALab tools has ONE lane (2026-09-24 post-push review): Phase 5 deleted
-        // the sealed seed, so no install ships a copy to install from, and the offer an
-        // off switch used to turn the first launch into (R20) is retired — nothing posts
-        // it. Off, nothing installs that nobody asked for (`PackagesConfig::auto_install`).
-        "ALab Tools" => {
-            "Automatic updates keeps ALab tools, Claude Code and Codex up to date and takes effect at once; Check & Update Now and aterm pkg work either way. Install ALab tools lets aterm download them (several GB) at the next package check, and new ones as they join; off installs nothing you did not ask for. Announce upstream cargo/rustc prints one line before a rerouted Rust tool runs."
-        }
-        "Smart Titles" => {
-            "Activity shows only when a tab has no Description. Built-in and aterm-managed \
-             Ollama keep terminal text on this device. Any other service receives recent \
-             terminal text only with your consent, and filtering cannot catch every secret."
-        }
-        "Permissions" => {
-            "Off by default; off refuses the program. Secure Keyboard Entry hides keys \
-             from other apps. Program notifications: macOS and Windows."
-        }
-        // Short on purpose (the "This Mac" note above says why).
-        "Notifications" => {
-            "Off, aterm's alerts stay in the window, the menu bar and Messages; \
-             agent-operator alerts are only counted in aterm fleet status."
-        }
-        "Window padding" => {
-            "Top padding cannot exceed all-edge padding; constrained values show their effective size."
+        EDIT_OUTPUT_STREAK_SOUND => {
+            "One soft note with the small comet that greets new output from a program."
         }
         _ => return None,
     })
 }
+const BELL_SOUND_NOTE: &str =
+    "The bell is your system's alert sound; Music effects and Sound volume do not change it.";
 
-/// [`application_timing`] of the Harness row: supervision is live, the
-/// launcher follows at the next session.
-pub(crate) const HARNESS_TIMING: &str =
-    "Supervision starts or stops when saved; the agent launcher changes for new sessions";
+/// The consequence note for one setting: what its own row cannot say, drawn
+/// inside that row under its name ([`row_notes`]), so a note never sits under
+/// another row, on a screen, a search result or a Modified list that lacks its
+/// own. `None` for rows that need none — notes explain consequences, they never
+/// restate the control (an empty color field already says "Theme default").
+pub(crate) fn footnote_of(key: &str) -> Option<&'static str> {
+    if key == EDIT_BELL_SOUND {
+        return Some(BELL_SOUND_NOTE);
+    }
+    // What each voice sounds like, in plain words, wherever its row shows: a
+    // name like "Ambient sound bed" says nothing on its own. The voices that
+    // have one leave the shared note to Sound volume, the box's first row.
+    if let Some(note) = sound_voice_note(key) {
+        return Some(note);
+    }
+    if SOUND_MENU_KEYS.contains(&key) {
+        return Some(SOUND_NOTE);
+    }
+    if key == EDIT_SECURE_KEYBOARD_ENTRY {
+        return Some("Secure Keyboard Entry hides what you type from other apps.");
+    }
+    if key == EDIT_EXPLAIN_HEAVY_LOAD {
+        return Some("Show a message when this computer is too busy to keep up.");
+    }
+    if SECURITY_BOOL_KEYS.contains(&key) {
+        return Some("These are off by default; off refuses the program's request.");
+    }
+    Some(match key {
+        // What sets each toy off, wherever its switch shows: Top Settings,
+        // search, Modified.
+        "sparkle_words.profanity.enabled" => {
+            "Sparkle words: swear words in output burst into sparkles."
+        }
+        "sparkle_words.feline.enabled" => {
+            "Keyword kitties: a little cat peeks out by words like \u{201c}cat\u{201d} and \
+             \u{201c}kitty\u{201d}."
+        }
+        EDIT_CURSOR_TRAIL_COLOR | EDIT_CURSOR_TRAIL_ACCENT => {
+            "Used by trails that take a color; blank follows the theme's cursor color."
+        }
+        EDIT_MINIMUM_CONTRAST => "1.0 leaves colors as the theme draws them.",
+        // The one place the translucent contrast floor is stated.
+        EDIT_BACKGROUND_OPACITY => {
+            "Translucency needs GPU rendering (the default). Text over a translucent \
+             background keeps at least 4.5:1 contrast."
+        }
+        EDIT_MATRIX_RAIN_ENABLED => {
+            "Rain follows activity and drains when idle. View ▸ Matrix Rain overrides it for \
+             one session. Serious Mode and Reduce Motion turn it off."
+        }
+        EDIT_OUTPUT_STREAK_ENABLED => {
+            "A small comet greets new output from a program. Serious Mode and Reduce Motion \
+             turn it off."
+        }
+        EDIT_MOTION => motion_auto_footnote(std::env::consts::OS),
+        // Always animate overrides it; the row says so while it does.
+        EDIT_LOAD_ADAPTIVE_MOTION => {
+            "Drops decorative effects while drawing falls behind. Scrolling stays smooth."
+        }
+        EDIT_STREAM_FADE | EDIT_STREAM_FADE_MS => {
+            "New output fades in. It is instant with Reduce Motion, an unfocused window, \
+             full-screen apps, scrollback, typing, or Serious Mode."
+        }
+        EDIT_CURSOR_TRAIL_BLOOM
+        | EDIT_CURSOR_TRAIL_BLOOM_STRENGTH
+        | EDIT_CURSOR_TRAIL_BLOOM_RADIUS
+        | EDIT_CURSOR_FIRE_SHIMMER
+        | EDIT_HDR_GLOW
+        | EDIT_CURSOR_GLOW_SDR_BOOST => {
+            "Bloom, shimmer, and HDR fall back quietly when the display cannot show them."
+        }
+        EDIT_FONT_WEIGHT => "Only variable fonts use Variable font weight; other fonts ignore it.",
+        EDIT_WINDOW_PADDING_TOP => "The top cannot be more than Sides and bottom.",
+        EDIT_CONFIRM_MULTILINE_PASTE => {
+            "Asks before pasting text with a line break into a program that does not use \
+             bracketed paste."
+        }
+        EDIT_PREDICTIVE_ECHO => {
+            "Adaptive shows what you type before a slow connection echoes it, never at a \
+             password prompt."
+        }
+        EDIT_SCROLLBACK => "0 keeps every line.",
+        EDIT_SEARCH_HISTORY_LINES => {
+            "Find searches this many recent lines; 0 searches only the screen."
+        }
+        EDIT_BIDI => {
+            "Auto shows Arabic and Hebrew lines in reading order; If asked leaves the order \
+             to the program."
+        }
+        EDIT_AMBIGUOUS_WIDTH => "Narrow gives characters like ① or ※ one cell, Wide two.",
+        // Short on purpose: at 2× text on a 320-wide page it shares the row. The revert
+        // lines live in `aterm pkg machine` and `aterm explain-config`.
+        EDIT_MACHINE_UNIVERSAL_CONTROL => {
+            "Off keeps the pointer on this Mac: it won\u{2019}t move to a nearby Mac or iPad."
+        }
+        EDIT_DESKTOP_ALERTS => {
+            "When off, aterm's alerts stay in the window, the menu bar and Messages."
+        }
+        // LIVE, and says so: the window's package loop re-reads `[packages] enabled`
+        // (the retired `auto_update` folded in) before every pass.
+        // Only what is true in every copy: where Check & Update Now works, the
+        // Packages page's own note says so.
+        EDIT_PACKAGES_ENABLED => {
+            "Keeps ALab tools and the coding agents aterm manages up to date, starting at once."
+        }
+        // ONE install lane: no install ships a copy to install from, so the switch
+        // is consent to download. Off, nothing installs that nobody asked for
+        // (`PackagesConfig::auto_install`).
+        EDIT_PACKAGES_AUTO_INSTALL => {
+            "Lets aterm download ALab tools (several GB) at the next check, and new ones as \
+             they join. Off installs nothing you did not ask for."
+        }
+        EDIT_REROUTE_ANNOUNCE => {
+            "Prints one line before cargo or rustc runs through the ALab toolchain."
+        }
+        EDIT_ROBI => "Robi walks around the window and shows tips; type robi to start him over.",
+        // The Harness page's SUPERVISION notes: what supervision does, then what
+        // each choice means in the words its rows show. One note per key, each
+        // whole on its own, so a search or Modified that lists some of the
+        // rows says only theirs and never points at rows it does not show.
+        EDIT_HARNESS_ENABLED => HARNESS_NOTE,
+        k if agent_switch(k).is_some() => HARNESS_AGENT_NOTE,
+        EDIT_HARNESS_AUTOPILOT => HARNESS_AUTOPILOT_NOTE,
+        EDIT_HARNESS_APPROVE => HARNESS_APPROVE_NOTE,
+        EDIT_HARNESS_ANSWER_QUESTIONS | EDIT_HARNESS_QUESTION_PRIORITY => HARNESS_QUESTIONS_NOTE,
+        // The AI CLIs page's notes: what each choice does, whole on its own.
+        EDIT_AI_PREFERRED => AI_PREFERRED_NOTE,
+        EDIT_AI_ENABLED => AI_ENABLED_NOTE,
+        k if ai_use_switch(k).is_some() => AI_USE_NOTE,
+        _ => return None,
+    })
+}
+
+/// What the preferred AI CLI is for.
+pub(crate) const AI_PREFERRED_NOTE: &str = "The AI CLI that asks when a review names none, \
+     and the first one aterm ai doctor checks.";
+/// What the look's switch does.
+pub(crate) const AI_ENABLED_NOTE: &str = "aterm checks each AI CLI's login and says in \
+     Messages when one needs you to sign in.";
+/// What a CLI's own switch does, under the last of them: one note the CLIs
+/// share, so it is drawn once.
+pub(crate) const AI_USE_NOTE: &str = "Off, aterm never signs that CLI in here, never asks \
+     it for a review and says nothing about it.";
+
+/// What supervision does, under the SUPERVISION card's master switch.
+pub(crate) const HARNESS_NOTE: &str = "aterm keeps your coding agents working by answering \
+     their permission boxes and questions for you.";
+/// What an agent's own switch does, under the last of them: one note the
+/// agents share, so it is drawn once.
+pub(crate) const HARNESS_AGENT_NOTE: &str = "Off, aterm leaves that agent's sessions alone; \
+     Supervise coding agents turns supervision off for all of them.";
+/// What the default autopilot's modes mean, for a session with none of its
+/// own.
+pub(crate) const HARNESS_AUTOPILOT_NOTE: &str = "For sessions with no autopilot of their own: \
+     Cruise keeps the work moving until the agent says it is done; Land wraps the work up, then \
+     stops; Off leaves the session alone.";
+/// What the approval segments All, Safe and None mean.
+pub(crate) const HARNESS_APPROVE_NOTE: &str = "All says yes to every permission box, for that \
+     request only; Safe says yes only to requests aterm can tell are safe, such as reading a \
+     file, and leaves every Codex box but its folder-trust gate to you; None leaves every box to \
+     you.";
+/// What the question priorities Recommended, Long-term and Short-term mean.
+/// Recommended is the default, which the picker offers as "Use default".
+pub(crate) const HARNESS_QUESTIONS_NOTE: &str = "With Answer questions on, Recommended (the \
+     default) picks the answer the question marks as recommended; Long-term and Short-term let \
+     the agent choose, for lasting quality or for the quickest finish.";
+
+/// The note each of `keys` (a box's rows, top to bottom) draws inside its
+/// row: its own [`footnote_of`], where no later row shares it. A note several
+/// rows share (the Sound voices' one, the security switches' one) is drawn
+/// once, in the last of them, so it sits in a row it explains and never
+/// repeats down the box.
+pub(crate) fn row_notes(keys: &[&str]) -> Vec<Option<&'static str>> {
+    keys.iter()
+        .enumerate()
+        .map(|(position, key)| {
+            let note = footnote_of(key)?;
+            let shared_later = keys[position + 1..]
+                .iter()
+                .any(|later| footnote_of(later) == Some(note));
+            (!shared_later).then_some(note)
+        })
+        .collect()
+}
+
+/// [`application_timing`] of the Harness row: supervision starts or stops
+/// on every agent session the moment the file is saved (`harness_host`, on
+/// the config reload). There is no launcher half, whatever the 2026-09-23
+/// text promised: aterm wraps no agent's launch, so nothing about the switch
+/// waits for a new session.
+pub(crate) const HARNESS_TIMING: &str = "Supervision starts or stops when saved";
+
+/// [`application_timing`] of the default-Autopilot row: live like the
+/// switch — every session with no Autopilot word of its own runs under the
+/// saved mode from the host's next pass (an `off` stops its supervisor, and
+/// `cruise` or `land` starts one), and a session's own word is left alone.
+pub(crate) const HARNESS_AUTOPILOT_TIMING: &str =
+    "Applies when saved to every session without an autopilot of its own";
 
 /// [`application_timing`] of the approval-level row: the host restarts every
 /// supervised agent session's worker under the policy the save produced
@@ -3252,6 +3963,13 @@ pub(crate) const HARNESS_TIMING: &str =
 /// changes.
 pub(crate) const HARNESS_APPROVE_TIMING: &str =
     "Applies when saved: every supervised agent session restarts its supervisor under it";
+
+/// [`application_timing`] of an agent's own switch: live like the master
+/// switch, through the host's admission (`harness_host`, on the config
+/// reload) — switched off, that agent's workers stop and its sessions are
+/// left to the person; switched on, they are supervised again.
+pub(crate) const HARNESS_AGENT_TIMING: &str =
+    "Applies when saved: supervision of its sessions stops or starts";
 
 /// When an authored value becomes effective. Most preferences are projected
 /// live. Keep this metadata beside the complete preference schema so Advanced,
@@ -3270,23 +3988,32 @@ pub(crate) fn application_timing(key: &str) -> Option<&'static str> {
         EDIT_ALLOW_KITTY_FILE_TRANSFER | EDIT_TEMPORAL_RECORDING | EDIT_SHELL | EDIT_SHELL_ARGS => {
             Some("Applies to new sessions")
         }
-        // The switch is two things (2026-09-23): the in-GUI supervisor, which
-        // starts or stops on every Claude session the moment the file is
-        // saved (`harness_host`, on the config reload), and the launcher twin,
-        // re-rendered without the prelude so the NEXT launch is plain.
+        // The in-GUI supervisor starts or stops on every agent session the
+        // moment the file is saved (`harness_host`, on the config reload).
         EDIT_HARNESS_ENABLED => Some(HARNESS_TIMING),
+        // The default Autopilot is live the same way, for every session with
+        // no word of its own.
+        EDIT_HARNESS_AUTOPILOT => Some(HARNESS_AUTOPILOT_TIMING),
         // Live the same way (2026-09-24), with no launcher half.
         // So is the question answer (2026-09-25), and how it answers.
         EDIT_HARNESS_APPROVE | EDIT_HARNESS_ANSWER_QUESTIONS | EDIT_HARNESS_QUESTION_PRIORITY => {
             Some(HARNESS_APPROVE_TIMING)
         }
+        // Each agent's own switch is live too: the host admits or revokes
+        // that agent's workers at its next pass.
+        k if agent_switch(k).is_some() => Some(HARNESS_AGENT_TIMING),
         EDIT_HDR_GLOW => Some("Disabling applies now; enabling may require a new window"),
         EDIT_RESTORE_SESSION => Some("Applies when closing or next launch"),
-        EDIT_REROUTE_ANNOUNCE => Some("Applies to the next rerouted command"),
-        EDIT_PACKAGES_AUTO_INSTALL | "packages.account" | "packages.exclude" | "packages.links" => {
-            Some("Applies at the next package check")
-        }
-        EDIT_MACHINE_UNIVERSAL_CONTROL => Some("Applies on the next package pass, or Apply now"),
+        EDIT_REROUTE_ANNOUNCE => Some("Applies to the next cargo or rustc run"),
+        // Universal Control too: the package tool applies `[machine]` on its
+        // pass. Apply Now, where there is something to apply, sits under the
+        // Security row and says what it does, so this sentence never names a
+        // button the page may not show.
+        EDIT_PACKAGES_AUTO_INSTALL
+        | "packages.account"
+        | "packages.exclude"
+        | "packages.links"
+        | EDIT_MACHINE_UNIVERSAL_CONTROL => Some("Applies at the next ALab tools check"),
         "update.owner" | "update.repo" => Some(
             "A development build only: applies on the next manual or automatic update \
              check; a shipped build reads its compiled channel",
@@ -3305,6 +4032,47 @@ pub(crate) fn application_timing(key: &str) -> Option<&'static str> {
     }
 }
 
+/// [`application_timing`] as the plain words a row shows on its second line:
+/// when a saved change takes effect, said as a short clause ("Applies after
+/// restart", "Applies to new sessions"). `None` for a key whose change takes
+/// effect as soon as it is saved — the norm, which a row never states — and
+/// for Matrix rain, whose one exception (a session's View menu override) is
+/// its note's to explain.
+pub(crate) fn application_timing_badge(key: &str) -> Option<&'static str> {
+    if key == EDIT_MATRIX_RAIN_ENABLED {
+        return None;
+    }
+    application_timing(key).and_then(|timing| match timing {
+        // Live: supervision and the default autopilot follow the save at
+        // once.
+        HARNESS_TIMING
+        | HARNESS_APPROVE_TIMING
+        | HARNESS_AUTOPILOT_TIMING
+        | HARNESS_AGENT_TIMING => None,
+        "Applies now, including a downloaded update" => None,
+        "Applies to new sessions" => Some("Applies to new sessions"),
+        "Disabling applies now; enabling may require a new window" => {
+            Some("Turning it on may need a new window")
+        }
+        "Applies when closing or next launch" => Some("Applies when aterm closes or restarts"),
+        "Applies to the next cargo or rustc run" => Some("Applies to the next cargo or rustc run"),
+        // Apply Now, where there is something to apply, sits under the row
+        // and says what it does.
+        "Applies at the next ALab tools check"
+        | "Applies at the next ALab tools check, or when you press Apply Now" => {
+            Some("Applies at the next ALab tools check")
+        }
+        "Applies to newly received text; existing cells keep their current width" => {
+            Some("Applies to new text only")
+        }
+        "Applies on the next dial" => Some("Applies at the next connection"),
+        timing if timing.starts_with("A development build only") => Some("Development builds only"),
+        // Next launch, whatever else the sentence adds (columns and lines: an
+        // update keeps the current size).
+        _ => Some("Applies after restart"),
+    })
+}
+
 /// Whether saving this key has any immediate effect in the running app.
 ///
 /// Most keys with an [`application_timing`] disclosure are wholly deferred.
@@ -3319,10 +4087,12 @@ pub(crate) fn application_has_live_effect(key: &str) -> bool {
             | EDIT_MATRIX_RAIN_ENABLED
             | EDIT_HDR_GLOW
             | EDIT_HARNESS_ENABLED
+            | EDIT_HARNESS_AUTOPILOT
             | EDIT_HARNESS_APPROVE
             | EDIT_HARNESS_ANSWER_QUESTIONS
             | EDIT_HARNESS_QUESTION_PRIORITY
-    ) || application_timing(key).is_none()
+    ) || agent_switch(key).is_some()
+        || application_timing(key).is_none()
 }
 
 /// Ambient precedence documented beside the schema. Active values are resolved
@@ -3332,7 +4102,7 @@ pub(crate) fn environment_precedence(key: &str) -> Option<&'static str> {
     Some(match key {
         EDIT_COLUMNS => "a launch --columns overrides this value",
         EDIT_LINES => "a launch --lines overrides this value",
-        EDIT_GPU => "a launch --cpu or --gpu overrides this value (the last one given wins)",
+        EDIT_GPU => "a launch --cpu or --gpu overrides this value",
         EDIT_FONT_PX => "a launch --font-px overrides this value",
         EDIT_FONT_FAMILY => "a launch --font overrides this value",
         EDIT_SHELL => "a launch --shell overrides this value; -e / --command bypasses the shell",
@@ -3348,25 +4118,27 @@ pub(crate) fn environment_precedence(key: &str) -> Option<&'static str> {
 /// Human label for a security opt-in row (keyed by its `SECURITY_BOOL_KEYS` entry).
 fn security_label(key: &str) -> &'static str {
     match key {
-        EDIT_ALLOW_OSC52_QUERY => "Allow programs to read the clipboard (OSC 52)",
+        // Plain words on the row; the escape sequences' names (OSC 52, XTWINOPS,
+        // OSC 4/21) are search words (`keywords_of`) and Manual's help.
+        EDIT_ALLOW_OSC52_QUERY => "Allow programs to read the clipboard",
         EDIT_SECURE_KEYBOARD_ENTRY => "Secure Keyboard Entry (block keystroke snooping)",
         EDIT_ALLOW_WINDOW_OPS => {
             if cfg!(target_os = "linux") {
                 // The manipulation half is wired there (frame audit #4).
-                "Allow window control & size queries (XTWINOPS)"
+                "Allow programs to resize the window and read its title and size"
             } else {
                 // No host callback off-Linux, so this is reports only — but
                 // "text-grid-size" undersold them once the engine gained its
                 // in-core pixel answers (CSI 14 t text area, CSI 16 t cell
                 // box). The Manual entry enumerates; the row says "size".
-                "Allow title & size queries (XTWINOPS)"
+                "Allow programs to read the window title and size"
             }
         }
-        EDIT_ALLOW_NOTIFICATIONS => "Allow desktop notifications",
-        EDIT_ALLOW_PALETTE_RECONFIGURE => "Allow programs to set indexed colors (OSC 4/21)",
-        // "(new sessions)" stays in the name: at Compact width with large text the
-        // row paints the name alone, without its timing (`setting_row`).
-        EDIT_ALLOW_KITTY_FILE_TRANSFER => "Allow local files for Kitty graphics (new sessions)",
+        EDIT_ALLOW_NOTIFICATIONS => "Allow programs to show desktop notifications",
+        EDIT_ALLOW_PALETTE_RECONFIGURE => "Allow programs to change the color palette",
+        // Its timing (new sessions) rides beside the name on every row, and the
+        // compact large-text row paints it in parentheses (`setting_row`).
+        EDIT_ALLOW_KITTY_FILE_TRANSFER => "Allow local files for Kitty graphics",
         _ => "Security option",
     }
 }
@@ -3374,25 +4146,26 @@ fn security_label(key: &str) -> &'static str {
 /// Truthful copy for `motion = "auto"` differs with the shipping platform
 /// seam: macOS observes Reduce Motion live, Windows samples its animations
 /// switch when a window attaches, and other platforms have no OS query yet.
+/// Returns the Settings note under the Motion row and Manual's help fragment.
 pub(crate) fn motion_auto_copy(target_os: &str) -> (&'static str, &'static str) {
     match target_os {
         "macos" => (
-            "auto (follows live macOS Reduce Motion)",
-            "motion=auto follows macOS Reduce Motion live",
+            "Automatic follows macOS Reduce Motion as you change it.",
+            " · motion=auto follows macOS Reduce Motion live",
         ),
         "windows" => (
-            "auto (samples Windows animations at window attach)",
-            "motion=auto samples Show animations in Windows when a window attaches; preference changes are not observed live",
+            "Automatic follows the Windows animation setting each time a window opens.",
+            " · motion=auto samples Show animations in Windows when a window attaches; preference changes are not observed live",
         ),
         _ => (
-            "auto (OS Reduce Motion unavailable; no OS-driven reduction)",
-            "motion=auto cannot query OS Reduce Motion on this platform and does not reduce motion for an OS preference; choose reduced explicitly",
+            "Automatic animates fully here: this system has no Reduce Motion setting to follow.",
+            " · motion=auto cannot query OS Reduce Motion on this platform and does not reduce motion for an OS preference; choose reduced explicitly",
         ),
     }
 }
 
-pub(crate) fn motion_auto_placeholder() -> &'static str {
-    motion_auto_copy(std::env::consts::OS).0
+fn motion_auto_footnote(target_os: &str) -> &'static str {
+    motion_auto_copy(target_os).0
 }
 
 pub(crate) fn motion_auto_help() -> &'static str {
@@ -3410,6 +4183,27 @@ pub(crate) struct Range {
     pub(crate) min: f64,
     pub(crate) max: f64,
     pub(crate) step: f64,
+}
+
+/// HOW A NUMBER READS: a numeric setting's value as its slider, the
+/// preview's badge, a status and its default say it, from the stored `value`
+/// and the number as written (`shown`). A 0–1 fraction reads as a
+/// percentage, Bloom strength as a percentage of its scale (0.85 is 85%),
+/// Bloom size as a multiple (its unit is the renderer's), and every other
+/// counted value with its unit. `None` keeps the bare number.
+pub(crate) fn numeric_reading(key: &str, value: f64, shown: &str) -> Option<String> {
+    let unit = match key {
+        EDIT_FONT_PX => "px",
+        EDIT_CURSOR_TRAIL_MS => "ms",
+        EDIT_CURSOR_TRAIL_LENGTH | EDIT_CURSOR_TRAIL_RADIUS => "cells",
+        EDIT_CURSOR_TRAIL_BLOOM_STRENGTH => return Some(format!("{:.0}%", value * 100.0)),
+        EDIT_CURSOR_TRAIL_BLOOM_RADIUS => return Some(format!("{shown}\u{00d7}")),
+        _ if range_of(key).is_some_and(|range| range.min == 0.0 && range.max == 1.0) => {
+            return Some(format!("{:.0}%", value * 100.0));
+        }
+        _ => return None,
+    };
+    Some(format!("{shown} {unit}"))
 }
 
 pub(crate) fn range_of(key: &str) -> Option<Range> {
@@ -3432,23 +4226,6 @@ pub(crate) fn range_of(key: &str) -> Option<Range> {
         EDIT_CURSOR_TRAIL_BLOOM_RADIUS => r(0.5, 8.0, 0.1),
         EDIT_CURSOR_GLOW_SDR_BOOST => r(0.0, 1.0, 0.05),
         EDIT_TAB_STRIP_ROWS => r(0.0, 4.0, 1.0),
-        // Smart-title cadence/context bounds match the config resolvers. Keeping the
-        // UI on the same domain means its displayed value is exactly what reload uses.
-        EDIT_TITLE_SUMMARY_INTERVAL_SECONDS => r(
-            MIN_TITLE_SUMMARY_INTERVAL_SECONDS as f64,
-            MAX_TITLE_SUMMARY_INTERVAL_SECONDS as f64,
-            1.0,
-        ),
-        EDIT_TITLE_SUMMARY_TIMEOUT_SECONDS => r(
-            MIN_TITLE_SUMMARY_TIMEOUT_SECONDS as f64,
-            MAX_TITLE_SUMMARY_TIMEOUT_SECONDS as f64,
-            1.0,
-        ),
-        EDIT_TITLE_SUMMARY_CONTEXT_LINES => r(
-            MIN_TITLE_SUMMARY_CONTEXT_LINES as f64,
-            MAX_TITLE_SUMMARY_CONTEXT_LINES as f64,
-            1.0,
-        ),
         // Tab-status policy, on the resolver's own domain. Step 50ms: finer than
         // that is below the observation budget and could not be observed anyway.
         EDIT_TAB_STATUS_QUIET_AFTER_MS => r(
@@ -3549,20 +4326,80 @@ const SHELL_PLACEHOLDER: &str =
 #[cfg(not(windows))]
 const SHELL_PLACEHOLDER: &str = "platform default";
 
+/// Keep ALab tools up to date's search words: what its card says, the
+/// retired spellings a file may still hold, and every coding agent aterm
+/// supervises (it keeps them up to date too), read from the agent roster so
+/// a new agent is found here with no list to edit.
+fn packages_keywords() -> &'static [&'static str] {
+    static WORDS: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    WORDS.get_or_init(|| {
+        let mut words = vec![
+            "packages",
+            "toolchain",
+            "atpkg",
+            "tools",
+            "automatic",
+            "updates",
+            "maintenance",
+            "master",
+            "alab",
+            "auto_update",
+            "auto-update",
+        ];
+        words.extend(
+            Program::ALL
+                .into_iter()
+                .filter(|agent| agent.supervisable())
+                .map(Program::name),
+        );
+        words
+    })
+}
+
 /// Extra search keywords for a control so a fuzzy query finds it by INTENT, not only by
 /// its label (e.g. "dark mode" → `window_theme`, "history" → `scrollback_lines`). The
 /// label, key, and section name are always part of the search corpus; this augments
 /// them. An unknown key contributes no extra keywords (empty slice).
 pub(crate) fn keywords_of(key: &str) -> &'static [&'static str] {
     match key {
-        EDIT_WINDOW_THEME => &["dark", "light", "mode", "appearance"],
-        EDIT_THEME => &["colors", "colour", "scheme", "palette"],
+        // Match macOS follows the system too.
+        EDIT_WINDOW_THEME => &[
+            "dark",
+            "light",
+            "mode",
+            "dark mode",
+            "light mode",
+            "appearance",
+            "follow system",
+            "system",
+        ],
+        // The theme row is also the Follow system light/dark pair: found by
+        // its switch's name and by what people call a dark or light theme.
+        EDIT_THEME => &[
+            "colors",
+            "colour",
+            "scheme",
+            "palette",
+            "follow system",
+            "follow",
+            "system",
+            "light",
+            "dark",
+            "mode",
+            "light mode",
+            "dark mode",
+            "light/dark",
+            "pair",
+        ],
         EDIT_SCROLLBACK => &["history", "buffer", "lines", "scroll"],
         EDIT_COPY_ON_SELECT => &["clipboard", "selection", "mouse"],
         EDIT_LIGATURES => &["font", "programming", "arrows"],
         // "blink" is what a user annoyed by the blinking cursor searches for; the
         // glow is what replaces it while they type.
         EDIT_CURSOR_MOMENTUM_GLOW => &["blink", "glow", "typing", "speed", "momentum", "effect"],
+        // The shape is found by its options' names ("beam" is the old
+        // spelling of Bar) and by what people call the cursor.
+        EDIT_CURSOR_STYLE => &["block", "bar", "beam", "caret", "shape"],
         EDIT_CURSOR_TRAIL
         | EDIT_CURSOR_TRAIL_MS
         | EDIT_CURSOR_TRAIL_LENGTH
@@ -3673,6 +4510,10 @@ pub(crate) fn keywords_of(key: &str) -> &'static [&'static str] {
         EDIT_BACKGROUND_OPACITY | EDIT_BACKGROUND_MATERIAL => &[
             "opacity",
             "transparent",
+            "transparency",
+            "translucent",
+            "translucency",
+            "see-through",
             "glass",
             "vibrancy",
             "blur",
@@ -3701,14 +4542,37 @@ pub(crate) fn keywords_of(key: &str) -> &'static [&'static str] {
             "script",
             "editor",
         ],
-        EDIT_WINDOW_PADDING | EDIT_WINDOW_PADDING_TOP => {
-            &["padding", "margin", "border", "spacing", "inset", "edge"]
-        }
+        EDIT_WINDOW_PADDING | EDIT_WINDOW_PADDING_TOP => &[
+            "padding", "margin", "border", "spacing", "inset", "edge", "sides", "bottom", "top",
+        ],
         EDIT_CONFIRM_MULTILINE_PASTE => &["paste", "safety", "multiline"],
         EDIT_OPTION_AS_META => &["alt", "meta", "keyboard"],
-        EDIT_BIDI => &["rtl", "arabic", "hebrew", "bidirectional"],
-        EDIT_AMBIGUOUS_WIDTH => &["east", "asian", "cjk", "width"],
-        EDIT_PREDICTIVE_ECHO => &["typing", "latency", "prediction"],
+        EDIT_BIDI => &[
+            "rtl",
+            "right-to-left",
+            "direction",
+            "arabic",
+            "hebrew",
+            "bidirectional",
+        ],
+        EDIT_AMBIGUOUS_WIDTH => &[
+            "east",
+            "asian",
+            "cjk",
+            "width",
+            "unicode",
+            "emoji width",
+            "double width",
+        ],
+        EDIT_PREDICTIVE_ECHO => &[
+            "typing",
+            "latency",
+            "prediction",
+            "local echo",
+            "echo",
+            "ssh",
+            "remote",
+        ],
         EDIT_FOCUS_BOOST => &["priority", "qos", "latency", "windows", "starvation"],
         EDIT_MATRIX_RAIN_ENABLED => &[
             "matrix",
@@ -3718,23 +4582,10 @@ pub(crate) fn keywords_of(key: &str) -> &'static [&'static str] {
             "screensaver",
             "green",
         ],
+        EDIT_OUTPUT_STREAK_ENABLED => &["streak", "prism", "wake", "comet", "output", "effects"],
         // The retired spellings a person may still HAVE in a file find the switch that
         // reads them (`auto_update` → this one, `seed_install` → the install consent).
-        EDIT_PACKAGES_ENABLED => &[
-            "packages",
-            "toolchain",
-            "atpkg",
-            "tools",
-            "automatic",
-            "updates",
-            "maintenance",
-            "master",
-            "claude",
-            "codex",
-            "alab",
-            "auto_update",
-            "auto-update",
-        ],
+        EDIT_PACKAGES_ENABLED => packages_keywords(),
         // The two switches of Software Update's Automatic updates card, findable by the
         // words that card paints at any width ("Auto-check updates", "Install").
         EDIT_UPDATE_ENABLED => &[
@@ -3791,6 +4642,20 @@ pub(crate) fn keywords_of(key: &str) -> &'static [&'static str] {
             "seed_install",
         ],
         EDIT_FONT_FAMILY | EDIT_FONT_PX => &["typeface", "size", "text"],
+        // The Display faces card's toggles, by the faces' own names.
+        EDIT_DISPLAY_FONT => &[
+            "display",
+            "display faces",
+            "faces",
+            "chunky",
+            "pixel",
+            "engraved",
+            "bubble",
+            "minecraft",
+            "retro",
+            "game",
+            "fun",
+        ],
         EDIT_FONT_FAMILY_BOLD | EDIT_FONT_FAMILY_ITALIC | EDIT_FONT_FAMILY_BOLD_ITALIC => {
             &["bold", "italic", "weight", "style", "typeface"]
         }
@@ -3867,142 +4732,40 @@ pub(crate) fn keywords_of(key: &str) -> &'static [&'static str] {
         | EDIT_CURSOR_COLOR
         | EDIT_SELECTION_COLOR
         | EDIT_SELECTION_FOREGROUND => &["color", "colour"],
+        // The escape sequences' names left the rows' labels, so they are
+        // search words here (before the shared Security arm below).
+        EDIT_ALLOW_OSC52_QUERY => &[
+            "security",
+            "permission",
+            "allow",
+            "clipboard",
+            "paste",
+            "osc 52",
+            "osc52",
+        ],
+        EDIT_ALLOW_WINDOW_OPS => &[
+            "security",
+            "permission",
+            "allow",
+            "window",
+            "title",
+            "size",
+            "xtwinops",
+            "csi t",
+        ],
+        EDIT_ALLOW_PALETTE_RECONFIGURE => &[
+            "security",
+            "permission",
+            "allow",
+            "palette",
+            "colors",
+            "colours",
+            "indexed colors",
+            "osc 4",
+            "osc 21",
+        ],
         k if SECURITY_BOOL_KEYS.contains(&k) => &["security", "permission", "allow"],
         EDIT_SHOW_BUILD_BADGE => &["version", "build", "badge", "chrome"],
-        EDIT_DESCRIPTIVE_TITLES => &[
-            "smart title",
-            "smart",
-            "live",
-            "activity",
-            "summary",
-            "description",
-            "tab",
-            "window",
-        ],
-        EDIT_TITLE_SUMMARY_PROVIDER => &[
-            "smart title",
-            "ai",
-            "llm",
-            "local",
-            "ollama",
-            "openai",
-            "service",
-            "provider",
-            "activity",
-        ],
-        EDIT_TITLE_SUMMARY_MODEL => &[
-            "smart title",
-            "activity",
-            "ai",
-            "llm",
-            "model",
-            "qwen",
-            "ollama",
-        ],
-        EDIT_TITLE_SUMMARY_ENDPOINT => &[
-            "smart title",
-            "url",
-            "server",
-            "host",
-            "ollama",
-            "openai",
-            "service",
-            "activity",
-        ],
-        EDIT_TITLE_SUMMARY_TOKEN_FILE => &[
-            "smart title",
-            "api",
-            "key",
-            "credential",
-            "secret",
-            "authentication",
-            "file",
-            "path",
-            "activity",
-        ],
-        EDIT_TITLE_SUMMARY_TIMEOUT_SECONDS => &[
-            "smart title",
-            "activity",
-            "request",
-            "timeout",
-            "network",
-            "seconds",
-        ],
-        EDIT_TITLE_SUMMARY_PROXY_MODE => &[
-            "smart title",
-            "activity",
-            "proxy",
-            "environment",
-            "direct",
-            "http_proxy",
-            "https_proxy",
-            "no_proxy",
-        ],
-        EDIT_TITLE_SUMMARY_CA_FILE => &[
-            "smart title",
-            "activity",
-            "tls",
-            "https",
-            "certificate",
-            "ca",
-            "pem",
-            "trust",
-            "file",
-            "path",
-        ],
-        EDIT_TITLE_SUMMARY_INTERVAL_SECONDS => &[
-            "smart title",
-            "refresh",
-            "cadence",
-            "frequency",
-            "seconds",
-            "update",
-            "live",
-            "activity",
-        ],
-        EDIT_TITLE_SUMMARY_CONTEXT_LINES => &[
-            "smart title",
-            "context",
-            "recent",
-            "history",
-            "lines",
-            "prompt",
-            "terminal",
-            "activity",
-        ],
-        EDIT_TITLE_SUMMARY_INCLUDE_OUTPUT => &[
-            "smart title",
-            "privacy",
-            "terminal",
-            "output",
-            "command",
-            "context",
-            "summary",
-            "activity",
-        ],
-        EDIT_TITLE_SUMMARY_ALLOW_REMOTE => &[
-            "smart title",
-            "privacy",
-            "network",
-            "remote",
-            "cloud",
-            "consent",
-            "send",
-            "unattested",
-            "trust",
-            "activity",
-        ],
-        EDIT_TAB_TITLE_FORMAT | EDIT_WINDOW_TITLE_FORMAT => &[
-            "smart title",
-            "title",
-            "description",
-            "format",
-            "layout",
-            "order",
-            "tab",
-            "window",
-            "activity",
-        ],
         EDIT_TAB_STATUS | EDIT_TAB_STATUS_BADGE => &[
             "tab status",
             "status",
@@ -4051,6 +4814,22 @@ pub(crate) fn keywords_of(key: &str) -> &'static [&'static str] {
         // Nested tables share one intent vocabulary per table.
         k if k.starts_with("net.") => &["network", "remote", "drive", "listener", "tls"],
         k if k.starts_with("update.") => &["update", "channel", "github", "release"],
+        // The default Autopilot answers to the control's name, its three
+        // modes and the owner's own words for them ("infinity mode", "wrap it
+        // up mode", "off").
+        EDIT_HARNESS_AUTOPILOT => &[
+            "harness",
+            "claude",
+            "autopilot",
+            "supervisor",
+            "cruise",
+            "land",
+            "wrap",
+            "wrap up",
+            "forever",
+            "infinity",
+            "off",
+        ],
         // The approval policy answers to what a person reaches for when the
         // agent keeps stopping on "Do you want to proceed?" — and to the words
         // for turning the answering off.
@@ -4100,6 +4879,15 @@ pub(crate) fn keywords_of(key: &str) -> &'static [&'static str] {
             "recommended",
             "decide",
         ],
+        // An agent's switch answers to the words for leaving it alone; its
+        // agent's own word is an own name ([`own_name_of`]), never a synonym.
+        k if agent_switch(k).is_some() => &["harness", "agent", "supervise", "disable", "off"],
+        // The AI CLIs' rows answer to the words a person reaches for to
+        // choose among them or turn one away (its own names are its label
+        // and key).
+        EDIT_AI_PREFERRED => &["ai", "cli", "preferred", "main", "default", "review"],
+        EDIT_AI_ENABLED => &["ai", "cli", "login", "sign in", "doctor", "messages"],
+        k if ai_use_switch(k).is_some() => &["ai", "cli", "use", "login", "review", "off"],
         // The one word most people will search for here is the vendor's — so
         // the wrapper's switch answers to "claude" as well as to "harness",
         // and to the two words an operator reaches for when they want it to
@@ -4126,6 +4914,20 @@ pub(crate) fn keywords_of(key: &str) -> &'static [&'static str] {
             "sfx",
             "sparkle",
             "words",
+        ],
+        // The two word effects answer to what they react to.
+        "sparkle_words.profanity.enabled" => &[
+            "sparkle",
+            "words",
+            "swear",
+            "swearing",
+            "profanity",
+            "curse",
+            "cursing",
+            "effects",
+        ],
+        "sparkle_words.feline.enabled" => &[
+            "kitty", "kitties", "cat", "cats", "feline", "keyword", "words", "effects",
         ],
         k if k.starts_with("sparkle_words.") => &["sparkle", "words", "decorations", "effects"],
         k if k.starts_with("matrix_rain.") => &["matrix", "rain", "phosphor", "effects"],
@@ -4173,6 +4975,13 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
     let cursor_trail_style = configured_str(cfg.cursor_trail_style.as_deref());
     let cursor_trail_color = configured_str(cfg.cursor_trail_color.as_deref());
     let cursor_trail_accent = configured_str(cfg.cursor_trail_accent.as_deref());
+    // The saved style's own trail colour, where it keeps one (Laser).
+    let own_trail_color = crate::app_config::resolve_trail_style(
+        cfg.cursor_trail_style_raw(),
+        &crate::app_config::TrailPackCatalog::default(),
+    )
+    .style
+    .and_then(aterm_effects::cursor_fx::own_trail_color);
     let cursor_nyan_sprite = configured_str(cfg.cursor_nyan_sprite.as_deref());
     let foreground = configured_str(cfg.foreground.as_deref());
     let background = configured_str(cfg.background.as_deref());
@@ -4180,32 +4989,15 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
     let selection_color = configured_str(cfg.selection_color.as_deref());
     let selection_foreground = configured_str(cfg.selection_foreground.as_deref());
     let predictive_echo = configured_str(cfg.predictive_echo.as_deref());
-    let title_summary_provider = cfg
-        .title_summary_provider
-        .as_ref()
-        .map(|provider| provider.as_str().to_string());
-    let title_summary_model = configured_str(cfg.title_summary_model.as_deref());
-    let title_summary_endpoint = configured_str(cfg.title_summary_endpoint.as_deref());
-    let title_summary_token_file = configured_str(cfg.title_summary_token_file.as_deref());
-    let title_summary_proxy_mode = cfg
-        .title_summary_proxy_mode
-        .map(|mode| mode.as_str().to_string());
-    let title_summary_ca_file = configured_str(cfg.title_summary_ca_file.as_deref());
-    let tab_title_format = cfg
-        .tab_title_format
-        .as_ref()
-        .map(|format| format.as_str().to_string());
-    let window_title_format = cfg
-        .window_title_format
-        .as_ref()
-        .map(|format| format.as_str().to_string());
     let mut fields = vec![
         // Family before size — the Typography "Font" group-box order (design §3.2).
         EditField {
             label: "Font family",
             key: EDIT_FONT_FAMILY,
             kind: EditKind::Text,
-            placeholder: font_family.clone().unwrap_or_else(|| "default".to_string()),
+            placeholder: font_family
+                .clone()
+                .unwrap_or_else(|| "Automatic".to_string()),
             seed: font_family,
         },
         EditField {
@@ -4213,9 +5005,10 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             key: EDIT_FONT_PX,
             kind: EditKind::Float,
             seed: cfg.font_px.map(|px| format!("{px}")),
+            // Unset, the size is the platform's: the slider sits on it.
             placeholder: match cfg.font_px {
                 Some(px) => format!("{px} px"),
-                None => "auto (default)".to_string(),
+                None => format!("{} (automatic)", crate::FONT_PX),
             },
         },
         EditField {
@@ -4235,7 +5028,7 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             kind: EditKind::Text,
             placeholder: font_family_bold
                 .clone()
-                .unwrap_or_else(|| "auto (discovered)".to_string()),
+                .unwrap_or_else(|| "Automatic".to_string()),
             seed: font_family_bold,
         },
         EditField {
@@ -4244,7 +5037,7 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             kind: EditKind::Text,
             placeholder: font_family_italic
                 .clone()
-                .unwrap_or_else(|| "auto (discovered)".to_string()),
+                .unwrap_or_else(|| "Automatic".to_string()),
             seed: font_family_italic,
         },
         EditField {
@@ -4253,7 +5046,7 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             kind: EditKind::Text,
             placeholder: font_family_bold_italic
                 .clone()
-                .unwrap_or_else(|| "auto (discovered)".to_string()),
+                .unwrap_or_else(|| "Automatic".to_string()),
             seed: font_family_bold_italic,
         },
         EditField {
@@ -4271,7 +5064,7 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             kind: EditKind::Text,
             placeholder: fallback_fonts
                 .clone()
-                .unwrap_or_else(|| "system discovery".to_string()),
+                .unwrap_or_else(|| "Automatic".to_string()),
             seed: fallback_fonts,
         },
         EditField {
@@ -4280,7 +5073,7 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             kind: EditKind::Text,
             placeholder: symbol_font
                 .clone()
-                .unwrap_or_else(|| "system discovery".to_string()),
+                .unwrap_or_else(|| "Automatic".to_string()),
             seed: symbol_font,
         },
         EditField {
@@ -4289,7 +5082,7 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             kind: EditKind::Text,
             placeholder: emoji_font
                 .clone()
-                .unwrap_or_else(|| "system discovery".to_string()),
+                .unwrap_or_else(|| "Automatic".to_string()),
             seed: emoji_font,
         },
         EditField {
@@ -4454,11 +5247,15 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             label: "Color theme",
             key: EDIT_THEME,
             kind: EditKind::Theme,
-            placeholder: theme.clone().unwrap_or_else(|| "Default".to_string()),
+            // Unset follows the OS (`app_config::UNSET_THEME`): Default in
+            // dark mode, Default Light in light mode.
+            placeholder: theme
+                .clone()
+                .unwrap_or_else(|| UNSET_THEME_LABEL.to_string()),
             seed: theme,
         },
         EditField {
-            label: "Cursor style",
+            label: "Cursor shape",
             key: EDIT_CURSOR_STYLE,
             kind: EditKind::Enum {
                 options: CURSOR_STYLES,
@@ -4487,7 +5284,7 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             placeholder: String::new(),
         },
         EditField {
-            label: "Cursor trail",
+            label: "Cursor effects",
             key: EDIT_CURSOR_TRAIL,
             kind: EditKind::Bool,
             // Master on/off for the cursor wake (default ON). The checkbox reflects the
@@ -4496,8 +5293,9 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             placeholder: String::new(),
         },
         EditField {
-            // ONE popup row over the whole style list (design graft #1).
-            label: "Cursor trail",
+            // The Cursor Styles page lists every style; elsewhere the row
+            // opens that page.
+            label: "Cursor style",
             key: EDIT_CURSOR_TRAIL_STYLE,
             kind: EditKind::Enum {
                 options: CURSOR_TRAIL_STYLES,
@@ -4508,11 +5306,14 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             seed: cursor_trail_style,
         },
         EditField {
-            // The aural half of the trail styles: each style's signature
-            // palette plays softly on the same spawn edge that lights the
-            // trail (droplets, crackle, chimes, the beam's hum...). Default ON;
-            // silent whenever the trail's light is (off style, reduced motion,
-            // unfocused). `trail_sound_volume` in aterm.toml trims the level.
+            // The master switch for every synth sound: the typing notes (each
+            // style's signature palette on the spawn edge that lights the
+            // trail), the ambient bed, the song, the output streak's note, the
+            // build verdict, the bonk and the supervisor chime. Default ON.
+            // Only the typing notes follow the trail's light (silent with the
+            // Off style, reduced motion or an unfocused window); the other
+            // sounds keep their own gates. The Sound volume row below trims
+            // the level.
             label: "Music effects",
             key: EDIT_TRAIL_SOUNDS,
             kind: EditKind::Bool,
@@ -4548,8 +5349,8 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
         },
         EditField {
             // The ambient BED: the continuous per-style background texture
-            // that swells behind fast typing. Default OFF (the owner dislikes
-            // the drone) — the toggle gates the synth's bed mixer entirely
+            // that swells behind fast typing. Default ON, voiced from the live
+            // chord — the toggle gates the synth's bed mixer entirely
             // (zero bed samples, not a muted gain), leaving the discrete
             // notes, the brrrring, the bonk and the melody untouched.
             label: "Ambient sound bed",
@@ -4608,7 +5409,7 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             // choosing"): the in-window supervisor answered a question box by
             // policy. A synth voice, under Music effects. Seeded through its
             // resolver.
-            label: "Question choice chime",
+            label: "Chime when the supervisor answers",
             key: EDIT_CHOICE_SOUND,
             kind: EditKind::Bool,
             seed: Some(cfg.choice_sound_or_default().to_string()),
@@ -4645,7 +5446,7 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             },
         },
         EditField {
-            label: "Light-crown radius",
+            label: "Glow size",
             key: EDIT_CURSOR_TRAIL_RADIUS,
             kind: EditKind::Float,
             seed: cfg.cursor_trail_radius.map(|v| v.to_string()),
@@ -4655,7 +5456,7 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             },
         },
         EditField {
-            label: "Landing ring",
+            label: "Ring on jumps",
             key: EDIT_CURSOR_TRAIL_RING,
             kind: EditKind::Bool,
             seed: Some(cfg.cursor_trail_ring_or_default().to_string()),
@@ -4665,18 +5466,26 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             label: "Trail color",
             key: EDIT_CURSOR_TRAIL_COLOR,
             kind: EditKind::Color,
-            placeholder: cursor_trail_color
-                .clone()
-                .unwrap_or_else(|| "cursor color (default)".to_string()),
+            // Unset, the trail draws the saved style's own colour where it
+            // has one (Laser's violet), else the live cursor colour.
+            placeholder: cursor_trail_color.clone().unwrap_or_else(|| {
+                own_trail_color.map_or_else(
+                    || "Cursor color (default)".to_string(),
+                    |(_, name)| format!("{name} (default)"),
+                )
+            }),
             seed: cursor_trail_color,
         },
         EditField {
-            label: "Trail accent",
+            label: "Trail accent color",
             key: EDIT_CURSOR_TRAIL_ACCENT,
             kind: EditKind::Color,
-            placeholder: cursor_trail_accent
-                .clone()
-                .unwrap_or_else(|| "brightened cursor color (default)".to_string()),
+            placeholder: cursor_trail_accent.clone().unwrap_or_else(|| {
+                own_trail_color.map_or_else(
+                    || "Brighter cursor color (default)".to_string(),
+                    |(_, name)| format!("Brighter {} (default)", name.to_lowercase()),
+                )
+            }),
             seed: cursor_trail_accent,
         },
         EditField {
@@ -4685,11 +5494,11 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             kind: EditKind::Text,
             placeholder: cursor_nyan_sprite
                 .clone()
-                .unwrap_or_else(|| "built-in sprite (default)".to_string()),
+                .unwrap_or_else(|| "Built-in sprite (default)".to_string()),
             seed: cursor_nyan_sprite,
         },
         EditField {
-            label: "GPU bloom",
+            label: "Bloom",
             key: EDIT_CURSOR_TRAIL_BLOOM,
             kind: EditKind::Bool,
             seed: Some(cfg.cursor_trail_bloom_or_default().to_string()),
@@ -4706,7 +5515,7 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             },
         },
         EditField {
-            label: "Bloom radius",
+            label: "Bloom size",
             key: EDIT_CURSOR_TRAIL_BLOOM_RADIUS,
             kind: EditKind::Float,
             seed: cfg.cursor_trail_bloom_radius.map(|v| v.to_string()),
@@ -4724,7 +5533,7 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             },
         },
         EditField {
-            label: "Fire heat shimmer",
+            label: "Heat shimmer",
             key: EDIT_CURSOR_FIRE_SHIMMER,
             kind: EditKind::Bool,
             seed: Some(cfg.cursor_fire_shimmer_or_default().to_string()),
@@ -4748,7 +5557,7 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             },
         },
         EditField {
-            label: "Serious mode (no sounds or effects)",
+            label: "Serious Mode (no sounds or effects)",
             key: EDIT_SERIOUS_MODE,
             kind: EditKind::Bool,
             seed: Some(cfg.serious_mode_or_default().to_string()),
@@ -4761,7 +5570,7 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
                 options: MOTION_MODES,
             },
             placeholder: configured_str(cfg.motion.as_deref())
-                .unwrap_or_else(|| motion_auto_placeholder().to_string()),
+                .unwrap_or_else(|| "auto (default)".to_string()),
             seed: configured_str(cfg.motion.as_deref()),
         },
         EditField {
@@ -4770,7 +5579,7 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             // Turn OFF (or set Motion = full) to keep the cursor trail / aurora on
             // regardless of load. Smooth scrolling and the scroll pill are never
             // shed under either setting (`App::effect_policy`).
-            label: "Load-adaptive motion",
+            label: "Reduce motion under heavy load",
             key: EDIT_LOAD_ADAPTIVE_MOTION,
             kind: EditKind::Bool,
             seed: Some(cfg.load_adaptive_motion_or_default().to_string()),
@@ -4803,7 +5612,7 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             kind: EditKind::Color,
             placeholder: foreground
                 .clone()
-                .unwrap_or_else(|| "theme default".to_string()),
+                .unwrap_or_else(|| "Theme default".to_string()),
             seed: foreground,
         },
         EditField {
@@ -4812,7 +5621,7 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             kind: EditKind::Color,
             placeholder: background
                 .clone()
-                .unwrap_or_else(|| "theme default".to_string()),
+                .unwrap_or_else(|| "Theme default".to_string()),
             seed: background,
         },
         EditField {
@@ -4821,7 +5630,7 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             kind: EditKind::Color,
             placeholder: cursor_color
                 .clone()
-                .unwrap_or_else(|| "theme default".to_string()),
+                .unwrap_or_else(|| "Theme default".to_string()),
             seed: cursor_color,
         },
         EditField {
@@ -4830,7 +5639,7 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             kind: EditKind::Color,
             placeholder: selection_color
                 .clone()
-                .unwrap_or_else(|| "theme default".to_string()),
+                .unwrap_or_else(|| "Theme default".to_string()),
             seed: selection_color,
         },
         EditField {
@@ -4839,11 +5648,11 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             kind: EditKind::Color,
             placeholder: selection_foreground
                 .clone()
-                .unwrap_or_else(|| "auto (contrast floor)".to_string()),
+                .unwrap_or_else(|| "Automatic".to_string()),
             seed: selection_foreground,
         },
         EditField {
-            label: "System appearance",
+            label: "Window appearance",
             key: EDIT_WINDOW_THEME,
             kind: EditKind::Enum {
                 options: WINDOW_THEMES,
@@ -4856,9 +5665,11 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             label: "Selected tab color",
             key: EDIT_ACTIVE_TAB_COLOR,
             kind: EditKind::Color,
+            // Unset follows the system's selected-tab pill: plain words, in
+            // the "(default)" form every other row uses, never a config word.
             placeholder: active_tab_color
                 .clone()
-                .unwrap_or_else(|| "transparent white (default)".to_string()),
+                .unwrap_or_else(|| "Automatic (default)".to_string()),
             seed: active_tab_color,
         },
         EditField {
@@ -4928,164 +5739,10 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             key: EDIT_TAB_STRIP_ROWS,
             kind: EditKind::Integer,
             seed: cfg.tab_strip_rows.map(|n| n.to_string()),
-            placeholder: cfg
-                .tab_strip_rows
-                .map_or_else(
-                    || format!("{} (default)", crate::app_config::DEFAULT_TAB_STRIP_ROWS),
-                    |n| n.to_string(),
-                ),
-        },
-        EditField {
-            label: "Generate live Activity",
-            key: EDIT_DESCRIPTIVE_TITLES,
-            kind: EditKind::Bool,
-            seed: Some(cfg.descriptive_titles_or_default().to_string()),
-            placeholder: String::new(),
-        },
-        EditField {
-            label: "Activity provider",
-            key: EDIT_TITLE_SUMMARY_PROVIDER,
-            kind: EditKind::Enum {
-                options: TITLE_SUMMARY_PROVIDERS,
-            },
-            placeholder: title_summary_provider
-                .clone()
-                .unwrap_or_else(|| "builtin (default)".to_string()),
-            seed: title_summary_provider,
-        },
-        EditField {
-            label: "Activity model",
-            key: EDIT_TITLE_SUMMARY_MODEL,
-            kind: EditKind::Text,
-            placeholder: title_summary_model
-                .clone()
-                .unwrap_or_else(|| format!("{DEFAULT_TITLE_SUMMARY_MODEL} (default)")),
-            seed: title_summary_model,
-        },
-        EditField {
-            label: "Provider endpoint",
-            key: EDIT_TITLE_SUMMARY_ENDPOINT,
-            kind: EditKind::Text,
-            placeholder: title_summary_endpoint.clone().unwrap_or_else(|| {
-                match cfg.title_summary_provider_or_default() {
-                    crate::app_config::TitleSummaryProvider::Ollama => format!(
-                        "blank = automatic private endpoint; {EXAMPLE_EXPLICIT_OLLAMA_TITLE_SUMMARY_ENDPOINT} = explicit shared endpoint"
-                    ),
-                    crate::app_config::TitleSummaryProvider::OpenAiCompatible => {
-                        "required: https://provider.example/v1/chat/completions".to_string()
-                    }
-                    crate::app_config::TitleSummaryProvider::Builtin
-                    | crate::app_config::TitleSummaryProvider::Off => {
-                        "not used by selected provider".to_string()
-                    }
-                }
-            }),
-            seed: title_summary_endpoint,
-        },
-        EditField {
-            // This is intentionally a path-only text field: the config/runtime
-            // interprets its contents as a filesystem path, never as a bearer token.
-            label: "Provider token file (path only)",
-            key: EDIT_TITLE_SUMMARY_TOKEN_FILE,
-            kind: EditKind::Text,
-            placeholder: title_summary_token_file
-                .clone()
-                .unwrap_or_else(|| "not configured (file path only)".to_string()),
-            seed: title_summary_token_file,
-        },
-        EditField {
-            label: "Request timeout (seconds)",
-            key: EDIT_TITLE_SUMMARY_TIMEOUT_SECONDS,
-            kind: EditKind::Integer,
-            seed: cfg
-                .title_summary_timeout_seconds
-                .map(|seconds| seconds.to_string()),
-            placeholder: cfg.title_summary_timeout_seconds.map_or_else(
-                || format!("{DEFAULT_TITLE_SUMMARY_TIMEOUT_SECONDS} (default)"),
-                |seconds| seconds.to_string(),
+            placeholder: cfg.tab_strip_rows.map_or_else(
+                || format!("{} (default)", crate::app_config::DEFAULT_TAB_STRIP_ROWS),
+                |n| n.to_string(),
             ),
-        },
-        EditField {
-            label: "Remote proxy policy",
-            key: EDIT_TITLE_SUMMARY_PROXY_MODE,
-            kind: EditKind::Enum {
-                options: TITLE_SUMMARY_PROXY_MODES,
-            },
-            placeholder: title_summary_proxy_mode
-                .clone()
-                .unwrap_or_else(|| "environment (default)".to_string()),
-            seed: title_summary_proxy_mode,
-        },
-        EditField {
-            // Like the token row, this is path-only. When present, the explicit
-            // PEM bundle replaces platform roots for this provider.
-            label: "Provider CA bundle (PEM path)",
-            key: EDIT_TITLE_SUMMARY_CA_FILE,
-            kind: EditKind::Text,
-            placeholder: title_summary_ca_file
-                .clone()
-                .unwrap_or_else(|| "platform trust roots (default)".to_string()),
-            seed: title_summary_ca_file,
-        },
-        EditField {
-            label: "Activity refresh interval (seconds)",
-            key: EDIT_TITLE_SUMMARY_INTERVAL_SECONDS,
-            kind: EditKind::Integer,
-            seed: cfg
-                .title_summary_interval_seconds
-                .map(|seconds| seconds.to_string()),
-            placeholder: cfg.title_summary_interval_seconds.map_or_else(
-                || format!("{DEFAULT_TITLE_SUMMARY_INTERVAL_SECONDS} (default)"),
-                |seconds| seconds.to_string(),
-            ),
-        },
-        EditField {
-            label: "Activity context lines",
-            key: EDIT_TITLE_SUMMARY_CONTEXT_LINES,
-            kind: EditKind::Integer,
-            seed: cfg
-                .title_summary_context_lines
-                .map(|lines| lines.to_string()),
-            placeholder: cfg.title_summary_context_lines.map_or_else(
-                || format!("{DEFAULT_TITLE_SUMMARY_CONTEXT_LINES} (default)"),
-                |lines| lines.to_string(),
-            ),
-        },
-        EditField {
-            label: "Include recent terminal output",
-            key: EDIT_TITLE_SUMMARY_INCLUDE_OUTPUT,
-            kind: EditKind::Bool,
-            seed: Some(cfg.title_summary_include_output_or_default().to_string()),
-            placeholder: String::new(),
-        },
-        EditField {
-            label: "Trust network or unowned provider",
-            key: EDIT_TITLE_SUMMARY_ALLOW_REMOTE,
-            kind: EditKind::Bool,
-            seed: Some(cfg.title_summary_allow_remote_or_default().to_string()),
-            placeholder: String::new(),
-        },
-        EditField {
-            label: "Tab label format",
-            key: EDIT_TAB_TITLE_FORMAT,
-            kind: EditKind::Enum {
-                options: TITLE_FORMATS,
-            },
-            placeholder: tab_title_format
-                .clone()
-                .unwrap_or_else(|| "title-description (default)".to_string()),
-            seed: tab_title_format,
-        },
-        EditField {
-            label: "Window title format",
-            key: EDIT_WINDOW_TITLE_FORMAT,
-            kind: EditKind::Enum {
-                options: TITLE_FORMATS,
-            },
-            placeholder: window_title_format
-                .clone()
-                .unwrap_or_else(|| "title-description (default)".to_string()),
-            seed: window_title_format,
         },
         EditField {
             label: "Classify session status",
@@ -5157,12 +5814,12 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             placeholder: String::new(),
         },
         EditField {
-            // `[packages] enabled`: "Automatic updates" — THE one switch for the
+            // `[packages] enabled`: "Keep ALab tools up to date" — THE one switch for the
             // background package lane (the retired `auto_update` folded in, seeded
             // RESOLVED), applied LIVE: the window's package loop re-reads it before every
             // pass and stands down or resumes without a relaunch. Explicit Update Now /
             // Install actions remain available.
-            label: "Automatic updates",
+            label: "Keep ALab tools up to date",
             key: EDIT_PACKAGES_ENABLED,
             kind: EditKind::Bool,
             seed: Some(cfg.packages_enabled().to_string()),
@@ -5185,7 +5842,8 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             // `[machine]` settings, unless this says "leave". Enum rows seed the CONFIGURED
             // raw value (blank when unset) with the effective default in the
             // placeholder — the same law as every other non-Bool row.
-            label: "Universal Control on this Mac",
+            // The row sits in the "This Mac" group, so its name needn't say so.
+            label: "Universal Control",
             key: EDIT_MACHINE_UNIVERSAL_CONTROL,
             kind: EditKind::Enum {
                 options: UNIVERSAL_CONTROL_POLICIES,
@@ -5213,7 +5871,7 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
     let background_material = configured_str(cfg.background_material.as_deref());
     fields.extend([
         EditField {
-            label: "GPU rendering (restart)",
+            label: "GPU rendering",
             key: EDIT_GPU,
             kind: EditKind::Bool,
             // Resolved CONFIG state (default ON with CPU fallback); the env/CLI
@@ -5222,7 +5880,7 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             placeholder: String::new(),
         },
         EditField {
-            label: "ANSI palette (comma-separated)",
+            label: "ANSI palette",
             key: EDIT_PALETTE,
             kind: EditKind::Text,
             placeholder: palette
@@ -5236,7 +5894,7 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
         // (The trail colour/accent, kitty sprite, comet-geometry, bloom, shimmer
         // and HDR/SDR glow ROWS live in the core list above — one row per key.)
         EditField {
-            label: "Trail Pack manifests (comma-separated)",
+            label: "Trail Packs",
             key: EDIT_CURSOR_TRAIL_PACKS,
             kind: EditKind::Text,
             placeholder: trail_packs
@@ -5252,7 +5910,7 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             placeholder: String::new(),
         },
         EditField {
-            label: "Stream fade ms",
+            label: "Fade-in duration (ms)",
             key: EDIT_STREAM_FADE_MS,
             kind: EditKind::Integer,
             seed: cfg.stream_fade_ms.map(|n| n.to_string()),
@@ -5270,7 +5928,7 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             seed: shell,
         },
         EditField {
-            label: "Shell arguments (comma-separated)",
+            label: "Shell arguments",
             key: EDIT_SHELL_ARGS,
             kind: EditKind::Text,
             placeholder: shell_args
@@ -5297,7 +5955,7 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             placeholder: String::new(),
         },
         EditField {
-            label: "Font features (comma-separated)",
+            label: "Font features",
             key: EDIT_FONT_FEATURES,
             kind: EditKind::Text,
             placeholder: font_features
@@ -5333,7 +5991,7 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             placeholder: cfg
                 .wallpaper
                 .clone()
-                .unwrap_or_else(|| "none (flat background)".to_string()),
+                .unwrap_or_else(|| "No image (default)".to_string()),
         },
         EditField {
             label: "Wallpaper dim",
@@ -5408,14 +6066,14 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             placeholder: String::new(),
         },
         EditField {
-            label: "Temporal recording",
+            label: "Record sessions for replay",
             key: EDIT_TEMPORAL_RECORDING,
             kind: EditKind::Bool,
             seed: Some(cfg.temporal_recording.unwrap_or(false).to_string()),
             placeholder: String::new(),
         },
         EditField {
-            label: "Window padding (px)",
+            label: "Sides and bottom (px)",
             key: EDIT_WINDOW_PADDING,
             kind: EditKind::Float,
             seed: cfg.window_padding.map(|v| format!("{v}")),
@@ -5425,7 +6083,7 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             },
         },
         EditField {
-            label: "Window top padding (px)",
+            label: "Top (px)",
             key: EDIT_WINDOW_PADDING_TOP,
             kind: EditKind::Float,
             seed: cfg.window_padding_top.map(|v| format!("{v}")),
@@ -6067,31 +6725,21 @@ mod trail_style_tests {
                 GlowStyle::style_names_dog_pet(canonical),
                 "alias {alias:?} and its canonical {canonical:?} draw different species"
             );
-            // …AND THE SAME BODY. `GlowConfig::ribbon_tall` is derived from the
-            // RESOLVED spelling (`app_config::resolve_cursor_glow` asks the
-            // predicate about `style_token`), so an alias's own geometry never
-            // reaches the engine — the canonical's does. A disagreeing pair is
-            // therefore not a display/engine split the user could spot: picker,
-            // validator, paint label AND engine all agree on the canonical, and
-            // the body the user asked for is silently swapped for another with
-            // nothing anywhere naming the substitution.
-            assert_eq!(
-                GlowStyle::style_names_tall_ribbon(alias),
-                GlowStyle::style_names_tall_ribbon(canonical),
-                "alias {alias:?} and its canonical {canonical:?} draw different ribbons"
-            );
-            // …AND THE SAME SPELLING on the underline axis, which is a separate
-            // constraint from the body above. `style_names_underline_ribbon`
-            // reports what the string SAYS, explicitly not "is this the
-            // alternate geometry?" (a bare `rainbow kitty` draws the tall
-            // default and answers `false`), and its one non-test caller is the
-            // Settings paint label. A disagreeing pair would label one spelling
-            // of a style with the shortened "Rainbow underline" and the other
-            // with its full name.
+            // …AND THE SAME BODY. The engine draws the tall body unless the
+            // spelling names the underline (`ribbon_tall` is
+            // `!style_names_underline_ribbon`), and the flat body only when it
+            // names it, so an alias whose canonical disagrees on either would
+            // silently swap the body the user asked for. (`… tall` spellings
+            // name the default's own body, so they share its canonical.)
             assert_eq!(
                 GlowStyle::style_names_underline_ribbon(alias),
                 GlowStyle::style_names_underline_ribbon(canonical),
-                "alias {alias:?} and its canonical {canonical:?} spell different ribbons"
+                "alias {alias:?} and its canonical {canonical:?} draw different ribbons"
+            );
+            assert_eq!(
+                GlowStyle::style_names_flat_ribbon(alias),
+                GlowStyle::style_names_flat_ribbon(canonical),
+                "alias {alias:?} and its canonical {canonical:?} draw different bodies"
             );
             assert_eq!(
                 super::cursor_trail_style_canonical(alias),
@@ -6161,8 +6809,11 @@ mod trail_style_tests {
                 CURSOR_TRAIL_STYLES.contains(&canonical),
                 "{tall:?} canonicalises outside the picker domain: {canonical:?}"
             );
+            // Tall is the default body: every spelling but the underline
+            // draws it (`ribbon_tall` is `!style_names_underline_ribbon`).
             assert!(
-                GlowStyle::style_names_tall_ribbon(canonical),
+                !GlowStyle::style_names_underline_ribbon(canonical)
+                    && !GlowStyle::style_names_flat_ribbon(canonical),
                 "{tall:?} canonicalises to {canonical:?}, which is NOT tall — the trail would \
                  come back as the flat strip and the look would be silently dropped"
             );
@@ -6173,14 +6824,10 @@ mod trail_style_tests {
             );
         }
         // The predicate records an explicit `tall` token, not resolved
-        // geometry: ordinary rainbow rows also draw tall without matching it.
+        // geometry: the tall spellings are aliases of the default, which
+        // draws tall without matching it, so no listed style says tall.
         for &s in CURSOR_TRAIL_STYLES {
-            let expected = matches!(s, "rainbow kitty tall");
-            assert_eq!(
-                GlowStyle::style_names_tall_ribbon(s),
-                expected,
-                "style {s:?}"
-            );
+            assert!(!GlowStyle::style_names_tall_ribbon(s), "style {s:?}");
             // The underline spelling is the other half of the same axis: exactly
             // one canonical option SAYS underline, and the paint label reads that
             // predicate off the displayed (canonical) value.
@@ -6325,12 +6972,11 @@ mod trail_style_tests {
 #[cfg(test)]
 mod edit_tests {
     use super::{
-        Config, EDIT_ALLOW_WINDOW_OPS, EDIT_BACKGROUND, EDIT_COLUMNS, EDIT_COPY_ON_SELECT,
-        EDIT_CURSOR_COLOR, EDIT_CURSOR_STYLE, EDIT_CURSOR_TRAIL, EDIT_CURSOR_TRAIL_STYLE,
-        EDIT_FONT_FAMILY, EDIT_FONT_PX, EDIT_FOREGROUND, EDIT_LIGATURES, EDIT_LINES, EDIT_MOTION,
-        EDIT_SCROLLBACK, EDIT_SEARCH_HISTORY_LINES, EDIT_SELECTION_COLOR, EDIT_THEME,
-        EDIT_WINDOW_THEME, EditKind, PrefsEditError, apply_prefs_edits, editable_fields,
-        keywords_of, range_of,
+        Config, EDIT_BACKGROUND, EDIT_COLUMNS, EDIT_COPY_ON_SELECT, EDIT_CURSOR_COLOR,
+        EDIT_CURSOR_STYLE, EDIT_CURSOR_TRAIL, EDIT_CURSOR_TRAIL_STYLE, EDIT_FONT_FAMILY,
+        EDIT_FONT_PX, EDIT_FOREGROUND, EDIT_LIGATURES, EDIT_LINES, EDIT_MOTION, EDIT_SCROLLBACK,
+        EDIT_SEARCH_HISTORY_LINES, EDIT_SELECTION_COLOR, EDIT_THEME, EditKind, PrefsEditError,
+        apply_prefs_edits, editable_fields, keywords_of, range_of,
     };
 
     /// `Some(v)` helper to keep the edit lists terse.
@@ -6339,7 +6985,7 @@ mod edit_tests {
     }
 
     #[test]
-    fn visual_preview_registry_is_complete_unique_and_counted() {
+    fn visual_preview_registry_is_complete_and_unique() {
         use std::collections::BTreeSet;
 
         let registry = super::VISUAL_PREVIEW_KEYS
@@ -6351,7 +6997,6 @@ mod edit_tests {
             super::VISUAL_PREVIEW_KEYS.len(),
             "duplicate preview key"
         );
-        assert_eq!(registry.len(), 57, "the explicit visual contract changed");
 
         let fields = super::editable_fields(&Config::default());
         let expected = fields
@@ -6362,11 +7007,11 @@ mod edit_tests {
                     super::Section::Appearance
                         | super::Section::Typography
                         | super::Section::Cursor
-                        // The Cursor Kitty pane is a VISUAL section like its
-                        // Cursor & Motion sibling — it shares that page's live
-                        // cursor scene — so its three keys owe the same
+                        // Cursor Styles is a VISUAL section like its Cursor &
+                        // Motion sibling — it shares that page's live cursor
+                        // scene — so its keys owe the same
                         // projection-or-documented-exemption proof.
-                        | super::Section::CursorKitty
+                        | super::Section::CursorStyles
                         | super::Section::Window
                 )
             })
@@ -6397,26 +7042,6 @@ mod edit_tests {
             assert!(
                 !registry.contains(key),
                 "{key} is both previewed and exempt"
-            );
-        }
-
-        for (section, count) in [
-            (super::Section::Appearance, 11),
-            (super::Section::Typography, 22),
-            // 21 → 18 + 3: the trail-style picker, the rainbow wake dial and the
-            // custom sprite moved to the cat's own pane. 58 → 57 and 3 → 2 when
-            // the wake dial was retired (2026-09-16).
-            (super::Section::Cursor, 18),
-            (super::Section::CursorKitty, 2),
-            (super::Section::Window, 4),
-        ] {
-            assert_eq!(
-                registry
-                    .iter()
-                    .filter(|key| super::section_of(key) == section)
-                    .count(),
-                count,
-                "{section:?} preview count",
             );
         }
 
@@ -6461,11 +7086,11 @@ mod edit_tests {
     }
 
     /// Blank = revert: removing the dotted child deletes only that key while
-    /// siblings remain — and an EMPTIED table is deliberately RETAINED (its
-    /// header may carry the user's comments, and an empty table parses to the
-    /// same defaults as an absent one — the nested writer's contract).
+    /// siblings remain. A table the removal leaves bare goes with it, and one
+    /// that keeps a comment stays: an empty table parses to the same defaults
+    /// as an absent one, so only the comment is worth keeping.
     #[test]
-    fn dotted_remove_reverts_and_retains_an_emptied_table() {
+    fn dotted_remove_reverts_and_prunes_only_a_bare_table() {
         let keep_sibling = "[matrix_rain]\nenabled = true\nfps = 24\n";
         let out = apply_prefs_edits(keep_sibling, &[(super::EDIT_MATRIX_RAIN_ENABLED, None)])
             .expect("dotted remove");
@@ -6481,6 +7106,13 @@ mod edit_tests {
         assert_eq!(
             out, "font_px = 13.0\n[matrix_rain]\n# mine\n",
             "an emptied table is retained, with the comment above its last key"
+        );
+        let bare = "font_px = 13.0\n\n[matrix_rain]\nenabled = true\n";
+        let out = apply_prefs_edits(bare, &[(super::EDIT_MATRIX_RAIN_ENABLED, None)])
+            .expect("dotted remove of the last uncommented child");
+        assert_eq!(
+            out, "font_px = 13.0\n",
+            "a bare table goes with its last key"
         );
         let cfg: crate::app_config::Config = aterm_toml::from_str(&out).expect("round-trip");
         assert!(
@@ -6579,8 +7211,8 @@ mod edit_tests {
     fn matrix_rain_row_surfaces_in_the_settings_model() {
         let key = super::EDIT_MATRIX_RAIN_ENABLED;
         assert_eq!(super::section_of(key), super::Section::Appearance);
-        assert_eq!(super::group_of(key), ("Matrix rain", 5));
-        assert!(super::group_footnote("Matrix rain").is_some());
+        assert_eq!(super::group_of(key), ("Effects", 5));
+        assert!(super::footnote_of(key).is_some());
         assert!(!keywords_of(key).is_empty());
         assert!(
             super::nested_leaf(key).is_some(),
@@ -6609,7 +7241,7 @@ mod edit_tests {
     /// comparison; these six assertions cannot.
     ///
     /// The routing claims are the interesting half: an `[output_streak]` LEAF
-    /// still lands in the Cursor pane's Sound box, because [`section_of`] and
+    /// still lands on the Sound page, because [`section_of`] and
     /// [`group_of`] consult the Sound menu ahead of their nested-table prefix
     /// rules — the bonk keys' law, applied to a second table.
     #[test]
@@ -6620,9 +7252,9 @@ mod edit_tests {
             super::SOUND_MENU_KEYS.contains(&key),
             "the pip is audible and must be on the Sound menu"
         );
-        assert_eq!(super::section_of(key), super::Section::Cursor);
-        assert_eq!(super::group_of(key), ("Sound", 2));
-        assert!(super::group_footnote("Sound").is_some());
+        assert_eq!(super::section_of(key), super::Section::Sound);
+        assert_eq!(super::group_of(key), ("Sound effects", 0));
+        assert!(super::footnote_of(key).is_some());
         assert!(!keywords_of(key).is_empty(), "searchable by intent");
         assert!(
             super::nested_leaf(key).is_some(),
@@ -6652,7 +7284,7 @@ mod edit_tests {
             .into_iter()
             .find(|f| f.key == key)
             .expect("the row exists on an unconfigured install");
-        assert_eq!(row.label, "Output streak pip");
+        assert_eq!(row.label, "Note when a program starts printing");
         assert_eq!(row.kind, EditKind::Bool);
         assert_eq!(
             row.seed.as_deref(),
@@ -6681,17 +7313,54 @@ mod edit_tests {
         assert!(!reparsed.output_streak_sound_or_default());
     }
 
+    /// PRISM WAKE'S SWITCH IS A ROW: Appearance's Effects box, seeded where the
+    /// engine starts (the platform-split default, or the file's `false`), and
+    /// written as the `[output_streak]` leaf the resolver reads, so turning
+    /// the comet off is a switch, not a hand edit.
+    #[test]
+    fn the_output_streak_switch_is_a_row_seeded_where_the_engine_starts() {
+        let key = super::EDIT_OUTPUT_STREAK_ENABLED;
+        let row = editable_fields(&Config::default())
+            .into_iter()
+            .find(|f| f.key == key)
+            .expect("the row exists on an unconfigured install");
+        assert_eq!(row.label, "Output streak");
+        assert_eq!(row.kind, EditKind::Bool);
+        assert_eq!(super::section_of(key), super::Section::Appearance);
+        assert_eq!(super::group_of(key), ("Effects", 5));
+        assert_eq!(
+            row.seed.as_deref(),
+            Some(if crate::app_config::DEFAULT_DECORATIVE_EFFECTS {
+                "true"
+            } else {
+                "false"
+            }),
+            "the resolved platform default"
+        );
+        let off: Config = aterm_toml::from_str("[output_streak]\nenabled = false").unwrap();
+        let row_off = editable_fields(&off)
+            .into_iter()
+            .find(|f| f.key == key)
+            .unwrap();
+        assert_eq!(row_off.seed.as_deref(), Some("false"), "resolved OFF");
+        let written = apply_prefs_edits("", &[(key, set("false"))])
+            .expect("the nested writer creates [output_streak]");
+        assert!(written.contains("[output_streak]"), "{written}");
+        let reparsed: Config = aterm_toml::from_str(&written).expect("re-parses as Config");
+        assert!(!reparsed.output_streak_enabled_or_default());
+    }
+
     /// The split's focus mark is a SETTING, not a compile-time constant: a real
-    /// Appearance row, Bool-typed, searchable, seeded from the resolved default
+    /// Window row, Bool-typed, searchable, seeded from the resolved default
     /// (ON) and from an explicit `false`, and — because the workbench scene is a
     /// single mock terminal with no divider gap for the mark to live in —
     /// carrying a documented preview exemption rather than a dead control.
     #[test]
-    fn the_split_focus_mark_row_is_a_real_appearance_setting_defaulting_on() {
+    fn the_split_focus_mark_row_is_a_real_window_setting_defaulting_on() {
         let key = super::EDIT_SPLIT_FOCUS_MARK;
         assert_eq!(super::edit_kind(key), EditKind::Bool);
-        assert_eq!(super::section_of(key), super::Section::Appearance);
-        assert_eq!(super::group_of(key), ("Text & Contrast", 2));
+        assert_eq!(super::section_of(key), super::Section::Window);
+        assert_eq!(super::group_of(key), ("Tabs & panes", 3));
         assert!(keywords_of(key).contains(&"split"));
         assert!(
             !super::VISUAL_PREVIEW_KEYS.contains(&key)
@@ -6715,392 +7384,443 @@ mod edit_tests {
         assert_eq!(row_off.seed.as_deref(), Some("false"), "resolved OFF");
     }
 
-    /// THE OFF SWITCH (design `docs/DESIGN-aterm-wrapper-2026-09-17.md`
-    /// §4.6.2): the aterm wrapper's master switch is an ordinary Bool row, so
-    /// it is reachable from Search, from the Modified review and from
-    /// `settings set harness.enabled false`. It lives in `aterm.toml`
-    /// precisely so a kill switch never depends on the thing it kills — this
-    /// test is what pins the key's HOME.
+    /// THE `[harness]` ROWS (design `docs/DESIGN-aterm-wrapper-2026-09-17.md`
+    /// §4.6.2; owner, 2026-09-24 and 2026-09-25; the Autopilot design,
+    /// 2026-10-15): the master switch, the default Autopilot, the approval
+    /// level, the question answer and its priority are ordinary rows of the
+    /// Harness section, reachable from Search, the Modified review and
+    /// `settings set`, that no environment variable bypasses (2026-09-23), each
+    /// applied live (the host follows the reload). SET writes `[harness]`
+    /// without touching the rest of the file, the SUPERVISOR's policy reads it
+    /// (and only it: a limit is not the kill switch, HOW is never WHETHER), the
+    /// row reads it back (a priority's case normalised), and UNSET is full power
+    /// again. The kill switch lives in `aterm.toml` so it never depends on the
+    /// thing it kills. NEGATIVE CONTROLS (owner ruling of 2026-09-25: only an
+    /// explicit setting takes power away): an off spelling seeds the key's
+    /// limit, and a value that is neither the key's own nor an off is no
+    /// setting — the policy unchanged, the row seeding the default.
     #[test]
-    fn the_harness_master_switch_round_trips_through_set_and_unset() {
-        let key = super::EDIT_HARNESS_ENABLED;
-        assert_eq!(super::edit_kind(key), EditKind::Bool);
-        assert_eq!(super::section_of(key), super::Section::Harness);
-        assert_eq!(super::group_of(key), ("Harness", 0));
-        for word in ["harness", "claude", "off"] {
-            assert!(keywords_of(key).contains(&word), "{word}");
-        }
-        assert_eq!(
-            super::environment_precedence(key),
-            None,
-            "no environment variable bypasses the harness (2026-09-23): the row is the switch"
-        );
-
-        // The row seeds its RESOLVED state, and an absent key is ON: a fresh
-        // machine has no aterm.toml and must not read as switched off.
-        let row = editable_fields(&Config::default())
-            .into_iter()
-            .find(|f| f.key == key)
-            .expect("the row exists on an unconfigured install");
-        assert_eq!(row.label, "Harness");
-        assert_eq!(row.seed.as_deref(), Some("true"), "absent means ON");
-
-        // SET: the writer creates `[harness]` non-destructively, leaves the
-        // rest of the file alone, and what it writes re-parses as `Config`.
-        let written = apply_prefs_edits("font_px = 14\n", &[(key, set("false"))])
-            .expect("the nested writer creates [harness]");
-        assert!(written.contains("[harness]"), "{written}");
-        assert!(
-            written.contains("font_px = 14"),
-            "an untouched key survives: {written}"
-        );
-        let off = Config::parse(&written).expect("re-parses as Config");
-        assert!(!off.harness_enabled());
-        // …and the row REALLY switches supervision: the same file's policy is
-        // off, and it says so as live (the host follows the reload), not as
-        // "Applies to new sessions" (2026-09-23).
-        assert!(!off.harness.policy.enabled);
-        assert!(Config::default().harness.policy.enabled, "absent is ON");
-        assert_eq!(super::application_timing(key), Some(super::HARNESS_TIMING));
-        assert!(super::application_has_live_effect(key));
-        assert_eq!(
-            editable_fields(&off)
-                .into_iter()
-                .find(|f| f.key == key)
-                .and_then(|f| f.seed),
-            Some("false".to_string()),
-            "the row reads back exactly what was written"
-        );
-
-        // UNSET: clearing the key returns the resolved default, ON. The switch
-        // has two positions and no third "unknown" one.
-        let cleared = apply_prefs_edits(&written, &[(key, None)]).expect("unset");
-        let back = Config::parse(&cleared).expect("re-parses as Config");
-        assert!(back.harness_enabled(), "{cleared}");
-        assert!(!cleared.contains("enabled = false"), "{cleared}");
-
-        // An explicit `true` is indistinguishable from absent, by design.
-        let on = apply_prefs_edits("", &[(key, set("true"))]).expect("set true");
-        let on_cfg = Config::parse(&on).expect("re-parses as Config");
-        assert!(on_cfg.harness_enabled());
-
-        // THE HOME, asserted rather than described: no OTHER registered leaf
-        // claims the same dotted path.
-        assert_eq!(
-            super::NESTED_LEAVES.iter().filter(|l| l.key == key).count(),
-            1,
-            "one registration, one home"
-        );
-        // The SHAPE the writer produces, MEASURED by this test on 2026-09-21:
-        // a `[harness]` header and `enabled = false` under it — what every
-        // reader of the table (`SupervisorConfig::from_aterm_toml`, the one)
-        // reads as the switch off.
-        assert!(
-            written.ends_with("[harness]\nenabled = false\n"),
-            "{written}"
-        );
-    }
-
-    /// THE APPROVAL LEVEL (owner, 2026-09-24: *"all such dialogs must be
-    /// approved by default unless there is a setting added later by the user
-    /// explicitly to NOT do this"*): `harness.approve` is an ordinary Enum row
-    /// beside the master switch in the Harness section — found by Search, the
-    /// Modified review, `settings set harness.approve safe` — seeded from the
-    /// SUPERVISOR's resolved level, and applied live like `enabled` (the host
-    /// restarts every supervised session's worker on the reload). This row is
-    /// "the setting added later": writing `safe` is decision 1's proven rules,
-    /// `none` hands every box to the owner, clearing it is full power again.
-    /// NEGATIVE CONTROLS: an off spelling (`"no"`) seeds `none`, and a value
-    /// that is no level (`"most"`) seeds `all` — no setting, so the default
-    /// (owner ruling of 2026-09-25: only an explicit setting takes power away).
-    #[test]
-    fn the_approve_row_round_trips_through_set_and_unset() {
+    fn the_harness_rows_round_trip_through_set_and_unset() {
         use aterm_agent::supervise::config::Approve;
-        let key = super::EDIT_HARNESS_APPROVE;
-        assert_eq!(key, "harness.approve", "the FILE spelling is the key");
-        assert_eq!(
-            super::edit_kind(key),
-            EditKind::Enum {
-                options: &["all", "safe", "none"]
-            }
-        );
-        assert_eq!(super::section_of(key), super::Section::Harness);
-        assert_eq!(super::group_of(key), ("Harness", 0));
-        for word in ["harness", "claude", "approve", "permission", "proceed"] {
-            assert!(keywords_of(key).contains(&word), "{word}");
-        }
-        assert_eq!(super::environment_precedence(key), None, "no env override");
-        assert_eq!(
-            super::NESTED_LEAVES.iter().filter(|l| l.key == key).count(),
-            1,
-            "one registration, one home"
-        );
-
-        // Absent is `all`: the default answers every box.
-        let row = editable_fields(&Config::default())
-            .into_iter()
-            .find(|f| f.key == key)
-            .expect("the row exists on an unconfigured install");
-        assert_eq!(row.label, "Approve permission boxes");
-        assert_eq!(row.seed, None, "absent is no override");
-        assert_eq!(row.placeholder, "all", "absent means all");
-
-        // SET safe: the writer adds the key to `[harness]` without touching
-        // the master switch, and the policy is decision 1's rules — still
-        // answering what they prove, not off.
-        let written = apply_prefs_edits("[harness]\nenabled = true\n", &[(key, set("safe"))])
-            .expect("the nested writer edits [harness]");
-        assert!(
-            written.contains("enabled = true") && written.contains("approve = \"safe\""),
-            "{written}"
-        );
-        let safe = Config::parse(&written).expect("re-parses as Config");
-        let policy = &safe.harness.policy;
-        assert!(
-            safe.harness_notices().is_empty(),
-            "{:?}",
-            safe.harness_notices()
-        );
-        assert!(policy.enabled, "the limit is not the kill switch");
-        assert_eq!(policy.approve, Approve::Safe);
-        assert_eq!(safe.harness_approve(), "safe");
-        assert_eq!(
-            super::application_timing(key),
-            Some(super::HARNESS_APPROVE_TIMING)
-        );
-        assert!(super::application_has_live_effect(key));
-        assert_eq!(
-            editable_fields(&safe)
+        use aterm_agent::supervise::{Autopilot, QuestionPriority, SupervisorConfig};
+        let seed = |cfg: &Config, key: &str| {
+            editable_fields(cfg)
                 .into_iter()
                 .find(|f| f.key == key)
-                .and_then(|f| f.seed),
-            Some("safe".to_string()),
-            "the row reads back exactly what was written"
-        );
-
-        // UNSET: full power again.
-        let cleared = apply_prefs_edits(&written, &[(key, None)]).expect("unset");
-        let back = Config::parse(&cleared).expect("re-parses as Config");
-        assert_eq!(back.harness_approve(), "all", "{cleared}");
-        assert!(!cleared.contains("approve"), "{cleared}");
-        assert!(
-            back.harness_enabled(),
-            "the master switch survived: {cleared}"
-        );
-
-        // NEGATIVE CONTROLS: an off spelling is `none`; a value that is no
-        // level keeps `all`, and the row says what the supervisor reads.
-        let seed = |text: &str| {
-            let c = Config::parse(text).unwrap();
-            let seeded = editable_fields(&c)
-                .into_iter()
-                .find(|f| f.key == key)
-                .and_then(|f| f.seed);
-            (c.harness_approve(), seeded)
+                .expect("the row exists")
+                .seed
         };
-        assert_eq!(
-            seed("[harness]\napprove = \"no\"\n"),
-            ("none", Some("none".to_string()))
+        let full = SupervisorConfig::default();
+        // (key, its seed while absent, the value typed, the seed read back,
+        // its timing, what the policy took)
+        type Row = (
+            &'static str,
+            Option<&'static str>,
+            &'static str,
+            &'static str,
+            &'static str,
+            fn(&SupervisorConfig) -> bool,
         );
-        assert_eq!(
-            seed("[harness]\napprove = \"most\"\n"),
-            ("all", None),
-            "an unreadable approve is the default, shown as the blank default row"
-        );
-    }
+        let rows: [Row; 5] = [
+            (
+                super::EDIT_HARNESS_ENABLED,
+                Some("true"),
+                "false",
+                "false",
+                super::HARNESS_TIMING,
+                |p| !p.enabled,
+            ),
+            (
+                super::EDIT_HARNESS_AUTOPILOT,
+                None,
+                "Land",
+                "land",
+                super::HARNESS_AUTOPILOT_TIMING,
+                |p| p.autopilot == Autopilot::Land && p.enabled,
+            ),
+            (
+                super::EDIT_HARNESS_APPROVE,
+                None,
+                "safe",
+                "safe",
+                super::HARNESS_APPROVE_TIMING,
+                |p| p.approve == Approve::Safe && p.enabled,
+            ),
+            (
+                super::EDIT_HARNESS_ANSWER_QUESTIONS,
+                Some("true"),
+                "false",
+                "false",
+                super::HARNESS_APPROVE_TIMING,
+                |p| !p.answer_questions && p.approve == Approve::All,
+            ),
+            (
+                super::EDIT_HARNESS_QUESTION_PRIORITY,
+                None,
+                "Short-Term",
+                "short-term",
+                super::HARNESS_APPROVE_TIMING,
+                |p| p.question_priority == QuestionPriority::ShortTerm && p.answer_questions,
+            ),
+        ];
+        for (key, absent, typed, stored, timing, took) in rows {
+            assert_eq!(super::section_of(key), super::Section::Harness, "{key}");
+            assert_eq!(super::environment_precedence(key), None, "{key}");
+            assert_eq!(super::application_timing(key), Some(timing), "{key}");
+            assert!(super::application_has_live_effect(key), "{key}");
+            // Applied when saved: the row paints no "Now", and the card's
+            // notes say what its choices mean.
+            assert_eq!(super::application_timing_badge(key), None, "{key}");
+            assert!(super::footnote_of(key).is_some(), "{key}");
+            assert_eq!(seed(&Config::default(), key).as_deref(), absent, "{key}");
 
-    /// THE QUESTION-ANSWER ROW (owner directive of 2026-09-25): the
-    /// `[harness] answer_questions` Bool is a Settings row in the Harness
-    /// section beside the approval level, ON by default, seeded from the
-    /// SUPERVISOR's resolved bit, live like it (the host restarts the
-    /// workers on the reload), and found by "question", "answer" and the
-    /// tool's name. Writing it `false` hands every question over and leaves
-    /// the approval level as it was; clearing it answers again. NEGATIVE
-    /// CONTROLS: an explicit off spelled `0` seeds OFF, and a value that is no
-    /// on or off (`"sometimes"`) seeds ON — no setting, as the reader takes it
-    /// (owner ruling of 2026-09-25).
-    #[test]
-    fn the_answer_questions_row_round_trips_through_set_and_unset() {
-        let key = super::EDIT_HARNESS_ANSWER_QUESTIONS;
-        assert_eq!(
-            key, "harness.answer_questions",
-            "the FILE spelling is the key"
-        );
-        assert_eq!(super::edit_kind(key), EditKind::Bool);
-        assert_eq!(super::section_of(key), super::Section::Harness);
-        assert_eq!(super::group_of(key).0, "Harness");
-        for word in ["harness", "claude", "question", "answer", "askuserquestion"] {
-            assert!(keywords_of(key).contains(&word), "{word}");
-        }
-        assert_eq!(super::environment_precedence(key), None, "no env override");
-        assert_eq!(
-            super::NESTED_LEAVES.iter().filter(|l| l.key == key).count(),
-            1,
-            "one registration, one home"
-        );
-        let row = editable_fields(&Config::default())
-            .into_iter()
-            .find(|f| f.key == key)
-            .expect("the row exists on an unconfigured install");
-        // WHETHER only: HOW is the priority row's, so the switch names no
-        // way of answering (under `long-term` no option is pressed at all).
-        assert_eq!(row.label, "Answer questions");
-        assert!(
-            !row.label.to_lowercase().contains("recommended"),
-            "{}",
-            row.label
-        );
-        assert_eq!(row.seed.as_deref(), Some("true"), "absent means ON");
-        assert_eq!(
-            super::application_timing(key),
-            Some(super::HARNESS_APPROVE_TIMING)
-        );
-        assert!(super::application_has_live_effect(key));
-
-        let written = apply_prefs_edits("[harness]\nenabled = true\n", &[(key, set("false"))])
-            .expect("the nested writer edits [harness]");
-        assert!(written.contains("answer_questions = false"), "{written}");
-        let off = Config::parse(&written).expect("re-parses as Config");
-        assert!(
-            off.harness_notices().is_empty(),
-            "{:?}",
-            off.harness_notices()
-        );
-        assert!(!off.harness.policy.answer_questions);
-        assert_eq!(
-            off.harness_approve(),
-            "all",
-            "the approval level is its own row"
-        );
-
-        let cleared = apply_prefs_edits(&written, &[(key, None)]).expect("unset");
-        let back = Config::parse(&cleared).expect("re-parses as Config");
-        assert!(back.harness.policy.answer_questions, "{cleared}");
-
-        let refused = Config::parse("[harness]\nanswer_questions = 0\n").expect("parses");
-        assert!(!refused.harness.policy.answer_questions);
-        assert_eq!(
-            editable_fields(&refused)
-                .into_iter()
-                .find(|f| f.key == key)
-                .and_then(|f| f.seed),
-            Some("false".to_string()),
-            "an explicit 0 is an off"
-        );
-        let unread =
-            Config::parse("[harness]\nanswer_questions = \"sometimes\"\n").expect("parses");
-        assert!(unread.harness.policy.answer_questions, "no setting: ON");
-    }
-
-    /// THE QUESTION-PRIORITY ROW (2026-09-25): `[harness] question_priority`
-    /// is an Enum Settings row in the Harness section beside the question
-    /// answer — its options the supervisor's own words, in their order —
-    /// `recommended` by default (the placeholder; nothing seeded while the
-    /// key is absent), live like it, and found by "priority", "long-term" and
-    /// "question". Writing a word stores it (case normalised) and the policy
-    /// reads it, the question answer left on; a word outside the three is
-    /// refused at Save; clearing it answers with the recommended option again.
-    /// NEGATIVE CONTROL: a refused value in the file seeds nothing, and the
-    /// answer switch reads OFF.
-    #[test]
-    fn the_question_priority_row_round_trips_through_set_and_unset() {
-        use aterm_agent::supervise::QuestionPriority;
-        let key = super::EDIT_HARNESS_QUESTION_PRIORITY;
-        assert_eq!(
-            key, "harness.question_priority",
-            "the FILE spelling is the key"
-        );
-        assert_eq!(
-            super::edit_kind(key),
-            EditKind::Enum {
-                options: &["recommended", "long-term", "short-term"]
-            }
-        );
-        assert_eq!(super::section_of(key), super::Section::Harness);
-        assert_eq!(super::group_of(key).0, "Harness");
-        for word in [
-            "question",
-            "priority",
-            "question priority",
-            "long-term",
-            "short-term",
-        ] {
-            assert!(keywords_of(key).contains(&word), "{word}");
-        }
-        assert_eq!(super::environment_precedence(key), None, "no env override");
-        assert_eq!(
-            super::NESTED_LEAVES.iter().filter(|l| l.key == key).count(),
-            1,
-            "one registration, one home"
-        );
-        let row = editable_fields(&Config::default())
-            .into_iter()
-            .find(|f| f.key == key)
-            .expect("the row exists on an unconfigured install");
-        assert_eq!(row.label, "Question priority");
-        assert_eq!(
-            row.seed, None,
-            "absent: the default, shown as the placeholder"
-        );
-        assert_eq!(row.placeholder, "recommended (default)");
-        assert_eq!(
-            super::application_timing(key),
-            Some(super::HARNESS_APPROVE_TIMING)
-        );
-        assert!(super::application_has_live_effect(key));
-
-        for (typed, want) in [
-            ("long-term", QuestionPriority::LongTerm),
-            ("Short-Term", QuestionPriority::ShortTerm),
-        ] {
-            let written = apply_prefs_edits("[harness]\nenabled = true\n", &[(key, set(typed))])
-                .expect("the nested writer edits [harness]");
+            let written = apply_prefs_edits("font_px = 14\n", &[(key, set(typed))]).expect("set");
             assert!(
-                written.contains(&format!("question_priority = \"{}\"", want.word())),
+                written.contains("font_px = 14") && written.contains("[harness]"),
                 "{written}"
             );
-            let on = Config::parse(&written).expect("re-parses as Config");
-            assert!(
-                on.harness_notices().is_empty(),
-                "{:?}",
-                on.harness_notices()
-            );
-            let policy = &on.harness.policy;
-            assert_eq!(policy.question_priority, want);
-            assert!(policy.answer_questions, "HOW, never WHETHER");
-            assert_eq!(
-                editable_fields(&on)
-                    .into_iter()
-                    .find(|f| f.key == key)
-                    .and_then(|f| f.seed),
-                Some(want.word().to_string())
-            );
+            let cfg = Config::parse(&written).expect("re-parses as Config");
+            assert!(cfg.harness_notices().is_empty(), "{written}");
+            assert!(took(&cfg.harness.policy), "{written}");
+            assert_eq!(seed(&cfg, key).as_deref(), Some(stored), "{written}");
+
             let cleared = apply_prefs_edits(&written, &[(key, None)]).expect("unset");
             let back = Config::parse(&cleared).expect("re-parses as Config");
-            assert_eq!(
-                back.harness.policy.question_priority,
-                QuestionPriority::Recommended,
-                "{cleared}"
+            assert_eq!(back.harness.policy, full, "{cleared}");
+        }
+        for (key, word) in [
+            (super::EDIT_HARNESS_QUESTION_PRIORITY, "long_term"),
+            (super::EDIT_HARNESS_AUTOPILOT, "hover"),
+        ] {
+            assert!(
+                apply_prefs_edits("", &[(key, set(word))]).is_err(),
+                "{key}: a word outside the three is refused at Save"
             );
         }
-        assert!(
-            apply_prefs_edits("", &[(key, set("long_term"))]).is_err(),
-            "a word outside the three is refused at Save"
-        );
 
-        let refused = Config::parse("[harness]\nquestion_priority = \"sometimes\"\n").unwrap();
-        assert!(
-            refused.harness.policy.answer_questions,
-            "a refused word changes nothing"
+        // NEGATIVE CONTROLS: (the line, its row, the seed, whether it limits).
+        let (autopilot, approve, answer, priority) = (
+            super::EDIT_HARNESS_AUTOPILOT,
+            super::EDIT_HARNESS_APPROVE,
+            super::EDIT_HARNESS_ANSWER_QUESTIONS,
+            super::EDIT_HARNESS_QUESTION_PRIORITY,
         );
-        assert_eq!(
-            editable_fields(&refused)
+        for (line, key, seeded, limits) in [
+            ("autopilot = \"no\"", autopilot, Some("off"), true),
+            ("autopilot = \"sometimes\"", autopilot, None, false),
+            ("approve = \"no\"", approve, Some("none"), true),
+            ("approve = \"most\"", approve, None, false),
+            ("answer_questions = 0", answer, Some("false"), true),
+            (
+                "answer_questions = \"sometimes\"",
+                answer,
+                Some("true"),
+                false,
+            ),
+            ("question_priority = \"sometimes\"", priority, None, false),
+        ] {
+            let cfg = Config::parse(&format!("[harness]\n{line}\n")).expect("parses");
+            assert_eq!(seed(&cfg, key).as_deref(), seeded, "{line}");
+            assert_eq!(cfg.harness.policy != full, limits, "{line}");
+        }
+    }
+
+    /// EACH AI CLI'S OWN SWITCH (docs/DESIGN-ai-connections-2026-10-16.md
+    /// §10): every connection (`aterm_agent::ai::connector::ids`) has its
+    /// `ai.<id>.use` row, labelled "Use <product> on this machine" — USE, never
+    /// the harness's "Supervise" — read back to it by [`super::ai_use_switch`],
+    /// in the Harness section (its AI CLIs sub-page draws it) and live. SET
+    /// `false` writes that CLI's `[ai.<id>]` table, which the AI layer's reader
+    /// takes as that CLI unwanted and only that one; the row reads it back;
+    /// UNSET leaves no table and the row on again. The preferred CLI and the
+    /// look's switch round-trip the same way, and every row seeds from the
+    /// RESOLVED value, a fleet document beside `aterm.toml` included, this
+    /// machine's own key over it. NEGATIVE CONTROLS: every other CLI's row
+    /// stays on, and no other key reads as an AI CLI's switch.
+    #[test]
+    fn each_ai_use_switch_round_trips_through_set_and_unset() {
+        use crate::app_config::AiPolicy;
+        let field = |cfg: &Config, key: &str| {
+            editable_fields(cfg)
                 .into_iter()
                 .find(|f| f.key == key)
-                .and_then(|f| f.seed),
-            None,
-            "a refused priority seeds nothing"
+                .unwrap_or_else(|| panic!("{key}: no row"))
+        };
+        let seed = |cfg: &Config, key: &str| field(cfg, key).seed;
+        let ids = aterm_agent::ai::connector::ids();
+        let key_of = |id: &str| format!("ai.{id}.use");
+        for id in ids.iter().copied() {
+            let key = key_of(id);
+            let key = key.as_str();
+            let cli = aterm_agent::ai::connector::connector(id).expect("a connection");
+            let row = super::NESTED_LEAVES
+                .iter()
+                .find(|leaf| leaf.key == key)
+                .unwrap_or_else(|| panic!("{key}: no Settings row for {id}"));
+            assert_eq!(
+                row.label,
+                format!("Use {} on this machine", cli.product),
+                "{key}"
+            );
+            assert_eq!(super::ai_use_switch(key).map(|c| c.id), Some(id), "{key}");
+            assert_eq!(super::section_of(key), super::Section::Harness, "{key}");
+            assert_eq!(super::group_of(key), ("AI CLIs", 1), "{key}");
+            assert_eq!(super::application_timing(key), None, "{key}: live");
+            assert!(super::application_has_live_effect(key), "{key}");
+            assert_eq!(super::footnote_of(key), Some(super::AI_USE_NOTE), "{key}");
+            assert!(!keywords_of(key).is_empty(), "{key}");
+            assert_eq!(super::edit_kind(key), EditKind::Bool, "{key}");
+            assert_eq!(seed(&Config::default(), key).as_deref(), Some("true"));
+
+            let written = apply_prefs_edits("font_px = 14\n", &[(key, set("false"))]).expect("set");
+            assert!(
+                written.contains("font_px = 14")
+                    && written.contains(&format!("[ai.{id}]\nuse = false")),
+                "{written}"
+            );
+            let cfg = Config::parse(&written).expect("re-parses as Config");
+            assert!(cfg.ai.notes.is_empty(), "{:?}", cfg.ai.notes);
+            assert!(!cfg.ai.settings().wants(id), "{written}");
+            assert_eq!(seed(&cfg, key).as_deref(), Some("false"), "{written}");
+            for other in ids.iter().copied().filter(|other| *other != id) {
+                assert!(cfg.ai.settings().wants(other), "{other}: {written}");
+                assert_eq!(
+                    seed(&cfg, &key_of(other)).as_deref(),
+                    Some("true"),
+                    "{other}"
+                );
+            }
+
+            let cleared = apply_prefs_edits(&written, &[(key, None)]).expect("unset");
+            assert!(!cleared.contains("[ai"), "no empty table left: {cleared}");
+            let back = Config::parse(&cleared).expect("re-parses as Config");
+            assert!(back.ai.settings().wants(id), "{cleared}");
+            assert_eq!(seed(&back, key).as_deref(), Some("true"), "{cleared}");
+        }
+        for key in [
+            "ai.nonesuch.use",
+            "ai.codex.enabled",
+            "ai.use",
+            "harness.codex.enabled",
+            super::EDIT_AI_ENABLED,
+            super::EDIT_AI_PREFERRED,
+        ] {
+            assert!(super::ai_use_switch(key).is_none(), "{key}");
+        }
+
+        // The preferred CLI: an Enum of every connection, the built-in
+        // default its placeholder and no seed until something chooses.
+        let preferred = super::EDIT_AI_PREFERRED;
+        assert_eq!(
+            super::edit_kind(preferred),
+            EditKind::Enum {
+                options: &aterm_agent::ai::connector::IDS
+            }
         );
+        let default = aterm_agent::ai::config::default_preferred().id;
+        let bare = field(&Config::default(), preferred);
+        assert_eq!(bare.seed, None);
+        assert_eq!(bare.placeholder, format!("{default} (default)"));
+        let written = apply_prefs_edits("", &[(preferred, set("codex"))]).expect("set");
+        let cfg = Config::parse(&written).expect("re-parses as Config");
+        assert_eq!(
+            cfg.ai.settings().preferred.1,
+            aterm_agent::ai::config::From::Local
+        );
+        assert_eq!(seed(&cfg, preferred).as_deref(), Some("codex"));
+        // The look's switch.
+        let written =
+            apply_prefs_edits("", &[(super::EDIT_AI_ENABLED, set("false"))]).expect("set");
+        let cfg = Config::parse(&written).expect("re-parses as Config");
+        assert!(!cfg.ai.enabled());
+        assert_eq!(seed(&cfg, super::EDIT_AI_ENABLED).as_deref(), Some("false"));
+        assert_eq!(
+            seed(&Config::default(), super::EDIT_AI_ENABLED).as_deref(),
+            Some("true")
+        );
+
+        // Seeds from the RESOLVED value: a fleet document beside aterm.toml
+        // chooses the preferred CLI and turns Muse Code off; this machine's
+        // own key outranks it, and Reset (the key removed) follows the fleet
+        // again.
+        let scratch = aterm_tempfile::tempdir().expect("scratch folder");
+        let dir = scratch.path();
+        std::fs::write(
+            dir.join(aterm_agent::ai::config::FLEET_FILE),
+            "schema = 1\npreferred = \"codex\"\n[muse]\nuse = false\n",
+        )
+        .expect("the fleet document");
+        let over = |text: &str| {
+            let mut cfg = Config::parse(text).expect("parses");
+            cfg.ai = AiPolicy::read_beside(text, Some(dir));
+            cfg
+        };
+        let fleet = over("");
+        assert_eq!(
+            fleet.ai.settings().preferred.1,
+            aterm_agent::ai::config::From::Fleet
+        );
+        assert_eq!(seed(&fleet, preferred).as_deref(), Some("codex"));
+        assert_eq!(seed(&fleet, &key_of("muse")).as_deref(), Some("false"));
+        assert_eq!(
+            fleet.path_feed_paths(),
+            vec![dir.join(aterm_agent::ai::config::FLEET_FILE)]
+        );
+        let local = over("[ai]\npreferred = \"claude\"\n[ai.muse]\nuse = true\n");
+        assert_eq!(seed(&local, preferred).as_deref(), Some("claude"));
+        assert_eq!(seed(&local, &key_of("muse")).as_deref(), Some("true"));
+        let reset = apply_prefs_edits("[ai]\npreferred = \"claude\"\n", &[(preferred, None)])
+            .expect("unset");
+        assert_eq!(
+            seed(&over(&reset), preferred).as_deref(),
+            Some("codex"),
+            "{reset}"
+        );
+        #[cfg(unix)]
+        {
+            let path = dir.join(aterm_agent::ai::config::FLEET_FILE);
+            std::fs::remove_file(&path).expect("remove own fleet fixture");
+            std::os::unix::fs::symlink(dir.join("missing-fleet"), &path)
+                .expect("dangling fleet entry");
+            let unknown = over("[ai]\nreviewers = [\"codex\"]\n");
+            assert!(matches!(
+                unknown.ai.settings().fleet,
+                aterm_agent::ai::config::FleetState::Refused { .. }
+            ));
+            assert!(unknown.ai.settings().reviewers.0.is_empty());
+            assert!(unknown.path_feed_paths().contains(&path));
+        }
+    }
+
+    /// EACH AGENT'S OWN SWITCH (`docs/DESIGN-harness-plugins-2026-10-15.md`
+    /// §3, §4): every supervisable agent ([`Program::ALL`]) has its
+    /// `harness.<agent>.enabled` row in the Harness section, labelled with its
+    /// product name and read back to it by [`super::agent_switch`]. SET `false`
+    /// writes that agent's `[harness.<agent>]` table, and the supervisor's
+    /// reader takes it as that agent switched off and only that agent; the row
+    /// reads it back; UNSET is full power again, the row back on. NEGATIVE
+    /// CONTROLS: every other agent's row stays on throughout, the master
+    /// switch off leaves every agent row on — each row is its agent's table,
+    /// not `on_for`, which the master switch row already says — and no other
+    /// key reads as an agent's switch.
+    #[test]
+    fn each_agent_switch_round_trips_through_set_and_unset() {
+        use aterm_agent::supervise::SupervisorConfig;
+        use aterm_phase::Program;
+        let seed = |cfg: &Config, key: &str| {
+            editable_fields(cfg)
+                .into_iter()
+                .find(|f| f.key == key)
+                .expect("the row exists")
+                .seed
+        };
+        let full = SupervisorConfig::default();
+        let agents: Vec<Program> = Program::ALL
+            .into_iter()
+            .filter(|p| p.supervisable())
+            .collect();
+        let key_of = |agent: Program| format!("harness.{}.enabled", agent.name());
+        for agent in agents.iter().copied() {
+            let key = key_of(agent);
+            let key = key.as_str();
+            let row = super::NESTED_LEAVES
+                .iter()
+                .find(|leaf| leaf.key == key)
+                .unwrap_or_else(|| panic!("{key}: no Settings row for {agent:?}"));
+            assert_eq!(
+                row.label,
+                format!("Supervise {} sessions", agent.product()),
+                "{key}"
+            );
+            assert_eq!(super::agent_switch(key), Some(agent), "{key}");
+            assert_eq!(super::section_of(key), super::Section::Harness, "{key}");
+            assert_eq!(
+                super::application_timing(key),
+                Some(super::HARNESS_AGENT_TIMING),
+                "{key}"
+            );
+            assert!(super::application_has_live_effect(key), "{key}");
+            assert!(!keywords_of(key).is_empty(), "{key}");
+            assert_eq!(
+                super::footnote_of(key),
+                Some(super::HARNESS_AGENT_NOTE),
+                "{key}"
+            );
+            assert_eq!(super::edit_kind(key), EditKind::Bool, "{key}");
+            assert_eq!(seed(&Config::default(), key).as_deref(), Some("true"));
+
+            let written = apply_prefs_edits("font_px = 14\n", &[(key, set("false"))]).expect("set");
+            assert!(
+                written.contains("font_px = 14")
+                    && written.contains(&format!("[harness.{}]\nenabled = false", agent.name())),
+                "{written}"
+            );
+            let cfg = Config::parse(&written).expect("re-parses as Config");
+            assert!(cfg.harness_notices().is_empty(), "{written}");
+            assert!(cfg.harness.notes.is_empty(), "{:?}", cfg.harness.notes);
+            let policy = &cfg.harness.policy;
+            assert!(!policy.on_for(agent), "{written}");
+            assert!(policy.enabled, "{written}");
+            assert_eq!(seed(&cfg, key).as_deref(), Some("false"), "{written}");
+            for other in agents.iter().copied().filter(|other| *other != agent) {
+                assert!(policy.on_for(other), "{other:?}: {written}");
+                assert_eq!(
+                    seed(&cfg, &key_of(other)).as_deref(),
+                    Some("true"),
+                    "{other:?}: {written}"
+                );
+            }
+
+            let cleared = apply_prefs_edits(&written, &[(key, None)]).expect("unset");
+            assert!(
+                !cleared.contains("[harness"),
+                "no empty table left: {cleared}"
+            );
+            let back = Config::parse(&cleared).expect("re-parses as Config");
+            assert_eq!(back.harness.policy, full, "{cleared}");
+            assert!(back.harness.policy.on_for(agent), "{cleared}");
+            assert_eq!(seed(&back, key).as_deref(), Some("true"), "{cleared}");
+        }
+        for key in [
+            super::EDIT_HARNESS_ENABLED,
+            "harness.generic.enabled",
+            "harness.claude-code.enabled",
+            "harness.disk.enabled",
+            "harness.claude.approve",
+            "claude.enabled",
+        ] {
+            assert_eq!(super::agent_switch(key), None, "{key}");
+        }
+        let (claude, codex) = (
+            super::EDIT_HARNESS_CLAUDE_ENABLED,
+            super::EDIT_HARNESS_CODEX_ENABLED,
+        );
+
+        // A saved table seeds its agent's row off and the other's on, in
+        // either spelling the reader takes as an off.
+        for text in [
+            "[harness.codex]\nenabled = false\n",
+            "[harness.codex]\nenabled = \"no\"\n",
+            "[harness]\ncodex.enabled = false\n",
+        ] {
+            let cfg = Config::parse(text).expect("parses");
+            assert_eq!(seed(&cfg, codex).as_deref(), Some("false"), "{text}");
+            assert_eq!(seed(&cfg, claude).as_deref(), Some("true"), "{text}");
+            assert_eq!(
+                seed(&cfg, super::EDIT_HARNESS_ENABLED).as_deref(),
+                Some("true"),
+                "{text}"
+            );
+        }
+        let off = Config::parse("[harness]\nenabled = false\n").expect("parses");
+        for agent in agents {
+            assert!(!off.harness.policy.on_for(agent), "{agent:?}");
+            assert_eq!(
+                seed(&off, &key_of(agent)).as_deref(),
+                Some("true"),
+                "{agent:?}"
+            );
+        }
     }
 
     /// The `[packages]` switches (2026-09-23: TWO, Automatic updates and the one install
@@ -7117,13 +7837,13 @@ mod edit_tests {
             assert_eq!(super::edit_kind(key), EditKind::Bool, "{key} types Bool");
             assert_eq!(super::section_of(key), super::Section::Packages);
             assert_eq!(super::group_of(key), ("ALab Tools", 0));
+            assert!(super::footnote_of(key).is_some());
             assert!(!keywords_of(key).is_empty());
             assert!(
                 !super::VISUAL_PREVIEW_KEYS.contains(&key),
                 "Packages rows carry no preview obligation"
             );
         }
-        assert!(super::group_footnote("ALab Tools").is_some());
 
         let fields = editable_fields(&Config::default());
         for (retired, _) in super::RETIRED_PACKAGES_SPELLINGS {
@@ -7222,8 +7942,7 @@ mod edit_tests {
     /// CO-LOCATED atpkg consumes from the same table (account/exclude/links): the
     /// switch flips only its own child — and the RETIRED spelling it replaced, which
     /// would otherwise go on deciding (2026-09-23) — and a blank-revert of the last GUI
-    /// key keeps the atpkg-owned siblings (an emptied table is retained too — the nested
-    /// writer never deletes a parent table).
+    /// key keeps the atpkg-owned siblings, which keep the table.
     #[test]
     fn packages_dotted_writes_preserve_the_atpkg_owned_siblings() {
         let existing = "# consent ledger\n[packages]\naccount = \"alabsystems\" # index owner\nexclude = [\"trust\"]\nseed_install = false\nauto_update = false\n\n[packages.links]\nay = \"~/ay\"\n";
@@ -7883,12 +8602,12 @@ listen = \"127.0.0.1:7777\" # local only
                 .iter()
                 .find(|field| field.key == key)
                 .unwrap_or_else(|| panic!("missing native Settings row for {key}"));
-            // The sprite art followed the cat to its own pane on 2026-08-10;
-            // everything else here still tunes the trail engine.
-            let expected_section = if key == super::EDIT_CURSOR_NYAN_SPRITE {
-                super::Section::CursorKitty
-            } else {
+            // The style's tuning and the sprite art live on Cursor Styles; the
+            // momentum glow works on every style, so it stays on Cursor & Motion.
+            let expected_section = if key == super::EDIT_CURSOR_MOMENTUM_GLOW {
                 super::Section::Cursor
+            } else {
+                super::Section::CursorStyles
             };
             assert_eq!(super::section_of(key), expected_section, "{key}");
             assert_eq!(field.kind, super::edit_kind(key), "{key} kind drift");
@@ -7987,12 +8706,16 @@ listen = \"127.0.0.1:7777\" # local only
         assert!(super::application_has_live_effect(
             super::EDIT_PACKAGES_ENABLED
         ));
-        // The [machine] rows are applied by the co-located atpkg — on its next
-        // pass, or on the Security page's Apply now — so they are NOT in the
-        // "Applies next launch" set and never will be.
+        // The [machine] rows are applied by the co-located atpkg on its next
+        // pass (Apply Now on Security, where it is drawn, says what it does) —
+        // so they are NOT in the "Applies next launch" set and never will be.
         assert_eq!(
             super::application_timing(super::EDIT_MACHINE_UNIVERSAL_CONTROL),
-            Some("Applies on the next package pass, or Apply now")
+            Some("Applies at the next ALab tools check")
+        );
+        assert_eq!(
+            super::application_timing_badge(super::EDIT_MACHINE_UNIVERSAL_CONTROL),
+            Some("Applies at the next ALab tools check")
         );
         assert!(!super::application_has_live_effect(
             super::EDIT_MACHINE_UNIVERSAL_CONTROL
@@ -8018,7 +8741,7 @@ listen = \"127.0.0.1:7777\" # local only
         );
         assert_eq!(
             super::application_timing(super::EDIT_REROUTE_ANNOUNCE),
-            Some("Applies to the next rerouted command")
+            Some("Applies to the next cargo or rustc run")
         );
         for key in [
             super::EDIT_PACKAGES_AUTO_INSTALL,
@@ -8028,7 +8751,7 @@ listen = \"127.0.0.1:7777\" # local only
         ] {
             assert_eq!(
                 super::application_timing(key),
-                Some("Applies at the next package check"),
+                Some("Applies at the next ALab tools check"),
                 "{key}"
             );
         }
@@ -8126,330 +8849,39 @@ listen = \"127.0.0.1:7777\" # local only
         }
     }
 
-    /// Smart Titles is one complete, searchable group in Window & Tabs. Every scalar
-    /// uses its real TOML type, and every string enum exposes only canonical values.
+    /// Legacy comma-separated list replacements may begin with a bracketed
+    /// path or argument; only a parsed TOML array takes the structured lane.
     #[test]
-    fn smart_title_schema_is_complete_typed_and_searchable() {
-        let fields = editable_fields(&Config::default());
-        let grouped: Vec<&str> = fields
-            .iter()
-            .filter(|field| super::group_of(field.key).0 == "Smart Titles")
-            .map(|field| field.key)
-            .collect();
+    fn bracket_prefixed_comma_lists_keep_their_literal_members() {
+        let raw = "[packs]/trail.toml, /tmp/another.toml";
+        let out = apply_prefs_edits("", &[(super::EDIT_CURSOR_TRAIL_PACKS, set(raw))]).unwrap();
+        let config: Config = aterm_toml::from_str(&out).unwrap();
         assert_eq!(
-            grouped,
-            super::SMART_TITLE_KEYS,
-            "the UI group and health-invalidation roster must not drift"
+            config.cursor_trail_packs,
+            Some(vec![
+                "[packs]/trail.toml".to_string(),
+                "/tmp/another.toml".to_string()
+            ])
         );
-        for &key in super::SMART_TITLE_KEYS {
-            let row = fields
-                .iter()
-                .find(|field| field.key == key)
-                .unwrap_or_else(|| panic!("missing Smart Titles row {key}"));
-            assert_eq!(super::section_of(key), super::Section::Window, "{key}");
-            assert_eq!(super::group_of(key).0, "Smart Titles", "{key}");
-            assert!(!keywords_of(key).is_empty(), "{key} must be searchable");
-            assert!(
-                keywords_of(key).contains(&"smart title"),
-                "the group-level search phrase must find {key}"
-            );
-            assert_eq!(row.kind, super::edit_kind(key), "{key} row/writer type");
-        }
-        for key in [
-            super::EDIT_DESCRIPTIVE_TITLES,
-            super::EDIT_TITLE_SUMMARY_INCLUDE_OUTPUT,
-            super::EDIT_TITLE_SUMMARY_ALLOW_REMOTE,
-        ] {
-            assert!(matches!(super::edit_kind(key), EditKind::Bool), "{key}");
-        }
-        for key in [
-            super::EDIT_TITLE_SUMMARY_TIMEOUT_SECONDS,
-            super::EDIT_TITLE_SUMMARY_INTERVAL_SECONDS,
-            super::EDIT_TITLE_SUMMARY_CONTEXT_LINES,
-        ] {
-            assert!(matches!(super::edit_kind(key), EditKind::Integer), "{key}");
-        }
-        assert!(
-            super::group_footnote("Smart Titles").is_some_and(|note| note
-                .contains("Activity shows only when a tab has no Description")
-                && note.contains(
-                    "Built-in and aterm-managed Ollama keep terminal text on this device"
-                )
-                && note.contains("recent terminal text only with your consent")
-                && note.contains("cannot catch every secret")),
-            "the group must say when Activity shows, which providers keep terminal text on \
-             this device, that any other needs consent, and the limit of secret filtering"
-        );
-    }
-
-    /// Unset fields remain blank (so Save can preserve an unset config) while the
-    /// controls still communicate all effective defaults. Bools seed their resolved
-    /// state because checkboxes have no placeholder channel.
-    #[test]
-    fn smart_title_defaults_seed_and_placeholder_correctly() {
-        let fields = editable_fields(&Config::default());
-        let row = |key: &str| {
-            fields
-                .iter()
-                .find(|field| field.key == key)
-                .unwrap_or_else(|| panic!("missing row {key}"))
-        };
+        let out =
+            apply_prefs_edits("", &[(super::EDIT_SHELL_ARGS, set("[working], --flag"))]).unwrap();
+        let config: Config = aterm_toml::from_str(&out).unwrap();
         assert_eq!(
-            row(super::EDIT_DESCRIPTIVE_TITLES).seed.as_deref(),
-            Some("true")
+            config.shell_args,
+            Some(vec!["[working]".to_string(), "--flag".to_string()])
         );
-        assert_eq!(
-            row(super::EDIT_TITLE_SUMMARY_INCLUDE_OUTPUT)
-                .seed
-                .as_deref(),
-            Some("true")
-        );
-        assert_eq!(
-            row(super::EDIT_TITLE_SUMMARY_ALLOW_REMOTE).seed.as_deref(),
-            Some("false")
-        );
-        for key in [
-            super::EDIT_TITLE_SUMMARY_PROVIDER,
-            super::EDIT_TITLE_SUMMARY_MODEL,
-            super::EDIT_TITLE_SUMMARY_ENDPOINT,
-            super::EDIT_TITLE_SUMMARY_TOKEN_FILE,
-            super::EDIT_TITLE_SUMMARY_TIMEOUT_SECONDS,
-            super::EDIT_TITLE_SUMMARY_PROXY_MODE,
-            super::EDIT_TITLE_SUMMARY_CA_FILE,
-            super::EDIT_TITLE_SUMMARY_INTERVAL_SECONDS,
-            super::EDIT_TITLE_SUMMARY_CONTEXT_LINES,
-            super::EDIT_TAB_TITLE_FORMAT,
-            super::EDIT_WINDOW_TITLE_FORMAT,
-        ] {
-            assert_eq!(row(key).seed, None, "{key} stays unset");
-            assert!(
-                !row(key).placeholder.is_empty(),
-                "{key} needs a default hint"
-            );
-        }
-        assert_eq!(
-            row(super::EDIT_TITLE_SUMMARY_PROVIDER).placeholder,
-            "builtin (default)"
-        );
-        assert_eq!(
-            row(super::EDIT_TITLE_SUMMARY_ENDPOINT).placeholder,
-            "not used by selected provider"
-        );
-        assert_eq!(
-            row(super::EDIT_TITLE_SUMMARY_TIMEOUT_SECONDS).placeholder,
-            "20 (default)"
-        );
-        assert_eq!(
-            row(super::EDIT_TITLE_SUMMARY_PROXY_MODE).placeholder,
-            "environment (default)"
-        );
-        assert_eq!(
-            row(super::EDIT_TITLE_SUMMARY_CA_FILE).placeholder,
-            "platform trust roots (default)"
-        );
-        assert_eq!(
-            row(super::EDIT_TITLE_SUMMARY_INTERVAL_SECONDS).placeholder,
-            "15 (default)"
-        );
-        assert_eq!(
-            row(super::EDIT_TITLE_SUMMARY_CONTEXT_LINES).placeholder,
-            "24 (default)"
-        );
-        assert_eq!(
-            row(super::EDIT_TAB_TITLE_FORMAT).placeholder,
-            "title-description (default)"
-        );
-    }
-
-    #[test]
-    fn smart_title_endpoint_hint_matches_the_selected_provider() {
-        let endpoint_hint = |provider| {
-            let mut config = Config {
-                title_summary_provider: Some(provider),
-                ..Config::default()
-            };
-            // A stale blank string has the same effective meaning as an absent key.
-            config.title_summary_endpoint = Some("   ".to_string());
-            editable_fields(&config)
-                .into_iter()
-                .find(|field| field.key == super::EDIT_TITLE_SUMMARY_ENDPOINT)
-                .expect("endpoint row")
-                .placeholder
-        };
-
-        assert!(
-            endpoint_hint(crate::app_config::TitleSummaryProvider::Ollama)
-                .starts_with("blank = automatic private endpoint")
-        );
-        assert!(
-            endpoint_hint(crate::app_config::TitleSummaryProvider::OpenAiCompatible)
-                .starts_with("required: https://")
-        );
-        for provider in [
-            crate::app_config::TitleSummaryProvider::Builtin,
-            crate::app_config::TitleSummaryProvider::Off,
-        ] {
-            assert_eq!(endpoint_hint(provider), "not used by selected provider");
-        }
-    }
-
-    /// A Save writes every Smart Titles control using serde-compatible TOML types and
-    /// configured values seed back into the exact controls on the next open.
-    #[test]
-    fn smart_title_edits_round_trip_and_reseed() {
+        // A real TOML array still preserves a member containing a comma.
         let out = apply_prefs_edits(
             "",
-            &[
-                (super::EDIT_DESCRIPTIVE_TITLES, set("false")),
-                (super::EDIT_TITLE_SUMMARY_PROVIDER, set("ollama")),
-                (super::EDIT_TITLE_SUMMARY_MODEL, set("qwen3.5:4b-q4_K_M")),
-                (
-                    super::EDIT_TITLE_SUMMARY_ENDPOINT,
-                    set("http://127.0.0.1:11434/api/chat"),
-                ),
-                (
-                    super::EDIT_TITLE_SUMMARY_TOKEN_FILE,
-                    set("/tmp/aterm-summary-token"),
-                ),
-                (super::EDIT_TITLE_SUMMARY_TIMEOUT_SECONDS, set("42")),
-                (super::EDIT_TITLE_SUMMARY_PROXY_MODE, set("direct")),
-                (
-                    super::EDIT_TITLE_SUMMARY_CA_FILE,
-                    set("/tmp/private-model-ca.pem"),
-                ),
-                (super::EDIT_TITLE_SUMMARY_INTERVAL_SECONDS, set("30")),
-                (super::EDIT_TITLE_SUMMARY_CONTEXT_LINES, set("40")),
-                (super::EDIT_TITLE_SUMMARY_INCLUDE_OUTPUT, set("false")),
-                (super::EDIT_TITLE_SUMMARY_ALLOW_REMOTE, set("true")),
-                (super::EDIT_TAB_TITLE_FORMAT, set("description-title")),
-                (super::EDIT_WINDOW_TITLE_FORMAT, set("description")),
-            ],
+            &[(super::EDIT_SHELL_ARGS, set(r#"["one,two", "three"]"#))],
         )
-        .expect("typed Smart Titles edits");
-        assert!(out.contains("descriptive_titles = false"));
-        assert!(out.contains("title_summary_interval_seconds = 30"));
-        assert!(out.contains("title_summary_context_lines = 40"));
-        assert!(out.contains("title_summary_provider = \"ollama\""));
-        assert!(out.contains("title_summary_timeout_seconds = 42"));
-        assert!(out.contains("title_summary_proxy_mode = \"direct\""));
-        assert!(out.contains("title_summary_ca_file = \"/tmp/private-model-ca.pem\""));
-
-        let cfg: Config = aterm_toml::from_str(&out).expect("Smart Titles config re-parses");
-        assert_eq!(cfg.descriptive_titles, Some(false));
+        .unwrap();
+        let config: Config = aterm_toml::from_str(&out).unwrap();
         assert_eq!(
-            cfg.title_summary_provider
-                .as_ref()
-                .map(|value| value.as_str()),
-            Some("ollama")
+            config.shell_args,
+            Some(vec!["one,two".to_string(), "three".to_string()])
         );
-        assert_eq!(cfg.title_summary_interval_seconds, Some(30));
-        assert_eq!(cfg.title_summary_context_lines, Some(40));
-        assert_eq!(cfg.title_summary_timeout_seconds, Some(42));
-        assert_eq!(
-            cfg.title_summary_proxy_mode.map(|mode| mode.as_str()),
-            Some("direct")
-        );
-        assert_eq!(
-            cfg.title_summary_ca_file.as_deref(),
-            Some("/tmp/private-model-ca.pem")
-        );
-        assert_eq!(cfg.title_summary_include_output, Some(false));
-        assert_eq!(cfg.title_summary_allow_remote, Some(true));
-        assert_eq!(
-            cfg.tab_title_format.as_ref().map(|value| value.as_str()),
-            Some("description-title")
-        );
-        assert_eq!(
-            cfg.window_title_format.as_ref().map(|value| value.as_str()),
-            Some("description")
-        );
-
-        let fields = editable_fields(&cfg);
-        let seed = |key: &str| {
-            fields
-                .iter()
-                .find(|field| field.key == key)
-                .and_then(|field| field.seed.as_deref())
-        };
-        assert_eq!(seed(super::EDIT_TITLE_SUMMARY_PROVIDER), Some("ollama"));
-        assert_eq!(
-            seed(super::EDIT_TITLE_SUMMARY_MODEL),
-            Some("qwen3.5:4b-q4_K_M")
-        );
-        assert_eq!(seed(super::EDIT_TITLE_SUMMARY_INTERVAL_SECONDS), Some("30"));
-        assert_eq!(seed(super::EDIT_TITLE_SUMMARY_CONTEXT_LINES), Some("40"));
-        assert_eq!(seed(super::EDIT_TITLE_SUMMARY_TIMEOUT_SECONDS), Some("42"));
-        assert_eq!(seed(super::EDIT_TITLE_SUMMARY_PROXY_MODE), Some("direct"));
-        assert_eq!(
-            seed(super::EDIT_TITLE_SUMMARY_CA_FILE),
-            Some("/tmp/private-model-ca.pem")
-        );
-        assert_eq!(
-            seed(super::EDIT_TITLE_SUMMARY_TOKEN_FILE),
-            Some("/tmp/aterm-summary-token")
-        );
-    }
-
-    /// The token setting stores a FILE PATH, never credential material. The shared
-    /// typed writer rejects obvious pasted API keys, authorization headers, JWTs,
-    /// and URLs before it can produce replacement TOML. A bad token-file value also
-    /// makes the whole edit batch fail, so an earlier valid edit cannot be partially
-    /// persisted by the native/control Settings service.
-    #[test]
-    fn smart_title_token_file_rejects_inline_credentials_before_toml() {
-        let pasted_values = vec![
-            "sk_pasted_bearer_not_a_file_path".to_string(),
-            "Bearer pasted-secret-value".to_string(),
-            "eyJhbGciOiJub25lIn0.payload.signature".to_string(),
-            "https://credentials.example.test/pasted-bearer".to_string(),
-            ["AK", "IA", "ABCDEFGHIJKLMNOP"].concat(),
-            ["AI", "za", "abcdefghijklmnopqrstuvwxyz012345"].concat(),
-            "0123456789abcdef".repeat(4),
-            "lowercaseopaque0123456789abcdefghi".to_string(),
-        ];
-
-        for pasted in &pasted_values {
-            let err = apply_prefs_edits(
-                "theme = \"Dracula\"\n",
-                &[
-                    (super::EDIT_THEME, set("Nord")),
-                    (super::EDIT_TITLE_SUMMARY_TOKEN_FILE, set(pasted)),
-                ],
-            )
-            .expect_err("pasted credential material must not produce TOML");
-            let diagnostic = err.to_string();
-            assert!(
-                !diagnostic.contains(pasted.as_str()),
-                "rejected credential leaked through its diagnostic: {diagnostic}"
-            );
-            assert!(diagnostic.contains("expected a file path"), "{diagnostic}");
-            match err {
-                PrefsEditError::SensitiveBadValue { key, .. } => {
-                    assert_eq!(key, super::EDIT_TITLE_SUMMARY_TOKEN_FILE)
-                }
-                other => panic!("expected redacted token-file error, got {other:?}"),
-            }
-        }
-    }
-
-    /// Absolute, home-relative, and ordinary relative paths remain valid. Dots and
-    /// hyphens in a filename — including a dotted name that is not a JWT — must not
-    /// be mistaken for inline credential material.
-    #[test]
-    fn smart_title_token_file_paths_round_trip_without_false_positives() {
-        for path in [
-            "/Users//example/.config/aterm/title-summary.token",
-            "~/.config/aterm/title-summary-token",
-            "../secrets/provider-token.txt",
-            "relative.token-file.with-dots",
-            "risk-analysis.txt",
-            "sk_prod/token-file",
-        ] {
-            let out = apply_prefs_edits("", &[(super::EDIT_TITLE_SUMMARY_TOKEN_FILE, set(path))])
-                .unwrap_or_else(|error| panic!("valid path {path:?} was rejected: {error}"));
-            let cfg: Config = aterm_toml::from_str(&out).expect("token-file TOML re-parses");
-            assert_eq!(cfg.title_summary_token_file.as_deref(), Some(path));
-        }
+        assert!(apply_prefs_edits("", &[(super::EDIT_SHELL_ARGS, set("[1]"))]).is_err());
     }
 
     /// WINDOWS PATH PARITY: a native path is BACKSLASHED, and a backslash is
@@ -8510,183 +8942,6 @@ listen = \"127.0.0.1:7777\" # local only
         let cfg: Config = aterm_toml::from_str(&again).expect("second Save re-parses");
         assert_eq!(cfg.font_family_bold.as_deref(), Some(bold));
         assert_eq!(cfg.font_px, Some(14.0));
-    }
-
-    #[test]
-    fn smart_title_ca_file_rejects_inline_pem_without_diagnostic_disclosure() {
-        for pasted in [
-            "-----BEGIN CERTIFICATE-----MIIBpasted",
-            concat!("-----BEGIN ", "PRIVATE KEY-----pasted-secret"),
-            "https://certificates.example.test/root.pem",
-            "-----BEGIN CERTIFICATE-----\npasted",
-        ] {
-            let err = apply_prefs_edits(
-                "theme = \"Dracula\"\n",
-                &[
-                    (super::EDIT_THEME, set("Nord")),
-                    (super::EDIT_TITLE_SUMMARY_CA_FILE, set(pasted)),
-                ],
-            )
-            .expect_err("inline certificate/key material must not produce TOML");
-            let diagnostic = err.to_string();
-            assert!(!diagnostic.contains(pasted), "PEM leaked: {diagnostic}");
-            assert!(diagnostic.contains("expected a file path"), "{diagnostic}");
-            assert!(matches!(
-                err,
-                PrefsEditError::SensitiveBadValue { key, .. }
-                    if key == super::EDIT_TITLE_SUMMARY_CA_FILE
-            ));
-            let outcome = super::SaveOutcome::Error(diagnostic);
-            let super::SaveOutcome::Error(message) = outcome else {
-                unreachable!();
-            };
-            assert!(!message.contains(pasted));
-        }
-
-        for path in [
-            "/Users//example/.config/aterm/private-model-ca.pem",
-            "~/.config/aterm/root-ca.pem",
-            "../certificates/provider-root.pem",
-            "C:\\certificates\\provider-root.pem",
-        ] {
-            let out = apply_prefs_edits("", &[(super::EDIT_TITLE_SUMMARY_CA_FILE, set(path))])
-                .unwrap_or_else(|error| panic!("valid CA path {path:?} was rejected: {error}"));
-            let cfg: Config = aterm_toml::from_str(&out).expect("CA-path TOML re-parses");
-            assert_eq!(cfg.title_summary_ca_file.as_deref(), Some(path));
-        }
-    }
-
-    #[test]
-    fn smart_title_endpoint_rejects_secrets_and_malformed_urls_without_disclosure() {
-        for pasted in [
-            "https://models.example.test/v1/chat?api_key=pasted-value",
-            "https://models.example.test/v1/chat?api-version=2026-01-01",
-            "https://models.example.test/v1/chat#pasted-token",
-            "https://alice:p4ssw0rd@models.example.test/v1/chat",
-            "models.example.test/v1/chat",
-            "ftp://models.example.test/v1/chat",
-            "https://models example.test/v1/chat",
-            "https://models.example.test:not-a-port/v1/chat",
-            "http://127.0.0.1:0/api/chat",
-            "https://-/v1/chat",
-            "https://models..example.test/v1/chat",
-            "https://127.1:9443/v1/chat",
-            "https://2130706433:9443/v1/chat",
-            "https://0x7f000001:9443/v1/chat",
-            concat!(
-                "https://models.example.test/v1/",
-                "sk-",
-                "proj-abcdefghijklmnopqrstuvwxyz012345/chat"
-            ),
-            concat!(
-                "https://",
-                "sk-",
-                "proj-abcdefghijklmnopqrstuvwxyz012345.models.example/v1/chat"
-            ),
-            "https://models.example.test/v1/%2Fchat",
-            "https://models.example.test/v1/%ZZ/chat",
-            "https://models.example.test\\v1\\chat",
-            "https://models.example.test/v1/{bad}/chat",
-            "https://models.example.test/v1/秘密/chat",
-        ] {
-            let err = apply_prefs_edits(
-                "title_summary_provider = \"openai-compatible\"\n",
-                &[(super::EDIT_TITLE_SUMMARY_ENDPOINT, set(pasted))],
-            )
-            .expect_err("endpoint parameters must not enter persistent config");
-            let diagnostic = err.to_string();
-            assert!(
-                !diagnostic.contains(pasted),
-                "endpoint leaked: {diagnostic}"
-            );
-            assert!(diagnostic.contains("without a query or fragment"));
-            assert!(matches!(
-                err,
-                PrefsEditError::SensitiveBadValue { key, .. }
-                    if key == super::EDIT_TITLE_SUMMARY_ENDPOINT
-            ));
-        }
-
-        let endpoint = "https://models.example.test/v1/chat/completions";
-        let out = apply_prefs_edits(
-            "title_summary_provider = \"openai-compatible\"\n",
-            &[(super::EDIT_TITLE_SUMMARY_ENDPOINT, set(endpoint))],
-        )
-        .expect("parameter-free endpoint remains valid");
-        let cfg: Config = aterm_toml::from_str(&out).expect("endpoint TOML re-parses");
-        assert_eq!(cfg.title_summary_endpoint.as_deref(), Some(endpoint));
-    }
-
-    /// Provider/proxy/title-format controls reject unknown values and canonicalize case;
-    /// timeout/cadence/context sliders enforce the same bounded domains as config.
-    #[test]
-    fn smart_title_enums_and_ranges_are_validated() {
-        for (key, options) in [
-            (
-                super::EDIT_TITLE_SUMMARY_PROVIDER,
-                super::TITLE_SUMMARY_PROVIDERS,
-            ),
-            (
-                super::EDIT_TITLE_SUMMARY_PROXY_MODE,
-                super::TITLE_SUMMARY_PROXY_MODES,
-            ),
-            (super::EDIT_TAB_TITLE_FORMAT, super::TITLE_FORMATS),
-            (super::EDIT_WINDOW_TITLE_FORMAT, super::TITLE_FORMATS),
-        ] {
-            match super::edit_kind(key) {
-                EditKind::Enum { options: actual } => assert_eq!(actual, options),
-                other => panic!("{key} should be Enum, got {other:?}"),
-            }
-            let canonical = options[0];
-            let out = apply_prefs_edits("", &[(key, set(&canonical.to_ascii_uppercase()))])
-                .expect("case-insensitive canonical enum");
-            assert!(out.contains(&format!("{key} = \"{canonical}\"")), "{out}");
-            assert!(matches!(
-                apply_prefs_edits("", &[(key, set("not-a-real-option"))]),
-                Err(PrefsEditError::BadValue { .. })
-            ));
-        }
-
-        assert_eq!(
-            range_of(super::EDIT_TITLE_SUMMARY_TIMEOUT_SECONDS),
-            Some(super::Range {
-                min: 1.0,
-                max: 120.0,
-                step: 1.0,
-            })
-        );
-        assert_eq!(
-            range_of(super::EDIT_TITLE_SUMMARY_INTERVAL_SECONDS),
-            Some(super::Range {
-                min: 5.0,
-                max: 300.0,
-                step: 1.0,
-            })
-        );
-        assert_eq!(
-            range_of(super::EDIT_TITLE_SUMMARY_CONTEXT_LINES),
-            Some(super::Range {
-                min: 4.0,
-                max: 80.0,
-                step: 1.0,
-            })
-        );
-        for (key, value) in [
-            (super::EDIT_TITLE_SUMMARY_TIMEOUT_SECONDS, "0"),
-            (super::EDIT_TITLE_SUMMARY_TIMEOUT_SECONDS, "121"),
-            (super::EDIT_TITLE_SUMMARY_INTERVAL_SECONDS, "4"),
-            (super::EDIT_TITLE_SUMMARY_INTERVAL_SECONDS, "301"),
-            (super::EDIT_TITLE_SUMMARY_CONTEXT_LINES, "3"),
-            (super::EDIT_TITLE_SUMMARY_CONTEXT_LINES, "81"),
-        ] {
-            assert!(
-                matches!(
-                    apply_prefs_edits("", &[(key, set(value))]),
-                    Err(PrefsEditError::BadValue { .. })
-                ),
-                "{key}={value} must be rejected"
-            );
-        }
     }
 
     /// `editable_fields` seeds CONFIGURED values only (unset = blank), in the documented
@@ -8823,17 +9078,6 @@ listen = \"127.0.0.1:7777\" # local only
         assert!(r.min < r.max && r.step > 0.0);
     }
 
-    /// A few representative controls expose intent keywords so fuzzy search can find
-    /// them by synonym (the corpus the settings search bar ranks against).
-    #[test]
-    fn keywords_surface_intent_synonyms() {
-        assert!(keywords_of(EDIT_WINDOW_THEME).contains(&"dark"));
-        assert!(keywords_of(EDIT_SCROLLBACK).contains(&"history"));
-        assert!(keywords_of(EDIT_COPY_ON_SELECT).contains(&"clipboard"));
-        assert!(keywords_of(EDIT_ALLOW_WINDOW_OPS).contains(&"security"));
-        assert!(keywords_of(EDIT_FONT_PX).contains(&"size"));
-    }
-
     /// A whitespace-only configured string seeds BLANK (None), matching the display
     /// fallback — so re-saving an untouched window doesn't materialise a "   " value.
     #[test]
@@ -8865,15 +9109,15 @@ listen = \"127.0.0.1:7777\" # local only
     #[test]
     fn editable_fields_placeholder_shows_effective_default() {
         let fields = editable_fields(&Config::default());
-        assert_eq!(placeholder(&fields, EDIT_FONT_PX), "auto (default)");
-        assert_eq!(placeholder(&fields, EDIT_FONT_FAMILY), "default");
-        assert_eq!(placeholder(&fields, EDIT_THEME), "Default");
+        assert_eq!(
+            placeholder(&fields, EDIT_FONT_PX),
+            format!("{} (automatic)", crate::FONT_PX)
+        );
+        assert_eq!(placeholder(&fields, EDIT_FONT_FAMILY), "Automatic");
+        assert_eq!(placeholder(&fields, EDIT_THEME), super::UNSET_THEME_LABEL);
         assert_eq!(placeholder(&fields, EDIT_CURSOR_STYLE), "block (default)");
         assert_eq!(placeholder(&fields, EDIT_SCROLLBACK), "100000 (default)");
-        assert_eq!(
-            placeholder(&fields, EDIT_MOTION),
-            super::motion_auto_placeholder()
-        );
+        assert_eq!(placeholder(&fields, EDIT_MOTION), "auto (default)");
         // None of the text-row placeholders are blank.
         for k in [
             EDIT_FONT_PX,
@@ -8886,21 +9130,93 @@ listen = \"127.0.0.1:7777\" # local only
         }
     }
 
+    /// Each row draws its own note: Alt/Option as Meta carries none and
+    /// Predictive echo its own, and rows that share a sentence draw it once,
+    /// in the last of them, so it never sits under a row it does not explain.
+    #[test]
+    fn a_row_draws_its_own_note_and_neighbours_share_one_once() {
+        assert_eq!(
+            super::row_notes(&[super::EDIT_OPTION_AS_META, super::EDIT_PREDICTIVE_ECHO]),
+            vec![None, super::footnote_of(super::EDIT_PREDICTIVE_ECHO)]
+        );
+        assert_eq!(
+            super::row_notes(&[super::EDIT_MINIMUM_CONTRAST, super::EDIT_SELECTION_INACTIVE]),
+            vec![super::footnote_of(super::EDIT_MINIMUM_CONTRAST), None],
+            "Minimum contrast's note stays in its own row"
+        );
+        // Each voice says what it sounds like in its own row; the shared
+        // note goes with the master and the volume, drawn once, in the last.
+        let sound = super::row_notes(&[
+            super::EDIT_TRAIL_SOUNDS,
+            super::EDIT_TRAIL_SOUND_VOLUME,
+            super::EDIT_TONE_MELODY,
+            super::EDIT_BELL_SOUND,
+        ]);
+        assert_eq!(
+            sound,
+            vec![
+                None,
+                Some(super::SOUND_NOTE),
+                super::footnote_of(super::EDIT_TONE_MELODY),
+                super::footnote_of(super::EDIT_BELL_SOUND)
+            ],
+            "the voices' shared note is drawn once, in the last row that shares it"
+        );
+        assert_eq!(
+            super::row_notes(&[
+                super::EDIT_TRAIL_SOUNDS,
+                super::EDIT_BELL_SOUND,
+                super::EDIT_TRAIL_SOUND_VOLUME,
+            ]),
+            vec![
+                None,
+                super::footnote_of(super::EDIT_BELL_SOUND),
+                Some(super::SOUND_NOTE)
+            ],
+            "a row with a note of its own between them does not repeat the shared one"
+        );
+        for voice in [
+            super::EDIT_TRAIL_SOUND_STYLE,
+            super::EDIT_TONE_MELODY,
+            super::EDIT_TRAIL_SOUND_BED,
+            super::EDIT_TRAIL_SOUND_RIFF,
+            super::EDIT_CHOICE_SOUND,
+            super::EDIT_SPARKLE_BONK,
+            super::EDIT_SPARKLE_BONK_DETONATION,
+            super::EDIT_OUTPUT_STREAK_SOUND,
+        ] {
+            let note = super::footnote_of(voice);
+            assert!(
+                note.is_some_and(|note| note != super::SOUND_NOTE),
+                "{voice} says what it sounds like: {note:?}"
+            );
+        }
+        assert_eq!(
+            super::row_notes(&[super::EDIT_PACKAGES_ENABLED]),
+            vec![super::footnote_of(super::EDIT_PACKAGES_ENABLED)],
+            "Modified listing one ALab tools switch explains only that switch"
+        );
+        assert_eq!(
+            super::footnote_of(EDIT_FOREGROUND),
+            None,
+            "the field says Theme default"
+        );
+    }
+
     #[test]
     fn motion_auto_copy_is_truthful_for_each_platform_capability() {
-        let (mac_placeholder, mac_help) = super::motion_auto_copy("macos");
-        assert!(mac_placeholder.contains("live macOS"));
+        let (mac_note, mac_help) = super::motion_auto_copy("macos");
+        assert!(mac_note.contains("macOS Reduce Motion as you change it"));
         assert!(mac_help.contains("live"));
 
-        let (windows_placeholder, windows_help) = super::motion_auto_copy("windows");
-        assert!(windows_placeholder.contains("window attach"));
+        let (windows_note, windows_help) = super::motion_auto_copy("windows");
+        assert!(windows_note.contains("each time a window opens"));
         assert!(windows_help.contains("not observed live"));
 
         for target in ["linux", "freebsd"] {
-            let (placeholder, help) = super::motion_auto_copy(target);
-            assert!(placeholder.contains("unavailable"));
+            let (note, help) = super::motion_auto_copy(target);
+            assert!(note.contains("no Reduce Motion setting"));
             assert!(help.contains("choose reduced explicitly"));
-            assert!(!placeholder.contains("follow OS"));
         }
     }
 
@@ -8921,85 +9237,19 @@ listen = \"127.0.0.1:7777\" # local only
     }
 }
 
-/// FULL-COVERAGE conformance: the proofs that the settings registry spans the
-/// ENTIRE `Config` surface (the AI-driveability contract behind Manual and
-/// `settings set|unset`) — an exhaustiveness gate over the serde fields, the
-/// dotted-key nested-table writer, and the list-row round-trips.
+/// REGISTRY conformance: the proofs behind Manual and `settings set|unset` (the
+/// AI-driveability contract) — the dotted-key nested-table writer and the
+/// list-row round-trips.
 #[cfg(test)]
 mod registry_conformance_tests {
     use super::{
-        Config, DEFERRED_CONFIG_KEYS, EditKind, NESTED_LEAVES, PrefsEditError, apply_prefs_edits,
-        edit_kind, editable_fields, integer_domain, range_of, section_of,
+        Config, EDIT_ADJUST_BASELINE, EDIT_COLUMNS, EDIT_SCROLLBACK, EditKind, NESTED_LEAVES,
+        PrefsEditError, apply_prefs_edits, edit_kind, editable_fields, integer_domain, range_of,
+        section_of,
     };
 
     fn set(v: &str) -> Option<String> {
         Some(v.to_string())
-    }
-
-    /// THE EXHAUSTIVENESS GATE: every serde field of `Config` (parsed straight
-    /// out of the struct's source, so a freshly-added field is seen the moment
-    /// it exists) is either registered in `editable_fields` — directly, or via
-    /// at least one dotted-leaf row for a nested table — or sits on the
-    /// [`DEFERRED_CONFIG_KEYS`] allowlist WITH its written rationale. A new
-    /// `Config` field therefore fails CI until it is deliberately exposed or
-    /// deliberately deferred; it can never silently skip the introspection
-    /// surface.
-    #[test]
-    fn every_config_field_is_registered_or_deferred() {
-        let src = include_str!("app_config.rs");
-        let head = "pub(crate) struct Config {";
-        let start = src
-            .find(head)
-            .expect("Config struct present in app_config.rs");
-        let body = &src[start + head.len()..];
-        let body = &body[..body.find("\n}").expect("Config struct closes")];
-        let mut serde_keys: Vec<&str> = Vec::new();
-        for line in body.lines() {
-            let t = line.trim();
-            // Every Config field is a `pub(crate) name: Option<...>` line; doc
-            // comments and attributes don't match the prefix.
-            if let Some(rest) = t.strip_prefix("pub(crate) ")
-                && let Some((name, ty)) = rest.split_once(':')
-                && ty.contains("Option<")
-            {
-                serde_keys.push(name.trim());
-            }
-        }
-        assert!(
-            serde_keys.len() >= 80,
-            "sanity: the source parse found the Config fields (got {})",
-            serde_keys.len()
-        );
-        let fields = editable_fields(&Config::default());
-        let registered: std::collections::HashSet<&str> = fields.iter().map(|f| f.key).collect();
-        for key in serde_keys {
-            let direct = registered.contains(key);
-            let via_dotted = fields.iter().any(|f| {
-                f.key.len() > key.len()
-                    && f.key.starts_with(key)
-                    && f.key.as_bytes()[key.len()] == b'.'
-            });
-            let deferred = DEFERRED_CONFIG_KEYS.iter().any(|&(k, _)| k == key);
-            assert!(
-                direct || via_dotted || deferred,
-                "Config field {key:?} is neither registered in editable_fields (directly or via \
-                 dotted-key leaves) nor on DEFERRED_CONFIG_KEYS — expose it or defer it with a \
-                 rationale"
-            );
-            if deferred {
-                assert!(
-                    !direct && !via_dotted,
-                    "{key:?} is deferred AND registered — remove it from one list"
-                );
-            }
-        }
-        // The allowlist carries a real rationale for every entry.
-        for &(key, why) in DEFERRED_CONFIG_KEYS {
-            assert!(
-                !why.trim().is_empty(),
-                "{key:?} deferred without a rationale"
-            );
-        }
     }
 
     /// Every registered nested leaf has a settings row whose kind agrees with
@@ -9057,9 +9307,69 @@ mod registry_conformance_tests {
         }
     }
 
+    /// AN INTEGER REFUSAL NAMES THE BOUND IT BROKE, in the words the Settings
+    /// row uses, so `settings set` says what to type instead of only "invalid
+    /// value". A whole number too long for i64 is still a whole number: its
+    /// sign says which end it passed.
+    #[test]
+    fn an_integer_refusal_names_the_bound_it_broke() {
+        for (key, raw, words) in [
+            (EDIT_COLUMNS, "70000", "must be at most 65,535"),
+            (EDIT_COLUMNS, "-1", "must be 0 or more"),
+            (
+                EDIT_COLUMNS,
+                "wide",
+                "must be a whole number from 0 to 65,535",
+            ),
+            (
+                EDIT_COLUMNS,
+                "99999999999999999999",
+                "must be at most 65,535",
+            ),
+            (
+                EDIT_SCROLLBACK,
+                "9223372036854775808",
+                "must be at most 9,223,372,036,854,775,807",
+            ),
+            (
+                EDIT_SCROLLBACK,
+                "99999999999999999999x",
+                "must be a whole number, 0 or more",
+            ),
+            (
+                EDIT_SCROLLBACK,
+                "-99999999999999999999",
+                "must be 0 or more",
+            ),
+            (
+                "sparkle_words.profanity.jitter",
+                "-99999999999999999999",
+                "must be at least -128",
+            ),
+            (
+                "sparkle_words.profanity.jitter",
+                "200",
+                "must be at most 127",
+            ),
+            (
+                EDIT_ADJUST_BASELINE,
+                "-9223372036854775809",
+                "must be at least -9,223,372,036,854,775,808",
+            ),
+        ] {
+            let error = apply_prefs_edits("", &[(key, set(raw))])
+                .expect_err("an out-of-domain integer is refused")
+                .to_string();
+            assert!(
+                error.contains(key) && error.contains(raw) && error.contains(words),
+                "{key} = {raw}: {error}"
+            );
+        }
+    }
+
     /// Every [`EditKind::Integer`] key enforces its declared writable integer
     /// domain at Save: normally the serde field's actual domain, with narrower
-    /// operational-policy domains for Smart Title request controls. `-1` is rejected
+    /// operational-policy domains for the tab-status controls. `-1` is rejected
     /// unless the writable domain is signed;
     /// `u64::MAX + 1` (beyond any TOML integer) is always rejected; BOTH
     /// [`integer_domain`] boundaries write files the REAL `Config` serde model

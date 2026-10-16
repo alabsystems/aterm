@@ -1,17 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The grid is the authority on columns; every measurer must agree with it.
+//! The grid is the authority on columns: `aterm_grapheme::GridColumns`, the find bar,
+//! scrollback selection and word selection must all agree with it.
 //!
-//! The terminal advances the cursor per character, not per grapheme cluster,
-//! with a stateful exception for emoji (VS16 widens, VS15 narrows, ZWJ and
-//! skin-tone modifiers fold into the preceding cell). A Devanagari conjunct is
-//! one UAX#29 cluster painted in three cells; keycap and VS16 emoji differ the
-//! other way. The find bar, scrollback selection and word selection must all
-//! use the grid's count.
-//!
-//! This file drives the real grid and is what
-//! `aterm_grapheme::GridColumns` is checked against.
+//! The grid advances per character, not per grapheme cluster, except that VS16 widens,
+//! VS15 narrows, and ZWJ and skin-tone modifiers fold into the preceding cell. So a
+//! Devanagari conjunct is one UAX #29 cluster in three cells, and keycap and VS16 emoji
+//! differ the other way.
 
 use aterm_core::terminal::Terminal;
 

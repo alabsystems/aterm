@@ -25,52 +25,7 @@
 //!
 //! And with no frame, a box's first row is never under the zone's start.
 
-use std::path::{Path, PathBuf};
-
-use aterm_phase::prompt::fixtures as fx;
-
-/// A fixture file's rows, read as `panic_sweep.rs` reads them: the
-/// provenance line (`# …`) dropped, and a saved waiter capture's `== …`
-/// head and `exit=` tail.
-fn file_rows(text: &str) -> Vec<String> {
-    let mut r = fx::screen(text);
-    if r.first().is_some_and(|l| l.starts_with("== ")) {
-        r.remove(0);
-    }
-    if r.last().is_some_and(|l| l.starts_with("exit=")) {
-        r.pop();
-    }
-    r
-}
-
-fn dir_screens(dir: &Path, into: &mut Vec<(String, Vec<String>)>) {
-    let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
-        .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
-        .map(|e| e.expect("a fixture entry").path())
-        .filter(|p| p.is_file())
-        .collect();
-    paths.sort();
-    assert!(!paths.is_empty(), "{}: no fixtures", dir.display());
-    for p in paths {
-        let text = std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
-        let name = p
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        into.push((name, file_rows(&text)));
-    }
-}
-
-fn screens() -> Vec<(String, Vec<String>)> {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut out = Vec::new();
-    dir_screens(&crate_dir.join("src/fixtures"), &mut out);
-    let agent = crate_dir.join("../aterm-agent/src/supervise/policy/fixtures");
-    if agent.is_dir() {
-        dir_screens(&agent, &mut out);
-    }
-    out
-}
+use crate::fixture_files::fixture_screens;
 
 /// `rows` with every row above `start` blank.
 fn blank_above(rows: &[String], start: usize) -> Vec<String> {
@@ -130,7 +85,7 @@ fn check(name: &str, rows: &[String]) -> Result<(), String> {
 
 #[test]
 fn the_live_zone_keeps_every_row_the_busy_reading_reads() {
-    let screens = screens();
+    let screens = fixture_screens("busy zone sweep");
     let mut bad = Vec::new();
     let mut framed = 0;
     for (name, rows) in &screens {
@@ -157,6 +112,6 @@ fn the_live_zone_keeps_every_row_the_busy_reading_reads() {
     assert!(
         screens
             .iter()
-            .any(|(n, _)| n == "claude-2.1.283-exit-relaunch-stale-busy.txt")
+            .any(|(n, _)| n.ends_with("/claude-2.1.283-exit-relaunch-stale-busy.txt"))
     );
 }

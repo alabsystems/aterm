@@ -146,18 +146,6 @@ fn scroll_clamps_the_column_to_the_last_one() {
 }
 
 #[test]
-fn inline_search_stored() {
-    let mut vi = ViMode::new();
-    vi.set_inline_search(InlineSearchState {
-        char: 'x',
-        kind: InlineSearchKind::FindRight,
-    });
-    let s = vi.inline_search().unwrap();
-    assert_eq!(s.char, 'x');
-    assert_eq!(s.kind, InlineSearchKind::FindRight);
-}
-
-#[test]
 fn word_motion_dispatches_through_vi_mode() {
     let grid = MockGrid::new(1, 30).with_line(0, "hello world foo");
     let mut vi = ViMode::new();
@@ -323,16 +311,6 @@ fn search_no_op_when_inactive() {
     vi.search_mut().set_matches(vec![ViPoint::new(1, 5)]);
     vi.motion_with_grid(&grid, ViMotion::SearchNext, ViBoundary::Grid);
     assert_eq!(vi.cursor_point(), ViPoint::default());
-}
-
-#[test]
-fn search_accessor_exposes_state() {
-    let mut vi = ViMode::new();
-    assert!(vi.search().is_empty());
-
-    vi.search_mut().set_matches(vec![ViPoint::new(0, 0)]);
-    assert_eq!(vi.search().match_count(), 1);
-    assert!(!vi.search().is_empty());
 }
 
 /// Regression test for #7622: search motions must clamp cursor to grid

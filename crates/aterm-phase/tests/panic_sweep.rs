@@ -31,12 +31,14 @@
 use std::collections::BTreeSet;
 use std::hash::{Hash, Hasher};
 use std::panic::{self, AssertUnwindSafe};
-use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 use std::time::Instant;
 
+use aterm_phase::Program;
 use aterm_phase::prompt::fixtures as fx;
-use aterm_phase::{Program, Reading};
+
+#[path = "common/fixture_files.rs"]
+mod fixture_files;
 
 /// One screen to sweep: where it came from and its rows.
 struct Screen {
@@ -44,57 +46,11 @@ struct Screen {
     rows: Vec<String>,
 }
 
-/// A fixture file's rows: the provenance line (`# …`) dropped, and a saved
-/// waiter capture's `== …` head and `exit=` tail dropped, the way the
-/// crate's own loaders read them.
-fn file_rows(text: &str) -> Vec<String> {
-    let mut r = fx::screen(text);
-    if r.first().is_some_and(|l| l.starts_with("== ")) {
-        r.remove(0);
-    }
-    if r.last().is_some_and(|l| l.starts_with("exit=")) {
-        r.pop();
-    }
-    r
-}
-
-fn dir_screens(dir: &Path, into: &mut Vec<Screen>) {
-    let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
-        .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
-        .map(|e| e.expect("a fixture entry").path())
-        .filter(|p| p.is_file())
-        .collect();
-    paths.sort();
-    assert!(!paths.is_empty(), "{}: no fixtures", dir.display());
-    for p in paths {
-        let text = std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
-        into.push(Screen {
-            name: p
-                .strip_prefix(env!("CARGO_MANIFEST_DIR"))
-                .unwrap_or(&p)
-                .display()
-                .to_string(),
-            rows: file_rows(&text),
-        });
-    }
-}
-
 fn screens() -> Vec<Screen> {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut out = Vec::new();
-    dir_screens(&crate_dir.join("src/fixtures"), &mut out);
-    // The supervisor's saved captures live in a sibling crate: read them when
-    // this crate sits in the aterm workspace, and say so when it does not (a
-    // packaged `aterm-phase` has no sibling, and its own sweep still runs).
-    let agent = crate_dir.join("../aterm-agent/src/supervise/policy/fixtures");
-    if agent.is_dir() {
-        dir_screens(&agent, &mut out);
-    } else {
-        eprintln!(
-            "panic sweep: {} absent (not in the aterm workspace): its captures are not swept",
-            agent.display()
-        );
-    }
+    let mut out: Vec<Screen> = fixture_files::fixture_screens("panic sweep")
+        .into_iter()
+        .map(|(name, rows)| Screen { name, rows })
+        .collect();
     let mut builder = |name: &str, rows: Vec<String>| {
         out.push(Screen {
             name: format!("builder {name}"),
@@ -165,29 +121,21 @@ fn truncated(rows: &[String], width: usize) -> Vec<String> {
 
 /// Every call the sweep makes on one window.
 fn read_all(w: &[String]) {
-    // `read` is a function of its arguments alone, so each reading is taken
-    // once and its box handed to `read_box` from that one reading. The
-    // cursor's column enters a reading only as its `suggestion` (the one
-    // `ScreenReader::read`, which no reader overrides), so a reading that
-    // differs from one already taken only by that column is not taken again
-    // (the reader was 2/3 of the sweep's CPU, Claude Code's 9/10 of that):
-    // * Claude Code's with the cursor at column 2 is the reading without it
-    //   plus `continuation_suggestion(w, 2)`, called with the other columns;
-    // * the screen-identified reading (`read(None, …)`) is `identify`'s
-    //   reader's `read(w, None)`: for Claude Code that is `claude`, for
-    //   Codex `codex` (whose suggestion at column 0 `read` computes too), so
-    //   only the generic reader's is read here.
-    // `the_sweep_reads_each_reading_it_skips_already` holds both, on every
-    // screen at every width.
-    let claude = aterm_phase::read(Some("claude"), w, None);
-    let codex = aterm_phase::read(Some("codex"), w, Some(0));
-    let by_screen = aterm_phase::identify(None, w);
-    let generic = (by_screen.program() == Program::Generic).then(|| by_screen.read(w, None));
+    // `read` is a function of its arguments alone, so each reader reads the
+    // window once and its box is handed to `read_box` from that one reading.
+    // Every reader ([`Program::ALL`], so a new agent's is swept with no edit
+    // here) reads it with the cursor at column 0: the cursor's column enters
+    // a reading only as its `suggestion` (the one `ScreenReader::read`, which
+    // no reader overrides), so that reading is the one without a cursor plus
+    // `continuation_suggestion(w, 0)`, called with the other columns below.
+    // The screen-identified reading (`read(None, …)`) is one of these
+    // readers' (`identify`), so it is not taken again (the readers were 2/3
+    // of the sweep's CPU, Claude Code's 9/10 of that).
     for col in [0, 1, 2, 200] {
         let _ = aterm_phase::continuation_suggestion(w, col);
     }
-    for reading in [Some(claude), generic, Some(codex)].into_iter().flatten() {
-        if let Some(p) = reading.prompt {
+    for program in Program::ALL {
+        if let Some(p) = program.reader().read(w, Some(0)).prompt {
             read_box(&p);
         }
     }
@@ -201,11 +149,6 @@ fn read_all(w: &[String]) {
         .get(aterm_phase::busy_zone_start(w)..)
         .expect("the live zone starts on the screen");
     let _ = aterm_phase::transcript_end(w);
-    let _ = aterm_phase::status_row_stall(w, w);
-    if let Some(rest) = w.get(1..) {
-        let _ = aterm_phase::status_row_stall(rest, w);
-        let _ = aterm_phase::status_row_stall(w, rest);
-    }
     let _ = aterm_phase::phase::composer_draft(w);
     let _ = aterm_phase::phase::composer_rules(w);
     let _ = aterm_phase::phase::composer_index(w);
@@ -213,7 +156,19 @@ fn read_all(w: &[String]) {
     let _ = aterm_phase::phase::last_said_row(w);
     let _ = aterm_phase::limit_notice(w);
     let _ = aterm_phase::interrupted(w);
-    let _ = aterm_phase::status_row_progress(w);
+    // The window's harness card reads the card's place every live frame.
+    let _ = aterm_phase::launch_card(w);
+    if let Some(place) = aterm_phase::launch_card_place(w) {
+        let _ = aterm_phase::launch_card_version(w, &place);
+        // A place read off other rows: the rows above it, cut short.
+        let _ = aterm_phase::launch_card_version(&w[..place.top], &place);
+    }
+    // …and keeps its reading without a scan while the rows it reads hold:
+    // every row changed, and indices past the rows.
+    let (banner, _) = aterm_phase::launch_card_scan(w);
+    let every: Vec<usize> = (0..=w.len()).chain([usize::MAX]).collect();
+    let _ = aterm_phase::launch_card_unmoved(w, banner, &every);
+    let _ = aterm_phase::launch_card_unmoved(w, banner.map(|b| b + 2), &every);
 }
 
 /// Every accessor a caller runs on a parsed box (the presence detail's
@@ -469,47 +424,5 @@ fn the_reader_never_panics_on_any_window_of_any_fixture() {
                 .collect::<Vec<_>>()
                 .join("\n")
         );
-    }
-}
-
-/// What [`read_all`] leaves out is a reading it already took: on every
-/// screen, whole and at every width, Claude Code's reading with the cursor at
-/// column 2 is its reading without one plus `continuation_suggestion(rows, 2)`,
-/// and the screen-identified reading of a screen identified as Claude Code's
-/// or Codex's is that program's reading (Codex's without its suggestion). If
-/// a reader ever reads the cursor anywhere else, this fails, and the sweep
-/// must take those readings again.
-#[test]
-fn the_sweep_reads_each_reading_it_skips_already() {
-    for s in screens() {
-        for width in std::iter::once(None).chain(WIDTHS.iter().copied().map(Some)) {
-            let rows = width.map_or_else(|| s.rows.clone(), |w| truncated(&s.rows, w));
-            let at = || format!("{} @width {width:?}", s.name);
-            let claude = aterm_phase::read(Some("claude"), &rows, None);
-            let codex = aterm_phase::read(Some("codex"), &rows, Some(0));
-            assert_eq!(
-                aterm_phase::read(Some("claude"), &rows, Some(2)),
-                Reading {
-                    suggestion: aterm_phase::continuation_suggestion(&rows, 2),
-                    ..claude.clone()
-                },
-                "{}",
-                at()
-            );
-            let by_screen = aterm_phase::read(None, &rows, None);
-            match by_screen.program {
-                Program::Claude => assert_eq!(by_screen, claude, "{}", at()),
-                Program::Codex => assert_eq!(
-                    by_screen,
-                    Reading {
-                        suggestion: None,
-                        ..codex
-                    },
-                    "{}",
-                    at()
-                ),
-                Program::Generic => {}
-            }
-        }
     }
 }

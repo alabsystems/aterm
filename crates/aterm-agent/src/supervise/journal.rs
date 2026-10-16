@@ -1,13 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `watch --journal FILE` / `supervise --journal FILE`: the loop's own record
-//! of what it decided, one JSON object per line, so `aterm drive ledger` can
-//! replay how the loop ran.
+//! `watch --journal FILE` / `supervise --journal FILE`: the loop's own record of what it
+//! decided, one JSON object per line, which `aterm drive ledger` replays.
 //!
-//! Every line either loop prints is journaled as it is printed (`watch`'s
-//! stdout, `supervise`'s stderr, and for `supervise` the lines `watch` would
-//! have printed for what it decides silently), as
+//! Every line either loop prints is journaled as printed (`watch`'s stdout, `supervise`'s
+//! stderr, and for `supervise` the lines `watch` would have printed for what it decides
+//! silently), as
 //!
 //! ```text
 //! {"t":<unix ms>,"sid":"<sid>"|null,
@@ -20,61 +19,117 @@
 //!  "line":"<the exact line>","turn":<id>|null,"report":<id>|null}
 //! ```
 //!
-//! read from the line itself ([`JournalRecord::of_line`]), so the record and
-//! the line cannot disagree. `turn` is the ledger turn the point's report was
-//! counted from (`watch --report`), else `null`; `report` is the inbox row id
-//! of the worker's report `watch --mail` folded into an `EVENT turn` line
-//! (its `rows=` is that body's row count), else `null`; a `MAIL …` line is
-//! `kind` `mail`, its words the summary. A limit episode's lines:
-//! `EXTEND until=<UTC> reset=<text>` is `extend`; the journal-only `ESCALATED
-//! seq=<n> …` and `CLEARED seq=<n> …` are `escalated` and `cleared`, their
-//! `seq=` read like an EVENT's. The turn-end policy's lines
-//! — `CONTINUED` and `TYPED seq=<n> rule=<id> <text>`, `RESTARTED seq=<n>
-//! rule=<id> <what>` (the host's restart in place, D3/D7), the journal-only
-//! `WAITING seq=<n> until=<UTC> <why>`, `SKIPPED` and `UNVERIFIED seq=<n>
-//! rule=<id> <why>`, `LIMITED seq=<n> handled: <message>` — are their word
-//! lowercased, `phase` the rule id where the line names one; so is the
-//! journal-only `UNPROVEN seq=<n> rule=<id> unproven: <why>` a full-power
-//! press writes after its `APPROVED` (why the safe rules did not prove the
-//! box, `approval_loop`'s module header), and so is the journal-only `DIALOG
-//! seq=<n> rule=<id|-> <rows>` every question decision writes — the
-//! dialog's rows as drawn, joined by ` ⏎ ` (answered under
-//! `answer-recommended@v1`, or `-` escalated), and so is the
-//! journal-only `DECLINED seq=<n> rule=<id> <subject> => <text>` a decline
-//! writes once its Enter landed (a box refused with a reason the worker
-//! reads, never handed to a person: `approval_loop.rs`), and the question
-//! answer's `CHOSE seq=<n> rule=answer-recommended@v1 policy=<word>
-//! <question → answer | …>` (`chose`, said once a dialog the loop's own keys
-//! answered is done), and the point only a person can answer,
-//! `EXCEPTION seq=<n> kind=<word> when=<later|now> <why> => <action>`
-//! (`exception`; its end is `CLEARED seq=<n> exception=<word> after=<s>s
-//! <what cleared it>`, a `cleared`; a reader older than the word shows it as
-//! `other`), and so is the accounts probe's `PROBED seq=<n>
-//! rule=usage-probe@v1 /usage session=<p|?>% week=<p|?>%` (`probed`; printed
-//! where a settled panel was sampled, journal-only as `… /usage no sample
-//! (<word>)` where none was: `turn_end_loop`'s `usage_probe`). A probe the
-//! roster said was due and the loop did NOT run is a `skipped` under that
-//! rule, its summary the gate that shut: `SKIPPED seq=<n>
-//! rule=usage-probe@v1 gate=<word>[ host=<word>]` (printed, once a point:
-//! `turn_end_loop`'s `probe_shut`; the words are the policy's `ProbeGate`).
-//! No new leading word: an earlier build's `PROBE …` is another thing. And
-//! so is a limit reset's `RESET seq=<n> rule=limit-reset@v1 <what>`
-//! (`reset`; `reset_loop`): `confirmed (<the confirmation's head as read>)`
-//! where its Enter was written, then how the step ended — `used (<n> left)`
-//! (printed), `lifted`, `kept (<why>)`, `failed (<why>)`, `unread` (journal
-//! only). A reset passed over at a dialog is a `skipped` under that rule
-//! (`gate=<word>` or `host=<word>`, once a mount), its waits `waiting`. A
-//! journal an earlier build wrote still reads: its `PROBE <sent|deferred>
-//! seq=<n> …` is `probe`, the probe's outcome an EVENT under `resumed`,
-//! `still-limited`, `rebriefed` or `rebrief-failed`. The file is opened
-//! append-only, created `0600` when missing; a failure to open or write it is
-//! said ONCE on stderr and never stops the loop — the journal is a record of
-//! the watch, not a condition of it.
+//! read from the line itself ([`JournalRecord::of_line`]), so record and line cannot disagree.
+//! An `EVENT`'s phase is its second word; a policy line's is its `rule=<id>` where it names
+//! one. `turn` is the ledger turn the point's report was counted from (`watch --report`);
+//! `report` is the inbox row id of the report `watch --mail` folded into an `EVENT turn`
+//! line, whose `rows=` is that body's row count.
+//!
+//! Some lines are journal-only, never printed (`Review::note`): `ESCALATED`, `CLEARED`,
+//! `WAITING`, `UNVERIFIED`, most `SKIPPED`, `UNPROVEN` (after a full-power `APPROVED`: why no
+//! safe rule proved the box), `DIALOG` (a question decision's rows joined by ` ⏎ `),
+//! `DECLINED`, `PROBED … /usage no sample (<word>)`, and every `RESET` but `used (<n> left)`.
+//! A due usage probe not run is the printed `SKIPPED seq=<n> rule=usage-probe@v1
+//! gate=<word>[ host=<word>]` (`ProbeGate`'s words). `PROBE <sent|deferred> seq=<n> …` is an
+//! older build's limit probe, still read as `probe`.
+//!
+//! The file is opened append-only, created `0600` when missing; a failure to open or write it
+//! is said once on stderr and never stops the loop.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use super::screen::Json;
+
+// THE WORDS A READER MATCHES ON. The loop's lines below are written through
+// these consts, and `harness::stats` reads the person's waits back through
+// the same ones, so a line reworded on one side cannot leave the other
+// counting nothing.
+
+/// The line that adopts a badge a previous loop left on the session, at this
+/// loop's start (`lifecycle.rs`'s `reconcile`): `ADOPTED seq=<n>
+/// attention=<text>` — its point still shows, so the badge is this loop's
+/// from here, and no second one goes up for it. A record of kind `other`.
+pub const ADOPTED: &str = "ADOPTED";
+
+/// The badge a `CLEARED seq=<n> box attention=<reply>` line ended: a box's,
+/// a question's or an idle point's the loop escalated (`escalate.rs`'s
+/// `close_box`).
+pub const CLEARED_BOX: &str = "box";
+/// … `CLEARED seq=<n> turn-end attention=<reply>`: the turn-end policy's,
+/// raised with no point to carry it (`/login` typed, a switch's note), gone
+/// once the worker works again.
+pub const CLEARED_TURN_END: &str = "turn-end";
+/// … `CLEARED seq=<n> goal attention=<reply>`: the note that Codex's goal
+/// runs on under a save-then-wait switch.
+pub const CLEARED_GOAL: &str = "goal";
+/// … `CLEARED seq=<n> memory attention=<reply>: …`: the memory measure's,
+/// no longer acted on.
+pub const CLEARED_MEMORY: &str = "memory";
+/// … `CLEARED seq=<n> stale attention=<reply> (…)`: one a previous loop left
+/// whose point is gone, unset at this loop's start.
+pub const CLEARED_STALE: &str = "stale";
+/// … `CLEARED seq=- hidden attention=<reply> (…)`: one a previous loop may
+/// have left under another owner's entry, unset unread at this loop's start
+/// (its `seq=` is `-`: no read was made).
+pub const CLEARED_HIDDEN: &str = "hidden";
+/// Every word a `CLEARED` line names a badge by. A limit episode's names
+/// none: `CLEARED seq=<n> attention=<reply> <why>`.
+pub const CLEARED_BADGES: [&str; 6] = [
+    CLEARED_BOX,
+    CLEARED_TURN_END,
+    CLEARED_GOAL,
+    CLEARED_MEMORY,
+    CLEARED_STALE,
+    CLEARED_HIDDEN,
+];
+
+/// The `<reply>` a badge's `CLEARED` line names where the loop's entry was
+/// NOT taken down: the server keeps one entry per owner, and it now carries
+/// another of this loop's escalations (`escalate.rs`'s `unset_if_ours`) —
+/// the badge it named is over, the loop's still stands.
+pub const ATTENTION_KEPT: &str = "kept";
+
+/// The line a stall's hold writes (`stall.rs`'s `hold_for_stall`): `FROZEN
+/// seq=<n> input=<word> wait_ms=<n> bytes=<n> rss_mb=<n> attention=<reply>
+/// mail=<reply>`. A record of kind `other`. The hold takes the loop's point
+/// badge down (the server's own entry says "frozen" over it), and no
+/// `CLEARED` line follows: its `attention=<reply>` is that unset's —
+/// [`ATTENTION_KEPT`] where the entry carries a limit's badge, which stands,
+/// and [`ATTENTION_SKIPPED`]'s `skipped: …` behind another supervisor, which
+/// touched nothing. Any other reply took the loop's entry down (or found
+/// none).
+pub const FROZEN: &str = "FROZEN";
+
+/// How an `ESCALATED seq=<n> attention=<reply> mail=<reply>` line's tail
+/// begins where NO BADGE went up, with why after it: another supervisor
+/// holds the session ([`ESCALATED_BEHIND`]), or a stall was in hand and the
+/// ask was withheld (`stall.rs`). Nobody was asked by this loop.
+pub const ATTENTION_SKIPPED: &str = "attention=skipped: ";
+/// Why [`ATTENTION_SKIPPED`] behind another supervisor's claim: `… another
+/// supervisor (<holder>) answers this session`.
+pub const ESCALATED_BEHIND: &str = "another supervisor";
+/// The mail word of a limit episode's escalation where a retry hit the wall
+/// again before the worker answered, or the notice an Autopilot Off park
+/// took the badge off is still up after it (`run.rs`'s `open_episode`): the
+/// same episode's badge up again, no second ask — `mail=skipped: the retry
+/// hit the wall again, the episode of seq=<n>`.
+pub const MAIL_RETRY: &str = "skipped: the retry hit the wall again";
+/// The mail word of a limit episode's escalation over a badge adopted from a
+/// previous loop ([`ADOPTED`]): the same ask, set again — `mail=skipped:
+/// adopted from a previous watcher`. Only while the notice it was adopted
+/// for still stands: once the worker answers past it, a limit is a new
+/// episode, mailed.
+pub const MAIL_ADOPTED: &str = "skipped: adopted from a previous watcher";
+/// The mail word of the turn-end policy's badge set again as an Autopilot
+/// Off park ends (`lifecycle.rs`'s `raise_parked_badge`): the badge the park
+/// took down, up again with no second ask of its own — `mail=skipped: set
+/// again after an off park`. Most such badges no point raises again
+/// (`/login`'s, a switch's note, a sandbox fall); one an act's own miss
+/// raised (a text not written or left typed, a draft with no fenced Enter)
+/// may be escalated again after this line, by its act decided afresh and
+/// missing again — its own `ESCALATED` line and ask.
+pub const MAIL_UNPARKED: &str = "skipped: set again after an off park";
 
 /// One journaled line.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,11 +139,11 @@ pub struct JournalRecord {
     /// The session the loop watched (the `@sid` it was given, without the
     /// `@`), `None` when it was given none.
     pub sid: Option<String>,
-    /// `event`, `approved`, `dismissed`, `reconnect`, `timeout`, `exit`,
-    /// `mail`, `extend`, `escalated`, `cleared` or `probe` (`other` for a
-    /// line none of those start).
+    /// The line's leading word lowercased (`RECONNECTED` is `reconnect`), `other` for a word
+    /// the reader does not know.
     pub kind: String,
-    /// The phase the line is about, `-` for none.
+    /// The phase the line is about (an `EVENT`'s second word, `prompt` for an `APPROVED`) or a
+    /// policy line's `rule=` id; `-` for none.
     pub phase: String,
     /// The line's `seq=`.
     pub seq: Option<u64>,
@@ -122,15 +177,7 @@ fn take_num<'s>(s: &'s str, key: &str) -> Option<(u64, &'s str)> {
 }
 
 impl JournalRecord {
-    /// The record of `line`, printed at `t`: its kind, phase, `seq=`,
-    /// `complete=`/`rows=` (or `report=`/`rows=`) and free-text tail, read
-    /// from the words the loop prints (`EVENT <phase> seq=<n> [complete=<0|1>
-    /// rows=<n>] <summary>`, `EVENT turn seq=<n> report=<id> rows=<n>
-    /// <summary>`, `APPROVED seq=<n> <command>`, `DISMISSED survey seq=<n>`,
-    /// `RECONNECT <reason>`, `RECONNECTED after <ms> ms`, `TIMEOUT`, `EXIT
-    /// <reason>`, `MAIL id=<n> …`, `EXTEND until=<UTC> …`, and the limit
-    /// episode's journal-only `ESCALATED seq=<n> …`, `CLEARED seq=<n> …`,
-    /// `PROBE <sent|deferred> seq=<n> …`).
+    /// The record of `line`, printed at `t`, read from the words the loop prints (module doc).
     pub fn of_line(t: i64, sid: Option<&str>, line: &str, turn: Option<u64>) -> Self {
         let mut rec = JournalRecord {
             t,
@@ -273,12 +320,10 @@ impl JournalRecord {
     }
 }
 
-/// `s` as a JSON string, quoted: the control path's one escape
-/// ([`aterm_codec::json::escape_into`]) — `"`, `\` and C0 escaped as RFC 8259
-/// asks, and every other character a terminal acts on (DEL, C1, the bidi
-/// controls, U+2028/9) as `\uXXXX`, since a journal line carries a screen's
-/// rows (`DIALOG`) and a person may read the file raw; everything else
-/// verbatim (UTF-8).
+/// `s` as a quoted JSON string through the control path's one escape
+/// ([`aterm_codec::json::escape_into`]): RFC 8259's escapes, plus every other character a
+/// terminal acts on (DEL, C1, the bidi controls, U+2028/9) as `\uXXXX`, since a journal line
+/// carries a screen's rows (`DIALOG`) and a person may read the file raw.
 pub fn json_str(s: &str) -> String {
     let mut out = String::with_capacity(s.len().saturating_add(2));
     out.push('"');
@@ -356,11 +401,9 @@ impl Journal {
         }
     }
 
-    /// Append one line that is already a JSON object (the approval ledger's
-    /// rows, [`super::approvals`]), under the same open-once, warn-once rule
-    /// as [`Self::record`]. Answers whether the line is on record: `false`
-    /// with no journal, or when the write failed (a full disk) — for a
-    /// caller that must not act on what it could not record (the disk
+    /// Append one line that is already a JSON object (the approval ledger's rows,
+    /// [`super::approvals`]), warning once like [`Self::record`]. `false` with no journal or when
+    /// the write failed, for a caller that must not act on what it could not record (the disk
     /// journal's intent rows).
     pub fn append_raw(&mut self, json: &str, warn: &mut dyn Write) -> bool {
         let res = match self.file.as_mut() {
@@ -507,8 +550,7 @@ mod tests {
                 "session gone (await seq 106 failed: aterm-ctl: ERR exited)"
             )
         );
-        // `watch --mail`'s lines: a delivery, a turn with its report folded
-        // in, and an idle no report came for.
+        // `watch --mail`'s lines: a delivery, a turn with its report folded in, an idle with none.
         let r = rec("MAIL id=5 off=91 from=s-1@n-1 kind=report len=2048 re=88");
         assert_eq!(
             (r.kind.as_str(), r.phase.as_str(), r.seq, r.summary.as_str()),
@@ -572,8 +614,6 @@ mod tests {
             (r.kind.as_str(), r.phase.as_str(), r.seq, r.summary.as_str()),
             ("continued", "usage-resume@v1", Some(102), "keep going")
         );
-        // A full-power press's journal-only line: the rule is the phase,
-        // the reason the summary.
         let r = rec("UNPROVEN seq=12 rule=allow-once@v1 unproven: not read-only: touch");
         assert_eq!(
             (r.kind.as_str(), r.phase.as_str(), r.seq, r.summary.as_str()),
@@ -584,7 +624,6 @@ mod tests {
                 "unproven: not read-only: touch"
             )
         );
-        // The question answer's line, told once a dialog is done.
         let r =
             rec("CHOSE seq=40 rule=answer-recommended@v1 policy=recommended Which colour? → Blue");
         assert_eq!(
@@ -596,10 +635,8 @@ mod tests {
                 "policy=recommended Which colour? → Blue"
             )
         );
-        // The accounts probe's line: the rule is the phase, what was read
-        // (or why nothing was) the summary. NEGATIVE CONTROLS: an earlier
-        // build's `PROBE …` line is still `probe`, its first word the phase;
-        // a word nothing here knows is `other`, its line whole.
+        // The accounts probe's line. Controls: the legacy `PROBE …` is still `probe`; an unknown
+        // word is `other`, its line whole.
         let r = rec("PROBED seq=102 rule=usage-probe@v1 /usage session=1% week=10%");
         assert_eq!(
             (r.kind.as_str(), r.phase.as_str(), r.seq, r.summary.as_str()),
@@ -615,9 +652,8 @@ mod tests {
             (r.kind.as_str(), r.phase.as_str(), r.summary.as_str()),
             ("probed", "usage-probe@v1", "/usage no sample (fold)")
         );
-        // A limit reset's lines: `reset`, the rule its phase, what came of
-        // the step its summary — and a reset passed over is a `skipped`
-        // under that rule. NEGATIVE CONTROL: the lowercase word is `other`.
+        // A limit reset's lines, and a reset passed over as a `skipped`. Control: the lowercase
+        // word is `other`.
         for (line, summary) in [
             (
                 "RESET seq=41 rule=limit-reset@v1 confirmed (Refills your weekly limit now)",
@@ -645,9 +681,7 @@ mod tests {
             ("skipped", "limit-reset@v1", "host=attempted")
         );
         assert_eq!(rec("reset seq=41 rule=limit-reset@v1 unread").kind, "other");
-        // A due probe NOT run: a `skipped` under the probe's rule, the gate
-        // that shut its summary — and, for a claim the host refused, the
-        // host's word after it. Every gate's word reads so.
+        // A due probe not run: the gate that shut it (and the host's word) is the summary.
         let r = rec("SKIPPED seq=102 rule=usage-probe@v1 gate=not-live");
         assert_eq!(
             (r.kind.as_str(), r.phase.as_str(), r.seq, r.summary.as_str()),
@@ -672,9 +706,8 @@ mod tests {
                 "{line}"
             );
         }
-        // NEGATIVE CONTROL: the example's other spelling, `PROBE skipped
-        // gate=…`, would read as an earlier build's limit probe — its kind
-        // `probe`, no rule — which is why the line is not spelled so.
+        // Control: `PROBE skipped gate=…` would read as the legacy limit probe, which is why the
+        // line is spelled `SKIPPED`.
         let r = rec("PROBE skipped gate=not-live");
         assert_eq!(
             (r.kind.as_str(), r.phase.as_str(), r.seq),
@@ -702,7 +735,6 @@ mod tests {
                 "relaunch --model opus"
             )
         );
-        // The approval policy's decline: journal-only, its rule the phase.
         let r = rec("DECLINED seq=105 rule=a-rule@v1 a box => aterm harness (not the user): …");
         assert_eq!(
             (r.kind.as_str(), r.phase.as_str(), r.seq, r.summary.as_str()),
@@ -723,8 +755,7 @@ mod tests {
                 "until=2026-09-19T18:10:00Z overloaded retry 1 of 3"
             )
         );
-        // A question decision's rows: the rule is the phase, the rows
-        // the summary.
+        // A question decision's rows are the summary.
         let r = rec("DIALOG seq=31 rule=answer-recommended@v1 ──── ⏎  ☐ Colors ⏎ ❯ 1. Dark");
         assert_eq!(
             (r.kind.as_str(), r.phase.as_str(), r.seq, r.summary.as_str()),
@@ -740,7 +771,7 @@ mod tests {
             (r.kind.as_str(), r.phase.as_str(), r.summary.as_str()),
             ("skipped", "continue@v1", "not submitted: skipped")
         );
-        // An earlier build's probe lines still read.
+        // The legacy `PROBE` lines still read.
         let r = rec("PROBE sent seq=102");
         assert_eq!(
             (r.kind.as_str(), r.phase.as_str(), r.seq, r.summary.as_str()),
@@ -769,8 +800,7 @@ mod tests {
         }
     }
 
-    /// A point only a person can answer is its own kind, and its end is a
-    /// `cleared`: a reader older than the word shows it as `other`.
+    /// An `EXCEPTION` line is its own kind, and its end a `cleared`.
     #[test]
     fn an_exception_line_is_its_own_kind() {
         let rec = |line: &str| JournalRecord::of_line(1_789_407_079_123, Some("@s-1"), line, None);

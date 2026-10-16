@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-0 for `NativeUpdateHistoryCarry` (2026-09-26): a self-update carries
-//! every history line of a tab, or counts it. The committed machine proves
-//! over its whole bounded space, and each of the four defects its `Buggy`
-//! member stands for is caught on its own path: a fallback that counts
-//! nothing (the silent loss the carry was written to end), a sidecar named
-//! over a history that moved under it, a failed sidecar dropped without a
-//! count, and an import that puts back a history the successor's pane cleared
-//! before it landed. Tier-1 — the real export, park, join, sidecar and import — is
-//! `aterm-gui/src/handoff_history_conformance.rs`.
+//! Tier-0 for `NativeUpdateHistoryCarry`: a self-update carries every history line of a tab, or
+//! counts it. Each `Buggy` defect is caught on its own path: a fallback that counts nothing, a
+//! sidecar named over a history that moved under it, a failed sidecar dropped without a count,
+//! and an import that restores a history the successor's pane cleared first. Tier-1 (the real
+//! export, park, join, sidecar and import): `aterm-gui/src/handoff_history_conformance.rs`.
 
 use crate::walk::walk;
 use aterm_spec::derive::native_update_history_carry_model;
@@ -18,12 +14,6 @@ use aterm_spec::{interp, verify};
 #[test]
 fn the_history_carry_proves_catches_and_has_no_dead_action() {
     let model = native_update_history_carry_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name),
-        "the history carry must stay enrolled in the spec-link registry"
-    );
     let fired = interp::fired_actions(&model);
     assert_eq!(
         fired.len(),

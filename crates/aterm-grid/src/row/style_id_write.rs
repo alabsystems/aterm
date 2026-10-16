@@ -24,7 +24,6 @@ impl Row {
         let cells_len = self.cells.len();
         let old_len = self.len as usize;
 
-        // Single bounds check upfront
         if col_usize >= cells_len {
             return false;
         }
@@ -32,7 +31,7 @@ impl Row {
         // SAFETY: col_usize < cells_len verified above
         let current_flags = unsafe { self.cells.get_unchecked(col_usize) }.flags();
 
-        // Wide character fixup (rare path) - check if either WIDE or WIDE_CONTINUATION is set
+        // Wide fixup only when the cell is either half of a wide pair (rare).
         let wide_mask = CellFlags::WIDE.union(CellFlags::WIDE_CONTINUATION);
         let end_half_blanked = (current_flags.bits() & wide_mask.bits()) != 0
             && self.fixup_wide_char_overwrite(col_usize, current_flags, cells_len);
@@ -63,10 +62,8 @@ impl Row {
         let col_usize = col as usize;
         let old_len = self.len as usize;
 
-        // Need at least 2 cells available - single bounds check
+        // A wide glyph needs two cells; at the edge the write is refused.
         if col_usize + 1 >= cells_len {
-            // Not enough room - write to last column as single-width
-            // (this matches terminal behavior when wide char is at edge)
             return false;
         }
 
@@ -74,14 +71,12 @@ impl Row {
         let first_flags = unsafe { self.cells.get_unchecked(col_usize) }.flags();
         let second_flags = unsafe { self.cells.get_unchecked(col_usize + 1) }.flags();
 
-        // Wide character fixup (rare path)
         let end_half_blanked = (first_flags.contains(CellFlags::WIDE_CONTINUATION)
             || second_flags.contains(CellFlags::WIDE))
             && self.fixup_wide_char_write(col_usize, second_flags, cells_len);
 
-        // SAFETY: bounds already verified
+        // SAFETY: col_usize + 1 < cells_len, verified above.
         unsafe {
-            // Write main cell with WIDE flag
             *self.cells.get_unchecked_mut(col_usize) =
                 Cell::with_style_id(c, style_id, cell_flags.union(CellFlags::WIDE));
             // The continuation carries the lead's rendition; `with_style_id` adds

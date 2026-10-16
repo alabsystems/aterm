@@ -27,8 +27,9 @@ pub enum GlowStyle {
     Sparkle,
     /// Black-body warm comet + rising, drifting embers.
     Fire,
-    /// A monochrome beam in the cursor colour — dim tail brightening to the pure
-    /// hue at the head, with a tight same-hue bloom (no white flash).
+    /// A lightning bolt in storm violet ([`LASER_DEFAULT_COLOR`]) or the pinned
+    /// trail colour — dim tail brightening to the pure hue at the head, with a
+    /// tight same-hue bloom.
     Laser,
     /// Beam: a clean, steady tube of cool light with near-constant power along
     /// its length, no particles, scintillation or lightning. Instead of fading
@@ -40,8 +41,8 @@ pub enum GlowStyle {
     Water,
     /// Comet: an icy dust tail (white-hot at the head, freezing back through the
     /// base hue to a dusty tail) plus twinkling debris glitter shed along the
-    /// swept path. (The raw styles `beam` and `lumen` keep the plain
-    /// [`Self::Lumen`] tracer.)
+    /// swept path. (The raw style `lumen` keeps the plain [`Self::Lumen`]
+    /// tracer.)
     Comet,
     /// The classic wake: a thin four-layer comet under a soft square box-stack
     /// bloom, with a landing ring on a jump, and a comet across screen-crossing
@@ -513,8 +514,7 @@ pub fn style_has_beam(style_raw: &str) -> bool {
 /// [`style_has_beam`] for a caller that already parsed the style (the per-frame
 /// `glow_config` path), avoiding a re-parse while sharing one source of truth.
 /// `style_raw` is taken (currently unused) so a future raw-string distinction
-/// among `comet`/`beam`/`lumen` (all [`GlowStyle::Lumen`]) needs no call-site
-/// changes.
+/// between spellings of one style needs no call-site changes.
 #[must_use]
 pub fn style_has_beam_of(style: GlowStyle, _style_raw: &str) -> bool {
     !matches!(style, GlowStyle::Water | GlowStyle::RainbowKitty)

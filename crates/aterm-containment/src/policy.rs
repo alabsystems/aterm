@@ -2,18 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Containment policy — maps mode to allowed capabilities.
-//!
-//! These functions and the tests below are the specification: the tests
-//! enumerate every mode and every ordered pair of modes.
+//! The containment policy: which capabilities each mode allows.
 
 use crate::capability::{FsCapability, NetworkCapability, ProcessCapability};
 use crate::mode::ContainmentMode;
 
-/// Complete capability set for a containment mode.
-///
-/// This is the output of [`ContainmentPolicy::capabilities`] — the three
-/// capability axes resolved for a given mode.
+/// The three capability axes resolved for one mode ([`ContainmentPolicy::capabilities`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub struct Capabilities {
@@ -25,14 +19,8 @@ pub struct Capabilities {
     pub process: ProcessCapability,
 }
 
-/// The containment policy engine.
-///
-/// Maps each [`ContainmentMode`] to allowed capabilities for each subsystem.
-/// All policy functions are pure (no state) and `const`-evaluable.
-///
-/// The policy is defined once and is immutable — it encodes the security
-/// contract between the launcher and aterm. This Rust implementation IS the
-/// specification, pinned by the tests in this module over all four modes.
+/// The mode → capabilities mapping: pure `const` functions, specified by this module's tests
+/// over every mode and every ordered pair of modes.
 #[derive(Debug, Clone, Copy)]
 pub struct ContainmentPolicy;
 
@@ -48,9 +36,7 @@ impl ContainmentPolicy {
         }
     }
 
-    /// Network capability for mode.
-    ///
-    /// - Master, User, Safety → Full; Containment → None
+    /// Network capability for `mode`.
     #[inline(always)]
     #[must_use]
     pub const fn network(mode: ContainmentMode) -> NetworkCapability {
@@ -62,9 +48,7 @@ impl ContainmentPolicy {
         }
     }
 
-    /// Filesystem capability for mode.
-    ///
-    /// - Master → Full, User → `HomeRW`, Safety → `ProjectRW`, Containment → `TmpOnly`
+    /// Filesystem capability for `mode`.
     #[inline(always)]
     #[must_use]
     pub(crate) const fn fs(mode: ContainmentMode) -> FsCapability {
@@ -76,9 +60,7 @@ impl ContainmentPolicy {
         }
     }
 
-    /// Process capability for mode.
-    ///
-    /// - Master → Full, User → Full, Safety → Restricted, Containment → `NoFork`
+    /// Process capability for `mode`.
     #[inline(always)]
     #[must_use]
     pub const fn process(mode: ContainmentMode) -> ProcessCapability {
@@ -94,8 +76,7 @@ impl ContainmentPolicy {
 mod tests {
     use super::*;
 
-    /// NonEscalation: mode can never increase in capability.
-    /// Verify that for all modes m1 < m2, every capability of m1 <= m2.
+    /// For every pair of modes, the lower never holds more of any capability.
     #[test]
     fn test_monotonic_capabilities() {
         let modes = [
@@ -121,24 +102,8 @@ mod tests {
         }
     }
 
-    /// Exhaustive numeric cross-check against the policy table: encodes the
-    /// intended discriminants as raw u8 constants and verifies each policy
-    /// function returns the matching capability, catching any drift between the
-    /// documented encoding and the implementation.
-    ///
-    /// | Mode        | Net       | Fs        | Proc      |
-    /// |-------------|-----------|-----------|-----------|
-    /// | Master(3)   | Full(1)   | Full(3)   | Full(2)   |
-    /// | User(2)     | Full(1)   | HomeRW(2) | Full(2)   |
-    /// | Safety(1)   | Full(1)   | ProjRW(1) | Restr(1)  |
-    /// | Contain(0)  | None(0)   | TmpOnly(0)| NoFork(0) |
-    ///
-    /// Safety narrows nothing on the network: no level promises filtering
-    /// that nothing does.
-    ///
-    ///   Network: None=0, Full=1
-    ///   Fs:      TmpOnly=0, ProjectRW=1, HomeRW=2, Full=3
-    ///   Process: NoFork=0, Restricted=1, Full=2
+    /// The policy table as raw discriminants, so a drift in the encoding or the mapping fails.
+    /// Safety narrows nothing on the network: no level promises filtering that nothing does.
     #[test]
     fn test_numeric_policy_table() {
         // [mode_level] -> (net, fs, proc)

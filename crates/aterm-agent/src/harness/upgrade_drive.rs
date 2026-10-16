@@ -70,6 +70,7 @@ pub(super) use upgrade_status::{last_command, wait_words_of};
 
 #[path = "upgrade_codex_drive.rs"]
 mod codex;
+pub(super) use codex::carry_in_flight as codex_carry_in_flight;
 
 #[path = "upgrade_watch.rs"]
 mod watch;
@@ -83,12 +84,12 @@ pub(crate) use upgrade_status::pin_awake_since;
 pub use upgrade_status::progress_projection;
 pub(super) use upgrade_status::runs_under;
 pub use upgrade_status::{
-    ATTENTION_OWNER, Ask, Attention, CLAIMED, DIGEST_AFTER_S, HUNG_EXIT_AFTER_S, HeldBy,
-    LIMIT_GRACE_S, Level, MOVE_BUDGET_S, NEED_THEN_MAX, NEED_WHY_MAX, NOT_FOREGROUND, NOW_QUIETS_S,
-    Need, NeedSeverity, REFUSED_STOPPED, Remedy, Row, STALLED_AFTER_S, SUSPENDED_AFTER_S, TELL_S,
-    UNWATCHED_AFTER_S, View, WAKE_CATCH_UP_S, WAKE_GRACE_S, ask, ask_for, awake_since,
-    elapsed_words, refusal_sentence, refused_stopped, rows, status_rows, system_awake_since,
-    unwatched_since, word_marker,
+    ATTENTION_OWNER, AUTOPILOT_OFF, Aside, Ask, Attention, CLAIMED, DIGEST_AFTER_S,
+    HUNG_EXIT_AFTER_S, HeldBy, LIMIT_GRACE_S, Level, MOVE_BUDGET_S, NEED_THEN_MAX, NEED_WHY_MAX,
+    NOT_FOREGROUND, NOW_QUIETS_S, Need, NeedSeverity, REFUSED_STOPPED, Remedy, Row,
+    STALLED_AFTER_S, SUSPENDED_AFTER_S, TELL_S, UNWATCHED_AFTER_S, View, WAKE_CATCH_UP_S,
+    WAKE_GRACE_S, ask, ask_for, awake_since, elapsed_words, refusal_sentence, refused_stopped,
+    rows, status_rows, system_awake_since, unwatched_since, word_marker,
 };
 pub use watch::{Watched, Watcher, watch};
 #[cfg(all(test, unix))]
@@ -499,7 +500,7 @@ pub fn ladder_projection(f: &Facts) -> std::collections::BTreeMap<&'static str, 
     aterm_spec::spec_unmodeled(
         machine = "HarnessUpgradeProgress",
         action = "WatchTypes",
-        reason = "Buggy=1 negative control only; the watch with hands, which `tools/grep_guard.sh` H1 fences lexically and the Tier-1 watch tests refuse at the control socket (zero input requests)."
+        reason = "Buggy=1 negative control only; the watch with hands, which the aterm-census guard `watch-hands` fences lexically and the Tier-1 watch tests refuse at the control socket (zero input requests)."
     )
 )]
 #[cfg_attr(
@@ -792,10 +793,26 @@ pub struct Opts {
     /// a model is judged by the build's own catalog alone. `false` — one
     /// login, the packaged state — reads them as ever.
     pub several_logins: bool,
+    /// `[harness] usage_tap` (`crate::supervise::SupervisorConfig::usage_tap`)
+    /// is on: the aterm a tap's status-line command names
+    /// ([`super::tap::stable_exe`]) and the login of the machine's one
+    /// account ([`super::tap::Armed`]). Every Claude Code relaunch line this
+    /// pass types carries the tap where its gate holds
+    /// ([`super::relaunch::plan`], [`super::tap::gate`]). `None` — the
+    /// packaged state — carries none, byte for byte the line as before.
+    pub usage_tap: Option<super::tap::Armed>,
     /// Where a pass with no roster of its own learns the live tabs
     /// ([`Instances`], [`instance_tabs`]): the machine's for the product, a
     /// test's own stand-ins in a test.
     pub instances: Instances,
+    /// The agents whose own switch is off (`[harness.<agent>] enabled =
+    /// false`, `crate::supervise::SupervisorConfig::off`): a pass leaves
+    /// their lanes alone ([`lanes`]), their restarts in flight are none of
+    /// its own ([`in_flight`]) and their tabs are never due ([`due`]). The
+    /// CLI's sweep and the window's host (each step, and the carry after an
+    /// update) fill it from the config; empty — the packaged state — takes
+    /// every lane.
+    pub agents_off: Vec<aterm_phase::Program>,
 }
 
 /// WHERE A PASS WITH NO ROSTER OF ITS OWN (the CLI's sweep) LEARNS THE LIVE
@@ -835,9 +852,11 @@ fn model_evidence(opts: &Opts, records: &Records) -> models::Evidence {
 /// directory alone: `~/.claude.json` BESIDE the user's own
 /// `user_home/.claude`, and `<dir>/.claude.json` INSIDE any other home a
 /// `CLAUDE_CONFIG_DIR=<dir>` names (measured 2026-10-09,
-/// `super::relaunch`'s module docs). An EMPTY `CLAUDE_CONFIG_DIR` keeps its
-/// records in a directory whose profile is `$HOME`'s: a reader that knows the
-/// home's raw value asks [`profile_apart`] ([`Records::profile`]).
+/// `super::relaunch`'s module docs). Two raw values say otherwise: an EMPTY
+/// `CLAUDE_CONFIG_DIR` keeps its records in a directory whose profile is
+/// `$HOME`'s, and one that names `~/.claude` itself keeps the profile inside
+/// it. A reader that knows the home's raw value asks [`profile_apart`]
+/// ([`Records::profile`]).
 fn claude_profile(user_home: &Path, claude_dir: &Path) -> PathBuf {
     if claude_dir == user_home.join(".claude") {
         user_home.join(".claude.json")
@@ -1165,6 +1184,16 @@ pub(super) trait Kernel {
     fn parent(&self, pid: u32) -> Option<u32>;
     /// The program that opened `pid`'s terminal ([`terminal_owner`]).
     fn terminal(&self, pid: u32) -> Option<(u32, String)>;
+    /// The process's start, read again at each restart fence. `None` is
+    /// uncertainty and never establishes that the process is still the same.
+    fn process_start(&self, pid: u32) -> Option<String> {
+        kernel_start(pid)
+    }
+    /// Work still running under the process at the restart's last look. An
+    /// unreadable table remains work, as in [`live_background`].
+    fn restart_background(&self, pid: u32) -> Vec<String> {
+        live_background(pid)
+    }
     /// Whether `shell` has its terminal back (a job-control shell leading its
     /// own process group, which is the terminal's foreground); `None` when it
     /// cannot be read now. The default reads the kernel, as [`Live`] does.
@@ -1385,7 +1414,7 @@ pub(super) fn gave_up_words(agent: upgrade::Agent, held: &[upgrade::Held], quiet
 
 /// When `pid` started, unix milliseconds (to the second: `ps`'s elapsed
 /// time), while it runs.
-pub(super) fn started_ms(pid: u32) -> Option<u64> {
+pub(crate) fn started_ms(pid: u32) -> Option<u64> {
     let etime = ps(&["-o", "etime=", "-p", &pid.to_string()])?;
     let age_s = parse_etime(etime.trim())?;
     let now_ms = u64::try_from(aterm_time::since_epoch()?.as_millis()).ok()?;
@@ -1569,6 +1598,20 @@ pub(super) fn native_root(home: &Path) -> PathBuf {
     home.join(".local/share/claude/versions")
 }
 
+/// atpkg's twin of `program` (`<prefix>/agents/<program>`), the managed build
+/// a session may be moved onto — unless `program` is dev-linked
+/// (`aterm pkg link`) and its twin names the developer's checkout rather than
+/// a STORE build: no session is moved onto, or ordered against, a checkout's
+/// build. An unlinked program's twin is the managed one, whatever it holds.
+fn managed_twin(layout: &atpkg::store::Layout, program: &str) -> Option<PathBuf> {
+    let twin = layout.agents_dir().join(program);
+    if !atpkg::linkmode::is_linked(layout, program) {
+        return Some(twin);
+    }
+    let exe = super::upgrade_catalog::twin_binary(&std::fs::read_to_string(&twin).ok()?)?;
+    exe.starts_with(layout.prefix.join("store")).then_some(twin)
+}
+
 /// The builds a session could move to, read once per sweep.
 pub(super) struct Targets {
     /// aterm's managed twin (`<prefix>/agents/claude`).
@@ -1585,7 +1628,7 @@ pub(super) struct Targets {
 impl Targets {
     pub(super) fn read(home: &Path) -> Targets {
         Targets::read_with(
-            atpkg::store::resolve_configured().map(|layout| layout.agents_dir().join("claude")),
+            atpkg::store::resolve_configured().and_then(|layout| managed_twin(&layout, "claude")),
             home,
             cached_version,
         )
@@ -1751,7 +1794,7 @@ pub(super) fn roster(c: &mut Client) -> Vec<String> {
     let Ok((head, body)) = c.request_counted("sessions") else {
         return Vec::new();
     };
-    if !head.starts_with("OK") {
+    if !crate::is_ok_reply(&head) {
         return Vec::new();
     }
     body.lines()
@@ -1763,47 +1806,77 @@ pub(super) fn roster(c: &mut Client) -> Vec<String> {
         .collect()
 }
 
-/// The tabs another supervisor's claim holds, from one `sessions` read: each
-/// row's live claim `supervisor=<holder|->` naming a holder other than a
-/// window's own host ([`HOST_HOLDER`]; a predecessor's carried claim lapses
-/// by itself). For `--status` ([`status_rows`]), which reads from outside the
-/// window. Bounded by [`CLAIMS_WAIT`]; `None` for no roster.
-pub(super) fn foreign_claims(c: &mut Client) -> Option<std::collections::BTreeSet<String>> {
+/// The tabs set aside from a window's host by a hand it does not hold, from
+/// one `sessions` read ([`Aside`]): another supervisor's — each row's live
+/// claim `supervisor=<holder|->` naming a holder other than a window's own
+/// host ([`HOST_HOLDER`]; a predecessor's carried claim lapses by itself) —
+/// and the owner's: each row whose agent its own switch holds off (its
+/// `program=` one of `agents_off`, `[harness.<agent>] enabled = false`), and
+/// each row whose effective Autopilot is Off (`autopilot=off`; the review of
+/// a295792e4) — a switched-off agent's row reads both, and the switch ranks
+/// first ([`Aside::agent_off`]). For `--status` ([`status_rows`]), which
+/// reads from outside the window. Bounded by [`CLAIMS_WAIT`]; `None` for no
+/// roster.
+pub(super) fn roster_aside(c: &mut Client, agents_off: &[aterm_phase::Program]) -> Option<Aside> {
     c.transport().set_read_timeout(Some(CLAIMS_WAIT)).ok()?;
     let (head, body) = c.request_counted("sessions").ok()?;
-    if !head.starts_with("OK") {
+    if !crate::is_ok_reply(&head) {
         return None;
     }
-    Some(
-        body.lines()
-            .filter_map(|row| {
-                let mut words = row.split_whitespace();
-                let sid = words.nth(1).filter(|s| s.starts_with("s-"))?;
-                // Past the parent, the state and the title, every column is
-                // `key=value`: a title never reads as the claim.
-                let holder = words.skip(3).find_map(|w| w.strip_prefix("supervisor="))?;
-                (holder != "-" && !is_host_holder(&aterm_codec::pct::decode(holder)))
-                    .then(|| sid.to_string())
-            })
-            .collect(),
-    )
+    let mut aside = Aside::default();
+    for row in body.lines() {
+        let mut words = row.split_whitespace();
+        let Some(sid) = words.nth(1).filter(|s| s.starts_with("s-")) else {
+            continue;
+        };
+        // Past the parent, the state and the title, every column is
+        // `key=value`: a title never reads as the claim. Each key's first.
+        let (mut holder, mut autopilot, mut program) = (None, None, None);
+        for word in words.skip(3) {
+            if let Some(h) = word.strip_prefix("supervisor=") {
+                holder = holder.or(Some(h));
+            } else if let Some(a) = word.strip_prefix("autopilot=") {
+                autopilot = autopilot.or(Some(a));
+            } else if let Some(p) = word.strip_prefix("program=") {
+                program = program.or(Some(p));
+            }
+        }
+        if program
+            .and_then(aterm_phase::program_of)
+            .is_some_and(|p| agents_off.contains(&p))
+        {
+            aside.agent_off.insert(sid.to_string());
+        }
+        if holder.is_some_and(|h| h != "-" && !is_host_holder(&aterm_codec::pct::decode(h))) {
+            aside.claimed.insert(sid.to_string());
+        }
+        if autopilot == Some("off") {
+            aside.off.insert(sid.to_string());
+        }
+    }
+    Some(aside)
 }
 
-/// THE CLAIMS OF EVERY INSTANCE `clients` reach, as one set
-/// ([`foreign_claims`] of each, unioned; tab ids are unique across
-/// instances): an instance that answers no roster adds nothing and holds no
-/// other back. `--status`'s view of a machine running several aterms.
-pub(super) fn claims_of(
+/// THE ASIDE OF EVERY INSTANCE `clients` reach, as one ([`roster_aside`] of
+/// each, unioned; tab ids are unique across instances): an instance that
+/// answers no roster adds nothing and holds no other back. `--status`'s view
+/// of a machine running several aterms.
+pub(super) fn aside_of(
     clients: impl IntoIterator<Item = Client>,
-) -> std::collections::BTreeSet<String> {
+    agents_off: &[aterm_phase::Program],
+) -> Aside {
     clients
         .into_iter()
-        .filter_map(|mut c| foreign_claims(&mut c))
-        .flatten()
-        .collect()
+        .filter_map(|mut c| roster_aside(&mut c, agents_off))
+        .fold(Aside::default(), |mut all, one| {
+            all.claimed.extend(one.claimed);
+            all.off.extend(one.off);
+            all.agent_off.extend(one.agent_off);
+            all
+        })
 }
 
-/// How long [`foreign_claims`] waits for the roster: the 2 s a discovery
+/// How long [`roster_aside`] waits for the roster: the 2 s a discovery
 /// client gives a peer (`aterm ctl ls`), four times the instance's own
 /// bound on the one hop its `sessions` reply takes.
 const CLAIMS_WAIT: Duration = Duration::from_secs(2);
@@ -1826,7 +1899,7 @@ pub(super) fn host_roster(c: &mut Client) -> Option<Vec<LiveTab>> {
 }
 
 fn parse_host_roster(head: &str, body: &str) -> Option<Vec<LiveTab>> {
-    if !head.starts_with("OK") {
+    if !crate::is_ok_reply(head) {
         return None;
     }
     Some(roster_rows(body)?.into_iter().map(|(_, tab)| tab).collect())
@@ -1929,7 +2002,7 @@ fn screen_tail(c: &mut Client, sid: &str) -> Option<Screen> {
 
 fn screen_query(c: &mut Client, request: &str) -> Option<Screen> {
     let (head, body) = c.request_counted(request).ok()?;
-    if !head.starts_with("OK") {
+    if !crate::is_ok_reply(&head) {
         return None;
     }
     parse_screen(if body.trim().is_empty() {
@@ -2054,7 +2127,7 @@ pub(super) fn compact(s: &str) -> String {
 /// it, [`server_fences_gen`]).
 pub(super) fn key_takes_gen(c: &mut Client) -> bool {
     c.request_counted("help key")
-        .is_ok_and(|(head, body)| head.starts_with("OK") && server_fences_gen(&body))
+        .is_ok_and(|(head, body)| crate::is_ok_reply(&head) && server_fences_gen(&body))
 }
 
 /// What stands of what the Claude lane left typed: a notice or release the
@@ -2105,15 +2178,20 @@ pub(super) fn left_standing(c: &mut Client, tab: &str, text: &str) -> Left {
 /// sends or clears them.
 fn left_cut(st: &mut St, c: &mut Client, tab: &str, text: &str) {
     st.left_typed = text.to_string();
-    let _ = settle_left(st, c, tab);
+    let _ = settle_left(st, c, tab, left_standing);
 }
 
-/// One read of what stands of [`St::left_typed`] in Claude Code's prompt
-/// ([`left_standing`], which presses nothing): the record goes once the text
-/// is gone — a person sent or cleared it.
-fn settle_left(st: &mut St, c: &mut Client, tab: &str) -> Left {
-    let text = st.left_typed.clone();
-    let left = left_standing(c, tab, &text);
+/// One read of what stands of [`St::left_typed`] by the lane's `standing`
+/// (Claude Code's prompt, [`left_standing`], or Codex's composer; each
+/// presses nothing): the record goes once the text is gone — a person sent
+/// or cleared it.
+fn settle_left(
+    st: &mut St,
+    c: &mut Client,
+    tab: &str,
+    standing: fn(&mut Client, &str, &str) -> Left,
+) -> Left {
+    let left = standing(c, tab, &st.left_typed);
     if left == Left::Gone {
         st.left_typed.clear();
     }
@@ -2136,7 +2214,7 @@ fn left_first(
     if st.left_typed.is_empty() {
         return None;
     }
-    let r = match settle_left(st, c, tab) {
+    let r = match settle_left(st, c, tab, left_standing) {
         Left::Gone => return None,
         Left::Kept(why) => said(r.clone(), format!("wait:left-typed:{why}")),
     };
@@ -2160,13 +2238,27 @@ pub(super) fn status_line(c: &mut Client, sid: &str) -> Option<String> {
     c.request_line(&format!("@{sid} status")).ok()
 }
 
+/// What [`step`] answers for a tab whose agent supervises itself under a
+/// PROVEN self-claim ([`self_claimed_by_status`]): no upgrade decision of
+/// aterm's is taken there (the native harness contract §7).
+pub const SKIP_SELF_CLAIMED: &str = "skip:self-claimed";
+
+/// Whether one `status` reply shows a PROVEN self-claim on the tab
+/// (`supervisor_proven=1`): its agent supervises itself, and aterm takes no
+/// upgrade decision there ([`due`], [`step`]). An older server prints no
+/// such field, and nothing reads as one.
+#[must_use]
+pub(super) fn self_claimed_by_status(line: &str) -> bool {
+    crate::is_ok_reply(line) && line.split_whitespace().any(|t| t == "supervisor_proven=1")
+}
+
 /// [`held`] over one `status` reply; anything but `OK` reads as held. Its
 /// halt and hands are [`super::relaunch::hand_on_tab`]'s — the one list the
 /// host carries an asked exit through (ruling 20 of 2026-10-14). A
 /// `human_ms=` under the grace is a person at the keyboard, who wins; `-` or
 /// no field (an older server) is nobody.
 pub(super) fn held_by_status(line: &str, grace_s: u32) -> bool {
-    !line.starts_with("OK")
+    !crate::is_ok_reply(line)
         || super::relaunch::hand_on_tab(line)
         || line.split_whitespace().any(|t| {
             t.strip_prefix("input=")
@@ -2203,7 +2295,7 @@ const HAND_RENEW: Duration = Duration::from_secs(20);
 /// The holder name of this process's hand ([`Hand`]): the name its supervisor
 /// loops claim sessions under, spelled the same as the window's host
 /// (`aterm-gui`'s `harness_host::holder`), by whose [`HOST_HOLDER`] `--status`
-/// tells a window's own claim from another supervisor's ([`foreign_claims`]).
+/// tells a window's own claim from another supervisor's ([`roster_aside`]).
 #[must_use]
 pub fn hand_name() -> String {
     format!("{HOST_HOLDER}{}", std::process::id())
@@ -2215,7 +2307,7 @@ const HOST_HOLDER: &str = "aterm-harness@";
 /// Whether a claim's holder (percent-decoded) is a window's own host —
 /// this one's or a predecessor's, whose carried claim names a process that
 /// is gone and lapses by itself ([`HOST_HOLDER`]) — and so no other
-/// supervisor's. The one spelling `--status` ([`foreign_claims`]) and the
+/// supervisor's. The one spelling `--status` ([`roster_aside`]) and the
 /// window's host (`aterm-gui`'s `harness_host::claimed_by_another`) read a
 /// `supervisor=` by.
 #[must_use]
@@ -2307,10 +2399,8 @@ impl Hand {
 /// presence layer (ruling 313: aterm's own hand never shows a row), and
 /// what [`type_fenced`] does for the Claude lane's notice and release; the
 /// Codex lane's notice, goal keys and continuation, and the Claude
-/// continuation a later visit finds owed, go through it too
-/// (`every_typed_act_in_the_harness_is_under_a_hand` fails the build for a
-/// typed act that does not). `act` runs its own fence read and its `turn`
-/// with nothing of aterm's between them.
+/// continuation a later visit finds owed, go through it too. `act` runs its
+/// own fence read and its `turn` with nothing of aterm's between them.
 pub(super) fn under_hand<T>(
     c: &mut Client,
     tab: &str,
@@ -2373,7 +2463,7 @@ pub(super) fn type_line(c: &mut Client, sid: &str, line: &str) -> Result<(), Str
         format!("@{sid} key enter"),
     ] {
         let reply = c.request_line(&request).map_err(|e| format!("{e}"))?;
-        if !reply.starts_with("OK") {
+        if !crate::is_ok_reply(&reply) {
             return Err(reply);
         }
     }
@@ -2442,7 +2532,7 @@ pub(super) fn turn(c: &mut Client, sid: &str, text: &str) -> Result<(), String> 
 /// nothing is asked between the read and the paste.
 fn turn_takes_gen(c: &mut Client) -> bool {
     c.help_counted("turn")
-        .is_ok_and(|(head, body)| head.starts_with("OK") && (head + &body).contains("if-gen="))
+        .is_ok_and(|(head, body)| crate::is_ok_reply(&head) && (head + &body).contains("if-gen="))
 }
 
 /// Whether the host's `turn` takes `cap=<n>` (per `help turn`): room to press
@@ -2450,7 +2540,7 @@ fn turn_takes_gen(c: &mut Client) -> bool {
 /// is never sent unprobed; the answer is kept with the rest of the help.
 fn turn_takes_cap(c: &mut Client) -> bool {
     c.help_counted("turn")
-        .is_ok_and(|(head, body)| head.starts_with("OK") && (head + &body).contains("cap=<n>"))
+        .is_ok_and(|(head, body)| crate::is_ok_reply(&head) && (head + &body).contains("cap=<n>"))
 }
 
 /// HOW A NOTICE IS PUT IN FRONT OF THE AGENT: pressed one key at a time, not
@@ -2535,14 +2625,14 @@ pub(super) enum Put {
 /// it); the answer is kept with the rest of the help.
 fn turn_takes_guard(c: &mut Client) -> bool {
     c.help_counted("turn")
-        .is_ok_and(|(head, body)| head.starts_with("OK") && (head + &body).contains("guarded:"))
+        .is_ok_and(|(head, body)| crate::is_ok_reply(&head) && (head + &body).contains("guarded:"))
 }
 
 /// Whether the host's `turn` takes the narrow `if-rows=` fence (per `help
 /// turn`). The same kept answer [`turn_takes_gen`] asks.
 fn turn_takes_rows(c: &mut Client) -> bool {
     c.help_counted("turn")
-        .is_ok_and(|(head, body)| head.starts_with("OK") && (head + &body).contains("if-rows="))
+        .is_ok_and(|(head, body)| crate::is_ok_reply(&head) && (head + &body).contains("if-rows="))
 }
 
 /// The checked type: one turn into the tab, parked first on a person's typing
@@ -2637,7 +2727,7 @@ fn turn_verdict(head: &str) -> Result<(), Typed> {
     if head.starts_with("ERR yield timeout") {
         return Err(Typed::Yielded);
     }
-    if !head.starts_with("OK") {
+    if !crate::is_ok_reply(head) {
         return Err(Typed::Refused(head.to_string()));
     }
     let words: Vec<&str> = head.split_whitespace().collect();
@@ -2952,12 +3042,125 @@ fn agent_settings(
     Some(models::model_settings_of(&Value::Object(said_below)))
 }
 
+/// THE SETTINGS CHAIN THE USAGE TAP'S GATE READS (`super::tap::gate`) for a
+/// Claude Code relaunched from `argv` (`argv[0]` first) in `cwd`: every
+/// document Claude Code reads for it
+/// ([`crate::supervise::policy::claude_settings::sources_under`], fenced at
+/// [`Opts::home`]: one inside a file-provider domain is reported, never
+/// opened) and its managed preference domains
+/// ([`crate::supervise::policy::claude_settings::managed_preferences`],
+/// reported, never opened). Read over the flags the line CARRIES (aterm's
+/// own tap shed: [`upgrade::rewrite_argv`]), as the process the line starts
+/// reads them, with the default home ([`Opts::home`]'s `.claude`: the gate
+/// takes no other) and BOTH user documents, `settings.json` and
+/// `cowork_settings.json`, since the variable that picks one is the
+/// process's and the line does not carry it — a superset, which can only
+/// refuse. A launch whose flags cannot be carried reads nothing: no line is
+/// made for it.
+pub(super) fn tap_settings(
+    opts: &Opts,
+    argv: &[String],
+    cwd: &str,
+) -> Vec<(String, super::netwatch::Source)> {
+    use crate::supervise::policy::claude_settings;
+    use crate::supervise::policy::git_config::WorkerEnv;
+    let Ok(mut flags) = upgrade::rewrite_argv(argv, "-") else {
+        return Vec::new();
+    };
+    flags.truncate(flags.len().saturating_sub(2));
+    let carried: Vec<String> = argv.first().cloned().into_iter().chain(flags).collect();
+    let account = ["USER", "LOGNAME"].iter().filter_map(|key| {
+        std::env::var(key)
+            .ok()
+            .map(|value| format!("{key}={value}"))
+    });
+    let worker = |cowork: bool| {
+        let env = [format!("HOME={}", opts.home.display())]
+            .into_iter()
+            .chain(account.clone())
+            .chain(cowork.then(|| "CLAUDE_CODE_USE_COWORK_PLUGINS=1".to_string()))
+            .collect();
+        WorkerEnv::new(atpkg::caller_shell::ProcArgs {
+            argv: carried.clone(),
+            env,
+            ..Default::default()
+        })
+    };
+    let managed = managed_settings_dir();
+    let mut out: Vec<(String, super::netwatch::Source)> = Vec::new();
+    for cowork in [false, true] {
+        let worker = worker(cowork);
+        let sources = claude_settings::sources_under(
+            &worker,
+            Path::new(cwd),
+            managed.as_deref(),
+            Some(&opts.home),
+        )
+        .into_iter()
+        .chain(
+            managed_preferences_dir()
+                .map(|dir| claude_settings::managed_preferences(&worker, &dir))
+                .unwrap_or_default(),
+        );
+        for source in sources {
+            if !out.iter().any(|(name, _)| *name == source.name) {
+                out.push((source.name, source.text.into()));
+            }
+        }
+    }
+    out
+}
+
+/// WHETHER THE VENDOR'S PROFILE STORE HOLDS A CONFIG for a Claude Code in
+/// the default home under [`Opts::home`] (`super::accounts::profile_configs_dir`,
+/// `super::accounts::profile_configured`: one listing, names only): the
+/// usage tap's gate refuses a session the vendor may authenticate by a
+/// profile. Asked at `$HOME/.config/anthropic` and, where this process has
+/// one, at `$XDG_CONFIG_HOME/anthropic` too: the relaunched process inherits
+/// its shell's, which this cannot read — the superset, which can only refuse.
+pub(super) fn tap_profile_store(opts: &Opts) -> bool {
+    use super::accounts::{profile_configs_dir, profile_configured};
+    let home = opts.home.display().to_string();
+    let by_home = profile_configs_dir([("HOME", home.as_str())]);
+    let by_xdg = host_xdg_config_home()
+        .and_then(|xdg| profile_configs_dir([("XDG_CONFIG_HOME", xdg.as_str())]));
+    by_home
+        .into_iter()
+        .chain(by_xdg)
+        .any(|configs| profile_configured(&configs))
+}
+
+/// This process's `XDG_CONFIG_HOME`, where it has one ([`tap_profile_store`]).
+#[cfg(not(test))]
+fn host_xdg_config_home() -> Option<String> {
+    std::env::var("XDG_CONFIG_HOME")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+}
+
+/// [`host_xdg_config_home`] in a test: none — the machine's own is never a
+/// test's.
+#[cfg(test)]
+fn host_xdg_config_home() -> Option<String> {
+    None
+}
+
 /// Claude Code's managed settings directory the model rule reads
-/// ([`agent_settings`]): this platform's
-/// ([`crate::supervise::policy::claude_settings::MANAGED_DIR`]).
+/// ([`agent_settings`]) and the usage tap's gate ([`tap_settings`]): this
+/// platform's ([`crate::supervise::policy::claude_settings::MANAGED_DIR`]).
 #[cfg(not(test))]
 fn managed_settings_dir() -> Option<PathBuf> {
     crate::supervise::policy::claude_settings::MANAGED_DIR.map(PathBuf::from)
+}
+
+/// The managed preference domains' directory the usage tap's gate looks in
+/// ([`tap_settings`]): this platform's
+/// ([`crate::supervise::policy::claude_settings::MANAGED_PREFERENCES_DIR`]).
+#[cfg(not(test))]
+fn managed_preferences_dir() -> Option<PathBuf> {
+    Some(PathBuf::from(
+        crate::supervise::policy::claude_settings::MANAGED_PREFERENCES_DIR,
+    ))
 }
 
 #[cfg(test)]
@@ -2966,12 +3169,22 @@ thread_local! {
     /// unless the test names one): the machine's own is never a test's.
     pub(super) static MANAGED_SETTINGS: std::cell::RefCell<Option<PathBuf>> =
         const { std::cell::RefCell::new(None) };
+    /// The managed preferences directory a test's tap gate looks in (none
+    /// unless the test names one).
+    pub(super) static MANAGED_PREFERENCES: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// [`managed_settings_dir`] in a test: the one it named on this thread.
 #[cfg(test)]
 fn managed_settings_dir() -> Option<PathBuf> {
     MANAGED_SETTINGS.with(|dir| dir.borrow().clone())
+}
+
+/// [`managed_preferences_dir`] in a test: the one it named on this thread.
+#[cfg(test)]
+fn managed_preferences_dir() -> Option<PathBuf> {
+    MANAGED_PREFERENCES.with(|dir| dir.borrow().clone())
 }
 
 fn model_record_path(opts: &Opts, session: &str) -> PathBuf {
@@ -3499,13 +3712,13 @@ pub(super) enum Terminated {
 /// form sent, or the kernel asked directly.
 pub(super) fn terminate(c: &mut Client, tab: &str, pid: i32, grace_s: u32) -> Terminated {
     match c.request_line(&format!("@{tab} signal term pid={pid} quiet={grace_s}")) {
-        Ok(reply) if reply.starts_with("OK") => Terminated::Sent,
+        Ok(reply) if crate::is_ok_reply(&reply) => Terminated::Sent,
         Ok(reply) if reply.starts_with("ERR bad signal argument: quiet=") => {
             if held(c, tab, grace_s) {
                 return Terminated::Refused("held".to_string());
             }
             match c.request_line(&format!("@{tab} signal term pid={pid}")) {
-                Ok(reply) if reply.starts_with("OK") => Terminated::Sent,
+                Ok(reply) if crate::is_ok_reply(&reply) => Terminated::Sent,
                 Ok(reply) if reply.starts_with("ERR halted") => {
                     Terminated::Refused("held".to_string())
                 }
@@ -3714,16 +3927,24 @@ pub(super) struct St {
     pub(super) home: Option<String>,
     /// THE PROFILE THAT HOME KEEPS APART FROM ITS DIRECTORY
     /// ([`profile_apart`]: `$HOME/.claude.json` for a `CLAUDE_CONFIG_DIR` set
-    /// and EMPTY, whose records are in the directory [`St::home`] names): the
-    /// login Claude Code keeps for the agent, which its model rule judges it
-    /// by ([`Records::profile`]). Kept with the home ([`St::keep_home`]) and
-    /// read back with it ([`St::agent_records`]): from the directory alone a
-    /// pass that learns the home from this record (the CLI's sweep with no
-    /// roster, [`recorded_homes`]) judged an empty home's agent by
+    /// and EMPTY, whose records are in the directory [`St::home`] names;
+    /// beside another `HOME`'s `.claude`): the login Claude Code keeps for
+    /// the agent, which its model rule judges it by ([`Records::profile`]).
+    /// Kept with the home ([`St::keep_home`]) and read back with it
+    /// ([`St::agent_records`]): from the directory alone a pass that learns
+    /// the home from this record (the CLI's sweep with no roster,
+    /// [`recorded_homes`]) judged an empty home's agent by
     /// `<dir>/.claude.json`, nobody's — its login's denials the unknown, a
-    /// model it is denied offered (the review of `fix/r17-homes2`). `None`
-    /// for every other home. On disk the key `home_profile` is WRITTEN ONLY
-    /// WHEN SET, as `home` is.
+    /// model it is denied offered (the review of `fix/r17-homes2`).
+    /// `~/.claude/.claude.json` for one naming the user's own `~/.claude` is
+    /// recorded too, by a relaunch, but NOTHING READS IT: the model rule
+    /// reads a home's own evidence only where [`Records::home_word`] names a
+    /// home ([`ModelCtx::at`]), which `~/.claude` never is, so that agent is
+    /// judged by the pass's own `~/.claude.json`; and [`Homes::add`] skips
+    /// `~/.claude`, so the sweep's visit reads the agent unstamped and
+    /// [`St::keep_home`] writes this back to `None`. `None` for every other
+    /// home. On disk the key `home_profile` is WRITTEN ONLY WHEN SET, as
+    /// `home` is.
     pub(super) home_profile: Option<String>,
     /// THE BUILD THAT FAILED TO START FOR THE CONVERSATION, KEPT BY A
     /// RESTART'S RECORD ON ITS OWN PROGRAM ([`St::kept_by_restart`]) from the
@@ -3868,12 +4089,35 @@ pub(super) struct St {
     pub(super) thread: String,
     /// Codex: the `$CODEX_HOME` the TUI ran with.
     pub(super) codex_home: String,
+    /// Codex: THE `CODEX_HOME` THE TUI'S OWN EXEC ENVIRONMENT SET, verbatim
+    /// (`codex::Tui::home_env`, [`super::relaunch::CodexRun::home_env`]),
+    /// which every relaunch line it plans carries as required environment
+    /// (`upgrade_codex::line_env`); `None`: the TUI had no such variable,
+    /// and the line adds none. [`St::codex_home`] alone cannot tell a home
+    /// set to `~/.codex` from the default. On disk the key `codex_home_env`
+    /// is WRITTEN ONLY WHEN SET (empty included): a record with none is byte
+    /// for byte what it was, and an older record reads as none.
+    pub(super) codex_home_env: Option<String>,
     /// Codex: the TUI's argv, its working directory and the managed twin, as
     /// they were at the exit — what the relaunch is planned from once the
     /// exit names the thread, by which time the TUI is gone.
     pub(super) argv: Vec<String>,
     pub(super) cwd: String,
     pub(super) twin: String,
+    /// A PROVEN SELF-CLAIMED codex-alab's relaunch (the crash rule,
+    /// [`super::self_claimed`]): the resume line its own session record
+    /// named, validated against the live process while it ran — typed as it
+    /// is, in place of the line the lane plans from `argv`. Empty: the lane's
+    /// own plan.
+    pub(super) resume_argv: Vec<String>,
+    /// Legacy self-claimed `CODEX_HOME`: a nonempty fallback for records
+    /// predating [`Self::codex_home_env`] on this path. New records also
+    /// carry that optional field, which preserves an explicitly empty value.
+    pub(super) resume_home: String,
+    /// With `resume_argv`: the original process's kernel start, retained
+    /// until its relaunch line is typed so deferred carries record the same
+    /// once-only witness as an immediate relaunch.
+    pub(super) resume_start: String,
     /// Text the lane typed into the composer and did not submit: on Codex, a
     /// guarded Enter that missed (`turn … reason=guard`); on Claude Code, a
     /// notice or release stopped part-way or with its guarded Enter unpressed
@@ -4479,8 +4723,9 @@ impl St {
     /// launch line, a resume elsewhere). A relaunch that kept its program
     /// ([`SAME_PROGRAM`]) is no such failure.
     pub(super) fn failed_start(&self) -> Option<FailedStart> {
-        if self.agent != upgrade::Agent::Claude {
-            return None;
+        match self.agent {
+            upgrade::Agent::Claude => {}
+            upgrade::Agent::Codex => return None,
         }
         match &self.phase {
             Phase::Failed(why) if why == "no-resume" && self.source != SAME_PROGRAM => {
@@ -4951,8 +5196,9 @@ impl St {
     /// nothing typed. A Claude Code record's release carries that instead,
     /// and its owner's view of a new build's round is worded as before.
     fn stop_kept_onto(&self) -> String {
-        if self.agent != upgrade::Agent::Codex {
-            return String::new();
+        match self.agent {
+            upgrade::Agent::Codex => {}
+            upgrade::Agent::Claude => return String::new(),
         }
         match &self.phase {
             Phase::Failed(why) if why == upgrade::GAVE_UP => why.clone(),
@@ -5370,6 +5616,8 @@ impl St {
             ("codex_home", &self.codex_home),
             ("cwd", &self.cwd),
             ("twin", &self.twin),
+            ("resume_home", &self.resume_home),
+            ("resume_start", &self.resume_start),
             ("left_typed", &self.left_typed),
             ("release", &self.release),
             ("last_stop", &self.last_stop),
@@ -5390,6 +5638,9 @@ impl St {
         }
         if let Some(home) = &self.home {
             o.insert("home".into(), Value::from(home.as_str()));
+        }
+        if let Some(home) = &self.codex_home_env {
+            o.insert("codex_home_env".into(), Value::from(home.as_str()));
         }
         if let Some(profile) = &self.home_profile {
             o.insert("home_profile".into(), Value::from(profile.as_str()));
@@ -5467,6 +5718,7 @@ impl St {
         let work_end_at: Vec<String> = self.work_end_at.iter().map(u64::to_string).collect();
         for (k, list) in [
             ("argv", &self.argv),
+            ("resume_argv", &self.resume_argv),
             ("markers", &self.markers),
             ("asked", &self.asked),
             ("held_by", &held_by),
@@ -5511,6 +5763,14 @@ impl St {
             "done" => Phase::Done,
             "failed" => Phase::Failed(s("why")),
             _ => return None,
+        };
+        // A record with no word is Claude Code's, as every record before the
+        // word was. A word this build has no lane for is a newer build's
+        // record: no record here, so every scan of the directory passes its
+        // file by as it lies.
+        let agent = match v.get("agent") {
+            None => upgrade::Agent::Claude,
+            Some(word) => upgrade::Agent::parse(word.as_str()?)?,
         };
         // A record an older build wrote mid-move has no `relaunched_at`: its
         // phase's own stamp is the line's instant, so the move it finishes
@@ -5594,13 +5854,20 @@ impl St {
             request_at: n("request_at"),
             outcome: s("outcome"),
             done_at: n("done_at"),
-            agent: upgrade::Agent::parse(&s("agent")),
+            agent,
             mode: s("mode"),
             thread: s("thread"),
             codex_home: s("codex_home"),
+            codex_home_env: v
+                .get("codex_home_env")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
             argv: list("argv"),
             cwd: s("cwd"),
             twin: s("twin"),
+            resume_argv: list("resume_argv"),
+            resume_home: s("resume_home"),
+            resume_start: s("resume_start"),
             left_typed: s("left_typed"),
             left_at: n("left_at"),
             exited_at: n("exited_at"),
@@ -5720,8 +5987,11 @@ impl St {
     /// relaunch on exit's own loop tries its stop again. A parent that
     /// cannot be read now is no landing.
     pub(super) fn landed_after_stop(&self, sf: &SessionFile, k: &dyn Kernel) -> bool {
-        self.agent == upgrade::Agent::Claude
-            && matches!(&self.phase, Phase::Failed(why) if why == "no-resume")
+        match self.agent {
+            upgrade::Agent::Claude => {}
+            upgrade::Agent::Codex => return false,
+        }
+        matches!(&self.phase, Phase::Failed(why) if why == "no-resume")
             && self.exited_at != 0
             && super::relaunch::ends_at_once(&self.cause)
             && self.started_by_line(sf)
@@ -5853,7 +6123,7 @@ impl St {
     /// session" would be false). A relaunch record ([`St::cause`]) typed no
     /// notice, and a Codex record is its own lane's.
     fn notified(&self) -> bool {
-        self.agent == upgrade::Agent::Claude
+        driven_here(self.agent)
             && self.cause.is_empty()
             && match &self.phase {
                 Phase::Announced { .. } => true,
@@ -6234,10 +6504,6 @@ pub(super) fn state_dir(opts: &Opts) -> PathBuf {
     opts.state.join("upgrade")
 }
 
-fn state_path(opts: &Opts, session: &str) -> PathBuf {
-    state_dir(opts).join(format!("{session}.json"))
-}
-
 /// A PENDING RECORD THE SESSION HAS SETTLED, for a session with nothing to
 /// move (`current`): its state goes, and the ledger says why once. Two
 /// records qualify, neither begun (no notice, nothing owed):
@@ -6297,6 +6563,19 @@ pub(super) fn settled(st: &St) -> bool {
     }
 }
 
+/// Whether a record of `agent`'s lane is this module's to drive — Claude
+/// Code's: the notice it owes ([`St::notified`]), its restart left orphaned
+/// ([`orphans`]), its stuck note ([`note_stuck`]), its prune
+/// ([`prune_states`]) and the Claude home it names ([`recorded_homes`]) — or
+/// its lane's, which does all of that for its own records ([`codex`]: one
+/// per tab).
+fn driven_here(agent: upgrade::Agent) -> bool {
+    match agent {
+        upgrade::Agent::Claude => true,
+        upgrade::Agent::Codex => false,
+    }
+}
+
 /// Whether the state file `entry` has sat unwritten for [`STATE_KEEP_S`] at
 /// `now` (unix seconds). A file whose write time cannot be read has not.
 pub(super) fn sat_a_week(entry: &std::fs::DirEntry, now: u64) -> bool {
@@ -6352,44 +6631,15 @@ fn prune_states(opts: &Opts, files: &[SessionFile], now: u64) {
                 .agent_records(&opts.home)
                 .session_files()
                 .is_none_or(|files| conversation_live(&files, id));
-        if st.agent == upgrade::Agent::Claude && settled(&st) && !held_elsewhere {
+        if driven_here(st.agent) && settled(&st) && !held_elsewhere {
             let _ = std::fs::remove_file(&path);
         }
     }
 }
 
-pub(super) fn load(opts: &Opts, session: &str) -> Option<St> {
-    St::from_json(&std::fs::read_to_string(state_path(opts, session)).ok()?)
-}
-
 /// The one writer of `session`'s record: [`save_at`] at this second.
 pub(super) fn save(opts: &Opts, session: &str, st: &St) {
     save_at(opts, session, st, now_s());
-}
-
-/// Writes `st` as `session`'s record at `now`, stamping its progress: when its
-/// progress key ([`St::progress_key`]) differs from the record on disk (or
-/// there is none) it is written as having moved at `now`
-/// ([`St::progress_at`]); otherwise the stamp on disk is kept, so a stale copy
-/// saved again restarts no clock. Detecting progress at the single writer
-/// means no step can forget or fake the stamp. A dry run writes nothing.
-pub(super) fn save_at(opts: &Opts, session: &str, st: &St, now: u64) {
-    if opts.dry_run {
-        return;
-    }
-    let key = st.progress_key();
-    let on_disk = load(opts, session);
-    let mut out = st.clone();
-    match &on_disk {
-        Some(disk) if disk.progress_key == key => out.progress_at = disk.progress_at,
-        _ => out.progress_at = now,
-    }
-    out.progress_key = key;
-    write_verbatim(opts, session, &out);
-    // A BUILD THAT FAILED TO START is the build's fact too, noted — and a
-    // stop taken back, retracted — by the one writer every stop and every
-    // reopening is saved through ([`build_start::note`]).
-    build_start::note(opts, session, on_disk.as_ref(), st, now);
 }
 
 /// WHETHER AN AGENT MAY BE MOVED ONTO `to` AT `now`
@@ -6409,49 +6659,101 @@ pub(super) fn build_starts(
     build_start::starts(opts, r, to, now, owner_now)
 }
 
-/// Writes `st` as `session`'s record exactly as it is, progress stamp
-/// included. [`save_at`] writes through it after stamping; [`restore`] uses
-/// it alone, so putting back a record after an act that did not go ahead is
-/// no progress. A dry run writes nothing.
-fn write_verbatim(opts: &Opts, session: &str, st: &St) {
-    if opts.dry_run {
-        return;
+/// THE UPGRADE RECORD HAS ONE WRITER AND ONE REMOVER. Every clock the view and
+/// the watch read off a record (its progress stamp, `St::progress_at`, and the
+/// deadlines built on it) is kept by [`save_at`], which stamps progress as it
+/// writes, and a record that goes, goes by [`remove`]. The record's path is
+/// private to this module, so no step can write or remove a record past them
+/// and move a clock no deadline sees. (A path built by hand from [`state_dir`],
+/// as the settled records' prune reads the directory, is outside this.)
+mod record {
+    use super::{Opts, St, state_dir};
+    use std::path::PathBuf;
+
+    fn state_path(opts: &Opts, session: &str) -> PathBuf {
+        state_dir(opts).join(format!("{session}.json"))
     }
-    let path = state_path(opts, session);
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+
+    pub(in super::super) fn load(opts: &Opts, session: &str) -> Option<St> {
+        St::from_json(&std::fs::read_to_string(state_path(opts, session)).ok()?)
     }
-    let tmp = path.with_extension("json.tmp");
-    if std::fs::write(&tmp, st.to_json()).is_ok() {
-        let _ = std::fs::rename(&tmp, &path);
+
+    /// Writes `st` as `session`'s record at `now`, stamping its progress: when its
+    /// progress key ([`St::progress_key`]) differs from the record on disk (or
+    /// there is none) it is written as having moved at `now`
+    /// ([`St::progress_at`]); otherwise the stamp on disk is kept, so a stale copy
+    /// saved again restarts no clock. Detecting progress at the single writer
+    /// means no step can forget or fake the stamp. A dry run writes nothing.
+    pub(in super::super) fn save_at(opts: &Opts, session: &str, st: &St, now: u64) {
+        if opts.dry_run {
+            return;
+        }
+        let key = st.progress_key();
+        let on_disk = load(opts, session);
+        let mut out = st.clone();
+        match &on_disk {
+            Some(disk) if disk.progress_key == key => out.progress_at = disk.progress_at,
+            _ => out.progress_at = now,
+        }
+        out.progress_key = key;
+        write_verbatim(opts, session, &out);
+        // A BUILD THAT FAILED TO START is the build's fact too, noted — and a
+        // stop taken back, retracted — by the one writer every stop and every
+        // reopening is saved through ([`super::build_start::note`]).
+        super::build_start::note(opts, session, on_disk.as_ref(), st, now);
+    }
+
+    /// Writes `st` as `session`'s record exactly as it is, progress stamp
+    /// included. [`save_at`] writes through it after stamping; [`restore`] uses
+    /// it alone, so putting back a record after an act that did not go ahead is
+    /// no progress. A dry run writes nothing.
+    fn write_verbatim(opts: &Opts, session: &str, st: &St) {
+        if opts.dry_run {
+            return;
+        }
+        let path = state_path(opts, session);
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, st.to_json()).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+
+    /// Puts back `session`'s record from before an act that did not go ahead:
+    /// `prior` as read, progress stamp included ([`write_verbatim`]), or no
+    /// record.
+    pub(in super::super) fn restore(opts: &Opts, session: &str, prior: Option<&St>) {
+        if opts.dry_run {
+            return;
+        }
+        match prior {
+            Some(st) => write_verbatim(opts, session, st),
+            None => remove(opts, session),
+        }
+    }
+
+    /// The one remover of `session`'s record: a record owed nothing more goes
+    /// here, as does the absence [`restore`] puts back. A dry run removes nothing.
+    pub(in super::super) fn remove(opts: &Opts, session: &str) {
+        if opts.dry_run {
+            return;
+        }
+        let _ = std::fs::remove_file(state_path(opts, session));
+    }
+
+    /// A test's planted record, written exactly as given: the watch suite's
+    /// negative controls stamp their own progress.
+    #[cfg(test)]
+    pub(in super::super) fn write_verbatim_for_test(opts: &Opts, session: &str, st: &St) {
+        write_verbatim(opts, session, st);
     }
 }
 
-/// Puts back `session`'s record from before an act that did not go ahead:
-/// `prior` as read, progress stamp included ([`write_verbatim`]), or no
-/// record.
-pub(super) fn restore(opts: &Opts, session: &str, prior: Option<&St>) {
-    if opts.dry_run {
-        return;
-    }
-    match prior {
-        Some(st) => write_verbatim(opts, session, st),
-        None => remove(opts, session),
-    }
-}
-
-/// The one remover of `session`'s record: a record owed nothing more goes
-/// here, as does the absence [`restore`] puts back. The record's path
-/// ([`state_path`]) is reached only by this, [`load`] and [`write_verbatim`]
-/// (`tools/grep_guard.sh` S1 fences every other harness function), so no step
-/// writes or removes a record past the one writer that stamps progress
-/// ([`save_at`]). A dry run removes nothing.
-pub(super) fn remove(opts: &Opts, session: &str) {
-    if opts.dry_run {
-        return;
-    }
-    let _ = std::fs::remove_file(state_path(opts, session));
-}
+#[cfg(test)]
+use record::write_verbatim_for_test as write_verbatim;
+pub(super) use record::{load, remove, restore, save_at};
 
 /// One ledger line per step taken: `<state>/upgrade/ledger.jsonl`. `detail`
 /// is the step's own: for a `relaunched`, an `exited` and a
@@ -6863,8 +7165,9 @@ pub(super) struct Records {
     dir: Option<PathBuf>,
     /// The profile, where the home's raw value keeps it apart from what the
     /// directory alone says ([`profile_apart`]: an EMPTY `CLAUDE_CONFIG_DIR`'s,
-    /// `$HOME/.claude.json`); `None` for every other home, whose profile is
-    /// read by its directory ([`claude_profile`]).
+    /// `$HOME/.claude.json`; one naming the user's own `~/.claude`, inside
+    /// it; an agent's own `HOME`'s, beside its `.claude`); `None` for every
+    /// other home, whose profile is read by its directory ([`claude_profile`]).
     profile: Option<PathBuf>,
 }
 
@@ -6872,7 +7175,10 @@ pub(super) struct Records {
 /// onboarding, its login, and the login's model caches (the denials, the
 /// disabled options, the announcements: [`models::read_evidence`]). Claude
 /// Code keeps it at `join(CLAUDE_CONFIG_DIR || homedir(), ".claude.json")`
-/// (READ in the 2.1.300 bundle), where the records are under
+/// (READ in the 2.1.300 bundle) unless a legacy `.config.json` in the
+/// records directory stands in for it or a custom OAuth URL renames it
+/// (`profile::effective`, READ in the 2.1.301 bundle: `accounts stats`
+/// follows it, the model rule does not), where the records are under
 /// `CLAUDE_CONFIG_DIR ?? join(homedir(), ".claude")` ([`Records::at`]): the
 /// two differ where `CLAUDE_CONFIG_DIR` is set and EMPTY, which `??` keeps
 /// (the records in the directory the process runs in) and `||` reads as
@@ -6881,10 +7187,15 @@ pub(super) struct Records {
 /// `CLAUDE_CONFIG_DIR=` it read and wrote `$HOME/.claude.json`, never one in
 /// its working directory. So the directory alone ([`claude_profile`]: the
 /// user's own `~/.claude` keeps it beside it, any other inside it) names
-/// every home's but an empty one's, whose directory is the one the process
-/// runs in: `Some(user_home/.claude.json)` for the raw `home` set and empty,
-/// `None` (the directory's) for any other — `.` names the same directory as
-/// an empty home and keeps its profile inside it.
+/// every home's but two. An empty one's, whose directory is the one the
+/// process runs in: `Some(user_home/.claude.json)` for the raw `home` set and
+/// empty. And a set one that names the user's own `~/.claude` (the
+/// real-Claude lab launches `CLAUDE_CONFIG_DIR=<home>/.claude claude`), which
+/// keeps it INSIDE, as every set home does (`CLAUDE_CONFIG_DIR || homedir()`,
+/// READ in the 2.1.301 bundle; `<home>/.claude.json` unread under it,
+/// MEASURED 2026-10-09, `super::relaunch`'s module docs):
+/// `Some(<dir>/.claude.json)`. `None` (the directory's) for any other — `.`
+/// names the same directory as an empty home and keeps its profile inside it.
 ///
 /// AND THE AGENT'S OWN `HOME` (`homedir()`, [`HomeVars::home`]): an unset
 /// `CLAUDE_CONFIG_DIR` keeps the records in `<HOME>/.claude` and the profile
@@ -6899,12 +7210,22 @@ pub(super) fn profile_apart(
 ) -> Option<PathBuf> {
     match vars.config {
         Some("") => Some(homedir(user_home, vars.home).join(".claude.json")),
-        Some(_) => None,
+        Some(_) => dir
+            .filter(|dir| *dir == user_home.join(".claude"))
+            .map(|dir| dir.join(".claude.json")),
         None => dir
             .filter(|dir| *dir != user_home.join(".claude"))
             .and_then(Path::parent)
             .map(|home| home.join(".claude.json")),
     }
+}
+
+/// The profile of the home whose records are in `dir`, named by the
+/// environment `vars`: the one kept apart ([`profile_apart`]), else the
+/// directory's ([`claude_profile`]) — [`Records::profile`] for a caller that
+/// resolved the directory already (`profile::path_in`).
+pub(super) fn profile_in(user_home: &Path, vars: HomeVars<'_>, dir: &Path) -> PathBuf {
+    profile_apart(user_home, vars, Some(dir)).unwrap_or_else(|| claude_profile(user_home, dir))
 }
 
 /// WHAT A CLAUDE CODE'S EXEC ENVIRONMENT SAYS OF ITS HOME ([`Records::at`],
@@ -7190,8 +7511,8 @@ impl Records {
     }
 
     /// What a record of the agent keeping these records names as the profile
-    /// its home keeps apart ([`St::home_profile`]): `None` but for an empty
-    /// home's ([`profile_apart`]), which [`Records::of_recorded`] reads back.
+    /// its home keeps apart ([`St::home_profile`]): `None` but where
+    /// [`profile_apart`] names one, which [`Records::of_recorded`] reads back.
     pub(super) fn profile_word(&self) -> Option<String> {
         self.profile
             .as_ref()
@@ -7213,8 +7534,9 @@ impl Records {
 
     /// `sf`, read here, as the home it was read under keeps it: whoever judges
     /// its agent by its login's model caches reads its profile
-    /// ([`Records::of_file`]). Only an empty home's differs from what the
-    /// directory says, so every other record is as it was read.
+    /// ([`Records::of_file`]). Only a home [`profile_apart`] names one for
+    /// differs from what the directory says, so every other record is as it
+    /// was read.
     fn stamped(&self, sf: SessionFile) -> SessionFile {
         SessionFile {
             profile: self.profile.clone(),
@@ -7532,8 +7854,9 @@ pub fn process_transcript_tail(
 /// `.claude`). `None` for a Codex, which writes no such transcript.
 #[must_use]
 pub fn snapshot_transcript_tail(snap: &super::relaunch::Snapshot) -> Option<String> {
-    if snap.codex.is_some() {
-        return None;
+    match snap.agent() {
+        upgrade::Agent::Claude => {}
+        upgrade::Agent::Codex => return None,
     }
     let args = atpkg::caller_shell::process_args(snap.pid);
     let home = aterm_types::dirs::home_dir();
@@ -7560,6 +7883,22 @@ pub fn named_standing_wall(
     snap: &super::relaunch::Snapshot,
 ) -> Option<upgrade::StandingWall> {
     upgrade::transcript_standing_wall(&snapshot_tail(user_home, snap)?)
+}
+
+/// WHEN THE NEWEST ANSWER of the conversation `snap` names came, of those
+/// that came by the second `by` ([`upgrade::transcript_last_answer`] over its
+/// transcript's tail in its agent's own records, the same bounded read as
+/// [`named_standing_wall`]; `None`: no answer by then, or no transcript
+/// read) — the instant what the session's screen says of its account's usage
+/// was true, which the window's host hands the accounts recorder
+/// (`accounts::record_usage`). It reads; it records nothing.
+#[must_use]
+pub fn named_last_answer(
+    user_home: &Path,
+    snap: &super::relaunch::Snapshot,
+    by: u64,
+) -> Option<u64> {
+    upgrade::transcript_last_answer(&snapshot_tail(user_home, snap)?, by)
 }
 
 /// THE LINE the usage-limit dialog of the conversation `snap` names ended
@@ -7605,6 +7944,16 @@ pub fn conversation_under(home: &Path, session: &str) -> bool {
 #[must_use]
 pub fn codex_wall_reset(pid: u32, home: &Path, text: &str, now: u64) -> Option<u64> {
     codex::place_wall(&Live, pid, home, text, now)
+}
+
+/// The UTC offset at instant `t` of the zone a Codex started with `TZ` =
+/// `zone` prints its clock in (`None`: no `TZ`, the machine's own zone; a
+/// zone the machine does not know reads `None`): the one reader its wall's
+/// placement takes ([`codex_wall_reset`]), which `harness limits` places its
+/// `/status` card's resets by.
+#[must_use]
+pub fn codex_zone_offset_at(zone: Option<&str>, t: i64) -> Option<i64> {
+    codex::zone_offset_at(zone, t)
 }
 
 /// The last `bytes` of `path`, decoded lossily: a cut inside a multi-byte
@@ -7683,9 +8032,11 @@ pub fn sweep(opts: &Opts) -> Vec<Report> {
 #[must_use]
 pub fn step(opts: &Opts) -> Report {
     let tab = opts.only_sid.clone().unwrap_or_else(|| "-".to_string());
-    let tabs = connect(opts, &tab)
-        .ok()
-        .and_then(|mut c| host_roster(&mut c));
+    let mut self_claimed = false;
+    let tabs = connect(opts, &tab).ok().and_then(|mut c| {
+        self_claimed = status_line(&mut c, &tab).is_some_and(|l| self_claimed_by_status(&l));
+        host_roster(&mut c)
+    });
     let current = || Report {
         pid: 0,
         tab: tab.clone(),
@@ -7694,6 +8045,14 @@ pub fn step(opts: &Opts) -> Report {
         to: "-".to_string(),
         step: "current".to_string(),
     };
+    // A session its own agent supervises under a proven self-claim takes no
+    // upgrade decision of aterm's (the native harness contract §7).
+    if self_claimed {
+        return Report {
+            step: SKIP_SELF_CLAIMED.to_string(),
+            ..current()
+        };
+    }
     let Some(tabs) = tabs.filter(|tabs| tab_is_live(tabs, &tab)) else {
         return Report {
             step: "wait:tab-not-live".to_string(),
@@ -7723,7 +8082,9 @@ fn pick<'a>(reports: &'a [Report], tab: &str) -> Option<&'a Report> {
 /// Whether tab `opts.only_sid` has an upgrade to take: its foreground Codex
 /// runs an older managed build (or its daemon is behind), its foreground
 /// Claude Code runs an older build or a model the model rule moves
-/// ([`super::upgrade_models`]), or a restart of this tab is in flight.
+/// ([`super::upgrade_models`]), or a restart of this tab is in flight — each
+/// only while that agent's lane is on ([`Opts::agents_off`]), as [`step`]
+/// takes it.
 /// Read-only and cheap enough to ask at worker start, every activation notice
 /// and every look: one roster read, session files when needed (never under a
 /// Codex foreground), cached build versions, the model list. A failed read
@@ -7739,10 +8100,14 @@ pub fn due(opts: &Opts) -> Due {
     if !in_flight(opts).is_empty() || confirming(opts) {
         return Due::Yes;
     }
-    let Some(tabs) = connect(opts, tab)
-        .ok()
-        .and_then(|mut c| host_roster(&mut c))
-    else {
+    let Ok(mut c) = connect(opts, tab) else {
+        return Due::Unread(UNREAD_SOCKET);
+    };
+    // A proven self-claim's session is its agent's to upgrade (contract §7).
+    if status_line(&mut c, tab).is_some_and(|l| self_claimed_by_status(&l)) {
+        return Due::No;
+    }
+    let Some(tabs) = host_roster(&mut c) else {
         return Due::Unread(UNREAD_SOCKET);
     };
     // The Codex branch: a Codex leads the tab ([`codex::due`]) — or the tab
@@ -7755,12 +8120,21 @@ pub fn due(opts: &Opts) -> Due {
 /// ([`UNREAD_PROCESS`]); only an unknown or other foreground (`codex_due` =
 /// `None`) can have a Claude session record that makes an upgrade due. A
 /// separate seam so the read-heavy Claude roster is provably skipped on every
-/// Codex answer.
+/// Codex answer, and on every answer while the Claude lane is off. A lane
+/// that is off ([`lane_on`]) has nothing due.
 fn due_after_codex(opts: &Opts, tabs: &[LiveTab], codex_due: Option<Due>) -> Due {
     if let Some(due) = codex_due {
-        return due;
+        return if lane_on(opts, upgrade::Agent::Codex) {
+            due
+        } else {
+            Due::No
+        };
     }
-    let Some(tab) = opts.only_sid.as_deref() else {
+    let Some(tab) = opts
+        .only_sid
+        .as_deref()
+        .filter(|_| lane_on(opts, upgrade::Agent::Claude))
+    else {
         return Due::No;
     };
     let homes = Homes::read(
@@ -8023,7 +8397,7 @@ fn recorded_homes(opts: &Opts) -> Vec<Records> {
     dir.flatten()
         .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
         .filter_map(|e| St::from_json(&std::fs::read_to_string(e.path()).ok()?))
-        .filter(|st| st.agent == upgrade::Agent::Claude && st.home.is_some())
+        .filter(|st| driven_here(st.agent) && st.home.is_some())
         .map(|st| st.agent_records(&opts.home))
         .collect()
 }
@@ -9075,30 +9449,53 @@ fn sweep_with_roster(opts: &Opts, live_tabs: Option<&[LiveTab]>) -> Vec<Report> 
     } else {
         confirmations(opts)
     };
-    // The Codex branch, under the same lock: every Codex home's daemon, every
-    // Codex TUI in a tab, then Codex restarts in flight ([`codex::sweep`]);
-    // for the window's step, the tab's TUI and its daemon. No Claude session
-    // file needed.
-    let codex = codex::sweep(opts, live_tabs);
-    // A tab whose foreground job is Codex belongs to the Codex branch alone:
-    // the Claude pass's machine-wide waits (Claude's records unreadable) are
+    reports.extend(lanes(opts, live_tabs, &|agent| match agent {
+        // Every Codex home's daemon, every Codex TUI in a tab, then Codex
+        // restarts in flight ([`codex::sweep`]); for the window's step, the
+        // tab's TUI and its daemon. No Claude session file needed.
+        upgrade::Agent::Codex => codex::sweep(opts, live_tabs),
+        upgrade::Agent::Claude => claude_pass(opts, live_tabs),
+    }));
+    reports
+}
+
+/// The lanes' share of one sweep, under its lock: the Codex lane first, then
+/// the Claude lane, each by `pass` — and none for an agent whose own switch is
+/// off ([`Opts::agents_off`]), whose sessions the pass leaves as they are.
+fn lanes(
+    opts: &Opts,
+    live_tabs: Option<&[LiveTab]>,
+    pass: &dyn Fn(upgrade::Agent) -> Vec<Report>,
+) -> Vec<Report> {
+    let swept = |agent: upgrade::Agent| {
+        if lane_on(opts, agent) {
+            pass(agent)
+        } else {
+            Vec::new()
+        }
+    };
+    let codex = swept(upgrade::Agent::Codex);
+    // A tab whose foreground job is Codex belongs to the Codex lane alone:
+    // the Claude lane's machine-wide waits (Claude's records unreadable) are
     // not that tab's.
     let codex_tab = opts
         .only_sid
         .as_ref()
         .is_some_and(|sid| live_tabs.is_some() && codex.iter().any(|r| r.tab == *sid));
+    let mut reports = Vec::new();
     if !codex_tab {
-        reports.extend(claude_pass(opts, live_tabs));
+        reports.extend(swept(upgrade::Agent::Claude));
     }
     reports.extend(codex);
     reports
 }
 
-/// A Codex restart in flight carried on from where it stopped
-/// ([`codex::carry_in_flight`]): the relaunch primitive's continuation step
-/// ([`super::relaunch::resume`]) for a Codex record.
-pub(super) fn codex_carry_in_flight(opts: &Opts, r: Report, st: St, session: &str) -> Report {
-    codex::carry_in_flight(opts, r, st, session)
+/// Whether a pass with `opts` takes `agent`'s lane: that agent's own switch
+/// is not off ([`Opts::agents_off`]). The one answer [`lanes`], [`due`] and
+/// [`in_flight`] give, so the window's host is never told a step is due that
+/// its step then leaves alone.
+fn lane_on(opts: &Opts, agent: upgrade::Agent) -> bool {
+    !opts.agents_off.contains(&agent.program())
 }
 
 /// A Codex TUI's [`super::relaunch::Snapshot`], read while it runs
@@ -9123,6 +9520,26 @@ pub(super) fn codex_look_at_exit(
 }
 
 /// A Codex relaunch on exit ([`codex::after_exit`]).
+/// THE CRASH RULE'S RELAUNCH of a proven self-claimed codex-alab (the
+/// self-claim contract, §4): `snap` the agent that crashed, `resume` the line
+/// aterm's own copy of its record validated while it ran, `asked` the
+/// explicit restart's cause where its stamp named the exit. The Codex lane's
+/// relaunch on that line ([`super::self_claimed`]), never its own plan.
+#[must_use]
+pub fn self_claimed_after_exit(
+    opts: &Opts,
+    snap: &super::relaunch::Snapshot,
+    resume: &super::self_claimed::Resume,
+    asked: Option<super::restart_stamp::Cause>,
+) -> Report {
+    let cause = match asked {
+        Some(super::restart_stamp::Cause::Stall) => super::relaunch::ExitCause::Stall,
+        Some(super::restart_stamp::Cause::Asked) => super::relaunch::ExitCause::Asked,
+        None => super::relaunch::ExitCause::Exit,
+    };
+    codex::self_claimed_after_exit(opts, snap, resume, cause, &Live)
+}
+
 pub(super) fn codex_after_exit(
     opts: &Opts,
     snap: &super::relaunch::Snapshot,
@@ -9322,8 +9739,9 @@ fn confirming(opts: &Opts) -> bool {
 
 /// The conversations an earlier sweep left mid-restart (agent signalled, new
 /// process not yet relaunched or carried on) that a sweep with `opts` would
-/// resume ([`orphans`]' filter, without its liveness checks). A sweep that
-/// stands down strands them, and says which.
+/// resume ([`orphans`]' filter, without its liveness checks): none of an
+/// agent whose lane is off ([`lane_on`]), which stays where it was until that
+/// switch is back on. A sweep that stands down strands them, and says which.
 #[must_use]
 pub fn in_flight(opts: &Opts) -> Vec<String> {
     let Ok(dir) = std::fs::read_dir(state_dir(opts)) else {
@@ -9338,7 +9756,8 @@ pub fn in_flight(opts: &Opts) -> Vec<String> {
             }
             let session = path.file_stem()?.to_string_lossy().into_owned();
             let st = load(opts, &session).filter(St::in_flight)?;
-            let ours = opts.only_sid.as_ref().is_none_or(|s| *s == st.tab);
+            let ours =
+                opts.only_sid.as_ref().is_none_or(|s| *s == st.tab) && lane_on(opts, st.agent);
             ours.then_some(session)
         })
         .collect();
@@ -10065,6 +10484,7 @@ fn visit_models(
                         true,
                         home,
                         args.env_var(super::accounts::LOGIN_ENV),
+                        stored_login_of(&args.env),
                     ),
                     shell,
                     t,
@@ -10233,6 +10653,7 @@ fn visit_models(
                 model: hand.as_deref(),
                 login: args.env_var(super::accounts::LOGIN_ENV),
                 home: args.env_var(super::accounts::HOME_ENV),
+                stored_login: stored_login_of(&args.env),
             };
             restart(opts, r, &mut st, &mut c, &tab, sf, t, k, &restarting)
         }
@@ -10807,7 +11228,7 @@ fn release(
     if host_claim.is_some_and(|claim| !claim_still_live(c, sf.pid, claim)) {
         return owed(r, "tab-ownership-changed");
     }
-    let text = upgrade::release_prompt_as(st.agent, f.quiet);
+    let text = upgrade::release_prompt(st.agent, f.quiet);
     match type_fenced(c, tab, &text, None, Put::Pressed) {
         Ok(()) => {
             let why = st.release.clone();
@@ -10985,7 +11406,7 @@ fn orphans(opts: &Opts, files: &[SessionFile], live_tabs: Option<&[LiveTab]>) ->
             continue;
         };
         // A Codex restart is the Codex lane's to carry on ([`codex`]).
-        if st.agent != upgrade::Agent::Claude {
+        if !driven_here(st.agent) {
             continue;
         }
         if live_tabs.is_some_and(|tabs| !tab_is_live(tabs, &st.tab)) {
@@ -11371,7 +11792,7 @@ fn held_back(opts: &Opts, r: Report, st: &mut St, session: &str, why: &str) -> R
 /// is in no `--status`), never from the read-only `--status`. A dry run
 /// writes nothing.
 pub(super) fn note_stuck(opts: &Opts, r: &Report, st: &mut St, session: &str, now: u64) {
-    if opts.dry_run || st.agent != upgrade::Agent::Claude || !st.is_upgrade() {
+    if opts.dry_run || !driven_here(st.agent) || !st.is_upgrade() {
         return;
     }
     let Some(what) = st.stuck(now) else {
@@ -11465,7 +11886,9 @@ fn announce(
 /// conversation and directory, its argv, the target build, the model the
 /// conversation moves to, if any, the permission mode it last ran in, and
 /// whether it is resumed (`false`: a conversation nobody has asked anything,
-/// started afresh), and the Claude home and login its process runs under.
+/// started afresh), the Claude home and login its process runs under, and
+/// whether that process authenticates by its stored login
+/// ([`Launch::stored_login`]).
 #[allow(clippy::too_many_arguments)]
 fn launch_of<'a>(
     sf: &'a SessionFile,
@@ -11476,6 +11899,7 @@ fn launch_of<'a>(
     resume: bool,
     home: Option<&'a str>,
     login: Option<&'a str>,
+    stored_login: bool,
 ) -> Launch<'a> {
     Launch {
         session: &sf.session_id,
@@ -11488,7 +11912,16 @@ fn launch_of<'a>(
         mode,
         home,
         login,
+        stored_login,
     }
+}
+
+/// Whether the exec environment `env` (`KEY=value`, as the kernel hands it
+/// back) authenticates by its stored login
+/// ([`super::accounts::ProcessLogin::of_exec_env`]): an environment that
+/// reads empty was not read, and is not.
+fn stored_login_of(env: &[String]) -> bool {
+    super::accounts::ProcessLogin::of_exec_env(env).is_some_and(|who| who.stored_login)
 }
 
 /// THE LINE STARTS THE AGENT UNDER THE CLAUDE HOME ITS RECORDS ARE IN. A
@@ -11949,6 +12382,9 @@ struct Restarting<'a> {
     /// `CLAUDE_CONFIG_DIR`; `None`: unset), re-applied exactly
     /// ([`super::relaunch::Launch::home`]).
     home: Option<&'a str>,
+    /// That exec environment leaves it its stored login
+    /// ([`super::relaunch::Launch::stored_login`]).
+    stored_login: bool,
 }
 
 /// Whether Claude's own status, read again at the restart's last look (`a`),
@@ -11989,6 +12425,7 @@ fn restart(
         model: hand_model,
         login,
         home,
+        stored_login,
     } = *how;
     // NEVER `--resume` OF A CONVERSATION WITH NO TRANSCRIPT, whatever the
     // step read ([`transcript_exists_in`]): Claude refuses it and exits, and
@@ -12052,6 +12489,7 @@ fn restart(
         !fresh,
         home,
         login,
+        stored_login,
     );
     let planned = home_carried(&opts.home, home, &sf.cwd, &records)
         .and_then(|()| plan(opts, &launch, proven, t));
@@ -12078,10 +12516,10 @@ fn restart(
             a.session_id == sf.session_id
                 && status_holds(&a)
                 && ours(st, &a)
-                && kernel_start(sf.pid).as_deref() == Some(squash(&a.proc_start).as_str())
+                && k.process_start(sf.pid).as_deref() == Some(squash(&a.proc_start).as_str())
         }) && foreground_shell(k.job(sf.pid)) == Ok(shell)
             && scr.is_some_and(|s| turn_over_shown(&s, lagging) && composer_empty(c, tab, &s))
-            && live_background(sf.pid).is_empty()
+            && k.restart_background(sf.pid).is_empty()
             && !held(c, tab, grace)
             && host_claim.is_none_or(|claim| claim_still_live(c, sf.pid, claim));
         if !still {
@@ -12117,7 +12555,7 @@ fn restart(
             a.session_id == sf.session_id
                 && status_holds(a)
                 && ours(st, a)
-                && kernel_start(sf.pid).as_deref() == Some(squash(&a.proc_start).as_str())
+                && k.process_start(sf.pid).as_deref() == Some(squash(&a.proc_start).as_str())
         });
         let owner = k.terminal(sf.pid);
         let owner = owner.as_ref().map(|(pid, name)| (*pid, name.as_str()));

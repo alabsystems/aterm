@@ -3,18 +3,13 @@
 
 //! The escort is the pet's default life.
 //!
-//! The console observation layer may direct the pet's body and performance
-//! only while genuinely resident (reading a selection, watching a command
-//! block, visiting a content anchor, holding a hidden cursor's home).
-//! Otherwise the pet is the caret's escort; the console layer keeps only
-//! presence and layering (the visibility hold, owned by
-//! `console_pet_visibility_hold`).
-//!
-//! The oracle is the pet itself: `set_console_presentable(false)` returns
-//! every console entry point early, so a twin brain driven with it off is the
-//! plain caret escort running the same chase law against the same terminal.
-//! Ordinary typing must not tell the two apart. Every absolute number derives
-//! from the escort law (`PetBrain::station`, `STATION_LEAD = 1.0`).
+//! The console layer may direct the pet's body only while genuinely resident
+//! (reading a selection, watching a command block, visiting a content anchor,
+//! holding a hidden cursor's home); otherwise it keeps only presence and layering
+//! (`console_pet_visibility_hold`). The oracle is a twin brain with
+//! `set_console_presentable(false)`, which returns every console entry point
+//! early: the plain escort on the same terminal. Ordinary typing must not tell the
+//! two apart. Absolute numbers derive from `PetBrain::station` (`STATION_LEAD = 1.0`).
 
 use std::time::{Duration, Instant};
 
@@ -35,7 +30,7 @@ struct Scene {
 }
 
 impl Scene {
-    /// `presentable == false` is the v0.76.0 escort with no console layer.
+    /// `presentable == false` is the plain escort, with no console layer.
     fn new(presentable: bool, home: &[u8]) -> Self {
         let mut term = Terminal::new(ROWS, COLS);
         term.process(b"\x1b]11;#000000\x07");
@@ -91,7 +86,7 @@ fn body(frame: PetFrame) -> Option<PetRect> {
         })
 }
 
-/// The v0.76.0 station, computed from the shipped law rather than recalled.
+/// The escort's station, computed from the escort law.
 fn escort_station(caret_col: u16) -> f32 {
     PetBrain::station(caret_col, COLS, art_cols(CELL_W, CELL_H))
 }
@@ -121,8 +116,8 @@ fn the_escort_stands_at_the_caret_ladder_not_a_console_perch() {
     let frame = settle(&mut scene, &mut now);
     assert!(frame.alpha > 0, "the pet must be on glass to be measured");
     let want = escort_station(CARET_COL);
-    // STATION_LEAD is one cell. Half a cell of slack absorbs the chase's easing
-    // and `body_px` rounding; a whole extra cell of standoff is refused.
+    // Half a cell of slack absorbs the chase's easing and `body_px` rounding; a
+    // whole extra cell of standoff is refused.
     assert!(
         (frame.col - want).abs() <= 0.5,
         "escort stood at {:.2}; the v0.76 ladder says {want:.2} (caret col {CARET_COL})",
@@ -136,10 +131,8 @@ fn the_caret_is_not_an_obstruction_to_its_own_escort() {
     let mut scene = parked();
     let settled = settle(&mut scene, &mut now);
     let want = escort_station(CARET_COL);
-    // A cat seated one cell past the caret stands inside the caret's 3x3
-    // keep-off ring. The ring keeps the pet from resting on the cursor; it
-    // does not push the escort clear, and nothing may evict it for being there.
-    // (`under_text_clearance` is the strict reading, caret included.)
+    // A cat seated one cell past the caret stands inside the caret's 3x3 keep-off
+    // ring, which keeps the pet off the cursor but never evicts the escort.
     let seated = body(settled).expect("a settled pet has a body");
     assert_eq!(
         scene.world().under_text_clearance(seated, 0.10),
@@ -181,11 +174,10 @@ fn plain_typing_is_the_pet_with_no_console_layer() {
             now += Duration::from_millis(16);
             let a = live.tick(now);
             let b = bare.tick(now);
-            // What the layer may say on an ordinary typing frame: `quiet` and
-            // `committed-input` are the escort untouched; `advancing-ink` is the
-            // contact brace (a 0.40 s silhouette when new ink runs into the
-            // body). `cursor-home`, `protected-*` and the perch reasons claim
-            // the escort's body and must not appear.
+            // On an ordinary typing frame the layer may say `quiet` or
+            // `committed-input` (the escort untouched) or `advancing-ink` (the
+            // contact brace when new ink runs into the body); `cursor-home`,
+            // `protected-*` and the perch reasons claim the body and must not.
             let reason = live.brain.console_reason();
             assert!(
                 matches!(reason, "quiet" | "committed-input" | "advancing-ink"),
@@ -200,14 +192,14 @@ fn plain_typing_is_the_pet_with_no_console_layer() {
             }
         }
     }
-    // A quarter of a cell: the chase is deterministic and both brains run
-    // the same one, so any real standoff shows up far above this.
+    // Both brains run the same deterministic chase, so any real standoff shows
+    // far above a quarter cell.
     assert!(
         worst <= 0.25,
         "the console layer displaced the escort by {worst:.2} cells (worst at key {worst_at})",
     );
-    // CONTACT_HOLD is 0.40 s and re-arms only once the body is roomy again, so
-    // a typing run buys about one brace, not a permanent one.
+    // `CONTACT_HOLD` (0.40 s) re-arms only once the body is roomy again, so a
+    // typing run buys about one brace.
     assert!(
         contact * 5 <= frames,
         "the contact brace held {contact} of {frames} typing frames",
@@ -222,8 +214,7 @@ fn a_settled_cat_typed_at_keeps_its_own_animation() {
         now += Duration::from_millis(16);
         live.tick(now);
     }
-    // A short burst so the cat is awake, then a pause long enough to sit but
-    // not sleep (a key on a sleeping cat is a wake, not this file's subject).
+    // A burst to wake the cat, then a pause long enough to sit but not sleep.
     for k in 0..24u32 {
         let ch = [b'a' + (k % 26) as u8];
         live.term.process(&ch);
@@ -242,16 +233,15 @@ fn a_settled_cat_typed_at_keeps_its_own_animation() {
         "precondition: the cat must have settled, got {:?}",
         live.brain.action(),
     );
-    // One key that changes nothing on screen (a password prompt). INPUT_HOLD
-    // is 0.65 s; 36 frames at 16 ms stay inside it.
+    // One key that changes nothing on screen (a password prompt); 36 frames stay
+    // inside `INPUT_HOLD` (0.65 s).
     live.brain.note_console_input(now, PetInputKind::Text);
     let mut poses = std::collections::BTreeSet::new();
     for i in 0..36 {
         now += Duration::from_millis(16);
         poses.insert(format!("{:?}", live.tick(now).pose));
-        // Precondition: the layer has a pose to impose (`committed-input` sets
-        // `console.pose = Some(PetStandEar)`), it is not resident, and the
-        // pet's action is a settled one (Sleep|Sit|Loaf|Purr|Groom|Perk|Stand).
+        // Precondition: the input hold owns the frame (`committed-input` imposes
+        // `PetStandEar`) and the cat stays settled.
         assert_eq!(
             live.brain.console_reason(),
             "committed-input",
@@ -263,8 +253,8 @@ fn a_settled_cat_typed_at_keeps_its_own_animation() {
             live.brain.action(),
         );
     }
-    // The silhouette is the action machine's: a cat whose action says Stand
-    // wears `PetStand`, not the console layer's `PetStandEar`.
+    // The silhouette is the action machine's: a cat whose action says Stand wears
+    // `PetStand`, not the console layer's `PetStandEar`.
     assert!(
         !poses.contains("PetStandEar"),
         "the console layer replaced a settled cat's silhouette with its own \

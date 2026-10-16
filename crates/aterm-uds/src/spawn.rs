@@ -3,8 +3,9 @@
 
 //! Which Windows CONSOLE a child process gets — decided in one place, when its
 //! `Command` is built: by `aterm_uds::spawnfd::command`, every shipped child's
-//! constructor, which applies [`Console::Quiet`] off Unix, and by [`set_flags`].
-//! Off Windows nothing here changes a `Command`.
+//! constructor, which applies [`Console::Quiet`] off Unix, by [`set_flags`] and,
+//! for a GUI image, by [`set_gui_image_flags`]. Off Windows nothing here changes
+//! a `Command`.
 //!
 //! ## The defect this exists to prevent (measured 2026-09-30)
 //!
@@ -53,7 +54,8 @@
 //! **Why not `DETACHED_PROCESS`.** A detached child has no console at all, and
 //! every plain console child IT starts then gets a new VISIBLE one (measured).
 //! [`Console::Detached`] is only for a GUI image (the console image handing a
-//! window to `aterm-gui.exe`), which has no console under any flag.
+//! window to `aterm-gui.exe`), which has no console under any flag; its one
+//! setter, [`set_gui_image_flags`], says so in its name.
 //!
 //! **Other flags compose through `extra`.** `CREATE_NEW_PROCESS_GROUP` alone
 //! from a parent with no console gives a VISIBLE window (measured: the codex
@@ -62,16 +64,17 @@
 //! `CREATE_NEW_CONSOLE`, `CREATE_NO_WINDOW`) come only from [`Console`]: any in
 //! `extra` are dropped.
 //!
-//! **[`set_flags`] is the ONLY setter.** std's
+//! **This module holds the ONLY setter.** std's
 //! `std::os::windows::process::CommandExt::creation_flags` REPLACES the whole
 //! flag word (measured: `CREATE_NO_WINDOW` then `CREATE_NEW_PROCESS_GROUP`
 //! shared the parent's console), so a second call anywhere after this module's
-//! silently brings the flash back. [`set_flags`] replaces the word too, which is
-//! how a site overrides the quiet choice `spawnfd::command` made: it calls
-//! [`set_flags`] on that `Command` with the whole choice (`Console::Detached`
-//! for the windowed sibling; `Console::Quiet` plus `CREATE_NEW_PROCESS_GROUP`
-//! for the codex daemon-update), and a raw `Command` B27 allows (a transparent
-//! pass-through) gets its console from [`set_flags`] the same way.
+//! silently brings the flash back; the workspace clippy.toml bans it outside
+//! here. [`set_flags`] replaces the word too, which is how a site overrides the
+//! quiet choice `spawnfd::command` made: it calls [`set_flags`] on that
+//! `Command` with its extra bits (`CREATE_NEW_PROCESS_GROUP` for the codex
+//! daemon-update), the windowed sibling calls [`set_gui_image_flags`], and a
+//! reviewed raw `Command` (a transparent pass-through) gets its console from
+//! [`set_flags`] the same way.
 //!
 //! A GUI-subsystem target ignores every console flag (measured: a WinForms
 //! child showed its form, with no console, under no flag, `CREATE_NO_WINDOW`,
@@ -91,22 +94,15 @@
 //!
 //! ## The fence
 //!
-//! B27 of `tools/grep_guard.sh` keeps every shipped `Command` on
-//! `aterm_uds::spawnfd::command`, which applies this rule off Unix; its
-//! allow-list names the raw exceptions. B28 keeps the decision here, in shipped
-//! code: std's `creation_flags` setter appears nowhere but this file, raw
-//! `CreateProcess*` / `ShellExecute*` / `WinExec` only in the ConPTY seam and
-//! the URL opener (by count), an explicit [`Console::Detached`] or
-//! [`Console::Visible`] only at the windowed sibling, no `Command` builder of
-//! this module's is called from outside aterm-uds (one would skip the Unix
-//! inheritance strip; the two it had, `command` and `command_as`, were removed
-//! when B27 landed), and each raw site B27 allows by fn that Windows reaches
-//! calls [`set_flags`] itself (B28e; the Unix-only rows are listed there). The
-//! one raw spawn without this rule is `aterm-verify`'s toolchain probes (B27's
-//! one whole-crate row that ships): dependency-free by charter, they are
-//! reached only from `aterm help rust`, typed at a console whose children share
-//! it, where [`Console::Quiet`] would add nothing; started with no console at
-//! all, each probe would show a console window.
+//! The workspace clippy.toml bans `std::process::Command` (every shipped child
+//! is built by `aterm_uds::spawnfd::command`, which applies this rule off
+//! Unix), std's `creation_flags` setter and the `windows-sys` process-creation
+//! calls; each reviewed raw site carries its `#[expect]`, and one that Windows
+//! reaches calls [`set_flags`] itself. The one raw spawn without this rule is
+//! atpkg's toolchain probes (`toolchain.rs`, compiled into the dependency-free
+//! aterm-verify too): reached only from `aterm help rust`, typed at a console
+//! whose children share it, where [`Console::Quiet`] would add nothing; started
+//! with no console at all, each probe would show a console window.
 //!
 //! ## What is not here
 //!
@@ -122,12 +118,10 @@
 //! [`Console`]: crate::spawn::Console
 //! [`Console::Quiet`]: crate::spawn::Console::Quiet
 //! [`Console::Detached`]: crate::spawn::Console::Detached
-//! [`Console::Visible`]: crate::spawn::Console::Visible
 //! [`creation_flags`]: crate::spawn::creation_flags
 //! [`have_console`]: crate::spawn::have_console
 //! [`set_flags`]: crate::spawn::set_flags
-
-use std::process::Command;
+//! [`set_gui_image_flags`]: crate::spawn::set_gui_image_flags
 
 /// `DETACHED_PROCESS` (WinBase.h): the child gets NO console — neither this
 /// process's nor a new one. For a GUI image only ([`Console::Detached`]).
@@ -138,8 +132,8 @@ use std::process::Command;
 /// command (`aterm`'s `windowed_sibling`, where this constant lived until
 /// 2026-09-30).
 pub const DETACHED_PROCESS: u32 = 0x0000_0008;
-/// `CREATE_NEW_CONSOLE` (WinBase.h): the child gets a new, VISIBLE console
-/// ([`Console::Visible`]).
+/// `CREATE_NEW_CONSOLE` (WinBase.h): the child gets a new, VISIBLE console.
+/// No choice here sets it; [`creation_flags`] drops it from `extra`.
 pub const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
 /// `CREATE_NEW_PROCESS_GROUP` (WinBase.h): the child leads a new console process
 /// group, with Ctrl+C disabled in it. Not a console bit: it composes through
@@ -160,11 +154,10 @@ pub enum Console {
     /// own (`CREATE_NO_WINDOW`), which its console children share.
     Quiet,
     /// No console at all (`DETACHED_PROCESS`): only for a GUI image, such as
-    /// the windowed sibling the console image starts. A console image started
-    /// this way gives each plain console child of its own a VISIBLE console.
+    /// the windowed sibling the console image starts ([`set_gui_image_flags`]).
+    /// A console image started this way gives each plain console child of its
+    /// own a VISIBLE console.
     Detached,
-    /// A new VISIBLE console (`CREATE_NEW_CONSOLE`): a window someone asked for.
-    Visible,
 }
 
 /// The `dwCreationFlags` word for a child that gets `console`, with the caller's
@@ -177,7 +170,6 @@ pub const fn creation_flags(console: Console, extra: u32, have_console: bool) ->
         Console::Quiet if have_console => extra,
         Console::Quiet => extra | CREATE_NO_WINDOW,
         Console::Detached => extra | DETACHED_PROCESS,
-        Console::Visible => extra | CREATE_NEW_CONSOLE,
     }
 }
 
@@ -208,16 +200,49 @@ pub fn have_console() -> bool {
     false
 }
 
-/// Set `cmd`'s creation flags for `console` plus `extra`, decided now
-/// ([`creation_flags`] over [`have_console`]). THE ONLY creation-flags setter:
-/// std's `creation_flags` replaces the whole word, so any later call drops
-/// `CREATE_NO_WINDOW` (module docs). It replaces the word as well, so called on
-/// a `Command` `spawnfd::command` built it overrides that quiet choice with the
+/// Set `cmd`'s creation flags for a [`Console::Quiet`] child plus `extra`,
+/// decided now ([`creation_flags`] over [`have_console`]). std's
+/// `creation_flags` replaces the whole word, so any later call drops
+/// `CREATE_NO_WINDOW` (module docs); this replaces the word as well, so called
+/// on a `Command` `spawnfd::command` built it overrides that choice with the
 /// whole of this one. A no-op off Windows.
-pub fn set_flags(cmd: &mut Command, console: Console, extra: u32) -> &mut Command {
+#[expect(
+    clippy::disallowed_types,
+    reason = "the console setter for a reviewed raw std Command (and, off Unix, spawnfd's own)"
+)]
+pub fn set_flags(cmd: &mut std::process::Command, extra: u32) -> &mut std::process::Command {
+    set_console(cmd, Console::Quiet, extra)
+}
+
+/// Set `cmd`'s creation flags for a GUI image: no console at all
+/// ([`Console::Detached`]), which a console image must never get (its own
+/// console children would each open a visible window). The windowed sibling's.
+/// A no-op off Windows.
+#[expect(
+    clippy::disallowed_types,
+    reason = "the console setter for the windowed sibling's raw std Command"
+)]
+pub fn set_gui_image_flags(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    set_console(cmd, Console::Detached, 0)
+}
+
+/// THE ONLY creation-flags write: `console` plus `extra`, decided now.
+#[expect(
+    clippy::disallowed_types,
+    reason = "the one creation-flags write, on the std Command it is given"
+)]
+fn set_console(
+    cmd: &mut std::process::Command,
+    console: Console,
+    extra: u32,
+) -> &mut std::process::Command {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt as _;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the one creation-flags setter (module docs)"
+        )]
         cmd.creation_flags(creation_flags(console, extra, have_console()));
     }
     #[cfg(not(windows))]
@@ -231,22 +256,6 @@ mod tests {
         CONSOLE_BITS, CREATE_NEW_CONSOLE, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, Console,
         DETACHED_PROCESS, creation_flags,
     };
-
-    /// The Win32 values, from WinBase.h. `DETACHED_PROCESS` came here from
-    /// `aterm`'s `windowed_sibling` with its pin.
-    #[test]
-    fn the_flag_values_are_the_win32_ones() {
-        assert_eq!(DETACHED_PROCESS, 0x8);
-        assert_eq!(CREATE_NEW_CONSOLE, 0x10);
-        assert_eq!(CREATE_NEW_PROCESS_GROUP, 0x200);
-        assert_eq!(CREATE_NO_WINDOW, 0x0800_0000);
-        assert_eq!(CONSOLE_BITS, 0x0800_0018);
-        assert_eq!(
-            CONSOLE_BITS & CREATE_NEW_PROCESS_GROUP,
-            0,
-            "not a console bit"
-        );
-    }
 
     /// The rule, whole: a quiet child is windowless only when this process has
     /// no console, the explicit choices ignore whether it has one, and the
@@ -265,18 +274,16 @@ mod tests {
             (Console::Detached, 0, false, DETACHED_PROCESS),
             (Console::Detached, 0, true, DETACHED_PROCESS),
             (Console::Detached, group, true, DETACHED_PROCESS | group),
-            (Console::Visible, 0, false, CREATE_NEW_CONSOLE),
-            (Console::Visible, 0, true, CREATE_NEW_CONSOLE),
             // Console bits passed in `extra` are dropped.
             (Console::Quiet, CREATE_NEW_CONSOLE | group, true, group),
             (Console::Quiet, DETACHED_PROCESS, false, CREATE_NO_WINDOW),
             (Console::Quiet, CREATE_NO_WINDOW, true, 0),
             (Console::Detached, CREATE_NO_WINDOW, false, DETACHED_PROCESS),
             (
-                Console::Visible,
+                Console::Detached,
                 CONSOLE_BITS | group,
                 true,
-                CREATE_NEW_CONSOLE | group,
+                DETACHED_PROCESS | group,
             ),
         ] {
             assert_eq!(
@@ -292,7 +299,7 @@ mod tests {
     /// (measured: `DETACHED_PROCESS` wins over `CREATE_NO_WINDOW`).
     #[test]
     fn no_flag_word_carries_two_console_bits() {
-        for console in [Console::Quiet, Console::Detached, Console::Visible] {
+        for console in [Console::Quiet, Console::Detached] {
             for have in [false, true] {
                 for extra in [0, CREATE_NEW_PROCESS_GROUP, CONSOLE_BITS, u32::MAX] {
                     let bits = creation_flags(console, extra, have) & CONSOLE_BITS;
@@ -305,14 +312,15 @@ mod tests {
         }
     }
 
-    /// Off Windows [`super::set_flags`] sets nothing, whatever the choice: the
+    /// Off Windows the setters set nothing, whatever the choice: the
     /// `Command` keeps its program and arguments, and the answer to "a
     /// console?" is no.
     #[cfg(not(windows))]
     #[test]
     fn off_windows_set_flags_changes_nothing() {
         let mut cmd = std::process::Command::new("/bin/true");
-        super::set_flags(&mut cmd, Console::Detached, CREATE_NEW_PROCESS_GROUP);
+        super::set_flags(&mut cmd, CREATE_NEW_PROCESS_GROUP);
+        super::set_gui_image_flags(&mut cmd);
         assert_eq!(cmd.get_program(), "/bin/true");
         assert_eq!(cmd.get_args().count(), 0);
         assert!(!super::have_console());

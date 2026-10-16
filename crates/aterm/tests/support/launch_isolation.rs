@@ -14,6 +14,10 @@
 //! which a caller adds to its window/session argv (before any `-e`/`--` payload), and a
 //! window's private socket is the `--control-sock` FLAG ([`control_sock`]): no
 //! environment variable selects a socket, the grid or headless mode (2026-09-24).
+#![allow(
+    clippy::disallowed_types,
+    reason = "test code: a stand-in child may inherit descriptors"
+)]
 
 use std::path::Path;
 use std::process::Command;
@@ -44,7 +48,7 @@ pub const CONFIG_OFF: &str = "[update]\nenabled = false\nauto_apply = false\n\
                               [machine]\nuniversal_control = \"leave\"\n\
                               [harness]\nenabled = false\n";
 
-/// [`CONFIG_OFF`]'s last table: Settings ▸ Harness off. The window supervises every
+/// [`CONFIG_OFF`]'s last table: Settings ▸ Agents off. The window supervises every
 /// agent session it hosts by default, a headless instance's included (owner,
 /// 2026-09-24), so a test that drives a fake `claude` would otherwise share the
 /// session with it. A test OF that supervisor takes this table out and writes its own.
@@ -64,7 +68,7 @@ pub const HARNESS_OFF: &str = "[harness]\nenabled = false\n";
 /// cannot write to is a broken fixture, not a reason to boot an unwatched instance.
 ///
 /// Unix only, like `aterm_uds::lifeline`: this file is also included by a Windows
-/// test twin (`protected_spawn.rs`), and `gate cells-foreign` compiles it there.
+/// test twin (`protected_spawn.rs`), and `verify cells` compiles it there.
 #[cfg(unix)]
 #[allow(dead_code)]
 pub fn lifeline(cmd: &mut Command, root: &Path) -> aterm_uds::lifeline::Lifeline {

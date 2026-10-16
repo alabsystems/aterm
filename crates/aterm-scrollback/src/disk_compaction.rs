@@ -15,28 +15,21 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 impl DiskColdTier {
-    /// Rewrite surviving pages contiguously to reclaim dead space at the
-    /// front of the file. Uses atomic temp-file + rename for crash safety.
+    /// Rewrite surviving pages contiguously to reclaim dead space at the front of
+    /// the file, via temp file + rename for crash safety.
     ///
-    /// Called from `truncate_front_lines` when `dead_bytes() > live_bytes()`
-    /// (file is >50% garbage). Compaction failure is non-fatal — the file
-    /// works fine with dead space; the next rotation will retry.
+    /// Called from `truncate_front_lines` when `dead_bytes() > live_bytes()`.
+    /// Failure is non-fatal: the file works with dead space and the next rotation
+    /// retries.
     pub(super) fn compact(&mut self) -> io::Result<()> {
         if self.file.is_none() {
             return Ok(());
         }
-        // `compact_inner` drops the mmap up front and only re-establishes it on the
-        // success path (reopen_after_compact). On any error before the rename — a
-        // temp File::create, page read, zstd decode of a corrupt first page, or
-        // disk-full write — self.file / self.index / front_offset are untouched;
-        // a failed rename reopens the original path before returning. Either way,
-        // best-effort re-map the original file to keep cold reads working. Without
-        // this, every subsequent decompress_page returns "no memory map available
-        // for disk read" until the next append, contradicting the documented
-        // "compaction failure is non-fatal — the file works fine with dead space"
-        // contract. Mirrors write_back_truncation's partial-write recovery. If the
-        // post-rename reopen failed, self.file is None and this leaves mmap = None
-        // (reads fail closed until the store is reloaded).
+        // `compact_inner` drops the mmap first and re-maps only on success. Any
+        // earlier failure leaves file, index and front_offset untouched (a failed
+        // rename reopens the original path), so re-map the original file to keep
+        // cold reads working. If the post-rename reopen failed, self.file is None and
+        // reads fail closed until the store is reloaded.
         let result = self.compact_inner();
         if result.is_err() {
             self.remap_current_file();
@@ -56,10 +49,8 @@ impl DiskColdTier {
         tmp.write_all(&header)?;
 
         let mut new_offset = HEADER_SIZE as u64;
-        // LIVE entries only: dead-prefix entries describe already-dropped
-        // pages and must not be resurrected into the compacted file. Direct
-        // field slicing (not the live_index() method) keeps the borrow
-        // disjoint from the `self.file` mutable borrow below.
+        // Live entries only: dead-prefix entries describe dropped pages. Slicing the
+        // field (not live_index()) keeps the borrow disjoint from `self.file` below.
         let live_from = self.front_dropped;
         let live_entries = self.index.get(live_from..).unwrap_or(&[]);
         let mut new_index = Vec::with_capacity(live_entries.len());
@@ -81,25 +72,20 @@ impl DiskColdTier {
 
         Self::write_compact_header(&mut tmp, &new_index)?;
         drop(tmp);
-        // Close our own destination handle BEFORE renaming over it: Windows can
-        // only replace a name with open handles when every holder opened with
-        // FILE_SHARE_DELETE and the volume supports POSIX-semantics rename
-        // (NTFS). Holding self.file across the rename made compaction fail on
-        // every rotation on exFAT/FAT32 scrollback dirs, so front dead bytes
-        // were never reclaimed and the file grew without bound.
+        // Close our handle before renaming over it: Windows replaces a name with open
+        // handles only when every holder opened with FILE_SHARE_DELETE on a volume
+        // with POSIX-semantics rename (NTFS); on exFAT/FAT32 the rename would fail.
         self.file = None;
         if let Err(e) = with_av_retry(|| std::fs::rename(&tmp_path, &self.path)) {
-            // The original file still owns self.path; reopen it so the tier
-            // keeps operating with dead space instead of silently degrading to
-            // memory-only appends (the reopen error, vanishingly unlikely for a
-            // file we just read, is secondary to the rename error we return).
+            // The original file still owns self.path; reopen it so the tier keeps
+            // working with dead space instead of degrading to memory-only appends.
             self.file = with_av_retry(|| open_rw(&self.path)).ok();
             return Err(e);
         }
         self.reopen_after_compact(new_index, new_offset, trim_front > 0)
     }
 
-    /// Decompress the first page, trim the consumed prefix, recompress (#5942).
+    /// Decompress the first page, trim the consumed prefix, recompress.
     fn compact_page_trimmed(
         file: &mut File,
         entry: &PageIndexEntry,
@@ -111,7 +97,7 @@ impl DiskColdTier {
         file.seek(SeekFrom::Start(entry.offset + PAGE_HEADER_SIZE as u64))?;
         file.read_exact(&mut compressed)?;
 
-        let decompressed = crate::decode_zstd_bounded(&compressed)
+        let decompressed = crate::decode_cold_bounded(&compressed)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         let lines = deserialize_page_lines(&decompressed);
         if trim > lines.len() {
@@ -124,8 +110,8 @@ impl DiskColdTier {
             ));
         }
         let trimmed = &lines[trim..];
-        let recompressed =
-            zstd::encode_all(serialize_lines(trimmed).as_slice(), crate::COLD_ZSTD_LEVEL)?;
+        let recompressed = crate::encode_cold_block(&serialize_lines(trimmed))
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
         let mut page_header = [0u8; PAGE_HEADER_SIZE];
         page_header[0..4].copy_from_slice(&len_to_u32(recompressed.len()).to_le_bytes());
@@ -180,20 +166,17 @@ impl DiskColdTier {
         had_front_trim: bool,
     ) -> io::Result<()> {
         let opened = with_av_retry(|| open_rw(&self.path));
-        // Adopt the compacted layout BEFORE the fallible steps: the rename already
-        // succeeded, so self.path IS the compacted file, and stale metadata would
-        // desynchronize the tier from what a reload sees. If the reopen above
-        // failed, self.file stays None (closed pre-rename) and reads fail closed
-        // ("no memory map available") rather than serving old offsets.
+        // Adopt the compacted layout before the fallible steps: after the rename,
+        // self.path is the compacted file. If the reopen failed, self.file stays None
+        // and reads fail closed rather than serve old offsets.
         self.index = new_index;
-        // Fresh, all-live index: reset the front-drop cursor and absolute
-        // base along with the zero-based cumulative rebuild below.
+        // Fresh, all-live index: reset the front-drop cursor and absolute base.
         self.front_dropped = 0;
         self.cumulative_base = 0;
         self.write_offset = new_offset;
 
         if had_front_trim {
-            // Consumed prefix is now physically trimmed — reset front_offset (#5942).
+            // The consumed prefix is now physically trimmed.
             self.front_offset = 0;
         }
 
@@ -212,10 +195,9 @@ impl DiskColdTier {
         self.mark_appends_synced();
 
         let file = opened?;
-        // Map LAST, and treat a mapping failure as NON-fatal: file/index/path are
-        // already consistent, so a failed map just leaves reads returning "no memory
-        // map available" until the next append re-maps (recoverable) rather than
-        // losing appended data. SAFETY: the File is exclusively owned by this tier.
+        // Map last; a mapping failure is non-fatal because file, index and path are
+        // already consistent: reads fail until the next append re-maps.
+        // SAFETY: the File is exclusively owned by this tier.
         self.mmap = if new_offset > HEADER_SIZE as u64 {
             unsafe { MmapMut::map_mut(&file) }.ok()
         } else {
@@ -237,7 +219,6 @@ impl DiskColdTier {
         self.access_counter.set(0);
         self.write_offset = HEADER_SIZE as u64;
 
-        // Truncate file if we have one
         if self.file.is_some() {
             self.flush_and_drop_mmap()?;
         }
@@ -261,8 +242,7 @@ impl DiskColdTier {
     /// Sync changes to disk.
     #[cfg(test)]
     pub fn sync(&mut self) -> io::Result<()> {
-        // Catch the deferred append header up first so an explicit sync()
-        // leaves the on-disk header consistent with the in-memory index.
+        // Catch up the deferred append header so the on-disk header matches the index.
         self.sync_appends()?;
         if let Some(ref mmap) = self.mmap {
             mmap.flush()?;
@@ -273,9 +253,7 @@ impl DiskColdTier {
         Ok(())
     }
 
-    /// Ensure mapped data is flushed before unmapping.
-    ///
-    /// We explicitly drop the mmap to avoid relying on field drop order.
+    /// Flush the mmap, then drop it explicitly rather than rely on field drop order.
     pub(super) fn flush_and_drop_mmap(&mut self) -> io::Result<()> {
         if let Some(ref mmap) = self.mmap {
             mmap.flush()?;

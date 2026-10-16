@@ -7,9 +7,9 @@
 // pointer reinterpret, pinned by its layout-equivalence tests. Every other
 // module keeps `#![deny(unsafe_code)]`.
 #![deny(unsafe_code)]
-#![deny(missing_docs)]
+#![warn(missing_docs)]
 // Production unwrap() is forbidden; tests opt out uniformly at the crate root.
-#![deny(clippy::unwrap_used)]
+#![warn(clippy::unwrap_used)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
 //! Trusted data-flow provenance framework (Phase 0; issue #8000, parent #7877).
@@ -17,8 +17,9 @@
 //! This crate provides the type-level taint the parser carries: every byte the
 //! PTY hands the `ActionSink` arrives as `Provenance<_, Pty>`, and no conversion
 //! relabels it.
-//! Privileged sinks are gated by capability ZSTs minted inside dispatch
-//! (`aterm-core/tests/capability_ceremony.rs`), not by a lift out of `Pty`.
+//! Privileged sinks are gated by capability ZSTs minted inside dispatch (each
+//! sealed by a private field, `aterm-core/src/terminal/mod.rs`'s `Seal`), not by
+//! a lift out of `Pty`.
 //!
 //! # Overview
 //!

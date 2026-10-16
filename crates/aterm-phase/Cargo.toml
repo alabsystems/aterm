@@ -11,15 +11,16 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "aterm — the worker-phase reader: busy | prompt | limited | idle | question, the context indicator and the approval box, read from one screen of a Claude Code or Codex session; shared by `aterm drive phase` and the fabric bridge's presence rows"
+description = "aterm — the worker-phase reader: busy | prompt | limited | idle | question, the context indicator and the approval box, read from one screen of a Claude Code, Codex, agy or Muse Code session; shared by `aterm drive phase` and the server's agent verdict"
 
 [lints]
 workspace = true
 
 # NO DEPENDENCIES, and that is the point of the crate. The reader is pure
-# functions over `&[String]` rows; `aterm-agent` (the supervisor, `aterm drive`)
-# and `aterm-link` (the fabric bridge, whose presence rows carry `phase=`)
-# both link it, and neither should pull the other. See src/lib.rs.
+# functions over `&[String]` rows, linked by `aterm-agent` (the supervisor,
+# `aterm drive`) and `aterm-gui` (the server, whose agent verdict the fabric
+# relays as `phase=`); `aterm-link`, the fabric, links no screen reader. See
+# src/lib.rs.
 [dependencies]
 
 [[test]]

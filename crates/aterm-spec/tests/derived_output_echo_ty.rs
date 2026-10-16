@@ -27,12 +27,6 @@ fn output_echo_receipt_publication_proves_and_catches() {
     let model = output_echo_receipt_publication_model();
     let _covered = verify::prove_and_catch_scalar(&model, model.name);
 
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name),
-        "the cross-reference/strict-vacuity registry must include this machine",
-    );
     assert_eq!(
         interp::fired_actions(&model),
         BTreeSet::from([

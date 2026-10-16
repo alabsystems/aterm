@@ -141,7 +141,7 @@ impl SafeStream {
             joint[..held].copy_from_slice(&self.carry[..held]);
             joint[held..held + take].copy_from_slice(&piece[..take]);
             let joint = &joint[..held + take];
-            let used = render(joint, out, false);
+            let used = render(joint, out);
             if used < held {
                 // Still cut: `piece` was too short to complete it, so all of
                 // it is held now (at most three bytes together).
@@ -151,7 +151,7 @@ impl SafeStream {
             self.held = 0;
             piece = &piece[(used - held).min(piece.len())..];
         }
-        let used = render(piece, out, false);
+        let used = render(piece, out);
         self.hold(&piece[used.min(piece.len())..]);
     }
 
@@ -173,9 +173,8 @@ impl SafeStream {
 }
 
 /// Render `bytes` into `out` and return how many were rendered: all of them,
-/// except — when `last` is false — a character cut at the end, which the
-/// caller holds for the next piece.
-fn render(bytes: &[u8], out: &mut String, last: bool) -> usize {
+/// except a character cut at the end, which the caller holds for the next piece.
+fn render(bytes: &[u8], out: &mut String) -> usize {
     let mut at = 0;
     while at < bytes.len() {
         let rest = &bytes[at..];
@@ -204,14 +203,8 @@ fn render(bytes: &[u8], out: &mut String, last: bool) -> usize {
                 }
                 at += n;
             }
-            // A character cut at the end: held, unless this is the last piece.
-            Some(None) if !last => return at,
-            Some(None) => {
-                for &b in bytes.iter().skip(at) {
-                    push_byte_escape(out, b);
-                }
-                return bytes.len();
-            }
+            // A character cut at the end: held until more input or `finish`.
+            Some(None) => return at,
         }
     }
     bytes.len()

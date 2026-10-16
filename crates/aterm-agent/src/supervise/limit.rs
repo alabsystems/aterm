@@ -150,6 +150,77 @@ pub fn parse_reset(text: &str) -> Option<ResetSpec> {
     })
 }
 
+/// The reset a limit row of Codex's `/status` card names, the words inside
+/// its `(resets …)` (`harness::usage::codex_status_windows`): codex-rs paints
+/// its clock as `%H:%M` (0.156.1: `13:24`) or, on a 12-hour clock, `%-I:%M
+/// %p` (0.163.0, measured in the lab: `12:15 PM`; its binary carries both
+/// formats), followed by ` on %-d %b` when the reset falls on another day
+/// than the reading it was drawn from (`13:24 on 1 Oct`, `11:15 AM on 21
+/// Oct`), in the TUI's own zone, which it never names. [`parse_reset`] reads
+/// a date only in front of the clock, so it refuses the dated form. `None`
+/// for any other shape.
+pub fn parse_card_reset(text: &str) -> Option<ResetSpec> {
+    let text = text.trim();
+    let (clock, day) = match text.split_once(" on ") {
+        Some((clock, day)) => (clock, Some(day)),
+        None => (text, None),
+    };
+    let (hour, minute) = card_clock(clock)?;
+    let date = match day {
+        None => None,
+        Some(day) => {
+            let words: Vec<&str> = day.split_whitespace().collect();
+            let [d, month] = words.as_slice() else {
+                return None;
+            };
+            let d: u32 = d.parse().ok()?;
+            if !(1..=31).contains(&d) {
+                return None;
+            }
+            Some((month_of(month)?, d))
+        }
+    };
+    Some(ResetSpec::At {
+        date,
+        hour,
+        minute,
+        zone: None,
+    })
+}
+
+/// A card's clock ([`parse_card_reset`]) as `(hour, minute)` on the 24-hour
+/// clock: `%H:%M` (two digits each), or `%-I:%M AM|PM` (an hour of 1 to 12,
+/// one digit or two; 12 AM is midnight, 12 PM noon). `None` otherwise.
+fn card_clock(clock: &str) -> Option<(u32, u32)> {
+    let (time, pm) = match clock.rsplit_once(' ') {
+        Some((time, "AM")) => (time, Some(false)),
+        Some((time, "PM")) => (time, Some(true)),
+        Some(_) => return None,
+        None => (clock, None),
+    };
+    let (h, m) = time.split_once(':')?;
+    let digits = |s: &str, most: usize| {
+        (1..=most).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit())
+    };
+    if m.len() != 2 || !digits(m, 2) {
+        return None;
+    }
+    let minute: u32 = m.parse().ok()?;
+    if minute > 59 {
+        return None;
+    }
+    let hour: u32 = match pm {
+        None if h.len() == 2 && digits(h, 2) => h.parse().ok().filter(|h| *h <= 23)?,
+        None => return None,
+        Some(pm) if digits(h, 2) => {
+            let h12: u32 = h.parse().ok().filter(|h| (1..=12).contains(h))?;
+            h12 % 12 + if pm { 12 } else { 0 }
+        }
+        Some(_) => return None,
+    };
+    Some((hour, minute))
+}
+
 /// A LIMIT NOTICE'S RESET AS ITS CLOCK SAYS IT — the date it names, the hour
 /// and the minute — what tells one limit's notice from another's: the one a
 /// supervisor waits on from an older one a `/resume`d conversation redraws
@@ -775,6 +846,67 @@ mod tests {
         assert_eq!(reset_at(&spec, dec30, 0, zones), 1_798_880_400);
     }
 
+    /// Codex's `/status` card names a reset as `%H:%M` (0.156.1) or `%-I:%M
+    /// %p` (0.163.0, measured: `12:15 PM`, `11:15 AM on 21 Oct`), and ` on
+    /// %-d %b` when it falls on another day: read as the clock with the date,
+    /// no zone. NEGATIVE CONTROLS: the supervisor's own grammar refuses the
+    /// dated form, and the card's grammar refuses the notices' shapes and
+    /// anything off its own (a one-digit 24-hour hour, an hour past 12 with
+    /// AM/PM, hour 0 on the 12-hour clock, a lower-case `pm`, a date in front,
+    /// a stray word).
+    #[test]
+    fn the_codex_cards_reset_parses_as_its_clock_and_day() {
+        let at = |date, hour, minute| {
+            Some(ResetSpec::At {
+                date,
+                hour,
+                minute,
+                zone: None,
+            })
+        };
+        assert_eq!(
+            parse_card_reset("13:24 on 1 Oct"),
+            at(Some((10, 1)), 13, 24)
+        );
+        assert_eq!(
+            parse_card_reset("00:05 on 31 Dec"),
+            at(Some((12, 31)), 0, 5)
+        );
+        assert_eq!(parse_card_reset(" 13:24 "), at(None, 13, 24));
+        // 0.163.0's 12-hour clock, as measured in the lab.
+        assert_eq!(parse_card_reset("12:15 PM"), at(None, 12, 15));
+        assert_eq!(
+            parse_card_reset("11:15 AM on 21 Oct"),
+            at(Some((10, 21)), 11, 15)
+        );
+        assert_eq!(parse_card_reset("1:24 PM"), at(None, 13, 24));
+        assert_eq!(parse_card_reset("12:05 AM"), at(None, 0, 5));
+        assert_eq!(parse_card_reset("09:05 AM"), at(None, 9, 5));
+        assert_eq!(
+            parse_reset("13:24 on 1 Oct"),
+            None,
+            "not the notices' grammar"
+        );
+        for text in [
+            "13:24 PM",
+            "0:05 AM",
+            "1:24 pm",
+            "1:24  PM",
+            "1:5 PM",
+            "1:24",
+            "Oct 1 at 13:24",
+            "13:24 on Oct 1",
+            "13:24 on 1 Oct 2026",
+            "13:24 on 32 Oct",
+            "24:00",
+            "13:60",
+            "in 3h",
+            "",
+        ] {
+            assert_eq!(parse_card_reset(text), None, "{text:?}");
+        }
+    }
+
     /// Both spellings the real notices carry, with the zone read.
     #[test]
     fn both_spellings_parse_with_the_zone() {
@@ -1234,9 +1366,9 @@ mod tests {
         // every clock swept here is on the minute, and so is every instant whose
         // local time of day equals one (86,400 is a whole number of minutes), so
         // the seconds skipped can never match and the first match is the one a
-        // walk of every second finds. Measured 2026-10-05: the second-by-second
-        // walk (~43,000 steps for each of ~40,000 scans) was all of this test's
-        // 4.0 s alone (~40 s at the merge gate's load); by the minute it is 0.09 s.
+        // walk of every second finds. The second-by-second walk (~43,000 steps
+        // for each of ~40,000 scans) was all of this test's 4.0 s alone (~40 s
+        // on a loaded machine); by the minute it is 0.09 s.
         let scan = |clock_s: i64, printed: i64| -> i64 {
             assert_eq!(clock_s % 60, 0, "a clock on the minute");
             let mut t = printed + 1;

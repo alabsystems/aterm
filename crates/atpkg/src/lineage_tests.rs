@@ -1,22 +1,20 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `lineage` over synthetic trees: the scan's evidence classes (each with the
-//! prose or shape that must NOT count), compiler admission by content (the `-vV`
-//! probe injected, everything else real files), the SEED-MINT port's messages and
-//! the LINEAGE record's round trip.
+//! `lineage` over synthetic trees: the scan's evidence classes (each with the prose or shape
+//! that must not count), compiler admission by content (the `-vV` probe injected, everything
+//! else real files), the SEED-MINT messages and the LINEAGE record's round trip.
 
 use super::*;
 
-/// A Trust compiler's commit (the 7d5533b2 seal's).
+/// A Trust compiler's commit.
 const TRUST: &str = "7d5533b2bb9c9417bc09c27f1acd9d0b808f8f15";
-/// Stock 1.97.1's commit (store ay 8256 embeds it 451 times).
+/// Stock rustc 1.97.1's commit.
 const STOCK: &str = "8bab26f4f68e0e26f0bb7960be334d5b520ea452";
 /// A Mach-O thin 64-bit head: what `native_head` admits.
 const MACHO: &[u8] = &[0xcf, 0xfa, 0xed, 0xfe, 0x0c, 0x00, 0x00, 0x01];
 
-/// A scratch dir ([`crate::testdir`]: removed on drop however the test ends), and its
-/// path.
+/// A scratch dir (removed on drop) and its path.
 fn tmp(label: &str) -> (crate::testdir::Dir, PathBuf) {
     let dir = crate::testdir::dir(&format!("atpkg-lineage-{label}-"));
     let path = dir.to_path_buf();
@@ -70,7 +68,7 @@ fn a_stock_std_path_is_refused_and_named() {
     }
     .describe();
     assert!(described.contains(STOCK), "{described}");
-    // The admitted compiler's OWN commit is not evidence against it.
+    // The admitted compiler's own commit is not evidence against it.
     assert!(scan_bytes(&object(path.as_bytes()), STOCK).is_empty());
     // Not a 40-hex commit: not a std path.
     assert!(scan_bytes(&object(b"/rustc/not-a-commit/library/std/src/x.rs"), TRUST).is_empty());
@@ -109,10 +107,8 @@ fn a_stock_metadata_header_is_refused_and_trusts_own_is_not() {
 
 #[test]
 fn a_beta_or_distribution_built_compiler_is_evidence() {
-    // Every shape a stock rustc writes into crate metadata (`rustc {CFG_VERSION}`):
-    // bootstrap's `release()` makes the beta channel `<num>-beta.<n>`, and
-    // `rust_version()` appends ` (<description>)` when a distribution configures one
-    // (Homebrew, Fedora, Arch …). Each names a compiler that is not the admitted one.
+    // Every shape a stock rustc writes into crate metadata: a beta channel's
+    // `<num>-beta.<n>`, and the ` (<description>)` a distribution appends.
     for v in [
         "rustc 1.81.0-beta.3 (4c39e7b6b 2024-07-29)",
         "rustc 1.82.0 (f6e511eec 2024-10-15) (Homebrew)",
@@ -162,8 +158,8 @@ fn a_beta_or_distribution_built_compiler_is_evidence() {
         )
         .is_empty()
     );
-    // A length that runs past the version into anything but ` (…)` is no header: a
-    // string that merely STARTS with a version (prose, a self-report) is not one.
+    // A length that runs past the version into anything but ` (…)` is no header: a string
+    // that merely starts with a version (prose, a self-report) is not one.
     let mut not_a_header = b"rust\0\0\0\n\0\0\0\0\0\0\0\0".to_vec();
     let text = b"rustc 1.97.1 (8bab26f4f 2026-07-14) was the stock compiler we measured";
     not_a_header.push(u8::try_from(text.len()).expect("short"));
@@ -178,8 +174,8 @@ fn a_beta_or_distribution_built_compiler_is_evidence() {
 
 #[test]
 fn prose_and_self_reports_are_not_evidence() {
-    // Measured in the 7d5533b2 seal's librustc_ast metadata: a doc comment QUOTING a
-    // stock version. Space-led, so no length byte can match it.
+    // A doc comment quoting a stock version, as Trust's own crate metadata carries: space-led,
+    // so no length byte can match it.
     let prose = b" not work either. MEASURED on stock rustc 1.97.1 (8bab26f4f 2026-07-14),";
     assert!(scan_bytes(&object(prose), TRUST).is_empty());
     // A backtick-quoted `trustc 1.99.0-dev (…)` (libtrust_types).
@@ -190,7 +186,7 @@ fn prose_and_self_reports_are_not_evidence() {
         )
         .is_empty()
     );
-    // A program's build-info self-report (aterm's arm64 slice carries exactly this).
+    // A program's build-info self-report.
     let self_report = b"another copyrustc 1.99.0-dev (7d5533b2b 2026-09-23) (trustc 0.1.0)";
     assert!(scan_bytes(&object(self_report), TRUST).is_empty());
     assert!(scan_bytes(&object(self_report), STOCK).is_empty());
@@ -220,7 +216,7 @@ fn producer_wasm_and_rustup_evidence_is_refused() {
         )
         .is_empty()
     );
-    // A wasm producers section, as the orca-alab aterm_wasm_bg.wasm carries it.
+    // A wasm producers section.
     let mut wasm =
         b"\0asm\x01\0\0\0\0p\tproducers\x02\x08language\x01\x04Rust\0\x0cprocessed-by\x03\x05rustc"
             .to_vec();
@@ -311,7 +307,7 @@ fn scan_tree_reads_compiled_output_only() {
     let stock = format!("/rustc/{STOCK}/library/std/src/x.rs");
     std::fs::write(d.join("bin/ay"), object(stock.as_bytes())).expect("write");
     std::fs::write(d.join("bin/clean"), object(b"nothing foreign")).expect("write");
-    // A text file that QUOTES a stock path is documentation, not compiled output.
+    // A text file that quotes a stock path is documentation, not compiled output.
     std::fs::write(d.join("README"), stock.as_bytes()).expect("write");
     std::fs::write(
         d.join("lib/rustlib/t/lib/libstd-1.rlib"),
@@ -328,7 +324,7 @@ fn scan_tree_reads_compiled_output_only() {
     assert_eq!(files, vec!["bin/ay", "lib/rustlib/t/lib/libstd-1.rlib"]);
 }
 
-// --- compiler admission ------------------------------------------------------------------
+// Compiler admission.
 
 fn trust_vv(commit: &str) -> String {
     format!(
@@ -435,8 +431,7 @@ fn a_script_trustc_is_refused_before_it_runs() {
     );
 }
 
-/// The genesis-stage0 shape: sh wrappers named trustc/targo whose bodies exec rustup's
-/// stable and sed its identity into Trust's.
+/// Sh wrappers named trustc/targo that exec rustup's stable and sed its identity into Trust's.
 #[test]
 fn a_genesis_style_wrapper_is_refused_by_content() {
     let (_dir, d) = tmp("genesis");
@@ -461,8 +456,8 @@ fn a_genesis_style_wrapper_is_refused_by_content() {
     );
 }
 
-/// A stock rustc copied in under Trust's names: native, so it runs — and its `-vV`
-/// and its driver's bytes say what it is.
+/// A stock rustc copied in under Trust's names: native, so it runs, and its `-vV` and its
+/// driver's bytes say what it is.
 #[test]
 fn a_renamed_stock_rustc_is_refused_by_content() {
     let (_dir, d) = tmp("renamed");
@@ -512,7 +507,7 @@ fn a_stock_location_is_refused_before_it_runs() {
         err.iter().any(|l| l.contains("rustup's directory")),
         "{err:?}"
     );
-    // A trustc LINKED into ~/.cargo (a rustup proxy) resolves there and is refused too.
+    // A trustc linked into ~/.cargo (a rustup proxy) resolves there and is refused too.
     let (_dir2, d2) = tmp("cargo-link");
     let bin2 = toolchain(&d2.join("tc"), b"");
     std::fs::create_dir_all(d2.join(".cargo/bin")).expect("mkdir");
@@ -587,7 +582,7 @@ fn a_seed_mint_admits_the_bytes_it_compared_and_nothing_else() {
     // Dormancy never excuses a wrong receipt.
     assert!(check_compiler_with(&bin, LineagePolicy::Dormant, &probe).is_err());
 
-    // A receipt that compared other files does not cover THIS compiler's bytes.
+    // A receipt that compared other files does not cover this compiler's bytes.
     seed_mint(&d, TRUST, &[]);
     let text = std::fs::read_to_string(d.join(SEED_MINT_FILE)).expect("read");
     let only_trustc: String = text
@@ -612,10 +607,9 @@ fn a_seed_mint_admits_the_bytes_it_compared_and_nothing_else() {
     );
 }
 
-/// The port of `atpkg_seed_mint_refusals`: each refusal alone, in the words the shell
-/// function printed (tools/test-atpkg-spec-catch-up.sh greps them from the lane).
+/// Each SEED-MINT defect, alone, is exactly one refusal, and it names that defect.
 #[test]
-fn seed_mint_refusals_speak_the_shell_twins_words() {
+fn each_seed_mint_defect_alone_is_one_refusal_naming_it() {
     let (_dir, d) = tmp("mint-words");
     toolchain(&d, b"");
     #[cfg(unix)]
@@ -711,10 +705,9 @@ fn seed_mint_refusals_speak_the_shell_twins_words() {
     assert!(seed_mint_refusals(&d, TRUST)[0].starts_with("the seal carries no SEED-MINT"));
 }
 
-/// The bundle's round trip: a seal admitted by SEED-MINT is staged, its bytes change
-/// (strip, relocate, re-sign), LINEAGE is stamped over the SHIPPED bytes, and the
-/// staged tree is then admitted by LINEAGE — and refused the moment the record or a
-/// byte it names is edited.
+/// The bundle's round trip: a seal admitted by SEED-MINT is staged, its bytes change, LINEAGE
+/// is stamped over the shipped bytes and admits them, and an edit to the record or a byte it
+/// names is refused.
 #[test]
 fn a_stamped_lineage_admits_the_shipped_bytes_and_refuses_an_edit() {
     let (_dir, d) = tmp("stamp");
@@ -780,8 +773,7 @@ fn a_stamped_lineage_admits_the_shipped_bytes_and_refuses_an_edit() {
     std::fs::write(stage.join("bin/targo"), object(b"targo stripped")).expect("restore");
     check_compiler_with(&stage.join("bin"), LineagePolicy::Require, &probe)
         .expect("the restored tree is admitted again");
-    // Swap the driver — what trust-mc 20065 shipped from rustup's nightly (TP-7). Nothing
-    // but the record's digest names the driver a stamped tree runs.
+    // Swap the driver: nothing but the record's digest names the driver a stamped tree runs.
     let driver = stage.join("lib/librustc_driver-0123456789abcdef.dylib");
     let shipped_driver = std::fs::read(&driver).expect("read driver");
     std::fs::write(&driver, object(b"driver swapped")).expect("write");
@@ -792,8 +784,8 @@ fn a_stamped_lineage_admits_the_shipped_bytes_and_refuses_an_edit() {
         "{err:?}"
     );
     std::fs::write(&driver, shipped_driver).expect("restore");
-    // Replace the tree's SEED-MINT with another receipt of the SAME commit, one that passes
-    // every check of its own: the record is bound to the receipt it was stamped against.
+    // Replace SEED-MINT with another receipt of the same commit that passes every check of
+    // its own: the record is bound to the receipt it was stamped against.
     let stamped_mint = std::fs::read(stage.join(SEED_MINT_FILE)).expect("read receipt");
     seed_mint(
         &stage,

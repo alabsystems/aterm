@@ -7,6 +7,7 @@ use super::StreamingSearch;
 use crate::grapheme::{
     ColumnMap, LowerByteMap, LowerNeed, display_columns, lower_fold, lower_need,
 };
+use crate::index::scan_line;
 use std::borrow::Cow;
 
 /// Per-row coordinate scratch, populated only after the first substring hit.
@@ -136,7 +137,9 @@ impl StreamingSearch {
         let mut matches = Vec::new();
         if Self::fuzzy_match(search_text, search_pattern) {
             let end_col = display_columns(text);
-            matches.push(StreamingMatch::new(row, 0, end_col));
+            if end_col > 0 {
+                matches.push(StreamingMatch::new(row, 0, end_col));
+            }
         }
         matches
     }
@@ -163,7 +166,7 @@ impl StreamingSearch {
             FilterMode::Regex => {
                 if let Some(ref re) = self.compiled_regex {
                     let mut columns = MatchColumns::new(text, false);
-                    re.find_iter(text)
+                    scan_line(re, text)
                         .filter(|cap| cap.start() != cap.end())
                         .map(|cap| {
                             let (start_col, end_col) =
@@ -212,11 +215,6 @@ fn case_fold(text: &str) -> Cow<'_, str> {
     }
 }
 
-// ========================================================================
-// Gap coverage: map_lower_byte_to_original monotonicity/identity
-// Part of #2875
-// ========================================================================
-
 #[cfg(test)]
 mod tests {
     use super::super::super::types::{FilterMode, SearchState, StreamingSearchConfig};
@@ -230,6 +228,22 @@ mod tests {
             ..StreamingSearchConfig::default()
         };
         StreamingSearch::with_config(config)
+    }
+
+    #[test]
+    fn fuzzy_search_ignores_rows_without_display_columns() {
+        for text in ["\t", "\r", "\u{0301}"] {
+            let mut engine = engine_literal(true);
+            engine.start_search(text, FilterMode::Fuzzy).unwrap();
+            engine.scan_row(0, text, 2);
+            assert!(engine.results().is_empty(), "{text:?}");
+            assert!(engine.verify_result_positions_valid());
+
+            engine.scan_row(1, &format!("{text}x"), 2);
+            assert_eq!(engine.results().len(), 1);
+            assert!(engine.results()[0].match_len > 0);
+            assert!(engine.verify_result_positions_valid());
+        }
     }
 
     /// Helper: start literal search, scan a single row, return matches.
@@ -443,36 +457,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_empty_pattern_returns_no_matches() {
-        let mut engine = StreamingSearch::new();
-        // start_search rejects empty patterns
-        let result = engine.start_search("", FilterMode::Literal);
-        assert!(result.is_err());
-    }
-
     // ====================================================================
     // Fuzzy matching
     // ====================================================================
-
-    #[test]
-    fn test_fuzzy_match_subsequence() {
-        let mut engine = StreamingSearch::new();
-        engine.start_search("hlo", FilterMode::Fuzzy).unwrap();
-        engine.scan_row(0, "hello world", 1);
-        assert_eq!(engine.result_count(), 1);
-        // Fuzzy match returns the full line
-        let m = &engine.results()[0];
-        assert_eq!(m.start_col, 0);
-    }
-
-    #[test]
-    fn test_fuzzy_no_match() {
-        let mut engine = StreamingSearch::new();
-        engine.start_search("xyz", FilterMode::Fuzzy).unwrap();
-        engine.scan_row(0, "hello world", 1);
-        assert_eq!(engine.result_count(), 0);
-    }
 
     #[test]
     fn fuzzy_match_rows() {

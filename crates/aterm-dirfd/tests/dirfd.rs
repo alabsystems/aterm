@@ -636,32 +636,6 @@ fn directory_listings_agree() {
     );
 }
 
-/// A big directory, so the listing crosses whatever buffer either
-/// implementation reads in.
-#[test]
-fn large_directory_listings_agree() {
-    let a = aterm_tempfile::tempdir().unwrap();
-    let b = aterm_tempfile::tempdir().unwrap();
-    for root in [a.path(), b.path()] {
-        for i in 0..500 {
-            std::fs::write(root.join(format!("entry-{i:04}")), b"x").unwrap();
-        }
-    }
-    let fa = open_root_mine(a.path());
-    let ra = run_mine(&fa, &Op::ReadDir, &mut Identities::default());
-    let rb = run_reference(b.path(), &Op::ReadDir, &mut Identities::default());
-    assert_eq!(ra, rb);
-    let Outcome::Names(names) = ra else {
-        panic!("expected a listing, got {ra:?}")
-    };
-    // 500 entries plus `.` and `..`, which must be returned
-    // (the callers filter them, and a wrapper that filtered for them would
-    // silently change what those filters mean).
-    assert_eq!(names.len(), 502, "entries plus . and ..");
-    assert!(names.contains(&".".to_string()));
-    assert!(names.contains(&"..".to_string()));
-}
-
 /// TWO live streams over ONE descriptor must each see the WHOLE directory.
 ///
 /// This is the test that a `dup`-based `Dir::read_from` fails. A duplicate

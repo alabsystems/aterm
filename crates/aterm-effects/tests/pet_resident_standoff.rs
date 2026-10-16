@@ -3,17 +3,11 @@
 
 //! The pet keeps one distance from the caret, not two.
 //!
-//! The caret's escort seats the pet `STATION_LEAD` (one cell) past the caret.
-//! The console layer's resident (the pet watching a running command's output
-//! beside a parked caret) takes the escort's stand as its home, so the pet
-//! does not shift when a command starts printing.
-//!
-//! The oracle is the pet itself, as in `pet_escort_primacy` and
-//! `pet_position_authority`: `set_console_presentable(false)` returns every
-//! console entry point early, so a twin brain driven with it off is the
-//! escort alone. The fixture is `pet_position_authority`'s streaming case
-//! with a shell-integration block left executing, which makes the live brain
-//! take the resident path.
+//! The escort seats the pet `STATION_LEAD` (one cell) past the caret. The console
+//! layer's resident (the pet watching a running command's output beside a parked
+//! caret) takes the escort's stand as its home, so the pet does not shift when a
+//! command starts printing. The oracle is a twin brain with
+//! `set_console_presentable(false)`, as in `pet_escort_primacy`.
 
 use std::time::{Duration, Instant};
 
@@ -30,8 +24,8 @@ struct Scene {
     term: Terminal,
     brain: PetBrain,
     presentable: bool,
-    /// Feed the older ink seam the way the host does (`app_render.rs`
-    /// hands `pet_ink()` to `sense_ink` every frame).
+    /// Feed the ink seam as the host does (`prepare_resident_pet_tick` hands
+    /// `pet_ink()` to `sense_ink` every frame).
     ink: bool,
 }
 
@@ -130,11 +124,9 @@ struct Settled {
     attention: PetAttention,
 }
 
-/// `pet_position_authority`'s streaming case (one 57-column line every
-/// 240 ms into a screen not yet full, the newline landing on the following
-/// frame as a real `echo` does) with a shell-integration block left
-/// executing, so the console layer's output watcher answers. Then output
-/// pauses with the caret parked, and the body is left until it stops moving.
+/// `pet_position_authority`'s streaming case with a shell-integration block left
+/// executing, so the console layer's output watcher answers; then output pauses
+/// with the caret parked, and the body is left until it stops moving.
 fn watch(presentable: bool, ink: bool, park: Park, trace: &mut Vec<String>) -> Settled {
     let mut now = Instant::now();
     let mut scene = Scene::new(
@@ -232,10 +224,8 @@ fn report(tag: &str, s: &Settled) -> String {
     )
 }
 
-/// For every way a command's output can leave the caret parked (column 0
-/// after a newline, mid-row after a progress line), with and without the
-/// host's ink seam fed, the resident's settled body is within one cell of the
-/// escort's, on the same row.
+/// For every way output can leave the caret parked, with and without the ink seam
+/// fed, the resident settles within one cell of the escort, on the same row.
 #[test]
 fn the_resident_settles_where_the_escort_settles() {
     let mut table = Vec::new();
@@ -249,9 +239,8 @@ fn the_resident_settles_where_the_escort_settles() {
             let tag = format!("ink={ink} park={park:?}");
             table.push(report(&format!("escort   {tag}"), &bare));
             table.push(report(&format!("resident {tag}"), &live));
-            // Preconditions, so the pin cannot pass vacuously: both bodies are
-            // on glass, the caret parked where the fixture says, and the live
-            // brain took the resident path.
+            // Preconditions against a vacuous pass: both bodies on glass, the
+            // same caret, and the live brain on the resident path.
             assert!(
                 bare.frame.alpha > 0 && live.frame.alpha > 0,
                 "{tag}: a body is off glass"
@@ -276,9 +265,8 @@ fn the_resident_settles_where_the_escort_settles() {
                     live.gap, bare.gap, live.frame.row, bare.frame.row,
                 ));
             }
-            // The resident is on the escort's ladder, not merely near where
-            // the escort stopped: `pet_escort_primacy`'s bound, half a cell of
-            // slack for the chase's easing and `body_px` rounding.
+            // The resident stands on the escort's ladder, with
+            // `pet_escort_primacy`'s half cell of slack.
             let want = escort_station(live.caret.1);
             if (live.frame.col - want).abs() > 0.5 {
                 failures.push(format!(

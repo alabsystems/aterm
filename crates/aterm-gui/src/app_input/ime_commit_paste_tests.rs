@@ -2,9 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! An input method's committed text that holds a control character reaches the
-//! PTY as a paste, unless the whole commit is one C0 or DEL key (boundaries hunt
-//! L2, ruling 2026-10-10, amended the same day;
-//! `docs/AUDIT-boundaries-2026-10-09.md`). Every host lowers its input-method
+//! PTY as a paste, unless the whole commit is one C0 or DEL key
+//! (`docs/AUDIT-boundaries-2026-10-09.md`). Every host lowers its input-method
 //! commit to `Ime::Commit` and `App::on_ime_commit`: X11's XIM lookup, Wayland's
 //! text-input `commit_string`, Windows' IMM result string, and macOS's
 //! `insertText:` (dictation included) under marked text. These tests drive that
@@ -77,8 +76,8 @@ fn mismatches(
 
 /// Under bracketed paste a commit holding a line break, ESC or a C1 control goes
 /// out framed and sanitized, exactly as `Terminal::format_paste` frames a paste:
-/// the line break cannot submit, and the planted `ESC [ 201 ~` cannot close the
-/// bracket early. On origin/main each went out raw as typed keys.
+/// the line break cannot submit, and a planted `ESC [ 201 ~` cannot close the
+/// bracket early.
 #[test]
 fn a_control_bearing_commit_is_a_bracketed_sanitized_paste() {
     let cases: [(&str, &[u8]); 5] = [
@@ -139,9 +138,8 @@ fn a_committed_line_break_waits_for_the_multi_line_guard() {
     close(pipe);
 }
 
-/// The common commit (CJK, an accent, an emoji) keeps the typed-key path: the
-/// same bytes as origin/main, written inline with no bracket even under
-/// bracketed paste, so a program that reads keys sees no difference.
+/// The common commit (CJK, an accent, an emoji) keeps the typed-key path:
+/// written inline with no bracket even under bracketed paste.
 #[test]
 fn a_printable_commit_keeps_the_typed_key_path() {
     for commit in ["日本", "é", "🙂", "a b"] {
@@ -161,10 +159,9 @@ fn a_printable_commit_keeps_the_typed_key_path() {
 
 /// A commit that is one C0 or DEL character is a key: X11 commits an unfiltered
 /// Return, Tab, BackSpace or Escape that way while an XIM preedit is open. Under
-/// bracketed paste it keeps the typed-key path (amended ruling 2026-10-10), so
-/// Return still runs the line and BackSpace still erases, where a paste would
-/// frame the CR as an inserted line break and the sanitizer would drop BS and
-/// DEL outright.
+/// bracketed paste it keeps the typed-key path, so Return still runs the line
+/// and BackSpace still erases, where a paste would frame the CR as an inserted
+/// line break and the sanitizer would drop BS and DEL.
 #[test]
 fn a_lone_control_key_commit_keeps_the_typed_key_path() {
     use aterm_types::keyboard::KeyboardMode;

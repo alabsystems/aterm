@@ -168,10 +168,10 @@ fn a_box_under_a_ticking_row_is_published_pushed_and_awaitable() {
     // Pin the revision once the FSM has PUBLISHED the running job, never on
     // a timer. `agent=busy` is the timeline's verdict and can lead the FSM's
     // `running` — held for its 750 ms dwell, then published on a sweep — by
-    // most of a second; a fixed 1.2 s sleep raced that publication, and a
-    // loaded gate whose event loop fell half a second behind pinned before
-    // it, so `revision=` moved by one at the prompt on a correct server (the
-    // load-sensitive test audit of 2026-09-27). Once `running` with movement
+    // most of a second; a fixed 1.2 s sleep raced that publication, and on a
+    // loaded machine, its event loop half a second behind, it pinned before
+    // the publication, so `revision=` moved by one at the prompt on a correct
+    // server. Once `running` with movement
     // is out, nothing moves the revision while the fake keeps ticking short
     // of a 5 s stall (`quiet_after`), so the control below still fails for a
     // gate that bumps it when the box is drawn.
@@ -529,10 +529,10 @@ fn an_agent_that_exits_is_no_agent_from_its_exit_on() {
 /// until `go` gave a read made while `bash -c 'exec -a claude …'` was still between
 /// fork and exec (a loaded machine stretches that past 500 ms) nothing to be re-read
 /// on, so `program=` stood at the interpreter for the whole 60 s hang detector -
-/// seen in the gate and in stress rounds, reproduced by a 1.2 s `sleep` before the
-/// `exec`. A real Claude Code moves the screen the moment it runs; this does too. (A
-/// cursor-only move does not: it leaves the screen's sequence number alone and the
-/// sweep never looks.)
+/// seen on a loaded machine and in stress rounds, reproduced by a 1.2 s `sleep`
+/// before the `exec`. A real Claude Code moves the screen the moment it runs; this
+/// does too. (A cursor-only move does not: it leaves the screen's sequence number
+/// alone and the sweep never looks.)
 ///
 /// A fake Claude Code LAUNCH, drawn as 2.1.283 draws one (measured frame by
 /// frame on 2026-09-26: aterm-phase's `LAUNCH_*` fixtures): nothing of it on
@@ -695,9 +695,9 @@ fn await_agent_idle_waits_for_the_relaunched_repl_in_the_same_tab() {
 fn launch_fake(inst: &Instance, sid: &str, script: &Path, go: &Path, quit: &Path) {
     // THE SHELL FIRST. A line typed before bash has drawn its prompt is echoed
     // twice: once raw by the tty in canonical mode, then again when readline
-    // starts and redisplays the pending input after its prompt. The merge
-    // contract measured it on 2026-09-27 under a loaded machine: the relaunch
-    // test counted three launch lines for two launches and failed. Every launch
+    // starts and redisplays the pending input after its prompt. On a loaded
+    // machine the relaunch test counted three launch lines for two launches
+    // and failed. Every launch
     // waits for a prompt row (`$ ` at the end, the default PS1) — the same wait a
     // person makes before typing.
     ctl_ok(

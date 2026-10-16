@@ -29,9 +29,9 @@ pub fn relative_words(now_unix_ms: u64, at_unix_ms: u64) -> String {
     }
 }
 
-/// `YYYY-MM-DD HH:MM:SS UTC` — a local twin of
-/// `aterm_types::rfc3339::format_rfc3339` (no aterm-types dependency). It
-/// names the zone: beside local clocks a bare UTC time reads as a wrong clock.
+/// `YYYY-MM-DD HH:MM:SS UTC`, the arithmetic of
+/// `aterm_types::rfc3339::format_rfc3339` without the dependency. It names
+/// the zone: beside local clocks a bare UTC time reads as a wrong clock.
 #[must_use]
 pub fn stamp_words(at_unix_ms: u64) -> String {
     let secs = at_unix_ms / 1000;
@@ -48,12 +48,11 @@ pub fn stamp_words(at_unix_ms: u64) -> String {
     out
 }
 
-/// When `at` was on the reader's LOCAL clock (design ruling 262), `offset_s`
-/// seconds from UTC: `Today 12:53:49 PM`, `Yesterday 9:02:11 AM`, else the
-/// day as its header says it ([`day_heading`]: `Thursday 9:02:11 AM`,
-/// `Tuesday, 15 September, 9:02:11 AM`) — the local date the meta line of an
-/// expanded entry says, never an ISO date under a weekday header. Copy keeps
-/// the UTC stamp ([`stamp_words`]). Pure: the host supplies the offset.
+/// When `at` was on the reader's local clock, `offset_s` seconds from UTC:
+/// `Today 12:53:49 PM`, `Yesterday 9:02:11 AM`, else the day as its header
+/// says it ([`day_heading`]: `Thursday 9:02:11 AM`, `Tuesday, 15 September,
+/// 9:02:11 AM`), never an ISO date under a weekday header. Copy keeps the
+/// UTC stamp ([`stamp_words`]). The host supplies the offset.
 #[must_use]
 pub fn local_words(now_unix_ms: u64, at_unix_ms: u64, offset_s: i64) -> String {
     let local = |ms: u64| {
@@ -81,11 +80,10 @@ pub fn local_words(now_unix_ms: u64, at_unix_ms: u64, offset_s: i64) -> String {
     format!("{day} {clock}")
 }
 
-/// How long ago `at` was, SPOKEN (design ruling 262): [`relative_words`] with
-/// its abbreviations said whole — `6 hours ago`, `1 minute ago`, `just now` —
-/// and past a day the time ELAPSED (`36 hours ago`, `3 days ago`), never a
-/// calendar word, which could contradict the LOCAL day header the row sits
-/// under (ruling 273). Elapsed time holds in every zone.
+/// How long ago `at` was, spoken: [`relative_words`] with its abbreviations
+/// said whole (`6 hours ago`, `1 minute ago`, `just now`), and past a day the
+/// time elapsed (`36 hours ago`, `3 days ago`), never a calendar word, which
+/// could contradict the local day header the row sits under.
 #[must_use]
 pub fn spoken_relative_words(now_unix_ms: u64, at_unix_ms: u64) -> String {
     let ago = now_unix_ms.saturating_sub(at_unix_ms);
@@ -126,9 +124,8 @@ fn twelve_hour(secs: u64, seconds: bool) -> String {
     clock
 }
 
-/// The reader's LOCAL calendar day of `at_unix_ms` — days since 1970-01-01
-/// on a clock `offset_s` seconds from UTC (design ruling 273). Pure: the
-/// host supplies the offset, as for [`local_words`].
+/// The reader's local calendar day of `at_unix_ms`: days since 1970-01-01 on
+/// a clock `offset_s` seconds from UTC. The host supplies the offset.
 #[must_use]
 pub fn local_day(at_unix_ms: u64, offset_s: i64) -> i64 {
     i64::try_from(at_unix_ms / 1000)
@@ -138,8 +135,8 @@ pub fn local_day(at_unix_ms: u64, offset_s: i64) -> i64 {
 }
 
 /// When `at` was on the reader's local clock, `offset_s` from UTC, without
-/// the day or the seconds: `9:02 AM` — the time a Settings ▸ Messages row
-/// shows under a day header older than today (design ruling 273).
+/// the day or the seconds: `9:02 AM`, the time a Settings ▸ Messages row
+/// shows under a day header older than today.
 #[must_use]
 pub fn clock_words(at_unix_ms: u64, offset_s: i64) -> String {
     let secs = i64::try_from(at_unix_ms / 1000)
@@ -149,14 +146,13 @@ pub fn clock_words(at_unix_ms: u64, offset_s: i64) -> String {
     twelve_hour(u64::try_from(secs).unwrap_or(0), false)
 }
 
-/// A DAY HEADER's words (design ruling 273), for local day `day` read on
-/// local day `today` (both [`local_day`] numbers) — the macOS Mail and
-/// Messages convention: `Today`, `Yesterday`, the weekday within the last
-/// week (`Thursday`), else the date, `Friday, 18 September`, with the year
-/// only when it is not this year (`Friday, 18 September 2025`). A day after
-/// `today` (a clock set back) reads `Today`. `short` abbreviates the weekday
-/// and the month of a date, for a column too narrow for the whole words
-/// (`Fri, 18 Sep`, `Fri, 18 Sep 2025`); the other words are already short.
+/// A day header's words for local day `day` read on local day `today` (both
+/// [`local_day`] numbers), as macOS Mail and Messages say them: `Today`,
+/// `Yesterday`, the weekday within the last week (`Thursday`), else the date,
+/// `Friday, 18 September`, with the year only when it is not this year
+/// (`Friday, 18 September 2025`). A day after `today` (a clock set back)
+/// reads `Today`. `short` abbreviates the weekday and month of a date for a
+/// narrow column (`Fri, 18 Sep`, `Fri, 18 Sep 2025`).
 #[must_use]
 pub fn day_heading(today: i64, day: i64, short: bool) -> String {
     const WEEKDAYS: [&str; 7] = [
@@ -244,11 +240,10 @@ fn push_padded(out: &mut String, v: u64, width: usize) {
     out.push_str(&digits);
 }
 
-/// `path` with a leading `home` component abbreviated to `~` — `~` for
-/// home itself, `~/sub` below it, sibling and foreign paths verbatim (the
-/// pure twin of `app_tabs::home_abbreviated`). `None` or an empty home
-/// leaves the path alone; a home given with a trailing slash names the
-/// same directory.
+/// `path` with a leading `home` component abbreviated to `~` (`~` for home
+/// itself, `~/sub` below it, sibling and foreign paths verbatim), the pure
+/// twin of `app_tabs::home_abbreviated`. `None` or an empty home leaves the
+/// path alone; a trailing slash on the home names the same directory.
 #[must_use]
 pub(crate) fn home_abbreviate(path: &str, home: Option<&str>) -> String {
     let Some(home) = home.filter(|h| !h.is_empty()) else {
@@ -264,7 +259,7 @@ pub(crate) fn home_abbreviate(path: &str, home: Option<&str>) -> String {
 
 /// Every path atom in `text` (a whitespace-delimited `home/…` token)
 /// abbreviated with [`home_abbreviate`]; the band prints `~/…` while the
-/// log keeps the absolute path (D4).
+/// log keeps the absolute path.
 #[must_use]
 pub(crate) fn abbreviate_paths_in(text: &str, home: Option<&str>) -> String {
     let Some(home) = home.filter(|h| !h.is_empty()) else {
@@ -286,9 +281,9 @@ pub(crate) fn abbreviate_paths_in(text: &str, home: Option<&str>) -> String {
 }
 
 /// The closed table a Complete echo reads a title's leading present
-/// participle through: the verbs band titles use or plausibly will, a
-/// script's own titles (ruling 270) and this crate's wait rows included, so
-/// no finished record keeps its in-flight words.
+/// participle through: the verbs band titles, scripts' titles and this
+/// crate's wait rows use or plausibly will, so no finished record keeps its
+/// in-flight words.
 const FINISHED_VERBS: [(&str, &str); 43] = [
     ("Downloading", "Downloaded"),
     ("Installing", "Installed"),
@@ -335,9 +330,9 @@ const FINISHED_VERBS: [(&str, &str); 43] = [
     ("Removing", "Removed"),
 ];
 
-/// A work title in its FINISHED form (design ruling 154): `Downloading aterm
-/// v0.91.0` → `Downloaded aterm v0.91.0`, through [`FINISHED_VERBS`]. `None`
-/// when the first word is not in the table — the title keeps its words.
+/// A work title in its finished form: `Downloading aterm v0.91.0` →
+/// `Downloaded aterm v0.91.0`, through [`FINISHED_VERBS`]. `None` when the
+/// first word is not in the table.
 #[must_use]
 pub(crate) fn finished_form(title: &str) -> Option<String> {
     let first = title.split(' ').next().unwrap_or(title);
@@ -345,13 +340,12 @@ pub(crate) fn finished_form(title: &str) -> Option<String> {
     Some(format!("{done}{}", &title[first.len()..]))
 }
 
-/// A DELIVERED work title the table has no past tense for (ruling 270):
-/// `Uploading the backup` → `Uploading the backup — done`, the words its
-/// Complete echo showed (`DONE_WORD` in the time slot), so the log never
-/// reads "still uploading" beside a ✓. Only a title that leads with a
-/// present participle (a capitalised word of five letters or more ending
-/// `ing`); any other title reads as its outcome already and keeps its
-/// words. `None` for a title in the table ([`finished_form`] answers it).
+/// A delivered work title the table has no past tense for: `Uploading the
+/// backup` → `Uploading the backup — done`, the words its Complete echo
+/// showed, so the log never reads "still uploading" beside a ✓. Only a title
+/// that leads with a present participle (a capitalised word of five letters
+/// or more ending `ing`); `None` for any other, and for a title in the table
+/// ([`finished_form`] answers it).
 #[must_use]
 pub(crate) fn done_form(title: &str) -> Option<String> {
     let first = title.split(' ').next().unwrap_or(title);
@@ -363,9 +357,8 @@ pub(crate) fn done_form(title: &str) -> Option<String> {
         .then(|| format!("{title} \u{2014} {}", crate::DONE_WORD))
 }
 
-/// A work title that ended WITHOUT delivering (design ruling 259):
-/// `Indexing photo library` → `Indexing stopped`, through the same table as
-/// [`finished_form`]. `None` when the first word is not in it.
+/// A work title that ended without delivering: `Indexing photo library` →
+/// `Indexing stopped`. `None` when the first word is not in [`FINISHED_VERBS`].
 #[must_use]
 pub(crate) fn stopped_form(title: &str) -> Option<String> {
     let first = title.split(' ').next().unwrap_or(title);
@@ -375,10 +368,9 @@ pub(crate) fn stopped_form(title: &str) -> Option<String> {
         .then(|| format!("{first} stopped"))
 }
 
-/// A work title that ended with NO outcome to claim (design ruling 265):
-/// `Indexing docs` → `Indexing ended`, through the same table as
-/// [`finished_form`] — a plain withdraw's record, whose live title read as
-/// still running. `None` when the first word is not in it.
+/// A work title that ended with no outcome to claim (a plain withdraw, whose
+/// live title read as still running): `Indexing docs` → `Indexing ended`.
+/// `None` when the first word is not in [`FINISHED_VERBS`].
 #[must_use]
 pub(crate) fn ended_form(title: &str) -> Option<String> {
     let first = title.split(' ').next().unwrap_or(title);
@@ -412,8 +404,8 @@ mod tests {
     use crate::log::{LogRecord, LogState};
     use crate::model::{Glyph, MessageId, Origin, Severity, WallStamp, tags};
 
-    /// THE LOCAL CLOCK (ruling 262): today, yesterday, else the local date,
-    /// on a twelve-hour clock — the offset moves the day as well as the hour.
+    /// Today, yesterday, else the local date, on a twelve-hour clock; the
+    /// offset moves the day as well as the hour.
     #[test]
     fn local_words_say_the_readers_own_clock() {
         // 2025-09-21 15:53:20 UTC.
@@ -459,10 +451,9 @@ mod tests {
         assert_eq!(relative_words(now, now - 3 * MS_PER_DAY), "2025-09-18");
     }
 
-    /// DAY HEADERS (ruling 273): the reader's local day — the offset moves
-    /// an instant across midnight — and the Mail/Messages words: today,
-    /// yesterday, a weekday within the week, then the date, with the year
-    /// only off this year; a day ahead of today (a clock set back) is today.
+    /// The offset moves an instant across midnight; then today, yesterday, a
+    /// weekday within the week, the date, the year only off this year; a day
+    /// ahead of today (a clock set back) is today.
     #[test]
     fn day_headings_follow_the_readers_calendar() {
         // 2026-09-27 12:00:00 UTC is a Sunday.
@@ -540,8 +531,8 @@ mod tests {
         assert_eq!(abbreviate_paths_in("/Users//w/x", None), "/Users//w/x");
     }
 
-    /// The finished forms (ruling 154): the leading participle only, through
-    /// the closed table; anything else keeps its words.
+    /// The leading participle only, through the closed table; anything else
+    /// keeps its words.
     #[test]
     fn a_work_title_reads_finished_through_the_closed_table() {
         for (ing, done) in FINISHED_VERBS {
@@ -571,9 +562,8 @@ mod tests {
         }
     }
 
-    /// RULING 270: a delivered title the table has no past tense for says
-    /// `— done`, as its echo did; a title with no leading participle, and
-    /// one the table answers, is left to the other forms.
+    /// A delivered title the table has no past tense for says `— done`, as its
+    /// echo did; any other title is left to the other forms.
     #[test]
     fn a_delivered_title_with_no_past_tense_says_done() {
         assert_eq!(
@@ -595,8 +585,8 @@ mod tests {
         }
     }
 
-    /// A plain withdraw's record (ruling 265): the leading participle and
-    /// `ended`, through the same closed table; anything else keeps its words.
+    /// A plain withdraw's record: the leading participle and `ended`, through
+    /// the same closed table; anything else keeps its words.
     #[test]
     fn a_work_title_reads_ended_through_the_closed_table() {
         assert_eq!(

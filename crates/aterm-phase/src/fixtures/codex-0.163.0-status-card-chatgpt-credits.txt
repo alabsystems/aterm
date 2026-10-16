@@ -1,0 +1,51 @@
+# codex-cli 0.163.0 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (144x50, aterm 0.105.0) running the real Codex, launched by path with a scratch `CODEX_HOME`, a composed fake ChatGPT `auth.json` (user@example.com) and the lab provider `base_url=http://127.0.0.1:<port>/v1` with `requires_openai_auth` (a local stub of the Responses API, crates/aterm-lab) · a composed fake ChatGPT login (plus, user@example.com) whose account usage says 5h 30% used, weekly 10%, credits has=true balance 12.5: `/status` after one turn
+
+  >_ OpenAI Codex (v0.163.0)
+     /private/tmp/at.x0SD/proj
+
+
+› hi
+
+
+• Hi! I am the local lab stub, not a model. (reply 1)
+
+  Worked for <1s • 11:15 AM
+
+/status
+
+  >_ OpenAI Codex (v0.163.0)
+
+  Visit https://chatgpt.com/settings/usage for up-to-date
+  information on rate limits and credits
+
+  Model:               GPT-6.1-Sol (reasoning low, summaries auto)
+  Model provider:      lab
+  Directory:           /private/tmp/at.x0SD/proj
+  Permissions:         Workspace (Ask for approval)
+  Agents.md:           <none>
+  Account:             user@example.com (Plus)
+  Thread name:         lab stub
+  Collaboration mode:  Default
+  Session:             01a145ed-117a-77c3-8914-e0f8651e30cb
+
+  Context window:      99% left (15.7K used / 258K)
+  5h limit:            [██████████████░░░░░░] 70% left (resets 12:15 PM)
+  Weekly limit:        [██████████████████░░] 90% left (resets 11:15 AM on 21 Oct)
+  Credits:             13 credits
+
+
+
+
+
+
+
+
+
+
+
+
+
+› Ask Codex to do anything
+
+  GPT-6.1-Sol default · /private/tmp/at.x0SD/proj · lab stub
+  ? for shortcuts

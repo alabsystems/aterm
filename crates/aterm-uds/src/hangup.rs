@@ -3,10 +3,10 @@
 
 //! Whether the far end of a connected control stream has gone away entirely.
 //!
-//! A control lane parked in a blocking verb (`await`, `turn`, `wait`, `ready`,
-//! a relay) holds a worker lane until its own timeout even after its client is
-//! killed. It must notice the hangup without reading, since bytes a live
-//! client pipelined behind the request are the next request.
+//! A control lane parked in a blocking verb (`await`, `turn`, `wait`, `ready`, a relay) would
+//! otherwise hold its worker until its own timeout after its client dies. It must notice the
+//! hangup without reading, since bytes a live client pipelined behind the request are the
+//! next request.
 //!
 //! The question is whether any byte written can still be delivered, i.e. the
 //! write side's end-of-file, and `poll(POLLOUT)` answers it on Darwin and
@@ -16,13 +16,10 @@
 //!   write side open: `POLLOUT`, no `POLLHUP`; it still wants the answer;
 //! * a peer that closed (or was SIGKILLed) takes both halves: `POLLHUP`.
 //!
-//! Asking with `POLLIN` instead would be wrong on Darwin, which reports a
-//! half-close as `POLLIN|POLLHUP`: measured 2026-09-25 on Darwin 25.6 with an
-//! `AF_UNIX` pair — open `POLLOUT`→`0x4`, half-closed `POLLOUT`→`0x4`, closed
-//! `POLLOUT`→`0x10`, while `POLLIN` read `0x11` for both of the last two.
+//! `POLLIN` would be wrong on Darwin, which reports a half-close as `POLLIN|POLLHUP`; with
+//! `POLLOUT` an open or half-closed peer reads `0x4` and a closed one `0x10`.
 //!
-//! The other direction — ending a connection so ITS peer reads the hangup — is
-//! [`hang_up`]: a `shutdown` of each half on its own, never `Shutdown::Both`.
+//! The other direction, ending a connection so its peer reads the hangup, is [`hang_up`].
 
 use crate::CtlStream;
 
@@ -44,26 +41,21 @@ pub fn peer_closed(stream: &CtlStream) -> bool {
     }
 }
 
-/// HANG `stream` UP for the whole socket: its peer reads end-of-file now, and
-/// a thread parked reading any descriptor of this end wakes to its own.
+/// Hang `stream` up for the whole socket: its peer reads end-of-file now, and a thread parked
+/// reading any descriptor of this end wakes to its own.
 ///
-/// `shutdown` acts on the socket, where closing acts on one descriptor, and a
-/// socket closes only with its last one. Any thread's `fork` hands the child a
-/// copy of every descriptor until it execs (macOS 26.6 does not honor
-/// `FD_CLOFORK`), so an end that is merely dropped can stay open in a child
-/// for seconds on a loaded machine; an end that is hung up cannot.
+/// `shutdown` acts on the socket, where closing acts on one descriptor and a socket closes only
+/// with its last one. A `fork` on any thread hands the child a copy of every descriptor until
+/// it execs (macOS 26.6 does not honor `FD_CLOFORK`), so a dropped end can stay open in a
+/// child for seconds; a hung-up end cannot.
 ///
-/// EACH HALF ON ITS OWN, the write half first — never `Shutdown::Both`. Darwin
-/// refuses a both-ways `shutdown` (`ENOTCONN`) of a socket whose read half is
-/// already shut — one whose peer half-closed toward it: a client that sent its
-/// request and its EOF (`printf … | nc -U`), a relay's child that answered —
-/// and then shuts NOTHING, the write half included (measured on macOS 26.6).
-/// That peer is the one still waiting for an end-of-file, and it got none
-/// until the last copy of this end closed.
+/// Each half on its own, the write half first, never `Shutdown::Both`: Darwin refuses a
+/// both-ways `shutdown` (`ENOTCONN`) of a socket whose peer already half-closed toward it (a
+/// client that sent its request and EOF, a relay's child that answered) and then shuts
+/// nothing, so that waiting peer gets no end-of-file.
 ///
-/// Returns whether this call shut either half: `false` for a socket that is
-/// not connected (a listening one; one whose peer closed entirely, on Darwin)
-/// or whose halves were both shut already.
+/// Returns whether this call shut either half: `false` for a socket that is not connected (a
+/// listening one; on Darwin one whose peer closed entirely) or already shut both ways.
 pub fn hang_up(stream: &CtlStream) -> bool {
     let wrote = stream.shutdown(std::net::Shutdown::Write).is_ok();
     let read = stream.shutdown(std::net::Shutdown::Read).is_ok();
@@ -121,14 +113,9 @@ mod tests {
         (&*stream).read(&mut [0u8; 16]).map_err(|e| e.kind())
     }
 
-    /// A HANG-UP REACHES A PEER THAT HALF-CLOSED FIRST, whatever copies of the
-    /// hung-up end survive. The `try_clone` stands in for the copy a forked
-    /// child holds until it execs: one more descriptor on the same socket,
-    /// which is all the kernel counts.
-    ///
-    /// NEGATIVE CONTROL (macOS): the both-ways `shutdown` every teardown made
-    /// before is refused once the peer half-closed, and shuts no half — the
-    /// peer still reads nothing, not its end-of-file.
+    /// The `try_clone` stands in for the copy a forked child holds until it execs. Negative
+    /// control (macOS): a both-ways `shutdown` is refused once the peer half-closed and shuts
+    /// no half.
     #[test]
     fn a_hang_up_reaches_a_peer_that_half_closed_though_a_copy_survives() {
         let (near, far) = crate::CtlStream::pair().expect("pair");
@@ -159,10 +146,8 @@ mod tests {
         assert!(!hang_up(&near), "nothing is left to shut");
     }
 
-    /// Between two open ends, a hang-up shuts both halves: the peer reads its
-    /// end-of-file, a reader of a surviving copy wakes to its own, and the
-    /// peer's writes are no longer delivered (Darwin discards them; Linux
-    /// refuses them).
+    /// Between two open ends a hang-up shuts both halves: the peer and a surviving copy both
+    /// read end-of-file, and the peer's later writes are not delivered.
     #[test]
     fn a_hang_up_shuts_both_halves_of_an_open_socket() {
         let (near, far) = crate::CtlStream::pair().expect("pair");

@@ -92,7 +92,7 @@ use super::*;
 /// `DebuggerChangeLane` (`begin` with the owner's answer, `poll`, `observe`,
 /// `needs_poll`), the real worker body `run_devtools_job` on a thread with the
 /// real change lock, and the real order `devtools_change_with` (through its
-/// `testing`-feature wrapper `devtools_change_with_for_test`) with a
+/// debug-build wrapper `devtools_change_with_for_test`) with a
 /// scripted re-read and a stand-in child, in both directions, and the records
 /// re-read mid-session (`ask_records`, the real reader `read_records`, then
 /// `poll`; a peer's marker written as its worker writes it and let go by the
@@ -341,6 +341,7 @@ pub fn debugger_access_change_model() -> Model {
 /// nothing re-reads.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
+#[crate::liveness(crate::derive::debugger_access_change_model)]
 pub fn debugger_access_change_liveness() -> Liveness {
     Liveness {
         name: "AnExitedChangeIsRead",

@@ -1,0 +1,29 @@
+# claude-code 2.1.300 · MEASURED 2026-10-15, `aterm ctl text` of a private headless aterm (144x50, aterm 0.103.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, tools/real-claude-lab) · 2.1.300 relaunched with `--permission-mode auto --resume <id>` draws the vendor's auto-mode notice (`⏺ Auto mode lets Claude handle permission prompts automatically — …`, four rows) as the last transcript block after the first reply; the dead process's frame and the shell's launch line above the new launch card are cut
+ ▐▛███▛█   Claude Code v2.1.300
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.95av/proj
+
+
+❯ hi after the remedy
+
+⏺ Hi! I am the local lab stub, not a model. (reply 1)
+
+✻ Worked for 0s · done 6:58 AM
+
+❯ [aterm harness] Relaunched: Claude Code exited without anyone asking, and this session was restarted on Claude Code 2.1.300 and resumed.
+  Continue where you left off. If you were waiting on the user, nobody is here to answer: decide for yourself, prefer reversible steps, and
+  keep going.
+
+⏺ Hi! I am the local lab stub, not a model. (reply 2)
+
+✻ Cogitated for 0s · done 7:06 AM
+
+⏺ Auto mode lets Claude handle permission prompts automatically — Claude checks each tool call for risky actions and prompt injection
+  before executing. Actions Claude identifies as safe are executed, while actions Claude identifies as risky are blocked and Claude may
+  try a different approach. Ideal for long-running tasks. Sessions are slightly more expensive. Claude can make mistakes that allow
+  harmful commands to run, it's recommended to only use in isolated environments. Shift+Tab to change mode.
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents

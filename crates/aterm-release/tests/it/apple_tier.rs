@@ -1,37 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier APPLE: the two-state hook, its identity resolution, its notarytool
-//! credential, its self-check verdict — and THE PIPELINE LINES THAT WIRE THEM.
+//! Tier APPLE: the two-state hook, its identity resolution, its notarytool credential, its
+//! self-check verdict, and the `publish.rs` call sites that wire them.
 //!
-//! Everything here runs WITHOUT an Apple Developer account, without a
-//! certificate, and without network — which is the whole point. Every Apple tool
-//! spawn sits behind [`sign::AppleTools`] and every packaging spawn behind
-//! [`publish::Packager`], so these tests drive the real decision code with
-//! recording fakes and assert what it DID, not merely that it returned `Ok`.
+//! No Apple account, certificate or network: every Apple tool spawn sits behind
+//! [`sign::AppleTools`] and every packaging spawn behind [`publish::Packager`], so these
+//! tests drive the real decision code with recording fakes and assert what it did. The
+//! call-site tests ([`publish::notarize_and_package`], [`publish::selfcheck_signing`],
+//! [`publish::resume_apple_tier`]) each name the mutation they kill: a rule nothing calls
+//! does not exist.
 //!
-//! # Two kinds of test live here, and the second kind is the load-bearing one
-//!
-//! The first kind proves the rules in `sign.rs`: what an active hook must do,
-//! what a verdict must reject, which certificate the anchor selects.
-//!
-//! The second kind proves the CALL SITES in `publish.rs` — the handful of lines
-//! that decide whether those rules ever run. They exist because a review found
-//! that two of them survived mutation: replacing `step_selfcheck`'s Tier APPLE
-//! gate with `if false`, and short-circuiting `step_sign`'s notarize hook with
-//! `if false &&`, each left the whole suite green. A rule nothing calls is a rule
-//! that does not exist, so `publish.rs` now hands its ordered decisions to
-//! [`publish::notarize_and_package`], [`publish::selfcheck_signing`] and
-//! [`publish::resume_apple_tier`], and the tests below fail under exactly those
-//! mutations. Each such test names the mutation it kills.
-//!
-//! # No value here could be mistaken for real
-//!
-//! Every team id is `TEAMIDXXXX` / `OTHERTEAM1`, every certificate hash is a
-//! repeated hex digit, and every name is `Placeholder Org`. `pins::APPLE_TEAM_ID`
-//! is ARMED in this tree;
-//! `the_shipped_anchor_is_armed_and_an_empty_anchor_still_resolves_inert` pins both
-//! halves — the real anchor is active, and an empty anchor still resolves inert.
+//! Every team id here is `TEAMIDXXXX` or `OTHERTEAM1`, every certificate hash a repeated
+//! hex digit, every name `Placeholder Org`; only
+//! `the_shipped_anchor_is_armed_and_an_empty_anchor_still_resolves_inert` reads the real
+//! `pins::APPLE_TEAM_ID`.
 
 use crate::{dmg, ledger, publish, sign};
 
@@ -43,8 +26,7 @@ use std::rc::Rc;
 
 // --- placeholders ------------------------------------------------------------
 
-/// Ten characters, the right SHAPE for an Apple Team ID and unmistakably not
-/// one. It appears only in this file's fixtures — never in pins.rs.
+/// The shape of an Apple Team ID, and unmistakably not one.
 const FAKE_TEAM: &str = "TEAMIDXXXX";
 const OTHER_TEAM: &str = "OTHERTEAM1";
 const FAKE_SHA1: &str = "1111111111111111111111111111111111111111";
@@ -66,10 +48,9 @@ fn active_tier() -> AppleTier {
 
 // --- the recording fakes -----------------------------------------------------
 
-/// The ordered transcript of everything the fakes were asked to do. Shared
-/// (`Rc`) because [`publish::notarize_and_package`] drives TWO seams — Apple
-/// tools and the packager — and the property under test is the order ACROSS
-/// them: the bundle must be stapled before the zip that carries it is built.
+/// The ordered transcript of what the fakes were asked to do, shared by both seams
+/// [`publish::notarize_and_package`] drives: the order across them is under test (the bundle
+/// is stapled before the zip that carries it is built).
 type Log = Rc<RefCell<Vec<String>>>;
 
 fn log() -> Log {
@@ -88,16 +69,14 @@ fn record(log: &Log, what: &str, target: &Path) {
     log.borrow_mut().push(format!("{what}:{name}"));
 }
 
-/// Records the sequence of Apple operations, and can be told to fail any one of
-/// them or to report any verification verdict. Recording the ORDER matters as
-/// much as the fact: notarizing before the preflight, or signing the DMG after
-/// notarizing it, would each produce a green-looking cut and a broken artifact.
+/// Records the Apple operations in order, and can be told to fail any one or report any
+/// verdict: notarizing before the preflight, or signing the DMG after notarizing it, each
+/// yields a green-looking cut and a broken artifact.
 struct FakeTools {
     log: Log,
     fail_on: Option<&'static str>,
-    /// Narrows [`FakeTools::fail_on`] to ONE artifact — `Some("aterm.dmg")` fails
-    /// the DMG's submission while letting the bundle's succeed, which is the only
-    /// way to reach the second half of the packaging sequence in a failure state.
+    /// Narrows [`FakeTools::fail_on`] to one artifact: `Some("aterm.dmg")` fails the DMG's
+    /// submission and lets the bundle's succeed, reaching the packaging's second half.
     fail_on_target: Option<&'static str>,
     /// `codesign --verify --deep --strict` verdict.
     strict_ok: bool,
@@ -145,8 +124,8 @@ impl FakeTools {
 
 impl AppleTools for FakeTools {
     fn sign_dmg(&self, dmg: &Path, id: &DevIdIdentity) -> Result<(), String> {
-        // Assert the codesign argument is the certificate HASH, not a name that
-        // could substring-match a second certificate in the keychain.
+        // The codesign argument is the certificate hash, never a name that could
+        // substring-match a second certificate in the keychain.
         assert_eq!(
             id.sha1, FAKE_SHA1,
             "sign_dmg must receive the resolved cert"
@@ -180,9 +159,8 @@ impl AppleTools for FakeTools {
         Ok(!Self::is(target, self.unstapled))
     }
     fn gatekeeper_ok(&self, target: &Path, kind: GatekeeperKind) -> Result<bool, String> {
-        // The assessment KIND is part of the verdict, not a detail: `-t exec` on
-        // a disk image does not apply and passes vacuously, so a self-check that
-        // asked the app's question about the DMG would be checking nothing.
+        // The assessment kind is part of the verdict: `-t exec` on a disk image does not
+        // apply and passes vacuously, so asking the app's question of the DMG checks nothing.
         let expected = if target.extension().is_some_and(|e| e == "dmg") {
             GatekeeperKind::Dmg
         } else {
@@ -199,10 +177,9 @@ impl AppleTools for FakeTools {
     }
 }
 
-/// Records packaging, and mints a DIFFERENT digest for the post-hook re-hash than
-/// the one `dmg()` minted — which is what makes "did the manifest get the digest
-/// of the bytes that actually ship?" an observable fact rather than an assertion
-/// about equal strings.
+/// Records packaging, and mints a different digest for the post-hook re-hash than the one
+/// `dmg()` minted, so whether the manifest got the digest of the bytes that ship is
+/// observable.
 struct FakePackager {
     log: Log,
 }
@@ -210,8 +187,7 @@ struct FakePackager {
 /// The digest `dmg::create` mints, before the Dev-ID signature and the staple
 /// rewrite the file.
 const DMG_SHA_BEFORE: &str = "pre-hook-digest";
-/// The digest a re-read of the same path yields afterwards. Clients download
-/// THESE bytes.
+/// The digest a re-read of the same path yields afterwards: the bytes clients download.
 const DMG_SHA_AFTER: &str = "post-hook-digest";
 const ZIP_SHA: &str = "zip-digest";
 
@@ -225,8 +201,8 @@ impl publish::Packager for FakePackager {
         })
     }
     fn zip(&self, app: &Path, _dist: &Path, _version: &str) -> ledger::Result<dmg::Packaged> {
-        // Recorded so the ORDERING contract stays observable: the zip is built from a
-        // bundle that has already been notarized and stapled.
+        // Recorded so the order stays observable: the zip is built from a bundle already
+        // notarized and stapled.
         record(&self.log, "create_zip", app);
         Ok(dmg::Packaged {
             path: PathBuf::from("/tmp/aterm-tier-fixture/aterm-mac.zip"),
@@ -265,15 +241,12 @@ fn good_dv() -> &'static str {
     )
 }
 
-// --- the anchor: armed 2026-08-15 ---------------------------------------------
+// --- the anchor ---------------------------------------------------------------
 
 #[test]
 fn the_shipped_anchor_is_armed_and_an_empty_anchor_still_resolves_inert() {
-    // Tier APPLE is ON: pins.rs carries the real Team ID (armed 2026-08-15 per the
-    // ACTIVATION CHECKLIST; this replaced the unset-anchor tripwire that stood here).
-    // Every "inactive path" test in this file exercises an EMPTY anchor passed
-    // explicitly, so the behaviour they pin survives the arming — proven below by
-    // resolving an empty anchor inert while the shipped one is active.
+    // pins.rs carries the real Team ID. Every inactive-path test here passes an empty anchor
+    // explicitly, so what they pin holds while the shipped one is active.
     assert_eq!(aterm_update_core::pins::APPLE_TEAM_ID, "A66A9P66Z7");
     assert!(aterm_update_core::pins::anchor_active(
         aterm_update_core::pins::APPLE_TEAM_ID
@@ -291,10 +264,8 @@ fn the_shipped_anchor_is_armed_and_an_empty_anchor_still_resolves_inert() {
 
 #[test]
 fn an_empty_anchor_resolves_to_the_inactive_tier_without_touching_a_keychain() {
-    // No credentials, no certificate, no notarytool profile — and no error.
-    // Anything else would break every FORK's cut, and every cut this tree made before
-    // 2026-08-15. `pins::APPLE_TEAM_ID` is armed, so a cut from this tree resolves the
-    // ACTIVE tier.
+    // No credentials, no certificate, no notarytool profile, and no error: anything else
+    // would break every fork's cut.
     let tier = sign::resolve_apple_tier("", None).expect("an unpinned build must resolve");
     assert!(
         tier.identity().is_none(),
@@ -319,9 +290,8 @@ fn the_inactive_hooks_do_nothing_and_claim_nothing() {
         !notarized_dmg,
         "nothing was notarized, so nothing is claimed"
     );
-    // The load-bearing assertion: not one Apple operation was attempted. This is
-    // what "byte-identical to today" means operationally — the DMG that reaches
-    // the manifest is the one `dmg::create` hashed, because nothing rewrote it.
+    // Not one Apple operation: the DMG that reaches the manifest is the one `dmg::create`
+    // hashed, because nothing rewrote it.
     assert!(
         entries(&log).is_empty(),
         "the inactive tier must not spawn a single Apple tool, got {:?}",
@@ -337,10 +307,8 @@ fn the_active_app_hook_preflights_then_notarizes_the_bundle() {
     let did = sign::notarize_app(&app(), &active_tier(), &FakeTools::healthy(&log))
         .expect("active app hook");
     assert!(did, "the active hook reports that it acted");
-    // MUTATION TARGET. Dropping the `tools.notarize(app, auth)?` line in
-    // `notarize_app` leaves the preflight and still returns Ok(true) — the exact
-    // failure that ships an unstapled bundle inside the zip the whole fleet
-    // downloads. This assertion is what makes that mutation fail.
+    // Mutation target: without `tools.notarize(app, auth)?`, `notarize_app` still
+    // preflights and returns Ok(true), and the zip ships an unstapled bundle.
     assert_eq!(
         entries(&log),
         vec!["preflight:aterm.app", "notarize:aterm.app"],
@@ -354,10 +322,8 @@ fn the_active_dmg_hook_signs_verifies_and_notarizes() {
     let did = sign::sign_and_notarize_dmg(&dmg(), &active_tier(), &FakeTools::healthy(&log))
         .expect("dmg hook");
     assert!(did, "the active hook reports that it acted");
-    // MUTATION TARGET. The behaviour this replaced signed the DMG, printed that
-    // it was NOT notarized, and returned Ok(false) so the release continued —
-    // while the manifest went on stamping a non-empty team_id. Removing the
-    // notarize call here reproduces exactly that, and fails here.
+    // Mutation target: without its notarize call `sign_and_notarize_dmg` returns having
+    // signed the DMG but not notarized it, while the manifest stamps a team id.
     assert_eq!(
         entries(&log),
         vec![
@@ -371,9 +337,8 @@ fn the_active_dmg_hook_signs_verifies_and_notarizes() {
 
 #[test]
 fn the_active_hook_never_reports_success_without_notarizing() {
-    // The return value IS the claim: `notarize_and_package` re-hashes the DMG and
-    // lets the manifest stamp a team id on the strength of it. So `true` must be
-    // unreachable without a completed notarization, for BOTH artifacts.
+    // The return value is the claim (`notarize_and_package` re-hashes the DMG and lets the
+    // manifest stamp a team id on it), so `true` needs a completed notarization, for both.
     let app_log = log();
     let app_ok = sign::notarize_app(&app(), &active_tier(), &FakeTools::healthy(&app_log))
         .expect("app hook");
@@ -394,10 +359,9 @@ fn the_active_hook_never_reports_success_without_notarizing() {
 
 #[test]
 fn a_failed_notarization_fails_the_release() {
-    // Apple rejected the submission, or the service was down, or the wait timed
-    // out. The cut must ABORT: a manifest with a non-empty team_id beside an
-    // unnotarized artifact is a promise `tools/install.sh` and the in-app
-    // updater will both refuse, after publication.
+    // Apple rejected the submission, the service was down, or the wait timed out: the cut
+    // aborts, since a manifest claiming a team beside an unnotarized artifact is refused by
+    // `tools/install.sh` and the updater, after publication.
     let dmg_log = log();
     let err = sign::sign_and_notarize_dmg(
         &dmg(),
@@ -417,9 +381,8 @@ fn a_failed_notarization_fails_the_release() {
 
 #[test]
 fn a_failed_verification_fails_the_release_before_apple_is_asked() {
-    // The preflight is a real gate, not a log line: if the artifact is not
-    // Developer-ID signed with the hardened runtime, the cut stops here rather
-    // than spending an Apple round trip to be told the same thing.
+    // The preflight is a real gate: an artifact not Developer-ID signed with the hardened
+    // runtime stops the cut before an Apple round trip.
     let log = log();
     let err = sign::notarize_app(
         &app(),
@@ -490,7 +453,7 @@ fn the_apple_id_spelling_produces_the_full_notarytool_triple() {
 
 #[test]
 fn the_team_id_notarytool_sees_comes_from_the_anchor_not_the_profile() {
-    // PRECONDITION: the profile CANNOT express a team id at all.
+    // The profile cannot express a team id at all.
     let profile = "signing_key = \"AA==\"\n\
                    notary_apple_id = \"placeholder@example.invalid\"\n\
                    notary_password = \"placeholder-app-specific-password\"\n\
@@ -498,8 +461,8 @@ fn the_team_id_notarytool_sees_comes_from_the_anchor_not_the_profile() {
     let auth = sign::credentials_notary_auth(profile)
         .expect("the stray team_id line is inert, not a parse error")
         .expect("the Apple stanza is present");
-    // Built with an EMPTY team id, then stamped from the anchor — so a team id
-    // written into the profile can never reach notarytool.
+    // Built with an empty team id, then stamped from the anchor, so a team id written into
+    // the profile never reaches notarytool.
     let args = auth.clone().with_team_id(FAKE_TEAM).args();
     assert!(
         args.contains(&FAKE_TEAM.to_string()),
@@ -530,10 +493,9 @@ fn a_password_never_reaches_a_debug_line() {
 
 // --- the refusal names the file to fix, or the profile to pass ----------------
 
-/// A fresh machine with only `~/.aterm/machine.key` — no `--release-credentials` — must be
-/// told to pass the profile `ship provision` writes, never to edit a profile it was not
-/// given; a real profile lacking `notary_profile` is named by its path. FAILS WITHOUT THE
-/// FIX: the machine-key case was refused with "add `notary_profile` to the profile".
+/// A machine with only `~/.aterm/machine.key` and no `--release-credentials` is told to pass
+/// the profile `ship provision` writes, never to edit a profile it was not given; a real
+/// profile lacking `notary_profile` is named by its path.
 #[test]
 fn a_cut_without_a_profile_is_told_to_pass_one_and_a_profile_without_notary_is_named() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -586,9 +548,7 @@ fn a_cut_without_a_profile_is_told_to_pass_one_and_a_profile_without_notary_is_n
 
 #[test]
 fn a_profile_with_no_apple_stanza_yields_no_auth() {
-    // A FORK's case: Tier APPLE off, profile carries only the signing key. The anchor is
-    // armed, so a cut from this tree needs a real notarytool credential named in the
-    // profile.
+    // A fork's case: Tier APPLE off, the profile carries only the signing key.
     assert!(
         sign::credentials_notary_auth("signing_key = \"AA==\"\n")
             .expect("no Apple stanza is legal")
@@ -627,8 +587,8 @@ fn a_half_written_headless_stanza_is_refused_by_name() {
 
 #[test]
 fn an_empty_notary_profile_is_refused_rather_than_read_as_absent() {
-    // `notary_profile = ""` would otherwise look configured and behave as if it
-    // were not — the silent-inert failure the whole anchor design exists to kill.
+    // `notary_profile = ""` would otherwise look configured and act unconfigured: the
+    // silent-inert failure the anchor design exists to prevent.
     let err = sign::credentials_notary_auth("notary_profile = \"\"\n")
         .expect_err("an empty value is a mistake, not an absence");
     assert!(err.contains("is empty"), "{err}");
@@ -724,8 +684,8 @@ fn two_matching_certificates_are_refused_rather_than_guessed_between() {
 
 #[test]
 fn the_disambiguator_can_only_narrow_never_widen() {
-    // `signing_identity_sha1` is per-machine state, so it must not be able to
-    // select a certificate the ANCHOR does not already accept.
+    // `signing_identity_sha1` is per-machine state, so it must not be able to select a
+    // certificate the anchor does not already accept.
     let text = listing(&[(
         OTHER_SHA1,
         &format!("Developer ID Application: Placeholder Org ({OTHER_TEAM})"),
@@ -736,9 +696,8 @@ fn the_disambiguator_can_only_narrow_never_widen() {
 
 #[test]
 fn an_empty_anchor_can_never_select_a_certificate() {
-    // Defence in depth behind `resolve_apple_tier`'s early return: if an empty
-    // anchor ever reached here, `"()"` would suffix-match nothing useful and the
-    // failure mode should be loud rather than subtle.
+    // Defence in depth behind `resolve_apple_tier`'s early return: an empty anchor that
+    // reached here fails loudly.
     let text = listing(&[(FAKE_SHA1, "Developer ID Application: Placeholder Org ()")]);
     sign::select_devid_identity(&text, "", None).expect_err("an empty anchor selects nothing");
 }
@@ -758,16 +717,14 @@ fn good_evidence() -> AppleSelfcheck<'static> {
 
 #[test]
 fn a_fully_notarized_stapled_cut_passes_the_self_check() {
-    // The non-vacuity guard for every rejection test below: if the "good" shape
-    // did not pass, those tests would prove nothing about WHICH rule fired.
+    // The control for every rejection test below.
     sign::apple_selfcheck_verdict(&good_evidence()).expect("a real Tier APPLE cut must pass");
 }
 
 #[test]
 fn a_bundle_without_a_stapled_ticket_fails_the_self_check() {
-    // THE test that matters most. `spctl` PASSES for a notarized-but-unstapled
-    // app whenever the cutting machine has network, because Gatekeeper falls
-    // back to an online lookup — so without this rule a green self-check on m3
+    // `spctl` passes a notarized but unstapled app whenever the cutting machine has network
+    // (Gatekeeper falls back to an online lookup), so without this rule a green self-check
     // says nothing about the offline Mac that downloads the zip.
     let mut e = good_evidence();
     e.app_stapled = false;
@@ -818,9 +775,9 @@ fn a_team_mismatch_fails_the_self_check() {
 
 #[test]
 fn the_apple_branch_refuses_to_run_for_a_cut_that_claims_nothing() {
-    // Guards the caller's `if !team.is_empty()`: were that gate ever inverted,
-    // an inactive cut would be judged by Apple rules it cannot satisfy, and this
-    // says so instead of failing with a confusing TeamIdentifier message.
+    // Guards the caller's `team.is_empty()` gate: were it inverted, an inactive cut would be
+    // judged by Apple rules it cannot satisfy, and this says so instead of failing with a
+    // confusing TeamIdentifier message.
     let mut e = good_evidence();
     e.team_id = "";
     let err = sign::apple_selfcheck_verdict(&e).expect_err("an unclaimed cut is not judged here");
@@ -828,27 +785,17 @@ fn the_apple_branch_refuses_to_run_for_a_cut_that_claims_nothing() {
 }
 
 // ---------------------------------------------------------------------------
-// THE CALL SITES — the lines that decide whether any of the above ever runs
+// The call sites that decide whether any of the above runs; each test names the mutation
+// it kills.
 // ---------------------------------------------------------------------------
-//
-// Everything above this line proves a RULE. Everything below proves that the
-// pipeline actually reaches it. Two skeptics found that the wiring, not the
-// rules, was what nothing tested: `if false` in place of the self-check's tier
-// gate, and `if false &&` in front of the build's notarize hook, both left the
-// suite green. Each test below states the mutation it kills, so a future reader
-// can re-run the experiment rather than trust the claim.
 
 // --- step_sign's hook: `notarize_and_package` --------------------------------
 
 #[test]
 fn the_active_build_notarizes_the_bundle_before_the_zip_that_carries_it() {
-    // MUTATION TARGET (finding A.2): `if false && sign::notarize_app(..)?` in
-    // `notarize_and_package`. The short circuit means the bundle is never
-    // submitted, so the zip the entire fleet downloads contains an unstapled
-    // app — and every offline `spctl -a -t exec` on a customer's Mac fails. The
-    // ORDER assertion below is what makes that mutation fail: with the hook
-    // short-circuited the log simply has no `preflight:aterm.app` /
-    // `notarize:aterm.app` prefix.
+    // Mutation target: skipping `sign::notarize_app` in `notarize_and_package` (`if false &&
+    // …`) ships the zip with an unstapled app; the order below then lacks its
+    // `preflight:aterm.app` / `notarize:aterm.app` prefix.
     let log = log();
     let out = publish::notarize_and_package(
         &app(),
@@ -867,7 +814,7 @@ fn the_active_build_notarizes_the_bundle_before_the_zip_that_carries_it() {
             // 1. the bundle is verified and notarized...
             "preflight:aterm.app",
             "notarize:aterm.app",
-            // 2. ...and only THEN are the containers built around it,
+            // 2. ...and only then are the containers built around it,
             "create_dmg:aterm.app",
             // 3. the DMG signed and notarized (which rewrites its bytes),
             "sign_dmg:aterm.dmg",
@@ -876,22 +823,20 @@ fn the_active_build_notarizes_the_bundle_before_the_zip_that_carries_it() {
             // 4. re-read afterwards,
             "rehash:aterm.dmg",
             "resize:aterm.dmg",
-            // 5. and the zip archived from the ALREADY-STAPLED bundle last.
+            // 5. and the zip archived from the already-stapled bundle last.
             "create_zip:aterm.app",
         ],
         "the bundle must be stapled before any container is built"
     );
-    // The digest that reaches the manifest is the one read AFTER the hook. A
-    // `dmg::create`-time digest here would abort the self-check at best and
-    // strand every client's sha256 gate at worst.
+    // The manifest gets the digest read after the hook: a `dmg::create`-time one would abort
+    // the self-check at best and strand every client's sha256 gate at worst.
     assert_eq!(out.dmg_sha256, DMG_SHA_AFTER);
     assert_eq!(out.dmg_size, 2_000, "the size must be re-read too");
     assert_eq!(out.zip.sha256, ZIP_SHA);
 }
 
-/// ONE DMG (RETIRED 2026-08-26: the Intel `-x86_64` restage and the `-lite`
-/// twin). The packaging seam builds exactly the canonical DMG and the zip —
-/// a second `create_dmg*` call of any spelling is a retired lane coming back.
+/// The packaging seam builds exactly the canonical DMG and the zip: a second `create_dmg*`
+/// call, or an `x86_64` or `lite` container, is a retired lane coming back.
 #[test]
 fn the_packaging_lane_builds_exactly_one_dmg_and_one_zip() {
     let log = log();
@@ -927,9 +872,8 @@ fn the_packaging_lane_builds_exactly_one_dmg_and_one_zip() {
 
 #[test]
 fn the_inactive_build_packages_exactly_as_it_always_did() {
-    // The other half of the same call site: with an EMPTY anchor — a fork's, and this
-    // tree's own before 2026-08-15 — the hooks must add NOTHING. No Apple tool, no
-    // re-hash, and the manifest keeps the digest `dmg::create` minted.
+    // With an empty anchor (a fork's) the hooks add nothing: no Apple tool, no re-hash, and
+    // the manifest keeps the digest `dmg::create` minted.
     let log = log();
     let out = publish::notarize_and_package(
         &app(),
@@ -956,9 +900,8 @@ fn the_inactive_build_packages_exactly_as_it_always_did() {
 
 #[test]
 fn a_failed_bundle_notarization_stops_the_cut_before_anything_is_packaged() {
-    // Fail-closed at the call site, not merely inside the hook: the containers
-    // must not exist, because a DMG built around an unnotarized bundle is an
-    // artifact whose manifest would still claim a team.
+    // Fail-closed at the call site: no container may exist around an unnotarized bundle,
+    // whose manifest would still claim a team.
     let log = log();
     let outcome = publish::notarize_and_package(
         &app(),
@@ -983,10 +926,9 @@ fn a_failed_bundle_notarization_stops_the_cut_before_anything_is_packaged() {
 
 #[test]
 fn a_failed_dmg_notarization_stops_the_cut_before_the_zip_is_built() {
-    // The bundle's submission succeeds and the DMG's fails — the state a cut
-    // reaches when Apple accepts one artifact and rejects the next. The zip must
-    // never be built: an asset set assembled around a failed notarization is one
-    // `--resume` away from being uploaded under a manifest that claims a team.
+    // Apple accepts the bundle and rejects the DMG: the zip is never built, since an asset
+    // set around a failed notarization is one `--resume` from upload under a manifest that
+    // claims a team.
     let log = log();
     let tools = FakeTools {
         fail_on_target: Some("aterm.dmg"),
@@ -1021,13 +963,9 @@ fn a_failed_dmg_notarization_stops_the_cut_before_the_zip_is_built() {
 
 #[test]
 fn the_self_check_gate_judges_every_cut_that_claims_a_team() {
-    // MUTATION TARGET (finding A.1): replacing the `if team.is_empty() { return }`
-    // gate in `selfcheck_signing` with an unconditional early return (equivalently,
-    // `if false` on the old `if !team.is_empty()` form). Under that mutation a cut
-    // whose artifacts carry NO notarization ticket sails through the self-check
-    // and publishes a manifest claiming a team — the precise lie the whole tier
-    // exists to prevent. This test fails under it, because an unstapled app must
-    // be rejected.
+    // Mutation target: an unconditional early return in place of `selfcheck_signing`'s
+    // `if team.is_empty()` gate lets a cut with no notarization ticket publish a manifest
+    // claiming a team.
     let log = log();
     let tools = FakeTools {
         unstapled: Some("aterm.app"),
@@ -1049,13 +987,12 @@ fn the_self_check_gate_judges_every_cut_that_claims_a_team() {
 
 #[test]
 fn the_self_check_gate_passes_a_genuinely_notarized_cut() {
-    // The non-vacuity guard for the test above: if the healthy fixture did not
-    // pass, "unstapled fails" would prove nothing about WHICH rule fired.
+    // The control for the test above.
     let log = log();
     let note = publish::selfcheck_signing(FAKE_TEAM, &app(), &dmg(), &FakeTools::healthy(&log))
         .expect("a fully notarized, stapled cut passes");
-    // The transcript's Tier APPLE claim is this function's RETURN VALUE, so the
-    // cut cannot print that it verified a staple without having verified one.
+    // The transcript's Tier APPLE claim is this function's return value, so the cut cannot
+    // print that it verified a staple without having verified one.
     assert!(note.contains("stapled ticket"), "{note}");
     assert_eq!(
         entries(&log),
@@ -1073,10 +1010,8 @@ fn the_self_check_gate_passes_a_genuinely_notarized_cut() {
 
 #[test]
 fn the_self_check_asks_nothing_of_apple_for_a_cut_that_claims_no_team() {
-    // The other direction of the same gate — inverting it (`if !team.is_empty()`
-    // → `if true`) would judge an ad-hoc cut (a fork's, or one of this tree's from before
-    // 2026-08-15) by rules it cannot satisfy and fail every release it makes. The hard
-    // codesign gate still runs; nothing else does.
+    // The other direction: an inverted gate would judge an ad-hoc cut (a fork's) by rules
+    // it cannot satisfy. The hard codesign gate still runs; nothing else does.
     let log = log();
     let note = publish::selfcheck_signing("", &app(), &dmg(), &FakeTools::healthy(&log))
         .expect("a cut that claims no team passes without asking Apple anything");
@@ -1104,9 +1039,8 @@ fn the_hard_codesign_gate_runs_on_the_shipped_tier_too() {
 
 #[test]
 fn a_gatekeeper_rejection_of_the_dmg_stops_the_cut() {
-    // Proves the DMG half of the branch is wired, not just the app's: they are
-    // separate evidence fields and a caller that filled the DMG's from the app's
-    // would pass every app-side test.
+    // The DMG half is wired, not just the app's: a caller that filled the DMG's evidence
+    // from the app's would pass every app-side test.
     let log = log();
     let tools = FakeTools {
         gatekeeper_rejects: Some("aterm.dmg"),
@@ -1119,9 +1053,7 @@ fn a_gatekeeper_rejection_of_the_dmg_stops_the_cut() {
 
 #[test]
 fn each_artifact_gets_the_gatekeeper_assessment_it_actually_faces() {
-    // `-t exec` on a disk image does not apply and passes vacuously, so asking
-    // the wrong question is indistinguishable from a green result. FakeTools
-    // asserts the kind per artifact; this pins the argv each kind expands to.
+    // FakeTools asserts the kind per artifact (`gatekeeper_ok`); this pins each kind's argv.
     assert_eq!(
         sign::spctl_argv(GatekeeperKind::App),
         vec!["/usr/sbin/spctl", "-a", "-t", "exec"]
@@ -1137,9 +1069,8 @@ fn each_artifact_gets_the_gatekeeper_assessment_it_actually_faces() {
             "context:primary-signature"
         ]
     );
-    // Absolute paths, always: a release pipeline that resolves `spctl` through
-    // `$PATH` lets whoever controls the path decide what "Gatekeeper approved"
-    // means. (The updater side already spawns absolutely.)
+    // Absolute paths: an `spctl` resolved through `$PATH` lets whoever controls the path
+    // decide what "Gatekeeper approved" means.
     for kind in [GatekeeperKind::App, GatekeeperKind::Dmg] {
         assert!(
             sign::spctl_argv(kind)[0].starts_with('/'),
@@ -1174,16 +1105,9 @@ fn journal_with(done: &[&str]) -> Journal {
 
 #[test]
 fn a_resume_past_the_build_never_asks_for_an_apple_credential() {
-    // FINDING B. Resolving unconditionally means a resume that is one upload away
-    // from finished still demands a Developer-ID certificate and a notarytool
-    // credential — and fails if the certificate expired since the cut began,
-    // which is exactly when a resume matters most. Nothing after `build` signs
-    // anything: the self-check re-proves the artifacts ON DISK against the
-    // MANIFEST's claim.
-    //
-    // MUTATION TARGET: delete the `is_done("sign")` early return. With no
-    // credentials and an active anchor, resolution then fails and this test goes
-    // red.
+    // Nothing after `sign` signs anything (the self-check re-proves the artifacts on disk
+    // against the manifest's claim), so a certificate that expired mid-cut must not make
+    // the cut unfinishable. Mutation target: delete the `is_done("sign")` early return.
     let tier = publish::resume_apple_tier(FAKE_TEAM, &journal_with(&["sign"]), None)
         .expect("a resume past the build must not need Apple credentials");
     assert!(
@@ -1194,13 +1118,9 @@ fn a_resume_past_the_build_never_asks_for_an_apple_credential() {
 
 #[test]
 fn a_resume_that_will_rebuild_must_still_prove_it_can_notarize() {
-    // The fail-closed half, and the reason the gate is a predicate rather than a
-    // deletion: a resume that re-enters at `build` bakes the artifact bytes the
-    // fleet installs, so it must re-prove the same things `run_cut` proved.
-    //
-    // MUTATION TARGET: make the early return unconditional (`if true`). The
-    // resume would then rebuild and ship an ad-hoc artifact under a manifest
-    // stamping a team id — and this test, which demands the refusal, goes red.
+    // A resume that re-enters at `build` bakes the bytes the fleet installs, so it must
+    // re-prove what `run_cut` proved. Mutation target: make the `is_done("sign")` early
+    // return unconditional.
     let err = publish::resume_apple_tier(FAKE_TEAM, &journal_with(&["gates"]), None)
         .expect_err("an active anchor with no credentials must refuse to rebuild");
     let err = err.to_string();
@@ -1215,6 +1135,5 @@ fn a_resume_that_will_rebuild_must_still_prove_it_can_notarize() {
 }
 
 // The shipped anchor's effect on a resume is asserted inside
-// `the_shipped_anchor_is_armed_and_an_empty_anchor_still_resolves_inert`, deliberately:
-// that keeps every assertion about the real anchor in ONE test, which is what pins.rs's
-// activation checklist points at.
+// `the_shipped_anchor_is_armed_and_an_empty_anchor_still_resolves_inert`, which keeps every
+// assertion about the real anchor in one test (pins.rs points at it).

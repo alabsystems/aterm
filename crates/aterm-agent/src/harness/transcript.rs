@@ -16,7 +16,8 @@ use serde::{Deserialize, Deserializer};
 enum Shape {
     Scalar,
     Object(&'static [Field]),
-    Content,
+    /// A list, each element read by the shape.
+    Seq(&'static Shape),
 }
 
 type Field = (&'static str, Shape);
@@ -40,6 +41,32 @@ const USAGE: Shape = Shape::Object(&[
                     ("output_tokens", Shape::Scalar),
                     ("cache_creation_input_tokens", Shape::Scalar),
                     ("cache_read_input_tokens", Shape::Scalar),
+                    // The cache writes by lifetime: one-hour writes list
+                    // higher (`usage::TokenUsage::cache_write_1h`).
+                    (
+                        "cache_creation",
+                        Shape::Object(&[
+                            ("ephemeral_5m_input_tokens", Shape::Scalar),
+                            ("ephemeral_1h_input_tokens", Shape::Scalar),
+                        ]),
+                    ),
+                    // What the price table does not price, so the spend
+                    // fold counts the message as approximate
+                    // (`spend::approx`): fast mode, US-only inference,
+                    // web search, a tier other than the standard one, any
+                    // iteration but a plain message — an advisor's, a
+                    // server-side fallback's (each entry's `type` only).
+                    ("speed", Shape::Scalar),
+                    ("inference_geo", Shape::Scalar),
+                    ("service_tier", Shape::Scalar),
+                    (
+                        "server_tool_use",
+                        Shape::Object(&[("web_search_requests", Shape::Scalar)]),
+                    ),
+                    (
+                        "iterations",
+                        Shape::Seq(&Shape::Object(&[("type", Shape::Scalar)])),
+                    ),
                 ]),
             ),
         ]),
@@ -66,12 +93,18 @@ const COMMAND_FIELDS: [Field; 7] = {
 };
 const COMMAND: Shape = Shape::Object(&COMMAND_FIELDS);
 const CONTENT_PART: Shape = Shape::Object(&[("type", Shape::Scalar), ("text", Shape::Scalar)]);
+/// A message's content: its parts' type and text, or the plain string.
+const CONTENT: Shape = Shape::Seq(&CONTENT_PART);
 /// What is kept of a limit row's `quotaLimits`: whether the request was
-/// rejected, the reset it names, and which of the account's limits it was.
-/// MEASURED on this machine's transcripts (2026-10-01: every one of the ten
-/// rows that carry the key, Claude Code 2.1.273 and 2.1.283; 2.1.286's row
-/// is the accounts design §1's): `{"status":"rejected","resetsAt":<unix s,
-/// an integer>,"unifiedRateLimitFallbackAvailable":false,
+/// rejected, the reset it names, which of the account's limits it was, and
+/// what it says of the account's usage credits — whether they are on
+/// (`overageStatus`), why not (`overageDisabledReason`), when they come back
+/// (`overageResetsAt`) and whether they were in use (`isUsingOverage`), what
+/// the accounts recorder keeps of them (`upgrade::CreditsWord`). MEASURED on
+/// this machine's transcripts (2026-10-01: every one of the ten rows that
+/// carry the key, Claude Code 2.1.273 and 2.1.283; 2.1.286's row is the
+/// accounts design §1's): `{"status":"rejected","resetsAt":<unix s, an
+/// integer>,"unifiedRateLimitFallbackAvailable":false,
 /// "rateLimitType":"five_hour" | "seven_day","overageStatus":…,
 /// "overageDisabledReason":…,"isUsingOverage":false}`, five of 2.1.273's
 /// with three `lowPriority…` keys besides. None of those other keys is read
@@ -80,6 +113,10 @@ const QUOTA_LIMITS: Shape = Shape::Object(&[
     ("status", Shape::Scalar),
     ("resetsAt", Shape::Scalar),
     ("rateLimitType", Shape::Scalar),
+    ("overageStatus", Shape::Scalar),
+    ("overageDisabledReason", Shape::Scalar),
+    ("overageResetsAt", Shape::Scalar),
+    ("isUsingOverage", Shape::Scalar),
 ]);
 const CONVERSATION: Shape = Shape::Object(&[
     ("type", Shape::Scalar),
@@ -102,7 +139,7 @@ const CONVERSATION: Shape = Shape::Object(&[
     ("quotaLimits", QUOTA_LIMITS),
     (
         "message",
-        Shape::Object(&[("model", Shape::Scalar), ("content", Shape::Content)]),
+        Shape::Object(&[("model", Shape::Scalar), ("content", CONTENT)]),
     ),
 ]);
 
@@ -120,6 +157,11 @@ const CODEX_METADATA: Shape = Shape::Object(&[
             ("cwd", Shape::Scalar),
             ("model", Shape::Scalar),
             ("sandbox_policy", Shape::Object(&[("type", Shape::Scalar)])),
+            // A `turn_context`'s permission mode, which a relaunch carries
+            // (`upgrade_codex::ThreadMode`); a `granular` policy's object
+            // is kept as null.
+            ("approval_policy", Shape::Scalar),
+            ("approvals_reviewer", Shape::Scalar),
         ]),
     ),
 ]);
@@ -134,6 +176,56 @@ impl<'de> Deserialize<'de> for CodexMetadata {
 
 pub(crate) fn codex_metadata(line: &str) -> aterm_json::Result<Value> {
     aterm_json::from_str::<CodexMetadata>(line).map(|v| v.0)
+}
+
+/// One token count of a Codex turn, in OpenAI's classes: `input_tokens`
+/// holds `cached_input_tokens`, and `output_tokens` holds
+/// `reasoning_output_tokens`.
+const CODEX_TOKENS: Shape = Shape::Object(&[
+    ("input_tokens", Shape::Scalar),
+    ("cached_input_tokens", Shape::Scalar),
+    ("cache_write_input_tokens", Shape::Scalar),
+    ("output_tokens", Shape::Scalar),
+    ("reasoning_output_tokens", Shape::Scalar),
+    ("total_tokens", Shape::Scalar),
+]);
+
+/// What the Codex spend fold reads of a rollout line
+/// (`supervise::codex_usage::TurnReader`): its stamp, a `session_meta`'s fork
+/// parent, a `turn_context`'s model and service tier, and a `token_count`'s
+/// running total and last turn. Instructions, tool payloads, messages and
+/// the rate limits are validated, never materialized.
+const CODEX_SPEND: Shape = Shape::Object(&[
+    ("type", Shape::Scalar),
+    ("timestamp", Shape::Scalar),
+    (
+        "payload",
+        Shape::Object(&[
+            ("type", Shape::Scalar),
+            ("forked_from_id", Shape::Scalar),
+            ("model", Shape::Scalar),
+            ("service_tier", Shape::Scalar),
+            (
+                "info",
+                Shape::Object(&[
+                    ("total_token_usage", CODEX_TOKENS),
+                    ("last_token_usage", CODEX_TOKENS),
+                ]),
+            ),
+        ]),
+    ),
+]);
+
+struct CodexSpend(Value);
+
+impl<'de> Deserialize<'de> for CodexSpend {
+    fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        CODEX_SPEND.deserialize(de).map(Self)
+    }
+}
+
+pub(crate) fn codex_spend(line: &str) -> aterm_json::Result<Value> {
+    aterm_json::from_str::<CodexSpend>(line).map(|v| v.0)
 }
 
 struct Usage(Value);
@@ -223,12 +315,12 @@ impl<'de> Visitor<'de> for Shape {
     }
 
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Value, A::Error> {
-        if matches!(self, Shape::Content) {
-            let mut parts = Vec::new();
-            while let Some(part) = seq.next_element_seed(CONTENT_PART)? {
-                parts.push(part);
+        if let Shape::Seq(element) = self {
+            let mut kept = Vec::new();
+            while let Some(one) = seq.next_element_seed(*element)? {
+                kept.push(one);
             }
-            return Ok(Value::Array(parts));
+            return Ok(Value::Array(kept));
         }
         while seq.next_element::<IgnoredAny>()?.is_some() {}
         Ok(Value::Null)
@@ -280,12 +372,9 @@ mod tests {
 
     fn project(value: Value, shape: Shape) -> Value {
         match (value, shape) {
-            (Value::Array(parts), Shape::Content) => Value::Array(
-                parts
-                    .into_iter()
-                    .map(|p| project(p, CONTENT_PART))
-                    .collect(),
-            ),
+            (Value::Array(parts), Shape::Seq(element)) => {
+                Value::Array(parts.into_iter().map(|p| project(p, *element)).collect())
+            }
             (Value::Object(mut obj), Shape::Object(fields)) => Value::Object(
                 fields
                     .iter()
@@ -331,6 +420,16 @@ mod tests {
                 ),
                 format!(r#"{{"message":{{"model":{value},"usage":{value},"content":{value}}}}}"#),
                 format!(
+                    r#"{{"message":{{"usage":{{"iterations":[{value},{{"type":{value},"input_tokens":1}}],"speed":{value}}}}}}}"#
+                ),
+                format!(r#"{{"message":{{"usage":{{"iterations":{value}}}}}}}"#),
+                format!(
+                    r#"{{"payload":{{"forked_from_id":{value},"service_tier":{value},"info":{value}}}}}"#
+                ),
+                format!(
+                    r#"{{"payload":{{"info":{{"total_token_usage":{value},"last_token_usage":{{"input_tokens":{value},"total_tokens":3,"total_tokens":{value}}},"rate_limits":{value}}}}}}}"#
+                ),
+                format!(
                     r#"{{"type":"ignored","t\u0079pe":"assistant","message":null,"message":{{"model":"opus","usage":{{"input_tokens":3,"input_tokens":{value}}}}}}}"#
                 ),
             ] {
@@ -350,18 +449,23 @@ mod tests {
                 );
                 assert_eq!(
                     codex_metadata(&text).expect("Codex metadata"),
-                    project(full, CODEX_METADATA)
+                    project(full.clone(), CODEX_METADATA)
+                );
+                assert_eq!(
+                    codex_spend(&text).expect("Codex spend"),
+                    project(full, CODEX_SPEND)
                 );
             }
         }
     }
 
     /// THE LIMIT ROW, as Claude Code 2.1.286 writes it (the accounts design
-    /// §1's row; ids cut): the conversation projection keeps the three keys
-    /// of `quotaLimits` its readers ask for — `status`, `resetsAt`,
-    /// `rateLimitType` — and none of the overage keys; the other projections
-    /// keep no `quotaLimits` at all. A key of the wrong shape reads as the
-    /// null it stands for, and does not cost the row its other keys.
+    /// §1's row; ids cut): the conversation projection keeps the keys of
+    /// `quotaLimits` its readers ask for — `status`, `resetsAt`,
+    /// `rateLimitType` and the usage credits' four — and nothing else of it
+    /// (`unifiedRateLimitFallbackAvailable`); the other projections keep no
+    /// `quotaLimits` at all. A key of the wrong shape reads as the null it
+    /// stands for, and does not cost the row its other keys.
     #[test]
     fn the_conversation_keeps_a_limit_rows_status_reset_and_limit_type() {
         let row = r#"{"type":"assistant","isApiErrorMessage":true,"error":"rate_limit","timestamp":"2026-09-30T19:02:11.123Z","quotaLimits":{"status":"rejected","resetsAt":1790870400,"unifiedRateLimitFallbackAvailable":false,"rateLimitType":"seven_day","overageStatus":"rejected","overageDisabledReason":"org_level_disabled","isUsingOverage":false},"message":{"model":"<synthetic>","content":[{"type":"text","text":"You've hit your weekly limit · resets Oct 1 at 9am (America/Los_Angeles)"}]}}"#;
@@ -369,7 +473,7 @@ mod tests {
         let quota = kept.get("quotaLimits").expect("quotaLimits");
         assert_eq!(
             aterm_json::to_string(quota).expect("json"),
-            r#"{"rateLimitType":"seven_day","resetsAt":1790870400,"status":"rejected"}"#
+            r#"{"isUsingOverage":false,"overageDisabledReason":"org_level_disabled","overageStatus":"rejected","rateLimitType":"seven_day","resetsAt":1790870400,"status":"rejected"}"#
         );
         // NEGATIVE CONTROL: the projections that read no limit keep none.
         for other in [usage(row), metadata(row), command(row)] {
@@ -410,9 +514,14 @@ mod tests {
                 assert!(metadata(&text).is_err(), "{text}");
                 assert!(conversation(&text).is_err(), "{text}");
                 assert!(codex_metadata(&text).is_err(), "{text}");
+                assert!(codex_spend(&text).is_err(), "{text}");
             }
         }
         let deep = format!("{}0{}", "[".repeat(130), "]".repeat(130));
         assert!(metadata(&format!(r#"{{"unknown":{deep}}}"#)).is_err());
     }
 }
+
+#[path = "transcript_corpus_tests.rs"]
+#[cfg(test)]
+mod corpus_tests;

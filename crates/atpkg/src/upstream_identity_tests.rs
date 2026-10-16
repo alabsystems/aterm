@@ -14,9 +14,8 @@ const STOCK_VV: &str = "rustc 1.97.1 (8bab26f4f 2026-07-14)\nbinary: rustc\n\
     commit-hash: 8bab26f4f68e0e26f0bb7960be334d5b520ea452\ncommit-date: 2026-07-14\n\
     host: aarch64-apple-darwin\nrelease: 1.97.1\nLLVM version: 22.1.6\n";
 
-/// Verbatim `cargo -vV` of the shipped Trust seal e9ca4908 (~/toolchains/trust-e9ca4908,
-/// index 9): Trust's tree by `trust-repo-commit-hash:`, and no `trust:` line — its
-/// `rustc` prints one.
+/// Verbatim `cargo -vV` of a shipped Trust seal: Trust's tree by `trust-repo-commit-hash:`,
+/// and no `trust:` line (its `rustc` prints one).
 const E9CA4908_CARGO_VV: &str = "cargo 1.99.0-dev (e9ca49080 2026-08-18)\n\
     release: 1.99.0-dev\ncommit-hash: e9ca49080f0f71d4ec8d6bb5a6394ff122031eaa\n\
     commit-date: 2026-08-18\n\
@@ -113,12 +112,9 @@ fn vv_says_trust_by_its_trust_line_and_stock_by_its_absence() {
     assert!(!Identity::Unknown { why: "x".into() }.is_trust());
 }
 
-/// STOCK is said only where nothing marks Trust. A `-vV` that carries a mark of Trust
-/// but no `trust:` version — the shipped seal e9ca4908's cargo — is named by what it
-/// printed and is not known to be Trust: not Trust (no claim is widened), and not
-/// STOCK. Measured 2026-09-30 before this: `-> STOCK cargo 1.99.0-dev (e9ca49080); not
-/// Trust`, and inside a Trust checkout "where a stock compiler would build part of
-/// Trust", of the cargo Trust shipped.
+/// Stock is said only where nothing marks Trust: a `-vV` with a mark of Trust but no
+/// `trust:` version (a shipped Trust cargo) is named by what it printed, neither Trust nor
+/// stock.
 #[test]
 fn stock_is_said_only_where_nothing_marks_trust() {
     let named = |vv: &str| Resolved {
@@ -303,8 +299,8 @@ fn picked_follows_rustups_order_and_names_only_a_match() {
     );
 }
 
-/// A copy that is not a rustup proxy is itself: its `-vV` names it — Trust or STOCK —
-/// and anything that does not answer as a Rust tool is not known, never Trust.
+/// A copy that is not a rustup proxy is itself: its `-vV` names it, Trust or stock, and
+/// anything that does not answer as a Rust tool is not known, never Trust.
 #[cfg(unix)]
 #[test]
 fn a_plain_copy_is_named_by_its_own_vv() {
@@ -506,8 +502,8 @@ fn a_rustup_answer_is_cached_by_what_rustup_reads() {
     assert_eq!(asked(), 5, "a failure is never cached");
 }
 
-/// A link NAMED rustup is a proxy whatever its directory; a plain copy with its own
-/// bytes is not; a copy of rustup's bytes is.
+/// A link named rustup is a proxy whatever its directory; a plain copy with its own bytes
+/// is not; a copy of rustup's bytes is.
 #[cfg(unix)]
 #[test]
 fn a_proxy_is_known_by_its_file() {
@@ -536,8 +532,7 @@ fn a_proxy_is_known_by_its_file() {
     assert_eq!(rustup_proxy(&lone, &lone), None, "no rustup beside it");
 
     // rustup's hard-link layout reached through a symlink: the link on PATH sits beside
-    // no rustup; the file it reaches sits beside rustup's own inode (measured
-    // 2026-09-30: missed, that proxy's `-vV` named one directory's toolchain in all).
+    // no rustup; the file it reaches sits beside rustup's own inode.
     let cargo_bin = dir.join("cargo-home").join("bin");
     std::fs::create_dir_all(&cargo_bin).unwrap();
     std::fs::copy(&rustup, cargo_bin.join("rustup")).unwrap();
@@ -561,11 +556,9 @@ fn a_proxy_is_known_by_its_file() {
     );
 }
 
-/// A plain copy — not rustup's proxy — is asked as it will run, `+<toolchain>` and all:
-/// a wrapper around a proxy passes it on. Measured 2026-09-30: asked without it, a `#!`
-/// wrapper over rustup's proxy was named Trust (the rustup default) while `cargo
-/// +1.97.1` ran stock 1.97.1 — and inside a Trust source checkout that stock ran. A copy
-/// that does not take a `+<toolchain>` answers as it would run: not known, never Trust.
+/// A plain copy (not rustup's proxy) is asked as it will run, `+<toolchain>` and all, since a
+/// wrapper around a proxy passes it on. A copy that does not take a `+<toolchain>` answers as
+/// it would run: not known, never Trust.
 #[cfg(unix)]
 #[test]
 fn a_plain_copy_is_asked_with_the_toolchain_it_is_handed() {
@@ -630,13 +623,8 @@ fn a_plain_copy_is_asked_with_the_toolchain_it_is_handed() {
     );
 }
 
-/// A COMPILED file that is not a toolchain's own is never answered from the cache: a
-/// mise/proto-style dispatcher symlinked as `cargo` and `rustc` picks the tool by its
-/// `argv[0]` and directory, so one answer kept under its one path names the other name
-/// and other directories. Measured 2026-09-30 when every compiled binary was cached by
-/// its file: `rustc`'s Trust answer from an unpinned directory, cached under a 10-line C
-/// dispatcher, named `cargo` Trust in a directory pinning stock 1.97.1 — inside a Trust
-/// source checkout, where that stock then ran.
+/// A mise/proto-style dispatcher symlinked as `cargo` and `rustc` picks the tool by `argv[0]`
+/// and directory, so an answer cached under its one path would serve the other name.
 #[cfg(unix)]
 #[test]
 fn a_compiled_dispatcher_is_never_answered_from_the_cache() {
@@ -646,8 +634,7 @@ fn a_compiled_dispatcher_is_never_answered_from_the_cache() {
     let real = std::fs::canonicalize(&dispatcher).unwrap();
     let cargo = dir.join("shims").join("cargo");
     link(&dispatcher, &cargo);
-    // What caching every compiled binary by its file alone kept, after a `rustc` asked
-    // through the same dispatcher answered Trust.
+    // A cached Trust answer for the dispatcher's path, as a `rustc` through it would give.
     let cache = dir.join(CACHE_FILE);
     let stamp = stamp_of(&std::fs::metadata(&real).unwrap()).unwrap();
     let vv = parse_vv(TRUST_VV).unwrap();
@@ -689,11 +676,9 @@ fn macho(at: &Path) {
     std::fs::set_permissions(at, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-/// A KEYED FILE IS ASKED BY ITS OWN PATH: the answer cached under a toolchain's file is that
-/// file's. The probe used to run the path the name was reached by, so a link re-pointed
-/// after `canonicalize` named the keyed file had another file's answer stored under its
-/// key. Here the reached path runs a Trust fake while the keyed file is a header that
-/// cannot run: its own answer — none — is what counts, and nothing is cached.
+/// A keyed file is asked by its own path, so the answer cached under it is that file's: here
+/// the reached path runs a Trust fake while the keyed file is a header that cannot run, and
+/// its own answer (none) is what counts; nothing is cached.
 #[cfg(unix)]
 #[test]
 fn a_keyed_file_is_asked_by_its_own_path() {
@@ -726,11 +711,9 @@ fn a_keyed_file_is_asked_by_its_own_path() {
     );
 }
 
-/// Only A TOOLCHAIN'S OWN FILE is cached — a compiled binary named what was typed, in a
-/// `bin/` beside a `lib/` holding a `librustc_driver` — keyed by its file AND its driver.
-/// Nothing else is: a script, a binary under another name (a dispatcher asked as
-/// `cargo`), one in a `bin/` with no driver beside it or in no `bin/` at all (a shim
-/// directory). A key that changed misses.
+/// Only a toolchain's own file is cached, keyed by its file and its driver: not a script, a
+/// binary under another name, or one in a `bin/` with no driver beside it or in no `bin/`. A
+/// key that changed misses.
 #[cfg(unix)]
 #[test]
 fn the_cache_keys_only_a_toolchains_own_file_by_its_file_and_driver() {
@@ -801,7 +784,7 @@ fn the_cache_keys_only_a_toolchains_own_file_by_its_file_and_driver() {
         cache_get(&cache, KIND_WHICH, "a which key"),
         Some(vec![String::from("/a/answer")])
     );
-    // A mark is kept: read back, a Trust-marked build is still not called STOCK.
+    // A mark is kept: read back, a Trust-marked build is still not called stock.
     let seal = parse_vv(E9CA4908_CARGO_VV).unwrap();
     rebuilt.store(&cache, &seal);
     assert_eq!(rebuilt.lookup(&cache), Some(seal));
@@ -810,8 +793,8 @@ fn the_cache_keys_only_a_toolchains_own_file_by_its_file_and_driver() {
     assert_eq!(cache_get(&cache, KIND_WHICH, "tab"), None);
 }
 
-/// A script's identity is measured on every call — two directories, two compilers — and
-/// a resolution through a cache file writes nothing for it.
+/// A script can be a different compiler in each directory, so a resolution through a cache
+/// file writes nothing for it.
 #[cfg(unix)]
 #[test]
 fn a_script_is_probed_every_time_and_never_written_to_the_cache() {

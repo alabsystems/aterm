@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE LIVE-CLASS AUDITOR: what `vendor/winit`'s macOS backend actually
+//! THE LIVE-CLASS AUDITOR: what `crates/aterm-window`'s macOS backend actually
 //! registered — all four of the classes it declares plus the one row it
 //! swizzles into a framework class — asked of the running Objective-C runtime
 //! and answered by the runtime's own authority.
 //!
 //! # The defect this exists to close, and why nothing else closed it
 //!
-//! W3 ported `vendor/winit/src/platform_impl/macos/window_delegate.rs` off
+//! W3 ported `crates/aterm-window/src/platform_impl/macos/window_delegate.rs` off
 //! `objc2::declare_class!` onto [`aterm_objc::declare_class!`] — 23 declared
 //! methods, and NOTHING IN CI READ THE REGISTERED CLASS. The census in
 //! `crates/aterm-objc/tests/winit_seam.rs` is a strong test of the ENCODING
@@ -67,7 +67,7 @@
 //!
 //! | target | instance | rows |
 //! |---|---|---|
-//! | [`DELEGATE`] `WinitWindowDelegate` | `-[[view window] delegate]` | 23 + `dealloc` |
+//! | [`DELEGATE`] `WinitWindowDelegate` | `-[[view window] delegate]` | 21 + `dealloc` |
 //! | [`VIEW`] `WinitView` | the window handle winit hands out | 43 + `dealloc` |
 //! | [`APP_DELEGATE`] `WinitApplicationDelegate` | `-[NSApp delegate]` | 3 + `dealloc` |
 //! | [`WINDOW`] `WinitWindow` | `-[view window]` | 2 + `dealloc` |
@@ -77,7 +77,7 @@
 //!
 //! That rule — every declared row is read off the live class, never off a
 //! table — had exactly one exception in this tree from W6 until W12.
-//! `vendor/winit/src/platform_impl/macos/app.rs` declared a `sendEvent:` row on
+//! `crates/aterm-window/src/platform_impl/macos/app.rs` declared a `sendEvent:` row on
 //! a `TestApplication` class that was NOT PRODUCT CODE: it sat inside
 //! `#[cfg(test)] mod tests`, in `fn test_custom_class()`, with a `todo!()`
 //! body, instantiated by that one test and by nothing else. No live-class audit
@@ -321,11 +321,11 @@ const NOT_RUN: i32 = 2;
 /// DECLARATION rather than this host's runtime — the [`HostLacks`] path, taken
 /// on a host whose AppKit does not register a protocol the class claims.
 ///
-/// A SEPARATE CODE, and the reason is the sentence the gate prints. `PASS` means
-/// "every method agrees with the runtime's own authority", and on such a host
-/// that sentence is false for the rows the runtime could not speak for — the
-/// receipt the merge gate writes would assert runtime authority nobody had. The
-/// gate reads this as a pass (the tree is not at fault and every row WAS held to
+/// A SEPARATE CODE, and the reason is the sentence `verify appkit` prints. `PASS`
+/// means "every method agrees with the runtime's own authority", and on such a
+/// host that sentence is false for the rows the runtime could not speak for — a
+/// plain pass would assert runtime authority nobody had. `verify appkit` reads
+/// this as a pass (the tree is not at fault and every row WAS held to
 /// a shape) under a label that says which claim was actually made, so a reader
 /// six months later can tell the two runs apart. See this driver's row in
 /// `OBJC_DRIVES` (`crates/aterm-verify/src/stages.rs`), where that label lives.
@@ -336,7 +336,7 @@ const FORK_DECLARED: i32 = 3;
 fn main() -> std::process::ExitCode {
     eprintln!(
         "objc-live-class-audit: NOT RUN — this audit is about \
-         vendor/winit/src/platform_impl/macos/window_delegate.rs, which does not \
+         crates/aterm-window/src/platform_impl/macos/window_delegate.rs, which does not \
          exist off macOS."
     );
     std::process::ExitCode::from(NOT_RUN as u8)
@@ -361,15 +361,14 @@ mod macos {
     use winit::event::WindowEvent;
     use winit::event_loop::ActiveEventLoop;
     use winit::platform::pump_events::{EventLoopExtPumpEvents, PumpStatus};
-    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use winit::window::{Window, WindowId};
 
     use super::{FAIL, FORK_DECLARED, NOT_RUN, PASS};
 
     /// One class this audit is responsible for.
     ///
-    /// The fork declares two, and W3 shipped the second (`view.rs`) into a gate
-    /// that only read the first — which is the exact defect D1 exists to
+    /// The fork declares two, and the second (`view.rs`) once shipped into an
+    /// audit that read only the first — which is the exact defect D1 exists to
     /// prevent, one file later. A `Target` is what stops that being a
     /// copy-paste of the whole audit per class.
     struct Target {
@@ -442,7 +441,7 @@ mod macos {
     /// there by `declare_class!` and every row is this gate's business.
     ///
     /// `NSApplication` is not like that, and it is the fifth target because
-    /// `vendor/winit/src/platform_impl/macos/app.rs` REACHES INTO IT.
+    /// `crates/aterm-window/src/platform_impl/macos/app.rs` REACHES INTO IT.
     /// `override_send_event` swizzles `-[NSApplication sendEvent:]` with
     /// `method_setImplementation` — no subclass, no `declare_class!`, no new
     /// class name — so the fork owns exactly one row of a table with hundreds
@@ -460,7 +459,7 @@ mod macos {
         Patched(&'static [&'static str]),
     }
 
-    /// `window_delegate.rs`'s class. 23 declared rows plus `-dealloc`; every one
+    /// `window_delegate.rs`'s class. 21 declared rows plus `-dealloc`; every one
     /// resolves, so the exemption list is empty and MEASURED empty.
     const DELEGATE: Target = Target {
         class_name: "WinitWindowDelegate",
@@ -526,10 +525,9 @@ mod macos {
     /// `NSApplicationDelegate` is also the one protocol here a host's AppKit
     /// may not register (macOS 14.4.1 and macOS 13.7.8 do not; the macOS 26
     /// cutter does), in which case `aterm_objc` supplied a name-only stand-in at
-    /// declaration and the runtime can speak for none of these three rows. Until
-    /// 2026-09-21 that made the whole audit NOT RUN there, and with it the merge
-    /// gate on every such host. They are now checked against the fork's own
-    /// declaration instead ([`APP_DELEGATE_HOST_LACKS`]), the verdict is
+    /// declaration and the runtime can speak for none of these three rows. So
+    /// that the audit still runs on such a host, they are checked against the
+    /// fork's own declaration instead ([`APP_DELEGATE_HOST_LACKS`]), the verdict is
     /// [`FORK_DECLARED`] — a pass that names the weaker claim rather than
     /// borrowing `PASS`'s sentence — and part F holds those written shapes to the
     /// protocol on every host that has one.
@@ -548,7 +546,7 @@ mod macos {
     /// registered.
     ///
     /// The types are transcribed from the fork's `declare_class!` site
-    /// (`vendor/winit/src/platform_impl/macos/app_state.rs`) and the encodings
+    /// (`crates/aterm-window/src/platform_impl/macos/app_state.rs`) and the encodings
     /// are GENERATED from them, never typed out. `applicationShouldTerminate:`
     /// returns `usize` and not a `Bool`, which is the runtime's own reading:
     /// that site records `NSApplicationDelegate` declaring it `Q24@0:8@16` — an
@@ -665,7 +663,8 @@ mod macos {
     /// `override_send_event`, which replaces `-[NSApplication sendEvent:]`'s
     /// IMP with the fork's own through `method_setImplementation`. It is on
     /// every keystroke path in the process (it is what makes Cmd+key deliver a
-    /// `keyUp:` at all, and it is where every `DeviceEvent` comes from), and it
+    /// `keyUp:` at all; until winit-core step 5 it was also where every
+    /// `DeviceEvent` came from), and it
     /// leaves the type encoding UNTOUCHED by construction — so not one encoding
     /// check in this tree can tell whether it ran. The only live evidence is
     /// the ADDRESS of the function the runtime will call, which is what
@@ -788,10 +787,10 @@ mod macos {
     /// dying before their first window — and a stand-in declares nothing. Until
     /// this struct existed, the three `WinitApplicationDelegate` rows therefore
     /// had NO authority on those hosts and the whole audit ended NOT RUN, so the
-    /// merge gate could not go green on any of them: measured on the fleet's
-    /// Intel Mac (macOS 13.7.8), where `none of the 1635 protocols loaded here
+    /// check could not go green on any of them: on the fleet's
+    /// Intel Mac (macOS 13.7.8), `none of the 1635 protocols loaded here
     /// declares this row` was the verdict for all three and every other row
-    /// agreed. A gate that cannot pass on a whole platform for ANY input is a
+    /// agreed. A check that cannot pass on a whole platform for ANY input is a
     /// verdict carrying no information — the disease this file's own `LaneVerdict`
     /// note describes — and the rows that went unchecked were exactly the
     /// `@optional` ones whose failure mode is silence (see the `declare_class!`
@@ -1937,10 +1936,13 @@ mod macos {
             }
         }
 
-        /// PART C (delegate) — two live sends, so the verdict is about code
-        /// and not only about a table. These are the two RETURN SHAPES that
-        /// port changed: the `BOOL` that stayed a `BOOL`, and the `NSUInteger`
-        /// that P3 made one.
+        /// PART C (delegate) — a live send, so the verdict is about code and
+        /// not only about a table: the `BOOL` that stayed a `BOOL`. (The
+        /// `NSUInteger` row this part also sent,
+        /// `window:willUseFullScreenPresentationOptions:`, left with exclusive
+        /// fullscreen in winit-core step 5; the delegate's other `NSUInteger`
+        /// row, `draggingEntered:`, is sent for real by `objc_window_drive`'s
+        /// drag-and-drop stage.)
         fn delegate_live_sends(
             &mut self,
             delegate: Id,
@@ -1953,20 +1955,12 @@ mod macos {
             // ladder reads as "no exit status", a correct RED with a useless
             // diagnosis. Ask the table part A already read, and report the
             // absence as the finding it is.
-            let mut absent = false;
-            for want in [
-                "windowShouldClose:",
-                "window:willUseFullScreenPresentationOptions:",
-            ] {
-                if !registered.contains_key(want) {
-                    absent = true;
-                    self.fail(format!(
-                        "{want} is not in the registered table, so the live send that would \
-                         exercise its return shape cannot be made"
-                    ));
-                }
-            }
-            if absent {
+            let want = "windowShouldClose:";
+            if !registered.contains_key(want) {
+                self.fail(format!(
+                    "{want} is not in the registered table, so the live send that would \
+                     exercise its return shape cannot be made"
+                ));
                 return;
             }
             // SAFETY: `windowShouldClose:` is registered `B@:@` (audited in part
@@ -1982,31 +1976,6 @@ mod macos {
                      through CloseRequested"
                         .to_owned(),
                 );
-            }
-
-            // A value with a bit set in every byte of the low word, so a
-            // one-byte or four-byte return would lose part of it.
-            const PROBE: usize = 0x0102_0304_0506_0708;
-            // SAFETY: `window:willUseFullScreenPresentationOptions:` is
-            // registered `Q@:@Q` (audited in part A); the fork returns the
-            // proposed options unchanged unless the window is in EXCLUSIVE
-            // fullscreen, which a freshly created window is not.
-            let echoed: usize = unsafe {
-                let send: unsafe extern "C-unwind" fn(Id, Sel, Id, usize) -> usize = msg();
-                send(
-                    delegate,
-                    sel!(window:willUseFullScreenPresentationOptions:),
-                    window,
-                    PROBE,
-                )
-            };
-            println!(
-                "  -window:willUseFullScreenPresentationOptions:({PROBE:#018x}) = {echoed:#018x}"
-            );
-            if echoed != PROBE {
-                self.fail(format!(
-                    "the NSUInteger row lost bits: sent {PROBE:#018x}, got {echoed:#018x}"
-                ));
             }
         }
 
@@ -2449,8 +2418,8 @@ mod macos {
         /// with a registered encoding, and for one whole wave two of them were
         /// arguments about something Foundation does not do. The comments were
         /// confident, the code compiled, the transcript printed numbers, and
-        /// the checks could not fail for any input. Nothing in a gate is more
-        /// expensive than that, because it reads exactly like a gate that
+        /// the checks could not fail for any input. Nothing in a check is more
+        /// expensive than that, because it reads exactly like a check that
         /// passes.
         ///
         /// So the mechanism is MEASURED, here, in this process, on classes this
@@ -3195,12 +3164,11 @@ mod macos {
         /// REFUSES on a mismatch at launch, so the drift cannot silently ship.
         ///
         /// The evidence is WHOSE CODE the runtime will call. `override_send_event`
-        /// is on every keystroke and every device event in the process and it
-        /// changes nothing a type encoding can see; if it silently stopped
-        /// running — an early return that fires wrongly, a call site deleted, an
-        /// `NSApp` that is a different object than the one it patched — the
-        /// behaviour lost is Cmd+key `keyUp:` delivery and the whole
-        /// `DeviceEvent` stream, and every gate in this tree would still be
+        /// is on every keystroke in the process and it changes nothing a type
+        /// encoding can see; if it silently stopped running — an early return
+        /// that fires wrongly, a call site deleted, an `NSApp` that is a
+        /// different object than the one it patched — the behaviour lost is
+        /// Cmd+key `keyUp:` delivery, and every gate in this tree would still be
         /// green. So the IMP is read off the live class and its IMAGE is asked
         /// of the dynamic loader: the fork's own code is in the running
         /// executable, and AppKit's is in AppKit.
@@ -3248,8 +3216,7 @@ mod macos {
                         "{name} on {} still runs {image}'s implementation — \
                          `override_send_event` did not take. Nothing else in this tree can see \
                          that: the swizzle preserves the type encoding, so every encoding check \
-                         passes either way, and what is lost is Cmd+key keyUp: delivery and the \
-                         entire DeviceEvent stream",
+                         passes either way, and what is lost is Cmd+key keyUp: delivery",
                         target.class_name
                     ));
                 } else {
@@ -3298,20 +3265,12 @@ mod macos {
                 return;
             };
             self.done = true;
-            let handle = match window.window_handle() {
-                Ok(h) => h.as_raw(),
-                Err(e) => {
-                    self.audit.blocked = Some(format!("no window handle: {e}"));
-                    el.exit();
-                    return;
-                }
-            };
-            let RawWindowHandle::AppKit(h) = handle else {
-                self.audit.blocked = Some("the window handle is not an AppKit one".to_owned());
+            let view = aterm_objc::HasNsView::ns_view(window);
+            if view.is_null() {
+                self.audit.blocked = Some("the window answered no content view".to_owned());
                 el.exit();
                 return;
-            };
-            let view = Id::from_ptr(h.ns_view.as_ptr());
+            }
             // SAFETY: `-[NSView window]` is `@@:`; `view` is the live NSView
             // winit just handed out.
             let ns_window: Id = unsafe {
@@ -3370,8 +3329,8 @@ mod macos {
 
     /// Drive the loop until the audit has run, then report.
     pub fn run() -> i32 {
-        // The quiet builder (Accessory, no launch activation): the gate runs this
-        // drive beside a developer who is typing somewhere else.
+        // The quiet builder (Accessory, no launch activation): `verify appkit` runs
+        // this drive beside a developer who is typing somewhere else.
         let mut el = match aterm_gui::quiet_driver_event_loop_builder::<()>().build() {
             Ok(el) => el,
             Err(e) => {
@@ -3432,9 +3391,9 @@ mod macos {
             NOT_RUN
         } else if !driver.audit.fork_declared.is_empty() {
             // Every row was held to a shape, and some were held to OURS because
-            // this host's AppKit could not speak for them. That is a pass the
-            // gate can land on, under a sentence that does not claim the runtime
-            // answered — see [`FORK_DECLARED`].
+            // this host's AppKit could not speak for them. That is a pass
+            // (`verify appkit` takes exit 3 as one), under a sentence that does
+            // not claim the runtime answered — see [`FORK_DECLARED`].
             for row in &driver.audit.fork_declared {
                 println!("  CHECKED AGAINST THE FORK'S OWN DECLARATION: {row}");
             }

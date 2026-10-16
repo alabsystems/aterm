@@ -1,223 +1,157 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The resize ledger's render verdict: a WRITER/READER contract between the
-//! engine's resize journal and the host's ledger.
+//! The resize ledger's render verdict: a writer/reader contract between the engine's resize
+//! journal and the host's ledger, and the repaint nudge that repairs a displaced tab.
 
 use super::{Liveness, Model};
 
-/// Whether an application has drawn over content a resize displaced, judged
-/// the way `aterm-gui`'s resize ledger judges it (`status render=`, the
-/// `resizes` verb, `EVENT <local> render desync-risk`).
+/// Whether an application has drawn over content a resize displaced, judged the way `aterm-gui`'s
+/// resize ledger judges it (`status render=`, the `resizes` verb, `EVENT <local> render
+/// desync-risk`).
 ///
-/// THE INCIDENT (2026-09-28, a live Claude Code session). On the alternate
-/// screen, a rows-only shrink with a non-blank bottom row DEMOTES the top row,
-/// and the alt grid keeps no history, so it was dropped; the grow that followed
-/// appended a blank row instead of revealing it. A 64→63→64 flap therefore
-/// left the whole screen one row higher than the app painted it. The app
-/// repaints (ED 2) only when its SIGWINCH handler reads a CHANGED size; when
-/// both resizes land before the handler runs it reads 64 == 64, skips the
-/// repaint, and its diff frames (absolute `CSI r;c H`, no clear) land on the
-/// shifted content for good.
+/// On the alternate screen a rows-only shrink with a non-blank bottom row demotes the top row,
+/// and the alt grid keeps no history, so a grow that only appends leaves a flap's content one
+/// row higher than the app painted it. An app repaints (ED 2) only when its SIGWINCH handler
+/// reads a changed size, so a flap whose halves both land before the handler runs reads no
+/// change, and its diff frames (absolute `CSI r;c H`, no clear) land on shifted content.
 ///
-/// THE ENGINE FIX. The grid's resize undo keeps the rows a shrink takes off
-/// (`st`, the demoted rows it could hand back) until anything is drawn; a grow
-/// hands them back, so a flap with no output between its halves is an identity
-/// (`QuietFlapIsIdentity`). Any output drops the undo: an app that drew at the
-/// smaller size has read, or will read, the change and repaint; output that
-/// draws nothing (`Output`) leaves a displaced net-zero run the ledger judges.
+/// The engine's resize undo keeps the rows a shrink demotes (`st`) until anything is drawn; a
+/// grow hands them back, so a flap with no output between its halves is an identity
+/// (`QuietFlapIsIdentity`). Any output drops the undo: an app that drew at the smaller size has
+/// read, or will read, the change and repaint; output that draws nothing (`Output`) leaves a
+/// displaced net-zero run for the ledger to judge.
 ///
-/// THE CONTRACT. The engine is the WRITER: each resize's report names what it
-/// did to the rows (`demoted`, `shift()`, and the rows its undo `stashed` or
-/// handed back as `restored_top`), and its full-clear and screen-replacement
-/// counters say when a displaced screen was repainted from scratch. The ledger
-/// is the READER: it groups resizes into RUNS and calls a RISK only a NET-ZERO
-/// run — one whose geometry ended where it began, so the app's handler,
-/// whenever it ran, read no change and has no reason to repaint. A run that
-/// displaces rows stays open through app output inside the run gap (every step
-/// here but `Evaluate`, a reader a second later) for a resize that takes the
-/// last one back (here, with two geometries, every next resize does; the
-/// ledger closes a drawn-on run to any other, so a drag the app follows frame
-/// by frame is not one long run): output is no evidence that the handler read
-/// the intermediate size, and a handler that did and repaints from scratch
-/// shows as the clear that closes the run (`Step` at a changed size); a run
-/// that has moved nothing closes on a draw, as before. Past the gap a run
-/// closes, unless it displaced rows the app has not drawn over (`silent`):
-/// that one stays open for the next resize (`late`), so a grow the undo
-/// answers nets it to zero — the rows the grow hands back return to the run
-/// whose shrink stashed them (`rd - st`; the ledger's `credit`). A run whose
-/// geometry stayed changed is the app's to repaint (its handler reads the
-/// change), and the ledger cannot see a repaint that does not clear, so a draw
-/// on it is UNVERIFIED (`verdict = 2`), never a risk and never ok. The
-/// invariants state the verdict and the `displaced` render against the ground
-/// truth (`disp`, `drew`), both ways: a verdict only over displaced content
-/// the app drew on (`NoFalseVerdict`), a net-zero one a risk unless a reader
-/// saw it short (`RiskIsFlagged`), displaced content drawn on never answered
-/// ok (`NoSilentPass`), and `render=displaced` exactly while undrawn content
-/// is displaced (`DisplacedIsShown`, `NoFalseDisplaced`).
-///
-/// (Integrated 2026-09-29 from two designs of 2026-09-28 over one base: the
-/// `unverified` verdict and the credit of main's `4aa0cf233`, and the grouping
-/// across a draw and past the gap of `fix/resize-ledger-split-flap`. Main's
-/// HELD run — `ro = 2`, a run time closed while the undo held its rows — is
-/// the grouping's `late` run here: a run holding rows is `silent` and
-/// undrawn, so it is never closed by time, and the hold is not a separate
-/// state.)
+/// The engine is the writer: each resize's report names what it did to the rows (`demoted`,
+/// `shift()`, the rows its undo `stashed` or handed back as `restored_top`), and its full-clear
+/// and screen-replacement counters say when a displaced screen was repainted from scratch. The
+/// ledger is the reader: it groups resizes into runs and calls a risk only for a net-zero run —
+/// one whose geometry ended where it began, so the handler, whenever it ran, read no change. A
+/// run that displaces rows stays open through app output inside the run gap (every step here
+/// but `Evaluate`) for a resize that takes the last one back (with two geometries every next
+/// resize does; the ledger closes a drawn-on run to any other, so a drag the app follows frame
+/// by frame is not one long run): output is no evidence that the handler read the intermediate
+/// size, and a handler that did and repaints from scratch shows as the clear that closes the run
+/// (`Step` at a changed size). A run that moved nothing closes on a draw. Past the gap a run
+/// closes unless it displaced rows the app has not drawn over (`silent`): that one stays open
+/// for the next resize (`late`), so a grow the undo answers nets it to zero — the rows handed
+/// back return to the run whose shrink stashed them (`rd - st`; the ledger's `credit`). A run
+/// whose geometry stayed changed is the app's to repaint, and the ledger cannot see a repaint
+/// that does not clear, so a draw on it is `unverified` (`verdict = 2`), never a risk and never
+/// ok. The invariants hold the verdict and `displaced` against the ground truth (`disp`,
+/// `drew`) both ways: a verdict only over displaced content the app drew on (`NoFalseVerdict`),
+/// a net-zero one a risk unless a reader saw it short (`RiskIsFlagged`), displaced content drawn
+/// on never ok (`NoSilentPass`), and `render=displaced` exactly while undrawn content is
+/// displaced (`DisplacedIsShown`, `NoFalseDisplaced`).
 ///
 /// * `geom`: the grid's rows (0 = the app's full height, 1 = one row fewer).
-/// * `app_geom`: the rows the app's frame is laid out for, what its SIGWINCH
-///   handler last read.
-/// * `disp`: how many rows the grid's content sits above where the app painted
-///   it. Engine truth, bounded by `Cap`.
-/// * `ro`/`rs`/`rd`/`rw`: the ledger's OPEN run — whether the next resize
-///   joins it, the geometry it started from, the rows it displaced so far, and
-///   whether the app drew while it displaced rows (`drew` on the ledger's run).
-/// * `late`: the open run outlived the run gap (a `silent` run a reader left
-///   open for the next resize): a draw now closes it.
-/// * `led`: the displacement the ledger booked in closed NET-ZERO runs that
-///   moved content up and has not seen healed (a run whose content moved
-///   DOWN is not summed: its negative `rd` would cancel an up-moved one's,
-///   and it keeps the space bounded); `lr`: it saw the app draw on a closed,
-///   unhealed net-zero run that moved content EITHER way — the ledger judges
-///   any `displaced != 0` (`Run::judged`), so a drawn down-moved one is a
-///   `desync-risk` too, and the open run's verdict reads the same. The rig
-///   never forms a down-moved net-zero run (its shrink after a grow that
-///   appended trims); the model forms one only through the over-approximated
-///   `Trim` after a `Draw`.
-/// * `lb`: the ledger booked a closed NET-CHANGED run that displaced rows and
-///   has not seen healed; `br`: it saw the app draw on one, which it reports
-///   `unverified`.
-/// * `blind`: ground truth, not the ledger's: a reader came by (`Evaluate`,
-///   past the run gap) while the grid was still at the changed size and its
-///   content displaced, so the app has had the time to read the change and
-///   owes the repaint; a grow that brings the displacement back to zero
-///   ends that episode (a later displacement is one no reader saw). The
-///   ledger's named blind spot is a flap whose halves
-///   MORE than the run gap separates, with a draw between: two net-changed
-///   runs, `unverified` once drawn on, which `cast drift` (a RETURN: a lossy
-///   shrink through the resize that brings the size back, however long after)
-///   audits instead. A flap inside the gap is never excused by it, whatever
-///   was drawn between.
-/// * `drew`: the app has drawn a non-clearing frame onto displaced content
-///   since its last full repaint.
+/// * `app_geom`: the rows the app's frame is laid out for, what its handler last read.
+/// * `disp`: how many rows the content sits above where the app painted it. Engine truth,
+///   bounded by `Cap`.
+/// * `ro`/`rs`/`rd`/`rw`: the ledger's open run — whether the next resize joins it, the
+///   geometry it started from, the rows it displaced so far, and whether the app drew while it
+///   displaced rows.
+/// * `late`: the open run outlived the run gap (a `silent` run left open for the next resize):
+///   a draw now closes it.
+/// * `led`: the displacement booked in closed net-zero runs that moved content up and not seen
+///   healed (a down-moved run is not summed: its negative `rd` would cancel an up-moved one's,
+///   and leaving it out keeps the space bounded); `lr`: the app drew on a closed, unhealed
+///   net-zero run that moved content either way — the ledger judges any `displaced != 0`
+///   (`Run::judged`), so a drawn down-moved one is a `desync-risk` too. The rig never forms a
+///   down-moved net-zero run; the model forms one only through the over-approximated `Trim`
+///   after a `Draw`.
+/// * `lb`: a closed net-changed run that displaced rows, not seen healed; `br`: the app drew on
+///   one, reported `unverified`.
+/// * `blind`: ground truth: a reader came by (`Evaluate`) while the grid was still at the
+///   changed size with content displaced, so the app has had time to read the change and owes
+///   the repaint; a grow that brings the displacement to zero ends that episode. The ledger's
+///   named blind spot is a flap whose halves more than the run gap separates, with a draw
+///   between: two net-changed runs, `unverified` once drawn on, which `cast drift` audits
+///   instead. A flap inside the gap is never excused, whatever was drawn between.
+/// * `drew`: the app has drawn a non-clearing frame onto displaced content since its last full
+///   repaint.
 /// * `st`: demoted rows the engine's resize undo holds for the next grow.
 /// * `d0`: `disp` when the open run opened (the identity's reference).
-/// * `bot`: what the last grow left on the bottom row, until something draws
-///   (0: unknown, either shrink is possible). 1: the blank it appended below
-///   the cursor, which the next shrink TRIMS. 2: the full row the undo handed
-///   back (a demote left no blank tail), so the next shrink DEMOTES again.
-/// * `out`: output (drawn or not) landed inside the open run. It drops the
-///   undo without closing the run, which is how a net-zero run can still
-///   displace rows and why the ledger still judges one.
-/// * `evaluated`/`verdict`/`shown`: the reader's last answer — `verdict` 0 ok,
-///   1 `render=desync-risk`, 2 `render=unverified`; `shown` 1 that some run is
-///   still `silent` (`render=displaced` when nothing else is said).
+/// * `bot`: what the last grow left on the bottom row, until something draws (0: unknown, either
+///   shrink is possible; 1: the blank it appended, which the next shrink trims; 2: the full row
+///   the undo handed back, so the next shrink demotes again).
+/// * `out`: output (drawn or not) landed inside the open run. It drops the undo without closing
+///   the run, which is how a net-zero run can still displace rows.
+/// * `evaluated`/`verdict`/`shown`: the reader's last answer — `verdict` 0 ok, 1
+///   `render=desync-risk`, 2 `render=unverified`; `shown` 1 that some run is still `silent`
+///   (`render=displaced` when nothing else is said).
 /// * `ls`: `Buggy = 3` only — a `silent` run that mutant closed by time.
 ///
-/// `Buggy = 1` is the historical engine AND the historical judge. The engine's
-/// grow only appends (the rows a shrink demoted are gone), so a quiet flap
-/// leaves the content one row up (`Demote, Grow` breaks
-/// `QuietFlapIsIdentity`). The judge calls a render at risk (and displaced)
-/// only while the grid's size differs from the size the app last laid out
-/// for: it misses that flap (`Demote, Grow, Step, Evaluate`: the sizes agree,
-/// the content is one row up and the app drew on it, breaking `RiskIsFlagged`,
-/// `NoSilentPass` and `DisplacedIsShown`) and it raises a false alarm on a
-/// trim-only shrink (`Trim, Evaluate`: nothing moved, breaking
-/// `NoFalseVerdict` and `NoFalseDisplaced`). The ratchet sweeps this one;
-/// every claim above falls to it.
+/// `Buggy = 1` is an append-only engine with a size-difference judge. The grow only appends, so
+/// a quiet flap leaves the content one row up (`Demote, Grow` breaks `QuietFlapIsIdentity`); the
+/// judge calls risk (and displaced) only while the grid's size differs from the app's, so it
+/// misses that flap (`Demote, Grow, Step, Evaluate` breaks `RiskIsFlagged`, `NoSilentPass`,
+/// `DisplacedIsShown`) and false-alarms on a trim-only shrink (`Trim, Evaluate` breaks
+/// `NoFalseVerdict`, `NoFalseDisplaced`). The ratchet sweeps this one; every claim falls to it.
 ///
-/// `Buggy = 2` is the ASSUMED REPAINT (the ledger as it first landed,
-/// 2026-09-28, never in a release): a net-changed run drawn on was
-/// `repainted`, the draw TAKEN as the app's repaint, so it answered ok.
-/// `Demote, Draw, Evaluate` (a spinner tick on the moved rows, the size still
-/// changed) leaves the screen one row up and drawn on, and that judge says ok:
-/// `NoSilentPass` breaks, alone.
+/// `Buggy = 2` assumes the repaint: a drawn-on net-changed run counts as repainted and answers
+/// ok. `Demote, Draw, Evaluate` (a spinner tick on the moved rows, the size still changed)
+/// breaks `NoSilentPass` alone.
 ///
-/// `Buggy = 3` is TIME CLOSING EVERY RUN (neither the late run nor the
-/// credit: the grouping before either design). A quiet flap only time split,
-/// which the undo made an identity, keeps a `silent` half (`Demote, Evaluate,
-/// Grow, Evaluate` breaks `NoFalseDisplaced`: `render=displaced` over an
-/// intact screen) and, drawn on, an `unverified` one (`Demote, Evaluate, Grow,
-/// Draw, Evaluate` breaks `NoFalseVerdict`). Over the whole space it also
-/// breaks `RiskIsFlagged` and `DisplacedIsShown` — four invariants, and only
-/// those (`each_named_mutant_breaks_exactly_its_claims_*` assert the set).
+/// `Buggy = 3` lets time close every run (no late run, no credit). A quiet flap only time split,
+/// which the undo made an identity, keeps a `silent` half (`Demote, Evaluate, Grow, Evaluate`
+/// breaks `NoFalseDisplaced`) and, drawn on, an `unverified` one (`Demote, Evaluate, Grow, Draw,
+/// Evaluate` breaks `NoFalseVerdict`); over the whole space it also breaks `RiskIsFlagged` and
+/// `DisplacedIsShown`, and only those four (`each_named_mutant_breaks_exactly_its_claims_*`).
 ///
-/// `Buggy = 4` is the design with a net-zero risk downgraded to `unverified`:
-/// `Demote, Output, Grow, Step, Evaluate` (a flap output split, the app's
-/// handler reading no change and drawing its diff) says `unverified` where the
-/// ledger must say `desync-risk` — which `NoSilentPass` accepts (any verdict)
-/// and only `RiskIsFlagged` refuses. It breaks `RiskIsFlagged` alone.
+/// `Buggy = 4` downgrades a net-zero risk to `unverified`: `Demote, Output, Grow, Step,
+/// Evaluate` says `unverified` where the ledger must say `desync-risk`, which `NoSilentPass`
+/// accepts; it breaks `RiskIsFlagged` alone.
 ///
-/// `Buggy = 5` is a DRAW CLOSING EVERY RUN (main's grouping before the
-/// integration, credit and all). A flap whose halves a spinner tick splits
-/// is two net-changed runs, `unverified` at best (`Demote, Draw, Grow, Step,
-/// Evaluate` breaks `RiskIsFlagged`: measured live on 2026-09-28 as
-/// `appended=1 restored=0`, ROW00 lost, the ledger not calling the risk), and
-/// an earlier restored flap a reader saw excuses no later one (`Demote,
-/// Evaluate, Grow, Demote, Draw, Grow, Step, Evaluate`). It breaks
-/// `RiskIsFlagged` alone. The Tier-0 test replays `Buggy = 2` to `5` by name
-/// and checks each breaks its claims and no other over the whole space.
+/// `Buggy = 5` lets a draw close every run. A flap a spinner tick splits is two net-changed
+/// runs, `unverified` at best (`Demote, Draw, Grow, Step, Evaluate`), and an earlier restored
+/// flap a reader saw excuses no later one (`Demote, Evaluate, Grow, Demote, Draw, Grow, Step,
+/// Evaluate`). It breaks `RiskIsFlagged` alone. The Tier-0 test replays `Buggy = 2` to `5` by
+/// name and checks each breaks its claims and no other over the whole space.
 ///
-/// THE EPOCH JUDGE (2026-09-29), the ledger's second judge, read from the
-/// ENGINE'S DEBT instead of from the shape of a run. The run judge above cannot
-/// see a flap an app frame splits (two net-changed runs), and cannot see an
-/// undrawn residual at all. The engine counts what it owes
-/// (`Terminal::render_debt`, exact however far the journal is overrun) and the
-/// ledger judges it as one epoch:
+/// The epoch judge is the ledger's second judge, read from the engine's debt instead of a run's
+/// shape: the run judge cannot see a flap an app frame splits (two net-changed runs) nor an
+/// undrawn residual. The engine counts what it owes (`Terminal::render_debt`, exact however far
+/// the journal is overrun) and the ledger judges it as one epoch:
 ///
-/// * `debt`: the engine counter, in rows the content sits above where the
-///   program painted it. A shrink that demotes adds one; a grow the undo serves
-///   gives back `st`; a changed-size read (the full clear) zeroes it. It is
-///   the report sums, not the screen, so `DebtIsTheDisplacement` (`debt == disp`)
-///   is the writer/reader bind between the two.
-/// * `eg`: the geometry BEFORE the first resize that made the debt (0 while none
-///   is owed): where the program's handler last laid the frame out.
-/// * `judged`: the presence classifier reads Claude Code, or this session has
-///   shown it clears its screen when resized (`Classify`, once).
-/// * `ev`: the epoch's word a second later — 0 ok, 1 `desync-risk`, 2
-///   `unjudged`: rows are owed AND the geometry is back at `eg` (the handler can
-///   only read an unchanged size), accused only when `judged`. While the
-///   geometry differs from `eg` the handler is still to read a change and
-///   repaints, so nothing is said.
+/// * `debt`: the engine counter, in rows the content sits above where the program painted it. A
+///   demoting shrink adds one; a grow the undo serves gives back `st`; a changed-size read (the
+///   full clear) zeroes it. It is the report sums, not the screen, so `DebtIsTheDisplacement`
+///   (`debt == disp`) binds writer to reader.
+/// * `eg`: the geometry before the first resize that made the debt (0 while none is owed): where
+///   the program's handler last laid the frame out.
+/// * `judged`: the presence classifier reads Claude Code, or this session has shown it clears
+///   its screen when resized (`Classify`, once).
+/// * `ev`: the epoch's word a second later — 0 ok, 1 `desync-risk`, 2 `unjudged`: rows are owed
+///   and the geometry is back at `eg` (the handler can only read an unchanged size), accused
+///   only when `judged`. While the geometry differs from `eg` the handler has a change to read
+///   and repaints, so nothing is said.
 ///
-/// The claims: a residual at a settled geometry is never answered ok
-/// (`EpochFlagsTheResidual`), nothing is said when nothing is owed
-/// (`EpochNoFalseAlarm`), an unlearned program is never accused
-/// (`OnlyAJudgedProgramIsAccused`: a program that repaints with cursor
-/// addressing and no ED 2 is indistinguishable from one that missed), and the
-/// counter is the displacement (`DebtIsTheDisplacement`).
+/// The claims: a residual at a settled geometry is never ok (`EpochFlagsTheResidual`), nothing
+/// is said when nothing is owed (`EpochNoFalseAlarm`), an unlearned program is never accused
+/// (`OnlyAJudgedProgramIsAccused`: one that repaints with cursor addressing and no ED 2 is
+/// indistinguishable from one that missed), and the counter is the displacement
+/// (`DebtIsTheDisplacement`). Under `Buggy = 1` the debt is a counter no full clear resets and
+/// the word is the size-difference one, ignoring the debt and the class. `Buggy = 6` accuses an
+/// unlearned program, `7` forgets the residual, `8` answers whenever the geometry is at `eg`
+/// whether or not anything is owed; each breaks its one claim and no other.
 ///
-/// `Buggy = 1` adds the historical epoch to the historical judge: the debt is a
-/// counter that no full clear resets, and the word is the size-difference one
-/// (`geom` differs from `app_geom`), which ignores the debt and the class.
-/// `Buggy = 6` accuses an unlearned program, `7` forgets the residual, `8`
-/// answers whenever the geometry is at `eg` whether or not anything is owed;
-/// each breaks its one claim and no other.
-///
-/// ASSUMED, NOT MODELED: the app's changed-size repaint starts with ED 2 (the
-/// `Step` action heals). An app that repaints every row WITHOUT clearing is
-/// seen by no counter, so a net-zero risk flagged before it stays flagged (a
-/// false `desync-risk` the ledger cannot retract), and a net-changed run such
-/// an app repaints stays `unverified` — which is why it is not called a risk,
-/// and why it is not called ok either. The 250 ms run gap is the host's
-/// environment bound: here every step but `Evaluate` lands inside it.
-///
-/// OVER-APPROXIMATED: whether a shrink demotes or trims is a free choice
-/// except right after a grow (`bot`), and every draw may have filled or
-/// cleared the bottom row.
+/// Assumed, not modeled: the app's changed-size repaint starts with ED 2 (the `Step` that
+/// heals). An app that repaints every row without clearing is seen by no counter, so a net-zero
+/// risk flagged before it stays flagged, and a net-changed run it repaints stays `unverified` —
+/// hence neither risk nor ok. The 250 ms run gap is the host's environment bound: every step
+/// but `Evaluate` lands inside it. Over-approximated: whether a shrink demotes or trims is free
+/// except right after a grow (`bot`), and every draw may have filled or cleared the bottom row.
 ///
 /// Tier-1: `aterm-gui/src/resize_ledger.rs` drives a real alternate-screen
-/// `aterm_core::Terminal` and the real `ResizeLedger` through every schedule
-/// of these actions up to a bounded depth, projects the screen, the resize
-/// undo, the app stand-in and the ledger's runs onto these variables, and
-/// checks each real transition against `action_enabled`, the model's successor
-/// and the invariants. Its negative controls replay `Demote, Grow, Step,
-/// Evaluate` on the historical engine (the undo dropped between the halves),
-/// where the real ledger flags it and the size-difference judge answers ok;
-/// the tick-split flap and the time-split restored flap, which the real
-/// ledger judges and `Buggy = 5` and `3` miss; and a tick on a still-changed
-/// size, where the real ledger says `unverified` and the assumed-repaint judge
-/// answers ok.
+/// `aterm_core::Terminal` and the real `ResizeLedger` through every schedule up to a bounded
+/// depth, projects the screen, the undo, the app stand-in and the ledger's runs onto these
+/// variables, and checks each real transition against `action_enabled`, the model's successor
+/// and the invariants. Its negative controls: `Demote, Grow, Step, Evaluate` with the undo
+/// dropped between the halves, where the real ledger flags it and the size-difference judge
+/// answers ok; the tick-split and time-split flaps, which the real ledger judges and `Buggy = 5`
+/// and `3` miss; and a tick at a still-changed size, where the real ledger says `unverified` and
+/// the assumed-repaint judge answers ok.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn resize_render_model() -> Model {
@@ -252,10 +186,8 @@ pub fn resize_render_model() -> Model {
             var judged = 0;
             var ev = 0;
 
-            // Alt-screen shrink with a non-blank bottom row: the top row is
-            // demoted and leaves the screen (the undo keeps it), so everything
-            // moves up one row. It joins the open run, or opens one from the
-            // current geometry.
+            // Alt-screen shrink with a non-blank bottom row: the top row is demoted (the undo
+            // keeps it), so everything moves up one row. It joins the open run, or opens one.
             action Demote when (geom == 0 && (bot == 0 || bot == 2) && disp <= Cap - 1) {
                 rs = if (ro == 1) { rs } else { geom };
                 rd = if (ro == 1) { rd + 1 } else { 1 };
@@ -285,11 +217,9 @@ pub fn resize_render_model() -> Model {
                 eg = if (debt <= 0) { 0 } else { eg };
                 evaluated = 0;
             }
-            // Alt-screen grow: the undo hands its demoted rows back to the top,
-            // moving everything back down; the rest is a blank row appended.
-            // The rows it hands back are the open run's own (`rd - st`: the
-            // ledger's credit to the run whose shrink stashed them). The
-            // historical engine (`Buggy = 1`) only appended.
+            // Alt-screen grow: the undo hands its demoted rows back to the top, moving everything
+            // back down; the rest is a blank row appended. The rows handed back are the open
+            // run's own (`rd - st`: the ledger's credit). `Buggy = 1` only appends.
             action Grow when (geom == 1) {
                 rs = if (ro == 1) { rs } else { geom };
                 rd = if (ro == 1) {
@@ -319,12 +249,10 @@ pub fn resize_render_model() -> Model {
                 late = 0;
                 evaluated = 0;
             }
-            // The app's SIGWINCH handler, then its next frame (output, which
-            // drops the engine's resize undo). At a CHANGED size, a full
-            // repaint (ED 2), which the ledger reads as a heal of every run:
-            // the open run closes and nothing displaced is left. At an
-            // unchanged size, a diff frame at absolute positions, with the
-            // ledger's run exactly as `Draw` leaves it.
+            // The app's SIGWINCH handler, then its next frame (output, which drops the undo). At
+            // a changed size, a full repaint (ED 2), which the ledger reads as a heal of every
+            // run: the open run closes and nothing displaced is left. At an unchanged size, a
+            // diff frame at absolute positions, the ledger's run exactly as `Draw` leaves it.
             action Step {
                 app_geom = geom;
                 disp = if (geom == app_geom) { disp } else { 0 };
@@ -379,16 +307,12 @@ pub fn resize_render_model() -> Model {
                 bot = 0;
                 evaluated = 0;
             }
-            // An ordinary diff frame (a spinner tick), no handler involved.
-            // Inside the run gap (`late == 0`), a run that displaces rows
-            // stays open and was drawn on (`rw`). A run that moved nothing
-            // closes (the app drew on an undisplaced screen: a fresh
-            // baseline), as does one past the gap (`late`: the app has had the
-            // time to read the size); `Buggy = 5` closes every run on a draw.
-            // A net-zero run it closes is booked (`led`) and now drawn on
-            // (`lr`); a net-changed one that displaced rows likewise (`lb`,
-            // `br`), and a booked one is now drawn on. Any output drops the
-            // engine's resize undo.
+            // An ordinary diff frame (a spinner tick), no handler involved. Inside the run gap
+            // (`late == 0`) a run that displaces rows stays open and is drawn on (`rw`). A run
+            // that moved nothing closes (a fresh baseline), as does one past the gap (`late`: the
+            // app has had time to read the size); `Buggy = 5` closes every run on a draw. A
+            // closed net-zero run is booked (`led`) and drawn on (`lr`); a net-changed one that
+            // displaced rows likewise (`lb`, `br`). Any output drops the engine's resize undo.
             action Draw {
                 led = if ((Buggy <= 4 || 6 <= Buggy) && late == 0 && (1 <= rd || rd <= 0 - 1)) { led } else {
                     if (ro == 1 && geom == rs && 1 <= rd) { led + rd } else { led }
@@ -418,23 +342,19 @@ pub fn resize_render_model() -> Model {
                 bot = 0;
                 evaluated = 0;
             }
-            // Output that draws nothing (a mode set, a query: the first bytes
-            // of a SIGWINCH handler): any output drops the engine's resize
-            // undo, but the screen's content did not move, so the ledger's open
-            // run stays open and the next resize joins it.
+            // Output that draws nothing (a mode set, a query: the first bytes of a SIGWINCH
+            // handler) drops the engine's resize undo, but the content did not move, so the
+            // ledger's open run stays open and the next resize joins it.
             action Output {
                 st = 0;
                 out = if (ro == 1) { 1 } else { out };
                 evaluated = 0;
             }
-            // The ledger's verdict a second later, past the run gap, from what
-            // it booked and saw drawn: `desync-risk` over a net-zero run drawn
-            // on, else `unverified` over a net-changed one, else ok. The time
-            // closes the open run (and books it), unless it displaced rows the
-            // app has not drawn over (`silent`: it waits for the next resize,
-            // however late); `Buggy = 3` closes that one too, leaving it
-            // `silent` (`ls`). The time does not drop the engine's undo:
-            // nothing was drawn.
+            // The ledger's verdict a second later, past the run gap, from what it booked and saw
+            // drawn: `desync-risk` over a drawn-on net-zero run, else `unverified` over a
+            // net-changed one, else ok. Time closes and books the open run unless it is `silent`
+            // (it waits for the next resize, however late); `Buggy = 3` closes that one too,
+            // leaving it `silent` (`ls`). Time does not drop the engine's undo: nothing was drawn.
             action Evaluate {
                 evaluated = 1;
                 ev = if (Buggy == 1) {
@@ -522,58 +442,48 @@ pub fn resize_render_model() -> Model {
             invariant EpochNoFalseAlarm: evaluated == 0 || ev == 0 || 1 <= disp;
             invariant OnlyAJudgedProgramIsAccused: evaluated == 0 || judged == 1 || ev == 0 || 2 <= ev;
             invariant DebtIsTheDisplacement: debt == disp;
-            invariant Bounded: disp <= Cap && led <= Cap && rd <= Cap && st <= Cap && debt <= Cap;
+            bound Bounded: disp <= Cap && led <= Cap && rd <= Cap && st <= Cap && debt <= Cap;
         }
     }
 }
 
-/// THE REPAINT NUDGE (G2 spike, 2026-09-28): the host's closed-loop repair of a
-/// tab whose application will not repaint by itself.
+/// The repaint nudge: the host's closed-loop repair of a tab whose application will not repaint
+/// by itself.
 ///
-/// An application that repaints only when its SIGWINCH handler READS a changed
-/// size can be left on a screen it no longer believes in (a flap whose halves
-/// it missed). The one natural, input-free way to make it repaint is the
-/// resize protocol itself, done so that its handler reads EACH size: hold the
-/// session one row short, wait for the app's answer, release, wait for the
-/// second answer. Back-to-back (the adoption pulse) it reads one size and
-/// repaints nothing (measured); on a timer it guesses the app's longest
-/// blocking read. The driver never guesses: the answer is the evidence, and a
-/// missing answer is a bounded wait, not a wedge.
+/// An application that repaints only when its SIGWINCH handler reads a changed size can be left
+/// on a screen it no longer believes in (a flap whose halves it missed). The one input-free way
+/// to make it repaint is the resize protocol itself, done so its handler reads each size: hold
+/// the session one row short, wait for the app's answer, release, wait for the second answer.
+/// Back-to-back it reads one size and repaints nothing; on a timer it guesses the app's longest
+/// blocking read. The driver never guesses: the answer is the evidence, and a missing answer is
+/// a bounded wait, not a wedge.
 ///
-/// * `phase`: 0 idle, 1 armed (debt seen; waiting for a quiet moment), 2 short
-///   (the hold is on), 3 restoring (the hold is off; the true size is back),
-///   4 at rest (healed or given up, said in the log).
-/// * `held`: the session's target is one row short. THE safety property: it is
-///   only ever set in phase 2, or after the driver was lost (`orphan`) and
-///   never for longer than `Cap` ticks (the hard deadline).
-/// * `halt`: a standing hold (`hold=1`): nothing is started, a running hold is
-///   lifted (`Release`) and the attempt judged by its answers like any other.
+/// * `phase`: 0 idle, 1 armed (debt seen; waiting for a quiet moment), 2 short (the hold is
+///   on), 3 restoring (the hold is off; the true size is back), 4 at rest (healed or given up,
+///   said in the log).
+/// * `held`: the session's target is one row short. The safety property: only ever set in phase
+///   2, or after the driver was lost (`orphan`), and never longer than `Cap` ticks (the hard
+///   deadline).
+/// * `halt`: a standing hold (`hold=1`): nothing is started, a running hold is lifted
+///   (`Release`) and the attempt judged by its answers like any other.
 /// * `safe`: the moment is quiet (no output burst, no DEC 2026 frame open).
 /// * `ack1`/`ack2`: the app answered the short / the true size.
-/// * `moved`: a real resize left the engine somewhere the hold did not find
-///   it. A flap during the hold (`Flap`) is not one: its passes put the PTY at
-///   the engine's size and the engine back where it was, so an app that read
-///   neither half saw nothing change (2026-10-02: the driver had read every
-///   write by someone else as a real resize and dropped the attempt, its one
-///   try spent and nothing said - `DropOnFlap`). It comes back (`Return`) when
-///   that resize did not last.
-/// * `superseded`: the attempt ended superseded (`Supersede`) and the epoch
-///   judge watches its epoch: while the resize stands the app has a size of its
-///   own, and once the engine is back where the hold found it the window owes
-///   the end (`Report`: the give-up while rows are owed). 2026-10-03: nothing
-///   watched it, so a resize that came back after the wait left the tab
-///   displaced, its try spent, nothing said - `ReturnUnwatched`.
+/// * `moved`: a real resize left the engine somewhere the hold did not find it. A flap during
+///   the hold (`Flap`) is not one: its passes put the PTY at the engine's size and the engine
+///   back where it was, so an app that read neither half saw nothing change (`DropOnFlap` is
+///   the defect). It comes back (`Return`) when that resize did not last.
+/// * `superseded`: the attempt ended superseded (`Supersede`) and the epoch judge watches its
+///   epoch: while the resize stands the app has a size of its own, and once the engine is back
+///   where the hold found it the window owes the end (`Report`: the give-up while rows are owed;
+///   `ReturnUnwatched` is the defect).
 /// * `lost`: the driver's record was lost (`DriverVanishes`).
-/// * `gaveup`: the owner hears of the end (the digest line). Only `debt`
-///   decides it, never the answers counted: a spent wait on a tab that owes
-///   nothing ends in silence (2026-10-02: two answers that landed before one
-///   step read as one, and the line flashed for a repaired tab). The Tier-1
-///   binds it to the code's `Act::GaveUp`.
+/// * `gaveup`: the owner hears of the end (the digest line). Only `debt` decides it, never the
+///   answers counted: a spent wait on a tab that owes nothing ends in silence. Tier-1 binds it
+///   to the code's `Act::GaveUp`.
 ///
-/// The environment (`Debt`, `Quiet`, `Busy`, `App1`, `App2`, `AltLeft`,
-/// `Flap`, `Resize`, `Return`) is never fair. The driver waits for a quiet
-/// moment only `Lim` ticks and for each answer only `Lim` ticks, so it ends
-/// with the app silent forever.
+/// The environment (`Debt`, `Quiet`, `Busy`, `App1`, `App2`, `AltLeft`, `Flap`, `Resize`,
+/// `Return`) is never fair. The driver waits only `Lim` ticks for a quiet moment and for each
+/// answer, so it ends with the app silent forever.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn repaint_nudge_model() -> Model {
@@ -601,7 +511,7 @@ pub fn repaint_nudge_model() -> Model {
             var superseded = 0;
             var lost = 0;
 
-            // THE ENVIRONMENT.
+            // The environment.
             action Debt when (phase == 0 && debt == 0) { debt = 1; }
             action Quiet when (safe == 0) { safe = 1; }
             action Busy when (safe == 1) { safe = 0; }
@@ -622,7 +532,7 @@ pub fn repaint_nudge_model() -> Model {
             // engine is back where the hold found it.
             action Return when (superseded == 1 && moved == 1) { moved = 0; }
 
-            // THE DRIVER.
+            // The driver.
             action Arm when (phase == 0 && debt == 1) { phase = 1; tick = 0; }
             // Never blocks on the world: past Lim ticks it goes anyway.
             action Hold when (phase == 1 && halt == 0 && (safe == 1 || tick > Lim - 1)) {
@@ -666,20 +576,18 @@ pub fn repaint_nudge_model() -> Model {
                 phase = 4;
                 superseded = 1;
             }
-            // THE WINDOW. The epoch judge finds a superseded attempt's epoch back
-            // where the hold found it: rows still owed are the give-up the same
-            // attempt is when the resize comes back inside its wait; none, and
-            // the end is silent.
+            // The epoch judge finds a superseded attempt's epoch back where the hold found it:
+            // rows still owed are the give-up the attempt would be had the resize come back
+            // inside its wait; none, and the end is silent.
             action Report when (superseded == 1 && moved == 0) {
                 superseded = 0;
                 gaveup = if (debt == 1) { 1 } else { gaveup };
             }
             action Tick when (1 <= phase && phase <= 3 && tick <= Lim - 1) { tick = tick + 1; }
 
-            // THE RELEASE CANNOT BE LOST. The driver's record is lost while the PTY
-            // is short (a panic in the tick, a teardown race): the App's own map of
-            // held sessions (`orphan`) still stands, and its hard deadline lets the
-            // PTY go whether or not any driver is left to do it.
+            // The release cannot be lost. The driver's record is lost while the PTY is short (a
+            // panic in the tick, a teardown race): the App's own map of held sessions (`orphan`)
+            // still stands, and its hard deadline lets the PTY go with or without a driver.
             action DriverVanishes when (phase == 2) { phase = 4; orphan = 1; lost = 1; }
             action Age when (held == 1 && age <= Cap - 1) { age = age + 1; }
             action ReleaseByDeadline when (held == 1 && age > Cap - 1) {
@@ -699,7 +607,7 @@ pub fn repaint_nudge_model() -> Model {
                 healed = 1;
                 debt = 0;
             }
-            // BUGGY (the first draft's design): the hold resizes the ENGINE, not just the PTY.
+            // BUGGY: the hold resizes the engine, not just the PTY.
             action HoldTheEngine when (Buggy == 1 && phase == 1 && debt == 1) {
                 phase = 2;
                 held = 1;
@@ -709,25 +617,21 @@ pub fn repaint_nudge_model() -> Model {
                 ack1 = 0;
                 ack2 = 0;
             }
-            // BUGGY: no hard deadline (a hold nobody lifts stays for as long as the
-            // process lives).
+            // BUGGY: no hard deadline (a hold nobody lifts stays for the process's life).
             action NoCap when (Buggy == 1 && held == 1 && age == Cap) { age = Cap + 1; }
-            // BUGGY: retried without a budget (an app that never answers is nudged
-            // forever).
+            // BUGGY: retried without a budget (an app that never answers is nudged forever).
             action RetryForever when (Buggy == 1 && phase == 3 && tick > Lim - 1
                                       && (ack1 == 0 || ack2 == 0) && debt == 1) {
                 phase = 1;
                 tick = 0;
             }
-            // BUGGY (shipped until 2026-10-02): any write by someone else read as
-            // a real resize, so a flap the app never saw ended the attempt at
-            // once: the epoch's one try spent, the tab still owing, nothing said.
+            // BUGGY: any write by someone else read as a real resize, so a flap the app never
+            // saw ends the attempt at once: the one try spent, the tab still owing, nothing said.
             action DropOnFlap when (Buggy == 1 && phase == 2 && held == 0 && moved == 0) {
                 phase = 4;
             }
-            // BUGGY (shipped until 2026-10-03): nothing watched a superseded
-            // attempt's epoch, so a resize that came back after the wait left the
-            // tab displaced, its one try spent, nothing said.
+            // BUGGY: nothing watches a superseded attempt's epoch, so a resize that comes back
+            // after the wait leaves the tab displaced, its one try spent, nothing said.
             action ReturnUnwatched when (Buggy == 1 && superseded == 1 && moved == 1) {
                 moved = 0;
                 superseded = 0;
@@ -738,12 +642,11 @@ pub fn repaint_nudge_model() -> Model {
             invariant HealedNeedsBothAnswers: healed == 0 || (ack1 == 1 && ack2 == 1);
             invariant OneTryPerEpoch: tries <= MaxTries;
             invariant NudgeNeverTouchesTheEngine: engine == 0;
-            // An attempt that ends on a tab still owing rows says so (a give-up,
-            // the owner's digest line), unless the driver itself was lost or a
-            // real resize superseded it and the epoch judge still watches its
-            // epoch: the resize stands, or it came back and the judge owes the
-            // give-up, which `TheNudgeEnds` holds it to (`Report`, weakly fair).
-            // A moved engine alone excuses nothing.
+            // An attempt that ends on a tab still owing rows says so (a give-up, the owner's
+            // digest line), unless the driver was lost or a real resize superseded it and the
+            // epoch judge still watches its epoch: the resize stands, or it came back and the
+            // judge owes the give-up (`Report`, weakly fair in `TheNudgeEnds`). A moved engine
+            // alone excuses nothing.
             invariant AnUnrepairedEndIsReported: phase <= 3 || debt == 0 || healed == 1
                 || gaveup == 1 || superseded == 1 || lost == 1;
         }
@@ -752,10 +655,11 @@ pub fn repaint_nudge_model() -> Model {
 
 /// The nudge ends, and its end is said: `[]<>(at rest with nothing owed to the
 /// owner \/ nothing to repair)`, under weak fairness of the driver's and the
-/// window's own steps and NO fairness for the app. At rest with nothing owed:
+/// window's own steps and no fairness for the app. At rest with nothing owed:
 /// no superseded attempt whose resize came back is left unreported (`Report`).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
+#[crate::liveness(crate::derive::repaint_nudge_model)]
 pub fn repaint_nudge_liveness() -> Liveness {
     use super::{and_, eq, int, or_, var};
     Liveness {

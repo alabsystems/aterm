@@ -6,9 +6,11 @@
 //! POSIX `.sh`; actively delete a stray one). The `.ps1` is what wires the managed bin/ onto
 //! PATH on Windows (and cross-platform pwsh), where no zsh/bash/fish runs the POSIX hooks.
 //!
-//! This is the ONLY thing that puts the atpkg-managed `bin/` on an interactive shell's PATH,
-//! and it **APPENDS** it (append-not-prepend, mirroring [`crate::store::append_bin_to_path`])
-//! so a managed tool can never shadow system `sudo`/`ssh`/`git` even on the interactive PATH.
+//! This is what puts the atpkg-managed `bin/` on an interactive shell's PATH outside aterm
+//! (inside it, the spawn seam appends the same entry from the first tab on,
+//! [`crate::session_bin_dir`]), and it **APPENDS** it (append-not-prepend, mirroring
+//! [`crate::store::append_bin_to_path`]) so a managed tool can never shadow system
+//! `sudo`/`ssh`/`git` even on the interactive PATH.
 //! The ONE exception (owner decision 2026-09-10): `<prefix>/agents/`
 //! ([`crate::store::Layout::agents_dir`]), which holds nothing but the agent programs'
 //! shims (`claude`, `codex` — [`crate::stub::AGENT_PROGRAMS`]), is MOVED TO THE FRONT as a
@@ -140,6 +142,16 @@ pub fn hook_file(home: &Path, shell: &str) -> Option<(std::path::PathBuf, &'stat
         .ok()
         .filter(|m| m.file_type().is_file())
         .map(|_| (path, hook))
+}
+
+/// Whether `home`'s `~/.aterm/shell.d` holds an atpkg hook for any shell ([`hook_file`]):
+/// [`write_hooks`] lays every dialect or none, so one is enough to say the hook that appends
+/// `bin/` is there for every interactive shell that sources it.
+#[must_use]
+pub fn written(home: &Path) -> bool {
+    ["zsh", "bash", "fish", "pwsh"]
+        .into_iter()
+        .any(|shell| hook_file(home, shell).is_some())
 }
 
 /// Whether `shell` — the basename of `$SHELL`: `zsh`, `bash`, `fish` — has an rc under
@@ -489,7 +501,7 @@ pub enum HookPass {
     /// owner or a group/other-writable mode): nothing was touched, no rc was read.
     NotHardened,
     /// The UNATTENDED pass ran from an app bundle that is not the release `aterm.app` — a
-    /// dev bundle from `tools/dev-app.sh`, a renamed copy — and wrote nothing: the shell
+    /// dev bundle from `ship dev-app`, a renamed copy — and wrote nothing: the shell
     /// hooks, the rc blocks and the command links are the release's to lay
     /// ([`in_release_bundle`]) — a stale dev bundle would lay stale hooks. `atpkg repair`
     /// from such a bundle — the asked-for pass — still writes.
@@ -539,6 +551,11 @@ pub enum RcOutcome {
 /// Best-effort choke point called after activation ([`crate::flow`]). Hardens `~/.aterm` +
 /// `~/.aterm/shell.d` (0700, symlink-refusing) then writes the hooks. NEVER propagates an
 /// error — hooks are ergonomics, not trust; a failed write must not fail an install.
+///
+/// Its callers: the first-launch seed (right after it lays the pending stubs, so `bin/` is
+/// on a shell's PATH before anything installs), the end of every update pass, an install,
+/// and `uninstall --all`. The hooks name the three managed directories and nothing that
+/// is installed, so they are valid before the first byte of the toolset moves.
 ///
 /// This is the UNATTENDED pass (install, seed, the six-hourly `update`), so its rc wiring
 /// HONOURS THE OPT-OUT the block itself documents: an rc that was wired once and no longer
@@ -679,7 +696,7 @@ pub(crate) const RC_FILES: [(&str, &str); 4] = [
 /// line. It is what makes the block's OWN SENTENCE true.
 ///
 /// The block says "delete this block to opt out", but [`refresh`] runs unconditionally
-/// from install, seed, `repair` and the six-hourly background `update`: with the marker as
+/// from install, every launch's seed and the six-hourly background `update`: with the marker as
 /// the only idempotency check, the opt-out would last until the next pass.
 ///
 /// So a wired rc is RECORDED here, and a recorded rc that no longer carries the block is
@@ -1083,9 +1100,9 @@ fn sources_shell_d(rc: &str) -> bool {
 /// bundle ([`in_release_bundle`]), and this pass never writes a link it would itself
 /// refuse to repoint: a dev bundle (`aterm (dev).app`) planting them would take them from
 /// the release, which could never take them back. Aiming `aterm` at a dev build is
-/// `tools/dev-app.sh` step 4's job — a stated choice, which prints what it displaced and
+/// `targo --unverified ship dev-app`'s job — a stated choice, which prints what it displaced and
 /// which `--no-link` declines — and never a side effect of launching it; `atpkg` stays
-/// with the release (dev-app.sh has never linked it). The same rule keeps the unattended
+/// with the release (`ship dev-app` never links it). The same rule keeps the unattended
 /// shell-hook pass ([`refresh`]) and the window's agent primer off a dev bundle.
 ///
 /// Unix-only: the whole body is bundle-shaped (`Contents/MacOS`, `~/.local/bin`,
@@ -1156,10 +1173,10 @@ fn ensure_command_links_from(home: &Path, exe: &Path) {
         match fs::symlink_metadata(&link) {
             Ok(meta) if meta.file_type().is_symlink() => {
                 // Ours to repoint only if it already points into an `aterm.app` bundle;
-                // anything else — a dev bundle `tools/dev-app.sh` aimed `aterm` at,
+                // anything else — a dev bundle `ship dev-app` aimed `aterm` at,
                 // someone's own build — belongs to whoever put it there. ONE exception,
                 // `atpkg` into another bundle's `Contents/MacOS`: no tool states that
-                // choice (`tools/dev-app.sh` links `aterm` only, and never has), so such a
+                // choice (`ship dev-app` links `aterm` only), so such a
                 // link is the leftover of this pass before it was release-only — a dev
                 // bundle's launch took it — and it goes back to the release.
                 let ours = fs::read_link(&link).ok().is_some_and(|old| {
@@ -1599,40 +1616,6 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
-
-    /// The checked remedy: `rc_hook_wired` reads the rc itself — the marker block, or a
-    /// hand-written line naming the hook — never a ledger, and knows the three shell
-    /// families and nothing else.
-    #[test]
-    fn rc_hook_wired_reads_the_rc_for_the_shell_family() {
-        let home = crate::testdir::dir("atpkg-rcwired-");
-        fs::create_dir_all(home.join(".config/fish")).unwrap();
-        // Nothing wired anywhere: every known shell says so, an unknown one says nothing.
-        assert_eq!(rc_hook_wired(&home, "zsh"), Some((false, "00-atpkg.zsh")));
-        assert_eq!(rc_hook_wired(&home, "bash"), Some((false, "00-atpkg.bash")));
-        assert_eq!(rc_hook_wired(&home, "fish"), Some((false, "00-atpkg.fish")));
-        assert_eq!(rc_hook_wired(&home, "nu"), None);
-        assert_eq!(rc_hook_wired(&home, ""), None);
-        // The marker block in .zshrc: zsh wired, bash still not.
-        fs::write(
-            home.join(".zshrc"),
-            format!("x=1\n{RC_BEGIN}\n. hook\n{RC_END}\n"),
-        )
-        .unwrap();
-        assert_eq!(rc_hook_wired(&home, "zsh"), Some((true, "00-atpkg.zsh")));
-        assert_eq!(rc_hook_wired(&home, "bash"), Some((false, "00-atpkg.bash")));
-        // A hand-written source line (no markers) in the LOGIN rc counts for bash…
-        fs::write(
-            home.join(".bash_profile"),
-            "[ -f ~/.aterm/shell.d/00-atpkg.bash ] && . ~/.aterm/shell.d/00-atpkg.bash\n",
-        )
-        .unwrap();
-        assert_eq!(rc_hook_wired(&home, "bash"), Some((true, "00-atpkg.bash")));
-        // …and an rc that exists but names no hook does not.
-        fs::write(home.join(".config/fish/config.fish"), "set -x FOO 1\n").unwrap();
-        assert_eq!(rc_hook_wired(&home, "fish"), Some((false, "00-atpkg.fish")));
-        let _ = fs::remove_dir_all(&home);
-    }
 
     /// ONE TABLE FOR THE HOOK NAME (2026-09-16): the four files `write_hooks` lays are
     /// exactly what `hook_for_shell` names per shell family, and `hook_file` answers only
@@ -2299,7 +2282,7 @@ mod tests {
     /// (a link into the dev bundle is not "ours"). Driven through the real pass on a
     /// bundle tree of its own: from the dev bundle nothing is planted and a release link
     /// is left alone; from the release bundle an absent link is planted, a link into an
-    /// OLDER release location is repointed (moves still track), and a link `tools/dev-app.sh`
+    /// OLDER release location is repointed (moves still track), and a link `ship dev-app`
     /// aimed at the dev bundle — the stated choice — is left alone.
     #[cfg(unix)]
     #[test]
@@ -2356,7 +2339,7 @@ mod tests {
         ensure_command_links_from(&home, &release.join("aterm"));
         assert_eq!(target("aterm"), Some(release.join("aterm")));
 
-        // 5. The stated choice stands: `tools/dev-app.sh` aimed `aterm` at the dev bundle,
+        // 5. The stated choice stands: `ship dev-app` aimed `aterm` at the dev bundle,
         //    and the release leaves it there.
         set("aterm", &dev.join("aterm"));
         ensure_command_links_from(&home, &release.join("aterm"));

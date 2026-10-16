@@ -292,11 +292,9 @@ fn markdown_cmd_a_and_escape_own_exact_source_selection() {
     let _ = fs::remove_dir_all(dir);
 }
 
-/// A configured raw sequence is explicit terminal authority. The physical
-/// key path resolves and swallows it before this seam; this lower boundary
-/// independently proves that even a controller-supplied `KeySequence`
-/// cannot cross an active native tab. The terminal pass is the negative
-/// control, proving the pipe observes real writes rather than a vacuous zero.
+/// Even a controller-supplied `KeySequence` cannot cross an active native tab
+/// (the physical key path already swallows a configured raw sequence before
+/// this seam). The terminal pass is the negative control: the pipe sees writes.
 #[cfg(unix)]
 #[test]
 fn raw_key_sequence_never_reaches_parked_pty_under_native_tab() {
@@ -335,9 +333,8 @@ fn raw_key_sequence_never_reaches_parked_pty_under_native_tab() {
     );
 
     assert!(app.close_settings_tabs());
-    // Closing the native tab deliberately re-mirrors the terminal session,
-    // including its real sink; restore the observing pipe for the terminal
-    // negative control.
+    // Closing the native tab re-mirrors the terminal session with its real
+    // sink; restore the observing pipe for the negative control.
     app.windows
         .get_mut(&wid)
         .unwrap()

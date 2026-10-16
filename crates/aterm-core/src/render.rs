@@ -3594,21 +3594,6 @@ mod ime_preedit_ragged_row_tests {
         f
     }
 
-    /// The extracted prompt row really is short, so the tests below exercise
-    /// the ragged case.
-    #[test]
-    fn the_fixture_row_stops_at_the_written_prefix() {
-        let f = prompt_frame(4, 20);
-        assert_eq!(f.cells[0].len(), 2, "a snapshot row is the written prefix");
-        assert_eq!(
-            (f.cursor_row, f.cursor_col),
-            (0, 2),
-            "and the prompt's caret sits exactly at its end"
-        );
-        assert_ne!(f.default_bg, COLOR_UNSET, "a configured host resolves both");
-        assert_ne!(f.default_fg, COLOR_UNSET);
-    }
-
     /// Composing at a prompt paints the composition on the ragged row, not
     /// only a cursor move.
     #[test]

@@ -1,59 +1,34 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! NO UPGRADE STUCK FOREVER, BOUND TO THE CODE (design record 2026-09-28,
-//! §4.4): the derived `HarnessUpgradeProgress` machine against the REAL
-//! reducer and the REAL classifier, over every state the committed machine
-//! reaches, its gap latch clear: `keep` (the watch recorded only a read that
-//! waits; closed by `upgrade::held_point` and `upgrade::NEXT_POINT`) is a
-//! negative control. The other gap, a limit a
-//! record at any age, is the CLASSIFIER's claim (`St::limit_until`,
-//! `Row::limit_passed`), bound in T1-f. Four tests:
+//! No upgrade stuck forever, bound to the code (design record 2026-09-28, §4.4): the derived
+//! `HarnessUpgradeProgress` machine against the real reducer and the real classifier, over every
+//! state the committed machine reaches with its gap latch clear. The `keep` latch (the watch
+//! records only a read that waits; closed by `upgrade::held_point` and `upgrade::NEXT_POINT`) is
+//! a negative control. The other gap, a limit left a quiet record at any age, is the classifier's
+//! to close (`St::limit_until`, [`Row::limit_passed`]), bound in T1-f.
 //!
-//! * T1-a, THE REDUCER — THE ASK-AND-DRAIN FLOW's (`upgrade_ask = true`,
-//!   opt-in), whose steps the machine's are: each state becomes the facts of
-//!   a real look — at an idle point, at a settled break (`background_point`), and as the watch's
-//!   dry read sees the screen (no break known) — and the real
-//!   `upgrade::requested_step` (with `upgrade::break_step` at a break)
-//!   decides: the machine's `StepAtIdle`/`StepAtBreak` is enabled exactly
-//!   where the real step acts, and lands the phase the real step's kind
-//!   does; the word the real watch records of the dry read
-//!   (`upgrade_watch::look_word` of the act's word and what holds its point,
-//!   `upgrade::held_point`) is exactly the class the machine's `Watch`
-//!   records (after `WatchRearms` where the read re-arms: the watch does
-//!   both in one pass). NEGATIVE CONTROLS: 0.94's break arm (every phase
-//!   answered `background` at a break), the terminal stop (before
-//!   `d633246d4`: a stopped round waits `failed` for good), and the `Buggy`
-//!   member `RestartOverWork` — each caught where the real reducer does
-//!   otherwise — and two looks that are not main's: the latch's
-//!   (`RecordedWordStands`: an act read records nothing), and a
-//!   posture-blind neutral word (every act read `next-point`), which names
-//!   aterm's own class at a person's box where the machine names the person.
-//! * T1-a', THE QUIET UPGRADE'S READ (`upgrade_ask = false`, the default):
-//!   its one step, the restart at a genuinely idle point, is not the
-//!   machine's, so its truth is not the machine's `T`; over the same
-//!   reachable states, the word the real watch records of the real quiet
-//!   read is the neutral one exactly where nothing holds the restart, and
-//!   elsewhere the class of what does. NEGATIVE CONTROLS: the ask flow's
-//!   read, `RestartOverWork`, main before C9, the posture-blind word.
-//! * T1-f, THE CLASSIFIER OVER THE MACHINE'S STATES: each state becomes a
-//!   record ([`Row`]); its projection ([`progress_projection`]) is the state,
-//!   and the owner-facing class the real [`Row::attention`] gives it is the
-//!   owner's rule ("don't continue to persist alerts to the user that are not
-//!   actionable"): a fresh record is QUIET — a wait is a record,
-//!   never a row or a mark — save for a limit whose named reset has passed
-//!   (a fault line, [`Row::limit_passed`]) and the agent's own work held for
-//!   a day (one digest line); a record with NO PROGRESS for a day is told
-//!   (a fault or a digest line), a limit only past its longest; and every
-//!   turn of the class by time alone falls at an instant [`next_change`]
-//!   names — the weak fairness of the view. T1-f', the same over the QUIET
-//!   flow's rows ([`Row::quiet`], the default): a limit past its named reset is
-//!   told only after the quiet move's chance. NEGATIVE CONTROL: the ask flow's
-//!   classification over the same quiet world tells a spent limit at the
-//!   instant the quiet move may first go.
-//! * THE REFUSED NOTICE'S INSTANT: a fault line that turns at
-//!   `refused_at + TELL_S` is an instant [`next_change`] names; the view
-//!   without that arm fails the check.
+//! * T1-a, the reducer of the ask-and-drain flow (`upgrade_ask = true`, opt-in): each state
+//!   becomes the facts of real looks (an idle point, a settled break, the watch's dry read), and
+//!   the real `upgrade::requested_step` (with `upgrade::break_step` at a break) enables the
+//!   machine's `StepAtIdle`/`RestartAtIdle`/`StepAtBreak` exactly where it acts, landing the same
+//!   phase; the word the real watch records of the dry read (`upgrade_watch::look_word`) is the
+//!   class the machine's `Watch` records. Negative controls: 0.94's break arm (every phase
+//!   answered `background` at a break), the terminal stop (a stopped round waits `failed` for
+//!   good), `RestartOverWork`, the latch's look (`RecordedWordStands`), and a posture-blind
+//!   neutral word.
+//! * T1-a', the quiet upgrade's read (`upgrade_ask = false`, the default): the word the real
+//!   watch records is the neutral one exactly where nothing holds the quiet restart, else the
+//!   class of what does.
+//! * T1-f, the classifier: each state becomes a record ([`Row`]) whose projection
+//!   ([`progress_projection`]) is the state, and [`Row::attention`] holds it to the rule that a
+//!   wait is a record: a fresh record is quiet save for a limit past its named reset (a fault
+//!   line) and the agent's own work held for a day (a digest line); a record with no progress
+//!   for a day is told, a limit only past its longest; and every turn of the class by time alone
+//!   falls at an instant [`next_change`] names. T1-f' holds the quiet flow's rows ([`Row::quiet`])
+//!   to the same.
+//! * The refused notice's instant: a fault line that turns at `refused_at + TELL_S` is an instant
+//!   [`next_change`] names.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -68,15 +43,13 @@ use crate::harness::upgrade_drive::{WATCH_GAP, at_point};
 /// The target the reducer is asked about.
 const TARGET: &str = "2.1.284";
 
-/// The committed machine at `Buggy = 0` with both gap latches clear (as
-/// `aterm-spec`'s `derived_harness_upgrade_progress_gaps_are_closed_on_main`
-/// builds it).
+/// The committed machine at `Buggy = 0` with its gap latch clear (as `aterm-spec`'s
+/// `derived_harness_upgrade_progress_gaps_are_closed_on_main` builds it).
 fn main_today() -> Model {
     interp::with_buggy(&harness_upgrade_progress_model(), 0)
 }
 
-/// Main as it was before a gap closed: the committed machine with that gap's
-/// latch (`keep`) set from the start.
+/// The committed machine with the gap latch `name` (`keep`) set from the start: the gap open.
 fn latched(name: &str) -> Model {
     let mut m = main_today();
     for v in &mut m.vars {
@@ -110,9 +83,8 @@ fn with(s: &State, var: &'static str, value: i64) -> State {
     s
 }
 
-/// How long the session has been behind, the classifier's horizons between
-/// them: an hour, an hour past [`STALLED_AFTER_S`] (the old six-hour mark,
-/// which is a word in `--status` now and no alert), an hour past
+/// How long the session has been behind, the classifier's horizons between them: an hour, an
+/// hour past [`STALLED_AFTER_S`] (six hours: a word in `--status`, no alert), an hour past
 /// [`MOVE_BUDGET_S`] (the day the agent's own work becomes one digest line).
 const BEHIND: [u64; 3] = [3_600, STALLED_AFTER_S + 3_600, MOVE_BUDGET_S + 3_600];
 
@@ -387,7 +359,7 @@ fn the_real_reducer_is_the_derived_machine() {
             if old != looked["cause"] {
                 caught.insert("RecordedWordStands");
             }
-            // NEGATIVE CONTROL — one neutral word for every act read, blind to
+            // Negative control: one neutral word for every act read, blind to
             // what holds its point: at a person's box it names aterm's own
             // class where the machine names the person (`NoStaleLook`).
             let blind = look_word(
@@ -477,20 +449,15 @@ fn read_word(s: &State, f: &Facts) -> String {
     look_word(&dry_word(&step, f), true, || f.status.clone())
 }
 
-/// WHAT HOLDS THE QUIET UPGRADE'S RESTART at state `s`, as classes of the
-/// machine's `cause` — `None` where nothing does, the neutral word's: a
-/// resting round's rest (its own); else, for the round the read would act on
-/// (a rested one re-armed: the new pending round's), an idle point — or a
-/// limit's notice a grace past its reset (C9) — with nothing under the agent
-/// holds nothing, and with processes under it their own work; a turn and a
-/// break, its own work; a limit before its reset, the limit; a person's box,
-/// the person — and, with processes under the agent too, either, since both
-/// hold the restart and the view tells both at the same instant. An
-/// ANNOUNCED round past its window whose restart its own work holds GIVES UP
-/// (the quiet flow asks nothing again, so a round an older aterm announced
-/// would stand announced for good over work that never ends): the
-/// release it owes goes at the next point a notice may go, which nothing
-/// holds at an idle point.
+/// What holds the quiet upgrade's restart at `s`, as classes of the machine's `cause`; `None`
+/// where nothing does (the neutral word's). A resting round: its own rest. Else, for the round
+/// the read acts on (a rested one re-armed: the new pending round): at an idle point (or a
+/// limit's notice a grace past its reset), nothing with no processes under the agent, else their
+/// work; a turn or a break, its own work; a limit before its reset, the limit; a person's box, the
+/// person, or either with processes under the agent too (both hold the restart and the view tells
+/// both at once). An announced round past its window that its own work holds gives up (the quiet
+/// flow asks nothing again, so it would stand announced for good): its release goes at the next
+/// point a notice may go, which nothing holds at an idle point.
 fn quiet_truth(s: &State) -> Option<BTreeSet<i64>> {
     if s["phase"] == 2 && s["clock"] == 0 {
         return Some(BTreeSet::from([0]));
@@ -728,7 +695,7 @@ fn deadlines(row: &Row) -> Vec<u64> {
     out
 }
 
-/// T1-f, THE CLASSIFIER OVER THE MACHINE'S STATES (see the module header).
+/// T1-f, the classifier over the machine's states (see the module header).
 #[test]
 fn the_real_view_is_the_derived_machine() {
     use aterm_spec::xref;
@@ -738,9 +705,9 @@ fn the_real_view_is_the_derived_machine() {
     let (mut quiet, mut faults, mut digests, mut stale_told, mut timed) = (0, 0, 0, 0, 0);
     for s in states.iter().filter(|s| s["phase"] <= 2) {
         for behind in BEHIND {
-            // A FRESH RECORD: it acted a minute ago.
+            // A fresh record: it acted a minute ago.
             let r = row(s, behind, NOW - 60);
-            // The projection IS the state.
+            // The projection is the state.
             let proj = progress_projection(&r, NOW);
             let mut want: BTreeMap<&str, i64> = ["phase", "rearmed", "cause", "clock"]
                 .into_iter()
@@ -755,11 +722,10 @@ fn the_real_view_is_the_derived_machine() {
                 r.overdue_cause(NOW) == OWN_WORK,
                 "{s:?}"
             );
-            // THE OWNER'S RULE, at every state: a wait is a record. Nothing
-            // marks the tab or takes a row, whatever the age, and the only
-            // things told of a record that acts are a limit that has ended
-            // (aterm's own line in the log) and the agent's own work held
-            // for a day (one digest line).
+            // The rule, at every state: a wait is a record. Nothing marks the
+            // tab or takes a row, whatever the age, and the only things told of
+            // a record that acts are a limit that has ended (aterm's own line in
+            // the log) and the agent's own work held for a day (one digest line).
             assert!(r.interrupt(NOW).is_none(), "{s:?}: an interrupt for a wait");
             assert!(r.badge(NOW).is_none(), "{s:?}: the tab is marked");
             match r.attention(NOW) {
@@ -776,8 +742,8 @@ fn the_real_view_is_the_derived_machine() {
                 }
                 Attention::Interrupt(n) => panic!("{s:?}: {n:?}"),
             }
-            // A LIMIT WHOSE RESET HAS PASSED is told, whatever the age or the
-            // phase; one whose reset is ahead is a record (ruling 307).
+            // A limit whose reset has passed is told, whatever the age or the
+            // phase; one whose reset is ahead is a record.
             if s["cause"] == 2 {
                 assert_eq!(
                     matches!(r.attention(NOW), Attention::Fault(_)),
@@ -785,7 +751,7 @@ fn the_real_view_is_the_derived_machine() {
                     "{s:?}"
                 );
             }
-            // THE WEAK FAIRNESS OF THE VIEW: every turn of the class by time
+            // Weak fairness of the view: every turn of the class by time
             // alone is an instant [`next_change`] names, so the host looks then.
             let horizon = NOW + 10 * 86_400;
             let rows = std::slice::from_ref(&r);
@@ -799,10 +765,10 @@ fn the_real_view_is_the_derived_machine() {
                 timed += 1;
             }
         }
-        // NO WAIT IS QUIET WITHOUT AN END: the same record with no progress
-        // for the longest a quiet wait may stand is told — by a fault line in
-        // the log or a digest line — unless it is a limit whose reset is
-        // still ahead, which stands to [`LIMIT_MAX_S`] and no further.
+        // No wait is quiet without an end: the same record with no progress
+        // for the longest a quiet wait may stand is told (a fault line in the
+        // log or a digest line), unless it is a limit whose reset is still
+        // ahead, which stands to [`LIMIT_MAX_S`] and no further.
         let never = LIMIT_MAX_S + 3_600;
         let r = row(s, never, NOW - never);
         assert!(
@@ -831,11 +797,10 @@ fn the_real_view_is_the_derived_machine() {
     );
 }
 
-/// The record a state stands for UNDER THE QUIET FLOW ([`Row::quiet`],
-/// `upgrade_ask = false`, the default): [`row`], read with the flow set — and
-/// the world's `reset` passed where the quiet flow's tell has: a limit past
-/// the reset its row named, [`QUIET_MOVE_S`] after the instant the quiet move
-/// may first go ([`Row::limit_passed`]).
+/// The record a state stands for under the quiet flow ([`Row::quiet`], `upgrade_ask = false`, the
+/// default): [`row`] read with the flow set, the world's `reset` passed where the quiet flow's tell
+/// has (a limit past the reset its row named, [`QUIET_MOVE_S`] after the instant the quiet move may
+/// first go, [`Row::limit_passed`]).
 fn quiet_row(s: &State, behind: u64, progress: u64) -> Row {
     let r = row(s, behind, progress);
     Row {
@@ -848,20 +813,12 @@ fn quiet_row(s: &State, behind: u64, progress: u64) -> Row {
     }
 }
 
-/// T1-f', THE CLASSIFIER UNDER THE QUIET FLOW: the classifier reads the flow
-/// its rows are read under — an announced round nothing asks again judged as
-/// pending, a limit past its named reset told only after the quiet move's
-/// chance — and T1-f builds every row under the ask flow. Here every
-/// state the machine reaches becomes a QUIET row ([`quiet_row`]) and is held to
-/// the owner's rule as T1-f holds it: nothing marks the tab or takes a row;
-/// the only things told of a record that acts are a limit whose reset and
-/// the quiet move's chance have passed (a fault line) and the agent's own work
-/// held for a day (one digest line); no wait is quiet without an end; and
-/// every turn of the class by time alone, the quiet limit's own deadline
-/// included, is an instant [`next_change`] names. NEGATIVE CONTROL, caught:
-/// the ask flow's classification over a spent limit at the instant the quiet
-/// move may first go, which faults it where the quiet flow still waits for the
-/// move.
+/// T1-f', the classifier under the quiet flow: it reads the flow its rows are read under (an
+/// announced round nothing asks again judged as pending, a limit past its named reset told only
+/// after the quiet move's chance). Every state the machine reaches becomes a quiet row
+/// ([`quiet_row`]) held to T1-f's rule, the quiet limit's own deadline among the instants
+/// [`next_change`] must name. Negative control: the ask flow's classification faults a spent limit
+/// at the instant the quiet move may first go, where the quiet flow still waits for the move.
 #[test]
 fn the_real_quiet_view_is_the_derived_machine_read_quietly() {
     let today = main_today();
@@ -893,8 +850,8 @@ fn the_real_quiet_view_is_the_derived_machine_read_quietly() {
                     "{s:?}"
                 );
             }
-            // THE WEAK FAIRNESS OF THE VIEW, quietly: the quiet tell of a
-            // limit is a deadline of its own.
+            // Weak fairness of the view, quietly: the quiet tell of a limit
+            // is a deadline of its own.
             let horizon = NOW + 10 * 86_400;
             let mut candidates = deadlines(&r);
             candidates.push(r.limit_until.saturating_add(LIMIT_GRACE_S + QUIET_MOVE_S));
@@ -907,7 +864,7 @@ fn the_real_quiet_view_is_the_derived_machine_read_quietly() {
                 timed += 1;
             }
         }
-        // NO WAIT IS QUIET WITHOUT AN END, quietly.
+        // No wait is quiet without an end, quietly.
         let never = LIMIT_MAX_S + 3_600;
         let r = quiet_row(s, never, NOW - never);
         assert!(
@@ -915,7 +872,7 @@ fn the_real_quiet_view_is_the_derived_machine_read_quietly() {
             "{s:?}: quiet with no end\n{r:?}"
         );
         assert!(r.interrupt(NOW).is_none(), "{s:?}");
-        // NEGATIVE CONTROL: at the instant the ask flow tells a limit (the
+        // Negative control: at the instant the ask flow tells a limit (the
         // grace past a named reset), the quiet world's reset has not passed
         // its move's chance.
         if s["cause"] == 2 && s["reset"] == 0 {
@@ -944,17 +901,13 @@ fn the_real_quiet_view_is_the_derived_machine_read_quietly() {
     );
 }
 
-/// THE REFUSED NOTICE'S INSTANT IS NAMED: a notice aterm's own fence refused
-/// is aterm's fault to fix [`TELL_S`] after the first refusal
-/// ([`Row::refused_notice`]), before the move is overdue — and [`next_change`]
-/// names `refused_at + TELL_S`, so the view's host looks then rather than at
-/// the next watch (up to [`WATCH_GAP`] later, hours with none due). NEGATIVE
-/// CONTROLS: the view
-/// without that arm — the chain of instants it names less this one, which is
-/// exactly what `next_change` named before, since each arm's instant is
-/// independent of the others — leaves the turn unnamed, with no watch due for
-/// hours; and the same row with no refusal counted, or a wait that is no
-/// refused notice, names nothing of the kind and never turns.
+/// The refused notice's instant is named: a notice aterm's own fence refused is aterm's fault to
+/// fix [`TELL_S`] after the first refusal ([`Row::refused_notice`]), before the move is overdue,
+/// and [`next_change`] names `refused_at + TELL_S`, so the host looks then rather than at the next
+/// watch (up to [`WATCH_GAP`] later). Negative controls: the view without that arm (the chain of
+/// instants less this one; each arm's instant is independent) leaves the turn unnamed with no
+/// watch due for hours; with no refusal counted, or a wait that is no refused notice, nothing of
+/// the kind is named and nothing turns.
 #[test]
 fn the_refused_notices_tell_is_an_instant_the_view_names() {
     let refused = Row {
@@ -984,9 +937,9 @@ fn the_refused_notices_tell_is_an_instant_the_view_names() {
     let mut before = named(std::slice::from_ref(&unwatched), NOW, horizon);
     assert!(before.remove(&tell), "the arm names it");
     assert!(before.range(tell..).next().is_none(), "{before:?}");
-    // NEGATIVE CONTROLS: no refusal counted — the wait is then aterm's own
-    // stuck one from when it began ([`HARNESS_TELL_S`]), an instant the view
-    // names too, but never `refused_at + TELL_S` — or no refused notice
+    // Negative controls: no refusal counted (the wait is then aterm's own
+    // stuck one from when it began, [`HARNESS_TELL_S`], an instant the view
+    // names too, but never `refused_at + TELL_S`), or no refused notice
     // waiting: no such instant, and no turn.
     let uncounted = Row {
         refused: 0,

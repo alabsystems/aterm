@@ -9,43 +9,16 @@
 
 use crate::walk::only;
 
-#[test]
-fn the_supervisor_claim_proves_and_catches_a_press_on_a_stale_view() {
-    aterm_spec::verify::prove_and_catch_scalar(
-        &aterm_spec::derive::supervisor_claim_model(),
-        "supervisor claim: renew before a press",
-    );
-}
-
-#[test]
-fn the_focus_choice_proves_and_catches_an_enter_on_an_unconfirmed_focus() {
-    aterm_spec::verify::prove_and_catch_scalar(
-        &aterm_spec::derive::supervisor_focus_choice_model(),
-        "supervisor focus choice: confirm before Enter",
-    );
-}
-
-#[test]
-fn the_turn_end_policy_proves_and_catches_typing_over_a_person_and_escalating_done() {
-    let m = aterm_spec::derive::supervisor_turn_end_model();
-    aterm_spec::verify::prove_and_catch_scalar(
-        &m,
-        "supervisor turn end: never type under a box, a person, over a draft or before a \
-         back-off; never escalate an answerable point",
-    );
-    // With a cap the owner wrote, the same machine proves too.
-    aterm_spec::verify::prove_and_catch_scalar(
-        &aterm_spec::interp::with_consts(&m, &[("Budget", 2)]),
-        "supervisor turn end under a written cap",
-    );
-}
-
 /// THE DONE CHECK (2026-09-27): a done report is typed the check, only the
 /// check's own done yield ends the task, and nothing is typed into a done
 /// task, and a wall someone else's turn ended on is acted on even after the
 /// task was done — proven; the policy before it (`Buggy = 1`: a done report
 /// continued like any point, and ended as soon as it repeats; the check's
 /// first cut, which left a done task closed at a wall) is caught by each.
+/// THE WORKER'S OWN FINISHED (DONE-1, 2026-10-16): a FINISHED naming open
+/// work is challenged before the task ends, once a job — proven; the harness
+/// before it (an open FINISHED ended at once) and a challenge that forgets it
+/// was asked are each caught.
 #[test]
 fn the_done_check_proves_and_catches_nudging_a_finished_task() {
     aterm_spec::verify::prove_and_catch_scalar(
@@ -68,6 +41,14 @@ fn the_done_check_proves_and_catches_nudging_a_finished_task() {
             &["OtherTurnDone", "Check", "YieldDone", "OtherTurnWall"][..],
             "AWallIsNeverLeftOnADoneTask",
         ),
+        (
+            &["OtherTurnOpenFinished", "FinishOpenAtOnce"][..],
+            "AnOpenFinishIsChallenged",
+        ),
+        (
+            &["OtherTurnOpenFinished", "Challenge", "ChallengeAgain"][..],
+            "OneChallengeAJob",
+        ),
     ] {
         let mut st = buggy.init_state();
         for action in path {
@@ -86,6 +67,22 @@ fn the_done_check_proves_and_catches_nudging_a_finished_task() {
     // act is owed (the review of 2026-09-27).
     assert!(m.fire("OtherTurnWall", &mut st));
     assert!(m.action_enabled("WallAct", &st), "{st:?}");
+    // An open FINISHED owes the challenge, never the end or the check; the
+    // finished yield to it ends the task, open work and all, and the next
+    // job's open FINISHED is challenged afresh.
+    let mut st = m.init_state();
+    assert!(m.fire("OtherTurnOpenFinished", &mut st));
+    assert_eq!(st["done"], 1);
+    assert!(m.action_enabled("Challenge", &st) && !m.action_enabled("Check", &st));
+    assert!(m.fire("Challenge", &mut st) && m.fire("YieldOpenFinished", &mut st));
+    assert_eq!((st["done"], st["challenged"]), (2, 0));
+    assert!(!m.action_enabled("Challenge", &st) && !m.action_enabled("Continue", &st));
+    assert!(m.fire("OtherTurnOpenFinished", &mut st));
+    assert!(m.action_enabled("Challenge", &st), "{st:?}");
+    // A clean FINISHED ends the task at once.
+    let mut st = m.init_state();
+    assert!(m.fire("OtherTurnFinished", &mut st));
+    assert_eq!(st["done"], 2);
 }
 
 /// THE STALL'S REMEDY (D4, 2026-09-27, cut back by that day's review): one
@@ -652,14 +649,12 @@ fn at_text_zero_the_question_model_is_todays() {
 
 /// EACH INSTANCE HOLDS ONLY LAWS ITS CONSTANTS CAN BREAK, AND EVERY ACTION
 /// FIRES (the review of the question-lean re-port): what the workspace's
-/// sweeps ask of a model in `xref::model_registry()` — the non-vacuity
-/// ratchet, that the fence alone (`Buggy = 1`) breaks every law
-/// (`verify::uncaught_invariants` names none), and `ty check
-/// --strict-vacuity`, that no action is dead at the committed constants
-/// (its one exception, a dead action that alone is the mutant, is not this
-/// model's shape: its mutant is the guards'). The recommended path is
-/// enrolled; the policy text is held to the same here, single- and
-/// multi-select, while its `Buggy = 1` space is past the sweep's budget.
+/// sweeps ask of a registered model — the non-vacuity sweep, that the fence
+/// alone (`Buggy = 1`) breaks every law (`verify::uncaught_invariants` names
+/// none), and `ty check --strict-vacuity`, that no action is dead at the
+/// committed constants (its one exception, a dead action that alone is the
+/// mutant, is not this model's shape: its mutant is the guards'). The policy
+/// text is held to the same here at the multi-select dial as well.
 /// NEGATIVE CONTROLS: the whole machine at `Text = 0` — the one model the
 /// two paths were until the review — has two ghosts, the text's laws; and
 /// the consume of a key read after the dialog closed, as an action of its
@@ -668,12 +663,6 @@ fn at_text_zero_the_question_model_is_todays() {
 #[test]
 fn each_question_instance_holds_only_laws_its_constants_can_break() {
     let answer = aterm_spec::derive::supervisor_question_answer_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == answer.name),
-        "the recommended path is enrolled in the registry"
-    );
     let text = aterm_spec::derive::supervisor_question_text_model();
     assert_eq!(text.name, "SupervisorQuestionText");
     assert!(text.consts.contains(&("Text", 1)), "{:?}", text.consts);
@@ -1313,20 +1302,6 @@ const DECLINE_INVARIANTS: [&str; 5] = [
     "NoKeyIntoTheComposer",
 ];
 
-/// THE DECLINE'S KEYSTROKES: with one keystroke in flight and a person's
-/// quiet, every key the supervisor writes meets the box as the read it was
-/// decided on showed it — proven; with the screen generation fence alone
-/// (`Buggy = 1`, the port as first shipped) a second Tab behind one not yet
-/// drawn shuts the input, and the reason typed after it lands on the closed
-/// Select, whose `1` chooses the allow — caught.
-#[test]
-fn the_decline_proves_and_catches_a_keystroke_that_meets_a_state_it_was_not_decided_on() {
-    aterm_spec::verify::prove_and_catch_scalar(
-        &aterm_spec::derive::supervisor_decline_keys_model(),
-        "supervisor decline: a keystroke meets the state it was decided on",
-    );
-}
-
 /// Non-vacuity, invariant by invariant: the fence alone refutes EACH of the
 /// five (a resent `↓` wraps onto `1. Yes` and the Tab behind it amends the
 /// allow; a resent Tab shuts the input under the reason, whose `1` chooses
@@ -1423,17 +1398,11 @@ fn the_decline_is_carried_out_and_a_keystroke_is_never_written_twice() {
 /// whatever the measure) is caught on both. And the first is no restatement
 /// of `Act`'s guard (the review of 2026-09-27): `Carry = 1` — the hold's
 /// clock carried across an episode's appearances, the guard untouched — is
-/// caught by it too. The machine stays enrolled in the spec-link registry,
-/// so the non-vacuity sweep keeps both invariants falsifiable.
+/// caught by it too, and the non-vacuity sweep keeps both invariants
+/// falsifiable.
 #[test]
 fn the_network_wall_proves_and_catches_typing_into_a_measured_outage() {
     let m = aterm_spec::derive::supervisor_network_wall_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == m.name),
-        "the network wall must stay enrolled in the spec-link registry"
-    );
     aterm_spec::verify::prove_and_catch_scalar(
         &m,
         "supervisor network wall: a measured outage typed into at most once a hold; at most \
@@ -1528,18 +1497,6 @@ fn the_network_wall_proves_and_catches_typing_into_a_measured_outage() {
 fn the_codex_rate_nudge_saves_the_work_and_comes_back() {
     let m = aterm_spec::derive::supervisor_codex_rate_nudge_model();
     let live = aterm_spec::derive::supervisor_codex_rate_nudge_liveness();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == m.name),
-        "the switch must stay enrolled in the spec-link registry"
-    );
-    assert!(
-        aterm_spec::xref::liveness_registry()
-            .iter()
-            .any(|(registered, l)| registered.name == m.name && l.name == live.name),
-        "its liveness claim must stay enrolled"
-    );
     aterm_spec::verify::prove_and_catch_scalar(
         &m,
         "codex rate nudge: no work while switched, no person's turn stopped, one wind-down per \
@@ -1748,12 +1705,6 @@ fn the_codex_rate_nudge_saves_the_work_and_comes_back() {
 fn a_taken_act_never_withholds_a_break_and_an_untaken_one_is_never_stacked_on() {
     use aterm_spec::{derive::supervisor_break_offer_model, interp, verify};
     let model = supervisor_break_offer_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name),
-        "the break-offer machine must stay enrolled in the spec-link registry"
-    );
     verify::prove_and_catch_scalar(&model, "supervisor break offer: taken, not judged");
 
     let walk = |m: &aterm_spec::derive::Model, path: &[&str]| {
@@ -1917,18 +1868,6 @@ fn the_rating_cards_0_is_written_only_where_it_lands_nowhere_else() {
 fn the_usage_wall_ends_and_never_types_before_its_reset() {
     let m = aterm_spec::derive::supervisor_usage_wall_model();
     let live = aterm_spec::derive::supervisor_usage_wall_liveness();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == m.name),
-        "the usage wall must stay enrolled in the spec-link registry"
-    );
-    assert!(
-        aterm_spec::xref::liveness_registry()
-            .iter()
-            .any(|(registered, l)| registered.name == m.name && l.name == live.name),
-        "its liveness claim must stay enrolled"
-    );
     aterm_spec::verify::prove_and_catch_scalar(
         &m,
         "usage wall: no first act before the tokens are back",
@@ -2101,6 +2040,46 @@ fn the_usage_wall_ends_and_never_types_before_its_reset() {
     assert!(
         !buggy.check_invariant("NoBlindAct", &misread),
         "{misread:?}"
+    );
+    // ANOTHER CONVERSATION RESUMED WHILE THE WALL SHOWS, its countdown armed
+    // (`ArmedConversationResumed`, W1 of ATERM-KI-1015-1): the vendor's own
+    // continuation of the older limit its history redraws is no word of this
+    // limit's — the wait stands to the reset; read as this limit's
+    // (`OtherLimitsContinuationRead`), the continuation went into the
+    // standing limit (measured on 2.1.300), caught by `NoBlindAct`. Not over
+    // background work (the countdown's screen reads busy there), and not at
+    // a wall whose notice already left (its countdown went with it).
+    let mut armed = m.init_state();
+    assert!(m.fire("WallAppears", &mut armed), "{armed:?}");
+    let mut busy = armed.clone();
+    assert!(m.fire("ArmedConversationResumed", &mut armed), "{armed:?}");
+    assert_eq!((armed["wall"], armed["other"]), (6, 2), "{armed:?}");
+    let mut misread = armed.clone();
+    assert!(!m.action_enabled("Act", &armed), "{armed:?}");
+    for _ in 0..3 {
+        assert!(m.fire("Tick", &mut armed), "{armed:?}");
+    }
+    assert!(m.action_enabled("Act", &armed), "at its reset: {armed:?}");
+    assert!(
+        buggy.fire("OtherLimitsContinuationRead", &mut misread),
+        "{misread:?}"
+    );
+    assert!(
+        !buggy.check_invariant("NoBlindAct", &misread),
+        "{misread:?}"
+    );
+    assert!(m.fire("BackgroundStarts", &mut busy), "{busy:?}");
+    assert!(
+        !m.action_enabled("ArmedConversationResumed", &busy),
+        "{busy:?}"
+    );
+    let mut left = m.init_state();
+    for a in ["WallAppears", "NoticeLeaves"] {
+        assert!(m.fire(a, &mut left), "{a} at {left:?}");
+    }
+    assert!(
+        !m.action_enabled("ArmedConversationResumed", &left),
+        "{left:?}"
     );
     let mut forgot = buggy.init_state();
     for a in [
@@ -2328,17 +2307,19 @@ fn the_usage_wall_ends_and_never_types_before_its_reset() {
         "LeftReadAsTurnEnd",
         "PersonTurnUnseen",
         "OtherLimitsTurnRead",
+        "OtherLimitsContinuationRead",
         "TakeWindowDropsWall",
         "RetryReadAsTaken",
         "UnreadLeftDropped",
         "UnreadAnswerReadAsTaken",
         "OlderLeftPlacedTomorrow",
         "MemoryLost",
+        "CreditsReadAsWall",
     ] {
         assert!(dead.contains(&d), "{d} is dead at Buggy = 0: {dead:?}");
     }
     assert_eq!(
-        aterm_spec::verify::audit_dead_negative_controls(&m, &dead),
+        aterm_spec::verify::audit_dead_negative_controls(std::slice::from_ref(&m)),
         Ok(dead.len()),
         "{dead:?}"
     );
@@ -2355,6 +2336,25 @@ fn the_usage_wall_ends_and_never_types_before_its_reset() {
     assert!(read.fire("OwnActTyped", &mut r));
     assert!(read.action_enabled("WallAppears", &r), "{r:?}");
     assert!(!read.action_enabled("WallAppearsLeft", &r), "{r:?}");
+
+    // USAGE CREDITS (accounts v2 S5): a turn they carry is no wall, and none
+    // appears while it runs; read as a spend wall it is caught by
+    // `NoWallOnCredits`.
+    let mut c = m.init_state();
+    assert!(m.fire("CreditsServes", &mut c), "{c:?}");
+    assert!(m.check_invariant("NoWallOnCredits", &c));
+    assert!(!m.action_enabled("WallAppears", &c), "{c:?}");
+    let mut spent = buggy.init_state();
+    for a in ["CreditsServes", "CreditsReadAsWall"] {
+        assert!(buggy.fire(a, &mut spent), "{a} at {spent:?}");
+    }
+    assert!(
+        !buggy.check_invariant("NoWallOnCredits", &spent),
+        "{spent:?}"
+    );
+    // The dial switched off takes its world away.
+    let no_credits = aterm_spec::interp::with_consts(&m, &[("Credits", 0)]);
+    assert!(!no_credits.action_enabled("CreditsServes", &no_credits.init_state()));
 }
 
 /// THE MODEL SWITCH (2026-09-22 to 09-27, 240 relaunches in five days): the
@@ -2370,18 +2370,6 @@ fn the_usage_wall_ends_and_never_types_before_its_reset() {
 fn the_model_switch_makes_the_fallback_and_returns_only_at_a_named_reset() {
     let m = aterm_spec::derive::supervisor_model_switch_model();
     let live = aterm_spec::derive::supervisor_model_switch_liveness();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == m.name),
-        "the switch must stay enrolled in the spec-link registry"
-    );
-    assert!(
-        aterm_spec::xref::liveness_registry()
-            .iter()
-            .any(|(registered, l)| registered.name == m.name && l.name == live.name),
-        "its liveness claim must stay enrolled"
-    );
     aterm_spec::verify::prove_and_catch_scalar(
         &m,
         "model switch: no return without a named reset, no ping-pong, no held point",
@@ -2481,8 +2469,8 @@ fn account_rotation_defect_breaks_only(
     s
 }
 
-/// The nine defects of the rotation, each with the one law it breaks.
-const ACCOUNT_ROTATION_DEFECTS: [(&str, &str); 9] = [
+/// The ten defects of the rotation, each with the one law it breaks.
+const ACCOUNT_ROTATION_DEFECTS: [(&str, &str); 10] = [
     ("RotatesIntoALimited", "NeverIntoALimitedAccount"),
     ("WallUnread", "NeverIntoALimitedAccount"),
     ("SharedFirst", "DedicatedBeforeShared"),
@@ -2492,6 +2480,7 @@ const ACCOUNT_ROTATION_DEFECTS: [(&str, &str); 9] = [
     ("MovesEarlyUnderAPin", "TheOwnersWordHolds"),
     ("RotatesPastTheBreaker", "NoPingPong"),
     ("WaitsAtTheLiftedWall", "NoWaitWhileOneIsUsable"),
+    ("CarriesOnAfterAnEarlyMove", "NothingTypedAfterAnEarlyMove"),
 ];
 
 /// ONE walk of `m`'s whole reachable space, going on past every violation:
@@ -2612,14 +2601,16 @@ fn account_rotation_goal(on: &'static str, jobs: bool, hold: bool) -> aterm_spec
 }
 
 /// ACCOUNT ROTATION (`docs/DESIGN-claude-accounts-2026-10-01.md` §6, §10): the
-/// seven laws prove at `Buggy = 0` — nobody is moved into a limited account, a
+/// eight laws prove at `Buggy = 0` — nobody is moved into a limited account, a
 /// dedicated account goes before the shared one and a fresh one before a low
 /// one, only an account that has served a response is followed, a session
 /// sleeps at its wall only for a reason the design names, the owner's pin
-/// holds, and the hour's rotations are bounded — and each of the nine defects
+/// holds, the hour's rotations are bounded, and a move made ahead of a wall
+/// types nothing of its own (v2 §3.5) — and each of the ten defects
 /// is caught at `Buggy = 1` (by its own law and no other, over its whole
 /// space: the test below). A session at the notice of a wall the owner lifted
-/// is continued there (`Resume…`). A session at its wall is moved once an account it
+/// is continued there (`Resume…`), and one moved at its wall gets that wall's
+/// resume (`Resumed…`). A session at its wall is moved once an account it
 /// could run on is usable, under the one fairness the claim names (the
 /// supervisor takes the advice and makes the move), broken alone by today's
 /// rule (the wall waited out); a canary that never answers holds it for the
@@ -2631,16 +2622,11 @@ fn account_rotation_goal(on: &'static str, jobs: bool, hold: bool) -> aterm_spec
 #[test]
 fn the_account_rotation_moves_one_session_alone_and_the_rest_once_it_is_served() {
     let m = aterm_spec::derive::supervisor_account_rotation_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == m.name),
-        "the rotation must stay enrolled in the spec-link registry"
-    );
     aterm_spec::verify::prove_and_catch_scalar(
         &m,
         "account rotation: never into a limited account, dedicated and fresh first, \
-         the herd waits for a served response, the pin holds, the hour is bounded",
+         the herd waits for a served response, the pin holds, the hour is bounded, \
+         nothing typed after an early move",
     );
     account_rotation_paths(&m);
 }
@@ -2651,12 +2637,6 @@ fn the_account_rotation_moves_one_session_alone_and_the_rest_once_it_is_served()
 fn the_account_rotation_moves_a_session_at_its_wall_once_an_account_is_usable() {
     let m = aterm_spec::derive::supervisor_account_rotation_model();
     let live = aterm_spec::derive::supervisor_account_rotation_liveness();
-    assert!(
-        aterm_spec::xref::liveness_registry()
-            .iter()
-            .any(|(registered, l)| registered.name == m.name && l.name == live.name),
-        "its liveness claim must stay enrolled"
-    );
     aterm_spec::verify::liveness_proves_and_catches_tiered(
         &m,
         &live,
@@ -3040,6 +3020,34 @@ fn account_rotation_paths(m: &aterm_spec::derive::Model) {
         "NoWaitWhileOneIsUsable",
     );
     assert_eq!((slept["w1"], slept["d1"]), (1, 0), "{slept:?}");
+
+    // WHAT IS TYPED AFTER A MOVE. Moved at its wall, a session gets that
+    // wall's resume, once; moved ahead of one — rule 4 off a low account, or
+    // a plain turn end on a limited one — nothing of the move's own.
+    let mut c = account_rotation_after(m, &["WallD1", "Move1"]);
+    assert_eq!((c["mv"], c["pw"], c["cx"]), (1, 1, 0), "{c:?}");
+    assert!(m.fire("Resumed1", &mut c));
+    assert!(!m.action_enabled("Resumed1", &c), "once: {c:?}");
+    assert!(m.fire("Served", &mut c));
+    assert_eq!((c["mv"], c["pw"], c["cx"]), (0, 0, 0), "{c:?}");
+    for early in [&["LowD1", "Move1"][..], &["WallD1", "Leave1"]] {
+        let c = account_rotation_after(m, early);
+        assert_eq!((c["mv"], c["pw"]), (1, 0), "{early:?}: {c:?}");
+        assert!(!m.action_enabled("Resumed1", &c), "{early:?}: {c:?}");
+        let typed = account_rotation_defect_breaks_only(
+            &buggy,
+            early,
+            "CarriesOnAfterAnEarlyMove",
+            "NothingTypedAfterAnEarlyMove",
+        );
+        assert_eq!(typed["cx"], 1, "{typed:?}");
+    }
+    // NEGATIVE CONTROL: after a move made at a wall the defect has no guard.
+    let c = account_rotation_after(&buggy, &["WallD1", "Move1"]);
+    assert!(
+        !buggy.action_enabled("CarriesOnAfterAnEarlyMove", &c),
+        "{c:?}"
+    );
 
     // THE BREAKER. Two rotations are the hour's; a third wall is waited out.
     let spent = [
@@ -3426,10 +3434,6 @@ fn the_box_ask_proves_and_catches_a_reask_on_a_redraw() {
     );
     let states = interp::bmc(&m).expect("the shipped machine proves");
     assert!(states > 1, "{states}");
-    assert!(
-        aterm_spec::verify::uncaught_invariants(&m).is_empty(),
-        "every invariant broken by Buggy = 1 alone"
-    );
     let mut space = interp::with_buggy(&m, 1);
     space.invariants.clear();
     interp::bmc(&space).expect("the Buggy = 1 space fits the interpreter");
@@ -3499,18 +3503,6 @@ fn the_usage_probe_writes_only_onto_its_own_panel_and_never_leaves_it_open() {
     use aterm_spec::{interp, verify};
     let m = aterm_spec::derive::supervisor_usage_probe_model();
     let live = aterm_spec::derive::supervisor_usage_probe_liveness();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == m.name),
-        "the usage probe must stay enrolled in the spec-link registry"
-    );
-    assert!(
-        aterm_spec::xref::liveness_registry()
-            .iter()
-            .any(|(registered, l)| registered.name == m.name && l.name == live.name),
-        "its liveness claim must stay enrolled"
-    );
     verify::prove_and_catch_scalar(
         &m,
         "usage probe: /usage and Escape only onto the harness's own panel, a sample only \
@@ -3524,11 +3516,10 @@ fn the_usage_probe_writes_only_onto_its_own_panel_and_never_leaves_it_open() {
     // Every defect is a negative control caught alone, and no law is a ghost.
     let dead: Vec<&str> = USAGE_PROBE_DEFECTS.iter().map(|(d, _)| *d).collect();
     assert_eq!(
-        verify::audit_dead_negative_controls(&m, &dead),
+        verify::audit_dead_negative_controls(std::slice::from_ref(&m)),
         Ok(dead.len()),
         "every defect is a negative control caught alone"
     );
-    assert_eq!(verify::uncaught_invariants(&m), Vec::<&str>::new());
 
     // The states the real loop refuses, one by one.
     let at = |set: &[(&'static str, i64)]| {
@@ -3882,21 +3873,6 @@ fn the_limit_reset_takes_one_row_a_wall_and_enters_only_its_own_exact_confirmati
     let m = aterm_spec::derive::supervisor_limit_reset_model();
     let ends = aterm_spec::derive::supervisor_limit_reset_claim_liveness();
     let closes = aterm_spec::derive::supervisor_limit_reset_confirmation_liveness();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == m.name),
-        "the limit reset must stay enrolled in the spec-link registry"
-    );
-    for live in [&ends, &closes] {
-        assert!(
-            aterm_spec::xref::liveness_registry()
-                .iter()
-                .any(|(registered, l)| registered.name == m.name && l.name == live.name),
-            "{} must stay enrolled",
-            live.name
-        );
-    }
     verify::prove_and_catch_scalar(
         &m,
         "limit reset: one row a wall, Enter only on the loop's own exact confirmation past \
@@ -3915,11 +3891,10 @@ fn the_limit_reset_takes_one_row_a_wall_and_enters_only_its_own_exact_confirmati
     // Every defect is a negative control caught alone, and no law is a ghost.
     let dead: Vec<&str> = LIMIT_RESET_DEFECTS.iter().map(|(d, _)| *d).collect();
     assert_eq!(
-        verify::audit_dead_negative_controls(&m, &dead),
+        verify::audit_dead_negative_controls(std::slice::from_ref(&m)),
         Ok(dead.len()),
         "every defect is a negative control caught alone"
     );
-    assert_eq!(verify::uncaught_invariants(&m), Vec::<&str>::new());
     // Each liveness claim is broken by its own mutant and not by the other's.
     for (live, other) in [
         (&ends, "StopsTryingItsEscape"),

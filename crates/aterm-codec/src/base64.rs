@@ -28,7 +28,9 @@ const STANDARD_DECODE: [u8; 256] = build_decode_table(STANDARD_ALPHABET);
 pub enum DecodeError {
     /// An invalid character was encountered at the given position.
     InvalidByte(usize, u8),
-    /// The input length is not valid for Base64 (not a multiple of 4 when padded).
+    /// The data length is one modulo four, or lenient input has more than two
+    /// padding bytes. The value is the length checked, after stripping at most
+    /// two trailing padding bytes in the lenient data-length check.
     InvalidLength(usize),
     /// The input exceeds [`crate::MAX_INPUT_LEN`] (DoS guard); value is the actual length.
     InputTooLarge(usize),

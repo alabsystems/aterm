@@ -47,10 +47,9 @@
 //!
 //! # What is NOT supported
 //!
-//! Nothing in TOML 1.0.0 is left out. The deliberate omissions are all TOML
-//! 1.1 *drafts* — the `\e` escape, unquoted trailing newlines in inline
-//! tables, seconds-optional times, and `\x` escapes — because 1.1 is not a
-//! released spec.
+//! This crate targets TOML 1.0.0. TOML 1.1 additions — the `\e` and `\x`
+//! escapes, newlines and trailing commas in inline tables, and times without
+//! seconds — are not supported.
 
 #![forbid(unsafe_code)]
 

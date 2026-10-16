@@ -12,9 +12,8 @@ use aterm_lexicon::Lexicon;
 
 use super::{bonk_sound_gain, drain_curse_bonk_cues};
 
-/// Resize quiet: a window inside [`crate::RESIZE_SOUND_QUIET`] of its last
-/// applied reflow mutes the sound seams (a TUI's resize repaint storm is not
-/// typing); a window that never resized is never quiet, and the mute expires.
+/// A window inside [`crate::RESIZE_SOUND_QUIET`] of its last reflow mutes the sound seams (a
+/// TUI's resize repaint storm is not typing); a never-resized window is never quiet.
 #[test]
 fn resize_quiets_the_sound_seams_and_expires() {
     let mut app = crate::App::headless_for_test();
@@ -38,11 +37,8 @@ fn resize_quiets_the_sound_seams_and_expires() {
     );
 }
 
-/// The drain seam end to end over a real typed-curse tick: an enabled
-/// drain emits exactly one namespaced `Words(Bonk)` gesture at the user
-/// volume; a MUTED drain drops the identical cue while still emptying the
-/// engine vec — no backlog may cross a later unmute (the trail-sound
-/// discipline verbatim).
+/// Over a real typed-curse tick, an enabled drain emits one `Words(Bonk)` at the user volume; a
+/// muted drain drops the same cue and still empties the engine's queue, so nothing backlogs.
 #[test]
 fn drain_maps_typed_cues_to_namespaced_bonk_and_never_backlogs() {
     let cfg = crate::app_config::Config::default()
@@ -66,9 +62,8 @@ fn drain_maps_typed_cues_to_namespaced_bonk_and_never_backlogs() {
     let typed_curse = |wd: &mut WordDecorations, now: Instant| {
         let mut term = Terminal::new(4, 32);
         term.process(b"fuck");
-        // Typed means a committed key, not just a caret parked one past the
-        // token — a scrolling build log leaves the caret there too, and this
-        // seam makes a SOUND. The engine's typed witness now demands both.
+        // Typed means a committed key, not just a caret one past the token (a scrolling build
+        // log leaves it there too); the engine's typed witness demands both.
         wd.note_typed_edit(now, None);
         wd.rescan(&term, 4, 32, &lex, &cfg, 1, now);
         tick(wd, now);
@@ -101,8 +96,7 @@ fn drain_maps_typed_cues_to_namespaced_bonk_and_never_backlogs() {
         "the clash register keys off the trail style"
     );
 
-    // Muted (knob off / unfocused / reduced ⇒ gain None): the same cue is
-    // dropped and the vec is emptied — nothing replays on unmute.
+    // Muted (gain None): the same cue is dropped and the queue emptied, so nothing replays.
     let mut wd2 = WordDecorations::default();
     typed_curse(&mut wd2, t0);
     let drained = drain_curse_bonk_cues(
@@ -131,11 +125,8 @@ fn drain_maps_typed_cues_to_namespaced_bonk_and_never_backlogs() {
     assert_eq!(drained, aterm_effects::sound_policy::CurseDrain::default());
 }
 
-/// Over a real typed curse, with the Curse bonk knob on, the window focused,
-/// full motion and volume up (asserted first), flipping only `trail_sounds`
-/// (the "Music effects" setting) takes the sound off and leaves the
-/// on-screen wince unchanged. Routed through the real [`bonk_sound_gain`]
-/// and [`drain_curse_bonk_cues`], so a missing argument shows.
+/// Flipping only `trail_sounds` (the "Music effects" setting) silences a real typed curse and
+/// leaves the wince unchanged, through the real [`bonk_sound_gain`] and [`drain_curse_bonk_cues`].
 #[test]
 fn music_effects_off_drops_a_real_typed_curse_but_keeps_the_wince() {
     let cfg = crate::app_config::Config::default()

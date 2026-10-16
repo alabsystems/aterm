@@ -5,14 +5,10 @@ use crate::App;
 use crate::app_config::{LaunchFont, successor_font_px};
 use crate::session_store::SessionHandoff;
 
-/// A Retina window auto-scaled to 24 px and zoomed to 26 px (Cmd-=, as
-/// `set_font_px` makes it) is handed over: the window carry names the zoom and the
-/// Cmd-0 size, the pair crosses the manifest's TOML, and the successor (config:
-/// unpinned 12 px) comes up at 26 px, pinned, with Cmd-0 returning to 24 px. The
-/// next handoff carries it on; a reset one carries nothing. An unzoomed window
-/// writes no key (an older build's wire), and an older producer's carry keeps the
-/// config's font. Negative controls: a pair with a half missing or out of bounds
-/// is ignored whole.
+/// A Retina window auto-scaled to 24 px and zoomed to 26 px (Cmd-=) hands over the zoom and
+/// the Cmd-0 size: the successor (config: unpinned 12 px) comes up at 26 px, pinned, with
+/// Cmd-0 returning to 24 px, and carries it on. An unzoomed window writes no key, and an older
+/// producer's carry keeps the config's font.
 #[test]
 fn a_zoomed_font_crosses_the_handoff() {
     let mut parent = App::headless_for_test();
@@ -141,12 +137,10 @@ fn a_zoomed_font_crosses_the_handoff() {
     );
 }
 
-/// The zoomed window crosses the handoff whole: a window sized to its grid is
-/// zoomed in, re-gridding inside the same window. The successor's window 0 is
-/// attached at the parent's raw inner size, holding exactly the carried grid, so
-/// zooming back out fits the pre-zoom grid and window. Negative controls: an older
-/// carry (no size) and a size that is not a remainder of this grid both size the
-/// exact frame.
+/// The successor's window 0 attaches at the parent's raw inner size, holding exactly the
+/// carried zoomed grid, so zooming back out fits the pre-zoom grid and window. Negative
+/// controls: an older carry (no size) and a size that is not a remainder of this grid both get
+/// the exact frame.
 #[test]
 fn a_zoom_out_after_a_handoff_restores_the_window_it_zoomed_in() {
     use crate::WindowId;
@@ -233,12 +227,9 @@ fn a_zoom_out_after_a_handoff_restores_the_window_it_zoomed_in() {
     }
 }
 
-/// Every window crosses the handoff whole: two windows of different sizes, each
-/// exactly its grid, are zoomed in. The layout carries window 1's raw size in its
-/// row across the sidecar's TOML, and the successor recreates window 1 from that
-/// row at its own grid and its parent's size, so zooming out fits window 1's
-/// former grid and window. A drag inside one cell during the boot changes the
-/// row's size but not the Commit's topology, which still sees the grid.
+/// Every window crosses whole: the layout row carries window 1's raw size across the
+/// sidecar's TOML, so the successor recreates it at its parent's size and zooming out fits the
+/// former grid. A drag inside one cell changes the row's size but not the Commit's topology.
 #[test]
 fn a_zoom_out_after_a_handoff_restores_every_window_it_zoomed_in() {
     use crate::WindowId;
@@ -294,8 +285,8 @@ fn a_zoom_out_after_a_handoff_restores_every_window_it_zoomed_in() {
     assert_eq!(layout, pending, "the size round-trips the wire");
     assert_eq!((layout.windows[1].rows, layout.windows[1].cols), zoomed);
 
-    // THE SUCCESSOR: the carried font; window 0, the bootstrap, at its
-    // carried grid; window 1 created from its row.
+    // The successor: the carried font; window 0, the bootstrap, at its carried grid; window 1
+    // created from its row.
     let carry = parent.handoff_window_carry(0).expect("the window carry");
     let mut successor = App::headless_for_test();
     let launch = successor_font_px(base, false, Some(&carry));

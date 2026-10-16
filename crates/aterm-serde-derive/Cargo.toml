@@ -1,0 +1,43 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0 AND (MIT OR Apache-2.0)
+#
+# The code this derive generates, and the decisions it makes about each
+# attribute, are derived from the upstream `serde_derive` crate, version
+# 1.0.228 (https://github.com/serde-rs/serde, by Erick Tryzelaar and David
+# Tolnay, dual-licensed MIT OR Apache-2.0). See `LICENSE-MIT` and
+# `LICENSE-APACHE` in this directory for the upstream licenses. Each derived
+# file names the upstream file it came from. The parsing underneath is
+# aterm's own (crates/aterm-macro-support), on std `proc_macro` alone.
+#
+# docs/AUDIT-third-party-2026-10-15.md, SP.5 (serde-procmacro ruling, step 5):
+# `#[derive(Serialize, Deserialize)]` for aterm-serde, implementing exactly the
+# `#[serde(...)]` keys, positions and forms
+# docs/measured/third-party-2026-10-15/serde-attrs.tsv lists. Any other key is
+# a compile error.
+
+[package]
+name = "aterm-serde-derive"
+description = "#[derive(Serialize, Deserialize)] for aterm-serde, on std proc_macro: aterm's closed set of #[serde] attributes. Derived from serde_derive 1.0.228; MIT OR Apache-2.0 upstream."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "Apache-2.0 AND (MIT OR Apache-2.0)"
+
+[lib]
+proc-macro = true
+path = "src/lib.rs"
+
+[dependencies]
+aterm-macro-support = { workspace = true }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+# The doctests derive against aterm-serde, as a dependent would. A dev-dependency
+# cycle (aterm-serde's `derive` feature depends on this crate), which Cargo
+# permits because dev-dependencies never enter the normal build graph. A path,
+# not `workspace = true`: the workspace has no `aterm-serde` row; its `serde`
+# row (SP.6) names this crate under the name `serde`.
+aterm-serde = { path = "../aterm-serde" }

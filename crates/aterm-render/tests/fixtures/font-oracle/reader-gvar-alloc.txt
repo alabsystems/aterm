@@ -1,0 +1,161 @@
+# The font oracle's reader answers (TF.1 format, docs/AUDIT-third-party-2026-10-15.md)
+# for the faces past 32 `gvar` tuples (GVAR_ALLOC_FACES in
+# crates/aterm-render/tests/font_oracle/corpus.rs): ttf-parser 0.25.1 built
+# with `gvar-alloc`, as aterm's Linux build ships it, recorded on macOS by
+# crates/aterm-render/tests/font_oracle/recorder (`gvar-alloc` mode). Without
+# that feature (aterm's macOS, Windows and wasm builds) such a glyph has no
+# outline at any instance. aterm-font answers these on every platform
+# (TF.3; crates/aterm-font/tests/reader_oracle.rs replays them).
+# Same line format and digests as reader.txt; instances: none set, every axis
+# at its minimum, every axis at its maximum, and wght 700 alone.
+read	ADTNumeric	04fd78bd767609c6#2	-	-	bbox	-	n=309 fnv=4dbb93443c9795ae
+read	ADTNumeric	04fd78bd767609c6#2	-	-	cmap.index	-	probed=422 mapped=202 fnv=6230380a53e3cfa9
+read	ADTNumeric	04fd78bd767609c6#2	-	-	cmap.sub0	-	p=Windows e=1 f=4 unicode=1 n=202 fnv=bad1ff25ffc73fdf
+read	ADTNumeric	04fd78bd767609c6#2	-	-	cmap.vs	-	n=0 fnv=cbf29ce484222325
+read	ADTNumeric	04fd78bd767609c6#2	-	-	coords	-	0,0,0,0
+read	ADTNumeric	04fd78bd767609c6#2	-	-	fvar	-	wdth:30.0,100.0,150.0 wght:1.0,400.0,1000.0 SOFT:0.0,70.0,100.0 GRAD:400.0,400.0,1000.0
+read	ADTNumeric	04fd78bd767609c6#2	-	-	gdef	-	classes=0 fnv=a5c2f942e5646d77
+read	ADTNumeric	04fd78bd767609c6#2	-	-	gpos	-	scripts=DFLT,arab,dev2,deva features=3 tags=dist,kern lookups=3 fv=0 fnv=fa493c330ba81f9f
+read	ADTNumeric	04fd78bd767609c6#2	-	-	gsub	-	scripts=DFLT,arab,dev2,deva features=24 tags=aalt,c2sc,calt,cv01,cv02,cv03,cv04,cv08,cv09,cv20,cv21,cv22,cv23,cv24,cv25,locl,smcp,ss01,ss02,ss03,ss06,ss10,tnum lookups=41 fv=0 fnv=91e28bf08ff6c9b9
+read	ADTNumeric	04fd78bd767609c6#2	-	-	gsub.lookups	-	lookups=41 kinds=1:38,3:1,6:2 unparsed=0 fnv=5f7a9ec05f03482e
+read	ADTNumeric	04fd78bd767609c6#2	-	-	head	-	upem=2048 glyphs=311 bbox=-338,-616,2320,1950 variable=1 faces=12 italic_angle=0.0 mono=0 tables=GDEF,GPOS,GSUB,HVAR,MVAR,OS/2,STAT,VVAR,cmap,fvar,glyf,gvar,head,hhea,hmtx,loca,maxp,meta,name,post,vhea,vmtx
+read	ADTNumeric	04fd78bd767609c6#2	-	-	hmtx	-	n=311 fnv=cca3106539d1172d
+read	ADTNumeric	04fd78bd767609c6#2	-	-	metrics	-	asc=1950 desc=-494 gap=0 height=2444 typo=1950,-494,0 vert=1024,-1024,2048,2048 x=1054 cap=1443 ul=-250,120 st=632,120 sub=1331,1228,0,153 sup=1331,1228,0,716
+read	ADTNumeric	04fd78bd767609c6#2	-	-	name	-	n=1154 fnv=868af0205721e25e family=.SF\u{20}Soft\u{20}Numeric
+read	ADTNumeric	04fd78bd767609c6#2	-	-	os2	-	weight=400 width=5 style=Normal bold=0 italic=0 oblique=0 regular=1 perm=Editable subset=1 outline_embed=1 ranges=00000000000000000000000000000000
+read	ADTNumeric	04fd78bd767609c6#2	-	-	outline.0	-	n=309 fnv=e54b239f3ce13e4f
+read	ADTNumeric	04fd78bd767609c6#2	-	-	vmtx	-	n=311 fnv=7fd524bf8e838643
+read	ADTNumeric	04fd78bd767609c6#2	wdth=150.0,wght=1000.0,SOFT=100.0,GRAD=1000.0	-	bbox	-	n=309 fnv=760a7f0cefe71ccd
+read	ADTNumeric	04fd78bd767609c6#2	wdth=150.0,wght=1000.0,SOFT=100.0,GRAD=1000.0	-	coords	-	16384,16384,16384,16384
+read	ADTNumeric	04fd78bd767609c6#2	wdth=150.0,wght=1000.0,SOFT=100.0,GRAD=1000.0	-	hmtx	-	n=311 fnv=a667d695fc927cff
+read	ADTNumeric	04fd78bd767609c6#2	wdth=150.0,wght=1000.0,SOFT=100.0,GRAD=1000.0	-	metrics	-	asc=1950 desc=-494 gap=0 height=2444 typo=1950,-494,0 vert=1024,-1024,2048,2048 x=1095 cap=1443 ul=-250,120 st=657,120 sub=1331,1228,0,153 sup=1331,1228,0,716
+read	ADTNumeric	04fd78bd767609c6#2	wdth=150.0,wght=1000.0,SOFT=100.0,GRAD=1000.0	-	outline.0	-	n=309 fnv=e2f19d08d55d4c42
+read	ADTNumeric	04fd78bd767609c6#2	wdth=150.0,wght=1000.0,SOFT=100.0,GRAD=1000.0	-	vmtx	-	n=311 fnv=7fd524bf8e838643
+read	ADTNumeric	04fd78bd767609c6#2	wdth=30.0,wght=1.0,SOFT=0.0,GRAD=400.0	-	bbox	-	n=309 fnv=1c2873f9c8c028c6
+read	ADTNumeric	04fd78bd767609c6#2	wdth=30.0,wght=1.0,SOFT=0.0,GRAD=400.0	-	coords	-	-16384,-16384,-16384,0
+read	ADTNumeric	04fd78bd767609c6#2	wdth=30.0,wght=1.0,SOFT=0.0,GRAD=400.0	-	hmtx	-	n=311 fnv=66300b341fb7c2fb
+read	ADTNumeric	04fd78bd767609c6#2	wdth=30.0,wght=1.0,SOFT=0.0,GRAD=400.0	-	metrics	-	asc=1950 desc=-494 gap=0 height=2444 typo=1950,-494,14 vert=1024,-1024,2048,2048 x=1040 cap=1443 ul=-75,120 st=624,50 sub=1331,1228,0,153 sup=1331,1228,0,716
+read	ADTNumeric	04fd78bd767609c6#2	wdth=30.0,wght=1.0,SOFT=0.0,GRAD=400.0	-	outline.0	-	n=309 fnv=0de9ed7b67da2565
+read	ADTNumeric	04fd78bd767609c6#2	wdth=30.0,wght=1.0,SOFT=0.0,GRAD=400.0	-	vmtx	-	n=311 fnv=7fd524bf8e838643
+read	ADTNumeric	04fd78bd767609c6#2	wght=700.0	-	bbox	-	n=309 fnv=da6bea5ca527a71e
+read	ADTNumeric	04fd78bd767609c6#2	wght=700.0	-	coords	-	0,8192,0,0
+read	ADTNumeric	04fd78bd767609c6#2	wght=700.0	-	hmtx	-	n=311 fnv=6a5e3b1586d07046
+read	ADTNumeric	04fd78bd767609c6#2	wght=700.0	-	metrics	-	asc=1950 desc=-494 gap=0 height=2444 typo=1950,-494,0 vert=1024,-1024,2048,2048 x=1079 cap=1443 ul=-250,120 st=647,120 sub=1331,1228,0,153 sup=1331,1228,0,716
+read	ADTNumeric	04fd78bd767609c6#2	wght=700.0	-	outline.0	-	n=309 fnv=c7813bf0adfed90c
+read	ADTNumeric	04fd78bd767609c6#2	wght=700.0	-	vmtx	-	n=311 fnv=7fd524bf8e838643
+read	ADTNumeric	04fd78bd767609c6#3	-	-	bbox	-	n=53 fnv=d3a70eb1ce8ff87d
+read	ADTNumeric	04fd78bd767609c6#3	-	-	cmap.index	-	probed=299 mapped=44 fnv=7ada0bcf9fcace3c
+read	ADTNumeric	04fd78bd767609c6#3	-	-	cmap.sub0	-	p=Windows e=1 f=4 unicode=1 n=44 fnv=0c1db71663f98690
+read	ADTNumeric	04fd78bd767609c6#3	-	-	cmap.vs	-	n=0 fnv=cbf29ce484222325
+read	ADTNumeric	04fd78bd767609c6#3	-	-	coords	-	0,0,0,0
+read	ADTNumeric	04fd78bd767609c6#3	-	-	fvar	-	HGHT:100.0,100.0,500.0 wdth:60.0,100.0,100.0 wght:1.0,400.0,1000.0 SOFT:0.0,70.0,100.0
+read	ADTNumeric	04fd78bd767609c6#3	-	-	gdef	-	classes=0 fnv=ac86b72e566c2177
+read	ADTNumeric	04fd78bd767609c6#3	-	-	gpos	-	scripts=DFLT,arab,dev2,deva features=3 tags=dist,kern lookups=3 fv=0 fnv=3d7ad93bb3b2ac2c
+read	ADTNumeric	04fd78bd767609c6#3	-	-	gsub	-	scripts=DFLT,arab,dev2,deva features=6 tags=aalt,calt,cv04,cv20,locl lookups=14 fv=0 fnv=b520573c1744ccd8
+read	ADTNumeric	04fd78bd767609c6#3	-	-	gsub.lookups	-	lookups=14 kinds=1:11,3:1,6:6 unparsed=0 fnv=d9ffba603bebbff1
+read	ADTNumeric	04fd78bd767609c6#3	-	-	head	-	upem=2048 glyphs=55 bbox=4,-494,1948,1950 variable=1 faces=12 italic_angle=0.0 mono=0 tables=GDEF,GPOS,GSUB,HVAR,MVAR,OS/2,STAT,VVAR,cmap,fvar,glyf,gvar,head,hhea,hmtx,loca,maxp,meta,name,post,vhea,vmtx
+read	ADTNumeric	04fd78bd767609c6#3	-	-	hmtx	-	n=55 fnv=1072ea39c40d2a4a
+read	ADTNumeric	04fd78bd767609c6#3	-	-	metrics	-	asc=1950 desc=-494 gap=0 height=2444 typo=1950,-494,0 vert=1024,-1024,2048,2048 x=1054 cap=1443 ul=-250,120 st=632,120 sub=1331,1228,0,153 sup=1331,1228,0,716
+read	ADTNumeric	04fd78bd767609c6#3	-	-	name	-	n=81 fnv=17f5dab913491d3c family=.SF\u{20}Adaptive\u{20}Soft\u{20}Numeric
+read	ADTNumeric	04fd78bd767609c6#3	-	-	os2	-	weight=400 width=5 style=Normal bold=0 italic=0 oblique=0 regular=1 perm=Editable subset=1 outline_embed=1 ranges=00000000000000000000000000000000
+read	ADTNumeric	04fd78bd767609c6#3	-	-	outline.0	-	n=53 fnv=8005571df36cba55
+read	ADTNumeric	04fd78bd767609c6#3	-	-	vmtx	-	n=55 fnv=a52ff01e20847b54
+read	ADTNumeric	04fd78bd767609c6#3	HGHT=100.0,wdth=60.0,wght=1.0,SOFT=0.0	-	bbox	-	n=53 fnv=a57232b25de9496f
+read	ADTNumeric	04fd78bd767609c6#3	HGHT=100.0,wdth=60.0,wght=1.0,SOFT=0.0	-	coords	-	0,-16384,-16384,-16384
+read	ADTNumeric	04fd78bd767609c6#3	HGHT=100.0,wdth=60.0,wght=1.0,SOFT=0.0	-	hmtx	-	n=55 fnv=7426187d2d8caa12
+read	ADTNumeric	04fd78bd767609c6#3	HGHT=100.0,wdth=60.0,wght=1.0,SOFT=0.0	-	metrics	-	asc=1950 desc=-494 gap=14 height=2444 typo=1950,-494,14 vert=1024,-1024,2048,2048 x=1040 cap=1443 ul=-75,120 st=624,50 sub=1331,1228,0,153 sup=1331,1228,0,716
+read	ADTNumeric	04fd78bd767609c6#3	HGHT=100.0,wdth=60.0,wght=1.0,SOFT=0.0	-	outline.0	-	n=53 fnv=28f2cc112eb30733
+read	ADTNumeric	04fd78bd767609c6#3	HGHT=100.0,wdth=60.0,wght=1.0,SOFT=0.0	-	vmtx	-	n=55 fnv=e5f8d248ab9c5b98
+read	ADTNumeric	04fd78bd767609c6#3	HGHT=500.0,wdth=100.0,wght=1000.0,SOFT=100.0	-	bbox	-	n=53 fnv=646bc18ebcaa2696
+read	ADTNumeric	04fd78bd767609c6#3	HGHT=500.0,wdth=100.0,wght=1000.0,SOFT=100.0	-	coords	-	16384,0,16384,16384
+read	ADTNumeric	04fd78bd767609c6#3	HGHT=500.0,wdth=100.0,wght=1000.0,SOFT=100.0	-	hmtx	-	n=55 fnv=c0f5f68767d1f52c
+read	ADTNumeric	04fd78bd767609c6#3	HGHT=500.0,wdth=100.0,wght=1000.0,SOFT=100.0	-	metrics	-	asc=1950 desc=-6200 gap=0 height=8150 typo=1950,-6200,0 vert=1024,-1024,2048,2048 x=1054 cap=1443 ul=-250,120 st=663,120 sub=1331,1228,0,153 sup=1331,1228,0,716
+read	ADTNumeric	04fd78bd767609c6#3	HGHT=500.0,wdth=100.0,wght=1000.0,SOFT=100.0	-	outline.0	-	n=53 fnv=9dfd63daaba6d42c
+read	ADTNumeric	04fd78bd767609c6#3	HGHT=500.0,wdth=100.0,wght=1000.0,SOFT=100.0	-	vmtx	-	n=55 fnv=a52ff01e20847b54
+read	ADTNumeric	04fd78bd767609c6#3	wght=700.0	-	bbox	-	n=53 fnv=d086366d03dd0385
+read	ADTNumeric	04fd78bd767609c6#3	wght=700.0	-	coords	-	0,0,8192,0
+read	ADTNumeric	04fd78bd767609c6#3	wght=700.0	-	hmtx	-	n=55 fnv=a83fcafb7c7c969d
+read	ADTNumeric	04fd78bd767609c6#3	wght=700.0	-	metrics	-	asc=1950 desc=-494 gap=0 height=2444 typo=1950,-494,0 vert=1024,-1024,2048,2048 x=1079 cap=1443 ul=-250,120 st=647,120 sub=1331,1228,0,153 sup=1331,1228,0,716
+read	ADTNumeric	04fd78bd767609c6#3	wght=700.0	-	outline.0	-	n=53 fnv=74fcad633980e931
+read	ADTNumeric	04fd78bd767609c6#3	wght=700.0	-	vmtx	-	n=55 fnv=a52ff01e20847b54
+read	ADTNumeric	04fd78bd767609c6#7	-	-	bbox	-	n=78 fnv=1210b8b81040aed7
+read	ADTNumeric	04fd78bd767609c6#7	-	-	cmap.index	-	probed=321 mapped=73 fnv=3c7534439eede8a8
+read	ADTNumeric	04fd78bd767609c6#7	-	-	cmap.sub0	-	p=Windows e=1 f=4 unicode=1 n=73 fnv=bec0b8c9255d4a09
+read	ADTNumeric	04fd78bd767609c6#7	-	-	cmap.vs	-	n=0 fnv=cbf29ce484222325
+read	ADTNumeric	04fd78bd767609c6#7	-	-	coords	-	0,0,0,0
+read	ADTNumeric	04fd78bd767609c6#7	-	-	fvar	-	opsz:12.0,50.0,200.0 wght:300.0,300.0,1000.0 wdth:30.0,100.0,100.0 SOFT:0.0,70.0,100.0
+read	ADTNumeric	04fd78bd767609c6#7	-	-	gdef	-	classes=0 fnv=2c1b93daafb34265
+read	ADTNumeric	04fd78bd767609c6#7	-	-	gpos	-	scripts=DFLT,arab,dev2,deva features=3 tags=dist,kern lookups=3 fv=0 fnv=29923700067a8714
+read	ADTNumeric	04fd78bd767609c6#7	-	-	gsub	-	scripts=DFLT,arab,dev2 features=5 tags=aalt,calt,cv04,locl,ss03 lookups=8 fv=0 fnv=756100ae23cbd383
+read	ADTNumeric	04fd78bd767609c6#7	-	-	gsub.lookups	-	lookups=8 kinds=1:6,3:1,6:3 unparsed=0 fnv=3e03ab3e82cffd81
+read	ADTNumeric	04fd78bd767609c6#7	-	-	head	-	upem=2048 glyphs=80 bbox=-32,-494,1891,1950 variable=1 faces=12 italic_angle=0.0 mono=0 tables=GDEF,GPOS,GSUB,HVAR,MVAR,OS/2,STAT,VVAR,cmap,fvar,glyf,gvar,head,hhea,hmtx,loca,maxp,meta,name,post,vhea,vmtx
+read	ADTNumeric	04fd78bd767609c6#7	-	-	hmtx	-	n=80 fnv=74023801173f9f33
+read	ADTNumeric	04fd78bd767609c6#7	-	-	metrics	-	asc=1950 desc=-494 gap=0 height=2444 typo=1950,-494,0 vert=1024,-1024,2048,2048 x=998 cap=1444 ul=-270,24 st=599,24 sub=1331,1229,0,154 sup=1331,1229,0,717
+read	ADTNumeric	04fd78bd767609c6#7	-	-	name	-	n=151 fnv=bfed2019fa2253b6 family=.New\u{20}York\u{20}Soft\u{20}Numeric
+read	ADTNumeric	04fd78bd767609c6#7	-	-	os2	-	weight=300 width=5 style=Normal bold=0 italic=0 oblique=0 regular=1 perm=Editable subset=1 outline_embed=1 ranges=0000000000010400000000400000a003
+read	ADTNumeric	04fd78bd767609c6#7	-	-	outline.0	-	n=78 fnv=c1f190c00ccb05fd
+read	ADTNumeric	04fd78bd767609c6#7	-	-	vmtx	-	n=80 fnv=78ff0b4ef1a7cab3
+read	ADTNumeric	04fd78bd767609c6#7	opsz=12.0,wght=300.0,wdth=30.0,SOFT=0.0	-	bbox	-	n=78 fnv=2d2891634716b16c
+read	ADTNumeric	04fd78bd767609c6#7	opsz=12.0,wght=300.0,wdth=30.0,SOFT=0.0	-	coords	-	-16384,0,-16384,-16384
+read	ADTNumeric	04fd78bd767609c6#7	opsz=12.0,wght=300.0,wdth=30.0,SOFT=0.0	-	hmtx	-	n=80 fnv=4f4b92aa557fafb3
+read	ADTNumeric	04fd78bd767609c6#7	opsz=12.0,wght=300.0,wdth=30.0,SOFT=0.0	-	metrics	-	asc=1950 desc=-494 gap=0 height=2444 typo=1950,-494,0 vert=1024,-1024,2048,2048 x=998 cap=1444 ul=-270,24 st=599,24 sub=1331,1229,0,154 sup=1331,1229,0,717
+read	ADTNumeric	04fd78bd767609c6#7	opsz=12.0,wght=300.0,wdth=30.0,SOFT=0.0	-	outline.0	-	n=78 fnv=7234538a6cdbe54d
+read	ADTNumeric	04fd78bd767609c6#7	opsz=12.0,wght=300.0,wdth=30.0,SOFT=0.0	-	vmtx	-	n=80 fnv=78ff0b4ef1a7cab3
+read	ADTNumeric	04fd78bd767609c6#7	opsz=200.0,wght=1000.0,wdth=100.0,SOFT=100.0	-	bbox	-	n=78 fnv=b402e9d28e0a4c93
+read	ADTNumeric	04fd78bd767609c6#7	opsz=200.0,wght=1000.0,wdth=100.0,SOFT=100.0	-	coords	-	16384,16384,0,16384
+read	ADTNumeric	04fd78bd767609c6#7	opsz=200.0,wght=1000.0,wdth=100.0,SOFT=100.0	-	hmtx	-	n=80 fnv=92921253caab60a2
+read	ADTNumeric	04fd78bd767609c6#7	opsz=200.0,wght=1000.0,wdth=100.0,SOFT=100.0	-	metrics	-	asc=1950 desc=-494 gap=0 height=2444 typo=1950,-494,0 vert=1024,-1024,2048,2048 x=1012 cap=1444 ul=-254,60 st=607,60 sub=1331,1229,0,154 sup=1331,1229,0,717
+read	ADTNumeric	04fd78bd767609c6#7	opsz=200.0,wght=1000.0,wdth=100.0,SOFT=100.0	-	outline.0	-	n=78 fnv=e901afb9d8978ce1
+read	ADTNumeric	04fd78bd767609c6#7	opsz=200.0,wght=1000.0,wdth=100.0,SOFT=100.0	-	vmtx	-	n=80 fnv=78ff0b4ef1a7cab3
+read	ADTNumeric	04fd78bd767609c6#7	wght=700.0	-	bbox	-	n=78 fnv=e6870a0980b3e766
+read	ADTNumeric	04fd78bd767609c6#7	wght=700.0	-	coords	-	0,9362,0,0
+read	ADTNumeric	04fd78bd767609c6#7	wght=700.0	-	hmtx	-	n=80 fnv=b38fd79f24e70818
+read	ADTNumeric	04fd78bd767609c6#7	wght=700.0	-	metrics	-	asc=1950 desc=-494 gap=0 height=2444 typo=1950,-494,0 vert=1024,-1024,2048,2048 x=1027 cap=1444 ul=-236,99 st=616,99 sub=1331,1229,0,154 sup=1331,1229,0,717
+read	ADTNumeric	04fd78bd767609c6#7	wght=700.0	-	outline.0	-	n=78 fnv=cef585a233386ca6
+read	ADTNumeric	04fd78bd767609c6#7	wght=700.0	-	vmtx	-	n=80 fnv=78ff0b4ef1a7cab3
+read	SFNS	2f7e3871468bf56b#0	-	-	bbox	-	n=2934 fnv=39b1c367e7fd5691
+read	SFNS	2f7e3871468bf56b#0	-	-	cmap.index	-	probed=1757 mapped=1686 fnv=b19e6cfa76f134d8
+read	SFNS	2f7e3871468bf56b#0	-	-	cmap.sub0	-	p=Unicode e=3 f=4 unicode=1 n=1603 fnv=524e6ae936c7ff18
+read	SFNS	2f7e3871468bf56b#0	-	-	cmap.sub1	-	p=Unicode e=4 f=12 unicode=1 n=1686 fnv=e964f8a4922d57c1
+read	SFNS	2f7e3871468bf56b#0	-	-	cmap.sub2	-	p=Windows e=1 f=4 unicode=1 n=1603 fnv=524e6ae936c7ff18
+read	SFNS	2f7e3871468bf56b#0	-	-	cmap.sub3	-	p=Windows e=10 f=12 unicode=1 n=1686 fnv=e964f8a4922d57c1
+read	SFNS	2f7e3871468bf56b#0	-	-	cmap.vs	-	n=0 fnv=cbf29ce484222325
+read	SFNS	2f7e3871468bf56b#0	-	-	coords	-	0,0,0,0
+read	SFNS	2f7e3871468bf56b#0	-	-	fvar	-	wdth:30.0,100.0,150.0 opsz:17.0,28.0,96.0 GRAD:400.0,400.0,1000.0 wght:1.0,400.0,1000.0
+read	SFNS	2f7e3871468bf56b#0	-	-	gdef	-	classes=0 fnv=3df7b8f03e9067ad
+read	SFNS	2f7e3871468bf56b#0	-	-	gpos	-	scripts=DFLT,cyrl,grek,latn features=2 tags=kern,ss09 lookups=5 fv=0 fnv=fb86122be1a9e5bd
+read	SFNS	2f7e3871468bf56b#0	-	-	gsub	-	scripts=DFLT,cyrl,grek,latn features=46 tags=THEX,appl,c2sc,calt,case,ccmp,cv01,cv02,cv03,cv04,cv05,cv06,cv07,cv08,cv09,cv10,cv11,cv12,cv13,dnom,frac,liga,locl,numr,ordn,pnum,rlig,rtlm,smcp,ss01,ss02,ss03,ss04,ss06,ss07,ss09,subs,sups,tnum lookups=67 fv=0 fnv=4ad1f49aeca53be7
+read	SFNS	2f7e3871468bf56b#0	-	-	gsub.lookups	-	lookups=67 kinds=1:49,2:3,4:7,6:13 unparsed=0 fnv=7f9d36c1246a92d3
+read	SFNS	2f7e3871468bf56b#0	-	-	head	-	upem=2048 glyphs=2954 bbox=-1322,-564,5050,1960 variable=1 faces=- italic_angle=0.0 mono=0 tables=GDEF,GPOS,GSUB,HVAR,MERG,MVAR,OS/2,STAT,avar,cmap,fvar,glyf,gvar,head,hhea,hmtx,loca,maxp,meta,name,post,trak
+read	SFNS	2f7e3871468bf56b#0	-	-	hmtx	-	n=2954 fnv=553c9ce0db191237
+read	SFNS	2f7e3871468bf56b#0	-	-	metrics	-	asc=1980 desc=-432 gap=0 height=2412 typo=1980,-432,0 vert=-,-,-,- x=1040 cap=1443 ul=-310,120 st=620,120 sub=650,600,0,75 sup=650,600,0,350
+read	SFNS	2f7e3871468bf56b#0	-	-	name	-	long fnv=004d0f5c70f1bb6d len=1380
+read	SFNS	2f7e3871468bf56b#0	-	-	os2	-	weight=400 width=5 style=Normal bold=0 italic=0 oblique=0 regular=1 perm=Installable subset=1 outline_embed=1 ranges=00000000040080205201ecffe10002ff
+read	SFNS	2f7e3871468bf56b#0	-	-	outline.0	-	n=1006 fnv=0dc4e2afe3687702
+read	SFNS	2f7e3871468bf56b#0	-	-	outline.1024	-	n=1024 fnv=12b6538e1535764e
+read	SFNS	2f7e3871468bf56b#0	-	-	outline.2048	-	n=904 fnv=e9ffae8a693e6787
+read	SFNS	2f7e3871468bf56b#0	-	-	vmtx	-	n=2954 fnv=70815ed519b3d341
+read	SFNS	2f7e3871468bf56b#0	wdth=150.0,opsz=96.0,GRAD=1000.0,wght=1000.0	-	bbox	-	n=2934 fnv=c63dca4c7bad3dbb
+read	SFNS	2f7e3871468bf56b#0	wdth=150.0,opsz=96.0,GRAD=1000.0,wght=1000.0	-	coords	-	16384,16384,16384,16384
+read	SFNS	2f7e3871468bf56b#0	wdth=150.0,opsz=96.0,GRAD=1000.0,wght=1000.0	-	hmtx	-	n=2954 fnv=38f888fae03af84c
+read	SFNS	2f7e3871468bf56b#0	wdth=150.0,opsz=96.0,GRAD=1000.0,wght=1000.0	-	metrics	-	asc=1980 desc=-432 gap=0 height=2412 typo=1980,-432,0 vert=-,-,-,- x=1091 cap=1443 ul=-262,232 st=684,232 sub=650,600,0,75 sup=650,600,0,350
+read	SFNS	2f7e3871468bf56b#0	wdth=150.0,opsz=96.0,GRAD=1000.0,wght=1000.0	-	outline.0	-	n=1006 fnv=1abbfdeb0c363514
+read	SFNS	2f7e3871468bf56b#0	wdth=150.0,opsz=96.0,GRAD=1000.0,wght=1000.0	-	outline.1024	-	n=1024 fnv=d04d75c730f1181c
+read	SFNS	2f7e3871468bf56b#0	wdth=150.0,opsz=96.0,GRAD=1000.0,wght=1000.0	-	outline.2048	-	n=904 fnv=0b28638f8d719451
+read	SFNS	2f7e3871468bf56b#0	wdth=150.0,opsz=96.0,GRAD=1000.0,wght=1000.0	-	vmtx	-	n=2954 fnv=70815ed519b3d341
+read	SFNS	2f7e3871468bf56b#0	wdth=30.0,opsz=17.0,GRAD=400.0,wght=1.0	-	bbox	-	n=2934 fnv=001aa14d7a0ff519
+read	SFNS	2f7e3871468bf56b#0	wdth=30.0,opsz=17.0,GRAD=400.0,wght=1.0	-	coords	-	-16384,-16384,0,-16384
+read	SFNS	2f7e3871468bf56b#0	wdth=30.0,opsz=17.0,GRAD=400.0,wght=1.0	-	hmtx	-	n=2954 fnv=2437e8928d22d9f5
+read	SFNS	2f7e3871468bf56b#0	wdth=30.0,opsz=17.0,GRAD=400.0,wght=1.0	-	metrics	-	asc=1980 desc=-432 gap=0 height=2412 typo=1980,-432,0 vert=-,-,-,- x=1076 cap=1443 ul=-250,260 st=700,260 sub=650,600,0,75 sup=650,600,0,350
+read	SFNS	2f7e3871468bf56b#0	wdth=30.0,opsz=17.0,GRAD=400.0,wght=1.0	-	outline.0	-	n=1006 fnv=ab7edfc6587a9770
+read	SFNS	2f7e3871468bf56b#0	wdth=30.0,opsz=17.0,GRAD=400.0,wght=1.0	-	outline.1024	-	n=1024 fnv=5b277020a9b28a66
+read	SFNS	2f7e3871468bf56b#0	wdth=30.0,opsz=17.0,GRAD=400.0,wght=1.0	-	outline.2048	-	n=904 fnv=d2b7b657b78b8ac1
+read	SFNS	2f7e3871468bf56b#0	wdth=30.0,opsz=17.0,GRAD=400.0,wght=1.0	-	vmtx	-	n=2954 fnv=70815ed519b3d341
+read	SFNS	2f7e3871468bf56b#0	wght=700.0	-	bbox	-	n=2934 fnv=30dc360c859dd4b1
+read	SFNS	2f7e3871468bf56b#0	wght=700.0	-	coords	-	0,0,0,8192
+read	SFNS	2f7e3871468bf56b#0	wght=700.0	-	hmtx	-	n=2954 fnv=790a2ae013a06e83
+read	SFNS	2f7e3871468bf56b#0	wght=700.0	-	metrics	-	asc=1980 desc=-432 gap=0 height=2412 typo=1980,-432,0 vert=-,-,-,- x=1072 cap=1443 ul=-280,190 st=660,190 sub=650,600,0,75 sup=650,600,0,350
+read	SFNS	2f7e3871468bf56b#0	wght=700.0	-	outline.0	-	n=1006 fnv=647293c7317a31c7
+read	SFNS	2f7e3871468bf56b#0	wght=700.0	-	outline.1024	-	n=1024 fnv=27594a18394bf92a
+read	SFNS	2f7e3871468bf56b#0	wght=700.0	-	outline.2048	-	n=904 fnv=730d437095c038c8
+read	SFNS	2f7e3871468bf56b#0	wght=700.0	-	vmtx	-	n=2954 fnv=70815ed519b3d341

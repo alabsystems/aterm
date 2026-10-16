@@ -12,16 +12,17 @@ use super::super::relaunch::{
 use super::super::upgrade::Dialect;
 use super::*;
 use crate::supervise::ScratchDir;
-// Every child these tests start is the product's kind: its stdio and nothing
-// else of this process. A `std::process::Command` child under a std without
-// SP-1 (which Trust seals from `62f89f11` on have, and no other std) holds
-// every descriptor open here without close-on-exec at its spawn, and on
-// Darwin that is any other test thread's pipe between its `pipe()` and its
-// `F_SETFD`: a stand-in that lives (a bash in its `read`, a parked agent) held
-// a `ps` child's stdout that way, and `ps()`'s read for its end waited as long
-// as the stand-in lived — one test's stand-in, another test's wait.
+// Every child these tests start holds its stdio and nothing else of this process: on Darwin a
+// child that inherits another test thread's pipe (open between its `pipe()` and `F_SETFD`)
+// keeps that pipe's reader waiting as long as the child lives.
 use aterm_uds::spawnfd::Command;
 use std::time::{Duration, Instant, UNIX_EPOCH};
+
+/// Where a test plants `session`'s record by hand: the record module keeps its
+/// own path private, so the one writer is the only shipped way to it.
+fn state_path(opts: &Opts, session: &str) -> std::path::PathBuf {
+    state_dir(opts).join(format!("{session}.json"))
+}
 
 /// A `text --json trim tail=3` reply from a busy Claude Code tab: the cursor
 /// row is absolute (57) and `first` is where the reply's rows start, so the
@@ -44,7 +45,7 @@ fn a_screen_reply_is_read_with_the_cursor_made_relative_to_its_rows() {
     assert_eq!(s.seq, 232_803);
     assert_eq!(s.first, 57, "the screen row `cell` addresses rows[0] by");
     assert!(upgrade::composer_is_empty(&s.rows, s.cursor, false));
-    // A cursor ABOVE the reply's first row is no cursor, not row 0.
+    // A cursor above the reply's first row is no cursor, not row 0.
     let above = SCREEN.replace(r#""row":57"#, r#""row":12"#);
     assert_eq!(parse_screen(&above).expect("parses").cursor, None);
     assert!(parse_screen("not json").is_none());
@@ -64,12 +65,9 @@ fn a_screen_reply_is_read_with_the_cursor_made_relative_to_its_rows() {
     assert_eq!(with("\"12\""), HumanInput::Unknown);
 }
 
-/// The busy footer the upgrade's gate waits on is the live zone's
-/// (`aterm_phase::busy_zone_start`): a dead process's `esc to interrupt`
-/// footer above a new launch card (after `/exit` and a fresh `claude` with no
-/// `clear`) does not hold the gate at `busy`. The new session's own footer,
-/// with the dead one above it, still counts; and a read too short to hold the
-/// frame (a `tail=3` of a busy tab) is read whole.
+/// The upgrade's gate reads the live zone's busy footer (`aterm_phase::busy_zone_start`): a dead
+/// process's `esc to interrupt` above a new launch card does not hold it at busy, the new
+/// session's own footer does, and a read too short for the frame is read whole.
 #[test]
 fn the_gate_reads_the_live_footer_not_a_dead_processs() {
     use aterm_phase::prompt::fixtures as f;
@@ -80,6 +78,39 @@ fn the_gate_reads_the_live_footer_not_a_dead_processs() {
     assert!(busy_footer(&f::screen(f::EXIT_RELAUNCH_STALE_FOOTER_BUSY)));
     let tail = parse_screen(SCREEN).expect("the measured reply parses");
     assert!(busy_footer(&tail.rows));
+}
+
+/// A proven self-claim (`supervisor_proven=1`) is its agent's session: no
+/// upgrade decision of aterm's ([`due`], [`step`]). NEGATIVE CONTROLS: an
+/// unproven claim of the same spelling, an older server with no field, and
+/// an `ERR` are none.
+#[test]
+fn a_proven_self_claim_is_read_off_status_and_nothing_else_is() {
+    let proven =
+        "OK schema=1 sid=0 supervisor=codex-alab%40500 supervisor_proven=1 autopilot=cruise";
+    assert!(self_claimed_by_status(proven));
+    assert!(!self_claimed_by_status(
+        &proven.replace("supervisor_proven=1", "supervisor_proven=0")
+    ));
+    assert!(!self_claimed_by_status(
+        "OK schema=1 sid=0 supervisor=codex-alab%40500 autopilot=cruise"
+    ));
+    assert!(!self_claimed_by_status("ERR supervisor_proven=1"));
+    assert!(!self_claimed_by_status("OKAY supervisor_proven=1"));
+    assert!(!self_claimed_by_status("OKsuffix supervisor_proven=1"));
+    assert!(!self_claimed_by_status("OK detail=supervisor_proven%3D1"));
+    assert_eq!(SKIP_SELF_CLAIMED, "skip:self-claimed");
+    assert!(
+        !Report {
+            pid: 0,
+            tab: "s-x".to_string(),
+            session: "-".to_string(),
+            from: "-".to_string(),
+            to: "-".to_string(),
+            step: SKIP_SELF_CLAIMED.to_string(),
+        }
+        .is_act()
+    );
 }
 
 /// A person at the keyboard wins: a tab a person typed into within
@@ -107,13 +138,10 @@ fn a_tab_is_held_by_a_halt_a_hand_a_person_or_an_unreadable_status() {
     );
 }
 
-/// The harness's own hand on a tab whose agent it restarts ([`Hand`]:
-/// `hand=lease:aterm-harness@<this pid>`) holds nothing against itself (its
-/// last looks, the relaunch line and its supervisor loops read on), while
-/// another holder's lease, a named driver's turn, and input its program has
-/// not read yet (a first prompt on its way, which a signal would drop; a
-/// shell's queued lines) hold the tab. Negative controls: another process's
-/// harness hand is someone else's, and `input=clear`/`-` holds nothing.
+/// The harness's own hand (`hand=lease:aterm-harness@<this pid>`) holds nothing against
+/// itself; another holder's lease, a driver's turn, and input its program has not read yet (a
+/// signal would drop it) hold the tab. Negative controls: another process's harness hand is
+/// someone else's, and `input=clear`/`-` holds nothing.
 #[test]
 fn the_harness_own_hand_holds_nothing_against_it_and_unread_input_holds_the_tab() {
     let ours = STATUS.replace("hand=-", &format!("hand=lease:{}", hand_name()));
@@ -150,6 +178,7 @@ fn who_roster_exposes_a_unique_foreground_group_without_a_window_hop() {
     assert_eq!(unique_tab_for_group(&tabs, 101), Some("s-a"));
     assert_eq!(parse_host_roster("OK 0", ""), Some(Vec::new()));
     assert_eq!(parse_host_roster("ERR busy", body), None);
+    assert_eq!(parse_host_roster("OKAY", body), None);
     assert_eq!(
         parse_host_roster("OK 2", &body.replace("s-b", "s-a")),
         None,
@@ -165,10 +194,8 @@ fn who_roster_exposes_a_unique_foreground_group_without_a_window_hop() {
     assert_eq!(unique_tab_for_group(&ambiguous, 101), None);
 }
 
-/// A Codex worker whose managed build is already current still has a
-/// foreground Codex: Claude's session directory has no bearing on its answer.
-/// The unknown/Claude arm is the negative control: it must keep the roster
-/// read, including when a Codex process could not be identified reliably.
+/// A conclusive Codex answer scans no Claude session file. Negative control: no answer (an
+/// unknown or Claude foreground) still reads Claude's roster.
 #[test]
 fn codex_due_answers_do_not_scan_claude_sessions() {
     let dir = scratch("codex-due-skips-claude-roster");
@@ -212,15 +239,86 @@ fn codex_due_answers_do_not_scan_claude_sessions() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A build that did not answer decides nothing. The tab's Claude Code runs
-/// 1.0.0, and the managed twin's `--version` timed out: the version cache
-/// ([`cached_version_with`]) holds it unanswered until its back-off,
-/// [`Targets`] carries that, and the look is [`UNREAD_VERSION`] (the host
-/// looks again on its unread ladder), never "not due". Asked again before the
-/// back-off, it says the same and probes nothing. Negative controls: once the
-/// build answers, it decides (`No` for a session on it, `Yes` for one behind
-/// it); and a record of another tab's agent is no record of this one's
-/// ([`UNREAD_RECORD`]), whatever the cache holds.
+/// A tab whose agent's own switch is off is never due, and its restart in flight is no pass's
+/// ([`Opts::agents_off`], [`lane_on`]): the host is never told a step is due that [`lanes`]
+/// then leaves alone, and its carry after an update never steps an off agent's restart. A Codex
+/// answer is dropped while Codex is off; the Claude half reads no session record while Claude
+/// Code is off. Negative controls: the other agent's switch off, or none, answers as usual.
+#[test]
+fn a_tab_whose_agents_switch_is_off_is_never_due() {
+    use aterm_phase::Program;
+    use upgrade::Agent::{Claude, Codex};
+    let dir = scratch("due-agent-off");
+    let base = Opts {
+        only_sid: Some(TAB.to_string()),
+        ..drive(&dir)
+    };
+    let off = |program: Program| Opts {
+        agents_off: vec![program],
+        ..base.clone()
+    };
+    let tabs = [LiveTab {
+        sid: TAB.to_string(),
+        fgpgid: Some(4_000_002),
+    }];
+    let check = |opts: &Opts, codex: Option<Due>| {
+        SESSION_FILE_SCANS.with(|count| count.set(0));
+        let due = due_after_codex(opts, &tabs, codex);
+        (due, SESSION_FILE_SCANS.with(std::cell::Cell::get))
+    };
+    // A Codex behind leads the tab.
+    assert_eq!(check(&off(Program::Codex), Some(Due::Yes)), (Due::No, 0));
+    assert_eq!(
+        check(&off(Program::Claude), Some(Due::Yes)),
+        (Due::Yes, 0),
+        "control: Claude Code's switch is no Codex's"
+    );
+    // No Codex leads it: the tab is Claude Code's half to read.
+    assert_eq!(check(&off(Program::Claude), None), (Due::No, 0));
+    assert_eq!(
+        check(&off(Program::Codex), None),
+        (Due::No, 1),
+        "control: Claude Code's roster is read"
+    );
+
+    // This tab's restart in flight, Claude Code's and then Codex's.
+    std::fs::create_dir_all(state_dir(&base)).expect("state");
+    for (agent, name, own, other) in [
+        (Claude, SESSION.to_string(), Program::Claude, Program::Codex),
+        (
+            Codex,
+            format!("codex-{TAB}"),
+            Program::Codex,
+            Program::Claude,
+        ),
+    ] {
+        let st = St {
+            agent,
+            phase: Phase::Exiting { at_s: now_s() },
+            pid: dead_pid(),
+            shell: std::process::id(),
+            tab: TAB.to_string(),
+            ..St::default()
+        };
+        std::fs::write(state_path(&base, &name), st.to_json()).expect("write");
+        assert!(in_flight(&off(own)).is_empty(), "{agent:?}");
+        assert_eq!(
+            due(&off(own)),
+            Due::Unread(UNREAD_SOCKET),
+            "{agent:?}: the restart is no answer; the roster decides"
+        );
+        assert_eq!(in_flight(&off(other)), [name.as_str()], "{agent:?}");
+        assert_eq!(due(&off(other)), Due::Yes, "control: {agent:?}");
+        assert_eq!(due(&base), Due::Yes, "control: {agent:?}");
+        std::fs::remove_file(state_path(&base, &name)).expect("rm");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A build whose `--version` timed out decides nothing: the version cache
+/// ([`cached_version_with`]) holds it unanswered until its back-off, probing nothing before
+/// then, and the look is [`UNREAD_VERSION`], never "not due". Negative controls: once answered
+/// it decides (`No` on it, `Yes` behind it); another tab's agent's record is [`UNREAD_RECORD`].
 #[test]
 fn a_build_whose_version_timed_out_is_unread_never_not_due() {
     let dir = scratch("due-unanswered");
@@ -317,11 +415,9 @@ fn every_phase_survives_the_state_file() {
             confirm_by: 1_790_000_120,
             resumed_on: "2.1.282".to_string(),
             resumed_pid: 9163,
-            // The move's instant, kept through Done for the finished move's
-            // record (audit 2026-10-09).
+            // The move's instant, kept through Done for the finished record.
             relaunched_at: 1_790_000_090,
-            // The command block its line was typed into, by which its end
-            // is read (review of 2026-10-09).
+            // The command block its line was typed into, by which its end is read.
             line_block: Some(12),
             hold_since_s: 1_790_000_060,
             hold_seen_s: 1_790_000_120,
@@ -342,20 +438,33 @@ fn every_phase_survives_the_state_file() {
         assert_eq!(St::from_json(&st.to_json()), Some(st));
     }
     assert_eq!(St::from_json(r#"{"phase":"sideways"}"#), None);
-    // An upgrade's record an older build wrote, with no cause at all, reads
-    // as the upgrade's.
+    // A record with no cause (an older build's) reads as the upgrade's.
     let old = r#"{"phase":"relaunched","at":7}"#;
     assert_eq!(St::from_json(old).map(|s| s.cause), Some(String::new()));
-    // Nor any `relaunched_at` (review of 2026-10-09): a move in flight across
-    // the window's update takes its phase's stamp as the move's instant, so
-    // its finished record still says when it moved. NEGATIVE CONTROL: a Done
-    // record of that build lost it with the phase and keeps none, and a
-    // written `0` is read as written.
+    // With no `relaunched_at` either, a move in flight takes its phase's stamp
+    // as the move's instant; a Done record keeps none, and a written `0` reads
+    // as written.
     assert_eq!(St::from_json(old).map(|s| s.relaunched_at), Some(7));
     let done = r#"{"phase":"done","at":0}"#;
     assert_eq!(St::from_json(done).map(|s| s.relaunched_at), Some(0));
     let written = r#"{"phase":"relaunched","at":7,"relaunched_at":0}"#;
     assert_eq!(St::from_json(written).map(|s| s.relaunched_at), Some(0));
+}
+
+/// The record's agent word: none (an older record) or Claude's own name is Claude Code's; a
+/// word this build has no lane for, or a value that is no word, is a newer build's record and
+/// no record here. Negative control: Codex's word reads as Codex's.
+#[test]
+fn a_record_names_its_agent_or_is_no_record() {
+    let agent =
+        |word: &str| St::from_json(&format!(r#"{{"phase":"pending"{word}}}"#)).map(|st| st.agent);
+    assert_eq!(agent(""), Some(upgrade::Agent::Claude));
+    assert_eq!(agent(r#","agent":"""#), Some(upgrade::Agent::Claude));
+    assert_eq!(agent(r#","agent":"claude""#), Some(upgrade::Agent::Claude));
+    assert_eq!(agent(r#","agent":"codex""#), Some(upgrade::Agent::Codex));
+    assert_eq!(agent(r#","agent":"gemini""#), None);
+    assert_eq!(agent(r#","agent":"Codex""#), None);
+    assert_eq!(agent(r#","agent":7"#), None);
 }
 
 /// One reader for both writers: a state written without the view fields (no
@@ -417,19 +526,11 @@ fn ps_rows(rows: &[(u32, u32, &str)]) -> Vec<(u32, u32, String)> {
         .collect()
 }
 
-/// Claude Code's own keep-awake is not work. Claude Code starts `caffeinate -i
-/// -t 300` as its own child at every turn and stops it some 30 s after the turn
-/// ends; counted as background work, it would hold every restart well past the
-/// READY answer. The tree is one `ps` read at a READY answer (Claude 4163 under
-/// the tab's zsh, its caffeinate 8931): nothing there is work, and the restart
-/// goes.
-///
-/// Negative controls, each still holding the restart: a `caffeinate` a Bash
-/// tool started (under the tool's shell); the python a Bash tool left running
-/// under the agent beside Claude's own keep-awake (only the keep-awake is let
-/// go, not every direct child); a shell Claude's keep-awake itself runs (the
-/// walk goes on below it); and a caffeinate some helper of the agent's
-/// started, which is not the agent's own.
+/// Claude Code's own keep-awake is not work: it starts `caffeinate -i -t 300` as its own child
+/// every turn and stops it some 30 s after, so counting it would hold every restart past the
+/// READY answer. Negative controls, each holding the restart: a `caffeinate` under a Bash
+/// tool's shell; a Bash tool's python beside the keep-awake (only the keep-awake is let go); a
+/// shell the keep-awake runs; a caffeinate an agent's helper started.
 #[test]
 fn the_agents_own_keep_awake_does_not_hold_the_restart() {
     let idle = Facts {
@@ -494,10 +595,8 @@ fn the_agents_own_keep_awake_does_not_hold_the_restart() {
     assert_eq!(gate, upgrade::Gate::Wait("background"));
 }
 
-/// The processes the notice names: two background poll loops under a Claude
-/// Code, as `ps` prints them. The notice quotes the `eval` payload and drops
-/// the Bash tool's boilerplate. Their pids come from the same walk as the
-/// gate's.
+/// The notice names what runs under the agent by its `eval` payload, without the Bash tool's
+/// boilerplate; its pids come from the gate's walk.
 #[test]
 fn the_notice_names_what_runs_under_the_agent_by_its_command() {
     let measured = "/bin/zsh -c source /Users//u/.claude/shell-snapshots/snapshot-zsh-1790024225604-061jsy.sh \
@@ -535,10 +634,8 @@ fn the_notice_names_what_runs_under_the_agent_by_its_command() {
     assert_eq!(parse_etime("soon"), None);
     assert_eq!(parse_etime("1:2:3:4"), None);
 
-    // The give-up's ledger row quotes the same list (a closer in the Bash
-    // tool's wrapper above). Its `grep -m1` is what makes the `tail -f` a wait
-    // that can never end, and the row keeps it past the 119-character path
-    // ahead of it.
+    // The give-up's ledger row quotes the same heads, keeping the `grep -m1`
+    // (what makes the `tail -f` endless) past the long path ahead of it.
     let closer = "/bin/zsh -c source /Users//u/.claude/shell-snapshots/snapshot-zsh-1790024225604-061jsy.sh \
         2>/dev/null || true && eval 'D=/Users//person/.claude/projects/-Users-person/\
         00000000-0000-4000-8000-000000000001/subagents/workflows/wf_examplerun-1; tail -f -n +1 \
@@ -562,9 +659,8 @@ fn the_notice_names_what_runs_under_the_agent_by_its_command() {
             && row.ends_with("echo \"closer finished\""),
         "{row}"
     );
-    // The row says the release is OWED, never that it was typed — the
-    // `released:` row that follows says that. The Codex lane types none,
-    // and its row promises none.
+    // The row says the release is owed, not typed (the `released:` row says
+    // that); the Codex lane types none and promises none.
     let claude = gave_up_words(upgrade::Agent::Claude, &[], false);
     assert!(
         claude.contains("owes the agent the line that releases it")
@@ -602,10 +698,8 @@ fn the_notice_names_what_runs_under_the_agent_by_its_command() {
     assert_eq!(background(74315, &t).len(), 2);
 }
 
-/// The restart's last look fails closed: a process table `ps` could not give
-/// is empty, and over an empty table the walk answers "nothing runs", which
-/// would let the irreversible act pass on no evidence. An empty table reads
-/// as work.
+/// The restart's last look fails closed: an empty process table (`ps` gave none) reads as work,
+/// never as "nothing runs".
 #[test]
 fn an_unreadable_process_table_is_never_read_as_nothing_running() {
     assert_eq!(
@@ -712,9 +806,8 @@ fn host_filters_foreign_groups_before_expensive_process_reads() {
     );
 }
 
-/// The one-minute host tick should pay no `ps` or argv cost for a current
-/// Claude, yet a newer native/managed build or an interrupted restart must
-/// still reach the ownership proofs before any possible act.
+/// A current Claude costs the host tick no `ps` or argv read; a newer build or a restart in
+/// flight still reaches the ownership proofs.
 #[test]
 fn current_claude_skips_process_inspection_but_new_and_in_flight_do_not() {
     let mut file = SessionFile {
@@ -821,7 +914,7 @@ fn a_dead_owners_leftover_session_file_does_not_strand_the_restart() {
             .collect::<Vec<_>>()
     };
     assert_eq!(steps(&[file(dead, "gone")]), ["would-resume:exiting"]);
-    // CONTROL: this test's own live process holding the conversation.
+    // Control: this test's own live process holding the conversation.
     let me = std::process::id();
     let start = kernel_start(me).expect("our own start");
     assert!(steps(&[file(me, &start)]).is_empty(), "`visit` has it");
@@ -832,7 +925,7 @@ fn a_dead_owners_leftover_session_file_does_not_strand_the_restart() {
 fn a_restart_left_between_exit_and_relaunch_is_resumed_by_the_next_sweep() {
     let dir = scratch("orphan");
     std::fs::create_dir_all(dir.join("home/.claude/sessions")).expect("home");
-    // A pid that WAS a process and is not one now.
+    // A pid that was a process and is not one now.
     let dead = dead_pid();
     let opts = Opts {
         sock: None,
@@ -871,17 +964,68 @@ fn a_restart_left_between_exit_and_relaunch_is_resumed_by_the_next_sweep() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A sweep leaves out the lane of an agent whose own switch is off ([`Opts::agents_off`],
+/// [`lanes`]): that lane's pass never runs, and the other agent's runs as usual. Negative
+/// control: with nothing off both lanes run, the Codex lane first and the Claude lane's
+/// reports before its.
+#[test]
+fn a_sweep_leaves_out_the_lane_of_an_agent_whose_switch_is_off() {
+    use aterm_phase::Program;
+    use upgrade::Agent::{Claude, Codex};
+    let dir = scratch("lanes-off");
+    let base = drive(&dir);
+    let ran = std::cell::RefCell::new(Vec::new());
+    let pass = |agent: upgrade::Agent| {
+        ran.borrow_mut().push(agent);
+        vec![Report {
+            pid: 0,
+            tab: "-".to_string(),
+            session: agent.product().to_string(),
+            from: "-".to_string(),
+            to: "-".to_string(),
+            step: "current".to_string(),
+        }]
+    };
+    let swept = |agents_off: Vec<Program>| {
+        ran.borrow_mut().clear();
+        let opts = Opts {
+            agents_off,
+            ..base.clone()
+        };
+        let reports = lanes(&opts, None, &pass);
+        let said: Vec<String> = reports.into_iter().map(|r| r.session).collect();
+        (ran.borrow().clone(), said)
+    };
+    assert_eq!(
+        swept(Vec::new()),
+        (
+            vec![Codex, Claude],
+            vec!["Claude Code".into(), "Codex".into()]
+        )
+    );
+    assert_eq!(
+        swept(vec![Program::Claude]),
+        (vec![Codex], vec!["Codex".into()])
+    );
+    assert_eq!(
+        swept(vec![Program::Codex]),
+        (vec![Claude], vec!["Claude Code".into()])
+    );
+    assert_eq!(
+        swept(vec![Program::Claude, Program::Codex]),
+        (Vec::new(), Vec::new())
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn scratch(name: &str) -> ScratchDir {
     ScratchDir::new("upgrade", name)
 }
 
-/// THE HOME'S MODEL CACHES ARE NOT READ WHILE TWO OR MORE ACCOUNTS ARE LISTED
-/// ([`Opts::several_logins`], [`model_evidence`]; the accounts design §9 row
-/// 2): the home keeps one profile, and its served catalog, its access cache
-/// and its announcements are whichever login started last — so under several
-/// logins the evidence is the UNKNOWN, and a model that cache denies is
-/// denied by nothing the upgrade reads. NEGATIVE CONTROL: with one login the
-/// same files are read as ever — the denial, the catalog, the announcement.
+/// The home's model caches are not read while two or more accounts are listed
+/// ([`Opts::several_logins`]): the home's one profile, catalog, access cache and announcements
+/// are whichever login started last, so the evidence is unknown. Negative control: with one
+/// login the same files are read.
 #[test]
 fn the_homes_model_caches_are_not_read_under_several_logins() {
     let dir = scratch("model-evidence-logins");
@@ -931,11 +1075,9 @@ fn the_homes_model_caches_are_not_read_under_several_logins() {
         models::Evidence::default(),
         "nothing of the home's"
     );
-    // What the sweeps judge by is that evidence ([`models_report`] reads it
-    // as every sweep does; what it says of the BUILD's own catalog depends
-    // on the Claude Code this machine has installed, and is not asserted):
-    // with one login a model's verdict is the cache's denial or the served
-    // catalog's; under several, neither is read, so neither is said.
+    // [`models_report`] judges by the same evidence (what it says of the
+    // installed build's catalog is not asserted): one login cites the denial and
+    // the served catalog, several cite neither.
     let served = models_report(&one);
     assert!(
         served.contains("served catalog") && served.contains("modelAccessCache entitled:false"),
@@ -962,11 +1104,8 @@ fn a_second_sweeper_does_nothing_while_the_first_holds_the_lock() {
     assert_eq!(got.len(), 1, "{got:?}");
     assert_eq!(got[0].step, "busy:another-sweep");
     assert!(!got[0].is_act());
-    // Released by `LOCK_UN` (the guard's drop), so the very next sweep runs. A
-    // child another test thread spawns at this instant shares the lock's open
-    // file description until its exec, so a lock released by close alone
-    // could read held after the drop; `LOCK_UN` strips it from the description
-    // itself, copies and all.
+    // Released by `LOCK_UN` (the guard's drop), so the very next sweep runs
+    // (see `a_dropped_sweep_lock_is_free_while_a_copy_of_its_descriptor_lives`).
     drop(first);
     let after = sweep(&opts);
     assert!(
@@ -1115,7 +1254,7 @@ fn a_launch_that_cannot_be_carried_is_refused_before_the_agent_is_asked_to_wind_
     assert_eq!(st.phase, Phase::Pending);
     assert!(!state_dir(&dry).exists());
 
-    // Negative control: an everyday launch IS announced, once, through the same
+    // Negative control: an everyday launch is announced, once, through the same
     // path — so the refusals above are the plan's, not a notice that never types.
     let got = announce(
         &opts,
@@ -1138,13 +1277,9 @@ fn a_launch_that_cannot_be_carried_is_refused_before_the_agent_is_asked_to_wind_
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The drain's bound, end to end over the real state: an answered
-/// announcement whose restart a box nobody answers has held past
-/// [`upgrade::DRAIN_S`] is voided by the sweep's own arm. The READY answer
-/// still in the transcript no longer counts ([`answered`], whose pre-void
-/// answer is the negative control), the ledger says why, the phase keeps its
-/// asks, and the reducer asks again at the next idle point instead of
-/// restarting on the stale answer. A dry run says it and changes nothing.
+/// The drain's bound over the real state: an answered announcement a box nobody answers has
+/// held past [`upgrade::DRAIN_S`] is voided. The READY answer no longer counts, the ledger says
+/// why, the phase keeps its asks, and the next idle point asks again. A dry run changes nothing.
 #[test]
 fn a_drain_a_person_holds_past_its_bound_voids_the_answer_and_asks_again() {
     let dir = scratch("drain-bound");
@@ -1243,10 +1378,9 @@ fn a_drain_a_person_holds_past_its_bound_voids_the_answer_and_asks_again() {
         "{said}"
     );
     let _ = std::fs::remove_dir_all(&codex_dir);
-    // The person clears the box: the stale answer does not end the agent, and
-    // no notice follows on the heels of the void: the release goes first
-    // ([`upgrade::gate_release`]), and the next notice `REASK_S` after the
-    // void (the box, while it stands, is only a wait for either).
+    // Once the box clears, the stale answer does not end the agent: the release
+    // goes first ([`upgrade::gate_release`]) and the next notice waits `REASK_S`
+    // after the void; while the box stands, both wait.
     let ready = answered(&st, Some(&tail));
     assert_eq!(
         upgrade::next_step(&st.phase, &idle, ready, expiry + 60),
@@ -1268,13 +1402,10 @@ fn a_drain_a_person_holds_past_its_bound_voids_the_answer_and_asks_again() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A sweep lock is free the moment its guard drops, whatever copies of its
-/// descriptor live on. `copy` stands in for a child another thread is
-/// mid-spawning, which holds every descriptor until its exec: a lock released
-/// by close alone would stay held and the next sweep would read
-/// `busy:another-sweep`. A regression of [`SweepLock`] to a bare `File` fails
-/// the assertion after the release. Negative control first: a lock a sweep
-/// holds refuses.
+/// A sweep lock is free the moment its guard drops, whatever copies of its descriptor live on:
+/// `copy` stands in for a child mid-spawn on another thread, which holds every descriptor until
+/// its exec, so a lock released by close alone would read `busy:another-sweep`. Negative control
+/// first: a held lock refuses.
 #[test]
 fn a_dropped_sweep_lock_is_free_while_a_copy_of_its_descriptor_lives() {
     let dir = scratch("lock-window");
@@ -1349,17 +1480,15 @@ const SESSION: &str = "0badf00d-1111-2222-3333-444455556666";
 /// restarted afresh, never announced to, and is carried on with nothing).
 const ASKED: &str = r#"{"type":"user","message":{"role":"user","content":"fix the bug"}}"#;
 
-/// The stand-in agent's argv: THIS test binary, running only [`park_when_asked`].
+/// The stand-in agent's argv: this test binary, running only [`park_when_asked`].
 const PARK: [&str; 2] = ["harness::upgrade_drive::tests::park_when_asked", "--exact"];
 
 /// What tells [`park_when_asked`] to park.
 const PARK_ENV: &str = "UPGRADE_DRIVE_TEST_PARK";
 
-/// The stand-in agents' body: idle unless asked to park — then parked for as
-/// long as the test process that started it lives (its parent changes when that
-/// process ends), bounded only as a hang detector. A fixed 30 s park was a
-/// latency budget in disguise: a test that ran past it on a loaded machine read
-/// the agent's argv after it had exited (`wait:argv-unreadable`).
+/// The stand-in agents' body: idle unless asked to park, then parked while the test process
+/// that started it lives (its parent changes when that process ends), bounded only as a hang
+/// detector.
 #[test]
 fn park_when_asked() {
     if std::env::var_os(PARK_ENV).is_none() {
@@ -1448,8 +1577,8 @@ fn register_as(claude_dir: &Path, pid: u32, session: &str, version: &str) -> Ses
     session_file_in(claude_dir, pid).expect("the file parses")
 }
 
-/// The complete roster was already read to find candidates. A quiet sweep
-/// with multiple live conversations must not re-scan it once per candidate.
+/// A sweep over several live conversations reads the session roster once, not once per
+/// candidate.
 #[test]
 fn multiple_candidates_share_one_preliminary_session_scan() {
     let dir = scratch("one-precheck-scan");
@@ -1632,16 +1761,11 @@ fn ready_from_tab_a_never_announces_or_terminates_tab_b() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// A notice whose process is gone is asked afresh of the live holder. Agent A
-/// in tab `s-a` was announced to, answered READY, and is owed a release; B
-/// holds the conversation (in A's tab, in another, and under A's pid
-/// recycled). While A lives (holding another conversation now) B waits. Once
-/// A is gone a dry run says it would reopen and changes nothing, and one visit
-/// puts the upgrade back to pending in a new round (a fresh salt, A's markers
-/// and fence forgotten, the release owed to A dropped, said once in the
-/// ledger) and asks B afresh with a marker of its own. A's READY, still the
-/// transcript's last word, never restarts B. Tier-1 of
-/// `harness_upgrade_notice_owner_model` (`Reask`, `Terminate`).
+/// A notice whose process is gone is asked afresh of the live holder B (in A's tab, in another,
+/// or under A's pid recycled). While A lives B waits; once A is gone a dry run changes nothing,
+/// and one visit reopens the upgrade in a new round (fresh salt; A's markers, fence and owed
+/// release dropped; said once) and asks B with a marker of its own. A's READY never restarts B.
+/// Tier-1 of `harness_upgrade_notice_owner_model` (`Reask`, `Terminate`).
 #[cfg(unix)]
 #[test]
 fn a_notice_whose_process_is_gone_is_asked_afresh_of_the_live_holder() {
@@ -1761,7 +1885,7 @@ fn a_notice_whose_process_is_gone_is_asked_afresh_of_the_live_holder() {
         assert_eq!(load(&opts, SESSION), Some(st.clone()), "{name}");
         assert!(ledger().is_empty(), "{name}: a dry run ledgers nothing");
 
-        // THE VISIT: a new round, and B asked afresh in it.
+        // The visit: a new round, and B asked afresh in it.
         let report = visit_as(&opts);
         assert_eq!(report.step, "announced:1", "{name}");
         assert_eq!(
@@ -1782,8 +1906,7 @@ fn a_notice_whose_process_is_gone_is_asked_afresh_of_the_live_holder() {
             got.salt > salt + u64::from(upgrade::MAX_ASKS),
             "{name}: a fresh salt, past every marker the old round could make"
         );
-        // AN AGE BELONGS TO ONE PROCESS: B was never asked and is behind since
-        // it began, never since A's round (which ended with A).
+        // B's age is its own: behind since it began, not since A's round.
         assert!(
             got.pending_since > salt,
             "{name}: B's age, not A's round's: {} vs {salt}",
@@ -1862,13 +1985,10 @@ fn a_notice_whose_process_is_gone_is_asked_afresh_of_the_live_holder() {
     }
 }
 
-/// A gone notice's row promises no ask the visit never makes: the upgrade is
-/// reopened when the process its notice reached is gone, before the visit
-/// knows whether the conversation still owes a move. Here the notified agent
-/// A exited and the person resumed its conversation by hand on the current
-/// build, so B is current and nothing is asked. The ledger says the upgrade
-/// is pending again (`reopened:`), once, and that the holder is asked only as
-/// a pending upgrade asks: while the conversation is still behind.
+/// A gone notice reopens the upgrade before the visit knows whether a move is still owed: here
+/// A exited and the person resumed its conversation by hand on the current build, so B is
+/// current and nothing is asked. The ledger says `reopened:` once and promises an ask only
+/// while the conversation is still behind.
 #[cfg(unix)]
 #[test]
 fn a_gone_notices_row_promises_no_ask_to_a_holder_already_current() {
@@ -1985,14 +2105,10 @@ fn a_gone_notices_row_promises_no_ask_to_a_holder_already_current() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The record a gone notice leaves ([`St::notice_gone`]): pending in a new
-/// round in the holder's tab (the salt past every marker the old round could
-/// make; the markers, the round's `asked` and the notice's fence forgotten;
-/// how long the session has been behind kept), and the release owed to the
-/// gone process answered. A `--now` hurried the round that is over and is
-/// spent with it, whatever tab it named (as at a give-up and a re-arm), so it
-/// waives nothing for a process a person just resumed by hand; the
-/// person-hold clocks start again. A `--skip` or `--defer` keeps its own
+/// The record a gone notice leaves ([`St::notice_gone`]): pending in a new round in the
+/// holder's tab (salt past every old marker; markers, `asked` and fence forgotten; the behind
+/// age kept), the gone process's owed release dropped, and the person-hold clocks restarted. A
+/// `--now` is spent with the old round whatever tab it named; a `--skip` or `--defer` keeps its
 /// fence.
 #[test]
 fn a_gone_notice_leaves_a_new_round_pending_in_the_holders_tab() {
@@ -2091,9 +2207,8 @@ fn run_model(
     s
 }
 
-/// A second session JSON can be half-written exactly when a sweep reads it.
-/// The valid owner's file does not make a partial directory an exhaustive
-/// conversation roster, so even an announced READY cannot be used to act.
+/// A sibling session file half-written or unreadable as the sweep reads it leaves the roster
+/// partial, so even the valid owner's READY answer is not acted on.
 #[test]
 fn malformed_or_unreadable_sibling_vetoes_a_valid_owner() {
     let dir = scratch("incomplete-roster");
@@ -2125,8 +2240,8 @@ fn malformed_or_unreadable_sibling_vetoes_a_valid_owner() {
     };
     std::fs::create_dir_all(state_dir(&opts)).expect("state");
     std::fs::write(state_path(&opts, SESSION), st.to_json()).expect("state file");
-    // A LIVE sibling (round six, F20): only a running process can hold a
-    // conversation, so only its unreadable record makes the roster partial.
+    // A live sibling: only a running process can hold a conversation, so only
+    // its unreadable record makes the roster partial.
     let mut sibling_agent = parked().spawn().expect("sibling");
     wait_exec(sibling_agent.id());
     let sibling_pid = sibling_agent.id();
@@ -2228,7 +2343,7 @@ fn a_dead_or_foreign_sibling_leaves_the_roster_whole() {
             _ => std::fs::remove_file(&stale).expect("remove"),
         }
     }
-    // Negative control: a dead pid's file name over a LIVE process's record.
+    // Negative control: a dead pid's file name over a live process's record.
     std::fs::copy(sessions.join(format!("{}.json", sf.pid)), &stale).expect("copy");
     assert!(
         session_files(&opts.home).is_none(),
@@ -2270,29 +2385,18 @@ fn drive(dir: &Path) -> Opts {
         // unless the test runs [`quietly`], under the default.
         ask: !QUIET.with(std::cell::Cell::get),
         several_logins: false,
+        usage_tap: None,
         instances: Instances::Listed(Vec::new()),
+        agents_off: Vec::new(),
     }
 }
 
-/// THE MACHINE'S CLAUDE CODE BUILD, SCANNED ONCE PER PROCESS. A model read
-/// ([`ModelCtx::read`], behind every restart's, relaunch's and look's
-/// [`Targets::read`]) finds the managed build through the developer's own
-/// store, as a sweep does, and keeps the build's baked catalog in
-/// `<state>/upgrade/builds`, keyed by the binary's path, size and mtime
-/// ([`catalog::baked_cached`]) — so every test's fresh state scanned the
-/// whole build anew: 230 MB through a debug build's byte loop, 0.7 s of CPU a
-/// scan, once per case of a test that restarts several. Measured 2026-10-05
-/// (`aterm pkg` claude 2.1.289 installed): 18 tests, 21 s of a serial run
-/// alone, and the five slowest of `upgrade_drive::tests` in the gate (41-47 s
-/// each at load 10-15).
-///
-/// `opts`'s state is handed the cache file the PRODUCT wrote for this build —
-/// its first `baked_cached`, here once per process (and again whenever the
-/// build's key moves) — so the test's read is the product's second read of
-/// the same build: the catalog off the file the scan wrote, asserted here to
-/// equal the scan's own. Every other file of the state is untouched; the
-/// state's listings read `*.json` only, never the `builds` directory. A
-/// machine with no managed build seeds nothing, and reads nothing either.
+/// Seeds `opts`'s state with the baked-catalog cache ([`catalog::baked_cached`], keyed by the
+/// binary's path, size and mtime) for the machine's managed Claude Code build, scanned once per
+/// process: a scan reads the whole build (230 MB, 0.7 s of CPU in a debug build), and every
+/// test's fresh state would scan it anew. The test's read is then the product's second read of
+/// the build, asserted equal to the scan. The state's listings read only `*.json`, never
+/// `builds`. No managed build: nothing is seeded.
 fn seed_builds(opts: &Opts) {
     type Key = (PathBuf, u64, Option<SystemTime>);
     type Files = Vec<(std::ffi::OsString, Vec<u8>)>;
@@ -2338,8 +2442,7 @@ fn seed_builds(opts: &Opts) {
 }
 
 thread_local! {
-    /// This test thread's visits run under the DEFAULT `upgrade_ask = false`
-    /// ([`quietly`]).
+    /// This test thread's visits run under the default `upgrade_ask = false` ([`quietly`]).
     static QUIET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -2352,18 +2455,12 @@ fn quietly<T>(f: impl FnOnce() -> T) -> T {
     out
 }
 
-/// A `/bin/sh` SCRIPT AT `exe` RUNNING `body`, the executable a hard link of
-/// ONE stand-in per process. macOS assesses every NEW executable at its first
-/// exec, one at a time machine-wide, and a script is one: measured
-/// 2026-10-05, a fresh `#!/bin/sh` file's first run took 0.46-2.3 s at load
-/// 26-32 (its second 3.5 ms), a hard link of a file already run 9 ms. So
-/// `exe` is a link of `#!/bin/sh` + `. "$0.sh"`, and `body` is written beside
-/// it as `<exe>.sh`, a plain file the shell reads: the same `/bin/sh` runs
-/// the same commands with the same `$0`, arguments, environment and
-/// descriptors, in the same one process, as it did with `body` under the
-/// shebang. The stand-in's directory goes as the process exits. Where no link
-/// can be made (another filesystem), `exe` is a fresh copy of the stand-in,
-/// slower and as correct.
+/// A `/bin/sh` script at `exe` running `body`, `exe` a hard link of one stand-in per process:
+/// macOS assesses every new executable at its first exec, one at a time machine-wide (a fresh
+/// script's first run took 0.46-2.3 s under load, a link of one already run 9 ms). The stand-in
+/// is `#!/bin/sh` + `. "$0.sh"` and `body` goes beside it as `<exe>.sh`, so the same shell runs
+/// the same commands with the same `$0`, arguments, environment and descriptors. Where no link
+/// can be made (another filesystem), `exe` is a fresh copy.
 #[cfg(unix)]
 pub(super) fn sh_script(exe: &Path, body: &str) {
     use std::os::unix::fs::PermissionsExt as _;
@@ -2409,14 +2506,10 @@ pub(super) fn sh_script(exe: &Path, body: &str) {
     }
 }
 
-/// INDEPENDENT CASES SIDE BY SIDE: each case on a thread of its own, every
-/// one joined, and the first in the order given that failed fails the test
-/// with its own panic. For cases that each wait out the product's own fixed
-/// waits — a relaunch's 600 ms for the shell to draw its prompt, its 250 ms
-/// polls, a lock's bounded ladder — so their waits overlap rather than add.
-/// A case shares nothing with another (its own scratch directory, socket,
-/// stand-ins and stand-in kernel) and sets any thread-local wait it needs on
-/// its own thread.
+/// Runs independent cases each on its own thread, joins every one, and fails with the first
+/// failed case's panic in the order given: cases that each wait out the product's fixed waits
+/// overlap rather than add. A case shares nothing with another and sets any thread-local wait
+/// it needs on its own thread.
 pub(super) fn side_by_side<'a>(cases: Vec<Box<dyn FnOnce() + Send + 'a>>) {
     std::thread::scope(|scope| {
         let running: Vec<_> = cases.into_iter().map(|case| scope.spawn(case)).collect();
@@ -2432,7 +2525,7 @@ pub(super) fn side_by_side<'a>(cases: Vec<Box<dyn FnOnce() + Send + 'a>>) {
     });
 }
 
-/// A pid that WAS a process and is not one now.
+/// A pid that was a process and is not one now.
 fn dead_pid() -> u32 {
     let mut child = Command::new("true").spawn().expect("spawn");
     let dead = child.id();
@@ -2512,8 +2605,7 @@ fn a_ready_answer_is_read_when_the_tail_window_starts_inside_a_character() {
 
 #[test]
 fn a_transcript_append_cannot_grow_a_tail_read_past_its_budget() {
-    // The file had eight bytes when metadata was read; by the time it was
-    // read it had grown to sixteen. No timing race or writer thread needed.
+    // Eight bytes when metadata was read, sixteen by the read.
     let body = b"0123456789abcdef";
     let mut file = std::io::Cursor::new(body);
     let (tail, mark) = tail_window(&mut file, 8, 4);
@@ -2539,7 +2631,7 @@ fn a_cell_reply_is_dim_only_by_its_attrs() {
     assert!(!cell_is_dim("OK %C2%A0 d0d0d0 111318 none"));
     assert!(!cell_is_dim("OK %20 d0d0d0 111318 none"));
     // The attrs are a comma list, a link trails them, and a never-written
-    // cell's grapheme is an EMPTY token that must not shift the fields.
+    // cell's grapheme is an empty token that must not shift the fields.
     assert!(cell_is_dim(
         "OK x 999999 111318 bold,dim link=https%3A%2F%2Fa"
     ));
@@ -2573,66 +2665,102 @@ fn fake_tab(replies: Vec<&'static str>) -> (Client, std::thread::JoinHandle<Vec<
     (RelayClient::new(ours), server)
 }
 
-/// Another supervisor's claim is read off one `sessions` read, never the
-/// window's own, so `--status` shows a tab an `aterm drive watch` loop holds.
-/// Kept: a tab whose `supervisor=` names another holder, verbatim or encoded.
-/// Negative controls: a window's own host's claim (any pid: a predecessor's
-/// carried one lapses on its own; encoded, it is still the host's), no claim,
-/// and a title that reads like one are no other supervisor's; a refused read
-/// is no roster; and an instance that never answers is given up on, never
-/// waited on.
+/// `--status` reads other supervisors' claims and the owner's Autopilot Off from one
+/// `sessions` read: a tab whose `supervisor=` names another holder (verbatim or encoded) is
+/// claimed, and one whose `autopilot=` is `off` shows as held by that switch, never as a record
+/// aterm stopped checking. Negative controls: a window host's own claim (any pid, encoded or
+/// not), no claim, and a title that reads like one are no other supervisor's; `cruise`,
+/// `land`, a shell's `-` and a title that reads `autopilot=off` are no Off; a refused read is
+/// no roster; an instance that never answers is given up on.
 #[cfg(unix)]
 #[test]
-fn foreign_claims_name_another_supervisors_tabs_never_the_windows_own() {
+fn the_roster_names_another_supervisors_tabs_and_the_off_ones_never_the_windows_own() {
     const ROSTER: &str = concat!(
-        "OK 6\n",
-        "1 s-a - live claude meta=1 window=1 supervisor=aterm-supervise:42 upgrade=-\n",
-        "2 s-b - live claude meta=1 window=1 supervisor=aterm-harness@777 upgrade=-\n",
-        "3 s-c - live zsh meta=0 window=1 supervisor=- upgrade=-\n",
-        "4 s-d s-a live supervisor=aterm-supervise:9 meta=0 window=1 supervisor=- upgrade=-\n",
-        "5 s-e - live claude meta=1 window=1 supervisor=aterm-harness%40778 upgrade=-\n",
-        "6 s-f - live claude meta=1 window=1 supervisor=a%20script upgrade=-",
+        "OK 8\n",
+        "1 s-a - live claude meta=1 window=1 supervisor=aterm-supervise:42 autopilot=off \
+         upgrade=-\n",
+        "2 s-b - live claude meta=1 window=1 supervisor=aterm-harness@777 autopilot=cruise \
+         upgrade=-\n",
+        "3 s-c - live zsh meta=0 window=1 supervisor=- autopilot=- upgrade=-\n",
+        "4 s-d s-a live supervisor=aterm-supervise:9 meta=0 window=1 supervisor=- autopilot=- \
+         upgrade=-\n",
+        "5 s-e - live claude meta=1 window=1 supervisor=aterm-harness%40778 autopilot=land \
+         upgrade=-\n",
+        "6 s-f - live claude meta=1 window=1 supervisor=a%20script upgrade=-\n",
+        "7 s-g - live claude meta=1 window=1 supervisor=- autopilot=off upgrade=-\n",
+        "8 s-h - live autopilot=off meta=1 window=1 supervisor=- autopilot=cruise upgrade=-",
     );
     let (mut c, server) = fake_tab(vec![ROSTER]);
-    let claims = foreign_claims(&mut c);
+    let aside = roster_aside(&mut c, &[]);
     drop(c);
     assert_eq!(
-        claims,
-        Some(["s-a", "s-f"].map(str::to_string).into()),
-        "another's claim, never the window's own"
+        aside,
+        Some(Aside {
+            claimed: ["s-a", "s-f"].map(str::to_string).into(),
+            off: ["s-a", "s-g"].map(str::to_string).into(),
+            ..Aside::default()
+        }),
+        "another's claim, never the window's own; the owner's Off"
     );
     assert_eq!(server.join().expect("server"), vec!["sessions"]);
     let (mut c, _) = fake_tab(vec!["ERR denied"]);
-    assert_eq!(foreign_claims(&mut c), None, "no roster");
+    assert_eq!(roster_aside(&mut c, &[]), None, "no roster");
     // An instance that takes the request and never answers.
     let (ours, theirs) = std::os::unix::net::UnixStream::pair().expect("pair");
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let _ = tx.send(foreign_claims(&mut RelayClient::new(ours)));
+        let _ = tx.send(roster_aside(&mut RelayClient::new(ours), &[]));
     });
     let given_up = rx.recv_timeout(Duration::from_secs(60));
     drop(theirs);
     assert_eq!(given_up, Ok(None), "a wedged instance is no roster");
 }
 
-/// EVERY INSTANCE'S CLAIMS, AS ONE SET: `--status` asked only
-/// the instance its socket resolved to, so a tab another supervisor claims in
-/// a second aterm read `unwatched`. Two instances' claims are unioned; one
-/// that refuses its roster adds nothing and holds no other back.
+/// `--status` unions every instance's claims and Off tabs; one that refuses its roster adds
+/// nothing and holds no other back.
 #[cfg(unix)]
 #[test]
-fn the_claims_of_every_instance_are_one_set() {
+fn the_aside_of_every_instance_is_one() {
     let (a, _) = fake_tab(vec![
         "OK 1\n1 s-a - live claude meta=1 window=1 supervisor=aterm-supervise:42 upgrade=-",
     ]);
-    let (b, _) = fake_tab(vec![
-        "OK 1\n1 s-b - live claude meta=1 window=1 supervisor=a%20script upgrade=-",
-    ]);
+    let (b, _) = fake_tab(vec![concat!(
+        "OK 2\n",
+        "1 s-b - live claude meta=1 window=1 supervisor=a%20script upgrade=-\n",
+        "2 s-o - live claude meta=1 window=1 supervisor=- autopilot=off upgrade=-",
+    )]);
     let (refused, _) = fake_tab(vec!["ERR denied"]);
     assert_eq!(
-        claims_of([a, refused, b]),
-        ["s-a", "s-b"].map(str::to_string).into()
+        aside_of([a, refused, b], &[]),
+        Aside {
+            claimed: ["s-a", "s-b"].map(str::to_string).into(),
+            off: ["s-o"].map(str::to_string).into(),
+            ..Aside::default()
+        }
     );
+}
+
+/// On `--status` too, a tab whose agent's own switch is off is set aside as that switch's, as
+/// the window's view reads it: the roster prints such a session `autopilot=off`, which read as
+/// the Autopilot's alone would promise a move once Autopilot is cruise or land again, and no
+/// cruise word can move it. Each row whose `program=` is a switched-off agent goes in
+/// `agent_off`, which ranks before `off`. Negative control: the other agent's row, Off by its
+/// own word, is Off alone; with no agent switched off, `agent_off` is empty.
+#[cfg(unix)]
+#[test]
+fn a_switched_off_agents_tab_is_set_aside_as_its_switchs_on_status() {
+    let roster = || {
+        fake_tab(vec![concat!(
+            "OK 2\n",
+            "1 s-x - live codex meta=1 window=1 program=codex supervisor=- autopilot=off upgrade=-\n",
+            "2 s-c - live claude meta=1 window=1 program=claude supervisor=- autopilot=off upgrade=-",
+        )])
+        .0
+    };
+    let aside = aside_of([roster()], &[aterm_phase::Program::Codex]);
+    assert_eq!(aside.agent_off, ["s-x"].map(str::to_string).into());
+    assert_eq!(aside.off, ["s-c", "s-x"].map(str::to_string).into());
+    assert!(aside_of([roster()], &[]).agent_off.is_empty());
 }
 
 #[cfg(unix)]
@@ -2812,17 +2940,11 @@ fn a_homed_draft_is_never_read_as_the_placeholder() {
     ));
 }
 
-/// A GRID DISPLACED BY A NET-ZERO RE-GRID NEVER MAKES A PLACEHOLDER A DRAFT
-/// (the owner's tab of 2026-09-28, 17:08:36 to 17:59:39: the window re-gridded
-/// 61>60>61 rows 0.75 ms apart, Claude read 61 == 61 and never repainted, and
-/// every row sat one higher than Claude drew it — the cursor one row BELOW the
-/// composer, on the rule. The old rule asked the dim cell at the CURSOR's row,
-/// read the rule's glyph, and called Claude's own dim suggestion a person's
-/// draft for 51 minutes, with nobody at the tab; the upgrade waited `draft`
-/// and posted a warn row for a draft nobody typed). The dim cell is read at the
-/// CARET row, wherever the cursor is. NEGATIVE CONTROLS: the same displaced
-/// grid with TYPED text (the cell reads `none`) and with an unreadable cell is
-/// a draft; a cursor inside the text is a draft and asks nothing.
+/// A grid displaced by a net-zero re-grid never makes a placeholder a draft: Claude sees no
+/// size change in a quick 61>60>61-row re-grid and does not repaint, so every row sits one
+/// higher than it drew it and the cursor lands on the rule below the composer. The dim cell is
+/// read at the caret row, never the cursor's. Negative controls: the displaced grid with typed
+/// text (`none`) or an unreadable cell is a draft; a cursor inside the text asks nothing.
 #[cfg(unix)]
 #[test]
 fn a_displaced_grid_never_makes_a_placeholder_a_draft() {
@@ -2921,7 +3043,7 @@ fn a_terminal_is_the_tabs_only_when_aterm_opened_it() {
     ]);
     assert_eq!(terminal_owner(99234, &script), Some((99225, "script")));
     assert!(!terminal_owner(99234, &script).is_some_and(owned_by_aterm));
-    // GNU screen started IN a tab: the window's agent is on the pty screen's
+    // GNU screen started in a tab: the window's agent is on the pty screen's
     // server opened; the tab's own shell is on the tab's.
     let screen = tty_rows(&[
         (29687, 28893, "ttys005", "2.1.0"),
@@ -3043,7 +3165,7 @@ fn only_its_shells_foreground_job_is_ever_announced_to_or_ended() {
 fn an_agent_no_job_control_shell_started_is_refused_before_anything_is_typed() {
     let dir = scratch("job");
     let opts = drive(&dir);
-    // In THIS process's group: what a launcher script gives its child.
+    // In this process's group: what a launcher script gives its child.
     let mut agent = parked().spawn().expect("spawn");
     wait_exec(agent.id());
     let sf = register(&opts.home, agent.id(), SESSION);
@@ -3057,7 +3179,7 @@ fn an_agent_no_job_control_shell_started_is_refused_before_anything_is_typed() {
         load(&opts, SESSION).map(|s| s.phase),
         Some(Phase::Failed("not-a-shell-job".to_string()))
     );
-    // Said ONCE: the next sweep finds the upgrade failed and asks nothing.
+    // Said once: the next sweep finds the upgrade failed and asks nothing.
     assert_eq!(again.step, "wait:no-socket", "{again:?}");
     assert_eq!(ledger_lines(&opts), 1);
     // A dry run says what it would do and records nothing.
@@ -3089,15 +3211,10 @@ fn an_agent_no_job_control_shell_started_is_refused_before_anything_is_typed() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// End to end: a visit's own retarget is said once in the ledger. A visit
-/// that finds a newer build than a waiting record's moves the record to it
-/// ([`St::for_target`]) and writes `retargeted:<from>-><to>`. The stand-in is a
-/// job of its own on no terminal, so the real visit retargets and then waits at
-/// the foreground proof (`wait:not-foreground`, no act): the row is the
-/// retarget's alone, written once, and the next visit (the record already on
-/// the build) writes none. Negative controls: a record already on the target,
-/// and a finished one (a new move, no retarget), write no row; a dry run
-/// writes neither the row nor the record.
+/// A visit's own retarget is said once in the ledger (`retargeted:<from>-><to>`): the
+/// stand-in, a job of its own, waits at the foreground proof after the retarget, so the
+/// row is the retarget's alone, and the next visit writes none. Negative controls: a
+/// record already on the target and a finished one write no row; a dry run writes nothing.
 #[cfg(unix)]
 #[test]
 fn a_visits_own_retarget_is_said_once_in_the_ledger() {
@@ -3165,12 +3282,10 @@ fn a_visits_own_retarget_is_said_once_in_the_ledger() {
         Some("9.9.8".to_string()),
         "and writes nothing"
     );
-    // HOW IT LEFT THE ROUND, SAID TRULY: an
-    // announced round the visit retargets IN PLACE — its notice this agent's,
-    // for no model, on the build the session runs — keeps its round, marker
-    // and READY, and its row says so; it said "pending again" of every
-    // retarget. NEGATIVE CONTROL: a stopped round's retarget starts a new
-    // pending round, and says "started over".
+    // How it left the round, said truly: an announced round retargeted in place (its
+    // notice this agent's, for no model, on the build the session runs) keeps its round,
+    // marker and READY, and its row says so. Negative control: a stopped round's retarget
+    // starts a new pending round and says "started over".
     let detail_of = |session: &str| {
         std::fs::read_to_string(ledger_path(&opts))
             .unwrap_or_default()
@@ -3201,12 +3316,9 @@ fn a_visits_own_retarget_is_said_once_in_the_ledger() {
             Phase::Failed("unanswered".to_string()),
             "1.0.0",
         ),
-        // A PENDING round the abandoning arm REBUILDS — its session moved off
-        // the build the round began on (0.9.0; it runs 1.0.0): pending before
-        // and after, no marker either side, and yet a new round (its salt,
-        // its recorded wait, its last stop dropped). Told by phase and
-        // marker, it was said "in place: its round … kept"; told by the
-        // arm, "started over".
+        // A pending round the abandoning arm rebuilds (its session moved off the build
+        // the round began on): pending before and after, no marker either side, yet a
+        // new round.
         (
             "0badf00d-1111-2222-3333-444455556675",
             Phase::Pending,
@@ -3250,8 +3362,7 @@ fn a_visits_own_retarget_is_said_once_in_the_ledger() {
             assert!(!said.contains("still count"), "{said}");
         }
         if phase == Phase::Pending {
-            // The reading that said "in place" of it: phase and marker as
-            // they were.
+            // Phase and marker as they were, yet a new round.
             assert_eq!((&st.phase, st.marker.as_str()), (&prior.phase, ""));
             assert_ne!(st.salt, prior.salt, "rebuilt: a new round");
         }
@@ -3263,16 +3374,9 @@ fn a_visits_own_retarget_is_said_once_in_the_ledger() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A RETARGET IS TOLD BY THE ARM THAT MADE IT: a
-/// pending record for 2.1.290 whose visit finds a model move due and 2.1.291
-/// installed fails the in-place arm (its promised model, none, is not the
-/// move's) and is REBUILT — its recorded wait and last stop dropped, a new
-/// salt — pending before and after, no marker either side. Phase and marker
-/// read it "in place: its round … kept" (now "still pending");
-/// [`St::retarget`] names the arm, and the row says "started over". A
-/// release the old notice owes rides it, and so do aterm's own words left in
-/// the prompt ([`St::left_typed`]), which are no build's. NEGATIVE CONTROL:
-/// the same record with no model move is moved in place, and said so.
+/// [`St::retarget`] names the arm that made a retarget: a pending record with a model move due
+/// and a newer build is rebuilt ("started over"), an owed release and [`St::left_typed`] riding
+/// it. Negative control: with no model move it moves in place ("still pending").
 #[test]
 fn a_retarget_is_told_by_the_arm_that_made_it() {
     let v = |s: &str| Version::parse(s).expect("version");
@@ -3307,7 +3411,7 @@ fn a_retarget_is_told_by_the_arm_that_made_it() {
     assert!(st.wait.is_empty() && st.last_stop.is_empty() && st.salt == 900);
     assert_eq!(st.left_typed, prior.left_typed, "its words ride it");
     assert_eq!(retarget_how(how, &st), "started over");
-    // NEGATIVE CONTROL: no model move, in place.
+    // Negative control: no model move, in place.
     let (st, how) = St::retarget(
         Some(prior.clone()),
         &v("2.1.290"),
@@ -3383,6 +3487,52 @@ impl Kernel for Script {
     }
 }
 
+/// A visit's parked test process with its process facts injected (its start, its background
+/// work), so its restart tests script the job and server races whether or not a concurrent
+/// case starts a `ps` at that moment. Every other `Script` user keeps the live probes.
+#[cfg(unix)]
+struct ParkedProcess<'a> {
+    script: &'a Script,
+    pid: u32,
+    start: Option<String>,
+    background: Vec<String>,
+}
+
+#[cfg(unix)]
+impl Kernel for ParkedProcess<'_> {
+    fn job(&self, pid: u32) -> Option<(Job, u32)> {
+        self.script.job(pid)
+    }
+
+    fn parent(&self, pid: u32) -> Option<u32> {
+        self.script.parent(pid)
+    }
+
+    fn terminal(&self, pid: u32) -> Option<(u32, String)> {
+        self.script.terminal(pid)
+    }
+
+    fn process_start(&self, pid: u32) -> Option<String> {
+        (pid == self.pid).then(|| self.start.clone()).flatten()
+    }
+
+    fn restart_background(&self, pid: u32) -> Vec<String> {
+        if pid == self.pid {
+            self.background.clone()
+        } else {
+            vec![UNREADABLE_TABLE.to_string()]
+        }
+    }
+
+    fn shell_holds_tab(&self, shell: u32) -> Option<bool> {
+        self.script.shell_holds_tab(shell)
+    }
+
+    fn describe(&self, agent: u32, procs: &[(u32, String)]) -> Vec<upgrade::Held> {
+        self.script.describe(agent, procs)
+    }
+}
+
 /// The screen [`instance`] shows: an idle Claude's empty composer, the caret at
 /// column 2 of its row, and no person's input to the session (`"human_ms":null`,
 /// so the tab is not attended: `upgrade::attended_by`).
@@ -3439,11 +3589,10 @@ struct Answers {
     /// relaunch line is typed at holds the tab (`None`: unscripted, so no
     /// relaunch line is ever typed).
     who: Option<String>,
-    /// A CLAUDE CODE PROMPT the stand-in draws itself ([`Prompt`]), in place
-    /// of `screen`: what a `turn` it answers with a skip that typed part of
-    /// its text (`typed=<k>`) or all of it (`reason=guard`) left there, and a
-    /// person's key after it where `person_key` says; `key … ctrl+u` kills the
-    /// line when its `if-gen=` names the screen drawn. `None`: `screen`.
+    /// A Claude Code prompt the stand-in draws itself ([`Prompt`]) in place of `screen`:
+    /// what a `turn` answered with a skip that typed part of its text (`typed=<k>`) or all
+    /// of it (`reason=guard`) left there, and a person's key after it where `person_key`
+    /// says; `key … ctrl+u` kills the line when its `if-gen=` names the screen drawn.
     prompt: Option<Prompt>,
 }
 
@@ -3510,35 +3659,24 @@ impl Default for Answers {
     }
 }
 
-/// A control socket at `<dir>/t.sock`, its token beside it, standing in for
-/// the aterm instance of [`TAB`] with an idle Claude in it: `sessions` names the
-/// tab, `text --json` is [`idle_screen`] (or what `<dir>/t.screen` says, when a
-/// test writes it: the screen a later look finds), `blocks` is unscripted (or
-/// what `<dir>/t.blocks` says, when a test writes it), a `cell` is a plain blank,
-/// `status` holds nothing (or answers what `<dir>/t.status` says, when a test
-/// writes it), and a `turn` is answered OK — recorded here, typed nowhere.
-/// Returns the socket and every request it read, in order. The accept loop
-/// ends with the test process.
+/// A control socket at `<dir>/t.sock` (its token beside it) standing in for [`TAB`]'s aterm with
+/// an idle Claude: `text --json` is [`idle_screen`], `blocks` unscripted, `status` holding
+/// nothing, each overridden by `<dir>/t.screen`, `t.blocks` or `t.status`; a `turn` is answered
+/// OK and recorded. Returns the socket and every request it read.
 #[cfg(unix)]
-fn instance(dir: &Path) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+fn instance(dir: &Path) -> (String, crate::harness::FakeInstanceLog) {
     instance_of(dir, TAB)
 }
 
 /// [`instance`] for the tab `tab`.
 #[cfg(unix)]
-fn instance_of(
-    dir: &Path,
-    tab: &'static str,
-) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+fn instance_of(dir: &Path, tab: &'static str) -> (String, crate::harness::FakeInstanceLog) {
     instance_for(dir, tab, Answers::default())
 }
 
 /// [`instance`], answering as `answers` says.
 #[cfg(unix)]
-fn instance_with(
-    dir: &Path,
-    answers: Answers,
-) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+fn instance_with(dir: &Path, answers: Answers) -> (String, crate::harness::FakeInstanceLog) {
     instance_for(dir, TAB, answers)
 }
 
@@ -3548,181 +3686,151 @@ fn instance_for(
     dir: &Path,
     tab: &'static str,
     answers: Answers,
-) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
-    use std::io::BufRead as _;
-    let sock = dir.join("t.sock");
-    std::fs::write(dir.join("t.sock.token"), format!("{TOKEN}\n")).expect("token");
-    let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
+) -> (String, crate::harness::FakeInstanceLog) {
     let status_file = dir.join("t.status");
     let screen_file = dir.join("t.screen");
     let blocks_file = dir.join("t.blocks");
-    let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let log = std::sync::Arc::clone(&asked);
-    std::thread::spawn(move || {
-        let mut turn_replies = answers.turn.clone();
-        let mut texts = 0;
-        let mut prompt = answers.prompt.clone();
-        let mut generation = 77;
-        // Status reads since a `lease acquire` (`None`: none acquired yet).
-        let mut looks: Option<usize> = None;
-        for conn in listener.incoming() {
-            let Ok(conn) = conn else { break };
-            let Ok(mut out) = conn.try_clone() else {
-                continue;
-            };
-            let mut lines = std::io::BufReader::new(conn).lines();
-            // `AUTH <token>` is acknowledged with nothing, as the server does.
-            let auth = format!("AUTH {TOKEN}");
-            if !lines.next().is_some_and(|l| l.is_ok_and(|l| l == auth)) {
-                continue;
+    let mut turn_replies = answers.turn.clone();
+    let mut texts = 0;
+    let mut prompt = answers.prompt.clone();
+    let mut generation = 77;
+    // Status reads since a `lease acquire` (`None`: none acquired yet).
+    let mut looks: Option<usize> = None;
+    crate::harness::fake_instance(&dir.join("t.sock"), TOKEN, move |line| {
+        let verb = line
+            .split_whitespace()
+            .find(|w| !w.starts_with('@'))
+            .unwrap_or("");
+        match verb {
+            "sessions" => format!("OK 1\nlocal {tab} 0 idle claude {}", answers.row),
+            "text" if prompt.is_some() => {
+                format!(
+                    "OK {}",
+                    prompt
+                        .as_ref()
+                        .map_or_else(String::new, |p| p.screen(generation))
+                )
             }
-            for line in lines {
-                let Ok(line) = line else { break };
-                let verb = line
+            "text" => {
+                texts += 1;
+                match (&answers.after, std::fs::read_to_string(&screen_file)) {
+                    (_, Ok(written)) => format!("OK {}", written.trim()),
+                    (Some((n, later)), _) if texts > *n => format!("OK {later}"),
+                    _ => format!("OK {}", answers.screen),
+                }
+            }
+            "cell" => answers.cell.to_string(),
+            "who" => answers
+                .who
+                .clone()
+                .unwrap_or_else(|| "ERR unscripted".to_string()),
+            "status" => {
+                let look = looks.as_mut().map(|n| {
+                    *n += 1;
+                    *n
+                });
+                match answers.after_first_look {
+                    Some(later) if look.is_some_and(|n| n >= 2) => later.to_string(),
+                    _ => std::fs::read_to_string(&status_file).map_or_else(
+                        |_| "OK schema=1 hold=0 hand=-".to_string(),
+                        |s| s.trim().to_string(),
+                    ),
+                }
+            }
+            "help" => answers.help.to_string(),
+            "blocks" => std::fs::read_to_string(&blocks_file)
+                .map_or_else(|_| answers.blocks.to_string(), |b| b.trim().to_string()),
+            "line" => answers.line.to_string(),
+            "rekey" if line.ends_with(" rekey withdraw") => "OK rekey withdrawn".to_string(),
+            "rekey" => answers.rekey.to_string(),
+            "lease" if line.contains(" lease release ") => {
+                if answers.lease.starts_with("OK lease acquired") {
+                    "OK lease released".to_string()
+                } else {
+                    "OK lease none".to_string()
+                }
+            }
+            "lease" => {
+                looks.get_or_insert(0);
+                answers.lease.to_string()
+            }
+            "turn" => {
+                let settles_on_quiet = line
                     .split_whitespace()
-                    .find(|w| !w.starts_with('@'))
-                    .unwrap_or("");
-                let reply = match verb {
-                    "sessions" => format!("OK 1\nlocal {tab} 0 idle claude {}", answers.row),
-                    "text" if prompt.is_some() => {
-                        format!(
-                            "OK {}",
-                            prompt
-                                .as_ref()
-                                .map_or_else(String::new, |p| p.screen(generation))
-                        )
-                    }
-                    "text" => {
-                        texts += 1;
-                        match (&answers.after, std::fs::read_to_string(&screen_file)) {
-                            (_, Ok(written)) => format!("OK {}", written.trim()),
-                            (Some((n, later)), _) if texts > *n => format!("OK {later}"),
-                            _ => format!("OK {}", answers.screen),
-                        }
-                    }
-                    "cell" => answers.cell.to_string(),
-                    "who" => answers
-                        .who
-                        .clone()
-                        .unwrap_or_else(|| "ERR unscripted".to_string()),
-                    "status" => {
-                        let look = looks.as_mut().map(|n| {
-                            *n += 1;
-                            *n
-                        });
-                        match answers.after_first_look {
-                            Some(later) if look.is_some_and(|n| n >= 2) => later.to_string(),
-                            _ => std::fs::read_to_string(&status_file).map_or_else(
-                                |_| "OK schema=1 hold=0 hand=-".to_string(),
-                                |s| s.trim().to_string(),
-                            ),
-                        }
-                    }
-                    "help" => answers.help.to_string(),
-                    "blocks" => std::fs::read_to_string(&blocks_file)
-                        .map_or_else(|_| answers.blocks.to_string(), |b| b.trim().to_string()),
-                    "line" => answers.line.to_string(),
-                    "rekey" if line.ends_with(" rekey withdraw") => {
-                        "OK rekey withdrawn".to_string()
-                    }
-                    "rekey" => answers.rekey.to_string(),
-                    "lease" if line.contains(" lease release ") => {
-                        if answers.lease.starts_with("OK lease acquired") {
-                            "OK lease released".to_string()
-                        } else {
-                            "OK lease none".to_string()
-                        }
-                    }
-                    "lease" => {
-                        looks.get_or_insert(0);
-                        answers.lease.to_string()
-                    }
-                    "turn" => {
-                        let settles_on_quiet = line
-                            .split_whitespace()
-                            .find_map(|w| w.strip_prefix("idle="))
-                            .and_then(|ms| ms.parse::<u64>().ok())
-                            .is_none_or(|ms| ms > 1);
-                        if settles_on_quiet {
-                            std::thread::sleep(answers.answer);
-                        }
-                        let next = turn_replies.first().copied().unwrap_or("OK status=done");
-                        if turn_replies.len() > 1 {
-                            turn_replies.remove(0);
-                        }
-                        // What the stopped turn left in the prompt.
-                        if let Some(p) = prompt.as_mut() {
-                            let text = line
-                                .find(" [aterm harness]")
-                                .map_or("", |at| &line[at + 1..]);
-                            let typed = next
-                                .split_whitespace()
-                                .find_map(|w| w.strip_prefix("typed="))
-                                .and_then(|k| k.parse::<usize>().ok());
-                            let left = match typed {
-                                Some(k) if k > 0 => Some(text.chars().take(k).collect()),
-                                _ if next.contains("reason=guard") => Some(text.to_string()),
-                                _ => None,
-                            };
-                            if let Some(left) = left {
-                                p.draft = left;
-                                if p.person_key {
-                                    p.draft.push('x');
-                                }
-                                generation += 1;
-                            }
-                        }
-                        next.to_string()
-                    }
-                    // The prompt's ctrl+u: the line killed, while the screen is
-                    // the one the key's `if-gen=` names.
-                    "key" if prompt.is_some() && line.ends_with(" ctrl+u") => {
-                        if line.contains(&format!(" if-gen=4.{generation} ")) {
-                            if let Some(p) = prompt.as_mut() {
-                                p.draft.clear();
-                            }
-                            generation += 1;
-                            format!("OK seq={generation}")
-                        } else {
-                            format!("OK skipped reason=changed seq={generation}")
-                        }
-                    }
-                    "send" | "key" => "OK seq=1".to_string(),
-                    // `signal term pid=<n>` as the server answers it: that
-                    // process is sent SIGTERM (the stand-in has no foreground
-                    // group to check it against), then `OK`.
-                    "signal" if !answers.signal.is_empty() => answers.signal.to_string(),
-                    "signal" => match line
-                        .split_whitespace()
-                        .find_map(|w| w.strip_prefix("pid="))
-                        .and_then(|p| p.parse::<i32>().ok())
-                    {
-                        Some(pid) if line.contains(" signal term ") => {
-                            // SAFETY: a plain signal to the stand-in agent the
-                            // test spawned and names by pid.
-                            if unsafe { libc::kill(pid, libc::SIGTERM) } == 0 {
-                                "OK signal term".to_string()
-                            } else {
-                                "ERR no such process".to_string()
-                            }
-                        }
-                        _ => "ERR usage".to_string(),
-                    },
-                    _ => "ERR unscripted".to_string(),
-                };
-                if let Ok(mut log) = log.lock() {
-                    log.push(line);
+                    .find_map(|w| w.strip_prefix("idle="))
+                    .and_then(|ms| ms.parse::<u64>().ok())
+                    .is_none_or(|ms| ms > 1);
+                if settles_on_quiet {
+                    std::thread::sleep(answers.answer);
                 }
-                if writeln!(out, "{reply}").is_err() {
-                    break;
+                let next = turn_replies.first().copied().unwrap_or("OK status=done");
+                if turn_replies.len() > 1 {
+                    turn_replies.remove(0);
+                }
+                // What the stopped turn left in the prompt.
+                if let Some(p) = prompt.as_mut() {
+                    let text = line
+                        .find(" [aterm harness]")
+                        .map_or("", |at| &line[at + 1..]);
+                    let typed = next
+                        .split_whitespace()
+                        .find_map(|w| w.strip_prefix("typed="))
+                        .and_then(|k| k.parse::<usize>().ok());
+                    let left = match typed {
+                        Some(k) if k > 0 => Some(text.chars().take(k).collect()),
+                        _ if next.contains("reason=guard") => Some(text.to_string()),
+                        _ => None,
+                    };
+                    if let Some(left) = left {
+                        p.draft = left;
+                        if p.person_key {
+                            p.draft.push('x');
+                        }
+                        generation += 1;
+                    }
+                }
+                next.to_string()
+            }
+            // The prompt's ctrl+u: the line killed, while the screen is
+            // the one the key's `if-gen=` names.
+            "key" if prompt.is_some() && line.ends_with(" ctrl+u") => {
+                if line.contains(&format!(" if-gen=4.{generation} ")) {
+                    if let Some(p) = prompt.as_mut() {
+                        p.draft.clear();
+                    }
+                    generation += 1;
+                    format!("OK seq={generation}")
+                } else {
+                    format!("OK skipped reason=changed seq={generation}")
                 }
             }
+            "send" | "key" => "OK seq=1".to_string(),
+            // `signal term pid=<n>` as the server answers it: that
+            // process is sent SIGTERM (the stand-in has no foreground
+            // group to check it against), then `OK`.
+            "signal" if !answers.signal.is_empty() => answers.signal.to_string(),
+            "signal" => match line
+                .split_whitespace()
+                .find_map(|w| w.strip_prefix("pid="))
+                .and_then(|p| p.parse::<i32>().ok())
+            {
+                Some(pid) if line.contains(" signal term ") => {
+                    // SAFETY: a plain signal to the stand-in agent the
+                    // test spawned and names by pid.
+                    if unsafe { libc::kill(pid, libc::SIGTERM) } == 0 {
+                        "OK signal term".to_string()
+                    } else {
+                        "ERR no such process".to_string()
+                    }
+                }
+                _ => "ERR usage".to_string(),
+            },
+            _ => "ERR unscripted".to_string(),
         }
-    });
-    (sock.to_string_lossy().into_owned(), asked)
+    })
 }
 
-/// The requests of `asked` that TYPE into the tab.
+/// The requests of `asked` that type into the tab.
 #[cfg(unix)]
 fn turns(asked: &std::sync::Mutex<Vec<String>>) -> usize {
     asked
@@ -3851,11 +3959,9 @@ fn carry_on_rechecks_tab_ownership_at_the_turn() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// The continuation a relaunched agent is owed looks for a person first: a
-/// person's keystroke within the grace (`human_ms=`) holds it (`wait:held`),
-/// nothing typed and the restart still in flight, so the next idle point
-/// types it. Negative control: with nobody at the keys it is typed, with
-/// `yield=0.2`.
+/// The continuation a relaunched agent is owed waits on a person's keystroke within the grace
+/// (`wait:held`, nothing typed, the restart still in flight). Negative control: with nobody at
+/// the keys it is typed, with `yield=0.2`.
 #[cfg(unix)]
 #[test]
 fn carry_on_is_held_for_a_person_at_the_keys() {
@@ -3931,12 +4037,10 @@ fn carry_on_is_held_for_a_person_at_the_keys() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// THE CONTINUATION IS TYPED UNDER THE HARNESS'S HAND, whoever holds it: a
-/// later visit that finds the relaunched agent owed one (no caller holds a
-/// hand) takes one for the typing alone and gives it back at once; the
-/// relaunch's own wait passes the hand it has kept and the typing neither
-/// takes nor gives back a second. NEGATIVE CONTROL: a tab another driver
-/// holds is `wait:held`, nothing typed, and this process gives back nothing.
+/// The continuation is typed under the harness's hand: a later visit with no hand takes
+/// one for the typing and gives it back at once; the relaunch's own wait passes the hand
+/// it kept, neither taken nor given back a second time. Negative control: a tab another
+/// driver holds is `wait:held`, nothing typed or given back.
 #[cfg(unix)]
 #[test]
 fn the_continuation_is_typed_under_a_hand_taken_or_passed() {
@@ -4016,7 +4120,7 @@ fn the_continuation_is_typed_under_a_hand_taken_or_passed() {
         at(&asked, " lease release ").expect("given back"),
     );
     assert!(turn < release, "still held when typed: {asked:#?}");
-    // NEGATIVE CONTROL: the tab is another driver's.
+    // Negative control: the tab is another driver's.
     let (step, asked) = run(
         "continuation-theirs",
         "ERR lease held holder=orchestrator expires_in_ms=5000",
@@ -4027,14 +4131,10 @@ fn the_continuation_is_typed_under_a_hand_taken_or_passed() {
     assert_eq!(count(&asked, " lease release "), 0, "{asked:#?}");
 }
 
-/// THE LINE IS NEVER TYPED OVER A LIVE OWNER UNDER THE AGENT'S OWN HOME:
-/// [`type_relaunch_line`]'s check that no live process holds the
-/// conversation reads the records it is given — the relaunched agent's
-/// ([`St::records`], review of `fix/cold-restore-login-home`, 2026-10-09). A
-/// Claude Code holding the conversation under `<dir>` keeps the line waiting
-/// (`conversation-owner-ambiguous`), nothing typed. NEGATIVE CONTROL: the
-/// user's `~/.claude`, which names no process of `<dir>`'s, lets it type —
-/// the read every relaunch made before.
+/// [`type_relaunch_line`]'s check that no live process holds the conversation reads the
+/// records it is given (the relaunched agent's own home): a holder under `<dir>` keeps the
+/// line waiting (`conversation-owner-ambiguous`). Negative control: the user's
+/// `~/.claude`, naming no process of `<dir>`'s, lets it type.
 #[cfg(unix)]
 #[test]
 fn a_relaunch_line_waits_on_a_live_owner_under_its_agents_own_home() {
@@ -4144,17 +4244,10 @@ fn relaunch_rechecks_shell_tab_after_the_session_scan() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// The relaunch line is typed under the harness's hand, never let go for it,
-/// so a retrying orchestrator's `turn` cannot slip into the bare shell before
-/// the line or the booting agent after it. The hand is the server's hard
-/// lease ([`Hand`]: `lease acquire … hard`), which refuses every other
-/// connection's writes and lets its own through, its `turn` included: between
-/// the hand taken and the line typed nothing is released or re-taken, for
-/// bash's raw `send` and zsh's fenced `turn` alike. A turn refused `ERR busy
-/// …` (a hand that could not be taken, or lapsed) is a wait, never the refusal
-/// that fails a relaunch whose agent is already gone. Negative control: from a
-/// server that takes no hard lease (an older aterm), the hand holds nothing
-/// and is given back by nothing.
+/// The relaunch line is typed under the harness's hand ([`Hand`]), so a retrying orchestrator's
+/// `turn` cannot slip in around it, for bash's `send` and zsh's fenced `turn` alike; a turn
+/// refused `ERR busy …` is a wait, never a failed relaunch (its agent is already gone).
+/// Negative control: a server with no hard lease gives no hand and nothing to give back.
 #[cfg(unix)]
 #[test]
 fn the_relaunch_line_is_typed_under_the_hand_never_let_go() {
@@ -4292,12 +4385,9 @@ fn the_hand_is_kept_through_every_wait_under_it() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The last look before the relaunch line is a `status` read at the moment it
-/// is typed, after every wait before it: a person who typed at the returned
-/// prompt within the grace, a halt and anyone's hand each hold the tab, and
-/// nothing is typed, so the line is never joined to a person's half-typed
-/// command. Negative control: a keystroke older than the grace, no hand, no
-/// halt: the line is typed.
+/// The last look before the relaunch line is a `status` read as it is typed: a person's
+/// keystroke within the grace, a halt or anyone's hand holds the tab and nothing is typed.
+/// Negative control: a keystroke older than the grace, no hand, no halt: the line is typed.
 #[cfg(unix)]
 #[test]
 fn the_relaunch_line_is_never_typed_over_a_person_or_a_holder() {
@@ -4359,11 +4449,9 @@ fn the_relaunch_line_is_never_typed_over_a_person_or_a_holder() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// At a bash prompt the relaunch line is typed, not pasted: a crashed agent
-/// leaves bracketed-paste mode on, and macOS's bash 3.2 reads the paste's
-/// frame as text (`--resume <id>01~`). Raw bytes (`send --`), then Enter.
-/// Negative control: a shell that is not bash (this test binary standing in)
-/// is pasted to with a `turn`, as zsh and fish are.
+/// At a bash prompt the relaunch line is typed as raw bytes (`send --`, then Enter), never
+/// pasted: a crashed agent leaves bracketed paste on and macOS's bash 3.2 reads the paste frame
+/// as text (`--resume <id>01~`). Negative control: another shell is pasted to with a `turn`.
 #[cfg(unix)]
 #[test]
 fn a_bash_prompt_is_typed_the_relaunch_line_never_pasted() {
@@ -4436,14 +4524,10 @@ fn a_bash_prompt_is_typed_the_relaunch_line_never_pasted() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// Every look at the job before an act is the one standing between a ctrl-z
-/// and that act. The agent is its shell's foreground job at the first look and
-/// a background job from the Nth read on; each N stops the sweep at exactly
-/// one look, and nothing is typed or signalled: the re-read before the
-/// announce (N = 1, on a pending upgrade), the same re-read before the SIGTERM
-/// (N = 1), restart's own gate (N = 2), and the last look before the signal
-/// (N = 3). Dropped, each lets the act through. Control: with every read
-/// foreground, the announce is typed.
+/// Every look at the job before an act stands between a ctrl-z and that act: the agent
+/// backgrounded from the Nth read on stops the sweep at exactly one look, nothing typed or
+/// signalled (the re-read before the announce or the SIGTERM, N = 1; the restart's gate,
+/// N = 2; the last look before the signal, N = 3). Control: all foreground, announced.
 #[cfg(unix)]
 #[test]
 fn every_look_at_the_job_stands_between_a_ctrl_z_and_the_act() {
@@ -4605,14 +4689,14 @@ fn relaunch_roster_retries_an_incomplete_or_unstatable_directory_every_poll() {
     assert!(rescanned, "missing metadata cannot suppress a roster read");
 }
 
-/// Only the relaunch itself — the SAME conversation, a child of the shell the
-/// line was typed at — is adopted and told it was upgraded.
+/// Only the relaunch itself (the same conversation, a child of the shell the line was
+/// typed at) is adopted and told it was upgraded.
 #[cfg(unix)]
 #[test]
 fn only_the_relaunch_itself_is_adopted_and_told_it_was_upgraded() {
     let dir = scratch("adopt");
     let opts = drive(&dir);
-    // Its parent is THIS process, standing in for the shell.
+    // Its parent is this process, standing in for the shell.
     let mut agent = parked().spawn().expect("spawn");
     let (pid, me, dead) = (agent.id(), std::process::id(), dead_pid());
     wait_exec(pid);
@@ -4640,8 +4724,8 @@ fn only_the_relaunch_itself_is_adopted_and_told_it_was_upgraded() {
         // The process that was ended is never its own relaunch.
         relaunch_of(&Live, &s(SESSION), SESSION, pid, me),
     ];
-    // END TO END, the in-flight branch of a sweep: a process the recorded
-    // shell did not start holds the conversation.
+    // End to end, the in-flight branch of a sweep: a process the recorded shell did not
+    // start holds the conversation.
     let sf = register(&opts.home, pid, SESSION);
     let put = |shell: u32| {
         let st = St {
@@ -4659,7 +4743,7 @@ fn only_the_relaunch_itself_is_adopted_and_told_it_was_upgraded() {
     put(1);
     let elsewhere = visit(&opts, &sf, &table(), &newer(), &Live);
     let failed = load(&opts, SESSION).map(|s| s.phase);
-    // Control: the recorded shell IS its parent — adopted, on to the tab.
+    // Control: the recorded shell is its parent: adopted, on to the tab.
     put(me);
     let ours = visit(&opts, &sf, &table(), &newer(), &Live);
     let _ = agent.kill();
@@ -4679,8 +4763,8 @@ fn only_the_relaunch_itself_is_adopted_and_told_it_was_upgraded() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A relaunch is judged from a parent READ: a parent that cannot be read (the
-/// process ended as it was asked, or `ps` could not run) is no verdict at all.
+/// A relaunch is judged from a parent read: a parent that cannot be read (the process
+/// ended as it was asked, or `ps` could not run) is no verdict at all.
 #[test]
 fn a_parent_that_cannot_be_read_is_no_verdict_on_the_relaunch() {
     assert_eq!(relaunch_by_parent(Some(1916), 1916), Relaunch::Ours);
@@ -4695,11 +4779,9 @@ fn a_parent_that_cannot_be_read_is_no_verdict_on_the_relaunch() {
     assert_eq!(Live.parent(me), ids(me).map(|(ppid, _, _)| ppid));
 }
 
-/// End to end, the in-flight branch: the new process holding the conversation
-/// fails the upgrade for good only from a parent read as another than the
-/// recorded shell. Unread, it is a wait (the phase kept, nothing in the
-/// ledger, the next sweep asks again), so the real relaunch is still told to
-/// carry on.
+/// The in-flight branch end to end: a new process holding the conversation fails the upgrade
+/// for good only when its parent reads as another than the recorded shell; unread, it is a wait
+/// (phase kept, nothing ledgered), so the real relaunch is still carried on.
 #[cfg(unix)]
 #[test]
 fn a_relaunch_whose_parent_cannot_be_read_is_waited_for_never_failed() {
@@ -4745,22 +4827,10 @@ fn a_relaunch_whose_parent_cannot_be_read_is_waited_for_never_failed() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A RELAUNCH STOPPED AS NEVER PICKED UP, PICKED UP AFTER ALL, IS CARRIED ON
-/// (the review of the 2026-10-09 sweep fixes): a stop `no-resume` is a
-/// reading of the tab, and the Claude Code the relaunch's line started can
-/// still come up after it — a start slower than the stale bound, a stop read
-/// early. Left stopped, the owner kept the interrupt `agent-down` (for a day)
-/// and the command that starts a second holder of the conversation, while
-/// the relaunched agent ran idle in the tab on the target build. The process
-/// the recorded shell started, holding the conversation, is that relaunch
-/// landed: the host's `due` asks about it whatever its build
-/// ([`needs_upgrade_inspection`]), and the visit reopens the record
-/// (`reopened:relaunch-landed`, ledgered once) and carries it on as any
-/// relaunch that landed. NEGATIVE CONTROLS, each left as it stood and asked
-/// about by nothing: the holder another shell started (resumed by hand
-/// elsewhere), a record stopped for another reason (`stale-exit`: its line
-/// was never typed), and a stop of the live relaunch on exit (its own loop
-/// tries it again).
+/// A relaunch stopped `no-resume` whose agent came up after all is that relaunch landed: the
+/// host's `due` asks about it ([`needs_upgrade_inspection`]) and the visit reopens the record
+/// (`reopened:relaunch-landed`, once) and carries it on. Negative controls, left standing: a
+/// holder another shell started, a `stale-exit` stop, a relaunch on exit's stop.
 #[cfg(unix)]
 #[test]
 fn a_relaunch_stopped_no_resume_whose_agent_came_up_is_carried_on() {
@@ -4840,19 +4910,12 @@ fn a_relaunch_stopped_no_resume_whose_agent_came_up_is_carried_on() {
     }
 }
 
-/// A CONVERSATION RESUMED BY HAND AFTER A NO-RESUME STOP IS THE PERSON'S, NOT
-/// A RELAUNCH THAT LANDED LATE (the review of the late-landing reopen): the
-/// stop tells the owner to resume the conversation in that tab (`claude
-/// --resume <id>`), and the process that command starts is a child of the
-/// recorded shell holding the conversation, as the line's own late agent
-/// would be. Read as the line's, the record was reopened (`came up after
-/// all`, false), and a restart in place's continuation (`nobody is here to
-/// answer: decide for yourself`) was owed to the conversation a person had
-/// just taken over, a day after the stop; an upgrade the person resumed on
-/// the OLD build closed `done` as moved onto the target. Only a holder that
-/// started no later than the stop was said, on the build the line ran, can
-/// be the line's agent ([`St::landed_after_stop`]). Each case leaves the stop
-/// standing: nothing asks about it, nothing is owed and nothing is typed.
+/// A conversation resumed by hand after a `no-resume` stop is the person's, not a relaunch
+/// that landed late, though the stop's own remedy (`claude --resume <id>` in that tab) starts
+/// a child of the recorded shell as the line's agent would be: only a holder that started no
+/// later than the stop, on the build the line ran, can be the line's agent
+/// ([`St::landed_after_stop`]). Each case leaves the stop standing: nothing asks about it,
+/// nothing is owed, nothing typed.
 #[cfg(unix)]
 #[test]
 fn a_conversation_resumed_by_hand_after_a_no_resume_stop_is_never_reopened() {
@@ -4868,7 +4931,7 @@ fn a_conversation_resumed_by_hand_after_a_no_resume_stop_is_never_reopened() {
         // An announced upgrade's stop, resumed by hand on the target a day
         // later: its continuation would be typed.
         ("hand-announced", "", "1.0.0", false, DAY),
-        // A quiet upgrade to 9.9.9 whose conversation runs on the OLD build
+        // A quiet upgrade to 9.9.9 whose conversation runs on the old build
         // (1.0.0) in a process of the recorded shell: not the line's agent,
         // whenever it started.
         ("hand-old-build", "", "9.9.9", true, 0),
@@ -4939,21 +5002,11 @@ fn a_conversation_resumed_by_hand_after_a_no_resume_stop_is_never_reopened() {
     }
 }
 
-/// A BUILD THAT FAILED TO START FOR A CONVERSATION IS NOT TRIED AGAIN FOR ITS
-/// HAND RESUME (the handoff's §4 residual, lab run `urfx1`, 2026-10-14):
-/// after an upgrade's relaunch onto a build that crashes at start stopped
-/// `no-resume`, the person who follows the stop's remedy (`claude --resume
-/// <id>` by hand) gets a NEW process, and the visit minted it a fresh round
-/// ([`St::retarget`]: a stopped round belongs to its process) — no rest, no
-/// streak — so the next quiet moment moved it onto the same broken build
-/// again (34 s later in the lab), stopped again, and undid the remedy every
-/// time. The failure is the conversation's on that build: the round keeps
-/// the stop's rest and streak, bound to the new process, so the target is
-/// not tried for it until the rest the streak defines runs out — after a
-/// restart in place of the hand resume too, whose record carries the stop
-/// ([`St::kept_by_restart`]). CONTROLS: past that rest the round re-arms; a
-/// stop on an OLDER target is no reason to hold back a newer one (a new
-/// pending round, as before).
+/// A build that failed to start for a conversation is not tried again for its hand
+/// resume: the new process's round keeps the stop's rest and streak, bound to it, until
+/// the rest runs out, also after a restart in place of the hand resume
+/// ([`St::kept_by_restart`]). Controls: past the rest the round re-arms; a stop on an
+/// older target holds no newer one back.
 #[cfg(unix)]
 #[test]
 fn a_build_that_failed_to_start_is_not_retried_for_the_conversations_hand_resume() {
@@ -5060,14 +5113,14 @@ fn a_build_that_failed_to_start_is_not_retried_for_the_conversations_hand_resume
         (Phase::Failed("no-resume".to_string()), "no-resume", 1),
         "the round rests after the restart in place: {saved:?}"
     );
-    // CONTROL: the rest over, the round re-arms onto the same build.
+    // Control: the rest over, the round re-arms onto the same build.
     let (r, saved, _) = visit(
         "hand-resume-rested",
         &stopped("9.9.9", upgrade::RETRY_S + 60),
     );
     assert_eq!(r.step, "rearmed:no-resume", "{r:?}");
     assert_eq!(saved.map(|st| st.phase), Some(Phase::Pending));
-    // CONTROL: a stop on an older target holds no newer build back: a new
+    // Control: a stop on an older target holds no newer build back: a new
     // round, pending (its screen yet to settle for this record).
     let (r, saved, _) = visit("hand-resume-newer", &stopped("9.9.8", 34));
     assert_eq!(r.step, "wait:settling", "{r:?}");
@@ -5106,19 +5159,11 @@ fn failed_start_saved(opts: &Opts, session: &str, to: &str, ago: u64) {
     save(&writes, session, &st);
 }
 
-/// A BUILD THAT FAILED TO START IS THE BUILD'S FACT, NOT ONLY ITS
-/// CONVERSATION'S (the handoff's §4 limits of `St::keep_stop`): after a
-/// relaunch onto 9.9.9 stopped `no-resume` for ONE conversation, an agent of
-/// ANOTHER conversation — a hand resume as another conversation (`claude`
-/// with no `--resume`, a new session id), or any other tab's agent — was
-/// moved onto that very build at its next quiet moment, ended, and left
-/// stopped; and the stopped conversation's own round, its rest run out, was
-/// moved onto it again ("a build that still crashes is tried once per rest
-/// and each try stops again"). Each such move kills a working agent. No
-/// agent is moved onto a build that has failed to start until the build is
-/// proved to start without one: here its probe cannot even run it (the
-/// candidate is `/nonexistent/claude`), so the quiet restart waits
-/// (`wait:build-fails`).
+/// A build that failed to start is the build's fact, not only its conversation's: no
+/// agent (another conversation's, or the stopped one's own round past its rest) is moved
+/// onto it until it is proved to start without one; here its probe cannot run it, so the
+/// quiet restart waits `wait:build-fails`. Control: a stop on an older build holds no
+/// newer one back.
 #[cfg(unix)]
 #[test]
 fn a_build_that_failed_to_start_for_any_conversation_moves_no_agent_onto_it() {
@@ -5142,15 +5187,15 @@ fn a_build_that_failed_to_start_for_any_conversation_moves_no_agent_onto_it() {
             )
         })
     };
-    // ANOTHER conversation's relaunch onto 9.9.9 stopped 34 s ago; this
-    // agent's own round is pending, quiet, at an idle point.
+    // Another conversation's relaunch onto 9.9.9 stopped 34 s ago; this agent's own round
+    // is pending, quiet, at an idle point.
     let (r, _, typed) = visit("another-conversations-stop", &|opts| {
         failed_start_saved(opts, OTHER, "9.9.9", 34);
     });
     assert!(typed.iter().all(|l| !l.contains(" turn ")), "nothing typed");
     assert_eq!(r.step, "wait:build-fails", "another conversation: {r:?}");
-    // THIS conversation's own stop, its rest run out and its round re-armed:
-    // the build is no better for the rest.
+    // This conversation's own stop, its rest run out and its round re-armed: the build is
+    // no better for the rest.
     let (r, _, _) = visit("its-own-stop-rested", &|opts| {
         failed_start_saved(opts, SESSION, "9.9.9", upgrade::RETRY_S + 60);
         let writes = Opts {
@@ -5171,21 +5216,18 @@ fn a_build_that_failed_to_start_for_any_conversation_moves_no_agent_onto_it() {
         save(&writes, SESSION, &st);
     });
     assert_eq!(r.step, "wait:build-fails", "its own rested round: {r:?}");
-    // CONTROL: a stop on an older build holds no newer one back.
+    // Control: a stop on an older build holds no newer one back.
     let (r, _, _) = visit("an-older-builds-stop", &|opts| {
         failed_start_saved(opts, OTHER, "9.9.8", 34);
     });
     assert_eq!(r.step, "would-restart", "{r:?}");
 }
 
-/// THE FAILURE IS NOTED AGAINST THE BUILD ONCE, BY THE ONE WRITER
-/// ([`build_start::note_failure`], from [`save_at`]): a `no-resume` stop of a
-/// relaunch onto 9.9.9 (managed) is the build's failure; the same record
-/// saved again, a new process of the conversation that keeps the stop
-/// ([`St::keep_stop`]) and a restart's record that carries it
-/// ([`St::kept_by_restart`]) are the same failure; another conversation's
-/// stop is another. NEGATIVE CONTROLS, none noted: a stop of another reason,
-/// a relaunch that kept its program, a Codex record, a dry run's save.
+/// `build_start::note_failure`, from [`save_at`], notes a `no-resume` stop of a relaunch
+/// onto a build once: the record saved again, a new process keeping the stop
+/// ([`St::keep_stop`]) and a restart's record carrying it are the same failure; another
+/// conversation's stop is another. Negative controls, none noted: another reason, a
+/// relaunch that kept its program, a Codex record, a dry run.
 #[cfg(unix)]
 #[test]
 fn a_failed_start_is_noted_against_its_build_once_by_the_one_writer() {
@@ -5221,7 +5263,7 @@ fn a_failed_start_is_noted_against_its_build_once_by_the_one_writer() {
     assert_eq!(failures(&opts), 1, "a restart's record that carries it");
     failed_start_saved(&opts, OTHER, "9.9.9", 10);
     assert_eq!(failures(&opts), 2, "another conversation's stop");
-    // NEGATIVE CONTROLS.
+    // Negative controls.
     let unnoted = |name: &str, st: St, opts: &Opts| {
         save(opts, OTHER, &st);
         assert_eq!(
@@ -5266,13 +5308,10 @@ fn a_failed_start_is_noted_against_its_build_once_by_the_one_writer() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// THE GATE ([`build_start::starts`]): a build with no failure noted is
-/// taken without a probe; one with a failure is taken only once a probe run
-/// since passes, and a probe that did not pass is not run again within
-/// [`build_start::PROBE_GAP_S`]; a move that fails after a passing probe
-/// leaves the build BLIND — no probe proves it again. Every probe run is one
-/// ledger row (`build-probe:<what>`). A dry run runs no build: what is not
-/// proved is a wait.
+/// The gate ([`build_start::starts`]): a build with no failure noted is taken without a
+/// probe; one with a failure only once a probe run since passes (a failed probe is not
+/// rerun within [`build_start::PROBE_GAP_S`]); a move failing after a passing probe leaves
+/// it blind. Each probe is one ledger row (`build-probe:<what>`); a dry run runs none.
 #[cfg(unix)]
 #[test]
 fn a_build_that_failed_to_start_is_moved_onto_only_once_proved_to_start() {
@@ -5360,7 +5399,7 @@ fn a_build_that_failed_to_start_is_moved_onto_only_once_proved_to_start() {
         Err(BUILD_FAILS),
         "no probe proves a blind build again"
     );
-    // CONTROL: a move that began before the proof and failed after it is no
+    // Control: a move that began before the proof and failed after it is no
     // verdict on the probe: another build's note, proved, then that failure.
     let older = Candidate {
         version: Version::parse("9.9.8").expect("v"),
@@ -5384,12 +5423,9 @@ fn a_build_that_failed_to_start_is_moved_onto_only_once_proved_to_start() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// THE START PROBE RUNS THE BUILD AS ITS RELAUNCH WOULD, WITHOUT AN AGENT
-/// ([`build_start::probe`]): `<build> --help` — the lab's crashing twin
-/// (`lab.sh twin --crashing`) names its version to `--version` and exits 1
-/// at any other launch, so `--version` proves nothing — exited 0 starts;
-/// exited 1 does not; one that cannot be run does not; one that never ends
-/// is killed at the bound, its group whole.
+/// [`build_start::probe`] runs the build as its relaunch would, without an agent:
+/// `<build> --help` exiting 0 starts (`--version` proves nothing: a build that crashes at
+/// launch still names its version); exit 1, no exec, and a hang killed at the bound do not.
 #[cfg(unix)]
 #[test]
 fn the_start_probe_runs_the_build_with_its_help_flag_bounded() {
@@ -5425,12 +5461,10 @@ fn the_start_probe_runs_the_build_with_its_help_flag_bounded() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// THE MOVE WAITS ON A BUILD THAT FAILED TO START, AT A REAL VISIT
-/// ([`build_starts`] at the act): the quiet restart of an idle agent, the
-/// build noted failed by another conversation's stop, is a recorded wait
-/// (`wait:build-fails`), its probe one ledger row; the owner's view reads the
-/// record as ONE fault per build (`build-fails`), never a stop. CONTROL: a
-/// build a probe proved since is moved onto (`would-restart`).
+/// A real visit waits on a build that failed to start ([`build_starts`] at the act): the
+/// quiet restart of an idle agent onto a build another conversation's stop noted failed is
+/// a recorded wait (`wait:build-fails`), nothing typed. Control: a build a probe proved
+/// since is moved onto.
 #[cfg(unix)]
 #[test]
 fn a_real_visit_waits_on_a_build_that_failed_to_start_and_says_it_once() {
@@ -5463,7 +5497,7 @@ fn a_real_visit_waits_on_a_build_that_failed_to_start_and_says_it_once() {
     let saved = saved.expect("the record");
     assert_eq!(saved.phase, Phase::Pending);
     assert_eq!(saved.wait, BUILD_FAILS);
-    // CONTROL: proved since its failure, the build is moved onto.
+    // Control: proved since its failure, the build is moved onto.
     let (r, _, _) = quietly(|| {
         visit_launched(
             "build-proved-visit",
@@ -5495,16 +5529,10 @@ fn a_real_visit_waits_on_a_build_that_failed_to_start_and_says_it_once() {
     assert_eq!(r.step, "would-restart", "{r:?}");
 }
 
-/// A READY GIVEN FOR A MOVE ONTO A BUILD THAT FAILS TO START STOPS THE ROUND
-/// AND RELEASES THE AGENT (the ask flow, `upgrade_ask = true`): the agent
-/// answered the notice and stopped for a restart onto 9.9.9, which another
-/// conversation's relaunch found failing to start. No restart comes, so the
-/// round is stopped at once (`failed:build-fails`, [`upgrade::build_hold`]):
-/// its markers forgotten, so the answer can restart nothing later, and the
-/// agent told to carry on in the same visit, ONCE — never left waiting on a
-/// restart the build's hold keeps from coming. Its ledger row says why, once.
-/// A dry read says what it would do (`would-fail:build-fails`) and writes
-/// nothing.
+/// A READY given for a move onto a build that fails to start stops the round
+/// (`failed:build-fails`, [`upgrade::build_hold`]), its markers forgotten, and releases the
+/// agent once in the same visit (the ask flow); its ledger row says why, once. A dry read
+/// says `would-fail:build-fails` and writes nothing.
 #[cfg(unix)]
 #[test]
 fn a_ready_for_a_build_that_failed_to_start_stops_the_round_and_releases_its_agent() {
@@ -5570,16 +5598,9 @@ fn onto_a_failing_build(h: &Parked) -> (Vec<String>, usize, St) {
     (steps, releases, load(&h.opts, SESSION).expect("the record"))
 }
 
-/// A GIVEN-UP ROUND'S LATE READY ONTO A BUILD THAT FAILS TO START IS
-/// RELEASED (the review of round eighteen's upgradebuild lane, major 1): the
-/// round asked to its bound and gave up, its release owed, and the agent
-/// then wound down and answered READY. The restart it would take is onto
-/// 9.9.9, which another conversation's relaunch found failing to start. The
-/// build's gate held that restart as a wait (`wait:build-fails`), the READY
-/// held the release behind it (`upgrade::gate_release`), and no re-arm is
-/// due while a READY stands (`upgrade::retry_due`): the agent, stopped for a
-/// restart that cannot come, was never restarted, voided nor released. It is
-/// released, ONCE, its answer void. CONTROL: with no failure noted, the
+/// A given-up round's late READY onto a build that fails to start is released, once, its
+/// answer void: the build's gate holds the restart and no re-arm is due while a READY
+/// stands, so nothing else would release the agent. Control: with no failure noted, the
 /// READY restarts it.
 #[cfg(unix)]
 #[test]
@@ -5613,16 +5634,10 @@ fn a_late_ready_onto_a_build_that_fails_to_start_is_released() {
     );
 }
 
-/// A PENDING ROUND THAT OWES ITS AGENT A RELEASE TYPES IT WHILE ITS BUILD
-/// FAILS TO START (the review's major 2): a notice for another build was
-/// abandoned by a retarget (`retargeted`), and the agent it reached may have
-/// answered READY and stopped. Under the ask flow the round's next notice
-/// superseded that release, under the quiet flow its restart carried the
-/// agent on; the build's gate holds both (`wait:build-fails`), and that wait
-/// was no point the release is the next act at (`upgrade::release_is_next`),
-/// so the agent was never told the upgrade is off. It is, ONCE, in both
-/// flows. CONTROL: with no failure noted, the notice (ask flow) or the
-/// restart (quiet flow) goes.
+/// A pending round owing its agent a release (a notice abandoned by a retarget) types it,
+/// once, in both flows while its build fails to start: the gate's `wait:build-fails`
+/// holds the next notice or restart, so nothing else tells the agent the upgrade is off.
+/// Control: with no failure noted, the notice (ask flow) or the restart (quiet flow) goes.
 #[cfg(unix)]
 #[test]
 fn a_pending_round_owing_a_release_types_it_while_its_build_fails_to_start() {
@@ -5661,14 +5676,10 @@ fn a_pending_round_owing_a_release_types_it_while_its_build_fails_to_start() {
     }
 }
 
-/// AN ANNOUNCED ROUND WHOSE BUILD FAILS TO START RELEASES ITS AGENT (found
-/// beside the review's majors, of their class): the agent was asked to wind
-/// down — save its work, stop its watches, start no new long-running work —
-/// and answered "not yet". Past the window, the re-ask is a notice the
-/// build's gate holds (`wait:build-fails`): the round never asked again,
-/// never gave up and never owed a release, and the agent stayed wound down
-/// for a restart that could not come, for as long as the build failed. It is
-/// released, ONCE. CONTROL: with no failure noted, the re-ask goes.
+/// An announced round whose build fails to start releases its agent, once: the agent
+/// wound down and answered "not yet", and the re-ask the build's gate holds
+/// (`wait:build-fails`) would leave it wound down for as long as the build fails.
+/// Control: with no failure noted, the re-ask goes.
 #[cfg(unix)]
 #[test]
 fn an_announced_round_whose_build_fails_to_start_releases_its_agent() {
@@ -5699,15 +5710,9 @@ fn an_announced_round_whose_build_fails_to_start_releases_its_agent() {
     assert_eq!(after.round_markers().count(), 0, "{after:?}");
 }
 
-/// A FAILURE WHOSE RELAUNCH CAME UP AFTER ALL IS NO FAILURE OF ITS BUILD
-/// (the review's minor 4): a relaunch stopped `no-resume` — its start slower
-/// than the stale bound — is noted against its build, and after a passing
-/// probe it makes the build BLIND. When the agent its line started comes up
-/// after all, the visit takes the stop back (`reopened:relaunch-landed`,
-/// [`St::reopen_landed`]), but the note kept it: no agent was moved onto a
-/// build that starts, until a newer one shipped. The stop taken back is
-/// taken back from its build too: the other conversation's failure alone
-/// stands, which the probe proved since.
+/// A stop whose relaunch came up after all (`reopened:relaunch-landed`,
+/// [`St::reopen_landed`]) is taken back from its build's note too, so the build is no
+/// longer blind: only the other conversation's failure stands, which a probe proved since.
 #[cfg(unix)]
 #[test]
 fn a_failure_whose_relaunch_came_up_after_all_is_taken_back_from_its_build() {
@@ -5777,13 +5782,9 @@ fn a_failure_whose_relaunch_came_up_after_all_is_taken_back_from_its_build() {
     assert_eq!(moves, Ok(()));
 }
 
-/// THE OWNER'S `--now` PROBES A BLIND BUILD AGAIN (the review's minor 4): a
-/// build a move failed on after a passing probe is BLIND — no probe proves
-/// it again — and the owner's own word to move the agent now moved nothing,
-/// said nothing and ran nothing, until a newer build shipped. The owner's
-/// `--now` runs the probe once more: a build that starts is moved onto (its
-/// note proved again), one that does not still waits. CONTROL: without the
-/// owner's word the blind build is not probed.
+/// The owner's `--now` probes a blind build again (one a move failed on after a passing
+/// probe, which no probe proves again): a build that starts is moved onto, its note proved
+/// again. Control: without the owner's word the blind build is not probed.
 #[cfg(unix)]
 #[test]
 fn the_owners_now_probes_a_blind_build_again() {
@@ -5846,13 +5847,9 @@ fn the_owners_now_probes_a_blind_build_again() {
     assert_ne!(r.step, "wait:build-fails", "moved: {r:?}");
 }
 
-/// THE SETTINGS CHAIN IS READ FOR THE RECORD'S OWN PROCESS, NEVER A PID
-/// REUSED SINCE (the review's minor 7): the model rule reads the `--settings`
-/// an agent was launched with off its process's argv, and read it off
-/// `sf.pid` whatever process held that pid now — a recycled pid's
-/// `--settings` was the dead agent's allowlist. Read only where the process
-/// is the record's (its kernel start, Claude's `procStart`). CONTROL: the
-/// record's own process's `--settings` is read.
+/// The model rule reads an agent's `--settings` off its process's argv only where that
+/// process is the record's (its kernel start against Claude's `procStart`), never a
+/// recycled pid's. Control: the record's own process's `--settings` is read.
 #[cfg(unix)]
 #[test]
 fn the_settings_chain_reads_no_recycled_pids_settings_flag() {
@@ -5936,17 +5933,12 @@ fn the_settings_chain_reads_no_recycled_pids_settings_flag() {
     );
 }
 
-/// THE STOP A NEW PROCESS OF THE CONVERSATION KEEPS ([`St::keep_stop`]), at
-/// [`St::retarget`]: a Claude Code relaunch onto the target that never
-/// registered the conversation (`no-resume`) is that build's failure for the
-/// conversation, so another process of it keeps the stop, its rest's
-/// instant and its streak — bound to itself (its start, its build, its age
-/// from now), nothing of the ended agent's (no exit seen, no process brought
-/// up) — and the next such stop rests longer. Said once on the ledger
-/// (`kept-stopped:no-resume`). NEGATIVE CONTROLS, each a fresh pending round
-/// as before: the same process keeps its record as it was; another reason
-/// (the process's or its line's); another install of the build (native); a
-/// relaunch that kept its program; a Codex record; a newer build.
+/// [`St::keep_stop`] at [`St::retarget`]: a Claude Code relaunch onto the target that
+/// stopped `no-resume` is that build's failure for the conversation, so another process of
+/// it keeps the stop, its rest and its streak, bound to itself with nothing of the ended
+/// agent's, said once (`kept-stopped:no-resume`). Negative controls: the same process keeps
+/// its record; another reason, another install, a relaunch that kept its program, a Codex
+/// record and a newer build each start a fresh pending round.
 #[test]
 fn a_hand_resume_keeps_the_stop_of_the_build_that_failed_to_start_for_it() {
     let running = Version::parse("2.1.296").expect("v");
@@ -6051,7 +6043,7 @@ fn a_hand_resume_keeps_the_stop_of_the_build_that_failed_to_start_for_it() {
         "saved"
     );
     let _ = std::fs::remove_dir_all(&dir);
-    // NEGATIVE CONTROLS.
+    // Negative controls.
     let fresh = |prior: St, to: &Candidate| {
         let (st, how) = St::retarget(Some(prior), &running, to, None, proc("B"), 1_029);
         (st.phase, how)
@@ -6106,22 +6098,11 @@ fn a_hand_resume_keeps_the_stop_of_the_build_that_failed_to_start_for_it() {
     );
 }
 
-/// A RESTART ON ITS OWN PROGRAM KEEPS THE STOP OF A BUILD THAT FAILED TO
-/// START FOR THE CONVERSATION (the review of `fix/upgrade-homes`,
-/// 2026-10-14): the stop lived on the conversation's record alone, and a
-/// restart in place (a memory banner, a bucket's fallback, an account move)
-/// or a relaunch on exit kept on its program wrote its own record over it,
-/// keeping only the owner's hold and the move clock
-/// ([`St::kept_by_restart`]). Once that restart landed, the next visit's
-/// retarget minted a fresh pending round for the very build — no rest, no
-/// streak — and the quiet flow moved the hand-resumed agent onto it inside
-/// the rest: the `urfx1` harm by another road. Now the restart's record
-/// carries the stop ([`St::failed_start`]), through a second restart too,
-/// and the retarget off it rests as the stopped arm does
-/// ([`Retarget::Rested`]): the stop, its rest's instant and its streak, a
-/// repeat resting longer. The record reads back as written. NEGATIVE
-/// CONTROLS: a newer build is a new round at once, and a restart over a
-/// record with no such stop carries none.
+/// A restart on its own program keeps the stop of a build that failed to start for the
+/// conversation ([`St::failed_start`] on its record, through a second restart too), and
+/// the retarget off it rests as the stopped arm does ([`Retarget::Rested`]): the stop, its
+/// rest and its streak, a repeat resting longer. Negative controls: a newer build is a
+/// new round at once; a restart over a record with no such stop carries none.
 #[test]
 fn a_restart_on_its_own_program_keeps_the_stop_of_a_build_that_failed_to_start() {
     use super::super::relaunch::{CAUSE_EXIT, CAUSE_MEMORY};
@@ -6210,7 +6191,7 @@ fn a_restart_on_its_own_program_keeps_the_stop_of_a_build_that_failed_to_start()
     late.rearm(995 + upgrade::RETRY_S + 1);
     late.stop("no-resume", 995 + upgrade::RETRY_S + 600);
     assert_eq!(late.stop_streak, 2, "a stop that repeats");
-    // NEGATIVE CONTROLS.
+    // Negative controls.
     let (newer, how) = St::retarget(
         Some(landed),
         &running,
@@ -6339,13 +6320,10 @@ fn a_restart_in_flight_too_long_or_without_its_shell_never_acts_on_the_tab() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The stale-exit bound counts from the exit a look saw, not the signal: a
-/// restart whose agent took longer than [`STALE_S`] to shut down, seen gone by
-/// the host's carry a moment ago, is carried by the orphan pass too, never
-/// failed `stale-exit` from under the carry. Negative controls: seen gone past
-/// the bound, it is stale; and the pass's own first sighting of an exit (no
-/// stamp: the exit may be long past) decides on the signal, the one time known
-/// to come before it.
+/// The stale-exit bound counts from the exit a look saw, not the signal: an agent slow to
+/// shut down, seen gone by the host's carry a moment ago, is carried by the orphan pass
+/// too. Negative controls: seen gone past the bound, it is stale; the pass's own first
+/// sighting (no stamp) decides on the signal, the one time known to come before the exit.
 #[test]
 fn a_restart_in_flight_is_stale_from_its_seen_exit_not_its_signal() {
     let dir = scratch("stale-from-exit");
@@ -6394,13 +6372,10 @@ fn a_restart_in_flight_is_stale_from_its_seen_exit_not_its_signal() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A Claude Code restart records when its agent was seen gone
-/// ([`St::exited_at`]), as the Codex lane does: a failure after it has no
-/// process left to vet it by, and is the tab's record in the status view.
-/// Seen by the orphan pass, over an agent no longer alive, before its expiry
-/// is decided and before a socket is dialled. Negative controls: an agent
-/// still alive (exiting) is not gone and its record says nothing of an exit,
-/// and a dry run writes nothing.
+/// The orphan pass stamps when a Claude Code restart's agent was seen gone
+/// ([`St::exited_at`], as the Codex lane does), before expiry is decided or a socket
+/// dialled: a failure after it has no process left to vet it by. Negative controls: an
+/// agent still exiting is not stamped; a dry run writes nothing.
 #[test]
 fn a_restart_whose_agent_the_orphan_pass_sees_gone_says_when() {
     let dir = scratch("seen-gone");
@@ -6480,15 +6455,11 @@ fn noted_for(opts: &Opts, step: &str, session: &str) -> usize {
         .count()
 }
 
-/// A restart under way that has not moved is said once on the ledger. A Claude
-/// Code the upgrade SIGTERMed that hangs in its own shutdown (a hook, an MCP
-/// teardown) keeps its session file and pid, and every visit answers
-/// `wait:exiting`. Past [`STALE_S`] the visit says it once (`stuck:exiting`,
-/// keyed on [`St::noted`] as a held-back wait is), in the status view's words;
-/// a later visit writes nothing more. It stays a note: the visit still waits,
-/// the record stays in flight (a failure would leave an agent that exits later
-/// un-relaunched), and nothing is signalled or typed. The ledger and
-/// `--status` agree. Negative control: within the bound nothing is said.
+/// A hung exit (a SIGTERMed Claude Code stuck in its own shutdown keeps its session file)
+/// is said once past [`STALE_S`] (`stuck:exiting`, keyed on [`St::noted`]) and only noted:
+/// the visit still waits and the record stays in flight (a failure would leave an agent that
+/// exits later unrelaunched), nothing signalled or typed; the ledger and `--status` agree.
+/// Negative control: within the bound, nothing is said.
 #[cfg(unix)]
 #[test]
 fn a_hung_exit_past_its_bound_is_noted_once_and_nothing_is_forced() {
@@ -6538,12 +6509,9 @@ fn a_hung_exit_past_its_bound_is_noted_once_and_nothing_is_forced() {
     }
 }
 
-/// The orphan pass: a hung agent that has already removed its session file
-/// (Claude's graceful shutdown removes it first) is no conversation a visit
-/// sees, and the orphan pass skips it while its pid lives. Past [`STALE_S`]
-/// that skip says it once too; nothing is acted on and its record stays in
-/// flight. Negative controls: within the bound nothing is said, and a dry run
-/// writes nothing.
+/// The orphan pass skips a hung agent that already removed its session file while its pid
+/// lives, and past [`STALE_S`] says so once; nothing is acted on and its record stays in
+/// flight. Negative controls: within the bound nothing is said; a dry run writes nothing.
 #[test]
 fn a_hung_exit_with_no_session_file_is_noted_once_by_the_orphan_pass() {
     let dir = scratch("stuck-orphan");
@@ -6601,13 +6569,10 @@ fn a_hung_exit_with_no_session_file_is_noted_once_by_the_orphan_pass() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A relaunched agent that never carries on: the line that resumes it was
-/// typed and the new process holds the conversation, but its carry-on waits
-/// (never idle, or a tab whose ownership moved). Past [`STALE_S`] from the
-/// relaunch, the carry-on's wait says it once (`stuck:relaunched`); nothing is
-/// typed and the record stays relaunched. Negative controls: within the bound
-/// nothing is said, and a relaunch on exit's record (no upgrade, in no
-/// `--status`) says nothing either.
+/// A relaunched agent whose carry-on keeps waiting is said once past [`STALE_S`]
+/// (`stuck:relaunched`), nothing typed and the record still relaunched. Negative controls:
+/// within the bound nothing is said; a relaunch on exit's record (in no `--status`) says
+/// nothing.
 #[cfg(unix)]
 #[test]
 fn a_relaunch_that_never_carries_on_is_noted_once_past_its_bound() {
@@ -6679,14 +6644,10 @@ fn a_restart_whose_agent_the_relaunch_sees_gone_says_when() {
     assert_ne!(st.exited_at, 0, "seen gone");
 }
 
-/// ...AND SO FOR AN AGENT ITS SHELL HAS NOT REAPED YET (the live re-check of
-/// 2026-10-09): the SIGTERMed Claude Code a zombie as the relaunch looks.
-/// `wait_exit` reads its exit (the kernel watches no zombie), but the stamp
-/// asked `kill(pid, 0)`, which a zombie still answers: the record stood with
-/// no exit on it, and a relaunch stopped at once read as an upgrade still
-/// owed, hidden from the owner, its old agent's exit taken for a graceful
-/// one of its own. (Where the kernel can say a process is a zombie: macOS's
-/// exit watch, Linux's `/proc/<pid>/stat`.)
+/// So too for an agent its shell has not reaped yet: a zombie still answers
+/// `kill(pid, 0)`, so the exit stamp follows `wait_exit`, which reads a zombie's exit.
+/// (Where the kernel can say a process is a zombie: macOS's exit watch, Linux's
+/// `/proc/<pid>/stat`.)
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn a_restart_whose_agent_is_not_reaped_yet_says_when_it_ended() {
@@ -6771,31 +6732,20 @@ fn relaunched_over(name: &str, pid: u32) -> St {
     st
 }
 
-/// Every step word is taught, and an untaught one is no last word: the last
-/// words are named in [`after`]; every word the lanes say is taught
-/// ([`unknown_step`] false); a word nobody taught is looked at again at the
-/// ladder's longest pause, and the host warns of it. Negative control: a
-/// catch-all `_ => After::Finished`, replayed, reads the untaught word as the
-/// last one.
+/// Every step word is taught and an untaught one is no last word: the last words are named
+/// in [`after`], the words the lanes say are taught ([`unknown_step`] false; one of each family
+/// below), and an untaught word is looked at again at the ladder's longest pause, the host
+/// warning of it.
 #[test]
 fn every_step_word_is_taught_and_an_untaught_one_is_looked_at_again() {
     for last in [
         "current",
         "done",
         "done:fresh",
-        "done:taskless",
-        "done:no-continue",
-        "done:unconfirmed",
-        "ended:graceful-exit",
         "ended:one-shot",
         "skip:not-selected",
-        "skip:another-home",
-        "skip:not-a-tui",
-        "skip:no-managed-codex",
         "daemon-updated",
         "would-announce",
-        "would-restart:fresh",
-        "would-release:gave-up",
         "wait:skipped",
         "terminated",
         "relaunched",
@@ -6822,7 +6772,6 @@ fn every_step_word_is_taught_and_an_untaught_one_is_looked_at_again() {
         "held-back:terminal:tmux",
         "left-typed-cleared",
         "left-typed:notice",
-        "wait:announce-refused:changed",
         "wait:not-idle:busy",
         "wait:failed",
         "wait:box",
@@ -6832,31 +6781,11 @@ fn every_step_word_is_taught_and_an_untaught_one_is_looked_at_again() {
         "goal-paused",
         "goal-esc",
         "goal-paused-seen",
-        "goal-resumed",
         "goal-resumed:moved",
         "goal-released:by-hand",
         "goal-pause-refused",
-        "left-typed:goal-pause",
-        "wait:goal",
-        "wait:goal:record",
-        "wait:goal:switch",
         "wait:goal-held",
-        "wait:goal-pausing",
-        "wait:goal-pausing:no-fence",
-        "wait:goal-pause-refused:held",
-        "wait:goal-resume",
-        "wait:goal-resuming",
-        "wait:goal-left-paused",
-        "wait:goal-sandboxed",
-        "wait:switch",
-        "wait:daemon-turn",
-        "wait:daemon-busy",
-        "wait:pin:busy-thread",
-        "wait:changed",
-        "wait:in-flight",
-        "wait:no-shell-integration",
-        "wait:screen-unreadable",
-        "wait:failed:no-resume",
+        "wait:goal:record",
     ] {
         assert!(!unknown_step(word), "{word}");
         assert_ne!(after(word, 0), After::Finished, "{word}");
@@ -6876,16 +6805,6 @@ fn every_step_word_is_taught_and_an_untaught_one_is_looked_at_again() {
             "{word}"
         );
     }
-    // Negative control: the match as it ended until this day.
-    let old = |step: &str| {
-        if unknown_step(step) {
-            After::Finished
-        } else {
-            after(step, 0)
-        }
-    };
-    assert_eq!(old("brand-new"), After::Finished);
-    assert_ne!(after("brand-new", 0), old("brand-new"));
 }
 
 /// The busy footer is read below the composer, not in the transcript: an idle
@@ -6941,24 +6860,27 @@ fn a_footer_quoted_in_the_transcript_is_no_turn_running() {
         "  ⏵⏵ auto mode on (shift+tab to cycle)",
     ]);
     assert!(busy_footer(&spinning), "the spinner row above the composer");
-    // Negative control: the rule as it stood.
+    // Negative control: an any-row rule reads the quote as busy.
     let any_row = |rows: &[String]| rows.iter().any(|r| r.contains("esc to interrupt"));
     assert!(any_row(&quoted));
 }
 
-/// The Claude notice fences on its input box: where the host's `help turn`
-/// names `if-rows=`, the notice's `turn` carries the box's three rows (the
-/// rule, the `❯` caret row, the rule), hashed by the definition the host
-/// shares, and no `if-gen=`, so a spinner row repainting above the box does
-/// not refuse it. Negative controls: a host whose `help turn` has no
-/// `if-rows=` is fenced on the generation, and so is a screen whose caret row
-/// is not framed by rules (another program's composer).
+/// A host's `help turn` that names the rows fence (`if-rows=`).
+const ROWS_HELP: &str = "OK 1\nturn [option=value ...] <text>: ... [if-gen=<epoch>.<seq>] \
+                         [if-rows=<first>-<last>:<hex16>] ...";
+
+/// A host's `help turn` that names the typing budget (`cadence=`, `cap=`, `yield=`).
+const CAP_HELP: &str = "OK 1\nturn [option=value ...] <text>: ... [cadence=<ms>] [cap=<n>] \
+                        [yield=<floor>] [if-gen=<epoch>.<seq>] ...";
+
+/// The Claude notice fences on its input box where the host's `help turn` names
+/// `if-rows=`: the box's three rows (rule, caret row, rule), hashed as the host does, and
+/// no `if-gen=`, so a spinner repainting above the box does not refuse it. Negative
+/// controls: an older host, or a caret row not framed by rules, fences on the generation.
 #[cfg(unix)]
 #[test]
 fn the_claude_notice_fences_on_its_input_box_where_the_host_takes_if_rows() {
     use aterm_types::control_verbs::RowsFence;
-    const ROWS_HELP: &str = "OK 1\nturn [option=value ...] <text>: ... [if-gen=<epoch>.<seq>] \
-                             [if-rows=<first>-<last>:<hex16>] ...";
     let rule = "─".repeat(20);
     let screen = |framed: bool| {
         let edge = if framed {
@@ -7020,14 +6942,10 @@ fn the_claude_notice_fences_on_its_input_box_where_the_host_takes_if_rows() {
     );
 }
 
-/// The fenced notice asks nothing between its read and its `turn`: the server
-/// types nothing when output came after the generation it is handed, so the
-/// `help turn` probe is asked first and kept for the connection, and a read
-/// that needs the composer `cell` is read once more after it: the last `text`
-/// read is followed by the `turn` itself. A composer that moved between the
-/// two reads is `changed`, nothing typed. Negative control: the other order,
-/// replayed on a fresh connection, sends the `cell` and the probe after the
-/// read the turn is fenced on.
+/// The fenced notice asks nothing between its read and its `turn` (the server types
+/// nothing when output came after the generation it is handed): the `help turn` probe is
+/// asked first and kept, and a read that needs the `cell` is read once more after it.
+/// Negative control: the other order sends the `cell` and the probe after the fenced read.
 #[cfg(unix)]
 #[test]
 fn the_fenced_notice_asks_nothing_between_its_read_and_its_turn() {
@@ -7102,7 +7020,7 @@ fn the_fenced_notice_asks_nothing_between_its_read_and_its_turn() {
     drop(c);
     assert!(!verbs(&asked).contains(&"turn".to_string()));
     let _ = std::fs::remove_dir_all(&dir);
-    // Negative control: the order as it stood until this day.
+    // Negative control: the other order (the read, then the `cell` and the probe).
     let (dir, mut c, asked) = rig("fence-old-order", answers(None));
     let scr = screen(&mut c, TAB).expect("a read");
     assert!(composer_empty(&mut c, TAB, &scr));
@@ -7115,16 +7033,11 @@ fn the_fenced_notice_asks_nothing_between_its_read_and_its_turn() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// THE FENCE JUDGES THE COMPOSER WHERE IT IS DRAWN (the owner's tab of
-/// 2026-09-28: the grid one row displaced, the cursor on the rule BELOW the
-/// composer). The `cell` is asked at the composer's caret row, whatever the
-/// cursor's — Claude's own dim suggestion is an empty composer there, typed
-/// text is a draft — and the two reads a `cell` sits between are the same
-/// composer when the CARET row's text is the same, not the cursor row's (a
-/// person typing changes the composer row, which the cursor row under a
-/// displaced grid would not show). NEGATIVE CONTROLS: typed text on the
-/// displaced grid is a draft; a composer that changed between the reads is
-/// `changed`, nothing typed.
+/// The fence judges the composer where it is drawn, not at the cursor's row (a grid
+/// displaced by a row puts the cursor on the rule below): the `cell` is asked at the caret
+/// row, and two reads are the same composer when the caret row's text is the same.
+/// Negative controls: typed text there is a draft; a composer changed between the reads
+/// is `changed`, nothing typed.
 #[cfg(unix)]
 #[test]
 fn the_fence_judges_the_composer_row_not_the_cursors_row() {
@@ -7164,8 +7077,8 @@ fn the_fence_judges_the_composer_row_not_the_cursors_row() {
     drop(c);
     assert_eq!(asked_cells(&asked), [format!("@{TAB} cell 2 2")]);
     let _ = std::fs::remove_dir_all(&dir);
-    // The same rows with the text TYPED: a draft.
-    let (dir, mut c, _) = rig(
+    // The same rows with the text typed: a draft.
+    let (dir, mut c, _asked) = rig(
         "displaced-typed",
         base("try the tests", "OK p d0d0d0 111318 none"),
     );
@@ -7191,7 +7104,7 @@ fn the_fence_judges_the_composer_row_not_the_cursors_row() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// THE HOST'S NEXT MOVE after one step: park again at the next idle point
+/// The host's next move after one step: park again at the next idle point
 /// after an announcement (the answer comes at a turn's end), look again on a
 /// growing pause after any wait (every minute while a person's hold stands,
 /// [`HOLD_LOOK`]), say a state that cannot hold the lock once, and stop for
@@ -7226,13 +7139,10 @@ fn after_a_step_the_host_parks_waits_longer_stops_or_says_it_is_broken() {
     assert_eq!(after("drain-expired:box", 0), After::NextIdle);
     assert_eq!(after("released:gave-up", 0), After::Later(LATER[0]));
     assert_eq!(after("wait:release:limited", 2), After::Later(LATER[2]));
-    // A stopped round says so as it stops (`failed:<why>`, `refused:<what>`)
-    // and, resting with nothing owed, `wait:failed` (an owed release reads
-    // `wait:release:<why>`, a Codex record's stop `wait:failed:<why>`); none
-    // is a last word, since upgrades must never stall: a new round starts
-    // once it has rested `upgrade::RETRY_S`, so each is looked at again, up to
-    // the ten-minute look; so is the new round's `rearmed:<why>`, whose first
-    // notice the next look types.
+    // A stopped round says so as it stops (`failed:<why>`, `refused:<what>`) and, resting
+    // with nothing owed, `wait:failed`; none is a last word, since a new round starts once
+    // it has rested `upgrade::RETRY_S`, so each is looked at again up to the ladder's last
+    // look; so is the new round's `rearmed:<why>`.
     for resting in [
         "wait:failed:unanswered",
         "refused:not-a-shell-job",
@@ -7253,14 +7163,10 @@ fn after_a_step_the_host_parks_waits_longer_stops_or_says_it_is_broken() {
     assert!(LATER.windows(2).all(|w| w[0] < w[1]), "each pause longer");
 }
 
-/// Whether a step moved the session, and whether it typed a turn: a step that
-/// typed into the agent or ended it leaves no point for the loop to decide
-/// again, and one that typed a turn (a notice, a carry-on, the release line)
-/// is awaited as the harness's own, whose answer is no work of the worker's.
-/// Negative controls: a step that ended the agent typed no turn into it; and
-/// every word that typed and ended nothing (a carry-on's model read later,
-/// `done`, `done:model-unconfirmed`, a daemon-mode Codex carried on with
-/// nothing typed, a release still owed or dropped) leaves the point standing.
+/// Whether a step moved the session and whether it typed a turn: one that typed into the agent
+/// or ended it leaves no point to decide again, and a typed turn (notice, carry-on, release) is
+/// awaited as the harness's own. Negative controls: ending the agent types no turn; a word that
+/// typed and ended nothing leaves the point standing.
 #[test]
 fn a_step_that_typed_or_ended_the_agent_moved_the_session() {
     for turn in [
@@ -7309,13 +7215,10 @@ fn a_step_that_typed_or_ended_the_agent_moved_the_session() {
     }
 }
 
-/// The upgrade owns a session's turn ends by its own step's word
-/// ([`owns_turn_ends`], what the window's host answers its loop with): after
-/// the announcement, and while READY is given and the restart's gate only
-/// settles or drains background work (bounded); never after an answer without
-/// READY, a hold, a release still owed, or a last word. Negative controls:
-/// past the bounded looks a drain or a settle owns nothing, and a release owed
-/// owns nothing whatever holds it.
+/// The upgrade owns a session's turn ends by its step's word ([`owns_turn_ends`]): after the
+/// announcement, and while READY is given and the gate only settles or drains (bounded); never
+/// after an answer without READY, a hold, an owed release or a last word. Negative controls:
+/// past the bounded looks a drain or settle owns nothing; an owed release owns nothing.
 #[test]
 fn the_upgrade_owns_turn_ends_only_while_its_step_says_so() {
     const GRACE: u32 = 120;
@@ -7359,15 +7262,10 @@ fn the_upgrade_owns_turn_ends_only_while_its_step_says_so() {
     }
 }
 
-/// UNDER THE QUIET FLOW A WAIT ON THE AGENT'S OWN WORK OWNS NO TURN END AND
-/// BOUNDS NONE (round eight, #25; [`owns_turn_ends_as`], [`bounded_wait_as`]):
-/// its drain ownership is for an agent that answered READY, and the quiet
-/// flow asks for none — a pending round with a shell under its agent waited
-/// `background` at every idle point and held the loop's continuation for
-/// [`OWNED_BACKGROUND_LOOKS`] looks for a restart that could not come before
-/// the work ended, and spent the settle's looks the restart is due at once it
-/// does. NEGATIVE CONTROLS: the ask flow's drain owns and bounds as ever, and
-/// the quiet restart's settle, a notice and a person's hold own in both.
+/// Under the quiet flow a wait on the agent's own work owns no turn end and bounds none
+/// ([`owns_turn_ends_as`], [`bounded_wait_as`]): drain ownership is for an agent that
+/// answered READY, which the quiet flow never asks. Negative controls: the ask flow's
+/// drain owns and bounds; the settle, a notice and a person's hold own in both flows.
 #[test]
 fn a_quiet_wait_on_the_agents_work_owns_no_turn_end() {
     const GRACE: u32 = 120;
@@ -7394,23 +7292,11 @@ fn a_quiet_wait_on_the_agents_work_owns_no_turn_end() {
     }
 }
 
-/// A PERSON AT THE TAB OWNS THE TURN END FOR THE PERSON'S GRACE (the
-/// 2026-09-27 20:27 point, s-d3346, live records): the agent answered READY at
-/// 20:27:20, the owner had typed "ok" at 20:26:42, and the upgrade waited
-/// `held-back:attended` (20:27:27), then `wait:attended` (20:27:49, 20:28:10)
-/// OWNING NOTHING, its next look climbing to 60 s — so at the grace's lapse
-/// (20:28:42) the loop typed `keep going` over the READY, and the upgrade then
-/// waited 5 h 50 min for an idle point that never came. Now the attended wait
-/// owns the point while the person's grace runs — every look reads it afresh,
-/// and a person scrolling through the answer renews it — and is looked at again
-/// at the first rung while the next look owns it ([`after_attended`]), so the
-/// look that finds the grace lapsed lands within 20 s of it and takes the
-/// restart. Negative controls: past the backstop ([`ATTENDED_OWNED_S`] beyond
-/// the grace) it owns nothing, so a stamp that fails closed never holds the loop
-/// for good, and its looks go back on the ladder; `awaiting-ready`, a
-/// person's hold, a give-up and an adoption still own nothing; a break still
-/// gives an attended wait's claim back; and every other wait keeps its
-/// ladder.
+/// A person at the tab owns the turn end for their grace, so the loop types nothing over a
+/// READY, and the attended wait is looked at again at the first rung ([`after_attended`]).
+/// Negative controls: past the grace plus [`ATTENDED_OWNED_S`] it owns nothing and its looks
+/// go back on the ladder; `awaiting-ready`, a hold, a give-up and an adoption own nothing; a
+/// break gives it back.
 #[test]
 fn a_person_at_the_tab_owns_the_turn_end_for_their_grace() {
     const GRACE: u32 = 120;
@@ -7469,15 +7355,11 @@ fn a_person_at_the_tab_owns_the_turn_end_for_their_grace() {
     assert_eq!(after("held-back:terminal:tmux", 2), After::Later(LATER[2]));
 }
 
-/// The release is typed only where it is the upgrade's next act
-/// ([`release_is_next`]), and a step that leaves one owed never reads as the
-/// host's last word ([`owed_word`]). The upgrade's own give-up, void and stop,
-/// and its waits on nothing of its own, leave the release next; every wait of
-/// the notice's or the restart's gate keeps its word (what it waits for goes
-/// first). A stop's own word, `failed:…` / `refused:…`, is the host's last
-/// word ([`After::Finished`]), so one that leaves a release owed says
-/// `wait:release:<why>` instead. Negative controls: an act the host looks on
-/// after (`gave-up`, `drain-expired:…`) keeps its word.
+/// The release is typed only where it is the upgrade's next act ([`release_is_next`]): the
+/// upgrade's own give-up, void, stop and waits on nothing of its own leave it next, while
+/// a gate's wait keeps its word. A step leaving one owed never reads as the host's last
+/// word ([`owed_word`]): a stop says `wait:release:<why>` instead. Negative controls: an
+/// act the host looks on after keeps its word.
 #[test]
 fn the_release_is_the_next_act_only_where_nothing_else_is() {
     for (step, word, next) in [
@@ -7567,12 +7449,9 @@ fn the_release_is_the_next_act_only_where_nothing_else_is() {
     }
 }
 
-/// [`due`] parks a session only when it has an upgrade to take (a restart of
-/// this tab in flight is one) and says what it could not read rather than
-/// "not due", so an unanswered socket never lets the upgrade go for good.
-/// Negative controls: another tab's restart, and a finished one, are not
-/// `Yes`; with no socket to read the tab by, they are `Unread(no-socket)`,
-/// never `No`.
+/// [`due`] parks a session only for an upgrade to take (this tab's restart in flight is one)
+/// and says what it could not read rather than "not due". Negative controls: another tab's
+/// restart and a finished one are not `Yes`; with no socket they are `Unread(no-socket)`.
 #[test]
 fn due_is_this_tabs_upgrade_or_restart_and_nothing_unread() {
     let dir = scratch("due");
@@ -7659,15 +7538,9 @@ fn the_tab() -> [LiveTab; 1] {
     }]
 }
 
-/// AN ANNOUNCED ROUND WHOSE NOTICE CARRIED A MODEL IS THE HOST'S TO VISIT:
-/// with the build current and the rule keeping the
-/// model now (here nothing is offered at all), the host's pre-filter — the
-/// one [`due`] and the step's pass ask — skipped it, so a model-only round
-/// was never visited again: its READY never acted on, a barred ride never
-/// dropped, the agent the notice asked to wind down never released.
-/// NEGATIVE CONTROLS: the same round carrying no model, and a gave-up round
-/// whose release was typed (visited at an attach, as every give-up is), are
-/// not looked at.
+/// An announced round whose notice carried a model is looked at with the build current
+/// (the pre-filter [`due`] asks), so its READY, barred ride or owed release is acted on.
+/// Negative controls: the same round with no model, and a gave-up round, are not.
 #[test]
 fn an_announced_round_carrying_a_model_is_looked_at_with_the_build_current() {
     let dir = scratch("due-announced-model");
@@ -7704,7 +7577,7 @@ fn an_announced_round_carrying_a_model_is_looked_at_with_the_build_current() {
         ..St::default()
     };
     assert_eq!(look(&announced), Due::Yes, "the model's round is looked at");
-    // NEGATIVE CONTROLS.
+    // Negative controls.
     let no_model = St {
         model_list: String::new(),
         ..announced.clone()
@@ -7718,16 +7591,10 @@ fn an_announced_round_carrying_a_model_is_looked_at_with_the_build_current() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A RECORD IS READ ONLY WHERE IT DECIDES (the review of the silent-drop
-/// fix): a record whose agent leads the tab and is behind, but whose PROCESS
-/// could not be read whole — its ids (a `ps` that could not spawn: under
-/// fork pressure), its argv, or the tab's foreground caught moving between
-/// the roster and the ids — decided nothing, and the look is
-/// [`UNREAD_PROCESS`]. It was counted as read before its process was, and
-/// read "not due": a READY'd session was let go without a word. NEGATIVE
-/// CONTROLS: every read whole is `Yes`; a readable environment naming
-/// another tab is read — none of this tab's — and `No`; a current record
-/// needs no process read at all.
+/// A record whose agent leads the tab and is behind, but whose process could not be read
+/// whole (its ids, its argv, or the foreground caught moving), decides nothing:
+/// [`UNREAD_PROCESS`], never "not due". Negative controls: read whole is `Yes`; an
+/// environment naming another tab is `No`; a current record needs no process read.
 #[test]
 fn a_record_whose_process_could_not_be_read_is_unread_never_not_due() {
     let dir = scratch("due-process");
@@ -7820,16 +7687,11 @@ fn a_record_whose_process_could_not_be_read_is_unread_never_not_due() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A launch's record is waited on for its launch, not for good ([`no_record`]):
-/// no record of the tab's agent is a wait ([`UNREAD_RECORD`]) while the agent
-/// (the tab's foreground group's leader) is younger than [`RECORD_WINDOW_S`],
-/// and nothing to take once older: a Claude Code that keeps its records
-/// elsewhere (`CLAUDE_CONFIG_DIR`), or whose session is no interactive CLI
-/// one, never writes one this look can find. A leader whose start cannot be
-/// read is a process not read while it lives, and nothing once gone; a tab the
-/// instance no longer has is nothing. A machine with no `.claude/sessions`
-/// holds no records (the same window decides), while one whose records cannot
-/// be read whole is unread.
+/// [`no_record`]: no record of the tab's agent is a wait ([`UNREAD_RECORD`]) only while the
+/// agent is younger than [`RECORD_WINDOW_S`], then nothing to take (a Claude Code under
+/// another home, or a non-CLI session, never writes one this look finds). A leader whose
+/// start cannot be read is unread while it lives; a gone tab is nothing; records caught
+/// half-written are unread.
 #[test]
 fn a_launch_is_waited_on_for_its_record_only_within_its_window() {
     let tabs = the_tab();
@@ -7878,8 +7740,8 @@ fn a_launch_is_waited_on_for_its_record_only_within_its_window() {
     let dir = scratch("records");
     assert_eq!(claude_records(&dir), Some(Vec::new()), "none kept here");
     std::fs::create_dir_all(dir.join(".claude/sessions")).expect("sessions");
-    // Half-written by a LIVE process (this one): only a running process's
-    // record can be mid-write (round six, F20).
+    // Half-written by a live process (this one): only a running process's record can be
+    // mid-write.
     let me = std::process::id();
     std::fs::write(
         dir.join(format!(".claude/sessions/{me}.json")),
@@ -7890,21 +7752,12 @@ fn a_launch_is_waited_on_for_its_record_only_within_its_window() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Tier-1 of `HarnessUpgradeLook`, its classifier half (the host's bind in
-/// aterm-gui, `the_real_look_conforms_to_the_upgrade_look_model`, fakes `due`
-/// from the model's `readable` bit, so it binds only the host's reaction).
-/// Here the real [`due_among`] and [`no_record`] are driven over every
-/// combination of what a look reads of one tab (its agent's record there or
-/// not, behind or current, its group, its ids and argv each read or not, the
-/// foreground caught moving, its environment naming no tab, its own or
-/// another, the agent a second old or past [`RECORD_WINDOW_S`]), and each
-/// verdict is taken as the model's action (`Yes` is `Look`, `No` is
-/// `NotDue`, `Unread` is `Unread`) at the state the combination projects to,
-/// a look owed: `due` an upgrade the step could take (the worst case where
-/// nothing says), `readable` every read the verdict needed answered. The
-/// model must enable each. Negative control: a classifier that counts the
-/// record as read before its process answers `No` where a process read
-/// failed: `NotDue` where the model forbids it (`NeverDropped`'s cause).
+/// Tier-1 of `HarnessUpgradeLook`, its classifier half (the host's bind in aterm-gui fakes
+/// `due`): the real [`due_among`] and [`no_record`] over every combination of what a look
+/// reads of one tab, each verdict taken as the model's action (`Yes` is `Look`, `No` is
+/// `NotDue`, `Unread` is `Unread`) at the state it projects to, which the model must
+/// enable. Negative control: counting the record read before its process makes `NotDue`
+/// where the model forbids it.
 #[test]
 fn the_real_classifier_conforms_to_the_upgrade_look_model() {
     let model = aterm_spec::derive::harness_upgrade_look_model();
@@ -8033,11 +7886,9 @@ fn the_real_classifier_conforms_to_the_upgrade_look_model() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A session is behind from its worker's attach ([`note_behind`]): its state
-/// is minted `Pending` there (the target, the tab, its age from now), and the
-/// first step, at the first idle point after a busy first turn, reuses it and
-/// keeps that age. Negative controls: a state already there is left as it is,
-/// and a session on the newest build gets none.
+/// A session is behind from its worker's attach ([`note_behind`]): minted `Pending` there,
+/// and the first step reuses it with that age. Negative controls: a state already there is
+/// left; a session on the newest build gets none.
 #[test]
 fn a_session_behind_is_minted_pending_at_attach_and_its_step_keeps_the_age() {
     let dir = scratch("behind");
@@ -8086,13 +7937,10 @@ fn a_session_behind_is_minted_pending_at_attach_and_its_step_keeps_the_age() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A fresh launch is behind from its worker's attach, though the note can only
-/// be made once Claude Code has written its record. The host asks again until
-/// it can be read, with the second it first saw the session: the state is
-/// minted with its age from then ([`mint_behind`]'s `since`), not from the ask
-/// that finally read it. A look that cannot read the session notes nothing and
-/// says why ([`Behind::Unread`]), never "nothing to note". Negative control: a
-/// `since` in the future never makes a session younger than now.
+/// A fresh launch is noted behind once Claude Code has written its record, its age from
+/// the second the host first saw it ([`mint_behind`]'s `since`); a look that cannot read
+/// the session says why ([`Behind::Unread`]). Negative control: a `since` in the future
+/// never makes a session younger than now.
 #[test]
 fn a_launch_noted_once_its_record_is_there_is_behind_from_the_attach() {
     let dir = scratch("behind-since");
@@ -8132,13 +7980,10 @@ fn a_launch_noted_once_its_record_is_there_is_behind_from_the_attach() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A session upgraded before: the state an earlier upgrade left (done, or
-/// failed on another build) no longer says where the session stands once a
-/// newer build lands, so it is minted behind anew ([`behind_anew`]), its age
-/// from now, not left to the first step. Negative controls: a state still in
-/// flight, a carry-on whose model is still waited for, a failure on this very
-/// build (final for it), and a pending one (the step's, its age kept) are left
-/// as they are.
+/// A state an earlier upgrade left (done, or failed on another build) is minted behind
+/// anew when a newer build lands ([`behind_anew`]), its age from now. Negative controls: a
+/// state in flight, a carry-on awaiting its model, a failure on this very build, and a
+/// pending one are left as they are.
 #[test]
 fn a_session_upgraded_before_is_behind_anew_when_a_newer_build_lands() {
     let dir = scratch("behind-anew");
@@ -8197,15 +8042,11 @@ fn a_session_upgraded_before_is_behind_anew_when_a_newer_build_lands() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A conversation resumed in another tab is behind there from the host's
-/// attach ([`mint_behind`]): the watch, the window's view and `--status` find a
-/// record by its tab, so at the attach that proves the conversation is held
-/// here the record is moved into this tab and onto the build the visit would
-/// choose (`retargeted:9.9.8->9.9.9`, said once in the ledger), its round and
-/// age kept, and this tab's rows name it; a stopped round resting is moved
-/// into this tab too. Negative controls: a record already in this tab is left
-/// as it is, and so is an announced round in another tab (its tab the
-/// notice's fence).
+/// A conversation resumed in another tab is moved into this tab at the host's attach
+/// ([`mint_behind`]) and onto the build the visit would choose (`retargeted:…`, said
+/// once), its round and age kept; a resting stopped round moves too. Negative controls: a
+/// record already here, or an announced round in another tab (its tab the notice's
+/// fence), stays.
 #[test]
 fn a_conversation_resumed_in_another_tab_is_retabbed_at_the_attach() {
     let dir = scratch("behind-retab");
@@ -8265,13 +8106,10 @@ fn a_conversation_resumed_in_another_tab_is_retabbed_at_the_attach() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A shell whose dialect the relaunch line is written for, alive until the
-/// test lets it go: bash blocks in its own `read` of a pipe the handle holds,
-/// so it stays the process and never ends on a clock a slow test outlives
-/// (a bash gone before its test ends is a zombie `ps` names `<defunct>`: a
-/// shell with no dialect). It holds that pipe and its stdio, nothing else: a
-/// bash that lives as long as its test is exactly the holder this file's
-/// `Command` import keeps out of another test's `ps`.
+/// A bash, a dialect the relaunch line is written for, alive until the test lets it go: it
+/// blocks in its own `read` of a pipe the handle holds, so it never ends on a clock a slow
+/// test outlives (a gone bash is a `<defunct>` zombie, a shell with no dialect). It holds
+/// that pipe and its stdio, nothing else (see this file's `Command` import).
 fn stand_in_shell() -> aterm_uds::spawnfd::Child {
     Command::new("/bin/bash")
         .args(["-c", "read -r _"])
@@ -8280,19 +8118,11 @@ fn stand_in_shell() -> aterm_uds::spawnfd::Child {
         .expect("bash")
 }
 
-/// THE OWNER'S `Skip` AND `Not today` HOLD A CRASH'S RELAUNCH (round eight,
-/// #24): the relaunch on exit chose the newest build it could move to and
-/// never read the owner's word on the tab, so an agent that crashed came
-/// back on the very build its owner had skipped (or deferred). Now a build
-/// the conversation's upgrade record holds the session off for this tab is
-/// no relaunch target: it comes back on the program it ran. So is A BUILD
-/// THAT FAILED TO START FOR THE CONVERSATION while its stop's rest stands
-/// ([`St::holds_off`]), whatever ended the agent: a crash, the stall
-/// remedy, `aterm ctl restart`, aterm's own end. NEGATIVE CONTROLS: no
-/// word, a deferral run out, a word on another tab and `--now` move it as
-/// before; a build NEWER than the skipped one is moved to; so is the failed
-/// build once the rest has run out (a stop there again then repeats), and a
-/// build a stop of another reason, or of an older build, names.
+/// The owner's `Skip` and `Not today` hold a crash's relaunch: a build the conversation's
+/// record holds the session off for this tab, or one that failed to start for it while its
+/// stop's rest stands ([`St::holds_off`]), is no relaunch target; the agent comes back on
+/// the program it ran. Negative controls: no word, a lapsed deferral, another tab's word,
+/// `--now`, a newer build, a rest run out, or a stop for another reason or build, move it.
 #[cfg(unix)]
 #[test]
 fn a_build_the_conversations_record_holds_it_off_is_no_relaunch_target() {
@@ -8331,6 +8161,7 @@ fn a_build_the_conversations_record_holds_it_off_is_no_relaunch_target() {
     .expect("the crash's record");
     let program = versions.join("2.1.281");
     let snap = Snapshot {
+        stored_login: false,
         tab: TAB.to_string(),
         pid: dead,
         start: start.to_string(),
@@ -8381,7 +8212,7 @@ fn a_build_the_conversations_record_holds_it_off_is_no_relaunch_target() {
         held,
         "not today"
     );
-    // NEGATIVE CONTROLS.
+    // Negative controls.
     assert_eq!(relaunched_to(Request::None, ""), moved, "no word");
     assert_eq!(
         relaunched_to(Request::DeferUntil(now - 1), TAB),
@@ -8399,13 +8230,8 @@ fn a_build_the_conversations_record_holds_it_off_is_no_relaunch_target() {
         moved,
         "a build newer than the skipped one"
     );
-    // A BUILD THAT FAILED TO START FOR THE CONVERSATION holds its relaunch
-    // the same way while the stop's rest stands ([`St::holds_off`]; the
-    // review of `fix/upgrade-homes`, 2026-10-14): the conversation's record
-    // is the kept stop of an upgrade onto 99.9.9 that stopped `no-resume`,
-    // its hand resume crashed (or was ended by the stall remedy, by `aterm
-    // ctl restart`, or with aterm itself), and the relaunch on exit moved it
-    // straight onto the build that had just failed to start for it.
+    // A build that failed to start for the conversation holds its relaunch the same way
+    // while the stop's rest stands ([`St::holds_off`]), whatever ended the agent.
     use super::super::restart_stamp::Cause;
     let stopped = |why: &str, to: &str, ago: u64| St {
         phase: Phase::Failed(why.to_string()),
@@ -8438,7 +8264,7 @@ fn a_build_the_conversations_record_holds_it_off_is_no_relaunch_target() {
             held,
             "{how}: inside the stop's rest"
         );
-        // NEGATIVE CONTROLS: the rest run out; another reason, the process's
+        // Negative controls: the rest run out; another reason, the process's
         // or its line's; a stop of an older build.
         assert_eq!(
             relaunched_over(&stopped("no-resume", "99.9.9", upgrade::RETRY_S + 60), how),
@@ -8474,10 +8300,9 @@ fn a_build_the_conversations_record_holds_it_off_is_no_relaunch_target() {
     let rested = stopped("no-resume", "99.9.9", upgrade::RETRY_S + 60);
     assert_eq!(stopped_on(&rested, "99.9.9"), 2, "a stop that repeats");
     assert_eq!(stopped_on(&rested, "99.9.10"), 1, "another build");
-    // A BUILD THAT FAILED TO START FOR ANOTHER CONVERSATION, not proved to
-    // start since ([`build_starts`], round eighteen): this conversation's
-    // record holds nothing, and its crash comes back on the program it ran.
-    // CONTROL: proved to start since, it is moved onto.
+    // A build that failed to start for another conversation, not proved to start since
+    // ([`build_starts`]): this conversation's record holds nothing, yet its crash comes
+    // back on the program it ran. Control: proved to start since, it is moved onto.
     let _ = std::fs::remove_file(state_path(&opts, SESSION));
     let writes = Opts {
         dry_run: false,
@@ -8511,18 +8336,11 @@ fn a_build_the_conversations_record_holds_it_off_is_no_relaunch_target() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A RESTART OR A RELAUNCH ON ITS OWN PROGRAM KEEPS THE OWNER'S HOLD AND THE
-/// MOVE CLOCK, AND THE ROUND AFTER IT KEEPS THEM (round eight, #24): a memory
-/// banner's restart in place, a bucket's fallback, a crash relaunched on the
-/// program it ran each wrote a fresh record over the upgrade's, and the next
-/// visit's retarget minted a round with no word and its clock at zero — under
-/// the quiet flow moving the session onto the very build the owner skipped
-/// at its next idle point. Now the restart's record keeps the hold and how
-/// long the session has been behind ([`St::kept_by_restart`]), and the
-/// retarget off it keeps the hold that still names its target and that clock
-/// ([`St::for_target`]). NEGATIVE CONTROLS: a skip does not follow onto a
-/// NEWER build; a deferral run out, `--now` and a word on another tab are not
-/// kept; a finished MOVE keeps no clock (the session is behind anew).
+/// A restart or relaunch on its own program keeps the owner's hold and the move clock
+/// ([`St::kept_by_restart`]), and the round after it keeps them too ([`St::for_target`]),
+/// so the quiet flow never moves the session onto a build the owner skipped. Negative
+/// controls: a skip does not follow onto a newer build; a lapsed deferral, `--now` and a
+/// word on another tab are not kept; a finished move keeps no clock.
 #[test]
 fn a_restart_on_its_own_program_keeps_the_owners_hold_and_the_round_after_it_too() {
     use super::super::relaunch::CAUSE_MEMORY;
@@ -8575,7 +8393,7 @@ fn a_restart_on_its_own_program_keeps_the_owners_hold_and_the_round_after_it_too
     assert_eq!(next.request_for(TAB), skip, "the round after it");
     assert!(next.request.holds(&next.phase, "2.1.300", now));
     assert_eq!(next.behind_since(), now - 7_200, "the move clock");
-    // NEGATIVE CONTROL: a skip names ONE build.
+    // Negative control: a skip names one build.
     let newer = St::for_target(
         Some(restart),
         &running,
@@ -8618,7 +8436,7 @@ fn a_restart_on_its_own_program_keeps_the_owners_hold_and_the_round_after_it_too
             "{word:?} {tab}: {next:?}"
         );
     }
-    // NEGATIVE CONTROL: a finished MOVE onto its build is behind anew.
+    // Negative control: a finished move onto its build is behind anew.
     let moved = St {
         phase: Phase::Done,
         from: "2.1.280".to_string(),
@@ -8639,19 +8457,11 @@ fn a_restart_on_its_own_program_keeps_the_owners_hold_and_the_round_after_it_too
     assert_eq!(next.behind_since(), now);
 }
 
-/// A RESTART THAT STOPS KEEPS THE OWNER'S SKIP OF THE BUILD IT HELD OFF
-/// (round eight, #24): a restart or relaunch on the session's own program
-/// carries the owner's `Skip` of the build it did not move to
-/// ([`St::kept_by_restart`]); when that restart STOPS — a relaunch overtaken
-/// or out of time, the conversation resumed elsewhere, a refused relaunch —
-/// its record is a stopped one on the build the session still runs, and the
-/// next retarget's stopped arm dropped every skip unasked: a new round with
-/// no word, which the quiet flow moved onto the skipped build at its next
-/// idle point. Now a skip that still names the new target is kept
-/// ([`St::word_onto`]), with the move clock. NEGATIVE CONTROLS: an upgrade
-/// round's own skip of the build IT moved to does not follow onto a newer
-/// one, and neither does the restart's onto a build newer than the one it
-/// names.
+/// A restart on the session's own program that stops keeps the owner's `Skip` of the
+/// build it held off ([`St::kept_by_restart`]), with the move clock: the retarget's stopped
+/// arm keeps a skip that still names the new target (`St::word_onto`). Negative controls:
+/// an upgrade round's own skip of its target, and the restart's onto a newer build, do
+/// not follow.
 #[test]
 fn a_restart_that_stops_keeps_the_owners_skip_of_the_build_it_held_off() {
     use super::super::relaunch::CAUSE_EXIT;
@@ -8702,7 +8512,7 @@ fn a_restart_that_stops_keeps_the_owners_skip_of_the_build_it_held_off() {
         assert_eq!(next.request_for(TAB), skip, "{why}: the owner's skip");
         assert!(next.request.holds(&next.phase, "2.1.300", now), "{why}");
         assert_eq!(next.behind_since(), now - 7_200, "{why}: the move clock");
-        // NEGATIVE CONTROL: a skip names ONE build.
+        // Negative control: a skip names one build.
         let newer = St::for_target(
             Some(restart),
             &running,
@@ -8713,8 +8523,8 @@ fn a_restart_that_stops_keeps_the_owners_skip_of_the_build_it_held_off() {
         );
         assert_eq!(newer.request, Request::None, "{why}");
     }
-    // NEGATIVE CONTROL: the upgrade round's own skip, its round stopped, does
-    // not follow onto the newer build (it names the build that round moved to).
+    // Negative control: the upgrade round's own skip, its round stopped, does not follow
+    // onto the newer build (it names the build that round moved to).
     let mut stopped = upgrade_round.clone();
     stopped.stop("relaunch-refused", now - 10);
     let next = St::for_target(
@@ -8729,23 +8539,11 @@ fn a_restart_that_stops_keeps_the_owners_skip_of_the_build_it_held_off() {
     assert!(!next.request.holds(&next.phase, "2.1.301", now));
 }
 
-/// A RESTART KEEPS THE MOVE CLOCK ONLY OF A RECORD ABOUT THE BUILD IT KEEPS
-/// THE SESSION ON (round eight, #24's review): [`St::kept_by_restart`] copied
-/// the prior record's clock whatever build that record was about. A round for
-/// 2.1.290 stopped `resumed-elsewhere` because the person resumed the
-/// conversation by hand on 2.1.290; a crash or a memory restart of it, kept on
-/// that program, carried the old round's clock onto its own record, and when
-/// 2.1.300 landed days later its round began at the ladder's last rung — no
-/// settle, a person's grace cut to a keystroke's, the quiet restart at the
-/// first idle point, its row overdue at once. Without the restart in between
-/// the retarget's stopped arm starts that clock afresh, and so does the
-/// restart now — through an older same-program record too. And a restart of
-/// the same program that STOPPED (a relaunch overtaken or out of time) is
-/// still behind, as the retarget's stopped arm keeps it: its clock was
-/// dropped. NEGATIVE CONTROLS: a round about the build the restart keeps,
-/// and a stopped restart of it, keep the clock; the owner's skip of a build
-/// is kept whatever build its record is about, as the retarget without the
-/// restart keeps it.
+/// [`St::kept_by_restart`] keeps the move clock only of a record about the build the
+/// restart keeps the session on: a stopped round for another build starts the clock afresh,
+/// as the retarget's stopped arm does, so the next build's round begins at its first rung.
+/// Negative controls: a round about the kept build, and a stopped restart of it, keep the
+/// clock; the owner's skip is kept whatever build its record is about.
 #[test]
 fn a_restart_keeps_the_move_clock_only_of_a_record_about_the_build_it_keeps() {
     use super::super::relaunch::{CAUSE_EXIT, CAUSE_MEMORY};
@@ -8810,7 +8608,7 @@ fn a_restart_keeps_the_move_clock_only_of_a_record_about_the_build_it_keeps() {
         ..St::default()
     };
     assert_eq!(restarted(&older_restart).behind_since(), now);
-    // NEGATIVE CONTROL: a round about the build the restart keeps.
+    // Negative control: a round about the build the restart keeps.
     let round_on_it = St {
         phase: Phase::Pending,
         from: "2.1.290".to_string(),
@@ -8822,8 +8620,8 @@ fn a_restart_keeps_the_move_clock_only_of_a_record_about_the_build_it_keeps() {
         ..St::default()
     };
     assert_eq!(restarted(&round_on_it).behind_since(), t0);
-    // A STOPPED restart of the same program is still behind (#24's review):
-    // its clock is kept by the restart after it, as by the retarget.
+    // A stopped restart of the same program is still behind: its clock is kept by the
+    // restart after it, as by the retarget.
     let mut stopped_relaunch = St {
         phase: Phase::Exiting { at_s: now - 60 },
         from: "2.1.290".to_string(),
@@ -8846,7 +8644,7 @@ fn a_restart_keeps_the_move_clock_only_of_a_record_about_the_build_it_keeps() {
         now,
     );
     assert_eq!(direct.behind_since(), t0, "the retarget keeps it too");
-    // NEGATIVE CONTROL: a stopped restart of ANOTHER build keeps no clock.
+    // Negative control: a stopped restart of another build keeps no clock.
     let other = St {
         from: "2.1.281".to_string(),
         to: "2.1.281".to_string(),
@@ -8873,17 +8671,12 @@ fn a_restart_keeps_the_move_clock_only_of_a_record_about_the_build_it_keeps() {
     assert!(direct.request.holds_build("2.1.300", now), "{direct:?}");
 }
 
-/// A STOPPED ROUND'S RETARGET KEEPS WHAT TELLS THE CODEX LANE ITS TUI WAS TOLD
-/// TO WIND DOWN (round eight, #23): the Codex lane types no release, and its
-/// quiet move carries a TUI on after its relaunch only where the record says
-/// a notice once reached it ([`St::noticed_at`]) or its round before gave up
-/// ([`St::last_stop`]). The stopped and abandoning arms of [`St::retarget`]
-/// built a fresh round with neither, so a newer Codex landing during a
-/// give-up's rest made the TUI's next move a quiet one, nothing typed after
-/// it. Now both arms carry the notice's stamp, and a Codex record the give-up
-/// (as the rest's re-arm records it). NEGATIVE CONTROLS: a Codex round
-/// stopped for another reason with no notice carries nothing; a Claude Code
-/// record's owner's view keeps no stop (its release carries the wind-down).
+/// A stopped round's retarget keeps what tells the Codex lane its TUI was told to wind
+/// down (that lane types no release, and carries a TUI on after its relaunch only where a
+/// notice reached it, [`St::noticed_at`], or its round before gave up, [`St::last_stop`]):
+/// the stopped and abandoning arms of [`St::retarget`] carry both. Negative controls: a
+/// Codex stop for another reason with no notice carries nothing; a Claude Code record
+/// keeps no stop.
 #[test]
 fn a_stopped_rounds_retarget_keeps_what_says_its_tui_was_told_to_wind_down() {
     let now = 1_790_000_000_u64;
@@ -8947,8 +8740,8 @@ fn a_stopped_rounds_retarget_keeps_what_says_its_tui_was_told_to_wind_down() {
         (next.noticed_at, next.last_stop.as_str()),
         (now - 3_600, "")
     );
-    // THE ABANDONING ARM (a round for another model): the stamp, and a
-    // re-armed give-up's stop.
+    // The abandoning arm (a round for another model): the stamp, and a re-armed
+    // give-up's stop.
     let announced = St {
         model_list: "gpt-5.5".to_string(),
         ..round(
@@ -8977,7 +8770,7 @@ fn a_stopped_rounds_retarget_keeps_what_says_its_tui_was_told_to_wind_down() {
     };
     let next = St::for_target(Some(rearmed), &running, &newer, None, Proc::default(), now);
     assert_eq!(next.last_stop, upgrade::GAVE_UP);
-    // NEGATIVE CONTROLS: nothing asked, nothing carried; a Claude Code
+    // Negative controls: nothing asked, nothing carried; a Claude Code
     // record keeps no stop.
     let next = St::for_target(
         Some(round(codex, refused, 0)),
@@ -8999,16 +8792,11 @@ fn a_stopped_rounds_retarget_keeps_what_says_its_tui_was_told_to_wind_down() {
     assert_eq!(next.last_stop, "");
 }
 
-/// RELAUNCH ON EXIT relaunches only an agent that CRASHED — exited leaving
-/// Claude's own record behind (a crash cannot remove it) — on the
-/// conversation that record names, and carries on a relaunch in flight
-/// rather than typing a second one. Dry runs: the steps are decided against
-/// real processes and files, and nothing is typed or written. NEGATIVE
-/// CONTROLS: an agent that still runs; a launch no record names a
-/// conversation of, and a one-shot run — each the launch's own end, never
-/// relaunched and never refused; and a GRACEFUL exit (its record removed:
-/// a person's or an orchestrator's `/exit`, a `kill`) — someone's decision,
-/// never relaunched from the snapshot.
+/// The relaunch on exit relaunches only a crashed agent (its own record left behind) on
+/// the conversation that record names, and carries on one in flight rather than typing a
+/// second. Dry runs. Negative controls: an agent still running; no conversation on record
+/// and a one-shot run (the launch's own end); a graceful exit (record removed), someone's
+/// decision.
 #[test]
 fn a_relaunch_on_exit_needs_an_exit_and_a_conversation_on_record() {
     let dir = scratch("after-exit");
@@ -9032,6 +8820,7 @@ fn a_relaunch_on_exit_needs_an_exit_and_a_conversation_on_record() {
     let mut shell = stand_in_shell();
     let shell_pid = shell.id();
     let snap = |pid: u32, start: &str, session: Option<&str>| Snapshot {
+        stored_login: false,
         tab: TAB.to_string(),
         pid,
         start: start.to_string(),
@@ -9109,7 +8898,7 @@ fn a_relaunch_on_exit_needs_an_exit_and_a_conversation_on_record() {
     // A conversation Claude filed no transcript for (no message yet) cannot
     // be resumed: the agent is started afresh — and so in a Claude home with
     // no projects at all (Claude makes them with the home's first message).
-    // NEGATIVE CONTROL: projects that exist and cannot be listed say nothing,
+    // Negative control: projects that exist and cannot be listed say nothing,
     // and the conversation is resumed (Claude says if it cannot).
     let projects = opts.home.join(".claude/projects");
     std::fs::remove_file(project.join(format!("{SESSION}.jsonl"))).expect("rm");
@@ -9131,8 +8920,8 @@ fn a_relaunch_on_exit_needs_an_exit_and_a_conversation_on_record() {
         (r.step.as_str(), r.session.as_str()),
         ("would-relaunch", later)
     );
-    // A record of ANOTHER process's start is not this agent's: its own is
-    // gone, a graceful exit.
+    // A record of another process's start is not this agent's: its own is gone, a
+    // graceful exit.
     let r = at_attempt(
         &snap(dead, "Mon Jan  1 00:00:00 2024", Some(SESSION)),
         false,
@@ -9216,6 +9005,7 @@ impl DeadAgent {
         let shell = stand_in_shell();
         let dead = dead_pid();
         let snap = Snapshot {
+            stored_login: false,
             tab: TAB.to_string(),
             pid: dead,
             start: "Thu Sep 24 01:02:03 2026".to_string(),
@@ -9303,14 +9093,11 @@ impl Drop for DeadAgent {
     }
 }
 
-/// What the exit left is read as the exit is seen, and kept. A crashed agent's
-/// record that another Claude Code removes during the back-off (starting in
-/// another tab) is still relaunched, on the conversation the look kept.
-/// Negative controls: a graceful exit whose record goes a moment after the
-/// exit is seen (inside the settle; `/exit` removes its own in its last
-/// moments) is read as removed and left, though the first look saw the
-/// record; and a record read at the attempt, replayed, reads the crash as a
-/// graceful exit.
+/// What the exit left is read as the exit is seen, and kept: a crash's record another
+/// Claude Code removes during the back-off is still relaunched, on the conversation the
+/// look kept. Negative controls: a graceful exit whose record goes inside the settle
+/// (`/exit` removes its own in its last moments) is left; a read at the attempt reads the
+/// crash as graceful.
 #[test]
 fn a_crash_read_at_its_exit_is_relaunched_whatever_removes_its_record_later() {
     let a = DeadAgent::new("exit-record");
@@ -9326,7 +9113,7 @@ fn a_crash_read_at_its_exit_is_relaunched_whatever_removes_its_record_later() {
     child.kill().expect("kill");
     child.wait().expect("reap");
     assert!(!look_at_exit(&a.opts.home, &a.snap).running);
-    // THE CRASH: its record survives the settle, and the look keeps it.
+    // The crash: its record survives the settle, and the look keeps it.
     a.write_record();
     let mut waits = 0_u32;
     let left = a.look(|_| waits += 1);
@@ -9344,13 +9131,11 @@ fn a_crash_read_at_its_exit_is_relaunched_whatever_removes_its_record_later() {
     assert_eq!(a.attempt(&left), "would-relaunch");
     let r = after_exit(&a.opts, &a.snap, &left, true, None);
     assert_eq!(r.session, SESSION, "the conversation the look kept");
-    // The defect, replayed: the record read at the attempt says graceful.
+    // Read at the attempt instead, the record says graceful.
     assert_eq!(a.attempt(&ExitRecord::Unread), "ended:graceful-exit");
-    // …unless an attempt of this exit read its record and relaunched it, and
-    // the agent that relaunch brought up was gone again before anything read
-    // it (the window's host tries the exit again): the record that relaunch
-    // filed names this agent, and the crash it read stands — the relaunched Claude Code's start swept
-    // the record it read.
+    // …unless an attempt of this exit relaunched it and the relaunched agent was gone
+    // again before anything read it (the window's host tries the exit again): the crash
+    // that relaunch read stands, since the relaunched Claude Code's start swept the record.
     let writes = Opts {
         dry_run: false,
         ..a.opts.clone()
@@ -9384,7 +9169,7 @@ fn a_crash_read_at_its_exit_is_relaunched_whatever_removes_its_record_later() {
     assert!(first_saw, "the first look saw the record");
     assert_eq!(left, ExitRecord::Removed);
     assert_eq!(a.attempt(&left), "ended:graceful-exit");
-    // …unless the stall's remedy ended it (U1): relaunched all the same.
+    // …unless the stall's remedy ended it: relaunched all the same.
     let r = after_exit(
         &a.opts,
         &a.snap,
@@ -9402,22 +9187,12 @@ fn a_crash_read_at_its_exit_is_relaunched_whatever_removes_its_record_later() {
     assert_eq!(look_at_exit(&a.opts.home, &reused).record, None);
 }
 
-/// An exit the harness's own restart made is never read as someone's. The
-/// upgrade's SIGTERM (and the restart in place's) is a graceful end, so Claude
-/// removes its own record ([`ExitRecord::Removed`]). A restart its step left in
-/// flight past [`STALE_S`] (the relaunch lane's back-off can pass the bound)
-/// is stopped with the moment its agent was seen gone (the status view shows
-/// it) and said — `told:<why>` for the upgrade's causes, whose own row asks
-/// the owner, `refused:<why>` for the restart in place's (the one case the
-/// host asks a person about) — and again for a
-/// restart already stopped after its exit; it never falls through to
-/// `ended:graceful-exit` unsaid. A relaunched one that never registered is
-/// never relaunched afresh: its line was typed once. Negative controls: a
-/// relaunch on exit's own record (its agent crashed), a record of another
-/// process than the one that left (closed with no failure stamp, where that
-/// process is the relaunch's own agent and the one that left the relaunched
-/// one), and a restart whose signal the kernel refused (its agent never seen
-/// gone) each fall through.
+/// An exit the harness's own restart made (a graceful end, its record removed) is never
+/// read as someone's: a restart left in flight past [`STALE_S`] is stopped, its agent's
+/// end stamped, and said (`told:<why>` for the upgrade's causes, `refused:<why>` for the
+/// restart in place's), again while it stands; one relaunched and never registered is never
+/// typed afresh. Negative controls: a relaunch on exit's record, another process's record,
+/// and a refused signal fall through.
 #[test]
 fn an_exit_the_harness_own_restart_made_is_never_read_as_graceful() {
     use super::super::relaunch::{CAUSE_EXIT, CAUSE_HOST, CAUSE_MEMORY, CAUSE_UPGRADE_FRESH};
@@ -9472,9 +9247,9 @@ fn an_exit_the_harness_own_restart_made_is_never_read_as_graceful() {
         &record(Phase::Relaunched { at_s: old }, "", a.snap.pid),
     );
     assert_eq!(attempt(), "told:no-resume");
-    // Negative controls. A relaunch on exit's record: its agent crashed, and
-    // its graceful end is read as before; the record too old to act on is
-    // closed as a stop ([`St::stop`]), with the moment its agent was seen gone.
+    // Negative controls. A relaunch on exit's record (its agent crashed): this exit
+    // reads as graceful, and the record too old to act on is closed as a stop
+    // ([`St::stop`]), with the moment its agent was seen gone.
     save(
         &opts,
         SESSION,
@@ -9502,12 +9277,9 @@ fn an_exit_the_harness_own_restart_made_is_never_read_as_graceful() {
         load(&opts, SESSION).expect("kept").phase,
         Phase::Failed("resumed-elsewhere".to_string())
     );
-    // The relaunched agent left before its continuation: the record names the
-    // agent its restart ended (seen gone as the relaunch was typed, or not
-    // stamped yet), and the one that left now is the relaunched one,
-    // gracefully: someone's decision. The record closes, and the exit is no
-    // failure of the move: no stamp, so the status view vets the stop against
-    // a holder and shows no stall for a relaunch that landed.
+    // The relaunched agent left before its continuation, gracefully: the record closes as
+    // no failure of the move (no stamp), so the status view shows no stall for a relaunch
+    // that landed.
     for seen in [now_s() - 30, 0] {
         save(
             &opts,
@@ -9535,11 +9307,9 @@ fn an_exit_the_harness_own_restart_made_is_never_read_as_graceful() {
             "{seen}: no stall shown"
         );
     }
-    // The same, the exit tried again on the agent before it (the window's
-    // host): a relaunch on exit
-    // that landed on a process gone already is closed as one overtaken —
-    // carried, it held the tab for a dead process until it went stale.
-    // NEGATIVE CONTROL: one whose adopted process lives is carried on.
+    // The same, the exit tried again on the agent before it (the window's host): a
+    // relaunch on exit that landed on a process gone already is closed as one overtaken.
+    // Negative control: one whose adopted process lives is carried on.
     for (adopted, carried) in [(dead_pid(), false), (std::process::id(), true)] {
         save(
             &opts,
@@ -9573,8 +9343,8 @@ fn an_exit_the_harness_own_restart_made_is_never_read_as_graceful() {
         &record(Phase::Failed("signal-refused".to_string()), "", a.snap.pid),
     );
     assert_eq!(attempt(), "ended:graceful-exit");
-    // A relaunch after aterm's own end (`host`): its record ended no agent
-    // of its own, so it is closed and read as before.
+    // A relaunch after aterm's own end (`host`): its record ended no agent of its own,
+    // so it is closed and the exit reads as graceful.
     save(
         &opts,
         SESSION,
@@ -9596,21 +9366,10 @@ fn an_exit_the_harness_own_restart_made_is_never_read_as_graceful() {
     );
 }
 
-/// THE UPGRADE'S OWN ROW ASKS FOR A MOVE STOPPED AFTER ITS EXIT, NOT THE
-/// HOST'S CARRY (the review of the 2026-10-09 sweep fixes). A record the
-/// owner's view lists — an upgrade's, quiet or fresh — that stopped after its
-/// agent was seen gone raises `agent-down` there, with the one remedy
-/// (`upgrade_status::Row::agent_down`: the conversation's resume, or a plain
-/// `claude` for a restart that started its agent afresh). The carry of that
-/// agent's exit answered `refused:<why>`, which the host says as an agent it
-/// cannot bring back: a second report, its reason `aterm refused it` (false:
-/// the new agent ended at once), its tab mark telling `claude --resume <the
-/// old conversation>` — which for a fresh restart is the conversation with no
-/// transcript that Claude refuses. Such a carry answers `told:<why>`,
-/// whatever the stop (`no-resume`, `stale-exit`), and the host reads it as
-/// said (`outcome`: `Cannot`, its word the row's). NEGATIVE CONTROL: a
-/// restart in place's record (a model move: listed nowhere) is still
-/// `refused:<why>`, the host's to say.
+/// The carry of an upgrade stopped after its exit answers `told:<why>` (the host's
+/// `Cannot`): the owner's view already raises `agent-down` on the upgrade's own row with
+/// the one remedy, so the host makes no second report. Negative control: a restart in
+/// place's record (a model move, listed nowhere) is still `refused:<why>`, the host's.
 #[test]
 fn the_carry_of_an_upgrade_stopped_after_its_exit_leaves_the_ask_to_its_row() {
     use super::super::relaunch::{CAUSE_UPGRADE_FRESH, Outcome, carry_restart, outcome, restarted};
@@ -9643,9 +9402,12 @@ fn the_carry_of_an_upgrade_stopped_after_its_exit_leaves_the_ask_to_its_row() {
                 ..St::default()
             },
         );
-        assert!(restarted(&opts, false, Some(pid)), "{cause:?}");
+        assert!(
+            restarted(&opts, upgrade::Agent::Claude, Some(pid)),
+            "{cause:?}"
+        );
         assert_eq!(
-            carry_restart(&opts, false, Some(pid)).step,
+            carry_restart(&opts, upgrade::Agent::Claude, Some(pid)).step,
             want,
             "{cause:?} {why}"
         );
@@ -9656,20 +9418,11 @@ fn the_carry_of_an_upgrade_stopped_after_its_exit_leaves_the_ask_to_its_row() {
     );
 }
 
-/// The host finds the restart that ended the agent that left ([`restarted`]),
-/// before whose exit it was — ONE rule for both lanes: the record of a restart
-/// that ended its agent itself, filed for the process that left (a Claude
-/// Code's SIGTERM, a Codex TUI's `/exit`) in its tab — and carries it
-/// ([`carry_restart`]): on to the tab while it may act ([`STALE_S`] from the
-/// exit the carry saw, never from the signal), `told:<why>` once it cannot
-/// (its own row asks the owner; said again while it is still that
-/// restart's), never typed afresh.
-/// Negative controls: another process, no snapshot, another tab and the other
-/// agent's lane find nothing; a stop long past its exit is no longer this
-/// exit's; and in the Codex lane, whose records are filed per tab, a Codex a
-/// person started at the prompt, and a record the relaunch on exit filed
-/// there (a crash, a stall, aterm's own end), are no restart of the
-/// harness's: a person's `/exit` of that Codex is theirs.
+/// [`restarted`] finds the restart that ended the agent that left (both lanes: a restart that
+/// ended that process itself, filed for it in its tab) and [`carry_restart`] carries it on within
+/// [`STALE_S`] of the exit, then `told:<why>`, never typed afresh. Negative controls: another
+/// process, snapshot, tab or lane; a stop long past its exit; in the Codex lane a person's Codex
+/// or a relaunch on exit's record.
 #[test]
 fn the_host_finds_and_carries_the_restart_that_ended_the_agent_that_left() {
     use super::super::relaunch::{carry_restart, restarted};
@@ -9693,21 +9446,30 @@ fn the_host_finds_and_carries_the_restart_that_ended_the_agent_that_left() {
         ..St::default()
     };
     save(&opts, SESSION, &claude(Phase::Exiting { at_s: now }, 0));
-    assert!(restarted(&opts, false, Some(pid)));
+    assert!(restarted(&opts, upgrade::Agent::Claude, Some(pid)));
     assert!(
-        !restarted(&opts, false, Some(dead_pid())),
+        !restarted(&opts, upgrade::Agent::Claude, Some(dead_pid())),
         "another process"
     );
-    assert!(!restarted(&opts, false, None), "no snapshot proves nothing");
-    assert!(!restarted(&opts, true, None), "no Codex record");
+    assert!(
+        !restarted(&opts, upgrade::Agent::Claude, None),
+        "no snapshot proves nothing"
+    );
+    assert!(
+        !restarted(&opts, upgrade::Agent::Codex, None),
+        "no Codex record"
+    );
     let other_tab = Opts {
         only_sid: Some("s-0ther".to_string()),
         ..opts.clone()
     };
-    assert!(!restarted(&other_tab, false, Some(pid)), "another tab");
+    assert!(
+        !restarted(&other_tab, upgrade::Agent::Claude, Some(pid)),
+        "another tab"
+    );
     // Carried to the tab (no socket here).
     assert_eq!(
-        carry_restart(&opts, false, Some(pid)).step,
+        carry_restart(&opts, upgrade::Agent::Claude, Some(pid)).step,
         "wait:no-socket"
     );
     // A shutdown that outlived the bound (a hung SessionEnd hook, an MCP
@@ -9717,7 +9479,7 @@ fn the_host_finds_and_carries_the_restart_that_ended_the_agent_that_left() {
     let signal = now - STALE_S - 60;
     save(&opts, SESSION, &claude(Phase::Exiting { at_s: signal }, 0));
     assert_eq!(
-        carry_restart(&opts, false, Some(pid)).step,
+        carry_restart(&opts, upgrade::Agent::Claude, Some(pid)).step,
         "wait:no-socket",
         "carried from its exit"
     );
@@ -9725,7 +9487,7 @@ fn the_host_finds_and_carries_the_restart_that_ended_the_agent_that_left() {
     assert_eq!(st.phase, Phase::Exiting { at_s: signal });
     assert!(st.exited_at >= now, "seen gone at the carry: {st:?}");
     assert_eq!(
-        carry_restart(&opts, false, Some(pid)).step,
+        carry_restart(&opts, upgrade::Agent::Claude, Some(pid)).step,
         "wait:no-socket",
         "and again at the next try"
     );
@@ -9735,7 +9497,7 @@ fn the_host_finds_and_carries_the_restart_that_ended_the_agent_that_left() {
         SESSION,
         &claude(Phase::Exiting { at_s: signal }, now - STALE_S - 1),
     );
-    let r = carry_restart(&opts, false, Some(pid));
+    let r = carry_restart(&opts, upgrade::Agent::Claude, Some(pid));
     // The upgrade's own row asks the owner about it (`told:`).
     assert_eq!(
         (r.step.as_str(), r.session.as_str()),
@@ -9744,9 +9506,9 @@ fn the_host_finds_and_carries_the_restart_that_ended_the_agent_that_left() {
     let st = load(&opts, SESSION).expect("kept");
     assert_eq!(st.phase, Phase::Failed("stale-exit".to_string()));
     assert_ne!(st.exited_at, 0);
-    assert!(restarted(&opts, false, Some(pid)));
+    assert!(restarted(&opts, upgrade::Agent::Claude, Some(pid)));
     assert_eq!(
-        carry_restart(&opts, false, Some(pid)).step,
+        carry_restart(&opts, upgrade::Agent::Claude, Some(pid)).step,
         "told:stale-exit"
     );
     // Long past its exit: a pid the kernel may have handed on.
@@ -9758,17 +9520,15 @@ fn the_host_finds_and_carries_the_restart_that_ended_the_agent_that_left() {
             now - 2 * STALE_S - 1,
         ),
     );
-    assert!(!restarted(&opts, false, Some(pid)));
+    assert!(!restarted(&opts, upgrade::Agent::Claude, Some(pid)));
     assert_eq!(
-        carry_restart(&opts, false, Some(pid)).step,
+        carry_restart(&opts, upgrade::Agent::Claude, Some(pid)).step,
         "refused:no-restart-in-flight"
     );
     std::fs::remove_file(state_path(&opts, SESSION)).expect("rm");
-    // A Codex restart in flight, found by its TUI and carried by its lane:
-    // past its bound, said. Its five minutes count from its `/exit`, not from
-    // the TUI's exit: a TUI still alive the Codex lane's `EXIT_TAKEN_S` after
-    // its `/exit` is one the `/exit` did not take, so one that left only now
-    // is past the bound all the same.
+    // A Codex restart in flight, found by its TUI and carried by its lane: past its bound,
+    // said. The bound counts from its `/exit`, not the TUI's exit: a TUI still alive the
+    // Codex lane's `EXIT_TAKEN_S` after its `/exit` is one the `/exit` did not take.
     let codex = format!("codex-{TAB}");
     // The TUI its `/exit` was typed into: the Codex that left.
     let tui = dead_pid();
@@ -9791,23 +9551,23 @@ fn the_host_finds_and_carries_the_restart_that_ended_the_agent_that_left() {
             ..St::default()
         },
     );
-    assert!(restarted(&opts, true, Some(tui)));
-    assert!(!restarted(&opts, false, Some(pid)), "not Claude Code's");
-    let r = carry_restart(&opts, true, Some(tui));
+    assert!(restarted(&opts, upgrade::Agent::Codex, Some(tui)));
+    assert!(
+        !restarted(&opts, upgrade::Agent::Claude, Some(pid)),
+        "not Claude Code's"
+    );
+    let r = carry_restart(&opts, upgrade::Agent::Codex, Some(tui));
     assert_eq!(
         (r.step.as_str(), r.session.as_str()),
         ("told:stale-exit", codex.as_str())
     );
     assert!(
-        !restarted(&opts, true, Some(tui)),
+        !restarted(&opts, upgrade::Agent::Codex, Some(tui)),
         "stopped: no longer in flight"
     );
-    // Relaunched: the old TUI's exit may still be read after the line was
-    // typed, so a relaunch no TUI was adopted from is still the restart's.
-    // Negative control: once its supervisor adopted the new TUI
-    // (`resumed_pid`), that TUI leaving (an `/exit`, a crash) is its own exit,
-    // never the restart's: no hand held on the tab, no badge saying the
-    // harness ended it.
+    // Relaunched: the old TUI's exit may be read after the line was typed, so a relaunch
+    // no TUI was adopted from is still the restart's. Negative control: once its
+    // supervisor adopted the new TUI (`resumed_pid`), that TUI leaving is its own exit.
     let relaunched = |resumed_pid: u32, relaunched_pid: u32| St {
         agent: upgrade::Agent::Codex,
         phase: Phase::Relaunched { at_s: now },
@@ -9824,24 +9584,24 @@ fn the_host_finds_and_carries_the_restart_that_ended_the_agent_that_left() {
     };
     save(&opts, &codex, &relaunched(0, 0));
     assert!(
-        restarted(&opts, true, Some(tui)),
+        restarted(&opts, upgrade::Agent::Codex, Some(tui)),
         "relaunched, none found yet"
     );
-    // WHICH TUI LEFT, AND WHAT FILED THE RECORD — Claude Code's rule
-    // ([`ended_by_restart`]). No snapshot names none, and a Codex a person
-    // started at the prompt the relaunch waited on is not the one the
-    // restart ended. The relaunch on exit files its own record in the same
-    // place (a crash, a stall, a crash's relaunch afresh, a tab aterm's own
-    // end reopened), held at its prompt (`wait:typing`, a hold) or relaunched
-    // and not found yet: no restart of the harness's, even for the TUI it was
-    // filed for. Read as one, a person's `/exit` of their own Codex there
-    // outranked their word, a hold and `[harness] relaunch = false`
-    // (`OnExit::Restarted`), and the crashed TUI's line was typed back.
-    assert!(!restarted(&opts, true, None), "no snapshot proves nothing");
+    // Which TUI left, and what filed the record (Claude Code's rule, `ended_by_restart`):
+    // no snapshot names none; a Codex a person started at the prompt is not the one the
+    // restart ended; and a record the relaunch on exit filed (a crash, a stall, a fresh
+    // relaunch, aterm's own end) is no restart of the harness's, even for its own TUI.
+    assert!(
+        !restarted(&opts, upgrade::Agent::Codex, None),
+        "no snapshot proves nothing"
+    );
     let person = tui.wrapping_add(1);
-    assert!(!restarted(&opts, true, Some(person)), "a person's Codex");
+    assert!(
+        !restarted(&opts, upgrade::Agent::Codex, Some(person)),
+        "a person's Codex"
+    );
     assert_eq!(
-        carry_restart(&opts, true, Some(person)).step,
+        carry_restart(&opts, upgrade::Agent::Codex, Some(person)).step,
         "refused:no-restart-in-flight"
     );
     {
@@ -9857,9 +9617,12 @@ fn the_host_finds_and_carries_the_restart_that_ended_the_agent_that_left() {
                     ..relaunched(0, 0)
                 };
                 save(&opts, &codex, &on_exit);
-                assert!(!restarted(&opts, true, Some(tui)), "{cause} {phase:?}");
+                assert!(
+                    !restarted(&opts, upgrade::Agent::Codex, Some(tui)),
+                    "{cause} {phase:?}"
+                );
                 assert_eq!(
-                    carry_restart(&opts, true, Some(tui)).step,
+                    carry_restart(&opts, upgrade::Agent::Codex, Some(tui)).step,
                     "refused:no-restart-in-flight",
                     "{cause} {phase:?}"
                 );
@@ -9872,18 +9635,16 @@ fn the_host_finds_and_carries_the_restart_that_ended_the_agent_that_left() {
     // exit is its own.
     save(&opts, &codex, &relaunched(0, std::process::id()));
     assert!(
-        restarted(&opts, true, Some(tui)),
+        restarted(&opts, upgrade::Agent::Codex, Some(tui)),
         "the relaunched TUI lives: the old one's exit, read late"
     );
-    // Gone, a carry of the old TUI's exit made after it (the host's carry
-    // tried again, or one another actor's adoption overtook) finds a restart
-    // that LANDED: closed as the Codex lane's relaunch on exit closes it,
-    // never `refused:no-restart-in-flight`, which the host says as a restart
-    // that cannot land.
+    // Gone, a carry of the old TUI's exit made after it (the host's carry tried again, or
+    // another actor's adoption overtook) finds a restart that landed: closed as the Codex
+    // lane's relaunch on exit closes it, never `refused:no-restart-in-flight`.
     let landed_gone = |st: &St| {
         save(&opts, &codex, st);
         let lines = ledger_lines(&opts);
-        let r = carry_restart(&opts, true, Some(tui));
+        let r = carry_restart(&opts, upgrade::Agent::Codex, Some(tui));
         assert_eq!(
             (r.step.as_str(), r.session.as_str()),
             ("landed", codex.as_str())
@@ -9896,13 +9657,13 @@ fn the_host_finds_and_carries_the_restart_that_ended_the_agent_that_left() {
     };
     save(&opts, &codex, &relaunched(0, dead_pid()));
     assert!(
-        !restarted(&opts, true, Some(tui)),
+        !restarted(&opts, upgrade::Agent::Codex, Some(tui)),
         "found and gone: the TUI that left was the relaunched one"
     );
     landed_gone(&relaunched(0, dead_pid()));
     save(&opts, &codex, &relaunched(4_000_002, 4_000_002));
     assert!(
-        !restarted(&opts, true, Some(tui)),
+        !restarted(&opts, upgrade::Agent::Codex, Some(tui)),
         "adopted: the TUI that left was the relaunched one"
     );
     landed_gone(&relaunched(4_000_002, 4_000_002));
@@ -9913,19 +9674,16 @@ fn the_host_finds_and_carries_the_restart_that_ended_the_agent_that_left() {
         &relaunched(std::process::id(), std::process::id()),
     );
     assert!(
-        !restarted(&opts, true, Some(tui)),
+        !restarted(&opts, upgrade::Agent::Codex, Some(tui)),
         "adopted and suspended: theirs"
     );
     assert_eq!(
-        carry_restart(&opts, true, Some(tui)).step,
+        carry_restart(&opts, upgrade::Agent::Codex, Some(tui)).step,
         "refused:no-restart-in-flight"
     );
-    // A new round forgets the old restart's TUI ([`St::rearm`]): a round whose
-    // relaunched TUI was adopted, then stopped, is re-armed on the same record
-    // once it has rested, and its next restart's relaunch is that restart's
-    // again; otherwise the old adoption would read the new restart's exit as
-    // the adopted TUI's own. Nor the block its old line was typed into
-    // ([`St::line_block`]): no line of the new round was typed there.
+    // A new round forgets the old restart's TUI and line block ([`St::rearm`]): else the
+    // old adoption would read the new restart's exit as the adopted TUI's own, and no
+    // line of the new round was typed in that block.
     let mut again = St {
         phase: Phase::Failed("no-resume".to_string()),
         line_block: Some(7),
@@ -9943,22 +9701,16 @@ fn the_host_finds_and_carries_the_restart_that_ended_the_agent_that_left() {
     );
     again.phase = Phase::Relaunched { at_s: now };
     save(&opts, &codex, &again);
-    assert!(restarted(&opts, true, Some(tui)), "re-armed: {again:?}");
+    assert!(
+        restarted(&opts, upgrade::Agent::Codex, Some(tui)),
+        "re-armed: {again:?}"
+    );
 }
 
-/// THE CARRY OF AN EXIT WHOSE MOVE LANDED MEANWHILE SAYS NOTHING: the host
-/// read the agent's exit as the
-/// harness's own restart's while that restart was in flight, and another
-/// actor — a hand-run `aterm harness upgrade`, which carries its relaunch on
-/// itself under the lock the host's carry waits on — finished the move
-/// before the carry's next try. The carry found nothing in flight and said
-/// `refused:no-restart-in-flight`, which the host badges "aterm ended the
-/// agent … cannot bring it back; resume it by hand" over an agent that is
-/// back. A record DONE for that very process, its conversation held by a
-/// live process now, answers `landed`: the host's `Relaunched`, nothing
-/// said, nothing written. NEGATIVE CONTROLS, today's word: the exit of
-/// another process, and the same record with nothing holding its
-/// conversation.
+/// The carry of an exit whose move another actor (a hand-run `aterm harness upgrade`)
+/// finished meanwhile answers `landed` (the host's `Relaunched`), nothing said or
+/// written, where a record Done for that process has its conversation held by a live
+/// process. Negative controls: another process's exit, and nothing holding the conversation.
 #[cfg(unix)]
 #[test]
 fn the_carry_of_an_exit_whose_move_landed_meanwhile_says_nothing() {
@@ -9989,38 +9741,31 @@ fn the_carry_of_an_exit_whose_move_landed_meanwhile_says_nothing() {
     );
     let saved = load(&opts, SESSION).expect("the record");
     register(&opts.home, me, SESSION);
-    let r = carry_restart(&opts, false, Some(old));
+    let r = carry_restart(&opts, upgrade::Agent::Claude, Some(old));
     assert_eq!((r.step.as_str(), r.session.as_str()), ("landed", SESSION));
     assert_eq!(outcome(&r.step), Outcome::Relaunched, "nothing said");
     assert_eq!(load(&opts, SESSION), Some(saved), "nothing written");
     assert_eq!(ledger_lines(&opts), 0);
-    // NEGATIVE CONTROLS: an exit this move did not end, and the move whose
+    // Negative controls: an exit this move did not end, and the move whose
     // conversation nothing holds now.
     assert_eq!(
-        carry_restart(&opts, false, Some(dead_pid())).step,
+        carry_restart(&opts, upgrade::Agent::Claude, Some(dead_pid())).step,
         "refused:no-restart-in-flight"
     );
     std::fs::remove_file(opts.home.join(format!(".claude/sessions/{me}.json")))
         .expect("remove the holder's session file");
     assert_eq!(
-        carry_restart(&opts, false, Some(old)).step,
+        carry_restart(&opts, upgrade::Agent::Claude, Some(old)).step,
         "refused:no-restart-in-flight"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// THE CARRY OF A RESTART ALREADY ADOPTED ANSWERS AT ONCE: the step that
-/// relaunched the agent found the new
-/// process, waited for its first idle point and handed it to its loop; the
-/// record stays in flight until that loop carries it on. The host's carry
-/// of the old agent's exit went back through `await_new` — the harness's
-/// hand on the tab again, the first idle point waited for again — and, past
-/// `STALE_S`, stopped the record `no-resume`, a relaunch that "never
-/// registered". While the adopted process holds the conversation the carry
-/// says `adopted` with that process, dials nothing and writes nothing,
-/// however old the relaunch. NEGATIVE CONTROLS: a relaunch not adopted yet,
-/// and one whose adopted process holds the conversation no longer, are
-/// carried as before (here, dialling a socket that is not there).
+/// The carry of a restart already adopted answers `adopted` at once, dialling and writing
+/// nothing however old the relaunch, while the adopted process holds the conversation
+/// (the record stays in flight until its loop carries it on). Negative controls: one not
+/// adopted yet, or whose adopted process holds it no longer, is carried (here dialling a
+/// socket that is not there).
 #[cfg(unix)]
 #[test]
 fn the_carry_of_a_restart_already_adopted_answers_without_waiting() {
@@ -10050,14 +9795,14 @@ fn the_carry_of_a_restart_already_adopted_answers_without_waiting() {
     for at_s in [now, now - STALE_S - 1] {
         save(&opts, SESSION, &relaunched(at_s, me));
         let saved = load(&opts, SESSION).expect("the record");
-        let r = carry_restart(&opts, false, Some(old));
+        let r = carry_restart(&opts, upgrade::Agent::Claude, Some(old));
         assert_eq!((r.step.as_str(), r.pid), ("adopted", me), "{at_s}");
         assert_eq!(load(&opts, SESSION), Some(saved), "{at_s}: nothing written");
     }
     assert_eq!(ledger_lines(&opts), 0, "nothing said");
     save(&opts, SESSION, &relaunched(now, 0));
     assert_eq!(
-        carry_restart(&opts, false, Some(old)).step,
+        carry_restart(&opts, upgrade::Agent::Claude, Some(old)).step,
         "wait:no-socket",
         "not adopted yet"
     );
@@ -10065,24 +9810,17 @@ fn the_carry_of_a_restart_already_adopted_answers_without_waiting() {
         .expect("remove the adopted process's session file");
     save(&opts, SESSION, &relaunched(now, me));
     assert_eq!(
-        carry_restart(&opts, false, Some(old)).step,
+        carry_restart(&opts, upgrade::Agent::Claude, Some(old)).step,
         "wait:no-socket",
         "holding it no longer"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// THE CARRY OF A RESTART WHOSE ADOPTED AGENT IS GONE CLOSES IT: the
-/// relaunch was adopted
-/// ([`St::relaunched_pid`]) and that process ended before its continuation.
-/// No carry types the line again, and the carry of the old agent's exit went
-/// back through `await_new`: the harness's hand on the tab 90 s at a time
-/// for a process that was gone, `wait:resume`, until past `STALE_S` it
-/// stopped the record `no-resume`, a relaunch that "never registered", which
-/// the host says as a restart that cannot land. It is closed at once, as
-/// `after_exit` closes one overtaken (no failure after the signalled agent's
-/// exit), and answered `landed`; that exit is the restart's no longer.
-/// NEGATIVE CONTROL: a dry run writes nothing.
+/// The carry of a restart whose adopted process ended before its continuation closes it
+/// at once (`exited-before-continuing`, as `after_exit` closes one overtaken) and answers
+/// `landed`, rather than holding the tab's hand for a gone process until `STALE_S`.
+/// Negative control: a dry run writes nothing.
 #[cfg(unix)]
 #[test]
 fn the_carry_of_a_restart_whose_adopted_agent_is_gone_closes_it() {
@@ -10117,13 +9855,16 @@ fn the_carry_of_a_restart_whose_adopted_agent_is_gone_closes_it() {
         dry_run: true,
         ..opts.clone()
     };
-    assert_eq!(carry_restart(&dry, false, Some(old)).step, "landed");
+    assert_eq!(
+        carry_restart(&dry, upgrade::Agent::Claude, Some(old)).step,
+        "landed"
+    );
     assert_eq!(
         load(&opts, SESSION),
         Some(saved),
         "a dry run writes nothing"
     );
-    let r = carry_restart(&opts, false, Some(old));
+    let r = carry_restart(&opts, upgrade::Agent::Claude, Some(old));
     assert_eq!((r.step.as_str(), r.session.as_str()), ("landed", SESSION));
     assert_eq!(outcome(&r.step), Outcome::Relaunched, "nothing said");
     let st = load(&opts, SESSION).expect("kept");
@@ -10133,20 +9874,17 @@ fn the_carry_of_a_restart_whose_adopted_agent_is_gone_closes_it() {
     );
     assert_eq!(ledger_lines(&opts), 1, "said once, in the ledger");
     assert!(
-        !restarted(&opts, false, Some(old)),
+        !restarted(&opts, upgrade::Agent::Claude, Some(old)),
         "the restart's no longer"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// THE AGENT OF A TAB ATERM'S OWN CRASH TOOK: aterm ended while
-/// it ran, its shell's hangup reached it, and it removed its own record as
-/// it went — which reads as a graceful exit, someone's decision. It was
-/// nobody's: the next launch reopened its tab, and `after_host_ended`
-/// relaunches it there on its conversation. A relaunch the crashed run had
-/// in flight for its OLD tab (that tab is gone) is closed, not waited on.
-/// Negative controls: the same removed record through `after_exit` (the
-/// agent's own exit) is left as graceful; and the continuation says why.
+/// An agent aterm's own crash took (its shell's hangup made it remove its record, which
+/// reads as a graceful exit) is relaunched in its reopened tab by `after_host_ended`; a
+/// relaunch the crashed run had in flight for its old tab is closed, not waited on.
+/// Negative controls: the same record through `after_exit` is graceful; the continuation
+/// says why.
 #[test]
 fn an_agent_whose_host_ended_is_relaunched_in_its_reopened_tab() {
     let a = DeadAgent::new("host-ended");
@@ -10194,19 +9932,12 @@ fn an_agent_whose_host_ended_is_relaunched_in_its_reopened_tab() {
     );
 }
 
-/// Tier-1 of `HarnessExitRecord` (aterm-spec): every path of the model, from
-/// its initial state to one where nothing more is enabled, replayed through
-/// the real look ([`look_at_exit`], [`exit_record`]) and the real attempt
-/// ([`after_exit`], a dry run) over a real record of a dead process. After each
-/// action the state the real code leaves (the record on disk, what the look
-/// kept, what the attempt decided) is the model's, and every invariant holds;
-/// every action is driven. Negative controls: the buggy host's witness
-/// `Crash`, `Look`, `Sweep`, `DecideAtAttempt` replayed through a read at the
-/// attempt (`ExitRecord::Unread`) leaves the crash exactly as the buggy model
-/// does, and `CrashIsRelaunched` catches it; and a graceful exit's own removal
-/// landing inside the real look's settle is read as `OwnRemoval` then `Look`,
-/// a state a `LookAtInstant` fix never reaches (its exit relaunched,
-/// `GracefulIsLeft`).
+/// Tier-1 of `HarnessExitRecord` (aterm-spec): every maximal path of the model, replayed
+/// through the real look ([`look_at_exit`], [`exit_record`]) and attempt ([`after_exit`],
+/// dry) over a real record, leaves the model's state, every invariant holding. Negative
+/// controls: the buggy witness read at the attempt breaks `CrashIsRelaunched`; a removal
+/// inside the look's settle reads as `OwnRemoval` then `Look`, never the `LookAtInstant`
+/// that breaks `GracefulIsLeft`.
 #[test]
 fn the_real_exit_read_conforms_to_the_model() {
     let model = aterm_spec::derive::harness_exit_record_model();
@@ -10354,14 +10085,10 @@ fn the_real_exit_read_conforms_to_the_model() {
     }
 }
 
-/// The restart in place: the host restarts the tab's own agent (idle,
-/// registered, its conversation on Claude's record) on the same program,
-/// resuming its conversation, with nothing typed into it first. Dry runs:
-/// decided against real processes and files, nothing typed or written.
-/// Negative controls: a tab whose agent could not be read, another tab's
-/// agent, no record of the process, a one-shot run (each a wait or a refusal,
-/// never a signal); and a restart already in flight for the conversation is
-/// carried on, never a second one started.
+/// The restart in place restarts the tab's own agent on the same program, resuming its
+/// conversation with nothing typed first (dry runs over real processes and files).
+/// Negative controls: an unread agent, another tab's, no record, a one-shot run (each a
+/// wait or refusal); a restart already in flight is carried on, never doubled.
 #[cfg(unix)]
 #[test]
 fn a_restart_in_place_is_planned_on_the_same_program_and_carried_on_once() {
@@ -10377,6 +10104,7 @@ fn a_restart_in_place_is_planned_on_the_same_program_and_carried_on_once() {
     wait_exec(agent.id());
     let start = kernel_start(agent.id()).expect("lstart");
     let snap = |argv: &[&str]| Snapshot {
+        stored_login: false,
         tab: TAB.to_string(),
         pid: agent.id(),
         start: start.clone(),
@@ -10429,10 +10157,9 @@ fn a_restart_in_place_is_planned_on_the_same_program_and_carried_on_once() {
         .step,
         "refused:one-shot"
     );
-    // A bucket's fallback asks for its model on the line; the way back asks
-    // for the bucket's, or (the notice named none) for the model the launch
-    // named before the fallback replaced it (its record kept it), else for
-    // none: the launch's `--model` dropped.
+    // A bucket's fallback asks for its model on the line; the way back asks for the model
+    // the launch named before the fallback (its record kept it), else the notice's alias,
+    // else none: the launch's `--model` dropped.
     let opus = Restart::Model {
         to: "opus".to_string(),
     };
@@ -10504,6 +10231,7 @@ fn answer_at(model: &str, at: &str) -> String {
 #[cfg(unix)]
 fn users_agent(session: &str) -> Snapshot {
     Snapshot {
+        stored_login: false,
         tab: TAB.to_string(),
         pid: 4242,
         start: "Thu Sep 24 01:02:03 2026".to_string(),
@@ -10546,12 +10274,9 @@ fn chose_by_hand(opts: &Opts, model: &str) {
     std::fs::write(dir.join(format!("{SESSION}.json")), rec.render()).expect("record");
 }
 
-/// A `/model` choice survives a memory restart: a command-line `--model`
-/// overrides the default Claude's `/model` saves, so the restart in place asks
-/// for the model chosen by hand rather than the launch's flag. Negative
-/// controls: nobody chose one (the launch's flags, no model asked for); a
-/// launch that named no model (`/model` saved the choice as the default the
-/// relaunch starts on, nothing asked for).
+/// A `/model` choice survives a memory restart (a command-line `--model` overrides the
+/// default `/model` saves): the restart asks for the hand choice, not the launch's flag.
+/// Negative controls: nobody chose one; a launch that named no model keeps its flags.
 #[cfg(unix)]
 #[test]
 fn a_memory_restart_carries_a_model_chosen_by_hand_not_the_launchs() {
@@ -10567,6 +10292,7 @@ fn a_memory_restart_carries_a_model_chosen_by_hand_not_the_launchs() {
     wait_exec(agent.id());
     let start = kernel_start(agent.id()).expect("lstart");
     let snap = |argv: &[&str]| Snapshot {
+        stored_login: false,
         tab: TAB.to_string(),
         pid: agent.id(),
         start: start.clone(),
@@ -10641,12 +10367,9 @@ fn an_exit_relaunch_carries_a_model_chosen_by_hand_not_the_launchs() {
     assert_eq!(a.attempt(&left), "would-relaunch:model=claude-opus-5-5");
 }
 
-/// A choice before the process is not its choice: a stalled agent ended with
-/// no record left (the stall's remedy relaunches it anyway) has no process
-/// start to read, so the start is taken from the host's own snapshot, and a
-/// choice a person made for an earlier process is not carried as this one's.
-/// Negative control: the same choice answered after the process started is
-/// carried.
+/// A stalled agent ended with no record left takes its process start from the host's
+/// snapshot, so a `/model` made for an earlier process is not carried. Negative control:
+/// a choice answered on since the process started is carried.
 #[cfg(unix)]
 #[test]
 fn an_exit_relaunch_with_no_record_carries_no_choice_older_than_the_process() {
@@ -10679,14 +10402,10 @@ fn an_exit_relaunch_with_no_record_carries_no_choice_older_than_the_process() {
     assert_eq!(stalled(&a).step, "would-relaunch:model=claude-opus-5-5");
 }
 
-/// The way back from a fallback outlives a memory restart: the model the launch
-/// named before a bucket's fallback replaced it is carried on every record
-/// while the fallback stands ([`St::fallback_from`]) and spent by the way
-/// back, so a restart saved over the fallback's record does not leave the way
-/// back with nothing to return to. Negative controls: with no fallback
-/// standing the way back drops `--model`; a second fallback keeps the first's
-/// origin; and a fallback's record an older build wrote (no origin field)
-/// still returns to the launch model it kept.
+/// The way back outlives a memory restart: the fallback's origin rides every record while
+/// the fallback stands ([`St::fallback_from`]) and is spent by the way back. Negative
+/// controls: no fallback standing drops `--model`; a second fallback keeps the first's
+/// origin; an older build's fallback record returns to its kept launch model.
 #[test]
 fn the_way_back_from_a_fallback_returns_to_the_launched_model_across_a_memory_restart() {
     let launched = "claude-fable-5-1";
@@ -10762,13 +10481,9 @@ fn the_way_back_from_a_fallback_returns_to_the_launched_model_across_a_memory_re
     assert_eq!(fallback_origin(&legacy).as_deref(), Some(launched));
 }
 
-/// The way back returns to what the person had, not to the notice's alias: a
-/// bucket's notice almost always names its family ("You've reached your Fable
-/// limit" → `fable`), but the conversation may have had an exact model before
-/// the fallback (a `[1m]` window, a hand `/model` a relaunch carried). The
-/// order is: a hand choice since the fallback, else the origin, else the
-/// notice's alias. Negative control: no fallback on record and no hand choice:
-/// the notice's alias.
+/// The way back prefers what the person had over the notice's alias: a hand choice since
+/// the fallback, else the exact origin (a `[1m]` window included), else the alias.
+/// Negative control: nothing on record and no `/model`, the alias.
 #[test]
 fn the_way_back_prefers_the_persons_model_over_the_notices_alias() {
     let launched = "claude-fable-5-1[1m]";
@@ -10839,12 +10554,9 @@ fn saved_restart(r: &super::super::relaunch::ModelRestart) -> St {
     St::from_json(&st.to_json()).expect("the record reads back")
 }
 
-/// A fallback from a launch that named no model is still a fallback: a
-/// fallback standing is recorded apart from the model it replaced, so an empty
-/// origin (no `--model`) is not read as "no fallback stands" and a second
-/// fallback's way back returns to Claude's default, not to the first
-/// fallback's model. Negative control: one fallback from no model: the way
-/// back drops `--model`.
+/// A fallback from a launch that named no model still stands (recorded apart from the
+/// model it replaced), so a second fallback's way back returns to Claude's default, not the
+/// first fallback's model. Negative control: one fallback from no model drops `--model`.
 #[test]
 fn a_second_fallback_from_a_launch_with_no_model_goes_back_to_no_model() {
     let first = model_restart(
@@ -10899,13 +10611,10 @@ fn a_second_fallback_from_a_launch_with_no_model_goes_back_to_no_model() {
     );
 }
 
-/// A `/model` since a fallback outranks the way back: a fallback onto Opus
-/// from Fable, then a person's `/model` to Sonnet, then an exit relaunched
-/// asking for Sonnet (the hand choice): the relaunch makes the hand choice the
-/// origin, so at the bucket's reset the way back asks for Sonnet, what the
-/// person has. Negative controls: the same exit with nobody's `/model` carries
-/// the origin, and the way back returns to Fable; the memory restart's record
-/// reads the same way; with no fallback standing, the hand choice makes none.
+/// A `/model` since a fallback outranks the way back: an exit relaunched on the hand
+/// choice makes it the origin, so the bucket's reset returns to it. Negative controls: no
+/// `/model` returns to the origin; a memory restart reads the same; with no fallback
+/// standing, a hand choice makes none.
 #[test]
 fn a_model_chosen_by_hand_after_a_fallback_is_not_undone_by_the_way_back() {
     let dir = scratch("hand-over-fallback");
@@ -11037,12 +10746,9 @@ fn an_upgrade_record_keeps_the_fallbacks_origin() {
     assert_eq!(fallback_origin(&none), None);
 }
 
-/// A `/model` before a fallback is what the way back returns to: launched
-/// `--model claude-fable-5-1`, moved to Sonnet by hand, then a bucket's
-/// fallback onto Opus: the fallback records the hand choice (Sonnet) as the
-/// origin, not the launch's Fable. Negative controls: nobody's `/model` (the
-/// launch's Fable); a fallback already standing keeps its origin over a hand
-/// choice.
+/// A `/model` before a bucket's fallback becomes the fallback's origin, not the launch's
+/// model. Negative controls: no `/model`, the launch's; a fallback already standing keeps
+/// its origin over a hand choice.
 #[test]
 fn a_fallback_after_a_model_chosen_by_hand_goes_back_to_that_model() {
     let launched = "claude-fable-5-1";
@@ -11122,7 +10828,7 @@ fn restart_saved_as(
     roster: &crate::harness::accounts::Roster,
 ) -> (Report, Option<St>) {
     let dir = scratch(name);
-    let (sock, _) = instance_with(&dir, Answers::default());
+    let (sock, _asked) = instance_with(&dir, Answers::default());
     let opts = Opts {
         sock: Some(sock),
         only_sid: Some(TAB.to_string()),
@@ -11144,6 +10850,7 @@ fn restart_saved_as(
         chose_by_hand(&opts, hand);
     }
     let snap = Snapshot {
+        stored_login: false,
         tab: TAB.to_string(),
         pid: agent.id(),
         start: kernel_start(agent.id()).expect("lstart"),
@@ -11178,13 +10885,10 @@ fn restart_saved_as(
     (r, saved)
 }
 
-/// The restart in place saves the fallback origin it decides, driven past its
-/// signal to the record it keeps: a memory restart of a fallback that carries
-/// a `/model` made since makes it the origin; a fallback made after a `/model`
-/// records that. Each wire of [`restart_from`] into [`model_restart`] is read
-/// off the saved record (the hand choice read for either restart, and the
-/// origin written). Negative control: the same memory restart with nobody's
-/// `/model` carries the fallback's own origin.
+/// The restart in place saves the fallback origin it decides ([`restart_from`] into
+/// [`model_restart`]), driven past its signal: over a fallback, a `/model` made since
+/// becomes the origin, as does a `/model` before a fallback. Negative control: a memory
+/// restart with no `/model` carries the fallback's own origin.
 #[cfg(unix)]
 #[test]
 fn a_restart_in_place_saves_the_fallback_origin_it_decides() {
@@ -11257,8 +10961,7 @@ const LOGIN_DIR: &str = "/tmp/aterm state/logins/owner's work-2";
 const LOGIN_WORD: &str =
     r"CLAUDE_SECURESTORAGE_CONFIG_DIR='/tmp/aterm state/logins/owner'\''s work-2' ";
 
-/// The design's own roster: `main` on this machine's login, `work-2` under
-/// [`LOGIN_DIR`].
+/// A two-row roster: `main` on this machine's login, `work-2` under [`LOGIN_DIR`].
 #[cfg(unix)]
 fn two_accounts() -> crate::harness::accounts::Roster {
     crate::harness::accounts::Roster::parse(&format!(
@@ -11268,14 +10971,10 @@ fn two_accounts() -> crate::harness::accounts::Roster {
     .expect("a roster")
 }
 
-/// EVERY RESTART IN PLACE RE-APPLIES THE LOGIN ITS PROCESS HAD, driven past
-/// its signal to the record it keeps: a memory restart of an agent whose own
-/// environment named a login types that login back, quoted, in front of the
-/// survey switch; one whose variable was set and EMPTY (the default login,
-/// named) types the empty value; and both keep it as a fact on the record
-/// ([`St::login`]). NEGATIVE CONTROL: an agent that had no such variable —
-/// every agent of a machine with no roster — gets the line it always got,
-/// and a record with no `login` key at all.
+/// Every restart in place re-applies the login its process had, quoted before the survey
+/// switch (an empty value as the empty value), and keeps it on the record ([`St::login`]).
+/// Negative control: an agent with no such variable gets the line it always got and no
+/// `login` key.
 #[cfg(unix)]
 #[test]
 fn a_restart_in_place_types_back_the_login_its_process_had() {
@@ -11320,15 +11019,11 @@ fn a_restart_in_place_types_back_the_login_its_process_had() {
     assert_eq!(old.map(|st| st.login), Some(None));
 }
 
-/// AN ACCOUNT MOVE TYPES THE TARGET'S LOGIN, FROM THE ROSTER: driven past its
-/// signal, a move to `work-2` types that row's directory verbatim whatever
-/// the process had, a move back to `main` (the row with no directory) types
-/// the EMPTY value over the directory the process ran under, and the record's
-/// cause is `account:<label>` — the label, never the directory. Where a
-/// bucket's fallback stands the move is the way back: the line asks for the
-/// origin, and the origin is spent. NEGATIVE CONTROLS: a label the roster
-/// does not list is refused before anything is signalled or saved, and so is
-/// every account move asked of a host with no roster.
+/// An account move types the target's login from the roster (`work-2`'s directory, or the
+/// empty value for `main`, the row with none) and records `account:<label>`, never the
+/// directory; over a standing fallback the line asks for the origin and spends it.
+/// Negative controls: a label the roster does not list, or no roster, is refused before
+/// anything is signalled or saved.
 #[cfg(unix)]
 #[test]
 fn an_account_move_types_the_rosters_login_and_a_label_nobody_lists_is_refused() {
@@ -11410,7 +11105,7 @@ fn an_account_move_types_the_rosters_login_and_a_label_nobody_lists_is_refused()
         saved.line
     );
     assert_eq!(saved.fallback_from, None, "{r:?}");
-    // NEGATIVE CONTROLS: nothing signalled, nothing saved.
+    // Negative controls: nothing signalled, nothing saved.
     for (name, roster) in [
         ("account-not-listed", &roster),
         (
@@ -11424,24 +11119,17 @@ fn an_account_move_types_the_rosters_login_and_a_label_nobody_lists_is_refused()
     }
 }
 
-/// AN EXIT'S RELAUNCH COMES BACK ON THE LOGIN THE AGENT RAN UNDER, driven
-/// (not dry) to the record it keeps: the snapshot read the login off the
-/// process while it ran, and the line types it back — so a session moved to
-/// another account stays on it through a crash. NEGATIVE CONTROL: an agent
-/// that had no such variable is relaunched with the line it always got.
-///
-/// AND THE RELAUNCH AFTER ATERM ENDED ([`after_host_ended`], a cold restore's
-/// step, `host`) types back the Claude home and the login the reopened
-/// leaf names (2026-10-09: the layout carries them off the host's
-/// snapshot), the home first — its crash's record filed under that home, as
-/// its Claude Code files it.
+/// An exit's relaunch types back the login the agent ran under (read off the process while
+/// it ran), so a session moved to another account stays on it through a crash; the
+/// relaunch after aterm ended ([`after_host_ended`]) types the reopened leaf's Claude home
+/// and login, the home first. Negative control: no such variable, the line it always got.
 #[cfg(unix)]
 #[test]
 fn an_exit_relaunch_types_back_the_login_the_agent_ran_under() {
     let case = |name: &str, home: bool, login: Option<&str>, host_ended: bool| {
         let _quick = QuickWaits::new();
         let mut a = DeadAgent::new(name);
-        let (sock, _) = instance_with(&a.dir, Answers::default());
+        let (sock, _asked) = instance_with(&a.dir, Answers::default());
         a.opts = Opts {
             sock: Some(sock),
             dry_run: false,
@@ -11496,13 +11184,10 @@ fn an_exit_relaunch_types_back_the_login_the_agent_ran_under() {
     });
 }
 
-/// A transcript of [`SESSION`] with one prompt in it, filed in the Claude
-/// Code directory `claude_dir` itself, project `project`: a conversation
-/// someone asked something, as Claude Code files one with its first message.
-/// A registered session with no transcript is one nobody has asked anything
-/// ([`transcript_exists_in`]): an upgrade restarts it afresh and announces
-/// nothing to it, and a relaunch starts it afresh, so the sessions the tests
-/// move or relaunch as ones with work have this.
+/// A transcript of [`SESSION`] with one prompt, filed under `claude_dir`'s project
+/// `project` as Claude Code files one with its first message. A session with no transcript
+/// is one nobody asked anything ([`transcript_exists_in`]) and is restarted afresh, so tests
+/// that move or relaunch sessions with work file this.
 #[cfg(unix)]
 fn file_transcript_in(claude_dir: &Path, project: &str) {
     let dir = claude_dir.join("projects").join(project);
@@ -11515,18 +11200,10 @@ fn file_transcript_in(claude_dir: &Path, project: &str) {
     .expect("transcript");
 }
 
-/// THE TURN END'S TASK READ IS THE AGENT'S OWN RECORDS
-/// ([`Tasked::of_snapshot`]; the review of the 2026-10-09 sweep fixes): an
-/// agent under another Claude home (an identity's `CLAUDE_CONFIG_DIR`)
-/// keeps its transcripts there, and a conversation a person asked something
-/// there is tasked, though the user's `~/.claude` exists with no projects —
-/// which, read instead, says no task (a Claude home with no projects holds
-/// no message), and the turn-end policy typed nothing into that tasked
-/// conversation. A RELATIVE home is read where it resolves from the
-/// directory the agent runs in (fix/r16-homes; it named nothing before).
-/// CONTROLS: with no home of its own, the user's `~/.claude` is read; a
-/// relative home whose directory nobody knows names nothing that can be
-/// read: nobody can say.
+/// [`Tasked::of_snapshot`]: the turn end's task read is the agent's own records, under its
+/// Claude home (a relative one where it resolves from the directory it runs in), not the
+/// user's `~/.claude`. Controls: with no home of its own, `~/.claude` is read; a relative
+/// home whose directory nobody knows says nothing.
 #[cfg(unix)]
 #[test]
 fn the_turn_ends_task_read_is_the_agents_own_records() {
@@ -11575,28 +11252,11 @@ fn the_turn_ends_task_read_is_the_agents_own_records() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// AN AGENT STARTED UNDER ANOTHER CLAUDE HOME IS RELAUNCHED OFF ITS OWN
-/// RECORDS (review of `fix/cold-restore-login-home`, 2026-10-09). Claude Code
-/// started with `CLAUDE_CONFIG_DIR=<dir>` files `sessions/<pid>.json` and
-/// `projects/` in `<dir>`, never in `~/.claude`
-/// (`docs/DESIGN-aterm-wrapper-2026-09-17.md`, review round 2); the relaunch
-/// after aterm itself ended ([`after_host_ended`], a cold restore's step)
-/// read them under the user's home alone. Driven (not dry) to the record it
-/// keeps, an agent whose snapshot names `<dir>`:
-///
-/// * whose crash left its record there, its snapshot naming no conversation
-///   (all a read of `~/.claude` gave it), is relaunched on the record's
-///   conversation — it ended `ended:no-conversation`, its tab never brought
-///   back;
-/// * whose transcript is there, the user's `~/.claude/projects` readable and
-///   without it (any machine that has run Claude Code under the default
-///   home), is RESUMED — it started afresh (`exit-fresh`, no `--resume`);
-///
-/// each line carrying the home. CONTROLS: the same agent whose own projects
-/// are readable and hold no transcript of it starts afresh though the user's
-/// `~/.claude` holds one of the same id (`--resume` under `<dir>` finds only
-/// `<dir>`'s); and an agent with no home is relaunched off `~/.claude`
-/// exactly as before.
+/// An agent started under another Claude home is relaunched after aterm ended
+/// ([`after_host_ended`]) off its own records in `<dir>`, never `~/.claude`'s: a record
+/// left there names the conversation, a transcript there is resumed, and each line carries
+/// the home. Controls: own projects with no transcript of it start afresh though
+/// `~/.claude` holds one of the same id; an agent with no home relaunches off `~/.claude`.
 #[cfg(unix)]
 #[test]
 fn an_agent_under_another_claude_home_is_relaunched_off_its_own_records() {
@@ -11613,7 +11273,7 @@ fn an_agent_under_another_claude_home_is_relaunched_off_its_own_records() {
     let case = |name: &str, own_home: bool, record: bool, transcript: Filed, resumed: bool| {
         let _quick = QuickWaits::new();
         let mut a = DeadAgent::new(name);
-        let (sock, _) = instance_with(&a.dir, Answers::default());
+        let (sock, _asked) = instance_with(&a.dir, Answers::default());
         a.opts = Opts {
             sock: Some(sock),
             dry_run: false,
@@ -11685,19 +11345,15 @@ fn an_agent_under_another_claude_home_is_relaunched_off_its_own_records() {
         known.join().expect("home-transcript");
         not_its.join().expect("home-not-its");
     });
-    // A record an older build wrote has no such key, and reads as none: its
-    // relaunch looks in `~/.claude`, as every one did.
+    // A record an older build wrote has no such key and reads as none: its relaunch looks
+    // in `~/.claude`.
     let old = St::from_json(r#"{"phase":"relaunched","at":7,"cause":"host"}"#);
     assert_eq!(old.map(|st| st.home), Some(None));
 }
 
-/// THE HOST'S LOOKS READ THE AGENT'S OWN RECORD ([`look_at_exit`],
-/// [`follow`]), under the Claude home its snapshot names (review of
-/// `fix/cold-restore-login-home`, 2026-10-09): read in the user's
-/// `~/.claude`, the crash of an agent started under another home read as a
-/// graceful exit (its record nowhere there: `Removed`), never relaunched;
-/// and a `/clear` it made while it ran was never followed, so its relaunch
-/// would resume the conversation it had left.
+/// The host's looks ([`look_at_exit`], [`follow`]) read the agent's record under the
+/// Claude home its snapshot names: its crash reads as a crash, and a `/clear` it made is
+/// followed.
 #[cfg(unix)]
 #[test]
 fn the_hosts_looks_read_the_record_under_the_agents_own_claude_home() {
@@ -11735,34 +11391,20 @@ fn register_running_in(claude_dir: &Path, pid: u32, start: &str, cwd: &Path) {
     .expect("the record");
 }
 
-/// A RELATIVE CLAUDE HOME IS FOLLOWED BY THE RELAUNCH ON EXIT AND THE
-/// RESTART IN PLACE (the upgrade-homes lane's stated limit, handoff §4): a
-/// Claude Code started with `CLAUDE_CONFIG_DIR=work home/.claude` files its
-/// records under the directory it runs in, where the live upgrade's sweep
-/// resolves it ([`Homes`]), and every read of a relaunch's agent read
-/// nothing for it ("no record is read, so nothing is relaunched"):
-///
-/// * the host's look at its crash found no record, so the crash read as a
-///   graceful exit and nothing was relaunched;
-/// * the relaunch after aterm itself ended kept the raw relative home as the
-///   home its relaunched process files under ([`St::home`]), which names no
-///   directory, so the new process was never found;
-/// * the restart in place found no record of the process
-///   (`wait:no-session-record`), and never restarted it;
-///
-/// where the line's `cd` puts the home: its own record's directory.
-/// CONTROL: a record whose directory would move the home (the line `cd`s
-/// elsewhere than where the agent ran) is refused, as the sweep refuses it
-/// (`refused:home`), never typed.
+/// A relative Claude home (`CLAUDE_CONFIG_DIR=work home/.claude`) is followed where the
+/// line's `cd` puts it, its own record's directory: the host's look at the crash reads its
+/// record, the relaunch after aterm ended records the resolved directory ([`St::home`]),
+/// and the restart in place restarts it. Control: a record whose directory would move the
+/// home is refused (`refused:home`).
 #[cfg(unix)]
 #[test]
 fn a_relative_claude_home_is_followed_by_the_relaunch_and_the_restart_in_place() {
     const RELATIVE: &str = "work home/.claude";
     let record = register_running_in;
-    // THE LOOK AT A CRASH, and the relaunch after aterm itself ended.
+    // The look at a crash, and the relaunch after aterm itself ended.
     let _quick = QuickWaits::new();
     let mut a = DeadAgent::new("relative-home-relaunch");
-    let (sock, _) = instance_with(&a.dir, Answers::default());
+    let (sock, _asked) = instance_with(&a.dir, Answers::default());
     a.opts = Opts {
         sock: Some(sock),
         dry_run: false,
@@ -11799,7 +11441,7 @@ fn a_relative_claude_home_is_followed_by_the_relaunch_and_the_restart_in_place()
         "the relaunched process is looked for where it files its record"
     );
 
-    // THE RESTART IN PLACE of a live agent registered under it.
+    // The restart in place of a live agent registered under it.
     let dir = scratch("relative-home-restart");
     let opts = Opts {
         dry_run: true,
@@ -11815,6 +11457,7 @@ fn a_relative_claude_home_is_followed_by_the_relaunch_and_the_restart_in_place()
     let work = dir.join("work");
     let claude_dir = work.join(RELATIVE);
     let snap = Snapshot {
+        stored_login: false,
         tab: TAB.to_string(),
         pid: agent.id(),
         start: start.clone(),
@@ -11832,7 +11475,7 @@ fn a_relative_claude_home_is_followed_by_the_relaunch_and_the_restart_in_place()
     };
     record(&claude_dir, agent.id(), &start, &work);
     let restarted = restart_from(&opts, &Restart::Memory, Ok(snap.clone())).step;
-    // CONTROL: its record says it runs elsewhere, where the line would `cd`
+    // Control: its record says it runs elsewhere, where the line would `cd`
     // and so move its home.
     record(&claude_dir, agent.id(), &start, &dir.join("elsewhere"));
     let moved = restart_from(&opts, &Restart::Memory, Ok(snap)).step;
@@ -11848,24 +11491,16 @@ fn a_relative_claude_home_is_followed_by_the_relaunch_and_the_restart_in_place()
     );
 }
 
-/// THE RESTART IN PLACE RECORDS THE DIRECTORY ITS RELAUNCHED AGENT FILES
-/// UNDER, for a RELATIVE Claude home (the homes lane's review, 2026-10-14:
-/// this hunk passed every test reverted alone). The upgrade's record keeps
-/// the home its relaunched process files its record under ([`St::home`]),
-/// and every later look for that process — its adoption, its carry, the
-/// view's holders, the CLI's sweep — reads there ([`St::agent_records`]).
-/// Kept as the raw value (`work home/.claude`), a relative home names no
-/// directory ([`Records::of`]): the relaunched process could never be found
-/// or adopted. So the record keeps the DIRECTORY ([`Records::home_word`]).
-/// Driven for real past its signal ([`super::super::relaunch::restart_as`],
-/// its job and terminal scripted), the record it saved read back, and the
-/// relaunched process looked for through it.
+/// The restart in place of a relative home's agent records the directory the relaunched
+/// process files under ([`Records::home_word`]), not the raw value, which names no
+/// directory: driven past its signal (`relaunch::restart_as`), the relaunched process is
+/// found through the saved record ([`St::agent_records`]).
 #[cfg(unix)]
 #[test]
 fn a_restart_in_place_records_the_directory_a_relative_homes_agent_files_under() {
     const RELATIVE: &str = "work home/.claude";
     let dir = scratch("restart-relative-home-record");
-    let (sock, _) = instance_with(&dir, Answers::default());
+    let (sock, _asked) = instance_with(&dir, Answers::default());
     let opts = Opts {
         sock: Some(sock),
         only_sid: Some(TAB.to_string()),
@@ -11883,6 +11518,7 @@ fn a_restart_in_place_records_the_directory_a_relative_homes_agent_files_under()
     register_running_in(&claude_dir, agent.id(), &start, &work);
     file_transcript_in(&claude_dir, "-work");
     let snap = Snapshot {
+        stored_login: false,
         tab: TAB.to_string(),
         pid: agent.id(),
         start,
@@ -11940,17 +11576,135 @@ fn a_restart_in_place_records_the_directory_a_relative_homes_agent_files_under()
     );
 }
 
-/// THE RELAUNCH ON EXIT REFUSES A LINE THAT WOULD MOVE A RELATIVE HOME (the
-/// homes lane's review, 2026-10-14: no test drove it into `refused:home`).
-/// An agent started with `CLAUDE_CONFIG_DIR=work home/.claude` in `work`
-/// filed its records under `work/work home/.claude`, where its snapshot read
-/// them ([`Snapshot::claude_dir`]); its crash's record says it ran in
-/// another directory, and the relaunch line `cd`s there, where the same
-/// relative home names another directory: the relaunched Claude Code would
-/// look for its conversation, and file its record, where nothing reads it.
-/// Refused ([`home_carried`], `refused:home`), as the restart in place and
-/// the upgrade refuse it, never typed. CONTROL: the same crash whose record
-/// names the directory the home resolves from is relaunched.
+/// The restart in place types the usage tap under the switch and writes no settings file:
+/// driven for real past its signal ([`super::super::relaunch::restart_as`], a stand-in agent on
+/// its stored login, its job and terminal scripted), the line it types and records carries
+/// `--settings <the tap>` before `--resume` when `[harness] usage_tap` names this aterm
+/// ([`Opts::usage_tap`]), and the user's `settings.json` is left byte for byte. On the
+/// machine's one account, renewed, the follow onto the renewed login types that login and the
+/// tap with it (`tap::Armed::lone_login`). Negative control: the switch off types no
+/// `--settings` (and a line armed for the default login alone carries none on the renewed one:
+/// [`the_planned_relaunch_line_carries_the_usage_tap_only_where_its_gate_holds`]).
+#[cfg(unix)]
+#[test]
+fn a_restart_in_place_types_the_usage_tap_under_the_switch_and_writes_no_settings() {
+    use super::super::accounts::{self, Roster};
+    use super::super::tap;
+    let exe = Path::new("/Applications/aterm.app/Contents/MacOS/aterm");
+    let value = tap::settings_value(exe).expect("an admissible path");
+    let armed = |lone_login: Option<&str>| {
+        Some(tap::Armed {
+            exe: exe.to_path_buf(),
+            lone_login: lone_login.map(str::to_owned),
+        })
+    };
+    let run = |label: &str, usage_tap: Option<tap::Armed>, why: &Restart, roster: &Roster| {
+        let dir = scratch(label);
+        let (sock, _asked) = instance_with(&dir, Answers::default());
+        let opts = Opts {
+            sock: Some(sock),
+            only_sid: Some(TAB.to_string()),
+            usage_tap,
+            ..drive(&dir)
+        };
+        seed_builds(&opts);
+        let claude_dir = opts.home.join(".claude");
+        std::fs::create_dir_all(claude_dir.join("sessions")).expect("the user's sessions");
+        std::fs::create_dir_all(state_dir(&opts)).expect("state");
+        let settings = claude_dir.join("settings.json");
+        let text = "{\n  \"permissions\": {\"allow\": [\"Bash(ls)\"]}\n}\n";
+        std::fs::write(&settings, text).expect("the user's settings");
+        let work = dir.join("work");
+        std::fs::create_dir_all(&work).expect("work");
+        let mut shell = stand_in_shell();
+        let mut agent = parked_bare().spawn().expect("agent");
+        wait_exec(agent.id());
+        let start = kernel_start(agent.id()).expect("lstart");
+        register_running_in(&claude_dir, agent.id(), &start, &work);
+        file_transcript_in(&claude_dir, "-work");
+        let snap = Snapshot {
+            stored_login: true,
+            tab: TAB.to_string(),
+            pid: agent.id(),
+            start,
+            shell: shell.id(),
+            program: PathBuf::from("/opt/claude/bin/claude"),
+            argv: vec!["/opt/claude/bin/claude".to_string()],
+            session: Some(SESSION.to_string()),
+            cwd: work.to_string_lossy().into_owned(),
+            version: Some("1.0.0".to_string()),
+            codex: None,
+            dialect: None,
+            login: None,
+            home: None,
+            claude_dir: None,
+        };
+        let r = crate::harness::relaunch::restart_as(
+            &opts,
+            why,
+            roster,
+            Ok(snap),
+            &Script::new(shell.id(), usize::MAX, None),
+        );
+        let saved = load(&opts, SESSION);
+        let after = std::fs::read_to_string(&settings).expect("settings");
+        let _ = agent.kill();
+        let _ = agent.wait();
+        let _ = shell.kill();
+        let _ = shell.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        let saved = saved.unwrap_or_else(|| panic!("nothing restarted: {r:?}"));
+        assert_eq!(after, text, "the user's settings are untouched");
+        saved.line
+    };
+    let none = Roster::default();
+    let tapped = run("restart-usage-tap-on", armed(None), &Restart::Memory, &none);
+    assert!(
+        tapped.contains(&format!("'--settings' '{value}' '--resume' '{SESSION}'")),
+        "{tapped}"
+    );
+    let plain = run("restart-usage-tap-off", None, &Restart::Memory, &none);
+    assert!(!plain.contains("--settings"), "{plain}");
+    assert!(
+        plain.contains(&format!("'--resume' '{SESSION}'")),
+        "{plain}"
+    );
+    // The one account (`adopt-default`), renewed: bound to a login of its own.
+    let renewed = "/tmp/aterm-state/logins/home-a.1";
+    let one = Roster::parse(
+        "[[account]]\nlabel = \"home-a\"\nclass = \"dedicated\"\nemail = \"owner@example.com\"\n",
+    )
+    .expect("a roster");
+    let mut logins = accounts::Logins::default();
+    let mut state = accounts::State::default();
+    accounts::note_renewed(&mut state, &mut logins, "home-a", None, renewed, None, 1);
+    let one = accounts::bound(&one, &logins);
+    let follow = Restart::Account {
+        to: "home-a".to_string(),
+        at: crate::supervise::policy::turn_end::AccountAt::Ahead,
+    };
+    let followed = run(
+        "restart-usage-tap-follow",
+        armed(one.lone_login()),
+        &follow,
+        &one,
+    );
+    assert!(
+        followed.contains(&format!(
+            "CLAUDE_SECURESTORAGE_CONFIG_DIR={renewed} CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1"
+        )),
+        "{followed}"
+    );
+    assert!(
+        followed.contains(&format!("'--settings' '{value}' '--resume' '{SESSION}'")),
+        "{followed}"
+    );
+}
+
+/// The relaunch on exit refuses a line whose `cd` would move a relative home (the crash's
+/// record says it ran elsewhere, where the same home names another directory):
+/// `refused:home` ([`home_carried`]), never typed. Control: a record naming the directory
+/// the home resolves from is relaunched.
 #[cfg(unix)]
 #[test]
 fn the_relaunch_on_exit_refuses_a_line_that_would_move_a_relative_home() {
@@ -11978,19 +11732,11 @@ fn the_relaunch_on_exit_refuses_a_line_that_would_move_a_relative_home() {
     );
 }
 
-/// THE RELAUNCH SNAPSHOT READS A RELATIVE OR EMPTY CLAUDE HOME WHERE ITS
-/// AGENT RUNS ([`super::super::relaunch::snapshot`] itself, which every
-/// other test of such a home stands in for with a hand-built snapshot, its
-/// `claude_dir` none: the review of the homes lane, 2026-10-14). The tab's
-/// foreground leader's exec `CLAUDE_CONFIG_DIR`, resolved by the one
-/// resolver of a running agent's record ([`Records::of_process`]: against
-/// the leader's working directory, or the one it was started in), names
-/// the directory its record is read from — the conversation and the build
-/// the snapshot names — and the snapshot keeps it
-/// ([`Snapshot::claude_dir`]), where every later read of the agent is made.
-/// Read as the raw value, a relative home named nothing: no record, so no
-/// conversation, and the stand-in not even a Claude Code (`not-claude`).
-/// CONTROL: an absolute home and the user's own (unset).
+/// [`super::super::relaunch::snapshot`] itself (other tests hand-build the snapshot) reads
+/// the tab leader's `CLAUDE_CONFIG_DIR` through [`Records::of_process`] (relative or empty,
+/// against the directory it runs in) and keeps the resolved directory
+/// ([`Snapshot::claude_dir`]) with the conversation it names. Control: an absolute home and
+/// the user's own.
 #[cfg(unix)]
 #[test]
 fn the_relaunch_snapshot_reads_a_relative_or_empty_home_where_its_agent_runs() {
@@ -12072,19 +11818,10 @@ fn the_relaunch_snapshot_reads_a_relative_or_empty_home_where_its_agent_runs() {
     case("snapshot-users-home", Home::Users);
 }
 
-/// AN UNSET `CLAUDE_CONFIG_DIR` IS THE AGENT'S OWN HOME'S `.claude`, NOT THE
-/// WINDOW'S (the homes lane's stated limit, handoff §4): Claude Code keeps
-/// its records under `CLAUDE_CONFIG_DIR ?? join(homedir(), ".claude")`, and
-/// `homedir()` is the agent's own `HOME` (READ in the 2.1.300 bundle). An
-/// agent launched with `HOME=<other>` and no `CLAUDE_CONFIG_DIR` files its
-/// session record in `<other>/.claude`; every reader resolved an unset home
-/// to the window's own `~/.claude`, so the relaunch snapshot named no
-/// conversation (the agent not even a Claude Code: `not-claude`), and the
-/// live upgrade's sweep never listed that home. And the footer's own reader
-/// (`footer::claude_dir_of`: the footer, netprobe and the disk census) read
-/// an EMPTY `CLAUDE_CONFIG_DIR` as unset — the user's `~/.claude`, where
-/// Claude Code's `??` keeps the empty value and files under the directory it
-/// runs in — and a relative one as none.
+/// An unset `CLAUDE_CONFIG_DIR` is the agent's own `HOME`'s `.claude`, not the window's
+/// (`homedir()` is the agent's `HOME`): the relaunch snapshot reads its record there and
+/// the sweep lists that home. `footer::claude_dir_of`, the one resolver, reads an empty
+/// value as the directory the process runs in and a relative one under it.
 #[cfg(unix)]
 #[test]
 fn an_unset_claude_home_is_the_agents_own_homes_not_the_windows() {
@@ -12161,13 +11898,10 @@ fn an_unset_claude_home_is_the_agents_own_homes_not_the_windows() {
     );
 }
 
-/// THE ONE RESOLVER'S PROFILE FOR AN AGENT'S OWN `HOME` ([`Records::at`],
-/// [`profile_apart`]): Claude Code keeps the profile at
-/// `join(CLAUDE_CONFIG_DIR || homedir(), ".claude.json")`, `homedir()` the
-/// agent's own `HOME` — beside `<HOME>/.claude` for an unset home, in that
-/// `HOME` for an empty one — never the window's. A record of such an agent
-/// keeps both ([`St::keep_home`]). CONTROL: an agent whose `HOME` is the
-/// user's is the user's own home, recorded as none.
+/// [`Records::at`] for an agent's own `HOME`: Claude Code keeps the profile at
+/// `join(CLAUDE_CONFIG_DIR || homedir(), ".claude.json")`, `homedir()` the agent's `HOME`,
+/// never the window's ([`profile_apart`]); [`St::keep_home`] keeps both. Control: an
+/// agent whose `HOME` is the user's is recorded as none.
 #[test]
 fn an_agents_own_home_keeps_its_records_and_its_profile() {
     let user = Path::new("/Users//someone");
@@ -12210,7 +11944,7 @@ fn an_agents_own_home_keeps_its_records_and_its_profile() {
         empty.profile(user),
         Some(PathBuf::from("/Users//someone/other/.claude.json"))
     );
-    // CONTROL: its HOME is the user's, or not known.
+    // Control: its HOME is the user's, or not known.
     for home in [Some("/Users//someone"), None] {
         let own = Records::at(user, HomeVars { config: None, home }, || None);
         assert_eq!(own.dir(), Some(Path::new("/Users//someone/.claude")));
@@ -12222,25 +11956,52 @@ fn an_agents_own_home_keeps_its_records_and_its_profile() {
     }
 }
 
-/// EVERY READER FINDS A RELATIVE HOME'S RECORDS WHERE ITS AGENT FILED THEM,
-/// after the agent changed directory (the homes lane's stated limit,
-/// handoff §4). Claude Code keeps `CLAUDE_CONFIG_DIR` RAW — `ve()` is a
-/// memoize keyed by the variable's value, holding `CLAUDE_CONFIG_DIR ??
-/// join(homedir(), ".claude")` unresolved (READ in the 2.1.300 bundle) —
-/// and opens every path under it from the directory it runs in at that
-/// moment; its session record, written once at its start, stays where it was
-/// filed. 2.1.300's worktree enter `process.chdir`s: MEASURED in the
-/// real-Claude lab (`other/.claude`, then `EnterWorktree`), the record stayed
-/// in `<start>/other/.claude/sessions`, the transcript went on under
-/// `<worktree>/other/.claude`. The window's relaunch snapshot and the
-/// sweep's homes each resolved the home against the LIVE working directory,
-/// which holds no record of the agent: the snapshot named no conversation
-/// (the stand-in not even a Claude Code), the sweep never found the agent.
-/// Driven over a stand-in started (`PWD`) in `work` and running in
-/// `work/wt`, its record filed under `work`'s home. CONTROL: a stand-in that
-/// never moved. (The wall confirmation's tail reads the transcript where the
-/// agent writes NOW, not where it filed its record:
-/// [`the_walls_tail_is_the_transcript_its_agent_writes_now`].)
+/// The user's own `~/.claude` named by `CLAUDE_CONFIG_DIR` keeps its profile inside it
+/// ([`Records::at`], [`profile_apart`]): Claude Code keeps the profile at
+/// `join(CLAUDE_CONFIG_DIR || homedir(), ".claude.json")`, so
+/// `CLAUDE_CONFIG_DIR=<home>/.claude` (how the real-Claude lab launches it) reads
+/// `<home>/.claude/.claude.json`, never the default home's `<home>/.claude.json`. The directory
+/// alone ([`claude_profile`]) says beside it, so the profile is kept apart: a record of such an
+/// agent keeps it with no home ([`St::keep_home`]) and reads it back ([`St::agent_records`]).
+/// Control: with the variable unset, the same directory keeps it beside, and the record keeps
+/// nothing apart.
+#[test]
+fn the_users_own_claude_home_named_explicitly_keeps_its_profile_inside_it() {
+    let user = Path::new("/Users//someone");
+    let named = Records::at(
+        user,
+        HomeVars::config(Some("/Users//someone/.claude")),
+        || None,
+    );
+    assert_eq!(named.dir(), Some(Path::new("/Users//someone/.claude")));
+    assert_eq!(
+        named.profile(user),
+        Some(PathBuf::from("/Users//someone/.claude/.claude.json"))
+    );
+    let mut st = St::default();
+    assert!(st.keep_home(&named, user));
+    assert_eq!(st.home, None, "the directory is the user's own");
+    assert_eq!(
+        st.home_profile.as_deref(),
+        Some("/Users//someone/.claude/.claude.json")
+    );
+    assert_eq!(st.agent_records(user), named, "read back whole");
+    // Control: unset, the same directory, the profile beside it.
+    let unset = Records::at(user, HomeVars::config(None), || None);
+    assert_eq!(unset.dir(), named.dir());
+    assert_eq!(
+        unset.profile(user),
+        Some(PathBuf::from("/Users//someone/.claude.json"))
+    );
+    let mut st = St::default();
+    assert!(!st.keep_home(&unset, user), "nothing kept apart");
+    assert_eq!((st.home, st.home_profile), (None, None));
+}
+
+/// Every reader finds a relative home's records where its agent filed them at start, though it
+/// changed directory since (Claude Code keeps `CLAUDE_CONFIG_DIR` unresolved and opens paths from
+/// its current directory): the relaunch snapshot and the sweep read there. Control: a stand-in
+/// that never moved.
 #[cfg(unix)]
 #[test]
 fn every_reader_finds_a_relative_homes_records_where_its_agent_filed_them() {
@@ -12302,20 +12063,11 @@ fn every_reader_finds_a_relative_homes_records_where_its_agent_filed_them() {
     case("records-where-filed-moved", true);
 }
 
-/// THE LIVE UPGRADE FINDS AN AGENT UNDER ANOTHER CLAUDE HOME (the handoff's
-/// §4 residual, 2026-10-14): a Claude Code started with
-/// `CLAUDE_CONFIG_DIR=<dir>` — an account roster's move, an owner's wrapper,
-/// the real-Claude lab — files `sessions/<pid>.json` in `<dir>`, and every
-/// reader of the sweep looked in `~/.claude` alone, so the agent leading the
-/// tab was never due ([`due`]: no record, then `No` past its launch) and the
-/// tab's step never visited it: relaunched on exit and restarted in place
-/// under its home, but never moved to a newer build. Driven through the
-/// host's own reads (the instance's `who` roster naming the agent's group,
-/// the agent's exec environment read off the kernel): due, and the step's
-/// pass visits it — under an absolute home, a relative one, and on a
-/// machine whose user home keeps no Claude records at all (no
-/// `~/.claude/sessions`, which the pass read as records it could not read).
-/// CONTROL: the same agent under the user's home, found as ever.
+/// The live upgrade finds an agent under another Claude home (`CLAUDE_CONFIG_DIR=<dir>`
+/// files `sessions/<pid>.json` in `<dir>`) through the host's own reads (the `who`
+/// roster, the agent's exec environment): due and visited, under an absolute or relative
+/// home and with no `~/.claude/sessions` at all. Control: the same agent under the
+/// user's home.
 #[cfg(unix)]
 #[test]
 fn the_live_upgrade_finds_an_agent_under_another_claude_home() {
@@ -12397,20 +12149,14 @@ fn the_live_upgrade_finds_an_agent_under_another_claude_home() {
     case("sweep-own-home-only", Home::Absolute, false);
 }
 
-/// AN AGENT UNDER AN EMPTY CLAUDE HOME IS READ WHERE CLAUDE CODE FILES IT
-/// (the upgrade-homes lane's stated limit, handoff §4): `CLAUDE_CONFIG_DIR`
-/// set and EMPTY was read as unset by every reader here, where Claude Code's
-/// `??` keeps the empty string and files `sessions/<pid>.json` and
-/// `projects/` in the directory it runs in (MEASURED in the real-Claude lab,
-/// 2026-10-14, 2.1.299). So such an agent was looked for in the user's
-/// `~/.claude`, which holds nothing of it: the live upgrade never found it
-/// (never due, never visited), and the host's look at its crash found no
-/// record (read as a graceful exit, never relaunched).
+/// An agent under a set-and-empty `CLAUDE_CONFIG_DIR` is read where Claude Code files it,
+/// in the directory it runs in (its `??` keeps the empty string): the live upgrade finds
+/// it due and visits it, and the host's look at its crash finds its record.
 #[cfg(unix)]
 #[test]
 fn an_agent_under_an_empty_claude_home_is_read_where_claude_code_files_it() {
-    // THE LIVE UPGRADE: the agent leading the tab, under `CLAUDE_CONFIG_DIR=`
-    // in `work`, its record where its Claude Code files it.
+    // The live upgrade: the agent leading the tab, under `CLAUDE_CONFIG_DIR=` in `work`,
+    // its record where its Claude Code files it.
     let dir = scratch("sweep-empty-home");
     let work = dir.join("work");
     std::fs::create_dir_all(&work).expect("its working directory");
@@ -12443,7 +12189,7 @@ fn an_agent_under_an_empty_claude_home_is_read_where_claude_code_files_it() {
     let _ = agent.kill();
     let _ = agent.wait();
     let _ = std::fs::remove_dir_all(&dir);
-    // THE HOST'S LOOK AT ITS CRASH.
+    // The host's look at its crash.
     let mut a = DeadAgent::new("look-empty-home");
     a.snap.cwd = a.dir.to_string_lossy().into_owned();
     a.snap.home = Some(String::new());
@@ -12458,13 +12204,9 @@ fn an_agent_under_an_empty_claude_home_is_read_where_claude_code_files_it() {
     assert!(looked, "its crash's record is read where it filed it");
 }
 
-/// THE UPGRADE VIEW COUNTS AN AGENT UNDER ANOTHER CLAUDE HOME: an upgrade
-/// record shows only while a live process holds its conversation
-/// ([`Row::standing`]), and the holders were read in `~/.claude` alone, so a
-/// pending upgrade of an agent under another home was never shown or
-/// counted. The record names the home its agent keeps its records under
-/// ([`St::home`]); the holder is read there. CONTROL: the same record with
-/// no home, its agent under the user's, as ever.
+/// The upgrade view shows a pending upgrade only while a live process holds its
+/// conversation (`Row::standing`); the holder is read under the home the record names
+/// ([`St::home`]). Control: a record with no home, its agent under the user's.
 #[cfg(unix)]
 #[test]
 fn the_upgrade_view_counts_an_agent_under_another_claude_home() {
@@ -12515,18 +12257,12 @@ fn the_upgrade_view_counts_an_agent_under_another_claude_home() {
     case("view-own-home", true);
 }
 
-/// [`Homes`]: what one pass reads past the user's own Claude home, off each
-/// tab leader's exec environment (injected here). A home is learned from a
-/// leader whose `CLAUDE_CONFIG_DIR` is set: an absolute one as it is, a
-/// RELATIVE one — set and EMPTY included, which Claude Code's `??` keeps —
-/// against the leader's working directory, as Claude Code resolves it (the
-/// one resolver, [`home_dir_at`]). Only the tab the pass is scoped to
-/// ([`Opts::only_sid`]). Each directory once, and the user's own never — by
-/// a link to it too: read twice, every record there would read as a second
-/// owner of its own conversation. A leader whose home cannot be named (its
-/// exec record unread; a relative home whose working directory is unread) is
-/// said, never read as one under the user's home. With no roster (the
-/// CLI's sweep), the homes the conversations' records name.
+/// [`Homes`]: the Claude homes one pass reads besides the user's, off each tab leader's exec
+/// environment: `CLAUDE_CONFIG_DIR` as set, or resolved against the leader's working directory
+/// ([`home_dir_at`]); only the scoped tab ([`Opts::only_sid`]); each directory once and never the
+/// user's own, even by a link (read twice, every record would be a second owner of its
+/// conversation). A home that cannot be named is marked `unnamed`, never read as the user's;
+/// with no roster, the records' homes.
 #[cfg(unix)]
 #[test]
 fn a_pass_reads_every_claude_home_its_tabs_agents_run_under() {
@@ -12637,11 +12373,10 @@ fn a_pass_reads_every_claude_home_its_tabs_agents_run_under() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// [`Homes::roster`]: every home's records, each stamped with where it was
-/// read ([`SessionFile::claude_dir`], what every later read of the agent
-/// follows). A home with no `sessions/` yet keeps none; one whose records
-/// cannot be read whole (a file where `sessions/` should be) leaves the whole
-/// roster unread, as the user's own does.
+/// [`Homes::roster`]: every home's records, each stamped with where it was read
+/// ([`SessionFile::claude_dir`]). A home with no `sessions/` yet keeps none; one that cannot be
+/// read whole (a file where `sessions/` should be) leaves the whole roster unread, as the user's
+/// own does.
 #[test]
 fn a_roster_reads_every_home_whole_or_not_at_all() {
     let dir = scratch("roster");
@@ -12673,13 +12408,9 @@ fn a_roster_reads_every_home_whole_or_not_at_all() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A RELATIVE CLAUDE HOME IS CARRIED ONLY WHERE THE LINE KEEPS IT
-/// ([`home_carried`]): Claude Code resolves `CLAUDE_CONFIG_DIR` against the
-/// directory it runs in, and the relaunch line starts it in the directory its
-/// record names (`cd`). Where that resolves elsewhere than where its records
-/// are, the relaunched agent would look for its conversation under another
-/// home: refused (`refused:home`, a line a resume cannot repeat). An absolute
-/// home, none, and a line that starts it where it runs now are carried.
+/// [`home_carried`]: a relative Claude home is carried only where the relaunch line's `cd`
+/// keeps it resolving to the agent's records; elsewhere it is refused (`refused:home`). An
+/// absolute home, none, and a line starting it where it runs now are carried.
 #[test]
 fn a_relative_claude_home_the_line_would_move_is_refused() {
     let user = Path::new("/home");
@@ -12695,9 +12426,8 @@ fn a_relative_claude_home_the_line_would_move_is_refused() {
         "/work/c",
         &records
     )));
-    // AN UNSET HOME UNDER ANOTHER `HOME` (round eighteen): its records are
-    // `<HOME>/.claude`, and the line, carrying no HOME, would start it under
-    // its shell's.
+    // An unset home under another `HOME`: its records are `<HOME>/.claude`, and the line,
+    // carrying no `HOME`, would start it under its shell's.
     let other = Records::at(
         user,
         HomeVars {
@@ -12709,13 +12439,9 @@ fn a_relative_claude_home_the_line_would_move_is_refused() {
     assert!(refused(home_carried(user, None, "/work/c", &other)));
 }
 
-/// THE UPGRADE'S RECORD NAMES THE CLAUDE HOME ITS AGENT RUNS UNDER
-/// ([`St::home`]), from the visit that finds it: where the restart's relaunch
-/// finds the new process ([`St::agent_records`]), the owner's view its
-/// holder, a pass with no roster the agent. Driven (not dry): an agent under
-/// another home, which the visit stops (not its shell's job) — its record
-/// names the home, written and read back. CONTROL: an agent under the
-/// user's own home: none written, the record as it always was.
+/// The upgrade's record names the Claude home its agent runs under ([`St::home`]), written
+/// by the visit and read back by [`St::agent_records`]. Control: an agent under the user's
+/// own home writes none.
 #[cfg(unix)]
 #[test]
 fn an_upgrades_record_names_the_claude_home_its_agent_runs_under() {
@@ -12751,13 +12477,10 @@ fn an_upgrades_record_names_the_claude_home_its_agent_runs_under() {
     }
 }
 
-/// AN EXIT'S RELAUNCH SAVES THE FALLBACK ORIGIN IT DECIDES, driven (not
-/// dry) to the record it keeps: a crashed agent of a standing fallback,
-/// moved to Opus by hand since, is relaunched asking for Opus with Opus as
-/// the origin — the wire of [`after_exit`] into [`exit_fallback`], the hand
-/// choice with it, read off the saved record. NEGATIVE CONTROL: nobody's
-/// `/model` — the fallback's own origin carried. The two run side by side:
-/// each waits out the stand-in shell's prompt that never comes back.
+/// An exit's relaunch saves the fallback origin it decides ([`after_exit`] into
+/// [`exit_fallback`]): a hand `/model` choice since becomes the origin. Negative control:
+/// no `/model`, the fallback's own origin is carried. The cases run side by side, each
+/// waiting out the stand-in shell's prompt.
 #[cfg(unix)]
 #[test]
 fn an_exit_relaunch_saves_the_fallback_origin_it_decides() {
@@ -12767,7 +12490,7 @@ fn an_exit_relaunch_saves_the_fallback_origin_it_decides() {
     let case = |name: &str, chose: Option<&str>, want: &str| {
         let _quick = QuickWaits::new();
         let mut a = DeadAgent::new(name);
-        let (sock, _) = instance_with(&a.dir, Answers::default());
+        let (sock, _asked) = instance_with(&a.dir, Answers::default());
         a.opts = Opts {
             sock: Some(sock),
             dry_run: false,
@@ -12820,15 +12543,9 @@ fn an_exit_relaunch_saves_the_fallback_origin_it_decides() {
     });
 }
 
-/// A RELAUNCH LEFT IN FLIGHT FINDS ITS PROCESS UNDER THE CLAUDE HOME ITS
-/// LINE CARRIED ([`St::home`], [`St::records`]; review of
-/// `fix/cold-restore-login-home`, 2026-10-09): the relaunched Claude Code
-/// files its record there, so the step that adopts it (a cold restore's,
-/// `host`) and the carry-on at its loop's idle point ([`resume`]) read there.
-/// Read in the user's `~/.claude`, a relaunched agent under another home was
-/// never found — `wait:resume` at every step, then `failed:no-resume` past
-/// the stale bound, its continuation never typed. NEGATIVE CONTROL: a record
-/// with no home finds its process in `~/.claude`, as ever.
+/// A relaunch left in flight finds its process under the Claude home its line carried
+/// ([`St::home`]), at adoption and at its loop's carry-on ([`resume`]). Negative control: a
+/// record with no home finds its process in `~/.claude`.
 #[cfg(unix)]
 #[test]
 fn a_relaunch_in_flight_finds_its_process_under_the_home_its_line_carried() {
@@ -12869,11 +12586,9 @@ fn a_relaunch_in_flight_finds_its_process_under_the_home_its_line_carried() {
     };
     let r = adopt(Some(&dir.join("work home/.claude")));
     assert_eq!((r.step.as_str(), r.pid), ("adopted", pid), "{r:?}");
-    // Its loop's idle point carries it on ([`resume`]): found again, read
-    // idle and the conversation's one live owner there, the carry goes on to
-    // the tab's own claim — which the stand-in, on no PTY of the tab's, does
-    // not hold. Read in `~/.claude`, it waited the whole settle for a record
-    // that never came and said the conversation had moved.
+    // Its loop's idle point carries it on ([`resume`]): found again under the same home,
+    // the carry goes on to the tab's own claim, which the stand-in (on no PTY of the tab's)
+    // does not hold.
     let carried = resume(&opts);
     assert_eq!(
         (carried.step.as_str(), carried.pid),
@@ -12887,14 +12602,10 @@ fn a_relaunch_in_flight_finds_its_process_under_the_home_its_line_carried() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A relaunch handed back: where a supervisor loop takes the relaunched agent
-/// (`hand_back`), the step ends as soon as the relaunch holds the conversation
-/// (`adopted`, its pid, the record still in flight and owed to its tab), and
-/// [`resume`], at the loop's idle point, carries it on. A typed continuation
-/// whose model is still to be read is owed too, and once read is owed no
-/// more. Negative controls: without `hand_back` the same find goes on to the
-/// carry-on; another tab owes nothing; a record whose model was read owes
-/// nothing.
+/// A relaunch handed back (`hand_back`): the step ends at `adopted`, the record still in
+/// flight and owed to its tab, and [`resume`] at the loop's idle point carries it on; a
+/// typed continuation's model is owed until read. Negative controls: without `hand_back`
+/// the find goes on to the carry-on; another tab owes nothing.
 #[cfg(unix)]
 #[test]
 fn a_relaunch_handed_to_its_loop_ends_at_adoption_and_is_owed_to_its_tab() {
@@ -12966,18 +12677,10 @@ fn a_relaunch_handed_to_its_loop_ends_at_adoption_and_is_owed_to_its_tab() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// ONE MOVE, ONE `adopted` ROW, IN ITS MOVE'S WORDS (a quiet upgrade's
-/// ledger said `adopted` twice in one second,
-/// each promising a continuation the same move's `done:resumed` then said was
-/// never typed; the second writer, the same pass's orphan pass, is fixed at
-/// its cause in
-/// `the_orphan_pass_leaves_a_restart_relaunched_since_its_list_was_read`). An
-/// adopted restart stays in flight until its loop's `resume`, and any step
-/// that finds it meanwhile — the host's carry of the old agent's exit — reads
-/// the record from disk, as the second actor here does. NEGATIVE CONTROLS: a
-/// new move's relaunched process, found with the last move's adoption still
-/// on the record, writes its own row; and a move that owes a continuation
-/// says its supervisor types it.
+/// One move, one `adopted` row: an adopted restart stays in flight until its loop's `resume`,
+/// and a step that finds it meanwhile reads the record from disk and says nothing again.
+/// Negative controls: a new move's relaunched process writes its own row; a move owing a
+/// continuation says its supervisor types it.
 #[cfg(unix)]
 #[test]
 fn an_adoption_is_said_once_in_the_words_of_its_move() {
@@ -12997,7 +12700,7 @@ fn an_adoption_is_said_once_in_the_words_of_its_move() {
     wait_exec(b);
     let mut c = connect(&opts, TAB).expect("control connection");
     let sessions = opts.home.join(".claude/sessions");
-    // One step over the record ON DISK, finding `pid` as the relaunch.
+    // One step over the record on disk, finding `pid` as the relaunch.
     let mut adopt = |pid: u32| {
         let _ = std::fs::remove_dir_all(&sessions);
         let sf = register(&opts.home, pid, SESSION);
@@ -13035,7 +12738,7 @@ fn an_adoption_is_said_once_in_the_words_of_its_move() {
             && !rows[0].contains("types the continuation"),
         "a quiet move promises nothing: {rows:?}"
     );
-    // NEGATIVE CONTROL: the next move — an ask-flow round, relaunched
+    // Negative control: the next move — an ask-flow round, relaunched
     // process `b` — says its own row, and owes the continuation.
     save(
         &opts,
@@ -13063,16 +12766,9 @@ fn an_adoption_is_said_once_in_the_words_of_its_move() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// THE ORPHAN PASS LEAVES A RESTART RELAUNCHED SINCE ITS LIST WAS READ: the
-/// pass read the session files
-/// while the old agent held the conversation, its visit ended that agent and
-/// relaunched it, and the new process registered after the list. Judged from
-/// the list, the restart read as orphaned and the same pass carried it again
-/// — the harness's hand on the tab a second time and the second `adopted` row
-/// of that test. Now it is `visit`'s, or its loop's `resume`: nothing is
-/// dialled, said or written. NEGATIVE CONTROL: once the relaunch holds
-/// nothing, the orphan pass carries it on (here, dialling a socket that is
-/// not there).
+/// The orphan pass leaves a restart whose relaunched process registered after the pass
+/// read its list: it is `visit`'s or its loop's `resume`, so nothing is dialled, said or
+/// written. Negative control: once the relaunch holds nothing, the orphan pass carries it.
 #[cfg(unix)]
 #[test]
 fn the_orphan_pass_leaves_a_restart_relaunched_since_its_list_was_read() {
@@ -13111,7 +12807,7 @@ fn the_orphan_pass_leaves_a_restart_relaunched_since_its_list_was_read() {
     assert_eq!(steps(), Vec::<String>::new(), "the relaunch holds it");
     assert_eq!(ledger_lines(&opts), 0, "nothing said");
     assert_eq!(load(&opts, SESSION), Some(saved), "nothing written");
-    // NEGATIVE CONTROL: the relaunched process gone, and its file with it.
+    // Negative control: the relaunched process gone, and its file with it.
     let _ = new.kill();
     let _ = new.wait();
     std::fs::remove_file(
@@ -13178,10 +12874,9 @@ fn a_fresh_start_is_the_same_launch_without_the_resume() {
     );
 }
 
-/// THE SURVEY EXPORT NEVER REFUSES A LAUNCH: a Claude launch whose relaunch line fits
-/// the kernel's bound only without `CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1 ` (38 bytes on
-/// a bound of 1000) is relaunched without it. NEGATIVE CONTROL: a launch that does not
-/// fit even without it is still refused, and one that fits with it carries it.
+/// The survey export never refuses a launch: a relaunch line that fits the kernel's bound
+/// only without `CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1 ` is relaunched without it.
+/// Negative control: a line over the bound either way is refused; one that fits carries it.
 #[test]
 fn the_survey_export_never_refuses_a_launch() {
     let exe = Path::new("/opt/claude");
@@ -13253,17 +12948,15 @@ fn user_row_at(text: &str, at: &str) -> String {
     )
 }
 
-/// A restart relaunched on 2.1.282 from 2.1.281 over a stand-in agent in
-/// [`TAB`], at the moment its new process holds the conversation: the state as
-/// [`relaunch`] leaves it, on disk, with what the restart recorded of the
-/// transcript (through the sweep's own read, [`tail_to_end`] and
-/// [`model_and_mark`]) when it was `before`. Dropped, it stops the agent and
-/// removes its directory.
+/// A restart relaunched from 2.1.281 onto 2.1.282 over a stand-in agent in [`TAB`], at the
+/// moment its new process holds the conversation: the state as [`relaunch`] leaves it, with the
+/// transcript's model and mark as the sweep read them ([`model_and_mark`]) when it was `before`.
+/// Dropped, it stops the agent and removes its directory.
 #[cfg(unix)]
 struct Rig {
     dir: ScratchDir,
     opts: Opts,
-    asked: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    asked: crate::harness::FakeInstanceLog,
     agent: aterm_uds::spawnfd::Child,
     sf: SessionFile,
     path: PathBuf,
@@ -13349,7 +13042,7 @@ impl Rig {
         )
     }
 
-    /// Every line typed into the tab.
+    /// Every turn typed into the tab.
     fn typed(&self) -> Vec<String> {
         self.asked
             .lock()
@@ -13413,11 +13106,9 @@ fn carried_on(name: &str, before: &[String], after: &[String], wait: Duration) -
     }
 }
 
-/// The model, before and after: the continuation names the model the agent's
-/// READY answer ran, and the resumed session's first answer past the
-/// restart's mark (Claude's own `<synthetic>` row skipped) is the model after,
-/// read by the step after the one that typed the continuation. A change is
-/// words only: the step is `done`.
+/// The continuation names the model the READY answer ran; the step after reads the model
+/// after from the resumed session's first answer past the mark (Claude's `<synthetic>`
+/// row skipped). A change is words only: the step is `done`.
 #[cfg(unix)]
 #[test]
 fn a_restart_says_the_model_before_and_confirms_the_one_after() {
@@ -13472,12 +13163,9 @@ fn a_restart_says_the_model_before_and_confirms_the_one_after() {
     );
 }
 
-/// A relaunch after aterm itself ended (`CAUSE_HOST`) types the relaunch's own
-/// words once its agent holds its conversation again, not the upgrade's
-/// (`Upgraded: this session was restarted on Claude Code …`), which would be
-/// false for an agent nobody upgraded. Negative control: the upgrade's own
-/// record (no cause) still types the upgrade's words, through the same
-/// carry-on.
+/// A relaunch after aterm itself ended (`CAUSE_HOST`) types the relaunch's own words, not
+/// the upgrade's `Upgraded: …`, which would be false for an agent nobody upgraded.
+/// Negative control: the upgrade's own record still types the upgrade's words.
 #[cfg(unix)]
 #[test]
 fn a_relaunch_after_aterm_ended_types_why_it_was_relaunched() {
@@ -13506,12 +13194,10 @@ fn a_relaunch_after_aterm_ended_types_why_it_was_relaunched() {
     assert!(upgrade[0].contains("Upgraded: "), "{upgrade:?}");
 }
 
-/// The relaunch's production waits (15 s for a shell's prompt, 5 s of a shell
-/// holding its tab before the agent reads as ended, a look a second) cut to a
-/// fraction of a second for THIS thread, until dropped ([`WaitsInTest`]): a
-/// stand-in shell that never takes its terminal back, or holds it throughout, is
-/// waited out in well under a second. Nothing here is a latency budget: no
-/// assertion bounds from above how long a step took.
+/// The relaunch's production waits (15 s for a shell's prompt, 5 s of a shell holding its
+/// tab before the agent reads as ended, a look a second) cut to a fraction of a second for
+/// this thread until dropped ([`WaitsInTest`]). No assertion bounds a step's time from
+/// above.
 #[cfg(unix)]
 struct QuickWaits;
 
@@ -13629,12 +13315,10 @@ const BLOCK_ENDED: &str = r#"OK {"blocks":[{"id":3,"state":"complete","exit":1,"
 #[cfg(unix)]
 const BLOCK_NEXT: &str = r#"OK {"blocks":[{"id":4,"state":"entering","exit":null,"prompt":12,"cmd":12,"cmdcol":5,"out":null,"end":null,"cwd":"","cmdline":""}]}"#;
 
-/// A relaunched agent that ended as it started (Claude's `No conversation
-/// found`, a crash at start) — the agent took the terminal, and its shell has
-/// it back at once — is said at once: `failed:no-resume`, stopped, one
-/// ledger line, in seconds, not after a long wait with the harness's hand on
-/// the tab. (Negative controls, where no 90 s wait is paid:
-/// `relaunch::tests::a_shell_that_has_the_tab_back_reads_as_ended_only_once_its_line_ran`.)
+/// A relaunched agent that ended as it started (Claude's `No conversation found`, a crash
+/// at start: the agent took the terminal, its shell has it back at once) stops in
+/// seconds: `failed:no-resume`, one ledger line. Negative controls:
+/// `relaunch::tests::a_shell_that_has_the_tab_back_reads_as_ended_only_once_its_line_ran`.
 #[cfg(unix)]
 #[test]
 fn a_relaunch_that_ended_as_it_started_is_said_at_once() {
@@ -13754,22 +13438,19 @@ fn held_step_shown(
     (r, st, rows, shown)
 }
 
-/// A wait long enough that a shell read as holding the tab throughout would
-/// have been read as ENDED ([`QuickWaits::ENDED`] and several looks more): the
-/// negative controls wait it out. A positive control, which ends at once, passes
-/// [`HANG_DETECTOR`] instead, so a loaded machine cannot cut it short.
+/// A wait long enough that a shell holding the tab throughout would have been read as ended
+/// ([`QuickWaits::ENDED`] and several looks more): the negative controls wait it out. A
+/// positive control, which ends at once, passes [`HANG_DETECTOR`] instead.
 #[cfg(unix)]
 const PAST_ENDED: Duration = Duration::from_millis(1_500);
 
-/// The wait of a step that must END early: only a hang waits it out.
+/// The wait of a step that must end early: only a hang waits it out.
 #[cfg(unix)]
 const HANG_DETECTOR: Duration = Duration::from_secs(60);
 
-/// Negative controls of the early verdict, through the step itself: a restored tab's relaunched agent that is still starting
-/// — something other than its shell holds the tab — or whose shell cannot be
-/// read is WAITED ON past [`QuickWaits::ENDED`]: `wait:resume`, the record still
-/// in flight, nothing stopped and nothing ledgered. Wired to a verdict that
-/// ignores the kernel's answer, both would fail as `failed:no-resume`.
+/// Negative controls of the early verdict, through the step itself: a restored tab's
+/// relaunched agent still starting (something other than its shell holds the tab), or
+/// whose shell cannot be read, is waited on (`wait:resume`, nothing ledgered).
 #[cfg(unix)]
 #[test]
 fn a_restored_relaunch_still_starting_or_unread_is_waited_on_not_failed() {
@@ -13795,13 +13476,9 @@ fn a_restored_relaunch_still_starting_or_unread_is_waited_on_not_failed() {
     );
 }
 
-/// The early verdict is never the live relaunch on exit's. It
-/// ([`CAUSE_EXIT`]) keeps its wait even with its agent seen to run and its
-/// shell holding the tab since: its loop retries `failed:no-resume` after
-/// its back-off by typing the relaunch line afresh, so an early verdict
-/// there would retype a refusing agent within seconds. Negative control: the
-/// same step as a restored tab's is said as ended (and so is an upgrade's,
-/// `an_upgrade_relaunch_that_ended_as_it_started_is_an_agent_down_at_once`).
+/// The early verdict is never the live relaunch on exit's ([`CAUSE_EXIT`]): its loop retries
+/// `failed:no-resume` by retyping the line, so an early verdict would retype a refusing
+/// agent within seconds. Negative control: a restored tab's step is said ended.
 #[cfg(unix)]
 #[test]
 fn a_live_relaunch_on_exit_keeps_its_wait_when_its_shell_has_the_tab() {
@@ -13820,19 +13497,10 @@ fn a_live_relaunch_on_exit_keeps_its_wait_when_its_shell_has_the_tab() {
     assert_eq!(rows, 1);
 }
 
-/// A SHELL THAT HOLDS ITS TAB IS NO PROOF THE AGENT ENDED (the review of the
-/// 2026-10-09 sweep fixes): a shell does its own work between reading the
-/// relaunch line and starting what it names — a `preexec` built on `$(…)`, a
-/// direnv on the line's `cd` — and holds its terminal all the while. Read as
-/// ended after `relaunch::ENDED_AT_ONCE` of that, an upgrade's relaunch was
-/// stopped `failed:no-resume`, and the owner was told to resume by hand,
-/// while the Claude Code the line started came up seconds later holding the
-/// very conversation (lab: `preexec() { : $(sleep 8) }`). Nothing showed
-/// that the line's command had run: the shell never handed its terminal to
-/// it, and the block it was typed into was still its prompt. The step waits
-/// (`wait:resume`), the record in flight and nothing ledgered, for the
-/// upgrade's move and for an account move alike (whose stop strikes the
-/// account it moved to), by either witness.
+/// A shell that holds its tab is no proof the agent ended: it can run its own work (a
+/// `preexec` with `$(…)`, direnv on the line's `cd`) between reading the line and starting
+/// it. With no witness that the line ran, the step waits `wait:resume`, the record in
+/// flight, for the upgrade's move and an account move alike.
 #[cfg(unix)]
 #[test]
 fn a_relaunch_whose_shell_has_not_run_its_line_yet_is_waited_on() {
@@ -13865,14 +13533,10 @@ fn a_relaunch_whose_shell_has_not_run_its_line_yet_is_waited_on() {
     );
 }
 
-/// THE SHELL'S OWN WORD DECIDES WHETHER THE LINE RAN where its integration
-/// marks the block the line was typed into ([`St::line_block`]): that block
-/// over — its `133;D`, or the next prompt's block begun — is the line's
-/// command ended, though no look caught the agent holding the terminal (a
-/// crash faster than a look): `failed:no-resume`. NEGATIVE CONTROL: the
-/// block still running its command is no end, though the kernel saw the
-/// agent take the terminal and give it back (the kernel's witness does not
-/// count where the shell's can be read): the step waits.
+/// Where the shell's integration marks the line's block ([`St::line_block`]), that block
+/// over (`133;D`, or the next prompt's begun) is the line's command ended, though no look
+/// caught the agent: `failed:no-resume`. Negative control: the block still running waits,
+/// though the kernel saw the agent come and go (the shell's word outranks it).
 #[cfg(unix)]
 #[test]
 fn the_shells_own_block_says_whether_the_line_ran() {
@@ -13914,17 +13578,10 @@ fn the_shells_own_block_says_whether_the_line_ran() {
 #[cfg(unix)]
 const BLOCK_AT_PROMPT: &str = r#"OK {"blocks":[{"id":3,"state":"prompt","exit":null,"prompt":10,"cmd":null,"cmdcol":null,"out":null,"end":null,"cwd":"","cmdline":""}]}"#;
 
-/// THE BLOCK A RESTART'S LINE IS TYPED INTO IS READ BEFORE IT IS, AND ITS END
-/// IS THE LINE'S (the review of the block witness: every test of it set
-/// [`St::line_block`] by hand, so nothing pinned that a relaunch stamps it).
-/// A restart in place at a zsh that holds its terminal throughout — no look
-/// sees the line's job, as with a Claude Code that crashes faster than a
-/// look — in a tab whose newest block is the prompt (block 3) as the line is
-/// typed: the record names block 3, and the next prompt's block begun after
-/// the line says the line's command ended: `failed:no-resume`, at once.
-/// NEGATIVE CONTROL: block 3 still the newest, the step waits
-/// (`wait:resume`). Without the stamp the kernel alone would judge, and it
-/// never saw the line run: both wait.
+/// A restart stamps the block its line is typed into ([`St::line_block`]) and judges the
+/// line by it: at a zsh that holds its terminal throughout, the next prompt's block begun
+/// after the line is `failed:no-resume` at once. Negative control: block 3 still the
+/// newest waits (`wait:resume`).
 #[cfg(unix)]
 #[test]
 fn a_restarts_line_is_judged_by_the_block_it_was_typed_into() {
@@ -13960,6 +13617,7 @@ fn a_restarts_line_is_judged_by_the_block_it_was_typed_into() {
             &[answer_at("claude-opus-5", "2099-01-01T00:00:00Z")],
         );
         let snap = Snapshot {
+            stored_login: false,
             tab: TAB.to_string(),
             pid,
             start: kernel_start(pid).expect("lstart"),
@@ -14016,9 +13674,8 @@ fn a_restarts_line_is_judged_by_the_block_it_was_typed_into() {
             )
         };
         let mut r = restart();
-        // The stand-in's agent is this test's child, alive to `kill(0)`
-        // until reaped: the relaunch is carried on, as the host's next idle
-        // point carries it, once it surely is.
+        // The stand-in is this test's child, alive to `kill(0)` until reaped: carry the
+        // relaunch on, as the host's next idle point would, once it is.
         assert!(
             ended.recv_timeout(HANG_DETECTOR).is_ok(),
             "{name}: the agent ended"
@@ -14056,20 +13713,11 @@ fn a_restarts_line_is_judged_by_the_block_it_was_typed_into() {
     ]);
 }
 
-/// AN UPGRADE'S RELAUNCH THAT ENDED AS IT STARTED IS SAID AT ONCE, AND READS
-/// AS AN AGENT THAT IS DOWN (the real-Claude sweep of 2026-10-09: the new
-/// Claude Code refused its relaunch line and exited at once; the record stood
-/// `relaunched` with nothing left to look at the tab, and read for half an
-/// hour as a start-up screen waiting on a person — "came back after the
-/// upgrade and has not reached a prompt" — never as `agent-down`). The
-/// harness's own restarts type their relaunch line once and never again, so
-/// the early read a restored tab's relaunch takes is theirs too: the quiet
-/// move's (no cause) and a fresh one's. The stopped record is the owner's one
-/// interrupt, `agent-down`, whose remedy is the conversation's resume — or,
-/// for a restart that started the agent afresh, a fresh `claude`: nothing of
-/// that conversation is there to resume. NEGATIVE CONTROL: the live relaunch
-/// on exit keeps its wait
-/// (`a_live_relaunch_on_exit_keeps_its_wait_when_its_shell_has_the_tab`).
+/// An upgrade's relaunch that ended as it started stops at once (`failed:no-resume`) and
+/// reads as `agent-down`, its remedy the conversation's resume (a fresh `claude` for a
+/// fresh restart): the harness's own restarts type their line once, so they take the early
+/// read a restored tab's relaunch takes. Negative control:
+/// [`a_live_relaunch_on_exit_keeps_its_wait_when_its_shell_has_the_tab`].
 #[cfg(unix)]
 #[test]
 fn an_upgrade_relaunch_that_ended_as_it_started_is_an_agent_down_at_once() {
@@ -14108,11 +13756,10 @@ fn an_upgrade_relaunch_that_ended_as_it_started_is_an_agent_down_at_once() {
     );
 }
 
-/// The kernel's own answer ([`Kernel::shell_holds_tab`]'s default, which
-/// [`Live`] uses) on real processes: a shell that leads its own session on a
-/// terminal and is its foreground holds the tab; a job in a group of its own
-/// that is not the terminal's foreground, or a process in another's group,
-/// does not; no shell recorded (pid 0) or a gone one cannot be read.
+/// The kernel's own answer ([`Kernel::shell_holds_tab`]'s default, [`Live`]'s) on real
+/// processes: a shell that leads its session on a terminal as its foreground holds the tab; a
+/// background job or a process in another's group does not; no shell recorded (pid 0) or a gone
+/// one cannot be read.
 #[cfg(unix)]
 #[test]
 fn the_kernel_reads_whether_a_shell_has_its_tab_back() {
@@ -14137,11 +13784,9 @@ fn the_kernel_reads_whether_a_shell_has_its_tab_back() {
     assert_eq!(Live.shell_holds_tab(dead_pid()), None);
 }
 
-/// Unconfirmed: a resumed session that has not answered by the first sweep
-/// past the bound is said to be, the one outcome whose step says so. The turns
-/// before the mark name a model: read from the start, they would have
-/// "confirmed" it; the mark keeps the old process's model from standing in for
-/// the new one's.
+/// A resumed session that has not answered by the first sweep past the bound is said
+/// `done:model-unconfirmed`, once; the mark keeps the old process's turns from confirming
+/// the new one's model.
 #[cfg(unix)]
 #[test]
 fn a_resumed_session_that_has_not_answered_is_unconfirmed() {
@@ -14216,11 +13861,9 @@ fn a_restart_without_a_mark_is_unconfirmed_at_once() {
     assert_eq!(rig.typed().len(), 1);
 }
 
-/// The model before is read from the tail that proved the READY answer, at the
-/// restart itself: a sweep that reaches the restart records the model the
-/// answer ran and where that read ended, even when its last look then waits
-/// (the next restart takes both again). The READY answer is not the last row
-/// here: Claude's own `<synthetic>` row follows it and names no model.
+/// A restart records the model its READY answer ran and where that read ended, from the
+/// tail that proved the answer, even when its last look then waits; Claude's own
+/// `<synthetic>` row after the READY names no model.
 #[cfg(unix)]
 #[test]
 fn a_restart_records_the_model_its_ready_answer_ran_and_where_that_read_ended() {
@@ -14304,13 +13947,9 @@ fn a_restart_records_the_model_its_ready_answer_ran_and_where_that_read_ended() 
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The visit does not wait out the answer: a sweep runs its visits one after
-/// another under one lock, and the orphan pass that relaunches a restart left
-/// exiting runs after all of them, so every second one visit blocks ages that
-/// restart toward [`STALE_S`], past which the agent is never relaunched. The
-/// resumed session's first answer can take the whole bound (a long first
-/// thought, retries, a usage limit that writes only `<synthetic>` rows), so
-/// the visit that types the continuation must not wait for it.
+/// The visit that types the continuation does not wait for the answer: a sweep's visits
+/// run one after another under one lock, the orphan pass last, so every second blocked
+/// ages a restart left exiting toward [`STALE_S`], past which it is never relaunched.
 #[cfg(unix)]
 #[test]
 fn the_sweep_that_types_the_continuation_does_not_wait_for_the_answer() {
@@ -14428,7 +14067,7 @@ fn a_new_upgrade_waits_for_the_last_restarts_model() {
         Some(pending),
         "the owed outcome is kept"
     );
-    // Once it is said, the next build is upgraded to as ever.
+    // Once it is said, the next build is upgraded to.
     let said = St {
         confirm_by: 0,
         ..load(&opts, SESSION).expect("state")
@@ -14441,17 +14080,9 @@ fn a_new_upgrade_waits_for_the_last_restarts_model() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// The same refusal with a model due, which the test above cannot see because
-/// it steps with [`ModelCtx::none`].
-///
-/// A warm conversation (answered moments ago) on `claude-opus-5`, a newer build
-/// installed, and `claude-opus-5-5` the newest Opus on offer: the model ladder
-/// sends the model along with the build restart (`build-restart`), so
-/// `model_to` is non-empty on every pass. The agent is a launcher script's
-/// child, which the upgrade must refuse once: the reuse guard must match the
-/// Failed state despite the non-empty `model_to`, so the refusal is said and
-/// ledgered only once. The negative control is the first pass: it must still
-/// refuse, so a pass is never one that simply stopped looking.
+/// A refusal with a model due (the ladder's `build-restart` keeps `model_to` set every
+/// pass) is still said and ledgered once: the reuse guard matches the Failed state. The
+/// first pass must still refuse.
 #[cfg(unix)]
 #[test]
 fn a_refusal_with_a_model_due_is_said_once_not_every_pass() {
@@ -14460,7 +14091,7 @@ fn a_refusal_with_a_model_due_is_said_once_not_every_pass() {
     let mut agent = parked().spawn().expect("spawn");
     wait_exec(agent.id());
     let sf = register(&opts.home, agent.id(), SESSION);
-    // A WARM transcript: the conversation answered on claude-opus-5 just now.
+    // A warm transcript: the conversation answered on claude-opus-5 just now.
     let now = i64::try_from(now_s()).expect("now");
     let proj = opts.home.join(".claude/projects/-work");
     std::fs::create_dir_all(&proj).expect("projects");
@@ -14480,8 +14111,8 @@ fn a_refusal_with_a_model_due_is_said_once_not_every_pass() {
         versions: Default::default(),
         native: None,
     };
-    // Precondition, so the pass below is about THIS path: the move is due,
-    // the cache is warm, and the ladder takes it because a build restarts.
+    // Precondition, so the pass below is about this path: the move is due, the cache is
+    // warm, and the ladder takes it because a build restarts.
     let mread = model_read(&opts, &sf, None, &mctx);
     assert!(
         matches!(&mread.verdict, ModelVerdict::Due { to, .. } if to == "claude-opus-5-5"),
@@ -14526,18 +14157,10 @@ fn a_refusal_with_a_model_due_is_said_once_not_every_pass() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// THE RIDE RE-JUDGED AT EVERY VISIT: an announced round carries
-/// `claude-opus-5-5`, and the conversation's model record says it was asked
-/// for once and did not take, so the ride must not ask for it again. With a newer build
-/// to move to, the visit drops the model from the round, said once
-/// (`model-ride-dropped`), the round itself KEPT (its salt, its phase, its
-/// notice); a later visit says nothing more. With the build current, the round
-/// had only the model to move: the agent is released and the round is pending
-/// again. And where the same visit's rule moves the conversation to ANOTHER
-/// model (a Fable its family's step offers, the carried Opus off the list from
-/// it), the retarget abandons the round — a new consent — and the row
-/// says so, never "kept". NEGATIVE CONTROL: the same round
-/// over a record that never failed keeps its model, and nothing is said.
+/// The ride is re-judged at every visit: a model the record says failed is dropped from an
+/// announced round once (`model-ride-dropped`), the round kept; with the build current the
+/// agent is released; where the rule now moves to another model the round starts over.
+/// Negative control: a record that never failed keeps its model, nothing said.
 #[cfg(unix)]
 #[test]
 fn a_barred_ride_is_dropped_once_and_the_round_goes_on_without_it() {
@@ -14614,7 +14237,7 @@ fn a_barred_ride_is_dropped_once_and_the_round_goes_on_without_it() {
             .collect()
     };
 
-    // NEGATIVE CONTROL: nothing recorded against the model — it rides.
+    // Negative control: nothing recorded against the model — it rides.
     save(&opts, SESSION, &announced("9.9.9"));
     let _ = pass(&newer());
     assert!(dropped().is_empty(), "{:?}", dropped());
@@ -14716,15 +14339,10 @@ fn a_barred_ride_is_dropped_once_and_the_round_goes_on_without_it() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// THE PLAN CARRIES THE CLAUDE HOME ITS AGENT RAN UNDER: `relaunch::plan`,
-/// the one place every relaunch line is made (the explicit restart's, the
-/// relaunch on exit, the restart in place, the upgrade's), types the
-/// `CLAUDE_CONFIG_DIR` its process had in front of the program, and with a
-/// login beside it both. Before 2026-10-09 the plan typed no home: the
-/// real-claude lab's Claude Code, started as `CLAUDE_CONFIG_DIR=<home>/.claude
-/// claude`, came back from `aterm ctl restart` in the first-run theme picker
-/// (it read `<home>/.claude.json`), its conversation never held. NEGATIVE
-/// CONTROL: no home, the planned line is byte for byte the plain one.
+/// `relaunch::plan`, the one place every relaunch line is made, types the
+/// `CLAUDE_CONFIG_DIR` its process had in front of the program (the login after it);
+/// without it, a Claude Code under another home comes back in the first-run theme picker.
+/// Negative control: no home, the plain line byte for byte.
 #[test]
 fn the_planned_relaunch_line_carries_the_claude_home() {
     let dir = scratch("line-home");
@@ -14732,6 +14350,7 @@ fn the_planned_relaunch_line_carries_the_claude_home() {
     let argv = vec!["claude".to_string(), "--verbose".to_string()];
     let planned = |home: Option<&str>, login: Option<&str>| {
         let launch = crate::harness::relaunch::Launch {
+            stored_login: false,
             session: SESSION,
             resume: true,
             cwd: "/tmp",
@@ -14764,7 +14383,7 @@ fn the_planned_relaunch_line_carries_the_claude_home() {
     let both = planned(Some("/lab/home/.claude"), Some("/logins/w"));
     assert!(both.contains(&format!("{home}{login}")), "{both}");
     assert_eq!(both.replacen(home, "", 1).replacen(login, "", 1), plain);
-    // NEGATIVE CONTROL: the process had no home of its own.
+    // Negative control: the process had no home of its own.
     assert!(!plain.contains("CLAUDE_CONFIG_DIR"), "{plain}");
     assert!(
         plain.contains(&format!("'/opt/claude' '--verbose' '--resume' '{SESSION}'")),
@@ -14773,13 +14392,189 @@ fn the_planned_relaunch_line_carries_the_claude_home() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A FAILED `--model` NEVER RIDES THE LINE: a process this
-/// harness relaunched with `--model claude-opus-5-5`, an ask the record has
-/// since marked FAILED, is relaunched by a site asking no model of its own
-/// without any `--model` (the saved default), and records none as kept. A
-/// person's own flag — an id no ask of the record names, or an alias — and a
-/// site's own model stand. NEGATIVE CONTROL: the same launch over a record
-/// with no failure keeps its `--model` verbatim.
+/// The planned line carries the usage tap where its gate holds (`relaunch::plan`, `tap::gate`;
+/// `docs/DESIGN-claude-accounts-v2-2026-10-15.md` §3.1): with `[harness] usage_tap` naming this
+/// aterm ([`Opts::usage_tap`]), a process on its stored login in the default home is relaunched
+/// with `--settings <the tap>` before `--resume`, judged against the settings chain Claude Code
+/// reads in the directory it starts in. Each guard alone takes the tap off: a statusLine in the
+/// user's, cowork, project shared or local, or managed settings; `disableAllHooks`; an
+/// `apiKeyHelper`; an `ANTHROPIC_BASE_URL` in `env`; a file that does not parse; a managed
+/// preference domain; a profile store config; a person's own `--settings`, carried verbatim.
+/// aterm's own tap at a stale path is replaced by the current one. A line on the login of the
+/// machine's one account (`tap::Armed::lone_login`, the login a renewal bound its row to)
+/// carries it too. Negative controls: with the switch off, off its stored login, or on a named
+/// login that is not the one account's, the line is byte for byte the untapped one.
+#[test]
+fn the_planned_relaunch_line_carries_the_usage_tap_only_where_its_gate_holds() {
+    use super::super::tap;
+    let dir = scratch("line-tap");
+    let mut opts = drive(&dir);
+    let project = dir.join("proj");
+    std::fs::create_dir_all(project.join(".claude")).expect("project");
+    std::fs::create_dir_all(opts.home.join(".claude")).expect("user dir");
+    let cwd = project.to_str().expect("utf-8").to_owned();
+    let exe = Path::new("/Applications/aterm.app/Contents/MacOS/aterm");
+    let value = tap::settings_value(exe).expect("an admissible path");
+    let planned = |opts: &Opts, argv: &[String], stored_login: bool| {
+        let launch = crate::harness::relaunch::Launch {
+            stored_login,
+            session: SESSION,
+            resume: true,
+            cwd: &cwd,
+            agent: 0,
+            argv,
+            exe: Path::new("/opt/claude"),
+            model: None,
+            mode: None,
+            login: None,
+            home: None,
+        };
+        crate::harness::relaunch::plan(opts, &launch, 999_999, &[(999_999, 1, "zsh".to_string())])
+            .unwrap_or_else(|_| panic!("a plan"))
+            .line
+    };
+    let argv = vec!["claude".to_string(), "--verbose".to_string()];
+    let plain = planned(&opts, &argv, true);
+    assert!(
+        plain.contains(&format!(
+            "'/opt/claude' '--verbose' '--resume' '{SESSION}' )"
+        )),
+        "{plain}"
+    );
+    // Negative control: with the switch off, no `--settings`.
+    assert!(!plain.contains("--settings"), "{plain}");
+    opts.usage_tap = Some(tap::Armed {
+        exe: exe.to_path_buf(),
+        lone_login: None,
+    });
+    let pair = format!("'--settings' '{value}'");
+    let tapped = planned(&opts, &argv, true);
+    assert!(
+        tapped.contains(&format!(
+            "'/opt/claude' '--verbose' {pair} '--resume' '{SESSION}' )"
+        )),
+        "{tapped}"
+    );
+    assert_eq!(tapped.replacen(&format!(" {pair}"), "", 1), plain);
+    // Negative control: not on its stored login, no tap.
+    assert_eq!(planned(&opts, &argv, false), plain);
+    // The one account's own login: tapped as the default login is.
+    let renewed = "/tmp/aterm-state/logins/home-a.1";
+    let on_login = |lone: Option<&str>| {
+        let opts = Opts {
+            usage_tap: Some(tap::Armed {
+                exe: exe.to_path_buf(),
+                lone_login: lone.map(str::to_owned),
+            }),
+            ..opts.clone()
+        };
+        let launch = crate::harness::relaunch::Launch {
+            login: Some(renewed),
+            stored_login: true,
+            session: SESSION,
+            resume: true,
+            cwd: &cwd,
+            agent: 0,
+            argv: &argv,
+            exe: Path::new("/opt/claude"),
+            model: None,
+            mode: None,
+            home: None,
+        };
+        crate::harness::relaunch::plan(&opts, &launch, 999_999, &[(999_999, 1, "zsh".to_string())])
+            .unwrap_or_else(|_| panic!("a plan"))
+            .line
+    };
+    let renewed_line = on_login(Some(renewed));
+    assert!(renewed_line.contains(renewed), "{renewed_line}");
+    assert!(renewed_line.contains(&pair), "{renewed_line}");
+    for lone in [None, Some("/tmp/aterm-state/logins/home-a.2")] {
+        let line = on_login(lone);
+        assert!(line.contains(renewed), "{line}");
+        assert!(!line.contains("--settings"), "{lone:?}: {line}");
+    }
+    // aterm's own tap at a stale path is shed and the current one carried.
+    let stale = tap::settings_value(Path::new("/Users//example/old/aterm")).expect("a path");
+    let rerun: Vec<String> = argv
+        .iter()
+        .cloned()
+        .chain(["--settings".to_string(), stale.clone()])
+        .collect();
+    let line = planned(&opts, &rerun, true);
+    assert_eq!(line, tapped, "the stale tap is replaced");
+    assert!(!line.contains("/Users//example/old"), "{line}");
+    // A person's own `--settings` is carried verbatim and blocks the tap.
+    let theirs: Vec<String> = argv
+        .iter()
+        .cloned()
+        .chain(["--settings".to_string(), r#"{"model":"x"}"#.to_string()])
+        .collect();
+    let line = planned(&opts, &theirs, true);
+    assert!(line.contains(r#"'--settings' '{"model":"x"}'"#), "{line}");
+    assert!(!line.contains("harness tap"), "{line}");
+    // Each document of the chain, alone, takes the tap off.
+    let user = opts.home.join(".claude/settings.json");
+    let cowork = opts.home.join(".claude/cowork_settings.json");
+    let shared = project.join(".claude/settings.json");
+    let local = project.join(".claude/settings.local.json");
+    let status = r#"{"statusLine":{"type":"command","command":"echo mine"}}"#;
+    for (file, text) in [
+        (&user, status),
+        (&cowork, status),
+        (&shared, status),
+        (&local, status),
+        (&local, r#"{"disableAllHooks":true}"#),
+        (&user, r#"{"apiKeyHelper":"/usr/local/bin/key"}"#),
+        (
+            &user,
+            r#"{"env":{"ANTHROPIC_BASE_URL":"https://gw.example"}}"#,
+        ),
+        (&shared, "{not json"),
+    ] {
+        std::fs::write(file, text).expect("write");
+        assert_eq!(
+            planned(&opts, &argv, true),
+            plain,
+            "{} {text}",
+            file.display()
+        );
+        std::fs::remove_file(file).expect("remove");
+    }
+    assert_eq!(
+        planned(&opts, &argv, true),
+        tapped,
+        "every document quiet again"
+    );
+    // The managed file and a managed preference domain.
+    let managed = dir.join("managed");
+    std::fs::create_dir_all(&managed).expect("managed");
+    std::fs::write(managed.join("managed-settings.json"), status).expect("write");
+    MANAGED_SETTINGS.with(|m| *m.borrow_mut() = Some(managed.clone()));
+    assert_eq!(planned(&opts, &argv, true), plain, "a managed statusLine");
+    MANAGED_SETTINGS.with(|m| *m.borrow_mut() = None);
+    let prefs = dir.join("prefs");
+    std::fs::create_dir_all(&prefs).expect("prefs");
+    std::fs::write(prefs.join("com.anthropic.claudecode.plist"), "<plist/>").expect("write");
+    MANAGED_PREFERENCES.with(|m| *m.borrow_mut() = Some(prefs.clone()));
+    assert_eq!(
+        planned(&opts, &argv, true),
+        plain,
+        "a managed preference domain"
+    );
+    MANAGED_PREFERENCES.with(|m| *m.borrow_mut() = None);
+    // A profile store config.
+    let configs = opts.home.join(".config/anthropic/configs");
+    std::fs::create_dir_all(&configs).expect("configs");
+    std::fs::write(configs.join("default.json"), "{}").expect("write");
+    assert_eq!(planned(&opts, &argv, true), plain, "a profile store config");
+    std::fs::remove_file(configs.join("default.json")).expect("remove");
+    assert_eq!(planned(&opts, &argv, true), tapped, "and back");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A `--model` this harness asked and the record marks failed never rides the line: a
+/// relaunch asking no model drops it and keeps none. A person's own id or alias, and a
+/// site's own model, stand. Negative control: with no failure the `--model` is kept.
 #[test]
 fn a_failed_model_on_the_launch_line_is_dropped_by_a_relaunch_asking_none() {
     let dir = scratch("line-failed");
@@ -14809,10 +14604,10 @@ fn a_failed_model_on_the_launch_line_is_dropped_by_a_relaunch_asking_none() {
         " CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1 '/opt/claude' '--model' 'claude-opus-5-5[1m]' \
          '--verbose' '--resume' '{SESSION}'"
     );
-    // The relaunch as planned — `relaunch::plan`, the one place every
-    // relaunch line is made, which asks the rule — on a zsh the table names.
+    // The relaunch as `relaunch::plan` makes it (asking the rule), on a zsh the table names.
     let planned = || {
         let launch = crate::harness::relaunch::Launch {
+            stored_login: false,
             session: SESSION,
             resume: true,
             cwd: "/tmp",
@@ -14853,7 +14648,7 @@ fn a_failed_model_on_the_launch_line_is_dropped_by_a_relaunch_asking_none() {
         .and_then(|facts| facts.resume)
         .expect("the footer's line")
     };
-    // NEGATIVE CONTROL: nothing failed — the flag is kept.
+    // Negative control: nothing failed — the flag is kept.
     assert_eq!(line(&ours, None), kept);
     assert!(planned().contains("'--model'"), "{}", planned());
     assert!(told().contains("--model"), "{}", told());
@@ -14885,7 +14680,7 @@ fn a_failed_model_on_the_launch_line_is_dropped_by_a_relaunch_asking_none() {
         told()
     );
     assert_eq!(footer(), told());
-    // A site's own model replaces it as ever.
+    // A site's own model replaces it.
     assert!(line(&ours, Some("claude-fable-5-1")).contains("'--model' 'claude-fable-5-1'"));
     // A person's own id or alias, which no ask on the record names, stands.
     for theirs in ["claude-fable-5-1", "opus"] {
@@ -14896,11 +14691,9 @@ fn a_failed_model_on_the_launch_line_is_dropped_by_a_relaunch_asking_none() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A DUE MODEL RIDES EVERY RESTART (the model ladder wired into ours): a
-/// relaunch on exit and the restart in place happen regardless, so a move
-/// that is due goes with them even on a WARM conversation (`build-restart`),
-/// and is recorded as asked for. NEGATIVE CONTROL: with nothing due — no
-/// model half — no model rides, and nothing is recorded.
+/// A due model rides every restart (a relaunch on exit, the restart in place), even on a
+/// warm conversation, and is recorded as asked for. Negative control: nothing due, nothing
+/// rides.
 #[test]
 fn a_due_model_rides_a_restart_made_for_another_reason() {
     let dir = scratch("riding-model");
@@ -14937,14 +14730,10 @@ fn a_due_model_rides_a_restart_made_for_another_reason() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The due clock survives a flicker, and only a definite "nothing due" clears
-/// it. A visit that cannot read the live model (a transcript tail with no
-/// answer in it, as a long tool result can leave for many visits) answers
-/// `model-unknown`; clearing the clock there would restart the one-hour bound
-/// every such visit, and an active session's move might never land.
-/// Conversely the early return (no model can run, none pending) is "nothing
-/// due" and must clear it, or a move that returns later inherits a stale start
-/// and skips its warm-cache grace.
+/// The due clock survives an unknown read (`model-unknown`, e.g. a tail holding no
+/// answer), or an active session's one-hour bound would restart every visit; a definite
+/// "nothing due" (no model can run, none pending) clears it, so a later move does not
+/// inherit a stale start.
 #[test]
 fn the_due_clock_survives_an_unknown_read_and_clears_when_nothing_is_due() {
     let dir = scratch("due-clock");
@@ -14980,7 +14769,7 @@ fn the_due_clock_survives_an_unknown_read_and_clears_when_nothing_is_due() {
     rec.due_since = now_s() - 3000;
     save_model_record(&opts, SESSION, &rec);
 
-    // A visit that cannot read the live model: the clock must STAND.
+    // A visit that cannot read the live model: the clock stands.
     std::fs::write(&path, "{\"type\":\"user\"}\n").expect("tail with no answer");
     let unknown = model_read(&opts, &sf, None, &mctx);
     assert_eq!(unknown.verdict, ModelVerdict::Keep("model-unknown"));
@@ -14991,7 +14780,7 @@ fn the_due_clock_survives_an_unknown_read_and_clears_when_nothing_is_due() {
         "an unknown read reset the due clock"
     );
 
-    // Readable again: the wait RESUMES where it was, not from zero.
+    // Readable again: the wait resumes where it was, not from zero.
     std::fs::write(&path, &answered).expect("transcript");
     let back = model_read(&opts, &sf, None, &mctx);
     assert!(
@@ -15000,7 +14789,7 @@ fn the_due_clock_survives_an_unknown_read_and_clears_when_nothing_is_due() {
         back.due_for_s
     );
 
-    // A start AHEAD of now (the wall clock stepped back): restarted at now,
+    // A start ahead of now (the wall clock stepped back): restarted at now,
     // never left to read as 0 s due for the whole skew.
     let mut ahead = load_model_record(&opts, SESSION);
     ahead.due_since = now_s() + 10_000;
@@ -15011,7 +14800,7 @@ fn the_due_clock_survives_an_unknown_read_and_clears_when_nothing_is_due() {
         "a future-dated start survived and would postpone the bound"
     );
 
-    // Nothing can run and nothing is pending: THAT clears it.
+    // Nothing can run and nothing is pending: that clears it.
     let none = ModelCtx {
         offered: Vec::new(),
         ..mctx
@@ -15025,13 +14814,9 @@ fn the_due_clock_survives_an_unknown_read_and_clears_when_nothing_is_due() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// An ask that ran stands. The harness asked for `claude-opus-5-5`, the
-/// relaunch ran it, and a visit recorded it applied. The conversation now runs
-/// another model (a person moved off it), and a visit comes after
-/// `MODEL_SETTLE_S`: the ask that ran is not recorded failed, which would be a
-/// false `model-failed` after its own `model-verified` and bar the model from
-/// this conversation for good. Negative control: an ask that never ran is
-/// still recorded failed.
+/// An ask that ran stands: once applied, a person moving the conversation off it is no
+/// failure (a false `model-failed` would bar the model for good). Negative control: an ask
+/// that never ran settles failed after `MODEL_SETTLE_S`.
 #[test]
 fn an_ask_that_ran_is_never_recorded_failed_when_a_person_moves_off_it() {
     let dir = scratch("ask-ran-stands");
@@ -15102,12 +14887,9 @@ fn answered_on(opts: &Opts, model: &str, ago_s: i64) {
     .expect("transcript");
 }
 
-/// A session that runs the native build is judged by the native build's own
-/// catalog and offer, not the managed one's: the same conversation on
-/// `claude-opus-5` is due for Opus 5.5 (its family's newest) under the managed
-/// view, and, the native build not offering Opus 5.5 yet, for the list's Fable
-/// 5.1 under the native one. With no native build installed, a native session
-/// falls back to the managed view rather than to nothing.
+/// A session on the native build is judged by the native build's own catalog and offer
+/// (here Fable 5.1, where the managed view offers Opus 5.5); with no native build
+/// installed it falls back to the managed view.
 #[test]
 fn a_native_session_is_judged_by_the_native_builds_own_offer() {
     let dir = scratch("native-view");
@@ -15139,15 +14921,10 @@ fn a_native_session_is_judged_by_the_native_builds_own_offer() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The pre-filter never restarts a native session's warm wait. A native
-/// session on `claude-opus-5`, warm: the managed build offers only
-/// `claude-opus-5` (the session runs it), the native build offers
-/// `claude-opus-5-5` (due), and the move has been due for 50 minutes. Every
-/// sweep runs the host's pre-filter before the visit; were it to write what it
-/// read under both views, the managed `model-current` would clear the due
-/// clock and the native `Due` restart it, so `warm-wait-over` would never
-/// fire. Negative control: where the views agree the pre-filter's settle step
-/// is still kept: the ask that runs is recorded applied.
+/// The host's pre-filter never restarts a native session's warm wait: writing what it read
+/// under both views would clear the due clock (managed `model-current`) and restart it
+/// (native `Due`), so `warm-wait-over` would never fire. Negative control: where the views
+/// agree, the pre-filter's settle step is kept.
 #[test]
 fn the_pre_filter_never_restarts_a_native_sessions_warm_wait() {
     let dir = scratch("prefilter-views");
@@ -15207,13 +14984,9 @@ fn the_pre_filter_never_restarts_a_native_sessions_warm_wait() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A crashed native session's riding model is the native build's. On the
-/// relaunch-on-exit path the session file's pid has exited, so `exe_of` reads
-/// nothing; the view is then the program the crash ran (`argv[0]`), which the
-/// relaunch runs again. Read off the dead pid alone it would be the managed
-/// view, which here offers only the model the session already runs, while the
-/// native build offers `claude-opus-5-5`. Negative control: a managed program
-/// on the same dead pid is judged by the managed view.
+/// A crashed native session's riding model is the native build's: its pid has exited, so
+/// the view is the program the crash ran (`argv[0]`), which the relaunch runs again.
+/// Negative control: a managed program on the same dead pid gets the managed view.
 #[test]
 fn a_crashed_native_sessions_riding_model_is_the_native_builds() {
     let dir = scratch("riding-native");
@@ -15243,21 +15016,10 @@ fn a_crashed_native_sessions_riding_model_is_the_native_builds() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// AN AGENT UNDER ANOTHER CLAUDE HOME IS JUDGED BY THAT HOME'S MODEL FILES
-/// (the review of `fix/upgrade-homes`, 2026-10-14): the sweep now finds an
-/// agent started with `CLAUDE_CONFIG_DIR=<dir>` and the model rule reads its
-/// transcript there, but judged it by the pass's one model half, read from
-/// the user's `~/.claude/settings.json`, `~/.claude/cache/model-catalog` and
-/// `~/.claude.json` — so a person's saved default and allowlist in `<dir>`,
-/// and a model `<dir>`'s login is denied, were never seen, the move was due
-/// across families, and the agent was restarted with a `--model` its own
-/// home chose against. Now each is read where the agent runs
-/// ([`ModelCtx::at`]): `<dir>/settings.json`, `<dir>/cache/model-catalog`
-/// and `<dir>/.claude.json`, where Claude Code under that home keeps them.
-/// CONTROLS: the same home with nothing chosen and nothing denied is due as
-/// before (the judge is not switched off), and an agent in the user's own
-/// home is judged by the user's files whatever the other home says; under
-/// several logins the other home's caches are not read either.
+/// An agent under another Claude home is judged by that home's model files
+/// ([`ModelCtx::at`]): its `settings.json`, `cache/model-catalog` and `.claude.json`.
+/// Controls: nothing chosen or denied there is still due; an agent in the user's own home
+/// is judged by the user's files; under several logins the other home's caches are unread.
 #[test]
 fn an_agent_under_another_claude_home_is_judged_by_its_homes_model_files() {
     let dir = scratch("model-home");
@@ -15309,7 +15071,7 @@ fn an_agent_under_another_claude_home_is_judged_by_its_homes_model_files() {
         from: "claude-fable-5-1".to_string(),
         to: "claude-opus-5-5".to_string(),
     };
-    // CONTROL: nothing chosen or denied in its home either: due, as before.
+    // Control: nothing chosen or denied in its home either: due.
     assert_eq!(verdict(&opts, &sf), due, "the judge is not switched off");
     assert!(model_wants_a_look(&opts, &sf, &mctx));
     // Each of its home's files, alone, keeps it.
@@ -15344,7 +15106,7 @@ fn an_agent_under_another_claude_home_is_judged_by_its_homes_model_files() {
         assert!(!model_wants_a_look(&opts, &sf, &mctx), "{name}");
         let argv = vec!["claude".to_string()];
         assert_eq!(riding_model_in(&opts, &sf, &argv, &mctx), None, "{name}");
-        // CONTROL: the same conversation in the user's own home is judged by
+        // Control: the same conversation in the user's own home is judged by
         // the user's files, which choose and deny nothing.
         answered(&opts.home.join(".claude"));
         let own = SessionFile {
@@ -15369,17 +15131,9 @@ fn an_agent_under_another_claude_home_is_judged_by_its_homes_model_files() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// THE MODEL RULE READS AN AGENT'S SETTINGS THROUGH THE ONE CHAIN
-/// (`claude_settings::sources_under`, handoff §4: "The upgrade's model half
-/// reads a Claude home's `settings.json` ALONE, not the chain"): Claude Code
-/// takes `model` and `availableModels` from the highest source that sets
-/// each — managed, `--settings`, the project's local and shared files, then
-/// the user's (READ in the 2.1.300 bundle: the restriction allowlists, among
-/// them `availableModels`, are owned whole by the highest source that sets
-/// one). A project's `.claude/settings.json` that allows only Fable 5.1 was
-/// never read: the agent standing in it was judged due onto Opus 5.5 and
-/// restarted with a `--model` its own settings disallow; a project's saved
-/// `model` the same.
+/// The model rule reads an agent's settings through the one chain
+/// (`claude_settings::sources_under`), not its home's `settings.json` alone: a project's
+/// `availableModels` or saved `model` keeps the agent where it is.
 #[test]
 fn the_model_rule_reads_the_agents_settings_chain_not_its_homes_file_alone() {
     let dir = scratch("model-settings-chain");
@@ -15421,7 +15175,7 @@ fn the_model_rule_reads_the_agents_settings_chain_not_its_homes_file_alone() {
         let _ = std::fs::remove_dir_all(opts.state.join("upgrade/models"));
         model_read_for(&opts, &sf, None, &mctx, false, None).verdict
     };
-    // CONTROL: nothing chosen or allowed anywhere: due.
+    // Control: nothing chosen or allowed anywhere: due.
     let due = ModelVerdict::Due {
         from: "claude-fable-5-1".to_string(),
         to: "claude-opus-5-5".to_string(),
@@ -15449,14 +15203,11 @@ fn the_model_rule_reads_the_agents_settings_chain_not_its_homes_file_alone() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// THE CHAIN'S ORDER ([`agent_settings`]): each of `model` and
-/// `availableModels` is the HIGHEST document's that sets it — the managed
-/// tier over the project's over the user's, a higher list replacing a lower
-/// one whole, the managed drop-ins over the managed file — as Claude Code
-/// merges them (READ in the 2.1.300 bundle). FAIL-CLOSED: a document there
-/// that does not parse makes the chain unknown and nothing is moved; an
-/// `availableModels` that is no list is an empty allowlist, as Claude Code
-/// enforces one.
+/// [`agent_settings`]: each of `model` and `availableModels` comes from the highest
+/// document that sets it (managed drop-ins over the managed file over the project's local
+/// and shared files over the user's), a higher list replacing a lower one whole.
+/// Fail-closed: an unparsable document leaves the chain unknown; a non-list
+/// `availableModels` allows nothing.
 #[test]
 fn the_model_rule_takes_each_key_from_the_highest_document_that_sets_it() {
     let dir = scratch("model-settings-order");
@@ -15583,21 +15334,11 @@ fn the_model_rule_takes_each_key_from_the_highest_document_that_sets_it() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// AN AGENT UNDER AN EMPTY CLAUDE HOME IS JUDGED BY THE PROFILE CLAUDE CODE
-/// KEEPS FOR IT (the homes lane's stated limit, handoff §4): Claude Code
-/// keeps its records and its `settings.json` under `CLAUDE_CONFIG_DIR ??
-/// join(homedir(), ".claude")` — for one set and EMPTY, the directory it
-/// runs in — but its global config, the profile holding the login's model
-/// caches, at `join(CLAUDE_CONFIG_DIR || homedir(), ".claude.json")`, whose
-/// `||` reads the empty value as unset: `$HOME/.claude.json` (READ in the
-/// 2.1.300 bundle; MEASURED in the real-Claude lab). The model rule read
-/// `<cwd>/.claude.json` for it (`claude_profile` had the directory alone,
-/// which an empty home shares with a relative `.`), so its login's denials
-/// were the unknown: a model its login is denied was offered, the agent
-/// judged due onto it and restarted with that `--model`. Driven through the
-/// sweep's own reader of the tab's leader ([`Homes::read`], [`Homes::roster`]).
-/// CONTROL: a relative `.` names the same directory and keeps its profile
-/// inside it, as Claude Code does.
+/// An agent under an empty `CLAUDE_CONFIG_DIR` keeps its records and settings in the
+/// directory it runs in, but its profile (the login's model caches) in `$HOME/.claude.json`
+/// (Claude Code reads the empty value as unset there): the model rule reads its login's
+/// denials there, through the sweep's own reader ([`Homes::read`]). Control: a relative
+/// `.` keeps its profile inside the directory.
 #[test]
 fn an_agent_under_an_empty_claude_home_is_judged_by_the_profile_claude_code_keeps_for_it() {
     let dir = scratch("model-empty-home-profile");
@@ -15670,7 +15411,7 @@ fn an_agent_under_an_empty_claude_home_is_judged_by_the_profile_claude_code_keep
         to: "claude-opus-5-5".to_string(),
     };
     let empty = read("");
-    // CONTROL: nothing denied anywhere: due.
+    // Control: nothing denied anywhere: due.
     assert_eq!(verdict(&empty), due, "the judge is not switched off");
     // Its login's denial, in `$HOME/.claude.json`: kept.
     let home_profile = opts.home.join(".claude.json");
@@ -15689,7 +15430,7 @@ fn an_agent_under_an_empty_claude_home_is_judged_by_the_profile_claude_code_keep
         due,
         "an empty home's working directory holds no profile of its"
     );
-    // CONTROL: `CLAUDE_CONFIG_DIR=.` names the same directory, and keeps its
+    // Control: `CLAUDE_CONFIG_DIR=.` names the same directory, and keeps its
     // profile inside it (`"." || homedir()` is `.`).
     let dot = read(".");
     assert_eq!(dot.claude_dir.as_deref(), Some(work.as_path()));
@@ -15701,18 +15442,10 @@ fn an_agent_under_an_empty_claude_home_is_judged_by_the_profile_claude_code_keep
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// THE PRIORITY LIST GROWS FROM THE RECOMMENDATIONS OF THE HOME AN AGENT
-/// RUNS UNDER (the homes lane's stated limit, handoff §4: "the priority list
-/// is still grown from the user's home's recommendations alone"). Claude Code
-/// announces a launched model to a login (`tengu_startup_announcements`'
-/// `requiresModel`, in the home's profile), and the list admits it — a model
-/// the installed build knows, of a family on the list, newer than its best —
-/// even where the build does not yet name it its family's latest
-/// ([`models::recommendations`], [`models::ingest`]). Read only in the user's
-/// home, the announcement made to an agent under ANOTHER home grew nothing:
-/// the model was never on offer to it ([`models::offered`]) and the agent
-/// was never moved to it, while the same agent under the user's home was.
-/// CONTROL: the same announcement in the user's home moves the user's agent.
+/// An agent under another Claude home is moved to a model announced to that home's login
+/// (`tengu_startup_announcements`' `requiresModel`, admitted by [`models::recommendations`]
+/// before the build names it its family's latest). Control: the same announcement in the
+/// user's home moves the user's agent.
 #[test]
 fn an_agent_under_another_claude_home_moves_to_the_model_its_home_announces() {
     let dir = scratch("model-home-announces");
@@ -15791,7 +15524,7 @@ fn an_agent_under_another_claude_home_moves_to_the_model_its_home_announces() {
         due,
         "moved to the model its own home's login was announced"
     );
-    // CONTROL: the user's agent, the same announcement in the user's home.
+    // Control: the user's agent, the same announcement in the user's home.
     std::fs::write(opts.home.join(".claude.json"), announced).expect("the user's profile");
     answered(&users);
     let own = SessionFile {
@@ -15802,16 +15535,9 @@ fn an_agent_under_another_claude_home_moves_to_the_model_its_home_announces() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// THE CLI'S SWEEP FINDS AN AGENT UNDER ANOTHER CLAUDE HOME NO VISIT HAS
-/// RECORDED (the homes lane's stated limit, handoff §4): `aterm harness
-/// upgrade` (no roster: [`sweep`]) read the user's `~/.claude` and the homes
-/// the upgrade records name ([`St::home`], written by a window's visit) —
-/// so an agent under another home that no window visit had recorded yet (a
-/// build that just landed, a window whose host is off) was never listed,
-/// never moved, by a hand-run sweep, though its record stood in its own home
-/// and its tab was live. The window's pass finds its home from the tab's
-/// foreground leader's exec environment ([`Homes::read`]); a pass with no
-/// roster of its own reads the instances' tabs the same way.
+/// The CLI's sweep (no roster, [`sweep`]) finds an agent under another Claude home that no
+/// visit has recorded, reading the instances' tabs' leaders as the window's pass does
+/// ([`Homes::read`]).
 #[cfg(unix)]
 #[test]
 fn the_clis_sweep_finds_an_agent_under_another_claude_home_no_visit_recorded() {
@@ -15883,7 +15609,7 @@ struct Parked {
     /// ([`Parked::reaped`]).
     agent: Option<aterm_uds::spawnfd::Child>,
     sf: SessionFile,
-    asked: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    asked: crate::harness::FakeInstanceLog,
 }
 
 #[cfg(unix)]
@@ -16042,13 +15768,11 @@ fn tty_zsh() -> std::process::Child {
     panic!("zsh never held its terminal");
 }
 
-/// A STAND-IN AGENT ([`parked`]) THAT LEADS A TERMINAL OF ITS OWN, as a
-/// Claude Code leads its aterm tab: a new session on a pty, that pty its
-/// controlling terminal, so its group is the terminal's foreground (`ids`:
-/// `pgid == tpgid == pid`) and a roster naming that group (`who …
-/// fgpgid=<pid>`) claims it ([`host_candidates`]). It names [`TAB`] and no
-/// login or Claude home of the test's; `env` adds to that. It runs in `cwd`
-/// (`None`: the test's own). Killed and reaped by the caller.
+/// A stand-in agent ([`parked`]) that leads a terminal of its own, as Claude Code leads its
+/// tab: a new session on a pty, its group the terminal's foreground (`pgid == tpgid ==
+/// pid`), so a roster naming that group (`who … fgpgid=<pid>`) claims it
+/// ([`host_candidates`]). It names [`TAB`] and no login or Claude home but `env`'s, and
+/// runs in `cwd` (`None`: the test's own). Killed and reaped by the caller.
 #[cfg(unix)]
 fn tty_agent(env: &[(&str, &Path)], cwd: Option<&Path>) -> std::process::Child {
     use aterm_uds::spawnfd::InheritNothing as _;
@@ -16152,17 +15876,10 @@ fn stamped_screen(human: Option<&str>) -> String {
     )
 }
 
-/// The presence guard, one presence fact: a tab is attended when a person gave
-/// this session input within ten minutes, by the server's per-session stamp on
-/// the very read the sweep judges (`"human_ms"`, `status human_ms=`), the one
-/// the supervisor's question policy reads; not the tab's placement or the
-/// machine's HID clock. The wait is said once (`held-back:attended`, a ledger
-/// row the host logs), then `wait:attended`. A host that sends no stamp proves
-/// no absence: it fails closed. `--now` types into it all the same. This rig
-/// is a hand-run sweep (no window, no clock injected) and reads the same fact
-/// the window does. Negative controls: the person gone eleven minutes, and
-/// nobody ever (`null`), each announce once settled, the tab's placement (in
-/// front of the focused window) notwithstanding.
+/// The presence guard: a tab is attended when the server's per-session stamp (`human_ms`)
+/// on the read the sweep judges shows input within `human_grace_s`, whatever the tab's
+/// placement. Said once (`held-back:attended`), then `wait:attended`; no stamp fails
+/// closed; `--now` types all the same. Negative controls: a person long gone, or `null`.
 #[cfg(unix)]
 #[test]
 fn an_attended_tab_has_a_person_at_it_and_is_said_once() {
@@ -16203,13 +15920,10 @@ fn an_attended_tab_has_a_person_at_it_and_is_said_once() {
     }
 }
 
-/// The notice is pressed, not pasted: Claude Code wraps a long paste in
-/// `<pasted_content>` and tells the model it may hold instructions its person
-/// did not write, so the model may decline to act on it. Where the host's
-/// `turn` takes `cap=` (its help names `cap=<n>`), the notice is typed
-/// `typed=1 cadence=2 cap=4096`, key by key, whole. Negative control: a host
-/// whose help does not name it gets the plain paste, never a `cap=` it would
-/// type as text. Either way the fence and the yield stay.
+/// The notice is pressed key by key (`typed=1 cadence=2 cap=4096`) where the host's `turn`
+/// takes `cap=`: Claude Code wraps a long paste in `<pasted_content>`, which the model may
+/// decline to act on. Negative control: a host without `cap=` gets the plain paste; either
+/// way the fence and the yield stay.
 #[cfg(unix)]
 #[test]
 fn the_notice_is_pressed_where_the_host_takes_cap_and_pasted_where_it_does_not() {
@@ -16252,12 +15966,9 @@ fn the_notice_is_pressed_where_the_host_takes_cap_and_pasted_where_it_does_not()
     }
 }
 
-/// A PRESSED NOTICE LEAVES CLAUDE CODE'S SURVEY TO THE PERSON (measured: a
-/// one-key card over the composer answers from the composer's
-/// value, so no key of the notice answers it — but its first key closes the
-/// card unanswered). With the session survey open above an empty composer,
-/// nothing is typed: the notice is refused `survey`, to be typed at the next
-/// quiet moment. NEGATIVE CONTROL: the same screen with no card presses it.
+/// A pressed notice leaves Claude Code's open session survey to the person (its first key
+/// would close the card unanswered): nothing is typed, refused `survey` until a quiet
+/// moment. Negative control: the same screen with no card presses it.
 #[cfg(unix)]
 #[test]
 fn a_pressed_notice_leaves_an_open_survey_to_the_person() {
@@ -16304,17 +16015,12 @@ fn a_pressed_notice_leaves_an_open_survey_to_the_person() {
     }
 }
 
-/// ONLY THE AGENT'S OWN WORDS ARE PRESSED: the relaunch line at zsh and fish
-/// is pasted whole (a person's Enter pressed into a line being typed key by
-/// key would run the part typed, a bare `claude`, and send the rest of the
-/// keys into it), and so is the continuation. Against a host whose `help turn`
-/// names `cap=<n>`, both go as ONE fenced paste — no `typed=1`. NEGATIVE
-/// CONTROL: the notice's own turn on the same host is pressed.
+/// Only the notice is pressed key by key: the relaunch line (a person's Enter mid-line
+/// would run a bare `claude`) and the continuation go as one fenced paste even where the
+/// host takes `cap=`. Negative control: the notice's own turn on the same host is pressed.
 #[cfg(unix)]
 #[test]
 fn only_the_agents_own_words_are_pressed_where_the_host_takes_cap() {
-    const CAP_HELP: &str = "OK 1\nturn [option=value ...] <text>: ... [cadence=<ms>] [cap=<n>] \
-                            [yield=<floor>] [if-gen=<epoch>.<seq>] ...";
     const SETTLED: &str = "OK 0 id=2 submitted=1 status=settled";
     let answers = || Answers {
         help: CAP_HELP,
@@ -16379,21 +16085,14 @@ fn only_the_agents_own_words_are_pressed_where_the_host_takes_cap() {
     );
 }
 
-/// A PRESSED TEXT'S TURN BUDGET COVERS ITS KEYS AND ITS DIGITS: the host
-/// holds each digit of a pressed text for the previous key's echo (the caret
-/// anchor, `TypingHold`) — about one Claude Code render — and a notice
-/// carries dozens of digits and up to ~2000 keys, more than [`TURN_WAIT`]'s
-/// 10 s: past its budget the host cuts the text part-way (`reason=deadline`),
-/// its words standing in the person's composer. The
-/// REAL notice, naming five processes, is asked a timeout covering its keys
-/// at the notice's cadence and its digits' renders on top of TURN_WAIT's
-/// own. NEGATIVE CONTROL: a paste on the same host — the relaunch line, the
-/// continuation — still waits TURN_WAIT exactly.
+/// A pressed notice's turn budget covers its keys and its digits: the host holds each
+/// digit for the previous key's echo (about one render), so a notice can outrun
+/// [`TURN_WAIT`]'s 10 s and be cut part-way. The real notice asks its keys at the cadence
+/// plus its digits' renders on top of `TURN_WAIT`. Negative control: a paste waits
+/// `TURN_WAIT` exactly.
 #[cfg(unix)]
 #[test]
 fn a_pressed_notices_turn_budget_covers_its_keys_and_its_digits() {
-    const CAP_HELP: &str = "OK 1\nturn [option=value ...] <text>: ... [cadence=<ms>] [cap=<n>] \
-                            [yield=<floor>] [if-gen=<epoch>.<seq>] ...";
     const SETTLED: &str = "OK 0 id=2 submitted=1 status=settled";
     let v = |s: &str| Version::parse(s).expect("version");
     let held: Vec<upgrade::Held> = (0..5u32)
@@ -16461,22 +16160,18 @@ fn a_pressed_notices_turn_budget_covers_its_keys_and_its_digits() {
     );
 }
 
-/// A NOTICE THE HOST CUT SHORT IS NOT DELIVERED: the host stops a pressed text part-way — a person's
-/// key or a screen switch between its keys, or the turn's deadline — and
-/// presses no Enter, answering `skipped reason=<why> typed=<k>`. That is
-/// [`Typed::Cut`]: never `announced` (the agent has half a notice, without
-/// the READY sentence at its end), and never typed again within the visit —
-/// the part typed sits in the composer, and a person's keys may sit with
-/// it. A skip that typed nothing keeps its word: `changed` is tried again, a
-/// person's hand or a spent budget before the first key is a wait
-/// (`yield`). Negative controls: the fence's `changed` is tried
-/// [`NOTICE_FENCE_TRIES`] times, and a whole pressed notice is announced.
+/// A notice the host cut short (`skipped reason=<why> typed=<k>`, [`Typed::Cut`]) is never
+/// announced (the agent has half a notice, no READY sentence) nor typed again in the
+/// visit. A skip that typed nothing keeps its word: `changed` is retried, a spent budget is
+/// a wait (`yield`). Negative controls: `changed` is tried [`NOTICE_FENCE_TRIES`] times; a
+/// whole notice is announced.
 #[cfg(unix)]
 #[test]
 fn a_notice_the_host_cut_short_is_never_announced_or_typed_again() {
     let cut = "OK 0 turn skipped reason=person typed=40 pasted=0 submitted=0 seq=78 id=1";
     for (head, want) in [
         (cut, Err(Typed::Cut("person".to_string()))),
+        ("OKAY", Err(Typed::Refused("OKAY".to_string()))),
         (
             "OK 0 turn skipped reason=deadline typed=12 pasted=0 submitted=0 seq=9 id=3",
             Err(Typed::Cut("deadline".to_string())),
@@ -16541,13 +16236,10 @@ fn a_notice_the_host_cut_short_is_never_announced_or_typed_again() {
     assert_eq!(step, "announced:1");
 }
 
-/// A labelled top rule is the input box too: Claude Code writes the effort
-/// tag, or `sandboxed`, into the box's top rule, which an all-`─` test would
-/// refuse, falling back to the whole-screen generation. The box is read by
-/// `aterm_phase`'s one frame reader: the recorded screens (`wait_bg.out`, the
-/// footer fixture) fence on their three rows, label and all, and the `turn` a
-/// labelled box is typed with carries `if-rows=` and no `if-gen=`. Negative
-/// control: the all-`─` test refuses both recorded top rules.
+/// A labelled top rule (an effort tag, `sandboxed`) is the input box too: `aterm_phase`'s
+/// frame reader fences the recorded screens (`wait_bg.out`, the footer fixture) on their
+/// three rows, and the notice's `turn` carries `if-rows=`, no `if-gen=`. Negative control:
+/// an all-`─` test refuses both recorded top rules.
 #[cfg(unix)]
 #[test]
 fn a_labelled_top_rule_is_the_input_box_the_notice_fences_on() {
@@ -16596,8 +16288,6 @@ fn a_labelled_top_rule_is_the_input_box_the_notice_fences_on() {
         assert!(composer_rows(&off).is_none(), "{name}");
     }
     // Through the fence's own read, on a host that takes `if-rows=`.
-    const ROWS_HELP: &str = "OK 1\nturn [option=value ...] <text>: ... [if-gen=<epoch>.<seq>] \
-                             [if-rows=<first>-<last>:<hex16>] ...";
     let top = format!("{} sandboxed ─", "─".repeat(20));
     let rule = "─".repeat(33);
     let dir = scratch("fence-rows-labelled");
@@ -16678,20 +16368,12 @@ pub(super) fn last_wrapped_row(text: &str, width: usize) -> String {
     row
 }
 
-/// A pressed notice's Enter is guarded on its own last row: a box Claude Code
-/// draws over its input on the same screen (a turn resumed at a workflow's
-/// break, its first tool call asking) moves neither the person's-key nor the
-/// screen-switch hold, so a plain Enter would confirm the box's focused `1.
-/// Yes`. Where the host takes it (`help turn` names `guarded:`), the notice's
-/// and the release's turn carries `submit=guarded:` with the supervisor's own
-/// composer guard: the cursor's row must still be the composer's, ending in
-/// the text's last word. On the host's own engine
-/// (`aterm_observe::row_matcher`) it matches the last row of the real notice
-/// and release at every width, and no row of the box. A miss (`reason=guard`,
-/// no `typed=`) is a cut (the text typed whole and unsent), never announced
-/// and never read as a refusal. Negative controls: a host whose help does not
-/// name the option gets the plain Enter (never a `submit=` it would type as
-/// text), and the guard over the box matches nothing there.
+/// A pressed notice's Enter is guarded on its own last row (`submit=guarded:`, the
+/// supervisor's composer guard): a box Claude Code draws over its input moves neither hold,
+/// and a plain Enter would confirm its `1. Yes`. On the host's engine
+/// (`aterm_observe::row_matcher`) the guard matches the notice's and release's last row at
+/// every width and no row of the box; a miss is a cut. Negative control: a host whose help
+/// does not name the option gets the plain Enter.
 #[cfg(unix)]
 #[test]
 fn a_pressed_notices_enter_is_guarded_on_its_own_last_row() {
@@ -16705,7 +16387,7 @@ fn a_pressed_notices_enter_is_guarded_on_its_own_last_row() {
         None,
         None,
     );
-    let release = upgrade::release_prompt(upgrade::Agent::Claude);
+    let release = upgrade::release_prompt(upgrade::Agent::Claude, false);
     let the_box = [
         " Do you want to proceed?",
         "❯ 1. Yes",
@@ -16795,12 +16477,10 @@ enum Kill {
     Nothing,
 }
 
-/// A Claude Code prompt for [`left_standing`] alone, 40 columns wide, holding
-/// `draft` ([`Prompt::screen`]): `text --json` draws it, a `cell` reads plain,
-/// `help` answers `help`, and `key … ctrl+u` (only while its `if-gen=` names
-/// the screen drawn) takes back what `kill` says, so a lane that pressed one
-/// would be seen to. Returns every request it read, and the draft it was left
-/// holding.
+/// A Claude Code prompt for [`left_standing`] alone, 40 columns wide, holding `draft`
+/// ([`Prompt::screen`]): `text --json` draws it, a `cell` reads plain, `help` answers `help`, and
+/// `key … ctrl+u` (only while its `if-gen=` names the screen drawn) takes back what `kill` says.
+/// Returns every request it read and the draft it was left holding.
 #[cfg(unix)]
 fn prompt_tab(
     draft: &str,
@@ -16853,17 +16533,14 @@ fn prompt_tab(
     (RelayClient::new(ours), server)
 }
 
-/// Aterm never takes its own words back: a `ctrl+u` fenced on the read cannot
-/// see a person's key the host has counted but Claude Code has not drawn, so it
-/// could erase the person's words with aterm's. What a stopped notice or
-/// release left in the prompt is only read ([`left_standing`]): aterm's part
-/// alone is `unsent`, with a person's key after it the person's (`mixed`), a
-/// person's own draft or an empty prompt means aterm's is `Gone`, and in every
-/// case nothing is pressed.
+/// Aterm never takes its own words back (a `ctrl+u` fenced on the read cannot see a key
+/// the host counted but Claude Code has not drawn): [`left_standing`] only reads what a
+/// stopped notice left, `unsent` alone, `mixed` with a person's key, else `Gone`; nothing
+/// is pressed.
 #[cfg(unix)]
 #[test]
 fn aterms_own_words_are_read_never_taken_back() {
-    let release = upgrade::release_prompt(upgrade::Agent::Claude);
+    let release = upgrade::release_prompt(upgrade::Agent::Claude, false);
     let part: String = release.chars().take(150).collect();
     let presses = |asked: &[String]| asked.iter().filter(|l| l.contains(" key ")).count();
     for (draft, want) in [
@@ -16886,15 +16563,10 @@ fn aterms_own_words_are_read_never_taken_back() {
     }
 }
 
-/// A notice the host stopped stands unsent, never a person's draft, and is
-/// never pressed back: the part a cut left in the prompt (its deadline, a
-/// screen switch, a guard's miss that left it whole, or a person's gesture) is
-/// recorded (`St::left_typed`) and every later look reads it first, before any
-/// gate, as aterm's own (`wait:left-typed:unsent`), never `draft`, so the
-/// supervisor's draft rule does not send it; nothing is pressed to take it
-/// back. With a person's key among aterm's words it is theirs
-/// (`left-typed:mixed`). Negative control: the same cut with the record
-/// forgotten reads aterm's words as a person's draft (`wait:draft`).
+/// A notice the host cut short is recorded (`St::left_typed`) and read first at every
+/// later look as aterm's own (`wait:left-typed:unsent`), never `draft`, so the
+/// supervisor's draft rule never sends it; nothing is pressed to take it back. A person's
+/// key among it makes it theirs (`mixed`). Negative control: the record forgotten, `draft`.
 #[cfg(unix)]
 #[test]
 fn a_notice_the_host_stopped_stands_unsent_and_is_never_pressed_back() {
@@ -16952,7 +16624,7 @@ fn a_notice_the_host_stopped_stands_unsent_and_is_never_pressed_back() {
     assert_eq!(h.visit().step, "wait:left-typed:mixed");
     assert_eq!(keys(&h), 0);
     drop(h);
-    // Negative control: the record forgotten, as before — a person's draft.
+    // Negative control: the record forgotten, aterm's words read as a person's draft.
     let h = rig("cut-forgotten", person, false);
     let _ = h.visit();
     let mut st = load(&h.opts, SESSION).expect("the record");
@@ -16962,22 +16634,13 @@ fn a_notice_the_host_stopped_stands_unsent_and_is_never_pressed_back() {
     assert_eq!(keys(&h), 0);
 }
 
-/// A TURN BEGUN SINCE THE LOOK TAKES NO NOTICE AND NO RELEASE UNDER THE ROWS
-/// FENCE: where the host takes `turn if-rows=`, the notice
-/// and the release are fenced on the input box's three rows alone
-/// ([`claude_fence`]), so the spinner and the `esc to interrupt` of a turn
-/// that started between the look and the fence's fresh read — a person's
-/// Enter, a background task's end that woke the agent — sit outside the
-/// fence. The fresh read the fence is taken on is held to the look's own
-/// turn fact ([`busy_footer`]): the notice waits `busy`, the
-/// release `release:busy`, nothing typed, the round as it was. NEGATIVE
-/// CONTROLS: the same visits over a screen that stayed idle type the notice
-/// and the release.
+/// A turn begun since the look takes no notice and no release under the rows fence: that
+/// fence (`if-rows=`, [`claude_fence`]) covers only the input box, so its fresh read is
+/// held to the look's own turn fact ([`busy_footer`]): `wait:busy` / `wait:release:busy`,
+/// nothing typed. Negative controls: a screen that stayed idle types both.
 #[cfg(unix)]
 #[test]
 fn a_turn_begun_since_the_look_takes_no_notice_and_no_release_under_the_rows_fence() {
-    const ROWS_HELP: &str = "OK 1\nturn [option=value ...] <text>: ... [if-gen=<epoch>.<seq>] \
-                             [if-rows=<first>-<last>:<hex16>] ...";
     let rule = "─".repeat(20);
     let idle = format!(
         r#"{{"rows":["{rule}","❯ ","{rule}"],"cursor":{{"row":1,"col":2}},"seq":77,"first":0,"gen":"4.77","human_ms":null}}"#
@@ -17001,8 +16664,7 @@ fn a_turn_begun_since_the_look_takes_no_notice_and_no_release_under_the_rows_fen
             .filter(|l| l.contains(" text "))
             .count()
     };
-    // THE NOTICE (the ask flow's): typed over a screen that stayed idle, on
-    // the box's rows.
+    // The notice (the ask flow's): typed over a screen that stayed idle, on the box's rows.
     let h = Parked::new("rows-turn-idle", answers(None), settled(), 3600);
     assert_eq!(h.visit().step, "announced:1");
     assert_eq!(h.typed().len(), 1);
@@ -17020,7 +16682,7 @@ fn a_turn_begun_since_the_look_takes_no_notice_and_no_release_under_the_rows_fen
     assert!(h.typed().is_empty(), "{:?}", h.typed());
     assert_eq!(load(&h.opts, SESSION).expect("state").phase, Phase::Pending);
     drop(h);
-    // THE RELEASE a give-up owes, under the same fence.
+    // The release a give-up owes, under the same fence.
     let owing = |h: &Parked| {
         let st = St {
             phase: Phase::Failed(upgrade::GAVE_UP.to_string()),
@@ -17059,17 +16721,11 @@ fn a_turn_begun_since_the_look_takes_no_notice_and_no_release_under_the_rows_fen
     );
 }
 
-/// The check-then-type: the screen read, the process proofs and the paste are
-/// separate steps, and a keystroke between them must not be typed in front of
-/// the notice. Where the host's `turn` takes the fence (`help turn` names
-/// `if-gen=`), the notice is typed with `if-gen=<the fresh read's generation>
-/// yield=0.2`; `skipped reason=changed` typed nothing. The visit reads and
-/// fences it again, [`NOTICE_FENCE_TRIES`] times in all: a moment's repaint is
-/// typed at the next try, and one that outlasts them is a wait with the
-/// upgrade still pending, counted (`St::refused`, from the first refusal). A
-/// person typing through the park (`ERR yield timeout`) is never typed at
-/// again. Negative control: a host without the fence gets the plain turn,
-/// never an `if-gen=` it would type as text.
+/// The notice is fenced on the generation it was judged on (`if-gen=<gen> yield=0.2` where
+/// `help turn` names it): a moment's repaint is typed at the next of
+/// [`NOTICE_FENCE_TRIES`] fresh tries, one that outlasts them waits pending (counted in
+/// `St::refused`), and a person typing through the park is not typed at again. Negative
+/// control: a host without the fence gets the plain turn.
 #[cfg(unix)]
 #[test]
 fn the_notice_is_fenced_on_the_generation_it_was_judged_on() {
@@ -17106,8 +16762,8 @@ fn the_notice_is_fenced_on_the_generation_it_was_judged_on() {
         ))),
         "{typed:?}"
     );
-    // How many screen reads come before the first paste: the look's and the
-    // first fence's. A later screen after them is what a RETRY reads.
+    // How many screen reads come before the first paste: the look's and the first
+    // fence's. A later screen after them is what a retry reads.
     let reads = {
         let asked = h.asked.lock().expect("asked").clone();
         asked
@@ -17123,13 +16779,9 @@ fn the_notice_is_fenced_on_the_generation_it_was_judged_on() {
     let st = load(&h.opts, SESSION).expect("the record");
     assert_eq!((st.refused, st.refused_at), (2, first));
     drop(h);
-    // A RETRY TYPES ONLY WHERE THE LOOK'S GATES STILL HOLD: the screen that moved was a person's keys or the program's
-    // own output. A person gave the tab input since the look (a message
-    // submitted between the look and the paste): the refusal stands. The
-    // agent woke into a turn (its spinner and busy footer): the fence's read
-    // shows the turn, which the gate waits for (`wait:busy`: no refusal of
-    // aterm's). Either way nothing is typed again — never
-    // a notice queued behind the person's message or into the live turn.
+    // A retry types only where the look's gates still hold: a person's input since the
+    // look keeps the refusal, and a turn the agent woke into waits `busy`; either way
+    // nothing is typed again.
     let busy_screen = format!(
         r#"{{"rows":["✻ Pondering… (3s · esc to interrupt)","{rule}","❯ ","{rule}"],"cursor":{{"row":2,"col":2}},"seq":79,"first":0,"gen":"4.79","human_ms":null}}"#
     );
@@ -17235,18 +16887,11 @@ fn the_notice_is_fenced_on_the_generation_it_was_judged_on() {
     assert!(!typed[0].contains("if-gen="), "{typed:?}");
 }
 
-/// THE NOTICE IS TYPED UNDER THE HARNESS'S OWN HAND, AND A REFUSED FENCE IS
-/// TRIED AGAIN INSIDE THE VISIT: a bare `turn` reads to the window's presence
-/// layer as somebody driving the tab — a row born and folded around it, two
-/// PTY resizes that can leave the grid displaced. Under the hand (`lease acquire …
-/// hard`, [`Hand`]) aterm's own turn shows no row; the fence, a whole-screen
-/// generation that a footer ticking once a second moves about one try in
-/// ninety, is tried again on a fresh read ([`NOTICE_FENCE_TRIES`]) instead of a
-/// minute later. The order is the hand taken, every try, the hand given back
-/// — on the refusal too. NEGATIVE CONTROLS: a tab another driver holds is a
-/// wait (`held`) and nothing is typed; a server that takes no hard lease
-/// gives no hand, and the notice is typed as it always was; a fence
-/// that keeps refusing is a wait after [`NOTICE_FENCE_TRIES`].
+/// The notice is typed under the harness's own hand (`lease acquire … hard`, [`Hand`]), so the
+/// window shows no driver row for it, and a refused fence (a ticking footer moves the generation
+/// about one try in ninety) is retried on a fresh read up to [`NOTICE_FENCE_TRIES`]. Negative
+/// controls: another driver's hold waits `held`; a server with no hard lease types without a
+/// hand; a fence that keeps refusing waits.
 #[cfg(unix)]
 #[test]
 fn the_notice_is_typed_under_the_harnesss_hand_and_a_refused_fence_is_retried() {
@@ -17319,7 +16964,7 @@ fn the_notice_is_typed_under_the_harnesss_hand_and_a_refused_fence_is_retried() 
         Some(Phase::Pending)
     );
     drop(h);
-    // NEGATIVE CONTROL: no hard lease to take (an older server).
+    // Negative control: no hard lease to take (an older server).
     let h = rig(
         "hand-older",
         "ERR lease acquire: unknown arg 'hard' (ttl=<ms> holder=<name>)",
@@ -17329,11 +16974,9 @@ fn the_notice_is_typed_under_the_harnesss_hand_and_a_refused_fence_is_retried() 
     assert_eq!(order(&requests(&h)), ["acquire", "turn"]);
 }
 
-/// THE WAIT LOG: the ledger holds acts, so a long wait's visit-by-visit
-/// history lives here. Each CHANGE of wait, and each
-/// act, is one row of the record: when, the word, and the facts the look
-/// decided on. The same word again adds nothing (a wait of hours is one row),
-/// the log is bounded to [`WAITS_KEPT`], and it survives the state file.
+/// The wait log (the ledger holds only acts): each change of wait and each act is one row
+/// with the facts the look decided on; a repeat adds nothing, the log is bounded to
+/// [`WAITS_KEPT`], and it survives the state file.
 #[test]
 fn the_wait_log_keeps_each_change_of_wait_with_the_facts_that_decided_it() {
     let mut st = St::default();
@@ -17371,10 +17014,9 @@ fn the_wait_log_keeps_each_change_of_wait_with_the_facts_that_decided_it() {
     assert_eq!(st.waits.last().map(|w| w.word.as_str()), Some("w28"));
 }
 
-/// THE WAIT LOG THROUGH THE REAL VISIT: a tab with text typed into its
-/// composer waits `draft`, and the row says what the look read — the person
-/// stamp, the composer's verdict and where the cursor and the caret stood,
-/// the render state, what ran under the agent.
+/// Through the real visit, a draft waits `draft` and its wait-log row records what the
+/// look read (person stamp, composer verdict, cursor and caret, render, holders); a repeat
+/// adds no row.
 #[cfg(unix)]
 #[test]
 fn a_visit_that_waits_records_what_it_read() {
@@ -17414,16 +17056,10 @@ fn a_visit_that_waits_records_what_it_read() {
     );
 }
 
-/// THE OWNER'S HOLD OWNS NO TURN END: an upgrade `--skip`ped onto its
-/// target, or `--defer`red past now, waits `skipped`/`deferred` and takes
-/// nothing, and no idle point cures that — a skip is the build's last word
-/// (the worker looks again only at the next activation notice or the owner's
-/// next word), a deferral is looked at again once it may have run out, and
-/// neither is a wait the worker owns the session's turn ends for, so its
-/// supervisor continues the worker as ever. Negative controls: the same busy
-/// session with no word, `--now`, a deferral that has run out, a skip of
-/// another build, and a word the owner put on ANOTHER tab each wait on the
-/// turn alone.
+/// The owner's hold owns no turn end: `--skip`ped onto its target or `--defer`red past
+/// now, an upgrade waits `skipped`/`deferred` (a skip is the build's last word) and the
+/// supervisor continues the worker. Negative controls: no word, `--now`, a lapsed
+/// deferral, a skip of another build, or a word on another tab waits on the turn alone.
 #[test]
 fn an_upgrade_the_owner_holds_owns_no_turn_end() {
     let now = now_s();
@@ -17477,22 +17113,17 @@ fn an_upgrade_the_owner_holds_owns_no_turn_end() {
     }
 }
 
-/// `<exe> --version` is bounded while the sweep holds its lock: the whole
-/// probe, the child's exit and the read of its output. A candidate that never
-/// answers is killed with its group, and one that answers and exits but leaves
-/// a grandchild holding the pipe is cut off at the bound too, its group
-/// killed. Either is `TimedOut`. Negative controls: one that answers is read;
-/// one that exits without a version is `NoVersion`.
+/// `<exe> --version` is bounded whole while the sweep holds its lock (probe, exit and
+/// output read): a candidate that never answers, or whose grandchild holds the pipe, is
+/// `TimedOut`, its group killed. Negative controls: an answer is read; an exit without a
+/// version is `NoVersion`.
 #[cfg(unix)]
 #[test]
 fn a_version_probe_is_bounded_whole() {
     let dir = scratch("version-probe");
-    // The sleeps' lengths carry this process's pid as their fraction, so the
-    // `ps` sweep below finds ONLY this test's own processes: a fixed number
-    // matched any other run's (a concurrent gate, a killed run's orphan that
-    // outlives it for days) and failed this test for a process that was never
-    // ours. A fraction, because macOS `sleep` refuses a number past about
-    // 4e9 seconds and exits at once, which would end `hang` before its bound.
+    // The sleeps carry this process's pid as their fraction, so the `ps` sweep below finds
+    // only this test's processes, never another run's. A fraction, because macOS `sleep`
+    // exits at once on a number past about 4e9 seconds.
     let pid = std::process::id();
     let (sleep_a, sleep_b, sleep_c) = (
         format!("987653.{pid}"),
@@ -17578,13 +17209,9 @@ fn a_version_probe_is_bounded_whole() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// The version cache: a clean answer (a version, or a clean failure to name
-/// one) is remembered while the file is unchanged, but a timeout is not a
-/// verdict on the build (one slow probe on a loaded machine must not stop that
-/// build being probed again). It is asked again on a back-off that doubles
-/// (unanswered until then, which a look reads as nothing decided,
-/// [`UNREAD_VERSION`]), and a changed file is asked at once. Driven on an
-/// injected clock.
+/// The version cache remembers a clean answer while the file is unchanged, but a timeout
+/// is no verdict on the build: it is asked again on a doubling back-off (unanswered until
+/// then, [`UNREAD_VERSION`] to a look), and a changed file at once. Injected clock.
 #[test]
 fn a_timed_out_version_probe_is_retried_on_a_back_off() {
     let dir = scratch("version-cache");
@@ -17686,12 +17313,9 @@ fn a_skipped_turn_typed_nothing() {
     assert!(!is_generation("18446744073709551616.15"));
 }
 
-/// The last look before the one irreversible act: a draft a person began after
-/// the restart's own screen check (while the state was being written) is read
-/// again on the same connection immediately before the SIGTERM, and vetoes it
-/// (`wait:changed-before-signal`, the agent alive and the upgrade still
-/// announced). Negative control: the same draft already on the restart's first
-/// look stops it there (`wait:changed`).
+/// A draft begun after the restart's own screen check is read again right before the
+/// SIGTERM and vetoes it (`wait:changed-before-signal`, still announced). Negative
+/// control: the same draft on the restart's first look stops it there (`wait:changed`).
 #[cfg(unix)]
 #[test]
 fn a_draft_begun_before_the_signal_vetoes_it() {
@@ -17794,12 +17418,9 @@ fn transcript_says(h: &Parked, text: &str) {
     .expect("transcript");
 }
 
-/// The continuation on a screen that never holds still: a resumed session
-/// whose screen keeps redrawing moves under every fenced try, so after its
-/// fenced tries the continuation is typed unfenced, once more checked for an
-/// empty composer, rather than ending `done:no-continue` with the agent never
-/// told to go on. Negative control: a host that refuses the turn is not typed
-/// at again.
+/// A continuation on a screen that keeps redrawing is typed unfenced after its fenced
+/// tries (still checked for an empty composer), never `done:no-continue`. Negative
+/// control: a refused turn is not typed again.
 #[cfg(unix)]
 #[test]
 fn a_continuation_on_a_screen_that_keeps_moving_is_still_typed() {
@@ -17840,13 +17461,9 @@ fn a_continuation_on_a_screen_that_keeps_moving_is_still_typed() {
     assert_eq!(rig.typed().len(), 1);
 }
 
-/// The relaunch line and a person typing through the yield: the fenced line
-/// parks on the typing momentum (`yield=0.2`), and a yield that outlives the
-/// turn's timeout (`ERR yield timeout`) is a wait, not a refusal
-/// (`failed:relaunch` after the agent was ended). Nor is it ever a reason to
-/// type the line unfenced into whatever the person is typing: the attempt
-/// waits `yield` at once, nothing more typed, and a later sweep reads the
-/// prompt afresh. Negative control: a real refusal is still one, at once.
+/// A fenced relaunch line that parks past the turn's timeout on a person's typing (`ERR
+/// yield timeout`) waits `yield`: it never fails the relaunch nor types unfenced.
+/// Negative control: a real refusal is still one, at once.
 #[cfg(unix)]
 #[test]
 fn a_yield_that_times_out_never_fails_the_relaunch() {
@@ -17926,17 +17543,10 @@ fn a_yield_that_times_out_never_fails_the_relaunch() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The heal rides the relaunch line: with the shell's dialect known, the window
-/// is asked for a typed re-key of the tab after every check that can make the
-/// attempt wait (`rekey shell=<the proven shell>`), and the line typed is the
-/// healed one: the shell's own take of the key from the path, then the
-/// relaunch line unchanged. Every way the heal can fail leaves the relaunch as
-/// it was: a refusal (a healthy tab), an older window that knows no such verb,
-/// and a healed line past the tty's bound (its key taken back at once) all
-/// type the plain line; no dialect asks nothing. An attempt that then types
-/// nothing (a person typing through the yield) takes the key back (`rekey
-/// withdraw`) before it returns, so its one-use file never waits for a line
-/// that is not coming.
+/// With the shell's dialect known, the relaunch attempt asks the window for a typed re-key
+/// (`rekey shell=<pid>`) and types the healed line. A refusal, an older window, or a
+/// healed line past the tty's bound (its key taken back) types the plain line; no dialect
+/// asks nothing; an attempt that types nothing takes the key back (`rekey withdraw`).
 #[cfg(unix)]
 #[test]
 fn the_relaunch_line_carries_a_rekey_and_never_waits_on_one() {
@@ -18052,11 +17662,9 @@ fn the_relaunch_line_carries_a_rekey_and_never_waits_on_one() {
     }
 }
 
-/// The heal at a bash prompt: the dialect is read off the live shell
-/// ([`shell_dialect`]), and a bash prompt, which is typed to and never pasted,
-/// is typed the healed line: bash's own take of the key, then the relaunch
-/// line unchanged. Negative control: a re-key the window refuses types the
-/// plain line at the same bash, and takes nothing back.
+/// At bash the dialect is read off the live shell ([`shell_dialect`]) and the healed line
+/// is typed (`send`, never pasted). Negative control: a refused re-key types the plain
+/// line and takes nothing back.
 #[cfg(unix)]
 #[test]
 fn a_relaunch_typed_at_bash_takes_the_key_its_live_shell_names() {
@@ -18137,25 +17745,17 @@ fn a_relaunch_typed_at_bash_takes_the_key_its_live_shell_names() {
     let _ = bash.wait();
 }
 
-/// The requests of `asked` that PASTE into the tab.
+/// The requests of `asked` that paste into the tab.
 #[cfg(unix)]
 fn turns_in(asked: &[String]) -> usize {
     asked.iter().filter(|l| l.contains(" turn ")).count()
 }
 
-/// The relaunch line is never typed onto a person's command: the fence proves
-/// only that the screen held still between a read and the paste, not that the
-/// prompt's input line is empty, so a paused `rm -rf build` would get the line
-/// appended and Enter pressed on both. The first read marks where the prompt
-/// left the cursor, and the mark is kept across attempts: a read that finds
-/// typing after it waits (`typing`), nothing typed, fenced or not, and so does
-/// the next attempt while the half-typed command is still there. Deleted, the
-/// prompt reads as marked again and the line goes. Negative controls: a prompt
-/// that holds its cursor is typed on the first fenced try; one whose screen
-/// keeps changing with the cursor in place (a ticking right prompt) is still
-/// typed unfenced after its fenced tries; one redrawn by an async prompt (its
-/// cursor moved, its text changed) waits (`prompt-moved`), never marked afresh
-/// within the attempt, and the next attempt marks it and types.
+/// The relaunch line is never typed onto a person's command (the fence proves only that
+/// the screen held still, not that the input line is empty): the first read marks where
+/// the prompt left the cursor, kept across attempts, and typing after the mark waits
+/// `typing` until deleted. Negative controls: a still prompt types fenced; a ticking one
+/// types unfenced after its tries; an async redraw waits `prompt-moved`, marked next time.
 #[cfg(unix)]
 #[test]
 fn the_relaunch_line_waits_for_a_person_typing_at_the_prompt() {
@@ -18382,12 +17982,9 @@ fn relaunch_attempt_ended(
 #[cfg(unix)]
 const FENCED_HELP: &str = "OK 1\nturn [option=value ...] <text>: ... [if-gen=<epoch>.<seq>] ...";
 
-/// At a bash prompt the mark still stands between a person's typing and the
-/// line: bash is typed to as keystrokes (`send`, which takes no `if-gen=`
-/// fence, [`type_relaunch_line`]), so the prompt is read against its mark once
-/// more right before them, and a person's typing after it (`ls`) is a wait:
-/// nothing is sent. Negative control: the same bash prompt as marked, nothing
-/// after it, is typed at.
+/// At a bash prompt (typed to with `send`, which takes no `if-gen=` fence) the prompt is
+/// read against its mark once more right before the keys, so a person's typing after it
+/// is a wait. Negative control: the bare marked prompt is typed at.
 #[cfg(unix)]
 #[test]
 fn a_bash_prompt_with_typing_after_its_mark_is_never_typed_at() {
@@ -18454,14 +18051,10 @@ fn a_bash_prompt_with_typing_after_its_mark_is_never_typed_at() {
     let _ = bash.wait();
 }
 
-/// The relaunch line is never typed into a program a person started at the
-/// returned prompt: the tries after the mark can take seconds (a fenced turn
-/// parks up to 30 s on a person's typing), and a person may run `vim x`,
-/// `ssh`, a REPL or a second `claude` in that time. A prompt that moves after
-/// the mark is a wait within the attempt, and the shell is proven to hold the
-/// tab again immediately before every typed try, the unfenced fallback
-/// included. Negative control: with the shell holding the tab throughout, the
-/// same prompt is typed at.
+/// The relaunch line is never typed into a program a person started at the returned
+/// prompt during the attempt's tries (a fenced turn can park 30 s): a prompt that moves
+/// after the mark is a wait, and the shell is proven to hold the tab right before every
+/// typed try, the unfenced fallback included. Negative control: the shell holding, typed.
 #[cfg(unix)]
 #[test]
 fn the_relaunch_line_is_never_typed_into_a_program_started_at_the_prompt() {
@@ -18551,13 +18144,10 @@ fn the_relaunch_line_is_never_typed_into_a_program_started_at_the_prompt() {
     assert_eq!(typed.len(), 1, "{typed:#?}");
 }
 
-/// A caret moved home over a half-typed command is typing: comparing only the
-/// cursor and the text left of it would read `rm -rf build` then ctrl-a as the
-/// prompt unmoved (a pure cursor move changes no content, so the fence passes
-/// it). The mark keeps where text to its right began (a right prompt): the
-/// cells from the cursor up to it must stay blank. Negative controls: a right
-/// prompt that ticks in place (a clock) is the prompt unmoved, and so is a
-/// bare prompt.
+/// A caret moved home over a half-typed command is typing (a pure cursor move changes no
+/// content, so the fence passes it): the mark keeps where a right prompt began, and the
+/// cells from the cursor up to it must stay blank. Negative controls: a right-prompt clock
+/// ticking in place, and a bare prompt, are the prompt unmoved.
 #[cfg(unix)]
 #[test]
 fn a_caret_moved_home_over_a_half_typed_command_is_typing() {
@@ -18626,14 +18216,10 @@ fn a_caret_moved_home_over_a_half_typed_command_is_typing() {
     assert_eq!(PromptMark::parse("3,9,a, b % "), None);
 }
 
-/// Typeahead before the first read is never the mark: a command typed while
-/// the agent exited is echoed at the prompt before that read, so marking where
-/// the cursor sits would append the line to it. Where the shell's integration
-/// marked the input's start (`133;B`: `blocks --json`'s `"cmdcol"`, on the row
-/// `line` reads), the cursor must sit exactly there; where it did not, the
-/// cursor must follow the prompt's trailing blank; either way the cells at the
-/// cursor must be blank. Negative controls: a clean prompt is marked and typed
-/// at, with the integration's mark and without it.
+/// Typeahead before the first read is never the mark (marking where the cursor sits would
+/// append the line to it): with the shell's `133;B` input start (`blocks --json`'s
+/// `cmdcol`) the cursor must sit exactly there, else after the prompt's trailing blank, and
+/// the cells at the cursor must be blank. Negative controls: a clean prompt is typed at.
 #[cfg(unix)]
 #[test]
 fn typeahead_before_the_first_read_is_never_the_mark() {
@@ -18665,8 +18251,8 @@ fn typeahead_before_the_first_read_is_never_the_mark() {
     );
     assert_eq!(got, Err(RelaunchLineError::Wait("typing")));
     assert!(typed.is_empty() && mark.is_none(), "{typed:#?} {mark:?}");
-    // The integration's input start: typeahead that DOES end in a blank —
-    // which the plain rule alone would take for the prompt — is still typing.
+    // The integration's input start: typeahead that does end in a blank, which the plain
+    // rule alone would take for the prompt, is still typing.
     let (got, typed, _) = attempt(
         "typeahead-133",
         prompt_screen("~/proj % ls ", 12, 77),
@@ -18696,35 +18282,19 @@ fn typeahead_before_the_first_read_is_never_the_mark() {
     }
 }
 
-/// A MARK THAT NAMES ANOTHER ROW IS NO PERSON'S TYPING (tab #1's shape).
-/// An upgrade SIGTERMed Claude Code (fullscreen) and the relaunch read the
-/// returned prompt: its cursor where the prompt ends, nothing after it, no
-/// person at the keys for nineteen hours — and the shell's `133;B` mark
-/// (`blocks 1 --json`: row 69, column = the prompt's length), whose row the
-/// `line` verb read as the line ABOVE the prompt (`claude --resume …`; the
-/// engine's absolute rows had slid, `aterm-core`'s
-/// `shell_mark_rows_across_resize`). The integration's check took the mismatch
-/// for typing, every attempt for five minutes waited `typing`, and the agent
-/// the upgrade had ended stayed down. The read's own `human_ms` stamp proves
-/// what the mark could not: no person keyed the session since the agent's
-/// end was asked, so the shell's line holds nothing of a person's, and the
-/// line is typed. NEGATIVE CONTROLS — the guard for REAL typing stands: a
-/// person's key after the end, a host that stamps no person input, a session
-/// the host has never seen keyed (a seamless update's successor reads every
-/// adopted session so, whatever was typed before it), or an end not known
-/// (a relaunch on exit) each WAIT, and say what holds them (`mark-elsewhere`,
-/// never `typing`); a person's typing that wrapped past the prompt's row (the
-/// mark on the row above, as here) with their keys since is never typed onto;
-/// and a mark that names the cursor's row with typeahead after it is
-/// `typing`, as ever.
+/// A shell mark that names another row (the `133;B` mark's row read as the line above the
+/// prompt) is no person's typing when the read's `human_ms` stamp shows nobody keyed since the
+/// agent's end was asked: the line is typed. Negative controls: a key after the end, no stamp,
+/// a never-keyed session (`null`) or an unknown end waits `mark-elsewhere`; wrapped typing is
+/// never typed onto; typeahead on the mark's row is `typing`.
 #[cfg(unix)]
 #[test]
 fn a_mark_that_names_another_row_is_no_persons_typing() {
     let settled = "OK 0 id=2 submitted=1 status=settled";
     const PROMPT: &str = "me@a-studio-of-128gb aterm %";
     let col = PROMPT.len() + 1;
-    // The incident's last rows (`text --json`, tail-trimmed), the cursor
-    // where the prompt ends.
+    // The returned prompt's last rows (`text --json`, tail-trimmed), the cursor where the
+    // prompt ends.
     let screen = |rows: &[&str], cursor: (usize, usize), human: &str| {
         let rows: Vec<String> = rows.iter().map(|r| format!("{r:?}")).collect();
         format!(
@@ -18763,7 +18333,7 @@ fn a_mark_that_names_another_row_is_no_persons_typing() {
         );
         (got, typed, mark)
     };
-    // THE INCIDENT: no person since (19 h ago, the end 3 s ago) — typed.
+    // Nobody keyed since the end (the last key 19 h ago, the end 3 s ago): typed.
     let quiet = r#","human_ms":70000000,"human_seq":51"#;
     let (got, typed, mark) = attempt(
         "mark-elsewhere-quiet",
@@ -18774,9 +18344,9 @@ fn a_mark_that_names_another_row_is_no_persons_typing() {
     assert_eq!(got, Ok(()), "the prompt nobody touched is typed at");
     assert_eq!(typed.len(), 1, "{typed:#?}");
     assert_eq!(mark.map(|m| (m.row, m.col)), Some((3, col)));
-    // A person's key AFTER the end (half a second ago): the line holds what
-    // they typed, for all the screen shows — a wait, named. So does a read
-    // that cannot date the last key against the end.
+    // A person's key after the end (half a second ago): the line holds what they typed,
+    // for all the screen shows, so it waits, named. So does a read that cannot date the
+    // last key against the end.
     for (name, human, ended_at_s) in [
         ("mark-elsewhere-keyed", r#","human_ms":500"#, ended),
         ("mark-elsewhere-unstamped", "", ended),
@@ -18792,9 +18362,9 @@ fn a_mark_that_names_another_row_is_no_persons_typing() {
         );
         assert!(typed.is_empty() && mark.is_none(), "{name}: {typed:#?}");
     }
-    // A person's typing that WRAPPED past the prompt's row: the mark names
-    // the row above (the prompt and the start of their command), the cursor
-    // sits on the continuation — after a blank, at the mark's very column.
+    // A person's typing that wrapped past the prompt's row: the mark names the row above
+    // (the prompt and the start of their command), the cursor sits on the continuation,
+    // after a blank, at the mark's very column.
     let wrapped = [
         "me@a-studio-of-128gb aterm % git commit -am 'fix the relaunch: a mark that na",
         "mes another row",
@@ -18819,24 +18389,11 @@ fn a_mark_that_names_another_row_is_no_persons_typing() {
     assert!(typed.is_empty(), "{typed:#?}");
 }
 
-/// TIER-1 OF `RelaunchPromptRead` (`aterm_spec::derive::
-/// relaunch_prompt_read_model`): the real relaunch line
-/// ([`type_relaunch_line`]) against a stand-in tab in EVERY world of the model
-/// — the shell's mark none, on the prompt's row or on another; the host
-/// stamping a person's input or not; the text left of the cursor ending in a
-/// blank or not — with and without a person's keys standing at the prompt,
-/// projected onto the model's state, makes exactly the model's one move
-/// there: it types where `Read` is enabled, and elsewhere waits with the word
-/// of the model's wait (`typing`, `mark-elsewhere`, `unmarked`). Each world is
-/// read in every spelling the host has for it: no mark as no integration
-/// (the verb unanswered) and as a newest block that is not `entering` (a
-/// command the shell runs — `claude; read` — holds the terminal); no stamp as
-/// an older host's (no `human_ms`) and as a session never keyed since the
-/// host began serving it (`null`). Tab #1's world (a mark elsewhere, a stamp,
-/// nobody keyed) is among them and types. NON-VACUITY: both verdicts occur,
-/// and a projection that drops the stamp (an older host's, or tab #1's rule,
-/// which never read it) would disagree with the real verdict in tab #1's
-/// world.
+/// Tier-1 of `RelaunchPromptRead` (`aterm_spec::derive::relaunch_prompt_read_model`): the real
+/// [`type_relaunch_line`] in every world of the model (shell mark none, here or elsewhere; input
+/// stamped or not; text before the cursor ending in a blank or not; a person's keys or not), in
+/// every spelling the host has, makes exactly the model's one move. Non-vacuity: both verdicts
+/// occur, and the stamp decides the mark-elsewhere world.
 #[cfg(unix)]
 #[test]
 fn the_real_prompt_read_conforms_to_the_model() {
@@ -18910,9 +18467,8 @@ fn the_real_prompt_read_conforms_to_the_model() {
                         ] {
                             state.insert(var, value);
                         }
-                        // Exactly one of the lane's four moves is the model's here,
-                        // and it is the one the real read made: the line, or the
-                        // wait with ITS word.
+                        // Exactly one of the lane's four moves is the model's here, and it
+                        // is the one the real read made: the line, or the wait with its word.
                         let lane: Vec<&str> =
                             ["Read", "WaitTyping", "WaitElsewhere", "WaitUnmarked"]
                                 .into_iter()
@@ -18958,10 +18514,9 @@ fn the_real_prompt_read_conforms_to_the_model() {
     );
 }
 
-/// A STALE EXIT NAMES WHAT HELD ITS LINE: every try notes its wait on the record —
-/// the host's carries too — and the stale bound's ledger line says it, in
-/// a person's words. With no wait recorded, or one with no words, the line is
-/// the bare fact; an end no look has seen yet is only the one asked for.
+/// The stale-exit line (`expired`) names the wait that held the relaunch line, in a
+/// person's words; with no wait, or one with no words, the bare fact; an end not yet seen
+/// is only the one asked for.
 #[test]
 fn a_stale_exit_names_the_wait_that_held_its_line() {
     let now = now_s();
@@ -19012,16 +18567,10 @@ fn a_stale_exit_names_the_wait_that_held_its_line() {
     );
 }
 
-/// NO MARK SAYS A PROMPT IS THERE, NO BLANK ENDS IT, AND NOBODY KEYED: the
-/// line is never typed on the stamp alone, and the wait says `unmarked`, not
-/// `typing`. The stamp proves no person typed, not
-/// that the shell is at a prompt: a shell with no integration whose prompt
-/// does not end in a blank looks so, and so does `while :; do claude; read
-/// -k1; done` once the agent is gone — the shell's own builtin holds the
-/// terminal (its newest block `running`), and a line typed into it would end
-/// the `read` with its first key and hand the rest to the agent the loop
-/// starts again. With a person's key since, the wait is `typing`, as before;
-/// the same prompt ending in a blank is typed at by its shape, as before.
+/// With no mark that a prompt is there, no blank ending it, and nobody keyed, the line is
+/// never typed on the stamp alone: it waits `unmarked`. The stamp proves nobody typed, not
+/// that the shell is at a prompt (a `while :; do claude; read -k1; done` loop's `read`
+/// holds the terminal). A key since waits `typing`; a prompt ending in a blank is typed at.
 #[cfg(unix)]
 #[test]
 fn a_prompt_no_mark_attests_is_never_typed_on_the_stamp_alone() {
@@ -19065,7 +18614,7 @@ fn a_prompt_no_mark_attests_is_never_typed_on_the_stamp_alone() {
         assert_eq!(got, Err(RelaunchLineError::Wait("typing")), "{name}");
         assert!(typed.is_empty(), "{name}: {typed:#?}");
     }
-    // The shape rule, unchanged: a prompt that ends in a blank is typed at.
+    // The shape rule: a prompt that ends in a blank is typed at.
     let (got, typed) = run(
         "unmarked-blank",
         screen("me@box proj %", 14, quiet),
@@ -19075,12 +18624,9 @@ fn a_prompt_no_mark_attests_is_never_typed_on_the_stamp_alone() {
     assert_eq!(typed.len(), 1, "{typed:#?}");
 }
 
-/// THE END A RELAUNCH DATES A PERSON'S KEYS AGAINST: a restart that ended its agent itself stamped its record
-/// before the signal, after a last look that found nobody's hand, so its
-/// stamp is the end; a relaunch on exit stamps its record after the agent
-/// left and the back-off ran (up to ten minutes), so keys a person typed at
-/// the returned prompt in between would date BEFORE it and read as the
-/// agent's — its end is unknown (`0`), and no stamp clears a prompt for it.
+/// `relaunch::end_asked_at`: only a restart that ended its agent itself (stamped before its
+/// signal) dates a person's keys against its end; a relaunch on exit stamps after the
+/// agent left and the back-off ran, so its end is unknown (`0`).
 #[test]
 fn only_a_restart_that_ended_its_agent_dates_a_persons_keys() {
     use super::super::relaunch::{
@@ -19128,15 +18674,9 @@ fn only_a_restart_that_ended_its_agent_dates_a_persons_keys() {
 
 // ---------------------------------------------------------------- the owner's view and word
 
-/// A `--now` reaches the act, and the wait is kept to read. A session whose
-/// screen just moved waits `settling`; the state keeps that wait, since when,
-/// the tab it is in and how long the session has been behind, and a second
-/// sweep with the same wait keeps the same start. That is the negative
-/// control: with no request, nothing is typed. `aterm harness upgrade <tab>
-/// --now` ([`ask`]) waives exactly that window (it stands the upgrade at the
-/// ladder's last rung) and the next visit types the notice; the act clears the
-/// kept wait. Ten minutes behind is the ladder's first rung (two hours would
-/// be the last rung already, with no settle of its own).
+/// A `--now` ([`ask`]) waives exactly the settling window and the next visit types the
+/// notice; until then the state keeps the wait (its start, the tab, the age) across
+/// sweeps, and the act clears it. Negative control: with no request, nothing is typed.
 #[cfg(unix)]
 #[test]
 fn an_owners_now_moves_a_settling_session_and_the_wait_is_kept_until_then() {
@@ -19156,7 +18696,7 @@ fn an_owners_now_moves_a_settling_session_and_the_wait_is_kept_until_then() {
         from: "1.0.0".to_string(),
         to: "9.9.9".to_string(),
         source: "managed".to_string(),
-        // The screen `instance` shows, first seen NOW: not yet quiet.
+        // The screen `instance` shows, first seen now: not yet quiet.
         last_seq: 77,
         seq_since_s: now_s(),
         pending_since: behind,
@@ -19215,19 +18755,12 @@ fn an_owners_now_moves_a_settling_session_and_the_wait_is_kept_until_then() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The ladder, driven on Claude Code through the real look: the real `visit`,
-/// whose `look` builds its facts by the same `ladder_look` the Codex visit
-/// does, across two looks, the clock between them moved by rewinding the state
-/// the first saved (its still run, the screen's `seq`, as the next look finds
-/// them):
+/// The ladder on Claude Code through the real `visit` (whose `look` shares `ladder_look`
+/// with the Codex visit), across two looks with the state rewound between them:
 ///
-/// * A repaint at Settled announces: the screen's `seq` moved at each look
-///   (its own quiet restarting) while its words stood still a minute, and the
-///   second look types the notice. Negative control: the same two looks at the
-///   Prefer rung wait `settling`.
-/// * A person near the tab at KeysOnly announces (their input a minute old).
-///   Negative control: the same person at Settled holds it.
-/// * A keystroke within 20 s at Land waits, look after look.
+/// * a repaint at Settled announces on the second look (at Prefer it waits `settling`);
+/// * a person near the tab at KeysOnly announces (at Settled it holds);
+/// * a keystroke within `KEYS_GAP_S` at Land waits, look after look.
 #[cfg(unix)]
 #[test]
 fn the_real_look_climbs_the_ladder_on_claude_code() {
@@ -19345,11 +18878,8 @@ fn the_real_look_climbs_the_ladder_on_claude_code() {
     );
 }
 
-/// A `--now` is on the tab it named, not the conversation, so it waives the
-/// settling window nowhere the conversation was resumed. A `--now` recorded
-/// for another tab is no word here: the settling session waits and nothing is
-/// typed. Negative control: the same word recorded for this tab types the
-/// notice at once.
+/// A `--now` waives the settling window only in the tab it named; recorded for another
+/// tab it is no word here. Negative control: recorded for this tab, the notice goes at once.
 #[cfg(unix)]
 #[test]
 fn the_owners_word_waives_nothing_in_a_tab_it_did_not_name() {
@@ -19370,7 +18900,7 @@ fn the_owners_word_waives_nothing_in_a_tab_it_did_not_name() {
         from: "1.0.0".to_string(),
         to: "9.9.9".to_string(),
         source: "managed".to_string(),
-        // The screen `instance` shows, first seen NOW: not yet quiet.
+        // The screen `instance` shows, first seen now: not yet quiet.
         last_seq: 77,
         seq_since_s: now_s(),
         request: Request::Now,
@@ -19407,15 +18937,9 @@ fn the_owners_word_waives_nothing_in_a_tab_it_did_not_name() {
     assert_eq!(typed_here, 1);
 }
 
-/// A READY answer a hold superseded is no consent. An upgrade held (`--defer`,
-/// `--skip`) is yielded nothing, and the window's supervisor waits on a point
-/// that answers its notice for three minutes at most, then types `keep going`
-/// and the agent goes back to work after its READY. That READY stays in the
-/// transcript's tail, so a hold on an announced upgrade ends its notice: the
-/// phase is pending again and the marker gone, and once the hold ends the next
-/// turn end gets a fresh notice and needs a fresh READY, rather than
-/// SIGTERMing an agent in the middle of its work. Negative control: the same
-/// READY state, settled, with no hold is ended: the agent dies of the SIGTERM.
+/// A READY answer a hold (`--defer`, `--skip`) superseded is no consent: the hold ends the
+/// notice (pending again, marker gone), so after the hold the next turn end gets a fresh
+/// notice, never the signal. Negative control: the same READY with no hold is ended.
 #[cfg(unix)]
 #[test]
 fn a_ready_answer_the_owners_hold_superseded_is_never_signalled_after_it() {
@@ -19497,12 +19021,9 @@ fn a_ready_answer_the_owners_hold_superseded_is_never_signalled_after_it() {
     assert_eq!(h.details("terminated"), ["SIGTERM"], "{r:?}");
 }
 
-/// An attended READY session is never signalled on the upgrade's own
-/// judgment: a READY answer at a settled point in a tab a person gave input in
-/// the last ten minutes (its `human_ms` stamp) waits `attended` (said once,
-/// then waited on) however long past the re-ask clock, and the agent is never
-/// sent the SIGTERM in front of the person. Negative control: `--now` ends it
-/// at once.
+/// A READY session a person gave input in within the grace (`human_ms`) waits `attended`
+/// however long past the re-ask clock, never signalled in front of them. Negative control:
+/// `--now` ends it at once.
 #[cfg(unix)]
 #[test]
 fn an_attended_ready_session_is_never_signalled_without_the_owners_now() {
@@ -19654,13 +19175,10 @@ fn proc(start: &str) -> Proc<'_> {
     }
 }
 
-/// AN AGE BELONGS TO ONE PROCESS: a pending record must not carry its age onto
-/// a process the owner restarted by hand since. A newer target carries the age only while the SAME
-/// process is still the one behind; a process that changed — by its kernel
-/// start, else (a record an older build wrote) by the build it was found
-/// behind — starts it from now. NEGATIVE CONTROLS: the same process carries;
-/// a record that names neither build nor process carries;
-/// a stopped round and a finished one are not this arm's.
+/// An age belongs to one process: a newer target carries a pending record's age only
+/// while the same process is behind, told by kernel start (for an older build's record,
+/// by the build it was found behind). Negative controls: the same process, or a record
+/// naming neither, carries; stopped and finished rounds are not this arm's.
 #[test]
 fn an_age_belongs_to_one_process() {
     let running = Version::parse("2.1.283").expect("v");
@@ -19691,7 +19209,7 @@ fn an_age_belongs_to_one_process() {
     let legacy = minted("2.1.274", "", Phase::Pending);
     let next = St::for_target(Some(legacy), &running, &to, None, proc("B"), 900);
     assert_eq!(next.behind_since(), 900, "found behind another build");
-    // NEGATIVE CONTROLS.
+    // Negative controls.
     let same_proc = minted("2.1.283", "B", Phase::Pending);
     let next = St::for_target(Some(same_proc), &running, &to, None, proc("B"), 900);
     assert_eq!(next.behind_since(), 100, "the same process is still behind");
@@ -19702,9 +19220,9 @@ fn an_age_belongs_to_one_process() {
     let unknown = minted("", "", Phase::Pending);
     let next = St::for_target(Some(unknown), &running, &to, None, proc("B"), 900);
     assert_eq!(next.behind_since(), 100, "names nothing: carried as ever");
-    // A PENDING record for the SAME target follows its process too: a session
-    // restarted by hand onto another build that is still behind it is behind
-    // since the restart, with nothing of the old process's waits.
+    // A pending record for the same target follows its process too: a session restarted
+    // by hand onto another still-behind build is behind since the restart, with none of
+    // the old process's waits.
     let waiting = St {
         wait: "background".to_string(),
         wait_since: 50,
@@ -19748,7 +19266,7 @@ fn an_age_belongs_to_one_process() {
         (0, "", "", 0),
         "and nothing the old process answered: B never refused a signal"
     );
-    // NEGATIVE CONTROL: the same process keeps its streak (it is still the one
+    // Negative control: the same process keeps its streak (it is still the one
     // that stopped).
     let same = St {
         proc_start: "B".to_string(),
@@ -19766,9 +19284,9 @@ fn an_age_belongs_to_one_process() {
         (900, "B"),
         "its minting is the new process's too: the classifier's horizons count from it"
     );
-    // An ANNOUNCED record of another process for the same target keeps its
-    // own process's start, so the next build's record is minted afresh
-    // instead of finding the record 'the same process' one visit later.
+    // An announced record of another process for the same target keeps its own process's
+    // start, so the next build's record is minted afresh rather than read as the same
+    // process one visit later.
     let announced = St {
         salt: 10,
         ..minted("2.1.274", "A", Phase::Announced { at_s: 50, asks: 1 })
@@ -19785,9 +19303,9 @@ fn an_age_belongs_to_one_process() {
         950,
         "B's age begins when B's target does"
     );
-    // A RECORD AN OLDER BUILD WROTE that predates the process now holding the
-    // conversation cannot be that process's age: its age begins when this target was first seen (the
-    // record's own salt) or when the process began, whichever is later.
+    // An older build's record that predates the process now holding the conversation
+    // cannot be its age: the age begins when this target was first seen (the record's
+    // salt) or when the process began, whichever is later.
     let target_284 = Candidate {
         version: Version::parse("2.1.284").expect("v"),
         ..to.clone()
@@ -19832,15 +19350,13 @@ fn an_age_belongs_to_one_process() {
         600,
         "an age from within the process stands"
     );
-    // A STOPPED ROUND IS ABOUT ITS PROCESS OR LAUNCH LINE: kept as it was for
-    // the process it was about ...
+    // A stopped round is about its process or launch line: kept as it was for the
+    // process it was about ...
     let stopped = minted("2.1.275", "B", Phase::Failed("no-resume".to_string()));
     let next = St::for_target(Some(stopped.clone()), &from, &target, None, proc("B"), 900);
     assert_eq!((next.phase, next.pending_since), (stopped.phase, 100));
-    // ... and NOT for another: a session the owner
-    // restarted by hand onto this still-behind build never had that round, so
-    // its age, its answers and the processes recorded under the one before it
-    // are not its own. It is asked afresh, from now.
+    // ... and not for another: a session restarted by hand onto this still-behind build
+    // never had that round, and is asked afresh, from now.
     let of_a = St {
         wait: "failed".to_string(),
         held_by: vec![HeldBy {
@@ -19868,12 +19384,9 @@ fn an_age_belongs_to_one_process() {
     assert_eq!(next.proc_start, "B");
 }
 
-/// A STOPPED ROUND'S PROCESS IS STILL BEHIND WHEN A NEWER BUILD LANDS (Claude
-/// ships about daily, so builds land in rests, and one that restarted the
-/// digest's 24 hours there would forget the round it had answered): the
-/// same process keeps its age, its unanswered rounds, its wait log and the
-/// last look that saw its work; another process, or a finished upgrade,
-/// starts fresh.
+/// A newer build landing in a rest keeps the same process's age, unanswered rounds, wait
+/// log and last work seen (Claude Code ships about daily, so builds land in rests);
+/// another process, or a finished upgrade, starts fresh.
 #[test]
 fn a_newer_build_landing_in_a_rest_keeps_the_process_s_history() {
     let running = Version::parse("2.1.283").expect("v");
@@ -19934,7 +19447,7 @@ fn a_newer_build_landing_in_a_rest_keeps_the_process_s_history() {
         ),
         (100, "no-resume", 2)
     );
-    // NEGATIVE CONTROLS: another process, and a finished upgrade.
+    // Negative controls: another process, and a finished upgrade.
     let next = St::for_target(
         Some(rested("A", gave_up)),
         &running,
@@ -19963,14 +19476,10 @@ fn a_newer_build_landing_in_a_rest_keeps_the_process_s_history() {
     );
 }
 
-/// TIER-1: `harness_upgrade_age_model` (aterm-spec) on EVERY reachable state
-/// and EVERY action it enables, against the real code: the record's age
-/// carried or begun again by [`St::for_target`] (the process named by its
-/// kernel start), closed by [`forget_settled_pending`] when the session runs
-/// the build it was moving to, and judged by the owner's view
-/// ([`rows`], `Row::stall`) — the state the model says results is the state
-/// the real code leaves. NEGATIVE CONTROL: the build that shipped is the
-/// model's `Buggy = 1`, whose `AgeIsThisProcess` breaks on a reachable state.
+/// Tier-1: `harness_upgrade_age_model` (aterm-spec) on every reachable state and enabled
+/// action against the real code ([`St::for_target`], [`forget_settled_pending`], the
+/// owner's view's `rows`). Negative control: the model's `Buggy = 1` breaks
+/// `AgeIsThisProcess`.
 #[test]
 fn the_real_age_conforms_to_the_age_model() {
     use aterm_spec::derive::harness_upgrade_age_model;
@@ -20003,8 +19512,7 @@ fn the_real_age_conforms_to_the_age_model() {
         })
     };
     let running = |s: &std::collections::BTreeMap<&'static str, i64>| {
-        // Where the holder stands: process 0 on 2.1.274; process 1 on 2.1.283
-        // (behind 2.1.284 when a newer build has landed).
+        // Where the holder stands, as `record` says.
         if s["proc"] == 0 {
             v("2.1.274")
         } else {
@@ -20105,8 +19613,8 @@ fn the_real_age_conforms_to_the_age_model() {
                 }
                 other => panic!("an action the bind does not drive: {other}"),
             };
-            // The buggy build is a different model; the real code must match
-            // the FIXED one (and `Visit`, absent in the buggy one, is driven).
+            // The real code must match the fixed model (`Visit`, absent from the buggy
+            // one, is driven too).
             assert_eq!(
                 (next["rec"], next["aged"], next["alarm"]),
                 real,
@@ -20119,8 +19627,7 @@ fn the_real_age_conforms_to_the_age_model() {
         std::collections::BTreeSet::from(["HandRestart", "Judge", "NewBuild", "Time", "Visit"]),
         "every action of the model is driven"
     );
-    // NEGATIVE CONTROL: the shipped build breaks the property on a state the
-    // walk reaches.
+    // Negative control: the model's buggy variant breaks the property on a reachable state.
     let buggy = interp::with_buggy(&model, 1);
     let mut b = buggy.init_state();
     for action in ["Time", "HandRestart", "NewBuild", "Judge"] {
@@ -20130,13 +19637,10 @@ fn the_real_age_conforms_to_the_age_model() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// A STOPPED UPGRADE RETARGETED KEEPS ITS MOVE CLOCK, THE OWNER'S WORD AND ITS
-/// STOP STREAK: otherwise a tab that gave up, rested and re-armed would have
-/// its `behind_since` reset by every vendor build, and an owner's `--defer`
-/// dropped, so the next point could announce inside it. NEGATIVE CONTROLS: a skip names its build and is not carried; a stopped round
-/// whose session has MOVED since (it runs another build than the one the
-/// round stopped on — `behind_anew`'s case) and a FINISHED upgrade each
-/// begin a new wait from now, their word and streak gone.
+/// A stopped upgrade retargeted keeps its move clock, the owner's word and its stop
+/// streak, so a re-armed tab's `behind_since` survives each new build and a `--defer`
+/// holds. Negative controls: a skip is of one build; a session moved since
+/// ([`behind_anew`]) or a finished upgrade begins again from now.
 #[test]
 fn a_stopped_upgrade_retargeted_keeps_its_clock_word_and_streak() {
     let from = Version::parse("2.1.280").expect("v");
@@ -20308,11 +19812,8 @@ fn a_reused_state_names_the_build_the_sweep_would_start_now() {
     }
 }
 
-/// The state directory is bounded: a settled upgrade of a conversation no live
-/// Claude holds goes once it has sat a week, and nothing else does: a live
-/// conversation, a fresh file, an announcement, a restart in flight, a request
-/// word, another agent's state, a file that is no state, and every file of a
-/// dry run all stay.
+/// [`prune_states`] removes a settled upgrade of a conversation no live Claude holds once
+/// it has sat [`STATE_KEEP_S`], and nothing else; a dry run removes nothing.
 #[test]
 fn settled_states_of_dead_conversations_are_pruned_after_a_week_and_nothing_else() {
     let dir = scratch("prune-states");
@@ -20388,9 +19889,8 @@ fn settled_states_of_dead_conversations_are_pruned_after_a_week_and_nothing_else
         models.exists(),
         "a file that is no state is not the prune's"
     );
-    // The explicit restart's stamps (review of 3eaa8f83c): no reader looks
-    // one up once its tab is gone; the prune removes it once stale, never
-    // while it stands.
+    // The explicit restart's stamps: no reader looks one up once its tab is gone, so the
+    // prune removes one once stale, never while it stands.
     let stamp_at = |at| super::super::restart_stamp::Stamp {
         pid: dead_pid(),
         start: "Thu Jan 1 00:00:00 1970".to_string(),
@@ -20414,6 +19914,179 @@ fn settled_states_of_dead_conversations_are_pruned_after_a_week_and_nothing_else
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A record of an agent this build has no lane for is a newer build's
+/// ([`upgrade::Agent::parse`]): every scan of the records passes it by and leaves its file as it
+/// lies (the load, the sweep's prunes, its orphan pass and limit hold, the host's carry and the
+/// continuation it owes, the owner's view and word, the watch). Each such record is the Codex
+/// record beside it, text for text but for its word, under a conversation's name, a tab's, and
+/// the Codex lane's own. Negative control: the same scans read the Codex records (and those
+/// that write, write them), and Claude Code's prune removes Claude's settled record.
+#[test]
+fn a_record_of_an_unknown_agent_is_passed_by_and_left_as_it_lies() {
+    use super::super::relaunch::{carry_restart, restarted};
+    const THEIRS: &str = "s-9e31a1c0ffee0000beef";
+    const CODEX: &str = "s-c0dec0dec0dec0dec0de";
+    let dir = scratch("unknown-agent");
+    let opts = Opts {
+        sock: None,
+        ..drive(&dir)
+    };
+    let in_tab = |tab: &str| Opts {
+        only_sid: Some(tab.to_string()),
+        ..opts.clone()
+    };
+    std::fs::create_dir_all(state_dir(&opts)).expect("state");
+    let now = now_s();
+    // The Codex TUI its `/exit` was typed into, gone.
+    let tui = dead_pid();
+    let codex = |tab: &str, phase: Phase| St {
+        agent: upgrade::Agent::Codex,
+        phase,
+        pid: tui,
+        tab: tab.to_string(),
+        from: "0.157.0".to_string(),
+        to: "0.157.1".to_string(),
+        source: "managed".to_string(),
+        ready_since: now - 10,
+        ..St::default()
+    };
+    // The Codex record's text under another word.
+    let worded = |st: &St, word: &str| {
+        let text = st.to_json();
+        let out = text.replace(r#""agent":"codex""#, &format!(r#""agent":"{word}""#));
+        assert_ne!(out, text, "the word is the record's");
+        out
+    };
+    let plant = |name: &str, text: &str| {
+        std::fs::write(state_path(&opts, name), text).expect("plant");
+    };
+    let mut theirs: Vec<(String, String)> = Vec::new();
+    let mut plant_theirs = |name: String, st: &St| {
+        let text = worded(st, "gemini");
+        plant(&name, &text);
+        theirs.push((name, text));
+    };
+    let codex_name = format!("codex-{CODEX}");
+
+    // Settled, a week old, no live conversation holding any, every tab gone.
+    let claude_done = "5d1c7f0e-2b8a-4c3d-9e6f-1a2b3c4d5e6f";
+    plant(claude_done, &worded(&codex(THEIRS, Phase::Done), ""));
+    plant_theirs(
+        "7a9e0d1b-3c4d-4e5f-8a9b-0c1d2e3f4a5b".to_string(),
+        &codex(THEIRS, Phase::Done),
+    );
+    plant_theirs(format!("codex-{THEIRS}"), &codex(THEIRS, Phase::Done));
+    plant(&codex_name, &codex(CODEX, Phase::Done).to_json());
+    // A restart in flight: relaunched, its continuation owed, its READY clock running.
+    let relaunched = Phase::Relaunched { at_s: now };
+    plant_theirs(
+        format!("gemini-{THEIRS}"),
+        &codex(THEIRS, relaunched.clone()),
+    );
+    let as_it_lies = |theirs: &[(String, String)]| {
+        for (name, text) in theirs {
+            let on_disk = std::fs::read_to_string(state_path(&opts, name)).ok();
+            assert_eq!(on_disk.as_deref(), Some(text.as_str()), "{name}");
+        }
+    };
+    for (name, _) in &theirs {
+        assert_eq!(load(&opts, name), None, "{name}");
+    }
+    assert_eq!(
+        load(&opts, claude_done).map(|st| st.agent),
+        Some(upgrade::Agent::Claude)
+    );
+    assert_eq!(
+        load(&opts, &codex_name).map(|st| st.agent),
+        Some(upgrade::Agent::Codex)
+    );
+    let week_on = now + STATE_KEEP_S + 60;
+    prune_states(&opts, &[], week_on);
+    assert!(
+        !state_path(&opts, claude_done).exists(),
+        "control: Claude Code's settled record is pruned"
+    );
+    codex::prune(&opts, week_on, |_| codex::TabLife::Gone);
+    assert!(
+        !state_path(&opts, &codex_name).exists(),
+        "control: the Codex lane's settled record is pruned"
+    );
+    as_it_lies(&theirs);
+
+    plant(&codex_name, &codex(CODEX, relaunched).to_json());
+    assert_eq!(in_flight(&opts), [codex_name.as_str()], "control");
+    // Claude Code's orphan pass: the Codex record is its own lane's.
+    let dry = Opts {
+        dry_run: true,
+        ..opts.clone()
+    };
+    let orphaned = orphans(&dry, &[], None);
+    assert!(orphaned.is_empty(), "{orphaned:?}");
+    let (mine, cdx) = (in_tab(THEIRS), in_tab(CODEX));
+    for lane in [upgrade::Agent::Codex, upgrade::Agent::Claude] {
+        assert!(!restarted(&mine, lane, Some(tui)));
+        assert_eq!(
+            carry_restart(&mine, lane, Some(tui)).step,
+            "refused:no-restart-in-flight"
+        );
+    }
+    assert!(!owed(&mine));
+    assert_eq!(resume(&mine).step, "current");
+    assert!(
+        restarted(&cdx, upgrade::Agent::Codex, Some(tui)),
+        "control: carried"
+    );
+    assert!(owed(&cdx), "control: its continuation owed");
+    as_it_lies(&theirs);
+    assert!(hold_clock(&mine, now + 600));
+    as_it_lies(&theirs);
+    assert!(hold_clock(&cdx, now + 600));
+    assert_eq!(
+        load(&opts, &codex_name).map(|st| st.ready_since),
+        Some(now + 600),
+        "control: the Codex record's clock is held"
+    );
+    let rows: Vec<String> = super::upgrade_status::rows(&opts)
+        .into_iter()
+        .map(|row| row.session)
+        .collect();
+    assert_eq!(rows, [codex_name.as_str()], "control: the owner's view");
+    let word = |tab: &str| {
+        super::upgrade_status::ask(&opts, tab, super::upgrade_status::Ask::Skip, false)
+            .expect_err("nothing to skip")
+    };
+    let refused = word(THEIRS);
+    assert!(refused.starts_with("no upgrade is recorded"), "{refused}");
+    let under_way = word(CODEX);
+    assert!(
+        under_way.contains("already under way"),
+        "control: {under_way}"
+    );
+    as_it_lies(&theirs);
+    let told = Watcher {
+        told: true,
+        ..Watcher::default()
+    };
+    let read = |o: &Opts| Report {
+        pid: 0,
+        tab: o.only_sid.clone().unwrap_or_default(),
+        session: "-".to_string(),
+        from: "-".to_string(),
+        to: "-".to_string(),
+        step: "wait:not-idle".to_string(),
+    };
+    let looked = |tab: &str| watch_with(&opts, tab, &told, now, &read);
+    assert_eq!(looked(THEIRS).skipped.as_deref(), Some("no-record"));
+    let control = looked(CODEX);
+    assert_ne!(
+        control.skipped.as_deref(),
+        Some("no-record"),
+        "control: {control:?}"
+    );
+    as_it_lies(&theirs);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// What a report says about waiting: a wait is recorded with Claude's status
 /// beside `not-idle` and keeps its start while it repeats; an act clears it;
 /// a skip or a dry run's `would-` changes nothing.
@@ -20432,7 +20105,7 @@ fn a_report_records_its_wait_and_an_act_clears_it() {
     st.note_step("announced:1", "idle", 250);
     assert!(st.wait.is_empty() && st.wait_since == 0);
     // The attended guard's wait is said once as `held-back:attended`, then
-    // `wait:attended`: ONE wait from its first sweep, never an act between.
+    // `wait:attended`: one wait from its first sweep, never an act between.
     st.note_step("held-back:attended", "idle", 300);
     assert_eq!((st.wait.as_str(), st.wait_since), ("attended", 300));
     assert_eq!(st.wait_seen, 300);
@@ -20516,8 +20189,8 @@ fn a_listed_model_replaces_every_launch_model_spelling() {
     );
     let kept = v(&["--model", "opus", "--resume", "ID"]);
     assert_eq!(with_model(kept.clone(), None), kept);
-    // An empty model DROPS the launch's (a bucket's way back to the default,
-    // D7): no `--model` at all, `--resume` still last.
+    // An empty model drops the launch's (a bucket's way back to the default): no `--model`,
+    // `--resume` still last.
     assert_eq!(
         with_model(
             v(&[
@@ -20555,15 +20228,9 @@ fn a_listed_model_replaces_every_launch_model_spelling() {
     );
 }
 
-/// The relaunch argv, end to end through the rule: a launch's argv, the model
-/// the conversation runs and what the build offers, made into the line the
-/// relaunch types by the same three calls the upgrade, the relaunch on exit
-/// and the restart in place make ([`upgrade::launch_model`],
-/// [`models::model_due`] over the seeded list, and [`line_for`], whose
-/// `with_model` puts the model in place of the launch's own). The first row:
-/// no `--model`, the transcript on Opus 5, the build's newest Opus 5.5; the
-/// line carries `--model claude-opus-5-5`, so the session does not come back
-/// on Opus 5.
+/// The relaunch argv end to end, by the calls the upgrade, the relaunch on exit and the
+/// restart in place make ([`upgrade::launch_model`], [`models::model_due`], [`line_for`])
+/// over a launch's argv, the conversation's model and what the build offers.
 #[test]
 fn the_relaunch_line_moves_the_model_within_its_family_first_and_keeps_the_rest() {
     const ID: &str = "446a0b3c-1979-414f-ae20-e06e26a2ef44";
@@ -20656,7 +20323,7 @@ fn the_relaunch_line_moves_the_model_within_its_family_first_and_keeps_the_rest(
             "claude-sonnet-5",
             &["--model", "claude-sonnet-5-5"],
         ),
-        // An ALIAS is kept verbatim: the build resolves it to its newest.
+        // An alias is kept verbatim: the build resolves it to its newest.
         (
             &["claude", "--model", "opus"],
             "claude-opus-5",
@@ -20673,14 +20340,14 @@ fn the_relaunch_line_moves_the_model_within_its_family_first_and_keeps_the_rest(
             "claude-opus-5",
             &["--model", "us.anthropic.claude-opus-5-v1:0"],
         ),
-        // Nothing newer of its family, and a Fable NOBODY chose: the list's
+        // Nothing newer of its family, and a Fable nobody chose: the list's
         // step moves it up to the Opus 5.5 ranked above it...
         (
             &["claude", "--verbose"],
             "claude-fable-5-1",
             &["--verbose", "--model", "claude-opus-5-5"],
         ),
-        // ...but a Fable the LAUNCH chose is never moved across families.
+        // ...but a Fable the launch chose is never moved across families.
         (
             &["claude", "--model", "claude-fable-5-1"],
             "claude-fable-5-1",
@@ -20714,14 +20381,10 @@ fn the_relaunch_line_moves_the_model_within_its_family_first_and_keeps_the_rest(
     );
 }
 
-/// A SAME-BUILD (model) restart the list no longer asks for is forgotten while
-/// nothing has begun, so neither the owner's view nor the tab's supervisor
-/// reads it PENDING for the rest of the conversation — and so is a pending
-/// record for a build the session now RUNS (the owner restarted it by hand),
-/// which is reported, so the ledger says so once.
-/// NEGATIVE CONTROLS: a build upgrade to a NEWER build, an announced record,
-/// a stopped round, a record that owes a release and a dry run keep their
-/// state.
+/// [`forget_settled_pending`] forgets a same-build (model) restart the list no longer asks
+/// for before it begins, and reports a pending record for the build the session now runs
+/// (reached by hand). Negative controls: a newer build, an announced or stopped round, an
+/// owed release and a dry run keep their state.
 #[test]
 fn an_unwanted_model_restart_is_forgotten_before_it_begins() {
     let dir = scratch("forget-model-restart");
@@ -20800,12 +20463,9 @@ fn an_unwanted_model_restart_is_forgotten_before_it_begins() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// The window's step answers with the tab's own word ([`pick`]): a Codex tab's
-/// pass also reports the daemon it runs on (`tab=-`), and the daemon's act
-/// never stands for the client's wait (a `daemon-updated` read as the tab's
-/// last word would leave its client unmoved until the next activation
-/// notice). A client that is current leaves the daemon's word; with nothing
-/// of the tab's, the first act, then the first wait.
+/// [`pick`] answers the window's step with the tab's own word, never its daemon's act: a
+/// Codex client's wait stands over `daemon-updated`. A current client leaves the daemon's
+/// word; with nothing of the tab's, the first act, then the first wait.
 #[test]
 fn the_windows_step_answers_with_the_tabs_own_word_before_its_daemons() {
     let report = |tab: &str, step: &str| Report {
@@ -20856,14 +20516,9 @@ fn the_windows_step_answers_with_the_tabs_own_word_before_its_daemons() {
     assert_eq!(words(&[report(tab, "current")]), None);
 }
 
-/// The notice at a break of the agent's own background work, at the drive: a
-/// Claude Code whose own status is `busy` (its turn over, a workflow it waits
-/// on) is announced to when the window's host takes the step at the break
-/// (`Opts::background`), on a screen that has just moved (the loop's settle
-/// stands for it). Then, within the re-ask interval, nothing more there: the
-/// step waits `background`, typing and ending nothing. (The re-ask a whole
-/// `REASK_S` later is the reducer's, pinned in `upgrade_tests`.) Negative
-/// control: the same busy session at an idle point's step waits `not-idle`.
+/// A busy Claude Code (its turn over, waiting on a workflow) is announced to once at a
+/// break (`Opts::background`), then waits `background` within the re-ask interval, ending
+/// nothing. Negative control: the same session at an idle point's step waits `not-idle`.
 #[cfg(unix)]
 #[test]
 fn a_break_of_background_work_takes_a_notice_and_ends_nothing() {
@@ -20922,12 +20577,9 @@ fn set_status(h: &mut Parked, status: &str) {
     assert_eq!(h.sf.status, status);
 }
 
-/// `h`'s record as THIS build writes it: naming the stand-in agent's own
-/// process ([`St::proc_start`]). A record that names none is an older
-/// build's, and the age it carries from before the process began is
-/// repaired to the process's start at the next look (`St::retarget`'s first
-/// arm) once a new round's salt is past it — so a rig whose agent has been
-/// behind for an hour names the agent the hour belongs to.
+/// Stamps `h`'s record with its agent's process start ([`St::proc_start`]), as this build
+/// writes it: a record naming none is an older build's, whose age is repaired to the
+/// process's start at the next look.
 #[cfg(unix)]
 fn own_record(h: &Parked) {
     let mut st = load(&h.opts, SESSION).expect("state");
@@ -20969,13 +20621,9 @@ fn asked_then_answered(h: &Parked, marker: &str, text: &str) {
     .expect("transcript");
 }
 
-/// THE QUIET UPGRADE RELEASES THE AGENT AN OLDER BUILD TOLD TO WIND DOWN:
-/// `Announced{asks:3}` written by an older build three days ago, Claude's
-/// status `shell`, two widowed shells under it that never end — every screen
-/// a break. Under the default (`upgrade_ask = false`) the round gives up at
-/// the break and types its ONE release in the same visit — worded for the
-/// quiet flow, promising no ask before a later restart — then rests (`wait:failed`). Nothing is ended. NEGATIVE CONTROL: the same
-/// round inside its window waits `background` and types nothing.
+/// The quiet flow releases an agent an older build announced to: at a break past the
+/// window it gives up and types its one release, worded for the quiet flow, then rests
+/// (`wait:failed`); nothing is ended. Negative control: inside the window, `background`.
 #[cfg(unix)]
 #[test]
 fn a_quiet_round_an_older_build_announced_gives_up_and_releases_its_agent() {
@@ -21018,8 +20666,8 @@ fn a_quiet_round_an_older_build_announced_gives_up_and_releases_its_agent() {
     let kept = load(&h.opts, SESSION).expect("state");
     assert!(kept.release.is_empty(), "nothing owed: {kept:?}");
     assert_eq!(kept.phase, Phase::Failed(upgrade::GAVE_UP.to_string()));
-    // What the owner's row tells this give-up by (#4's review): its own work
-    // was seen — `Upgrade now` does not move it past that work.
+    // The owner's row tells this give-up by its work seen: `Upgrade now` does not move it
+    // past that work.
     assert!(kept.work_seen, "{kept:?}");
     assert!(
         !h.asked
@@ -21030,22 +20678,17 @@ fn a_quiet_round_an_older_build_announced_gives_up_and_releases_its_agent() {
         "nothing ended"
     );
     drop(h);
-    // NEGATIVE CONTROL: inside the notice's window.
+    // Negative control: inside the notice's window.
     let h = rig("quiet-announced-new", now_s() - 60);
     let shells = shells_under(&h);
     assert_eq!(h.visit_with(dead_pid(), &shells).step, "wait:background");
     assert!(h.typed().is_empty(), "{:?}", h.typed());
 }
 
-/// A QUIET PENDING ROUND TYPES THE RELEASE IT OWES WHERE ITS AGENT'S OWN WORK
-/// HOLDS THE RESTART: a notice reached this agent once and
-/// its round was abandoned since (here a retarget), so the agent was asked to
-/// wind down and is owed the line that releases it. The quiet flow types no
-/// notice, and its restart waits on shells that never end, so the release is
-/// the round's next act there (`released:retargeted`),
-/// and the round stays pending, its quiet restart still to come. NEGATIVE
-/// CONTROLS: a release owed to ANOTHER process is dropped, nothing typed; a
-/// round owing nothing types nothing.
+/// A quiet pending round owing a release (a notice reached this agent, its round abandoned
+/// since) types it where the agent's own work holds the restart (`released:retargeted`) and
+/// stays pending. Negative controls: a release owed to another process is dropped; owing
+/// nothing types nothing.
 #[cfg(unix)]
 #[test]
 fn a_quiet_pending_round_types_the_release_it_owes_where_work_holds_its_restart() {
@@ -21090,7 +20733,7 @@ fn a_quiet_pending_round_types_the_release_it_owes_where_work_holds_its_restart(
     assert_eq!(h.visit_with(dead_pid(), &shells).step, "wait:background");
     assert_eq!(h.typed().len(), 1, "once");
     drop(h);
-    // NEGATIVE CONTROLS.
+    // Negative controls.
     for (name, owed) in [
         ("quiet-owed-elsewhere", Some(false)),
         ("quiet-owes-nothing", None),
@@ -21106,17 +20749,10 @@ fn a_quiet_pending_round_types_the_release_it_owes_where_work_holds_its_restart(
     }
 }
 
-/// THE OWNER'S `--now` MOVES A QUIET SESSION WHOSE STATUS ONLY LAGS, ALL THE
-/// WAY TO THE SIGNAL: Claude's own `shell` left over an
-/// idle screen with nothing under the agent — an agent that finished, or
-/// asked its person something — holds the quiet restart (`status-stale`),
-/// since the quiet flow types nothing that would rewrite it. The quiet step
-/// reads that lag past on the owner's word, and so does the restart's last
-/// look before the signal: it takes the very status the look read past, unrewritten since, and the
-/// agent is ended (SIGTERM), nothing typed first. NEGATIVE CONTROLS: unasked,
-/// the status holds the restart at every look; the first look under the
-/// word shows no lag yet; and the last look's own reading
-/// ([`status_lets_signal`]) refuses a status rewritten since the look.
+/// The owner's `--now` moves a quiet session whose status only lags (`shell` over an idle
+/// screen, nothing under the agent) to its signal: the second look reads the lag past, and
+/// the last look takes that status only unrewritten ([`status_lets_signal`]). Negative
+/// controls: unasked it holds at every look; the first look under the word is no lag.
 #[cfg(unix)]
 #[test]
 fn the_owners_now_restarts_a_quiet_session_whose_status_only_lags() {
@@ -21207,16 +20843,10 @@ fn the_owners_now_restarts_a_quiet_session_whose_status_only_lags() {
     );
 }
 
-/// THE OWNER'S `--now` NEVER SIGNALS A TURN BEGUN SINCE THE LOOK OVER A
-/// LAGGING STATUS: where the quiet step reads past a status
-/// that only lags on the owner's word, the restart's last look takes the very
-/// status the look read, unrewritten since ([`status_lets_signal`]) — but a
-/// stale `busy` that Claude Code need not restamp when a turn begins (a
-/// background task's end that woke the agent) would pass that, so the last
-/// look and the re-read before the signal also ask the screen for the turn
-/// over ([`turn_over_shown`]): no busy footer, the reader at an
-/// idle point. NEGATIVE CONTROL: the same visits over a screen that stays
-/// idle end the agent (SIGTERM), nothing typed first.
+/// The owner's `--now` never signals a turn begun since the look over a lagging status: a
+/// stale `busy` need not be restamped when a turn begins, so the last look and the re-read
+/// before the signal also ask the screen for the turn over ([`turn_over_shown`]).
+/// Negative control: a screen that stays idle ends the agent (SIGTERM), nothing typed.
 #[cfg(unix)]
 #[test]
 fn the_owners_now_never_signals_a_turn_begun_since_the_look_over_a_lagging_status() {
@@ -21249,7 +20879,7 @@ fn the_owners_now_never_signals_a_turn_begun_since_the_look_over_a_lagging_statu
             .iter()
             .any(|l| l.contains(" signal "))
     };
-    // NEGATIVE CONTROL: the screen stays idle — ended, nothing typed.
+    // Negative control: the screen stays idle — ended, nothing typed.
     let mut h = rig("lag-turn-idle", None);
     let ended = h.reaped();
     let mut shell = tty_zsh();
@@ -21295,18 +20925,10 @@ fn the_owners_now_never_signals_a_turn_begun_since_the_look_over_a_lagging_statu
     }
 }
 
-/// THE RELEASE A GIVE-UP OWES IS TYPED AT A BREAK: a Claude Code
-/// whose own status reads `shell`, two shells under it that never end — every
-/// screen a break, no idle point ever. Its fourth notice's window runs out at
-/// a break: the upgrade gives up there, and in the same visit types the ONE
-/// release line it owes, on the ledger as `released:gave-up`; after it the
-/// upgrade's word is `wait:failed`, and nothing more is typed. Nothing is
-/// ended: the shells run on. THE LATE READY the shells outlive —
-/// the agent stopped for a restart a break never takes — is voided at the
-/// break past the drain and the agent released the same way, and so is one
-/// that work inside the agent's own process outlives (workflows it waits on,
-/// nothing under it). Negative control: an announced upgrade inside its
-/// window types nothing at a break.
+/// A give-up at a break types its one owed release (`released:gave-up`) in the same visit,
+/// then waits `wait:failed`; a late READY voided past the drain is released the same way,
+/// over shells or work inside the agent. Nothing is ended. Negative control: a notice
+/// inside its window types nothing (`wait:background`) and names its holders.
 #[cfg(unix)]
 #[test]
 fn a_give_up_at_a_break_types_the_release_it_owes() {
@@ -21389,11 +21011,8 @@ fn a_give_up_at_a_break_types_the_release_it_owes() {
     assert!(!signalled(&h), "nothing ended");
     drop(h);
 
-    // The late READY work inside the agent outlives: workflows the agent
-    // waits on (`✻ Waiting for 2 dynamic workflows`, Claude's status `busy`)
-    // run in its own process, so nothing runs under it. Past the drain the
-    // READY is voided at the break and the agent released, as over a shell,
-    // rather than waiting `background` on a restart the break never takes.
+    // The late READY that work inside the agent outlives (workflows it waits on, status
+    // `busy`, nothing under it): voided past the drain and released, as over a shell.
     let waiting = Answers {
         screen: waiting_screen(),
         ..Answers::default()
@@ -21454,12 +21073,10 @@ fn a_give_up_at_a_break_types_the_release_it_owes() {
     );
 }
 
-/// What holds the move is kept by start, not age ([`St::note_held`]): `ps` ages
-/// to the second, read at another second than the look's clock, so the same
-/// process keeps the start it had and its status row stays the same row at
-/// every look (the window is sent a row only when it changes). A process that
-/// is new under an old pid is its own. A step that acts clears it. Negative
-/// control: a look that waited on nothing running names nothing.
+/// [`St::note_held`] keeps what holds the move by start, not age: `ps` ages are whole
+/// seconds read off another clock, so the same process keeps its start and its status row
+/// (sent only when it changes). A new process under an old pid is its own; an act clears
+/// it, and a wait on nothing names nothing.
 #[test]
 fn what_holds_the_move_is_kept_by_its_start() {
     let zsh = |pid: u32, age_s: u64| upgrade::Held {
@@ -21504,15 +21121,10 @@ fn mid_turn_screen() -> String {
     )
 }
 
-/// Claude's status against an idle screen, through the real visit: a Claude
-/// Code whose idle screen draws no shell count, its own status `shell` over two
-/// shells that never end, is asked at its idle point: the first look waits
-/// `status-stale` (the status disagrees with the screen, named), the second
-/// types the notice, naming the shells; then the status view is told what
-/// holds the move, and nothing is ever ended. A status left `busy` over an
-/// idle screen and an empty process tree reads idle the same way. Negative
-/// control: the same shells under a turn still running (a foreground Bash
-/// call) never read an idle screen: `not-idle`, nothing typed.
+/// An idle screen over Claude Code's own work (status `shell` over two never-ending
+/// shells, or a stale `busy` over nothing) waits `status-stale` one look and is asked at
+/// its second, the notice naming the shells; nothing is ended. Negative control: a turn
+/// still running waits `not-idle`.
 #[cfg(unix)]
 #[test]
 fn an_idle_screen_over_claudes_own_work_is_asked_at_its_second_look() {
@@ -21543,7 +21155,7 @@ fn an_idle_screen_over_claudes_own_work_is_asked_at_its_second_look() {
     );
     drop(h);
 
-    // A STALE `busy` over an idle screen and nothing under the agent.
+    // A stale `busy` over an idle screen and nothing under the agent.
     let mut h = Parked::new("stale-busy", Answers::default(), settled(), 3600);
     set_status(&mut h, "busy");
     assert_eq!(h.visit().step, "wait:status-stale");
@@ -21568,15 +21180,10 @@ fn an_idle_screen_over_claudes_own_work_is_asked_at_its_second_look() {
     assert!(h.typed().is_empty(), "{:?}", h.typed());
 }
 
-/// The idle looks are one agent's, in a row: [`St::idle_looks`] counts the looks
-/// that read this process's screen idle, and the record carries it across
-/// visits keyed to the process it read, so an idle look of an old process
-/// (a gone notice's new holder, a record that followed the conversation to
-/// another tab) does not count toward the new one's lag and let the notice go
-/// on the new agent's first look, the one look [`upgrade::IDLE_LOOKS`] exists
-/// to refuse. The run is bounded in time ([`IDLE_RUN_GAP_S`]): a look older
-/// than that begins it again. Negative control: the new agent's own second
-/// look is its lag, and the notice goes.
+/// [`St::idle_looks`] counts one process's idle looks in a row, so an old process's idle
+/// look (a gone notice's new holder, a record that followed its conversation) never lets
+/// the notice go on a new agent's first look; a look older than [`IDLE_RUN_GAP_S`] starts
+/// the run again. Negative control: the new agent's own second look announces.
 #[cfg(unix)]
 #[test]
 fn an_idle_look_of_another_process_counts_toward_no_lag() {
@@ -21613,7 +21220,7 @@ fn an_idle_look_of_another_process_counts_toward_no_lag() {
     assert_eq!(late.visit().step, "announced:1", "in a row: its second");
 }
 
-// ---------------------------------------------------------------- D1: no task
+// ---------------------------------------------------------------- no task
 
 /// A user row the harness typed, as the E2E's transcripts hold one.
 #[cfg(unix)]
@@ -21621,14 +21228,10 @@ fn harness_row(text: &str) -> String {
     user_row(&format!("[aterm harness] {text}"))
 }
 
-/// Whether a conversation has a task, read on: nobody can say without a Claude
-/// home or with projects that cannot be listed; a home with no projects yet,
-/// and readable projects with no transcript, hold no message and no task; the harness's
-/// own turns, answered, are no task; a line caught half-written is read once
-/// whole; someone else's prompt is a task the moment it is whole (before its
-/// answer), and for good, and the next ask of the same conversation reads only
-/// what was written since. Two transcripts claiming the conversation: nobody
-/// can say. Negative control: another conversation is read from its own start.
+/// [`Tasked`] reads a conversation's task on from where its last read ended: no Claude
+/// home, unlistable projects, or two transcripts of the id say nothing; no projects or no
+/// transcript is no task, nor are the harness's own turns; a person's whole prompt is a
+/// task at once and for good; a half-written line is read once whole.
 #[cfg(unix)]
 #[test]
 fn whether_a_conversation_has_a_task_is_read_on_from_where_the_last_read_ended() {
@@ -21705,9 +21308,9 @@ fn whether_a_conversation_has_a_task_is_read_on_from_where_the_last_read_ended()
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A stand-in agent in [`TAB`] whose conversation holds `rows` — its state
-/// Pending on the newer build, its screen quiet an hour — and what a visit
-/// under `kernel` answers, the state it left, and every line typed.
+/// A stand-in agent in [`TAB`] whose conversation holds `rows` (Pending on the newer build,
+/// its screen quiet an hour): the visit's report under `kernel`, the state it left, and how
+/// many turns it typed.
 #[cfg(unix)]
 fn visit_holding(
     name: &str,
@@ -21718,11 +21321,9 @@ fn visit_holding(
     visit_seen(name, rows, dry_run, kernel, 77, None, None)
 }
 
-/// [`visit_holding`], the last look having seen the screen at `last_seq` an
-/// hour ago (the screen now reads `seq` 77), the tab's `status` saying
-/// `status` (`None`: nothing held, no agent verdict), and — `Some` — the
-/// tab's supervisor having ledgered those texts as typed
-/// ([`Opts::aterm_state`]; `None`: no ledger known).
+/// [`visit_holding`] with the last look an hour ago at `last_seq` (the screen now at `seq` 77),
+/// the tab's `status` reading `status` (`None`: nothing held, no agent verdict), and the tab's
+/// supervisor having ledgered `ledger` as typed ([`Opts::aterm_state`]; `None`: no ledger).
 #[cfg(unix)]
 fn visit_seen(
     name: &str,
@@ -21826,6 +21427,45 @@ fn visit_launched_env(
     seed: &dyn Fn(&Opts),
     env: &[String],
 ) -> (Report, Option<St>, Vec<String>) {
+    visit_launched_probed(
+        name,
+        rows,
+        dry_run,
+        kernel,
+        last_seq,
+        status,
+        ledger,
+        answers,
+        launch,
+        seed,
+        env,
+        |pid, start| ParkedProcess {
+            script: kernel,
+            pid,
+            start: Some(start),
+            background: Vec::new(),
+        },
+    )
+}
+
+/// The same visit with its last-look process reads injected (`make_kernel`), so the parked
+/// fixture and the last-look controls drive one real visit.
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn visit_launched_probed<K: Kernel>(
+    name: &str,
+    rows: &[String],
+    dry_run: bool,
+    kernel: &Script,
+    last_seq: u64,
+    status: Option<&str>,
+    ledger: Option<&[&str]>,
+    answers: Answers,
+    launch: &[&str],
+    seed: &dyn Fn(&Opts),
+    env: &[String],
+    make_kernel: impl FnOnce(u32, String) -> K,
+) -> (Report, Option<St>, Vec<String>) {
     use crate::supervise::approvals;
     let dir = scratch(name);
     let (sock, asked) = instance_with(&dir, answers);
@@ -21887,13 +21527,14 @@ fn visit_launched_env(
     let mut args = atpkg::caller_shell::process_args(agent.id()).expect("agent argv");
     args.argv.extend(launch.iter().map(|w| (*w).to_string()));
     args.env.extend(env.iter().cloned());
+    let stable = make_kernel(sf.pid, squash(&sf.proc_start));
     let r = visit_with_claim(
         &opts,
         &sf,
         files.as_deref(),
         &table,
         &newer(),
-        kernel,
+        &stable,
         Some(&args),
         None,
     );
@@ -21905,12 +21546,9 @@ fn visit_launched_env(
     (r, saved, asked)
 }
 
-/// An upgrade never announces to a conversation with no task: the notice would
-/// start a conversation nobody asked for. A fresh session, and one holding only
-/// the harness's own turns, is restarted afresh instead (`would-restart:fresh`).
-/// Negative controls: once a person's prompt was answered it is announced to
-/// (`would-announce`), and so is one whose first prompt is recorded and not
-/// answered yet (read as taskless, the fresh restart would end it in flight).
+/// A conversation with no task (fresh, or only the harness's own turns) is restarted
+/// afresh, never announced to. Negative controls: an answered prompt, or a first prompt
+/// recorded and not yet answered, is announced to.
 #[cfg(unix)]
 #[test]
 fn an_upgrade_restarts_a_conversation_with_no_task_afresh_and_announces_to_one_with_a_task() {
@@ -21936,17 +21574,9 @@ fn an_upgrade_restarts_a_conversation_with_no_task_afresh_and_announces_to_one_w
     }
 }
 
-/// A CLAUDE HOME WITH NO `projects/` HOLDS NO TRANSCRIPT (the real-Claude
-/// sweep of 2026-10-09, Claude Code 2.1.294 -> 2.1.295): Claude Code makes
-/// the directory with a home's first message, so an idle session nobody has
-/// asked anything in a fresh home — a new machine's first run, a new
-/// `CLAUDE_CONFIG_DIR` — has none. Read as "nobody can say", the quiet
-/// upgrade restarted it `--resume <id>`, Claude answered `No conversation
-/// found with session ID` and exited, and the tab was left without its
-/// agent; the ask flow typed its notice into the empty session. Both start
-/// it afresh. NEGATIVE CONTROL: projects that exist and cannot be read (a
-/// file in the directory's place) still say nothing, and the quiet move
-/// resumes, as before.
+/// A Claude home with no `projects/` holds no transcript (Claude Code makes it with the
+/// home's first message): both flows restart such a session afresh, never `--resume`.
+/// Negative control: projects that exist but cannot be read say nothing.
 #[cfg(unix)]
 #[test]
 fn an_upgrade_in_a_claude_home_with_no_projects_restarts_the_session_afresh() {
@@ -21981,7 +21611,7 @@ fn an_upgrade_in_a_claude_home_with_no_projects_restarts_the_session_afresh() {
     let (r, _, typed) = visit("no-projects-ask", false);
     assert_eq!(r.step, "would-restart:fresh", "ask: {r:?}");
     assert!(typed.iter().all(|l| !l.contains(" turn ")), "{typed:?}");
-    // NEGATIVE CONTROL: unreadable projects say nothing of a task.
+    // Negative control: unreadable projects say nothing of a task.
     let (r, _, _) = quietly(|| visit("unreadable-projects-quiet", true));
     assert_eq!(r.step, "would-restart", "{r:?}");
 }
@@ -22014,17 +21644,10 @@ impl Kernel for Racing<'_> {
     }
 }
 
-/// NO RESTART RESUMES A CONVERSATION WITH NO TRANSCRIPT, whatever its step
-/// read (`restart`'s guard; the review of the 2026-10-09 sweep fixes, which
-/// found it untested). The step reads the conversation tasked and takes the
-/// quiet restart, and the transcript is gone before the restart looks (a
-/// race: removed between the step's reads and the restart's). Typed
-/// `--resume`, Claude refuses that conversation and exits, and the tab is
-/// left with no agent. The restart starts it afresh instead: its line has no
-/// `--resume`, its record says so (`CAUSE_UPGRADE_FRESH`: the relaunch adopts
-/// the new process and carries nothing on), and its ledger row says
-/// `restarted afresh`. NEGATIVE CONTROL: the transcript still there, the same
-/// quiet restart resumes the conversation as it was.
+/// A restart never resumes a conversation whose transcript went after its step (Claude
+/// Code refuses that `--resume` and exits, leaving the tab without an agent): it restarts
+/// afresh (`CAUSE_UPGRADE_FRESH`, `restarted afresh`). Negative control: the transcript
+/// there, it resumes.
 #[cfg(unix)]
 #[test]
 fn a_restart_never_resumes_a_conversation_whose_transcript_went_after_its_step() {
@@ -22076,7 +21699,7 @@ fn a_restart_never_resumes_a_conversation_whose_transcript_went_after_its_step()
         terminated,
         ["SIGTERM (no task: restarted afresh, nothing typed or resumed)"]
     );
-    // NEGATIVE CONTROL: its transcript there, resumed as it was.
+    // Negative control: its transcript there, resumed as it was.
     let (st, terminated) = run("resume-kept", false);
     assert!(st.line.contains("'--resume'"), "{}", st.line);
     assert_eq!(st.cause, "");
@@ -22086,15 +21709,10 @@ fn a_restart_never_resumes_a_conversation_whose_transcript_went_after_its_step()
     );
 }
 
-/// The quiet upgrade at the driver (the default): a tasked conversation at a
-/// genuinely idle point is restarted with nothing typed before it
-/// (`would-restart`, never `would-announce`), and the line it plans resumes the
-/// conversation (`--resume`, the launch's flags). The person is told first:
-/// the round first seen behind at this very look waits `notice-shown`, and so
-/// does a conversation with no task. The run up to the signal keeps every last
-/// look: backgrounded under it, nothing is signalled and the round stays
-/// pending, nothing typed. The knob (`upgrade_ask = true`, every other test
-/// here): `would-announce` at the same point.
+/// The quiet upgrade (the default) restarts a tasked conversation at an idle point with
+/// nothing typed first, resuming it (`--resume`, the launch's flags); a round first seen
+/// behind at this look waits `notice-shown`. The knob (`upgrade_ask = true`, every other
+/// test here) announces instead.
 #[cfg(unix)]
 #[test]
 fn a_quiet_upgrade_restarts_an_idle_conversation_with_nothing_typed_first() {
@@ -22111,7 +21729,7 @@ fn a_quiet_upgrade_restarts_an_idle_conversation_with_nothing_typed_first() {
     let (r, _, typed) = quietly(|| visit_holding("quiet-idle", &asked, true, &kernel()));
     assert_eq!(r.step, "would-restart", "{r:?}");
     assert_eq!(typed, 0);
-    // THE KNOB: the notice, as before.
+    // The knob (`upgrade_ask`): the notice.
     let (r, _, _) = visit_holding("ask-idle", &asked, true, &kernel());
     assert_eq!(r.step, "would-announce", "{r:?}");
     // The person is told first: first seen behind at this look.
@@ -22162,15 +21780,9 @@ fn a_quiet_upgrade_restarts_an_idle_conversation_with_nothing_typed_first() {
     );
 }
 
-/// THE UPGRADE MOVES A SESSION ONTO A NEWER BUILD, NEVER ONTO ANOTHER
-/// ACCOUNT: the line it plans re-applies exactly the login the agent's own
-/// exec environment names — a session an account move relaunched under
-/// `work-2` comes back from the upgrade under `work-2`, where the tab's shell
-/// would have put it back on its own login. Read off the line the visit
-/// planned up to its signal (the stand-in's shell backgrounds it there), and
-/// kept as a fact on the record. NEGATIVE CONTROL: an agent whose
-/// environment names no login gets no such word, and no `login` on its
-/// record.
+/// The upgrade's relaunch line re-applies exactly the login the agent's exec environment
+/// names (an account move's `work-2` stays `work-2`), and the record keeps it. Negative
+/// control: no login in the environment, none on the line or the record.
 #[cfg(unix)]
 #[test]
 fn the_upgrades_own_relaunch_types_back_the_login_the_agent_runs_under() {
@@ -22218,7 +21830,7 @@ fn the_upgrades_own_relaunch_types_back_the_login_the_agent_runs_under() {
         named.line
     );
     assert_eq!(named.login.as_deref(), Some(""));
-    // NEGATIVE CONTROL.
+    // Negative control.
     let plain = run("upgrade-login-none", &[]);
     assert!(
         !plain.line.contains("CLAUDE_SECURESTORAGE_CONFIG_DIR") && plain.line.contains("--resume"),
@@ -22228,11 +21840,10 @@ fn the_upgrades_own_relaunch_types_back_the_login_the_agent_runs_under() {
     assert_eq!(plain.login, None);
 }
 
-/// A QUIET RESTART IS CARRIED ON WITH NOTHING ([`St::quiet`]): the agent was
-/// idle and no notice was typed, so the relaunched conversation — a
-/// tasked one — is `done:resumed`, said once, nothing typed; the tab's loop
-/// decides that point as if nothing had moved. NEGATIVE CONTROL: the same
-/// conversation after an announced restart (the knob's) is carried on.
+/// A quiet restart ([`St::quiet`]) and every account move (`relaunch::carried_quietly`)
+/// are carried on with nothing: `done:resumed`, said once, nothing typed, the point left
+/// to the tab's loop. Negative controls: an announced restart and a memory relaunch are
+/// carried on.
 #[cfg(unix)]
 #[test]
 fn a_quiet_restart_is_carried_on_with_nothing() {
@@ -22248,8 +21859,7 @@ fn a_quiet_restart_is_carried_on_with_nothing() {
     assert!(rig.typed().is_empty(), "nothing typed: {:?}", rig.typed());
     assert_eq!(st.phase, Phase::Done);
     assert!(st.outcome.contains("nothing typed"), "{}", st.outcome);
-    // Nothing waits for a model to confirm here: never "unconfirmed", which
-    // read as a check that failed on every default upgrade.
+    // Nothing waits for a model to confirm: never "unconfirmed", which reads as a failed check.
     assert!(
         st.outcome.contains("resumed while idle") && !st.outcome.contains("unconfirmed"),
         "{}",
@@ -22257,24 +21867,33 @@ fn a_quiet_restart_is_carried_on_with_nothing() {
     );
     assert_eq!(rig.details("done:resumed").len(), 1, "said once");
     assert!(!moved("done:resumed"), "the point still stands");
+    let rig = Rig::new("carry-account", &asked);
+    let mut st = rig.st.clone();
+    st.cause = "account:work-2".to_string();
+    assert!(!st.quiet);
+    let r = rig.carry_on_from(&mut st, MODEL_WAIT);
+    assert_eq!(r.step, "done:resumed", "{r:?}");
+    assert!(rig.typed().is_empty(), "nothing typed: {:?}", rig.typed());
+    assert!(st.outcome.contains("nothing typed"), "{}", st.outcome);
+    assert!(!typed("done:resumed"), "no turn of the host's to await");
+    // Negative controls.
     let rig = Rig::new("carry-announced", &asked);
     let mut st = rig.st.clone();
     let r = rig.carry_on_from(&mut st, MODEL_WAIT);
     assert_ne!(r.step, "done:resumed", "{r:?}");
     assert_eq!(rig.typed().len(), 1, "{r:?}");
+    let rig = Rig::new("carry-memory", &asked);
+    let mut st = rig.st.clone();
+    st.cause = super::super::relaunch::CAUSE_MEMORY.to_string();
+    let r = rig.carry_on_from(&mut st, MODEL_WAIT);
+    assert_eq!(r.step, "continued", "{r:?}");
+    assert_eq!(rig.typed().len(), 1, "{r:?}");
 }
 
-/// A pending round that still owes its agent a release is no quiet restart:
-/// the release says a notice reached the agent (abandoned since by a retarget,
-/// a `--defer`, a give-up re-armed), so it was asked to wind down and may have
-/// answered READY and stopped. Under the default the reducer restarts the
-/// pending round at the idle point; the restart is not quiet ([`St::quiet`]
-/// false, so its carry-on types the continuation), and it goes through the
-/// notice's own fence (the process the notice reached,
-/// [`St::notice_belongs_to`]) up to the last look before the signal, where the
-/// stand-in's shell backgrounds it and everything is put back, the release
-/// included. Negative controls: the same round owing nothing, and one owing a
-/// release to another process (void here), are quiet restarts.
+/// A pending round that still owes its agent a release is no quiet restart ([`St::quiet`]
+/// false): a notice reached that agent, which may have wound down. It goes through the
+/// notice's fence ([`St::notice_belongs_to`]) and, stopped at the last look, puts the
+/// release back. Negative controls: owing nothing, or owing another process, is quiet.
 #[cfg(unix)]
 #[test]
 fn a_pending_round_that_owes_its_agent_a_release_is_carried_on_not_quiet() {
@@ -22330,12 +21949,9 @@ fn a_pending_round_that_owes_its_agent_a_release_is_carried_on_not_quiet() {
     }
 }
 
-/// What the tab's own supervisor typed is no task: a record holding the
-/// harness's notice and the supervisor's own `keep going` and `answer_text`
-/// (unmarked, but in the tab's loop's ledger under [`Opts::aterm_state`]) is
-/// restarted afresh. Negative controls: the same record with no ledger known,
-/// and with a ledger of other words, is announced to (its `keep going` read as
-/// someone's).
+/// The tab's own supervisor's words (`keep going`, `answer_text`, found in its loop's
+/// ledger under [`Opts::aterm_state`]) are no task: such a record is restarted afresh.
+/// Negative controls: no ledger, or a ledger of other words, is announced to.
 #[cfg(unix)]
 #[test]
 fn what_the_tabs_own_supervisor_typed_is_no_task() {
@@ -22371,14 +21987,9 @@ fn what_the_tabs_own_supervisor_typed_is_no_task() {
     }
 }
 
-/// D1: WHAT THE TAB'S SUPERVISOR TYPED INTO ANOTHER CONVERSATION IS NO ROW
-/// OF THIS ONE. The ledger is the TAB's, kept across every conversation the
-/// tab has held: a person who begins a new conversation there with the
-/// loop's own words (`keep going`) has asked it something, and it is
-/// announced to and resumed — never restarted afresh, out of its tab, on the
-/// strength of a `keep going` the loop typed into an earlier conversation.
-/// Its control is [`what_the_tabs_own_supervisor_typed_is_no_task`]: the
-/// same words the loop typed as the row was recorded are its own.
+/// The tab's ledger spans every conversation it held: the loop's `keep going` in a new
+/// conversation, recorded at another time, is a person's, so it is announced to, never
+/// restarted afresh. Control: [`what_the_tabs_own_supervisor_typed_is_no_task`].
 #[cfg(unix)]
 #[test]
 fn the_loops_words_in_another_conversation_are_no_turn_of_this_one() {
@@ -22402,13 +22013,9 @@ fn the_loops_words_in_another_conversation_are_no_turn_of_this_one() {
     assert_eq!(typed, 0, "a dry run types nothing");
 }
 
-/// D1: THE FRESH RESTART IS THE UPGRADE'S RESTART WITHOUT THE NOTICE AND
-/// WITHOUT `--resume`: nothing is typed into the agent, the line it plans
-/// starts the newer build on the launch's flags alone, and every last look
-/// before the signal stands — here the agent is put in the background under
-/// it, so nothing is signalled and the state goes back to where it was (its
-/// cause with it: a later restart of a conversation that gained a task
-/// resumes it).
+/// The fresh restart is the upgrade's restart without the notice and without `--resume`:
+/// nothing typed, the newer build on the launch's flags alone, and every last look kept
+/// (here one backgrounds the agent, so nothing is signalled and the state goes back).
 #[cfg(unix)]
 #[test]
 fn a_fresh_restart_types_nothing_plans_no_resume_and_keeps_every_last_look() {
@@ -22430,13 +22037,9 @@ fn a_fresh_restart_types_nothing_plans_no_resume_and_keeps_every_last_look() {
     assert!(!saved.line.contains("--resume"), "afresh: {}", saved.line);
 }
 
-/// The upgrade resumes in the mode the pill shows: Claude writes its
-/// `permission-mode` row only when it re-appends its session metadata, not as
-/// the mode changes, so a session launched with
-/// `--dangerously-skip-permissions` and switched to auto still reads bypass in
-/// its transcript. The relaunch takes the mode the visit's look read off the
-/// tab's pill. Negative control: with no pill on the screen, the transcript's
-/// mode decides.
+/// The upgrade resumes in the mode the tab's pill shows: Claude Code writes its
+/// `permission-mode` row only when it re-appends session metadata, so the transcript can
+/// lag a mode change. Negative control: with no pill, the transcript's mode decides.
 #[cfg(unix)]
 #[test]
 fn an_upgrade_resumes_in_the_mode_the_pill_shows_not_the_transcripts_older_one() {
@@ -22524,11 +22127,8 @@ fn an_upgrade_resumes_in_the_mode_the_pill_shows_not_the_transcripts_older_one()
     }
 }
 
-/// The announcement is planned in the mode the pill shows: the notice is typed
-/// only once a relaunch line is planned, and that plan takes the look's pill,
-/// as the restart does (not the transcript's mode alone); the line planned is
-/// kept with the announcement. Negative control: with no pill on the screen,
-/// the transcript's bypass, the launch's own flags.
+/// The announcement plans its relaunch line in the mode the pill shows, as the restart
+/// does, and keeps the line. Negative control: no pill, the launch's own flags.
 #[cfg(unix)]
 #[test]
 fn an_announcement_is_planned_in_the_mode_the_pill_shows() {
@@ -22581,12 +22181,9 @@ fn an_announcement_is_planned_in_the_mode_the_pill_shows() {
     }
 }
 
-/// The upgrade carries a model chosen by hand: a session launched `--model
-/// claude-sonnet-5-5` and moved to Opus with `/model` (answered on Opus since)
-/// is relaunched asking for Opus when the list moves it to no model (its
-/// `model_list` empty), in the line its announcement plans and in the fresh
-/// restart's. Negative control: nobody's `/model` remembered: the launch's
-/// flags.
+/// A model chosen by hand (`/model`, answered on since) rides the relaunch line when the
+/// list moves none, in the announcement's plan and the fresh restart's. Negative control:
+/// no `/model` remembered keeps the launch's flags.
 #[cfg(unix)]
 #[test]
 fn an_upgrade_carries_a_model_chosen_by_hand_when_the_list_moves_none() {
@@ -22642,14 +22239,9 @@ fn an_upgrade_carries_a_model_chosen_by_hand_when_the_list_moves_none() {
     }
 }
 
-/// The upgrade's restart makes a hand choice it carries the fallback's origin:
-/// a session on a bucket's fallback (`--model claude-sonnet-5-5`, launched on
-/// Fable), moved to Opus with `/model` since, is relaunched asking for Opus,
-/// and once the signal is sent the saved record names Opus as the origin, so
-/// the way back at the bucket's reset does not put Fable over it. Negative
-/// controls: nobody's `/model`: Fable carried; a restart that stops short of
-/// its signal (the job moved before it, the server refused it) leaves the
-/// origin as it was.
+/// A hand `/model` choice on a bucket's fallback is relaunched and, once the signal is
+/// sent, saved as the fallback's origin, so the way back does not undo it. Negative
+/// controls: no `/model` keeps the old origin; a restart stopped before its signal leaves it.
 #[cfg(unix)]
 #[test]
 fn an_upgrade_restart_makes_the_hand_choice_it_carries_the_fallbacks_origin() {
@@ -22755,14 +22347,77 @@ fn an_upgrade_restart_makes_the_hand_choice_it_carries_the_fallbacks_origin() {
     });
 }
 
-/// A restart holds the tab from its last look ([`Hand`]): a fresh restart can
-/// fire the moment an orchestrator's `await agent idle` returns, and a first
-/// prompt sent to the bare shell before the relaunch line would run as a
-/// command line. The hand is taken before the last look and every read of that
-/// look comes after it; a look that then stops the restart (here the agent put
-/// in the background under it) gives it back, nothing signalled. Negative
-/// control: another driver's live lease on the tab is theirs: the restart
-/// waits `held`, reads no last look, signals and releases nothing.
+/// Unknown process identity, running background work or an unreadable process table vetoes the
+/// restart's last look (`wait:changed`), while the same fixture with stable facts reaches the
+/// fake signal's refusal (`wait:signal-held`). No probe failure becomes leave to signal or
+/// moves the fallback origin.
+#[cfg(unix)]
+#[test]
+fn the_restart_last_look_keeps_unknown_identity_and_background_work_fenced() {
+    let shell = dead_pid();
+    for (name, known, background, expected) in [
+        ("last-look-stable", true, Vec::new(), "wait:signal-held"),
+        ("last-look-unknown", false, Vec::new(), "wait:changed"),
+        (
+            "last-look-work",
+            true,
+            vec!["sh".to_string()],
+            "wait:changed",
+        ),
+        (
+            "last-look-unreadable",
+            true,
+            vec![UNREADABLE_TABLE.to_string()],
+            "wait:changed",
+        ),
+    ] {
+        let script = Script::new(shell, usize::MAX, None);
+        let (report, saved, asked) = visit_launched_probed(
+            name,
+            &[
+                harness_row("Claude Code 2.1.283 (managed) is installed"),
+                answer_at("claude-opus-5-5", "2099-01-01T00:00:00Z"),
+            ],
+            false,
+            &script,
+            77,
+            None,
+            None,
+            Answers {
+                signal: "ERR busy",
+                ..Answers::default()
+            },
+            &["--model", "claude-sonnet-5-5"],
+            &|opts| {
+                let mut st = load(opts, SESSION).expect("state");
+                st.fallback_from = Some("claude-fable-5-1".to_string());
+                save(opts, SESSION, &st);
+                chose_by_hand(opts, "claude-opus-5-5");
+            },
+            &[],
+            |pid, start| ParkedProcess {
+                script: &script,
+                pid,
+                start: known.then_some(start),
+                background,
+            },
+        );
+        assert_eq!(report.step, expected, "{name}: {report:?}");
+        assert_eq!(
+            asked.iter().any(|line| line.contains(" signal ")),
+            known && name == "last-look-stable",
+            "{name}: {asked:?}"
+        );
+        assert_eq!(
+            saved.expect("state").fallback_from.as_deref(),
+            Some("claude-fable-5-1")
+        );
+    }
+}
+
+/// A restart takes the tab's hand ([`Hand`]) before its last look, so a first prompt sent to
+/// the bare shell cannot run as a command line, and gives it back when that look stops it.
+/// Negative control: another driver's live lease waits `held`, reading and signalling nothing.
 #[cfg(unix)]
 #[test]
 fn a_restart_holds_the_tab_from_its_last_look_and_gives_it_back_when_it_stops() {
@@ -22829,15 +22484,10 @@ fn a_restart_holds_the_tab_from_its_last_look_and_gives_it_back_when_it_stops() 
     assert!(!asked.iter().any(|l| l.ends_with(&release)), "{asked:#?}");
 }
 
-/// The last look and the signal: between the restart's first look (under its
-/// hand) and the signal the state is written, and a person who keys the tab
-/// then (`human_ms` inside the grace), or a prompt sent then and not read yet
-/// (`input=pending`), is seen by the last look: nothing is signalled, the
-/// state goes back, the hand is given back. The signal itself is the last
-/// word, one server decision (`signal term pid=<p> quiet=<grace>`): a
-/// keystroke after the last look refuses it (`ERR busy person …`), a wait, the
-/// state back, the hand given back. Negative control: the same restart with
-/// nothing arriving sends the signal, `quiet=` the grace.
+/// A key (`human_ms` inside the grace) or an unread prompt (`input=pending`) after the
+/// restart's first look stops it before its signal, state and hand given back. The signal
+/// itself is one server decision (`signal term pid=<p> quiet=<grace>`) that a later
+/// keystroke refuses (`wait:signal-held`).
 #[cfg(unix)]
 #[test]
 fn a_key_or_a_prompt_after_the_first_look_stops_the_restart_before_its_signal() {
@@ -22897,15 +22547,8 @@ fn a_key_or_a_prompt_after_the_first_look_stops_the_restart_before_its_signal() 
     );
 }
 
-/// A SIGNAL NEVER SENT ASKED NOTHING: an announced
-/// round whose notice carried `claude-opus-5-5` is READY'd, and its restart
-/// records the ask before its one act; the signal then refused (a keystroke
-/// after the last look), the ask is TAKEN BACK and the one it replaced — an
-/// earlier ask of the harness's, still settling — stands again, time and all.
-/// Kept, it settled as FAILED [`models::MODEL_SETTLE_S`] later though nothing
-/// relaunched: the model lost to the conversation for good, and to the very
-/// round whose READY the refusal left standing (the ride's guard). The ask
-/// kept is the negative control of `ModelRecord::take_back`'s unit test.
+/// A refused signal takes back the model ask its restart recorded, and the earlier ask it
+/// replaced stands again, time and all; kept, it would settle failed with nothing relaunched.
 #[cfg(unix)]
 #[test]
 fn a_refused_signal_takes_back_the_model_it_asked() {
@@ -23000,19 +22643,10 @@ fn a_refused_signal_takes_back_the_model_it_asked() {
     );
 }
 
-/// A MODEL IS ASKED ONLY BY THE LINE THAT ASKS IT: the restart
-/// in place (Claude Code's critical-memory banner, aterm's memory ceiling)
-/// rides a due model — the conversation answers on Opus 5 and Opus 5.5 is
-/// offered — and the conversation's record names it asked only once the
-/// relaunch line carrying it is typed. The signal refused (a person's key
-/// after the last look), or sent with its line never typed (the tab not
-/// proven the shell's: a wait, which a stale exit later ends), no relaunch
-/// asked the model, and the record is as it was. Written before the signal,
-/// the ask settled FAILED ten minutes later though nothing relaunched: a
-/// `model-failed` row, the model barred from the conversation for good, and a
-/// person's own later `--model` of it dropped from every relaunch line.
-/// NEGATIVE CONTROL: the line typed at the shell the roster names holding the
-/// tab records the ask.
+/// The restart in place records a model ask only once the relaunch line carrying it is
+/// typed (an ask recorded with no line would settle failed and bar the model): a refused
+/// signal, or one whose line is never typed, leaves the record as it was. Negative
+/// control: the line typed at the shell the roster names records the ask.
 #[cfg(unix)]
 #[test]
 fn a_restart_in_place_records_its_model_ask_only_with_the_line_that_asks_it() {
@@ -23054,6 +22688,7 @@ fn a_restart_in_place_records_its_model_ask_only_with_the_line_that_asks_it() {
         )
         .expect("catalog");
         let snap = Snapshot {
+            stored_login: false,
             tab: TAB.to_string(),
             pid,
             start: kernel_start(pid).expect("lstart"),
@@ -23090,9 +22725,8 @@ fn a_restart_in_place_records_its_model_ask_only_with_the_line_that_asks_it() {
         };
         let mut r = restart();
         if let Some(ended) = &ended {
-            // The stand-in's agent is this test's child, alive to `kill(0)`
-            // until reaped: the relaunch is carried on, as the host's next
-            // idle point carries it, once it surely is.
+            // The stand-in is this test's child, alive to `kill(0)` until reaped: carry the
+            // relaunch on, as the host's next idle point would, once it is.
             assert!(
                 ended.recv_timeout(HANG_DETECTOR).is_ok(),
                 "{name}: the agent ended"
@@ -23138,8 +22772,7 @@ fn a_restart_in_place_records_its_model_ask_only_with_the_line_that_asks_it() {
             );
         }),
         Box::new(move || {
-            // NEGATIVE CONTROL: the line typed asks the model, and the record
-            // says so.
+            // Negative control: the typed line asks the model, and the record says so.
             let (r, record, typed) = case("ask-typed", "", true);
             assert_eq!(typed, 1, "{r:?}");
             assert_eq!(record.set, "claude-opus-5-5", "{r:?} {record:?}");
@@ -23154,12 +22787,9 @@ fn at_in(asked: &[String], needle: &str) -> Option<usize> {
     asked.iter().position(|l| l.ends_with(needle))
 }
 
-/// A conversation with no task is carried on with nothing: a carry-on
-/// ("Continue where you left off … decide for yourself") typed into one would
-/// start a conversation nobody asked for. A relaunched conversation whose
-/// record holds only the harness's own turns is done (`done:taskless`, said
-/// once in the ledger) and nothing is typed. Negative control: one a person
-/// asked something is carried on.
+/// A relaunched conversation whose record holds only the harness's own turns is done
+/// (`done:taskless`, said once) and nothing is typed. Negative control: a tasked one is
+/// carried on.
 #[cfg(unix)]
 #[test]
 fn a_conversation_with_no_task_is_carried_on_with_nothing() {
@@ -23189,15 +22819,10 @@ fn a_conversation_with_no_task_is_carried_on_with_nothing() {
     assert_eq!(rig.typed().len(), 1, "{r:?}");
 }
 
-/// The settle is the agent's verdict's, not the screen's: counted from the
-/// look that first saw a new screen `seq`, a dim `❯ continue` suggestion drawn
-/// between two looks would restart it. It is how long the server's own verdict
-/// has said the agent's turn is over (`status agent=idle agent_since_ms=`): a
-/// screen that moved since the last look, with the agent idle 30 s, is
-/// announced to at once. Negative controls: the agent idle only 5 s, or busy,
-/// waits `settling`; and a server that publishes no verdict, or one with no
-/// evidence (`unknown`), is measured by the looks' samples: a moved screen
-/// waits.
+/// The settle counts how long the server's own verdict has said the agent's turn is over
+/// (`status agent=idle agent_since_ms=`), not since a new screen `seq`, which a repainted
+/// dim suggestion would restart. Negative controls: idle 5 s, busy, no verdict, or
+/// `unknown` over a moved screen wait `settling`.
 #[cfg(unix)]
 #[test]
 fn the_settle_is_measured_from_the_agents_verdict_not_from_a_repaint() {
@@ -23243,18 +22868,9 @@ fn the_settle_is_measured_from_the_agents_verdict_not_from_a_repaint() {
     }
 }
 
-/// A TURN THE HARNESS TYPES RETURNS ONCE ITS SUBMIT IS TAKEN, NOT WHEN THE
-/// AGENT'S ANSWER IS OVER: the step is taken in the session's loop while the
-/// loop is still, and an answer that ended inside the step would go unseen by
-/// the loop. Here the stand-in agent answers for two minutes
-/// after every submit: the carry-on and the notice each return inside a
-/// minute's hang detector, asked `idle=1 timeout=10000` ([`TURN_WAIT`]; the
-/// stand-in names no `cap=`, so the notice is pasted — a pressed one's
-/// timeout grows with its keys, [`turn_wait`], and returns alike) — a
-/// step that waited the answer out is told from one that did not whatever
-/// the machine's load. Negative control: a turn asked to settle on quiet
-/// waits the answer out (a stand-in answering for 1 s, so the
-/// control costs a second, not minutes).
+/// A turn the harness types returns once its submit is taken, not when the answer ends:
+/// the step runs while the loop is still, so an answer ending inside it would go unseen.
+/// Negative control: a turn asked to settle on quiet waits the answer out.
 #[cfg(unix)]
 #[test]
 fn a_typed_turn_returns_once_its_submit_is_taken_not_after_the_answer() {
@@ -23279,13 +22895,11 @@ fn a_typed_turn_returns_once_its_submit_is_taken_not_after_the_answer() {
     assert!(typed[0].contains(&format!(" {TURN_WAIT} ")), "{typed:?}");
     assert!(took < HANG, "the carry-on waited the answer out: {took:?}");
     drop(rig);
-    // Negative control: the old settle waits the stand-in's answer out. The
-    // answer's length is the stand-in's own, not the product's, and the
-    // control holds for any: the stand-in sleeps it before it replies, so the
-    // turn cannot return sooner at any load.
+    // Negative control: a turn that settles on quiet waits the stand-in's answer out; the
+    // stand-in sleeps before it replies, so no load returns it sooner.
     let answer = Duration::from_secs(1);
     let dir = scratch("turn-wait-control");
-    let (sock, _) = instance_with(&dir, answers(answer));
+    let (sock, _asked) = instance_with(&dir, answers(answer));
     let opts = Opts {
         sock: Some(sock),
         ..drive(&dir)
@@ -23330,12 +22944,8 @@ fn a_typed_turn_returns_once_its_submit_is_taken_not_after_the_answer() {
 #[path = "upgrade_stall_tests.rs"]
 mod stall;
 
-/// A stop that repeats rests longer, never for good: the same reason in a row
-/// stretches the rest (RETRY_S, then twice, then four times as long, no
-/// longer), so a relaunch that never comes up is not re-asked, re-signalled
-/// and left dead every RETRY_S. A different reason starts the streak over, and
-/// the rest still ends: the round re-arms. Negative control: the first stop
-/// rests exactly RETRY_S.
+/// A stop that repeats rests longer, never for good: the same reason in a row doubles the
+/// rest up to four times `RETRY_S`; a new reason starts over, and the rest still ends.
 #[test]
 fn a_stop_that_repeats_rests_longer_and_never_for_good() {
     let now = 1_000_000;
@@ -23388,17 +22998,10 @@ mod login_wall;
 #[path = "upgrade_watch_tests.rs"]
 mod watch;
 
-/// The end of the agent's own work re-arms a round that gave up and asks in
-/// the same visit: a round that asked at breaks of a workflow, each answered
-/// "not yet", gave up and rested. Here the record as it rests (gave up an hour
-/// ago, the agent's work seen since its latest notice, `St::work_seen`) meets
-/// an idle point with nothing under the agent: the round is re-armed
-/// (`rearmed:unanswered`, in the ledger) and its first notice typed in the
-/// same visit (`announced:1`), so the loop never has the point in between; the
-/// stamp is spent with the notice. An announced round there asks again at
-/// once. Negative controls: the same record with no work seen rests
-/// (`wait:failed`), and the announced one waits for its answer
-/// (`wait:awaiting-ready`).
+/// The end of the agent's own work re-arms a given-up round (`rearmed:unanswered`) and
+/// types its first notice in the same visit; an announced round there asks again at once.
+/// Negative controls: with no work seen a given-up round rests and an announced one waits
+/// for its answer, as it does inside the floor or past the day's budget.
 #[cfg(unix)]
 #[test]
 fn the_end_of_the_agents_work_re_arms_and_asks_in_the_same_visit() {
@@ -23475,12 +23078,9 @@ fn the_end_of_the_agents_work_re_arms_and_asks_in_the_same_visit() {
     }
 }
 
-/// THE OWNER'S WORD OUTLIVES THE BUILD IT WAS PRESSED ON: `Not today` is a `--defer` on the SESSION, and the retarget arm
-/// carries it to the next build. A record closed because its session reached
-/// its build by hand ([`forget_settled_pending`]) must not take the word with
-/// it, or the next build's record begins with none and a notice is typed
-/// inside the owner's snooze. A record holding a word still in force is kept;
-/// a spent one is closed.
+/// `Not today` is a `--defer` on the session, carried to the next build by the retarget
+/// arm: closing a record its session reached by hand ([`forget_settled_pending`]) keeps a
+/// word still in force and closes a spent one.
 #[test]
 fn closing_a_reached_pending_record_keeps_the_owners_defer() {
     let dir = scratch("rv-defer");
@@ -23514,7 +23114,7 @@ fn closing_a_reached_pending_record_keeps_the_owners_defer() {
         "the snooze holds for the next build: {:?}",
         next.request
     );
-    // NEGATIVE CONTROLS: a spent defer and no word at all close the record.
+    // Negative controls: a spent defer and no word at all close the record.
     for request in [Request::DeferUntil(1), Request::None] {
         let spent = record(request);
         save(&opts, SESSION, &spent);
@@ -23523,13 +23123,9 @@ fn closing_a_reached_pending_record_keeps_the_owners_defer() {
     }
 }
 
-/// A CALLER THAT NAMES NO PROCESS GETS THE BUILD TEST, which cannot tell a
-/// session the owner restarted by hand onto the SAME build from the process
-/// the record was minted for: so every
-/// caller that retargets names its process — the visit from the session file
-/// it holds; any later caller (a timer that retargets off a point) must read
-/// the session file too, and retarget nothing when it cannot. Only the Codex
-/// lane, whose conversation is its daemon's, passes none.
+/// A caller that names no process gets the build test, which cannot tell a same-build
+/// restart by hand from the record's process: every retargeting caller names its process,
+/// except the Codex lane, whose conversation is its daemon's.
 #[test]
 fn an_unnamed_process_falls_back_to_the_build_test() {
     let running = Version::parse("2.1.283").expect("v");
@@ -23590,12 +23186,9 @@ fn cadence_facts() -> Facts {
     }
 }
 
-/// THE END OF THE AGENT'S OWN WORK ASKS NO SOONER THAN ITS FLOOR AND NO MORE THAN
-/// ITS BUDGET: the ask it leads to is exempt
-/// from the round's ask cap and clock, so the driver bounds the FACT — ten
-/// minutes after the latest notice (for a resting round, after its rest began),
-/// six a day. NEGATIVE CONTROLS: the same record outside the bounds reads the
-/// end of the work.
+/// The work-end ask is exempt from the round's ask cap and clock, so the driver bounds the
+/// fact: no sooner than [`upgrade::WORK_END_FLOOR_S`] after the latest notice (or the rest's
+/// start), at most [`upgrade::WORK_END_DAILY`] in a rolling day.
 #[test]
 fn the_end_of_the_work_asks_no_sooner_than_its_floor_and_no_more_than_its_budget() {
     let now = 1_790_645_000;
@@ -23640,8 +23233,8 @@ fn the_end_of_the_work_asks_no_sooner_than_its_floor_and_no_more_than_its_budget
         failed_at: now + 3_600,
         ..resting(0)
     }));
-    // A repeated stop's longer rest counts from the STOP: `failed_at` sits
-    // the ladder past it, and the end of the agent's work asks at once.
+    // A repeated stop's longer rest counts from the stop: `failed_at` sits the ladder past
+    // it, and the end of the agent's work asks at once.
     let declined = |stopped_ago: u64, streak: u32| {
         let mut st = St {
             phase: Phase::Failed(upgrade::GAVE_UP.to_string()),
@@ -23677,7 +23270,7 @@ fn the_end_of_the_work_asks_no_sooner_than_its_floor_and_no_more_than_its_budget
         upgrade::WORK_END_DAILY,
         "a day on the budget is whole again"
     );
-    // A ROLLING window: the asks age out one at a time.
+    // A rolling window: the asks age out one at a time.
     let mut rolling = St::default();
     for k in 0..u64::from(upgrade::WORK_END_DAILY) {
         rolling.spend_work_end(now + k * 3_600);
@@ -23693,11 +23286,9 @@ fn the_end_of_the_work_asks_no_sooner_than_its_floor_and_no_more_than_its_budget
     assert_eq!(again.work_end_at, st.work_end_at);
 }
 
-/// The notices a round-after-round declining agent is asked in `hours`, by the
-/// real reducer and the real record transitions: after every notice its work
-/// runs for `job_s` seconds (a job under the agent, seen by the looks) and ends,
-/// and it answers "not yet" each time. Looks are a minute apart. `Some(t)`
-/// for every notice's second.
+/// The seconds at which an agent that declines every notice is asked over `hours`, by the
+/// real reducer and record transitions: after each notice a job runs under it for `job_s`
+/// seconds, then ends. Looks are a minute apart.
 fn declined_notices(hours: u64, job_s: u64) -> Vec<u64> {
     let t0 = 1_790_000_000;
     let to = Version::parse("2.1.284").expect("v");
@@ -23743,16 +23334,10 @@ fn declined_notices(hours: u64, job_s: u64) -> Vec<u64> {
     notices
 }
 
-/// A SESSION THAT KEEPS STARTING AND ENDING WORK IS ASKED A BOUNDED NUMBER OF
-/// TIMES A DAY: the ask at the end of the agent's work is exempt from the ask
-/// cap, and each is a full model turn on the owner's whole context. The
-/// adversary declines every notice and starts a short job after each. The
-/// notices in ANY 24 hours stay within what the ladder allows: at most three
-/// rounds of [`upgrade::MAX_ASKS`] (rests of 2 h and 4 h between them, the
-/// third round's rest 8 h, then a day) and the day's budget of asks at the end
-/// of its work, one more for the round's first; and from the third day, with
-/// the rest a day long, one round's worth. NEGATIVE CONTROL (mutation-checked):
-/// without the budget the same agent is asked in every gap between its jobs.
+/// A session that keeps starting and ending work is asked a bounded number of times a
+/// day: the work-end ask is exempt from the ask cap, so in any 24 h the notices stay within
+/// three rounds of [`upgrade::MAX_ASKS`] plus the day's work-end budget (one round's worth
+/// from the third day). Negative control: without the budget it is asked in every gap.
 #[test]
 fn a_declining_agent_is_asked_a_bounded_number_of_times_a_day() {
     let day = 86_400;
@@ -23790,27 +23375,10 @@ fn a_declining_agent_is_asked_a_bounded_number_of_times_a_day() {
     }
 }
 
-// ---------------------------------------------------------------- tab 1's real shape
-
-/// THE ASK AT THE END OF THE AGENT'S OWN WORK NEEDS NOTHING UNDER THE AGENT AND
-/// CLAUDE'S OWN STATUS IDLE. Tab 1's recorded shape: an announced round 15
-/// minutes past its latest notice, the agent's disk watcher — a bash and its
-/// zsh wrapper, five hours old — under it at every look, Claude's status
-/// `busy` and unchanged through two notices' replies, the work seen since the
-/// notice. Four points of one
-/// round, the end of the work asked exactly where both hold:
-///
-/// * the watcher under the agent, status busy: no ask (`awaiting-ready`, or
-///   the status' own wait) — tab 1;
-/// * the watcher gone, status BUSY (a `/goal` keeps Claude's status busy):
-///   no ask, the gate's wait (`status-stale`: the screen reads idle, the status
-///   does not, and the restart's gate never takes that lag for idle) — the work
-///   is gone and the status is not;
-/// * the watcher under the agent, status idle: no ask;
-/// * the watcher gone, status idle: THE NOTICE, at once.
-///
-/// So on a tab like tab 1 the end of the workflow alone asks nothing: the
-/// watcher must go and the goal must let Claude's status idle.
+/// The ask at the end of the agent's own work needs nothing under the agent and Claude's
+/// own status idle: of one announced round's four (watcher, status) points, only the
+/// watcher gone with status idle is asked (a busy status over an idle screen waits
+/// `status-stale`).
 #[cfg(unix)]
 #[test]
 fn tab_ones_recorded_shape_is_not_asked_until_nothing_runs_and_claude_idles() {
@@ -23854,306 +23422,6 @@ fn tab_ones_recorded_shape_is_not_asked_until_nothing_runs_and_claude_idles() {
     }
 }
 
-// ---------------------------------------------------- the typed-act guard
-
-/// What makes a function's typing aterm's own hand ([`Hand`]): it takes one
-/// (`Hand::take`, `take_or_none`), runs the act through [`under_hand`] or
-/// [`type_fenced`], or is given one by its caller (`&mut Hand`).
-const HAND_TOKENS: [&str; 5] = [
-    "Hand::take",
-    "take_or_none",
-    "type_fenced(",
-    "under_hand(",
-    "&mut Hand",
-];
-
-/// The calls that put text into an agent's composer or a shell's prompt.
-const TYPING_CALLS: [&str; 7] = [
-    "turn_fenced(",
-    "notice_fenced(",
-    "type_text(",
-    "type_line(",
-    "turn(",
-    // The keys the Codex lane sends into a composer (ctrl+u, esc, enter) and
-    // the clear that sends them: the presence layer reads a key as somebody
-    // driving the tab as it reads a turn.
-    "key_args(",
-    "composer_clear(",
-];
-
-/// The typing a hand-less function may contain, each with WHERE THE HAND IS
-/// TAKEN — a function in the same file that holds a [`HAND_TOKENS`] token
-/// (checked) and the call chain to it (read; said in the reason). An unleased
-/// `turn` is read by the window's presence layer as somebody driving the tab:
-/// a row is born and folded around it and the tab's PTY is re-gridded twice.
-/// A new typed act joins this
-/// list only with a reason that names whose hand it is under.
-const UNDER_ANOTHERS_HAND: [(&str, &str, &str, &str); 4] = [
-    (
-        "upgrade_drive.rs",
-        "turn",
-        "relaunch.rs:carry_on_once",
-        "the unfenced primitive: its one caller is the continuation's last resort \
-         (relaunch::type_continuation), itself inside carry_on_once's under_hand",
-    ),
-    (
-        "relaunch.rs",
-        "type_continuation",
-        "relaunch.rs:carry_on_once",
-        "called inside carry_on_once's under_hand (the caller's hand, else one for the typing)",
-    ),
-    (
-        "relaunch.rs",
-        "type_at_prompt",
-        "relaunch.rs:relaunch_held",
-        "the relaunch line: type_relaunch_line(_with) is called by relaunch_held under its \
-         `&mut Hand`, and by the Codex lane's relaunch_held under its own",
-    ),
-    (
-        "upgrade_codex_drive.rs",
-        "exit_typed",
-        "upgrade_codex_drive.rs:exit",
-        "its one caller, exit, takes the hand before the last look and gives it back where \
-         the /exit is not typed (the relaunch keeps it)",
-    ),
-];
-
-/// Each function of `src` (before its inline test module) as (name, body),
-/// the body's comment lines dropped. A function ends at the next `fn` line
-/// no deeper than it.
-fn functions_of(src: &str) -> Vec<(String, String)> {
-    let mut lines: Vec<&str> = src.lines().collect();
-    if let Some(at) = (0..lines.len().saturating_sub(1)).find(|&i| {
-        lines[i].trim() == "#[cfg(test)]"
-            && lines[i + 1].trim_end().ends_with('{')
-            && lines[i + 1].contains("mod ")
-    }) {
-        lines.truncate(at);
-    }
-    let head = |line: &str| -> Option<(usize, String)> {
-        let indent = line.len() - line.trim_start().len();
-        let mut rest = line.trim_start();
-        if let Some(after) = rest.strip_prefix("pub") {
-            rest = match after.strip_prefix('(') {
-                Some(inner) => inner.split_once(')')?.1.trim_start(),
-                None => after.trim_start(),
-            };
-        }
-        for word in ["const ", "async ", "unsafe "] {
-            rest = rest.strip_prefix(word).unwrap_or(rest);
-        }
-        let name = rest.strip_prefix("fn ")?;
-        let end = name.find(|c: char| !(c.is_alphanumeric() || c == '_'))?;
-        Some((indent, name[..end].to_string()))
-    };
-    let heads: Vec<(usize, usize, String)> = lines
-        .iter()
-        .enumerate()
-        .filter_map(|(i, l)| head(l).map(|(indent, name)| (i, indent, name)))
-        .collect();
-    heads
-        .iter()
-        .enumerate()
-        .map(|(n, (at, indent, name))| {
-            let end = heads[n + 1..]
-                .iter()
-                .find(|(_, deeper, _)| deeper <= indent)
-                .map_or(lines.len(), |(i, _, _)| *i);
-            let body: Vec<&str> = lines[*at..end]
-                .iter()
-                .copied()
-                .filter(|l| !l.trim_start().starts_with("//"))
-                .collect();
-            (name.clone(), body.join("\n"))
-        })
-        .collect()
-}
-
-/// Whether `body` calls one of [`TYPING_CALLS`] (a call, not its definition).
-fn types_text(body: &str) -> bool {
-    TYPING_CALLS.iter().any(|call| {
-        body.match_indices(call).any(|(at, _)| {
-            let before = &body[..at];
-            !before.ends_with("fn ") && !before.ends_with(|c: char| c.is_alphanumeric() || c == '_')
-        })
-    })
-}
-
-/// Whether `body` holds a hand. A `&mut Hand` counts only where the caller MUST
-/// give one: an `Option<&mut Hand>` may be `None`, so a function that types
-/// through it holds a hand only by taking one itself (`under_hand(`,
-/// `Hand::take`, ...), which the other tokens see.
-fn holds_a_hand(body: &str) -> bool {
-    HAND_TOKENS.iter().any(|t| {
-        body.match_indices(t).any(|(at, _)| {
-            let before = &body[..at];
-            // A definition (`fn type_fenced(`) is no call: the function that
-            // wraps a hand is judged by its own body, never by its signature.
-            !before.ends_with("fn ") && (*t != "&mut Hand" || !before.ends_with("Option<"))
-        })
-    })
-}
-
-/// The functions of `sources` (file name, text) that type text with no hand
-/// and no entry in [`UNDER_ANOTHERS_HAND`] whose holder holds one.
-fn unleased_typing(sources: &[(String, String)]) -> Vec<String> {
-    let fns: Vec<(String, Vec<(String, String)>)> = sources
-        .iter()
-        .map(|(file, src)| (file.clone(), functions_of(src)))
-        .collect();
-    let body_of = |file: &str, name: &str| -> Option<&str> {
-        fns.iter()
-            .find(|(f, _)| f == file)?
-            .1
-            .iter()
-            .find(|(n, _)| n == name)
-            .map(|(_, b)| b.as_str())
-    };
-    let mut bad = Vec::new();
-    for (file, functions) in &fns {
-        for (name, body) in functions {
-            if !types_text(body) || holds_a_hand(body) {
-                continue;
-            }
-            let covered = UNDER_ANOTHERS_HAND
-                .iter()
-                .find(|(f, n, ..)| f == file && n == name)
-                .and_then(|(_, _, holder, _)| {
-                    let (hf, hn) = holder.split_once(':')?;
-                    body_of(hf, hn)
-                })
-                .is_some_and(holds_a_hand);
-            if !covered {
-                bad.push(format!("{file}::{name}"));
-            }
-        }
-    }
-    bad
-}
-
-/// THE TYPED-ACT GUARD: every function under `harness/` that types text into an agent's
-/// composer or a shell's prompt does it under aterm's own hand, or is
-/// named — with where its hand is taken — in [`UNDER_ANOTHERS_HAND`]: an
-/// unleased act reads to the window as somebody driving the tab, and
-/// re-grids its PTY. NEGATIVE CONTROLS:
-/// the scan finds an unleased act in a synthetic source, and a handed one is
-/// not; every allowlist entry names a function that exists, types, and is
-/// covered; the scan sees the source it is guarding.
-#[test]
-fn every_typed_act_in_the_harness_is_under_a_hand() {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/harness");
-    let mut sources = Vec::new();
-    for entry in std::fs::read_dir(&dir).expect("the harness directory") {
-        let path = entry.expect("an entry").path();
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if name.ends_with(".rs") && !name.ends_with("_tests.rs") {
-            sources.push((
-                name.to_string(),
-                std::fs::read_to_string(&path).expect("source"),
-            ));
-        }
-    }
-    assert!(
-        ["upgrade_drive.rs", "upgrade_codex_drive.rs", "relaunch.rs"]
-            .iter()
-            .all(|f| sources.iter().any(|(n, _)| n == f)),
-        "the scan reads the three files that type"
-    );
-    let unleased = unleased_typing(&sources);
-    assert!(
-        unleased.is_empty(),
-        "typed acts with no hand (take one with `under_hand`, or name whose hand it is \
-         under in UNDER_ANOTHERS_HAND): {unleased:?}"
-    );
-    // The scan sees typing at all: the guarded files' typing functions.
-    let typing: Vec<String> = sources
-        .iter()
-        .flat_map(|(file, src)| {
-            functions_of(src)
-                .into_iter()
-                .filter(|(_, body)| types_text(body))
-                .map(move |(name, _)| format!("{file}::{name}"))
-        })
-        .collect();
-    for want in [
-        "upgrade_codex_drive.rs::type_under",
-        "upgrade_codex_drive.rs::carry_on",
-        "relaunch.rs::type_continuation",
-        "upgrade_drive.rs::type_fenced",
-    ] {
-        assert!(typing.iter().any(|t| t == want), "{want} types: {typing:?}");
-    }
-    // Every allowlist entry is real: the function types, the holder holds.
-    for (file, name, holder, reason) in UNDER_ANOTHERS_HAND {
-        assert!(!reason.is_empty());
-        let functions = sources
-            .iter()
-            .find(|(n, _)| n == file)
-            .map(|(_, src)| functions_of(src))
-            .expect("the entry's file");
-        let body = &functions
-            .iter()
-            .find(|(n, _)| n == name)
-            .unwrap_or_else(|| panic!("{file}::{name} exists"))
-            .1;
-        assert!(
-            types_text(body) || holds_a_hand(body),
-            "{file}::{name} no longer types: drop its entry"
-        );
-        let (hf, hn) = holder.split_once(':').expect("file:fn");
-        let held = sources
-            .iter()
-            .find(|(n, _)| n == hf)
-            .map(|(_, src)| functions_of(src))
-            .and_then(|f| f.into_iter().find(|(n, _)| n == hn))
-            .unwrap_or_else(|| panic!("{holder} exists"));
-        assert!(holds_a_hand(&held.1), "{holder} holds no hand");
-    }
-    // NEGATIVE CONTROL: the same scan over a synthetic source.
-    let synthetic = |body: &str| {
-        vec![(
-            "synthetic.rs".to_string(),
-            format!("fn announce(c: &mut Client) {{\n{body}\n}}\n"),
-        )]
-    };
-    assert_eq!(
-        unleased_typing(&synthetic("    let _ = turn_fenced(c, tab, text, None);")),
-        ["synthetic.rs::announce"],
-        "an unleased turn_fenced is found"
-    );
-    assert_eq!(
-        unleased_typing(&synthetic("    let _ = type_text(c, tab, text, None);")),
-        ["synthetic.rs::announce"],
-        "an unleased type_text is found"
-    );
-    assert_eq!(
-        unleased_typing(&synthetic("    let _ = notice_fenced(c, tab, text, None);")),
-        ["synthetic.rs::announce"],
-        "an unleased notice_fenced is found"
-    );
-    // A function named for the hand it never takes: the signature is no hand.
-    assert_eq!(
-        unleased_typing(&[(
-            "synthetic.rs".to_string(),
-            "fn type_fenced(c: &mut Client) {\n    let _ = turn_fenced(c, tab, text, None);\n}\n"
-                .to_string(),
-        )]),
-        ["synthetic.rs::type_fenced"],
-        "a type_fenced that takes no hand is found"
-    );
-    assert!(
-        unleased_typing(&synthetic(
-            "    let hand = Hand::take_or_none(c, tab);\n    let _ = turn(c, tab, text);"
-        ))
-        .is_empty(),
-        "a handed one is not"
-    );
-    assert!(
-        unleased_typing(&synthetic("    // turn_fenced(c, tab, text, None)")).is_empty(),
-        "a comment types nothing"
-    );
-}
-
 // ---------------------------------------------------------------- the READY at its turn end
 
 /// An idle Claude Code screen whose last answer is `said`, one row a line
@@ -24184,22 +23452,10 @@ fn said_screen(said: &[&str], seq: u64) -> String {
     )
 }
 
-/// A READY answer not yet recorded, driven through the real visit. The notice
-/// went out, recorded by Claude Code wrapped as a paste. The agent's answer
-/// (several paragraphs, `ATERM-UPGRADE-READY-d6476091` its last line) is on
-/// the idle screen, and the window's host takes the step 180 ms later, over a
-/// transcript Claude Code has not appended the row to yet (a batched queue:
-/// `FLUSH_INTERVAL_MS=100`, then an async append).
-///
-/// (1) The READY on the idle screen, its row unwritten, holds the point
-/// (`wait:ready-unrecorded`, owned: nothing is typed over it). Negative
-/// control: the same look with no READY on the screen waits `awaiting-ready`,
-/// owning nothing. (2) The row appended, the READY is heard: the restart's
-/// settle holds the point, the answer's clock running. (3) A person's message
-/// after that look, taken up by the agent: its next idle point is the
-/// re-ask's, said `superseded` while the turn settles, and owned. (4)
-/// Settled, the notice is typed again at once (a new ask, with a marker of its
-/// own), not after the re-ask's half hour. The agent is never signalled.
+/// A READY answer on the idle screen before Claude Code appends its transcript row (a
+/// batched append, `FLUSH_INTERVAL_MS=100`), through the real visit: held
+/// `wait:ready-unrecorded`, then heard and settled; a message taken up since is re-asked
+/// as soon as its turn settles. The agent is never signalled.
 #[cfg(unix)]
 #[test]
 fn a_ready_answer_is_heard_at_its_turn_end_and_a_superseded_one_is_asked_again() {
@@ -24319,9 +23575,8 @@ fn a_ready_answer_is_heard_at_its_turn_end_and_a_superseded_one_is_asked_again()
     assert!(owns_turn_ends(&heard.step, 0, grace));
     assert_ne!(load(&p.opts, SESSION).expect("state").ready_since, 0);
 
-    // (3) Someone directed the agent after that look, and it took that up:
-    // its next idle point shows its new answer. The re-ask is due there,
-    // said `superseded` while the turn settles, and owned.
+    // (3) A message taken up since that look: the re-ask waits `superseded` while the
+    // turn settles, owning it.
     append(&[
         typed("keep going"),
         model("Two pieces of work are running in the background."),
@@ -24354,12 +23609,9 @@ fn a_ready_answer_is_heard_at_its_turn_end_and_a_superseded_one_is_asked_again()
     assert!(alive(p.sf.pid), "the agent was never signalled");
 }
 
-/// THE QUOTA WALL A CONVERSATION STANDS AT, READ FROM ITS TRANSCRIPT'S TAIL
-/// ([`named_standing_wall`]): the reader of [`upgrade::transcript_standing_wall`]
-/// over the same BOUNDED read as [`named_limit_reset`] ([`TAIL_BYTES`]), so a
-/// transcript megabytes long costs one tail — and a wall the tail no longer
-/// holds is not read (the stated bound). NEGATIVE CONTROLS: another
-/// conversation, and a home with no transcript, have none.
+/// [`named_standing_wall`] reads the quota wall over the same bounded tail as
+/// [`named_limit_reset`] ([`TAIL_BYTES`]); a wall past the tail is not read.
+/// Negative controls: another conversation and a home with no transcript have none.
 #[cfg(unix)]
 #[test]
 fn the_standing_wall_is_read_from_the_named_transcripts_bounded_tail() {
@@ -24370,6 +23622,10 @@ fn the_standing_wall_is_read_from_the_named_transcripts_bounded_tail() {
         at: 1_790_794_931,
         until: Some(1_790_870_400),
         window: Some("seven_day".to_string()),
+        credits: Some(upgrade::CreditsWord::Off {
+            reason: Some("org_level_disabled".to_string()),
+            until: None,
+        }),
     };
     // A megabyte of a person's rows before it: only the tail is read, and
     // the wall is in it.
@@ -24389,7 +23645,7 @@ fn the_standing_wall_is_read_from_the_named_transcripts_bounded_tail() {
         Some(1_790_870_400),
         "the same row"
     );
-    // NEGATIVE CONTROLS.
+    // Negative controls.
     assert_eq!(
         named_standing_wall(&home, &users_agent("00000000-0000-4000-8000-000000000000")),
         None
@@ -24398,7 +23654,7 @@ fn the_standing_wall_is_read_from_the_named_transcripts_bounded_tail() {
         named_standing_wall(&dir.join("nowhere"), &users_agent(SESSION)),
         None
     );
-    // THE BOUND: more than a tail of rows after it, and it is not read.
+    // The bound: a wall followed by more than a tail of rows is not read.
     let mut rows = vec![wall];
     rows.extend(vec![filler; 80]);
     assert!(rows[1..].iter().map(String::len).sum::<usize>() as u64 > TAIL_BYTES);
@@ -24406,13 +23662,9 @@ fn the_standing_wall_is_read_from_the_named_transcripts_bounded_tail() {
     assert_eq!(named_standing_wall(&home, &users_agent(SESSION)), None);
 }
 
-/// THE LINE A CONVERSATION'S USAGE-LIMIT DIALOG ENDED WITH, READ FROM ITS
-/// TRANSCRIPT'S TAIL ([`named_reset_line`]): the reader of
-/// [`upgrade::transcript_reset_line`] over the same bounded read as
-/// [`named_standing_wall`]. THE RESET ROW IS COMPOSED, never captured: the bundle's text on the two rows measured for this dialog's
-/// wait row (`upgrade_stall_tests.rs`); OPEN: replace with a capture.
-/// NEGATIVE CONTROLS: asked since a later second, another conversation and
-/// a home with no transcript have none.
+/// [`named_reset_line`]: the line the usage-limit dialog ended with, over the same bounded
+/// tail. The reset row is composed from the bundle's text, not captured.
+/// Negative controls: asked since a later second, another conversation, no transcript.
 #[cfg(unix)]
 #[test]
 fn the_reset_line_is_read_from_the_named_transcripts_bounded_tail() {
@@ -24440,7 +23692,7 @@ fn the_reset_line_is_read_from_the_named_transcripts_bounded_tail() {
         named_reset_line(&home, &users_agent(SESSION), claimed).as_deref(),
         Some(said)
     );
-    // NEGATIVE CONTROLS.
+    // Negative controls.
     assert_eq!(
         named_reset_line(&home, &users_agent(SESSION), claimed + 60),
         None
@@ -24459,21 +23711,9 @@ fn the_reset_line_is_read_from_the_named_transcripts_bounded_tail() {
     );
 }
 
-/// THE WINDOW HOST'S LIMIT AND WALL READERS READ THE AGENT'S OWN CLAUDE HOME
-/// (the upgrade-homes lane's stated limit, handoff §4): the reset a standing
-/// usage limit names ([`named_limit_reset`], the loop's
-/// `IdleHost::limit_until`), the quota wall that stands
-/// ([`named_standing_wall`], the accounts recorder's and the limit reset's)
-/// and the line the usage-limit dialog ended with ([`named_reset_line`], the
-/// reset's outcome) are read from the conversation's transcript, which a
-/// Claude Code started with `CLAUDE_CONFIG_DIR=<dir>` files under `<dir>`.
-/// The window host asked each of them under the user's home: for such an
-/// agent no reset was ever named (a notice left on the screen past its reset
-/// withheld every point until something was typed, and a bare clock time
-/// read on a later day than its notice was placed a day late), and no wall
-/// or reset line was read. Each now takes the agent's relaunch snapshot and
-/// reads its own records ([`Records::of_snapshot`]): its absolute home, a
-/// relative one and a set-and-empty one where they resolve.
+/// The window host's limit and wall readers ([`named_limit_reset`], [`named_standing_wall`],
+/// [`named_reset_line`]) read the transcript under the agent's own Claude home
+/// ([`Records::of_snapshot`]): absolute, relative, or set and empty.
 #[cfg(unix)]
 #[test]
 fn the_window_hosts_limit_and_wall_readers_read_the_agents_own_claude_home() {
@@ -24509,6 +23749,7 @@ fn the_window_hosts_limit_and_wall_readers_read_the_agents_own_claude_home() {
     // The agent as the window host keeps it: its relaunch snapshot.
     let work = dir.join("work");
     let snap = |home: Option<&str>, claude_dir: Option<PathBuf>| Snapshot {
+        stored_login: false,
         tab: TAB.to_string(),
         pid: 4242,
         start: "Thu Sep 24 01:02:03 2026".to_string(),
@@ -24545,9 +23786,8 @@ fn the_window_hosts_limit_and_wall_readers_read_the_agents_own_claude_home() {
         named,
         "its own absolute home"
     );
-    // Relative, and set and empty: under the directory it runs in — here a
-    // snapshot a reopened layout gave back, which names no directory of its
-    // records and is read where its line starts it.
+    // Relative, and set and empty: under the directory it runs in (a snapshot from a
+    // reopened layout, which names no records directory).
     let relative = work.join("rel/.claude");
     file(&relative);
     assert_eq!(
@@ -24557,9 +23797,8 @@ fn the_window_hosts_limit_and_wall_readers_read_the_agents_own_claude_home() {
     );
     file(&work);
     assert_eq!(read(&snap(Some(""), None)), named, "set and empty");
-    // CONTROLS: an agent under the user's home is read there, as ever; a
-    // relative home whose directory nobody knows names nothing; no
-    // conversation, nothing.
+    // Controls: an agent under the user's home is read there; a relative home whose
+    // directory nobody knows, or no conversation, names nothing.
     assert_eq!(
         read(&snap(None, None)),
         (None, None, None),
@@ -24579,16 +23818,9 @@ fn the_window_hosts_limit_and_wall_readers_read_the_agents_own_claude_home() {
     assert_eq!(read(&unnamed), (None, None, None), "no conversation");
 }
 
-/// THE ACCOUNT MOVE WHOSE RESTART SIGNALLED AN AGENT IS NAMED BY ITS LABEL
-/// ([`super::super::relaunch::account_restart`]): a record in flight whose
-/// cause is an account move's, naming that very process in that tab — and
-/// one that STOPPED a short while after its agent was seen gone, which is
-/// still that exit's. What the window's host reads to tell a move left in
-/// flight (its signal sent) from one never begun, whether or not the
-/// signalled process has gone yet. NEGATIVE CONTROLS: the upgrade's own
-/// restart and the memory banner's (the harness signalled the agent, but
-/// for no account move); another process; another tab; no record at all;
-/// and a stop long past its exit.
+/// [`super::super::relaunch::account_restart`] names the account move whose restart
+/// signalled this process in this tab, also shortly after it stopped. Negative controls:
+/// other causes, another process or tab, no record, and a stop long past its exit.
 #[test]
 fn the_account_move_that_signalled_an_agent_is_named_by_its_label() {
     use super::super::relaunch::{account_restart, restarted};
@@ -24636,11 +23868,11 @@ fn the_account_move_that_signalled_an_agent_is_named_by_its_label() {
     );
     assert_eq!(account_restart(&opts, pid).as_deref(), Some("work-2"));
 
-    // NEGATIVE CONTROLS.
+    // Negative controls.
     for cause in ["", "memory", "model:claude-sonnet-5-5"] {
         save(&opts, SESSION, &record(cause, exiting.clone(), 0));
         assert!(
-            restarted(&opts, false, Some(pid)),
+            restarted(&opts, upgrade::Agent::Claude, Some(pid)),
             "{cause:?}: the harness did signal it"
         );
         assert_eq!(
@@ -24668,13 +23900,9 @@ fn the_account_move_that_signalled_an_agent_is_named_by_its_label() {
     );
 }
 
-/// A CONVERSATION IS KEPT UNDER THE HOME ITS TRANSCRIPT IS FILED IN
-/// ([`conversation_under`]): what a host with no process to read decides
-/// "the agent's Claude home was the default one" on. NEGATIVE CONTROLS:
-/// another conversation; a home with no projects, or none at all (a Claude
-/// Code under another home files its conversations there); a name that is
-/// no session id — one that would walk out of the projects directory to a
-/// file that IS there included; and a directory of the transcript's name.
+/// [`conversation_under`]: a conversation is under the home whose `projects/` holds its
+/// transcript. Negative controls: another conversation, no projects, a name that is no
+/// session id (path traversal included), and a directory of the transcript's name.
 #[cfg(unix)]
 #[test]
 fn a_conversation_is_under_the_home_its_transcript_is_filed_in() {
@@ -24702,22 +23930,10 @@ fn a_conversation_is_under_the_home_its_transcript_is_filed_in() {
     assert!(!conversation_under(&home, dir_named));
 }
 
-/// THE TRANSCRIPT A SUPERVISOR CONFIRMS A WALL BY, FOUND FROM THE PROCESS
-/// (H6-HARNESS-1; the review of pass 3 measured the check OFF for a Claude
-/// Code launched with its own `CLAUDE_CONFIG_DIR`, whose record and
-/// transcript the host looked for under `~/.claude` alone). Found now as the
-/// window's footer finds a process's conversation
-/// ([`process_transcript_tail`]): under the process's own
-/// `CLAUDE_CONFIG_DIR`, through the record that directory keeps of its pid,
-/// its own project's transcript first. Under that config directory the
-/// tail is the alternate conversation's, though the home's `.claude` keeps
-/// a record of the same pid naming another; with no config directory, the
-/// home's. NEGATIVE CONTROLS: a record whose `procStart` is not the
-/// process's (a reused pid) names nothing; two transcripts of the id are
-/// settled by the project's own place, and with that place empty they are
-/// none (one planted elsewhere can neither stand in for the conversation
-/// nor be picked over it), while one elsewhere alone is read; no transcript,
-/// and no record of the process: none.
+/// [`process_transcript_tail`] finds a process's conversation under its own
+/// `CLAUDE_CONFIG_DIR`, through that directory's record of its pid, its project's
+/// transcript first. Negative controls: a reused pid, an id filed twice with its own place
+/// empty, no transcript and no record name nothing.
 #[test]
 fn the_transcript_that_confirms_a_wall_is_found_from_the_process() {
     let root = ScratchDir::new("upgrade", "wall-tail");
@@ -24798,26 +24014,16 @@ fn the_transcript_that_confirms_a_wall_is_found_from_the_process() {
         Some("{\"the\":\"moved\"}\n"),
         "one elsewhere, read"
     );
-    // No transcript: none.
     std::fs::remove_file(alt.join("projects/-moved").join(format!("{alt_id}.jsonl")))
         .expect("moved");
     assert_eq!(tail(Some(&alt), start), None, "no transcript");
-    // No record of the process: none.
     std::fs::remove_file(alt.join("sessions/4242.json")).expect("record");
     assert_eq!(tail(Some(&alt), start), None, "no record");
 }
 
-/// …READ FROM THE LIVE PROCESS'S OWN EXEC ENVIRONMENT
-/// ([`snapshot_transcript_tail`], what the window's host asks; the review of
-/// pass 4 dropped its `CLAUDE_CONFIG_DIR` and no test failed): a stand-in
-/// agent launched with `CLAUDE_CONFIG_DIR` naming a directory of its own and
-/// `HOME` another, each keeping a record of its pid that names a different
-/// conversation — the tail is the config directory's, read from the
-/// process's environment, never the home's `.claude`. The same stand-in
-/// launched with no `CLAUDE_CONFIG_DIR` reads its home's. A RELATIVE one,
-/// and one set and EMPTY, are read where they resolve from the directory the
-/// process runs in, by the one resolver ([`home_dir_at`]; fix/r16-homes:
-/// before, a relative one read nothing and an empty one its home's).
+/// [`snapshot_transcript_tail`] takes the config directory from the live process's exec
+/// environment, never the home's `.claude`; a relative or set-and-empty one resolves from
+/// the directory the process runs in ([`home_dir_at`]).
 #[cfg(unix)]
 #[test]
 fn the_transcript_is_found_under_the_live_processs_own_config_dir() {
@@ -24866,6 +24072,7 @@ fn the_transcript_is_found_under_the_live_processs_own_config_dir() {
             "{\"the\":\"home tail\"}\n",
         );
         let snap = Snapshot {
+            stored_login: false,
             tab: TAB.to_string(),
             pid,
             start: start.to_string(),
@@ -24908,26 +24115,9 @@ fn the_transcript_is_found_under_the_live_processs_own_config_dir() {
     );
 }
 
-// ------------------------------------------------- the review of fix/r17-homes2
-
-/// THE CLI'S SWEEP JUDGES AN EMPTY HOME'S AGENT BY ITS LOGIN AFTER A WINDOW
-/// RECORDED IT (the review of `fix/r17-homes2`, 2026-10-14). Claude Code keeps
-/// an EMPTY `CLAUDE_CONFIG_DIR`'s records in the directory it runs in and its
-/// profile — the login's model caches — in `$HOME/.claude.json`
-/// ([`profile_apart`]). A record a window's visit or note writes keeps the
-/// home as its directory alone ([`St::home`]), which `aterm harness upgrade`
-/// (no roster) reads back ([`recorded_homes`], [`St::agent_records`]) with no
-/// profile apart, and [`Homes`] kept the first reading of a directory — so
-/// once a window had noted the agent, the CLI's pass judged it by
-/// `<cwd>/.claude.json` again: a model its login is denied was offered, the
-/// agent due onto it. Driven through the pass's own reads ([`Homes::read`]
-/// with no roster) over an instance that lists the agent's tab and over one
-/// that answers nothing (the records' homes alone), before and after the
-/// window's note ([`mint_behind`]) of the record it read. The record now
-/// keeps the profile with the home ([`St::home_profile`], [`St::keep_home`])
-/// and a home read off a live leader comes before a record's word
-/// ([`Homes::read`]), which an older build's record (its directory alone)
-/// shows.
+/// The CLI's sweep judges an empty-home agent by its login's profile (`$HOME/.claude.json`,
+/// [`profile_apart`]) also after a window recorded it: the record keeps the profile with the
+/// home ([`St::home_profile`]), and a home read off a live leader comes before the record's.
 #[cfg(unix)]
 #[test]
 fn the_clis_sweep_judges_an_empty_homes_agent_a_window_recorded_by_its_login() {
@@ -25009,7 +24199,7 @@ fn the_clis_sweep_judges_an_empty_homes_agent_a_window_recorded_by_its_login() {
         })
     };
     let keep = Some(ModelVerdict::Keep("model-current"));
-    // CONTROL: no record of a visit. The listed tab's leader names the home;
+    // Control: no record of a visit. The listed tab's leader names the home;
     // with no tab listed, nothing names it.
     assert_eq!(verdict(&listed), keep, "CONTROL: read from its tab");
     assert_eq!(verdict(&unlisted), None, "CONTROL: nothing names its home");
@@ -25059,20 +24249,10 @@ fn the_clis_sweep_judges_an_empty_homes_agent_a_window_recorded_by_its_login() {
     );
 }
 
-/// THE WALL'S TAIL IS THE TRANSCRIPT ITS AGENT WRITES NOW (the review of
-/// `fix/r17-homes2`): under a relative home, a Claude Code that changed
-/// directory (2.1.300's worktree enter) keeps its record where it filed it at
-/// start and writes its conversation under the home its NEW directory names
-/// (MEASURED in the real-Claude lab, `h2wtobs1`: the start home's transcript
-/// frozen at 244191 bytes, the worktree's growing 83849 → 88660). The tail a
-/// supervisor confirms a wall on its screen by ([`process_transcript_tail`])
-/// was read where the record is, a transcript that ends before the move, so
-/// every real wall the agent hit in the worktree read unconfirmed. Driven
-/// over a stand-in started (`PWD`) in `work` with its record and transcript
-/// filed there: in `work/wt` writing a notice under `wt`'s own home, the
-/// tail is that notice's; in `work/wt` with nothing written there yet, no
-/// tail (the screen decides, as before the homes lane); CONTROL: in `work`,
-/// its transcript's.
+/// Under a relative home, a Claude Code that changed directory keeps its record where it
+/// started but writes its conversation under the home its new directory names: the wall's
+/// tail ([`process_transcript_tail`]) is read there, and nothing written there is no tail.
+/// Control: an agent that never moved reads its own transcript.
 #[cfg(unix)]
 #[test]
 fn the_walls_tail_is_the_transcript_its_agent_writes_now() {
@@ -25116,6 +24296,7 @@ fn the_walls_tail_is_the_transcript_its_agent_writes_now() {
             .expect("transcript");
         }
         let tail = snapshot_transcript_tail(&Snapshot {
+            stored_login: false,
             tab: TAB.to_string(),
             pid,
             start,
@@ -25157,15 +24338,8 @@ fn the_walls_tail_is_the_transcript_its_agent_writes_now() {
     );
 }
 
-/// THE CLI'S SWEEP LEARNS HOMES FROM THE INSTANCES' TABS AND WAITS ON NONE OF
-/// THEM (the review of `fix/r17-homes2`): with no roster of its own,
-/// `aterm harness upgrade` reads every instance's tabs to learn the Claude
-/// homes their leaders run under ([`instance_tabs`]), and every live tab
-/// whose leader's exec record could not be read (a `sudo` shell, another
-/// user's process: none of them Claude) was named unread ([`Homes::unnamed`])
-/// and reported `wait:no-process`, rows the CLI's sweep never printed
-/// before. The window's own roster names its tabs' waits (CONTROL); a tab the
-/// CLI only learned homes from is not its to wait on.
+/// A tab the CLI's sweep only learned homes from is not its to wait on: an unreadable
+/// leader there is no `wait:no-process` row. Control: the window's own roster waits on it.
 #[cfg(unix)]
 #[test]
 fn the_clis_sweep_waits_on_no_tab_it_only_learned_homes_from() {
@@ -25199,17 +24373,9 @@ fn the_clis_sweep_waits_on_no_tab_it_only_learned_homes_from() {
     );
 }
 
-/// ANOTHER HOME'S ANNOUNCEMENT GROWS THE LIST ITS OWN AGENTS ARE JUDGED BY,
-/// AND NO OTHER (the review of `fix/r17-homes2`): an agent under another
-/// Claude home is judged by a list grown from that home's announcements
-/// ([`ModelCtx::at`]), which was written to the pass's shared `models.json`
-/// and journaled `models-changed` once per such agent — so the user's own
-/// agents, whose login was announced nothing, were judged by it on the next
-/// pass (moved onto a model their login was never offered), and two homes'
-/// growths overwrote each other's. Two agents under one other home in one
-/// real pass: each moved to the model its home announces; the file and the
-/// journal as the pass's own read left them; CONTROL: the user's agent, on
-/// the next pass, not moved.
+/// An agent under another Claude home is judged by a list grown from that home's
+/// announcements ([`ModelCtx::at`]), leaving the pass's shared `models.json` and its journal
+/// as they were. Control: the user's own agent, announced nothing, is not moved.
 #[test]
 fn another_homes_announcement_grows_only_its_own_agents_list() {
     let dir = scratch("model-home-grows-alone");
@@ -25317,18 +24483,9 @@ fn another_homes_announcement_grows_only_its_own_agents_list() {
     );
 }
 
-/// AN AGENT WHOSE RECORDS A WORKTREE SPLIT WAITS, ASKED NOTHING (the review
-/// of `fix/r17-homes2`): under a relative home, a Claude Code that changed
-/// directory keeps its record where it filed it, its status frozen at what it
-/// was as it moved (`busy`: its updates under the new directory fail,
-/// MEASURED in the real-Claude lab), while it writes its conversation under
-/// the home its new directory names. Found there by the sweep since the homes
-/// lane, its look went on to the upgrade's gates, which read that frozen
-/// status as lagging the idle screen: under the ask flow the notice and its
-/// re-asks were typed, then a release, for a restart that waits on a status
-/// that cannot move. Its look now waits by name (`wait:home-moved`) until it
-/// is back where its record is. CONTROL: the same agent, never moved, goes
-/// on to the gates.
+/// Under a relative home, a Claude Code that changed directory leaves its record (status
+/// frozen) where it filed it: its look waits `wait:home-moved` and types nothing.
+/// Control: the same agent, never moved, goes on to the gates.
 #[cfg(unix)]
 #[test]
 fn an_agent_whose_records_a_worktree_split_waits_and_is_asked_nothing() {
@@ -25396,16 +24553,8 @@ fn an_agent_whose_records_a_worktree_split_waits_and_is_asked_nothing() {
     assert_ne!(unmoved, "wait:home-moved", "CONTROL: never moved");
 }
 
-/// THE CLI'S SWEEP READS THE TABS OF EVERY INSTANCE IT IS GIVEN (the review
-/// of `fix/r17-homes2`): with no roster of its own, a pass learns the Claude
-/// homes from the `who` roster of every instance [`Opts::instances`] names
-/// ([`instance_tabs`]) — the product's, every instance `aterm ctl ls` lists.
-/// That arm had no test (its only one dialled a `--sock`), and a `cfg(test)`
-/// escape kept the machine's instances from this crate's tests alone; the
-/// instances are now a field ([`Instances`]), and a test names its own. Two
-/// stand-in instances, each with one tab whose leader runs under a Claude
-/// home of its own: both homes' agents are read. CONTROL: given one of them,
-/// the other's agent is not; given none, neither.
+/// With no roster of its own, the CLI's sweep learns Claude homes from the `who` roster
+/// of every instance [`Opts::instances`] names. Control: an instance not given is not read.
 #[cfg(unix)]
 #[test]
 fn the_clis_sweep_reads_the_tabs_of_every_instance_it_is_given() {
@@ -25413,11 +24562,12 @@ fn the_clis_sweep_reads_the_tabs_of_every_instance_it_is_given() {
     let dir = scratch("cli-sweep-two-instances");
     // Two instances, one tab each, each tab led by an agent under its own home.
     let mut socks = Vec::new();
+    let mut instances = Vec::new();
     for (name, tab, leader) in [("a", TAB, 4_242_u32), ("b", OTHER_TAB, 4_343)] {
         let at = dir.join(name);
         std::fs::create_dir_all(&at).expect("the instance's directory");
         let who = format!("OK 1\n0 {tab} driving=- watchers=0 turns=0 alive fgpgid={leader}");
-        let (sock, _asked) = instance_for(
+        let (sock, asked) = instance_for(
             &at,
             tab,
             Answers {
@@ -25426,6 +24576,8 @@ fn the_clis_sweep_reads_the_tabs_of_every_instance_it_is_given() {
             },
         );
         socks.push(sock);
+        // Both servers must outlive the roster reads after this loop.
+        instances.push(asked);
         let home = dir.join(format!("{name}/.claude"));
         std::fs::create_dir_all(home.join("sessions")).expect("sessions");
         std::fs::write(
@@ -25474,4 +24626,52 @@ fn the_clis_sweep_reads_the_tabs_of_every_instance_it_is_given() {
     );
     assert_eq!(one, [4_242], "CONTROL: the instance not given is not read");
     assert_eq!(none, Vec::<u32>::new(), "CONTROL: none given, none read");
+}
+
+/// THE MANAGED TARGET IS NEVER A DEV LINK'S: atpkg's twin of `claude` is the
+/// build a session may be moved onto, except while `claude` is dev-linked
+/// (`aterm pkg link`) and its twin names the checkout rather than a store
+/// build. CONTROLS: an unlinked program's twin is managed whatever it holds
+/// (a test's stand-in script included); a linked program's twin that still
+/// names a store build is managed.
+#[test]
+fn a_dev_links_twin_is_no_managed_build() {
+    let dir = scratch("managed-twin");
+    let layout = atpkg::store::Layout {
+        prefix: dir.to_path_buf(),
+    };
+    std::fs::create_dir_all(dir.join("agents")).expect("agents");
+    let twin = dir.join("agents/claude");
+    std::fs::write(&twin, "#!/bin/sh\necho stand-in\n").expect("stand-in");
+    assert_eq!(
+        managed_twin(&layout, "claude"),
+        Some(twin.clone()),
+        "CONTROL: not linked, the twin is managed"
+    );
+    let checkout = dir.join("claude-code");
+    std::fs::create_dir_all(checkout.join("bin")).expect("checkout");
+    std::fs::write(checkout.join("bin/claude"), "#!/bin/sh\n").expect("dev build");
+    atpkg::linkmode::link(&layout, "claude", &checkout, &[PathBuf::from("bin/claude")])
+        .expect("dev link");
+    assert!(atpkg::linkmode::is_linked(&layout, "claude"));
+    std::fs::write(
+        &twin,
+        format!(
+            "#!/bin/sh\nexec '{}' \"$@\"\n",
+            checkout.join("bin/claude").display()
+        ),
+    )
+    .expect("dev twin");
+    assert_eq!(managed_twin(&layout, "claude"), None, "a dev link's");
+    let store = dir.join("store/claude/7/bin/claude");
+    std::fs::write(
+        &twin,
+        format!("#!/bin/sh\nexec '{}' \"$@\"\n", store.display()),
+    )
+    .expect("twin");
+    assert_eq!(
+        managed_twin(&layout, "claude"),
+        Some(twin),
+        "CONTROL: linked, but the twin names a store build"
+    );
 }

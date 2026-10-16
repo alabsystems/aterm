@@ -4,6 +4,10 @@
 //! Adversarial tests against the `declare_class!`/`msg` contracts.
 
 #![cfg(target_os = "macos")]
+#![allow(
+    clippy::disallowed_types,
+    reason = "test code: a stand-in child may inherit descriptors"
+)]
 
 use std::cell::Cell;
 use std::ffi::{CStr, c_char, c_void};
@@ -15,16 +19,10 @@ use aterm_objc::{
     class_of, declare_class, msg, sel,
 };
 
-/// The [`MainThread`](aterm_objc::MainThread) witness every instantiation owes,
-/// for a test that is not on the main thread and does not need to be.
-///
-/// libtest runs every test on a worker (`pthread_main_np()` is 0 there even
-/// under `--test-threads=1`), so `MainThread::new()` correctly answers `None`
-/// here and the checked constructor is unusable. Every class in this file is an
-/// `NSObject`/`NSView` subclass that touches no AppKit state, is instantiated
-/// and released on the SAME worker, and whose `Ivars` are therefore dropped on
-/// the thread that made them — which is the second form of `new_unchecked`'s
-/// obligation, written once instead of at every call site.
+/// The [`MainThread`](aterm_objc::MainThread) witness, minted unchecked:
+/// libtest runs every test on a worker, so `MainThread::new()` answers `None`.
+/// Every class here touches no AppKit state and is created and released on the
+/// same worker, which is `new_unchecked`'s second obligation.
 fn mtm() -> aterm_objc::MainThread {
     // SAFETY: see this function's doc comment — the class has no main-thread
     // affinity and its ivars are born and dropped on this one worker.
@@ -68,8 +66,8 @@ impl Drop for Ivars {
 }
 
 declare_class! {
-    /// Arities 4, 5 and 6, plus the two
-    /// struct sizes that straddle the `_stret` boundary.
+    /// Arities 4, 5 and 6, plus the two struct sizes that straddle the `_stret`
+    /// boundary.
     struct Adv: NSObject {
         const NAME: &str = "ATermObjcAdvW2";
         type Ivars = Ivars;
@@ -79,7 +77,7 @@ declare_class! {
             a * 1000 + b * 100 + c * 10 + d
         }
 
-        /// Five arguments of FIVE different encodings, so a register shift
+        /// Five arguments of five different encodings, so a register shift
         /// cannot cancel out.
         @sel(i:d:o:s:f:)
         fn arity5(&self, i: i64, d: f64, o: Id, s: Sel, f: f32) -> f64 {
@@ -88,8 +86,7 @@ declare_class! {
             (i as f64) * 100_000.0 + d * 1000.0 + o_bit * 100.0 + s_bit * 10.0 + f64::from(f)
         }
 
-        /// Six — the width of the widest real selector in the tree
-        /// (`addObserver:selector:name:object:` is four; winit's widest is six).
+        /// Six arguments of mixed widths, a struct among them.
         @sel(p:q:r:s:t:u:)
         fn arity6(&self, p: i8, q: i16, r: i32, s: i64, t: Bool, u: CGPoint) -> f64 {
             f64::from(p) + f64::from(q) + f64::from(r) + (s as f64)
@@ -118,8 +115,8 @@ declare_class! {
             out
         }
 
-        /// D5, checked against the runtime's own retain count rather than
-        /// against a drop counter.
+        /// The +0 return an object-returning declared method owes, checked
+        /// against the runtime's own retain count rather than a drop counter.
         @sel(makeChild)
         fn make_child(&self) -> Id {
             match Adv::alloc_init(mtm(), Ivars {
@@ -131,8 +128,7 @@ declare_class! {
             }
         }
 
-        /// The +1 form D5 says is a LEAK, kept so the test can show the
-        /// difference rather than assert it.
+        /// The +1 form, which leaks; kept so the test can show the difference.
         @sel(makeLeakedChild)
         fn make_leaked_child(&self) -> Id {
             match Adv::alloc_init(mtm(), Ivars {
@@ -285,7 +281,7 @@ fn sixteen_and_seventeen_byte_returns_both_round_trip() {
             g17(obj.as_id(), sel!(seventeen)),
             B17([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17])
         );
-        // Arguments AND return of each size, so a shifted register shows up.
+        // Arguments and return of each size, so a shifted register shows up.
         let e16: unsafe extern "C-unwind" fn(Id, Sel, B16) -> B16 = msg();
         assert_eq!(
             e16(obj.as_id(), sel!(echoSixteen:), B16 { lo: 11, hi: 22 }),
@@ -325,7 +321,7 @@ fn a_thirty_two_byte_send_and_a_sixteen_byte_send_agree_with_the_c_abi() {
     let _ = CGSize::default();
 }
 
-// ------------------------------------------------ D5 by real retain count
+// ------------------------------------- the +0 object return, by retain count
 
 #[test]
 fn an_autoreleased_return_is_at_plus_one_owned_by_the_pool() {
@@ -404,9 +400,9 @@ fn a_caller_may_retain_an_autoreleased_return_across_the_pool() {
 
 #[test]
 fn nsinvocation_reads_our_arity_and_types_and_invokes_correctly() {
-    // The reflective path D1 and D3 are ABOUT: Foundation builds an
-    // `NSMethodSignature` from the encoding this crate registered, and reads
-    // argument count, widths and the return type out of it.
+    // The reflective path: Foundation builds an `NSMethodSignature` from the
+    // encoding this crate registered and reads argument count, widths and the
+    // return type out of it.
     let drops = Arc::new(AtomicUsize::new(0));
     let obj = adv(&drops);
     let cls = Adv::class();
@@ -450,7 +446,7 @@ fn nsinvocation_reads_our_arity_and_types_and_invokes_correctly() {
         let ret_len: unsafe extern "C-unwind" fn(Id, Sel) -> usize = msg();
         assert_eq!(ret_len(sig, sel!(methodReturnLength)), 8);
 
-        // Now actually INVOKE through NSInvocation.
+        // Now invoke through NSInvocation.
         autoreleasepool(|_| {
             let inv_with: unsafe extern "C-unwind" fn(ClassPtr, Sel, Id) -> Id = msg();
             let inv = inv_with(
@@ -483,9 +479,8 @@ fn nsinvocation_reads_our_arity_and_types_and_invokes_correctly() {
 
 #[test]
 fn nsmethodsignature_agrees_with_foundation_on_what_bool_is() {
-    // D3 through the reflective path, arch-adaptive: the return type
-    // Foundation reports for OUR `BOOL` method must be the same letter it
-    // reports for its OWN.
+    // `BOOL` through the reflective path: the return type Foundation reports
+    // for our `BOOL` method must be the letter it reports for its own.
     let cls = Adv::class();
     // SAFETY: documented Foundation signatures on live class objects.
     unsafe {
@@ -591,7 +586,7 @@ fn a_block_that_is_never_invoked_still_drops_its_capture_once() {
 #[test]
 fn a_block_handed_to_a_real_framework_api_survives_and_is_released_once() {
     // `NSArray -enumerateObjectsUsingBlock:` copies and releases the block
-    // itself, which is the path all three real sites take.
+    // itself, as AppKit's handler APIs do.
     let drops = Arc::new(AtomicUsize::new(0));
     let hits = Arc::new(AtomicUsize::new(0));
     struct Noisy(Arc<AtomicUsize>);
@@ -649,10 +644,9 @@ fn a_block_handed_to_a_real_framework_api_survives_and_is_released_once() {
 
 #[test]
 fn the_sel_cache_is_correct_under_a_hard_concurrent_first_use() {
-    // Many threads, many DISTINCT slots, every slot's first use racing. The
-    // claim under test is that the relaxed store is benign BY VALUE: every
-    // thread must observe the same interned pointer, and it must equal the
-    // uncached lookup.
+    // Many threads, many distinct slots, every first use racing: the relaxed
+    // store must be benign by value, every thread seeing the same interned
+    // pointer, equal to the uncached lookup.
     const THREADS: usize = 16;
     let barrier = Arc::new(std::sync::Barrier::new(THREADS));
     let mut handles = Vec::new();
@@ -699,9 +693,9 @@ fn a_panic_inside_a_declared_method_aborts_instead_of_unwinding_into_foundation(
     if std::env::var_os(PANIC_CHILD).is_some() {
         let drops = Arc::new(AtomicUsize::new(0));
         let obj = adv(&drops);
-        // Dispatched by FOUNDATION, not by a direct call: `-performSelector:`
-        // puts a framework frame between the send and our trampoline, which is
-        // the shape `NSNotificationCenter` and AppKit's responder chain use.
+        // Dispatched by Foundation, not by a direct call: `-performSelector:`
+        // puts a framework frame between the send and our trampoline, the
+        // shape `NSNotificationCenter` and AppKit's responder chain use.
         // SAFETY: `-performSelector:` is `-(id)performSelector:(SEL)`, and the
         // target is a live instance that declares `-boom`.
         unsafe {

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The promoted `metal/ffi.rs` surface, plus the selector cache.
+//! Runtime basics: class lookup, NSString round trips, ownership, pools, nil sends, and the
+//! selector cache.
 
 #![cfg(target_os = "macos")]
 
@@ -96,10 +97,8 @@ fn ns_string_length_is_utf16_code_units() {
 #[test]
 fn owned_and_retained_balance_exactly() {
     autoreleasepool(|_| {
-        // A plain NSObject, NOT an NSString: a short literal string becomes a
-        // TAGGED POINTER, whose `-retainCount` is `UINT64_MAX` because it is
-        // immortal. That is a real property of the runtime and the reason this test
-        // does not use `ns_string` — the arithmetic below would overflow.
+        // A plain NSObject: a short NSString is an immortal tagged pointer whose `-retainCount`
+        // is `UINT64_MAX`, and the arithmetic below would overflow.
         // SAFETY: `+alloc`/`-init` on NSObject return a +1 instance this `Obj`
         // adopts and releases exactly once.
         let obj = unsafe {
@@ -108,8 +107,7 @@ fn owned_and_retained_balance_exactly() {
             let init: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
             Obj::from_owned(init(raw, sel!(init))).expect("NSObject instance")
         };
-        // SAFETY: `-retainCount` is `-(NSUInteger)`; it is diagnostic-only, which
-        // is precisely what this test wants it for.
+        // SAFETY: `-retainCount` is `-(NSUInteger)` and diagnostic-only.
         let count = |o: &Obj| -> usize {
             unsafe {
                 let f: unsafe extern "C-unwind" fn(Id, Sel) -> usize = msg();
@@ -208,7 +206,7 @@ fn cached_selectors_are_the_uncached_ones() {
         sel!(toolbar:itemForItemIdentifier:willBeInsertedIntoToolbar:),
         sel_uncached(c"toolbar:itemForItemIdentifier:willBeInsertedIntoToolbar:")
     );
-    // Cached twice in a row is stable (the fill path ran once).
+    // A cached selector is stable across uses.
     assert_eq!(sel!(description), sel!(description));
 }
 
@@ -237,11 +235,8 @@ fn a_cache_slot_survives_concurrent_first_use() {
 
 #[test]
 fn a_pool_scope_is_a_pure_nesting() {
-    // Nested pools must pop in reverse order without disturbing each other; an
-    // autoreleased object created inside the inner pool must still be readable
-    // while that pool is live. Written as nested SCOPES because that is now the
-    // only way this crate lets a second pool exist — see `pools.rs` for what
-    // the RAII-token form allowed.
+    // Nested scopes pop in reverse order without disturbing each other; `pools.rs` covers the
+    // out-of-order case.
     let text = autoreleasepool(|_outer| {
         autoreleasepool(|_inner| {
             let s = ns_string("nested").expect("NSString");
@@ -254,13 +249,10 @@ fn a_pool_scope_is_a_pure_nesting() {
 
 #[test]
 fn an_autoreleased_object_lives_exactly_as_long_as_its_pool() {
-    // The capability D5 named: `objc_autorelease`. An object handed to the pool
-    // is readable for the rest of the scope and released when the scope ends.
-    // Measured through `-retainCount` on a plain NSObject (NOT an NSString: a
-    // short literal is a tagged pointer whose retain count is `UINT64_MAX`).
+    // `Obj::autorelease` hands the +1 to the pool: the object stays readable for the rest of the
+    // scope. A plain NSObject, for the reason in `owned_and_retained_balance_exactly`.
     let count = |id: Id| -> usize {
-        // SAFETY: `-retainCount` is `-(NSUInteger)` and diagnostic-only, which
-        // is exactly what this test wants it for.
+        // SAFETY: `-retainCount` is `-(NSUInteger)` and diagnostic-only.
         unsafe {
             let f: unsafe extern "C-unwind" fn(Id, Sel) -> usize = msg();
             f(id, sel!(retainCount))
@@ -294,8 +286,8 @@ fn an_autoreleased_object_lives_exactly_as_long_as_its_pool() {
 
 #[test]
 fn utf8_string_of_a_nil_receiver_is_empty() {
-    // nil is a legal receiver; a send to it returns zero. This is the property
-    // `Id` is a raw pointer rather than a `NonNull` for.
+    // nil is a legal receiver and a send to it returns zero, which is why `Id` is a raw pointer,
+    // not a `NonNull`.
     // SAFETY: sending to nil is defined by the runtime and returns 0/null.
     let p: *const c_char = unsafe {
         let f: unsafe extern "C-unwind" fn(Id, Sel) -> *const c_char = msg();
@@ -314,11 +306,9 @@ fn poison_the_next_frame() -> u64 {
     junk.iter().map(|&b| u64::from(b)).sum()
 }
 
-/// `send_rect` on nil with the result held in THIS frame, so its struct-return
-/// slot is stack [`poison_the_next_frame`] just filled with 0xAB. A call written
-/// in the test body forwards the slot to the test's own local, whose bytes
-/// nothing dirtied, and reads zero by luck; that is how the first cut of this
-/// test passed on an Intel Mac with the guard deleted.
+/// `send_rect` on nil with the result held in this frame, so its return slot is stack
+/// [`poison_the_next_frame`] just filled with 0xAB. Called from the test body, the slot would be
+/// the test's own clean local and read zero by luck.
 #[inline(never)]
 fn nil_rect_in_a_poisoned_frame() -> [u64; 4] {
     // SAFETY: `-frame` is `-(NSRect)frame`, and nil is a valid receiver.
@@ -332,13 +322,9 @@ fn nil_rect_in_a_poisoned_frame() -> [u64; 4] {
     ]
 }
 
-/// A nil receiver on a struct-returning send hands back ZERO — on x86_64 too.
-///
-/// libobjc zeroes register-class returns on the nil path and leaves an
-/// INDIRECT (`objc_msgSend_stret`) return untouched (pinned below). A 32-byte
-/// CGRect is indirect on x86_64 and register-class (d0-d3) on arm64, so without
-/// `send_rect`'s own nil check it reads whatever the return slot held on an
-/// Intel Mac and zero on every arm64 dev machine.
+/// A nil receiver on `send_rect` returns a zero rect on both arches. A 32-byte CGRect is an
+/// indirect (`objc_msgSend_stret`) return on x86_64, which libobjc's nil path leaves unwritten,
+/// and register-class (d0-d3) on arm64, which it zeroes.
 #[test]
 fn a_nil_receiver_returns_a_zero_rect_on_this_arch() {
     for _ in 0..8 {
@@ -348,11 +334,9 @@ fn a_nil_receiver_returns_a_zero_rect_on_this_arch() {
     }
 }
 
-/// The premise the guard exists for, measured on the arch that has it: a nil
-/// `objc_msgSend_stret` returns without writing its out-buffer. The x86_64
-/// stret ABI passes the hidden result pointer first, so declaring the entry as
-/// `(out, self, _cmd) -> ()` is the same call with the pointer made explicit —
-/// and the buffer can be poisoned deterministically.
+/// The premise of `send_rect`'s nil check, on x86_64: a nil `objc_msgSend_stret` leaves its
+/// out-buffer unwritten. The stret ABI passes the result pointer first, so
+/// `(out, self, _cmd) -> ()` is the same call with a buffer the test can poison.
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn libobjc_leaves_a_nil_stret_return_untouched_on_x86_64() {

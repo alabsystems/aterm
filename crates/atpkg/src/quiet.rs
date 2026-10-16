@@ -4,15 +4,14 @@
 //! FLIP WHEN QUIET (gap #12(b)): an unattended update stages a new Trust toolchain at once and
 //! flips it only when nothing is using the one it replaces.
 //!
-//! A trust update used to flip within about 30 s of being published, at any hour. The flip
-//! re-points `store/trust/current` and the `bin/` shims, and the next re-assertion re-lays
-//! the rustup view. A build in flight keeps the compiler it started with (gc keeps the
-//! build its processes run from), but a WORKFLOW is several commands: `targo build` then
-//! `targo test` through the shim, or a gate's stages, ran on two compilers the moment a
-//! flip landed between them — `Dirty …: the toolchain changed`, about 600 packages
-//! rebuilt with sccache misses, or E0514 on the `current` path (measured, gap #12). The
-//! merge contract and the cutter pin one physical directory per run (2026-09-24); nothing
-//! held the flip itself back.
+//! A trust update can be published at any hour. The flip re-points `store/trust/current`
+//! and the `bin/` shims, and the next re-assertion re-lays the rustup view. A build in
+//! flight keeps the compiler it started with (gc keeps the build its processes run from),
+//! but a WORKFLOW is several commands: `targo build` then `targo test` through the shim, or
+//! a `verify` run's checks, run on two compilers the moment a flip lands between them —
+//! `Dirty …: the toolchain changed`, about 600 packages rebuilt with sccache misses, or
+//! E0514 on the `current` path (gap #12). `verify` and the cutter pin one physical
+//! directory per run, but only the flip itself can wait for the workflow to end.
 //!
 //! # The rule ([`decide`]; the derived model `AtpkgFlipQuiet`)
 //!
@@ -70,8 +69,8 @@ use serde::{Deserialize, Serialize};
 use crate::store::Layout;
 
 /// How long an unattended flip waits for quiet, at most: four hours from the first
-/// deferral. Long enough for a merge-contract run (33 minutes typical) and a release cut
-/// to finish on the compiler they started with; short enough that a machine building all
+/// deferral. Long enough for a release cut, or a command held by `aterm pkg lease`, to
+/// finish on the compiler it started with; short enough that a machine building all
 /// day still takes the day's toolchain the same day.
 pub const CEILING_SECS: i64 = 4 * 60 * 60;
 
@@ -1000,7 +999,7 @@ mod tests {
         let lease = crate::lease::take(
             &l.prefix,
             &crate::lease::Subject::view("trust").unwrap(),
-            "aterm-verify (pid 7)",
+            "targo (pid 7) \u{2014} held by `aterm pkg lease` in /w",
             crate::lease::DEFAULT_WAIT,
         )
         .unwrap();

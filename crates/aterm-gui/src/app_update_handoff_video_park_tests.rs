@@ -474,10 +474,9 @@ fn a_commit_whose_answers_took_time_holds_its_claim_through_the_fence() {
         // The take's client reads its answer 50 ms after it is SENT: it
         // waits for the answer first, so the 50 ms is always time the
         // claim's pass spent answering, however late the main thread
-        // got there (it began when the thread was spawned until
-        // 2026-10-06, and a gate at load ~20 reached the answer after the
-        // 50 ms had passed: the pass took under the 2 ms yield and wrote
-        // the Commit at once).
+        // got there (begun when the thread is spawned instead, a machine at
+        // load ~20 reaches the answer after the 50 ms has passed: the pass
+        // takes under the 2 ms yield and writes the Commit at once).
         let (wire, release) = crate::control::ReplyWire::new();
         app.video_reply_wires.push(wire);
         let reader = std::thread::spawn(move || {

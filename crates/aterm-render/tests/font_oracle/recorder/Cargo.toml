@@ -1,0 +1,60 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+#
+# THE FONT ORACLE'S RECORDER (TF.1, docs/AUDIT-third-party-2026-10-15.md), in
+# ITS OWN WORKSPACE on purpose (the empty `[workspace]` below): no
+# `[patch.crates-io]`, so rustybuzz, ttf-parser and skrifa resolve with their
+# real registry dependencies (core_maths -> libm, smallvec, log), not aterm's
+# first-party facades. skrifa runs here on macOS, whose shipped renderer uses
+# CoreText instead. Its Cargo.lock pins the versions aterm's own
+# lockfile held when the corpora were recorded.
+#
+# ttf-parser is built with `gvar-alloc`, as aterm's Linux build ships it
+# (winit's `wayland-csd-adwaita` -> sctk-adwaita -> ab_glyph turns it on); the
+# workspace's macOS, Windows and wasm builds, and `-p aterm-render`, leave it
+# off. It changes only a glyph with more than 32 `gvar` tuples (drawn with it,
+# no outline without), so `replay` checking `reader.txt` here also shows that
+# no face there has one.
+#
+# Nothing in the aterm workspace builds this. From this directory:
+#   targo --unverified run -- replay ../../..
+#       re-answer every `shape` and `read` line of the committed corpora with
+#       the registry crates and diff (the facade cross-check)
+#   targo --unverified run -- hint ../../.. ../../fixtures/font-oracle/hinting.txt
+#       re-record the hinting corpus (skrifa's grid-fitted masks)
+#   targo --unverified run -- gvar-alloc ../../.. ../../fixtures/font-oracle/reader-gvar-alloc.txt
+#       re-record the `read` answers of the faces past 32 `gvar` tuples
+#   targo --unverified run --release -- differential ../../.. [runs]
+#       shape seeded random runs with rustybuzz and with aterm-font's shaper
+#       and compare them (TF.6; the text domain is in src/differential.rs)
+#   targo --unverified run --release -- hint-differential ../../..
+#       hint every face this host has with skrifa and with aterm-font's
+#       autohinter and compare the fitted outlines (TF.4; the domain is in
+#       src/hint_diff.rs)
+# It includes ../probe.rs, ../reader.rs, ../shaper.rs, ../hint_raster.rs and
+# aterm-render's src/raster.rs by path, so it answers with the same code the
+# pin tests and the renderer run (reader.rs on ttf-parser here, on aterm-font
+# in the workspace's replays; hint_raster.rs on skrifa here, on aterm-font's
+# autohinter in its replay).
+[package]
+name = "font-oracle-recorder"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+rustybuzz = "=0.20.1"
+ttf-parser = { version = "=0.25.1", features = ["gvar-alloc"] }
+skrifa = "=0.46.2"
+# `differential` and `hint-differential` only: aterm-font's shaper (by
+# `../shaper.rs`) and autohinter (its default `hint` feature), its Unicode
+# tables and bidi data. First-party crates with no third-party dependency, so
+# the registry crates above still resolve unpatched.
+aterm-font = { path = "../../../../aterm-font" }
+aterm-grapheme = { path = "../../../../aterm-grapheme" }
+aterm-bidi = { path = "../../../../aterm-bidi" }
+
+[profile.dev]
+opt-level = 2

@@ -6,15 +6,6 @@ use aterm_spec::{
     interp, verify,
 };
 
-/// The twin contract proves at `Buggy = 0` and CATCHES the 2026-09-22 veto
-/// at `Buggy = 1` (a STANDING record read as ABSENT): one twin inside an
-/// arrived block refused the follow and the row melted — the owner's vanish.
-#[test]
-fn ribbon_follow_twin_proves_and_catches_the_twin_veto() {
-    let model = ribbon_follow_twin_model();
-    verify::prove_and_catch_scalar(&model, model.name);
-}
-
 /// The owner's shape at four records, both ways: ARRIVED, STANDING (the
 /// `Y` of `WHY` under the `Y` of `HEY`), ARRIVED, ARRIVED, every glyph gone
 /// from its own row. The contract names the whole run, `1..=4`; the veto

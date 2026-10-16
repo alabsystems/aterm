@@ -2,50 +2,26 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Budgeted, resumable full-buffer search (P1).
+//! Budgeted, resumable full-buffer search.
 //!
-//! A one-shot full-buffer search pays the whole index build + verification cost
-//! in a single call — hundreds of milliseconds at deep scrollback, which blocks
-//! the caller's event loop (the wasm render worker cannot answer input while
-//! it runs). [`BudgetedSearch`] splits that work into row-sized units the
-//! caller feeds incrementally: each `feed_row`
-//! verifies ONE row with the batch index's matching machinery, so
-//! a caller can stop after any number of rows, yield, and RESUME without
-//! rebuilding anything. The row text and its coordinate map are discarded
-//! after verification; only the bounded matches and scan progress survive.
+//! A one-shot search pays the whole index build and verification in one call,
+//! blocking the caller's event loop at deep scrollback. [`BudgetedSearch`] verifies
+//! one fed row at a time, so a caller can stop after any row, yield, and resume.
+//! Row text is dropped after verification; only the bounded matches and progress
+//! survive.
 //!
-//! ## Results-equality contract
+//! Driving a `BudgetedSearch` to completion yields the same [`SearchResults`] as
+//! [`SearchIndex::search_results_opts`] over the same rows, however the rows were
+//! sliced: each per-row verifier is the batch path's own (the forward iterator's
+//! scan, [`CaseInsensitiveMatcher`], the same capped regex and [`scan_line`]), rows
+//! arrive in the batch build's order, and [`MAX_SEARCH_MATCHES`] applies to the
+//! final retained suffix. Rows the deterministic eviction schedule would drop are
+//! consumed unverified, so a capped evicted prefix cannot starve newer matches. A
+//! row whose regex scan runs out of budget keeps the matches found so far and counts
+//! in [`SearchResults::cut_short_lines`], as in the one-shot search.
 //!
-//! Driving a `BudgetedSearch` to completion yields the SAME [`SearchResults`]
-//! as building a [`SearchIndex`] over the same rows and calling
-//! [`SearchIndex::search_results_opts`] — regardless of how the rows were
-//! sliced across calls. This holds because every per-row verifier IS the batch
-//! path's own machinery run over one row (the forward match iterator's scan
-//! for case-sensitive literals, [`CaseInsensitiveMatcher`] for case-insensitive
-//! literals, the same compiled/capped regex for regex mode), rows are fed in
-//! the same ascending absolute order the batch build indexes them, and the
-//! [`MAX_SEARCH_MATCHES`] cap is applied to exactly the final retained suffix.
-//! Rows that deterministic index eviction would discard are consumed without
-//! verification, preventing a capped evicted prefix from starving newer retained
-//! matches. No index is retained: the same eviction schedule determines the
-//! searchable suffix up front. Pinned by the slicing-oracle tests below,
-//! including the combined cap-plus-eviction regime.
-//!
-//! The equality covers rows a regex scan could not finish. Each row is scanned
-//! under its own budget by the batch path's own [`scan_line`]; a row that runs
-//! out keeps the matches found before it did and is counted in
-//! [`SearchResults::cut_short_lines`], which marks the results incomplete —
-//! exactly what the one-shot search reports for the same rows. Later rows are
-//! still scanned, each under its own budget. So no reader is handed a list
-//! missing a row's tail as if it were the whole, and no long row takes every
-//! other row's matches away.
-//!
-//! ## Staleness
-//!
-//! `BudgetedSearch` knows nothing about content generations — it searches the
-//! rows it is fed. The owner (aterm-core's `Terminal::search_budgeted`) keys
-//! each instance to a content generation and DISCARDS it when the underlying
-//! buffer changes, so a resumed cursor can never surface stale coordinates.
+//! The engine knows nothing about content generations; its owner
+//! (aterm-core's `Terminal::search_budgeted`) discards it when the content changes.
 
 use std::borrow::Cow;
 
@@ -60,33 +36,23 @@ use crate::index::{
 use crate::iterators::next_literal_match;
 use crate::types::{SearchMatch, SearchResults};
 
-/// Per-row verifier, fixed at construction from `(case_sensitive, is_regex)`.
-///
-/// Each variant reuses the corresponding batch-search machinery so budgeted
-/// results are equal to one-shot results by construction (module docs).
+/// Per-row verifier, fixed by `(case_sensitive, is_regex)`; each reuses the batch
+/// path's machinery.
 enum RowMatcher {
-    /// Case-sensitive literal: verified with the batch forward iterator's own
-    /// scan ([`next_literal_match`]) run over the supplied row.
+    /// Case-sensitive literal: the batch forward iterator's scan
+    /// ([`next_literal_match`]).
     Literal,
     /// Case-insensitive literal: the batch path's per-line matcher.
     CaseInsensitive(CaseInsensitiveMatcher),
-    /// Regex (either case mode): compiled ONCE with the batch path's pattern
-    /// length / NFA / DFA caps, reused across every resumed slice.
+    /// Regex (either case mode), compiled once with the batch path's caps.
     Regex(aterm_regex::Regex),
 }
 
-/// A budgeted, resumable search over a fixed window of absolute rows.
-///
-/// Construct with the query + options and the window `[base_row, base_row +
-/// total_rows)`, then feed each row's text in ascending order via
-/// `feed_row` — as few or as many per call as the caller's
-/// budget allows. [`is_complete`](Self::is_complete) reports whether every row
-/// has been consumed; [`results`](Self::results) returns the accumulated
-/// [`SearchResults`] (partial until complete). See the module docs for the
-/// results-equality and staleness contracts.
+/// A budgeted, resumable search over the absolute rows
+/// `[base_row, base_row + total_rows)`, fed one row at a time in ascending order.
+/// See the module docs for the results-equality contract.
 pub struct BudgetedSearch {
-    /// The batch index's cache cap, preserved for its first-eviction warning.
-    /// This engine retains no row cache of its own.
+    /// The batch index's cache cap; no row cache is kept here.
     max_cached_lines: usize,
     /// The query string (verbatim; folding/compilation lives in `matcher`).
     query: String,
@@ -99,18 +65,15 @@ pub struct BudgetedSearch {
     base_row: usize,
     /// Total rows in the window.
     total_rows: usize,
-    /// Rows consumed so far; the next `feed_row` is absolute
-    /// `base_row + rows_fed`.
+    /// Rows consumed so far.
     rows_fed: usize,
-    /// Window-relative first row that the completed index will retain. Rows
-    /// before this are consumed but deliberately not verified; see the
-    /// equality contract.
+    /// Window-relative first row the completed index retains; earlier rows are
+    /// consumed unverified.
     verify_from: usize,
-    /// Final one-shot-compatible watermark, known from the deterministic
-    /// eviction schedule before feeding begins. Zero means no eviction.
+    /// The one-shot watermark, known up front from the eviction schedule; zero
+    /// means no eviction.
     final_lowest_retained_line: usize,
-    /// The terminal's `ambiguous_width` policy match columns are measured
-    /// under, as the batch index's.
+    /// The `ambiguous_width` policy match columns are measured under.
     ambiguous_width: AmbiguousWidth,
     /// Verified rows whose regex scan ran out of its budget part-way
     /// ([`SearchResults::cut_short_lines`]).
@@ -118,11 +81,8 @@ pub struct BudgetedSearch {
 }
 
 impl BudgetedSearch {
-    /// Start a budgeted search for `query` over `total_rows` rows whose first
-    /// row is absolute row `base_row`.
-    ///
-    /// Regex patterns are validated and compiled here (with the batch path's
-    /// size caps), so an invalid pattern fails before any row scanning.
+    /// Start a search for `query` over `total_rows` rows from absolute row
+    /// `base_row`. An invalid regex fails here, before any row is scanned.
     pub fn new(
         query: &str,
         case_sensitive: bool,
@@ -179,35 +139,27 @@ impl BudgetedSearch {
     }
 
     /// Measure match columns under the terminal's `ambiguous_width` policy, as
-    /// [`SearchIndex::set_ambiguous_width`] does for the batch path. Set it
-    /// before feeding rows.
+    /// [`SearchIndex::set_ambiguous_width`] does. Set it before feeding rows.
     #[must_use]
     pub fn with_ambiguous_width(mut self, ambiguous: AmbiguousWidth) -> Self {
         self.ambiguous_width = ambiguous;
         self
     }
 
-    /// Consume and verify ONE row. Rows must be fed in ascending window order;
-    /// this row is absolute `base_row + rows_fed()`. Feeding past the window
-    /// is a no-op (the caller's completion check races nothing, so tolerate it
-    /// rather than panic).
+    /// Consume and verify one row, absolute `base_row + rows_fed()`. Rows arrive in
+    /// ascending order; feeding past the window is a no-op.
     #[cfg(test)]
     pub fn feed_row(&mut self, text: &str) {
         self.feed_row_cow(Cow::Borrowed(text), None);
     }
 
-    /// Consume and verify one owned row without copying or retaining its text.
-    ///
-    /// This has the same ordering and completion contract as
-    /// `feed_row`; `text` is released before returning.
+    /// Consume and verify one owned row; `text` is dropped before returning.
     pub fn feed_row_owned(&mut self, text: String) {
         self.feed_row_cow(Cow::Owned(text), None);
     }
 
-    /// [`feed_row_owned`](Self::feed_row_owned) with the grid cells the row's
-    /// text was read from, which its matches are reported in, as
-    /// [`TerminalSearch::index_numbered_cells_owned`](crate::TerminalSearch::index_numbered_cells_owned)
-    /// reports the batch index's.
+    /// [`feed_row_owned`](Self::feed_row_owned) with the [`LineCells`] the text was
+    /// read from; matches are reported in those cells.
     pub fn feed_row_cells(&mut self, text: String, cells: &LineCells) {
         self.feed_row_cow(Cow::Owned(text), Some(cells));
     }
@@ -219,8 +171,7 @@ impl BudgetedSearch {
         let row_offset = self.rows_fed;
         let abs_row = self.base_row.saturating_add(row_offset);
         self.rows_fed += 1;
-        // Preserve the batch index's once-per-search truncation diagnostic at
-        // its first eviction boundary, without building its unused row cache.
+        // The batch index's one-time truncation warning, at its first eviction.
         if self.verify_from > 0 && row_offset == self.max_cached_lines {
             let lowest = self
                 .base_row
@@ -234,17 +185,15 @@ impl BudgetedSearch {
         if row_offset < self.verify_from {
             return;
         }
-        // Once capped, further verification cannot change the result set (the
-        // batch path stops scanning at the cap too). Because verification only
-        // begins at the final retained suffix, later eviction can never remove
-        // capped matches and expose an unverified hole.
+        // Past the cap nothing can change the result (the batch path stops there
+        // too); verifying only the retained suffix means eviction never removes a
+        // capped match.
         if self.matches.len() < MAX_SEARCH_MATCHES {
             self.verify_row(abs_row, &text, cells);
         }
     }
 
-    /// Rows consumed so far (also the window-relative index of the next
-    /// expected row).
+    /// Rows consumed so far: the window-relative index of the next row.
     #[must_use]
     pub fn rows_fed(&self) -> usize {
         self.rows_fed
@@ -262,26 +211,15 @@ impl BudgetedSearch {
         self.rows_fed >= self.total_rows
     }
 
-    /// The accumulated results (partial until [`is_complete`](Self::is_complete)).
-    ///
-    /// Mirrors [`SearchIndex::search_results_opts`]'s reporting: `incomplete`
-    /// is set when eviction dropped indexed rows OR the match cap was reached,
-    /// and matches below the eviction watermark are filtered out so a
-    /// completed budgeted search equals a one-shot search over the same rows.
-    /// This is a full snapshot; resumable frontends should use
-    /// [`results_range`](Self::results_range) to bound per-turn copying.
-    ///
-    /// A row whose regex scan ran out of budget is counted in
-    /// [`SearchResults::cut_short_lines`], as the one-shot search counts it
-    /// (module docs).
+    /// A full snapshot of the results (partial until [`is_complete`](Self::is_complete)),
+    /// reported as [`SearchIndex::search_results_opts`] reports them. Resumable owners
+    /// use [`results_range`](Self::results_range) to bound copying.
     #[must_use]
     pub fn results(&self) -> SearchResults {
         let capped = self.matches.len() >= MAX_SEARCH_MATCHES;
         let evicted = self.verify_from > 0;
         let lowest = self.final_lowest_retained_line;
         let matches = if evicted {
-            // Keep the one-shot watermark boundary explicit. Verification
-            // already skips the prefix its completed index would have evicted.
             self.matches
                 .iter()
                 .filter(|m| m.line >= lowest)
@@ -294,21 +232,15 @@ impl BudgetedSearch {
             .with_cut_short_lines(self.cut_short_rows)
     }
 
-    /// Number of matches accumulated so far.
-    ///
-    /// This lets a resumable owner deliver each match exactly once without
-    /// cloning the whole growing prefix on every event-loop turn.
+    /// Number of matches accumulated so far, so an owner can deliver each once.
     #[must_use]
     pub fn result_count(&self) -> usize {
         self.matches.len()
     }
 
-    /// Clone at most `limit` accumulated matches beginning at `start`.
-    ///
-    /// The returned metadata describes the whole search state, while
-    /// `matches` is only the requested stable slice. Verification starts at
-    /// the completed index's final retained suffix, so a slice already handed
-    /// to a caller can never be invalidated by a later eviction pass.
+    /// Clone at most `limit` matches from `start`, with metadata for the whole
+    /// search. Verification starts at the final retained suffix, so a slice already
+    /// handed out is never invalidated by later eviction.
     #[must_use]
     pub fn results_range(&self, start: usize, limit: usize) -> SearchResults {
         let start = start.min(self.matches.len());
@@ -325,8 +257,7 @@ impl BudgetedSearch {
             .with_cut_short_lines(self.cut_short_rows)
     }
 
-    /// Verify matches on the supplied row `abs_row`, appending to
-    /// `self.matches` (ascending order preserved; capped).
+    /// Append row `abs_row`'s matches to `self.matches`, up to the cap.
     fn verify_row(&mut self, abs_row: usize, text: &str, cells: Option<&LineCells>) {
         if self.query.is_empty() && !matches!(&self.matcher, RowMatcher::Regex(_)) {
             return;
@@ -337,10 +268,7 @@ impl BudgetedSearch {
         };
         match &mut self.matcher {
             RowMatcher::Literal => {
-                // Use the batch forward iterator's own per-row verifier.
-                // Rebuilding postings for a row consumed exactly once would
-                // add work without improving this scan. All three arms use
-                // the same temporary coordinate map and retain only matches.
+                // The batch forward iterator's own scan; no postings for a row read once.
                 let searcher = crate::bytesearch::Searcher::new(self.query.as_bytes());
                 let mut next_byte = 0;
                 while let Some((found, resume)) =
@@ -363,8 +291,7 @@ impl BudgetedSearch {
             RowMatcher::Regex(re) => {
                 let mut scan = scan_line(re, text);
                 for cap in scan.by_ref() {
-                    // Skip zero-length matches and byte spans that resolve to
-                    // zero display columns — the batch forward path's rule.
+                    // Skip empty spans and zero-column spans, as the batch path does.
                     if cap.start() == cap.end() {
                         continue;
                     }
@@ -464,8 +391,8 @@ mod tests {
             let mut borrowed = BudgetedSearch::new(query, case_sensitive, is_regex, 7, rows.len())
                 .expect("budgeted construction");
             for row in rows {
-                // Excess capacity must not affect matching or be kept by the
-                // engine. Actual reclamation is checked by index_release_memory.
+                // Spare capacity must not affect matching (reclamation is checked by
+                // index_release_memory).
                 let mut text = String::with_capacity(4096);
                 text.push_str(row);
                 owned.feed_row_owned(text);
@@ -482,8 +409,7 @@ mod tests {
         }
     }
 
-    /// The closed-form doomed-prefix calculation must stay identical to the
-    /// real index's hysteretic 3/4 eviction schedule for every small boundary.
+    /// `final_evicted_prefix` equals the real index's eviction schedule.
     #[test]
     fn final_evicted_prefix_matches_real_index_schedule() {
         for cap in 1..=20 {
@@ -501,9 +427,8 @@ mod tests {
         }
     }
 
-    /// Resume-equality oracle: any slicing of the row feed produces results
-    /// identical to the one-shot batch search — every filter mode, including
-    /// short (< trigram) and Unicode queries, at a non-zero base row.
+    /// Any slicing of the row feed equals the one-shot search, in every mode, at a
+    /// non-zero base row.
     #[test]
     fn any_slicing_equals_one_shot_across_all_modes() {
         let rows = sample_rows();
@@ -532,8 +457,7 @@ mod tests {
         }
     }
 
-    /// The match cap applies identically to budgeted and one-shot searches,
-    /// and both report the capped set as incomplete.
+    /// The match cap applies identically and is reported as incomplete.
     #[test]
     fn match_cap_matches_one_shot_and_reports_incomplete() {
         // 80 matches per row x 1300 rows = 104_000 > MAX_SEARCH_MATCHES.
@@ -546,9 +470,8 @@ mod tests {
         assert_eq!(got, oracle);
     }
 
-    /// Eviction mid-build: the completed budgeted search equals the one-shot
-    /// search over the same capped index (evicted rows filtered, incomplete
-    /// reported, watermark equal).
+    /// With eviction mid-build, the completed search equals the one-shot search over
+    /// the same capped index.
     #[test]
     fn eviction_matches_one_shot_capped_index() {
         let rows: Vec<String> = (0..100).map(|i| format!("needle row {i}")).collect();
@@ -579,15 +502,14 @@ mod tests {
         }
     }
 
-    /// Regression: reaching the match cap in rows that are later evicted must
-    /// not starve matches in the final retained suffix. This is the interaction
-    /// the separate cap-only and eviction-only tests cannot exercise.
+    /// Hitting the match cap in rows that are later evicted must not starve the
+    /// retained suffix.
     #[test]
     fn combined_match_cap_and_eviction_equals_one_shot() {
         const CACHE_LINES: usize = 10;
         const ROWS: usize = 20;
-        // More than MAX_SEARCH_MATCHES matches occur before the final retained
-        // suffix, while every retained row also contains matches.
+        // Over MAX_SEARCH_MATCHES matches before the retained suffix, and matches
+        // in every retained row.
         let dense = "a".repeat(MAX_SEARCH_MATCHES / 2 + 1);
         let rows: Vec<&str> = (0..ROWS).map(|_| dense.as_str()).collect();
 
@@ -624,21 +546,16 @@ mod tests {
         }
     }
 
-    /// An invalid regex fails at construction, before any row scanning.
     #[test]
     fn invalid_regex_fails_at_construction() {
         let err = BudgetedSearch::new("f(oo", false, true, 0, 10);
         assert!(matches!(err, Err(SearchOptionsError::InvalidRegex(_))));
     }
 
-    /// A row whose regex scan runs out of its budget is reported exactly as
-    /// the one-shot search over the same rows reports it: the matches found
-    /// before the scan stopped, the row counted in `cut_short_lines`, the
-    /// results marked incomplete — never `incomplete == false` over a row
-    /// whose tail was not read, and never a refusal that throws away every
-    /// other row's matches. Rows after it are still searched. One search over
-    /// budget, and a `find_iter` whose per-match searches each fit but
-    /// together re-walk the row quadratically.
+    /// A row whose regex scan runs out of budget is reported as the one-shot search
+    /// reports it: matches found so far, counted in `cut_short_lines`, incomplete,
+    /// later rows still searched. Cases: one search over budget, and a `find_iter`
+    /// whose per-match searches each fit but together re-walk the row quadratically.
     #[test]
     fn a_row_the_regex_scan_cannot_finish_is_reported_like_the_one_shot() {
         let wide = format!("{}z", "x".repeat(4095));
@@ -675,9 +592,7 @@ mod tests {
         }
     }
 
-    /// Partial results are a prefix of the final results (progressive display
-    /// never shows a match that later disappears absent invalidation), and
-    /// feeding past the window is a tolerated no-op.
+    /// Partial results are a prefix of the final results; overfeeding is a no-op.
     #[test]
     fn partial_results_are_a_prefix_and_overfeed_is_a_noop() {
         let rows = sample_rows();
@@ -704,9 +619,8 @@ mod tests {
         assert_eq!(done, one_shot(&rows, 0, "needle", false, false));
     }
 
-    /// Stable slices stay valid even when the batch index would cross an
-    /// eviction boundary: doomed-prefix rows are never emitted, and bounded
-    /// range reads do not clone the full accumulated vector.
+    /// Emitted range slices stay a prefix across an eviction boundary, and range
+    /// reads are bounded.
     #[test]
     fn result_ranges_are_bounded_and_stable_across_eviction() {
         let rows: Vec<String> = (0..20).map(|i| format!("needle row {i}")).collect();

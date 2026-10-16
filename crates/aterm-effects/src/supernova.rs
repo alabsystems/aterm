@@ -21,10 +21,10 @@
 //!   crown, aggregate light capped. Light (the eclipse): an Over dark veil of
 //!   per-cell `DecoGlyph::Shade` stamps around the word (≤ 200 cells) and a dark
 //!   crown, aggregate opacity capped.
-//! * **Shockwave** `650–1600`: a double ring expanding to
-//!   `min(6 rows, grid extent)`, 30-band chord construction (≤ 2 chords per band
-//!   per ring). Light themes keep a saturated additive core plus an Over dark
-//!   fringe along the circumference.
+//! * **Shockwave** `650–1600`: a double ring expanding to [`r_max_for`] (6 rows,
+//!   at most half the grid height), 30-band chord construction (≤ 2 chords per
+//!   band per ring). Light themes keep a saturated additive core plus an Over
+//!   dark fringe along the circumference.
 //! * **Rainbow debris** `1200–2400`: 24–40 hue-cycled motes on the shared 350 ms
 //!   twinkle grid (additive on dark, Over on light).
 //! * **Afterglow** `≥ 2400`: the ink settles to static rainbow and the ember star
@@ -39,7 +39,7 @@ use crate::color_math::hsv2rgb;
 /// Deterministic per script, decorrelated across repeats of one word.
 pub const SUPERNOVA_SALT: u64 = 0xF0CC_AC1A_5EED_B00F;
 
-/// The three detonation tiers (owner, 2026-07-24).
+/// The three detonation tiers.
 ///
 /// A tier axis inside `BurstKind::SuperNova` rather than separate burst kinds,
 /// so `super_prepass`, the burst mutex, `grant_ignition`,
@@ -47,10 +47,10 @@ pub const SUPERNOVA_SALT: u64 = 0xF0CC_AC1A_5EED_B00F;
 /// the GPU parity arm are shared.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum SuperTier {
-    /// The everyday bang: a local wash and one ring, ~1.1 s. The FLOOR of the
-    /// ladder — before this tier existed, 90% of f-bombs detonated not at all.
+    /// The everyday bang: a local wash and one ring, ~1.1 s. The ladder's
+    /// floor.
     Flash,
-    /// Today's supernova, byte-identical. The uncommon middle.
+    /// The full supernova (the module's phase timeline). The uncommon middle.
     #[default]
     Nova,
     /// The mushroom cloud (`crate::nuke`). The jackpot, ~3.6 s.
@@ -67,16 +67,15 @@ pub enum SuperTier {
 pub const TIER_FLASH_END: u64 = 700;
 pub const TIER_NOVA_END: u64 = 950;
 
-/// Decode the tier from the HIGH half of the birth draw.
+/// Decode the tier from the high half of the birth draw (base windows).
 #[must_use]
 #[cfg(test)]
 pub fn tier_of(draw: u64) -> SuperTier {
     tier_for(draw, 1)
 }
 
-/// The f-bomb combo (owner, 2026-08-07): a typed f-bomb within
-/// [`COMBO_WINDOW_MS`] of recent typed f-bombs raises the combo level (recent
-/// f-bombs, this one included).
+/// The f-bomb combo: a typed f-bomb within [`COMBO_WINDOW_MS`] of recent typed
+/// f-bombs raises the combo level (recent f-bombs, this one included).
 ///
 /// The level escalates both decodes of the birth draw: the detonation chance
 /// rises [`COMBO_CHANCE_STEP`] points per level and the tier windows slide
@@ -107,8 +106,8 @@ const COMBO_TIER_WINDOWS: [(u64, u64); COMBO_EXTREME_LEVEL as usize] = [
     (0, 0),
 ];
 
-/// Decode the tier from the HIGH half of the birth draw at a combo level.
-/// `tier_for(draw, level <= 1)` is byte-identical to the classic `tier_of`.
+/// Decode the tier from the high half of the birth draw at a combo level;
+/// `level <= 1` uses the base windows.
 #[must_use]
 pub fn tier_for(draw: u64, level: u32) -> SuperTier {
     let row = level.clamp(1, COMBO_EXTREME_LEVEL) as usize - 1;
@@ -149,7 +148,7 @@ pub const DEBRIS_START_MS: u64 = 1200;
 /// Total window; the host sets `nova_done` here and starts the ember fade.
 pub const SUPER_TOTAL_MS: u64 = 2400;
 
-/// §3.2 shockwave reach in rows (clamped to the grid extent by the caller).
+/// §3.2 shockwave reach in rows (clamped by [`r_max_for`]).
 pub const SUPER_RADIUS_ROWS: f32 = 6.0;
 
 /// The reach clamp in px: `min(6 rows · cell_h, grid_h / 2)`, floored at 1 px;
@@ -164,7 +163,7 @@ pub fn r_max_for(cell_h: i32, grid_h: i32) -> f32 {
 
 /// Per-supernova quad budget (own `QuadSink` clone under it).
 pub const MAX_SUPER_QUADS_PER: usize = 1024;
-/// Concurrency: at most ONE live supernova, window-wide.
+/// Concurrency: at most one live supernova, window-wide.
 pub const MAX_ACTIVE_SUPERNOVAE: usize = 1;
 /// Charge motes.
 pub const CHARGE_MOTES: usize = 12;
@@ -218,7 +217,7 @@ pub struct SuperEnv {
     /// Detonation center, px (the word span's visual midpoint).
     pub cx: i32,
     pub cy: i32,
-    /// Shockwave reach, px: `min(6 rows · cell_h, grid extent)`.
+    /// Shockwave reach, px ([`r_max_for`]).
     pub r_max: f32,
     /// Word span, cells (the light-theme veil anchors around it).
     pub row: u16,
@@ -282,8 +281,7 @@ impl QuadSink<'_> {
                 w: (x1 - x0) as u16,
                 h: (band_end - yy) as u16,
                 color: premul,
-                // ADDITIVE light — this emitter has no other mode (see
-                // [`GlowQuad::alpha`]).
+                // Additive light: this emitter has no other mode.
                 alpha: 0,
                 color2: premul,
                 alpha2: 0,
@@ -771,8 +769,7 @@ pub fn emit_super_decos(t_ms: u64, env: &SuperEnv, out: &mut Vec<WordDecoration>
         }
     }
     if (DEBRIS_START_MS..SUPER_TOTAL_MS).contains(&t_ms) {
-        // Rainbow debris: 24–40 hue-cycled motes, twinkle LOCKED to the shared
-        // 350 ms grid (2 phases ⇒ region onsets ≤ 3/s, the WCAG floor).
+        // Rainbow debris: 24–40 hue-cycled motes on the shared twinkle grid.
         let n = 24 + (env.seed % 17) as usize; // 24..=40
         let p = (t_ms - DEBRIS_START_MS) as f32 / (SUPER_TOTAL_MS - DEBRIS_START_MS) as f32;
         for k in 0..n {
@@ -985,8 +982,7 @@ mod tests {
     fn r_max_for_matches_engine_clamp() {
         // Tall grid: the 6-row reach wins (64 rows: grid_h/2 = 32 rows).
         assert_eq!(r_max_for(20, 64 * 20), 6.0 * 20.0);
-        // Short grid (8 rows): the grid_h/2 clamp binds at 4 rows — the case
-        // the old min(grid_w, grid_h) formula let escape to 6 rows.
+        // Short grid (8 rows): the grid_h/2 clamp binds at 4 rows.
         assert_eq!(r_max_for(20, 8 * 20), 4.0 * 20.0);
         // Degenerate metrics floor at 1 px (the engine's .max(1.0)).
         assert_eq!(r_max_for(0, 0), 1.0);
@@ -1127,8 +1123,8 @@ mod tests {
     fn detonation_has_a_hard_aggregate_readability_ceiling() {
         let t = 500; // sin(pi * 0.5): the exact detonation peak
 
-        // Negative control: the pre-limiter center wash alone contributed 230
-        // channel levels, before any crown overlap.
+        // Negative control: the unbounded centre wash alone reaches 230 channel
+        // levels, before any crown overlap.
         let raw_wash = max_channel(premul(WASH_CORE, 0.9));
         assert!(
             raw_wash > MAX_VIEWPORT_OVERLAY,
@@ -1175,8 +1171,7 @@ mod tests {
             "the eclipse stays visible but cannot cross the aggregate opacity ceiling: {bounded_alpha}"
         );
 
-        // The cap is scoped to viewport-covering Shade stamps.  The tiny
-        // rainbow debris keeps its bright sparkle detail.
+        // The cap is scoped to Shade stamps: small rainbow debris stays bright.
         let mut debris = Vec::new();
         emit_super_decos(2000, &light, &mut debris, 256);
         assert!(
@@ -1476,8 +1471,7 @@ mod tests {
             wash_rows.iter().all(|r| (40..rows).contains(r)),
             "window clamps inside the grid"
         );
-        // A ≤160-row viewport still washes every row from 0 (byte-identical
-        // to the pre-fix emission — the window only moves when it must).
+        // A ≤160-row viewport still washes every row from 0.
         let e = env(20, false, 64);
         let mut q = Vec::new();
         let c = emit_super(500, &e, MAX_SUPER_QUADS_PER, &mut q);
@@ -1490,7 +1484,7 @@ mod tests {
     #[test]
     fn light_charge_and_debris_ride_over_stream() {
         let (dark, light) = (env(20, false, 64), env(20, true, 64));
-        // Charge (t = 200): light emits NO additive quads; ≤ 12 Over decos.
+        // Charge (t = 200): light emits no additive quads; ≤ 12 Over decos.
         let mut lq = Vec::new();
         let lc = emit_super(200, &light, MAX_SUPER_QUADS_PER, &mut lq);
         assert_eq!(lc.charge, 0, "light charge leaves the additive channel");
@@ -1529,10 +1523,8 @@ mod tests {
         }
     }
 
-    /// Determinism and phase windows: same (t, env) gives identical bytes, and
-    /// each phase lives only in its window. The tiers split 70/25/5 and the tier
-    /// decode is independent of the detonate decode, so it does not skew with
-    /// `chance_pct`.
+    /// The tiers split 70/25/5, and the tier decode is independent of the
+    /// detonate decode, so the split does not skew with `chance_pct`.
     #[test]
     fn tier_split_is_the_designed_distribution() {
         let (mut flash, mut nova, mut nuke) = (0u32, 0u32, 0u32);
@@ -1595,21 +1587,18 @@ mod tests {
         );
     }
 
-    /// Each tier owns its own window, and they are strictly ordered — the
-    /// rarest degree is also the longest.
+    /// Tier windows are strictly ordered: the rarest tier is also the longest.
     #[test]
     fn tier_windows_are_ordered() {
         assert!(total_ms(SuperTier::Flash) < total_ms(SuperTier::Nova));
         assert!(total_ms(SuperTier::Nova) < total_ms(SuperTier::Nuke));
-        // Nova is UNCHANGED — the historical supernova must stay byte-identical.
         assert_eq!(total_ms(SuperTier::Nova), SUPER_TOTAL_MS);
-        // A Flash ends before the debris phase even begins, which is what makes
-        // it read as the smaller event rather than a truncated supernova.
+        // A Flash ends before debris begins, so it reads as a smaller event,
+        // not a truncated supernova.
         assert!(total_ms(SuperTier::Flash) < DEBRIS_START_MS);
     }
 
-    /// A lone f-bomb cannot tell the combo exists: levels 0 and 1 decode
-    /// byte-identically to the classic `tier_of` over the full draw shape.
+    /// Levels 0 and 1 decode exactly as the base windows (`tier_of`).
     #[test]
     fn combo_baseline_is_byte_identical() {
         for i in 0..200_000u64 {

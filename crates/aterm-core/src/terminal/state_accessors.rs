@@ -1,8 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! State accessors for `Terminal`: keyboard, cursor, modes, title, icon,
-//! security authorizations and snapshots.
+//! State accessors for `Terminal`: vi mode, keyboard, cursor, modes, title and the
+//! security authorizations.
 
 use super::{
     CurrentStyle, Cursor, CursorStyle, KittyKeyboardFlags, MAX_TITLE_BYTES, Terminal,
@@ -44,20 +44,14 @@ impl Terminal {
         self.vi.cursor_point()
     }
 
-    /// Toggle vi mode on/off.
-    ///
-    /// When toggling on, the cursor is placed at the terminal's current
-    /// cursor position. Split-borrows `grid` and `vi` to avoid borrow conflicts.
+    /// Toggle vi mode on/off; toggling on places the vi cursor at the terminal cursor.
     pub fn vi_toggle(&mut self) {
         let cursor = self.grid.cursor();
         let point = crate::vi_mode::ViPoint::new(i32::from(cursor.row), cursor.col);
         self.vi.toggle(point);
     }
 
-    /// Execute a vi mode motion with grid access.
-    ///
-    /// Split-borrows `grid` (read) and `vi` (write) to dispatch motions
-    /// that require grid content (word, bracket, paragraph, search).
+    /// Execute a vi mode motion; word, bracket, paragraph and search motions read the grid.
     pub fn vi_motion(
         &mut self,
         motion: crate::vi_mode::ViMotion,
@@ -66,40 +60,29 @@ impl Terminal {
         self.vi.motion_with_grid(&self.grid, motion, boundary);
     }
 
-    /// Keep the vi cursor on its text after a batch moved rows, then clamp it
-    /// onto the grid.
+    /// Keep the vi cursor on its text after a batch moved rows, then clamp it onto the grid.
     ///
-    /// A vi line is counted from the live screen's top. `lines` is the rise of
-    /// the grid's absolute row counter (the count that re-pins a scrolled-back
-    /// viewport): output that scrolled the whole screen pushed every line that
-    /// many lines up. History grows only by such scrolls and by a region at the
-    /// top scrolling into it, both counted by the rise, so a line already in
-    /// history always moves up by the whole rise.
+    /// A vi line counts from the live screen's top; `lines` is the rise of the grid's
+    /// absolute row counter. History grows only by whole-screen scrolls and by a top region
+    /// scrolling into it, both counted by the rise, so a line in history moves up by the
+    /// whole rise.
     ///
-    /// `bands` is the batch's row-band record when it explains every row the
-    /// batch moved (`post_process`). A cursor on the screen then rides only the
-    /// moves its row was in, replayed in order:
+    /// `bands` is the batch's row-band record when it explains every row the batch moved.
+    /// A cursor on the screen then replays, in order, only the moves its row was in:
     ///
-    /// * a region at the top of a screen with history (`top == 0`, the counter
-    ///   rising): its rows and all of history go up and its top rows enter
-    ///   history, while the fixed rows below it stay (Codex's composer, apt's
-    ///   progress bar);
-    /// * any other band (an interior region, IL/DL, a reverse index, a top
-    ///   region with no history): its rows move, a cursor whose row left the
-    ///   band rests on the edge it left through, as Alacritty's does, and
-    ///   every line outside it stays.
+    /// * a top region of a screen with history (`top == 0`, the counter rising): its rows
+    ///   and all of history go up, its top rows into history, and the fixed rows below it
+    ///   stay (Codex's composer, apt's progress bar);
+    /// * any other band (interior region, IL/DL, reverse index, a top region with no
+    ///   history): its rows move, a cursor whose row left the band rests on the edge it
+    ///   left through, and every line outside it stays.
     ///
-    /// A row that entered history is among the batch's `lines` newest history
-    /// lines, so the replay stops there. Only a batch that also took rows off
-    /// the top of such a region without archiving them (DL at row 0) could
-    /// carry it further: the band record composes the two moves into one.
+    /// A row that entered history is among the batch's `lines` newest history lines, so
+    /// the replay stops there; the band record composes a DL at row 0 with the archival.
     ///
-    /// The clamp runs on every batch, so a batch that cleared history (ED 3)
-    /// leaves no cursor below the oldest line. A cursor whose text left history
-    /// rests on the oldest line kept, which at display offset 0 can be above
-    /// the viewport: aterm's cursor follows its text out of a live viewport on
-    /// purpose. Alacritty's `scroll_up_relative` instead stops it at the
-    /// viewport's top, on text that is not its own.
+    /// The clamp runs on every batch, so a cleared history (ED 3) leaves no cursor below
+    /// the oldest line. A cursor whose text left history rests on the oldest line kept, even
+    /// above a live viewport: it follows its text on purpose.
     pub(super) fn vi_follow_output(&mut self, lines: u64, bands: Option<aterm_grid::RowBandMoves>) {
         if !self.vi_is_active() {
             return;
@@ -130,13 +113,11 @@ impl Terminal {
         self.vi_shift(after.saturating_sub(before));
     }
 
-    /// Move the vi cursor `delta` lines and clamp it onto the grid: its line
-    /// into `-history..=rows - 1`, its column into the width. While an
-    /// offloaded reflow holds the history (a window's width change), no
-    /// history is in memory to clamp against: the line keeps its floor until
-    /// [`Self::finish_resize_offload`] or [`Self::abort_resize_offload`]
-    /// clamps it — clamped then, a width change in copy mode put a cursor in
-    /// history on live line 0.
+    /// Move the vi cursor `delta` lines and clamp it onto the grid: line into
+    /// `-history..=rows - 1`, column into the width. While an offloaded reflow holds the
+    /// history, nothing is in memory to clamp against, so the line keeps its floor until
+    /// [`Self::finish_resize_offload`] or [`Self::abort_resize_offload`] clamps it
+    /// (clamping now would put a cursor in history on live line 0).
     pub(super) fn vi_shift(&mut self, delta: i32) {
         if !self.vi_is_active() {
             return;
@@ -152,8 +133,6 @@ impl Terminal {
     }
 
     /// Execute a vi mode inline character search (f/F/t/T).
-    ///
-    /// Split-borrows `grid` (read) and `vi` (write).
     pub fn vi_inline_search_execute(
         &mut self,
         needle: char,
@@ -178,43 +157,32 @@ impl Terminal {
         self.kitty_keyboard.flags()
     }
 
-    /// Enable or disable the Kitty keyboard protocol (default on).
-    ///
-    /// When disabled the terminal behaves as if the protocol is unsupported: the
-    /// `CSI ? u` query gets no reply, `CSI > u` / `= u` / `< u` are consumed and
-    /// ignored, and [`keyboard_mode`](Self::keyboard_mode) never carries kitty
-    /// flags, including ones negotiated earlier. For embedders whose platform
-    /// consumes kitty sequences itself (Windows ConPTY; xterm.js
-    /// `vtExtensions.kittyKeyboard = false`). Host policy: preserved across
-    /// `reset()`/RIS like the `allow_*` bits.
+    /// Enable or disable the Kitty keyboard protocol (default on), for embedders whose
+    /// platform consumes kitty sequences itself (Windows ConPTY). When disabled the
+    /// terminal acts as if the protocol is unsupported: `CSI ? u` gets no reply,
+    /// `CSI > u` / `= u` / `< u` are ignored, and [`keyboard_mode`](Self::keyboard_mode)
+    /// carries no kitty flags, even ones negotiated earlier. Host policy: preserved across
+    /// `reset()`/RIS.
     pub fn set_kitty_keyboard_enabled(&mut self, enabled: bool) {
         self.modes.kitty_keyboard_enabled = enabled;
         self.refresh_mode_mirror();
     }
 
-    /// Declare whether this session sits behind a Windows console host
-    /// (ConPTY), whose `CSI ? 9001 h` asks for win32-input-mode key records
-    /// (default off). Only then does DEC 9001 take effect; anywhere else it is
-    /// program output and is ignored, so a file that writes it cannot turn the
-    /// person's Escape and Enter chords into records no console host reads.
-    /// Host policy: preserved across `reset()`/RIS like the kitty capability.
+    /// Declare whether this session sits behind a Windows console host (ConPTY), whose
+    /// `CSI ? 9001 h` asks for win32-input-mode key records (default off). Elsewhere DEC 9001
+    /// is ignored, so program output cannot turn Escape and Enter into records nothing reads.
+    /// Host policy: preserved across `reset()`/RIS.
     pub fn set_win32_input_enabled(&mut self, enabled: bool) {
         self.modes.win32_input_enabled = enabled;
         self.refresh_mode_mirror();
     }
 
-    /// Set the keyboard capabilities a console host decides, from the fact
-    /// that also picks the session's resize seam policy, so the two cannot
-    /// disagree. Behind a Windows console host ([`ResizePolicy::ConPty`]),
-    /// conhost's DEC 9001 is honored
-    /// ([`set_win32_input_enabled`](Self::set_win32_input_enabled)) and the
-    /// kitty protocol is off
-    /// ([`set_kitty_keyboard_enabled`](Self::set_kitty_keyboard_enabled)):
-    /// conhost cannot turn CSI-u reports into the key records a console
-    /// program reads. Any other session gets the reverse. It sets both bits
-    /// whichever way they stood, so a checkpoint that carried another host's
-    /// bits does not outlive it. A live session and every replay of one
-    /// (`cast drift`) call this with the policy they resize under.
+    /// Set the keyboard capabilities a console host decides from the same fact that picks
+    /// the resize seam policy, so the two cannot disagree. Behind a Windows console host
+    /// ([`ResizePolicy::ConPty`]) DEC 9001 is honored and the kitty protocol is off
+    /// (conhost cannot turn CSI-u reports into console key records); any other session gets
+    /// the reverse. Sets both bits either way, so a checkpoint carrying another host's bits
+    /// does not outlive it. A live session and every replay (`cast drift`) call this.
     pub fn set_console_host_posture(&mut self, policy: ResizePolicy) {
         let console_host = policy == ResizePolicy::ConPty;
         self.modes.win32_input_enabled = console_host;
@@ -242,9 +210,7 @@ impl Terminal {
         &self.style
     }
 
-    /// Set the window title.
-    ///
-    /// Titles longer than `MAX_TITLE_BYTES` are truncated at a char boundary.
+    /// Set the window title, truncated at a char boundary to `MAX_TITLE_BYTES`.
     pub fn set_title(&mut self, title: &str) {
         let title = &title[..title.floor_char_boundary(MAX_TITLE_BYTES)];
         // Bump the title-change epoch only on a real value change (mirrors the
@@ -278,14 +244,10 @@ impl Terminal {
         Arc::clone(&self.title.window)
     }
 
-    /// Monotonic tab-label change epoch (window title or reported cwd).
-    ///
-    /// Incremented each time a value a host labels a tab with changes: the
-    /// window title (OSC 0/2 or [`set_title`](Self::set_title)) or the
-    /// shell-reported cwd (OSC 7 / OSC 633 `P;Cwd=`), shown for an unset title.
-    /// A no-op re-set does not bump it. Read with a lock-free `Relaxed` load so
-    /// hosts can poll without taking the terminal lock; it wraps, so compare
-    /// against a cached value.
+    /// Monotonic tab-label change epoch: bumped when the window title (OSC 0/2 or
+    /// [`set_title`](Self::set_title)) or the shell-reported cwd (OSC 7 / OSC 633
+    /// `P;Cwd=`, shown for an unset title) changes value. A lock-free `Relaxed` load, so
+    /// hosts poll it without the terminal lock; it wraps, so compare against a cached value.
     #[must_use]
     pub fn title_epoch(&self) -> u64 {
         self.title.epoch.load(std::sync::atomic::Ordering::Relaxed)
@@ -298,15 +260,8 @@ impl Terminal {
         &self.title.icon
     }
 
-    /// Enable or disable secure keyboard entry mode.
-    ///
-    /// Advisory: the UI layer activates the platform's secure input:
-    ///
-    /// - **macOS**: `EnableSecureEventInput()` / `DisableSecureEventInput()`
-    /// - **iOS**: not applicable (sandboxed)
-    /// - **Windows**: limited protection available
-    /// - **Linux/X11**: not possible
-    /// - **Linux/Wayland**: secure by default
+    /// Enable or disable secure keyboard entry mode. Advisory: the UI layer activates the
+    /// platform's secure input (macOS `EnableSecureEventInput()`).
     #[cfg(test)]
     pub fn set_secure_keyboard_entry(&mut self, enabled: bool) {
         self.secure_keyboard_entry = enabled;
@@ -323,8 +278,7 @@ impl Terminal {
         }
         self.modes.color_scheme = scheme;
         if self.modes.report_color_scheme {
-            // Unsolicited host-initiated push (not a query reply, so no capability
-            // gating / rate limiting): append directly to the response buffer.
+            // Unsolicited push, not a query reply: no capability gate or rate limit.
             use std::fmt::Write as _;
             let mut response = super::stack_response::StackResponse::<16>::new();
             let _ = write!(response, "\x1b[?997;{}n", scheme.dsr_code());
@@ -340,12 +294,10 @@ impl Terminal {
         self.modes.color_scheme
     }
 
-    /// Whether an OSC 52 query the program sends now reaches the host's
-    /// clipboard callback: one is installed, and the gate its handler mints
-    /// with opens (query access authorized, or allowed by the installed
-    /// policy). A host reads the pasteboard for a query before it takes the
-    /// terminal lock, and only for one this answers yes to (aterm-gui's
-    /// `host_io_prefetch`).
+    /// Whether an OSC 52 query the program sends now reaches the host's clipboard
+    /// callback: one is installed and the query gate opens (authorized, or allowed by the
+    /// installed policy). aterm-gui's `host_io_prefetch` reads the pasteboard, before it
+    /// takes the terminal lock, only when this says yes.
     #[must_use]
     pub fn clipboard_query_admitted(&self) -> bool {
         self.clipboard.callback.is_some()
@@ -363,25 +315,19 @@ impl Terminal {
         self.kitty_file_resolver.is_some()
     }
 
-    /// Authorize a clipboard access class for parser-origin sequences.
-    ///
-    /// `Write` covers OSC 52 set/clear and the OSC 1337 `CopyToClipboard` /
-    /// `EndCopy` / `Copy=` paths; `Query` covers OSC 52 queries. This is the
-    /// only way to mint a [`super::clipboard_auth::ClipboardWriteCapability`] or
-    /// [`super::clipboard_auth::ClipboardQueryCapability`] (via
-    /// [`super::clipboard_auth::ClipboardAuth`]).
+    /// Authorize a clipboard access class for parser-origin sequences: `Write` covers
+    /// OSC 52 set/clear and OSC 1337 `CopyToClipboard` / `EndCopy` / `Copy=`; `Query`
+    /// covers OSC 52 queries. The only way to mint a clipboard capability.
     pub fn authorize_clipboard_access(&mut self, access: super::clipboard_auth::ClipboardAccess) {
         use super::clipboard_auth::ClipboardAccess;
         match access {
             ClipboardAccess::Write => {
                 self.clipboard_auth.authorize_write();
-                // Mirror the set bit on modes so checkpoints and FFI observers
-                // agree with the capability state.
+                // Mirror the bit on modes so checkpoints and FFI observers agree.
                 self.modes.allow_osc52_set = true;
             }
             ClipboardAccess::Query => {
                 self.clipboard_auth.authorize_query();
-                // Mirror the query bit on modes for FFI/config back-compat.
                 self.modes.allow_osc52_query = true;
             }
         }
@@ -404,57 +350,41 @@ impl Terminal {
         }
     }
 
-    /// Authorize OSC 133 / OSC 633 shell integration with a 32-byte capability
-    /// nonce.
+    /// Authorize OSC 133 / OSC 633 shell integration with a 32-byte capability nonce.
     ///
-    /// When [`TerminalModes::require_shell_integration_nonce`] is set, OSC 133
-    /// A/B/C/D and OSC 633 A-H/P sequences dispatch only if their
-    /// `id=<64-hex>` equals `nonce`; others are dropped silently. The comparison
-    /// is constant-time.
-    ///
-    /// The host:
-    /// 1. Generates `nonce` with a CSPRNG at session init.
-    /// 2. Installs it here.
-    /// 3. Passes it to the shell's environment (e.g. `ATERM_SHELL_NONCE`) so the
-    ///    integration preamble emits `id=<hex>`.
-    /// 4. Sets `modes.require_shell_integration_nonce = true` once the preamble
-    ///    is in place; until then the check is bypassed (default off, like
-    ///    [`allow_palette_reconfigure`][aterm_types::TerminalModes]).
+    /// While [`TerminalModes::require_shell_integration_nonce`] is set, OSC 133 A/B/C/D and
+    /// OSC 633 A-H/P sequences dispatch only if their `id=<64-hex>` equals `nonce`
+    /// (constant-time compare); others are dropped silently. The host generates the nonce
+    /// with a CSPRNG, installs it here, passes it to the shell (`ATERM_SHELL_NONCE`) so
+    /// the preamble emits `id=<hex>`, and turns enforcement on once the preamble is in place.
     pub fn authorize_shell_integration(&mut self, nonce: [u8; 32]) {
         self.shell_integration_auth.authorize(nonce);
     }
 
-    /// [`authorize_shell_integration`][Self::authorize_shell_integration] for a
-    /// nonce the shell has not taken yet: the re-key of an adopted shell whose
-    /// nonce did not survive an update, delivered through a file the shell reads
-    /// at its next prompt (aterm-gui `shell_rekey`, the scripts'
-    /// `__aterm_rekey_check`). Marks signed with it verify at once, but it is not
-    /// in use until the first arrives:
-    /// [`shell_integration_posture`][Self::shell_integration_posture] reads
-    /// `Degraded` until then, and the seamless-handoff carry leaves it behind.
+    /// [`authorize_shell_integration`][Self::authorize_shell_integration] for a nonce the
+    /// shell has not taken yet: the re-key of an adopted shell whose nonce did not survive an
+    /// update, delivered through a file the shell reads at its next prompt (aterm-gui
+    /// `shell_rekey`). Marks signed with it verify at once, but
+    /// [`shell_integration_posture`][Self::shell_integration_posture] reads `Degraded` and
+    /// the seamless-handoff carry leaves it behind until the first arrives.
     pub fn authorize_shell_integration_on_first_mark(&mut self, nonce: [u8; 32]) {
         self.shell_integration_auth.authorize_on_first_mark(nonce);
     }
 
     /// [`authorize_shell_integration_on_first_mark`][Self::authorize_shell_integration_on_first_mark]
-    /// for a typed re-key (aterm-gui `shell_rekey::typed`): a nonce left in a
-    /// one-use file for a line typed at the prompt, healing a shell that has no
-    /// re-key hook. It can be taken back: the replaced authorization is kept
-    /// until the host restores it with
-    /// [`withdraw_shell_integration_rekey`][Self::withdraw_shell_integration_rekey]
-    /// (the line never ran) or forgets it with
-    /// [`settle_shell_integration_rekey`][Self::settle_shell_integration_rekey]
-    /// (the shell read the file). Marks verify at once; it is `On` from the
-    /// first of them.
+    /// for a typed re-key (aterm-gui `shell_rekey::typed`): a nonce left in a one-use file
+    /// for a line typed at the prompt. The replaced authorization is kept until
+    /// [`withdraw_shell_integration_rekey`][Self::withdraw_shell_integration_rekey] restores
+    /// it (the line never ran) or
+    /// [`settle_shell_integration_rekey`][Self::settle_shell_integration_rekey] forgets it
+    /// (the shell read the file). Marks verify at once; it is `On` from the first of them.
     pub fn authorize_shell_integration_rekey(&mut self, nonce: [u8; 32]) {
         self.shell_integration_auth.authorize_rekey(nonce);
     }
 
-    /// Take back the typed re-key `nonce`
-    /// ([`authorize_shell_integration_rekey`][Self::authorize_shell_integration_rekey]),
-    /// restoring the authorization it replaced. `false`, changing nothing, when
-    /// `nonce` is not that pending key (a mark signed with it already arrived, or
-    /// it was replaced or settled).
+    /// Take back the typed re-key `nonce`, restoring the authorization it replaced. `false`,
+    /// changing nothing, when `nonce` is not that pending key (a mark signed with it already
+    /// arrived, or it was replaced or settled).
     pub fn withdraw_shell_integration_rekey(&mut self, nonce: &[u8; 32]) -> bool {
         self.shell_integration_auth.withdraw_rekey(nonce)
     }
@@ -484,13 +414,10 @@ impl Terminal {
         self.shell_integration_auth.dropped_count()
     }
 
-    /// Enable or disable OSC 133 / OSC 633 capability-nonce enforcement
-    /// (`modes.require_shell_integration_nonce`). When `true`, every sequence
-    /// must carry a matching `id=<64-hex>` (see [`authorize_shell_integration`]);
-    /// `false` (the default) accepts unnonced shell integrations.
-    ///
-    /// Preserved across RIS and [`Terminal::reset`], so a program cannot turn
-    /// enforcement off with a reset (see `reset.rs`).
+    /// Enable or disable OSC 133 / OSC 633 capability-nonce enforcement (default off):
+    /// when on, every sequence must carry a matching `id=<64-hex>` (see
+    /// [`Self::authorize_shell_integration`]). Preserved across RIS and
+    /// [`Terminal::reset`], so a program cannot turn enforcement off with a reset.
     pub fn set_require_shell_integration_nonce(&mut self, required: bool) {
         self.modes.require_shell_integration_nonce = required;
     }
@@ -502,43 +429,29 @@ impl Terminal {
         self.modes.require_shell_integration_nonce
     }
 
-    /// Enable or disable OSC 9 / 99 / 777 desktop notifications (default off).
-    ///
-    /// While disabled, the handlers in `handler_osc_notify.rs` return before
-    /// invoking any callback; hosts that wire a notification callback must also
-    /// call this with `true`. `modes.allow_notifications` is the single source
-    /// of truth; `Self::authorize_notifications` sets the same bool.
-    ///
-    /// Preserved across `Terminal::reset()` and RIS, so a program cannot
-    /// re-enable notifications with a reset (see `reset.rs` and
-    /// `handler_esc.rs::reset_terminal_state`).
+    /// Enable or disable OSC 9 / 99 / 777 desktop notifications (default off): while off,
+    /// the handlers in `handler_osc_notify.rs` never reach the callback, so a host that
+    /// wires one must also call this with `true`. Preserved across `reset()` and RIS, so a
+    /// program cannot re-enable notifications with a reset.
     pub fn set_allow_notifications(&mut self, allowed: bool) {
         self.modes.allow_notifications = allowed;
     }
 
-    /// Authorize OSC 9 / 99 / 777 desktop notifications: sets
-    /// `modes.allow_notifications = true`, without which the handlers in
-    /// `handler_osc_notify.rs` never reach the callback. The pending-notification
-    /// cap applies regardless.
+    /// Authorize OSC 9 / 99 / 777 desktop notifications (`modes.allow_notifications`).
+    /// The pending-notification cap applies regardless.
     #[cfg(test)]
     pub fn authorize_notifications(&mut self) {
         self.modes.allow_notifications = true;
     }
 
-    /// Add an extra OSC 8 URI scheme to the safe allowlist: the one hyperlink
-    /// decision a host makes (see [`super::hyperlink_auth`]; what a person may
-    /// open is checked by the host at click time).
+    /// Add an extra OSC 8 URI scheme to the safe allowlist (see [`super::hyperlink_auth`];
+    /// what a person may open is checked by the host at click time).
     ///
-    /// Returns `false`, state unchanged, when `scheme` is over 32 bytes, not RFC
-    /// 3986 scheme-shaped (`ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`), in the
-    /// never-allow set (`javascript`/`data`/`file`/`vbscript`/`about`/`blob`,
-    /// case- and suffix-insensitively), or when 4 extra schemes are already
-    /// live. Returns `true` when stored (idempotent). Stored lowercased; matching
-    /// is case-insensitive.
-    ///
-    /// The other OSC 8 guards (byte cap, control-char scan, BiDi-override
-    /// rejection) still apply. Extra schemes are terminal-instance state: they
-    /// survive soft and hard resets and are excluded from checkpoints.
+    /// Returns `false`, state unchanged, when `scheme` is over 32 bytes, not RFC 3986
+    /// scheme-shaped, in the never-allow set (`javascript`/`data`/`file`/`vbscript`/
+    /// `about`/`blob`, case- and suffix-insensitively), or when 4 extra schemes are already
+    /// live; `true` when stored (idempotent, lowercased). The other OSC 8 guards still
+    /// apply. Extra schemes survive soft and hard resets and are not checkpointed.
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
         aterm_spec::refines(
@@ -625,11 +538,9 @@ impl Terminal {
         self.policy.clear();
     }
 
-    /// Enable or disable OSC 4 / OSC 21 indexed palette reconfigure (default
-    /// off): while disabled, PTY-origin attempts to change the 256-entry palette
-    /// are ignored. Equivalent to setting
-    /// `modes_mut().allow_palette_reconfigure`; preserved across
-    /// `Terminal::reset()` and RIS so a program cannot re-enable it with a reset.
+    /// Enable or disable OSC 4 / OSC 21 indexed palette reconfigure (default off): while
+    /// off, PTY-origin palette changes are ignored. Preserved across `Terminal::reset()` and
+    /// RIS so a program cannot re-enable it with a reset.
     pub fn set_allow_palette_reconfigure(&mut self, allowed: bool) {
         self.modes.allow_palette_reconfigure = allowed;
     }
@@ -640,15 +551,11 @@ impl Terminal {
         self.grid.cursor()
     }
 
-    /// Monotonic autowrap serial of the active grid. Advances each time an
-    /// autowrap line advance resolves (`Grid::advance_autowrap_line`); hard
-    /// newlines never advance it. A host diffs it against a per-session baseline
-    /// read under the same lock as [`Self::cursor`] to tell a wrap from `Home`
-    /// pressed at the last column.
-    ///
-    /// Not checkpointed, and each grid keeps its own serial across main/alt
-    /// swaps, so a restore or buffer switch costs at most one spurious read,
-    /// which the host's same-session baseline diff tolerates.
+    /// Monotonic autowrap serial of the active grid: advances on each autowrap line
+    /// advance, never on a hard newline. A host diffs it against a baseline read under the
+    /// same lock as [`Self::cursor`] to tell a wrap from `Home` pressed at the last column.
+    /// Not checkpointed and kept per grid across main/alt swaps, so a restore or buffer
+    /// switch costs at most one spurious read.
     #[must_use]
     pub fn wrap_serial(&self) -> u64 {
         self.grid.wrap_serial()
@@ -660,12 +567,10 @@ impl Terminal {
         self.modes.cursor_visible
     }
 
-    /// The echo anchor: where the most recent PTY print run ended, as `(row,
-    /// col)` in active-grid coordinates one past the last glyph (a pending wrap
-    /// counts, so a glyph at the last column reports `col == cols`), plus a
-    /// monotonic per-print sequence so a host can tell new output from a stale
-    /// sample. `None` before the first print or after a reset. For the
-    /// cursor-effect host; never read by the terminal itself.
+    /// The echo anchor: where the most recent PTY print run ended, as `(row, col)` in
+    /// active-grid coordinates one past the last glyph (a pending wrap counts, so a glyph at
+    /// the last column reports `col == cols`), plus a monotonic per-print sequence. `None`
+    /// before the first print or after a reset. Read only by the cursor-effect host.
     #[must_use]
     pub fn print_anchor(&self) -> Option<(u16, u16, u64)> {
         self.transient
@@ -713,11 +618,9 @@ impl Terminal {
         self.modes.reverse_video
     }
 
-    /// Monotonic repaint-blink epoch: DECTCEM hides processed while DEC 2026
-    /// synchronized output was active, the per-keystroke repaint bracket of
-    /// full-redraw TUIs. Hosts diff it to classify apps that repaint per
-    /// keystroke; vim/less and ConPTY never advance it. Never reset, never gates
-    /// bytes.
+    /// Monotonic repaint-blink epoch: counts DECTCEM hides processed inside DEC 2026
+    /// synchronized output, the per-keystroke repaint bracket of full-redraw TUIs. Hosts
+    /// diff it to classify such apps. Never reset, never gates bytes.
     #[must_use]
     pub fn repaint_blink_epoch(&self) -> u64 {
         self.repaint_blink_epoch
@@ -755,28 +658,21 @@ impl Terminal {
         self.grid.cols()
     }
 
-    /// Pipeline timestamps from the last `process()` call: per-stage durations
-    /// (parse, grid, total), carried by the render snapshot for latency
-    /// breakdowns.
+    /// Per-stage durations (parse, grid, total) of the last `process()` call.
     #[must_use]
     #[inline]
     pub fn pipeline_timestamps(&self) -> &PipelineTimestamps {
         &self.transient.pipeline_timestamps
     }
 
-    /// Process-unique identity stamped into every engine-filled RenderInput.
-    /// Cursor-effect input witnesses use the same nonce to prove that an arm
-    /// and its later content observation belong to one Terminal instance.
+    /// Process-unique identity stamped into every engine-filled RenderInput, so a
+    /// cursor-effect witness can tell its later content observation comes from this terminal.
     #[must_use]
     #[inline]
     pub fn render_identity(&self) -> u64 {
         self.extract_identity
     }
 }
-
-// ---------------------------------------------------------------------------
-// Test-only accessors for session serialization and charset tests.
-// ---------------------------------------------------------------------------
 
 use super::TerminalModes;
 
@@ -797,12 +693,9 @@ impl Terminal {
     }
 }
 
-/// Append a DEC mode-2048 in-band size report to a response buffer.
-///
-/// Format `CSI 48 ; rows ; cols ; pixH ; pixW t` (matching xterm/ghostty). Pixel
-/// dimensions are `rows*cell_h` / `cols*cell_w`, computed in `u32` to avoid u16
-/// overflow; `0` cell sizes yield `0` pixels (apps tolerate this). Shared by the
-/// DECSET-2048 enable path and `Terminal::resize`.
+/// Append a DEC mode-2048 in-band size report, `CSI 48 ; rows ; cols ; pixH ; pixW t`
+/// (as xterm/ghostty), to a response buffer. Pixels are computed in `u32`; a `0` cell size
+/// reports `0` pixels. Shared by the DECSET-2048 enable path and `Terminal::resize`.
 pub(super) fn push_in_band_size_report(
     buf: &mut Vec<u8>,
     rows: u16,

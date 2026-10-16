@@ -76,9 +76,7 @@ fn emit_adversarial(s: &mut u64, buf: &mut Vec<u8>) {
 fn gpu_render_adversarial_states_never_panics_and_matches_cpu() {
     let theme = Theme::default();
     let px = 16.0;
-    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(px, theme);
     // Compare the shared base render: GPU-only bloom and heat shimmer are
     // outside the parity check.
     gpu.set_bloom(false);
@@ -105,8 +103,8 @@ fn gpu_render_adversarial_states_never_panics_and_matches_cpu() {
             emit_adversarial(&mut s, &mut buf);
         }
         term.process(&buf);
-        // Vary the render path: DEC double-WIDTH and double-HEIGHT (the clip/scale
-        // path) lines, plus cursor hide/show.
+        // Vary the render path: DEC double-width and double-height lines (the
+        // clip/scale path), plus cursor hide/show.
         let dec = next(&mut s) % 5;
         match dec {
             0 => term.process(b"\x1b#6"), // DECDWL
@@ -120,7 +118,7 @@ fn gpu_render_adversarial_states_never_panics_and_matches_cpu() {
 
         let input = term.cell_frame(rows, cols);
         let cpu_frame = cpu.render_input(&input);
-        let gpu_frame = gpu.render_input(&mut win, &input, None); // <- PRIMARY: must not panic
+        let gpu_frame = gpu.render_input(&mut win, &input, None); // must not panic
         assert_eq!(
             (cpu_frame.width, cpu_frame.height),
             (gpu_frame.width, gpu_frame.height),
@@ -128,19 +126,17 @@ fn gpu_render_adversarial_states_never_panics_and_matches_cpu() {
         );
         assert!(!gpu_frame.pixels.is_empty(), "iter {it}: empty GPU frame");
 
-        // DECDHL (double height, dec 1/2) is excluded from parity: when the top
-        // half is anchored above the visible area, the clip boundary does not
-        // align to the 2x source grid, and GPU UV + NEAREST sampling picks a
-        // different source row than the CPU's integer clip
-        // (`gpu_matches_cpu::decdhl_double_height_gpu_matches_cpu` covers the
-        // aligned case). It is still rendered for panic-freedom. DECDWL (dec 0) is exact and checked.
+        // DECDHL (dec 1/2) is excluded from parity: with the top half anchored
+        // above the visible area the clip boundary does not align to the 2x
+        // source grid, and GPU UV + NEAREST sampling picks a different source
+        // row than the CPU's integer clip (the aligned case is
+        // `gpu_matches_cpu::decdhl_double_height_gpu_matches_cpu`). It still
+        // renders for panic-freedom; DECDWL (dec 0) is checked.
         let is_decdhl = dec == 1 || dec == 2;
         if !is_decdhl {
             let d = max_channel_delta(&cpu_frame, &gpu_frame);
             worst = worst.max(d);
-            // Bounded by magnitude and count: linear-light compositing amplifies
-            // the software/hardware sRGB encode difference at a few glyph
-            // AA-fringe pixels; interiors stay within 8. See `parity_fuzz.rs`.
+            // Bounded by magnitude and count (the AA-fringe bound; see `parity_fuzz.rs`).
             let exc = count_exceeding(&cpu_frame, &gpu_frame, 8);
             worst_exc = worst_exc.max(exc);
             assert!(

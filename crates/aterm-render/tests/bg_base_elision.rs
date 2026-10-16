@@ -1,35 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// FRM-1's correctness gate: `render_row_bg` no longer emits a background fill
-// whose colour is the one the band's BASE already carries (the full path's
-// `pixels.resize(w·h, frame_bg | bg_t<<24)`, the damaged path's band reset
-// to exactly that value). The elision is byte-identical BY CONSTRUCTION — the
-// skipped `fill` would store the u32 already in every pixel it covers — but
-// "by construction" is only as good as the predicate, so this file pins the
-// four fixtures where a NAIVE version of that predicate breaks:
+// `render_row_bg` emits no background fill whose colour the band's base already
+// carries (the full path's `frame_bg | bg_t<<24` clear, the damaged path's band reset).
+// The elision stores nothing a fill would change, so it is byte-identical as long as
+// the predicate is right; these fixtures pin where a naive predicate breaks:
 //
-//   1. a plain frame                       — the elision fires everywhere;
-//   2. an SGR background that COINCIDES     — a cell explicitly coloured to the
-//      with the frame default                 frame default. `RenderCell.bg` is
-//                                             a bare `[u8; 3]`, so "explicitly
-//                                             this colour" and "default" are the
-//                                             same value and must render the same
-//                                             pixel either way;
-//   3. a LIVE WALLPAPER                     — the band's base is BACKDROP TEXELS,
-//                                             not one scalar, so nothing may be
-//                                             elided against `frame_bg`. A guard
-//                                             that dropped `!wallpaper` would punch
-//                                             the backdrop through a SELECTION band
-//                                             whose colour coincides with it;
-//   4. background OPACITY below 1           — the base carries a transmittance
-//                                             byte in bits 24..32, so the
-//                                             comparison must be against
-//                                             `frame_bg | (bg_t << 24)` and not
-//                                             against `frame_bg` alone;
+//   1. a plain frame: the elision fires everywhere;
+//   2. an SGR background equal to the frame default: `RenderCell.bg` is a bare
+//      `[u8; 3]`, so it must render the same pixel as a default cell;
+//   3. a live wallpaper: the base is backdrop texels, so nothing may be elided against
+//      `frame_bg`;
+//   4. background opacity below 1: the base carries a transmittance byte, so the
+//      comparison is against `frame_bg | (bg_t << 24)`;
 //
-// plus a PARTIAL-DAMAGE repaint of the same content, asserted byte-identical to
-// a from-scratch full repaint through a renderer that has never rendered before.
+// plus a partial-damage repaint asserted byte-identical to a fresh full repaint.
 
 use aterm_core::render::SceneAtlas;
 use aterm_core::selection::{SelectionSide, SelectionType};
@@ -44,10 +29,9 @@ fn renderer() -> Renderer {
         .expect("no font: build with aterm-render's default embedded-font feature")
 }
 
-/// A terminal whose LIVE default background is the renderer theme's — the state
-/// the shipping app is always in (`applied_terminal_config_*` pins the engine
-/// default bg to `theme.bg` on every session), and the state in which "the base
-/// clear and a default cell are the same colour" is true at all.
+/// A terminal whose live default background is the renderer theme's, as in the shipping
+/// app (`applied_terminal_config*` pins the engine default bg to `theme.bg`): the state
+/// in which the base clear and a default cell share a colour.
 fn themed_term() -> Terminal {
     let mut term = Terminal::new(ROWS as u16, COLS as u16);
     let bg = Theme::default().bg;
@@ -102,15 +86,14 @@ fn plain_frame_default_cells_carry_the_clear_colour() {
         theme_bg,
         "a blank default-bg cell must show the frame clear colour"
     );
-    // A blank cell on the TEXT row, past the end of the text: still the clear
-    // colour, so the elision covers the materialized prefix as well as the tail.
+    // A blank cell on the text row past the text: the elision covers the materialized
+    // prefix as well as the tail.
     assert_eq!(
         cell_px(&r, &px, w, 0, COLS - 2),
         theme_bg,
         "a blank cell on the text row must show the frame clear colour"
     );
-    // Non-vacuity: the frame really rasterized ink somewhere, so the assertions
-    // above are not describing an empty buffer.
+    // Non-vacuity: the frame rasterized ink somewhere.
     assert!(
         px.iter().any(|&p| p != theme_bg),
         "the frame is entirely the clear colour — no glyph was rasterized, so \
@@ -135,8 +118,7 @@ fn sgr_background_equal_to_the_frame_default_renders_the_same_pixel() {
         .as_bytes(),
     );
     let input = term.cell_frame(ROWS, COLS);
-    // The engine resolved both cells to concrete colours; the coincident one IS
-    // the frame default, which is the whole point of the fixture.
+    // Both cells resolved to concrete colours; the coincident one is the frame default.
     assert_eq!(
         rgb_to_u32(input.cells[1][0].bg),
         theme_bg,
@@ -166,19 +148,11 @@ fn sgr_background_equal_to_the_frame_default_renders_the_same_pixel() {
 
 #[test]
 fn under_a_wallpaper_nothing_is_elided_against_the_theme_background() {
-    // The hazard the `!wallpaper` conjunct exists for. Under a wallpaper the
-    // band's base is BACKDROP TEXELS, so `frame_bg` is not what stands in those
-    // pixels — and a run CAN still resolve to exactly `frame_bg` there: a
-    // SELECTION band takes `theme.selection`, which a theme is free to set equal
-    // to its background. A predicate that compared the run against `frame_bg`
-    // without excluding the wallpaper regime would elide that band and let the
-    // picture show through the selection.
-    //
-    // (An SGR cell whose bg merely COINCIDES with the frame default is NOT this
-    // case: `resolve` already returns `None` for any cell whose bg equals its
-    // pane default under a wallpaper — `RenderCell.bg` is a bare `[u8; 3]`, so
-    // "explicitly this colour" and "default" are the same value — and that rule
-    // predates and is untouched by the elision.)
+    // Under a wallpaper the band's base is backdrop texels, not `frame_bg`, yet a
+    // selection band takes `theme.selection`, which a theme may set equal to its
+    // background. Without the `!wallpaper` conjunct the predicate would elide that band
+    // and the picture would show through the selection. (An SGR cell whose bg equals the
+    // pane default is not this case: `resolve` already returns `None` for it.)
     let theme_bg = Theme::default().bg;
     let theme = Theme {
         selection: theme_bg,
@@ -284,8 +258,8 @@ fn a_partial_damage_repaint_is_byte_identical_to_a_full_repaint() {
     let mut wc = WindowCpu::new();
     let _ = frame(&mut warm, &mut wc, &term.cell_frame(ROWS, COLS));
 
-    // A one-row mutation: the damaged path re-establishes ONLY that row's band
-    // (Phase A's band reset) and then runs the elided background pass over it.
+    // A one-row mutation: the damaged path resets only that row's band, then runs the
+    // elided background pass over it.
     for step in 0..6u8 {
         term.process(format!("\x1b[1;1Hstep {step}").as_bytes());
         let input = term.cell_frame(ROWS, COLS);

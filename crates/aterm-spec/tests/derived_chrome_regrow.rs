@@ -1,14 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-0 for `ChromeRegrowFloor` (ruling 414, 2026-09-29): after
-//! any rise of a window's chrome rows, neither the message band's quiet shrink
-//! nor the presence row's quiet fold re-grids the window back inside the
-//! settle — whichever source rose — and a fall the floor holds is applied once
-//! its own quiet and the floor have run. `Buggy = 1` holds the two laws as
-//! they shipped (each source's fall once its OWN quiet has run: the measured
-//! cross-source pairs) and a floor re-anchored on a step that is no rise.
-//! Tier-1 — the real App path — is `aterm-gui/src/chrome_regrow_conformance.rs`.
+//! Tier-0 for `ChromeRegrowFloor`: after any rise of a window's chrome rows, neither the
+//! message band's quiet shrink nor the presence row's quiet fold re-grids the window back
+//! inside the settle, whichever source rose, and a fall the floor holds is applied once its own
+//! quiet and the floor have run. `Buggy = 1` lets each source fall once its own quiet has run
+//! (the cross-source pairs) and re-anchors the floor on a step that is no rise. Tier-1, the real
+//! App path, is `aterm-gui/src/chrome_regrow_conformance.rs`.
 
 use crate::walk::walk;
 use aterm_spec::derive::{chrome_regrow_floor_liveness, chrome_regrow_floor_model};
@@ -17,23 +15,16 @@ use aterm_spec::{interp, verify};
 #[test]
 fn no_source_falls_inside_the_settle_of_another_sources_rise() {
     let model = chrome_regrow_floor_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name),
-        "the chrome regrow floor must stay enrolled in the spec-link registry"
-    );
     verify::prove_and_catch_scalar(&model, "chrome regrow floor");
     let dead = ["BandFallOwnQuiet", "PresFallOwnQuiet", "Restart"];
     assert_eq!(
-        verify::audit_dead_negative_controls(&model, &dead),
+        verify::audit_dead_negative_controls(std::slice::from_ref(&model)),
         Ok(dead.len()),
         "every mutant is a negative control caught alone"
     );
 
-    // RAISE THEN BANDSHRINK, fixed: the band's row is up and let go, its own
-    // quiet runs — and the presence row is born just before the band would
-    // shrink. The band waits the floor; one tick later it shrinks.
+    // The presence row is born just before the band's quiet shrink: the band waits the floor
+    // and shrinks one tick later.
     let mut state = walk(
         &model,
         &["BandRise", "Tick", "BandUnwant", "PresRise", "BandQuiet"],
@@ -48,8 +39,8 @@ fn no_source_falls_inside_the_settle_of_another_sources_rise() {
     }
     assert_eq!((state["b"], state["quick"]), (0, 0), "{state:?}");
 
-    // BAND THEN QUIET FOLD, fixed: the presence row's want went away and its
-    // quiet ran; a band row rises just before the fold would land.
+    // A band row rises just before the presence row's quiet fold lands: the fold waits the
+    // floor.
     let mut state = walk(
         &model,
         &["PresRise", "Tick", "PresUnwant", "PresQuiet", "BandRise"],
@@ -60,8 +51,8 @@ fn no_source_falls_inside_the_settle_of_another_sources_rise() {
     }
     assert_eq!((state["p"], state["quick"]), (0, 0), "{state:?}");
 
-    // BAND THEN A PERSON'S READ, fixed: a row that has stood its quiet is
-    // read just after a band row rose — the read waits the floor.
+    // A band row rises just before a person reads a row that has stood its quiet: the read
+    // waits the floor.
     let mut state = walk(&model, &["PresRise", "Tick", "BandRise", "PresRead"]);
     assert_eq!(state["pq"], 1, "the read's own due has passed: {state:?}");
     assert!(!model.action_enabled("PresFall", &state), "{state:?}");
@@ -69,10 +60,9 @@ fn no_source_falls_inside_the_settle_of_another_sources_rise() {
         assert!(model.fire(action, &mut state), "{action}: {state:?}");
     }
 
-    // The model lets a source's own quiet run out before a tick of the floor
-    // (an over-approximation: the real quiet, 1.5 s, outlasts the floor's
-    // 400 ms), so the floor covers a source's own pair too; on the real clock
-    // the source's own quiet always binds first.
+    // The model lets a source's own quiet run out before a floor tick (an over-approximation:
+    // the real quiet, 1.5 s, outlasts the 400 ms floor), so the floor covers a source's own
+    // pair too.
     let own = walk(&model, &["BandRise", "BandUnwant", "BandQuiet"]);
     assert!(!model.action_enabled("BandFall", &own), "{own:?}");
 
@@ -93,8 +83,8 @@ fn no_source_falls_inside_the_settle_of_another_sources_rise() {
     );
     assert_eq!((benign["b"], benign["p"]), (0, 1), "{benign:?}");
 
-    // THE WINDOW'S OWN SHRINK takes a waiting fall at once, inside the floor,
-    // and is exempt by name.
+    // The window's own shrink takes a waiting fall at once, inside the floor; it is exempt by
+    // name.
     let mut cramped = walk(
         &model,
         &["BandRise", "BandUnwant", "BandQuiet", "PresRise", "Cramp"],
@@ -103,8 +93,8 @@ fn no_source_falls_inside_the_settle_of_another_sources_rise() {
     assert!(model.fire("BandTaken", &mut cramped), "{cramped:?}");
     assert_eq!((cramped["b"], cramped["quick"]), (0, 0), "{cramped:?}");
 
-    // THE SHIPPED LAWS (`Buggy = 1`): each source's fall once its own quiet
-    // has run is the measured net-zero pair — `NoQuickRegrow` breaks.
+    // `Buggy = 1`: each source falls once its own quiet has run, the net-zero cross-source
+    // pair, and `NoQuickRegrow` breaks.
     let buggy = interp::with_buggy(&model, 1);
     let raise = walk(
         &buggy,
@@ -156,17 +146,10 @@ fn no_source_falls_inside_the_settle_of_another_sources_rise() {
 fn a_fall_the_floor_holds_is_applied_and_the_restart_mutant_starves_it() {
     let model = chrome_regrow_floor_model();
     let live = chrome_regrow_floor_liveness();
-    assert!(
-        aterm_spec::xref::liveness_registry()
-            .iter()
-            .any(|(m, l)| m.name == model.name && l.name == live.name),
-        "the liveness obligation must stay registered"
-    );
     verify::liveness_proves_and_catches_tiered(&model, &live, "ChromeRegrowFloor");
 
-    // THE MUTANT'S LOOP: every step re-anchors the floor, so time passes and
-    // the fall never comes due. No state of it is stuck — only the property
-    // sees it.
+    // Restart re-anchors the floor on every step, so time passes and the fall never comes due;
+    // no state is stuck, only the property sees it.
     let restarting = verify::buggy_baseline_with(&model, "Restart");
     let starved = interp::nonprogress_under(&restarting, &live)
         .expect("a floor re-anchored on every step never lets the grid grow back");

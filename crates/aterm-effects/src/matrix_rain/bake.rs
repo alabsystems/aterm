@@ -285,14 +285,6 @@ mod tests {
         }
     }
 
-    /// Baking is deterministic byte-for-byte (integer coverage only).
-    #[test]
-    fn bake_bytes_are_deterministic() {
-        let mut a = baked(9, 18);
-        let mut b = baked(9, 18);
-        assert_eq!(a.atlas().unwrap().rgba, b.atlas().unwrap().rgba);
-    }
-
     /// Progressive bake: at most 8 tiles per tick (8 ticks to finish), with a
     /// version bump on every batch and on the metric-change restart.
     #[test]

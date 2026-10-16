@@ -9,9 +9,9 @@
 //!
 //! `embed-resource` pulled `vswhom`/`vswhom-sys` on Windows-msvc hosts, which
 //! need `libc::wchar_t`/`wcslen`; `crates/aterm-libc` declares only the
-//! `core::ffi` primitives on Windows by design (`libc-oracle/gen/README.md`).
+//! `core::ffi` primitives on Windows by design (`crates/aterm-libc-oracle`'s cell table).
 //! Build-dependencies compile for the HOST, so a cross build from a Mac never
-//! sees that graph (`xtask gate cells --cell win` passes right through it):
+//! sees that graph (`verify cells`' `win` cell passes right through it):
 //! only a native Windows-msvc build breaks. Declaring `wchar_t`/`wcslen` in
 //! aterm-libc would trade its design for one build helper; dropping the helper
 //! cost nothing the product uses.
@@ -36,6 +36,10 @@
 //! apply. A machine with no resource compiler gets an [`Outcome`] the caller
 //! turns into a warning or an error (`crates/aterm/build.rs`), never a silent
 //! no-op.
+#![allow(
+    clippy::disallowed_types,
+    reason = "never linked into the shipped binary: a build-script step"
+)]
 
 use std::ffi::OsStr;
 use std::fmt;

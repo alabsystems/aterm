@@ -104,8 +104,8 @@ fn the_first_rung_is_seeded_from_the_dry_run_and_kept_for_the_next_update() {
     );
     assert!(kept.is_none());
 
-    // A park that LANDED earlier in 30 ms: the part of the freeze the dry
-    // run cannot time. The rung is never budgeted below it.
+    // A park that landed earlier in 30 ms, the part of the freeze the dry run cannot time:
+    // the rung is never budgeted below it.
     super::keep_landed_park(Duration::from_millis(30))
         .expect("the park cost is kept")
         .join()
@@ -154,11 +154,9 @@ fn the_first_rung_is_seeded_from_the_dry_run_and_kept_for_the_next_update() {
         assert!(prior.is_none(), "only macOS keeps an apply-lane ledger");
     }
 
-    // The parser parks mid-sequence with the rest of the sequence queued:
-    // the dry run cannot say how long a capture takes.
-    // Close-on-exec from birth: a child another test spawns meanwhile
-    // never keeps the slave open past its exec, so a closed slave reads
-    // as hung up (the fd-copy sweep of 2026-09-27).
+    // The parser parks mid-sequence with the rest of the sequence queued: the dry run cannot
+    // say how long a capture takes. The pair is close-on-exec from birth, so a child another
+    // test spawns never keeps the slave open and a closed slave reads as hung up.
     let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
     app.pool
         .sessions
@@ -292,23 +290,18 @@ fn seeding_stores_the_first_rung_on_the_prelaunched_attempt() {
     );
 }
 
-/// A park that lands keeps its cost: the launched lane's real park, through the
-/// shipping park cue over a real PTY, writes it into the ledger's landed-park
-/// slot, the floor for the next update's first rung. Nothing else writes that
-/// slot.
+/// A landed park (the launched lane's real park over a real PTY) writes its cost into the
+/// ledger's landed-park slot, the floor for the next update's first rung.
 #[test]
 fn a_landed_park_keeps_its_cost_for_the_next_updates_first_rung() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
-    // A sentinel no real park costs, written and joined first: the wait
-    // below is for this park's write, not an earlier one.
+    // A sentinel no real park costs, written and joined first, so the wait below is for this
+    // park's write.
     super::keep_landed_park(Duration::from_micros(1))
         .expect("the sentinel is kept")
         .join()
         .expect("the ledger writer finished");
     let mut app = crate::App::headless_for_test();
-    // Close-on-exec from birth: a child another test spawns meanwhile
-    // never keeps the slave open past its exec, so a closed slave reads
-    // as hung up (the fd-copy sweep of 2026-09-27).
     let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
     app.pool
         .sessions
@@ -408,15 +401,12 @@ fn publish(
     app.publish_preverified_pass_for_test(ticket, &read)
 }
 
-/// `extra` more live sessions (ids 1..=extra) beside session 0, each on its
-/// own duplicate of session 0's quiet master (so the park's master checks
-/// read the same quiet PTY), registered and pooled as spawned tabs are.
-/// Each session owns its duplicate, and its drop closes it.
+/// `extra` more live sessions (ids 1..=extra) beside session 0, each owning a duplicate of
+/// session 0's quiet master, registered and pooled as spawned tabs are.
 fn add_sessions_on(app: &mut crate::App, master: i32, extra: u64) {
     for id in 1..=extra {
-        // SAFETY: `master` is the test's open PTY master; `F_DUPFD_CLOEXEC`
-        // returns a new descriptor this session owns, close-on-exec from
-        // birth (no window in which a sibling's fork copies it).
+        // SAFETY: `master` is the test's open PTY master; `F_DUPFD_CLOEXEC` returns a new
+        // descriptor this session owns, close-on-exec from birth.
         let dup = unsafe { libc::fcntl(master, libc::F_DUPFD_CLOEXEC, 0) };
         assert!(dup >= 0, "dup the quiet master");
         let mut session = crate::stub_session(id);
@@ -496,20 +486,11 @@ fn a_park_refuses_a_desk_the_dialled_claim_cannot_carry_before_freezing() {
     release_pty(&mut app, pty);
 }
 
-/// A FORK HAS NO DESCRIPTOR-MESSAGE LIMIT (round six of the update audit,
-/// item 38). The launched lane refused at runtime (`fork_after_park`, which
-/// cues the park with no dialer and no grant limit), and the person opened a
-/// 63rd tab during the hold: the attempt that forks passes its masters by
-/// inheritance, so the park is not refused, the attempt does not stand
-/// down, and the park lands and hands the fork every session. The park's
-/// deadline is a test park's one-minute hang detector
-/// (`park_budget_for_test`): a 63-session park in a debug build under load
-/// sometimes missed the quarter-second rung, which is not this test's
-/// subject.
-///
-/// RED before the fix: the park refused it as "more sessions opened than one
-/// descriptor message carries" — a transport this attempt no longer used —
-/// and the attempt stood down and backed off.
+/// A fork has no descriptor-message limit: when the launched lane falls back at runtime
+/// (`fork_after_park`, no dialer and no grant limit) with 63 tabs, the park is not refused and
+/// the fork gets every session by inheritance. The park's deadline is the test park's
+/// one-minute hang detector (`park_budget_for_test`), since a 63-session park in a loaded
+/// debug build can miss the quarter-second rung.
 #[test]
 fn a_fork_after_park_is_not_held_to_the_rendezvous_session_limit() {
     // A landed park starts a detached ledger writer.
@@ -539,32 +520,13 @@ fn a_fork_after_park_is_not_held_to_the_rendezvous_session_limit() {
     release_pty(&mut app, pty);
 }
 
-/// A LAUNCHD-LIMITED PRODUCER MAKES ROOM FOR ITS OWN PARK (round eight of
-/// the update audit, #3). A window started from the Dock, Finder or a login
-/// item runs at launchd's soft 256 descriptors: about 30 of its own, and
-/// three for each session (the master and both ends of the reader's wake
-/// pipe). At 63 sessions — a desk only the chunked grant carries — that
-/// leaves 37, and the park's duplicate of every master needs 63. The test
-/// builds that desk in a child of the test binary and leaves it exactly
-/// launchd's headroom. The CONTROL is the park, refused at the duplicate
-/// as this process's own failure. The attempt's raise
-/// (`raise_descriptor_limit_for_park`, which `start_unix_update_handoff`
-/// makes once the seamless lane is admitted, before either lane reserves
-/// anything) then makes room for the same park's duplicate of every
-/// master — and a tab opened afterwards still gets the launcher's limit.
-/// Toward an OLDER target the raise is not made (round eight's review of
-/// #3): that successor may not read the launcher's limit it is told, so
-/// the limit stays and the park fails exactly as it did before the raise
-/// existed.
-/// And once a raise has been made, an older target's successor is started
-/// at launchd's limit all the same (the second review), unless it is
-/// handed a duplicate only the raise made room for.
-///
-/// RED before the fix: nothing raised the producer's own limit, so every
-/// such attempt failed the CONTROL's way, and was retried on the transient
-/// schedule for a cause that never passes. RED before the review: the
-/// raise was made toward every target, older ones included. RED before the
-/// second review: the older successor's stand-in read the raise.
+/// A launchd-limited producer makes room for its own park. A window started from the Dock,
+/// Finder or a login item runs at launchd's soft 256 descriptors: about 30 of its own and
+/// three per session, so a 63-session desk leaves 37 where the park's duplicates need 63. At
+/// exactly that headroom the park is refused (the control); the attempt's raise
+/// (`raise_descriptor_limit_for_park`) makes room while new tabs keep the launcher's limit.
+/// Toward an older target no raise is made, and an older successor starts at launchd's limit
+/// unless handed a duplicate only the raise fit.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_launchd_limited_producer_makes_room_to_park_a_chunked_desk() {
@@ -572,13 +534,11 @@ fn a_launchd_limited_producer_makes_room_to_park_a_chunked_desk() {
     const LAUNCHD_SOFT_NOFILE: u64 = 256;
     const SESSIONS: u64 = 63;
     const WINDOW_BASE_NOFILE: u64 = 30;
-    // The running build a target is compared with (the record's own
-    // target build, as it happens: only the comparison matters).
+    // The running build a target is compared with; only the comparison matters.
     const THIS_BUILD: u64 = 7;
 
-    // THE WIRING: raised once the seamless lane is admitted, and before
-    // the launched lane binds its rendezvous or the fork lane duplicates
-    // its first master.
+    // The wiring: raised once the seamless lane is admitted, before the launched lane binds
+    // its rendezvous or the fork lane duplicates its first master.
     let (_, start) = super::cold_lane_layout_tests::attempt_entry_source();
     let admitted = start
         .find("ApplyLane::Seamless,\n            ) => {}")
@@ -596,9 +556,8 @@ fn a_launchd_limited_producer_makes_room_to_park_a_chunked_desk() {
         admitted < raise && raise < launched && raise < forked,
         "raised after the admission and before either lane reserves anything"
     );
-    // …told the ONE target build the lane decision reads (round eight's
-    // review of #3): an older target is the fork lane's alone, and the
-    // raise must say "older" exactly when the lane decision does.
+    // …told the one target build the lane decision reads: an older target is the fork lane's
+    // alone, and the raise must say "older" exactly when the lane decision does.
     let target = start
         .find("let target_build = apply_attempt")
         .expect("the attempt's target build");
@@ -643,14 +602,10 @@ fn a_launchd_limited_producer_makes_room_to_park_a_chunked_desk() {
             }
         })
         .collect();
-    // LAUNCHD'S HEADROOM, NOT ITS NUMBER: a window of about 30 descriptors
-    // of its own (stdio, its logs, the control listener, the event loop's
-    // queues — measured on a live window beside its sessions, round eight
-    // #3's review) and this desk leave `LAUNCHD_SOFT_NOFILE - 30 - 3 × 63`
-    // = 37 below launchd's 256. The soft limit is set to leave exactly
-    // that many here: this binary's own table is smaller than a window's,
-    // and under a std without SP-1 a child of a busy test run inherits what
-    // other tests held open across its spawn, at whatever numbers they had.
+    // Launchd's headroom, not its number: a window's ~30 descriptors of its own (measured) and
+    // this desk leave `256 - 30 - 3 × 63` = 37. The soft limit is set to leave exactly that
+    // here, since this binary's own table is smaller than a window's and, under a std without
+    // SP-1, a child of a busy test run inherits what other tests held open across its spawn.
     let headroom = LAUNCHD_SOFT_NOFILE - WINDOW_BASE_NOFILE - 3 * SESSIONS;
     let listed: Vec<i32> = std::fs::read_dir("/dev/fd")
         .expect("the descriptor directory")
@@ -687,11 +642,9 @@ fn a_launchd_limited_producer_makes_room_to_park_a_chunked_desk() {
         unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const launchd) },
         0
     );
-    // A window at launchd's limit holds no descriptor at or above it: what
-    // a busy test run leaked into this child up there (at the numbers it
-    // had in the parent, whatever this child's limit) is marked
-    // close-on-exec, up to the kernel's per-process maximum, so no
-    // successor below can be handed it.
+    // A window at launchd's limit holds no descriptor at or above it: whatever a busy test run
+    // leaked into this child up there is marked close-on-exec, up to the kernel's maximum, so
+    // no successor below can be handed it.
     for fd in i32::try_from(launchd_soft).expect("a descriptor number")
         ..aterm_uds::spawnfd::descriptor_bound()
     {
@@ -730,12 +683,9 @@ fn a_launchd_limited_producer_makes_room_to_park_a_chunked_desk() {
     );
     assert!(transferred.try_recv().is_err(), "CONTROL: nothing captured");
 
-    // AN OLDER TARGET KEEPS THE LIMIT IT ALWAYS HAD (round eight's review
-    // of #3). Toward a build older than this one — the fork lane's alone,
-    // whose child inherits this process's limit and, before 06b06e74e,
-    // never reads the launcher's it is told — no raise is made: the limit
-    // and the shells' record stay as they were, and the park fails exactly
-    // as it did before the raise existed.
+    // Toward an older target (the fork lane's alone, whose child inherits this limit and may
+    // not read the launcher's limit it is told) no raise is made, the shells' record stays
+    // empty, and the park still fails.
     let soft_nofile = || {
         let mut now = libc::rlimit {
             rlim_cur: 0,
@@ -769,12 +719,9 @@ fn a_launchd_limited_producer_makes_room_to_park_a_chunked_desk() {
     );
     assert!(transferred.try_recv().is_err(), "nothing captured");
 
-    // The same build (a same-image re-exec), and so every newer one,
-    // reads the told limit: the raise is made, and the duplicate the
-    // CONTROL's park was refused at — the one both lanes reserve with —
-    // now has room for every master. That is the park's whole question
-    // about descriptors; whether the 63-session park then lands inside
-    // its 250 ms rung is a clock's, and a miss there is a re-park.
+    // The same build (a same-image re-exec), and so every newer one, reads the told limit: the
+    // raise is made and the duplicate has room for every master. Whether the park then lands
+    // inside its 250 ms rung is the clock's question; a miss there is a re-park.
     crate::handoff_rendezvous::raise_descriptor_limit_for_park(THIS_BUILD, THIS_BUILD);
     assert!(soft_nofile() > launchd_soft, "the park's raise is made");
     let (reserved, adoption) = super::reserve_child_only_masters(&app.handoff_live_sessions())
@@ -790,13 +737,9 @@ fn a_launchd_limited_producer_makes_room_to_park_a_chunked_desk() {
         "a tab opened afterwards still gets the launcher's limit"
     );
 
-    // …AND A LATER ATTEMPT TOWARD AN OLDER BUILD STARTS ITS SUCCESSOR AT
-    // LAUNCHD'S LIMIT (round eight's second review of #3). Nothing lowers
-    // this process's limit again, so the raise above is still held when an
-    // older bundle is put back or the channel switched; the fork lane's
-    // hook (`start_older_image_at_its_limit`) starts that successor at the
-    // limit held before the raise, as before round eight, and its
-    // stand-in's own `ulimit -n` reads it.
+    // …and since nothing lowers the raised limit again, a later attempt toward an older build
+    // starts its successor at the limit held before the raise (`start_older_image_at_its_limit`),
+    // which its stand-in's `ulimit -n` reads.
     let successor_soft = |target_build: u64, handed: &[i32]| -> u64 {
         // std on purpose: the shipped hook under test installs a `pre_exec`.
         let mut successor = std::process::Command::new("/bin/sh");
@@ -825,10 +768,8 @@ fn a_launchd_limited_producer_makes_room_to_park_a_chunked_desk() {
         raised,
         "a same-or-newer one inherits the room, and reads the told limit"
     );
-    // A successor HANDED this desk's duplicates — which outgrew launchd's
-    // limit, so this desk could not be parked toward an older build before
-    // round eight (the CONTROL) — keeps the room it is handed them in: its
-    // strip would not reach them under launchd's.
+    // A successor handed this desk's duplicates, which outgrew launchd's limit, keeps the room
+    // it is handed them in: its strip would not reach them under launchd's.
     let above: Vec<i32> = adoption
         .iter()
         .map(|(_, master, _)| *master)
@@ -861,14 +802,10 @@ fn sidecars(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
         .unwrap_or_default()
 }
 
-/// The launched lane sends no scrollback under a policy that carries none. Its
-/// history export starts beside the launch, before the policy may be read; its
-/// park reads the policy. Through the shipping park cue over a real PTY with an
-/// export that already wrote its sidecar: under `carry = "visible"` or
-/// `"repaint"` the park stops the export, removes its file, hands the worker
-/// `HistoryPlan::Withheld`, and the join names no sidecar and counts every line
-/// (`history_dropped`) as the policy's. Control: with no policy the export is
-/// handed on and the join names its sidecar.
+/// The launched lane sends no scrollback under a policy that carries none: its history export
+/// starts before the policy can be read, so under `carry = "visible"` or `"repaint"` the park
+/// stops it, removes its sidecar and hands the worker `HistoryPlan::Withheld`, and the join
+/// counts every line as the policy's. Control: with no policy the sidecar is named.
 #[test]
 fn a_policy_without_scrollback_withholds_the_launched_lanes_history_carry() {
     use crate::handoff_history::{Fallback, HistoryExporter, HistoryPlan};
@@ -946,9 +883,8 @@ fn a_policy_without_scrollback_withholds_the_launched_lanes_history_carry() {
             capture.history
         );
         if withheld {
-            // The export is stopped at the park, and a stopped export's
-            // files go with it (bounded: its worker may finish its last
-            // look just after the park's own bounded wait).
+            // The export is stopped at the park and its files go with it (bounded: its worker
+            // may finish its last look just after the park's own bounded wait).
             let patience = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
             while !sidecars(&dir).is_empty() {
                 assert!(
@@ -959,7 +895,7 @@ fn a_policy_without_scrollback_withholds_the_launched_lanes_history_carry() {
             }
         }
 
-        // The worker's join, exactly as `prepare_outgoing_artifacts` runs it.
+        // The worker's join, as `prepare_outgoing_artifacts` runs it.
         let verdicts = crate::handoff_history::stamp_manifest(
             &mut capture.manifest,
             &capture.screens,
@@ -1014,10 +950,9 @@ fn a_policy_without_scrollback_withholds_the_launched_lanes_history_carry() {
     }
 }
 
-/// Hold `term`'s engine from another thread for longer than the widest
-/// freeze rung, returning once it is held: a park on the real rung
-/// (`park_budget_for_test::real`) then misses its capture
-/// (`CaptureFailure::EngineBusy`), and its rollback waits the hold out.
+/// Holds `term`'s engine from another thread past the widest freeze rung, returning once held,
+/// so a park on the real rung (`park_budget_for_test::real`) misses with `EngineBusy` and its
+/// rollback waits the hold out.
 pub(super) fn hold_engine_past_every_rung(
     term: &std::sync::Arc<std::sync::Mutex<aterm_core::terminal::Terminal>>,
 ) -> std::thread::JoinHandle<()> {
@@ -1033,12 +968,9 @@ pub(super) fn hold_engine_past_every_rung(
     holder
 }
 
-/// A missed park resumes the history export it paused. The launched lane's park
-/// pauses the export, then misses (an engine held past the deadline) and
-/// re-parks with readers live while the tab prints more than 256 lines. Driven
-/// through the shipping gate (`try_park_for_prelaunched_successor`) twice, with
-/// a real following export and the worker's join over the second capture: the
-/// whole history crosses and nothing is counted as lost.
+/// A missed park resumes the history export it paused: after a miss (engine held past the
+/// deadline) the tab prints more than 256 lines before the re-park, and the whole history still
+/// crosses through the second capture's join.
 #[test]
 fn a_missed_park_resumes_the_history_export_for_the_repark() {
     use crate::handoff_history::{HistoryExporter, HistoryPlan};
@@ -1067,9 +999,8 @@ fn a_missed_park_resumes_the_history_export_for_the_repark() {
     });
     app.update_handoff_prelaunch = Some(record);
 
-    // THE FIRST PARK MISSES: the engine is held past every rung's deadline
-    // (and released later by itself: the miss's rollback takes it too).
-    // On the real rung: a test park's default deadline would wait it out.
+    // The first park misses: the engine is held past every rung's deadline, on the real rung
+    // (a test park's default deadline would wait it out).
     let real = super::park_budget_for_test::real();
     let holder = hold_engine_past_every_rung(&term);
     let first = std::time::Instant::now();
@@ -1087,8 +1018,8 @@ fn a_missed_park_resumes_the_history_export_for_the_repark() {
     );
     let retry_at = prelaunch.park_retry_at.expect("a re-park is scheduled");
 
-    // The tab keeps printing through the retry delay, past the screen
-    // carry's lines — and the export, resumed, follows it.
+    // The tab prints past the screen carry's lines through the retry delay; the resumed
+    // export follows it.
     for n in 2000..2600 {
         crate::term_lock(&term)
             .process(format!("line {n}: printed during the retry delay\r\n").as_bytes());
@@ -1148,16 +1079,13 @@ fn a_missed_park_resumes_the_history_export_for_the_repark() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The dry run captures under the successor's policy. With the grid projection
-/// every non-blank carry takes made to panic (aterm-core's
-/// `checkpoint.carry_projection` fault point):
+/// The dry run captures under the successor's policy. With aterm-core's
+/// `checkpoint.carry_projection` fault point armed (every non-blank grid projection panics):
 ///
-/// * with the policy not read yet, no dry run is taken (`Unmeasured`) and the
-///   seed falls back to the ledger;
-/// * under `carry = "repaint"`, the dry run is measured, projects nothing, and
-///   seeds the rung;
-/// * control: under a pass with no policy (`full`), the dry run panics at the
-///   fault point.
+/// * with the policy not read yet, no dry run is taken (`Unmeasured`) and the seed falls back
+///   to the ledger;
+/// * under `carry = "repaint"`, the dry run is measured, projects nothing, and seeds the rung;
+/// * control: under a pass with no policy (`full`), the dry run panics at the fault point.
 #[test]
 fn the_dry_run_captures_under_the_successors_policy_and_not_before_it_is_read() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -1210,8 +1138,8 @@ fn the_dry_run_captures_under_the_successors_policy_and_not_before_it_is_read() 
         "the rung is seeded from the policy's own capture: {seed:?}"
     );
 
-    // CONTROL, last (a panic inside the capture poisons the engine's lock):
-    // a pass with no policy is `full`, and that capture projects.
+    // Control, last (a panic inside the capture poisons the engine's lock): a pass with no
+    // policy is `full`, and that capture projects.
     assert_eq!(publish(&app, &ticket, None), None);
     assert!(
         armed(&mut app).is_err(),

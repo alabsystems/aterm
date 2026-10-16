@@ -24,11 +24,6 @@ pub(crate) struct SettingsState {
     /// Settings rebuilds it from its config snapshot after every persisted change, so
     /// the displayed value tracks the file. OWNED — [`EditField`] is moved in.
     pub(crate) fields: Vec<EditField>,
-    /// The fuzzy-search query filtering the visible controls (empty ⇒ every control shows).
-    /// Matched against each field's label, key, section name, and [`prefs::keywords_of`].
-    pub(crate) query: String,
-    /// Whether the search bar is FOCUSED.
-    pub(crate) searching: bool,
     /// The ids of the loaded Trail Packs (`cursor_trail_packs`), so the
     /// `cursor_trail_style` picker lists a `pack:<id>` option per loaded pack
     /// (the dynamic twin of the static [`prefs::CURSOR_TRAIL_STYLES`]). Sorted; empty
@@ -43,8 +38,6 @@ impl SettingsState {
     pub(crate) fn from_config_with_trail_pack_ids(cfg: &Config, trail_pack_ids: &[String]) -> Self {
         Self {
             fields: prefs::editable_fields(cfg),
-            query: String::new(),
-            searching: false,
             trail_pack_ids: trail_pack_ids.to_vec(),
         }
     }
@@ -154,6 +147,8 @@ pub(crate) struct Roles {
     pub(crate) text_secondary: [u8; 3],
     pub(crate) text_tertiary: [u8; 3],
     pub(crate) accent: [u8; 3],
+    /// [`crate::native_appearance::NativeRoles::accent_ink`].
+    pub(crate) accent_ink: [u8; 3],
     pub(crate) on_accent: [u8; 3],
     pub(crate) separator: [u8; 3],
     pub(crate) control_track: [u8; 3],
@@ -186,6 +181,7 @@ impl Roles {
             text_secondary: roles.text_secondary,
             text_tertiary: roles.text_tertiary,
             accent: roles.accent,
+            accent_ink: roles.accent_ink,
             on_accent: roles.on_accent,
             separator: roles.separator,
             control_track: roles.control_track,

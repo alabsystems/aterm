@@ -51,9 +51,9 @@ fn a_classic_erase_key_leaves_no_standing_wake() {
     }
 }
 
-/// While the display temperature (`disp_t`, a 1.5 s attack) is above the
-/// visibility threshold the ember is a pending visible change and both wake
-/// predicates say so, so the host does not sleep before the ember appears.
+/// While the display temperature (`disp_t`) climbs above the visibility threshold the ember is a
+/// pending visible change, and both wake predicates say so: the host does not sleep before the
+/// ember appears.
 #[test]
 fn the_forge_ember_keeps_the_host_awake_while_the_metal_heats() {
     let g = Geom {
@@ -414,17 +414,10 @@ fn a_composer_newline_licenses_its_own_row_change_and_nothing_after() {
     }
 }
 
-/// The seam's typed `Sweep` needs typed pairing, never the geometric
-/// `mv.typing` (dist ≤ 1) alone: an arrow's hop keeps its wake, and a
-/// quench/kill-licensed keyless +1 (a spinner, a status redraw) lays nothing.
-///
-/// The pin reads the word's right bound `col1`, the one a rightward hop would
-/// extend, not `col0`: a leaving mark reaches backward for its four letters
-/// (one cell per [`rk::ribbon::REACH_STEP_S`], [`rk::ribbon::FOUR_LETTER_CELLS`])
-/// inside the window after the phrase rest ([`rk::ribbon::PHRASE_REST_MIN_S`]),
-/// which this test's cadence lands in. Nothing at or past the hop column may
-/// join the word's cohort, its only typed cell stays the seating key's, and
-/// anything that joins lies left of the word and is untyped.
+/// The seam's typed `Sweep` needs typed pairing, never `mv.typing` (dist ≤ 1) alone: an arrow's
+/// hop keeps its wake, and a quench/kill-licensed keyless +1 (a spinner, a status redraw) lays
+/// nothing. The pin reads the word's right bound `col1`, the one a rightward hop would extend: a
+/// leaving mark's backward reach may move `col0` and join untyped cells left of the word.
 #[test]
 fn a_one_shot_licensed_plus_one_lays_no_typed_cell() {
     let g = Geom {
@@ -663,13 +656,11 @@ fn a_keyless_wide_hop_under_a_one_shot_licence_lights_no_landing_on_a_dangling_s
 
 // ──────── the typed press across a one-shot: nothing whose echo is owed is superseded ────────
 
-/// The one-shots survive a typed press (their echoes are still owed), a
-/// Return-paired move neither re-anchors nor pops the glyph's stamp, a Return /
-/// Nav forget edge forgets only presses banked at or before the one-shot, and
-/// the engine replays a `Typed` buffered before a one-shot's move against the
-/// caret before that move. Shape: a slow prompt (SSH, a p10k precmd) lands the
-/// Enter's response after the next glyph's dispatch; no phantom lights at the
-/// prompt's cell and the glyph's own +1 lights.
+/// A slow prompt (SSH, a p10k precmd) lands the Enter's response after the next glyph's dispatch.
+/// The one-shot survives the typed press, the Return-paired move neither re-anchors nor pops the
+/// glyph's stamp, its forget edge spares presses after the one-shot, and a `Typed` buffered
+/// before the move replays against the caret before it: no phantom at the prompt's cell, and the
+/// glyph's own +1 lights.
 #[test]
 fn a_glyph_typed_before_the_enters_response_lands_keeps_its_credit_and_its_cell() {
     let g = wide_geom();
@@ -970,18 +961,11 @@ fn a_glyph_typed_before_the_composer_newline_lands_keeps_its_credit_and_its_cell
     assert_eq!(glow.spawns(), spawns, "a keyless +1 is refused");
 }
 
-/// The composer's new line starts its walk again however soon the next glyph
-/// follows the newline (`rk::ribbon::Ribbon::fresh_line`, end to end through
-/// the seam). Thirty glyphs on row 27 of an alt-screen composer, Shift+Enter
-/// (a typed stamp beside the newline hint, no `note_return`), and the next
-/// line's first glyph pressed either before or after the line break lands. The
-/// break reaches v2 as a `Licence::Return` move `(27, 32) → (28, 2)`; eighteen
-/// more glyphs follow. Either way row 28 continues the colour row 27 reached,
-/// one step past its last glyph, at distance zero (`d0 = 0`).
-///
-/// This models a top-anchored box growing down; the bottom-anchored shape of
-/// Claude Code's own box is pinned in `tests/composer_box_growth_wrap.rs`
-/// (`a_shift_enter_newline_starts_the_walk_again_in_a_bottom_anchored_box_too`).
+/// The composer's new line starts its walk again however soon the next glyph follows the newline
+/// (`Ribbon::fresh_line`, through the seam). Thirty glyphs on row 27, Shift+Enter, and the next
+/// glyph pressed before or after the break lands: either way row 28 continues row 27's colour
+/// one step past its last glyph, at `d0 = 0`. This is a top-anchored box; the bottom-anchored one
+/// is pinned in `tests/composer_box_growth_wrap.rs`.
 #[test]
 fn a_composer_newline_starts_the_walk_again_however_soon_the_next_glyph_follows() {
     let g = wide_geom();
@@ -1324,11 +1308,10 @@ fn a_key_whose_echo_lands_a_frame_late_lays_no_cell_left_of_the_caret() {
 
 // ──────── the delivered insert's presses ────────
 
-/// Bound, don't spend: presses banked at or before an unknown-width insert's
-/// delivery (multi-line paste, ⌃V, Tab) can only echo in its hop or the next
-/// repaint, so they retire 2 s after the hop was laid. Otherwise a queued
-/// key's credit lives for the 10 s patience and licenses the next keyless +1
-/// as `inflight`.
+/// Bound, don't spend: presses banked at or before an unknown-width insert's delivery
+/// (multi-line paste, ⌃V, Tab) can only echo in its hop or the next repaint, so they retire 2 s
+/// after the hop (`INSERT_REWRITE_FRESH`) rather than living the 10 s patience and licensing the
+/// next keyless +1 as `inflight`.
 #[test]
 fn a_key_queued_behind_an_unknown_insert_is_retired_with_the_hop_that_echoed_it() {
     let g = wide_geom();
@@ -1345,7 +1328,7 @@ fn a_key_queued_behind_an_unknown_insert_is_retired_with_the_hop_that_echoed_it(
         glow.note_delivered(d + ms(1), DeliveredClass::Typed);
         d
     };
-    // ONE HOP: the placeholder (16 cells) and the key (1) echo as +17.
+    // One hop: the placeholder (16 cells) and the key (1) echo as +17.
     let mut glow = CursorGlow::default();
     let t0 = Instant::now();
     let pre = pre_roll(&mut glow, 27, t0, &c, g);
@@ -1373,8 +1356,8 @@ fn a_key_queued_behind_an_unknown_insert_is_retired_with_the_hop_that_echoed_it(
         last_row(&glow)
     );
 
-    // TWO FRAMES: the placeholder echoes as +16, the key as its own +1 a
-    // frame later — the key spends its credit and lights `key`.
+    // Two frames: the placeholder echoes as +16, the key as its own +1 a frame later, spending
+    // its credit as `key`.
     let mut glow = CursorGlow::default();
     let t0 = Instant::now();
     let pre = pre_roll(&mut glow, 27, t0, &c, g);
@@ -1396,8 +1379,7 @@ fn a_key_queued_behind_an_unknown_insert_is_retired_with_the_hop_that_echoed_it(
     );
     assert_eq!(glow.in_flight_tally().credits, 0);
 
-    // CONTROL: the PRICED twin (`Cells(16)` + the key as +17) spends the
-    // key at the hop.
+    // Control: the priced twin (`Cells(16)`, the key as +17) spends the key at the hop.
     let mut glow = CursorGlow::default();
     let t0 = Instant::now();
     let pre = pre_roll(&mut glow, 27, t0, &c, g);
@@ -1612,11 +1594,9 @@ fn a_mid_line_park_is_not_released_by_the_tails_re_lay() {
 
 // ──────── the stamp bank ────────
 
-/// v2's `Typed` banks the same bounded width as the press credit
-/// (`RAINBOW_TYPED_SWEEP_MAX`), so a saturated IME/dictation commit (`u16::MAX`
-/// cells) cannot lay an O(n²) ribbon folding through the grid. The echo is the
-/// cap's worth of cells, the widest coalesced hop the seam licenses, and
-/// `[Typed, Sweep, Move]` reaches `Ribbon::lay`.
+/// v2's `Typed` banks the press credit's bounded width (`RAINBOW_TYPED_SWEEP_MAX`), so a
+/// saturated IME/dictation commit (`u16::MAX` cells) cannot lay an O(n²) ribbon folding through
+/// the grid: an echo of the cap's width lays exactly the cap.
 #[test]
 fn a_wide_committed_text_lays_at_most_the_sweep_cap() {
     let g = Geom {
@@ -1652,11 +1632,9 @@ fn a_wide_committed_text_lays_at_most_the_sweep_cap() {
     );
 }
 
-/// `TypedStamps::split_off_after` and `merge` are index-addressed (re-banking
-/// through `stamp()` is quadratic, on every held-park flush). A split and merge
-/// must leave the bank exactly as one-by-one banking would: packed
-/// oldest-first, the newest `TYPED_STAMP_DEPTH` surviving an overflow, at every
-/// fill including a full bank on both sides of the cut.
+/// `TypedStamps::split_off_after` and `merge` are index-addressed (re-banking through `stamp()`
+/// is quadratic) and must leave the bank as one-by-one banking would: packed oldest-first, the
+/// newest `TYPED_STAMP_DEPTH` surviving an overflow, at every fill.
 #[test]
 fn a_stamp_banks_split_and_merge_match_one_by_one_banking_at_every_fill() {
     let t0 = Instant::now();
@@ -1739,14 +1717,12 @@ fn a_stamp_banks_split_and_merge_match_one_by_one_banking_at_every_fill() {
 
 // ──────── the band's walk ────────
 
-/// The band's walk is the hand's, whatever the echo's lag. A cell's `t` is a
-/// function of its column in its cohort (`Cohort::t_at`: `t0 +
-/// walk_t(col − anchor_col)`), never a clock, and the seam dates a typed sweep
-/// at the key's clock (the press's stamp, or the oldest unpaid press for a
-/// stalled batch), floored at one stamp window before the echo
-/// (`rainbow_kitty::SWEEP_BIRTH_FLOOR_S`). Thirty keys at 100 ms with echoes 3,
-/// 8, 120 or 400 ms late, or as one hop 3 s after the last press, lay the same
-/// `t` on every column, and every cell is born at a key's clock, never its echo.
+/// The band's walk is the hand's, whatever the echo's lag. A cell's `t` is a function of its
+/// column (`Cohort::t_at`), never a clock, and the seam dates a typed sweep at the key's clock
+/// (the press's stamp, or the oldest unpaid press for a stalled batch), floored one stamp window
+/// before the echo (`rainbow_kitty::SWEEP_BIRTH_FLOOR_S`). Thirty keys at 100 ms, echoed 3 to
+/// 400 ms late or as one hop 3 s after the last press, lay the same `t` on every column, and
+/// every cell is born at a key's clock, never its echo's.
 #[test]
 fn the_bands_walk_is_the_hands_whatever_the_echos_lag() {
     let g = wide_geom();
@@ -1915,10 +1891,9 @@ fn the_glyph_gate_refuses_only_a_known_foreign_glyph() {
     assert_eq!(p.foreign_to_live(late, '_'), None, "no live press: unknown");
 }
 
-/// The run's last glyph belongs only to the anchor it came with; an anchor
-/// without one ([`CursorGlow::observe_print_anchor`], every host but the GUI)
-/// forgets it, and a `None` anchor keeps the previous pair. Otherwise the glyph
-/// is this frame's probe of the caret's row or a flanking row.
+/// The run's last glyph belongs only to the anchor it came with: an anchor handed over without
+/// one ([`CursorGlow::observe_print_anchor`]) forgets it, and a `None` anchor keeps the previous
+/// pair. Otherwise the glyph is this frame's probe of the caret's row or a flanking row.
 #[test]
 fn the_glyph_before_a_cell_is_the_host_s_for_its_own_anchor_else_this_frame_s_probe() {
     let t0 = Instant::now();
@@ -2021,17 +1996,12 @@ fn a_typed_re_anchor_lays_its_landing_only_under_a_live_press_s_glyph() {
 
 // ──────── the landing gate meets the composer's re-wraps ────────
 
-/// The landing gate witnesses the cell a soft-wrapped caret lays. One `a`
-/// after no typing: the glyph is drawn at the row's last text column (3, 17)
-/// and the caret alone wraps to the continuation indent (4, 2). The re-anchor
-/// lays the origin ([`CursorGlow::soft_wrapped_caret`]), so the gate reads the
-/// origin: the key's glyph there lays exactly (3, 17); a glyph no press typed
-/// is refused `program-row` and the press forgotten; a count-only press lays
-/// the origin.
-///
-/// Only a key that went in at the fold counts: the same move with the origin
-/// row rewritten left of the origin (zle switching to an older two-line entry)
-/// is no soft wrap, so the witness stays at the blank landing and is refused.
+/// The landing gate reads the cell a soft-wrapped caret lays. One `a`: the glyph lands at the
+/// row's last text column (3, 17) and the caret alone wraps to the indent (4, 2); the re-anchor
+/// lays the origin ([`CursorGlow::soft_wrapped_caret`]), so the gate reads the origin. The key's
+/// glyph there lays exactly (3, 17); a foreign glyph is refused `program-row` and the press
+/// forgotten; a count-only press lays the origin. With the origin row rewritten left of the
+/// origin (zle switching to an older two-line entry) the move is no soft wrap and is refused.
 #[test]
 fn a_soft_wrapped_re_anchor_is_witnessed_at_the_origin_it_lays() {
     let g = wide_geom();
@@ -2145,12 +2115,10 @@ fn a_foreign_landing_restores_the_prior_licensed_hand_row() {
     );
 }
 
-/// A lifted word lays no landing, so the landing gate stands down. A bordered
-/// composer: `│the text` on row 3, `│already[Image #1]` on row 4, caret after
-/// `already`. A Space lets `already` fit row 3: it is rewritten there and the
-/// caret stays at (4, 1), a same-row typed retreat whose `landing − 1` is `│`.
-/// The move is judged (not refused), its press spent, the engine told of the
-/// `Lift`, and nothing laid under the caret.
+/// A lifted word lays no landing, so the landing gate stands down. In a bordered composer a Space
+/// lets `already` on row 4 fit row 3, and the caret stays at (4, 1): a same-row typed retreat
+/// whose `landing − 1` is `│`. The move is judged, not refused, its press spent, and nothing is
+/// laid under the caret.
 #[test]
 fn a_lifted_word_is_not_refused_by_the_landing_gate() {
     let g = wide_geom();
@@ -2188,15 +2156,11 @@ fn a_lifted_word_is_not_refused_by_the_landing_gate() {
     );
 }
 
-/// A flushed park is witnessed by the glyph it was held over (zsh's Ctrl-R
-/// walking back along its row). One `o` and the caret retreats six cells with
-/// `l` at the landing cell; the retreat is held as a park and flushed past the
-/// window, when no probe is that frame's, so the gate reads
-/// [`HeldPark::landing_cell`]: declined `program-row`, nothing laid, the press
-/// forgotten. Controls: the key's own glyph lays exactly the landing; a blank
-/// (Ink's park to the input's start) is licensed with the landing withheld
-/// ([`HeldPark::landing_glyph`]) and the press spent; a count-only press lays
-/// the landing.
+/// A flushed park is witnessed by the glyph it was held over (zsh's Ctrl-R walking back along its
+/// row). Flushed past the window, with no probe from that frame, the gate reads
+/// [`HeldPark::landing_cell`]: a foreign glyph is declined `program-row` and the press forgotten;
+/// the key's own glyph lays exactly the landing; a blank (Ink's park to the input's start) is
+/// licensed with the landing withheld ([`HeldPark::landing_glyph`]); a count-only press lays it.
 #[test]
 fn a_flushed_park_is_witnessed_by_the_glyph_it_was_held_over() {
     let g = wide_geom();
@@ -2260,13 +2224,9 @@ fn a_flushed_park_is_witnessed_by_the_glyph_it_was_held_over() {
     }
 }
 
-/// **A RECALL AT THE NEXT KEY LEAVES THAT KEY'S HAND ON ITS ROW**
-/// ([`TornLay`]). A typed lay made with the hand off its row, a print ending
-/// on the row below, the caret walked back onto the lay, and the next key's
-/// echo before the caret rested: the lay is recalled at that key's origin,
-/// and the hand is on the row the new key echoed on. RED with the recall
-/// run after the key put its hand down: the recall handed back the hand
-/// from before the recalled lay (`None`).
+/// A recall at the next key leaves that key's hand on its row ([`TornLay`]). Shape: a typed lay
+/// made with the hand off its row (the print ends on the row below), the caret walked back onto
+/// the lay, and the next key's echo before the caret rested.
 #[test]
 fn a_recall_at_the_next_key_leaves_that_key_s_hand_on_its_row() {
     let g = wide_geom();
@@ -2309,12 +2269,9 @@ fn a_recall_at_the_next_key_leaves_that_key_s_hand_on_its_row() {
     );
 }
 
-/// **A LAY WITH NOTHING ON GLASS IS NO RECALL** ([`TornLay`]). The engine
-/// births a typed lay's cells on the tick's replay, and may lay none (a key
-/// held for its echo); a recall judged over no live cell of the lay retracts
-/// nothing, so it must not hand back the hand or log `licence=recall`. RED
-/// without the own-cell check: the hand went back to `None` and the ring
-/// logged a recall for a lay nobody saw.
+/// A recall judged over no live cell of the lay ([`TornLay`]) retracts nothing, so it hands back
+/// no hand and logs no `licence=recall` (the engine may lay none of a typed lay's cells, e.g. for
+/// a key held for its echo).
 #[test]
 fn a_lay_with_no_live_cell_is_not_recalled() {
     let c = cfg(GlowStyle::RainbowKitty, true);

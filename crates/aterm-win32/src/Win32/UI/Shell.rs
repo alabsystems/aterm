@@ -1,0 +1,14 @@
+// Copyright (c) Microsoft Corporation.
+// Copyright 2026 Andrew Yates
+// SPDX-License-Identifier: MIT OR Apache-2.0
+//
+// Derived from windows-sys 0.61.2 src/Windows/Win32/UI/Shell/mod.rs. GENERATED
+// by aterm-win32-oracle: the 2 of its 4959 names that aterm's Windows cells
+// read or that those name, with their feature gates dropped and their paths
+// pointed into this crate. Do not edit; regenerate. See ../../../LICENSE-MIT
+// and ../../../LICENSE-APACHE for the upstream licenses.
+
+//! `Win32::UI::Shell`.
+
+link!("shell32.dll" "system" fn DragQueryFileW(hdrop : HDROP, ifile : u32, lpszfile : crate::core::PWSTR, cch : u32) -> u32);
+pub type HDROP = *mut core::ffi::c_void;

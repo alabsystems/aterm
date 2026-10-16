@@ -255,9 +255,11 @@ mod tests {
     }
 
     /// THE DEDUP WINDOW MAY NOT OUTLAST THE QUICK LADDER. A completed check 100 s
-    /// ago skips every checker on the 10-minute base (the 7-minute window; the
+    /// ago skips every checker on a 10-minute base (the 7-minute window; the
     /// negative control: sized on the base, the checker's own 2-minute re-check would
-    /// read its own stamp as a sibling's and wait out the window). The same receipt
+    /// read its own stamp as a sibling's and wait out the window). A base longer than
+    /// the rungs, where the ladder shows: at the shipped two-minute base every rung is
+    /// the base and every window its 84 s. The same receipt
     /// carrying a head in flight sizes the window on the rung its count names (84 s
     /// for the 2-minute rung, 168 s for the 4-minute one, 336 s for the 8-minute
     /// one), and once the rungs are spent, or on a deferral, the ordinary window
@@ -270,7 +272,7 @@ mod tests {
         crate::status::clear_check_note();
         let staging = Staging::scratch("check-receipt-in-flight");
         let source = source("one");
-        let base = Duration::from_secs(crate::cadence::INTERVAL_SECS);
+        let base = Duration::from_secs(10 * 60);
         let now = crate::unix_now_secs();
         let skip = || crate::checker_skip_for(&staging, 42, &source, base, now);
 

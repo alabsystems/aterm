@@ -4,19 +4,13 @@
 
 //! Kitty graphics protocol (APC `G`) command parser.
 //!
-//! Parses one Kitty graphics command — `APC G <control> ; <base64 payload> ST` —
-//! into a structured [`KittyCommand`]. The control data is a comma-separated list
-//! of `key=value` pairs; the optional payload after the `;` is the base64-encoded
-//! image data (or, for non-direct mediums, a base64 path / shared-memory name).
+//! Parses `APC G <control> ; <base64 payload> ST` into a [`KittyCommand`]: the control data is
+//! comma-separated `key=value` pairs, the payload the base64 image data (or, for a non-direct
+//! medium, a path or shared-memory name). Pure and panic-free. The image store, placements and
+//! deletes live in `handler_actions.rs` (`handle_complete_kitty_command` lists what the engine
+//! does not implement).
 //!
 //! Protocol: <https://sw.kovidgoyal.net/kitty/graphics-protocol/>.
-//!
-//! The parser is pure, allocation-bounded, and never panics, so it is fully
-//! unit-testable without a `Terminal`. The image store, placements and deletes
-//! built on it live in `handler_actions.rs` (`handle_complete_kitty_command`,
-//! which lists what the engine does not implement); `kitty_graphics` is
-//! advertised true on the strength of that core (`aterm-types`
-//! `terminal_core.rs`).
 
 /// The `a=` action of a Kitty graphics command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -178,11 +172,9 @@ pub struct KittyCommand {
 /// `MAX_IMAGE_DIMENSION`).
 pub(crate) const MAX_KITTY_DIMENSION: u32 = 10_000;
 
-/// What a command that arrives while a chunked load (`m=1`) is in flight does
-/// to that load. kitty's `grman_handle_command` (`graphics.c`) routes it by
-/// action and medium, never by its other keys, once it has refused the two
-/// commands it refuses before routing: one naming both `i=` and `I=`, and a
-/// query naming no `i=`. Neither reaches this routing
+/// What a command arriving during a chunked load (`m=1`) does to that load. As in kitty's
+/// `grman_handle_command` (`graphics.c`), only action and medium decide. The two commands
+/// handled before routing (both `i=` and `I=`; a query with no `i=`) never get here
 /// (`handle_kitty_command` in `handler_actions.rs`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DuringLoad {
@@ -224,16 +216,12 @@ impl KittyCommand {
         }
     }
 
-    /// Whether this command declares data of a size kitty begins to load: no
-    /// declared side (`s=`, `v=`) over `MAX_KITTY_DIMENSION`, whatever the
-    /// format, and for raw pixels both sides declared and at least 1. kitty
-    /// compares the declared sides with its limit before it looks at the
-    /// format (`handle_add_command` for a transmit or query,
-    /// `handle_animation_frame_load_command` for `a=f`), then refuses raw
-    /// pixels with no area (`initialize_load_data`). It aborts any other
-    /// command at its first chunk, so it holds no load in flight for it and
-    /// stores no image from it. A PNG need declare no size: its own is read
-    /// from its data.
+    /// Whether kitty would begin loading this command's data: no declared side (`s=`, `v=`)
+    /// over `MAX_KITTY_DIMENSION`, whatever the format, and for raw pixels both sides declared
+    /// and at least 1 (a PNG's size comes from its data). kitty checks the sides before the
+    /// format (`handle_add_command`, `handle_animation_frame_load_command` for `a=f`), then
+    /// refuses zero-area raw pixels (`initialize_load_data`); any other command it aborts at the
+    /// first chunk, holding no load and storing no image.
     pub(crate) fn declares_loadable_size(&self) -> bool {
         let within = |side: Option<u32>| side.is_none_or(|n| n <= MAX_KITTY_DIMENSION);
         let has_area = |side: Option<u32>| side.is_some_and(|n| n >= 1);
@@ -253,14 +241,11 @@ impl KittyCommand {
 /// half is still usable (e.g. a query or delete with no data). Never panics.
 #[must_use]
 pub fn parse_kitty_command(apc: &[u8]) -> Option<KittyCommand> {
-    // The graphics identifier is the leading `G`.
     let rest = apc.strip_prefix(b"G")?;
-    // Split control data from the optional base64 payload on the first ';'.
     let (control, payload_b64) = match rest.iter().position(|&b| b == b';') {
         Some(i) => (&rest[..i], &rest[i + 1..]),
         None => (rest, &b""[..]),
     };
-    // Control data is ASCII key=value pairs; reject non-UTF-8 outright.
     let control = std::str::from_utf8(control).ok()?;
 
     let mut cmd = KittyCommand::default();
@@ -320,9 +305,7 @@ pub fn parse_kitty_command(apc: &[u8]) -> Option<KittyCommand> {
         }
     }
 
-    // Kitty base64 uses the standard alphabet; tolerate a bad payload by leaving it
-    // empty (the control half — query/delete/metadata — is still valid). The APC
-    // payload of a single chunk is continuous base64 (no line-wrapping).
+    // Standard-alphabet base64, unwrapped.
     if !payload_b64.is_empty()
         && let Ok(s) = std::str::from_utf8(payload_b64)
         && let Ok(bytes) = aterm_codec::base64::decode(s)
@@ -400,9 +383,8 @@ fn blend_over(dst: &mut [u8], src: &[u8]) {
     dst[3] = u8::try_from((alpha + 127) / 255).unwrap_or(u8::MAX);
 }
 
-/// Extract `(width, height)` in pixels from a PNG's IHDR header, or `None` if the
-/// bytes are not a PNG. Lets the Kitty handler compute a PNG image's CELL
-/// footprint without a full decode (the renderer decodes the pixels at draw time).
+/// Extract `(width, height)` in pixels from a PNG's IHDR header, or `None` if the bytes are not
+/// a PNG. Gives a PNG's cell footprint without a decode (the renderer decodes at draw time).
 #[must_use]
 pub fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     const SIG: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
@@ -468,9 +450,6 @@ mod tests {
         assert_eq!(c.payload, b"raw");
     }
 
-    /// No side declared over `MAX_KITTY_DIMENSION` loads, whatever the
-    /// format, and raw pixels also need both sides of at least 1, as in
-    /// kitty; a PNG need declare no size.
     #[test]
     fn a_loadable_size_is_kittys() {
         let cases = [
@@ -542,9 +521,6 @@ mod tests {
         assert!(!c.cursor_stays && !c.virtual_placement);
     }
 
-    /// The cell-offset and relative-placement keys. The negative control is
-    /// the parse before these keys were read: every one of them fell to the
-    /// unknown-key arm, so a relative put parsed as a plain put at the cursor.
     #[test]
     fn cell_offset_and_relative_placement_keys() {
         let c = parse_kitty_command(&apc("a=p,i=4,X=3,Y=5,P=7,Q=9,H=-2,V=4", b"")).expect("parses");
@@ -600,8 +576,6 @@ mod tests {
         assert!(parse_kitty_command(b"Ga=\xfft").is_none());
     }
 
-    /// Composition copies or blends inside both rasters and skips what falls
-    /// outside them — a rectangle past either edge is clipped, never a panic.
     #[test]
     fn compose_rgba_copies_blends_and_clips() {
         // A 2x2 opaque blue canvas.

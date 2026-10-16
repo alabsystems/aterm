@@ -17,14 +17,15 @@
 //! re-inlined literal, and `metal::pipelines::tests` fails a row Metal cannot
 //! express.
 //!
-//! There is one row per pipeline. `build_glow_boost_pipeline` is one call site
-//! building two rows (the HDR crown, `fs_hdr_glow` on `Rgba16Float` One/One,
-//! and the SDR crown, `fs_sdr_glow` on the swapchain format with `Screen`).
+//! There is one row per pipeline. `build_glow_boost_pipeline` is one
+//! construction site for two rows (the HDR crown, `fs_hdr_glow` on
+//! `Rgba16Float` One/One, and the SDR crown, `fs_sdr_glow` on the swapchain
+//! format with `Screen`).
 //!
 //! Not held here: bind-group layouts, buffers, samplers and pipeline layouts
-//! (per-backend objects). Where those bind on the Metal side is the
-//! [`BindSpec`] column, checked against the `.metal` sources both ways by the
-//! scan in `crate::metal::shaders`.
+//! (per-backend objects). Where those bind on the explicit-slot backends is the
+//! [`BindSpec`] column, checked against every hand-written twin (`.metal`
+//! today; `.glsl` and `.hlsl` as they land) both ways by `crate::shader_twins`.
 
 /// Which shader module a pipeline's entry points live in: one WGSL const in
 /// `renderer.rs` and its `.metal` twin beside `crate::metal::shaders`.
@@ -166,21 +167,22 @@ impl BlendComponent {
         dst: Factor::OneMinusSrcAlpha,
         op: BlendOp::Add,
     };
-    /// `src * src_a + dst * (1 - src_a)` — the STRAIGHT-alpha source-over RGB
+    /// `src * src_a + dst * (1 - src_a)` — the straight-alpha source-over RGB
     /// half of `wgpu::BlendState::ALPHA_BLENDING`.
     const STRAIGHT_OVER: Self = Self {
         src: Factor::SrcAlpha,
         dst: Factor::OneMinusSrcAlpha,
         op: BlendOp::Add,
     };
-    /// `src + dst` — the premultiplied additive light shared by the aurora, the
-    /// rain halos, the fire-add half, the sparkle-add and the EDR crown.
+    /// `src + dst` — the premultiplied additive light shared by the rain halos,
+    /// the fire-add half, the deco sparkle and the EDR crown.
     const ADD: Self = Self {
         src: Factor::One,
         dst: Factor::One,
         op: BlendOp::Add,
     };
-    /// `src + dst * (1 - src)` — SCREEN, the SDR crown (`Pipeline::SdrGlow`).
+    /// `src + dst * (1 - src)` — SCREEN, for the bloom composite and the SDR
+    /// crown.
     const SCREEN: Self = Self {
         src: Factor::One,
         dst: Factor::OneMinusSrc,
@@ -227,13 +229,13 @@ impl Blend {
         color: BlendComponent::ADD,
         alpha: BlendComponent::ADD,
     };
-    /// The SDR crown's (`Pipeline::SdrGlow`) SCREEN on both halves.
+    /// SCREEN on both halves: the bloom composite and the SDR crown.
     const SCREEN: Self = Self {
         color: BlendComponent::SCREEN,
         alpha: BlendComponent::SCREEN,
     };
     /// The one-sided generalization the flat `GlowQuad` streams take:
-    /// `out = src + dst*(1 - src_a)`, which IS `One`/`One` at `src_a == 0`.
+    /// `out = src + dst*(1 - src_a)`, which is `One`/`One` at `src_a == 0`.
     const GLOW_OVER: Self = Self {
         color: BlendComponent::OVER,
         alpha: BlendComponent::OVER,
@@ -465,8 +467,8 @@ pub(crate) struct VertexLayoutSpec {
     /// The instance struct's name, for the golden listing.
     #[cfg(test)]
     pub(crate) name: &'static str,
-    /// `size_of` the instance struct. Pinned to the Rust type by a
-    /// `const _: () = assert!(...)` beside each struct in `renderer.rs`.
+    /// `size_of` the instance struct, pinned to the Rust type by a `const`
+    /// assert in `renderer.rs`.
     pub(crate) stride: u64,
     /// The attributes, in `location` order.
     pub(crate) attrs: &'static [VertexAttr],
@@ -726,10 +728,12 @@ static FIRE_BUFFERS: [wgpu::VertexBufferLayout<'static>; 1] = [wgpu::VertexBuffe
     attributes: &FIRE_ATTRS,
 }];
 
-/// Where one row's resources bind on the Metal side. `metal/blit.rs` and the
-/// encoder call sites take their `set*:atIndex:` indices from here, and the MSL
-/// scan in `crate::metal::shaders` checks every `.metal` entry point against it
-/// in both directions.
+/// Where one row's resources bind on the explicit-slot backends (Metal today;
+/// D3D11's per-stage registers take the same numbers, and GL's units and block
+/// bindings the buffer and texture ones). `metal/blit.rs` and the encoder call
+/// sites take their `set*:atIndex:` indices from here, and `crate::shader_twins`
+/// checks every twin against it in both directions: each `.metal` entry point,
+/// and each `.glsl` / `.hlsl` library at module scope.
 ///
 /// The instance stream is not here; it always binds at
 /// `metal::ffi::INSTANCE_STREAM_SLOT`.
@@ -742,7 +746,7 @@ static FIRE_BUFFERS: [wgpu::VertexBufferLayout<'static>; 1] = [wgpu::VertexBuffe
 /// * Textures and samplers take per-type sequential slots in `(group, binding)`
 ///   order (the blit sampler at `@binding(1)` is `[[sampler(0)]]`).
 /// * The per-stage split is not visible from WGSL module scope, so that check
-///   compares the per-library union; the MSL scan checks each entry point.
+///   compares the per-library union; the MSL twin scan checks each entry point.
 /// * wgpu's own internal MSL slots are not described here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg(any(target_os = "macos", test))]
@@ -752,9 +756,9 @@ pub(crate) struct BindSpec {
     /// vertex functions use 0 (safe because the stream binds at
     /// `INSTANCE_STREAM_SLOT`); `vs_tray` uses 2.
     pub(crate) vertex_uniform: Option<u32>,
-    /// The FRAGMENT-stage `[[texture(n)]]` slots, in slot order.
+    /// The fragment-stage `[[texture(n)]]` slots, in slot order.
     pub(crate) fragment_textures: &'static [u32],
-    /// The FRAGMENT-stage `[[sampler(n)]]` slots, in slot order.
+    /// The fragment-stage `[[sampler(n)]]` slots, in slot order.
     pub(crate) fragment_samplers: &'static [u32],
     /// Fragment-stage `[[buffer(n)]]` slots in order. `fs_glyph` re-binds the
     /// vertex stage's `Uniforms` (argument tables are per stage); post passes
@@ -797,7 +801,7 @@ impl BindSpec {
         fragment_samplers: &[0],
         fragment_buffers: &[2],
     };
-    /// The crown pair: `HdrU` at vertex `[[buffer(0)]]` AND fragment
+    /// The crown pair: `HdrU` at vertex `[[buffer(0)]]` and fragment
     /// `[[buffer(0)]]`; no texture (the crown is procedural light).
     const CROWN: Self = Self {
         vertex_uniform: Some(0),
@@ -806,7 +810,7 @@ impl BindSpec {
         fragment_buffers: &[0],
     };
     /// The tray: placement uniform at vertex `[[buffer(2)]]`, card texture and
-    /// LINEAR sampler at fragment 0.
+    /// linear sampler at fragment 0.
     const TRAY: Self = Self {
         vertex_uniform: Some(2),
         fragment_textures: &[0],
@@ -846,9 +850,9 @@ pub(crate) struct PipelineSpec {
     pub(crate) label: &'static str,
     /// Which shader module both entry points live in.
     pub(crate) library: ShaderLibrary,
-    /// The vertex entry point, IDENTICAL in the WGSL and the MSL twin.
+    /// The vertex entry point, identical in the WGSL and the MSL twin.
     pub(crate) vs: &'static str,
-    /// The fragment entry point, IDENTICAL in the WGSL and the MSL twin.
+    /// The fragment entry point, identical in the WGSL and the MSL twin.
     pub(crate) fs: &'static str,
     /// Which attachment this pipeline draws into.
     pub(crate) target: TargetRole,
@@ -959,7 +963,7 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         vs: "vs_glyph",
         fs: "fs_glyph",
         target: TargetRole::OffscreenSrgb,
-        // out = fg*cov + dst*(1-cov) in LINEAR light (sRGB target).
+        // out = fg*cov + dst*(1-cov) in linear light (sRGB target).
         blend: Some(Blend::ALPHA_BLENDING),
         write_mask: WriteMask::All,
         vertex: VertexLayout::Glyph,
@@ -974,7 +978,7 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         vs: "vs_glyph",
         fs: "fs_glyph_color",
         target: TargetRole::OffscreenSrgb,
-        // out = rgb*a + dst*(1-a) in LINEAR light (sRGB target).
+        // out = rgb*a + dst*(1-a) in linear light (sRGB target).
         blend: Some(Blend::ALPHA_BLENDING),
         write_mask: WriteMask::All,
         vertex: VertexLayout::Glyph,
@@ -983,7 +987,7 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         #[cfg(any(target_os = "macos", test))]
         binds: BindSpec::CELL_ATLAS,
     },
-    // --- the nine demand-built EFFECT pipelines ----------------------------
+    // --- the nine demand-built effect pipelines ----------------------------
     PipelineSpec {
         label: "aterm-gpu cursor blend pipeline",
         library: ShaderLibrary::Cell,
@@ -1001,10 +1005,10 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
     PipelineSpec {
         label: "aterm-gpu glow additive pipeline",
         library: ShaderLibrary::Cell,
-        // `vs_glow` carries the instance's colour PAIR and rect span FLAT to
+        // `vs_glow` carries the instance's colour pair and rect span flat to
         // the fragment, which ramps them per column (`GlowInstance`).
         vs: "vs_glow",
-        // Glow is RAW (no sRGB decode): the Unorm view keeps One/One byte-exact
+        // Glow is raw (no sRGB decode): the Unorm view keeps One/One byte-exact
         // against the CPU `add_sat`.
         fs: "fs_glow",
         target: TargetRole::OffscreenUnorm,
@@ -1136,7 +1140,7 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         vs: "vs_fs",
         fs: "fs_shimmer",
         target: TargetRole::OffscreenUnorm,
-        // REPLACE by omission: the fragment IS the refracted frame.
+        // REPLACE by omission: the fragment is the refracted frame.
         blend: None,
         // All channels: the refraction displaces the whole sample, so alpha
         // stays consistent with the rgb on a translucent present.
@@ -1147,18 +1151,18 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         #[cfg(any(target_os = "macos", test))]
         binds: BindSpec::POST_FS,
     },
-    // --- the glow-boost pair: ONE construction site, TWO pipelines ---------
+    // --- the glow-boost pair: one construction site, two pipelines ---------
     PipelineSpec {
         label: "aterm-gpu hdr-glow pipeline",
         library: ShaderLibrary::HdrGlow,
         vs: "vs_hdr_glow",
         fs: "fs_hdr_glow",
         target: TargetRole::Edr,
-        // EDR stays ADDITIVE: the f16 target's whole point is emission above
+        // EDR stays additive: the f16 target's whole point is emission above
         // 1.0, so there is no `1 - dst` headroom to divide up.
         blend: Some(Blend::ADDITIVE),
         write_mask: WriteMask::Color,
-        // The crown reads the SAME `GlowInstance` stream the bloom extract
+        // The crown reads the same `GlowInstance` stream the bloom extract
         // does, so a gradient quad ramps in the crown as it does on the glass.
         vertex: VertexLayout::Glow,
         #[cfg(any(wgpu_arm, test))]
@@ -1189,8 +1193,8 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         fs: "fs_blit",
         target: TargetRole::Present,
         blend: Some(Blend::REPLACE),
-        // The blit is what PUBLISHES the alpha the ten RGB-only effect
-        // pipelines were careful not to disturb.
+        // The blit publishes the alpha the RGB-only effect rows leave
+        // untouched.
         write_mask: WriteMask::All,
         vertex: VertexLayout::None,
         #[cfg(any(wgpu_arm, test))]
@@ -1219,7 +1223,7 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
 /// its definition, exactly like `EFFECT_PIPELINE_COUNT`.
 pub(crate) const PIPELINE_COUNT: usize = 18;
 
-/// A row of [`PIPELINES`], by name. The discriminants ARE the indices.
+/// A row of [`PIPELINES`], by name. The discriminants are the indices.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(usize)]
 pub(crate) enum Pipeline {

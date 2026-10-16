@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Display-offset damage: which rows need redrawing when the scroll position
-//! into history changes. Every function that modifies `display_offset`
-//! delegates here.
+//! into history changes. The viewport-scroll paths in `grid/scroll.rs` and
+//! `grid/scrollback_offload.rs` delegate here.
 
 use super::Damage;
 
@@ -21,15 +21,12 @@ pub(crate) enum DisplayOffsetDamage {
     BottomRows {
         /// First damaged row (inclusive).
         start: u16,
-        /// Row count (exclusive upper bound for mark_rows).
+        /// Exclusive end row (the visible row count).
         end: u16,
     },
 }
 
-/// Damage for a display-offset transition over `visible_rows`:
-/// - scrolling up (new > old): top rows are new content from scrollback;
-/// - scrolling down (new < old): bottom rows are newly exposed live content;
-/// - delta ≥ visible rows: full damage.
+/// Damage for a display-offset transition over `visible_rows`.
 #[must_use]
 pub(crate) fn compute_display_offset_damage(
     old_offset: usize,

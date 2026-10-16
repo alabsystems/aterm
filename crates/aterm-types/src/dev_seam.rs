@@ -16,9 +16,8 @@
 //! [`dev_seam!`](crate::dev_seam) is the ONE reader. It expands IN THE CALLING CRATE,
 //! so `feature = "dev-seams"` is that crate's own feature: every crate that reads a
 //! seam declares `dev-seams` in its manifest and forwards it to the crates it depends
-//! on. `aterm-update-core`'s `env_reads` gate holds the rule: a seam's name may be read
-//! only through this macro, and a release-code env read of any other `ATERM_*` /
-//! `ATPKG_*` name must be on that gate's allow-list.
+//! on. A release build compiles every read through this macro to `None`, so no seam
+//! ships.
 
 /// Read the development seam `$name` — `Some(value)` only in a build that compiles
 /// seams (`debug_assertions`, or the calling crate's `dev-seams` feature) and only

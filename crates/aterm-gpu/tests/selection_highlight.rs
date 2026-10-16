@@ -1,13 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// Selection-highlight gate for the GPU renderer: with an active text selection,
-// the GPU must paint selected cells with `Theme::selection` as their background
-// (glyph foreground unchanged), leave unselected cells alone, and stay
-// pixel-equal to the CPU renderer within the same per-channel tolerance the
-// `gpu_matches_cpu` test uses.
+// Selection-highlight parity: selected cells take the selection background
+// (`Theme::selection`, a live OSC 17 colour, or the inactive derivation),
+// unselected cells keep theirs, and the GPU matches the CPU within the
+// `gpu_matches_cpu` tolerance.
 //
-// Gated: if there is no GPU or no system font, the test no-ops (returns).
+// A host with no GPU ends each test as could-not-run (`common::backends`).
 
 use aterm_core::selection::{SelectionSide, SelectionType};
 use aterm_core::terminal::Terminal;
@@ -35,9 +34,7 @@ fn selection_highlight_gpu_matches_cpu() {
     let theme = Theme::default();
     let px = 18.0;
 
-    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(px, theme);
 
     let (rows, cols) = (4usize, 10usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
@@ -110,11 +107,7 @@ fn selection_highlight_gpu_matches_cpu() {
 fn sparse_tail_selection_and_deepest_image_cover_match_cpu_gpu() {
     let theme = Theme::default();
     let px = 18.0;
-    // The kit's pair is font-settled (`common::font_settled`), so a chain still
-    // parsing cannot read as a parity failure.
-    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(px, theme);
     let (cw, ch) = cpu.cell_size();
     let (rows, cols) = (2usize, 8usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
@@ -200,11 +193,7 @@ fn sparse_tail_selection_and_deepest_image_cover_match_cpu_gpu() {
 fn multiline_selection_clip_matches_cpu_and_never_tints_sibling_cells() {
     let theme = Theme::default();
     let px = 18.0;
-    // The kit's pair is font-settled (`common::font_settled`), so a chain still
-    // parsing cannot read as a parity failure.
-    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(px, theme);
     let (cw, ch) = cpu.cell_size();
     let (rows, cols) = (3usize, 9usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
@@ -260,9 +249,7 @@ fn inactive_selection_bg_gpu_matches_cpu() {
     let theme = Theme::default();
     let px = 18.0;
 
-    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(px, theme);
 
     let (rows, cols) = (4usize, 10usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
@@ -283,13 +270,13 @@ fn inactive_selection_bg_gpu_matches_cpu() {
     assert_eq!(input.selection_bg, 0x0060_4020);
     let inactive_bg =
         aterm_render::derive_inactive_selection_bg(input.selection_bg, input.default_bg);
-    // It must DIFFER from the active selection — otherwise this test proves nothing.
+    // It must differ from the active selection, or this test proves nothing.
     assert!(
         !near(inactive_bg, input.selection_bg, 8),
         "derived inactive bg must visibly differ from the active selection"
     );
 
-    // (A) UNFOCUSED: both paths paint the inactive bg in selected cells, and match.
+    // (A) Unfocused: both paths paint the inactive bg in selected cells, and match.
     cpu.set_selection_inactive(true);
     gpu.set_selection_inactive(true);
     let cpu_inactive = cpu.render_input(&input);
@@ -317,7 +304,7 @@ fn inactive_selection_bg_gpu_matches_cpu() {
         );
     }
 
-    // (B) FOCUSED again: both paths revert to the ACTIVE selection bg, and match.
+    // (B) Focused again: both paths revert to the active selection bg, and match.
     cpu.set_selection_inactive(false);
     gpu.set_selection_inactive(false);
     let cpu_active = cpu.render_input(&input);
@@ -348,10 +335,8 @@ fn selection_fg_override_gpu_matches_cpu() {
     // contrast-floor default.
     let theme = Theme::default();
     let px = 18.0;
-    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
-        return;
-    };
-    // Distinctive override unlike the default fg/bg/selection, on BOTH paths.
+    let (mut cpu, mut gpu) = backends(px, theme);
+    // Distinctive override unlike the default fg/bg/selection, on both paths.
     let sel_fg = 0x00ff_00ffu32;
     cpu.set_selection_fg(Some(sel_fg));
     gpu.set_selection_fg(Some(sel_fg));

@@ -215,3 +215,188 @@ fn single_pane_glow_handoff_reuses_buffers_and_erases_on_disable() {
         "a settled frame still reaches the repaint early-out"
     );
 }
+
+/// Single-pane predictive local echo reconciles against the frame hold's own
+/// snapshot without taking a second terminal lock, so an echo arriving right
+/// after the hold is released never blanks the predicted glyph for a frame.
+#[test]
+fn a_predicted_frame_takes_one_terminal_lock_and_never_blanks_on_interleaved_echo() {
+    let wid = WindowId(0);
+    let mut app = scripted_app();
+    app.config.predictive_echo = Some("always".into());
+    app.predict_mode_cache = None;
+    feed(&app, b"$ ");
+    app.redraw_window(wid);
+
+    // 1. Arm a prediction at the live cursor (0, 2) with no PTY echo yet:
+    //    the frame takes ONE terminal hold and overlays the tentative glyph.
+    let now = std::time::Instant::now();
+    let coords = {
+        let term = app
+            .front_terminal(wid)
+            .expect("front terminal")
+            .term
+            .clone();
+        let t = term_lock(&term);
+        (
+            t.content_scroll_state().coordinate_generation(),
+            t.cols(),
+            t.rows(),
+        )
+    };
+    {
+        let ws = app.windows.get_mut(&wid).expect("scripted window");
+        ws.predictor.set_mode(crate::predict::PredictMode::Always);
+        assert!(ws.predictor.predict_char_in_grid(
+            'k',
+            (0, 2),
+            coords.0,
+            (coords.1, coords.2),
+            now,
+        ));
+    }
+    let before = term_lock_acquisitions_on_this_thread();
+    app.redraw_window(wid);
+    let taken = term_lock_acquisitions_on_this_thread() - before;
+    assert_eq!(
+        taken, 1,
+        "a single-pane frame with an active prediction takes ONE terminal hold (took {taken})"
+    );
+    assert!(
+        app.windows[&wid].pred_shown,
+        "the pending prediction was overlaid onto the frame"
+    );
+    assert_eq!(
+        app.windows[&wid].input_scratch.cells[0][2].ch, 'k',
+        "the predicted glyph is visible at (0, 2)"
+    );
+
+    // 2. Interleaved PTY echo race: the PTY echoes `k` immediately after the
+    //    frame's one terminal hold drops (before prediction reconciliation runs).
+    //    Under the old two-lock path, reconciliation re-locked the terminal,
+    //    observed the post-echo cursor `(0, 3)` and grid `'k'`, retired the
+    //    prediction, and left the pre-echo `input_scratch` cell `(0, 2)` blank
+    //    for one frame (`SingleHoldPredictionReconcile`). Under single-hold
+    //    reconciliation, the prediction survives to paint this frame and is
+    //    confirmed on the next frame when the echo's grid snapshot is extracted.
+    let term = app
+        .front_terminal(wid)
+        .expect("front terminal")
+        .term
+        .clone();
+    {
+        let term = term.clone();
+        redraw_hold_hook::install(move || {
+            term_lock(&term).process(b"k");
+        });
+    }
+    let before = term_lock_acquisitions_on_this_thread();
+    app.redraw_window(wid);
+    redraw_hold_hook::clear();
+    let taken = term_lock_acquisitions_on_this_thread() - before;
+    assert_eq!(
+        taken, 2,
+        "one hold by redraw_window + one hold by the test hook (took {taken})"
+    );
+    assert_eq!(
+        app.windows[&wid].input_scratch.cells[0][2].ch, 'k',
+        "interleaved PTY echo after the frame hold must never blank the glyph"
+    );
+    assert!(
+        has_damage(&app),
+        "the interleaved echo's damage remains pending for the next frame"
+    );
+
+    // 3. The next frame extracts the echoed `'k'` from the terminal grid and
+    //    retires the prediction cleanly.
+    let before = term_lock_acquisitions_on_this_thread();
+    app.redraw_window(wid);
+    let taken = term_lock_acquisitions_on_this_thread() - before;
+    assert_eq!(taken, 1, "the confirmation frame takes ONE terminal hold");
+    assert!(
+        !has_damage(&app),
+        "the confirmation frame consumed the echo damage"
+    );
+    assert!(
+        app.windows[&wid].predictor.idle(),
+        "the echoed glyph retired the prediction"
+    );
+    assert!(
+        !app.windows[&wid].pred_shown,
+        "no tentative overlay remains once the grid owns the glyph"
+    );
+    assert_eq!(
+        app.windows[&wid].input_scratch.cells[0][2].ch, 'k',
+        "the confirmed grid glyph is presented at (0, 2)"
+    );
+}
+
+fn arm_prediction(app: &mut crate::App, ch: char) {
+    let wid = WindowId(0);
+    let term = app
+        .front_terminal(wid)
+        .expect("front terminal")
+        .term
+        .clone();
+    let (cursor, coords, grid) = {
+        let term = term_lock(&term);
+        let cur = term.cursor();
+        (
+            (cur.row, cur.col),
+            term.content_scroll_state().coordinate_generation(),
+            (term.cols(), term.rows()),
+        )
+    };
+    let predictor = &mut app.windows.get_mut(&wid).unwrap().predictor;
+    predictor.set_mode(crate::predict::PredictMode::Always);
+    assert!(predictor.predict_char_in_grid(ch, cursor, coords, grid, std::time::Instant::now()));
+}
+
+#[test]
+fn prediction_reconcile_confirms_rtl_echo_in_logical_columns() {
+    let wid = WindowId(0);
+    let mut app = scripted_app();
+    app.config.predictive_echo = Some("always".into());
+    app.predict_mode_cache = None;
+    feed(&app, "אב".as_bytes());
+    app.redraw_window(wid);
+    arm_prediction(&mut app, 'ג');
+    feed(&app, "ג".as_bytes());
+    app.redraw_window(wid);
+    let ws = app.windows.get_mut(&wid).unwrap();
+    assert_eq!(
+        ws.input_scratch.cells[0][0].ch, 'ג',
+        "RTL echo is in visual order"
+    );
+    assert_eq!(
+        ws.input_scratch.visual_col(0, 2),
+        0,
+        "logical and visual columns differ"
+    );
+    assert!(ws.predictor.idle());
+    assert_ne!(
+        ws.predictor.take_link_estimate(),
+        Default::default(),
+        "a real RTL echo confirms the prediction and records its RTT"
+    );
+}
+
+#[test]
+fn prediction_reconcile_never_confirms_uncommitted_ime_text() {
+    let wid = WindowId(0);
+    let mut app = scripted_app();
+    app.config.predictive_echo = Some("always".into());
+    app.predict_mode_cache = None;
+    feed(&app, b"$ ");
+    app.redraw_window(wid);
+    arm_prediction(&mut app, 'k');
+    app.on_ime_preedit(wid, "k".into(), Some((1, 1)));
+    app.redraw_window(wid);
+    let ws = app.windows.get_mut(&wid).unwrap();
+    assert!(!ws.predictor.idle(), "IME preedit has not reached the PTY");
+    assert_eq!(
+        ws.predictor.take_link_estimate(),
+        Default::default(),
+        "host-painted composition must not count as an echo RTT sample"
+    );
+}

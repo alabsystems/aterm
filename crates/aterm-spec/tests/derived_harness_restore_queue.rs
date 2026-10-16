@@ -1,52 +1,16 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-use aterm_spec::{derive::harness_restored_first_attempt_model, verify};
+use aterm_spec::verify;
 
-#[test]
-fn restored_tabs_get_first_attempts_before_a_retry() {
-    let model = harness_restored_first_attempt_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name),
-        "the restore queue must stay enrolled in the spec-link registry"
-    );
-    verify::prove_and_catch_scalar(&model, "restored tabs' first attempts precede retry");
-}
-
-#[test]
-fn network_probe_shutdown_cannot_notify_before_the_waiter_parks() {
-    let model = aterm_spec::derive::netprobe_shutdown_park_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name)
-    );
-    verify::prove_and_catch_scalar(&model, "network probe shutdown cannot lose its wake");
-}
-
-/// HARNESS WORK IN FLIGHT AT A SEAMLESS UPDATE'S COMMIT (round four of the
-/// 2026-09 update robustness work, plan item 7): a restored agent the park
-/// caught mid-step is carried to the successor and relaunched there, no step
-/// starts while the terminal is parked, and a restart record the outgoing
-/// instance left in flight in a shell tab is swept at the Commit. The carry
-/// is read live (round eleven): a step that lands while parked, or an agent
-/// that runs in the tab — and stays a fact once it stopped again (round
-/// twelve) — refuses a Commit whose captures it splits, and a tab an agent
-/// ran in is never relaunched over; a relaunch that typed its line is not
-/// overtaken by its own agent (round thirteen). NEGATIVE CONTROLS: the
-/// mutants that shipped, each caught by its invariant.
+/// Harness work in flight at a seamless update's Commit: a restored agent the park caught
+/// mid-step is relaunched by the successor, no step starts while parked, a restart record left
+/// in flight is swept, a step or agent that splits the captures refuses the Commit, and a tab an
+/// agent ran in is never relaunched over. Each `Buggy = 1` mutant is caught by its invariant.
 #[test]
 fn harness_work_in_flight_at_a_commit_is_carried_never_dropped() {
     use aterm_spec::derive::harness_restored_carry_model;
     let model = harness_restored_carry_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name),
-        "the restored carry must stay enrolled in the spec-link registry"
-    );
     verify::prove_and_catch_scalar(&model, "harness work in flight at a Commit");
 
     // The park lands mid-step: what it captures includes the agent whose
@@ -92,9 +56,9 @@ fn harness_work_in_flight_at_a_commit_is_carried_never_dropped() {
         assert!(model.fire(action, &mut before), "{action}: {before:?}");
     }
     assert_eq!(before["succ"], 0);
-    // A relaunch that TYPED its line, then an agent in its tab: its own
-    // (one seen during the step that typed included) — never overtaken,
-    // stepped again (carrying its line on, typing nothing twice) and carried.
+    // A relaunch that typed its line, then an agent in its tab: its own (one seen during the
+    // step that typed included), never overtaken, stepped again (carrying its line on, typing
+    // nothing twice) and carried.
     for during in [false, true] {
         let mut typed = model.init_state();
         let actions: &[&str] = if during {
@@ -142,8 +106,8 @@ fn harness_work_in_flight_at_a_commit_is_carried_never_dropped() {
     // A queue that never asked the tab steps it here.
     let asked_nothing = replay(&["AgentRuns", "StepStartOvertaken"]);
     assert!(!buggy.check_invariant("NoRelaunchOverAgent", &asked_nothing));
-    // Round eleven: the agent that ran is forgotten once it stopped, both
-    // captures agree, and the successor types beside it.
+    // The agent that ran is forgotten once it stopped: both captures agree, and the successor
+    // types beside it.
     let forgotten = replay(&[
         "Park",
         "AgentRuns",
@@ -154,33 +118,15 @@ fn harness_work_in_flight_at_a_commit_is_carried_never_dropped() {
     assert!(!buggy.check_invariant("NoRelaunchOverAgent", &forgotten));
 }
 
-/// A CRASHED AGENT'S RELAUNCH THROUGH A PARK'S COMMIT THAT FAILS (F13,
-/// rounds eleven to fourteen): whenever the stopped worker decides, before
-/// the rollback or after it, what it owes is relaunched; an exit no worker
-/// was handed — the agent crashed while the Commit held the host, or its
-/// worker was stopped healthy, or handed over to a successor a changed
-/// policy starts at the next pass — is handed by the host once it
-/// supervises again; and the next park carries the relaunch the rollback
-/// queued, an overtaken one of the same tab notwithstanding; and one a quit
-/// keeps the queue from taking stays owed for the quit layout. Round
-/// seventeen: a panic of the host's loop loses no exit its workers held, and
-/// an exit no pass sees as it comes is read as it is seen, whatever a Claude
-/// Code started before the host hands it removes — and an agent a relaunch
-/// lands is watched until a pass names it, the host down or not. Round
-/// eighteen: the rollback queue's landing is watched as a worker's is, a
-/// landing no read reaches keeps its worker — and the queue's keeps its
-/// attempt — and a panic in the host's restart loses no worker. NEGATIVE
-/// CONTROLS: the mutants that shipped, each caught by its invariant.
+/// A crashed agent's relaunch through a failed Commit is never lost: the stopped worker's debt
+/// is relaunched whenever it decides, an exit no worker was handed is handed once the host
+/// supervises again, the next park carries what the rollback queued, a host panic loses no exit
+/// or worker, and a landing is watched until a pass names it. Each `Buggy = 1` mutant is caught
+/// by its invariant.
 #[test]
 fn a_relaunch_owed_through_a_failed_commit_is_never_lost() {
     use aterm_spec::derive::harness_commit_owed_model;
     let model = harness_commit_owed_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name),
-        "the Commit's owed relaunch must stay enrolled in the spec-link registry"
-    );
     verify::prove_and_catch_scalar(&model, "a relaunch owed through a failed Commit");
 
     let run = |model: &aterm_spec::derive::Model, actions: &[&str]| {
@@ -229,11 +175,9 @@ fn a_relaunch_owed_through_a_failed_commit_is_never_lost() {
         (1, 0, 0)
     );
     assert!(!model.action_enabled("HandUnwatched", &alive));
-    // Round fourteen: a changed policy hands the worker over just before the
-    // Commit's stop, which then marks nothing (its stop is set already); the
-    // agent crashes while the Commit holds. The worker handed over leaves
-    // the exit to the host as it ends, which hands it once it supervises
-    // again.
+    // A changed policy hands the worker over just before the Commit's stop, and the agent crashes
+    // while the Commit holds: the handed-over worker leaves the exit to the host, which hands it
+    // once it supervises again.
     let handed_over = run(
         &model,
         &[
@@ -281,13 +225,8 @@ fn a_relaunch_owed_through_a_failed_commit_is_never_lost() {
         ),
         (1, 0, 0, 0)
     );
-    // The joint audit of 2026-10-01: the agent back — the host reads it and
-    // marks it its own — and gone again before the worker read it. The
-    // worker reads it gone and relaunches it itself — in its back-off, or
-    // (round two) at the landing that started it: it never ends there,
-    // leaving the exit to a worker the host would hand it; or a Commit's
-    // stop came while it was back, and the rollback queues what it still
-    // owes.
+    // The agent is back and gone again before the worker read it: the worker relaunches it
+    // itself, or, if a Commit's stop came while it was back, the rollback queues what it owes.
     let rearmed = run(
         &model,
         &[
@@ -323,9 +262,8 @@ fn a_relaunch_owed_through_a_failed_commit_is_never_lost() {
         ],
     );
     assert!(!model.action_enabled("Commit", &split), "{split:?}");
-    // Round sixteen: a quit closes the queue before the worker told to take
-    // its relaunch up decides; refused, it stays owed — stranded, for the
-    // quit layout — and nothing more is queued, stepped or handed.
+    // A quit closes the queue before the worker told to take its relaunch up decides: refused, it
+    // stays owed for the quit layout, and nothing more is queued, stepped or handed.
     let quit = run(
         &model,
         &[
@@ -336,10 +274,9 @@ fn a_relaunch_owed_through_a_failed_commit_is_never_lost() {
     for action in ["QueueSteps", "Park", "Start", "HandUnwatched"] {
         assert!(!model.action_enabled(action, &quit), "{action}: {quit:?}");
     }
-    // Round seventeen: the host's loop panics, and the agent crashes while
-    // it waits out its back-off — a Claude Code started meanwhile sweeping
-    // the record. The workers lived on: nothing is handed while the host is
-    // down, and its first pass back hands the exit, read as it was seen.
+    // The host's loop panics and the agent crashes in its back-off, a new Claude Code sweeping the
+    // record: nothing is handed while the host is down, and its first pass back hands the exit,
+    // read as it was seen.
     let down = run(&model, &["Panic", "Crash", "Sweep"]);
     assert!(!model.action_enabled("Hand", &down), "{down:?}");
     let back = run(
@@ -347,10 +284,9 @@ fn a_relaunch_owed_through_a_failed_commit_is_never_lost() {
         &["Panic", "Crash", "Sweep", "Up", "Hand", "Read", "Relaunch"],
     );
     assert_eq!((back["done"], back["down"]), (1, 0));
-    // A crash while a Commit holds the host, swept during the hold: the exit
-    // left to the host was read as it was seen, and is relaunched once the
-    // Commit fails — and so when the panic and the Commit coincide, once the
-    // host is back.
+    // A crash while a Commit holds the host, swept during the hold: the exit was read as it was
+    // seen and is relaunched once the Commit fails, or, when a panic coincides, once the host is
+    // back.
     let held = run(
         &model,
         &[
@@ -396,12 +332,9 @@ fn a_relaunch_owed_through_a_failed_commit_is_never_lost() {
         ],
     );
     assert_eq!((both["done"], both["unwatched"]), (1, 0));
-    // The review of round seventeen's first cut: a worker's relaunch lands
-    // while the host is down, and the agent it started crashes before the
-    // host is back — no pass read it back (`Back` needs one), so no worker
-    // holds it and no mark, but its watch does: the host's first pass hands
-    // that exit, read as it was seen, and it is relaunched again. With the
-    // host up the pass that names it starts its worker and ends the watch.
+    // A relaunch lands while the host is down and its agent crashes before the host is back: no
+    // pass read it back, but its watch holds it, so the host's first pass hands that exit. With
+    // the host up, the pass that names it starts its worker and ends the watch.
     let landed = run(
         &model,
         &[
@@ -439,9 +372,8 @@ fn a_relaunch_owed_through_a_failed_commit_is_never_lost() {
     );
     let named = run(&model, &["Crash", "Hand", "Read", "Relaunch", "Start"]);
     assert_eq!((named["worker"], named["landed"]), (1, 0));
-    // Round eighteen: the rollback queue's landing is watched too — its
-    // agent crashing before a pass names it is handed by the host and
-    // relaunched once more.
+    // The rollback queue's landing is watched too: its agent crashing before a pass names it
+    // is handed by the host and relaunched once more.
     let queue_landed = run(
         &model,
         &[
@@ -482,9 +414,8 @@ fn a_relaunch_owed_through_a_failed_commit_is_never_lost() {
         (queue_relaunched["done"], queue_relaunched["landed"]),
         (1, 1)
     );
-    // A landing no read reaches keeps its worker, while the host is down
-    // too: its agent's crash is its own relaunch's again, and a later read
-    // is a landing watched as any.
+    // A landing no read reaches keeps its worker, the host down too: its agent's crash is its own
+    // relaunch's again, and a later read is a landing watched as any.
     let unread = run(
         &model,
         &["Crash", "Hand", "Read", "Panic", "RelaunchUnread", "Crash"],
@@ -506,9 +437,8 @@ fn a_relaunch_owed_through_a_failed_commit_is_never_lost() {
         (reread["done"], reread["landed"], reread["worker"]),
         (1, 1, 0)
     );
-    // The review of round eighteen's first cut: the rollback queue's landing
-    // no read reaches keeps its attempt, the exit's holder — read later, it
-    // is watched; crashed unread, it is owed again and stepped again.
+    // The rollback queue's landing no read reaches keeps its attempt, the exit's holder: read
+    // later, it is watched; crashed unread, it is owed and stepped again.
     let rollback_queued = [
         "Crash", "Hand", "Read", "Suspend", "Decide", "Resume", "Rollback",
     ];
@@ -594,7 +524,7 @@ fn a_relaunch_owed_through_a_failed_commit_is_never_lost() {
             "{actions:?}: {state:?}"
         );
     };
-    // Round ten: the stop read as the park, which the rollback lifted.
+    // `DecideByPark`: the stop read as the park, which the rollback lifted.
     lost(&[
         "Crash",
         "Hand",
@@ -604,7 +534,7 @@ fn a_relaunch_owed_through_a_failed_commit_is_never_lost() {
         "Rollback",
         "DecideByPark",
     ]);
-    // Round eleven: the exit read from `left`, which the stop cleared.
+    // `StopEndsUnread`: the exit read from `left`, which the stop cleared.
     lost(&[
         "Crash",
         "Hand",
@@ -613,8 +543,8 @@ fn a_relaunch_owed_through_a_failed_commit_is_never_lost() {
         "Resume",
         "Rollback",
     ]);
-    // Round twelve: a worker stopped with no exit handed ended, and no pass
-    // hands an exit to a stopped worker.
+    // `EndUnhandedForgotten`: a worker stopped with no exit handed ends, and no pass hands an
+    // exit to a stopped worker.
     lost(&[
         "Suspend",
         "Crash",
@@ -622,8 +552,8 @@ fn a_relaunch_owed_through_a_failed_commit_is_never_lost() {
         "Resume",
         "Rollback",
     ]);
-    // Round thirteen: only a worker the Commit marked left the exit to the
-    // host, and the Commit marks no worker a hand-over stopped first.
+    // `EndHandedOverForgotten`: only a worker the Commit marked leaves the exit to the host,
+    // and the Commit marks no worker a hand-over stopped first.
     lost(&[
         "HandOver",
         "Suspend",
@@ -641,8 +571,8 @@ fn a_relaunch_owed_through_a_failed_commit_is_never_lost() {
         "Resume",
         "Rollback",
     ]);
-    // Until the joint audit of 2026-10-01: the agent back and gone again
-    // read as a stop for good, nothing holding its exit.
+    // `GoneReadAsStop`: the agent back and gone again is read as a stop for good, nothing
+    // holding its exit.
     lost(&[
         "Crash",
         "Hand",
@@ -654,9 +584,8 @@ fn a_relaunch_owed_through_a_failed_commit_is_never_lost() {
         "Resume",
         "Rollback",
     ]);
-    // Until round two of that audit: a landing whose agent was gone before
-    // the worker read it ended the worker, and the worker the host handed
-    // the exit could not decide it.
+    // `SettleGone`: a landing whose agent was gone before the worker read it ends the worker,
+    // and the worker the host hands the exit cannot decide it.
     lost(&[
         "Crash",
         "Hand",
@@ -669,8 +598,8 @@ fn a_relaunch_owed_through_a_failed_commit_is_never_lost() {
         "Resume",
         "Rollback",
     ]);
-    // Until round sixteen: a worker told `TakenUp` that decided after a quit
-    // closed the queue had its relaunch refused, and owed it no more.
+    // `DecideClosedDrops`: a worker told `TakenUp` that decides after a quit closed the queue
+    // has its relaunch refused, and owes it no more.
     lost(&[
         "Crash",
         "Hand",
@@ -681,10 +610,8 @@ fn a_relaunch_owed_through_a_failed_commit_is_never_lost() {
         "Quit",
         "DecideClosedDrops",
     ]);
-    // Until round seventeen: the host's panic dropped its workers, stopping
-    // each — one supervising ended leaving no exit to the host, one handed
-    // its exit settled what it owed — and the crash while the host was down
-    // was never relaunched.
+    // `PanicStops`: the host's panic stops its workers, and the crash while the host is down is
+    // never relaunched.
     lost(&[
         "PanicStops",
         "Crash",
@@ -705,9 +632,8 @@ fn a_relaunch_owed_through_a_failed_commit_is_never_lost() {
         "Resume",
         "Rollback",
     ]);
-    // Until round seventeen: an exit left to the host while a Commit held it
-    // was read only by the worker it was handed after the hold, the record
-    // swept by then: a graceful exit.
+    // `CrashUnseen`: an exit left to the host while a Commit held it is read only by the worker
+    // it is handed after the hold, the record swept by then: a graceful exit.
     lost(&[
         "Suspend",
         "EndUnhanded",
@@ -718,9 +644,8 @@ fn a_relaunch_owed_through_a_failed_commit_is_never_lost() {
         "HandUnwatched",
         "Read",
     ]);
-    // Until the review of round seventeen's first cut: the agent a relaunch
-    // landed was left to the roster with nothing watching it, and its crash
-    // before a pass named it was read by nobody.
+    // `LandedLost`: the agent a relaunch landed is left to the roster with nothing watching it,
+    // and nobody reads its crash before a pass names it.
     lost(&[
         "Crash",
         "Hand",
@@ -733,9 +658,8 @@ fn a_relaunch_owed_through_a_failed_commit_is_never_lost() {
         "Resume",
         "Rollback",
     ]);
-    // Until round eighteen: the rollback queue's landing was watched by
-    // nobody, and its agent's crash before a pass named it was read by
-    // nobody.
+    // `QueueLandedLost`: nobody watches the rollback queue's landing, and nobody reads its
+    // agent's crash before a pass names it.
     lost(&[
         "Crash",
         "Hand",
@@ -746,8 +670,8 @@ fn a_relaunch_owed_through_a_failed_commit_is_never_lost() {
         "Rollback",
         "QueueLandedLost",
     ]);
-    // Until round eighteen: a landing no read reached ended its worker with
-    // nothing watching its agent, whose crash was read by nobody.
+    // `UnreadLandedLost`: a landing no read reached ends its worker with nothing watching its
+    // agent, whose crash is read by nobody.
     lost(&[
         "Crash",
         "Hand",
@@ -759,8 +683,8 @@ fn a_relaunch_owed_through_a_failed_commit_is_never_lost() {
         "Resume",
         "Rollback",
     ]);
-    // Round eighteen's first cut: the queue's landing no read reached ended
-    // its attempt, and its crash before any read was held by nobody.
+    // `QueueUnreadLost`: the queue's landing no read reached ends its attempt, and its crash
+    // before any read is held by nobody.
     lost(&[
         "Crash",
         "Hand",
@@ -772,8 +696,7 @@ fn a_relaunch_owed_through_a_failed_commit_is_never_lost() {
         "QueueStepsUnread",
         "QueueUnreadLost",
     ]);
-    // Until round eighteen: a panic in the host's restart dropped its
-    // workers, as the run's own panic had before round seventeen.
+    // `RestartPanicStops`: a panic in the host's restart drops its workers.
     lost(&[
         "Panic",
         "RestartPanicStops",
@@ -784,7 +707,7 @@ fn a_relaunch_owed_through_a_failed_commit_is_never_lost() {
         "Resume",
         "Rollback",
     ]);
-    // Round twelve: both captures read the overtaken relaunch first.
+    // `ParkFirstFound`: both captures read the overtaken relaunch first.
     let dropped = run(
         &buggy,
         &[

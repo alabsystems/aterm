@@ -51,6 +51,7 @@ use super::*;
 // fail-closed regardless. No runtime logic and no panic surface beyond
 // the idiomatic allocs; the MODEL it returns is what `ty` machine-checks.
 #[cfg_attr(trust_verify, trust::skip)]
+#[crate::model]
 pub fn terminal_modes_model() -> Model {
     // (Set action, Reset action, mode) for every boolean toggle pair.
     const TOGGLES: [(&str, &str, &str); 13] = [
@@ -165,6 +166,7 @@ pub fn terminal_modes_model() -> Model {
         actions,
         invariants: vec![Invariant {
             name: "ResetRestoresDefaults",
+            kind: InvariantKind::Claim,
             expr: or_(eq(var("reset"), int(0)), restored),
         }],
     }
@@ -185,6 +187,7 @@ pub fn terminal_modes_model() -> Model {
 // Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
 // models above) — the MODEL it returns is what `ty` machine-checks.
 #[cfg_attr(trust_verify, trust::skip)]
+#[crate::model]
 pub fn ring_model() -> Model {
     Model {
         name: "Ring",
@@ -224,6 +227,7 @@ pub fn ring_model() -> Model {
         }],
         invariants: vec![Invariant {
             name: "LenBounded",
+            kind: InvariantKind::Claim,
             // seq - lo + 1 <= Cap
             expr: le(add(sub(var("seq"), var("lo")), int(1)), cst("Cap")),
         }],
@@ -250,6 +254,7 @@ pub fn ring_model() -> Model {
 // Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
 // models above) — the MODEL it returns is what `ty` machine-checks.
 #[cfg_attr(trust_verify, trust::skip)]
+#[crate::model]
 pub fn cursor_model() -> Model {
     Model {
         name: "Cursor",
@@ -290,6 +295,7 @@ pub fn cursor_model() -> Model {
         ],
         invariants: vec![Invariant {
             name: "CursorBounded",
+            kind: InvariantKind::Claim,
             expr: le(var("cursor"), var("seq")), // cursor <= seq
         }],
     }
@@ -312,6 +318,7 @@ pub fn cursor_model() -> Model {
 // Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
 // models above) — the MODEL it returns is what `ty` machine-checks.
 #[cfg_attr(trust_verify, trust::skip)]
+#[crate::model]
 pub fn subscribe_model() -> Model {
     Model {
         name: "Subscribe",
@@ -391,6 +398,7 @@ pub fn subscribe_model() -> Model {
         ],
         invariants: vec![Invariant {
             name: "NoSilentLoss",
+            kind: InvariantKind::Claim,
             expr: eq(var("lost"), int(0)), // lost = 0
         }],
     }
@@ -418,6 +426,7 @@ pub fn subscribe_model() -> Model {
 // Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
 // models above) — the MODEL it returns is what `ty` machine-checks.
 #[cfg_attr(trust_verify, trust::skip)]
+#[crate::model]
 pub fn watcher_latch_model() -> Model {
     Model {
         name: "WatcherLatch",
@@ -483,6 +492,7 @@ pub fn watcher_latch_model() -> Model {
         ],
         invariants: vec![Invariant {
             name: "NoSilentLoss",
+            kind: InvariantKind::Claim,
             expr: eq(var("lost"), int(0)), // lost = 0
         }],
     }
@@ -554,6 +564,7 @@ enum WakeLatchMutant {
 // Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
 // models above) — the MODEL it returns is what `ty` machine-checks.
 #[cfg_attr(trust_verify, trust::skip)]
+#[crate::model]
 pub fn damage_to_present_model() -> Model {
     wake_latch_model(WakeLatchMutant::OneShot)
 }
@@ -572,6 +583,7 @@ pub fn damage_to_present_model() -> Model {
 /// frame of `Expiry + 1` ticks, TurnEnd — the exact live trace).
 // Skip (T2 vcgen-budget lane): a spec-model DATA constructor.
 #[cfg_attr(trust_verify, trust::skip)]
+#[crate::model]
 pub fn wake_heal_evidence_model() -> Model {
     wake_latch_model(WakeLatchMutant::AgeOnly)
 }
@@ -651,11 +663,13 @@ fn wake_latch_model(mutant: WakeLatchMutant) -> Model {
                     // bounded response the 5 fps incident violated (its bound
                     // was ∞).
                     name: "DamageBounded",
+                    kind: InvariantKind::Claim,
                     expr: le(var("waited"), add(cst("Expiry"), int(1))),
                 },
                 Invariant {
                     // A stranded wake never swallows damage past its expiry.
                     name: "StrandedReposted",
+                    kind: InvariantKind::Claim,
                     expr: eq(var("missedRepost"), int(0)),
                 },
             ],
@@ -665,6 +679,7 @@ fn wake_latch_model(mutant: WakeLatchMutant) -> Model {
             vec![Invariant {
                 // No heal ever fires on a wake still in the queue.
                 name: "NoFalseHeal",
+                kind: InvariantKind::Claim,
                 expr: eq(var("falseHeal"), int(0)),
             }],
         ),
@@ -866,6 +881,7 @@ fn wake_latch_model(mutant: WakeLatchMutant) -> Model {
 // Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
 // models above) — the MODEL it returns is what `ty` machine-checks.
 #[cfg_attr(trust_verify, trust::skip)]
+#[crate::model]
 pub fn idle_deadline_model() -> Model {
     // min(a, b) == IF a > b THEN b ELSE a ; keep-first(a, v) == IF a = Unset THEN v ELSE a.
     let arm = |v: i64| -> Expr {
@@ -921,6 +937,7 @@ pub fn idle_deadline_model() -> Model {
         ],
         invariants: vec![Invariant {
             name: "EarliestArmed",
+            kind: InvariantKind::Claim,
             expr: eq(var("armed"), var("minp")), // armed == min of pending deadlines
         }],
     }
@@ -959,7 +976,7 @@ pub fn surface_coverage_model() -> Model {
                 presented = 1;
             }
 
-            invariant FrameFitsSurface: frame <= Surface;
+            bound FrameFitsSurface: frame <= Surface;
             invariant PresentCoversSurface:
                 if presented == 1 { covered == Surface } else { 1 == 1 };
             invariant RemainderUsesLiveBackground:
@@ -997,7 +1014,7 @@ pub fn startup_phase_publication_model() -> Model {
                 published = 1;
             }
 
-            invariant PhaseBounded: phase <= PhaseCount;
+            bound PhaseBounded: phase <= PhaseCount;
             invariant CompleteBeforeValidPublication:
                 if published == 1 { phase == PhaseCount } else { 1 == 1 };
         }
@@ -1112,16 +1129,16 @@ pub fn present_retry_model() -> Model {
                 outstanding = 1;
             }
 
-            invariant Bounds:
+            bound Bounds:
                 remaining <= RetryCap && retry <= 2 && ready <= 1 && parked <= 1 &&
                 outstanding <= 1 && bootstrap_available <= 1;
-            invariant RetryDeadlineIsStrictlyFuture: retry <= 1;
+            uncaught RetryDeadlineIsStrictlyFuture: retry <= 1;
             invariant AutonomousTrainBound: train <= RetryCap;
-            invariant ParkedHasNoDeadline:
+            uncaught ParkedHasNoDeadline:
                 if parked == 1 { retry == 0 } else { 1 == 1 };
-            invariant ExhaustedAttemptParks:
+            uncaught ExhaustedAttemptParks:
                 if remaining == 0 && ready == 0 { parked == 1 } else { 1 == 1 };
-            invariant OutstandingRedrawHasOpenGate:
+            uncaught OutstandingRedrawHasOpenGate:
                 if outstanding == 1 { ready == 1 && retry == 0 && parked == 0 }
                 else { 1 == 1 };
         }
@@ -1157,7 +1174,7 @@ pub fn gpu_loss_route_model() -> Model {
                 route = 0;
             }
 
-            invariant RouteRange: route <= 2;
+            bound RouteRange: route <= 2;
             invariant LostUsesFallback:
                 if lost == 1 { route == 2 } else { 1 == 1 };
         }
@@ -1414,7 +1431,7 @@ pub fn gpu_loss_recovery_model() -> Model {
                 cpu_presented = 1;
             }
 
-            invariant Bounds:
+            bound Bounds:
                 path <= 2 && fallback_failed <= 1 && retry <= 1 && delivered <= 1 &&
                 exhausted <= 1 && parked <= 1 && cpu_ready <= 1 && requested <= 1 &&
                 cpu_presented <= 1 &&
@@ -1505,7 +1522,7 @@ pub fn recovery_redraw_model() -> Model {
                 presented = 1;
             }
 
-            invariant Bounds:
+            bound Bounds:
                 unresolved <= 1 && stimulated <= 1 && requested <= 1 &&
                 suppressed <= 1 && presented <= 1;
             invariant RecoveryStimulusRequestsRedraw:
@@ -1672,7 +1689,7 @@ pub fn predictive_echo_visibility_model() -> Model {
                 retracted = 0;
             }
 
-            invariant Bounds:
+            bound Bounds:
                 app_owned <= 1 && slow <= 1 && confirmed <= 1 &&
                 pending <= 1 && visible <= 1 && erased <= 1 && fresh <= 1 &&
                 fast_streak <= Hide && retracted <= 1;
@@ -1725,6 +1742,7 @@ pub fn predictive_echo_visibility_model() -> Model {
 // Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
 // models above) — the MODEL it returns is what `ty` machine-checks.
 #[cfg_attr(trust_verify, trust::skip)]
+#[crate::model]
 pub fn self_governor_model() -> Model {
     Model {
         name: "SelfGovernor",
@@ -1766,6 +1784,7 @@ pub fn self_governor_model() -> Model {
         ],
         invariants: vec![Invariant {
             name: "FailClosed",
+            kind: InvariantKind::Claim,
             expr: eq(var("wrote_while_tripped"), int(0)), // no write survived a trip
         }],
     }
@@ -1788,6 +1807,7 @@ pub fn self_governor_model() -> Model {
 // Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
 // models above) — the MODEL it returns is what `ty` machine-checks.
 #[cfg_attr(trust_verify, trust::skip)]
+#[crate::model]
 pub fn inject_floor_model() -> Model {
     Model {
         name: "InjectFloor",
@@ -1836,10 +1856,12 @@ pub fn inject_floor_model() -> Model {
         invariants: vec![
             Invariant {
                 name: "NoOverdraft",
+                kind: InvariantKind::Claim,
                 expr: eq(var("over"), int(0)), // never admitted past an empty bucket
             },
             Invariant {
                 name: "BoundedTokens",
+                kind: InvariantKind::Uncaught,
                 expr: le(var("tokens"), cst("Cap")), // the bucket never exceeds Cap
             },
         ],
@@ -1857,12 +1879,12 @@ pub fn inject_floor_model() -> Model {
 /// reachable from untrusted code (any `unsafe { Authority::root_authority() }` an
 /// untrusted path could execute), and `ty` must drive the untrusted actor to `Top`,
 /// violating `NoUntrustedTop`. At `Buggy = 0` the mint is launcher-only and the
-/// invariant holds. Bound to real code by the `aterm-cap/tests/mint_reachability.rs`
-/// source-scan conformance test (Tier-1): the sealed constructor is named in exactly
-/// one product location and no engine crate can reach it.
+/// invariant holds. In the code the `launcher-mint` source guard (`aterm-census
+/// --guards`) keeps every shipped call to the mint in aterm-gui and aterm-cli.
 // Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
 // models above) — the MODEL it returns is what `ty` machine-checks.
 #[cfg_attr(trust_verify, trust::skip)]
+#[crate::model]
 pub fn mint_reachability_model() -> Model {
     Model {
         name: "MintReachability",
@@ -1899,6 +1921,7 @@ pub fn mint_reachability_model() -> Model {
         ],
         invariants: vec![Invariant {
             name: "NoUntrustedTop",
+            kind: InvariantKind::Claim,
             // untrusted authority never reaches the mint level
             expr: le(var("untrusted"), sub(cst("Top"), int(1))),
         }],
@@ -1923,6 +1946,7 @@ pub fn mint_reachability_model() -> Model {
 // Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
 // models above) — the MODEL it returns is what `ty` machine-checks.
 #[cfg_attr(trust_verify, trust::skip)]
+#[crate::model]
 pub fn channel_bind_model() -> Model {
     Model {
         name: "ChannelBind",
@@ -1959,6 +1983,7 @@ pub fn channel_bind_model() -> Model {
         ],
         invariants: vec![Invariant {
             name: "NoReplay",
+            kind: InvariantKind::Claim,
             expr: eq(var("accepted_replay"), int(0)), // a cross-channel replay never authorizes
         }],
     }
@@ -1986,6 +2011,7 @@ pub fn channel_bind_model() -> Model {
 // Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
 // models above) — the MODEL it returns is what `ty` machine-checks.
 #[cfg_attr(trust_verify, trust::skip)]
+#[crate::model]
 pub fn net_capability_grant_model() -> Model {
     props::conjunctive_authz(props::ConjunctiveAuthz {
         name: "NetCapabilityGrant",
@@ -2022,6 +2048,7 @@ pub fn net_capability_grant_model() -> Model {
 // Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
 // models above) — the MODEL it returns is what `ty` machine-checks.
 #[cfg_attr(trust_verify, trust::skip)]
+#[crate::model]
 pub fn net_dial_after_grant_model() -> Model {
     props::happens_before(props::Ordering {
         name: "NetDialAfterGrant",
@@ -2247,7 +2274,7 @@ pub fn alt_archive_pool_model() -> Model {
             // archives only (see the doc): an archive over its current
             // allowance has not drawn since the allowance moved, and comes
             // within it on its next frame.
-            invariant PoolBounded:
+            uncaught PoolBounded:
                 (a > (if Local == 1 { Total }
                       else { if (if Buggy == 1 { if Instances > 1 { 1 } else { 0 } }
                                  else { if b > 0 { 1 } else { 0 } }) > 0

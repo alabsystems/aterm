@@ -1,85 +1,68 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The glass: which rows rank where (pure over the live set), and the
-//! single-row width law that turns one message into one `cols`-wide row of
-//! cells (glyph, bold title, ` · ` excerpt, percent or elapsed clock, ETA,
-//! load words, stats, and the right-aligned capsules) over the row's meter.
-//! Everything here is a pure function of its arguments; the host paints the
-//! [`Presentation`] it gets back.
+//! The glass: which rows rank where (pure over the live set), and the single-row width
+//! law that turns one message into one `cols`-wide row of cells (glyph, bold title,
+//! ` · ` excerpt, percent or elapsed clock, ETA, load words, stats, and the right-aligned
+//! capsules) over the row's meter. Everything here is a pure function of its arguments;
+//! the host paints the [`Presentation`] it gets back.
 //!
-//! The meter is the row: a metered row's meter is `(0, cols, fill)`, 0 % at
-//! the window's left edge and 100 % at its right, with everything else on
-//! the row written over it. It takes no room from the words and is never
-//! sacrificed; the host maps the fill onto the window's pixels, gutters
-//! included. A busy row ([`crate::Meter::busy`]) carries `track = (0, cols)`,
-//! the same surface, for the comet.
+//! The meter is the row: a metered row's meter is `(0, cols, fill)`, 0 % at the window's
+//! left edge and 100 % at its right, under everything else on the row. It takes no room
+//! from the words and is never sacrificed; the host maps the fill onto the window's
+//! pixels, gutters included. A busy row ([`crate::Meter::busy`]) carries
+//! `track = (0, cols)`, the same surface, for the comet.
 //!
 //! Fit order per row, `budget = cols − 2·MARGIN`:
 //!
-//! 1. `fixed = head + A + BEFORE_CAPSULES + capsules(long)`, where `A` is the
-//!    activity's words: [`PCT_W`] for a row with a fill, `1 + ELAPSED_SHORT_W`
-//!    for a busy one (the elapsed slot's long form is the first extra), 0
-//!    otherwise; plus, on a moving row that carries the load slot, `2 +` the
-//!    widest words among the loads the row declared
-//!    ([`crate::Message::loads`]; every load's when it declared none), whether
-//!    its words show yet or not. The slot is reserved at one width for the
-//!    row's life, so words arriving, changing resource or leaving never re-lay
-//!    a moving row. Over budget → the implicit `Details ›` goes first, where
-//!    that alone fits the row (the row body opens Details); still over →
-//!    every capsule takes its short form (a capsule with none goes); still
-//!    over → the title elides down to [`TITLE_MIN`]; still over (cols < ~24)
-//!    → degenerate: `A` goes whole, the title takes what is left, the implicit
-//!    `Details ›` goes, and the capsules stand from column 0 for the painter to
-//!    clip. Rows are always exactly `cols` cells; never a panic; authored
-//!    capsules are never dropped. The meter and the track cost nothing and
-//!    outlive even the degenerate step.
+//! 1. `fixed = head + A + BEFORE_CAPSULES + capsules(long)`, where `A` is the activity's
+//!    words: [`PCT_W`] for a row with a fill, `1 + ELAPSED_SHORT_W` for a busy one (the
+//!    elapsed slot's long form is the first extra), 0 otherwise; plus, on a moving row
+//!    that carries the load slot, `2 +` the widest words among the loads the row
+//!    declared ([`crate::Message::loads`]; every load's when it declared none), shown
+//!    yet or not. The slot keeps one width for the row's life, so load words arriving,
+//!    changing or leaving never re-lay a moving row. Over budget, in turn: the implicit
+//!    `Details ›` goes, where that alone fits (the row body opens Details); every
+//!    capsule takes its short form (one with none goes); the title elides down to
+//!    [`TITLE_MIN`]; then (cols < ~24) the degenerate step: `A` goes whole, the title
+//!    takes what is left, the implicit `Details ›` goes, and the capsules stand from
+//!    column 0 for the painter to clip. Rows are always exactly `cols` cells, never a
+//!    panic, and authored capsules are never dropped.
 //!
-//!    An action excerpt (a painted `detail[0]` on a moving row, which the
-//!    host paints only when it changes what the person does) is the one thing
-//!    on such a row the person must read. Its joint and its first
-//!    [`DETAIL_FLOOR`] cells join `fixed` (`3 + min(width, DETAIL_FLOOR)`), so
-//!    the capsules' short forms and the title's elision pay for it; only when
-//!    the title at [`TITLE_MIN`] still cannot does it go, before the
-//!    degenerate step. Its row's load slot is not in `fixed`: it is an extra
-//!    after the excerpt.
-//! 2. `room = budget − fixed`, `fixed` measured with the long capsules
-//!    whatever they became: the cells the short forms free never re-buy an
-//!    extra a wider row already gave up, so every extra below is monotone as
-//!    the row narrows. The extras, in allocation order: (a) the ETA slot,
-//!    `1 + ETA_W` (else `1 + ETA_SHORT_W`), when a moving determinate row asks
-//!    for one; (b) the excerpt (`detail[0]`): whole if `3 + width ≤ room`,
-//!    else shaped to `room − 3` cells if `room ≥ 3 + DETAIL_FLOOR` (its whole
-//!    lead clause where that cut says no word past it), else its whole lead
-//!    clause if `3 +` its width fits and the floor's cut begins with it
-//!    (`behind for 7 h` of `behind for 7 h: its turn…`;
-//!    [`crate::text::lead_clause`]), else dropped, never a stub (an action
-//!    excerpt adds its reserved floor to the room, and a starved one keeps
-//!    just the floor); (b′) an action excerpt's row's load slot, `3 +` its
-//!    widest load words, beside a whole excerpt when it fits; (c) stats if
-//!    `2 + len` fits after the excerpt, else their short form
-//!    ([`short_stats`]: `3 of 10 programs` → `3/10 programs`, never a bare
-//!    `3/10`) if that fits, beside a whole excerpt (or none at all). An extra
+//!    An action excerpt (a painted `detail[0]` on a moving row, which the host paints
+//!    only when it changes what the person does) is the one thing on such a row the
+//!    person must read. Its joint and first [`DETAIL_FLOOR`] cells join `fixed`
+//!    (`3 + min(width, DETAIL_FLOOR)`), so the short capsules and the title's elision
+//!    pay for it; it goes only when the title at [`TITLE_MIN`] still cannot, before the
+//!    degenerate step. Its row's load slot is then an extra after the excerpt.
+//! 2. `room = budget − fixed`, `fixed` measured with the long capsules whatever they
+//!    became, so the cells the short forms free never re-buy an extra a wider row gave
+//!    up and every extra is monotone as the row narrows. The extras, in allocation
+//!    order: (a) the ETA slot, `1 + ETA_W` (else `1 + ETA_SHORT_W`), when a moving
+//!    determinate row asks for one; (b) the excerpt (`detail[0]`): whole if
+//!    `3 + width ≤ room`, else shaped to `room − 3` cells if `room ≥ 3 + DETAIL_FLOOR`,
+//!    else its whole lead clause where it fits and the floor's cut begins with it
+//!    (`behind for 7 h` of `behind for 7 h: its turn…`; [`crate::text::lead_clause`]),
+//!    else dropped, never a stub; (b′) an action excerpt's row's load slot, `2 +` its
+//!    widest load words, beside a whole excerpt when it fits; (c) stats if `2 + len`
+//!    fits, else their short form ([`short_stats`]: `3 of 10 programs` →
+//!    `3/10 programs`, never a bare `3/10`), beside a whole excerpt or none. An extra
 //!    asked for that does not fit starves every extra after it.
 //!
-//! Sacrifice order as the row narrows: stats (short, then gone) → excerpt
-//! (shaped, then its lead clause, then dropped) → ETA (long, then short) →
-//! the implicit `Details ›` → capsule short forms → title elision → the
-//! activity words with the load words. On a row with an ETA, how long
-//! outranks the load words: where no ETA fits the room, the load slot's
-//! cells (which the head paid for) buy the short one, and it then goes with
-//! the activity's words. On an action excerpt's row: stats → load slot →
-//! excerpt shaped → ETA → capsule short forms → title elision → the excerpt →
-//! the activity words. Each is a monotone flag while the row narrows (what is
-//! gone at one width is gone at every narrower one). The meter is never on
-//! that list.
+//! Sacrifice order as the row narrows: stats (short, then gone) → excerpt (shaped, then
+//! its lead clause, then dropped) → ETA (long, then short) → the implicit `Details ›` →
+//! capsule short forms → title elision → the activity words with the load words. On a
+//! row with an ETA, how long outranks the load words: where no ETA fits, the load
+//! slot's cells buy the short one. On an action excerpt's row: stats → load slot →
+//! excerpt shaped → ETA → capsule short forms → title elision → the excerpt → the
+//! activity words. What is gone at one width is gone at every narrower one; the meter
+//! is never on the list.
 //!
-//! Cells on a row: `glyph title · excerpt ␠␠pct|␠elapsed ␠eta ␠␠stats …
-//! load ␠␠capsules`, all over the meter. The percent is right-aligned in its
-//! four cells and the time words are left-aligned in theirs, so nothing after
-//! them moves as the numbers change; the load slot sits at the tail of the
-//! words, right-aligned against the capsules, so it never moves as the stats
-//! do. Beside a percent the stats paint as [`job_stats`] says.
+//! Cells on a row: `glyph title · excerpt ␠␠pct|␠elapsed ␠eta ␠␠stats … load ␠␠capsules`,
+//! all over the meter. The percent is right-aligned in its four cells and the time words
+//! left-aligned in theirs, so nothing after them moves as the numbers change; the load
+//! slot sits at the tail of the words, right-aligned against the capsules, so it never
+//! moves as the stats do. Beside a percent the stats paint as [`job_stats`] says.
 
 use std::cmp::Reverse;
 
@@ -377,7 +360,7 @@ impl Presentation {
     }
 }
 
-/// FNV-1a, the status bars' hash, over typed fields with separators.
+/// FNV-1a over typed fields with separators.
 pub(crate) struct Fnv(u64);
 
 impl Fnv {
@@ -504,7 +487,7 @@ pub(crate) fn speakable(words: &str) -> String {
 pub enum Links {
     /// Authored capsules only; the overflow row is words alone.
     Withheld,
-    /// Every row ends in its link (the design's end state, Phase 2 on).
+    /// Every row ends in its link.
     Painted,
 }
 
@@ -681,14 +664,10 @@ impl Activity {
     }
 }
 
-/// The overflow row's spec: one link to Settings ▸ Messages, its words the
-/// whole row (`… N more ›`), with no capsule of its own. When a live
-/// progress row is among the hidden ones, the row names it first (`+
-/// Downloading aterm v0.91.0 45% · 2 more ›`: the `+` in the glyph's cell,
-/// `N` then the other hidden rows) and falls back to `N more ›` where that
-/// does not fit whole. `progress` is the hidden row's title and its percent,
-/// already joined. The `›` is the link's, so it is painted only with the
-/// links ([`Links::Painted`]). `words` is [`overflow_words`]' long form.
+/// The overflow row's spec: one link to Settings ▸ Messages, its words the whole row,
+/// with no capsule of its own. `words` is [`overflow_words`]' long form; where it does
+/// not fit whole the row falls back to `N more ›`. The `›` is the link's, painted only
+/// with the links ([`Links::Painted`]).
 #[must_use]
 pub(crate) fn overflow_spec(hidden: usize, words: &str) -> RowSpec<'_> {
     RowSpec {
@@ -1172,19 +1151,14 @@ fn allocate_extras(
     //    extras after it, as a short capsule does, so the cells it saved
     //    never re-buy an excerpt or stats a wider row gave up.
     let mut eta_w = 0;
-    // The load slot and its words: paid for in the fixed head, so a moving
-    // row that kept its activity keeps them, except beside an action excerpt
-    // (the slot is an extra after it, below) and on a row whose ETA they
-    // would cost: how long outranks the load words, so where no ETA fits the
-    // room the slot's cells buy the short one. The slot is one width for the
-    // row's life, so the trade depends on the width alone: words arriving or
-    // leaving never re-lay the row, and once traded it stays traded at every
-    // narrower width.
+    // The load slot is paid for in the fixed head, so a row that kept its activity
+    // keeps it, except beside an action excerpt (an extra after it, below) and where
+    // no ETA fits the room: how long outranks the load words, so the slot's cells buy
+    // the short ETA. The trade depends on the width alone, so it is monotone.
     let mut load_slot = reserves_load(spec, fit.activity) && !fit.action_excerpt;
-    // What the slot costs the room: its painted width, save where the band
-    // forces the short form on a row that had room for the long one; that
-    // row pays the long width, so the cells the short words save buy no
-    // excerpt, load words or stats (the elapsed slot above does the same).
+    // The ETA slot costs its painted width, save where the band forces the short
+    // form on a row with room for the long one: that row pays the long width, as
+    // the elapsed slot above does.
     if spec.eta && fit.activity == Activity::LiveBar {
         if ETA_W < room {
             eta_w = if short_time { ETA_SHORT_W } else { ETA_W };
@@ -1855,9 +1829,9 @@ pub(crate) mod tests {
         ]
     }
 
-    /// Invariant 14: the five rows at 60 / 80 / 120 / 160 columns, pinned
-    /// string for string (whole / shaped-to-N / dropped / short capsules /
-    /// meter width). A chip is ` label `; every row is exactly `cols` cells.
+    /// The five rows at 60 / 80 / 120 / 160 columns, pinned string for string (whole /
+    /// shaped-to-N / dropped / short capsules / meter width). A chip is ` label `; every
+    /// row is exactly `cols` cells.
     #[test]
     fn the_five_rows_at_60_80_120_160_are_pinned_string_for_string() {
         let pinned: &[(&str, usize, &str)] = &[
@@ -1999,15 +1973,11 @@ pub(crate) mod tests {
         assert!(failures.is_empty(), "re-pin:\n{}", failures.join("\n"));
     }
 
-    /// Invariant 13: cols 8..=200 over the five fixtures, the live
-    /// indicator's and the overdue upgrade rows: every row exactly `cols`
-    /// wide, no panic; the sacrifices land in order (stats, the excerpt
-    /// shaped, then its whole lead clause, then dropped below the floor, the
-    /// ETA, then the capsules go short, then the title, then the activity's
-    /// words whole with their load words); authored capsules present at every
-    /// width; the meter (or a busy row's track) is the whole row at every
-    /// width; a moving row's percent or elapsed slot outlives every extra, and
-    /// its latched load words live exactly as long as it.
+    /// Cols 8..=200 over the five fixtures, the live indicator's and the overdue upgrade
+    /// rows: every row exactly `cols` wide, no panic; the sacrifices land in the module
+    /// doc's order; authored capsules present at every width; the meter (or a busy row's
+    /// track) is the whole row at every width; a moving row's percent or elapsed slot
+    /// outlives every extra, and its latched load words live exactly as long as it.
     #[test]
     fn width_law_degrades_in_order() {
         // The overdue upgrade rows: one tab's excerpt's lead clause stands
@@ -2379,8 +2349,8 @@ pub(crate) mod tests {
         );
     }
 
-    /// Invariant 17: every capsule column range maps back to its
-    /// `ActionIndex`; the gaps map to `Body`; the overflow row is one link.
+    /// Every capsule column range maps back to its `ActionIndex`; the gaps map to
+    /// `Body`; the overflow row is one link.
     #[test]
     fn hit_test_agrees_with_layout() {
         let fixtures = fixtures();
@@ -2417,8 +2387,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// Invariant 18: `0` with no rows; stats fold into the key; the fill is
-    /// quantized to whole percent.
+    /// `0` with no rows; stats fold into the key; the fill is quantized to whole percent.
     #[test]
     fn fingerprint_is_zero_when_empty_and_quantizes_the_fill() {
         assert_eq!(
@@ -2478,13 +2447,9 @@ pub(crate) mod tests {
         assert_ne!(busy_at(false), busy_at(true), "busy is folded");
     }
 
-    /// A busy row is a whole-row track: a row with work in flight and no
-    /// fill carries `track = (0, cols)` at every width, under every piece,
-    /// and never a meter or a pct. It costs the words nothing but its elapsed
-    /// slot: at every width the busy row's title and stats are the still
-    /// row's with `1 + ELAPSED_W` cells less room. Its excerpt is an action
-    /// excerpt, so the track never takes from it. A fill wins (a row with one
-    /// is never busy), and a row that is not busy has no track.
+    /// A busy row carries `track = (0, cols)` at every width and never a meter or a pct;
+    /// its words are the still row's with `1 + ELAPSED_W` cells less room, its excerpt an
+    /// action excerpt. A fill wins, and a row that is not busy has no track.
     #[test]
     fn a_busy_row_is_a_whole_row_track_that_costs_the_words_nothing() {
         let flow = RowSpec {
@@ -2675,12 +2640,9 @@ pub(crate) mod tests {
         );
     }
 
-    /// The meter is the row: it spans every column at every width, from 120
-    /// cols down through the short capsules and the degenerate clip, held or
-    /// live, and costs the words nothing. The excerpt a held metered row
-    /// shows at a width is the one the same row without a fill shows five
-    /// columns narrower (the ` NN%`), a live one's (an action excerpt) at
-    /// least that, and the fill is carried exactly.
+    /// The meter spans every column at every width, held or live, and costs the words
+    /// nothing: a held metered row's excerpt is the unmetered row's five columns narrower
+    /// (the ` NN%`), a live one's at least that, and the fill is carried exactly.
     #[test]
     fn the_meter_is_the_whole_row_at_every_width_and_costs_the_words_nothing() {
         for animated in [false, true] {
@@ -2735,11 +2697,9 @@ pub(crate) mod tests {
         }
     }
 
-    /// The live indicator at 60 / 80 / 120 / 160 columns: the percent or the
-    /// elapsed slot, the ETA slot, the load words, the stats, in that order,
-    /// pinned string for string over the whole-row meter (the time slots are
-    /// the motion layer's and render blank here; the meter is asserted field
-    /// by field in the width-law test).
+    /// The live indicator at 60 / 80 / 120 / 160 columns, pinned string for string (the
+    /// time slots are the motion layer's and render blank; the meter is asserted in the
+    /// width-law test).
     #[test]
     fn the_live_indicator_rows_are_pinned_string_for_string() {
         let pinned: &[(&str, usize, &str)] = &[
@@ -2890,10 +2850,8 @@ pub(crate) mod tests {
         assert!(failures.is_empty(), "re-pin:\n{}", failures.join("\n"));
     }
 
-    /// The ETA keeps its slot where the long form does not fit: at 80
-    /// columns a first run's row under disk load takes its short form (`8m
-    /// left`, [`ETA_SHORT_W`]); wider it is long; the short form starves the
-    /// excerpt and the stats after it.
+    /// At 80 columns a first run's row under disk load takes the ETA's short form
+    /// (`8m left`), wider the long one; the short form starves the excerpt and the stats.
     #[test]
     fn the_eta_slot_goes_short_before_it_goes() {
         let fixtures = motion_fixtures();
@@ -2951,13 +2909,10 @@ pub(crate) mod tests {
         }
     }
 
-    /// The load slot is sized to the row's own loads: a busy row that
-    /// declared `CPU busy` reserves 2 + 8 cells at the tail of its words, not
-    /// the 2 + 12 of `network busy`, so at 80 columns its stats keep their
-    /// cells. A row whose loads include the network (the ALab tools pass)
-    /// keeps the widest slot, and at 80 its ETA outranks its stats: its
-    /// count's short form, `3/10 programs`, does not fit there, so the count
-    /// goes whole rather than as a bare `3/10`, and is whole at 120.
+    /// The load slot is sized to the row's own loads (`CPU busy` reserves 2 + 8 cells, not
+    /// the 2 + 12 of `network busy`, so at 80 its stats keep their cells); a row whose
+    /// loads include the network keeps the widest slot, and at 80 its ETA outranks its
+    /// stats, which go whole rather than as a bare `3/10`.
     #[test]
     fn the_load_slot_is_sized_to_the_rows_declared_loads() {
         // A busy build that declared its CPU (a measured level, the strain
@@ -3121,12 +3076,10 @@ pub(crate) mod tests {
         );
     }
 
-    /// How long outranks the load words. A moving row with an ETA and a load
-    /// slot keeps both while the ETA fits the room; where no ETA fits, the
-    /// slot's cells buy the short one (at 60 `Updating ALab tools 66% ~1 min`
-    /// rather than `66% · network busy`). Each is a monotone flag as the row
-    /// narrows, and the load words arriving or leaving never move a cell. A
-    /// busy Install's announced size survives at 80 in its short form.
+    /// A moving row with an ETA and a load slot keeps both while the ETA fits; where it
+    /// does not, the slot's cells buy the short ETA. Each is monotone as the row narrows,
+    /// load words arriving or leaving move no cell, and a busy Install's size survives
+    /// at 80 in its short form.
     #[test]
     fn the_eta_outranks_the_load_words_as_the_row_narrows() {
         let spec = |load: Option<Load>| RowSpec {

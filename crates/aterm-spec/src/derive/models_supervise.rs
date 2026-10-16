@@ -22,12 +22,25 @@ use super::{Liveness, Model};
 /// its last claim request was not served — asked again before the next
 /// request, pressing nothing until answered); `age` the ticks since the
 /// loop last asked. `Buggy = 1` presses without the fresh
-/// renewal — the stale-view press — and is caught: a lapse, another's claim,
-/// then a press under it. Tier-1 (aterm-agent `run_engine_tests.rs`) drives
-/// the real `Session` over the scripted server and projects its claim
-/// state onto these variables. A host with no claim to take (`CLAIM
-/// unavailable`: a build before lane C) is outside this model: the loop
-/// acts there as it did before the claim existed.
+/// renewal and without its fence — the stale-view press — and is caught: a
+/// lapse, another's claim, then a press under it. Tier-1 (aterm-agent
+/// `run_engine_tests.rs`) drives the real `Session` over the scripted server
+/// (an `External` loop) and projects its claim state onto these variables.
+/// A host with no claim to take (`CLAIM unavailable`: a build before lane C)
+/// is outside this model: the loop acts there as it did before the claim
+/// existed.
+///
+/// THE PROVEN SELF-CLAIM (the codex-alab native harness contract, §2): the
+/// server lets a proven self-claim REPLACE the window host's held claim
+/// (`ProvenReplaces`, `held` 1 → 2) while the loop still reads it as its own
+/// (`view` 1) — no renewal precedes that. Only the HOSTED loop's claim is so
+/// replaced, and it FENCES every write with its own holder
+/// (`if-supervisor=<holder>`, `fenced` 1): the server admits a fenced write
+/// only while that holder holds the claim, counted from the fence's read to
+/// the write's end, and a replacement is answered only once those writes
+/// landed (aterm-gui `session_timeline::FencedWrite`), so a fenced press
+/// under another's claim lands nothing. An external loop (`External`) does
+/// not fence and is never replaced so; it is held to the renewal.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn supervisor_claim_model() -> Model {
@@ -36,40 +49,63 @@ pub fn supervisor_claim_model() -> Model {
             const Buggy = 0;
             const Renew = 1;
             const Ttl = 3;
+            var started = 0;
+            var fenced = 1;
             var held = 0;
             var view = 0;
             var age = 0;
             var pressed_under_other = 0;
 
+            // Which loop this is: the window host's (it fences) or an
+            // external supervisor's (it does not).
+            action Hosted when (started == 0) {
+                started = 1;
+            }
+            action External when (started == 0) {
+                started = 1;
+                fenced = 0;
+            }
             // Time passes with no request from the loop.
-            action Tick when (age <= Ttl - 1) {
+            action Tick when (started == 1 && age <= Ttl - 1) {
                 age = age + 1;
             }
             // The server lets an unrenewed lease go.
-            action Lapse when (held == 1 && age == Ttl) {
+            action Lapse when (started == 1 && held == 1 && age == Ttl) {
                 held = 0;
             }
-            action OtherClaims when (held == 0) {
+            action OtherClaims when (started == 1 && held == 0) {
                 held = 2;
             }
-            action OtherReleases when (held == 2) {
+            // A proven self-claim replaces the hosted loop's held claim.
+            action ProvenReplaces when (started == 1 && held == 1 && fenced == 1) {
+                held = 2;
+            }
+            action OtherReleases when (started == 1 && held == 2) {
                 held = 0;
             }
             // Any request of the loop's, preceded by the renewal once it is
             // due: the server grants a free claim and refuses a held one.
-            action Renewal when (Renew <= age || view == 3) {
+            action Renewal when (started == 1 && (Renew <= age || view == 3)) {
                 view = if held == 2 { 2 } else { 1 };
                 held = if held == 2 { 2 } else { 1 };
                 age = 0;
             }
             // A claim request the server did not serve (an outage): the
             // loop cannot tell whose the session is.
-            action Unserved when (Renew <= age || view == 3) {
+            action Unserved when (started == 1 && (Renew <= age || view == 3)) {
                 view = 3;
                 age = 0;
             }
-            action Press when (view == 1 && (age <= Renew - 1 || Buggy == 1)) {
-                pressed_under_other = if held == 2 { 1 } else { pressed_under_other };
+            // A press lands under another's claim only unfenced: a fenced
+            // one is refused by the server there and lands nothing.
+            action Press when (
+                started == 1 && view == 1 && (age <= Renew - 1 || Buggy == 1)
+            ) {
+                pressed_under_other = if held == 2 && (fenced == 0 || Buggy == 1) {
+                    1
+                } else {
+                    pressed_under_other
+                };
             }
 
             invariant NoPressUnderAnothersClaim: pressed_under_other == 0;
@@ -224,6 +260,9 @@ pub fn supervisor_turn_end_model() -> Model {
             const Budget = 0;
             const Take = 2;
             const Streak = 3;
+            // A cap the owner wrote: its window and the escalation past it
+            // exist only there.
+            scenario Budget = 2;
             var box_up = 0;
             var wall = 0;
             var person = 0;
@@ -407,7 +446,7 @@ pub fn supervisor_turn_end_model() -> Model {
             invariant NeverTypeOverADraft: typed_over == 0;
             invariant NeverTypeBeforeItsBackoff: typed_early == 0;
             invariant NeverEscalateUnderFullPower: escalated == 0;
-            invariant WithinTheCap: Budget == 0 || used <= Budget;
+            uncaught WithinTheCap: Budget == 0 || used <= Budget;
             invariant NoSilentLatch: latched == 0;
             invariant NeverTypeIntoATasklessSession: typed_taskless == 0;
             invariant NeverBackOffForTheHarness: backoff <= earned;
@@ -418,29 +457,45 @@ pub fn supervisor_turn_end_model() -> Model {
 
 /// THE DONE CHECK (aterm-agent `supervise/policy/turn_end.rs`). A worker whose last
 /// words say it is DONE is not continued: at the point past its back-off it
-/// is typed the check — *"If the task is finished and verified, reply DONE
-/// and stop; otherwise continue"* — and when that check's own yield says
-/// done again THE TASK IS DONE: nothing more is typed into the session until
-/// someone else's turn (a person's, an orchestrator's) opens it again.
-/// Without it a finished task is continued on the back-off until the model
-/// invents work.
+/// is typed the check — *"do every open item you can still do …; reply
+/// ATERM-TASK-DONE … only when what is left needs a person or cannot be done
+/// on this host"* — and when that check's own yield says done again THE TASK
+/// IS DONE: nothing more is typed into the session until someone else's turn
+/// (a person's, an orchestrator's) opens it again. Without it a finished task
+/// is continued on the back-off until the model invents work.
+///
+/// THE WORKER'S OWN FINISHED (DONE-1, 2026-10-16): a report whose last line is
+/// `ATERM-TASK-DONE` ends the task at once, with no check — unless its own
+/// words name open work without a blocker (`Still open:`, `Left:`, `not run`):
+/// then it is a first done report owing THE CHALLENGE, typed once a job, and
+/// a finished or done yield to it ends the task whatever it still lists. The
+/// job's memory of the challenge is forgotten when the task ends, so the next
+/// job is challenged afresh.
 ///
 /// `done` is the done reports in a row at the points the policy saw: 0 none,
-/// 1 the point is one (the check is owed), 2 the task is done; `pending` 0
-/// at a point, 1 a continuation's turn running, 2 the check's, 3 a wall's
-/// act's (the 529's retry, the limit's resume, `/compact`); `walled` the
-/// point shows a wall — its ladder acts there, never the continuation or the
-/// check. `typed_done` something was typed into a done task, `unchecked` a
-/// done report was answered with a plain continuation, `cut_short` the task
-/// ended on a done report the check never asked about. `Buggy = 1` continues
-/// a done report like any point and reads it as the end the moment it
-/// repeats, and leaves a done task closed when someone else's turn ends on a
-/// wall (a person's turn that hit a 529 after the task was done is stranded,
-/// no retry) — caught by each invariant on a path of its own. Tier-1
-/// (aterm-agent `tests/supervise_conformance_done_check.rs`)
-/// drives the real `decide_turn_end` and `TurnEndState` along every
-/// reachable state and checks it types the continuation, the check, the
-/// wall's act, or nothing exactly where the model does.
+/// 1 the point is one (the check, or the challenge, is owed), 2 the task is
+/// done; `pending` 0 at a point, 1 a continuation's turn running, 2 the
+/// check's, 3 a wall's act's (the 529's retry, the limit's resume,
+/// `/compact`), 4 the challenge's; `walled` the point shows a wall — its
+/// ladder acts there, never the continuation, the check or the challenge;
+/// `open` the point is a FINISHED naming open work (the challenge is owed);
+/// `challenged` the challenge was typed this job. `typed_done` something was
+/// typed into a done task, `unchecked` a done report was answered with a
+/// plain continuation, `cut_short` the task ended on a done report the check
+/// never asked about, `open_end` the task ended on an open FINISHED no
+/// challenge asked about, `twice` a second challenge typed in one job.
+/// `Buggy = 1` continues a done report like any point and reads it as the end
+/// the moment it repeats, and leaves a done task closed when someone else's
+/// turn ends on a wall (a person's turn that hit a 529 after the task was done
+/// is stranded, no retry) — and adds two dead actions: the harness before
+/// DONE-1, which ended the task on an open FINISHED at once
+/// (`FinishOpenAtOnce`), and a challenge that forgets it was asked, typing
+/// another at the open FINISHED that answers it (`ChallengeAgain`) —
+/// caught by each invariant on a path of its own. Tier-1 (aterm-agent
+/// `tests/supervise_conformance_done_check.rs`) drives the real
+/// `decide_turn_end` and `TurnEndState` along every reachable state and checks
+/// it types the continuation, the check, the challenge, the wall's act, or
+/// nothing exactly where the model does.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn supervisor_done_check_model() -> Model {
@@ -453,6 +508,10 @@ pub fn supervisor_done_check_model() -> Model {
             var unchecked = 0;
             var cut_short = 0;
             var walled = 0;
+            var open = 0;
+            var challenged = 0;
+            var open_end = 0;
+            var twice = 0;
 
             // Someone else's turn, answered: the task is theirs again, and
             // a done report in it is a first one — and one that ended on a
@@ -460,18 +519,38 @@ pub fn supervisor_done_check_model() -> Model {
             action OtherTurnDone when (pending == 0) {
                 done = 1;
                 walled = 0;
+                open = 0;
             }
             action OtherTurnWork when (pending == 0) {
                 done = 0;
                 walled = 0;
+                open = 0;
             }
             action OtherTurnWall when (pending == 0) {
                 done = if Buggy == 1 { done } else { 0 };
                 walled = 1;
+                open = 0;
+            }
+            // Someone else's turn ending on the worker's FINISHED: a clean
+            // report ends the task; one naming open work owes the challenge,
+            // unless this job already had it. Either way the job's memory of
+            // the challenge goes: the task ended, or it was never asked.
+            action OtherTurnFinished when (pending == 0) {
+                done = 2;
+                walled = 0;
+                open = 0;
+                challenged = 0;
+            }
+            action OtherTurnOpenFinished when (pending == 0) {
+                done = if challenged == 1 { 2 } else { 1 };
+                open = if challenged == 1 { 0 } else { 1 };
+                walled = 0;
+                challenged = 0;
             }
             // The policy's act at a free point: the wall's act at a wall,
             // the continuation where no done was reported, the check where
-            // one was, nothing on a done task.
+            // one was, the challenge at an open FINISHED, nothing on a done
+            // task.
             action WallAct when (pending == 0 && walled == 1 && done <= 1) {
                 walled = 0;
                 pending = 3;
@@ -481,8 +560,14 @@ pub fn supervisor_done_check_model() -> Model {
                 unchecked = if done == 1 { 1 } else { unchecked };
                 pending = 1;
             }
-            action Check when (pending == 0 && walled == 0 && done == 1) {
+            action Check when (pending == 0 && walled == 0 && done == 1 && open == 0) {
                 pending = 2;
+            }
+            action Challenge when (pending == 0 && walled == 0 && open == 1) {
+                twice = if challenged == 1 { 1 } else { twice };
+                challenged = 1;
+                open = 0;
+                pending = 4;
             }
             action YieldWork when (pending > 0) {
                 pending = 0;
@@ -490,7 +575,25 @@ pub fn supervisor_done_check_model() -> Model {
             }
             action YieldDone when (pending > 0) {
                 cut_short = if pending == 1 && done == 1 { 1 } else { cut_short };
-                done = if pending == 2 || (Buggy == 1 && done == 1) { 2 } else { 1 };
+                done = if pending == 2 || pending == 4 || (Buggy == 1 && done == 1) { 2 } else { 1 };
+                challenged = if pending == 2 || pending == 4 || (Buggy == 1 && done == 1) {
+                    0
+                } else {
+                    challenged
+                };
+                pending = 0;
+            }
+            // A yield ending on the worker's FINISHED: as someone else's turn
+            // ending so, the challenge's own yield ending the task.
+            action YieldFinished when (pending > 0) {
+                pending = 0;
+                done = 2;
+                challenged = 0;
+            }
+            action YieldOpenFinished when (pending > 0) {
+                done = if challenged == 1 { 2 } else { 1 };
+                open = if challenged == 1 { 0 } else { 1 };
+                challenged = 0;
                 pending = 0;
             }
             // A yield that ended on a wall: its done reports stand.
@@ -498,11 +601,27 @@ pub fn supervisor_done_check_model() -> Model {
                 pending = 0;
                 walled = 1;
             }
+            // `Buggy`: the harness before DONE-1, which ended the task on an
+            // open FINISHED at once.
+            action FinishOpenAtOnce when (Buggy == 1 && pending == 0 && open == 1) {
+                open_end = 1;
+                done = 2;
+                open = 0;
+                challenged = 0;
+            }
+            // `Buggy`: a challenge that forgets it was asked — the open
+            // FINISHED answering it is challenged again.
+            action ChallengeAgain when (Buggy == 1 && pending == 4) {
+                twice = 1;
+                pending = 4;
+            }
 
             invariant NeverTypeIntoADoneTask: typed_done == 0;
             invariant ADoneReportIsChecked: unchecked == 0;
             invariant OnlyTheCheckEndsTheTask: cut_short == 0;
             invariant AWallIsNeverLeftOnADoneTask: walled == 0 || done <= 1;
+            invariant AnOpenFinishIsChallenged: open_end == 0;
+            invariant OneChallengeAJob: twice == 0;
         }
     }
 }
@@ -1339,20 +1458,22 @@ pub fn upgrade_refused_turn_end_model() -> Model {
 /// constants is a GHOST to the workspace's non-vacuity sweep, and the two
 /// text laws are unbreakable at `Text = 0`, where no text is written. So
 /// this machine is checked as two models, each with only the laws its
-/// constants can break: [`supervisor_question_answer_model`], the
-/// recommended path, and [`supervisor_question_text_model`], the policy
-/// text.
+/// constants can break: this one, the policy text (`answer-long-term@v1`,
+/// `answer-short-term@v1`: `Text = 1`, a single-select dialog committed,
+/// `Multi` its dial), and [`supervisor_question_answer_model`], the
+/// recommended path, cut from it.
+#[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
-fn supervisor_question_family() -> Model {
+pub fn supervisor_question_text_model() -> Model {
     crate::ty_model! {
-        SupervisorQuestionAnswer {
+        SupervisorQuestionText {
             const Buggy = 0;
             const Tabs = 2;
             const PersonFence = 1;
             const TakenBeforeStill = 1;
             const Review = 1;
             const MaxRetry = 2;
-            const Text = 0;
+            const Text = 1;
             const Multi = 0;
             const OwnTextRemembered = 1;
             const EnterWhereTyped = 0;
@@ -1724,54 +1845,30 @@ const QUESTION_TEXT_ACTIONS: [&str; 6] = [
 ];
 
 /// THE QUESTION ANSWER'S RECOMMENDED PATH (`answer-recommended@v1`, `Text =
-/// 0`, as committed): the machine documented on
-/// `supervisor_question_family` with the four laws every key of that path
-/// keeps — no Enter in the free-text field or off the chosen row, none on a
-/// later tab, none on the review's cancel, none into the composer — and
-/// only the actions that can fire there. The policy text's two laws and its
-/// six actions (`QUESTION_TEXT_LAWS`, `QUESTION_TEXT_ACTIONS`) are
-/// [`supervisor_question_text_model`]'s: at `Text = 0` every one of those
-/// actions is disabled in every state, so the reachable space is the same
-/// state for state (pinned by `aterm-spec/tests/derived_supervise.rs`), and
-/// a law about them is one nothing here can break. In
-/// `xref::model_registry()`: the non-vacuity sweep holds each of the four
-/// caught by the fence alone (`Buggy = 1`), and `ty check --strict-vacuity`
-/// every action live.
+/// 0`, as committed): [`supervisor_question_text_model`]'s machine with the
+/// four laws every key of that path keeps — no Enter in the free-text field
+/// or off the chosen row, none on a later tab, none on the review's cancel,
+/// none into the composer — and only the actions that can fire there. The
+/// policy text's two laws and its six actions (`QUESTION_TEXT_LAWS`,
+/// `QUESTION_TEXT_ACTIONS`) are the text model's: at `Text = 0` every one of
+/// those actions is disabled in every state, so the reachable space is the
+/// same state for state (pinned by `aterm-spec/tests/derived_supervise.rs`),
+/// and a law about them is one nothing here can break.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
+#[crate::model]
 pub fn supervisor_question_answer_model() -> Model {
-    let mut m = supervisor_question_family();
+    let mut m = supervisor_question_text_model();
+    m.name = "SupervisorQuestionAnswer";
+    for (name, value) in &mut m.consts {
+        if *name == "Text" {
+            *value = 0;
+        }
+    }
     m.invariants
         .retain(|law| !QUESTION_TEXT_LAWS.contains(&law.name));
     m.actions
         .retain(|action| !QUESTION_TEXT_ACTIONS.contains(&action.name));
-    m
-}
-
-/// THE QUESTION ANSWER'S POLICY TEXT (`answer-long-term@v1`,
-/// `answer-short-term@v1`: `Text = 1`, a single-select dialog committed,
-/// `Multi` its dial): the machine documented on
-/// `supervisor_question_family` whole — every action and all six laws,
-/// each broken by the fence alone at these constants, single- and
-/// multi-select (`aterm-spec/tests/derived_supervise.rs`). Its own model
-/// (`SupervisorQuestionText`), so no law of it is judged where no text is
-/// written. NOT in `xref::model_registry()` yet: its `Buggy = 1` space (the
-/// fence alone, a text written again behind one unread) outgrows the
-/// interpreter's budget, which the workspace's non-vacuity sweep walks
-/// whole (`every_buggy_space_fits_the_interpreter`) — measured past 100 000
-/// states at the committed bounds and at `MaxRetry = 1`, single- and
-/// multi-select, against 30 527 for the recommended path; enrolling it
-/// needs a mutant that fires only from a state the guarded model reaches.
-#[must_use]
-#[cfg_attr(trust_verify, trust::skip)]
-pub fn supervisor_question_text_model() -> Model {
-    let mut m = supervisor_question_family();
-    m.name = "SupervisorQuestionText";
-    for (name, value) in &mut m.consts {
-        if *name == "Text" {
-            *value = 1;
-        }
-    }
     m
 }
 
@@ -1886,6 +1983,13 @@ pub fn supervisor_decline_keys_model() -> Model {
             }
             action PersonTypes when (q1 == 5 && gone == 0 && open == 1 && focus == 1) {
                 text = 2;
+                q1 = q2;
+                q2 = 0;
+                fresh = 0;
+            }
+            // Their Backspace: the input empty again.
+            action PersonClears when (q1 == 5 && gone == 0 && open == 1 && focus == 1) {
+                text = 0;
                 q1 = q2;
                 q2 = 0;
                 fresh = 0;
@@ -2838,6 +2942,7 @@ pub fn supervisor_codex_rate_nudge_model() -> Model {
 /// there.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
+#[crate::liveness(crate::derive::supervisor_codex_rate_nudge_model)]
 pub fn supervisor_codex_rate_nudge_liveness() -> crate::derive::Liveness {
     use crate::derive::{and_, eq, int, or_, var};
     crate::derive::Liveness {
@@ -2913,7 +3018,15 @@ pub fn supervisor_codex_rate_nudge_liveness() -> crate::derive::Liveness {
 /// (`Buggy`: `OtherLimitsTurnRead`, its older limit's served turn read as one
 /// since this limit — the wait ended and the continuation typed into the
 /// standing limit, caught by `NoBlindAct`; the review of 2026-10-14 measured
-/// it on 2.1.300).
+/// it on 2.1.300). So is one `/resume`d while the wall SHOWS, its countdown
+/// armed (`ArmedConversationResumed`, `other` 2: W1 of ATERM-KI-1015-1):
+/// Claude Code drops the countdown and redraws an older limit the vendor
+/// continued by itself, whose word (`Usage limit reset · continuing
+/// automatically`) is no continuation of this limit's (`Buggy`:
+/// `OtherLimitsContinuationRead`, that word tied to no limit — the wait ended
+/// and the continue policy typed into the standing limit, caught by
+/// `NoBlindAct`; measured on 2.1.300, 2026-10-15: the stub's 429 22 minutes
+/// before the reset).
 ///
 /// `held` 1: an act of the policy's OWN is inside its take window — typed, no
 /// read has seen it taken, and its point not judged yet (30 s in the real
@@ -2976,6 +3089,11 @@ pub fn supervisor_codex_rate_nudge_liveness() -> crate::derive::Liveness {
 /// of the act it was taken to answer, the past clock read as TOMORROW's
 /// (`view = 2`: no act for a day while the session is free; measured on
 /// 745d63b36), caught by `NoDayWait` and the liveness claim.
+///
+/// USAGE CREDITS (the `Credits` dial, accounts v2 S5): a turn that crosses
+/// the limit is carried by credits and served, no wall drawn
+/// (`CreditsServes`, `credits` 1; lab E4). `Buggy`: `CreditsReadAsWall`,
+/// credits taken for a spend wall, caught by `NoWallOnCredits`.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn supervisor_usage_wall_model() -> Model {
@@ -2992,6 +3110,7 @@ pub fn supervisor_usage_wall_model() -> Model {
             const Leaves = 1;
             const OwnAct = 1;
             const Unread = 1;
+            const Credits = 1;
             var wall = 0;
             var bg = 0;
             var due = 2;
@@ -3006,6 +3125,7 @@ pub fn supervisor_usage_wall_model() -> Model {
             var other = 0;
             var held = 0;
             var unread = 0;
+            var credits = 0;
 
             // ---- the world ----
             // Background work starts under a turn: never on a screen the
@@ -3018,7 +3138,7 @@ pub fn supervisor_usage_wall_model() -> Model {
             }
             // A wall appears: on time (the account's tokens come at the
             // reset the notice names) or late (they come `Skew` ticks after).
-            action WallAppears when (wall == 0) {
+            action WallAppears when (wall == 0 && credits == 0) {
                 wall = 1;
                 sitting = 0;
                 ran = 0;
@@ -3029,7 +3149,7 @@ pub fn supervisor_usage_wall_model() -> Model {
                 tries = 0;
                 waited = 0;
             }
-            action WallAppearsLate when (wall == 0) {
+            action WallAppearsLate when (wall == 0 && credits == 0) {
                 wall = 1;
                 sitting = 0;
                 ran = 0;
@@ -3044,7 +3164,7 @@ pub fn supervisor_usage_wall_model() -> Model {
             // redraws the conversation without its done row): nothing dates
             // its print, the session rule places its bare clock, and a clock
             // more than five hours ahead reads as passed.
-            action WallFoundSitting when (wall == 0 && held == 0) {
+            action WallFoundSitting when (wall == 0 && held == 0 && credits == 0) {
                 wall = 1;
                 sitting = 1;
                 ran = 0;
@@ -3106,12 +3226,24 @@ pub fn supervisor_usage_wall_model() -> Model {
             action ConversationResumed when (Leaves == 1 && wall == 6 && other == 0) {
                 other = 1;
             }
+            // A person `/resume`s ANOTHER conversation while the wall SHOWS,
+            // the vendor's countdown armed (W1 of ATERM-KI-1015-1, 2.1.300):
+            // Claude Code drops the countdown and redraws that conversation's
+            // history — an older limit and the vendor's own continuation of
+            // it (`Usage limit reset · continuing automatically`), no `❯` row
+            // since. The screen reads idle with no wall; this limit stands.
+            action ArmedConversationResumed when (
+                Leaves == 1 && wall == 1 && bg == 0 && other == 0
+            ) {
+                wall = 6;
+                other = 2;
+            }
             // The limit answers the own act at once AND a person's Esc on the
             // vendor's countdown takes its notice off the screen's end before
             // the loop's first read after the act: the screen it reads shows
             // only the vendor's cancel under the notice, no wall.
             action WallAppearsLeft when (
-                Unread == 1 && Leaves == 1 && held == 1 && wall == 0 && bg == 0
+                Unread == 1 && Leaves == 1 && held == 1 && wall == 0 && bg == 0 && credits == 0
             ) {
                 wall = 6;
                 unread = 1;
@@ -3131,7 +3263,7 @@ pub fn supervisor_usage_wall_model() -> Model {
             // reads shows only the cancel under the notice under the person's
             // prompt, no wall.
             action PersonWallLeft when (
-                Unread == 1 && Leaves == 1 && held == 0 && wall == 0 && bg == 0
+                Unread == 1 && Leaves == 1 && held == 0 && wall == 0 && bg == 0 && credits == 0
             ) {
                 wall = 6;
                 unread = 1;
@@ -3152,7 +3284,7 @@ pub fn supervisor_usage_wall_model() -> Model {
             // act's answer, its bare clock is placed never more than a
             // session window out: a reset already past is passed.
             action OlderLeftResumed when (
-                Unread == 1 && Leaves == 1 && held == 1 && wall == 0 && bg == 0
+                Unread == 1 && Leaves == 1 && held == 1 && wall == 0 && bg == 0 && credits == 0
             ) {
                 wall = 6;
                 unread = 1;
@@ -3166,10 +3298,22 @@ pub fn supervisor_usage_wall_model() -> Model {
                 waited = 0;
             }
 
+            // Usage credits carry a turn past the limit (the `Credits` dial):
+            // it is served, at 100%, and no wall is drawn; at its end the
+            // account is as it was, the next turn's wall the world's again.
+            action CreditsServes when (
+                Credits == 1 && wall == 0 && held == 0 && credits == 0 && bg == 0
+            ) {
+                credits = 1;
+            }
+            action CreditsTurnEnds when (credits == 1) {
+                credits = 0;
+            }
+
             // ---- the supervisor ----
             // The continue policy's own act at a turn's end (the `OwnAct`
             // dial: 0 switches it off): typed, its take window open.
-            action OwnActTyped when (OwnAct == 1 && wall == 0 && held == 0) {
+            action OwnActTyped when (OwnAct == 1 && wall == 0 && held == 0 && credits == 0) {
                 held = 1;
             }
             // The first act: `Grace` past the reset the notice names (150 s and a
@@ -3241,7 +3385,7 @@ pub fn supervisor_usage_wall_model() -> Model {
             // stays masked (the reader lifts it when the shell ends, which the
             // world never has to do, so no lift is modelled: a defect action
             // must be caught alone, and a lift alone could not even fire).
-            action WallMasked when (Buggy == 1 && wall == 0 && bg == 1) {
+            action WallMasked when (Buggy == 1 && wall == 0 && bg == 1 && credits == 0) {
                 wall = 3;
                 sitting = 0;
                 blind = 0;
@@ -3279,6 +3423,20 @@ pub fn supervisor_usage_wall_model() -> Model {
             // limit): the wait ends while the tokens are not back, and the
             // continue policy types into the standing limit.
             action OtherLimitsTurnRead when (Buggy == 1 && wall == 6 && other == 1 && clock <= due - 1) {
+                blind = if blind <= 1 { blind + 1 } else { blind };
+                tries = if tries <= 2 { tries + 1 } else { tries };
+                wall = 2;
+                waited = 0;
+                other = 0;
+                unread = 0;
+            }
+            // Another conversation's older limit continued by the vendor,
+            // its word read as THIS limit's continuation (evidence tied to no
+            // limit): the wait ends while the tokens are not back, and the
+            // continue policy types into the standing limit.
+            action OtherLimitsContinuationRead when (
+                Buggy == 1 && wall == 6 && other == 2 && clock <= due - 1
+            ) {
                 blind = if blind <= 1 { blind + 1 } else { blind };
                 tries = if tries <= 2 { tries + 1 } else { tries };
                 wall = 2;
@@ -3326,6 +3484,7 @@ pub fn supervisor_usage_wall_model() -> Model {
             // for a day while the session is free.
             action OlderLeftPlacedTomorrow when (
                 Buggy == 1 && Unread == 1 && Leaves == 1 && held == 1 && wall == 0 && bg == 0
+                    && credits == 0
             ) {
                 wall = 6;
                 unread = 1;
@@ -3358,7 +3517,7 @@ pub fn supervisor_usage_wall_model() -> Model {
             }
             // A bare clock time read by the session window's rule: the reset
             // is placed in the past and the first act goes at once.
-            action WallMisplaced when (Buggy == 1 && wall == 0) {
+            action WallMisplaced when (Buggy == 1 && wall == 0 && credits == 0) {
                 wall = 1;
                 sitting = 0;
                 blind = 0;
@@ -3369,9 +3528,25 @@ pub fn supervisor_usage_wall_model() -> Model {
                 waited = 0;
             }
 
+            // A turn usage credits serve read as a wall (credits taken for
+            // spend): the session held at a limit that did not stop it.
+            action CreditsReadAsWall when (Buggy == 1 && credits == 1 && wall == 0) {
+                wall = 1;
+                sitting = 0;
+                ran = 0;
+                blind = 0;
+                due = ResetAt;
+                clock = 0;
+                view = 0;
+                tries = 0;
+                waited = 0;
+            }
+
             // No act before the tokens are back but the one try of a wall
             // found with nothing to date it.
             invariant NoBlindAct: blind <= sitting;
+            // Usage credits carrying a turn are no wall.
+            invariant NoWallOnCredits: credits == 0 || wall == 0;
             // No wall is masked (`wall == 3`) and the ladder never gives up
             // (`wall == 4`): the defects' marks, each caught alone.
             invariant NoStuckWall: wall <= 2 || 5 <= wall;
@@ -3400,6 +3575,7 @@ pub fn supervisor_usage_wall_model() -> Model {
 /// are here).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
+#[crate::liveness(crate::derive::supervisor_usage_wall_model)]
 pub fn supervisor_usage_wall_liveness() -> Liveness {
     use super::{eq, int, le, or_, sub, var};
     Liveness {
@@ -3565,6 +3741,7 @@ pub fn supervisor_model_switch_model() -> Model {
 /// `GivesUp` (the asks stop after a few refusals).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
+#[crate::liveness(crate::derive::supervisor_model_switch_model)]
 pub fn supervisor_model_switch_liveness() -> Liveness {
     use super::{eq, int, or_, var};
     Liveness {

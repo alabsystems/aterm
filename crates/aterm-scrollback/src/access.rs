@@ -2,14 +2,9 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Shared interface for scrollback storage backends.
-//!
-//! [`ScrollbackAccess`] unifies the methods that both [`Scrollback`] and
-//! [`DiskBackedScrollback`] implement with compatible signatures;
-//! [`ScrollbackStorage`] dispatches to it by matching on the concrete backend
-//! (see `storage.rs` for why it is not `dyn`).
-//!
-//! Part of #6274.
+//! [`ScrollbackAccess`]: the methods [`Scrollback`] and [`DiskBackedScrollback`]
+//! share; [`ScrollbackStorage`] dispatches to it by matching on the concrete
+//! backend (see `storage.rs` for why it is not `dyn`).
 
 use std::borrow::Cow;
 
@@ -17,27 +12,19 @@ use std::borrow::Cow;
 use super::DiskBackedScrollback;
 use super::{Line, Scrollback, ScrollbackError, WatermarkLevel};
 
-/// Private supertrait — the SEALED-trait idiom. `ScrollbackAccess` is an
-/// INTERNAL backend abstraction (the memory and disk tiers); it is exported so
-/// callers can name it (`&impl ScrollbackAccess`), never so they can implement
-/// it. Sealing states that intent in the type system, and it is also what makes
-/// the impl set provably CLOSED: the Trust verifier's closed-world rung then
-/// discharges every `<S as ScrollbackAccess>::m` dispatch by conjunction over
-/// the enumerated impls (both verified panic-free) instead of failing closed on
-/// an unresolvable generic callee. Zero annotations, zero behavior change — a
-/// downstream `impl` was never valid and is now a compile error.
+/// Sealed-trait supertrait: callers may name `ScrollbackAccess`, never implement
+/// it. The closed impl set lets the Trust verifier discharge every
+/// `<S as ScrollbackAccess>::m` dispatch over the enumerated impls instead of
+/// failing closed on an unresolvable generic callee.
 mod sealed {
     pub trait Sealed {}
 }
 
 /// Shared interface for scrollback storage backends.
 ///
-/// All methods that both [`Scrollback`] and [`DiskBackedScrollback`] implement
-/// with compatible signatures. The trait uses `io::Result` / `Result<_, ScrollbackError>`
-/// for methods where the disk backend can fail — the memory backend wraps
-/// infallible calls in `Ok(())`.
-///
-/// **Sealed**: implementable only inside this crate (see [`sealed`]).
+/// Methods where the disk backend can fail return `io::Result` or
+/// `Result<_, ScrollbackError>`; the memory backend wraps infallible calls.
+/// Sealed: implementable only inside this crate.
 pub trait ScrollbackAccess: sealed::Sealed {
     // --- Read ---
 
@@ -108,12 +95,10 @@ pub trait ScrollbackAccess: sealed::Sealed {
     fn checkpoint_snapshot_fast(&self) -> Scrollback;
 }
 
-/// Shared implementation for `checkpoint_snapshot_fast()`.
-///
-/// Both [`Scrollback`] and [`DiskBackedScrollback`] iterate warm + hot lines,
-/// skipping the cold tier for bounded checkpoint latency. (#5946, #6714)
-// Skip: the snapshot walk drives the sealed-trait accessors plus Vec/Line
-// clones (idiomatic-alloc class). Round-trip tested by the checkpoint gate.
+/// Shared `checkpoint_snapshot_fast()`: copies warm + hot lines and skips the
+/// cold tier, for bounded checkpoint latency.
+// Skip: the walk drives the sealed-trait accessors plus Vec/Line clones
+// (idiomatic-alloc class).
 #[cfg_attr(trust_verify, trust::skip)]
 pub(crate) fn checkpoint_snapshot_fast_from(source: &impl ScrollbackAccess) -> Scrollback {
     let mut snapshot = Scrollback::new(
@@ -151,10 +136,6 @@ pub(crate) fn checkpoint_snapshot_fast_from(source: &impl ScrollbackAccess) -> S
 
     snapshot
 }
-
-// ---------------------------------------------------------------------------
-// impl ScrollbackAccess for Scrollback
-// ---------------------------------------------------------------------------
 
 impl sealed::Sealed for Scrollback {}
 
@@ -212,13 +193,12 @@ impl ScrollbackAccess for Scrollback {
     }
 
     fn push_line(&mut self, line: Line) -> std::io::Result<()> {
-        // Inherent push_line returns (), wrap in Ok for trait compatibility.
+        // The inherent push_line and clear are infallible.
         Scrollback::push_line(self, line);
         Ok(())
     }
 
     fn clear(&mut self) -> std::io::Result<()> {
-        // Inherent clear returns (), wrap in Ok for trait compatibility.
         Scrollback::clear(self);
         Ok(())
     }
@@ -239,10 +219,6 @@ impl ScrollbackAccess for Scrollback {
         self.checkpoint_snapshot_fast()
     }
 }
-
-// ---------------------------------------------------------------------------
-// impl ScrollbackAccess for DiskBackedScrollback
-// ---------------------------------------------------------------------------
 
 #[cfg(feature = "disk-tier")]
 impl sealed::Sealed for DiskBackedScrollback {}

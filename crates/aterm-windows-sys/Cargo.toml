@@ -1,0 +1,113 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+# THE DIRECTORY AND THE PACKAGE NAME DIFFER ON PURPOSE, as with
+# crates/aterm-windows-sys-052: `[patch.crates-io]` matches on PACKAGE name,
+# so this must be called `windows-sys` to take the `windows-sys = "0.61"`
+# edges of winit (crates/aterm-window), softbuffer, aterm-http and aterm-net,
+# and the directory keeps the `aterm-` prefix so it reads as ours
+# (docs/AUDIT-third-party-2026-10-15.md, windows-bindings step 3).
+name = "windows-sys"
+# NOT `version.workspace = true`: a SEMVER CONTRACT with the consumers, not an
+# aterm release number. winit and softbuffer ask `^0.61.2`, aterm-http and
+# aterm-net `^0.61`, and the lock-only parents (async-io, async-signal, errno,
+# polling, rustix 1.x, tempfile, uds_windows, zbus) ask `^0.61` or lower;
+# 0.61.2 is what the lock held, so the lock's version line does not move. A
+# registry 0.61.x above it would outrank the patch (`targo --unverified forge
+# check` [OB-12] fails if one does).
+version = "0.61.2"
+# NOT A WORKSPACE MEMBER, so no field is inherited: cargo refuses two members
+# of one package name ("two packages named `windows-sys` in this workspace"),
+# and crates/aterm-windows-sys-052 is the member. The root manifest's
+# `exclude` and the `[workspace]` stub below make this its own root, the way
+# a vendored fork is; the patch row reaches it by path like any other.
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/alabsystems/aterm"
+authors = ["Andrew Yates"]
+publish = false
+description = "First-party `windows-sys` 0.61 for aterm: re-exports aterm-win32's generated Win32 declarations at upstream's paths (replaces the crates.io windows-sys 0.61)"
+
+# `windows-sys` is the PACKAGE; `windows_sys` is what every consumer writes.
+[lib]
+name = "windows_sys"
+path = "src/lib.rs"
+test = false
+
+[dependencies]
+aterm-win32 = { path = "../aterm-win32" }
+
+[features]
+# Every upstream feature some package in the lock asks of windows-sys 0.61,
+# with upstream's edges, so the patch row takes every edge (cargo refuses a
+# patch that lacks a requested feature and keeps the registry crate). They
+# gate NOTHING: aterm-win32 always holds the whole closure. A feature asked
+# only by a lock-only parent (rustix 1.x's `Wdk_Storage_FileSystem`,
+# tempfile's `Win32_Storage_FileSystem`, ...) is declared and holds none of
+# that parent's declarations: no Windows cell compiles those parents. Every
+# other upstream feature is ABSENT, so a new consumer asking for one fails to
+# resolve instead of compiling against declarations nobody checked.
+# BEGIN GENERATED FEATURES (aterm-win32-oracle gen)
+default = []
+Wdk = ["Win32_Foundation"]
+Wdk_Foundation = ["Wdk"]
+Wdk_Storage = ["Wdk"]
+Wdk_Storage_FileSystem = ["Wdk_Storage"]
+Win32 = ["Win32_Foundation"]
+Win32_Devices = ["Win32"]
+Win32_Devices_HumanInterfaceDevice = ["Win32_Devices"]
+Win32_Foundation = ["Win32"]
+Win32_Globalization = ["Win32"]
+Win32_Graphics = ["Win32"]
+Win32_Graphics_Dwm = ["Win32_Graphics"]
+Win32_Graphics_Gdi = ["Win32_Graphics"]
+Win32_Media = ["Win32"]
+Win32_NetworkManagement = ["Win32"]
+Win32_NetworkManagement_IpHelper = ["Win32_NetworkManagement"]
+Win32_Networking = ["Win32"]
+Win32_Networking_WinSock = ["Win32_Networking"]
+Win32_Security = ["Win32"]
+Win32_Security_Authorization = ["Win32_Security"]
+Win32_Security_Cryptography = ["Win32_Security"]
+Win32_Storage = ["Win32"]
+Win32_Storage_FileSystem = ["Win32_Storage"]
+Win32_System = ["Win32"]
+Win32_System_Com = ["Win32_System"]
+Win32_System_Com_StructuredStorage = ["Win32_System_Com"]
+Win32_System_Console = ["Win32_System"]
+Win32_System_Diagnostics = ["Win32_System"]
+Win32_System_Diagnostics_Debug = ["Win32_System_Diagnostics"]
+Win32_System_IO = ["Win32_System"]
+Win32_System_LibraryLoader = ["Win32_System"]
+Win32_System_Memory = ["Win32_System"]
+Win32_System_Ole = ["Win32_System"]
+Win32_System_SystemInformation = ["Win32_System"]
+Win32_System_SystemServices = ["Win32_System"]
+Win32_System_Threading = ["Win32_System"]
+Win32_System_WindowsProgramming = ["Win32_System"]
+Win32_UI = ["Win32"]
+Win32_UI_Accessibility = ["Win32_UI"]
+Win32_UI_Controls = ["Win32_UI"]
+Win32_UI_HiDpi = ["Win32_UI"]
+Win32_UI_Input = ["Win32_UI"]
+Win32_UI_Input_Ime = ["Win32_UI_Input"]
+Win32_UI_Input_KeyboardAndMouse = ["Win32_UI_Input"]
+Win32_UI_Input_Pointer = ["Win32_UI_Input"]
+Win32_UI_Input_Touch = ["Win32_UI_Input"]
+Win32_UI_Shell = ["Win32_UI"]
+Win32_UI_TextServices = ["Win32_UI"]
+Win32_UI_WindowsAndMessaging = ["Win32_UI"]
+# END GENERATED FEATURES
+
+# A non-member cannot inherit the workspace's lints: these are the ones that
+# can fire on a re-export, and it has no `unsafe` to allow.
+[lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+
+# Its own root (the `package` section says why).
+[workspace]

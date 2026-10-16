@@ -5,11 +5,7 @@
 
 use super::*;
 
-// ===================================================================
-// The wake census at the seam.
-// ===================================================================
-
-/// One gesture of the confirmation capture's schedule.
+/// One gesture of the census schedule.
 #[derive(Clone, Copy, Debug)]
 enum CensusGesture {
     /// One typed glyph, echoed one cell right.
@@ -22,10 +18,8 @@ enum CensusGesture {
     Enter,
 }
 
-/// The capture schedule, in ms from the first key: 35 keys at 70 ms, a 1.5 s
-/// pause, 9 keys at 35 ms, a 1 s pause, four Ctrl-A / Ctrl-E jumps 500 ms
-/// apart, four backspaces at 100 ms, Enter, and the tail the lane is judged
-/// on.
+/// The census schedule, in ms from the first key: 35 keys at 70 ms, a 1.5 s pause, 9 keys at
+/// 35 ms, a 1 s pause, four Ctrl-A / Ctrl-E jumps 500 ms apart, four backspaces at 100 ms, Enter.
 fn census_schedule() -> Vec<(u64, CensusGesture)> {
     let mut s = Vec::new();
     let mut t = 0u64;
@@ -60,7 +54,7 @@ enum SeamOwner {
     V2Brisk,
     /// v2's next visible step — a tail or an edge, never the train.
     V2Tail,
-    /// v1's crown window alone held the FRAME train (no v2 brisk light).
+    /// v1's crown window alone held the frame train (no v2 brisk light).
     V1Crown,
     /// Another v1 brisk pool held the train (sparks, ring, pops…).
     V1Other,
@@ -75,8 +69,8 @@ struct SeamCensus {
     wakes: std::collections::BTreeMap<SeamOwner, u32>,
     renders: u32,
     presents: u32,
-    /// Ticks on which `is_active` held with NO deadline offered — the
-    /// fingerprint-only pin the host's train would otherwise re-arm on.
+    /// Ticks on which `is_active` held with no deadline offered: the fingerprint-only pin the
+    /// host's train would otherwise re-arm on.
     fp_only: u32,
     /// ms after the last gesture at which `needs_frame_cadence` first read
     /// `false` (and stayed so).
@@ -169,7 +163,7 @@ fn seam_wake_census(lane: Duration) -> SeamCensus {
             last_fp = fp;
         }
         glow.drain_sound_cues().for_each(drop);
-        // Classify the deadline the seam offers from THIS state.
+        // Classify the deadline the seam offers from this state.
         due = glow.next_change_deadline(now, lane);
         let brisk_v2 = glow.v2.needs_frame_cadence();
         let crown = glow.crown_until.is_some_and(|t| now < t);
@@ -225,10 +219,9 @@ fn seam_wake_census(lane: Duration) -> SeamCensus {
     census
 }
 
-/// The seam's wake census, printed with `--nocapture`: wakes by owner over the
-/// capture schedule. Pins that no crown holds the frame train and that the
-/// seam's cadence follows the engine's (false within a tick of the engine's
-/// 83 ms).
+/// The seam's wake census, printed with `--nocapture`: wakes by owner over the census schedule.
+/// No v1 pool holds the frame train under v2, and the seam's cadence releases when the engine's
+/// does.
 #[test]
 fn under_v2_the_seam_never_paces_the_frame_train_for_v1s_crown() {
     let lane = Duration::from_micros(16_667);
@@ -274,15 +267,11 @@ fn under_v2_the_seam_never_paces_the_frame_train_for_v1s_crown() {
         "the seam offered wakes {none} ms after the last key"
     );
     assert_eq!(v2.fp_only, 0, "a fingerprint-only pin with no deadline");
-    // v2's brisk wakes are its only frame-cadence wakes; tail wakes are paced
-    // steps (≥ `TAIL_FLOOR` apart), counted separately. So the train is at
-    // most one wake per lane tick over the session (the last gesture plus the
-    // cadence held after it); an unticked brisk wake is a busy re-arm.
-    //
-    // No glyph probe is fed, so no stardust is born and these brisk wakes are
-    // the ribbon's and the meteor's. The exhaust's frame-train cost is bounded
-    // over a probed sky in `rk::stardust::tests::`
-    // `the_exhaust_costs_the_frame_train_its_own_window_and_no_more`.
+    // v2's brisk wakes are its only frame-cadence wakes (tail wakes are paced `TAIL_FLOOR` apart
+    // and counted separately), so the train is at most one wake per lane tick over the session;
+    // an unticked brisk wake is a busy re-arm. No glyph probe is fed, so no stardust is born; the
+    // exhaust's train cost is bounded in
+    // `rk::stardust::tests::the_exhaust_costs_the_frame_train_its_own_window_and_no_more`.
     let train_v2 = v2.wakes.get(&SeamOwner::V2Brisk).copied().unwrap_or(0);
     let last_ms = census_schedule().last().map_or(0, |s| s.0);
     let lane_ticks =

@@ -5,9 +5,9 @@
 //! on it.
 //!
 //! macOS's syspolicyd assesses every new executable inode the first time it
-//! runs and caches the verdict per inode. Measured on the owner's Mac
-//! (2026-10-07/08): under a gate's load the first exec of a freshly built 167 MB
-//! debug `aterm-gui` took 64 s and the next one 0.13 s. The smokes launch the
+//! runs and caches the verdict per inode: under load the first exec of a
+//! freshly built debug `aterm-gui` can take a minute, the next one a tenth of
+//! a second. The smokes launch the
 //! `aterm-gui` they just built and give its control socket a minute to listen
 //! ([`crate::smoke_stages::SOCKET_POLLS`]), so a smoke could go red on the
 //! system's wait, not on a defect. A suspended `posix_spawn` does not trigger
@@ -15,16 +15,16 @@
 //!
 //! IT RUNS AT THE LAUNCH, NOT AFTER THE BUILD ROW. On this Mac cargo puts each
 //! binary at `<target>/debug/<name>` by COPYING it, on every invocation, rebuilt
-//! or not (measured 2026-10-08: two no-op `targo build`s, two inodes; a
-//! re-copied binary that had already run took 4.3 s and 13 s again, its same
-//! inode 20 ms). Every smoke runs its own build first, so a warm-up anywhere
+//! or not, so each build is a new inode to assess. Every smoke runs its own
+//! build first, so a warm-up anywhere
 //! before that build warms a file that is gone by the launch. So `bring_up`
 //! calls [`warm_first_exec`] after its build, on the path it then launches.
 //!
 //! The suites' own launches are warmed the same way, by the test helper
-//! `aterm_spec::wait::first_exec` (this crate takes no dependencies, so it
-//! keeps its own). It decides nothing: one line in the row's report, never a
-//! ladder row and never a skip. The launch keeps its hang detector; this takes
+//! `aterm_spec::wait::first_exec` (the CLI links only what its in-process
+//! checks run, and aterm-spec's model machinery is not that, so this keeps its
+//! own). It decides nothing: one line in the row's report, never a ladder row
+//! and never a skip. The launch keeps its hang detector; this takes
 //! the system's wait out from under it. Off macOS nothing assesses: the run
 //! costs a process start and leaves the binary in the page cache.
 
@@ -58,10 +58,10 @@ pub fn warm_first_exec(ctx: &Ctx, r: &mut Report, bin: &Path, flag: &str) {
 
 /// [`warm_first_exec`] under `bound`. The child is spawned through
 /// [`exec::run`], so it leads its own process group, reads no stdin, is on the
-/// list an interrupted gate kills, and is killed with its group at the bound.
+/// list an interrupted run kills, and is killed with its group at the bound.
 /// Its stdout and stderr go nowhere, it starts in `env`'s cwd as every stage
 /// child does, and its environment is ONLY a PATH and a scratch HOME, XDG dirs
-/// and TMPDIR (`env -i`, as `tools/visual-judge/capture.sh` drives a private
+/// and TMPDIR (`env -i`, as `targo --unverified lab instance` drives a private
 /// instance): no `ATERM_*` session, capability, handoff, fabric or update
 /// authority reaches it, and nothing it resolves is the person's.
 fn warm_within(env: ExecEnv<'_>, bound: Duration, r: &mut Report, bin: &Path, flag: &str) {
@@ -158,11 +158,11 @@ mod tests {
         }
     }
 
-    /// The sentinel the gate's own environment carries ([`env_in`]): an
+    /// The sentinel the run's own environment carries ([`env_in`]): an
     /// `ATERM_*` the warm-up child must never see.
     const SENTINEL: &str = "ATERM_WARM_SENTINEL";
 
-    /// An [`ExecEnv`] in `dir` whose additions carry [`SENTINEL`], as a gate's
+    /// An [`ExecEnv`] in `dir` whose additions carry [`SENTINEL`], as a run's
     /// carry the variables every other stage child gets.
     fn env_in<'a>(dir: &'a Path, add: &'a [(OsString, OsString)]) -> ExecEnv<'a> {
         ExecEnv {
@@ -190,7 +190,7 @@ mod tests {
 
     /// A present binary runs ONCE, with its flag, in an environment that is
     /// exactly the scratch one: PATH, a HOME, XDG dirs and TMPDIR the run made
-    /// and removed, and the shell's own variables; the gate's additions (an
+    /// and removed, and the shell's own variables; the run's additions (an
     /// `ATERM_*` sentinel) and its inherited environment never reach it. The
     /// line is reported, and is no ladder row: the warm-up never fails or skips
     /// its stage.

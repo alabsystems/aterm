@@ -2,8 +2,8 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Grid tests that need aterm-core: the facade contract test and
-//! `take_response_preserves_capacity` (uses `crate::terminal::Terminal`).
+//! Grid tests that need aterm-core: the facade re-export check and
+//! `take_response_preserves_capacity`.
 
 mod extras_performance;
 mod facade_completeness;

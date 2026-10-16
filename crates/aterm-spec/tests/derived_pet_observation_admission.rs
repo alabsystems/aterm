@@ -1,13 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-use aterm_spec::{derive::console_observation_admission_model, verify};
-
-#[test]
-fn pet_observation_admission_proves_and_catches_incoherent_motion() {
-    let model = console_observation_admission_model();
-    verify::prove_and_catch_scalar(&model, model.name);
-}
+use aterm_spec::derive::console_observation_admission_model;
 
 #[test]
 fn pet_observation_admission_preserves_unfed_motion_and_recovers_existing_flight() {

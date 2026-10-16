@@ -27,9 +27,8 @@ fn divider_grid_is_uniform_seam() {
     let theme = Theme::default();
     let seam = divider_cell(theme);
     let mut dst = RenderInput::empty();
-    // Every host-owned visual and present transform belongs to the frame
-    // that produced it. A single-pane -> split/native transition must not
-    // retain any of them in the reused window scratch.
+    // Host visuals and present transforms belong to the frame that made them: a single-pane ->
+    // split/native transition must not carry any of them in the reused scratch.
     dst.ink.push(aterm_render::InkCell {
         row: 0,
         col: 0,
@@ -148,9 +147,8 @@ fn divider_grid_is_uniform_seam() {
     );
 }
 
-/// Recomposition is a frame-hot path. Clearing the outer sparse channels
-/// would drop every row's retained allocation and turn a stable split into
-/// per-frame allocator churn; reset the existing inner rows in place.
+/// Recomposition is frame-hot: the sparse channels' inner rows are reset in place, keeping
+/// their allocations.
 #[test]
 fn divider_grid_reuses_sparse_row_storage() {
     let mut dst = RenderInput::empty();
@@ -223,10 +221,8 @@ fn blit_places_pane_and_keeps_seam() {
     assert_eq!(row[4].ch, 'D');
 }
 
-/// A split pane's BiDi row keeps its visual→logical map in the composite, at
-/// the pane's columns, so the pane's selection (relocated into frame columns)
-/// still lights the cells it copies. The left pane and the divider stay in
-/// painted order.
+/// A split pane's BiDi row keeps its visual→logical map at the pane's columns, so its
+/// relocated selection lights the cells it copies; the left pane and divider stay unpermuted.
 #[test]
 fn a_composed_bidi_pane_lights_the_cells_its_selection_copies() {
     use crate::app_render::push_pane_selection;
@@ -306,9 +302,8 @@ fn blit_confines_each_pane_line_size_to_its_own_columns() {
     }
 }
 
-/// The ordinary split — every pane on an ordinary line — must leave the
-/// span list empty so the renderers keep their uniform `col * cell_w` fast
-/// path. Spans are a rare-case escape hatch, not a per-frame cost.
+/// An all-single-width split records no spans, so the renderers keep their uniform
+/// `col * cell_w` path.
 #[test]
 fn blit_leaves_ordinary_splits_uniform() {
     let theme = Theme::default();
@@ -328,10 +323,8 @@ fn blit_leaves_ordinary_splits_uniform() {
     );
 }
 
-/// Side-by-side terminals own independent DEC line modes, and panes are not
-/// guaranteed to blit left-to-right. The DEC pane must record exactly one
-/// bounded run over its own columns whichever order it lands in, so blit
-/// order can never restore last-pane-wins state.
+/// Panes need not blit left to right: the DEC pane records exactly one run over its own
+/// columns in either order.
 #[test]
 fn blit_records_pane_local_line_size_spans() {
     use aterm_core::grid::LineSize;
@@ -340,19 +333,16 @@ fn blit_records_pane_local_line_size_spans() {
     let theme = Theme::default();
     let (left, left_blank) = pane_snapshot("AB", 1, 2);
     let mut right_term = Terminal::new(1, 2);
-    // Only set the row mode. On a 2-column DECDWL row there is one visible
-    // character position; feeding "CD" would legitimately wrap/scroll this
-    // one-row terminal and replace the row with a fresh SingleWidth line,
-    // invalidating the fixture before composition is exercised.
+    // Set only the row mode: a 2-column DECDWL row has one visible position, so text would
+    // wrap and scroll this one-row terminal onto a fresh SingleWidth line.
     right_term.process(b"\x1b#6");
     let mut right = RenderInput::empty();
     right_term.cell_frame_into(&mut right, 1, 2);
     let right_blank = terminal_blank_cell(&right_term);
     assert_eq!(right.line_sizes, vec![LineSize::DoubleWidth]);
 
-    // Only the DEC pane records a run: a column no run claims already renders
-    // SingleWidth, which is exactly what the ordinary pane wants and is what
-    // keeps `blit_leaves_ordinary_splits_uniform`'s fast path free.
+    // Only the DEC pane records a run; an unclaimed column renders SingleWidth, which keeps
+    // ordinary splits on the uniform path.
     let expected = vec![LineSizeSpan::new(3, 5, LineSize::DoubleWidth)];
     for reverse in [false, true] {
         let mut dst = RenderInput::empty();
@@ -382,10 +372,8 @@ fn blit_records_pane_local_line_size_spans() {
     }
 }
 
-/// A multi-pane frame cannot represent independent OSC 11/DECSCNM defaults
-/// with one scalar. Each pane row records its own resolved implicit
-/// background while the divider gap retains the scalar fallback; order of
-/// extraction cannot change the sorted provenance.
+/// One scalar cannot hold each pane's OSC 11/DECSCNM default: each pane row records its own
+/// implicit background span, the divider gap keeps the scalar, and blit order cannot change it.
 #[test]
 fn blit_records_pane_local_default_background_spans() {
     use aterm_core::render::{COLOR_UNSET, DefaultBgSpan};
@@ -423,9 +411,8 @@ fn blit_records_pane_local_default_background_spans() {
     }
 }
 
-/// Native trays may contain transparent antialiasing. Their terminal-grid
-/// underlay is a themed blank pane, never the divider sentinel, and carries
-/// the same hard SingleWidth pane clip as a terminal leaf.
+/// A native tray's underlay (it may antialias transparently) is a themed blank pane, never the
+/// divider sentinel, with the same SingleWidth pane clip as a terminal leaf.
 #[test]
 fn native_blank_underlay_replaces_only_its_pane_rectangle() {
     use aterm_core::grid::LineSize;
@@ -458,10 +445,8 @@ fn native_blank_underlay_replaces_only_its_pane_rectangle() {
     }
 }
 
-/// A terminal snapshot deliberately keeps unwritten row tails sparse. The
-/// pane blit must still paint the pane's FULL declared rectangle with the
-/// terminal's implicit blank cell; otherwise the divider-grid sentinel leaks
-/// through as broad gray bands after short lines and across empty rows.
+/// A snapshot keeps unwritten row tails sparse; the blit still paints the pane's full rectangle
+/// with the terminal's implicit blank, or the divider sentinel shows through as gray bands.
 #[test]
 fn blit_ragged_rows_paints_full_pane_rectangles() {
     let theme = Theme::default();
@@ -543,14 +528,13 @@ fn test_image_ref() -> aterm_core::grid::extra::ImageRef {
     }
 }
 
-/// `fill_divider_grid` rebuilds `images` to exactly `rows` empty rows every compose,
-/// like `cell_frame_into`, so it stays length-aligned with `cells` for the per-row
-/// damage gate: a stale oversized `images` is reset to 3 empty rows.
+/// `fill_divider_grid` rebuilds `images` to exactly `rows` empty rows, keeping it aligned with
+/// `cells` for the per-row damage gate.
 #[test]
 fn divider_grid_resets_stale_images_to_window_rows() {
     let theme = Theme::default();
     let mut dst = RenderInput::empty();
-    // Simulate a leaked / misaligned images vec from prior compose presents.
+    // A stale, oversized images vec from an earlier compose.
     dst.images = vec![Vec::new(); 7];
     dst.images[2].push((1, test_image_ref()));
     fill_divider_grid(&mut dst, 3, 5, theme, None);
@@ -594,10 +578,8 @@ fn blit_copies_pane_images_col_shifted() {
     );
 }
 
-/// A pane snapshot can briefly contain metadata from a wider engine grid
-/// while resize convergence is in flight. Cells already clip to `src.cols`;
-/// every parallel sparse channel must use that same pane-local boundary or
-/// an emoji/combining mark/image anchor can land on the divider or neighbour.
+/// During resize convergence a snapshot can carry metadata from a wider grid: every sparse
+/// channel clips at `src.cols` like the cells, or it lands on the divider or neighbour.
 #[test]
 fn blit_clips_sparse_metadata_to_pane_rectangle() {
     let theme = Theme::default();
@@ -638,10 +620,8 @@ fn blit_clips_sparse_metadata_to_pane_rectangle() {
     );
 }
 
-/// Resize convergence can snapshot a grid wider than the pane rectangle. If
-/// the pane boundary cuts between a wide glyph's lead and continuation, the
-/// lead must not survive alone: both renderers would otherwise paint its
-/// two-cell glyph over the divider even though the continuation was clipped.
+/// A wider snapshot can cut a wide glyph at the pane boundary: the orphaned lead goes too, or
+/// both renderers paint its two-cell glyph over the divider.
 #[test]
 fn blit_drops_wide_glyph_cut_by_pane_boundary() {
     let theme = Theme::default();

@@ -96,9 +96,9 @@ fn steady_state(app: &mut App, wid: WindowId, into: u64, frames: usize) -> Arms 
     }
 }
 
-/// A settled split of two or three panes books one scoped extraction per
-/// leaf per painted frame (background and focused) and nothing to the full
-/// arm. Assertions are lower bounds that survive concurrent tests.
+/// A settled split of two or three panes books one scoped extraction per leaf per painted frame
+/// (focused included) and nothing to the full arm. Assertions are lower bounds: concurrent tests
+/// only add.
 #[test]
 fn a_split_window_keeps_every_leaf_on_the_scoped_arm() {
     for panes in [2usize, 3] {
@@ -116,8 +116,6 @@ fn a_split_window_keeps_every_leaf_on_the_scoped_arm() {
             d.painted >= FRAMES - 2,
             "the workload must actually present: {d:?}"
         );
-        // One scoped extraction per leaf per painted frame; a lower bound,
-        // since concurrent tests only add and frames can exceed `FRAMES - 2`.
         let leaves = panes as u64;
         assert!(
             d.scoped >= (FRAMES as u64 - 2) * leaves,
@@ -134,12 +132,8 @@ fn a_split_window_keeps_every_leaf_on_the_scoped_arm() {
     }
 }
 
-/// The composed focused leaf stays on the DMG-1 carrier. A regression is
-/// silent (no other counter moves), so the failure names the refusing
-/// clause: `host_mutation` means a pass-2 mutator skipped the `snapshot_seq`
-/// bump, `damage_taken` means a bare `take_damage` bumped the generation
-/// without restamping, `terminal_mismatch` means the focused pane lost its
-/// dedicated buffer.
+/// The composed focused leaf stays on the DMG-1 carrier. A regression moves no other counter, so
+/// the failure names the refusing clause.
 #[test]
 fn the_composed_focused_leaf_stays_on_the_carrier() {
     use aterm_core::render::FrameRefill;

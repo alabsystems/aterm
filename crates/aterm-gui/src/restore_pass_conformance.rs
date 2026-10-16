@@ -10,10 +10,13 @@
 //! headless App's lane and queue reads (`App::restore_pass_handoff_lane`,
 //! `App::restore_pass_queued`), the site decision both call sites make
 //! (`restore_pass_due`: `FirstAttach` in `resumed`, `Park` in `about_to_wait`),
-//! and the proof's paint decision over real `WindowState`s
-//! (`handoff_paint_proven`, fed as `App::maybe_signal_handoff_ready` feeds it).
-//! Each guarded step (`RebuildAtAttach`, `LeaveResume`, `RebuildAtPark`,
-//! `Prove`) must be enabled in the model exactly when the real code takes it.
+//! whether that pass may run a slice and leave the rest owed (`restore_pass_sliced`
+//! over `App::restore_pass_carries_shells`; a drain under way is
+//! `App::restore_drain`), and the proof's paint decision over real
+//! `WindowState`s (`handoff_paint_proven`, fed as
+//! `App::maybe_signal_handoff_ready` feeds it). Each guarded step
+//! (`RebuildAtAttach`, `LeaveResume`, `RebuildAtPark`, `SliceAtPark`, `Prove`)
+//! must be enabled in the model exactly when the real code takes it.
 //!
 //! Negative control: the same decisions against `Buggy = 1` must disagree
 //! somewhere, so a pass is never vacuous.
@@ -23,9 +26,12 @@ use std::collections::BTreeSet;
 use aterm_spec::derive::{Model, native_update_successor_attach_model};
 use aterm_spec::interp::{self, State};
 
-use crate::{App, RestorePassSite, WindowId, WindowState, handoff_paint_proven, restore_pass_due};
+use crate::{
+    App, RestorePassSite, WindowId, WindowState, handoff_paint_proven, restore_pass_due,
+    restore_pass_sliced,
+};
 
-/// The four guarded App steps, as the shipping code decides each in `state`.
+/// The Apps whose guarded steps the shipping code decides in each `state`.
 struct Real {
     handoff: App,
     degraded: App,
@@ -79,10 +85,10 @@ impl Real {
         )
     }
 
-    /// The App whose lane the model's `lane` names; `alt` picks the degraded
-    /// handoff for the cold lane's second face.
-    fn app(&mut self, lane: i64, alt: bool) -> &mut App {
-        match (lane, alt) {
+    /// The App whose lane the model's `lane` names; on the cold lane, `handed`
+    /// picks the degraded handoff.
+    fn app(&mut self, lane: i64, handed: bool) -> &mut App {
+        match (lane, handed) {
             (1, _) => &mut self.handoff,
             (_, true) => &mut self.degraded,
             _ => &mut self.cold,
@@ -103,17 +109,22 @@ fn window(painted: bool) -> Box<WindowState> {
 }
 
 /// Which of the App's guarded steps the shipping code takes in `s`.
-fn real_steps(real: &mut Real, s: &State, alt: bool) -> BTreeSet<&'static str> {
+fn real_steps(real: &mut Real, s: &State) -> BTreeSet<&'static str> {
     let lane = s["lane"];
     let mut steps = BTreeSet::new();
     if lane == 0 {
         return steps;
     }
-    let app = real.app(lane, alt);
+    let app = real.app(lane, s["handed"] == 1);
+    // The rebuild owed: a manifest not yet begun, or a cold drain with slices
+    // to go.
+    let draining = s["queued"] == 1 && s["draining"] == 1;
     app.pending_restore =
-        (s["queued"] == 1).then(|| crate::restore::RestoreManifest::new(Vec::new()));
+        (s["queued"] == 1 && !draining).then(|| crate::restore::RestoreManifest::new(Vec::new()));
+    app.restore_drain = draining.then(|| Box::new(crate::app_restore::RestoreDrain::new(None)));
     let handoff_lane = app.restore_pass_handoff_lane();
     let queued = app.restore_pass_queued();
+    let carries_shells = app.restore_pass_carries_shells();
     let first_present_done = s["painted0"] == 1 || s["painted_extras"] == 1;
     let at_attach = restore_pass_due(
         RestorePassSite::FirstAttach,
@@ -124,6 +135,9 @@ fn real_steps(real: &mut Real, s: &State, alt: bool) -> BTreeSet<&'static str> {
     match s["phase"] {
         1 if at_attach => {
             steps.insert("RebuildAtAttach");
+            if restore_pass_sliced(RestorePassSite::FirstAttach, carries_shells) {
+                steps.insert("SliceAtPark");
+            }
         }
         // `resumed` returns once its pass ran or was not due.
         1 => {
@@ -137,6 +151,9 @@ fn real_steps(real: &mut Real, s: &State, alt: bool) -> BTreeSet<&'static str> {
         ) =>
         {
             steps.insert("RebuildAtPark");
+            if restore_pass_sliced(RestorePassSite::Park, carries_shells) {
+                steps.insert("SliceAtPark");
+            }
         }
         _ => {}
     }
@@ -167,14 +184,17 @@ fn real_steps(real: &mut Real, s: &State, alt: bool) -> BTreeSet<&'static str> {
 /// (a `Buggy = 1` mutant takes the step it corrupts). The mutant-only
 /// liveness action, `RebuildWithoutKick`, is no guard decision: it builds
 /// windows without their first present, which this bind does not drive.
-const APP_STEPS: [(&str, &str); 7] = [
+const APP_STEPS: [(&str, &str); 10] = [
     ("RebuildAtAttach", "RebuildAtAttach"),
     ("LeaveResume", "LeaveResume"),
     ("RebuildAtPark", "RebuildAtPark"),
+    ("RebuildSliceAtPark", "SliceAtPark"),
     ("Prove", "Prove"),
     ("RebuildAtAttachCold", "RebuildAtAttach"),
     ("LeaveResumeOwing", "LeaveResume"),
     ("ProveAtFirstPresent", "Prove"),
+    ("RebuildSliceHanded", "SliceAtPark"),
+    ("RebuildSliceBeforePaint", "SliceAtPark"),
 ];
 
 fn model_steps(model: &Model, s: &State) -> BTreeSet<&'static str> {
@@ -217,19 +237,25 @@ fn the_shipping_rebuild_sites_and_proof_gate_conform_to_the_model() {
         states.len()
     );
     let mut attach_passes = 0;
+    let mut cold_slices = 0;
     for s in &states {
-        for alt in [false, true] {
-            let want = model_steps(&model, s);
-            let got = real_steps(&mut real, s, alt);
-            assert_eq!(got, want, "state {s:?} (degraded face: {alt})");
-        }
+        let want = model_steps(&model, s);
+        let got = real_steps(&mut real, s);
+        assert_eq!(got, want, "state {s:?}");
         if model.action_enabled("RebuildAtAttach", s) && s["painted0"] == 0 && s["many"] == 1 {
             attach_passes += 1;
+        }
+        if s["draining"] == 1 && s["queued"] == 1 && got.contains("SliceAtPark") {
+            cold_slices += 1;
         }
     }
     assert!(
         attach_passes > 0,
         "the parallel attach is reached: extra windows built before window 0 has presented"
+    );
+    assert!(
+        cold_slices > 0,
+        "a drain under way is reached, and its next park slices again"
     );
 }
 
@@ -240,12 +266,12 @@ fn negative_control_the_buggy_family_disagrees_with_the_shipping_code() {
     let mut disagreements = BTreeSet::new();
     for s in reachable(&buggy) {
         let want = model_steps(&buggy, &s);
-        let got = real_steps(&mut real, &s, false);
+        let got = real_steps(&mut real, &s);
         for step in want.symmetric_difference(&got) {
             disagreements.insert(*step);
         }
     }
-    for step in ["RebuildAtAttach", "LeaveResume", "Prove"] {
+    for step in ["RebuildAtAttach", "LeaveResume", "SliceAtPark", "Prove"] {
         assert!(
             disagreements.contains(step),
             "the shipping code must refuse the mutant's {step}: {disagreements:?}"

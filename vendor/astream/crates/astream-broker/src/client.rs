@@ -4,15 +4,20 @@
 //! `recv` returns exactly when the next delivery arrives, with no reliance on sleeps
 //! or wall-clock.
 
-use crate::proto::{decode_response, encode_request, read_frame, write_frame, Request, Response};
-use astream_wire::{Frame, FrameError, HEADER_SIZE};
+use crate::logid::LogIdentity;
+use crate::proto::{
+    append_frame, decode_response, encode_request, foreign_protocol, read_frame, Request, Response,
+    CAP_EXPIRED_PREFIX, ERR_BAD_FILTER, ERR_BAD_SUBJECT, ERR_PROTOCOL, ERR_RECORD_REFUSED,
+    ERR_REFUSED, ERR_SUBJECT_BOUND, ERR_UNAUTHORIZED, PROTO_VERSION,
+};
+use astream_wire::{Frame, FrameError};
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 #[cfg(unix)]
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// One record as a client sees it: `(offset, subject, body)` — what a `Delivery`
 /// carries.
@@ -22,6 +27,38 @@ pub type Record = (u64, String, Vec<u8>);
 /// the page of records, then the `(next, head)` its closing `Mark` carried. Also the
 /// shape of [`Client::last_all`]'s whole-face answer, whose mark is its FIRST page's.
 pub type Page = (Vec<Record>, (u64, u64));
+
+/// A producer's DISTINCT-SUBJECT BUDGET as one broker log counts it: the answer to
+/// [`Client::subject_budget`].
+///
+/// `subjects` is how many entries of the last-value index are charged to the
+/// producer (a subject is charged to the producer whose record first put it in the
+/// index — updating someone else's subject costs nothing), `reserved` how many more
+/// its registered wills hold for subjects they have not landed yet, and `max` the
+/// budget both count against
+/// ([`MAX_SUBJECTS_PER_PRODUCER`](crate::store::MAX_SUBJECTS_PER_PRODUCER)). A publish
+/// that would add a subject past it is refused with
+/// [`ERR_SUBJECT_BOUND`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubjectBudget {
+    /// Index entries charged to the producer.
+    pub subjects: u64,
+    /// Subjects the producer's registered, unlanded wills hold in reserve.
+    pub reserved: u64,
+    /// The budget `subjects + reserved` counts against.
+    pub max: u64,
+}
+
+impl SubjectBudget {
+    /// How many NEW subjects the producer may still introduce: `max - subjects -
+    /// reserved`, saturating at 0. A snapshot — another connection publishing as the
+    /// same producer spends from it at once.
+    pub fn remaining(&self) -> u64 {
+        self.max
+            .saturating_sub(self.subjects)
+            .saturating_sub(self.reserved)
+    }
+}
 
 /// The most `Last` requests one [`Client::last_walk`] may make before the walk is
 /// called a FAILURE rather than an answer.
@@ -65,9 +102,28 @@ pub enum Walk {
 /// every transport. A caller that picks the transport at RUNTIME uses the free
 /// function [`connect`] instead: one [`AnyClient`] for every wire, plus the
 /// [`Closer`] that ends it and bounds its I/O.
+///
+/// A request/reply client keeps itself IN STEP with its replies. A request that fails
+/// part-way through its exchange — a write error, a read that timed out or hit EOF, a
+/// reply that does not decode or is not the one the request is owed, a page longer
+/// than it asked for — leaves the stream at an unknown point (a late reply may still
+/// arrive), so the client latches: every later request on it fails at once with
+/// `ErrorKind::BrokenPipe`, writing nothing, rather than reading the reply owed to
+/// the request before it. Reconnect. A broker REFUSAL is a whole reply and leaves the
+/// client in step ([`BrokerRefusal`]). A broker in ANOTHER protocol is neither: its
+/// reply is a [`ProtocolMismatch`], and it latches the client like any other failure.
 #[cfg(unix)]
 pub struct Client<S = UnixStream> {
     stream: S,
+    /// Why this connection is out of step with its replies, once it is.
+    lost: Option<String>,
+    /// The log identity this connection's latest `Hello` answer carried.
+    identity: Option<LogIdentity>,
+    /// When this client last wrote a request (or was made): what
+    /// [`keepalive_if_idle`](Client::keepalive_if_idle) measures idleness from.
+    sent_at: Instant,
+    /// The broker answered a `Keepalive` as a verb it does not know.
+    keepalive_unknown: bool,
 }
 
 /// A connection to a broker over a byte stream. Windows twin: std has no
@@ -76,6 +132,15 @@ pub struct Client<S = UnixStream> {
 #[cfg(not(unix))]
 pub struct Client<S = TcpStream> {
     stream: S,
+    /// Why this connection is out of step with its replies, once it is.
+    lost: Option<String>,
+    /// The log identity this connection's latest `Hello` answer carried.
+    identity: Option<LogIdentity>,
+    /// When this client last wrote a request (or was made): what
+    /// [`keepalive_if_idle`](Client::keepalive_if_idle) measures idleness from.
+    sent_at: Instant,
+    /// The broker answered a `Keepalive` as a verb it does not know.
+    keepalive_unknown: bool,
 }
 
 #[cfg(unix)]
@@ -83,9 +148,7 @@ impl Client<UnixStream> {
     /// Connect to the broker's Unix socket at `socket_path` (same machine,
     /// unsealed — reachability is scoped by the socket path's permissions).
     pub fn connect(socket_path: impl AsRef<Path>) -> io::Result<Client<UnixStream>> {
-        Ok(Client {
-            stream: UnixStream::connect(socket_path)?,
-        })
+        Ok(Client::from_stream(UnixStream::connect(socket_path)?))
     }
 }
 
@@ -95,9 +158,7 @@ impl Client<TcpStream> {
     /// untrusted network use `connect_tcp_sealed` (the `aead` feature), which
     /// carries the same protocol inside an authenticated-encryption record layer.
     pub fn connect_tcp(addr: impl ToSocketAddrs) -> io::Result<Client<TcpStream>> {
-        Ok(Client {
-            stream: dial_tcp(addr, None)?,
-        })
+        Ok(Client::from_stream(dial_tcp(addr, None)?))
     }
 
     /// [`connect_tcp`](Self::connect_tcp) with a bound on the CONNECT: each address
@@ -116,9 +177,7 @@ impl Client<TcpStream> {
         addr: impl ToSocketAddrs,
         timeout: Duration,
     ) -> io::Result<Client<TcpStream>> {
-        Ok(Client {
-            stream: dial_tcp(addr, Some(timeout))?,
-        })
+        Ok(Client::from_stream(dial_tcp(addr, Some(timeout))?))
     }
 }
 
@@ -217,7 +276,7 @@ impl Client<astream_aead::SealedStream<TcpStream>> {
         key: [u8; astream_aead::KEY_LEN],
     ) -> io::Result<Client<astream_aead::SealedStream<TcpStream>>> {
         let stream = seal_tcp(dial_tcp(addr, None)?, key, SEALED_HANDSHAKE_TIMEOUT)?;
-        Ok(Client { stream })
+        Ok(Client::from_stream(stream))
     }
 }
 
@@ -234,7 +293,7 @@ impl Client<astream_aead::SealedStream<TcpStream>> {
         psk: [u8; astream_aead::KEY_LEN],
     ) -> io::Result<Client<astream_aead::SealedStream<TcpStream>>> {
         let sealed = agree_tcp(dial_tcp(addr, None)?, &psk, KEY_AGREEMENT_TIMEOUT)?;
-        Ok(Client { stream: sealed })
+        Ok(Client::from_stream(sealed))
     }
 }
 
@@ -260,7 +319,7 @@ impl Client<astream_aead::SealedStream<TcpStream>> {
         let sealed = astream_aead::client_identity_handshake(stream, &identity, &expected_server)?;
         sealed.get_ref().set_read_timeout(None)?;
         sealed.get_ref().set_write_timeout(None)?;
-        Ok(Client { stream: sealed })
+        Ok(Client::from_stream(sealed))
     }
 }
 
@@ -270,29 +329,76 @@ impl<S: Read + Write> Client<S> {
     /// whatever transport setup (nodelay, sealing) the stream needs; this is the
     /// inverse of [`into_stream`](Self::into_stream).
     pub fn from_stream(stream: S) -> Client<S> {
-        Client { stream }
+        Client {
+            stream,
+            lost: None,
+            identity: None,
+            sent_at: Instant::now(),
+            keepalive_unknown: false,
+        }
     }
 
     /// Give the underlying byte stream back (e.g. to box it behind a `dyn` trait so
-    /// one code path serves every transport). The connection stays open.
+    /// one code path serves every transport). The connection stays open. A client
+    /// that was out of step hands back a stream that still is.
     pub fn into_stream(self) -> S {
         self.stream
     }
 
     /// Ask the broker for this connection's NONCE — the value an [`attach`](Self::attach)
     /// proof is computed over. Answered by a guarded and an unguarded broker alike, so
-    /// one client works against either.
+    /// one client works against either. The log identity the answer carries is kept
+    /// ([`seen_log_identity`](Self::seen_log_identity)).
     pub fn hello(&mut self) -> io::Result<[u8; 32]> {
+        self.hello_identity().map(|(nonce, _)| nonce)
+    }
+
+    /// [`hello`](Self::hello), returning beside the nonce the [`LogIdentity`] of the
+    /// log the broker serves — `None` from a broker that predates log identity. Kept,
+    /// like `hello`'s, as [`seen_log_identity`](Self::seen_log_identity).
+    pub fn hello_identity(&mut self) -> io::Result<([u8; 32], Option<LogIdentity>)> {
         self.send(&Request::Hello)?;
         match self.read_response()? {
-            Response::Nonce { nonce } => nonce.as_slice().try_into().map_err(|_| {
-                io::Error::new(
+            Response::Nonce { nonce, log } => match nonce.as_slice().try_into() {
+                Ok(nonce) => {
+                    self.identity = log;
+                    Ok((nonce, log))
+                }
+                Err(_) => Err(self.lose(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("broker nonce is {} bytes, expected 32", nonce.len()),
-                )
-            }),
-            other => Err(refused(other)),
+                ))),
+            },
+            other => Err(self.reply_error(other)),
         }
+    }
+
+    /// The [`LogIdentity`] of the log the broker serves NOW: one `Hello` round trip.
+    /// `Ok(None)` is a broker that predates log identity, which says nothing either
+    /// way.
+    ///
+    /// Check it before using any offset persisted from an EARLIER connection — a
+    /// delivered-up-to watermark, a cursor, an offset already answered. If it is not
+    /// the identity that offset was read under (a different `id` OR `generation`),
+    /// the offset names nothing in this log: drop it and start over from this log, as
+    /// a first run would (the [`LogIdentity`] docs say how). The broker's own consumer
+    /// groups need no such check: their cursors live inside the log.
+    ///
+    /// It IS a `Hello`: the connection's nonce is replaced, so an attach proof
+    /// computed over an earlier one no longer verifies ([`attach`](Self::attach) and
+    /// [`attach_all`](Self::attach_all) fetch their own).
+    pub fn log_identity(&mut self) -> io::Result<Option<LogIdentity>> {
+        self.hello_identity().map(|(_, log)| log)
+    }
+
+    /// The [`LogIdentity`] this connection's latest `Hello` answer carried — the one
+    /// [`attach`](Self::attach) and [`attach_all`](Self::attach_all) send — so a client
+    /// that attached learns it with no further round trip. `None` before any `Hello`
+    /// on this connection, or from a broker that predates log identity
+    /// ([`log_identity`](Self::log_identity) asks). A connection to a REPLICA can see
+    /// it change, when the replica adopts its leader's: ask again for the current one.
+    pub fn seen_log_identity(&self) -> Option<LogIdentity> {
+        self.identity
     }
 
     /// Add a grant to this connection's keyring by presenting a PROOF the caller has
@@ -313,36 +419,113 @@ impl<S: Read + Write> Client<S> {
     /// connection's nonce, then `Attach` carrying `HMAC-SHA256(tag, nonce ‖ grant)` —
     /// a PROOF OF POSSESSION, so the tag never crosses the wire and a captured attach
     /// cannot be replayed onto another connection. Blocks for the acknowledgement and
-    /// returns its `(next, head)`.
+    /// returns its `(next, head)`. [`attach_all`](Self::attach_all) with one grant.
     ///
     /// `Attach` APPENDS: several narrow grants on one connection are the intended
     /// shape (read one subtree, commit under another, publish as a bound principal in
     /// a third), and each request is authorized existentially over the ring. A
-    /// repeated grant string replaces rather than growing it.
+    /// repeated grant string replaces rather than growing it. A connection that holds
+    /// several grants attaches them with [`attach_all`](Self::attach_all), which pays
+    /// one `Hello` for the lot.
     ///
     /// # Errors
     /// The socket errors, or the broker refuses the attach (a proof that does not
     /// verify, a producer-id collision in the binding table, or a full keyring).
-    #[cfg(feature = "cap")]
     pub fn attach(&mut self, grant: &str, tag: &[u8]) -> io::Result<(u64, u64)> {
-        let tag: [u8; 32] = tag.try_into().map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("capability tag is {} bytes, expected 32", tag.len()),
-            )
-        })?;
+        self.attach_all([(grant, tag)])?.ok_or_else(|| {
+            // Unreachable: a one-grant ring is acknowledged or refused, never empty.
+            io::Error::new(io::ErrorKind::InvalidData, "no attach was acknowledged")
+        })
+    }
+
+    /// Add every capability in `ring` — `(grant, tag)` pairs, in order — to this
+    /// connection's keyring in TWO round trips however many there are: ONE `Hello`
+    /// (the broker keeps a connection's nonce until the next `Hello`, and verifies any
+    /// number of `Attach`es against it), then every `Attach` pipelined, at most
+    /// [`ATTACH_WINDOW`](Self::ATTACH_WINDOW) in flight, each acknowledged in order.
+    /// Returns the LAST acknowledgement's `(next, head)`; `None` for an empty ring,
+    /// which sends nothing at all (an unguarded setup with no capability files).
+    ///
+    /// A REFUSED grant stops the sending: the attaches already in flight are still
+    /// answered and read — so the connection stays in step for the next request —
+    /// and the FIRST refusal is returned ([`BrokerRefusal`] inside, in ring order).
+    /// Each grant is decided on its own: on an `Err` the connection holds the grants
+    /// ahead of the refused one, and perhaps some that were in flight behind it, so a
+    /// caller that needs the whole ring drops the connection.
+    ///
+    /// # Errors
+    /// A tag that is not 32 bytes (`InvalidInput`, before anything is sent); the
+    /// socket; or the broker's first refusal.
+    #[cfg(feature = "cap")]
+    pub fn attach_all<'a>(
+        &mut self,
+        ring: impl IntoIterator<Item = (&'a str, &'a [u8])>,
+    ) -> io::Result<Option<(u64, u64)>> {
+        let ring = ring
+            .into_iter()
+            .map(|(grant, tag)| {
+                let tag: [u8; 32] = tag.try_into().map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("capability tag is {} bytes, expected 32", tag.len()),
+                    )
+                })?;
+                Ok((grant, tag))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        if ring.is_empty() {
+            return Ok(None);
+        }
         let nonce = self.hello()?;
-        let proof = astream_cap::attach_proof(&tag, &nonce, grant);
-        self.attach_with_proof(grant, &proof)
+        let mut mark = None;
+        let mut sent = 0usize;
+        let mut received = 0usize;
+        let mut failure: Option<io::Error> = None;
+        loop {
+            while failure.is_none() && sent < ring.len() && sent - received < Self::ATTACH_WINDOW {
+                let (grant, tag) = &ring[sent];
+                let proof = astream_cap::attach_proof(tag, &nonce, grant);
+                match self.send(&Request::Attach {
+                    grant: grant.to_string(),
+                    proof: proof.to_vec(),
+                }) {
+                    Ok(()) => sent += 1,
+                    Err(e) => failure = Some(e),
+                }
+            }
+            if received == sent {
+                break;
+            }
+            received += 1;
+            match self.read_mark() {
+                Ok(m) => mark = Some(m),
+                Err(e) if broker_refusal(&e).is_some() => {
+                    failure.get_or_insert(e);
+                }
+                // A transport failure: the client is out of step now, and says so.
+                Err(e) => return Err(failure.unwrap_or(e)),
+            }
+        }
+        match failure {
+            Some(e) => Err(e),
+            None => Ok(mark),
+        }
     }
 
     /// Without the `cap` feature there is no way to compute an attach PROOF: the tag
     /// stays on the client and the wire carries `HMAC-SHA256(tag, nonce ‖ grant)`
     /// instead, which needs the same vetted MAC a guarded broker uses. Build with
     /// `cap` (or compute the proof yourself and call
-    /// [`attach_with_proof`](Self::attach_with_proof)).
+    /// [`attach_with_proof`](Self::attach_with_proof)). An EMPTY ring needs no proof:
+    /// it is `Ok(None)`, as with `cap`, and sends nothing.
     #[cfg(not(feature = "cap"))]
-    pub fn attach(&mut self, _grant: &str, _tag: &[u8]) -> io::Result<(u64, u64)> {
+    pub fn attach_all<'a>(
+        &mut self,
+        ring: impl IntoIterator<Item = (&'a str, &'a [u8])>,
+    ) -> io::Result<Option<(u64, u64)>> {
+        if ring.into_iter().next().is_none() {
+            return Ok(None);
+        }
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "presenting a capability needs the `cap` feature: an Attach carries a proof of \
@@ -350,6 +533,12 @@ impl<S: Read + Write> Client<S> {
              so the client must be able to compute that MAC",
         ))
     }
+
+    /// The most `Attach`es [`attach_all`](Self::attach_all) keeps in flight before
+    /// reading an acknowledgement — a keyring's worth (`MAX_KEYRING`, past which the
+    /// broker refuses anyway), so a ring of any length cannot fill both directions'
+    /// socket buffers and wedge the connection.
+    pub const ATTACH_WINDOW: usize = 16;
 
     /// Publish `body` to `subject`, deduped by `(producer_id, producer_seq)`. Blocks
     /// for the ack; returns `(offset, deduped)` — `deduped` true means a re-send
@@ -391,7 +580,7 @@ impl<S: Read + Write> Client<S> {
     pub fn recv_publish_ack(&mut self) -> io::Result<(u64, bool)> {
         match self.read_response()? {
             Response::PublishAck { offset, deduped } => Ok((offset, deduped)),
-            other => Err(refused(other)),
+            other => Err(self.reply_error(other)),
         }
     }
 
@@ -447,7 +636,8 @@ impl<S: Read + Write> Client<S> {
             match resp {
                 Response::PublishAck { offset, deduped } => acks.push((offset, deduped)),
                 other => {
-                    failure.get_or_insert(refused(other));
+                    let e = self.reply_error(other);
+                    failure.get_or_insert(e);
                 }
             }
         }
@@ -487,6 +677,123 @@ impl<S: Read + Write> Client<S> {
             body: body.to_vec(),
         })?;
         self.read_mark()
+    }
+
+    /// Say this connection is alive: one [`Request::Keepalive`], answered with a
+    /// `Mark` and appending nothing. Over TCP it also asks the broker to HOLD the
+    /// connection to its keepalive deadline
+    /// ([`KEEPALIVE_DEADLINE`](crate::broker::KEEPALIVE_DEADLINE), 60 s unless the
+    /// broker set another) from now on: a connection that then goes that long with
+    /// nothing read from it is ended exactly as a closed one is — its will fires, its
+    /// slot is freed — which is how the broker notices a client that vanished without a
+    /// FIN (a power loss, a NAT or Wi-Fi change, a cable pull) instead of waiting on it
+    /// until the broker restarts. So a client that keeps alive once keeps alive for the
+    /// connection's life: every
+    /// [`KEEPALIVE_INTERVAL`](crate::broker::KEEPALIVE_INTERVAL) it has sent nothing
+    /// else, which is [`keepalive_if_idle`](Self::keepalive_if_idle). Any request
+    /// counts, so a busy connection never needs one. A Unix-socket connection is
+    /// answered and never held: its peer cannot vanish without its kernel closing it.
+    ///
+    /// ARMING ON A KEEPALIVE IS THE VERSION CHECK, the twin of
+    /// [`Subscription::recv_live`] arming on a `Mark`: a client that never sends one is
+    /// never cut, so every client that predates the verb idles exactly as it always has.
+    ///
+    /// `Ok(true)`: the broker knows the verb. `Ok(false)`: it predates it — it answered
+    /// `ERR_REFUSED` ("malformed request"), a whole reply, so this client is in step —
+    /// and it will never cut this connection; `keepalive_if_idle` sends nothing more
+    /// on it.
+    ///
+    /// PRECONDITION, as for [`fetch`](Self::fetch): no pipelined publish is un-acked on
+    /// this connection.
+    ///
+    /// # Errors
+    /// The socket; on a guarded broker, `ERR_UNAUTHORIZED` while no capability is
+    /// attached (a keepalive grants nothing, but its answer names the log's head).
+    pub fn keepalive(&mut self) -> io::Result<bool> {
+        self.send(&Request::Keepalive)?;
+        match self.read_mark() {
+            Ok(_) => Ok(true),
+            Err(e) if broker_refusal(&e).is_some_and(|r| r.code == ERR_REFUSED) => {
+                self.keepalive_unknown = true;
+                Ok(false)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// [`keepalive`](Self::keepalive) when this client has sent nothing for `interval`
+    /// — pass [`KEEPALIVE_INTERVAL`](crate::broker::KEEPALIVE_INTERVAL) — and nothing at
+    /// all otherwise, or once the broker has answered a keepalive as a verb it does not
+    /// know. Call it from a loop that wakes at least that often: it reads the clock
+    /// and, while the connection is busy, sends nothing. Returns whether a keepalive
+    /// went out.
+    ///
+    /// Idleness runs from the last request WRITTEN (or the client's making), whatever
+    /// it was; a blocking request's own wait for its answer is not idleness on the
+    /// broker's side, which counts only the time it spends waiting to read.
+    ///
+    /// # Errors
+    /// As [`keepalive`](Self::keepalive).
+    pub fn keepalive_if_idle(&mut self, interval: Duration) -> io::Result<bool> {
+        if self.keepalive_unknown || self.sent_at.elapsed() < interval {
+            return Ok(false);
+        }
+        self.keepalive().map(|_| true)
+    }
+
+    /// READ `producer_id`'s DISTINCT-SUBJECT BUDGET: one [`Request::Budget`], answered
+    /// with what the broker's log counts against the producer and the budget it
+    /// counts against ([`SubjectBudget`]). Appends nothing.
+    ///
+    /// It is the count a subject-bound refusal is decided by
+    /// ([`BrokerRefusal::is_subject_bound`]), read after this connection's own pending
+    /// acks, so a producer can keep headroom for the subjects it cannot do without
+    /// from the broker's number rather than from a guess of its own.
+    ///
+    /// `Ok(None)`: the broker predates the verb — it answered `ERR_REFUSED` ("malformed
+    /// request"), a whole reply, so this client is in step — and cannot say.
+    ///
+    /// PRECONDITION, as for [`fetch`](Self::fetch): no pipelined publish is un-acked on
+    /// this connection.
+    ///
+    /// # Errors
+    /// The socket; on a guarded broker, `ERR_UNAUTHORIZED` unless the ring holds a
+    /// genuine, unexpired read-write grant that publishes as `producer_id` (bound to
+    /// it, or unbound).
+    pub fn subject_budget(&mut self, producer_id: u64) -> io::Result<Option<SubjectBudget>> {
+        self.send(&Request::Budget { producer_id })?;
+        match self.read_response()? {
+            Response::Budget {
+                subjects,
+                reserved,
+                max,
+            } => Ok(Some(SubjectBudget {
+                subjects,
+                reserved,
+                max,
+            })),
+            other => match self.reply_error(other) {
+                e if broker_refusal(&e).is_some_and(|r| r.code == ERR_REFUSED) => Ok(None),
+                e => Err(e),
+            },
+        }
+    }
+
+    /// Ask for catch-up and idle marks on this connection's next subscription.
+    /// `subscribe` and `subscribe_group` negotiate this before handing the socket
+    /// over. A broker that does not know the verb returns `Ok(false)` and leaves
+    /// the stream framed; the subscription retains that broker's behavior.
+    /// This request arms no deadline and appends no record. A guarded broker
+    /// requires an attached capability because the acknowledgement names the head.
+    ///
+    /// As for `fetch`, no pipelined publish may be awaiting its acknowledgement.
+    pub fn idle_marks(&mut self) -> io::Result<bool> {
+        self.send(&Request::IdleMarks)?;
+        match self.read_mark() {
+            Ok(_) => Ok(true),
+            Err(e) if broker_refusal(&e).is_some_and(|r| r.code == ERR_REFUSED) => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     /// LAST-VALUE query: the most recent record of every subject matching `filter`
@@ -707,11 +1014,12 @@ impl<S: Read + Write> Client<S> {
         let mut page = Vec::new();
         loop {
             match self.read_response()? {
+                // The rest of that page is still on the stream, unread: out of step.
                 Response::Delivery { .. } if page.len() >= max as usize => {
-                    return Err(io::Error::new(
+                    return Err(self.lose(io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!("broker sent more than the {max} records the page asked for"),
-                    ))
+                    )))
                 }
                 Response::Delivery {
                     offset,
@@ -719,14 +1027,18 @@ impl<S: Read + Write> Client<S> {
                     body,
                 } => page.push((offset, subject, body)),
                 Response::Mark { next, head, resume } => return Ok((page, (next, head), resume)),
-                other => return Err(refused(other)),
+                other => return Err(self.reply_error(other)),
             }
         }
     }
 
     /// Subscribe to every record matching `filter` from `from_offset`, then live.
-    /// Consumes the client (the connection becomes a delivery stream).
-    pub fn subscribe(self, from_offset: u64, filter: &str) -> io::Result<Subscription<S>> {
+    /// Consumes the client (the connection becomes a delivery stream). Negotiates
+    /// [`idle_marks`](Self::idle_marks) first, falling back to an older broker's
+    /// existing tail behavior. The acknowledgement is consumed before any
+    /// subscription event, so only a tail's own mark arms `recv_live`.
+    pub fn subscribe(mut self, from_offset: u64, filter: &str) -> io::Result<Subscription<S>> {
+        self.idle_marks()?;
         self.into_subscription(&Request::Subscribe {
             from_offset,
             filter: filter.to_string(),
@@ -769,7 +1081,10 @@ impl<S: Read + Write> Client<S> {
 
     /// Subscribe as consumer `group`: the broker resumes delivery from the group's
     /// DURABLE committed offset (no client-tracked cursor), then tails live.
-    pub fn subscribe_group(self, group: &str, filter: &str) -> io::Result<Subscription<S>> {
+    /// Negotiates [`idle_marks`](Self::idle_marks) as [`subscribe`](Self::subscribe)
+    /// does; an older broker keeps its existing tail behavior.
+    pub fn subscribe_group(mut self, group: &str, filter: &str) -> io::Result<Subscription<S>> {
+        self.idle_marks()?;
         self.into_subscription(&Request::SubscribeGroup {
             group: group.to_string(),
             filter: filter.to_string(),
@@ -795,30 +1110,76 @@ impl<S: Read + Write> Client<S> {
         })
     }
 
-    /// Write one request frame.
+    /// Write one request frame. A request that cannot be FRAMED (over the frame cap)
+    /// is refused before a byte is written, so the client stays in step; a failed
+    /// WRITE may have sent part of a frame, so it latches the client out of step.
     fn send(&mut self, req: &Request) -> io::Result<()> {
-        write_frame(&mut self.stream, &encode_request(req))
+        self.in_step()?;
+        let mut out = Vec::new();
+        append_frame(&mut out, &encode_request(req))?;
+        self.stream.write_all(&out).map_err(|e| self.lose(e))?;
+        self.sent_at = Instant::now();
+        Ok(())
     }
 
-    /// Read the one response a request is owed. A close is `UnexpectedEof` and an
-    /// undecodable payload is `InvalidData`; a broker `Error` is returned AS a
-    /// response, because a refusal leaves the stream in step and a transport failure
-    /// does not.
+    /// Read the one response a request is owed. A close is `UnexpectedEof`, a broker in
+    /// another protocol a [`ProtocolMismatch`] and an undecodable payload
+    /// `InvalidData`; a broker `Error` is returned AS a response, because a refusal
+    /// leaves the stream in step and a transport failure does not — every failure here
+    /// latches the client out of step.
     fn read_response(&mut self) -> io::Result<Response> {
-        match read_frame(&mut self.stream)? {
-            Some(p) => decode_response(&p).ok_or_else(unexpected_response),
-            None => Err(io::Error::new(
+        self.in_step()?;
+        let read = match read_frame(&mut self.stream) {
+            Ok(Some(p)) => decode_reply(&p),
+            Ok(None) => Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "broker closed",
             )),
-        }
+            Err(e) => Err(e),
+        };
+        read.map_err(|e| self.lose(e))
     }
 
     /// Read the `Mark` that acknowledges an `Attach` or a `Will`: its `(next, head)`.
     fn read_mark(&mut self) -> io::Result<(u64, u64)> {
         match self.read_response()? {
             Response::Mark { next, head, .. } => Ok((next, head)),
-            other => Err(refused(other)),
+            other => Err(self.reply_error(other)),
+        }
+    }
+
+    /// The error a reply other than the one a request is owed becomes: the broker's
+    /// refusal, which leaves the client in step — or any other reply, which is the
+    /// signature of a LATE one (owed to an earlier request), and latches it out.
+    fn reply_error(&mut self, resp: Response) -> io::Error {
+        match resp {
+            Response::Error { code, msg } => BrokerRefusal { code, msg }.into(),
+            _ => self.lose(unexpected_response()),
+        }
+    }
+
+    /// Latch this client out of step with its replies because of `e`, and hand `e`
+    /// back. The first cause is the one kept.
+    fn lose(&mut self, e: io::Error) -> io::Error {
+        if self.lost.is_none() {
+            self.lost = Some(e.to_string());
+        }
+        e
+    }
+
+    /// `Ok` while the client is in step with its replies; once it is not, the
+    /// `BrokenPipe` every later request fails with. Not `ErrorKind::Other`, which is
+    /// what a broker refusal is.
+    fn in_step(&self) -> io::Result<()> {
+        match &self.lost {
+            None => Ok(()),
+            Some(why) => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                format!(
+                    "this connection is out of step with its replies since a request on it \
+                     failed ({why}): reconnect"
+                ),
+            )),
         }
     }
 
@@ -828,6 +1189,7 @@ impl<S: Read + Write> Client<S> {
         Ok(Subscription {
             stream: self.stream,
             rx: RecvBuf::default(),
+            marked: false,
         })
     }
 }
@@ -836,14 +1198,181 @@ fn unexpected_response() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "unexpected response")
 }
 
-/// The error a response other than the one a request expects becomes: the broker's
-/// own refusal message, or a protocol violation.
+/// A reply payload as the response it carries — or, from a broker that speaks another
+/// protocol, the [`ProtocolMismatch`] it is. Asked FIRST, so a reply this build cannot
+/// decode for that reason is never reported as a garbled one.
+fn decode_reply(p: &[u8]) -> io::Result<Response> {
+    if let Some(broker) = foreign_protocol(p) {
+        return Err(ProtocolMismatch {
+            broker,
+            client: PROTO_VERSION,
+        }
+        .into());
+    }
+    decode_response(p).ok_or_else(unexpected_response)
+}
+
+/// The broker and this client speak DIFFERENT astream protocols (`PROTO_VERSION`s), so
+/// nothing either says can be decoded by the other: the broker's reply came stamped with
+/// another version — what an older broker's "malformed request" is — or was its
+/// [`ERR_PROTOCOL`] refusal, which names its version. The
+/// broker closes the connection after it, and the client is out of step for good.
+/// The remedy is the same astream release on both ends; no retry on this pair succeeds.
+///
+/// It reaches the caller inside an `io::Error` of kind `Unsupported` — the kind of a
+/// transport this build cannot speak, and for the same reason: two builds that do not
+/// match. Read it back with [`protocol_mismatch`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProtocolMismatch {
+    /// The protocol the broker speaks.
+    pub broker: u8,
+    /// The protocol this client speaks (this build's `PROTO_VERSION`).
+    pub client: u8,
+}
+
+impl std::fmt::Display for ProtocolMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "protocol mismatch: broker speaks astream protocol {}, this client {} (run the \
+             same astream release on both ends)",
+            self.broker, self.client
+        )
+    }
+}
+
+impl std::error::Error for ProtocolMismatch {}
+
+impl From<ProtocolMismatch> for io::Error {
+    /// `ErrorKind::Unsupported`, the mismatch inside.
+    fn from(m: ProtocolMismatch) -> io::Error {
+        io::Error::new(io::ErrorKind::Unsupported, m)
+    }
+}
+
+/// The protocol mismatch `e` carries, if it is one: `Some` exactly when a broker's reply
+/// said it speaks another astream protocol (see [`ProtocolMismatch`]).
+pub fn protocol_mismatch(e: &io::Error) -> Option<&ProtocolMismatch> {
+    e.get_ref()?.downcast_ref()
+}
+
+/// The error a response other than the one a stream expects becomes: the broker's
+/// own refusal ([`BrokerRefusal`]), or a protocol violation.
 fn refused(resp: Response) -> io::Error {
     match resp {
-        Response::Error { msg, .. } => io::Error::other(msg),
+        Response::Error { code, msg } => BrokerRefusal { code, msg }.into(),
         _ => unexpected_response(),
     }
 }
+
+/// A REFUSAL the broker sent — its `Response::Error` — as the client hands it back:
+/// inside the `io::Error` a refused request returns, with `ErrorKind::Other`. Read it
+/// back with [`broker_refusal`].
+///
+/// `code` is the refusal's class (the [`proto`](crate::proto) table of `ERR_*`
+/// codes); `msg` is the broker's words, and is the error's `Display`, so a caller
+/// that only prints or matches the message sees exactly what it always did.
+///
+/// A refusal is a whole reply: the client stays in step and the next request on the
+/// connection is answered normally. Every `ErrorKind::Other` the request/reply verbs
+/// return is one of these, except what a client decides for itself — the error a
+/// [`Client::last_walk`] callback returns, a walk past [`LAST_WALK_PAGES_MAX`] pages,
+/// [`Client::last_all`] past `u32::MAX` rows — which carries no refusal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrokerRefusal {
+    /// The `proto::ERR_*` class.
+    pub code: u8,
+    /// The broker's message.
+    pub msg: String,
+}
+
+impl BrokerRefusal {
+    /// Whether the SAME request, resent unchanged on the same connection, is refused
+    /// again — a record that can never land, a read the grants never cover — so a
+    /// caller retrying it would loop: [`ERR_BAD_SUBJECT`], [`ERR_BAD_FILTER`],
+    /// [`ERR_RECORD_REFUSED`], [`ERR_UNAUTHORIZED`], [`ERR_PROTOCOL`] (which this
+    /// client reads as a [`ProtocolMismatch`] when the refusal names the broker's
+    /// version).
+    ///
+    /// `false` is NOT "will succeed": it is every other code, [`ERR_REFUSED`] above
+    /// all — a write that failed to append or commit, a quorum not reached — then
+    /// [`ERR_SUBJECT_BOUND`] (see [`is_subject_bound`](Self::is_subject_bound)), and
+    /// every code this client does not know. A broker older than the permanent codes
+    /// answered every refusal but 2, 3 and 6 with `ERR_REFUSED`, so against it this is
+    /// `false` for a permanent refusal too: the fail-safe reading, under which a
+    /// caller retries rather than drops.
+    pub fn is_permanent(&self) -> bool {
+        matches!(
+            self.code,
+            ERR_BAD_SUBJECT | ERR_BAD_FILTER | ERR_RECORD_REFUSED | ERR_UNAUTHORIZED | ERR_PROTOCOL
+        )
+    }
+
+    /// Whether the producer is at its DISTINCT-SUBJECT BUDGET and the request named a
+    /// subject new to the index ([`ERR_SUBJECT_BOUND`]): nothing was appended.
+    ///
+    /// Not [`is_permanent`](Self::is_permanent): the identical request lands once
+    /// another producer introduces the subject (an update spends nothing) or the
+    /// producer's own count falls. Whether to wait for that is the PRODUCER's
+    /// question, because only it knows who else writes the subject: a producer that
+    /// alone writes it — its own lanes — can retire the record for good, and one that
+    /// shares it can hold the record. [`Client::subject_budget`] reads the count.
+    ///
+    /// `false` against a broker that predates the code, which sends [`ERR_REFUSED`]
+    /// for this refusal: the fail-safe reading, under which a caller retries.
+    pub fn is_subject_bound(&self) -> bool {
+        self.code == ERR_SUBJECT_BOUND
+    }
+
+    /// Whether the refusal is an EXPIRED capability: [`ERR_UNAUTHORIZED`] whose
+    /// message starts [`CAP_EXPIRED_PREFIX`]. The broker sends that refusal for a
+    /// genuine grant whose `exp=` has passed, whether at the `Attach`, on a request
+    /// every covering grant has lapsed for, or when a stream ends at its grants'
+    /// deadline. Its remedy is to mint the same grant again with a later `exp=`.
+    ///
+    /// `false` is every other refusal, every other code-8 one included: a proof that
+    /// does not verify (a forged or tampered grant, or one minted under another
+    /// secret), a request no attached grant ever covered, a full keyring, a producer
+    /// id bound elsewhere, and a connection that stayed unattached too long. Neither
+    /// half alone is enough. The words under another code are not an expiry, and code
+    /// 8 under other words is not one either.
+    ///
+    /// Against a broker that predates [`CAP_EXPIRED_PREFIX`], this is `true` for an
+    /// expired attach and for a stream ended at its deadline. It is `false` for a
+    /// lone request whose grants lapsed, which such a broker refused as "does not
+    /// grant".
+    pub fn is_expired(&self) -> bool {
+        self.code == ERR_UNAUTHORIZED && self.msg.starts_with(CAP_EXPIRED_PREFIX)
+    }
+}
+
+impl std::fmt::Display for BrokerRefusal {
+    /// The broker's message, exactly.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.msg)
+    }
+}
+
+impl std::error::Error for BrokerRefusal {}
+
+impl From<BrokerRefusal> for io::Error {
+    /// `ErrorKind::Other`, the refusal inside.
+    fn from(r: BrokerRefusal) -> io::Error {
+        io::Error::other(r)
+    }
+}
+
+/// The broker refusal `e` carries, if it is one: `Some` exactly when a request was
+/// answered with the broker's `Response::Error` (see [`BrokerRefusal`]). A transport
+/// failure, a client-side bound and an out-of-step client are `None`.
+pub fn broker_refusal(e: &io::Error) -> Option<&BrokerRefusal> {
+    e.get_ref()?.downcast_ref()
+}
+
+/// How long [`take`] must have WAITED for a `Mark` to read it as the broker saying
+/// "idle, now" rather than as one already queued on the socket. Under the broker's
+/// liveness poll (200 ms), which is the closest two idle marks can come.
+const IDLE_STOP_WAIT: Duration = Duration::from_millis(100);
 
 /// Take at most `max` records from a group subscription WITHOUT committing anything.
 ///
@@ -859,6 +1388,16 @@ fn refused(resp: Response) -> io::Error {
 /// with [`Subscription::get_ref`]), or this parks in the read until the broker sends
 /// something.
 ///
+/// It also stops when the broker says the subscription is IDLE: a caught-up tail is
+/// sent a `Mark` after every [`IDLE_MARK`](crate::broker::IDLE_MARK) with nothing to
+/// deliver, and each one is a read that returned, so without this stop a window
+/// longer than the broker's interval would never time out. The stop is on a mark
+/// this take WAITED for (100 ms or longer). A mark that was already queued — the one
+/// the tail sends as it first catches up, or marks that piled up while nobody was
+/// taking — says nothing about now, and is passed over. So against a broker that
+/// marks, a take parks for at most about two idle intervals; against one that does
+/// not, it is exactly the read timeout.
+///
 /// The idle stop is frame-atomic: a timeout that lands part-way through a record
 /// keeps that record's bytes on the subscription and resumes it on the next call
 /// (see [`Subscription::recv_event`]), so the same `sub` can be taken from again.
@@ -867,8 +1406,22 @@ fn refused(resp: Response) -> io::Error {
 pub fn take<S: Read + Write>(sub: &mut Subscription<S>, max: usize) -> io::Result<Vec<Record>> {
     let mut out = Vec::with_capacity(max.min(64));
     while out.len() < max {
-        match sub.recv() {
-            Ok(Some(rec)) => out.push(rec),
+        let caught_up_before = sub.marked;
+        let asked = Instant::now();
+        match sub.recv_event() {
+            Ok(Some(Event::Delivery {
+                offset,
+                subject,
+                body,
+            })) => out.push((offset, subject, body)),
+            // An idle mark this take waited for: nothing more right now.
+            Ok(Some(Event::Mark { .. }))
+                if caught_up_before && asked.elapsed() >= IDLE_STOP_WAIT =>
+            {
+                break
+            }
+            // The catch-up mark, or one already queued: more may follow at once.
+            Ok(Some(Event::Mark { .. })) => {}
             Ok(None) => break, // the broker closed
             Err(e)
                 if matches!(
@@ -979,6 +1532,8 @@ pub struct Subscription<S = UnixStream> {
     stream: S,
     /// What has been read off `stream` and not yet returned; see [`RecvBuf`].
     rx: RecvBuf,
+    /// Whether a `Mark` has come down this stream yet (see [`take`]).
+    marked: bool,
 }
 
 /// A live delivery stream from the broker (Windows twin: TCP default, as above).
@@ -987,6 +1542,8 @@ pub struct Subscription<S = TcpStream> {
     stream: S,
     /// What has been read off `stream` and not yet returned; see [`RecvBuf`].
     rx: RecvBuf,
+    /// Whether a `Mark` has come down this stream yet (see [`take`]).
+    marked: bool,
 }
 
 #[cfg(unix)]
@@ -1012,9 +1569,17 @@ impl Subscription<UnixStream> {
 /// comes from a TCP or sealed subscription and from [`connect`].
 pub type SubscriptionCloser = Closer;
 
-/// What a subscription can carry: a record, or the `Mark` that closes a bounded
-/// read. [`Subscription::recv`] keeps its signature and SKIPS marks; a caller that
-/// needs the cursor reads [`recv_event`](Subscription::recv_event) instead.
+/// What a subscription can carry: a record, or a `Mark`. [`Subscription::recv`] keeps
+/// its signature and SKIPS marks; a caller that needs the cursor reads
+/// [`recv_event`](Subscription::recv_event) instead, and
+/// [`recv_live`](Subscription::recv_live) turns them into liveness.
+///
+/// On a `ForkSubscribe` stream the one `Mark` closes the snapshot. On a `Subscribe` or
+/// `SubscribeGroup` stream that negotiated idle marks a `Mark` is the broker saying
+/// it is there with nothing to deliver: once when the tail first CATCHES UP, then
+/// again after each [`IDLE_MARK`](crate::broker::IDLE_MARK) with nothing written —
+/// so a live idle subscription is never silent for long, and a silent one is a link
+/// that has died.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     /// One delivered record: `(offset, subject, body)`.
@@ -1023,8 +1588,8 @@ pub enum Event {
         subject: String,
         body: Vec<u8>,
     },
-    /// The end of a bounded read: resume from `next`; `head` is the
-    /// subscriber-visible head the answer was read with.
+    /// Resume from `next`; `head` is the subscriber-visible head the broker read
+    /// with — the end of a bounded read, or a tail that is caught up or idle.
     Mark { next: u64, head: u64 },
 }
 
@@ -1091,9 +1656,10 @@ impl RecvBuf {
                 Ok(0) => {
                     let partial = self.end - self.start;
                     self.reset();
-                    // As `proto::read_frame`: a close inside a header is a close, one
-                    // inside a payload is a frame cut short.
-                    return if partial < HEADER_SIZE {
+                    // As `proto::read_frame`: only a close with NOTHING of the next
+                    // frame read is a close; once any byte of it — a header byte
+                    // included — has arrived, the frame was cut short.
+                    return if partial == 0 {
                         Ok(None)
                     } else {
                         Err(io::Error::new(
@@ -1174,7 +1740,7 @@ impl<S: Read + Write> Subscription<S> {
         let Some(p) = self.rx.next_frame(&mut self.stream)? else {
             return Ok(None);
         };
-        match decode_response(&p).ok_or_else(unexpected_response)? {
+        match decode_reply(&p)? {
             Response::Delivery {
                 offset,
                 subject,
@@ -1184,8 +1750,49 @@ impl<S: Read + Write> Subscription<S> {
                 subject,
                 body,
             })),
-            Response::Mark { next, head, .. } => Ok(Some(Event::Mark { next, head })),
+            Response::Mark { next, head, .. } => {
+                self.marked = true;
+                Ok(Some(Event::Mark { next, head }))
+            }
             other => Err(refused(other)),
+        }
+    }
+
+    /// [`recv`](Self::recv) that turns a DEAD LINK into an error instead of silence:
+    /// the first `Mark` this subscription reads arms a read `deadline` on its socket
+    /// through `closer` (the [`Closer`] from [`connect`], or this subscription's own
+    /// `closer()`), and from then on `deadline` with no byte arriving fails the call
+    /// `WouldBlock`/`TimedOut`. Every `Mark` re-arms it.
+    ///
+    /// A `Subscribe`/`SubscribeGroup` tail is sent a `Mark` when it catches up and
+    /// after every [`IDLE_MARK`](crate::broker::IDLE_MARK) with nothing to deliver, so a
+    /// healthy idle subscription keeps answering the deadline, and one whose peer
+    /// vanished without a FIN — power loss, a NAT or Wi-Fi change, a frozen relay —
+    /// times out instead of parking for good. Pass a deadline a few idle intervals
+    /// long ([`IDLE_MARK_DEADLINE`](crate::broker::IDLE_MARK_DEADLINE)).
+    ///
+    /// ARMING ON A MARK IS THE VERSION CHECK. A broker that predates idle marks never
+    /// marks a tail, so the deadline is never armed and this is exactly `recv` — no
+    /// timeouts against a long-lived older broker. The other side of that: until the
+    /// first `Mark` (a backlog still being delivered) the subscription is unbounded.
+    ///
+    /// A timeout leaves any partial frame resumable (see
+    /// [`recv_event`](Self::recv_event)), but a caller that set this deadline means
+    /// "the link is gone": drop the subscription and resubscribe.
+    ///
+    /// # Errors
+    /// As `recv`; the timeout above; the `setsockopt` that arms it.
+    pub fn recv_live(&mut self, closer: &Closer, deadline: Duration) -> io::Result<Option<Record>> {
+        loop {
+            match self.recv_event()? {
+                None => return Ok(None),
+                Some(Event::Mark { .. }) => closer.set_read_timeout(Some(deadline))?,
+                Some(Event::Delivery {
+                    offset,
+                    subject,
+                    body,
+                }) => return Ok(Some((offset, subject, body))),
+            }
         }
     }
 }
@@ -1372,8 +1979,9 @@ impl Closer {
     /// keeps its partial record, so [`take`] / [`drain`] can stop and come back. On a
     /// request/reply CLIENT it is a deadline and nothing more: a request that timed out
     /// may still be answered late, so the connection is no longer in step with its
-    /// replies — drop it and reconnect; do not retry on it. That is what turns a broker
-    /// that accepts and never answers from a caller parked forever into an error.
+    /// replies, and the client says so — every later request on it fails `BrokenPipe`
+    /// without being sent (see [`Client`]). Reconnect. That is what turns a broker that
+    /// accepts and never answers from a caller parked forever into an error.
     ///
     /// # Errors
     /// The `setsockopt`; a zero duration is `InvalidInput` (std's own refusal).
@@ -1388,7 +1996,7 @@ impl Closer {
     /// Bound how long a write on this connection parks on a full send buffer (a broker
     /// that stopped reading): `SO_SNDTIMEO` on the socket, `None` clears it. A write
     /// that times out may have sent PART of a frame, so the connection is no longer
-    /// framed: drop it, do not retry on it.
+    /// framed: a client refuses every later request on it (`BrokenPipe`); reconnect.
     ///
     /// # Errors
     /// The `setsockopt`; a zero duration is `InvalidInput` (std's own refusal).
@@ -1547,6 +2155,7 @@ fn connect_handshake(
 #[cfg(test)]
 mod tests {
     use super::{RecvBuf, READ_CHUNK};
+    use crate::proto::read_frame;
     use astream_wire::{Frame, HEADER_SIZE, MAX_PAYLOAD_LEN};
     use std::io::{self, Read};
 
@@ -1620,20 +2229,131 @@ mod tests {
         }
     }
 
-    /// A close inside a header is a close; inside a payload it is a frame cut short.
+    /// A stream cut at EVERY byte of a frame is classified as `proto::read_frame`
+    /// classifies it: only a cut before the first byte is a close (`Ok(None)`); a cut
+    /// after any of its bytes — inside the header as well as inside the payload — is
+    /// a frame cut short (`UnexpectedEof`).
     #[test]
     fn a_close_mid_frame_is_classified_like_read_frame() {
         let bytes = framed(&[b"payload".to_vec()]);
-        for (cut, clean) in [(0, true), (HEADER_SIZE - 1, true), (HEADER_SIZE + 3, false)] {
+        for cut in 0..bytes.len() {
             let mut s = Scripted::new(bytes[..cut].to_vec(), vec![Some(usize::MAX)]);
-            match RecvBuf::default().next_frame(&mut s) {
-                Ok(None) => assert!(clean, "cut at {cut}"),
-                Err(e) => {
-                    assert!(!clean, "cut at {cut}: {e}");
-                    assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof);
-                }
-                Ok(Some(p)) => panic!("cut at {cut} produced a frame: {p:?}"),
+            let ours = RecvBuf::default().next_frame(&mut s).map_err(|e| e.kind());
+            let theirs = read_frame(&mut &bytes[..cut]).map_err(|e| e.kind());
+            assert_eq!(ours, theirs, "cut at {cut}");
+            let expected = if cut == 0 {
+                Ok(None)
+            } else {
+                Err(io::ErrorKind::UnexpectedEof)
+            };
+            assert_eq!(
+                ours, expected,
+                "cut at {cut} (header is {HEADER_SIZE} bytes)"
+            );
+        }
+    }
+
+    /// A broker that answers `Hello` with a nonce, and holds every `Attach`
+    /// acknowledgement back until `ring` of them have arrived — reading earlier gets
+    /// `WouldBlock`, as a socket whose peer has not answered yet would.
+    #[cfg(feature = "cap")]
+    struct RingBroker {
+        written: Vec<u8>,
+        ring: usize,
+        nonce: [u8; 32],
+        pending: Vec<u8>,
+        answered: usize,
+    }
+
+    #[cfg(feature = "cap")]
+    impl RingBroker {
+        fn requests(&self) -> Vec<crate::proto::Request> {
+            let mut at = &self.written[..];
+            let mut out = Vec::new();
+            while let Some(p) = read_frame(&mut at).unwrap() {
+                out.push(crate::proto::decode_request(&p).unwrap());
             }
+            out
+        }
+    }
+
+    #[cfg(feature = "cap")]
+    impl io::Write for RingBroker {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "cap")]
+    impl Read for RingBroker {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            use crate::proto::{encode_response, Request, Response};
+            if self.pending.is_empty() {
+                let reqs = self.requests();
+                let reply = |r: &Response| Frame::new(encode_response(r)).encode().unwrap();
+                if self.answered == 0 && reqs == [Request::Hello] {
+                    self.pending = reply(&Response::Nonce {
+                        log: None,
+                        nonce: self.nonce.to_vec(),
+                    });
+                } else if self.answered == 1 && reqs.len() == 1 + self.ring {
+                    for _ in 0..self.ring {
+                        self.pending.extend(reply(&Response::Mark {
+                            next: 3,
+                            head: 3,
+                            resume: String::new(),
+                        }));
+                    }
+                } else {
+                    return Err(io::Error::new(io::ErrorKind::WouldBlock, "not yet"));
+                }
+                self.answered += 1;
+            }
+            let n = self.pending.len().min(buf.len());
+            buf[..n].copy_from_slice(&self.pending[..n]);
+            self.pending.drain(..n);
+            Ok(n)
+        }
+    }
+
+    /// `attach_all` sends ONE `Hello` and then every `Attach` before it reads an
+    /// acknowledgement — each proof over that one nonce — so a ring costs two round
+    /// trips. A client that waited for each acknowledgement (or said `Hello` per
+    /// grant, as `attach` once did) reads before the broker answers and fails here.
+    #[cfg(feature = "cap")]
+    #[test]
+    fn attach_all_pipelines_a_ring_under_one_hello() {
+        use crate::proto::Request;
+        let tags = [[1u8; 32], [2u8; 32], [3u8; 32]];
+        let grants = ["ro:/a/>", "ro:/b/>", "rw:/c/>"];
+        let mut c = super::Client::from_stream(RingBroker {
+            written: Vec::new(),
+            ring: grants.len(),
+            nonce: [9u8; 32],
+            pending: Vec::new(),
+            answered: 0,
+        });
+        let mark = c
+            .attach_all(grants.iter().zip(&tags).map(|(g, t)| (*g, &t[..])))
+            .unwrap();
+        assert_eq!(mark, Some((3, 3)));
+        let wire = c.into_stream();
+        let reqs = wire.requests();
+        assert_eq!(reqs[0], Request::Hello);
+        assert_eq!(reqs.len(), 1 + grants.len(), "one Hello for the whole ring");
+        for ((req, grant), tag) in reqs[1..].iter().zip(grants).zip(&tags) {
+            let proof = astream_cap::attach_proof(tag, &[9u8; 32], grant);
+            assert_eq!(
+                req,
+                &Request::Attach {
+                    grant: grant.to_string(),
+                    proof: proof.to_vec(),
+                }
+            );
         }
     }
 

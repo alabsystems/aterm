@@ -4,8 +4,8 @@
 //! Keyboard-song A/B bench: a delete that poofs, a spacebar that is a low
 //! musical downbeat, and typing that reads as a pleasant song over long
 //! sessions. It types real prose (every space a [`SoundKind::Space`], every
-//! newline a [`SoundKind::Jump`]) at realistic rates, with the edit and
-//! whitespace corner cases spelled out (owner, 2026-08-26).
+//! newline a [`SoundKind::Jump`]) at realistic rates, plus the edit and
+//! whitespace corner cases.
 //!
 //!   targo --unverified run --release -p aterm-effects \
 //!       --example keyboard_song_ab -- <out_dir> \
@@ -14,35 +14,30 @@
 //!       [--timbre plain|bloom|hue|room] [--jitterfix ship|j0|j1] [--metronome]
 //!       [--census] [--probes] [--scripts] [--text "<s>"]
 //!
-//! `--scripts` renders the listening reel's fixed scripts ([`SCRIPTS`]) and
-//! `--text "<s>"` one line of the caller's own, both through the product's key
-//! path (a bare Shift ahead of every shifted run, Return as
-//! [`SoundKind::Enter`]), writing one TSV row per take.
+//! - `--scripts` renders the listening reel's fixed scripts ([`SCRIPTS`]) and
+//!   `--text "<s>"` one line of the caller's own, through the product's key path
+//!   (a bare Shift ahead of every shifted run, Return as [`SoundKind::Enter`]),
+//!   one TSV row per take.
+//! - `--metronome` types the prose scene with no rests, as the census does, so a
+//!   WAV pair at two rates makes tempo invariance audible.
+//! - `--census` sweeps 3-14 cps, clean and at ±25 % jitter, over several
+//!   corpora, reporting keys, steps, distinct-pitch %, melody notes/s, silent
+//!   keys and a hash of the degree sequence, read off the engine's own
+//!   [`aterm_effects::trail_sound::MelodyV2`] hooks. No WAVs.
 //!
-//! `--metronome` types the prose scene as a strict metronome (no rests), as
-//! the census does, so a WAV pair at two rates makes tempo invariance audible.
-//!
-//! Every cue goes through [`TrailSynth::push_meta`] with its scripted press
-//! time, so the melody runs on the shipping clock (bare `push` would fall back
-//! to the 512-frame block clock).
-//!
-//! Every WAV is stereo: left is the synth, right a 2 ms 2 kHz tick at each
-//! key's press time (−20 dBFS). The music channel carries [`PRE_ROLL_FRAMES`]
-//! of leading silence (the host's queue depth), so the file shows the real
-//! finger-to-note offset.
-//!
-//! `--census` sweeps 3-14 cps, clean and at ±25 % jitter, over several
-//! corpora, reporting keys, steps, distinct-pitch %, melody notes/s, silent
-//! keys and a hash of the degree sequence, read off the engine's own
-//! [`aterm_effects::trail_sound::MelodyV2`] hooks.
+//! Every cue goes through [`TrailSynth::push_meta`] with its scripted press time,
+//! so the melody runs on the shipping clock (bare `push` falls back to the
+//! 512-frame block clock). Every WAV is stereo: left the synth, right a 2 ms
+//! 2 kHz tick at each key's press time (−20 dBFS). The music channel leads with
+//! [`PRE_ROLL_FRAMES`] of silence (the host's queue depth), so the file shows the
+//! real finger-to-note offset.
 //!
 //! Each scenario renders at the host default volume (0.4) and 1.0 with no
-//! normalisation, so A/B sides share gain staging. Filenames are
-//! `<tag>-<scenario>-v<volume>.wav`. Reported per scenario: pitched onsets/s,
-//! pre-clip peak (the soft clipper is inverted), post-clip peak, RMS, crest,
-//! max live voices, voice steals and realtime factor, plus a gesture probe
-//! table (Typed / Space / Backspace / Shift / Land from one settled melody
-//! state) with spectral centroid, high-band fraction, tonality and peak.
+//! normalisation; files are `<tag>-<scenario>-v<volume>.wav`. Reported per
+//! scenario: pitched onsets/s, pre-clip peak (the soft clipper inverted),
+//! post-clip peak, RMS, crest, max live voices, voice steals and realtime factor,
+//! plus a gesture probe table ([`PROBES`], each from one settled melody state)
+//! with spectral centroid, high-band fractions, tonality, peak and onset counts.
 
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -116,11 +111,11 @@ impl Cue {
             rank: aterm_effects::trail_sound::typed_glyph_rank(
                 (self.ch != '\0').then_some(self.ch),
             ),
-            // The keyed seam has no travel: a keystroke's origin IS its
-            // column. Only the meteor reads this.
+            // The keyed seam has no travel: a keystroke's origin is its column.
+            // Only the meteor reads this.
             pan_from: 0.0,
-            // The bench renders on its own grid: cues land ON a block
-            // boundary by construction, so there is no pre-roll to hand over.
+            // The bench spawns each cue at its own frame (`BlockFix::spawn_frame`),
+            // so there is no pre-roll to hand over.
             block_lead_s: 0.0,
             // Flow heat: a scripted take has no hand, so it plays the cold box
             // (0.0 is the identity).
@@ -130,8 +125,7 @@ impl Cue {
 }
 
 /// [`Cue::ch`] for a key typed at a no-echo prompt: the bench's spelling of the
-/// host's `SECRET` stamp, in the private-use area so no script can type it
-/// (owner, 2026-09-27).
+/// host's `SECRET` stamp, in the private-use area so no script can type it.
 const SECRET_CH: char = '\u{E000}';
 
 /// The glyphs a US layout cannot produce without Shift.
@@ -184,8 +178,7 @@ impl Hand {
         }
     }
 
-    /// A steady metronome — what every scenario used before the flags landed,
-    /// so the shipped scripts render exactly as they did.
+    /// A steady metronome (no jitter, the default seed).
     fn steady(cps: f32) -> Self {
         Self::new(cps, 0.0, SEED)
     }
@@ -291,9 +284,9 @@ fn type_metronome(cues: &mut Vec<Cue>, t0: f32, hand: &mut Hand, text: &str, hea
     t
 }
 
-/// 60 s of realistic prose at 10 cps with a typist's pauses, looping the
-/// corpus. `metronome` drops every rest, so the take's first 403 keys are the
-/// census's `prose` row for that rate.
+/// 60 s of prose at `cps` with a typist's pauses, looping the corpus.
+/// `metronome` drops every rest, so the take's first pass (403 typed keys) is
+/// the census's `prose` row at that rate.
 fn scenario_prose(cps: f32, jitter: f32, seed: u32, metronome: bool) -> Scenario {
     let mut cues = Vec::new();
     let mut hand = Hand::new(cps, jitter, seed);
@@ -366,7 +359,7 @@ fn scenario_edit() -> Scenario {
         t += 0.09;
     }
     t += 0.9;
-    // HELD backspace: 30 per second for a second.
+    // A held Backspace: 30 per second for a second.
     for _ in 0..30 {
         push(&mut cues, t, SoundKind::Backspace, 0.2, '\0');
         t += 1.0 / 30.0;
@@ -439,7 +432,6 @@ fn scenario_shift() -> Scenario {
 }
 
 /// The rotation scenario: does a repeated Shift or Space rotate its tone?
-/// (owner, 2026-08-31)
 ///
 /// - A. Twenty bare [`SoundKind::Shift`] presses 0.45 s apart, alone and
 ///   centred, so the melody never steps and any pitch variety is the ting's
@@ -479,8 +471,8 @@ fn scenario_rotate() -> Scenario {
     }
 }
 
-/// A 20 cps BURST — twice the sustained rate the governor is tuned for, six
-/// seconds of it, with spaces at real word cadence.
+/// A 20 cps burst, twice the sustained rate the governor is tuned for, for six
+/// seconds, with spaces at real word cadence.
 fn scenario_burst() -> Scenario {
     /// The letters the burst is made of: real text, cycled, spaces removed
     /// (the script cues its own on the sixth key), so each key is its own note.
@@ -534,14 +526,14 @@ fn scenario_pathological() -> Scenario {
     // A held letter at auto-repeat speed, thirty times.
     t = type_metronome(&mut cues, t, hand, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 0.6);
     t += 0.7;
-    // DIGITS, which the glyph class separates from letters.
+    // Digits, which the glyph class separates from letters.
     t = type_metronome(&mut cues, t, hand, "0123456789 0123456789", 0.6);
     t += 0.7;
     // The hero glyph, four times, alone.
     t = type_metronome(&mut cues, t, hand, "!!!!", 0.6);
     t += 0.7;
-    // A BASE64 BLOB: capitals, digits and punctuation with no word shape at
-    // all, so the Shift path fires at random and no boundary ever arrives.
+    // A base64 blob: capitals, digits and punctuation with no word shape, so the
+    // Shift path fires at random and no boundary ever arrives.
     t = type_metronome(
         &mut cues,
         t,
@@ -550,8 +542,8 @@ fn scenario_pathological() -> Scenario {
         0.6,
     );
     t += 0.7;
-    // ONE WORD, over and over: the repetition case a pattern-derived melody
-    // must not turn into a drone.
+    // One word, over and over: the repetition a pattern-derived melody must not
+    // turn into a drone.
     t = type_metronome(&mut cues, t, hand, "the the the the the the the the ", 0.6);
     t += 0.7;
     // The same text slow, so both ends of the speed range are covered.
@@ -755,10 +747,10 @@ fn script_shift_space(name: String) -> ScriptTake {
 }
 
 /// `password`: a `sudo` line, a password typed at its no-echo prompt, the
-/// Return, and a line after it. The password is what the host sends: every
-/// key a `Typed` cue stamped `SECRET` (the space too), unshifted, at one pan,
-/// with no bare Shift. The following line should sound as if the password
-/// had never been typed (owner, 2026-09-27).
+/// Return, and a line after it. The password is what the host sends: every key
+/// a `Typed` cue stamped `SECRET` (the space too), unshifted, at one pan, with
+/// no bare Shift. The following line should sound as if the password had never
+/// been typed.
 const PASSWORD_BEFORE: &str = "sudo make install\n";
 const PASSWORD: &str = "Correct Horse 42!";
 const PASSWORD_AFTER: &str = "done, it built.\n";
@@ -867,8 +859,8 @@ fn script_reel(
                 let peak = seg.iter().fold(0.0f32, |m, v| m.max(v.abs()));
                 let rms_v = rms(seg);
                 let bands = spectrum_bands(&r.mono, from, to);
-                // THE CREST: the loudest sample inside any ting + word-head
-                // capital window, on the shipping bus (spec F16).
+                // The crest: the loudest sample inside any ting + word-head
+                // capital window, on the shipping bus.
                 let crest = take
                     .crest_windows
                     .iter()
@@ -922,28 +914,27 @@ struct Rendered {
     max_voices: usize,
     steals: u32,
     render_s: f64,
-    /// The degree the line sounded on every typed key, read off
-    /// `MelodyV2::walk` during the render. A siren (a ramp that never turns, a
-    /// register walked out of, one degree sat on) is a property of the
-    /// sequence, which no spectral column can refute, so it is judged here.
+    /// The degree the line sounded on every typed key (`MelodyV2::walk`). A
+    /// siren is a property of the sequence that no spectral column can refute;
+    /// [`siren_verdict`] judges it.
     degrees: Vec<i8>,
 }
 
 /// Where a cue's voice is allowed to start, relative to the key. The host
-/// renders whole 512-frame blocks and applies queued cues at block
-/// boundaries, so a mid-block key starts 0–10.7 ms late, a jitter
-/// uncorrelated with the melody's clock.
+/// renders whole 512-frame blocks, so a cue applied at the next block boundary
+/// starts 0–10.7 ms late, a jitter uncorrelated with the melody's clock.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum BlockFix {
-    /// TODAY. The cue is applied at the first block boundary at or after its
-    /// press time: 0–10.7 ms late, and a different amount every key.
+    /// The block clock with no lead (`--jitterfix ship`): the cue is applied at
+    /// the first block boundary at or after its press, 0–10.7 ms late, a
+    /// different amount every key.
     Ship,
     /// Zero added latency: the onset lands on the key's own sample. The bench
     /// splits the render at the cue's frame, the best case; a host j0 would
     /// also truncate up to 10.7 ms off the mallet's head.
     J0,
-    /// A constant +10.7 ms with the mallet intact: every onset exactly one
-    /// block late, so the jitter is zero.
+    /// What ships (the host's `EventMeta::block_lead_s`): a constant +10.7 ms
+    /// with the mallet intact, every onset exactly one block late, zero jitter.
     J1,
 }
 
@@ -961,7 +952,7 @@ impl BlockFix {
     fn spawn_frame(self, t: f32) -> usize {
         let exact = (f64::from(t) * f64::from(SR)).max(0.0) as usize;
         match self {
-            // Round UP to the block boundary: the block containing the cue is
+            // Round up to the block boundary: the block containing the cue is
             // already being filled when the cue arrives.
             Self::Ship => exact.div_ceil(BLOCK) * BLOCK,
             Self::J0 => exact,
@@ -1060,9 +1051,8 @@ fn render(
             }
             cue_i += 1;
         }
-        // Render to the next event or 512-frame boundary. Under
-        // `BlockFix::Ship` every spawn frame is a boundary; only the two
-        // repairs split a block.
+        // Render to the next event or 512-frame boundary. Under `BlockFix::Ship`
+        // every spawn frame is a boundary; only J0 and J1 split a block.
         let next_block = (f / BLOCK + 1) * BLOCK;
         let next_cue = spawn.get(cue_i).copied().unwrap_or(usize::MAX);
         let to = frames.min(next_block).min(next_cue);
@@ -1089,7 +1079,7 @@ fn render(
 
 /// Invert the synth's output saturator so the reported peak is what the mix
 /// asked for. `soft_clip(x) = x·(27+x²)/(27+9x²)`, clamped to ±0.98, is
-/// strictly increasing where unclamped, so three Newton steps converge.
+/// strictly increasing where unclamped, so Newton's method converges.
 fn pre_clip(y: f32) -> f32 {
     let s = y.signum();
     let y = y.abs();
@@ -1123,7 +1113,7 @@ fn rms(x: &[f32]) -> f64 {
     (x.iter().map(|&v| f64::from(v) * f64::from(v)).sum::<f64>() / x.len().max(1) as f64).sqrt()
 }
 
-// -- FFT (radix-2 DIT, hand-rolled — no dependency) --------------------------
+// -- FFT (radix-2 DIT, hand-rolled) -------------------------------------------
 
 fn fft(re: &mut [f32], im: &mut [f32]) {
     let n = re.len();
@@ -1211,16 +1201,13 @@ const SCENE_ONSET: (usize, f32) = (35, 1.35);
 /// behind a key.
 ///
 /// A capital (Shift's ting, then the letter 60 ms on) is judged on the scene
-/// census instead: the ting rings through the strike, and two lattice
-/// partials a consonant interval apart ripple the summed envelope at their
-/// difference frequency, which this detector's 2.67 ms window counts as
-/// extra rises. The exact statements are the unit pins
-/// `a_capital_is_one_strike_with_a_lifted_degree_and_one_ring` and
-/// `a_bare_shift_is_a_ting_that_never_steps`.
-///
-/// Valid only above the bass: the 2.7 ms window rides the waveform of the
-/// bass dyad under a Space or a Kill (65-130 Hz), so it is taken only on rows
-/// [`Probe::census`] marks.
+/// census instead: the ting rings through the strike, and two lattice partials a
+/// consonant interval apart ripple the summed envelope at their difference
+/// frequency, which this detector's 2.67 ms window counts as extra rises (the
+/// unit pins are `a_capital_is_one_strike_with_a_lifted_degree_and_one_ring` and
+/// `a_bare_shift_is_a_ting_that_never_steps`). It is also blind under the bass:
+/// the window rides the waveform of the bass dyad under a Space or a Kill
+/// (65-130 Hz), so it is taken only on rows [`Probe::census`] marks.
 const FINE_ONSET: (usize, f32) = (10, 1.12);
 
 /// Onset frames by rise detection, not threshold crossing: at 10 cps the
@@ -1294,11 +1281,11 @@ struct Bands {
     hi2: f64,
     /// Energy share over 6 kHz, the "harsh" band.
     hi6: f64,
-    /// 2.8–5.6 kHz, the ear's most sensitive octave (spec F13).
+    /// 2.8–5.6 kHz, the ear's most sensitive octave.
     presence: f64,
 }
 
-/// The 2.8–5.6 kHz octave F13 is stated on.
+/// The 2.8–5.6 kHz presence octave.
 const PRESENCE_BAND_HZ: (f64, f64) = (2800.0, 5600.0);
 
 /// Spectral centroid and the band shares, over `from..to`.
@@ -1311,8 +1298,8 @@ fn spectrum_bands(x: &[f32], from: usize, to: usize) -> Bands {
         for (k, &m) in mag_at(x, s).iter().enumerate() {
             let e = f64::from(m) * f64::from(m);
             let hz = k as f64 * hz_per_bin;
-            // The original operand order, so the centroid column is the
-            // number it always was.
+            // Not `e * hz`: this order keeps the centroid column comparable, bit
+            // for bit, with earlier takes.
             num += e * k as f64 * hz_per_bin;
             den += e;
             if hz > 2000.0 {
@@ -1350,8 +1337,8 @@ fn spectrum(x: &[f32], from: usize, to: usize) -> (f64, f64) {
     (b.centroid_hz, b.hi2)
 }
 
-/// A band's own LEVEL in dB: the span's RMS scaled by the band's energy
-/// share. Absolute, so a BEFORE reading and an AFTER reading compare.
+/// A band's own level in dB: the span's RMS scaled by the band's energy share.
+/// Absolute, so a before and an after reading compare.
 fn band_db(rms_v: f64, share: f64) -> f64 {
     db(rms_v * share.max(0.0).sqrt())
 }
@@ -1409,8 +1396,8 @@ fn analyze(name: &str, volume: f32, r: &Rendered, window: (f32, f32)) -> Row {
     let pre = seg.iter().fold(0.0f32, |m, &v| m.max(pre_clip(v).abs()));
     let rms_v = rms(seg);
     let (centroid, _) = spectrum(&r.mono, from, to);
-    // The melodic SPAN: the extremes of the pitched onsets. Percussive
-    // outliers cannot enter — `notes` is already tonality-gated.
+    // The melodic span: the extremes of the pitched onsets (`notes` is already
+    // tonality-gated, so percussive outliers cannot enter).
     let (lo, hi) = notes
         .iter()
         .filter(|&&f| f > 0.0)
@@ -1527,32 +1514,28 @@ const PROBE_WALK_SETTLES: [usize; 4] = [PROBE_SETTLE, 6, 9, 12];
 /// One gesture's takes: its row, and the four monos the row was scored on.
 struct Take {
     row: ProbeRow,
-    /// The SHIPPING BUS, `with` the gesture and `without` it — the reel, and
-    /// the level and spectrum columns.
+    /// The shipping bus, `with` the gesture and `without` it: the reel, and the
+    /// level and spectrum columns.
     bus_with: Vec<f32>,
     bus_alone: Vec<f32>,
-    /// The same two takes with §9.7's bus limiter out of circuit — the ONSET
+    /// The same two takes with §9.7's bus limiter out of circuit: the onset
     /// census's domain (see [`probe`]).
     pre_with: Vec<f32>,
     pre_alone: Vec<f32>,
 }
 
-/// One gesture alone from one settled melody state, measured as a
-/// difference: the settled synth is rendered with and without the gesture,
-/// and the row is scored on `with − without`. Both runs share the seed and
-/// settling keys, so everything the gesture did not cause (such as a settling
-/// key's bloom tail) cancels; a sound the gesture damped shows up as the
-/// negative of what it cut. The reel keeps the raw `with` render.
+/// One gesture alone from one settled melody state, scored on `with − without`:
+/// the settled synth rendered with and without the gesture, sharing seed and
+/// settling keys, so everything the gesture did not cause (a settling key's
+/// bloom tail) cancels and a sound it damped shows as the negative of what it
+/// cut. The reel keeps the raw `with` render.
 ///
-/// The onset census is taken before the bus limiter: `with − without` isolates
-/// the gesture only through a linear bus, and the limiter's gain moves a
-/// strike's envelope by about a decibel, which the fine census would count as
-/// a strike. So both takes render twice: on the shipping bus for the reel,
-/// level and spectrum columns, and with the limiter out
-/// ([`TrailSynth::set_bus_limiter`]) for the onset columns. `soft_clip` stays
-/// in on both (memoryless and compressive, it can only lower a rise ratio).
-///
-/// Returns the row and the four takes.
+/// The onset census is taken with the bus limiter out
+/// ([`TrailSynth::set_bus_limiter`]): the difference isolates the gesture only
+/// through a linear bus, and the limiter's gain moves a strike's envelope by
+/// about a decibel, which the fine census would count as a strike. The reel and
+/// the level and spectrum columns use the shipping bus. `soft_clip` stays in on
+/// both (memoryless and compressive, it can only lower a rise ratio).
 fn probe(
     p: &Probe,
     voice: SoundVoice,
@@ -1574,25 +1557,22 @@ fn probe(
         bed: false,
         shifted,
     };
-    // The class and the rank through the engine's own producers, exactly as
-    // [`Cue::meta`] stamps them; `None` is `0`/`0`, the row as it always was.
+    // The class and the rank through the engine's own producers, as
+    // [`Cue::meta`] stamps them; `None` stamps class 0, rank 0.
     let stamp = |frame: usize, ch: Option<char>| EventMeta {
         at_ms: ((frame as f64 * 1000.0 / f64::from(SR)) as u32).max(1),
         glyph_class: aterm_effects::trail_sound::typed_glyph_class(ch),
         rank: aterm_effects::trail_sound::typed_glyph_rank(ch),
         pan_from: 0.0,
         block_lead_s: 0.0,
-        // Flow heat: a scripted take plays the cold box (0.0 is the identity).
         flow: 0.0,
     };
     // Three settling keystrokes ([`PROBE_SETTLE`]), ~340 ms apart: the previous
-    // tail is dead, and the probe lands on an accent (every third keystroke),
-    // so it is measured against the tune, not the accompaniment. Callers vary
-    // `settle` in multiples of three ([`PROBE_WALK_SETTLES`]).
-    //
-    // Stamped like every push here, or the settling keys collapse onto the
-    // block clock. A letter in the prefix takes one settling keystroke's place;
-    // a Space is not a keystroke of the bar.
+    // tail is dead, and the probe lands on an accent (every third keystroke), so
+    // it is measured against the tune, not the accompaniment. Callers vary
+    // `settle` in multiples of three ([`PROBE_WALK_SETTLES`]). Each is stamped,
+    // or the settling keys collapse onto the block clock. A letter in the prefix
+    // takes one settling keystroke's place; a Space is not a keystroke of the bar.
     let settle = settle.saturating_sub(p.prefix.chars().filter(|c| *c != ' ').count());
     let settled = |limiter: bool| {
         let mut synth = TrailSynth::new(SR as f32, seed);
@@ -1652,7 +1632,7 @@ fn probe(
         synth.render(&mut stereo[cursor * CHANNELS..]);
         let raw = to_mono(&stereo);
 
-        // WITHOUT it: the same settled synth left to ring.
+        // Without it: the same settled synth left to ring.
         let mut quiet = settled(limiter);
         let mut alone = vec![0.0f32; frames * CHANNELS];
         quiet.render(&mut alone);
@@ -2147,8 +2127,8 @@ const CLICK_HZ: f32 = 2_000.0;
 const CLICK_MS: f32 = 2.0;
 const CLICK_LEVEL: f32 = 0.1;
 
-/// The RIGHT channel: one tick at every scripted key press, on the key's own
-/// time — no pre-roll, because the pre-roll is exactly the thing being shown.
+/// The right channel: one tick at every scripted key press, on the key's own
+/// time, with no pre-roll (the pre-roll is what the file shows).
 fn click_track(cues: &[Cue], frames: usize) -> Vec<f32> {
     let mut click = vec![0.0f32; frames];
     let n = (CLICK_MS * 0.001 * SR as f32) as usize;
@@ -2234,11 +2214,9 @@ fn wav_aligned(chans: &[&[f32]]) -> Vec<u8> {
 // The census: what the melody rule does to a hand, with no ear in the loop
 // ---------------------------------------------------------------------------
 //
-// One keystroke is one melody step at every typing speed: a falsifiable claim
-// about a pure function of the key times, settled offline before any WAV is
-// rendered. The numbers are read off the engine's own state after every push
-// (`MelodyV2::steps`, `last_onset_ms`, `walk`), never re-derived from the
-// constants.
+// One keystroke is one melody step at every typing speed, checked offline on
+// the engine's own state after every push (`MelodyV2::steps`, `last_onset_ms`,
+// `walk`), never re-derived from the constants.
 
 /// The rates swept, characters per second.
 const CENSUS_CPS: [f32; 8] = [3.0, 4.0, 4.5, 5.0, 6.0, 8.0, 10.0, 14.0];
@@ -2250,11 +2228,11 @@ struct CensusRow {
     corpus: &'static str,
     cps: f32,
     jitter: f32,
-    /// TYPED keys only — a space is a rest and an Enter is a cadence; neither
-    /// is a note the melody's playhead can step on.
+    /// Typed keys only: a space is a rest and an Enter a cadence, neither a note
+    /// the melody's playhead steps on.
     keys: usize,
-    /// Keys that moved `MelodyV2::steps` — the melody advanced. Under R1
-    /// this must equal `keys` on every row, at every rate, for ever.
+    /// Keys that moved `MelodyV2::steps` (the melody advanced). R1: equal to
+    /// `keys` on every row, at every rate.
     steps: usize,
     /// Keys whose sounding degree differs from the previous key's: how often
     /// the melody moved.
@@ -2281,21 +2259,20 @@ struct CensusRow {
     /// fold sending a distance to zero, a reflection landing on the note it
     /// left). Must be zero on every row.
     stall: usize,
-    /// Keys that made NO SOUND AT ALL — a re-strike inside
-    /// `RESTRIKE_COALESCE_MS`, which advanced the state in silence.
+    /// Keys that made no sound: the push left `MelodyV2::last_onset_ms`
+    /// unchanged, advancing the state in silence.
     silent: usize,
-    /// The largest gap, in ms, between a key's scripted press time and the time
-    /// stamped on the onset the mixer made for it (`MelodyV2::last_onset_ms`).
-    /// Alignment as a number, read per key from the engine rather than from a
-    /// density-blind envelope detector. A stamped row must read 0 (asserted);
-    /// `blockclk` shows the 512-frame block quantisation (up to 10.7 ms).
+    /// The largest gap, in ms, between a key's scripted press time and the stamp
+    /// on the onset the mixer made for it (`MelodyV2::last_onset_ms`). A stamped
+    /// row must read 0 (asserted); `blockclk` shows the 512-frame block
+    /// quantisation (up to 10.7 ms).
     algn_ms: u32,
     /// The wall time the typing occupied, seconds.
     span_s: f64,
-    /// FNV-1a hash of the degree sequence (the walk after every typed key).
-    /// With every key stepping, `dist%` and `silent` saturate, but the derived
-    /// contour reads the inter-key gap, so the sequence still tells two clocks
-    /// apart; two runs agreeing here played the same tune.
+    /// FNV-1a hash of the degree sequence (the walk after every typed key). The
+    /// derived contour reads the inter-key gap, so the sequence tells two clocks
+    /// apart where `dist%` and `silent` saturate; two runs agreeing here played
+    /// the same tune.
     seq: u64,
 }
 
@@ -2342,14 +2319,13 @@ fn census_row(
     synth.set_v2_timbre_stops(timbre.stops());
     let mut stereo = vec![0.0f32; BLOCK * CHANNELS];
     let (mut keys, mut steps, mut distinct, mut silent) = (0usize, 0usize, 0usize, 0usize);
-    // The repeat ledger, and the previous TYPED key's rank it is kept
-    // against. `0` is "no key behind this cue", which is never a repeat.
+    // The repeat ledger, and the previous typed key's rank it is kept against.
+    // `0` is "no key behind this cue", which is never a repeat.
     let (mut dbl, mut head, mut subj, mut stall) = (0usize, 0usize, 0usize, 0usize);
     let mut phr = 0usize;
     let mut prev_rank: u8 = 0;
     let mut algn_ms: u32 = 0;
-    // FNV-1a, 64-bit — small, dependency-free, and order-sensitive, which is
-    // the whole requirement.
+    // FNV-1a, 64-bit: order-sensitive, which is all this needs.
     let mut seq: u64 = 0xcbf2_9ce4_8422_2325;
     let (mut ci, mut f) = (0usize, 0usize);
     while f < frames {
@@ -2365,7 +2341,7 @@ fn census_row(
             // is never a replay.
             let was_answer = !was_head && m.motif_answering();
             // The token's steering budget, read before the push: a key that
-            // takes it false → true IS the steering mark.
+            // takes it false → true is the steering mark.
             let was_marked = m.token_marked();
             let rank =
                 aterm_effects::trail_sound::typed_glyph_rank((cue.ch != '\0').then_some(cue.ch));
@@ -2466,7 +2442,6 @@ fn census_row(
     }
 }
 
-/// The census sweep, printed.
 #[allow(clippy::too_many_arguments)]
 /// Space-head census: types the prose scenario at 6, 8 and 10 cps, clean and
 /// at ±25 % jitter, through the engine as [`render`] does, and asks for every
@@ -2665,6 +2640,7 @@ fn shift_census(
     }
 }
 
+/// The census sweep, printed.
 fn census(
     seed: u32,
     voice: SoundVoice,
@@ -2674,25 +2650,20 @@ fn census(
     timbre: Timbre,
 ) {
     // Corpora:
-    //
-    // `letters`: the prose with spaces and line feeds removed, a pure key
-    // stream that isolates the melody rule.
-    //
-    // `prose`: the same text with spaces as `Space` and newlines as `Jump`.
-    // Neither is a derived note, but both take time and move the harmony, so
-    // this is the realistic column.
-    //
-    // `blockclk`: `letters` pushed with bare `push`, no stamp, so the melody
-    // clock is quantised to the spawn grid. A control: the derived contour
-    // reads the inter-key gap on every key, so `blockclk` must differ from
-    // `letters` in `seq` on every row. It only does under `spawn Ship`: under
-    // J0 the spawn is the cue's own sample, so the two clocks coincide by
-    // construction (the census says so when the spawn is not Ship).
+    // - `letters`: the prose with spaces and line feeds removed, a pure key
+    //   stream that isolates the melody rule.
+    // - `prose`: the same text with spaces as `Space` and newlines as `Jump`;
+    //   neither is a derived note, but both take time and move the harmony.
+    // - `blockclk`: `letters` pushed with bare `push`, no stamp, so the melody
+    //   clock is quantised to the spawn grid. A control: the derived contour reads
+    //   the inter-key gap, so under `--jitterfix ship` its `seq` differs from
+    //   `letters`' on every row; off Ship the spawn tracks the cue's own time and
+    //   the two clocks coincide (the census says so).
     let letters: String = PROSE.chars().filter(|c| !c.is_whitespace()).collect();
     // `phrase`: the reel's sentence and line of code three times over (every
-    // phrase mark, capitals, a decimal, brackets, a tie, `::` and a dotted
-    // path), so the ledger is read on the keys phrasing acts on. (`prose` has
-    // only `.` and `,`.)
+    // phrase mark, capitals, a decimal, brackets, a tie, `::` and a dotted path),
+    // so the ledger is read on the keys phrasing acts on (`prose` has only `.`
+    // and `,`).
     let phrase: String = [SCRIPTS[0].text, SCRIPTS[1].text].concat().repeat(3);
     let corpora: [(&'static str, &str, bool); 4] = [
         ("letters", &letters, true),
@@ -2725,8 +2696,7 @@ fn census(
         "algn",
         "seq"
     );
-    // The two totals the acceptance line is stated over, so the verdict is
-    // computed from the sweep rather than transcribed from a comment.
+    // The totals the verdict below is computed from.
     let (mut worst_stall, mut rows_off_r1) = (0usize, 0usize);
     let (mut worst_algn, mut worst_algn_ctl) = (0u32, 0u32);
     for (corpus, text, stamped) in corpora {
@@ -2921,10 +2891,9 @@ fn main() {
     let mut want_probes = false;
     let mut dump_probes = false;
     // J1 is what ships, so it is the default: the host sets
-    // `EventMeta::block_lead_s` on every `push_meta` and the engine puts every
-    // onset a constant one block after its press. J0 would take a
-    // block-phase-dependent bite out of each mallet's attack.
-    // `--jitterfix ship` models the block clock without that lead.
+    // `EventMeta::block_lead_s` on every `push_meta`, which puts every onset a
+    // constant one block after its press. `--jitterfix ship` models the block
+    // clock without that lead.
     let mut fix = BlockFix::J1;
     let mut want_census = false;
     let mut want_space_census = false;
@@ -2963,8 +2932,8 @@ fn main() {
                     _ => GlowStyle::RainbowKitty,
                 };
             }
-            // The prose take's typing rate. Every other scenario keeps its own
-            // scripted cadence — the burst is a burst at any setting.
+            // The prose take's typing rate; every other scenario keeps its own
+            // scripted cadence.
             "--cps" => {
                 let v = val("--cps");
                 cps_named = true;
@@ -2977,7 +2946,7 @@ fn main() {
                         std::process::exit(2);
                     });
             }
-            // Per-interval wobble, PERCENT: 25 is the ±25 % a hand carries.
+            // Per-interval wobble in percent: 25 is the ±25 % a hand carries.
             "--jitter" => {
                 let v = val("--jitter");
                 jitter = v
@@ -2990,8 +2959,8 @@ fn main() {
                         std::process::exit(2);
                     });
             }
-            // Seeds the HAND (the jitter) and the SYNTH (the velocity draw),
-            // so one seed is one performance end to end.
+            // Seeds the hand (the jitter) and the synth (the velocity draw), so
+            // one seed is one performance end to end.
             "--seed" => {
                 let v = val("--seed");
                 seed = v
@@ -3051,8 +3020,7 @@ fn main() {
     }
 
     if want_census {
-        // No WAVs: the census needs no ear, and rendering 96 takes to print a
-        // table would make the one run that must happen FIRST the slowest.
+        // No WAVs: the census reads engine state, not audio.
         census(seed, voice, style, fix, bed, timbre);
         return;
     }
@@ -3143,8 +3111,8 @@ fn main() {
                     share,
                     outside,
                 ));
-                // The lift is read in the melody's register, the bass in its
-                // own [220, 440) band; the two bands are disjoint.
+                // The lift is read in the melody's register (450-4000 Hz), the bass
+                // in its own (200-470 Hz).
                 let shifts = cue_times(sc, SoundKind::Shift);
                 if !shifts.is_empty() {
                     rots.push(rotation_of(
@@ -3244,9 +3212,8 @@ fn main() {
     );
     let mut siren_free = true;
     for (name, keys, worst, visited, share, outside) in &sirens {
-        // The three guarantees, read back: MELODY_RUN_MAX inverts the fourth
-        // identical stride, reflection keeps the line in register, gravity
-        // keeps it off one note. Fewer than a handful of keys says nothing.
+        // [`siren_verdict`]'s three guarantees; under 20 keys the share and
+        // visited counts say nothing.
         let thin = *keys < 20;
         let ok = *outside == 0 && *worst <= 3 && (thin || (*share < 50.0 && *visited >= 5));
         siren_free &= ok;
@@ -3339,16 +3306,13 @@ fn probe_tables(
                 p.fine.map_or("-".to_string(), |n| n.to_string())
             );
         }
-        // A keystroke is one onset by the fine census (`Typed 1`; a Caps-Lock
-        // capital rings but does not strike twice). `Capital` is two keys (the
-        // bare Shift's ting and the letter 60 ms on) and reads 2. The bare
-        // Shift sings by design.
+        // A keystroke is one onset by the fine census (`Typed 1`); `Capital` is
+        // two keys (the bare Shift's ting and the letter 60 ms on) and reads 2.
+        // The bare Shift sings by design.
         let find = |name: &str| probes.iter().find(|p| p.name == name);
         let fine_of = |name: &str| find(name).and_then(|p| p.fine).unwrap_or(0);
         let typed = fine_of("Typed");
-        // The capital is counted on the scene census: the ting rings through
-        // the strike, and the partials' difference tone (≥ 100 Hz) reads as
-        // extra rises on the fine census (see [`FINE_ONSET`]).
+        // The capital is counted on the scene census (see [`FINE_ONSET`]).
         let capital = find("Capital").map_or(0, |p| p.onsets);
         let caps_lock = find("CapsLockA").and_then(|p| p.fine);
         let shift_tonality = find("Shift").map_or(0.0, |p| p.tonality);
@@ -3372,9 +3336,9 @@ fn probe_tables(
         };
         let shift_re_typed = find("Shift").map_or(f64::NAN, |s| s.peak_db - typed_walk_db);
         // The bare Shift is a ting. On the v1 palettes it sits at the Space's
-        // tier, −3 dB re the walk-mean keystroke. The music box's ting is a
-        // 200 ms FM-free bell on a tone of the live chord; ringing 2.4× as long,
-        // it is as present 1.5 dB lower: −4.5 ± 1.0 dB re the walk-mean Typed.
+        // tier, −3 dB re the walk-mean keystroke; the music box's 200 ms bell on a
+        // tone of the live chord rings 2.4× as long, so it sits 1.5 dB lower:
+        // −4.5 ± 1.0 dB.
         let music_box = match voice {
             SoundVoice::RainbowKittyV2 | SoundVoice::Of(GlowStyle::RainbowKitty) => true,
             SoundVoice::Style => style == GlowStyle::RainbowKitty,
@@ -3391,9 +3355,8 @@ fn probe_tables(
         let shift_level_ok =
             (shift_re_typed - SHIFT_RE_TYPED_TARGET_DB).abs() <= SHIFT_RE_TYPED_TOL_DB;
         let caps_lock_ok = caps_lock.is_none_or(|n| n == 1);
-        // The ting's own line on both engines: the Typed clause ("a keystroke
-        // is one onset") reads red on the v1 palettes, so the ting's verdict
-        // is stated separately.
+        // The ting's verdict is its own line: the Typed clause ("a keystroke is
+        // one onset") reads red on the v1 palettes.
         println!(
             "ting ({ruled}): Shift {shift_re_typed:+.2} dB re the walk-mean Typed \
              ({typed_walk_db:.2} dBFS over settle {PROBE_WALK_SETTLES:?}; the row's own \
@@ -3431,10 +3394,9 @@ fn probe_tables(
             }
         );
         // Forte, not higher: the `Capital-run-interior` row's `B` (inside a
-        // shifted run, so the walk's accent does not fire) against its
-        // lowercase twin `b` from the same settled state. Both derive one
-        // degree, so they must read one note. Read 25 ms past the onset, as
-        // every pitch here.
+        // shifted run, so the walk's accent does not fire) against its lowercase
+        // twin `b` from the same settled state must read one note, 25 ms past
+        // the onset.
         if let Some(interior) = PROBES.iter().find(|p| p.label == "Capital-run-interior") {
             let twin = Probe {
                 label: "run-interior twin",
@@ -3472,18 +3434,13 @@ fn probe_tables(
                 }
             );
         }
-        // The space head must be heard: −6.5..0 dB re the walk-mean Typed
-        // (never over the letter), centroid ≥ 450 Hz, and at least a fiftieth
-        // of the energy over 2 kHz (a laptop speaker rolls off a bare bass).
-        // The letter is the walk mean because the v1 downbeat is a fixed bass
-        // root while the letter walks its palette's roof; the row's own
-        // reading is printed beside it.
-        //
-        // The three clauses are the engine's (`trail_sound`'s
-        // `SPACE_HEAD_RE_TYPED_DB`, `SPACE_HEAD_CENTROID_FLOOR_HZ`,
-        // `SPACE_HEAD_HI_FLOOR`), shared with its pin
-        // `the_space_head_is_heard_with_top_on_every_v1_voice`, in f64 so
-        // nothing is widened in the printout.
+        // The space head must be heard: −6.5..0 dB re the walk-mean Typed (never
+        // over the letter), centroid ≥ 450 Hz, and at least a fiftieth of the
+        // energy over 2 kHz (a laptop speaker rolls off a bare bass). The letter is
+        // the walk mean because the v1 downbeat is a fixed bass root while the
+        // letter walks its palette's roof. The clauses are the engine's
+        // `SPACE_HEAD_*` constants, shared with its pin
+        // `the_space_head_is_heard_with_top_on_every_v1_voice`.
         let (space_re_typed_lo_db, space_re_typed_hi_db) = SPACE_HEAD_RE_TYPED_DB;
         if let (Some(sp), Some(t)) = (find("Space"), find("Typed")) {
             let re = sp.peak_db - typed_walk_db;

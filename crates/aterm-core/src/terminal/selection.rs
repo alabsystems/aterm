@@ -12,42 +12,31 @@ use super::content::{TrailingBlanks, visible_row_bounds_to_string};
 use crate::search::LineCells;
 use crate::selection::SmartSelection;
 
-/// Cap on the rows [`Terminal::selection_to_string`] materializes in one call.
-///
-/// Scrollback retention can be unlimited, so without a cap a control-socket
-/// select-all plus copy would do O(scrollback) work under the terminal mutex.
-/// 1M rows is about ten times the default 100k retention and the same order as
-/// search's `MAX_SEARCH_MATCHES`, so realistic selections are never clipped.
+/// Cap on the rows [`Terminal::selection_to_string`] materializes in one call: retention
+/// can be unlimited, and a control-socket select-all plus copy would otherwise do
+/// O(scrollback) work under the terminal mutex. Ten times the default 100k-line retention.
 const MAX_SELECTION_ROWS: usize = 1_000_000;
 
-/// Cap on the bytes [`Terminal::selection_to_string`] produces: the binding
-/// memory bound, since one stored line can be `MAX_GRID_COLS` (4096) wide
-/// clusters of multi-byte text. 64 MiB exceeds a full default 100k-line
-/// scrollback (~20 MiB).
+/// Cap on the bytes [`Terminal::selection_to_string`] produces, the binding memory bound:
+/// one stored line can be `MAX_GRID_COLS` (4096) clusters of multi-byte text. 64 MiB
+/// exceeds a full default 100k-line scrollback (~20 MiB).
 const MAX_SELECTION_BYTES: usize = 64 * 1024 * 1024;
 
-/// Cap, in each direction, on how many physical rows
-/// [`Terminal::logical_line_span`] walks to join one soft-wrapped logical line.
-/// Each history row's wrap bit can cost a tier fetch under the terminal mutex,
-/// and scrollback can be unlimited. 4096 rows (~320 KiB at 80 columns) never
-/// clips a line a human selects.
+/// Cap, each way, on the physical rows [`Terminal::logical_line_span`] walks to join one
+/// soft-wrapped line: a history row's wrap bit can cost a tier fetch under the terminal
+/// mutex, and scrollback can be unlimited. 4096 rows never clips a line a human selects.
 const MAX_LOGICAL_LINE_ROWS: usize = 4096;
 
-/// Per-line byte ceiling for scrollback text extraction in
-/// [`Terminal::get_line_text`].
-///
-/// A scrollback [`Line`](aterm_scrollback::Line) has no length bound (a crafted
-/// checkpoint restored via `restore_grid` -> `deserialize_lines` can inject a
-/// multi-MiB line), so extraction bounds both the copy and the grapheme walk.
-/// A real line is at most `MAX_GRID_COLS` (4096) cells of 1 base +
-/// `Extra::MAX_COMBINING` (16) marks (~272 KiB), so 1 MiB never clips one.
+/// Per-line byte ceiling for scrollback text extraction. A scrollback
+/// [`Line`](aterm_scrollback::Line) has no length bound (a crafted checkpoint can inject a
+/// multi-MiB one), so extraction bounds both the copy and the grapheme walk. A real line
+/// is at most `MAX_GRID_COLS` (4096) cells of 1 base + `Extra::MAX_COMBINING` (16) marks
+/// (~272 KiB), so 1 MiB never clips one.
 pub(crate) const MAX_SCROLLBACK_LINE_SCAN_BYTES: usize = 1024 * 1024;
 
-/// A stored line's full text (all columns, no trim) bounded to
-/// `max_scan_bytes`: a [`Line::to_string`](aterm_scrollback::Line) equivalent
-/// that an oversized line cannot blow up. Used by the search-index build.
-/// Borrows valid UTF-8 under the ceiling; lossy-converts only a bounded prefix
-/// otherwise.
+/// A stored line's full text (all columns, no trim) bounded to `max_scan_bytes`: a
+/// [`Line::to_string`](aterm_scrollback::Line) an oversized line cannot blow up. Borrows
+/// valid UTF-8 under the ceiling; lossy-converts only a bounded prefix otherwise.
 pub(crate) fn line_text_bounded(bytes: &[u8], max_scan_bytes: usize) -> Cow<'_, str> {
     let scan = if bytes.len() <= max_scan_bytes {
         bytes
@@ -57,28 +46,19 @@ pub(crate) fn line_text_bounded(bytes: &[u8], max_scan_bytes: usize) -> Cow<'_, 
     String::from_utf8_lossy(scan)
 }
 
-/// Extract a column range from a scrollback line's raw bytes without
-/// materializing the whole line: the bytes of the cells drawn over columns
-/// `start_col..=end_col`, `cells_of` giving the cells the line's bounded text
-/// is drawn in ([`history_line_text_cells`]). A cell the range covers only
-/// half of (a wide glyph straddling an edge) is copied whole, the scrollback
-/// twin of [`visible_row_bounds_to_string`]'s
-/// [`glyph_cell_span`](aterm_types::selection::glyph_cell_span) edges, so a
-/// stored line copies the same cells the highlight paints. The text, and the
-/// walk that reads its cells, are bounded by `max_scan_bytes`
-/// ([`MAX_SCROLLBACK_LINE_SCAN_BYTES`] in production); columns past the
-/// scanned content yield an empty string. Split from
-/// [`Terminal::get_line_text`] so the ceiling can be tested small.
-///
-/// A stored line holds exactly the cells its row had written, so
-/// [`TrailingBlanks::Written`] keeps the range as stored.
-///
-/// Ruling 2026-10-11 (r16 selection-stride review): the columns are the
-/// cells', never a walk of the text under the `ambiguous_width` policy now in
-/// force. A row written before a live switch keeps the cells it was drawn in,
-/// so re-measuring its arrows two cells each copied `→f` from the cells that
-/// draw `foo`; the ring tier's two flag halves drawn apart were one
-/// two-column flag to the walk.
+/// Extract a column range from a scrollback line's raw bytes without materializing the
+/// whole line: the bytes of the cells drawn over columns `start_col..=end_col`, `cells_of`
+/// giving the cells the line's bounded text is drawn in ([`history_line_text_cells`]). A
+/// cell the range covers only half of (a wide glyph straddling an edge) is copied whole,
+/// the scrollback twin of [`visible_row_bounds_to_string`]'s
+/// [`glyph_cell_span`](aterm_types::selection::glyph_cell_span) edges, so a stored line
+/// copies the cells the highlight paints. The columns are the cells', never a walk of the
+/// text under the `ambiguous_width` policy now in force: a row keeps the cells it was drawn
+/// in. The text and its cell walk are bounded by `max_scan_bytes`
+/// ([`MAX_SCROLLBACK_LINE_SCAN_BYTES`] in production; a parameter so tests can use a small
+/// one); columns past the scanned content yield an empty string. A stored line holds
+/// exactly the cells its row had written, so [`TrailingBlanks::Written`] keeps the range as
+/// stored.
 ///
 /// [`history_line_text_cells`]: super::history_line_text_cells
 /// [`visible_row_bounds_to_string`]: super::content::visible_row_bounds_to_string
@@ -155,20 +135,16 @@ struct SelectionRow<'a> {
     continues: bool,
 }
 
-/// The word `smart`'s rules find at column `col` of `text`, a line read with
-/// the grid cells it is drawn in (`cells`, as [`Terminal::written_line_cells`]
-/// and [`Terminal::line_range_cells`] read them): its bytes in `text` and the
-/// columns `(start, end)`, `end` exclusive, it is drawn in. `None` on a column
-/// no cell is drawn over (right of the text) or on whitespace.
+/// The word `smart`'s rules find at column `col` of `text`, read with the grid cells it is
+/// drawn in (`cells`, as [`Terminal::written_line_cells`] and
+/// [`Terminal::line_range_cells`] read them): its bytes in `text` and the columns
+/// `(start, end)`, `end` exclusive, it is drawn in. `None` on a column no cell is drawn
+/// over (right of the text) or on whitespace.
 ///
-/// Both directions go through the cells, never a walk of the text: the click
-/// names the cell drawn over its column ([`LineCells::byte_at_column`]), and
-/// the word comes back in the columns find would report a match over the same
-/// bytes in ([`LineCells::columns_of`]). Ruling 2026-10-11 (r16
-/// selection-stride): a walk of a row's text does not know the cells the grid
-/// kept apart or narrow (two flag halves drawn out of order, a VS16 base in
-/// the last column), so it put a double-click's word, and a web host's word
-/// or link under a cell, beside the cells that hold it.
+/// Both directions go through the cells ([`LineCells::byte_at_column`],
+/// [`LineCells::columns_of`]), never a walk of the text, which does not know the cells the
+/// grid kept apart or narrow (two flag halves drawn out of order, a VS16 base in the last
+/// column).
 #[must_use]
 pub fn smart_word_in_cells(
     smart: &SmartSelection,
@@ -182,22 +158,18 @@ pub fn smart_word_in_cells(
 }
 
 impl Terminal {
-    /// Get the selected text as a string; `None` if there is no selection or it
-    /// is empty. Block selections separate rows with newlines.
-    ///
-    /// Output is bounded by [`MAX_SELECTION_ROWS`] / [`MAX_SELECTION_BYTES`];
-    /// clipped content is dropped silently here. Use
-    /// [`Self::selection_to_string_bounded`] to learn whether truncation occurred.
+    /// The selected text; `None` if there is no selection or it is empty. Block selections
+    /// separate rows with newlines. Bounded by [`MAX_SELECTION_ROWS`] /
+    /// [`MAX_SELECTION_BYTES`], dropping clipped content silently; see
+    /// [`Self::selection_to_string_bounded`].
     #[must_use]
     pub fn selection_to_string(&self) -> Option<String> {
         self.selection_to_string_bounded().0
     }
 
-    /// Like [`Self::selection_to_string`], but also returns whether content is
-    /// missing from the text, so callers can report truncation (as search
-    /// reports `incomplete`). `true` means selected content is absent from either
-    /// end: the copy caps drop it from the tail, and a scrollback eviction that
-    /// clamped the selection's head drops it from the front.
+    /// [`Self::selection_to_string`] and whether selected content is missing from either
+    /// end (the copy caps drop the tail; a scrollback eviction that clamped the head drops
+    /// the front), so callers can report it as search reports `incomplete`.
     #[must_use]
     pub fn selection_to_string_bounded(&self) -> (Option<String>, bool) {
         self.selection_to_string_capped(MAX_SELECTION_ROWS, MAX_SELECTION_BYTES)
@@ -212,11 +184,9 @@ impl Terminal {
     ) -> (Option<String>, bool) {
         use crate::selection::SelectionType;
 
-        // Side-adjusted bounds so the copied text matches the highlight (a
-        // Right-sided start or Left-sided end excludes its character).
-        // `truncated` also covers eviction, decided before the walk: a clamped
-        // head at the floor row, col 0, side Left can collapse the span, and
-        // that must still report incomplete rather than an empty `OK 0`.
+        // Side-adjusted bounds, so the copy matches the highlight (a Right-sided start or
+        // Left-sided end excludes its character). Eviction is read first: a clamped head
+        // can collapse the span, and that still reports incomplete, not an empty `OK 0`.
         let evicted = self.text_selection.truncated();
         let Some((adj_start_row, adj_start_col, adj_end_row, adj_end_col)) =
             self.text_selection.side_adjusted_bounds()
@@ -227,24 +197,19 @@ impl Terminal {
         let mut result = String::new();
         let cols = self.grid.cols();
         if cols == 0 {
-            // A zero-column grid addresses no content at all; that is a degenerate
-            // geometry, not a partial report about a span that exists.
+            // A degenerate geometry, not a partial report about a span that exists.
             return (None, false);
         }
 
-        // Two bounds keep any selection from spinning or allocating unboundedly
-        // under the terminal mutex:
-        // 1. Clamp the row span to [-scrollback_lines, rows-1], so unclamped i32
-        //    anchors from the control socket do not iterate rows with no content.
-        // 2. MAX_SELECTION_ROWS / MAX_SELECTION_BYTES in the loops below, since
-        //    real content itself can be unbounded (unlimited scrollback).
+        // Two bounds keep a selection from spinning or allocating unboundedly under the
+        // terminal mutex: the span is clamped to [-scrollback_lines, rows-1] (control-socket
+        // anchors are unclamped i32s), and MAX_SELECTION_ROWS / MAX_SELECTION_BYTES bound
+        // the walks (content itself can be unbounded).
         let visible_rows = i32::from(self.grid.rows());
         let history = i32::try_from(self.grid.scrollback_lines()).unwrap_or(i32::MAX);
         let first_row = adj_start_row.max(-history);
         let last_row = adj_end_row.min(visible_rows - 1);
 
-        // One geometry value, computed once and threaded to whichever shape walk
-        // runs. Deriving it inside the walks instead would let the two copies drift.
         let geom = SelectionGeometry {
             first_row,
             last_row,
@@ -255,9 +220,7 @@ impl Terminal {
             cols,
         };
 
-        // Iteration runs oldest to newest, so a cap truncates the tail and the
-        // start row/col is always kept. Each shape walk returns its counters so
-        // the cap report below is the same for either shape.
+        // Oldest to newest, so a cap truncates the tail and the start is always kept.
         let (rows_emitted, truncated) = match self.text_selection.selection_type() {
             SelectionType::Block => {
                 self.push_block_selection(&mut result, geom, max_rows, max_bytes)
@@ -267,17 +230,16 @@ impl Terminal {
         };
 
         if truncated {
-            // Log the truncation for callers that only take the text (mouse, wasm);
-            // `truncated` is also returned so cmd_selection/cmd_copy can append
-            // ` incomplete`.
+            // Logged for callers that take only the text (mouse, wasm); `cmd_selection`
+            // and `cmd_copy` append ` incomplete` from the returned flag.
             aterm_log::warn!(
                 "selection_to_string truncated at cap (rows_emitted={rows_emitted}, bytes={})",
                 result.len()
             );
         }
 
-        // The two halves of the report are independent — a capped walk over an
-        // already-clamped selection is missing text at both ends — so they or.
+        // The two halves are independent (a capped walk over a clamped selection misses
+        // text at both ends), so they or.
         if result.is_empty() {
             (None, truncated || evicted)
         } else {
@@ -304,7 +266,6 @@ impl Terminal {
         let mut rows_emitted = 0usize;
         let mut truncated = false;
 
-        // Rectangular selection: extract adjusted columns from each row
         for row in first_row..=last_row {
             if rows_emitted >= max_rows || result.len() >= max_bytes {
                 truncated = true;
@@ -328,13 +289,11 @@ impl Terminal {
     /// Walk a linear (Simple/Semantic/Lines) selection into `result`, returning
     /// `(rows_emitted, truncated)`, with one tier fetch per history row.
     ///
-    /// Trailing blanks are trimmed where a logical line ends (a hard line break,
-    /// or the selection's last row), from the whole line: a row the next row
-    /// continues (a soft wrap) keeps every cell the program wrote, so a space it
-    /// printed in the last column joins the two words it separates, and those
-    /// kept blanks go when the line ends in blanks after all. The cell a wide
-    /// glyph leaves when it wraps early was never written, so it is not in the
-    /// row's written text either: no guess about holes is needed.
+    /// Trailing blanks are trimmed where a logical line ends (a hard break or the
+    /// selection's last row), from the whole line: a row the next row continues keeps
+    /// every cell the program wrote, so a space printed in the last column joins the two
+    /// words it separates. The cell a wide glyph leaves when it wraps early was never
+    /// written, so it is not in the row's text either.
     fn push_linear_selection(
         &self,
         result: &mut String,
@@ -353,14 +312,11 @@ impl Terminal {
         } = geom;
         let mut rows_emitted = 0usize;
         let mut truncated = false;
-        // Whether a row's trailing blanks are content depends on the NEXT row's
-        // wrap bit, so the next row is read one iteration early and carried
-        // into its own: each history row is still fetched from the tier once (a
-        // fetch builds a full `Line` on the ring path, or clones one out of a
-        // decompressed block).
+        // A row's trailing blanks are content when the next row continues it, so the next
+        // row is read one iteration early and carried over: each history row is still
+        // fetched from the tier once (a fetch builds or clones a full `Line`).
         let mut lookahead: Option<SelectionRow<'_>> = None;
-        // Where the logical line now being emitted starts in `result`: its end
-        // trims back to here, never into the line before it.
+        // Where the current logical line starts in `result`; its end trims back to here.
         let mut line_start = result.len();
 
         for row in first_row..=last_row {
@@ -370,8 +326,7 @@ impl Terminal {
             }
             rows_emitted += 1;
             let current = lookahead.take().unwrap_or_else(|| self.selection_row(row));
-            // A newline only before a row that does not continue the one above
-            // (`continuation_bit`, shared with the logical-line click gestures).
+            // A newline only before a row that does not continue the one above.
             if row > first_row && !current.continues {
                 result.push('\n');
                 line_start = result.len();
@@ -387,8 +342,7 @@ impl Terminal {
             } else {
                 cols - 1
             };
-            // `row < last_row` also means the range runs to the row's last
-            // column: only the end row stops short of it.
+            // Only the end row stops short of the row's last column.
             let trailing = if row < last_row {
                 let next = self.selection_row(row + 1);
                 let continued = next.continues;
@@ -402,9 +356,7 @@ impl Terminal {
                 TrailingBlanks::Trim
             };
 
-            // The history arm is `get_line_text`'s negative-row arm on the line
-            // already fetched, with the same `MAX_SCROLLBACK_LINE_SCAN_BYTES`
-            // ceiling.
+            // The history arm is `get_line_text`'s on the line already fetched.
             let line = if row < 0 {
                 current.history.as_ref().and_then(|stored| {
                     self.history_range_text(row, stored, (start_col, end_col), trailing)
@@ -418,9 +370,8 @@ impl Terminal {
                     break;
                 }
             }
-            // The logical line ends here: trim it whole, so blanks a wrapped row
-            // kept are dropped when nothing but blanks follows them (a padded
-            // column wider than the window copies as its text, as before).
+            // The logical line ends here: trim it whole, so blanks a wrapped row kept go
+            // when nothing but blanks follows them.
             if trailing == TrailingBlanks::Trim {
                 let keep = line_start + result[line_start..].trim_end().len();
                 result.truncate(keep);
@@ -430,9 +381,8 @@ impl Terminal {
         (rows_emitted, truncated)
     }
 
-    /// Read selection-space `row` for [`Self::push_linear_selection`]: its
-    /// stored line when it is history (fetched once, here) and whether it
-    /// continues the row above.
+    /// Read selection-space `row` for [`Self::push_linear_selection`]: its stored line when
+    /// history (fetched once, here) and whether it continues the row above.
     fn selection_row(&self, row: i32) -> SelectionRow<'_> {
         let history = if row < 0 {
             usize::try_from(-(i64::from(row)) - 1)
@@ -445,17 +395,11 @@ impl Terminal {
         SelectionRow { history, continues }
     }
 
-    /// Whether selection-space `row` continues the previous row's content (a
-    /// soft wrap, not a hard line break).
-    ///
-    /// The one place selection reads `Row::is_wrapped()` / `Line::is_wrapped()`:
-    /// [`Self::push_linear_selection`] (newlines in the copy) and
-    /// [`Self::logical_line_span`] (click reach) must agree, or the highlight and
-    /// the clipboard describe different text.
-    ///
-    /// `history_line` is the caller's already-fetched line for a negative row;
-    /// with `None` this fetches it. Reads the live frame: selection rows are
-    /// terminal-relative (see [`Self::get_line_text`]).
+    /// Whether selection-space `row` continues the previous row (a soft wrap). The one place
+    /// selection reads the wrap bit: [`Self::push_linear_selection`] (newlines in the copy)
+    /// and [`Self::logical_line_span`] (click reach) must agree, or highlight and clipboard
+    /// describe different text. `history_line` is the caller's already-fetched line for a
+    /// negative row; `None` fetches it.
     #[allow(
         clippy::redundant_closure_for_method_calls,
         reason = "private row/line types prevent method-reference shorthand"
@@ -487,19 +431,12 @@ impl Terminal {
         self.continuation_bit(row, None)
     }
 
-    /// The inclusive physical row span `(first, last)` of the logical line
-    /// containing selection-space `row`: the maximal run joined by soft wraps.
-    ///
-    /// This is what word/line click gestures select, matching the copy walk
-    /// ([`Self::push_linear_selection`]), which emits no newline before a
-    /// continuation row. Bounding a triple-click to the physical row would drop
-    /// the continuation from the clipboard.
-    ///
-    /// A hard newline ends the run in both directions; an unwrapped row answers
-    /// `(row, row)`. The walk stops at the live screen's bottom and at the
-    /// scrollback floor (an evicted head starts at the oldest retained row, as
-    /// `adjust_for_scroll` clamps), and an out-of-range row answers `(row, row)`.
-    /// Bounded by [`MAX_LOGICAL_LINE_ROWS`] in each direction.
+    /// The inclusive physical row span `(first, last)` of the logical line containing
+    /// selection-space `row`: the maximal run joined by soft wraps, what word/line click
+    /// gestures select, matching the copy walk ([`Self::push_linear_selection`]). The walk
+    /// stops at a hard newline, the live screen's bottom and the scrollback floor (as
+    /// `adjust_for_scroll` clamps), bounded by [`MAX_LOGICAL_LINE_ROWS`] each way; an
+    /// unwrapped or out-of-range row answers `(row, row)`.
     #[must_use]
     pub fn logical_line_span(&self, row: i32) -> (i32, i32) {
         let visible_rows = i32::from(self.grid.rows());
@@ -521,37 +458,19 @@ impl Terminal {
         (first, last)
     }
 
-    /// Rows `first..=last` of a logical line (already clamped to its span)
-    /// joined into one line, with the grid cells each byte was read from:
-    /// `(text, cells)`.
+    /// Rows `first..=last` of a logical line (already clamped to its span) joined into one
+    /// line, with the grid cells each byte was read from: `(text, cells)`. Row `k` is drawn
+    /// from column `k * cols` of the join, so column `g` is cell
+    /// `(first + g / cols, g % cols)`. Each row is read with its cells
+    /// ([`Self::written_line_cells`]), cut after its last cell ([`Self::drawn_line_cells`]),
+    /// and joined by [`LineCells::append_wrapped_row`], which pads a short row to its width
+    /// with spaces that read as a break. No column is counted by re-measuring a row's text:
+    /// a VS16 base kept one cell wide or two flag halves drawn apart measure otherwise.
+    /// `None` only when `first` addresses no line.
     ///
-    /// Row `k` of the window is drawn from column `k * cols` of the join, so a
-    /// column `g` of it is cell `(first + g / cols, g % cols)`, and the cells
-    /// name the column each piece of the text is drawn in
-    /// ([`LineCells::byte_at_column`], [`LineCells::columns_of`]). Each row is
-    /// read as written with its cells ([`Self::written_line_cells`]: a visible
-    /// row's live cells, a history row's as either history tier draws it), cut
-    /// after its last cell ([`Self::drawn_line_cells`]), and joined by
-    /// [`LineCells::append_wrapped_row`], find's soft-wrap join, which pads a
-    /// row its text does not fill out to its width with spaces that read as a
-    /// break (at a ragged wrap a word does not run on across the gap). `None`
-    /// only when `first` addresses no line.
-    ///
-    /// Ruling 2026-10-11 (r16 selection-stride): no column of the join is
-    /// counted by re-measuring a row's text. That padded each row from its
-    /// text's measured width, which is not the row's: a VS16 base the grid
-    /// kept one cell wide in the last column measures two, so the row took
-    /// `cols + 1` columns of the join and every word on every later row of
-    /// the run was looked up a cell left of where it is drawn; and two flag
-    /// halves drawn into neighbouring cells out of order (the grid folds a
-    /// regional indicator only into the cell before the cursor) measure as one
-    /// two-column flag, which moved every word after them on the row two
-    /// cells left and padded the row's end, splitting a word that straddled
-    /// the wrap.
-    ///
-    /// Word rules scan only this window, widening it when a match runs to an
-    /// edge, so a double-click on a very long logical line (a minified bundle)
-    /// does not scan the whole join under the terminal mutex.
+    /// Word rules scan only this window, widening it when a match runs to an edge, so a
+    /// double-click on a very long logical line does not scan the whole join under the
+    /// terminal mutex.
     #[must_use]
     pub fn line_range_cells(&self, first: i32, last: i32) -> Option<(String, LineCells)> {
         let (mut text, mut cells) = self.drawn_line_cells(first)?;
@@ -565,14 +484,10 @@ impl Terminal {
         Some((text, cells))
     }
 
-    /// [`Self::written_line_cells`] cut after the row's last cell: the text
-    /// the row shows, which is what a gesture on the glass reads. A history
-    /// row's stored line can hold text past the grid's width that no cell
-    /// draws (a line restored from a checkpoint or a `.dtrm` written wider,
-    /// up to the 1 MiB a stored line is read to); cutting it keeps a
-    /// double-click's window, which the word rules scan under the terminal
-    /// mutex, as long as the rows it spans, as reading each row by its
-    /// columns did.
+    /// [`Self::written_line_cells`] cut after the row's last cell: the text the row shows.
+    /// A stored line can hold text past the grid's width that no cell draws (restored from
+    /// a checkpoint or a `.dtrm` written wider); cutting it keeps a double-click's window,
+    /// scanned under the terminal mutex, as long as the rows it spans.
     pub(crate) fn drawn_line_cells(&self, row: i32) -> Option<(String, LineCells)> {
         let (mut text, cells) = self.written_line_cells(row)?;
         let end = cells.end_byte();
@@ -582,24 +497,19 @@ impl Terminal {
         Some((text, cells))
     }
 
-    /// Get text from a line (visible or scrollback), trailing blanks trimmed.
-    ///
-    /// `row` is terminal-relative and scroll-invariant: `0..rows` are the live
-    /// screen rows (the renderer paints a selection at `viewport_row -
-    /// display_offset`), negative rows are scrollback (`-1` = newest history
-    /// line). `col_range` is inclusive; `None` extracts the whole line.
+    /// A line's text (visible or scrollback), trailing blanks trimmed. `row` is
+    /// terminal-relative and scroll-invariant: `0..rows` are the live screen rows,
+    /// negative rows are scrollback (`-1` = newest). `col_range` is inclusive; `None` is
+    /// the whole line.
     pub fn get_line_text(&self, row: i32, col_range: Option<(u16, u16)>) -> Option<String> {
         self.line_text(row, col_range, TrailingBlanks::Trim)
     }
 
-    /// The text a row holds as written, trailing blanks included: every cell a
-    /// live row's program wrote (up to `Row::len`), and a history row's stored
-    /// line whole (bounded by [`MAX_SCROLLBACK_LINE_SCAN_BYTES`]), which is what
-    /// that row held when it scrolled off. `None` when `row` addresses no line.
-    ///
-    /// One extractor for both, so a row reads the same on the screen and in
-    /// history: what search indexes, and what a `$`-anchored or space-ended
-    /// query sees, does not change when output scrolls the row off the screen.
+    /// The text a row holds as written, trailing blanks included: every cell a live row's
+    /// program wrote (up to `Row::len`), or a history row's stored line whole (bounded by
+    /// [`MAX_SCROLLBACK_LINE_SCAN_BYTES`]). One extractor for both, so what search indexes
+    /// does not change when output scrolls the row off. `None` when `row` addresses no
+    /// line.
     #[must_use]
     pub fn written_line_text(&self, row: i32) -> Option<String> {
         if row < 0 {
@@ -622,7 +532,6 @@ impl Terminal {
         let visible_rows = i32::from(self.grid.rows());
 
         if row >= 0 && row < visible_rows {
-            // Visible row: row is in [0, visible_rows) where visible_rows <= u16::MAX
             let row_idx = u16::try_from(row).ok()?;
             let cols = self.grid.cols();
             if cols == 0 && col_range.is_none() {
@@ -633,8 +542,7 @@ impl Terminal {
                 &self.grid, row_idx, start_col, end_col, trailing,
             ))
         } else if row < 0 {
-            // Scrollback row: history_line_rev covers the ring buffer and tiered
-            // scrollback; rev_idx 0 is the most recently scrolled-off line.
+            // rev_idx 0 is the most recently scrolled-off line (ring or tiered).
             let rev_idx = usize::try_from(-(i64::from(row)) - 1).ok()?;
             let scrollback_line = self.grid.history_line_rev(rev_idx)?;
             let cols = self.grid.cols();
@@ -642,8 +550,6 @@ impl Terminal {
                 return Some(String::new());
             }
             let (start_col, end_col) = col_range.unwrap_or((0, cols.saturating_sub(1)));
-            // Extract without materializing the whole line: a stored line's
-            // length is unbounded (see MAX_SCROLLBACK_LINE_SCAN_BYTES).
             self.history_range_text(row, &scrollback_line, (start_col, end_col), trailing)
         } else {
             None
@@ -652,10 +558,9 @@ impl Terminal {
 }
 
 impl Terminal {
-    /// The text the cells of history row `row` (selection-space, negative),
-    /// whose stored line is `line`, hold in columns `start_col..=end_col`
-    /// ([`scrollback_line_range_text`] over the cells the row is drawn in).
-    /// `None` when `row` addresses no history line.
+    /// The text in columns `start_col..=end_col` of history row `row` (selection-space,
+    /// negative; `line` its stored line), read from the cells the row is drawn in. `None`
+    /// when `row` addresses no history line.
     fn history_range_text(
         &self,
         row: i32,
@@ -681,9 +586,8 @@ impl Terminal {
 #[cfg(test)]
 mod tests {
 
-    /// The copy is correct and every selected history row is fetched from the
-    /// tier exactly once: `take_row_to_line_ops` counts `Line` constructions
-    /// (`row_to_line_with_stored_extras`), and an N-row selection must cost N.
+    /// Each selected history row is fetched from the tier once: `take_row_to_line_ops`
+    /// counts `Line` constructions, and an N-row selection costs N.
     #[test]
     fn scrollback_selection_reads_each_history_line_once() {
         use crate::selection::{SelectionSide, SelectionType};
@@ -700,7 +604,7 @@ mod tests {
             corpus.push_str(&format!("row{i:03}\r\n"));
         }
         term.process(corpus.as_bytes());
-        // Ring reads/writes the fixture performed are not what is being counted.
+        // Not counting the fixture's own ring reads and writes.
         let _ = aterm_grid::test_counters::take_row_to_line_ops();
 
         let selected_rows = i32::try_from(SELECTED).expect("SELECTED fits i32");
@@ -719,8 +623,7 @@ mod tests {
             .expect("a 40-row scrollback selection copies text");
         let reads = aterm_grid::test_counters::take_row_to_line_ops();
 
-        // Identity first: history holds fill lines 0..=(FILL - ROWS), so row -1
-        // is fill line FILL - ROWS and row -SELECTED is SELECTED-1 lines above it.
+        // History holds fill lines 0..=(FILL - ROWS): row -1 is fill line FILL - ROWS.
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(
             lines.len(),
@@ -747,7 +650,7 @@ mod tests {
         );
     }
 
-    /// Select rows `first..=last` whole, as a drag over them does, and copy.
+    /// Select rows `first..=last` whole, as a drag does, and copy.
     fn copy_rows(term: &mut crate::terminal::Terminal, first: i32, last: i32) -> Option<String> {
         use crate::selection::{SelectionSide, SelectionType};
         let cols = term.cols();
@@ -758,10 +661,27 @@ mod tests {
         term.selection_to_string()
     }
 
-    /// A space the program printed in a wrapped row's last column separates two
-    /// words, so the copy keeps it at the join: on screen, from history, and for
-    /// a triple-click's line selection. A row that ends its line still loses
-    /// its trailing blanks.
+    #[test]
+    fn line_selection_copies_every_highlighted_row_before_column_expansion() {
+        use crate::selection::{SelectionSide, SelectionType};
+        let mut term = crate::terminal::Terminal::new(3, 10);
+        term.process(b"first row\r\nsecond row");
+        let selection = term.text_selection_mut();
+        selection.start_selection(0, 5, SelectionSide::Right, SelectionType::Lines);
+        selection.update_selection(1, 0, SelectionSide::Left);
+        selection.complete_selection();
+        assert!(
+            selection.contains(1, 0),
+            "the endpoint row is highlighted whole"
+        );
+        assert_eq!(
+            term.selection_to_string().as_deref(),
+            Some("first row\nsecond row")
+        );
+    }
+
+    /// A space printed in a wrapped row's last column is kept at the join (screen, history,
+    /// triple-click); a row that ends its line still loses its trailing blanks.
     #[test]
     fn copy_keeps_a_space_printed_in_a_wrapped_rows_last_column() {
         use crate::selection::{SelectionSide, SelectionType};
@@ -796,8 +716,8 @@ mod tests {
         );
     }
 
-    /// The same at 80 columns, where dropping the space would fuse a command's
-    /// two arguments, and in prose wrapped mid-sentence.
+    /// The same at 80 columns, where dropping the space would fuse two arguments, and in
+    /// prose.
     #[test]
     fn copy_keeps_wrap_boundary_spaces_in_prose_and_commands() {
         let cmd = "cp ./build/output/release/artifacts/aterm-universal-apple-darwin.tar.zstxxxxxxx \
@@ -819,10 +739,8 @@ mod tests {
         );
     }
 
-    /// A line that ends in blanks across a wrap is trimmed whole, as it was
-    /// before wrapped rows kept their blanks: `printf 'foo%12s'` in 10 columns
-    /// (a padded column wider than the window) copies as `foo`, by drag, by
-    /// triple-click and from history, and a line of nothing but blanks copies
+    /// A line ending in blanks across a wrap is trimmed whole: `printf 'foo%12s'` in 10
+    /// columns copies as `foo` (drag, triple-click, history), and an all-blank line copies
     /// as an empty line.
     #[test]
     fn copy_trims_a_line_that_ends_in_blanks_across_a_wrap() {
@@ -863,8 +781,7 @@ mod tests {
         );
     }
 
-    /// The cell a wide glyph leaves when it wraps early was never written, so
-    /// the copy keeps no blank for it: the program wrote `x中中中中中y`.
+    /// The unwritten cell a wide glyph's early wrap leaves adds no blank to the copy.
     #[test]
     fn copy_adds_no_blank_for_a_wide_glyphs_early_wrap() {
         let mut term = crate::terminal::Terminal::new(4, 10);
@@ -883,9 +800,8 @@ mod tests {
         );
     }
 
-    /// With `ambiguous_width = "wide"` a scrollback copy of the cells a line's
-    /// `foo` is drawn in (4-6, after two two-cell arrows) copies `foo`, as the
-    /// same cells copy on the screen.
+    /// With `ambiguous_width = "wide"` a scrollback copy of cells 4-6 (after two two-cell
+    /// arrows) copies `foo`, as on the screen.
     #[test]
     fn a_scrollback_copy_measures_ambiguous_characters_as_the_grid_draws_them() {
         use crate::selection::{SelectionSide, SelectionType};
@@ -929,13 +845,9 @@ mod tests {
         );
     }
 
-    /// A web host's double-click and link hit-test (`smart_word_at`) find the
-    /// word under a cell in the cells the grid drew it in when two flag halves
-    /// were drawn into neighbouring cells out of order (r16 selection-stride):
-    /// they stay two two-column cells, so `wx` is in cells 4-5 and the URL in
-    /// 7-27, where a walk of the row's text, pairing the halves into one
-    /// two-column flag, put both two cells left (on origin/main a click on
-    /// `w` found nothing and one in the URL answered cells 5-25).
+    /// `smart_word_at` (a web host's double-click and link hit-test) finds the word in the
+    /// cells the grid drew it in when two flag halves were drawn out of order: they stay
+    /// two two-column cells, so `wx` is in cells 4-5 and the URL in 7-27.
     #[test]
     fn smart_word_at_finds_the_word_in_the_cells_the_grid_drew() {
         let mut term = crate::terminal::Terminal::new(4, 40);
@@ -960,11 +872,8 @@ mod tests {
         ] {
             assert_eq!(term.smart_word_at(0, col, &smart), want, "column {col}");
         }
-        // Scrolled into history and back into view: the ring tier draws the
-        // row from its own cells, halves apart, and the words are read there.
-        // Reading a history row's cells from its stored line paired the
-        // halves: column 4 found nothing and column 2, a flag half, answered
-        // a word (r16 selection-stride review).
+        // Scrolled into history and back into view: the ring tier draws the row from its
+        // own cells, halves apart, and the words are read there.
         term.process(b"\r\n1\r\n2\r\n3\r\n4");
         term.scroll_display(1);
         assert_eq!(
@@ -991,16 +900,14 @@ mod tests {
         );
     }
 
-    /// The history tiers a row can be drawn from: the ring tier, which draws
-    /// a row from its own cells, and past the ring (a one-row ring), where a
-    /// row is drawn from its stored line.
+    /// The history tiers: the ring tier draws a row from its own cells; past the ring (a
+    /// one-row ring) a row is drawn from its stored line.
     const HISTORY_TIERS: [(&str, Option<usize>); 2] =
         [("ring tier", None), ("past the ring", Some(1))];
 
-    /// A terminal `rows` x `cols` (`ring`: a ring of that many rows, else the
-    /// default) on whose top row `write` is processed, then `before_scroll`,
-    /// then scrolled into history: the oldest history row, drawn from the
-    /// `tier` named, at the selection-space row returned.
+    /// A terminal `rows` x `cols` (`ring` rows of ring, else the default) with `write` on
+    /// its top row, then `before_scroll`, scrolled into history: the oldest history row,
+    /// drawn from `tier`, and its selection-space row.
     fn row_in_history_tier(
         tier: &str,
         ring: Option<usize>,
@@ -1035,12 +942,9 @@ mod tests {
         (term, row)
     }
 
-    /// A copy of history cells written before a live switch to
-    /// `ambiguous_width = "wide"` copies what those cells draw, on either
-    /// history tier: the row keeps the cells it was drawn in, one an arrow,
-    /// so cells 2-4 are `foo`. The copy re-measured a history row's text
-    /// under the policy now in force, two cells an arrow, and copied `→f`
-    /// (r16 selection-stride review).
+    /// History cells written before a live switch to `ambiguous_width = "wide"` copy what
+    /// they draw, on either tier: the row keeps its cells (an arrow is one), so cells 2-4
+    /// are `foo`.
     #[test]
     fn a_history_copy_after_a_live_ambiguous_switch_copies_the_cells_drawn() {
         use crate::selection::{SelectionSide, SelectionType};
@@ -1079,15 +983,9 @@ mod tests {
         }
     }
 
-    /// A history row draws a flag whose halves a mark separates as the screen
-    /// drew it, on either tier: one cell, so `ZEBRA` stays in cells 3-7, and
-    /// a copy of those cells copies it. The live grid folds the second half
-    /// into the cell holding the first and its mark; the layout of a stored
-    /// line split them, so on origin/main the row moved two cells right once
-    /// it scrolled off (the ring tier, finding the cell two units, drew it
-    /// that way too), and once a copy read a history row's columns from the
-    /// cells it is drawn in, the copy of cells 3-7 lost `RA` (r16
-    /// selection-stride review).
+    /// A history row draws a flag whose halves a mark separates as the screen drew it (one
+    /// cell, the live grid folding the second half into the first's cell), on either tier,
+    /// so `ZEBRA` stays in cells 3-7 and a copy of them copies it.
     #[test]
     fn a_history_row_draws_a_flag_around_a_mark_as_the_screen_did() {
         let line = "\u{1f1fa}\u{301}\u{1f1f8} ZEBRA";
@@ -1122,12 +1020,9 @@ mod tests {
         }
     }
 
-    /// Every column of a history row's cells names the cell either history
-    /// tier draws there, for shapes whose text and cells disagree (r16
-    /// selection-stride review): the cell's text in `written_line_cells`
-    /// starts with what `display_cell_grapheme` reads from the drawn row, a
-    /// wide cell's right half names the cell it belongs to, and a column no
-    /// cell is read in draws nothing.
+    /// Every column of a history row's cells names the cell either tier draws there, for
+    /// shapes whose text and cells disagree; a wide cell's right half names its cell, and a
+    /// column no cell is read in draws nothing.
     #[test]
     fn a_history_rows_cells_name_the_cells_it_is_drawn_in() {
         let shapes = [
@@ -1175,9 +1070,8 @@ mod tests {
         }
     }
 
-    /// [`scrollback_line_range_text`] over a stored line drawn from its own
-    /// text on a row `cols` wide: the walk a row past the ring tier is drawn
-    /// by.
+    /// [`scrollback_line_range_text`] over a stored line laid out `cols` wide, as a row past
+    /// the ring tier is drawn.
     fn stored_range_text(
         bytes: &[u8],
         ceiling: usize,
@@ -1230,12 +1124,7 @@ mod tests {
         }
     }
 
-    // ── selection_to_string caps ─────────────────────────────────────────────
-    //
-    // The production caps are too large for a fast test, so these call
-    // selection_to_string_capped with small caps: the row cap truncates the tail
-    // and keeps the start row/col, the byte cap truncates, and caps above the
-    // content match the uncapped public method.
+    // ── selection_to_string caps, at small values via selection_to_string_capped ──
 
     fn selection_grid() -> crate::terminal::Terminal {
         use crate::selection::{SelectionSide, SelectionType};
@@ -1293,7 +1182,7 @@ mod tests {
             "an overflowing row is clamped"
         );
         assert_eq!(r.len(), 10, "hard cap: result never exceeds max_bytes");
-        // Never split a multi-byte char: budget 2 < 3-byte '你' -> push nothing.
+        // Budget 2 < the 3-byte '你': nothing is pushed.
         let mut r2 = String::from("ab");
         assert!(push_row_capped(&mut r2, "你好", 4));
         assert_eq!(
@@ -1305,8 +1194,7 @@ mod tests {
 
     #[test]
     fn selection_byte_cap_is_hard_within_a_single_row() {
-        // max_bytes smaller than the first row's width: the cap must clamp mid-row
-        // (not overshoot) and flag truncation. Row 0 is "R0" (2 bytes); cap = 1.
+        // A cap below the first row's width clamps mid-row.
         let term = selection_grid();
         let (text, truncated) = term.selection_to_string_capped(usize::MAX, 1);
         let copied = text.expect("selection has text");
@@ -1320,7 +1208,6 @@ mod tests {
     #[test]
     fn selection_no_truncation_under_caps_is_byte_identical() {
         let term = selection_grid();
-        // Caps far above the content must not alter output vs the uncapped method.
         let (capped, truncated) = term.selection_to_string_capped(1_000, 1_000_000);
         let full = term.selection_to_string();
         assert!(!truncated, "generous caps do not flag truncation");
@@ -1331,10 +1218,6 @@ mod tests {
         );
     }
 
-    // ── scrollback line extraction bounds the scan to the ceiling ───────────
-    //
-    // scrollback_line_range_text reads at most `max_scan_bytes` of a line (a
-    // crafted checkpoint can inject a multi-MiB one). Tested at a small ceiling.
     #[test]
     fn line_text_bounded_borrows_valid_utf8_and_owns_lossy_text() {
         use std::borrow::Cow;
@@ -1363,35 +1246,29 @@ mod tests {
     #[test]
     fn scrollback_line_range_text_bounds_scan_to_ceiling() {
         use super::TrailingBlanks;
-        // 2000 single-byte, single-width columns; ceiling of 100 bytes.
         let bytes = vec![b'A'; 2000];
 
-        // In-range within the ceiling: cols 0..9 → 10 'A's.
         let read = |start, end, ceiling| {
             stored_range_text(&bytes, ceiling, 2048, (start, end), TrailingBlanks::Trim)
         };
         assert_eq!(read(0, 9, 100).len(), 10);
 
-        // Columns past the 100-byte ceiling are not materialized, so empty.
         assert!(
             read(500, 509, 100).is_empty(),
             "columns past the scan ceiling must not be materialized"
         );
 
-        // With a ceiling above the requested column, the same request is reachable
-        // — proving the emptiness above is the ceiling, not a logic bug.
+        // Reachable under a higher ceiling: the emptiness above is the ceiling's.
         assert_eq!(read(500, 509, 4096).len(), 10);
     }
 
     #[test]
     fn scrollback_line_range_text_lossy_prefix_is_bounded() {
         use super::TrailingBlanks;
-        // Invalid UTF-8 forces the lossy path; a >ceiling line must still only touch
-        // a bounded prefix (no panic, bounded output).
+        // Invalid UTF-8 forces the lossy path, which still reads only a bounded prefix.
         let mut bytes = vec![0xFFu8; 4096]; // invalid UTF-8, 4096 bytes
         bytes.extend_from_slice(b"tail");
         let out = stored_range_text(&bytes, 64, 80, (0, 3), TrailingBlanks::Trim);
-        // 64-byte prefix of 0xFF → up to 64 U+FFFD (3 bytes each); cols 0..3 → 4.
         assert!(out.chars().count() <= 4, "bounded to the requested columns");
         assert!(
             !out.contains("tail"),
@@ -1399,21 +1276,17 @@ mod tests {
         );
     }
 
-    // ── the real checkpoint-restore path extracts correctly on a large line ─────
     #[test]
     fn get_line_text_extracts_from_large_injected_scrollback_line() {
         use crate::grid::Grid;
         use crate::scrollback::{Line, Scrollback};
-        // As via checkpoint restore_grid: a tiered scrollback holding one 2 MiB
-        // line, twice the scan ceiling.
+        // One 2 MiB line, twice the scan ceiling, as a checkpoint restore can leave.
         let big = vec![b'A'; 2 * 1024 * 1024];
         let mut scrollback = Scrollback::with_defaults();
         scrollback.push_line(Line::from_bytes(&big));
         let grid = Grid::with_tiered_scrollback(4, 80, 1000, scrollback);
         let term = crate::terminal::Terminal::with_grid(grid);
 
-        // In-range extraction (row -1 = most recently scrolled-off) still works and
-        // is bounded to the requested column span, not the 2 MiB line.
         let text = term
             .get_line_text(-1, Some((0, 79)))
             .expect("scrollback line has text");
@@ -1424,11 +1297,8 @@ mod tests {
         );
     }
 
-    // ── terminal-relative rows are live-frame (scroll-invariant) ────────────
-
-    /// get_line_text's positive rows are terminal-relative: row 0 is the live
-    /// top regardless of scroll position, as the renderer's selection contract
-    /// (`sel_row = viewport_row - display_offset`) assumes.
+    /// `get_line_text`'s positive rows are terminal-relative: row 0 is the live top at any
+    /// scroll position, as the renderer's `sel_row = viewport_row - display_offset` assumes.
     #[test]
     fn get_line_text_positive_rows_are_scroll_invariant() {
         let mut term = crate::terminal::Terminal::new(5, 20);
@@ -1448,8 +1318,7 @@ mod tests {
         }
     }
 
-    /// Copy reads the rows the highlight paints: the copied text does not
-    /// change when the viewport scrolls between drag and copy.
+    /// The copied text does not change when the viewport scrolls between drag and copy.
     #[test]
     fn selection_copy_is_scroll_invariant() {
         use crate::selection::{SelectionSide, SelectionType};
@@ -1457,7 +1326,6 @@ mod tests {
         for i in 0..30 {
             term.process(format!("line{i}\r\n").as_bytes());
         }
-        // Select live row 2 ("line28") in terminal-relative coordinates.
         let sel = term.text_selection_mut();
         sel.start_selection(2, 0, SelectionSide::Left, SelectionType::Simple);
         sel.update_selection(2, 19, SelectionSide::Right);
@@ -1472,10 +1340,7 @@ mod tests {
         );
     }
 
-    /// Fixture: a long docker command auto-wrapped across two rows of an
-    /// 80-column screen, then a hard-newline line. Row 0 holds the first 80
-    /// columns, row 1 the remaining 50 with `is_wrapped`; row 2 is another
-    /// logical line.
+    /// A docker command soft-wrapped across two 80-column rows, then a hard-newline line.
     fn wrapped_docker_fixture() -> (crate::terminal::Terminal, String) {
         const HEAD: &str =
             "docker run --rm -v $PWD:/w -w /w --network host --name bld-boxy aterm-build rust";
@@ -1492,8 +1357,7 @@ mod tests {
         (term, cmd)
     }
 
-    /// A soft wrap is one logical line and a hard newline ends it: the span the
-    /// word/line click gestures select.
+    /// A soft wrap is one logical line and a hard newline ends it.
     #[test]
     fn logical_line_span_joins_a_soft_wrap_and_stops_at_a_hard_newline() {
         let (term, _) = wrapped_docker_fixture();
@@ -1523,19 +1387,16 @@ mod tests {
         );
     }
 
-    /// The logical line containing `row`, joined as a double-click reads it:
-    /// `(text, first_row, last_row)`.
+    /// The logical line containing `row` as a double-click reads it: `(text, first, last)`.
     fn logical_line(term: &crate::terminal::Terminal, row: i32) -> Option<(String, i32, i32)> {
         let (first, last) = term.logical_line_span(row);
         let (text, _) = term.line_range_cells(first, last)?;
         Some((text, first, last))
     }
 
-    /// Every column `g` of `term`'s joined rows `first..=last` names the cell
-    /// `(first + g / cols, g % cols)` the grid drew there: its text starts at
-    /// the byte the join's cells give for `g`, a wide glyph's right half
-    /// names its left half, and only the blanks past the last row's text are
-    /// in no cell.
+    /// Every column `g` of the joined rows `first..=last` names the cell
+    /// `(first + g / cols, g % cols)` the grid drew there; a wide glyph's right half names
+    /// its left half, and only the blanks past the last row's text are in no cell.
     fn assert_join_names_the_drawn_cells(term: &crate::terminal::Terminal, first: i32, last: i32) {
         let cols = usize::from(term.cols());
         let (text, cells) = term.line_range_cells(first, last).expect("rows to join");
@@ -1552,7 +1413,6 @@ mod tests {
                 );
                 continue;
             }
-            // Only the blank cells past the last row's text are in no cell.
             let Some(byte) = byte else {
                 assert!(
                     g >= cells.end_col() && drawn == " ",
@@ -1583,13 +1443,9 @@ mod tests {
         );
     }
 
-    /// The join names the cells the grid drew where a row's text measures
-    /// otherwise (r16 selection-stride): two flag halves drawn into
-    /// neighbouring cells out of order stay two cells (a walk of the text
-    /// pairs them into one), and a VS16 base in the last column stays one
-    /// cell (a walk widens it to two), so a row's text is no measure of its
-    /// columns. On origin/main the join was padded from each row's measured
-    /// width, putting every later column of the run off its cell.
+    /// The join names the cells the grid drew where a row's text measures otherwise: two
+    /// flag halves drawn out of order stay two cells, and a VS16 base in the last column
+    /// stays one.
     #[test]
     fn line_range_cells_name_the_cells_where_a_row_measures_otherwise() {
         let mut term = crate::terminal::Terminal::new(4, 10);
@@ -1609,8 +1465,7 @@ mod tests {
         assert_join_names_the_drawn_cells(&term, 1, 2);
         assert_join_names_the_drawn_cells(&term, 0, 1);
 
-        // A row reads the same from scrollback: the stored VS16 row is drawn
-        // with its base one cell wide in the last column too.
+        // The same from scrollback: the stored VS16 base stays one cell in the last column.
         let mut term = crate::terminal::Terminal::new(3, 10);
         term.process("abcdefghi\u{2714}\u{fe0f}jk lm".as_bytes());
         let live = term.line_range_cells(0, 1).expect("a live run");
@@ -1619,11 +1474,9 @@ mod tests {
         assert_eq!(term.line_range_cells(-2, -1), Some(live));
     }
 
-    /// A double-click, and a web host's word under a cell, read what the
-    /// glass shows: a history row whose stored line is wider than the grid
-    /// (as a checkpoint restore can leave one) gives only the text its cells
-    /// draw, so the word rules' window stays as long as the rows it spans,
-    /// not the 2 MiB line behind one of them.
+    /// A history row whose stored line is wider than the grid (a checkpoint restore can
+    /// leave one) gives only the text its cells draw, so a double-click's window stays as
+    /// long as the rows it spans.
     #[test]
     fn line_range_cells_reads_only_the_text_a_rows_cells_draw() {
         use crate::grid::Grid;
@@ -1636,7 +1489,6 @@ mod tests {
         let (text, cells) = term.line_range_cells(-1, -1).expect("a history row");
         assert_eq!(text, "A".repeat(80), "the 80 cells the row draws");
         assert_eq!((cells.end_col(), cells.end_byte()), (80, 80));
-        // A web host's word under a cell, with the row scrolled into view.
         term.scroll_display(1);
         let smart = crate::selection::SmartSelection::with_builtin_rules();
         assert_eq!(
@@ -1645,12 +1497,11 @@ mod tests {
         );
     }
 
-    /// A logical line that straddles the scrollback/live boundary joins across
-    /// it: the head is history row -1, the tail is live row 0.
+    /// A logical line straddling the scrollback/live boundary joins across it.
     #[test]
     fn logical_line_span_joins_across_the_scrollback_boundary() {
         let mut term = crate::terminal::Terminal::new(2, 10);
-        // Wraps to two rows, then one more line pushes the head into history.
+        // Wraps to two rows; more lines push the head into history.
         term.process(b"ABCDEFGHIJKL");
         term.process(b"\r\nsecond\r\nthird");
         assert_eq!(

@@ -2,16 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Kitty keyboard protocol types (CSI u encoding, modifier handling, flag stacks).
+//! Kitty keyboard protocol state: the enhancement flags and the per-screen push/pop stacks.
 //!
 //! Reference: <https://sw.kovidgoyal.net/kitty/keyboard-protocol/>
 
-/// Kitty keyboard protocol enhancement flags.
-///
-/// These flags control progressive enhancement of keyboard handling.
-/// Applications request specific levels using `CSI = flags u` sequences.
-///
-/// Reference: <https://sw.kovidgoyal.net/kitty/keyboard-protocol/>
+/// Kitty keyboard protocol enhancement flags, which applications set with `CSI = flags u`
+/// and push with `CSI > flags u`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct KittyKeyboardFlags(u8);
@@ -98,26 +94,20 @@ impl KittyKeyboardFlags {
     pub fn apply(&mut self, bits: u8, mode: u8) {
         let bits = bits & 0b1_1111; // Mask to valid flags
         match mode {
-            // Mode 0 = set: aterm's parser delivers an empty mode
-            // (`CSI = f ; u`) as 0, and an empty parameter is the default, 1.
-            // A literal `CSI = f ; 0 u` reads the same way (#7714); kitty
-            // no-ops that one, and the deviation is deliberate and harmless.
+            // Mode 0 is set: the parser delivers an empty mode (`CSI = f ; u`) as 0, and an
+            // empty parameter means the default, 1. A literal `CSI = f ; 0 u` reads the same
+            // (#7714) where kitty no-ops it; the deviation is harmless.
             0 | 1 => self.0 = bits, // Set exactly these bits
             2 => self.0 |= bits,    // OR with current
             3 => self.0 &= !bits,   // Clear specified bits
-            // An explicit UNDEFINED mode (>= 4) changes nothing — kitty's
-            // set handler is if/else-if over 1/2/3, so a program probing a
-            // future mode gets "unsupported", not "clobber my flags".
+            // An undefined mode (>= 4) changes nothing, as in kitty's set handler.
             _ => {}
         }
     }
 }
 
-/// Kitty keyboard protocol stack entry.
-///
-/// Each entry stores flags with a valid bit (0x80) set.
-/// Validity is tracked by the stack pointer, not by reading this bit.
-/// The bit is set for consistency but never checked at runtime.
+/// Kitty keyboard protocol stack entry: flags with a valid bit (0x80) set. The stack pointer,
+/// not this bit, tracks validity.
 #[derive(Debug, Clone, Copy, Default)]
 struct KittyKeyboardStackEntry(u8);
 
@@ -149,9 +139,9 @@ pub struct KittyKeyboardState {
     main_saved_flags: Option<KittyKeyboardFlags>,
     /// Saved flags for the alternate screen while the main screen is active.
     alt_saved_flags: Option<KittyKeyboardFlags>,
-    /// Stack for main screen (8 entries max, like Kitty).
+    /// Stack for the main screen: 8 slots, at most 7 saved entries (+ the live mode).
     main_stack: [KittyKeyboardStackEntry; 8],
-    /// Stack for alternate screen (8 entries max).
+    /// Stack for the alternate screen.
     alt_stack: [KittyKeyboardStackEntry; 8],
     /// Current stack pointer for main screen (points to next free slot).
     main_sp: usize,
@@ -258,11 +248,8 @@ impl KittyKeyboardState {
         }
     }
 
-    /// Push current flags onto the stack (CSI > flags u).
-    ///
-    /// The flags parameter specifies the new flags to activate after pushing.
-    /// If the stack is full, the oldest entry is evicted.
-    // Skip: Vec::extend_from_slice alloc class.
+    /// Push the current flags (CSI > flags u) and activate `new_flags`; a full stack evicts
+    /// its oldest entry.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn push_flags_for_buffer(&mut self, new_flags: u8, buffer: ScreenBuffer) {
         let (stack, sp) = if matches!(buffer, ScreenBuffer::Alternate) {
@@ -271,42 +258,27 @@ impl KittyKeyboardState {
             (&mut self.main_stack, &mut self.main_sp)
         };
 
-        // If the stack is full, shift everything down (evict oldest). The
-        // retained depth is 7 SAVED entries + the live current mode = 8 total
-        // modes, matching kitty's 8-slot key_encoding_flags array (which
-        // stores the current mode as its top entry). A 9-mode depth diverged
-        // from kitty after eviction: a pop that exactly emptied the stack
-        // restored the stale evicted-era stack[0] where kitty resets to 0
-        // (differentially checked against kitty's screen.c push/pop/set over
-        // 200k random sequences). The read index is masked to the array's
-        // 0..=7 range (`(i + 1) & 7`); for `i` in 0..6 that is exactly
-        // `i + 1`, so behaviour is unchanged while the Trust gate sees the
-        // index is always in bounds.
+        // A full stack evicts its oldest entry. The depth is 7 saved entries + the live mode =
+        // 8, kitty's 8-slot key_encoding_flags (current mode on top); a deeper stack diverges
+        // from kitty when a pop empties it after an eviction. `(i + 1) & 7` is `i + 1` for i in
+        // 0..6, masked (with a saturating add) so the Trust gate sees every index in bounds.
         if *sp >= 7 {
             for i in 0..6 {
-                // `(i + 1) & 7` is in 0..=7 by the mask; `i < 6` bounds the store.
-                // saturating_add keeps the index arithmetic provable (exact here).
                 stack[i] = stack[i.saturating_add(1) & 7];
             }
             *sp = 6;
         }
 
-        // Push current flags. `*sp <= 7` here (either it was < 8, or the block
-        // above just clamped it to 7), so the masked index `*sp & 7` equals
-        // `*sp`. The mask is inlined into the index expression (a `let` binding
-        // did not carry the 0..=7 range to the gate) and the bump saturates
-        // (`*sp <= 7`, so the result is `*sp + 1` unchanged).
+        // `*sp <= 6` here, so the mask is identity and the bump exact; the mask sits in the
+        // index expression because a `let` binding did not carry the 0..=7 range to the gate.
         stack[*sp & 7] = KittyKeyboardStackEntry::new(self.flags);
         *sp = (*sp & 7).saturating_add(1);
 
-        // Set new flags
         self.flags = KittyKeyboardFlags::from_bits(new_flags);
     }
 
-    /// Pop flags from the stack (CSI < n u).
-    ///
-    /// Pops n entries (default 1) and restores the flags from the top of the remaining stack.
-    /// If the stack becomes empty, flags are reset to 0.
+    /// Pop `count` entries (CSI < n u), restoring the flags the deepest popped entry saved;
+    /// popping more entries than the stack holds resets the flags to 0.
     pub fn pop_flags_for_buffer(&mut self, count: u16, buffer: ScreenBuffer) {
         let (stack, sp) = if matches!(buffer, ScreenBuffer::Alternate) {
             (&mut self.alt_stack, &mut self.alt_sp)
@@ -314,50 +286,40 @@ impl KittyKeyboardState {
             (&mut self.main_stack, &mut self.main_sp)
         };
 
-        // An EXPLICIT `CSI < 0 u` pops nothing (kitty's loop is
-        // `num && i-- > 0`); the spec's default-to-1 clause covers only the
-        // OMITTED-parameter case, which the dispatcher resolves before this
-        // call. The early return also keeps count=0 out of the normal-pop
-        // branch, which would otherwise reload the one-past-top slot.
+        // An explicit `CSI < 0 u` pops nothing (kitty's loop is `num && i-- > 0`); the spec's
+        // default of 1 covers only an omitted parameter, which the dispatcher resolves. The
+        // early return also keeps count=0 from reloading the one-past-top slot.
         let count = count as usize;
         if count == 0 {
             return;
         }
 
-        // Pop count > stack depth (including empty stack): per Kitty spec,
-        // reset to default (flags = 0). This handles the case where flags
-        // were set via CSI = u without a prior push (#7421, #7482).
+        // Popping more than the stack holds (an empty stack included) resets to 0 per the
+        // spec, also when flags were set by `CSI = u` without a push (#7421, #7482).
         if count > *sp {
             self.flags = KittyKeyboardFlags::none();
             *sp = 0;
             return;
         }
 
-        // Normal pop: restore stack[new_sp]. This includes new_sp==0, where
-        // stack[0] holds the flags saved by the first push (#5679). `count <=
-        // *sp <= 8` here (the early return above handles `count > *sp`), so
-        // `wrapping_sub` never wraps, `new_sp` is 0..=7, and `new_sp & 7 ==
-        // new_sp`; the wrapping op and the mask only prove the subtraction and
-        // the load safe to the Trust gate.
+        // Normal pop: restore stack[new_sp], including new_sp == 0, which holds the flags the
+        // first push saved (#5679). `count <= *sp <= 7`, so `wrapping_sub` never wraps and the
+        // mask is identity; both only prove the subtraction and load safe to the Trust gate.
         let new_sp = (*sp).wrapping_sub(count);
         self.flags = stack[new_sp & 7].flags();
         *sp = new_sp;
     }
 
-    /// Reset the CURRENT screen's kitty keyboard state only (for DECSTR).
-    ///
-    /// The kitty spec is silent on soft reset; clearing the active screen's
-    /// flags/stack on DECSTR is an xterm-style soft-reset convention (foot
-    /// and ghostty do the same). The INACTIVE screen's saved flags and stack
-    /// must survive — a full both-screens wipe belongs to RIS ([`Self::reset`],
-    /// matching kitty's screen_reset).
+    /// Reset the current screen's kitty keyboard state only (DECSTR). The kitty spec is silent
+    /// on soft reset; this follows the xterm-style convention foot and ghostty use. The
+    /// inactive screen's saved flags and stack survive; RIS ([`Self::reset`]) wipes both, as
+    /// kitty's screen_reset does.
     pub fn reset_current_screen(&mut self, buffer: ScreenBuffer) {
         self.flags = KittyKeyboardFlags::none();
         if matches!(buffer, ScreenBuffer::Alternate) {
             self.alt_stack = [KittyKeyboardStackEntry::default(); 8];
             self.alt_sp = 0;
-            // The current screen's saved-flags slot is already None while the
-            // screen is active; clearing is harmless defense.
+            // Already None while the screen is active; cleared for safety.
             self.alt_saved_flags = None;
         } else {
             self.main_stack = [KittyKeyboardStackEntry::default(); 8];
@@ -396,10 +358,8 @@ impl KittyKeyboardState {
             alt_saved_flags: self.alt_saved_flags,
             main_stack,
             alt_stack,
-            // 7 saved entries max (+ the live mode = kitty's 8 retained
-            // modes). A restored sp of 8 would make the next push evict one
-            // entry AND overwrite another (the eviction shift leaves slot 6
-            // stale and the push lands on it).
+            // At most 7 saved entries (+ the live mode = kitty's 8). A restored sp of 8 would
+            // make the next push evict one entry and overwrite another.
             main_sp: self.main_sp.min(7) as u8,
             alt_sp: self.alt_sp.min(7) as u8,
         }
@@ -410,8 +370,7 @@ impl KittyKeyboardState {
         self.flags = snapshot.flags;
         self.main_saved_flags = snapshot.main_saved_flags;
         self.alt_saved_flags = snapshot.alt_saved_flags;
-        // Clamp to the 7-saved-entry depth; a legacy sp=8 snapshot would
-        // otherwise lose two entries on the next push (see `snapshot`).
+        // Clamp to the 7-saved-entry depth (see `snapshot`).
         self.main_sp = usize::from(snapshot.main_sp.min(7));
         self.alt_sp = usize::from(snapshot.alt_sp.min(7));
 

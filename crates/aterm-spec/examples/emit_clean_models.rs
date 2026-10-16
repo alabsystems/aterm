@@ -642,61 +642,6 @@ fn progress_island(index: usize, m: &Model, live: &Liveness) -> Result<(String, 
     ))
 }
 
-/// The `Buggy` values a model's mutants are written for: every literal it is
-/// compared with (`Buggy == 3`), and 1 wherever it is used another way. Each
-/// dial is a race the model was written to catch.
-fn dials(m: &Model) -> Vec<i64> {
-    fn walk(e: &Expr, out: &mut BTreeSet<i64>) {
-        match e {
-            Expr::Eq(a, b) | Expr::Neq(a, b) => match (&**a, &**b) {
-                (Expr::ConstRef("Buggy"), Expr::Int(k))
-                | (Expr::Int(k), Expr::ConstRef("Buggy")) => {
-                    out.insert(*k);
-                }
-                _ => {
-                    walk(a, out);
-                    walk(b, out);
-                }
-            },
-            Expr::ConstRef("Buggy") => {
-                out.insert(1);
-            }
-            Expr::Int(_) | Expr::Var(_) | Expr::ConstRef(_) | Expr::Bool(_) => {}
-            Expr::Add(a, b)
-            | Expr::Sub(a, b)
-            | Expr::Gt(a, b)
-            | Expr::Le(a, b)
-            | Expr::Or(a, b)
-            | Expr::And(a, b)
-            | Expr::Iff(a, b)
-            | Expr::InRange(a, b)
-            | Expr::Except(_, a, b) => {
-                walk(a, out);
-                walk(b, out);
-            }
-            Expr::If(a, b, c) | Expr::Forall(_, a, b, c) | Expr::Comprehension(_, a, b, c) => {
-                walk(a, out);
-                walk(b, out);
-                walk(c, out);
-            }
-            Expr::FnAccess(_, a) => walk(a, out),
-        }
-    }
-    let mut out = BTreeSet::new();
-    for action in &m.actions {
-        if let Some(guard) = &action.guard {
-            walk(guard, &mut out);
-        }
-        for update in &action.updates {
-            walk(&update.expr, &mut out);
-        }
-    }
-    for invariant in &m.invariants {
-        walk(&invariant.expr, &mut out);
-    }
-    out.into_iter().filter(|dial| *dial > 0).collect()
-}
-
 /// `interp::bmc`, with a space past the interpreter's limit (which panics)
 /// reported as `None`, quietly.
 fn bounded_check(m: &Model) -> Option<Result<usize, String>> {
@@ -768,7 +713,7 @@ fn main() {
         // listed with the reason (a dial that breaks only liveness is safe).
         let mut mutants: Vec<(i64, Model)> = Vec::new();
         let mut others: Vec<String> = Vec::new();
-        for dial in dials(original) {
+        for dial in original.mutant_dials() {
             let Ok(split) = determinized(&interp::with_buggy(original, dial)) else {
                 others.push(format!("{dial}: not determinized"));
                 continue;

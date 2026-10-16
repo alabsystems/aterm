@@ -1599,7 +1599,7 @@ pub fn write_rest(planned: Planned) -> Result<Report, String> {
     record.push_str(&aterm_types::rfc3339::format_rfc3339(planned.now));
     record.push_str("\"\n");
     // THE RECORD IS THE HALF A PUBLISHER CANNOT DO WITHOUT, so its write is checked, and
-    // atomic for the same reason the roster's is. `tools/atpkg-index.sh` refuses to build
+    // atomic for the same reason the roster's is. `atpkg-publish index` refuses to build
     // an index when `machine.toml` is missing, empty or unparseable — the index must state
     // WHICH machine signed it, and that id is not derivable from the key — and its remedy
     // is to write the record back by hand (it prints the two lines). `atpkg-keys join`
@@ -2562,7 +2562,7 @@ mod tests {
     /// THE MACHINE'S PUBLIC RECORD IS A CHECKED WRITE, NOT A WISH.
     ///
     /// `machine.toml` is the other half of this machine's identity, and it is the half a
-    /// publisher cannot do without: `tools/atpkg-index.sh` refuses to build an index when
+    /// publisher cannot do without: `atpkg-publish index` refuses to build an index when
     /// the record is missing and names ONE remedy — "Re-run `atpkg-keys join --id
     /// <this-machine-id>`". That remedy is refused by this module's own preflight the
     /// moment `machine.key` exists, and by `roster_ops::add` for an id already on the

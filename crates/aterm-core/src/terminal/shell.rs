@@ -1,11 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Shell integration types and constants.
-//!
-//! The data types live in `aterm-types` and are re-exported here with the
-//! terminal-internal constants and state. Most API surface is in
-//! [`super::shell_api`].
+//! Shell integration types (re-exported from `aterm-types`) and the terminal's caps on
+//! them. Most of the API is in [`super::shell_api`].
 
 pub use aterm_types::{
     Annotation, BlockState, CommandMark, OutputBlock, TerminalMark, current_time_ms,
@@ -25,6 +22,5 @@ pub(super) const TERMINAL_MARKS_MAX: usize = 1000;
 /// first.
 pub(super) const ANNOTATIONS_MAX: usize = 1000;
 
-// ShellState lives in `domain` (a leaf module) to avoid a semantic -> terminal
-// dependency cycle.
+// `ShellState` lives in `domain` (a leaf module) to avoid a dependency cycle.
 pub use crate::domain::ShellState;

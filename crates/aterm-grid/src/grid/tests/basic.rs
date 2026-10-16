@@ -128,7 +128,6 @@ fn grid_scroll_up() {
     grid.line_feed();
     grid.write_char('C');
 
-    // Now at bottom, scroll
     grid.line_feed();
     grid.write_char('D');
 
@@ -273,7 +272,6 @@ fn test_row_text_complex_chars_and_combining_marks() {
 
     let mut grid = Grid::new(4, 20);
 
-    // Write "Hi " at columns 0-2
     for c in "Hi ".chars() {
         grid.write_char(c);
     }
@@ -329,7 +327,7 @@ fn test_row_text_bmp_only_unchanged() {
     assert_eq!(text, "Hello World");
 }
 
-// --- Supplementary plane character tests ---
+// Supplementary-plane characters
 
 #[test]
 fn write_char_preserves_supplementary_plane_emoji() {
@@ -369,7 +367,6 @@ fn write_char_supplementary_sets_complex_flag() {
 #[test]
 fn write_char_supplementary_mixed_with_ascii() {
     let mut grid = Grid::new(4, 40);
-    // Write: "Hi " + rocket + " bye"
     for c in "Hi ".chars() {
         grid.write_char(c);
     }

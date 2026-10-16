@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance for the release-channel floor lifecycle. The production
-//! resolver and late guard remain in `publish.rs`; this test projects their real
-//! decisions onto the single-source derived model and keeps explicit mutants.
+//! Tier-1 conformance for the release-channel floor lifecycle: the real resolver and late guard
+//! in `publish.rs`, projected onto the derived model, with explicit mutants.
 
 use crate::{ledger, manifest_out, publish, verify};
 
@@ -70,8 +69,8 @@ fn frozen_state(
     state.insert("frozen_floor", numeric(carried));
     state.insert("journal_floor", numeric(carried));
     state.insert("latest_floor", numeric(newest));
-    // The pure guard is modeled at its required call site: inside the release
-    // lease that must remain held through PublishChecked.
+    // The pure guard is modeled at its required call site: inside the release lease, held
+    // through PublishChecked.
     state.insert("lease_owned", 1);
     state
 }
@@ -114,9 +113,8 @@ fn command_ok() -> RunOut {
     }
 }
 
-/// Exhaustively bind the real carry-forward resolver to the model over the whole
-/// bounded domain. `None` and `Some(0)` deliberately project to the same canonical
-/// zero state, matching the manifest wire policy.
+/// Exhaustively bind the real carry-forward resolver to the model over the bounded domain.
+/// `None` and `Some(0)` both project to the zero state, as on the manifest wire.
 #[test]
 fn effective_min_build_conforms_to_release_channel_floor_model() {
     let model = release_channel_floor_model();
@@ -155,8 +153,8 @@ fn effective_min_build_conforms_to_release_channel_floor_model() {
                     assert_eq!(after["journal_floor"], real_floor);
                     assert_eq!(real_floor, maximum);
 
-                    // NEGATIVE CONTROL 1: the operator-only mutant must disagree
-                    // whenever the live channel carries the larger floor.
+                    // Negative control: the operator-only mutant disagrees whenever the live
+                    // channel carries the larger floor.
                     if numeric(*operator) < numeric(*observed) {
                         let dropped = buggy.successors("ResolveOperatorOnly", &before)[0].clone();
                         assert_eq!(dropped["frozen_floor"], numeric(*operator));
@@ -166,9 +164,9 @@ fn effective_min_build_conforms_to_release_channel_floor_model() {
                     }
                 } else {
                     assert_eq!(after["phase"], 4);
-                    // NEGATIVE CONTROL 1b: the claim check applied to the
-                    // operator's request alone carries a channel floor above
-                    // the build, which the real resolver just refused.
+                    // Negative control: the claim check applied to the operator's request
+                    // alone carries a channel floor above the build, which the real resolver
+                    // just refused.
                     if action == "RejectObservedAboveClaim" {
                         let carried =
                             buggy.successors("ResolveUncheckedCarryForward", &before)[0].clone();
@@ -224,9 +222,9 @@ fn effective_min_build_conforms_to_release_channel_floor_model() {
     assert!(buggy_admitted, "Buggy=1 did not admit floor drop: {why}");
 }
 
-/// Bind the non-vacuous crash/resume transition to the real atomic Journal
-/// save/load path. Runtime state is deliberately cleared before resume; the loaded
-/// persisted floor is what reconstructs it, and the journal resumes at `publish`.
+/// Bind the crash/resume transition to the real atomic Journal save/load. Runtime state is
+/// cleared before resume; the persisted floor reconstructs it, and the journal resumes at
+/// `publish`.
 #[test]
 fn journal_round_trip_restores_frozen_floor_for_resume() {
     let model = release_channel_floor_model();
@@ -285,8 +283,8 @@ fn journal_round_trip_restores_frozen_floor_for_resume() {
         "release floor: atomic journal restores resume policy",
     );
     assert!(admitted, "model rejected real journal resume: {why}");
-    // NEGATIVE CONTROL: the resumed floor rebuilt from the resume command's
-    // request (1) instead of the journal's frozen floor (2).
+    // Negative control: the resumed floor rebuilt from the resume command's request (1) instead
+    // of the journal's frozen floor (2).
     let buggy = aterm_spec::interp::with_buggy(&model, 1);
     let from_request = buggy.successors("ResumeFromOperatorRequest", &crashed)[0].clone();
     assert_ne!(from_request["frozen_floor"], numeric(loaded.min_build));
@@ -303,9 +301,8 @@ fn journal_round_trip_restores_frozen_floor_for_resume() {
     let _ = std::fs::remove_file(path);
 }
 
-/// Bind the real late race guard, at its required lease-held call site, to
-/// ConfirmCovered/RejectAdvanced and prove that a publish-from-frozen mutant is
-/// rejected by the healthy lifecycle.
+/// Bind the real late race guard, at its lease-held call site, to ConfirmCovered/RejectAdvanced;
+/// the healthy lifecycle rejects a publish-from-frozen mutant.
 #[test]
 fn channel_floor_covered_conforms_and_skipped_guard_is_rejected() {
     let model = release_channel_floor_model();
@@ -333,8 +330,8 @@ fn channel_floor_covered_conforms_and_skipped_guard_is_rejected() {
         }
     }
 
-    // The concrete race: our journal carries 1, another publisher raises the
-    // channel to 2, and the real guard refuses visibility.
+    // The race: our journal carries 1, another publisher raises the channel to 2, and the real
+    // guard refuses visibility.
     let raced = frozen_state(&model, Some(1), Some(2));
     assert!(publish::channel_floor_covered(Some(1), Some(2)).is_err());
     let rejected = model.successors("RejectAdvanced", &raced)[0].clone();
@@ -349,9 +346,9 @@ fn channel_floor_covered_conforms_and_skipped_guard_is_rejected() {
     );
     assert!(admitted, "model rejected real late guard: {why}");
 
-    // NEGATIVE CONTROL 2: a skipped guard jumps directly from Frozen to
-    // Published. Healthy rejects the step; Buggy=1 admits it, and both publish
-    // invariants expose the lowered live floor and absent revalidation.
+    // Negative control: a skipped guard jumps from Frozen to Published. Healthy rejects the
+    // step; Buggy=1 admits it, and both publish invariants expose the lowered live floor and
+    // absent revalidation.
     let buggy = aterm_spec::interp::with_buggy(&model, 1);
     let published = buggy.successors("PublishUnchecked", &raced)[0].clone();
     assert_eq!(published["phase"], 3);
@@ -380,9 +377,8 @@ fn channel_floor_covered_conforms_and_skipped_guard_is_rejected() {
     assert!(buggy_admitted, "Buggy=1 did not admit skipped guard: {why}");
 }
 
-/// Tier-1 binds exact-owner resume, owner+floor checked visibility, lease retention
-/// through the post-publish suffix, and the final exact-CAS unlock to the corrected
-/// `ReleaseChannelFloor` lifecycle.
+/// Tier-1 binds exact-owner resume, owner+floor checked visibility, lease retention through the
+/// post-publish suffix and the final exact-CAS unlock to the `ReleaseChannelFloor` lifecycle.
 #[test]
 fn release_lease_seams_conform_through_final_unlock() {
     let model = release_channel_floor_model();
@@ -412,8 +408,8 @@ fn release_lease_seams_conform_through_final_unlock() {
     );
     assert!(admitted, "model rejected exact-owner acquire: {why}");
 
-    // Existing exact ownership is the crash/resume path: acquire reads the same
-    // owner twice and produces a guard without attempting to replace the ref.
+    // Exact existing ownership is the crash/resume path: acquire reads the same owner twice and
+    // returns a guard without replacing the ref.
     let resume_git = LeaseScript::new(vec![
         command_ok(),
         lease_owner_row(&owner),
@@ -432,8 +428,8 @@ fn release_lease_seams_conform_through_final_unlock() {
         publish::publish_checked(&guard, Some(&foreign), Some(2), Some(2)).is_err(),
         "a foreign owner must fail before visibility"
     );
-    // NEGATIVE CONTROL: the floor check alone, without the owner check the real
-    // guard pairs it with, confirms a covered cut nobody holds the lease for.
+    // Negative control: the floor check without the owner check confirms a covered cut nobody
+    // holds the lease for.
     let buggy = aterm_spec::interp::with_buggy(&model, 1);
     assert!(
         model
@@ -496,8 +492,8 @@ fn release_lease_seams_conform_through_final_unlock() {
     assert!(admitted, "model rejected real final unlock: {why}");
     assert!(model.check_invariant("CompletionRequiresProvedHead", &unlocked));
 
-    // NEGATIVE CONTROL: the model's early-unlock mutant is unreachable in the
-    // healthy lifecycle and violates both completion and bypass invariants.
+    // Negative control: the early-unlock mutant is unreachable in the healthy lifecycle and
+    // violates both completion and bypass invariants.
     let early = buggy.successors("UnlockBeforeHeadProof", &published)[0].clone();
     let (admitted, why) = aterm_spec::verify::validate_transition_tiered(
         &model,
@@ -512,10 +508,9 @@ fn release_lease_seams_conform_through_final_unlock() {
     assert!(!buggy.check_invariant("UnlockCannotBeBypassed", &early));
 }
 
-/// Tier-1 binds the model's symbolic-target distinction to the real immutable
-/// release snapshot and the exact origin-tag resolver `ship verify` and a yank's
-/// successor proof bind the published head through. The old
-/// target-equals-manifest mutant is retained as an explicit negative control.
+/// Tier-1 binds the model's symbolic-target distinction to the real immutable release snapshot
+/// and the exact origin-tag resolver through which `ship verify` and a yank's successor proof
+/// bind the published head. A target-equals-manifest mutant is the negative control.
 #[test]
 fn published_identity_snapshot_and_tag_resolution_refine_model() {
     let model = release_published_identity_model();
@@ -610,9 +605,9 @@ fn yank_published(tag: &str, build: u64, min_build: Option<u64>) -> verify::Publ
     }
 }
 
-/// Tier-1 binds the real successor ordering/build/floor decision to the yank
-/// model. Signature, remote DMG digest, and tag-peel checks are replayed by the
-/// caller before this eligibility result can authorize either cleanup mutation.
+/// Tier-1 binds the real successor ordering/build/floor decision to the yank model. The caller
+/// replays the signature, remote DMG digest and tag-peel checks before this result can
+/// authorize either cleanup mutation.
 #[test]
 fn yank_successor_decision_refines_successor_first_model() {
     let model = release_yank_successor_first_model();
@@ -655,9 +650,8 @@ fn yank_successor_decision_refines_successor_first_model() {
     let stale_build = yank_published("v0.55.0", 54, Some(55));
     assert!(verify::yank_successor_covers(&bad, &stale_build).is_err());
 
-    // A retired two-component release is inert archive history no client
-    // selects: it is refused as target AND as successor, so a non-orderable
-    // identity can never license a deletion.
+    // A retired two-component release is refused as target and as successor, so a
+    // non-orderable identity never licenses a deletion.
     let retired = yank_published("v0.61", 61, Some(61));
     for (bad_end, successor_end) in [(&bad, &retired), (&retired, &successor)] {
         let error = verify::yank_successor_covers(bad_end, successor_end)

@@ -2057,7 +2057,21 @@ pub fn spawn_shell_with_pid_cell_px(
         //     `/proc/self/fd`, and the strip needs none of the limits. This
         //     child cannot be a `posix_spawn` with `POSIX_SPAWN_CLOEXEC_DEFAULT`,
         //     which needs no strip at all: the sandbox's `setrlimit` and
-        //     `login_tty`'s `TIOCSCTTY` are not file actions.
+        //     `login_tty`'s `TIOCSCTTY` are not file actions. Nor does a file
+        //     action that opens the slave stand in for `TIOCSCTTY`, even where
+        //     no limit is set (User/Master). MEASURED 2026-10-16 on Darwin 27:
+        //     with `POSIX_SPAWN_SETSID` and `addopen(0, pts, O_RDWR)` (no
+        //     `O_NOCTTY`) the child starts a session leader with NO
+        //     controlling terminal: `tcgetsid` on the pty fails `ENOTTY`,
+        //     `tcgetpgrp` answers 0, and Ctrl-C at an interactive zsh does not
+        //     stop `sleep 30`, where this fork answers the shell's pid to both
+        //     and Ctrl-C works. The same child takes the terminal when it
+        //     reopens the slave itself, so the kernel runs the file actions
+        //     before it applies SETSID. That reopen is why a `/bin/sh` (bash)
+        //     child passes a `/dev/tty` check; zsh, dash, python3 and sleep
+        //     never get a terminal. The fork-free spawn took 0.34 ms against
+        //     1.0 ms for a C model of this path, and would cost every shell
+        //     its job control.
         //     `apply` is async-signal-safe: raw syscalls on integers only.
         inherit_strip.apply();
         // (1) confine resource use (WS-G auto-sandbox). FAIL-CLOSED (§5.6): if
@@ -2563,8 +2577,8 @@ pub fn reap(pid: i32) {
 /// one leaked thread (and the fd/process slot it pins) per such mid-run close.
 /// So poll `WNOHANG`: escalate to an unignorable SIGKILL after a short grace,
 /// and after a hard deadline return — handing a shell that is still OUR
-/// unreaped child to the process-wide straggler reaper ([`reap_in_background`]'s
-/// thread), which waits for it without blocking anyone. A no-op for a
+/// unreaped child to the process-wide reaper (`aterm_uds::reaper`), which
+/// waits for it without blocking anyone. A no-op for a
 /// non-positive pid.
 ///
 /// NEVER GIVEN UP ON. A session leader that
@@ -2577,7 +2591,7 @@ pub fn reap(pid: i32) {
 /// well past this loop's deadline, and a zombie at once when the master
 /// closed). The master closes only when its last `SinkWriter` clone drops,
 /// which can be long after this loop's deadline, so a shell still OUR unreaped
-/// child at the deadline is handed to the straggler reaper, which waits for it
+/// child at the deadline is handed to `aterm_uds::reaper`, which waits for it
 /// whenever it does exit (else it stays `<defunct>` for the window's life).
 ///
 /// NOT-OUR-CHILD SHELLS (the overlap handoff): a seamlessly ADOPTED session's
@@ -2623,7 +2637,7 @@ pub fn reap_shell_in_background(identity: ShellIdentity) {
 /// [`reap_shell`] with its schedule given: `kill_at` is the tick of the
 /// `SIGKILL` escalation (`None`: never — a test's stand-in for a child no
 /// signal can finish), `deadline` the tick it hands a still-unreaped own child
-/// to the straggler reaper. `grace` is its place in [`wait_for_reaps`]'s count,
+/// to `aterm_uds::reaper`. `grace` is its place in [`wait_for_reaps`]'s count,
 /// given back once the shell is settled or its SIGKILL has gone out.
 fn reap_shell_scheduled(
     identity: ShellIdentity,
@@ -2669,116 +2683,26 @@ fn reap_shell_scheduled(
         std::thread::sleep(POLL);
     }
     // Past the deadline. A shell that is still OUR unreaped child is never
-    // dropped: the straggler reaper waits for it. (An adopted shell is
+    // dropped: `aterm_uds::reaper` waits for it. (An adopted shell is
     // launchd's to reap; there is nothing of ours to wait for.)
     if identity.own_child && identity.verify() {
-        hand_to_reaper(Straggler::Shell(identity));
+        aterm_uds::reaper::hand_off(move || straggler_settled(&identity));
     }
 }
 
-/// A child of this process that nobody else will wait for: a shell past
-/// [`reap_shell`]'s deadline, or a helper a caller spawned and let go
-/// ([`reap_in_background`]).
-enum Straggler {
-    /// A spawned shell, re-verified before every wait exactly as
-    /// [`reap_shell`] does, so its pid is never waited for once it names
-    /// anyone else.
-    Shell(ShellIdentity),
-    /// A spawned helper: the handle owns the pid until it is waited for.
-    Child(aterm_uds::spawnfd::Child),
-}
-
-impl Straggler {
-    /// Whether it is settled — reaped now, or no longer ours to reap. Never
-    /// blocks, never signals.
-    fn settled(&mut self) -> bool {
-        match self {
-            Self::Shell(identity) => {
-                if !identity.verify() {
-                    return true;
-                }
-                let mut status: libc::c_int = 0;
-                // SAFETY: `WNOHANG` `waitpid` on the verified own child; a
-                // valid out-param.
-                let r = unsafe { libc::waitpid(identity.pid, &mut status, libc::WNOHANG) };
-                r == identity.pid
-                    || (r == -1 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted)
-            }
-            Self::Child(child) => !matches!(child.try_wait(), Ok(None)),
-        }
+/// Whether a straggling shell is settled: reaped now, or no longer ours to
+/// reap. It is re-verified before every wait exactly as [`reap_shell`] does,
+/// so its pid is never waited for once it names anyone else. Never blocks,
+/// never signals.
+fn straggler_settled(identity: &ShellIdentity) -> bool {
+    if !identity.verify() {
+        return true;
     }
-}
-
-/// The straggler reaper's ledger: the children it still waits for, and
-/// whether its thread is running. A `const` initializer — nothing lazy.
-struct Stragglers {
-    waiting: Vec<Straggler>,
-    running: bool,
-}
-
-static STRAGGLERS: std::sync::Mutex<Stragglers> = std::sync::Mutex::new(Stragglers {
-    waiting: Vec::new(),
-    running: false,
-});
-
-/// How soon the straggler reaper first looks. It runs only while it holds a
-/// child, and backs off to [`STRAGGLER_POLL_MAX`] while nothing it holds
-/// settles, so a child held for hours (its terminal's master never closing)
-/// costs a wake every two seconds, not ten a second.
-const STRAGGLER_POLL: std::time::Duration = std::time::Duration::from_millis(100);
-/// The straggler reaper's slowest look.
-const STRAGGLER_POLL_MAX: std::time::Duration = std::time::Duration::from_secs(2);
-
-/// Hand `straggler` to the process-wide reaper thread, starting it if it is
-/// not running. A thread that cannot start leaves the child queued; the next
-/// hand-off tries again.
-fn hand_to_reaper(straggler: Straggler) {
-    let mut ledger = STRAGGLERS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    ledger.waiting.push(straggler);
-    if !ledger.running {
-        ledger.running = std::thread::Builder::new()
-            .name("aterm-reaper".into())
-            .spawn(reap_stragglers)
-            .is_ok();
-    }
-}
-
-/// The reaper thread: wait (without blocking) for each queued child, first
-/// after [`STRAGGLER_POLL`] and then twice as long each time nothing settles,
-/// up to [`STRAGGLER_POLL_MAX`]; end once none is left.
-fn reap_stragglers() {
-    let mut pause = STRAGGLER_POLL;
-    loop {
-        std::thread::sleep(pause);
-        let mut ledger = STRAGGLERS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let before = ledger.waiting.len();
-        ledger.waiting.retain_mut(|straggler| !straggler.settled());
-        if ledger.waiting.is_empty() {
-            ledger.running = false;
-            return;
-        }
-        pause = if ledger.waiting.len() < before {
-            STRAGGLER_POLL
-        } else {
-            (pause * 2).min(STRAGGLER_POLL_MAX)
-        };
-    }
-}
-
-/// Reap `child` once it exits, off the caller's thread and without blocking
-/// anyone: for a helper this process starts and does not wait for (a URL
-/// handed to `open`, a detached tool). Dropping a `Child` that is still
-/// running neither waits nor kills, so it stays a zombie once it exits, for the
-/// life of the process — in a window that runs for days, one per click.
-/// Nothing is signalled.
-pub fn reap_in_background(mut child: aterm_uds::spawnfd::Child) {
-    if matches!(child.try_wait(), Ok(None)) {
-        hand_to_reaper(Straggler::Child(child));
-    }
+    let mut status: libc::c_int = 0;
+    // SAFETY: `WNOHANG` `waitpid` on the verified own child; a valid out-param.
+    let r = unsafe { libc::waitpid(identity.pid, &mut status, libc::WNOHANG) };
+    r == identity.pid
+        || (r == -1 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted)
 }
 
 /// How many [`reap_shell`] calls are still inside their grace: neither settled
@@ -3619,8 +3543,15 @@ pub fn flush_input_queue(fd: i32) -> Option<usize> {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = fd;
-        None
+        if !fd_is_tty(fd) {
+            return None;
+        }
+        // SAFETY: `fd` is a tty (checked by `fd_is_tty` just above) and
+        // `tcflush` only discards queued data; a stale fd fails with rc < 0.
+        if unsafe { libc::tcflush(fd, libc::TCIFLUSH) } != 0 {
+            return None;
+        }
+        Some(0)
     }
 }
 
@@ -4010,8 +3941,8 @@ thread_local! {
 // the 1 ms [`HOT_BATCH_BUDGET`] and the 3 ms streaming budget are wall clocks
 // started before the first read, so a gather preempted for that long on a
 // loaded machine delivers on the budget before it ever reaches the dry gap the
-// test is about (the merge gate at load 100-170 read `filled` 2048 of 4096
-// there, and `parks` 1 of 2). It replaces whichever budget the gather would
+// test is about (at load 100-170 a gather reads `filled` 2048 of 4096 there,
+// and `parks` 1 of 2). It replaces whichever budget the gather would
 // use, hot or streaming. The budgets themselves keep their own tests, which run
 // on the shipped values.
 #[cfg(test)]
@@ -4356,8 +4287,8 @@ pub fn close_fd(fd: i32) {
 /// Measured on a saturated machine: a child sharing that band with this repo's own
 /// compilers answered keystrokes at `echo_p95_ms=75.69 echo_p99_ms=150.04
 /// echo_max_ms=367.85` while aterm wrote each key at `key_write_p99_ms=6.29`.
-/// What aterm can actually do is DECLINE TO COMPETE — its merge gate, release
-/// cutter and package lane all spawn at utility, below the band being typed
+/// What aterm can actually do is DECLINE TO COMPETE — `verify`'s builds, the
+/// release cutter and the package lane all spawn at utility, below the band being typed
 /// into — and publish the child's `echo_*` round trip on the `metrics` summary
 /// beside its own slices, so a lag report can tell the two apart.
 ///
@@ -4433,8 +4364,8 @@ mod tests;
 /// Tier-1 trace conformance: bind the REAL `write_all` drain loop to the external
 /// `WriteAll.tla` design spec (TRUST_NATIVE_TLA Phase 2, I/O DURABILITY family).
 ///
-/// `WriteAll.tla` is model-checked in the abstract by aterm-spec-models'
-/// `model_check.rs` (Tier-0: proves the loop reports completion ONLY when `off =
+/// `WriteAll.tla` is model-checked in the abstract by `spec-check specs`
+/// (Tier-0: proves the loop reports completion ONLY when `off =
 /// Size`, and catches the dropped-tail bug at `Buggy=TRUE`), but nothing tied it to
 /// the code that runs. This test closes that gap two ways:
 ///

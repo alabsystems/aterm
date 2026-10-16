@@ -244,13 +244,4 @@ impl GridCursorState {
             .copied()
             .unwrap_or(false)
     }
-
-    #[cfg(test)]
-    pub(crate) fn tab_stop_positions(&self) -> impl Iterator<Item = u16> + '_ {
-        self.tab_stops
-            .iter()
-            .enumerate()
-            .filter(|&(_, &is_stop)| is_stop)
-            .map(|(col, _)| u16::try_from(col).unwrap_or(u16::MAX))
-    }
 }

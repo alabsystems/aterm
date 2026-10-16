@@ -34,12 +34,12 @@ fn phaser_band_spans_three_letters_and_never_parks() {
             "cell {col} inside the three-letter band is lit"
         );
     }
-    // A 2 s thinking pause, then ONE key: it must take the short base life
+    // A 2 s thinking pause, then one key: it must take the short base life
     // (well under a second), never a pause-scaled chained one.
     t += Duration::from_secs(2);
     glow.note_synthetic_typed(t, 1);
     glow.tick(Some((2, 13)), t, &c, g, &mut out);
-    // (The typing spark lays at the just-typed ORIGIN cell — col 12.)
+    // The typing spark lays at the just-typed origin cell, col 12.
     let head = glow
         .sparks
         .iter()
@@ -76,7 +76,7 @@ fn coalesced_echo_advance_is_typing_and_lays_every_cell() {
         g,
         &mut out,
     );
-    // …then two keys echo in ONE observed move (frame coalescing).
+    // …then two keys echo in one observed move (frame coalescing).
     glow.note_synthetic_typed(t0 + Duration::from_millis(22), 2);
     glow.tick(
         Some((2, 8)),
@@ -119,7 +119,7 @@ fn wide_coalesced_echo_still_sweeps_every_cell() {
     glow.tick(Some((2, 4)), t0, &c, g, &mut out);
     glow.note_synthetic_typed(t0 + Duration::from_millis(6), 1);
     glow.tick(Some((2, 5)), t0 + Duration::from_millis(8), &c, g, &mut out);
-    // Six keys echo in ONE observed move (a frame slip under load).
+    // Six keys echo in one observed move (a frame slip under load).
     glow.note_synthetic_typed(t0 + Duration::from_millis(14), 6);
     glow.tick(
         Some((2, 11)),
@@ -184,7 +184,7 @@ fn wrap_echo_continues_the_band_across_the_fold() {
         glow.fire_meteors.is_empty(),
         "a typing wrap flies no meteor for any style"
     );
-    // The pre-wrap tail was NOT snuffed: its sparks keep their chained
+    // The pre-wrap tail is not snuffed: its sparks keep their chained
     // lives (the phaser wrap-follow exemption).
     let tail = glow
         .sparks
@@ -267,10 +267,11 @@ fn phaser_burst_origin_cannot_outlive_the_band() {
 }
 
 /// Light-theme law (beam family): additive light cannot brighten a white
-/// ground, so on `dark_theme: false` the comet/band renders as source-over
-/// veil halos with no additive beam quads; dark themes are untouched.
+/// ground, so on `dark_theme: false` the band renders as source-over ink
+/// under the letters with no additive quads or halos; dark themes are
+/// untouched.
 #[test]
-fn light_theme_band_is_veils_not_additive() {
+fn light_theme_band_is_ink_not_additive() {
     let g = geom();
     let mut c = cfg(GlowStyle::Phaser, true);
     c.dark_theme = false;
@@ -286,11 +287,11 @@ fn light_theme_band_is_veils_not_additive() {
     }
     assert!(
         out.is_empty(),
-        "no additive quads on a light theme (band, crown, ring all veil/skip)"
+        "no additive quads on a light theme (band, crown, ring all ink/skip)"
     );
     assert!(
-        glow.halos().iter().any(|h| h.mode == HaloMode::Over),
-        "the light-theme band renders as source-over veils"
+        !glow.under_quads().is_empty() && glow.under_quads().iter().all(|q| q.alpha > 0),
+        "the light-theme band renders as source-over ink under the letters"
     );
     assert!(
         glow.halos().iter().all(|h| h.mode == HaloMode::Over),

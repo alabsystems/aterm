@@ -1,23 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The supervisor's transports: the [`Ctl`] seam over one persistent control
-//! connection ([`RelayCtl`], a [`RelayClient`] underneath), and [`Transport`],
-//! which is that connection or, where it cannot be opened, the
+//! The supervisor's transports: [`RelayCtl`], the [`Ctl`] seam over one persistent control
+//! connection, and [`Transport`], which is that connection or, where it cannot be opened, the
 //! `aterm-ctl`-per-request [`CtlClient`].
 //!
-//! A held socket avoids forking the `aterm` binary per request, and an in-GUI
-//! host has no binary to fork. [`RelayCtl`] renders every reply as `aterm-ctl`
-//! prints it (the framing table
-//! [`aterm_types::control_verbs::framing_of`], `ERR …` on stderr at exit 1,
-//! timeouts at exit 124, counted rows on stdout), so every judgment in the
-//! loop ([`CtlReply::lost`], `timed_out`, `unknown_form`, `skipped`) reads the
-//! same either way.
-//!
-//! A lost connection is reported in `aterm-ctl`'s own words, so the loop rides
-//! it out the same way, and the next request dials again, re-resolving the
-//! socket when none was named (following the `latest` alias after a
-//! self-update's handoff).
+//! A held socket avoids forking `aterm` per request, and an in-GUI host has no binary to fork.
+//! [`RelayCtl`] renders every reply as `aterm-ctl` prints it
+//! ([`aterm_types::control_verbs::framing_of`], `ERR …` on stderr at exit 1, timeouts at exit
+//! 124, counted rows on stdout), so every judgment in the loop ([`CtlReply::lost`], `timed_out`,
+//! `unknown_form`, `skipped`) reads the same either way. A lost connection is reported in
+//! `aterm-ctl`'s words, and the next request dials again, re-resolving the socket when none was
+//! named (following the `latest` alias after a self-update's handoff).
 
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -91,9 +85,8 @@ impl RelayCtl {
     fn dial(&mut self) -> Result<&mut RelayClient<CtlStream>, String> {
         if self.conn.is_none() {
             let sock = self.sock()?;
-            // The token beside the socket is read once this dial's connect
-            // succeeded, so it is the listener's that took it — never one read
-            // for a socket an update's successor has since rebound.
+            // The token beside the socket is read after this dial's connect succeeded, so it is
+            // the listener's that took it, never one for a socket a successor has since rebound.
             let client = match &self.token {
                 Some(t) => RelayClient::connect_local(&sock, t.trim()),
                 None => RelayClient::connect_local_beside(&sock),
@@ -168,18 +161,16 @@ fn lossy(body: Vec<u8>) -> String {
     String::from_utf8(body).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
-/// A reply rendered as `aterm-ctl` renders it: `header` is the status line,
-/// `body` the counted rows (`Lines`) or raw bytes (`Bytes`): the transport
-/// hands over the reply it owns (no copy), the supervisor's tests a slice.
-/// Visible to those tests, which build their scripted replies through it so a
-/// reply shape no transport produces cannot pass for one.
+/// A reply rendered as `aterm-ctl` renders it: `header` the status line, `body` the counted rows
+/// (`Lines`) or raw bytes (`Bytes`). The supervisor's tests build their scripted replies through
+/// it, so a reply shape no transport produces cannot pass for one.
 pub(super) fn render(
     verb: &str,
     framing: Framing,
     header: &str,
     body: impl Into<Vec<u8>>,
 ) -> CtlReply {
-    if header != "OK" && !header.starts_with("OK ") {
+    if !crate::is_ok_reply(header) {
         return client_failure(header);
     }
     let body = body.into();
@@ -188,12 +179,18 @@ pub(super) fn render(
     let mut stderr = String::new();
     let stdout = match framing {
         Framing::Lines => {
+            // `search`'s ` incomplete` marker: the note `aterm-ctl` prints.
+            if verb == "search"
+                && let Some(note) = aterm_ctl::search_incomplete_note(tail)
+            {
+                stderr.push_str(&format!("aterm-ctl: {note}\n"));
+            }
             if tail.split_whitespace().nth(1) == Some("turn") {
                 let verdict: Vec<&str> = tail.split_whitespace().skip(1).collect();
                 stderr.push_str(&format!("aterm-ctl: {}\n", verdict.join(" ")));
             }
             let empty = tail.split_whitespace().next() == Some("0");
-            if verb == "inbox" || verb == "offscreen" {
+            if verb == "inbox" || verb == "offscreen" || verb == "search" {
                 stderr.push_str(&format!("aterm-ctl: {header}\n"));
             } else if empty {
                 stderr.push_str(&format!("aterm-ctl: {header} ({verb}: no results)\n"));
@@ -267,11 +264,8 @@ impl Ctl for RelayCtl {
         let shut = Arc::clone(&self.shut);
         Some(Box::new(move || {
             cut.store(true, Ordering::SeqCst);
-            // Each half on its own ([`aterm_uds::hangup::hang_up`]): a server
-            // that half-closed toward this client (a relay whose child ended)
-            // has shut its read half, and Darwin refuses a both-ways
-            // `shutdown` of it, shutting nothing — the server then read no
-            // EOF while this transport held the connection.
+            // Each half on its own ([`aterm_uds::hangup::hang_up`]): Darwin refuses a both-ways
+            // `shutdown` of a socket whose server half-closed toward us, shutting nothing.
             if let Some(s) = shut.lock().unwrap_or_else(PoisonError::into_inner).as_ref() {
                 aterm_uds::hangup::hang_up(s);
             }
@@ -381,7 +375,9 @@ mod tests {
                 Some("OK skipped seq=7\n"),
                 Some("OK 1 turn submitted=1 status=settled seq=9\nrow\n"),
                 Some("OK 5\nhello"),
+                Some("OK 1 incomplete capped\n10 0 1\n"),
                 Some("OK title=- attention=-\n"),
+                Some("OK 1 incomplete older\n10 0 1\n"),
             ],
         );
         let mut c = RelayCtl::new(Endpoint::Socket(sock), Some("tok".to_string()));
@@ -410,13 +406,31 @@ mod tests {
         assert!(turn.submitted() && turn.turn_seq() == Some(9), "{turn:?}");
         let body = c.call(&["@s-1", "inbox", "get", "3"]).expect("inbox get");
         assert_eq!(body.stdout, "hello");
+        let search = c.call(&["@s-1", "search", "x"]).expect("search");
+        assert_eq!(search.stdout, "10 0 1\n");
+        assert_eq!(
+            search.stderr,
+            "aterm-ctl: results stop at 100000 matches\naterm-ctl: OK 1 incomplete capped\n"
+        );
         let meta = c.call(&["@s-1", "meta"]).expect("meta");
         assert_eq!(meta.stdout, "OK title=- attention=-\n");
+        // `search`'s ` incomplete` marker: the hits on stdout, `aterm-ctl`'s
+        // note for it on stderr, then the header (`aterm drive report` reads
+        // both).
+        let search = c.call(&["@s-1", "search", "^›", "regex"]).expect("search");
+        assert_eq!(
+            (search.stdout.as_str(), search.stderr.as_str()),
+            (
+                "10 0 1\n",
+                "aterm-ctl: older history not searched (search_history_lines)\naterm-ctl: OK \
+                 1 incomplete older\n"
+            )
+        );
         drop(c);
         let seen = h.join().expect("server");
         assert_eq!(seen[0], "AUTH");
         assert_eq!(seen[1], "@s-1 text --json tail=40");
-        assert_eq!(seen.len(), 8, "one connection, one AUTH: {seen:?}");
+        assert_eq!(seen.len(), 10, "one connection, one AUTH: {seen:?}");
     }
 
     /// A connection that closes unanswered is `lost` in `aterm-ctl`'s words,
@@ -470,9 +484,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(100));
             cut();
         });
-        // The await asks for five minutes, so a cut that did not land waits
-        // them out (plus the reply margin); the bound is a minute's hang
-        // detector (AGENTS.md), never a latency budget.
+        // The await asks for five minutes; the bound is a one-minute hang detector.
         let started = std::time::Instant::now();
         let r = c.call(&["await", "inbox", "since=0", "timeout", "300000"]);
         assert!(r.is_err(), "{r:?}");
@@ -489,14 +501,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// THE CUT HANGS UP A CONNECTION ITS SERVER HALF-CLOSED — a relay passes its
-    /// child's EOF on so — though the transport still holds it: the server
-    /// reads its end-of-file at the cut, not when the transport lets go.
-    ///
-    /// NEGATIVE CONTROL (run by restoring the both-ways `shutdown`): Darwin
-    /// refused it for a socket whose read half the server's half-close had
-    /// shut (`ENOTCONN`) and shut nothing, so the server read `WouldBlock`
-    /// after the `AUTH` line, not its end-of-file.
+    /// The cut hangs up a connection its server half-closed (a relay passes its child's EOF on
+    /// so) while the transport still holds it: the server reads its end-of-file at the cut. A
+    /// both-ways `shutdown` fails here on Darwin (`ENOTCONN`) and shuts nothing.
     #[test]
     fn the_interrupter_hangs_up_a_connection_its_server_half_closed() {
         use std::io::Read as _;

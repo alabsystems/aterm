@@ -1,64 +1,32 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The Windows in-window CLOSE / QUIT CONFIRMATION banner — the destructive-close
-//! confirm composed into the window's own top rows, the way [`crate::paste_banner`]
-//! composes the multi-line-paste question.
+//! The Windows in-window close/quit confirmation banner: the destructive-close confirm composed
+//! into the window's own top rows, as [`crate::paste_banner`] composes the multi-line-paste
+//! question. A native task-modal dialog would run its own message loop inside the call and stop
+//! winit's event loop, so every main-thread ctl verb would time out until a person clicked.
 //!
-//! # The defect this replaces (measured 2026-09-22, Windows audit)
+//! The question is parked on `App::close_banner` ([`PendingClose`]) and the gesture refused for
+//! now (`confirm_destructive_close` answers `false`): the event loop keeps turning, and
+//! `controls front` reports the pending confirm with the wire way to answer it
+//! ([`PendingClose::controls_line`]). Enter proceeds by replaying the gesture ([`CloseReplay`])
+//! under the `Programmatic` close policy, so the question is never asked twice; Escape (or a
+//! click on the band) cancels. The keystroke decision is [`crate::alert_keys::confirm_key`].
 //!
-//! `invoke CloseTab` on a last tab with a running job raised a NATIVE task-modal
-//! dialog on the main thread (`TaskDialogIndirect`, window class #32770, caption
-//! "aterm", buttons Quit / Cancel). A modal dialog runs its own message loop
-//! INSIDE the call, so winit's event loop — the one thread every control verb's
-//! `call_main` hop waits on — did not turn until a human clicked. While the dialog
-//! stood, EVERY main-thread ctl verb answered `ERR main-thread reply did not
-//! arrive within 30s` (`window: timed out`), nothing reported that a dialog was
-//! pending, and `controls` could not show it. For a human it was a modal; for an
-//! agent driving the window it was a wedge — and the agent's own `invoke` was what
-//! raised it, so it could not even know to click.
+//! The wire answers with its own verb, `confirm yes|no` ([`WIRE_ACCEPT`] / [`WIRE_CANCEL`],
+//! served by `App::answer_close_confirm_from_wire`), never a keystroke: `key enter` is the most
+//! common key an agent sends and is always the PTY's, and a flagless key lands in the front
+//! window, which may not be the one asking. There is one question per instance, so the verb
+//! needs no aim. The wire answers only a question the wire asked
+//! ([`PendingClose::wire_may_answer`]); one a person asked at the window (Ctrl-W, Alt+F4, the
+//! caption ✕, the Quit menu) waits for them.
 //!
-//! # The shape
+//! No TTL and no auto-dismiss: the banner stands until a key, a click, `confirm`, or the window
+//! closing answers it. One at a time: a second destructive gesture while one stands is refused.
 //!
-//! The question is PARKED on `App::close_banner` ([`PendingClose`]) and the gesture
-//! is REFUSED for now (`confirm_destructive_close` answers `false`): the event loop
-//! keeps turning, so ctl keeps answering, and `controls front` reports the pending
-//! confirm with the wire way to answer it ([`PendingClose::controls_line`]). Enter
-//! proceeds — by REPLAYING the gesture ([`CloseReplay`]) under the `Programmatic`
-//! close policy, so the question is never asked twice — and Escape (or a click on
-//! the band) cancels. The keystroke decision is [`crate::alert_keys::confirm_key`],
-//! the same pure router the macOS sheet and the Linux paste banner answer through.
-//!
-//! The wire answers with its own verb, `confirm yes|no` ([`WIRE_ACCEPT`] /
-//! [`WIRE_CANCEL`], served by `App::answer_close_confirm_from_wire`), and never with
-//! a keystroke: a wire `key enter` is always the PTY's. An earlier cut answered the
-//! question with the wire's `key enter` / `key escape`, and review found two ways
-//! that failed. `key enter` is the most common keystroke an agent sends, so one that
-//! carried on with its routine `send <command>` + `key enter` after missing the
-//! `invoke` refusal quit aterm and killed the job, with a reply (`OK`) identical to
-//! typing Enter. And a flagless key lands in the FRONT window, so once the person
-//! brought another window forward, the printed `answer="key enter"` ran whatever
-//! was typed at that window's prompt instead. There is one question per instance, so
-//! the verb needs no aim and its reply says what it did.
-//!
-//! The wire answers only a question the WIRE asked ([`PendingClose::wire_may_answer`]):
-//! a control client's `invoke CloseTab` or `invoke Quit`. A question a person asked
-//! at the window (Ctrl-W, Alt+F4, the caption ✕, the Quit menu) waits for that
-//! person: `confirm` refuses it, so no driver answers a question it was never asked.
-//!
-//! Pure + geometry-injected like `paste_banner`: the row builder takes explicit
-//! `cols`/`panel_rows` so it unit-tests without a window. No TTL and no
-//! auto-dismiss — a destructive question does not answer itself; the banner stands
-//! until a key, a click, the wire's `confirm`, or the window closing (which drops
-//! it: that close was the thing being asked about) answers it. ONE at a time: a second destructive gesture
-//! while one stands is refused and the standing question keeps its answer, which is
-//! what the disabled owner window of the old modal enforced.
-//!
-//! The macOS `NSAlert` path is untouched, deliberately and not because it is
-//! immune: `menu::confirm` answers inside `runModal`, and control wakes queue
-//! behind that nested run loop the same way (`menu::confirm_owner` says so). This
-//! change is scoped to the platform where the wedge was measured; the Linux
-//! titlebar-warning confirm never blocks.
+//! The macOS `NSAlert` path is not immune — `menu::confirm` answers inside `runModal`, and
+//! control wakes queue behind that nested run loop (`menu::confirm_owner`) — but is out of this
+//! module's scope; the Linux titlebar-warning confirm never blocks.
 
 use aterm_core::terminal::RenderCell;
 use aterm_render::Theme;
@@ -69,28 +37,25 @@ use crate::quit_safety::ConfirmPrompt;
 use crate::session_store::ExitActor;
 use crate::settings::{blank_row, write_str};
 
-/// What Enter REPLAYS: the gesture the banner stood in for, re-run under the
+/// What Enter replays: the gesture the banner stood in for, re-run under the
 /// `Programmatic` close policy (see `App::replay_confirmed_close`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CloseReplay {
-    /// Close window `wid`: `App::close_window`, which exits the app iff it was the
-    /// last window. Every spelling of a last-tab close (Ctrl-W, the strip's ✕,
-    /// `invoke CloseTab`, the tab menu) escalates to exactly this once its confirm
-    /// passes, and Alt+F4 / the caption ✕ ARE this — so replaying the window close
-    /// is replaying the gesture, with the window's own native/document barriers.
+    /// Close window `wid` (`App::close_window`, which exits the app iff it was the last
+    /// window). Every last-tab close escalates to this once its confirm passes, and Alt+F4 /
+    /// the caption ✕ are this, so replaying it replays the gesture.
     Window(crate::WindowId),
     /// Quit the whole program (the Quit action): `App::on_quit_requested`, whose
     /// quit-scope barriers a window close does not run.
     Quit,
 }
 
-/// ONE parked close/quit confirmation awaiting an answer. Held by `App` in
+/// One parked close/quit confirmation awaiting an answer. Held by `App` in
 /// `Option<PendingClose>`: `Some` ⇔ the banner is up over `wid`'s top rows and the
 /// gesture's answer is still owed.
 pub(crate) struct PendingClose {
-    /// The window the banner splices into — the one the gesture would close (or,
-    /// for a quit, the one it was anchored to); only ITS keys answer it, and the
-    /// entry dies with it.
+    /// The window the banner splices into: the one the gesture would close (or, for a quit, the
+    /// one it was anchored to). Only its keys answer it, and the entry dies with it.
     pub(crate) wid: crate::WindowId,
     /// The copy the native dialog would have shown — title, body, and the verb
     /// on the affirmative button.
@@ -121,9 +86,9 @@ pub(crate) const CONTROLS_CLOSED: &str = "confirm open=false";
 /// The `confirm` verb's refusal when no question stands.
 pub(crate) const NOTHING_PENDING: &str = "nothing is waiting for an answer";
 
-/// The wire `kind=` of a prompt: what the affirmative answer DOES. A last-tab close
-/// of the last window quits the app, and on Windows its prompt says so (`proceed ==
-/// "Quit"`), so the kind follows the prompt rather than the gesture that raised it.
+/// The wire `kind=` of a prompt: what the affirmative answer does. A last-tab close of the last
+/// window quits the app, and on Windows its prompt says so (`proceed == "Quit"`), so the kind
+/// follows the prompt rather than the gesture that raised it.
 pub(crate) fn kind(prompt: &ConfirmPrompt) -> &'static str {
     match prompt.proceed {
         "Quit" => "quit",
@@ -140,17 +105,15 @@ fn gesture(prompt: &ConfirmPrompt) -> &'static str {
     }
 }
 
-/// The QUESTION's words: the prompt's title. The painted warn mark is added by
+/// The question's words: the prompt's title. The painted warn mark is added by
 /// [`banner_rows`], so the accessible alert does not read it aloud.
 pub(crate) fn question(prompt: &ConfirmPrompt) -> String {
     prompt.title.to_string()
 }
 
-/// The two keys that answer the question, right-aligned on the title row and
-/// spoken as the a11y question's description: the affirmative key names the
-/// prompt's REAL verb (the reason the native dialog was a `TaskDialog` and not a
-/// Yes/No `MessageBoxW`), so "Enter quits" over a quit prompt, "Enter closes"
-/// over a close.
+/// The two keys that answer the question, right-aligned on the title row and spoken as the a11y
+/// question's description. The affirmative key names the prompt's verb: "Enter quits" over a
+/// quit, "Enter closes" over a close.
 pub(crate) fn answer_keys(prompt: &ConfirmPrompt) -> String {
     let verb = match prompt.proceed {
         "Quit" => "quits",
@@ -229,10 +192,9 @@ impl PendingClose {
         }
     }
 
-    /// The `controls front` report of this pending confirm: what is being asked,
-    /// over which window, who asked, and — the part an agent needs — how to
-    /// answer it from the wire (`answer=-` when the person who asked answers
-    /// it). One line, `k=v` tokens; the title is quoted because it carries spaces.
+    /// The `controls front` report of this pending confirm: what is asked, over which window, who
+    /// asked, and how to answer it from the wire (`answer=-` when the person who asked answers
+    /// it). One line of `k=v` tokens; the title is quoted because it carries spaces.
     pub(crate) fn controls_line(&self) -> String {
         let (answer, cancel) = self.wire_answers();
         format!(
@@ -248,11 +210,8 @@ impl PendingClose {
         )
     }
 
-    /// The `invoke` reply of the gesture that PARKED this question
-    /// (`App::invoke_reply`): an `OK`, because asking is what the action does,
-    /// in words no driver can read as a close that happened — `invoked
-    /// CloseTab` would say exactly that over a tab that is still there. The
-    /// state, then the one action.
+    /// The `invoke` reply of the gesture that parked this question (`App::invoke_reply`): an `OK`
+    /// (asking is what the action does), worded so no driver reads it as a close that happened.
     pub(crate) fn wire_pending(&self) -> String {
         format!(
             "confirm pending kind={} window={}; `confirm yes|no` answers it",
@@ -261,13 +220,10 @@ impl PendingClose {
         )
     }
 
-    /// The wire refusal of a gesture this question stands in the way of: a
-    /// second one refused while it stands — and the `confirm` verb's refusal of
-    /// a question it may not answer. It is also what the parking gesture leaves
-    /// in `pending_action_refusal`, the channel a `tab` verb and every other
-    /// reply-minting consumer reads; `invoke` answers that gesture with
-    /// [`Self::wire_pending`] instead. The state in words, then the one action;
-    /// `controls front` carries the rest.
+    /// The wire refusal of a gesture this question stands in the way of, and the `confirm` verb's
+    /// refusal of a question it may not answer. The parking gesture also leaves it in
+    /// `pending_action_refusal` for every other reply-minting consumer; `invoke` answers that
+    /// gesture with [`Self::wire_pending`] instead.
     pub(crate) fn wire_refusal(&self) -> String {
         let gesture = gesture(&self.prompt);
         if self.wire_may_answer() {
@@ -289,9 +245,8 @@ impl PendingClose {
     }
 }
 
-/// The `confirm` verb's argument: `yes` proceeds, `no` keeps everything. PURE, so
-/// the grammar is pinned without an event loop; the `Err` is the whole usage
-/// line, so the refusal teaches it.
+/// The `confirm` verb's argument: `yes` proceeds, `no` keeps everything. The `Err` is the whole
+/// usage line, so the refusal teaches it.
 pub(crate) fn parse_wire_answer(rest: &str) -> Result<bool, String> {
     let mut words = rest.split_whitespace();
     match (words.next(), words.next()) {
@@ -301,11 +256,10 @@ pub(crate) fn parse_wire_answer(rest: &str) -> Result<bool, String> {
     }
 }
 
-/// PURE grid-cell row builder: exactly `panel_rows` rows, each exactly `cols` wide,
-/// so the splice overwrites frame rows in place (the `paste_banner` contract).
-/// Row 0 carries the question ([`question`]) with the two answer keys
-/// ([`answer_keys`]) right-aligned, then the prompt's body, ellipsized to fit; in a
-/// window too narrow for the keys beside the question they take row 1 and the
+/// Pure grid-cell row builder: exactly `panel_rows` rows, each exactly `cols` wide, so the splice
+/// overwrites frame rows in place (the `paste_banner` contract). Row 0 carries the question
+/// ([`question`]) with the answer keys ([`answer_keys`]) right-aligned, then the prompt's body,
+/// ellipsized; in a window too narrow for the keys beside the question they take row 1 and the
 /// body row 2.
 pub(crate) fn banner_rows(
     prompt: &ConfirmPrompt,
@@ -368,9 +322,8 @@ pub(crate) fn banner_rows(
             false,
         );
     }
-    // The seam is the whole top edge, in one tone (the `paste_banner` lesson:
-    // `write_str` rebuilds every cell it touches without the overline, so the rule
-    // has to be sealed after the words are written).
+    // `write_str` rebuilds every cell it touches without the overline, so the seam (the whole
+    // top edge, one tone) is sealed after the words.
     chrome_band::seal_band_top(&mut rows[0], c.label);
     rows
 }
@@ -391,9 +344,8 @@ mod tests {
         crate::quit_safety::confirm_prompt(false, true, true).expect("a busy close prompts")
     }
 
-    /// The banner stands in for the native dialog, so it must show what the dialog
-    /// showed: the title, the body, and both answers — with the affirmative key
-    /// naming the prompt's REAL verb, the property the `TaskDialog` was chosen for.
+    /// The banner shows what the native dialog showed: title, body and both answers, the
+    /// affirmative key naming the prompt's verb.
     #[test]
     fn banner_shows_question_body_and_verb_named_keys() {
         let rows = banner_rows(&quit_prompt(), 100, BANNER_ROWS, Theme::default());
@@ -444,8 +396,8 @@ mod tests {
         }
     }
 
-    /// A NARROW WINDOW STILL SHOWS THE ANSWER: the band swallows every other key,
-    /// so a destructive question without its keys has no visible way out.
+    /// A narrow window still shows the answer keys: the band swallows every other key, so
+    /// without them there is no visible way out.
     #[test]
     fn a_narrow_band_keeps_the_answer_keys() {
         let multi = crate::quit_safety::ConfirmPrompt {
@@ -481,8 +433,8 @@ mod tests {
         assert!(row0.contains("Enter") && row0.contains("Esc"), "{row0:?}");
     }
 
-    /// The wire kind follows what the answer DOES — a last-tab close of the last
-    /// window is a quit on Windows and its prompt says so.
+    /// The wire kind follows what the answer does: a last-tab close of the last window is a
+    /// quit on Windows, and its prompt says so.
     #[test]
     fn kind_follows_the_prompt_verb() {
         assert_eq!(kind(&quit_prompt()), "quit");
@@ -555,10 +507,9 @@ mod tests {
         }
     }
 
-    /// A question a PERSON asked is theirs to answer: the wire may not, the report
-    /// says who asked and that no wire verb answers it, and a gesture made with no
-    /// close scope of its own (the Quit menu) counts as the person's. A control
-    /// client's sid asks on the wire like `ctl` does.
+    /// A question a person asked is theirs to answer: the wire may not, the report says who asked
+    /// and that no wire verb answers it, and a gesture with no close scope of its own (the Quit
+    /// menu) counts as the person's. A control client's sid asks on the wire like `ctl` does.
     #[test]
     fn a_question_a_person_asked_is_not_answered_from_the_wire() {
         for asked_by in [ExitActor::Human, ExitActor::Unknown] {

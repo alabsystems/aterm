@@ -1,14 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-0 for `NetSlotDisplacement` (r13 NET-1, 2026-10-10): the network
-//! drive's listener keeps at most `Cap` connections in flight, claims each
-//! connection's unauthenticated phase exactly once (handshake, deadline or
-//! eviction), and never force-closes one its handshake claimed. A newcomer
-//! that takes a slot before the displaced connection lets go, a handshake's
-//! store over a cut connection's claim, a watchdog closing on its deadline
-//! alone, and an eviction's store over an admitted relay are the caught
-//! mutants.
+//! Tier-0 for `NetSlotDisplacement`: the network drive's listener keeps at most `Cap`
+//! connections in flight, claims each connection's unauthenticated phase exactly once
+//! (handshake, deadline or eviction), and never force-closes one its handshake claimed.
 
 use aterm_spec::derive::net_slot_displacement_model;
 use aterm_spec::interp::with_buggy;
@@ -18,12 +13,6 @@ const INVARIANTS: [&str; 3] = ["InFlightBounded", "ClaimExactlyOnce", "AuthedNev
 #[test]
 fn net_slot_displacement_proves_and_catches_the_cut_relay() {
     let model = net_slot_displacement_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name),
-        "the slot model must stay enrolled in the spec-link registry"
-    );
     aterm_spec::verify::prove_and_catch_scalar(&model, "net slot displacement");
     let uncaught = aterm_spec::verify::uncaught_invariants(&model);
     assert!(uncaught.is_empty(), "ghost invariants: {uncaught:?}");

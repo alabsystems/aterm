@@ -96,7 +96,7 @@ pub struct Signed {
 /// is fresh at `now_unix`, and one of its LIVE machines (listed, not revoked, not expired)
 /// signed the file.
 ///
-/// The ALab lane (`tools/atpkg-auto-alab.sh`) runs this over an ALab source release's
+/// The ALab lane (`atpkg-publish lane run alab`) runs this over an ALab source release's
 /// `SHA256SUMS` before it builds that source, against the roster the channel's verified
 /// index ships — so a release signed by no rostered machine, or by one revoked since, is
 /// never built beside the machine key. The refusal is the verifier's own reason, never an

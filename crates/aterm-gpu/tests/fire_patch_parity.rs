@@ -1,28 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// Fire-patch (`RenderInput.fire_patch`) CPU/GPU byte parity. Every covered
-// pixel evaluates the shared integer fire field (`aterm_render::fire_field`
-// on the CPU, the `fs_fire_add`/`fs_fire_over` WGSL equivalents on the GPU),
-// so the bar is byte-exact CPU==GPU.
+// Fire-patch (`RenderInput.fire_patch`) CPU/GPU byte parity. Every covered pixel evaluates the
+// shared integer fire field (`aterm_render::fire_field` on the CPU, the `fs_fire_add` /
+// `fs_fire_over` WGSL equivalents on the GPU), so the bar is byte-exact CPU==GPU: a synthetic
+// burn field at two font sizes and several phases, mixed Add+Over (light-theme ink) fire, the
+// cached path, a chrome head band, split-patch seams, and run-to-run determinism.
 //
-// Covered:
-//   * base frames without fire are byte-exact, so the fire delta is
-//     effect-only;
-//   * a synthetic burn field (temps, strengths, leans, cov_caps, multi-row
-//     and edge-clipped patches) is byte-exact across font sizes and phases;
-//   * `FireMode::Over` (light-theme ink fire): a mixed Add+Over field is
-//     byte-exact over dark and white frames, and darkens the white ground;
-//   * the cached path: an animating burn that moves rows misses the dirty
-//     gate, repaints prev∪cur patch rows and leaves no ghost;
-//   * seams: one wide patch and the same burn split into narrow patches
-//     render identically per backend;
-//   * `clear_overlays` restores the bare frame exactly;
-//   * the same input renders the same bytes twice.
-//
-// No GPU or no font: no-op. Cross-backend byte-exact checks also skip on
-// downlevel (sRGB-offscreen) adapters via `additive_is_byte_exact`;
-// backend-internal properties are asserted on any adapter.
+// No GPU or no font: no-op. Cross-backend byte-exact checks also skip on downlevel
+// (sRGB-offscreen) adapters (`additive_is_byte_exact`); backend-internal properties hold on any
+// adapter.
 
 use aterm_core::terminal::Terminal;
 use aterm_render::{FireMode, FirePatch, Theme, WindowCpu};
@@ -152,15 +139,12 @@ fn synthetic_burns(phase: u32, ch: usize, grid_w: usize, grid_h: usize) -> Vec<F
     out
 }
 
-/// Fire-patch parity: the base frame is byte-exact, so the fire delta is the
-/// stream's alone. The synthetic field over block text at several phases must
-/// be byte-identical on both backends.
+/// The base frame is byte-exact, so the fire delta is the stream's alone; the synthetic field
+/// over block text at several phases must be byte-identical on both backends.
 #[test]
 fn fire_patch_synthetic_field_is_byte_exact_over_text() {
     let theme = Theme::default();
-    let Some((mut cpu, mut gpu)) = backends(18.0, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(18.0, theme);
     let mut win = aterm_gpu::WindowGpu::new();
     let (rows, cols) = (10usize, 40usize);
     let mut term = block_text_term(rows, cols, 1..8);
@@ -219,9 +203,7 @@ fn fire_patch_synthetic_field_is_byte_exact_over_text() {
 #[test]
 fn fire_patch_byte_exact_at_4k_class_cells() {
     let theme = Theme::default();
-    let Some((mut cpu, mut gpu)) = backends(44.0, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(44.0, theme);
     let mut win = aterm_gpu::WindowGpu::new();
     let (rows, cols) = (6usize, 24usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
@@ -259,8 +241,8 @@ fn fire_patch_byte_exact_at_4k_class_cells() {
     }
 }
 
-/// A calm LIGHT theme (white ground, near-black ink) — the frame additive
-/// fire light is invisible on, i.e. the frame `FireMode::Over` exists for.
+/// A calm light theme (white ground, near-black ink): additive fire light is invisible on it,
+/// which is what `FireMode::Over` exists for.
 fn light_theme() -> Theme {
     Theme {
         fg: 0x0020_2020,
@@ -276,9 +258,7 @@ fn light_theme() -> Theme {
 #[test]
 fn over_ink_fire_byte_exact_over_dark_and_light_frames() {
     for (label, theme) in [("dark", Theme::default()), ("light", light_theme())] {
-        let Some((mut cpu, mut gpu)) = backends(18.0, theme) else {
-            return;
-        };
+        let (mut cpu, mut gpu) = backends(18.0, theme);
         let mut win = aterm_gpu::WindowGpu::new();
         let (rows, cols) = (10usize, 40usize);
         let mut term = block_text_term(rows, cols, 1..8);
@@ -351,7 +331,7 @@ fn over_ink_fire_byte_exact_over_dark_and_light_frames() {
             "({label}) the burns must actually paint (non-vacuous)"
         );
         if label == "light" {
-            // The law the mode exists for: ink-fire DARKENS the white ground.
+            // The law the mode exists for: ink fire darkens the white ground.
             let pad = (cpu_f.width - grid_w) / 2;
             let probe_x = pad + grid_w - 2 * ch;
             let probe_y = pad + grid_h - ch / 2;
@@ -380,16 +360,13 @@ fn over_ink_fire_byte_exact_over_dark_and_light_frames() {
     }
 }
 
-/// Cached-path parity: frame A places a burn; frame B advances its phase by
-/// one 16 ms tick and moves it to other rows. The change misses the dirty
-/// gate (`fire_patch_changed`), repaints prev∪cur patch rows, and lands
-/// byte-exact with no ghost.
+/// Cached-path parity: frame A places a burn; frame B advances its phase one 16 ms tick and
+/// moves it to other rows. The change misses the dirty gate (`fire_patch_changed`), repaints
+/// prev∪cur patch rows, and lands byte-exact with no ghost.
 #[test]
 fn damaged_path_fire_patch_parity_cpu_matches_gpu() {
     let theme = Theme::default();
-    let Some((mut cpu, mut gpu)) = backends(18.0, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(18.0, theme);
     let mut win_cpu = WindowCpu::new();
     let mut win_gpu = aterm_gpu::WindowGpu::new();
     let (rows, cols) = (8usize, 20usize);
@@ -428,8 +405,8 @@ fn damaged_path_fire_patch_parity_cpu_matches_gpu() {
     let _ = cpu.render_input_cached(&mut win_cpu, &in_a);
     let _ = gpu.render_input_cached(&mut win_gpu, &in_a);
 
-    // Frame B: the burn ANIMATES (phase +16 ≈ one 60 fps tick) and moves up
-    // two rows — a genuine content change on new and vacated rows.
+    // Frame B: the burn animates (phase +16 ≈ one 60 fps tick) and moves up two rows, a real
+    // change on new and vacated rows.
     let mut in_b = base_input.clone();
     in_b.fire_patch = burn_at(grid_h - 2 * ch - 4, 70_016);
     let misses_before = gpu.gate_misses();
@@ -446,8 +423,8 @@ fn damaged_path_fire_patch_parity_cpu_matches_gpu() {
         "an animating fire_patch must MISS the GPU dirty gate (real re-render)"
     );
 
-    // Ground truth: the damaged frame must equal a FRESH full render (no
-    // ghost flame at the vacated rows, no missing flame at the new rows) ...
+    // The damaged frame equals a fresh full render (no ghost flame at the vacated rows, no
+    // missing flame at the new rows) ...
     let cpu_fresh = cpu.render_input(&in_b).pixels.clone();
     assert_eq!(
         cpu_b, cpu_fresh,
@@ -472,9 +449,7 @@ fn damaged_path_fire_patch_parity_cpu_matches_gpu() {
 #[test]
 fn seam_law_split_patches_byte_identical_to_one_wide() {
     let theme = Theme::default();
-    let Some((mut cpu, gpu)) = backends(18.0, theme) else {
-        return;
-    };
+    let (mut cpu, gpu) = backends(18.0, theme);
     let mut gpu = gpu;
     let mut win = aterm_gpu::WindowGpu::new();
     let (rows, cols) = (8usize, 32usize);
@@ -540,14 +515,12 @@ fn seam_law_split_patches_byte_identical_to_one_wide() {
     }
 }
 
-/// DETERMINISM: the field is pure and the pipelines are stateless — the same
-/// input must render the identical bytes twice, on both backends.
+/// The field is pure and the pipelines are stateless: the same input renders the same bytes
+/// twice, on both backends.
 #[test]
 fn fire_patch_determinism_same_bytes_twice() {
     let theme = Theme::default();
-    let Some((mut cpu, mut gpu)) = backends(18.0, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(18.0, theme);
     let mut win = aterm_gpu::WindowGpu::new();
     let (rows, cols) = (8usize, 24usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
@@ -574,9 +547,7 @@ fn fire_patch_head_band_parity_cpu_matches_gpu() {
     const P: usize = 6; // interior pad (px per edge)
     const H: usize = 20; // chrome head band (px above the padded grid)
     let theme = Theme::default();
-    let Some((mut cpu, mut gpu)) = backends(18.0, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(18.0, theme);
     cpu.set_pad(P);
     cpu.set_head(H);
     gpu.set_pad(P);
@@ -648,8 +619,8 @@ fn fire_patch_head_band_parity_cpu_matches_gpu() {
         "the head-band burn must actually paint (non-vacuous)"
     );
 
-    // The band really carries flame on BOTH backends: some pixel strictly
-    // above the grid (`y < grid_top`) differs from that backend's base.
+    // The band carries flame on both backends: some pixel above the grid (`y < grid_top`)
+    // differs from that backend's base.
     let band_lit =
         |painted: &[u32], base: &[u32], w: usize| (0..grid_top * w).any(|i| painted[i] != base[i]);
     assert!(

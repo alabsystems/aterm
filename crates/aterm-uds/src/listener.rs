@@ -1,28 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! WHICH LISTENING SOCKET a path names: the socket file its `bind` created —
-//! device and inode, and its birth where the filesystem keeps one, so an inode
-//! number handed out again at once is still told apart. Every bind makes a new
-//! one.
+//! Which listening socket a path names: the socket file its `bind` created (device and inode,
+//! plus its birth where the filesystem keeps one, so an inode number reissued at once is
+//! still told apart). Every bind makes a new one.
 //!
-//! A PID ALONE DOES NOT NAME A SERVER (2026-09-30): aterm-gui's cold update lane
-//! closes its listening socket and shuts down every stream it accepted
-//! (`Endpoint::retire`) right before an `exec` that KEEPS the pid; the exec'd
-//! image binds the same path (`aterm-<pid>.sock`, or the `--control-sock` its
-//! argv carries), and an `exec` that returned reopens it in the same process
-//! (`Endpoint::reopen`: a fresh socket renamed over the path). Judged by pid,
-//! that process answering was the server that ended the stream on purpose when
-//! a client looked once it was up, and never a successor when it looked
-//! before. Both sides of a hang-up judge it with this identity: `aterm ctl`'s
-//! redial (whether the server it reached still answers) and aterm-gui's forward
-//! relay (whether the host behind a forward still serves where it was reached).
+//! A pid alone does not name a server: aterm-gui's cold update lane closes its listener and
+//! every stream it accepted (`Endpoint::retire`) right before an `exec` that keeps the pid, and
+//! the new image binds the same path (if the `exec` returns, `Endpoint::reopen` renames a fresh
+//! socket over it). Both sides of a hang-up judge it by this identity: `aterm ctl`'s redial
+//! (whether the server it reached still answers) and aterm-gui's forward relay (whether the
+//! host behind a forward still serves where it was reached).
 //!
-//! One fresh listener cuts nothing: the watchdog's rebind of a wedged one
-//! (aterm-gui's `control_listener`) leaves every stream it accepted served. A
-//! stream that server then ends on purpose, without saying its sessions
-//! exited, is asked once more of that same process, which takes it or refuses
-//! it — never another aterm.
+//! The watchdog's rebind of a wedged listener (aterm-gui's `control_listener`) leaves every
+//! stream it accepted served; a stream that server then ends without saying its sessions
+//! exited is asked once more of that same process, never another aterm.
 
 use std::path::Path;
 use std::time::SystemTime;
@@ -36,12 +28,10 @@ pub struct ListenerId {
     born: Option<SystemTime>,
 }
 
-/// The [`ListenerId`] of the socket `path` names now, a link followed. Read
-/// once a connection through `path` is up, it names the listener that accepted
-/// it — unless one was renamed over the path in between, which errs toward the
-/// same listener, the verdict before this identity was read. `None` when
-/// nothing is there, it is not a socket, or the platform names no socket file
-/// (every one but Unix): the pid alone then decides.
+/// The [`ListenerId`] of the socket `path` names now, a link followed. Read once a connection
+/// through `path` is up, it names the listener that accepted it, unless one was renamed over
+/// the path in between (which errs toward "the same listener"). `None` when nothing is there,
+/// it is not a socket, or the platform names no socket file (all but Unix).
 #[must_use]
 pub fn listener_at(path: impl AsRef<Path>) -> Option<ListenerId> {
     let meta = std::fs::metadata(path).ok()?;
@@ -51,9 +41,8 @@ pub fn listener_at(path: impl AsRef<Path>) -> Option<ListenerId> {
     })
 }
 
-/// Whether `path` still names the listener `then` was read from — read now,
-/// after whatever answered there answered. `true` when either reading is
-/// missing: the pid alone then decides, as it did before this identity.
+/// Whether `path` still names the listener `then` was read from, read now (after whatever
+/// answered there answered). `true` when either reading is missing: the pid alone decides.
 #[must_use]
 pub fn still_names(path: impl AsRef<Path>, then: Option<ListenerId>) -> bool {
     match (then, listener_at(path)) {

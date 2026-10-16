@@ -164,9 +164,11 @@ impl<T: Copy + PartialEq + Default> Rle<T> {
             None
         };
 
-        // Replace the run with the new runs
+        // Replace the run with the new runs; only `mid` (at `mid_idx`) has
+        // newly-adjacent neighbors, so O(1) local compaction suffices.
+        let mid_idx = run_idx.saturating_add(usize::from(before.is_some()));
         self.replace_run_span(run_idx, run_idx, before, mid, after);
-        self.compact();
+        self.compact_around(mid_idx);
     }
 
     /// Split multiple runs to set a range to a new value.
@@ -224,9 +226,13 @@ impl<T: Copy + PartialEq + Default> Rle<T> {
             None
         };
 
-        // Replace the runs
+        // Replace the runs; `before` (if any) keeps `start_run.value` which
+        // differed from `runs[start_run_idx - 1]`, and `after` (if any) keeps
+        // `end_run.value` which differed from `runs[end_run_idx + 1]`, so only
+        // `mid` (at `mid_idx`) can merge with an adjacent neighbor.
+        let mid_idx = start_run_idx.saturating_add(usize::from(before.is_some()));
         self.replace_run_span(start_run_idx, end_run_idx, before, mid, after);
-        self.compact();
+        self.compact_around(mid_idx);
     }
 
     /// Replace the runs in `start_run_idx..=end_run_idx` with the sequence
@@ -291,6 +297,13 @@ impl<T: Copy + PartialEq + Default> Rle<T> {
     }
 
     /// Compact adjacent runs with the same value.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "reference full-scan compaction kept for Trust verification floor and differential equivalence tests"
+        )
+    )]
     pub(crate) fn compact(&mut self) {
         if self.runs.len() <= 1 {
             return;
@@ -346,6 +359,58 @@ impl<T: Copy + PartialEq + Default> Rle<T> {
             self.runs[idx].length =
                 Self::checked_run_length_sum(self.runs[idx].length, self.runs[next].length);
             self.runs.remove(next);
+        }
+    }
+}
+
+// A `clean { … }` island is Clean surface that only a Trust rustc can parse. A
+// stock rustc (the cross cells of `verify cells`, the x86_64-apple-darwin
+// compat slice) parses a cfg'd-out module's body all the same, so the island's
+// module goes through this macro, which drops its tokens there and emits them
+// unchanged under `cfg(trust_verify)`.
+#[cfg(trust_verify)]
+macro_rules! verify_island {
+    ($($tt:tt)*) => {
+        $($tt)*
+    };
+}
+
+#[cfg(not(trust_verify))]
+macro_rules! verify_island {
+    ($($tt:tt)*) => {};
+}
+
+verify_island! {
+    mod rle_local_compact_proofs {
+        // Given a compact run sequence where adjacent runs outside the spliced
+        // `[before?, mid, after?]` span already differ in value (`prev_val != before_val`
+        // and `after_val != next_val`), only `mid` (at `mid_idx`) can match its
+        // immediate left or right neighbor, and once `mid` merges with a neighbor,
+        // the merged run preserves the pre-existing inequality with the outer neighbor.
+        clean {
+            section RleLocalCompact
+            theorem OuterInequalityPreservedOnLeftMerge :
+                forall (prev_val left_val mid_val : Nat),
+                    Not (Eq prev_val left_val) ->
+                    Eq left_val mid_val ->
+                    Not (Eq prev_val mid_val) :=
+                fun (prev_val left_val mid_val : Nat)
+                    (h_neq : Not (Eq prev_val left_val))
+                    (h_eq : Eq left_val mid_val) =>
+                    fun (h_contra : Eq prev_val mid_val) =>
+                        h_neq (Eq.trans h_contra (Eq.symm h_eq))
+
+            theorem OuterInequalityPreservedOnRightMerge :
+                forall (mid_val right_val next_val : Nat),
+                    Not (Eq right_val next_val) ->
+                    Eq mid_val right_val ->
+                    Not (Eq mid_val next_val) :=
+                fun (mid_val right_val next_val : Nat)
+                    (h_neq : Not (Eq right_val next_val))
+                    (h_eq : Eq mid_val right_val) =>
+                    fun (h_contra : Eq mid_val next_val) =>
+                        h_neq (Eq.trans (Eq.symm h_eq) h_contra)
+            end RleLocalCompact
         }
     }
 }

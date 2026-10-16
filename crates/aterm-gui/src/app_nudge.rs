@@ -1,55 +1,34 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE REPAINT NUDGE, host side: the thin driver around the pure machine in
-//! `aterm_core::terminal::repaint_nudge` (design decision D7).
+//! The repaint nudge, host side: the driver around the pure machine in
+//! `aterm_core::terminal::repaint_nudge`. The machine says when the session's PTY is set one row
+//! short ([`Act::Hold`]) and back ([`Act::Release`]); this file reads the world into [`Facts`],
+//! performs those two PTY writes and keeps the release from being lost. It reaches the world only
+//! through [`NudgeWorld`] ([`AppWorld`] in production, a table in the tests).
 //!
-//! WHAT THE MACHINE DECIDES AND WHAT THIS FILE DOES. The machine says when the
-//! session's PTY is to be set one row short ([`Act::Hold`]) and back
-//! ([`Act::Release`]); this file reads the world into [`Facts`], performs those
-//! two PTY writes and keeps them from ever being lost. It reaches the world only
-//! through [`NudgeWorld`] (the production one, [`AppWorld`], reads the
-//! `App`; the tests' one is a table), so the host logic runs without a window or
-//! a PTY.
+//! The ordinary layout passes cannot repair a PTY left short (they write the PTY only when the
+//! engine's size moves), so the release does not rest on this driver's own exit paths:
 //!
-//! THE RELEASE CANNOT BE LOST (D11). The ordinary layout passes cannot repair a
-//! PTY left short: they compare the ENGINE's size with its plan and write the PTY
-//! only when the engine moves. So the safety does not rest on this driver's own
-//! exit paths:
+//! 1. the hold is a [`PtyGuard`] whose `Drop` sets the PTY to the engine's current size;
+//! 2. a hold has a hard deadline, [`PTY_HOLD_CAP_MS`], and the tick first releases any hold
+//!    past it;
+//! 3. [`NudgeHost::pty_short`] lives outside the drivers and is emptied only when `TIOCGWINSZ`
+//!    reads the engine's size, so a hold whose driver vanished meets the same deadline;
+//! 4. a handoff freeze calls [`NudgeHost::release_all`] first, and `Facts::frozen` is a gate;
+//! 5. a window pass that changes the engine's size sets the PTY to its plan anyway: the machine
+//!    forgets the hold ([`Act::Forget`], no write).
 //!
-//! 1. the hold is a [`PtyGuard`] whose `Drop` sets the PTY to the engine's
-//!    current size (a panic unwinding the tick, a driver dropped by a teardown);
-//! 2. a hold carries a hard deadline, [`PTY_HOLD_CAP_MS`], and the tick's first
-//!    act is to release any hold past it;
-//! 3. [`NudgeHost::pty_short`] lives OUTSIDE the drivers, is filled at the hold
-//!    and is emptied only when `TIOCGWINSZ` reads the engine's size after a
-//!    release - so a hold whose driver vanished is found by the same deadline;
-//! 4. a handoff freeze calls [`NudgeHost::release_all`] before it starts, and
-//!    `rows_frozen` is a gate;
-//! 5. a window pass that changes the ENGINE's size sets the PTY to its plan
-//!    anyway: the machine sees a PTY that is not the one it set and forgets
-//!    the hold ([`Act::Forget`], no write); the map entry goes as after a
-//!    release, once `TIOCGWINSZ` reads the engine's size.
+//! An attempt that held always ends judged (healed, a give-up the owner hears, or a drop whose
+//! reason is true) with one `aterm.log` line ([`end_line`]). A real resize that moves the engine
+//! ends it [`Dropped::Superseded`]; if that resize comes back, the epoch judge raises the give-up
+//! the attempt would have reached ([`NudgeWorld::superseded`], `crate::resize_epoch`).
 //!
-//! EVERY ATTEMPT THAT HELD ENDS JUDGED, AND SAYS HOW. The hold marks its epoch
-//! tried for good, so whatever ends the hold - the machine, the deadline (2),
-//! a freeze (4), someone else's write (5) - the attempt goes on to a judged
-//! end: healed, a give-up the owner hears, or a drop whose reason is true, and
-//! `aterm.log` has one line for it ([`end_line`]). A real resize that left the
-//! engine elsewhere ends it [`Dropped::Superseded`]; if that resize comes back
-//! after the wait, the epoch judge finds the epoch at risk again where the hold
-//! found it, and the window raises the give-up it would have been inside the
-//! wait ([`NudgeWorld::superseded`], `crate::resize_epoch`).
-//!
-//! WHEN IT RUNS. Armed by the epoch's own judgement (`resize_epoch::note_nudge_due`
-//! from whichever path judged it), never by the status sweep; ticked from the
-//! event loop's `about_to_wait`; its next instant is folded into the loop's
-//! deadline under `DeadlineOwner::RenderEpoch`. A machine with nothing armed
-//! costs one map length check.
-//!
-//! MODES. `[render] repaint_nudge`: `on` acts; `log` runs everything but the
-//! two PTY writes and writes `would-nudge ...`; `off` arms nothing. Only the
-//! agent class is ever held, whatever the mode.
+//! Armed by the epoch's judgement (`resize_epoch::note_nudge_due`), never by the status sweep;
+//! ticked from `about_to_wait`, its next instant folded into the loop's deadline under
+//! `DeadlineOwner::RenderEpoch`. `[render] repaint_nudge`: `on` acts; `log` runs everything but
+//! the two PTY writes and logs `would-nudge ...`; `off` arms nothing. Only the agent class is
+//! ever held.
 
 use std::collections::HashMap;
 
@@ -162,7 +141,7 @@ pub(crate) trait NudgeWorld {
     fn pty_dims(&self, session: u64) -> Option<(u16, u16)>;
     /// Set the PTY's size (`TIOCSWINSZ`).
     fn set_pty(&mut self, session: u64, rows: u16, cols: u16, cell_px: Option<(u16, u16)>);
-    /// A guard that sets the PTY to the engine's CURRENT size when dropped.
+    /// A guard that sets the PTY to the engine's current size when dropped.
     fn restore_guard(
         &self,
         session: u64,
@@ -178,11 +157,8 @@ pub(crate) trait NudgeWorld {
     /// The attempt ended; let the ledger read the engine (an epoch the repaint
     /// healed closes `by=nudge`) and tell whoever watches.
     fn publish(&mut self, session: u64);
-    /// The repair could not be done and the screen is probably still off by a
-    /// row: the owner's one action ("drag the window edge one row and back")
-    /// belongs in the exceptions digest (zero rows, dismissable,
-    /// `render.<tab>.unrepaired`, `Family::Render`): the production world hands
-    /// it to the window after the step, which owns the digest.
+    /// The repair failed and the screen is probably still a row off. The production world hands
+    /// it to the window after the step, which raises the `render.<tab>.unrepaired` digest line.
     fn give_up(&mut self, session: u64, epoch: u64, why: GiveUp);
     /// A real resize superseded the attempt for `epoch`: the epoch judge owes
     /// its end if the resize comes back (`crate::resize_epoch`).
@@ -201,7 +177,7 @@ struct NudgeDriver {
     wake_ms: Option<u64>,
     /// Detail for the log lines.
     epoch_view: Option<NudgeView>,
-    /// The engine size and cell box the hold was taken against.
+    /// The cell box the hold was taken with, reused at the release.
     held_cell_px: Option<(u16, u16)>,
     /// What the ledger was last told.
     stamped: (Phase, u32),
@@ -221,7 +197,7 @@ struct Watch {
 /// The host: drivers per session, the held-PTY map, the mode.
 pub(crate) struct NudgeHost {
     mode: Mode,
-    /// Repaint adoptions under watch (R08).
+    /// Repaint adoptions under watch.
     watch: HashMap<u64, Watch>,
     drivers: HashMap<u64, NudgeDriver>,
     /// Sessions whose PTY is held one row short, and since when (timeline ms).
@@ -301,12 +277,10 @@ impl NudgeHost {
         true
     }
 
-    /// Let every hold go at once: a handoff freeze is about to start, and the
-    /// successor adopts each PTY at the size its program believes. Each
-    /// attempt goes on as after a release and waits the freeze out (no parked
-    /// reader can carry an answer): a successor judges the debt it is handed,
-    /// and a rollback finds the attempt waiting for its answer, judged as any
-    /// other. An armed one waits at its freeze gate.
+    /// Let every hold go before a handoff freeze, so the successor adopts each PTY at the size
+    /// its program believes. Each attempt then waits the freeze out as after a release (no parked
+    /// reader carries an answer): a successor judges the debt it is handed, and after a rollback
+    /// the attempt is judged as any other. An armed one waits at its freeze gate.
     pub(crate) fn release_all<W: NudgeWorld>(&mut self, w: &mut W) {
         let now = w.now_ms();
         let sessions: Vec<u64> = self.drivers.keys().copied().collect();
@@ -433,11 +407,9 @@ impl NudgeHost {
                 next = Some(next.map_or(at, |n| n.min(at)));
             }
         }
-        // A held PTY has a deadline of its own.
-        // Past its cap an entry the reconcile could not clear (the terminal
-        // lock contended or poisoned, a kernel that did not confirm the size)
-        // is retried at a slow beat, never at an instant already gone: that
-        // would re-arm an immediate wake on every turn of the loop.
+        // A held PTY has a deadline of its own. Past its cap, an entry the reconcile could not
+        // clear (lock contended or poisoned, kernel did not confirm) is retried at a slow beat,
+        // never at an instant already gone, which would re-arm an immediate wake every turn.
         for since in self.pty_short.values() {
             let at = since.saturating_add(PTY_HOLD_CAP_MS);
             let at = if at > now {
@@ -461,12 +433,10 @@ impl NudgeHost {
         }
     }
 
-    /// Settle every watched adoption: repainted by the pulse (a gain,
-    /// nothing to do), still blank and known to be Claude Code (armed once), or
-    /// not Claude Code (left to the pulse, which is today's behaviour). The
-    /// clock runs from the moment the reader is attached and no handoff freeze
-    /// is on - never from the spawn, which for a deferred reader is well before
-    /// anything the program draws can be seen.
+    /// Settle every watched adoption: repainted by the pulse (a gain), still blank and known to
+    /// be Claude Code (armed once), or not Claude Code (left to the pulse). The clock runs from
+    /// the reader's attach with no handoff freeze on, never from the spawn, which for a deferred
+    /// reader is well before anything the program draws can be seen.
     fn tick_watch<W: NudgeWorld>(&mut self, w: &mut W, now: u64) -> Option<u64> {
         let mut next: Option<u64> = None;
         let sessions: Vec<u64> = self.watch.keys().copied().collect();
@@ -511,8 +481,8 @@ impl NudgeHost {
                 continue;
             }
             if waited >= ADOPTION_CLASS_MS {
-                // Not known to be Claude Code (or not on the alternate screen)
-                // this long after attach: the pulse alone, as before.
+                // Not known to be Claude Code on the alternate screen this long after attach:
+                // left to the pulse.
                 self.watch.remove(&session);
                 continue;
             }
@@ -868,11 +838,9 @@ impl NudgeWorld for AppWorld<'_> {
         let Some(s) = self.app.pool.get(session) else {
             return PtyGuard::new(|| {});
         };
-        // The guard holds a sink clone, so the master stays open until it
-        // drops: it outlives the session up to the next tick, and by then a
-        // bare number could name another tab's PTY. The terminal is read only
-        // for its size; the parse stage or a worker can hold it past the
-        // master, so it proves nothing about the descriptor.
+        // The guard holds a sink clone, so the master stays open until it drops: a bare number
+        // could name another tab's PTY by the next tick. The terminal is read only for its size
+        // (the parse stage or a worker can outlive the master, so it proves nothing about it).
         let sink = std::sync::Arc::clone(&s.ctx.sink);
         let term = std::sync::Arc::downgrade(&s.term);
         PtyGuard::new(move || {
@@ -930,10 +898,6 @@ impl NudgeWorld for AppWorld<'_> {
     }
 
     fn give_up(&mut self, session: u64, epoch: u64, why: GiveUp) {
-        // "Tab N may be one row off" plus its cause from
-        // `render_unrepaired_reason` is the digest's line
-        // (`App::note_render_unrepaired`); the `aterm.log` line above is the
-        // developer's.
         self.gave_up.push((session, epoch, why));
     }
 
@@ -960,11 +924,8 @@ impl NudgeWorld for AppWorld<'_> {
 }
 
 impl crate::App {
-    /// Walk the sessions and arm the nudge for every untried agent-class
-    /// epoch at `desync-risk`, and raise the give-up the epoch judge found owed
-    /// for a superseded attempt whose resize came back
-    /// (`crate::resize_epoch::EpochBook::take_returned`). Cheap: one atomic
-    /// swap when nothing changed.
+    /// Arm the nudge for every untried agent-class epoch at `desync-risk`, and raise the give-up
+    /// owed for a superseded attempt whose resize came back. One atomic load when nothing changed.
     fn arm_nudges(&mut self) {
         let generation = crate::resize_epoch::nudge_due_generation();
         if self.nudges.mode() == Mode::Off || generation == self.nudge_gen_seen {
@@ -1275,7 +1236,7 @@ mod tests {
         let (mut host, mut w) = armed(Mode::On);
         host.tick(&mut w);
         assert_eq!(host.held(), 1);
-        // The window resized the ENGINE; the layout pass set the PTY to its plan.
+        // The window resized the engine; the layout pass set the PTY to its plan.
         w.s.borrow_mut().engine.insert(1, (62, 200));
         w.s.borrow_mut().pty.insert(1, (62, 200));
         w.advance(10);
@@ -1404,7 +1365,7 @@ mod tests {
     fn a_lost_drivers_hold_is_found_and_released_by_the_reconcile() {
         let (mut host, mut w) = armed(Mode::On);
         host.tick(&mut w);
-        // The driver vanishes WITHOUT running its guard (a leaked guard): only
+        // The driver vanishes without running its guard (a leaked guard): only
         // the app-level map remembers the hold.
         let driver = host.drivers.remove(&1).unwrap();
         std::mem::forget(driver);
@@ -1455,7 +1416,7 @@ mod tests {
         assert!(w.s.borrow().gave_up.is_empty(), "nothing judged frozen");
         assert_eq!(w.pty(1), ENGINE, "and nothing held again");
         // A rollback lifts the freeze: the wait starts again and the attempt is
-        // judged as after any release. It used to end at the freeze, unsaid.
+        // judged as after any release.
         w.s.borrow_mut().frozen = false;
         host.tick(&mut w);
         assert!(w.s.borrow().gave_up.is_empty(), "the wait starts again");
@@ -1509,9 +1470,8 @@ mod tests {
         assert_ne!(w.pty(1), ENGINE);
     }
 
-    /// R08: a blank agent tab that gave no full repaint within 1500 ms of its
-    /// reader's attach is armed for the closed loop - once - and the nudge then
-    /// repaints it through the same gates and bounds as a debt.
+    /// A blank agent tab with no full repaint within `ADOPTION_WAIT_MS` of attach is armed once,
+    /// then repaired through the same gates and bounds as a debt.
     #[test]
     fn a_blank_agent_tab_with_no_answer_in_1500ms_is_armed_once() {
         let mut w = Fake::new(&[1]);
@@ -1566,8 +1526,7 @@ mod tests {
         );
     }
 
-    /// R08 negative control: a program that is not Claude Code on a blank
-    /// engine keeps today's behaviour - the pulse alone, never a hold.
+    /// Negative control: a blank tab whose program is not Claude Code is never held.
     #[test]
     fn a_blank_non_agent_tab_is_left_to_the_pulse() {
         let mut w = Fake::new(&[1]);
@@ -1582,8 +1541,7 @@ mod tests {
         assert!(host.is_idle(), "the watch gave up on it");
     }
 
-    /// R08 negative control: a program that answers the pulse (vim, less) is
-    /// repainted by the pulse and never nudged.
+    /// Negative control: a program that answers the pulse (vim, less) is never nudged.
     #[test]
     fn an_adoption_the_pulse_repainted_is_never_nudged() {
         let mut w = Fake::new(&[1]);
@@ -1600,9 +1558,8 @@ mod tests {
         assert!(host.is_idle());
     }
 
-    /// R08: the 1500 ms are counted from the moment the reader is attached and
-    /// no handoff freeze is on, never from the spawn: a deferred reader's
-    /// program cannot have answered before it.
+    /// The adoption wait counts from the reader's attach with no handoff freeze on, never from
+    /// the spawn: a deferred reader's program cannot have answered before it.
     #[test]
     fn a_deferred_reader_adoption_arms_at_ready() {
         let mut w = Fake::new(&[1]);
@@ -1681,11 +1638,10 @@ mod tests {
         assert_eq!(*ran.borrow(), 1);
     }
 
-    /// The production guard holds the session's master, not its number: with
-    /// the session and its terminal gone (a tab closed during a hold), the
-    /// guard alone keeps the master open and still puts THAT PTY back, at the
-    /// size the hold recorded. A captured number would be closed by then, and
-    /// free for another tab's `forkpty`.
+    /// The production guard holds the session's master, not its number: with the session and its
+    /// terminal gone (a tab closed during a hold), the guard alone keeps the master open and puts
+    /// that PTY back at the size the hold recorded. A captured number could by then name another
+    /// tab's PTY.
     #[cfg(unix)]
     #[test]
     fn the_restore_guard_holds_the_master_past_its_session() {

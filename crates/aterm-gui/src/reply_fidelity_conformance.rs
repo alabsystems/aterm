@@ -34,11 +34,10 @@ use crate::test_socket::{hang_up, join_after_hang_up};
 
 type State = BTreeMap<&'static str, i64>;
 
-/// The connect-probe bound for runs whose child answers at once, and how long
-/// a run waits for the child's read. Both wait for something that MUST happen
-/// (the child is serving): hang detectors, never latency budgets, so a loaded
-/// machine cannot turn a delivered verb into a false `delivered = 0`. The
-/// unanswered-probe run passes its own short bound.
+/// The connect-probe bound for runs whose child answers at once, and how long a run
+/// waits for the child's read: hang detectors for what must happen, never latency
+/// budgets, so a loaded machine cannot turn a delivered verb into `delivered = 0`.
+/// The unanswered-probe run passes its own short bound.
 const PATIENCE: std::time::Duration = aterm_spec::wait::MUST_HAPPEN;
 
 fn state(delivered: bool, reported_err: bool) -> State {

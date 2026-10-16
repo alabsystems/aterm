@@ -5,9 +5,8 @@
 
 use super::*;
 
-/// The frame-0 law at the seam (T2, §6): a 20-cell same-row nav move puts the
-/// meteor's train (`under`), white heat (`out`) and coma (`halos`) on glass on
-/// the tick the caret is observed, with no spark, zoom, starburst, ring,
+/// A 20-cell same-row nav move puts the meteor's train (`under`), white heat (`out`) and coma
+/// (`halos`) on glass on the tick the caret is observed, with no spark, zoom, starburst, ring,
 /// particle or Sweep/Glide cue beside the engine's one meteor cue.
 #[test]
 fn a_v2_nav_jump_draws_the_meteor_on_the_observed_frame() {
@@ -100,9 +99,8 @@ fn under_light_at(quads: &[GlowQuad], g: Geom, row: u16, col: u16) -> u32 {
         .unwrap_or(0)
 }
 
-/// `trail status` claims the ribbon it lays (§17.2 seam point 12, read by the
-/// paint-conformance bind): `ribbon_segments=` and `ribbon_hue_bands=` count
-/// v2's cells and determine `ribbon_active` (`≥ 2 && ≥ 2`).
+/// `trail status` claims the ribbon it lays: `ribbon_segments=` and `ribbon_hue_bands=` count
+/// v2's cells and determine `ribbon_active` (both ≥ 2).
 #[test]
 fn under_v2_trail_status_claims_the_ribbon_it_lays() {
     let g = geom();
@@ -131,12 +129,9 @@ fn under_v2_trail_status_claims_the_ribbon_it_lays() {
     );
 }
 
-/// The frame-0 law for a typed key (T2, §2.1; §2.5's `edge-in` attack is kept,
-/// with its readable floor on the key frame): the frame that echoes the key
-/// already shows its ribbon cell. The host stamps the key at
-/// `note_typed_glyph(t_key)`; the echo lands 0.2–0.4 ms later, and the same
-/// `tick` that observes the caret's move must emit `under` light over the new
-/// cell. The floor is a quarter of the settled cell.
+/// The frame that echoes a typed key already shows its ribbon cell: the host stamps the key, the
+/// echo lands 0.3 ms later, and the same `tick` that observes the caret's move emits `under`
+/// light over the new cell, at least a quarter of the settled cell's.
 #[test]
 fn the_frame_that_echoes_the_key_already_shows_its_ribbon_cell() {
     let g = geom();
@@ -146,24 +141,23 @@ fn the_frame_that_echoes_the_key_already_shows_its_ribbon_cell() {
     let mut out = Vec::new();
     glow.tick(Some((2, 4)), t0, &c, g, &mut out);
     assert!(glow.v2.engaged());
-    // Warm the spine exactly as a live hand does — the cell under test is
-    // the FOURTH of a 90 ms burst, so `birth_disp` is not the cold floor.
+    // Warm the spine as a live hand does: the cell under test is the fourth of a 90 ms burst, so
+    // `birth_disp` is not the cold floor.
     let mut now = t0;
     for k in 1..=3u16 {
         now = t0 + Duration::from_millis(90 * u64::from(k));
         glow.note_typed_cells(now, 1);
         glow.tick(Some((2, 4 + k)), now, &c, g, &mut out);
     }
-    // THE KEY — stamped by the host at the key, as `app_input.rs` does.
+    // The key, stamped by the host at the key.
     let t_key = now + Duration::from_millis(90);
     glow.note_typed_cells(t_key, 1);
-    // THE ECHO — the caret is observed at its landing 0.3 ms later.
+    // The echo: the caret is observed at its landing 0.3 ms later.
     let echo = t_key + Duration::from_micros(300);
     let fp = glow.tick(Some((2, 8)), echo, &c, g, &mut out);
     assert_ne!(fp, 0, "the echo frame is on glass");
     let on_echo = under_light_at(glow.under_quads(), g, 2, 7);
-    // The frame after it, one panel period on, is where the light
-    // arrived in the capture.
+    // The frame after it, one panel period on.
     let next = echo + Duration::from_millis(17);
     glow.tick(Some((2, 8)), next, &c, g, &mut out);
     let on_next = under_light_at(glow.under_quads(), g, 2, 7);
@@ -178,13 +172,11 @@ fn the_frame_that_echoes_the_key_already_shows_its_ribbon_cell() {
     );
 }
 
-/// A line still being typed has no dark cell inside its live span. A sentence
-/// of 60 keys at 7 cps (fast words, thinking pauses, one slow word), each echo
-/// observed on the tick after its key, ticks at 60 Hz: on every tick while the
-/// hand types, every glyph cell from the first key to the caret's neighbour is
-/// live. The cohort shares one life, so a word typed at a dip cannot die
-/// before an older, hotter word beside it, and the oldest cells do not die
-/// under a hand that has not lifted (owner, 2026-09-08).
+/// A line still being typed has no dark cell inside its live span. A 60-key sentence at 7 cps
+/// (fast words, thinking pauses, one slow word), each echo observed on the tick after its key, at
+/// 60 Hz: on every tick while the hand types, every glyph cell from the first key to the caret's
+/// neighbour is live. The cohort shares one life, so neither a word typed at a dip nor the oldest
+/// cells die under a hand that has not lifted.
 #[test]
 fn a_line_still_being_typed_has_no_dark_cell_inside_its_live_span() {
     let g = Geom {
@@ -263,9 +255,8 @@ fn a_line_still_being_typed_has_no_dark_cell_inside_its_live_span() {
     );
 }
 
-/// T6 at the seam: an engaged v2 with nothing live is exactly zero
-/// (fingerprint 0, empty streams, no cadence, no deadline, inactive, status
-/// reports nothing drawn), so the loop parks.
+/// An engaged v2 with nothing live is exactly zero (fingerprint 0, empty streams, no cadence, no
+/// deadline, inactive, status reports nothing drawn), so the loop parks.
 #[test]
 fn v2_idle_is_exactly_zero() {
     let g = geom();

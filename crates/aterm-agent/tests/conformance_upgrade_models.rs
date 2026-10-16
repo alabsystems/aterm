@@ -1,19 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 binding for the live upgrade's model priority list, its model
-//! ladder and its model switch (`harness::upgrade_models`, specs
-//! `HarnessModelPriority`, `HarnessModelLadder` and `HarnessModelSwitch`).
-//!
-//! These tests drive the real `Priority::admit`, `render`/`parse` and
-//! `upgrade_models::list_target` over `offered` (the list), `model_moves_now`
-//! (the ladder), and `model_read_step`, `model_due`, `model_to`,
-//! `ModelRecord::settle`/`due_clock`/`asked` and `live_model_at` (the switch)
-//! over every reachable state of the derived models, project the results onto
-//! the models' variables, and check every observed transition against the
-//! model on the in-process interpreter and, where installed, `ty trace
-//! validate`. Forged successors the model must refuse keep a green bind from
-//! being vacuous.
+//! Tier-1 binding for `harness::upgrade_models` against the derived specs
+//! `HarnessModelPriority` (the list), `HarnessModelLadder` (the ladder) and
+//! `HarnessModelSwitch` (the switch). Each submodule drives the real code over every
+//! reachable model state and validates each observed transition on every installed
+//! tier; forged successors the model must refuse keep a green bind from being vacuous.
 
 use std::collections::BTreeMap;
 

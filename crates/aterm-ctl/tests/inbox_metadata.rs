@@ -6,6 +6,10 @@
 //! `offscreen`). No live aterm session is discovered or addressed.
 
 #![cfg(unix)]
+#![allow(
+    clippy::disallowed_types,
+    reason = "test code: a stand-in child may inherit descriptors"
+)]
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;

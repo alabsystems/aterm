@@ -1070,7 +1070,7 @@ mod tests {
     /// the EDR test and the exhaustion test.
     #[test]
     fn the_swapchain_states_every_axis_the_wgpu_configure_sets() {
-        let Some(dev) = device() else { return };
+        let dev = device();
         let config = SwapchainConfig {
             format: PixelFormat::Bgra8Unorm,
             width: 16,
@@ -1124,7 +1124,7 @@ mod tests {
     /// OS's fresh-layer default.
     #[test]
     fn the_edr_arm_opts_into_extended_range_and_names_its_colorspace() {
-        let Some(dev) = device() else { return };
+        let dev = device();
         let config = SwapchainConfig::aterm_present(PixelFormat::Rgba16Float, 8, 8);
         let sc = Swapchain::standalone(&dev, &config, Arc::new(loss::LossLatch::new()))
             .expect("EDR swapchain");
@@ -1150,7 +1150,7 @@ mod tests {
     /// beside it; dropping the swapchain unparents only its own layer.
     #[test]
     fn a_leftover_wgpu_layer_survives_attach_and_detach() {
-        let Some(dev) = device() else { return };
+        let dev = device();
         // Dropping Metal objects autoreleases, so the test owns a pool.
         let _test_pool = AutoreleasePool::new();
         let parent = plain_calayer();
@@ -1217,7 +1217,7 @@ mod tests {
     /// oversized and soft.
     #[test]
     fn attach_adopts_the_parents_contents_scale_and_follows_it() {
-        let Some(dev) = device() else { return };
+        let dev = device();
         let _test_pool = AutoreleasePool::new();
         let parent = plain_calayer();
         // A Retina parent.
@@ -1274,7 +1274,7 @@ mod tests {
     /// crash on a nil `superlayer`.
     #[test]
     fn a_standalone_swapchain_has_no_parent_to_adopt_a_scale_from() {
-        let Some(dev) = device() else { return };
+        let dev = device();
         let _test_pool = AutoreleasePool::new();
         let config = SwapchainConfig {
             format: PixelFormat::Bgra8Unorm,
@@ -1302,7 +1302,7 @@ mod tests {
     /// `allowsNextDrawableTimeout == YES` readback.
     #[test]
     fn acquire_fails_bounded_and_named_when_the_layer_cannot_vend() {
-        let Some(dev) = device() else { return };
+        let dev = device();
         // As in the attach test: the pool `Obj::drop` says every caller owes.
         let _test_pool = AutoreleasePool::new();
         let config = SwapchainConfig {
@@ -1400,7 +1400,7 @@ mod tests {
         use crate::metal::loss::{CbOutcome, LossLatch};
         use crate::pipeline_table::Pipeline;
 
-        let Some(dev) = device() else { return };
+        let dev = device();
         let _test_pool = AutoreleasePool::new();
 
         const W: usize = 16;
@@ -1677,7 +1677,7 @@ mod tests {
     /// compile.
     #[test]
     fn deliberate_exhaustion_stays_bounded_and_headless_pools_never_starve() {
-        let Some(dev) = device() else { return };
+        let dev = device();
         let _test_pool = AutoreleasePool::new();
         let config = SwapchainConfig {
             format: PixelFormat::Bgra8Unorm,
@@ -1741,7 +1741,7 @@ mod tests {
             CbOutcome, ERROR_PAGE_FAULT, ERROR_TIMEOUT, LossLatch, STATUS_ERROR, classify,
         };
 
-        let Some(dev) = device() else { return };
+        let dev = device();
         let _test_pool = AutoreleasePool::new();
         let latch = Arc::new(LossLatch::new());
         let session = encoder::EncodeSession::new(&dev, Arc::clone(&latch)).expect("session");
@@ -1862,7 +1862,7 @@ mod tests {
         use crate::metal::encoder::EncodeSession;
         use crate::metal::loss::{CbOutcome, LossLatch};
 
-        let Some(dev) = device() else { return };
+        let dev = device();
         let _test_pool = AutoreleasePool::new();
         let latch = Arc::new(LossLatch::new());
         let session = EncodeSession::new(&dev, Arc::clone(&latch)).expect("session");
@@ -2035,7 +2035,7 @@ mod tests {
         use crate::metal::loss::{CbOutcome, LossLatch};
         use crate::pipeline_table::Pipeline;
 
-        let Some(dev) = device() else { return };
+        let dev = device();
         let _test_pool = AutoreleasePool::new();
 
         const W: usize = 16;
@@ -2294,7 +2294,7 @@ mod tests {
     fn present_refuses_a_session_wired_to_a_different_loss_latch() {
         use crate::metal::loss::LossLatch;
 
-        let Some(dev) = device() else { return };
+        let dev = device();
         let _test_pool = AutoreleasePool::new();
         let sc_latch = Arc::new(LossLatch::new());
         let foreign_latch = Arc::new(LossLatch::new());
@@ -2343,7 +2343,7 @@ mod tests {
         use crate::metal::loss::LossLatch;
         use crate::metal::resources::MetalResourceDevice;
 
-        let Some(dev) = device() else { return };
+        let dev = device();
         let _test_pool = AutoreleasePool::new();
 
         // Domain 1: the swapchain's.
@@ -2509,7 +2509,7 @@ mod tests {
     fn a_present_beside_a_live_foreign_metal_layer_touches_only_its_own_layer() {
         use crate::pipeline_table::Pipeline;
 
-        let Some(dev) = device() else { return };
+        let dev = device();
         let _test_pool = AutoreleasePool::new();
         let latch = Arc::new(loss::LossLatch::new());
         let session = encoder::EncodeSession::new(&dev, Arc::clone(&latch)).expect("session");
@@ -2760,7 +2760,7 @@ mod tests {
         use crate::metal::loss::{CbOutcome, LossLatch};
         use crate::pipeline_table::{Pipeline, TargetRole};
 
-        let Some(dev) = device() else { return };
+        let dev = device();
         let _test_pool = AutoreleasePool::new();
 
         const W: usize = 16;
@@ -2992,7 +2992,7 @@ mod tests {
     fn a_present_ticket_feeds_the_latch_exactly_once_however_asked() {
         use crate::metal::loss::{CbOutcome, LossLatch};
 
-        let Some(dev) = device() else { return };
+        let dev = device();
         let _test_pool = AutoreleasePool::new();
         let latch = Arc::new(LossLatch::new());
         let session = encoder::EncodeSession::new(&dev, Arc::clone(&latch)).expect("session");
@@ -3050,7 +3050,7 @@ mod tests {
 
         fn sink(_: GlassReport) {}
 
-        let Some(dev) = device() else { return };
+        let dev = device();
         let _test_pool = AutoreleasePool::new();
         let _ = install_sink(sink);
         let latch = Arc::new(LossLatch::new());
@@ -3097,7 +3097,7 @@ mod tests {
 
     #[test]
     fn attachment_parent_survives_its_callers_release_until_retirement() {
-        let Some(dev) = device() else { return };
+        let dev = device();
         let _test_pool = AutoreleasePool::new();
         let config = SwapchainConfig::aterm_present(PixelFormat::Bgra8Unorm, 16, 16);
         let (sc, parent_id) = {
@@ -3125,7 +3125,7 @@ mod tests {
 
     #[test]
     fn worker_handoff_accepts_its_origin_and_rejects_same_size_foreign_layers() {
-        let Some(dev) = device() else { return };
+        let dev = device();
         let _test_pool = AutoreleasePool::new();
         let config = SwapchainConfig::aterm_present(PixelFormat::Bgra8Unorm, 16, 16);
         let latch = Arc::new(loss::LossLatch::new());

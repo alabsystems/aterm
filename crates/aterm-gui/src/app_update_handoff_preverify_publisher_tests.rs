@@ -4,10 +4,9 @@
 use super::{PreverifyPublisher, capture_exceeds_policy};
 use aterm_update_core::handoff_policy::{CarryCeiling, HandoffPolicy, PolicyFile, PolicyRead};
 
-/// The publisher and the park agree on the key because both take it from the
-/// ticket (`PreverifyPublisher::for_attempt`, `App::park_policy`). Also pins
-/// that before any pass `known` is false, so the fork lane has its worker check
-/// the capture against the policy once read.
+/// The publisher and the park agree on the key because both take it from the ticket
+/// (`PreverifyPublisher::for_attempt`, `App::park_policy`); before any pass `known` is
+/// false, so the fork lane's worker checks the capture against the policy once read.
 #[test]
 fn the_worker_publishes_and_the_park_reads_by_the_same_ticket() {
     let app = crate::App::headless_for_test();
@@ -40,7 +39,7 @@ fn the_worker_publishes_and_the_park_reads_by_the_same_ticket() {
         "the launched lane's gate reads it too"
     );
 
-    // A pass for a policy-free candidate is KNOWN to ask nothing.
+    // A pass for a policy-free candidate is known to ask nothing.
     PreverifyPublisher::for_attempt(&app.handoff_preverified, Some(&ticket))
         .expect("an attempt names its artifact")
         .publish_policy_pass(&PolicyRead::Absent, running, "the test candidate");
@@ -139,9 +138,8 @@ fn a_published_pass_carries_the_policy_to_the_park_by_the_attempt_s_key() {
         None
     );
 
-    // SEVERAL RESCUES (r8c finding 504): this build reads `[[ranges]]` and
-    // parks under the one rescue naming it — the relaxed Land gate, at Full —
-    // not under the hull above the list, which asks for blank screens.
+    // Several rescues: the park follows the `[[ranges]]` entry naming this build
+    // (relaxed Land gate, at Full), not the top-level hull above the list.
     let earlier = running.saturating_sub(5);
     let ranged = PolicyRead::Parsed(
         PolicyFile::parse(&format!(
@@ -160,8 +158,8 @@ fn a_published_pass_carries_the_policy_to_the_park_by_the_attempt_s_key() {
     assert_eq!(park.carry_ceiling(), CarryCeiling::Full);
     assert!(park.relaxes_land_gate());
 
-    // A PASS whose policy file could not be followed, or is for other
-    // builds, still publishes the pass — and no policy.
+    // A policy that cannot be followed, or is for other builds, still publishes
+    // the pass, with no policy.
     let other = running.wrapping_add(7);
     for read in [
         PolicyRead::Ignored("not TOML".to_string()),

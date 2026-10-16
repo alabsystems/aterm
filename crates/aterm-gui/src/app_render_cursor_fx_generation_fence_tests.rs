@@ -6,10 +6,7 @@ use crate::{App, WindowId};
 use aterm_core::terminal::ContentScrollState;
 use std::time::{Duration, Instant};
 
-/// A rainbow-kitty window with one lit ribbon cell on glass, built through
-/// the real frame path; the seam tests below fire one host seam at it. `peak`
-/// is the brightest `glow_under` quad (the ribbon's own stream), so "gone"
-/// means gone from the composite.
+/// A rainbow-kitty window with one lit ribbon cell on glass, built through the real frame path.
 fn rainbow_window_with_a_lit_band(t0: Instant) -> (App, WindowId, Instant) {
     let mut app = App::headless_for_test();
     app.config.motion = Some("full".into());
@@ -70,16 +67,13 @@ fn tick_at(app: &mut App, wid: WindowId, at: Instant, cur: (u16, u16), live_view
     app.cursor_frame(wid, fx).expect("cursor tick");
 }
 
-/// A coordinate-space seam curtains the ribbon instead of cutting it.
-/// Through the real `retire_torn_cursor_fx` seam (alt screen, tab switch,
-/// layout re-grid): a typed key lays a lit cell, the seam fires, and the
-/// body is still on glass half-way through the 0.24 s curtain (spending,
-/// drawn toward the caret) and exactly gone at its end, with the engine
-/// still owning the frame and every other coordinate-bound owner retired.
+/// The real `retire_torn_cursor_fx` seam (alt screen, tab switch, re-grid) curtains the ribbon
+/// instead of cutting it: still on glass half-way through the 0.24 s curtain, exactly gone at its
+/// end, with the engine still owning the frame and every other coordinate-bound owner retired.
 #[test]
 fn a_coordinate_space_seam_curtains_the_rainbow_ribbon_over_a_quarter_second() {
-    // The seam reads the wall clock itself, so the band is laid 300 ms in the
-    // past (whole and settled) and the seam falls at the real present.
+    // The seam reads the wall clock itself, so the band is laid 300 ms in the past (whole and
+    // settled) and the seam falls at the real present.
     let t0 = Instant::now() - Duration::from_millis(300);
     let (mut app, wid, _settled) = rainbow_window_with_a_lit_band(t0);
     let full = band_peak(&app, wid);
@@ -88,7 +82,7 @@ fn a_coordinate_space_seam_curtains_the_rainbow_ribbon_over_a_quarter_second() {
         "precondition: the typed key laid a lit ribbon cell"
     );
 
-    // The SEAM, on its own clock (`Instant::now()` inside it).
+    // The seam, on its own clock (`Instant::now()` inside it).
     retire_torn_cursor_fx(app.windows.get_mut(&wid).expect("window"));
     let fell = Instant::now();
     assert!(
@@ -104,8 +98,8 @@ fn a_coordinate_space_seam_curtains_the_rainbow_ribbon_over_a_quarter_second() {
         !app.windows[&wid].fx.cursor().trail.is_active(),
         "…while the other engines are retired as before"
     );
-    // A2's own oracle: never > 4 lit to 0 in one frame, and ≥ 3 frames of
-    // it at 30 fps. Six 33 ms frames inside the 0.24 s span.
+    // Law A2: the light only goes down and draws on at least three 30 fps frames; six 33 ms
+    // frames fit inside the 0.24 s curtain.
     let mut prev = full;
     let mut spending = 0;
     for ms in [33_u64, 66, 99, 132, 165, 198] {
@@ -157,14 +151,11 @@ fn a_coordinate_space_seam_curtains_the_rainbow_ribbon_over_a_quarter_second() {
     );
 }
 
-/// Entering the alternate screen curtains the band
-/// (`sync_cursor_effect_coordinate_space`), and leaving it brings nothing
-/// back: the exit fires the same seam over an empty pool, since the band
-/// was spent, not parked.
+/// Entering the alternate screen curtains the band (`sync_cursor_effect_coordinate_space`);
+/// leaving it fires the same seam over an empty pool, since the band was spent, not parked.
 #[test]
 fn entering_the_alternate_screen_curtains_the_band_and_leaving_it_returns_nothing() {
-    // The seam reads the wall clock itself, so the band is laid 300 ms in the
-    // past (whole and settled) and the seam falls at the real present.
+    // Laid 300 ms back: the seam reads the wall clock.
     let t0 = Instant::now() - Duration::from_millis(300);
     let (mut app, wid, _settled) = rainbow_window_with_a_lit_band(t0);
     assert!(band_peak(&app, wid) > 0, "precondition: a lit band");
@@ -207,7 +198,7 @@ fn entering_the_alternate_screen_curtains_the_band_and_leaving_it_returns_nothin
         true,
     );
     assert_eq!(band_peak(&app, wid), 0, "gone at the curtain's end");
-    // EXIT: nothing returns (D-2). The seam fires on an empty pool.
+    // Exit: nothing returns (D-2); the seam fires on an empty pool.
     {
         let ws = app.windows.get_mut(&wid).expect("window");
         assert!(super::sync_cursor_effect_coordinate_space(ws, 7, false));
@@ -235,11 +226,8 @@ fn entering_the_alternate_screen_curtains_the_band_and_leaving_it_returns_nothin
     );
 }
 
-/// Every other coordinate-space seam curtains the same way, one row per
-/// seam, each asserting its trigger held (the alternate screen, with its
-/// exit phase, is its own test). Each band is laid 300 ms in the past
-/// because the seam reads the wall clock; every row curtains (never cuts),
-/// still draws half-way through, and is exactly gone at the end.
+/// Every other coordinate-space seam curtains the same way, one row per seam, each asserting its
+/// trigger held: it curtains (never cuts), still draws half-way through, and is gone at the end.
 #[test]
 fn every_coordinate_space_seam_curtains_the_band() {
     type Seam = fn(&mut App, WindowId);
@@ -340,8 +328,7 @@ fn every_coordinate_space_seam_curtains_the_band() {
 /// the same span, dimmer by the time that passed.
 #[test]
 fn a_history_viewport_hides_the_band_and_the_live_viewport_returns_it_on_its_own_clocks() {
-    // Every clock in this twin is the injected one: the hide seam reads no
-    // wall clock of its own.
+    // Every clock here is injected: the hide seam reads no wall clock of its own.
     let t0 = Instant::now();
     let (mut app, wid, settled) = rainbow_window_with_a_lit_band(t0);
     let before = band_peak(&app, wid);
@@ -355,7 +342,7 @@ fn a_history_viewport_hides_the_band_and_the_live_viewport_returns_it_on_its_own
         .map(|r| r.cells().len())
         .expect("v2 owns the frame");
 
-    // HISTORY: three frames of it, nothing composed, nothing destroyed.
+    // History: three frames of it, nothing composed, nothing destroyed.
     for ms in [20_u64, 60, 120] {
         tick_at(
             &mut app,
@@ -381,7 +368,7 @@ fn a_history_viewport_hides_the_band_and_the_live_viewport_returns_it_on_its_own
         );
     }
 
-    // BACK: the same span, dimmer by the elapsed time.
+    // Back: the same span, dimmer by the elapsed time.
     tick_at(
         &mut app,
         wid,

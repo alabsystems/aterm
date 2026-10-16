@@ -2,11 +2,7 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Grid-local facade for the pin and generation tracking helpers. Runtime
-//! builds use only `GenerationTracker`; `Pin` and `PinnedRange` are
-//! test-only here.
-
-// Grid impl for pin operations
+//! Absolute row numbering: the counter and its maps to visible and history rows.
 
 use super::Grid;
 
@@ -32,24 +28,19 @@ impl Grid {
         self.storage.absolute_row_counter = counter.min(CEILING).max(floor);
     }
 
-    /// EVERY RETAINED ROW KEEPS A KEY AT OR ABOVE 0: raise the counter to the
-    /// retained total (`visible_rows + scrollback_lines()`) where a resize left
-    /// it below — the floor [`Self::continue_absolute_numbering`] keeps for a
-    /// restore, kept for every resize.
+    /// Raise the counter to the retained total (`visible_rows + scrollback_lines()`)
+    /// where it is below, and bump `history_renumber_epoch`: the floor
+    /// [`Self::continue_absolute_numbering`] keeps for a restore, kept for every
+    /// rewrap and scrollback attach.
     ///
     /// The two maps of an absolute row agree only above that floor: a mark is
-    /// RECORDED through [`Self::visible_to_absolute`] (`counter − visible + r`)
-    /// and read back through [`Self::oldest_absolute_row`] (`counter − visible −
-    /// scrollback`, saturating at 0) plus the history count. Below it the read
-    /// map saturates and the write map does not, so every OSC 133 mark a shell
-    /// records from then on reads back as a row above its prompt (`line`,
-    /// `blocks`; tab #1, 2026-10-01), for good — output moves the counter and
-    /// the history together. A rows-only resize no longer gets here (its bottom
-    /// arms move the counter with their rows); a WIDTH rewrap can, since it
-    /// changes how many rows the same lines take (synchronously, or at the
-    /// re-attach of an offloaded one). Raising the counter moves the write map
-    /// onto the read map — the keys every read already used — and is reported
-    /// as the renumbering it is to the write side.
+    /// recorded through [`Self::visible_to_absolute`] (`counter − visible + r`)
+    /// and read back through [`Self::oldest_absolute_row`] (saturating at 0) plus
+    /// its history index. Below it the read map saturates and the write map does
+    /// not, so every OSC 133 mark recorded from then on reads back above its
+    /// prompt. A width rewrap changes how many rows the same lines take and can
+    /// land here; a rows-only resize moves the counter with its rows. Raising the
+    /// counter moves the write map onto the read map.
     pub(crate) fn cover_retained_rows(&mut self) {
         let retained =
             u64::from(self.storage.visible_rows).saturating_add(self.scrollback_lines() as u64);
@@ -84,10 +75,10 @@ impl Grid {
     }
 
     /// Epoch of row renumberings invisible to `(content_gen,
-    /// absolute_row_revision)` (see `GridStorage::history_renumber_epoch`): a
-    /// width reflow or a Kitty CSI +T unscroll. On an advance, absolute-row-keyed
-    /// caches rebuild and cached absolute rows (search hits, find anchors) are
-    /// recomputed before use.
+    /// absolute_row_revision)`, such as a width reflow or a Kitty CSI +T unscroll
+    /// (cases on `GridStorage::history_renumber_epoch`). On an advance,
+    /// absolute-row-keyed caches rebuild and cached absolute rows (search hits,
+    /// find anchors) are recomputed before use.
     #[must_use]
     #[inline]
     pub fn history_renumber_epoch(&self) -> u64 {

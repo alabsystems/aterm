@@ -20,10 +20,18 @@ the build, `git diff`, the exit code) and decide from that.
 
 ## The window already supervises every agent session
 
-Every Claude Code and Codex session in an aterm window is supervised by the window's host
+Every Claude Code, Codex and agy session in an aterm window is supervised by the window's host
 (`status supervisor=aterm-harness@<pid>`), fully automatic by default: it answers boxes and
-questions, continues ended turns and escalates what it cannot settle. `aterm help harness`
-says what it does, `aterm harness ledger @<sid>` what it did.
+questions, continues ended jobs (never a person's own question or message outside a job it is
+continuing) and escalates what it cannot settle. `aterm help harness` says what it does, `aterm harness ledger @<sid>` what it did.
+
+A worker's report that ends with `ATERM-TASK-DONE` on a line by itself stops those
+continuations. The token means every part of the job the worker can still do is done and
+verified (built, tested, measured where numbers were asked for, committed and landed), and
+what is left needs a person (a credential, a decision, physical access) or cannot be done on
+that host, each item named with its blocker; a slow check is not blocked. A report that ends
+with it but still names open work (`Still open`, `Left:`, `not run`, `skipped`, …) without a
+blocker gets one challenge from the host before the job stops.
 
 One supervisor per session: a `drive watch` you start where the host holds the claim
 only watches. To drive a worker the host supervises, hold its lease, `aterm ctl "@$SID"
@@ -42,14 +50,16 @@ done). While `status` shows `hand=lease:<you>` the host presses and types nothin
   the secrets and every write outside the temp roots.
 - Keep a notes file (objective, worker sid and socket, the ground-truth command, budget
   left, one line per action) and give it to `--notes`; give `watch`/`supervise` a
-  `--journal` file so `aterm drive ledger` can replay the run.
+  `--journal` file so `aterm drive ledger` can replay the run. Keep both under the
+  project or `~/`, not the Claude Code scratchpad (`/private/tmp/claude-<uid>/…`): macOS's
+  daily `com.apple.tmp_cleaner` deletes files there untouched for about three days.
 
 ## The loop
 
 With the fabric on, mail is the channel and the screen is the safety net:
 
 ```sh
-aterm drive watch "@$SID" --mail --no-continue --no-answer --journal "$JOURNAL"   # under ONE background monitor
+aterm drive watch "@$SID" --mail --no-continue --no-answer --journal "$JOURNAL"   # under one background monitor
 aterm drive task "@$SID" 'run the suite and report'                               # instructions by mail + a one-line nudge
 aterm ctl @self inbox get <id>                                                    # the report an EVENT turn line names
 ```
@@ -64,13 +74,14 @@ The same loop by hand:
 1. SWEEP: `aterm ctl "@$SID" status`. An unchanged `revision` means nothing new.
 2. CLASSIFY: `aterm drive phase "@$SID"`; for a prompt the parsed box follows.
 3. REVIEW once the turn is done: run the ground truth, then take one action: next,
-   revise, answer, done (the ground truth proves the objective), or escalate.
+   revise, answer, done (the ground truth proves the objective and nothing the worker
+   could still do is left), or escalate.
 4. WAIT: `aterm drive await-turn "@$SID" --timeout 600000`. Park one waiter; no sleep
    loops.
 
-Drive with one verified turn on one line with balanced quotes and brackets (an open
-bracket turns Claude Code's Enter into a newline): `aterm ctl "@$SID" turn
-settle=gone:esc.to.interrupt timeout=600000 '<instruction>'`.
+Without the fabric, drive with one verified turn on one line with balanced quotes and
+brackets (an open bracket turns Claude Code's Enter into a newline): `aterm ctl "@$SID"
+turn settle=gone:esc.to.interrupt timeout=600000 '<instruction>'`.
 
 ## Prompts
 
@@ -95,8 +106,12 @@ settle=gone:esc.to.interrupt timeout=600000 '<instruction>'`.
   work stands.
 - No progress: two or three drives with no `revision` advance means the worker is wedged.
   Change the input (read the screen, `signal int`, re-brief) or escalate.
-- Escalate a human's decision with `aterm ctl "@$SID" meta set attention '<why>'` and
-  carry on with what you can decide.
+- Pass on the owner's direction, never your own caution. A worker builds a driver's
+  instruction into its own review gates, so a gate the owner never set ("wait for the
+  owner's sign-off") costs review work every round until you withdraw it. When a turn ends
+  asking for a person's decision and the owner set no gate, tell the worker to decide.
+- Escalate a decision only a human can make with `aterm ctl "@$SID" meta set attention
+  '<why>'` and carry on with what you can decide.
 - A person at the keyboard (`human_ms=` under 120000) or another lease holder owns the
   input.
 - Read an unknown screen (`text`, `image`) before any key: a blind key lands wherever

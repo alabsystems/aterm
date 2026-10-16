@@ -1,15 +1,11 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Thin RAII wrapper around the OS file-mapping primitives.
-//!
-//! Replaces the `memmap2` crate with a minimal inline implementation. On
-//! macOS / Linux this is `libc::mmap` / `libc::munmap` (the same libc
-//! dependency already used by `aterm-shm`); on Windows it is
-//! `CreateFileMappingW` / `MapViewOfFile` / `UnmapViewOfFile` with the same
-//! whole-file, read-write, shared semantics. The platform seam is the three
-//! private [`sys`] calls; everything above them — the bounds-checked safe
-//! API and its invariants — is shared.
+//! Thin RAII wrapper around the OS file-mapping primitives: `libc::mmap` /
+//! `munmap` on Unix, `CreateFileMappingW` / `MapViewOfFile` / `UnmapViewOfFile`
+//! on Windows, with the same whole-file, shared semantics. The platform seam is
+//! the three private [`sys`] calls; the bounds-checked safe API above them is
+//! shared.
 
 use std::fs::File;
 use std::io;
@@ -20,9 +16,9 @@ use std::ops::{Deref, DerefMut};
 /// Unmaps the region on [`Drop`]. The mapping covers the entire file at the
 /// time [`map_mut`](Self::map_mut) is called.
 #[derive(Debug)]
-// Trust: `ptr` is valid for `len` bytes — the relational backing-length invariant.
-// Under `trustc -Z trust-verify` this lets the compiler PROVE the `from_raw_parts`
-// bounds in `as_slice`/`slice` (spatial HIGH-2) instead of only catching them.
+// Trust: `ptr` is valid for `len` bytes, the relational backing-length invariant
+// that lets `trustc -Z trust-verify` prove the `from_raw_parts` bounds in
+// `as_slice`/`slice`.
 #[cfg_attr(trust_verify, trust::backing)]
 pub struct MmapMut {
     ptr: *mut u8,
@@ -57,10 +53,9 @@ impl MmapMut {
     ///
     /// Returns an I/O error if the file metadata cannot be read, the file
     /// is empty, or `mmap(2)` fails.
-    // Trust: the caller's `# Safety` contract (no concurrent modification of the
-    // backing file) IS the single-writer invariant. Under `trustc -Z trust-verify`
-    // this lets `ty` PROVE the temporal (truncation) safety of the mapping instead
-    // of catching it — the `# Safety` promise made machine-checked.
+    // Trust: the `# Safety` contract (no concurrent modification of the backing
+    // file) is the single-writer invariant, which lets `ty` prove the mapping's
+    // temporal (truncation) safety.
     #[cfg_attr(trust_verify, trust::single_writer)]
     pub unsafe fn map_mut(file: &File) -> io::Result<Self> {
         // SAFETY: forwarded caller contract (exclusive access).
@@ -69,10 +64,9 @@ impl MmapMut {
 
     /// Create a read-only memory mapping of the entire file.
     ///
-    /// Use this for mappings that are only ever read (e.g. the cold-tier
-    /// page cache): the view is mapped `PROT_READ` / `PAGE_READONLY`, so it
-    /// can hold no dirty pages, [`flush`](Self::flush) is a no-op, and
-    /// dropping it performs no synchronous write-back.
+    /// The view is mapped `PROT_READ` / `PAGE_READONLY`, so it holds no dirty
+    /// pages, [`flush`](Self::flush) is a no-op, and dropping it writes nothing
+    /// back.
     ///
     /// # Safety
     ///
@@ -121,23 +115,17 @@ impl MmapMut {
     #[must_use]
     #[inline]
     pub fn as_slice(&self) -> &[u8] {
-        // SAFETY: `ptr` is a valid mmap'd region of `len` bytes, guaranteed
-        // by the successful `mmap` call in `map_mut` and the absence of
-        // `munmap` until `Drop`.
+        // SAFETY: `ptr` is a valid mapped region of `len` bytes, from the
+        // successful map call in `map_inner`, not unmapped until `Drop`.
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
 
-    /// Returns a checked sub-slice `[start, start + len)` of the mapped region.
+    /// Returns a checked sub-slice `[start, start + len)` of the mapped region,
+    /// or `None` if `start + len` overflows or passes the mapping length: the
+    /// way to read a sub-range at attacker-influenced offsets.
     ///
-    /// Returns `None` if `start + len` overflows or exceeds the recorded
-    /// mapping length, ensuring the raw `from_raw_parts` is never indexed
-    /// past the bytes the kernel mapped. This is the only sound way to read
-    /// a sub-range from attacker-influenced offsets/lengths: bounding against
-    /// `self.len` keeps the deref within the mapped region.
-    ///
-    /// Note: `self.len` is the length at map time. Callers that need to guard
-    /// against an external truncation of the backing file should additionally
-    /// validate against the live file length before calling here.
+    /// `self.len` is the length at map time; a caller guarding against external
+    /// truncation of the file also checks the live file length.
     #[must_use]
     #[inline]
     pub fn slice(&self, start: usize, len: usize) -> Option<&[u8]> {
@@ -188,9 +176,8 @@ impl MmapMut {
     ///
     /// Returns an I/O error if the platform flush fails.
     pub fn flush(&self) -> io::Result<()> {
-        // A read-only mapping holds no dirty pages: flushing it would issue a
-        // full FlushViewOfFile + FlushFileBuffers (device write-cache flush)
-        // for nothing. Skip it.
+        // A read-only mapping holds no dirty pages; flushing it would only cost a
+        // device write-cache flush.
         if !self.writable {
             return Ok(());
         }
@@ -296,11 +283,11 @@ mod sys {
 }
 
 /// Windows twin of the Unix seam: `CreateFileMappingW` + `MapViewOfFile`
-/// (whole file, read-write, shared), `FlushViewOfFile` + `FlushFileBuffers`
-/// for `MS_SYNC`-equivalent durability, `UnmapViewOfFile` on drop. The
-/// mapping-object handle is closed immediately after the view is created
-/// (the view keeps the mapping alive — documented Win32 behavior); a
-/// duplicated file handle is retained so `flush` can reach the file.
+/// (whole file, shared), `FlushViewOfFile` + `FlushFileBuffers` for
+/// `MS_SYNC`-equivalent durability, `UnmapViewOfFile` on drop. The
+/// mapping-object handle is closed right after the view is created (the view
+/// keeps the mapping alive); a duplicated file handle is retained so `flush`
+/// can reach the file.
 #[cfg(windows)]
 mod sys {
     use std::fs::File;
@@ -378,7 +365,7 @@ mod sys {
         }
         // SAFETY: live mapping handle; map exactly the validated `len` bytes.
         let view = unsafe { MapViewOfFile(mapping, access, 0, 0, len) };
-        // Capture the failure reason BEFORE any cleanup: a successful
+        // Capture the failure reason before any cleanup: a successful
         // CloseHandle can reset the thread's last-error, clobbering the real
         // MapViewOfFile code (e.g. ERROR_NOT_ENOUGH_MEMORY) with 0.
         let err = if view.is_null() {

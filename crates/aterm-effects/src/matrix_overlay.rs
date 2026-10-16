@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Parser-free PHOSPHOR embedding adapter.
+//! Parser-free embedding adapter for the Phosphor (Matrix) rain.
 //!
 //! [`ExternalRainOverlay`] lets a host that already owns a terminal emulator
 //! drive aterm's [`MatrixRain`](crate::matrix_rain::MatrixRain) without feeding
@@ -32,9 +32,9 @@ use crate::matrix_rain::{
 
 /// Hard resident-cell ceiling for one external viewport snapshot.
 ///
-/// 262,144 cells is over five 512x100 8K-monitor terminal viewports while
-/// preventing a hostile embedder from asking the adapter to retain a full
-/// 4096x4096 grid. The axis limits still match aterm's public grid limits.
+/// 262,144 cells covers five 512x100 viewports while refusing to retain a
+/// hostile embedder's full 4096x4096 grid. The axis limits match aterm's grid
+/// limits.
 pub const MAX_EXTERNAL_RAIN_CELLS: usize = 256 * 1024;
 /// Maximum visible rows accepted by the external adapter.
 pub const MAX_EXTERNAL_RAIN_ROWS: u16 = MAX_GRID_ROWS;
@@ -471,10 +471,9 @@ impl ExternalRainOverlay {
             return Ok(ExternalRainSync::Deferred);
         }
 
-        // A new occupancy or material-generation contract cannot present the
-        // previous frame. The host emits immediately after sync; until then the
-        // public channels stay empty rather than pairing stale quads/atlas with
-        // fresh xterm cells.
+        // The previous frame does not match the new occupancy or material. The
+        // host emits right after sync; until then the channels stay empty rather
+        // than pairing stale quads/atlas with fresh cells.
         self.clear_output();
         let mut result = ExternalRainSync::Resampled;
         if needs_rescan {
@@ -861,7 +860,7 @@ mod tests {
     }
 
     /// Hide creates a freshness obligation: refocus alone cannot authorize an
-    /// old snapshot. `Buggy=1` models the exact missing-invalidation defect.
+    /// old snapshot. `Buggy=1` is the missing-invalidation negative control.
     fn external_rain_freshness_model() -> aterm_spec::derive::Model {
         use aterm_spec::ty_model;
         ty_model! {
@@ -901,7 +900,7 @@ mod tests {
         aterm_spec::verify::prove_and_catch_scalar(&model, model.name);
     }
 
-    /// Tier-1 bind: drive the shipping adapter through the model's exact
+    /// Conformance: the shipping adapter follows the model's
     /// Sync -> Emit -> Hide -> Focus -> Emit -> Sync -> Emit trace.
     #[test]
     fn real_overlay_hide_refocus_trace_conforms_to_freshness_model() {

@@ -23,7 +23,6 @@
 #![cfg(unix)]
 
 use std::collections::HashMap;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use aterm_update_core::roster::{Roster, RosterReject, verify_roster};
@@ -37,9 +36,8 @@ const TRIPLE: &str = "aarch64-apple-darwin";
 // The phrase→seed leg (`parse_master`, the `/dev/tty` prompt, the transcription
 // check) is proved exhaustively in `master.rs` and `paper_master_to_client.rs`; what this
 // file proves is what happens DOWNSTREAM of a master, for both products at once. Using a
-// generated key here also keeps a phrase-shaped literal off a file the key-surface guard
-// (`tools/grep_guard.sh` B7) would then have to exempt by name — the exemption list is
-// only worth having while it is short enough to audit.
+// generated key here also keeps a phrase-shaped literal off the key surface the census
+// guard `key-material` reads.
 
 /// 2026-08-04T00:00:00Z — inside the roster's default validity window.
 const NOW: i64 = 1_785_801_600;
@@ -73,10 +71,8 @@ fn make_archive(dir: &Path) -> PathBuf {
     tar.resize(tar.len() + (512 - content.len() % 512) % 512, 0);
     tar.resize(tar.len() + 1024, 0);
     let path = dir.join("ay-18.tar.zst");
-    let f = std::fs::File::create(&path).unwrap();
-    let mut enc = zstd::Encoder::new(f, 0).unwrap();
-    enc.write_all(&tar).unwrap();
-    enc.finish().unwrap();
+    let mut f = std::fs::File::create(&path).unwrap();
+    aterm_zstd::frame::write_raw(&mut f, &tar, aterm_zstd::frame::Checksum::Xxh64).unwrap();
     path
 }
 

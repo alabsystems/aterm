@@ -3,9 +3,8 @@
 
 [package]
 name = "aterm-types"
-# Integration tests are declared below, not discovered: every file is a module
-# of the one `types_suite` binary. With autotests off a `tests/*.rs` file listed
-# nowhere never compiles.
+# Integration tests are declared below, not discovered: every file is a module of
+# the one `types_suite` binary, so an unlisted `tests/*.rs` never compiles.
 autotests = false
 version.workspace = true
 edition.workspace = true
@@ -16,27 +15,23 @@ description = "Shared types for aterm terminal engine (Rgb, CursorStyle, BiDiMod
 [features]
 default = []
 serde = ["dep:serde"]
-# Development seams (`aterm_types::dev_seam!`) in an optimized build. Debug builds
-# compile them anyway; the release cutter never enables this (aterm-release's
-# buildplan pins it). Declared here because `dev_seam!` reads the CALLING crate's
-# `dev-seams` feature, and this crate's own test calls it.
+# Development seams (`aterm_types::dev_seam!`) in an optimized build; debug builds
+# compile them anyway and the release build never enables this. `dev_seam!` reads
+# the calling crate's `dev-seams` feature, and this crate's own test calls it.
 dev-seams = []
-# NO PLATFORM FEATURE LIVES HERE. Cargo unifies features across a workspace
-# resolve, so an optional platform dependency here links into every consumer
-# (an optional winit dep once cost `aterm-ctl` ~1.7 ms of AppKit dyld work per
-# exec). Put platform code in a crate of its own, as `aterm-winit-keymap` is.
+# No platform feature here: Cargo unifies features across the workspace, so an
+# optional platform dependency would link into every consumer. Platform code gets
+# a crate of its own, as `aterm-winit-keymap` does.
 
 [dependencies]
 aterm-alloc = { workspace = true }
-# FNV-1a/64 for `RowsFence::hash_rows`, the screen's `hash=` stamp, which must be
-# the one hash the server and every client compute. Dependency-free.
+# FNV-1a/64 for `RowsFence::hash_rows`: server and clients must compute one hash.
 aterm-hash = { workspace = true }
 # MutexExt::lock_or_recover logs each poison recovery.
 aterm-log = { workspace = true }
-# Internal clock seam: std::time on native (byte-identical), JS clock on wasm32 so
-# `current_time_ms()` doesn't panic "time not implemented".
+# Clock seam: std::time on native, the JS clock on wasm32 (std's panics there).
 aterm-time = { workspace = true }
-serde = { workspace = true, optional = true }
+serde = { workspace = true, optional = true, features = ["derive"] }
 
 [dev-dependencies]
 aterm-spec = { workspace = true }

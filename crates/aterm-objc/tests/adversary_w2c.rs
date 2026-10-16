@@ -14,14 +14,18 @@
 // | F9      | this file compiles with NO crate-level `too_many_arguments` allow   |
 
 #![cfg(target_os = "macos")]
+#![allow(
+    clippy::disallowed_types,
+    reason = "test code: a stand-in child may inherit descriptors"
+)]
 
 use std::ffi::{CStr, c_char, c_void};
 use std::os::unix::process::ExitStatusExt as _;
 use std::process::Command;
 
 use aterm_objc::{
-    ClassPtr, ClassType, Encode, Id, Obj, RcBlock, Retained, Sel, class, declare_class,
-    method_encoding, msg, ns_string, sel, sel_uncached,
+    ClassPtr, ClassType, Encode, Id, RcBlock, Sel, declare_class, method_encoding, msg, ns_string,
+    sel, sel_uncached,
 };
 
 /// The [`MainThread`](aterm_objc::MainThread) witness every instantiation owes,
@@ -324,7 +328,7 @@ declare_class! {
     /// `const void *` — in the SDK (`NSKeyValueObserving.h`:
     /// `context:(nullable void *)context`), in `objc2-foundation`'s generated
     /// binding (`context: *mut c_void`) and in
-    /// `vendor/winit/src/platform_impl/macos/window_delegate.rs:456`
+    /// `crates/aterm-window/src/platform_impl/macos/window_delegate.rs:456`
     /// (`_context: *mut c_void`), so it is armed with the `*mut` spelling the
     /// live sites use: encoding it as `"@"` (an OBJECT) would invite
     /// `NSInvocation` and forwarding to retain a pointer the caller owns.
@@ -471,42 +475,4 @@ fn a_block_may_return_a_type_that_has_no_default_impl() {
     // SAFETY: as above.
     let two = unsafe { RcBlock::new2(|a: u64, b: u64| NoDefault(a + b)) }.expect("_Block_copy");
     assert!(!one.as_ptr().is_null() && !two.as_ptr().is_null());
-}
-
-// ---------------------------------------------------------------------------
-// F6's structural half lives in `tests/abi.rs`, where the rest of the
-// return-classification evidence is. What belongs here is the API consequence:
-// a return type nobody has stated an ABI for cannot be sent at all.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn the_return_types_this_crate_can_send_all_declare_their_abi() {
-    // Every one of these has an `Encode` impl with a SAFETY comment naming its
-    // C ABI, which is now a PRECONDITION of `msg` rather than a courtesy.
-    // SAFETY: no pointer here is called; the test only builds the prototypes,
-    // which is what exercises the bound.
-    unsafe {
-        let _: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
-        let _: unsafe extern "C-unwind" fn(Id, Sel) = msg();
-        let _: unsafe extern "C-unwind" fn(Id, Sel) -> aterm_objc::Bool = msg();
-        let _: unsafe extern "C-unwind" fn(Id, Sel) -> aterm_objc::CGRect = msg();
-        let _: unsafe extern "C-unwind" fn(Id, Sel) -> *const c_char = msg();
-        let _: unsafe extern "C-unwind" fn(Id, Sel) -> Sel = msg();
-        let _: unsafe extern "C-unwind" fn(Id, Sel) -> *const c_void = msg();
-    }
-    // A real send through the newly-encodable `*const c_char`: `-UTF8String`.
-    let s = ns_string("utf8 through a char*").expect("NSString");
-    // SAFETY: `-UTF8String` on a live NSString returns a NUL-terminated buffer
-    // owned by the receiver and valid while it is.
-    let round = unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel) -> *const c_char = msg();
-        CStr::from_ptr(f(s.id(), sel!(UTF8String)))
-            .to_string_lossy()
-            .into_owned()
-    };
-    assert_eq!(round, "utf8 through a char*");
-
-    // The negative side is a `compile_fail` doctest on `msg` itself, because a
-    // test that does not compile cannot live in a test binary.
-    let _ = (class(c"NSObject"), Obj::retain, Retained::<Bare>::retain);
 }

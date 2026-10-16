@@ -12,9 +12,13 @@
 //! bounded-wait harness and the same session path.
 //!
 //! The unix tests drive a POSIX `/bin/sh` through the binary; the `#[cfg(windows)]`
-//! twin drives the platform's default shell through the ConPTY seam. No gate host
-//! runs Windows (`FLEET_HOST_TRIPLES`), so the merge contract's `gate
-//! cells-foreign` row type-checks the twin and it RUNS only on a Windows host.
+//! twin drives the platform's default shell through the ConPTY seam. No fleet host
+//! runs Windows (`FLEET_HOST_TRIPLES`), so `verify cells` type-checks the twin
+//! and it RUNS only on a Windows host.
+#![allow(
+    clippy::disallowed_types,
+    reason = "test code: a stand-in child may inherit descriptors"
+)]
 
 use std::io::{Read, Write};
 use std::process::{Child, Command, Output, Stdio};
@@ -23,11 +27,11 @@ use std::time::{Duration, Instant};
 use crate::launch_isolation;
 
 /// How long the CLI gets to run the scripted shell session and exit. GENEROUS —
-/// a healthy run finishes in well under a second even on a loaded CI box — because
+/// a healthy run finishes in well under a second even on a loaded machine — because
 /// the only thing this bound must catch is the exact regression these tests guard:
-/// the CLI *not exiting*. `Child::wait_with_output` has no deadline and the
-/// workspace gate (`cargo test`) has no per-test timeout, so without this bound a
-/// doesn't-exit regression manifests as `cargo test` hanging forever instead of a
+/// the CLI *not exiting*. `Child::wait_with_output` has no deadline and a test run
+/// (`targo --unverified test`) has no per-test timeout, so without this bound a
+/// doesn't-exit regression manifests as the test run hanging forever instead of a
 /// red test — the failure would hide inside the harness meant to detect it.
 const CLI_EXIT_DEADLINE: Duration = Duration::from_secs(60);
 

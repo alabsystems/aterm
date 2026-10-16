@@ -1,32 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance of the real follow pass to `aterm-spec`'s
-//! `ribbon_follow_twin_model` (`RibbonFollowTwin`): the content witness's arm
-//! writes a twin bit (`Witness::walk`) and its follow reads it
-//! (`Witness::follow_runs`). This keeps an existing line rainbow following
-//! its text rather than vanishing (owner, 2026-09-23).
+//! Tier-1 conformance of the real follow pass to `aterm-spec`'s `ribbon_follow_twin_model`: the
+//! content witness's arm writes a twin bit (`Witness::walk`) and its follow reads it
+//! (`Witness::follow_runs`), so a line's rainbow follows its text when the text moves. This
+//! drives the reader; `tests/ribbon_arrival_conformance.rs` binds the writer (`Seen::arrivals`).
 //!
-//! The bit the reader reads is the accumulated arrival evidence
-//! (`Seen::arrivals`); a twin at arm time is one way a record comes to have
-//! none. How the witness writes that evidence over a record's life is the
-//! writer's model, `RibbonArrivalEvidence`, bound in
-//! `tests/ribbon_arrival_conformance.rs`. This file drives the reader through
-//! the arm-time case.
-//!
-//! Every configuration of a six-record run is driven through the real
-//! witness: each record arrived (its glyph a row up, no twin at arm time),
-//! standing (its glyph a row up and there when armed), absent, or absent-twin
-//! (there when armed, gone since), and each gone from its own row or not.
-//! That is `4^6 x 2^6` runs, the model read once per `3^6 x 2^6` (both absent
-//! classes count alike), with every invariant checked at `N = 6` (Tier-0
-//! proves `N = 4`). The six glyphs are distinct, so no suffix can stand
-//! relaid at its row's start (`Witness::relaid_suffix` stays `0`; the model
-//! has no relay). The real verdict (named or not, extent, missed count) must
-//! equal the model's `Decide` successor. The negative control replays a veto
-//! rule (a twin never found, never neutral), which is the model at
-//! `Buggy = 1`, and `AnArrivedBlockFollows` refuses it on hundreds of
-//! configurations.
+//! Every configuration of a six-record run goes through the real witness: each record arrived
+//! (its glyph a row up, no twin at arm), standing (its glyph a row up and there when armed),
+//! absent, or absent-twin (there when armed, gone since), and each gone from its own row or not:
+//! `4^6 × 2^6` runs, the model read once per `3^6 × 2^6` (both absent classes count alike), every
+//! invariant checked at `N = 6`. The glyphs are distinct, so `Witness::relaid_suffix` stays `0`
+//! (the model has no relay). The real verdict (named or not, extent, missed count) must equal
+//! the model's `Decide` successor. The negative control is a veto rule (a twin never found, never
+//! neutral), the model at `Buggy = 1`.
 
 use std::collections::BTreeMap;
 use std::time::Instant;

@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! M1b PROVE bullets bound to the SHIPPING renderer (`render_input` /
-//! `render_input_cached`): the sub-row scroll translate is (1) the identity at
-//! `scroll_frac_px == 0` — a fractional frame at frac 0 is byte-identical to the
-//! whole-row-jump frame — and (2) chrome-invariant: for ANY `scroll_frac_px`,
-//! every pixel OUTSIDE the terminal-content grid band `[grid_top_row,
-//! grid_bot_row)` is byte-identical to the frac-0 frame (the KEY theorem). The
-//! pure geometry carries its own always-on lattice proofs + a `ty` twin
-//! (`aterm_render::scroll_translate` / `grid_translate_model`); this test binds
-//! that behaviour to the code the frontend actually presents.
+//! The sub-row scroll translate on the shipping renderer (`render_input` /
+//! `render_input_cached`): at `scroll_frac_px == 0` it is the identity, and for
+//! any `scroll_frac_px` every pixel outside the grid band
+//! `[grid_top_row, grid_bot_row)` is byte-identical to the frac-0 frame. The
+//! geometry's own proofs and `ty` twin are `aterm_render::scroll_translate` and
+//! `grid_translate_model`.
 
 use aterm_core::terminal::Terminal;
 use aterm_render::{Renderer, Theme, WindowCpu};
@@ -27,14 +24,14 @@ fn seeded_terminal() -> Terminal {
         };
         t.process(line.as_bytes());
     }
-    // Scroll into history so the grid shows scrollback (a real smooth-scroll frame).
+    // Into history, so the grid shows scrollback.
     t.scroll_display(5);
     t
 }
 
-/// Build a frame snapshot with a chrome partition: row 0 is designated tab-strip
-/// chrome, the last row is designated bottom chrome, and the middle is the terminal
-/// grid — the exact `[grid_top_row, grid_bot_row)` layout the compose path emits.
+/// A frame with row 0 as tab-strip chrome, the last row as bottom chrome and
+/// the middle as the grid: the `[grid_top_row, grid_bot_row)` layout the compose
+/// path emits.
 fn frame_with_partition(t: &mut Terminal, frac: i32) -> aterm_core::render::RenderInput {
     let mut input = t.cell_frame(ROWS, COLS);
     input.grid_top_row = 1; // row 0 = tab strip (chrome)
@@ -50,7 +47,7 @@ fn frac_zero_is_byte_identical_to_untranslated() {
     let mut t = seeded_terminal();
     // A frame with a grid partition but frac 0.
     let zero = r.render_input(&frame_with_partition(&mut t, 0));
-    // The same viewport with NO partition set at all (the pre-M1b default path).
+    // The same viewport with no partition set at all.
     let plain = {
         let input = t.cell_frame(ROWS, COLS);
         r.render_input(&input)
@@ -83,9 +80,8 @@ fn chrome_pixels_are_invariant_under_any_frac() {
 
     let mut any_moved = false;
     let mut any_down = false;
-    // BIDIRECTIONAL: sweep sub-cell residuals across BOTH signs — a positive frac
-    // shifts the grid band UP (glide), a negative frac shifts it DOWN (the elastic
-    // overscroll bounce at a history end). Chrome stays pinned for either sign.
+    // Both signs: a positive frac shifts the grid band up (glide), a negative
+    // one down (the overscroll bounce at a history end).
     for frac in (-(cell_h as i32 - 1)..cell_h as i32).filter(|&f| f != 0) {
         let mut t = seeded_terminal();
         let shifted = r.render_input(&frame_with_partition(&mut t, frac));
@@ -123,10 +119,9 @@ fn chrome_pixels_are_invariant_under_any_frac() {
 
 #[test]
 fn damage_cached_present_translates_without_perturbing_the_cache() {
-    // The frac translate must present a shifted frame while the UNTRANSLATED
-    // damage cache keeps driving the row diff: after a fractional frame, a
-    // subsequent frac-0 frame of the SAME viewport returns to the byte-identical
-    // untranslated pixels (no residue banked into the cache).
+    // The translate shifts the presented frame while the untranslated damage
+    // cache drives the row diff: a frac-0 frame after a fractional one returns
+    // the untranslated pixels.
     let mut r = Renderer::from_system(16.0, Theme::default())
         .expect("no font: build with aterm-render's default embedded-font feature");
     let mut wc = WindowCpu::new();

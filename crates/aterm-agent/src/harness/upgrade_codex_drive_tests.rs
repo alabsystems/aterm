@@ -9,7 +9,6 @@
 //! when `/exit` is typed and whose relaunch appears when its line is. Screens
 //! and hints are Codex 0.157.0/0.157.1's.
 
-use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -32,7 +31,7 @@ fn v(s: &str) -> Version {
     Version::parse(s).expect("version")
 }
 
-/// A fresh directory per CALL, removed when it drops: two tests share a name
+/// A fresh directory per call, removed when it drops: two tests share a name
 /// (`Rig::new("daemon-busy")` and `daemon_home("daemon-busy")`) and run on
 /// parallel threads, so a per-name directory would let one wipe the other's.
 fn scratch(name: &str) -> ScratchDir {
@@ -178,7 +177,6 @@ struct World {
     lease: &'static str,
     exited: Arc<AtomicBool>,
     relaunched: Arc<AtomicBool>,
-    asked: Arc<Mutex<Vec<String>>>,
     /// A goal on the tab's Codex, as the stand-in draws it (`None`: the
     /// screens above, as they are): its footer and the relaunched Codex's
     /// `Resume paused goal?` box, moved by the goal's keys and commands.
@@ -210,13 +208,10 @@ pub(super) struct GoalWorld {
     pub(super) seen: Vec<String>,
 }
 
-/// The tab's Codex with a goal on its footer, pursued or `paused`, at its
-/// idle-looking frame (a goal turn's first moments), the person stamp
-/// `human`; with a goal turn's status row over the composer where `working`
-/// (`• Working (0s • esc to interrupt)`, as
-/// `codex-0.158.0-goal-busy-live.txt` draws it mid-turn), and its composer
-/// holding `draft`, the cursor after it, where there is one (the lane's own
-/// words left there, [`World::left`]).
+/// The tab's Codex with a goal on its footer, pursued or `paused`, at its idle-looking frame
+/// (a goal turn's first moments), the person stamp `human`; with a goal turn's status row over
+/// the composer where `working`, and the composer holding `draft` (the lane's own words left
+/// there, [`World::left`]) with the cursor after it.
 pub(super) fn codex_goal_frame(
     paused: bool,
     working: bool,
@@ -309,168 +304,141 @@ fn codex_holding(text: &str, seq: u64) -> String {
 }
 
 /// A control socket at `<dir>/t.sock` standing in for the aterm instance of
-/// [`TAB`] (the Claude lane's stand-in, answering as the host answers).
-fn instance(dir: &Path, w: World) -> String {
-    let sock = dir.join("t.sock");
-    std::fs::write(dir.join("t.sock.token"), format!("{TOKEN}\n")).expect("token");
-    let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
-    std::thread::spawn(move || {
-        for conn in listener.incoming() {
-            let Ok(conn) = conn else { break };
-            let Ok(mut out) = conn.try_clone() else {
-                continue;
-            };
-            let mut lines = std::io::BufReader::new(conn).lines();
-            let auth = format!("AUTH {TOKEN}");
-            if !lines.next().is_some_and(|l| l.is_ok_and(|l| l == auth)) {
-                continue;
+/// [`TAB`] (the Claude lane's stand-in, answering as the host answers), and
+/// the requests it was asked, in order.
+fn instance(dir: &Path, w: World) -> (String, crate::harness::FakeInstanceLog) {
+    crate::harness::fake_instance(&dir.join("t.sock"), TOKEN, move |line| {
+        let verb = line
+            .split_whitespace()
+            .find(|w| !w.starts_with('@'))
+            .unwrap_or("");
+        let exited = w.exited.load(Ordering::SeqCst);
+        let relaunched = w.relaunched.load(Ordering::SeqCst);
+        let left = w.left.lock().ok().and_then(|l| l.clone());
+        let goal = w.goal.as_ref().and_then(|g| {
+            let mut g = g.lock().ok()?;
+            // The relaunch's startup frames, one per screen read.
+            let startup = verb == "text" && relaunched && g.startup > 0;
+            if startup {
+                g.startup -= 1;
             }
-            for line in lines {
-                let Ok(line) = line else { break };
-                let verb = line
-                    .split_whitespace()
-                    .find(|w| !w.starts_with('@'))
-                    .unwrap_or("");
-                let exited = w.exited.load(Ordering::SeqCst);
-                let relaunched = w.relaunched.load(Ordering::SeqCst);
-                let left = w.left.lock().ok().and_then(|l| l.clone());
-                let goal = w.goal.as_ref().and_then(|g| {
-                    let mut g = g.lock().ok()?;
-                    // The relaunch's startup frames, one per screen read.
-                    let startup = verb == "text" && relaunched && g.startup > 0;
+            Some((g.paused, g.boxed, g.human_ms, g.working, startup))
+        });
+        match verb {
+            "sessions" => format!("OK 1\nlocal {TAB} 0 idle codex"),
+            // A goal on the tab's Codex: its footer, and the box the
+            // relaunched Codex opens on while the goal is paused.
+            "text" if goal.is_some() && (relaunched || !exited) => {
+                let (paused, boxed, human, working, startup) = goal.unwrap_or_default();
+                format!(
+                    "OK {}",
                     if startup {
-                        g.startup -= 1;
-                    }
-                    Some((g.paused, g.boxed, g.human_ms, g.working, startup))
-                });
-                let reply = match verb {
-                    "sessions" => format!("OK 1\nlocal {TAB} 0 idle codex"),
-                    // A goal on the tab's Codex: its footer, and the box the
-                    // relaunched Codex opens on while the goal is paused.
-                    "text" if goal.is_some() && (relaunched || !exited) => {
-                        let (paused, boxed, human, working, startup) = goal.unwrap_or_default();
-                        format!(
-                            "OK {}",
-                            if startup {
-                                codex_startup(39)
-                            } else if boxed {
-                                codex_goal_box(40)
-                            } else {
-                                codex_goal_frame(
-                                    paused,
-                                    working,
-                                    human,
-                                    left.as_deref(),
-                                    if paused { 12 } else { 11 },
-                                )
-                            }
+                        codex_startup(39)
+                    } else if boxed {
+                        codex_goal_box(40)
+                    } else {
+                        codex_goal_frame(
+                            paused,
+                            working,
+                            human,
+                            left.as_deref(),
+                            if paused { 12 } else { 11 },
                         )
                     }
-                    "text" => format!(
-                        "OK {}",
-                        if relaunched {
-                            w.after_relaunch.clone()
-                        } else if exited {
-                            w.after_exit.clone()
-                        } else if let Some(t) = &left {
-                            codex_holding(t, 30)
-                        } else if let Some(shown) = w.shows.lock().ok().and_then(|s| s.clone()) {
-                            shown
-                        } else {
-                            w.before.clone()
-                        }
-                    ),
-                    "cell" if left.is_some() => "OK / d0d0d0 2d2f33 none".to_string(),
-                    "cell" => w.cell.to_string(),
-                    "status" => format!(
-                        "{}{}",
-                        w.status,
-                        w.status_extra.lock().map(|e| e.clone()).unwrap_or_default()
-                    ),
-                    "help" if line.contains("help key") => {
-                        "OK 2\nkey  key [if-gen=<epoch>.<seq>] [if=<re>] <name>\n     FENCES"
-                            .to_string()
-                    }
-                    "help" => "OK 1\nturn [if-gen=<epoch>.<seq>] <text>".to_string(),
-                    "blocks" if line.contains("blocks 2") => format!("OK {}", w.blocks2),
-                    "blocks" => format!("OK {}", w.blocks1),
-                    "blocktext" => std::iter::once(format!("OK {}", w.block_out.len()))
-                        .chain(w.block_out.iter().cloned())
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                    "line" => "OK % ".to_string(),
-                    "lease" if line.contains(" lease release ") => {
-                        if w.lease.starts_with("OK lease acquired") {
-                            "OK lease released".to_string()
-                        } else {
-                            "OK lease none".to_string()
-                        }
-                    }
-                    "lease" => w.lease.to_string(),
-                    "turn" if w.miss.is_some() => {
-                        // What the host does on a missed guard: the text is
-                        // typed and its Enter not pressed.
-                        let text = line
-                            .split_once(&format!(" {TURN_WAIT} "))
-                            .map_or("", |(_, t)| t)
-                            .to_string();
-                        if let Ok(mut l) = w.left.lock() {
-                            *l = Some(text);
-                        }
-                        w.miss.unwrap_or_default().to_string()
-                    }
-                    // The goal's keys: Enter on the resume box resumes the
-                    // goal, Esc stops a goal turn and pauses the goal.
-                    "key"
-                        if w.goal.is_some()
-                            && (line.ends_with(" enter") || line.ends_with(" esc")) =>
-                    {
-                        if let Some(Ok(mut g)) = w.goal.as_ref().map(|g| g.lock()) {
-                            if line.ends_with(" enter") && g.boxed {
-                                g.boxed = false;
-                                g.paused = false;
-                                g.seen.push("enter".to_string());
-                            } else if line.ends_with(" esc") {
-                                g.paused = true;
-                                g.seen.push("esc".to_string());
-                            }
-                        }
-                        "OK seq=41".to_string()
-                    }
-                    "turn" => {
-                        if line.ends_with(" /exit") {
-                            w.exited.store(true, Ordering::SeqCst);
-                        } else if line.contains("'resume'") || line.contains("/agents/codex'") {
-                            w.relaunched.store(true, Ordering::SeqCst);
-                            // `codex resume` over a paused goal opens on its box.
-                            if let Some(Ok(mut g)) = w.goal.as_ref().map(|g| g.lock()) {
-                                g.boxed = g.paused;
-                            }
-                        } else if let Some(Ok(mut g)) = w.goal.as_ref().map(|g| g.lock()) {
-                            if line.ends_with(" /goal pause") {
-                                g.seen.push("pause".to_string());
-                                if g.takes {
-                                    g.paused = true;
-                                }
-                            } else if line.ends_with(" /goal resume") {
-                                g.seen.push("resume".to_string());
-                                g.paused = false;
-                            }
-                        }
-                        "OK 0 turn submitted=1 status=settled seq=1 id=1".to_string()
-                    }
-                    _ => "ERR unscripted".to_string(),
-                };
-                if let Ok(mut asked) = w.asked.lock() {
-                    asked.push(line);
+                )
+            }
+            "text" => format!(
+                "OK {}",
+                if relaunched {
+                    w.after_relaunch.clone()
+                } else if exited {
+                    w.after_exit.clone()
+                } else if let Some(t) = &left {
+                    codex_holding(t, 30)
+                } else if let Some(shown) = w.shows.lock().ok().and_then(|s| s.clone()) {
+                    shown
+                } else {
+                    w.before.clone()
                 }
-                if writeln!(out, "{reply}").is_err() {
-                    break;
+            ),
+            "cell" if left.is_some() => "OK / d0d0d0 2d2f33 none".to_string(),
+            "cell" => w.cell.to_string(),
+            "status" => format!(
+                "{}{}",
+                w.status,
+                w.status_extra.lock().map(|e| e.clone()).unwrap_or_default()
+            ),
+            "help" if line.contains("help key") => {
+                "OK 2\nkey  key [if-gen=<epoch>.<seq>] [if=<re>] <name>\n     FENCES".to_string()
+            }
+            "help" => "OK 1\nturn [if-gen=<epoch>.<seq>] <text>".to_string(),
+            "blocks" if line.contains("blocks 2") => format!("OK {}", w.blocks2),
+            "blocks" => format!("OK {}", w.blocks1),
+            "blocktext" => std::iter::once(format!("OK {}", w.block_out.len()))
+                .chain(w.block_out.iter().cloned())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            "line" => "OK % ".to_string(),
+            "lease" if line.contains(" lease release ") => {
+                if w.lease.starts_with("OK lease acquired") {
+                    "OK lease released".to_string()
+                } else {
+                    "OK lease none".to_string()
                 }
             }
+            "lease" => w.lease.to_string(),
+            "turn" if w.miss.is_some() => {
+                // What the host does on a missed guard: the text is
+                // typed and its Enter not pressed.
+                let text = line
+                    .split_once(&format!(" {TURN_WAIT} "))
+                    .map_or("", |(_, t)| t)
+                    .to_string();
+                if let Ok(mut l) = w.left.lock() {
+                    *l = Some(text);
+                }
+                w.miss.unwrap_or_default().to_string()
+            }
+            // The goal's keys: Enter on the resume box resumes the
+            // goal, Esc stops a goal turn and pauses the goal.
+            "key" if w.goal.is_some() && (line.ends_with(" enter") || line.ends_with(" esc")) => {
+                if let Some(Ok(mut g)) = w.goal.as_ref().map(|g| g.lock()) {
+                    if line.ends_with(" enter") && g.boxed {
+                        g.boxed = false;
+                        g.paused = false;
+                        g.seen.push("enter".to_string());
+                    } else if line.ends_with(" esc") {
+                        g.paused = true;
+                        g.seen.push("esc".to_string());
+                    }
+                }
+                "OK seq=41".to_string()
+            }
+            "turn" => {
+                if line.ends_with(" /exit") {
+                    w.exited.store(true, Ordering::SeqCst);
+                } else if line.contains("'resume'") || line.contains("/agents/codex'") {
+                    w.relaunched.store(true, Ordering::SeqCst);
+                    // `codex resume` over a paused goal opens on its box.
+                    if let Some(Ok(mut g)) = w.goal.as_ref().map(|g| g.lock()) {
+                        g.boxed = g.paused;
+                    }
+                } else if let Some(Ok(mut g)) = w.goal.as_ref().map(|g| g.lock()) {
+                    if line.ends_with(" /goal pause") {
+                        g.seen.push("pause".to_string());
+                        if g.takes {
+                            g.paused = true;
+                        }
+                    } else if line.ends_with(" /goal resume") {
+                        g.seen.push("resume".to_string());
+                        g.paused = false;
+                    }
+                }
+                "OK 0 turn submitted=1 status=settled seq=1 id=1".to_string()
+            }
+            _ => "ERR unscripted".to_string(),
         }
-    });
-    sock.to_string_lossy().into_owned()
+    })
 }
 
 /// The scripted kernel: [`TUI`] is [`SHELL`]'s foreground job on a tab's
@@ -607,7 +575,7 @@ struct Rig {
     tui: Tui,
     target: Target,
     kernel: Script,
-    asked: Arc<Mutex<Vec<String>>>,
+    asked: crate::harness::FakeInstanceLog,
     rollout: PathBuf,
     /// What the stand-in's composer holds of the lane's own typing.
     left: Arc<Mutex<Option<String>>>,
@@ -640,7 +608,6 @@ impl Rig {
         .expect("rollout");
         let exited = Arc::new(AtomicBool::new(false));
         let relaunched = Arc::new(AtomicBool::new(false));
-        let asked = Arc::new(Mutex::new(Vec::new()));
         let left = Arc::new(Mutex::new(None));
         let status_extra = Arc::new(Mutex::new(String::new()));
         let shows = Arc::new(Mutex::new(None));
@@ -675,11 +642,10 @@ impl Rig {
             lease: "ERR unscripted",
             exited: Arc::clone(&exited),
             relaunched: Arc::clone(&relaunched),
-            asked: Arc::clone(&asked),
             goal: None,
         };
         world(&mut w);
-        let sock = instance(&dir, w);
+        let (sock, asked) = instance(&dir, w);
         let opts = Opts {
             home,
             state: dir.join("state"),
@@ -693,7 +659,9 @@ impl Rig {
             // The ask-and-drain flow these tests pin (`upgrade_ask = true`).
             ask: true,
             several_logins: false,
+            usage_tap: None,
             instances: crate::harness::upgrade_drive::Instances::Listed(Vec::new()),
+            agents_off: Vec::new(),
         };
         let lock = embedded.then(|| {
             codex
@@ -719,6 +687,7 @@ impl Rig {
                 argv: vec!["/store/codex/1000000000157000000/bin/codex".to_string()],
                 version: v("0.157.0"),
                 home: codex,
+                home_env: None,
             },
             target,
             kernel: Script {
@@ -880,12 +849,119 @@ fn a_daemon_client_is_exited_by_a_typed_exit_and_resumed_on_the_managed_twin() {
     );
 }
 
-/// ND1 for a Codex: the harness's hard hand is taken before the `/exit`'s
-/// last look and kept through the `/exit`, the bare shell and the relaunch
-/// line, both typed under it on its own connection, and given back once the
-/// relaunched TUI is carried on. Negative control: another driver's hold on
-/// the tab makes the restart wait `held`, typing nothing and giving nothing
-/// back.
+/// A TUI STARTED UNDER `CODEX_HOME=<dir>` IS RELAUNCHED UNDER IT: the upgrade's relaunch line
+/// carries the variable the TUI's own exec environment set ([`Tui::home_env`]), verbatim and
+/// quoted as every word is, in front of the managed twin, never the canonical home its records
+/// are read under; and its record keeps it (`codex_home_env`), which the line of a relaunch
+/// left in flight is planned from. Without it the new TUI took its shell's home, `~/.codex`,
+/// where its thread is not. NEGATIVE CONTROL: a TUI that had no `CODEX_HOME` is relaunched with
+/// none, and its record's file holds no such key, byte for byte as before.
+#[test]
+fn a_codex_started_under_a_codex_home_is_relaunched_under_it() {
+    super::super::tests::side_by_side(
+        [true, false]
+            .into_iter()
+            .map(|set| {
+                Box::new(move || {
+                    let mut rig = Rig::new("codex-home-line", T1, false, |_| {});
+                    // The home spelled through a link: the verbatim value is not the canonical one.
+                    let alias = rig.dir.join("my codex");
+                    std::os::unix::fs::symlink(&rig.tui.home, &alias).expect("link");
+                    let value = alias.to_string_lossy().into_owned();
+                    if set {
+                        rig.tui.home_env = Some(value.clone());
+                    }
+                    rig.settle(10);
+                    let r = rig.visit(daemon_current());
+                    assert_eq!(r.step, "done", "set={set}: {r:?}\n{:#?}", rig.asked());
+                    let typed = rig.typed();
+                    assert_eq!(typed.len(), 2, "{typed:#?}");
+                    let line = &typed[1];
+                    let twin = format!("'{}' 'resume' '{T1}'", rig.target.twin.display());
+                    assert!(line.contains(&twin), "{line}");
+                    let st = rig.state();
+                    if set {
+                        let word = format!("CODEX_HOME={} ", upgrade::quote(Dialect::Zsh, &value));
+                        assert!(line.contains(&format!("{word}{twin}")), "{line}");
+                        assert!(
+                            !line.contains(rig.tui.home.to_string_lossy().as_ref()),
+                            "the canonical home: {line}"
+                        );
+                        assert_eq!(st.codex_home_env.as_deref(), Some(value.as_str()));
+                    } else {
+                        assert!(!line.contains("CODEX_HOME"), "{line}");
+                        assert_eq!(st.codex_home_env, None);
+                        let file = std::fs::read_to_string(
+                            state_dir(&rig.opts).join(format!("{}.json", key(TAB))),
+                        )
+                        .expect("the record");
+                        assert!(!file.contains("codex_home_env"), "{file}");
+                    }
+                }) as Box<dyn FnOnce() + Send>
+            })
+            .collect(),
+    );
+}
+
+/// A RELAUNCH CARRIES THE THREAD'S OWN PERMISSION MODE (`cx::carried_mode`): a Codex launched
+/// `-a on-request -s read-only` whose thread's newest `turn_context` records the Full Access a
+/// person chose with `/permissions` (`never`/`danger-full-access`, the measured 0.163.0 shape)
+/// is resumed with `-a never -s danger-full-access`, its other flags as launched — Codex runs a
+/// resume in the flags it is given, so the launch's would undo the choice (measured in the lab,
+/// 2026-10-16). NEGATIVE CONTROLS: a thread whose newest turn ran in the launch's own mode is
+/// resumed with the launch's flags verbatim; and a bypassed launch whose thread now runs
+/// sandboxed (a fall) keeps its bypass flag.
+#[test]
+fn a_codex_relaunch_carries_the_permission_mode_its_thread_last_ran_in() {
+    let context = |approval: &str, sandbox: &str| {
+        format!(
+            "{{\"timestamp\":\"2026-10-16T18:20:07.010Z\",\"type\":\"turn_context\",\"payload\":\
+             {{\"turn_id\":\"t\",\"cwd\":\"/w\",\"approval_policy\":\"{approval}\",\
+             \"approvals_reviewer\":\"user\",\"sandbox_policy\":{{\"type\":\"{sandbox}\"}},\
+             \"model\":\"gpt-6.1-sol\"}}}}"
+        )
+    };
+    let cases: [(&[&str], [&str; 2], &str); 3] = [
+        (
+            &["-a", "on-request", "-s", "read-only"],
+            ["never", "danger-full-access"],
+            "'-a' 'never' '-s' 'danger-full-access'",
+        ),
+        (
+            &["-a", "on-request", "-s", "read-only"],
+            ["on-request", "read-only"],
+            "'-a' 'on-request' '-s' 'read-only'",
+        ),
+        (
+            &["--dangerously-bypass-approvals-and-sandbox"],
+            ["never", "workspace-write"],
+            "'--dangerously-bypass-approvals-and-sandbox'",
+        ),
+    ];
+    for (flags, [approval, sandbox], carried) in cases {
+        let mut rig = Rig::new("codex-perms-carry", T1, false, |_| {});
+        rig.tui.argv.extend(flags.iter().map(|f| (*f).to_string()));
+        // The launch's mode first, then the newest turn's.
+        let first = context("on-request", "read-only");
+        let last = context(approval, sandbox);
+        let mut text = std::fs::read_to_string(&rig.rollout).expect("the rollout");
+        text = format!("{first}\n{text}{last}\n");
+        std::fs::write(&rig.rollout, text).expect("rollout");
+        age(&rig.rollout);
+        rig.settle(10);
+        let r = rig.visit(daemon_current());
+        assert_eq!(r.step, "done", "{flags:?}: {r:?}\n{:#?}", rig.asked());
+        let typed = rig.typed();
+        assert_eq!(typed.len(), 2, "{typed:#?}");
+        let line = &typed[1];
+        let twin = format!("'{}' 'resume' {carried} '{T1}'", rig.target.twin.display());
+        assert!(line.contains(&twin), "{flags:?} → {line}");
+    }
+}
+
+/// The harness's hard hand is taken before the `/exit`'s last look, kept through the `/exit`
+/// and the relaunch line, and given back once the relaunched TUI is carried on. Negative
+/// control: another driver's hold makes the restart wait `held`, typing nothing.
 #[test]
 fn a_codex_restart_holds_the_tab_from_its_last_look_to_the_relaunched_tui() {
     let held = "OK lease acquired holder=x ttl_ms=60000 expires_in_ms=60000 hard=1";
@@ -947,11 +1023,9 @@ fn a_daemon_client_waits_for_its_daemon_and_for_every_quiet_gate() {
     assert!(rig.typed().is_empty());
     // No daemon at all and no lock held: nothing proves the mode.
     assert_eq!(rig.visit(None).step, "wait:no-daemon");
-    // Its daemon on the build, its own thread running a turn its screen does
-    // not show (the kernel names it: the daemon's one thread, this TUI its one
-    // client; a goal-mode Codex begins its next turn within milliseconds of
-    // every end, its screen idle for seconds): its `/exit` might stop that
-    // turn, so nothing is typed, at any rung.
+    // Its daemon on the build, its own thread running a turn its screen does not show (the
+    // kernel names it: the daemon's one thread, this TUI its one client): its `/exit` might
+    // stop that turn, so nothing is typed.
     let hidden = Some(DaemonView {
         running: Some(v("0.157.1")),
         wait: String::new(),
@@ -1087,13 +1161,10 @@ fn an_embedded_conversation_is_asked_first_and_moved_only_on_its_ready_answer() 
     );
 }
 
-/// THE CODEX TWINS OF THE TYPED ACTS: the
-/// notice and the continuation are typed under the harness's own hand — the
-/// wire is `lease acquire … hard`, the fence's `help turn`, its screen read,
-/// the `turn`, `lease release`, nothing of aterm's between the last read and
-/// the `turn` — so the window's presence layer reads aterm's own hand and
-/// raises no row. NEGATIVE CONTROL: a tab another driver holds is a wait
-/// (`wait:held`), nothing typed, nothing given back.
+/// The notice and the continuation are typed under the harness's own hand (`lease acquire …
+/// hard`, the fence's `help turn` and screen read, the `turn`, `lease release`), so the
+/// window's presence layer raises no row. Negative control: a tab another driver holds is
+/// `wait:held`, nothing typed.
 #[test]
 fn the_codex_notice_and_the_continuation_are_typed_under_the_harnesss_hand() {
     let held = "OK lease acquired holder=x ttl_ms=60000 expires_in_ms=60000 hard=1";
@@ -1165,7 +1236,7 @@ fn the_codex_notice_and_the_continuation_are_typed_under_the_harnesss_hand() {
             .any(|l| l.contains(" lease release ")),
         "and given back after it: {asked:#?}"
     );
-    // NEGATIVE CONTROL: another driver holds the tab.
+    // Negative control: another driver holds the tab.
     let rig = Rig::new("embedded-theirs", T2, true, |w| {
         w.lease = "ERR lease held holder=orchestrator expires_in_ms=5000";
     });
@@ -1335,17 +1406,14 @@ fn fake_update_verb(dir: &Path, home: &Path, new_pid: u32) -> PathBuf {
         home = home.display(),
         pkg = PACKAGE.replace("0.157.0", "0.157.1"),
     );
-    // A link of the one stand-in, its first exec no assessment of a new file.
+    // A link of the one stand-in: its first exec pays no code assessment of a new file.
     super::super::tests::sh_script(&exe, &script);
     exe
 }
 
-/// The verb inherits nothing but its stdio: a descriptor this process holds
-/// without close-on-exec (a stand-in for the GUI's shader-cache files) must
-/// not reach the vendor's verb, so it cannot reach the daemon the verb
-/// starts, which outlives the GUI. The verb reports what it finds open before
-/// it answers: its stdout is the detector's positive control, and the answer
-/// being read proves the verb ran.
+/// The verb inherits nothing but its stdio: a descriptor held without close-on-exec must not
+/// reach the vendor's verb, so it cannot reach the daemon the verb starts. The verb's report of
+/// its stdout is the detector's positive control, and its answer proves it ran.
 #[test]
 fn the_daemon_update_verb_inherits_nothing_but_its_stdio() {
     use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
@@ -1368,8 +1436,7 @@ fn the_daemon_update_verb_inherits_nothing_but_its_stdio() {
     );
     let exe = dir.join("codex");
     let report = dir.join("fds");
-    // A link of the one stand-in, its first exec no assessment of a new file
-    // (the body is read by the shell, and closed, before it runs).
+    // A link of the one stand-in; the shell reads and closes the body before it runs.
     super::super::tests::sh_script(
         &exe,
         &format!(
@@ -1547,7 +1614,9 @@ fn daemon_home(name: &str, last: &str, age_s: u64) -> (ScratchDir, Opts, DaemonS
         // The ask-and-drain flow these tests pin (`upgrade_ask = true`).
         ask: true,
         several_logins: false,
+        usage_tap: None,
         instances: crate::harness::upgrade_drive::Instances::Listed(Vec::new()),
+        agents_off: Vec::new(),
     };
     let script = DaemonScript {
         home: home.clone(),
@@ -1653,6 +1722,10 @@ fn a_busy_or_settling_thread_holds_the_daemon_where_it_is() {
 struct Found2 {
     exe: PathBuf,
     homes: Vec<(u32, String)>,
+    /// The `CODEX_HOME` each pid was started with; a pid not listed had none.
+    codex_homes: Vec<(u32, String)>,
+    /// Each pid's working directory; a pid not listed has none readable.
+    cwds: Vec<(u32, String)>,
     name: &'static str,
 }
 
@@ -1674,10 +1747,17 @@ impl CodexKernel for Found2 {
     }
     fn args(&self, pid: u32) -> Option<atpkg::caller_shell::ProcArgs> {
         let home = self.homes.iter().find(|(p, _)| *p == pid)?.1.clone();
+        let codex_home = self
+            .codex_homes
+            .iter()
+            .filter(|(p, _)| *p == pid)
+            .map(|(_, h)| format!("CODEX_HOME={h}"));
         Some(atpkg::caller_shell::ProcArgs {
             exec_path: format!("/bin/{}", self.name),
             argv: vec!["codex".to_string()],
-            env: vec![format!("HOME={home}")],
+            env: std::iter::once(format!("HOME={home}"))
+                .chain(codex_home)
+                .collect(),
         })
     }
     fn exe(&self, _: u32) -> Option<PathBuf> {
@@ -1704,12 +1784,110 @@ impl CodexKernel for Found2 {
     fn daemon_clients(&self, _: u32) -> Option<Vec<u32>> {
         Some(Vec::new())
     }
-    fn cwd(&self, _: u32) -> Option<String> {
-        None
+    fn cwd(&self, pid: u32) -> Option<String> {
+        self.cwds
+            .iter()
+            .find(|(p, _)| *p == pid)
+            .map(|(_, d)| d.clone())
     }
     fn in_tab(&self, _: &mut Client, _: u32, _: &str) -> bool {
         false
     }
+}
+
+/// THE VENDOR-BYTES GUARD (the native harness contract §7): the Codex lane
+/// moves only a TUI whose package is the vendor's, and only onto a managed
+/// build that is. A codex-alab's package (its `alab-build.json` beside the
+/// manifest) is not moved however old it reads, a managed codex-alab is no
+/// vendor target, and an exe with no package is no vendor bytes. NEGATIVE
+/// CONTROL: the same tab, package and target without the marker is due.
+#[test]
+fn the_codex_lane_moves_only_vendor_bytes_onto_vendor_bytes() {
+    let dir = scratch("codex-vendor-bytes");
+    let root = dir.join("store/codex/b");
+    std::fs::create_dir_all(root.join("bin")).expect("bin");
+    std::fs::write(root.join("bin/codex"), "").expect("exe");
+    std::fs::write(root.join(cx::PACKAGE_JSON), PACKAGE).expect("pkg");
+    let home = dir.join("home");
+    std::fs::create_dir_all(&home).expect("home");
+    let opts = Opts {
+        home: home.clone(),
+        state: dir.join("state"),
+        sock: None,
+        only_sid: Some(TAB.to_string()),
+        dry_run: true,
+        human_grace_s: 120,
+        hand_back: false,
+        background: false,
+        aterm_state: None,
+        ask: true,
+        several_logins: false,
+        usage_tap: None,
+        instances: crate::harness::upgrade_drive::Instances::Listed(Vec::new()),
+        agents_off: Vec::new(),
+    };
+    let tabs = [LiveTab {
+        sid: TAB.to_string(),
+        fgpgid: Some(i64::from(TUI)),
+    }];
+    let kernel = Found2 {
+        exe: root.join("bin/codex"),
+        homes: vec![(TUI, home.to_string_lossy().into_owned())],
+        codex_homes: Vec::new(),
+        cwds: Vec::new(),
+        name: "codex",
+    };
+    let target = Target {
+        twin: dir.join("agents/codex"),
+        exe: root.join("bin/codex"),
+        version: v("0.157.1"),
+    };
+    let check = || {
+        due_with(
+            &opts,
+            &tabs,
+            &kernel,
+            || Some(target.clone()),
+            |_| Some((9, i64::from(TUI), i64::from(TUI))),
+            |_| None,
+        )
+    };
+    assert!(cx::vendor_bytes(&root.join("bin/codex")));
+    assert!(!cx::alab_bytes(&root.join("bin/codex")));
+    assert_eq!(check(), Some(Due::Yes), "the vendor's older build is moved");
+    // The same package marked ALab's.
+    std::fs::write(root.join(cx::ALAB_BUILD_JSON), "{}").expect("marker");
+    assert!(!cx::vendor_bytes(&root.join("bin/codex")));
+    assert!(cx::alab_bytes(&root.join("bin/codex")));
+    assert_eq!(check(), Some(Due::No), "a codex-alab is never moved");
+    // …nor is a managed codex-alab a target: its twin names no vendor build.
+    let twin = dir.join("agents/codex");
+    std::fs::create_dir_all(twin.parent().expect("agents")).expect("agents");
+    std::fs::write(
+        &twin,
+        format!(
+            "#!/bin/sh\nexec '{}' \"$@\"\n",
+            root.join("bin/codex").display()
+        ),
+    )
+    .expect("twin");
+    assert!(Target::of_twin(&twin).is_none());
+    std::fs::remove_file(root.join(cx::ALAB_BUILD_JSON)).expect("unmark");
+    assert!(
+        Target::of_twin(&twin).is_some(),
+        "control: the vendor's is a target"
+    );
+    // An exe with no package (a build out of a checkout) is no vendor bytes.
+    let loose = dir.join("checkout/target/release/codex");
+    std::fs::create_dir_all(loose.parent().expect("dir")).expect("dir");
+    std::fs::write(&loose, "").expect("exe");
+    assert!(!cx::vendor_bytes(&loose));
+    assert!(
+        !cx::alab_bytes(&loose),
+        "nor ALab bytes: no package says so"
+    );
+    assert!(!cx::vendor_bytes(&dir.join("nowhere/codex")));
+    assert!(!cx::alab_bytes(&dir.join("nowhere/codex")));
 }
 
 #[test]
@@ -1734,7 +1912,9 @@ fn due_distinguishes_a_current_codex_from_an_unknown_or_claude_foreground() {
         // The ask-and-drain flow these tests pin (`upgrade_ask = true`).
         ask: true,
         several_logins: false,
+        usage_tap: None,
         instances: crate::harness::upgrade_drive::Instances::Listed(Vec::new()),
+        agents_off: Vec::new(),
     };
     let tabs = [LiveTab {
         sid: TAB.to_string(),
@@ -1743,6 +1923,8 @@ fn due_distinguishes_a_current_codex_from_an_unknown_or_claude_foreground() {
     let mut kernel = Found2 {
         exe: root.join("bin/codex"),
         homes: vec![(TUI, home.to_string_lossy().into_owned())],
+        codex_homes: Vec::new(),
+        cwds: Vec::new(),
         name: "codex",
     };
     let target = Target {
@@ -1773,6 +1955,19 @@ fn due_distinguishes_a_current_codex_from_an_unknown_or_claude_foreground() {
         "a current Codex is a conclusive answer, not an unknown foreground"
     );
     assert_eq!(check(&kernel, None), Some(Due::No), "no managed target");
+    // A relative `CODEX_HOME` is placed in the TUI's directory; with that
+    // directory unread the Codex is unread, never `No` (nor read under
+    // `$HOME/.codex`).
+    kernel.codex_homes = vec![(TUI, "rel-home".to_string())];
+    assert_eq!(
+        check(&kernel, Some(target.clone())),
+        Some(Due::Unread(UNREAD_PROCESS)),
+        "its home unplaced"
+    );
+    kernel.cwds = vec![(TUI, dir.to_string_lossy().into_owned())];
+    assert_eq!(check(&kernel, Some(target.clone())), Some(Due::Yes));
+    kernel.codex_homes.clear();
+    kernel.cwds.clear();
     kernel.name = "claude";
     assert_eq!(
         due_with(
@@ -1840,7 +2035,9 @@ fn a_codex_of_another_home_is_never_this_sweeps() {
         // The ask-and-drain flow these tests pin (`upgrade_ask = true`).
         ask: true,
         several_logins: false,
+        usage_tap: None,
         instances: crate::harness::upgrade_drive::Instances::Listed(Vec::new()),
+        agents_off: Vec::new(),
     };
     let k = Found2 {
         exe: root.join("bin/codex"),
@@ -1849,6 +2046,8 @@ fn a_codex_of_another_home_is_never_this_sweeps() {
             (2, "/somewhere/else".to_string()),
             (3, "/somewhere/else".to_string()),
         ],
+        codex_homes: Vec::new(),
+        cwds: Vec::new(),
         name: "codex",
     };
     let found = |pid, tab: &str, claimed: bool| Found {
@@ -1882,6 +2081,133 @@ fn a_codex_of_another_home_is_never_this_sweeps() {
             .map(|r| (r.pid, r.step.as_str()))
             .collect::<Vec<_>>(),
         vec![(2, "skip:another-home")]
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The `CODEX_HOME` a TUI was started with is read off its own exec environment VERBATIM
+/// ([`Tui::home_env`]), beside the canonical home its records are read under ([`Tui::home`]):
+/// a home named through a link keeps the link's spelling, which its relaunch line carries.
+/// NEGATIVE CONTROL: a TUI started with none reads `None`, though its home is the same
+/// directory, the default `~/.codex` — the canonical home alone cannot tell the two apart.
+#[test]
+fn the_codex_home_a_tui_was_started_with_is_read_verbatim() {
+    let dir = scratch("codex-home-env");
+    let root = dir.join("store/codex/b");
+    std::fs::create_dir_all(root.join("bin")).expect("bin");
+    std::fs::write(root.join("bin/codex"), "").expect("exe");
+    std::fs::write(root.join(cx::PACKAGE_JSON), PACKAGE).expect("pkg");
+    let mine = dir.join("mine");
+    std::fs::create_dir_all(mine.join(".codex")).expect("home");
+    let alias = dir.join("my codex");
+    std::os::unix::fs::symlink(mine.join(".codex"), &alias).expect("link");
+    let alias = alias.to_string_lossy().into_owned();
+    let opts = Opts {
+        home: mine.clone(),
+        state: dir.join("state"),
+        sock: None,
+        only_sid: None,
+        dry_run: true,
+        human_grace_s: 120,
+        hand_back: false,
+        background: false,
+        aterm_state: None,
+        ask: true,
+        several_logins: false,
+        usage_tap: None,
+        instances: crate::harness::upgrade_drive::Instances::Listed(Vec::new()),
+        agents_off: Vec::new(),
+    };
+    let mine_s = mine.to_string_lossy().into_owned();
+    let k = Found2 {
+        exe: root.join("bin/codex"),
+        homes: vec![(1, mine_s.clone()), (2, mine_s)],
+        codex_homes: vec![(1, alias.clone())],
+        cwds: Vec::new(),
+        name: "codex",
+    };
+    let found = |pid: u32, tab: &str| Found {
+        pid,
+        tab: tab.to_string(),
+        claim: None,
+    };
+    let (tuis, reports) = tuis(&opts, vec![found(1, "s-a"), found(2, "s-b")], &k);
+    assert!(reports.is_empty(), "{reports:?}");
+    assert_eq!(tuis.iter().map(|t| t.pid).collect::<Vec<_>>(), vec![1, 2]);
+    assert_eq!(tuis[0].home_env.as_deref(), Some(alias.as_str()));
+    assert_eq!(tuis[0].home, canonical(&mine.join(".codex")));
+    assert_eq!(tuis[1].home_env, None, "none set");
+    assert_eq!(tuis[1].home, tuis[0].home, "the same directory either way");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A RELATIVE `CODEX_HOME` IS THE TUI'S DIRECTORY'S, as Codex resolves it (it canonicalizes
+/// the variable against its own working directory as it starts): the lane reads that TUI's
+/// rollouts, thread locks and daemon under `<its cwd>/<the value>`, while its relaunch line
+/// carries the value verbatim from that directory ([`Tui::home_env`]). NEGATIVE CONTROLS: a
+/// TUI whose directory cannot be read is no TUI this sweep can place (`wait:home-unreadable`),
+/// never one read under `$HOME/.codex`, another Codex's; an absolute value is taken as given.
+#[test]
+fn a_relative_codex_home_is_the_tuis_directorys() {
+    let dir = scratch("codex-home-relative");
+    let root = dir.join("store/codex/b");
+    std::fs::create_dir_all(root.join("bin")).expect("bin");
+    std::fs::write(root.join("bin/codex"), "").expect("exe");
+    std::fs::write(root.join(cx::PACKAGE_JSON), PACKAGE).expect("pkg");
+    let mine = dir.join("mine");
+    std::fs::create_dir_all(mine.join(".codex")).expect("home");
+    let proj = dir.join("proj");
+    std::fs::create_dir_all(proj.join("rel-home")).expect("the relative home");
+    let opts = Opts {
+        home: mine.clone(),
+        state: dir.join("state"),
+        sock: None,
+        only_sid: None,
+        dry_run: true,
+        human_grace_s: 120,
+        hand_back: false,
+        background: false,
+        aterm_state: None,
+        ask: true,
+        several_logins: false,
+        usage_tap: None,
+        instances: crate::harness::upgrade_drive::Instances::Listed(Vec::new()),
+        agents_off: Vec::new(),
+    };
+    let mine_s = mine.to_string_lossy().into_owned();
+    let absolute = proj.join("rel-home").to_string_lossy().into_owned();
+    let k = Found2 {
+        exe: root.join("bin/codex"),
+        homes: vec![(1, mine_s.clone()), (2, mine_s.clone()), (3, mine_s)],
+        codex_homes: vec![
+            (1, "rel-home".to_string()),
+            (2, "rel-home".to_string()),
+            (3, absolute.clone()),
+        ],
+        cwds: vec![(1, proj.to_string_lossy().into_owned())],
+        name: "codex",
+    };
+    let found = |pid: u32, tab: &str| Found {
+        pid,
+        tab: tab.to_string(),
+        claim: None,
+    };
+    let (tuis, reports) = tuis(
+        &opts,
+        vec![found(1, "s-a"), found(2, "s-b"), found(3, "s-c")],
+        &k,
+    );
+    assert_eq!(tuis.iter().map(|t| t.pid).collect::<Vec<_>>(), vec![1, 3]);
+    assert_eq!(tuis[0].home, canonical(&proj.join("rel-home")));
+    assert_ne!(tuis[0].home, canonical(&mine.join(".codex")));
+    assert_eq!(tuis[0].home_env.as_deref(), Some("rel-home"), "verbatim");
+    assert_eq!(tuis[1].home, canonical(&proj.join("rel-home")));
+    assert_eq!(
+        reports
+            .iter()
+            .map(|r| (r.pid, r.step.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(2, "wait:home-unreadable")]
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1949,10 +2275,57 @@ fn a_relaunch_that_waited_keeps_the_thread_its_first_attempt_read() {
     assert!(other.typed().is_empty());
 }
 
+#[test]
+fn a_self_claimed_relaunch_records_its_witness_after_a_deferred_carry() {
+    use crate::harness::self_claimed::{Resume, Witnesses};
+
+    let rig = Rig::new("self-claim-carry", T2, true, |w| after_crash(w, 137));
+    rig.kernel.exited.store(true, Ordering::SeqCst);
+    let snap = crashed_snap(&rig, Some(T2), true);
+    let home_alias = rig.dir.join("custom codex");
+    std::os::unix::fs::symlink(&rig.tui.home, &home_alias).expect("home alias");
+    // The lock stays under the captured canonical home; the launch retains its alias.
+    let resume = Resume {
+        argv: vec![
+            rig.target.exe.to_string_lossy().into_owned(),
+            "resume".to_string(),
+            T2.to_string(),
+        ],
+        session: T2.to_string(),
+        codex_home: Some(home_alias.to_string_lossy().into_owned()),
+        cwd: Some("/w".to_string()),
+    };
+    let witnesses = Witnesses::under(&rig.opts.state);
+    *rig.status_extra.lock().expect("status") = " human_ms=500".to_string();
+    let r = self_claimed_after_exit(&rig.opts, &snap, &resume, ExitCause::Exit, &rig.kernel);
+    assert_eq!(r.step, "wait:held", "{r:?}");
+    assert!(rig.typed().is_empty());
+    assert!(!witnesses.handled(snap.pid, &snap.start));
+    let waiting = rig.state();
+    assert!(matches!(waiting.phase, Phase::Exiting { .. }));
+    assert_eq!(waiting.resume_start, snap.start);
+
+    rig.status_extra.lock().expect("status").clear();
+    let r = self_claimed_after_exit(&rig.opts, &snap, &resume, ExitCause::Exit, &rig.kernel);
+    assert_eq!(r.step, "continued", "{r:?}\n{:#?}", rig.asked());
+    assert!(witnesses.handled(snap.pid, &snap.start));
+    assert_eq!(rig.state().phase, Phase::Done);
+    let typed = rig.typed();
+    assert_eq!(typed.len(), 2, "the resume line and carry-on: {typed:#?}");
+    assert!(
+        typed[0].contains(&format!(
+            "CODEX_HOME={} ",
+            upgrade::quote(Dialect::Zsh, resume.codex_home.as_deref().expect("home"))
+        )),
+        "{}",
+        typed[0]
+    );
+    let r = self_claimed_after_exit(&rig.opts, &snap, &resume, ExitCause::Exit, &rig.kernel);
+    assert_eq!(r.step, "ended:handled", "{r:?}");
+    assert_eq!(rig.typed(), typed, "a second decision types nothing");
+}
+
 // ---------------------------------------------------------------- daemon-mode tabs
-//
-// Each test below pins a behaviour of the daemon-mode lane, with a negative
-// control beside it.
 
 /// The daemon home of [`daemon_home`], serving one daemon-mode TUI (the
 /// stand-in tab of a [`Rig`], attached to the daemon) and `world` for that
@@ -1999,9 +2372,8 @@ fn owner_word(opts: &Opts, request: Request) {
     );
 }
 
-/// Codex's idle screen with a person's input to the tab a second ago.
-/// A person gave the tab input a minute ago: within `human_grace_s`, not
-/// within the ladder's KEYS_GAP_S.
+/// A person gave the tab input a minute ago: within `human_grace_s`, not within the ladder's
+/// KEYS_GAP_S.
 fn attended(w: &mut World) {
     w.before = codex_idle(10).replace(r#""human_ms":null"#, r#""human_ms":60000"#);
 }
@@ -2329,10 +2701,8 @@ fn a_background_terminal_that_outlives_the_answer_is_asked_again_then_given_up()
     );
 }
 
-/// EACH CODEX NOTICE IS ONE ASK ON THE PROCESS'S RECORD (`St::notices`, the
-/// owner's "Asked N times"): an embedded notice counts one, and the count
-/// rides a retarget of the same process onto a newer build, whose next
-/// notice counts one more.
+/// Each Codex notice is one ask on the process's record (`St::notices`), and the count rides a
+/// retarget of the same process onto a newer build.
 #[test]
 fn each_codex_notice_counts_one_ask_on_the_record() {
     let mut rig = Rig::new("codex-asks", T2, true, |_| {});
@@ -2346,15 +2716,10 @@ fn each_codex_notice_counts_one_ask_on_the_record() {
     assert_eq!((st.to.as_str(), st.notices), ("0.157.2", 2), "{st:?}");
 }
 
-/// No stop is for good in the Codex lane either: an embedded conversation's
-/// round gives up over a background terminal that outlives its READY; it
-/// rests (`wait:failed:unanswered`, looked at again, nothing typed), and once
-/// it has rested `RETRY_S` a new round starts (`rearmed:unanswered`, on the
-/// ledger, nothing typed at that look), whose first notice the next look
-/// types, with a READY marker of its own. Negative control: the owner's
-/// `--skip` of the build holds the rested round however long it rests and
-/// says `wait:skipped` (the host's last word, as in the Claude lane), and a
-/// `--defer` not run out holds it too, looked at again (`wait:deferred`).
+/// A round that gave up rests (`wait:failed:unanswered`, nothing typed), and after `RETRY_S` a
+/// new round starts (`rearmed:unanswered`, nothing typed at that look) whose first notice the
+/// next look types with a READY marker of its own. Negative control: the owner's `--skip`
+/// (`wait:skipped`) or an unexpired `--defer` (`wait:deferred`) holds the rested round.
 #[test]
 fn a_codex_round_that_gave_up_rests_then_a_new_one_asks_again() {
     let mut rig = embedded_ready("emb-rearm", |_| {});
@@ -2381,10 +2746,8 @@ fn a_codex_round_that_gave_up_rests_then_a_new_one_asks_again() {
         failed_at: now_s() - upgrade::RETRY_S,
         ..rig.state()
     };
-    // Held by the owner's word, the rested round says so as the Claude lane
-    // does: `wait:skipped` is the host's last word (a newer build or the
-    // owner's next word wakes it), never a `wait:failed:<why>` looked at every
-    // ten minutes for ever; a deferral is looked at again until it runs out.
+    // Held by the owner's word: a skip is the host's last word (a newer build or the owner's
+    // next word wakes it); a deferral is looked at again until it runs out.
     for (request, word, last) in [
         (Request::Skip("0.157.1".into()), "wait:skipped", true),
         (Request::DeferUntil(now_s() + 3_600), "wait:deferred", false),
@@ -2487,17 +2850,11 @@ fn keys(rig: &Rig) -> Vec<String> {
         .collect()
 }
 
-/// A Codex notice naming a long command is guarded on its closing word: the
-/// clause naming what runs goes before the closing sentence
-/// (`upgrade::with_running`, as Claude's does), so the notice ends `…ask
-/// again later.` whatever runs, the agent's command quoted whole, and its
-/// guarded Enter (the text's last word on the cursor's row) never waits on a
-/// long path that wraps inside itself. Here Codex's exec shell stays alive
-/// for a pipeline whose last word is a long log path: a lone command runs
-/// with no shell between (the unified exec), and a `tail` or `sleep` is no
-/// process the notice names. Negative control, on the host's own engine over
-/// the wrap model (`last_wrapped_row`): the clause at the notice's end has
-/// its guard miss the cursor's row at 80 columns.
+/// A Codex notice naming a long command is guarded on its closing word: the clause naming what
+/// runs goes before the closing sentence (`upgrade::with_running`), so the notice ends `…ask
+/// again later.` with the command quoted whole, and the guarded Enter never waits on a long
+/// path that wraps inside itself. Negative control, over the host's wrap model
+/// (`last_wrapped_row`): the clause at the end has its guard miss the cursor's row at 80 columns.
 #[test]
 fn a_codex_notice_naming_a_long_command_is_guarded_on_its_closing_word() {
     // 157 characters: under `HELD_COMMAND_CHARS`, quoted whole; the path
@@ -2539,15 +2896,11 @@ fn a_codex_notice_naming_a_long_command_is_guarded_on_its_closing_word() {
     assert!(guard(text).matches(&wrapped(text)), "{}", wrapped(text));
 }
 
-/// THE CODEX NOTICE STAYS A PASTE CODEX DRAWS AS TEXT (measured 2026-09-30
-/// on Codex 0.159.2: 1000 characters are drawn as they are, 1001 as
-/// `[Pasted Content 1001 chars]`, a placeholder the guarded Enter and
-/// `left_standing` never find, left in the person's composer as their
-/// draft). Eight shells under Codex, each an hour older than the next and
-/// each running a long loop: the notice as typed is within
-/// [`cx::PASTE_SHOWN_MAX`], still ends in the closing sentence, and still
-/// names the oldest. NEGATIVE CONTROL: the same held set through the
-/// unbounded clause (`upgrade::running_clause`) is past it.
+/// The Codex notice stays a paste Codex draws as text: past [`cx::PASTE_SHOWN_MAX`] characters
+/// Codex draws `[Pasted Content N chars]`, a placeholder the guarded Enter and `left_standing`
+/// never find. With eight long-running shells under Codex the notice is within the bound, ends
+/// in the closing sentence and names the oldest. Negative control: the unbounded clause
+/// (`upgrade::running_clause`) is past it.
 #[test]
 fn a_codex_notice_naming_many_long_commands_stays_under_the_paste_placeholder() {
     let held: Vec<upgrade::Held> = (0..8u32)
@@ -2579,7 +2932,7 @@ fn a_codex_notice_naming_many_long_commands_stays_under_the_paste_placeholder() 
     );
     assert!(text.ends_with(upgrade::NOTICE_CLOSE), "{text}");
     assert!(text.contains(&format!("pid {oldest} (zsh, 8h")), "{text}");
-    // NEGATIVE CONTROL: the whole clause, unbounded.
+    // Negative control: the whole clause, unbounded.
     let notice = cx::prepare_prompt(&v("0.157.0"), &v("0.157.1"), &rig.state().marker);
     let unbounded = upgrade::with_running(&notice, &upgrade::running_clause(&held));
     assert!(
@@ -2589,15 +2942,11 @@ fn a_codex_notice_naming_many_long_commands_stays_under_the_paste_placeholder() 
     );
 }
 
-/// A MISSED GUARD ON `/exit` IS SAID AND LEFT STANDING: the guarded Enter
-/// missed and `/exit` sits in the composer. Said once (`left-typed:exit`) and
-/// recorded, so no look reads it as the person's draft — and NEVER TAKEN
-/// BACK: a fenced `ctrl+u` would also clear a person's key the host had
-/// counted and Codex had not drawn yet. No key is pressed; every later look waits on
-/// it, a person's hold (`wait:left-typed:unsent`) — the watch's dry run
-/// reads it alike, saving and ledgering nothing. NEGATIVE CONTROL: the
-/// person clears it — the record goes, and the act waits out its back-off,
-/// typed once.
+/// A missed guard on `/exit` is said once (`left-typed:exit`) and recorded, so no look reads it
+/// as the person's draft, and never taken back: a fenced `ctrl+u` would also clear a person's
+/// key the host had counted and Codex had not drawn yet. Every later look, the watch's dry run
+/// alike, waits on it as a person's hold (`wait:left-typed:unsent`). Negative control: the
+/// person clears it, the record goes, and the act waits out its back-off.
 #[test]
 fn a_missed_guard_on_exit_is_said_and_left_standing() {
     let rig = Rig::new("gm-exit", T1, false, |w| {
@@ -2685,10 +3034,9 @@ fn an_enter_that_did_not_submit_the_notice_is_said_and_left_standing() {
     );
 }
 
-/// A CODEX STALE EXIT NAMES WHAT HELD ITS LINE, as Claude Code's does
-/// (`a_stale_exit_names_the_wait_that_held_its_line`): the relaunch line's
-/// wait in a person's words; none of the lane's other waits, and no wait,
-/// give the bare line. An end no look saw is only the `/exit` typed.
+/// A Codex stale exit names the wait that held its relaunch line in a person's words, as Claude
+/// Code's does; other waits, and none, give the bare line. An end no look saw is only the
+/// `/exit` typed.
 #[test]
 fn a_codex_stale_exit_names_the_wait_that_held_its_line() {
     let rig = Rig::new("stale-words", T1, false, |_| {});
@@ -2752,10 +3100,10 @@ fn an_exit_the_tui_outlived_is_never_waited_on_again() {
         at_s: now_s() - 3_600,
     };
     save(&rig.opts, &key(TAB), &st);
-    let t0 = std::time::Instant::now();
+    // Its step is `exit_not_taken`'s, which waits on nothing (a wait for the
+    // exit is `relaunch`'s, a step of its own).
     let r = rig.visit(daemon_current());
     assert_eq!(r.step, "failed:stale-exit");
-    assert!(t0.elapsed() < EXIT_WAIT, "{:?}", t0.elapsed());
     assert_eq!(rig.state().phase, Phase::Failed("stale-exit".into()));
     // Two minutes old: not waited on either, and a `/exit` left in its
     // composer stands, recorded — never taken back, nothing ledgered.
@@ -2768,9 +3116,7 @@ fn an_exit_the_tui_outlived_is_never_waited_on_again() {
         at_s: now_s() - 120,
     };
     save(&fresh.opts, &key(TAB), &st);
-    let t0 = std::time::Instant::now();
     assert_eq!(fresh.visit(daemon_current()).step, "wait:exit-not-taken");
-    assert!(t0.elapsed() < EXIT_WAIT);
     assert_eq!(
         fresh.left.lock().expect("left").as_deref(),
         Some(CODEX_EXIT)
@@ -2879,10 +3225,8 @@ fn a_current_codex_in_the_tab_ends_a_move_that_failed_after_its_exit() {
 
 // ---------------------------------------------------------------- the one host
 //
-// The Codex branch is taken by the session's own worker at its idle point
-// (the window's host), through the same step and relaunch primitive as a
-// Claude Code restart: the relaunched TUI is handed back to its supervisor,
-// and the daemon a tab's step reaches asks every Codex tab it serves.
+// The window's host takes the Codex branch in the session's worker at its idle point, through
+// the same step and relaunch primitive as a Claude Code restart.
 
 #[test]
 fn the_window_hands_a_relaunched_codex_back_and_carries_it_on_at_its_next_idle_point() {
@@ -2900,8 +3244,8 @@ fn the_window_hands_a_relaunched_codex_back_and_carries_it_on_at_its_next_idle_p
         "the notice, `/exit` and the relaunch line — the carry-on is the loop's: {:#?}",
         rig.typed()
     );
-    // The record stays in flight: what the relaunch primitive's continuation
-    // step ([`super::crate::harness::relaunch::owed`]) finds for the tab.
+    // The record stays in flight: what the relaunch primitive's continuation step
+    // (`relaunch::owed`) finds for the tab.
     let Phase::Relaunched { at_s: moved } = rig.state().phase else {
         panic!("{:?}", rig.state().phase);
     };
@@ -2929,8 +3273,7 @@ fn the_window_hands_a_relaunched_codex_back_and_carries_it_on_at_its_next_idle_p
         typed[3]
     );
     assert_eq!(rig.state().phase, Phase::Done);
-    // The move's instant outlives the phase that carried it: the finished
-    // move's record names it (audit 2026-10-09, `Row::moved_at`).
+    // The move's instant outlives the phase that carried it (`Row::moved_at`).
     assert_eq!(rig.state().relaunched_at, moved, "kept through Done");
     assert_eq!(
         rig.ledger_steps(),
@@ -2945,14 +3288,10 @@ fn the_window_hands_a_relaunched_codex_back_and_carries_it_on_at_its_next_idle_p
     assert!(!rig.asked().iter().any(|l| l.contains("signal")));
 }
 
-/// A relaunched Codex the restart found is yours once it is gone, adopted or
-/// not: two paths leave it up in the tab without an adoption stamp (an adopt
-/// whose [`ADOPT_WAIT`] ran out, `wait:resume`, and a carry-on that found a
-/// person at the keys, `wait:held`). The TUI the relaunch brought up is on
-/// the record ([`St::resumed_pid`]) from the look that finds it, and once it
-/// is gone a Codex leaving the tab is that TUI's own exit, not the restart's.
-/// (`NEW` is the rig's: no process of the real kernel's, so gone to
-/// `relaunch::restarted`, which reads the real one.)
+/// A relaunched Codex the restart found is yours once it is gone, adopted or not: an adopt
+/// whose [`ADOPT_WAIT`] ran out (`wait:resume`) and a carry-on that met a person at the keys
+/// (`wait:held`) leave it up unadopted, but it is on the record ([`St::relaunched_pid`]) from
+/// the look that finds it. (`NEW` is no real process, so gone to `relaunch::restarted`.)
 #[test]
 fn a_relaunched_codex_the_restart_found_is_yours_once_gone_adopted_or_not() {
     let mut rig = embedded_ready("emb-found", |_| {});
@@ -2969,7 +3308,7 @@ fn a_relaunched_codex_the_restart_found_is_yours_once_gone_adopted_or_not() {
     };
     // Asked about the TUI that left: the one its `/exit` was typed into.
     assert_eq!(rig.state().pid, TUI);
-    let restarted = || super::super::super::relaunch::restarted(&tab, true, Some(TUI));
+    let restarted = || super::super::super::relaunch::restarted(&tab, Agent::Codex, Some(TUI));
     // The record an adopt whose ADOPT_WAIT ran out leaves: the new TUI found
     // and up, and never stamped as adopted.
     let mut st = rig.state();
@@ -3000,10 +3339,8 @@ fn a_relaunched_codex_the_restart_found_is_yours_once_gone_adopted_or_not() {
         "found, never adopted"
     );
     assert!(!restarted(), "the person's `/exit` is theirs");
-    // Found by a visit: a relaunched TUI no earlier look recorded (the
-    // relaunch's own wait ran out before it came up) is on the record from
-    // the visit that finds it leading the tab, held at the keys as here, or
-    // its adoption out of time.
+    // Found by a visit: a relaunched TUI no earlier look recorded is on the record from the
+    // visit that finds it leading the tab.
     let mut st = rig.state();
     st.relaunched_pid = 0;
     save(&rig.opts, &key(TAB), &st);
@@ -3021,12 +3358,10 @@ fn a_relaunched_codex_the_restart_found_is_yours_once_gone_adopted_or_not() {
         "found by the visit, never adopted"
     );
     assert!(!restarted(), "the person's `/exit` is theirs");
-    // A carry of the old TUI's exit made after it finds the restart LANDED:
-    // closed as the relaunch on exit closes it, no hand held on the tab for
-    // a TUI that is gone, and never `refused:no-restart-in-flight`, which the
-    // host says as a restart that cannot land.
+    // A carry of the old TUI's exit made after that finds the restart landed: closed as the
+    // relaunch on exit closes it, never `refused:no-restart-in-flight`.
     assert_eq!(
-        super::super::super::relaunch::carry_restart(&tab, true, Some(TUI)).step,
+        super::super::super::relaunch::carry_restart(&tab, Agent::Codex, Some(TUI)).step,
         "landed",
         "no hand held on the tab for a TUI that is gone"
     );
@@ -3034,10 +3369,8 @@ fn a_relaunched_codex_the_restart_found_is_yours_once_gone_adopted_or_not() {
         rig.state().phase,
         Phase::Failed("exited-before-continuing".to_string())
     );
-    // Gone by its own orderly exit before its continuation: the relaunched
-    // TUI's own exit closes the upgrade's record as one overtaken — never the
-    // upgrade's failure after ITS exit, "The upgrade ended it and aterm could
-    // not start it again" marked and notified for a day.
+    // Gone by its own orderly exit before its continuation: the relaunched TUI's exit closes
+    // the upgrade's record as overtaken, never as the upgrade's failure after its exit.
     use crate::harness::relaunch::{ExitCause, ExitRecord};
     rig.kernel.relaunched.store(false, Ordering::SeqCst);
     let gone = crate::harness::relaunch::Snapshot {
@@ -3113,14 +3446,11 @@ fn a_daemon_reached_from_one_tabs_step_asks_every_codex_tab_it_serves() {
     assert!(!ran);
 }
 
-/// A Codex daemon behind the managed Codex, or on it with the vendor's
-/// updater armed, makes its tab due: the latter for the pin alone, and at
-/// most once every PIN_LOOK_S (an armed updater can restart the daemon
-/// mid-turn). The look the pin takes is stamped by the daemon step when it
-/// does not pin (a goal keeps a thread running: `wait:pin:busy-thread`), so
-/// a goal that never pauses is asked about once an hour, not at every turn
-/// end. Negative controls: pinned on the managed build, ahead of it, or no
-/// daemon at all: nothing to move or pin.
+/// A Codex daemon behind the managed Codex, or on it with the vendor's updater armed, makes its
+/// tab due: the latter for the pin alone, at most once every PIN_LOOK_S. The daemon step stamps
+/// a pin look that did not pin (`wait:pin:busy-thread`), so a goal that never pauses is asked
+/// about hourly, not at every turn end. Negative controls: pinned on the managed build, ahead
+/// of it, or no daemon: nothing owed.
 #[test]
 fn a_codex_daemon_behind_or_on_the_vendors_updater_is_due_and_the_pin_alone_boundedly() {
     let (dir, opts, k, target) = daemon_home("due", IDLE_LAST, 600);
@@ -3271,12 +3601,9 @@ fn upgrade_drive_owns_turn_ends(step: &str) -> bool {
 
 #[test]
 fn a_background_terminals_break_takes_the_notice_and_ends_nothing() {
-    // An embedded session whose finished turn left a background terminal (its
-    // status line under the turn's end, so its loop reads the turn running)
-    // is told of its upgrade at that break, the notice alone; its READY
-    // answer waits for an idle point, where the `/exit` still waits out the
-    // terminal. A daemon-mode client, which gets no notice, types nothing
-    // there.
+    // An embedded session whose finished turn left a background terminal is told of its
+    // upgrade at that break, the notice alone; its READY answer waits for an idle point, where
+    // the `/exit` still waits out the terminal. A daemon-mode client types nothing there.
     let with_terminal = |w: &mut World| {
         w.before = screen_json(
             &[
@@ -3373,10 +3700,8 @@ fn at_a_break_a_daemon_mode_client_waits_background_and_its_daemon_is_only_read(
 
 // ---------------------------------------------------------------- the ladder, driven
 //
-// These drive the real visit across two looks (its own reads of the screen,
-// the status line, the person's stamp, the kernel and the daemon), with the
-// clock between the looks moved by rewinding the state the first look saved
-// (the still run, the screen's `seq`), as a later look finds it.
+// These drive the real visit across two looks, the clock between them moved by rewinding the
+// state the first look saved (the still run, the screen's `seq`).
 
 /// A kernel that is the tab's ([`Script`]) for the TUI, its shell and its
 /// relaunch, and the daemon's ([`DaemonScript`]) for the daemon — the one a
@@ -3575,12 +3900,9 @@ fn behind(rig: &Rig, behind_s: u64, last_seq: u64, seq_since_s: u64) {
     );
 }
 
-/// The ladder, driven: the real visit of a daemon-mode Codex across two
-/// looks. A repaint at Settled moves: the screen's own quiet restarted at each
-/// look (its `seq` moved) while its words stood still 20 s, so the Settled
-/// rung takes the reader's run of looks and the second look types the
-/// `/exit`. Negative control: the same two looks at the Prefer rung wait
-/// `settling` and type nothing.
+/// The ladder, driven: a repaint at Settled moves (the screen's `seq` moved at each look while
+/// its words stood still 20 s, so the Settled rung takes the reader's run of looks). Negative
+/// control: the same two looks at the Prefer rung wait `settling` and type nothing.
 #[test]
 fn the_real_visit_moves_at_settled_on_a_repaint_and_waits_at_prefer() {
     for (behind_s, moves) in [(upgrade::RUNG_SETTLED_S + 60, true), (600, false)] {
@@ -3603,11 +3925,9 @@ fn the_real_visit_moves_at_settled_on_a_repaint_and_waits_at_prefer() {
     }
 }
 
-/// The ladder, driven: a person near the tab at KeysOnly moves (their input a
-/// minute old, within `human_grace_s`, not within KEYS_GAP_S). The first look,
-/// at Settled, waits for them (`attended`, said once as
-/// `held-back:attended`); the same person an hour behind no longer holds it,
-/// and the next look types the `/exit`.
+/// The ladder, driven: a person near the tab (input a minute old, within `human_grace_s`, not
+/// KEYS_GAP_S) holds it at Settled (`held-back:attended`) but not at KeysOnly, where the next
+/// look types the `/exit`.
 #[test]
 fn the_real_visit_lets_a_person_near_the_tab_go_by_at_keys_only() {
     let rig = Rig::new("ladder-near", T1, false, attended);
@@ -3637,18 +3957,13 @@ fn the_real_visit_waits_a_keystroke_out_at_land() {
     assert_eq!(rig.visit(daemon_current()).step, "done");
 }
 
-/// Another Codex session's turn holds an idle client only until its screen
-/// places it there. Two daemon-mode tabs on one daemon, this one idle at its
-/// placeholder, the other's conversation's root running a turn: the kernel
-/// cannot say which conversation is this client's (two roots, two clients),
-/// so the first look waits `daemon-busy`, worded as a turn that may be this
-/// tab's own (a subagent) or another session's, never as a goal to pause
-/// here; a look 20 s (`QUIET_S`) later, the other root still running,
-/// another Codex attached and this screen's words unchanged, places it in the
-/// other session and types the `/exit`. Negative controls: a thread that
-/// began running only at the second look is not placed (a goal's next turn
-/// streams nothing at first); with this tab's thread the daemon's only one,
-/// running, the kernel names it this tab's own (`daemon-turn`).
+/// Another Codex session's turn holds an idle client only until its screen places it there.
+/// With two roots and two clients the kernel cannot say which is this client's, so the first
+/// look waits `daemon-busy` (worded as a subagent's or another session's turn, never a goal's);
+/// a look `QUIET_S` later, the other root still running and this screen unchanged, places it in
+/// the other session and types the `/exit`. Negative controls: a thread found running only at
+/// the second look is not placed yet; this tab's thread the daemon's only one, running, is this
+/// tab's own (`daemon-turn`).
 #[test]
 fn another_sessions_turn_holds_an_idle_client_only_until_its_screen_places_it() {
     const TUI2: u32 = 4_000_009;
@@ -3770,15 +4085,11 @@ fn another_sessions_turn_holds_an_idle_client_only_until_its_screen_places_it() 
     ]);
 }
 
-/// A goal on this screen places nothing: the same two daemon-mode tabs as
-/// [`another_sessions_turn_holds_an_idle_client_only_until_its_screen_places_it`],
-/// the other's thread running, but this tab's footer says `Pursuing goal
-/// (…)`, so this client's own goal turn may be running where its screen reads
-/// idle, and a thread that runs through the still run may be its own. Look
-/// after look the real visit waits `daemon-busy`, keeps no record of the
-/// run's threads, and types nothing. Negative control: the same looks with no
-/// goal in the footer place the other session's turn at the second look and
-/// move.
+/// A goal on this screen places nothing: as in
+/// [`another_sessions_turn_holds_an_idle_client_only_until_its_screen_places_it`], but this
+/// tab's footer says `Pursuing goal (…)`, so a thread running through the still run may be its
+/// own goal turn. Look after look the visit waits `daemon-busy`, keeps no record of the run's
+/// threads, and types nothing. Negative control: with no goal the second look places the turn.
 #[test]
 fn a_goal_on_this_screen_places_no_other_sessions_turn() {
     const TUI2: u32 = 4_000_009;
@@ -3864,16 +4175,11 @@ fn three_looks(
     steps
 }
 
-/// One conversation on the daemon (the root this tab's TUI resumed and three
-/// subagents it spawned, each rollout opening on its `session_meta`), this
-/// TUI the daemon's only client. The pass reads each thread's spawn tree and
-/// the kernel names the conversation, so a subagent's turn is this tab's
-/// own: running while the root idles, the real visit waits `daemon-turn` at
-/// every look 20 s apart (`goal` under a goal's footer) and types nothing;
-/// the root running while the subagents idle, the same. All idle, it moves,
-/// and where the tab's shell integration marks do not reach aterm
-/// (`integration=degraded`) the kernel names the conversation's root,
-/// recorded before the `/exit` and resumed.
+/// One conversation on the daemon (the root this TUI resumed and three subagents it spawned),
+/// this TUI the daemon's only client: the kernel names the conversation, so any of its turns is
+/// this tab's own and the visit waits `daemon-turn` (`goal` under a goal's footer) at every
+/// look, typing nothing. All idle, it moves; where shell integration marks do not reach aterm
+/// the kernel names the root, recorded before the `/exit` and resumed.
 #[test]
 fn the_tabs_own_subagents_hold_it_and_the_kernel_names_their_root() {
     let degraded = |w: &mut World| {
@@ -3975,16 +4281,11 @@ fn the_tabs_own_subagents_hold_it_and_the_kernel_names_their_root() {
     );
 }
 
-/// An idle conversation behind a line longer than the tail: a turn ended,
-/// then one very large `item_completed` line (a command that finished after
-/// it) and settings rows. In the one-conversation shape and on a daemon
-/// holding the one thread, the pass reads the root's turn back past that
-/// line: idle, and the tab moves at the first look, the root resumed.
-/// Controls, each waiting `daemon-turn` with nothing typed: a turn started
-/// before the same line (busy), a line whose output quotes a turn's end after
-/// a turn started (text, never an event), and a turn's end further back than
-/// the reader looks ([`TURN_BACK_BYTES`]: Unknown, counted running, fail
-/// closed).
+/// An idle conversation behind a line longer than the tail (a turn ended, then one very large
+/// `item_completed` line): the pass reads the root's turn back past it, idle, and the tab moves
+/// at the first look. Controls, each waiting `daemon-turn`: a turn started before the line, a
+/// line whose output quotes a turn's end (text, never an event), and a turn's end further back
+/// than [`TURN_BACK_BYTES`] (Unknown, counted running).
 #[test]
 fn an_idle_conversation_behind_a_line_longer_than_the_tail_moves() {
     const STARTED: &str = r#"{"timestamp":"2026-09-27T20:30:00.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"t9"}}"#;
@@ -4061,17 +4362,11 @@ fn an_idle_conversation_behind_a_line_longer_than_the_tail_moves() {
     super::super::tests::side_by_side(cases);
 }
 
-/// Negative controls for the one-conversation shape: where the kernel names
-/// no conversation, what the lane can never place holds the tab for as long
-/// as it runs, look after look, and nothing is typed: two roots and two TUIs
-/// with a running subagent of the other conversation (its root idle) or of
-/// this tab's own (another conversation idle beside it), since a subagent is
-/// never placed; and a second root running with this TUI the daemon's only
-/// client (a thread no tab shows, or this tab's own while its screen shows
-/// another thread), not provably another session's. Each waits
-/// `daemon-busy`, worded without presuming whose turn it is. With the marks
-/// gone, two roots name nothing: the `/exit` waits `no-shell-integration`
-/// even when every thread idles.
+/// Negative controls for the one-conversation shape: where the kernel names no conversation,
+/// what the lane can never place holds the tab look after look (`daemon-busy`, nothing typed):
+/// a running subagent, of the other conversation or of this tab's own (a subagent is never
+/// placed), and a second root running with this TUI the daemon's only client. With the marks
+/// gone, two roots name nothing: the `/exit` waits `no-shell-integration` even when all idle.
 #[test]
 fn what_the_lane_never_places_holds_the_tab_where_the_kernel_names_nothing() {
     const TUI2: u32 = 4_000_009;
@@ -4151,14 +4446,10 @@ fn what_the_lane_never_places_holds_the_tab_where_the_kernel_names_nothing() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A turn begun since the sweep read the daemon holds the `/exit`: the gate
-/// passed on the daemon as the pass read it (this tab's thread, the daemon's
-/// only one, idle), and between that read and the `/exit` the thread began a
-/// turn (a goal's next one begins within milliseconds of the last one's
-/// end). The `/exit`'s last look reads the daemon again, finds this tab's own
-/// thread running, and waits `changed`, typing nothing; so does a daemon it
-/// can no longer read. Negative control: nothing begun since, and the same
-/// visit moves.
+/// A turn begun since the sweep read the daemon holds the `/exit`: its last look reads the
+/// daemon again, finds this tab's thread running (a goal's next turn begins within milliseconds
+/// of the last) or the daemon unreadable, and waits `changed`, typing nothing. Negative
+/// control: nothing begun since, and the visit moves.
 #[test]
 fn a_turn_begun_since_the_sweeps_read_holds_the_exit() {
     for case in ["idle", "began", "gone"] {
@@ -4196,16 +4487,11 @@ fn a_turn_begun_since_the_sweeps_read_holds_the_exit() {
     }
 }
 
-/// No shell integration, and the kernel names the thread
-/// (`integration=degraded`, no blocks): the rows a daemon-mode client prints
-/// as it leaves cannot be told from the prompt after them, but its daemon
-/// holds one thread and this TUI is its one client, so that thread is this
-/// TUI's, recorded before the `/exit` (its ledger row says so) and resumed.
-/// Negative controls: a second thread on the daemon, or a second Codex
-/// attached to it: the `/exit` waits `no-shell-integration`, typing nothing,
-/// and the wait is a blocker whose clock stands through the other waits a
-/// later look finds (a goal's `daemon-turn`), until a look finds the marks
-/// back.
+/// No shell integration (`integration=degraded`, no blocks), and the kernel names the thread:
+/// its daemon holds one thread and this TUI is its one client, so that thread is recorded
+/// before the `/exit` (its ledger row says so) and resumed. Negative controls: a second thread
+/// or a second Codex attached: the `/exit` waits `no-shell-integration`, a blocker whose clock
+/// stands through other waits until a look finds the marks back.
 #[test]
 fn without_shell_integration_the_kernel_names_the_thread_or_the_exit_waits() {
     let no_marks = |w: &mut World| {
@@ -4343,7 +4629,7 @@ fn an_unreadable_screen_is_recorded_and_blocks_after_half_an_hour() {
 #[path = "upgrade_goal_drive_tests.rs"]
 mod goal;
 
-// Codex's usage wall and the reset it names (design record C9's Codex half).
+// Codex's usage wall and the reset it names.
 #[path = "upgrade_codex_limit_tests.rs"]
 mod limit_wall;
 
@@ -4364,6 +4650,7 @@ fn crashed_snap(
     embedded: bool,
 ) -> crate::harness::relaunch::Snapshot {
     crate::harness::relaunch::Snapshot {
+        stored_login: false,
         tab: TAB.to_string(),
         pid: TUI,
         start: "Sat Sep 27 14:19:56 2026".to_string(),
@@ -4375,6 +4662,7 @@ fn crashed_snap(
         version: Some("0.157.0".to_string()),
         codex: Some(crate::harness::relaunch::CodexRun {
             home: rig.tui.home.clone(),
+            home_env: rig.tui.home_env.clone(),
             embedded,
             started_ms: 0,
             ambiguous: false,
@@ -4399,11 +4687,9 @@ fn after_crash(w: &mut World, exit: i64) {
     w.blocks1 = b1;
 }
 
-/// A restart whose resume line was never typed, overtaken by a Codex a
-/// person started by hand in its tab: that process's exit closes it as
-/// resumed elsewhere, never as aterm's relaunch quitting (Claude Code's rule
-/// too). NEGATIVE CONTROL: a record of the same phase relaunched closes as
-/// the relaunched Codex exiting.
+/// A restart whose resume line was never typed, overtaken by a Codex a person started by hand
+/// in its tab: that process's exit closes it as resumed elsewhere, never as aterm's relaunch
+/// quitting. Negative control: a relaunched record closes as the relaunched Codex exiting.
 #[test]
 fn a_hand_resumed_codex_closes_a_restart_as_resumed_elsewhere() {
     use crate::harness::relaunch::{ExitCause, ExitRecord};
@@ -4441,16 +4727,11 @@ fn a_hand_resumed_codex_closes_a_restart_as_resumed_elsewhere() {
     }
 }
 
-/// THE EXPLICIT RESTART IS OFFERED ONLY WHERE THIS LANE BRINGS BACK WHAT IT
-/// ENDS ([`crate::harness::relaunch::carries_restart`]; review of
-/// `fix/restart-advice`, 2026-10-08): a daemon client whose thread the
-/// snapshot could not name — none begun, its daemon unreadable, or another
-/// client in its directory (`ambiguous`) — is read again at exit, and a read
-/// that fails refuses its relaunch with nothing typed, leaving the Codex the
-/// act ended at its shell. The predicate answers `false` for both, so the act
-/// refuses it (`not-relaunchable`) and no word names it. A thread named — the
-/// `exit-stall` case of `a_crashed_codex_is_relaunched_on_its_thread_and_told_why`,
-/// relaunched on it — or held answers `true`.
+/// The explicit restart is offered only where this lane brings back what it ends
+/// ([`crate::harness::relaunch::carries_restart`]): a daemon client whose thread the snapshot
+/// could not name (none begun, its daemon unreadable, or `ambiguous`) is read again at exit,
+/// and a failed read refuses its relaunch with nothing typed, so the predicate answers `false`
+/// and the act refuses it (`not-relaunchable`). A thread named or held answers `true`.
 #[test]
 fn the_restart_is_carried_only_for_a_codex_whose_thread_is_settled() {
     use crate::harness::relaunch::{ExitCause, ExitRecord, carries_restart};
@@ -4483,19 +4764,13 @@ fn the_restart_is_carried_only_for_a_codex_whose_thread_is_settled() {
     assert!(carries_restart(&crashed_snap(&rig, None, true)), "held");
 }
 
-/// …AND ONLY WHERE THE LANE'S PLAN WOULD WRITE ITS LINE
-/// ([`crate::harness::relaunch::carries_restart`]; review of 0ce4678a5,
-/// 2026-10-09). A Codex whose thread was settled but which was launched with
-/// a flag its resume cannot carry (`--worktree`, `--remote`) or that the
-/// rewrite does not know, with a kept flag no line can hold (a control
-/// character), or in a shell no line is written for (`sh`, tcsh) was offered
-/// the restart and carried it: the act's signals ended it, and its relaunch
-/// refused (`failed:argv:…`, `failed:line:…`) or waited for ever
-/// (`wait:shell-dialect`), nothing typed. Each snapshot — the run's own
-/// ([`snapshot`]), its shell's dialect read as the plan reads it — now
-/// answers `false`, paired with the lane's word on that exit. CONTROL: the
-/// same Codex launched plain in a zsh tab is carried, and its exit relaunched
-/// on its thread.
+/// …and only where the lane's plan would write its line
+/// ([`crate::harness::relaunch::carries_restart`]): a Codex launched with a flag its resume
+/// cannot carry (`--worktree`, `--remote`) or the rewrite does not know, with a kept flag no
+/// line can hold (a control character), or in a shell no line is written for (`sh`, tcsh)
+/// answers `false`, paired with the lane's word on that exit (`failed:argv:…`,
+/// `failed:line:…`, `wait:shell-dialect`), nothing typed. Control: the same Codex launched
+/// plain in a zsh tab is carried and relaunched on its thread.
 #[test]
 fn the_restart_is_carried_only_where_the_codex_lanes_plan_writes_its_line() {
     use crate::harness::relaunch::{ExitCause, ExitRecord, carries_restart};
@@ -4544,7 +4819,7 @@ fn the_restart_is_carried_only_where_the_codex_lanes_plan_writes_its_line() {
         ),
         ("sh", true, "/bin/sh", &[], None, "wait:shell-dialect"),
         ("tcsh", true, "/bin/tcsh", &[], None, "wait:shell-dialect"),
-        // CONTROL.
+        // Control.
         (
             "plain",
             true,
@@ -4622,21 +4897,172 @@ fn the_restart_is_carried_only_where_the_codex_lanes_plan_writes_its_line() {
     );
 }
 
-/// A crashed embedded Codex (SIGKILL: `exit 137`, its thread's lock left
-/// behind) is relaunched on the thread it held (`<build> resume <thread>`,
-/// the build it ran with `[harness] upgrade` off) and, its new TUI holding
-/// the thread again, told why (the relaunch's carry-on, not the upgrade's).
-/// Negative controls: the same exit read as its own (`exit 0`, a `/exit`) or
-/// someone's signal, and an exit no word came for, are left alone with
-/// nothing typed, unless the stall's remedy ended it (U1), or aterm itself
-/// ended while it ran and the next launch reopened its tab (its hangup read
-/// as its own orderly exit, which it was not).
+/// …AND UNDER THE `CODEX_HOME` IT WAS STARTED WITH: launched `CODEX_HOME=<dir> codex`, the
+/// run's snapshot reads the variable off the process's own exec environment, verbatim
+/// ([`crate::harness::relaunch::CodexRun::home_env`]), beside the canonical home it finds the
+/// thread under; the restart is carried, and its relaunch line resumes the thread under it. The
+/// variable is REQUIRED: a value no line can hold (a control character) refuses the relaunch
+/// (`failed:line:…`) with nothing typed, and the restart is not carried — never a line typed
+/// without it, which would resume under `~/.codex`. NEGATIVE CONTROL: a Codex launched with no
+/// `CODEX_HOME`, under the same directory, is relaunched with none.
+#[test]
+fn a_codex_started_under_a_codex_home_is_relaunched_on_exit_under_it() {
+    use crate::harness::relaunch::{ExitCause, ExitRecord, carries_restart};
+    super::super::tests::side_by_side(
+        ["set", "unset", "control"]
+            .into_iter()
+            .map(|case| {
+                Box::new(move || {
+                    let mut rig = Rig::new(&format!("home-exit-{case}"), T2, true, |w| {
+                        after_crash(w, 143);
+                    });
+                    rig.kernel.exe = Some(rig.target.exe.clone());
+                    let alias = rig.dir.join("my codex");
+                    std::os::unix::fs::symlink(&rig.tui.home, &alias).expect("link");
+                    let value = alias.to_string_lossy().into_owned();
+                    let env = match case {
+                        "set" => vec![format!("CODEX_HOME={value}")],
+                        // Read under `$HOME/.codex`: the rig's home, the same directory.
+                        _ => vec![format!("HOME={}", rig.opts.home.display())],
+                    };
+                    let args = atpkg::caller_shell::ProcArgs {
+                        exec_path: rig.tui.argv[0].clone(),
+                        argv: rig.tui.argv.clone(),
+                        env,
+                    };
+                    let mut snap = snapshot(
+                        &rig.opts,
+                        TAB,
+                        TUI,
+                        "Sat Sep 27 14:19:56 2026".to_string(),
+                        SHELL,
+                        &args,
+                        &rig.kernel,
+                    )
+                    .expect("the run's snapshot");
+                    snap.version = Some("0.157.0".to_string());
+                    assert_eq!(
+                        snap.session.as_deref(),
+                        Some(T2),
+                        "{case}: its lock's thread"
+                    );
+                    let run = snap.codex.as_mut().expect("a Codex run");
+                    assert_eq!(run.home, rig.tui.home, "{case}: the canonical home");
+                    match case {
+                        "set" => assert_eq!(run.home_env.as_deref(), Some(value.as_str())),
+                        "unset" => assert_eq!(run.home_env, None),
+                        _ => run.home_env = Some(format!("{value}\u{7}")),
+                    }
+                    let want = if case == "control" {
+                        "failed:line:a control character in the line"
+                    } else {
+                        "continued"
+                    };
+                    assert_eq!(carries_restart(&snap), want == "continued", "{case}");
+                    rig.kernel.exited.store(true, Ordering::SeqCst);
+                    let r = after_exit(
+                        &rig.opts,
+                        &snap,
+                        &ExitRecord::Removed,
+                        false,
+                        ExitCause::Asked,
+                        &rig.kernel,
+                    );
+                    assert_eq!(r.step, want, "{case}: {r:?}");
+                    let typed = rig.typed();
+                    let resume = format!("'{}' 'resume' '{T2}'", rig.target.exe.display());
+                    match case {
+                        "set" => {
+                            let word =
+                                format!("CODEX_HOME={} ", upgrade::quote(Dialect::Zsh, &value));
+                            assert!(typed[0].contains(&format!("{word}{resume}")), "{typed:#?}");
+                        }
+                        "unset" => {
+                            assert!(typed[0].contains(&resume), "{typed:#?}");
+                            assert!(!typed[0].contains("CODEX_HOME"), "{typed:#?}");
+                        }
+                        _ => assert!(typed.is_empty(), "nothing typed: {typed:#?}"),
+                    }
+                }) as Box<dyn FnOnce() + Send>
+            })
+            .collect(),
+    );
+}
+
+#[test]
+fn a_self_claimed_crash_relaunch_keeps_the_captured_home_environment() {
+    use crate::harness::self_claimed::{Live as ClaimedLive, Record, validate};
+
+    for case in ["unset", "path", "empty"] {
+        let mut rig = Rig::new(&format!("self-claim-home-{case}"), T2, true, |w| {
+            after_crash(w, 137);
+        });
+        let captured = match case {
+            "unset" => None,
+            "empty" => Some(String::new()),
+            _ => Some(rig.tui.home.to_string_lossy().into_owned()),
+        };
+        rig.tui.home_env.clone_from(&captured);
+        let snap = crashed_snap(&rig, Some(T2), true);
+        let launch = snap.program.to_string_lossy().into_owned();
+        let record = Record {
+            pid: TUI,
+            session_id: Some(T2.to_string()),
+            resume_argv: Some(vec![launch.clone(), "resume".to_string(), T2.to_string()]),
+            env: captured
+                .iter()
+                .map(|s| ("CODEX_HOME".to_string(), s.clone()))
+                .collect(),
+            status: Some("busy".to_string()),
+            exit: None,
+            cwd: Some(snap.cwd.clone()),
+        };
+        let live = ClaimedLive {
+            exec_path: launch,
+            argv: snap.argv.clone(),
+            codex_home: captured.clone(),
+            cwd: Some(PathBuf::from(&snap.cwd)),
+            ..ClaimedLive::default()
+        };
+        let resume = validate(&record, TUI, &live).expect("the captured line validates");
+        assert_eq!(resume.codex_home, captured);
+        rig.kernel.exited.store(true, Ordering::SeqCst);
+        let result =
+            self_claimed_after_exit(&rig.opts, &snap, &resume, ExitCause::Exit, &rig.kernel);
+        assert_eq!(result.step, "continued", "{case}: {result:?}");
+        assert_eq!(
+            rig.state().codex_home_env,
+            captured,
+            "{case}: persisted environment"
+        );
+        let typed = rig.typed();
+        let line = typed
+            .first()
+            .expect("the fake instance received a relaunch");
+        match captured {
+            Some(value) => assert!(
+                line.contains(&format!("CODEX_HOME={value} "))
+                    || line.contains(&format!(
+                        "CODEX_HOME={} ",
+                        upgrade::quote(Dialect::Zsh, &value)
+                    )),
+                "{case}: {typed:#?}"
+            ),
+            None => assert!(!line.contains("CODEX_HOME"), "{typed:#?}"),
+        }
+    }
+}
+
+/// A crashed embedded Codex (SIGKILL: `exit 137`, its thread's lock left behind) is relaunched
+/// on the thread it held, on the build it ran with `[harness] upgrade` off, and told why (the
+/// relaunch's carry-on, not the upgrade's). Negative controls: its own exit (`exit 0`) or
+/// someone's signal, and an exit no word came for, are left alone with nothing typed, unless
+/// the stall's remedy ended it or aterm itself ended while it ran.
 #[test]
 fn a_crashed_codex_is_relaunched_on_its_thread_and_told_why() {
     use crate::harness::relaunch::{ExitCause, ExitRecord};
-    // Six cases, each a rig of its own whose relaunches each wait out the
-    // shell's prompt (600 ms) and the new TUI's first idle: side by side
-    // (4.3 s one after another, measured 2026-10-05).
+    // Six cases, each a rig whose relaunches wait out the shell's prompt and the new TUI's
+    // first idle: side by side.
     super::super::tests::side_by_side(vec![
         Box::new(|| {
             let rig = Rig::new("exit-crash", T2, true, |w| after_crash(w, 137));
@@ -4728,11 +5154,9 @@ fn a_crashed_codex_is_relaunched_on_its_thread_and_told_why() {
             assert_eq!(rig.state().cause, crate::harness::relaunch::CAUSE_HOST);
         }),
         Box::new(|| {
-            // The crash tried again once the TUI its relaunch brought up and handed
-            // back is gone before its continuation: closed and relaunched afresh — carried
-            // on, the try waited 90 s on a dead TUI, the harness's hand on the tab,
-            // until the record went stale. NEGATIVE CONTROL: while that TUI lives, a
-            // try finds it again and types nothing.
+            // The crash tried again once the TUI its relaunch brought up and handed back is
+            // gone before its continuation: closed and relaunched afresh. Negative control:
+            // while that TUI lives, a try finds it again and types nothing.
             let mut rig = Rig::new("exit-landed-gone", T2, true, |w| after_crash(w, 137));
             rig.opts.hand_back = true;
             rig.kernel.exited.store(true, Ordering::SeqCst);
@@ -4763,13 +5187,10 @@ fn a_crashed_codex_is_relaunched_on_its_thread_and_told_why() {
             );
         }),
         Box::new(|| {
-            // The same crash with its word read only at the first attempt (`Unread`
-            // at the exit: a park held the parser, or the prompt came back late): the
-            // retry decides on
-            // what that attempt read, the record its relaunch filed naming this TUI.
-            // By then the tab's newest finished block is the relaunched TUI's own,
-            // and read again the crash was dropped `exit-unwitnessed`, nothing typed
-            // and nothing said.
+            // The same crash with its word read only at the first attempt (`Unread` at the
+            // exit: a park held the parser, or the prompt came back late): the retry decides
+            // on what that attempt read, since by then the tab's newest finished block is the
+            // relaunched TUI's own.
             let mut rig = Rig::new("exit-late-landed", T2, true, |w| after_crash(w, 137));
             rig.opts.hand_back = true;
             rig.kernel.exited.store(true, Ordering::SeqCst);
@@ -4806,23 +5227,16 @@ fn a_crashed_codex_is_relaunched_on_its_thread_and_told_why() {
     ]);
 }
 
-/// TIER-1 of `HarnessCodexExitWitness` (aterm-spec
-/// `harness_codex_exit_witness_model`): EVERY look of the model — a crash
-/// (`exit 137`), its own `/exit` (`exit 0`, its thread lock removed) or
-/// someone's signal (`exit 143`, the lock left, as measured), with the
-/// shell's word drawn or not yet, or drawn and another command's block
-/// newest since — replayed through the REAL `look_at_exit` and
-/// `exit_record` over a stand-in tab (the lock on disk and the blocks drawn
-/// as the model has them): the look keeps what the model's does (a crash,
-/// no crash, or no word within its wait). And EVERY attempt — what the look
-/// kept, the tab as it stands then — through the REAL `after_exit`, which
-/// relaunches (`continued`) exactly where the model's `Decide` does: a word
-/// that came after the look is read then, never another command's. NEGATIVE CONTROLS: where the
-/// `Buggy = 1` model reads the lock (`LookAtLock` relaunches someone's
-/// signal) or reads silence as a graceful exit (`LookAsClaude` leaves a
-/// crash), the real look reads no word at all; where it decides on the look
-/// alone (`DecideOnLook`) or on the newest block
-/// (`DecideOnNewest`), the real attempt decides otherwise.
+/// Tier-1 of `HarnessCodexExitWitness` (aterm-spec `harness_codex_exit_witness_model`): every
+/// look of the model (a crash `exit 137`, its own `/exit` `exit 0` with its lock removed, or
+/// someone's signal `exit 143` with the lock left; the shell's word drawn, not yet, or drawn
+/// with another command's block newest since) is replayed through the real `look_at_exit` and
+/// `exit_record` over a stand-in tab and keeps what the model's does; every attempt goes
+/// through the real `after_exit`, which relaunches exactly where the model's `Decide` does.
+/// Negative controls: where the `Buggy = 1` model reads the lock (`LookAtLock`) or reads
+/// silence as a graceful exit (`LookAsClaude`), the real look reads no word; where it decides
+/// on the look alone (`DecideOnLook`) or on the newest block (`DecideOnNewest`), the real
+/// attempt decides otherwise.
 #[test]
 fn tier1_the_real_codex_exit_read_conforms_to_the_model() {
     use crate::harness::relaunch::{ExitCause, ExitRecord, exit_record};
@@ -4994,14 +5408,11 @@ fn the_codex_exit_is_read_off_its_command_block() {
     }
 }
 
-/// A daemon-mode client that named no thread is resumed on the one thread its
-/// daemon holds that was begun in its directory after it started (UUIDv7
-/// ids). Negative controls: one begun before it started, or elsewhere, is not
-/// it (`Ok(None)`); two that fit are never guessed between; another live
-/// client of the daemon in the same directory makes the one thread that fits
-/// no answer (it may be that client's), as does one whose directory cannot be
-/// read, or clients that cannot be listed; with no daemon to read, nothing is
-/// told.
+/// A daemon-mode client that named no thread is resumed on the one thread its daemon holds that
+/// was begun in its directory after it started (UUIDv7 ids). Negative controls: one begun
+/// before it or elsewhere is not it (`Ok(None)`); two that fit, another live client in the same
+/// directory (or one whose directory cannot be read), or clients that cannot be listed give no
+/// answer; with no daemon, nothing is told.
 #[test]
 fn a_daemon_clients_thread_is_the_one_its_daemon_began_for_it() {
     let (_dir, _opts, mut k, _target) = daemon_home("daemon-thread", IDLE_LAST, 60);
@@ -5095,7 +5506,9 @@ fn prune_opts(dir: &Path) -> Opts {
         aterm_state: None,
         ask: false,
         several_logins: false,
+        usage_tap: None,
         instances: crate::harness::upgrade_drive::Instances::Listed(Vec::new()),
+        agents_off: Vec::new(),
     }
 }
 
@@ -5196,14 +5609,12 @@ fn collection_conforms(
     Ok(())
 }
 
-/// Tier-1: the real `prune`, reading the real registry over records on disk,
-/// bound to the derived `HarnessUpgradeStateCollection`. A closed tab's
-/// settled record goes once it has sat a week (done, failed, or pending with
-/// no word of the owner's), and nothing else does. Negative controls: a live
-/// tab's record (the host's own, and another window's that only the registry
-/// names) and a restart in flight survive, however old; the model's
-/// `PruneLiveTab` member would take the live one; and the Claude-only
-/// `prune_states` is caught keeping a record the model lets go.
+/// Tier-1: the real `prune`, reading the real registry over records on disk, bound to the
+/// derived `HarnessUpgradeStateCollection`. A closed tab's settled record goes once it has sat
+/// a week (done, failed, or pending with no word of the owner's), and nothing else does.
+/// Negative controls: a live tab's record (the host's own, or one only the registry names) and
+/// a restart in flight survive however old; the model's `PruneLiveTab` member would take the
+/// live one; and the Claude-only `prune_states` is caught keeping a record the model lets go.
 #[test]
 #[allow(clippy::too_many_lines)]
 fn the_prune_collects_a_closed_tabs_settled_codex_record_and_nothing_else() {
@@ -5541,16 +5952,11 @@ fn assert_the_wall_reads_limited_and_only_it_does(text: &str, what: &str) {
     }
 }
 
-/// The usage wall of a real Codex is the limit fact ([`upgrade::limited`],
-/// which [`Facts::limited`] is read from): 0.159.2's `■ You’ve hit your usage
-/// limit …` block as the last thing on the screen (after a turn that ran a
-/// command, after a notice typed as a turn, redrawn by `codex resume`) in
-/// every pane. Negative controls: the fresh idle screen; each wall screen
-/// with its block gone; and each wall screen with the block naming a wall
-/// that is no limit (a full context, a busy model), which the same reader
-/// reads as a wall and the limit fact does not. All six screens come from a
-/// loopback 429 and wear the wording that names no reset; the other wording
-/// is [`the_usage_wall_of_an_earlier_codex_reads_limited_with_and_without_a_reset`].
+/// The usage wall of a real Codex is the limit fact ([`upgrade::limited`], read into
+/// [`Facts::limited`]): 0.159.2's `■ You’ve hit your usage limit …` block as the last thing on
+/// the screen, in every pane measured. Negative controls: the idle screen, each wall screen
+/// with its block gone, and each with a wall that is no limit. These screens name no reset; the
+/// other wording is [`the_usage_wall_of_an_earlier_codex_reads_limited_with_and_without_a_reset`].
 #[test]
 fn the_usage_wall_of_a_real_codex_reads_limited_on_every_screen_it_was_measured_on() {
     use aterm_phase::codex::fixtures as fx;
@@ -5561,14 +5967,10 @@ fn the_usage_wall_of_a_real_codex_reads_limited_on_every_screen_it_was_measured_
     assert!(!upgrade::limited(Agent::Codex, &idle), "the idle control");
 }
 
-/// The usage wall reads limited whether or not it names a reset, on two
-/// earlier screens: 0.157.1's real `HIT_LIMIT_NO_RESET` (a loopback 429: `try
-/// again later`), and 0.156.1's `HIT_LIMIT`, hand-built from the binary's
-/// strings (the Pro plan's text, `try again at Sep 25th, 2026 3:05 PM.`,
-/// wrapped to column 0), since no real reset-bearing wall was captured. The
-/// visit-level tests run on the 0.159.2 panes alone; the gate they pin is
-/// this fact, so it must not depend on the reset. The same controls as the
-/// 0.159.2 test.
+/// The usage wall reads limited whether or not it names a reset: 0.157.1's real
+/// `HIT_LIMIT_NO_RESET` (`try again later`) and 0.163.0's measured `HIT_LIMIT` (`try again at
+/// Oct 17th, 2026 1:14 PM.`, the lab's weekly wall). The visit-level tests run on 0.159.2's
+/// panes alone, so this pins that the gate does not depend on the reset.
 #[test]
 fn the_usage_wall_of_an_earlier_codex_reads_limited_with_and_without_a_reset() {
     use aterm_phase::codex::fixtures as fx;
@@ -5578,7 +5980,7 @@ fn the_usage_wall_of_an_earlier_codex_reads_limited_with_and_without_a_reset() {
             "0.157.1, measured, no reset named",
             false,
         ),
-        (fx::HIT_LIMIT, "0.156.1, hand-built, a reset named", true),
+        (fx::HIT_LIMIT, "0.163.0, measured, a reset named", true),
     ] {
         assert_the_wall_reads_limited_and_only_it_does(text, what);
         let rows = aterm_phase::prompt::fixtures::screen(text);
@@ -5619,24 +6021,15 @@ fn quiet_showing(name: &str, screen: String) -> Rig {
     quiet
 }
 
-/// A Codex at its usage wall is never asked or re-asked, and its clocks hold:
-/// what Codex takes typed at the wall is a turn that fails and stays in
-/// history, so a notice per re-ask window would all arrive together, unread,
-/// when the limit resets. The screen ([`Facts::limited`]) keeps them out: a
-/// pending round in every pane types nothing; a round announced hours ago,
-/// on each of its [`upgrade::MAX_ASKS`] asks, waits `limited` (no re-ask, no
-/// give-up, no key), and its re-ask window is restarted at every look, so
-/// the agent gets the whole of it once a turn gets past the wall. The
-/// screen's word has no end here: the `■` block stays the last block until a
-/// turn goes through (a person's, or the supervise loop's continue at the
-/// reset). These screens name no reset and this is the ask flow, so nothing
-/// lifts the wait; the one bound is the quiet upgrade's grace, which lifts a
-/// wall that names its reset an hour after it (class C9 of
-/// `docs/DESIGN-upgrade-never-stuck-2026-09-28.md`; pinned in
-/// `upgrade_codex_limit_tests.rs`). Negative controls: the same rounds on the
-/// wall's own screens with the block gone (the block the only difference)
-/// type the notice, ask again on each ask and give up on the last; and a
-/// fresh screen with no wall.
+/// A Codex at its usage wall is never asked or re-asked, and its clocks hold: Codex records
+/// what is typed at the wall as a failed turn, so notices would pile up unread until the reset.
+/// A pending round in every pane types nothing; a round announced hours ago waits `limited` on
+/// each of its [`upgrade::MAX_ASKS`] asks (no re-ask, no give-up, no key), its re-ask window
+/// restarted at every look. These screens name no reset and this is the ask flow, so nothing
+/// lifts the wait (the quiet upgrade's grace, class C9 of
+/// `docs/DESIGN-upgrade-never-stuck-2026-09-28.md`, is pinned in
+/// `upgrade_codex_limit_tests.rs`). Negative controls: the same rounds with the block gone type
+/// the notice, ask again on each ask and give up on the last; and a fresh screen with no wall.
 #[test]
 fn a_codex_at_its_usage_wall_is_never_asked_or_re_asked_and_its_clocks_hold() {
     for (text, what) in WALL_MID_TURN {
@@ -5731,24 +6124,16 @@ fn a_codex_at_its_usage_wall_is_never_asked_or_re_asked_and_its_clocks_hold() {
     );
 }
 
-/// A Codex at its usage wall is never exited, asked or not: the restart would
-/// drop the vendor's own wait and resume into the wall, so the gate every
-/// restart passes ([`upgrade::gate_restart`], the reducer's `quiet_step`)
-/// waits `limited` first, before READY, the ladder's settle or the owner's
-/// notice. Asked (`upgrade_ask`): a notice typed, its READY answered and
-/// settled, the wall on the screen: no `/exit`, no relaunch, and the READY's
-/// clock restarted at the look. Quiet (the default): the same wall types
-/// nothing at all. This also keeps [`carry_on`] off a wall in practice: a
-/// relaunched Codex replays a wall only where one came up between the last
-/// look and the `/exit`. Negative controls: each lane on the wall's own
-/// screen with the block gone (the block the only difference) moves, the
-/// asked one to `continued`, the quiet one to its `/exit`, as does each on a
-/// fresh screen with no wall.
+/// A Codex at its usage wall is never exited, asked or not: the restart would drop the vendor's
+/// own wait and resume into the wall, so the gate every restart passes
+/// ([`upgrade::gate_restart`]) waits `limited` first. Asked: a READY answered and settled, the
+/// wall on screen: no `/exit`, and the READY's clock restarted at the look. Quiet (the
+/// default): nothing typed at all. Negative controls: each lane with the block gone moves (the
+/// asked one to `continued`, the quiet one to its `/exit`), as does each with no wall.
 #[test]
 fn a_codex_at_its_usage_wall_is_not_exited_whether_it_was_asked_or_not() {
-    // Ten rigs of their own, the moving ones each waiting out a relaunch's
-    // fixed waits (the shell's prompt, the new TUI's first idle): side by
-    // side (3.7 s one after another, measured 2026-10-05).
+    // Ten rigs of their own, the moving ones each waiting out a relaunch's fixed waits: side
+    // by side.
     let mut cases: Vec<Box<dyn FnOnce() + Send>> = Vec::new();
     for (text, what) in WALL_AT_THE_NOTICE {
         // Asked: the notice went out on a clear screen and was answered, hours
@@ -5820,13 +6205,10 @@ fn a_codex_at_its_usage_wall_is_not_exited_whether_it_was_asked_or_not() {
     super::super::tests::side_by_side(cases);
 }
 
-/// A CRASHED CODEX IS RELAUNCHED ON ITS OWN PROGRAM WHILE THE OWNER'S WORD
-/// HOLDS THE MANAGED BUILD (the Codex half): a `Skip` of
-/// that build, or a `Not today` standing, kept the visit off it but not the
-/// relaunch on exit, which moved the crashed Codex straight onto it.
-/// NEGATIVE CONTROLS: no word, a deferral run out, a skip of another build
-/// and `--now` move it; `[harness] upgrade = false` and an older managed
-/// build never do.
+/// A crashed Codex is relaunched on its own program while the owner's word holds the managed
+/// build ([`relaunch_onto`]): a `Skip` of that build, or a `Not today` standing. Negative
+/// controls: no word, a deferral run out, a skip of another build and `--now` move it;
+/// `[harness] upgrade = false` and an older managed build never do.
 #[test]
 fn a_crashed_codex_is_relaunched_off_the_build_its_owner_holds() {
     let now = 1_790_000_000_u64;
@@ -5855,7 +6237,7 @@ fn a_crashed_codex_is_relaunched_off_the_build_its_owner_holds() {
         onto(true, Some(upgrade::Request::DeferUntil(now + 60))),
         None
     );
-    // NEGATIVE CONTROLS.
+    // Negative controls.
     assert_eq!(onto(true, None), moved);
     assert_eq!(
         onto(true, Some(upgrade::Request::DeferUntil(now - 1))),
@@ -5873,27 +6255,12 @@ fn a_crashed_codex_is_relaunched_off_the_build_its_owner_holds() {
     );
 }
 
-/// A CRASHED CODEX RELAUNCHED OFF THE BUILD ITS OWNER HOLDS IS STILL HELD AT
-/// THE RELAUNCHED TUI'S NEXT VISIT (end to end): the crash
-/// relaunched the TUI on its own program while the owner's Skip held the
-/// managed build, and the relaunch's record kept the hold and the move clock
-/// — but it still named the TUI that crashed, so the relaunched TUI's first
-/// visit read it as another TUI's ([`own_prior`]) and minted a round with no
-/// word and its clock at zero: under the quiet flow, a move onto the very
-/// build the owner had skipped, one launch late. The relaunch now hands its
-/// record to the TUI it brought up ([`found`]): its visit says
-/// `wait:skipped`, and the session is as far behind as before the crash.
-/// NEGATIVE CONTROLS: a crash relaunched on its own program with no word —
-/// the next visit moves the TUI, its age kept: past the waiting record's
-/// look (`would-exit`), where a round minted afresh still shows its record
-/// first. And A WORD GIVEN TO ANOTHER TUI: the owner skipped
-/// the build for a Codex the person has since quit, and the TUI they started
-/// after it crashed before its first visit re-minted the record. The crash
-/// read that record unfiltered, kept its word and its clock, and [`found`]
-/// stamped them onto the relaunched TUI, held `wait:skipped` by a word
-/// nobody gave it. Now the record is read only as the crashed TUI's (its pid
-/// and kernel start, as [`own_prior`] and [`owner_word_on`] read it): the
-/// relaunch keeps neither, and its next visit moves it.
+/// A crashed Codex relaunched off the build its owner holds is still held at the relaunched
+/// TUI's next visit: the relaunch hands its record to the TUI it brought up ([`found`]), so
+/// that visit says `wait:skipped` and the session is as far behind as before the crash.
+/// Negative controls: with no word the next visit moves the TUI, its age kept (`would-exit`);
+/// and a word given to another TUI (one the person has since quit) is read only as that TUI's
+/// ([`own_prior`], [`owner_word_on`]), so the relaunch keeps neither its word nor its clock.
 #[test]
 fn a_crashed_codex_relaunched_off_a_held_build_is_still_held_at_its_next_visit() {
     use crate::harness::relaunch::{ExitCause, ExitRecord};
@@ -5972,17 +6339,11 @@ fn a_crashed_codex_relaunched_off_a_held_build_is_still_held_at_its_next_visit()
     }
 }
 
-/// A QUIET CODEX MOVE AFTER A ROUND THAT GAVE UP IS CARRIED ON ACROSS A NEWER
-/// BUILD (the retarget): the quiet flow gave up a round an
-/// older build announced, and a newer managed Codex landed during its rest.
-/// The retarget of the stopped round ([`St::retarget`]'s stopped arm) built
-/// a fresh round with neither the notice's stamp ([`St::noticed_at`]) nor
-/// the give-up ([`St::last_stop`]), so the TUI told to wind down was ended
-/// with `/exit` and resumed with nothing typed (`done:resumed`). Both are
-/// now carried: its move types the continuation — after a stamped notice,
-/// and after a give-up an older build recorded with no stamp. NEGATIVE
-/// CONTROL: a round that stopped for another reason with no notice ever
-/// typed is resumed with nothing typed after.
+/// A quiet Codex move after a round that gave up is carried on across a newer build: the
+/// retarget of the stopped round ([`St::retarget`]) keeps the notice's stamp
+/// ([`St::noticed_at`]) and the give-up ([`St::last_stop`]), so the move types the
+/// continuation, after a stamped notice and after an unstamped give-up alike. Negative
+/// control: a round that stopped for another reason with no notice typed resumes silently.
 #[test]
 fn a_quiet_codex_move_after_a_given_up_round_a_newer_build_retargets_types_its_continuation() {
     for (why, noticed, name) in [
@@ -6024,17 +6385,10 @@ fn a_quiet_codex_move_after_a_given_up_round_a_newer_build_retargets_types_its_c
     }
 }
 
-/// A QUIET CODEX MOVE AFTER A ROUND THAT GAVE UP ON ITS NOTICES IS CARRIED ON
-/// (the Codex half): the quiet flow gives up a round an
-/// older aterm (or `upgrade_ask`) announced once the agent's own work held it
-/// past the notice's window, and re-arms it after the rest — a pending round
-/// whose agent was asked to wind down and was never told to go on: this lane
-/// types no release line. Its quiet `/exit` was followed by nothing
-/// (`done:resumed`). Now that move types the continuation — and so does one
-/// whose notice the owner's hold ended, or `--now` re-armed after a give-up
-/// (the notice's stamp, [`St::noticed_at`], with no stop recorded).
-/// NEGATIVE CONTROL: a pending round nothing was asked of is resumed with
-/// nothing typed after.
+/// A quiet Codex move after a round that gave up on its notices types the continuation: this
+/// lane types no release line, so an agent once asked to wind down is told to go on. So does
+/// one whose notice the owner's hold ended or `--now` re-armed ([`St::noticed_at`] with no stop
+/// recorded). Negative control: a pending round nothing was asked of resumes silently.
 #[test]
 fn a_quiet_codex_move_after_a_given_up_round_types_its_continuation() {
     for (asked, name) in [
@@ -6074,16 +6428,10 @@ fn a_quiet_codex_move_after_a_given_up_round_types_its_continuation() {
     }
 }
 
-/// A RELAUNCHED CODEX THAT REPLAYS THE WALL IS CARRIED ON ONCE, NEVER STACKED:
-/// [`carry_on`] is not gated on the usage wall, on purpose (its doc says
-/// why), so the restart that comes back onto a replayed wall types its one
-/// continuation there — a turn that fails and stays in history — and the
-/// record is done: the next looks, however many, type and press nothing, and
-/// the restart's earlier lines (the notice, the `/exit`, the relaunch) are the
-/// same as anywhere. This pins the fact that decision rests on, `one line per
-/// restart`. NEGATIVE CONTROL: the same restart onto a screen with no wall —
-/// the same four lines, one of them the continuation, the same record, the
-/// same quiet after it.
+/// A relaunched Codex that replays the wall is carried on once, never stacked: [`carry_on`] is
+/// not gated on the usage wall, so the restart types its one continuation there and the record
+/// is done; later looks type and press nothing. Negative control: the same restart onto a
+/// screen with no wall gives the same four lines, record and quiet after it.
 #[test]
 fn a_relaunched_codex_that_replays_the_wall_is_carried_on_once_and_never_stacked() {
     let replayed = measured_screen(aterm_phase::codex::fixtures::WALL_RESUMED_0_159, 20);

@@ -1,19 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The one back-off ladder: a schedule of pauses, the `n`-th retry's pause its
-//! `n`-th step, and every retry past the table its last step, never a give-up.
-//! Every schedule the supervisor and its host wait on reads through it (host
-//! restarts, relaunch attempts, upgrade looks, survey tries, the turn-end
-//! policy's API-error and usage-limit ladders). [`doubling`] is every back-off
-//! that doubles to a cap (press retries, a re-asked question's pause, the
-//! short-turn streak).
+//! The one back-off ladder: the `n`-th retry pauses the table's `n`-th step, and every retry
+//! past the table its last step, never a give-up. Every schedule the supervisor and its host
+//! wait on reads through it (host restarts, relaunch attempts, upgrade looks, survey tries, the
+//! turn-end policy's API-error and usage-limit ladders); [`doubling`] is every back-off that
+//! doubles to a cap (press retries, a re-asked question's pause, the short-turn streak).
 
 use std::time::Duration;
 
-/// The one doubling back-off: `base` at step 0, twice the last at each next
-/// step, at most `max` — for every `n`, never a give-up and never an
-/// overflow.
+/// The one doubling back-off: `base` at step 0, doubling each step, at most `max`, for every
+/// `n` without overflow.
 #[must_use]
 pub fn doubling(base: Duration, n: u32, max: Duration) -> Duration {
     base.checked_mul(1u32.checked_shl(n).unwrap_or(u32::MAX))
@@ -44,8 +41,7 @@ impl Ladder<'_> {
 mod tests {
     use super::*;
 
-    /// Each step in turn, then the last for ever; nothing from an empty
-    /// table.
+    /// Each step in turn, then the last for ever; nothing from an empty table.
     #[test]
     fn a_ladder_clamps_to_its_last_step() {
         let s = |n| Duration::from_secs(n);
@@ -59,8 +55,7 @@ mod tests {
         assert_eq!(Ladder(&[]).at(0), None);
     }
 
-    /// Doubling from the base, then the cap for ever — past a shift or a
-    /// multiplication that would overflow too. Negative control: a cap under
+    /// Doubling from the base, then the cap for ever, overflow included. Control: a cap under
     /// the base is the cap.
     #[test]
     fn a_doubling_back_off_doubles_to_its_cap() {

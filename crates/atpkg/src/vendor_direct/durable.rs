@@ -245,11 +245,12 @@ mod tests {
                     }
                 }
             });
-            for w in writers {
-                w.join().unwrap();
-            }
+            let written: Vec<_> = writers.into_iter().map(|w| w.join()).collect();
             done.store(true, Ordering::Relaxed);
             reader.join().unwrap();
+            for result in written {
+                result.unwrap();
+            }
         });
         assert_eq!(torn.load(Ordering::Relaxed), 0, "a reader saw a torn file");
         let last = std::fs::read(&dest).unwrap();

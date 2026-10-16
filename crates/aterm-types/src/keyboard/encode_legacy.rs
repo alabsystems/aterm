@@ -3,6 +3,10 @@
 // Author: Andrew Yates
 
 //! Legacy/xterm-compatible keyboard encoding helpers.
+//!
+//! Some constructors use `[..].to_vec()` rather than `vec![..]`: `vec!` lowers to
+//! `into_vec(box [..])`, which the Trust full verifier refutes spuriously, while
+//! `<[u8]>::to_vec` is a modeled std callee. The bytes are the same.
 
 use super::{KeyboardMode, Modifiers, NamedKey};
 
@@ -20,28 +24,10 @@ pub(super) fn encode_character_legacy(
     let meta_sends_escape =
         modifiers.contains(Modifiers::META) && mode.contains(KeyboardMode::META_SENDS_ESC);
 
-    // Trust gate note: `[..].to_vec()` instead of `vec![..]` throughout this
-    // file's byte-sequence constructors. The `vec!` list macro lowers to
-    // `into_vec(box [..])`, whose inlined allocation/pointer writes the Trust
-    // full verifier refutes spuriously (the known workspace-wide
-    // `trust-bitmask-refute` alignment artifact, ledger item T10);
-    // `<[u8]>::to_vec` is a modeled std callee, so the artifact never fires.
-    // Behavior-identical: both build a fresh heap `Vec<u8>` with the same
-    // length, capacity, and bytes — the legacy encode tests pin the bytes.
-    // `Key::Character` carries the UNSHIFTED base, so a chord named after its
-    // SHIFTED glyph arrives here as the base plus SHIFT — Ctrl-`_` is
-    // `Ctrl+Shift+'-'`. `ctrl_character('-')` is None (the table holds `'_'`,
-    // not `'-'`), so the chord fell through to the plain-glyph path below and
-    // emitted a literal `_` instead of 0x1F: readline/emacs `undo` did nothing.
-    // Its siblings only escaped the bug by accident —
-    // `Ctrl+Shift+'/'`, `'2'`, `'6'` all have their UNSHIFTED char in the table
-    // too, so the lookup hit before shift ever mattered.
-    //
-    // The shifted form is consulted ONLY as a fallback, never as a replacement:
-    // every chord that resolves today keeps its exact byte (notably
-    // `Ctrl+Shift+'/'` stays 0x1F rather than becoming `Ctrl-?` = 0x7F). On the
-    // US table `'-'` is the only key this newly resolves, which is precisely
-    // the reported gap.
+    // `Key::Character` carries the unshifted base, so a chord named after a shifted glyph
+    // arrives as base + SHIFT (Ctrl-`_` is Ctrl+Shift+'-'). The shifted glyph's control byte
+    // is only a fallback: a chord whose base is in the table keeps its byte (Ctrl+Shift+'/'
+    // stays 0x1F, not Ctrl-? = 0x7F).
     let ctrl_base = ctrl_character(c).or_else(|| {
         if modifiers.contains(Modifiers::SHIFT) {
             super::shifted_character(c, modifiers).and_then(ctrl_character)
@@ -60,10 +46,8 @@ pub(super) fn encode_character_legacy(
 
     if alt_sends_escape || meta_sends_escape {
         let mut buf = [0x1b].to_vec();
-        // Meta sends ESC + the glyph that would be typed. Under SHIFT that is the
-        // SHIFTED glyph, not merely an uppercased letter — `to_ascii_uppercase`
-        // no-ops on digits/symbols, so Alt+Shift+2 wrongly emitted ESC '2'
-        // instead of ESC '@'. Reuse the engine's US-QWERTY shift table.
+        // Meta sends ESC + the glyph that would be typed: under Shift the shifted glyph
+        // (Alt+Shift+2 is ESC '@').
         let glyph = if modifiers.contains(Modifiers::SHIFT) {
             super::shifted_character(c, modifiers).unwrap_or(c)
         } else {
@@ -75,13 +59,8 @@ pub(super) fn encode_character_legacy(
         return buf;
     }
 
-    // SHIFT must yield the SHIFTED glyph, not just an uppercased letter. The old
-    // `to_ascii_uppercase` silently no-ops on every non-letter, so Shift+2 stayed
-    // '2' instead of '@' and EVERY shifted symbol was lost in legacy mode — the
-    // "Shift doesn't work" regression. Reuse `shifted_character`, the same
-    // US-QWERTY table the Kitty `REPORT_ALTERNATE_KEYS` path already uses, so the
-    // legacy and Kitty shift mappings agree. (Layout-aware shifting for non-US
-    // keyboards is a separate, larger concern: the engine has no live layout.)
+    // Shift yields the shifted glyph from the US table, the one the Kitty
+    // `REPORT_ALTERNATE_KEYS` path uses, so the two agree.
     let output = super::shifted_character(c, modifiers).unwrap_or(c);
 
     let mut buf = [0u8; 4];
@@ -96,10 +75,8 @@ pub(super) fn encode_named_legacy(
 ) -> Vec<u8> {
     let app_cursor = mode.contains(KeyboardMode::APP_CURSOR);
     let app_keypad = mode.contains(KeyboardMode::APP_KEYPAD);
-    // Lock bits (CapsLock/NumLock) are folded into the modifier set upstream but
-    // must NOT turn an unmodified navigation/function key into its modified CSI
-    // form (e.g. Up -> ESC[1;1A). Mask to the real chord modifiers — mirroring
-    // encode_xterm_other_keys — so lock state is ignored on the legacy path.
+    // Lock bits must not turn an unmodified navigation or function key into its modified CSI
+    // form (Up -> ESC[1;1A): keep only the chord modifiers, as encode_xterm_other_keys does.
     let modifiers =
         modifiers & (Modifiers::SHIFT | Modifiers::ALT | Modifiers::CTRL | Modifiers::SUPER);
     let has_modifiers = !modifiers.is_empty();
@@ -133,22 +110,13 @@ fn encode_control_named_legacy(
 ) -> Option<Vec<u8>> {
     Some(match key {
         NamedKey::Enter => {
-            // aterm INPUT POLICY — a terminal that forces programs to be better rather
-            // than faking its own identity to coax them. Legacy VT100/xterm has no
-            // escape for Shift+Enter, so every other terminal sends a plain CR for it,
-            // which is why "Shift+Enter for a newline" silently fails in TUIs (e.g.
-            // Claude Code) that haven't enabled the Kitty protocol (handled EARLIER in
-            // `encode_key_with_layout`; reaching this legacy arm means NO protocol is
-            // active). Instead of masquerading as a recognized terminal, aterm IMPOSES
-            // the useful behaviour directly: a bare Shift+Enter emits LF (0x0a), which
-            // every app using the universal CR=submit / LF=insert-newline convention
-            // (Claude Code, readline, vim, …) honours as a newline — no negotiation, no
-            // fake identity. Plain Enter stays CR; Alt keeps Meta-Enter (ESC CR);
-            // Ctrl+Enter stays CR. Under ConPTY win32-input-mode (DEC 9001, the
-            // first arm of `encode_key_with_layout`) the Shift/Ctrl chords never
-            // reach here: conhost reads a bare LF as Ctrl+Enter, so they go out
-            // as the win32 key record a Windows keyboard makes (`win32_enter_chord`:
-            // CR for Shift+Enter, LF with Ctrl).
+            // Legacy VT has no Shift+Enter, so other terminals send CR and "Shift+Enter for a
+            // newline" fails in TUIs without the Kitty protocol. Rather than fake another
+            // terminal's identity, aterm sends LF (0x0a) for a bare Shift+Enter, which apps using
+            // CR=submit / LF=newline (Claude Code, readline, vim) take as a newline. Plain and
+            // Ctrl+Enter stay CR; Alt sends ESC CR. Under ConPTY win32-input-mode the Shift/Ctrl
+            // chords go out earlier as win32 records (`win32_enter_chord`), since conhost reads a
+            // bare LF as Ctrl+Enter.
             if modifiers.contains(Modifiers::ALT) {
                 vec![0x1b, 0x0d]
             } else if modifiers.contains(Modifiers::SHIFT) && !modifiers.contains(Modifiers::CTRL) {
@@ -167,11 +135,8 @@ fn encode_control_named_legacy(
                 vec![0x09]
             }
         }
-        // Under ConPTY win32-input-mode (DEC 9001) these bytes are still the
-        // question `win32_escape_record` asks, but never the answer sent:
-        // once conhost has read one win32 record it holds a lone ESC (and
-        // `ESC ESC`) until the next byte arrives, so Escape goes out as a
-        // record there.
+        // Under ConPTY win32-input-mode these bytes are only what `win32_escape_record`
+        // inspects: Escape goes out as a record there.
         NamedKey::Escape => {
             if modifiers.contains(Modifiers::ALT) {
                 vec![0x1b, 0x1b]
@@ -180,19 +145,16 @@ fn encode_control_named_legacy(
             }
         }
         NamedKey::Backspace => {
-            // DECBKM (mode 67): when set, Backspace sends BS (0x08) and DEL (0x7f)
-            // becomes the Ctrl-modified form; default (reset) is the reverse. The
-            // Alt form ESC-prefixes the unmodified byte. (xterm `backarrowKey`.)
+            // DECBKM (mode 67, xterm `backarrowKey`): set, Backspace sends BS (0x08) and Ctrl
+            // sends DEL (0x7f); reset (the default) is the reverse.
             let bksp = if mode.contains(KeyboardMode::BACKARROW_SENDS_BS) {
                 0x08
             } else {
                 0x7f
             };
             let ctrl_bksp = if bksp == 0x08 { 0x7f } else { 0x08 };
-            // Ctrl picks the byte; Alt ESC-prefixes whichever it is, so
-            // Ctrl+Alt+Backspace is `ESC ^H` (readline's M-C-h,
-            // backward-kill-word), as kitty's legacy C0 table and xterm's
-            // altSendsEscape send it — not a bare Ctrl+Backspace.
+            // Ctrl picks the byte; Alt ESC-prefixes it, so Ctrl+Alt+Backspace is `ESC ^H`
+            // (readline's M-C-h), as kitty's legacy C0 table and xterm send it.
             let byte = if modifiers.contains(Modifiers::CTRL) {
                 ctrl_bksp
             } else {
@@ -327,19 +289,10 @@ fn encode_numpad_named_legacy(
         NamedKey::NumpadMultiply => encode_numpad(b'j', '*', app_keypad, vt52, modifiers),
         NamedKey::NumpadSubtract => encode_numpad(b'm', '-', app_keypad, vt52, modifiers),
         NamedKey::NumpadAdd => encode_numpad(b'k', '+', app_keypad, vt52, modifiers),
-        // NumpadEnter: SS3 M in DECKPAM (VT52: ESC ? M), which is what tells
-        // the keypad's Enter from the main Return (#7558); Shift cancels
-        // application keypad mode as it does for every keypad key. OUTSIDE
-        // application mode — and under Alt, which `encode_numpad` ranks ahead
-        // of it — KP_Enter is the main Enter BYTE FOR BYTE: CR, aterm's
-        // Shift+Enter LF imposition, Alt's ESC CR. The keypad's Enter is a
-        // second Return to the hand on it, and it reaches this arm from the
-        // keyboard now (`aterm_winit_keymap::map_numpad_key`), not only from a
-        // controller's `key kpenter`; before that seam a physical Shift+KP_Enter
-        // typed LF, and it still must. Under ConPTY win32-input-mode (DEC 9001)
-        // a Shift/Ctrl+KP_Enter is routed EARLIER (`encode_key_with_layout`) as
-        // an ENHANCED_KEY win32 record, because conhost reads this arm's bare
-        // LF as Ctrl+Enter.
+        // NumpadEnter: SS3 M in DECKPAM (VT52: ESC ? M), which tells it from the main Return
+        // (#7558); Shift cancels application keypad mode. Outside application mode, and under
+        // Alt, it is the main Enter byte for byte (CR, Shift's LF, Alt's ESC CR). Under ConPTY
+        // win32-input-mode a Shift/Ctrl+KP_Enter goes out earlier as an ENHANCED_KEY record.
         NamedKey::NumpadEnter => {
             let effective_app = app_keypad && !modifiers.contains(Modifiers::SHIFT);
             if !effective_app || modifiers.contains(Modifiers::ALT) {
@@ -354,28 +307,14 @@ fn encode_numpad_named_legacy(
         NamedKey::NumpadEqual => encode_character_legacy('=', modifiers, mode),
         // NumpadSeparator: comma on some international keyboards (SS3 l in DECKPAM).
         NamedKey::NumpadSeparator => encode_numpad(b'l', ',', app_keypad, vt52, modifiers),
-        // NumpadBegin (KP_BEGIN / centre 5 key): SS3 E in DECKPAM, CSI E
-        // otherwise — xterm's `kb2`, and what this arm's own comment has always
-        // said it sends. It emitted a bare `5` instead, which nothing could
-        // reach while the GUI had no road to `NumpadBegin`; the winit seam
-        // (`aterm_winit_keymap::map_numpad_key`) opened one, and a NumLock-OFF
-        // centre key would have started TYPING A DIGIT at the shell prompt
-        // where it had written nothing before — a new defect of exactly the
-        // class the seam exists to remove. The key has no glyph (that is why
-        // xkb reports `Unidentified` for it and why `main_block_twin` refuses
-        // it), so there is no digit for it to send. `CSI E` also agrees with
-        // the kitty encoder, which has always answered
-        // `letter_final(b'E', ..)` here.
-        //
-        // ALT is the `altSendsEscape` prefix on the sequence the key would
-        // otherwise send, as it is for every keypad key in `encode_numpad`;
-        // VT52 application keypad keeps `ESC ? 5`, its keypad-character form.
+        // NumpadBegin (KP_BEGIN, the centre key with NumLock off): SS3 E in DECKPAM, CSI E
+        // otherwise (xterm's `kb2`; the kitty encoder sends `E` too). The key has no glyph, so
+        // it never sends a digit. Alt sends ESC + CSI E; VT52 application keypad `ESC ? 5`.
         NamedKey::NumpadBegin => {
             let effective_app = app_keypad && !modifiers.contains(Modifiers::SHIFT);
             if modifiers.contains(Modifiers::ALT) {
                 [0x1b, 0x1b, b'[', b'E'].to_vec()
             } else if vt52 && effective_app {
-                // VT52 application keypad: ESC ? 5
                 [0x1b, b'?', b'5'].to_vec()
             } else if effective_app {
                 [0x1b, b'O', b'E'].to_vec()
@@ -392,10 +331,8 @@ fn encode_numpad_named_legacy(
 pub(super) fn ctrl_character(c: char) -> Option<u8> {
     let c_upper = c.to_ascii_uppercase();
     if c_upper.is_ascii_uppercase() {
-        // `c_upper` is 'A'..='Z' here, so `c_upper as u8` is 65..=90 and the
-        // control byte is 1..=26. The saturating ops are identity on that range
-        // (they only discharge the Trust gate's underflow/overflow obligations,
-        // which the `is_ascii_uppercase` guard already rules out in practice).
+        // `c_upper` is 'A'..='Z', so the byte is 1..=26; the saturating ops are identity
+        // there and only discharge the Trust gate's overflow obligations.
         Some((c_upper as u8).saturating_sub(b'A').saturating_add(1))
     } else {
         match c {
@@ -497,19 +434,9 @@ fn encode_numpad(
     vt52: bool,
     modifiers: Modifiers,
 ) -> Vec<u8> {
-    // Per xterm: Shift cancels application keypad mode, forcing numeric output.
-    // Ctrl has no effect on numpad digits in legacy encoding. (#7480)
-    //
-    // Trust gate note: `char_val` is always an ASCII numpad glyph, so the
-    // narrowing to `u8` never truncates and `& 0xFF` is identity — masking
-    // before the cast is behavior-identical (`char as u8` already takes the
-    // low byte for every input) and discharges the cast-overflow obligations
-    // (Phase 1.3). The stdlib `vec!` alignment refutations this let the
-    // verifier reach (the workspace-wide `trust-bitmask-refute` artifact,
-    // ledger item T10) are killed by building the sequences as
-    // `[..].to_vec()` instead of `vec![..]` — same fresh `Vec<u8>`, same
-    // bytes, but via the modeled `<[u8]>::to_vec` rather than the macro's
-    // inlined `into_vec(box [..])` allocation the artifact refutes.
+    // Shift cancels application keypad mode (xterm); Ctrl does nothing to a keypad digit
+    // (#7480). `char_val` is ASCII, so `& 0xFF` before the cast is identity; it discharges the
+    // cast-overflow obligation.
     let effective_app = app_keypad && !modifiers.contains(Modifiers::SHIFT);
     if modifiers.contains(Modifiers::ALT) {
         let mut buf = [0x1b].to_vec();

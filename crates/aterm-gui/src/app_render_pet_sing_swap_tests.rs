@@ -86,9 +86,9 @@ fn reduced_motion_first_resident_pet_frame_is_opaque_without_a_frame_train() {
     );
 }
 
-/// Real pet ticks and the shipping sprite emitter, with a moving caret
-/// during the held song and its tail. The former caret-withholding gate
-/// made this animal fade out; a head cannot satisfy the full-body check.
+/// Real pet ticks and the shipping sprite emitter, with a moving caret through
+/// the held song and its tail: the full body stays emitted and hit-testable,
+/// and a stale head cannot claim a second companion.
 #[test]
 fn singing_pet_keeps_its_body_hit_target_and_cursor_home() {
     let geom = hit_geom();
@@ -320,11 +320,9 @@ fn hot_owner_or_style_change_grounds_an_invisible_ordinary_flight() {
     );
 }
 
-/// Tier 1 for the cursor-viewport lifecycle: genuine charged Glow/Trail
-/// and cursor-body state are retired on the first history snapshot. The
-/// resident pet's half (a lifecycle-live brain that settles in history)
-/// is the engine's: `aterm_effects::companion`'s
-/// `history_lets_the_fading_pet_brain_settle`.
+/// The cursor-viewport lifecycle: charged Glow/Trail and cursor-body state
+/// retire on the first history snapshot. The resident pet's half is
+/// `aterm_effects::companion`'s `history_lets_the_fading_pet_brain_settle`.
 #[test]
 fn history_retires_cursor_pixels_and_cursor_bodies() {
     let mut app = App::headless_for_test();
@@ -371,8 +369,8 @@ fn history_retires_cursor_pixels_and_cursor_bodies() {
     let mut history = CursorFxInputs::sample_for_test(t0 + Duration::from_millis(3));
     history.live_viewport = false;
     history.cur = None;
-    // Exercise the stronger gate: even a stale/raw DECTCEM-visible bit
-    // cannot restore an active-grid cursor body over history.
+    // Even a stale DECTCEM-visible bit cannot restore an active-grid cursor
+    // body over history.
     history.cursor_visible = true;
     let history_tick = app.cursor_frame(wid, history).expect("history tick");
     let ws = app.windows.get(&wid).expect("window");

@@ -1,0 +1,50 @@
+# claude-code 2.1.300 · MEASURED 2026-10-15, `aterm ctl text` of a private headless aterm (26x50, aterm 0.103.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake claude.ai OAuth token (`claude --subscriber`) and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, tools/real-claude-lab) · seven_day 93600 s at 26 columns: the usage-limit dialog
+     (America/Los_Angeles)
+     /upgrade to increase
+     your usage limit.
+
+✻ Churned for 0s · done
+  6:54 AM
+
+⏺ Automatic
+  continue
+  cancelled · /rat
+  e-limit-options
+  to re-arm
+
+❯ keep going
+
+⏺ Hi! I am the local lab
+  stub, not a model.
+  (reply 8)
+
+✻ Cogitated for 0s · done
+  7:03 AM
+
+❯ carry on with the task
+  ⎿  You've hit your
+     weekly limit · resets
+     Oct 16 at 9:04am
+     (America/Los_Angeles)
+     /upgrade to increase
+     your usage limit.
+
+✻ Crunched for 0s · done
+  7:04 AM
+
+❯ /rate-limit-options
+
+──────────────────────────
+  What do you want to
+  do?
+
+  ❯ 1. Stop and wait for
+       limit to reset
+    2. Wait here, then
+       continue
+       automatically at
+       Oct 16 at 9:04am
+    3. Upgrade your plan
+
+  Enter to confirm · Esc
+  to cancel

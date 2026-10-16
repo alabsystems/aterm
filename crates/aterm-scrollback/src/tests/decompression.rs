@@ -2,12 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Bounded decompression codec tests (#3598) and error-safety tests for
-//! corrupt compressed data in warm/cold tiers (#4638, #5893, #5921).
+//! Bounded decompression codec tests and error-safety tests for corrupt
+//! compressed data in the warm and cold tiers.
 
 use super::*;
 
-// Bounded Decompression Tests (#3598)
+// Bounded decompression tests
 
 #[test]
 fn decompress_lz4_bounded_rejects_oversized_prefix() {
@@ -21,15 +21,6 @@ fn decompress_lz4_bounded_rejects_oversized_prefix() {
 fn decompress_lz4_bounded_rejects_too_short() {
     let err = decompress_lz4_bounded(&[0u8; 3]).expect_err("should reject short data");
     assert!(matches!(err, ScrollbackError::Decompression(ref m) if m.contains("too short")));
-}
-
-#[cfg(feature = "zstd")]
-#[test]
-fn decode_zstd_bounded_roundtrip() {
-    let original = b"hello world scrollback data";
-    let compressed = zstd::encode_all(&original[..], 3).expect("zstd encode");
-    let decoded = decode_zstd_bounded(&compressed).expect("bounded decode");
-    assert_eq!(&decoded, original);
 }
 
 #[test]
@@ -48,14 +39,11 @@ fn decompress_lz4_bounded_roundtrip() {
     assert_eq!(&decoded, original);
 }
 
-// Decompression Failure Behavioral Tests (#4638, #5893)
+// Decompression failure behaviour
 
-/// Truncate with corrupt warm block succeeds via front_offset (no decompression).
-///
-/// Before the front_offset optimization, truncation decompressed the boundary
-/// block and failed on corrupt data. Now truncation advances `front_offset`
-/// instead, making line-limit enforcement immune to corruption. The corrupt
-/// block is detected later when accessed (get_line) or evicted (pop_front).
+/// Truncate with a corrupt warm block succeeds: truncation advances
+/// `front_offset` without decompressing, so the corruption surfaces only when
+/// the block is read (`get_line`) or evicted.
 #[test]
 fn truncate_succeeds_on_corrupt_warm_block() {
     let mut sb = Scrollback::with_block_size(5, 10, 10_000_000, 5);
@@ -72,11 +60,8 @@ fn truncate_succeeds_on_corrupt_warm_block() {
     assert_eq!(sb.line_count(), 12, "line count should reflect truncation");
 }
 
-/// Three-tier truncate with corrupt warm block succeeds via front_offset.
-///
-/// Validates that truncation spanning cold+warm+hot tiers does not require
-/// decompression of the warm boundary block. The front_offset pattern makes
-/// all three tiers infallible during truncation.
+/// Truncation spanning cold+warm+hot needs no decompression of the corrupt
+/// warm boundary block.
 #[test]
 fn truncate_three_tier_succeeds_with_corrupt_warm_block() {
     let mut sb = Scrollback::with_block_size(5, 10, 10_000_000, 5);
@@ -144,13 +129,9 @@ fn remove_newest_aborts_on_decompression_failure() {
     );
 }
 
-/// Verify that when cold tier rejects a warm block (Zstd re-compression failure),
-/// the block is restored to warm tier instead of being silently dropped.
-///
-/// Before the fix, `evict_warm_to_cold` would pop a block from warm, call
-/// `cold.push_block()` which returned 0 on error, then adjust line_count down —
-/// permanently losing an entire block of lines. Now the block is pushed back to
-/// warm, matching `DiskBackedScrollback::evict_warm_to_cold` behavior.
+/// When the cold tier rejects a warm block (re-compression failure), the block
+/// goes back to warm instead of being dropped with its lines, as
+/// `DiskBackedScrollback::evict_warm_to_cold` does.
 #[test]
 fn evict_warm_to_cold_restores_block_on_failure() {
     // hot=5, warm=10, block_size=5: warm holds 2 blocks of 5 before eviction.
@@ -167,8 +148,8 @@ fn evict_warm_to_cold_restores_block_on_failure() {
     // Corrupt the oldest warm block (lines 0-4) so cold re-compression fails.
     sb.warm.corrupt_oldest_block();
 
-    // Push 5 more lines to trigger another hot→warm promotion + eviction attempt.
-    // The corrupt block eviction to cold fails, but now the block is restored to warm.
+    // Push 5 more lines to trigger another promotion and eviction attempt:
+    // evicting the corrupt block to cold fails, and it is restored to warm.
     for i in 15..20 {
         sb.push_str(&format!("Line {i}"));
     }
@@ -279,8 +260,8 @@ fn evict_warm_to_cold_preserves_trimmed_corrupt_block_until_quarantine() {
     );
 }
 
-/// Regression test (#5921, #6070): the budget setter must surface rejected
-/// warm-to-cold eviction instead of looping or reporting success.
+/// The budget setter surfaces a rejected warm-to-cold eviction instead of
+/// looping or reporting success.
 #[test]
 fn set_memory_budget_reports_cold_rejection() {
     // Small budget forces memory pressure. block_size=5, warm_limit=5 (1 block).
@@ -298,8 +279,6 @@ fn set_memory_budget_reports_cold_rejection() {
     // Corrupt warm block so cold tier rejects eviction.
     sb.warm.corrupt_oldest_block();
     let warm_before = sb.warm.block_count();
-    // Trigger memory pressure — before #5921 fix this looped forever, and
-    // before #6070 the setter still reported success after restoring the block.
     let error = sb
         .set_memory_budget(1)
         .expect_err("corrupt warm block should reject budget enforcement");
@@ -325,15 +304,14 @@ fn set_memory_budget_reports_cold_rejection() {
     );
 }
 
-// Warm Block Quarantine Tests (#5947)
+// Warm block quarantine tests
 
 /// Corrupt warm block is quarantined (dropped) after QUARANTINE_THRESHOLD
 /// consecutive decompression failures during eviction attempts.
 #[test]
 fn corrupt_warm_block_quarantined_after_threshold() {
-    // warm_limit=5 means each hot→warm promotion triggers one eviction attempt
-    // when warm already has a block. This gives deterministic one-failure-per-batch.
-    // hot=5, warm_limit=5, budget=10MB (large, not the eviction driver), block_size=5.
+    // warm_limit=5: once warm holds a block, each hot→warm promotion makes one
+    // eviction attempt, so one failure per batch (the budget is not the driver).
     let mut sb = Scrollback::with_block_size(5, 5, 10_000_000, 5);
 
     // Push 10 lines → 5 warm (1 block), 5 hot.
@@ -406,8 +384,7 @@ fn corrupt_warm_block_quarantines_only_on_final_eviction_attempt() {
                 "failed eviction attempt {attempt} must not drop the corrupt block early"
             );
             // Avoid probing `get_line()` here: read-path failures also advance
-            // the quarantine counter, which would perturb the eviction-only
-            // accounting this regression is checking.
+            // the quarantine counter and would perturb the eviction-only count.
             assert!(
                 sb.cold_line_count() == 0,
                 "attempt {attempt} must not silently accept the corrupt block into cold storage"
@@ -466,9 +443,8 @@ fn quarantine_mid_history_keeps_rows_and_counts_the_loss() {
     }
 }
 
-/// Iterator skips quarantined warm block lines without redundant decompression.
-/// Before the fix, each line in a corrupt block triggered a separate decompress
-/// attempt, causing O(B) wasted work per iteration pass.
+/// The iterator skips a quarantined warm block's lines without a decompress
+/// attempt per line.
 #[test]
 fn iterator_skips_quarantined_block_without_redundant_decompression() {
     // Large budget so we don't trigger eviction — we want to test get_line
@@ -512,8 +488,7 @@ fn iterator_skips_quarantined_block_without_redundant_decompression() {
     }
 }
 
-/// Line limit enforcement succeeds after a corrupt warm block is quarantined.
-/// Before the fix, truncation failed permanently at the corrupt block boundary.
+/// The line limit is enforced once a corrupt warm block is quarantined.
 #[test]
 fn line_limit_enforced_past_corrupt_block() {
     // Same warm_limit=5 pattern: one eviction attempt per promotion.

@@ -32,10 +32,9 @@ VB_W, VB_H = 128.0, 176.0
 GROUND = 170.0          # standing poses put the lowest foot texel here
 GRIP_Y = 10.0           # hanging poses put the gripping hand center here
 
-# ── palette (the REAL NK robot, chip-upgraded cyan) ────────────────────────
-# Rendered side-by-side against the NK SVG: Robi has NO dark ink — his look
-# is a white shell with SOFT light-gray strokes (#c2c9d6), small cyan DOT
-# eyes with a thin smile, and the smart-chip cyan (#39d7ff) lights.
+# ── palette (the NK robot's, chip-upgraded cyan) ───────────────────────────
+# Robi has no dark ink: a white shell with soft light-gray strokes, small cyan
+# dot eyes with a thin smile, and smart-chip cyan lights.
 INK = "#C2C9D6"         # NK's stroke gray — the outline inflate IS the stroke
 BODY = "#F7F9FC"        # white shell (NK gradient #ffffff->#d5dbe6, averaged light)
 PLATE = "#C9CFDA"       # plating: ears, neck, antenna stalk, belt, chest ring
@@ -306,9 +305,9 @@ def body_layers(arms, legs, face_kind):
     ]
 
 
-# NOTE: painter order puts every silhouette in one grown outline layer under
-# one coat layer — so no limb may overlap the head/torso (its outline would
-# vanish under the shared coat). Poses keep hands clear of the shell.
+# Painter order puts every silhouette in one grown outline layer under one coat
+# layer, so a limb overlapping the head or torso would lose its outline under the
+# shared coat: poses keep the hands clear of the shell.
 
 POSES = [
     dict(id="robi_stand", note="At ease: arms relaxed, happy visor.",

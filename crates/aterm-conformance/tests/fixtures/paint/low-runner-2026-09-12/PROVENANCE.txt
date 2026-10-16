@@ -1,0 +1,16 @@
+low-runner-2026-09-12 — three frames of one kept `fake-claude` paint take, VERBATIM.
+
+Binary:   the shipped v0.83.0 bundle (build 1789245159), /Users//example/aterm/dist/cut-app/aterm.app
+Take:     tools/paint-conformance/paint_probe.sh <bin> --shape fake-claude
+          --keys t,h,e,r,a,i,n,b,o,w,k,i,t,t,y,p,a,i,n,t,s,t,h,e,a,r,c,o,k
+          --capture image --focus out --record 3 --expect ink --budget 25 --backend gpu
+          run from an interactive shell (QoS USER_INTERACTIVE), ATERM_PAINT_KEEP=1,
+          scratch /tmp/atpaint-RqFf0Y, 2026-09-12 16:11, cell 7x14, 67 frames.
+Probe:    PAINT ... pet_claimed=67 pet_missing=11 ... verdict=PASS
+Frames:   shot_0000 (the baseline; pet_sleep_1, found via the compact witness)
+          shot_0014 (mid-take; pet_pose=pet_run_0, read MISSING by the pre-2026-09-12 scanner)
+          shot_0019 (mid-take; pet_pose=pet_run_0, read MISSING by the pre-2026-09-12 scanner)
+Rows:     trail-status.rows holds the three paired `trail status` rows in the same order.
+Measured: inside the claimed body cell the run_0 component is 16 px tall and 30 px wide
+          (tall_component_records, min_height=1) — under COMP_MIN_H (18), over
+          resting_pet_min_width(7) = 15.

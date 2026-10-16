@@ -1,0 +1,51 @@
+# codex-cli 0.163.0 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (144x50, aterm 0.105.0) running the real Codex, launched by path with a scratch `CODEX_HOME`, the lab provider `base_url=http://127.0.0.1:<port>/v1`, `wire_api = "responses"`, a fake `env_key` (a local stub of the Responses API, crates/aterm-lab) · Codex 0.163.0 mid-turn: every Responses answer is HTTP 200 SSE cut after two output_text deltas (no response.completed); the retry row 5/5
+› hi
+• Hi! I am the local lab stub, not a model. (reply 1)
+
+  Worked for <1s • 11:19 AM
+
+
+› stream cut test A
+
+
+• Partial answer before the cutPartial answer before the cutPartial answer before the cutPartial answer before the cutPartial answer before the
+  cutPartial answer before the cut
+
+■ stream disconnected before completion: stream closed before response.completed
+
+
+› stream cut test B no text
+
+
+■ stream disconnected before completion: stream closed before response.completed
+
+
+› stream cut test C no text
+
+
+■ stream disconnected before completion: stream closed before response.completed
+
+
+› stream cut test D text
+
+
+• Partial answer before the cutPartial answer before the cutPartial answer before the cutPartial answer before the cutPartial answer before the
+  cutPartial answer before the cut
+
+■ stream disconnected before completion: stream closed before response.completed
+
+
+› stream cut test E text
+
+
+• Partial answer before the cutPartial answer before the cutPartial answer before the cutPartial answer before the cutPartial answer before the
+  cut
+
+• Reconnecting... 5/5 (3s • esc to interrupt)
+  └ Stream disconnected before completion: stream closed before response.completed
+
+
+› Ask Codex to do anything
+
+  GPT-6.1-Sol default · /private/tmp/at.lI6N/proj · lab stub
+  ? for shortcuts

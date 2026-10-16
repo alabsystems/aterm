@@ -27,7 +27,7 @@ name = "aterm-redraw-conformance"
 path = "src/bin/aterm-redraw-conformance.rs"
 required-features = ["control-conformance"]
 
-# THE LIVE-CLASS AUDITOR (D1). `vendor/winit`'s ported `WinitWindowDelegate` had
+# THE LIVE-CLASS AUDITOR (D1). `crates/aterm-window`'s ported `WinitWindowDelegate` had
 # NOTHING IN CI READING THE REGISTERED CLASS: two compile-verified plants — an
 # argument retyped `Id` -> `Bool`, and `NSWindowDelegate` deleted from the
 # `protocols:` list — both left `cargo build` at 0 and the seam census at 6/6,
@@ -55,7 +55,7 @@ name = "objc_ime_drive"
 path = "examples/objc_ime_drive.rs"
 
 # THE TOOLBAR DRIVER, and it closes the same D1 gap ONE FILE OVER. The auditor
-# above drives FIVE targets, all of them `vendor/winit`'s; `src/toolbar.rs` is
+# above drives FIVE targets, all of them `crates/aterm-window`'s; `src/toolbar.rs` is
 # the largest ported file in the tree — four declared classes, and after W7
 # every AppKit binding call in it — and NOTHING IN THE TREE DROVE IT. Its
 # classes were checked by `#[cfg(test)] mod objc_tests`, whose central case is
@@ -71,15 +71,26 @@ path = "examples/objc_ime_drive.rs"
 name = "objc_toolbar_drive"
 path = "examples/objc_toolbar_drive.rs"
 
+# THE DEVELOPER TOOLS HELPER PANEL'S DRIVER (owner ask 2026-10-15). The panel
+# (`src/devtools_helper.rs`'s `live` module) stands beside System Settings, so no
+# unit test can build it (libtest is never on the main thread) and no check may
+# show it on a desktop a person is using. This builds its views exactly as the
+# live arm does, in NO window, under the Prohibited activation policy, captures
+# every state to PNG in the directory given as its argument and reads back the
+# panel window it never shows. A look, NOT an `OBJC_DRIVES` row; by hand it is
+# `targo --unverified run -p aterm-gui --example objc_devtools_helper_drive -- <dir>`.
+[[example]]
+name = "objc_devtools_helper_drive"
+path = "examples/objc_devtools_helper_drive.rs"
+
 # THE WINDOW DRIVER (W8), and it closes the same D1 gap one file over again.
 # `window_delegate.rs` is the largest file in the mac-arm endgame and W8 moved
 # all 177 of its AppKit BINDING calls off `objc2-app-kit`. The live auditor
-# checks that file's DECLARED rows and `winit_sent_prototypes.rs` checks the
-# ENCODINGS of the rows it sends; neither can see a correct send of the wrong
+# checks that file's DECLARED rows; it cannot see a correct send of the wrong
 # selector, an inverted boolean, or a constant that encodes fine and means
 # something else — which is precisely the defect W7 shipped and pixels caught.
 # This drives the window surface for real: title, style mask, geometry, size
-# limits, visibility, focus, theme, tabs, drag-and-drop, close and fullscreen.
+# limits, visibility, focus, theme, drag-and-drop, close and fullscreen.
 # Also run by `aterm verify`; by hand it is
 #   cargo run -q -p aterm-gui --example objc_window_drive
 [[example]]
@@ -170,8 +181,8 @@ a11y-appkit = []
 # dropping it saved). It is NOT the whole story of whether the tree is built: `build.rs`
 # folds this feature together with a Linux PLATFORM FACT into one `a11y_tree` cfg, so a
 # LINUX build publishes the tree whether or not the feature is named, and on macOS and
-# Windows this row is the only way to get it. It links cleanly against the vendored winit
-# 0.30.13 (single winit instance via the workspace patch). Mutually exclusive with
+# Windows this row is the only way to get it. It links cleanly against aterm's winit
+# 0.30.13, crates/aterm-window (single winit instance via the workspace patch). Mutually exclusive with
 # `a11y-appkit` on macOS (both would claim the content view's accessibility tree), enforced
 # by a `compile_error!` in `accesskit_tree.rs`.
 a11y-accesskit = ["dep:accesskit", "dep:accesskit_winit"]
@@ -250,6 +261,10 @@ aterm-session = { workspace = true }
 # presence band reads off the last rows of the screen — run only when a
 # session's status revision moves (`presence::classify`), never per frame.
 aterm-phase = { workspace = true }
+# The session log engine (`crate::session_log`): each session's hierarchical
+# record (session > run > turn > step), its turn tracker, fold and brief. Pure:
+# no clock, file, thread or socket (time enters as the host's `Stamp`).
+aterm-slog = { workspace = true }
 # L3 network drive: the opt-in (secure-default-OFF) TLS front-end that relays a
 # channel-bound remote driver into the local control socket (see net_listen.rs).
 aterm-net = { workspace = true }
@@ -305,10 +320,10 @@ libc = { workspace = true }
 winit = { workspace = true }
 # Cross-platform accessibility tree (behind the opt-in `a11y-accesskit` feature —
 # NOT default-on since 2026-08-25; see the `[features]` note above).
-# accesskit_winit =0.33.1 targets winit ^0.30.5, satisfied by the vendored winit 0.30.13
-# through the workspace `[patch.crates-io]` redirect (so a SINGLE winit instance links).
-# EXACT-pinned: a bump to winit 0.31 would split the winit graph and break the patch (see
-# the vendored-winit note in the root Cargo.toml). `dep:` so the feature, not the dep
+# accesskit_winit =0.33.1 targets winit ^0.30.5, satisfied by the absorbed winit 0.30.13
+# (crates/aterm-window) through the workspace `[patch.crates-io]` redirect (so a SINGLE
+# winit instance links). EXACT-pinned: a bump to winit 0.31 would split the winit graph
+# and break the patch (see the winit note in the root Cargo.toml). `dep:` so the feature, not the dep
 # presence, gates compilation.
 accesskit = { version = "0.24", optional = true }
 accesskit_winit = { version = "=0.33.1", optional = true }
@@ -325,7 +340,7 @@ accesskit_winit = { version = "=0.33.1", optional = true }
 # cfg so the code never has to spell the platform.
 # Config file parsing. Both crates are ALREADY in this binary's tree (via the
 # engine's config + policy crates), so this adds bindings, not weight.
-serde = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 # Seamless-update screen carry: the checkpoint meta rides the TOML manifest as a
 # JSON string (TOML cannot represent its `None` fields). Same workspace version
 # aterm-update already uses.
@@ -334,20 +349,15 @@ serde = { workspace = true }
 # behind it.
 aterm-json = { workspace = true }
 # SHA-256 for the operator/seamless/config-completion proof digests and the
-# managed-model blob check. First-party; no third-party crypto in this binary.
+# control-socket token digest. First-party; no third-party crypto in this binary.
 aterm-digest = { workspace = true }
 aterm-toml = { workspace = true }
-# Smart-title inference runs on one bounded worker, never the UI thread. The
-# first-party HTTP/1.1 client serves both the local Ollama and the opt-in
-# OpenAI-compatible provider; TLS stays enabled for remote endpoints and JSON
-# bodies are bounded. It replaced `ureq`, which was this binary's largest single
-# third-party import at 12 packages / 89,080 lines. THE TRUST MODEL IS
-# UNCHANGED: `platform-verifier` was requested here on purpose so remote
-# certificates verify against the OS trust store, and aterm-http keeps exactly
-# that (`rustls-platform-verifier`, now a direct dependency). What left is
-# ureq's own HTTP stack — ureq, ureq-proto, http, bytes, httparse, utf8-zero,
-# percent-encoding — plus the bundled `webpki-roots` it carried: 8 packages,
-# 69,546 lines.
+# The first-party HTTP/1.1 + TLS layer. Its user here is the supervisor's
+# network probe (`harness_netprobe.rs`): a TLS handshake to the API host that the
+# OPERATING SYSTEM's trust store verifies (`aterm_http::verifier`), under one
+# deadline. (It was written for the Smart Titles LLM worker, retired 2026-10-15,
+# when it replaced `ureq` — 12 packages / 89,080 lines — and its bundled
+# `webpki-roots`.)
 aterm-http = { workspace = true }
 # PNG encode/decode for the control-socket `window` verb (the macOS full-window
 # capture): it draws the front NSWindow's on-screen pixels into a tightly-packed
@@ -356,16 +366,21 @@ aterm-http = { workspace = true }
 # verb's framebuffer PNG, so this adds no dep to the tree.
 aterm-png = { workspace = true }
 # NOTE: the tray's glyph rasterization no longer takes a font dependency of its
-# own — `aterm_render::font::Font` (first-party, ttf-parser + this workspace's
-# own coverage fill) retired `fontdue` here and in aterm-render together.
+# own — `aterm_render::font::Font` (first-party: the aterm-font reader + this
+# workspace's own coverage fill) retired `fontdue` here and in aterm-render
+# together.
 
 [build-dependencies]
 # The build script derives the exact 64-byte lowercase updater-key fingerprint
 # record embedded in a dedicated Mach-O section.  It deliberately hashes the
 # same raw Ed25519 key bytes that `aterm-update` verifies at runtime — read from
-# the committed anchor in `aterm-update-core::pins`, never from the environment,
-# so the embedded record cannot disagree with the key actually trusted.
-aterm-update-core = { workspace = true }
+# the committed anchor in `aterm-update-core`'s `pins.rs`, never from the
+# environment, so the embedded record cannot disagree with the key actually
+# trusted. build.rs compiles that one file in by `#[path]` rather than naming
+# `aterm-update-core` here: as a build-dependency it was built a second time for
+# the host with its closure (ring under a second feature set, so a second C/asm
+# build-script run; aterm-types), 7.8 unit-s of a clean mac dev build, to read
+# one constant.
 # Standard padded Base64 — first-party and zero-dependency. `decode_strict` is
 # the entry point every trust path uses: canonical padding REQUIRED and no
 # trailing bits, so a pinned key has exactly one spelling.
@@ -384,18 +399,18 @@ aterm-winres = { workspace = true }
 [dev-dependencies]
 # Scratch home directories for the auto-prime pass test (spawn.rs): the pass
 # must be driven against a directory that is NOT the developer's real $HOME.
-aterm-tempfile = { workspace = true, features = ["stand-in"] }
+aterm-tempfile = { workspace = true }
 # Re-declared with `conformance` ON so this crate's TEST build carries the
 # verb-matrix suite (`aterm_control::conformance::run_all`) and can be run against
 # `GuiHost`. Production `cargo build -p aterm-gui` keeps the feature off.
 aterm-control = { workspace = true, features = ["conformance"] }
-# Enables a path-filtered, thread-local counter at the actual visual-feed
-# platform-open seam. It is used only by same-read/ABA conformance tests.
-aterm-effects = { workspace = true, features = ["test-open-probe"] }
 # The seal on a persistent message hold has no public constructor: a fixture
 # that needs a bare `Hold::STANDING` / `Hold::asking(..)` takes them from this
 # feature, which lends it the engine's own adopted ask. TEST builds only.
 aterm-messages = { workspace = true, features = ["test-fixtures"] }
+# `serde_corpus_tests.rs` round-trips `aterm_policy::Policy`, whose serde impls
+# sit behind `toml` (PM-1). TEST builds only.
+aterm-policy = { workspace = true, features = ["toml"] }
 # VISUAL CAPTURE (`message_band_visual_capture` and its #[ignore]d siblings): dump
 # real rendered frames to PNG so the chrome can be reviewed as pixels, not asserts —
 # the same pattern `aterm-gpu`'s rain screenshot harness uses. (Redundant with the
@@ -412,7 +427,7 @@ winit = { workspace = true, features = ["aterm-test-key-event"] }
 aterm-spec = { workspace = true }
 # TRUST_NATIVE_TLA Phase 2: the relocated `spec_xref_closure` gate lives in this
 # binary's TEST build (`#[cfg(test)] mod spec_xref_gate` in main.rs). It collects
-# the ISOLATION-family `#[refines]`/`#[spec_unmodeled]` anchors via `inventory`, so
+# the ISOLATION-family `#[refines]`/`#[spec_unmodeled]` anchors via the registry, so
 # every anchor-bearing crate must be LINKED WITH ITS `spec-anchors` FEATURE ON in
 # this test build. Re-declaring these (already normal `[dependencies]`) here with
 # `features = ["spec-anchors"]` turns the anchors on ONLY for aterm-gui's test/bench
@@ -421,27 +436,20 @@ aterm-spec = { workspace = true }
 # the `terminal_modes` + `alt_screen` anchors, aterm-sandbox the `sandbox`, aterm-pty
 # the `write_all` + `fork_exec`, aterm-gpu the `gpu_encode`; aterm-gui's own
 # `path_confine` anchor expands via this crate's `cfg(test)` directly.
-# `fault-injection` arms aterm-core's thread-local fault points in this test build
-# only: the seamless capture's tests prove a successor's `carry = "repaint"` policy
-# never projects a live session's grids by making that projection fail
-# (`checkpoint.carry_projection`). The production build keeps the const-false stub.
-aterm-core = { workspace = true, features = ["spec-anchors", "fault-injection"] }
-# `testing` exposes the debugger change's real order
-# (`consent::devtools_change_with_for_test`) to `debugger_access`'s Tier-1 bind.
-aterm-containment = { workspace = true, features = ["testing"] }
+aterm-core = { workspace = true, features = ["spec-anchors"] }
 aterm-sandbox = { workspace = true, features = ["spec-anchors"] }
 aterm-pty = { workspace = true, features = ["spec-anchors"] }
 aterm-gpu = { workspace = true, features = ["spec-anchors"] }
 # aterm-session supplies the `fd_lifecycle` anchors (the SinkWriter PTY-master
 # fd-lifecycle: UseFd #[refines] on master()/write_frame + Clone/DropClone RAII
-# waivers). Re-declared here with `spec-anchors` ON so `inventory` collects them
-# into this gate's test binary (initiative A7, WS-G), and `testing` ON for the
-# sink's read-only accounting the egress-contract suite asserts on.
-aterm-session = { workspace = true, features = ["spec-anchors", "testing"] }
-# aterm-scrollback's `testing` adds the corruption seam
-# (`inject_corrupted_warm_block`) the native search's dense-history tests stage a
-# corrupt tiered segment with (`control_query::dense_history_tests`).
-aterm-scrollback = { workspace = true, features = ["testing"] }
+# waivers). Re-declared here with `spec-anchors` ON so the registry collects them
+# into this gate's test binary (initiative A7, WS-G); the sink's read-only
+# accounting the egress-contract suite asserts on is a debug build's.
+aterm-session = { workspace = true, features = ["spec-anchors"] }
+# The corruption seam (`inject_corrupted_warm_block`, a debug build's) the native
+# search's dense-history tests stage a corrupt tiered segment with
+# (`control_query::dense_history_tests`).
+aterm-scrollback = { workspace = true }
 # aterm-grid supplies the page-store, row and resize-undo `#[refines]` anchors,
 # aterm-search the `streaming_search` ones (the derived StreamingSearch machine)
 # and aterm-selection the `text_selection_lifecycle` ones (TextSelection's five
@@ -499,7 +507,8 @@ windows = { version = "0.62", features = [
 aterm-dirfd = { workspace = true }
 # THE PTY KEEPER's client (P3, opt-in: `[keeper] enabled`): the window's link
 # registers every master with the keeper and takes its offers at boot
-# (`keeper_link.rs`). The keeper itself links no GUI framework (grep_guard B19).
+# (`keeper_link.rs`). The keeper itself links no GUI framework (the aterm-census
+# guards `keeper-gui` and `keeper-gui-deps`).
 aterm-keeper = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -515,6 +524,13 @@ x11rb = { version = "0.13", default-features = false }
 # Orca reads; without it a Linux build exposes nothing at all.
 accesskit = "0.24"
 accesskit_winit = "=0.33.1"
+
+# zbus (under accesskit_unix, whose cfg this row copies) writes `#[instrument]`
+# but asks for `tracing` with default features only, and the shim's default
+# leaves `attributes` out (PM-1, crates/aterm-tracing/Cargo.toml). This row
+# turns it on where zbus can be in the graph; nothing in aterm-gui uses it.
+[target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))'.dependencies]
+tracing = { workspace = true, features = ["attributes"] }
 
 # THE ROW, softbuffer half: the CPU present path is FIRST-PARTY on macOS, so
 # this dependency is target-gated OFF that cell.
@@ -555,8 +571,9 @@ accesskit_winit = "=0.33.1"
 # drive a DRM/KMS framebuffer aterm never presents to (it presents to a winit
 # window). `kms = ["bytemuck", "drm", "rustix"]` and both bytemuck and rustix
 # are ALSO held by the x11 and wayland arms, so nothing else falls out with it.
-# The feature list is `vendor/winit/Cargo.toml:332-340` verbatim — winit already
-# made exactly this trim for exactly this reason.
+# The feature list is upstream winit 0.30.13's own softbuffer dev-dependency
+# verbatim (its published Cargo.toml) — winit already made exactly this trim for
+# exactly this reason.
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 softbuffer = { version = "0.4", default-features = false, features = [
     "x11",
@@ -564,6 +581,14 @@ softbuffer = { version = "0.4", default-features = false, features = [
     "wayland",
     "wayland-dlopen",
 ] }
+# winit's raw-window-handle traits, for the presenters that take a window
+# through them here: wgpu's surface (`aterm_gpu::WindowTarget`), softbuffer and
+# the Win32 HWND reads. `rwh_06` is not a winit default: on macOS the Metal
+# presenter and the AppKit chrome take the content view through first-party
+# `aterm_objc::HasNsView`, so raw-window-handle is out of that graph
+# (docs/AUDIT-third-party-2026-10-15.md, winit-core step 6; mac-arm -1 package,
+# -1,984 lines).
+winit = { workspace = true, features = ["rwh_06"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # THE FOUR objc2-FAMILY ROWS THAT STOOD HERE ARE RETIRED — `objc2-app-kit`,
@@ -585,19 +610,19 @@ softbuffer = { version = "0.4", default-features = false, features = [
 # packages, zero lines, zero unsafe tokens.** `cargo forge survey --cell
 # mac-arm` is byte-identical across this commit. All six family packages are
 # held by a SECOND parent that is still live: the winit fork's own four macOS
-# rows (`vendor/winit/Cargo.toml`), whose backend has eight files still using
+# rows (`crates/aterm-window/Cargo.toml`), whose backend has eight files still using
 # them. `cargo tree -i -p objc2-app-kit` answers `winit` and nothing else once
 # these rows are gone.
 #
 # So this row's removal is an HONESTY fix, not a size win: it stops this crate
 # claiming a dependency it does not have, and it makes the fork the single
 # remaining parent, which is what the next wave has to port. The packages leave
-# `mac-arm` on the commit that empties `vendor/winit/src/platform_impl/macos`,
-# at no earlier one. Pinned by `objc2_exit_condition`'s
-# `the_manifest_rows_are_live_or_dead_exactly_as_the_file_counts_say`.
+# `mac-arm` on the commit that empties `crates/aterm-window/src/platform_impl/macos`,
+# at no earlier one. aterm-forge's dominator survey asserts the family absent
+# from the mac-arm graph.
 #
 # THAT COMMIT IS THE W12 + W13 MERGE onto the containment (2026-09-05): the
-# fork's rows are gone too (see the retirement note in vendor/winit/Cargo.toml),
+# fork's rows are gone too (see the retirement note in crates/aterm-window/Cargo.toml),
 # and the mac-arm cell moved by the packages and lines tools/forge-budget.tsv
 # records with its dated note (6).
 
@@ -615,8 +640,8 @@ aterm-objc = { workspace = true }
 # proxy clone wakes it, and that it keeps the main dispatch queue drained. It
 # speaks libtest's command line for its one test (`headless_event_loop`): the
 # filters, `--skip`, `--exact`, `--ignored` and `--list` select and list it as
-# libtest would, the merge contract's test run hands it the same argv as every
-# other binary (`aterm_verify::stages::test_run_args`), and an option it does
+# libtest would, `verify test` hands it the same argv as every other binary
+# (`aterm_verify::stages::test_run_args`), and an option it does
 # not handle is refused, never ignored. No test off macOS.
 [[test]]
 name = "headless_event_loop"

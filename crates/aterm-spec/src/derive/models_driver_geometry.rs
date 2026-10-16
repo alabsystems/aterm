@@ -270,6 +270,7 @@ pub fn driver_geometry_model() -> Model {
 /// gone hand's words raised stands.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
+#[crate::liveness(crate::derive::driver_geometry_model)]
 pub fn driver_geometry_liveness() -> super::Liveness {
     use super::{eq, gt, int, le, or_, var};
     super::Liveness {

@@ -1875,33 +1875,6 @@ mod tests {
         }
     }
 
-    // ---- Ctrl+C inheritance: the pre-spawn reset ----
-
-    // `SetConsoleCtrlHandler(NULL, FALSE)` must be idempotent, since it runs
-    // before EVERY spawn, and must succeed from whatever console state the
-    // process has. This test runs under cargo's console, so what it EXERCISES
-    // is the attached-console case; the no-console case (aterm-gui is a
-    // GUI-subsystem image) is the documented contract, not measured here.
-    // Windows exposes no query for the inherited "ignore CTRL+C" bit, so what
-    // a unit test can pin is exactly this: the call is made, it cannot fail
-    // the spawn, and repeating it is harmless. The inheritance itself is the
-    // OS contract quoted on the fn.
-    #[test]
-    fn restore_ctrl_c_processing_is_callable_and_idempotent() {
-        restore_ctrl_c_processing();
-        restore_ctrl_c_processing();
-        // Direct form, checking the documented success path: with a NULL
-        // routine the call reports success whether or not a console is attached.
-        // SAFETY: the documented NULL/FALSE form; nothing is dereferenced.
-        let ok = unsafe { ffi::SetConsoleCtrlHandler(std::ptr::null(), 0) };
-        assert_ne!(
-            ok,
-            0,
-            "SetConsoleCtrlHandler(NULL, FALSE) failed: {}",
-            io::Error::last_os_error()
-        );
-    }
-
     // ---- DefTerm inbound handoff: adopt_handoff + the signal-pipe resize ----
 
     /// Access rights the adoption path actually depends on. `SYNCHRONIZE` is

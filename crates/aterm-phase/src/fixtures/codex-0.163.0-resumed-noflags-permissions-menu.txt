@@ -1,0 +1,51 @@
+# codex-cli 0.163.0 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (144x50, aterm 0.105.0) running the real Codex, launched by path with a scratch `CODEX_HOME`, the lab provider `base_url=http://127.0.0.1:<port>/v1`, `wire_api = "responses"`, a fake `env_key` (a local stub of the Responses API, crates/aterm-lab) · control: Full Access chosen again and one turn, /exit, then codex --no-daemon resume <thread-id> with NO -a/-s flags (same CODEX_HOME, config.toml unchanged) and one turn: /permissions and Enter, the menu's (current) row
+› second turn after full access
+
+
+• Hi! I am the local lab stub, not a model. (reply 2)
+
+  Worked for <1s • 11:20 AM
+
+
+› third turn after model change
+
+
+• Hi! I am the local lab stub, not a model. (reply 3)
+
+  Worked for <1s • 11:20 AM
+
+
+› fourth turn after resume
+
+
+• Hi! I am the local lab stub, not a model. (reply 4)
+
+  Worked for <1s • 11:21 AM
+
+
+› fifth turn full access again
+
+
+• Hi! I am the local lab stub, not a model. (reply 5)
+
+  Worked for <1s • 11:22 AM
+
+
+› sixth turn after resume without flags
+
+
+• Hi! I am the local lab stub, not a model. (reply 6)
+
+  Worked for <1s • 11:23 AM
+
+
+  Update Model Permissions
+
+
+  1. Ask for approval       Read and edit workspace files and run commands, with approval required for internet access or edits outside the
+                            workspace
+  2. Approve for me         Only ask for actions detected as potentially unsafe
+› 3. Full Access (current)  Use with caution: Codex can edit files outside this workspace and access the internet without approval
+  4. Read Only              Read workspace files, with approval required for edits or internet access
+
+  enter select · esc back

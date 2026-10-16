@@ -56,11 +56,10 @@ impl RecentTypedRun {
 /// Bounded FIFO of typed-press licence stamps, packed oldest-first. K presses
 /// bank K stamps (the oldest dropped past [`TYPED_STAMP_DEPTH`]) and each
 /// observed echo sweep pops one, so K keys license K sweeps and program output
-/// beyond them finds an empty queue. A stamp licenses only within
-/// `TYPE_HINT_FRESH` of its press and goes stale in place. Under Rainbow Kitty
-/// a stamp licenses only while the press ring still owes a cell
-/// ([`CursorGlow::seam_licensed`]). A single slot would collapse several keys
-/// in one frame gap into one licence and decline every later sweep.
+/// beyond them finds an empty queue; a single slot would collapse several keys
+/// in one frame gap into one licence. A stamp licenses only within
+/// `TYPE_HINT_FRESH` of its press and goes stale in place; under Rainbow Kitty
+/// only while the press ring still owes a cell ([`CursorGlow::seam_licensed`]).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct TypedStamps {
     /// Packed oldest-first: every `Some` precedes every `None`.
@@ -68,8 +67,7 @@ pub(crate) struct TypedStamps {
 }
 
 impl Default for TypedStamps {
-    // Written out because `[T; N]: Default` stops at N = 32 and the bank is
-    // deeper than that now (see [`TYPED_STAMP_DEPTH`]).
+    // Written out because `[T; N]: Default` stops at N = 32.
     fn default() -> Self {
         Self {
             slots: [None; TYPED_STAMP_DEPTH],
@@ -81,14 +79,11 @@ impl Default for TypedStamps {
 /// cell cap ([`CursorGlow::RAINBOW_TYPED_SWEEP_MAX`]): one observed move spends
 /// at most this many cells. A TUI batches by its own repaint, so one observed
 /// move can carry many keys, and a press stays in flight for
-/// [`IN_FLIGHT_PATIENCE_S`]; 128 covers that patience at a fast sustained hand
-/// and a full 100-column row. Past the depth the oldest presses drop, and a
-/// deeper batch is refused by the sweep cap (dark, never wrong).
-///
-/// Cost: three 128-slot `Copy` arrays per `CursorGlow`, and one O(depth) spend
-/// on the spawn edge only. The depth exceeds `[T; N]: Default`, so the banks
-/// write `Default` by hand. `pub`: the host's Backspace price memory
-/// (`app_input.rs`'s `ErasePriceMemory`) is bounded by it.
+/// [`IN_FLIGHT_PATIENCE_S`]; 128 covers that at a fast sustained hand and a
+/// full 100-column row. Past the depth the oldest presses drop, and a deeper
+/// batch is refused by the sweep cap (dark, never wrong). `pub`: the host's
+/// Backspace price memory (`app_input.rs`'s `ErasePriceMemory`) is bounded by
+/// it.
 pub const TYPED_STAMP_DEPTH: usize = 128;
 
 /// The in-flight patience (seconds): the upper bound on how long a typed press
@@ -106,16 +101,10 @@ pub(crate) const IN_FLIGHT_PATIENCE_S: f32 = 10.0;
 /// program-row brand ([`AnchorRow::tainted`]). A new row takes the least
 /// recently printed row's slot ([`CursorGlow::remember_anchor_row`]), so a
 /// status row is evicted only by sixteen other rows printing since it last
-/// did, never by age.
-///
-/// A busy Claude Code prints on at least five rows (spinner, composer, bullet,
-/// two timers); losing the spinner's brand lets its next digit be read as a
-/// key's echo (pinned by
-/// `a_busy_tuis_status_row_keeps_its_brand_across_five_print_rows`). The
-/// brand keeps a status row from spending a stamp when its glyph matches the
-/// key's; presses themselves survive a wiped brand
-/// ([`CursorGlow::echo_anchor_pass`]'s minibuffer gate). The lookup is a
-/// linear scan of 16 slots, once per new print run.
+/// did, never by age. A busy Claude Code prints on at least five rows
+/// (spinner, composer, bullet, two timers); losing the spinner's brand lets its
+/// next digit be read as a key's echo
+/// (`a_busy_tuis_status_row_keeps_its_brand_across_five_print_rows`).
 pub(super) const ANCHOR_ROWS: usize = 16;
 
 /// One entry of [`CursorGlow::anchor_rows`]: where the last print run on `row`
@@ -322,19 +311,8 @@ impl TypedStamps {
     }
 }
 
-/// The press-credit ring: the typed-echo coalescer's ledger, one slot per keyed
-/// glyph (`(press instant, unpaid cells, exact glyph if known)`), banked by
-/// [`CursorGlow::note_typed_glyph`] and spent oldest-first by the cells a
-/// licensed typed echo lays. The question is whether a press's cells have been
-/// laid, not how old it is: a late batch is always older than its presses'
-/// observation.
-///
-/// A slot leaves the ring when its cells are laid, when an edge the press
-/// cannot explain forgets it ([`Self::forget`],
-/// [`CursorGlow::forget_typed_credits`]), when the key that erases it is
-/// pressed ([`Self::retire_newest`]), or after [`IN_FLIGHT_PATIENCE_S`]; every
-/// read is life-filtered ([`Self::within`]). A scroll or row-band move keeps
-/// the pool. Fixed-size and `Copy`: the frame path allocates nothing.
+/// One live unpaid press as the exact-run proofs collect it: `(slot, press
+/// instant, unpaid cells, exact glyph if known)`.
 pub(super) type LiveUnpaidPress = (usize, Instant, u8, Option<char>);
 
 /// Bound on the exact-glyph proof for a loaded host that missed a whole
@@ -348,6 +326,19 @@ pub(super) const ORPHAN_EXACT_KEYS_MAX: usize = 2;
 /// Fixed, press-ordered escrow candidates recovered after an unknown insert.
 pub(super) type OrphanExactPressRun = [Option<(Instant, char)>; ORPHAN_EXACT_KEYS_MAX];
 
+/// The press-credit ring: the typed-echo coalescer's ledger, one slot per keyed
+/// glyph (`(press instant, unpaid cells, exact glyph if known)`), banked by
+/// [`CursorGlow::note_typed_glyph`] and spent oldest-first by the cells a
+/// licensed typed echo lays. The question is whether a press's cells have been
+/// laid, not how old it is: a late batch is always older than its presses'
+/// observation.
+///
+/// A slot leaves the ring when its cells are laid, when an edge the press
+/// cannot explain forgets it ([`Self::forget`],
+/// [`CursorGlow::forget_typed_credits`]), when the key that erases it is
+/// pressed ([`Self::retire_newest`]), or after [`IN_FLIGHT_PATIENCE_S`]; every
+/// read is life-filtered ([`Self::within`]). A scroll or row-band move keeps
+/// the pool. Fixed-size and `Copy`: the frame path allocates nothing.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PressCredits {
     pub(super) slots: [Option<(Instant, u8, Option<char>)>; TYPED_STAMP_DEPTH],
@@ -680,9 +671,9 @@ impl PressCredits {
 
     /// Retire every press banked at or before `at`: the twin of
     /// [`Self::revoke_at`] for presses an unknown-width insert's hop echoed
-    /// without pricing ([`CursorGlow::insert_orphans`]). Such presses can only
-    /// echo in that hop or the next repaint, so they are retired rather than
-    /// left to license a keyless `+1`. Later presses are untouched.
+    /// without pricing ([`InsertSeam::orphans`]). Such presses can only echo in
+    /// that hop or the next repaint, so they are retired rather than left to
+    /// license a keyless `+1`. Later presses are untouched.
     pub(super) fn retire_through(&mut self, at: Instant) {
         self.blank_where(|t| t <= at);
     }
@@ -831,7 +822,7 @@ pub enum DeliveredClass {
     Gesture,
 }
 
-/// How the host priced a delivered insert ([`CursorGlow::note_insert_delivered`]).
+/// How the host priced a delivered insert ([`CursorGlow::note_insert_delivered_from`]).
 /// The two classes are spent under different row laws, so the distinction is a
 /// type rather than a sentinel width.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -854,7 +845,7 @@ pub enum InsertWidth {
 /// [`CursorGlow::INSERT_HINT_FRESH`], and spendable only by a same-row forward
 /// advance no wider than `cells` plus the unpaid typed credits behind it, on
 /// the insert's own row ([`CursorGlow::insert_row_identity`]). See
-/// [`CursorGlow::note_insert_delivered`].
+/// [`CursorGlow::note_insert_delivered_from`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct InsertLicence {
     /// The delivery instant — the writer thread's completed write (or the
@@ -898,7 +889,7 @@ pub(super) struct InsertSpan {
 /// A same-row forward hop the seam refused for want of a licence, remembered
 /// for one delivery. A preempted writer thread can publish an insert's receipt
 /// after the frame that observed its echo; without this the whole insert would
-/// stay dark. When [`CursorGlow::note_insert_delivered`] finds a refused hop of
+/// stay dark. When [`CursorGlow::note_insert_delivered_from`] finds a refused hop of
 /// exactly the insert's (accumulated) width within
 /// [`CursorGlow::INSERT_RETRO_FRESH`], it lays it. An unknown-width insert
 /// claims the hop by its row witness instead, up to
@@ -912,22 +903,20 @@ pub(super) struct PendingHop {
     pub(super) at: Instant,
 }
 
-/// **A TYPED LAY THE CARET HAS NOT YET RESTED BEHIND** (Rainbow Kitty, the
-/// visible lane). A remote zle drawing its Ctrl-R match, torn across two
-/// reads, prints the match's own glyph at the caret first — the very frame
-/// a typed echo draws, so the visible lane lays it — then prints its status
-/// row BELOW and walks the caret back onto the match with no key behind the
-/// move. A glyph's echo leaves the caret right of it, so that shape — a
-/// print ending off the lay's row, then the caret at REST on or left of the
-/// cells laid — shows the lay was judged on a frame caught mid-redisplay,
-/// and the lay is recalled: its cells retract as the insert's rewrite's do
+/// A typed lay the caret has not yet rested behind (Rainbow Kitty, the visible
+/// lane). A remote zle drawing its Ctrl-R match torn across two reads prints
+/// the match's glyph at the caret first (the frame a typed echo draws, so the
+/// visible lane lays it), then prints its status row below and walks the caret
+/// back onto the match with no key. A glyph's echo leaves the caret right of
+/// it, so a print ending off the lay's row followed by the caret at rest on or
+/// left of the laid cells shows the lay was judged mid-redisplay: it is
+/// recalled, its cells retracting as an insert rewrite's do
 /// ([`rk::Event::Rewrite`]). Judged at the caret's rest
 /// ([`CursorGlow::TORN_REST_S`] without a move) or at the next typed lay's
-/// origin. A caret that rests right of the lay, anywhere else, or behind a
-/// keyed move keeps it, and so does a walk back with every print on the
-/// lay's row (a highlighter's redraw split across reads, vi-mode Escape).
-/// The lay is a SHORTENED band, not a refused one: it is on glass until the
-/// recall's retract ends (RAINBOW-PATH-V3 §8 D-13).
+/// origin. A caret resting right of the lay, elsewhere, or behind a keyed move
+/// keeps it, as does a walk back with every print on the lay's row (a
+/// highlighter's redraw split across reads, vi-mode Escape). The lay is a
+/// shortened band, not a refused one (RAINBOW-PATH-V3 §8 D-13).
 #[derive(Clone, Copy, Debug)]
 pub(super) struct TornLay {
     /// The row the typed echo laid on (a scroll drops the lay).
@@ -949,29 +938,24 @@ pub(super) struct TornLay {
     pub(super) printed_off_row: bool,
 }
 
-/// **THE PARK** — Ink's rewrite observed as two sync brackets: Ink repaints
-/// the input row by parking the caret LEFT (a same-row backward move), then
-/// rewriting the row to its end plus the new glyph, and a frame can catch
-/// the two ~40 ms apart. Judged at once, the park is a typed re-anchor
-/// (the key's stamp spent on it, the mirror moved to the park column so the
-/// key's `Typed` replay lays the PROMPT cell) and the return is refused for
-/// want of a licence: half the row dark. So a same-row backward
-/// typed-paired (or in-flight-backed, or delivered-insert-backed) move is
-/// HELD, not judged — nothing consumed, nothing spent, no v2 `Move`. It is
-/// RELEASED by its return on either lane ([`CursorGlow::release_held_park`]:
-/// a forward move within one stamp window from the landing past the
-/// origin, reclassified as `origin -> target`; or the rewrite's print
-/// advancing the row's end from the origin under a hidden caret) or
-/// CANCELLED by a same-end rewrite (a repaint that carried no glyph), and
-/// FLUSHED at its own clock by every other edge — through the ordinary
-/// body, so every other verdict (the box-growth re-anchor, a ConPTY
-/// hide-bridged retreat) is byte-identical, only emitted one observed move
-/// (or ≤ 0.25 s) later. It rides a scroll or a band move with its row
-/// ([`CursorGlow::carry_held_park`]) and is a WAKE SOURCE: `is_active`, and
-/// a deadline just past its window in `next_change_deadline`, so a host
-/// that sleeps on the engine's word still delivers a silent park's verdict
-/// on time. Rainbow Kitty only; `Copy` (the config and geometry it must be
-/// judged under ride along, so any edge can flush it), no allocation.
+/// The park: Ink repaints the input row by parking the caret left (a same-row
+/// backward move), then rewriting the row to its end plus the new glyph, and a
+/// frame can catch the two ~40 ms apart. Judged at once, the park would be a
+/// typed re-anchor and the return refused for want of a licence: half the row
+/// dark. So a same-row backward typed-paired (or in-flight- or insert-backed)
+/// move is held, not judged: nothing consumed or spent, no v2 `Move`.
+///
+/// Its return on either lane releases it ([`CursorGlow::release_held_park`]: a
+/// forward move within one stamp window from the landing past the origin,
+/// reclassified as `origin -> target`, or the rewrite's print advancing the
+/// row's end from the origin under a hidden caret); a same-end rewrite cancels
+/// it; every other edge flushes it at its own clock through the ordinary body,
+/// so every other verdict is unchanged, only up to one observed move (or
+/// 0.25 s) later. It rides a scroll or band move with its row
+/// ([`CursorGlow::carry_held_park`]) and is a wake source (`is_active`,
+/// `next_change_deadline`), so a host sleeping on the engine's word still
+/// delivers a silent park's verdict. Rainbow Kitty only; `Copy`, carrying the
+/// config and geometry it must be judged under.
 #[derive(Clone, Copy)]
 pub(super) struct HeldPark {
     /// The source row. A background footer repaint may park on another
@@ -1379,10 +1363,10 @@ impl CursorGlow {
     pub fn note_backspace_erasing(&mut self, now: Instant, cells: Option<u16>) {
         self.recent_typed_run = None;
         // Backspace starts a new deletion class: close every older movement
-        // class and the swallowed typed cohort's unspent admission credits
-        // before arming quench/poof state. `clear_typed_keeping_hand` flushes a
-        // held park first, so its `Move` precedes the `Erase` in v2's order
-        // ([`HeldPark`]). The hand keeps its row.
+        // class and the swallowed typed cohort's unspent credits before arming
+        // quench/poof state. `clear_typed_keeping_hand` flushes a held park
+        // first, so its `Move` precedes the `Erase` in v2's order. The hand
+        // keeps its row.
         self.clear_typed_keeping_hand(now);
         // The key it erases: a Backspace typed into a stall erases the newest
         // press in flight (bytes are processed in order), so that press is
@@ -1414,10 +1398,10 @@ impl CursorGlow {
         // `fresh_kill` gate, and the full-trust span/fallback machinery covers
         // the erase (a ContentOnly probe licenses nothing, see [`ProbeTrust`]).
         self.bs_poof_hint = Some(now);
-        // Stamp the PRE-erase row fill while it is still the pre-erase row (see
-        // [`Self::bs_baseline`]).
+        // Stamp the pre-erase row fill while it is still the pre-erase row
+        // ([`Self::bs_baseline`]).
         self.bs_baseline = self.row_fill_at_key();
-        // Seam point 2 (§17.2, D14): one Backspace → v2's `Erase`, on the key's
+        // Seam point 2 (§17.2): one Backspace → v2's `Erase`, on the key's
         // own edge, beside the v1 bookkeeping above.
         if self.v2.engaged() {
             self.v2.on_event(rk::Event::Erase, now);
@@ -1488,7 +1472,7 @@ impl CursorGlow {
         let credits = cells.clamp(1, Self::RAINBOW_TYPED_SWEEP_MAX as u16) as u8;
         self.type_press_ring.bank(now, credits, expected);
         self.last_committed_type = Some(now);
-        // Seam point 2 (§17.2, D14): the typed key → v2's `Typed`, the only
+        // Seam point 2 (§17.2): the typed key → v2's `Typed`, the only
         // event that builds its spine. The width is the same bound the credit
         // took: an unclamped saturated commit would lay an O(n²) fold through
         // the whole grid for a key v1 would refuse anyway.
@@ -1548,7 +1532,7 @@ impl CursorGlow {
         self.unsettle();
         self.user_gesture_hint = None;
         self.return_hint = Some(now);
-        // Seam point 2 (§17.2, D14): the Enter key → v2's `Return`, inert by
+        // Seam point 2 (§17.2): the Enter key → v2's `Return`, inert by
         // design (a keypress is not a move); the flight arrives as the
         // observed move with `Licence::Return`.
         if self.v2.engaged() {
@@ -1559,14 +1543,14 @@ impl CursorGlow {
     /// Record a Tab / scripted-gesture classifier boundary. It licenses the
     /// following move within [`Self::USER_GESTURE_HINT_FRESH`]. A paste does
     /// not ride this class: its delivered insert arms
-    /// [`Self::note_insert_delivered`] instead.
+    /// [`Self::note_insert_delivered_from`] instead.
     ///
     /// A gesture goes through [`Self::supersede_typed_press`] and keeps the
     /// banked typed stamps (real keys whose echoes are in flight) and the
     /// Return, nav, quench and composer-newline one-shots, as a glyph does:
     /// an arrow's hop or Backspace's retreat in flight at the Tab is that
     /// key's echo, and the gesture waits for its completion. The classic
-    /// trail's gesture still drops its nav hint (its Tier-1 binding).
+    /// trail's gesture still drops its nav hint.
     pub fn note_user_gesture(&mut self, now: Instant) {
         self.flush_held_park();
         self.supersede_typed_press();
@@ -1695,7 +1679,7 @@ impl CursorGlow {
         let _ = self.arm_insert(at, at, width);
     }
 
-    /// The arm shared by [`Self::note_insert_delivered`] and
+    /// The arm shared by [`Self::deliver_insert`] and
     /// [`Self::note_insert_armed`]: resolve the width, read the row witness now
     /// (before the echo moves anything), and arm the seam
     /// ([`InsertSeam::arm`]). Returns the licence, or `None` for `Cells(0)`.
@@ -1950,7 +1934,7 @@ impl CursorGlow {
             }
         }
         // An unknown width pays no surplus below its bound; presses banked at
-        // or before its delivery are retired later ([`Self::insert_orphans`]).
+        // or before its delivery are retired later ([`InsertSeam::orphans`]).
         if !ins.known && self.type_press_ring.cells_where(now, |t| t <= ins.at) > 0 {
             let site = self
                 .row_cur_meta
@@ -1980,8 +1964,8 @@ impl CursorGlow {
         }
         self.last_licensed_row = Some((cr, now));
         if self.v2.engaged() {
-            // Born on the delivery clock (T2: the echoing frame shows the
-            // run lit, no edge-in), floored like a key's sweep.
+            // Born on the delivery clock (the echoing frame shows the run lit,
+            // no edge-in), floored like a key's sweep.
             self.v2.on_event(
                 rk::Event::Sweep {
                     row: cr,
@@ -2560,11 +2544,9 @@ impl CursorGlow {
         self.quench = (self.quench + Self::KILL_QUENCH_GAIN).min(1.0);
         self.heat *= Self::QUENCH_COOL;
         self.coal *= Self::QUENCH_COOL;
-        // Canonical metric: a span erased un-earns like ~two deletes (the
-        // same escalation the quench above documents) — and never builds.
+        // The canonical metric un-earns about two deletes' worth; never builds.
         self.momentum.kill(now);
-        // The mirror metric builds, and a span kill credits twice (the same
-        // escalation the forward metric spends on a kill).
+        // The erase mirror builds, and a span kill credits twice.
         self.erase_mom.advance(now);
         self.erase_mom.advance(now);
         // Stamp the pre-kill row as `note_backspace` does: both poof licences
@@ -2578,35 +2560,28 @@ impl CursorGlow {
         if moves_cursor {
             self.nav_hint = Some(now);
         }
-        // …and it owes exactly one such retreat, dated here. See
-        // `kill_retreat_pending`.
+        // …and it owes exactly one such retreat (`kill_retreat_pending`).
         self.kill_retreat_pending = moves_cursor.then_some(now);
-        // `kill_reported_to_v2` is keyed on this stamp and needs no reset. A
-        // fresh licence starts non-word; only `note_word_kill` marks it, after
-        // this runs.
+        // A fresh licence starts non-word; only `note_word_kill` marks it, after
+        // this runs. `kill_reported_to_v2` is keyed on the stamp.
         self.kill_hint_word = false;
     }
 
     /// [`Self::note_kill`] for a word-scale kill chord (^W, Alt-D, Alt/Ctrl-
     /// Backspace): the same licence, but the poof speaks
-    /// [`crate::trail_sound::SoundKind::KillWord`] (the erase poof's slightly
-    /// larger cousin) instead of the tier-3 swoosh (owner, 2026-08-29).
+    /// [`crate::trail_sound::SoundKind::KillWord`] instead of the swoosh.
     pub fn note_word_kill(&mut self, now: Instant, moves_cursor: bool) {
         self.note_kill(now, moves_cursor);
         self.kill_hint_word = true;
     }
 
-    /// Disarm dangling typed and backspace hints. Called when a key with its
-    /// own move semantics arrives (Enter, Tab, nav, kill), so a hint left by a
-    /// no-move echo (a password prompt, vim `x`/`r`) cannot re-anchor the next
-    /// proven move. The Backspace pairing hint (`quench_hint`) clears too,
-    /// since `bs_pair` in `spawn` only peeks it.
-    ///
-    /// This is the class-changing press-path supersede: the GUI host calls it
-    /// on every non-typed press and input boundary (mouse, focus, paste drain)
-    /// before class-specific code arms. A typed press goes through
-    /// [`Self::supersede_typed_press`] instead, which keeps the banked stamps
-    /// ([`TypedStamps`]: K keys in one frame license K sweeps).
+    /// Disarm dangling typed and backspace hints when a key with its own move
+    /// semantics arrives (Enter, Tab, nav, kill), so a hint left by a no-move
+    /// echo (a password prompt, vim `x`/`r`) cannot re-anchor the next proven
+    /// move. The GUI host calls it on every non-typed press and input boundary
+    /// (mouse, focus, paste drain) before class-specific code arms; a typed
+    /// press goes through [`Self::supersede_typed_press`], which keeps the
+    /// banked stamps.
     ///
     /// It also takes the hand off its row ([`Self::hand_row`]): an unclassified
     /// press may open a minibuffer (zle's Ctrl-R/S, Alt-X, Escape into vi's
@@ -2614,8 +2589,7 @@ impl CursorGlow {
     /// modifier edges use [`Self::clear_typed_keeping_hand`].
     pub fn clear_typed(&mut self, now: Instant) {
         self.clear_typed_keeping_hand(now);
-        // The hand did something other than type or edit its line (zle's
-        // Ctrl-R opens its minibuffer with this press).
+        // The hand did something other than type or edit its line.
         self.hand_row = None;
     }
 
@@ -2624,18 +2598,12 @@ impl CursorGlow {
     /// and line motions, kills), a paste (its delivered insert licenses its own
     /// echo), or a bare modifier edge. Every licence term closes the same way,
     /// but the hand keeps its row ([`Self::hand_row`]): none of these opens a
-    /// minibuffer in zle, readline or an agent composer, so the next glyph is
-    /// still echoed at the drawn caret. A key that moves the caret off the row
-    /// leaves the hand's row no longer the caret's, which its readers
-    /// ([`Self::refused_below_the_caret`], the parked-caret hold of
-    /// [`Self::echo_anchor_pass`]) compare against. Inside zle's search the
-    /// opening Ctrl-R already took the hand off, so nothing is kept there.
+    /// minibuffer in zle, readline or an agent composer.
     pub fn clear_typed_keeping_hand(&mut self, now: Instant) {
-        // This closes movement licences, including the boundary between two
+        // Closes movement licences, including the boundary between two
         // controller `turn` calls. The recent typed run is content evidence,
-        // not a licence: a later echo must still prove its own credit and an
-        // exact adjacent continuation. Edit, navigation and geometry
-        // boundaries retire the run where they are classified.
+        // not a licence: it is retired where edits, navigation and geometry
+        // boundaries are classified.
         self.flush_held_park();
         if self.newline_hint.is_some() && self.v2.engaged() {
             self.v2.on_event(rk::Event::CancelComposerNewline, now);
@@ -2682,8 +2650,8 @@ impl CursorGlow {
     /// license a later program move. Called when a key was queued behind a
     /// draining paste, an inline write failed, or a paste's arrival stamp must
     /// not outlive its enqueue (the completed write re-arms the delivered
-    /// insert, [`Self::note_insert_delivered`]). Matching by timestamp avoids
-    /// cancelling a newer gesture or that later delivery stamp.
+    /// insert, [`Self::note_insert_delivered_from`]). Matching by timestamp
+    /// avoids cancelling a newer gesture or that later delivery stamp.
     pub fn revoke_input_hints_at(&mut self, at: Instant) {
         let clear = |slot: &mut Option<Instant>| {
             if *slot == Some(at) {
@@ -2702,12 +2670,9 @@ impl CursorGlow {
         clear(&mut self.newline_hint);
         clear(&mut self.reflow_hint);
         clear(&mut self.kill_hint);
-        // The delivered insert is revoked by its exact instant too. An earlier
-        // unspent insert this arm accumulated into is restored, not discarded,
-        // and the arm's tally is undone: a revoked arm was not a delivery, so
-        // `inserts_delivered=` and `last_insert_cells=` read as before it. The
-        // re-arm at delivery counts the gesture once; a failed write never
-        // re-arms.
+        // The delivered insert is revoked by its exact instant too; an earlier
+        // unspent insert this arm accumulated into is restored and the arm's
+        // tally undone (a revoked arm was not a delivery).
         self.insert.revoke_arm_at(at);
         let revoke_bs = self.bs_poof_hint == Some(at);
         clear(&mut self.bs_poof_hint);
@@ -2729,24 +2694,21 @@ impl CursorGlow {
     }
 
     /// Consume every one-shot classifier at a completed hidden→visible boundary
-    /// where `spawn` did not, including a same-cell return: the hide
-    /// choreography is complete and must not license a later PTY/CUP move.
+    /// where `spawn` did not, including a same-cell return, so the hide
+    /// choreography cannot license a later PTY/CUP move.
     ///
     /// Spared while fresh: a TUI that brackets each repaint in a DECTCEM hide
-    /// completes hidden boundaries mid-burst, so stamps younger than
-    /// [`Self::TYPE_HINT_FRESH`] survive and stale ones retire. The credit ring
-    /// keeps its own [`IN_FLIGHT_PATIENCE_S`] clock. The delivered insert and
-    /// a held park follow the bank's law. The one-shot class hints
-    /// (quench/return/gesture/newline/reflow) clear unconditionally, except a
-    /// nav hint younger than [`Self::NAV_HINT_FRESH`]: a same-cell completion
-    /// under it is a key whose echo has not landed (a viewport snap-back before
-    /// zsh's `\x08`×n, an Ink repaint's hidden half before its `CUP`).
+    /// completes hidden boundaries mid-burst, so typed stamps younger than
+    /// [`Self::TYPE_HINT_FRESH`] survive (the delivered insert and a held park
+    /// follow the same law; the credit ring keeps its own
+    /// [`IN_FLIGHT_PATIENCE_S`] clock). The other one-shots clear, except a nav
+    /// hint younger than [`Self::NAV_HINT_FRESH`]: a same-cell completion under
+    /// it is a key whose echo has not landed (a viewport snap-back before zsh's
+    /// `\x08`×n, an Ink repaint's hidden half before its `CUP`).
     pub(super) fn retire_hidden_movement_provenance(&mut self, now: Instant) {
         // A held park is spared while fresh, like the typed bank: Ink brackets
         // its park and rewrite in DECTCEM hides, so a boundary can complete
         // mid-park. A park past its window is judged now, as the tick would.
-        // `retire_all_movement_provenance` (the declined relocation) still
-        // flushes.
         if self.held_park.is_some_and(|p| !p.fresh(now)) {
             self.flush_held_park();
         }
@@ -2800,11 +2762,10 @@ impl CursorGlow {
     /// A hidden→visible relocation the bounded ConPTY bridge declined never
     /// reaches `spawn`, so its one-shot classifiers are consumed here. For
     /// Rainbow Kitty the caret mirror moves to `cur`
-    /// ([`rk::Engine::observe_caret`]) so the next key lays at the true cell,
-    /// and nothing of the ribbon is retired here. The content witness reads
-    /// the abandoned row on this frame and decides per cell: replaced or moved
-    /// with the caret → fast melt; gone → the swoosh; intact → nothing (so an
-    /// Enter in Claude Code lets the contrail fade instead of vanishing).
+    /// ([`rk::Engine::observe_caret`]) so the next key lays at the true cell;
+    /// nothing of the ribbon is retired here: the content witness decides per
+    /// cell on this frame (replaced or moved with the caret → fast melt; gone →
+    /// the swoosh; intact → nothing, so the contrail fades).
     pub(super) fn retire_declined_hidden_relocation(&mut self, cur: (u16, u16)) {
         // Full consumption, not the fresh-sparing retire: the relocation was
         // refused, so nothing about it correlates with the banked keys, and a

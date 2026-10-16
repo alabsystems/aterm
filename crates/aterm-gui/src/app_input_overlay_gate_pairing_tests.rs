@@ -1,13 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The `App::input` overlay gate preserves Kitty press/release pairing
-//! across overlay open/close. The observable is the seam's reply on the
-//! stub session's invalid (-1) sink with Kitty REPORT_EVENT_TYPES
-//! (`CSI > 2 u`) negotiated: an encoded event reports `WriteFailed`, while
-//! a swallowed one returns `Ok` without touching the sink. `Source` is
-//! audit-only, so `Source::Human` exercises the same gate a controller
-//! event hits.
+//! The `App::input` overlay gate preserves Kitty press/release pairing across
+//! overlay open/close. With Kitty REPORT_EVENT_TYPES (`CSI > 2 u`) negotiated on
+//! the stub session's invalid (-1) sink, an encoded event reports `WriteFailed`
+//! and a swallowed one `Ok`. `Source` is audit-only, so `Source::Human`
+//! exercises the gate a controller event hits.
 use crate::input::{InputEvent, InputOutcome, Source};
 use crate::{App, WindowId, term_lock};
 use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
@@ -82,8 +80,7 @@ fn release_of_pre_overlay_press_falls_through_the_gate() {
     let mut swallowed = state.clone();
     assert!(buggy.fire("ReleaseForwardedPress", &mut swallowed));
     assert!(!buggy.check_invariant("UntrackedReleaseNeverSwallowed", &swallowed,));
-    // The in-flight release must still reach the seam (encode + fail), not be
-    // swallowed to Ok by the gate.
+    // The in-flight release still reaches the seam (encode + fail).
     assert_eq!(
         app.input(
             wid,
@@ -150,8 +147,8 @@ fn press_under_overlay_release_swallowed_after_close() {
             .is_empty(),
         "swallow-once: the entry is removed"
     );
-    // A later unrelated release of the same key encodes as today (reaches the
-    // seam and fails on the stub sink) — no stale double-swallow.
+    // A later unrelated release of the same key encodes again (no stale
+    // double-swallow).
     assert_eq!(
         app.input(
             wid,

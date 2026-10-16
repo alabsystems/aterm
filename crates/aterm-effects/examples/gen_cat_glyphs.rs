@@ -9,7 +9,7 @@
 //! until the checked-in file matches.
 //!
 //! ```text
-//! cargo run -p aterm-effects --example gen_cat_glyphs
+//! targo --unverified run -p aterm-effects --example gen_cat_glyphs
 //! ```
 
 use std::path::Path;

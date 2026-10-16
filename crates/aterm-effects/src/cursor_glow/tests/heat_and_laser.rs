@@ -5,8 +5,8 @@
 
 use super::*;
 
-/// Sustained fast typing must leave a brighter, longer wake than relaxed
-/// typing at the SAME config — the heat ("acceleration") model.
+/// Sustained fast typing leaves a brighter, longer wake than relaxed typing at
+/// the same config (the heat model).
 #[test]
 fn sustained_typing_outshines_relaxed_typing() {
     let g = geom();
@@ -66,7 +66,7 @@ fn heat_cools_after_a_pause() {
     assert!(glow.heat < 0.1, "a pause cools the wake: {}", glow.heat);
 }
 
-/// A laser JUMP strikes LIGHTNING: a jagged main channel plus branch forks
+/// A laser jump strikes lightning: a jagged main channel plus branch forks
 /// spawn with the move (geometry frozen at spawn), keep emitting strobing
 /// light while alive, and decay to exactly nothing.
 #[test]
@@ -159,7 +159,7 @@ fn laser_typing_leaves_a_charged_crackling_trail() {
         trail_rooted,
         "crackle arcs root along the charged trail, not only at the head"
     );
-    // 0.45s after the last key the charged trail is STILL lit…
+    // 0.45 s after the last key the charged trail is still lit…
     glow.tick(
         Some((2, 14)),
         t + Duration::from_millis(450),
@@ -232,7 +232,7 @@ fn laser_is_monochrome() {
     }
 }
 
-/// A raw Ctrl-A/Home timestamp forges no LASER strike because it is not
+/// A raw Ctrl-A/Home timestamp forges no laser strike because it is not
 /// movement provenance. The same geometry under an explicit synthetic
 /// candidate still exercises the strike morphology.
 #[test]

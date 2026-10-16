@@ -7,10 +7,10 @@
 # vendored upstream (`vendor/`).
 name = "once_cell"
 # Not `version.workspace = true`: this is a semver contract with the consumers.
-# It must satisfy the strictest requirement (`read-fonts 0.43.2` asks
-# `^1.21.4`) and stay >= any other `1.x` once_cell in the graph, or cargo picks
-# the registry copy and the patch row is silently inert. `targo --unverified
-# forge check` fails if that happens.
+# It must satisfy the strictest requirement (`naga`, `wgpu-core` and
+# `wgpu-hal` 29.0.3 ask `^1.21`) and stay >= any other `1.x` once_cell in the
+# graph, or cargo picks the registry copy and the patch row is silently inert.
+# `targo --unverified forge check` fails if that happens.
 version = "1.21.4"
 edition.workspace = true
 license.workspace = true
@@ -21,28 +21,25 @@ description = "First-party `once_cell` replacement for aterm (sync/unsync/race c
 [lib]
 name = "once_cell"
 path = "src/lib.rs"
-# No unit tests: they live in tests/behaviour.rs and tests/consumers.rs.
+# No unit tests: they live in tests/behaviour.rs.
 test = false
 
 [dependencies]
-# None. Upstream's three are optional and no aterm cell enables them
-# (`tests/consumers.rs::no_cell_enables_a_feature_this_shim_ignores`).
+# None. Upstream's three are optional, behind the features this shim does not
+# declare (below).
 
 [features]
-# Upstream's nine feature names, declared (a `[patch]` target must accept every
-# feature its consumers ask for) and inert: `sync`, `unsync` and `race` are
-# always built. The implications are upstream's. `critical-section`,
-# `atomic-polyfill`, `parking_lot` and `portable-atomic` would change upstream's
-# implementation; `tests/consumers.rs` fails if a cell enables one.
+# Upstream's feature names that change nothing here, declared (a `[patch]`
+# target must accept every feature its consumers ask for) and inert: `sync`,
+# `unsync` and `race` are always built. The implications are upstream's.
+# `critical-section`, `atomic-polyfill`, `parking_lot` and `portable-atomic` are
+# NOT declared: each changes upstream's implementation, so a consumer that asks
+# for one fails to resolve instead of silently getting this one.
 default = ["std"]
 std = ["alloc"]
 alloc = ["race"]
 race = []
 unstable = []
-critical-section = ["portable-atomic"]
-atomic-polyfill = ["critical-section"]
-parking_lot = []
-portable-atomic = []
 
 [dev-dependencies]
 # No differential oracle: a registry `once_cell` would make `-p once_cell`

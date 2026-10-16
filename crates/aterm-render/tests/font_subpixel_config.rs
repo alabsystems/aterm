@@ -1,26 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! LINUX SUBPIXEL stage 1: the `font_subpixel` config key's renderer seam
-//! ([`Renderer::set_font_subpixel`]) — the one way to change the subpixel mode,
-//! mirroring the `font_hinting_config` suite.
-//!
-//! Laws under test, on the Linux subpixel seam:
-//! * the DEFAULT is `off` and the getter round-trips every canonical spelling;
-//! * a same-value set is a free `false`, a real change is `true`;
-//! * OFF renders NO chroma on an all-grey theme (every pixel R == G == B —
-//!   grayscale coverage of grey ink over grey ground cannot make colour), and
-//!   the flag defaulting OFF means the shipped pixels are untouched;
-//! * ON renders chroma-fringed stems (some pixel R != B): the actual win the
-//!   RFC's stage 1 exists to judge;
-//! * the OPAQUE-FRAME gate: `background_opacity < 1` falls back to grayscale
-//!   for the whole frame even with the mode on;
-//! * flips are reversible byte-for-byte (the overlay never contaminates the
-//!   shared grayscale store).
-//!
-//! On targets without the seam the setter is inert `false` and the getter pins
-//! `"off"` — asserted so the cross-platform contract is machine-checked
-//! everywhere the suite runs (macOS/Windows byte-identical is the lane law).
+//! The `font_subpixel` renderer seam ([`Renderer::set_font_subpixel`]), on Linux: the
+//! default is `off` and every spelling round-trips; a same-value set returns `false`; off
+//! renders no chroma on an all-grey theme, on renders chroma-fringed stems; a translucent
+//! frame (`background_opacity < 1`) falls back to grayscale; flips are reversible byte for
+//! byte. Without the seam the setter is inert and the getter reports `"off"`.
 
 #![cfg(feature = "embedded-font")]
 
@@ -29,8 +14,8 @@ use aterm_render::{Renderer, Theme};
 
 const LINUX_SEAM: bool = cfg!(all(unix, not(target_os = "macos")));
 
-/// All-grey theme: greyscale rendering of it is monochrome BY CONSTRUCTION,
-/// so any R != B pixel in a frame is subpixel chroma and nothing else.
+/// All-grey theme: grayscale rendering is monochrome, so any pixel whose channels differ is
+/// subpixel chroma.
 fn grey_theme() -> Theme {
     Theme {
         fg: 0x00FF_FFFF,
@@ -112,8 +97,7 @@ fn subpixel_fringes_appear_only_when_on_and_opaque() {
         "grayscale rendering of a grey theme must be monochrome"
     );
 
-    // ON: stems grow the coloured fringes (the whole point), and cell
-    // geometry never moves (the raster changes coverage, not metrics).
+    // On: stems grow coloured fringes; cell geometry never moves.
     r.set_font_subpixel("rgb");
     assert_eq!(r.cell_size(), cell, "subpixel never moves the cell box");
     let on = render_stems(&mut r);
@@ -129,7 +113,7 @@ fn subpixel_fringes_appear_only_when_on_and_opaque() {
         );
     }
 
-    // The OPAQUE-FRAME gate: translucency falls back to grayscale wholesale.
+    // Opaque-frame gate: translucency falls back to grayscale for the whole frame.
     r.set_background_opacity(0.9);
     let translucent = render_stems(&mut r);
     assert_eq!(
@@ -139,8 +123,8 @@ fn subpixel_fringes_appear_only_when_on_and_opaque() {
     );
     r.set_background_opacity(1.0);
 
-    // And back OFF: byte-identical to the first frame — the overlay cache
-    // never contaminates the shared grayscale store.
+    // Back off: byte-identical to the first frame (the overlay never touches the shared
+    // grayscale store).
     r.set_font_subpixel("off");
     let off_again = render_stems(&mut r);
     assert_eq!(off.pixels, off_again.pixels, "mode flips are reversible");

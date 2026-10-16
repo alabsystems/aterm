@@ -15,4 +15,5 @@ mod animal_species;
 mod corpus;
 mod english_fold_collisions;
 mod profanity_reaches_major_languages;
+mod serde_corpus;
 mod tricks;

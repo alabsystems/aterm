@@ -44,7 +44,7 @@ pub struct Cmd {
     /// `env VAR=… cmd` prefixes the script used.
     pub envs: Vec<(OsString, OsString)>,
     pub capture: Capture,
-    /// Spawn under utility QoS rather than the gate's inherited tier — see
+    /// Spawn under utility QoS rather than the run's inherited tier — see
     /// [`Cmd::demoted`] for which children may, and why the rest may not.
     pub demoted: bool,
     /// The directory the child starts in, in place of [`ExecEnv::cwd`] — a
@@ -55,16 +55,16 @@ pub struct Cmd {
     /// [`ExecEnv`]'s PATH, removals and additions are not applied, because the
     /// environment was recorded from a child that already had them
     /// ([`Cmd::replayed`]), or is a scratch one that must carry nothing of the
-    /// gate's ([`crate::first_exec`]).
+    /// run's ([`crate::first_exec`]).
     pub exact_env: bool,
     /// Text written at the head of the child's captured log before it starts
     /// ([`Capture::Emit`] only), so a ceiling kill's diagnostic, which reads that
     /// log, sees it too: cargo's `Running <target> (<path>)` header for a test
-    /// binary the gate runs itself, from which the TIMEOUT block names the
+    /// binary verify runs itself, from which the TIMEOUT block names the
     /// binary and the test still running ([`crate::libtest::note`]).
     pub preamble: Option<String>,
-    /// When the gate must end this child early — its ceiling fired, or the
-    /// gate itself was interrupted — send its group `SIGTERM` first and give it
+    /// When the run must end this child early — its ceiling fired, or the
+    /// run itself was interrupted — send its group `SIGTERM` first and give it
     /// this long to exit before the `SIGKILL`. `None` (the default): `SIGKILL`
     /// at once. See [`Cmd::term_grace`] for which children ask for it.
     pub term_grace: Option<Duration>,
@@ -143,33 +143,18 @@ impl Cmd {
     /// it), so a compile yields the CPU to the programs a person is typing into.
     /// Utility, not background (`-b`): background also throttles disk I/O hard.
     ///
-    /// WHY (2026-09-15). Every stage child used to start at the default band,
-    /// the band the user's shell and its programs run in: a `trustc` and the
-    /// Codex a person was typing into both read `pri 31` in `ps`. While ~45
-    /// runnable threads shared 18 cores, aterm's own share of a keystroke stayed
-    /// short (`key_write_p99_ms=6.29`) while the child's share, write to first
-    /// byte back, stretched to `echo_p95_ms=75.69 echo_p99_ms=150.04
-    /// echo_max_ms=367.85`. The program has to be scheduled to read the key,
-    /// update and repaint, and the compiles competed with it as equals. Measured:
-    /// under `taskpolicy -c utility` a child reads `pri 20`, under the
-    /// inherited tier `31`.
-    ///
-    /// Utility, not background (`-b`, `pri 4`): background also throttles disk
-    /// I/O hard, and a cold workspace compile is already the child that sets
-    /// [`DEFAULT_CHILD_CEILING`].
+    /// WHY: at the default band a compile competes as an equal with the program
+    /// a person is typing into, which has to be scheduled to read each key,
+    /// update and repaint; under load its keystroke echo stretched to hundreds of
+    /// milliseconds. Under `taskpolicy -c utility` a child reads `pri 20`, under
+    /// the inherited tier `31`. Utility, not background (`-b`, `pri 4`):
+    /// background also throttles disk I/O hard.
     ///
     /// ONLY FOR A CHILD THAT JUST COMPILES. A QoS clamp is inherited by
-    /// everything the child starts, and docs/RELEASING.md measured what that
-    /// does to a child the gate MEASURES: an aterm launched under UTILITY had
-    /// its paint probe's 50 ms timer fire 75 ms late, and the smoke went red 11
-    /// times in 30. So the test run, the measuring tests (the paint and spin
-    /// guards), the smokes, the drives and every other child that RUNS code keep
+    /// everything the child starts: an aterm launched under UTILITY fires its
+    /// paint probe's timers late and goes red. So the test run, the measuring
+    /// tests, the smokes, the drives and every other child that RUNS code keep
     /// the inherited tier. That is why this is opt-in per child, not a default.
-    ///
-    /// No gate compile is a release's critical path: the release builds the bytes
-    /// MEASURE judges itself, once (`aterm-release`'s build step), and hands the
-    /// MEASURE run that artifact, so every compile a gate run makes yields to the
-    /// desktop.
     #[must_use]
     pub fn demoted(mut self) -> Self {
         self.demoted = true;
@@ -178,16 +163,16 @@ impl Cmd {
 
     /// End this child with `SIGTERM` and a `grace` before the `SIGKILL`, so a
     /// shell suite's `trap … EXIT` runs. Every stage child leads its own process
-    /// group, and both ways the gate ends one early (the ceiling,
-    /// [`kill_and_reap`]; an interrupted gate, [`group::kill_on_interrupt`])
+    /// group, and both ways the run ends one early (the ceiling,
+    /// [`kill_and_reap`]; an interrupted run, [`group::kill_on_interrupt`])
     /// signal that group; bash runs its EXIT trap on `SIGTERM` but never on
     /// `SIGKILL`. Suites clean up scratch keychains, private instances' temp
     /// trees and daemons that left the group only in that trap.
     ///
     /// Opt-in, like [`Cmd::demoted`]: a compile has no trap, so the default is
-    /// the immediate `SIGKILL`. The grace is a bound, not a wait: the gate moves
+    /// the immediate `SIGKILL`. The grace is a bound, not a wait: the run moves
     /// on once the group has emptied, and a child still alive at its end is
-    /// `SIGKILL`ed. An interrupted gate waits at most [`TERM_GRACE`], whatever a
+    /// `SIGKILL`ed. An interrupted run waits at most [`TERM_GRACE`], whatever a
     /// child asked for.
     #[must_use]
     pub fn term_grace(mut self, grace: Duration) -> Self {
@@ -212,36 +197,31 @@ pub struct ExecEnv<'a> {
     pub path: &'a OsStr,
     pub scratch: &'a Path,
     /// The wall-clock ceiling on one child, or `None` to wait forever. Resolved
-    /// once from `--stage-timeout` ([`crate::Ctx::exec_env`]) and carried per
+    /// once from `--timeout` ([`crate::Ctx::exec_env`]) and carried per
     /// invocation, so a stage's decision is a function of a value a test can
     /// construct.
     pub child_ceiling: Option<Duration>,
     /// Variables removed from every child's inherited environment before its own
-    /// [`Cmd::envs`] are applied, so a stage that names a variable still wins.
-    /// Every run removes [`crate::CHILD_ENV_REMOVED`] (e.g. `CARGO_TARGET_DIR`,
-    /// since the lanes are the run's own directories).
+    /// [`Cmd::envs`] are applied, so a stage that names a variable still wins
+    /// ([`crate::CHILD_ENV_REMOVED`]).
     pub remove_env: &'a [&'a str],
     /// Variables added to every child, after [`Self::remove_env`] and before the
-    /// stage's own [`Cmd::envs`], so a stage that names a variable still wins.
-    /// Facts the whole run must agree on, resolved once on the main thread
-    /// ([`crate::CHILD_ENV`], [`crate::Ctx::with_pinned_child_facts`]): the git
-    /// stamp, `RUST_TEST_THREADS`, `TRUST_STAGE2_BIN`, `CARGO_INCREMENTAL=0`.
+    /// stage's own [`Cmd::envs`], so a stage that names a variable still wins:
+    /// facts the whole run must agree on, resolved once on the main thread
+    /// (`CARGO_TARGET_DIR`, `TRUST_STAGE2_BIN`, `RUST_TEST_THREADS`).
     pub add_env: &'a [(OsString, OsString)],
 }
 
 /// The one-minute load average, in-process: `getloadavg(3)` (libSystem, glibc
 /// and musl all have it; macOS answers it from the same `vm.loadavg` sysctl the
-/// spawn below prints). Read at each stage's start and end for its `time` line,
-/// its receipt `load` line and the verdict's under-load label
-/// ([`crate::ladder::StageLoad`]); `None` when neither this nor the spawn
-/// answers.
+/// spawn below prints). Read at each stage's start and end for its `time` line
+/// in the log ([`crate::ladder::StageLoad`]); `None` when neither this nor the
+/// spawn answers.
 ///
-/// It is a call, not a child, because the ladder asks twice per planned stage,
-/// before it decides whether the stage runs at all: a Fast plan is 22 stages,
-/// so a ladder that ran nothing still spawned `sysctl` 44 times (measured:
-/// 88 spawns for the two lean runs of one `environment_contract` test), each a
-/// fork and an exec on a machine whose load is the very thing being read. A
-/// reading that is not a finite non-negative number is as good as no answer.
+/// It is a call, not a child, because the run asks twice per planned stage: a
+/// spawn each would be a fork and an exec on a machine whose load is the very
+/// thing being read. A reading that is not a finite non-negative number is as
+/// good as no answer.
 #[must_use]
 pub fn load_average() -> Option<f64> {
     #[cfg(unix)]
@@ -257,13 +237,10 @@ pub fn load_average() -> Option<f64> {
 /// when there is none from the last ten): the test pool's admission reading
 /// ([`crate::Ctx::test_load`], [`crate::testrun::Limits::may_start`]).
 ///
-/// WHY NOT THE LOAD AVERAGE (2026-10-05): the one-minute load is an average
-/// that trails a burst by a minute. A warm gate's test run held two binaries
-/// at a time while the load read 14-18 on 14 cores, though its binaries spent
-/// 1,407 CPU-s in 264 s (5.3 cores) beside one other stage: their walls summed
-/// to 691 s, so the pool averaged 2.6 of its 8 and the cores it was protecting
-/// sat idle after each burst. Busy time over the last second answers what the
-/// pool asks — is a core free now — within a sample.
+/// WHY NOT THE LOAD AVERAGE: the one-minute load trails a burst by a minute,
+/// so a pool reading it holds back while the cores it protects sit idle after
+/// each burst. Busy time over the last second answers what the pool asks — is
+/// a core free now — within a sample.
 ///
 /// macOS: `host_statistics(HOST_CPU_LOAD_INFO)`; Linux: `/proc/stat`'s first
 /// line (iowait counts as idle). `None` elsewhere, or when the counters cannot
@@ -287,10 +264,9 @@ pub fn busy_cores() -> Option<f64> {
     if total == 0 {
         // No tick since the last reading. A caller asking again within one is
         // answered nothing, and macOS hands a process that asks many times a
-        // second its cached figures (measured 2026-10-05: five readers at once
-        // saw one total for half a second while the counters moved every
-        // 2.5 ms), so it is never asked again here: the pool reads once a
-        // second and falls back to the load average for this sample.
+        // second its cached figures, so it is never asked again here: the pool
+        // reads once a second and falls back to the load average for this
+        // sample.
         *last = Some((then, busy0, total0));
         return None;
     }
@@ -360,9 +336,8 @@ fn cpu_ticks() -> Option<(u64, u64)> {
 #[cfg(unix)]
 fn getloadavg_one() -> Option<f64> {
     unsafe extern "C" {
-        /// `<stdlib.h>`; declared here because this crate has no dependencies
-        /// ([`group`] declares its libc symbols the same way). `int` is `i32`
-        /// on every target this gate runs on.
+        /// `<stdlib.h>`, declared beside [`group`]'s own libc symbols. `int`
+        /// is `i32` on every target verify runs on.
         fn getloadavg(loadavg: *mut f64, nelem: i32) -> i32;
     }
     let mut load = [0f64; 1];
@@ -398,14 +373,13 @@ pub fn parse_load_average(text: &str) -> Option<f64> {
         .and_then(|t| t.parse().ok())
 }
 
-/// The host's physical memory in bytes, read once per run for the plan's memory
-/// decisions ([`crate::plan::land_builds`], [`crate::testrun::memory_jobs`]), and
-/// whether it is Linux's `MemTotal` (a few percent under the installed RAM);
-/// `None` when the host will not say.
+/// The host's physical memory in bytes, read once per run for the test pool's
+/// memory cap ([`crate::testrun::memory_jobs`]), and whether it is Linux's
+/// `MemTotal` (a few percent under the installed RAM); `None` when the host
+/// will not say.
 ///
-/// The same two sources `tools/trust-gate-all.sh` reads for the trust lane's
-/// `HOST:` figure: Linux's `MemTotal` from `/proc/meminfo`, else `sysctl -n
-/// hw.memsize` (macOS: the RAM the machine was sold with). Read here and not
+/// Linux's `MemTotal` from `/proc/meminfo`, else `sysctl -n hw.memsize`
+/// (macOS: the RAM the machine was sold with). Read here and not
 /// through `aterm_sysprobe::physical_memory_mib` because this crate takes no
 /// dependency on any aterm crate (its `Cargo.toml` says why).
 #[must_use]
@@ -428,69 +402,6 @@ pub fn host_memory_bytes() -> Option<(u64, bool)> {
         .ok()
         .filter(|&b: &u64| b > 0)
         .map(|b| (b, false))
-}
-
-/// The memory this host can GIVE builds now, in bytes, read once per run beside
-/// [`host_memory_bytes`] and held under its `physical` figure: Linux's
-/// `MemAvailable`; on macOS the physical memory less what the kernel holds
-/// wired, which no build can page out. `None` when the host will not say.
-///
-/// WHY (measured 2026-10-06, the 8 GiB Mac): the kernel held 228,350 wired
-/// 16 KiB pages (3.5 GiB) with nothing building — a degraded state a reboot
-/// clears — and three workspace builds sized for 8 GiB thrashed for 3 h 25 min
-/// without finishing the test compile ([`crate::plan::land_builds`]).
-#[must_use]
-pub fn host_usable_bytes(physical: u64) -> Option<u64> {
-    if let Ok(text) = std::fs::read_to_string("/proc/meminfo") {
-        return parse_meminfo(&text, "MemAvailable:").map(|b| b.min(physical));
-    }
-    host_wired_bytes().map(|wired| physical.saturating_sub(wired))
-}
-
-/// The memory the kernel holds wired, in bytes: `host_statistics64`'s
-/// `wire_count` times the host page size — `vm_stat`'s "Pages wired down".
-#[cfg(target_os = "macos")]
-fn host_wired_bytes() -> Option<u64> {
-    unsafe extern "C" {
-        /// `<mach/mach_init.h>`: this task's send right to its host port.
-        fn mach_host_self() -> u32;
-        /// `<mach/mach_host.h>`; `host_info64_t` is `integer_t *`.
-        fn host_statistics64(host: u32, flavor: i32, info: *mut i32, count: *mut u32) -> i32;
-        /// `<mach/mach_host.h>`; `vm_size_t` is `uintptr_t`.
-        fn host_page_size(host: u32, size: *mut usize) -> i32;
-    }
-    /// `HOST_VM_INFO64` and `HOST_VM_INFO64_COUNT`: `vm_statistics64` is 152
-    /// bytes, 38 `integer_t`s, and `wire_count` is its fourth `natural_t`.
-    const HOST_VM_INFO64: i32 = 4;
-    const COUNT: u32 = 38;
-    // SAFETY: no arguments; it returns a port name this task keeps.
-    let host = unsafe { mach_host_self() };
-    let mut page: usize = 0;
-    // SAFETY: `page` is one writable `vm_size_t`.
-    if unsafe { host_page_size(host, &raw mut page) } != 0 || page == 0 {
-        return None;
-    }
-    let mut info = [0_i32; COUNT as usize];
-    let mut count = COUNT;
-    // SAFETY: `info` is `COUNT` writable `integer_t`s and `count` says so; the
-    // kernel writes at most `count` of them.
-    let kr = unsafe { host_statistics64(host, HOST_VM_INFO64, info.as_mut_ptr(), &raw mut count) };
-    if kr != 0 || count < 4 {
-        return None;
-    }
-    #[expect(
-        clippy::cast_sign_loss,
-        reason = "a natural_t counter handed back as integer_t"
-    )]
-    let wired = u64::from(info[3] as u32);
-    Some(wired.saturating_mul(u64::try_from(page).ok()?))
-}
-
-/// The memory the kernel holds wired: unread off macOS (Linux answers
-/// `MemAvailable` instead, [`host_usable_bytes`]).
-#[cfg(not(target_os = "macos"))]
-fn host_wired_bytes() -> Option<u64> {
-    None
 }
 
 /// `MemTotal:  16303612 kB` from `/proc/meminfo`, in bytes.
@@ -520,7 +431,7 @@ pub struct Run {
     pub ok: bool,
     pub output: String,
     /// The exit code, for the stages whose child says more than pass/fail (the
-    /// redraw gate's `2` is "could not run here"). `None` for a signal death or
+    /// redraw harness's `2` is "could not run here"). `None` for a signal death or
     /// a child that never spawned.
     pub code: Option<i32>,
     /// Set when the child could not be spawned at all (tool vanished mid-run).
@@ -541,7 +452,7 @@ impl Run {
     /// never spawned ([`Run::spawn_error`]), when its output carries
     /// [`ENOSPC_SENTENCE`] (it ran out of disk), or when every failed test says
     /// the machine refused it ([`crate::libtest::COULD_NOT_RUN_SENTINEL`], e.g.
-    /// aterm-link's stray-daemon guard or a starved paint take; one failure
+    /// a headless boot the OS refused or a starved paint take; one failure
     /// without it keeps the child a finding,
     /// [`crate::libtest::environment_refusals`]). `None` for a child that ran and
     /// answered, pass or fail. [`crate::ladder::Report::fail_child`] asks this
@@ -582,7 +493,7 @@ impl Run {
 
 /// The default wall-clock ceiling on one stage child: 3 hours.
 ///
-/// Without a ceiling a deadlocked stage does not turn the gate red, it makes it
+/// Without a ceiling a deadlocked stage does not turn the run red, it makes it
 /// silent. The ceiling only tells wedged from slow, so it sits far above the
 /// slowest honest child (a cold full-workspace build or `--no-fail-fast` test
 /// run on a loaded machine): a false kill turns a true green into a false red
@@ -595,9 +506,89 @@ impl Run {
 /// its own session), and the diagnostic says so.
 pub const DEFAULT_CHILD_CEILING: Duration = Duration::from_secs(3 * 60 * 60);
 
+/// Why an in-process walk ([`bounded`]) gave no answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unfinished {
+    /// Still running at the ceiling. Its command scope has been closed and
+    /// its children reaped; a stuck in-process walk may outlive the row.
+    TimedOut(Duration),
+    /// It panicked (the panic printed on stderr).
+    Panicked,
+}
+
+impl Unfinished {
+    /// The reason, for a NOT RUN row.
+    #[must_use]
+    pub fn sentence(self) -> String {
+        match self {
+            Self::TimedOut(d) => format!("did not finish within the {}s ceiling", d.as_secs()),
+            Self::Panicked => "panicked (above, on stderr)".to_string(),
+        }
+    }
+}
+
+/// Run an in-process walk on a thread of its own under the same wall-clock
+/// ceiling as a child (`None` is `--timeout off`): a walk that hangs ends its
+/// row, never the run.
+///
+/// # Errors
+/// [`Unfinished`]: the walk timed out or panicked.
+pub fn bounded<T: Send + 'static>(
+    ceiling: Option<Duration>,
+    walk: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, Unfinished> {
+    bounded_wait(walk, |rx| match ceiling {
+        Some(limit) => rx.recv_timeout(limit).map_err(|e| match e {
+            std::sync::mpsc::RecvTimeoutError::Timeout => Unfinished::TimedOut(limit),
+            std::sync::mpsc::RecvTimeoutError::Disconnected => Unfinished::Panicked,
+        }),
+        None => rx.recv().map_err(|_| Unfinished::Panicked),
+    })
+}
+
+/// The same wait with an injected receiver verdict: tests can reach the
+/// deadline only after the real child has announced itself, without racing
+/// first-exec scheduling against a short timer.
+fn bounded_wait<T: Send + 'static>(
+    walk: impl FnOnce() -> T + Send + 'static,
+    wait: impl FnOnce(std::sync::mpsc::Receiver<T>) -> Result<T, Unfinished>,
+) -> Result<T, Unfinished> {
+    struct Close(std::sync::Arc<output::Scope>);
+    impl Drop for Close {
+        fn drop(&mut self) {
+            self.0.close();
+        }
+    }
+    let scope = Close(std::sync::Arc::new(output::Scope::default()));
+    let executor = std::sync::Arc::clone(&scope.0);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        aterm_uds::output::with_executor(
+            std::sync::Arc::new(move |command| executor.output(command)),
+            || {
+                // A timed-out receiver rejects the returned value. Keep its
+                // destructor under the same closed command scope as the walk.
+                tx.send(walk()).ok();
+            },
+        );
+    });
+    let answer = wait(rx);
+    // Closing and command admission use the same lock. A command already
+    // admitted kills/reaps before releasing its permit; a late one is refused.
+    // No arbitrary Rust/FS walk is joined while it may still be stuck.
+    drop(scope);
+    if worker.is_finished() {
+        let _ = worker.join();
+    }
+    answer
+}
+
+#[path = "exec_output.rs"]
+mod output;
+
 /// The `SIGTERM` grace the stage suites ask for ([`Cmd::term_grace`]), and the
-/// longest an interrupted gate waits for any group it sent `SIGTERM` before it
-/// `SIGKILL`s the rest and dies. A bound, not a sleep: the gate stops waiting
+/// longest an interrupted run waits for any group it sent `SIGTERM` before it
+/// `SIGKILL`s the rest and dies. A bound, not a sleep: the run stops waiting
 /// once every such group has exited, or at a second interrupt.
 pub const TERM_GRACE: Duration = Duration::from_secs(10);
 
@@ -605,12 +596,12 @@ pub const TERM_GRACE: Duration = Duration::from_secs(10);
 /// `Duration::from_secs_f64` panics outright on a value it cannot hold.
 const MAX_CEILING_SECS: f64 = 3_153_600_000.0;
 
-/// Parse a `--stage-timeout` value: `Some(Some(d))` moves
-/// [`DEFAULT_CHILD_CEILING`] to `d` (seconds, fractional accepted), `Some(None)`
-/// removes it (`0`, `off`, `none`, `never`), and `None` is a value this cannot
-/// read, which the command line refuses as a usage error. Removing the ceiling
-/// must be typed (`--stage-timeout off`), never reached by typing `45m` into a
-/// field that wants seconds.
+/// Parse a `--timeout` value: `Some(Some(d))` moves [`DEFAULT_CHILD_CEILING`]
+/// to `d` (seconds, fractional accepted), `Some(None)` removes it (`0`, `off`,
+/// `none`, `never`), and `None` is a value this cannot read, which the command
+/// line refuses as a usage error. Removing the ceiling must be typed
+/// (`--timeout off`), never reached by typing `45m` into a field that wants
+/// seconds.
 #[must_use]
 pub fn parse_ceiling(text: &str) -> Option<Option<Duration>> {
     let text = text.trim();
@@ -635,8 +626,8 @@ pub fn parse_ceiling(text: &str) -> Option<Option<Duration>> {
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// macOS's QoS launcher, the same one `snapshot::delete_in_background` uses for
-/// trash deletion. Absent elsewhere, where a [`Cmd::demoted`] child runs as is.
+/// macOS's QoS launcher. Absent elsewhere, where a [`Cmd::demoted`] child runs
+/// as is.
 pub const TASKPOLICY: &str = "/usr/sbin/taskpolicy";
 
 /// Spawn, wait, and collect. Never panics on a missing tool: an unspawnable
@@ -778,11 +769,11 @@ fn resolves(cmd: &Cmd, env: ExecEnv<'_>) -> bool {
 /// two disagree. Lossy, so one stray byte costs neither.
 ///
 /// While the child runs, its process group is on [`group`]'s live list, so an
-/// interrupted gate takes it down too; while it is being spawned it is counted
-/// in flight ([`group::Spawning`]), so an interrupted gate waits for it to get
+/// interrupted run takes it down too; while it is being spawned it is counted
+/// in flight ([`group::Spawning`]), so an interrupted run waits for it to get
 /// there. The child is reaped through one door ([`group::Live::reap`]), which
-/// leaves it unreaped once an interrupted gate may have seen its group: the
-/// gate signals a group only while it holds the group's leader.
+/// leaves it unreaped once an interrupted run may have seen its group: the
+/// run signals a group only while it holds the group's leader.
 fn finish(
     mut c: Command,
     cmd: &Cmd,
@@ -792,7 +783,7 @@ fn finish(
     let read_log = |log: Option<&Path>| {
         log.map(|p| String::from_utf8_lossy(&std::fs::read(p).unwrap_or_default()).into_owned())
     };
-    // An interrupted gate is on its way down: a child spawned now would only be
+    // An interrupted run is on its way down: a child spawned now would only be
     // killed. The handler raises the flag before it signals anything, so at most
     // a spawn already past this check races it. Between `spawn` and the live
     // list that child exists and the handler cannot name its group, so the
@@ -803,7 +794,7 @@ fn finish(
     // the log, so the handler never waits on a file.
     #[cfg(unix)]
     let spawning = group::Spawning::begin();
-    // A stand-in gate's hold on the window, for the tests of it: here, with
+    // A stand-in run's hold on the window, for the tests of it: here, with
     // the spawn counted and the flag not yet read, or below, once the child
     // exists.
     #[cfg(all(test, unix))]
@@ -812,7 +803,7 @@ fn finish(
     if group::stopping() {
         drop(spawning);
         return (
-            failed_to_wait("the gate was interrupted before this child started"),
+            failed_to_wait("the run was interrupted before this child started"),
             read_log(log),
             None,
         );
@@ -891,11 +882,9 @@ struct Stage {
 ///
 /// On Unix this is `wait4(2)`, std's `wait` with the `rusage` it drops: a test
 /// run's wall time on a saturated machine says how long a binary waited, its CPU
-/// what it cost everything else (measured 2026-10-05: a gate test run at load
-/// 12-20 on 14 cores moved 3 % while summed binary walls moved 7 %). It goes
-/// through [`group::Live::reap`], the one door a stage child is reaped
-/// through, which answers an error instead of reaping once an interrupted gate
-/// may have seen the child's group. Once this reaps, the `Child` is never
+/// what it cost everything else. It goes through [`group::Live::reap`], the one
+/// door a stage child is reaped through, which answers an error instead of
+/// reaping once an interrupted run may have seen the child's group. Once this reaps, the `Child` is never
 /// waited on again: [`kill_and_reap`] runs only on a child that has not exited.
 fn reap(
     stage: &mut Stage,
@@ -925,16 +914,13 @@ fn reap(
 ///
 /// Every signal here goes to the group while this thread holds its leader, the
 /// child, unreaped, and the reap comes last, through the one door
-/// ([`group::Live`] has the rule and why: a group's id is the gate's only
-/// while its leader is, and a reaped leader's id was another process's within
-/// 3 ms when a probe aimed for it). The kill is repeated until the group
-/// has stayed empty a while ([`group::Live::kill`]): one `SIGKILL` misses a
-/// process the group was making as it landed. That costs every ceiling kill
-/// its quiet rounds, the one that took its whole group at once too: a `sleep`
-/// killed at its ceiling was reported 1.4 ms after it before and is 51 ms
-/// after it now (the median of 40, measured 2026-10-13). Rounds that ran out
-/// with a process still there are reported, since the block below would
-/// otherwise say the group is gone.
+/// ([`group::Live`] has the rule and why: a group's id is the run's only
+/// while its leader is, and a reaped leader's id can be another process's
+/// within milliseconds). The kill is repeated until the group has stayed empty
+/// a while ([`group::Live::kill`]): one `SIGKILL` misses a process the group
+/// was making as it landed. That costs every ceiling kill its quiet rounds
+/// (about 50 ms). Rounds that ran out with a process still there are reported,
+/// since the block below would otherwise say the group is gone.
 ///
 /// With a `grace` ([`Cmd::term_grace`]) the group is sent `SIGTERM` first and
 /// given up to `grace` to empty, polled without reaping so the id stays held. A
@@ -946,7 +932,7 @@ fn reap(
 fn kill_and_reap(stage: &mut Stage, grace: Option<Duration>) -> String {
     // Held, for every signal below: the child is reaped by this function's
     // last statement and by nothing before it (the grace's early return
-    // reaps as its own last step), so the group's id is the gate's throughout.
+    // reaps as its own last step), so the group's id is the run's throughout.
     #[cfg(unix)]
     let term = match grace {
         None => String::new(),
@@ -986,7 +972,7 @@ fn kill_and_reap(stage: &mut Stage, grace: Option<Duration>) -> String {
              apart: one may be running on)\n",
             group::KILL_ROUNDS
         ),
-        // By pid, and the child is not reaped yet: the pid is the gate's.
+        // By pid, and the child is not reaped yet: the pid is the run's.
         Err(e) => match stage.child.kill() {
             Ok(()) => format!(
                 "  (killing its process group failed: {e} — SIGKILL reached the direct child \
@@ -1001,7 +987,7 @@ fn kill_and_reap(stage: &mut Stage, grace: Option<Duration>) -> String {
         Err(e) => format!("  (SIGKILL itself failed: {e})\n"),
     };
     // Reap, so no zombie is left for the rest of the run: last, and through
-    // the door, which leaves the zombie where an interrupted gate may still
+    // the door, which leaves the zombie where an interrupted run may still
     // signal its group. SIGKILL is not maskable, so this returns once the
     // kernel has torn the process down.
     let _ = reap(stage, true);
@@ -1034,8 +1020,8 @@ fn over_ceiling(
              {note}\
              {kill}\
              \x20 Never a pass and never a skip: the child never exited.\n\
-             \x20 Raise the ceiling with --stage-timeout <seconds>, or remove it with \
-             --stage-timeout off.\n\
+             \x20 Raise the ceiling with --timeout <seconds>, or remove it with \
+             --timeout off.\n\
              \x20 The kill reached the child's whole process group (a targo's trustc \
              processes, a harness's own children); only a process that left the group — one \
              that started its own session, as a PTY-hosted shell does — may still be running.\n"
@@ -1048,22 +1034,21 @@ fn over_ceiling(
     }
 }
 
-/// Every stage child leads a process group of its own, so the gate can end
+/// Every stage child leads a process group of its own, so the run can end
 /// everything a stage started: the ceiling kills the whole group
-/// ([`kill_and_reap`]), and an interrupted gate kills every group still running
+/// ([`kill_and_reap`]), and an interrupted run kills every group still running
 /// ([`group::kill_on_interrupt`]), the group of a child a stage was in the
 /// middle of spawning among them ([`group::Spawning`], which also says what
-/// that leaves). Survivors (a hung test's `aterm-gui --headless` daemons, say)
-/// would otherwise hold sockets and CPU and trip the next run's stray-daemon
-/// guard.
+/// that leaves). Survivors (a hung test's `aterm --headless` daemons, say)
+/// would otherwise hold sockets and CPU past the run.
 ///
 /// A GROUP IS SIGNALLED ONLY WHILE THE GATE HOLDS ITS LEADER. A group's id is
-/// its leader's pid, and that number is the gate's only while the leader is
+/// its leader's pid, and that number is the run's only while the leader is
 /// its child, running or exited and not yet reaped: the kernel hands out no
 /// id that is in use, and hands a reaped leader's on to the next process to
 /// reach it. So the runner sends a group nothing, not even the question
 /// "anyone there?", once it has reaped the group's leader, and a leader an
-/// interrupted gate may still signal is never reaped at all
+/// interrupted run may still signal is never reaped at all
 /// ([`group::Live`] has the rule, the argument and the measurements).
 ///
 /// One `SIGKILL` does not end a group that is making a process at that
@@ -1074,15 +1059,15 @@ fn over_ceiling(
 /// what it costs every kill and what is left).
 ///
 /// The interrupt half is why this needs `unsafe`: a child in its own group no
-/// longer receives the terminal's `SIGINT`, so the gate must forward it, and std
+/// longer receives the terminal's `SIGINT`, so the run must forward it, and std
 /// has no signal handling. The handler does only async-signal-safe work: atomic
 /// loads and stores, `killpg`, `nanosleep` (the bounded `SIGTERM` grace,
 /// [`Cmd::term_grace`], the bounded wait for a spawn in flight, and the
 /// bounded rounds of the repeated kill), then
-/// `signal(SIG_DFL)` and `raise`, so the gate still
+/// `signal(SIG_DFL)` and `raise`, so the run still
 /// dies of the signal it was sent (of the last, when a second one hurried it).
-/// This crate has no dependencies, so its libc symbols are declared here, with
-/// `wait4` and `waitid`, which [`reap`] uses and the handler does not.
+/// Its libc symbols are declared here, with `wait4` and `waitid`, which
+/// [`reap`] uses and the handler does not.
 #[cfg(unix)]
 pub mod group {
     use std::ffi::c_long;
@@ -1096,7 +1081,7 @@ pub mod group {
     const SIG_DFL: usize = 0;
 
     /// `struct timespec`: `time_t` and `long` are both `long` on every LP64
-    /// target this gate runs on (macOS and Linux, arm64 and x86_64).
+    /// target verify runs on (macOS and Linux, arm64 and x86_64).
     #[repr(C)]
     struct Timespec {
         tv_sec: c_long,
@@ -1115,7 +1100,7 @@ pub mod group {
     }
 
     /// `struct rusage`: the two times, then fourteen `long` counters this reads
-    /// none of; 144 bytes on every LP64 target this gate runs on.
+    /// none of; 144 bytes on every LP64 target verify runs on.
     #[repr(C)]
     #[derive(Default)]
     struct Rusage {
@@ -1159,9 +1144,9 @@ pub mod group {
     /// handler never reads a group with another child's flag.
     static LIVE: [AtomicI32; 256] = [const { AtomicI32::new(0) }; 256];
 
-    /// The interrupt that began ending the gate, `0` until one arrives. The
+    /// The interrupt that began ending the run, `0` until one arrives. The
     /// handler sets it before it signals anything, so no stage starts a child
-    /// the gate is about to kill (`finish` asks). One atomic says both that an
+    /// the run is about to kill (`finish` asks). One atomic says both that an
     /// interrupt is not the first and which signal the first was
     /// ([`on_signal`]).
     static STOPPING: AtomicI32 = AtomicI32::new(0);
@@ -1177,17 +1162,14 @@ pub mod group {
 
     /// How many rounds [`on_signal`] waits, at most, for the spawns in
     /// flight to reach the live list. A round is a 1 ms [`nap`], so this is
-    /// about a second (1.3 s when it was measured), and it is paid only
-    /// while a spawn is in flight: the wait ends on the first round that
-    /// finds none.
+    /// about a second, paid only while a spawn is in flight: the wait ends on
+    /// the first round that finds none.
     ///
-    /// Why a second. A spawn is in flight for the length of one
-    /// `Command::spawn`: 0.09 ms at the median and 0.25 ms at the most over
-    /// 4,000 spawns on an idle 18-core Mac, and 1.3 ms and 84 ms over 6,000
-    /// at a load of 42 to 52 (measured 2026-10-13). A second is twelve
-    /// times the worst of those. It is not longer because one case pays it
-    /// whole and gains nothing ([`Spawning`], what is left), and it is small
-    /// beside the ten seconds an interrupted gate already gives a suite
+    /// Why a second: a spawn is in flight for the length of one
+    /// `Command::spawn`, well under a millisecond idle and under 100 ms at the
+    /// worst under heavy load. It is not longer because one case pays it whole
+    /// and gains nothing ([`Spawning`], what is left), and it is small beside
+    /// the ten seconds an interrupted run already gives a suite
     /// ([`super::TERM_GRACE`]).
     const SPAWN_ROUNDS: u16 = 1_000;
 
@@ -1198,83 +1180,49 @@ pub mod group {
     ///
     /// WHY A SIGKILL IS REPEATED. On macOS a group's `SIGKILL` reaches the
     /// members the group has at that instant and not a process one of them
-    /// is making: a signal does not find a child until its `fork` or
-    /// `posix_spawn` is nearly done (read in xnu-12377: `killpg` looks each
-    /// member up with `proc_find`, which refuses a process still being
-    /// made). The parent dies and the child runs on. Measured 2026-10-13 on
-    /// macOS 26.6 with no gate in it, one `SIGKILL` at a group whose leader
-    /// was inside the call: the child was left in 1,435 of 3,000 groups for
-    /// a `fork`, in 498 of 3,000 for a `posix_spawn`, and in 807 of 2,000
-    /// groups forking back to back. One more `SIGKILL` reaches it once the
-    /// call is over: each of 11,000 such groups was emptied by one.
+    /// is making: `killpg` looks each member up with `proc_find`, which
+    /// refuses a process still being made (xnu). The parent dies and the
+    /// child runs on, for a large share of groups killed mid-`fork` or
+    /// mid-`posix_spawn`. One more `SIGKILL` reaches it once the call is over.
     ///
-    /// WHY NOT "UNTIL THE GROUP IS GONE". `killpg` answers whether it found
-    /// a process (a group down to its unreaped leader says `EPERM`, an
-    /// empty one `ESRCH`: 200 of 200 each), and it can answer "nobody"
-    /// while a child is still on its way. A process stops answering when
-    /// the thread that takes the kill begins its exit, and another of its
-    /// threads can be inside `posix_spawn` then: for that long neither
-    /// parent nor child is found. Killing only while the group answered
-    /// left a `sleep` in 19 of 3,000 groups whose second thread was
-    /// spawning, and in 16 of 1,500 spawning back to back. `fork` is spared
-    /// (its kernel half ends the child of a process that has begun to
-    /// exit), and so is every process with one thread, a shell among them,
-    /// which answers until its `fork` is over. A `targo` or a test harness
-    /// is neither. So the rule is time, [`QUIET_ROUNDS`]: a group is done
-    /// with when that many rounds running have found nobody in it.
+    /// WHY NOT "UNTIL THE GROUP IS GONE". `killpg` answers whether it found a
+    /// process (a group down to its unreaped leader says `EPERM`, an empty one
+    /// `ESRCH`), and it can answer "nobody" while a child is still on its way:
+    /// a process stops answering when the thread that takes the kill begins
+    /// its exit, and another of its threads can be inside `posix_spawn` then.
+    /// `fork` is spared (its kernel half ends the child of a process that has
+    /// begun to exit), and so is every single-threaded process; a `targo` or a
+    /// test harness is neither. So the rule is time, [`QUIET_ROUNDS`]: a group
+    /// is done with when that many rounds running have found nobody in it.
     ///
-    /// WHAT IT BUYS. On stand-in gates whose stage was making processes
-    /// back to back as the kill landed (measured the same day, at a load of
-    /// 13 to 22 on 18 cores): one kill, as before, left a process of the
-    /// stage after 50 and 62 of 300 ceiling kills of a forking shell
-    /// (without a grace, and with one it ignored), after 80 and 59 of 300
-    /// interrupts of it, and after 45 of 300 ceiling kills and 27 of 300
-    /// interrupts of a stage spawning from a second thread. With the
-    /// rounds: none of 500 each.
+    /// THE BOUND. A group that keeps answering is killed this many times and
+    /// no more: a third of a second. A group that emptied stops answering
+    /// within tens of milliseconds even under heavy load.
     ///
-    /// THE BOUND. A group that keeps answering is killed this many times
-    /// and no more: a third of a second, at 1.26 ms a round. One that
-    /// emptied stopped answering within 30 ms of its kill at a load of 42
-    /// to 64 (within 1.8 ms at a load under 28), and no group in 25,100
-    /// kills by this rule took more than 14 rounds over its quiet ones.
+    /// ONLY ON macOS ([`REPEATS`]). Linux's `fork` takes the group's lock to
+    /// add the child and fails if a fatal signal is pending for the parent by
+    /// then, so the kill takes the child with the parent or there is no child
+    /// (`copy_process`); there an unreaped zombie answers `killpg` too, so
+    /// these rounds would only ever run out. Any other Unix gets its one
+    /// `SIGKILL`.
     ///
-    /// ONLY WHERE IT WAS MEASURED ([`REPEATS`]): macOS. Linux needs none of
-    /// it: its `fork` takes the group's lock to add the child, and fails if
-    /// a fatal signal is pending for the parent by then, so the kill takes
-    /// the child with the parent or there is no child (`copy_process`, read
-    /// in v6.12; nothing here was run on Linux). There an unreaped zombie
-    /// answers `killpg` too, so these rounds would only ever run out. On
-    /// any other Unix nothing was measured and nothing was read: a group
-    /// is sent its one `SIGKILL` there, as before.
-    ///
-    /// WHAT IS LEFT. A process that left the group, as before. A child
-    /// that takes longer to appear than the quiet rounds last. And a group
-    /// that still holds a process after every round: something in it makes
-    /// processes faster than a kill a millisecond ends them, and the
-    /// ceiling's report says so.
+    /// WHAT IS LEFT. A process that left the group. A child that takes longer
+    /// to appear than the quiet rounds last. And a group that still holds a
+    /// process after every round: something in it makes processes faster than
+    /// a kill a millisecond ends them, and the ceiling's report says so.
     pub(super) const KILL_ROUNDS: u16 = 250;
 
     /// How many rounds in a row must find nobody in any group before
-    /// [`rekill`] stops. It is what every `SIGKILL` of this runner now
-    /// costs when it took its whole group at once, which is nearly every
-    /// time: 50 ms, where an interrupted stand-in gate used to be gone
-    /// 0.3 ms after its signal.
+    /// [`rekill`] stops: what every `SIGKILL` of this runner costs when it
+    /// took its whole group at once, about 50 ms.
     ///
     /// It has to outlast a `posix_spawn` in flight in a process that has
-    /// already stopped answering ([`KILL_ROUNDS`]). Measured 2026-10-13,
-    /// groups that read as empty and then answered again did so 1.2 ms
-    /// after their kill at the latest, at a load of 3 to 28 (544 of them)
-    /// and at a load of 42 to 64 under a load generator (696 of them), and
-    /// 8.9 ms after it while another job's build was starting up beside
-    /// them (355 of them: 2.2 ms at the ninetieth percentile, 5.9 ms at the
-    /// ninety-ninth). Forty rounds are over five times the longest of
-    /// those.
-    ///
-    /// THE COST IS TAKEN ON PURPOSE (ruled 2026-10-13). A kill is a rare
-    /// event, a stage over its ceiling or an interrupt, and no rule that
-    /// costs a clean kill nothing is correct: one empty answer is exactly
-    /// the reading that was measured wrong for a process that spawns from a
-    /// second thread, which a `targo` and a test harness both are.
+    /// already stopped answering ([`KILL_ROUNDS`]): groups that read as empty
+    /// and then answered again did so within ~9 ms of their kill, even beside
+    /// a build starting up, and forty rounds are over five times that. The
+    /// cost is taken on purpose: a kill is rare, and one empty answer is
+    /// exactly the reading that is wrong for a process that spawns from a
+    /// second thread.
     ///
     /// The same quiet is asked of a group that a `SIGTERM` seems to have
     /// emptied, before the ceiling's grace believes it ([`Live::gone`]).
@@ -1287,16 +1235,16 @@ pub mod group {
     pub(super) const REPEATS: bool = cfg!(target_os = "macos");
 
     /// Whether this module can see that a child has exited without reaping
-    /// it ([`exited`]), which is what lets an interrupted gate signal a
+    /// it ([`exited`]), which is what lets an interrupted run signal a
     /// group without ever signalling an id it no longer holds ([`Live`]):
     /// on macOS and Linux, where `waitid`'s numbers were read. Nowhere else
-    /// does the gate catch an interrupt ([`kill_on_interrupt`]).
+    /// does the run catch an interrupt ([`kill_on_interrupt`]).
     pub(super) const HOLDS: bool = cfg!(any(target_os = "macos", target_os = "linux"));
 
     /// What a stage is told of a child [`Live::reap`] left unreaped, in
     /// place of a status.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    const KEPT: &str = "the gate was interrupted while this child ran";
+    const KEPT: &str = "the run was interrupted while this child ran";
 
     /// How many stage groups are on the live list now (a graced group's negative
     /// entry counts): what a test waits on before it interrupts.
@@ -1316,15 +1264,12 @@ pub mod group {
 
     /// A spawn in flight, for as long as this value lives. `finish` holds
     /// one from before it asks [`stopping`] until its child's group is on
-    /// [`LIVE`], or until it knows there is no child (the gate was stopping,
+    /// [`LIVE`], or until it knows there is no child (the run was stopping,
     /// or the spawn failed). In between a child can exist that the list does
     /// not hold yet. It leads its own group, so neither the handler's sweeps
-    /// nor the terminal's Ctrl-C reach it, and until 2026-10-13 it ran on
-    /// after an interrupted gate had died: measured then on a stand-in gate
-    /// spawning children back to back, 35 of 600 interrupts left one with
-    /// one stage thread and 84 of 400 with four. [`on_signal`] now waits
-    /// for the count to reach zero and then sweeps the list once more, and
-    /// none of 1,000 did either way.
+    /// nor the terminal's Ctrl-C reach it, and unwaited for it would run on
+    /// after an interrupted run had died. So [`on_signal`] waits for the
+    /// count to reach zero and then sweeps the list once more.
     ///
     /// WHY THAT MISSES NO CHILD. `finish` raises the count and then reads
     /// [`STOPPING`]. The handler claims `STOPPING` and, after its kills,
@@ -1332,7 +1277,7 @@ pub mod group {
     /// steps have one order, and `finish`'s read of the flag falls on one
     /// side of the handler's claim:
     ///
-    /// - after it: `finish` reads the gate stopping and spawns nothing;
+    /// - after it: `finish` reads the run stopping and spawns nothing;
     /// - before it: then the raise came before the claim too, and so before
     ///   the handler's read of the count. The handler reads the count
     ///   raised until `finish` lowers it, and `finish` lowers it only once
@@ -1354,41 +1299,25 @@ pub mod group {
     ///   gets the handler is the kernel's choice. macOS and Linux both offer a
     ///   signal sent to the process to its main thread first (XNU's
     ///   `get_signalthread`, Linux's `complete_signal`), and the ladder's
-    ///   children are started by stage threads, so in a gate this is the main
-    ///   thread's own toolchain query and nothing a stage runs. Measured
-    ///   2026-10-13 on macOS 26.6: with stage threads spawning, none of 3,800
-    ///   interrupts left a child and none waited the second out; with the MAIN
-    ///   thread spawning back to back, 21 of 400 still left one (19 of 400
-    ///   before), and those gates died 1.3 s after the interrupt. Closing it
+    ///   children are started by stage threads, so in a run this is the main
+    ///   thread's own toolchain query and nothing a stage runs. Closing it
     ///   means blocking the three signals on the spawning thread, and std
-    ///   hands a child its parent thread's signal mask (measured the same
-    ///   day), so every child would have to unblock them itself, in a
-    ///   `pre_exec`, which changes how std spawns. This crate keeps the plain
-    ///   spawn.
+    ///   hands a child its parent thread's signal mask, so every child would
+    ///   have to unblock them itself, in a `pre_exec`, which changes how std
+    ///   spawns. This crate keeps the plain spawn.
     ///
-    /// And one spawn is not counted at all: the gate's git calls to the
-    /// remote (`differential::git_bounded`: main's tip, the published notes,
-    /// a baseline's push) put their own group on the list, a few a run, from
-    /// the main thread. A count would buy them nothing there (the second
-    /// case) and cost its second, so an interrupt that lands inside one of
-    /// those spawns leaves that git running, as it did before.
-    ///
-    /// WHAT THE COUNT COSTS, in a spawn this gate does not make today: a
+    /// WHAT THE COUNT COSTS, in a spawn this run does not make today: a
     /// child named without a slash. `run_measured` sets `PATH`, and std
     /// then starts such a child by `fork` and `exec` (read in this
     /// toolchain's std). Until that fork's own `setpgid` it is a copy of the
-    /// gate inside the gate's group, with this handler installed and the
+    /// run inside the run's group, with this handler installed and the
     /// count as it stood at the fork, one at least. An interrupt sent to the
     /// group, as a terminal's Ctrl-C is, reaches the copy too. It waits out
     /// [`SPAWN_ROUNDS`] on a count that nothing in it can lower and dies of
-    /// the signal without having exec'ed, and until it has, the gate's own
-    /// `spawn` has not returned, so the gate waits as long. Measured
-    /// 2026-10-13 on a stand-in gate starting `sleep` by that name from
-    /// four threads: none of 480 interrupted through their group left a
-    /// child (52 of 100 did before the count), and 57 of them took up to
-    /// 1.2 s to die where the rest took milliseconds. Every child the
-    /// ladder starts is named by a path (read the same day), which std
-    /// starts with `posix_spawn` on macOS, so the gate has no such copy.
+    /// the signal without having exec'ed, and until it has, the run's own
+    /// `spawn` has not returned, so the run waits as long, about a second.
+    /// Every child the ladder starts is named by a path, which std starts
+    /// with `posix_spawn` on macOS, so the run has no such copy.
     pub struct Spawning(());
 
     impl Spawning {
@@ -1411,30 +1340,22 @@ pub mod group {
     /// long as this value lives, and the only handle through which the runner
     /// signals that group or reaps that child.
     ///
-    /// THE RULE. The gate never signals a process-group id unless it holds
+    /// THE RULE. The run never signals a process-group id unless it holds
     /// that group's leader as its own child, running or exited and not yet
     /// reaped, at that moment. A group's id is its leader's pid. While the
-    /// leader is the gate's child the number is taken: macOS hands out no id
-    /// that is in use as a pid or as a group's (`forkproc`, read in
-    /// xnu-12377; an unreaped leader's id was never handed out over a full
-    /// wrap of the pid counter, 99,184 forks, measured 2026-10-13), and
-    /// Linux frees a number only when nothing uses it as either (read in
-    /// v6.12, not run). Once the leader is reaped the number is anybody's,
-    /// the next process's that the kernel's counter brings to it. Measured
-    /// the same day, by a probe that aimed for one: a process that was not
-    /// the gate's led a new group with a reaped leader's id 2.7 ms after
-    /// the reap, and this module as it then was `SIGKILL`ed it, 10.6 s
-    /// after the interrupt, with the kill an interrupted gate sends a
-    /// graced group once the grace is over. The premise is a child that
+    /// leader is the run's child the number is taken: macOS hands out no id
+    /// that is in use as a pid or as a group's (`forkproc` in xnu: not over a
+    /// full wrap of the pid counter), and Linux frees a number only when
+    /// nothing uses it as either (read in v6.12, not run). Once the leader is
+    /// reaped the number is anybody's, the next process's that the kernel's
+    /// counter brings to it: a probe that aims for one leads a new group with
+    /// a reaped leader's id within milliseconds, and a kill sent seconds
+    /// later, once a grace is over, would land on it. The premise is a child that
     /// stays a zombie until its parent reaps it. The kernel reaps a
     /// process's children for it only once that process has itself set
     /// `SIGCHLD` to be ignored, which nothing in this crate does; an ignore
-    /// the gate merely inherited keeps its zombies as the default does
-    /// (measured 2026-10-13 on macOS 26.6: a probe that inherited the
-    /// ignore across `exec`, either way of handing it over, kept its exited
-    /// child a zombie until it reaped it, and a stand-in gate started with
-    /// `SIGCHLD` ignored kept its killed leader a zombie and died of its
-    /// interrupt as one started without).
+    /// the run merely inherited across `exec` keeps its zombies as the
+    /// default does.
     ///
     /// ORDINARY CODE keeps the rule by construction. [`Live::term`],
     /// [`Live::alive`], [`Live::gone`] and [`Live::kill`] are the only ways
@@ -1454,9 +1375,9 @@ pub mod group {
     /// 2. take the group off the list;
     /// 3. read [`STOPPING`];
     /// 4. reap, if that read found no interrupt. If it found one the child
-    ///    is never reaped: it stays a zombie, and its id the gate's, for as
-    ///    long as the gate lives, which is until the handler has finished.
-    ///    The gate is dying of its signal, and its zombies go with it.
+    ///    is never reaped: it stays a zombie, and its id the run's, for as
+    ///    long as the run lives, which is until the handler has finished.
+    ///    The run is dying of its signal, and its zombies go with it.
     ///
     /// WHY THAT MISSES NO CASE. The handler claims `STOPPING`, a store,
     /// before it reads the list, and every id it signals is one it read off
@@ -1466,9 +1387,9 @@ pub mod group {
     /// order, and the thread's read of the flag falls on one side of the
     /// handler's claim:
     ///
-    /// - after it: the thread reads the gate stopping and does not reap.
+    /// - after it: the thread reads the run stopping and does not reap.
     ///   Whether or not the handler read this group off the list, its
-    ///   leader stays the gate's child for the rest of the gate's life;
+    ///   leader stays the run's child for the rest of the run's life;
     /// - before it: then the slot was emptied before the claim too, and so
     ///   before every read the handler makes of the list. The handler never
     ///   reads this group's id, keeps no record of it and never signals it,
@@ -1480,26 +1401,23 @@ pub mod group {
     /// group between the look and the reap. A stage thread reaps every 1 to
     /// 25 ms; the handler remembers for seconds.
     ///
-    /// Nothing else in the gate reaps a stage child: no call here waits for
+    /// Nothing else in the run reaps a stage child: no call here waits for
     /// "any child", std reaps only a `Child` it is asked to wait for, and
     /// one that went through this door is never asked ([`super::reap`]).
     ///
     /// WHAT IT CHANGES for a stage. A child that exited is asked after twice,
     /// once without reaping and once to reap, where one call did both: a
-    /// system call more for each stage child, and nothing that shows.
-    /// Measured 2026-10-13 at a load of 9 on 18 cores: either call took
-    /// 0.11 microseconds on a running child, and a run of `/usr/bin/true`
-    /// took what it had before, 0.85 ms waited for and 1.38 ms polled under
-    /// a ceiling, at the median of 500 either way. And the stage of a child
-    /// left unreaped is told that the gate was interrupted ([`KEPT`]), an
+    /// system call more for each stage child, a tenth of a microsecond, and
+    /// nothing that shows. And the stage of a child
+    /// left unreaped is told that the run was interrupted ([`KEPT`]), an
     /// environment failure like the one a stage gets that asks for a child
-    /// once the gate is stopping, where it used to be handed the status of a
+    /// once the run is stopping, where it used to be handed the status of a
     /// child the handler had just killed. The thread goes on from there as
     /// before; it is not parked, so it holds nothing anyone waits for.
     ///
     /// ON LINUX (read in v6.12, not run) a group's unreaped leader answers
     /// `killpg`, signal 0 included, so a group whose leader is kept reads as
-    /// alive. An interrupted gate there waits out its whole grace for a
+    /// alive. An interrupted run there waits out its whole grace for a
     /// suite that asked for one, unless a second interrupt ends the wait;
     /// before, it stopped waiting once a stage thread had reaped the suite.
     ///
@@ -1507,8 +1425,8 @@ pub mod group {
     /// other Unix a child's exit can be learned only by reaping it
     /// ([`Live::exited`]), with nothing to stop that reaping a child whose
     /// group a handler remembered. So no handler is installed there
-    /// ([`kill_on_interrupt`]): an interrupted gate dies of its signal at
-    /// once and its stages' groups run on, as they did before the gate
+    /// ([`kill_on_interrupt`]): an interrupted run dies of its signal at
+    /// once and its stages' groups run on, as they did before the run
     /// forwarded an interrupt at all. Ordinary code keeps the rule there
     /// as everywhere: nothing is sent a group once its leader is reaped.
     pub struct Live {
@@ -1557,13 +1475,13 @@ pub mod group {
         /// The group's id, while this thread has not reaped its leader.
         ///
         /// # Errors
-        /// Once it has: the number is no longer the gate's to signal.
+        /// Once it has: the number is no longer this run's to signal.
         fn held(&self) -> std::io::Result<i32> {
             if self.group > 0 {
                 Ok(self.group)
             } else {
                 Err(std::io::Error::other(
-                    "the child was reaped, so its group's id is no longer the gate's to signal",
+                    "the child was reaped, so its group's id is no longer this run's to signal",
                 ))
             }
         }
@@ -1582,8 +1500,8 @@ pub mod group {
         /// `killpg(g, 0)`, which delivers nothing. On macOS a group whose
         /// only member is its unreaped, exited leader answers `EPERM`, so
         /// this reads it as empty without reaping the leader, whose id (and
-        /// so the group's) stays the gate's. Never, once the child is
-        /// reaped: there is no group of the gate's to ask after.
+        /// so the group's) stays the run's. Never, once the child is
+        /// reaped: there is no group of the run's to ask after.
         #[must_use]
         pub fn alive(&self) -> bool {
             // Held: this thread has not reaped the leader (`held`).
@@ -1598,10 +1516,7 @@ pub mod group {
         /// running have found nobody. The first that finds a process
         /// answers no: the caller's `SIGKILL` is for that process. (Where
         /// nothing is repeated, [`REPEATS`], it is the one reading.) It is
-        /// what a grace that worked costs now: a child that died of its
-        /// `SIGTERM` at once was reported 31 ms after its ceiling before
-        /// and is 80 ms after it now (the median of 40, measured
-        /// 2026-10-13).
+        /// what a grace that worked costs: about 50 ms more.
         #[must_use]
         pub fn gone(&self) -> bool {
             let Ok(g) = self.held() else {
@@ -1648,8 +1563,7 @@ pub mod group {
         /// Has the child exited? Asked without reaping it, so its group can
         /// still be signalled whatever the answer (`block`: wait until it
         /// has). For a caller with something to do between the child's exit
-        /// and its reap ([`crate::differential`]'s bounded git call), and
-        /// the first step of [`Live::reap`].
+        /// and its reap, and the first step of [`Live::reap`].
         ///
         /// # Errors
         /// The OS's, after which the child is taken for reaped: a kernel that
@@ -1668,7 +1582,7 @@ pub mod group {
 
         /// Has the child exited? Off macOS and Linux this module has no way
         /// to ask without reaping ([`HOLDS`]), so this reaps: once it has
-        /// answered yes the group's id is the gate's no longer, nothing more
+        /// answered yes the group's id is the run's no longer, nothing more
         /// is sent it ([`Live::held`]), and [`Live::reap`] hands on the
         /// status kept here.
         ///
@@ -1687,6 +1601,38 @@ pub mod group {
             Ok(self.reaped.is_some())
         }
 
+        /// Reap a descriptor-safe output child through the same interrupt
+        /// fence as stage children, updating that child's own cached status.
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        pub(super) fn reap_output(
+            &mut self,
+            child: &mut aterm_uds::spawnfd::Child,
+        ) -> std::io::Result<std::process::ExitStatus> {
+            if self.held()?.unsigned_abs() != child.id() {
+                return Err(std::io::Error::other(
+                    "output child does not own this group",
+                ));
+            }
+            self.exited(true)?;
+            self.release_for_reap()?;
+            child.wait()
+        }
+
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        fn release_for_reap(&mut self) -> std::io::Result<i32> {
+            let pid = self.held()?;
+            #[cfg(test)]
+            super::tests::at_the_door(false);
+            self.leave();
+            #[cfg(test)]
+            super::tests::at_the_door(true);
+            if stopping() {
+                return Err(std::io::Error::other(KEPT));
+            }
+            self.group = 0;
+            Ok(pid)
+        }
+
         /// THE ONE DOOR a stage child is reaped through ([`Live`] has the
         /// rule this keeps, and the argument). `Ok(None)` while the child
         /// runs (never when `block`ing), else its status and the user plus
@@ -1695,7 +1641,7 @@ pub mod group {
         ///
         /// # Errors
         /// [`KEPT`], when the child has exited and an interrupt has begun
-        /// ending the gate: it is left unreaped, for good. The OS's own,
+        /// ending the run: it is left unreaped, for good. The OS's own,
         /// from either wait. A child already reaped ([`Live::held`]).
         pub fn reap(
             &mut self,
@@ -1706,20 +1652,9 @@ pub mod group {
             }
             #[cfg(any(target_os = "macos", target_os = "linux"))]
             {
-                let pid = self.held()?;
-                // A test's hold with the exit seen and the group still listed.
-                #[cfg(test)]
-                super::tests::at_the_door(false);
-                self.leave();
-                // ...and with the group off the list and the flag not yet read.
-                #[cfg(test)]
-                super::tests::at_the_door(true);
-                if stopping() {
-                    return Err(std::io::Error::other(KEPT));
-                }
                 // Reaped, or lost to an error: either way the number is no
-                // longer known to be the gate's, and nothing more is sent it.
-                self.group = 0;
+                // longer known to be the run's, and nothing more is sent it.
+                let pid = self.release_for_reap()?;
                 wait_rusage(pid.unsigned_abs(), true)
             }
             #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -1738,7 +1673,7 @@ pub mod group {
     /// Send group `g` signal `sig` (`0` asks and delivers nothing): did it
     /// find a process? The one place this module calls `killpg`, so every
     /// caller owes [`Live`]'s rule at its own call: `g`'s leader is the
-    /// gate's child, running or unreaped, right now. Async-signal-safe
+    /// run's child, running or unreaped, right now. Async-signal-safe
     /// ([`on_signal`] calls it): `killpg`, and nothing else outside a test
     /// build.
     fn send(g: i32, sig: i32) -> bool {
@@ -1809,7 +1744,7 @@ pub mod group {
 
     /// Has child `pid` exited? `waitid(2)` with `WNOWAIT`, which answers
     /// and leaves the child as it was: a zombie still, its pid still the
-    /// gate's ([`Live`]). `block` waits until it has; otherwise `WNOHANG`.
+    /// run's ([`Live`]). `block` waits until it has; otherwise `WNOHANG`.
     /// Retried on `EINTR`. Not for the handler: `waitid` is not among the
     /// calls POSIX promises a handler, and only stage threads ask.
     ///
@@ -1824,12 +1759,11 @@ pub mod group {
     /// A `si_signo` that is not zero (it is `SIGCHLD`) is an exit on
     /// Linux, which reports to a caller that asked for exits nothing else
     /// (`wait_task_stopped`, read in v6.12, not run; a child the caller
-    /// traces aside, and the gate traces none). ON macOS IT IS NOT. Asked
+    /// traces aside, and the run traces none). ON macOS IT IS NOT. Asked
     /// for exits alone, macOS 26.6's `waitid` answers for a child that is
-    /// only stopped as well, with `si_code` saying so (`CLD_STOPPED`;
-    /// measured 2026-10-13, 2 of 2 by hand and then by this module's own
-    /// test of it, against the XNU source, which reads as if only a caller
-    /// that asked for stopped children were told). A stage's
+    /// only stopped as well, with `si_code` saying so (`CLD_STOPPED`; this
+    /// module's own test shows it, though the XNU source reads as if only a
+    /// caller that asked for stopped children were told). A stage's
     /// `ssh` asking for a passphrase is stopped by the terminal, and one
     /// taken for exited would leave the live list with the child still
     /// there. So on macOS the exit is read from `si_code`: `CLD_EXITED`,
@@ -1893,7 +1827,7 @@ pub mod group {
     /// CPU of it and the descendants it reaped. Retried on `EINTR`.
     ///
     /// Private to this module: it reaps by pid, and a child whose group the
-    /// gate signals is reaped through [`Live`] only, which sends that group
+    /// run signals is reaped through [`Live`] only, which sends that group
     /// nothing once it has.
     fn wait_rusage(
         pid: u32,
@@ -1937,7 +1871,7 @@ pub mod group {
         }
     }
 
-    /// Has an interrupt begun ending the gate?
+    /// Has an interrupt begun ending the run?
     #[must_use]
     pub fn stopping() -> bool {
         STOPPING.load(Ordering::SeqCst) != 0
@@ -1955,9 +1889,7 @@ pub mod group {
     /// handler returns into the sleep. What is left of a nap cut short is
     /// not slept: asking `nanosleep` for it (a `rem`) sends macOS's to the
     /// clock service, a Mach message from handler context whose error path
-    /// formats to stderr (read in `libsystem_c`, macOS 26.6, 2026-10-13), and
-    /// the handler has made this call with a null `rem` since its grace was
-    /// added.
+    /// formats to stderr (`libsystem_c`), so the handler passes a null `rem`.
     fn nap(ms: c_long) {
         let t = Timespec {
             tv_sec: 0,
@@ -1988,28 +1920,24 @@ pub mod group {
     /// the frame that sent the `SIGTERM`s, so it still knows every group it
     /// sent one, a group whose leader has since exited and is off [`LIVE`]
     /// among them (that leader is left unreaped, so the id is still the
-    /// gate's: EVERY ID IT SIGNALS, below). No group with a member left
-    /// outlives the gate, whichever signal ends the wait and whenever.
+    /// run's: EVERY ID IT SIGNALS, below). No group with a member left
+    /// outlives the run, whichever signal ends the wait and whenever.
     ///
     /// A HANGUP TOLD TWICE IS ONE HANGUP. A `SIGHUP` after a first `SIGHUP`
     /// is not a second interrupt and ends no grace. A closing terminal hangs
     /// its foreground job up more than once: the kernel hangs up the
-    /// foreground group, and the shell its jobs (measured 2026-10-12, zsh 5.9
-    /// on macOS 26.6: two `SIGHUP`s 0.3 to 0.5 ms apart, 6 of 6, and one
-    /// under `setopt nohup`). Nobody at a keyboard said "now", and a closing
-    /// terminal is what the grace is for: taken for a second interrupt, that
-    /// `SIGHUP` ends it within a nap, and a suite's EXIT trap needs more than
-    /// one (0.03 to 1.2 s, measured when the grace was added). An operator in
-    /// a hurry has `SIGINT` and `SIGTERM`. The repeat still ends the nap it
-    /// lands in, which is one round off that grace ([`NAP_MS`]), not its end.
-    /// The rounds add up, because the wait counts them: 200 repeats, one to
-    /// a round, are a whole grace (measured 2026-10-13: 200 of them 3 ms
-    /// apart ended a grace in 0.6 s, 100 of them 64 ms apart in 6.8 s, and 2
-    /// took nothing measurable off its 10.7 s). A closing terminal sends
-    /// two.
+    /// foreground group, and the shell its jobs (zsh sends two `SIGHUP`s
+    /// under a millisecond apart). Nobody at a keyboard said "now", and a
+    /// closing terminal is what the grace is for: taken for a second
+    /// interrupt, that `SIGHUP` would end it within a nap, and a suite's EXIT
+    /// trap needs more than one. An operator in a hurry has `SIGINT` and
+    /// `SIGTERM`. The repeat still ends the nap it lands in, which is one
+    /// round off that grace ([`NAP_MS`]), not its end. The rounds add up,
+    /// because the wait counts them: 200 repeats, one to a round, are a whole
+    /// grace. A closing terminal sends two.
     ///
     /// A CHILD BEING SPAWNED IS WAITED FOR AND KILLED. A stage thread that
-    /// read the gate running just before this frame claimed [`STOPPING`] can
+    /// read the run running just before this frame claimed [`STOPPING`] can
     /// have a child the list does not hold yet ([`Spawning`] has the
     /// argument, and what it leaves). So after its `SIGKILL`s the frame
     /// waits while any spawn is in flight, [`SPAWN_ROUNDS`] rounds at most,
@@ -2018,20 +1946,19 @@ pub mod group {
     /// round it lands in. The kills the operator asked for are done by
     /// then, the wait is over in the time one spawn takes, and it is all
     /// that stands between "now" and a child left running. A group that
-    /// asked for a grace gets none here: its child was born as the gate was
+    /// asked for a grace gets none here: its child was born as the run was
     /// interrupted and has barely started, and phase 3 has always
     /// `SIGKILL`ed a child that started during the grace.
     ///
     /// EVERY GROUP IT KILLED IS KILLED AGAIN. A `SIGKILL` does not reach a
     /// process its group was making at that instant ([`KILL_ROUNDS`]), and
-    /// a gate that died straight after its kills left that process running.
+    /// a run that died straight after its kills left that process running.
     /// The frame keeps every group it sends `SIGKILL`, one whose leader has
     /// since exited and left [`LIVE`] among them, and its last
     /// phase sends each of them `SIGKILL` again, a millisecond apart, until
     /// [`QUIET_ROUNDS`] rounds running have found nobody in any of them
-    /// ([`rekill`]). That is what an interrupt costs now when every group
-    /// died at once: 50 ms, measured on a stand-in gate with one group,
-    /// which used to be gone 0.3 ms after its signal. [`KILL_ROUNDS`]
+    /// ([`rekill`]). That is what an interrupt costs when every group died
+    /// at once: about 50 ms. [`KILL_ROUNDS`]
     /// rounds, a third of a second, is the most it can cost, and a frame
     /// that killed nothing sleeps no round. The record holds 256 groups, as
     /// the live list does, and a full one takes no more. Like the wait
@@ -2042,33 +1969,24 @@ pub mod group {
     ///
     /// EVERY ID IT SIGNALS IS STILL THE GATE'S. A group's id is its
     /// leader's pid, and the kernel hands a reaped leader's on to the next
-    /// process to reach it: within 3 ms, for a probe that aimed for one
-    /// ([`Live`]).
-    /// This frame signals ids for as long as it runs, up to twelve seconds
-    /// after it read them, so each must still be the gate's when the signal
+    /// process to reach it, within milliseconds ([`Live`]). This frame
+    /// signals ids for as long as it runs, up to twelve seconds
+    /// after it read them, so each must still be the run's when the signal
     /// goes. It is: every id here was read off [`LIVE`] after this frame
     /// claimed [`STOPPING`], at once or from the frame's own record of such
     /// a read (`termed`, `killed`), and a stage thread never reaps a child
     /// whose group could have been read so ([`Live::reap`], which has the
-    /// argument). The leader is running or a zombie, and the gate's child,
-    /// until the gate itself is gone. Until 2026-10-13 a stage thread
-    /// reaped at once, and phase 3's kill of a graced group, sent when the
-    /// grace was over, could land on a group the gate had never started:
-    /// measured that day on a stand-in gate, it did.
+    /// argument). The leader is running or a zombie, and the run's child,
+    /// until the run itself is gone; reaped at once, phase 3's kill of a
+    /// graced group, sent when the grace is over, could land on a group the
+    /// run never started.
     ///
     /// NOTHING IS BLOCKED WHILE IT RUNS ([`catch`]: an empty mask and
     /// `SA_NODEFER`), because an interrupt held back is one the wait never
-    /// hears of. Until 2026-10-12 `signal(3)` installed this, which holds back
-    /// the signal being handled until its handler returns, and a frame that
-    /// was not the first did the `SIGKILL`s itself, from [`LIVE`] alone, then
-    /// ended the gate. Measured then, with a graced group that kept a
-    /// survivor: a second Ctrl-C skipped nothing on a stand-in gate down to
-    /// one thread (it died 10.7 s after the first, as it did without one),
-    /// and on a gate whose stage threads were alive it ended the gate at once
-    /// and left the survivor running, as a `SIGTERM` or `SIGHUP` during the
-    /// grace did on either (3 of 3). A closing terminal ended the gate within
-    /// 0.01 s (11 closes, 4 of them of the gate itself), in 10 of them before
-    /// its suite's EXIT trap, one `touch`, had run.
+    /// hears of: `signal(3)` holds back the signal being handled until its
+    /// handler returns, so under it a second Ctrl-C skipped nothing, and a
+    /// frame that was not the first, killing from [`LIVE`] alone, left a
+    /// graced group's survivor running.
     ///
     /// Async-signal-safe throughout: atomic loads and stores, `killpg`
     /// ([`send`]), `nanosleep`, `signal` and `raise`, the four calls this
@@ -2097,7 +2015,7 @@ pub mod group {
         let mut k = 0;
         // Held, here and at every signal below: each id is read off the list
         // after the claim above, so its leader is never reaped again
-        // (`Live::reap`), and is the gate's child for as long as this runs.
+        // (`Live::reap`), and is the run's child for as long as this runs.
         for slot in &LIVE {
             let v = slot.load(Ordering::SeqCst);
             if v > 0 {
@@ -2115,7 +2033,7 @@ pub mod group {
         let round = c_long::from(NAP_MS);
         let mut waited: c_long = 0;
         // Held: `termed` is this frame's record of ids read off the list
-        // after the claim, so the question is still asked of the gate's own
+        // after the claim, so the question is still asked of the run's own
         // groups however long the wait has run. Signal 0 delivers nothing.
         while n > 0
             && waited < grace_ms
@@ -2129,8 +2047,8 @@ pub mod group {
         // outlived their grace, and any child that started in the meantime.
         //
         // Held: a group in `termed` may have left the list seconds ago, its
-        // leader long exited. That leader is a zombie the gate keeps: its
-        // stage thread found the gate stopping and did not reap it.
+        // leader long exited. That leader is a zombie the run keeps: its
+        // stage thread found the run stopping and did not reap it.
         for g in &termed[..n] {
             send(*g, SIGKILL);
             remember(&mut killed, &mut k, *g);
@@ -2169,7 +2087,7 @@ pub mod group {
         // after the claim, like `termed`.
         rekill(&killed[..k]);
         // Die of the last interrupt: the second when one came (which is what
-        // the gate died of before, whenever a second one ended it), else this
+        // the run died of before, whenever a second one ended it), else this
         // frame's own. Restoring the default action and raising ends the
         // process inside `raise`. `raise` returns only for a signal this
         // thread blocks; `last` reached the process, perhaps on another
@@ -2186,7 +2104,7 @@ pub mod group {
         }
     }
 
-    /// `SIGINT` back at its default action, for a test's stand-in gate: a process
+    /// `SIGINT` back at its default action, for a test's stand-in run: a process
     /// started as a background job with job control off inherits `SIGINT`
     /// ignored (POSIX), and a stand-in that ignores the interrupt measures
     /// nothing.
@@ -2212,12 +2130,12 @@ pub mod group {
     ///
     /// Only where a stage child's exit can be seen without reaping it
     /// ([`HOLDS`]: macOS and Linux). The handler signals group ids it read
-    /// seconds earlier, which is right only while the gate still holds each
+    /// seconds earlier, which is right only while the run still holds each
     /// group's leader ([`Live`]), and nowhere else is there a way to keep a
     /// stage thread from reaping one in the meantime. On any other Unix
-    /// this installs nothing: an interrupt ends the gate at once and its
+    /// this installs nothing: an interrupt ends the run at once and its
     /// stages' groups run on, which a signal sent to a group that is no
-    /// longer the gate's would be worse than.
+    /// longer the run's would be worse than.
     pub fn kill_on_interrupt() {
         if !HOLDS {
             return;
@@ -2380,7 +2298,7 @@ mod tests {
     #[cfg(unix)]
     use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32};
 
-    /// The default the gate itself runs under, so every test that does not say
+    /// The default the run itself runs under, so every test that does not say
     /// otherwise exercises the polling wait.
     fn env_in(dir: &Path) -> ExecEnv<'_> {
         ceiled(dir, Some(DEFAULT_CHILD_CEILING))
@@ -2390,6 +2308,220 @@ mod tests {
     /// to outlast `/bin/sh` starting and printing on a loaded machine. The child
     /// sleeps 600 s after, so the ceiling always fires.
     const PRINTS_FIRST: Duration = Duration::from_secs(5);
+
+    /// A walk answers, panics, or outlives its ceiling; only the first is an
+    /// answer, and the hung one never holds the caller past the ceiling.
+    #[test]
+    fn an_in_process_walk_answers_or_is_named_unfinished() {
+        assert_eq!(bounded(Some(DEFAULT_CHILD_CEILING), || 7), Ok(7));
+        assert_eq!(bounded(None, || 7), Ok(7));
+        let panicked = bounded(None, || -> u8 { panic!("a walk that panics") });
+        assert_eq!(panicked, Err(Unfinished::Panicked));
+        let (_hold, never) = std::sync::mpsc::channel::<()>();
+        let ceiling = Duration::from_millis(50);
+        let hung = bounded(Some(ceiling), move || never.recv().ok());
+        assert_eq!(hung, Err(Unfinished::TimedOut(ceiling)));
+    }
+
+    /// The child is this exact test binary, with no shell or real tools. Its
+    /// emergency cleanup is a private file request to SIGKILL itself; the
+    /// regression never signals a saved pid after the owner may have reaped it.
+    #[cfg(unix)]
+    #[test]
+    fn bounded_output_stand_in() {
+        let Some(dir) = std::env::var_os("ATERM_VERIFY_BOUNDED_OUTPUT_CHILD") else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        println!("owned stdout");
+        eprintln!("owned stderr");
+        std::fs::write(dir.join("ready"), format!("{}\n", std::process::id())).unwrap();
+        if std::env::var_os("ATERM_VERIFY_BOUNDED_OUTPUT_NORMAL").is_some() {
+            return;
+        }
+        while !dir.join("stop").exists() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        aterm_uds::process::kill_self_now();
+    }
+
+    #[cfg(unix)]
+    fn bounded_output_command(dir: &Path, normal: bool) -> aterm_uds::spawnfd::Command {
+        let mut command = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "exec::tests::bounded_output_stand_in",
+                "--nocapture",
+            ])
+            .env("ATERM_VERIFY_BOUNDED_OUTPUT_CHILD", dir);
+        if normal {
+            command.env("ATERM_VERIFY_BOUNDED_OUTPUT_NORMAL", "1");
+        }
+        command
+    }
+
+    /// The deadline is injected only after a real child is live. A timeout must
+    /// not report while that child is still running, and an ordinary command
+    /// must retain both output streams. The guard cleans up the faulty baseline
+    /// too, before unwinding, without orphaning a test process.
+    #[cfg(unix)]
+    #[test]
+    fn a_bounded_walk_reaps_its_output_child_before_reporting_timeout() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        struct Cleanup {
+            stop: PathBuf,
+            done: std::sync::mpsc::Receiver<std::io::Result<std::process::Output>>,
+        }
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                std::fs::write(&self.stop, "stop").unwrap();
+                let output = self
+                    .done
+                    .recv_timeout(HANG_DETECTOR)
+                    .expect("owned output worker ended");
+                if let Ok(output) = output {
+                    use std::os::unix::process::ExitStatusExt as _;
+                    assert_eq!(output.status.signal(), Some(9), "stand-in dies by SIGKILL");
+                }
+            }
+        }
+        let (done, rx) = std::sync::mpsc::channel();
+        let cleanup = Cleanup {
+            stop: dir.path().join("stop"),
+            done: rx,
+        };
+        let work = dir.path().to_owned();
+        let mut pid = String::new();
+        let timed_out: Result<(), _> = bounded_wait(
+            move || {
+                let output = aterm_uds::output::output(&mut bounded_output_command(&work, false));
+                done.send(output).unwrap();
+            },
+            |_| {
+                pid = read_pid(&dir.path().join("ready"));
+                assert!(
+                    aterm_uds::process::pid_alive(pid.parse().unwrap()),
+                    "actual stand-in is live"
+                );
+                Err(Unfinished::TimedOut(HANG_DETECTOR))
+            },
+        );
+        assert_eq!(timed_out, Err(Unfinished::TimedOut(HANG_DETECTOR)));
+        let absent = !aterm_uds::process::pid_alive(pid.parse().unwrap());
+        drop(cleanup);
+        assert!(
+            absent,
+            "bounded returned with its output child {pid} still alive"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_bounded_walk_keeps_normal_child_output() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let work = dir.path().to_owned();
+        let output = bounded(Some(HANG_DETECTOR), move || {
+            aterm_uds::output::output(&mut bounded_output_command(&work, true))
+        })
+        .unwrap()
+        .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("owned stdout"));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("owned stderr"));
+    }
+
+    /// A walk may be stuck outside a command when its row times out. When it
+    /// resumes, it still cannot start a child behind the completed row. A new
+    /// independent walk remains usable (the normal-output control above).
+    #[cfg(unix)]
+    #[test]
+    fn a_timed_out_walk_cannot_launch_a_child_later() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let work = dir.path().to_owned();
+        let (parked, ready) = std::sync::mpsc::channel();
+        let (release, resume) = std::sync::mpsc::channel();
+        let (sent, result) = std::sync::mpsc::channel();
+        let timed_out: Result<(), _> = bounded_wait(
+            move || {
+                parked.send(()).unwrap();
+                resume
+                    .recv_timeout(HANG_DETECTOR)
+                    .expect("release the owned walk");
+                sent.send(aterm_uds::output::output(&mut bounded_output_command(
+                    &work, true,
+                )))
+                .unwrap();
+            },
+            |_| {
+                ready
+                    .recv_timeout(HANG_DETECTOR)
+                    .expect("walk parked before launching");
+                Err(Unfinished::TimedOut(HANG_DETECTOR))
+            },
+        );
+        assert_eq!(timed_out, Err(Unfinished::TimedOut(HANG_DETECTOR)));
+        release.send(()).unwrap();
+        let output = result
+            .recv_timeout(HANG_DETECTOR)
+            .expect("late launch answered");
+        assert_eq!(output.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            !dir.path().join("ready").exists(),
+            "the actual child never started"
+        );
+    }
+
+    /// A returned value rejected by the abandoned result channel still belongs
+    /// to that walk. Its destructor must not start an unowned command after
+    /// the scope has closed, even though the walk body has already returned.
+    #[cfg(unix)]
+    #[test]
+    fn a_timed_out_walk_cannot_launch_from_its_returned_value_drop() {
+        struct OutputOnDrop {
+            work: PathBuf,
+            sent: std::sync::mpsc::Sender<std::io::Result<std::process::Output>>,
+        }
+        impl Drop for OutputOnDrop {
+            fn drop(&mut self) {
+                let output =
+                    aterm_uds::output::output(&mut bounded_output_command(&self.work, true));
+                self.sent.send(output).unwrap();
+            }
+        }
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let work = dir.path().to_owned();
+        let (parked, ready) = std::sync::mpsc::channel();
+        let (release, resume) = std::sync::mpsc::channel();
+        let (sent, result) = std::sync::mpsc::channel();
+        let timed_out = bounded_wait(
+            move || {
+                parked.send(()).unwrap();
+                resume
+                    .recv_timeout(HANG_DETECTOR)
+                    .expect("release the owned walk");
+                OutputOnDrop { work, sent }
+            },
+            |_| {
+                ready
+                    .recv_timeout(HANG_DETECTOR)
+                    .expect("walk parked before returning");
+                Err(Unfinished::TimedOut(HANG_DETECTOR))
+            },
+        );
+        assert!(matches!(timed_out, Err(Unfinished::TimedOut(limit)) if limit == HANG_DETECTOR));
+        // The result receiver is already gone, so sending the value invokes
+        // its actual destructor in the output worker, without a timing race.
+        release.send(()).unwrap();
+        let output = result
+            .recv_timeout(HANG_DETECTOR)
+            .expect("returned value was dropped");
+        assert_eq!(output.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            !dir.path().join("ready").exists(),
+            "the actual child never started"
+        );
+    }
 
     fn ceiled(dir: &Path, child_ceiling: Option<Duration>) -> ExecEnv<'_> {
         ExecEnv {
@@ -2403,7 +2535,7 @@ mod tests {
     }
 
     /// The pool's reading is a count of busy cores, between none and every one,
-    /// on both hosts the gate runs on.
+    /// on both hosts verify runs on.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn busy_cores_reads_between_none_and_every_core() {
@@ -2462,28 +2594,26 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// The gate's own setting reaches the child over whatever the caller's shell
+    /// The run's own setting reaches the child over whatever the caller's shell
     /// exported, and a stage that names the variable itself still wins (the same
-    /// precedence `remove_env` has). `lib.rs` pins that `CARGO_INCREMENTAL=0` is
-    /// one of the run's facts.
+    /// precedence `remove_env` has).
     #[test]
     fn an_added_variable_reaches_the_child_and_a_stage_naming_it_still_wins() {
         let tmp = crate::mktemp_dir("atv-setenv").expect("mktemp");
-        let added = [(OsString::from("CARGO_INCREMENTAL"), OsString::from("0"))];
+        let added = [(OsString::from("ATV_ADDED_PROBE"), OsString::from("0"))];
         let env = ExecEnv {
             add_env: &added,
             ..env_in(&tmp)
         };
-        let ask = Cmd::new("/bin/sh").args(["-c", "printf %s \"${CARGO_INCREMENTAL-unset}\""]);
+        let ask = Cmd::new("/bin/sh").args(["-c", "printf %s \"${ATV_ADDED_PROBE-unset}\""]);
         assert_eq!(run(&ask, env).trimmed_output(), "0");
-        let stage_says = ask.clone().env("CARGO_INCREMENTAL", "1");
+        let stage_says = ask.clone().env("ATV_ADDED_PROBE", "1");
         assert_eq!(run(&stage_says, env).trimmed_output(), "1");
         let plain = run(&ask, env_in(&tmp));
-        assert!(
-            plain.trimmed_output() != "0"
-                || std::env::var_os("CARGO_INCREMENTAL").is_some_and(|v| v == "0"),
-            "with nothing set the child inherits: {:?}",
-            plain.output
+        assert_eq!(
+            plain.trimmed_output(),
+            "unset",
+            "nothing added, nothing set"
         );
         std::fs::remove_dir_all(&tmp).ok();
     }
@@ -2702,23 +2832,6 @@ mod tests {
         assert_eq!(parse_meminfo(text, "MemAvailable:"), None);
     }
 
-    /// The usable reading is the host's own and sits under its physical
-    /// memory: on macOS, the physical less a nonzero wired figure.
-    #[test]
-    fn the_usable_memory_reading_is_under_the_physical() {
-        let Some((physical, _)) = host_memory_bytes() else {
-            return;
-        };
-        let usable = host_usable_bytes(physical);
-        if cfg!(any(target_os = "macos", target_os = "linux")) {
-            let usable = usable.expect("a usable figure on macOS and Linux");
-            assert!(usable > 0 && usable <= physical, "{usable} of {physical}");
-        }
-        if cfg!(target_os = "macos") {
-            assert!(usable < Some(physical), "the kernel wires some memory");
-        }
-    }
-
     /// The in-process reading answers a load, and it is THE load the machine
     /// reports: it sits between two reads of the older reading
     /// (`/proc/loadavg`, else `sysctl -n vm.loadavg`) taken either side of it.
@@ -2755,7 +2868,7 @@ mod tests {
     }
 
     /// A replayed child is the process cargo would have started: its own
-    /// directory, exactly the recorded environment (none of the gate's PATH,
+    /// directory, exactly the recorded environment (none of the run's PATH,
     /// removals or additions), and a preamble at the head of its log, above its
     /// own bytes.
     #[test]
@@ -2796,8 +2909,8 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// The preamble is what a ceiling kill reads: a test binary the gate runs
-    /// itself carries cargo's `Running` header only because the gate wrote it,
+    /// The preamble is what a ceiling kill reads: a test binary verify runs
+    /// itself carries cargo's `Running` header only because the run wrote it,
     /// and the TIMEOUT block names the binary and its re-run line from it.
     #[test]
     fn a_timed_out_replayed_binary_is_named_from_its_preamble() {
@@ -2924,7 +3037,7 @@ mod tests {
     }
 
     /// The pid a stage child's shell wrote for the `sleep` it backgrounded. The
-    /// bound is liveness, not latency: a loaded gate can take seconds to start a
+    /// bound is liveness, not latency: a loaded machine can take seconds to start a
     /// shell.
     #[cfg(unix)]
     fn read_pid(file: &Path) -> String {
@@ -2965,9 +3078,9 @@ mod tests {
         let tmp = crate::mktemp_dir("atv-ceil-group").expect("mktemp");
         // The ceiling clock starts at the spawn, so a ceiling that fires before
         // the shell has backgrounded its `sleep` kills a group with no
-        // grandchild in it, and no pid ever comes (2026-10-01: a merge gate at
-        // load 110 on 18 cores waited its minute for one behind a 0.5 s
-        // ceiling). The group is dead and reaped once `run` returns, so a
+        // grandchild in it, and no pid ever comes (under heavy load a 0.5 s
+        // ceiling can fire first). The group is dead and reaped once `run`
+        // returns, so a
         // pidfile with no finished line by then never gets one: that run
         // tested nothing, and the next doubles the ceiling.
         let mut ceiling = Duration::from_millis(500);
@@ -3012,28 +3125,24 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// The marker a stand-in gate writes beside `pidfile` once it has armed.
+    /// The marker a stand-in run writes beside `pidfile` once it has armed.
     #[cfg(unix)]
     fn armed(pidfile: &Path) -> PathBuf {
         pidfile.with_extension("armed")
     }
 
-    /// A stand-in gate's stage: run `child` and write the [`armed`] marker once
+    /// A stand-in run's stage: run `child` and write the [`armed`] marker once
     /// the child's group is on the live list, `pidfile` holds its grandchild's
     /// pid, and that grandchild has exec'ed its `sleep` ([`has_become`]). The
     /// pidfile alone would race the registration, and it races the exec.
     ///
-    /// WHY THE EXEC (2026-10-12, a merge gate's one red: "the handler stops
-    /// waiting once the group has gone: 10.79 s"). The shell writes `$!` once
-    /// it has forked, and the fork is still that shell until it execs. A bash
+    /// WHY THE EXEC. The shell writes `$!` once it has forked, and the fork is
+    /// still that shell until it execs. A bash
     /// with an EXIT trap catches `SIGTERM` to run it, the fork inherits the
     /// handler, and a group `SIGTERM` that reaches the fork before its `exec`
     /// can be taken there, and is then gone: the `sleep` it becomes never
-    /// hears of it, the group does not empty, and the interrupted gate waits
-    /// out its whole grace before the `SIGKILL`. Measured with no Rust in it
-    /// (bash 3.2.57, [`suite_with_trap`]'s script, `SIGTERM` within 30 ms of
-    /// the pidfile's newline): the `sleep` outlived it in 27 of 1,800 trials
-    /// at load 40-75 on 18 cores and in none of 600 on an idle machine.
+    /// hears of it, the group does not empty, and the interrupted run waits
+    /// out its whole grace before the `SIGKILL` — rarely, and only under load.
     /// [`suite_slow_to_exec`] holds that window open.
     #[cfg(unix)]
     fn run_armed(child: &Cmd, pidfile: &Path) {
@@ -3078,7 +3187,7 @@ mod tests {
             .expect("/bin/kill runs");
     }
 
-    /// Wait for a stand-in gate to arm (an event, never a guessed delay), and
+    /// Wait for a stand-in run to arm (an event, never a guessed delay), and
     /// answer its stage's grandchild. A stand-in that never arms is killed, and
     /// with it the grandchild its pidfile names, which the panic describes: a
     /// stage that had written its pid leaves no 600 s `sleep` behind. One that
@@ -3103,7 +3212,7 @@ mod tests {
                     },
                 );
                 panic!(
-                    "the stand-in gate never armed ({}): {stuck}",
+                    "the stand-in run never armed ({}): {stuck}",
                     marker.display()
                 );
             }
@@ -3112,7 +3221,7 @@ mod tests {
         read_pid(pidfile)
     }
 
-    /// Send a stand-in gate `SIGINT` once it has armed ([`armed_grandchild`]),
+    /// Send a stand-in run `SIGINT` once it has armed ([`armed_grandchild`]),
     /// and answer how it exited, its stage's grandchild, and how long it took
     /// to exit after the signal.
     #[cfg(unix)]
@@ -3127,8 +3236,8 @@ mod tests {
         (status, grandchild, t.elapsed())
     }
 
-    /// An interrupted gate takes its stage children with it. The test re-executes
-    /// itself as a stand-in gate that installs [`group::kill_on_interrupt`] (or,
+    /// An interrupted run takes its stage children with it. The test re-executes
+    /// itself as a stand-in run that installs [`group::kill_on_interrupt`] (or,
     /// for the negative control, does not), runs a stage child with a
     /// grandchild, and is sent `SIGINT` as a terminal's Ctrl-C would. With the
     /// handler the grandchild is gone and the stand-in died of `SIGINT`; without
@@ -3169,7 +3278,7 @@ mod tests {
             if !handler {
                 c.env(NO_HANDLER, "1");
             }
-            let child = c.spawn().expect("the stand-in gate starts");
+            let child = c.spawn().expect("the stand-in run starts");
             let (status, grandchild, _) = interrupt_when_armed(child, pidfile);
             (status, grandchild)
         };
@@ -3182,7 +3291,7 @@ mod tests {
         );
         assert!(
             gone_within(&grandchild, GONE),
-            "the grandchild {grandchild} outlived the interrupted gate"
+            "the grandchild {grandchild} outlived the interrupted run"
         );
 
         let (_, orphan) = stand_in(&tmp.join("unhandled.pid"), false);
@@ -3206,7 +3315,7 @@ mod tests {
     #[cfg(unix)]
     const SUITE_CEILING: Duration = Duration::from_secs(3);
 
-    /// A grace far past [`HANG_DETECTOR`]: a gate that SLEEPS its grace instead
+    /// A grace far past [`HANG_DETECTOR`]: a run that SLEEPS its grace instead
     /// of moving on when the group empties then takes ten minutes, so a minute's
     /// hang detector tells the two apart however loaded the machine is.
     #[cfg(unix)]
@@ -3236,8 +3345,7 @@ mod tests {
     /// `sleep 1` it waits on. A `SIGTERM` sent on the strength of `pidfile`
     /// alone, or of the name the process goes by, is taken by that handler and
     /// the `sleep 600` outlives it: a stand-in armed either way waits out its
-    /// whole 10 s grace (2026-10-12: on the pidfile three runs of three, on
-    /// `ps`'s `comm` three of three).
+    /// whole 10 s grace.
     #[cfg(unix)]
     fn suite_slow_to_exec(marker: &Path, pidfile: &Path) -> Cmd {
         Cmd::new("/bin/bash").args([
@@ -3285,7 +3393,7 @@ mod tests {
     }
 
     /// A graceful child's EXIT trap runs before the ceiling kill: the group is
-    /// sent `SIGTERM`, bash runs its trap, the group empties, and the gate moves
+    /// sent `SIGTERM`, bash runs its trap, the group empties, and the run moves
     /// on without waiting out the grace; the grandchild is gone too. Negative
     /// control: the same suite with no grace gets `SIGKILL`, and no marker.
     #[cfg(unix)]
@@ -3378,15 +3486,15 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// An interrupted gate lets a graceful child run its EXIT trap: the stand-in
-    /// gate of [`an_interrupted_gate_kills_every_live_stage_group`], running a
+    /// An interrupted run lets a graceful child run its EXIT trap: the stand-in
+    /// run of [`an_interrupted_gate_kills_every_live_stage_group`], running a
     /// suite-shaped child with a grace, gets `SIGINT`, its handler sends the
     /// child's group `SIGTERM`, the trap runs, the grandchild is gone, and the
     /// stand-in still dies of `SIGINT`. Negative control: no grace, no trap.
     ///
     /// Twice with a grace: the suite as it is, and the one whose grandchild is
     /// slow to exec ([`suite_slow_to_exec`]). The second is there for the
-    /// stand-in's arming, not for the handler: a gate interrupted before that
+    /// stand-in's arming, not for the handler: a run interrupted before that
     /// grandchild has exec'ed waits out its whole grace, which is the red
     /// [`run_armed`] records and no fault of the handler's.
     #[cfg(unix)]
@@ -3428,7 +3536,7 @@ mod tests {
             for flag in shape {
                 c.env(flag, "1");
             }
-            let child = c.spawn().expect("the stand-in gate starts");
+            let child = c.spawn().expect("the stand-in run starts");
             let (status, grandchild, took) = interrupt_when_armed(child, &dir.join("gc.pid"));
             (status, grandchild, took, dir.join("trap-ran").exists())
         };
@@ -3446,7 +3554,7 @@ mod tests {
             assert!(trapped, "{case}: the graceful child's EXIT trap ran");
             assert!(
                 gone_within(&grandchild, GONE),
-                "{case}: {grandchild} outlived the gate"
+                "{case}: {grandchild} outlived the run"
             );
             assert!(
                 took < TERM_GRACE,
@@ -3458,7 +3566,7 @@ mod tests {
         assert_eq!(status.signal(), Some(2), "{status:?}");
         assert!(
             gone_within(&grandchild, GONE),
-            "{grandchild} outlived the gate"
+            "{grandchild} outlived the run"
         );
         assert!(
             !trapped,
@@ -3467,13 +3575,12 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// An interrupted gate sends a graced group ONE `SIGTERM`: a second would
+    /// An interrupted run sends a graced group ONE `SIGTERM`: a second would
     /// land in the middle of the EXIT trap the grace is for. The stand-in
-    /// gate runs a suite whose trap takes 0.3 s ([`suite_with_slow_trap`])
-    /// and is interrupted once: the trap finishes, and the gate goes when
-    /// the group has, long before its grace is up. Measured 2026-10-13 on a
-    /// handler that sent each graced group `SIGTERM` again, one round into
-    /// the wait or on every round of it: no marker, 6 runs of 6 each.
+    /// verify runs a suite whose trap takes 0.3 s ([`suite_with_slow_trap`])
+    /// and is interrupted once: the trap finishes, and the run goes when
+    /// the group has, long before its grace is up. A handler that sent a
+    /// graced group `SIGTERM` again leaves no marker.
     #[cfg(unix)]
     #[test]
     fn an_interrupted_gate_sends_a_graceful_group_one_sigterm() {
@@ -3502,7 +3609,7 @@ mod tests {
             .env(DIR, &tmp)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
-        let child = stand_in.spawn().expect("the stand-in gate starts");
+        let child = stand_in.spawn().expect("the stand-in run starts");
         let (status, grandchild, took) = interrupt_when_armed(child, &tmp.join("gc.pid"));
         assert_eq!(
             status.signal(),
@@ -3515,7 +3622,7 @@ mod tests {
         );
         assert!(
             gone_within(&grandchild, GONE),
-            "{grandchild} outlived the gate"
+            "{grandchild} outlived the run"
         );
         assert!(
             took < TERM_GRACE,
@@ -3524,23 +3631,23 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// The variable that makes a test process the stand-in gate of the
+    /// The variable that makes a test process the stand-in run of the
     /// survivor tests ([`survivor_stand_in`]): the directory its files go in.
     #[cfg(unix)]
     const SURVIVOR_DIR: &str = "ATV_SECOND_INTERRUPT_DIR";
 
     /// Set beside [`SURVIVOR_DIR`], it keeps the stand-in's test thread alive
-    /// once its stage has ended, as a gate's other stages keep theirs: a
+    /// once its stage has ended, as a run's other stages keep theirs: a
     /// later signal then has a thread other than the handler's to land on.
     #[cfg(unix)]
     const SURVIVOR_STAYS: &str = "ATV_SECOND_INTERRUPT_STAYS";
 
-    /// Be the stand-in gate of the survivor tests when [`SURVIVOR_DIR`] says
+    /// Be the stand-in run of the survivor tests when [`SURVIVOR_DIR`] says
     /// so, and answer whether it did: install [`group::kill_on_interrupt`], run
     /// [`suite_with_survivor`] with a grace, and once that stage has ended
     /// leave `stage-ended` beside its pidfile. The stage ends when the first
     /// interrupt's `SIGTERM` has ended its shell and `run` has seen that
-    /// (and left the shell unreaped: the gate is stopping, `group::Live`).
+    /// (and left the shell unreaped: the run is stopping, `group::Live`).
     /// So the marker says the survivor's group is off the live list, while
     /// the handler, on the main thread, waits out the grace that survivor
     /// holds.
@@ -3565,7 +3672,7 @@ mod tests {
         true
     }
 
-    /// What a stand-in gate with a survivor did when it was interrupted.
+    /// What a stand-in run with a survivor did when it was interrupted.
     #[cfg(unix)]
     struct Interrupted {
         status: std::process::ExitStatus,
@@ -3579,7 +3686,7 @@ mod tests {
         survivor_gone: bool,
     }
 
-    /// Run `test`'s stand-in gate ([`survivor_stand_in`]) in `dir`, one that
+    /// Run `test`'s stand-in run ([`survivor_stand_in`]) in `dir`, one that
     /// `stays` ([`SURVIVOR_STAYS`]) or not, and send it `first` once it has
     /// armed. Then, when `second` names a signal, send that once the
     /// stand-in's stage has ended (its `stage-ended` marker: an event, never
@@ -3604,7 +3711,7 @@ mod tests {
         if stays {
             stand_in.env(SURVIVOR_STAYS, "1");
         }
-        let mut child = stand_in.spawn().expect("the stand-in gate starts");
+        let mut child = stand_in.spawn().expect("the stand-in run starts");
         let grandchild = armed_grandchild(&mut child, &dir.join("gc.pid"));
         let gate = child.id().to_string();
         let began = Instant::now();
@@ -3622,7 +3729,7 @@ mod tests {
                     let _ = child.wait();
                     send("KILL", &grandchild);
                     panic!(
-                        "the stand-in gate died, or a minute passed, before its stage ended \
+                        "the stand-in run died, or a minute passed, before its stage ended \
                          ({}): it was sent no second signal",
                         ended.display()
                     );
@@ -3648,7 +3755,7 @@ mod tests {
     }
 
     /// A second interrupt during the grace is the operator saying "now": the
-    /// gate stops waiting, `SIGKILL`s what it sent `SIGTERM`, and dies of that
+    /// run stops waiting, `SIGKILL`s what it sent `SIGTERM`, and dies of that
     /// second signal, whichever of the three each one was (bar a `SIGHUP`
     /// after a `SIGHUP`, which is one hangup). The stand-in's suite leaves a
     /// survivor ([`suite_with_survivor`]), and the second signal is sent once
@@ -3670,9 +3777,8 @@ mod tests {
             // cfg). Under `signal(3)` a second interrupt of the number being
             // handled is held back on the handling thread, this stand-in has
             // no other thread to take it, and the pair waits out the whole
-            // grace, as that arm's doc says (measured 2026-10-13 on a macOS
-            // build of that arm: 10.7 s, red 2 of 2). The four pairs below
-            // are what both arms promise.
+            // grace, as that arm's doc says. The four pairs below are what
+            // both arms promise.
             #[cfg(any(
                 target_os = "macos",
                 all(
@@ -3708,12 +3814,12 @@ mod tests {
                 "{case}: the second signal ends the wait: {:?}",
                 it.took
             );
-            assert!(it.survivor_gone, "{case}: the survivor outlived the gate");
+            assert!(it.survivor_gone, "{case}: the survivor outlived the run");
         }
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// What a stand-in gate whose grace nothing ended did: it lived out its
+    /// What a stand-in run whose grace nothing ended did: it lived out its
     /// whole [`TERM_GRACE`] (the survivor's group never empties), `SIGKILL`ed
     /// what it had sent `SIGTERM`, although the live list no longer held it,
     /// and died of `signal`, the first one it was sent. `repeats` is how many
@@ -3733,20 +3839,20 @@ mod tests {
         let whole = TERM_GRACE - Duration::from_millis(u64::from(group::NAP_MS)) * repeats;
         assert!(
             it.lived >= whole,
-            "a survivor holds the gate for its whole grace: {:?}",
+            "a survivor holds the run for its whole grace: {:?}",
             it.lived
         );
         // A hang detector: a grace that never ends in the SIGKILL leaves the
-        // gate waiting on the survivor's `sleep 600`.
+        // run waiting on the survivor's `sleep 600`.
         assert!(
             it.lived < TERM_GRACE + HANG_DETECTOR,
-            "the grace ran out and the gate did not die: {:?}",
+            "the grace ran out and the run did not die: {:?}",
             it.lived
         );
-        assert!(it.survivor_gone, "the survivor outlived the gate");
+        assert!(it.survivor_gone, "the survivor outlived the run");
     }
 
-    /// …and sent no second interrupt, the gate waits out its whole grace
+    /// …and sent no second interrupt, the run waits out its whole grace
     /// before the `SIGKILL` ([`assert_the_grace_ran_out`]).
     #[cfg(unix)]
     #[test]
@@ -3771,7 +3877,7 @@ mod tests {
     /// a second interrupt, and the suites keep their grace, less the one
     /// round of the wait that repeat ends. The stand-in
     /// stays up ([`SURVIVOR_STAYS`]), so that second `SIGHUP` finds what it
-    /// finds in a gate: more threads than the one the handler runs on.
+    /// finds in a run: more threads than the one the handler runs on.
     #[cfg(unix)]
     #[test]
     fn a_second_hangup_is_the_same_hangup_and_ends_no_grace() {
@@ -3790,20 +3896,20 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// The variable that makes a test process the stand-in gate of
+    /// The variable that makes a test process the stand-in run of
     /// [`an_interrupt_takes_the_child_it_caught_being_spawned`]: the
     /// directory its files go in.
     #[cfg(unix)]
     const WINDOW_DIR: &str = "ATV_SPAWN_WINDOW_DIR";
 
     /// Set beside [`WINDOW_DIR`], it moves that stand-in's hold from after
-    /// its child's spawn to before `finish` has read whether the gate is
+    /// its child's spawn to before `finish` has read whether the run is
     /// stopping ([`hold_until_interrupted`]).
     #[cfg(unix)]
     const WINDOW_EARLY: &str = "ATV_SPAWN_WINDOW_EARLY";
 
     /// Set beside [`WINDOW_DIR`], it has that stand-in's stage interrupt the
-    /// gate a second time from inside the window, once the first interrupt
+    /// run a second time from inside the window, once the first interrupt
     /// has it stopping, and stay there a while longer
     /// ([`hold_until_interrupted`]).
     #[cfg(unix)]
@@ -3839,8 +3945,8 @@ mod tests {
     /// `finish`'s two calls from inside the spawn window, where its spawn is
     /// counted in flight ([`group::Spawning`]) and the live list does not
     /// hold its child: with `None` as soon as the spawn is counted, before
-    /// it reads whether the gate is stopping, and with the child's pid once
-    /// there is one. A stand-in gate that set [`HOLD`] keeps the stage
+    /// it reads whether the run is stopping, and with the child's pid once
+    /// there is one. A stand-in run that set [`HOLD`] keeps the stage
     /// thread at one of the two; every other test process passes through.
     #[cfg(unix)]
     pub(super) fn in_the_window(child: Option<u32>) {
@@ -3849,11 +3955,11 @@ mod tests {
         }
     }
 
-    /// THE RULE, CHECKED AT EVERY SIGNAL: the gate signals a process group
+    /// THE RULE, CHECKED AT EVERY SIGNAL: the run signals a process group
     /// only while it holds that group's leader as its own child, running or
     /// unreaped (`group::Live`). `group::send`, the one place the runner
     /// calls `killpg`, comes here first in a test build, so every test that
-    /// kills at a ceiling or interrupts a stand-in gate checks each signal
+    /// kills at a ceiling or interrupts a stand-in run checks each signal
     /// it causes, the handler's among them, and the question (signal 0)
     /// too. The check is the kernel's own word on it: `waitid` with
     /// `WNOWAIT` for the group's id answers for a child of this process,
@@ -3861,7 +3967,7 @@ mod tests {
     /// process was handed included.
     ///
     /// A signal that would break the rule is not sent. In a test's own
-    /// process that is a panic, which names the group. In a stand-in gate
+    /// process that is a panic, which names the group. In a stand-in run
     /// that is stopping it may be the signal handler asking, where nothing
     /// can be formatted or unwound: the stand-in dies there, of `SIGKILL`,
     /// and the test that expected it to die of its interrupt reads signal 9
@@ -3895,7 +4001,7 @@ mod tests {
     /// through, both with the child's exit seen and the child unreaped:
     /// with `false` while its group is still on the live list, and with
     /// `true` once the group has left it and before the door reads whether
-    /// the gate is stopping. A stand-in gate that set [`DOOR`] keeps the
+    /// the run is stopping. A stand-in run that set [`DOOR`] keeps the
     /// stage thread at one of the two; every other test process passes
     /// through.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -3931,7 +4037,7 @@ mod tests {
         }
     }
 
-    /// What a stage in the spawn window finds of its gate: the groups on the
+    /// What a stage in the spawn window finds of its run: the groups on the
     /// live list and the spawns in flight.
     #[cfg(unix)]
     fn found_in_the_window() -> String {
@@ -3943,7 +4049,7 @@ mod tests {
     }
 
     /// The [`HOLD`] of the spawn-window stand-in: keep the stage thread in
-    /// the window until the gate has been interrupted, and leave what the
+    /// the window until the run has been interrupted, and leave what the
     /// test reads.
     ///
     /// `held`, once it is holding: the event to interrupt on, and what the
@@ -3956,13 +4062,13 @@ mod tests {
     /// is at once, and the interrupt finds a spawn that is counted and that
     /// `finish` has not yet decided to make.
     ///
-    /// `suite.pid`, once the child exists. And then, if the gate is
+    /// `suite.pid`, once the child exists. And then, if the run is
     /// stopping, `in-the-window`: what the interrupt left the stage to find.
-    /// Under [`WINDOW_TWICE`] the stage first interrupts the gate again and
+    /// Under [`WINDOW_TWICE`] the stage first interrupts the run again and
     /// stays where it is for [`STAYS_HELD`], its spawn still in flight. That
     /// second interrupt is a `SIGTERM` to its own thread ([`raise_here`]),
     /// so the frame that records it has run before the stage goes on: what
-    /// it writes then, it writes in a gate that has been told "now" and is
+    /// it writes then, it writes in a run that has been told "now" and is
     /// still waiting for this spawn.
     ///
     /// [`group::stopping`] turning true is an event, and the wait for it
@@ -4005,43 +4111,37 @@ mod tests {
 
     /// An interrupt that lands inside a spawn takes that child too. Between
     /// its spawn and its group's place on the live list a stage child is one
-    /// the handler's sweeps cannot see, and until 2026-10-13 it ran on after
-    /// the gate had died (`group::Spawning` has the measurement). The
-    /// stand-in gate holds its stage's spawn in that window
-    /// ([`hold_until_interrupted`]) and is interrupted there, with nothing
-    /// on its live list: the handler waits for the spawn, and the suite and
-    /// its grandchild are gone when the stand-in is. Measured 2026-10-13 on
-    /// the handler as it was, and on this one without its wait, without its
-    /// last sweep, and with the count lowered before the child is on the
-    /// list: the suite outlived the gate, 9 runs of 9.
+    /// the handler's sweeps cannot see, and unwaited for it would run on after
+    /// the run had died (`group::Spawning`). The stand-in run holds its
+    /// stage's spawn in that window ([`hold_until_interrupted`]) and is
+    /// interrupted there, with nothing on its live list: the handler waits for
+    /// the spawn, and the suite and its grandchild are gone when the stand-in
+    /// is. Without the wait, without its last sweep, or with the count lowered
+    /// before the child is on the list, the suite outlives the run.
     ///
     /// Twice that way, without a grace and with one. Either way it is
-    /// `SIGKILL`: the trap of a child born as the gate was interrupted does
+    /// `SIGKILL`: the trap of a child born as the run was interrupted does
     /// not run, which is read once the suite itself has gone. What a
     /// `SIGTERM` does to this same suite is
     /// [`an_interrupted_gate_lets_a_graceful_child_run_its_exit_trap`].
     ///
     /// And once with the hold earlier ([`WINDOW_EARLY`]): `finish` has
-    /// counted its spawn and has not yet read whether the gate is stopping.
+    /// counted its spawn and has not yet read whether the run is stopping.
     /// Interrupted there it reads that it is, and starts no child. This is
     /// the case that pins the order of those two steps, the count and then
     /// the look. Held between them, the stage says what it found before any
     /// interrupt, and it is its own spawn in flight: a count raised after
-    /// the look is not there to find, and a look taken before the hold
-    /// starts the child. Measured 2026-10-13: with the count raised after
-    /// the look the stage found no spawn in flight, 3 runs of 3; with the
-    /// look taken before the hold, or never acted on, it started its child,
-    /// 9 runs of 9.
+    /// the look is not there to find, and a look taken before the hold, or
+    /// never acted on, starts the child.
     ///
     /// And once interrupted twice ([`WINDOW_TWICE`]): held with its child
-    /// off the list, the stage sends the gate a `SIGTERM` as soon as the
+    /// off the list, the stage sends the run a `SIGTERM` as soon as the
     /// `SIGINT` has it stopping, and stays held. A second interrupt ends a
     /// grace; it does not end the wait for a spawn in flight, which is all
-    /// that stands between "now" and a child left running. So the gate is
+    /// that stands between "now" and a child left running. So the run is
     /// still there when the stage looks again, takes the child once it is
-    /// listed, and dies of the second signal. Measured 2026-10-13 with that
-    /// wait ending on a second interrupt as the grace does: the suite
-    /// outlived the gate, 5 runs of 5.
+    /// listed, and dies of the second signal. Were that wait to end on a
+    /// second interrupt as the grace does, the suite would outlive the run.
     #[cfg(unix)]
     #[test]
     fn an_interrupt_takes_the_child_it_caught_being_spawned() {
@@ -4053,14 +4153,13 @@ mod tests {
             let dir = PathBuf::from(dir);
             let (marker, pidfile) = (dir.join("trap-ran"), dir.join("gc.pid"));
             let mut child = if std::env::var_os(WINDOW_EARLY).is_some() {
-                // Never started: the gate is stopping by the time `finish`
+                // Never started: the run is stopping by the time `finish`
                 // looks. It forks nothing all the same, for the run that
                 // does start it, a red one: that child is SIGKILLed within a
                 // millisecond or two of its spawn, and a shell killed while
-                // it forks its `sleep` left that `sleep` behind (`killpg`
-                // reaches the shell, not the process it is creating: one
-                // `sleep 600` left in ten runs, 2026-10-13, before a kill
-                // was repeated, `group::KILL_ROUNDS`).
+                // it forks its `sleep` could leave that `sleep` behind
+                // (`killpg` reaches the shell, not the process it is
+                // creating: `group::KILL_ROUNDS`).
                 Cmd::new("/bin/sleep").args(["600"])
             } else {
                 suite_with_trap(&marker, &pidfile, false)
@@ -4095,7 +4194,7 @@ mod tests {
             for flag in shape {
                 stand_in.env(flag, "1");
             }
-            let mut child = stand_in.spawn().expect("the stand-in gate starts");
+            let mut child = stand_in.spawn().expect("the stand-in run starts");
             // The stage's child and its grandchild, where it has one, as far
             // as each has been written down.
             let written = || {
@@ -4114,7 +4213,7 @@ mod tests {
                         send("KILL", &pid);
                     }
                     panic!(
-                        "{case}: the stand-in gate never held its spawn ({})",
+                        "{case}: the stand-in run never held its spawn ({})",
                         held.display()
                     );
                 }
@@ -4122,7 +4221,7 @@ mod tests {
             }
             send("INT", &child.id().to_string());
             let status = child.wait().expect("the stand-in exits");
-            // What the gate left running is killed here, by pid, whatever is
+            // What the run left running is killed here, by pid, whatever is
             // asserted next. One hang detector for all of it.
             let gone_by = Instant::now() + GONE;
             let left: Vec<_> = written()
@@ -4139,7 +4238,7 @@ mod tests {
             );
             assert!(
                 left.is_empty(),
-                "{case}: the child being spawned when the interrupt landed outlived the gate: \
+                "{case}: the child being spawned when the interrupt landed outlived the run: \
                  {left:?}"
             );
             assert_eq!(
@@ -4151,16 +4250,16 @@ mod tests {
             if case == "early" {
                 assert!(
                     !dir.join("suite.pid").exists(),
-                    "{case}: the interrupt landed before `finish` had read whether the gate \
+                    "{case}: the interrupt landed before `finish` had read whether the run \
                      was stopping, and it started its child all the same"
                 );
             } else {
                 assert_eq!(
                     std::fs::read_to_string(dir.join("in-the-window")).unwrap_or_default(),
                     "0 live, 1 in flight\n",
-                    "{case}: what the stage found once its child existed: the gate stopping, \
+                    "{case}: what the stage found once its child existed: the run stopping, \
                      nothing on the live list, its own spawn in flight (nothing at all: the \
-                     gate died without waiting for the spawn)"
+                     run died without waiting for the spawn)"
                 );
             }
             assert!(
@@ -4171,7 +4270,7 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// The variable that makes a test process the stand-in gate of
+    /// The variable that makes a test process the stand-in run of
     /// [`an_interrupt_taken_on_the_spawning_thread_still_ends_the_gate`]:
     /// the directory its files go in.
     #[cfg(unix)]
@@ -4198,14 +4297,13 @@ mod tests {
     /// taken on the very thread that is spawning stops that thread under the
     /// handler's frame, so the count the frame waits on cannot drop
     /// (`group::Spawning`, what is left), and only the wait's own bound lets
-    /// the gate die of its interrupt. The stand-in gate's stage interrupts
+    /// the run die of its interrupt. The stand-in run's stage interrupts
     /// itself in the window, once its child exists
-    /// ([`interrupt_the_spawning_thread`]), and the gate is dead of `SIGINT`
+    /// ([`interrupt_the_spawning_thread`]), and the run is dead of `SIGINT`
     /// inside a minute: a hang detector, for a wait that takes a second.
-    /// Measured 2026-10-13 with the bound taken out of that wait: the
-    /// stand-in was alive a minute later, 3 runs of 3.
+    /// Without the bound the stand-in is alive a minute later.
     ///
-    /// That child is the one the gate leaves behind in this case, which is
+    /// That child is the one the run leaves behind in this case, which is
     /// why it is killed here, by pid, and not asserted gone.
     #[cfg(unix)]
     #[test]
@@ -4232,7 +4330,7 @@ mod tests {
             .env(SAME_THREAD_DIR, &tmp)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
-        let mut child = stand_in.spawn().expect("the stand-in gate starts");
+        let mut child = stand_in.spawn().expect("the stand-in run starts");
         let deadline = Instant::now() + HANG_DETECTOR;
         let status = loop {
             match child.try_wait() {
@@ -4257,26 +4355,26 @@ mod tests {
         assert_eq!(
             status.and_then(|status| status.signal()),
             Some(2),
-            "the gate dies of its interrupt once the wait for a spawn in flight has run out \
+            "the run dies of its interrupt once the wait for a spawn in flight has run out \
              (`None`: it was alive a minute later, and was killed here): {status:?}"
         );
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// Once the gate has been interrupted it starts no child, and no way out
+    /// Once the run has been interrupted it starts no child, and no way out
     /// of a spawn leaves that spawn counted in flight (a count left raised
-    /// is a second the handler waits for nothing). The stand-in gate runs a
+    /// is a second the handler waits for nothing). The stand-in verify runs a
     /// child that exits and one that cannot start, then the survivor suite
     /// ([`suite_with_survivor`]), and is interrupted there: the survivor
-    /// holds the handler in its grace, so the gate is stopping and still
+    /// holds the handler in its grace, so the run is stopping and still
     /// alive when its stage asks for one more child. That one is refused
     /// before it is spawned. A second signal then ends the grace.
     ///
     /// The way out that every stage takes is its child reaching the live
     /// list, and that one is read while the suite runs, before anything
     /// interrupts it: once `finish` has returned, a count it kept for as
-    /// long as its child ran reads zero too. Measured 2026-10-13 with the
-    /// count kept that long: one in flight while the suite ran, 3 runs of 3.
+    /// long as its child ran would read zero too, so the read is taken while
+    /// the suite runs.
     #[cfg(unix)]
     #[test]
     fn an_interrupted_gate_starts_no_child_and_leaves_no_spawn_in_flight() {
@@ -4341,14 +4439,14 @@ mod tests {
             "it dies of the second signal: {:?}",
             it.status
         );
-        assert!(it.survivor_gone, "the survivor outlived the gate");
+        assert!(it.survivor_gone, "the survivor outlived the run");
         assert_eq!(
             std::fs::read_to_string(tmp.join("late")).unwrap_or_default(),
             "a child that exited: ok=true, then 0 in flight\n\
              a child that could not start: refused=true, then 0 in flight\n\
              a child that is running: 0 in flight\n\
              a child after the interrupt: \
-             Some(\"the gate was interrupted before this child started\"), then 0 in flight\n"
+             Some(\"the run was interrupted before this child started\"), then 0 in flight\n"
         );
         assert!(
             !tmp.join("late-started").exists(),
@@ -4368,9 +4466,7 @@ mod tests {
     /// waited for: a stage's `ssh` asking for a passphrase is stopped by the
     /// terminal, and a wait that took that for an exit would take its group
     /// off the live list with the child still there. macOS answers a
-    /// `waitid` that asked for exits alone for a stopped child too
-    /// (measured 2026-10-13: this test, reading no more than whether the
-    /// kernel had answered, took the stopped child for exited), so the
+    /// `waitid` that asked for exits alone for a stopped child too, so the
     /// answer is read for what it says. The wait that must not return is
     /// given a fifth of a second, a window that can only go vacuous: kept
     /// short.
@@ -4488,7 +4584,7 @@ mod tests {
             assert!(
                 answer
                     .as_ref()
-                    .is_err_and(|e| e.to_string().contains("no longer the gate's")),
+                    .is_err_and(|e| e.to_string().contains("no longer this run's")),
                 "{what} after the reap: {answer:?}"
             );
         };
@@ -4499,7 +4595,7 @@ mod tests {
         assert!(gone, "and as gone, at once");
     }
 
-    /// The variable that makes a test process the stand-in gate of
+    /// The variable that makes a test process the stand-in run of
     /// [`a_stage_child_an_interrupt_may_have_seen_is_never_reaped`]: the
     /// directory its files go in.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -4510,7 +4606,7 @@ mod tests {
     /// child's exit seen and its group still on the live list, a child that
     /// exited by itself and one a ceiling killed; `left` and `beside` hold
     /// it once the group has left the list, before the door reads whether
-    /// the gate is stopping, `beside` with a second stage's group on the
+    /// the run is stopping, `beside` with a second stage's group on the
     /// list beside it.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     const DOOR_CASE: &str = "ATV_DOOR_CASE";
@@ -4527,7 +4623,7 @@ mod tests {
     }
 
     /// The [`DOOR`] of that stand-in: keep the stage thread at its case's
-    /// place in the door until the gate has been interrupted, and leave
+    /// place in the door until the run has been interrupted, and leave
     /// `held` once it is holding there: the event to interrupt on, and what
     /// the stage found of the live list ([`found_in_the_window`]), renamed
     /// into place so whoever sees it sees it whole. The suite's leader has
@@ -4566,30 +4662,29 @@ mod tests {
         }
     }
 
-    /// The gate signals a group only while it holds the group's leader, and
+    /// The run signals a group only while it holds the group's leader, and
     /// the interrupt handler signals the ids it read off the live list for
     /// seconds afterwards. So a stage child whose group the handler may
     /// have read is never reaped, and one it cannot have read is not the
-    /// gate's to signal (`group::Live` has the rule and the argument; until
-    /// 2026-10-13 a stage thread reaped at once, and a stand-in gate
-    /// `SIGKILL`ed a group that was not its own). The door a child is
+    /// run's to signal (`group::Live` has the rule and the argument). The
+    /// door a child is
     /// reaped through takes its group off the list and THEN reads whether
-    /// the gate is stopping, and the stand-in gate holds its stage on
+    /// the run is stopping, and the stand-in run holds its stage on
     /// either side of that first step ([`hold_at_the_door`]), with the
     /// child's exit seen and the child unreaped, and is interrupted there:
     ///
     /// - `listed`: the group is still on the list. The handler reads it
     ///   and sends its `SIGTERM` (the suite asked for a grace, and left a
     ///   `sleep` that ignores it, which holds the handler in that grace).
-    ///   The stage goes on, finds the gate stopping, and does not reap: its
+    ///   The stage goes on, finds the run stopping, and does not reap: its
     ///   child is still a zombie when the stage has ended, and the stage
-    ///   was told the gate was interrupted. A second signal then ends the
+    ///   was told the run was interrupted. A second signal then ends the
     ///   grace, the handler `SIGKILL`s the group it remembered, the `sleep`
     ///   is gone, and every one of those signals found the leader held
     ///   ([`signalling`] ends a stand-in that would send one that did not:
     ///   it dies of signal 9, not of its interrupt).
     /// - `left`: the group is off the list. The handler finds no group
-    ///   there, signals nothing and the gate dies at once: the `sleep` the
+    ///   there, signals nothing and the run dies at once: the `sleep` the
     ///   suite left runs on, as that of any stage that ended before the
     ///   interrupt does, and is ended here by pid.
     /// - `ceiling`: `listed` again, reached from a ceiling kill, which
@@ -4600,8 +4695,8 @@ mod tests {
     /// - `beside`: `left` again, with a second stage running beside it
     ///   whose suite asked for a grace and ignores its `SIGTERM`. The
     ///   handler reads that group, not the held one, and waits in its
-    ///   grace, so the gate lives on and what the held stage does next can
-    ///   be read: it finds the gate stopping and keeps its child, as at
+    ///   grace, so the run lives on and what the held stage does next can
+    ///   be read: it finds the run stopping and keeps its child, as at
     ///   `listed`, because the door reads the flag only after the group
     ///   has left the list. A door that read the flag first would have read
     ///   it clear before the hold and would reap here. That order is the
@@ -4611,15 +4706,12 @@ mod tests {
     ///   This case pins the order instead. A second signal then ends the
     ///   grace and the handler `SIGKILL`s the group beside, which it read.
     ///
-    /// Measured 2026-10-13 with the door changed, one run each. Reaping
-    /// although the gate is stopping: this test red at `listed`, and nine
-    /// older interrupt tests with it, each stand-in dead of signal 9.
-    /// Reading whether the gate is stopping before the group has left the
-    /// list, and leaving the list only after the reap: red at `left`. A
-    /// ceiling kill that reaps with std's `wait`: red at `ceiling`, never
-    /// held. Reading it before the group has left the list with the door's
-    /// two holds where they are, which passed every test before `beside`:
-    /// red at `beside` 3 runs of 3, the child reaped, and no other test red.
+    /// Each case catches one way to break the door: reaping although the run
+    /// is stopping (red at `listed`); reading the flag before the group has
+    /// left the list and leaving only after the reap (red at `left`); a
+    /// ceiling kill that reaps with std's `wait` (red at `ceiling`); reading
+    /// the flag before the group has left the list with the holds where they
+    /// are (red at `beside` alone).
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn a_stage_child_an_interrupt_may_have_seen_is_never_reaped() {
@@ -4662,7 +4754,7 @@ mod tests {
                         ])
                         .term_grace(TERM_GRACE)
                 });
-            // On a thread of its own, as a gate's stages are: the handler
+            // On a thread of its own, as a run's stages are: the handler
             // runs on the main thread, and a stage held underneath it would
             // never leave the door. The stage beside is not waited for: it
             // ends only when the handler kills it.
@@ -4694,7 +4786,7 @@ mod tests {
                 .env(DOOR_CASE, case)
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null());
-            let mut child = stand_in.spawn().expect("the stand-in gate starts");
+            let mut child = stand_in.spawn().expect("the stand-in run starts");
             let gate = child.id().to_string();
             // Wait for `marker` (an event), or end the stand-in and what its
             // suite left, by pid, and say why.
@@ -4713,7 +4805,7 @@ mod tests {
                             send("KILL", &pid);
                         }
                         panic!(
-                            "{case}: the stand-in gate died, or a minute passed, before {}",
+                            "{case}: the stand-in run died, or a minute passed, before {}",
                             marker.display()
                         );
                     }
@@ -4736,8 +4828,8 @@ mod tests {
             // What the suite left running is ended here, by pid, whatever is
             // asserted next.
             let left_running = written_pid(&dir.join("gc.pid")).map(|pid| {
-                // At `beside` it is looked at once, the gate being dead: `left`
-                // has the window it is given to outlive the gate.
+                // At `beside` it is looked at once, the run being dead: `left`
+                // has the window it is given to outlive the run.
                 let window = match case {
                     "left" => STILL_THERE,
                     "beside" => Duration::ZERO,
@@ -4776,13 +4868,13 @@ mod tests {
                 "beside" => {
                     assert!(
                         leader.as_deref().is_some_and(|stat| stat.starts_with('Z')),
-                        "{case}: a child whose door was passed with the gate stopping was reaped: \
+                        "{case}: a child whose door was passed with the run stopping was reaped: \
                          the door read the flag before its group left the list (its `ps` state \
                          once the stage had ended, a zombie's if it was kept: {leader:?})"
                     );
                     assert_eq!(
                         std::fs::read_to_string(dir.join("stage-ended")).unwrap_or_default(),
-                        "Some(\"the gate was interrupted while this child ran\")\n",
+                        "Some(\"the run was interrupted while this child ran\")\n",
                         "{case}: what the stage was told of the child it did not reap"
                     );
                     assert_eq!(
@@ -4795,7 +4887,7 @@ mod tests {
                         beside_running,
                         Some(false),
                         "{case}: the stage beside, whose group the handler read off the list, \
-                         outlived the gate"
+                         outlived the run"
                     );
                 }
                 "listed" => {
@@ -4807,13 +4899,13 @@ mod tests {
                     );
                     assert_eq!(
                         std::fs::read_to_string(dir.join("stage-ended")).unwrap_or_default(),
-                        "Some(\"the gate was interrupted while this child ran\")\n",
+                        "Some(\"the run was interrupted while this child ran\")\n",
                         "{case}: what the stage was told of the child it did not reap"
                     );
                     assert_eq!(
                         left_running,
                         Some(false),
-                        "{case}: the `sleep` the suite left outlived the gate"
+                        "{case}: the `sleep` the suite left outlived the run"
                     );
                 }
                 "left" => assert_eq!(
@@ -4834,7 +4926,7 @@ mod tests {
     /// from the lowest, and `after` is the answer from the 65th round on;
     /// `asked` counts the rounds. A script that only `watches` counts them
     /// and leaves the kernel's answers alone. All of it atomics, because a
-    /// stand-in gate's signal handler asks too. Sixteen at a time: the rule's
+    /// stand-in run's signal handler asks too. Sixteen at a time: the rule's
     /// own test holds six, beside every test that scripts a real group.
     ///
     /// `group` is the group's id for its repeated `SIGKILL`s, and the id
@@ -4866,7 +4958,7 @@ mod tests {
     #[cfg(unix)]
     const NOBODY: i32 = 0x7fff_0000;
 
-    /// Set by a stand-in gate whose groups never empty: every repeated
+    /// Set by a stand-in run whose groups never empty: every repeated
     /// `SIGKILL` answers that it found a process.
     #[cfg(unix)]
     static NEVER_GONE: AtomicBool = AtomicBool::new(false);
@@ -4966,7 +5058,7 @@ mod tests {
     /// comes back a round short of the quiet it needs is killed there, and
     /// the count of quiet rounds starts again. And a group that never
     /// empties ends the rounds at their bound, which is all that lets a
-    /// ceiling kill return and an interrupted gate die. Rounds with no
+    /// ceiling kill return and an interrupted run die. Rounds with no
     /// bound would never return from that case, so the cases run under a
     /// hang detector of their own ([`within_the_hang_detector`]).
     #[cfg(unix)]
@@ -5145,9 +5237,8 @@ mod tests {
     /// ([`Script::watching`]). Every round then finds nobody: the group is
     /// down to its unreaped leader, which answers a signal with `EPERM`, and
     /// that is the reading the rounds take for "nobody". Read the other way
-    /// round (measured 2026-10-13, with the test of what a kill found
-    /// inverted) every ceiling kill ran to its bound, took a third of a
-    /// second and reported a process that was not there.
+    /// round, every ceiling kill would run to its bound, take a third of a
+    /// second and report a process that was not there.
     ///
     /// The count is not pinned to the quiet rounds exactly: a process that
     /// is dying can answer a round or two more on a loaded machine
@@ -5206,9 +5297,9 @@ mod tests {
 
     /// A ceiling's grace takes its group for gone only once the group has
     /// stayed empty. One empty reading can be of a group that is still
-    /// making a process (`group::KILL_ROUNDS`), and until 2026-10-13 the
-    /// grace returned on that one reading, with no `SIGKILL` at all and a
-    /// note that the group had exited. Twice here, on a stage that dies of
+    /// making a process (`group::KILL_ROUNDS`), and a grace that returned on
+    /// that one reading would send no `SIGKILL` at all and note that the
+    /// group had exited. Twice here, on a stage that dies of
     /// its `SIGTERM` at once (one process, no fork, so nothing of it can
     /// outlive that signal):
     ///
@@ -5305,10 +5396,10 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// An interrupted gate's repeated kills end by themselves. The stand-in
-    /// gate's groups answer every repeated `SIGKILL` as if a process were
+    /// An interrupted run's repeated kills end by themselves. The stand-in
+    /// run's groups answer every repeated `SIGKILL` as if a process were
     /// still there ([`NEVER_GONE`]: a group that cannot be killed cannot be
-    /// built), and the gate is dead of `SIGINT` inside a minute, with its
+    /// built), and the run is dead of `SIGINT` inside a minute, with its
     /// stage's grandchild gone: a hang detector, for rounds that take a
     /// fraction of a second. It took every round to get there, a
     /// millisecond's nap each, so the bound is what ended them.
@@ -5338,7 +5429,7 @@ mod tests {
             .env(PIDFILE, &pidfile)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
-        let mut child = stand_in.spawn().expect("the stand-in gate starts");
+        let mut child = stand_in.spawn().expect("the stand-in run starts");
         let grandchild = armed_grandchild(&mut child, &pidfile);
         let t = Instant::now();
         send("INT", &child.id().to_string());
@@ -5362,18 +5453,18 @@ mod tests {
         assert_eq!(
             status.and_then(|status| status.signal()),
             Some(2),
-            "the gate dies of its interrupt once its repeated kills have run out (`None`: it \
+            "the run dies of its interrupt once its repeated kills have run out (`None`: it \
              was alive a minute later, and was killed here): {status:?}"
         );
         assert!(
             !group::REPEATS || took >= Duration::from_millis(u64::from(group::KILL_ROUNDS)),
             "every round was taken, a millisecond's nap each: {took:?}"
         );
-        assert!(gone, "the grandchild {grandchild} outlived the gate");
+        assert!(gone, "the grandchild {grandchild} outlived the run");
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// The variable that makes a test process the stand-in gate of
+    /// The variable that makes a test process the stand-in run of
     /// [`an_interrupted_gate_takes_a_group_that_is_making_processes`]:
     /// the directory its files go in.
     #[cfg(unix)]
@@ -5543,9 +5634,9 @@ mod tests {
 
     /// A ceiling kill leaves nothing of a group that was making processes
     /// when it landed. A `SIGKILL` reaches the members a group has at that
-    /// instant and not the one being made, so until 2026-10-13 a stage
-    /// killed in the middle of starting a child could leave that child
-    /// running (`group::KILL_ROUNDS` has the measurements). The stage here
+    /// instant and not the one being made, so one kill of a stage in the
+    /// middle of starting a child can leave that child running
+    /// (`group::KILL_ROUNDS`). The stage here
     /// makes children back to back ([`making_processes`]) and the ceiling
     /// lands in that stream: no live member of its group is left, with a
     /// grace that it ignores or without one, and whether its children come
@@ -5622,9 +5713,9 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// …and so does an interrupted gate. The stand-in gate runs one such
+    /// …and so does an interrupted run. The stand-in verify runs one such
     /// stage ([`making_processes`]) and is interrupted once the stream is
-    /// under way: no live member of the stage's group is left when the gate
+    /// under way: no live member of the stage's group is left when the run
     /// has died of its interrupt. The stage with a grace ignores its
     /// `SIGTERM` and goes on forking, and a second signal ends that grace,
     /// so its `SIGKILL` lands in the stream as well.
@@ -5665,7 +5756,7 @@ mod tests {
                 .env(MAKING_SHAPE, shape)
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null());
-            let mut child = stand_in.spawn().expect("the stand-in gate starts");
+            let mut child = stand_in.spawn().expect("the stand-in run starts");
             let _first = armed_grandchild(&mut child, &dir.join("gc.pid"));
             let gate = child.id().to_string();
             send("INT", &gate);
@@ -5695,7 +5786,7 @@ mod tests {
         println!("interrupt, {}", report.join("; "));
         assert!(
             outlived.is_empty(),
-            "a member of a killed group outlived the interrupted gate: {outlived:?}\n{QUIET_WINDOW}"
+            "a member of a killed group outlived the interrupted run: {outlived:?}\n{QUIET_WINDOW}"
         );
         std::fs::remove_dir_all(&tmp).ok();
     }
@@ -5727,8 +5818,8 @@ mod tests {
         assert!(out.contains("  child: /bin/sh -c printf "), "{out}");
         assert!(out.contains("child killed after "), "{out}");
         assert!(out.contains("over the 5.0s wall-clock ceiling"), "{out}");
-        assert!(out.contains("--stage-timeout <seconds>"), "{out}");
-        assert!(out.contains("--stage-timeout off"), "{out}");
+        assert!(out.contains("--timeout <seconds>"), "{out}");
+        assert!(out.contains("--timeout off"), "{out}");
         assert!(out.contains("whole process group"), "{out}");
 
         // The order: the child's bytes, the TIMEOUT line, the name, the verdict

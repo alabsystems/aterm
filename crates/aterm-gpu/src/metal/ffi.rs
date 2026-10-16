@@ -80,11 +80,9 @@ unsafe extern "C" {
 
 #[link(name = "Metal", kind = "framework")]
 unsafe extern "C" {
-    /// The one C entry point in Metal. `CF_RETURNS_RETAINED`: the caller owns
-    /// the +1 and must release it, which [`Device`] does on drop.
-    fn MTLCreateSystemDefaultDevice() -> Id;
     /// Every Metal device, as a +1 `NSArray<id<MTLDevice>>`; elements are +0
-    /// until retained.
+    /// until retained. (`MTLCreateSystemDefaultDevice` is declared inside its
+    /// one caller, [`window_server_door`].)
     fn MTLCopyAllDevices() -> Id;
 }
 
@@ -596,37 +594,69 @@ pub(crate) fn choose_listed(
     sole(display().map(|(i, _)| i)).map(|i| (i, "the only display GPU"))
 }
 
-impl Device {
-    /// The GPU aterm renders on.
-    ///
-    /// A terminal needs no discrete GPU, and on a dual-GPU MacBook Pro the
-    /// system default is the discrete one. Like the wgpu arm's
-    /// `PowerPreference::LowPower`, this picks the first low-power, non-headless
-    /// device `MTLCopyAllDevices` lists, unless the development seam
-    /// `ATERM_GPU_POWER=high` asks otherwise. Per `MTLDevice.h`,
-    /// `MTLCreateSystemDefaultDevice` switches an automatic-switching Mac to the
-    /// high-power GPU while `MTLCopyAllDevices` does not, so the system default
-    /// is not created when a low-power device exists.
-    ///
-    /// `MTLCreateSystemDefaultDevice` also makes the process a WindowServer
-    /// client (WindowServer runs a tccd preflight on it); `MTLCopyAllDevices`
-    /// does not. When the listing has exactly one display GPU, that GPU is the
-    /// system default, so it is returned from the listing and headless
-    /// processes (and test binaries) never touch WindowServer.
-    ///
-    /// The system default is created only when the listing cannot decide
-    /// ([`choose_listed`]): several non-low-power display GPUs, none at all, or
-    /// the `high` seam with two or more display GPUs. `tools/grep_guard.sh` B9d
-    /// keeps that call in this function.
-    pub(crate) fn preferred() -> Option<Self> {
-        let want_high = aterm_types::dev_seam!("ATERM_GPU_POWER")
-            .is_some_and(|v| v.eq_ignore_ascii_case("high"));
-        if let Some(listed) = Self::listed(want_high) {
-            return Some(listed);
-        }
-        Self::system_default_asks_window_server()
-    }
+/// THE METAL DOOR: `MTLCreateSystemDefaultDevice`, the one Metal call that
+/// makes this process a WindowServer client (WindowServer then runs a
+/// synchronous TCC preflight of the binary on its main thread; a unit test that
+/// made that call outran WindowServer's watchdog on 2026-09-01). It is declared
+/// inside [`Device::system_default_asks_window_server`], which is private to
+/// this module, so [`Device::preferred`] is its only caller: no other code in
+/// the crate, test code included, can name either.
+mod window_server_door {
+    use super::{AutoreleasePool, Device, Id, Obj};
 
+    impl Device {
+        /// The GPU aterm renders on.
+        ///
+        /// A terminal needs no discrete GPU, and on a dual-GPU MacBook Pro the
+        /// system default is the discrete one. Like the wgpu arm's
+        /// `PowerPreference::LowPower`, this picks the first low-power, non-headless
+        /// device `MTLCopyAllDevices` lists, unless the development seam
+        /// `ATERM_GPU_POWER=high` asks otherwise. Per `MTLDevice.h`,
+        /// `MTLCreateSystemDefaultDevice` switches an automatic-switching Mac to the
+        /// high-power GPU while `MTLCopyAllDevices` does not, so the system default
+        /// is not created when a low-power device exists.
+        ///
+        /// `MTLCreateSystemDefaultDevice` also makes the process a WindowServer
+        /// client (WindowServer runs a tccd preflight on it); `MTLCopyAllDevices`
+        /// does not. When the listing has exactly one display GPU, that GPU is the
+        /// system default, so it is returned from the listing and headless
+        /// processes (and test binaries) never touch WindowServer.
+        ///
+        /// The system default is created only when the listing cannot decide
+        /// ([`choose_listed`](super::choose_listed)): several non-low-power
+        /// display GPUs, none at all, or the `high` seam with two or more
+        /// display GPUs.
+        pub(crate) fn preferred() -> Option<Self> {
+            let want_high = aterm_types::dev_seam!("ATERM_GPU_POWER")
+                .is_some_and(|v| v.eq_ignore_ascii_case("high"));
+            if let Some(listed) = Self::listed(want_high) {
+                return Some(listed);
+            }
+            Self::system_default_asks_window_server()
+        }
+
+        /// The system default GPU (raw `MTLCreateSystemDefaultDevice`, the
+        /// discrete GPU on a dual-GPU Mac), or `None` without a Metal device.
+        fn system_default_asks_window_server() -> Option<Self> {
+            #[link(name = "Metal", kind = "framework")]
+            unsafe extern "C" {
+                /// `CF_RETURNS_RETAINED`: the caller owns the +1 and must
+                /// release it, which [`Device`] does on drop.
+                fn MTLCreateSystemDefaultDevice() -> Id;
+            }
+            #[cfg(test)]
+            super::tests::WINDOW_SERVER_ASKS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // Device creation autoreleases driver objects into the caller's
+            // frame; the +1 device is owned and unaffected by the pop.
+            let _pool = AutoreleasePool::new();
+            // SAFETY: `MTLCreateSystemDefaultDevice` is `CF_RETURNS_RETAINED`,
+            // so the +1 is ours and `Obj` releases it exactly once.
+            unsafe { Obj::from_owned(MTLCreateSystemDefaultDevice()) }.map(Self)
+        }
+    }
+}
+
+impl Device {
     /// The GPU [`choose_listed`] picks from `MTLCopyAllDevices`, or `None`.
     /// Reports its pick once when the machine has more than one GPU.
     fn listed(want_high: bool) -> Option<Self> {
@@ -678,24 +708,6 @@ impl Device {
                 .collect();
             Some((all, gpus))
         }
-    }
-
-    /// The system default GPU (raw `MTLCreateSystemDefaultDevice`, the discrete
-    /// GPU on a dual-GPU Mac), or `None` without a Metal device.
-    ///
-    /// Private and called only from [`Self::preferred`], because it makes the
-    /// process a WindowServer client. Tests use [`Self::preferred`].
-    /// `tools/grep_guard.sh` B9d fails on a second caller, a test caller, a
-    /// `pub`, or `MTLCreateSystemDefaultDevice` named outside this file.
-    fn system_default_asks_window_server() -> Option<Self> {
-        #[cfg(test)]
-        tests::WINDOW_SERVER_ASKS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        // Device creation autoreleases driver objects into the caller's frame;
-        // the +1 device is owned and unaffected by the pop.
-        let _pool = AutoreleasePool::new();
-        // SAFETY: `MTLCreateSystemDefaultDevice` is `CF_RETURNS_RETAINED`, so
-        // the +1 is ours and `Obj` releases it exactly once.
-        unsafe { Obj::from_owned(MTLCreateSystemDefaultDevice()) }.map(Self)
     }
 
     #[inline]
@@ -822,7 +834,8 @@ impl Device {
     /// it so). Consequences the SAFETY comments rely on:
     ///
     /// * Managed is non-Private, so `replaceRegion:` ([`texture_upload`]) is
-    ///   legal and driver-synchronised.
+    ///   legal. It is CPU-synchronous, outside command-queue hazard tracking;
+    ///   callers must settle prior GPU users before modifying a resident texture.
     /// * Managed is not CPU-coherent: on a discrete GPU a CPU read of the system
     ///   copy after GPU writes is stale without `synchronizeResource:`. This
     ///   crate never calls `getBytes:`; every readback copies into a Shared
@@ -888,8 +901,10 @@ impl Device {
     }
 
     /// `-[MTLDevice maxBufferLength]`, the Metal equivalent of wgpu's
-    /// `limits().max_buffer_size`.
-    #[cfg(test)]
+    /// `limits().max_buffer_size`. Read by the device layer's
+    /// `max_buffer_size`, whose only production caller is the wgpu arm's
+    /// stream growth, so it compiles where that arm does.
+    #[cfg(wgpu_arm)]
     pub(crate) fn max_buffer_length(&self) -> usize {
         // SAFETY: `-maxBufferLength` is an `NSUInteger` getter on a live
         // `MTLDevice`.
@@ -1416,7 +1431,9 @@ pub(crate) struct MtlRegion {
 }
 
 impl MtlRegion {
-    /// The whole of a 2-D mip level.
+    /// The whole of a 2-D mip level (the tests' upload shape; production
+    /// uploads go through the device layer's row-ranged verb).
+    #[cfg(test)]
     pub(crate) const fn full_2d(width: usize, height: usize) -> Self {
         Self {
             origin: MtlOrigin { x: 0, y: 0, z: 0 },
@@ -1866,8 +1883,7 @@ mod tests {
     fn preferred_asks_the_window_server_only_when_the_listing_cannot_decide() {
         let _pool = AutoreleasePool::new();
         let Some(gpus) = listing_read_independently() else {
-            crate::stderr_line!("SKIP: no Metal device");
-            return;
+            aterm_spec::host::could_not_run("no Metal device on this machine");
         };
         let want_high = aterm_types::dev_seam!("ATERM_GPU_POWER")
             .is_some_and(|v| v.eq_ignore_ascii_case("high"));
@@ -2007,9 +2023,7 @@ mod tests {
     /// descriptor's platform default.
     #[test]
     fn textures_are_minted_managed_and_managed_is_the_platform_default() {
-        let Some(dev) = crate::metal::test_support::device() else {
-            return;
-        };
+        let dev = crate::metal::test_support::device();
         assert_eq!(
             texture_descriptor_default_storage_mode(),
             TEXTURE_STORAGE_MODE_MANAGED,

@@ -3,18 +3,13 @@
 
 //! Accessibility snapshot of the visible terminal grid.
 //!
-//! A PURE conversion from the rendered cells + cursor into the text and metadata
-//! an assistive backend (macOS NSAccessibility / VoiceOver) needs: the visible
-//! screen as plain text, a role, a label, the grid size, and the cursor's
-//! character offset within that text. It holds no GUI state and calls no platform
-//! API, so it is unit-tested directly; the App (lib.rs) builds it from live terminal
-//! state each frame and, on macOS, hands the text to the content `NSView`'s
-//! accessibility attributes (see `apply_to_ns_view`).
-//!
-//! The text format is byte-identical to the SIGUSR1 `.txt` snapshot — both go
-//! through [`push_visible_row`] — so the AI text snapshot and screen reader
-//! consume the same visible-cell projection. This is semantic parity with the
-//! app-render input; it does not assert compositor or scanout state.
+//! A pure conversion from the rendered cells and cursor into what an assistive
+//! backend needs: the visible screen as plain text, a role, a label, the grid size
+//! and the cursor's character offset. It holds no GUI state and calls no platform
+//! API; the App builds it each frame and, on macOS with `a11y-appkit`, hands it to
+//! the content `NSView` (`apply_to_ns_view`). The text goes through
+//! [`push_visible_row`], as the SIGUSR1 `.txt` snapshot does, so a screen reader and
+//! the text snapshot read the same visible-cell projection.
 
 use aterm_core::terminal::RenderCell;
 
@@ -29,21 +24,14 @@ pub(crate) const ROLE_TEXT_AREA: &str = "AXTextArea";
 pub(crate) const LABEL: &str = "aterm terminal";
 
 /// Append one grid row to `text`: each cell's glyph char (control/NUL → space),
-/// up to `cols`, with trailing blanks trimmed, terminated by `'\n'`.
+/// up to `cols`, trailing blanks trimmed, terminated by `'\n'`. Shared by the
+/// accessibility snapshot and the SIGUSR1 `.txt` snapshot, so the two are identical.
 ///
-/// Shared by the accessibility snapshot and the SIGUSR1 `.txt` snapshot so the two
-/// representations are always identical.
-///
-/// ONE CHARACTER PER CELL, WIDE GLYPHS INCLUDED. A double-width glyph occupies two
-/// cells and the engine fills its continuation with a space
-/// (`aterm_core::terminal::render_cells`), so a CJK or emoji line reaches an assistive
-/// client as `漢 字` and navigates as separate words. That pad is deliberate and
-/// load-bearing rather than an oversight: it is what makes the character index EQUAL the
-/// grid column, which every consumer of this text depends on — the caret offset, the
-/// published selection span, and the per-character positions that drive braille cursor
-/// routing all address the row by column. Dropping it would buy correct word navigation
-/// at the price of a caret that lands in the wrong place on every line with a wide glyph
-/// to its left.
+/// One character per cell, wide glyphs included: the engine pads a double-width
+/// glyph's continuation cell with a space (`aterm_core::terminal::render_cells`),
+/// so `漢 字` reads as separate words. The pad is deliberate: it keeps the character
+/// index equal to the grid column, which the caret offset, the published selection
+/// span and braille cursor routing all rely on.
 pub(crate) fn push_visible_row(text: &mut String, cells: &[RenderCell], cols: usize) {
     for cell in cells.iter().take(cols) {
         text.push(if cell.ch == '\0' || cell.ch.is_control() {
@@ -88,22 +76,15 @@ impl AccessibleSnapshot {
         Self::from_cells_in(rows_cells, 0..rows_cells.len(), 0..cols, cursor)
     }
 
-    /// Build a snapshot of ONE RECTANGLE of the rendered rows — the projection a
-    /// split pane needs.
+    /// Build a snapshot of one rectangle of the rendered rows: the projection a
+    /// split pane needs. A composed split frame carries every pane side by side
+    /// on the same rows, so a whole row is two programs' output spliced together;
+    /// read through one pane's rectangle of the same cells, it is that pane's
+    /// painted line.
     ///
-    /// A composed split frame carries every visible pane side by side on the same
-    /// rows, separated by a divider column. Read whole, a row of that frame is two
-    /// unrelated programs' output spliced together and a screen reader reads
-    /// nonsense; read through one pane's rectangle it is that pane's line. The
-    /// rectangle is taken from the SAME composed cells the frame was drawn from, so
-    /// a pane's announced text is the pane's painted text by construction.
-    ///
-    /// `cursor` is already PANE-LOCAL (the caller owns the pane's origin), and is
-    /// `None` for a pane whose cursor is not on screen.
-    ///
-    /// Rows and columns outside the supplied cells are simply absent rather than
-    /// clamped-with-padding: a short row yields a short line, exactly as the
-    /// whole-frame projection does.
+    /// `cursor` is pane-local, `None` when the pane's cursor is off screen. Cells
+    /// outside the supplied rows are absent, not padded: a short row yields a
+    /// short line.
     #[must_use]
     pub(crate) fn from_cells_in(
         rows_cells: &[Vec<RenderCell>],
@@ -147,25 +128,26 @@ impl AccessibleSnapshot {
         LABEL
     }
 
-    /// The cursor's character offset within [`value`](Self::value), suitable for
+    /// The cursor's UTF-16 offset within [`value`](Self::value), suitable for
     /// an `AXSelectedTextRange` (a zero-length selection at the caret), or `None`
     /// when the cursor is hidden.
     ///
     /// The offset accounts for per-row trailing-blank trimming: it sums the
     /// trimmed length of each preceding line (plus its `'\n'`) and clamps the
     /// column to the cursor line's trimmed length (so a caret parked in trailing
-    /// whitespace maps to the end of that line's visible text).
+    /// whitespace maps to the end of that line's visible text). The grid uses
+    /// one scalar per cell; NSString's NSRange counts an astral scalar as two
+    /// UTF-16 units, so translate after finding the cell's text prefix.
     #[must_use]
     #[cfg(any(all(target_os = "macos", feature = "a11y-appkit"), test))]
     pub(crate) fn cursor_offset(&self) -> Option<usize> {
         let (crow, ccol) = self.cursor?;
         let mut off = 0usize;
         for (i, line) in self.text.split('\n').enumerate() {
-            let line_len = line.chars().count();
             if i == crow {
-                return Some(off + ccol.min(line_len));
+                return Some(off + line.chars().take(ccol).map(char::len_utf16).sum::<usize>());
             }
-            off += line_len + 1; // +1 for the '\n'
+            off += line.encode_utf16().count() + 1; // +1 for the '\n'
         }
         None
     }
@@ -183,14 +165,11 @@ mod macos {
     use crate::appkit;
 
     /// Publish `snap` to the window's content `NSView` accessibility attributes so
-    /// VoiceOver can read the terminal: role (text area), label, value (the visible
-    /// screen text), and the caret as a zero-length `AXSelectedTextRange` (so
-    /// VoiceOver tracks the cursor), unless the cursor is hidden.
+    /// VoiceOver can read the terminal: role, label, value (the visible text) and,
+    /// unless the cursor is hidden, the caret as a zero-length `AXSelectedTextRange`.
     ///
-    /// Best-effort and side-effect-only: it silently returns if the AppKit handle
-    /// is unavailable. Must be called on the main thread (AppKit requirement),
-    /// which the winit event loop guarantees. VoiceOver behavior itself is not
-    /// machine-verifiable here and is validated manually.
+    /// Best-effort: returns silently without an AppKit handle. Main thread only
+    /// (the winit event loop's). VoiceOver behaviour is validated by hand.
     pub(crate) fn apply_to_ns_view(window: &Window, snap: &AccessibleSnapshot) {
         let view = crate::platform::ns_view_of(window);
         if view.is_null() {
@@ -205,13 +184,9 @@ mod macos {
                 return;
             };
             // SAFETY: `view` is this window's live NSView (winit owns it for the
-            // window's lifetime), borrowed on the main thread to set its
-            // accessibility attributes. `-setAccessibilityRole:` /
-            // `-setAccessibilityLabel:` are `-(void)(NSString *)` (the role
-            // typedef IS an NSString), `-setAccessibilityValue:` is
-            // `-(void)(id)` — objc2 needed an explicit three-step deref
-            // coercion to reach that erased type and `Id` simply IS it — and
-            // `-setAccessibilityElement:` is `-(void)(BOOL)`.
+            // window's lifetime), used on the main thread. `-setAccessibilityRole:` /
+            // `-setAccessibilityLabel:` / `-setAccessibilityValue:` take one object
+            // (the role typedef is an NSString) and `-setAccessibilityElement:` a BOOL.
             unsafe {
                 appkit::send_v_id(view, sel!(setAccessibilityRole:), role.id());
                 appkit::send_v_id(view, sel!(setAccessibilityLabel:), label.id());
@@ -257,11 +232,19 @@ mod tests {
     }
 
     #[test]
-    fn cursor_offset_counts_chars_to_the_caret() {
+    fn cursor_offset_counts_utf16_units_to_the_caret() {
         for (label, text, cursor, expected) in [
             ("hidden caret", "abc\n", None, None),
             // caret at row 0 col 2 in "hello" → offset 2.
             ("first line", "hello\nworld\n", Some((0, 2)), Some(2)),
+            ("astral glyph before caret", "😀 x\n", Some((0, 2)), Some(3)),
+            (
+                "astral glyph on earlier row",
+                "😀\nx\n",
+                Some((1, 1)),
+                Some(4),
+            ),
+            ("astral trailing clamp", "😀\n", Some((0, 10)), Some(2)),
             // "hello\n" is 6 chars; caret at row 1 col 3 → 6 + 3 = 9.
             (
                 "second line counts the newline",
@@ -283,7 +266,6 @@ mod tests {
 
     #[test]
     fn from_cells_builds_text_from_real_render_cells() {
-        // Drive a real engine so we exercise the actual RenderCell shape.
         let mut term = Terminal::new(3, 10);
         term.process(b"hello");
         let cells: Vec<Vec<RenderCell>> = (0..3).map(|r| term.render_row(r)).collect();
@@ -295,11 +277,7 @@ mod tests {
         assert_eq!(s.cursor_offset(), Some(5));
     }
 
-    /// A composed split frame tiles both panes onto the SAME rows with a divider between
-    /// them, so the whole-frame projection reads two unrelated programs' output spliced
-    /// together on every line. Reading one pane's rectangle out of those same cells is
-    /// what gives that pane its own text — and it is the same cells, so the announced text
-    /// is the painted text.
+    /// A pane's rectangle reads only its own columns of the composed split frame.
     #[test]
     fn a_pane_rectangle_reads_only_its_own_columns() {
         let mut term = Terminal::new(2, 21);
@@ -321,8 +299,7 @@ mod tests {
         assert_eq!(right.cursor_offset(), Some(5), "the pane-local caret");
     }
 
-    /// The whole-frame projection is the rectangle that covers everything, so the two
-    /// cannot drift: `from_cells` is `from_cells_in` over the full grid.
+    /// `from_cells` is `from_cells_in` over the full grid, so the two cannot drift.
     #[test]
     fn the_whole_frame_is_the_full_rectangle() {
         let mut term = Terminal::new(3, 10);

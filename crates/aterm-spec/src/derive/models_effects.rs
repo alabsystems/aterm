@@ -1,22 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-//! Sparkle / ignition / cursor-cat / rainbow-kitty effect models, plus the
-//! generalized error-class trio. Each constructor keeps its `crate::derive`
-//! path via the `pub use` re-exports in `derive.rs`.
+//! Sparkle, ignition, cursor-cat and rainbow-kitty effect models, plus the error-class trio,
+//! re-exported from `crate::derive`.
 
 use super::*;
 
-/// Pointer strokes are input-driven and rate limited. This bounded projection
-/// distinguishes absent contact, partial travel, and a completed slow stroke;
-/// geometry, speed, and elapsed-time thresholds are exercised by the detector's
-/// concrete regressions. `cooldown_due` is the independent obligation created
-/// by the most recent earned stroke, so resetting contact cannot erase it.
-///
-/// `Buggy = 1` admits stationary/partial/cooling samples as strokes, drops the
-/// cooldown on reset, and retains abandoned contact. Tier-1 in
-/// `aterm-effects/src/pet_stroke.rs` drives the real detector, reads its actual
-/// contact/travel/deadline fields, and binds each abstract transition.
+/// Pointer strokes are input-driven and rate limited. This projection distinguishes absent
+/// contact, partial travel and a completed slow stroke; geometry, speed and time thresholds are
+/// left to the detector's regression tests. `cooldown_due` is the obligation the latest earned
+/// stroke creates, so resetting contact cannot erase it. `Buggy = 1` admits stationary, partial
+/// and cooling samples as strokes, drops the cooldown on reset, and keeps abandoned contact.
+/// Tier-1 in `aterm-effects/src/pet_stroke.rs` drives the real detector, reads its contact,
+/// travel and deadline fields, and binds each transition.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn pet_stroke_detector_model() -> Model {
@@ -68,55 +64,43 @@ pub fn pet_stroke_detector_model() -> Model {
                 if cooldown_due == 1 { cooling == 1 } else { cooling <= 1 };
             invariant ResetForgetsContact:
                 if event == 6 { contact == 0 && progress == 0 } else { contact <= 1 };
-            invariant StrokeStateBounded:
+            bound StrokeStateBounded:
                 contact <= 1 && progress <= 1 && cooling <= 1 && cooldown_due <= 1
                     && emitted <= 1 && event <= 8;
         }
     }
 }
 
-/// SPARKLE-WORDS v2 identity/persistence episodes (docs/sparkle-words-v2-design.md
-/// §3.6/§9), authored via [`ty_model!`] exactly as the design prints it. One word
-/// identity's episode lifecycle over the GUI's grace-TTL persist map:
+/// Sparkle-words identity and persistence episodes (docs/sparkle-words-v2-design.md §3.6/§9): one
+/// word identity's episode lifecycle over the GUI's grace-TTL persist map.
 ///
-///   * `Appear` — a persist MISS births an episode: the genome rolls exactly
-///     once (`rolls`), the per-episode nova re-arms (`nova = 0`). Guarded by
-///     `MaxBirths` — the §9 finiteness rule (vars carry no declared bounds, so
-///     the re-enterable Absent→Live→Grace→Absent cycle must be guard-bounded
-///     for explicit-state BFS to terminate; the design's §15.14e correction).
-///   * `Vanish`/`Rehit` — occlusion enters grace; a re-hit within grace
-///     CONTINUES the episode. At `Buggy = 1` the re-hit re-rolls the genome —
-///     exactly v1's one-epoch `prev_appeared` amnesia (flaw B-3).
-///   * `Rekey` — a same logical occurrence moved by a terminal redraw changes
-///     its position key without changing its genome, spent-nova bit, done mark,
-///     or fire count. `Buggy = 1` models treating the move as a fresh identity:
-///     it re-rolls and resets the spent guards, admitting a second ignition.
-///   * `ContextMove` — the stronger redraw-recognition obligation: the same
-///     logical occurrence moves while its row-local neighbor/status context
-///     changes. Healthy recognition still transfers the episode; `Buggy = 1`
-///     models rejecting the changed fingerprint, allocating a false fresh
-///     birth, and re-arming the spent occurrence.
-///   * `Tick`/`Expire` — grace ages out; only true expiry re-rolls.
-///   * `Ignite` — one nova per episode; the `Buggy` threshold form admits a
-///     re-ignition (the print-erase-print strobe the grace map exists to stop).
+/// * `Appear`: a persist miss births an episode; the genome rolls once (`rolls`) and the
+///   per-episode nova re-arms. `MaxBirths` guard-bounds the re-enterable
+///   Absent→Live→Grace→Absent cycle so explicit-state BFS terminates (§9).
+/// * `Vanish`/`Rehit`: occlusion enters grace; a re-hit within grace continues the episode. At
+///   `Buggy = 1` the re-hit re-rolls the genome.
+/// * `Rekey`: a terminal redraw moves the same logical occurrence, changing its position key but
+///   not its genome, spent-nova bit, done mark or fire count. `Buggy = 1` treats the move as a
+///   fresh identity, re-rolling and resetting the spent guards.
+/// * `ContextMove`: the same occurrence moves while its row-local neighbor/status context
+///   changes. Healthy recognition still transfers the episode; `Buggy = 1` rejects the changed
+///   fingerprint, births falsely and re-arms the spent occurrence.
+/// * `Tick`/`Expire`: grace ages out; only true expiry re-rolls.
+/// * `Ignite`: one nova per episode; the `Buggy` threshold admits a re-ignition (the
+///   print-erase-print strobe the grace map exists to stop).
 ///
-/// Invariants, proven at `Buggy = 0` (exhaustive) and caught at `Buggy = 1`
-/// (violates `GenomeFrozen` on re-hit/rekey, `RecognitionComplete` /
-/// `NoFalseBirths` on a context-changing move, and admits a second fire):
-/// `GenomeFrozen: rolls = births`, `OneNovaPerEpisode: nova <= 1`,
-/// `PlayedOnce: fires <= 1`, `AgeBounded: age <= GraceMax`.
+/// Invariants: `GenomeFrozen: rolls = births`, `OneNovaPerEpisode: nova <= 1`,
+/// `PlayedOnce: fires <= 1`, plus `RecognitionComplete` and `NoFalseBirths` for context-changing
+/// moves.
 ///
-/// Tier-0: `derived_sparkle_identity_proves_and_catches_amnesia_and_rekey`
-/// (aterm-spec/tests/derived_ring_ty.rs). Tier-1 lives beside the shipping map
-/// in `aterm-effects/src/word_decorations.rs`:
-/// `sparkle_identity_conformance_real_persist_map` drives the REAL
-/// `WordDecorations` persist map with a fake clock and validates the projected
-/// `(state, rolls, nova)` trace, with grace-less and missing-rekey negative
-/// controls. The public-API redraw regression is
+/// Tier-0: `derived_sparkle_identity_proves_and_catches_amnesia_and_rekey` (`derived_ring_ty.rs`).
+/// Tier-1: `sparkle_identity_conformance_real_persist_map` in
+/// `aterm-effects/src/word_decorations.rs` drives the real `WordDecorations` persist map with a
+/// fake clock and validates the projected `(state, rolls, nova)` trace, with grace-less and
+/// missing-rekey negative controls; the public-API redraw regression is
 /// `aterm-effects/tests/word_reflow_identity.rs`.
 #[must_use]
-// Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
-// models above) — the MODEL it returns is what `ty` machine-checks.
+// Skip (T2 vcgen-budget lane): a model data constructor; `ty` checks the model it returns.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn sparkle_identity_model() -> Model {
     crate::ty_model! {
@@ -131,18 +115,16 @@ pub fn sparkle_identity_model() -> Model {
             var rolls = 0;    // genome rolls
             var age = 0;      // grace age (rescans since last_seen)
             var nova = 0;     // novas fired this episode
-            var done = 0;     // v3: the identity's done mark — SURVIVES Expire
-            var fires = 0;    // v3: total ignitions across every episode generation
+            var done = 0;     // the identity's done mark; survives Expire
+            var fires = 0;    // ignitions across every episode generation
             var rekeys = 0;   // logical occurrence position changes
             var context = 0;  // bounded row-local context version
             var context_moves = 0;      // logical moves whose local context changed
             var recognized_moves = 0;   // those moves transferred as the same episode
             var false_births = 0;       // context moves misclassified as fresh
             action Appear when (state == 0 && births <= MaxBirths - 1) {
-                // v3: an Appear from the done set enters BORN-DONE (done = 1
-                // holds; the Ignite guard below stays disabled forever). The
-                // genome still rolls (born-done words show settled ink, which
-                // needs the genome), so GenomeFrozen is unchanged.
+                // An Appear from the done set is born done (Ignite stays disabled). The genome
+                // still rolls (born-done words show settled ink), so GenomeFrozen holds.
                 state = 1; births = births + 1; rolls = rolls + 1; nova = 0;
             }
             action Vanish when (state == 1) { state = 2; age = 0; }
@@ -152,10 +134,8 @@ pub fn sparkle_identity_model() -> Model {
             }
             action Rekey when (state == 1 && rekeys <= MaxRekeys - 1) {
                 rekeys = rekeys + 1;
-                // Healthy: only the map key changes (all modeled lifecycle
-                // fields are UNCHANGED). Buggy: a fresh-identity replacement
-                // re-rolls and forgets both spent guards, so Ignite can fire
-                // again and PlayedOnce catches the second event.
+                // Healthy: only the map key changes. Buggy: a fresh-identity replacement
+                // re-rolls and forgets both spent guards, so PlayedOnce catches a second Ignite.
                 rolls = if Buggy == 1 { rolls + 1 } else { rolls };
                 nova = if Buggy == 1 { 0 } else { nova };
                 done = if Buggy == 1 { 0 } else { done };
@@ -165,13 +145,11 @@ pub fn sparkle_identity_model() -> Model {
                 && rekeys <= MaxRekeys - 1
                 && births <= MaxBirths - 1)
             {
-                // The surface/logical occurrence is unchanged, but row-local
-                // neighbors changed while a same-width redraw moved it. The
-                // healthy recognizer transfers the old episode despite that
-                // context toggle. The buggy recognizer takes the real fresh
-                // allocation path: births and rolls remain internally
-                // consistent, so only the explicit recognition obligations
-                // catch the classification error before the second Ignite.
+                // The occurrence is unchanged but its row-local neighbors changed while a
+                // same-width redraw moved it. The healthy recognizer transfers the episode; the
+                // buggy one takes the real fresh-allocation path, so births and rolls stay
+                // consistent and only the recognition obligations catch it before the second
+                // Ignite.
                 context = if context == 0 { 1 } else { 0 };
                 context_moves = context_moves + 1;
                 recognized_moves = if Buggy == 1 {
@@ -193,56 +171,46 @@ pub fn sparkle_identity_model() -> Model {
             {
                 nova = nova + 1; fires = fires + 1; done = 1;
             }
-            invariant GenomeFrozen: rolls == births;     // v1's one-epoch amnesia is the Buggy trace
+            invariant GenomeFrozen: rolls == births;
             invariant OneNovaPerEpisode: nova <= 1;
-            invariant AgeBounded: age <= GraceMax;
-            invariant RekeysBounded: rekeys <= MaxRekeys;
-            invariant ContextBounded: context <= 1;
-            invariant ContextMovesBounded: context_moves <= MaxContextMoves;
+            bound AgeBounded: age <= GraceMax;
+            bound RekeysBounded: rekeys <= MaxRekeys;
+            bound ContextBounded: context <= 1;
+            bound ContextMovesBounded: context_moves <= MaxContextMoves;
             invariant RecognitionComplete: recognized_moves == context_moves;
             invariant NoFalseBirths: false_births == 0;
-            // v3 §1.3 PlayedOnce: no second Ignite/entrance per done-marked
-            // identity — the done flag survives Expire, so a re-born episode
-            // can never re-fire (Buggy = 1 re-admits and violates this too).
+            // v3 §1.3: the done flag survives Expire, so a re-born episode never re-fires.
             invariant PlayedOnce: fires <= 1;
         }
     }
 }
 
-/// Bounded repeated-surface policy, the group complement to
-/// [`sparkle_identity_model`]'s single-occurrence `ContextMove`. This is NOT a
-/// general same-form oracle: each action names one licensed matcher premise for
-/// spent episodes in one collision-free exact-`FormId` group:
+/// Bounded repeated-surface policy, the group complement to [`sparkle_identity_model`]'s
+/// single-occurrence `ContextMove`. Not a general same-form oracle: each action names one
+/// licensed matcher premise for spent episodes in one collision-free exact-`FormId` group.
 ///
-/// * `MovePair`: an immediate, same-width GLOBAL redraw moves both old
-///   occurrences within the bounded linear window and leaves no stationary
-///   same-seed anchor. Both are recognizable; 2 → 2 means two transfers and no
-///   birth/arm. The buggy exact-context-only classifier misses both.
-/// * `GrowOne`: the same global-redraw premises, but 2 → 3 contains one
-///   logically new occurrence. Two transfer and exactly one is fresh/armed;
-///   the buggy context gate births all three.
-/// * `RotatePair`: a recent log-tail rotation has a stationary same-seed
-///   survivor. That survivor anchors the group: one old episode transfers and
-///   the new bottom occurrence is genuinely fresh/armed. The buggy
-///   cardinality-only classifier falsely transfers the departed twin too.
-/// * `BlankGrace`: after MORE than two BLANK occlusion scans, the exact seed
-///   and exact context return untainted. Blank grace is still the same logical
-///   episode and must transfer despite exceeding the weak redraw window. The
-///   buggy blanket recency gate creates a false fresh/armed birth.
-/// * `TypedRetype` / `RecentTypedRetype`: for the feline class only, after
-///   NONBLANK incremental replacement, the same form returns at the SAME
-///   position-bearing seed and exact context, but continuity is tainted. Both
-///   the >2-scan case and a coalesced one-partial case inside the weak window
-///   are logically new and must be one fresh/armed birth. The buggy
-///   exact-evidence path ignores taint and steals the spent episode (the
-///   “kitty does not activate after more typing” witness). Profanity does not
-///   use these actions: it conservatively transfers an exact surface for the
-///   full grace lifetime so unrelated `fix` composer churn cannot relight it.
+/// * `MovePair`: an immediate same-width global redraw moves both old occurrences within the
+///   bounded linear window with no stationary same-seed anchor; 2 → 2 is two transfers and no
+///   birth. The buggy exact-context-only classifier misses both.
+/// * `GrowOne`: the same premises, but 2 → 3 holds one logically new occurrence: two transfer
+///   and exactly one is fresh/armed. The buggy context gate births all three.
+/// * `RotatePair`: a recent log-tail rotation with a stationary same-seed survivor, which
+///   anchors the group: one old episode transfers and the new bottom occurrence is fresh. The
+///   buggy cardinality-only classifier also transfers the departed twin.
+/// * `BlankGrace`: after more than two blank occlusion scans the exact seed and context return
+///   untainted; still the same episode, so it transfers despite exceeding the weak redraw
+///   window. The buggy blanket recency gate births it.
+/// * `TypedRetype` / `RecentTypedRetype`: for the feline class only, after nonblank incremental
+///   replacement the same form returns at the same seed and context but with continuity
+///   tainted. Both the >2-scan case and a coalesced one-partial case inside the weak window are
+///   logically new and must be one fresh/armed birth; the buggy exact-evidence path steals the
+///   spent episode, so the kitty does not activate after more typing. Profanity does not use
+///   these actions: it transfers an exact surface for the full grace lifetime, so unrelated
+///   `fix` composer churn cannot relight it.
 ///
-/// `expected_fresh`/`logical_new` encode the scenario truth independently of
-/// the classifier outputs. `RecognitionComplete` catches missed licensed
-/// transfers, while `NoFalseTransfers` catches identity theft outside those
-/// premises; neither direction is inferred from raw 2 → 2 cardinality alone.
+/// `expected_fresh`/`logical_new` encode the scenario truth independently of the classifier.
+/// `RecognitionComplete` catches missed licensed transfers and `NoFalseTransfers` identity theft
+/// outside those premises; neither is inferred from raw 2 → 2 cardinality.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn sparkle_reflow_cardinality_model() -> Model {
@@ -372,27 +340,27 @@ pub fn sparkle_reflow_cardinality_model() -> Model {
                 armed = if Buggy == 1 { 0 } else { 1 };
                 false_transfers = if Buggy == 1 { 1 } else { 0 };
             }
-            invariant CandidateAccounting: transferred + fresh == new_count;
-            invariant SurvivorsBounded: transferred <= OldCount;
-            invariant ScenarioSelected:
+            uncaught CandidateAccounting: transferred + fresh == new_count;
+            uncaught SurvivorsBounded: transferred <= OldCount;
+            uncaught ScenarioSelected:
                 global_redraw + stationary_anchor + blank_grace + typed_retype == state;
-            invariant GlobalRedrawHasNoAnchor: global_redraw + stationary_anchor <= 1;
-            invariant LicensedEdgesAreRecent:
+            uncaught GlobalRedrawHasNoAnchor: global_redraw + stationary_anchor <= 1;
+            uncaught LicensedEdgesAreRecent:
                 global_redraw + stationary_anchor <= recent;
-            invariant RecentTypedRetypeIsRecent: recent_typed_retype <= recent;
-            invariant RecentTypedRetypeIsTyped:
+            uncaught RecentTypedRetypeIsRecent: recent_typed_retype <= recent;
+            uncaught RecentTypedRetypeIsTyped:
                 recent_typed_retype <= typed_retype;
-            invariant BlankGraceOutsideWindow: blank_grace + recent <= 1;
-            invariant StaleSameSeedCases:
+            uncaught BlankGraceOutsideWindow: blank_grace + recent <= 1;
+            uncaught StaleSameSeedCases:
                 stale_same_seed + recent_typed_retype == blank_grace + typed_retype;
-            invariant ExactContextCases:
+            uncaught ExactContextCases:
                 exact_context == blank_grace + typed_retype;
-            invariant TaintSelectsTypedRetype: continuity_tainted == typed_retype;
-            invariant BlankGraceUntainted: blank_grace + continuity_tainted <= 1;
-            invariant StaleSameSeedOutsideWindow: stale_same_seed + recent <= 1;
-            invariant TypedRetypeIsLogicalNew: typed_retype <= logical_new;
-            invariant BlankGraceIsContinuation: blank_grace + logical_new <= 1;
-            invariant RecentMatchesScanWindow:
+            uncaught TaintSelectsTypedRetype: continuity_tainted == typed_retype;
+            uncaught BlankGraceUntainted: blank_grace + continuity_tainted <= 1;
+            uncaught StaleSameSeedOutsideWindow: stale_same_seed + recent <= 1;
+            uncaught TypedRetypeIsLogicalNew: typed_retype <= logical_new;
+            uncaught BlankGraceIsContinuation: blank_grace + logical_new <= 1;
+            uncaught RecentMatchesScanWindow:
                 if state == 0 {
                     seq_gap == 0
                 } else {
@@ -402,41 +370,35 @@ pub fn sparkle_reflow_cardinality_model() -> Model {
                         seq_gap > WeakMaxScans
                     }
                 };
-            invariant SeqGapBounded: seq_gap <= WeakMaxScans + 1;
-            invariant ExpectedPartition:
+            bound SeqGapBounded: seq_gap <= WeakMaxScans + 1;
+            uncaught ExpectedPartition:
                 expected_recognized + logical_new == new_count;
-            invariant ExpectedFreshIsLogicalNew: expected_fresh == logical_new;
-            invariant TransferAccounting:
+            uncaught ExpectedFreshIsLogicalNew: expected_fresh == logical_new;
+            uncaught TransferAccounting:
                 recognized + false_transfers == transferred;
             invariant FreshMatchesExpected: fresh == expected_fresh;
             invariant ArmedMatchesExpected: armed == expected_fresh;
-            invariant ArmedMatchesFresh: armed == fresh;
-            // Directional aliases retained for the Tier-1 fresh-birth fault
-            // injection: the equality above additionally catches UNDER-birth
-            // caused by a false transfer in RotatePair/TypedRetype.
+            uncaught ArmedMatchesFresh: armed == fresh;
+            // Directional forms for the Tier-1 fresh-birth fault injection; the equality above
+            // also catches under-birth from a false transfer in RotatePair/TypedRetype.
             invariant FreshAtMostNetGrowth: fresh <= expected_fresh;
             invariant ArmedAtMostNetGrowth: armed <= expected_fresh;
             invariant RecognitionComplete: recognized == expected_recognized;
             invariant NoFalseBirths: false_births == 0;
             invariant NoFalseTransfers: false_transfers == 0;
-            invariant StateBounded: state <= 1;
-            invariant NewCountBounded: new_count <= 3;
+            bound StateBounded: state <= 1;
+            bound NewCountBounded: new_count <= 3;
         }
     }
 }
 
-/// Repeated explicit feline retyping versus session done-mark poisoning.
+/// Repeated explicit feline retyping versus session done-mark poisoning. Each completed,
+/// continuity-tainted `kitty` token is a new intentional episode and arms once; closing the
+/// replaced episode installs no redraw done mark. `Buggy = 1`: the outgoing episode writes a
+/// mark, so the second retype is born-done and inert.
 ///
-/// Each completed, continuity-tainted `kitty` token is a new intentional
-/// episode and must arm once. The healthy transition closes the replaced
-/// episode without installing/inheriting a redraw done mark. `Buggy = 1`:
-/// the first retype arms but its outgoing old episode writes a mark, so the
-/// second retype is born-done and inert.
-///
-/// Tier-1 binding:
-/// `word_decorations::tests::two_consecutive_recent_kitty_retypes_both_arm`
-/// drives two real partial→complete cycles at the same identity key and checks
-/// the real birth/armed counters after each one.
+/// Tier-1: `word_decorations::tests::two_consecutive_recent_kitty_retypes_both_arm` drives two
+/// real partial→complete cycles at the same identity key and checks the birth/armed counters.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn sparkle_retype_rearm_model() -> Model {
@@ -453,26 +415,20 @@ pub fn sparkle_retype_rearm_model() -> Model {
                 poisoned = if Buggy == 1 { 1 } else { 0 };
             }
             invariant EveryRetypeArmed: armed == retypes;
-            invariant RetypesBounded: retypes <= MaxRetypes;
-            invariant ArmedBounded: armed <= MaxRetypes;
+            bound RetypesBounded: retypes <= MaxRetypes;
+            bound ArmedBounded: armed <= MaxRetypes;
         }
     }
 }
 
-/// Capacity-boundary transaction for the sparkle identity persist map.
+/// Capacity-boundary transaction for the sparkle identity persist map. The alignment pass pulls
+/// one unmatched old episode from a full map, admits a freshly observed replacement, then offers
+/// the old episode back for grace; the offer is an LRU union that departs one episode, so
+/// cardinality stays at `Cap`. `Buggy = 1` is a raw grace `insert`, reaching `Cap + 1`.
 ///
-/// The shipping alignment pass temporarily pulls one unmatched old episode
-/// from a full map, admits a freshly observed replacement, then offers the old
-/// episode back for grace. The healthy implementation treats the final offer
-/// as an LRU union and departs one episode, so cardinality remains at `Cap`.
-/// `Buggy = 1` is a raw grace `insert`: the old episode is reinserted after
-/// the fresh slot refills, reaching `Cap + 1`.
-///
-/// Tier-1 binding:
-/// `word_decorations::tests::persist_cap_drops_unmatched_grace_after_fresh_move`
-/// drives this exact transaction through the real scanner/persist map, proves
-/// the fresh claimant stayed resident, and checks that the departed one-shot's
-/// done mark was written.
+/// Tier-1: `word_decorations::tests::persist_cap_drops_unmatched_grace_after_fresh_move` drives
+/// this transaction through the real scanner and persist map, checks the fresh claimant stayed
+/// resident, and that the departed one-shot's done mark was written.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn sparkle_persist_capacity_model() -> Model {
@@ -502,50 +458,35 @@ pub fn sparkle_persist_capacity_model() -> Model {
                 phase = 3;
             }
             invariant ResidentBounded: resident <= Cap;
-            invariant Conservation:
+            uncaught Conservation:
                 resident + pulled + departed == Cap + admitted;
-            invariant PulledBounded: pulled <= 1;
-            invariant PhaseBounded: phase <= 3;
+            bound PulledBounded: pulled <= 1;
+            bound PhaseBounded: phase <= 3;
         }
     }
 }
 
-/// SPARKLE-WORDS v2 supernova phase machine (docs/sparkle-words-v2-design.md
-/// §6.1/§9), authored via [`ty_model!`] per the design's NovaPhase sketch:
-/// `{0 Armed, 1 Dip, 2 Flash, 3 Ring, 4 Debris, 5 Ember, 6 Settled}` with a
-/// single monotone `Step` (guard-bounded by `MaxSteps` — the §9 finiteness
-/// rule) that counts a flash on ENTERING Flash (pre-state phase == 1; updates
-/// are simultaneous), and a `Rearm` (bounded by `MaxArms`) that resets BOTH
-/// `phase = 0` and `flashes = 0`. Both resets are load-bearing (§9): a Rearm
-/// that reset only `phase` would break `OneFlashPerArm` at `Buggy = 0` on the
-/// second cycle — `flashes` is per-arm by construction; the per-EPISODE
-/// one-nova property lives in [`sparkle_identity_model`]'s `nova`.
+/// Sparkle-words supernova phase machine (docs/sparkle-words-v2-design.md §6.1/§9):
+/// `{0 Armed, 1 Dip, 2 Flash, 3 Ring, 4 Debris, 5 Ember, 6 Settled}` with one monotone `Step`
+/// (guard-bounded by `MaxSteps`) that counts a flash on entering Flash (pre-state phase 1), and a
+/// `Rearm` (bounded by `MaxArms`) that resets both `phase` and `flashes`. Both resets are
+/// load-bearing: resetting only `phase` breaks `OneFlashPerArm` on the second cycle. The
+/// per-episode one-nova property is [`sparkle_identity_model`]'s `nova`.
 ///
-/// At `Buggy = 1`, `Rearm` re-enters **Flash directly** (the §9 negative
-/// control: a re-arm that skips the machine and re-flashes) — `ty` catches it
-/// on `OneFlashPerArm`. Invariants: `Monotone: phase <= 6`,
-/// `OneFlashPerArm: flashes <= 1`, and the §9 self-termination property as a
-/// FUEL invariant — `CanSettle: steps + 6 <= MaxSteps + phase`, i.e. the
-/// remaining step budget always covers the `6 − phase` steps still needed to
-/// reach Settled, so no reachable arm is ever stranded mid-walk by the
-/// finiteness guard (which is why `MaxSteps = 18 = 6 steps × (1 + MaxArms)
-/// walks`: a 12-step budget would strand the third arm at `steps = 12,
-/// phase = 0` and fail this very invariant at `Buggy = 0`).
+/// `Buggy = 1`: `Rearm` re-enters Flash directly, refuted on `OneFlashPerArm`. The fuel invariant
+/// `CanSettle: steps + 6 <= MaxSteps + phase` means the finiteness guard strands no reachable arm.
+/// `MaxSteps = 18` is 6 steps × (1 + `MaxArms`) walks; 12 would strand the third arm.
 ///
-/// Tier-1, two binds. aterm-effects' `word_decorations::nova_host_conformance`
-/// drives the real `WordDecorations` engine over a real terminal through three
-/// arms and what lies between them — the flash limiter's grant, the spent mark,
-/// a grace re-hit and an identity rebirth that must not re-ignite, a suspend
-/// frozen mid-crown and thawed, and two `hard_reset` re-arms — projecting
-/// `phase` from the host's own grant and `flashes` from the light its nova
-/// stream actually carries. Every window boundary is validated as `Step`, every
-/// re-arm as `Rearm`, and the `Buggy = 1` re-flash, built from the real settled
-/// state, is the step it rejects. aterm-effects' `tests/nova_phase_conformance.rs`
-/// walks the shipping `nova::phase` and crown emitter at 1 ms for every genome
-/// duration against `Step`.
+/// Tier-1, two binds. `word_decorations::nova_host_conformance` drives the real
+/// `WordDecorations` engine over a real terminal through three arms and what lies between (the
+/// flash limiter's grant, the spent mark, a grace re-hit and an identity rebirth that must not
+/// re-ignite, a suspend frozen mid-crown and thawed, two `hard_reset` re-arms), projecting `phase`
+/// from the host's grant and `flashes` from the light its nova stream carries; every window
+/// boundary validates as `Step`, every re-arm as `Rearm`, and the `Buggy = 1` re-flash built from
+/// the real settled state is rejected. `tests/nova_phase_conformance.rs` walks the shipping
+/// `nova::phase` and crown emitter at 1 ms for every genome duration against `Step`.
 #[must_use]
-// Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
-// models above) — the MODEL it returns is what `ty` machine-checks.
+// Skip (T2 vcgen-budget lane): a model data constructor; `ty` checks the model it returns.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn nova_phase_model() -> Model {
     crate::ty_model! {
@@ -567,53 +508,39 @@ pub fn nova_phase_model() -> Model {
                 phase = if Buggy == 1 { 2 } else { 0 };
                 flashes = if Buggy == 1 { flashes + 1 } else { 0 };
             }
-            invariant Monotone: phase <= 6;
+            bound Monotone: phase <= 6;
             invariant OneFlashPerArm: flashes <= 1;
-            // §9 self-termination, as a safety (fuel) invariant: the unspent
-            // step budget MaxSteps - steps always covers the 6 - phase steps
-            // left to Settled, so the guard bound never strands a walk.
-            invariant CanSettle: steps + 6 <= MaxSteps + phase;
+            // §9 self-termination as a fuel invariant: MaxSteps - steps covers the 6 - phase
+            // steps left to Settled.
+            uncaught CanSettle: steps + 6 <= MaxSteps + phase;
         }
     }
 }
 
-/// SPARKLE-WORDS v2 flash limiter (docs/sparkle-words-v2-design.md §6.4/§9):
-/// WCAG 2.3.1 as a machine-checked property, authored via [`ty_model!`]
-/// exactly as the design prints it. Time is discretized to 250 ms ticks; the
-/// rolling second is a 4-slot ring of per-tick ignition counts (no modulo —
-/// the grammar has none; `Shift`'s simultaneous updates ARE a correct
-/// rotation). `Overlap` is a scenario constant (two candidates' regions
-/// overlap, §6.4 item 2); `2·x` is written `x + x` (no `*`).
+/// Sparkle-words flash limiter (docs/sparkle-words-v2-design.md §6.4/§9): WCAG 2.3.1 as a
+/// machine-checked property. Time is 250 ms ticks; the rolling second is a 4-slot ring of
+/// per-tick ignition counts (`Shift`'s simultaneous updates are a correct rotation without
+/// modulo). `Overlap` is a scenario constant (two candidates' regions overlap); `2·x` is `x + x`.
 ///
-/// Invariants: `IgnitionBound` — ≤ 2 ignitions per rolling second, tightening
-/// to ≤ 1 under overlap; `RegionFlashPairs` — the REGION-scoped flash-pair
-/// count (2 pairs/ignition co-charged to a region only when regions overlap)
-/// stays ≤ 3. Deliberately NOT window-global: two disjoint ignitions expose
-/// their 2 pairs to DIFFERENT regions — a window-global "pairs ≤ 3" is
-/// arithmetically inconsistent with "ignitions ≤ 2" at 2 pairs/ignition
-/// (4 > 3) and fails `ty` at `Buggy = 0` (the §9/§15.14 binding-spec erratum,
-/// corrected in the open: WCAG counts flashes per region).
+/// `IgnitionBound`: at most 2 ignitions per rolling second, 1 under overlap. `RegionFlashPairs`:
+/// the region-scoped flash-pair count (2 pairs per ignition, co-charged to a region only when
+/// regions overlap) stays at most 3. It is not window-global: two disjoint ignitions expose their
+/// pairs to different regions, and a window-global "pairs ≤ 3" contradicts "ignitions ≤ 2" at 2
+/// pairs each (WCAG counts flashes per region).
 ///
-/// `Buggy = 1` removes the overlap tightening — two overlapping ignitions in
-/// one rolling second put 4 transition pairs on the shared region — so the
-/// counterexample needs BOTH `Buggy = 1` and `Overlap = 1` (the Tier-0 test
-/// drives `to_cfg_with` accordingly; a plain `Buggy = 1, Overlap = 0` run
-/// stays green, which is exactly the point: disjoint novas at 2/s are legal).
+/// `Buggy = 1` removes the overlap tightening, so the counterexample needs both `Buggy = 1` and
+/// `Overlap = 1` (the Tier-0 test drives `to_cfg_with`); `Buggy = 1, Overlap = 0` stays green,
+/// since disjoint novas at 2/s are legal.
 ///
-/// Tier-1 binding (the §7.5 ledger's "FlashLimiter" row — the limiter IS the
-/// WCAG argument, so no per-frame flash audit ships): aterm-gui's
-/// `flash_limiter_conformance_real_limiter_projects_onto_model` drives the
-/// REAL `grant_ignition` queue through scripted disjoint + overlapping
-/// ignition storms and projects every decision onto THIS model (grants ↔
-/// `Ignite` admitted, delays ↔ `Ignite` disabled until the matching `Shift`
-/// tick), with `…negative_control_overlap_blind_limiter_is_buggy_trace` as
-/// the non-vacuity twin (an overlap-blind limiter reproduces the
-/// `Buggy = 1, Overlap = 1` counterexample); `limiter_delays_third_of_three_
-/// ignitions…` and `limiter_tightens_to_one_per_second_on_overlap` drive the
-/// same limiter end-to-end through the full host tick.
+/// Tier-1 (the limiter is the WCAG argument, so no per-frame flash audit ships):
+/// `flash_limiter_conformance_real_limiter_projects_onto_model` drives the real `grant_ignition`
+/// queue through disjoint and overlapping ignition storms and projects every decision onto this
+/// model (grants ↔ `Ignite` admitted, delays ↔ `Ignite` disabled until the matching `Shift`),
+/// with `flash_limiter_negative_control_overlap_blind_limiter_is_buggy_trace` as the non-vacuity
+/// twin; `limiter_delays_third_of_three_ignitions_deterministically` and
+/// `limiter_tightens_to_one_per_second_on_overlap` drive the limiter through the full host tick.
 #[must_use]
-// Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
-// models above) — the MODEL it returns is what `ty` machine-checks.
+// Skip (T2 vcgen-budget lane): a model data constructor; `ty` checks the model it returns.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn flash_limiter_model() -> Model {
     crate::ty_model! {
@@ -629,54 +556,41 @@ pub fn flash_limiter_model() -> Model {
                 <= if Overlap == 1 { if Buggy == 1 { 1 } else { 0 } } else { 1 })
             { s0 = s0 + 1; }
             // window-wide ignition bound: <= 2, tightening to <= 1 under overlap
-            invariant IgnitionBound:
+            uncaught IgnitionBound:
                 s0 + s1 + s2 + s3 <= if Overlap == 1 { 1 } else { 2 };
-            // REGION-scoped flash pairs (2 per ignition on a shared region) stay <= 3.
-            invariant RegionFlashPairs:
+            // Region-scoped flash pairs (2 per ignition on a shared region) stay <= 3.
+            uncaught RegionFlashPairs:
                 (if Overlap == 1 { (s0 + s1 + s2 + s3) + (s0 + s1 + s2 + s3) }
                  else { 2 }) <= 3;
         }
     }
 }
 
-/// SPARKLE-WORDS v2 flash limiter, WINDOW-WIDE: the same WCAG 2.3.1 argument
-/// as [`flash_limiter_model`], but with the ENFORCER COUNT as a dial.
+/// Sparkle-words flash limiter, window-wide: the WCAG 2.3.1 argument of [`flash_limiter_model`]
+/// with the enforcer count as a dial. [`flash_limiter_model`] is true of one limiter however many
+/// exist, so it cannot see per-pane limiters: give each split pane its own `WordDecorations` and
+/// each limiter satisfies `IgnitionBound` while a viewer, with one retina, sees 2N flashes a
+/// second.
 ///
-/// [`flash_limiter_model`] is the correct theorem about ONE limiter, and it
-/// stays true no matter how many limiters exist — which is exactly why it
-/// cannot see the defect that prompted this model. Give every split pane its
-/// own `WordDecorations`, hence its own reservation vec, hence its own
-/// limiter, and each limiter independently satisfies `IgnitionBound` while a
-/// photosensitive viewer — who has ONE retina, not one per pane — sees 2N
-/// flashes per second.
+/// Two enforcers (`a0..a3`, `b0..b3`, each the same 4-slot rolling second) share one `Shift`
+/// clock, with two dials:
 ///
-/// So this model carries TWO structural enforcers (`a0..a3`, `b0..b3`: the
-/// same 4-slot rolling second each), one SHARED `Shift` clock (they are on one
-/// wall clock and one retina), and two dials:
+/// * `Instances` — live enforcers; `Spawn` admits the second only when `Instances > 1`, so
+///   `Instances = 1` collapses onto the single-limiter model.
+/// * `Local` — what each enforcer consults. `Local = 0` (committed) is the shipping shape, one
+///   limiter whose guard sees every reservation; `Local = 1` is per-pane, each enforcer blind to
+///   the other's slots.
 ///
-/// * `Instances` — how many enforcers are live. `Spawn` admits the second one
-///   only when `Instances > 1`, so `Instances = 1` collapses this model onto
-///   the single-limiter one.
-/// * `Local` — WHAT each enforcer consults. `Local = 0` (committed) is the
-///   shipping shape: one limiter whose guard sees every reservation.
-///   `Local = 1` is the per-pane refactor: each enforcer admits against ITS
-///   OWN slots and is blind to the other's.
+/// `WindowIgnitionBound` is charged against the sum. At `Local = 1, Instances = 2` two
+/// individually correct limiters overshoot it at every scenario corner, unlike the `Buggy = 1`
+/// overlap defect, which also needs `Overlap = 1`: multiplication alone is the defect.
 ///
-/// `WindowIgnitionBound` is charged against the SUM, because the retina is.
-/// At `Local = 1, Instances = 2` two individually-correct limiters overshoot
-/// it at EVERY scenario corner — no geometric coincidence needed, unlike the
-/// `Buggy = 1` overlap defect, which needs `Overlap = 1` as well. That
-/// asymmetry is the point: multiplication alone is the defect.
-///
-/// This model does NOT catch the refactor — nothing in a state machine can
-/// know how many engines the host builds. It machine-checks the SENTENCE the
-/// scope-cardinality census (`aterm-census` OB-13..OB-18, claim
-/// `flash-limiter`) would otherwise assert in prose, and the two interlock:
-/// OB-16 fails the build if this model is deleted, and
-/// `prove_catch_and_multiply_scalar` fails the test if it goes toothless.
+/// No state machine can know how many engines the host builds, so this does not catch the
+/// refactor; it machine-checks the sentence the scope-cardinality census (`aterm-census`
+/// OB-13..OB-16, claim `flash-limiter`) would otherwise assert in prose. OB-16 fails if this
+/// model is deleted, and `prove_catch_and_multiply_scalar` fails if it goes toothless.
 #[must_use]
-// Skip (T2 vcgen-budget lane): a spec-model DATA constructor — same class as
-// `flash_limiter_model`; the MODEL it returns is what `ty` machine-checks.
+// Skip (T2 vcgen-budget lane): a model data constructor; `ty` checks the model it returns.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn flash_limiter_window_model() -> Model {
     crate::ty_model! {
@@ -711,41 +625,33 @@ pub fn flash_limiter_window_model() -> Model {
                 <= if Overlap == 1 { if Buggy == 1 { 1 } else { 0 } } else { 1 })
             { b0 = b0 + 1; }
 
-            // The bound the RETINA experiences: charged against every live
-            // enforcer's slots at once, not against each enforcer's own.
-            invariant WindowIgnitionBound:
+            // The bound the retina sees: every live enforcer's slots at once.
+            uncaught WindowIgnitionBound:
                 a0 + a1 + a2 + a3 + b0 + b1 + b2 + b3
                     <= if Overlap == 1 { 1 } else { 2 };
         }
     }
 }
 
-/// The §3.2 two-way GLOBAL BURST MUTEX over the shared `nova_add` channel
-/// (sparkle words, `aterm-effects` `supernova.rs` / `word_decorations.rs`).
+/// The §3.2 two-way global burst mutex over the shared `nova_add` channel (sparkle words,
+/// `aterm-effects` `supernova.rs` / `word_decorations.rs`).
 ///
-/// A supernova's per-frame decoration quads are bounded by `S_MAX_BOUND` (900)
-/// and a classic nova's by 392; the channel funds at most `MAX_NOVA_QUADS`
-/// (1536) of them. `MAX_ACTIVE_SUPERNOVAE = 1` plus the TWO-WAY mutex — a
-/// supernova grant defers behind any live classic window, and classic grants
-/// defer behind a live supernova — is what keeps the funded share inside the
-/// budget without the funding clamp ever truncating a live effect. The
-/// const-asserts in `supernova.rs` are over CONSTANTS and cannot see a second
-/// live instance; this machine states the instance count. The mutex is
-/// window-wide over every pane's episode shard (the scope census's
-/// `supernova-burst-mutex` claim, whose `machine` this is).
+/// A supernova's per-frame decoration quads are bounded by `S_MAX_BOUND` (900) and a classic
+/// nova's by 392; the channel funds at most `MAX_NOVA_QUADS` (1536). `MAX_ACTIVE_SUPERNOVAE = 1`
+/// and the two-way mutex (a supernova grant defers behind any live classic window, classic grants
+/// behind a live supernova) keep the funded share inside the budget without the funding clamp
+/// truncating a live effect. The const-asserts in `supernova.rs` cannot see a second live
+/// instance; this machine states the instance count. The mutex is window-wide over every pane's
+/// episode shard (the scope census's `supernova-burst-mutex` claim, whose `machine` this is).
 ///
-/// `Buggy = 1` is the regression family: a second supernova admitted while one
-/// is live (2 x 900 = 1800), and a classic admitted beside a live supernova
-/// (900 + 2 x 392 = 1684) — each falsifies a named invariant.
+/// `Buggy = 1` admits a second supernova beside a live one (1800) and a classic beside a live
+/// supernova (1684); each falsifies a named invariant.
 ///
-/// Tier-1 binding: `aterm_effects` `word_decorations` test
-/// `real_burst_grants_conform_to_the_supernova_mutex_model` drives the real
-/// `super_prepass`/`nova_prepass` grants over a bound pane AND a parked one and
-/// checks every observed grant against `action_enabled`, with a negative control.
-/// The bind is TEST-ONLY: the grant sites carry no `#[refines]` anchor
-/// (aterm-effects has no `spec-anchors` feature), so spec-link closure does not
-/// see it; the model is in `xref::model_registry()` so the non-vacuity sweep
-/// covers its invariants.
+/// Tier-1: `word_decorations`'s `real_burst_grants_conform_to_the_supernova_mutex_model` drives
+/// the real `super_prepass`/`nova_prepass` grants over a bound pane and a parked one and checks
+/// every grant against `action_enabled`, with a negative control. The bind is test-only (no
+/// `#[refines]` anchor: aterm-effects has no `spec-anchors` feature), so spec-link closure does
+/// not see it; the non-vacuity sweep covers its invariants.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn supernova_burst_mutex_model() -> Model {
@@ -793,21 +699,16 @@ pub fn supernova_burst_mutex_model() -> Model {
     }
 }
 
-/// Ownership/cardinality lifecycle for delayed sparkle-word ignition slots.
+/// Ownership and cardinality of delayed sparkle-word ignition slots. A future reservation is
+/// one-to-one with a live persist episode; when its owner departs it is cancelled, since no
+/// flash occurred. A slot that already fired moves into the rolling safety history and survives
+/// its owner until its one-second window expires, so at most `Cap` owner-backed future slots
+/// plus `RecentCap` fired slots are resident. `Buggy = 1` sweeps only on expiry, so a cancelled
+/// owner leaves its future slot behind and churn exceeds the pending bound.
 ///
-/// A future reservation is one-to-one with a live persist episode. Once its
-/// owner departs, the reservation is cancelled because no flash occurred. A
-/// slot that already fired moves into the rolling safety history and survives
-/// owner departure until its one-second window expires. Thus at most `Cap`
-/// owner-backed future slots plus `RecentCap` fired slots are resident.
-/// `Buggy = 1` reproduces the former expiry-only sweep: cancelling an owner
-/// leaves its future slot behind, so repeated churn creates ownerless pending
-/// work and eventually exceeds the pending bound.
-///
-/// Tier-1 binding: `ignition_reservation_lifecycle_real_queue_conforms` drives
-/// the real `grant_ignition`/`prune_ignitions` queue through immediate grants,
-/// delayed grants, future-owner departure, fired-owner departure, and history
-/// expiry, with an expiry-only negative control.
+/// Tier-1: `ignition_reservation_lifecycle_real_queue_conforms` drives the real
+/// `grant_ignition`/`prune_ignitions` queue through immediate and delayed grants, future- and
+/// fired-owner departure, and history expiry, with an expiry-only negative control.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn ignition_reservation_lifecycle_model() -> Model {
@@ -845,26 +746,22 @@ pub fn ignition_reservation_lifecycle_model() -> Model {
 
             invariant FutureOwned: pending <= live;
             invariant PendingBound: pending <= Cap;
-            invariant RecentBound: recent <= RecentCap;
+            uncaught RecentBound: recent <= RecentCap;
             invariant ReservationBound: pending + recent <= Cap + RecentCap;
-            invariant LiveBound: live <= Cap;
+            uncaught LiveBound: live <= Cap;
         }
     }
 }
 
-/// Atomic ownership transfer for a delayed ignition across episode alignment.
+/// Atomic ownership transfer for a delayed ignition across episode alignment. Alignment may
+/// replace an occurrence identity while keeping the episode's frozen `nova_start`; the future
+/// limiter slot moves in the same operation, or pruning drops it as ownerless and a competing
+/// overlapping request claims the same rolling window although the rekeyed episode will still
+/// flash. `Buggy = 1` skips the owner rewrite.
 ///
-/// Alignment is allowed to replace an occurrence identity while preserving the
-/// episode's frozen `nova_start`. The corresponding future limiter slot must
-/// move in the same operation: otherwise pruning sees an ownerless reservation,
-/// drops it, and a competing overlapping request can claim the same rolling
-/// window even though the rekeyed episode will still flash. `Buggy = 1` models
-/// precisely that missing owner rewrite.
-///
-/// Tier-1 binding: `ignition_reservation_rekey_real_queue_conforms` drives the
-/// real rekey helper and limiter through GrantDelayed -> Rekey -> Prune ->
-/// CompetingGrant, then repeats the trace without the owner transfer as a
-/// negative control.
+/// Tier-1: `ignition_reservation_rekey_real_queue_conforms` drives the real rekey helper and
+/// limiter through GrantDelayed -> Rekey -> Prune -> CompetingGrant, then without the owner
+/// transfer as a negative control.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn ignition_reservation_rekey_model() -> Model {
@@ -903,24 +800,19 @@ pub fn ignition_reservation_rekey_model() -> Model {
             invariant RekeyOwnsReservation: rekey_untracked == 0;
             invariant DelayedSlotSurvivesPrune: live_slot_pruned == 0;
             invariant NoOverlappingFlash: original_flash + competing_flash <= 1;
-            invariant PhaseBounded: phase <= 4;
+            bound PhaseBounded: phase <= 4;
         }
     }
 }
 
-/// Bounded constant-selection LRU for completed sparkle-word episodes.
+/// Bounded constant-selection LRU for completed sparkle-word episodes. The oldest slot is
+/// addressed through an intrusive head link, so replacement at capacity makes one oldest-slot
+/// selection whatever `resident` is. `Buggy = 1` probes every resident (a `min_by_key` scan),
+/// breaking `ConstantSelection` once the map holds more than one entry; cardinality stays bounded
+/// in both, so the counterexample is about work, not overflow.
 ///
-/// The healthy implementation addresses the oldest slot directly through an
-/// intrusive head link, so replacement at capacity performs one oldest-slot
-/// selection independent of `resident`. `Buggy = 1` models the retired
-/// `HashMap::iter().min_by_key(...)` path: selection probes every resident,
-/// violating `ConstantSelection` as soon as the bounded map has more than one
-/// entry. Cardinality remains bounded in both variants, making the performance
-/// counterexample non-vacuous rather than conflating it with overflow.
-///
-/// Tier-1 binding: `done_mark_lru_real_order_and_constant_work_conform` drives
-/// the shipping LRU at a small exact cap, checks deterministic touch/eviction
-/// order and fixed link-write work, then demonstrates the legacy full scan
+/// Tier-1: `done_mark_lru_real_order_and_constant_work_conform` drives the shipping LRU at a
+/// small cap, checks touch/eviction order and fixed link-write work, and runs a full scan
 /// against the buggy model.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
@@ -948,35 +840,26 @@ pub fn done_mark_lru_model() -> Model {
                 selections = if Buggy == 1 { resident } else { 1 };
             }
 
-            invariant ResidentBounded: resident <= Cap;
+            uncaught ResidentBounded: resident <= Cap;
             invariant ConstantSelection: selections <= 1;
-            invariant EvictionsBounded: evictions <= 1;
-            invariant TouchesBounded: touches <= 1;
+            uncaught EvictionsBounded: evictions <= 1;
+            uncaught TouchesBounded: touches <= 1;
         }
     }
 }
 
-/// SPARKLE-WORDS v3 ONE-SHOT PEEK (docs/sparkle-words-v3-design.md §1.2/§1.3),
-/// replacing the v2.2 `PeekCycle` bob model wholesale: a graphic plays exactly
-/// once per word appearance — `Idle → Rise → Dwell → Descend → Done` — and
-/// Done is ABSORBING per episode (zero quads forever, zero wakes: the duty
-/// pin). The idle-event scheduler (bobs, blink deadlines) is retired; in-dwell
-/// life is pure time inside the Dwell phase and never re-enters Rise.
+/// Sparkle-words one-shot peek (docs/sparkle-words-v3-design.md §1.2/§1.3): a graphic plays
+/// exactly once per word appearance, `Idle → Rise → Dwell → Descend → Done`, and Done is
+/// absorbing per episode (zero quads, zero wakes). In-dwell life is pure time inside Dwell and
+/// never re-enters Rise. `Buggy = 1` lets a `Repeek` re-enter Rise after Done (ordinal churn,
+/// grace expiry or a reset re-birthing a finished episode), refuted by `NoRepeek`. `CanFinish`
+/// is the fuel invariant.
 ///
-/// `Buggy = 1` models exactly the replay class v3 §1.1 exists to kill: a
-/// `Repeek` re-enters Rise after Done (ordinal churn / grace expiry / reset
-/// re-birthing a finished episode) — `ty` PROVES `NoRepeek` (rises ≤ 1) at
-/// `Buggy = 0` and CATCHES the counterexample at `Buggy = 1`. `CanFinish` is
-/// the fuel/termination invariant (the step budget always covers the walk to
-/// Done — no reachable state strands mid-cycle).
-///
-/// Tier-1 binding: aterm-effects' `one_shot_peek_conformance_real_engine`
-/// drives the REAL engine across rescans, occlusion shorter and longer than
-/// GRACE_TTL, twin growth/shrink/rotation, freeze/thaw mid-rise, and an
-/// unfocused birth, projecting the emitted-quad phases onto this model.
+/// Tier-1: aterm-effects' `one_shot_peek_conformance_real_engine` drives the real engine across
+/// rescans, occlusion shorter and longer than `GRACE_TTL`, twin growth/shrink/rotation,
+/// freeze/thaw mid-rise and an unfocused birth, projecting the emitted-quad phases.
 #[must_use]
-// Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
-// models above) — the MODEL it returns is what `ty` machine-checks.
+// Skip (T2 vcgen-budget lane): a model data constructor; `ty` checks the model it returns.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn one_shot_peek_model() -> Model {
     crate::ty_model! {
@@ -996,61 +879,45 @@ pub fn one_shot_peek_model() -> Model {
                 phase = 4; steps = steps + 1;  // Done: absorbing (see Repeek)
             }
             action Repeek when (phase == 4 && steps <= MaxSteps - 1) {
-                // Buggy: a re-Rise after Done — the §1.1 replay classes
-                // (ordinal churn, grace recount, reset) reborn as an entrance.
+                // Buggy: a re-Rise after Done (ordinal churn, grace recount, reset).
                 phase = if Buggy == 1 { 1 } else { phase };
                 rises = if Buggy == 1 { rises + 1 } else { rises };
                 steps = steps + 1;
             }
             invariant NoRepeek: rises <= 1;   // Done is absorbing per episode
-            invariant PhaseBounded: phase <= 4;
-            // Fuel/termination: the unspent budget always covers the 4 - phase
-            // steps left to Done, so the finiteness guard strands no walk.
-            invariant CanFinish: steps + 4 <= MaxSteps + phase;
+            bound PhaseBounded: phase <= 4;
+            // Fuel: the unspent budget covers the 4 - phase steps left to Done.
+            uncaught CanFinish: steps + 4 <= MaxSteps + phase;
         }
     }
 }
 
-/// CURSOR-CAT host gate and collectible discovery lifecycle. Ordinary rainbow kitty
-/// momentum is owned by the cursor-trail master: input while that master is
-/// off cannot arm or draw an ordinary flight, and turning it off retracts an
-/// existing ordinary host arm. A collection hello is a separate bounded
-/// promise and remains drawable with that master off.
+/// Cursor-cat host gate and collectible discovery lifecycle. Ordinary rainbow kitty momentum is
+/// owned by the cursor-trail master: input while it is off cannot arm or draw an ordinary
+/// flight, and turning it off retracts an existing arm. A collection hello is a separate bounded
+/// promise and stays drawable with the master off.
 ///
-/// A newly collected look gets a
-/// guaranteed, bounded hello even when ordinary cursor momentum is cold:
-/// `Hidden -> Discovery -> Fade -> Hidden`. `visible` is deliberately separate
-/// from `forced`: the former is the draw obligation, while the latter is the
+/// A newly collected look gets a guaranteed, bounded hello even when cursor momentum is cold:
+/// `Hidden -> Discovery -> Fade -> Hidden`. `visible` is the draw obligation; `forced` the
 /// stronger promise that cursor style and momentum cannot dismiss the hello.
 ///
-/// Time is abstracted into five PRESENTABLE host-frame samples: three
-/// discovery samples followed by two fade samples. `HiddenTick` represents an
-/// unfocused or host-suppressed sample. It may hide the current draw, but it
-/// cannot consume `elapsed`, `presented`, or the forced hold. Once samples are
-/// presentable again, `Tick` resumes the same bounded lifecycle and
-/// `HiddenAtDeadline` pins completion to a fully quiescent state.
-/// `LongPresentableGap` is the other licensed presentable-clock transition:
-/// after the host has drawn at least one visible discovery frame, one delayed
-/// sample beyond the complete hold-plus-fade deadline settles directly to
-/// Hidden. It must not manufacture a late, fully opaque Fade frame and another
-/// animation tail merely because no intermediate frame callbacks arrived.
+/// Time is five presentable host-frame samples: three discovery, two fade. `HiddenTick` is an
+/// unfocused or host-suppressed sample: it may hide the draw but cannot consume `elapsed`,
+/// `presented` or the forced hold; `Tick` resumes the same lifecycle and `HiddenAtDeadline` pins
+/// completion to a quiescent state. `LongPresentableGap`: after at least one visible discovery
+/// frame, one delayed sample past the whole hold-plus-fade deadline settles straight to Hidden,
+/// without a late opaque Fade frame and another animation tail.
 ///
-/// At `Buggy = 1`, `TypeWhileTrailOff` reproduces the host leak by arming an
-/// ordinary rainbow kitty cat behind a disabled trail master. `HiddenTick` also consumes
-/// the wall clock while `presented` stays
-/// fixed. Enough hidden samples therefore walk Discovery through Fade to
-/// Hidden without delivering the promised hold. The same switch makes
-/// `LongPresentableGap` strand an expired hello in a visible Fade. `ty` proves
-/// the full contract at `Buggy = 0` and catches both defect witnesses at
-/// `Buggy = 1`.
+/// `Buggy = 1`: `TypeWhileTrailOff` arms an ordinary cat behind a disabled trail master;
+/// `HiddenTick` consumes the wall clock while `presented` stays fixed, so hidden samples walk
+/// Discovery to Hidden without the promised hold; `LongPresentableGap` strands an expired hello
+/// in a visible Fade.
 ///
-/// Tier-0: `derived_cursor_cat_proves_and_catches_hidden_expiry`
-/// (aterm-spec/tests/derived_ring_ty.rs). Tier-1 drives the real
-/// `aterm_effects::kitty_cursor::CursorCat` clock and projects its public frame
-/// state plus host presentability at the same lifecycle boundaries.
+/// Tier-0: `derived_cursor_cat_proves_and_catches_hidden_expiry` (`derived_ring_ty.rs`). Tier-1
+/// drives the real `aterm_effects::kitty_cursor::CursorCat` clock and projects its frame state
+/// and host presentability at the same boundaries.
 #[must_use]
-// Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
-// models above) — the MODEL it returns is what `ty` machine-checks.
+// Skip (T2 vcgen-budget lane): a model data constructor; `ty` checks the model it returns.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn cursor_cat_model() -> Model {
     crate::ty_model! {
@@ -1126,9 +993,8 @@ pub fn cursor_cat_model() -> Model {
                 collections == 1 && presented_once == 1 && presentable == 1 &&
                 visible == 1 && wall_expired == 0 && elapsed <= TotalTicks - 1
             ) {
-                // This is one presentable wall-clock observation beyond the
-                // entire hold + fade, not a burst of synthetic frame ticks.
-                // Healthy production consumes that elapsed tail atomically.
+                // One presentable observation past the whole hold + fade, not a burst of
+                // synthetic ticks; production consumes the elapsed tail atomically.
                 wall_expired = 1;
                 elapsed = TotalTicks;
                 presented = presented + 1;
@@ -1137,16 +1003,15 @@ pub fn cursor_cat_model() -> Model {
                 visible = if Buggy == 1 { 1 } else { 0 };
                 forced = 0;
             }
-            // A collected hello remains in its protected Discovery phase until
-            // the host has actually had HoldTicks presentable opportunities,
-            // unless a later presentable observation is already beyond the
-            // entire bounded lifecycle. HiddenTick cannot set wall_expired.
+            // A collected hello stays in its protected Discovery phase until the host has had
+            // HoldTicks presentable opportunities, unless a presentable observation is already
+            // past the whole lifecycle. HiddenTick cannot set wall_expired.
             invariant ForcedUntilPresented:
                 collections <= forced +
                     (if presented > HoldTicks - 1 { 1 } else { 0 }) + wall_expired &&
                 collections <= (if phase == 1 { 1 } else { 0 }) +
                     (if presented > HoldTicks - 1 { 1 } else { 0 }) + wall_expired;
-            invariant VisibilityMatchesContext:
+            uncaught VisibilityMatchesContext:
                 if presentable == 0 { visible == 0 }
                 else { if phase == 0 { visible == 0 } else { visible == 1 } };
             invariant HiddenAtDeadline:
@@ -1159,42 +1024,37 @@ pub fn cursor_cat_model() -> Model {
                     elapsed == TotalTicks && phase == 0 &&
                     visible == 0 && forced == 0
                 } else { wall_expired == 0 };
-            invariant VisibleFrameWasPresented: visible <= presented_once;
+            uncaught VisibleFrameWasPresented: visible <= presented_once;
             invariant TrailMasterOwnsOrdinary:
                 if trail_master == 0 {
                     ordinary_armed == 0 && ordinary_visible == 0
                 } else { ordinary_visible == ordinary_armed };
-            invariant HelloIndependentOfTrailMaster:
+            uncaught HelloIndependentOfTrailMaster:
                 if trail_master == 0 && phase > 0 && presentable == 1 {
                     visible == 1
                 } else { visible <= 1 };
-            invariant PresentedOnceBounded: presented_once <= 1;
-            invariant WallExpiredBounded: wall_expired <= 1;
-            invariant TimeBounded: elapsed <= TotalTicks;
-            invariant PresentedBounded: presented <= TotalTicks;
-            invariant HiddenBounded: hidden <= MaxHidden;
-            invariant PhaseBounded: phase <= 2;
-            invariant OrdinaryGateBounded:
+            bound PresentedOnceBounded: presented_once <= 1;
+            bound WallExpiredBounded: wall_expired <= 1;
+            bound TimeBounded: elapsed <= TotalTicks;
+            bound PresentedBounded: presented <= TotalTicks;
+            bound HiddenBounded: hidden <= MaxHidden;
+            bound PhaseBounded: phase <= 2;
+            bound OrdinaryGateBounded:
                 trail_master <= 1 && ordinary_armed <= 1 && ordinary_visible <= 1;
         }
     }
 }
 
-/// The classic flying cursor kitty's forward/reverse wrap placement. A fold
-/// begins on the old edge, leaves that edge wholly off glass, changes sides
-/// while still wholly off glass, and only then re-enters on the new edge.
-/// `off_samples` is the history abstraction bound by Tier-1 to actual signed
-/// sprite rectangles; it cannot be minted by an on-glass sample.
+/// The classic flying cursor kitty's forward/reverse wrap placement. A fold begins on the old
+/// edge, leaves it wholly off glass, changes sides while wholly off glass, and only then
+/// re-enters on the new edge. `off_samples` is the history abstraction Tier-1 binds to the real
+/// signed sprite rectangles; an on-glass sample cannot mint it. `Buggy = 1` jumps straight from
+/// the old on-glass edge to the new one (`OffGlassBeforeSideChange`).
 ///
-/// `Buggy = 1` reproduces the retired direct placement law: the first fold
-/// sample jumps straight from the old on-glass edge to the new on-glass edge,
-/// with no wholly-off-glass witness. `OffGlassBeforeSideChange` catches that
-/// transition in either direction.
-///
-/// Tier-0: `derived_cursor_cat_fold_proves_and_catches_direct_edge_teleport`.
-/// Tier-1: `cursor_cat_fold_conformance_real_placement_and_teleport_mutant`
-/// drives `WordDecorations::resolve_kitty_cursor_placement` and projects the
-/// emitted signed sprite rectangle after every transition.
+/// Tier-0: `derived_cursor_cat_fold_proves_and_catches_direct_edge_teleport`. Tier-1:
+/// `cursor_cat_fold_conformance_real_placement_and_teleport_mutant` drives
+/// `WordDecorations::resolve_kitty_cursor_placement` and projects the emitted rectangle after
+/// every transition.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn cursor_cat_fold_model() -> Model {
@@ -1237,27 +1097,22 @@ pub fn cursor_cat_fold_model() -> Model {
 
             invariant OffGlassBeforeSideChange:
                 phase == 0 || side == origin_side || off_samples > 0;
-            invariant StateBounded:
+            bound StateBounded:
                 phase <= 4 && direction <= 2 && origin_side <= 1 && side <= 1 &&
                 off_glass <= 1 && off_samples <= 1 && folds <= MaxFolds;
         }
     }
 }
 
-/// Cursor-cat reaction to complete profanity cues. Incomplete prefixes never
-/// reach the visual reaction; each accepted complete token re-kicks the wince
-/// and increases the bounded phrase chain through four distinct beats. A
-/// hidden companion ignores the cue rather than being summoned by it.
+/// Cursor-cat reaction to complete profanity cues. Incomplete prefixes never reach the visual
+/// reaction; each accepted complete token re-kicks the wince and lengthens the bounded phrase
+/// chain through four beats. A hidden companion ignores the cue rather than being summoned.
 ///
-/// `Buggy=1` reproduces the predictive-prefix defect by treating `fuc` as a
-/// complete curse, and drops `on_curse`'s `!self.is_active()` refusal so a
-/// hidden cat ACCEPTS a complete curse: `on_curse` answers true (the host
-/// requests a spurious follow-up draw) and the wince and its `Wince` reaction
-/// hold leak into a companion that is not on glass. The cat is not made visible
-/// — that is `state`'s, which `on_curse` never writes — and the next hidden
-/// frame's `reset_spine` clears the wince clock, though not the reaction hold.
-/// Tier-1 drives the real `CursorCat::on_curse` seam and projects its public
-/// reaction plus the accepted/rejected decision.
+/// `Buggy=1` treats `fuc` as a complete curse and drops `on_curse`'s `!self.is_active()`
+/// refusal, so a hidden cat accepts a curse: `on_curse` answers true (a spurious follow-up draw)
+/// and the wince and its `Wince` reaction hold leak into a companion not on glass. The next
+/// hidden frame's `reset_spine` clears the wince clock but not the reaction hold. Tier-1 drives
+/// `CursorCat::on_curse` and projects its reaction and the accepted/rejected decision.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn cursor_cat_curse_wince_model() -> Model {
@@ -1316,37 +1171,25 @@ pub fn cursor_cat_curse_wince_model() -> Model {
     }
 }
 
-/// SING-ALONG held-key detector. A run becomes armed only on the sixteenth
-/// distinct-in-time same-character press. Breaking an unarmed run clears its
-/// partial count; releasing an armed run enters one bounded wind-down phase,
-/// which then settles to the byte-identical idle state.
+/// Sing-along held-key detector. A run arms only on the sixteenth distinct-in-time
+/// same-character press. Breaking an unarmed run clears its count; releasing an armed run enters
+/// one bounded wind-down, which settles to the byte-identical idle state.
 ///
-/// `Buggy=1` restores the original eight-press arm threshold, at full drive as
-/// it shipped. The `ArmedRequiresCurrentThreshold` invariant therefore supplies
-/// a concrete counterexample at the eighth press while the committed model
-/// proves that every armed state has accumulated all sixteen presses.
-///
-/// `ArmedRunIsAtFullDrive` is the one drive law with content: an armed run
-/// drives the celebration at 1.0 from the arming press. Its slip is an
-/// ALTERNATIVE arm, not a variant of the eight-press one, so `Buggy=1` picks it
-/// per run (`PickRampedArm` sets `ramp_fault`, which `Buggy=0` pins to zero):
-/// the run arms on the sixteenth press but ramps its drive IN from zero —
-/// `drive()` easing 0 → 1 from `armed_at`, a mirror of the wind-down's
-/// smoothstep — so the arming instant reads armed with no drive and the host's
-/// 0.33 face gate keeps the ordinary cursor kitty where the singer belongs.
-/// That slip is hypothetical: the shipping `drive` returns 1.0 whenever the run
+/// `Buggy=1` picks one of two wrong arms per run (`PickRampedArm` sets `ramp_fault`, pinned to
+/// zero at `Buggy=0`): an eight-press threshold at full drive, refuted by
+/// `ArmedRequiresCurrentThreshold` at the eighth press; or a sixteen-press arm whose drive ramps
+/// in from zero (easing 0 → 1 from `armed_at`), refuted by `ArmedRunIsAtFullDrive`, since the
+/// arming instant would read armed with no drive and the host's 0.33 face gate would keep the
+/// ordinary cursor kitty where the singer belongs. The shipping `drive` is 1.0 whenever the run
 /// is armed and unreleased.
 ///
-/// No law says an idle run has no drive or that a released one still has some.
-/// Every writer of phase 0 writes `drive_live = 0` and `Release` writes it 1,
-/// and the Tier-1 projection DERIVES phases 0 and 2 from the drive (unarmed
-/// with / without a tail), so both halves would restate the writes here and
-/// the projection's definition there. The release crossfade is pinned directly
-/// by the Tier-1 (`drive > 0` at the release instant).
+/// No law says an idle run has no drive or a released one some: every writer of phase 0 writes
+/// `drive_live = 0`, `Release` writes 1, and the Tier-1 projection derives phases 0 and 2 from
+/// the drive, so such laws would restate the writes. Tier-1 pins the release crossfade
+/// (`drive > 0` at release).
 ///
-/// Tier-0 lives in `derived_ring_ty.rs`; Tier-1 drives the genuine
-/// `aterm_effects::kitty_sing::KittySing` press, release, and settle methods in
-/// `aterm-effects/tests/kitty_activation_conformance.rs`.
+/// Tier-0 is in `derived_ring_ty.rs`; Tier-1 drives `aterm_effects::kitty_sing::KittySing`'s
+/// press, release and settle methods in `aterm-effects/tests/kitty_activation_conformance.rs`.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn kitty_sing_detector_model() -> Model {
@@ -1358,12 +1201,11 @@ pub fn kitty_sing_detector_model() -> Model {
             var phase = 0;      // 0 idle/accumulating, 1 armed, 2 winding down
             var count = 0;      // same-character presses in the current run
             var drive_live = 0; // full drive or its bounded release tail exists
-            // Which arm a `Buggy=1` run carries: 0 the eight-press one, 1 the
-            // sixteen-press one that ramps its drive in. Always 0 at `Buggy=0`.
+            // Which arm a `Buggy=1` run carries: 0 the eight-press one, 1 the sixteen-press one
+            // that ramps its drive in. Always 0 at `Buggy=0`.
             var ramp_fault = 0;
 
-            // A stutter at `Buggy=0`, so no action is dead at the committed
-            // config (the strict-vacuity rule for negative controls).
+            // A stutter at `Buggy=0`, so no action is dead at the committed config.
             action PickRampedArm when (ramp_fault == 0 && phase == 0 && count == 0) {
                 ramp_fault = Buggy;
             }
@@ -1401,24 +1243,20 @@ pub fn kitty_sing_detector_model() -> Model {
                 if phase == 1 { count == ArmRepeats } else { count <= ArmRepeats - 1 };
             invariant ArmedRunIsAtFullDrive:
                 if phase == 1 { drive_live == 1 } else { 1 == 1 };
-            invariant CountBounded: count <= ArmRepeats;
-            invariant PhaseBounded: phase <= 2;
+            bound CountBounded: count <= ArmRepeats;
+            bound PhaseBounded: phase <= 2;
         }
     }
 }
 
-/// Cursor-cat SING-ALONG bypass floor. Pinning the canonical momentum for a
-/// held-key celebration starts a fresh qualifying run but may not summon the
-/// companion until sixteen correlated forward cursor events have arrived.
-/// This model deliberately isolates that travel guard from the stricter normal
-/// band+dwell law: the bypass is the path on which the independent count is
-/// load-bearing.
+/// Cursor-cat sing-along bypass floor. Pinning the canonical momentum for a held-key celebration
+/// starts a fresh qualifying run but does not summon the companion until sixteen correlated
+/// forward cursor events have arrived. The model isolates that travel guard from the stricter
+/// band+dwell law: the bypass is where the independent count is load-bearing.
 ///
-/// `Buggy=1` restores v0.56's ten-event floor. `NoCatBeforeSixteen` is therefore
-/// violated by the exact historical witness (active at event ten) while the
-/// committed model proves the cat remains hidden through event fifteen.
-/// Tier-1 drives real `CursorCat::set_singing` + `CursorCat::on_key` calls and
-/// includes the ten-event mutant as a negative control.
+/// `Buggy=1` uses a ten-event floor (`NoCatBeforeSixteen` fails at event ten). Tier-1 drives
+/// real `CursorCat::set_singing` and `CursorCat::on_key` calls, with the ten-event mutant as a
+/// negative control.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn cursor_cat_earn_floor_model() -> Model {
@@ -1445,25 +1283,22 @@ pub fn cursor_cat_earn_floor_model() -> Model {
                 };
             }
 
-            // No separate "active requires singing" law: `Qualify` is this
-            // machine's only summons and its guard already reads `singing`, and
-            // outside the bypass the shipping cat earns lawfully by band+dwell.
+            // No separate "active requires singing" law: `Qualify` is the only summons and its
+            // guard reads `singing`; outside the bypass the cat earns by band+dwell.
             invariant NoCatBeforeSixteen:
                 if active == 1 { run == MinRun } else { run <= MinRun - 1 };
-            invariant RunBounded: run <= MinRun;
-            invariant FlagsBounded: singing <= 1 && active <= 1;
+            bound RunBounded: run <= MinRun;
+            bound FlagsBounded: singing <= 1 && active <= 1;
         }
     }
 }
 
-/// The resident pet retains pixel and caret custody through every sampled
-/// song phase, including direct jumps from the held song into its tail or
-/// fully drained state. The historical public model name is retained for
-/// registry compatibility; there is no longer a handoff to a replacement head.
+/// The resident pet keeps pixel and caret custody through every sampled song phase, including
+/// direct jumps from the held song into its tail or fully drained state. The model's name is
+/// kept for registry compatibility; no replacement head takes over.
 ///
-/// `Buggy=1` replays the former singing-head takeover, followed by the former
-/// late-frame blackout. Tier-1 binds the real host/capture admission helpers
-/// and resident alpha to each transition; the pet must remain the one body.
+/// `Buggy=1` hands the glass to a singing head and then blacks out late frames. Tier-1 binds
+/// the real host/capture admission helpers and resident alpha to each transition.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn reduced_motion_companion_handoff_model() -> Model {
@@ -1539,37 +1374,28 @@ pub fn reduced_motion_companion_handoff_model() -> Model {
                 if phase > 3 {
                     singer_visible == 0 && pet_ready == 1 && pet_visible == 1
                 } else { phase <= 3 };
-            invariant StateBounded:
+            bound StateBounded:
                 phase <= 5 && started <= 1 && song_tail_live <= 1
                     && singer_visible <= 1 && pet_ready <= 1 && pet_visible <= 1;
         }
     }
 }
 
-/// One-shot routing for the CLASSIFIER-MINTED cursor-cat motion pulse shared by
-/// ordinary rendering and the extracted/composed render path. A render route
-/// that observes the pulse must take it from the glow producer and deliver it
-/// to the cat exactly once. Route changes after that frame see no pulse, so a
-/// style/layout transition cannot replay old typing into a new owner.
+/// One-shot routing for the classifier-minted cursor-cat motion pulse shared by ordinary
+/// rendering and the extracted/composed render path. A route that observes the pulse takes it
+/// from the glow producer and delivers it to the cat exactly once; later route changes see no
+/// pulse, so a style or layout transition cannot replay old typing into a new owner.
 ///
-/// WHERE THE PULSE COMES FROM (`docs/design/EFFECTS-LICENSE-REDESIGN.md`): a
-/// spawn that cleared the LICENSE seam and was then positively classified as a
-/// typed advance or fold — `RainbowState::momentum_pulse`, minted beside
-/// `shape_wrap`/`re_anchor` inside `CursorGlow::spawn`. It is not "authenticated"
-/// by anything downstream: under the license law nothing is pending between the
-/// key hint and the verdict, so `LicenseMove` -> `ClassifyPulse` is the whole
-/// provenance chain and an unlicensed program move never reaches the classifier
-/// that mints one.
+/// The pulse (`docs/design/EFFECTS-LICENSE-REDESIGN.md`) is minted by a spawn that cleared the
+/// license seam and was classified a typed advance or fold (`CursorGlow::momentum_pulse`, beside
+/// `shape_wrap`/`re_anchor` in `CursorGlow::spawn`). Nothing is pending between key hint and
+/// verdict, so `LicenseMove` -> `ClassifyPulse` is the whole provenance chain.
 ///
-/// `Buggy=1` reproduces two independent defects: the composed-route omission —
-/// that route records an attempt but neither takes nor delivers the pulse,
-/// stranding it in the producer, after which switching to the ordinary route
-/// consumes the stale pulse (`stale_replay`) — and a pulse minted with no
-/// license behind it (`cold_pulse`), the shape a re-introduced cold spawn seam
-/// would have. Tier-0 proves the healthy conservation/one-shot/provenance laws
-/// and requires all three witnesses. Tier-1 binds the route actions to
-/// `take_cursor_cat_motion_pulse` plus `forward_kitty_cursor_motion` at the
-/// ordinary and composed/extracted seams.
+/// `Buggy=1` adds two defects: the composed route records an attempt but neither takes nor
+/// delivers the pulse, so a later switch to the ordinary route consumes it stale
+/// (`stale_replay`); and a pulse minted with no license (`cold_pulse`). Tier-1 binds the route
+/// actions to `take_cursor_cat_motion_pulse` plus `forward_kitty_cursor_motion` at the ordinary
+/// and composed/extracted seams.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn cursor_cat_motion_pulse_routing_model() -> Model {
@@ -1591,8 +1417,8 @@ pub fn cursor_cat_motion_pulse_routing_model() -> Model {
             action LicenseMove when (licensed == 0) {
                 licensed = 1;
             }
-            // The producer mints the pulse INSIDE a licensed spawn, from the
-            // classifier. `Buggy=1` lets it mint with no license behind it.
+            // The producer mints the pulse inside a licensed spawn, from the classifier.
+            // `Buggy=1` lets it mint with no license behind it.
             action ClassifyPulse when (
                 (licensed == 1 || Buggy == 1) && classified == 0
             ) {
@@ -1646,12 +1472,10 @@ pub fn cursor_cat_motion_pulse_routing_model() -> Model {
             invariant NoComposedRouteStrand: stranded == 0;
             invariant RouteSwitchCannotReplay: stale_replay == 0;
             invariant NoPulseFromAnUnlicensedMove: cold_pulse == 0;
-            // No separate at-most-once / classified-provenance law. The first
-            // law pins `consumes == deliveries` (1 after an attempt, 0 before),
-            // and `consumes <= classified` holds by the guards, not by that
-            // law: every consuming render needs `pending`, which only
-            // `ClassifyPulse` sets, together with `classified`.
-            invariant StateBounded:
+            // No separate at-most-once law: the first pins `consumes == deliveries`, and
+            // `consumes <= classified` holds by the guards (consuming needs `pending`, which
+            // only `ClassifyPulse` sets).
+            bound StateBounded:
                 licensed <= 1 && classified <= 1 && pending <= 1 && route <= 2
                     && attempted_route <= 2 && consumes <= 1 && deliveries <= 1
                     && switched <= 1 && stranded <= 1 && stale_replay <= 1
@@ -1660,12 +1484,11 @@ pub fn cursor_cat_motion_pulse_routing_model() -> Model {
     }
 }
 
-/// THE LICENSE, modelled at the seam that asks it: *did a human touch the
-/// keyboard just now?* (`docs/design/EFFECTS-LICENSE-REDESIGN.md`).
+/// The license, modelled at the seam that asks it: did a human touch the keyboard just now?
+/// (`docs/design/EFFECTS-LICENSE-REDESIGN.md`).
 ///
-/// The predicate, enumerated term by term at the top of `CursorGlow::spawn` /
-/// `CursorTrail::spawn`, before `classify_move` and before one byte of state
-/// moves:
+/// The predicate, evaluated at the top of `CursorGlow::spawn` / `CursorTrail::spawn` before
+/// `classify_move` and before any state moves:
 ///
 /// ```text
 /// licensed = fresh(type_hint) || fresh(quench_hint) || fresh(nav_hint)
@@ -1673,76 +1496,50 @@ pub fn cursor_cat_motion_pulse_routing_model() -> Model {
 ///         || fresh(user_gesture_hint) || synthetic_note_pending
 /// ```
 ///
-/// Six key-hint stamps under their own freshness constants (the 0.25 s class),
-/// plus the scripted-preview note, which needs no field of its own because
-/// `note_synthetic_move` / `note_synthetic_typed` stamp `user_gesture_hint` /
-/// `type_hint` at the same instant. The disjunction is CLASS-BLIND on purpose —
-/// which choreography fires stays `classify_move`'s job — so the model carries
-/// ONE three-valued licence term (`hint`: absent / fresh / stale) rather than
-/// six symmetric copies of the same disjunct.
+/// Six key-hint stamps under their own freshness constants (the 0.25 s class), plus the
+/// scripted-preview note, which needs no field because `note_synthetic_move` /
+/// `note_synthetic_typed` stamp `user_gesture_hint` / `type_hint` at the same instant. The
+/// disjunction is class-blind (which choreography fires is `classify_move`'s job), so the model
+/// carries one three-valued licence term (`hint`: absent / fresh / stale).
 ///
-/// WHAT THE MODEL CLAIMS, derived from that predicate rather than from the
-/// implementation (the enumerate-the-predicate discipline that ended the
-/// erase-poof lane), and each claim carrying its own `Buggy=1` counterexample:
+/// Claims, derived from the predicate and each with its own `Buggy=1` counterexample:
 ///
-/// * A move with NO stamp mints nothing (`cold_admitted`) — the cold token
-///   streamer, `cat`, a spinner two rows away. This is the one invariant the
-///   design names, and it is STRICTLY STRONGER than v0.43.0, whose tick spawned
-///   on every presented cursor delta and let a cold one-cell advance earn heat.
-/// * A move with a STALE stamp mints nothing (`stale_admitted`). Freshness is
-///   half the predicate; a model that only knew about absence would prove
-///   nothing about the window.
-/// * `reflow_hint` / `blink_hint` are NOT licence terms (`morphology_admitted`).
-///   A resize and a TUI's repaint blink are not keypresses; they stay morphology
-///   inputs, and the mutant is the maintainer who "helpfully" adds one to the
-///   disjunction.
-/// * A key this window SWALLOWED never licenses (`swallow_admitted`) — the ~15
-///   `clear_move_license` call sites (mouse, wheel, focus, paste, scroll, tab
-///   switch, IME, a11y, `signal`). A stamp that outlives its own boundary is
-///   not an answer to the licence question.
-/// * A DECLINED move destroys nothing (`wiped`). This is the second half of the
-///   law and the actual reported darkness: the proof era's denial paths refused
-///   to mint (fine) and then wiped the ribbon the user's own typing had earned.
-///   Retention is decay + `note_scroll` translation + reset, and nothing else.
-/// * Every armed press reaches EXACTLY ONE disposition — consumed by its one
-///   paired echo, expired by freshness, cleared at a swallow boundary, or
-///   superseded by a newer press over the one-slot stamp. Never two, never none;
-///   `admissions <= arms` is the same law counted from the other side (one hint,
-///   one echo).
-/// * The press CREDIT budget spends monotonically: spent cells never exceed the
-///   cells real presses banked, an admitted multi-cell coalesce PAYS for its
-///   ribbon, a starved one pays nothing and stays dark, and retiring a stale
-///   stamp never refunds cells to fund a second stray sweep (`credit_refunded`).
-/// * A press is IN FLIGHT until its row echoes or an observed edge forgets it
-///   (the stall): with no stamp fresh, two or more unpaid presses
-///   license the row's late echo as one batch (`InFlightBatchEchoMintsLight`),
-///   and ONE unpaid press licenses exactly its own one-cell echo
-///   (`InFlightPressEchoMintsLight`, the stalled last key) — spent on
-///   admission, so one press funds one cell once; a keyless move the echo
-///   shape refuses forgets them (`UnexplainedHopForgetsCredits`), so a
-///   swallowed press never licenses a later batch (`phantom_admitted`) and
-///   the pool a forget leaves is empty until the next press. The decline
-///   guards read a pool of AT MOST ONE press: with two or more in flight a
-///   keyless move is a batch's echo or an unexplained hop, never merely cold
-///   or stale; with exactly one the model carries no hop width, so it
-///   admits BOTH the press's own +1 (`InFlightPressEchoMintsLight`) and the
-///   engine's real refusal of a hop wider than one cell — refused and KEPT
-///   (`StaleStampMoveDeclines` / `ColdMoveDeclines`, which forfeit nothing).
-///   The mutant is the patience that does not forget, and the one-press
-///   echo that does not spend.
-///   The model is clockless: the patience's BOUND (`PatienceElapses`) is a
-///   forget like any other here, and its number is pinned by the engine's
-///   own tests, not by `ty`.
-/// * A delivered insert's echo cannot spend a key dispatched behind it on
-///   the FIFO. A delayed output frame may see both receipts, but the paste
-///   bytes still precede the key bytes. The mutant takes that first frame as
-///   typed, leaving the insert armed and the later key credit stolen.
-/// * The slimmed diagnosis ring cannot lie to `ctl trail`: every spawn scores
-///   exactly one of `licensed`/`declined`, and a `licensed` row means light was
-///   actually minted.
+/// * A move with no stamp mints nothing (`cold_admitted`): a token streamer, `cat`, a spinner
+///   two rows away.
+/// * A move with a stale stamp mints nothing (`stale_admitted`).
+/// * `reflow_hint` / `blink_hint` are not licence terms (`morphology_admitted`): a resize and a
+///   TUI's repaint blink are morphology inputs, not keypresses, and adding either to the
+///   disjunction is the mutant.
+/// * A key this window swallowed never licenses (`swallow_admitted`): the `clear_move_license`
+///   call sites (mouse, wheel, focus, paste, scroll, tab switch, IME, a11y, `signal`).
+/// * A declined move destroys nothing (`wiped`): a denial never wipes the ribbon earlier typing
+///   earned; retention is decay, `note_scroll` translation and reset, nothing else.
+/// * Every armed press reaches exactly one disposition: consumed by its paired echo, expired,
+///   cleared at a swallow boundary, or superseded by a newer press over the one-slot stamp;
+///   `admissions <= arms` is the same law counted from the other side.
+/// * The press credit budget spends monotonically: spent cells never exceed the cells presses
+///   banked, an admitted multi-cell coalesce pays for its ribbon, a starved one pays nothing and
+///   stays dark, and retiring a stale stamp never refunds cells (`credit_refunded`).
+/// * A press is in flight until its row echoes or an observed edge forgets it (the stall). With
+///   no stamp fresh, two or more unpaid presses license the row's late echo as one batch
+///   (`InFlightBatchEchoMintsLight`) and one unpaid press licenses its own one-cell echo
+///   (`InFlightPressEchoMintsLight`), spent on admission. A keyless move the echo shape refuses
+///   forgets them (`UnexplainedHopForgetsCredits`), so a swallowed press never licenses a later
+///   batch (`phantom_admitted`). The decline guards read a pool of at most one press: with two
+///   or more in flight a keyless move is a batch's echo or an unexplained hop, never merely cold
+///   or stale. With one, the model has no hop width, so it admits both the press's own +1 and
+///   the engine's refusal of a wider hop, refused and kept. The mutants are patience that never
+///   forgets and a one-press echo that does not spend. The model is clockless:
+///   `PatienceElapses` is a forget like any other, and its number is pinned by the engine's
+///   tests.
+/// * A delivered insert's echo cannot spend a key dispatched behind it on the FIFO: a delayed
+///   output frame may see both receipts, but the paste bytes precede the key bytes. The mutant
+///   takes that first frame as typed, stealing the later key's credit.
+/// * The diagnosis ring cannot lie to `ctl trail`: every spawn scores exactly one of
+///   `licensed`/`declined`, and a `licensed` row means light was minted.
 ///
-/// Tier-1 (`cursor_glow/tests/licence.rs`, `app_input.rs`) drives the REAL `CursorGlow`
-/// through press, echo, cold echo, expiry and delayed paste/key frames.
+/// Tier-1 (`cursor_glow/tests/licence.rs`, `app_input.rs`) drives the real `CursorGlow` through
+/// press, echo, cold echo, expiry and delayed paste/key frames.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn cursor_hint_license_model() -> Model {
@@ -1753,15 +1550,14 @@ pub fn cursor_hint_license_model() -> Model {
             const CoalesceCells = 2;
             const MoveCap = 2;
 
-            // The class-blind licence term: 0 absent, 1 fresh, 2 present but
-            // stale. One slot, exactly like every `*_hint: Option<Instant>`.
+            // The class-blind licence term: 0 absent, 1 fresh, 2 present but stale; one slot,
+            // like every `*_hint: Option<Instant>`.
             var hint = 0;
             // A live `reflow_hint`/`blink_hint`: morphology, never a licence.
             var morphology = 0;
             // The live arm's key was swallowed at the host boundary.
             var swallowed = 0;
-            // Presses that armed a licence, and the four dispositions an arm can
-            // reach. `EveryArmReachesExactlyOneDisposition` is the conservation.
+            // Presses that armed a licence, and the four dispositions an arm can reach.
             var arms = 0;
             var consumed = 0;
             var expired = 0;
@@ -1769,15 +1565,11 @@ pub fn cursor_hint_license_model() -> Model {
             var superseded = 0;
             // Moves that passed the licence seam (one per consumed arm).
             var admissions = 0;
-            // The press CREDIT budget (`RainbowState::type_press_ring`).
-            // THE IN-FLIGHT LAW (the stall): the unpaid pool is
-            // `credit_arms - spent - forfeited` — presses whose glyphs have
-            // not been laid AND that no observed edge has forgotten. A
-            // press is in flight until its row echoes (spent, by the cells
-            // it lays) or a move it cannot explain forgets it (forfeited);
-            // `just_forgot` says the last spawn was such an edge with no
-            // press since, and `phantom_admitted` witnesses a batch licensed
-            // out of a pool an edge had already forgotten.
+            // The press credit budget (`CursorGlow::type_press_ring`). The unpaid pool is
+            // `credit_arms - spent - forfeited`: presses not yet laid and not forgotten. A press
+            // is in flight until its row echoes (spent) or a move it cannot explain forgets it
+            // (forfeited); `just_forgot` says the last spawn was such an edge with no press
+            // since, and `phantom_admitted` a batch licensed out of a forgotten pool.
             var credit_arms = 0;
             var spent = 0;
             var forfeited = 0;
@@ -1791,36 +1583,30 @@ pub fn cursor_hint_license_model() -> Model {
             var spawns = 0;
             var licensed_tally = 0;
             var declined_tally = 0;
-            // Witnesses. Every one of these is a shape the proof era or a bare
-            // v0.43.0 revert really produces; all are 0 at the committed config.
+            // Witnesses, all 0 at the committed config.
             var cold_admitted = 0;
             var stale_admitted = 0;
             var morphology_admitted = 0;
             var swallow_admitted = 0;
             var wiped = 0;
             var credit_refunded = 0;
-            // THE DELIVERED INSERT ("the image insert breaks the
-            // rainbow"): a paste's write is QUEUED on the session FIFO and
-            // lands later on the writer thread. `write_pending` is that
-            // queued write; `insert_hint` is the insert's own licence slot
-            // (0 absent, 1 fresh, 2 stale — its own class, never `hint`);
-            // `insert_undelivered` marks a live insert arm minted at ENQUEUE,
-            // before the bytes landed — the shape the seam refuses.
+            // The delivered insert: a paste's write is queued on the session FIFO and lands
+            // later on the writer thread. `write_pending` is that write; `insert_hint` the
+            // insert's own licence slot (0 absent, 1 fresh, 2 stale); `insert_undelivered` a
+            // live insert arm minted at enqueue, before the bytes landed.
             var write_pending = 0;
             var insert_hint = 0;
             var insert_undelivered = 0;
             // Witness: an insert echo admitted on an arm minted before delivery.
             var undelivered_admitted = 0;
-            // A typed press dispatched AFTER the queued insert. Its credit
-            // cannot own an earlier paste echo just because both receipts
-            // have reached the renderer before the first output frame.
+            // A typed press dispatched after the queued insert; its credit cannot own the
+            // earlier paste echo even when both receipts reach the renderer before output.
             var later_key_credit = 0;
             var later_key_stolen = 0;
 
-            // A press arms the licence and banks one cell credit. The stamp is
-            // ONE SLOT: a press over a live stamp supersedes it (the older arm
-            // is disposed of, its credit survives in the ring), which is why the
-            // conservation has four dispositions and not two.
+            // A press arms the licence and banks one cell credit. The stamp is one slot: a press
+            // over a live stamp supersedes it (its credit survives in the ring), hence four
+            // dispositions.
             action PressArmsLicense when (arms <= ArmCap - 1) {
                 superseded = if hint == 1 { superseded + 1 } else { superseded };
                 hint = 1;
@@ -1829,19 +1615,15 @@ pub fn cursor_hint_license_model() -> Model {
                 swallowed = 0;
                 just_forgot = 0;
             }
-            // Pointer hover that writes no terminal bytes and owns no local
-            // gesture cannot dispose of an in-flight key. It is a stutter of
-            // the licence state, like an inert modifier. The mutant loses the
-            // stamp without any of the four legitimate arm dispositions.
+            // Pointer hover that writes no terminal bytes and owns no local gesture does not
+            // dispose of an in-flight key; it stutters the licence state. `Buggy=1` loses the
+            // stamp with none of the four legitimate dispositions.
             action ByteSilentPointerPreservesLicense when (hint == 1) {
                 hint = if Buggy == 1 { 0 } else { hint };
             }
-            // THE PASTE IS QUEUED: enqueue is not delivery, so the completed
-            // arm is nothing yet (the host's arrival-time gesture stamp is
-            // revoked in the same turn — `SwallowedKeyClearsLicense`'s shape).
-            // `Buggy=1` keeps an arm at enqueue: a licence for bytes that
-            // have not provably landed, spendable by concurrent program
-            // output.
+            // The paste is queued: enqueue is not delivery, so nothing is armed yet (the host's
+            // arrival-time gesture stamp is revoked in the same turn). `Buggy=1` arms at
+            // enqueue, a licence for bytes not yet landed that program output could spend.
             action PasteEnqueues when (write_pending == 0 && arms <= ArmCap - 1) {
                 write_pending = 1;
                 superseded = if Buggy == 1 && insert_hint == 1 {
@@ -1853,11 +1635,9 @@ pub fn cursor_hint_license_model() -> Model {
                 insert_undelivered = if Buggy == 1 { 1 } else { insert_undelivered };
                 arms = if Buggy == 1 { arms + 1 } else { arms };
             }
-            // THE WRITER THREAD'S COMPLETED WRITE: the bytes are on the wire,
-            // and THAT arms the insert licence — one slot, the supersede
-            // shape. Its width is its OWN credit, carried on the stamp and
-            // spent with it, never a press credit in the typed ring
-            // (`credit_arms` is the typed budget the coalesce share reads).
+            // The writer thread's completed write puts the bytes on the wire and arms the insert
+            // licence (one slot, the supersede shape). Its width is its own credit, carried on
+            // the stamp, never a press credit in the typed ring.
             action WriteCompletesArmsInsertLicence when (
                 write_pending == 1 && arms <= ArmCap - 1
             ) {
@@ -1878,11 +1658,9 @@ pub fn cursor_hint_license_model() -> Model {
                 swallowed = 0;
                 just_forgot = 0;
             }
-            // The FIFO's paste bytes echo first. The historical classifier
-            // counted ALL banked key credits, so a same-width paste frame
-            // spent the later key's credit as typed and left its insert arm
-            // waiting. The fixed class spends the insert arm and preserves
-            // the key for the next frame.
+            // The FIFO's paste bytes echo first: the insert arm is spent and the later key's
+            // credit kept for the next frame. `Buggy=1` counts every banked key credit, so a
+            // same-width paste frame spends the later key's credit as typed.
             action DelayedInsertEchoPrecedesLaterKey when (
                 insert_hint == 1 && later_key_credit == 1
                     && hint == 1 && spawns <= MoveCap - 1
@@ -1907,10 +1685,9 @@ pub fn cursor_hint_license_model() -> Model {
             action RetireStaleInsertLicence when (insert_hint == 2) {
                 insert_hint = 0;
             }
-            // THE INSERT'S ECHO: one same-row forward hop, laid as one sweep,
-            // spending the stamp (its width goes with it). `Buggy=1` leaves
-            // the stamp live after consuming it, so one delivery funds every
-            // hop that follows — caught by the disposition conservation.
+            // The insert's echo: one same-row forward hop, laid as one sweep, spending the stamp
+            // and its width. `Buggy=1` leaves the stamp live, so one delivery funds every hop
+            // that follows (caught by the disposition conservation).
             action LicensedInsertEchoMintsLight when (
                 insert_hint == 1 && spawns <= MoveCap - 1
             ) {
@@ -1927,8 +1704,7 @@ pub fn cursor_hint_license_model() -> Model {
                     undelivered_admitted
                 };
             }
-            // A stale insert stamp is not a licence either (the typed
-            // `StaleStampMoveDeclines`, restated for the delivered class).
+            // A stale insert stamp is not a licence either.
             action StaleInsertStampDeclines when (
                 insert_hint == 2 && hint == 0 && spawns <= MoveCap - 1
             ) {
@@ -1951,15 +1727,13 @@ pub fn cursor_hint_license_model() -> Model {
             action MorphologyStampArrives when (morphology == 0) {
                 morphology = 1;
             }
-            // The freshness window elapses: the stamp is still SET, and no
-            // longer fresh. That distinction is the whole point of the window.
+            // The freshness window elapses: the stamp is still set, no longer fresh.
             action LicenseExpires when (hint == 1) {
                 hint = 2;
                 expired = expired + 1;
             }
-            // The classifier's `take_if` drops the stale stamp. `Buggy=1`
-            // refunds its cell to the press budget — the historical shape where
-            // a retired hint's cells funded a second stray multi-cell sweep.
+            // The classifier's `take_if` drops the stale stamp. `Buggy=1` refunds its cell to the
+            // press budget, funding a second stray multi-cell sweep.
             action RetireStaleLicense when (hint == 2) {
                 hint = 0;
                 spent = if Buggy == 1 && spent > 0 { spent - 1 } else { spent };
@@ -1969,21 +1743,16 @@ pub fn cursor_hint_license_model() -> Model {
                     credit_refunded
                 };
             }
-            // `clear_move_license`: a key this window swallowed is not an answer
-            // to the licence question, so its stamp must not outlive the
-            // boundary. `Buggy=1` lets it survive.
+            // `clear_move_license`: a swallowed key's stamp does not outlive the boundary.
+            // `Buggy=1` lets it survive.
             action SwallowedKeyClearsLicense when (hint == 1 && swallowed == 0) {
                 hint = if Buggy == 1 { 1 } else { 0 };
                 cleared = if Buggy == 1 { cleared } else { cleared + 1 };
                 swallowed = 1;
             }
-            // The licensed typed echo: one hint, one echo. `Buggy=1` leaves the
-            // stamp live after consuming it, so one press funds every echo that
-            // follows — caught twice over, by the disposition conservation and
-            // by `admissions <= arms`. The echo SPENDS the credit its cell
-            // lays (`lays_typed_cells`: every same-row
-            // forward typed echo spends), so the pool after an on-time echo
-            // is what the real ring holds — empty.
+            // The licensed typed echo: one hint, one echo, spending the credit its cell lays.
+            // `Buggy=1` leaves the stamp live, so one press funds every later echo (caught by
+            // the disposition conservation and by `admissions <= arms`).
             action LicensedTypedMoveMintsLight when (
                 hint == 1 && spawns <= MoveCap - 1
             ) {
@@ -1997,9 +1766,8 @@ pub fn cursor_hint_license_model() -> Model {
                 licensed_tally = licensed_tally + 1;
                 swallow_admitted = if swallowed == 1 { 1 } else { swallow_admitted };
             }
-            // A batched multi-cell echo, backed by enough recent CELL credits to
-            // pay for every swept cell, SPENDS them: the same pool can never pay
-            // for a second stray sweep. `Buggy=1` paints the ribbon for free.
+            // A batched multi-cell echo backed by enough cell credits spends them, so the pool
+            // never pays for a second stray sweep. `Buggy=1` paints the ribbon for free.
             action AdmitCoalesceSpendsCredits when (
                 hint == 1 && coalesce_births == 0 && spawns <= MoveCap - 1
                     && credit_arms - spent - forfeited > CoalesceCells - 1
@@ -2015,13 +1783,10 @@ pub fn cursor_hint_license_model() -> Model {
                 licensed_tally = licensed_tally + 1;
                 swallow_admitted = if swallowed == 1 { 1 } else { swallow_admitted };
             }
-            // Licensed and classified, and the CREDIT budget alone refused it —
-            // vim's `w` is one press echoing as a multi-cell hop. It stays dark
-            // and pays nothing; the ring names `no-credits`. `Buggy=1` bills the
-            // budget it could not afford AND tells `ctl trail` it painted.
-            // A `no-credits` refusal is an UNEXPLAINED HOP too:
-            // whatever the pool held did not describe this move, and it is
-            // forgotten with the refusal.
+            // Licensed and classified, refused by the credit budget alone: vim's `w` is one
+            // press echoing as a multi-cell hop. It stays dark, pays nothing, and the ring names
+            // `no-credits`; it is an unexplained hop too, so the pool is forgotten. `Buggy=1`
+            // bills the budget and tells `ctl trail` it painted.
             action StarvedCoalesceDeclines when (
                 hint == 1 && spawns <= MoveCap - 1
                     && credit_arms - spent - forfeited <= CoalesceCells - 1
@@ -2044,14 +1809,10 @@ pub fn cursor_hint_license_model() -> Model {
                     declined_tally + 1
                 };
             }
-            // THE IN-FLIGHT BATCH (the stall): no stamp is fresh (absent, or stale in place — the
-            // row stayed silent past the window), and the LEDGER licenses the
-            // echo: at least two unpaid presses whose glyphs have not been
-            // laid. The batch spends them. The stale stamps are NOT consumed
-            // (the real bank pops only fresh ones). `Buggy=1` is the mutant
-            // of `UnexplainedHopForgetsCredits` reaching here: a pool an
-            // unexplained hop should have forgotten licenses the batch, and
-            // `phantom_admitted` witnesses it.
+            // The in-flight batch (the stall): no stamp fresh (absent, or stale in place), and
+            // at least two unpaid presses license the echo, which spends them. Stale stamps are
+            // not consumed (the bank pops only fresh ones). At `Buggy=1` a pool an unexplained
+            // hop should have forgotten licenses the batch (`phantom_admitted`).
             action InFlightBatchEchoMintsLight when (
                 (hint == 0 || hint == 2) && coalesce_births == 0 && spawns <= MoveCap - 1
                     && credit_arms - spent - forfeited > CoalesceCells - 1
@@ -2065,12 +1826,9 @@ pub fn cursor_hint_license_model() -> Model {
                 licensed_tally = licensed_tally + 1;
                 phantom_admitted = if just_forgot == 1 { 1 } else { phantom_admitted };
             }
-            // THE ONE-PRESS ECHO (the stalled last key): no stamp
-            // is fresh and exactly ONE press is unpaid — its own +1 echo is
-            // licensed and the press is SPENT: one press, one cell, once.
-            // `Buggy=1` does not spend, so the same press funds a second +1
-            // and `PairedAdmissionsNeverExceedArms` catches it within two
-            // moves (press, expire, +1, +1: two admissions on one arm).
+            // The one-press echo (the stalled last key): no stamp fresh and exactly one press
+            // unpaid, so its own +1 echo is licensed and the press spent. `Buggy=1` does not
+            // spend, so the same press funds a second +1 (`PairedAdmissionsNeverExceedArms`).
             action InFlightPressEchoMintsLight when (
                 (hint == 0 || hint == 2) && spawns <= MoveCap - 1
                     && credit_arms - spent - forfeited == 1
@@ -2083,14 +1841,11 @@ pub fn cursor_hint_license_model() -> Model {
                 licensed_tally = licensed_tally + 1;
                 phantom_admitted = if just_forgot == 1 { 1 } else { phantom_admitted };
             }
-            // AN UNEXPLAINED HOP FORGETS THE CREDITS: a keyless
-            // move the echo shape refuses — backward, cross-row, a row change
-            // no key licensed, a forward hop the share rule refused. The
-            // presses in flight did not describe it, so they are forgotten
-            // with the refusal: a swallowed press (a pager's `q`, a password,
-            // a modal) can never roll forward as a phantom credit. THE
-            // MUTANT (`Buggy=1`) is a patience that does not forget — the
-            // pool survives the hop, and the next batch shape licenses it.
+            // An unexplained hop forgets the credits: a keyless move the echo shape refuses
+            // (backward, cross-row, an unlicensed row change, a forward hop the share rule
+            // refused). The presses did not describe it, so a swallowed press (a pager's `q`, a
+            // password, a modal) never rolls forward as a phantom credit. `Buggy=1` keeps the
+            // pool across the hop, and the next batch shape licenses it.
             action UnexplainedHopForgetsCredits when (
                 (hint == 0 || hint == 2) && spawns <= MoveCap - 1
                     && credit_arms - spent - forfeited > 0
@@ -2100,25 +1855,18 @@ pub fn cursor_hint_license_model() -> Model {
                 forfeited = if Buggy == 1 { forfeited } else { credit_arms - spent };
                 just_forgot = 1;
             }
-            // THE BOUND: the in-flight patience elapses with the row still
-            // silent — the presses are forgotten by the clock. A bounds
-            // action, not a design claim: the model has no clock, so it
-            // cannot say WHEN (the red unit tests pin the number); it says
-            // only that the bound is a forget like any other.
+            // The in-flight patience elapses with the row silent and the clock forgets the
+            // presses. The model has no clock, so it says only that the bound is a forget; the
+            // engine's unit tests pin the number.
             action PatienceElapses when (credit_arms - spent - forfeited > 0) {
                 forfeited = credit_arms - spent;
             }
-            // THE COLD MOVE: program output nobody's fingers asked for. No
-            // stamp at all, and at most ONE press in flight: with two or more
-            // a keyless move is never merely cold — it is the batch's echo or
-            // an unexplained hop, and those actions own it. With exactly one
-            // the model has no hop width: a +1 is the press's own echo
-            // (`InFlightPressEchoMintsLight`), a wider hop is refused and the
-            // press KEPT — the engine's real transition
-            // (`a_single_stalled_press_wider_than_one_cell_is_still_refused_and_kept`)
-            // — so both are enabled here and neither forfeits. `Buggy=1` is
-            // the pre-licence seam — v0.43.0's tick, which spawned on every
-            // presented cursor delta.
+            // The cold move: program output nobody's fingers asked for. No stamp, and at most
+            // one press in flight (with two or more a keyless move is a batch's echo or an
+            // unexplained hop). With one the model has no hop width: a +1 is the press's own
+            // echo, and a wider hop is refused with the press kept
+            // (`a_single_stalled_press_wider_than_one_cell_is_still_refused_and_kept`), so both
+            // are enabled and neither forfeits. `Buggy=1` spawns on every cursor delta.
             action ColdMoveDeclines when (
                 hint == 0 && spawns <= MoveCap - 1
                     && credit_arms - spent - forfeited <= CoalesceCells - 1
@@ -2138,9 +1886,8 @@ pub fn cursor_hint_license_model() -> Model {
                     declined_tally + 1
                 };
             }
-            // The same cold move, over light the user's own typing earned.
-            // `Buggy=1` is `clear_denied_move_visuals`: it refuses to mint AND
-            // wipes the ribbon, invisibly to the ring. That wipe is the darkness.
+            // The same cold move over light the user's typing earned. `Buggy=1` refuses to
+            // mint and wipes the ribbon, invisibly to the ring.
             action ColdMoveOverEarnedLight when (
                 hint == 0 && resident == 1 && spawns <= MoveCap - 1
                     && credit_arms - spent - forfeited <= CoalesceCells - 1
@@ -2154,8 +1901,8 @@ pub fn cursor_hint_license_model() -> Model {
                     declined_tally + 1
                 };
             }
-            // A move under a live reflow/blink stamp and nothing else. The
-            // stamp is consumed as morphology; it never licenses.
+            // A move under a live reflow/blink stamp alone: consumed as morphology, never a
+            // licence.
             action MorphologyOnlyMoveDeclines when (
                 hint == 0 && morphology == 1 && spawns <= MoveCap - 1
             ) {
@@ -2179,15 +1926,10 @@ pub fn cursor_hint_license_model() -> Model {
                     declined_tally + 1
                 };
             }
-            // A move whose stamp is SET but stale, with at most ONE press in
-            // flight. The stamp was never the licence, the press in flight is
-            // (`AStaleStampIsNotALicence`): over an empty pool — spent by its
-            // own echo, forgotten by an edge, past the patience — a stale
-            // stamp licenses nothing; over ONE press the model has no hop
-            // width, so a +1 is `InFlightPressEchoMintsLight`'s and a wider
-            // hop (vim's `w` on a stale stamp) is this refusal, the press
-            // KEPT for the next key's bridge. Two or more in flight are
-            // `InFlightBatchEchoMintsLight`'s.
+            // A move whose stamp is set but stale, with at most one press in flight. The press,
+            // not the stamp, is the licence: over an empty pool a stale stamp licenses nothing;
+            // over one press a +1 is `InFlightPressEchoMintsLight`'s and a wider hop (vim's
+            // `w`) is this refusal, the press kept for the next key's bridge.
             action StaleStampMoveDeclines when (
                 hint == 2 && spawns <= MoveCap - 1
                     && credit_arms - spent - forfeited <= CoalesceCells - 1
@@ -2214,17 +1956,13 @@ pub fn cursor_hint_license_model() -> Model {
             invariant ASwallowedKeyNeverLicences: swallow_admitted == 0;
             invariant DeclinedMovesNeverDestroyEarnedLight: wiped == 0;
             invariant SpentCreditsNeverComeBack: credit_refunded == 0;
-            // THE IN-FLIGHT LAW'S TWO CLAIMS: a press an
-            // unexplained hop forgot never licenses a later batch, and the
-            // pool such a hop leaves behind is empty until the next press.
-            // Each is falsified alone by the mutant that keeps the credits
-            // across the hop (`UnexplainedHopForgetsCredits` at `Buggy=1`).
+            // A press an unexplained hop forgot never licenses a later batch, and the pool
+            // such a hop leaves is empty until the next press; each is falsified alone by
+            // `UnexplainedHopForgetsCredits` at `Buggy=1`.
             invariant AForgottenPressNeverLicences: phantom_admitted == 0;
             invariant ForgottenCreditsNeverReturn:
                 just_forgot == 0 || credit_arms - spent - forfeited == 0;
-            // An insert licence is minted by the COMPLETED WRITE and nothing
-            // else: enqueue arms nothing, so no insert echo is ever admitted
-            // on an arm from before the bytes landed.
+            // Only the completed write mints an insert licence; enqueue arms nothing.
             invariant AnInsertLicenceIsMintedOnlyByACompletedWrite:
                 undelivered_admitted == 0;
             invariant LaterKeysCannotOwnAnEarlierInsertEcho: later_key_stolen == 0;
@@ -2243,7 +1981,7 @@ pub fn cursor_hint_license_model() -> Model {
             invariant TheRingCannotClaimUnmintedLight: licensed_tally == births;
             invariant TheRingScoresEverySpawnOnce:
                 licensed_tally + declined_tally == spawns;
-            invariant StateBounded:
+            bound StateBounded:
                 hint <= 2 && morphology <= 1 && swallowed <= 1 && arms <= ArmCap
                     && write_pending <= 1 && insert_hint <= 2 && insert_undelivered <= 1
                     && undelivered_admitted <= 1
@@ -2261,93 +1999,64 @@ pub fn cursor_hint_license_model() -> Model {
     }
 }
 
-/// THE ECHO LEDGER'S LAW (`docs/design/RAINBOW-KITTY-V2.md`, "The late echo's
-/// one-press case"): the rainbow-kitty v2 engine banks every
-/// typed press and lets a LICENSED typed move pay a hole the seam refused —
-/// the cells between the engine's mirror and the move's `from` — out of the
-/// presses that could have produced it, one press one cell, and nothing else
-/// (`EchoLedger`, `Engine::echo_bridge` in `aterm-effects`).
+/// The echo ledger's law (`docs/design/RAINBOW-KITTY-V2.md`, "The late echo's one-press case"):
+/// the rainbow kitty engine banks every typed press and lets a licensed typed move pay a hole the
+/// seam refused (the cells between the engine's mirror and the move's `from`) out of the presses
+/// that could have produced it, one press one cell (`EchoLedger`, `Engine::echo_bridge` in
+/// `aterm-effects`).
 ///
-/// The ledger is two buckets and a stale lane, partitioned by the LICENSING
-/// KEY — the press whose clock the host's sweep for the move carries:
-/// `older` (presses banked before that key, whose glyphs lie in the hole),
-/// `younger` (the key and the presses still in flight behind it, whose glyphs
-/// lie at and past `from`), `stale` (presses past `ECHO_PATIENCE_S` — the
-/// host's in-flight patience `IN_FLIGHT_PATIENCE_S` by alias — which the next
-/// move drops as swallowed). `hole` is the caret's unlicensed advance
-/// since the mirror — a late echo the seam refused, or program output; the
-/// engine cannot tell which, and that is the whole point: only the ledger can.
+/// The ledger is two buckets and a stale lane, partitioned by the licensing key (the press whose
+/// clock the host's sweep carries): `older` (banked before the key; their glyphs lie in the
+/// hole), `younger` (the key and the presses in flight behind it, at and past `from`), `stale`
+/// (past `ECHO_PATIENCE_S`, an alias of `IN_FLIGHT_PATIENCE_S`, which the next move drops as
+/// swallowed). `hole` is the caret's unlicensed advance since the mirror: a refused late echo or
+/// program output, which only the ledger can tell apart.
 ///
-/// WHAT THE MODEL CLAIMS, each claim with its own `Buggy = 1` counterexample:
+/// Claims, each with its own `Buggy = 1` counterexample:
 ///
-/// * `BridgedNeverExceedsOlderPresses` — the cells a move lays for a hole never
-///   exceed the presses banked before its licensing key. The mutant is the
-///   FIRST ledger, the one the adversarial review broke: any banked press pays
-///   any cell, so a program nudge followed by a fast burst lights the nudge's
-///   cell with the burst's in-flight presses (three presses, four cells).
-/// * `AProgramGapIsNeverBridged` — a hole is laid only when the older presses
-///   explain it EXACTLY; a program nudge beside a real late echo (older 1,
-///   hole 2), or two swallowed keys before a one-cell nudge (older 2, hole 1),
-///   lays nothing. Same mutant, the other half of the partition.
-/// * `ForfeitedCreditsNeverReturn` — a refused bridge empties the ledger, so
-///   the presses it held can never fund a later cell (a swallowed press would
-///   otherwise roll forward behind the hand as a phantom credit). The mutant
-///   keeps them.
-/// * `NoBridgeOutsideALicensedMove` — every bridged cell is a press a licensed
-///   move spent; T1 in the ledger's terms: a keydown never pre-draws its cell
-///   (the mutant lays the cell on the press).
-/// * `OnePressOneCell` — conservation: every banked press is exactly one of
-///   waiting, stale, spent, forfeited or expired. The mutant bills a
-///   two-cell unswept echo against a single press.
-/// * `ExpiredPressesBuyNothing` — a press that crossed the patience line is
-///   only ever dropped, never spent. The mutant counts stale presses as
-///   payment.
-/// * `NoBridgeOnARefusedMove` — a refused bridge lays nothing: the move's
-///   bridged delta is zero whenever the ledger was just forgotten. The
-///   mutant lays a cell for the hop it refused.
+/// * `BridgedNeverExceedsOlderPresses`: a move never lays more hole cells than the presses
+///   banked before its key. The mutant lets any banked press pay any cell, so a program nudge
+///   followed by a fast burst lights the nudge's cell with the burst's in-flight presses.
+/// * `AProgramGapIsNeverBridged`: a hole is laid only when the older presses explain it exactly
+///   (older 1 with hole 2, or older 2 with hole 1, lays nothing). Same mutant.
+/// * `ForfeitedCreditsNeverReturn`: a refused bridge empties the ledger, so its presses never
+///   fund a later cell as phantom credits. The mutant keeps them.
+/// * `NoBridgeOutsideALicensedMove`: every bridged cell is a press a licensed move spent; a
+///   keydown never pre-draws its cell (the mutant does).
+/// * `OnePressOneCell`: every banked press is exactly one of waiting, stale, spent, forfeited or
+///   expired. The mutant bills a two-cell unswept echo against one press.
+/// * `ExpiredPressesBuyNothing`: a press past the patience line is only dropped, never spent.
+///   The mutant counts stale presses as payment.
+/// * `NoBridgeOnARefusedMove`: a refused bridge lays nothing. The mutant lays a cell for it.
 ///
-/// Abstractions, stated so the Tier-1 twin can be read against them: a press
-/// is one cell (the engine banks a wide glyph as two — the same arithmetic,
-/// twice); a swept move is the per-key shape, one cell of advance under the
-/// host's own sweep; an unswept move is a `Batch`-cell echo the host licensed
-/// but did not sweep. `Depth` conflates the ledger's ENTRY cap
-/// (`ECHO_LEDGER_DEPTH` presses) with the paid move's CELL cap (the same
-/// constant, in cells), which is exact only for one-cell presses. The
-/// one-cell unswept shape is outside the action vocabulary because the host
-/// sweeps every typed same-row forward echo except a non-coalesced
-/// re-anchor, which is the `Batch` shape. Outside the bounded space, stated
-/// rather than modelled: the ledger's overflow (the engine drops the OLDEST
-/// press past `ECHO_LEDGER_DEPTH`), and the two clockless clears — `reset`
-/// (which also zeroes `bridged`) and `translate_scroll`. Patience elapses per
-/// press in the engine, oldest first (`OnePressGoesStale`), and all at once
-/// as the closed form (`TimePasses`). A backward typed move re-anchors the
-/// mirror, drops the stale presses (the engine expires before it looks) and
-/// keeps the fresh ones. Every other clearing edge is one of two: the
-/// move-shaped clears (a non-typed licence, a row change, a hop that landed
-/// behind the mirror) are `LedgerForgotten`, which also re-anchors the mirror
-/// so the hole is zero; the in-place clears (erase, kill, focus loss) are
-/// `LedgerClearedInPlace`, which leaves the mirror — and so the hole — where
-/// it is. Tier-1
-/// (`rainbow_kitty::tests::the_real_engine_conforms_to_the_echo_ledger_model`)
-/// drives the REAL `Engine` through press, refused echo, licensed echo with
-/// the host's sweep on the press's clock, the nudge-then-burst break, the
-/// swallowed-press phantom, the navigation clear, the vim-`w` re-anchor the
-/// host does not sweep, the unswept batch, the fresh and the stale retreat,
-/// the patience expiry whole and per press, and the three in-place clears,
-/// projecting the ledger's live buckets and tallies off the engine.
+/// Abstractions: a press is one cell (the engine banks a wide glyph as two); a swept move is one
+/// cell of advance under the host's sweep; an unswept move is a `Batch`-cell echo the host
+/// licensed but did not sweep (the host sweeps every typed same-row forward echo except a
+/// non-coalesced re-anchor). `Depth` conflates the ledger's entry cap (`ECHO_LEDGER_DEPTH`
+/// presses) with the paid move's cell cap, exact only for one-cell presses. Not modelled: the
+/// overflow (the engine drops the oldest press past `ECHO_LEDGER_DEPTH`) and the clockless clears
+/// `reset` (which also zeroes `bridged`) and `translate_scroll`. Patience elapses per press,
+/// oldest first (`OnePressGoesStale`), or all at once (`TimePasses`). A backward typed move
+/// re-anchors the mirror, drops stale presses and keeps fresh ones. Move-shaped clears are
+/// `LedgerForgotten` (the mirror re-anchors, so the hole is zero); in-place clears are
+/// `LedgerClearedInPlace` (the mirror and hole stay).
+///
+/// Tier-1 (`rainbow_kitty::tests::the_real_engine_conforms_to_the_echo_ledger_model`) drives the
+/// real `Engine` through press, refused echo, licensed echo on the press's clock, the
+/// nudge-then-burst break, the swallowed-press phantom, the navigation clear, the vim-`w`
+/// re-anchor, the unswept batch, fresh and stale retreats, patience expiry whole and per press,
+/// and the three in-place clears, projecting the ledger's buckets and tallies off the engine.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn echo_ledger_bridge_model() -> Model {
     crate::ty_model! {
         EchoLedgerBridge {
             const Buggy = 0;
-            // The most presses one move can pair with (`ECHO_LEDGER_DEPTH`,
-            // scaled down): the ledger's live capacity and the largest hole.
+            // `ECHO_LEDGER_DEPTH`, scaled down: the ledger's live capacity and the largest hole.
             const Depth = 3;
             // Presses one bounded run banks.
             const BankCap = 4;
-            // Cells of the unswept echo the host licensed on its credits but
-            // did not sweep (the reported two-cell shape).
+            // Cells of an unswept echo the host licensed but did not sweep.
             const Batch = 2;
 
             // The ledger, partitioned by the licensing key.
@@ -2356,10 +2065,8 @@ pub fn echo_ledger_bridge_model() -> Model {
             var stale = 0;
             // The caret's unlicensed advance past the mirror.
             var hole = 0;
-            // Tallies: every banked press reaches exactly one of spent,
-            // forfeited, expired, or is still waiting (`older`/`younger`) or
-            // stale. `stale_gone` counts the presses that crossed the patience
-            // line, dropped or not.
+            // Tallies: every banked press is spent, forfeited, expired, waiting or stale.
+            // `stale_gone` counts the presses that crossed the patience line.
             var banked = 0;
             var spent = 0;
             var forfeited = 0;
@@ -2367,19 +2074,16 @@ pub fn echo_ledger_bridge_model() -> Model {
             var stale_gone = 0;
             // `Status::bridged` — cells the ledger laid.
             var bridged = 0;
-            // The last licensed move, as the bridge saw it: the hole cells it
-            // laid, the older presses it found, and every cell it bridged
-            // (the hole, or the unswept batch).
+            // The last licensed move as the bridge saw it: the hole cells it laid, the older
+            // presses it found, and every cell it bridged (the hole, or the unswept batch).
             var laid_hole = 0;
             var last_older = 0;
             var bridged_delta = 0;
-            // The last move was a refused bridge and no press has been banked
-            // since — the ledger must be empty.
+            // The last move was a refused bridge and no press was banked since.
             var just_refused = 0;
 
-            // A press the host will clock its next sweep at: everything
-            // banked before it is OLDER than the key. `Buggy=1` pre-draws the
-            // key's cell on the keydown — T1's failure in ledger terms.
+            // A press the host will clock its next sweep at: everything banked before it is
+            // older than the key. `Buggy=1` pre-draws the key's cell on the keydown.
             action KeyPressed when (
                 banked <= BankCap - 1 && older + younger + stale <= Depth - 1
             ) {
@@ -2389,8 +2093,7 @@ pub fn echo_ledger_bridge_model() -> Model {
                 just_refused = 0;
                 bridged = if Buggy == 1 { bridged + 1 } else { bridged };
             }
-            // A press behind the key, still in flight: its glyph lies to the
-            // RIGHT of the key's cell.
+            // A press behind the key, still in flight: its glyph lies right of the key's cell.
             action PressInFlight when (
                 banked <= BankCap - 1 && older + younger + stale <= Depth - 1
             ) {
@@ -2398,44 +2101,37 @@ pub fn echo_ledger_bridge_model() -> Model {
                 banked = banked + 1;
                 just_refused = 0;
             }
-            // The caret advanced one cell and no licensed move arrived: a
-            // late echo the seam refused, or program output. The engine sees
-            // neither; it reads the hole off the next move's `from`.
+            // The caret advanced a cell with no licensed move: a refused late echo or program
+            // output. The engine sees neither; it reads the hole off the next move's `from`.
             action UnlicensedAdvance when (hole <= Depth - 1) {
                 hole = hole + 1;
             }
-            // The patience elapses on every waiting press: swallowed, not
-            // late. They stay on the ledger until a move drops them.
+            // The patience elapses on every waiting press (swallowed, not late); they stay on
+            // the ledger until a move drops them.
             action TimePasses when (1 <= older + younger) {
                 stale = stale + older + younger;
                 stale_gone = stale_gone + older + younger;
                 older = 0;
                 younger = 0;
             }
-            // The patience elapses on ONE press — the oldest waiting one, as
-            // the engine expires: presses are banked in clock order, so the
-            // stale prefix is always an oldest-first prefix, older before
-            // younger.
+            // The patience elapses on one press, the oldest waiting: presses are banked in clock
+            // order, so the stale prefix is oldest-first, older before younger.
             action OnePressGoesStale when (1 <= older + younger) {
                 older = if 1 <= older { older - 1 } else { older };
                 younger = if older <= 0 { younger - 1 } else { younger };
                 stale = stale + 1;
                 stale_gone = stale_gone + 1;
             }
-            // THE PAID BRIDGE. A licensed typed move on the mirror's row,
-            // forward, one cell of advance under the host's own sweep on the
-            // key's clock: stale presses are dropped first; the hole is the
-            // older presses', exactly, and the advance is the key's. Spent
-            // oldest-first, the hole laid, counted for `trail status`.
-            // `Buggy=1` is the partition-blind, patience-blind first ledger:
-            // any press on the ledger pays any cell.
+            // The paid bridge: a licensed forward typed move on the mirror's row, one cell of
+            // advance under the host's sweep on the key's clock. Stale presses drop first; the
+            // hole is exactly the older presses', the advance the key's; spent oldest-first and
+            // counted for `trail status`. `Buggy=1` lets any press on the ledger pay any cell.
             action SweptMovePays when (
                 (Buggy == 0 && older == hole && 1 <= younger)
                     || (Buggy == 1 && hole + 1 <= older + younger + stale)
             ) {
                 expired = if Buggy == 1 { expired } else { expired + stale };
-                // `Buggy=1` spends the hole and the key's cell oldest-first
-                // across every bucket, stale presses included.
+                // `Buggy=1` spends oldest-first across every bucket, stale included.
                 stale = if Buggy == 1 && hole + 1 <= stale - 1 {
                     stale - hole - 1
                 } else {
@@ -2466,13 +2162,10 @@ pub fn echo_ledger_bridge_model() -> Model {
                 last_older = older;
                 hole = 0;
             }
-            // THE REFUSED BRIDGE: the same move when the older presses do not
-            // explain the hole exactly, or the key itself is not on the
-            // ledger. Nothing is laid (the host's sweep lit its own cell) and
-            // the ledger is FORGOTTEN: the presses no longer describe the row.
-            // `Buggy=1` keeps them for the next hole, and lays a cell for
-            // the hop it refused — once per press, so the mutant space stays
-            // bounded: the first refusal after a press, with presses held.
+            // The refused bridge: the same move when the older presses do not explain the hole
+            // exactly, or the key is not on the ledger. Nothing is laid (the host's sweep lit
+            // its own cell) and the ledger is forgotten. `Buggy=1` keeps the presses and lays a
+            // cell for the refused hop, once per press so the space stays bounded.
             action SweptMoveRefuses when (
                 older <= hole - 1 || hole <= older - 1 || younger <= 0
             ) {
@@ -2496,14 +2189,11 @@ pub fn echo_ledger_bridge_model() -> Model {
                 hole = 0;
                 just_refused = 1;
             }
-            // THE UNSWEPT ECHO: a licensed `Batch`-cell typed move the host
-            // did not sweep — a non-coalesced re-anchor, or a batch its press
-            // credits (in flight for `IN_FLIGHT_PATIENCE_S`)
-            // could not pay for. With no key clock there is no partition:
-            // only a move starting AT the mirror is attributed, to the oldest
-            // presses, and every cell is laid.
-            // `Buggy=1` bills the batch against a single press — one press,
-            // two cells.
+            // The unswept echo: a licensed `Batch`-cell typed move the host did not sweep (a
+            // non-coalesced re-anchor, or a batch its press credits could not pay for). With no
+            // key clock there is no partition: only a move starting at the mirror is
+            // attributed, to the oldest presses, and every cell is laid. `Buggy=1` bills the
+            // batch against a single press.
             action UnsweptMovePays when (
                 hole == 0
                     && ((Buggy == 0 && Batch <= older + younger)
@@ -2531,8 +2221,8 @@ pub fn echo_ledger_bridge_model() -> Model {
                 laid_hole = 0;
                 last_older = older;
             }
-            // The unswept echo refused: a hole before it (no clock to
-            // partition by), or too few presses. Forgotten, like every refusal.
+            // The unswept echo refused: a hole before it (no clock to partition by), or too few
+            // presses. Forgotten, like every refusal.
             action UnsweptMoveRefuses when (1 <= hole || older + younger <= Batch - 1) {
                 expired = expired + stale;
                 stale = 0;
@@ -2545,10 +2235,9 @@ pub fn echo_ledger_bridge_model() -> Model {
                 hole = 0;
                 just_refused = 1;
             }
-            // THE MOVE-SHAPED CLEARS: a non-typed licence, a row change, a
-            // hop that landed behind the mirror. The presses no longer
-            // describe the row under the hand, and the move re-anchors the
-            // mirror, so the hole is gone with them.
+            // Move-shaped clears (a non-typed licence, a row change, a hop that landed behind
+            // the mirror): the presses no longer describe the row, and the move re-anchors the
+            // mirror, so the hole goes with them.
             action LedgerForgotten when (1 <= older + younger + stale + hole) {
                 expired = expired + stale;
                 stale = 0;
@@ -2560,10 +2249,8 @@ pub fn echo_ledger_bridge_model() -> Model {
                 laid_hole = 0;
                 last_older = older;
             }
-            // THE IN-PLACE CLEARS: an erase, a kill, a focus loss. The
-            // presses are dropped (the stale ones as expired — the engine
-            // expires before it clears) but nothing moved the mirror, so the
-            // hole is exactly what it was.
+            // In-place clears (an erase, a kill, a focus loss): the presses are dropped (stale
+            // ones as expired), but nothing moved the mirror, so the hole stays.
             action LedgerClearedInPlace when (1 <= older + younger + stale) {
                 expired = expired + stale;
                 stale = 0;
@@ -2573,10 +2260,9 @@ pub fn echo_ledger_bridge_model() -> Model {
                 bridged_delta = 0;
                 laid_hole = 0;
             }
-            // A backward typed move — a retreat, a re-anchor, a rewrite
-            // landing left of its launch: not an echo's shape. The mirror
-            // moves; the fresh presses keep waiting, the stale ones are
-            // dropped (the engine expires before it looks at the shape).
+            // A backward typed move (a retreat, a re-anchor, a rewrite landing left of its
+            // launch) is not an echo's shape: the mirror moves, fresh presses keep waiting,
+            // stale ones are dropped (the engine expires before it looks at the shape).
             action RetreatKeepsPresses when (1 <= hole || 1 <= stale) {
                 expired = expired + stale;
                 stale = 0;
@@ -2596,11 +2282,9 @@ pub fn echo_ledger_bridge_model() -> Model {
             invariant OnePressOneCell:
                 older + younger + stale + spent + forfeited + expired == banked;
             invariant ExpiredPressesBuyNothing: stale_gone == expired + stale;
-            // The space, one variable per bound. The tallies' relations to
-            // `banked` are the conservation laws above (`OnePressOneCell`,
-            // `ExpiredPressesBuyNothing`, `NoBridgeOutsideALicensedMove`), and
-            // the ledger's live total is the press actions' guard.
-            invariant StateBounded:
+            // The space, one variable per bound; the tallies' relations to `banked` are the
+            // conservation laws above.
+            bound StateBounded:
                 older <= Depth && younger <= Depth && stale <= Depth
                     && hole <= Depth && banked <= BankCap
                     && spent <= BankCap + BankCap && forfeited <= BankCap
@@ -2612,21 +2296,15 @@ pub fn echo_ledger_bridge_model() -> Model {
     }
 }
 
-/// Cursor-owned pixels/cells live in the active viewport coordinate space.
-/// Entering retained history must immediately suppress the DEC cursor, both
-/// trail engines, every cursor body/companion overlay, and a later Retain
-/// projection must keep them dark. The resident pet brain still receives a
-/// hidden-caret tick and can settle its scheduler; presentation is suppressed,
-/// not lifecycle progress.
+/// Cursor-owned pixels and cells live in the active viewport's coordinates. Entering retained
+/// history suppresses the DEC cursor, both trail engines and every cursor body and companion
+/// overlay, and a later Retain projection keeps them dark. The hidden pet brain still gets a
+/// tick and can settle its scheduler: presentation is suppressed, not lifecycle progress.
 ///
-/// `Buggy=1` reproduces the former `cur=None` implementation: resident trail
-/// geometry and cursor companions remain projected over unrelated history,
-/// while the hidden pet lifecycle receives no progress and can strand its
-/// frame cadence. "No progress" is modelled literally: the hidden brain gets no
-/// tick on entry (`HiddenPetLifecycleProgresses`), and a brain that is never
-/// ticked never settles, so `SettleHistoryBrain` does not fire at `Buggy=1` and
-/// the stuck scheduler is written where the tick was withheld
-/// (`HiddenSchedulerNeverSticks`).
+/// `Buggy=1` keeps trail geometry and companions projected over unrelated history and withholds
+/// the hidden brain's tick (`HiddenPetLifecycleProgresses`); an unticked brain never settles, so
+/// `SettleHistoryBrain` cannot fire and the stuck scheduler is recorded where the tick was
+/// withheld (`HiddenSchedulerNeverSticks`).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn cursor_viewport_lifecycle_model() -> Model {
@@ -2711,7 +2389,7 @@ pub fn cursor_viewport_lifecycle_model() -> Model {
                     pet_brain_ticked <= 1
                 };
             invariant HiddenSchedulerNeverSticks: scheduler_stuck == 0;
-            invariant CursorViewportValuesBounded:
+            bound CursorViewportValuesBounded:
                 live_viewport <= 1 && glow_visible <= 1 && trail_visible <= 1
                     && cursor_body_visible <= 1 && pet_visible <= 1
                     && base_cursor_visible <= 1 && pet_brain_pending <= 1
@@ -2720,38 +2398,27 @@ pub fn cursor_viewport_lifecycle_model() -> Model {
     }
 }
 
-/// Resident cursor-pet coordinates are owned by one front terminal surface.
-/// A pane/tab owner change, a same-terminal main/alternate-screen change, or a
-/// focus loss that leaves cursor effects truly unpresentable retires both the
-/// visible body and its host-owned hit target.
-/// The pet's durable identity survives so the next lawful sighting uses the
-/// same companion. Raw focus loss is not itself a retirement proof: a live
-/// typed-wake or recording pin keeps the same presentation surface admitted.
-/// What the NEXT frame draws is `PetSurfaceSeam`'s law: an owner switch
-/// crossfades from a non-interactive ghost of the old body, drawn only at the
-/// very pixels it occupied, never moved and never a hit target.
+/// Resident cursor-pet coordinates are owned by one front terminal surface. A pane or tab owner
+/// change, a main/alternate-screen change, or a focus loss that leaves cursor effects truly
+/// unpresentable retires both the visible body and its host-owned hit target, while the pet's
+/// durable identity survives for the next sighting. Raw focus loss is not a retirement proof: a
+/// live typed-wake or recording pin keeps the surface admitted. What the next frame draws is
+/// `PetSurfaceSeam`'s law (an owner switch crossfades from a non-interactive ghost of the old
+/// body, at the pixels it occupied).
 ///
-/// `Buggy = 1` reproduces the retained-coordinate defect: retiring boundaries
-/// keep the old body and hit target, allowing them to jump into a replacement
-/// pane/tab or remain interactable after presentation has stopped.
+/// Only the resident `PetBrain` body and the GUI's paired hit target are projected. `Buggy = 1`
+/// keeps the old body and hit target across retiring boundaries (so they jump into a
+/// replacement pane or stay interactable), and also over-repairs the pinned blurs: typed-wake
+/// and recording focus losses rebuild the brain (`PetBrain::default()`) where
+/// `PetBrain::retire_coordinate_space` would carry the identity. That hides a body the pin still
+/// presents (`PresentationPinsPreserveTheSighting`) and drops the identity
+/// (`DurableIdentitySurvives`): `prepare_resident_pet_tick` re-applies the species from config,
+/// but nothing restores the worn look, contentment, disposition and lifetime clocks. The Tier-1
+/// projection reads the species at the blur itself, and the negative control replays the
+/// rebuild on the real window.
 ///
-/// This model projects only the resident `PetBrain` body and the GUI's paired
-/// hit target. `Buggy = 1` also carries the over-repair on the pinned blurs, so
-/// the repair cannot be "retire on every raw blur": the typed-wake and recording
-/// focus losses retire too, by rebuilding the resident brain
-/// (`PetBrain::default()`) where `PetBrain::retire_coordinate_space` would carry
-/// the durable identity across. That hides a body the pin still presents
-/// (`PresentationPinsPreserveTheSighting`) and drops the identity
-/// (`DurableIdentitySurvives`). The drop is not all transient: the species is
-/// re-applied from config by `prepare_resident_pet_tick` on the next tick, but
-/// nothing re-applies the worn look, earned contentment, disposition and
-/// lifetime clocks the carry exists for. The Tier-1 projection reads the
-/// species at the blur itself, before any tick, and the negative control
-/// replays the rebuild on the real window.
-///
-/// The ordinary flying cursor cat has a distinct earned/promise
-/// lifecycle; its owner-switch retirement is a separately asserted host rule
-/// in the Tier-1 GUI regression, not one of these variables.
+/// The ordinary flying cursor cat has its own earned/promise lifecycle; its owner-switch
+/// retirement is a separate host rule in the Tier-1 GUI regression.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn cursor_companion_owner_lifecycle_model() -> Model {
@@ -2759,8 +2426,7 @@ pub fn cursor_companion_owner_lifecycle_model() -> Model {
         CursorCompanionOwnerLifecycle {
             const Buggy = 0;
             var phase = 0;
-            // The model begins with a configured durable identity but no
-            // surface-relative sighting. 1 means that identity is retained.
+            // A configured durable identity, no surface-relative sighting yet.
             var durable_identity = 1;
             var pet_visible = 0;
             var hit_target = 0;
@@ -2816,19 +2482,17 @@ pub fn cursor_companion_owner_lifecycle_model() -> Model {
                     phase <= 7
                 };
             invariant DurableIdentitySurvives: durable_identity == 1;
-            invariant CompanionOwnerValuesBounded:
+            bound CompanionOwnerValuesBounded:
                 phase <= 7 && pet_visible <= 1 && hit_target <= 1
                     && durable_identity <= 1;
         }
     }
 }
 
-/// A composed frame owns one DEC-2026 hold machine per visible terminal. One
-/// pane completing its bracket cannot release a sibling pane whose bracket is
-/// still incomplete; only a frame where every member releases may present.
-///
-/// `Buggy = 1` is the retired aggregate-counter defect: the first pane close
-/// presents the composite even though the other pane remains held.
+/// A composed frame owns one DEC-2026 hold machine per visible terminal. One pane completing its
+/// bracket cannot release a sibling whose bracket is still open; only a frame where every member
+/// releases may present. `Buggy = 1` is an aggregate counter: the first pane close presents the
+/// composite while the other pane is held.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn composed_sync_hold_model() -> Model {
@@ -2878,37 +2542,30 @@ pub fn composed_sync_hold_model() -> Model {
                 } else {
                     presented <= 1
                 };
-            invariant ComposedSyncValuesBounded:
+            bound ComposedSyncValuesBounded:
                 phase <= 5 && a_hold <= 1 && b_hold <= 1 && presented <= 1;
         }
     }
 }
 
-/// A DEC-2026 close edge licenses the last completed episode for presentation.
-/// If the terminal immediately opens a new episode, that completed boundary may
-/// remain visible while the new episode is still clean. The first completed
-/// parser action in the reopened episode sets `open_dirty`; from that point the
-/// host must hold the partial episode until its matching close.
+/// A DEC-2026 close edge licenses the last completed episode for presentation. If the terminal
+/// at once opens a new episode, that completed boundary may stay visible while the new episode
+/// is clean; the first completed parser action in the reopened episode sets `open_dirty`, and
+/// from then the host holds the partial episode until its matching close.
 ///
-/// `Buggy = 1` is the close/reopen race that treats the close sequence alone as
-/// a presentation license. It keeps presenting after the reopened episode has
-/// become dirty, exposing cells that belong to an incomplete synchronized
-/// update (`DirtyReopenHoldsUntilClose`). The opposite, older error is an
-/// ALTERNATIVE hold rule, not a second half of the same one, so `Buggy = 1`
-/// picks it per trace (`PickLevelHold` sets `level_fault`, which `Buggy = 0`
-/// pins to zero): a LEVEL-sampled hold, which reads a close+reopen as one
-/// endless episode and holds the clean reopen and the dirty episode alike, so
-/// the completed boundary never presents and a flooding TUI
-/// pins presents to the sync timeout (`CleanReopenMayPresentCompletedBoundary`).
+/// `Buggy = 1` picks one of two wrong hold rules per trace (`PickLevelHold` sets `level_fault`,
+/// pinned to zero at `Buggy = 0`): the close sequence alone as a presentation license, which keeps
+/// presenting after the reopened episode turns dirty (`DirtyReopenHoldsUntilClose`), or a
+/// level-sampled hold, which reads a close+reopen as one endless episode, never presents the
+/// completed boundary and pins a flooding TUI's presents to the sync timeout
+/// (`CleanReopenMayPresentCompletedBoundary`).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn sync_reopen_visibility_model() -> Model {
     crate::ty_model! {
         SyncReopenVisibility {
             const Buggy = 0;
-            // Begin inside a dirty first episode. The modeled close/reopen edge
-            // is the exact boundary at which the stale close-sequence-only
-            // license used to lose track of the new episode's writes.
+            // Begin inside a dirty first episode, just before the close/reopen edge.
             var phase = 0;
             var sync_active = 1;
             var open_dirty = 1;
@@ -2920,8 +2577,7 @@ pub fn sync_reopen_visibility_model() -> Model {
             // license, 1 the level-sampled hold. Always 0 at `Buggy = 0`.
             var level_fault = 0;
 
-            // A stutter at `Buggy = 0`, so no action is dead at the committed
-            // config (the strict-vacuity rule for negative controls).
+            // A stutter at `Buggy = 0`, so no action is dead at the committed config.
             action PickLevelHold when (phase == 0 && level_fault == 0) {
                 level_fault = Buggy;
             }
@@ -2935,9 +2591,8 @@ pub fn sync_reopen_visibility_model() -> Model {
             action ReopenClean when (phase == 1) {
                 phase = 2;
                 sync_active = 1;
-                // The new episode has performed no presented mutation, so the
-                // completed close boundary remains a lawful frame. The level
-                // hold holds on the sampled level instead, and presents nothing.
+                // The new episode has made no presented mutation, so the completed close
+                // boundary is a lawful frame; the level hold holds and presents nothing.
                 hold = if level_fault == 1 { 1 } else { hold };
                 presented_generation = if level_fault == 1 { presented_generation } else { 1 };
             }
@@ -2973,7 +2628,7 @@ pub fn sync_reopen_visibility_model() -> Model {
                 } else {
                     phase <= 4
                 };
-            invariant SyncReopenValuesBounded:
+            bound SyncReopenValuesBounded:
                 phase <= 4 && sync_active <= 1 && open_dirty <= 1 && hold <= 1
                     && completed_generation <= 2 && presented_generation <= 2
                     && partial_visible <= 1;
@@ -2981,20 +2636,17 @@ pub fn sync_reopen_visibility_model() -> Model {
     }
 }
 
-/// Family-wide lifecycle for PTY scroll translation. `survivor_y` abstracts
-/// every position-bearing member whose translated anchor remains visible;
-/// `off_top_alive` abstracts every member that crosses the top boundary. The
-/// real Tier-1 fixtures seed every concrete CursorGlow pool (including tail,
-/// wake, future glide landing, and an outgoing fade) and every CursorTrail
-/// position field, assert their exact deltas, then project one survivor and one
-/// retired member from each engine onto this transition.
+/// Family-wide lifecycle for PTY scroll translation. `survivor_y` abstracts every
+/// position-bearing member whose translated anchor stays visible; `off_top_alive` every member
+/// that crosses the top. Tier-1 seeds every CursorGlow pool (tail, wake, glide landing, an
+/// outgoing fade) and every CursorTrail position field, asserts their exact deltas, and projects
+/// one survivor and one retired member from each engine onto this transition.
 ///
-/// `stale_proof_alive` covers an input proof whose row identity is invalidated
-/// by the same scroll fence (the plain-Backspace `(row, fill)` baseline and its
-/// one-shot poof hint). `Buggy=1` is the historical per-family omission: live
-/// geometry and stale provenance all remain in their pre-scroll state. The
-/// invariants separately catch a detached segment, an off-top segment, and a
-/// proof later reused against unrelated content at the same numeric row.
+/// `stale_proof_alive` is an input proof whose row identity the same scroll fence invalidates
+/// (the plain-Backspace `(row, fill)` baseline and its one-shot poof hint). `Buggy=1` leaves live
+/// geometry and stale provenance in their pre-scroll state; the invariants separately catch a
+/// detached segment, an off-top segment, and a proof reused against other content at the same
+/// row.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn cursor_effect_scroll_model() -> Model {
@@ -3029,33 +2681,24 @@ pub fn cursor_effect_scroll_model() -> Model {
     }
 }
 
-/// Host-side scroll observation at a retained-history cap. The terminal owns
-/// two cumulative, non-consuming clocks: `uniform_rows` for composable
-/// full-screen upward motion on either active screen and `epoch` for
-/// region/reset/restore mutations whose
-/// coordinates cannot be transformed as one plane. `retained_history` stays
-/// zero in every state, modeling both a zero-history terminal and a saturated
-/// ring whose public count no longer changes.
+/// Host-side scroll observation at a retained-history cap. The terminal owns two cumulative,
+/// non-consuming clocks: `uniform_rows` for composable full-screen upward motion on either
+/// screen and `epoch` for region, reset and restore mutations whose coordinates cannot be
+/// transformed as one plane. `retained_history` stays zero throughout, modelling both a
+/// zero-history terminal and a saturated ring whose public count no longer changes.
 ///
-/// `UniformAtCap` must still reach one exact translation and retire row-bound
-/// proof. `AltUniform` must make the same exact translation: changing active
-/// screen invalidates independently, but an in-screen full-grid shift is not
-/// ambiguous. Region, reset and in-place restore events must instead choose
-/// invalidation and drop all geometry/proof. `Buggy=1` infers motion from the
-/// unchanged retained count and preserves the stranded effect state.
+/// `UniformAtCap` and `AltUniform` reach one exact translation and retire row-bound proof
+/// (changing active screen invalidates on its own, but an in-screen full-grid shift is not
+/// ambiguous). Region, reset and in-place restore events invalidate and drop all geometry and
+/// proof. `Buggy=1` infers motion from the unchanged retained count and keeps the stranded state.
 ///
-/// `RegionBandMove` (event 6) is the THIRD answer, for the
-/// inline viewports Codex and friends stream through: the epoch still steps —
-/// `band_batches` counts it as a SUBSET, so every consumer that cannot
-/// translate bands still reads "discard" — but the whole row motion of that
-/// batch is one exact `RowBandMove`, so the host translates the band's light
-/// DOWN by `Delta` (`survivor_y == StartY + Delta`: a region scroll down, the
-/// reverse index a streamed transcript line writes) and keeps its geometry
-/// alive. Row-bound PROOF still dies: the rows inside the band hold different
-/// content than the bytes that proof was measured against. `Buggy=1` is
-/// `decision = 2` for this event and every mark
-/// destroyed, the per-line reset the owner reported as "the rainbow
-/// disappears".
+/// `RegionBandMove` (event 6) is the third answer, for the inline viewports Codex and others
+/// stream through: the epoch still steps (`band_batches` counts it as a subset, so a consumer
+/// that cannot translate bands still discards), but the batch's whole row motion is one exact
+/// `RowBandMove`, so the host translates the band's light down by `Delta` (a region scroll
+/// down, the reverse index a streamed transcript line writes) and keeps its geometry. Row-bound
+/// proof still dies, since the band's rows hold different content. `Buggy=1` invalidates
+/// (`decision = 2`) and destroys every mark, so the rainbow disappears on each streamed line.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn cursor_scroll_signal_model() -> Model {
@@ -3155,33 +2798,21 @@ pub fn cursor_scroll_signal_model() -> Model {
     }
 }
 
-/// THE LANDING POOL — the v2 rainbow kitty's bounded FIFO of landings
+/// The landing pool: the rainbow kitty's bounded FIFO of landings
 /// (`rainbow_kitty::meteor::Meteors::landings`, `LANDING_POOL` = 3).
 ///
-/// Every arrival is ADMITTED, from either of its two sites: a meteor's arrival
-/// edge in `Meteors::emit`, and a ringing bar of the sing-along party in
-/// `Meteors::party`. At capacity the OLDEST landing is evicted to make the room,
-/// so the pool always holds exactly the latest arrivals, contiguous in arrival
-/// order: the jump the user just made always lands. Every landing lives the same
-/// 600 ms (`Landing::end`: the spark life and the ring's ceiling are both
-/// `FLIGHT_OFF_GLASS_MS`), so expiry takes the oldest first and never a newer
-/// one; `Meteors::reset` empties the pool.
+/// Every arrival is admitted, from either site: a meteor's arrival edge in `Meteors::emit` and
+/// a ringing bar of the sing-along party in `Meteors::party`. At capacity the oldest landing is
+/// evicted, so the pool holds exactly the latest arrivals in order and the jump the user just
+/// made always lands. Every landing lives the same 600 ms (`Landing::end`; the spark life and the
+/// ring's ceiling are both `FLIGHT_OFF_GLASS_MS`), so expiry takes the oldest first;
+/// `Meteors::reset` empties the pool. `Buggy=1` drops the arrival when saturated
+/// (`if len < LANDING_POOL { push }`), so the newest jump lands with no impact.
 ///
-/// `Buggy=1` is the eviction regression the admission guards: a saturated pool
-/// DROPS the arrival (`if len < LANDING_POOL { push }`) instead of the oldest, so
-/// the newest jump lands with no impact while three stale ones finish.
-///
-/// Tier-1: `rainbow_kitty::meteor::tests::the_landing_pool_conforms_to_the_model`
-/// walks this model's whole reachable space on a real `Meteors` — real flights
-/// landing through `emit`, real ring bars through `party`, real expiry through
-/// `emit`'s retain at the oldest landing's own end, real `reset` — projecting the
-/// pool's length and the arrival ordinals of its first and last landings, and
-/// rejects the drop-the-arrival mutant at each admission site.
-///
-/// (The v1 model of the burst ring this replaces, `RainbowJumpBurstLifecycle`,
-/// also moved a style-fade payload into a ghost owner; v2 has no fade transfer,
-/// so that half is gone, and the retired model survives only as
-/// `ty_checker_canary.rs`'s fixture.)
+/// Tier-1: `rainbow_kitty::meteor::tests::the_landing_pool_conforms_to_the_model` walks the whole
+/// reachable space on a real `Meteors` (flights through `emit`, ring bars through `party`, expiry
+/// through `emit`'s retain, real `reset`), projecting the pool's length and its first and last
+/// arrival ordinals, and rejects the drop-the-arrival mutant at each admission site.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn rainbow_landing_pool_model() -> Model {
@@ -3227,45 +2858,30 @@ pub fn rainbow_landing_pool_model() -> Model {
                 } else {
                     newest == 0 && oldest == 0
                 };
-            // The space, not the design: `newest`/`oldest` need no bound of their
-            // own — `HoldsTheLatestArrivals` pins both to `issued`.
-            invariant StateBounds: resident <= Cap && issued <= MaxIssued;
+            // `newest`/`oldest` need no bound: `HoldsTheLatestArrivals` pins both to `issued`.
+            bound StateBounds: resident <= Cap && issued <= MaxIssued;
         }
     }
 }
 
-// ===========================================================================
-// Generalized error-CLASS models (audit findings F1, ordering, reply-fidelity).
-// These teach Trust to catch the *classes* the second bug-hunt surfaced — not
-// just the specific bugs — so a future regression of the same shape fails the
-// exhaustive `ty` check. Same Buggy convention as the safety models above.
-// ===========================================================================
+// Error-class models: information flow, ordering and reply fidelity, each a property class a
+// future regression of the same shape fails.
 
-/// CAPABILITY SECRECY / information-flow (audit finding F1). A bearer-token SECRET
-/// must reach a SANDBOXED same-uid peer (one that cannot read 0600 files) only if
-/// it is placed in an INHERITABLE env sink; routed through a 0600 file it must not.
-/// `published` is the channel (0 none, 1 file, 2 env); `peer_has` is whether the
-/// sandboxed peer obtained the secret. `Buggy = 1` chooses the env channel (the
-/// original design); `Buggy = 0` the 0600-file channel (the F1 fix).
+/// Capability secrecy (information flow): a bearer-token secret in an inheritable env sink
+/// reaches a sandboxed same-uid peer (one that cannot read 0600 files); one routed through a
+/// 0600 file does not. `published` is the channel (0 none, 1 file, 2 env); `peer_has` whether the
+/// sandboxed peer obtained the secret. `Buggy = 1` chooses the env channel.
+/// `NoSecretToSandboxedPeer`: the sandboxed peer never holds the token.
 ///
-/// Invariant `NoSecretToSandboxedPeer`: the sandboxed peer never holds the token.
-/// `ty` proves it for the file channel and catches the env-channel disclosure —
-/// a genuinely new property CLASS: explicit information flow of a secret to an
-/// untrusted sink.
-///
-/// Tier-1 binding: aterm-gui's
-/// `spawn::capability_secrecy_conformance` drives the real provisioning
-/// (`spawn::provision_child_proxy`) with a private socket dir and with none,
-/// reads `published` off the env it produced against the secrets the proxy
-/// table registered, and validates the real `Provision` (the file channel exactly
-/// when there is a private dir). `SandboxedRead` follows from the channel by this
-/// model's own definition, so the channel is what is bound. Binding it found
-/// the code short of the model: with no private dir, or a file it could not
-/// write, it fell back to the env channel. That fallback is deleted; the
-/// provisioning now fails closed.
-// Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
-// models above) — the MODEL it returns is what `ty` machine-checks.
+/// Tier-1: aterm-gui's `spawn::capability_secrecy_conformance` drives
+/// `spawn::provision_child_proxy` with a private socket dir and with none, reads `published` off
+/// the env it produced against the secrets the proxy table registered, and validates the real
+/// `Provision` (the file channel exactly when there is a private dir; with none, or a file it
+/// cannot write, provisioning fails closed). `SandboxedRead` follows from the channel by
+/// definition, so the channel is what is bound.
+// Skip (T2 vcgen-budget lane): a model data constructor; `ty` checks the model it returns.
 #[cfg_attr(trust_verify, trust::skip)]
+#[crate::model]
 pub fn capability_secrecy_model() -> Model {
     props::two_stage_leak(props::TwoStage {
         name: "CapabilitySecrecy",
@@ -3274,7 +2890,7 @@ pub fn capability_secrecy_model() -> Model {
         stage: "published",
         stage_act: "Provision",
         stage_rhs: if_(eq(cst("Buggy"), int(1)), int(2), int(1)),
-        // A sandboxed peer obtains the secret ONLY from the env channel (2).
+        // A sandboxed peer obtains the secret only from the env channel (2).
         leak: "peer_has",
         leak_act: "SandboxedRead",
         leak_guard: gt(var("published"), int(0)),
@@ -3284,25 +2900,19 @@ pub fn capability_secrecy_model() -> Model {
     })
 }
 
-/// PUBLISH ORDERING (the graph-entry-before-bind race). A discovery entry must be
-/// published only AFTER the socket is bound, so a concurrent stale-sweep can never
-/// see an entry pointing at a not-yet-bound socket and delete it. `Buggy = 1`
-/// publishes before binding (the original main-thread write); `Buggy = 0` requires
-/// `bound` first (publish from inside `spawn` after `bind`).
+/// Publish ordering: a discovery entry is published only after its socket is bound, so a
+/// concurrent stale sweep never sees an entry naming an unbound socket and deletes it.
+/// `Buggy = 1` publishes before binding. `PublishImpliesBound`: `published ⟹ bound`.
 ///
-/// Invariant `PublishImpliesBound`: `published ⟹ bound`. `ty` proves the ordered
-/// discipline and catches the pre-bind publish. The shipping order is structural:
-/// aterm-gui's `control::publish_discovery` consumes the `BoundControl` only the
-/// bind produces, names the socket it was bound at, and hands back the listener
-/// `control::spawn` serves on — so publishing first, naming another socket, or
-/// serving without publishing are compile errors there. Tier-1: aterm-gui's
-/// `publish_ordering_conformance` projects each real entry (on disk? does the
-/// socket it names answer a dial?) through the real bind, publication,
-/// register-seam publish and stale sweep; the pre-bind write is the step it
-/// rejects, and the real sweep deletes that entry.
-// Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
-// models above) — the MODEL it returns is what `ty` machine-checks.
+/// The shipping order is structural: aterm-gui's `control::publish_discovery` consumes the
+/// `BoundControl` only the bind produces, names the socket it was bound at, and hands back the
+/// listener `control::spawn` serves on, so publishing first, naming another socket, or serving
+/// without publishing do not compile. Tier-1: `publish_ordering_conformance` projects each real
+/// entry (on disk? does its socket answer a dial?) through the real bind, publication,
+/// register-seam publish and stale sweep; the pre-bind write is the step it rejects.
+// Skip (T2 vcgen-budget lane): a model data constructor; `ty` checks the model it returns.
 #[cfg_attr(trust_verify, trust::skip)]
+#[crate::model]
 pub fn publish_ordering_model() -> Model {
     props::happens_before(props::Ordering {
         name: "PublishOrdering",
@@ -3314,26 +2924,17 @@ pub fn publish_ordering_model() -> Model {
     })
 }
 
-/// REPLY FIDELITY (the ERR-after-delivery defect). Once a forwarded verb has been
-/// DELIVERED to the child, a later relay-stage failure must NOT report `ERR` to
-/// the client (a false "didn't happen" for an op that did). `delivered` and
-/// `reported_err` are booleans. A failure BEFORE delivery — the dial, a
-/// sibling's token that cannot be read once the connection exists, or the
-/// handshake write — is reported (`DialFail`: the honest `ERR forward`), and
-/// nothing is delivered after it. `Buggy = 1` reports a relay failure after
-/// delivery (the original `connect_and_relay` returning the relay error),
-/// `Buggy = 0` swallows it (return Ok once delivered — the fix).
+/// Reply fidelity: once a forwarded verb has been delivered to the child, a later relay-stage
+/// failure does not report `ERR` to the client (a false "didn't happen" for an op that did). A
+/// failure before delivery (the dial, a sibling's token unreadable once connected, the handshake
+/// write) is reported as `DialFail`, the honest `ERR forward`. `Buggy = 1` reports a relay failure
+/// after delivery. `NoErrorAfterDelivery`: never both delivered and error-reported.
 ///
-/// Invariant `NoErrorAfterDelivery`: never both delivered AND error-reported.
-///
-/// Tier-1: aterm-gui's `reply_fidelity_conformance` drives the shipping
-/// `proxy::deliver_then_relay` against a real child socket — the real relay, a
-/// relay that fails after delivery, a dial with no listener, a child that
-/// never accepts, and a sibling with no token to present — projecting
-/// `delivered` from what the child actually read and `reported_err` from the
-/// result the caller turns into `ERR forward`.
-// Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
-// models above) — the MODEL it returns is what `ty` machine-checks.
+/// Tier-1: aterm-gui's `reply_fidelity_conformance` drives `proxy::deliver_then_relay` against a
+/// real child socket (the real relay, a relay that fails after delivery, a dial with no listener,
+/// a child that never accepts, a sibling with no token), projecting `delivered` from what the
+/// child read and `reported_err` from the result the caller turns into `ERR forward`.
+// Skip (T2 vcgen-budget lane): a model data constructor; `ty` checks the model it returns.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn reply_fidelity_model() -> Model {
     crate::ty_model! {
@@ -3351,32 +2952,22 @@ pub fn reply_fidelity_model() -> Model {
     }
 }
 
-/// **A FLICKERING PROGRAM NEVER TAKES THE CURSOR** — the anti-flap law of the
-/// cursor companion's tenure gate, which is what stands between the user and a
-/// cat that changes identity every time a command block opens and closes.
+/// A flickering program never takes the cursor: the anti-flap law of the cursor companion's
+/// tenure gate, which keeps the cat from changing identity every time a command block opens
+/// and closes.
 ///
-/// `KittyTenure::observe` is a DWELL gate: a claim that differs from the one on
-/// glass becomes a CANDIDATE, and it lands only once it has held for
-/// `dwell_for` (TENURE to arrive, RELEASE to fall back). The load-bearing arm
-/// is the `_` one — any observation that does not match the standing candidate
-/// RESTARTS it at `now`. So a pane whose claim alternates never accumulates
-/// dwell, and the cat does not move.
+/// `KittyTenure::observe` is a dwell gate: a claim that differs from the one on glass becomes a
+/// candidate and lands only once it has held for `dwell_for` (`TENURE` to arrive, `RELEASE` to
+/// fall back). The load-bearing arm is `_`: an observation that does not match the standing
+/// candidate restarts it at `now`, so an alternating claim never accumulates dwell.
 ///
-/// This model is the flicker SCENARIO and nothing else: `last` forces the two
-/// observations to alternate, so every trace in the state space is a flicker,
-/// and the invariant is simply that the worn identity never changes. `Buggy = 1`
-/// is the pre-tenure behaviour — land the raw claim at once — and it breaks the
-/// law on the very first observation.
-///
-/// What it does NOT model, deliberately: the steady case, where a program that
-/// really does hold the pane lands after `Tenure` and the identity SHOULD
-/// change once. Mixing the two would need the invariant to be about a rate
-/// rather than a count, and a rate invariant that has to be true of both
-/// scenarios ends up asserting less than either. The steady arm is covered by
-/// `aterm_effects::companion_look`'s own tests, which drive the real gate across `TENURE`.
+/// This is the flicker scenario only: `last` forces the two observations to alternate, and the
+/// invariant is that the worn identity never changes. `Buggy = 1` lands the raw claim at once.
+/// The steady case (a program that holds the pane lands after `Tenure`, changing the identity
+/// once) is left out: covering both would need a rate invariant, which asserts less than either
+/// count. `aterm_effects::companion_look`'s own tests drive the real gate across `TENURE`.
 #[must_use]
-// Skip (T2 vcgen-budget lane): a spec-model DATA constructor — the MODEL it
-// returns is what `ty` machine-checks.
+// Skip (T2 vcgen-budget lane): a model data constructor; `ty` checks the model it returns.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn companion_tenure_flicker_model() -> Model {
     crate::ty_model! {
@@ -3390,9 +2981,8 @@ pub fn companion_tenure_flicker_model() -> Model {
             var last = 0;       // 0 = the last observation was `none`, 1 = a program
             var steps = 0;      // run bound
 
-            // The pane reports a program executing. Alternation is forced by
-            // `last`, so this is the flicker a command block opening puts on
-            // the gate, never a steady claim.
+            // The pane reports a program executing; `last` forces alternation, so this is
+            // the flicker of a command block opening, never a steady claim.
             action SeeProgram when (steps <= 7 && last == 0) {
                 steps = steps + 1;
                 last = 1;
@@ -3430,7 +3020,7 @@ pub fn companion_tenure_flicker_model() -> Model {
                                else { 0 } };
             }
 
-            // THE LAW: across a whole flicker storm, the cat does not move.
+            // Across a whole flicker storm, the cat does not move.
             invariant FlickerNeverLands: changes == 0;
         }
     }

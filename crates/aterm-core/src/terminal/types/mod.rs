@@ -2,21 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Terminal type definitions.
-//!
-//! Public types (CursorStyle, TerminalSize, etc.) live in the `aterm-types`
-//! crate. `CurrentStyle` and `SavedCursorState` live in `aterm-grid` (they
-//! depend on grid primitives). This module re-exports all of them.
-
-// ============================================================================
-// Re-exports from aterm-grid
-// ============================================================================
+//! Terminal type definitions. Public types live in `aterm-types`, and `CurrentStyle` /
+//! `SavedCursorState` in `aterm-grid`; this module re-exports them.
 
 pub use crate::grid::{CurrentStyle, SavedCursorState};
-
-// ============================================================================
-// Public re-exports from aterm-types
-// ============================================================================
 
 pub use aterm_types::TerminalModes;
 pub use aterm_types::mouse::MouseEncoding;
@@ -24,19 +13,8 @@ pub use aterm_types::mouse::MouseMode;
 pub use aterm_types::osc::Iterm2ShellIntegrationVersion;
 pub use aterm_types::{ClipboardOperation, ClipboardSelection, CursorStyle, TerminalSize};
 
-// ============================================================================
-// Terminal-only State Types
-// ============================================================================
-
-/// Bitmask for selective XTPUSHSGR attribute tracking.
-///
-/// Per xterm spec, `CSI # { Ps...` can selectively push only specific
-/// SGR attributes. These flags track which attributes were saved.
-///
-/// Supported Ps values (per xterm ctlseqs):
-/// 1/2=bold+dim, 3=italic, 4/21=underline, 5=blink, 7=inverse,
-/// 8=invisible, 9=strikethrough, 30/31/38/39=foreground,
-/// 40/41/48/49=background, 53=overline.
+/// Bitmask of the SGR attribute groups a selective XTPUSHSGR (`CSI # { Ps…`) saved;
+/// [`Self::from_params`] maps the xterm Ps values.
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct SgrPushMask(u16);
 
@@ -121,28 +99,19 @@ impl SgrPushMask {
     }
 }
 
-/// SGR attribute stack entry for XTPUSHSGR/XTPOPSGR (`CSI # {` / `CSI # }`).
-/// A selective push (`CSI # { 1 ; 30`) saves and restores only the
-/// attributes in `mask`.
+/// SGR attribute stack entry for XTPUSHSGR/XTPOPSGR (`CSI # {` / `CSI # }`); a selective
+/// push (`CSI # { 1 ; 30`) saves and restores only the attributes in `mask`.
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct SgrStackEntry {
     /// Current style attributes (fg, bg, flags, protected).
     pub style: CurrentStyle,
-    /// Underline color (SGR 58), stored as 0x01_RRGGBB or None.
+    /// Underline color (SGR 58), raw: `0x01_RRGGBB` RGB or `0x02_0000NN` indexed.
     pub underline_color: Option<u32>,
     /// Which attributes were selectively pushed. `ALL` if no params given.
     pub mask: SgrPushMask,
 }
 
-// ============================================================================
-// Crate-internal re-exports
-// ============================================================================
-
 pub(crate) use aterm_types::osc::RemoteHost;
-
-// ============================================================================
-// Terminal-internal re-exports (only used within terminal/)
-// ============================================================================
 
 pub(super) use aterm_types::TerminalCapabilities;
 pub(super) use aterm_types::osc::{Notification, TaskbarProgress};

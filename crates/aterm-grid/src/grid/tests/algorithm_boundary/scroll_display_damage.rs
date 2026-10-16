@@ -12,7 +12,6 @@ use super::*;
 fn scroll_display_up_marks_top_rows_dirty() {
     let mut grid = Grid::with_scrollback(10, 10, 50);
 
-    // Generate scrollback
     for _ in 0..20 {
         grid.set_cursor(9, 0);
         grid.write_char('X');
@@ -37,7 +36,6 @@ fn scroll_display_up_marks_top_rows_dirty() {
             "row {row} should be dirty after scroll_display up by 3"
         );
     }
-    // Rows below the scroll delta should not be dirty
     for row in 3..10u16 {
         assert!(
             !grid.damage().is_row_damaged(row),
@@ -51,7 +49,6 @@ fn scroll_display_up_marks_top_rows_dirty() {
 fn scroll_display_down_marks_bottom_rows_dirty() {
     let mut grid = Grid::with_scrollback(10, 10, 50);
 
-    // Generate scrollback
     for _ in 0..20 {
         grid.set_cursor(9, 0);
         grid.write_char('X');
@@ -79,7 +76,6 @@ fn scroll_display_down_marks_bottom_rows_dirty() {
             "row {row} should be dirty after scroll_display down by 3"
         );
     }
-    // Rows above the scroll delta should not be dirty
     for row in 0..7u16 {
         assert!(
             !grid.damage().is_row_damaged(row),
@@ -93,7 +89,6 @@ fn scroll_display_down_marks_bottom_rows_dirty() {
 fn scroll_display_large_delta_marks_full_damage() {
     let mut grid = Grid::with_scrollback(5, 10, 100);
 
-    // Generate enough scrollback
     for _ in 0..30 {
         grid.set_cursor(4, 0);
         grid.write_char('X');
@@ -115,14 +110,12 @@ fn scroll_display_large_delta_marks_full_damage() {
 fn scroll_display_clamped_no_damage() {
     let mut grid = Grid::with_scrollback(5, 10, 50);
 
-    // Generate scrollback
     for _ in 0..10 {
         grid.set_cursor(4, 0);
         grid.write_char('X');
         grid.line_feed();
     }
 
-    // Scroll to max
     grid.scroll_to_top();
     let max = grid.display_offset();
 
@@ -170,7 +163,6 @@ fn content_scroll_delta_set_by_scroll_up_and_consumed() {
     }
     grid.clear_damage();
 
-    // Trigger scroll
     grid.set_cursor(4, 0);
     grid.line_feed();
 

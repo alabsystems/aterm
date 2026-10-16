@@ -1,43 +1,31 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// A LIVE-HEAP PROFILER FOR WINDOWS, in-process, no window and no child process.
+// A live-heap profiler for Windows, in-process: a `#[global_allocator]` shim that keeps,
+// per allocation site, the bytes still live (the Windows twin of the `LD_PRELOAD`
+// interposer in `docs/measured/memory-footprint-2026-08-24.md` §2).
 //
-// This is the Windows twin of the `LD_PRELOAD` interposer the Linux memory note
-// (`docs/measured/memory-footprint-2026-08-24.md` §2) used: a `#[global_allocator]`
-// shim that keeps, per ALLOCATION SITE, the bytes that are still live.
+// What it sees:
+//   * every `alloc`/`realloc`/`dealloc` through Rust's global allocator: every
+//     `Vec`/`Box`/`HashMap`/`Arc` in aterm and the Rust crates it links;
+//   * for allocations >= `MIN_TRACK` bytes, the return-address stack
+//     (`RtlCaptureStackBackTrace`, symbolized through dbghelp at report time).
+//     Symbolization has failed on Windows (`SymInitializeW` returns 1 with
+//     `GetLastError` 0, then every `SymFromAddr` fails), so `report` prints raw
+//     addresses and sites are identified by count and size
+//     (`docs/measured/win-heap-2026-08-29.md` §1). Unresolved: check the build triple
+//     (a `*-windows-gnu` build carries DWARF, which dbghelp cannot read) and whether
+//     the test exe's PDB is found (else pass its directory as the search path);
+//   * exact live and peak byte totals for all sizes.
 //
-// WHAT IT SEES
-//   * every `alloc`/`realloc`/`dealloc` that goes through Rust's global allocator,
-//     which is every `Vec`/`Box`/`HashMap`/`Arc` in aterm and in every Rust crate
-//     it links (fontdue, ttf-parser, wgpu's Rust side, ...);
-//   * for allocations >= `MIN_TRACK` bytes, the return-address stack that made
-//     them (`RtlCaptureStackBackTrace`, symbolized through dbghelp at report
-//     time). SYMBOLIZATION FAILED on the one Windows box it ran on
-//     (`SymInitializeW` returns 1 with `GetLastError` 0, then every `SymFromAddr`
-//     fails), so `report` prints raw addresses and sites are identified by
-//     allocation COUNT and SIZE against a known file table
-//     (`docs/measured/win-heap-2026-08-29.md` §1). EXTERNAL — needs a Windows
-//     host to diagnose: first check the build's triple (a `*-windows-gnu` build
-//     carries DWARF, which dbghelp cannot read — resolve through `gimli` there)
-//     and whether the test exe's PDB is found (else pass the exe's directory as
-//     `SymInitializeW`'s search path).
-//   * exact live/peak byte totals for ALL sizes (the sub-threshold ones are
-//     counted, just not attributed).
+// What it cannot see: anything outside Rust's global allocator (direct
+// `HeapAlloc`/`VirtualAlloc`/`malloc` from C/C++ libraries such as the D3D12 runtime,
+// the driver and DirectWrite; thread stacks; module images; file mappings), i.e. the
+// GPU stack and most of the OS footprint. Live bytes and working set are both
+// reported, so the allocator's retained-but-free arena shows as the gap.
 //
-// WHAT IT CANNOT SEE
-//   * anything that does not go through Rust's global allocator: direct
-//     `HeapAlloc`/`VirtualAlloc`/`malloc` from a C or C++ library (the D3D12
-//     runtime, the AMD driver, DirectWrite), thread stacks, loaded module images,
-//     and any file mapping. That is the whole GPU stack and most of the OS's own
-//     footprint. What remains is the application heap.
-//   * the difference between live bytes and working set. Both are reported so the
-//     allocator's own retained-but-free arena is visible as the gap (the Linux
-//     note's §14 finding was that gap, not the live bytes).
-//
-// One report per process: the working set never shrinks back on Windows either,
-// so a second measurement in the same process measures the first one's freed
-// arena and lies.
+// One report per process: the working set never shrinks back, so a second measurement
+// in the same process would measure the first one's freed arena.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -46,12 +34,9 @@ use std::ffi::c_void;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
-/// Allocations at least this large get a stack. Below it they are only counted.
-/// 512 B keeps the live map small and the capture cheap while still catching
-/// fontdue's per-glyph geometry (measured ~3.4 kB each on Linux) and every font
-/// file buffer. Everything under it is counted in the totals but not attributed,
-/// and `report` prints both so the unattributed remainder is always visible —
-/// measured at 1,917 kB of 80,006 kB (2.4%) on the full font-stack workload.
+/// Allocations at least this large get a stack; smaller ones are only counted, and
+/// `report` prints the unattributed remainder. 512 B keeps the live map small and the
+/// capture cheap while still catching every font file buffer.
 pub const MIN_TRACK: usize = 512;
 /// Return addresses captured per site.
 pub const FRAMES: usize = 16;
@@ -96,7 +81,7 @@ unsafe extern "system" {
     ) -> i32;
 }
 
-/// Process working set in kB — the same counter the GPU memory-floor work used.
+/// Process working set in kB.
 #[must_use]
 pub fn working_set_kb() -> u64 {
     let mut c = ProcessMemoryCounters {
@@ -459,13 +444,12 @@ fn resolve(addr: usize) -> String {
     format!("{name}{where_}")
 }
 
-/// Print the top `top` allocation sites by LIVE bytes, deepest frames first.
+/// Print the top `top` allocation sites by live bytes, deepest frames first.
 pub fn report(title: &str, top: usize) {
     stop();
-    // The bookkeeping lock is NOT reentrant, and everything below allocates:
-    // growing `rows` inside the locked block reallocs, which re-enters
-    // `book_dealloc`, which takes the same lock and deadlocks. `BUSY` is the
-    // same guard the alloc path uses; hold it for the whole report.
+    // The bookkeeping lock is not reentrant and everything below allocates (growing
+    // `rows` reallocs, re-entering `book_dealloc`, which would deadlock on the lock), so
+    // hold the alloc path's `BUSY` guard for the whole report.
     let outer = BUSY.with(|b| b.replace(true));
     let (mut rows, total_live, total_count) = {
         let st = lock();
@@ -523,12 +507,6 @@ pub fn report(title: &str, top: usize) {
     BUSY.with(|b| b.set(outer));
 }
 
-/// One priced line item: run `f`, report the live heap it LEAVES BEHIND.
-///
-/// This is the per-item twin of [`report`]: where the stack attribution says
-/// which call site allocated, this says what one named step costs, which is the
-/// number a fix is measured against. Both are needed — a step can be cheap and
-/// still hold a duplicate, and a site can be expensive and still be earned.
 /// [`bill`] without the printing: `(value, live delta kB, own-transient peak kB)`.
 pub fn measure<T>(f: impl FnOnce() -> T) -> (T, i64, i64) {
     let before = LIVE_BYTES.load(Ordering::Relaxed);
@@ -539,11 +517,14 @@ pub fn measure<T>(f: impl FnOnce() -> T) -> (T, i64, i64) {
     (out, (after - before) / 1024, (peak - before) / 1024)
 }
 
+/// One priced line item: run `f` and print the live heap it leaves behind, its own
+/// transient peak, the working-set delta and the time. Where [`report`] says which call
+/// site allocated, this says what one named step costs.
 pub fn bill<T>(label: &str, f: impl FnOnce() -> T) -> T {
     let before = LIVE_BYTES.load(Ordering::Relaxed);
     let ws_before = working_set_kb();
-    // Re-arm the high-water mark at the CURRENT level, so the third column is
-    // this step's own transient rather than the whole process's history.
+    // Re-arm the high-water mark at the current level, so the peak column is this
+    // step's own transient.
     PEAK_BYTES.store(before, Ordering::Relaxed);
     let t0 = std::time::Instant::now();
     let out = f();

@@ -4,17 +4,13 @@
 //! One writer owns where the body is.
 //!
 //! The caret's escort is the pet's own locomotion (the chase and the flight,
-//! continuous and speed-limited). The console observation layer's only
-//! placement role is moving a body off a surface it may not occupy (a
-//! selection, an image, a row with no certified cell-to-pixel projection), or
-//! not drawing it. It must never relocate a body for being far from the caret:
-//! a second writer closing that distance in one frame fights the escort, and
-//! the sprite sweeps out and snaps back while output prints.
-//!
-//! The oracle is the pet itself, as in `pet_escort_primacy`:
-//! `set_console_presentable(false)` returns every console entry point early,
-//! so a twin brain with it off is the plain escort. Streaming output must not
-//! tell the two apart.
+//! continuous and speed-limited). The console layer's only placement role is moving
+//! a body off a surface it may not occupy (a selection, an image, a row with no
+//! certified cell-to-pixel projection), or not drawing it; it never relocates a body
+//! for being far from the caret, which would fight the escort and snap the sprite
+//! out and back while output prints. The oracle is a twin brain with
+//! `set_console_presentable(false)`, as in `pet_escort_primacy`: streaming output
+//! must not tell the two apart.
 
 use std::time::{Duration, Instant};
 
@@ -28,9 +24,9 @@ const COLS: u16 = 80;
 const CELL_W: u16 = 8;
 const CELL_H: u16 = 16;
 
-/// A single-frame displacement this large is not locomotion. The chase is
-/// speed-limited and the flight is a schedule; neither can cross two cells
-/// between two 16 ms frames at the paces this crate ships.
+/// A single-frame displacement this large is not locomotion: the chase is
+/// speed-limited and the flight is a schedule, so neither crosses two cells between
+/// two 16 ms frames.
 const TELEPORT: f32 = 2.0;
 
 struct Scene {
@@ -40,7 +36,7 @@ struct Scene {
 }
 
 impl Scene {
-    /// `presentable == false` is the v0.76.0 escort with no console layer.
+    /// `presentable == false` is the plain escort, with no console layer.
     fn new(presentable: bool, home: &[u8]) -> Self {
         let mut term = Terminal::new(ROWS, COLS);
         term.process(b"\x1b]11;#000000\x07");
@@ -88,8 +84,8 @@ fn body(frame: PetFrame) -> Option<PetRect> {
         })
 }
 
-/// One sample of the thing the owner is describing: where the sprite is,
-/// where the caret is, and what the console layer said about it.
+/// One frame's sample: where the sprite is, where the caret is, and what the console
+/// layer said.
 struct Sample {
     frame: u32,
     col: f32,
@@ -180,9 +176,8 @@ fn streaming_output_never_teleports_the_body() {
     );
 }
 
-/// The same seen through the reason string: `cursor-home` claims the escort's
-/// body; `pet_escort_primacy` refuses it on a typing frame, and output is not
-/// a licence either.
+/// The same through the reason string: `cursor-home` claims the escort's body, and
+/// output is no licence for it (`pet_escort_primacy` refuses it on typing frames).
 #[test]
 fn a_printing_command_is_not_a_licence_to_claim_the_escorts_body() {
     let live = stream_output(true, 900);
@@ -202,9 +197,8 @@ fn a_printing_command_is_not_a_licence_to_claim_the_escorts_body() {
     );
 }
 
-/// A caret that jumps is not a reason to teleport the cat: the escort closes
-/// distance at a walking pace, and that pace is the feature. Measured with no
-/// keystroke, so only the placement pass could move the body.
+/// A caret that jumps does not teleport the cat: the escort closes distance at a
+/// walking pace. No keystroke, so only the placement pass could move the body.
 #[test]
 fn a_caret_that_jumps_does_not_teleport_the_body() {
     let mut now = Instant::now();

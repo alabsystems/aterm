@@ -29,6 +29,10 @@
 //! (`support/launch_isolation.rs`). A headless instance opens no window.
 
 #![cfg(unix)]
+#![allow(
+    clippy::disallowed_types,
+    reason = "test code: a stand-in child may inherit descriptors"
+)]
 
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};

@@ -75,7 +75,6 @@ fn write_wide_char_last_valid_col() {
     let fg = PackedColor::DEFAULT_FG;
     let bg = PackedColor::DEFAULT_BG;
 
-    // Col 8 is the last position where a wide char fits (needs cols 8 and 9)
     let ok = row.write_wide_char(8, '\u{4E2D}', fg, bg, CellFlags::empty());
     assert!(ok);
     assert!(row.get(8).unwrap().is_wide());
@@ -88,14 +87,12 @@ fn write_wide_char_last_col_rejected() {
     let fg = PackedColor::DEFAULT_FG;
     let bg = PackedColor::DEFAULT_BG;
 
-    // Col 9 only has room for 1 cell, wide char needs 2
     let ok = row.write_wide_char(9, '\u{4E2D}', fg, bg, CellFlags::empty());
     assert!(!ok);
 }
 
 #[test]
 fn write_wide_char_two_col_row() {
-    // Minimum row that can hold a wide char
     let (_pages, mut row) = make_row(2);
     let fg = PackedColor::DEFAULT_FG;
     let bg = PackedColor::DEFAULT_BG;
@@ -108,7 +105,6 @@ fn write_wide_char_two_col_row() {
 
 #[test]
 fn write_wide_char_single_col_row_rejected() {
-    // Row with only 1 col can never hold a wide char
     let (_pages, mut row) = make_row(1);
     let fg = PackedColor::DEFAULT_FG;
     let bg = PackedColor::DEFAULT_BG;

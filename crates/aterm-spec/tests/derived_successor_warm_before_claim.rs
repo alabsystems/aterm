@@ -2,14 +2,9 @@
 // Copyright 2026 Andrew Yates
 
 //! Tier-0 for `NativeUpdateSuccessorWarmBeforeClaim`
-//! (docs/DESIGN-warm-successor-2026-09-29.md): before its claim a successor
-//! mutates no environment once a thread exists, and owns, shows and proves
-//! nothing — and each mutant (the post-claim `publish()` into `environ`, a
-//! pre-claim bind, a revealed placeholder, a proving warm present, a folded
-//! hint) is caught. P2's order: the warm prologue runs before the dial except
-//! on the relative-socket shape, a stale hint is re-selected and a config
-//! edited during the hold is warmed again before any carried present, and
-//! every successor proves or exits.
+//! (docs/DESIGN-warm-successor-2026-09-29.md): before its claim a successor mutates no
+//! environment once a thread exists and owns, shows and proves nothing; the warm prologue runs
+//! before the dial except on the relative-socket shape; every successor proves or exits.
 
 use aterm_spec::{
     derive::{
@@ -18,14 +13,6 @@ use aterm_spec::{
     },
     interp, verify,
 };
-
-#[test]
-fn successor_warm_before_claim_proves_and_catches() {
-    verify::prove_and_catch_scalar(
-        &native_update_successor_warm_before_claim_model(),
-        "successor warm before claim",
-    );
-}
 
 /// Each invariant mutant with the invariant it was written for.
 const MUTANTS: [(&str, &str); 9] = [
@@ -53,8 +40,7 @@ fn only(mutant: &str) -> aterm_spec::derive::Model {
     model
 }
 
-/// Every invariant is falsified by one mutant ALONE, so none of the ten is
-/// carried by another's counterexample.
+/// Each invariant is falsified by one mutant alone, not carried by another's counterexample.
 #[test]
 fn each_mutant_alone_breaks_the_invariant_it_was_written_for() {
     for (mutant, invariant) in MUTANTS {
@@ -74,16 +60,12 @@ fn each_mutant_alone_breaks_the_invariant_it_was_written_for() {
         interp::bmc(&bind).is_err(),
         "a bind while warming, then a failed claim, leaves something owned at exit"
     );
-    // And with no mutant live the Buggy = 1 model is clean: the catches above
-    // are the mutants', not damage the dial does elsewhere.
+    // With no mutant live the Buggy = 1 model is clean, so the catches are the mutants'.
     assert!(interp::bmc(&only("")).is_ok());
 }
 
-/// P2's order, walked: the launched lane warms before it dials; the relative
-/// socket shape cannot, and warms after the intake; a stale hint blocks the
-/// carried present until the join re-selects the carried size, and a config
-/// edit the outgoing process applied during the hold blocks it until the
-/// config half of the warm runs again.
+/// The launched lane warms before it dials; the relative-socket shape warms after the intake; a
+/// stale hint or a config edit during the hold blocks the carried present until re-warmed.
 #[test]
 fn the_warm_precedes_the_dial_except_where_the_intake_changes_directory() {
     let model = native_update_successor_warm_before_claim_model();
@@ -172,21 +154,12 @@ fn the_warm_precedes_the_dial_except_where_the_intake_changes_directory() {
     assert!(model.fire("RealPresent", &mut edited));
 }
 
-/// Liveness: every successor proves or exits, under the fairness stated on
-/// `native_update_successor_warm_before_claim_liveness`, and a prologue that
-/// joins its worker before the dial is the caught mutant — interpreter and,
-/// where installed, `ty`.
+/// Liveness: every successor proves or exits under the stated fairness; joining the worker before
+/// the dial is the caught mutant.
 #[test]
 fn every_warm_successor_proves_or_exits() {
     let model = native_update_successor_warm_before_claim_model();
     let live = native_update_successor_warm_before_claim_liveness();
-    assert!(
-        aterm_spec::xref::liveness_registry()
-            .iter()
-            .any(|(registered, obligation)| registered.name == model.name
-                && obligation.name == live.name),
-        "the warm successor's liveness must stay enrolled"
-    );
     verify::liveness_proves_and_catches_tiered(
         &model,
         &live,

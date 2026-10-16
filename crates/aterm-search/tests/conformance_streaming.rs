@@ -5,15 +5,14 @@
 //!
 //! Three layers, per `aterm_spec::derive`'s module docs (ONE registered Rust
 //! model — `aterm_spec::derive::streaming_search_model()` — feeds all of them,
-//! the SAME `Model` the compile-time gate in `build.rs`, the Tier-0 tests in
-//! aterm-spec, the global strict-vacuity audit, and trust-ir spec-link check,
-//! so no layer can check a different spec):
+//! the SAME `Model` the Tier-0 tests in aterm-spec, the global strict-vacuity
+//! audit, and trust-ir spec-link check, so no layer can check a different spec):
 //!
-//!   Tier 0 (also enforced at COMPILE TIME by build.rs): the invariants are
-//!     proven exhaustively over every Start/Scan/Nav/Add/Invalidate/Reflow/
-//!     Cancel interleaving, and a counterexample is required at `Buggy=1`
-//!     (one slip per law, the dropped invalidation clamp among them —
-//!     non-vacuity).
+//!   Tier 0 (aterm-spec's `tests/derived_streaming_search_ty.rs`): the
+//!     invariants are proven exhaustively over every Start/Scan/Nav/Add/
+//!     Invalidate/Reflow/Cancel interleaving, at `Wrap=1` and `Wrap=0`, and a
+//!     counterexample is required at `Buggy=1` (one slip per law, the dropped
+//!     invalidation clamp among them — non-vacuity).
 //!
 //!   Tier 1 (THIS file's heart): the model is bound to the LITERAL shipping
 //!     `StreamingSearch`. Every bounded interleaving of the unit-effect trace alphabet is
@@ -247,16 +246,6 @@ fn model_consts_match_driver() {
     assert_eq!(c("MaxResults"), MAX_RESULTS as i64);
     assert_eq!(c("MaxTotal"), MAX_TOTAL);
     assert_eq!(c("Buggy"), 0, "committed config is the fixed engine");
-}
-
-/// Tier 0 backstop (the build.rs gate runs the same check at compile time; this
-/// keeps `cargo test -p aterm-search` alone proving it too).
-#[test]
-fn streaming_search_spec_model_checked_in_trust() {
-    verify::prove_and_catch_scalar(
-        &streaming_search_model(),
-        "streaming-search derived spec (Tier-0 backstop)",
-    );
 }
 
 /// Tier 1: EVERY bounded interleaving, driven on the REAL engine in lockstep

@@ -1,0 +1,30 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "aterm-wasm-abi-macros"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "#[export] for aterm-wasm-abi: the syn-free attribute that marks what a wasm module shows JS (replaces wasm-bindgen-macro)"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+# String literals (doc comments, `js_name = "x"`) through the shared reader.
+# Its cursor and derive-input parser run only inside a macro invocation; this
+# crate's signature parser works on its own token tree (src/tt.rs) so the
+# Trust lane tests it natively. No proc-macro2 / quote / syn either way.
+aterm-macro-support = { workspace = true }
+
+[dev-dependencies]
+# The unit tests hold the record constants and encoding to the runtime's
+# decoder (src/expand.rs). A dev-dependency cycle: the runtime depends on
+# this crate as its proc macro.
+aterm-wasm-abi = { workspace = true }
+
+[lints]
+workspace = true

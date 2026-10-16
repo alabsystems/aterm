@@ -52,8 +52,8 @@ use crate::crash_signal::{MarkerOwner, markers};
 /// are named for. A worker of [`the_real_journal_conforms_to_the_model`] keeps
 /// one desk for all its replays, emptied between them ([`Desk::clear`]).
 ///
-/// WHY (2026-10-06, gate speed): a fresh desk per replay made and removed two
-/// directories in the system temp dir, the one every test binary of the gate
+/// WHY (test-run speed): a fresh desk per replay made and removed two
+/// directories in the system temp dir, the one every test binary of a run
 /// makes its own in, and reaped one process for its pid: 1,852 replays, 7,408
 /// directory makes and removes and 2,440 spawns of `/usr/bin/true` in one run.
 /// Beside three `F_FULLFSYNC` writers those directory calls took 2.9-6.2 ms
@@ -596,13 +596,13 @@ fn the_real_journal_conforms_to_the_model() {
     );
     // Each replay runs on a rig of its own (its worker's desk, emptied for it,
     // and its own journal and markers), so the replays are independent: they
-    // run side by side (29.8 s of this test's 31.7 s run in turn on the
-    // 6-core gate host, 2026-10-05), each exactly once, every step checked
-    // where it was replayed, and the states they reach are gathered below.
+    // run side by side (in turn they were 29.8 s of this test's 31.7 s on a
+    // 6-core host), each exactly once, every step checked where it was
+    // replayed, and the states they reach are gathered below.
     //
     // Each DISTINCT step is validated on both tiers by the worker that met it
-    // first, between its replays, and not after the last replay (2026-10-06,
-    // gate speed): with the installed `ty` (0.13.0, no `--cases` co-process)
+    // first, between its replays, and not after the last replay, for speed on
+    // a loaded machine: with the installed `ty` (0.13.0, no `--cases` co-process)
     // the 129 of them are 262 `ty` spawns, and run one after another once
     // every replay was done they were the last 5.4 s of a 63.3 s run beside
     // eight spinners and three `F_FULLFSYNC` writers. Beside replays that wait
@@ -611,7 +611,7 @@ fn the_real_journal_conforms_to_the_model() {
     // 53.4-56.6 s (13.7 CPU-s instead of 16.9), and 2.1-2.3 s alone instead
     // of 3.8-3.9 s.
     //
-    // FOUR AT MOST (2026-10-05, gate speed). A replay mostly waits on the
+    // FOUR AT MOST (test-run speed). A replay mostly waits on the
     // shipping writers' syncs (`restore`'s `F_FULLFSYNC`, the journal's
     // `fsync`), so the wall stops falling at about four threads (run alone on
     // 14 cores: 23.6 s on one, 18.7 s on two, 15.6 s on four, 15.7 s on

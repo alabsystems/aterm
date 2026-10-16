@@ -2,14 +2,13 @@
 // Copyright 2026 Andrew Yates
 
 //! Tier-1: the shipping `MessageCenter` follows the derived
-//! `ExceptionsDigestEnds` model in lock step (aterm-spec `derive`, step
-//! 3), and so the liveness `AnUnnamedEntryEnds` proven on the model is a
-//! property of the code. After every real step the projection `(open, missed,
-//! age)` of the center equals the model's, where `missed` is "the center names
-//! a deadline" (`digest_deadline`) and `age` counts the clock in halves of
-//! `RESOLVE_AFTER`. The negative controls replay the second edition's two-look
-//! rule and the early end against the mutant models and show the real center
-//! is not what they describe.
+//! `ExceptionsDigestEnds` model in lock step, so the liveness
+//! `AnUnnamedEntryEnds` proven on the model is a property of the code. After
+//! every real step the center's `(open, missed, age)` equals the model's, where
+//! `missed` is "the center names a deadline" (`digest_deadline`) and `age`
+//! counts the clock in halves of `RESOLVE_AFTER`. The negative controls replay
+//! the two-look rule and the early end against the mutant models and show the
+//! real center is not what they describe.
 
 use aterm_messages::need::{Fingerprint, LaterAsk, RESOLVE_AFTER, Reason, Resurface, Then, Why};
 use aterm_messages::{
@@ -64,6 +63,10 @@ struct Real {
 
 impl Real {
     fn new() -> Self {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test code: the one instant a test mints and feeds in"
+        )]
         let now = Instant::now();
         let mut c = MessageCenter::new(MessageLog::empty(), now);
         let wall = 1_790_000_000_000;
@@ -233,9 +236,9 @@ fn the_real_center_follows_the_model_in_lock_step() {
     );
 }
 
-/// The second edition ended an entry at a SECOND missed look. The mutant model
-/// (`TwoLooksToEnd`) is that rule; the real center, given one empty look and
-/// the passing of the clock, ends the entry, which the mutant does not admit.
+/// The mutant `TwoLooksToEnd` ends an entry only at a second missed look; the
+/// real center, given one empty look and the clock, ends it, which the mutant
+/// does not admit.
 #[test]
 fn the_second_editions_two_look_rule_is_not_this_code() {
     let model = exceptions_digest_ends_model();
@@ -246,7 +249,7 @@ fn the_second_editions_two_look_rule_is_not_this_code() {
     real.step("CauseEnds");
     assert!(model.fire("CauseEnds", &mut healthy));
     assert!(two.fire("CauseEnds", &mut mutant));
-    // ONE look, and no second look ever comes.
+    // One look, and no second look ever comes.
     real.step("Miss");
     assert!(model.fire("Miss", &mut healthy));
     assert!(two.fire("TwoLooksToEnd", &mut mutant));
@@ -268,7 +271,7 @@ fn the_second_editions_two_look_rule_is_not_this_code() {
         "the real center ended the entry with no second look"
     );
     assert_eq!(got, healthy);
-    // The mutant model, holding the same look, cannot take the step the code took.
+    // The mutant, holding the same look, cannot take the step the code took.
     let mut before = mutant.clone();
     before.insert("age", 2);
     assert_eq!(
@@ -292,9 +295,9 @@ fn the_second_editions_two_look_rule_is_not_this_code() {
     );
 }
 
-/// The early end: two looks a few milliseconds apart (or the loop's settle) must
-/// not end a fact the reporter merely flickered, and a repeated empty look must
-/// not push the deadline out either. `EndsBeforeTheClockRan` is the mutant.
+/// Two looks a few milliseconds apart (or the loop's settle) do not end a fact
+/// the reporter merely flickered (the mutant `EndsBeforeTheClockRan`), and a
+/// repeated empty look does not push the deadline out.
 #[test]
 fn a_flicker_is_not_an_end_and_a_repeated_look_does_not_move_the_clock() {
     let mut real = Real::new();
@@ -316,7 +319,7 @@ fn a_flicker_is_not_an_end_and_a_repeated_look_does_not_move_the_clock() {
     real.step("Name");
     assert_eq!(real.c.digest().len(), 1);
     assert!(real.c.digest_deadline().is_none());
-    // a NEW miss starts a NEW clock, from its own instant (time passed unarmed)
+    // a new miss starts a new clock, from its own instant
     real.now += tick();
     real.wall += u64::try_from(tick().as_millis()).expect("fits");
     real.step("Miss");

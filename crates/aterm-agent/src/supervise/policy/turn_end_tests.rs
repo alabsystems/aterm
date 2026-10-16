@@ -12,6 +12,9 @@ use aterm_phase::prompt::fixtures::{
 
 const MIN: Duration = Duration::from_secs(60);
 
+/// A turn's work past [`EXCHANGE_WORK`]: a job, even one a person opened.
+const JOB: Duration = Duration::from_secs(12 * 60);
+
 /// [`TurnEndTiming::reset_grace`], the default: how long past a reset the
 /// first continuation waits (150 s, past the vendor's own auto-continue).
 const GRACE: Duration = Duration::from_secs(150);
@@ -24,6 +27,14 @@ fn cfg() -> SupervisorConfig {
 fn no_answers() -> SupervisorConfig {
     SupervisorConfig {
         answer_questions: false,
+        ..cfg()
+    }
+}
+
+/// The owner's `continue = false`: a plain turn end types nothing.
+fn no_continue() -> SupervisorConfig {
+    SupervisorConfig {
+        continue_policy: false,
         ..cfg()
     }
 }
@@ -108,6 +119,10 @@ fn idle(said: &str, worked: Option<Duration>) -> TurnEndReading {
         thread_model: None,
         upgrade_goal: false,
         account: None,
+        autopilot: Autopilot::Cruise,
+        login_label: None,
+        login_superseded: false,
+        login_notice: None,
     }
 }
 
@@ -165,7 +180,7 @@ fn retried(rule: &'static str, cause: ApiCause, r: &TurnEndReading) -> TurnEndAc
 /// Nothing typed: the act's point waited for, to its deadline
 /// ([`TurnEndTiming::take_within`] from `act_or_first_unseen`).
 fn awaits(a: &TurnEndAction, act_or_first_unseen: Instant) -> bool {
-    matches!(a, TurnEndAction::WaitUntil { until, why }
+    matches!(a, TurnEndAction::WaitUntil { until, why, .. }
         if *until == act_or_first_unseen + TurnEndTiming::default().take_within
             && why.starts_with("the worker to take"))
 }
@@ -619,7 +634,8 @@ fn a_529_backs_off_then_continues_exactly_once_per_step_for_ever() {
         a,
         TurnEndAction::WaitUntil {
             until: t + MIN,
-            why: "overloaded retry 1".to_string()
+            why: "overloaded retry 1".to_string(),
+            retry: true,
         }
     );
     // Still waiting a second before the step; then exactly one continue.
@@ -813,13 +829,15 @@ fn captured(text: &str, reset: Option<Instant>, jitter: Duration) -> TurnEndRead
 /// no work, and the continuation typed at once met the standing limit (a
 /// 429) four minutes before its reset. Decided as the wall it left: the
 /// vendor says it will not go on, so the reset plus the grace and the jitter.
-/// A notice gone with no word of the vendor's keeps its countdown's: the
-/// wall's own `auto_resume_grace` past the reset. (The vendor that DID go on
+/// A notice gone with its countdown still drawn keeps the countdown's word:
+/// the wall's own `auto_resume_grace` past the reset; gone with nothing
+/// drawn, the countdown was dropped, and it is placed as a cancelled one. (The vendor that DID go on
 /// is [`a_limit_the_vendor_continued_by_itself_gets_no_usage_resume`]'s.)
 /// NEGATIVE CONTROLS, each the point's own act: the worker worked since (the
 /// continue policy's back-off), the screen says the login is back, the
-/// notice named no reset, the wall was a model bucket (a person's `/model`
-/// is its way out).
+/// notice named no reset. (A model bucket is waited on so too, unless the
+/// session left its model:
+/// [`a_bucket_no_relaunch_moved_off_is_waited_on_when_its_countdown_ends`].)
 #[test]
 fn a_limit_whose_notice_left_the_screen_waits_for_the_reset_it_named() {
     let t = t0();
@@ -844,7 +862,22 @@ fn a_limit_whose_notice_left_the_screen_waits_for_the_reset_it_named() {
     }
     assert_eq!(at(&mut st, &cancelled, due), typed(RULE_LIMIT_RESUME));
 
-    // Gone with no word of the vendor's: its countdown at its word.
+    // Gone with its countdown still drawn: the countdown at its word.
+    let counting = TurnEndReading {
+        auto_continue: Some(aterm_phase::AutoContinue::Armed),
+        ..cancelled.clone()
+    };
+    let mut st = TurnEndState::default();
+    at(&mut st, &armed, t);
+    let a = at(&mut st, &counting, t + MIN);
+    assert!(waits_until(&a, reset + 10 * MIN), "{a:?}");
+    assert_eq!(
+        at(&mut st, &counting, reset + 10 * MIN),
+        typed(RULE_LIMIT_RESUME)
+    );
+    // Gone with no word of the vendor's and no countdown drawn: dropped (a
+    // `/resume`, a `/clear`), and placed as a cancelled one
+    // ([`a_countdown_the_vendor_dropped_is_placed_as_a_cancelled_one`]).
     let unsaid = TurnEndReading {
         auto_continue: None,
         ..cancelled.clone()
@@ -852,11 +885,7 @@ fn a_limit_whose_notice_left_the_screen_waits_for_the_reset_it_named() {
     let mut st = TurnEndState::default();
     at(&mut st, &armed, t);
     let a = at(&mut st, &unsaid, t + MIN);
-    assert!(waits_until(&a, reset + 10 * MIN), "{a:?}");
-    assert_eq!(
-        at(&mut st, &unsaid, reset + 10 * MIN),
-        typed(RULE_LIMIT_RESUME)
-    );
+    assert!(waits_until(&a, due), "{a:?}");
 
     // Negative controls. The worker worked since: the wall is over, and the
     // point is the continue policy's (a short turn: its back-off).
@@ -890,16 +919,6 @@ fn a_limit_whose_notice_left_the_screen_waits_for_the_reset_it_named() {
         t,
     );
     assert_eq!(at(&mut st, &cancelled, t + MIN), typed(RULE_LIMIT_RESUME));
-    // A model bucket.
-    let mut st = TurnEndState::default();
-    let mut bucket = walled(
-        WallKind::ModelBucket { consent: false },
-        "You've reached your Fable limit. Run /usage-credits to continue or switch models with /model.",
-        None,
-    );
-    bucket.reset_at = Some(reset);
-    at(&mut st, &bucket, t);
-    assert_eq!(at(&mut st, &cancelled, t + MIN), typed(RULE_LIMIT_RESUME));
 }
 
 /// A WALL IS TRACKED WHEREVER IT IS READ, A POINT OR NOT (round 16; round
@@ -929,7 +948,7 @@ fn a_wall_read_before_its_point_is_tracked_and_the_act_judged_as_before() {
     let cancelled = captured(AUTO_CONTINUE_CANCELLED, None, Duration::ZERO);
     let ended = idle("Fixed the parser; the suite is green.", Some(3 * MIN));
     let taking = |a: &TurnEndAction, until: Instant| {
-        matches!(a, TurnEndAction::WaitUntil { until: u, why }
+        matches!(a, TurnEndAction::WaitUntil { until: u, why, .. }
             if *u == until && why == "the worker to take the continue@v1 act")
     };
     // The continuation, then the limit answering it inside the window.
@@ -1022,7 +1041,7 @@ fn a_retry_the_wall_answers_inside_its_take_window_is_met_not_taken() {
     let armed = captured(AUTO_CONTINUE_ARMED, Some(reset), Duration::ZERO);
     let cancelled = captured(AUTO_CONTINUE_CANCELLED, None, Duration::ZERO);
     let taking = |a: &TurnEndAction, until: Instant| {
-        matches!(a, TurnEndAction::WaitUntil { until: u, why }
+        matches!(a, TurnEndAction::WaitUntil { until: u, why, .. }
             if *u == until && why == "the worker to take the usage-resume@v1 act")
     };
     // The limit, its notice left, the resume at its reset; the next read
@@ -1128,7 +1147,7 @@ fn the_limit_a_cancel_left_answers_the_act_it_was_not_typed_over() {
     let now = t + Duration::from_secs(1);
     let a = at(&mut st, &answer, now);
     assert!(
-        matches!(&a, TurnEndAction::WaitUntil { until, why }
+        matches!(&a, TurnEndAction::WaitUntil { until, why, .. }
             if *until == now + take && why == "the worker to take the continue@v1 act"),
         "the act's own window: {a:?}"
     );
@@ -1295,7 +1314,7 @@ fn a_lost_login_no_point_decided_is_decided_as_the_wall_it_left() {
     );
     assert_eq!((left.wall, left.login_back), (None, false), "{left:#?}");
     let taking = |a: &TurnEndAction, until: Instant| {
-        matches!(a, TurnEndAction::WaitUntil { until: u, why }
+        matches!(a, TurnEndAction::WaitUntil { until: u, why, .. }
             if *u == until && why == "the worker to take the continue@v1 act")
     };
     // The continuation, answered by the lost login inside its window, and
@@ -1563,7 +1582,10 @@ fn a_limit_the_vendor_continued_by_itself_gets_no_usage_resume() {
     let t = t0();
     let reset = t + 4 * MIN;
     let armed = captured(AUTO_CONTINUE_ARMED, Some(reset), Duration::ZERO);
-    let resumed = captured(RESUMED_BY_ITSELF, None, Duration::ZERO);
+    // The measured continuation, under THIS limit's notice (`3:15pm`): the
+    // vendor's word is a limit's own only there
+    // ([`a_resumed_conversations_older_vendor_continuation_ends_no_wait`]).
+    let resumed = captured_rows(&continued_by_the_vendor_at("3:15pm"));
     let after = reset + Duration::from_secs(70);
     let mut st = TurnEndState::default();
     at(&mut st, &armed, t);
@@ -1598,6 +1620,202 @@ fn a_limit_the_vendor_continued_by_itself_gets_no_usage_resume() {
         at_under(&mut st, &cancelled, reset + GRACE, &held),
         typed(RULE_LIMIT_RESUME)
     );
+}
+
+/// [`RESUMED_BY_ITSELF`]'s rows with its limit's clock (`3:35pm`) named
+/// `clock`: [`AUTO_CONTINUE_ARMED`]'s own (`3:15pm`), or another limit's.
+fn continued_by_the_vendor_at(clock: &str) -> Vec<String> {
+    screen(RESUMED_BY_ITSELF)
+        .into_iter()
+        .map(|r| r.replace("3:35pm", clock))
+        .collect()
+}
+
+/// ANOTHER CONVERSATION'S OLDER LIMIT THAT THE VENDOR CONTINUED IS NO WORD
+/// OF THIS ONE (W1 of ATERM-KI-1015-1, the lab on Claude Code 2.1.300,
+/// 2026-10-15). A five-hour limit stands, its countdown armed (`3:15pm`);
+/// a person `/resume`s another conversation, and Claude Code redraws ITS
+/// history — its own older limit (`11:05am`) that the vendor continued by
+/// itself (`⏺ Usage limit reset · continuing automatically`, the reply under
+/// it), and no `❯` row since. Measured before: that word was read as THIS
+/// limit's continuation (`AutoContinue::Fired`, tied to no limit), the wait
+/// ended, and the continue policy typed `keep going` into the standing limit
+/// (the stub's 429, 51 minutes before its reset). The vendor's word is this
+/// limit's only under THIS limit's own notice (the reset it names), as a
+/// served turn is: the wait stands, nothing is typed before the reset.
+/// NEGATIVE CONTROL: the same rows under this limit's own notice end the
+/// wait (the vendor went on: the continue policy's back-off).
+#[test]
+fn a_resumed_conversations_older_vendor_continuation_ends_no_wait() {
+    let t = t0();
+    let reset = t + 60 * MIN;
+    let armed = captured(AUTO_CONTINUE_ARMED, Some(reset), Duration::ZERO);
+    let older = captured_rows(&continued_by_the_vendor_at("11:05am"));
+    assert_eq!(
+        (older.wall, &older.phase, older.auto_continue),
+        (None, &Phase::Idle, Some(aterm_phase::AutoContinue::Fired)),
+        "{older:#?}"
+    );
+    let mut st = TurnEndState::default();
+    at(&mut st, &armed, t);
+    for now in [t + MIN, t + 10 * MIN, t + 30 * MIN, reset] {
+        let a = at(&mut st, &older, now);
+        assert!(
+            matches!(&a, TurnEndAction::WaitUntil { until, why, .. }
+                if *until >= reset + GRACE && why.contains("usage-session")),
+            "the limit's own wait, nothing typed before its reset: {a:?} at {:?}",
+            now - t
+        );
+        assert!(st.waits_on_named_reset(), "the limit's wait stands");
+    }
+    // NEGATIVE CONTROL: this limit's own notice, continued by the vendor.
+    let own = captured_rows(&continued_by_the_vendor_at("3:15pm"));
+    let mut st = TurnEndState::default();
+    at(&mut st, &armed, t);
+    let a = at(&mut st, &own, reset + Duration::from_secs(70));
+    assert!(
+        matches!(&a, TurnEndAction::WaitUntil { why, .. } if why.contains("short turn")),
+        "the continue policy's back-off: {a:?}"
+    );
+    assert!(!st.waits_on_named_reset());
+}
+
+/// [`AUTO_CONTINUE_ARMED`]'s screen with the limit's rows taken off — the
+/// turn that met it, its notice, the transcript's countdown row and the
+/// footer's banner — but the footer rows in `keep`: what a `/resume` of a
+/// conversation with no limit in its history draws (the countdown dropped,
+/// `keep` empty), or that screen with the vendor's countdown still drawn.
+fn limit_rows_gone(keep: &[&str]) -> Vec<String> {
+    screen(AUTO_CONTINUE_ARMED)
+        .into_iter()
+        .filter(|r| {
+            keep.iter().any(|k| r.contains(k))
+                || ![
+                    "carry on with the task",
+                    "You've hit your",
+                    "Usage limit reached",
+                    "Continuing automatically",
+                    "Baked for",
+                ]
+                .iter()
+                .any(|gone| r.contains(gone))
+        })
+        .collect()
+}
+
+/// A COUNTDOWN CLAUDE CODE DROPPED IS A CANCELLED ONE (W4 of ATERM-KI-1015-1,
+/// the lab on Claude Code 2.1.300, 2026-10-15). A five-hour limit's countdown
+/// armed: the vendor goes on by itself, and the policy's net under it is the
+/// reset plus 10 minutes. A `/resume` of another conversation (or a `/clear`)
+/// drops that countdown silently — the composer drawn, no notice, no
+/// countdown, no word of the vendor's. Measured before: the policy kept `goes
+/// on by itself` (only `Automatic continue cancelled` cleared it) and
+/// continued at the reset plus 10 minutes. Nobody goes on by itself where no
+/// countdown is drawn: placed as a cancelled one, the reset plus the grace
+/// and the jitter. NEGATIVE CONTROL: the countdown still drawn (its row
+/// alone, no notice): taken at its word, the reset plus 10 minutes.
+#[test]
+fn a_countdown_the_vendor_dropped_is_placed_as_a_cancelled_one() {
+    let t = t0();
+    let reset = t + 60 * MIN;
+    let jitter = Duration::from_secs(17);
+    let armed = captured(AUTO_CONTINUE_ARMED, Some(reset), jitter);
+    assert!(armed.resumes_by_itself, "{armed:#?}");
+    let dropped = captured_rows(&limit_rows_gone(&[]));
+    assert_eq!(
+        (dropped.wall, &dropped.phase, dropped.auto_continue),
+        (None, &Phase::Idle, None),
+        "{dropped:#?}"
+    );
+    let mut st = TurnEndState::default();
+    assert!(waits_until(&at(&mut st, &armed, t), reset + 10 * MIN));
+    let due = reset + GRACE + jitter;
+    for now in [t + MIN, due - Duration::from_secs(1)] {
+        let a = at(&mut st, &dropped, now);
+        assert!(
+            matches!(&a, TurnEndAction::WaitUntil { until, why, .. }
+                if *until == due && why.ends_with("usage-session resets")),
+            "placed as a cancelled one: {a:?}"
+        );
+    }
+    assert_eq!(at(&mut st, &dropped, due), typed(RULE_LIMIT_RESUME));
+
+    // NEGATIVE CONTROL: the countdown still drawn.
+    let counting = captured_rows(&limit_rows_gone(&["Continuing automatically at 3:15pm"]));
+    assert_eq!(counting.wall, None, "{counting:#?}");
+    let mut st = TurnEndState::default();
+    at(&mut st, &armed, t);
+    let a = at(&mut st, &counting, t + MIN);
+    assert!(waits_until(&a, reset + 10 * MIN), "{a:?}");
+}
+
+/// A COUNTDOWN'S RECORD IN A RESUMED HISTORY IS NO COUNTDOWN (the review of
+/// ATERM-KI-1015-1's W4 fix; measured on Claude Code 2.1.301, the lab,
+/// `lpaw4rb`). Conversation B's five-hour limit armed; a `/resume` of A drops
+/// its countdown (placed as a cancelled one); a `/resume` BACK into B redraws
+/// B's history, whose last thing said is the record of the countdown, `⏺
+/// Usage limit reached · continuing automatically at 12:59pm · esc to
+/// cancel`, and draws no countdown — Claude Code does not arm it again.
+/// Measured before: that row was read as a standing wall that goes on by
+/// itself, and the wait went back to the reset plus 10 minutes
+/// (`WAITING until=…20:09:00Z usage-session goes on by itself`, the reset
+/// 12:59), where nobody counts down. On Claude Code's screen a live countdown
+/// is a row of its own (the footer's, under its banner, from 2.1.294 on):
+/// words with none drawn are history, and the limit is placed as a cancelled
+/// one — the reset plus the grace and the jitter. NEGATIVE CONTROL: the armed
+/// screen (the footer's countdown drawn) goes on by itself.
+#[test]
+fn a_countdowns_record_in_a_resumed_history_is_no_countdown() {
+    use aterm_phase::prompt::fixtures::{
+        RESUMED_BACK_INTO_LIMITED_CONVERSATION_2_1_301, RESUMED_NO_LIMIT_AT_ARMED_LIMIT_2_1_300,
+        WALL_SESSION_ARMED_CONVERSATION_B_2_1_300,
+    };
+    let t = t0();
+    let reset = t + 10 * MIN;
+    let jitter = Duration::from_secs(17);
+    let due = reset + GRACE + jitter;
+    let armed = TurnEndReading {
+        reset_at: Some(reset),
+        jitter,
+        ..captured_rows(
+            &screen(WALL_SESSION_ARMED_CONVERSATION_B_2_1_300)
+                .into_iter()
+                .map(|r| r.replace("9:19am", "12:59pm"))
+                .collect::<Vec<_>>(),
+        )
+    };
+    let resumed = captured(
+        RESUMED_NO_LIMIT_AT_ARMED_LIMIT_2_1_300,
+        None,
+        Duration::ZERO,
+    );
+    let back = captured(
+        RESUMED_BACK_INTO_LIMITED_CONVERSATION_2_1_301,
+        Some(reset),
+        jitter,
+    );
+    assert_eq!(
+        (back.wall, back.auto_continue),
+        (Some(WallKind::UsageSession), None),
+        "{back:#?}"
+    );
+    let resets = |a: &TurnEndAction| {
+        matches!(a, TurnEndAction::WaitUntil { until, why, .. }
+            if *until == due && why == "usage-session resets")
+    };
+    // B armed, A resumed, B resumed back.
+    let mut st = TurnEndState::default();
+    assert!(waits_until(&at(&mut st, &armed, t), reset + 10 * MIN));
+    assert!(resets(&at(&mut st, &resumed, t + MIN)));
+    let a = at(&mut st, &back, t + 2 * MIN);
+    assert!(resets(&a), "placed as a cancelled one: {a:?}");
+    // A loop that attaches at B's redrawn history.
+    let mut st = TurnEndState::default();
+    let a = at(&mut st, &back, t + 2 * MIN);
+    assert!(resets(&a), "{a:?}");
+    assert!(!back.resumes_by_itself, "no countdown drawn: {back:#?}");
+    // NEGATIVE CONTROL: the footer's countdown drawn.
+    assert!(armed.resumes_by_itself, "{armed:#?}");
 }
 
 /// The same kind of wall after Esc on the countdown, then — the limit lifted
@@ -1891,7 +2109,7 @@ fn at_a_limit_whose_notice_left_the_screen_the_roster_is_asked_as_at_the_wall() 
         t + MIN,
     );
     assert!(
-        matches!(&a, TurnEndAction::WaitUntil { until, why }
+        matches!(&a, TurnEndAction::WaitUntil { until, why, .. }
             if *until == t + 10 * MIN && why.contains("another account")),
         "{a:?}"
     );
@@ -1939,6 +2157,527 @@ fn with_resume_limits_off_a_limit_whose_notice_left_gets_nothing() {
     assert_eq!(
         at_under(&mut st, &worked, t + 91 * MIN, &off),
         typed(RULE_CONTINUE)
+    );
+}
+
+/// A SONNET BUCKET UNDER CLAUDE CODE 2.1.300'S GENERIC BANNER IS RELAUNCHED
+/// ON THE FALLBACK (W3 of ATERM-KI-1015-1, the lab, 2026-10-15). The turn
+/// ended on `⎿  You've hit your Sonnet limit · resets Oct 17 at 4:20pm (…)`,
+/// the harness answered the vendor's dialog `Wait here, …`, and the footer
+/// says only `⚠ Usage limit reached · limit resets Oct 17 at 4:20pm` over
+/// its countdown. Read off that banner the wall was `usage-session`, which
+/// goes on by itself: the default `model_fallback = "opus"` never ran and the
+/// session waited two days for the bucket's reset. Read as the turn's own
+/// notice names it, the measured screen is the model bucket, and the point a
+/// relaunch on opus (from sonnet, back at the bucket's reset). NEGATIVE
+/// CONTROL: with no fallback configured, the bucket's reset is waited out —
+/// its countdown armed, taken at its word as a usage limit's is (the reset
+/// plus `auto_resume_grace`,
+/// [`a_bucket_no_relaunch_moved_off_is_waited_on_when_its_countdown_ends`]).
+#[test]
+fn a_sonnet_bucket_under_the_generic_banner_relaunches_on_the_fallback() {
+    let t = t0();
+    let reset = t + 2 * 24 * 60 * MIN;
+    let r = TurnEndReading {
+        restartable: true,
+        ..captured(
+            aterm_phase::prompt::fixtures::WALL_SONNET_BUCKET_AUTO_CONTINUE_ARMED_2_1_300,
+            Some(reset),
+            Duration::ZERO,
+        )
+    };
+    assert_eq!(
+        r.wall,
+        Some(WallKind::ModelBucket { consent: false }),
+        "{r:#?}"
+    );
+    let mut st = TurnEndState::default();
+    let a = act(&mut st, &r, t);
+    assert!(
+        restarts(
+            &a,
+            &Restart::Model {
+                to: "opus".to_string()
+            },
+            RULE_MODEL_FALLBACK
+        ),
+        "{a:?}"
+    );
+    assert_eq!(
+        st.model_switch(),
+        Some(&ModelSwitch {
+            from: Some("sonnet".to_string()),
+            to: "opus".to_string(),
+            back_at: Some(reset)
+        })
+    );
+    // NEGATIVE CONTROL: no fallback, the bucket's reset waited out.
+    let none = SupervisorConfig {
+        model_fallback: None,
+        ..cfg()
+    };
+    let mut st = TurnEndState::default();
+    let a = at_under(&mut st, &r, t, &none);
+    assert!(
+        matches!(&a, TurnEndAction::WaitUntil { until, why, .. }
+            if *until == reset + 10 * MIN && why == "model-bucket goes on by itself"),
+        "{a:?}"
+    );
+}
+
+/// The lab's Sonnet bucket on Claude Code 2.1.300, its countdown armed
+/// ([`a_sonnet_bucket_under_the_generic_banner_relaunches_on_the_fallback`]).
+const SONNET_BUCKET_ARMED: &str =
+    aterm_phase::prompt::fixtures::WALL_SONNET_BUCKET_AUTO_CONTINUE_ARMED_2_1_300;
+
+/// [`SONNET_BUCKET_ARMED`]'s rows with each `from` of `edits` replaced by its
+/// `to`, the footer's banner and countdown taken off, and `above` drawn over
+/// the composer's frame — what the screen is once the countdown ended. The
+/// endings are CONSTRUCTED from the measured screen as Claude Code 2.1.296
+/// draws a five-hour limit's (the lab, 2026-10-09): Esc's `⏺ Automatic
+/// continue cancelled · …`, the reset's `⏺ Usage limit reset · continuing
+/// automatically` and the reply under it.
+fn sonnet_bucket_then(edits: &[(&str, &str)], above: &[&str]) -> Vec<String> {
+    let mut rows: Vec<String> = screen(SONNET_BUCKET_ARMED)
+        .into_iter()
+        .filter(|r| !r.contains("Usage limit reached") && !r.contains("Continuing automatically"))
+        .map(|r| edits.iter().fold(r, |r, (from, to)| r.replace(from, to)))
+        .collect();
+    let top = rows
+        .iter()
+        .position(|r| r.starts_with('─'))
+        .expect("the composer's frame");
+    rows.splice(top..top, above.iter().map(|r| (*r).to_string()));
+    rows
+}
+
+/// The vendor's word after Esc on its countdown (2.1.296's row).
+const CANCELLED_ROW: &str = "⏺ Automatic continue cancelled · /rate-limit-options to re-arm";
+
+/// A BUCKET NO RELAUNCH MOVED OFF IS WAITED ON WHEN ITS COUNTDOWN ENDS (the
+/// review of ATERM-KI-1015-1's W3 fix, 2026-10-15). Claude Code 2.1.300 draws
+/// a bucket's limit under the generic `⚠ Usage limit reached` banner, its
+/// countdown armed; read as the bucket it is, the wall is the model bucket's.
+/// Where no relaunch on the fallback is made — `model_fallback` off, no host
+/// to relaunch, the fallback the bucket's own model (an Opus bucket under the
+/// default `opus`) — the bucket stands until its reset, as a usage limit
+/// does, and the vendor goes on by itself at it. A `/resume` (the lab's
+/// screen: the countdown dropped, no notice) or Esc on the countdown takes
+/// the notice off the screen. Measured before: the bucket's track went at
+/// once there (`a person's /model is its way out`), and `usage-resume@v1
+/// keep going` was typed one minute after the `/resume` or the Esc, into a
+/// bucket standing for two days. Decided as the wall it left: the reset,
+/// placed as a cancelled countdown (the grace and the jitter). At the armed
+/// screen itself the vendor's countdown is taken at its word, as a usage
+/// limit's is: the reset plus `auto_resume_grace`. NEGATIVE CONTROLS, where
+/// the session LEFT the bucket's model and its reset binds nothing: a
+/// person's `/model` since its notice (constructed: `❯ /model` and `⎿  Set
+/// model to …` under the measured notice) goes at once, as it always has;
+/// the fallback's relaunch made (the default `opus` from sonnet) leaves the
+/// point to the continue policy. And a bucket whose notice named no reset
+/// goes at once. A `/model` read with no notice of this bucket's on the
+/// screen (under the `/resume`d history) ties to nothing: the wait stands.
+#[test]
+fn a_bucket_no_relaunch_moved_off_is_waited_on_when_its_countdown_ends() {
+    let t = t0();
+    let reset = t + 2 * 24 * 60 * MIN;
+    let jitter = Duration::from_secs(17);
+    let sonnet = captured(SONNET_BUCKET_ARMED, Some(reset), jitter);
+    let opus_rows: Vec<String> = screen(SONNET_BUCKET_ARMED)
+        .into_iter()
+        .map(|r| r.replace("your Sonnet limit", "your Opus limit"))
+        .collect();
+    let opus = TurnEndReading {
+        reset_at: Some(reset),
+        jitter,
+        ..captured_rows(&opus_rows)
+    };
+    for armed in [&sonnet, &opus] {
+        assert_eq!(
+            (armed.wall, armed.resumes_by_itself),
+            (Some(WallKind::ModelBucket { consent: false }), true),
+            "{armed:#?}"
+        );
+    }
+    let resumed = captured(
+        aterm_phase::prompt::fixtures::RESUMED_NO_LIMIT_AT_ARMED_LIMIT_2_1_300,
+        None,
+        Duration::ZERO,
+    );
+    let cancelled = captured_rows(&sonnet_bucket_then(&[], &[CANCELLED_ROW, ""]));
+    assert_eq!(
+        (resumed.wall, resumed.auto_continue, cancelled.wall),
+        (None, None, None)
+    );
+    assert_eq!(
+        cancelled.auto_continue,
+        Some(aterm_phase::AutoContinue::Unkept)
+    );
+    let fallback = |f: Option<&str>| SupervisorConfig {
+        model_fallback: f.map(str::to_string),
+        ..cfg()
+    };
+    let due = reset + GRACE + jitter;
+    for (what, armed, c, restartable) in [
+        ("model_fallback off", &sonnet, fallback(None), true),
+        ("no host to relaunch", &sonnet, cfg(), false),
+        (
+            "the fallback is the bucket's model",
+            &sonnet,
+            fallback(Some("sonnet")),
+            true,
+        ),
+        (
+            "an Opus bucket under the default fallback",
+            &opus,
+            cfg(),
+            true,
+        ),
+    ] {
+        for (left, screen) in [
+            ("a /resume", &resumed),
+            ("Esc on the countdown", &cancelled),
+        ] {
+            let on = |r: &TurnEndReading| TurnEndReading {
+                restartable,
+                ..r.clone()
+            };
+            let mut st = TurnEndState::default();
+            let at_wall = at_under(&mut st, &on(armed), t, &c);
+            for now in [t + MIN, due - Duration::from_secs(1)] {
+                let a = at_under(&mut st, &on(screen), now, &c);
+                assert!(
+                    matches!(&a, TurnEndAction::WaitUntil { until, why, .. }
+                        if *until == due && why == "model-bucket resets"),
+                    "{what}, {left}: the bucket's reset, placed as a cancelled one: {a:?}"
+                );
+                assert!(st.waits_on_named_reset(), "{what}, {left}: the wait stands");
+            }
+            assert_eq!(
+                at_under(&mut st, &on(screen), due, &c),
+                typed(RULE_LIMIT_RESUME),
+                "{what}, {left}"
+            );
+            assert!(
+                matches!(&at_wall, TurnEndAction::WaitUntil { until, why, .. }
+                    if *until == reset + 10 * MIN && why == "model-bucket goes on by itself"),
+                "{what}: the countdown at its word: {at_wall:?}"
+            );
+        }
+    }
+
+    // NEGATIVE CONTROLS. A person's `/model` under the bucket's own notice.
+    let set_row = "  ⎿  Set model to Opus 5.5 and saved as your default for new sessions";
+    let chosen = captured_rows(&sonnet_bucket_then(&[], &["❯ /model", set_row, ""]));
+    assert!(
+        chosen.since_limit.as_ref().is_some_and(|s| s.model_set),
+        "{chosen:#?}"
+    );
+    let off = fallback(None);
+    let mut st = TurnEndState::default();
+    at_under(&mut st, &sonnet, t, &off);
+    assert_eq!(
+        at_under(&mut st, &chosen, t + MIN, &off),
+        typed(RULE_LIMIT_RESUME)
+    );
+    assert!(!st.waits_on_named_reset());
+    // The fallback's relaunch made: the point is the continue policy's.
+    let mut st = TurnEndState::default();
+    let relaunch = TurnEndReading {
+        restartable: true,
+        ..sonnet.clone()
+    };
+    assert!(
+        restarts(
+            &act(&mut st, &relaunch, t),
+            &Restart::Model {
+                to: "opus".to_string()
+            },
+            RULE_MODEL_FALLBACK
+        ),
+        "the relaunch"
+    );
+    let a = at(&mut st, &resumed, t + MIN);
+    assert!(
+        matches!(&a, TurnEndAction::WaitUntil { why, .. } if why.contains("short turn")),
+        "the continue policy's back-off: {a:?}"
+    );
+    assert!(!st.waits_on_named_reset());
+    // A bucket whose notice named no reset.
+    let mut st = TurnEndState::default();
+    at_under(
+        &mut st,
+        &TurnEndReading {
+            reset_at: None,
+            ..sonnet.clone()
+        },
+        t,
+        &off,
+    );
+    assert_eq!(
+        at_under(&mut st, &cancelled, t + MIN, &off),
+        typed(RULE_LIMIT_RESUME)
+    );
+    // A `/model` tied to no notice of this bucket's: the wait stands.
+    let mut untied = screen(aterm_phase::prompt::fixtures::RESUMED_NO_LIMIT_AT_ARMED_LIMIT_2_1_300);
+    let top = untied
+        .iter()
+        .position(|r| r.starts_with('─'))
+        .expect("the frame");
+    untied.splice(top..top, ["❯ /model", set_row, ""].map(str::to_string));
+    let untied = captured_rows(&untied);
+    let mut st = TurnEndState::default();
+    at_under(&mut st, &sonnet, t, &off);
+    let a = at_under(&mut st, &untied, t + MIN, &off);
+    assert!(
+        matches!(&a, TurnEndAction::WaitUntil { until, why, .. }
+            if *until == due && why == "model-bucket resets"),
+        "{a:?}"
+    );
+}
+
+/// A model selection only escapes a named bucket when its latest completed
+/// choice names another known family. Reselecting Sonnet, returning to it, or
+/// choosing an unknown model leaves the Sonnet reset binding.
+#[test]
+fn a_model_choice_only_leaves_a_bucket_for_a_known_different_family() {
+    let t = t0();
+    let reset = t + 2 * 24 * 60 * MIN;
+    let jitter = Duration::from_secs(17);
+    let armed = captured(SONNET_BUCKET_ARMED, Some(reset), jitter);
+    let c = SupervisorConfig {
+        model_fallback: None,
+        ..cfg()
+    };
+    let due = reset + GRACE + jitter;
+    for (choices, escapes) in [
+        (vec!["Sonnet 4.6"], false),
+        (vec!["Claude Sonnet 4.7"], false),
+        (vec!["Opus 5.5", "Sonnet 4.6"], false),
+        (vec!["Opus 5.5", "new-default"], false),
+        (vec!["new-default"], false),
+        (vec!["Sonnet 4.6", "Opus 5.5"], true),
+        (vec!["Haiku 4.5"], true),
+    ] {
+        let rows: Vec<String> = choices
+            .iter()
+            .flat_map(|model| {
+                [
+                    "❯ /model".to_string(),
+                    format!("  ⎿  Set model to {model} and saved as your default for new sessions"),
+                    String::new(),
+                ]
+            })
+            .collect();
+        let above: Vec<&str> = rows.iter().map(String::as_str).collect();
+        let chosen = captured_rows(&sonnet_bucket_then(&[], &above));
+        assert!(chosen.since_limit.as_ref().is_some_and(|s| s.model_set));
+        let mut st = TurnEndState::default();
+        at_under(&mut st, &armed, t, &c);
+        let action = at_under(&mut st, &chosen, t + MIN, &c);
+        if escapes {
+            assert_eq!(action, typed(RULE_LIMIT_RESUME), "{choices:?}");
+            assert!(!st.waits_on_named_reset(), "{choices:?}");
+        } else {
+            assert!(
+                matches!(&action, TurnEndAction::WaitUntil { until, why, .. }
+                    if *until == due && why == "model-bucket resets"),
+                "{choices:?}: {action:?}"
+            );
+            assert!(st.waits_on_named_reset(), "{choices:?}");
+        }
+    }
+}
+
+/// A RELAUNCH DECIDED WHERE THE BUCKET'S NOTICE HAS LEFT KNOWS THE BUCKET
+/// (the amendment of ATERM-KI-1015-1's W3 fix). A bucket waited out with no
+/// host to relaunch it (the lab's 2.1.300 Sonnet bucket, its countdown
+/// armed); a `/resume` drops the countdown and takes the notice off the
+/// screen, and the host can relaunch there: the bucket is decided as the
+/// wall it left, and its own rule relaunches on the fallback. The loop
+/// records the relaunch against ITS reading — the `/resume`d screen, which
+/// names no bucket and no reset — so read off it, the switch knew neither
+/// the bucket's model (`from: None`, the return made on the launch's model)
+/// nor its reset (`back_at: None`, no return scheduled: the session stayed on
+/// the fallback for good). The switch is the bucket's: from sonnet, back at
+/// its reset. NEGATIVE CONTROL: a relaunch at the wall itself, as ever.
+#[test]
+fn a_relaunch_where_the_buckets_notice_left_knows_the_bucket() {
+    let t = t0();
+    let reset = t + 2 * 24 * 60 * MIN;
+    let armed = captured(SONNET_BUCKET_ARMED, Some(reset), Duration::ZERO);
+    let resumed = TurnEndReading {
+        restartable: true,
+        ..captured(
+            aterm_phase::prompt::fixtures::RESUMED_NO_LIMIT_AT_ARMED_LIMIT_2_1_300,
+            None,
+            Duration::ZERO,
+        )
+    };
+    let switched = ModelSwitch {
+        from: Some("sonnet".to_string()),
+        to: "opus".to_string(),
+        back_at: Some(reset),
+    };
+    let fallback = |a: &TurnEndAction| {
+        restarts(
+            a,
+            &Restart::Model {
+                to: "opus".to_string(),
+            },
+            RULE_MODEL_FALLBACK,
+        )
+    };
+    let mut st = TurnEndState::default();
+    let a = at(&mut st, &armed, t);
+    assert!(
+        matches!(&a, TurnEndAction::WaitUntil { why, .. } if why == "model-bucket goes on by itself"),
+        "no host to relaunch: {a:?}"
+    );
+    let a = act(&mut st, &resumed, t + MIN);
+    assert!(fallback(&a), "the bucket's own rule where it left: {a:?}");
+    assert_eq!(st.model_switch(), Some(&switched));
+    // NEGATIVE CONTROL: the relaunch at the wall.
+    let mut st = TurnEndState::default();
+    let a = act(
+        &mut st,
+        &TurnEndReading {
+            restartable: true,
+            ..armed.clone()
+        },
+        t,
+    );
+    assert!(fallback(&a), "{a:?}");
+    assert_eq!(st.model_switch(), Some(&switched));
+}
+
+/// A BUCKET WAITED ON IS TAKEN UP BY THE LOOP THAT FOLLOWS (the review of
+/// ATERM-KI-1015-1's W3 fix). A model bucket is waited on off the screen as
+/// a usage limit is, so the ledger keeps its wall open and a loop restarted
+/// there (each seamless update, each fault) seeds it
+/// ([`TurnEndState::seed_named_reset`]) with its words: the bucket's model
+/// read off them as at the wall — an Opus bucket under the default fallback
+/// `opus` is waited out, never relaunched into the same bucket. NEGATIVE
+/// CONTROL: a Sonnet bucket's seeded words, the host able to relaunch: the
+/// relaunch on `opus` is its rule, as at its notice.
+#[test]
+fn a_bucket_waited_on_is_taken_up_by_the_loop_that_follows() {
+    let t = t0();
+    let reset = t + 2 * 24 * 60 * MIN;
+    let resumed = TurnEndReading {
+        restartable: true,
+        ..captured(
+            aterm_phase::prompt::fixtures::RESUMED_NO_LIMIT_AT_ARMED_LIMIT_2_1_300,
+            None,
+            Duration::ZERO,
+        )
+    };
+    let words = |model: &str| {
+        format!(
+            "You've hit your {model} limit · resets Oct 17 at 4:20pm (America/Los_Angeles) — ⚠ \
+             Usage limit reached · limit resets Oct 17 at 4:20pm"
+        )
+    };
+    let seeded = |model: &str| {
+        let mut st = TurnEndState::default();
+        st.seed_named_reset(
+            WallKind::ModelBucket { consent: false },
+            &words(model),
+            reset,
+            Duration::ZERO,
+            false,
+            ResetClock::of(Some("Oct 17 at 4:20pm")),
+            t,
+        );
+        assert!(st.waits_on_named_reset());
+        st
+    };
+    let mut st = seeded("Opus");
+    let a = at(&mut st, &resumed, t + MIN);
+    assert!(
+        matches!(&a, TurnEndAction::WaitUntil { until, why, .. }
+            if *until == reset + GRACE && why == "model-bucket resets"),
+        "{a:?}"
+    );
+    // NEGATIVE CONTROL: another bucket's model, a host to relaunch.
+    let mut st = seeded("Sonnet");
+    let a = at(&mut st, &resumed, t + MIN);
+    assert!(
+        restarts(
+            &a,
+            &Restart::Model {
+                to: "opus".to_string()
+            },
+            RULE_MODEL_FALLBACK
+        ),
+        "{a:?}"
+    );
+}
+
+/// THE VENDOR'S CONTINUATION OF A BUCKET ENDS ITS WAIT, AND ONLY UNDER ITS
+/// OWN NOTICE (the review of ATERM-KI-1015-1's W3 fix, 2026-10-15). At the
+/// bucket's reset Claude Code goes on by itself (`⏺ Usage limit reset ·
+/// continuing automatically`, the reply under it, no `❯` row), and a short
+/// reply ends before any read sees it busy. Measured before: the vendor's
+/// word ended only a usage limit's track; the bucket's was kept, and
+/// `usage-resume@v1 keep going` followed the vendor's own continuation. Under
+/// the bucket's own notice (the reset it names) the word ends the wait as
+/// work does: the point is the continue policy's. NEGATIVE CONTROL: the word
+/// under ANOTHER limit's notice — a `/resume`d conversation's older
+/// five-hour limit that the vendor continued (the lab's 2.1.300 screen) —
+/// says nothing of the bucket, whose wait stands.
+#[test]
+fn the_vendors_continuation_of_a_bucket_ends_its_wait_under_its_own_notice() {
+    let t = t0();
+    let reset = t + 2 * 24 * 60 * MIN;
+    let off = SupervisorConfig {
+        model_fallback: None,
+        ..cfg()
+    };
+    let armed = captured(SONNET_BUCKET_ARMED, Some(reset), Duration::ZERO);
+    let fired = captured_rows(&sonnet_bucket_then(
+        &[],
+        &[
+            "⏺ Usage limit reset · continuing automatically",
+            "",
+            "⏺ Hi! I am the local lab stub, not a model. (reply 3)",
+            "",
+            "✻ Worked for 0s · done 4:21 PM",
+            "",
+        ],
+    ));
+    assert_eq!(
+        (fired.wall, fired.auto_continue),
+        (None, Some(aterm_phase::AutoContinue::Fired)),
+        "{fired:#?}"
+    );
+    let mut st = TurnEndState::default();
+    at_under(&mut st, &armed, t, &off);
+    let a = at_under(&mut st, &fired, reset + Duration::from_secs(70), &off);
+    assert!(
+        matches!(&a, TurnEndAction::WaitUntil { why, .. } if why.contains("short turn")),
+        "the vendor went on: the continue policy's back-off: {a:?}"
+    );
+    assert!(!st.waits_on_named_reset());
+
+    // NEGATIVE CONTROL: another limit's continuation, redrawn by a `/resume`.
+    let older = captured(
+        aterm_phase::prompt::fixtures::RESUMED_OLDER_LIMIT_CONTINUED_AT_ARMED_LIMIT_2_1_300,
+        None,
+        Duration::ZERO,
+    );
+    assert_eq!(
+        older.auto_continue,
+        Some(aterm_phase::AutoContinue::Fired),
+        "{older:#?}"
+    );
+    let mut st = TurnEndState::default();
+    at_under(&mut st, &armed, t, &off);
+    let a = at_under(&mut st, &older, t + MIN, &off);
+    assert!(
+        matches!(&a, TurnEndAction::WaitUntil { until, why, .. }
+            if *until == reset + GRACE && why == "model-bucket resets"),
+        "the bucket's wait stands: {a:?}"
     );
 }
 
@@ -2384,6 +3123,142 @@ fn a_lost_login_types_login_then_escalates_and_a_spend_wall_waits_its_reset() {
     ));
 }
 
+/// A Codex lost login, read off Codex's own screen (`■ Your access token could
+/// not be refreshed. …`), types nothing: Codex signs in outside its TUI, so the
+/// point is escalated with how it signs in (`codex login`), and nothing is
+/// typed at its next point either. NEGATIVE CONTROL: Claude Code's lost login
+/// at the same point still types `/login`.
+#[test]
+fn a_codex_lost_login_types_nothing_and_escalates_with_its_sign_in() {
+    let t = t0();
+    let rows: Vec<String> = [
+        "› go on",
+        "",
+        "■ Your access token could not be refreshed. Please log out and sign in again.",
+        "",
+        "› Ask Codex to do anything",
+        "",
+        "  gpt · /x",
+    ]
+    .map(String::from)
+    .to_vec();
+    let reading = aterm_phase::read(Some("codex"), &rows, None);
+    let codex = TurnEndReading::of(&reading, &rows, false, Some(3 * MIN), None, None);
+    assert_eq!(codex.program, Program::Codex);
+    assert_eq!(codex.wall, Some(WallKind::Auth), "read as the auth wall");
+    let mut st = TurnEndState::default();
+    let a = act(&mut st, &codex, t);
+    assert!(is_escalate(&a, "the login is gone"), "{a:?}");
+    assert!(is_escalate(&a, "codex login"), "{a:?}");
+    assert!(!is_escalate(&a, "/login"), "{a:?}");
+    let again = TurnEndReading {
+        worked: None,
+        ..codex.clone()
+    };
+    assert!(
+        !matches!(
+            at(&mut st, &again, t + MIN),
+            TurnEndAction::Type { .. } | TurnEndAction::TypeCommand { .. }
+        ),
+        "nothing typed at the next point"
+    );
+
+    let claude = TurnEndReading {
+        program: Program::Claude,
+        ..codex
+    };
+    assert_eq!(
+        act(&mut TurnEndState::default(), &claude, t),
+        TurnEndAction::TypeCommand {
+            command: "/login".to_string(),
+            rule_id: RULE_LOGIN,
+            then: Then::Escalate("finish sign-in in the browser".to_string())
+        }
+    );
+}
+
+/// agy signed out draws its sign-in menu INSTEAD of a composer (measured on
+/// 1.4.0): no point is ever reached there, so the lost login is escalated
+/// where it stands, with how agy signs in (quit and run it again), and
+/// nothing is typed or pressed. NEGATIVE CONTROL: the same reading with no
+/// evidence for its phase escalates nothing.
+#[test]
+fn agys_sign_in_menu_is_escalated_with_how_it_signs_in() {
+    let t = t0();
+    let rows = aterm_phase::prompt::fixtures::screen(aterm_phase::agy::fixtures::SIGNED_OUT);
+    let reading = aterm_phase::read(Some("agy"), &rows, None);
+    let agy = TurnEndReading::of(&reading, &rows, false, None, None, None);
+    assert_eq!(
+        (agy.wall, agy.composer.clone()),
+        (Some(WallKind::Auth), Composer::Absent)
+    );
+    let a = at(&mut TurnEndState::default(), &agy, t);
+    assert!(is_escalate(&a, "the login is gone"), "{a:?}");
+    assert!(is_escalate(&a, "quit agy and run it again"), "{a:?}");
+    let unread = TurnEndReading {
+        authoritative: false,
+        ..agy
+    };
+    assert_eq!(
+        at(&mut TurnEndState::default(), &unread, t),
+        TurnEndAction::Nothing,
+        "the control"
+    );
+}
+
+/// THE MEMBER'S LIMIT-INCREASE BANNER TYPES NOTHING (gap #3, measured on
+/// 0.163.0): a workspace member out of credits, or at the owner's spend cap,
+/// is drawn `Usage limit reached` / `… Request increase?` over `1. Yes (y)`
+/// and `› 2. No (default) (n)` under the wall, in place of the composer —
+/// a box, so no turn end is read there and nothing is typed: a resume text
+/// typed into it would reach its `(y)`. NEGATIVE CONTROL: the same wall with
+/// the banner gone and the composer back is an idle point the policy acts on.
+#[test]
+fn a_codex_limit_increase_banner_types_nothing() {
+    use aterm_phase::codex::fixtures as cx;
+    use aterm_phase::prompt::fixtures::screen;
+    let t = t0();
+    for text in [
+        cx::WALL_MEMBER_CREDITS_0_163,
+        cx::WALL_MEMBER_SPEND_CAP_0_163,
+    ] {
+        let rows = screen(text);
+        let reading = aterm_phase::read(Some("codex"), &rows, None);
+        assert_eq!(reading.phase, Phase::Prompt, "PRECONDITION: the banner");
+        let r = TurnEndReading::of(&reading, &rows, false, Some(3 * MIN), None, None);
+        let mut st = TurnEndState::default();
+        for k in 0..3 {
+            let a = act(&mut st, &r, t + k * MIN);
+            assert_eq!(a, TurnEndAction::Nothing, "{a:?}");
+        }
+        // The control: the banner's rows taken out, the composer under the
+        // wall.
+        let title = rows
+            .iter()
+            .position(|r| r.trim() == "Usage limit reached")
+            .expect("the banner's title");
+        let mut bare = rows[..title].to_vec();
+        bare.extend(
+            [
+                "› Ask Codex to do anything",
+                "",
+                "  GPT-6.1-Sol default · /x · lab stub",
+                "  ? for shortcuts",
+            ]
+            .map(String::from),
+        );
+        let reading = aterm_phase::read(Some("codex"), &bare, None);
+        assert_eq!(
+            reading.wall.as_ref().map(|w| w.kind),
+            Some(WallKind::Spend),
+            "{bare:#?}"
+        );
+        let r = TurnEndReading::of(&reading, &bare, false, Some(3 * MIN), None, None);
+        let a = act(&mut TurnEndState::default(), &r, t);
+        assert_ne!(a, TurnEndAction::Nothing, "the control: {a:?}");
+    }
+}
+
 #[test]
 fn the_rules_ride_in_the_continuation() {
     let now = t0();
@@ -2397,6 +3272,42 @@ fn the_rules_ride_in_the_continuation() {
             rule_id: RULE_CONTINUE
         }
     );
+    // THE RULES GIVE WAY TO A LONG TEXT: rules as long as the loop passes
+    // (its `RULES_CAP`, 400 characters) ride whole after `keep going`, but
+    // after the done check or the open-items challenge they would push the
+    // text past what the composer draws as typed (`VERBATIM_UNITS`; longer is
+    // `[Pasted text #N]`, which no guard reads back), so they are cut at a
+    // word, `…` after — counted in UTF-16 units, as Claude Code counts. Not
+    // one word fitting, they are left off.
+    let words = "word ".repeat(80);
+    let words = words.trim_end();
+    let astral = "😀 ".repeat(133);
+    let astral = astral.trim_end();
+    for rules in [words, astral] {
+        for text in [
+            continuation_text(&cfg(), Some(rules)),
+            done_check_text(Some(rules)),
+            open_items_text(OPEN_HEADS, Some(rules)),
+        ] {
+            let units = text.encode_utf16().count();
+            assert!(units <= VERBATIM_UNITS, "{units} units: {text}");
+            assert!(
+                text.ends_with(&format!("{rules})")) || text.ends_with("…)"),
+                "{text}"
+            );
+        }
+    }
+    assert_eq!(
+        continuation_text(&cfg(), Some(words)),
+        format!("keep going (standing rules: {words})")
+    );
+    let check = done_check_text(Some(words));
+    assert!(
+        check.starts_with(&format!("{DONE_CHECK} (standing rules: word word "))
+            && check.ends_with(" word…)"),
+        "{check}"
+    );
+    assert_eq!(done_check_text(Some(&"x".repeat(400))), DONE_CHECK);
 }
 
 #[test]
@@ -2596,7 +3507,7 @@ fn a_draft_left_standing_is_submitted_where_the_policy_would_act() {
     let drafted = |person: Option<Duration>| TurnEndReading {
         composer: Composer::Typed,
         person,
-        ..idle("Fixed the parser.", Some(3 * MIN))
+        ..idle("Fixed the parser.", Some(JOB))
     };
     let grace = Duration::from_secs(u64::from(cfg().human_grace_s));
     let mut st = TurnEndState::default();
@@ -2691,7 +3602,7 @@ fn aterms_own_words_left_in_the_prompt_are_never_sent_as_a_draft() {
     );
     assert_eq!(notice_part, Composer::Own);
     let release_whole = with_draft(
-        &crate::harness::upgrade::release_prompt(crate::harness::upgrade::Agent::Claude),
+        &crate::harness::upgrade::release_prompt(crate::harness::upgrade::Agent::Claude, false),
         "",
     );
     assert_eq!(release_whole, Composer::Own);
@@ -3352,20 +4263,20 @@ fn a_persons_keystroke_holds_every_act_for_the_grace() {
     let grace = Duration::from_secs(u64::from(cfg().human_grace_s));
     let ago = Duration::from_secs(30);
     for r in [
-        idle("Stage done.", Some(3 * MIN)),
-        idle("Should I rename the module?", Some(3 * MIN)),
-        walled(WallKind::Overloaded, "529", Some(3 * MIN)),
+        idle("Stage done.", Some(JOB)),
+        idle("Should I rename the module?", Some(JOB)),
+        walled(WallKind::Overloaded, "529", Some(JOB)),
         // A PERSON'S OWN `/compact` that failed (Claude Code 2.1.286, typed by
         // hand): its row is the full context's wall, and is theirs for the
         // grace like any act at a wall.
-        read_screen(&screen(COMPACT_FAILED_1_MEASURED), Some(3 * MIN)),
+        read_screen(&screen(COMPACT_FAILED_1_MEASURED), Some(JOB)),
         // A usage wall whose reset and grace have passed.
         TurnEndReading {
             reset_at: Some(now - 10 * MIN),
             ..walled(
                 WallKind::UsageWeekly,
                 "You've hit your weekly limit",
-                Some(3 * MIN),
+                Some(JOB),
             )
         },
     ] {
@@ -3520,6 +4431,249 @@ fn someone_elses_turn_opens_a_done_task_again() {
     assert_eq!(a, checked(), "their turn was real work: no back-off");
 }
 
+/// A PERSON'S OWN EXCHANGE IS THEIRS (the owner, 2026-10-15: a greeting was
+/// answered with `ATERM-TASK-DONE`, or else got the done check two minutes
+/// later). A turn a person's keystroke opened, answered within
+/// `EXCHANGE_WORK`, on a task the policy was not carrying, gets nothing —
+/// whatever its words: a done phrase, a question, the token, a plain greeting.
+#[test]
+fn a_persons_own_exchange_is_left_to_them_whatever_it_says() {
+    let now = t0();
+    let quick = Some(Duration::from_secs(5));
+    let theirs = |said: &str| TurnEndReading {
+        person: Some(Duration::from_secs(8)),
+        ..idle(said, quick)
+    };
+    for said in [
+        "Hi! What would you like me to work on?",
+        "Hi! What would you like me to work on?\nATERM-TASK-DONE",
+        "Hello! How can I help?",
+        "Which file is the bug in?",
+        "Hello!",
+    ] {
+        let mut st = TurnEndState::default();
+        assert_eq!(
+            at(&mut st, &theirs(said), now),
+            TurnEndAction::Nothing,
+            "{said}"
+        );
+        assert!(st.left_to_person(), "{said}");
+        for later in [2 * MIN, 60 * MIN, 24 * 60 * MIN] {
+            let r = TurnEndReading {
+                person: Some(later),
+                ..theirs(said)
+            };
+            let a = decide_turn_end(&st, &r, &cfg(), now + later);
+            assert_eq!(a, TurnEndAction::Nothing, "{said} at +{later:?}");
+        }
+    }
+    // However long the answer took inside `EXCHANGE_WORK` — it thought, it
+    // looked things up — it is still their exchange.
+    let long = EXCHANGE_WORK - MIN;
+    let mut st = TurnEndState::default();
+    let r = TurnEndReading {
+        person: Some(long + Duration::from_secs(8)),
+        ..idle("Keep the token: it costs nothing.", Some(long))
+    };
+    assert_eq!(at(&mut st, &r, now), TurnEndAction::Nothing);
+    assert!(st.left_to_person());
+    // Negative controls, each acted on as before. Nobody's hand (a dispatch,
+    // the agent's own wake): the back-off, then an act.
+    let said = "Hi! What would you like me to work on?";
+    let mut st = TurnEndState::default();
+    at(&mut st, &idle(said, quick), now);
+    assert!(!st.left_to_person());
+    let a = decide_turn_end(&st, &idle(said, quick), &cfg(), now + 60 * MIN);
+    assert!(a.rule_id().is_some(), "{a:?}");
+    // A keystroke from before the turn began.
+    let mut st = TurnEndState::default();
+    let old = TurnEndReading {
+        person: Some(5 * MIN),
+        ..idle(said, quick)
+    };
+    at(&mut st, &old, now);
+    assert!(!st.task_done());
+    // A turn they stopped with Esc, one that ended on a wall, and one that did
+    // real work: none is an exchange.
+    for r in [
+        TurnEndReading {
+            interrupted: true,
+            ..theirs(said)
+        },
+        TurnEndReading {
+            person: Some(Duration::from_secs(8)),
+            ..walled(WallKind::Overloaded, "529", quick)
+        },
+        TurnEndReading {
+            person: Some(JOB),
+            ..idle("Added the flag; the parser is next.", Some(JOB))
+        },
+    ] {
+        let mut st = TurnEndState::default();
+        at(&mut st, &r, now);
+        assert!(!st.task_done(), "{r:?}");
+    }
+}
+
+/// A person's quick turns INSIDE A RUN THE POLICY IS CARRYING (check-ins
+/// between its continuations, one after another) stay on the ladder; once
+/// the worker has said it is done, a quick turn of theirs (a closing
+/// "thanks") is theirs. Controls: the same turn on a task nobody is carrying
+/// is left to them, and a gesture before the turn began is no hand.
+#[test]
+fn a_check_in_on_a_carried_task_stays_on_the_ladder() {
+    let mut now = t0();
+    let mut st = TurnEndState::default();
+    at(&mut st, &idle("Stage 1 landed.", Some(10 * MIN)), now);
+    assert_eq!(
+        act(&mut st, &idle("Stage 1 landed.", None), now),
+        typed(RULE_CONTINUE)
+    );
+    now += 10 * MIN;
+    at(&mut st, &idle("Stage 2 landed.", Some(10 * MIN)), now);
+    let quick = Some(Duration::from_secs(5));
+    let check_in = TurnEndReading {
+        person: Some(Duration::from_secs(8)),
+        ..idle("Going well: stage 3 of 5 is next.", quick)
+    };
+    for _ in 0..2 {
+        now += MIN;
+        at(&mut st, &check_in, now);
+        assert!(!st.task_done());
+    }
+    let a = decide_turn_end(&st, &idle("Going well.", None), &cfg(), now + 60 * MIN);
+    assert_eq!(a, typed(RULE_CONTINUE));
+    // The worker said it is done (the check is owed): a closing quick turn
+    // of theirs is theirs.
+    now += MIN;
+    at(&mut st, &idle("All done.", Some(10 * MIN)), now);
+    assert_eq!(st.done_reports(), 1);
+    now += MIN;
+    let thanks = TurnEndReading {
+        person: Some(Duration::from_secs(8)),
+        ..idle("You're welcome!", quick)
+    };
+    at(&mut st, &thanks, now);
+    assert!(st.left_to_person());
+    // Control: no run carried, the same check-in is theirs.
+    let mut fresh = TurnEndState::default();
+    at(&mut fresh, &check_in, now);
+    assert!(fresh.left_to_person());
+    // Control: a scroll after the last point but before the turn began (an
+    // agent's own wake) is no hand.
+    let mut st = TurnEndState::default();
+    at(&mut st, &idle("Waiting on the build.", Some(10 * MIN)), now);
+    let woke = TurnEndReading {
+        person: Some(5 * MIN),
+        ..idle("The build passed.", quick)
+    };
+    at(&mut st, &woke, now + 6 * MIN);
+    assert!(!st.task_done());
+}
+
+/// THE CARRY ENDS WHERE THE TASK PASSES TO A PERSON: their own task after the
+/// worker said it is done, or their Esc on the policy's act, makes their next
+/// quick turn theirs. A loop that restarts carries what its ledger shows it
+/// typed within the window. Controls: the carried check-in stays on the
+/// ladder, and a fresh loop with no acts seeded leaves it to them.
+#[test]
+fn a_carry_ends_where_the_task_passes_to_a_person() {
+    let quick = Some(Duration::from_secs(5));
+    let theirs = |said: &str, worked: Option<Duration>| TurnEndReading {
+        person: Some(worked.unwrap_or_default() + Duration::from_secs(3)),
+        ..idle(said, worked)
+    };
+    let carried = |now: Instant| {
+        let mut st = TurnEndState::default();
+        at(&mut st, &idle("Stage 1 landed.", Some(10 * MIN)), now);
+        act(&mut st, &idle("Stage 1 landed.", None), now);
+        st
+    };
+    // Their own task after the worker's done report, then a quick follow-up.
+    let mut now = t0();
+    let mut st = carried(now);
+    now += 10 * MIN;
+    at(&mut st, &idle("All done.", Some(10 * MIN)), now);
+    now += MIN;
+    at(&mut st, &theirs("Added the flag.", Some(10 * MIN)), now);
+    assert!(!st.task_done());
+    now += MIN;
+    at(&mut st, &theirs("Got it.", quick), now);
+    assert!(st.left_to_person());
+    // Their Esc on the policy's continuation, then a quick turn of theirs.
+    let mut now = t0();
+    let mut st = carried(now);
+    now += 10 * MIN;
+    let stopped = TurnEndReading {
+        interrupted: true,
+        ..theirs("Stage 2 landed.", quick)
+    };
+    at(&mut st, &stopped, now);
+    now += MIN;
+    at(&mut st, &theirs("Sure.", quick), now);
+    assert!(st.left_to_person());
+    // A restarted loop: its ledger's act within the window carries the task.
+    let now = t0();
+    let mut st = TurnEndState::default();
+    st.seed_acts(&[5 * MIN], now);
+    at(&mut st, &idle("Stage 2 landed.", None), now);
+    at(&mut st, &theirs("Stage 3 is next.", quick), now + MIN);
+    assert!(!st.task_done());
+    // Control: nothing seeded, the same turn is theirs.
+    let mut st = TurnEndState::default();
+    at(&mut st, &idle("Stage 2 landed.", None), now);
+    at(&mut st, &theirs("Stage 3 is next.", quick), now + MIN);
+    assert!(st.left_to_person());
+}
+
+/// A wall's retry that delivers a person's own exchange again, answered
+/// short, leaves it theirs; a retry of a person's job does not — one that
+/// worked past `EXCHANGE_WORK` before the wall, or one the wall split into
+/// parts that are each within it but not in all.
+#[test]
+fn a_persons_exchange_on_a_wall_gets_its_retry_and_stays_theirs() {
+    let mut now = t0();
+    let mut st = TurnEndState::default();
+    let quick = Some(Duration::from_secs(5));
+    let r = TurnEndReading {
+        person: Some(Duration::from_secs(8)),
+        ..walled(WallKind::Overloaded, "529", quick)
+    };
+    at(&mut st, &r, now);
+    assert!(!st.task_done(), "a wall is its ladder's");
+    now += 10 * MIN;
+    // The point read again (no new turn): the wall's retry.
+    let retry = TurnEndReading {
+        person: None,
+        worked: None,
+        ..r
+    };
+    let a = act(&mut st, &retry, now);
+    assert!(a.rule_id().is_some_and(is_wall_retry), "{a:?}");
+    now += MIN;
+    at(&mut st, &idle("Hello! How can I help?", quick), now);
+    assert!(st.left_to_person());
+    // Controls: their turn had worked past `EXCHANGE_WORK` before the wall,
+    // or six minutes before it and six more after its retry.
+    let half = Some(6 * MIN);
+    for (before, after) in [(Some(JOB), quick), (half, half)] {
+        let mut st = TurnEndState::default();
+        let r = TurnEndReading {
+            person: before,
+            ..walled(WallKind::Overloaded, "529", before)
+        };
+        at(&mut st, &r, now);
+        let retry = TurnEndReading {
+            person: None,
+            worked: None,
+            ..r
+        };
+        act(&mut st, &retry, now + 10 * MIN);
+        at(&mut st, &idle("Stage 2 of 5 done.", after), now + 20 * MIN);
+        assert!(!st.task_done(), "{before:?} then {after:?}");
+    }
+}
+
 /// Someone else's turn that ends on a wall opens a done task again too: the
 /// wall's own ladder runs (the 529's retry, the full context's `/compact`).
 /// Negative control: the same wall on a fresh state acts the same way.
@@ -3562,7 +4716,8 @@ fn someone_elses_turn_that_ends_on_a_wall_is_walled_not_done() {
             a,
             TurnEndAction::WaitUntil {
                 until: now + MIN,
-                why: "overloaded retry 1".to_string()
+                why: "overloaded retry 1".to_string(),
+                retry: true,
             }
         );
         let same = TurnEndReading {
@@ -6977,13 +8132,11 @@ fn a_done_task_never_strands_an_open_switch() {
 /// rung after an `api-back` act the wall met again) is a next try; the check
 /// that the worker took the act, a person typing, a person's Esc, a limit's
 /// reset and a context wall's `/compact` check are not. Each is produced by
-/// the real policy here, so a reworded reason moves with the test. (The
-/// `/model` picker's wait needs Codex's whole save-then-wait switch, and
-/// stays a literal.)
+/// the real policy here, and read by its `retry` flag, never its words.
 #[test]
 fn only_a_retrys_wait_is_the_next_try() {
-    let why = |a: &TurnEndAction| match a {
-        TurnEndAction::WaitUntil { why, .. } => why.clone(),
+    let wait = |a: &TurnEndAction| match a {
+        TurnEndAction::WaitUntil { why, retry, .. } => (why.clone(), *retry),
         other => panic!("a wait: {other:?}"),
     };
     let t = t0();
@@ -7039,8 +8192,8 @@ fn only_a_retrys_wait_is_the_next_try() {
                 t + Duration::from_secs(1),
             );
         }
-        let w = why(&a);
-        assert!(is_retry_wait(&w), "{name}: {w}");
+        let (w, retry) = wait(&a);
+        assert!(retry, "{name}: {w}");
     }
     // The rung after an `api-back` act: the host measured the API reachable
     // and the loop continued at once (`api-back@v1`), and the wall met the
@@ -7055,9 +8208,9 @@ fn only_a_retrys_wait_is_the_next_try() {
     let mut st = TurnEndState::default();
     let back = act(&mut st, &up, t);
     assert_eq!(back.rule_id(), Some(RULE_API_BACK), "{back:?}");
-    let w = why(&at(&mut st, &up, t + 3 * MIN));
+    let (w, retry) = wait(&at(&mut st, &up, t + 3 * MIN));
     assert!(w.contains("back but met again"), "{w}");
-    assert!(is_retry_wait(&w), "{w}");
+    assert!(retry, "{w}");
     // NOT a try: the check that the worker took the act just typed.
     let mut st = TurnEndState::default();
     let r = walled(unreachable, "API Error", Some(3 * MIN));
@@ -7079,33 +8232,33 @@ fn only_a_retrys_wait_is_the_next_try() {
         },
         t + MIN + Duration::from_secs(1),
     );
-    let w = why(&check);
+    let (w, retry) = wait(&check);
     assert!(w.contains("the worker to take"), "{w}");
-    assert!(!is_retry_wait(&w), "{w}");
+    assert!(!retry, "{w}");
     // NOT a try: a person typing into the walled session, a person's Esc.
     let typing = TurnEndReading {
         person: Some(Duration::ZERO),
         ..walled(unreachable, "API Error", Some(3 * MIN))
     };
-    let w = why(&at(&mut TurnEndState::default(), &typing, t));
+    let (w, retry) = wait(&at(&mut TurnEndState::default(), &typing, t));
     assert!(w.contains("a person is typing"), "{w}");
-    assert!(!is_retry_wait(&w), "{w}");
+    assert!(!retry, "{w}");
     let esc = TurnEndReading {
         interrupted: true,
         ..idle("Interrupted", Some(3 * MIN))
     };
-    let w = why(&at(&mut TurnEndState::default(), &esc, t));
+    let (w, retry) = wait(&at(&mut TurnEndState::default(), &esc, t));
     assert!(w.contains("stopped the turn with Esc"), "{w}");
-    assert!(!is_retry_wait(&w), "{w}");
+    assert!(!retry, "{w}");
     // NOT a try: a usage limit's reset, a full context's `/compact` check.
     let limit = walled(
         WallKind::UsageSession,
         "You've hit your session limit · resets 7:30pm",
         Some(3 * MIN),
     );
-    let w = why(&at(&mut TurnEndState::default(), &limit, t));
+    let (w, retry) = wait(&at(&mut TurnEndState::default(), &limit, t));
     assert!(w.ends_with("resets"), "{w}");
-    assert!(!is_retry_wait(&w), "{w}");
+    assert!(!retry, "{w}");
     let mut st = TurnEndState::default();
     let full = walled(WallKind::Context, "Context low", Some(3 * MIN));
     let compact = act(&mut st, &full, t);
@@ -7113,13 +8266,9 @@ fn only_a_retrys_wait_is_the_next_try() {
         matches!(&compact, TurnEndAction::TypeCommand { command, .. } if command == "/compact"),
         "{compact:?}"
     );
-    let w = why(&at(&mut st, &again(&full), t + Duration::from_secs(1)));
+    let (w, retry) = wait(&at(&mut st, &again(&full), t + Duration::from_secs(1)));
     assert!(w.contains("context still full"), "{w}");
-    assert!(!is_retry_wait(&w), "{w}");
-    // NOT a try (a literal: the picker's wait, see above).
-    assert!(!is_retry_wait(
-        "the /model picker's next box, or its leaving"
-    ));
+    assert!(!retry, "{w}");
 }
 
 /// The owner's tab 1, 2026-09-28 12:19:43 PDT — the MEASURED screen (the weekly
@@ -7933,9 +9082,15 @@ fn finished_is_only_the_token_on_the_last_line() {
         assert!(!says_finished(Some(no)), "{no:?}");
     }
     assert!(!says_finished(None));
-    // The primer (`aterm-primer`'s PRIMER_BODY) teaches this exact spelling.
-    assert_eq!(FINISHED, "ATERM-TASK-DONE");
-    assert!(DONE_CHECK.contains(FINISHED));
+    // The primer every agent here loads teaches this exact spelling, on a line
+    // by itself, and so do the done check and the challenge.
+    assert!(
+        aterm_primer::primer_block(None).contains(&format!("`{FINISHED}` on a line by itself")),
+        "{}",
+        aterm_primer::primer_block(None)
+    );
+    assert!(DONE_CHECK.contains(&format!("{FINISHED} on a line by itself")));
+    assert!(open_items_text(&[], None).contains(&format!("{FINISHED} on a line by itself")));
 }
 
 /// A finished task is opened again by someone else's turn that ends without
@@ -7970,6 +9125,335 @@ fn a_finished_task_opens_again_and_a_walled_token_is_no_finish() {
     r.pending_input = true;
     at(&mut st, &r, t0());
     assert!(!st.finished_by_worker());
+}
+
+/// The report that ended with the token while its own words listed work
+/// left (the owner, 2026-10-16: "stop telling me done if you're not done").
+const OPEN_REPORT: &str = "Built and tested the parser; committed on main.\n\
+                           Still open: the lexer's e2e suite (not run).\n\
+                           ATERM-TASK-DONE";
+
+/// The challenge as typed for [`OPEN_REPORT`].
+fn challenged() -> TurnEndAction {
+    TurnEndAction::Type {
+        text: open_items_text(&["still open"], None),
+        rule_id: RULE_OPEN_ITEMS,
+    }
+}
+
+/// WHAT A FINISHED REPORT LEAVES OPEN, in its own words ([`open_work`]): a
+/// head (`Still open:`, `Left:`, `Next steps`, …) with an item that is
+/// neither negated nor blocked, or a status word (`not run`, `skipped`)
+/// that stands undescribed. NEGATIVE CONTROLS: a negation (`Nothing left`,
+/// `Left: none`, `0 skipped`), an item that names its blocker or a decision,
+/// a description (`do not run it twice`, `is skipped`), code in backticks,
+/// and a word that only begins like a head (`Left the config`).
+#[test]
+fn open_work_reads_heads_and_status_words_and_never_a_negation() {
+    for (tail, want) in [
+        (
+            "Committed the parser. Left: the lexer.\nATERM-TASK-DONE",
+            &["left"][..],
+        ),
+        (OPEN_REPORT, &["still open"]),
+        (
+            "Done:\n- the parser\nStill open:\n- the lexer\n- the docs\nATERM-TASK-DONE",
+            &["still open"],
+        ),
+        (
+            "**Remaining work:** the lexer.\nATERM-TASK-DONE",
+            &["remaining"],
+        ),
+        (
+            "## Next steps\n1. Port the reader.\nATERM-TASK-DONE",
+            &["next steps"],
+        ),
+        (
+            "Follow-ups:\n- delete the old table\nATERM-TASK-DONE",
+            &["follow-ups"],
+        ),
+        ("TODO: wire the flag.\nATERM-TASK-DONE", &["todo"]),
+        (
+            "Landed the parser; the e2e suite was not run.\nATERM-TASK-DONE",
+            &["not run"],
+        ),
+        (
+            "Tests: 12 passed, 2 skipped.\nATERM-TASK-DONE",
+            &["skipped"],
+        ),
+        (
+            "Left: nothing. The e2e suite was not run.\nATERM-TASK-DONE",
+            &["not run"],
+        ),
+        // A row Claude Code wrapped carries the line on.
+        (
+            "Still open: the lexer's e2e suite, which needs a\nrebuild of its fixtures.\nATERM-TASK-DONE",
+            &["still open"],
+        ),
+        (
+            "Left: the lexer.\nThe docs were skipped.\nATERM-TASK-DONE",
+            &["left", "skipped"],
+        ),
+    ] {
+        assert_eq!(open_work(Some(tail)), want, "{tail:?}");
+    }
+    for tail in [
+        "Nothing left.\nATERM-TASK-DONE",
+        "No open items.\nATERM-TASK-DONE",
+        "Left: none.\nATERM-TASK-DONE",
+        "Still open: nothing.\nATERM-TASK-DONE",
+        "Remaining: n/a\nATERM-TASK-DONE",
+        "Next steps: none from me.\nATERM-TASK-DONE",
+        "Tests: 12 passed, 0 skipped.\nATERM-TASK-DONE",
+        "Nothing was skipped.\nATERM-TASK-DONE",
+        "Still open (needs the owner's credential): the release.\nATERM-TASK-DONE",
+        "Still open:\n- the release: needs the owner's release credential\n\
+         - the GPU bench: no GPU on this host\nATERM-TASK-DONE",
+        "Left: the release, blocked on the owner's credential.\nATERM-TASK-DONE",
+        "Not done (decision): kept the cache at 64 MB; 128 MB costs 40 ms more.\nATERM-TASK-DONE",
+        "Do not run the migration twice.\nATERM-TASK-DONE",
+        "A warm cache is skipped, which saves 3 ms.\nATERM-TASK-DONE",
+        "Ran `targo --unverified test -- --skipped`; all green.\nATERM-TASK-DONE",
+        "Removed the skipped-test registry.\nATERM-TASK-DONE",
+        "Left the config as it was; the remaining tests pass.\nATERM-TASK-DONE",
+        "Opened the PR and left a note.\nATERM-TASK-DONE",
+        "Landed on main; every gate green.\nATERM-TASK-DONE",
+        "Hi! What would you like me to work on?\nATERM-TASK-DONE",
+        "ATERM-TASK-DONE",
+    ] {
+        assert!(open_work(Some(tail)).is_empty(), "{tail:?}");
+    }
+    assert!(open_work(None).is_empty());
+}
+
+#[test]
+fn open_work_keeps_fenced_examples_out_of_the_report() {
+    for tail in [
+        "A sample report:\n```text\nStill open: finish the tests.\n```\nATERM-TASK-DONE",
+        "A sample report:\n````text\n```\nTests were not run.\n```\n````\nATERM-TASK-DONE",
+        "A sample report:\n~~~text\nStill open: finish the tests.\n~~~\nATERM-TASK-DONE",
+        "A sample report:\n```text\nStill open: finish the tests.\nATERM-TASK-DONE",
+        "Still open:\n```text\nAn example, not a reported item.\n```\nAll checks passed.\nATERM-TASK-DONE",
+    ] {
+        assert!(open_work(Some(tail)).is_empty(), "{tail:?}");
+    }
+    for fence in ["```", "~~~~"] {
+        let tail = format!(
+            "A sample report:\n{fence}text\nLeft: the example only.\n{fence}\n\
+             Still open: finish the actual tests.\nATERM-TASK-DONE"
+        );
+        assert_eq!(open_work(Some(&tail)), &["still open"], "{tail:?}");
+    }
+    assert_eq!(
+        open_work(Some(
+            "All work completed\n```text\nAn example.\n```\nstill open: the actual tests.\nATERM-TASK-DONE"
+        )),
+        &["still open"]
+    );
+}
+
+#[test]
+fn open_work_reads_balanced_underscore_emphasis_without_splitting_identifiers() {
+    for (tail, want) in [
+        (
+            "__Still open__: finish the tests.\nATERM-TASK-DONE",
+            "still open",
+        ),
+        (
+            "_Remaining work_: finish the tests.\nATERM-TASK-DONE",
+            "remaining",
+        ),
+        ("The tests were _not run_.\nATERM-TASK-DONE", "not run"),
+        ("The checks were __skipped__.\nATERM-TASK-DONE", "skipped"),
+    ] {
+        assert_eq!(open_work(Some(tail)), &[want], "{tail:?}");
+    }
+    for tail in [
+        "Removed the skipped_test registry.\nATERM-TASK-DONE",
+        "Removed the _skipped_test_ registry.\nATERM-TASK-DONE",
+        "__Still open: an unmatched example marker.\nATERM-TASK-DONE",
+        "Ran `_not run_` as the example string.\nATERM-TASK-DONE",
+    ] {
+        assert!(open_work(Some(tail)).is_empty(), "{tail:?}");
+    }
+}
+
+#[test]
+fn open_work_reads_later_unblocked_sentences_after_a_blocked_item() {
+    for tail in [
+        "Still open: the release needs a credential. Tests were not run.\nATERM-TASK-DONE",
+        "Left (blocked on the owner): the release. The tests were not run.\nATERM-TASK-DONE",
+        "Still open: the release needs a credential; the tests were not run.\nATERM-TASK-DONE",
+    ] {
+        assert_eq!(open_work(Some(tail)), &["not run"], "{tail:?}");
+    }
+    for tail in [
+        "Still open: the release tests were not run without the owner's credential.\nATERM-TASK-DONE",
+        "Left (blocked on the owner): the release. No tests were skipped.\nATERM-TASK-DONE",
+    ] {
+        assert!(open_work(Some(tail)).is_empty(), "{tail:?}");
+    }
+    assert_eq!(
+        open_work(Some(
+            "Left: fix the tests. Tests were skipped.\nATERM-TASK-DONE"
+        )),
+        &["left", "skipped"]
+    );
+}
+
+/// A FINISHED REPORT THAT STILL NAMES OPEN WORK does not end the task (the
+/// owner, 2026-10-16: an agent ended with the token while its own "Still
+/// open" list held work it could do): it gets the challenge at once — no
+/// back-off — and the challenge names what was found in aterm's own words.
+/// A FINISHED after it ends the task whatever it still lists, and so does a
+/// done reply: one challenge a job, never a loop. A reply of work carries the
+/// job on, and the job's next FINISHED ends it. Once the job is over the next
+/// one, opened by someone's turn, is challenged afresh. NEGATIVE CONTROL: a
+/// report that says nothing is left ends the task at once.
+#[test]
+fn a_finished_report_naming_open_work_is_challenged_once_a_job() {
+    let mut st = TurnEndState::default();
+    let mut now = t0();
+    // Someone's turn of real work ends on the open report: challenged now.
+    assert_eq!(
+        act(&mut st, &idle(OPEN_REPORT, Some(JOB)), now),
+        challenged()
+    );
+    assert!(!st.task_done() && !st.finished_by_worker());
+    assert_eq!(st.open_items(), (&[][..], true));
+    // Its FINISHED reply ends the task though it still lists an item.
+    now += 5 * MIN;
+    let still = "Ran the lexer's e2e suite: green, committed.\nLeft: the docs.\nATERM-TASK-DONE";
+    assert_eq!(
+        at(&mut st, &idle(still, Some(5 * MIN)), now),
+        TurnEndAction::Nothing
+    );
+    assert!(st.task_done() && st.finished_by_worker() && !st.done_after_challenge());
+    assert_eq!(st.open_items(), (&[][..], false), "the job is over");
+    for later in [2 * MIN, 60 * MIN, 24 * 60 * MIN] {
+        assert_eq!(
+            at(&mut st, &idle(still, None), now + later),
+            TurnEndAction::Nothing
+        );
+    }
+    // The next job, opened by someone's turn, is challenged afresh.
+    now += 60 * MIN;
+    assert_eq!(
+        act(&mut st, &idle(OPEN_REPORT, Some(JOB)), now),
+        challenged()
+    );
+
+    // A done reply to the challenge ends the task, as the check's does.
+    let mut st = TurnEndState::default();
+    let mut now = t0();
+    act(&mut st, &idle(OPEN_REPORT, Some(JOB)), now);
+    now += 5 * MIN;
+    let a = at(
+        &mut st,
+        &idle("All done; nothing left to do.", Some(5 * MIN)),
+        now,
+    );
+    assert_eq!(a, TurnEndAction::Nothing);
+    assert!(st.task_done() && !st.finished_by_worker());
+    assert!(st.done_after_challenge(), "the journal names the challenge");
+
+    // A reply of work carries the job on, and the job's next FINISHED ends
+    // it, open work and all: the job had its challenge.
+    let mut st = TurnEndState::default();
+    let mut now = t0();
+    act(&mut st, &idle(OPEN_REPORT, Some(JOB)), now);
+    now += 5 * MIN;
+    let a = act(
+        &mut st,
+        &idle("Running the lexer's e2e suite.", Some(5 * MIN)),
+        now,
+    );
+    assert_eq!(a, typed(RULE_CONTINUE));
+    now += 5 * MIN;
+    assert_eq!(
+        at(&mut st, &idle(OPEN_REPORT, Some(JOB)), now),
+        TurnEndAction::Nothing
+    );
+    assert!(st.finished_by_worker());
+
+    // The done check answered with an open FINISHED: challenged, not ended.
+    let mut st = TurnEndState::default();
+    let mut now = t0();
+    let a = act(
+        &mut st,
+        &idle("Fixed the parser; all done.", Some(JOB)),
+        now,
+    );
+    assert_eq!(a, checked());
+    now += 5 * MIN;
+    assert_eq!(
+        at(&mut st, &idle(OPEN_REPORT, Some(5 * MIN)), now),
+        challenged()
+    );
+    assert!(!st.task_done());
+
+    // NEGATIVE CONTROL: nothing left, so the token ends the task at once.
+    let mut st = TurnEndState::default();
+    let a = at(
+        &mut st,
+        &idle(
+            "Built, tested and landed the parser. Nothing left.\nATERM-TASK-DONE",
+            Some(JOB),
+        ),
+        t0(),
+    );
+    assert_eq!(a, TurnEndAction::Nothing);
+    assert!(st.finished_by_worker());
+}
+
+/// Where nothing says the job was not challenged, or the open report is not
+/// the policy's to challenge, the token ends the task as before: the first
+/// point a loop attaches to (the loop before it may have challenged it), a
+/// person's own exchange, a turn they stopped with Esc, Land (its
+/// instruction asks for what is left beside the token) and Off. NEGATIVE
+/// CONTROL: the same report after a turn this state saw run is challenged.
+#[test]
+fn the_token_ends_the_task_where_the_challenge_is_not_the_policys() {
+    let now = t0();
+    let cases: [(&str, TurnEndReading); 5] = [
+        ("attached", idle(OPEN_REPORT, None)),
+        (
+            "a person's exchange",
+            TurnEndReading {
+                person: Some(Duration::from_secs(8)),
+                ..idle(OPEN_REPORT, Some(Duration::from_secs(5)))
+            },
+        ),
+        (
+            "stopped with Esc",
+            TurnEndReading {
+                interrupted: true,
+                ..idle(OPEN_REPORT, Some(JOB))
+            },
+        ),
+        ("land", land(idle(OPEN_REPORT, Some(JOB)))),
+        (
+            "off",
+            TurnEndReading {
+                autopilot: Autopilot::Off,
+                ..idle(OPEN_REPORT, Some(JOB))
+            },
+        ),
+    ];
+    for (case, r) in cases {
+        let mut st = TurnEndState::default();
+        st.observe(&r, now);
+        assert!(st.task_done(), "{case}");
+        assert_eq!(st.open_items().0, &[] as &[&str], "{case}");
+        let a = decide_turn_end(&st, &r, &cfg(), now + 5 * MIN);
+        assert_eq!(a, TurnEndAction::Nothing, "{case}");
+    }
+    // NEGATIVE CONTROL: a turn this state saw run.
+    let mut st = TurnEndState::default();
+    assert_eq!(
+        at(&mut st, &idle(OPEN_REPORT, Some(JOB)), now),
+        challenged()
+    );
 }
 
 // ------------------------------------------------------------------------
@@ -8428,7 +9912,7 @@ fn a_session_makes_at_most_four_account_moves_an_hour() {
 #[test]
 fn a_plain_turn_end_moves_ahead_of_the_wall_around_its_own_act() {
     let t = t0();
-    let end = idle("Stage 2 done.", Some(5 * MIN));
+    let end = idle("Stage 2 done.", Some(JOB));
     let r = advised(&end, "work-2");
     let cont = at(&mut TurnEndState::default(), &end, t);
     assert_eq!(cont, typed(RULE_CONTINUE));
@@ -8546,15 +10030,35 @@ fn an_account_move_is_asked_ahead_of_the_models_return() {
     assert_eq!(st.model_switch(), None);
 }
 
-/// A LOST LOGIN RIGHT AFTER THIS SESSION'S OWN MOVE is the move's, not the
-/// person's: with the host's advice (it has struck the account) the answer
-/// is the next account — no `/login` typed, nothing escalated, no exception
-/// raised — and the login rule only what the point gets where the relaunch
-/// is not made. NEGATIVE CONTROLS: no advice; a session that made no move;
-/// once `/login` has been typed; a draft in the composer (the person's);
-/// past the session's bound; and under `retry_api_errors = false` the move
-/// is still asked and no exception stands, where with no advice the login
-/// exception does.
+/// The state after a move made at a usage limit to `work-2` whose relaunched
+/// session has been asked a turn (one the host typed: any turn asked does):
+/// a lost login the screen shows next is the new process's own.
+fn moved_and_asked(t: Instant) -> TurnEndState {
+    let mut st = TurnEndState::default();
+    st.restarted(
+        &to_account("work-2", AccountAt::Wall),
+        true,
+        &session_wall(t),
+        t,
+    );
+    st.host_typed(t);
+    st
+}
+
+/// A LOST LOGIN RIGHT AFTER THIS SESSION'S OWN MOVE — met by a turn asked
+/// under the new login — is the move's, not the person's: with the host's
+/// advice (it has struck the account) the answer is the next account — no
+/// `/login` typed, nothing escalated, no exception raised — and where the
+/// relaunch is not made, a wait. With no move to make (no advice, the
+/// session's bound spent) the point is waited at, never signed in.
+/// NEGATIVE CONTROLS: a session that made no move types `/login`, and so does
+/// one under `accounts = "off"` — after which nothing more, not even the
+/// move; a draft in the composer is the person's; and under `retry_api_errors
+/// = false` the move is still asked and no exception stands, where a session
+/// that made no move has the login exception. (Rewritten for F11/F12: the
+/// moved session here has been asked a turn first; before one is, the same
+/// row is the old process's:
+/// `a_lost_login_before_any_turn_is_asked_is_the_old_process_s`.)
 #[test]
 fn a_lost_login_right_after_a_move_is_answered_by_the_next_account() {
     let t = t0();
@@ -8568,16 +10072,14 @@ fn a_lost_login_right_after_a_move_is_answered_by_the_next_account() {
         rule_id: RULE_LOGIN,
         then: Then::Escalate("finish sign-in in the browser".to_string()),
     };
-    let moved = || {
-        let mut st = TurnEndState::default();
-        st.restarted(
-            &to_account("work-2", AccountAt::Wall),
-            true,
-            &session_wall(t),
-            t,
-        );
-        st
-    };
+    // Asked again after the restart ladder's last pause.
+    let reask = t
+        + MIN
+        + *TurnEndTiming::default()
+            .restart_backoff
+            .last()
+            .expect("a ladder");
+    let moved = || moved_and_asked(t);
     let r = advised(&gone, "pool-a");
     let mut st = moved();
     let a = at(&mut st, &r, t + MIN);
@@ -8585,20 +10087,37 @@ fn a_lost_login_right_after_a_move_is_answered_by_the_next_account() {
         restarts(&a, &to_account("pool-a", AccountAt::Wall), RULE_ACCOUNT),
         "{a:?}"
     );
-    assert_eq!(otherwise_of(&a), &login);
+    assert!(waits_until(otherwise_of(&a), reask), "{a:?}");
     assert_eq!(
         super::super::exception::exception_for(&st, &r, &cfg(), t + MIN),
         None
     );
+    // No move to make: waited at.
+    let a = at(&mut moved(), &gone, t + MIN);
+    assert!(waits_until(&a, reask), "no advice: {a:?}");
+    let mut spent = moved();
+    for i in 1..ACCOUNT_MOVES_PER_WINDOW {
+        let when = t + Duration::from_secs(u64::try_from(i).expect("small"));
+        spent.restarted(&to_account("pool-a", AccountAt::Wall), true, &gone, when);
+        spent.host_typed(when);
+    }
+    let a = at(&mut spent, &r, t + MIN);
+    assert!(
+        matches!(&a, TurnEndAction::WaitUntil { until, why, .. }
+            if *until == t + 60 * MIN && why.contains("a breaker: 4 account moves")),
+        "the bound is spent, until its oldest move leaves the window: {a:?}"
+    );
     // NEGATIVE CONTROLS.
-    assert_eq!(at(&mut moved(), &gone, t + MIN), login, "no advice");
     assert_eq!(
         at(&mut TurnEndState::default(), &r, t + MIN),
         login,
         "no move of this session's"
     );
+    let mut off = cfg();
+    off.accounts = crate::harness::accounts::Mode::Off;
     let mut st = moved();
-    assert_eq!(act(&mut st, &gone, t + MIN), login);
+    assert_eq!(at_under(&mut st, &gone, t + MIN, &off), login);
+    st.acted(&login, &gone, t + MIN);
     let again = TurnEndReading {
         worked: None,
         ..r.clone()
@@ -8614,12 +10133,6 @@ fn a_lost_login_right_after_a_move_is_answered_by_the_next_account() {
         &at(&mut moved(), &drafted, t + MIN),
         "a draft stands in the composer"
     ));
-    let mut spent = moved();
-    for i in 1..ACCOUNT_MOVES_PER_WINDOW {
-        let when = t + Duration::from_secs(u64::try_from(i).expect("small"));
-        spent.restarted(&to_account("pool-a", AccountAt::Wall), true, &gone, when);
-    }
-    assert_eq!(at(&mut spent, &r, t + MIN), login, "the bound is spent");
     // `retry_api_errors = false`.
     let mut off = cfg();
     off.retry_api_errors = false;
@@ -8630,12 +10143,12 @@ fn a_lost_login_right_after_a_move_is_answered_by_the_next_account() {
         &to_account("pool-a", AccountAt::Wall),
         RULE_ACCOUNT
     ));
-    assert!(is_escalate(otherwise_of(&a), "the login is gone"));
+    assert!(waits_until(otherwise_of(&a), reask), "{a:?}");
     assert_eq!(
         super::super::exception::exception_for(&st, &r, &off, t + MIN),
         None
     );
-    let mut st = moved();
+    let mut st = TurnEndState::default();
     st.observe(&gone, t + MIN);
     assert_eq!(
         super::super::exception::exception_for(&st, &gone, &off, t + MIN).map(|e| e.kind),
@@ -8643,13 +10156,605 @@ fn a_lost_login_right_after_a_move_is_answered_by_the_next_account() {
     );
 }
 
+/// A LOST LOGIN AFTER A MOVE, EVERY OTHER ACCOUNT WALLED: the host advises a
+/// wait, and the point waits until its instant (never nearer than a minute),
+/// typing nothing, counting no attempt and raising no exception — under
+/// `retry_api_errors = false` too — so when an account opens, the move is
+/// still asked. NEGATIVE CONTROL: the same wall and advice in a session that
+/// made no move types `/login`. (Rewritten for F11/F12: a turn is asked under
+/// the new login first, so the lost login is the new process's own.)
+#[test]
+fn a_lost_login_after_a_move_waits_for_an_account_and_types_nothing() {
+    let t = t0();
+    let gone = walled(
+        WallKind::Auth,
+        "Not logged in · Please run /login",
+        Some(Duration::from_secs(2)),
+    );
+    let mut st = moved_and_asked(t);
+    let r = advised_wait(&gone, t + 30 * MIN);
+    let a = act(&mut st, &r, t + MIN);
+    assert_eq!(
+        a,
+        TurnEndAction::WaitUntil {
+            until: t + 30 * MIN,
+            why: "the login is gone: another account can be used then".to_string(),
+            retry: false,
+        }
+    );
+    assert_eq!(st.login_track(), Some(0), "no attempt counted");
+    let mut off = cfg();
+    off.retry_api_errors = false;
+    for cfg in [cfg(), off.clone()] {
+        assert_eq!(
+            super::super::exception::exception_for(&st, &r, &cfg, t + MIN),
+            None
+        );
+    }
+    assert_eq!(decide_turn_end(&st, &r, &off, t + MIN), a, "no escalation");
+    let soon = advised_wait(&gone, t + MIN);
+    assert!(waits_until(&at(&mut st, &soon, t + 2 * MIN), t + 3 * MIN));
+    // The way back opens: the move.
+    let back = TurnEndReading {
+        worked: None,
+        ..advised(&gone, "main")
+    };
+    let a = at(&mut st, &back, t + 30 * MIN);
+    assert!(
+        restarts(&a, &to_account("main", AccountAt::Wall), RULE_ACCOUNT),
+        "{a:?}"
+    );
+    // NEGATIVE CONTROL.
+    let a = at(&mut TurnEndState::default(), &r, t + MIN);
+    assert!(
+        matches!(&a, TurnEndAction::TypeCommand { command, rule_id: RULE_LOGIN, .. }
+            if command == "/login"),
+        "{a:?}"
+    );
+}
+
+/// F17: A LOST LOGIN AFTER A MOVE IS WAITED AT ONLY WHERE A MOVE COULD EVER
+/// BE MADE. Under `relaunch = false` or `resume_limits = false`, where no
+/// host relaunches the agent, and for an agent that is not Claude Code, the
+/// wall's own rule decides it as for a session with no move — `/login` (on
+/// Codex the escalation naming `codex login`), or the escalation under
+/// `retry_api_errors = false` — and the login exception
+/// stands once it has: never a silent wait every ten minutes for ever. An
+/// upgrade holding the point is no such place: the move waits for it.
+/// NEGATIVE CONTROL: the same point where a move can be made waits.
+#[test]
+fn a_lost_login_is_waited_at_only_where_a_move_could_be_made() {
+    let t = t0();
+    let gone = walled(
+        WallKind::Auth,
+        "Not logged in · Please run /login",
+        Some(Duration::from_secs(2)),
+    );
+    let login = TurnEndAction::TypeCommand {
+        command: "/login".to_string(),
+        rule_id: RULE_LOGIN,
+        then: Then::Escalate("finish sign-in in the browser".to_string()),
+    };
+    let reask = t
+        + MIN
+        + *TurnEndTiming::default()
+            .restart_backoff
+            .last()
+            .expect("a ladder");
+    // NEGATIVE CONTROL: a move can be made — waited at, never `/login` (the
+    // host advising nothing, the login exception that asks for the sign-in
+    // stands: `a_lost_login_with_no_account_to_wait_for_asks_for_its_sign_in_now`).
+    let mut st = moved_and_asked(t);
+    assert!(waits_until(&at(&mut st, &gone, t + MIN), reask));
+    assert_eq!(
+        super::super::exception::exception_for(&st, &gone, &cfg(), t + MIN).map(|e| (
+            e.kind,
+            e.when,
+            e.escalated
+        )),
+        Some((
+            super::super::outlook::ExceptionKind::Login,
+            super::super::exception::Urgency::Now,
+            false
+        ))
+    );
+    // Under each switch that stops every move, the wall's own rule.
+    for limit in ["relaunch", "resume_limits"] {
+        let mut off = cfg();
+        off.limit(limit);
+        let mut st = moved_and_asked(t);
+        let a = at_under(&mut st, &gone, t + MIN, &off);
+        assert_eq!(a, login, "{limit}");
+        st.acted(&a, &gone, t + MIN);
+        assert_eq!(
+            super::super::exception::exception_for(&st, &gone, &off, t + 2 * MIN)
+                .map(|e| (e.kind, e.when)),
+            Some((
+                super::super::outlook::ExceptionKind::Login,
+                super::super::exception::Urgency::Now
+            )),
+            "{limit}"
+        );
+        let mut esc = off.clone();
+        esc.retry_api_errors = false;
+        assert!(
+            is_escalate(
+                &at_under(&mut moved_and_asked(t), &gone, t + MIN, &esc),
+                "the login is gone"
+            ),
+            "{limit}"
+        );
+    }
+    let mut stuck = gone.clone();
+    stuck.restartable = false;
+    assert_eq!(
+        at(&mut moved_and_asked(t), &stuck, t + MIN),
+        login,
+        "no host relaunches"
+    );
+    let mut codex = gone.clone();
+    codex.program = aterm_phase::Program::Codex;
+    assert!(
+        is_escalate(&at(&mut moved_and_asked(t), &codex, t + MIN), "codex login"),
+        "not Claude Code: its own sign-in, nothing typed"
+    );
+    // An upgrade holding the point: waited at, the move after it.
+    let mut held = gone.clone();
+    held.upgrading = true;
+    assert!(
+        waits_until(&at(&mut moved_and_asked(t), &held, t + MIN), reask),
+        "the upgrade's point"
+    );
+}
+
+/// P5: A LOST LOGIN WAITED AT WITH NO END ANYONE KNOWS — the host asked, and
+/// advising nothing at all (no account to move to, no instant one opens) —
+/// is the owner's NOW: the login exception, whose one step signs the
+/// session's own login in again with `aterm harness accounts login <label>`,
+/// never the page `/login` opens (none was opened). The wait stands, so the
+/// move is still made once an account opens. NEGATIVE CONTROLS: a wait with
+/// an end — the host's `Wait`, the bound spent — raises nothing; nor does a
+/// point the host is not asked about (an upgrade holding it); and a session
+/// with no move keeps the old exception, after its `/login`.
+#[test]
+fn a_lost_login_with_no_account_to_wait_for_asks_for_its_sign_in_now() {
+    use super::super::exception::{Urgency, exception_for};
+    use super::super::outlook::ExceptionKind;
+    let t = t0();
+    let gone = walled(
+        WallKind::Auth,
+        "Not logged in · Please run /login",
+        Some(Duration::from_secs(2)),
+    );
+    let mut st = moved_and_asked(t);
+    let a = at(&mut st, &gone, t + MIN);
+    assert!(
+        matches!(&a, TurnEndAction::WaitUntil { why, .. } if why.contains("no move can be made")),
+        "{a:?}"
+    );
+    assert!(
+        st.account_point(&gone, &cfg()).is_some(),
+        "the host was asked"
+    );
+    let e = exception_for(&st, &gone, &cfg(), t + MIN).expect("the owner is needed now");
+    assert_eq!((e.kind, e.when), (ExceptionKind::Login, Urgency::Now));
+    assert!(!e.escalated, "a wait escalates nothing: the host asks");
+    assert_eq!(e.action, "Run aterm harness accounts login work-2.");
+    assert!(
+        !e.action.contains("/login") && !e.action.contains("browser"),
+        "{e:?}"
+    );
+    let mut off = cfg();
+    off.retry_api_errors = false;
+    assert_eq!(exception_for(&st, &gone, &off, t + MIN), Some(e));
+    // NEGATIVE CONTROLS: a wait with an end.
+    let wait = advised_wait(&gone, t + 30 * MIN);
+    assert_eq!(
+        exception_for(&st, &wait, &cfg(), t + MIN),
+        None,
+        "the host's wait"
+    );
+    let mut spent = moved_and_asked(t);
+    for i in 1..ACCOUNT_MOVES_PER_WINDOW {
+        let when = t + Duration::from_secs(u64::try_from(i).expect("small"));
+        spent.restarted(&to_account("pool-a", AccountAt::Wall), true, &gone, when);
+        spent.host_typed(when);
+    }
+    let bound = advised(&gone, "pool-b");
+    spent.observe(&bound, t + MIN);
+    assert!(waits_until(
+        &decide_turn_end(&spent, &bound, &cfg(), t + MIN),
+        t + 60 * MIN
+    ));
+    assert_eq!(
+        exception_for(&spent, &bound, &cfg(), t + MIN),
+        None,
+        "the bound's room"
+    );
+    // …a point the host is not asked about: it ends by itself.
+    let mut held = gone.clone();
+    held.upgrading = true;
+    assert_eq!(
+        exception_for(&st, &held, &cfg(), t + MIN),
+        None,
+        "the upgrade's"
+    );
+    // …and with no move, the old exception after `/login`.
+    let mut none = TurnEndState::default();
+    let a = at(&mut none, &gone, t + MIN);
+    none.acted(&a, &gone, t + MIN);
+    let old = exception_for(&none, &gone, &cfg(), t + 2 * MIN).expect("the old exception");
+    assert!(old.action.contains("browser"), "{old:?}");
+    assert!(old.escalated, "the `/login` it typed escalated it");
+}
+
+/// THE OWNER'S SIGN-IN STANDS WHILE A PERSON HAS THE ROW OFF THE SCREEN: a
+/// lost login waited at with no account to move to raises the login
+/// exception, and a person's `/status` in the tab (the row gone, nothing
+/// worked) is that same wall as the point is decided again
+/// ([`super::waited_login`]): the tab is still stopped, so the exception
+/// stands in the same words, and the host's move once advised still ends it.
+/// NEGATIVE CONTROLS: the host's wait with an end raises nothing there
+/// either; and once `/login` was typed at the wall (no move behind the
+/// session), the row off the screen is held as told, and raises nothing.
+#[test]
+fn the_sign_in_asked_stands_while_the_row_is_off_the_screen() {
+    use super::super::exception::exception_for;
+    let t = t0();
+    let gone = walled(
+        WallKind::Auth,
+        "Not logged in · Please run /login",
+        Some(Duration::from_secs(2)),
+    );
+    let mut st = moved_and_asked(t);
+    let _ = act(&mut st, &gone, t + MIN);
+    let e = exception_for(&st, &gone, &cfg(), t + MIN).expect("the owner is needed now");
+    let status = idle("Status   Config   Usage", None);
+    st.observe(&status, t + 2 * MIN);
+    assert_eq!(
+        exception_for(&st, &status, &cfg(), t + 2 * MIN),
+        Some(e),
+        "the same wall, the same words"
+    );
+    assert_eq!(
+        exception_for(&st, &advised(&status, "work-2"), &cfg(), t + 2 * MIN),
+        None,
+        "the move to the login signed in again"
+    );
+    // NEGATIVE CONTROLS.
+    assert_eq!(
+        exception_for(
+            &st,
+            &advised_wait(&status, t + 30 * MIN),
+            &cfg(),
+            t + 2 * MIN
+        ),
+        None,
+        "a wait with an end"
+    );
+    let mut none = TurnEndState::default();
+    let a = act(&mut none, &gone, t + MIN);
+    assert!(
+        matches!(&a, TurnEndAction::TypeCommand { command, .. } if command == "/login"),
+        "{a:?}"
+    );
+    assert!(exception_for(&none, &gone, &cfg(), t + MIN).is_some_and(|e| e.escalated));
+    none.observe(&status, t + 2 * MIN);
+    assert_eq!(
+        decide_turn_end(&none, &status, &cfg(), t + 2 * MIN),
+        TurnEndAction::Nothing,
+        "held as told"
+    );
+    assert_eq!(exception_for(&none, &status, &cfg(), t + 2 * MIN), None);
+}
+
+/// F11/F12 (P1): A LOST LOGIN READ BEFORE ANY TURN HAS BEEN ASKED UNDER THE
+/// LOGIN THE MOVE CHOSE IS THE OLD PROCESS'S — the relaunch resumed a
+/// conversation that ends on the old process's `Please run /login` row — as
+/// a usage limit's notice is: nothing is answered (no strike), the host is
+/// not asked, no wall is tracked and no exception stands. A move made AT A
+/// WALL owes its resume, and that is typed — the request that tests the new
+/// login; the lost login after it is the new process's own: answered, the
+/// host asked, the move. A move made at a wall over one made AHEAD of a wall,
+/// no turn asked under either, owes nothing, and its point is decided as the
+/// plain turn end it would be with no such notice: the continue policy's
+/// continuation, the done check, nothing under `continue_policy = false` —
+/// never `/login`, never a strike. A move made ahead of a wall left no such
+/// notice (R12): the lost login on its first screen is the new process's
+/// own, struck at once and asked about. NEGATIVE CONTROLS: a session that
+/// made no move types `/login` at the same row; the same row after a turn
+/// was asked is answered, and asked about; a turn of anyone's that ran into
+/// it at the point is the new process's own too.
+#[test]
+fn a_lost_login_before_any_turn_is_asked_is_the_old_process_s() {
+    use super::super::exception::exception_for;
+    let t = t0();
+    let gone = walled(
+        WallKind::Auth,
+        "Not logged in · Please run /login",
+        Some(Duration::from_secs(2)),
+    );
+    let moved = |at: AccountAt| {
+        let mut st = TurnEndState::default();
+        st.restarted(&to_account("pool-a", at), true, &session_wall(t), t);
+        st
+    };
+    // A move made at a wall: the resume, at once, whatever is advised.
+    let mut st = moved(AccountAt::Wall);
+    let r = advised(&gone, "pool-b");
+    assert_eq!(st.account_answer(&r), None, "nothing struck");
+    st.observe(&r, t + MIN);
+    assert_eq!(st.login_track(), None, "no wall tracked");
+    assert_eq!(st.account_point(&r, &cfg()), None, "the host is not asked");
+    assert_eq!(exception_for(&st, &r, &cfg(), t + MIN), None);
+    let mut off = cfg();
+    off.retry_api_errors = false;
+    assert_eq!(exception_for(&st, &r, &off, t + MIN), None);
+    let a = decide_turn_end(&st, &r, &cfg(), t + MIN);
+    assert_eq!(a, typed(RULE_LIMIT_RESUME));
+    st.acted(&a, &r, t + MIN);
+    // Its answer, a lost login of the new process's own: answered once the
+    // turn is taken, and the host is asked.
+    let after = walled(
+        WallKind::Auth,
+        "Not logged in · Please run /login",
+        Some(Duration::from_secs(1)),
+    );
+    assert_eq!(
+        st.account_answer(&after),
+        Some(AccountAnswer::Bad(AccountBad::SignedOut))
+    );
+    st.account_told(AccountAnswer::Bad(AccountBad::SignedOut));
+    let next = advised(&after, "pool-b");
+    st.observe(&next, t + 2 * MIN);
+    assert_eq!(
+        st.account_point(&next, &cfg()),
+        Some(AccountPoint::Wall {
+            kind: WallKind::Auth
+        })
+    );
+    let a = decide_turn_end(&st, &next, &cfg(), t + 2 * MIN);
+    assert!(
+        restarts(&a, &to_account("pool-b", AccountAt::Wall), RULE_ACCOUNT),
+        "{a:?}"
+    );
+    // That move, made AT the lost login: its relaunch resumes a conversation
+    // that ends on `pool-a`'s row, repainted — the resume again, nothing
+    // struck.
+    st.restarted(
+        &to_account("pool-b", AccountAt::Wall),
+        true,
+        &next,
+        t + 2 * MIN,
+    );
+    assert!(st.account_resume_owed(), "a turn was cut short");
+    let repaint = advised(&after, "pool-c");
+    assert_eq!(st.account_answer(&repaint), None, "pool-b is not struck");
+    st.observe(&repaint, t + 3 * MIN);
+    assert_eq!(st.account_point(&repaint, &cfg()), None);
+    assert_eq!(
+        decide_turn_end(&st, &repaint, &cfg(), t + 3 * MIN),
+        typed(RULE_LIMIT_RESUME)
+    );
+    // R12: A MOVE MADE AHEAD OF A WALL left the model's reply on the
+    // conversation, no notice: a lost login on its first screen is the new
+    // process's own — struck at once, the host asked, never `/login`.
+    for c in [cfg(), no_continue()] {
+        let mut ahead = moved(AccountAt::Ahead);
+        assert_eq!(
+            ahead.account_answer(&gone),
+            Some(AccountAnswer::Bad(AccountBad::SignedOut)),
+            "struck at once"
+        );
+        ahead.account_told(AccountAnswer::Bad(AccountBad::SignedOut));
+        ahead.observe(&gone, t + MIN);
+        assert_eq!(
+            ahead.account_point(&gone, &c),
+            Some(AccountPoint::Wall {
+                kind: WallKind::Auth
+            }),
+            "the host is asked"
+        );
+        let a = decide_turn_end(&ahead, &advised(&gone, "pool-b"), &c, t + MIN);
+        assert!(
+            restarts(&a, &to_account("pool-b", AccountAt::Wall), RULE_ACCOUNT),
+            "{a:?}"
+        );
+        let a = decide_turn_end(&ahead, &gone, &c, t + MIN);
+        assert!(
+            matches!(&a, TurnEndAction::WaitUntil { why, .. } if why.contains("no move can be made")),
+            "{a:?}"
+        );
+    }
+    // A move AT a wall made over that one with no turn asked under either
+    // owes nothing (F7): the row its relaunch repaints is the old process's,
+    // and the point is the plain turn end it would be with no such notice.
+    let plain = idle("Suites are running.", Some(Duration::from_secs(2)));
+    let chain = || {
+        let mut st = moved(AccountAt::Ahead);
+        st.restarted(&to_account("pool-b", AccountAt::Wall), true, &gone, t);
+        st
+    };
+    for c in [cfg(), no_continue()] {
+        let mut chained = chain();
+        let mut none = TurnEndState::default();
+        let want = at_under(&mut none, &plain, t + MIN, &c);
+        assert_eq!(chained.account_answer(&gone), None, "nothing struck");
+        let a = at_under(&mut chained, &gone, t + MIN, &c);
+        assert_eq!(a, want, "as with no move and no such notice");
+        assert_ne!(a.rule_id(), Some(RULE_LOGIN));
+        assert_eq!(
+            chained.account_point(&gone, &c),
+            None,
+            "the host is not asked"
+        );
+        assert_eq!(exception_for(&chained, &gone, &c, t + MIN), None);
+    }
+    let done = walled(
+        WallKind::Auth,
+        "Not logged in · Please run /login",
+        Some(5 * MIN),
+    );
+    let done = TurnEndReading {
+        said_tail: Some("All done.".to_string()),
+        ..done
+    };
+    assert_eq!(
+        at(&mut chain(), &done, t + MIN).rule_id(),
+        Some(RULE_DONE_CHECK),
+        "the done check, as with no move"
+    );
+    // NEGATIVE CONTROLS.
+    let login = at(&mut TurnEndState::default(), &gone, t + MIN);
+    assert_eq!(login.rule_id(), Some(RULE_LOGIN), "no move: the login rule");
+    let asked = moved_and_asked(t);
+    assert_eq!(
+        asked.account_answer(&gone),
+        Some(AccountAnswer::Bad(AccountBad::SignedOut)),
+        "a turn was asked"
+    );
+    let mut ran = moved(AccountAt::Wall);
+    ran.observe(&idle("Stage 2 done.", None), t + MIN);
+    assert_eq!(
+        ran.account_answer(&gone),
+        Some(AccountAnswer::Bad(AccountBad::SignedOut)),
+        "a turn of anyone's ran into it"
+    );
+    ran.account_told(AccountAnswer::Bad(AccountBad::SignedOut));
+    ran.observe(&gone, t + 2 * MIN);
+    assert!(ran.account_point(&gone, &cfg()).is_some());
+    assert_eq!(
+        ran.login_track(),
+        Some(0),
+        "the new process's wall, tracked"
+    );
+}
+
+/// F7 (P2): A MOVE MADE OVER THIS SESSION'S OWN MOVE STILL UNANSWERED, with no
+/// turn asked under it, owes what that move owed and no more: a move ahead of
+/// a wall, then a move at a wall from the login it chose (a usage limit
+/// repainted there, before any turn: the host's advice moves the session on),
+/// leaves the second relaunch's first point decided as with no move — nothing
+/// under `continue_policy = false`, the done check at a done report — never
+/// the wall's resume. NEGATIVE CONTROLS: the same chain begun AT a wall still
+/// owes the resume; and once a turn was asked under the first move — typed,
+/// or a person's that ran into the wall the second is made at, in this loop
+/// or told by a loop before it (R14: the ledger's told row, no `typed` one)
+/// — the second, made at a wall that cut it short, owes it. And a first move
+/// read back from the ledger ahead of a wall, neither asked nor told, owes
+/// nothing.
+#[test]
+fn a_move_over_an_unanswered_move_owes_what_that_move_owed() {
+    let t = t0();
+    let chain = |first: AccountAt, asked: bool| {
+        let mut st = TurnEndState::default();
+        st.restarted(
+            &to_account("work-2", first),
+            true,
+            &idle("Stage 2 done.", None),
+            t,
+        );
+        if asked {
+            // A turn asked under the first move, cut short by its limit.
+            st.host_typed(t + MIN);
+            st.observe(&session_wall(t), t + MIN + MIN / 2);
+        }
+        st.restarted(
+            &to_account("main", AccountAt::Wall),
+            true,
+            &session_wall(t),
+            t + 2 * MIN,
+        );
+        st
+    };
+    let first = idle("Stage 2 done.", None);
+    let done = idle("All done.", Some(5 * MIN));
+    let mut st = chain(AccountAt::Ahead, false);
+    assert!(!st.account_resume_owed());
+    assert_eq!(
+        at_under(&mut st, &first, t + 3 * MIN, &no_continue()),
+        TurnEndAction::Nothing,
+        "as with no move"
+    );
+    let mut st = chain(AccountAt::Ahead, false);
+    assert_eq!(
+        at(&mut st, &done, t + 3 * MIN).rule_id(),
+        Some(RULE_DONE_CHECK),
+        "the done check, as with no move"
+    );
+    // NEGATIVE CONTROLS.
+    let mut st = chain(AccountAt::Wall, false);
+    assert!(st.account_resume_owed());
+    assert_eq!(
+        at_under(&mut st, &first, t + 3 * MIN, &no_continue()),
+        typed(RULE_LIMIT_RESUME),
+        "begun at a wall: the resume"
+    );
+    let mut st = chain(AccountAt::Ahead, true);
+    assert!(st.account_resume_owed(), "a turn asked, and cut short");
+    assert_eq!(
+        at_under(&mut st, &first, t + 3 * MIN, &no_continue()),
+        typed(RULE_LIMIT_RESUME)
+    );
+    // A person's turn, the first to run under the move, cut short by the
+    // new account's own limit: a turn asked under it.
+    let mut st = TurnEndState::default();
+    st.restarted(&to_account("work-2", AccountAt::Ahead), true, &first, t);
+    st.observe(&first, t + MIN);
+    st.observe(&session_wall(t), t + 5 * MIN);
+    st.restarted(
+        &to_account("main", AccountAt::Wall),
+        true,
+        &session_wall(t),
+        t + 6 * MIN,
+    );
+    assert!(st.account_resume_owed(), "a person's turn, cut short");
+    // R14: the same across loops — the first move read back from the ledger
+    // as told and not asked (a person's turn writes no `typed` row): the
+    // answer told was a turn that ran into the wall, so the second owes it.
+    for first in [AccountAt::Wall, AccountAt::Ahead] {
+        let mut st = TurnEndState::default();
+        st.seed_account("work-2".to_string(), first, 5 * MIN, false, true, true, t);
+        st.restarted(
+            &to_account("main", AccountAt::Wall),
+            true,
+            &session_wall(t),
+            t + MIN,
+        );
+        assert!(st.account_resume_owed(), "{first:?}: told, so a turn ran");
+    }
+    let mut st = TurnEndState::default();
+    st.seed_account(
+        "work-2".to_string(),
+        AccountAt::Ahead,
+        5 * MIN,
+        false,
+        false,
+        false,
+        t,
+    );
+    st.restarted(
+        &to_account("main", AccountAt::Wall),
+        true,
+        &session_wall(t),
+        t + MIN,
+    );
+    assert!(
+        !st.account_resume_owed(),
+        "seeded ahead of a wall, neither asked nor told: nothing was cut short"
+    );
+}
+
 /// WHAT ANSWERED THE MOVE, read off the point before it is folded in. A
-/// usage limit says nothing about the new account until a turn has been
-/// asked under it (the relaunch resumes a conversation whose last row may be
-/// the OLD account's limit); a lost login says so at once; served is a turn
-/// that was asked, ran, and ended with no wall. Each is told once. NEGATIVE
-/// CONTROLS: no move made, nothing; a spend wall, nothing; a reply no read
-/// saw busy, nothing yet.
+/// usage limit and a lost login say nothing about the new account until a
+/// turn has been asked under it (the relaunch resumes a conversation whose
+/// last row may be the OLD process's notice); served is a turn that was
+/// asked, ran, and ended with no wall. Each is told once. A move read back
+/// from the ledger with no turn asked under it takes the first point as the
+/// relaunch's start-up, as one this loop made does (R6). NEGATIVE CONTROLS:
+/// no move made, nothing; a spend wall, nothing; a reply no read saw busy,
+/// nothing yet. (Rewritten for F11/F12: a lost login was answered at once,
+/// before any turn.)
 #[test]
 fn the_first_turn_after_a_move_says_whether_the_account_serves() {
     let t = t0();
@@ -8671,7 +10776,7 @@ fn the_first_turn_after_a_move_says_whether_the_account_serves() {
     assert_eq!(st.account_answer(&resumed), None);
     assert_eq!(st.account_answer(&wall), None, "the old account's notice");
     assert_eq!(st.account_answer(&answered), None, "nobody asked a turn");
-    // The host's carry-on is the first turn asked.
+    // A turn the host typed is the first turn asked.
     let mut st = moved();
     st.host_typed(t + MIN);
     assert_eq!(
@@ -8680,7 +10785,7 @@ fn the_first_turn_after_a_move_says_whether_the_account_serves() {
     );
     assert_eq!(st.account_answer(&resumed), None, "no read saw it busy");
     assert_eq!(st.account_answer(&answered), Some(AccountAnswer::Served));
-    // The carry-on typed AT the notice the old account left: that notice
+    // A turn typed AT the notice the old account left: that notice
     // stands until the agent takes it, and says nothing yet — the point is
     // the act's once it has been judged so (no busy read in `take_within`).
     let standing = TurnEndReading {
@@ -8704,14 +10809,24 @@ fn the_first_turn_after_a_move_says_whether_the_account_serves() {
     st.account_told(AccountAnswer::Served);
     assert_eq!(st.account_move(), None);
     assert_eq!(st.account_answer(&answered), None);
-    // A lost login: at once, and once.
+    // A lost login: not before a turn is asked (the old process's notice),
+    // then once.
     let gone = walled(WallKind::Auth, "Not logged in · Please run /login", None);
     let mut st = moved();
+    assert_eq!(st.account_answer(&gone), None, "the old process's notice");
+    st.host_typed(t + MIN);
+    assert_eq!(st.account_answer(&gone), None, "no read saw it busy");
+    let met = TurnEndReading {
+        worked: Some(Duration::from_secs(1)),
+        ..gone.clone()
+    };
     assert_eq!(
-        st.account_answer(&gone),
+        st.account_answer(&met),
         Some(AccountAnswer::Bad(AccountBad::SignedOut))
     );
     st.account_told(AccountAnswer::Bad(AccountBad::SignedOut));
+    // Folded where it was told, as the loop does: the relaunch's first point.
+    st.observe(&met, t + MIN);
     assert_eq!(st.account_answer(&gone), None, "told once");
     assert!(
         st.account_move().is_some(),
@@ -8740,6 +10855,7 @@ fn the_first_turn_after_a_move_says_whether_the_account_serves() {
         5 * MIN,
         false,
         false,
+        false,
         t,
     );
     assert_eq!(st.account_move().map(|m| m.to.as_str()), Some("work-2"));
@@ -8748,6 +10864,13 @@ fn the_first_turn_after_a_move_says_whether_the_account_serves() {
         st.account_resume_owed(),
         "as far as the notice it left goes (the test of the seeded resume)"
     );
+    // R6: the first point this state sees is the resumed process's start-up,
+    // so a lost login read there with work is the notice it repainted.
+    assert_eq!(
+        st.account_answer(&met),
+        None,
+        "the start-up's work: nothing struck"
+    );
     let mut st = TurnEndState::default();
     st.seed_account(
         "work-2".to_string(),
@@ -8755,14 +10878,21 @@ fn the_first_turn_after_a_move_says_whether_the_account_serves() {
         5 * MIN,
         true,
         false,
+        false,
         t,
     );
     assert_eq!(st.account_answer(&answered), Some(AccountAnswer::Served));
+    assert_eq!(
+        st.account_answer(&met),
+        Some(AccountAnswer::Bad(AccountBad::SignedOut)),
+        "a turn asked under it: the new process's own"
+    );
     let mut st = TurnEndState::default();
     st.seed_account(
         "work-2".to_string(),
         AccountAt::Wall,
         5 * MIN,
+        true,
         true,
         true,
         t,
@@ -8777,16 +10907,333 @@ fn the_first_turn_after_a_move_says_whether_the_account_serves() {
         90 * MIN,
         false,
         false,
+        false,
         t,
     );
     assert_eq!(st.account_move(), None, "older than the window");
 }
 
+/// T1/T6: A MOVE WHOSE BAD ANSWER WAS TOLD STANDS WHATEVER ITS AGE
+/// ([`TurnEndState::seed_account`]). One loop holds a told move until the
+/// worker works past it, and the wait at a lost login has no end until the
+/// owner signs in — so a loop started on it an hour and more after the move
+/// (the agent relaunched after it crashed there, a seamless update, a
+/// fault) holds it too: at that lost login it waits and asks the host, and
+/// with nothing advised it asks the owner for the sign-in; `/login` is never
+/// typed into a tab nobody is at. NEGATIVE CONTROLS: a move of the same age
+/// never told is history, and its lost login is the login rule's —
+/// `/login`, as for a session with no move; so is one TOLD BY AN OLDER
+/// BUILD (its row without `until=served`: that build closed a told move
+/// silently, and its ledger holds every one open), which inside the window
+/// is held told as ever.
+#[test]
+fn a_told_move_is_held_by_a_later_loop_whatever_its_age() {
+    let t = t0();
+    let gone = walled(
+        WallKind::Auth,
+        "Not logged in · Please run /login",
+        Some(Duration::from_secs(2)),
+    );
+    let seeded_at = |ago: Duration, told: bool, closes: bool| {
+        let mut st = TurnEndState::default();
+        st.seed_account(
+            "work-2".to_string(),
+            AccountAt::Wall,
+            ago,
+            false,
+            told,
+            closes,
+            t,
+        );
+        st
+    };
+    let seeded = |told: bool| seeded_at(90 * MIN, told, told);
+    let mut st = seeded(true);
+    assert_eq!(st.account_move().map(|m| m.to.as_str()), Some("work-2"));
+    let a = at(&mut st, &gone, t + MIN);
+    assert!(
+        matches!(&a, TurnEndAction::WaitUntil { why, .. } if why.starts_with("the login is gone")),
+        "{a:?}"
+    );
+    assert_eq!(
+        st.account_point(&gone, &cfg()),
+        Some(AccountPoint::Wall {
+            kind: WallKind::Auth
+        }),
+        "the host is asked"
+    );
+    assert_eq!(
+        login_wall_stuck(&st, &gone, &cfg(), t + MIN).as_deref(),
+        Some("work-2"),
+        "the owner is asked to sign it in"
+    );
+    // NEGATIVE CONTROLS: never told, or told by an older build, the same
+    // age is history.
+    let login = TurnEndAction::TypeCommand {
+        command: "/login".to_string(),
+        rule_id: RULE_LOGIN,
+        then: Then::Escalate("finish sign-in in the browser".to_string()),
+    };
+    for mut st in [seeded(false), seeded_at(90 * MIN, true, false)] {
+        assert_eq!(st.account_move(), None);
+        assert_eq!(at(&mut st, &gone, t + MIN), login);
+    }
+    let mut st = seeded_at(5 * MIN, true, false);
+    assert!(st.account_move().is_some(), "inside the window: held");
+    assert_eq!(st.account_answer(&gone), None, "told by the loop before");
+    assert!(
+        matches!(at(&mut st, &gone, t + MIN), TurnEndAction::WaitUntil { .. }),
+        "and waited at"
+    );
+}
+
+/// T2: A TOLD MOVE IS TOLD SERVED EXACTLY WHERE THE FOLD ENDS IT
+/// ([`TurnEndState::account_answer`], [`TurnEndState::observe`]): the
+/// session moved to `work-2` met `work-2`'s own limit, told; once the limit
+/// has lifted, the first point with work, no wall and no unanswered row —
+/// the vendor's own continuation fired, no read busy, among them — says
+/// `served`, so the host forgets the move it kept and the ledger closes it.
+/// Told, the move is over, and nothing more is said. NEGATIVE CONTROLS: the
+/// limit still on the screen, a point with no work, an unanswered row and a
+/// point that is no point say nothing — and at each of these the fold
+/// leaves the move standing.
+#[test]
+fn a_told_move_is_told_served_where_the_worker_works_past_it() {
+    let t = t0();
+    let wall = session_wall(t);
+    let mut st = TurnEndState::default();
+    st.restarted(&to_account("work-2", AccountAt::Wall), true, &wall, t);
+    st.host_typed(t + MIN);
+    assert_eq!(
+        st.account_answer(&wall),
+        Some(AccountAnswer::Bad(AccountBad::Wall))
+    );
+    st.account_told(AccountAnswer::Bad(AccountBad::Wall));
+    st.observe(&wall, t + MIN);
+    let served = idle("Carrying on: stage 3.", Some(4 * MIN));
+    let fired = TurnEndReading {
+        auto_continue: Some(aterm_phase::AutoContinue::Fired),
+        ..idle("Carrying on: stage 3.", None)
+    };
+    let quiet = idle("Stage 2 done.", None);
+    let unanswered = TurnEndReading {
+        pending_input: true,
+        ..served.clone()
+    };
+    let busy = TurnEndReading {
+        phase: Phase::Busy,
+        ..served.clone()
+    };
+    // The fold agrees at every one: the move ends exactly where `served`
+    // is said.
+    for (r, says) in [
+        (&served, true),
+        (&fired, true),
+        (&wall, false),
+        (&quiet, false),
+        (&unanswered, false),
+        (&busy, false),
+    ] {
+        let want = says.then_some(AccountAnswer::Served);
+        assert_eq!(st.account_answer(r), want, "{r:?}");
+        let mut folded = st.clone();
+        folded.observe(r, t + 2 * 60 * MIN);
+        assert_eq!(folded.account_move().is_none(), says, "{r:?}");
+    }
+    st.account_told(AccountAnswer::Served);
+    assert_eq!(st.account_move(), None, "over");
+    assert_eq!(st.account_answer(&served), None, "and said once");
+}
+
+/// A TOLD MOVE'S FIRST POINT AFTER A RELAUNCH IS THAT PROCESS'S START-UP
+/// ([`TurnEndState::seed_account`], [`TurnEndState::restarted`]): a loop
+/// begun on a told move (its agent relaunched after it crashed at the lost
+/// login) may read the resumed process drawing its conversation, busy, and
+/// its first point shows that work with no wall — no worker working past
+/// the wall. Nothing is told and the move stands, so the lost login the
+/// continuation meets after it is waited at, never `/login`; the point
+/// after the start-up, with work, is the service. So too the first point
+/// after a memory restart, a model's fallback or its return made while a
+/// told move stands. NEGATIVE CONTROLS: the same first point, the start-up
+/// past, is told `served` and ends the move; a relaunch NOT made is no
+/// start-up.
+#[test]
+fn a_told_moves_first_point_after_a_relaunch_is_its_start_up() {
+    let t = t0();
+    let drawn = idle("Resumed: carrying on.", Some(Duration::from_secs(2)));
+    let worked = idle("Carried on: stage 3.", Some(4 * MIN));
+    let gone = walled(WallKind::Auth, "Not logged in · Please run /login", None);
+    let seeded = || {
+        let mut st = TurnEndState::default();
+        st.seed_account(
+            "work-2".to_string(),
+            AccountAt::Wall,
+            90 * MIN,
+            false,
+            true,
+            true,
+            t,
+        );
+        st
+    };
+    let mut st = seeded();
+    assert_eq!(
+        st.account_answer(&drawn),
+        None,
+        "the start-up: nothing told"
+    );
+    st.observe(&drawn, t);
+    assert!(st.account_move().is_some(), "the move stands");
+    let a = at(&mut st, &gone, t + MIN);
+    assert!(
+        matches!(&a, TurnEndAction::WaitUntil { why, .. } if why.starts_with("the login is gone")),
+        "the continuation's lost login is waited at: {a:?}"
+    );
+    // NEGATIVE CONTROL: the start-up past, the same point is the service.
+    let mut st = seeded();
+    st.observe(&drawn, t);
+    assert_eq!(st.account_answer(&drawn), Some(AccountAnswer::Served));
+    assert_eq!(st.account_answer(&worked), Some(AccountAnswer::Served));
+    st.observe(&worked, t + MIN);
+    assert_eq!(st.account_move(), None, "and the fold ends it there");
+    for why in [
+        Restart::Memory,
+        Restart::Model {
+            to: "sonnet".to_string(),
+        },
+        Restart::ModelBack { to: None },
+    ] {
+        let mut st = seeded();
+        st.observe(&drawn, t);
+        st.restarted(&why, true, &drawn, t + MIN);
+        assert_eq!(st.account_answer(&drawn), None, "{why:?}: its start-up");
+        st.observe(&drawn, t + 2 * MIN);
+        assert!(st.account_move().is_some(), "{why:?}: the move stands");
+        assert_eq!(
+            st.account_answer(&worked),
+            Some(AccountAnswer::Served),
+            "{why:?}: the point after it"
+        );
+        // NEGATIVE CONTROL: not made, no new process.
+        let mut st = seeded();
+        st.observe(&drawn, t);
+        st.restarted(&why, false, &drawn, t + MIN);
+        assert_eq!(
+            st.account_answer(&drawn),
+            Some(AccountAnswer::Served),
+            "{why:?}: not made"
+        );
+        // An UNTOLD move a turn was asked under: its first point after the
+        // relaunch is the start-up too, never the service.
+        let untold = || {
+            let mut st = TurnEndState::default();
+            st.seed_account(
+                "work-2".to_string(),
+                AccountAt::Wall,
+                MIN,
+                true,
+                false,
+                false,
+                t,
+            );
+            st.observe(&drawn, t);
+            st
+        };
+        let mut st = untold();
+        st.restarted(&why, true, &drawn, t + MIN);
+        assert_eq!(
+            st.account_answer(&drawn),
+            None,
+            "{why:?}: untold, its start-up"
+        );
+        st.observe(&drawn, t + 2 * MIN);
+        assert_eq!(
+            st.account_answer(&worked),
+            Some(AccountAnswer::Served),
+            "{why:?}: untold, the point after it"
+        );
+        // NEGATIVE CONTROL: not made, the same point is the service.
+        let mut st = untold();
+        st.restarted(&why, false, &drawn, t + MIN);
+        assert_eq!(
+            st.account_answer(&drawn),
+            Some(AccountAnswer::Served),
+            "{why:?}: untold, not made"
+        );
+    }
+}
+
+/// T8: THE TELL READS THE LOST LOGIN WHERE THE HOST IS ASKED ABOUT IT
+/// ([`TurnEndState::account_answer`], [`TurnEndState::account_point`]): the
+/// turn asked under `work-2` met its lost login inside the act's take
+/// window, no read busy, and a person's `/status` drew over the row before
+/// the point that judges the act. That point is asked about as the lost
+/// login its track holds ([`left_waited_login`]) — so it is told there
+/// first, and `work-2` is struck before any advice. NEGATIVE CONTROLS:
+/// still awaited (inside the window) nothing is told; the login back
+/// (`Login successful`) is no lost login, told or asked; and a point with
+/// work and no wall is the turn served, never the track's lost login.
+#[test]
+fn a_lost_login_whose_row_left_is_told_where_it_is_asked_about() {
+    let t = t0();
+    let gone = walled(WallKind::Auth, "Not logged in · Please run /login", None);
+    let left = idle("Stage 2 done.", None);
+    let back = TurnEndReading {
+        login_back: true,
+        ..left.clone()
+    };
+    let login = AccountPoint::Wall {
+        kind: WallKind::Auth,
+    };
+    let met = || {
+        let mut st = TurnEndState::default();
+        st.restarted(
+            &to_account("work-2", AccountAt::Wall),
+            true,
+            &session_wall(t),
+            t,
+        );
+        st.host_typed(t);
+        // Inside the window: tracked, the act still awaited.
+        st.observe(&gone, t + Duration::from_secs(5));
+        assert_eq!(st.account_answer(&gone), None, "the act still awaited");
+        st
+    };
+    let mut st = met();
+    assert_eq!(st.account_answer(&left), None, "still awaited");
+    st.observe(&left, t + MIN);
+    assert_eq!(
+        st.account_point(&left, &cfg()),
+        Some(login),
+        "asked as the lost login"
+    );
+    assert_eq!(
+        st.account_answer(&left),
+        Some(AccountAnswer::Bad(AccountBad::SignedOut)),
+        "told there first"
+    );
+    let worked = idle("Stage 2 done.", Some(MIN));
+    assert_eq!(
+        st.account_answer(&worked),
+        Some(AccountAnswer::Served),
+        "work and no wall: the track never shadows a turn served"
+    );
+    // NEGATIVE CONTROL: the login back.
+    let mut st = met();
+    st.observe(&back, t + MIN);
+    assert_eq!(st.account_point(&back, &cfg()), None);
+    assert_eq!(st.account_answer(&back), None);
+}
+
 /// WHERE THE HOST IS ASKED: only at a point its advice could decide — a
 /// session or weekly limit, a model bucket, a lost login while the session's
-/// own move is unanswered, a plain turn end once it is answered. NEGATIVE
-/// CONTROLS: a spend wall, an API error, a point the upgrade owns, no task,
-/// a busy screen, a draft, and every limit that stops rotation ask nothing.
+/// own move is unanswered (once a turn has been asked under it: before, the
+/// old process's notice — rewritten for F11/F12; and once that turn has been
+/// read busy or its act judged: before, the point waits for the act, and the
+/// lost login is told first, R10), a plain turn end once it is answered.
+/// NEGATIVE CONTROLS: a spend wall, an API error, a point the upgrade owns,
+/// no task, a busy screen, a draft, and every limit that stops rotation ask
+/// nothing.
 #[test]
 fn the_host_is_asked_only_where_its_advice_could_decide() {
     let t = t0();
@@ -8817,9 +11264,39 @@ fn the_host_is_asked_only_where_its_advice_could_decide() {
     moved.restarted(&to_account("work-2", AccountAt::Wall), true, &wall, t);
     assert_eq!(
         moved.account_point(&gone, &cfg()),
-        Some(AccountPoint::Wall {
-            kind: WallKind::Auth
-        })
+        None,
+        "no turn asked under the new login: the old process's notice"
+    );
+    moved.host_typed(t);
+    let lost = Some(AccountPoint::Wall {
+        kind: WallKind::Auth,
+    });
+    let met = TurnEndReading {
+        worked: Some(Duration::from_secs(1)),
+        ..gone.clone()
+    };
+    assert_eq!(
+        moved.account_point(&met, &cfg()),
+        lost,
+        "the turn ran into it"
+    );
+    assert_eq!(
+        moved.account_point(&gone, &cfg()),
+        None,
+        "no busy read since the turn was asked: its act is judged first"
+    );
+    let mut judged = moved.clone();
+    judged.observe(&gone, t + MIN);
+    assert_eq!(
+        judged.account_point(&gone, &cfg()),
+        None,
+        "inside the take window"
+    );
+    judged.observe(&gone, t + MIN + TurnEndTiming::default().take_within);
+    assert_eq!(
+        judged.account_point(&gone, &cfg()),
+        lost,
+        "the act judged at its deadline: the point is the act's"
     );
     // NEGATIVE CONTROLS.
     let mut spend = wall.clone();
@@ -8913,17 +11390,16 @@ fn a_move_not_made_gets_the_walls_breaker_and_no_act_past_it() {
 }
 
 /// THE REFUSAL OF A MOVE AHEAD OF A WALL IS REMEMBERED FOR THE WINDOW, NOT FOR
-/// GOOD. A host's word that is no wait can be of the moment — the login it
-/// found signed out is signed in an hour later, the store it could not read is
-/// readable, a restart of another kind that was in flight has landed — and at a
-/// plain turn end nothing else ever ends the label's latch: no wall stands
-/// whose end would. Kept for the life of the loop, the owner's `accounts use
-/// <label>` after such a refusal reached every tab but this one, which stayed
-/// on its account until its own wall. So the same account is asked again once
-/// the window ([`TurnEndTiming::window`], an hour) has passed since the
-/// refusal: one refused relaunch an hour at the most, where it was one at every
-/// turn end. NEGATIVE CONTROL: inside the window the same advice decides
-/// nothing, turn end after turn end.
+/// GOOD. A host's word that is no wait can be of the moment — the store it
+/// could not read is readable, a restart of another kind that was in flight
+/// has landed — and at a plain turn end nothing else ever ends the label's
+/// latch: no wall stands whose end would. Kept for the life of the loop, the
+/// owner's `accounts use <label>` after such a refusal reached every tab but
+/// this one, which stayed on its account until its own wall. So the same
+/// account is asked again once the window ([`TurnEndTiming::window`], an
+/// hour) has passed since the refusal: one refused relaunch an hour at the
+/// most, where it was one at every turn end. NEGATIVE CONTROL: inside the
+/// window the same advice decides nothing, turn end after turn end.
 #[test]
 fn a_move_ahead_that_was_refused_is_asked_again_an_hour_on() {
     let t = t0();
@@ -9028,9 +11504,9 @@ fn a_latch_ends_where_a_new_wall_of_the_same_class_begins() {
 /// at the relaunched session's first idle point, and at once where the resumed
 /// conversation repaints the limit it left (that notice names the OLD account's
 /// reset, which says nothing about the account the session runs on now). Owed
-/// ONCE: the host's carry-on, or any turn that ran, is the continuation.
-/// NEGATIVE CONTROLS: a move made AHEAD of a wall owes nothing (the turn's own
-/// act is the continue policy's); the host's carry-on typed first;
+/// ONCE: any act typed, and any turn that ran — a turn the host typed too —
+/// pays it. NEGATIVE CONTROLS: a move made AHEAD of a wall owes nothing (the
+/// turn's own act is the continue policy's); a turn the host typed first;
 /// `resume_limits` off; and a session that made no move waits its wall out.
 #[test]
 fn a_move_made_at_a_wall_owes_the_walls_resume() {
@@ -9075,7 +11551,7 @@ fn a_move_made_at_a_wall_owes_the_walls_resume() {
     assert_eq!(
         at_under(&mut st, &prompt, t + MIN, &quiet),
         TurnEndAction::Nothing,
-        "the host's carry-on was the continuation"
+        "a turn the host typed paid it"
     );
     let mut off = quiet.clone();
     off.resume_limits = false;
@@ -9658,7 +12134,7 @@ fn the_decider_reads_a_probe_as_its_otherwise_at_every_account_fixture() {
 #[test]
 fn the_probes_gate_is_true_at_a_plain_idle_point_and_false_with_any_condition_flipped() {
     let t = t0();
-    let base = advised_probe(&idle("Added the flag.", Some(5 * MIN)), None);
+    let base = advised_probe(&idle("Added the flag.", Some(JOB)), None);
     let seen = |r: &TurnEndReading| {
         let mut st = TurnEndState::default();
         st.observe(r, t);
@@ -9895,6 +12371,7 @@ ATERM-TASK-DONE",
             Duration::from_secs(30),
             false,
             false,
+            false,
             t,
         );
         assert_eq!(moved.account_resume_owed(), resume);
@@ -10055,9 +12532,9 @@ fn a_turn_that_ran_since_the_move_pays_the_resume_whatever_it_ended_on() {
 /// the resumed conversation repaints is the old account's, the host is asked
 /// nothing about it and the continuation goes at once, under `resume_limits`
 /// whatever `continue_policy` says. NEGATIVE CONTROLS: at a plain prompt
-/// nothing is owed (the ledger cannot say whether the host's carry-on went: a
-/// host's turn leaves no row), and a limit that shows later is a wall like any
-/// other; a move made AHEAD of a wall, one a turn was asked under, and one
+/// nothing is owed (the ledger cannot say whether a turn went since: a
+/// person's turn leaves no row), and a limit that shows later is a wall like
+/// any other; a move made AHEAD of a wall, one a turn was asked under, and one
 /// whose bad answer was told owe nothing; nor does any under `resume_limits =
 /// false`.
 #[test]
@@ -10067,7 +12544,7 @@ fn a_move_a_later_loop_takes_up_owes_its_resume_only_at_the_notice_it_left() {
     quiet.continue_policy = false;
     let seeded = |at: AccountAt, asked: bool, told: bool| {
         let mut st = TurnEndState::default();
-        st.seed_account("work-2".to_string(), at, 5 * MIN, asked, told, t);
+        st.seed_account("work-2".to_string(), at, 5 * MIN, asked, told, told, t);
         st
     };
     let notice = TurnEndReading {
@@ -10090,7 +12567,7 @@ fn a_move_a_later_loop_takes_up_owes_its_resume_only_at_the_notice_it_left() {
     assert_eq!(
         at_under(&mut st, &prompt, t, &quiet),
         TurnEndAction::Nothing,
-        "a plain prompt: the host's carry-on, or nothing"
+        "a plain prompt: nothing owed"
     );
     assert!(!st.account_resume_owed());
     let later = at_under(&mut st, &notice, t + MIN, &quiet);
@@ -10109,6 +12586,150 @@ fn a_move_a_later_loop_takes_up_owes_its_resume_only_at_the_notice_it_left() {
     off.resume_limits = false;
     let a = at_under(&mut seeded(AccountAt::Wall, false, false), &notice, t, &off);
     assert_ne!(a.rule_id(), Some(RULE_LIMIT_RESUME), "{a:?}");
+}
+
+/// F19 (P6): A SEEDED WALL MOVE'S RESUME STAYS OWED WHILE THE SCREEN DRAWS
+/// THE SESSION'S NEWEST USAGE-LIMIT NOTICE WITH NO TURN SERVED UNDER IT,
+/// though no wall is read there — the vendor's `Automatic continue
+/// cancelled` under the repainted notice is the last thing said — and at the
+/// lost login the session left (a move made at a lost login): the resume
+/// goes at once, under `resume_limits` whatever `continue_policy` says.
+/// NEGATIVE CONTROLS: a turn served under that notice (a person's, between
+/// the loops) drops it, and so does a screen that draws no notice.
+#[test]
+fn a_seeded_resume_is_owed_while_the_notice_it_left_stands_unserved() {
+    let t = t0();
+    let quiet = no_continue();
+    let seeded = || {
+        let mut st = TurnEndState::default();
+        st.seed_account(
+            "work-2".to_string(),
+            AccountAt::Wall,
+            5 * MIN,
+            false,
+            false,
+            false,
+            t,
+        );
+        st
+    };
+    let cancelled = |served: bool| TurnEndReading {
+        auto_continue: Some(aterm_phase::AutoContinue::Unkept),
+        since_limit: Some(aterm_phase::SinceLimit {
+            kind: WallKind::UsageSession,
+            reset: Some("3pm".to_string()),
+            served,
+            model_set: false,
+            chosen_model: None,
+        }),
+        ..idle("Automatic continue cancelled", None)
+    };
+    let mut st = seeded();
+    assert_eq!(
+        at_under(&mut st, &cancelled(false), t, &quiet),
+        typed(RULE_LIMIT_RESUME),
+        "the notice it left, its vendor's continue cancelled"
+    );
+    let gone = walled(WallKind::Auth, "Not logged in · Please run /login", None);
+    let mut st = seeded();
+    assert_eq!(
+        at_under(&mut st, &gone, t, &quiet),
+        typed(RULE_LIMIT_RESUME),
+        "the lost login it left"
+    );
+    // NEGATIVE CONTROLS.
+    let mut st = seeded();
+    assert_eq!(
+        at_under(&mut st, &cancelled(true), t, &quiet),
+        TurnEndAction::Nothing,
+        "a turn served under it"
+    );
+    assert!(!st.account_resume_owed());
+    let mut st = seeded();
+    assert_eq!(
+        at_under(&mut st, &idle("Suites are running.", None), t, &quiet),
+        TurnEndAction::Nothing,
+        "no notice"
+    );
+}
+
+/// F9 (P3): A LOST LOGIN THE POLICY ONLY WAITED AT (no `/login` typed) whose
+/// row LEAVES THE SCREEN — a person's `/status` or `/usage`, Esc out of
+/// `/login` — is still decided as that wall while the session's own move
+/// stands, and the host is still asked about it as that wall: it waits
+/// again, and moves once the host advises a move. A row that left after
+/// `Login successful` was read is no such wall (R13): the login is back, and
+/// the point is the continue policy's. NEGATIVE CONTROL: once `/login` was
+/// typed at it, the old hold stands — nothing, and the host is not asked.
+#[test]
+fn a_waited_lost_login_whose_row_leaves_is_still_decided_as_that_wall() {
+    let t = t0();
+    let gone = walled(
+        WallKind::Auth,
+        "Not logged in · Please run /login",
+        Some(Duration::from_secs(2)),
+    );
+    let mut st = moved_and_asked(t);
+    let a = act(&mut st, &advised_wait(&gone, t + 30 * MIN), t + MIN);
+    assert!(waits_until(&a, t + 30 * MIN), "{a:?}");
+    // A person's `/status`: the row is gone, and nothing worked.
+    let status = idle("Status   Config   Usage", None);
+    st.observe(&status, t + 2 * MIN);
+    assert_eq!(
+        st.account_point(&status, &cfg()),
+        Some(AccountPoint::Wall {
+            kind: WallKind::Auth
+        }),
+        "asked as the wall it left"
+    );
+    let a = decide_turn_end(
+        &st,
+        &advised_wait(&status, t + 30 * MIN),
+        &cfg(),
+        t + 2 * MIN,
+    );
+    assert!(waits_until(&a, t + 30 * MIN), "waits again: {a:?}");
+    let a = decide_turn_end(&st, &advised(&status, "main"), &cfg(), t + 30 * MIN);
+    assert!(
+        restarts(&a, &to_account("main", AccountAt::Wall), RULE_ACCOUNT),
+        "the move, once advised: {a:?}"
+    );
+    // R13: a person's `/login` in the tab, `Login successful` read, ends the
+    // lost login for good: their `/status` after it is a plain turn end —
+    // the continue policy's, under the login they restored — never asked
+    // about as that wall, never waited at, never moved from.
+    let mut st = moved_and_asked(t);
+    let _ = act(&mut st, &advised_wait(&gone, t + 30 * MIN), t + MIN);
+    let back = TurnEndReading {
+        login_back: true,
+        ..idle("Login successful", None)
+    };
+    st.observe(&back, t + 2 * MIN);
+    st.observe(&status, t + 3 * MIN);
+    assert_eq!(st.login_track(), None, "the lost login is over");
+    assert_eq!(st.account_point(&status, &cfg()), None, "no host asked");
+    let a = decide_turn_end(&st, &advised(&status, "main"), &cfg(), t + 30 * MIN);
+    assert_eq!(
+        a.rule_id(),
+        Some(RULE_CONTINUE),
+        "the continue policy's: {a:?}"
+    );
+    // NEGATIVE CONTROL: `/login` typed at it.
+    let mut st = moved_and_asked(t);
+    st.observe(&gone, t + MIN);
+    let login = TurnEndAction::TypeCommand {
+        command: "/login".to_string(),
+        rule_id: RULE_LOGIN,
+        then: Then::Escalate("finish sign-in in the browser".to_string()),
+    };
+    st.acted(&login, &gone, t + MIN);
+    st.observe(&status, t + 2 * MIN);
+    assert_eq!(st.account_point(&status, &cfg()), None);
+    assert_eq!(
+        decide_turn_end(&st, &advised(&status, "main"), &cfg(), t + 30 * MIN),
+        TurnEndAction::Nothing,
+        "held as it stands"
+    );
 }
 
 // ------------------------------------------------------------------------
@@ -10208,11 +12829,11 @@ fn each_end_of_a_limit_reset_owes_one_continuation() {
         assert_eq!(st.reset_resume_owed(), Some(due), "{outcome:?}");
         let waits = at_under(&mut st, &after, t + sec, &quiet);
         assert!(waits_until(&waits, due), "{outcome:?}: {waits:?}");
-        let TurnEndAction::WaitUntil { why, .. } = &waits else {
+        let TurnEndAction::WaitUntil { why, retry, .. } = &waits else {
             panic!("{waits:?}")
         };
         assert_eq!(why, "the limit reset's own continuation");
-        assert!(!is_retry_wait(why), "no next try a tab shows");
+        assert!(!retry, "no next try a tab shows");
         let again = after_the_dialog(None);
         assert!(waits_until(
             &at_under(&mut st, &again, due - sec, &quiet),
@@ -10352,7 +12973,7 @@ fn the_resets_continuation_keeps_resume_limits_and_a_persons_grace() {
         st.reset_told(&ResetOutcome::Kept, t);
         st
     };
-    let after = after_the_dialog(Some(3 * MIN));
+    let after = after_the_dialog(Some(JOB));
     assert_eq!(at(&mut told(), &after, t), typed(RULE_LIMIT_RESUME));
     for continue_policy in [true, false] {
         let mut off = cfg();
@@ -10626,4 +13247,2041 @@ fn a_remembered_tail_reads_as_a_fresh_read_of_it() {
     // carried to the wrong tail would fail above.
     assert_ne!(classify_said_read(tails[0]), classify_said_read(tails[1]));
     assert_ne!(says_done_read(tails[0]), says_done_read(tails[2]));
+}
+
+/// USAGE CREDITS ARE WORK GOING ON, NEVER A WALL (accounts v2 S5, §3.3): at
+/// every measured credits screen (2.1.300: both renderers, 110 and 80
+/// columns) the reader names credits in use and no wall, and the turn-end
+/// decision — every timing, the continuation's back-off included — is the one
+/// the same screen gets with the credits notice taken away. NEGATIVE CONTROL:
+/// the same screen whose footer says the limit was hit decides a wait.
+#[test]
+fn a_credits_screen_decides_as_the_same_screen_without_its_notice() {
+    use aterm_phase::prompt::fixtures::{
+        CREDITS_IN_USE_2_1_300, CREDITS_IN_USE_80_2_1_300, CREDITS_IN_USE_FULLSCREEN_2_1_300,
+        CREDITS_STARTED_2_1_300, CREDITS_STARTED_80_2_1_300, CREDITS_STARTED_FULLSCREEN_2_1_300,
+    };
+    let quiet = |rows: &[String]| -> Vec<String> {
+        rows.iter()
+            .map(|r| {
+                ["You're now using usage credits", "Now using usage credits"]
+                    .iter()
+                    .fold(r.clone(), |r, words| match r.find(words) {
+                        Some(at) => r[..at].trim_end().to_string(),
+                        None => r,
+                    })
+            })
+            .collect()
+    };
+    let t = t0();
+    for fixture in [
+        CREDITS_STARTED_2_1_300,
+        CREDITS_IN_USE_2_1_300,
+        CREDITS_STARTED_80_2_1_300,
+        CREDITS_IN_USE_80_2_1_300,
+        CREDITS_STARTED_FULLSCREEN_2_1_300,
+        CREDITS_IN_USE_FULLSCREEN_2_1_300,
+    ] {
+        let rows = screen(fixture);
+        let read = aterm_phase::read(Some("claude"), &rows, Some(2));
+        assert!(read.credits.is_some() && read.wall.is_none(), "{fixture}");
+        let without = quiet(&rows);
+        assert!(
+            aterm_phase::read(Some("claude"), &without, Some(2))
+                .credits
+                .is_none(),
+            "the control has no notice: {without:#?}"
+        );
+        for worked in [None, Some(MIN), Some(3 * MIN)] {
+            let (mut a, mut b) = (TurnEndState::default(), TurnEndState::default());
+            for step in 0..3u32 {
+                let now = t + MIN * step;
+                assert_eq!(
+                    at(&mut a, &read_screen(&rows, worked), now),
+                    at(&mut b, &read_screen(&without, worked), now),
+                    "{fixture} worked {worked:?} step {step}"
+                );
+            }
+        }
+    }
+    // NEGATIVE CONTROL: a footer that says the limit was hit is a wall.
+    let rows = screen(CREDITS_IN_USE_2_1_300);
+    let walled: Vec<String> = rows
+        .iter()
+        .map(|r| {
+            r.replace(
+                "Now using usage credits",
+                "⚠ Usage limit reached · limit resets 9:43am",
+            )
+        })
+        .collect();
+    let mut st = TurnEndState::default();
+    let r = read_screen(&walled, Some(3 * MIN));
+    assert_eq!(r.wall, Some(WallKind::UsageSession), "{walled:#?}");
+    assert!(
+        matches!(at(&mut st, &r, t), TurnEndAction::WaitUntil { .. }),
+        "{r:#?}"
+    );
+}
+
+/// `r` under Autopilot `mode` ([`TurnEndReading::autopilot`]).
+fn under(mode: Autopilot, r: TurnEndReading) -> TurnEndReading {
+    TurnEndReading {
+        autopilot: mode,
+        ..r
+    }
+}
+
+/// `r` under Autopilot Land.
+fn land(r: TurnEndReading) -> TurnEndReading {
+    under(Autopilot::Land, r)
+}
+
+/// The land instruction, as typed.
+fn land_instruction() -> TurnEndAction {
+    TurnEndAction::Type {
+        text: LAND.to_string(),
+        rule_id: RULE_LAND,
+    }
+}
+
+/// A land nudge, as typed.
+fn land_nudged() -> TurnEndAction {
+    TurnEndAction::Type {
+        text: LAND_NUDGE.to_string(),
+        rule_id: RULE_LAND_NUDGE,
+    }
+}
+
+/// The land answer, as typed.
+fn land_answered() -> TurnEndAction {
+    TurnEndAction::Type {
+        text: LAND_ANSWER.to_string(),
+        rule_id: RULE_LAND_ANSWER,
+    }
+}
+
+/// The texts as the design words them, each the harness's own turn by its
+/// mark but the answer, and the standing rules riding with each.
+#[test]
+fn the_land_texts_are_the_designs_and_carry_the_rules() {
+    assert_eq!(
+        LAND,
+        "[aterm harness] Autopilot is set to Land: wrap up this work cleanly. Finish only the \
+         step in hand and start nothing new. Make sure what is done is verified, and leave it \
+         committed (and pushed, if that is how this repository works). Then write a short summary \
+         of what is done and what is left, and reply with ATERM-TASK-DONE on a line by itself."
+    );
+    assert_eq!(
+        LAND_NUDGE,
+        "[aterm harness] Still landing: finish only what leaves the work clean, then reply with \
+         ATERM-TASK-DONE on a line by itself."
+    );
+    assert_eq!(
+        LAND_ANSWER,
+        "Nobody is here to choose: take the option that finishes this work cleanly soonest, \
+         start nothing new, and change nothing irreversible."
+    );
+    let mark = crate::harness::upgrade::HARNESS_MARK;
+    assert!(LAND.starts_with(mark) && LAND_NUDGE.starts_with(mark));
+    assert!(!LAND_ANSWER.starts_with(mark));
+    for (text, built) in [
+        (LAND, land_text(Some("never push to main"))),
+        (LAND_NUDGE, land_nudge_text(Some("never push to main"))),
+        (LAND_ANSWER, land_answer_text(Some("never push to main"))),
+    ] {
+        assert_eq!(
+            built,
+            format!("{text} (standing rules: never push to main)")
+        );
+    }
+    assert_eq!(
+        (RULE_LAND, RULE_LAND_NUDGE, RULE_LAND_ANSWER, LAND_NUDGES),
+        ("land@v1", "land-nudge@v1", "land-answer@v1", 2)
+    );
+    for rule in [RULE_LAND, RULE_LAND_NUDGE, RULE_LAND_ANSWER] {
+        assert!(is_land_rule(rule) && is_continue_rule(rule), "{rule}");
+    }
+    assert!(!is_land_rule(RULE_CONTINUE) && !is_land_rule(RULE_DONE_CHECK));
+}
+
+/// LAND: the first point types the land instruction where Cruise would type
+/// the continuation, and a reply to it that says done — or ends on
+/// `ATERM-TASK-DONE`, with what is left listed beside it as the instruction
+/// asks — ends the task: nothing more, now or a day on. NEGATIVE CONTROL:
+/// the same points under Cruise continue; their done reply gets the done
+/// check, and the token beside a `Left:` the open-items challenge, never
+/// the end.
+#[test]
+fn land_types_its_instruction_once_and_a_done_reply_ends_the_task() {
+    for (reply, finished) in [
+        ("All done. Nothing left to do.", false),
+        (
+            "Committed and pushed the parser and its tests. Left: the lexer.\nATERM-TASK-DONE",
+            true,
+        ),
+    ] {
+        let mut now = t0();
+        let mut st = TurnEndState::default();
+        assert_eq!(
+            act(&mut st, &land(idle("Stage 1 landed.", Some(3 * MIN))), now),
+            land_instruction()
+        );
+        assert_eq!(st.land_episode(), (true, 0));
+        now += 2 * MIN;
+        let a = at(&mut st, &land(idle(reply, Some(2 * MIN))), now);
+        assert_eq!(a, TurnEndAction::Nothing, "{reply}");
+        assert!(st.task_done() && st.landed(), "{reply}");
+        assert_eq!(st.finished_by_worker(), finished, "{reply}");
+        for later in [2 * MIN, 60 * MIN, 24 * 60 * MIN] {
+            let again = land(idle(reply, None));
+            assert_eq!(at(&mut st, &again, now + later), TurnEndAction::Nothing);
+        }
+        // Negative control: Cruise continues, and checks the done reply.
+        let mut now = t0();
+        let mut st = TurnEndState::default();
+        assert_eq!(
+            act(&mut st, &idle("Stage 1 landed.", Some(3 * MIN)), now),
+            typed(RULE_CONTINUE)
+        );
+        now += 2 * MIN;
+        let a = at(&mut st, &idle(reply, Some(2 * MIN)), now);
+        assert!(!st.landed(), "{reply}");
+        if finished {
+            assert!(!st.task_done(), "{reply}");
+            let challenge = TurnEndAction::Type {
+                text: open_items_text(&["left"], None),
+                rule_id: RULE_OPEN_ITEMS,
+            };
+            assert_eq!(a, challenge, "Cruise challenges what Land accepts");
+        } else {
+            assert!(!st.task_done(), "{reply}");
+            let wait = st.short_wait().unwrap_or_default();
+            assert_eq!(act(&mut st, &idle(reply, None), now + wait), checked());
+        }
+    }
+}
+
+/// A reply to the instruction that says no done gets a nudge — on the short
+/// streak's back-off, as the continuation it stands in for — at most
+/// [`LAND_NUDGES`] of them, and then nothing: the landing is over, though the
+/// task is not done. A done reply to a nudge ends the task. NEGATIVE
+/// CONTROL: Cruise keeps continuing the same yields.
+#[test]
+fn a_land_reply_without_done_gets_at_most_two_nudges_then_nothing() {
+    let progress = "Committing the parser now; the lexer is next.";
+    let mut now = t0();
+    let mut st = TurnEndState::default();
+    assert_eq!(
+        act(&mut st, &land(idle("Stage 1 landed.", Some(3 * MIN))), now),
+        land_instruction()
+    );
+    // A short reply: backed off, then nudged.
+    now += Duration::from_secs(30);
+    let short = land(idle(progress, Some(Duration::from_secs(30))));
+    assert!(waits_until(&at(&mut st, &short, now), now + 2 * MIN));
+    now += 2 * MIN;
+    let same = TurnEndReading {
+        worked: None,
+        ..short
+    };
+    assert_eq!(act(&mut st, &same, now), land_nudged());
+    assert_eq!(st.land_episode(), (true, 1));
+    // Real work, no done: the second nudge at once.
+    now += 3 * MIN;
+    assert_eq!(
+        act(&mut st, &land(idle(progress, Some(3 * MIN))), now),
+        land_nudged()
+    );
+    assert_eq!(st.land_episode(), (true, LAND_NUDGES));
+    // And then nothing, now or later; the task is not done.
+    now += 3 * MIN;
+    assert_eq!(
+        at(&mut st, &land(idle(progress, Some(3 * MIN))), now),
+        TurnEndAction::Nothing
+    );
+    for later in [2 * MIN, 60 * MIN] {
+        let again = land(idle(progress, None));
+        assert_eq!(at(&mut st, &again, now + later), TurnEndAction::Nothing);
+    }
+    assert!(!st.task_done() && !st.landed());
+    // A done reply to a nudge ends the task.
+    let mut now = t0();
+    let mut st = TurnEndState::default();
+    act(&mut st, &land(idle("Stage 1 landed.", Some(3 * MIN))), now);
+    now += 3 * MIN;
+    assert_eq!(
+        act(&mut st, &land(idle(progress, Some(3 * MIN))), now),
+        land_nudged()
+    );
+    now += 3 * MIN;
+    at(&mut st, &land(idle("DONE", Some(3 * MIN))), now);
+    assert!(st.task_done() && st.landed());
+    // Negative control: Cruise continues each of those yields.
+    let mut now = t0();
+    let mut st = TurnEndState::default();
+    for _ in 0..4 {
+        assert_eq!(
+            act(&mut st, &idle(progress, Some(3 * MIN)), now),
+            typed(RULE_CONTINUE)
+        );
+        now += 3 * MIN;
+    }
+}
+
+/// The episode's memory is kept across a turn of someone else's: a worker
+/// whose own turns keep ending (a background job's) is landed once and
+/// nudged, never given the instruction again. NEGATIVE CONTROL: a fresh
+/// state at the same point is given the instruction.
+#[test]
+fn a_turn_of_someone_elses_keeps_the_land_episode() {
+    let progress = "Committing the parser now; the lexer is next.";
+    let mut now = t0();
+    let mut st = TurnEndState::default();
+    act(&mut st, &land(idle("Stage 1 landed.", Some(3 * MIN))), now);
+    now += 3 * MIN;
+    // The instruction's reply, judged; nothing typed for it here.
+    assert_eq!(
+        at(&mut st, &land(idle(progress, Some(3 * MIN))), now),
+        land_nudged()
+    );
+    // A turn nobody here typed, ended.
+    now += 10 * MIN;
+    let theirs = land(idle(progress, Some(5 * MIN)));
+    assert_eq!(at(&mut st, &theirs, now), land_nudged());
+    assert_eq!(st.land_episode(), (true, 0));
+    assert_eq!(
+        at(&mut TurnEndState::default(), &theirs, now),
+        land_instruction()
+    );
+}
+
+/// A done report under Land gets the land instruction, never the done check
+/// (the instruction asks for the token itself) — a done report that also
+/// asks what is next included, as Cruise checks it rather than answer it.
+/// Its done reply ends the task.
+#[test]
+fn a_done_report_under_land_gets_the_instruction_not_the_check() {
+    for said in ["All done.", "All done. What's next?"] {
+        let mut now = t0();
+        let mut st = TurnEndState::default();
+        st.observe(&land(idle(said, Some(3 * MIN))), now);
+        assert_eq!(st.done_reports(), 1, "{said}");
+        now += st.short_wait().unwrap_or_default();
+        assert_eq!(
+            act(&mut st, &land(idle(said, None)), now),
+            land_instruction(),
+            "{said}"
+        );
+        now += MIN;
+        at(
+            &mut st,
+            &land(idle("DONE", Some(Duration::from_secs(4)))),
+            now,
+        );
+        assert!(st.task_done() && st.landed(), "{said}");
+        // Negative control: Cruise checks it.
+        let mut st = TurnEndState::default();
+        st.observe(&idle(said, Some(3 * MIN)), t0());
+        let later = t0() + st.short_wait().unwrap_or_default();
+        assert_eq!(act(&mut st, &idle(said, None), later), checked(), "{said}");
+    }
+}
+
+/// A question under Land gets the land answer, whatever the question
+/// priority — one naming an irreversible act too: the land answer says to
+/// change nothing irreversible, where Cruise's reversible answer says to
+/// keep going; under `answer_questions = false` it is escalated, as under
+/// Cruise. The land answer's done reply ends the task once the instruction
+/// was typed. NEGATIVE CONTROLS: Cruise answers with the owner's text, and
+/// the irreversible one with the reversible answer.
+#[test]
+fn a_question_under_land_gets_the_land_answer() {
+    let now = t0();
+    let asked = "Did the suite pass on your machine?";
+    let long_term = SupervisorConfig {
+        question_priority: QuestionPriority::LongTerm,
+        ..cfg()
+    };
+    for policy in [cfg(), long_term] {
+        let a = at_under(
+            &mut TurnEndState::default(),
+            &land(idle(asked, Some(3 * MIN))),
+            now,
+            &policy,
+        );
+        assert_eq!(a, land_answered(), "{:?}", policy.question_priority);
+    }
+    assert_eq!(
+        at(
+            &mut TurnEndState::default(),
+            &idle(asked, Some(3 * MIN)),
+            now
+        ),
+        answered()
+    );
+    let wipe = "Waiting on you: shall I wipe build/ and start over?";
+    assert_eq!(
+        at(
+            &mut TurnEndState::default(),
+            &land(idle(wipe, Some(3 * MIN))),
+            now
+        ),
+        land_answered()
+    );
+    assert_eq!(
+        at(
+            &mut TurnEndState::default(),
+            &idle(wipe, Some(3 * MIN)),
+            now
+        ),
+        answered_reversibly()
+    );
+    for said in [asked, wipe] {
+        let a = at_under(
+            &mut TurnEndState::default(),
+            &land(idle(said, Some(3 * MIN))),
+            now,
+            &no_answers(),
+        );
+        assert!(is_escalate(&a, ANSWERS_OFF), "{said}: {a:?}");
+    }
+    // After the instruction, the answer's done reply ends the task.
+    let mut t = now;
+    let mut st = TurnEndState::default();
+    assert_eq!(
+        act(&mut st, &land(idle("Stage 1 landed.", Some(3 * MIN))), t),
+        land_instruction()
+    );
+    t += 3 * MIN;
+    assert_eq!(
+        act(&mut st, &land(idle(asked, Some(3 * MIN))), t),
+        land_answered()
+    );
+    assert_eq!(st.land_episode(), (true, 0), "an answer is no nudge");
+    t += MIN;
+    at(&mut st, &land(idle("All done.", Some(MIN))), t);
+    assert!(st.task_done() && st.landed());
+}
+
+/// The land acts are typed continuations: `continue = false` types none of
+/// them where nothing is asked or a done report stands, and still answers a
+/// question with the land answer, as Cruise still answers one.
+#[test]
+fn continue_off_limits_the_land_instruction_but_not_its_answer() {
+    let now = t0();
+    let off = SupervisorConfig {
+        continue_policy: false,
+        ..cfg()
+    };
+    let run = |said: &str| {
+        at_under(
+            &mut TurnEndState::default(),
+            &land(idle(said, Some(3 * MIN))),
+            now,
+            &off,
+        )
+    };
+    assert_eq!(run("Stage 1 landed."), TurnEndAction::Nothing);
+    assert_eq!(run("All done."), TurnEndAction::Nothing);
+    assert_eq!(run("Did the suite pass on your machine?"), land_answered());
+    // Negative control: switched on, the instruction goes.
+    assert_eq!(
+        at(
+            &mut TurnEndState::default(),
+            &land(idle("Stage 1 landed.", Some(3 * MIN))),
+            now
+        ),
+        land_instruction()
+    );
+}
+
+/// Leaving Land forgets the episode: Cruise continues as ever, and a Land
+/// chosen again is a new episode, its instruction typed again. A task Land
+/// ended stays done under Cruise until someone else's turn reopens it.
+#[test]
+fn leaving_land_forgets_the_episode_and_a_done_task_stays_done() {
+    let progress = "Committing the parser now; the lexer is next.";
+    let mut now = t0();
+    let mut st = TurnEndState::default();
+    act(&mut st, &land(idle("Stage 1 landed.", Some(3 * MIN))), now);
+    now += 3 * MIN;
+    assert_eq!(
+        act(&mut st, &idle(progress, Some(3 * MIN)), now),
+        typed(RULE_CONTINUE)
+    );
+    assert_eq!(st.land_episode(), (false, 0));
+    now += 3 * MIN;
+    assert_eq!(
+        act(&mut st, &land(idle(progress, Some(3 * MIN))), now),
+        land_instruction(),
+        "a new episode"
+    );
+    // A task Land ended stays done in Cruise...
+    now += 3 * MIN;
+    at(&mut st, &land(idle("DONE", Some(3 * MIN))), now);
+    assert!(st.task_done());
+    now += MIN;
+    assert_eq!(
+        at(&mut st, &idle("DONE", None), now),
+        TurnEndAction::Nothing
+    );
+    assert!(st.task_done() && st.land_episode() == (false, 0));
+    // ...until someone else's turn reopens it.
+    now += 10 * MIN;
+    at(
+        &mut st,
+        &idle("Added the flag. All done.", Some(5 * MIN)),
+        now,
+    );
+    assert!(!st.task_done());
+}
+
+/// AN OFF PARK ENDS THE LAND EPISODE ([`TurnEndState::park_off`]), though
+/// every reading the policy folded in was Land's (the loop decides nothing
+/// while parked): the next Land point gets the instruction again, never a
+/// nudge — the instruction's act awaited included. A task Land ended stays
+/// done. NEGATIVE CONTROL: the same readings with no park get the nudge.
+#[test]
+fn leaving_land_for_an_off_park_types_the_instruction_again() {
+    let progress = "Committing the parser now; the lexer is next.";
+    let run = |park: bool| {
+        let mut now = t0();
+        let mut st = TurnEndState::default();
+        act(&mut st, &land(idle("Stage 1 landed.", Some(3 * MIN))), now);
+        assert_eq!(st.land_episode(), (true, 0));
+        if park {
+            st.park_off();
+            assert_eq!(st.land_episode(), (false, 0));
+        }
+        now += 3 * MIN;
+        act(&mut st, &land(idle(progress, Some(3 * MIN))), now)
+    };
+    assert_eq!(run(true), land_instruction());
+    assert_eq!(run(false), land_nudged());
+    // A task Land ended stays done across a park.
+    let mut now = t0();
+    let mut st = TurnEndState::default();
+    act(&mut st, &land(idle("Stage 1 landed.", Some(3 * MIN))), now);
+    now += 3 * MIN;
+    at(&mut st, &land(idle("DONE", Some(3 * MIN))), now);
+    assert!(st.landed());
+    st.park_off();
+    now += MIN;
+    assert_eq!(
+        at(&mut st, &land(idle("DONE", None)), now),
+        TurnEndAction::Nothing
+    );
+    assert!(st.task_done() && st.landed());
+}
+
+/// A PERSON'S OWN EXCHANGE IS THEIRS UNDER EVERY AUTOPILOT MODE: a turn a
+/// person's keystroke opened, answered short on a task the policy is not
+/// carrying, is left to them under Cruise and Land alike — no land
+/// instruction is typed over it, and it is never read as landed — and Off
+/// decides nothing anyway. NEGATIVE CONTROLS: the same reply with nobody's
+/// hand gets Cruise's done check and Land's instruction (Off still nothing).
+#[test]
+fn a_persons_own_exchange_is_theirs_under_every_autopilot() {
+    let now = t0();
+    let quick = Some(Duration::from_secs(5));
+    let said = "Hi! What would you like me to work on?";
+    let theirs = TurnEndReading {
+        person: Some(Duration::from_secs(8)),
+        ..idle(said, quick)
+    };
+    for mode in Autopilot::ALL {
+        let mut st = TurnEndState::default();
+        assert_eq!(
+            at(&mut st, &under(mode, theirs.clone()), now),
+            TurnEndAction::Nothing,
+            "{mode:?}"
+        );
+        assert!(st.left_to_person() && !st.landed(), "{mode:?}");
+        assert_eq!(st.land_episode(), (false, 0), "{mode:?}: no instruction");
+        for later in [2 * MIN, 60 * MIN, 24 * 60 * MIN] {
+            let r = under(
+                mode,
+                TurnEndReading {
+                    person: Some(later),
+                    ..theirs.clone()
+                },
+            );
+            let a = decide_turn_end(&st, &r, &cfg(), now + later);
+            assert_eq!(a, TurnEndAction::Nothing, "{mode:?} at +{later:?}");
+        }
+        // Negative control: nobody's hand (a dispatch, the agent's own wake).
+        let mut st = TurnEndState::default();
+        at(&mut st, &under(mode, idle(said, quick)), now);
+        assert!(!st.left_to_person(), "{mode:?}");
+        let a = decide_turn_end(&st, &under(mode, idle(said, quick)), &cfg(), now + 60 * MIN);
+        let want = match mode {
+            Autopilot::Cruise => checked(),
+            Autopilot::Land => land_instruction(),
+            Autopilot::Off => TurnEndAction::Nothing,
+        };
+        assert_eq!(a, want, "{mode:?}");
+    }
+}
+
+/// LAND AND A PERSON'S EXCHANGE COMPOSE BY WHOSE TURN ENDED. A person's
+/// quick check-in inside a landing (the instruction typed and answered: the
+/// policy is carrying the task) stays on the landing's ladder: the next
+/// point is nudged. A land act's done reply ends the task as LANDED — a
+/// gesture of the person's inside that turn changes nothing, the turn was
+/// the policy's act — and never as left to the person. Once landed, the
+/// person's own closing quick turn is THEIRS, no longer the landing's.
+/// NEGATIVE CONTROLS: the same closing turn with nobody's hand reopens the
+/// task (someone else's turn, as under Cruise), and is neither.
+#[test]
+fn a_landing_and_a_persons_own_exchange_compose() {
+    let quick = Some(Duration::from_secs(5));
+    let hand = |r: TurnEndReading| TurnEndReading {
+        person: Some(Duration::from_secs(8)),
+        ..r
+    };
+    let progress = "Committing the parser now; the lexer is next.";
+    let landed = |closing: Option<TurnEndReading>| {
+        let mut now = t0();
+        let mut st = TurnEndState::default();
+        assert_eq!(
+            act(&mut st, &land(idle("Stage 1 landed.", Some(3 * MIN))), now),
+            land_instruction()
+        );
+        // The instruction's reply: real work, no done — carried.
+        now += 3 * MIN;
+        at(&mut st, &land(idle(progress, Some(3 * MIN))), now);
+        // A person's quick check-in: on the ladder, nudged after it.
+        now += MIN;
+        let check_in = hand(land(idle("Going well: the lexer is next.", quick)));
+        at(&mut st, &check_in, now);
+        assert!(!st.task_done() && !st.left_to_person());
+        now += 60 * MIN;
+        let next = land(idle("Going well: the lexer is next.", None));
+        assert_eq!(act(&mut st, &next, now), land_nudged());
+        // The nudge's done reply, the person's gesture inside its turn:
+        // landed, not left.
+        now += MIN;
+        at(&mut st, &hand(land(idle("All done.", quick))), now);
+        assert!(st.landed() && !st.left_to_person());
+        now += MIN;
+        if let Some(r) = closing {
+            at(&mut st, &r, now);
+        }
+        st
+    };
+    let thanks = land(idle("You're welcome!", quick));
+    let st = landed(Some(hand(thanks.clone())));
+    assert!(st.left_to_person() && !st.landed());
+    assert_eq!(
+        decide_turn_end(&st, &thanks, &cfg(), t0() + 24 * 60 * MIN),
+        TurnEndAction::Nothing
+    );
+    // Negative control: nobody's hand reopens the task, neither landed nor
+    // left to anyone.
+    let st = landed(Some(thanks));
+    assert!(!st.task_done() && !st.landed() && !st.left_to_person());
+    // And with no turn after it, the landing stands.
+    let st = landed(None);
+    assert!(st.landed());
+}
+
+/// A SPENT LANDING CARRIES NO TASK (the review of the Autopilot merge,
+/// probe P1): the land instruction and both nudges answered with work and no
+/// done, the landing types nothing more of its own, so a person's quick turn
+/// hours later — a question in it included — is THEIR OWN EXCHANGE, never
+/// answered with the land answer. FAILS WITHOUT THE FIX: the carry stood for
+/// good, and the person's question got `land-answer@v1`. NEGATIVE CONTROLS:
+/// the same question with nobody's hand still gets the land answer, and a
+/// person's check-in inside a landing not yet spent is still nudged.
+#[test]
+fn a_spent_landing_carries_no_task_so_a_persons_quick_turn_is_theirs() {
+    let quick = Some(Duration::from_secs(5));
+    let progress = "Committing the parser now; the lexer is next.";
+    let question = "Committed the parser. Did the suite pass on your machine?";
+    // A landing whose instruction and `nudges` nudges were answered with
+    // work and no done.
+    let landing = |nudges: u32| {
+        let mut now = t0();
+        let mut st = TurnEndState::default();
+        assert_eq!(
+            act(&mut st, &land(idle("Stage 1 landed.", Some(3 * MIN))), now),
+            land_instruction()
+        );
+        for _ in 0..nudges {
+            now += 3 * MIN;
+            assert_eq!(
+                act(&mut st, &land(idle(progress, Some(3 * MIN))), now),
+                land_nudged()
+            );
+        }
+        now += 3 * MIN;
+        at(&mut st, &land(idle(progress, Some(3 * MIN))), now);
+        (st, now)
+    };
+    let (mut st, now) = landing(LAND_NUDGES);
+    assert_eq!(st.land_episode(), (true, LAND_NUDGES));
+    assert_eq!(
+        decide_turn_end(&st, &land(idle(progress, None)), &cfg(), now + MIN),
+        TurnEndAction::Nothing,
+        "spent: nothing more of its own"
+    );
+    let later = now + 6 * 60 * MIN;
+    let theirs = land(TurnEndReading {
+        person: Some(Duration::from_secs(8)),
+        ..idle(question, quick)
+    });
+    at(&mut st, &theirs, later);
+    assert!(st.left_to_person() && !st.landed());
+    let r = land(TurnEndReading {
+        person: Some(10 * MIN),
+        ..idle(question, None)
+    });
+    assert_eq!(
+        decide_turn_end(&st, &r, &cfg(), later + 10 * MIN),
+        TurnEndAction::Nothing
+    );
+    // NEGATIVE CONTROL: nobody's hand — the worker's own question gets the
+    // land answer.
+    let (mut st, now) = landing(LAND_NUDGES);
+    let later = now + 6 * 60 * MIN;
+    at(&mut st, &land(idle(question, quick)), later);
+    assert!(!st.left_to_person());
+    assert_eq!(
+        decide_turn_end(&st, &land(idle(question, None)), &cfg(), later + 10 * MIN),
+        land_answered()
+    );
+    // NEGATIVE CONTROL: a landing one nudge short of spent is still carried:
+    // a person's quick check-in stays on its ladder and gets the last nudge.
+    let (mut st, now) = landing(LAND_NUDGES - 1);
+    let check_in = land(TurnEndReading {
+        person: Some(Duration::from_secs(8)),
+        ..idle("Going well: the lexer is next.", quick)
+    });
+    at(&mut st, &check_in, now + MIN);
+    assert!(!st.task_done() && !st.left_to_person());
+    assert_eq!(
+        decide_turn_end(
+            &st,
+            &land(idle("Going well: the lexer is next.", None)),
+            &cfg(),
+            now + 60 * MIN
+        ),
+        land_nudged()
+    );
+}
+
+/// OFF STANDING ENDS THE CARRY (probe P4; [`TurnEndState::park_off`]): a
+/// task the policy carried — under Cruise or Land — and then an Off park,
+/// where the person drove: their quick "Hello!" after it is their own
+/// exchange, and nothing is typed over it (no continuation, no new land
+/// instruction). FAILS WITHOUT THE FIX: the park left the carry, and the
+/// greeting got the continuation, or the full land instruction as a new
+/// episode. NEGATIVE CONTROL: the same greeting with no park is a check-in
+/// on the carried run — Cruise continues it, Land nudges it.
+#[test]
+fn an_off_park_ends_the_carry_so_a_persons_greeting_after_it_is_theirs() {
+    let quick = Some(Duration::from_secs(5));
+    for mode in [Autopilot::Cruise, Autopilot::Land] {
+        let run = |park: bool| {
+            let mut now = t0();
+            let mut st = TurnEndState::default();
+            let first = act(
+                &mut st,
+                &under(mode, idle("Stage 1 landed.", Some(3 * MIN))),
+                now,
+            );
+            assert!(first.rule_id().is_some(), "{mode:?}: {first:?}");
+            now += 3 * MIN;
+            at(
+                &mut st,
+                &under(
+                    mode,
+                    idle("Committing the parser; the lexer is next.", Some(3 * MIN)),
+                ),
+                now,
+            );
+            if park {
+                st.park_off();
+            }
+            now += 10 * MIN;
+            let hello = under(
+                mode,
+                TurnEndReading {
+                    person: Some(Duration::from_secs(8)),
+                    ..idle("Hello!", quick)
+                },
+            );
+            at(&mut st, &hello, now);
+            let r = under(
+                mode,
+                TurnEndReading {
+                    person: Some(10 * MIN),
+                    ..idle("Hello!", None)
+                },
+            );
+            let a = decide_turn_end(&st, &r, &cfg(), now + 10 * MIN);
+            (st.left_to_person(), a)
+        };
+        assert_eq!(run(true), (true, TurnEndAction::Nothing), "{mode:?}");
+        let want = match mode {
+            Autopilot::Land => land_nudged(),
+            _ => typed(RULE_CONTINUE),
+        };
+        assert_eq!(run(false), (false, want), "{mode:?}");
+    }
+}
+
+/// A TURN NO READ SAW BUSY IS NEVER LEFT TO A PERSON (the reviews of
+/// 85d489954 and 7c7771267): at the first point a loop finds — fresh, started
+/// by the window's host as the session's Off lifted, or the first after an Off
+/// park — the person's gesture 10 s back says nothing of who opened the turn.
+/// It may be their greeting under Off, the harness's own `keep going`, done
+/// check or land instruction answered while Off stood, the point Off stood on
+/// read again, or the person's check-in on the run Cruise carried, the chip
+/// then taken round through Off. Each is decided as any first point is:
+/// backed off, then acted on — under Cruise and Land alike. FAILS WITH
+/// 85d489954's first-point arm (`(None, None) if theirs …`): every one but
+/// the restart was `left_to_person` and nothing was typed an hour later,
+/// Cruise stalled with nothing escalated. CONTROL: a restart mid-run, whose
+/// ledger carries the task, was never left.
+#[test]
+fn a_first_point_no_read_saw_busy_is_never_left_to_a_person() {
+    let hand = Some(Duration::from_secs(10));
+    const STOOD: &str = "Stage 2 landed; stage 3 is next.";
+    let points = [
+        (
+            "a greeting under Off",
+            "Hi! What would you like me to work on?",
+        ),
+        (
+            "the harness's keep going, answered under Off",
+            "Wired the lexer into the parser; the docs are next.",
+        ),
+        (
+            "the done check, answered under Off",
+            "Not finished: the docs are out of date. Updating them next.",
+        ),
+        (
+            "the land instruction, answered under Off",
+            "Left: the docs and the release notes.",
+        ),
+        (
+            "a check-in on the carried run",
+            "Tests are green; the docs are next.",
+        ),
+        ("the point Off stood on, read again", STOOD),
+    ];
+    type Begin = fn(&mut TurnEndState, Autopilot, Instant);
+    let starts: [(&str, Begin); 4] = [
+        ("a fresh loop", |_, _, _| {}),
+        ("a loop started as Off lifted", |st, _, now| {
+            st.seed_acts(&[Duration::from_secs(80)], now);
+            st.start_lifted_off();
+        }),
+        ("a restart mid-run (control)", |st, _, now| {
+            st.seed_acts(&[Duration::from_secs(80)], now);
+        }),
+        ("the first point after an Off park", |st, mode, now| {
+            let r = under(mode, idle("Stage 1 landed.", Some(3 * MIN)));
+            assert!(act(st, &r, now - 20 * MIN).rule_id().is_some());
+            at(st, &under(mode, idle(STOOD, Some(3 * MIN))), now - 15 * MIN);
+            st.park_off();
+        }),
+    ];
+    for mode in [Autopilot::Cruise, Autopilot::Land] {
+        for (start, begin) in starts {
+            for (why, said) in points {
+                let now = t0();
+                let mut st = TurnEndState::default();
+                begin(&mut st, mode, now);
+                let unseen = |person: Option<Duration>| {
+                    under(
+                        mode,
+                        TurnEndReading {
+                            person,
+                            ..idle(said, None)
+                        },
+                    )
+                };
+                st.observe(&unseen(hand), now);
+                assert!(!st.left_to_person(), "{mode:?}, {start}: {why}");
+                let later = now + 60 * MIN;
+                let a = decide_turn_end(&st, &unseen(hand.map(|h| h + 60 * MIN)), &cfg(), later);
+                assert!(
+                    matches!(a, TurnEndAction::Type { .. }),
+                    "{mode:?}, {start}: {why}: {a:?}"
+                );
+            }
+        }
+    }
+}
+
+/// A LOOP STARTED AS OFF LIFTED KEEPS THE CARRY FOR A TURN ALREADY RUNNING
+/// AS IT ATTACHES (the review of 85d489954, finding 3): the chip's way from
+/// Land back to Cruise is through Off, the agent mid-turn on the `keep
+/// going` the stopped loop typed 4 minutes ago. The new loop's first read is
+/// that turn live ([`TurnEndState::took`]), its tail 40 s of work, no done
+/// row, the person's scroll 10 s before its end: the harness's own run,
+/// continued. FAILS WITHOUT THE FIX: the lifted start dropped the carry, and
+/// the scroll made the tail a person's exchange, left for good. NEGATIVE
+/// CONTROL: a lifted loop whose first point came before any live read drops
+/// the carry for good — the person's quick turn after it, seen busy, is
+/// theirs.
+#[test]
+fn a_loop_started_as_off_lifted_keeps_the_carry_for_the_turn_it_attached_to() {
+    let said = "Committed step 4; step 5 is next.";
+    let now = t0();
+    let mut st = TurnEndState::default();
+    st.seed_acts(&[4 * MIN], now);
+    st.start_lifted_off();
+    st.took();
+    let tail = TurnEndReading {
+        person: Some(Duration::from_secs(10)),
+        ..idle(said, Some(Duration::from_secs(40)))
+    };
+    at(&mut st, &tail, now);
+    assert!(!st.left_to_person());
+    let later = TurnEndReading {
+        person: Some(60 * MIN),
+        ..idle(said, None)
+    };
+    assert_eq!(
+        decide_turn_end(&st, &later, &cfg(), now + 60 * MIN),
+        typed(RULE_CONTINUE)
+    );
+    // NEGATIVE CONTROL: the first point before any live read.
+    let mut st = TurnEndState::default();
+    st.seed_acts(&[4 * MIN], now);
+    st.start_lifted_off();
+    at(&mut st, &idle("Waiting for your word.", None), now);
+    assert!(!st.left_to_person());
+    st.took();
+    let hello = TurnEndReading {
+        person: Some(Duration::from_secs(5)),
+        ..idle("Hello!", Some(Duration::from_secs(5)))
+    };
+    at(&mut st, &hello, now + 10 * MIN);
+    assert!(st.left_to_person());
+}
+
+/// AUTOPILOT OFF decides nothing at any point — an idle point, a question, a
+/// wall, the memory banner, a draft standing, aterm's own words standing, an
+/// act awaited, an escalation — where Cruise acts or waits at each
+/// (NEGATIVE CONTROL); Land decides the walls as Cruise does.
+#[test]
+fn autopilot_off_decides_nothing_where_cruise_acts() {
+    let now = t0();
+    let cases = [
+        idle("Stage 1 landed.", Some(3 * MIN)),
+        idle("Did the suite pass on your machine?", Some(3 * MIN)),
+        walled(
+            WallKind::Overloaded,
+            "API Error: 529 Overloaded.",
+            Some(3 * MIN),
+        ),
+        walled(
+            WallKind::Memory,
+            "Claude Code is using a lot of memory",
+            Some(3 * MIN),
+        ),
+        TurnEndReading {
+            composer: Composer::Typed,
+            ..idle("Stage 1 landed.", Some(3 * MIN))
+        },
+        TurnEndReading {
+            composer: Composer::Own,
+            ..idle("Stage 1 landed.", Some(3 * MIN))
+        },
+    ];
+    for r in cases {
+        let cruise = at(&mut TurnEndState::default(), &r, now);
+        assert_ne!(cruise, TurnEndAction::Nothing, "{r:?}");
+        let off = under(Autopilot::Off, r.clone());
+        assert_eq!(
+            at(&mut TurnEndState::default(), &off, now),
+            TurnEndAction::Nothing,
+            "{r:?}"
+        );
+        if r.wall.is_some() {
+            assert_eq!(
+                at(&mut TurnEndState::default(), &land(r.clone()), now),
+                cruise,
+                "{r:?}"
+            );
+        }
+    }
+    // An act awaited: Cruise waits for it to be taken; Off decides nothing.
+    let mut st = TurnEndState::default();
+    act(&mut st, &idle("Stage 1 landed.", Some(3 * MIN)), now);
+    let unseen = idle("Stage 1 landed.", None);
+    assert!(awaits(&at(&mut st.clone(), &unseen, now), now));
+    let off = under(Autopilot::Off, unseen);
+    assert_eq!(
+        decide_turn_end(&st, &off, &cfg(), now),
+        TurnEndAction::Nothing
+    );
+    // An escalation under `answer_questions = false`: none under Off.
+    let asks = idle("Did the suite pass on your machine?", Some(3 * MIN));
+    assert!(matches!(
+        at_under(&mut TurnEndState::default(), &asks, now, &no_answers()),
+        TurnEndAction::Escalate { .. }
+    ));
+    assert_eq!(
+        at_under(
+            &mut TurnEndState::default(),
+            &under(Autopilot::Off, asks),
+            now,
+            &no_answers()
+        ),
+        TurnEndAction::Nothing
+    );
+}
+
+/// A landing that is over (instruction and nudges spent) is not wrapped in an
+/// account move ahead of the wall: the relaunch's carry-on would start the
+/// work moving again. Only a spent landing: a Land point with nothing to
+/// type under `continue = false` is wrapped as Cruise's is there. NEGATIVE
+/// CONTROL: a landing not over is wrapped as Cruise's continuation is.
+#[test]
+fn a_spent_landing_asks_no_relaunch() {
+    let progress = "Committing the parser now; the lexer is next.";
+    let mut now = t0();
+    let mut st = TurnEndState::default();
+    act(&mut st, &land(idle("Stage 1 landed.", Some(3 * MIN))), now);
+    for _ in 0..LAND_NUDGES {
+        now += 3 * MIN;
+        assert_eq!(
+            act(&mut st, &land(idle(progress, Some(3 * MIN))), now),
+            land_nudged()
+        );
+    }
+    now += 3 * MIN;
+    let end = land(idle(progress, Some(3 * MIN)));
+    assert_eq!(
+        at(&mut st, &advised(&end, "work-2"), now),
+        TurnEndAction::Nothing
+    );
+    let a = at(&mut TurnEndState::default(), &advised(&end, "work-2"), now);
+    assert!(
+        restarts(&a, &to_account("work-2", AccountAt::Ahead), RULE_ACCOUNT),
+        "{a:?}"
+    );
+    assert_eq!(otherwise_of(&a), &land_instruction());
+    // `continue = false`: nothing to type, under Land as under Cruise, and
+    // the move goes ahead of the wall in both, its own act nothing.
+    let off = SupervisorConfig {
+        continue_policy: false,
+        ..cfg()
+    };
+    for r in [end.clone(), under(Autopilot::Cruise, end.clone())] {
+        let a = at_under(
+            &mut TurnEndState::default(),
+            &advised(&r, "work-2"),
+            now,
+            &off,
+        );
+        assert!(
+            restarts(&a, &to_account("work-2", AccountAt::Ahead), RULE_ACCOUNT),
+            "{:?}: {a:?}",
+            r.autopilot
+        );
+        assert_eq!(otherwise_of(&a), &TurnEndAction::Nothing);
+    }
+}
+
+/// A SPENT LANDING IS WRAPPED IN NO MODEL'S RETURN, WHATEVER ITS POINT GETS
+/// (the review of a295792e4): a model bucket moved the session to its
+/// fallback, Land's instruction and both nudges went before the bucket's
+/// reset, and the reset has passed. A point that asks a question gets the
+/// land answer, typed as it is — never the relaunch whose carry-on would
+/// start the work again — and a point inside the short streak's back-off
+/// waits, unwrapped too. NEGATIVE CONTROL: a landing not over (its
+/// instruction alone typed) is wrapped as Cruise's point is: the model's
+/// return, the land answer what the point gets where it is not made.
+#[test]
+fn a_spent_landing_is_wrapped_in_no_model_return_whatever_its_point_gets() {
+    let t = t0();
+    let progress = "Committing the parser now; the lexer is next.";
+    let asks = "Did the suite pass on your machine?";
+    let back = Some("fable".to_string());
+    // The bucket's move at `t` (its reset 2 h on), then Land's instruction
+    // and `nudges` nudges, each after 3 minutes of work.
+    let landed = |nudges: u32| {
+        let mut st = TurnEndState::default();
+        act(&mut st, &bucket(Some(t + 120 * MIN), 3 * MIN), t);
+        let mut now = t + 3 * MIN;
+        assert_eq!(
+            act(&mut st, &land(idle("Stage 1 landed.", Some(3 * MIN))), now),
+            land_instruction()
+        );
+        for _ in 0..nudges {
+            now += 3 * MIN;
+            assert_eq!(
+                act(&mut st, &land(idle(progress, Some(3 * MIN))), now),
+                land_nudged()
+            );
+        }
+        st
+    };
+    let past_reset = t + 130 * MIN;
+
+    // Spent, a question past the reset: the land answer alone.
+    let mut st = landed(LAND_NUDGES);
+    assert_eq!(
+        at(&mut st, &land(idle(asks, Some(3 * MIN))), past_reset),
+        land_answered()
+    );
+    // Spent, a short turn past the reset: the back-off's wait alone.
+    let mut st = landed(LAND_NUDGES);
+    let a = at(
+        &mut st,
+        &land(idle(progress, Some(Duration::from_secs(30)))),
+        past_reset,
+    );
+    assert!(
+        matches!(a, TurnEndAction::WaitUntil { .. }),
+        "the back-off, unwrapped: {a:?}"
+    );
+    // Spent, nothing asked: nothing, as ever.
+    let mut st = landed(LAND_NUDGES);
+    assert_eq!(
+        at(&mut st, &land(idle(progress, Some(3 * MIN))), past_reset),
+        TurnEndAction::Nothing
+    );
+
+    // NEGATIVE CONTROL: the instruction alone typed — the model's return,
+    // wrapping the land answer.
+    let mut st = landed(0);
+    let a = at(&mut st, &land(idle(asks, Some(3 * MIN))), past_reset);
+    assert!(
+        restarts(
+            &a,
+            &Restart::ModelBack { to: back.clone() },
+            RULE_MODEL_RESTORE
+        ),
+        "{a:?}"
+    );
+    assert_eq!(otherwise_of(&a), &land_answered());
+    // ...and so is Cruise's question at the spent landing's point.
+    let mut st = landed(LAND_NUDGES);
+    let a = at(&mut st, &idle(asks, Some(3 * MIN)), past_reset);
+    assert!(
+        restarts(&a, &Restart::ModelBack { to: back }, RULE_MODEL_RESTORE),
+        "{a:?}"
+    );
+}
+
+// -----------------------------------------------------------------------
+// Autopilot meets `EXCHANGE_WORK` and the wall split (the merge of main's
+// 00d0a2ccc and 7fffc8156 into the Autopilot branch): each interplay, with
+// its negative control.
+// -----------------------------------------------------------------------
+
+/// A LAND ACT'S REPLY IS LANDED HOWEVER LONG IT WORKED: a land act is a
+/// continuation, so its turn is never a person's exchange — answered done
+/// after 3 s, after 8 minutes (past `min_work`, inside [`EXCHANGE_WORK`]) or
+/// after 12, a gesture of the person's inside it, it ends the task as
+/// LANDED, never as left to them. NEGATIVE CONTROL: the same reply ending a
+/// turn the person's own message opened, on a task the policy is not
+/// carrying, is their exchange inside `EXCHANGE_WORK` (left, never landed)
+/// and a job past it (neither: a done report, which Land meets with its
+/// instruction).
+#[test]
+fn a_land_acts_reply_is_landed_however_long_it_worked() {
+    let reply = "All done: committed and pushed.";
+    // Each turn's work, and whether the person's own turn of that length is
+    // their exchange: 8 minutes is, though it is past `min_work`.
+    for (worked, exchange) in [
+        (Duration::from_secs(3), true),
+        (8 * MIN, true),
+        (JOB, false),
+    ] {
+        // The person's gesture half-way through the turn: after the act.
+        let hand = Some(worked / 2);
+        let mut now = t0();
+        let mut st = TurnEndState::default();
+        assert_eq!(
+            act(&mut st, &land(idle("Stage 1 landed.", Some(3 * MIN))), now),
+            land_instruction()
+        );
+        now += worked;
+        let r = land(TurnEndReading {
+            person: hand,
+            ..idle(reply, Some(worked))
+        });
+        st.observe(&r, now);
+        assert!(st.landed() && !st.left_to_person(), "{worked:?}: {st:?}");
+        let later = land(TurnEndReading {
+            person: Some(60 * MIN),
+            ..idle(reply, None)
+        });
+        assert_eq!(
+            decide_turn_end(&st, &later, &cfg(), now + 60 * MIN),
+            TurnEndAction::Nothing,
+            "{worked:?}"
+        );
+        // NEGATIVE CONTROL: no land act awaited — the person's own message.
+        let mut st = TurnEndState::default();
+        st.observe(&r, now);
+        assert!(!st.landed(), "{worked:?}");
+        let a = decide_turn_end(&st, &later, &cfg(), now + 60 * MIN);
+        if exchange {
+            assert!(st.left_to_person(), "{worked:?}");
+            assert_eq!(a, TurnEndAction::Nothing, "{worked:?}");
+        } else {
+            assert!(!st.task_done() && !st.left_to_person(), "{worked:?}");
+            assert_eq!(a, land_instruction(), "{worked:?}");
+        }
+    }
+}
+
+/// A WALL SPLITS A PERSON'S JOB UNDER LAND AS UNDER CRUISE: a person's turn
+/// on a task the policy is not carrying works 6 minutes into a 529, the
+/// wall's retry delivers it again, and its answer works 6 more — 12 in all,
+/// past [`EXCHANGE_WORK`]: a job, so Land lands it (its instruction), and the
+/// retry, no land act, is never read as landed. NEGATIVE CONTROL: 3 + 3
+/// minutes across the same wall is still their exchange — left, nothing
+/// typed, no instruction.
+#[test]
+fn a_wall_split_job_is_landed_and_a_split_exchange_is_left_under_land() {
+    let now = t0();
+    let run = |before: Duration, after: Duration| {
+        let mut st = TurnEndState::default();
+        let r = land(TurnEndReading {
+            person: Some(before),
+            ..walled(WallKind::Overloaded, "529", Some(before))
+        });
+        at(&mut st, &r, now);
+        let retry = TurnEndReading {
+            person: None,
+            worked: None,
+            ..r
+        };
+        let a = act(&mut st, &retry, now + 10 * MIN);
+        assert!(a.rule_id().is_some_and(is_wall_retry), "{a:?}");
+        let answered = now + 10 * MIN + after;
+        at(
+            &mut st,
+            &land(idle("Stage 2 of 5 is in.", Some(after))),
+            answered,
+        );
+        let a = decide_turn_end(
+            &st,
+            &land(idle("Stage 2 of 5 is in.", None)),
+            &cfg(),
+            answered + 60 * MIN,
+        );
+        (st.left_to_person(), st.landed(), st.land_episode(), a)
+    };
+    assert_eq!(
+        run(6 * MIN, 6 * MIN),
+        (false, false, (false, 0), land_instruction())
+    );
+    assert_eq!(
+        run(3 * MIN, 3 * MIN),
+        (true, false, (false, 0), TurnEndAction::Nothing)
+    );
+}
+
+/// A SPENT LANDING LEAVES A PERSON'S MINUTES-LONG QUESTION TO THEM: the
+/// landing's instruction and nudges typed with no done, the task is carried
+/// no more, so a person's question the agent answers in 8 minutes — past
+/// `min_work`, inside [`EXCHANGE_WORK`] — is their own exchange: nothing
+/// typed, no land answer. NEGATIVE CONTROLS: the same 8-minute answer with
+/// nobody's hand, and a person's 12-minute turn (a job), get the land answer.
+#[test]
+fn a_spent_landing_leaves_a_persons_minutes_long_question_to_them() {
+    let progress = "Committing the parser now; the lexer is next.";
+    let question = "Committed the parser. Did the suite pass on your machine?";
+    let spent = || {
+        let mut now = t0();
+        let mut st = TurnEndState::default();
+        assert_eq!(
+            act(&mut st, &land(idle("Stage 1 landed.", Some(3 * MIN))), now),
+            land_instruction()
+        );
+        for _ in 0..LAND_NUDGES {
+            now += 3 * MIN;
+            assert_eq!(
+                act(&mut st, &land(idle(progress, Some(3 * MIN))), now),
+                land_nudged()
+            );
+        }
+        now += 3 * MIN;
+        at(&mut st, &land(idle(progress, Some(3 * MIN))), now);
+        assert_eq!(st.land_episode(), (true, LAND_NUDGES));
+        (st, now + 6 * 60 * MIN)
+    };
+    let ends = |worked: Duration, person: Option<Duration>| {
+        let (mut st, later) = spent();
+        let r = land(TurnEndReading {
+            person,
+            ..idle(question, Some(worked))
+        });
+        st.observe(&r, later);
+        let a = decide_turn_end(&st, &land(idle(question, None)), &cfg(), later + 10 * MIN);
+        (st.left_to_person(), a)
+    };
+    let minutes = 8 * MIN;
+    assert_eq!(
+        ends(minutes, Some(minutes + Duration::from_secs(8))),
+        (true, TurnEndAction::Nothing)
+    );
+    // NEGATIVE CONTROLS: nobody's hand; a person's job.
+    assert_eq!(ends(minutes, None), (false, land_answered()));
+    assert_eq!(
+        ends(JOB, Some(JOB + Duration::from_secs(8))),
+        (false, land_answered())
+    );
+}
+
+/// AFTER AN OFF PARK A PERSON'S TURN IS JUDGED BY [`EXCHANGE_WORK`]: a
+/// carried task, an Off park ([`TurnEndState::park_off`]), then a person's
+/// turn the agent answers in 8 minutes — past `min_work`, inside the bound —
+/// is their own exchange under Cruise and Land: nothing typed. NEGATIVE
+/// CONTROLS: with no park the same turn is a check-in on the carried run
+/// (Cruise continues it, Land nudges it); after the park a person's
+/// 12-minute turn is a job, acted on (Cruise continues it, Land types a new
+/// episode's instruction).
+#[test]
+fn after_an_off_park_a_persons_turn_is_judged_by_the_exchange_bound() {
+    let said = "Wired the lexer in; the docs are next.";
+    for mode in [Autopilot::Cruise, Autopilot::Land] {
+        let run = |park: bool, worked: Duration| {
+            let mut now = t0();
+            let mut st = TurnEndState::default();
+            let first = act(
+                &mut st,
+                &under(mode, idle("Stage 1 landed.", Some(3 * MIN))),
+                now,
+            );
+            assert!(first.rule_id().is_some(), "{mode:?}: {first:?}");
+            now += 3 * MIN;
+            at(
+                &mut st,
+                &under(
+                    mode,
+                    idle("Committing the parser; the lexer is next.", Some(3 * MIN)),
+                ),
+                now,
+            );
+            if park {
+                st.park_off();
+            }
+            // The person's message, after the last point.
+            now += 30 * MIN;
+            let theirs = under(
+                mode,
+                TurnEndReading {
+                    person: Some(worked + Duration::from_secs(8)),
+                    ..idle(said, Some(worked))
+                },
+            );
+            st.observe(&theirs, now);
+            let r = under(
+                mode,
+                TurnEndReading {
+                    person: Some(10 * MIN),
+                    ..idle(said, None)
+                },
+            );
+            (
+                st.left_to_person(),
+                decide_turn_end(&st, &r, &cfg(), now + 10 * MIN),
+            )
+        };
+        assert_eq!(
+            run(true, 8 * MIN),
+            (true, TurnEndAction::Nothing),
+            "{mode:?}"
+        );
+        let (on_the_ladder, after_the_park) = match mode {
+            Autopilot::Land => (land_nudged(), land_instruction()),
+            _ => (typed(RULE_CONTINUE), typed(RULE_CONTINUE)),
+        };
+        assert_eq!(run(false, 8 * MIN), (false, on_the_ladder), "{mode:?}");
+        assert_eq!(run(true, JOB), (false, after_the_park), "{mode:?}");
+    }
+}
+
+/// A LOOP STARTED AS OFF LIFTED KEEPS THE CARRY HOWEVER LONG THE TURN IT
+/// ATTACHED TO WORKED: its tail of 8 minutes — inside [`EXCHANGE_WORK`] — with
+/// the person's scroll in it is still the harness's run, continued
+/// ([`TurnEndState::start_lifted_off`], [`TurnEndState::took`]). NEGATIVE
+/// CONTROLS: where the first point came before any live read the carry is
+/// dropped, so a person's 8-minute turn after it is theirs (left), and their
+/// 12-minute one is a job (continued).
+#[test]
+fn a_lifted_loops_kept_carry_holds_inside_the_exchange_bound() {
+    let said = "Committed step 4; step 5 is next.";
+    let now = t0();
+    let minutes = 8 * MIN;
+    let mut st = TurnEndState::default();
+    st.seed_acts(&[4 * MIN], now);
+    st.start_lifted_off();
+    st.took();
+    let tail = TurnEndReading {
+        person: Some(Duration::from_secs(10)),
+        ..idle(said, Some(minutes))
+    };
+    st.observe(&tail, now);
+    assert!(!st.left_to_person());
+    let later = TurnEndReading {
+        person: Some(60 * MIN),
+        ..idle(said, None)
+    };
+    assert_eq!(
+        decide_turn_end(&st, &later, &cfg(), now + 60 * MIN),
+        typed(RULE_CONTINUE)
+    );
+    // NEGATIVE CONTROLS: the first point before any live read drops the
+    // carry; then the bound decides.
+    let after_an_unseen_first_point = |worked: Duration| {
+        let mut st = TurnEndState::default();
+        st.seed_acts(&[4 * MIN], now);
+        st.start_lifted_off();
+        at(&mut st, &idle("Waiting for your word.", None), now);
+        assert!(!st.left_to_person());
+        st.took();
+        let theirs = TurnEndReading {
+            person: Some(worked + Duration::from_secs(8)),
+            ..idle(said, Some(worked))
+        };
+        st.observe(&theirs, now + 30 * MIN);
+        (
+            st.left_to_person(),
+            decide_turn_end(&st, &later, &cfg(), now + 90 * MIN),
+        )
+    };
+    assert_eq!(
+        after_an_unseen_first_point(minutes),
+        (true, TurnEndAction::Nothing)
+    );
+    assert_eq!(
+        after_an_unseen_first_point(JOB),
+        (false, typed(RULE_CONTINUE))
+    );
+}
+
+/// A PERSON'S EXCHANGE ON A WALL KEEPS ITS WORK ACROSS AN OFF PARK: their
+/// question works 6 minutes into a 529, the wall's retry is typed, Off
+/// stands ([`TurnEndState::park_off`]), and the retry's answer works 6 more
+/// after it — 12 in all, past [`EXCHANGE_WORK`]: a job, continued, as with
+/// no park. The park ends the carry, never the count. NEGATIVE CONTROL:
+/// 3 + 3 minutes across the same park is still their exchange — left.
+#[test]
+fn a_persons_exchange_on_a_wall_keeps_its_work_across_an_off_park() {
+    let now = t0();
+    let run = |before: Duration, after: Duration, park: bool| {
+        let mut st = TurnEndState::default();
+        let r = TurnEndReading {
+            person: Some(before),
+            ..walled(WallKind::Overloaded, "529", Some(before))
+        };
+        at(&mut st, &r, now);
+        let retry = TurnEndReading {
+            person: None,
+            worked: None,
+            ..r
+        };
+        act(&mut st, &retry, now + 10 * MIN);
+        if park {
+            st.park_off();
+        }
+        let answered = now + 10 * MIN + after;
+        at(&mut st, &idle("Stage 2 of 5 is in.", Some(after)), answered);
+        let a = decide_turn_end(
+            &st,
+            &idle("Stage 2 of 5 is in.", None),
+            &cfg(),
+            answered + 60 * MIN,
+        );
+        (st.left_to_person(), a)
+    };
+    for park in [true, false] {
+        assert_eq!(
+            run(6 * MIN, 6 * MIN, park),
+            (false, typed(RULE_CONTINUE)),
+            "park {park}"
+        );
+        assert_eq!(
+            run(3 * MIN, 3 * MIN, park),
+            (true, TurnEndAction::Nothing),
+            "park {park}"
+        );
+    }
+}
+
+/// A PERSON'S EXCHANGE A WALL'S RETRY WAS DELIVERING AGAIN, ITS POINT FIRST
+/// SEEN AFTER AN OFF PARK WITH NO BUSY READ, IS NEVER LEFT TO THEM (the merge
+/// review's probe P8; [`TurnEndState::park_off`]): their question works 4
+/// minutes into a 529, the wall's retry is typed, Off stands, and 90 minutes
+/// on the first point after the park shows no busy read, the person's stamp
+/// in it. Nothing there says the retry's answer is what ended: the person
+/// drove the session under Off. It is decided as any first point is — backed
+/// off, then acted on — under Cruise and Land. FAILS WITHOUT THE FIX: the
+/// exchange stood across the park, and the unseen point was left, nothing
+/// typed an hour on. NEGATIVE CONTROL: with no park the same unseen point is
+/// the retry's own answer, their exchange delivered again: left.
+#[test]
+fn a_persons_exchange_retried_on_a_wall_and_unseen_after_an_off_park_is_never_left() {
+    let said = "Stage 2 of 5 is in.";
+    let now = t0();
+    for mode in [Autopilot::Cruise, Autopilot::Land] {
+        let run = |park: bool| {
+            let mut st = TurnEndState::default();
+            let r = under(
+                mode,
+                TurnEndReading {
+                    person: Some(4 * MIN),
+                    ..walled(WallKind::Overloaded, "529", Some(4 * MIN))
+                },
+            );
+            at(&mut st, &r, now);
+            let retry = TurnEndReading {
+                person: None,
+                worked: None,
+                ..r
+            };
+            let a = act(&mut st, &retry, now + 10 * MIN);
+            assert!(a.rule_id().is_some_and(is_wall_retry), "{mode:?}: {a:?}");
+            if park {
+                st.park_off();
+            }
+            let back = now + 100 * MIN;
+            let unseen = |ago: Duration| {
+                under(
+                    mode,
+                    TurnEndReading {
+                        person: Some(ago),
+                        ..idle(said, None)
+                    },
+                )
+            };
+            let hand = Duration::from_secs(10);
+            st.observe(&unseen(hand), back);
+            let judged = back + 10 * MIN;
+            let first = at(&mut st, &unseen(hand + 10 * MIN), judged);
+            let later = decide_turn_end(&st, &unseen(hand + 70 * MIN), &cfg(), judged + 60 * MIN);
+            (st.left_to_person(), first, later)
+        };
+        let (left, first, later) = run(true);
+        assert!(!left, "{mode:?}");
+        assert!(
+            matches!(first, TurnEndAction::WaitUntil { .. }),
+            "{mode:?}: backed off first: {first:?}"
+        );
+        let want = match mode {
+            Autopilot::Land => land_instruction(),
+            _ => typed(RULE_CONTINUE),
+        };
+        assert_eq!(later, want, "{mode:?}");
+        // NEGATIVE CONTROL: no park.
+        assert_eq!(
+            run(false),
+            (true, TurnEndAction::Nothing, TurnEndAction::Nothing),
+            "{mode:?}"
+        );
+    }
+}
+
+/// `first` typed at an idle point, its turn cut by a 529 after 5 minutes, the
+/// wall's retry typed, and the retry's turn answering `reply` after 3: the
+/// state, and the decision an hour on.
+fn wall_split_reply(
+    mode: Autopilot,
+    lead: &[&str],
+    first: &str,
+    reply: &str,
+) -> (TurnEndState, TurnEndAction) {
+    // Each point's act, typed once its back-off is over.
+    let typed_at = |st: &mut TurnEndState, said: &str, now: Instant| {
+        let r = under(mode, idle(said, Some(3 * MIN)));
+        let mut a = at(st, &r, now);
+        let mut when = now;
+        while let TurnEndAction::WaitUntil { until, .. } = a {
+            when = until;
+            a = act(
+                st,
+                &TurnEndReading {
+                    worked: None,
+                    ..r.clone()
+                },
+                when,
+            );
+        }
+        if a.rule_id().is_some() && when == now {
+            st.acted(&a, &r, now);
+        }
+        assert!(a.rule_id().is_some(), "{mode:?}: {said}: {a:?}");
+        when
+    };
+    let mut now = t0();
+    let mut st = TurnEndState::default();
+    for said in lead {
+        now = typed_at(&mut st, said, now) + 3 * MIN;
+    }
+    now = typed_at(&mut st, first, now) + 5 * MIN;
+    let cut = under(mode, walled(WallKind::Overloaded, "529", Some(5 * MIN)));
+    at(&mut st, &cut, now);
+    now += 10 * MIN;
+    let retry = TurnEndReading {
+        worked: None,
+        ..cut
+    };
+    let a = act(&mut st, &retry, now);
+    assert!(a.rule_id().is_some_and(is_wall_retry), "{mode:?}: {a:?}");
+    now += 3 * MIN;
+    at(&mut st, &under(mode, idle(reply, Some(3 * MIN))), now);
+    let a = decide_turn_end(&st, &under(mode, idle(reply, None)), &cfg(), now + 60 * MIN);
+    (st, a)
+}
+
+/// A WALL INSIDE A LAND ACT'S TURN OR THE DONE CHECK'S NEVER COSTS ITS DONE
+/// REPLY (the merge review's probe P3): the wall's retry delivers the act the
+/// wall cut again, so its done reply is that act's — under Land, after
+/// [`LAND`] or a [`LAND_NUDGE`], LANDED; under Cruise, after the
+/// [`DONE_CHECK`], the task done — nothing more typed, as with no wall.
+/// FAILS WITHOUT THE FIX: the wall's point took the act it cut, so the
+/// retry's done reply was a first done report: Land nudged it (an extra
+/// round; on the last nudge's turn the landing ended spent, never landed) and
+/// Cruise typed the check again. NEGATIVE CONTROL: a wall inside a plain
+/// continuation's turn — the retry's done reply is a first done report, and
+/// Cruise checks it.
+#[test]
+fn a_wall_inside_a_land_act_or_the_done_check_keeps_the_act_it_cut() {
+    let reply = "All done: committed and pushed.";
+    let progress = "Committing the parser now; the lexer is next.";
+    // LAND itself, and the last nudge.
+    for lead in [&[][..], &[progress; LAND_NUDGES as usize][..]] {
+        let (st, a) = wall_split_reply(Autopilot::Land, lead, "Stage 1 landed.", reply);
+        assert!(st.landed(), "{} nudges: {st:?}", lead.len());
+        assert_eq!(a, TurnEndAction::Nothing, "{} nudges", lead.len());
+    }
+    // The done check under Cruise.
+    let (st, a) = wall_split_reply(Autopilot::Cruise, &["Stage 1 landed."], reply, reply);
+    assert!(st.task_done() && !st.landed(), "{st:?}");
+    assert_eq!(a, TurnEndAction::Nothing);
+    // NEGATIVE CONTROL: a plain continuation.
+    let (st, a) = wall_split_reply(Autopilot::Cruise, &[], "Stage 1 landed.", reply);
+    assert_eq!(st.done_reports(), 1, "{st:?}");
+    assert_eq!(a.rule_id(), Some(RULE_DONE_CHECK), "{a:?}");
+}
+
+/// A wall's retry delivers the check it interrupted. A words-only done
+/// reply therefore keeps the original check's journal attribution as well
+/// as ending the task. The ordinary done check is the negative control:
+/// only the open-items challenge reports `done_after_challenge`.
+#[test]
+fn a_wall_retry_keeps_the_done_checks_origin() {
+    let reply = "All done: committed and pushed.";
+    let (ordinary, action) = wall_split_reply(Autopilot::Cruise, &[], reply, reply);
+    assert!(ordinary.task_done() && !ordinary.finished_by_worker());
+    assert_eq!(action, TurnEndAction::Nothing);
+    assert!(!ordinary.done_after_challenge());
+
+    let (challenge, action) = wall_split_reply(Autopilot::Cruise, &[], OPEN_REPORT, reply);
+    assert!(challenge.task_done() && !challenge.finished_by_worker());
+    assert_eq!(action, TurnEndAction::Nothing);
+    assert!(
+        challenge.done_after_challenge(),
+        "the retry delivers the open-items challenge: {challenge:?}"
+    );
+}
+
+/// `r` on the renewable login `label` (a roster row with an email,
+/// [`TurnEndReading::login_label`]).
+fn renewable(r: &TurnEndReading, label: &str) -> TurnEndReading {
+    TurnEndReading {
+        login_label: Some(label.to_string()),
+        ..r.clone()
+    }
+}
+
+/// A RENEWABLE LOGIN'S END WITH NO MOVE BEHIND IT (accounts v2 S7): never
+/// `/login` — the wall is WAITED AT, under `accounts = "off"` too; the host
+/// is asked about it as at that wall; with nothing advised the owner is
+/// needed now, by an exception whose one step is `accounts renew <label>`
+/// and which no escalation of the loop's carries; once the host advises the
+/// move to that very label (renewed), the relaunch AT THE WALL, and after it
+/// the wall's resume. NEGATIVE CONTROLS: the same wall with no renewable
+/// login, and under `logins = "off"`, types `/login` as before renewal
+/// existed; a move to another label is no follow under `accounts = "off"`;
+/// a draft in the composer is the person's.
+#[test]
+fn a_renewable_login_s_end_is_waited_at_asks_its_renewal_and_follows_it() {
+    use super::super::exception::{Urgency, exception_for};
+    use super::super::outlook::ExceptionKind;
+    let t = t0();
+    let gone = walled(
+        WallKind::Auth,
+        "Not logged in · Please run /login",
+        Some(Duration::from_secs(2)),
+    );
+    let login = TurnEndAction::TypeCommand {
+        command: "/login".to_string(),
+        rule_id: RULE_LOGIN,
+        then: Then::Escalate("finish sign-in in the browser".to_string()),
+    };
+    let ended = renewable(&gone, "m7-a");
+    let mut off = cfg();
+    off.accounts = crate::harness::accounts::Mode::Off;
+    for under in [cfg(), off.clone()] {
+        let mut st = TurnEndState::default();
+        let a = at_under(&mut st, &ended, t + MIN, &under);
+        assert!(
+            matches!(&a, TurnEndAction::WaitUntil { why, .. } if why.starts_with("the login is gone")),
+            "{a:?}"
+        );
+        assert_eq!(st.login_track(), Some(0), "no attempt counted");
+        assert_eq!(
+            st.account_point(&ended, &under),
+            Some(AccountPoint::LoginEnded),
+            "the host is asked about the login's own end"
+        );
+        let e = exception_for(&st, &ended, &under, t + MIN).expect("the owner is needed now");
+        assert_eq!(
+            (e.kind, e.when, e.escalated),
+            (ExceptionKind::Login, Urgency::Now, false)
+        );
+        assert_eq!(e.action, "Run aterm harness accounts renew m7-a.");
+        assert!(
+            e.why.chars().count() <= super::super::exception::WHY_MAX,
+            "{e:?}"
+        );
+        // Renewed: the move to its own label, at the wall.
+        let back = advised(&ended, "m7-a");
+        let a = at_under(&mut st, &back, t + 2 * MIN, &under);
+        assert!(
+            restarts(&a, &to_account("m7-a", AccountAt::Wall), RULE_ACCOUNT),
+            "{a:?}"
+        );
+        assert_eq!(exception_for(&st, &back, &under, t + 2 * MIN), None);
+        // …and once relaunched, the wall's resume at its first point.
+        st.restarted(
+            &to_account("m7-a", AccountAt::Wall),
+            true,
+            &back,
+            t + 2 * MIN,
+        );
+        let first = renewable(&idle("Suites are running.", None), "m7-a");
+        assert_eq!(
+            at_under(&mut st, &first, t + 3 * MIN, &under),
+            typed(RULE_LIMIT_RESUME)
+        );
+    }
+    // NEGATIVE CONTROLS.
+    assert_eq!(
+        at(&mut TurnEndState::default(), &gone, t + MIN),
+        login,
+        "no renewable login"
+    );
+    let mut no_logins = cfg();
+    no_logins.logins = false;
+    assert_eq!(
+        at_under(&mut TurnEndState::default(), &ended, t + MIN, &no_logins),
+        login,
+        "logins = \"off\""
+    );
+    let mut st = TurnEndState::default();
+    let other = advised(&ended, "pool-a");
+    let a = at_under(&mut st, &other, t + MIN, &off);
+    assert!(
+        matches!(&a, TurnEndAction::WaitUntil { .. }),
+        "another label is a rotation, which accounts = \"off\" makes none of: {a:?}"
+    );
+    let mut drafted = ended.clone();
+    drafted.composer = Composer::Typed;
+    assert!(is_escalate(
+        &at(&mut TurnEndState::default(), &drafted, t + MIN),
+        "a draft stands in the composer"
+    ));
+}
+
+/// WHICH LOST LOGIN THE HOST IS ASKED ABOUT IS THE POLICY'S TO SAY: on a
+/// renewable login, the session's own move standing — held from the ledger
+/// by a later loop, the process it brought up long gone — makes the lost
+/// login that move's ([`AccountPoint::Wall`]), which the roster answers with
+/// the login back or the next account; with no move of the rotation's
+/// behind it, it is the login's own end ([`AccountPoint::LoginEnded`]),
+/// which only a renewal answers. NEGATIVE CONTROLS: the same wall with no
+/// move, and with the move under `accounts = "off"` (no rotation behind
+/// it), is the login's own end.
+#[test]
+fn a_lost_login_is_its_logins_own_end_only_with_no_move_behind_it() {
+    let t = t0();
+    let gone = renewable(
+        &walled(
+            WallKind::Auth,
+            "Not logged in · Please run /login",
+            Some(Duration::from_secs(2)),
+        ),
+        "m7-a",
+    );
+    let mut st = TurnEndState::default();
+    st.seed_account(
+        "work-2".to_string(),
+        AccountAt::Wall,
+        90 * MIN,
+        false,
+        true,
+        true,
+        t,
+    );
+    assert_eq!(
+        st.account_point(&gone, &cfg()),
+        Some(AccountPoint::Wall {
+            kind: WallKind::Auth
+        }),
+        "the move's lost login"
+    );
+    assert_eq!(
+        TurnEndState::default().account_point(&gone, &cfg()),
+        Some(AccountPoint::LoginEnded)
+    );
+    let mut off = cfg();
+    off.accounts = crate::harness::accounts::Mode::Off;
+    assert_eq!(
+        st.account_point(&gone, &off),
+        Some(AccountPoint::LoginEnded)
+    );
+}
+
+/// A RENEWABLE LOGIN IS NEVER SIGNED IN WHERE IT STANDS, wherever its wait
+/// for a renewal cannot be — `relaunch = false`, `resume_limits = false`,
+/// no host that relaunches the agent, a draft in the composer: `/login` is
+/// not typed (it would sign the LIVE login in through the default browser,
+/// perhaps as another account), the loop escalates with the renewal's step,
+/// and the exception names it as the loop's own.
+///
+/// AND THE POINT AFTER THE RENEWAL — the process still on the login it
+/// replaced ([`TurnEndReading::login_superseded`]), which no renewal reaches
+/// — never asks the renewal again: it names what holds the relaunch onto the
+/// renewed login. Over a draft that is the draft, and once the composer is
+/// empty the session moves by itself; where nothing relaunches it, the start
+/// under the renewed login by hand, which only the agent working clears.
+///
+/// NEGATIVE CONTROL: the same walls on a login no roster row with an email
+/// names type `/login` — or, over the draft, escalate the sign-in — as before
+/// renewal existed.
+#[test]
+fn a_renewable_login_is_never_signed_in_where_it_stands() {
+    use super::super::exception::{Urgency, exception_for};
+    use super::super::outlook::ExceptionKind;
+    let t = t0();
+    let gone = walled(
+        WallKind::Auth,
+        "Not logged in · Please run /login",
+        Some(Duration::from_secs(2)),
+    );
+    let mut no_relaunch = cfg();
+    no_relaunch.relaunch = false;
+    let mut no_resume = cfg();
+    no_resume.resume_limits = false;
+    let unrestartable = TurnEndReading {
+        restartable: false,
+        ..gone.clone()
+    };
+    let mut drafted = gone.clone();
+    drafted.composer = Composer::Typed;
+    let cases = [
+        (&gone, &no_relaunch),
+        (&gone, &no_resume),
+        (&unrestartable, &cfg()),
+        (&drafted, &cfg()),
+    ];
+    for (shown, under) in cases {
+        let ended = renewable(shown, "m7-a");
+        let mut st = TurnEndState::default();
+        let a = at_under(&mut st, &ended, t + MIN, under);
+        assert!(
+            is_escalate(&a, "renew it: aterm harness accounts renew m7-a"),
+            "{a:?}"
+        );
+        let e = exception_for(&st, &ended, under, t + MIN).expect("the owner is needed now");
+        assert_eq!(
+            (e.kind, e.when, e.escalated, e.action.as_str()),
+            (
+                ExceptionKind::Login,
+                Urgency::Now,
+                true,
+                "Run aterm harness accounts renew m7-a."
+            )
+        );
+        // Renewed: the next point, the process still on the login the
+        // renewal replaced.
+        let after = TurnEndReading {
+            login_superseded: true,
+            ..ended.clone()
+        };
+        let a = at_under(&mut st, &after, t + 2 * MIN, under);
+        assert!(
+            matches!(&a, TurnEndAction::Escalate { reason } if !reason.contains("renew it")),
+            "no renewal reaches this process: {a:?}"
+        );
+        let e = exception_for(&st, &after, under, t + 2 * MIN).expect("the owner is needed now");
+        assert!(
+            !e.action.starts_with(super::super::exception::RENEW_STEP),
+            "{e:?}"
+        );
+        assert_eq!(
+            (e.kind, e.when, e.escalated),
+            (ExceptionKind::Login, Urgency::Now, true)
+        );
+        if shown.composer.drafted() {
+            assert!(is_escalate(&a, "send or clear it"), "{a:?}");
+            assert_eq!(
+                e.action,
+                "Send the draft in this tab, and it moves onto the renewed login."
+            );
+            // …and so it does, once the composer is empty: the host advises
+            // the move onto the renewed login, made at the wall.
+            let sent = advised(
+                &TurnEndReading {
+                    composer: gone.composer.clone(),
+                    ..after.clone()
+                },
+                "m7-a",
+            );
+            let a = at_under(&mut st, &sent, t + 3 * MIN, under);
+            assert!(
+                restarts(&a, &to_account("m7-a", AccountAt::Wall), RULE_ACCOUNT),
+                "{a:?}"
+            );
+        } else {
+            let why = if !under.relaunch {
+                "relaunch is off"
+            } else if !under.resume_limits {
+                "resume_limits is off"
+            } else {
+                "no host relaunches it"
+            };
+            assert!(
+                is_escalate(
+                    &a,
+                    &format!(
+                        "the login was renewed, but {why}: quit Claude Code and start it with \
+                         the line accounts renew printed"
+                    )
+                ),
+                "{a:?}"
+            );
+            assert_eq!(
+                (e.action.as_str(), e.clears),
+                (
+                    "Quit Claude Code here and start it with the line accounts renew printed.",
+                    "the agent working"
+                )
+            );
+        }
+        // NEGATIVE CONTROL: no renewable login.
+        let a = at_under(&mut TurnEndState::default(), shown, t + MIN, under);
+        let signs_in = matches!(&a, TurnEndAction::TypeCommand { command, .. } if command == "/login")
+            || is_escalate(&a, "sign in with /login");
+        assert!(signs_in, "{a:?}");
+    }
+}
+
+/// A SESSION STILL ON A LOGIN A RENEWAL SUPERSEDED follows the renewed one
+/// at an idle turn end, ahead of any wall — the move wraps the turn's own
+/// act, which goes on where the relaunch is not made — under `accounts =
+/// "off"` too. NEGATIVE CONTROLS: a draft holds it (the person's words
+/// would be sent), and so does `logins = "off"`.
+#[test]
+fn a_superseded_login_follows_the_renewed_one_at_an_idle_turn_end() {
+    let t = t0();
+    let done = renewable(
+        &advised(&idle("Suites are green.", Some(3 * MIN)), "m7-a"),
+        "m7-a",
+    );
+    let mut off = cfg();
+    off.accounts = crate::harness::accounts::Mode::Off;
+    for under in [cfg(), off] {
+        let mut st = TurnEndState::default();
+        assert_eq!(st.account_point(&done, &under), Some(AccountPoint::TurnEnd));
+        let a = at_under(&mut st, &done, t, &under);
+        assert!(
+            restarts(&a, &to_account("m7-a", AccountAt::Ahead), RULE_ACCOUNT),
+            "{a:?}"
+        );
+        assert_eq!(
+            *otherwise_of(&a),
+            typed(RULE_CONTINUE),
+            "the turn's own act"
+        );
+    }
+    let mut drafted = done.clone();
+    drafted.composer = Composer::Typed;
+    let a = at(&mut TurnEndState::default(), &drafted, t);
+    assert!(!matches!(a, TurnEndAction::Restart { .. }), "{a:?}");
+    let mut no_logins = cfg();
+    no_logins.logins = false;
+    no_logins.accounts = crate::harness::accounts::Mode::Off;
+    let a = at_under(&mut TurnEndState::default(), &done, t, &no_logins);
+    assert_eq!(a, typed(RULE_CONTINUE));
+}
+
+/// A SUPERSEDED LOGIN'S FOLLOW HELD A MOMENT (accounts v2 S7): the process
+/// still on the login a renewal replaced, whose lost login the host answers
+/// with a wait — a limit reset in flight on the account holds every move off
+/// it, the follow onto the renewed login included — is waited at until then,
+/// in the renewed login's words, and NOTHING IS RAISED: the renewal the
+/// owner would be asked for is made. When the hold ends the host advises the
+/// move, and the session follows. NEGATIVE CONTROLS: the same wait on the
+/// row's own login is the rotation's (`another account`); and the same
+/// superseded point with nothing advised — the renewed login itself ended
+/// since, nowhere to follow — asks the renewal.
+#[test]
+fn a_superseded_logins_held_follow_is_waited_for_and_asks_nothing() {
+    use super::super::exception::{RENEW_STEP, exception_for};
+    let t = t0();
+    let ended = renewable(
+        &walled(
+            WallKind::Auth,
+            "Not logged in · Please run /login",
+            Some(Duration::from_secs(2)),
+        ),
+        "m7-a",
+    );
+    let superseded = TurnEndReading {
+        login_superseded: true,
+        ..ended.clone()
+    };
+    let ends = t + 3 * MIN;
+    let waited = advised_wait(&superseded, ends);
+    let mut st = TurnEndState::default();
+    assert_eq!(
+        st.account_point(&waited, &cfg()),
+        Some(AccountPoint::LoginEnded)
+    );
+    let a = at(&mut st, &waited, t + MIN);
+    assert_eq!(
+        a,
+        TurnEndAction::WaitUntil {
+            until: ends,
+            why: "the login is gone: its renewed login can be used then".to_string(),
+            retry: false,
+        }
+    );
+    assert_eq!(st.login_track(), Some(0), "no attempt counted");
+    assert_eq!(exception_for(&st, &waited, &cfg(), t + MIN), None);
+    let followed = advised(&superseded, "m7-a");
+    let a = at(&mut st, &followed, ends);
+    assert!(
+        restarts(&a, &to_account("m7-a", AccountAt::Wall), RULE_ACCOUNT),
+        "{a:?}"
+    );
+    assert_eq!(exception_for(&st, &followed, &cfg(), ends), None);
+    // NEGATIVE CONTROLS.
+    let mut st = TurnEndState::default();
+    let a = at(&mut st, &advised_wait(&ended, ends), t + MIN);
+    assert!(
+        matches!(&a, TurnEndAction::WaitUntil { why, .. } if why.ends_with("another account can be used then")),
+        "{a:?}"
+    );
+    let mut st = TurnEndState::default();
+    at(&mut st, &superseded, t + MIN);
+    let e = exception_for(&st, &superseded, &cfg(), t + MIN).expect("the owner is needed now");
+    assert_eq!(e.action, format!("{RENEW_STEP}m7-a."));
 }

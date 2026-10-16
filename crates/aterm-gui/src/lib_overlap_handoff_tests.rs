@@ -917,6 +917,7 @@ fn a_wake_after_the_commit_waits_for_the_commit_wake() {
             src: crate::input::Source::Controller,
             reply: Some(reply),
             session: Some(a),
+            fence: None,
         };
         (wake, answer)
     };
@@ -2545,14 +2546,6 @@ fn overlap_event_classes_exempt_paint_tolerate_typing_and_revoke_structure() {
             delta: MouseScrollDelta::LineDelta(0.0, 1.0),
             phase: TouchPhase::Moved,
         },
-        WindowEvent::PinchGesture {
-            device_id: DeviceId::dummy(),
-            delta: 0.25,
-            phase: TouchPhase::Moved,
-        },
-        WindowEvent::DoubleTapGesture {
-            device_id: DeviceId::dummy(),
-        },
         WindowEvent::Moved(PhysicalPosition::new(1, 1)),
         WindowEvent::ThemeChanged(winit::window::Theme::Dark),
         WindowEvent::HoveredFileCancelled,
@@ -2627,6 +2620,7 @@ fn overlap_event_classes_exempt_paint_tolerate_typing_and_revoke_structure() {
             src: crate::input::Source::Human,
             reply: None,
             session: None,
+            fence: None,
         },
     ] {
         assert_eq!(update_handoff_wake_class(&tolerated), Class::Tolerated);
@@ -2641,6 +2635,9 @@ fn overlap_event_classes_exempt_paint_tolerate_typing_and_revoke_structure() {
         Wake::ConfirmedClose {
             replay: crate::close_confirm::CloseReplay::Quit,
         },
+        Wake::TabSpawned(std::sync::Arc::new(
+            crate::tab_spawn::TabSpawnCompletion::default(),
+        )),
     ] {
         assert_eq!(update_handoff_wake_class(&revoking), Class::Revoking);
     }

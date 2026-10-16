@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// Inline images (iTerm2 OSC 1337 File=): an `imgcat`-style sequence places a
-// PNG over the grid and the CPU renderer composites its ACTUAL pixels — image
-// cells skip their glyph (image-vs-glyph precedence), and a text-only frame is
-// byte-identical to the pre-image path.
+// Inline images on the CPU renderer: OSC 1337 `File=` and sixel placements composite their
+// actual pixels, image cells skip their glyph, Kitty z-order against cell backgrounds, the
+// chrome band lift, the footprint decode's scaling policies, and the oversized-PNG guard.
 
 use aterm_core::terminal::Terminal;
 use aterm_render::{Renderer, Theme};
@@ -72,7 +71,7 @@ fn red_image_paints_red_pixels_over_the_grid() {
         "image centre should be red, got #{px:06x}"
     );
 
-    // A pixel BELOW the image (row 3) must NOT be red — the image is bounded.
+    // A pixel below the image (row 3) must not be red — the image is bounded.
     let below = frame.pixels[(3 * ch) * frame.width + mid_x];
     let br = (below >> 16) & 0xff;
     assert!(
@@ -83,10 +82,8 @@ fn red_image_paints_red_pixels_over_the_grid() {
 
 #[test]
 fn image_cell_skips_its_glyph() {
-    // A glyph written first, then an image placed over the SAME cells, must not
-    // show the glyph: the image owns the cell. We compare the image region of an
-    // image-covered frame against a control where the same green image covers a
-    // BLANK grid — they must be pixel-identical (the prior glyph left no trace).
+    // An image placed over existing glyphs owns the cells: its region matches the same
+    // image over a blank grid.
     let mut r = Renderer::from_system(16.0, Theme::default())
         .expect("no font: build with aterm-render's default embedded-font feature");
     let (cw, ch) = r.cell_size();
@@ -107,8 +104,7 @@ fn image_cell_skips_its_glyph() {
     term_b.process(&osc_1337_file("inline=1;width=2;height=1", &png));
     let frame_b = r2.render_input(&term_b.cell_frame(4, 8));
 
-    // The 2-cell image band (rows 0..ch, cols 0..2*cw) must be identical — proof
-    // the glyph under the image left no pixels.
+    // The 2-cell image band is identical: the glyph under the image left no pixels.
     for y in 0..ch {
         for x in 0..(2 * cw) {
             let i = y * frame_a.width + x;
@@ -122,9 +118,8 @@ fn image_cell_skips_its_glyph() {
 
 #[test]
 fn negative_z_images_composite_before_base_and_combining_glyphs() {
-    // CPU-only z-order pin (runs even when no GPU adapter is available). For
-    // both opaque and semitransparent Kitty z<0 tiles, image-over-cell-bg then
-    // glyph must equal a no-image oracle whose cell bg is that exact composite.
+    // For opaque and semitransparent Kitty z<0 tiles, image-over-cell-bg then glyph equals
+    // a no-image oracle whose cell bg is that composite.
     let mut r = Renderer::from_system(18.0, Theme::default())
         .expect("no font: build with aterm-render's default embedded-font feature");
     r.debug_block_on_lazy_fallbacks();
@@ -276,11 +271,10 @@ fn kitty_extreme_negative_z_sits_below_non_default_cell_backgrounds() {
 
 #[test]
 fn chrome_band_lift_paints_the_lip_above_the_grid() {
-    // The tab strip's pixel band ([`ImageData::band_lift_px`]): an image whose
-    // canvas extends `lift` px ABOVE its first cell row must paint the chrome
-    // lip `[grid_top - lift, grid_top)` from its own top rows, seat its cell
-    // rows exactly where an unlifted image sits, and leave every pixel outside
-    // its columns untouched. A lift of 0 must remain byte-identical.
+    // The tab strip's pixel band (`ImageData::band_lift_px`): an image whose canvas extends
+    // `lift` px above its first cell row paints the chrome lip `[grid_top - lift, grid_top)`
+    // from its own top rows, seats its cell rows where an unlifted image sits, and touches
+    // nothing outside its columns.
     let mut r = Renderer::from_system(16.0, Theme::default())
         .expect("no font: build with aterm-render's default embedded-font feature");
     let (cw, ch) = r.cell_size();
@@ -360,8 +354,8 @@ fn chrome_band_lift_paints_the_lip_above_the_grid() {
     let outside = sample(&lifted, pad + 3 * cw, grid_top / 2);
     assert_ne!(outside, 0x00DC_1E1E, "the lift never bleeds sideways");
 
-    // Control: lift 0 leaves the lip untouched (the canvas is drawn squashed
-    // into the footprint per the decode contract — nothing above `grid_top`).
+    // Control: lift 0 draws nothing above `grid_top` (the canvas is squashed into the
+    // footprint).
     let mut r2 = Renderer::from_system(16.0, Theme::default()).expect("font");
     r2.set_pad(pad);
     r2.set_pad_top(pad_top);
@@ -384,8 +378,8 @@ fn crc32_ieee(data: &[u8]) -> u32 {
     !crc
 }
 
-/// A tiny PNG whose IHDR *declares* `w`×`h` (valid IHDR CRC) but carries one
-/// pixel — the inline-image allocation bomb a remote peer can stream over SSH.
+/// A tiny PNG whose IHDR declares `w`×`h` (valid IHDR CRC) but carries one pixel: the
+/// allocation bomb a remote peer can stream.
 fn png_with_declared_dims(w: u32, h: u32) -> Vec<u8> {
     let mut bytes = solid_png(1, 1, [9, 9, 9]);
     let ihdr_data = 16usize; // 8-byte sig + 4 len + 4 "IHDR"
@@ -398,9 +392,8 @@ fn png_with_declared_dims(w: u32, h: u32) -> Vec<u8> {
 
 #[test]
 fn oversized_inline_image_png_draws_nothing_without_huge_alloc() {
-    // End-to-end: a remote peer sends an OSC 1337 inline image whose PNG IHDR
-    // claims 30000×30000 (≈3.4 GiB if honored) in a sub-1KB payload. The render
-    // path must skip it (draw nothing) rather than allocate — no panic, no OOM.
+    // An OSC 1337 PNG whose IHDR claims 30000×30000 (≈3.4 GiB) in a sub-1KB payload is
+    // skipped, not allocated.
     let mut r = Renderer::from_system(16.0, Theme::default())
         .expect("no font: build with aterm-render's default embedded-font feature");
     let (cw, ch) = r.cell_size();
@@ -411,8 +404,7 @@ fn oversized_inline_image_png_draws_nothing_without_huge_alloc() {
         bomb.len()
     );
 
-    // The guard's load-bearing claim: the footprint decode is rejected (returns
-    // nothing), so no `30000*30000*4` buffer is ever allocated.
+    // The footprint decode is rejected, so no `30000*30000*4` buffer is allocated.
     assert!(
         aterm_render::decode_image_to_footprint(
             &bomb,
@@ -426,11 +418,9 @@ fn oversized_inline_image_png_draws_nothing_without_huge_alloc() {
         "oversized inline-image PNG must decode to nothing"
     );
 
-    // End-to-end the render must complete without panic / OOM, and the rejected
-    // bomb must paint exactly like ANY other undecodable placement. We compare it
-    // against a control with identical placement args but a non-PNG garbage
-    // payload: both reject, so the footprint pixels must be byte-identical. (This
-    // isolates "image rejected" from the handler's footprint-reservation paint.)
+    // End to end the render completes, and the rejected bomb paints exactly like a non-PNG
+    // payload with the same placement args (both reject), isolating "image rejected" from
+    // the handler's footprint-reservation paint.
     let mut term = Terminal::new(6, 10);
     term.set_cell_pixel_size(cw as u16, ch as u16);
     term.process(&osc_1337_file("inline=1;width=4;height=2", &bomb));
@@ -456,45 +446,16 @@ fn oversized_inline_image_png_draws_nothing_without_huge_alloc() {
     }
 }
 
-#[test]
-fn text_only_frame_is_unaffected_by_the_image_path() {
-    // No image anywhere → the rendered pixels must be byte-identical to a render
-    // built before any image plumbing existed. We assert internal consistency:
-    // the same input renders identically twice (the image pass is a strict no-op
-    // for an image-free row, allocating nothing and touching no pixels).
-    let mut r = Renderer::from_system(16.0, Theme::default())
-        .expect("no font: build with aterm-render's default embedded-font feature");
-    let mut term = Terminal::new(4, 8);
-    term.process(b"\x1b[31mhi\x1b[0m world");
-    let a = r.render_input(&term.cell_frame(4, 8)).pixels;
-    let mut r2 = Renderer::from_system(16.0, Theme::default()).expect("font");
-    let b = r2.render_input(&term.cell_frame(4, 8)).pixels;
-    assert_eq!(a, b, "image-free frame renders identically");
-}
-
-/// ASPECT FIDELITY of the FITTED placement (`ImageScaling::Fit`): iTerm2 OSC
-/// 1337 `File=width=…;height=…`, Kitty with an explicit `c=`/`r=` cell box, and
-/// the host's own chrome rasters — every placement whose target was named in
-/// CELLS. The footprint decode FITS the source instead of stretching it.
-/// (Sixel names PIXELS and takes the other policy; see
-/// `sixel_footprint_decode_is_pixel_exact`.)
-///
-/// The measured defect (0.61.0, live pixels): a 120x60 sixel card — aspect exactly
-/// 2.00 — landed in a 14x4-cell footprint of 126x68 px and was drawn 126x68, i.e.
-/// aspect 1.85, a 7.9% error; a 100x40 card (2.50) came out 2.12, an 18% error.
-/// Circles became ellipses on every image whose pixel size was not an exact
-/// multiple of the cell box, which is nearly all of them.
-///
-/// Here the same shape is checked on the ONE decode both renderers share: the
-/// OPAQUE region (what is actually drawn) must carry the SOURCE's aspect to
-/// within a pixel, and the remainder must be fully transparent so the cell
-/// background — not a smeared edge — shows through.
+/// The fitted placement (`ImageScaling::Fit`: OSC 1337 `width=…;height=…`, Kitty with
+/// `c=`/`r=`, the host's chrome rasters, every target named in cells) fits the source
+/// instead of stretching it: on the decode both renderers share, the opaque region carries
+/// the source's aspect to within a pixel and the remainder is fully transparent. Sixel
+/// names pixels and takes the other policy (`sixel_footprint_decode_is_pixel_exact`).
 #[test]
 fn footprint_decode_preserves_the_source_aspect_ratio() {
     use aterm_core::grid::extra::ImageFormat;
 
-    // Opaque 120x60 raw raster (the RawRgba8 layout the engine hands over), 2.00
-    // aspect, placed with the FIT policy.
+    // Opaque 120x60 raw raster (the RawRgba8 layout the engine hands over), aspect 2.00.
     let (sw, sh) = (120usize, 60usize);
     let src: Vec<u8> = std::iter::repeat_n([200u8, 30, 30, 255], sw * sh)
         .flatten()
@@ -519,7 +480,7 @@ fn footprint_decode_preserves_the_source_aspect_ratio() {
         "the buffer is still the footprint"
     );
 
-    // Bounding box of the OPAQUE pixels: what the eye sees.
+    // Bounding box of the opaque (drawn) pixels.
     let opaque = |x: usize, y: usize| out[(y * fp_w + x) * 4 + 3] > 0;
     let (mut x0, mut x1, mut y0, mut y1) = (fp_w, 0usize, fp_h, 0usize);
     for y in 0..fp_h {
@@ -533,8 +494,8 @@ fn footprint_decode_preserves_the_source_aspect_ratio() {
         }
     }
     let (drawn_w, drawn_h) = (x1 + 1 - x0, y1 + 1 - y0);
-    // Width binds (the source is wider than the box), so the full width is used
-    // and the height is the aspect-exact 63 — letterboxed 2 px above, 3 below.
+    // Width binds (the source is wider than the box): full width, aspect-exact height 63,
+    // letterboxed 2 px above and 3 below.
     assert_eq!(
         (drawn_w, drawn_h),
         (126, 63),
@@ -550,8 +511,7 @@ fn footprint_decode_preserves_the_source_aspect_ratio() {
         sw as f64 / sh as f64,
         err * 100.0
     );
-    // The bars are FULLY transparent: the cell background shows through them
-    // rather than a stretched edge row.
+    // The bars are fully transparent, so the cell background shows through them.
     for y in 0..y0 {
         for x in 0..fp_w {
             assert_eq!(out[(y * fp_w + x) * 4 + 3], 0, "top bar at ({x},{y})");
@@ -564,11 +524,9 @@ fn footprint_decode_preserves_the_source_aspect_ratio() {
     }
 }
 
-/// NON-VACUITY + no regression for the paths that already fitted exactly: a
-/// source whose aspect equals the footprint's fills every pixel (no bars), and a
-/// cell-EXACT source is still returned byte-identically (measured: 126x68 in,
-/// 126x68 out, zero interpolated pixels) — the tab strip's chrome band builds its
-/// raster at exactly the footprint size to land on that path.
+/// A source whose aspect equals the footprint's fills every pixel, and a cell-exact source
+/// passes through byte-identically (the tab strip's chrome band builds its raster at exactly
+/// the footprint size to land on that path).
 #[test]
 fn an_aspect_matched_source_still_fills_the_whole_footprint() {
     use aterm_core::grid::extra::ImageFormat;
@@ -595,7 +553,7 @@ fn an_aspect_matched_source_still_fills_the_whole_footprint() {
         "a cell-exact raster must pass through untouched"
     );
 
-    // Half-size but SAME aspect (63x34 into 126x68): scaled up, still no bars.
+    // Half-size but same aspect (63x34 into 126x68): scaled up, still no bars.
     let (hw, hh) = (63usize, 34usize);
     let half: Vec<u8> = std::iter::repeat_n([7u8, 200, 90, 255], hw * hh)
         .flatten()
@@ -618,11 +576,9 @@ fn an_aspect_matched_source_still_fills_the_whole_footprint() {
     );
 }
 
-/// STRETCH (iTerm2 `preserveAspectRatio=0`) is the one policy that fills the
-/// WHOLE footprint whatever the source's aspect. The same 120x60 raster the fit
-/// test letterboxes into a 126x68 box must, stretched, leave no transparent
-/// pixel at all — and the fitted decode of it is the negative control: it DOES
-/// leave bars, so the two policies are genuinely different requests.
+/// Stretch (iTerm2 `preserveAspectRatio=0`) fills the whole footprint whatever the source's
+/// aspect: the 120x60 raster the fit test letterboxes into 126x68 leaves no transparent
+/// pixel stretched, while its fitted decode (the control) does.
 #[test]
 fn stretch_fills_the_whole_footprint_where_fit_letterboxes() {
     use aterm_core::grid::extra::{ImageFormat, ImageScaling};
@@ -673,7 +629,7 @@ fn stretch_fills_the_whole_footprint_where_fit_letterboxes() {
     assert_eq!(transparent(&from_png), 0, "PNG stretch fills the box too");
 }
 
-/// A Kitty source rectangle (`x=`/`y=`/`w=`/`h=`) crops BEFORE the scaling
+/// A Kitty source rectangle (`x=`/`y=`/`w=`/`h=`) crops before the scaling
 /// policy runs: only the named part of the raster reaches the footprint, a zero
 /// width/height means "to the edge", an over-long one is clamped, and one that
 /// misses the raster entirely draws nothing.
@@ -755,8 +711,8 @@ fn source_rect_crops_before_the_scaling_policy() {
     );
 }
 
-/// The fit arithmetic itself, including the axis that binds and the exact-aspect
-/// identity the chrome band depends on.
+/// The fit arithmetic: the binding axis, and the exact-aspect identity the chrome band
+/// depends on.
 #[test]
 fn aspect_fit_box_picks_the_binding_axis() {
     use aterm_render::aspect_fit_box;
@@ -772,30 +728,14 @@ fn aspect_fit_box_picks_the_binding_axis() {
     assert!(w <= 10 && h >= 1);
 }
 
-/// SIXEL IS PIXEL-EXACT — measured on the composited framebuffer, the way the
-/// eye measures it.
+/// Sixel is pixel-exact, measured on the composited framebuffer. Sixel names its size in
+/// pixels, so unlike OSC 1337 (which names cells) its raster is neither scaled to the
+/// rounded-up cell footprint nor centred in it.
 ///
-/// The defect (measured on a live 0.86.0 window, cell 9x17, cursor at CUP 3;3):
-/// a 40x12 sixel was drawn 45x14, a 4x6 sprite 9x14 (a 2.25x magnification), and
-/// an 8-px-wide raster carrying ONE PURE PALETTE COLOUR PER 1-PX COLUMN came
-/// back with only its first and last columns intact — the middle seven were
-/// bilinear blends of their neighbours. Even a cell-exact 90x12 raster, drawn at
-/// the right size, sat 2 px low. The cause was one placement policy shared with
-/// iTerm2 OSC 1337: the footprint is the raster rounded UP to whole cells, and
-/// the raster was then scaled back out to fill that rounded box and CENTRED in
-/// it. For OSC 1337 that is the spec (the program named its target in cells);
-/// for sixel, which names PIXELS, it is pure rounding noise.
-///
-/// So: drive a REAL sixel DCS through the engine and read the pixels the CPU
-/// renderer composites. The raster is one pixel WIDER than a cell — the case the
-/// old policy magnified — and its columns alternate pure red / pure blue, one
-/// colour per 1-px column, so any resampling at all turns the interior columns
-/// into blends. Three claims, each of which the old placement broke:
-///   1. the raster lands at the footprint's TOP-LEFT (not centred),
-///   2. one sixel pixel is one device pixel (no magnification),
-///   3. every painted pixel is EXACTLY its palette entry (no interpolation),
-///      and the rounded-up remainder of the footprint is left unpainted —
-///      byte-equal to the same frame with no image in it.
+/// A real sixel DCS one pixel wider than a cell, alternating pure red / pure blue per 1-px
+/// column (any resampling turns interior columns into blends), must land at the footprint's
+/// top-left, one sixel pixel per device pixel, every pixel exactly its palette entry, with
+/// the rest of the footprint byte-equal to the same frame without the image.
 #[test]
 fn sixel_draws_one_sixel_pixel_per_device_pixel() {
     let mut r = Renderer::from_system(16.0, Theme::default())
@@ -814,7 +754,7 @@ fn sixel_draws_one_sixel_pixel_per_device_pixel() {
         format!("\x1bP0;0;8q\"1;1;{raster_w};{raster_h}#0;2;100;0;0#1;2;0;0;100").as_bytes(),
     );
     for x in 0..raster_w {
-        // A colour SELECT does not advance the sixel cursor; the data byte does.
+        // A colour select does not advance the sixel cursor; the data byte does.
         dcs.extend_from_slice(if x % 2 == 0 { b"#0~" } else { b"#1~" });
     }
     dcs.extend_from_slice(b"\x1b\\");
@@ -831,8 +771,7 @@ fn sixel_draws_one_sixel_pixel_per_device_pixel() {
     input.cursor_visible = false; // the cursor block is not part of the picture
     let frame = r.render_input(&input);
 
-    // Control: the same grid with NO image, so "unpainted" can be asserted as
-    // BYTE-EQUAL to the background rather than guessed at.
+    // Control: the same grid with no image, so "unpainted" is asserted byte-equal.
     let mut r2 = Renderer::from_system(16.0, Theme::default()).expect("font");
     let mut ctrl = Terminal::new(rows as u16, cols as u16);
     ctrl.set_cell_pixel_size(cw as u16, ch as u16);
@@ -846,8 +785,7 @@ fn sixel_draws_one_sixel_pixel_per_device_pixel() {
     let fp_w = 2 * cw;
     let fp_h = raster_h.div_ceil(ch) * ch;
 
-    // (1)+(2)+(3): the painted rect is EXACTLY the raster, at the top-left, in
-    // its own palette colours.
+    // The painted rect is exactly the raster, at the top-left, in its palette colours.
     for y in 0..raster_h {
         for x in 0..raster_w {
             let want = if x % 2 == 0 { RED } else { BLUE };
@@ -861,8 +799,8 @@ fn sixel_draws_one_sixel_pixel_per_device_pixel() {
         }
     }
 
-    // ...and nothing else in the footprint is touched: the rounded-up remainder
-    // is left unpainted, exactly as xterm/foot/mlterm/wezterm leave it.
+    // The rounded-up remainder of the footprint is left unpainted, as xterm, foot, mlterm
+    // and wezterm leave it.
     for y in 0..fp_h {
         for x in 0..fp_w {
             if y < raster_h && x < raster_w {
@@ -878,16 +816,14 @@ fn sixel_draws_one_sixel_pixel_per_device_pixel() {
     }
 }
 
-/// The pixel-exact placement arithmetic itself, on the ONE decode both renderers
-/// share — including the clip case the grid-width clamp can produce.
+/// The pixel-exact placement arithmetic on the decode both renderers share, including the
+/// clip case the grid-width clamp can produce.
 #[test]
 fn sixel_footprint_decode_is_pixel_exact() {
     use aterm_core::grid::extra::ImageFormat;
 
-    // A 4x6 sprite — the hunter's `g.six`, drawn 9x14 (2.25x) before the fix —
-    // in the 9x17 footprint one cell gives it. Each pixel gets its own byte
-    // value so a resample of ANY kind is visible as a value that is not in the
-    // source.
+    // A 4x6 sprite in the 9x17 footprint one cell gives it. Each pixel has its own value,
+    // so any resample shows as a value not in the source.
     let (sw, sh) = (4usize, 6usize);
     let mut src = Vec::with_capacity(sw * sh * 4);
     for y in 0..sh {
@@ -928,8 +864,8 @@ fn sixel_footprint_decode_is_pixel_exact() {
         }
     }
 
-    // A raster WIDER/TALLER than its footprint (the engine clamped the cell span
-    // to the grid) is CLIPPED at the margin, not shrunk to fit.
+    // A raster larger than its footprint (the engine clamped the cell span to the grid) is
+    // clipped at the margin, not shrunk.
     let big: Vec<u8> = std::iter::repeat_n([9u8, 200, 30, 255], 20 * 20)
         .flatten()
         .collect();

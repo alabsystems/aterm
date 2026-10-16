@@ -2,73 +2,47 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! `TerminalCheckpoint`: a scoped, round-trippable projection of a live
-//! [`Terminal`].
+//! `TerminalCheckpoint`: a scoped, round-trippable projection of a live [`Terminal`].
 //!
-//! The live [`Terminal`] is neither `Clone` nor `Serialize`: it holds host
-//! callbacks (`Box<dyn FnMut>`: bell, window, colour change/query,
-//! notifications, clipboard), three host-auth gates (clipboard,
-//! shell-integration, hyperlink), a policy engine, and a live `Parser`. A
-//! [`TerminalCheckpoint`] is therefore a precise projection with a documented
-//! exclusion list (below), not a clone.
-//!
-//! It captures both grid bodies (full cell fidelity via the `Line` codec) with
-//! their absolute row numbering, per-grid cursor / scroll-region / pending-wrap
-//! / tab-stops, size, modes, style, charsets, keyboard state, the colours an
-//! application set, the shell-integration state and the titles a program set
-//! (window title, icon name and title stack, `checkpoint_state.rs`), and the
-//! engine state output still to come relies on (the REP character, an SGR 58
-//! underline colour, an open OSC 8 link, a VT52 address in progress, a ZWJ
-//! waiting for the emoji it joins, the XTPUSHSGR stack and the XTSAVE'd
-//! modes, `checkpoint_output.rs`). The round-trip is proven by the property
-//! test in `mod tests`.
+//! The live [`Terminal`] is neither `Clone` nor `Serialize` (host callbacks, host-auth
+//! gates, a policy engine, a live `Parser`), so a checkpoint is a projection with the
+//! exclusion list below, not a clone. It captures both grid bodies (full cell fidelity
+//! via the `Line` codec) with their absolute row numbering, per-grid cursor / scroll
+//! region / pending wrap / tab stops, size, modes, style, charsets, keyboard state,
+//! the colours, shell-integration state and titles a program set
+//! (`checkpoint_state.rs`), and the engine state output still to come relies on
+//! (`checkpoint_output.rs`). The round-trip property test is in `mod tests`.
 //
-// ===========================================================================
-// excluded (and why):
-//   - host effects: the callbacks, the policy engine, and the live auth gates
-//     (the shell-integration nonce travels only on the seamless carry, and the
-//     adopting host authorizes it). A restore never replays a host effect
-//     (bell, notification, clipboard write, window op). `from_checkpoint`
-//     gives `Terminal::new`'s defaults; a host installs its own through the
-//     ordinary setters, or adopts into a configured terminal with
-//     `restore_checkpoint`.
-//   - the rest of `transient`: the response buffer and rate limiter, one
-//     batch's own scratch (its clock, the alt-screen park and restore notes,
-//     the parser reset RIS defers), what the host polls or observes (the
-//     bell, the OSC event queue, the print anchor, pipeline timings, the
-//     sync, reset, clear and screen-replacement counters, the render debt
-//     the host seeds), the orphaned-screen leave's notes (a restored session
-//     takes the 1049 exit), and the Kitty image store with any chunked
-//     transmission in progress: an image whose chunks the park splits is
-//     lost, as every stored image is (decoded images, below). The in-flight
-//     OUTPUT state in `transient` is carried instead (`output_state`, round
-//     eight of the update audit, finding 502, `checkpoint_output.rs`): the
-//     REP character, an SGR 58 underline colour, an open OSC 8 link, a VT52
-//     `ESC Y` waiting for its address, a ZWJ waiting for the emoji it joins,
-//     the XTPUSHSGR stack and the XTSAVE'd modes. A successor older than that
-//     carry resumes with none of them; the seamless capture re-parks rather
-//     than hand it an open link or a pending address over queued output
-//     (`Terminal::output_state_in_flight`), and that hop loses the rest as it
-//     always did. A synchronized-update window stays open, since `modes`
-//     crosses whole, with its timer re-armed at the restore.
-//   - `vi` mode, `text_selection`, the observation watchers and
-//     `last_custody` (see `state.rs`), which describe the person's
-//     interaction with this process, not the screen.
-//   - `marks_state` (OSC 1337 SetMark/AddAnnotation), `semantic` zones and
-//     `iterm2` image placements: iTerm2-protocol extras with no consumer that
-//     survives an update; OSC 133/633 blocks are carried.
-//   - sixel and other decoded images: too large for the handoff (megabytes
-//     per screen); the cells they covered carry.
-//   - the bell and response-rate clocks (`last_bell_time`, `bell_total`, the
-//     response rate limiter): live supervision state that reads real time on
-//     purpose (`state.rs`, `processing.rs`).
-//   - the title epoch: a host's change signal, not state. The titles
-//     themselves are carried; a restore that changes the window title bumps
-//     this terminal's own epoch instead.
+// Excluded, and why:
+//   - host effects: the callbacks, the policy engine and the live auth gates (the
+//     shell-integration nonce travels only on the seamless carry, and the adopting
+//     host authorizes it). A restore never replays a host effect. `from_checkpoint`
+//     gives `Terminal::new`'s defaults; a host installs its own through the setters,
+//     or adopts into a configured terminal with `restore_checkpoint`.
+//   - the rest of `transient`: the response buffer and rate limiter, one batch's own
+//     scratch, what the host polls or observes (bell, OSC event queue, print anchor,
+//     timings, counters, render debt), the orphaned-screen leave's notes (a restored
+//     session takes the 1049 exit), and the Kitty image store with any chunked
+//     transmission in progress. Its in-flight output state is carried
+//     (`output_state`); a successor that predates that key resumes without it, and
+//     the seamless capture re-parks rather than hand it an open link or a pending
+//     VT52 address over queued output (`Terminal::output_state_in_flight`). A
+//     synchronized-update window stays open (`modes` crosses whole), its timer
+//     re-armed at the restore.
+//   - `vi` mode, `text_selection`, the observation watchers and `last_custody`
+//     (`state.rs`): the person's interaction with this process, not the screen.
+//   - `marks_state` (OSC 1337 SetMark/AddAnnotation), `semantic` zones and `iterm2`
+//     image placements: extras no consumer needs across an update (OSC 133/633
+//     blocks are carried).
+//   - sixel and other decoded images: megabytes per screen; the cells they covered
+//     carry.
+//   - the bell and response-rate clocks: live supervision state that reads real time
+//     on purpose (`state.rs`, `processing.rs`).
+//   - the title epoch: a host's change signal; a restore that changes the window
+//     title bumps this terminal's own epoch.
 //
-// The seamless-handoff wire form is `CheckpointMeta` (serde, every scalar
-// field) plus the grid blobs as sidecars.
-// ===========================================================================
+// The seamless-handoff wire form is `CheckpointMeta` (serde, every scalar field) plus
+// the grid blobs as sidecars.
 
 use aterm_parser::ParserCarry;
 use aterm_types::charset::CharacterSetState;
@@ -81,10 +55,8 @@ use super::types::{CurrentStyle, TerminalModes};
 use crate::grid::{CellFlags, Cursor, Grid, PackedColor, SavedCursorState};
 use crate::scrollback::{Scrollback, deserialize_lines, serialize_lines};
 
-/// Per-grid cursor + region + wrap + tab-stop projection.
-///
-/// Captured independently for the main grid and (when present) the alt grid,
-/// because each carries its own cursor and scroll region.
+/// Per-grid cursor + region + wrap + tab-stop projection, captured for the main grid
+/// and (when present) the alt grid.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct GridCursorRepr {
@@ -106,12 +78,9 @@ pub struct GridCursorRepr {
     pub margin_right: u16,
     /// Per-column tab stops (`true` = stop set at that column).
     pub tab_stops: Vec<bool>,
-    /// Whether TBC 3 has suppressed the every-8 defaults. The other half of
-    /// the tab state, and the half a resize reads: without it a restored grid
-    /// that had been told "clear ALL tab stops" re-seeds the default into the
-    /// columns the next widen adds. `#[serde(default)]` for the additive rule
-    /// this file already follows — a checkpoint written before this field
-    /// existed restores `false`, which is what those producers meant.
+    /// Whether TBC 3 suppressed the every-8 defaults: without it a restored grid told
+    /// to clear all tab stops re-seeds the default into the columns the next widen
+    /// adds. `serde(default)`: an older checkpoint restores `false`, as it meant.
     #[cfg_attr(feature = "serde", serde(default))]
     pub tab_defaults_suppressed: bool,
 }
@@ -135,8 +104,7 @@ impl GridCursorRepr {
 
     fn apply(&self, grid: &mut Grid) {
         grid.set_scroll_region(self.scroll_top, self.scroll_bottom);
-        // set_horizontal_margins self-validates (full margins recompute
-        // has_horizontal_margins=false), so this is safe even if cols changed.
+        // set_horizontal_margins self-validates, so this is safe even if cols changed.
         grid.set_horizontal_margins(self.margin_left, self.margin_right);
         grid.set_cursor(self.cursor_row, self.cursor_col);
         grid.set_pending_wrap(self.pending_wrap);
@@ -144,14 +112,10 @@ impl GridCursorRepr {
     }
 }
 
-/// Minimal, by-value style projection.
-///
-/// `CurrentStyle` carries cached fields that are pure functions of the four
-/// semantically-meaningful inputs `(fg, bg, flags, protected)`, so we capture
-/// only those and rebuild via `CurrentStyle::new(...)` on restore. This both
-/// avoids depending on `PartialEq` for `CurrentStyle`'s private cache and keeps
-/// the round-trip honest (the cache is recomputed from the four inputs, then
-/// `apply_style_change()` re-arms the rebuilt grid's BCE cursor template).
+/// Minimal, by-value style projection: the four inputs `(fg, bg, flags, protected)`
+/// that `CurrentStyle`'s cached fields are pure functions of. A restore rebuilds the
+/// cache with `CurrentStyle::new`, then `apply_style_change()` re-arms the rebuilt
+/// grid's BCE cursor template.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StyleRepr {
     /// Foreground color.
@@ -179,9 +143,7 @@ impl StyleRepr {
     }
 }
 
-/// Wire-stable DECSC/DECRC slot. The style is stored as semantic raw fields so
-/// restore rebuilds `CurrentStyle` caches from them rather than carrying any
-/// grid-local index.
+/// A DECSC slot's deferred-wrap flag (a bare `bool` on the wire).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(transparent))]
@@ -197,6 +159,8 @@ impl SavedCursorPendingWrap {
     }
 }
 
+/// Wire-stable DECSC/DECRC slot: the style as raw semantic fields, so a restore
+/// rebuilds `CurrentStyle`'s caches rather than carrying a grid-local index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SavedCursorRepr {
@@ -216,16 +180,13 @@ pub struct SavedCursorRepr {
 impl SavedCursorRepr {
     /// Project a DECSC slot for the wire, raw, exactly as the engine keeps it.
     ///
-    /// The slot holds absolute coordinates that nothing reads until DECRC or a
-    /// 1049 exit, which clamp to the grid at that moment (`Grid::set_cursor`,
-    /// as xterm's `CursorRestore` does). `Terminal::resize` moves the slot
-    /// only with its text (`Grid::lend_saved_cursor`), so a slot on a row a
-    /// shrink trimmed names a row the grid no longer has; if the grid grows
-    /// back first, the cursor lands on that row. The projection therefore must
-    /// not clamp.
-    ///
-    /// The wire's bound for this slot is the engine's protocol ceiling, not
-    /// the current grid (see `seamless::checkpoint_meta_bound_violation`).
+    /// The slot holds absolute coordinates that nothing reads until DECRC or a 1049
+    /// exit, which clamp to the grid then (`Grid::set_cursor`, as xterm's
+    /// `CursorRestore` does). A resize moves the slot only with its text, so a slot on
+    /// a row a shrink trimmed names a row the grid no longer has, and lands there if
+    /// the grid grows back first: the projection must not clamp. The wire bounds the
+    /// slot by the protocol ceiling, not the current grid
+    /// (`seamless::checkpoint_meta_bound_violation`).
     fn capture(saved: SavedCursorState) -> Self {
         Self {
             cursor_row: saved.cursor.row,
@@ -383,14 +344,12 @@ pub struct TerminalCheckpoint {
     pub secure_keyboard_entry: bool,
     /// Current working directory (OSC 7).
     pub current_working_directory: Option<String>,
-    /// The parser this checkpoint restores into is in Ground: `parser`
-    /// is `None`, and either the live parser was Ground with nothing pending at
-    /// capture time, or the capture
-    /// ([`Terminal::checkpoint_carry_abandoning_partial`]) cancelled, as CAN
-    /// would, a partial sequence no carry can hold (a hooked DCS query).
-    /// `false` with `parser` set: the restore continues that partial state.
-    /// `false` with `parser` `None` is an in-memory checkpoint of a parser
-    /// inside a hooked DCS query, which no handoff carries.
+    /// The parser this checkpoint restores into is in Ground: `parser` is `None`, and
+    /// either the live parser was Ground with nothing pending, or the capture
+    /// ([`Terminal::checkpoint_carry_abandoning_partial`]) cancelled, as CAN would, a
+    /// partial sequence no carry can hold (a hooked DCS query). `false` with `parser`
+    /// set: the restore continues that partial state. `false` with `parser` `None`: an
+    /// in-memory checkpoint of a parser inside a hooked DCS query.
     pub parser_ground: bool,
     /// The parser's partial state ([`ParserCarry`]): a sequence split across
     /// PTY reads (a CSI, an OSC title, the head of a UTF-8 glyph), which the
@@ -424,19 +383,14 @@ pub struct TerminalCheckpoint {
     /// prompt re-signs it. A fact about the shell, not an authority: a restore
     /// installs it (a checkpoint without one leaves the engine's alone).
     pub shell_integration_rev: Option<String>,
-    /// The titles a program set ([`TitleRepr`]). `Some` in every checkpoint a
-    /// terminal projects, an untitled one included; `None` only for one
-    /// reassembled from a handoff whose producer carried no title — a build
-    /// before this field, or a value that did not read. A restore then leaves
-    /// the engine's title alone, and the adopting host may seed it from what
-    /// else it knows (`aterm-gui`'s handoff record). Presence is the whole
-    /// signal, so it is never folded into an empty title.
+    /// The titles a program set ([`TitleRepr`]). `Some` in every checkpoint a terminal
+    /// projects, an untitled one included; `None` only when a handoff's producer
+    /// carried no title (an older build, or a value that did not read), and then a
+    /// restore leaves the engine's title alone for the adopting host to seed. Presence
+    /// is the whole signal, so it is never folded into an empty title.
     pub title: Option<TitleRepr>,
-    /// The engine state output still to come relies on: the REP character,
-    /// an SGR 58 underline colour, an open OSC 8 link, a VT52 address in
-    /// progress, a ZWJ waiting for the emoji it joins, the XTPUSHSGR stack and
-    /// the XTSAVE'd modes ([`OutputStateRepr`]). A restore installs it whole
-    /// (default: none of it set).
+    /// The engine state output still to come relies on ([`OutputStateRepr`]); a
+    /// restore installs it whole.
     pub output_state: OutputStateRepr,
 }
 
@@ -544,35 +498,28 @@ impl Terminal {
         })
     }
 
-    /// [`Self::checkpoint_carry`] for a parser that may hold a partial
-    /// sequence no carry can: the same projection (visible screen plus at most
-    /// `max_history` lines, the inactive grid pinned to its visible rows),
-    /// taken without that precondition, plus the name of the parser state
-    /// whose partial sequence the projection leaves out (`None` when nothing
-    /// was left out, in which case the checkpoint equals
+    /// [`Self::checkpoint_carry`] for a parser that may hold a partial sequence no
+    /// carry can: the same projection (visible screen plus at most `max_history`
+    /// lines, the inactive grid pinned to its visible rows) without that
+    /// precondition, plus the name of the parser state whose partial sequence it
+    /// leaves out (`None` when nothing was left out: then it equals
     /// `checkpoint_carry(max_history)`).
     ///
-    /// Almost every partial sequence is carried in
-    /// [`TerminalCheckpoint::parser`] (a split CSI or DCS header, an OSC title,
-    /// a UTF-8 head; an ignored DCS, SOS/PM/APC or oversize OSC, and a hooked
-    /// DCS string whose handler keeps nothing or holds a picture, ride as a
-    /// string to swallow). What is left out is a hooked DCS QUERY
+    /// Almost every partial sequence is carried in [`TerminalCheckpoint::parser`] (a
+    /// split CSI or DCS header, an OSC title, a UTF-8 head; an ignored DCS, SOS/PM/APC
+    /// or oversize OSC, and a hooked DCS string whose handler keeps nothing or holds a
+    /// picture, ride as a string to swallow). Left out is a hooked DCS query
     /// (`DcsPassthrough` under DECRQSS or XTGETTCAP), whose reply lives in its
-    /// handler. A parser can sit there indefinitely (a stalled ssh session, an
+    /// handler; a parser can sit there indefinitely (a stalled ssh session, an
     /// unterminated string), and the update must not refuse for it.
     ///
-    /// The semantics are CAN (0x18) applied to the copy: the checkpoint
-    /// describes the engine as if the partial sequence had been cancelled, so
-    /// `parser_ground` is `true` and a restored terminal treats the next byte
-    /// as fresh input. The live terminal is only read, so a handoff that rolls
-    /// back resumes byte-exactly.
-    ///
-    /// Whatever of the string the program still sends reaches the restored
-    /// Ground parser as ordinary input (as after a CAN in any terminal). For a
-    /// stalled string that is at most a few late bytes; for a tail already
-    /// queued on the PTY it would be visible garbage, so the seamless capture
-    /// asks [`Self::partial_sequence_uncarried`] first and re-parks on a
-    /// sequence boundary instead.
+    /// The semantics are CAN (0x18) applied to the copy: `parser_ground` is `true` and
+    /// a restored terminal treats the next byte as fresh input. The live terminal is
+    /// only read, so a handoff that rolls back resumes byte-exactly. The rest of the
+    /// string reaches the restored Ground parser as ordinary input: a few late bytes
+    /// for a stalled string, but visible garbage for a tail already queued on the PTY,
+    /// so the seamless capture asks [`Self::partial_sequence_uncarried`] first and
+    /// re-parks on a sequence boundary instead.
     #[must_use]
     pub fn checkpoint_carry_abandoning_partial(
         &self,
@@ -591,17 +538,14 @@ impl Terminal {
         (carry, self.partial_sequence_uncarried())
     }
 
-    /// The scalar half of [`Self::checkpoint_carry_abandoning_partial`]`(0)` —
-    /// exactly the [`CheckpointMeta`] of that carry — without projecting either
-    /// grid.
+    /// The scalar half of [`Self::checkpoint_carry_abandoning_partial`]`(0)` (exactly
+    /// that carry's [`CheckpointMeta`]) without projecting either grid.
     ///
     /// For the seamless capture's Repaint rung (`aterm-gui`'s
-    /// `seamless::repaint_carry_for_wire`), which carries a blank canonical screen
-    /// and reads nothing of the grids but their geometry and cursors. Taking the
-    /// full carry there serialized the visible and the inactive grid inside the
-    /// frozen window only to throw both away — and ran the very grid code a
-    /// successor's `carry = "repaint"` handoff policy is sent to route around when
-    /// a release finds it slow or panicking.
+    /// `seamless::repaint_carry_for_wire`), which carries a blank canonical screen and
+    /// reads only the grids' geometry and cursors: the frozen window neither
+    /// serializes grids it would throw away nor runs the grid code a successor's
+    /// `carry = "repaint"` policy routes around.
     #[cfg(feature = "serde")]
     #[must_use]
     pub fn carry_meta_abandoning_partial(&self) -> CheckpointMeta {
@@ -611,11 +555,10 @@ impl Terminal {
         CheckpointMeta::from_checkpoint(&scalars)
     }
 
-    /// The authorized shell-integration nonce as the two seamless-handoff
-    /// projections carry it — [`Self::checkpoint_carry`] and
-    /// [`Self::checkpoint_carry_abandoning_partial`], and no other. Only a nonce
-    /// IN USE: a re-key the shell has not taken yet stays behind, and the
-    /// successor re-keys the shell afresh.
+    /// The authorized shell-integration nonce as the two seamless-handoff projections
+    /// carry it ([`Self::checkpoint_carry`],
+    /// [`Self::checkpoint_carry_abandoning_partial`]). Only a nonce in use: a re-key
+    /// the shell has not taken yet stays behind, and the successor re-keys afresh.
     fn carried_shell_integration_nonce(&self) -> Option<ShellIntegrationNonce> {
         self.shell_integration_auth
             .nonce_in_use()
@@ -633,14 +576,13 @@ impl Terminal {
         (!state.is_ground()).then(|| state.name())
     }
 
-    /// The parser state a partial sequence NO carry CAN hold is sitting in —
-    /// `DcsPassthrough` under a DCS query (DECRQSS, XTGETTCAP), whose reply
-    /// lives in its handler ([`Self::parser_carry`]) — or `None` when the
-    /// parser's state is carried, whole or as a string to swallow
-    /// ([`TerminalCheckpoint::parser`]). What the seamless capture asks before
-    /// it treats a mid-sequence parser over queued output as a timing miss: a
-    /// carried sequence continues in the successor, so its queued tail is no
-    /// hazard. A pure read.
+    /// The parser state a partial sequence no carry can hold is sitting in
+    /// (`DcsPassthrough` under a DCS query, DECRQSS or XTGETTCAP, whose reply lives in
+    /// its handler; [`Self::parser_carry`]), or `None` when the parser's state is
+    /// carried, whole or as a string to swallow ([`TerminalCheckpoint::parser`]). The
+    /// seamless capture asks this before treating a mid-sequence parser over queued
+    /// output as a timing miss: a carried sequence continues in the successor. A pure
+    /// read.
     #[must_use]
     pub fn partial_sequence_uncarried(&self) -> Option<&'static str> {
         self.parser_carry()
@@ -648,9 +590,8 @@ impl Terminal {
             .then(|| self.parser.state().name())
     }
 
-    /// What a hooked DCS string's handler holds, or `None` when the parser is
-    /// not inside one (round eight of the update audit, finding 57). The
-    /// parser cannot see it; this engine's DCS router can.
+    /// What a hooked DCS string's handler holds, or `None` when the parser is not
+    /// inside one. The parser cannot see it; this engine's DCS router can.
     fn hooked_dcs(&self) -> Option<HookedDcs> {
         if self.parser.state() != aterm_parser::State::DcsPassthrough {
             return None;
@@ -669,16 +610,12 @@ impl Terminal {
         })
     }
 
-    /// The parser's partial state as a carry holds it — `None` only for a
-    /// hooked DCS whose handler a carry would rob of something nothing
-    /// replaces (a query's reply). A hooked string whose handler keeps nothing,
-    /// or holds a picture, rides as one to ignore to its terminator
-    /// ([`aterm_parser::Parser::carry_unhooking`], in a state whose every
-    /// transition is the hooked string's): the successor swallows its tail
-    /// instead of printing it. Before round eight's finding 57 every
-    /// hooked DCS was uncarried, so a tab streaming sixel frames, or one whose
-    /// tmux wraps its output in passthrough strings, missed every park while
-    /// the stream ran and held the update for as long.
+    /// The parser's partial state as a carry holds it: `None` only for a hooked DCS
+    /// whose handler a carry would rob of something nothing replaces (a query's
+    /// reply). A hooked string whose handler keeps nothing, or holds a picture, rides
+    /// as one to ignore to its terminator ([`aterm_parser::Parser::carry_unhooking`]),
+    /// so the successor swallows its tail instead of printing it, and a tab streaming
+    /// sixel frames or tmux passthrough strings does not miss every park.
     fn parser_carry(&self) -> Option<ParserCarry> {
         match self.hooked_dcs() {
             None => self.parser.carry(),
@@ -687,49 +624,43 @@ impl Terminal {
         }
     }
 
-    /// The parser state a partial sequence is in when the carry would hold it
-    /// only as one to swallow to its terminator, where this engine would still
-    /// have delivered it (an OSC over the carry's cap such as OSC 52 or 1337,
-    /// an APC string whose consumer started, a hooked sixel string), or `None`
-    /// ([`aterm_parser::Parser::carry_swallows_sequence`]; a hooked string
-    /// whose handler keeps nothing loses nothing, so it is not named). Over queued
-    /// output the seamless capture treats this as a timing miss and re-parks
-    /// on a sequence boundary, since the successor would swallow the tail.
-    /// Over a quiet PTY the carry still goes: a stalled sequence may never end.
-    /// A pure read.
+    /// The parser state a partial sequence is in when the carry would hold it only as
+    /// one to swallow, where this engine would still have delivered it (an OSC over
+    /// the carry's cap such as OSC 52 or 1337, an APC string whose consumer started,
+    /// a hooked sixel string), or `None`
+    /// ([`aterm_parser::Parser::carry_swallows_sequence`]; a hooked string whose
+    /// handler keeps nothing loses nothing, so it is not named). Over queued output
+    /// the seamless capture treats this as a timing miss and re-parks on a sequence
+    /// boundary; over a quiet PTY the carry still goes, as a stalled sequence may
+    /// never end. A pure read.
     #[must_use]
     pub fn partial_sequence_swallowed(&self) -> Option<&'static str> {
         (self.parser.carry_swallows_sequence() || self.hooked_dcs() == Some(HookedDcs::Picture))
             .then(|| self.parser.state().name())
     }
 
-    /// Whether the sequence [`Self::partial_sequence_swallowed`] names is a
-    /// picture — a kitty-graphics APC, an OSC 1337 image, or a hooked sixel
-    /// string — which a graphics stream's next frame replaces
+    /// Whether the sequence [`Self::partial_sequence_swallowed`] names is a picture
+    /// (a kitty-graphics APC, an OSC 1337 image, a hooked sixel string), which a
+    /// graphics stream's next frame replaces
     /// ([`aterm_parser::Parser::carry_swallows_picture`]). The seamless capture
-    /// carries one rather than miss every park while the stream plays (round
-    /// eight of the update audit, finding 57); an OSC 52 clipboard write and
-    /// every other swallowed sequence stay a miss. A pure read.
+    /// carries one rather than miss every park while the stream plays; an OSC 52
+    /// clipboard write and every other swallowed sequence stay a miss. A pure read.
     #[must_use]
     pub fn partial_sequence_swallows_picture(&self) -> bool {
         self.parser.carry_swallows_picture() || self.hooked_dcs() == Some(HookedDcs::Picture)
     }
 
-    /// The engine state (not the parser's) that output still to come relies on
-    /// and that is IN FLIGHT, or `None`: `"Osc8HyperlinkOpen"` while an OSC 8
-    /// link is open, `"Vt52CursorAddress"` while a VT52 `ESC Y` waits for its
-    /// row and column bytes.
+    /// The engine state (not the parser's) that output still to come relies on and
+    /// that is in flight, or `None`: `"Osc8HyperlinkOpen"` while an OSC 8 link is
+    /// open, `"Vt52CursorAddress"` while a VT52 `ESC Y` waits for its address bytes.
     ///
-    /// Every checkpoint carries both ([`TerminalCheckpoint::output_state`]),
-    /// but a successor older than that carry (round eight of the update audit,
-    /// finding 502) resumes with neither: the rest of the link's text unlinked,
-    /// the address bytes printed as text. So on a hop to an older build the
-    /// seamless capture asks this beside [`Self::partial_sequence_swallowed`]
-    /// and re-parks over queued output; over a quiet PTY it carries anyway (a
-    /// link may never close). The rest of the carried output state (the REP
-    /// character, an SGR 58 underline colour, a pending ZWJ, the XTPUSHSGR
-    /// stack, the XTSAVE'd modes) is not named: an older successor never had
-    /// it either, and the hop stays exactly as it was. A pure read.
+    /// Every checkpoint carries both ([`TerminalCheckpoint::output_state`]), but a
+    /// successor that predates that carry resumes with neither (the rest of the link
+    /// unlinked, the address bytes printed). So on a hop to an older build the
+    /// seamless capture asks this beside [`Self::partial_sequence_swallowed`] and
+    /// re-parks over queued output; over a quiet PTY it carries anyway (a link may
+    /// never close). The rest of the output state is not named: an older successor
+    /// never had it. A pure read.
     #[must_use]
     pub fn output_state_in_flight(&self) -> Option<&'static str> {
         if self.transient.vt52_cursor_state != super::Vt52CursorState::None {
@@ -741,15 +672,11 @@ impl Terminal {
         }
     }
 
-    /// A carried synchronized-update window (mode 2026) gets a fresh timer.
-    /// `modes` crosses whole, so a session parked between `?2026h` and
-    /// `?2026l` resumes with the mode set — but the window's start instant is
-    /// `transient` state and does not cross, and the engine's own timeout
-    /// fires only from that instant, so without re-arming a program that died
-    /// before its `?2026l` would leave the mode on for good.
-    /// Armed as `?2026h` arms it, at this engine's processing clock, so the
-    /// carried window ends at its closing `?2026l`, as it would have, or times
-    /// out like any other.
+    /// A carried synchronized-update window (mode 2026) gets a fresh timer: `modes`
+    /// crosses whole but the window's start instant is `transient` and does not, and
+    /// the engine's timeout fires only from it, so without re-arming a program that
+    /// died before its `?2026l` would leave the mode on for good. Armed as `?2026h`
+    /// arms it, at this engine's processing clock.
     fn arm_carried_sync_window(&mut self) {
         self.transient.sync_start = self
             .modes
@@ -881,13 +808,11 @@ impl Terminal {
 
         let (alt_grid, alt_cursor) = match &self.alt_grid {
             Some(inactive) => (
-                // `alt_grid` is the inactive grid: while the alternate screen
-                // is up it holds the saved primary, scrollback and all. The wire
-                // gives this blob exactly `rows` records (the one
-                // `history_lines` describes the main blob) and the consumer
-                // validates it with `history = 0`, so the handoff projection
-                // pins `inactive_max_history` to 0, while a full in-memory
-                // checkpoint uses the active grid's bound.
+                // While the alternate screen is up the inactive grid is the saved
+                // primary, scrollback and all. The wire gives this blob exactly
+                // `rows` records (the consumer validates it with `history = 0`),
+                // so the handoff pins `inactive_max_history` to 0; a full
+                // in-memory checkpoint uses the active grid's bound.
                 Some(if grids {
                     serialize_lines(&inactive.checkpoint_lines_bounded(inactive_max_history))
                 } else {
@@ -929,14 +854,11 @@ impl Terminal {
         }
     }
 
-    /// Rebuild a fully-living [`Terminal`] from a checkpoint (B.3.2).
-    ///
-    /// The rebuilt terminal's *buffer state* matches the source exactly (proven
-    /// by the round-trip test). It has `Terminal::new`'s host effects — no
-    /// callbacks, no policy engine, default auth — because those are not in the
-    /// checkpoint (see the excluded block); a host that wants its own installs
-    /// them through the ordinary setters, or adopts into a configured terminal
-    /// with [`Self::restore_checkpoint`].
+    /// Rebuild a fully-living [`Terminal`] from a checkpoint. Its buffer state matches
+    /// the source exactly (the round-trip test); its host effects are
+    /// `Terminal::new`'s (see the excluded block), so a host installs its own through
+    /// the setters, or adopts into a configured terminal with
+    /// [`Self::restore_checkpoint`].
     #[must_use]
     pub fn from_checkpoint(c: &TerminalCheckpoint) -> Terminal {
         // Which slot holds the alternate buffer (no scrollback ring) varies:
@@ -957,7 +879,6 @@ impl Terminal {
             terminal.alt_grid = Some(saved);
         }
 
-        // Leaf fields by value.
         terminal.modes = c.modes;
         terminal.cursor_save.main = c.saved_cursor_main.map(SavedCursorRepr::into_saved);
         terminal.cursor_save.alt = c.saved_cursor_alt.map(SavedCursorRepr::into_saved);
@@ -976,19 +897,31 @@ impl Terminal {
         // background would be lost at the first scroll/erase before an SGR.
         terminal.style = c.style.into_style();
         {
-            // We reach the SGR view via the generated handler split.
             let (_parser, mut handler) = terminal.split_for_process();
             handler.sgr_style().apply_style_change();
         }
         terminal.apply_color_repr(&c.color);
         terminal.apply_shell_repr(&c.shell);
+        // The shell's integration body, when the carry named one — the same
+        // install `restore_checkpoint` does, so the two restore doors agree
+        // (the field's contract: a restore installs it, an absent or malformed
+        // one leaves the engine's alone). Validated like a signed mark.
+        if let Some(rev) = c
+            .shell_integration_rev
+            .as_deref()
+            .filter(|rev| crate::shell_integration::is_integration_rev(rev))
+        {
+            let mut bytes = [0u8; 16];
+            bytes.copy_from_slice(rev.as_bytes());
+            terminal.shell.integration_rev = Some(bytes);
+        }
         if let Some(title) = &c.title {
             terminal.restore_title(title);
         }
         // After the style: the open link goes through the OSC 8 handler.
         terminal.apply_output_state_repr(&c.output_state);
-        // Last of the input-side state: the title above is restored AS OSC
-        // input, which must not run through a carried partial sequence.
+        // Last of the input-side state: the title above is restored as OSC input,
+        // which must not run through a carried partial sequence.
         terminal.restore_parser_carry(c.parser.as_ref());
         terminal.arm_carried_sync_window();
         // `modes`/kitty/xterm were assigned by value above, after `with_grid`
@@ -998,13 +931,10 @@ impl Terminal {
         terminal
     }
 
-    /// Restore a checkpoint's buffer state into an already-configured live
-    /// terminal (the seamless-update adopt path): the caller built `self` via
-    /// the normal config-applied constructor (callbacks/policy/auth wired), and
-    /// this replaces only what [`Self::from_checkpoint`] would have captured —
-    /// grids, cursor state, modes, charset, keyboard state, style. Host
-    /// bindings and auth state are untouched, so this composes with the spawn
-    /// path's configure_* wiring instead of re-deriving it.
+    /// Restore a checkpoint's buffer state into an already-configured live terminal
+    /// (the seamless-update adopt path): replaces only what [`Self::from_checkpoint`]
+    /// would have captured, leaving host bindings and auth state untouched, so it
+    /// composes with the spawn path's `configure_*` wiring.
     pub fn restore_checkpoint(&mut self, c: &TerminalCheckpoint) {
         // Scrollback retention is this process's config, not the checkpoint's.
         // The host's config reached `self` before this adopt, but
@@ -1073,10 +1003,8 @@ impl Terminal {
         if let Some(title) = &c.title {
             self.restore_title(title);
         }
-        // The engine state output still to come relies on (round eight of the
-        // update audit, finding 502), the link through this engine's own OSC 8
-        // handler. A checkpoint from a producer before it holds none of it,
-        // which is what the fresh adopting engine already holds.
+        // The engine state output still to come relies on, the link through this
+        // engine's own OSC 8 handler (an older producer's checkpoint holds none).
         self.apply_output_state_repr(&c.output_state);
         // After the title, which is restored as OSC input (see
         // `from_checkpoint`).
@@ -1091,8 +1019,7 @@ impl Terminal {
         // Hydration replaced both grids and `modes.alternate_screen`, so the
         // parked selection (restored on the next alt exit) would name content
         // from another lineage; clear it. The live selection is left alone, so
-        // a highlight survives an in-place update. (The mode mirror is
-        // republished at the end of this fn.)
+        // a highlight survives an in-place update.
         self.parked_text_selection.clear();
         // In-place hydration replaced `modes`, the kitty stack and the xterm
         // keyboard state outside `process()`: republish the lock-free fold so
@@ -1104,18 +1031,17 @@ impl Terminal {
     }
 }
 
-/// The serde-carryable half of a [`TerminalCheckpoint`]: every scalar field,
-/// without the two grid byte blobs (which stay on the binary `Line` codec).
+/// The serde-carryable half of a [`TerminalCheckpoint`]: every scalar field, without
+/// the two grid byte blobs (which stay on the binary `Line` codec).
 ///
-/// Used for the seamless update screen carry: the outgoing process
-/// serializes this into the handoff manifest and writes the grid blobs as
-/// sidecar files; the incoming process reassembles the checkpoint via
-/// [`CheckpointMeta::into_checkpoint`] and hydrates the adopted session's
-/// engine with [`Terminal::from_checkpoint`], so the window comes back
-/// showing the same screen. The generic serializer is additive via
-/// `serde(default)`; seamless schema 1 is stricter (`aterm-gui` requires
-/// every semantic key and binds the canonical result into its adoption
-/// proof). Style crosses as raw bits (`PackedColor(pub u32)`,
+/// The seamless update's screen carry: the outgoing process serializes this into the
+/// handoff manifest and writes the grid blobs as sidecar files; the incoming process
+/// reassembles the checkpoint ([`CheckpointMeta::into_checkpoint`]) and hydrates the
+/// adopted session's engine. The generic serializer is additive via `serde(default)`:
+/// a key a parent did not write restores its default, an older child ignores a key it
+/// does not know, and the screen digest hashes the bytes as sent. Seamless schema 1 is
+/// stricter (`aterm-gui` requires every semantic key and binds the canonical result
+/// into its adoption proof). Style crosses as raw bits (`PackedColor(pub u32)`,
 /// `CellFlags(pub u16)`) to keep serde out of the grid crate.
 #[cfg(feature = "serde")]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1125,14 +1051,9 @@ pub struct CheckpointMeta {
     /// Grid cols.
     pub cols: u16,
     /// How many leading records of the main grid blob are scrollback rather than
-    /// visible rows (see `TerminalCheckpoint::history_lines`).
-    ///
-    /// `#[serde(default)]` on purpose: every producer before this field existed
-    /// emitted a visible-only blob, and `0` is exactly that. A checkpoint arriving
-    /// without the key is therefore read correctly rather than rejected — which is
-    /// the whole compatibility story, because in a handoff the parent is always
-    /// the older build and the child the newer one, so the consumer is the side
-    /// that has to accept both shapes.
+    /// visible rows (see `TerminalCheckpoint::history_lines`). `serde(default)`: a
+    /// producer without the field emitted a visible-only blob, which `0` is, and in a
+    /// handoff the consumer is the newer build, so it accepts both shapes.
     #[serde(default)]
     pub history_lines: u32,
     /// Main-grid cursor/region/wrap/tab projection.
@@ -1180,52 +1101,43 @@ pub struct CheckpointMeta {
     #[serde(default)]
     pub current_working_directory: Option<String>,
     /// The authorized shell-integration nonce as 64 hex digits
-    /// ([`TerminalCheckpoint::shell_integration_nonce`]). Additive and absent
-    /// when there is none, so a parent without the field, and a session without
-    /// integration, add no key for it; a value that is not 64
-    /// hex digits reassembles as `None` (the successor reports the session
-    /// `integration=degraded` rather than trusting a partial nonce).
+    /// ([`TerminalCheckpoint::shell_integration_nonce`]). Absent when there is none; a
+    /// value that is not 64 hex digits reassembles as `None` (the successor reports
+    /// the session `integration=degraded` rather than trusting a partial nonce).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shell_integration_nonce: Option<String>,
-    /// [`TerminalCheckpoint::absolute_row_counter`]. Additive: `0` (a parent
-    /// without the field) restores fresh numbering. Written for every live
-    /// session (a grid's counter is at least its rows); an older child
-    /// ignores the key, and the screen digest hashes the bytes as sent.
+    /// [`TerminalCheckpoint::absolute_row_counter`]. `0` (a parent without the field)
+    /// restores fresh numbering; written for every live session (a grid's counter is
+    /// at least its rows).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub absolute_row_counter: u64,
-    /// [`TerminalCheckpoint::alt_absolute_row_counter`]. Additive, as above.
+    /// [`TerminalCheckpoint::alt_absolute_row_counter`], as above.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub alt_absolute_row_counter: u64,
-    /// [`TerminalCheckpoint::color`]. Additive and absent when nothing is
-    /// overridden, so a session with the host's colours adds no key for it.
+    /// [`TerminalCheckpoint::color`]. Absent when nothing is overridden.
     #[serde(default, skip_serializing_if = "ColorRepr::is_default")]
     pub color: ColorRepr,
-    /// [`TerminalCheckpoint::shell`]. Additive and absent for a session that
-    /// never saw a mark.
+    /// [`TerminalCheckpoint::shell`]. Absent for a session that never saw a mark.
     #[serde(default, skip_serializing_if = "ShellRepr::is_default")]
     pub shell: ShellRepr,
     /// The integration body the shell last signed that it runs, 16 hex digits
-    /// ([`TerminalCheckpoint::shell_integration_rev`]). Absent when there is
-    /// none, so it adds no key; a value that is not a folder address
-    /// reassembles as `None`.
+    /// ([`TerminalCheckpoint::shell_integration_rev`]). Absent when there is none; a
+    /// value that is not a folder address reassembles as `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shell_integration_rev: Option<String>,
-    /// [`TerminalCheckpoint::title`]. Written for every session, `{}` when
-    /// nothing titled it, because presence tells a successor the producer
-    /// carried titles: absent means the successor may seed the tab's title
-    /// from the handoff record, while `{}` means untitled. An older child
-    /// ignores the key, and the screen digest hashes the bytes as sent. A
-    /// value that does not read costs only the title ([`lenient_title`]).
+    /// [`TerminalCheckpoint::title`]. Written for every session, `{}` when nothing
+    /// titled it: presence tells a successor the producer carried titles, so absent
+    /// means it may seed the tab's title from the handoff record. A value that does
+    /// not read costs only the title ([`lenient_title`]).
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         deserialize_with = "lenient_title"
     )]
     pub title: Option<TitleRepr>,
-    /// [`TerminalCheckpoint::parser`]. Additive, and absent for a Ground
-    /// parser with nothing pending. An older child ignores the key and resumes
-    /// at Ground; the screen digest hashes the bytes as sent, so the carry is
-    /// inside the adoption proof. A value that does not read costs only the
+    /// [`TerminalCheckpoint::parser`]. Absent for a Ground parser with nothing
+    /// pending; an older child resumes at Ground. The screen digest covers it, so the
+    /// carry is inside the adoption proof. A value that does not read costs only the
     /// partial sequence (`lenient_parser`).
     #[serde(
         default,
@@ -1233,12 +1145,10 @@ pub struct CheckpointMeta {
         deserialize_with = "super::checkpoint_parser::lenient_parser"
     )]
     pub parser: Option<super::checkpoint_parser::ParserRepr>,
-    /// [`TerminalCheckpoint::output_state`] (round eight of the update audit,
-    /// finding 502). Additive, and absent when none of it is set; a session
-    /// that has printed anything carries at least its REP character. An older
-    /// child ignores the key and resumes with none of it, the screen digest
-    /// hashes the bytes as sent, and a value that does not read costs only this
-    /// state (`lenient_output_state`), never the screen.
+    /// [`TerminalCheckpoint::output_state`]. Absent when none of it is set (a session
+    /// that printed anything carries at least its REP character); an older child
+    /// resumes with none of it. A value that does not read costs only this state
+    /// (`lenient_output_state`), never the screen.
     #[serde(
         default,
         skip_serializing_if = "OutputStateRepr::is_default",
@@ -1247,13 +1157,10 @@ pub struct CheckpointMeta {
     pub output_state: OutputStateRepr,
 }
 
-/// Read a carried [`TitleRepr`], or `None` when the value is not one.
-///
-/// Why lenient: `CheckpointMeta` is parsed whole, and a strict field that
-/// failed would fail it — the successor then adopts that session onto a blank
-/// screen and repaints it (`aterm-gui`'s consumer degrade). A title is not
-/// worth a screen, so a malformed one reads as "not carried", exactly like a
-/// producer that never wrote the key.
+/// Read a carried [`TitleRepr`], or `None` when the value is not one: `CheckpointMeta`
+/// is parsed whole, and a failed strict field would send the session to a blank,
+/// repainted screen (`aterm-gui`'s consumer degrade). A malformed title reads as not
+/// carried, like a producer that never wrote the key.
 #[cfg(feature = "serde")]
 fn lenient_title<'de, D>(deserializer: D) -> Result<Option<TitleRepr>, D::Error>
 where
@@ -1286,10 +1193,8 @@ fn is_zero(n: &u64) -> bool {
 impl CheckpointMeta {
     /// Project a full checkpoint into its carryable meta half.
     ///
-    /// Exhaustive destructure on purpose: adding a field to
-    /// [`TerminalCheckpoint`] must fail this build until the carry decides to
-    /// ship or deliberately drop it — silent drift is how a "seamless" update
-    /// quietly loses state.
+    /// Exhaustive destructure on purpose: a new [`TerminalCheckpoint`] field fails
+    /// this build until the carry ships it or deliberately drops it.
     #[must_use]
     pub fn from_checkpoint(c: &TerminalCheckpoint) -> Self {
         let TerminalCheckpoint {
@@ -1420,23 +1325,18 @@ impl CheckpointMeta {
     }
 }
 
-/// Rebuild a single grid from `serialize_lines` bytes + a cursor projection.
-///
-/// The byte stream is `scrollback-then-visible` (the `checkpoint_lines` layout):
-/// the last `rows` lines are the visible rows; everything before is scrollback,
-/// oldest first. We attach the scrollback to a tiered store (preserving order),
-/// then restore the visible rows via the shared `fill_row_from_line` path, then
-/// apply the cursor/region/wrap/tabs.
+/// Rebuild a single grid from `serialize_lines` bytes + a cursor projection. The
+/// bytes are scrollback-then-visible (the `checkpoint_lines` layout): the last `rows`
+/// lines are the visible rows, everything before is scrollback, oldest first, pushed
+/// into a tiered store.
 fn restore_grid(rows: u16, cols: u16, bytes: &[u8], cursor: &GridCursorRepr, is_alt: bool) -> Grid {
     let lines = deserialize_lines(bytes);
     let visible_start = lines.len().saturating_sub(rows as usize);
     let (scrollback_lines, visible_lines) = lines.split_at(visible_start);
 
     let mut grid = if is_alt {
-        // The alternate screen has NO scrollback (matches enter_alternate_screen).
-        // A restored alt buffer must discard scrolled-off lines exactly like the
-        // live one; giving it a 1000-line ring let it accrue phantom history that
-        // the source never had, and diverged from the live engine on re-checkpoint.
+        // The alternate screen keeps no scrollback (as `enter_alternate_screen`): a
+        // ring would accrue history the source never had and diverge on re-checkpoint.
         Grid::with_scrollback(rows, cols, 0)
     } else {
         let mut scrollback = Scrollback::with_defaults();
@@ -1600,7 +1500,7 @@ mod tests {
         // Sanity: the colour and shell projections are non-trivial.
         assert_eq!(c0.color.palette.len(), 2, "two OSC 4 overrides");
         assert!(c0.color.foreground.is_some() && c0.color.cursor.is_some());
-        assert_eq!(c0.color.stack.len(), 1, "one XTPUSHCOLORS entry");
+        assert_eq!(c0.color.stack_overrides.len(), 1, "one XTPUSHCOLORS entry");
         assert_eq!(c0.shell.command_marks.len(), 1, "one finished command");
         assert!(
             c0.shell.current_block.is_some(),
@@ -1610,10 +1510,8 @@ mod tests {
         let h = Terminal::from_checkpoint(&c0);
         let c1 = h.checkpoint();
 
-        // (A) re-checkpoint equality — the ship gate.
         assert_eq!(c0, c1, "re-checkpoint equality (c0 == c1)");
 
-        // (B) rendered content equality.
         assert_eq!(
             t.visible_content(),
             h.visible_content(),
@@ -1623,10 +1521,8 @@ mod tests {
             assert_eq!(t.row_text(r), h.row_text(r), "row_text equal for row {r}");
         }
 
-        // cursor equality.
         assert_eq!(t.cursor(), h.cursor(), "cursor equal");
 
-        // scroll region + modes + charset equality.
         assert_eq!(
             t.grid().scroll_region(),
             h.grid().scroll_region(),
@@ -1782,10 +1678,8 @@ mod tests {
 
     #[test]
     fn checkpoint_post_hydration_styled_write_matches() {
-        // Proves the writer caches were correctly rebuilt: a styled write on
-        // both the source and the hydrated terminal must produce identical
-        // cells. (If from_checkpoint had left the caches or the BCE cursor
-        // template unrebuilt, the hydrated write would diverge.)
+        // The writer caches and the BCE cursor template are rebuilt: a styled
+        // write on the source and the hydrated terminal produces identical cells.
         let (rows, cols) = (10u16, 30u16);
         let mut t = build_rich_terminal(rows, cols);
         let c0 = t.checkpoint();
@@ -1945,13 +1839,9 @@ mod tests {
 
     #[test]
     fn restored_alt_screen_accrues_no_scrollback_when_scrolled() {
-        // #5 behavioral proof: a restored ALT screen must accrue NO scrollback
-        // when scrolled, exactly like a live alt screen. The bug this guards is a
-        // restored alt buffer handed a 1000-line ring — re-checkpoint identity
-        // alone cannot see it (the captured bytes never carry alt scrollback),
-        // so we must actually scroll the restored buffer and compare to the live
-        // engine. With a phantom 1000-ring the restored buffer would diverge from
-        // `replay_from_checkpoint_matches_live_engine` the moment it scrolls.
+        // A restored alt screen accrues no scrollback when scrolled, like a live
+        // one. Re-checkpoint identity alone cannot see a ring on it (the captured
+        // bytes never carry alt scrollback), so both are scrolled and compared.
         let (rows, cols) = (6u16, 16u16);
         let mut t = Terminal::new(rows, cols);
         t.process(b"\x1b[?1049h"); // enter alt screen (active grid = alt, 0-ring)
@@ -2070,12 +1960,9 @@ mod tests {
         assert!(!closed.modes().synchronized_output());
     }
 
-    /// The engine states output still queued relies on that are in flight: an
-    /// open OSC 8 link and a VT52 `ESC Y` waiting for its address bytes.
-    /// `output_state_in_flight` names each while it is pending and neither
-    /// once it is done. The checkpoint carries each, on both restore paths
-    /// (round eight of the update audit, finding 502); the capture still asks
-    /// the predicate for a successor older than that carry.
+    /// `output_state_in_flight` names an open OSC 8 link and a VT52 `ESC Y` waiting
+    /// for its address bytes while pending, and neither once done; the checkpoint
+    /// carries each on both restore paths.
     #[test]
     fn output_state_in_flight_names_an_open_link_and_a_pending_vt52_address() {
         let mut t = Terminal::new(4, 20);
@@ -2277,28 +2164,17 @@ mod tests {
         assert_eq!(twin.checkpoint_carry(0).expect("Ground"), cp);
     }
 
-    /// A HOOKED DCS STRING RIDES THE CARRY unless it is a query (round eight
-    /// of the update audit, finding 57). Every hooked string used to be
-    /// uncarried, so a tab streaming sixel frames, or one behind a tmux that
-    /// wraps output in passthrough strings, missed every park over queued
-    /// output and held the update for as long as the stream ran.
+    /// A hooked DCS string rides the carry unless it is a query:
     ///
-    /// * A string the engine only consumes (a tmux passthrough wrapper, tmux
-    ///   control mode, a kitty remote-control command) is carried as one to
-    ///   ignore, and loses NOTHING: the restored engine reads the queued tail —
-    ///   the wrapper's doubled ESC breaking into the inner sequence, UTF-8 in
-    ///   the payload and an 8-bit ST included — exactly as the live one does,
-    ///   so it is not named as swallowed.
-    /// * A sixel string is carried the same way, and named as a swallowed
-    ///   PICTURE: its tail is swallowed rather than printed as text, whichever
-    ///   ST ends it, and the stream's next frame replaces the one picture lost.
-    /// * A query (DECRQSS) stays uncarried: its reply would be lost
+    /// * a string the engine only consumes (a tmux passthrough wrapper, tmux control
+    ///   mode, a kitty remote-control command) is carried as one to ignore and loses
+    ///   nothing: the restored engine reads the queued tail (the wrapper's doubled
+    ///   ESC breaking into the inner sequence, UTF-8 in the payload, an 8-bit ST)
+    ///   exactly as the live one does, so it is not named as swallowed;
+    /// * a sixel string is carried the same way and named a swallowed picture: its
+    ///   tail is swallowed, whichever ST ends it, and the next frame replaces it;
+    /// * a query (DECRQSS) stays uncarried, as its reply would be lost
     ///   ([`a_hooked_dcs_query_is_carried_by_abandoning_it`]).
-    ///
-    /// The UTF-8 and 8-bit-ST tails were RED with the first carried form,
-    /// `DcsIgnore` (the review of round eight's fix): the tmux control-mode
-    /// line printed `\u{fffd} \u{276f} ls` and `%end`, the kitty command
-    /// `\u{fffd}llo"}`, and a string ended by `0x9C` swallowed `after`.
     #[test]
     fn a_hooked_dcs_rides_the_carry_unless_it_is_a_query() {
         let consumed: [(&[u8], &[u8]); 4] = [
@@ -2378,14 +2254,12 @@ mod tests {
         assert!(query.checkpoint_carry(0).is_none());
     }
 
-    /// A STRING HOLDING A CHARACTER WITH 0x9C IN IT IS SWALLOWED WHOLE, LIVE
-    /// AND ACROSS A HANDOFF SPLIT INSIDE THAT CHARACTER. U+672C 本 is
-    /// `E6 9C AC`, and with C1 controls off a DCS or APC string ends at the
-    /// 8-bit ST `0x9C`: a tmux passthrough line, a tmux control-mode line or a
-    /// kitty command carrying 本 used to end there, and the rest printed as
-    /// text. Now that `0x9C` is the character's byte; and a carry taken
-    /// between `E6` and `9C` holds the character's head, through the meta wire,
-    /// so the successor swallows the rest of the string as the live engine does.
+    /// A string holding a character with a `0x9C` byte is swallowed whole, live and
+    /// across a handoff split inside that character: U+672C 本 is `E6 9C AC`, and with
+    /// C1 controls off a DCS or APC string ends at the 8-bit ST `0x9C`, so the byte
+    /// must read as the character's. A carry taken between `E6` and `9C` holds the
+    /// head through the meta wire, so the successor swallows the rest as the live
+    /// engine does.
     #[test]
     fn a_string_with_a_0x9c_inside_a_character_is_swallowed_live_and_carried() {
         let strings: [(&[u8], &str); 4] = [
@@ -2431,14 +2305,12 @@ mod tests {
         }
     }
 
-    /// Every non-Ground state the parser can be parked in is carried — whole
-    /// (a DCS header among them, since 2026-10-10), or (an SOS/PM/APC string)
-    /// as a string to ignore to its terminator, a hooked DCS string whose
-    /// handler keeps nothing or holds a picture among them — except a hooked
-    /// DCS query, which is abandoned and named. None of them trips
-    /// `checkpoint_bounded`'s Ground `debug_assert` (these tests run with debug
-    /// assertions on, so a path through it would panic here), and each
-    /// restored carry re-projects to itself.
+    /// Every non-Ground state the parser can be parked in is carried, whole (a DCS
+    /// header among them) or as a string to ignore to its terminator (SOS/PM/APC, and
+    /// a hooked DCS string whose handler keeps nothing or holds a picture), except a
+    /// hooked DCS query, which is abandoned and named. None trips
+    /// `checkpoint_bounded`'s Ground `debug_assert` (tests run with debug assertions,
+    /// so a path through it panics), and each restored carry re-projects to itself.
     #[test]
     fn every_partial_parser_state_is_carried_and_named() {
         let partials: [(&[u8], &str, Option<&str>); 13] = [
@@ -2500,9 +2372,9 @@ mod tests {
         }
     }
 
-    /// On a Ground parser the abandoning carry IS the ordinary carry — so a
-    /// producer can call it unconditionally without changing a healthy desk's
-    /// bytes (and so the adoption digest of every healthy carry is unchanged).
+    /// On a Ground parser the abandoning carry is the ordinary carry, so a producer
+    /// can call it unconditionally without changing a healthy carry's bytes (or its
+    /// adoption digest).
     #[test]
     fn the_abandoning_carry_of_a_ground_parser_is_the_ordinary_carry() {
         let t = build_rich_terminal(12, 40);
@@ -2710,6 +2582,20 @@ mod tests {
         plain.shell_integration_rev = None;
         adopted.restore_checkpoint(&plain);
         assert_eq!(adopted.shell_integration_rev(), Some(rev_b));
+
+        // The OTHER restore door agrees: `from_checkpoint` installs the carried
+        // rev too (it used to drop it), and a carry naming none yields the fresh
+        // engine's None.
+        assert_eq!(
+            Terminal::from_checkpoint(&carry).shell_integration_rev(),
+            Some(rev_b),
+            "from_checkpoint installs the carried rev"
+        );
+        assert_eq!(
+            Terminal::from_checkpoint(&plain).shell_integration_rev(),
+            None,
+            "from_checkpoint of a carry naming none has none"
+        );
     }
 
     /// A re-key the shell has not taken yet: the key verifies marks at once,
@@ -2771,13 +2657,11 @@ mod tests {
         );
     }
 
-    /// A typed re-key (healing a shell spawned before the re-key channel,
-    /// whose key rides a one-use file a typed line reads) is the channel's key
-    /// plus a way back. Taken back, it authorizes nothing and the prior
-    /// authorization stands again (a shell with no nonce has none, so a mark
-    /// signed with the withdrawn key is dropped). Settled, it stays pending
-    /// until its first mark, like the channel's key, and can no longer be
-    /// taken back. Once a mark carried it, neither verb moves it.
+    /// A typed re-key (healing a shell spawned before the re-key channel, its key on
+    /// a one-use file a typed line reads) is the channel's key plus a way back. Taken
+    /// back, it authorizes nothing and the prior authorization stands again; settled,
+    /// it stays pending until its first mark and can no longer be taken back; once a
+    /// mark carried it, neither verb moves it.
     #[test]
     fn a_typed_rekey_is_taken_back_until_the_shell_reads_it() {
         let key = [0x4Du8; 32];
@@ -2921,8 +2805,8 @@ mod tests {
         assert_eq!(rebuilt.checkpoint(), t.checkpoint());
         assert_eq!(rebuilt.title(), "vim main.rs");
 
-        // A checkpoint that carried NO title (an older producer) leaves the
-        // adopting engine's own alone — what the host may have seeded stays.
+        // A checkpoint that carried no title (an older producer) leaves the
+        // adopting engine's own, which the host may have seeded.
         let mut untitled = carry.clone();
         untitled.title = None;
         let mut seeded = Terminal::new(4, 20);

@@ -129,8 +129,7 @@ fn composite_tray_src_over_and_clamps() {
     let mut fb2 = vec![0x0012_3456u32; 1];
     composite_tray(&mut fb2, 1, 1, &card(vec![0xFF, 0xFF, 0xFF, 0x00], 0, 0));
     assert_eq!(fb2[0], 0x0012_3456);
-    // Half alpha over black → ~half the source per channel (rounded). Dst is 0, so
-    // the src-over reduces to `(s*a + 127) / 255`.
+    // Half alpha over black: src-over reduces to `(s*a + 127) / 255` per channel.
     let mut fb3 = vec![0u32; 1];
     composite_tray(&mut fb3, 1, 1, &card(vec![0xFF, 0x00, 0x80, 0x80], 0, 0));
     let exp = |s: u32, a: u32| (s * a + 127) / 255;
@@ -217,7 +216,7 @@ fn border_is_accent_heavy_interior_is_faint() {
     assert!(drop_border_px(w, h) >= 2);
 }
 
-/// Degenerate dimensions and a no-window case are no-ops, never panics.
+/// Zero dimensions are a no-op, never a panic.
 #[test]
 fn zero_dims_is_noop() {
     let mut px = vec![0x0011_2233u32; 4];

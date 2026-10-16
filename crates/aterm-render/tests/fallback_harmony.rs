@@ -361,8 +361,8 @@ fn materialized_ambiguous_spans_coexist_and_combining_stays_zero_width() {
 
     let primary_bytes = display_face_bytes("pixel").expect("bundled primary");
     let fallback_bytes = embedded_font();
-    let primary_face = ttf_parser::Face::parse(primary_bytes, 0).expect("primary parses");
-    let fallback_face = ttf_parser::Face::parse(fallback_bytes, 0).expect("fallback parses");
+    let primary_face = aterm_font::Face::parse(primary_bytes, 0).expect("primary parses");
+    let fallback_face = aterm_font::Face::parse(fallback_bytes, 0).expect("fallback parses");
     let covered_only_by_fallback = |ch: char| {
         primary_face.glyph_index(ch).is_none() && fallback_face.glyph_index(ch).is_some()
     };
@@ -606,7 +606,8 @@ fn ct_probe_is_total_and_sound() {
         .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
         .collect();
     assert!(!ct_face_can_render(&junk, 0, 'M'), "pseudo-random blob");
-    if let Ok(menlo) = std::fs::read("/System/Library/Fonts/Menlo.ttc") {
+    let menlo = std::fs::read("/System/Library/Fonts/Menlo.ttc").expect("macOS ships Menlo.ttc");
+    {
         for cut in [1usize, 12, 256, 4096, menlo.len() / 2] {
             assert!(
                 !ct_face_can_render(&menlo[..cut.min(menlo.len())], 0, 'M') || cut >= menlo.len(),
@@ -620,22 +621,57 @@ fn ct_probe_is_total_and_sound() {
             "face index out of range"
         );
         // Non-vacuity: the real face IS accepted for a covered char and
-        // rejected for an uncovered one (cmap duty via ttf-parser).
+        // rejected for an uncovered one (cmap duty via aterm-font).
         assert!(ct_face_can_render(&menlo, 0, 'M'), "Menlo must accept 'M'");
         assert!(
             !ct_face_can_render(&menlo, 0, '\u{FFFF}'),
             "a permanent noncharacter has no glyph"
         );
-    } else {
-        eprintln!("SKIP: Menlo.ttc not readable");
     }
     // Colour-bitmap glyphs are rejected (the mono resolver's contract).
-    if let Ok(emoji) = std::fs::read("/System/Library/Fonts/Apple Color Emoji.ttc") {
-        assert!(
-            !ct_face_can_render(&emoji, 0, '\u{1F600}'),
-            "a colour-bitmap glyph must not pass the MONO drawability probe"
-        );
-    }
+    let emoji = std::fs::read("/System/Library/Fonts/Apple Color Emoji.ttc")
+        .expect("macOS ships Apple Color Emoji");
+    assert!(
+        !ct_face_can_render(&emoji, 0, '\u{1F600}'),
+        "a colour-bitmap glyph must not pass the MONO drawability probe"
+    );
+}
+
+/// A checked-in face's bytes, for tests whose subject is the fallback lane's
+/// law rather than the faces this host happens to have.
+fn asset(rel: &str) -> Vec<u8> {
+    let path = format!("{}/assets/{rel}", env!("CARGO_MANIFEST_DIR"));
+    std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e}"))
+}
+
+/// A renderer on the checked-in Cascadia Mono (no long arrows, no `⚠`) with
+/// `fallback` injected as its broad tier.
+fn cascadia_with_fallback(px: f32, fallback: &str) -> aterm_render::Renderer {
+    let mut r = aterm_render::Renderer::from_bytes(
+        &asset("bundled/CascadiaMonoPL-Regular.ttf"),
+        px,
+        aterm_render::Theme::default(),
+    )
+    .expect("Cascadia Mono builds a renderer");
+    r.set_fallback_bytes(&asset(fallback))
+        .expect("the fallback face parses");
+    r
+}
+
+/// Whether a candidate file this host has maps `ch` in some face of its
+/// collection: a host fact read from the files, never from the renderer.
+fn a_candidate_file_maps(paths: &[String], ch: char) -> bool {
+    paths.iter().any(|p| {
+        std::fs::read(p).is_ok_and(|bytes| {
+            let faces = aterm_font::fonts_in_collection(&bytes).unwrap_or(1);
+            (0..faces).any(|i| {
+                aterm_font::Face::parse(&bytes, i)
+                    .ok()
+                    .and_then(|f| f.glyph_index(ch))
+                    .is_some_and(|g| g.0 != 0)
+            })
+        })
+    })
 }
 
 // ---- end-to-end regression pins (real renderer) ----
@@ -643,12 +679,22 @@ fn ct_probe_is_total_and_sound() {
 /// A wide CJK glyph resolved through the fallback chain: (i) its coverage
 /// rows sit inside the cell row band (the W8 clip, pinned on the REAL raster
 /// under both backends), and (ii) its advance is the full 2-cell box (the
-/// centring recipe). Skips gracefully on a host with no system font.
+/// centring recipe). A host whose candidate files carry no ideograph could not
+/// run it.
 #[test]
 fn cjk_fallback_glyph_is_banded_and_wide() {
     use aterm_render::{FaceId, GlyphClass, Renderer, Theme};
+    let candidates = ['\u{4E2D}', '\u{4E00}', '\u{4E01}', '\u{53E3}']; // 中 一 丁 口
     let mut r = Renderer::from_system(16.0, Theme::default())
         .expect("no font: build with aterm-render's default embedded-font feature");
+    if !candidates
+        .iter()
+        .any(|&c| a_candidate_file_maps(r.debug_fallback_candidate_paths(), c))
+    {
+        aterm_spec::host::could_not_run(
+            "no fallback candidate file on this host maps an ideograph",
+        );
+    }
     // Without this, `glyph_key` answers while the fallback parse is still in
     // flight and PROVISIONALLY routes every candidate to the primary — which
     // made the skip guard below fire on every host, i.e. the test always
@@ -663,17 +709,12 @@ fn cjk_fallback_glyph_is_banded_and_wide() {
         // Any wide ideograph the FALLBACK chain serves will do — the law under
         // test is the tier's, not one codepoint's. Hard-coding 中 made this
         // test vacuous on hosts whose primary collection covers it (this very
-        // machine: 中 resolves to the primary, 一 to Arial Unicode), and a
-        // guard that skips on the developer's own machine guards nothing.
-        let candidates = ['\u{4E2D}', '\u{4E00}', '\u{4E01}', '\u{53E3}']; // 中 一 丁 口
-        let Some(key) = candidates
+        // machine: 中 resolves to the primary, 一 to Arial Unicode).
+        let key = candidates
             .iter()
             .map(|&c| r.glyph_key(c))
             .find(|k| k.source == FaceId::Fallback && k.glyph_class == GlyphClass::Mono)
-        else {
-            eprintln!("SKIP: no wide ideograph served by the fallback chain on this host");
-            return;
-        };
+            .expect("a candidate file maps an ideograph, so the chain serves one");
         assert_eq!(key.cell_span, 2, "a true CJK scalar defaults to two cells");
         let baseline = r.baseline();
         let (cell_w, _) = r.cell_size();
@@ -717,22 +758,19 @@ fn cjk_fallback_glyph_is_banded_and_wide() {
 
 /// A bare warning sign is text-presentation and occupies one terminal cell.
 /// Proportional fallback faces must not let its square symbol ink spill into
-/// the following cell (the visible `⚠ MCP` kerning regression).
+/// the following cell (the visible `⚠ MCP` kerning regression). Over the
+/// checked-in Noto Sans Symbols 2, a proportional face whose `⚠` is wider than
+/// a cell.
 #[test]
 fn narrow_fallback_symbol_is_bounded_to_one_cell() {
-    use aterm_render::{FaceId, GlyphClass, Renderer, StyleBits, Theme};
-    let mut r = Renderer::from_system(16.0, Theme::default())
-        .expect("no font: build with aterm-render's default embedded-font feature");
-    r.debug_block_on_lazy_fallbacks();
+    use aterm_render::{FaceId, GlyphClass, StyleBits};
+    let mut r = cascadia_with_fallback(16.0, "bundled/NotoSansSymbols2-Regular.ttf");
     let key = r.glyph_key('\u{26A0}');
-    if !matches!(
-        key.source,
-        FaceId::Fallback | FaceId::SymbolFallback | FaceId::RuntimeFallback
-    ) || key.glyph_class != GlyphClass::Mono
-    {
-        eprintln!("SKIP: warning sign is not served by a mono fallback face: {key:?}");
-        return;
-    }
+    assert_eq!(
+        (key.source, key.glyph_class),
+        (FaceId::Fallback, GlyphClass::Mono),
+        "the injected face serves the warning sign"
+    );
     assert_eq!(key.cell_span, 1, "bare U+26A0 must stay one cell");
     let (cell_w_usize, cell_h) = r.cell_size();
     let cell_w = cell_w_usize as i32;
@@ -825,15 +863,11 @@ fn narrow_fallback_symbol_is_bounded_to_one_cell() {
 /// macOS native-CJK routing (W8): with the stock candidate list, the chain
 /// face that covers 中 is the native CJK design (Hiragino Sans GB), not Arial
 /// Unicode — while a char Hiragino lacks still lands on the broad face
-/// (additive tier, no coverage lost). Skips when the host lacks the faces.
+/// (additive tier, no coverage lost).
 #[test]
 #[cfg(target_os = "macos")]
 fn native_cjk_face_leads_the_macos_chain() {
     use aterm_render::{Renderer, Theme};
-    if !std::path::Path::new("/System/Library/Fonts/Hiragino Sans GB.ttc").exists() {
-        eprintln!("SKIP: Hiragino Sans GB not installed");
-        return;
-    }
     let mut r = Renderer::from_system(16.0, Theme::default())
         .expect("no font: build with aterm-render's default embedded-font feature");
     let pick = r.debug_fallback_pick_path('\u{4E2D}');
@@ -843,14 +877,12 @@ fn native_cjk_face_leads_the_macos_chain() {
         "中 must come from the native CJK chain face"
     );
     // Additive tier: Arabic (which Hiragino lacks) still reaches the broad face.
-    if std::path::Path::new("/System/Library/Fonts/Supplemental/Arial Unicode.ttf").exists() {
-        let arabic = r.debug_fallback_pick_path('\u{0645}'); // م
-        assert_eq!(
-            arabic.as_deref(),
-            Some("/System/Library/Fonts/Supplemental/Arial Unicode.ttf"),
-            "the broad face must still back the chain"
-        );
-    }
+    let arabic = r.debug_fallback_pick_path('\u{0645}'); // م
+    assert_eq!(
+        arabic.as_deref(),
+        Some("/System/Library/Fonts/Supplemental/Arial Unicode.ttf"),
+        "the broad face must still back the chain"
+    );
 }
 
 /// T5. THE REGRESSION PIN for the reported defect. U+27F5..U+27FC are ONE
@@ -864,60 +896,62 @@ fn native_cjk_face_leads_the_macos_chain() {
 /// Asserts the display-face law `tests/display_faces.rs` already enforces for
 /// bundled faces, now extended to the fallback lane: the coverage lies wholly
 /// inside the cell box. Run under `debug_force_fontdue` too, so the guarantee
-/// is not a CoreText accident. NON-VACUITY: at least one of the eight must
-/// actually have been condensed (its width pinned to exactly `cell_w`), or
-/// the test would pass silently on a host whose raster was already narrow.
+/// is not a CoreText accident. Over this host's chain and over the checked-in
+/// Noto Sans Math, which maps all eight, so the law is checked on every host.
+/// NON-VACUITY: at least one of the eight must actually have been condensed
+/// (its width pinned to exactly `cell_w`), or the test would pass silently on
+/// a build whose raster was already narrow.
 #[test]
 fn long_arrows_never_leave_their_cell() {
     use aterm_render::{FaceId, GlyphClass, Renderer, Theme};
     let mut checked = 0u32;
     let mut condensed = 0u32;
     for px in [12.0f32, 16.0, 24.0] {
-        let mut r = Renderer::from_system(px, Theme::default())
+        let mut host = Renderer::from_system(px, Theme::default())
             .expect("no font: build with aterm-render's default embedded-font feature");
-        r.debug_block_on_lazy_fallbacks();
-        for force_fontdue in [false, true] {
-            if force_fontdue {
-                r.debug_force_fontdue();
-            }
-            let (cell_w, _) = r.cell_size();
-            for ch in '\u{27F5}'..='\u{27FC}' {
-                let key = r.glyph_key(ch);
-                if !matches!(
-                    key.source,
-                    FaceId::Fallback | FaceId::SymbolFallback | FaceId::RuntimeFallback
-                ) || key.glyph_class != GlyphClass::Mono
-                {
-                    continue;
+        host.debug_block_on_lazy_fallbacks();
+        let fixed = cascadia_with_fallback(px, "bundled/NotoSansMath-Regular.ttf");
+        for mut r in [host, fixed] {
+            for force_fontdue in [false, true] {
+                if force_fontdue {
+                    r.debug_force_fontdue();
                 }
-                let img = r.glyph_image(key);
-                if img.width() == 0 || img.height() == 0 {
-                    continue; // no glyph on this host / this backend
-                }
-                assert!(
-                    img.bytes().iter().any(|&c| c > 0),
-                    "U+{:04X} condensed to blank coverage (px={px} force_fontdue={force_fontdue})",
-                    ch as u32
-                );
-                assert!(
-                    img.xmin() >= 0 && img.xmin() + img.width() as i32 <= cell_w as i32,
-                    "U+{:04X} paints outside its cell: xmin={} w={} cell_w={cell_w} \
+                let (cell_w, _) = r.cell_size();
+                for ch in '\u{27F5}'..='\u{27FC}' {
+                    let key = r.glyph_key(ch);
+                    if !matches!(
+                        key.source,
+                        FaceId::Fallback | FaceId::SymbolFallback | FaceId::RuntimeFallback
+                    ) || key.glyph_class != GlyphClass::Mono
+                    {
+                        continue;
+                    }
+                    let img = r.glyph_image(key);
+                    if img.width() == 0 || img.height() == 0 {
+                        continue; // no glyph on this host / this backend
+                    }
+                    assert!(
+                        img.bytes().iter().any(|&c| c > 0),
+                        "U+{:04X} condensed to blank coverage (px={px} force_fontdue={force_fontdue})",
+                        ch as u32
+                    );
+                    assert!(
+                        img.xmin() >= 0 && img.xmin() + img.width() as i32 <= cell_w as i32,
+                        "U+{:04X} paints outside its cell: xmin={} w={} cell_w={cell_w} \
                      (px={px} force_fontdue={force_fontdue})",
-                    ch as u32,
-                    img.xmin(),
-                    img.width()
-                );
-                checked += 1;
-                if img.width() == cell_w {
-                    condensed += 1;
+                        ch as u32,
+                        img.xmin(),
+                        img.width()
+                    );
+                    checked += 1;
+                    if img.width() == cell_w {
+                        condensed += 1;
+                    }
                 }
             }
         }
     }
-    if checked == 0 {
-        eprintln!("SKIP: no long arrow is served by a fallback tier on this host");
-        return;
-    }
+    assert!(checked > 0, "the checked-in face serves every long arrow");
     assert!(
         condensed > 0,
         "non-vacuity: {checked} arrows checked but none was condensed to the cell width — \

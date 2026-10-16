@@ -1,76 +1,50 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Naming the test a killed `targo test` child was still running.
+//! Reading a `targo test` child's log: the test a killed child was still
+//! running, the tests that failed and whether the machine refused them, the
+//! host services that went silent, and the slowest tests. Pure: `&str` in,
+//! text out.
 //!
-//! WHY (2026-09-16). The gate's aterm-gui test binary sat three hours on
-//! `control::tests::cross_session_paste_reports_a_dead_spill_peer_as_write_failed`
-//! until the wall-clock ceiling killed it, and the TIMEOUT block named only the
-//! argv — `targo --unverified test --workspace --no-fail-fast --tests`, which in
-//! that run spanned 12,976 tests over 218 binaries, of which the one that hung
-//! declared 4,874. The evidence was in the child's own log the whole time:
-//! libtest prints `test <name> has been running for over 60 seconds` for a slow
-//! test and `test <name> ... ok` when it finishes, so a slow test with no
-//! verdict after it is the one still running when the kill landed. This module
-//! reads that out of the log. It is pure (`&str` in, text out), so the shapes
-//! below are pinned by inline fixtures and by
-//! `tests/fixtures/hung-test-stage.log` — a CONSTRUCTED log in the real log's
-//! shapes, with its real names, because a verbatim excerpt cannot be
-//! self-contained (a child section's opening and closing lines sit thousands of
-//! lines apart and four are open at once) and the whole 6,023-line section is
-//! 552 KB. It is std-only string scanning because this crate has no
-//! dependencies on purpose (see Cargo.toml).
+//! When a test hangs until the ceiling kills its binary, the argv alone names
+//! thousands of tests. libtest prints `test <name> has been running for over 60
+//! seconds` for a slow test and `test <name> ... ok` when it finishes, so a
+//! slow test with no verdict after it was still running when the kill landed.
 //!
-//! WHAT LIBTEST ACTUALLY WRITES, read from an upstream libtest source
-//! (nightly-2025-11-13, `library/test/src/formatters/pretty.rs`; the Trust
-//! toolchain this gate runs ships no `rust-src`, and the shapes below are the
-//! ones the 2026-09-16 log exhibits):
+//! What libtest writes (`library/test/src/formatters/pretty.rs`):
 //!
 //! * `write_plain` flushes every fragment, so a multithreaded binary prints a
-//!   verdict as three writes — `test X ... `, `ok`, `\n` — and anything else
-//!   on the same stdout can land between them.
-//! * A binary told to run ONE test on one thread prints `test X ... ` BEFORE
+//!   verdict as three writes (`test X ... `, `ok`, `\n`) and anything else on
+//!   the same stdout can land between them.
+//! * A binary told to run one test on one thread prints `test X ... ` before
 //!   running it and the verdict word later, as a bare `ok` line.
-//! * The slow notice is one write of a whole line, and the name in it is
-//!   bare: `test X - should panic ... ok` carries a mode suffix the notice
-//!   does not.
+//! * The slow notice is one write of a whole line, and its name is bare:
+//!   `test X - should panic ... ok` carries a mode suffix the notice does not.
 //!
-//! That matters here because aterm-gui tests re-exec their own binary with
-//! `--exact` and inherited stdio — 37 such child runs from 21 distinct tests in
-//! that log — so the log is the parent's lines torn by its children's. Four
-//! rules absorb the tears: one the real log forced, three the shapes above make
-//! possible and the fixtures pin.
+//! aterm-gui tests re-exec their own binary with `--exact` and inherited
+//! stdio, so the log is the parent's lines torn by its children's. Four rules
+//! absorb the tears:
 //!
-//! * A VERDICT is `test <name> ... ` immediately followed by the verdict word,
-//!   anywhere in a line; a bare `test C ... ` prefix glued onto the next line is
-//!   not one.
-//! * A slow name is cleared only by a verdict at or after its notice, since a
-//!   child's verdict for the same name printed earlier belongs to an earlier run
-//!   of that test.
-//! * A name is listed once however many notices carry it, because a re-exec
-//!   child that is not held to one thread prints its own.
-//! * WHOSE VERDICT IT IS. A child runs the PARENT'S OWN NAME and the parent
-//!   blocks on it, so a verdict for the hung name is guaranteed to arrive after
-//!   the notice — and crediting it would drop the one name the reader needs. A
-//!   verdict that falls inside a `running 1 test` section which was running that
-//!   same name is the child's, never this run's; the name stays listed and the
-//!   note says a child reported it. Depth alone cannot decide this: the parent
-//!   runs four threads, so several child sections are open at once and a notice
-//!   can be printed inside one while the parent's own verdict for it lands after
-//!   they close. (Found by the review of this module, 2026-09-17: in that log
-//!   8 of the 37 child runs printed their verdict untorn, and one of them —
-//!   `visual_preview_matrix_…` — landed 870 lines before the parent's own for the
-//!   same name.)
+//! * A verdict is `test <name> ... ` immediately followed by the verdict word,
+//!   anywhere in a line; a bare `test C ... ` prefix glued onto the next line
+//!   is not one.
+//! * A slow name is cleared only by a verdict at or after its notice: an
+//!   earlier verdict for the same name belongs to an earlier run of that test.
+//! * A name is listed once however many notices carry it: a re-exec child not
+//!   held to one thread prints its own.
+//! * A verdict inside a `running 1 test` section that was running the same
+//!   name is the child's, never this run's. The child runs the parent's own
+//!   name while the parent blocks on it, so its verdict always follows the
+//!   parent's notice, and crediting it would drop the one name the reader
+//!   needs; the name stays listed and the note says a child reported it. Depth
+//!   cannot decide this: the parent runs several threads, so several child
+//!   sections can be open at once.
 //!
-//! ANCHOR. cargo runs test binaries one at a time even under `--no-fail-fast`,
-//! so the hung binary is the LAST one cargo announced — the last
-//! `     Running <target> (<path>)` or `   Doc-tests <crate>` line — and only
-//! the lines after it are read. A backticked `Running \`…\`` line is a nested
-//! `cargo run` inside a test, not a binary of this run, and does not move it.
-//! Since 2026-09-26 the test stage runs the binaries itself, several at a
-//! time ([`crate::testrun`]), and each one's log is its own, headed by the
-//! `Running` line the gate writes in front of it — so the anchor is that
-//! binary's header, and the note names the one binary that hung.
+//! The test stage runs each binary itself ([`crate::testrun`]), its log headed
+//! by cargo's `     Running <target> (<path>)` (or `   Doc-tests <crate>`)
+//! line. Only the lines after the last such header are read, so the note names
+//! the one binary that hung. A backticked `Running \`…\`` line is a nested
+//! `cargo run` inside a test and does not move the anchor.
 
 use std::collections::BTreeMap;
 
@@ -84,11 +58,10 @@ pub struct Hung {
     pub line: usize,
     /// How many lines the log wrote after that notice.
     pub followed: usize,
-    /// A verdict for this name DID arrive after the notice, but inside a nested
-    /// `running 1 test` section — a re-exec child of this binary running the same
-    /// name. It cannot be this run's verdict (the parent is blocked on that child
-    /// while it runs), so the name is still reported; this says the reader may see
-    /// a verdict for it in the log and should not read that as a contradiction.
+    /// A verdict for this name arrived after the notice, but inside a re-exec
+    /// child's `running 1 test` section running the same name, so it is the
+    /// child's and the name is still reported; the reader may see that verdict
+    /// in the log.
     pub child_verdict: bool,
 }
 
@@ -153,11 +126,44 @@ pub fn ran_no_test(log: &str) -> bool {
     log.lines().any(|l| header(l).is_some()) && !log.lines().any(|l| l.starts_with("test result: "))
 }
 
+/// Why a test target of a selective `targo test` child that exited 0 decided
+/// nothing ([`passed_by_target`] gives it no passed test).
+pub const PASSED_NONE: &str = "not one row passed: the filter selected none (a renamed \
+     module, a lost `--ignored`), so it measured nothing";
+
+/// Each test binary of a `targo test` child's log, in log order: its cargo
+/// target (`tests/paint.rs`, `unittests src/lib.rs`) and the `N passed` of the
+/// last `test result:` line in its section, `None` when it printed none. The
+/// last line is the binary's own: a re-exec child's result prints before its
+/// parent's. Per binary, never summed, so one target that selected nothing
+/// is not hidden by another that passed.
+#[must_use]
+pub fn passed_by_target(log: &str) -> Vec<(String, Option<usize>)> {
+    if log.contains('\x1b') {
+        return passed_by_target(&strip_ansi(log));
+    }
+    let mut out: Vec<(String, Option<usize>)> = Vec::new();
+    for l in log.lines() {
+        if let Some(h) = header(l) {
+            let target = h.split_once(" (").map_or(h.as_str(), |(t, _)| t);
+            out.push((target.to_string(), None));
+        } else if let Some(rest) = l.strip_prefix("test result: ")
+            && let Some((_, counts)) = rest.split_once(". ")
+            && let Some(n) = counts
+                .split_once(" passed")
+                .and_then(|(n, _)| n.trim().parse::<usize>().ok())
+            && let Some(last) = out.last_mut()
+        {
+            last.1 = Some(n);
+        }
+    }
+    out
+}
+
 /// The lines a test binary prints, once each, when a macOS service it needs
 /// did not answer and its tests of it returned without asserting anything
-/// (`aterm_uds::deadline::{SKIPPED, DISK_IMAGE_SKIPPED}`). Included from
-/// aterm-uds's own file, not copied and not a dependency: this crate takes
-/// none (its Cargo.toml).
+/// (`aterm_uds::deadline::{SKIPPED, DISK_IMAGE_SKIPPED}`), included from
+/// aterm-uds's own file.
 pub(crate) mod skipped {
     include!("../../aterm-uds/src/deadline/skipped.rs");
 }
@@ -216,7 +222,7 @@ fn printed(log: &str, line: &str) -> Vec<String> {
     found
 }
 
-/// The test stage's skip rows, ONE per service whose silence any binary named
+/// The test stage's skip rows, one per service whose silence any binary named
 /// ([`WEDGED`]): what ran stays decided, and each row names what did not and
 /// what clears it. Empty when none did.
 #[must_use]
@@ -293,9 +299,9 @@ pub(crate) fn strip_ansi(s: &str) -> String {
     out
 }
 
-/// The name in a bare `test <name> ... ` PREFIX — the first thing libtest writes when
-/// it starts a test under one thread, with or without a verdict word after it. Used to
-/// learn which test a `running 1 test` child was asked to run.
+/// The name in a bare `test <name> ... ` prefix, the first thing libtest writes
+/// when it starts a test under one thread. Names the test a `running 1 test`
+/// child was asked to run.
 fn prefix_in(line: &str) -> Option<&str> {
     let at = line.find(SEP)?;
     let t = line[..at].rfind(TEST)?;
@@ -342,13 +348,9 @@ fn verdicts_in(line: &str) -> Vec<&str> {
 /// wedged compile, say — so the caller adds nothing.
 #[must_use]
 pub fn scan(log: &str) -> Option<Unfinished> {
-    // COLOUR. Nothing in this gate asks cargo or libtest for it — stage children
-    // write to a file, so neither is on a tty — but a caller that exported
-    // `CARGO_TERM_COLOR=always` (or a future lane that does) would put CSI
-    // sequences around every verdict word, and then `test X ... ` would not match,
-    // the header would not parse, and the note would degrade to its worst shape:
-    // no binary, no re-run line, every slow test named. Cheaper to be right: strip
-    // the escapes once, and only when there are any.
+    // Stage children write to a file, so nothing is coloured unless a caller
+    // exports `CARGO_TERM_COLOR=always`; then CSI sequences around the verdict
+    // words and headers would defeat every match below.
     if log.contains('\x1b') {
         return scan(&strip_ansi(log));
     }
@@ -363,26 +365,18 @@ pub fn scan(log: &str) -> Option<Unfinished> {
     let mut slow: Vec<(&str, usize, usize)> = Vec::new();
     // name -> every verdict index, in section indices
     let mut verdict: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
-    // WHOSE VERDICT IS IT. A re-exec child of this binary runs the PARENT'S OWN NAME
-    // (`current_exe --exact <that name> --nocapture`: 21 distinct tests and 37 child
-    // runs in the 2026-09-16 log) and the parent BLOCKS on it, so a verdict for the
-    // hung name is guaranteed to arrive after the parent's slow notice — and crediting
-    // it would drop the one name the reader needs. Depth alone cannot tell them apart:
-    // the parent runs four threads, so several child sections are open at once and a
-    // notice can be printed inside one (the log's byline notice is, at depth 2) while
-    // the parent's own verdict for it lands after they close (depth 1). What does tell
-    // them apart is the window: a verdict for name X that falls INSIDE a child section
-    // running X is that child's, never this run's. Each `running 1 test` opens such a
-    // section, its name is the first test-prefix printed after it, and a `test result:`
-    // with a non-zero `filtered out` closes the oldest one still open.
+    // Re-exec child sections, whose verdicts are never this run's (module doc):
+    // each `running 1 test` opens one, the first test prefix after it names it,
+    // and a `test result:` with a non-zero `filtered out` closes the oldest one
+    // still open.
     let mut children: Vec<(usize, Option<usize>, Option<&str>)> = Vec::new();
     for (i, line) in lines[start..].iter().enumerate() {
         if let Some(n) = declared_in(line) {
             runs += 1;
             declared.get_or_insert(n);
-            // The binary's OWN run is the first `running N` after the header — and it
-            // declares 1 when the caller filtered to one test, which is exactly what a
-            // child looks like. Only the runs after it can be children.
+            // The binary's own run is the first `running N`, and it declares 1
+            // when the caller filtered to one test, so only later runs can be
+            // children.
             if n == 1 && runs > 1 {
                 children.push((i, None, None));
             }
@@ -394,9 +388,8 @@ pub fn scan(log: &str) -> Option<Unfinished> {
             }
         }
         let names = verdicts_in(line);
-        // The child's own name is the first test-prefix after its `running 1 test`,
-        // whether or not a verdict word follows it on that line (a torn prefix is the
-        // common shape).
+        // The child's name is the first test prefix after its `running 1 test`,
+        // with or without a verdict word after it (a torn prefix is common).
         if let Some(name) = prefix_in(line)
             && let Some(open) = children
                 .iter_mut()
@@ -455,8 +448,8 @@ pub fn scan(log: &str) -> Option<Unfinished> {
 }
 
 /// One timed verdict: `test <name> ... <word> <1.234s>`, the shape libtest
-/// prints under `-Zunstable-options --report-time` (the test run's arguments
-/// since 2026-09-28, `stages::LIBTEST_REPORT_TIME`).
+/// prints under `-Zunstable-options --report-time` (the test run's arguments,
+/// `stages::LIBTEST_REPORT_TIME`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Timed {
     /// Wall seconds libtest measured for the test.
@@ -515,12 +508,10 @@ pub fn timed_verdicts(log: &str) -> Vec<Timed> {
     out
 }
 
-/// The `n` slowest tests of a `--report-time` log, as indented ladder lines —
-/// the per-test long poles inside each binary, which a binary's `finished in`
-/// cannot show. A name timed more than once in one binary (a re-exec child of
-/// it re-running the same test) is listed once, at its longest. `None` when
-/// the log has no timed verdict at all (a run without `--report-time`, or one
-/// that ran nothing).
+/// The `n` slowest tests of a `--report-time` log, as indented ladder lines:
+/// the long poles inside each binary, which its `finished in` cannot show. A
+/// name timed more than once in one binary (a re-exec child re-running it) is
+/// listed once, at its longest. `None` when the log has no timed verdict.
 #[must_use]
 pub fn slowest(log: &str, n: usize) -> Option<String> {
     let all = timed_verdicts(log);
@@ -589,7 +580,7 @@ fn lines_word(n: usize) -> &'static str {
     if n == 1 { "line" } else { "lines" }
 }
 
-/// The note the TIMEOUT block splices in under its `child:` line: indented,
+/// The note `exec`'s TIMEOUT block splices in under its `child:` line: indented,
 /// newline-terminated, or `None` when the log carries no libtest lines at all.
 #[must_use]
 pub fn note(log: &str) -> Option<String> {
@@ -650,44 +641,36 @@ pub fn note(log: &str) -> Option<String> {
     Some(s)
 }
 
-/// The words a test prints when the MACHINE refused it, not the tree: a
-/// previous run's daemons still alive (aterm-link's world harness), a paint
-/// take its own instrument disowns as starved (the probe's exit 3), or a paint
-/// or spin probe that decided nothing (exit 2, since 2026-09-26). A red row
-/// under this sentinel says nothing about the code, so the gate records it as
-/// COULD NOT RUN — the same severity as a full disk — and the receipt says
-/// `verdict COULD-NOT-RUN`, never `FAIL`.
+/// The words a test prints when the machine refused it, not the tree: a
+/// headless boot the OS refused (`crates/aterm/tests/support/headless_boot.rs`),
+/// a host with no GPU adapter (`aterm-gpu`'s test helpers), a paint take its
+/// own instrument disowns as starved, or a paint or spin probe that decided
+/// nothing, among others. A red row under this sentinel says nothing about the
+/// code, so the run records it as COULD NOT RUN, never `FAIL`.
 ///
-/// Producers print it VERBATIM in their panic message, and
-/// `every_producer_prints_the_sentinel_verbatim` below holds each of them to
-/// it, so a reworded producer cannot quietly turn its refusals back into
-/// findings.
+/// Producers print it verbatim in their panic message, most through
+/// `aterm_spec::host::could_not_run` (its `COULD_NOT_RUN` is this string); a
+/// reworded producer turns its refusals into findings, which fails closed.
 pub const COULD_NOT_RUN_SENTINEL: &str = "aterm-gate: COULD NOT RUN";
 
-/// The failed tests in a failed `targo test` child's log, when EVERY failure
-/// carries [`COULD_NOT_RUN_SENTINEL`]; `None` when any failure does not, or
-/// when the log cannot account for every failure.
+/// The failed tests in a failed `targo test` child's log, when every failure
+/// carries [`COULD_NOT_RUN_SENTINEL`]; `None` when any does not, or when the
+/// log cannot account for every failure. A finding must never read as the
+/// machine's fault, so all of this must hold:
 ///
-/// Conservative in the one direction that matters — a finding must never
-/// read as the machine's fault — so all of this must hold:
-///
-/// * at least one `---- <name> stdout ----` block, and every one of them
-///   carries the sentinel;
-/// * the names libtest LISTS under its closing `failures:` are exactly the
-///   names that had a block, counted with multiplicity, so no failure went
-///   unread;
+/// * at least one `---- <name> stdout ----` block, and every one carries the
+///   sentinel;
+/// * the names listed under the closing `failures:` are exactly the names that
+///   had a block, counted with multiplicity;
 /// * every binary cargo reported failed (`error: test failed, to rerun pass`)
-///   printed a `test result: FAILED.` line — a binary that died of a signal
-///   prints no result, and a crash is a finding;
+///   printed a `test result: FAILED.` line: a binary that died of a signal
+///   prints none, and a crash is a finding;
 /// * no binary exited other than libtest's 101 ([`abnormal_exit`]): one that
-///   printed its result and THEN died of a signal is a crash too
-///   (2026-09-27, second review).
+///   printed its result and then died of a signal is a crash too.
 ///
-/// EVERY BLOCK IS ITS OWN FAILURE (2026-09-23). One `--no-fail-fast` log holds
-/// many binaries, and two of them can fail a test of the same bare name — a
-/// refusal in one, a real assertion in the other. Keyed by name, the second
-/// block inherited the first one's sentinel and the finding read as the
-/// machine's; so a block is a position in the log, never a name.
+/// A block is a position in the log, never a name: two binaries of one
+/// `--no-fail-fast` log can fail tests of the same bare name, one a refusal and
+/// one a real assertion.
 #[must_use]
 pub fn environment_refusals(log: &str) -> Option<Vec<String>> {
     if log.contains('\x1b') {
@@ -774,14 +757,12 @@ pub struct FailedTest {
     pub refused: bool,
 }
 
-/// cargo's word that a test binary did NOT exit with libtest's 101: the
-/// `Caused by:` it puts under the re-run line, and the `process didn't exit
-/// successfully: `…` (signal: 11, SIGSEGV)` under that — a signal, another
-/// exit status, a spawn error. cargo prints neither for a 101 (a plain failed
-/// test), so outside a test's own block either one means the binary ended in
-/// something its `test result:` line does not account for: a teardown crash, a
-/// background thread's abort after the summary (2026-09-27, second review —
-/// the crash was in no finding, and the one red it did list was main's).
+/// cargo's word that a test binary did not exit with libtest's 101: the
+/// `Caused by:` under the re-run line, and the `process didn't exit
+/// successfully: … (signal: …)` under that. cargo prints neither for a plain
+/// failed test, so outside a test's own block either means the binary ended in
+/// something its `test result:` line does not account for (a teardown crash, a
+/// background thread's abort after the summary).
 fn abnormal_exit(line: &str) -> bool {
     line.trim_end() == "Caused by:"
         || line
@@ -800,36 +781,30 @@ fn rerun_spec(line: &str) -> Option<&str> {
 }
 
 /// Every failed test in a failed `targo test` child's log, each with the
-/// binary that failed it ([`FailedTest::spec`]) — `None` unless the log
+/// binary that failed it ([`FailedTest::spec`]); `None` unless the log
 /// accounts for every failure, so a failure it cannot name is never dropped
-/// from a list a reader will compare against another run's.
+/// from a list a reader compares against another run's.
 ///
-/// The same accounting [`environment_refusals`] demands, for the same reason:
+/// The accounting [`environment_refusals`] demands, and more:
 ///
-/// * at least one `---- <name> stdout ----` block, and every block is
-///   followed by the `error: test failed, to rerun pass` line of the binary
-///   that printed it (that line is how a block gets its spec);
-/// * the names libtest LISTS under its closing `failures:` are exactly the
-///   blocks' names, counted with multiplicity;
-/// * every binary cargo reported failed printed a `test result: FAILED.`
-///   line. A binary that died of a signal prints none, and a re-exec child
-///   that failed prints a result with no re-run line of its own — both leave
-///   the log unaccounted, and the caller falls back to judging the whole row;
-/// * PER BINARY (2026-09-27): the names listed since the last re-run line are
-///   exactly the blocks read since it, and no `test result:` or re-run line
-///   arrives inside an open block. A test whose own output quotes a nested
-///   cargo log — the gate's contract tests panic with fixture ladders — had its
-///   block cut at the nested re-run line and credited to the nested spec, and
-///   the rest of its message never reached the fingerprint;
-/// * THE CLOSING LIST IS WHOLE (2026-09-27, second review): once a `failures:`
-///   line closes a binary's blocks, only its listed names (four-space
-///   indented), blank lines and its `test result:` may follow. A test whose own
-///   message holds a line reading `failures:` — an oracle's list of failing
-///   cases — had its block closed there, and every line after it that was not
-///   a four-space name fell outside any block: dropped from the fingerprint;
-/// * every binary exited with libtest's 101 ([`abnormal_exit`]): one that
-///   printed its `test result:` and then died of a signal accounted for its
-///   failures, and the crash was in no finding.
+/// * at least one `---- <name> stdout ----` block, each followed by the
+///   `error: test failed, to rerun pass` line of its binary (how a block gets
+///   its spec);
+/// * the names listed under the closing `failures:` are exactly the blocks'
+///   names, counted with multiplicity;
+/// * every binary cargo reported failed printed a `test result: FAILED.` line
+///   (a binary that died of a signal prints none, and a failed re-exec child
+///   prints a result with no re-run line of its own);
+/// * per binary, the names listed since the last re-run line are exactly the
+///   blocks read since it, and no `test result:` or re-run line arrives inside
+///   an open block: a test whose output quotes a nested cargo log (this crate's
+///   contract tests panic with fixture ladders) would otherwise have its block
+///   cut and credited to the nested spec;
+/// * once a `failures:` line closes a binary's blocks, only its listed names
+///   (four-space indented), blank lines and its `test result:` follow: a test
+///   whose message holds a `failures:` line would otherwise have its block
+///   closed there;
+/// * every binary exited with libtest's 101 ([`abnormal_exit`]).
 #[must_use]
 pub fn failed_tests(log: &str) -> Option<Vec<FailedTest>> {
     if log.contains('\x1b') {
@@ -955,9 +930,47 @@ mod tests {
         u.hung.iter().map(|h| h.name.as_str()).collect()
     }
 
-    /// A silent `trustd` (2026-10-06: nine binaries printed aterm-uds's line
-    /// and the run still claimed the merge contract): each binary that printed
-    /// it is named once, by crate and target, and a log without it names none.
+    /// Each binary is read on its own, coloured or not: a target whose rows were
+    /// all ignored or filtered out passed none even beside one that passed, a
+    /// re-exec child's result is not its parent's, and a binary with no result
+    /// line is `None`.
+    #[test]
+    fn passed_is_read_per_target_never_summed() {
+        let line = |verdict: &str, passed: usize, ignored: usize| {
+            format!(
+                "test result: {verdict}. {passed} passed; 0 failed; {ignored} ignored; 0 measured; \
+                 0 filtered out; finished in 0.01s\n"
+            )
+        };
+        let paint = "     Running tests/paint.rs (target/debug/deps/paint-1a)\n";
+        let spin = "     Running tests/spin.rs (target/debug/deps/spin-2b)\n";
+        let t = |name: &str, n: Option<usize>| (name.to_string(), n);
+        let one_empty = format!("{paint}{}{spin}{}", line("ok", 0, 23), line("ok", 2, 0));
+        assert_eq!(
+            passed_by_target(&one_empty),
+            [t("tests/paint.rs", Some(0)), t("tests/spin.rs", Some(2))]
+        );
+        let child = format!(
+            "{paint}running 1 test\n{}{}",
+            line("ok", 1, 0),
+            line("FAILED", 0, 0)
+        );
+        assert_eq!(passed_by_target(&child), [t("tests/paint.rs", Some(0))]);
+        assert_eq!(
+            passed_by_target(&format!("{HEADER}running 2 tests\n")),
+            [t("unittests src/lib.rs", None)]
+        );
+        assert_eq!(
+            passed_by_target(&format!(
+                "{spin}test result: \x1b[32mok\x1b[0m. 3 passed; 0 failed; 0 ignored\n"
+            )),
+            [t("tests/spin.rs", Some(3))]
+        );
+        assert!(passed_by_target("").is_empty());
+    }
+
+    /// A silent `trustd`: each binary that printed aterm-uds's line is named
+    /// once, by crate and target, and a log without it names none.
     #[test]
     fn a_binary_that_printed_the_trustd_line_is_named_once() {
         let log = format!(
@@ -985,9 +998,9 @@ mod tests {
         assert!(host_skips(clean).is_empty());
     }
 
-    /// A wedged disk-image service (2026-10-08: `hdiutil create` timed out
-    /// after 121 s and failed the merge gate on a host fault) is its own row,
-    /// beside trustd's, each naming only the binaries that printed its line.
+    /// A wedged disk-image service (`hdiutil create` timing out, a host fault)
+    /// is its own row, beside trustd's, each naming only the binaries that
+    /// printed its line.
     #[test]
     fn a_silent_disk_image_service_is_its_own_row() {
         let log = format!(
@@ -1012,11 +1025,10 @@ mod tests {
         assert!(host_skips(&log).iter().all(|r| is_host_skip(r)));
     }
 
-    /// THE `--report-time` SUFFIX (2026-09-28): a verdict still reads as a
-    /// verdict with `<1.234s>` after its word, and the time is read off it —
-    /// credited to the binary whose header came last, a mode suffix stripped,
-    /// a torn verdict (its word on a later line) not counted, and a re-exec
-    /// child's second timing of the same name kept at the longest.
+    /// A verdict with `<1.234s>` after its word is still a verdict, and the time
+    /// is read off it: credited to the binary whose header came last, mode suffix
+    /// stripped, a torn verdict not counted, and a re-exec child's second timing
+    /// of the same name kept at the longest.
     #[test]
     fn a_report_time_suffix_is_a_verdict_and_a_duration() {
         let log = "     Running unittests src/lib.rs (target/debug/deps/aterm_gui-66ca)\n\
@@ -1144,12 +1156,10 @@ mod tests {
         assert!(!n.contains("still running when killed"), "{n}");
     }
 
-    /// Lifted from the real log (stage27, lines 13505-13535): a one-thread
-    /// re-exec child's `test C ... ` prefix has no newline until C finishes,
-    /// so it is glued onto whatever the parent writes next — here P's whole
-    /// verdict. That is structural, not a one-off: 24 lines of that section
-    /// carry two `test ` prefixes (log line 13510 is the first). The prefix is
-    /// not a verdict for C; P's torn verdict still is one for P.
+    /// A one-thread re-exec child's `test C ... ` prefix has no newline until C
+    /// finishes, so it is glued onto whatever the parent writes next, here P's
+    /// whole verdict. The prefix is not a verdict for C; P's torn verdict still
+    /// is one for P.
     #[test]
     fn a_torn_reexec_child_prefix_is_not_a_verdict_and_a_torn_parent_verdict_still_counts() {
         let mut log = format!(
@@ -1219,8 +1229,7 @@ mod tests {
 
     #[test]
     fn a_verdict_with_a_mode_suffix_clears_the_bare_slow_name() {
-        // libtest's verdict line carries the mode, its slow notice does not
-        // (stage27 lines 11256-11257 are the real `- should panic` shape).
+        // libtest's verdict line carries the mode, its slow notice does not.
         let log = format!(
             "{HEADER}running 1 test\n\
              test a::boom has been running for over 60 seconds\n\
@@ -1265,7 +1274,7 @@ mod tests {
                    \n\
                    running 2 tests\n\
                    test two::fine ... ok\n\
-                   \x20    Running `target/debug/xtask gate forge`\n\
+                   \x20    Running `target/debug/aterm-lab tool`\n\
                    test two::stuck has been running for over 60 seconds\n";
         let u = scan(log).expect("a test binary's section");
         assert_eq!(
@@ -1342,12 +1351,10 @@ mod tests {
         assert_eq!(note(""), None);
     }
 
-    /// tests/fixtures/hung-test-stage.log is a verbatim excerpt of the log of
-    /// the run that hung on 2026-09-15/16 (verify-fast-77cd5cb47, stage 27,
-    /// 15,683 lines): its lines 9660-9668, 11256-11257, 13505-13552,
-    /// 15328-15350 and 15675-15683, with `spec_xref_closure:` and `NOTICE`
-    /// lines (no libtest marker in them) cut at 120 columns. Three tests were
-    /// reported slow; two of them got their verdicts.
+    /// tests/fixtures/hung-test-stage.log is an excerpt of a real hung run's log,
+    /// lines without a libtest marker cut at 120 columns. Three tests were
+    /// reported slow: one's own verdict arrived, one's only verdict was a
+    /// child's, and one got none.
     #[test]
     fn the_real_logs_shapes_name_exactly_the_hung_test() {
         let log = include_str!("../tests/fixtures/hung-test-stage.log");
@@ -1360,7 +1367,7 @@ mod tests {
             ],
             "the byline name's own verdict arrived; the other two never did: {u:?}"
         );
-        // The one whose only verdict was a child's says so; the incident has none at all.
+        // The one whose only verdict was a child's says so; the other has none.
         let flags: Vec<bool> = u.hung.iter().map(|h| h.child_verdict).collect();
         assert_eq!(flags, [true, false], "{u:?}");
         assert_eq!(
@@ -1419,9 +1426,8 @@ mod tests {
         )
     }
 
-    /// THE MACHINE, NOT THE TREE. Every failure in the log carries the
-    /// sentinel, across two binaries, so the child is an environment refusal
-    /// and the names are the ones that refused.
+    /// Every failure, across two binaries, carries the sentinel: the child is an
+    /// environment refusal, named by the tests that refused.
     #[test]
     fn a_log_whose_every_failure_carries_the_sentinel_is_the_machines() {
         let log = format!(
@@ -1448,8 +1454,8 @@ mod tests {
         );
     }
 
-    /// THE NEGATIVE CONTROL: one real finding among the refusals, and the
-    /// whole child is a finding. A refusal may never launder a failure.
+    /// One real finding among the refusals makes the whole child a finding: a
+    /// refusal never launders a failure.
     #[test]
     fn one_failure_without_the_sentinel_makes_the_whole_child_a_finding() {
         let log = failed_binary(
@@ -1468,12 +1474,9 @@ mod tests {
         assert_eq!(environment_refusals(&log), None);
     }
 
-    /// ONE NAME, TWO BINARIES, TWO FAILURES. `boots_a_world` refused in one
-    /// binary and failed a real assertion in a later one: the finding must not
-    /// inherit the refusal's sentinel through the shared name. Keyed by name,
-    /// this log read as the machine's (measured on the pre-fix function). The
-    /// control is the same log with both blocks refused, which is the
-    /// machine's, and names the test once.
+    /// A test that refused in one binary and failed a real assertion in another
+    /// stays a finding: blocks are keyed by position, never by name. The control,
+    /// both blocks refused, is the machine's and names the test once.
     #[test]
     fn a_finding_that_shares_a_refusals_name_in_another_binary_is_still_a_finding() {
         let finding = "thread 't' panicked at x.rs:1:1:\nassertion failed: world.ready()";
@@ -1502,8 +1505,8 @@ mod tests {
         );
     }
 
-    /// A binary that DIED — a signal, an abort — prints no `test result:`, and
-    /// a crash is a finding however politely its siblings refused.
+    /// A binary that died prints no `test result:`, and a crash is a finding
+    /// however its siblings refused.
     #[test]
     fn a_binary_that_died_without_a_result_is_a_finding() {
         let log = format!(
@@ -1516,8 +1519,8 @@ mod tests {
         assert_eq!(environment_refusals(&log), None);
     }
 
-    /// A failure libtest LISTED but printed no block for is a failure nobody
-    /// read, and the sentinel cannot be vouched for.
+    /// A failure libtest listed but printed no block for is unread, so the
+    /// sentinel cannot be vouched for.
     #[test]
     fn a_listed_failure_with_no_block_is_not_accounted_for() {
         let mut log = failed_binary("bridge_e2e", &[("boots_a_world", &refused("strays"))]);
@@ -1531,33 +1534,9 @@ mod tests {
         assert_eq!(environment_refusals(""), None);
     }
 
-    /// THE PRODUCERS, HELD TO THE WORDS. The gate recognises a refusal only by
-    /// [`COULD_NOT_RUN_SENTINEL`], so a producer that rewords its panic turns
-    /// every refusal back into a finding without a line of the gate changing.
-    /// Each file must still carry the sentinel verbatim, once per refusal arm.
-    #[test]
-    fn every_producer_prints_the_sentinel_verbatim() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        for (file, arms) in [
-            ("crates/aterm-link/tests/harness/mod.rs", 1),
-            // Exit 2 (decided nothing) and exit 3 (unproved), 2026-09-26.
-            ("crates/aterm-conformance/tests/paint/measuring.rs", 2),
-            ("crates/aterm-conformance/tests/spin/measuring.rs", 1),
-        ] {
-            let text =
-                std::fs::read_to_string(root.join(file)).unwrap_or_else(|e| panic!("{file}: {e}"));
-            assert_eq!(
-                text.matches(COULD_NOT_RUN_SENTINEL).count(),
-                arms,
-                "{file} must print `{COULD_NOT_RUN_SENTINEL}` in each of its {arms} refusal arm(s)"
-            );
-        }
-    }
-
-    /// EVERY FAILED TEST, WITH THE BINARY THAT FAILED IT. Two binaries, three
-    /// failures, one of them a refusal: each is named with its binary's re-run
-    /// spec and its own block, and the refusal is marked. Two binaries failing
-    /// a test of the same bare name stay two failures with two specs.
+    /// Each failure is named with its binary's re-run spec and its own block, the
+    /// refusal is marked, and two binaries failing a test of the same bare name
+    /// stay two failures with two specs.
     #[test]
     fn a_failed_test_log_names_each_failure_with_its_binarys_rerun_spec() {
         let log = format!(
@@ -1593,8 +1572,7 @@ mod tests {
         assert!(got[1].block.contains("plain failure"), "{:?}", got[1]);
     }
 
-    /// A LOG THAT CANNOT ACCOUNT FOR A FAILURE ITEMIZES NOTHING, so a failure
-    /// the list would miss is never dropped from a comparison: a binary that
+    /// A log that cannot account for a failure itemizes nothing: a binary that
     /// died of a signal (a re-run line with no `test result:`), a block the
     /// closing list does not name, and a block no re-run line claims.
     #[test]
@@ -1621,11 +1599,9 @@ mod tests {
         assert_eq!(failed_tests(""), None);
     }
 
-    /// A TEST THAT QUOTES A NESTED CARGO LOG IS NOT ITEMIZED (2026-09-27): the
-    /// gate's own contract tests panic with fixture ladders, and the nested
-    /// log's result and re-run lines inside the block used to cut it short and
-    /// credit it to the nested spec — whether the nested log is a whole failed
-    /// binary (its own list balances its own block) or only its tail.
+    /// A test that quotes a nested cargo log is not itemized: the nested result
+    /// and re-run lines would cut its block short and credit it to the nested
+    /// spec, whether the quote is a whole failed binary or only its tail.
     #[test]
     fn a_block_that_quotes_a_nested_cargo_log_itemizes_nothing() {
         let nested = failed_binary("inner", &[("x", "\ninner boom")]);
@@ -1653,13 +1629,9 @@ mod tests {
         assert_eq!(failed_tests(&plain).map(|t| t.len()), Some(1));
     }
 
-    /// A `failures:` LINE IN A TEST'S OWN MESSAGE (2026-09-27, second review)
-    /// — an oracle listing the cases that disagreed — closed its block, and
-    /// every line after it that was not a four-space name fell outside every
-    /// block, so a branch adding failing cases hashed as main's. Now anything
-    /// but the closing list's names and its `test result:` after a `failures:`
-    /// that closed blocks leaves the log unaccounted — whether the message's
-    /// list is indented two spaces or four, and whichever block holds it.
+    /// A `failures:` line in a test's own message (an oracle listing the cases
+    /// that disagreed) leaves the log unaccounted rather than closing the block,
+    /// however the message's list is indented and whichever block holds it.
     #[test]
     fn a_failures_line_in_a_message_itemizes_nothing() {
         for cases in ["  case_07: got 3 want 4", "    case_07"] {
@@ -1680,14 +1652,10 @@ mod tests {
         assert!(got[0].block.contains("case_07"), "{:?}", got[0].block);
     }
 
-    /// A BINARY THAT PRINTED ITS RESULT AND THEN DIED (2026-09-27, second
-    /// review): a crash in teardown, or a background thread's abort after the
-    /// summary. Its listed failures balance its blocks, so the log read as
-    /// accounted for and the crash was in no finding. cargo says so under the
-    /// re-run line — `Caused by:` and `process didn't exit successfully: …
-    /// (signal: …)`, as it does for any exit but libtest's 101, and as the
-    /// gate's own test runner writes it — and either line leaves the log
-    /// unaccounted, and no refusal.
+    /// A binary that printed its result and then died (a teardown crash, a
+    /// background thread's abort after the summary) balances its list against
+    /// its blocks, but cargo's `Caused by:` / `process didn't exit successfully`
+    /// lines under the re-run line leave the log unaccounted, and no refusal.
     #[test]
     fn a_binary_that_died_after_its_result_is_not_accounted_for() {
         let one = failed_binary("render", &[("t", "\nknown red")]);

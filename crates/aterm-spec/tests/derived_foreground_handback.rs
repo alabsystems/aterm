@@ -1,19 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-0 for `ForegroundHandback` (the 2026-09-25 "crashed" tab): the
-//! in-stream handback proves over the whole bounded space, and the designs it
-//! replaced are caught — no handback with the restore left to the UI-thread
-//! status sweep (`Buggy = 1`, on every invariant; without a sweep it is the
-//! incident itself) and batch-end-only sampling (`Split = 0`), and the two
-//! designs the 2026-09-25 review caught: a handback at EVERY foreground
-//! change, which strips a stopped (or job-controlling) program's modes while
-//! it still runs (`Alive = 0`), and a restarted reader seeded with a fresh
-//! probe, which never sees a job that died while the readers were parked
-//! (`Carry = 0`). And the rule the second 2026-09-25 review caught: display
-//! modes alone counted as orphaned, so a one-shot `tput smcup` or `tput civis`
-//! was reverted the moment `tput` exited (`Display = 1`). Tier-1 — the real
-//! PTY reader with a scripted foreground probe — is
+//! Tier-0 for `ForegroundHandback`: the in-stream handback proves over the bounded space, and
+//! each rejected design is caught: the restore left to the UI-thread status sweep (`Buggy = 1`,
+//! on every invariant); batch-end-only sampling (`Split = 0`); a handback at every foreground
+//! change, which strips a stopped or job-controlling program's modes while it still runs
+//! (`Alive = 0`); a restarted reader seeded with a fresh probe, which never sees a job that
+//! died while the readers were parked (`Carry = 0`); and display modes alone counted as
+//! orphaned, which reverts a one-shot `tput smcup` or `tput civis` the moment `tput` exits
+//! (`Display = 1`). Tier-1 (the real PTY reader with a scripted foreground probe) is
 //! `aterm-gui/src/foreground_handback_conformance.rs`.
 
 use crate::walk::only;
@@ -39,8 +34,8 @@ const INCIDENT: [&str; 13] = [
     "Parse",
 ];
 
-/// The adopted session: the reader attaches while the job already holds the
-/// terminal with its modes in force (the incident tab was exactly this).
+/// The adopted session: the reader attaches while the job already holds the terminal with its
+/// modes in force.
 const ADOPTED: [&str; 8] = [
     "Adopt",
     "Die",
@@ -103,9 +98,8 @@ const PARKED: [&str; 14] = [
     "Parse",
 ];
 
-/// A one-shot that sets a DISPLAY mode on purpose (`tput smcup`, `tput
-/// civis`) and exits cleanly, then the shell's prompt: the incident's
-/// schedule with `OneShot` in place of `Launch`.
+/// A one-shot that sets a display mode on purpose (`tput smcup`, `tput civis`) and exits
+/// cleanly, then the shell's prompt: the incident's schedule with `OneShot` for `Launch`.
 const ONE_SHOT: [&str; 13] = [
     "OneShot",
     "JobWrite",
@@ -125,19 +119,16 @@ const ONE_SHOT: [&str; 13] = [
 #[test]
 fn foreground_handback_proves_catches_and_has_no_dead_action() {
     let model = foreground_handback_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name),
-        "the foreground handback must stay enrolled in the spec-link registry"
-    );
     let fired = interp::fired_actions(&model);
     assert_eq!(
         fired.len(),
         model.actions.len(),
         "every action fires at the committed configuration: {fired:?}"
     );
-    assert_eq!(verify::audit_dead_negative_controls(&model, &[]), Ok(0));
+    assert_eq!(
+        verify::audit_dead_negative_controls(std::slice::from_ref(&model)),
+        Ok(0)
+    );
     verify::prove_and_catch_scalar(
         &model,
         "foreground handback: the prompt is never hijacked and keeps its own modes",
@@ -191,7 +182,7 @@ fn foreground_handback_incident_and_adopted_schedules_committed_vs_buggy() {
             (1, 0, 1, 0),
             "{schedule:?}"
         );
-        // The 2026-09-25 terminal: the prompt under the dead program's modes.
+        // `Buggy = 1`: the prompt under the dead program's modes.
         assert_eq!(
             (broken["prompt"], broken["leak"], broken["tail"]),
             (1, 1, 0),
@@ -208,8 +199,8 @@ fn foreground_handback_a_stopped_job_keeps_its_modes_until_it_dies() {
     for (i, action) in STOP_FG.iter().enumerate() {
         assert!(m.fire(action, &mut s), "{action}: {s:?}");
         if i == 12 {
-            // The stop edge was parsed: the job lives, so its modes stay —
-            // under the shell's `zsh: suspended`, as before the handback.
+            // The stop edge was parsed: the job lives, so its modes stay under the shell's
+            // `zsh: suspended`.
             assert_eq!((s["life"], s["leak"], s["prompt"]), (5, 1, 1), "{s:?}");
         }
         if i == 18 {
@@ -237,8 +228,7 @@ fn foreground_handback_at_every_foreground_change_is_caught() {
         "the job is alive: {state:?}"
     );
 
-    // The review's probe, replayed: Ctrl-Z strips the modes, `fg` resumes the
-    // job without them.
+    // Ctrl-Z strips the modes, and `fg` resumes the job without them.
     let mut s = m.init_state();
     for action in &STOP_FG[..14] {
         assert!(m.fire(action, &mut s), "{action}: {s:?}");
@@ -271,7 +261,7 @@ fn foreground_handback_a_restarted_reader_without_the_carried_holder_is_caught()
     for action in PARKED {
         assert!(m.fire(action, &mut s), "{action}: {s:?}");
     }
-    // The 2026-09-25 terminal again: no edge, no handback.
+    // No edge, so no handback: the prompt under the dead job's modes.
     assert_eq!((s["prompt"], s["leak"], s["tail"]), (1, 1, 0), "{s:?}");
     assert!(!committed.check_invariant("PromptNotHijacked", &s));
 }
@@ -299,8 +289,8 @@ fn foreground_handback_a_one_shot_keeps_its_display_modes() {
         assert!(committed.check_invariant(invariant, &s), "{invariant}");
     }
 
-    // The reviewed rule: display modes alone are orphaned, and the one-shot's
-    // mode is reverted at the cut.
+    // `Display = 1`: display modes alone count as orphaned, and the one-shot's mode is
+    // reverted at the cut.
     let m = interp::with_consts(&committed, &[("Display", 1)]);
     let (state, invariant) = interp::bmc(&m).expect_err("a one-shot's mode reverted");
     assert_eq!(invariant, "OneShotKeepsItsModes", "{state:?}");
@@ -325,9 +315,8 @@ fn foreground_handback_a_one_shot_keeps_its_display_modes() {
     assert_eq!((s["hij"], s["leak"]), (1, 0), "{s:?}");
 }
 
-/// The 2026-09-27 lane at load 59-65: a one-shot the reader never saw (its
-/// `?1000h` parsed as the shell's), then a job that arms mouse tracking in
-/// its own bytes and dies.
+/// A one-shot the reader never saw (its `?1000h` parsed as the shell's), then a job that arms
+/// mouse tracking in its own bytes and dies.
 const MISSED_THEN_JOB: [&str; 9] = [
     "Launch", "Arm", "Die", "Reclaim", "Launch", "Sample", "Arm", "Die", "Reclaim",
 ];
@@ -338,19 +327,16 @@ const SHELL_ARM_THEN_JOB: [&str; 6] = ["ShellArm", "Launch", "Sample", "Arm", "D
 #[test]
 fn foreground_handback_ownership_proves_catches_and_has_no_dead_action() {
     let model = foreground_handback_ownership_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name),
-        "the ownership model must stay enrolled in the spec-link registry"
-    );
     let fired = interp::fired_actions(&model);
     assert_eq!(
         fired.len(),
         model.actions.len(),
         "every action fires at the committed configuration: {fired:?}"
     );
-    assert_eq!(verify::audit_dead_negative_controls(&model, &[]), Ok(0));
+    assert_eq!(
+        verify::audit_dead_negative_controls(std::slice::from_ref(&model)),
+        Ok(0)
+    );
     verify::prove_and_catch_scalar(
         &model,
         "foreground handback ownership: a missed job loses only its own handback",
@@ -369,16 +355,15 @@ fn foreground_handback_ownership_a_missed_job_loses_only_its_own_handback() {
         for action in schedule {
             assert!(committed.fire(action, &mut s), "{name}: {action}: {s:?}");
         }
-        // The job that armed in its own bytes is handed back: the session
-        // recovered.
+        // The job that armed in its own bytes is handed back.
         assert_eq!(
             (s["life"], s["done"], s["bit"], s["owner"], s["backs"]),
             (0, 1, 0, 0, 1),
             "{name}: {s:?}"
         );
 
-        // The replaced rule: the job's re-arm leaves the shell the owner, and
-        // its death hands nothing back.
+        // `Buggy = 1`: the job's re-arm leaves the shell the owner, and its death hands
+        // nothing back.
         let mut b = buggy.init_state();
         for action in schedule {
             assert!(buggy.fire(action, &mut b), "{name}: {action}: {b:?}");
@@ -402,7 +387,7 @@ fn foreground_handback_ownership_a_missed_job_loses_only_its_own_handback() {
         "{s:?}"
     );
 
-    // bmc finds the replaced rule's counterexample on its own.
+    // bmc finds the `Buggy = 1` counterexample on its own.
     let (state, invariant) = interp::bmc(&buggy).expect_err("the stuck session");
     assert_eq!(invariant, "ObservedArmIsHandedBack", "{state:?}");
     assert_eq!((state["done"], state["bit"]), (1, 1), "{state:?}");

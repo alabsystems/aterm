@@ -1,28 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Live-headless conformance for an ISOLATED instance's footprint (the
-//! 2026-09-24 live probe's D9 and D10): a headless instance given its own
-//! state root writes nothing into the person's log directory, and a `kill`
-//! takes its control socket with it.
+//! Live-headless conformance for an isolated instance's footprint: a headless instance given
+//! its own state root writes nothing into the person's log directory, and a `kill` takes its
+//! control socket with it.
 //!
-//! * THE LOG FOLLOWS THE STATE ROOT: with `$ATERM_STATE_HOME` set, `aterm.log`
-//!   is `<state>/logs/aterm.log`; the platform log directory under the
-//!   instance's `$HOME` is never created. NEGATIVE CONTROL: the same launch
-//!   without the override logs under `$HOME`, so the first assertion is about
-//!   the override, not about a logger that wrote nothing.
-//! * SIGTERM REMOVES THE ENDPOINT: the socket and its token are gone once the
-//!   process has died of the signal (it still dies of it — the exit status
-//!   names SIGTERM).
+//! * The log follows the state root: with `$ATERM_STATE_HOME` set, `aterm.log` is
+//!   `<state>/logs/aterm.log`, and the platform log directory under the instance's `$HOME` is
+//!   never created. Negative control: without the override it logs under `$HOME`.
+//! * SIGTERM removes the endpoint: the socket and its token are gone once the process has died
+//!   of the signal (the exit status still names SIGTERM).
 //!
-//! ISOLATION: scratch HOME/XDG roots, a private socket, every automatic lane
-//! off (`support/launch_isolation.rs`), `--no-reroute`, `SHELL=/bin/sh`, and a
-//! LIFELINE (`launch_isolation::lifeline`): a runner killed mid-test takes its
-//! instance with it, which the `Drop` below cannot do. An instance that cannot
-//! start FAILS the test (`support/headless_boot.rs` `await_ready`); SKIP only on
-//! a scratch, log or spawn refusal.
+//! Isolation is `support/launch_isolation.rs`'s, with a lifeline
+//! (`launch_isolation::lifeline`): a runner killed mid-test takes its instance with it, which
+//! the `Drop` below cannot do.
 
 #![cfg(unix)]
+#![allow(
+    clippy::disallowed_types,
+    reason = "test code: a stand-in child may inherit descriptors"
+)]
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -75,9 +72,9 @@ fn headless(tmp: &Path) -> (Command, aterm_uds::lifeline::Lifeline) {
     (cmd, lifeline)
 }
 
-/// Boot one headless instance with `state` as its `$ATERM_STATE_HOME` when
-/// given. `None` = an environmental refusal (scratch, log, spawn), a SKIP; an
-/// instance that exits or never listens PANICS (`headless_boot::await_ready`).
+/// Boot one headless instance, with `state` as its `$ATERM_STATE_HOME` when given. `None` is an
+/// environment refusal (scratch, log, spawn), a skip; an instance that exits or never listens
+/// panics (`headless_boot::await_ready`).
 fn boot(tag: &str, state: Option<&str>) -> Option<Instance> {
     let Some(tmp) = scratch_root(tag) else {
         eprintln!("SKIP: no scratch base with a short enough socket path");
@@ -124,9 +121,8 @@ fn home_log(tmp: &Path) -> PathBuf {
     }
 }
 
-/// The logger opens its file at startup, before the socket binds; allow it the
-/// boot's hang detector anyway so a slow machine does not read a race as a
-/// defect.
+/// The logger opens its file at startup, before the socket binds; it gets the boot's hang
+/// detector anyway.
 fn appears(path: &Path) -> bool {
     for _ in 0..SOCKET_POLLS {
         if path.exists() {
@@ -137,10 +133,9 @@ fn appears(path: &Path) -> bool {
     false
 }
 
-/// Whether `log` says the control socket is listening — the line the server
-/// logs only AFTER it recorded what it owns (`owned_endpoint::publish`), so a
-/// signal sent after it finds the handler armed. The socket FILE appears
-/// earlier, at bind.
+/// Whether `log` says the control socket is listening, a line the server logs only after it
+/// recorded what it owns (`owned_endpoint::publish`), so a signal sent after it finds the
+/// handler armed. The socket file appears earlier, at bind.
 fn listening(log: &Path) -> bool {
     for _ in 0..SOCKET_POLLS {
         if std::fs::read_to_string(log).is_ok_and(|l| l.contains("control socket listening at")) {
@@ -165,7 +160,7 @@ fn an_isolated_state_root_keeps_the_log_and_the_default_does_not() {
         "nothing is written to the person's log directory"
     );
     drop(isolated);
-    // NEGATIVE CONTROL: no override, and the log is the platform's.
+    // Negative control: no override, and the log is the platform's.
     let Some(plain) = boot("p", None) else {
         return;
     };
@@ -198,10 +193,8 @@ fn sigterm_removes_the_socket_and_its_token() {
     assert!(!token.exists(), "the token went with it");
 }
 
-/// A state root that is not an absolute path is refused — no log directory
-/// resolves — and the instance SAYS so on stderr rather than silently writing
-/// no log. NEGATIVE CONTROL: the words name the variable, which the message
-/// before 2026-09-24 ("set HOME") did not.
+/// A state root that is not an absolute path is refused (no log directory resolves), and the
+/// instance says so on stderr, naming the variable, rather than silently writing no log.
 #[test]
 fn a_refused_state_root_is_said_not_silent() {
     use std::io::Read as _;
@@ -240,10 +233,8 @@ fn a_refused_state_root_is_said_not_silent() {
         .take()
         .expect("piped")
         .read_to_string(&mut stderr);
-    // The refusal is SAID, naming the variable and that what depends on the
-    // state root is off; the list of what is off grows with the product
-    // (d034733c6 added session restore, the crash journal and the cell-metrics
-    // cache), so the test pins the sentence's head and its verdict, not the list.
+    // The refusal names the variable and says what depends on the state root is off; that
+    // list grows with the product, so the test pins the sentence's head and its verdict.
     assert!(
         stderr.contains("ATERM_STATE_HOME is not an absolute path; crash reports")
             && stderr.contains("aterm.log")

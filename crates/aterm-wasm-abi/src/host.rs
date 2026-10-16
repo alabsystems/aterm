@@ -1,0 +1,70 @@
+// Copyright 2026 Andrew Yates
+// SPDX-License-Identifier: Apache-2.0
+
+//! The JS calls a module makes, as raw `aterm_host` imports the generated
+//! glue provides: the two the panic hook needs and the two browser clocks.
+//!
+//! The glue knows each by name and signature and refuses a module importing
+//! anything else, so an import added here is added to `verify glue` in
+//! the same change.
+//!
+//! | import | JS |
+//! |---|---|
+//! | `aterm_host.console_error(ptr, len)` | `console.error(text)` |
+//! | `aterm_host.error_stack(out)` | `new Error().stack`, written as a string the module owns |
+//! | `aterm_host.performance_now()` | `performance.now()` |
+//! | `aterm_host.date_now()` | `Date.now()` |
+
+use crate::panic_hook::Console;
+
+#[link(wasm_import_module = "aterm_host")]
+unsafe extern "C" {
+    #[link_name = "console_error"]
+    fn host_console_error(ptr: *const u8, len: usize);
+    #[link_name = "error_stack"]
+    fn host_error_stack(out: *mut [usize; 2]);
+    #[link_name = "performance_now"]
+    safe fn host_performance_now() -> f64;
+    #[link_name = "date_now"]
+    safe fn host_date_now() -> f64;
+}
+
+/// `console.error(text)`.
+pub fn console_error(text: &str) {
+    // SAFETY: the glue reads `len` bytes at `ptr` before returning.
+    unsafe { host_console_error(text.as_ptr(), text.len()) }
+}
+
+/// `new Error().stack`: the JS stack here, wasm frames included.
+#[must_use]
+pub fn error_stack() -> String {
+    let mut out = [0usize; 2];
+    // SAFETY: the glue writes a pointer and length to the two words at
+    // `out`: a UTF-8 string it allocated with `aterm_alloc`/`aterm_realloc`
+    // at exactly that length, now this module's.
+    unsafe {
+        host_error_stack(&mut out);
+        <String as crate::marshal::FromAbi>::from_abi(out[0], out[1])
+    }
+    .unwrap_or_default()
+}
+
+/// `performance.now()`, resolved at call time, so one module works in a
+/// window, a worker and a worklet.
+#[must_use]
+pub fn performance_now() -> f64 {
+    host_performance_now()
+}
+
+/// `Date.now()`.
+#[must_use]
+pub fn date_now() -> f64 {
+    host_date_now()
+}
+
+/// The panic hook's console through these imports
+/// (`panic_hook::set_once(host::CONSOLE)`).
+pub const CONSOLE: Console = Console {
+    error: console_error,
+    stack: error_stack,
+};

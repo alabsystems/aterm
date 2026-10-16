@@ -2,23 +2,9 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Bloom filter for fast negative lookups.
-//!
-//! A bloom filter provides O(1) probabilistic set membership tests.
-//! It has no false negatives but may have false positives.
-//!
-//! ## Design
-//!
-//! - Uses k=7 hash functions (optimal for 1% false positive rate)
-//! - Bit array stored as `Vec<u64>` for cache efficiency
-//! - FNV-1a based hash functions for speed
-//!
-//! ## Complexity
-//!
-//! - Lookup: O(1) with respect to filter size - checks at most K=7 bits (early return on miss)
-//! - Insert: O(1) with respect to filter size - always sets exactly K=7 bits
-//!
-//! ## Usage
+//! Bloom filter for fast negative trigram lookups: no false negatives, possible
+//! false positives. K=7 FNV-1a-derived hashes over a `Vec<u64>` bit array; a lookup
+//! checks at most K bits and an insert sets exactly K.
 //!
 //! ```rust,no_run
 //! use aterm_search::BloomFilter;
@@ -28,16 +14,14 @@
 //! assert_eq!(bloom.item_count(), 1);
 //! ```
 //!
-//! Membership is queried through [`crate::SearchIndex::might_contain`], which
-//! probes every trigram of the query: `false` means definitely absent, `true`
-//! means possibly present (verify with the actual search).
+//! [`crate::SearchIndex::might_contain`] probes every trigram of a query.
 
 use aterm_hash::{FNV64_OFFSET, FNV64_PRIME};
 
-/// Number of hash functions (k=7 is optimal for 1% FPR with m/n ~= 10)
+/// Number of hash functions (optimal for ~1% FPR at m/n ~= 10).
 const K: usize = 7;
 
-// Counters for bloom filter bit operations (O(1) verification).
+// Bit-operation counters: the tests pin O(1) lookup and insert.
 #[cfg(test)]
 thread_local! {
     static BLOOM_GET_BIT_OPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -76,9 +60,7 @@ fn take_set_bit_ops() -> usize {
     })
 }
 
-/// Bloom filter for fast set membership testing.
-///
-/// False positives are possible, false negatives are not.
+/// Bloom filter: false positives are possible, false negatives are not.
 #[derive(Debug, Clone)]
 pub struct BloomFilter {
     /// Bit array stored as u64 chunks.
@@ -92,33 +74,18 @@ pub struct BloomFilter {
 impl BloomFilter {
     #[inline]
     fn requested_bits_for_capacity(expected_items: usize) -> usize {
-        // Explicit comparison instead of `Ord::max` (which the Trust L0 gate
-        // treats as opaque) so bounds on `expected_items` survive to the
-        // storage sizing. Identical value on every input.
+        // Not `Ord::max`, which the Trust L0 gate treats as opaque.
         let bits = expected_items.saturating_mul(10);
         if bits < 64 { 64 } else { bits }
     }
 
-    /// Smallest capacity that already saturates the [`Self::MAX_BITS`] cap.
-    ///
-    /// For any `expected_items >= MAX_EFFECTIVE_CAPACITY`,
-    /// `requested_bits_for_capacity` yields >= `MAX_BITS`, so `storage_layout`
-    /// returns the identical maximal layout. Clamping a capacity to this
-    /// value therefore NEVER changes the constructed filter. It also sits
-    /// below the Trust L0 gate's per-allocation budget, so clamped counts are
-    /// provably bounded at the allocation sites.
+    /// Smallest capacity that already saturates [`Self::MAX_BITS`], so clamping to it
+    /// never changes the filter while bounding the allocation for the Trust L0 gate.
     pub(crate) const MAX_EFFECTIVE_CAPACITY: usize = Self::MAX_BITS / 10 + 1;
 
-    /// Maximum number of bits we allow before capping.
-    ///
-    /// Chosen so that `num_u64s * 64` cannot overflow `usize` and the
-    /// resulting `Vec<u64>` stays within a reasonable allocation size
-    /// (~128 MiB on 64-bit, ~32 MiB on 32-bit). The 64-bit cap also keeps the
-    /// backing store below the Trust L0 gate's per-allocation budget so the
-    /// filter allocation is provably bounded. At 10 bits/item this still
-    /// serves >100M trigrams (~1000x the documented ~1M-line scrollback
-    /// bound); beyond the cap the filter degrades gracefully to a higher
-    /// false-positive rate, never to false negatives.
+    /// Bit cap: keeps `num_u64s * 64` inside `usize` and the allocation within the
+    /// Trust L0 gate's per-allocation budget. At 10 bits/item it serves >100M
+    /// trigrams; past it the false-positive rate rises, never false negatives.
     const MAX_BITS: usize = if cfg!(target_pointer_width = "64") {
         // ~128 MiB = 1 Gi bits
         1 << 30
@@ -127,67 +94,47 @@ impl BloomFilter {
         1 << 28
     };
 
-    /// Maximum number of backing `u64` words (`MAX_BITS / 64`).
-    ///
-    /// Restated as its own constant so `storage_layout` can clamp `num_u64s`
-    /// with a direct comparison: the Trust L0 gate's integer engines treat
-    /// runtime division results as opaque, so the bound implied by
-    /// `capped_bits / 64` is not otherwise visible to the
-    /// `num_u64s * 64` overflow proof or the allocation-bound proof.
+    /// Maximum number of backing `u64` words, restated so `storage_layout` can clamp
+    /// with a comparison the Trust L0 gate sees.
     const MAX_U64S: usize = Self::MAX_BITS / 64;
 
     #[inline]
     fn storage_layout(requested_bits: usize) -> (usize, usize) {
-        // Spelled as explicit comparisons (not `Ord::max`/`Ord::min`/`div_ceil`
-        // calls) so the Trust L0 gate's interval reasoning can carry the bounds
-        // through to the multiplication and the backing-store allocation.
-        // Identical values on every input.
+        // Explicit comparisons (not `max`/`min`/`div_ceil`) so the Trust L0 gate's
+        // interval reasoning carries the bounds to the multiply and the allocation;
+        // the division result is opaque to it.
         let floored_bits = if requested_bits < 64 {
             64
         } else {
             requested_bits
         };
-        // Cap to prevent overflow in the `num_u64s * 64` multiplication
-        // and to avoid unreasonably large allocations.
         let capped_bits = if floored_bits > Self::MAX_BITS {
             Self::MAX_BITS
         } else {
             floored_bits
         };
-        // div_ceil(64), spelled out for the same reason. The saturating_add
-        // is dead code (capped_bits / 64 < MAX_U64S in the remainder branch);
-        // it carries the no-overflow proof past the opaque division result.
+        // div_ceil(64), spelled out; the saturating_add never saturates.
         let raw_u64s = if capped_bits % 64 == 0 {
             capped_bits / 64
         } else {
             (capped_bits / 64).saturating_add(1)
         };
-        // Dominating clamp: `capped_bits <= MAX_BITS` already guarantees
-        // `raw_u64s <= MAX_U64S` mathematically (so the clamp never fires on
-        // ANY input — identical values always), but the gate treats the
-        // division as opaque, so the bound must be restated as a comparison.
+        // Never fires (`capped_bits <= MAX_BITS`), but the gate needs the bound as
+        // a comparison.
         let num_u64s = if raw_u64s > Self::MAX_U64S {
             Self::MAX_U64S
         } else {
             raw_u64s
         };
-        // Safe: num_u64s <= MAX_U64S ensures num_u64s * 64 <= MAX_BITS,
-        // which is well within usize range on all supported targets.
+        // num_u64s <= MAX_U64S, so the product is at most MAX_BITS.
         (num_u64s, num_u64s * 64)
     }
 
-    /// Create a new bloom filter with approximately `expected_items` capacity.
-    ///
-    /// The filter is sized for ~1% false positive rate at the expected capacity.
+    /// Create a filter sized for ~1% false positives at `expected_items`.
     #[must_use]
     pub fn with_capacity(expected_items: usize) -> Self {
-        // For 1% FPR, we need m/n ~= 10 bits per item
-        // Add some headroom
-        //
-        // Clamp: any capacity at or above MAX_EFFECTIVE_CAPACITY already
-        // saturates the MAX_BITS cap in storage_layout, so this produces the
-        // IDENTICAL filter on every input while giving the Trust L0 gate a
-        // dominating bound on the backing-store allocation.
+        // Clamping to MAX_EFFECTIVE_CAPACITY never changes the filter; it gives the
+        // Trust L0 gate a dominating bound on the allocation.
         let expected_items = if expected_items > Self::MAX_EFFECTIVE_CAPACITY {
             Self::MAX_EFFECTIVE_CAPACITY
         } else {
@@ -200,12 +147,9 @@ impl BloomFilter {
     #[must_use]
     pub fn with_size(num_bits: usize) -> Self {
         let (num_u64s, final_num_bits) = Self::storage_layout(num_bits);
-        // Branch-duplicated allocation: storage_layout already guarantees
-        // `num_u64s <= MAX_U64S` on every input, so the first arm is dead
-        // code and both arms build the identical filter. The Trust L0 gate
-        // havocs local-callee results and its allocation recognizer needs the
-        // comparison to directly dominate each `vec!` count (a phi-merged
-        // clamp is not recognized), so the bound is restated as a branch.
+        // The first arm is dead (`storage_layout` caps `num_u64s`), but the Trust L0
+        // gate's allocation recognizer needs a comparison directly dominating each
+        // `vec!` count.
         let bits = if num_u64s > Self::MAX_U64S {
             vec![0u64; Self::MAX_U64S]
         } else {
@@ -227,9 +171,7 @@ impl BloomFilter {
             let bit_idx = self.get_bit_index(h1, h2, i);
             self.set_bit(bit_idx);
         }
-        // Saturating: one insert per call means the count can never actually
-        // reach usize::MAX, so this is identical to `+= 1` on every reachable
-        // path while carrying the no-overflow proof for the Trust L0 gate.
+        // Saturating only to carry the no-overflow proof for the Trust L0 gate.
         self.count = self.count.saturating_add(1);
     }
 
@@ -241,7 +183,7 @@ impl BloomFilter {
             let bit_idx = self.get_bit_index(h1, h2, i);
             self.set_bit(bit_idx);
         }
-        // Saturating: identical to `+= 1` on every reachable path (see insert).
+        // Saturating only to carry the no-overflow proof for the Trust L0 gate.
         self.count = self.count.saturating_add(1);
     }
 
@@ -289,10 +231,8 @@ impl BloomFilter {
         self.count
     }
 
-    /// Estimate the false positive rate.
-    ///
-    /// Returns a value between 0.0 (empty filter) and ~1.0 (fully saturated).
-    /// Uses the theoretical formula: FPR ~= (1 - e^(-k*n/m))^k
+    /// Estimated false positive rate, (1 - e^(-k*n/m))^k: 0.0 when empty, near 1.0
+    /// when saturated.
     #[must_use]
     #[allow(
         clippy::cast_precision_loss,
@@ -302,21 +242,16 @@ impl BloomFilter {
         if self.count == 0 {
             return 0.0;
         }
-        // FPR ≈ (1 - e^(-k*n/m))^k
         let k = K as f64;
         let n = self.count as f64;
         let m = self.num_bits as f64;
         let exp = (-k * n / m).exp();
-        // K = 7 (const), always fits in i32
         let k_i32 = i32::try_from(K).unwrap_or(7);
         (1.0 - exp).powi(k_i32)
     }
 
-    /// Returns `true` when the filter is too saturated to be useful.
-    ///
-    /// When the estimated false positive rate exceeds 50%, the filter returns
-    /// `true` for most queries, degrading to a linear scan. Callers should
-    /// rebuild or resize the filter when this returns `true`. Part of #7243.
+    /// Returns `true` when the estimated false positive rate exceeds 50%: the filter
+    /// then passes most queries and should be rebuilt or resized.
     #[must_use]
     pub fn is_saturated(&self) -> bool {
         self.estimated_fpr() > 0.5
@@ -328,15 +263,11 @@ impl BloomFilter {
         self.count = 0;
     }
 
-    /// Compute two independent hashes using FNV-1a.
-    ///
-    /// Uses the Kirsch-Mitzenmacher technique: h_i = h1 + i*h2
-    /// Optimized to compute both hashes in a single pass.
+    /// Two FNV-1a hashes in one pass, combined as h_i = h1 + i*h2
+    /// (Kirsch-Mitzenmacher).
     #[inline]
     fn hash_pair(bytes: &[u8]) -> (u64, u64) {
-        // Compute both hashes in a single pass.
-        // h1: Standard FNV-1a
-        // h2: FNV-1a with different seed and rotated intermediate values
+        // h1 is plain FNV-1a; h2 starts from a rotated seed and is rotated at the end.
         let mut h1 = FNV64_OFFSET;
         let mut h2 = FNV64_OFFSET.rotate_left(17); // Different seed
 
@@ -358,20 +289,14 @@ impl BloomFilter {
     #[inline]
     fn get_bit_index(&self, h1: u64, h2: u64, i: usize) -> usize {
         let combined = h1.wrapping_add((i as u64).wrapping_mul(h2));
-        // Safe on 64-bit (lossless). On 32-bit: truncation is harmless — result is
-        // immediately bounded by modulo num_bits, so any bits lost don't affect correctness
         #[allow(
             clippy::cast_possible_truncation,
             reason = "result bounded by modulo num_bits; truncation harmless"
         )]
         let combined_usize = combined as usize;
-        // Single field load + explicit zero guard ahead of the `%`: the Trust
-        // L0 gate needs the dominating `num_bits != 0` comparison on the same
-        // local as the divisor to discharge the remzero obligation (it treats
-        // `checked_rem`'s internal `unlikely()` guard as opaque). `num_bits`
-        // is always >= 64 by construction (`storage_layout` floors at 64), so
-        // the early return is dead on every reachable path and the result is
-        // identical to `combined_usize % self.num_bits`.
+        // The zero guard on the same local as the divisor discharges the Trust L0
+        // gate's remzero obligation; `num_bits >= 64` by construction, so it never
+        // fires.
         let num_bits = self.num_bits;
         if num_bits == 0 {
             return 0;

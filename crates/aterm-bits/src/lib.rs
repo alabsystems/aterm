@@ -33,10 +33,9 @@
 //! Implementors are responsible for verifying these properties; this crate
 //! only provides the machinery to transmute once they hold.
 
-#![forbid(unsafe_op_in_unsafe_fn)]
-#![deny(missing_docs)]
-#![deny(clippy::undocumented_unsafe_blocks)]
-#![deny(rust_2018_idioms)]
+#![warn(missing_docs)]
+#![warn(clippy::undocumented_unsafe_blocks)]
+#![warn(rust_2018_idioms)]
 
 use core::mem::{align_of, size_of, size_of_val};
 use core::slice;

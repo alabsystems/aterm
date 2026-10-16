@@ -11,7 +11,9 @@
 //! row carries `message.{id,model,usage}`, repeated once per content block, so
 //! each id counts once; a repeat with larger counts sums only the difference.
 //! A row without an id is summed (over-count never hides cost), sidechain rows
-//! are real spend, and an unpriced model yields `usd: null`. Bounds:
+//! are real spend, and `usd` is `null`: nothing here knows what a model
+//! costs. A caller that priced a row says so in it ([`SpendView::usd`]: the
+//! Codex path of `harness usage`, priced by `spend`). Bounds:
 //!
 //! | bound | value | why |
 //! |---|---|---|
@@ -20,10 +22,14 @@
 //! | [`MAX_ID_BYTES`] | 128 | a longer `message.id` is treated as absent (summed, not deduped) so a hostile id cannot fill the set |
 //! | [`MAX_MODELS`] | 64 | further distinct model ids fold into `"(other)"` |
 //!
-//! The per-account rate-limit windows are not filled here (`"windows":{}`, `?%`
-//! in the HUD); `harness limits` prints them ([`usage_panel_windows`]). The fold
-//! also feeds the window footer's `Σ` tokens and limit wall
-//! ([`LimitNoticeRow`]) through [`super::session_usage`].
+//! The per-account rate-limit windows are filled only from the usage tap's
+//! reading for the session's own process ([`AccountView::windows`],
+//! [`super::tap`]), its caller's to read; without one they stay unknown
+//! (`"windows":{}`, `?%` in the HUD), and `harness limits` prints a painted
+//! panel's ([`usage_panel_windows`]), or a Codex `/status` card's
+//! ([`codex_status_windows`]). The fold also feeds the window
+//! footer's `Σ` tokens and limit wall ([`LimitNoticeRow`]) through
+//! [`super::session_usage`].
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -51,7 +57,7 @@ pub const MAX_ID_BYTES: usize = 128;
 /// into the `"(other)"` row.
 pub const MAX_MODELS: usize = 64;
 
-/// The HUD line's byte cap — the `meta set description` cap.
+/// The longest HUD line, in bytes, that `harness usage` prints.
 pub const HUD_MAX_BYTES: usize = 1024;
 
 /// The model key spend is filed under when an assistant row carries none.
@@ -90,29 +96,94 @@ pub struct TokenUsage {
     pub input: u64,
     /// `output_tokens`.
     pub output: u64,
-    /// `cache_creation_input_tokens`.
+    /// `cache_creation_input_tokens`: every cache write, both lifetimes.
     pub cache_write: u64,
+    /// Of [`Self::cache_write`], the tokens written to the one-hour cache
+    /// (`cache_creation.ephemeral_1h_input_tokens`), which list at a higher
+    /// price than the five-minute ones; never more than `cache_write`. 0 where
+    /// the row carries no split (every write is then a five-minute one).
+    pub cache_write_1h: u64,
     /// `cache_read_input_tokens`.
     pub cache_read: u64,
 }
 
 impl TokenUsage {
-    /// Read the four counts; a missing one reads 0. `None` when none of the
-    /// four is present as a number — that object is not a usage.
-    fn from_object(obj: &Map) -> Option<Self> {
+    /// Read the counts; a missing one reads 0. `None` when none of the four
+    /// totals is present as a number — that object is not a usage. A row with
+    /// a `cache_creation` split and no total sums the split.
+    pub(crate) fn from_object(obj: &Map) -> Option<Self> {
         let input = num_u64(obj.get("input_tokens"));
         let output = num_u64(obj.get("output_tokens"));
-        let cache_write = num_u64(obj.get("cache_creation_input_tokens"));
+        let split = obj.get("cache_creation").and_then(Value::as_object);
+        let five_min = split.and_then(|s| num_u64(s.get("ephemeral_5m_input_tokens")));
+        let one_hour = split.and_then(|s| num_u64(s.get("ephemeral_1h_input_tokens")));
+        let cache_write = num_u64(obj.get("cache_creation_input_tokens")).or_else(|| {
+            (five_min.is_some() || one_hour.is_some())
+                .then(|| five_min.unwrap_or(0).saturating_add(one_hour.unwrap_or(0)))
+        });
         let cache_read = num_u64(obj.get("cache_read_input_tokens"));
         if input.is_none() && output.is_none() && cache_write.is_none() && cache_read.is_none() {
             return None;
         }
+        let cache_write = cache_write.unwrap_or(0);
         Some(Self {
             input: input.unwrap_or(0),
             output: output.unwrap_or(0),
-            cache_write: cache_write.unwrap_or(0),
+            cache_write,
+            cache_write_1h: one_hour.unwrap_or(0).min(cache_write),
             cache_read: cache_read.unwrap_or(0),
         })
+    }
+
+    /// Whether every count is 0: a row that spent nothing.
+    #[must_use]
+    pub fn is_zero(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The request's prompt: input, cache writes and cache reads together —
+    /// what a price by prompt length is decided on.
+    #[must_use]
+    pub fn prompt(&self) -> u64 {
+        self.input
+            .saturating_add(self.cache_write)
+            .saturating_add(self.cache_read)
+    }
+
+    /// Each count the larger of the two.
+    #[must_use]
+    pub fn max(&self, other: &Self) -> Self {
+        Self {
+            input: self.input.max(other.input),
+            output: self.output.max(other.output),
+            cache_write: self.cache_write.max(other.cache_write),
+            cache_write_1h: self.cache_write_1h.max(other.cache_write_1h),
+            cache_read: self.cache_read.max(other.cache_read),
+        }
+    }
+
+    /// Each count less the other's, never below 0.
+    #[must_use]
+    pub fn less(&self, other: &Self) -> Self {
+        Self {
+            input: self.input.saturating_sub(other.input),
+            output: self.output.saturating_sub(other.output),
+            cache_write: self.cache_write.saturating_sub(other.cache_write),
+            cache_write_1h: self.cache_write_1h.saturating_sub(other.cache_write_1h),
+            cache_read: self.cache_read.saturating_sub(other.cache_read),
+        }
+    }
+
+    /// Each count plus the other's, saturating.
+    #[must_use]
+    pub fn plus(&self, other: &Self) -> Self {
+        Self {
+            input: self.input.saturating_add(other.input),
+            output: self.output.saturating_add(other.output),
+            cache_write: self.cache_write.saturating_add(other.cache_write),
+            cache_write_1h: self.cache_write_1h.saturating_add(other.cache_write_1h),
+            cache_read: self.cache_read.saturating_add(other.cache_read),
+        }
     }
 }
 
@@ -127,8 +198,10 @@ pub struct ModelSpend {
     pub input: u64,
     /// Output tokens.
     pub output: u64,
-    /// Cache-creation input tokens.
+    /// Cache-creation input tokens, both lifetimes.
     pub cache_write: u64,
+    /// Of `cache_write`, the one-hour cache writes ([`TokenUsage::cache_write_1h`]).
+    pub cache_write_1h: u64,
     /// Cache-read input tokens.
     pub cache_read: u64,
     /// Distinct messages counted (one per id; each id-less row counts one).
@@ -137,29 +210,37 @@ pub struct ModelSpend {
 
 impl ModelSpend {
     fn add(&mut self, t: TokenUsage) {
-        self.input = self.input.saturating_add(t.input);
-        self.output = self.output.saturating_add(t.output);
-        self.cache_write = self.cache_write.saturating_add(t.cache_write);
-        self.cache_read = self.cache_read.saturating_add(t.cache_read);
+        self.add_tokens(t);
         self.messages = self.messages.saturating_add(1);
     }
 
     /// Add a message's token counts without counting another message — the
     /// growth a streamed repeat of one id brings.
     fn add_tokens(&mut self, t: TokenUsage) {
-        self.input = self.input.saturating_add(t.input);
-        self.output = self.output.saturating_add(t.output);
-        self.cache_write = self.cache_write.saturating_add(t.cache_write);
-        self.cache_read = self.cache_read.saturating_add(t.cache_read);
+        let sum = self.tokens().plus(&t);
+        self.input = sum.input;
+        self.output = sum.output;
+        self.cache_write = sum.cache_write;
+        self.cache_write_1h = sum.cache_write_1h;
+        self.cache_read = sum.cache_read;
     }
 
     /// Add another spend's totals — two files' folds of one session, summed.
     pub(crate) fn add_spend(&mut self, other: &Self) {
-        self.input = self.input.saturating_add(other.input);
-        self.output = self.output.saturating_add(other.output);
-        self.cache_write = self.cache_write.saturating_add(other.cache_write);
-        self.cache_read = self.cache_read.saturating_add(other.cache_read);
+        self.add_tokens(other.tokens());
         self.messages = self.messages.saturating_add(other.messages);
+    }
+
+    /// The token counts, as one request's are held.
+    #[must_use]
+    pub fn tokens(&self) -> TokenUsage {
+        TokenUsage {
+            input: self.input,
+            output: self.output,
+            cache_write: self.cache_write,
+            cache_write_1h: self.cache_write_1h,
+            cache_read: self.cache_read,
+        }
     }
 }
 
@@ -210,18 +291,8 @@ impl SeenIds {
             if *held == usage {
                 return Seen::Same;
             }
-            let grown = TokenUsage {
-                input: held.input.max(usage.input),
-                output: held.output.max(usage.output),
-                cache_write: held.cache_write.max(usage.cache_write),
-                cache_read: held.cache_read.max(usage.cache_read),
-            };
-            let delta = TokenUsage {
-                input: grown.input - held.input,
-                output: grown.output - held.output,
-                cache_write: grown.cache_write - held.cache_write,
-                cache_read: grown.cache_read - held.cache_read,
-            };
+            let grown = held.max(&usage);
+            let delta = grown.less(held);
             *held = grown;
             return Seen::Differs(delta);
         }
@@ -356,7 +427,7 @@ pub struct LimitNoticeRow {
 
 /// Unix seconds of a transcript row's own `timestamp` (the workspace's
 /// RFC 3339 reader, which refuses an offset it would misread).
-fn row_time(obj: &Map) -> Option<i64> {
+pub(crate) fn row_time(obj: &Map) -> Option<i64> {
     obj.get("timestamp")
         .and_then(Value::as_str)
         .and_then(super::upgrade_models::parse_utc)
@@ -716,7 +787,7 @@ impl TranscriptUsage {
 /// either literal or uses a `\u` escape, so a line with neither cannot say
 /// `"type":"assistant"`. A malformed object-shaped line answers
 /// [`Fold::NotAssistant`] instead of [`Fold::Unparsed`].
-fn cannot_be_assistant(line: &str) -> bool {
+pub(crate) fn cannot_be_assistant(line: &str) -> bool {
     line.starts_with('{')
         && line.ends_with('}')
         && !line.contains("assistant")
@@ -729,79 +800,6 @@ fn cannot_be_assistant(line: &str) -> bool {
 /// `\u`-escaped spelling is parsed anyway), and folded into
 /// [`TranscriptUsage::busy_ms`].
 const TURN_DURATION: &str = "turn_duration";
-
-// ---------------------------------------------------------------------------
-// Prices — injected, never built in
-// ---------------------------------------------------------------------------
-
-/// Dollars per million tokens for one model, in the four token classes.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub struct ModelPrice {
-    /// Per million input tokens.
-    pub input: f64,
-    /// Per million output tokens.
-    pub output: f64,
-    /// Per million cache-creation tokens.
-    pub cache_write: f64,
-    /// Per million cache-read tokens.
-    pub cache_read: f64,
-}
-
-impl ModelPrice {
-    fn is_valid(&self) -> bool {
-        [self.input, self.output, self.cache_write, self.cache_read]
-            .iter()
-            .all(|p| p.is_finite() && *p >= 0.0)
-    }
-}
-
-/// Prices by exact model id. Empty unless the caller fills it: nothing here
-/// knows what any model costs, and a model with no row prices as `None`.
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct PriceTable {
-    rows: BTreeMap<String, ModelPrice>,
-}
-
-impl PriceTable {
-    /// An empty table.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Set the price of one model id (exact match, no prefix or family rule).
-    #[cfg(test)]
-    pub(crate) fn insert(&mut self, model: impl Into<String>, price: ModelPrice) {
-        self.rows.insert(model.into(), price);
-    }
-
-    /// Builder form of [`insert`](Self::insert).
-    #[cfg(test)]
-    pub(crate) fn with(mut self, model: impl Into<String>, price: ModelPrice) -> Self {
-        self.insert(model, price);
-        self
-    }
-
-    /// The price row for a model id, if the caller supplied one.
-    pub fn get(&self, model: &str) -> Option<&ModelPrice> {
-        self.rows.get(model)
-    }
-
-    /// Dollars for a spend, or `None` when the model has no row or the row
-    /// holds a negative or non-finite price.
-    pub fn usd(&self, model: &str, spend: &ModelSpend) -> Option<f64> {
-        let p = self.get(model)?;
-        if !p.is_valid() {
-            return None;
-        }
-        let per = |tokens: u64, price: f64| tokens as f64 * price / 1_000_000.0;
-        Some(
-            per(spend.input, p.input)
-                + per(spend.output, p.output)
-                + per(spend.cache_write, p.cache_write)
-                + per(spend.cache_read, p.cache_read),
-        )
-    }
-}
 
 // ---------------------------------------------------------------------------
 // The view
@@ -818,20 +816,33 @@ pub struct SpendView {
     pub cache_write: u64,
     /// Cache-read tokens.
     pub cache_read: u64,
-    /// Dollars, when the price table had the model; `None` otherwise.
+    /// List dollars, where the caller priced every turn of it (Codex's
+    /// rollouts, `spend::fold_conversation`); `None` otherwise: nothing in
+    /// this module knows a price.
     pub usd: Option<f64>,
 }
 
-/// One account: its spend (per model) and the model its live session runs.
+/// One rate-limit window of an account as the usage tap read it
+/// ([`super::tap::Window`]): whole percent used, the reset, and how old the
+/// reading is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowView {
+    /// `used_percentage`.
+    pub used_pct: u32,
+    /// `resets_at`, Unix seconds.
+    pub resets_at: i64,
+    /// Seconds since the tap wrote it, at the view's `as_of`.
+    pub age_s: u64,
+}
+
+/// One account: its spend (per model), the model its live session runs, and
+/// the windows its usage tap read.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AccountView {
     /// The owner's label for the account (`accounts.toml`). `harness usage`
     /// names the roster row its Claude Code's login names, where two or more
     /// are listed, and says `account` where it cannot tell.
     pub label: String,
-    /// The config directory, when the caller wants it shown (`harness usage`
-    /// shows none).
-    pub dir: Option<String>,
     /// Whether this is the account the live session runs under: always, for
     /// the one account `harness usage` shows. Not the machine's active
     /// account, which is `harness accounts --json`'s.
@@ -841,6 +852,10 @@ pub struct AccountView {
     /// The session's model id ([`TranscriptUsage::last_model`], taken by
     /// [`Self::add_transcript`]).
     pub model: Option<String>,
+    /// The rate-limit windows by the vendor's name (`five_hour`,
+    /// `seven_day`), from the usage tap's reading for the session's own
+    /// process ([`Self::add_reading`]); empty with none.
+    pub windows: BTreeMap<String, WindowView>,
 }
 
 impl AccountView {
@@ -848,17 +863,38 @@ impl AccountView {
     pub fn new(label: impl Into<String>, active: bool) -> Self {
         Self {
             label: label.into(),
-            dir: None,
             active,
             spend: BTreeMap::new(),
             model: None,
+            windows: BTreeMap::new(),
         }
     }
 
-    /// Take the per-model spend from a transcript fold, priced by `prices`,
-    /// and the model its newest summed row names.
-    pub fn add_transcript(&mut self, usage: &TranscriptUsage, prices: &PriceTable) {
-        for (model, s) in spend_from_transcript(usage, prices) {
+    /// Take the windows of a usage tap's `reading` ([`super::tap::Reading`]),
+    /// as old as `as_of` makes it.
+    pub fn add_reading(&mut self, reading: &super::tap::Reading, as_of: i64) {
+        let age_s = u64::try_from(as_of.saturating_sub(reading.at)).unwrap_or(0);
+        for (name, window) in [
+            ("five_hour", reading.five_hour),
+            ("seven_day", reading.seven_day),
+        ] {
+            if let Some(w) = window {
+                self.windows.insert(
+                    name.to_owned(),
+                    WindowView {
+                        used_pct: w.pct,
+                        resets_at: w.resets_at,
+                        age_s,
+                    },
+                );
+            }
+        }
+    }
+
+    /// Take the per-model spend from a transcript fold, and the model its
+    /// newest summed row names.
+    pub fn add_transcript(&mut self, usage: &TranscriptUsage) {
+        for (model, s) in spend_from_transcript(usage) {
             self.spend.insert(model, s);
         }
         if let Some(model) = usage.last_model() {
@@ -898,19 +934,24 @@ impl UsageView {
 // The `/usage` panel, read off aterm's own grid
 // ---------------------------------------------------------------------------
 
-/// One rate-limit window Claude Code painted on its `/usage` panel, before its
-/// reset text is placed on a clock; the producer of
-/// [`super::source::Source::Grid`]. The panel is the only surface that paints
-/// a quota figure.
+/// One rate-limit window Claude Code painted on its `/usage` panel, or Codex
+/// on its `/status` card ([`codex_status_windows`]), before its reset text is
+/// placed on a clock; the producer of [`super::source::Source::Grid`]. The
+/// panel and the card are the only surfaces that paint a quota figure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PanelWindow {
-    /// The window key this row names (the vendor's own: `five_hour`, …).
+    /// The window key this row names (the vendor's own: `five_hour`, …; on
+    /// Codex's card, the same keys for the windows its labels name by length,
+    /// `5h` and `Weekly`, another length's label folded: [`codex_window_key`]).
     pub name: String,
     /// The whole-number percent printed (`7% used` → 7). The vendor floors its
-    /// own figure, so this is the painted integer, never re-derived.
+    /// own figure, so this is the painted integer, never re-derived. Codex's
+    /// card paints what is LEFT (`99% left`), and this is its complement
+    /// (`1`): the painted integer, turned round.
     pub used_pct: u32,
-    /// The text after `Resets `, exactly as painted and not placed on a clock.
-    /// `None` when the row carried no reset.
+    /// The text after `Resets `, exactly as painted and not placed on a clock
+    /// (on Codex's card, inside `(resets …)`). `None` when the row carried no
+    /// reset.
     pub reset_text: Option<String>,
 }
 
@@ -976,7 +1017,8 @@ fn reset_after(s: &str) -> Option<String> {
 }
 
 /// Lowercase, non-alphanumeric runs folded to `_`, bounded: the key half of
-/// an UNMEASURED `Current week (<display name>)` title.
+/// an UNMEASURED `Current week (<display name>)` title, and of a Codex card's
+/// label no window key names ([`codex_window_key`]).
 fn panel_key_slug(display: &str) -> Option<String> {
     let mut out = String::new();
     for c in display.chars() {
@@ -1098,6 +1140,271 @@ pub fn usage_panel_windows(rows: &[String]) -> Vec<PanelWindow> {
         return Vec::new();
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// Codex's `/status` card, read off aterm's own grid
+// ---------------------------------------------------------------------------
+
+/// What the first row inside a Codex card says (`>_ OpenAI Codex (v0.156.1)`):
+/// the `/status` card's, and the session card's it opens on, which carries no
+/// limit row.
+const CODEX_CARD_HEADER: &str = ">_ OpenAI Codex";
+
+/// What a card row holds between its side rules (`│ … │`); `None` for a row
+/// that is not one.
+fn card_row(row: &str) -> Option<&str> {
+    row.trim()
+        .strip_prefix('\u{2502}')?
+        .strip_suffix('\u{2502}')
+}
+
+/// The words inside `(resets …)` on a card row, or `None`.
+fn card_reset(s: &str) -> Option<String> {
+    let at = s.find("(resets ")? + "(resets ".len();
+    let rest = s.get(at..)?;
+    let text = rest.get(..rest.find(')')?)?.trim();
+    (!text.is_empty()).then(|| text.to_owned())
+}
+
+/// The windows the card names by their length (codex-rs labels a window
+/// `5h`, `weekly`, …), keyed as Claude Code's panel keys the same windows
+/// ([`PANEL_TITLES`]): Codex's own limit's are aterm's `five_hour` and
+/// `seven_day` (`docs/DESIGN-account-stats-2026-10-15.md` §7.2). Any other
+/// length is its label folded ([`panel_key_slug`]: `monthly`).
+const CODEX_CARD_WINDOWS: [(&str, &str); 2] = [("5h", "five_hour"), ("weekly", "seven_day")];
+
+/// A `<label> limit:` row of the card, its side rules gone: the label and
+/// what follows the colon.
+fn codex_limit_label(inner: &str) -> Option<(&str, &str)> {
+    let (label, value) = inner.trim().split_once(':')?;
+    Some((label.trim().strip_suffix(" limit")?, value))
+}
+
+/// What a limit row says after its label: the meter, `N% left`, and
+/// `(resets …)` where it fits on the row; read as what is used, the
+/// complement of what is left, and the reset's words.
+fn codex_limit_figure(value: &str) -> Option<(u32, Option<String>)> {
+    let at = value.find("% left")?;
+    let head = &value[..at];
+    let digits = head.len() - head.trim_end_matches(|c: char| c.is_ascii_digit()).len();
+    if digits == 0 {
+        return None;
+    }
+    let left: u32 = head[head.len() - digits..].parse().ok()?;
+    Some((100u32.checked_sub(left)?, card_reset(&value[at..])))
+}
+
+/// The key of the window a limit row labels ([`CODEX_CARD_WINDOWS`]).
+/// Another model's limit (`limit_name`, the accounts design's F11) labels
+/// its windows by length too, so its key carries its name, folded, in front
+/// (`<name>_five_hour`): under a `<name> limit:` row that heads it
+/// (`family`), or in a label of its own (`<name> 5h`, a limit with one
+/// window). `None` for a label that folds to nothing.
+fn codex_window_key(label: &str, family: Option<&str>) -> Option<String> {
+    let known = |label: &str| {
+        CODEX_CARD_WINDOWS
+            .iter()
+            .find(|(length, _)| label.eq_ignore_ascii_case(length))
+            .map(|(_, key)| (*key).to_owned())
+    };
+    let named = |name: &str, window: String| match panel_key_slug(name) {
+        Some(name) => format!("{name}_{window}"),
+        None => window,
+    };
+    if known(label).is_none()
+        && let Some((name, window)) = label
+            .rsplit_once(' ')
+            .and_then(|(name, length)| Some((name, known(length)?)))
+    {
+        return Some(named(name, window));
+    }
+    let window = known(label).or_else(|| panel_key_slug(label))?;
+    Some(match family {
+        Some(name) => named(name, window),
+        None => window,
+    })
+}
+
+/// The windows one card's rows name, read row by row ([`Self::feed`]): each
+/// `<label> limit:` row with a figure is a window, a `<name> limit:` row with
+/// none heads another model's limit, and a `(resets …)` row right under a
+/// window is that window's reset where its own row had none.
+#[derive(Default)]
+struct CardWindows {
+    windows: Vec<PanelWindow>,
+    /// The last row read was a window (its reset may be painted on the next).
+    after_window: bool,
+    /// The other model's limit a row above headed (its `<name> limit:`).
+    family: Option<String>,
+}
+
+impl CardWindows {
+    /// One card row, `inner` its text (a boxed row's between its side rules).
+    fn feed(&mut self, inner: &str) {
+        let after_window = std::mem::replace(&mut self.after_window, false);
+        if let Some((label, value)) = codex_limit_label(inner) {
+            if value.trim().is_empty() {
+                self.family = Some(label.to_owned());
+            } else if let Some((used_pct, reset_text)) = codex_limit_figure(value)
+                && let Some(name) = codex_window_key(label, self.family.as_deref())
+            {
+                self.windows.push(PanelWindow {
+                    name,
+                    used_pct,
+                    reset_text,
+                });
+                self.after_window = true;
+            }
+        } else if after_window
+            && inner.trim().starts_with("(resets ")
+            && let Some(window) = self.windows.last_mut()
+            && window.reset_text.is_none()
+        {
+            window.reset_text = card_reset(inner);
+        }
+    }
+}
+
+/// The rate-limit windows Codex painted on its `/status` card, read off the
+/// rows of aterm's own parsed grid. Two layouts are read, measured:
+///
+/// * codex 0.156.1 (2026-09-24) draws the card in a box:
+///
+/// ```text
+/// ╭────────────────────────────────────────────────────────────────────────╮
+/// │  >_ OpenAI Codex (v0.156.1)                                            │
+/// │  …                                                                     │
+/// │  Context window:  99% left (14.8K used / 258K)                         │
+/// │  Weekly limit:    [████████████████████] 99% left (resets 13:24 on 1 Oct) │
+/// ╰────────────────────────────────────────────────────────────────────────╯
+/// ```
+///
+///   Only a box whose first row is Codex's header ([`CODEX_CARD_HEADER`])
+///   and whose bottom rule is on the grid is read.
+/// * codex 0.163.0 (2026-10-16, the lab) draws it with no box, under the
+///   `/status` it answers, every row at column 2, its resets on a 12-hour
+///   clock where the TUI's is one:
+///
+/// ```text
+/// /status
+///
+///   >_ OpenAI Codex (v0.163.0)
+///   …
+///   Context window:      99% left (15.7K used / 258K)
+///   5h limit:            [██████████████░░░░░░] 70% left (resets 12:15 PM)
+///   Weekly limit:        [██████████████████░░] 90% left (resets 11:15 AM on 21 Oct)
+///   Credits:             13 credits
+///
+/// › Ask Codex to do anything
+/// ```
+///
+///   Only a header at column 2 whose nearest row above, past blanks, is the
+///   `/status` it answers, and whose rows (blank, or at column 2 or deeper)
+///   end on the grid at a row that is none of them (the composer), is read
+///   ([`unboxed_card`]); a provider with no limits (`Limits: data not
+///   available yet`) paints none.
+///
+/// Each `<label> limit:` row is a window (`5h limit` is `five_hour`, `Weekly
+/// limit` `seven_day`: [`codex_window_key`]): what it says is left, turned
+/// into what is used. A `<name> limit:` row with no figure heads another
+/// model's limit, whose windows below it carry its name. A reset that does
+/// not fit beside the figure is painted alone on the row under it (`(resets
+/// …)`). The context window is no limit and is not read, so a row quoted in
+/// a conversation is not; of two cards, either layout, the lower (the newer)
+/// is read. Credits are not read here: the card's figure is a balance, not
+/// Claude Code's notice that credits carry the session. The text is evidence
+/// of what was drawn, never an instruction.
+#[must_use]
+pub fn codex_status_windows(rows: &[String]) -> Vec<PanelWindow> {
+    /// The box open on the grid: whether its first row is Codex's header, how
+    /// many rows it has shown, and its windows.
+    struct Card {
+        codex: bool,
+        rows: usize,
+        read: CardWindows,
+    }
+    // The newest card read, by the row it ends on. A completed newer card
+    // supersedes history even when its quota is absent or unreadable.
+    let mut read: Option<(usize, Vec<PanelWindow>)> = None;
+    let mut keep = |end: usize, windows: Vec<PanelWindow>| {
+        if read.as_ref().is_none_or(|(at, _)| end > *at) {
+            read = Some((end, windows));
+        }
+    };
+    let mut open: Option<Card> = None;
+    for (i, row) in rows.iter().enumerate() {
+        if let Some(windows) = unboxed_card(rows, i) {
+            keep(i, windows);
+        }
+        let t = row.trim();
+        if t.starts_with('\u{256d}') {
+            open = Some(Card {
+                codex: false,
+                rows: 0,
+                read: CardWindows::default(),
+            });
+            continue;
+        }
+        if t.starts_with('\u{2570}') {
+            if let Some(card) = open.take()
+                && card.codex
+            {
+                keep(i, card.read.windows);
+            }
+            continue;
+        }
+        let Some(card) = open.as_mut() else {
+            continue;
+        };
+        let Some(inner) = card_row(row) else {
+            // Anything else between the rules is no card.
+            open = None;
+            continue;
+        };
+        card.rows += 1;
+        if card.rows == 1 {
+            card.codex = inner.trim().starts_with(CODEX_CARD_HEADER);
+            continue;
+        }
+        card.read.feed(inner);
+    }
+    read.map(|(_, windows)| windows).unwrap_or_default()
+}
+
+/// The command a `/status` card answers, as Codex 0.163.0 echoes it in the
+/// history above the card it draws.
+const STATUS_COMMAND: &str = "/status";
+
+/// The windows of the box-less card (codex 0.163.0, [`codex_status_windows`])
+/// whose LAST row is `rows[end - 1]`, read when `rows[end]` is the row that
+/// ends it: a row the card does not draw (neither blank nor at column 2 or
+/// deeper: the composer), under rows that run back to its header at column 2
+/// (`  >_ OpenAI Codex (v…)`), the nearest row above which, past blanks, is
+/// the `/status` it answers. `None` for any other `end`.
+fn unboxed_card(rows: &[String], end: usize) -> Option<Vec<PanelWindow>> {
+    let card_row = |r: &str| r.trim().is_empty() || r.starts_with("  ");
+    if card_row(rows.get(end)?) {
+        return None;
+    }
+    let first = rows[..end]
+        .iter()
+        .rposition(|r| !card_row(r))
+        .map_or(0, |at| at + 1);
+    let header = (first..end).find(|&i| {
+        rows[i]
+            .strip_prefix("  ")
+            .is_some_and(|r| r.starts_with(CODEX_CARD_HEADER))
+    })?;
+    let above = rows[..header].iter().rev().find(|r| !r.trim().is_empty())?;
+    if above.trim() != STATUS_COMMAND {
+        return None;
+    }
+    let mut read = CardWindows::default();
+    for row in &rows[header + 1..end] {
+        read.feed(row);
+    }
+    Some(read.windows)
 }
 
 // ---------------------------------------------------------------------------
@@ -1265,11 +1572,8 @@ pub fn panel_sample(
     })
 }
 
-/// The fold's per-model totals as spend rows, priced where the table allows.
-pub fn spend_from_transcript(
-    usage: &TranscriptUsage,
-    prices: &PriceTable,
-) -> BTreeMap<String, SpendView> {
+/// The fold's per-model totals as spend rows.
+pub fn spend_from_transcript(usage: &TranscriptUsage) -> BTreeMap<String, SpendView> {
     usage
         .per_model()
         .iter()
@@ -1281,7 +1585,7 @@ pub fn spend_from_transcript(
                     output: s.output,
                     cache_write: s.cache_write,
                     cache_read: s.cache_read,
-                    usd: prices.usd(model, s),
+                    usd: None,
                 },
             )
         })
@@ -1346,9 +1650,28 @@ pub fn hud_line(view: &UsageView) -> String {
         .map(model_short)
         .map(|m| sanitize(&m))
         .unwrap_or_else(|| "model?".to_owned());
+    let five = acct.windows.get("five_hour");
+    let seven = acct.windows.get("seven_day");
+    let pct =
+        |w: Option<&WindowView>| w.map_or_else(|| "?%".to_owned(), |w| format!("{}%", w.used_pct));
+    // The reset the HUD names: the five-hour window's, else the week's, as
+    // a span from the view's instant (no zone is read here).
+    let resets = five.or(seven).map_or_else(
+        || "?".to_owned(),
+        |w| {
+            let left = u64::try_from(w.resets_at.saturating_sub(view.as_of)).unwrap_or(0);
+            format!("in {}", super::upgrade::span(left))
+        },
+    );
+    let source = match five.or(seven) {
+        Some(w) => format!("tap {}", super::upgrade::span(w.age_s)),
+        None => "none".to_owned(),
+    };
     truncate_to(
         format!(
-            "{model} ?%/5h · ?%/7d · acct {} · resets ? · none",
+            "{model} {}/5h · {}/7d · acct {} · resets {resets} · {source}",
+            pct(five),
+            pct(seven),
             sanitize(&acct.label)
         ),
         HUD_MAX_BYTES,
@@ -1373,19 +1696,19 @@ pub fn rfc3339_utc(epoch: i64) -> String {
     )
 }
 
-fn opt_f64(v: Option<f64>) -> Value {
-    v.filter(|f| f.is_finite()).map_or(Value::Null, Value::from)
-}
-
 fn spend_json(s: &SpendView) -> Value {
     let mut o = Map::new();
     o.insert("in".to_owned(), Value::from(s.input));
     o.insert("out".to_owned(), Value::from(s.output));
     o.insert("cache_write".to_owned(), Value::from(s.cache_write));
     o.insert("cache_read".to_owned(), Value::from(s.cache_read));
+    // Schema 1 keeps the key: null where the caller priced nothing (module
+    // doc); Codex's list dollars where every turn of the row was priced.
     o.insert(
         "usd".to_owned(),
-        opt_f64(s.usd.map(|u| (u * 10_000.0).round() / 10_000.0)),
+        s.usd
+            .filter(|u| u.is_finite())
+            .map_or(Value::Null, Value::from),
     );
     Value::Object(o)
 }
@@ -1393,13 +1716,25 @@ fn spend_json(s: &SpendView) -> Value {
 fn account_json(a: &AccountView) -> Value {
     let mut o = Map::new();
     o.insert("label".to_owned(), Value::from(a.label.as_str()));
-    if let Some(dir) = &a.dir {
-        o.insert("dir".to_owned(), Value::from(dir.as_str()));
-    }
     o.insert("active".to_owned(), Value::from(a.active));
-    // No window is known here (module doc); the key stays, empty, as every
-    // live run printed it.
-    o.insert("windows".to_owned(), Value::Object(Map::new()));
+    // The usage tap's windows, by the vendor's name; empty where the session
+    // has no reading (module doc), as every run before the tap printed it.
+    o.insert(
+        "windows".to_owned(),
+        Value::Object(
+            a.windows
+                .iter()
+                .map(|(name, w)| {
+                    let mut m = Map::new();
+                    m.insert("used_pct".to_owned(), Value::from(u64::from(w.used_pct)));
+                    m.insert("resets_at".to_owned(), Value::from(w.resets_at));
+                    m.insert("source".to_owned(), Value::from("tap"));
+                    m.insert("age_s".to_owned(), Value::from(w.age_s));
+                    (name.clone(), Value::Object(m))
+                })
+                .collect(),
+        ),
+    );
     o.insert(
         "spend".to_owned(),
         Value::Object(
@@ -2074,60 +2409,8 @@ mod tests {
         assert_eq!(t.per_model()["model-000"].messages, 2);
     }
 
-    // -- PriceTable ---------------------------------------------------------
-
     #[test]
-    fn price_table_prices_only_what_the_caller_supplied() {
-        let spend = ModelSpend {
-            input: 1_000_000,
-            output: 500_000,
-            cache_write: 200_000,
-            cache_read: 4_000_000,
-            messages: 9,
-        };
-        let empty = PriceTable::new();
-        assert_eq!(
-            empty.usd("claude-fable-5-1", &spend),
-            None,
-            "no built-in prices"
-        );
-        let table = PriceTable::new().with(
-            "claude-fable-5-1",
-            ModelPrice {
-                input: 3.0,
-                output: 15.0,
-                cache_write: 3.75,
-                cache_read: 0.3,
-            },
-        );
-        let usd = table.usd("claude-fable-5-1", &spend).expect("priced");
-        // 3 + 7.5 + 0.75 + 1.2
-        assert!((usd - 12.45).abs() < 1e-9, "{usd}");
-        assert_eq!(table.usd("claude-fable-5", &spend), None, "exact id only");
-        let bad = PriceTable::new().with(
-            "m",
-            ModelPrice {
-                input: -1.0,
-                ..ModelPrice::default()
-            },
-        );
-        assert_eq!(
-            bad.usd("m", &spend),
-            None,
-            "a negative price is not a price"
-        );
-        let nan = PriceTable::new().with(
-            "m",
-            ModelPrice {
-                output: f64::NAN,
-                ..ModelPrice::default()
-            },
-        );
-        assert_eq!(nan.usd("m", &spend), None);
-    }
-
-    #[test]
-    fn spend_from_transcript_carries_tokens_and_prices_where_known() {
+    fn spend_from_transcript_carries_tokens() {
         let mut t = TranscriptUsage::new();
         fold_all(
             &mut t,
@@ -2136,22 +2419,40 @@ mod tests {
                 &assistant_row("msg_b", "claude-opus-5", 10, 0),
             ],
         );
-        let prices = PriceTable::new().with(
-            "claude-fable-5-1",
-            ModelPrice {
-                input: 2.0,
-                ..ModelPrice::default()
-            },
-        );
-        let spend = spend_from_transcript(&t, &prices);
+        let spend = spend_from_transcript(&t);
         assert_eq!(spend["claude-fable-5-1"].input, 1_000_000);
         assert_eq!(spend["claude-fable-5-1"].cache_read, 1000);
-        // Only the input price was supplied; the cache tokens price at 0.
-        assert!((spend["claude-fable-5-1"].usd.expect("priced") - 2.0).abs() < 1e-9);
-        assert_eq!(
-            spend["claude-opus-5"].usd, None,
-            "unpriced is unknown, not zero"
-        );
+        assert_eq!(spend["claude-opus-5"].input, 10);
+    }
+
+    /// THE ONE-HOUR WRITES ARE KEPT APART: 800 of the row's 1000 cache writes
+    /// are one-hour ones (`cache_creation.ephemeral_1h_input_tokens`, the key
+    /// MEASURED by name on Claude Code 2.1.30x transcripts), which list higher
+    /// than five-minute ones. A split larger than the total is held to it, and
+    /// a split with no total sums to one. Negative control: a row with no
+    /// split reads every write as a five-minute one.
+    #[test]
+    fn one_hour_cache_writes_are_kept_apart() {
+        let split = r#"{"type":"assistant","message":{"id":"msg_s","model":"m","usage":{"input_tokens":10,"cache_creation_input_tokens":1000,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":200,"ephemeral_1h_input_tokens":800},"output_tokens":0}}}"#;
+        let over = r#"{"type":"assistant","message":{"id":"msg_o","model":"o","usage":{"cache_creation_input_tokens":5,"cache_creation":{"ephemeral_1h_input_tokens":9}}}}"#;
+        let only_split = r#"{"type":"assistant","message":{"id":"msg_p","model":"p","usage":{"cache_creation":{"ephemeral_5m_input_tokens":2,"ephemeral_1h_input_tokens":3}}}}"#;
+        let bare = r#"{"type":"assistant","message":{"id":"msg_b","model":"b","usage":{"cache_creation_input_tokens":1000}}}"#;
+        let mut t = TranscriptUsage::new();
+        for line in [split, over, only_split, bare] {
+            assert_eq!(t.fold_line(line), Fold::Summed);
+        }
+        let held = |t: &TranscriptUsage, m: &str| {
+            let s = t.per_model()[m];
+            (s.cache_write, s.cache_write_1h)
+        };
+        assert_eq!(held(&t, "m"), (1000, 800));
+        assert_eq!(held(&t, "o"), (5, 5));
+        assert_eq!(held(&t, "p"), (5, 3));
+        // NEGATIVE CONTROL.
+        assert_eq!(held(&t, "b"), (1000, 0));
+        // A streamed repeat raises the split with the rest.
+        t.fold_line(&split.replace("800}", "900}").replace(":1000,", ":1100,"));
+        assert_eq!(held(&t, "m"), (1100, 900));
     }
 
     // -- the view -----------------------------------------------------------
@@ -2175,7 +2476,7 @@ mod tests {
         );
         assert_eq!(t.last_model(), Some("claude-fable-5-1"));
         let mut a = AccountView::new("work", true);
-        a.add_transcript(&t, &PriceTable::new());
+        a.add_transcript(&t);
         assert_eq!(a.model.as_deref(), Some("claude-fable-5-1"));
         // A row that names no model: nothing named.
         let mut none = TranscriptUsage::new();
@@ -2185,7 +2486,7 @@ mod tests {
         );
         assert_eq!(none.last_model(), None);
         let mut a = AccountView::new("work", true);
-        a.add_transcript(&none, &PriceTable::new());
+        a.add_transcript(&none);
         assert_eq!(a.model, None);
     }
 
@@ -2210,7 +2511,7 @@ mod tests {
         assert_eq!(all.last_model(), Some("claude-fable-5-1"));
         assert_eq!(all.per_model().len(), 2, "both files' spend is summed");
         let mut a = AccountView::new("account", true);
-        a.add_transcript(&all, &PriceTable::new());
+        a.add_transcript(&all);
         assert_eq!(a.model.as_deref(), Some("claude-fable-5-1"));
         // Negative control: nothing named anywhere, nothing named in the sum.
         let mut none = TranscriptUsage::new();
@@ -2236,7 +2537,7 @@ mod tests {
         );
         assert_eq!(t.last_model(), Some("claude-fable-5-1"));
         let mut a = AccountView::new("account", true);
-        a.add_transcript(&t, &PriceTable::new());
+        a.add_transcript(&t);
         assert_eq!(
             hud_line(&view_with(a)),
             "fable ?%/5h · ?%/7d · acct account · resets ? · none"
@@ -2278,6 +2579,53 @@ mod tests {
             hud_line(&view_with(AccountView::new("work", true))),
             "model? ?%/5h · ?%/7d · acct work · resets ? · none"
         );
+    }
+
+    /// A USAGE TAP'S READING fills the windows: the HUD shows both figures,
+    /// the five-hour reset as a span from the view's instant and the
+    /// reading's age, and the JSON's `windows` (schema 1's own key, empty
+    /// before) carries each by the vendor's name. NEGATIVE CONTROL: a window
+    /// the reading has not is still `?%`, and no reading leaves `windows`
+    /// empty and the HUD's `none`.
+    #[test]
+    fn a_tap_reading_fills_the_windows_of_the_hud_and_the_json() {
+        let reading = crate::harness::tap::Reading {
+            at: 1_000,
+            sid: "s-1".to_string(),
+            pid: 7,
+            session: None,
+            login: None,
+            home: None,
+            api_ms: 5,
+            five_hour: Some(crate::harness::tap::Window {
+                pct: 42,
+                resets_at: 1_000 + 2 * 3_600 + 30 * 60,
+            }),
+            seven_day: None,
+            warm: None,
+            cache_expires_at: None,
+            version: None,
+            dur_us: 0,
+        };
+        let mut a = live_account();
+        a.add_reading(&reading, 1_012);
+        let mut view = UsageView::new(1_012);
+        view.accounts.push(a);
+        let line = hud_line(&view);
+        assert!(
+            line.starts_with("fable 42%/5h · ?%/7d · acct work · resets in "),
+            "{line}"
+        );
+        assert!(line.ends_with(" · tap 12s"), "{line}");
+        let json: Value = aterm_json::from_str(&usage_json(&view)).expect("json");
+        let five = &json["accounts"][0]["windows"]["five_hour"];
+        assert_eq!(five["used_pct"], Value::from(42u64));
+        assert_eq!(five["source"], Value::from("tap"));
+        assert_eq!(five["age_s"], Value::from(12u64));
+        assert!(json["accounts"][0]["windows"].get("seven_day").is_none());
+        let bare: Value =
+            aterm_json::from_str(&usage_json(&view_with(live_account()))).expect("json");
+        assert_eq!(bare["accounts"][0]["windows"], Value::Object(Map::new()));
     }
 
     #[test]
@@ -2345,7 +2693,6 @@ mod tests {
     #[test]
     fn usage_json_is_schema_1_and_round_trips_through_the_parser() {
         let mut work = live_account();
-        work.dir = Some("/Users/_x/.claude".to_owned());
         let mut t = TranscriptUsage::new();
         fold_all(
             &mut t,
@@ -2354,16 +2701,7 @@ mod tests {
                 &assistant_row("msg_b", "claude-opus-5", 10, 0),
             ],
         );
-        let prices = PriceTable::new().with(
-            "claude-fable-5-1",
-            ModelPrice {
-                input: 3.0,
-                output: 15.0,
-                cache_write: 3.75,
-                cache_read: 0.3,
-            },
-        );
-        work.add_transcript(&t, &prices);
+        work.add_transcript(&t);
         let alt = AccountView::new("alt-1", false);
         let mut v = UsageView::new(1_789_650_000);
         v.accounts.push(work);
@@ -2377,7 +2715,6 @@ mod tests {
         assert_eq!(accounts.len(), 2);
         let w = &accounts[0];
         assert_eq!(w["label"].as_str(), Some("work"));
-        assert_eq!(w["dir"].as_str(), Some("/Users/_x/.claude"));
         assert_eq!(w["active"].as_bool(), Some(true));
         // The newest summed row of the transcript names the model.
         assert_eq!(w["model"].as_str(), Some("claude-opus-5"));
@@ -2388,16 +2725,11 @@ mod tests {
         assert_eq!(fable["out"].as_u64(), Some(0));
         assert_eq!(fable["cache_write"].as_u64(), Some(10));
         assert_eq!(fable["cache_read"].as_u64(), Some(1000));
-        // 3.0 + 0 + 0.0000375 + 0.0003 → 3.0003375 → 3.0003 at four places.
-        assert_eq!(fable["usd"].as_f64(), Some(3.0003));
-        assert!(
-            w["spend"]["claude-opus-5"]["usd"].is_null(),
-            "unpriced is null"
-        );
+        // No price is known: the key stays, null.
+        assert!(fable["usd"].is_null());
         let a = &accounts[1];
         assert_eq!(a["active"].as_bool(), Some(false));
         assert!(a.get("model").is_none());
-        assert!(a.get("dir").is_none());
         assert!(a["windows"].as_object().is_some_and(Map::is_empty));
         assert!(a["spend"].as_object().is_some_and(Map::is_empty));
         assert_eq!(j["sheet"]["enabled"].as_bool(), Some(false));
@@ -2509,13 +2841,303 @@ mod tests {
         assert!(usage_panel_windows(&[]).is_empty());
     }
 
+    // -- Codex's `/status` card --------------------------------------------
+
+    /// A card as codex-rs lays it out: its header row first, `body` between,
+    /// its rules at `width` columns.
+    fn codex_card(body: &[&str]) -> Vec<String> {
+        let width = 90;
+        let row = |text: &str| {
+            let pad = width - text.chars().count();
+            format!("\u{2502}{text}{}\u{2502}", " ".repeat(pad))
+        };
+        let rule = "\u{2500}".repeat(width);
+        std::iter::once(format!("\u{256d}{rule}\u{256e}"))
+            .chain(std::iter::once(row("  >_ OpenAI Codex (v0.156.1)")))
+            .chain(body.iter().map(|text| row(text)))
+            .chain(std::iter::once(format!("\u{2570}{rule}\u{256f}")))
+            .collect()
+    }
+
+    /// MEASURED (codex 0.156.1, 2026-09-24): the `/status` card's one limit
+    /// row, `Weekly limit: […] 99% left (resets 13:24 on 1 Oct)`, is a window,
+    /// `seven_day` (the key Claude Code's weekly window has), 1% used, its
+    /// reset as painted; the `Context window: 99% left` row above it is no
+    /// limit and is not read.
+    #[test]
+    fn the_codex_status_card_paints_its_weekly_window() {
+        use aterm_phase::codex::fixtures::STATUS;
+        let got = codex_status_windows(&fx::screen(STATUS));
+        assert_eq!(
+            got,
+            vec![PanelWindow {
+                name: String::from("seven_day"),
+                used_pct: 1,
+                reset_text: Some(String::from("13:24 on 1 Oct")),
+            }]
+        );
+        // NEGATIVE CONTROL: Claude Code's reader finds no panel on it.
+        assert!(usage_panel_windows(&fx::screen(STATUS)).is_empty());
+    }
+
+    /// MEASURED (codex 0.163.0, 2026-10-16, the lab, a composed ChatGPT
+    /// login at 5h 30% and weekly 10% used): the card is drawn with no box
+    /// under the `/status` it answers, and read the same: `five_hour` 30%
+    /// used, reset `12:15 PM`, and `seven_day` 10%, reset `11:15 AM on 21 Oct`
+    /// (a 12-hour clock); the `Context window` and `Credits` rows are no
+    /// limit. With the 5h window spent (the same login later) the newer card
+    /// reads it 100% used, under an older card scrolled past its header. The
+    /// lab provider's card says `Limits: data not available yet`: no window.
+    #[test]
+    fn the_codex_0_163_status_card_is_read_without_its_box() {
+        let window = |name: &str, used_pct, reset: &str| PanelWindow {
+            name: name.to_owned(),
+            used_pct,
+            reset_text: Some(reset.to_owned()),
+        };
+        let credits = fx::screen(include_str!(
+            "../../../aterm-phase/src/fixtures/codex-0.163.0-status-card-chatgpt-credits.txt"
+        ));
+        assert_eq!(
+            codex_status_windows(&credits),
+            vec![
+                window("five_hour", 30, "12:15 PM"),
+                window("seven_day", 10, "11:15 AM on 21 Oct"),
+            ]
+        );
+        let spent = fx::screen(include_str!(
+            "../../../aterm-phase/src/fixtures/codex-0.163.0-status-card-chatgpt-credits-in-use.txt"
+        ));
+        assert_eq!(
+            codex_status_windows(&spent),
+            vec![
+                window("five_hour", 100, "12:15 PM"),
+                window("seven_day", 10, "11:15 AM on 21 Oct"),
+            ]
+        );
+        let lab = fx::screen(include_str!(
+            "../../../aterm-phase/src/fixtures/codex-0.163.0-status-card-lab-provider.txt"
+        ));
+        assert!(codex_status_windows(&lab).is_empty(), "no limits painted");
+        // Each reset is the card's clock.
+        for (w, at) in [("12:15 PM", (12, 15)), ("11:15 AM on 21 Oct", (11, 15))] {
+            assert!(
+                matches!(
+                    crate::supervise::limit::parse_card_reset(w),
+                    Some(crate::supervise::limit::ResetSpec::At { hour, minute, .. })
+                        if (hour, minute) == at
+                ),
+                "{w}"
+            );
+        }
+    }
+
+    /// The box-less card's reader ([`unboxed_card`]) refuses what is not the
+    /// card. NEGATIVE CONTROLS, each the measured card with one thing
+    /// changed: no `/status` above its header (a card quoted in a message);
+    /// no row under it that ends it (the card runs off the grid); its header
+    /// not at column 2; the session card Codex opens on (no limit row).
+    #[test]
+    fn the_codex_0_163_card_reader_refuses_what_is_not_the_card() {
+        let credits = fx::screen(include_str!(
+            "../../../aterm-phase/src/fixtures/codex-0.163.0-status-card-chatgpt-credits.txt"
+        ));
+        assert_eq!(codex_status_windows(&credits).len(), 2, "the control");
+        let status = credits
+            .iter()
+            .position(|r| r == "/status")
+            .expect("the command");
+        let mut quoted = credits.clone();
+        quoted[status] = "• Here is my card:".to_string();
+        assert!(codex_status_windows(&quoted).is_empty(), "no /status above");
+        let composer = credits
+            .iter()
+            .rposition(|r| r.starts_with('›'))
+            .expect("the composer");
+        assert!(
+            codex_status_windows(&credits[..composer]).is_empty(),
+            "nothing ends it"
+        );
+        let shifted: Vec<String> = credits
+            .iter()
+            .map(|r| {
+                if r.contains(">_ OpenAI Codex") {
+                    format!("  {r}")
+                } else {
+                    r.clone()
+                }
+            })
+            .collect();
+        assert!(
+            codex_status_windows(&shifted).is_empty(),
+            "the header off column 2"
+        );
+        let idle = fx::screen(include_str!(
+            "../../../aterm-phase/src/fixtures/codex-0.163.0-idle.txt"
+        ));
+        assert!(codex_status_windows(&idle).is_empty(), "the session card");
+    }
+
+    /// Every `<label> limit:` row of the card is a window, keyed by the
+    /// window its label names (`5h` is `five_hour`, `Weekly` `seven_day`,
+    /// another length its label folded); a reset that does not fit beside the
+    /// figure is read off the row under it, alone; a row with no reset has
+    /// none; a full window is 100% used. Of two cards, the lower (the newer)
+    /// is read.
+    #[test]
+    fn every_limit_row_of_the_codex_card_is_a_window() {
+        let card = codex_card(&[
+            "  Context window:   99% left (14.8K used / 258K)",
+            "  5h limit:         [████████████████░░░░] 80% left",
+            "                    (resets 18:05)",
+            "  Weekly limit:     [░░░░░░░░░░░░░░░░░░░░] 0% left (resets 13:24 on 1 Oct)",
+            "  Monthly limit:    [████████████████████] 100% left",
+        ]);
+        let window = |name: &str, used_pct, reset: Option<&str>| PanelWindow {
+            name: name.to_owned(),
+            used_pct,
+            reset_text: reset.map(str::to_owned),
+        };
+        assert_eq!(
+            codex_status_windows(&card),
+            vec![
+                window("five_hour", 20, Some("18:05")),
+                window("seven_day", 100, Some("13:24 on 1 Oct")),
+                window("monthly", 0, None),
+            ]
+        );
+        let older = codex_card(&["  Weekly limit:     [██████████] 50% left (resets 09:00)"]);
+        let both: Vec<String> = older.into_iter().chain(card.clone()).collect();
+        assert_eq!(codex_status_windows(&both).len(), 3, "the newer card");
+    }
+
+    /// The newest completed Codex card owns the reading even when it is the
+    /// session card, which paints no quota. An older `/status` card left in
+    /// the transcript must not supply this card's windows.
+    #[test]
+    fn a_newer_codex_card_without_limits_retires_older_windows() {
+        let older = codex_card(&["  Weekly limit:     [██████████] 50% left"]);
+        assert_eq!(codex_status_windows(&older)[0].used_pct, 50);
+        let newer = codex_card(&["  Model:            GPT-5.6-Luna"]);
+        assert!(codex_status_windows(&newer).is_empty());
+        let both: Vec<String> = older.into_iter().chain(newer).collect();
+        assert!(
+            codex_status_windows(&both).is_empty(),
+            "the newest card paints no quota; the older card is history"
+        );
+    }
+
+    /// An unreadable figure on the newest completed card is unknown, not
+    /// permission to reuse an older card's readable figure. Positive control:
+    /// a newer valid figure replaces the old one as before.
+    #[test]
+    fn an_unreadable_newer_codex_limit_retires_older_windows() {
+        let older = codex_card(&["  Weekly limit:     [██████████] 50% left"]);
+        let valid = codex_card(&["  Weekly limit:     [███████████████] 75% left"]);
+        let valid_pair: Vec<String> = older.iter().cloned().chain(valid).collect();
+        assert_eq!(
+            codex_status_windows(&valid_pair)
+                .into_iter()
+                .map(|window| window.used_pct)
+                .collect::<Vec<_>>(),
+            vec![25],
+            "the newer valid card owns the reading"
+        );
+        let invalid = codex_card(&["  Weekly limit:     [████] 101% left"]);
+        assert!(codex_status_windows(&invalid).is_empty());
+        let both: Vec<String> = older.into_iter().chain(invalid).collect();
+        assert!(
+            codex_status_windows(&both).is_empty(),
+            "the unreadable current quota must not become the older quota"
+        );
+    }
+
+    /// ANOTHER MODEL'S LIMIT on the card (`limit_name`, the accounts design's
+    /// F11; UNMEASURED, laid out as codex-rs's status card lays it: a
+    /// `<name> limit:` row with no figure over its windows, or `<name> <length>
+    /// limit` for a limit with one window) labels its windows by length as
+    /// Codex's own do, and is keyed with its name in front: its `5h` is never
+    /// read as Codex's `five_hour`. NEGATIVE CONTROL: Codex's own windows
+    /// above it keep the bare keys.
+    #[test]
+    fn another_models_limit_on_the_codex_card_keeps_its_own_keys() {
+        let card = codex_card(&[
+            "  5h limit:                    [████████████████░░░░] 80% left (resets 18:05)",
+            "  Weekly limit:                [████████████████████] 99% left",
+            "  GPT-5.3-Codex-Spark limit:",
+            "  5h limit:                    [░░░░░░░░░░░░░░░░░░░░] 0% left (resets 19:00)",
+            "  Weekly limit:                [██████████████████░░] 90% left",
+            "  GPT-5.6-Mini weekly limit:   [███████████████░░░░░] 75% left",
+        ]);
+        let keys: Vec<(String, u32)> = codex_status_windows(&card)
+            .into_iter()
+            .map(|w| (w.name, w.used_pct))
+            .collect();
+        let want = |rows: &[(&str, u32)]| -> Vec<(String, u32)> {
+            rows.iter().map(|(k, u)| ((*k).to_owned(), *u)).collect()
+        };
+        assert_eq!(
+            keys,
+            want(&[
+                ("five_hour", 20),
+                ("seven_day", 1),
+                ("gpt_5_3_codex_spark_five_hour", 100),
+                ("gpt_5_3_codex_spark_seven_day", 10),
+                ("gpt_5_6_mini_seven_day", 25),
+            ])
+        );
+    }
+
+    /// The card's reader refuses what is not the card. NEGATIVE CONTROLS: the
+    /// session card Codex opens on (its header, no limit row); a limit row
+    /// quoted outside a card; a box that is not Codex's; a card whose bottom
+    /// rule is not on the grid; a `(resets …)` row that follows no window;
+    /// and a figure past 100% left.
+    #[test]
+    fn the_codex_card_reader_refuses_what_is_not_the_card() {
+        use aterm_phase::codex::fixtures::IDLE;
+        assert!(
+            codex_status_windows(&fx::screen(IDLE)).is_empty(),
+            "the session card"
+        );
+        assert!(
+            codex_status_windows(&rows(
+                "• Weekly limit:     [████] 99% left (resets 13:24 on 1 Oct)\n"
+            ))
+            .is_empty(),
+            "a quoted row"
+        );
+        let mut other = codex_card(&["  Weekly limit:     [████] 99% left (resets 13:24)"]);
+        other[1] = other[1].replace(">_ OpenAI Codex", ">_ Another Tool ");
+        assert!(codex_status_windows(&other).is_empty(), "not Codex's box");
+        let mut cut = codex_card(&["  Weekly limit:     [████] 99% left (resets 13:24)"]);
+        cut.pop();
+        assert!(codex_status_windows(&cut).is_empty(), "no bottom rule");
+        let stray = codex_card(&[
+            "  Model:            GPT-5.6-Luna",
+            "                    (resets 13:24)",
+            "  Weekly limit:     [████] 99% left",
+        ]);
+        assert_eq!(
+            codex_status_windows(&stray)
+                .into_iter()
+                .map(|w| w.reset_text)
+                .collect::<Vec<_>>(),
+            vec![None],
+            "a reset under no window is no window's"
+        );
+        let past = codex_card(&["  Weekly limit:     [████] 101% left"]);
+        assert!(codex_status_windows(&past).is_empty(), "past 100% left");
+        assert!(codex_status_windows(&[]).is_empty());
+    }
+
     // -- the accounts probe's read: the Settings panel, the settled rule ------
 
     use aterm_phase::prompt::fixtures as fx;
 
     /// MEASURED: the one whole-screen capture of the panel on Claude Code
-    /// 2.1.278, 2026-09-22 (`tools/harness-capture.sh`; the vendor corpus,
-    /// whose manifest holds its digest): 46 rows at 56 columns, the `▔` rule
+    /// 2.1.278, 2026-09-22 (the vendor corpus, whose manifest records its
+    /// digest): 46 rows at 56 columns, the `▔` rule
     /// on row 3, the header on row 4, three windows in the narrow layout,
     /// and the vendor's `↓` ending row 46 — the tail is under the fold.
     const SCREEN_2_1_278: &str =

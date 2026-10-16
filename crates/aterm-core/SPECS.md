@@ -1,0 +1,1985 @@
+<!-- Copyright 2026 Andrew Yates -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
+# aterm-core: spec recovery from its 1364 unit tests
+
+> Status 2026-10-15: this is the crate's migration worklist. Each of the 292 specs below is proved
+> through Trust/Clean about the compiled Rust function, then the tests it subsumes are deleted in the
+> same commit. The 42 tests in §4 sample no spec and can go now (or move to a bench). No test has
+> been deleted yet, and no spec here is proved yet.
+
+Source: `crates/aterm-core` (read only). Every `#[test]` was read together with the code it reaches:
+`src/render.rs`, `src/bell.rs`, `src/fault.rs`, `src/terminal/**` (unit tests and the `*_tests.rs` /
+`*_conformance.rs` modules), `tests/*.rs` (integration tests) and `test_support/**`. Nothing was compiled
+or run; every claim comes from reading the code. The recovery ran in five parallel chunks; this file
+merges them, keeps one spec where two chunks found the same property from different files, and unifies
+the notation (§0).
+
+Result: **292 specs**, covering **1322 tests**. **42 tests are not spec samples** (§4).
+Every one of the 1364 tests is either mapped in §2 or listed in §4.
+
+## 0. Notation used in the statements
+
+- Paths. Test ids in §2 and §4 are relative to `crates/aterm-core/` (`src/...`, `tests/...`,
+  `test_support/...`); every path is spelled out.
+- `Reach`: the Terminals reachable from `Terminal::new(r,c)` (r,c ≥ 1), `Terminal::with_scrollback`,
+  `TerminalBuilder::build`, `from_checkpoint` or `restore_checkpoint` by any sequence of public calls:
+  `process`, `process_at`, `resize`, `resize_with_policy`, `resize_offloading_scrollback` +
+  `finish_resize_offload`, `scroll_display`, `apply_config`, `apply_policy_engine`, the host setters
+  (`set_default_*`, `set_palette_*`, `authorize_*`, `revoke_*`, `set_*_callback`,
+  `set_console_host_posture`, `set_kitty_keyboard_enabled`), `leave_alternate_screen`, `reset`,
+  `take_damage`, `take_response`, `cell_frame*`, `search*`, `watch*`. A statement written "∀ T" ranges
+  over `Reach`.
+- Feeding bytes. `process(T,x)`, `feed(T,x)` and `step(T,x)` are the same thing. `process_at(T,x,c)`
+  (also written `Batch(T,x,c)`) takes an injected `ClockReading c`; `process(x) = process_at(x, now)`.
+- `Resp(T)` = `T.take_response()`. `DECRQM(T,m)` = `Resp(process(T, CSI ? m $ p))`.
+- `Inv(T)`: rows, cols > 0, cursor.row < rows, cursor.col ≤ cols (col = cols is the pending-wrap
+  column), and the aterm-grid checks `assert_structural_invariants` (cursor, scroll region, ring,
+  KeysCoverRetained), `assert_wide_char_consistent` and `assert_extras_claimed`.
+- `ObsFull(T)` = `checkpoint(T)`, every visible cell's packed bits and resolved extras (combining,
+  cluster, link, underline colour, image layers, resolved fg/bg), every row's len and text, the cursor,
+  pending wrap, title, the alt archive read, and the concatenated replies. `Obs(T)` is the visible grid
+  + cursor + modes + keyboard and mouse state + both scrollbacks + title/icon/cwd. `ObsH` (handoff) is
+  defined in `checkpoint-carry-continues`.
+- `Abs(T,r)`: the content of absolute row key `r` (history from `oldest_absolute_row()`, then the
+  viewport). `H(T)` = `scrollback_lines()`, `R`/`C` = rows/cols, `d` = `display_offset()`.
+- `LL(T)`: the logical lines (history oldest first, then the screen, wrapped rows joined). A recorded
+  early-wrap hole is dropped; any other cell, a printed blank included, is kept.
+- `HP(T)`: the host-policy modes `reset_modes` copies (osc52 query/set, window ops, notifications,
+  palette reconfigure, require nonce, kitty keyboard enabled, win32 input enabled, ambiguous width,
+  colour scheme).
+- `Carry(T,n)` = `checkpoint_carry(T,n)` or the first half of `checkpoint_carry_abandoning_partial`;
+  `Adopt(S,cp)` = `restore_checkpoint(S,cp)` or `from_checkpoint(cp)`.
+- `ConsoleHost(T)` ⇔ the ConPty resize posture (`win32_input_enabled`). `REPORTED` = the domain on which
+  `handle_decrqm` answers 1 or 2 (read from the function, not from a hand-kept list).
+- Character classes: C0 = U+0000..001F, C1 = U+0080..009F, BIDI9 = U+202A..202E and U+2066..2069.
+- `FullRender(T)` = `T.cell_frame(rows, cols)` compared by RenderInput's content-only `PartialEq`.
+  `Content(f)` is the field tuple that `PartialEq` names; frame rows are ragged (only the written prefix).
+- Content-scroll signals: `CSS` = `ContentScrollState{uniform_up_rows, invalidation_epoch, band_batches,
+  band_seq, bands[16]}`; `U, δ, F, B` = the grid's drained selection update, scroll delta, coordinates
+  flag and row band moves; `ΔX` = the change of field X across one batch.
+- Alt-archive scroll model: a transcript T of rows shown through a viewport of height t at top v_k,
+  optional fixed header rows above and chrome rows below. Steps are appends, scroll-backs and -forwards,
+  jumps, in-place edits, resizes, blank screens, leave and enter. An anchor row has ≥ MIN_ANCHOR_CHARS
+  visible chars and is distinct in the transcript.
+- `KittyModel`: images id → (first-sent seq, frames, gaps, animation state, loops), placements
+  (image, placement id) → (anchor | virtual | relative(parent, dx, dy), layout, z, seq), number → id, the
+  pending chunk and the byte total. Kitty specs are refinements of it.
+- `Conhost(T, r', c')`: a model of conhost's resize (the old viewport kept row-0-anchored, rewrapped at
+  c', conhost's demotion rule, conhost's CUP). It must be authored with `ty_model!`.
+- Vi mode: a vi line is live-relative (0..R−1 the screen, −k the k-th newest history line, independent of
+  d). `Reads(g)` = the `BufferAccess` reads of a grid; `OnGrid(p)` ⇔ −H ≤ line ≤ R−1 ∧ col ≤ C−1;
+  `clampG` clamps onto that box; `follow(l, Moves)` is the fold in `vi_follow_output`.
+- Repaint nudge: `NudgeRun` = `arm`/`step`/`let_go` over Facts with nondecreasing `now_ms`; the host
+  applies Hold as pty := (engine.rows−1, cols) and Release as pty := engine.
+- "refines M": the stated projection of every reachable real state is a state of the `ty_model!` model M
+  (`aterm_spec::derive`), each real step is admitted as the named action, and M's `Buggy` members are
+  rejected (the negative control).
+- Kinds: contract (requires/ensures), invariant (type or trace invariant over Reach), equivalence (two
+  functions or two paths agree), refinement (code refines a model), round-trip, table-property (decidable
+  by evaluating a finite table), no-panic, other (cost, call-graph, purity, cross-crate composition).
+- Gaps: numbers are the rows of §7 in the historical development audit
+  `docs/AUDIT-trust-for-test-migration-2026-10-15.md`.
+  Gap 0 (a seal that publishes Clean rows) blocks every spec and is not repeated per row. Floating-point
+  specs have no row of their own; they are filed under 3 and 6.
+- Six specs (`gr-*`, `sx-*`, `width-table-ucd`, parts of `key-encoding-composition`) are about code in
+  aterm-grapheme, aterm-sixel or aterm-types that aterm-core's tests exercise. They are listed here
+  because the tests live here; their proofs belong to those crates.
+
+## 1. Specs (TSV)
+
+Columns: `id`, `kind`, `functions`, `statement`, `blocking_gaps` (audit §7; gap 0 implied), `tests`
+(primary / total that sample it; the list is in §2), `difficulty` (Rust features the proof must handle).
+
+```tsv
+id	kind	functions	statement	blocking_gaps	tests	difficulty
+bell-flash-model	refinement	bell::BellFlash::{new,ring,is_active,deadline,expire}	BellFlash refines the one-variable model d: Option<Instant>. new(): d=None. ring(now): d' = Some(now+FLASH_DURATION), so a ring during a flash extends it. is_active(now) ⇔ d = Some(x) ∧ now < x. deadline() = d. expire(now) returns true with d' = None iff d = Some(x) ∧ now ≥ x; otherwise false with d' = d. Corollaries: after ring(t0), is_active(t) ⇔ t < t0+FLASH_DURATION for t ≥ t0; expire returns true at most once per ring.	1,2,3	5/5	Option<Instant> field, &mut self, Instant+Duration, Instant ordering (aterm_time newtype needs an ordered-time model)
+bell-rate-limiter	contract	bell::BellRateLimiter::{new,try_fire}	try_fire(now) returns true iff last = None ∨ now.saturating_duration_since(last) ≥ interval; on true last' = Some(now), on false last' = last (a denied fire never re-arms). Corollary: for monotone calls, accepted times are pairwise ≥ interval apart, and every call ≥ interval after the last accepted one is accepted.	1,2,3	4/4	Option<Instant>, Duration compare, &mut self, saturating duration_since
+ime-walk-contract	contract	render::{walk_ime_preedit,ime_preedit_caret_col}	Let w(ch) = cjk ? char_width_cjk(ch) : char_width(ch) and c = caret_byte.unwrap_or(|preedit|). The walk visits preedit.char_indices() in order from col = start: if no caret yet and byte ≥ c then caret := col; if w(ch) = 0 skip; if col+w(ch) > cols stop; else emit(ch,col,w(ch)) and col += w(ch). It returns (end = col, min(caret.unwrap_or(end), cols.saturating_sub(1))). Hence emit never straddles the edge, and ime_preedit_caret_col = walk(..).1. Corollary: for char-boundary prefixes p ⊑ q of a fitting, all-nonzero-width composition with caret None, caret(p) < caret(q).	1,3,4,5,7,13	5/5	&str char_indices loop, FnMut closure param, Option<usize>, width tables in aterm_grapheme
+ime-overlay-contract	contract	render::RenderInput::{overlay_ime_preedit,implicit_blank_at}	If preedit = "" or cursor_row ≥ rows (or cells[row] is missing) the frame is unchanged. Otherwise, with r = cursor_row, s = cursor_col and (end, caret) = walk(preedit, caret, cjk, s, cols): seed = cells[r][s] if present, else implicit_blank_at(r,s) (Some iff default_fg and default_bg_at(r,s) ≠ COLOR_UNSET), else cells[r].last(), else RenderCell::default(); pad = a blank in seed's fg/bg with no decoration. For every emitted (ch,col,w): |cells'[r]| ≥ col+w (the gap padded, never past cols), cells'[r][col] = {ch, seed.fg, seed.bg, Single underline}, and when w = 2 cells'[r][col+1] is that cell with ch=' ' and wide=true. If end > s: a wide continuation under s clears its lead to pad, a wide continuation at end is cleared to pad, and clusters/combining entries in the covered columns are removed. Nothing else changes; cursor_col' = caret; the row grows only to the last column drawn.	1,2,3,4,5,7,13	18/18	&mut self over Vec<Vec<RenderCell>>, Vec<(usize,Box<str>)> retain over a Range, FnMut closure capturing &mut row
+ime-overlay-agrees-with-caret-query	equivalence	render::RenderInput::overlay_ime_preedit, render::ime_preedit_caret_col	For every frame with cursor_row < rows, cells[cursor_row] present and cursor_col < cols: the cursor_col left by overlay_ime_preedit(preedit, caret, cjk) equals ime_preedit_caret_col(preedit, caret, cjk, cursor_col, cols).	1,2,4,5	1/1	free once ime-walk-contract and ime-overlay-contract are proved
+line-size-run-at	contract	render::RenderInput::line_size_run_at	requires each row's spans sorted by start_col and pairwise disjoint (half-open). If line_size_spans.get(row) is None or empty: (line_sizes.get(row).unwrap_or_default(), 0, cols); else if a span s has s.start_col ≤ col < s.end_col: (s.line_size, s.start_col, s.end_col); else (SingleWidth, 0, cols). The row-level summary is never consulted on a spanned row, and no row/col panics.	1,2,3,5,7	5/5	Vec<Vec<LineSizeSpan>>, binary_search_by_key, Option, enum
+sparse-column-accessors	contract	render::RenderInput::{cluster_at,combining_at,image_at,images_at,image_hides_glyph_at}, render::images_in_row_at	requires each per-row list sorted by column. cluster_at(row,col) = the entry whose column = col, else None; combining_at likewise; images_at(row,col) = the maximal contiguous sub-slice with column = col (empty when the row is missing), equal to filter(column = col) in order; image_at = images_at(..).last(); image_hides_glyph_at ⇔ ∃ layer in images_at with z_index ≥ 0.	1,2,3,5,7,11	2/2	binary_search_by_key / partition_point over Vec<(usize,T)>, Arc field reads
+default-bg-at	contract	render::RenderInput::default_bg_at	requires default_bg_spans[row] sorted by end_col. If the row is missing: default_bg. Else with i = the first index with end_col > col: spans[i].default_bg iff spans[i] exists ∧ start < end ≤ cols ∧ start ≤ col < end, else default_bg. So gaps, empty or missing rows and malformed spans fall back to the frame scalar.	1,2,3,5,7	1/1	partition_point, Option filter/map_or
+render-input-content-equality-and-clone	equivalence	render::RenderInput::{eq,clone,clone_from,copy_from}, render::visual_to_logical_eq	Let Content(f) be the tuple of every field RenderInput::eq names (cells, cursor fields and overrides, every effect stream, the selection fields, clusters, combining, line_sizes, line_size_spans, default_bg_spans, chrome rasters, colours). Images compare by images_eq, atlases/wallpaper by Arc pointer identity, and visual_to_logical by row meaning (a missing row ≡ an empty row). Then (a) a == b ⇔ Content(a) = Content(b), so metadata (snapshot_seq, absolute_row_revision, base_y, continuity tokens, apron, scroll_frac_px …) never affects equality; (b) a.clone() == a; (c) after b.clone_from(&a) every field of b, metadata included, equals a's, whatever b held.	1,2,3,4,7	8/8	hand-written PartialEq over ~60 fields, Option<Arc<_>> pointer compare, Clone/clone_from macro
+images-eq-is-tag-stripped-equality	equivalence	render::images_eq	images_eq(a,b) ⇔ strip(a) = strip(b) under derived equality, where strip sets every ImageRef.kitty to None. The memo over Arc pointer pairs is sound: Arc::ptr_eq ⇒ deep-equal, and a cached verdict equals the deep compare it replaced.	1,3,4,7,13	1/1	FxHashMap memo keyed by Arc pointers, FnMut closure, zip/all
+clear-overlays-contract	contract	render::RenderInput::clear_overlays	clear_overlays sets the cursor overrides, rain/cat/free atlases and wallpaper to None, empties every effect stream (cursor_trail, glow, fire, ink, char_fg, cat_quads, free_sprites, nova_add, rain_quads, rain_add …), resets the four EffectStreamDamage records, and changes no other field. Corollary: if f differs from RenderInput::empty() only in those fields, f.clear_overlays() == empty().	1,2	1/1	&mut self, Vec::clear, Option assignment
+selection-hit-denotation	contract	render::RenderInput::{selection_hit,selection_contains_cell,any_selection,selection_row_span,selection_row_key,logical_col,visual_col}, render::selection_row_span_of	With L = logical_col(r,c) (visual_to_logical[r][c] if present, else c): if selections = [], selection_hit = Some(0) iff (selection_clip absent or contains (r,c)) ∧ selection.contains_cell(r − display_offset, L, w, wc); else it is the least i with selections[i].clip ∋ (r,c) ∧ selections[i].selection.contains_cell(r, L, w, wc). selection_contains_cell = selection_hit.is_some(). any_selection ⇔ selection.has_selection() ∨ selections ≠ []. selection_row_key(r) lists, in order, each entry whose selection_row_span_of is Some((lo,hi)), with its colours; selection_row_span(r) is their hull. For a permutation row map, visual_col(r, logical_col(r,v)) = v.	1,2,3,4,7,13	3/3	Vec<PaneSelection> iteration, i32/u16 saturating conversions, cross-module TextSelection::contains_cell, impl Iterator return
+composed-fill-blessing	invariant	render::RenderInput::{bless_composed_fill,composed_fill_intact,invalidate_row_revisions,note_host_row_prepend,undo_host_row_prepend,host_prepend_blessing}	composed_fill_intact ⇔ composed_fill_seq ≠ 0 ∧ snapshot_seq = composed_fill_seq. bless sets composed_fill_seq := snapshot_seq; invalidate_row_revisions, note_host_row_prepend and a successful undo_host_row_prepend set it to 0. So after a bless, any snapshot_seq change or any of those calls makes it false, and only bless makes it true. undo_host_row_prepend returns false and changes nothing unless row_shift > 0 ∧ shifted_fill_seq ≠ 0 ∧ snapshot_seq = shifted_fill_seq ∧ rows = engine_rows + row_shift ∧ |cells| = |clusters| = |combining| = rows; on true it drains the first row_shift rows and re-arms snapshot_seq = shifted_fill_seq = engine_fill_seq.	1,2,3,7	1/1	u64 fields, Vec drain/splice, pool push with a cap
+effect-damage-cache	contract	render::RenderInput::{clone_damage_cache_from,refresh_cursor_effect_damage}, render::EffectStreamDamage::{refresh,refill_from,is_valid,mark_rows,same_content}	After dst.clone_damage_cache_from(&src) every field equals copy_from(src), except that each of the four effect streams is empty when src's damage record for it is valid and cloned otherwise; each damage record equals src's. After refresh_cursor_effect_damage(): each record is valid, its bitmap has ⌈rows/64⌉ words with bit r set ⇔ some quad of that stream has row r < rows, and same_content(a,b) = Some(fingerprint_a = fingerprint_b) for two valid records (None if either is invalid). The fingerprint is a function of the stream's damage_words, so equal streams give Some(true).	1,2,3,7,13	2/2	macro-expanded per-stream branches, Vec<u64> bitmap, hashing fold with closures
+damage-words-injective	contract	render::{GlowQuad,RainHalo,FirePatch}::damage_words, render::pack_u16x4	For quads q1, q2 of one type: damage_words(q1) = damage_words(q2) ⇒ q1 = q2 (every renderer-visible field is encoded). A flat GlowQuad (color2 = color ∧ alpha2 = alpha) encodes as [pack_u16x4(row,x,y,w), h | color<<16 | alpha<<48]; a gradient appends a third word.	1,3	1/1	shifts and casts into u64, fixed-capacity word array, Copy structs
+prepend-host-rows-splice	equivalence	render::RenderInput::{prepend_host_rows,note_host_row_prepend}	For strip > 0: (a) Translate is 'placed below, then Placed': prepend(f, Translate) == prepend(shift_px(f, strip·cell_h), Placed), where shift_px moves every window-space y down by strip·cell_h. (b) Per-row channels move with their rows: cells, clusters, combining, visual_to_logical and the selection anchors at row r+strip equal the originals at r, and the first strip rows are the chrome rows with empty clusters, combining and maps. (c) Placed moves no pixel coordinate, and every in-grid quad's row tag is re-derived from its pixel y. strip = 0 is the identity.	1,2,3,7,11	2/2	~20 Vec channels spliced, generic Iterator<Item=&[RenderCell]> with a lifetime, u16 pixel arithmetic
+alt-archive-differ-no-loss	invariant	terminal::alt_archive::AltArchive::{commit_rows,leave,flush paths}	Under the scroll model (appends, scroll-backs, scroll-forwards, jumps, in-place edits, ticking chrome, resizes, blank screens), after every commit every anchor row T[i] that left the top of the viewport is in the retained archive unless eviction removed it (then it counts in lost). Rows that left at the bottom are held in `below` and archived by a later flush or when they scroll off the top. leave, resize and restore flush the displayed scrolling region. Chrome rows (bottom rows identical across a diffed shift, rule/box rows redrawn at a new width) are never archived by a commit, leave, resize or restore.	1,2,3,4,5,7,10,11	12/12	VecDeque<ArchivedRow{Arc<str>}>, row hashing, anchor voting loops, scratch HashMap, generic S: AsRef<str>; needs a List-valued Lean model of the scroll walk
+alt-archive-differ-exact	refinement	AltArchive::{commit_rows,texts,gaps,back,back_at,read(..).pin}	For scroll-model sequences over pairwise-distinct anchor rows with constant geometry, where consecutive frames overlap by ≥ NEED_VOTES anchors: texts() = T[0 .. max_k v_k] exactly (in order, no duplicate or omission), gaps() = [] and lost = 0 within budget; back() = max_k v_k − v_n and back_at is the index of T[v_n]. An identical frame changes nothing (epoch unchanged). A frame with no overlap flushes the old region once and records exactly one Jump gap (consecutive jumps record one). A frame whose top is found in the last REANCHOR_SCREENS screens re-anchors without re-archiving. A blank screen filling up archives nothing until a real shift. pin = the number of fixed header rows, and screen row pin+m is archived row back_at+m for m < back.	1,2,3,4,5,7,10	17/17	as alt-archive-differ-no-loss, plus u64 index arithmetic and debt bookkeeping
+alt-archive-lifecycle	contract	AltArchive::{leave,leave_whole,enter,restore,wipe,set_budget,set_enabled,commit_rows(geometry change)}	leave(): flush the last frame's scrolling region without the measured chrome (or the whole screen if none was measured, never rows identical to the bottom chrome), append Gap{after: last, Leave}, epoch += 1, next commit is a baseline. leave_whole(): the same with the whole frame. enter(): epoch += 1, fresh baseline, floor := last+1. A commit with changed cols or rows flushes as leave, records a Resize gap, epoch += 1. wipe(): lost += len, rows cleared, indices continue (oldest = last+1), Reset gap. set_budget(0): disabled and wiped. While disabled, commits record nothing; set_enabled(true) starts from an empty baseline.	1,2,3,7	5/5	&mut self, VecDeque push/clear, counters, enum gap kinds
+alt-archive-row-charge	contract	terminal::alt_archive::alt_archive_row_charge, ALT_ARCHIVE_ROW_OVERHEAD	For len ≤ usize::MAX − 15: alt_archive_row_charge(len) = round_up(len, 16) + size_of::<ArchivedRow>() + 2·size_of::<usize>().	3,6	1/1	const fn, next_multiple_of, size_of constants (near the E6 fragment)
+alt-archive-retention-budget	invariant	AltArchive::{commit_rows,bytes,effective_budget,budget,set_budget,len,lost,oldest,last,texts,gaps}	Inv: bytes = Σ row_charge(|row|) ≤ effective_budget ∧ len ≤ max_rows ∧ last = oldest + len − 1 ∧ lost + len + (rows removed by wipe or carry) = rows ever archived ∧ every gap.after ≥ oldest − 1. Inv holds after every public mutator, with effective_budget = min(budget, pool.share()) when joined to a pool. Eviction is oldest-first, so texts() is the newest contiguous run archived; a shrinking share drops the oldest rows and a growing one resumes with no hole. Gaps below the window are dropped with their rows. Under equal row costs the (last, oldest) projection refines aterm_spec::derive::ring_model (each archiving commit is a Push).	1,2,3,5,7,10,13	4/4	VecDeque pop_front loop, usize sums, Option<BudgetShare> reading an Arc<AtomicUsize>
+alt-archive-pool-share	refinement	AltArchiveBudget::{new,share,live}, BudgetShare::{set_counted,drop}, AltArchive::{share_budget,set_enabled,set_budget,commit_rows,drop}, Terminal::set_alt_archive_shared	share(p) = max(total / max(live,1), min(min_share, total)), where live counts archives joined to p that are enabled and hold ≥ 1 row. Joining empty, disabling, set_budget(0), share_budget(None), a wipe to empty and drop each remove an archive from live (increments and decrements paired, Drop included). An archive never sheds rows on another archive's thread: after the share falls it keeps its rows until its own next commit, which brings it within min(budget, share) in whole rows. So with N live archives each committing once after the last change, Σ bytes ≤ max(total, N·min_share). The two-archive projection refines aterm_spec::derive::alt_archive_pool_model (PoolBounded, IdleTakesNothing).	1,2,3,8,10,13	7/7	Arc<AtomicUsize> shared across archives, Drop, OnceLock process pool; multi-object state
+alt-archive-read-paging	contract	AltArchive::read, AltArchiveRead::page_last, AltArchiveQuery::{oldest,newest}	read(oldest(since,n)): first = max(min(since,last)+1, oldest); rows = up to n retained rows from first, in order; more ⇔ rows exist after the page; lost = |{i : since < i < oldest}|; page_last = first + |rows| − 1 (a since above last is clamped); gaps = the gaps after since; origin, back, back_at, pin as the archive's. read(newest(since,n)) returns the last min(n, rows after since) rows, with more ⇔ earlier rows after since exist. Reads never panic, and back_at ∈ [oldest,last] whenever back > 0.	1,2,3,7	1/1	VecDeque range iteration, saturating u64 arithmetic
+alt-archive-normalize-row	contract	terminal::alt_archive::normalize_row	normalize_row(s) = trim_end(map(c ↦ (c = '\0' ∨ c.is_control()) ? ' ' : c, s)). The byte pre-screen (b < 0x20 ∨ b = 0x7F ∨ b = 0xC2) is exact, since every is_control char is C0, DEL or U+0080..U+009F, whose UTF-8 starts with 0xC2.	1,2,3,7	1/1	&mut String in place, chars().map().collect, Unicode Cc and White_Space tables
+dec-mode-matcher	equivalence	terminal::alt_archive::DecModeMatcher::{scan,scan_inner,classify,finish_param,csi_before}, find_byte	On the alt screen a hit is reported at the final byte of each CSI ? P (; P)* F: P decimal, ':' also separates, values saturate at 100000; a C0 other than CAN/SUB/ESC executes without aborting, CAN/SUB abort, ESC restarts, any other byte makes the sequence irrelevant. F='l' with 47/1047/1049 ⇒ Exit; F='l' with 2026 ⇒ Esu; F='r' with an alt param ⇒ Restore(mask); ESC c ⇒ Reset. On the main screen only F ∈ {h,r} with an alt param ⇒ Enter, recognized only when 'ESC [' immediately precedes '?'. Chunk invariance: the hits of scan over x then y (y shifted by |x|) equal the hits over x++y. find_byte(h,n) = h.iter().position(= n).	1,2,3,5,7	3/3	Copy state machine with an enum, [u8;2] tail across calls, as_chunks::<64> scan
+has-alt-1049-enter	contract	terminal::alt_archive::{has_alt_1049_enter,find_byte}	has_alt_1049_enter(input) ⇔ b"\x1b[?1049h" occurs in input as a contiguous substring.	1,3,5,7	1/1	while-let over slices, starts_with, as_chunks search
+alt-archive-hook-commit-points	contract	Terminal::{advance_parser_archiving,alt_archive_epilogue,alt_archive_after_restore,alt_archive_after_host_reset,leave_alternate_screen}, AltArchiveState::leave_orphaned	On the alt screen the archive commits exactly at: each ESU close (after it); each alt exit (?47/1047/1049 l, or an XTRESTORE of a saved-off 1049), one byte before it so the alt grid is committed before the swap, followed by leave(); DECSTR (a commit, no rebaseline); and, only when no ESU was seen this alt epoch, the read epilogue, at most once per FALLBACK_COMMIT_INTERVAL of process_now time and never inside an open 2026 window. RIS or a host reset wipes at its stream position (Reset gap). restore_checkpoint flushes the replaced screen (Restore gap, epoch+1) and installs the restored screen as the baseline unless it was captured inside an open 2026 window. Main-screen output is never archived, a disabled archive records nothing, and an XTRESTORE that stays on alt commits nothing early. A host leave of a stuck alt screen archives its final screen whole behind one Leave gap, and still leaves with the archive off.	1,2,3,4,5,7,10	16/16	Terminal-wide &mut self, Option<Instant> clock compares, matcher + differ + parser integration
+alt-archive-end-to-end	contract	Terminal::{process_at,alt_archive,alt_archive_read,resize,restore_checkpoint}	With the archive enabled, for an alt-screen stream of DEC-2026 frames that paint a transcript shifted by k rows above fixed chrome (absolute moves and erases only), the archive's texts are exactly the transcript rows that left the top, once each and in order, with no gaps, no lost rows and back = 0; spinner and chrome never appear and the alt grid keeps zero scrollback. alt_archive_read(oldest) returns row m at index first+m. On 1049l the last screen's scrolling region (never the composer or footer) is flushed, followed by one Leave gap. A frame left open is committed once a later process_at finds the sync window expired. Main-screen output archives nothing. After a restore, a repaint at the old size archives nothing, and the first resize, before or after the first frame, archives only rows that left the screen. (Conditioned on the stream grammar; see §5.)	1,2,3,5,7,12	5/5	screen-diff heuristic, Vec<Arc<str>>, gap records, ClockReading compares, sync timeout
+alt-archive-noninterference	equivalence	Terminal::{set_alt_archive_enabled,process_at,visible_content}	For every stream and chunking, visible_content and the grid cursor are the same with the archive enabled and disabled; disabled, the archive stays empty. The hook only splits input and never changes what the parser sees.	1,2,3,5,7,12	1/1	frame lemma: archive state is write-only from the grid's side
+alt-archive-carry-continues	equivalence	AltArchive::{carry_head,carry_rows,carry_differ,import,fence}, terminal::alt_archive::differ_fits, Terminal::{alt_archive_carry_head,alt_archive_carry_rows,alt_archive_carry_differ,alt_archive_import,set_alt_archive_origin}	Whole carry: if b imports carry_head(true) + carry_rows(fence, 0, ∞) then import = Exact and, for every later sequence of frames, leave and enter, every read and fence answer is equal on a and b (a bisimulation): origin and indices preserved, back_at in range. Tail carry carry_rows(fence, from, cap): carried first = min(from, reach), where reach = last+1 − REANCHOR_SCREENS·screen rows (not below floor) and back_at when back > 0; lost' = lost + (first − oldest); only the newest rows fitting cap (by row charge) are carried; a scroll-back past the carried rows is re-archived after a Jump gap. carry_rows/carry_differ succeed only while the fence holds (no commit since carry_head), taken before or after the freeze. Exceptions: counters only (no rows) ⇒ a read from an old mark reports lost = last − mark and later rows take the next indices; differ = None or failing differ_fits ⇒ NoBaseline, a Restore gap, later rows diffed against the restored screen; a resize after import adds a Resize gap with lost = 0; an importer with the archive disabled ⇒ Refused, archive empty.	1,2,3,4,5,7,12	16/16	carry struct with Vec<Arc<str>> and Option<AltArchiveDiffer>, validation predicate, u64 index arithmetic
+alt-archive-import-total	no-panic	AltArchive::{import,commit_rows,read}	For every carry (any field values: indices near 0, u64::MAX or MAX_CARRIED_INDEX; arbitrary row text; arbitrary gaps and differ fields) and every later step sequence: import and every later commit, leave, enter and read neither panic nor overflow. Afterwards bytes ≤ budget, read.last ≥ read.oldest − 1, and back_at ∈ [oldest,last] whenever back > 0.	1,2,3,5,7	1/1	panic-freedom over all arithmetic and indexing in import, differ and read
+alt-selection-park-refines-model	refinement	Terminal::{process(?1049h/l, RIS),text_selection_mut,clear_scrollback,resize,reset,restore_checkpoint,text_selection,parked_text_selection}	Project (on_alt, live_sel, parked_sel, last_event). For every Terminal reachable from the fixture by Select, Deselect, Enter, Leave, ClearScrollback, WidthResize, Reset, RIS, RIS+re-enter, RestoreMain and RestoreAlt, the projection is a state of aterm_spec::derive::alt_selection_park_model and each real step is admitted as its named action(s). The model's Buggy = 1 members (a symmetric swap on Enter/Leave, each destroyer forgetting the parked slot) are rejected at that action.	1,2,10	2/2	whole-Terminal steps, ty_model! binding
+bidi-visual-order-cells	contract	terminal::bidi_reorder::compute_visual_order_cells, Terminal::bidi_visual_order_cells	For |chars| = |wide|: the result is a permutation of 0..|chars|. It is the identity when mode = Disabled, when no char is ≥ U+0590, or when no cell has an R/AL/AN class. Otherwise it equals aterm_bidi::reorder_cells_with_classes(classes, brackets, wide, base_direction_from_classes(dir, autodetect, classes)). Terminal::bidi_visual_order_cells(cells) is this over (c.ch, c.wide) under the terminal's modes. A wide pair stays adjacent and in order.	1,3,4,7,12	8/8	Vec<char>/Vec<bool>/Vec<BidiClass> via map/collect, cross-crate aterm_bidi UAX #9 (needs its own spec)
+bidi-base-direction	table-property	terminal::bidi_reorder::base_direction_from_classes	Auto ↦ (autodetect ? BaseDirection::Auto : Ltr); Ltr ↦ Ltr; Rtl ↦ Rtl; AutoRtl ↦ (¬autodetect ? Rtl : (∃ c ∈ classes, c ∈ {L,R,AL}) ? Auto : Rtl); any other (non_exhaustive) variant ↦ as Auto. The cfg(test) twin base_direction agrees on every arm.	1,3,7	1/1	enum match, slice any
+bidi-default-paragraph-ltr	contract	compute_visual_order_cells under (Implicit, Auto, autodetect=false), Terminal::cell_frame	Under the shipping default (dir = Auto, DECSET 2501 reset) the paragraph base is LTR: in a row without explicit embeddings every class-L cell is a fixed point, RTL runs (with attached EN/neutrals per UAX #9) reverse in place, the row stays left-anchored and the cursor stays on its logical cell. With 2501 set and the first strong char R/AL the base is RTL, and the first logical cell lands in the last visual column of the reordered prefix.	1,3,4,5,7,12	4/4	as bidi-visual-order-cells, plus a UAX #9 level lemma (rule I1)
+bidi-frame-reorder	contract	Terminal::{apply_bidi_reorder,cell_frame_into}, RenderInput::{visual_to_logical_row,logical_col,visual_col}	For each processed row r whose order o = bidi_visual_order_cells(cells[r]) is not the identity: cells'[r][v] = cells[r][o[v]]; every column-keyed entry (clusters, combining, images) at logical column l moves to inv(o)[l], re-sorted stably by column; on the cursor row cursor_col' = inv(o)[cursor_col]; visual_to_logical[r] = o. Rows not permuted keep their cells and an empty map, so a refill drops a stale map. Returns whether any row was permuted. Hence logical_col(r,v) = o[v] and visual_col(r, logical_col(r,v)) = v. Disabled is a no-op.	1,2,3,5,7,11	5/5	scratch Vecs (clear/extend/swap), inverse-permutation loop, generic remap_cols<T> with sort_by_key, u64 bitmask
+bidi-pointer-and-introspection-agree-with-frame	equivalence	Terminal::{viewport_cell_logical,row_display_order}	viewport_cell_logical(row,col) = (the logical column cell_frame paints at col on that viewport row, whether its level is odd) when BiDi is on, the row's written prefix holds an RTL candidate and col is within it; otherwise (col, false). row_display_order(row) = (the text in display order, each right-to-left-level cell reading as its Bidi_Mirroring_Glyph as the frame paints it, map), where map[..k] = bidi_visual_order_cells(render_row(row)) for the k written cells and the identity beyond; None for row ≥ rows.	1,2,3,4,7,12	2/2	grid row views, cross-crate aterm_bidi calls, String building
+bidi-mode-change-reprojects-and-damages	contract	handler SCP (CSI Ps SP k), DECSET/DECRST 2501, DECSTR, DECRQM 2501, Terminal::{apply_config (bidi),invalidate_bidi_all}	Any change of bidi_mode, bidi_direction or bidi_autodetection (SCP 0/1/2, DECSET/DECRST 2501, DECSTR resetting 2501, apply_config changing config.bidi) marks full damage, advances damage_epoch, and makes the next cell_frame reproject stored rows under the new configuration; an unchanged reload damages nothing. DECRQM ?2501 reports 1 or 2, reset on a fresh terminal. SCP 0 sets direction Auto (the LTR default, not autodetection).	1,2,3,4	6/6	VT handler &mut self, damage epoch bookkeeping
+block-text-range	contract	Terminal::{text_range,block_output_text,block_command_text}	text_range(s,e) = Evicted if e > s ∧ s < oldest_absolute_row. Otherwise Text(join): the absolute rows s..e (history or screen, independent of display_offset) grouped into logical lines (a row continues the previous one iff its wrapped flag is set), each the concatenation of its rows' text trimmed at its end only (blanks inside a wrapped row's last column kept), joined with '\n'. block_output_text(b) = NotAvailable if b has no output rows, else text_range(output rows). block_command_text prefers a non-blank trimmed OSC 633;E commandline, else the trimmed command rows. A non-evicted read never bumps the eviction counter.	1,2,3,4,7,8	5/5	Grid history ring + tiered reads (Result), String truncate/trim_end, enum BlockText
+block-eviction-log-thinning	contract	Terminal::record_block_eviction	Each call increments eviction_reads. If eviction_seen[side] = Some(n) ∧ block_id ≤ n it logs nothing; otherwise seen := Some(block_id), news += 1, and a WARN line (block id, side, rows, oldest retained row, eviction_reads, news) is logged iff news is a power of two. So k newly evicted blocks give ⌊log2 k⌋+1 lines and re-reads give none.	1,2,3,8	2/2	Cell<u64>/Cell<Option<u64>> interior mutability, logging side effect
+last-completed-block-is-sealed	contract	Terminal::last_completed_block, OSC 133 A/B/C/D handling	last_completed_block() = shell.output_blocks.back(): only blocks sealed by the next prompt's OSC 133;A; a Complete block that is still current is not returned. After A→B→C→output→D;code→A it is the block with exit_code = Some(code) and its full output rows.	1,2	1/1	VecDeque back, shell-integration state machine
+scrollback-line-limit	contract	Terminal::{set_scrollback_line_limit,scrollback_line_limit,scrollback_truncated_lines}, Grid::set_scrollback_line_limit	After set_scrollback_line_limit(Some(n)), the primary-content grid (the active grid off alt, the saved primary on alt) retains the newest min(previous, n) history lines in order, and never more than n afterwards; raising the limit lets history grow again. The alt buffer's scrollback stays 0, scrollback_line_limit() = the limit, scrollback_truncated_lines is unchanged (requested truncation is not loss), and display offsets are re-clamped.	1,2,3,4,7,12	2/2	Option<&mut Grid> selection, ring eviction in aterm_grid
+scrollback-pressure-level	contract	Terminal::{scrollback_pressure_level,set_ring_byte_watermark (cfg(test))}, Grid::ring_watermark_level	scrollback_pressure_level = max(active grid's store watermark (Green if none), active grid's ring_watermark_level, alt grid's store watermark). ring_watermark_level is Green with no watermark set and Red when ring bytes exceed it (Yellow band below). With no tiered store and no watermark the level is Green.	1,2,4,12	1/1	Ord max over an enum, cross-crate grid accessors
+format-paste-denotation	contract	Terminal::{format_paste,format_paste_framed}, buffer_api::{bounded_paste_text,paste_char_allowed}	body = replace(replace(filter(paste_char_allowed, bounded(text)), "\r\n", "\r"), "\n", "\r"). format_paste_framed(text, b) = (b ? ESC[200~ : "") ++ body ++ (b ? ESC[201~ : ""), and format_paste(text) = format_paste_framed(text, modes.bracketed_paste). Corollaries: the body has no ESC, C1, DEL or C0 except TAB and CR, so the only ESC[201~ is the closing guard, and framing never changes the body.	1,3,7	6/6	chars filter/collect into String, str::replace, char-boundary loop
+paste-has-payload	contract	Terminal::paste_has_payload, buffer_api::paste_char_can_move	paste_has_payload(text) ⇔ some c in the longest char-boundary prefix of bounded(text) with ≤ PASTE_GESTURE_PROBE_BYTES bytes has paste_char_allowed(c) ∧ (c ∈ {TAB,LF,CR} ∨ char_width(c) > 0). Control-only, zero-width-only and empty text, and payload past the probe prefix, have none; framing bytes never count.	1,3,7	1/1	&str slicing at char boundaries, chars().any, width table
+paste-insert-cells	contract	Terminal::paste_insert_cells	With b = bounded(text): |b| > PASTE_INSERT_PRICE_BYTES ⇒ None; b contains TAB, LF or CR ⇒ None; else body = filter(paste_char_allowed, b), and the result is Some(0) if str_width(body) = 0, else Some(min(grapheme display width of body under AmbiguousWidth::(amb ? Double : Single), u16::MAX)). Monotone in amb.	1,3,7,12	1/1	String building, grapheme width (cross-crate), u16::try_from
+drain-bell-edge-flag	contract	Terminal::drain_bell, BEL handling	drain_bell() returns bell_pending and clears it. A BEL that passes the rate limit sets it. So a fresh terminal drains false, and after one BEL two drains give true then false.	2	1/1	bool field on &mut self (scalar once &mut views are certified)
+osc-event-queue-bounded-fifo	invariant	transient_state::OscEventQueue::{push,pop_front,bytes,rewrite,retain}, Terminal::{take_osc_event,has_osc_events}	OscEventQueue is a FIFO of (code, payload) with bytes = Σ|payload| ≤ MAX_BYTES after every push; a push that would exceed it drops the oldest first, so a late reader sees the newest suffix in order. take_osc_event = pop_front; has_osc_events ⇔ non-empty; rewrite and retain keep bytes = the sum of the surviving payloads.	1,2,3,7,13	1/1	VecDeque<(u32,String)>, byte accounting, closures
+osc-app-event-payloads	contract	handler OSC 7 / OSC 133 / OSC 52, Terminal::{take_osc_event,current_working_directory}	OSC 7 file://H/P: current_working_directory = P and the event is (7, P) when H ∈ {"","localhost"}, else (7, "//H/P"). Accepted OSC 133 A/B/C queue "X;row=R;col=C" with the cursor's absolute row and column, and D queues "D;exit=N". OSC 52 c;base64 with write authorization queues (52, decoded text).	1,2,3,4,7	3/3	URI/percent parsing, base64, format!, VecDeque
+vt-sampled-handler-effects	contract	handler DECSET/DECRST 2031, CUP, Terminal::cell_grapheme	DECSET ?2031 sets report_color_scheme_enabled and DECRST clears it (default off). CUP CSI r;c H puts the cursor at (clamp(r,1,rows)−1, clamp(c,1,cols)−1) without origin mode. cell_grapheme(r,c) = Some(base ++ combining marks) in range, None out of range.	1,2,3,4	3/3	handler dispatch, grid cell + extras read
+print-anchor	contract	Terminal::{print_anchor,print_anchor_glyph}	print_anchor() = Some((row, col, seq)), the end of the last print run in active-grid coordinates: col is one past the last printed cell (so a last-column glyph with a pending wrap reports col = cols), and seq strictly increases with each print. Cursor motion does not move it; it is None after RIS or before any print. print_anchor_glyph() = the live char of the cell left of the anchor ('\0' for a wide continuation, ' ' if erased since), read regardless of display_offset; None when the anchor lies off the grid or there is none.	1,2,3	2/2	Option<(u16,u16,u64)> updated in the print path
+trickle-lazy-bounded	contract	Terminal::{trickle_lazy_bounded,lazy_backlog_len,drain_lazy_bounded}	On the primary-content grid's backlog: trickle_lazy_bounded(n) skips (returns the backlog unchanged) iff the flood path is cutting that backlog and a batch arrived since the previous opportunity; otherwise it behaves as drain_lazy_bounded(n), promoting min(n, backlog) staged lines (the cut's marker first) and returning those still staged.	1,2,7	1/1	grid lazy buffer (VecDeque), counters
+offloaded-resize-equivalence	equivalence	Terminal::{resize_offloading_scrollback,finish_resize_offload,resize}, PendingScrollbackReflow::reflow	With a tiered store and a width change, on either screen: p = resize_offloading_scrollback(rows, cols) is Some, and finish_resize_offload(p.reflow()) returns None when the width did not change meanwhile; the resulting history (scrollback of the primary-content grid) and visible state equal those of resize(rows, cols): no line lost or duplicated. Corollary: for every script of output, ED 3, reader scrolls and resizes, the lines the offloaded run retains ⊇ those the synchronous run retains.	1,2,3,4,5,7,8,12,13	3/3	Send job moving a detached store, reflow over lines, Option<&mut Grid>
+checkpoint-roundtrip	round-trip	Terminal::{checkpoint,from_checkpoint,checkpoint_carry,process_at,watchers_armed}	For T ∈ Reach with the parser at Ground: c = checkpoint(T) has checkpoint(from_checkpoint(c)) = c, and the hydrated h agrees with T on visible_content, every row_text, cursor, scroll region, DECSLRM margins, modes, charset, tab stops, pending wrap, taskbar progress, secure keyboard entry, cwd, keyboard state, colours and colour stack, shell marks/blocks/counters, and presence of alt_grid (both the 1049 and the retained-47 polarities). Hydration continues the mirror: for all x, c', checkpoint(process_at(from_checkpoint(c), x, c')) = checkpoint(process_at(T, x, c')). For cp = checkpoint_carry(T,n), checkpoint_carry(from_checkpoint(cp), n) agrees with cp on both DECSC slots, rows and cols. Watchers are not carried: watchers_armed(from_checkpoint(cp)) = false.	1,2,3,4,5,7,12	8/8	large struct projection with serialized grid blobs, Option fields, the whole Terminal state
+checkpoint-carry-continues	equivalence	Terminal::{checkpoint,checkpoint_visible,checkpoint_carry,checkpoint_carry_abandoning_partial,from_checkpoint,restore_checkpoint,process,resize}	For T ∈ Reach (any parser state, including mid-SGR, mid-UTF-8, an unterminated OSC, a DCS header or a carried-to-ignore DCS string, a UTF-8 head inside a string so a 0x9C continuation does not end it), every carry c ∈ {checkpoint, checkpoint_visible, Carry(T,n)} that is Some, and every successor h = Adopt(S, c) with host config C: for every later sequence of process and resize, h agrees with T on ObsH (cell frame, row texts, links, cursor and visibility, title, replies, blocks/marks and completed_command_seq, OSC 4/10/11 overrides, tab stops, the text under each DECSC slot when restored), modulo history beyond the n carried lines and the slots C configures that the carry does not override. The carried engine state includes the REP char, an open OSC 8 link, the SGR 58 colour, a pending VT52 address, a pending ZWJ, a completed flag, XTPUSHSGR and XTSAVE state, a DECSC slot, styled writes rebuilt from the writer caches, a restored alt screen accruing no scrollback, and an open 2026 window whose timeout is re-armed at the restore. Sixel strings are swallowed, not printed.	1,2,3,4,5,7,10,12	24/24	simulation relation through many &self accessors, aterm-parser's carry-restore-continues as a cross-crate lemma, clock seam, CheckpointMeta serde
+checkpoint-visible-projection	contract	Terminal::checkpoint_visible	checkpoint_visible(T) = None iff partial_sequence_uncarried(T) ≠ None (a hooked DCS query). Otherwise its grid (and alt grid) holds exactly rows lines, its size ≤ the full checkpoint's, it is independent of display_offset, and from_checkpoint of it re-projects to itself.	1,2,7	2/2	serialized-grid Vec<u8>, &self projection
+checkpoint-partial-sequence-carry	table-property	Terminal::{checkpoint_carry,checkpoint_carry_abandoning_partial,carry_meta_abandoning_partial,partial_sequence_state,partial_sequence_uncarried,partial_sequence_swallowed,partial_sequence_swallows_picture,has_inactive_grid}	Carry table over the parser state: Ground ↦ no parser carry; Escape, EscapeIntermediate, CsiEntry, CsiParam, CsiIntermediate, DcsEntry, DcsParam, DcsIntermediate, OscString and SosPmApcString ↦ themselves; a DcsPassthrough whose handler only consumes (tmux/kitty/sixel) ↦ HOOKED_STRING_CARRY (swallowed; a picture iff sixel is decoded); a DcsPassthrough query (DECRQSS/XTGETTCAP) ↦ uncarried, so checkpoint_carry = None exactly then. checkpoint_carry_abandoning_partial(n) = (checkpoint_carry(n), None) at Ground and, for an uncarried query, (the carry after CAN, Some(state name)). partial_sequence_uncarried = abandoning(..).1. The history bound n applies in every case, and a restored carry re-projects to the same parser carry. carry_meta_abandoning_partial = CheckpointMeta::from_checkpoint(the abandoning carry), computed without projecting a grid. has_inactive_grid ⇔ the carry has an alt_grid.	1,2,3,4,12	5/5	match over 14 parser states, Option<&'static str>, a test-only fault point, serde feature
+checkpoint-restore-sanitizes	contract	Terminal::{restore_checkpoint (output state),restore_title,capture_output_state_repr,capture_title_repr}	A restore is judged by the engine's own handlers. restore_title stores for window and icon what OSC 0/1/2 would store (≤ 1024 bytes; C0 except TAB, C1 and the BIDI9 overrides stripped) and keeps the bottom TITLE_STACK_MAX_DEPTH stack entries, cleaned the same way; it is idempotent. Output state: a hyperlink OSC 8 would refuse is not installed, a control REP char is dropped, an SGR stack deeper than SGR_STACK_MAX_DEPTH keeps its newest entries, each push mask is intersected with the defined bits, saved modes unknown to XTSAVE are dropped, and a checkpoint carrying none of it clears the engine's own. Well-formed state is installed exactly.	1,2,3,7	2/2	String filtering at char boundaries, Vec truncation, bitmask &
+checkpoint-shell-integration-carry	contract	Terminal::{checkpoint,checkpoint_carry,checkpoint_carry_abandoning_partial,restore_checkpoint,shell_integration_rev,shell_integration_posture}, CheckpointMeta::{from_checkpoint,into_checkpoint}	Only the carry projections carry the in-use shell-integration nonce, the signed integration rev and the title (window, icon, stack); checkpoint() carries neither nonce nor rev. CheckpointMeta round-trips each exactly and reads a malformed nonce (not 64 hex) or a rev that is not 16 lowercase hex as None; Debug never prints the nonce. restore_checkpoint installs a carried rev/title and keeps the adopter's own when the carry names none (an explicit empty title is installed). A rev is recorded only from a signed OSC 633;P;AtermIntegration=<16 lowercase hex> with the right id; the latest wins and RIS keeps it. A restored require-nonce without a nonce is posture Degraded until authorized.	1,2,3,9	4/4	Option<[u8;32]>, String validation, serde, custom Debug
+shell-integration-authorization-model	refinement	Terminal::{authorize_shell_integration,authorize_shell_integration_on_first_mark,authorize_shell_integration_rekey,withdraw_shell_integration_rekey,settle_shell_integration_rekey,set_require_shell_integration_nonce,shell_integration_posture,shell_integration_dropped_count}, OSC 133/633 id= verification	The authorization state refines {active, pending, typed: Option<(key, prior, settled)>, require, in_use}, with posture = Off if ¬require, On if an active key is in use, else Degraded. authorize(k) makes k active and in use and ends any typed re-key's way back. on_first_mark(k) makes k pending (it verifies, posture Degraded, not carried) until the first mark signed with k. A mark with a wrong or missing id is dropped (dropped_count += 1) and changes nothing. rekey(k) is pending with a way back: withdraw(k) succeeds once while unsettled and unused and restores the prior authorization; settle(k) succeeds only for the current typed key; once a mark used it, neither moves it. The carry takes the nonce only when it is in use.	1,2,10	2/2	Option<[u8;32]> fields, OSC hex compare; needs a ty_model! model
+shell-integration-nonce-hex	round-trip	ShellIntegrationNonce::{to_hex,from_hex}	For n: [u8;32], from_hex(to_hex(n)) = Some(n) = from_hex(uppercase(to_hex(n))), where to_hex is the 64-char lowercase hex. from_hex(s) = Some(m) ⇔ |s| = 64 ∧ every byte is an ASCII hex digit, with m[i] = 16·hex(s[2i]) + hex(s[2i+1]).	1,3,7	1/1	[u8;32], String fold with write!, as_chunks::<2>, to_digit
+restore-advances-scroll-epoch-once	contract	Terminal::{restore_checkpoint,content_scroll_state}	After restore_checkpoint(&c), content_scroll_state().invalidation_epoch = before + 1 and uniform_up_rows is unchanged; a later process(b"") leaves it unchanged (no latent scroll sentinel).	2	1/1	&mut self counters
+saved-cursor-follows-content	contract	Terminal::{resize,resize_with_policy,resize_offloading_scrollback,finish_resize_offload,lend_saved_cursors,take_back_saved_cursors,checkpoint_carry}, Grid::{lend_saved_cursor,take_lent_saved_cursor}	For each DECSC slot (main, including the one 1049h saves, and alt), every resize path and both storage shapes, let ρ send each surviving cell to its post-resize (row,col) (demotes move rows up, reveals and deficit fills move them down, rewraps move cells onto continuation rows). (a) A slot on a cell of a line moves to ρ(slot), as that grid's own cursor would. (b) A slot past its line's content keeps its distance from the line start, clamped to cols−1. (c) A slot on a trimmed or dropped row stays past the grid at the same offset below the content it followed and rides later reveals and fills. Style, modes, charset and pending wrap are unchanged. The checkpoint carries the slot unclamped; DECRC or 1049l clamps only on read. Corollaries: a width round trip restores the slot exactly, and text printed after the restore lands right after the text it was saved on.	1,2,3,4,5,7,12	15/15	the reflow map defined by the rewrap chunker, u16 values past the grid, two-phase offload job
+parser-repr-wire-roundtrip	round-trip	checkpoint_parser::ParserRepr::{from_carry,to_carry,fields,fields_to_carry}, checkpoint_parser::{to_hex,from_hex}, ParserCarry::for_older_builds	For every carry c: ParserRepr::from_carry(&c).to_carry() = Some(c). from_carry(c).exact = None ⇔ for_older_builds(c) = None, and when it is Some(o) the outer fields equal fields(o) (DcsIgnore holding nothing, for a DCS header) with exact = fields(c). r.to_carry() = None ⇔ the chosen fields (exact if present) have an unknown state name or a hex field of odd length or with a non-hex digit. from_hex(to_hex(b)) = Some(b).	1,3,7	3/3	Vec<u8>/Vec<u16>, Option<Box<ParserRepr>>, hex encode/decode, State::from_name
+refused-parser-carry-resumes-at-ground	contract	Terminal::restore_checkpoint, aterm_parser::Parser::restore_carry	For every checkpoint whose parser carry restore_carry rejects (e.g. params longer than MAX_PARAMS): after restore_checkpoint the parser is at Ground and every other part of the checkpoint is restored as for an accepted carry, so the tail is processed as by a fresh Ground parser.	1,2,3,4,12	1/1	Result branch on a cross-crate call (cites aterm-parser restore-carry-validation)
+adopt-keeps-host-retention-config	contract	Terminal::{restore_checkpoint,set_scrollback_line_limit,scrollback_line_limit}	If the host set scrollback_line_limit = L before restore_checkpoint(cp) (cp taken on either screen), then scrollback_line_limit = L right after the restore, after any later process (1049l included), and on the grid that owns the primary content; so the adopted terminal retains exactly what a never-adopted terminal configured with L would.	1,2,3,12	2/2	Option<usize> on whichever grid slot holds primary content
+checkpoint-carry-wire-shape	contract	Terminal::checkpoint_carry, serialize_lines, deserialize_lines_strict	checkpoint_carry(T,n) = Some(cp) iff the parser is at Ground (or, per checkpoint-partial-sequence-carry, a carried state). Then history_lines ≤ n, and > 0 when the primary has scrollback and n > 0; cp.grid deserializes strictly to exactly rows+history_lines lines that re-serialize byte-identically; an alt_grid (alt up via 1049 or 1047, or the persistent 1047 buffer after leaving) deserializes strictly to exactly rows records with history 0.	1,2,3,5,7,12	5/5	Vec<u8> serialization grammar, cross-crate aterm-scrollback serializer
+host-policy-survives-reset	invariant	Terminal::{process,reset}, reset_modes, reset_common_fields	For all x: HP(process(T,x)) = HP(T), in particular RIS keeps require_shell_integration_nonce, and HP(reset(T)) = HP(T). reset_modes(prev) agrees with TerminalModes::new() off HP and with prev on HP, so RIS and the API reset agree.	1,2,3,5,7,12	2/2	struct-update with 10 copied fields; frame lemma that no handler writes HP
+clipboard-capability-mint	contract	ClipboardAuth::{new,authorize_write,revoke_write,authorize_query,revoke_query,try_mint_write_capability_with_engine,try_mint_query_capability_with_engine}, PolicyGates::{compile,osc52_set,osc52_query}	ClipboardAuth::new() has both flags false, and authorize_x/revoke_x set/clear exactly flag x (write and query are independent). mint_write_with_engine(a, g).is_some() ⇔ g.osc52_set().resolve(a.write_authorized), likewise for query. resolve(f) = true for a sequence-specific Execute rule, f for a universal-wildcard Execute rule or no match (Fallback), false for any other matching response. So the standard profile never over-grants a revoked capability, and an explicit OSC 52 set/query Execute rule grants regardless of the flag.	1,2,4,12	8/8	Copy struct of bools, PolicyGates compiled from aterm_policy (cross-crate)
+clipboard-invoke-forwarding	contract	clipboard_auth::{invoke_set,invoke_query,invoke_clear}	invoke_set calls the callback (if any) exactly once with Set{selections.to_vec(), content} and ignores its result; invoke_query returns None without a callback, else callback(Query{selections}) verbatim; invoke_clear calls it once with Clear{selections}.	1,3,13	3/3	Option<Box<dyn FnMut(..) -> Option<String> + Send>>
+resolve-colors-denotation	contract	color_resolve::{resolve_both,raw_resolve,resolve_colors,resolve_colors_raw_opts}, color_resolve::resolve_fg_color (cfg(test))	(f0,b0) = raw: default ↦ dfg/dbg, indexed i ↦ palette.get(i), RGB ↦ rgb.unwrap_or(default). f1 = palette.get(i+8) if opts.bold_is_bright ∧ BOLD ∧ ¬DIM ∧ fg indexed i < 8, else f0. f2 = DIM ? dim_toward_bg(f1, b0, opts.faint_opacity) : f1 (opacity 1.0 leaves fg). (f3,b3) = (INVERSE ≠ DECSCNM) ? (b0,f2) : (f2,b0). Result = (HIDDEN ? b3 : f3, b3). resolve_colors is this with the extras' RGB and default opts. The default palette maps 16..231 to the xterm 6×6×6 cube and 232..255 to the gray ramp (e.g. 128 ↦ (175,0,215)). The render path and apply_config's style policy read this resolver.	1,3,4	21/21	bit-packed Cell flags/colours, palette array, mem::swap; dim calls into f32
+dim-contrast-law	contract	color_resolve::{dim_toward_bg,linear_to_srgb_with}	For t ∈ [0,1] (non-finite opacity uses DIM_FACTOR) and WCAG contrast C: grayscale pairs have C(dim(fg,bg,t), bg) ≤ C(fg,bg) exactly; RGB pairs ≤ C(fg,bg) when C(fg,bg) ≥ 1.05, else ≤ C(fg,bg) + 0.005 (u8 quantization). t = 1 returns fg and t = 0 returns bg. The mix is max(t, the smallest mix with C ≥ C(fg,bg)^t) (faint_mix), so C(dim, bg) ≥ C(fg,bg)^t up to quantization: dark ink on a light ground keeps ≥ 3:1 on Aterm Day, Linen and Default Light at t = 0.5. On a light background dim moves dark text toward the background channel-wise.	3,5,6,7,13	5/5	f32 clamp/lerp, OnceLock tables, u8 rounding; needs an IEEE f32 model or exhaustive evaluation
+srgb-transfer-tables-exact	equivalence	color_resolve::{TransferTables::new,linear_to_srgb_with,srgb_to_linear_direct,linear_to_srgb_direct,encoded_unit_to_linear}	For c: u8, tables.to_linear[c] = srgb_to_linear_direct(c) bit for bit; for every finite f32 l, linear_to_srgb_with(tables, l) = linear_to_srgb_direct(l) (bucket base plus threshold correction reproduces the powf quantizer, thresholds included). Decidable by evaluation over 2^32 bit patterns once powf is fixed.	3,6,7,8,13	1/1	f32 powf (libm), to_bits loops, 8192-entry static, OnceLock
+color-state-model	refinement	Terminal::{set_default_foreground,set_default_background,set_default_cursor_color,set_default_selection_background,set_default_selection_foreground,set_palette_color,set_palette_color_components,reset_color_palette,color_palette_mut}, handle_osc_4, handle_osc_10_11_12, handle_osc_19, handle_osc_21, osc_21_{query_color,set_dynamic_color,reset_color}, OSC 104/110-119, colour stack (OSC 30001/30101), RIS, apply_config	Each slot s (fg, bg, cursor, selection bg/fg, palette[i]) has a live value live(s): Option<Rgb> (None = dynamic) and a host baseline base(s). Host setters and apply_config set live := base := v (palette setters touch only the named slot; a palette-view commit captures only the slots it changed); Terminal::new seeds base from aterm_types::DEFAULT_FOREGROUND/BACKGROUND. An OSC set changes live only (OSC 4 only with allow_palette_reconfigure), notifying Set; an empty OSC 21 value makes it dynamic (Dynamic); a bare key or OSC 1xx sets live := base (Reset; a bare numeric key resets palette[i] without SET permission); RIS sets every live := base. A host palette reset sets both to the built-in value, so a later OSC 104 cannot resurrect a cleared host colour. A query answers live (or '' when dynamic or undefined), a host callback's answer overriding, echoing the terminator; an unknown key is echoed as k=? iff osc_21_key_is_echoable(k), with no reply when none is. Push/pop of the colour stack restore every slot including dynamic ones. Getters read live.	1,2,3,4,10,12,13	16/16	ColorState Option<Rgb> fields, 256-entry palette with overrides, Drop guard ColorPaletteMut, callbacks, Vec colour stack
+host-color-mutators-damage	contract	Terminal::{set_palette_color,reset_color_palette,reset_palette_color_to_default,set_default_foreground,set_default_background,set_default_cursor_color,set_default_selection_background,set_default_selection_foreground}, ColorPaletteMut::drop	After each host colour mutator, has_damage() holds and damage_epoch() is greater than before, with no glyph written (full damage).	2	1/1	&mut self damage state, Drop of a guard
+config-negotiated-modes-seed	contract	config_api::apply_negotiated_mode, Terminal::apply_config, state::ConfiguredModes::default, TerminalConfig::default, DECSTR/RIS	apply_negotiated_mode(live, seed, v): seed = v ⇒ nothing changes, returns false; else seed' = live' = v and it returns live ≠ v. So for auto_wrap, focus_reporting and bracketed_paste, apply_config moves the live mode only when the host value differs from the one it last applied; an unchanged reload never overrides an app-negotiated mode. ConfiguredModes::default() equals those three modes of TerminalConfig::default(). DECSTR and RIS return them to the DEC power-on value, not the seed, and a later unchanged reload does not undo that.	2,4	5/5	two &mut bool into distinct fields; apply_negotiated_mode is straight-line scalar code (a first E6 target)
+config-reload-damage-and-idempotence	contract	Terminal::apply_config	apply_config(c) marks full damage (damage_epoch + 1) iff a render-time visual changed: cursor colour, any default/selection colour or the palette, or the style policy (bold_is_bright, faint_opacity). An ambiguous-width change damages nothing and leaves existing cells' geometry, while new text uses the new width. Idempotence: a second apply_config(c) returns [] and adds no damage.	2,3	3/3	field-by-field compares, f32 epsilon, Vec push
+config-reload-during-detached-reflow	contract	Terminal::{apply_config,set_memory_budget,set_scrollback_line_limit,scrollback_line_limit,finish_resize_offload,reset}	While the primary-content grid's store is detached for an off-thread reflow (on either screen), apply_config's memory budget and scrollback limit are recorded as pending; the getters read them back (a detached finite limit is not taken for unlimited), an identical reload is a no-op, they survive a reset/RIS in the detach window (the reflow then never re-attaches stale history), and they are applied on re-attach.	1,2,4,8,13	2/2	detach/reattach protocol with pending Option fields, Send job
+conhost-orphan-recovery	refinement	TerminalHandler::leave_orphaned_alternate_screen, Terminal::process (win32-input posture), conhost-left-alt-screen state, ?1049h/l, AltArchiveState::leave_orphaned	Against a ty_model! of conhost's two buffers (a frozen primary saved at ?1049h, a dead alternate buffer the shell keeps printing on): when a ConPTY session with ConsoleHost(T) leaves an orphaned alternate screen at an OSC 133 prompt, the engine lays the screen out as conhost does (the prompt at conhost's cursor row, rows above blank, absolute moves agree). Let S be the rows written after the orphaned leave. Until the state ends, conhost's next buffer switch (a ?1049h after a blank repaint, a stray ?1049l, or the host-forced leave) moves S and the history before it into scrollback so every row of S is retained exactly once and later repaints cannot reach the history. The state ends on a live enter, RIS, or after the first switch; a partial DECSTBM region leaves rows unmoved and spends it. Without ConsoleHost (a program's own ?9001h included) no rows move: 1049 exit restores the saved cursor in place, and conhost's blank repaint can erase rows typed after the kill, as the model predicts.	1,2,3,4,5,7,10	13/13	whole pipeline over recorded fixture streams, grid history, a conhost buffer model
+cell-extras-coherence	invariant	Grid cell write paths (plain blast, styled, VS15/VS16 width change, ICH/DCH/ECH/EL/DECERA/DECSEL/DECCRA/DECIC, wide-pair fixups, rectangle scroll), Grid::extras, Terminal::hyperlink_at	For every T ∈ Reach and cell (r,c): the extras map has an entry for (r,c) iff the cell's content needs one (an OSC 8 link, combining marks, an RGB/underline colour, a complex cluster), and the entry describes exactly the last write to the cell. Every operation that blanks or overwrites a cell removes its entry: plain and styled overwrites, a VS16 widen over a marked cell, ICH pushing a toned emoji off the edge, a narrow glyph over half a wide pair, VS15 narrowing a linked emoji, EL/ECH/DCH/DECERA bisecting a pair, DECSEL, DECCRA copying a head its source edge cut, a wide glyph wrapping off a marked last column, ICH/DCH on a DWL row. So hyperlink_at and row_text never report data from an earlier write. A wide pair brought in by a rectangle scroll is a wide pair to every writer.	1,2,3,5,7,12	5/5	HashMap-backed CellExtras keyed by coordinates, &mut grid write loops, HAS_WIDE_CHARS hint
+csi-dispatch-table	table-property	csi_dispatch_table::{lookup_csi_handler,encode_intermediates,csi_hash,CSI_DISPATCH_TABLE}, handler_csi::{lookup_csi_handler,csi_dispatch_untabled}	lookup_csi_handler(ims, f) = TABLE(ims, f), the 73-entry map (35 with no intermediate, 38 keyed by ?, ?$, >, =, <, !, space, ", #, $, +, ') and None elsewhere, including |ims| ≥ 3 and every two-byte intermediate other than ?$. Equivalently the 73 occupied slots hold pairwise distinct keys k, each at index csi_hash(k); encode_intermediates is injective on {[], [x] (x ∉ {0x00,0x01,0xFF}), [?,$]}, everything else maps to 0xFF, and no slot has key 0xFF. TABLE is disjoint from the csi_dispatch_untabled fallback (DECSACE, SL, SR, DECRARA, XTPUSHSGR/XTPOPSGR aliases, ECMA-48 SD). Decidable by evaluation.	1,3	7/7	slice patterns, wrapping_mul/add, static array of Option<(u8,u8,enum)>
+foreground-handback-gate-and-post	contract	Terminal::{foreground_handback,foreground_handback_scoped,program_owns_terminal,program_evidence}, DCS query handlers	foreground_handback() = None iff the parser is at Ground ∧ program_evidence = 0. Otherwise it returns h with h.bytes starting with CAN iff the parser was mid-sequence (and ESC < before any CSI when VT52 is on); a CAN ending a torn DECRQSS/XTGETTCAP query queues no response. Afterwards the parser is at Ground and program_evidence = 0. Every evidence-bearing mode is at its host baseline (the host-configured value if set, e.g. focus, paste, wrap, alternate scroll; else DEC power-on): alt screen left with its saved cursor restored, kitty flags on both screens' stacks, mouse mode and encoding, focus, modifyOtherKeys/formatOtherKeys, 2026, 2048, 2031, bracketed paste, cursor visibility, VT52; DECOM off and a full scroll region, cursor kept. Non-evidence modes (DECAWM, DECCKM, DECKPAM, charsets, IRM, LNM, DECSCNM, 1007, 67, 1036, encoding alone) are untouched unless a hidden cursor or the alt screen was the evidence (then wrap, cursor keys and G0 are also returned). h.reverted names exactly the reverted items; a torn sequence alone gives bytes [0x18] and reverted ["parser"]. foreground_handback_scoped(false) only cancels a torn sequence. Main-screen kitty flags parked under alt count as INPUT evidence.	1,2,3,4	13/13	Terminal-wide &mut self, u32 evidence bitset, Vec<u8> building, kitty stack snapshots
+handback-replay-and-idempotence	equivalence	Terminal::{foreground_handback,manual_handback,process}	Let t' be t after h = foreground_handback() (resp. manual_handback()). The projection (modes, normalised kitty snapshot, xterm keyboard, cursor, scroll region, parser ground) of t·process(h.bytes) equals that of t'. A second foreground_handback() on t' is None; a second manual_handback() returns empty bytes and reverted; manual_handback on a fresh terminal returns empty bytes.	1,2,3,4,10	2/2	as foreground-handback-gate-and-post, plus the handler run over emitted bytes
+manual-handback-post	contract	Terminal::manual_handback	After manual_handback(): parser at Ground (CAN first when it was not), program_evidence = 0, off the alt screen, mouse None with X10 encoding, legacy keys (no kitty flags or modifyOtherKeys; Ctrl+7 encodes as 0x1f), G0 = ASCII and GL = G0, no open hyperlink, cursor visible; reverted names each changed item. Main-screen content and the scrollback line count are unchanged. It reaches state the evidence gate does not (shifted charsets, an open OSC 8 link).	1,2,3,4	2/2	Terminal-wide &mut self, byte building
+evidence-assertion-table	table-property	Terminal::take_evidence_asserted, DEC/kitty/xterm mode setters	Every setter of an evidence bit asserts it, even when the mode is already in force: ?1049h/?47h/?1047h ↦ ALT_SCREEN; ?9h/?1000h/?1002h/?1003h ↦ MOUSE; ?25l ↦ CURSOR_HIDDEN; ?2026h ↦ SYNC; ?2048h ↦ SIZE_REPORTS; ?2031h ↦ COLOR_SCHEME_REPORTS; ?1004h ↦ FOCUS; ?2004h ↦ BRACKETED_PASTE; CSI >Nu (any N) and CSI =N;1u with N≠0 ↦ KITTY; CSI >4;N m with N≠0 ↦ MODIFY_OTHER_KEYS; CSI >4;N f with N≠0 ↦ FORMAT_OTHER_KEYS; ?2l ↦ VT52. One CSI with several params asserts the union; disarms and evidence-free modes assert nothing. take_evidence_asserted returns the accumulated set and clears it.	1,2,3	1/1	u32 bitset accumulated in handler paths
+absolute-row-update-remap	contract	handler::{apply_absolute_row_update,shell_event_row}, OscEventQueue::{rewrite,retain,bytes}	rev' = rev + 1 (saturating). Splice{at, ins}: every start anchor r (mark and block prompt/command/output rows, marks' and annotations' rows) maps to r ≥ at ? r+ins : r; a block's exclusive end_row e maps to e+ins iff e > at or the block starts at or after at, so a block ending exactly at the splice keeps its end. Queued OSC 133 A/B/C events with row ≥ at are rewritten to row+ins, order kept, and the queue's byte count equals the sum of the surviving payloads. Invalidate: command_marks, current_mark, output_blocks, current_block, marks and annotations are emptied, and exactly the coordinate-bearing events (133 A/B/C with a row) are removed, keeping the rest in order.	1,2,3,7,13	2/2	&mut to four structs, VecDeque iter_mut, shift closures over &mut u64, string parse/format
+terminal-wf-invariant	invariant	Terminal::{new,process,resize,resize_with_policy,resize_offloading_scrollback,finish_resize_offload}, Grid::{assert_structural_invariants,assert_wide_char_consistent,assert_extras_claimed}	Inv(Terminal::new(r,c)) for r,c ≥ 1. For T ∈ Reach with Inv(T) and every byte string x, process(T,x) terminates without panicking (no out-of-bounds index, overflow or unwrap on None) and Inv holds after it. For every r',c' ≥ 1 and every resize path (sync, offloaded, ConPty policy), resize does not panic, Inv holds, and rows = r', cols = c'. Every visible cell is readable and get_line_text never panics on any visible row or history depth, so visible_content and probe reads never panic.	1,2,3,5,7,12,16	15/15	&mut self over Terminal (Grid, Parser, scrollback tiers, extras side table), ring index arithmetic, generic ActionSink, debug assert fns as the predicate, the parser type-invariant cross-crate
+process-chunk-invariance	equivalence	Terminal::{process,process_at,checkpoint,take_response,alt_archive,alt_archive_read}, Terminal::advance_parser_archiving, alt_archive_epilogue, TerminalHandler::{print_ascii_bulk,write_ascii_bulk_fast,write_unicode_bulk,handle_sgr}	For T ∈ Reach, byte strings x, y and a clock c: ObsFull(process_at(process_at(T,x,c),y,c)) = ObsFull(process_at(T,x++y,c)), and the replies drained after each call concatenate to the replies drained once. By induction every chunking folds to the same ObsFull, and refolding a log gives a bit-identical state. This covers the alt archive (texts, gaps, lost) and the grid, cursor and screen mode, and implies that the bulk writers (ASCII blast, styled run, extras run, splat, print_unicode_bulk, REP) agree with the per-glyph writer under every mode (DECSLRM, DECAWM, IRM, charsets, DWL, VT52), that an SGR split at any byte is one SGR, and that an RIS after a query keeps the replies it generated. Compared after every ground prefix, the lanes conform to coalesce_model.	1,2,3,4,5,7,10,12	17/17	lift of aterm-parser's advance-fast-chunk-invariance through the handlers; simulation of every bulk writer by per-glyph writes
+has-run-of-4	contract	handler_actions::has_run_of_4	has_run_of_4(d) ⇔ ∃ i. i+3 < |d| ∧ d[i] = d[i+1] = d[i+2] = d[i+3].	1,3,5,7	1/1	slice windows(4) loop
+apc-put-bulk-refines-per-byte	equivalence	TerminalHandler::{apc_put_bulk,apc_put}	For every handler state, run r and split of r, folding apc_put_bulk over the chunks leaves (dcs.data, total_bytes, sequence_bytes) equal to folding apc_put over the bytes. Both keep |dcs.data| ≤ 4 MiB and total_bytes ≤ MAX_DCS_GLOBAL_BUDGET, dropping each byte past a cap.	1,2,3,7	1/1	Vec<u8> extend with min/saturating arithmetic, loops
+dcs-put-bulk-refines-per-byte	equivalence	TerminalHandler::{dcs_put_bulk,dcs_put}, SixelDecoder::pixel_alloc_bytes	For every dcs_type, state, run and split, folding dcs_put_bulk yields the same (dcs.data, total_bytes, sequence_bytes), and for Sixel the same decoder pixel_alloc_bytes, as folding dcs_put. |dcs.data| ≤ cap(dcs_type) (Decrqss 256, Xtgettcap 1024; Unknown pushes nothing without a callback but still counts), total_bytes ≤ MAX_DCS_GLOBAL_BUDGET.	1,2,3,7,12	2/2	enum match on DcsType, Vec, the sixel decoder (feature-gated)
+alloc-fault-fail-closed	contract	kitty chunk accumulator (fault kitty.chunk_alloc), response append (fault response.append_alloc), fault::hit	If an allocation at a fault site fails (modelling a try_reserve failure) the operation is dropped whole: the Kitty transfer is abandoned with kitty_pending = None and nothing placed, or the response is not appended. No partial state remains, so the next identical operation behaves as on a fresh path.	1,2,8	2/2	nondeterministic allocation-failure oracle, try_reserve, Result
+kitty-store-lifecycle	refinement	TerminalHandler::handle_kitty_graphics (transmit/put/delete), Terminal::{cell_frame,images_row}	Kitty store commands refine KittyModel. a=t stores an id with no placement; a=T stores and places at the cursor; a=p places a stored id (else ENOENT). Chunks with m=1 accumulate under the first chunk's keys and nothing is placed until m=0. a=d with a lowercase selector removes the matching placements and keeps the data; uppercase also frees images left with no placement; bare a=d is d=a. Virtual placements are reached only by id-addressed selectors, and d=A keeps an image that still has one. Re-transmitting id k replaces k's data and removes k's placements only. cell_frame/images_row show exactly the model's placements whose tiles cover each cell.	1,2,3,4,5,7,10	7/7	HashMap/BTreeMap of Arc<Image>, Vec placements, base64, a ty_model! model plus binding
+kitty-delete-semantics	contract	delete_kitty_placements (handler_actions.rs), kitty a=p put, Terminal::images_row	For each a=d selector (a/A, i/I with optional p=, n/N newest image with that number, R id range, p/P point, q/Q point with z, x/X column, y/Y row, z/Z, c/C cursor cell, f/F frame) the removed placements are exactly the kitty placements matching it; a placement covering the addressed cell is removed in full; z defaults to 0; a cursor on an empty cell matches nothing; a selector missing its id or coordinates, or naming a cell beyond the screen (up to u32::MAX), removes nothing and does not panic. Lowercase keeps every image's data; uppercase also frees each named or cleared image left with no placement (d=F on a single-frame image removes it; d=f keeps a lone frame). No selector removes another protocol's image. A put naming an existing (i,p) moves that placement; an unnamed put adds one.	1,2,3,5,7	18/18	match over selector chars, filters over placements, u32→u16 range checks
+kitty-chunked-load-lifecycle	contract	kitty APC handler: chunked load state (m=1/m=0), OSC 133/633 A and C	A first chunk with m=1 opens a load iff kitty would hold it in flight (an accepted direct-medium transmit, query or frame load; not a frame for an absent image, a query with no i=, both i= and I=, raw pixels with no area, or a side over the limit); any other m=1 command runs at once and opens nothing. An open load assembles across unrelated output and final chunks repeating the first chunk's keys. It ends at an OSC 133/633 A or C, at a delete (which runs), and at a command on another medium (which is answered). A put mid-load is drawn and the load goes on. A command refused before routing is answered and leaves the load in flight. The final answer honours the q= of its chunks. Without an ending event, the next complete command is taken as the final chunk and draws nothing.	1,2,3,5,7	8/8	Option<PendingLoad> state machine with Vec<u8>, key parsing, base64
+kitty-payload-source	contract	kitty data load (medium, o=z inflate, raw length check), Terminal::set_kitty_file_resolver	data = (t=d) the base64 payload | (t ∈ {f,t,s} ∧ a resolver installed) resolver(medium, path) | otherwise refused with no host read. If o=z the data must zlib-inflate, else refused. Raw f=24/32 must have length s·v·bpp, else refused. f=100 is read as PNG. A refused transmit places and stores nothing.	1,2,4,12,13	6/6	boxed FnMut resolver, zlib inflate (aterm_codec), Result
+kitty-reply-protocol	contract	kitty reply writer, Terminal::take_response	The reply to a Kitty command is None if it names neither i= nor I=, or q=2, or (q=1 ∧ OK), or a=d, or (a=a ∧ the image exists). Otherwise it is ESC _ G i=<id>[,I=<n>][,p=<pid>][,r=<frame>] ; <OK | ECODE:msg> ESC \, where id is assigned by the terminal for an I= transmit, r= is echoed only when given (the new frame's number for a=f), and ECODE ∈ {ENOENT, EINVAL, ENOSPC, ENOPARENT, ECYCLE, ETOODEEP, EBADPNG, ENOTSUPPORTED} is the model's refusal reason. a=q answers OK for t=d, and for t ∈ {f,t,s} OK iff a resolver is installed else ENOTSUPPORTED; a transmit over a disabled medium gets the probe's verdict; i= with I= is EINVAL.	1,2,3,4,5	6/6	String formatting into the response Vec, enum outcomes
+kitty-store-budget	invariant	kitty store insert/delete, RIS, put variant cache	kitty_total_bytes = Σ payload bytes over stored images, every frame and every live put variant (a base transmit charges two slots, a frame one), and ≤ MAX_KITTY_STORE_BYTES. A transmit that would exceed the cap is refused with store and counter unchanged; deleting frees exactly the freed slots; d=A and RIS empty the store, frames and pending chunk and zero the counter. Put variants per id ≤ MAX_KITTY_VARIANTS; an unshown variant is recycled; a new one with MAX_KITTY_VARIANTS shown is ENOSPC.	1,2,5,7	5/5	type invariant over HashMaps of Arc<Image> and Vec frames
+kitty-placement-layout	contract	kitty placement layout (footprint, scaling, offsets, crop), cursor policy after placement	For raster (w,h), cell (cw,ch) and keys c,r,X,Y,x,y,w',h': the source is the crop if given (a crop missing the raster is EINVAL). Neither c nor r: footprint = (⌈(src_w+X')/cw⌉, ⌈(src_h+Y')/ch⌉), scaling PixelExact; both: (c,r), Fit; one: the other follows the aspect ratio as kitty computes it. c=0/r=0 are unset; X' = min(X,cw−1), Y' = min(Y,ch−1); sums saturate and clamp to the grid. A virtual placement (U=1) gets no offset and stamps no cell. A put's own keys lay out the image; a key-less put shows the stored Arc; an identical put reuses its variant. Cursor: C=1 or U=1 leaves it; otherwise (row+rows−1, col+cols), or the next line's column 0 when past the right margin.	1,2,3,5,12	7/7	u32 saturating ceil-div, Option keys, Arc::ptr_eq reuse
+kitty-layer-order	invariant	kitty layer stacking in cell extras, Terminal::{images_row,cell_frame}	The Kitty layers covering a cell, bottom first, are sorted by (z, image first-sent seq, placement seq). A put equal to an existing unnamed placement of the same image (same cell, footprint and layout; only the crop corner may differ) replaces it and its relatives follow; a differing put stacks. A non-Kitty image takes the cell whole. Floating placements ≤ MAX_KITTY_FLOATING (ENOSPC past it). A frame carries each cell's top MAX_IMAGE_LAYERS layers. The order survives scrolling into history and back.	1,2,5,7,12	4/4	sorted Vec insert in a CellExtra, capped Vec
+kitty-relative-placements	contract	kitty relative placement (P=/Q=/H=/V=), kitty_floating, kitty_relations	A put with P=p,Q=q is placed at anchor(p,q) + (V,H) and leaves the cursor; for a virtual parent the anchor is the (top row, leftmost column) of its placeholders on screen, recomputed each frame (none on screen: kept but drawn nowhere). Moving the parent moves its descendants; deleting it deletes them, freeing images left with no placement. Refusals change nothing: missing parent ENOPARENT, a cycle ECYCLE, a relative virtual placement EINVAL, depth > MAX_KITTY_RELATIVE_DEPTH ETOODEEP.	1,2,5,7,10	3/3	relation graph (HashMap), bounded chain walk, placeholder scan
+kitty-placeholder-resolution	contract	kitty_placeholder::decode_cell, render_cells::images_row_into	decode_cell = None unless the cell's char is U+10EEEE. Otherwise image_id = (dv(mark2)&0xFF)<<24 | fg_id (RGB fg packs r<<16|g<<8|b, indexed fg is its index, default 0), placement_id = the underline colour index, else its RGB id, else 0, and (row,col) = (dv(mark0), dv(mark1)) with missing or unknown marks 0. At render the placeholder draws tile (row,col) of that virtual placement; placement_id = 0 picks the newest; an unknown placement or image draws nothing; the tile uses that placement's own box.	1,3,4,12	3/3	&Grid reads, Option chaining, u32 bit ops
+kitty-frames	refinement	kitty a=f / a=a / a=c / d=f, compose_rgba	Frames refine KittyModel.frames. a=f with r absent (or past the end) appends; r=k edits frame k in place (r=1 is the root). Data is composed at (x,y) over transparent black, frame c, or the Y= background, X=1 overwriting instead of blending; the frame takes the root's layout; the reply names r=. a=a c=k shows frame k in every placement, each keeping its layout, and damages every placeholder row naming the image. a=c copies rect (x,y,w,h) of frame r onto frame c (out of bounds or self-overlap EINVAL, missing frame ENOENT). PNG frames are decoded to RGBA. d=f r=k (absent → 1, past end → last) removes frame k, renumbers, refunds its bytes; the shown frame stays if it survives, else the frame now at its number (or the last); a lone frame is kept by d=f and d=F deletes the image. A refused a=f adds no frame.	1,2,4,5,7,10,12	7/7	Vec<Frame> remove/insert, Arc<Image> rebuild, PNG decode (aterm_png), damage marks
+kitty-animation-scheduler	contract	Terminal::{advance_kitty_animations,process_at}, kitty a=a s=/v=/z=	advance_kitty_animations(now) returns KittyAnimationStep::default() when no animation runs or every running one is drawn nowhere (including through a virtual parent). Otherwise for each running animation with frame f shown since t0: advanced ⇔ now ≥ t0+gap(f), then the next frame with a nonzero gap (wrapping to the root); next_frame_at = its shown-since + gap. s=1 stops and holds, s=3 runs, s=2 rests on the last frame until a new one arrives, v=n bounds loops to n−1 passes, a new s= restarts the count, s=0 changes nothing. A drawn frame held by a renderer does not stop the store recycling a copy nothing shows.	1,2,5,7,8	5/5	Instant/Duration as inputs, HashMap iteration
+live-image-budget	invariant	image placement (Kitty, iTerm2, sixel) live-byte accounting per screen, place_sixel_image	For each screen (main, alt; parked or active), Σ payload bytes of the distinct Arc<Image> layers it shows ≤ MAX_LIVE_IMAGE_BYTES + the image just placed, and the image just placed is never evicted, including images the store does not keep or has freed or replaced behind a parked screen. An image larger than MAX_IMAGE_BYTES (e.g. a DECGRA-only sixel declaring 2100×2100) places no cells.	1,2,5,7	6/6	per-grid counters, Arc dedup, HashSet, main/alt swap, eviction loop
+kitty-command-parse	contract	kitty_graphics::{parse_kitty_command,KittyAction::from_char,nonzero}	parse_kitty_command(apc) = None ⇔ apc is empty or apc[0] ≠ 'G' or the control half (before the first ';') is not UTF-8. Otherwise the control is split on ',' into k=v pairs; each known key (a,f,t,i,I,p,s,v,c,r,x,y,w,h,X,Y,P,Q,H,V,z,m,o,q,C,U) takes its last value and others are ignored. Defaults: Transmit, Rgba, Direct, quiet 0, more false, compressed false. i,I,p,P,Q = 0 map to None, and P=0/Q=0 also drop H/V/X. payload = base64-decode(the rest), or [] if absent or undecodable.	1,3,5,7,12	12/12	from_utf8, split iterators, str::parse, ~30 Option fields, base64
+kitty-loadable-size	contract	KittyCommand::declares_loadable_size, kitty transmit acceptance	declares_loadable_size(c) ⇔ (width None or ≤ MAX_KITTY_DIMENSION) ∧ (height None or ≤ MAX_KITTY_DIMENSION) ∧ (format = Png ∨ (width ≥ 1 ∧ height ≥ 1)). A whole-image transmit with otherwise good data is stored (OK) iff it declares a loadable size, else EINVAL with nothing stored.	1,3,4	2/2	Option<u32> closures, enum compare
+compose-rgba	contract	kitty_graphics::{compose_rgba,blend_over}	With H_u = |under|/(4·under_w) (0 for width 0) and H_o likewise: for row < h, col < w with sy+row < H_o, dy+row < H_u, sx+col < over_w and dx+col < under_w, pixel under[(dy+row, dx+col)]' = blend ? over_px(dst, src) : src with src = over[(sy+row, sx+col)]. Every other byte is unchanged, and the call never panics. over_px: sa=255 → src, sa=0 → dst, else straight-alpha source-over.	1,2,3,5,7	1/1	&mut [u8], nested loops, checked_div, slice get ranges
+png-dimensions	contract	kitty_graphics::png_dimensions	png_dimensions(b) = Some((be32(b[16..20]), be32(b[20..24]))) if |b| ≥ 24 ∧ b[..8] is the PNG signature; else None.	1,3	1/1	slice compare, from_be_bytes
+rgb-to-rgba	contract	kitty_graphics::rgb_to_rgba	|out| = 4·⌊|rgb|/3⌋ and out[4i..4i+4] = rgb[3i..3i+3] ++ [0xFF]; a trailing partial pixel is dropped.	1,3,7	1/1	as_chunks::<3>, extend loop
+kitty-diacritic-table	table-property	kitty_placeholder::{DIACRITICS,diacritic_value}	|DIACRITICS| = 297, strictly ascending; diacritic_value(c) = Some(i) ⇔ DIACRITICS[i] = c, else None. The table equals Kitty's rowcolumn-diacritics list.	1,3,7	2/2	const [char;297], binary_search (decidable by evaluation)
+iterm2-inline-image	contract	handler_osc_1337 File=, detect_format, place_image	OSC 1337;File=args:b places an image iff inline=1 ∧ ':' present ∧ b (whitespace removed) is base64 with no ';' that decodes to non-empty P; otherwise nothing is placed. Stored bytes = P; format = detect_format(P) (Unknown still places). cols = min(width cells, grid cols); rows = the requested height bounded by max(grid rows, ⌈4096/ch⌉), else by aspect ratio. Every footprint cell holds a layer with its (cell_row, cell_col) and one shared Arc. scaling = Stretch iff preserveAspectRatio=0, else Fit. The final state equals text flow: rows past the bottom (or DECSTBM region) scroll, rows above the region persist, and the cursor ends at column 0 below the image.	1,2,4,5,7,12	14/14	arg parsing, base64, Arc<Image>, grid stamping loop, scrolling
+image-retention-horizon	contract	Terminal::{scrollback_image_rows_dropped,scrollback_truncated_lines,cell_frame}, Line::serialize	An image placement's history rows keep their tiles while the line is uncompressed (ring, staging, hot tier). Once serialized past the hot tier its rows materialize with no tiles and empty text, and surrounding text lines are intact. scrollback_image_rows_dropped counts the image-bearing rows that crossed that horizon, each once; it is monotone, 0 for a session with no picture, and independent of scrollback_truncated_lines.	1,2,3,5,7,12	4/4	counter at the serialize boundary, wire format with no image section
+history-image-payload-shared	contract	Terminal::cell_frame, ImageRef, history materialization of image extras	All materialized tiles of one inline image scrolled into history and shown again have Arc::ptr_eq ImageRef.image; no tile copies the bytes.	1,2,3,12	1/1	Arc identity
+sixel-dcs-never-leaks-glyphs	contract	DCS q sixel hook (feature sixel) / DcsType::Unknown consume, Terminal::{images_row,visible_content}, DA1	For every DCS sixel string, well-formed or not, its payload bytes never become glyphs. With the sixel feature (DA1 advertises 4) a well-formed image is decoded and placed at the cursor row; without it the string is only consumed. The adversarial corpus is a sample of terminal-wf-invariant.	1,2,3,5,7,12	1/1	cfg(feature) branches, sixel decoder, DA1 bytes
+decslrm-validity	contract	DECSLRM (CSI Pl;Pr s under DECLRMM)	With DECLRMM set, defaults Pl=1, Pr=cols, l = Pl−1, r = min(Pr,cols)−1: if l < r the margins become (l,r) and the cursor goes home; otherwise margins and cursor are unchanged.	2,3,4,12	2/2	grid margins, u16 arithmetic
+decslrm-run-wraps-at-the-right-margin	contract	print writers (blast, styled, extras, splat, REP, print_unicode_bulk), DECSLRM/DECLRMM	With DECLRMM and margins [L,R], a run printed from column c ≤ R wraps at R and continues at L on the next row, on every writer; from c > R it wraps at the last column back to column 0. On a double-width row the limit is min(R, cols/2 − 1). So rows after the first hold no text right of R, the first ends exactly at R when c ≤ R, and DSR's cursor column is identical across writers and chunkings.	1,2,3,5,7	1/1	per-glyph vs per-run row limit, u16 arithmetic
+damage-scope	contract	DECTCEM, DECSCUSR, mode 12, DECSCNM, 47/1047/1049 exit, handle_osc_10_11_12, handle_osc_19, Grid damage	A real cursor-appearance transition (DECTCEM, DECSCUSR, ?12) leaves non-empty, non-full damage containing the cursor's row and no other row, with damage_epoch + 1; a no-op transition adds none. A whole-screen change (DECSCNM, any alt-screen exit, an OSC dynamic-colour set or reset such as 11/19/119) marks full damage with damage_epoch + 1.	1,2,4,5,12	5/5	damage rows in aterm_grid, u64 epoch
+decrqm-mode-agreement	invariant	handle_decrqm, query_dec_mode, DECSET/DECRST handlers, DECRQSS ?m	For every m in REPORTED: DECRQM(T,m) = CSI ? m ; (state(T,m) ? 1 : 2) $ y, where state is the mode's observable effect (?67 ⇔ BACKARROW_SENDS_BS, ?12 ⇔ a blinking cursor style, ?2031/?2048/?1035/?1036/?1039/?1045/?9001 their flags). CSI ? m h/l sets or resets state subject to its precondition (3 needs 40; 9001 needs ConsoleHost). A permanently reset mode (2027) answers 4 and ?m h changes nothing; ?9001 without a console host answers 0. DECRQSS ?m answers 1$r?m(h|l) consistently.	1,2,3,4,5	6/6	match over u16 mode numbers, ~40 bools, response formatting
+xtsave-restore-roundtrip	equivalence	XTSAVE (CSI ? m s), XTRESTORE (CSI ? m r), query_dec_mode	For every m in REPORTED and every mode changes w that do not touch the save slot: DECRQM(feed(T, CSI?m s · w · CSI?m r), m) = DECRQM(T, m). The XTSAVE table covers exactly the DECRQM-reportable domain (stated over handle_decrqm's domain, not a hand-kept list).	1,2,4,5	2/2	save-slot map over modes, match over u16
+keyboard-mode-projection	contract	keyboard_mode::keyboard_mode_from_state, Terminal::{keyboard_mode,kitty_report_all_keys,kitty_reports_functional_keys,kitty_suppresses_predictive_echo}, TermMode::from_keyboard_state	keyboard_mode(T) = keyboard_mode_from_state(modes, kitty_keyboard_enabled ? kitty_flags : none, xterm) = TermMode::from_keyboard_state(app_cursor, app_keypad, vt52, kitty, xterm).to_keyboard_mode() ∪ {BACKARROW_SENDS_BS if backarrow_sends_bs} ∪ {ALT_NO_ESC if ¬alt_send_escape} ∪ {META_SENDS_ESC if meta_send_escape} ∪ {NO_SPECIAL_MODIFIERS if ¬special_modifiers} ∪ {WIN32_INPUT if win32_input_mode ∧ ConsoleHost}. WIN32_INPUT never enters the kitty flag word; mode 1045 does not appear. kitty_report_all_keys ⇔ REPORT_ALL_KEYS_AS_ESC ∈ km; kitty_reports_functional_keys ⇔ km ∩ {DISAMBIGUATE, REPORT_ALL} ≠ ∅; kitty_suppresses_predictive_echo ⇔ km ∩ {REPORT_EVENT_TYPES, REPORT_ALL} ≠ ∅. Disabling the kitty capability hides the bits without erasing the negotiated flags.	1,2,3,12	9/9	bitflags union, cross-crate aterm_types TermMode
+key-encoding-composition	other (cross-crate composition)	aterm_types::keyboard::{encode_key_with_layout,encode_key}, Terminal::{keyboard_mode,mode_mirror}	The bytes of encode_key_with_layout(key, mods, keyboard_mode(T), event) are the encoder's spec applied to keyboard-mode-projection(T). Instances: legacy Enter CR, Shift+Enter LF, Ctrl+Enter CR, Alt+Enter ESC CR; under DISAMBIGUATE Shift+Enter is CSI 13;2u and Menu CSI 57363u (no legacy form: empty); modifyOtherKeys 2 gives CSI 27;2;13~; ALT_NO_ESC drops the Alt ESC prefix and META_SENDS_ESC adds one; under WIN32_INPUT Enter chords, Escape, Ctrl+[ and Alt+[ are win32 key-record pairs, the matching release is empty, and Alt+a stays ESC a. The encoder's ensures are cited at the keyboard_mode result.	1,4,12	9/9	Vec<u8> formatting in aterm-types, enum Key match
+kitty-keyboard-protocol	refinement	KittyKeyboardQuery/Push/Set/Pop handlers, DECSTR, per-screen kitty stacks, Terminal::set_kitty_keyboard_enabled	Kitty keyboard state refines one (flags, stack) per screen plus a capability bit E. CSI ? u answers CSI ? flags u iff E ∧ ¬ConPty posture. CSI > f u pushes and sets flags = f & MASK; CSI = f ; m u sets, ORs or AND-NOTs f & MASK; CSI < n u pops n. With ¬E, push/set/pop are consumed with no effect. DECSTR resets only the active screen's pair; alt entry/exit switches the active pair; DEC 9001 never changes flags or stack; RIS keeps E. (MASK width: see §5.)	1,2,4,5,10	8/8	bounded stack per screen, u16→u8 masking
+win32-input-mode-lifecycle	contract	DECSET/DECRST 9001, Terminal::{set_win32_input_enabled,set_console_host_posture}, RIS, DECSTR	win32_input_mode becomes true only through CSI ?9001h under ConsoleHost. Without one, ?9001h changes nothing observable (keyboard_mode and mirror lack WIN32_INPUT, encoder output unchanged, DECRQM answers 0) and is consumed with no grid effect. RIS clears the mode and DECSTR keeps it. set_console_host_posture(Native) drops WIN32_INPUT, even when restored from a ConPTY checkpoint; ConPty suppresses the kitty query reply.	1,2,4	6/6	bool modes, enum ResizePolicy, checkpoint round trip
+host-leave-orphaned-alt	contract	Terminal::leave_alternate_screen, TerminalHandler::leave_orphaned_alternate_screen, alt_archive	leave_alternate_screen(T) returns modes.alternate_screen; on false T is unchanged. On true T' is on the main screen with its grid and scrollback as before the entry, cursor = the save of the latest entry for 1049 or the alt cursor for 47, the alt rows are archived, and a later ?47h shows a blank alt buffer. The dead app's scroll region becomes full, mouse None, encoding X10, app cursor/keypad off and synchronized output off, focus reporting kept. The request is one-shot, and a prompt-driven leave releases the same modes.	1,2,4,7,10	7/7	grid swap, scrollback, mode reset, batch prologue/epilogue
+prompt-leaves-orphaned-alt	contract	OSC 133/633 A on the alt screen, alt_archive, shell marks	On the alt screen an accepted prompt-start mark (133;A or 633;A passing the nonce gate when required) performs host-leave-orphaned-alt before the prompt is painted, so the prompt and its mark (prompt_start_row = an absolute main-grid row) land on the main grid. Every alt row painted before the A, the same read included, is archived in exactly one Leave gap. B, C and D do not leave; a dropped A changes nothing; on the main screen an A changes no screen state and adds no gap.	1,2,4,7,10	8/8	OSC param parsing, nonce compare, grid swap, archive Vec
+in-band-size-report	contract	DECSET 2048, Terminal::resize, in-band size emitter	R(T) = CSI 48;rows;cols;rows·ch;cols·cw t (cell px default 8×16) is queued exactly on a ?2048 disabled→enabled transition and on each resize while enabled; never when disabled, and a repeated ?2048h queues nothing.	1,2,3,4	4/4	bool transition guard, u16/u32 multiply, format
+response-buffer-bounded	invariant	send_response, in-band size emitter and every direct response writer	For T ∈ Reach, |pending response bytes| ≤ MAX_RESPONSE_BUFFER_SIZE, including paths that bypass send_response (e.g. a ?2048l/?2048h toggle flood).	1,2,5	1/1	Vec<u8> length invariant across every writer
+resp-take-response	contract	Terminal::{take_response,response_buffer_capacity}, DSR 5n	take_response() = Some(contents) if the buffer is non-empty, leaving it empty with its capacity unchanged; otherwise None. DSR CSI 5 n replies "\x1b[0n".	1,2,3,4	1/1	Vec<u8> capacity (needs an allocation model)
+cursor-blink-mode-12	contract	DEC mode 12, DECSCUSR, Terminal::cursor_style, DECRQM ?12, DECRQSS ?12	Mode 12 is the blink bit of cursor_style: ?12h/l set or clear blink and keep the shape. DECSCUSR n ∈ 1..=6 sets shape (n+1)/2, blinking iff n is odd. DECRQM 12 = 1 iff blinking, else 2; DECRQSS ?12 = ?12h iff blinking. ?25h/l does not touch the style.	1,2,3,4	2/2	enum CursorStyle, response formatting
+cursor-style-default	contract	Terminal::{set_default_cursor_style,apply_config}, DECSCUSR, DECSTR, RIS	cursor_style(T) = the app override if a DECSCUSR arrived since the last reset (DECSTR, RIS or construction), else the default style. set_default_cursor_style(s) and apply_config(cursor_style = s) set the default without clearing an override. DECSTR and RIS clear the override, restoring the host default.	1,2,4	5/5	Option<CursorStyle> override
+color-scheme-report	contract	DSR ?996, Terminal::set_color_scheme, DEC 2031	CSI ?996n answers CSI ?997;(1 Dark | 2 Light) n for the current appearance (default Dark). set_color_scheme(a) queues the same report iff mode 2031 is set ∧ a differs from the previous appearance.	1,2,4	2/2	enum Appearance, response formatting
+xtversion-reply	contract	XTVERSION (CSI > 0 q), aterm_types::version::app_version	process(T, ESC[>0q) queues exactly ESC P >|aterm(app_version()) ESC \.	1,3,12	1/1	String formatting, cross-crate const fn
+vt52-address-and-ascii-after-zwj	contract	VT52 ESC Y, print writers with a ZWJ continuation	VT52 ESC Y r c consumes exactly its two address bytes and the rest of the run goes to the writer it would take in the next read. Printable ASCII after a ZWJ never folds into the previous cell under any mode (IRM, DECAWM off, a national charset, bulk path); a printed ASCII glyph ends the ZWJ continuation, so an emoji after it opens its own cell.	1,2,3,7	1/1	small pending-address state machine, writer fold flag
+rep-repeats-the-last-graphic-character	contract	REP (CSI n b), last graphic char tracking	CSI n b prints n copies (default 1) of the last graphic scalar received, whichever writer laid it out and whatever the pen (the skin-tone modifier after a toned emoji, the second RI after a flag). REP of a space writes the same cells and row len as n typed spaces.	1,2,3,7	1/1	char field updated on every writer path
+row-len-is-the-written-extent	invariant	Row::len, print writers (splat, REP), combining-mark attach	Row::len = 1 + the largest written column (0 for none). A printed blank counts on every writer, and a mark attached to a blank cell writes that cell, so row_text keeps trailing printed blanks and the mark. Hence a prompt ending in printed spaces keeps the cursor after them through a width round trip, for every chunking.	1,2,3,7	1/1	per-row u16 len on every writer
+sanitize-title	contract	handler_osc::sanitize_title, handler_osc_notify::sanitize_notification	sanitize_title(s) = [c ∈ s | c = '\t' ∨ (c ∉ C0 ∧ c ∉ C1 ∧ c ∉ BIDI9)], order kept; sanitize_notification(s) = its prefix cut at floor_char_boundary(MAX_NOTIFICATION_FIELD_BYTES). Corollaries: idempotent, no control or BIDI9 char in the result, identity on clean text.	1,3,5,7	4/4	chars().filter().collect(), char ranges, floor_char_boundary
+osc-title-and-epoch	contract	TerminalHandler::set_title (OSC 0/1/2), Terminal::{set_title,title_epoch}, CSI 22/23 t, OSC 7 label fallback	OSC 0;t sets title and icon, OSC 1;t the icon, OSC 2;t the title, each to sanitize_title(from_utf8_lossy(t)) with t = params[1..] rejoined by ';'. title_epoch strictly increases iff the tab label (title, or the cwd for a titleless tab) changes value, through OSC 0/2, set_title, a CSI 23 t pop or an OSC 7 change or clear; a same-value set leaves it. CSI 22/23 t push and pop the title stack regardless of allow_window_ops.	1,2,4	6/6	String compare/assign, from_utf8_lossy, Vec title stack
+osc-semicolon-tail-preserved	contract	set_title, handle_osc_8, aterm_parser::parse_osc_from_third_param	For every title s of OSC data bytes (no BEL, ESC, CAN, SUB) with any number of ';' within the OSC cap, ESC]0;s BEL gives title() = s. For every URI u the OSC 8 gate accepts, with any ';', ESC]8;;u ST X gives hyperlink_at(0,0) = Some(u) exactly, never truncated.	1,3,4,5,7,12	2/2	borrowed subslices with the last slot as remainder (cites the parser osc spec), join
+osc8-uri-acceptance	contract	TerminalHandler::handle_osc_8, handler_osc::is_allowed_scheme, Terminal::{current_hyperlink,hyperlink_at_visible}	OSC 8;params;U (U = params[2..] rejoined): current_hyperlink' = Some(U) iff |U| ≤ MAX_HYPERLINK_URL_BYTES ∧ no control char but tab ∧ no BIDI9 ∧ is_allowed_scheme(U, extra); otherwise None, so a refused URI ends the open link. is_allowed_scheme(U,E) ⇔ U contains ':' ∧ the scheme before it is RFC 3986-shaped ∧ eq_ignore_ascii_case an element of {http, https, mailto, sftp, tel} ∪ E. Cells printed while a link is open carry it.	1,2,3,5,7	8/8	&str find/slice, eq_ignore_ascii_case, Arc<str>
+hyperlink-auth	refinement	HyperlinkAuth::{new,authorize_scheme,revoke_scheme}, hyperlink_auth::{is_rfc3986_scheme_shape,is_never_allowed}, Terminal::{authorize_hyperlink_scheme,revoke_hyperlink_scheme,is_hyperlink_scheme_authorized,hyperlink_extra_scheme_count}	new() = ∅. authorize_scheme(s), l = lower(s): returns true with E' = E ∪ {l} iff |s| ≤ 32 ∧ shape(s) ∧ trim_end(l, '+-.') ∉ NEVER_ALLOW {javascript, data, file, vbscript, about, blob} ∧ (l ∈ E ∨ |E| < MAX_EXTRA_SCHEMES = 4); else false, E unchanged. revoke_scheme(s) removes every e eq_ignore_ascii_case s. shape(s) ⇔ s non-empty, ASCII letter first, then alphanumerics or '+-.'. Invariant: |E| ≤ 4 and every e is lowercase, shaped and allowed. Only authorize/revoke mutate E (not DECSTR or RIS). The projection (orca authorized, other count, any never-allowed authorized) refines hyperlink_scheme_cap_model, never = 0 holds, and an OSC 8 orca: URI is accepted iff orca is authorized.	1,2,3,5,7,10	10/10	Vec<Box<str>> push/retain, to_ascii_lowercase, trim_end_matches
+cwd-store	contract	TerminalHandler::{store_reported_cwd,handle_osc_7}, handler_osc::reported_cwd_is_storable, parse_file_uri, OSC 633 P Cwd	store_reported_cwd(None) clears the cwd; store_reported_cwd(Some(p)) sets it iff |p| ≤ MAX_CWD_PATH_BYTES ∧ '\0' ∉ p, else cwd, event queue and title_epoch are unchanged. OSC 7 stores percent-decode(path) through it and queues (7, p) iff it stored; OSC 633 P;Cwd=v goes through the same gate.	1,2,3,4,7	4/4	Option<&str>, percent-decoding loop, VecDeque
+osc633-commandline-cap	contract	OSC 633 E	OSC 633;E;t sets current_block.commandline = unescape(t) iff |t| ≤ MAX_COMMANDLINE_BYTES; otherwise the previous commandline is kept.	1,2,3,7	1/1	String unescape loop
+osc52-clipboard-gate	contract	TerminalHandler::{handle_osc_52,handle_osc_52_set,handle_osc_52_query}, clipboard_auth, policy bridge	OSC 52;sel;? answers OSC 52;sel;base64(C) iff Query is authorized (a wildcard Execute never grants it) ∧ the callback returns C with |C| ≤ MAX_OSC52_QUERY_RESPONSE_BYTES; else no response. Otherwise the callback is called (and the event queued) with decode(d) iff Write is authorized ∧ |d| ≤ MAX/3·4+4 (checked before decoding) ∧ decode succeeds ∧ |decode(d)| ≤ MAX; else nothing.	1,2,4,12,13	6/6	boxed callbacks, base64, aterm_policy lookup, response budget
+palette-query-cap	contract	TerminalHandler::{handle_osc_4,handle_osc_21}, palette_per_sequence_cap, palette_rate_limit_consume_one	For one OSC 4 with q query pairs, the reply frames number min(q, cap) when the rate limit permits, with cap = the policy's palette per_sequence_max if > 0, else LEGACY_PALETTE_PER_SEQUENCE_MAX; every permitted set pair applies regardless of its position. One OSC 21 reply carries min(#index queries, cap) pairs.	1,2,5,7,12	5/5	loop over pairs with a counter, policy lookup
+osc21-key-echoable	contract	handler_osc_color::osc_21_key_is_echoable	osc_21_key_is_echoable(k) ⇔ |k| ≤ MAX_OSC21_ECHO_KEY_BYTES ∧ every byte ∈ [A-Za-z0-9_-].	1,3,5,7	1/1	bytes().all
+taskbar-progress	contract	handler_osc_notify::parse_conemu_taskbar_progress, TerminalHandler::handle_osc_9	For '4;s[;v]': Some(Hidden | Normal(v') | Error(v') | Indeterminate | Paused(v')) for s = 0 or absent | 1 | 2 | 3 | 4 with v' = min(parse_u32(v), 100) (0 when absent or unparsable); None for other s. OSC 9;4;… sets taskbar_progress when Some and leaves it otherwise, needs no notification authorization, and never fires a notification.	1,3,5	4/4	split iterator, parse::<u32>, match on &str
+notification-gate	contract	handle_osc_9, handle_osc_99, handle_osc_777, Terminal::authorize_notifications	A notification callback fires iff notifications are authorized, and then only for OSC 9;msg with msg not starting '4;' (callback(sanitize_notification(msg))), a final OSC 99 chunk, or OSC 777;notify;title;body (advanced callback, sanitized). Urgency u=0|1|2 maps to Low|Normal|Critical. Other OSC 777 subcommands are ignored.	1,2,4,13	6/6	boxed callbacks, join_params, bool gate
+osc99-accumulation	contract	handle_osc_99, append_notification_field, notifications.pending	OSC 99 chunks are keyed by id, with one shared default id for id-less chunks. A chunk appends to its field (p=title default, or body): field' = field ++ text[..floor_char_boundary(MAX_NOTIFICATION_FIELD_BYTES − |field|)]. d=0 keeps it pending; any other d dispatches and removes it. |pending| ≤ MAX_PENDING_NOTIFICATIONS, a final chunk is never refused for capacity, and id-less chunks occupy at most one entry.	1,2,3,5	4/4	HashMap<String, Notification>, push_str with floor_char_boundary
+can-sub-cancels-every-string-consumer	contract	Terminal::process, OSC 52/2/8, DECRQSS/XTGETTCAP DCS, kitty APC (chunked load), Terminal::{take_osc_event,take_response,images_row}	For every introducer in {OSC 52, OSC 2, OSC 8, DCS $q, DCS +q, APC G (single or a chunk with m=0/1)}, body and chunking: a string ended by CAN or SUB queues no clipboard event, leaves the title, opens no link, queues no reply and draws no image, and a chunked kitty transfer it belonged to ends with no buffer left, so the next complete command draws. The same string ended by ST or BEL delivers its effect.	1,2,3,4,5,7,12	6/6	cites the parser can-sub-cancel spec, handler reset on cancel, base64, kitty load machine
+empty-trailing-param-is-default	contract	CSI handlers: handle_sgr, xtmodkeys, xtfmtkeys, decstbm, cup, decslrm, kitty CSI = u, decscusr, deccara, xtpushsgr; aterm_parser::close_params	For every CSI handler, prefix P and I F: CSI P ; I F (a trailing empty parameter) has the effect of CSI P ; 0 I F in every chunking, and each handler reads 0 as that position's default, as when omitted. SGR: empty is 0 (reset) after plain codes, a truecolour run or a colon group; XTMODKEYS/XTFMTKEYS reset to 0; DECSTBM bottom 0 is the last line; CUP column 0 is column 1; DECSLRM right 0 is the last column; kitty CSI = f ; u uses mode 1; DECSCUSR closes params before SP; DECCARA with no attribute is SGR 0; XTPUSHSGR 0/empty is no group.	1,2,3,4,5,12	2/2	&[u16] params with subparam mask, cited parser lemma
+sgr-extended-color-parse	contract	SgrStyleHandler::{parse_extended_color,parse_underline_color,extended_color_skip}, parse_extended_color_colon	extended_color_skip(p) = 4 if p[1]=2, 2 if p[1]=5, else 0. parse_extended_color(p) = rgb(min(p2,255), min(p3,255), min(p4,255)) if p[1]=2 ∧ |p| ≥ 5; indexed(min(p2,255)) if p[1]=5 ∧ |p| ≥ 3; else None. parse_underline_color packs the same cases as 0x01_RRGGBB and 0x02_0000NN. Corollary: whenever a parse is Some, |p| ≥ 1 + skip(p), and a truncated triple is None.	1,3	1/1	slice get, u16 min, u32 shifts
+sgr-denotation	equivalence	SgrStyleHandler::handle_sgr, csi_dispatch_sgr_fast, set_cursor_template, CurrentStyle, Terminal::{render_row,implicit_blank_render_cell}	Let den map an SGR list (with colon groups) to its abstract update sequence. handle_sgr folds left to right; at p[i] ∈ {38,48,58} with a Some parse it sets fg/bg/underline colour and resumes at i+1+skip, colon forms giving the same result; every other param applies its own attribute (0/empty resets style and underline colour, 59 only the underline colour, 39 only fg, 4/1/3/9 underline/bold/italic/strike). For every pen p and lists a, b with den(a) = den(b) (fast paths, 3/4/5/10-param shapes, colon forms, 90/100 vs 38;5;8+n, SGR 0 vs individual resets): apply(p,a) = apply(p,b) as seen by the next printed cell, an erase's BCE fill and a scrolled-in blank. apply depends only on (p, den), so indexed after truecolour renders as indexed, and 38;2;r;g;b renders exactly after any number of other colours.	1,2,3,5,7,12	11/11	while loop with variable stride, subparam mask, PackedColor + RGB overflow ring, writer caches
+erase-resets-pending-wrap	contract	ED, EL, DECSED/DECSEL, VT52 ESC J / ESC K, Grid::pending_wrap	For every erase ε ∈ {ED0, ED1, ED2, EL0, EL1, EL2, DECSED*, DECSEL*, VT52 J (= ED0), VT52 K (= EL0)}: the cursor is unchanged, pending_wrap' = false, and exactly the cells in ε's range are blanked, except DECSCA-protected cells under the selective forms; the same with DECAWM off. So a print right after ε at a parked last column overwrites it and does not wrap.	1,2,3,4,12	11/11	grid row/cell ranges, protected flag
+alt-screen-switch-wrap-and-save	contract	DECSET/DECRST 47, 1047, 1049; cursor save/restore slots	?1049h = save into the current screen's slot, switch to alt (no-op if there), clear (resetting the wrap). ?1049l = switch to main, restore the main slot including its saved pending_wrap. ?1047l = clear (resetting the wrap) then leave. ?47h switches carrying the cursor and pending_wrap. So a second ?1049h on alt clears the alt screen and saves into the alt slot, and ?1049l restores the cursor of the first entry.	1,2,4	4/4	two grids, saved-cursor structs per screen
+alt-1049-roundtrip	refinement	Terminal::process, enter_alternate_screen, leave_alternate_screen, Terminal::{grid,cursor}	For T on the main screen with cursor (r0,c0) and every x without a 1049/1047/47 switch, RIS or resize: process(T, ESC[?1049h ++ x ++ ESC[?1049l) leaves the visible main grid equal cell for cell (every channel) and the cursor at (r0,c0), and the alt grid is blank right after 1049h. The projection ⟨active, mainCell, altCell, cursor, savedCursor, entered, mainSaved⟩ refines the AltScreen model (MainRestoredAfterRoundTrip).	1,2,3,5,7,10,12	2/2	frame lemma: no handler on alt writes the parked main grid; Option<Grid> swap
+motion-counts-columns	contract	CUF, CUB, HPR, BS, print over a wide cell	In every grapheme_cluster_mode: CUF n and HPR n give col' = min(col+n, right edge); CUB n and n BS give col' = max(col−n, left edge), counting cells, never clusters, over wide cells too. A narrow glyph printed on a wide cell's first half is written and the second half blanked.	1,2,3,12	1/1	u16 saturating arithmetic, wide-cell fixup
+xtwinops-gate	contract	TerminalHandler::handle_xtwinops, policy bridge, window callback	For a CSI Ps t report r: a response iff gate(r) ∧ (the callback answers ∨ an in-core truth exists), gate(r) = allow_window_ops ∨ a policy rule granting exactly r (a wildcard Execute grants none). In-core truths: 14t = CSI 4;rows·ch;cols·cw t and 16t = CSI 6;ch;cw t, only while the host has measured a cell with both axes > 0, using the current grid. A callback answer is used verbatim. 14;2, 15, 19, 11, 13 and 13;2 have no in-core truth. 20t/21t report icon label and title. Manipulation ops reach the callback only when gated. 22t/23t never respond.	1,2,4,12,13	15/15	enum WindowOperation, closures, aterm_policy, Option cell size
+xtsmgraphics-geometry	contract	handle_xtsmgraphics (Pi=2 read)	CSI ?2;1S always answers CSI ?2;0;W;H S with (W,H) = the callback's text area if allow_window_ops ∧ it answers; else (cols·cw, rows·ch) if allow_window_ops ∧ a cell box was measured; else (4096, 4096). The callback is never consulted without allow_window_ops.	1,2,4,13	3/3	closure callback, u32 multiply
+char-width-fast-path	equivalence	handler_write::char_width, aterm_grapheme::{char_width,char_width_cjk}	For every char c: char_width(c, false) = aterm_grapheme::char_width(c) and char_width(c, true) = char_width_cjk(c). Decidable by evaluation over 0..=0x10FFFF.	1,3,12	3/3	u32 range matches, bitmap table, cross-crate callee
+width-table-ucd	table-property	aterm_grapheme::{char_width,char_width_cjk}	char_width(c) = W(c, ambiguous=1) and char_width_cjk(c) = W(c, ambiguous=2), W the wcwidth rule over UCD East_Asian_Width, General_Category and Default_Ignorable (W/F → 2, A → ambiguous, Mn/Me/Cf and Hangul medial/final jamo → 0, unassigned → 1). Pinned: U+4DC0..4DFF, U+302E/F, U+AC00..D7A3, ✨ = 2; U+303F = 1; U+3248..324F and ★ by mode; U+302A..302D, U+3099/309A = 0. (aterm-grapheme code: its SPECS.md is the home.)	1,3,12	1/1	generated table in another crate vs a UCD reference
+print-cell-placement	contract	print path (write_char, combining attach, VS16, emoji modifier fold), write_unicode_bulk	Printing c of width w at the cursor: w = 0 (combining marks, tags U+E0000..E007F, VS supplement U+E0100..E01EF, Hangul V/T incl. Extended-B) attaches c to the cell left of the cursor, or under it when there is none, never moving the cursor. VS16 widens a base to 2 iff it has an emoji presentation sequence (Emoji=Yes ∧ Emoji_Presentation=No). A skin-tone modifier folds into the previous cell iff that base is wide by emoji presentation (default or VS16), never when only ambiguous_width widened it. L V T jamo form one wide cluster. ambiguous_width_double makes EAW=A 2 cells. The layout is the same whole or one scalar per call, and survives checkpoint_carry/restore and scrollback rewrap.	1,2,4,5,7,12	10/10	char tables (cross-crate), CellExtra combining Vec, checkpoint serialization
+wide-wrap-bce	contract	Grid::blank_wide_wrap_tail, wide glyph at the last column	A width-2 glyph printed at the last column with autowrap blanks the tail cell, and any wide head it bisects, with the current BCE template (same PackedColors, the current SGR background), then lands at column 0 of the next row.	1,2,3,12	1/1	grid writes, BCE colour ring
+grid-columns-model-agreement	equivalence	print writers, aterm_grapheme::{str_grid_columns,str_grid_columns_with}	For every string s of printable scalars fitting one row and W ∈ {Single, Double} (via ambiguous_width_double): on a fresh, wide-enough terminal, writing s then a marker paints the marker at column str_grid_columns_with(s, W). This covers VS15/VS16, keycaps, ZWJ folds onto any base width, skin tones only on a wide Emoji_Modifier_Base, flags (also around a mark), Indic conjuncts and half forms, Sinhala ZWJ-ended clusters, and ASCII after a ZWJ.	1,3,5,7,12	2/2	cross-crate refinement between two width machines over chars
+history-fence-export	contract	Terminal::{history_fence,history_lines_since_fence}	Concatenating history_lines_since_fence(fence, cursor, k) from fence.oldest to fence.end (any page size k) yields the main grid's scrollback in order, i.e. the saved primary's while on alt.	1,2,5,7,12	1/1	u64 cursors, Vec<Line>, tiered scrollback
+older-history-claim	contract	Terminal::{reserve_older_history_keys,older_history_claim_holds,attach_older_history}	A claim from reserve_older_history_keys(n) holds until an ED 3 or RIS (ED 2 keeps it). attach_older_history(h, c) with c holding = Ok(|h|) and main history' = h ++ history, also under alt and after leaving it; with c broken = Err(Cleared) and the history unchanged.	1,2,4,12	2/2	Result, scrollback prepend, claim epoch
+terminal-host-adapter	equivalence	impl TerminalHost for Terminal, impl TerminalBlockAccess for Terminal, block_snapshot_from_output	Each TerminalHost method equals the inherent accessor: size = (rows, cols); scrollback_line_count = scrollback_lines(); scrollback_line(i) = history line i trimmed; scrollback_line_from_end(j) = scrollback_line(count−1−j); process and resize delegate. blocks() = map(block_snapshot_from_output, the shell blocks), so |blocks()| = the block count.	1,4,11,12	2/2	trait impls, String trim, Vec map
+mode-mirror-coherence	invariant	ModeMirror publish; Terminal::{new,process,set_kitty_keyboard_enabled,set_host_alternate_scroll,leave_alternate_screen,apply_config,reset,from_checkpoint,restore_checkpoint}	After construction and after every public &mut Terminal method: mode_mirror() = (keyboard_mode(), mouse_mode(), mouse_tracking_enabled(), focus_reporting_enabled(), is_alternate_screen(), modes().alternate_scroll).	1,2,4,13	3/3	lock-free atomic word, postconditions over many methods
+mouse-wheel-encoding	contract	Terminal::encode_mouse_wheel, aterm_types mouse encoder	encode_mouse_wheel(dir, x, y, mods) = None if mouse_mode ∈ {None, X10}; otherwise button (64 + idx(dir)) | mods with Up 0, Down 1, Left 2, Right 3 in the current encoding (SGR: CSI < b ; x+1 ; y+1 M).	1,3,12	4/4	enum match, bit OR, cross-crate formatting
+mouse-report-memo	contract	Terminal::{mouse_motion_repeats_last_report,note_mouse_report}	mouse_motion_repeats_last_report(x,y) ⇔ memo = Some((mouse_mode, mouse_encoding, x, y)) for the current mode and encoding; note_mouse_report(x,y) sets exactly that, so any change of position, mode or encoding (DEC 1016 included) makes the next report fresh.	1,2	1/1	Option<struct> equality
+tab-stops-shared-and-suppression-carried	contract	TBC (CSI 3 g), Grid::tab_stops, GridCursorState::tab_defaults_suppressed, alt enter/leave, Terminal::{resize,checkpoint_carry,from_checkpoint}	Tab stops and tab_defaults_suppressed are one state shared by both screens: an alt switch neither copies stops back nor drops the flag, and the carry carries both. A widen from c0 to c1 seeds every-8 stops in columns c0..c1 iff the flag is clear. With no stops, HT from column 0 lands on the last column.	1,2,3,5,7	3/3	Vec<bool> resized lazily, a bool flag, Option<Grid> swap
+obs-arm-eval-classes	table-property	observe::WatcherSpec::{needs_arm_eval,is_row}	needs_arm_eval(s) ⇔ s ∈ {SeqAdvanced, RowMatches, RowsClear}; is_row(s) ⇔ s ∈ {RowMatches, RowsClear}. IdleFor, BlockComplete and MomentumBelow are never evaluated at arm.	1,3	1/1	matches! over an enum carrying Arc<dyn RowMatch>, f32, Instant
+obs-observe-latch-step	contract	observe::WatcherSet::{observe_screen,is_advance}, observe::{any_row_matches,every_row_clear}, RowRange::{contains,covers_any}, RowMatch::{matches,clears}	adv = (alt ≠ clock.alt ∨ epoch ≠ clock.epoch ∨ seq > clock.last_seq); on adv clock' = (seq, now, alt, epoch). Latches are sticky. An unlatched watcher latches with Satisfaction{seq, at: now} exactly when: SeqAdvanced{after}: alt ≠ armed_alt ∨ epoch ≠ armed_epoch ∨ seq > after; BlockComplete: bc; RowMatches{m,R}: (adv ∨ fresh) ∧ ∃ i ∈ R with rows[i] = Some(t) ∧ verdict(t) = Match; RowsClear{m,R}: (adv ∨ fresh) ∧ R.covers_any(|rows|) ∧ every in-range row is None or NoMatch. Undecided is neither. IdleFor and MomentumBelow never latch here. fresh' = false for every unlatched watcher. covers_any(All,n) ⇔ n > 0; covers_any(Span{s,e},n) ⇔ s ≤ e ∧ s < n. Returns whether any latched.	1,2,3,5,7,11	9/9	Vec<Watcher> loop, dyn RowMatch (uninterpreted), &[Option<String>], any/all closures
+obs-deadline-semantics	contract	observe::WatcherSet::{arm,observe_screen,expire,restart_idle}	arm(IdleFor{d}, now) sets deadline = now+d; arm(MomentumBelow{crossing}) sets deadline = crossing. observe_screen with adv resets an unlatched IdleFor's deadline to now+d and never moves a MomentumBelow deadline. restart_idle(now) resets every unlatched IdleFor. expire(now) latches exactly the unlatched IdleFor/MomentumBelow watchers with deadline ≤ now, with Satisfaction{seq: clock.last_seq, at: deadline}. So the latched Satisfaction does not depend on the expire instant (live and replay agree).	1,2,3,5,7	6/6	Instant + Duration as an ordered additive type, Vec loop
+obs-next-deadline-min	contract	observe::WatcherSet::next_deadline	next_deadline() = min of the deadlines of unlatched watchers that have one, or None.	1,3,7	1/1	filter_map/min
+obs-capacity	contract	observe::WatcherSet::{with_capacity,arm,disarm,poll}	With cap' = max(cap,1): arm returns None and changes nothing iff |watchers| ≥ cap'; otherwise Some(WatchId(next_id)) with next_id + 1, so ids are never reused. disarm(id) removes exactly that id and is idempotent. poll(id) = its latch, or None if unknown. Invariant |watchers| ≤ cap'.	1,2,3	2/2	Vec push/retain/find, u64 counter
+obs-first-matching-row	contract	observe::first_matching_row	first_matching_row(src, m, R) = the least i < src.rows() with R.contains(i) ∧ src.row_text(i) = Some(t) ∧ m.verdict(t) = Match, or None.	1,3,7,11	1/1	&dyn SurfaceSource and &dyn RowMatch, Range find
+obs-terminal-watch-arm-eval	refinement	observe::Terminal::{watch,observe_at,watch_rows}, WatcherSet::{seed_screen,wants_row_scan}	watch(spec, now) seeds the clock to (content_seq, alt, invalidation_epoch); if needs_arm_eval(spec) it then latches as observe_screen on the current surface with fresh = true and rows = the fresh row texts (the scratch buffer is never observable). So SeqAdvanced{after} latches at arm iff content_seq > after. Each batch's observe_at equals observe_screen with fresh row text when wants_row_scan(adv), else rows = [].	1,2,3,4,7	2/2	mem::take of a scratch Vec<Option<String>>, the process pipeline
+watcher-seq-latch	refinement	Terminal::{watch,watch_poll,process_at,observe_at}, ContentScrollState::invalidation_epoch	With key = (content_seq, invalidation_epoch), where every screen switch advances the epoch: a SeqAdvanced{after} watcher latches at arm iff content_seq > after, otherwise at the first later batch that changes key, with seq = the live content_seq. It never latches on a batch that leaves key unchanged (a DSR, a cursor move, an equal-seq repaint with no switch). An alt switch latches it even when content_seq goes down or repeats. Projected to (seq, epoch, seen_seq, seen_epoch) the decision equals observation_screen_generation_model's Observe (EveryChangeIsSeen); the (seq, alt) key of Buggy = 1 disagrees on an equal-seq re-entry.	1,2,3,7,10,12	6/6	watcher table, u64 compares
+watcher-idle-deadline	contract	Terminal::{watch,watch_expire,watch_next_deadline,process_at}	An IdleFor{dur} watcher armed at a has deadline D = max(a, the monotonic instant of the last later batch that changed key) + dur. Alt-screen output counts; content-less batches and arming other watchers do not (watch_next_deadline is unchanged by them). watch_expire(now) latches it iff now ≥ D, with Satisfaction.at = D, so a live wake and a lazy replay are byte-identical; never before D.	1,2,3,7,12	5/5	Instant/Duration values, max
+watcher-row-match	contract	Terminal::{watch_rows,watch_poll}, RowMatch::verdict	A row watcher latches at the first batch after arming that changes key and leaves some visible in-range row whose text p.verdict holds, on either grid, including after an alt switch that restarts content_seq below the main watermark and an equal-seq re-entry in one batch or two.	1,2,3,5,7,12,13	2/2	Arc<dyn RowMatch>, row text extraction
+pb-bridge-decision-tree	contract	policy_bridge::{engine_decision,engine_decision_deny_by_default_capability,engine_decision_with_wildcard_execute_fallback,is_universal_wildcard_rule}	decision(None, s, o, w) = Fallback. Otherwise d = e.evaluate(s, o): no matched rule ⇒ Fallback; Execute ⇒ Fallback when w ∧ is_universal_wildcard_rule(the rule's sequence), else Allow; any other response ⇒ Deny. engine_decision uses w = false, the deny-by-default variant w = true. is_universal_wildcard_rule(x) ⇔ trim(x) = "*" ∨ its ASCII-whitespace tokens are [response, any] case-insensitively. Profile samples also need aterm_policy's evaluate spec and profile data.	1,3,4,12	9/9	Option<&PolicyEngine>, cross-crate evaluate, trim/split_ascii_whitespace
+pb-resolve-table	table-property	policy_bridge::BridgeDecision::resolve	resolve(Allow, b) = true, resolve(Deny, b) = false, resolve(Fallback, b) = b.	1,3	3/3	match on a fieldless Copy enum
+pb-response-sink-gate	contract	TerminalHandler::send_response, PolicyState::gates, PolicyGates::response_sink, Terminal::take_response	The response bytes a batch appends are exactly the replies the handlers produced, each through send_response, which appends only if gates().response_sink().resolve(true) and the rate limit and MAX_RESPONSE_BUFFER_SIZE admit it. So with an engine whose rule matches the response-sink probe from Pty with a non-Execute response, take_response() = None after any batch (DA1, the Kitty a=q probe, CPR …); with no engine, DA1 or a Kitty a=q,i=1 query get a non-empty reply.	1,2,3,4,5,7	4/4	full pipeline, frame invariant (every reply through send_response, enforced by ResponseCapability)
+pg-compiled-equals-live	equivalence	policy_gates::{PolicyGates::compile,PolicyState::xtwinops_gate,PolicyState::shell_integration_gate,compile_xtwinops,compile_shell,shell_slot,xtwinops_verdict,shell_verdict}, shell_integration_auth::probe_subcommand, response_capability::probe_for	compile(e).response_sink = engine_decision(e, probe_for(response_sink()), Pty); osc52_set and osc52_query = the deny-by-default decision on their probes. xtwinops_gate(ps) = xtwinops_verdict(engine, ps) for every ps: u16. shell_integration_gate(c, p) = shell_verdict(engine, c, probe_subcommand(p)), probe_subcommand(p) = utf8(p[1]) if present and valid, else "A". shell_slot(c, sub) = Some((i, sub[0]−'A')) iff c = SHELL_MAJORS[i] ∧ sub is one ASCII uppercase byte. compile(None) = all Fallback, and the compiled sink's resolve(true) equals mint_for_dispatch_with_engine(e, Pty, response_sink()).is_some().	1,3,4,5,7,12,13	10/10	array::from_fn with closures, try_from, encode_utf8; core lemma: purity of PolicyEngine::evaluate
+pg-state-sync-invariant	invariant	policy_gates::PolicyState::{new,install,clear}, Terminal::{apply_policy_engine,clear_policy_engine}	For every PolicyState reachable by install/clear: gates = compile(engine), xtwinops = compile_xtwinops(engine), shell = compile_shell(engine), response_limit = engine.map_or(UNDECLARED, |e| e.rate_limit_slot("response")). So every gate outcome of a dispatch is a function of the currently installed engine and the legacy bits only, never of the install/replace/clear history.	1,2,4,5,12,13	8/8	struct type invariant, Option<PolicyEngine> move
+pg-covered-gates-are-table-reads	other (call-graph)	policy_gates::PolicyState::{xtwinops_gate,shell_integration_gate,gates}	gates(), xtwinops_gate(ps) for ps ≤ 24, and shell_integration_gate(c,p) whenever shell_slot(c, probe_subcommand(p)) = Some make no call to engine_decision*; ps > 24 and an uncovered pair make exactly one live call. A no-call obligation over the compiled bodies, not the test-only thread_local counter.	3,4,13	1/1	call-absence over a path
+pg-response-slot-equals-id	equivalence	PolicyState::{response_rate_limit_try_consume,rate_limit_try_consume}, PolicyEngine::rate_limit_slot	response_rate_limit_try_consume(a, c) = rate_limit_try_consume("response", a, c) with identical bucket state afterwards. Both are None iff no engine is installed; with an engine but no declared response bucket the answer is Some(true); the slot names the "response" bucket wherever it sits.	1,2,4,11,12	5/5	generic T: TimeSource, cross-crate limiter
+wa-mint-iff-resolve	contract	window_auth::{WindowMintAuthority::try_mint_with_engine,probe_xtwinops}	try_mint_with_engine(g, b).is_some() ⇔ g.resolve(b). With pg-compiled-equals-live and pb-bridge-decision-tree: a wildcard Execute rule gives b, an explicit CSI <ps> t Execute rule mints even with b = false. probe_xtwinops(ps) = DispatchedSequence::csi(Some(ps), 't', []).	1,3,12	4/4	ZST, enum resolve, profile data cross-crate
+rl-token-bucket	contract	ResponseRateLimiter::{with_limits,new,try_consume,refill}	with_limits(rate, cap): tokens = cap, last_refill = None. try_consume(n): cap = 0 or n > cap ⇒ false, unchanged. Otherwise refill (the first call seeds last_refill and grants nothing; later tokens = min(tokens + rate·Δt, cap) with saturating Δt), then true with tokens −= n iff tokens ≥ n. Invariant 0 ≤ tokens ≤ cap, so accepted bytes over [t0,t1] ≤ cap + rate·(t1−t0). Defaults 100 KiB/s and 96 KiB accept any burst ≤ 96 KiB at one instant.	1,2,3,11	7/7	f64 arithmetic (needs a rational model or a precision bound), generic TimeSource
+pr-splice-accounts	contract	processing::splice_accounts_for_batch_row_advance	splice_accounts_for_batch_row_advance(before, after, inserted) ⇔ after ≥ before ∧ after − before = inserted.	3	1/1	u64 checked_sub, is_some_and closure
+pr-ris-retires-selections	contract	Terminal::{process_at,finish_ris_batch,post_process}	After a batch containing an effective RIS, neither the parked nor the live text selection has a selection, whichever screen the batch starts and ends on, including RIS followed by an alt entry in the same batch.	1,2,3,4,7	2/2	mem::take of selection structs, full pipeline
+pr-ris-keeps-parser-carry	equivalence	Terminal::{process_at,advance_parser_archiving,finish_ris_batch}	If x's last RIS is followed by a partial sequence p (CSI, UTF-8 or DCS prefix), the grid after process(x); process(y) equals that after process(x++y): finish_ris_batch never resets the parser, so p completes in y and its payload is never printed. This holds with profiling on or off, and profiling affects only pipeline_timestamps.	1,2,3,4,7,12	3/3	full pipeline incl. parser (cross-crate chunk invariance)
+pr-post-process-scroll-verdict	contract	processing::Terminal::post_process, ContentScrollState::{invalidate,record_uniform_up,record_band_batch}	With U, δ, F, B the drained grid signals, inv = U.is_some() ∨ F ∨ δ = i32::MAX ∨ δ < 0. If inv: Δepoch = 1, and bands are recorded (Δband_batches = 1, Δband_seq = |B|) iff |B| > 0 ∧ ¬B.inexact ∧ δ = 0 ∧ the screen did not switch ∧ U ≠ Some(Invalidate). If ¬inv: Δepoch = Δband = 0 and Δuniform_up_rows = max(δ, 0). Every signal is drained, so an empty batch afterwards changes nothing.	1,2,3,4	3/3	many fields, i32/u64 conversions, enum match
+pr-content-scroll-state-soundness	contract	Terminal::process_at, aterm_grid::Grid scroll/erase/IL/DL/swap ops, ContentScrollState	(a) Δuniform_up_rows = k > 0 with Δepoch = 0 only for an exact full-grid upward translation by k, on either screen, whatever the history capacity. (b) Δepoch = 0 when no visible row moved: ED 0/1/2, DECSED, DECALN, EL, DECERA and ED 3 (which also keeps visible_to_absolute and row text and only raises oldest_absolute_row). (c) Δepoch = 1 for every alt switch, RIS, reset(), IL/DL, partial DECSTBM scrolls and margined scrolls. (d) Δband_batches = 1 iff the row motion is exactly the recorded RowBandMoves: composed RIs merge into one move, and a top-anchored archival scroll is the band [0..=bottom] with delta −1.	1,2,3,4,5,7,12	9/9	a row-motion denotation of the grid ops (needs a grid content model)
+st-delta-since	contract	state::ContentScrollState::delta_since	delta_since(None, c) = Baseline. If any of uniform_up_rows, invalidation_epoch, band_batches, band_seq regressed: Invalidate. Else with differences d_u, d_e, d_bb, d_bs: d_e = 0 ⇒ (d_bs ≠ 0 ∨ d_bb ≠ 0 ? Invalidate : d_u = 0 ? Unchanged : d_u ≤ u16::MAX ? Translate(d_u) : Invalidate); d_e > 0 ⇒ Bands{first_seq: p.band_seq, count: d_bs} iff d_u = 0 ∧ d_e = d_bb ∧ 1 ≤ d_bs ≤ 16, else Invalidate.	1,3	1/1	u64 compare/subtract, try_from, enum results (straight-line; a good E6 target)
+st-band-ring	contract	state::ContentScrollState::{record_band_batch,band,invalidate}	record_band_batch(ms) writes ms[i] to bands[(band_seq + i) mod 16] in order, then band_seq += |ms| and band_batches += 1. band(seq) = bands[seq mod 16], so for seq ∈ [band_seq − 16, band_seq) band(seq) is the move recorded with that number. invalidate() increments the epoch.	1,2,3,7	1/1	slice loop, mod-16 indexing
+st-band-history-refines-model	refinement	Terminal::post_process, ContentScrollState::delta_since	The band history read through delta_since against a baseline refines the ContentScrollBandHistory ty_model (Cap = 16): exact band batches are Step, RIS is Poison, a re-baseline is Baseline, verdicts 0/1/2 = Unchanged/Bands/Invalidate; ReplayComplete and RetireIncomplete hold and catch the Buggy = 1 overwritten replay.	1,2,4,10	2/2	ty_model binding, full pipeline
+pr-sync-timeout	contract	processing::Terminal::post_process	At a batch end with synchronized_output ∧ sync_start = Some(s): expired = s.checked_add(sync_timeout) is None ∨ process_now ≥ s + sync_timeout. If expired: synchronized_output, sync_start, sync_open_dirty cleared and sync_end_seq + 1; else unchanged. Never panics (overflow counts as expired).	1,2,3	2/2	Instant checked_add, is_none_or
+pr-sync-open-dirty	invariant	TerminalHandler::note_sync_open_action, handler_dec_refinement::{enable,disable}_synchronized_output, DECSTR, Terminal::sync_open_dirty	sync_open_dirty() ⇔ synchronized_output ∧ some completed parser action (print run, execute, CSI, ESC, OSC, DCS commit, APC commit) was dispatched since the last off→on transition. A redundant DECSET 2026 does not clear it; DECRST 2026, DECSTR, RIS and the timeout do.	1,2,4,5,10	3/3	trace invariant over handler entry points
+pr-sync-frame-unfinished	invariant	Terminal::sync_frame_unfinished and the 2026 handlers	sync_frame_unfinished() ⇔ app_sync_open ∧ app_sync_dirty. A ?2026h sets app_sync_open only when it was false, clearing app_sync_dirty; it is cleared only by the program's ?2026l, DECSTR or RIS, never by the timeout. app_sync_dirty is set by any completed action while open.	1,2,4,5,10	1/1	as pr-sync-open-dirty
+pr-repaint-blink-epoch	contract	DECRST 25 handler, Terminal::repaint_blink_epoch	repaint_blink_epoch starts at 0 and changes only in the DECTCEM-hide handler: each CSI ?25l increments it iff synchronized_output holds at that moment. Nothing else changes it.	1,2,3,4	2/2	frame condition over every handler
+pr-process-at-determinism	other (purity)	Terminal::process_at, ClockReading	process_at is a function of (state, bytes, ClockReading): two equal terminals fed the same schedule end with equal visible content, modes, bell-callback count and mark timestamps. The bell throttle, the 2026 timeout and OSC 133 mark times read only the injected clock; only profiling timestamps and the response token bucket read real time, and neither feeds this projection.	1,2,4,8,13	1/1	absence of wall-clock reads on the state path
+viewport-pin	contract	Terminal::{process,resize}, Grid::{display_offset,top_visible_absolute_row,pin_viewport_to_live_for_output_batch,repin_display_offset}, Terminal::scroll_display	Live output: for a batch that switches no screen, with L = the rows the batch added: d = 0 stays 0; d > 0 (no eviction past the pinned row) gives d' = min(d + L, scrollback_lines'), the same absolute row and text at viewport row 0, and no new row visible while d + L ≤ scrollback_lines'. Alt sessions (47, 1047, 1049; one batch or many; output before the smcup in the same batch): after the exit top_visible_absolute_row is unchanged (d' = d plus the lines the pre-smcup output pushed); d = 0 stays 0; bytes after an rmcup land on the live screen. A rows-only resize (sync or offloaded, ring or tiered, primary or parked primary) with d > 0 keeps the top absolute row (clamped only at the retention cap); d = 0 stays 0. A width resize with d > 0 gives d' > 0.	1,2,3,4,5,7,12	16/16	batch prologue/epilogue pin, u64 absolute rows, Option<Grid> swap, tiered reads
+sync-update-is-render-only	equivalence	Terminal::process, modes.synchronized_output	For x without 2026 toggles, the grid and history after ESC[?2026h ++ x ++ ESC[?2026l equal those after x; only the render deferral and the mode bit differ, so 2026 never gates scroll_up.	1,2,3,5,7,12	1/1	frame lemma: the bit is read only by the present path
+st-damage-epoch	contract	Terminal::{damage_epoch,take_damage,has_damage,cell_frame}, Grid::scroll_display, RenderInput::{snapshot_seq,engine_fill_seq}	damage_epoch() increments by 1 and sets counted := true iff ¬counted ∧ grid has damage; otherwise it returns the stored epoch. take_damage() clears damage, sets counted := false and bumps extract_gen. A fresh terminal has damage; a processed write damages; process(b""), a bare ESC and a scroll that does not move the viewport do not; a scroll that moves it does. cell_frame stamps snapshot_seq = engine_fill_seq = damage_epoch at fill, so after take_damage and a damaging process the live epoch exceeds a held frame's engine_fill_seq (stale frames are detectable). Projected onto read_image_seq_model, NoTornRead and SeqIsStaleOrCurrent hold.	1,2,3,4,6,10,12	5/5	bool latch + wrapping u64, cross-crate damage tracker
+st-content-seq	invariant	Terminal::content_seq, Grid::content_gen, every print writer, Terminal::{cell_frame,cell_grapheme}	content_seq > 0 from construction and non-decreasing per grid. It strictly increases whenever a cell's rendered grapheme changes: bulk and fragmented writes on every writer (styled, DECAWM off), a combining or presentation suffix (VS15/VS16, skin tone, second RI, ZWJ tail), a defective combining mark (kept on the cursor cell, cursor not advanced), a mark after CR (it accents column 0), erases and content scrolls. It is unchanged when nothing rendered changed: cursor motion, empty input, DSR, scroll_display, or a wide glyph rejected at the last column with DECAWM off. frame.content_seq = content_seq at fill.	1,2,3,4,5,7,12	8/8	u64 generation bumped in many writer paths; the iff needs a cell content model
+tm-refines-model	refinement	handler_dec_refinement (#[refines(machine="terminal_modes")] sites), terminal_modes_conformance::project_modes	For every mode action the real bytes drive (DECSET/DECRST 1, 6, 7, 25, 1004, 2026, 2004, 9/1000/1002/1003, 1005/1006/1015/1016, 47/1047/1049; SM/RM 4 and 20; DECSCUSR, mode 12; DECSTR; RIS): project_modes(T') is a successor of project_modes(T) under that action of terminal_modes_model, ResetRestoresDefaults holds, and a fresh terminal projects to Init. A DECSTR keeping synchronized_output is rejected by the model and admitted by Buggy = 1.	1,2,4,10	2/2	ty_model binding over a BTreeMap projection
+sa-completed-command-seq	contract	Terminal::completed_command_seq, OSC 133;D, Terminal::reset	completed_command_seq starts at 0, increments by exactly 1 per OSC 133;D (or 633;D) completing a command regardless of timestamps, and survives reset().	1,2,4	1/1	frame condition, u64 counter
+sia-verify-nonce	contract	ShellIntegrationAuth::verify_nonce, shell_integration_auth::find_nonce_hex	verify_nonce(p) ⇔ nonce = Some(e) ∧ find_nonce_hex(p) = Some(h) ∧ decode_hex_32(h) = Some(c) ∧ c = e, where find_nonce_hex scans p[2..] for the first id= (an id= at index 0 or 1 never counts). On true: awaiting_first_mark' = false, typed_prior' = None, dropped_count unchanged. On false: dropped_count saturating + 1, nothing else.	1,2,3,7	8/8	&[&[u8]], strip_prefix, find_map, [u8;32]
+sia-decode-hex	contract	shell_integration_auth::{decode_hex_32,hex_digit}	decode_hex_32(h) = Some(o) ⇔ |h| = 64 ∧ all bytes in [0-9a-fA-F], with o[i] = 16·val(h[2i]) + val(h[2i+1]); hex_digit(b) = (val(b), 0) for a hex digit, else (0, 1). So decode_hex_32(lowerhex(n)) = decode_hex_32(upperhex(n)) = Some(n).	1,3,7	1/1	fixed 32-iteration loop, u8 shifts/ors, byte-range match
+sia-ct-eq	contract	shell_integration_auth::constant_time_eq_32	constant_time_eq_32(a, b) ⇔ a = b. (The constant-time shape is not a functional property.)	1,3,7	1/1	fixed XOR/OR loop over arrays, black_box as identity
+cfg-defaults	contract	config::{TerminalConfig::default,BiDiConfig::default,BiDiConfig::disabled,BiDiConfig::is_enabled}	TerminalConfig::default() has cursor_style = BlinkingBlock, cursor_blink = cursor_visible = auto_wrap = true and scrollback_limit = Some(aterm_scrollback::DEFAULT_LINE_LIMIT). BiDiConfig::default() = {Implicit, reorder_nsm: true}; disabled().mode = Disabled; is_enabled ⇔ mode ≠ Disabled.	1,3,12	3/3	struct literals, cross-crate constant
+gr-width-bounds	contract	aterm_grapheme::grapheme_display_width	For every scalar c, grapheme_display_width(c.to_string()) ≤ 2, and = 1 for c ∈ 0x20..=0x7E. (aterm-grapheme's spec; belongs in its SPECS.md.)	1,3,5,7,12	2/2	Unicode width tables
+gr-aggregate-consistency	equivalence	aterm_grapheme::{grapheme_width,split_graphemes}	grapheme_width(s).display_width = Σ widths over split_graphemes(s), grapheme_count = |split_graphemes(s)|, and byte_count = |s| (check the precondition; see §5). (aterm-grapheme's spec.)	1,3,5,7,11,12	2/2	UAX #29 segmentation iterator
+sx-decoder-bounded	no-panic	aterm_sixel::SixelDecoder::{new,hook,put,unhook}	For every byte stream and any number of hook/put*/unhook cycles, no call panics, and every image unhook returns has width, height ≤ SIXEL_MAX_DIMENSION and |pixels| = width·height; unhook without hook is None. (aterm-sixel's spec.)	1,2,3,5,7,12	2/2	Vec<u32> growth with caps, usize multiply overflow
+sx-span-total	no-panic	aterm_sixel::SixelImage::{rows_spanned,cols_spanned}	For every image and size: u16 (0 and u16::MAX included) both return without panicking.	3,12	1/1	integer division and ceil arithmetic
+rc-render-cell-resolution	contract	render_cells::Terminal::{render_row,render_row_into,render_row_into_impl}, UnderlineStyle::from_flags, handler::is_vs16_emoji_capable	render_row(r) is empty when r ≥ 2^16 or the row view is absent. Otherwise for each present cell c (missing cells are skipped and reset prev_wide) it pushes RenderCell with: wide = cell is a wide continuation ∧ ¬cell.is_wide() ∧ prev cell wide (a DECSCA-protected cell is never wide); ch = ' ' if wide ∨ raw = '\0', else raw (complex base or cell.char()); (fg,bg) = resolve_colors_raw_opts(cell, rgb, live palette, defaults, DECSCNM, style opts); emoji_presentation = ¬wide ∧ cell.is_wide() ∧ is_vs16_emoji_capable(ch); text_presentation = ¬wide ∧ ¬cell.is_wide() ∧ U+FE0E ∈ marks; underline = from_flags(flags) (DOTTED, DASHED, CURLY, DOUBLE, UNDERLINE in that order), Single when that is None and the cell has a hyperlink; strike/overline/bold/italic from their bits; underline_color = None without underline, else the extra's RGB or palette[index] resolved against the live palette. The handler's grapheme fold (RI pairs, VS15/VS16) is sampled through it.	1,2,3,5,7	14/14	per-column loop with carried bool, VisibleRowView enum, bitflags, marks iterator
+rc-wide-spacer-inherits-rendition	invariant	print path (incl. widen_previous_cell_for_vs16), render_row_into_impl	Every wide-continuation cell carries the SGR flags and colours of its lead, whether made by the wide-glyph writer or VS16 widening, so render_row(r)[c+1].{fg,bg,underline,strikethrough,overline} = render_row(r)[c].{…} for a continuation at c+1.	1,2,4,5,7	4/4	grid type invariant preserved by every write path
+rc-extras-classification	contract	render_row_into_impl (extras_out), render_cells::{is_emoji_sequence_marker,draws_no_glyph}, Terminal::cell_frame, cluster_row_into/combining_row_into (cfg(test) oracles)	For a present cell with base raw and marks M (arrival order, ≤ CellExtra::MAX_COMBINING): if some m ∈ M is an emoji-sequence marker (ZWJ, U+20E3, skin tones, RIs, tags E0020-E007F), clusters[r] has (c, raw++M) iff raw ≠ '\0' and combining[r] has no entry; else if M' = [m ∈ M | ¬draws_no_glyph(m)] (FE0E, FE0F, E0000-E0FFF draw nothing) is non-empty, combining[r] has (c, M'); otherwise no entry. Entries are in ascending column order, and the folded extraction in cell_frame equals the cfg(test) row accessors at offset 0.	1,3,5,7	8/8	Box<str>/Box<[char]>, filter/collect, char ranges
+history-render-parity	equivalence	Terminal::{cell_frame,row_text}, render_row_into_impl, Grid::{visible_row_view,materialize_scrollback_row_full}, materialize_from_line, Line::serialize, CellDataView::marks	For every line R written live at offset 0 that has not crossed the image horizon: once R scrolls into history (ring, lazy or tiered) and the viewport shows it, its rendered row equals R's live render in every field (glyph, fg/bg, wide, emoji_presentation, attributes, underline and its colour), plus clusters, combining marks and image tiles, and row_text equals the live row_text. This includes VS15/VS16 width, keycaps, skin-tone folding only onto a wide Emoji_Modifier_Base, flags as one cell, last-column narrow VS16 and coloured trailing blanks. Indexed colours are stored as indices and resolve against the current palette. A wide spacer carries its lead's underline colour and SGR-7-swapped truecolour, live and in history. CellDataView::History(e).marks() = complex tail chars ++ combining, in order.	1,2,3,4,5,7,12	19/19	Line serialize/parse round trip, grapheme segmenter, Arc<str> clusters, materialization loops
+ring-fast-materialize-equals-line-roundtrip	equivalence	Grid::{materialize_scrollback_row_full,history_line_rev}, materialize_from_line	For rev_idx < scrollback_lines: materialize_scrollback_row_full(rev_idx, cols) = materialize_from_line(history_line_rev(rev_idx), cols) on .cells and on get_extra(col) for every col. The fast path is taken iff the row is ring-resident.	1,2,3,5,7,12	2/2	two implementations with normalizations (combining folded into cluster, single-BMP complex demoted, spacer recreated)
+viewport-projection	contract	Terminal::{cell_frame,cell_frame_into,row_text,display_row_text,display_cell_grapheme,display_terminal_row,cell_grapheme,hyperlink_at_visible,scroll_to_top}, Grid::{visible_row_view,row_text_screen,row_ansi_text_screen}	For every display offset d ∈ [0, scrollback_lines] and display row r < rows, every channel (glyph, cluster, combining, fg/bg, underline colour, image tile, link) that cell_frame, display_row_text, display_cell_grapheme and hyperlink_at_visible show at r is the content of terminal-relative row r − d: a history row materialized from its tier for r < d, else the live row r − d with its extras read at r − d (never shifted twice), marks paired to their cells. display_cell_grapheme gives the complex cluster on its lead and "" on a wide continuation; trim_end(concat over c of display_cell_grapheme(r,c)) = trim_end(display_row_text(r)), and row text agrees with the render glyph stream. row_text_screen and row_ansi_text_screen are independent of d. scroll_to_top shows the oldest retained line at row 0. At d = 0 these equal the live reads (row_text, cell_grapheme).	1,2,3,5,7,12	11/11	viewport row view enum (ring/lazy/tiered), materialization loops, &mut memo
+rc-render-row-at-screen	equivalence	render_cells::Terminal::{render_row_at_screen,render_row}	render_row_at_screen(r) does not depend on display_offset (it is render_row(r) at offset 0), and equals render_row(r) when display_offset = 0.	1,3,5	1/1	bool-selected row view
+rc-implicit-blank	contract	render_cells::Terminal::{implicit_blank_render_cell,cell_frame_into}	implicit_blank_render_cell() = RenderCell{fg, bg, ..Default} with (fg,bg) = resolve_colors(Cell::EMPTY, …) = (dfg,dbg), swapped under DECSCNM. Every cell_frame_into sets scratch.implicit_blank to it at that extraction; it is plain owned data that later mutations do not change and clone/clone_from preserve.	1,3,4	2/2	struct update, Copy struct, resolver call
+rc-frame-scalar-stamps	contract	render_cells::Terminal::{cell_frame_into,cell_frame,cell_frame_fill}	After cell_frame_into(s, rows, cols): line_size_spans and default_bg_spans have length rows with every inner Vec empty (capacity kept); selection_clip = None; selections = []; selection_bg/fg = the live selection colours (OSC 17/19, else host defaults); default_bg = COLOR_UNSET for an unconfigured terminal without DECSCNM, else the packed implicit-blank background; cursor_color = COLOR_UNSET when unconfigured, else the OSC 12 or host cursor colour, or the live default fg when dynamic; absolute_row_revision and history_renumber_epoch stamped from the terminal. Stale values in s are overwritten.	1,2,3,7	5/5	nested Vec resize keeping capacity, u32 packing
+rc-images-frame-equals-per-row	equivalence	render_cells::Terminal::{images_frame_into,images_frame,images_row_into}	images_frame_into(out, n) gives |out| = n and out[r] = images_row(r) element-wise (column order, Arc identity, tile coordinates) for every r < n (n > rows included), at any display_offset, with Kitty placeholders and stale scrolled-off extras.	1,3,5,7	2/2	HashMap iteration then stable sort, Arc identity, nested Vec reuse
+rc-images-frame-cost	other (cost)	render_cells::Terminal::{images_frame_into,images_row_into}	With an empty extras map both readers make 0 lookups; otherwise images_row over all rows makes rows×cols lookups and images_frame exactly |extras| (plus history-row work proportional to image spans). A ghost cost model, not the cfg(test) counter.	3,7,13	1/1	ghost counter over loop iterations
+rc-cursor-projection	contract	render_cells::Terminal::cell_frame_fill	frame.cursor_visible ⇔ cursor visible ∧ cursor_row + display_offset < rows, and then frame.cursor_row = cursor_row + display_offset.	1,3	1/1	usize arithmetic
+rc-apron-row	contract	render_cells::Terminal::{apron_row_into,cell_frame_fill}	apron_row.present ⇔ d > 0, with cells = [] at d = 0. For d > 0 its cells, clusters, combining and line_size equal the bottom row of the frame at offset d−1 at every depth (shallow live row, the d = rows seam, deep history), and cursor_col = Some(cc) iff the cursor is visible and cursor_row + d = rows.	1,2,3,5,7	1/1	viewport/history row mapping, memoized row materialization
+rc-damage-scoped-equals-full	refinement	render_cells::Terminal::{cell_frame_damage_scoped_into,damage_scoped_refill_refusal,scrolled_scoped_refill_delta,rotate_scrolled_scratch,apron_row_into}, FrameRefill	For every T ∈ Reach (any interleaving of output, take_damage by other consumers, viewport scrolls, recolours, alt swaps, resizes, BiDi reorders, eviction) and every scratch s (including one last filled by another terminal or host-mutated with a snapshot_seq bump): after cell_frame_damage_scoped_into returns Full or Scoped, s = FullRender(T) under content equality, apron included, and host-owned overlay channels in s are unchanged. For a scratch filled by this terminal at the same size, a batch whose only damage is row r (no scroll, wrap or resize) gives Scoped{rows_refilled ≤ 1}.	1,2,3,4,5,7,13	11/11	simulation between scratch and grid via continuity tokens (terminal_id nonce, extract_gen, snapshot_seq, base_y, revisions, content_gen, epochs, alt bit, dims); damage superset lemma; process-unique AtomicU64
+rc-refill-cause-classification	table-property	render_cells::Terminal::damage_scoped_refill_refusal, render::FullRefillCause::{ALL,as_str,index}	damage_scoped_refill_refusal returns the first failing clause in the order BidiVisual, ScratchUnstamped, TerminalMismatch, DamageTaken, HostMutation, RowShift, AltScreen, ScratchRows, ScratchRowCount, EngineDims, EngineScrolled, ScratchScrolled, BaseY, RowRevision, FullDamage, and None iff all hold. FullRefillCause::ALL lists each variant once with ALL[i].index() = i; as_str labels are distinct, non-empty and in [a-z0-9_].	1,3,5	1/1	if-return chain, const enum array, &'static str
+rc-scrolled-strip-size	contract	render_cells::Terminal::{scrolled_scoped_refill_delta,cell_frame_damage_scoped_into}	If the scratch was filled at d0 > 0, every clause before EngineScrolled holds, content_seq, history_renumber_epoch, base_y and absolute_row_revision match, there is no full damage and |d1 − d0| < rows with d1 > 0: the result is Scoped{rows_refilled = |d1 − d0|}. Every other scrolled case is Full. Every fill at d1 ≠ 0 publishes row_rev_lane = 0.	1,2,3	2/2	signed offset arithmetic
+rc-presentation-fingerprint	other (cache-key soundness)	render_cells::Terminal::{presentation_fingerprint,render_row}	presentation_fingerprint() is FxHash of (palette fingerprint, default fg, default bg, DECSCNM, bold_is_bright, faint_opacity bits, bidi mode/direction/autodetect) and nothing else, so cell writes never change it. Provable converse: for equal grid content and equal fingerprint inputs, render_row(r) is equal for all r. (That every input change moves the hash is a no-collision claim, not provable; see §5.)	1,3,11	1/1	Hasher trait, f32::to_bits
+viewport-memo-coherent	contract	Terminal::cell_frame_into, viewport row memo keyed by HistoryEpoch, Kitty CSI + T unscroll	cell_frame_into fills the scratch with exactly the frame an uncached materialization would give, whatever the memo holds; after output arrives while scrolled back, or after a Kitty CSI n+T unscroll, the next frame shows the new rows. The unscroll moves n history lines into the screen, raises history_renumber_epoch, and leaves content_gen, absolute_row_counter and display_offset unchanged.	1,2,3,5,7,12	2/2	memo slot table inside &mut self, tiered reads
+rn-refines-model	refinement	repaint_nudge::RepaintNudge::{arm,step,let_go}, Facts, Terminal::{render_debt,full_clear_count,screen_replaced_count}	RepaintNudge refines the RepaintNudge ty_model (aterm-spec models_resize_render.rs) under conformance_repaint_nudge::World::project: every refines-anchored act (Arm, Hold, Release, Forget, Finish/Healed, GiveUp, Supersede, ReleaseByDeadline, Dropped from Restoring) is enabled at the projected pre-state and its post-phase equals the model's, for every Facts schedule (answers at once, late, never, diff frames, no ED 2, a busy handler, streams), window resizes, halts and lock-busy intervals; GaveUp is reported iff the model sets gaveup. Safety: the PTY differs from the engine size only in phase Short; the machine never resizes the engine; an attempt with no answer leaves screen text and render_debt unchanged.	1,2,3,6,10	8/8	&mut self state machine, VecDeque<u64>, u64 saturating arithmetic; the step is near E6 once enums are admitted
+rn-armed-gates	contract	RepaintNudge::{step_armed,defer}, repaint_nudge::person_quiet_ms	In phase Armed the first applicable guard wins: mode=Off → Dropped(Off); ¬agent → Dropped(NotAgent); ¬alt_screen → Dropped(LeftAltScreen); reason=Debt ∧ ¬owed → Dropped(NothingOwed); engine.0 < 2 ∨ engine.1 = 0 → Dropped(TooSmall) (all to Rest; only NothingOwed/Repainted mark the epoch tried); halted ∨ frozen ∨ dragging ∨ shared → Nothing; mode=On budget/cooldown (rn-attempt-budget); driver_may_type → defer(Lease, 120 s); person_quiet_ms < 1500 → WaitUntil(now + 1500 − q); selection → defer(Selection, 30 s); other_hold → WaitUntil(now + 250); quiet wait from the first quiet look: frame_open → GaveUp(Deferred(Busy)) after 6000 ms else WaitUntil(now + 50); output_quiet_ms < 150 within 3000 ms → WaitUntil(now + min(150 − q, 50)). Then mode=Log → WouldNudge (Rest, epoch tried) and mode=On → Hold (Short, epoch tried, nudged + 1, baselines recorded). defer(g, cap) gives GaveUp(Deferred(g)) once now − first_deferral(g) ≥ cap, else WaitUntil(min(now + 250, since + cap)). person_quiet_ms(Some(g), a) = g, (None, a) = a.	1,2,3	16/16	Option::get_or_insert, [Option<u64>;3], saturating u64, enum payloads
+rn-attempt-budget	invariant	RepaintNudge::{arm,step_armed,prune}	(a) arm(mode, reason, e) returns false and changes nothing iff mode = Off ∨ phase ∈ {Armed, Short, Restoring} ∨ last_epoch = Some(e), so at most one Hold or WouldNudge per epoch. (b) Mode-On Holds are ≥ COOLDOWN_MS = 60 s apart (a step inside it is WaitUntil(last + 60 s)). (c) At most MAX_PER_HOUR = 3 Holds in any HOUR_MS window; the fourth attempt is GaveUp(Budget), and prune restores the budget once the oldest attempt is ≥ 1 h old.	1,2,3,5,7,10	3/3	VecDeque push/pop loop, quantified trace invariant
+rn-answer-protocol	contract	RepaintNudge::{step_short,step_restoring,release,forget,let_go}	answered ⇔ full_clears > base ∨ screen_replaced > base; settled ⇔ ¬frame_open ∧ output_quiet_ms ≥ 40. Short (w = now − hold_ms): engine ≠ hold_engine or pty ≠ (hold.rows−1, hold.cols) → Forget (Restoring, baselines rebased); ¬alt_screen → Release (Rest); halted ∨ frozen → Release (Restoring); answered ∧ (settled ∨ w ≥ 1500) → Release (first_answer = w); answered → WaitUntil(now + max(40 − q, 10)); w ≥ 1500 → Release; else WaitUntil(hold_ms + 1500). Restoring (w = now − release_ms): frozen → Nothing; answered ∧ (settled ∨ w ≥ 1500) → Healed{first, w} if a first answer was seen, else Dropped(Repainted); answered → WaitUntil; w ≥ 1500 → Dropped(Superseded) if the engine moved, Dropped(NothingOwed) if reason = Debt ∧ ¬owed, else GaveUp(NoAnswer). let_go(now) returns true iff phase = Short, moving to Restoring with release_ms = now.	1,2,3	9/9	mem::take, tuple compare, saturating u64
+rn-hold-always-lifted	invariant	RepaintNudge::{step,let_go}	The only PTY-writing acts are Hold and Release, and no act names the engine. Every Hold is followed, before Rest, by exactly one Release, Forget or successful let_go, and after Release pty = engine. For a program that never answers under eligible facts, the non-Wait acts are exactly [Hold, Release, GaveUp(NoAnswer)]. With mode On and fixed facts, Armed reaches Hold or Rest within max(LEASE_DEFER_CAP, SELECTION_DEFER_CAP, QUIET_MAX + FRAME_WAIT_CAP, COOLDOWN, PERSON_GATE), unless an event-gated wait (halted, frozen, dragging, shared) stands.	1,2,5,10	3/3	trace safety and bounded liveness
+cp-conhost-repaint-lossless	refinement	Terminal::{resize_with_policy,resize_offloading_scrollback_with_policy,process}, Grid resize (ResizePolicy::ConPty)	For T ∈ Reach (ring, deep ring, tiered; either screen; any history) and (r', c'), let (S, D, cur) = Conhost(T, r', c'). A resize under ResizePolicy::ConPty (sync, or offloaded with conhost's repaint arriving before or after re-attach) followed by conhost's repaint of S gives history = old history ++ D (each line once, in order), visible rows = S and cursor = cur, with no stray continuation link. Grow-then-shrink and widen-then-narrow restore the history line count. On alt the saved primary keeps its history and row-0-anchored viewport. A rows-only offloaded resize returns None and equals the synchronous policy. Negative control: ResizePolicy::Native.	1,2,3,4,5,7,8,10,12,13	13/13	rewrap/reflow, tiered store, offload job, a conhost ty_model!
+cp-rows-grow-shape	contract	Terminal::resize_with_policy, Grid::take_last_resize_row_shift	For r' > r at the same width under ConPty: scrollback_lines unchanged, rows 0..r = the old viewport, rows r..r' blank, cursor row unchanged, take_last_resize_row_shift() = 0; a scrolled-back reader keeps the same absolute line at viewport row 0 across the grow and the shrink back.	1,2,3,12	1/1	grid resize arms, display-offset anchoring
+cp-rows-shrink-native	equivalence	Terminal::resize_with_policy	For r' < r at the same width, resize_with_policy(r', c, ConPty) leaves the same retained rows, viewport and cursor as resize_with_policy(r', c, Native).	1,2,3,12	1/1	two-run equivalence
+cp-absolute-keys-stable	invariant	Terminal::resize_with_policy, CommandMark rows	With or without retention eviction, for every completed CommandMark m, after any ConPTY resize followed by conhost's repaint, Abs(T, m.prompt_start_row) and Abs(T, m.output_start_row) name the same text as before.	1,2,3,5,12	1/1	u64 absolute-row bookkeeping, VecDeque of marks
+cp-default-resize-is-native	equivalence	Terminal::{resize,resize_with_policy}	resize(r, c) ≡ resize_with_policy(r, c, ResizePolicy::Native). (The test's golden digest is a pin, not part of the spec; see §5.)	2,3,4	1/1	one delegating call
+absolute-keys-cover-retained-rows	invariant	Grid::{absolute_row_counter,oldest_absolute_row,visible_to_absolute}, Terminal::{resize,resize_with_policy,restore_checkpoint,reserve_older_history_keys,attach_older_history,abs_row_text}	KeysCoverRetained: absolute_row_counter ≥ rows + scrollback_lines and visible_to_absolute(0) = oldest_absolute_row + scrollback_lines, on the primary grid of every T ∈ Reach, through process (ED 3 and alt switches), every resize path, the ConPty policy, checkpoint_carry then restore_checkpoint (also with zeroed counters), and reserve_older_history_keys(k) then attach_older_history. reserve raises the counter by exactly k and moves no live key. A ConPty rows-only grow changes neither scrollback_lines nor (oldest_absolute_row, visible_to_absolute(0), history_renumber_epoch). Corollary: an OSC 133;B mark recorded on row r reads back via abs_row_text as row r's text with command_start_col = the recording column.	1,2,3,5,7,12	5/5	saturating u64 counters, append vs reveal branch, Result from attach
+rj-quiet-flap-identity	contract	Terminal::{resize,render_row,hyperlink_at_visible}, Grid resize undo (resize_undo, drop_resize_undo)	For T on either screen and any sequence of rows-only resizes R → R−k1 → … → R (cols unchanged) with no non-empty process() in between: the picture (render_row of every row: text, wide CJK, clusters, SGR colour and weight, curly underline and its colour, OSC 8 links, truecolour backgrounds, blank rows), cursor, the DECSC slot, extras on demoted rows and the selection come back exactly as before; the scroll region is restored when the final height equals the original, and render_debt is unchanged. On alt the resize undo stashes demoted rows and restored_top hands them back; on the primary they go to history and are revealed back; with a blank tail the shrink only trims. A selection moved between the halves is not put back.	1,2,3,5,7,12	6/6	undo stash Vec<Row>, selection transform
+rj-undo-dropped-by-output-or-switch	contract	Terminal::{process_at (drop_resize_undo),resize}, alt switch handlers	A non-empty process() between the halves, or a screen switch, drops the resize undo on both grids: the next grow has restored_top = 0 and appended = rows grown, content stays shifted, the selection takes the ordinary transform, and the report's adjoins(prev) is false when content_seq moved.	1,2,3,4,12	2/2	&mut grids incl. Option<Grid>
+rj-journal-ring	contract	Terminal::{resize_journal_since,resize_ordinal}, ResizeReport::adjoins	resize_ordinal() counts every resize, offloaded ones included (0 initially). Each resize journals a report (ordinal, from/to, alt, in_sync, reflowed = a width change on the primary, content_seq before/after, full_clears/screen_replaced snapshot). resize_journal_since(w), w' = 0 if w > ordinal else w, returns the retained reports with ordinal > w', oldest first and contiguous, at most RESIZE_JOURNAL_CAP = 16, plus lost = (ordinal − w') − |returned|. b.adjoins(a) ⇔ b.content_seq_before = a.content_seq.	1,2,3,7	1/1	bounded VecDeque ring with an overrun count
+rj-full-clear-count	contract	Terminal::full_clear_count, erase_display (ED)	full_clear_count starts at 0 and is never reset (RIS included); it increments by 1 per ED 2 and per ED 0 with the cursor at (0,0); ED 3, EL, ED 1, DECSED and ED 0 elsewhere leave it.	1,2,3,4	1/1	frame condition, u64 counter
+rj-screen-replaced-and-healed-by	contract	Terminal::{screen_replaced_count,reset}, ResizeReport::healed_by	screen_replaced_count increments by 1 for every effective alt switch (47/1047/1049 h and l when they change screen, and a repeated 1049 h, which clears), RIS and reset(); a no-op switch leaves it. r.healed_by(c, s) ⇔ c > r.full_clears ∨ s > r.screen_replaced.	1,2,3,4	1/1	frame condition, u64 compare
+rj-render-debt	invariant	Terminal::{render_debt,seed_render_debt,resize,resize_with_policy}	render_debt() = (0,0) on the primary screen and under ResizePolicy::ConPty. On alt it is the sum, over resizes since the last full clear (ED 2 / home ED 0), screen switch or RIS, of each resize's (row shift, bottom rows lost) not handed back by the undo; a quiet flap nets (0,0), and it stays exact past a journal overrun. seed_render_debt sets it only on alt and survives a checkpoint restore.	1,2,3,4,5	8/8	signed accumulators
+rj-lifetime-token	contract	Terminal::{resize_lifetime,from_checkpoint}	Every constructed or restored engine has resize_lifetime() ≠ 0, distinct from every other engine in the process, constant over its life (resize, ED, RIS); from_checkpoint gives a new token with resize_ordinal() = 0.	1,2,9,13	1/1	process-wide atomic counter
+shared-scrollback-budget	refinement	ScrollbackBudgetShare::{register,effective,pending_effective,set_configured,drop}, set_global_scrollback_budget, Terminal::set_memory_budget, ScrollbackStorage::{memory_budget,budgeted_memory_used}	With G = GLOBAL_BUDGET_BYTES and N = LIVE_SHARES: register increments N and drop saturating-decrements it. effective() = max(configured, 1) if G = 0, else max(min(configured, G / max(N,1)), 1). pending_effective() returns Some(e) and sets applied := e iff e = effective() ≠ applied (applied starts at usize::MAX, so the first poll fires). Every interleaving of Join, Leave and Apply refines shared_budget_model (Buggy = 0): Σ applied ≤ G once every live pane applied and a departed pane holds 0. After set_memory_budget(b), budgeted_memory_used ≤ b (the store evicts to fit).	1,2,3,7,8,10,13	5/5	process-global AtomicUsize statics, Drop, tiered eviction loop
+history-shed-contract	contract	Terminal::{shed_history_scrollback,history_scrollback,history_scrollback_bytes,scrollback,set_memory_budget}, Grid::history_link_bytes	shed_history_scrollback(f) returns None and changes nothing iff no tiered store is attached to the grid holding the primary history, on either screen. Otherwise HistoryShed{before, after} with before = store.used + ring link bytes = history_scrollback_bytes, after ≤ before, store.used ≤ f(budget), ring link bytes ≤ f(budget)/4, memory_budget unchanged, and freed = 0 when already under f(budget). Links are stripped from whole rows oldest first; every row keeps its text. history_scrollback() names the primary store on either screen, scrollback() the active grid's (None on alt). Leaving alt afterwards brings back fewer lines, but not zero.	1,2,3,5,7,12,13	3/3	FnOnce(usize)->usize param, budget setters with Result, tier eviction
+scrollback-fifo	contract	Terminal::process, Grid::{get_history_line,scrollback_lines}	For lines L1..Ln written as Li CR LF with no eviction (n − rows ≤ limit): get_history_line(k) has text L(k+1) (trimmed) oldest first for every k < scrollback_lines, whichever tier holds it.	1,2,3,5,7,12	1/1	tier pipeline with LZ4 (codec round-trip lemma)
+bottom-line-feed-scrolls-the-screen	contract	Terminal::process, Grid::linefeed	With the cursor on the last row, a full-screen region, no horizontal margins and display_offset 0: after a LF, row_text(r)' = row_text(r+1) for r < rows−1 and the last row is blank, on both screens, after any history of rows-only grows and wrapped rings.	1,2,3,12	0/2	ring rotation with a capped ring that may wrap
+top-anchored-region-scroll-archives	contract	Terminal::process, Grid::scroll_up (region), Terminal::absolute_row_revision, Grid::get_history_line	On the main screen with a DECSTBM region [0, b], a LF at the region's bottom shifts the region up; the displaced top row is appended to history iff it was ever written (a blank separator after written content is archived as an empty line); rows below b are unchanged; absolute_row_revision + 1 iff b < rows−1 and a row was archived (a full-screen scroll leaves it). On alt the same bytes add nothing to scrollback, during the session or after 1049l.	1,2,3,12	5/5	per-row ever-written flag, ring push, u64 revision
+content-anchored-metadata	contract	Terminal::{process,resize,attach_older_history,command_marks,all_blocks,terminal_marks,annotations,take_osc_event,text_selection}	Every absolute-row anchor (command marks and blocks, terminal marks, annotations, row= fields of queued OSC 133 events, selection endpoints, the pinned viewport top, the live cursor) moves exactly with its row's content under every row-moving operation: a uniform scroll, a top-anchored DECSTBM splice (anchors in the region shift, anchors in the protected footer stay, anchors created after the splice in the same batch are not shifted twice), a rows-only grow reveal (the cursor rides its line and the revealed rows are the archived transcript in order, no blank band), a demoting shrink and a history import. After an import or adopt a finished block's output and command text are the source's.	1,2,3,5,7,12	4/4	piecewise row remaps, Vec<Mark>/Vec<Block> updates, queued String events
+reflow-preserves-logical-lines	equivalence	Terminal::{resize,resize_offloading_scrollback,finish_resize_offload}, Grid::resize_with_reflow_mode, rewrap chunker, Line::serialize	For every width w, resize path and storage (ring, tiered with any ring size), a resize that evicts nothing keeps LL(T): only recorded early-wrap holes are dropped, and a space or glyph written in a row's last cell is kept, including at chunk ends, across the history boundary, in runs longer than a chunk, after an edit that ends a hole, and when BCE coloured the hole. DECLRMM IL/DL/SU/SD carry a hole marker with the last cell when copied, clear it when vacated, and leave it unchanged outside the rectangle. A visible rewrap records new holes and fills them with the following wide glyph's BCE background, including RGB; distinct historical erased/recoloured non-content hole paint is not retained. A round trip w0 → w → w0 restores content rows and scrollback_lines when nothing was evicted. The cursor follows its content cell. Every on-screen non-BMP glyph, cluster, combining mark and coloured content cell survives every resize path (rows-only and no-reflow included) and never becomes U+FFFD.	1,2,3,5,7,12	22/22	reflow chunk loops with wide back-off, hole flag, ComplexCharRing migration, tier pipeline, offload job; needs a list model of logical lines
+extras-follow-their-glyph	invariant	Terminal::resize, Row::resize, fill_row_into, copy_cells_to_row, materialize_from_line, filled_span_cols, Grid::cell_extra, Terminal::hyperlink_at	For every resize path and view (screen, each history tier, any offset), a cell carries a link, an SGR 58 colour, an image tile or ring RGB iff it holds the glyph (or its wide continuation) written with it. (a) When one column cannot hold a wide glyph, or an alt width cut blanks a wide head, the blank keeps no link or underline and no unclaimed extras entry remains. (b) A VS16 glyph kept narrow mid-row keeps the following spans on their columns. (c) An image footprint rides its line through a rewrap (same tiles and anchor; a tile survives a narrowing iff its column < cols, with no invented rows; image rows extract as empty text), through combined rows+cols resizes and a parked-primary width change under alt. (d) Truecolour of a surviving row is unchanged by same-size, flap, unreverted-shrink and alt-narrow resizes, and a demoted row takes its colours.	1,2,3,5,7,12	10/10	extras side table, span tables in history Lines, Arc image refs
+sbg-completion-equals-one-shot	equivalence	search_budgeted::Terminal::{search_budgeted,feed_budgeted_history}, aterm_search::BudgetedSearch	For every T (corrupt tiered segments included), query, case and regex flags and budget b ≥ 0, driving search_budgeted from cursor None and feeding back each cursor with no mutation in between terminates; the first step has reset = true, later ones reset = false with the same search_id, incomplete steps carry Some(cursor). The concatenated matches with the last step's incomplete / lowest_retained_line / cut_short_lines equal the one-shot index's results, including rows a regex could not afford (counted in cut_short_lines, incomplete = true).	1,2,3,4,5,7,12	4/4	loop invariant relating partial matches to a prefix of the one-shot build, budgeted regex (cross-crate)
+sbg-step-budget	contract	search_budgeted::Terminal::search_budgeted	With b' = max(b, 1): 0 ≤ Δrows_fed ≤ b', = b' on every step that is neither final nor drain-only, and 0 only on a drain-only turn after rows_fed = total_rows. Each step delivers ≤ MAX_MATCHES_PER_STEP = 4096 matches. complete ⇒ rows_fed = total_rows ∧ cursor = None. total_rows = scrollback_lines + rows; with sparse matches there are ⌈total_rows / b'⌉ steps.	1,2,3	1/1	usize clamping, Vec truncation
+sbg-cursor-validity	contract	search_budgeted::Terminal::{search_budgeted,cancel_budgeted_search}	A call resumes iff resume_cursor = Some(state.cursor) ∧ phase = InFlight ∧ (query, case, regex, ambiguous_width, alternate_screen, content_seq) equals the state's key. Otherwise (content changed, another pattern, a forged, foreign or completed cursor, after cancel) it restarts with reset = true, a new search_id, a fresh process-unique cursor and rows_fed ≤ b', even when the restart completes in the same turn. cancel_budgeted_search drops the state.	1,2,3,13	5/5	String equality, process-wide AtomicU64 allocator
+sbg-error-retains-nothing	contract	search_budgeted::Terminal::search_budgeted	If search_budgeted returns Err (invalid or oversized regex, regex feature off, cursor space exhausted), budgeted_search = None afterwards and the next valid search starts fresh.	1,2,3	1/1	Result with ?, Option take
+sbg-cursor-allocator	contract	search_budgeted::allocate_cursor	allocate_cursor(counter) = Some(v) with counter' = v + 1 when v < u64::MAX, and None with counter unchanged at u64::MAX: issued tokens strictly increase and never wrap.	3,13	1/1	AtomicU64::fetch_update with checked_add
+sbg-summary-reuse	contract	search_budgeted::Terminal::search_summary_results, search_index::Terminal::release_search_index	search_summary_results(q, cs, rx) always equals the live index's results. When a budgeted search for the same key completed over the current snapshot and was not released, it answers from that state with search_index_rebuilds unchanged; otherwise it falls back to the cached one-shot index, which then rebuilds.	1,2,3,4	1/1	Option match, counter frame condition
+sbg-refines-model	refinement	search_budgeted::Terminal::{search_budgeted,cancel_budgeted_search,indexed_search}, SearchResults	Project each step (search_id and cursor by first-seen rank, rows_fed, total_rows, complete, reset, delivery counted from appended deltas against the one-shot count). Every sequence of search_budgeted and cancel calls refines budgeted_search_resume_model via Start, Resume, ContentRestart, QueryRestart, ForgedRestart, Supersede, Cancel, FinishScan, RestartComplete, StartComplete, StartBacklog, Drain and DrainComplete; every non-Buggy action has one #[refines] anchor (BuggyScanOnlyCompletion is the only waiver). Per step |matches| ≤ 4096 and rows_fed ≤ total_rows; complete ⇔ scan done ∧ emitted ≥ result_count, then cursor = None; deltas since the last reset concatenate exactly once to search_results_opts.	1,2,3,5,7,10,12,13	3/3	global id allocator, Vec deltas, resumable scan, ty_model binding
+si-cached-equals-fresh	equivalence	search_index::Terminal::{indexed_search,try_refresh_search_index,build_search_index,release_search_index}	For every T ∈ Reach (any interleaving of output, in-place edits, erases, ED 3, height or width resizes under either policy, alt switches, retention and memory-budget shrinks, Kitty unscroll, checkpoint restore, live ambiguous_width switches, release, viewport scrolls; absolute rows past u32::MAX; corrupt tiered segments) and every query: indexed_search() results equal a from-scratch build_search_index (matches, incomplete, watermark). Every match's absolute row r has Abs(T, r) = its line's text, and no evicted row is returned.	1,2,3,4,5,7,12	14/14	cache-key soundness lemma plus refresh ≡ rebuild for Append/Replace/EvictBelow over aterm-search's line table
+si-match-columns-are-drawn-cells	contract	search_rows::history_row_for_search, search_index::Terminal::build_search_index, selection::history_line_text_cells, LineCells::columns_of, Terminal::get_line_text	For every match (row, start_col, len) from any reader (full build, refresh, budgeted search, the from-scratch oracle), start_col..start_col+len are exactly the grid columns of the cells holding the matched bytes as the grid drew them: cells written out of order or joined by a delete, ASCII after a ZWJ, flag halves, and ambiguous-width characters measured under the policy in force when each was written; live rows and either history tier alike. A row's matches do not change when it scrolls into history. Once a line is in history, get_line_text(row, Some((c1,c2))) returns exactly the text the live grid painted in columns c1..=c2, and a grapheme folded across a UAX #29 boundary lives in the cell it joined.	1,2,3,5,7,12	11/11	byte→cell map over clusters, Line serialization, Unicode width tables
+si-cache-reuse-policy	other (cost)	search_index::Terminal::{indexed_search,search_index_rebuilds,search_index_refreshes}	search_index_rebuilds increments on an indexed_search() call iff the cache is absent (never built, released, restored) or its key (alt, content_seq, ambiguous_width, absolute_row_revision, history_renumber_epoch) differs. A pure viewport scroll changes no key. A miss whose only change is an append, an in-place replace at or above the visible base, or eviction below is served by a refresh; a reflow, alt switch, splice or renumber rebuilds.	1,2,3	1/1	counter frame conditions, key compare
+sel-copy-denotation	contract	selection::Terminal::{selection_to_string,push_linear_selection,push_block_selection,get_line_text}, selection::scrollback_line_range_text	selection_to_string() joins, over the selection's rows (Lines: every highlighted row whole), the bytes of the covered cells by grid columns as drawn (either history tier), a half-covered wide glyph copied whole. Rows are separated by newline at hard breaks and joined directly across soft wraps; a soft-wrapped row keeps every cell the program wrote (a space in the last column included), an early-wrap hole contributes nothing, and trailing blanks are trimmed where the logical line ends (hard break or selection end). A blank-only line copies as empty. Columns are the cells', never re-measured under the current ambiguous_width. scrollback_line_range_text(line, s, e) = the bytes of the cells drawn over columns s..=e.	1,2,3,5,7,12	8/8	String building with caps, row loops, history Line reads
+sel-history-cells-are-drawn-cells	equivalence	selection::Terminal::{written_line_cells,line_range_cells,drawn_line_cells}, history_line_text_cells	For a history row h (either tier) and column g, the LineCells of h name the cell the grid draws at (h, g): its text starts with display_cell_grapheme at g, a wide right half names its left half, and a column with no cell draws nothing; a history row draws the cells it drew live. For a joined logical line first..=last, line_range_cells names cell (first + ⌊g/cols⌋, g mod cols) at join column g and reads only what the rows' cells draw (a stored line wider than the grid contributes only its drawn cols).	1,3,5,7,12	5/5	grapheme/cell maps, history tier layout
+sel-smart-word-in-cells	contract	selection::smart_word_in_cells, Terminal::smart_word_at, LineCells::{byte_at_column,columns_of}	smart_word_in_cells(t, C, col, rules) = None if no cell is drawn over col or the byte there is whitespace; otherwise the word containing C.byte_at_column(col) under the smart rules, with its bytes and columns C.columns_of(w).	1,3,7,12	1/1	byte indexing, word-rule scanning
+sel-copy-caps	contract	selection::Terminal::{selection_to_string_capped,selection_to_string_bounded}, selection::push_row_capped	selection_to_string_capped(R, B) = (Some(p), tr) with p a prefix of the uncapped copy, |p| ≤ B bytes, at most R rows, and tr ⇔ p ≠ full ∨ the head was clamped by eviction; with large enough caps p = full and tr = false. push_row_capped(res, row, B) appends the longest char-boundary prefix of row keeping |res'| ≤ B and returns whether it clamped.	1,3,5,7	5/5	push_str, is_char_boundary loop
+sel-bounded-line-text	contract	selection::{line_text_bounded,scrollback_line_range_text,MAX_SCROLLBACK_LINE_SCAN_BYTES}, Terminal::get_line_text	line_text_bounded(b, m) = Borrowed(str(b)) when b is valid UTF-8 and |b| ≤ m, else Owned(from_utf8_lossy(b[..min(|b|,m)])). scrollback_line_range_text scans at most max_scan_bytes; columns past it give "". get_line_text on a history line of any size returns at most the cells the requested range covers, in bounded time.	1,3,7	4/4	Cow<str>, from_utf8, from_utf8_lossy
+sel-scroll-invariance	equivalence	selection::Terminal::{get_line_text,selection_to_string}	For any two display offsets reached by scroll_display alone, get_line_text(r, cr) for r ≥ 0 and selection_to_string() are equal; positive rows are terminal-relative with row 0 the live top.	1,2,3,5	2/2	scroll_display frame lemma
+sel-logical-line-span	contract	selection::Terminal::{logical_line_span,row_continues_previous}	For r in −scrollback_lines..rows, logical_line_span(r) = (f, l) with f ≤ r ≤ l: f the least row with row_continues_previous(k) for all k ∈ (f, r], l the greatest with it for all k ∈ (r, l], each bounded by the walk cap and the buffer ends, crossing the scrollback/live boundary.	1,3,5,7	2/2	bounded while loops over i32 rows
+sel-one-fetch-per-history-row	other (cost)	selection::Terminal::{push_linear_selection,selection_row}	Copying a linear selection spanning N history rows constructs exactly N history Lines (one tier fetch per row), and the text is correct. A ghost cost model, not the test-only counter.	3,7,13	1/1	ghost counter over a loop
+selection-custody	invariant	Terminal::{process,resize,set_scrollback_line_limit,clear_scrollback,reset,restore_checkpoint,selection_to_string,selection_to_string_bounded}, TextSelection::truncated, SelectionDamage bands	Let D = selection_to_string(T) for a completed selection anchored at absolute rows, and op any process, resize, set_scrollback_line_limit, clear_scrollback, reset or restore_checkpoint. SAFETY: if the selection survives op, either its text is D, or truncated() holds, its start clamps to the oldest retained row at column 0, the text is a suffix of D, and selection_to_string_bounded reports incomplete. PRECISION: it survives with text D when op replaced no cell it names (attribute-only DECCARA, a DECCRA source, appends past a row's content, uniform scrolls, ED 2 off its rows, region scrolls outside it, up to MAX_SELECTION_DAMAGE_BANDS = 8 disjoint repaint bands that miss it), op is not a width rewrap, ED 3, RIS or restore, and an endpoint is still retained. A selection made on alt is cleared at the alt exit; a main-screen selection is parked across an alt session in every mode and batching and comes back as D. Anchors move with content under demotes, reveals, splices and parked-grid resizes. Past the band bound the cover over-approximates, so the selection clears and is never left stale.	1,2,3,5,7,12	47/47	[(u64,u64);8] band accumulator with closest-pair merge, i32/u64 row conversions, parked slot swap, per-batch dedup guard
+selection-paint-equals-copy	equivalence	RenderInput::selection_contains_cell, TextSelection::contains_cell, aterm_types::selection::glyph_cell_span, Terminal::{selection_to_string,display_cell_grapheme,cell_frame}	For every selection (Simple or Block, any anchor order and half-cell sides, endpoints on live or history rows at any offset d) and display row r: (a) the painted set P(r) contains both cells of a wide pair or neither; (b) concatenating display_cell_grapheme(r, c) over P(r), trailing blanks trimmed, equals the part of selection_to_string on terminal-relative row r − d. So a selection from a wide glyph's continuation selects the whole glyph, and a combining cluster is never split.	1,2,3,5,7,12	9/9	shared pure helper in aterm-types, String building over history byte offsets
+selection-to-string-bounded	contract	Terminal::selection_to_string, selection_to_string_capped	For anchor rows anywhere in i32 (i32::MAX and i32::MIN included), selection_to_string visits only rows in [−scrollback_lines, rows−1], so it runs at most rows + scrollback_lines iterations, returns at most that many lines, and reads retained rows unchanged.	1,3,5,7	1/1	i32 clamping, loop variant
+vi-line-frame-independent-of-viewport	invariant	aterm_grid::Grid as BufferAccess::{char_at,line_len,line_text,line_wide_continuations,is_wide,is_line_wrapped}, buffer_access::line_view, Terminal::scroll_display	For every grid g and display offsets d1, d2 ∈ 0..=H(g), Reads(g at d1)(l, col) = Reads(g at d2)(l, col). For l ∈ 0..R the reads are live screen row l; for l ∈ −H..=−1 the history row with reverse index −l−1; any other l gives line_text None, line_len 0, char_at None.	1,2,3,5	1/1	dyn BufferAccess, i32/i64 arithmetic, materialized scrollback rows
+vi-grid-motion-commutes-with-scroll-display	equivalence	aterm_vi::ViMode::motion_with_grid, Terminal::{vi_motion,scroll_display}	With vi active, for every motion m ∉ {High, Middle, Low} and boundary b, the cursor after scroll_display(k); vi_motion(m, b) equals that after vi_motion(m, b) for every k keeping 0 ≤ d ≤ H. The result itself is aterm-vi's word-motion spec over line text.	1,2,3,4,5,7	0/1	split borrow of Terminal, dyn trait, word scanners
+vi-high-middle-low-viewport-rows	contract	aterm_vi::ViMode::motion_with_grid	For an active ViMode and m ∈ {High, Middle, Low} with row = 0 | R/2 | R−1: cursor.line' = clamp(−display_offset + row, −total_lines, R−1) and cursor.col' = min(col, C−1); nothing else changes. Inactive: unchanged.	2,3	1/1	saturating ops, clamp, min
+vi-toggle-starts-at-terminal-cursor	contract	Terminal::vi_toggle, aterm_vi::ViMode::toggle	With vi inactive, after vi_toggle() vi is active at (i32::from(cursor.row), cursor.col).	2,3	1/1	split borrow, field writes
+vi-shift-clamp-contract	contract	Terminal::vi_shift, aterm_vi::{ViMode::scroll,Cursor::scroll}	Inactive: vi_shift changes nothing. Active: vi' = (clamp(line + delta saturating, top, R−1), min(col, C−1)) with top = i32::MIN while an offloaded reflow holds history, else −H; the grid is unchanged.	2,3	3/3	saturating_add, clamp, bool branch
+vi-cursor-on-grid-invariant	invariant	Terminal::{process,resize,resize_offloading_scrollback,finish_resize_offload,abort_resize_offload,clear_scrollback,set_scrollback_line_limit,scroll_display,vi_motion}	With vi active, after every public mutating call: OnGrid(vi) when no offloaded reflow is in flight; while one is, vi.line ≤ R−1, vi.col ≤ C−1 and the line is unchanged by the offloading resize, and finish/abort restores OnGrid by clampG. A width change sets vi := clampG(vi); clear_scrollback/ED 3 sends a history cursor to line 0; set_scrollback_line_limit(Some(k)) sends l < −k to −k (the oldest kept line).	1,2,3,4,5,7,13	1/4	whole Terminal state, tiered scrollback, offload job
+vi-follow-output-fold-contract	contract	Terminal::vi_follow_output	With rise = min(lines, i32::MAX) and l = vi.line: vi.line' = clamp(follow(l, bands, rise), top, R−1) and col' = min(col, C−1), where follow(l, Some(bs)) for l ≥ 0 = max(fold over bs of [top = 0 ∧ delta < 0 ∧ rise > 0 ? (l ≤ bottom ? l + delta : l) : top ≤ l ≤ bottom ? clamp(l + delta, top, bottom) : l], −rise), and follow(l, _) = l − rise otherwise. Inactive: no change.	1,2,3,5,7	2/2	fold over a slice of structs, Option match with guard
+vi-cursor-custody-across-output	refinement	Terminal::{process,vi_follow_output}, Grid RowBandMoves	For a batch B that switches no screen: (a) Moves(B) describes every row move: each surviving line l moved to follow(l, Moves(B)) with the same text; (b) the vi cursor on a surviving row lands on follow(l) with the same text and column; a cursor on a row that left a non-archival band rests on that band's edge; a cursor whose text was evicted from a full history goes to −H; rows outside every moved band (a composer, status or progress bar below a region scrolling into history) keep their line; (c) the result is independent of display_offset, and every history line moves by exactly −rise.	1,2,3,4,5,7,10	3/7	full VT pipeline, scroll regions, band composition
+vi-rows-resize-relabel-round-trip	round-trip	Terminal::{resize,finalize_resize,vi_shift}	On the primary screen, a rows-only shrink that demotes k rows gives vi = clampG(l − k, c), on the same text when the row survived; a grow revealing k rows gives clampG(l + k). Shrink then grow back restores vi and its text when the grow reveals exactly the demoted rows.	1,2,3,4,7	1/1	Grid resize row moves, i32/u16 conversions
+vi-alt-resize-undo-restores-cursor	round-trip	Terminal::{follow_resize_undo_selection,finalize_resize,resize}	On alt with vi at l0, a flap of shrinks under one resize undo followed by a grow the grid reports undone returns vi to l0 (clamped, same text) if no vi motion moved it in between; if one did, the cursor ends where the composed per-resize relabels take it. H = 0 throughout, and a cursor on a demoted row rests on line 0 after the shrink.	1,2,3,4	1/1	Option<struct> take/compare, alt/primary swap
+```
+
+### Distribution by kind (292)
+
+| kind | count | ids |
+|---|---|---|
+| contract | 180 | bell-rate-limiter, ime-walk-contract, ime-overlay-contract, line-size-run-at, sparse-column-accessors, default-bg-at, clear-overlays-contract, selection-hit-denotation, effect-damage-cache, damage-words-injective, alt-archive-lifecycle, alt-archive-row-charge, alt-archive-read-paging, alt-archive-normalize-row, has-alt-1049-enter, alt-archive-hook-commit-points, alt-archive-end-to-end, bidi-visual-order-cells, bidi-default-paragraph-ltr, bidi-frame-reorder, bidi-mode-change-reprojects-and-damages, block-text-range, block-eviction-log-thinning, last-completed-block-is-sealed, scrollback-line-limit, scrollback-pressure-level, format-paste-denotation, paste-has-payload, paste-insert-cells, drain-bell-edge-flag, osc-app-event-payloads, vt-sampled-handler-effects, print-anchor, trickle-lazy-bounded, checkpoint-visible-projection, checkpoint-restore-sanitizes, checkpoint-shell-integration-carry, restore-advances-scroll-epoch-once, saved-cursor-follows-content, refused-parser-carry-resumes-at-ground, adopt-keeps-host-retention-config, checkpoint-carry-wire-shape, clipboard-capability-mint, clipboard-invoke-forwarding, resolve-colors-denotation, dim-contrast-law, host-color-mutators-damage, config-negotiated-modes-seed, config-reload-damage-and-idempotence, config-reload-during-detached-reflow, foreground-handback-gate-and-post, manual-handback-post, absolute-row-update-remap, has-run-of-4, alloc-fault-fail-closed, kitty-delete-semantics, kitty-chunked-load-lifecycle, kitty-payload-source, kitty-reply-protocol, kitty-placement-layout, kitty-relative-placements, kitty-placeholder-resolution, kitty-animation-scheduler, kitty-command-parse, kitty-loadable-size, compose-rgba, png-dimensions, rgb-to-rgba, iterm2-inline-image, image-retention-horizon, history-image-payload-shared, sixel-dcs-never-leaks-glyphs, decslrm-validity, decslrm-run-wraps-at-the-right-margin, damage-scope, keyboard-mode-projection, win32-input-mode-lifecycle, host-leave-orphaned-alt, prompt-leaves-orphaned-alt, in-band-size-report, resp-take-response, cursor-blink-mode-12, cursor-style-default, color-scheme-report, xtversion-reply, vt52-address-and-ascii-after-zwj, rep-repeats-the-last-graphic-character, sanitize-title, osc-title-and-epoch, osc-semicolon-tail-preserved, osc8-uri-acceptance, cwd-store, osc633-commandline-cap, osc52-clipboard-gate, palette-query-cap, osc21-key-echoable, taskbar-progress, notification-gate, osc99-accumulation, can-sub-cancels-every-string-consumer, empty-trailing-param-is-default, sgr-extended-color-parse, erase-resets-pending-wrap, alt-screen-switch-wrap-and-save, motion-counts-columns, xtwinops-gate, xtsmgraphics-geometry, print-cell-placement, wide-wrap-bce, history-fence-export, older-history-claim, mouse-wheel-encoding, mouse-report-memo, tab-stops-shared-and-suppression-carried, obs-observe-latch-step, obs-deadline-semantics, obs-next-deadline-min, obs-capacity, obs-first-matching-row, watcher-idle-deadline, watcher-row-match, pb-bridge-decision-tree, pb-response-sink-gate, wa-mint-iff-resolve, rl-token-bucket, pr-splice-accounts, pr-ris-retires-selections, pr-post-process-scroll-verdict, pr-content-scroll-state-soundness, st-delta-since, st-band-ring, pr-sync-timeout, pr-repaint-blink-epoch, viewport-pin, st-damage-epoch, sa-completed-command-seq, sia-verify-nonce, sia-decode-hex, sia-ct-eq, cfg-defaults, gr-width-bounds, rc-render-cell-resolution, rc-extras-classification, viewport-projection, rc-implicit-blank, rc-frame-scalar-stamps, rc-cursor-projection, rc-apron-row, rc-scrolled-strip-size, viewport-memo-coherent, rn-armed-gates, rn-answer-protocol, cp-rows-grow-shape, rj-quiet-flap-identity, rj-undo-dropped-by-output-or-switch, rj-journal-ring, rj-full-clear-count, rj-screen-replaced-and-healed-by, rj-lifetime-token, history-shed-contract, scrollback-fifo, bottom-line-feed-scrolls-the-screen, top-anchored-region-scroll-archives, content-anchored-metadata, sbg-step-budget, sbg-cursor-validity, sbg-error-retains-nothing, sbg-cursor-allocator, sbg-summary-reuse, si-match-columns-are-drawn-cells, sel-copy-denotation, sel-smart-word-in-cells, sel-copy-caps, sel-bounded-line-text, sel-logical-line-span, selection-to-string-bounded, vi-high-middle-low-viewport-rows, vi-toggle-starts-at-terminal-cursor, vi-shift-clamp-contract, vi-follow-output-fold-contract |
+| equivalence | 38 | ime-overlay-agrees-with-caret-query, render-input-content-equality-and-clone, images-eq-is-tag-stripped-equality, prepend-host-rows-splice, dec-mode-matcher, alt-archive-noninterference, alt-archive-carry-continues, bidi-pointer-and-introspection-agree-with-frame, offloaded-resize-equivalence, checkpoint-carry-continues, srgb-transfer-tables-exact, handback-replay-and-idempotence, process-chunk-invariance, apc-put-bulk-refines-per-byte, dcs-put-bulk-refines-per-byte, xtsave-restore-roundtrip, sgr-denotation, char-width-fast-path, grid-columns-model-agreement, terminal-host-adapter, pg-compiled-equals-live, pg-response-slot-equals-id, pr-ris-keeps-parser-carry, sync-update-is-render-only, gr-aggregate-consistency, history-render-parity, ring-fast-materialize-equals-line-roundtrip, rc-render-row-at-screen, rc-images-frame-equals-per-row, cp-rows-shrink-native, cp-default-resize-is-native, reflow-preserves-logical-lines, sbg-completion-equals-one-shot, si-cached-equals-fresh, sel-history-cells-are-drawn-cells, sel-scroll-invariance, selection-paint-equals-copy, vi-grid-motion-commutes-with-scroll-display |
+| invariant | 28 | composed-fill-blessing, alt-archive-differ-no-loss, alt-archive-retention-budget, osc-event-queue-bounded-fifo, host-policy-survives-reset, cell-extras-coherence, terminal-wf-invariant, kitty-store-budget, kitty-layer-order, live-image-budget, decrqm-mode-agreement, response-buffer-bounded, row-len-is-the-written-extent, mode-mirror-coherence, pg-state-sync-invariant, pr-sync-open-dirty, pr-sync-frame-unfinished, st-content-seq, rc-wide-spacer-inherits-rendition, rn-attempt-budget, rn-hold-always-lifted, cp-absolute-keys-stable, absolute-keys-cover-retained-rows, rj-render-debt, extras-follow-their-glyph, selection-custody, vi-line-frame-independent-of-viewport, vi-cursor-on-grid-invariant |
+| refinement | 22 | bell-flash-model, alt-archive-differ-exact, alt-archive-pool-share, alt-selection-park-refines-model, shell-integration-authorization-model, color-state-model, conhost-orphan-recovery, kitty-store-lifecycle, kitty-frames, kitty-keyboard-protocol, hyperlink-auth, alt-1049-roundtrip, obs-terminal-watch-arm-eval, watcher-seq-latch, st-band-history-refines-model, tm-refines-model, rc-damage-scoped-equals-full, rn-refines-model, cp-conhost-repaint-lossless, shared-scrollback-budget, sbg-refines-model, vi-cursor-custody-across-output |
+| table-property | 9 | bidi-base-direction, checkpoint-partial-sequence-carry, csi-dispatch-table, evidence-assertion-table, kitty-diacritic-table, width-table-ucd, obs-arm-eval-classes, pb-resolve-table, rc-refill-cause-classification |
+| other | 7 | key-encoding-composition, pg-covered-gates-are-table-reads, pr-process-at-determinism, rc-images-frame-cost, rc-presentation-fingerprint, si-cache-reuse-policy, sel-one-fetch-per-history-row |
+| round-trip | 5 | checkpoint-roundtrip, shell-integration-nonce-hex, parser-repr-wire-roundtrip, vi-rows-resize-relabel-round-trip, vi-alt-resize-undo-restores-cursor |
+| no-panic | 3 | alt-archive-import-total, sx-decoder-bounded, sx-span-total |
+
+### Gap histogram (specs blocked by each gap)
+
+| gap | what | specs |
+|---|---|---|
+| 0 | seal that publishes Clean rows | 292 (all) |
+| 1 | non-scalar carriers and content models | 273 |
+| 2 | certified &self/&mut self views, two-state | 223 |
+| 3 | E6 body widening (calls, casts, loops, enums) | 235 |
+| 4 | callee-ensures composition | 110 |
+| 5 | quantified clauses | 124 |
+| 6 | plain-Rust clause publication (and floats) | 5 |
+| 7 | loops | 159 |
+| 8 | effects | 11 |
+| 9 | proc-macro boundary (serde) | 2 |
+| 10 | model→code refinement surface | 33 |
+| 11 | generics | 11 |
+| 12 | cross-crate theorem citation | 104 |
+| 13 | threads, atomics, closures | 37 |
+| 16 | soundness | 1 |
+
+### Proof dependency order
+
+Scalar and table specs (§6 tiers A–B) → pure byte/string functions (tier D) → the self-contained state
+machines (`bell-*`, `rn-*`, `obs-*`, `rl-token-bucket`, `pb-*`) → `resolve-colors-denotation`,
+`rc-render-cell-resolution` and the RenderInput contracts → the per-handler contracts (DEC modes,
+OSC, SGR, kitty, erase) → `terminal-wf-invariant` → `process-chunk-invariance` (a lift of
+aterm-parser's `advance-fast-chunk-invariance` through the handlers) → the checkpoint and carry
+bisimulations, the reflow and custody invariants, and the model refinements (ConPTY, alt archive,
+selection park, budgeted search) last.
+
+## 2. Test → spec map (TSV; all 1364)
+
+`primary` is the spec whose proof retires the test; `also` lists other specs the test samples.
+Tests in §4 appear with `primary` = `(§4: <action>)`.
+
+```tsv
+file	test	primary	also
+src/bell.rs	deadline_persists_until_expired	bell-flash-model	
+src/bell.rs	expire_clears_only_after_deadline	bell-flash-model	
+src/bell.rs	flash_starts_idle	bell-flash-model	
+src/bell.rs	rate_limiter_allows_at_interval_boundary	bell-rate-limiter	
+src/bell.rs	rate_limiter_blocks_within_interval	bell-rate-limiter	
+src/bell.rs	rate_limiter_denied_fire_does_not_rearm	bell-rate-limiter	
+src/bell.rs	rate_limiter_first_fire_always_allowed	bell-rate-limiter	
+src/bell.rs	ring_activates_for_flash_duration	bell-flash-model	
+src/bell.rs	ring_during_flash_extends_deadline	bell-flash-model	
+src/fault.rs	unarmed_is_false_armed_is_true	(§4: delete)	
+src/fault.rs	with_armed_scopes_and_disarms	(§4: delete)	
+src/render.rs	a_composition_at_column_zero_of_an_unwritten_row_is_painted	ime-overlay-contract	
+src/render.rs	a_composition_at_the_prompt_caret_is_painted_not_swallowed	ime-overlay-contract	
+src/render.rs	a_composition_longer_than_the_row_remainder_stops_at_the_frame_edge	ime-overlay-contract	
+src/render.rs	a_full_row_keeps_its_length_and_still_seeds_from_its_own_cursor_cell	ime-overlay-contract	
+src/render.rs	a_prepend_moves_each_bidi_row_map_with_its_row	prepend-host-rows-splice	
+src/render.rs	a_run_governs_only_its_own_columns	line-size-run-at	
+src/render.rs	a_spanned_row_never_inherits_the_row_level_summary	line-size-run-at	
+src/render.rs	a_truncated_composition_materializes_only_what_it_drew	ime-overlay-contract	
+src/render.rs	a_wide_composition_with_one_column_left_paints_nothing_and_grows_nothing	ime-overlay-contract	
+src/render.rs	absolute_row_revision_is_cloned_but_not_render_content	render-input-content-equality-and-clone	
+src/render.rs	an_empty_pane_list_leaves_the_scalar_path_untouched	selection-hit-denotation	
+src/render.rs	an_empty_preedit_is_byte_identical	ime-overlay-contract	
+src/render.rs	an_unresolved_frame_seeds_from_the_rows_last_real_cell	ime-overlay-contract	
+src/render.rs	ascii_preedit_lands_underlined_at_the_cursor_and_the_caret_trails	ime-overlay-contract	
+src/render.rs	cjk_preedit_occupies_lead_plus_wide_continuation	ime-overlay-contract	
+src/render.rs	clear_overlays_strips_all_three_rain_channels	clear-overlays-contract	
+src/render.rs	clone_from_copies_all_three_rain_channels	render-input-content-equality-and-clone	
+src/render.rs	composing_onto_a_graphemes_continuation_drops_the_cluster_at_its_lead	ime-overlay-contract	
+src/render.rs	composing_onto_a_wide_characters_continuation_takes_its_lead_too	ime-overlay-contract	
+src/render.rs	composing_onto_a_wide_characters_lead_takes_its_continuation_too	ime-overlay-contract	
+src/render.rs	composing_over_a_grapheme_drops_its_stale_cluster	ime-overlay-contract	
+src/render.rs	cursor_effect_damage_words_cover_every_visible_field	damage-words-injective	
+src/render.rs	cursor_effect_style_override_is_content_cloned_and_cleared_with_overlays	render-input-content-equality-and-clone	
+src/render.rs	cursor_fill_override_is_content_cloned_and_cleared_with_overlays	render-input-content-equality-and-clone	
+src/render.rs	damage_cache_keeps_effect_revisions_and_drops_large_payloads	effect-damage-cache	
+src/render.rs	damage_record_covers_8k_glow_under_without_retaining_its_payload	effect-damage-cache	
+src/render.rs	default_bg_span_tests::spans_are_render_content_and_survive_both_clone_paths	render-input-content-equality-and-clone	
+src/render.rs	empty_spans_yield_the_row_line_size_over_the_whole_row	line-size-run-at	
+src/render.rs	frames_compare_bidi_maps_by_meaning	render-input-content-equality-and-clone	
+src/render.rs	image_hides_glyph_only_when_z_is_nonnegative	sparse-column-accessors	
+src/render.rs	images_eq_memo_matches_derived_equality	images-eq-is-tag-stripped-equality	
+src/render.rs	line_size_span_tests::spans_are_render_content_and_survive_both_clone_paths	render-input-content-equality-and-clone	
+src/render.rs	lookup_uses_owning_pane_and_falls_back_for_gaps_or_malformed_spans	default-bg-at	
+src/render.rs	multiline_selection_is_confined_to_its_frame_rectangle	selection-hit-denotation	
+src/render.rs	out_of_range_lookups_fall_back_instead_of_panicking	line-size-run-at	
+src/render.rs	partial_eq_sees_rain_content_and_atlas_identity	render-input-content-equality-and-clone	
+src/render.rs	per_column_accessors_binary_search_sparse_sorted_lists	sparse-column-accessors	
+src/render.rs	per_pane_selections_resolve_per_cell_while_the_span_is_a_hull	selection-hit-denotation	
+src/render.rs	preedit_truncates_at_the_edge_and_a_wide_char_never_straddles_it	ime-overlay-contract	
+src/render.rs	run_boundaries_are_half_open_and_gaps_fall_back	line-size-run-at	
+src/render.rs	the_ambiguous_width_flag_widens_the_composition_it_is_given	ime-walk-contract	
+src/render.rs	the_anchor_moves_with_the_composition_the_engine_cursor_does_not	ime-walk-contract	
+src/render.rs	the_caret_never_advances_past_what_was_actually_drawn	ime-overlay-contract	
+src/render.rs	the_caret_query_returns_exactly_the_column_the_paint_lands_on	ime-overlay-agrees-with-caret-query	
+src/render.rs	the_composed_fill_blessing_is_revoked_by_every_other_producer	composed-fill-blessing	
+src/render.rs	the_fixture_row_stops_at_the_written_prefix	(§4: delete)	
+src/render.rs	the_gap_before_the_caret_is_padded_with_undecorated_blanks	ime-overlay-contract	
+src/render.rs	the_platform_caret_at_offset_zero_anchors_at_the_composition_start	ime-walk-contract	
+src/render.rs	the_platform_caret_offset_places_the_cursor_mid_composition	ime-walk-contract	
+src/render.rs	the_style_seed_falls_back_to_the_live_default_colors	ime-overlay-contract	
+src/render.rs	translate_is_the_native_splice_of_a_frame_placed_below_the_rows	prepend-host-rows-splice	
+src/render.rs	zero_width_combining_marks_advance_nothing	ime-walk-contract	
+src/terminal/alt_archive_tests.rs	a1_rows_edited_in_place_in_the_old_chrome_band_are_flushed_on_leave_and_resize	alt-archive-differ-no-loss	
+src/terminal/alt_archive_tests.rs	a2_leave_before_any_shift_never_archives_the_composer	alt-archive-differ-no-loss	
+src/terminal/alt_archive_tests.rs	a3_clear_then_exit_never_archives_the_composer	alt-archive-hook-commit-points	
+src/terminal/alt_archive_tests.rs	a4_fixed_rows_under_a_big_scroll_never_outvote_it	alt-archive-differ-no-loss	
+src/terminal/alt_archive_tests.rs	a5_short_rows_that_move_are_archived_exactly	alt-archive-differ-exact	
+src/terminal/alt_archive_tests.rs	a6_rows_below_that_come_back_are_archived_once_in_order	alt-archive-differ-exact	
+src/terminal/alt_archive_tests.rs	a6_rows_that_left_at_the_bottom_survive_a_later_jump	alt-archive-differ-no-loss	
+src/terminal/alt_archive_tests.rs	a8_chunked_equivalence_with_exits_ris_decstr_strings	process-chunk-invariance	
+src/terminal/alt_archive_tests.rs	a8b_a_read_boundary_after_alt_enter_never_changes_the_archive	process-chunk-invariance	
+src/terminal/alt_archive_tests.rs	a_budget_of_zero_turns_it_off_and_wipes	alt-archive-lifecycle	
+src/terminal/alt_archive_tests.rs	a_composer_box_redrawn_at_a_new_width_is_chrome	alt-archive-differ-no-loss	
+src/terminal/alt_archive_tests.rs	a_crowded_pool_floors_the_share_instead_of_starving_a_session	alt-archive-pool-share	
+src/terminal/alt_archive_tests.rs	a_differ_state_that_does_not_fit_is_dropped_whole	alt-archive-carry-continues	
+src/terminal/alt_archive_tests.rs	a_live_session_joins_the_process_budget_and_leaves_when_it_closes	alt-archive-pool-share	
+src/terminal/alt_archive_tests.rs	a_pinned_header_does_not_block_archiving	alt-archive-differ-exact	
+src/terminal/alt_archive_tests.rs	a_pool_shares_one_total_where_per_session_budgets_charged_it_n_times	alt-archive-pool-share	
+src/terminal/alt_archive_tests.rs	a_restore_inside_an_open_2026_window_is_not_the_baseline	alt-archive-hook-commit-points	
+src/terminal/alt_archive_tests.rs	a_scroll_back_past_the_carried_rows_is_a_gap_not_a_silent_repeat	alt-archive-carry-continues	
+src/terminal/alt_archive_tests.rs	a_session_that_fills_up_alone_and_goes_idle_is_the_pool_s_worst_case	alt-archive-pool-share	
+src/terminal/alt_archive_tests.rs	a_share_is_a_ceiling_and_not_an_allowance	alt-archive-retention-budget	
+src/terminal/alt_archive_tests.rs	a_share_that_moves_mid_stream_never_leaves_more_than_it_allows	alt-archive-retention-budget	
+src/terminal/alt_archive_tests.rs	a_tab_opening_lowers_the_others_on_their_next_frame_and_closing_gives_it_back	alt-archive-pool-share	
+src/terminal/alt_archive_tests.rs	a_tail_carry_counts_what_it_leaves_out	alt-archive-carry-continues	
+src/terminal/alt_archive_tests.rs	a_tail_carry_reaches_back_as_far_as_the_differ_can_point	alt-archive-carry-continues	
+src/terminal/alt_archive_tests.rs	a_torn_frame_is_never_committed	alt-archive-hook-commit-points	
+src/terminal/alt_archive_tests.rs	a_whole_carry_continues_exactly_where_the_old_archive_would	alt-archive-carry-continues	
+src/terminal/alt_archive_tests.rs	a_width_resize_still_treats_rule_rows_as_chrome	alt-archive-differ-no-loss	
+src/terminal/alt_archive_tests.rs	all_rule_rows_make_no_false_shift	alt-archive-differ-exact	
+src/terminal/alt_archive_tests.rs	alt_archive_pool_conformance_real_archives_project_onto_model	alt-archive-pool-share	
+src/terminal/alt_archive_tests.rs	alt_exit_commits_what_was_drawn_after_the_last_esu	alt-archive-hook-commit-points	
+src/terminal/alt_archive_tests.rs	an_archive_that_is_off_refuses_the_carry	alt-archive-carry-continues	
+src/terminal/alt_archive_tests.rs	an_archive_that_is_off_takes_no_share	alt-archive-pool-share	
+src/terminal/alt_archive_tests.rs	an_enter_behind_main_screen_frames_in_one_read_still_splits	process-chunk-invariance	
+src/terminal/alt_archive_tests.rs	an_xtrestore_that_stays_on_the_alt_screen_commits_nothing_early	alt-archive-hook-commit-points	
+src/terminal/alt_archive_tests.rs	apps_without_2026_are_committed_at_the_epilogue_rate_limited	alt-archive-hook-commit-points	
+src/terminal/alt_archive_tests.rs	back_five_then_forward_eight_archives_three_without_duplicates	alt-archive-differ-exact	
+src/terminal/alt_archive_tests.rs	blank_area_shrinking_mid_archive_archives_nothing	alt-archive-differ-exact	
+src/terminal/alt_archive_tests.rs	blank_start_archives_nothing_until_the_first_real_shift	alt-archive-differ-exact	
+src/terminal/alt_archive_tests.rs	blank_start_painted_all_at_once_archives_nothing	alt-archive-differ-exact	
+src/terminal/alt_archive_tests.rs	consecutive_jumps_with_nothing_between_record_one_gap	alt-archive-differ-exact	
+src/terminal/alt_archive_tests.rs	control_chars_are_collapsed_like_the_screen_reply	alt-archive-normalize-row	
+src/terminal/alt_archive_tests.rs	decstr_commits_without_rebaselining	alt-archive-hook-commit-points	
+src/terminal/alt_archive_tests.rs	disabled_archive_records_nothing	alt-archive-hook-commit-points	
+src/terminal/alt_archive_tests.rs	eviction_counts_lost_and_advances_first	alt-archive-retention-budget	
+src/terminal/alt_archive_tests.rs	fixed_bottom_chrome_is_never_archived	alt-archive-differ-no-loss	
+src/terminal/alt_archive_tests.rs	host_leave_archives_the_rows_typed_onto_the_stuck_screen	alt-archive-hook-commit-points	
+src/terminal/alt_archive_tests.rs	host_leave_with_the_archive_off_still_leaves	alt-archive-hook-commit-points	
+src/terminal/alt_archive_tests.rs	identical_frames_do_no_work	alt-archive-differ-exact	
+src/terminal/alt_archive_tests.rs	independently_priced_archive_eviction_conforms_to_ring	alt-archive-retention-budget	
+src/terminal/alt_archive_tests.rs	leave_flushes_without_chrome_and_enter_starts_fresh	alt-archive-lifecycle	
+src/terminal/alt_archive_tests.rs	leave_whole_flushes_the_chrome_a_leave_leaves_out	alt-archive-lifecycle	
+src/terminal/alt_archive_tests.rs	main_screen_output_is_never_archived	alt-archive-hook-commit-points	
+src/terminal/alt_archive_tests.rs	many_frames_in_one_read_are_each_committed	process-chunk-invariance	
+src/terminal/alt_archive_tests.rs	matcher_finds_esu_and_alt_exit	dec-mode-matcher	
+src/terminal/alt_archive_tests.rs	matcher_reports_by_screen_enters_and_xtrestore	dec-mode-matcher	
+src/terminal/alt_archive_tests.rs	matcher_survives_a_split_at_every_byte	dec-mode-matcher	
+src/terminal/alt_archive_tests.rs	no_carry_panics_the_import_or_any_frame_after_it	alt-archive-import-total	
+src/terminal/alt_archive_tests.rs	one_installed_frame_then_a_one_row_resize_archives_no_chrome	alt-archive-differ-no-loss	
+src/terminal/alt_archive_tests.rs	p1_viewport_random_walk_never_loses_a_row_that_left_the_top	alt-archive-differ-no-loss	
+src/terminal/alt_archive_tests.rs	p2_claude_like_walk_with_spinner_and_repeats	alt-archive-differ-no-loss	
+src/terminal/alt_archive_tests.rs	pageup_one_screen_then_forward_line_by_line_has_no_duplicates	alt-archive-differ-exact	
+src/terminal/alt_archive_tests.rs	pin_and_back_at_locate_the_reshown_rows_under_a_pinned_header	alt-archive-differ-exact	
+src/terminal/alt_archive_tests.rs	read_pages_forward_and_tails	alt-archive-read-paging	
+src/terminal/alt_archive_tests.rs	resize_flushes_the_old_screen_and_records_a_gap	alt-archive-lifecycle	
+src/terminal/alt_archive_tests.rs	restore_checkpoint_rebaselines	alt-archive-hook-commit-points	
+src/terminal/alt_archive_tests.rs	restore_then_an_identical_frame_archives_nothing	alt-archive-hook-commit-points	
+src/terminal/alt_archive_tests.rs	retained_row_charge_includes_header_and_padding	alt-archive-row-charge	
+src/terminal/alt_archive_tests.rs	ris_and_host_reset_wipe_the_archive	alt-archive-hook-commit-points	
+src/terminal/alt_archive_tests.rs	ris_between_frames_in_one_read_wipes_only_what_came_before	alt-archive-hook-commit-points	
+src/terminal/alt_archive_tests.rs	rows_attach_only_while_the_fence_holds	alt-archive-carry-continues	
+src/terminal/alt_archive_tests.rs	rows_left_out_of_a_resize_flush_are_archived_when_they_scroll_off	alt-archive-differ-no-loss	
+src/terminal/alt_archive_tests.rs	spinner_only_edits_archive_nothing	alt-archive-differ-no-loss	
+src/terminal/alt_archive_tests.rs	streaming_append_is_exact_for_uniform_and_mixed_steps	alt-archive-differ-exact	
+src/terminal/alt_archive_tests.rs	the_conhost_enter_scan_finds_1049h_and_nothing_else	has-alt-1049-enter	
+src/terminal/alt_archive_tests.rs	the_differ_state_is_taken_off_the_freeze_only_while_nothing_committed	alt-archive-carry-continues	
+src/terminal/alt_archive_tests.rs	the_first_frame_after_a_restore_archives_what_left_the_restored_screen	alt-archive-hook-commit-points	
+src/terminal/alt_archive_tests.rs	the_origin_and_indices_survive_the_carry	alt-archive-carry-continues	
+src/terminal/alt_archive_tests.rs	twenty_row_jump_without_overlap_flushes_and_records_a_gap	alt-archive-differ-exact	
+src/terminal/alt_archive_tests.rs	twenty_row_shift_with_overlap_archives_exactly_twenty	alt-archive-differ-exact	
+src/terminal/alt_archive_tests.rs	two_page_ups_then_forward_has_no_duplicates	alt-archive-differ-exact	
+src/terminal/alt_archive_tests.rs	wholesale_redraw_and_back_reanchors_without_duplicates	alt-archive-differ-exact	
+src/terminal/alt_archive_tests.rs	wipe_counts_rows_lost_and_marks_a_reset	alt-archive-lifecycle	
+src/terminal/alt_selection_park_conformance.rs	the_real_park_conforms_to_the_model_over_its_whole_reachable_space	alt-selection-park-refines-model	
+src/terminal/alt_selection_park_conformance.rs	the_swap_and_each_forgetful_destroyer_are_rejected	alt-selection-park-refines-model	
+src/terminal/bidi_reorder.rs	a_logical_selection_lights_the_cells_it_copies_on_a_reordered_row	bidi-frame-reorder	
+src/terminal/bidi_reorder.rs	a_number_inside_an_rtl_run_pins_the_maps_direction	bidi-frame-reorder	
+src/terminal/bidi_reorder.rs	a_refill_drops_the_map_of_a_row_that_no_longer_reorders	bidi-frame-reorder	
+src/terminal/bidi_reorder.rs	autortl_defaults_rtl_only_without_strong_chars	bidi-base-direction	
+src/terminal/bidi_reorder.rs	cell_frame_leaves_ascii_row_in_logical_order	bidi-frame-reorder	
+src/terminal/bidi_reorder.rs	cell_frame_reorders_rtl_row_visually	bidi-frame-reorder	
+src/terminal/bidi_reorder.rs	cells_disabled_is_identity	bidi-visual-order-cells	
+src/terminal/bidi_reorder.rs	cells_implicit_reorders_rtl_keeping_wide_pair	bidi-visual-order-cells	
+src/terminal/bidi_reorder.rs	decset_2501_turns_first_strong_autodetection_on_and_off	bidi-mode-change-reprojects-and-damages	
+src/terminal/bidi_reorder.rs	decstr_resets_autodetection	bidi-mode-change-reprojects-and-damages	
+src/terminal/bidi_reorder.rs	default_row_with_rtl_first_keeps_ltr_columns	bidi-default-paragraph-ltr	
+src/terminal/bidi_reorder.rs	disabled_is_always_identity	bidi-visual-order-cells	
+src/terminal/bidi_reorder.rs	explicit_mode_also_reorders_via_the_bridge	bidi-visual-order-cells	
+src/terminal/bidi_reorder.rs	implicit_reorders_rtl	bidi-visual-order-cells	
+src/terminal/bidi_reorder.rs	ltr_cells_are_fixed_points_under_the_default_paragraph	bidi-default-paragraph-ltr	
+src/terminal/bidi_reorder.rs	pure_ltr_is_identity_without_invoking_reorder	bidi-visual-order-cells	
+src/terminal/bidi_reorder.rs	pure_rtl_row_stays_left_anchored	bidi-default-paragraph-ltr	
+src/terminal/bidi_reorder.rs	row_display_order_is_the_renderers_permutation	bidi-pointer-and-introspection-agree-with-frame	
+src/terminal/bidi_reorder.rs	scp_direction_change_reorders_and_damages_an_existing_row	bidi-mode-change-reprojects-and-damages	
+src/terminal/bidi_reorder.rs	scp_zero_is_the_terminal_default_not_autodetect	bidi-default-paragraph-ltr	
+src/terminal/bidi_reorder.rs	terminal_cell_method_uses_default_config_and_real_cells	bidi-visual-order-cells	
+src/terminal/bidi_reorder.rs	terminal_method_uses_default_implicit_config	bidi-visual-order-cells	
+src/terminal/bidi_reorder.rs	viewport_cell_logical_follows_the_painted_order	bidi-pointer-and-introspection-agree-with-frame	
+src/terminal/blocks_api.rs	a_block_read_again_and_again_after_its_eviction_is_logged_once	block-eviction-log-thinning	
+src/terminal/blocks_api.rs	a_program_starting_block_after_block_logs_their_evictions_by_doubling	block-eviction-log-thinning	
+src/terminal/blocks_api.rs	block_output_keeps_a_space_printed_in_a_wrapped_rows_last_column	block-text-range	
+src/terminal/blocks_api.rs	block_output_trims_a_line_that_ends_in_blanks_across_a_wrap	block-text-range	
+src/terminal/blocks_api.rs	evicted_block_returns_evicted_marker_retained_block_returns_true_output	block-text-range	
+src/terminal/blocks_api.rs	last_completed_block_returns_newest_sealed_block_only	last-completed-block-is-sealed	
+src/terminal/blocks_api.rs	retained_block_before_eviction_reads_true_output	block-text-range	
+src/terminal/blocks_api.rs	text_range_joins_soft_wrapped_rows	block-text-range	
+src/terminal/buffer_api.rs	a_supplied_framing_decides_the_guards_and_nothing_else	format-paste-denotation	
+src/terminal/buffer_api.rs	bracketed_paste_blocks_c1_csi_terminator	format-paste-denotation	
+src/terminal/buffer_api.rs	bracketed_paste_blocks_embedded_escape_terminator	format-paste-denotation	
+src/terminal/buffer_api.rs	cell_grapheme_reads_real_cell	vt-sampled-handler-effects	
+src/terminal/buffer_api.rs	cursor_position_reads_real_grid_state	vt-sampled-handler-effects	
+src/terminal/buffer_api.rs	drain_bell_reflects_real_bel_byte	drain-bell-edge-flag	
+src/terminal/buffer_api.rs	mode_2031_toggles_color_scheme_getter	vt-sampled-handler-effects	
+src/terminal/buffer_api.rs	osc_133_marks_queue_real_payloads	osc-app-event-payloads	
+src/terminal/buffer_api.rs	osc_52_flood_is_held_to_the_event_byte_budget	osc-event-queue-bounded-fifo	
+src/terminal/buffer_api.rs	osc_52_set_queues_decoded_clipboard	osc-app-event-payloads	
+src/terminal/buffer_api.rs	osc_7_queues_real_cwd_path	osc-app-event-payloads	
+src/terminal/buffer_api.rs	paste_converts_line_breaks_to_cr	format-paste-denotation	
+src/terminal/buffer_api.rs	paste_insert_cells_prices_the_sanitized_single_line_body	paste-insert-cells	
+src/terminal/buffer_api.rs	paste_payload_probe_is_the_formatter_sanitizer_without_protocol_wrappers	paste-has-payload	
+src/terminal/buffer_api.rs	print_anchor_counts_the_pending_wrap_column	print-anchor	
+src/terminal/buffer_api.rs	print_anchor_glyph_is_the_run_s_last_cell	print-anchor	
+src/terminal/buffer_api.rs	ring_only_scrollback_limit_governs_retention	scrollback-line-limit	
+src/terminal/buffer_api.rs	ring_watermark_and_truncation_counter_are_out_of_band	scrollback-pressure-level	
+src/terminal/buffer_api.rs	scrollback_limit_targets_primary_content_never_the_alt_buffer	scrollback-line-limit	
+src/terminal/buffer_api.rs	unbracketed_paste_strips_c0_signal_bytes	format-paste-denotation	
+src/terminal/buffer_api.rs	unbracketed_paste_strips_escape_and_c1	format-paste-denotation	
+src/terminal/callback_setters.rs	offloaded_resize_alt_screen_preserves_saved_primary	offloaded-resize-equivalence	
+src/terminal/callback_setters.rs	offloaded_resize_primary_preserves_scrollback	offloaded-resize-equivalence	
+src/terminal/callback_setters.rs	trickle_skips_a_flood_that_outruns_it_on_the_backlog_the_worker_drains	trickle-lazy-bounded	
+src/terminal/checkpoint.rs	a_carried_synchronized_update_window_still_times_out	checkpoint-carry-continues	
+src/terminal/checkpoint.rs	a_carried_title_is_sanitized_and_capped	checkpoint-restore-sanitizes	
+src/terminal/checkpoint.rs	a_hooked_dcs_query_is_carried_by_abandoning_it	checkpoint-partial-sequence-carry	
+src/terminal/checkpoint.rs	a_hooked_dcs_rides_the_carry_unless_it_is_a_query	checkpoint-carry-continues	
+src/terminal/checkpoint.rs	a_rekey_is_in_use_only_from_the_first_mark_signed_with_it	shell-integration-authorization-model	
+src/terminal/checkpoint.rs	a_resize_moves_the_decsc_slot_with_its_text_and_the_wire_carries_it	saved-cursor-follows-content	
+src/terminal/checkpoint.rs	a_restored_output_state_goes_through_the_engines_own_doors	checkpoint-restore-sanitizes	
+src/terminal/checkpoint.rs	a_signed_integration_rev_is_recorded_and_carried	checkpoint-shell-integration-carry	
+src/terminal/checkpoint.rs	a_string_with_a_0x9c_inside_a_character_is_swallowed_live_and_carried	checkpoint-carry-continues	
+src/terminal/checkpoint.rs	a_typed_rekey_is_taken_back_until_the_shell_reads_it	shell-integration-authorization-model	
+src/terminal/checkpoint.rs	an_unterminated_osc_is_carried_whole	checkpoint-carry-continues	
+src/terminal/checkpoint.rs	carry_keeps_title_icon_and_stack	checkpoint-shell-integration-carry	
+src/terminal/checkpoint.rs	checkpoint_alt_screen_toggle_on_hydrated	checkpoint-carry-continues	
+src/terminal/checkpoint.rs	checkpoint_no_alt_grid_when_absent	checkpoint-roundtrip	
+src/terminal/checkpoint.rs	checkpoint_post_hydration_styled_write_matches	checkpoint-carry-continues	
+src/terminal/checkpoint.rs	checkpoint_roundtrip_full_projection	checkpoint-roundtrip	
+src/terminal/checkpoint.rs	checkpoint_roundtrips_decslrm_horizontal_margins	checkpoint-roundtrip	
+src/terminal/checkpoint.rs	checkpoint_roundtrips_on_main_with_retained_alt_buffer	checkpoint-roundtrip	
+src/terminal/checkpoint.rs	decsc_saved_cursor_survives_handoff_and_decrc_continuation	checkpoint-carry-continues	
+src/terminal/checkpoint.rs	every_partial_parser_state_is_carried_and_named	checkpoint-partial-sequence-carry	
+src/terminal/checkpoint.rs	in_place_restore_advances_content_scroll_epoch_once	restore-advances-scroll-epoch-once	
+src/terminal/checkpoint.rs	only_the_carry_projection_takes_the_shell_integration_nonce	checkpoint-shell-integration-carry	
+src/terminal/checkpoint.rs	output_state_in_flight_names_an_open_link_and_a_pending_vt52_address	checkpoint-carry-continues	
+src/terminal/checkpoint.rs	restored_alt_screen_accrues_no_scrollback_when_scrolled	checkpoint-carry-continues	
+src/terminal/checkpoint.rs	shell_integration_nonce_hex_round_trips_and_refuses_malformed	shell-integration-nonce-hex	
+src/terminal/checkpoint.rs	the_abandoning_carry_carries_the_shell_integration_nonce	checkpoint-shell-integration-carry	
+src/terminal/checkpoint.rs	the_abandoning_carry_of_a_ground_parser_is_the_ordinary_carry	checkpoint-partial-sequence-carry	
+src/terminal/checkpoint.rs	the_carry_meta_is_the_visible_carrys_meta_and_projects_no_grid	checkpoint-partial-sequence-carry	
+src/terminal/checkpoint.rs	the_pre_projection_reads_agree_with_the_projection	checkpoint-partial-sequence-carry	
+src/terminal/checkpoint.rs	visible_checkpoint_carries_a_partial_parser_sequence	checkpoint-carry-continues	
+src/terminal/checkpoint.rs	visible_checkpoint_is_live_frame_not_scrolled_viewport_and_continues	checkpoint-visible-projection	
+src/terminal/checkpoint.rs	visible_checkpoint_restores_screen_without_carrying_history	checkpoint-visible-projection	
+src/terminal/checkpoint_parser.rs	a_carry_crosses_the_wire_form_intact	parser-repr-wire-roundtrip	
+src/terminal/checkpoint_parser.rs	a_dcs_header_rides_beside_the_form_an_older_build_reads	parser-repr-wire-roundtrip	
+src/terminal/checkpoint_parser.rs	a_wire_form_that_does_not_read_is_none	parser-repr-wire-roundtrip	
+src/terminal/clipboard_auth.rs	authorize_query_grants_only_query	clipboard-capability-mint	
+src/terminal/clipboard_auth.rs	authorize_write_grants_only_write	clipboard-capability-mint	
+src/terminal/clipboard_auth.rs	default_has_no_capabilities	clipboard-capability-mint	
+src/terminal/clipboard_auth.rs	explicit_osc52_query_rule_still_allows_revoked_query_access	clipboard-capability-mint	
+src/terminal/clipboard_auth.rs	explicit_osc52_set_rule_still_allows_revoked_write_access	clipboard-capability-mint	
+src/terminal/clipboard_auth.rs	invoke_clear_takes_write_capability	(§4: delete)	
+src/terminal/clipboard_auth.rs	invoke_query_returns_host_content	clipboard-invoke-forwarding	
+src/terminal/clipboard_auth.rs	invoke_query_returns_none_when_host_denies	clipboard-invoke-forwarding	
+src/terminal/clipboard_auth.rs	invoke_set_delivers_content_via_callback	clipboard-invoke-forwarding	
+src/terminal/clipboard_auth.rs	invoke_set_no_callback_is_noop	(§4: delete)	
+src/terminal/clipboard_auth.rs	revoke_disables_future_mint	clipboard-capability-mint	
+src/terminal/clipboard_auth.rs	standard_profile_wildcard_execute_does_not_overgrant_revoked_clipboard_access	clipboard-capability-mint	
+src/terminal/clipboard_auth.rs	write_and_query_are_independent	clipboard-capability-mint	
+src/terminal/color_resolve.rs	dim_never_increases_contrast_grayscale_exhaustive	dim-contrast-law	
+src/terminal/color_resolve.rs	dim_reduces_contrast_both_polarities_rgb_lattice	dim-contrast-law	
+src/terminal/color_resolve.rs	dim_transfer_tables_are_byte_exact	srgb-transfer-tables-exact	
+src/terminal/color_resolve.rs	old_gamma_multiply_violates_the_law	dim-contrast-law	
+src/terminal/color_resolve.rs	test_all_flags_precedence	resolve-colors-denotation	
+src/terminal/color_resolve.rs	test_bold_dim_dim_wins	resolve-colors-denotation	
+src/terminal/color_resolve.rs	test_bold_is_bright_off_keeps_base_color	resolve-colors-denotation	
+src/terminal/color_resolve.rs	test_bold_no_change_already_bright	resolve-colors-denotation	
+src/terminal/color_resolve.rs	test_bold_no_change_true_rgb	resolve-colors-denotation	
+src/terminal/color_resolve.rs	test_bold_promotes_ansi_to_bright	resolve-colors-denotation	
+src/terminal/color_resolve.rs	test_custom_default_colors	resolve-colors-denotation	
+src/terminal/color_resolve.rs	test_decscnm_plus_inverse_cancel	resolve-colors-denotation	
+src/terminal/color_resolve.rs	test_decscnm_reverses	resolve-colors-denotation	
+src/terminal/color_resolve.rs	test_dim_ansi_color	resolve-colors-denotation	
+src/terminal/color_resolve.rs	test_dim_recedes_on_light_theme	dim-contrast-law	
+src/terminal/color_resolve.rs	test_dim_true_rgb	resolve-colors-denotation	
+src/terminal/color_resolve.rs	test_extended_palette_color	resolve-colors-denotation	
+src/terminal/color_resolve.rs	test_hidden_fg_equals_bg	resolve-colors-denotation	
+src/terminal/color_resolve.rs	test_hidden_plus_inverse	resolve-colors-denotation	
+src/terminal/color_resolve.rs	test_inverse_swaps_colors	resolve-colors-denotation	
+src/terminal/color_resolve.rs	test_no_flags_returns_default_colors	resolve-colors-denotation	
+src/terminal/colors_api.rs	configured_colors_survive_dynamic_color_set_and_reset	color-state-model	
+src/terminal/colors_api.rs	mutable_palette_view_updates_only_changed_reset_slots	color-state-model	
+src/terminal/colors_api.rs	public_color_mutators_mark_full_damage_without_a_glyph_write	host-color-mutators-damage	
+src/terminal/colors_api.rs	public_default_setters_seed_osc_reset_baselines	color-state-model	
+src/terminal/colors_api.rs	public_palette_reset_durably_restores_built_in_baseline	color-state-model	
+src/terminal/colors_api.rs	public_palette_setter_seeds_osc_and_ris_reset_baseline	color-state-model	
+src/terminal/config_api.rs	a_config_reload_leaves_an_app_negotiated_bracketed_paste_alone	config-negotiated-modes-seed	
+src/terminal/config_api.rs	a_config_reload_leaves_app_negotiated_wrap_and_focus_reporting_alone	config-negotiated-modes-seed	
+src/terminal/config_api.rs	a_real_host_change_to_a_negotiated_mode_still_reaches_the_terminal	config-negotiated-modes-seed	
+src/terminal/config_api.rs	a_reset_returns_a_negotiated_mode_to_the_power_on_value_not_the_config_seed	config-negotiated-modes-seed	
+src/terminal/config_api.rs	ambiguous_width_reload_changes_new_text_without_reflowing_existing_cells	config-reload-damage-and-idempotence	
+src/terminal/config_api.rs	bidi_config_reload_marks_existing_rows_for_repaint	bidi-mode-change-reprojects-and-damages	
+src/terminal/config_api.rs	bidi_reload_damages_static_cells_exactly_when_changed	bidi-mode-change-reprojects-and-damages	
+src/terminal/config_api.rs	bidi_reload_reprojects_already_received_rtl_text	bidi-mode-change-reprojects-and-damages	
+src/terminal/config_api.rs	config_reload_during_reflow_survives_terminal_reset	config-reload-during-detached-reflow	
+src/terminal/config_api.rs	config_reload_during_reflow_targets_saved_primary_under_alt_screen	config-reload-during-detached-reflow	
+src/terminal/config_api.rs	cursor_color_only_reload_marks_visual_damage	config-reload-damage-and-idempotence	
+src/terminal/config_api.rs	style_policy_reload_damages_static_cells_exactly_when_changed	config-reload-damage-and-idempotence	
+src/terminal/config_api.rs	style_policy_reload_repaints_preexisting_cells	resolve-colors-denotation	
+src/terminal/config_api.rs	the_mode_seed_holds_exactly_what_a_default_host_config_carries	config-negotiated-modes-seed	
+src/terminal/conpty_dead_alt_screen_replay_tests.rs	a_console_client_leaving_the_dead_buffer_puts_the_next_pager_back_in_step	conhost-orphan-recovery	
+src/terminal/conpty_dead_alt_screen_replay_tests.rs	the_next_pager_after_a_kill_shows_the_consoles_frozen_screen_and_loses_no_row	conhost-orphan-recovery	
+src/terminal/conpty_dead_alt_screen_replay_tests.rs	the_same_reads_without_conhosts_mode_request_lose_the_rows_typed_after_the_kill	conhost-orphan-recovery	
+src/terminal/content.rs	display_cell_grapheme_keeps_history_extras_paired	viewport-projection	
+src/terminal/content.rs	display_cell_grapheme_reads_the_displayed_row	viewport-projection	
+src/terminal/content.rs	display_row_text_straddling_keeps_combining_marks_paired	viewport-projection	
+src/terminal/content.rs	display_row_text_straddling_viewport_reads_each_displayed_row	viewport-projection	
+src/terminal/content.rs	plain_overwrite_removes_stale_combining_mark_entry	cell-extras-coherence	
+src/terminal/content.rs	plain_overwrite_removes_stale_hyperlink_extras_entries	cell-extras-coherence	
+src/terminal/content.rs	styled_overwrite_does_not_resurrect_stale_hyperlink	cell-extras-coherence	
+src/terminal/csi_dispatch_table.rs	test_all_entries_resolve	csi-dispatch-table	
+src/terminal/csi_dispatch_table.rs	test_entry_count	csi-dispatch-table	
+src/terminal/csi_dispatch_table.rs	test_no_collisions	(§4: delete)	
+src/terminal/csi_dispatch_table.rs	test_unknown_returns_none	csi-dispatch-table	
+src/terminal/custody.rs	the_record_is_as_small_as_its_justification_claims	(§4: delete (replace with a const assert))	
+src/terminal/foreground_handback_tests.rs	foreground_handback_a_one_shot_that_armed_bracketed_paste_is_handed_back	foreground-handback-gate-and-post	
+src/terminal/foreground_handback_tests.rs	foreground_handback_asserted_evidence_reports_every_setter_even_a_re_arm	evidence-assertion-table	
+src/terminal/foreground_handback_tests.rs	foreground_handback_clears_margins_and_keeps_the_cursor	foreground-handback-gate-and-post	
+src/terminal/foreground_handback_tests.rs	foreground_handback_hidden_cursor_takes_the_non_evidence_modes_with_it	foreground-handback-gate-and-post	
+src/terminal/foreground_handback_tests.rs	foreground_handback_incident_is_handed_back_once_in_both_kitty_orders	foreground-handback-gate-and-post	
+src/terminal/foreground_handback_tests.rs	foreground_handback_leaves_vt52_before_any_csi	foreground-handback-gate-and-post	
+src/terminal/foreground_handback_tests.rs	foreground_handback_main_screen_kitty_flags_under_the_alt_screen_are_evidence	foreground-handback-gate-and-post	
+src/terminal/foreground_handback_tests.rs	foreground_handback_non_evidence_modes_are_left_alone	foreground-handback-gate-and-post	
+src/terminal/foreground_handback_tests.rs	foreground_handback_replays_to_the_live_state	handback-replay-and-idempotence	
+src/terminal/foreground_handback_tests.rs	foreground_handback_restores_alternate_scroll_to_the_host_value	foreground-handback-gate-and-post	
+src/terminal/foreground_handback_tests.rs	foreground_handback_scoped_without_modes_only_cancels_a_torn_sequence	foreground-handback-gate-and-post	
+src/terminal/foreground_handback_tests.rs	foreground_handback_single_evidence_modes_each_open_the_gate	foreground-handback-gate-and-post	
+src/terminal/foreground_handback_tests.rs	foreground_handback_targets_the_host_configured_values	foreground-handback-gate-and-post	
+src/terminal/foreground_handback_tests.rs	foreground_handback_torn_sequence_alone_gets_only_can	foreground-handback-gate-and-post	
+src/terminal/foreground_handback_tests.rs	manual_handback_hands_the_stuck_prompt_back_without_clearing_anything	manual-handback-post	
+src/terminal/foreground_handback_tests.rs	manual_handback_is_idempotent_and_replays_to_the_live_state	handback-replay-and-idempotence	
+src/terminal/foreground_handback_tests.rs	manual_handback_reaches_what_the_evidence_gate_cannot	manual-handback-post	
+src/terminal/handler.rs	invalidation_drops_only_coordinate_bearing_shell_events	absolute-row-update-remap	
+src/terminal/handler.rs	splice_preserves_exclusive_end_boundaries_and_remaps_all_anchor_families	absolute-row-update-remap	
+src/terminal/handler_actions.rs	a_redraw_in_place_replaces_the_placement_it_covers	kitty-layer-order	
+src/terminal/handler_actions.rs	a_running_animation_steps_its_frames_on_their_gaps	kitty-animation-scheduler	
+src/terminal/handler_actions.rs	a_selected_frame_shows_in_every_placement_and_repaints_placeholders	kitty-frames	
+src/terminal/handler_actions.rs	a_whole_image_declaring_a_side_over_kittys_limit_is_refused	kitty-loadable-size	
+src/terminal/handler_actions.rs	a_zero_state_changes_nothing	kitty-animation-scheduler	
+src/terminal/handler_actions.rs	an_animation_drawn_nowhere_through_a_virtual_parent_does_not_play	kitty-animation-scheduler	
+src/terminal/handler_actions.rs	an_animation_plays_through_while_its_drawn_frames_are_held	kitty-animation-scheduler	
+src/terminal/handler_actions.rs	animation_frame_keys_place_the_data_and_keep_the_root_layout	kitty-frames	
+src/terminal/handler_actions.rs	animation_frame_transmit_and_select_switches_displayed_frame	kitty-frames	
+src/terminal/handler_actions.rs	apc_put_bulk_crosses_caps_parity	apc-put-bulk-refines-per-byte	
+src/terminal/handler_actions.rs	armed_alloc_fault_aborts_chunked_transfer_fail_closed	alloc-fault-fail-closed	
+src/terminal/handler_actions.rs	bare_delete_keeps_store_but_uppercase_all_frees_it	kitty-store-lifecycle	
+src/terminal/handler_actions.rs	chunked_transmit_display_assembles_and_places	kitty-store-lifecycle	
+src/terminal/handler_actions.rs	compose_copies_a_rectangle_between_frames	kitty-frames	
+src/terminal/handler_actions.rs	compressed_o_z_payload_is_inflated_and_placed	kitty-payload-source	
+src/terminal/handler_actions.rs	dcs_put_bulk_crosses_caps_parity	dcs-put-bulk-refines-per-byte	
+src/terminal/handler_actions.rs	dcs_put_bulk_sixel_parity	dcs-put-bulk-refines-per-byte	
+src/terminal/handler_actions.rs	delete_by_id_removes_only_that_image	kitty-store-lifecycle	
+src/terminal/handler_actions.rs	deletes_are_never_answered	kitty-reply-protocol	
+src/terminal/handler_actions.rs	deletes_reach_virtual_placements_by_id_only	kitty-store-lifecycle	
+src/terminal/handler_actions.rs	file_medium_places_image_via_host_resolver	kitty-payload-source	
+src/terminal/handler_actions.rs	floating_placements_are_capped_and_a_frame_keeps_each_cells_top_layers	kitty-layer-order	
+src/terminal/handler_actions.rs	frame_and_animation_errors_name_the_commands_frame	kitty-reply-protocol	
+src/terminal/handler_actions.rs	frame_delete_removes_the_numbered_frame_as_kitty_does	kitty-frames	
+src/terminal/handler_actions.rs	frames_are_composed_on_a_canvas	kitty-frames	
+src/terminal/handler_actions.rs	has_run_of_4_detects_exact_boundary	has-run-of-4	
+src/terminal/handler_actions.rs	huge_lengths_with_an_in_cell_offset_fill_the_grid	kitty-placement-layout	
+src/terminal/handler_actions.rs	images_of_one_z_stack_in_the_order_they_were_first_sent	kitty-layer-order	
+src/terminal/handler_actions.rs	kitty_cursor_lands_after_the_image_and_c1_keeps_it	kitty-placement-layout	
+src/terminal/handler_actions.rs	kitty_frames_replaced_behind_a_parked_screen_stay_within_the_live_budget	live-image-budget	
+src/terminal/handler_actions.rs	kitty_images_freed_behind_a_parked_screen_stay_within_the_live_budget	live-image-budget	
+src/terminal/handler_actions.rs	kitty_store_global_budget_rejects_overflow	kitty-store-budget	
+src/terminal/handler_actions.rs	kitty_total_bytes_accounting_is_precise	kitty-store-budget	
+src/terminal/handler_actions.rs	long_data_with_runs_still_renders_identically	process-chunk-invariance	
+src/terminal/handler_actions.rs	long_run_free_prose_renders_identically	process-chunk-invariance	
+src/terminal/handler_actions.rs	loop_counts_and_loading_rest_on_the_last_frame	kitty-animation-scheduler	
+src/terminal/handler_actions.rs	malformed_o_z_payload_is_rejected_not_panic	kitty-payload-source	
+src/terminal/handler_actions.rs	malformed_raw_buffer_is_rejected	kitty-payload-source	
+src/terminal/handler_actions.rs	non_direct_mediums_skip_cleanly_never_garbage	kitty-payload-source	
+src/terminal/handler_actions.rs	number_transmit_assigns_an_id_and_answers_with_both	kitty-reply-protocol	
+src/terminal/handler_actions.rs	one_cell_dimension_keeps_the_aspect	kitty-placement-layout	
+src/terminal/handler_actions.rs	overlapping_placements_stack_by_z_then_image_then_placement_order	kitty-layer-order	
+src/terminal/handler_actions.rs	placements_relative_to_a_virtual_placement_follow_its_placeholders	kitty-relative-placements	
+src/terminal/handler_actions.rs	png_frames_are_decoded_to_compose	kitty-frames	
+src/terminal/handler_actions.rs	put_lays_the_image_out_by_its_own_keys	kitty-placement-layout	
+src/terminal/handler_actions.rs	put_offsets_start_the_image_inside_its_first_cell	kitty-placement-layout	
+src/terminal/handler_actions.rs	put_variants_are_budgeted_recycled_and_capped	kitty-store-budget	
+src/terminal/handler_actions.rs	query_answers_per_medium_availability	kitty-reply-protocol	
+src/terminal/handler_actions.rs	query_reports_ok	kitty-reply-protocol	
+src/terminal/handler_actions.rs	relative_chains_are_bounded	kitty-relative-placements	
+src/terminal/handler_actions.rs	relative_placements_follow_their_parent	kitty-relative-placements	
+src/terminal/handler_actions.rs	retransmitting_an_id_removes_its_old_placements	kitty-store-lifecycle	
+src/terminal/handler_actions.rs	ris_clears_in_flight_kitty_chunk_accumulator	kitty-store-budget	
+src/terminal/handler_actions.rs	ris_clears_kitty_store_and_budget	kitty-store-budget	
+src/terminal/handler_actions.rs	shared_memory_medium_routes_through_resolver	kitty-payload-source	
+src/terminal/handler_actions.rs	store_then_put_displays_only_after_put	kitty-store-lifecycle	
+src/terminal/handler_actions.rs	transmit_and_display_places_inline_image	kitty-store-lifecycle	
+src/terminal/handler_actions.rs	transmit_over_a_disabled_medium_answers_as_the_probe_does	kitty-reply-protocol	
+src/terminal/handler_actions.rs	un_sized_transmit_is_pixel_exact_but_an_explicit_cell_box_is_fitted	kitty-placement-layout	
+src/terminal/handler_actions.rs	unicode_placeholder_places_stored_image_via_fg_id_and_diacritics	kitty-placeholder-resolution	
+src/terminal/handler_actions.rs	unicode_placeholder_unknown_id_places_nothing	kitty-placeholder-resolution	
+src/terminal/handler_actions.rs	unstored_kitty_images_stay_within_the_live_budget	live-image-budget	
+src/terminal/handler_actions.rs	virtual_placement_stamps_nothing_and_keeps_the_cursor	kitty-placement-layout	
+src/terminal/handler_actions.rs	virtual_placements_carry_their_own_id_and_layout	kitty-placeholder-resolution	
+src/terminal/handler_csi.rs	decslrm_default_params_reset_full_and_home	decslrm-validity	
+src/terminal/handler_csi.rs	decslrm_invalid_left_ge_right_is_noop	decslrm-validity	
+src/terminal/handler_csi.rs	test_z4_table_all_intermediate_sequences_resolve	csi-dispatch-table	
+src/terminal/handler_csi.rs	test_z4_table_all_standard_sequences_resolve	csi-dispatch-table	
+src/terminal/handler_csi.rs	test_z4_table_total_handler_count	(§4: delete)	
+src/terminal/handler_csi.rs	test_z4_table_unrecognized_returns_none	csi-dispatch-table	
+src/terminal/handler_csi.rs	untabled_fallback_sequences_are_absent_from_the_z4_table	csi-dispatch-table	
+src/terminal/handler_dcs.rs	a_handback_does_not_answer_a_torn_query	foreground-handback-gate-and-post	
+src/terminal/handler_dec.rs	a_conhost_repaint_after_the_recovery_cannot_reach_the_history	conhost-orphan-recovery	
+src/terminal/handler_dec.rs	a_cursor_only_change_damages_the_cursor_cell_not_the_whole_grid	damage-scope	
+src/terminal/handler_dec.rs	a_dead_apps_scroll_region_and_input_modes_do_not_outlive_it	host-leave-orphaned-alt	
+src/terminal/handler_dec.rs	a_live_enter_or_a_reset_ends_the_state	conhost-orphan-recovery	
+src/terminal/handler_dec.rs	a_partial_scroll_region_is_left_alone	conhost-orphan-recovery	
+src/terminal/handler_dec.rs	a_programs_9001_does_not_fake_a_console_host_for_the_recovery	conhost-orphan-recovery	
+src/terminal/handler_dec.rs	a_second_pager_under_conhost_keeps_what_was_typed_after_the_recovery	conhost-orphan-recovery	
+src/terminal/handler_dec.rs	a_stray_1049l_under_conhost_keeps_the_rows_from_the_primary_repaint	conhost-orphan-recovery	
+src/terminal/handler_dec.rs	a_whole_screen_change_still_marks_the_whole_grid	damage-scope	
+src/terminal/handler_dec.rs	decrqm_reports_keyboard_mode_states	decrqm-mode-agreement	
+src/terminal/handler_dec.rs	decrqm_reports_mode_2048_state	decrqm-mode-agreement	
+src/terminal/handler_dec.rs	decrqm_reports_mode_67_state	decrqm-mode-agreement	
+src/terminal/handler_dec.rs	decrqm_reports_mode_9001_state	decrqm-mode-agreement	
+src/terminal/handler_dec.rs	decscusr_moves_mode_12_with_the_style	cursor-blink-mode-12	
+src/terminal/handler_dec.rs	host_leave_is_one_shot_and_a_later_app_can_enter_again	host-leave-orphaned-alt	
+src/terminal/handler_dec.rs	host_leave_of_a_1049_screen_entered_after_a_47_one_restores_its_save	host-leave-orphaned-alt	
+src/terminal/handler_dec.rs	host_leave_of_a_mode_47_screen_keeps_the_cursor_where_the_app_had_it	host-leave-orphaned-alt	
+src/terminal/handler_dec.rs	host_leave_on_the_main_screen_is_a_refused_no_op	host-leave-orphaned-alt	
+src/terminal/handler_dec.rs	host_leave_restores_the_main_grid_and_its_scrollback	host-leave-orphaned-alt	
+src/terminal/handler_dec.rs	leaving_the_alternate_screen_marks_the_restored_grid_fully_damaged	damage-scope	
+src/terminal/handler_dec.rs	mode_1035_special_modifiers_toggles_flag	keyboard-mode-projection	
+src/terminal/handler_dec.rs	mode_1036_meta_send_escape_toggles_flag	keyboard-mode-projection	
+src/terminal/handler_dec.rs	mode_1036_set_adds_meta_escape_prefix_in_encoding	key-encoding-composition	
+src/terminal/handler_dec.rs	mode_1039_reset_drops_alt_escape_prefix_in_encoding	key-encoding-composition	
+src/terminal/handler_dec.rs	mode_1039_reset_sets_alt_no_esc_flag	keyboard-mode-projection	
+src/terminal/handler_dec.rs	mode_1045_tracked_but_does_not_affect_encoding	keyboard-mode-projection	
+src/terminal/handler_dec.rs	mode_12_moves_the_cursor_the_user_sees_and_reports_it	cursor-blink-mode-12	
+src/terminal/handler_dec.rs	mode_2027_is_permanently_reset	decrqm-mode-agreement	
+src/terminal/handler_dec.rs	mode_2048_emits_on_enable_with_default_cell_px	in-band-size-report	
+src/terminal/handler_dec.rs	mode_2048_emits_on_resize_and_honors_cell_px	in-band-size-report	
+src/terminal/handler_dec.rs	mode_2048_repeated_enable_emits_once	in-band-size-report	
+src/terminal/handler_dec.rs	mode_2048_toggle_flood_is_capped	response-buffer-bounded	
+src/terminal/handler_dec.rs	mode_67_toggles_backarrow_and_keyboard_mode	keyboard-mode-projection	
+src/terminal/handler_dec.rs	mode_9001_is_consumed_not_echoed_to_the_grid	win32-input-mode-lifecycle	
+src/terminal/handler_dec.rs	mode_9001_is_off_by_default_and_toggles_the_win32_input_bit	keyboard-mode-projection	
+src/terminal/handler_dec.rs	mode_9001_survives_decstr	win32-input-mode-lifecycle	
+src/terminal/handler_dec.rs	no_report_when_2048_disabled	in-band-size-report	
+src/terminal/handler_dec.rs	ris_clears_mode_9001	win32-input-mode-lifecycle	
+src/terminal/handler_dec.rs	the_host_forced_leave_under_conhost_keeps_the_rows_too	conhost-orphan-recovery	
+src/terminal/handler_dec.rs	the_host_leave_releases_the_dead_apps_modes_too	host-leave-orphaned-alt	
+src/terminal/handler_dec.rs	under_conhost_the_prompt_lands_on_conhosts_row_and_absolute_moves_agree	conhost-orphan-recovery	
+src/terminal/handler_dec.rs	without_conhost_the_prompt_returns_to_the_row_1049_saved	conhost-orphan-recovery	
+src/terminal/handler_dec.rs	without_conhost_the_same_bytes_move_nothing	conhost-orphan-recovery	
+src/terminal/handler_dec.rs	xtsave_and_xtrestore_carry_mode_9001	xtsave-restore-roundtrip	
+src/terminal/handler_dec.rs	xtsave_covers_every_mode_decrqm_reports	xtsave-restore-roundtrip	
+src/terminal/handler_osc.rs	authorize_hyperlink_scheme_refuses_javascript_data_file	hyperlink-auth	
+src/terminal/handler_osc.rs	authorize_hyperlink_scheme_refuses_malformed_scheme_shapes	hyperlink-auth	
+src/terminal/handler_osc.rs	osc52_query_answers_every_clipboard_it_admits	osc52-clipboard-gate	
+src/terminal/handler_osc.rs	osc52_query_still_refuses_a_clipboard_over_the_cap	osc52-clipboard-gate	
+src/terminal/handler_osc.rs	osc_0_invalid_utf8_title_is_lossy_decoded	osc-title-and-epoch	
+src/terminal/handler_osc.rs	osc_0_title_strips_all_nine_bidi_overrides	osc-title-and-epoch	
+src/terminal/handler_osc.rs	osc_1_icon_strips_bidi_override	osc-title-and-epoch	
+src/terminal/handler_osc.rs	osc_52_set_pre_decode_bound_passes_exact_cap_payload	osc52-clipboard-gate	
+src/terminal/handler_osc.rs	osc_52_set_pre_decode_bound_rejects_oversized_without_decoding	osc52-clipboard-gate	
+src/terminal/handler_osc.rs	osc_52_standard_policy_wildcard_does_not_overgrant_revoked_query	osc52-clipboard-gate	
+src/terminal/handler_osc.rs	osc_52_standard_policy_wildcard_does_not_overgrant_revoked_set	osc52-clipboard-gate	
+src/terminal/handler_osc.rs	osc_633_e_oversized_commandline_rejected	osc633-commandline-cap	
+src/terminal/handler_osc.rs	osc_633_p_oversized_cwd_rejected	cwd-store	
+src/terminal/handler_osc.rs	osc_7_cwd_with_a_nul_byte_is_ignored	cwd-store	
+src/terminal/handler_osc.rs	osc_7_oversized_cwd_path_not_queued	cwd-store	
+src/terminal/handler_osc.rs	osc_8_custom_scheme_accepted_after_authorize_hyperlink_scheme	osc8-uri-acceptance	
+src/terminal/handler_osc.rs	osc_8_custom_scheme_rejected_without_host_mint	osc8-uri-acceptance	
+src/terminal/handler_osc.rs	osc_8_extra_scheme_still_capped_by_max_url_bytes	osc8-uri-acceptance	
+src/terminal/handler_osc.rs	osc_8_extra_scheme_still_rejects_bidi_and_control_chars	osc8-uri-acceptance	
+src/terminal/handler_osc.rs	osc_8_refused_uri_ends_the_open_link	osc8-uri-acceptance	
+src/terminal/handler_osc.rs	osc_8_refuses_oversized_and_control_char_uris	osc8-uri-acceptance	
+src/terminal/handler_osc.rs	osc_8_url_with_each_of_nine_bidi_overrides_rejected	osc8-uri-acceptance	
+src/terminal/handler_osc.rs	reset_clears_extra_schemes_is_a_host_choice	hyperlink-auth	
+src/terminal/handler_osc.rs	revoke_hyperlink_scheme_restores_default_allowlist	osc8-uri-acceptance	
+src/terminal/handler_osc.rs	sanitize_title_passes_legitimate_text_through	sanitize-title	
+src/terminal/handler_osc.rs	sanitize_title_strips_all_nine_bidi_overrides_concatenated	sanitize-title	
+src/terminal/handler_osc.rs	sanitize_title_strips_c0_controls	sanitize-title	
+src/terminal/handler_osc.rs	sanitize_title_strips_c1_controls	sanitize-title	
+src/terminal/handler_osc.rs	the_cwd_store_ignores_a_path_with_a_nul_byte	cwd-store	
+src/terminal/handler_osc.rs	title_epoch_bumps_on_real_change_not_on_noop	osc-title-and-epoch	
+src/terminal/handler_osc.rs	title_epoch_bumps_on_real_cwd_change_not_on_reprompt	osc-title-and-epoch	
+src/terminal/handler_osc_1337_tests.rs	a_footprint_is_no_taller_than_the_screen_or_the_decodable_height	iterm2-inline-image	
+src/terminal/handler_osc_1337_tests.rs	a_screen_of_sixels_keeps_its_images_within_the_live_budget	live-image-budget	
+src/terminal/handler_osc_1337_tests.rs	cursor_advances_below_the_image	iterm2-inline-image	
+src/terminal/handler_osc_1337_tests.rs	decgra_only_sixel_over_image_cap_is_rejected	live-image-budget	
+src/terminal/handler_osc_1337_tests.rs	does_not_panic_on_truncated_sequences	terminal-wf-invariant	
+src/terminal/handler_osc_1337_tests.rs	each_screen_keeps_its_images_within_the_live_budget	live-image-budget	
+src/terminal/handler_osc_1337_tests.rs	file_with_cell_dimensions_covers_exact_footprint	iterm2-inline-image	
+src/terminal/handler_osc_1337_tests.rs	footprint_clamps_to_grid_width	iterm2-inline-image	
+src/terminal/handler_osc_1337_tests.rs	large_inline_image_payload_decodes_intact	iterm2-inline-image	
+src/terminal/handler_osc_1337_tests.rs	malformed_or_non_inline_draws_nothing	iterm2-inline-image	
+src/terminal/handler_osc_1337_tests.rs	preserve_aspect_ratio_zero_carries_stretch_and_the_default_fits	iterm2-inline-image	
+src/terminal/handler_osc_1337_tests.rs	semicolon_after_payload_start_is_rejected	iterm2-inline-image	
+src/terminal/handler_osc_1337_tests.rs	single_arg_body_places_via_borrowed_payload	iterm2-inline-image	
+src/terminal/handler_osc_1337_tests.rs	tall_image_above_scroll_region_keeps_leading_rows	iterm2-inline-image	
+src/terminal/handler_osc_1337_tests.rs	tall_image_final_state_matches_text_flow	iterm2-inline-image	
+src/terminal/handler_osc_1337_tests.rs	tile_coordinates_increase_across_the_footprint	iterm2-inline-image	
+src/terminal/handler_osc_1337_tests.rs	unknown_format_still_places_cells_but_renders_nothing	iterm2-inline-image	
+src/terminal/handler_osc_1337_tests.rs	whitespace_in_payload_is_tolerated	iterm2-inline-image	
+src/terminal/handler_osc_color.rs	color_stack_pop_reports_dynamic_cursor_as_dynamic	color-state-model	
+src/terminal/handler_osc_color.rs	color_stack_round_trip_restores_both_selection_colors	color-state-model	
+src/terminal/handler_osc_color.rs	cursor_state_escapes_damage_the_cursor_cell_not_the_whole_grid	damage-scope	
+src/terminal/handler_osc_color.rs	osc_19_selection_foreground_set_query_and_reset_are_stateful	color-state-model	
+src/terminal/handler_osc_color.rs	osc_21_bare_numeric_key_resets_without_set_permission	color-state-model	
+src/terminal/handler_osc_color.rs	osc_21_dynamic_cursor_query_honors_host_override	color-state-model	
+src/terminal/handler_osc_color.rs	osc_21_empty_values_are_dynamic_and_bare_keys_reset	color-state-model	
+src/terminal/handler_osc_color.rs	osc_21_queries_report_undefined_and_unknown_fields	color-state-model	
+src/terminal/handler_osc_color.rs	osc_21_query_pairs_capped_at_per_sequence_limit	palette-query-cap	
+src/terminal/handler_osc_color.rs	osc_21_selection_foreground_set_and_query_share_osc_19_state	color-state-model	
+src/terminal/handler_osc_color.rs	osc_21_unknown_key_is_echoed_only_when_well_formed	osc21-key-echoable	
+src/terminal/handler_osc_color.rs	osc_4_query_256_pairs_capped_at_per_sequence_limit	palette-query-cap	
+src/terminal/handler_osc_color.rs	osc_4_query_8_pairs_all_emit_below_cap	palette-query-cap	
+src/terminal/handler_osc_color.rs	osc_4_query_single_pair_emits_one_frame	palette-query-cap	
+src/terminal/handler_osc_color.rs	osc_4_set_operations_unaffected_by_query_cap	palette-query-cap	
+src/terminal/handler_osc_color.rs	osc_recolor_with_no_glyph_marks_damage_and_advances_epoch	damage-scope	
+src/terminal/handler_osc_color.rs	selection_color_resets_and_ris_restore_host_baselines	color-state-model	
+src/terminal/handler_osc_notify.rs	osc_777_non_notify_subcmd_ignored	notification-gate	
+src/terminal/handler_osc_notify.rs	osc_777_notify_fires_advanced_callback	notification-gate	
+src/terminal/handler_osc_notify.rs	osc_99_anonymous_nonfinal_chunks_do_not_starve_final_notifications	osc99-accumulation	
+src/terminal/handler_osc_notify.rs	osc_99_concatenated_field_is_capped	osc99-accumulation	
+src/terminal/handler_osc_notify.rs	osc_99_multipart_accumulates_title_and_body	osc99-accumulation	
+src/terminal/handler_osc_notify.rs	osc_99_same_kind_chunks_concatenate	osc99-accumulation	
+src/terminal/handler_osc_notify.rs	osc_99_single_message_fires_advanced_callback	notification-gate	
+src/terminal/handler_osc_notify.rs	osc_9_4_sets_taskbar_progress_without_authorization	taskbar-progress	
+src/terminal/handler_osc_notify.rs	osc_9_4_state_mapping_and_clamp	taskbar-progress	
+src/terminal/handler_osc_notify.rs	osc_9_4_unknown_state_leaves_progress_unchanged	taskbar-progress	
+src/terminal/handler_osc_notify.rs	osc_9_fires_notification_callback_when_authorized	notification-gate	
+src/terminal/handler_osc_notify.rs	osc_9_ignores_conemu_taskbar_progress	taskbar-progress	
+src/terminal/handler_osc_notify.rs	osc_9_is_noop_when_not_authorized	notification-gate	
+src/terminal/handler_osc_notify.rs	osc_9_strips_bidi_override	notification-gate	
+src/terminal/handler_osc_shell.rs	a_prompt_on_the_alt_screen_leaves_it_and_paints_on_the_main_grid	prompt-leaves-orphaned-alt	
+src/terminal/handler_osc_shell.rs	a_prompt_on_the_main_screen_changes_no_screen_state	prompt-leaves-orphaned-alt	
+src/terminal/handler_osc_shell.rs	a_prompt_the_nonce_gate_drops_leaves_nothing	prompt-leaves-orphaned-alt	
+src/terminal/handler_osc_shell.rs	a_vscode_633_prompt_leaves_the_alt_screen_too	prompt-leaves-orphaned-alt	
+src/terminal/handler_osc_shell.rs	b_c_and_d_on_the_alt_screen_do_not_leave_it	prompt-leaves-orphaned-alt	
+src/terminal/handler_osc_shell.rs	rows_painted_in_the_same_read_as_the_prompt_are_archived	prompt-leaves-orphaned-alt	
+src/terminal/handler_osc_shell.rs	the_prompt_mark_names_the_main_grid_row_it_painted_on	prompt-leaves-orphaned-alt	
+src/terminal/handler_osc_shell.rs	what_the_stuck_screen_showed_is_in_the_archive_whole	prompt-leaves-orphaned-alt	
+src/terminal/handler_report.rs	apply_config_cursor_style_persists_as_default	cursor-style-default	
+src/terminal/handler_report.rs	decrqm_reports_mode_2031_state	decrqm-mode-agreement	
+src/terminal/handler_report.rs	dsr_996_reports_current_scheme	color-scheme-report	
+src/terminal/handler_report.rs	full_reset_restores_host_default_not_blinking_block	cursor-style-default	
+src/terminal/handler_report.rs	host_default_does_not_clobber_app_decscusr	cursor-style-default	
+src/terminal/handler_report.rs	host_default_takes_effect_before_app_decscusr	cursor-style-default	
+src/terminal/handler_report.rs	mode_2031_pushes_on_change_only_when_set	color-scheme-report	
+src/terminal/handler_report.rs	response_append_alloc_fault_drops_response_fail_closed	alloc-fault-fail-closed	
+src/terminal/handler_report.rs	soft_reset_restores_host_default_not_blinking_block	cursor-style-default	
+src/terminal/handler_sgr.rs	a_param_after_the_semicolon_colour_is_applied_on_its_own	sgr-denotation	
+src/terminal/handler_sgr.rs	colon_semicolon_and_combined_forms_draw_the_same_cells	sgr-denotation	
+src/terminal/handler_sgr.rs	semicolon_colour_split_at_every_read_boundary_is_one_colour	process-chunk-invariance	
+src/terminal/handler_sgr.rs	semicolon_forms_consume_exactly_their_sub_parameters	sgr-extended-color-parse	
+src/terminal/handler_sgr.rs	semicolon_indexed_after_sgr_4_colours_the_underline_from_the_palette	sgr-denotation	
+src/terminal/handler_sgr.rs	semicolon_rgb_after_sgr_4_colours_the_underline_red	sgr-denotation	
+src/terminal/handler_sgr.rs	semicolon_rgb_with_zero_components_keeps_the_underline_on	sgr-denotation	
+src/terminal/handler_sgr.rs	sgr_59_clears_the_colour_but_not_the_underline	sgr-denotation	
+src/terminal/handler_state.rs	a_second_1049_enter_clears_the_alt_screen_it_finds	alt-screen-switch-wrap-and-save	
+src/terminal/handler_state.rs	alt_1047_exit_clears_the_wrap_it_hands_back	alt-screen-switch-wrap-and-save	
+src/terminal/handler_state.rs	alt_1049_enter_resets_wrap_and_exit_restores_it	alt-screen-switch-wrap-and-save	
+src/terminal/handler_state.rs	alt_47_enter_carries_the_wrap_over	alt-screen-switch-wrap-and-save	
+src/terminal/handler_state.rs	cuf_cub_hpr_and_bs_move_by_columns_over_wide_text	motion-counts-columns	
+src/terminal/handler_state.rs	decsel0_protected_parked_glyph_survives_but_wrap_resets	erase-resets-pending-wrap	
+src/terminal/handler_state.rs	ed0_without_a_print_clears_the_parked_glyph	erase-resets-pending-wrap	
+src/terminal/handler_state.rs	ed1_at_bottom_right_pending_wrap_reduces_to_full_clear	erase-resets-pending-wrap	
+src/terminal/handler_state.rs	ed_at_pending_wrap_then_print_overwrites_last_column	erase-resets-pending-wrap	
+src/terminal/handler_state.rs	el0_at_pending_wrap_ghostty_golden	erase-resets-pending-wrap	
+src/terminal/handler_state.rs	el0_at_pending_wrap_with_decawm_off	erase-resets-pending-wrap	
+src/terminal/handler_state.rs	el1_at_pending_wrap_four_columns_is_xterms_result_not_xterm_js	erase-resets-pending-wrap	
+src/terminal/handler_state.rs	el1_at_pending_wrap_ghostty_golden	erase-resets-pending-wrap	
+src/terminal/handler_state.rs	el2_at_pending_wrap_then_print_overwrites_last_column	erase-resets-pending-wrap	
+src/terminal/handler_state.rs	vt52_esc_j_at_pending_wrap_clears_parked_glyph	erase-resets-pending-wrap	
+src/terminal/handler_state.rs	vt52_esc_k_at_pending_wrap_clears_parked_glyph	erase-resets-pending-wrap	
+src/terminal/handler_window.rs	a_host_that_answers_a_pixel_report_overrides_the_in_core_fallback	xtwinops-gate	
+src/terminal/handler_window.rs	a_zero_axis_cell_box_is_not_a_measurement	xtwinops-gate	
+src/terminal/handler_window.rs	csi_14t_follows_the_grid_across_a_resize	xtwinops-gate	
+src/terminal/handler_window.rs	csi_14t_reports_the_text_area_in_pixels	xtwinops-gate	
+src/terminal/handler_window.rs	csi_16t_reports_the_host_reported_cell_box	xtwinops-gate	
+src/terminal/handler_window.rs	csi_20t_icon_label_report_suppressed_when_window_ops_disabled	xtwinops-gate	
+src/terminal/handler_window.rs	csi_21t_policy_rule_can_enable_specific_report_without_legacy_bool	xtwinops-gate	
+src/terminal/handler_window.rs	csi_21t_policy_rule_does_not_overgrant_other_xtwinops_reports	xtwinops-gate	
+src/terminal/handler_window.rs	csi_21t_title_report_allowed_when_window_ops_enabled	xtwinops-gate	
+src/terminal/handler_window.rs	csi_21t_title_report_suppressed_when_window_ops_disabled	xtwinops-gate	
+src/terminal/handler_window.rs	csi_22t_title_push_allowed_when_window_ops_disabled	xtwinops-gate	
+src/terminal/handler_window.rs	csi_23t_title_pop_bumps_epoch_on_window_change	osc-title-and-epoch	
+src/terminal/handler_window.rs	reports_with_no_in_core_truth_stay_silent_rather_than_guess	xtwinops-gate	
+src/terminal/handler_window.rs	standard_profile_wildcard_does_not_overgrant_xtwinops_manipulation	xtwinops-gate	
+src/terminal/handler_window.rs	the_pixel_reports_are_still_gated_by_allow_window_ops	xtwinops-gate	
+src/terminal/handler_window.rs	the_pixel_reports_stay_silent_when_no_host_has_measured_a_cell	xtwinops-gate	
+src/terminal/handler_write.rs	a_combining_mark_after_a_cursor_motion_uses_the_cell_to_the_left	print-cell-placement	
+src/terminal/handler_write.rs	a_combining_mark_still_prefers_the_cell_to_its_left	print-cell-placement	
+src/terminal/handler_write.rs	a_combining_mark_with_no_cell_to_its_left_lands_on_the_cursor_cell	print-cell-placement	
+src/terminal/handler_write.rs	a_wide_glyph_wrapping_off_the_last_column_repaints_the_orphan_it_bisects	wide-wrap-bce	
+src/terminal/handler_write.rs	ambiguous_misc_symbols_take_two_cells_in_wide_mode	print-cell-placement	
+src/terminal/handler_write.rs	extended_b_vowels_and_finals_join_the_syllable	print-cell-placement	
+src/terminal/handler_write.rs	fast_path_width_matches_table_cjk_block	char-width-fast-path	
+src/terminal/handler_write.rs	fast_path_width_matches_table_hangul_blocks	char-width-fast-path	
+src/terminal/handler_write.rs	fast_path_width_matches_table_misc_symbols_and_dingbats	char-width-fast-path	
+src/terminal/handler_write.rs	known_cjk_width_regressions	width-table-ucd	
+src/terminal/handler_write.rs	skin_tone_folds_onto_an_emoji_presentation_base_in_both_width_modes	print-cell-placement	
+src/terminal/handler_write.rs	subdivision_flag_occupies_two_cells	print-cell-placement	
+src/terminal/handler_write.rs	tag_and_vs_supplement_attach_to_the_previous_cell	print-cell-placement	
+src/terminal/handler_write.rs	vs16_widening_is_unchanged	print-cell-placement	
+src/terminal/handler_write.rs	vs16_widens_exactly_the_text_default_emoji	print-cell-placement	
+src/terminal/handler_xtsmgraphics.rs	sixel_geometry_read_does_not_reach_the_host_without_window_ops	xtsmgraphics-geometry	
+src/terminal/handler_xtsmgraphics.rs	sixel_geometry_read_falls_back_without_a_cell_box	xtsmgraphics-geometry	
+src/terminal/handler_xtsmgraphics.rs	sixel_geometry_read_reports_the_text_area_with_window_ops	xtsmgraphics-geometry	
+src/terminal/history_carry.rs	a_scrollback_the_shell_clears_before_the_import_stays_cleared	older-history-claim	
+src/terminal/history_carry.rs	an_import_lands_in_the_saved_primary_under_an_alt_screen	older-history-claim	
+src/terminal/history_carry.rs	the_saved_primarys_history_is_what_an_alt_screen_terminal_exports	history-fence-export	
+src/terminal/host_traits.rs	terminal_block_access_snapshots_are_available	terminal-host-adapter	
+src/terminal/host_traits.rs	terminal_host_exposes_size_and_scrollback	terminal-host-adapter	
+src/terminal/hyperlink_auth.rs	a_new_scheme_set_is_empty_so_only_the_builtin_safe_list_admits	hyperlink-auth	
+src/terminal/hyperlink_auth.rs	authorize_scheme_bounded_at_max_extra_schemes	hyperlink-auth	
+src/terminal/hyperlink_auth.rs	authorize_scheme_refuses_malformed_shapes_and_overlength	hyperlink-auth	
+src/terminal/hyperlink_auth.rs	authorize_scheme_refuses_never_allow_incl_case_and_suffix_evasion	hyperlink-auth	
+src/terminal/hyperlink_auth.rs	authorize_scheme_stores_lowercased_and_is_idempotent	hyperlink-auth	
+src/terminal/hyperlink_auth.rs	revoke_scheme_is_case_insensitive_and_noop_when_absent	hyperlink-auth	
+src/terminal/keyboard_mode.rs	codex_report_event_types_suppresses_predictive_echo	keyboard-mode-projection	
+src/terminal/keyboard_mode.rs	conpty_9001_changes_no_application_facing_projection	keyboard-mode-projection	
+src/terminal/keyboard_mode.rs	conpty_9001_is_reported_by_decrqm_and_cleared_by_ris	win32-input-mode-lifecycle	
+src/terminal/keyboard_mode.rs	conpty_9001_never_leaks_into_the_kitty_query_or_the_kitty_stack	kitty-keyboard-protocol	
+src/terminal/keyboard_mode.rs	conpty_9001_release_of_an_enter_chord_emits_no_second_key_up	key-encoding-composition	
+src/terminal/keyboard_mode.rs	conpty_9001_sends_escape_as_a_record_so_it_survives_the_first_chord	key-encoding-composition	
+src/terminal/keyboard_mode.rs	conpty_9001_turns_enter_chords_into_win32_records_and_9001l_turns_them_back	key-encoding-composition	
+src/terminal/keyboard_mode.rs	decstr_resets_only_the_current_screens_kitty_state	kitty-keyboard-protocol	
+src/terminal/keyboard_mode.rs	disabled_negotiation_is_consumed_and_ignored	kitty-keyboard-protocol	
+src/terminal/keyboard_mode.rs	disabled_query_gets_no_reply	kitty-keyboard-protocol	
+src/terminal/keyboard_mode.rs	disabled_survives_ris	kitty-keyboard-protocol	
+src/terminal/keyboard_mode.rs	disabling_after_negotiation_drops_kitty_bits_and_reenabling_restores	keyboard-mode-projection	
+src/terminal/keyboard_mode.rs	functional_key_reporting_tracks_what_the_encoder_actually_emits	key-encoding-composition	
+src/terminal/keyboard_mode.rs	kitty_query_is_answered	kitty-keyboard-protocol	
+src/terminal/keyboard_mode.rs	legacy_shift_enter_is_lf_aterm_imposes_newline	key-encoding-composition	
+src/terminal/keyboard_mode.rs	modify_other_keys_level2_distinguishes_shift_enter	key-encoding-composition	
+src/terminal/keyboard_mode.rs	program_output_cannot_turn_on_win32_records_without_a_console_host	win32-input-mode-lifecycle	
+src/terminal/keyboard_mode.rs	push_disambiguate_then_shift_enter_is_csi_u	kitty-keyboard-protocol	
+src/terminal/keyboard_mode.rs	push_flags_over_255_are_masked_not_saturated	kitty-keyboard-protocol	
+src/terminal/keyboard_mode.rs	set_disambiguate_then_shift_enter_is_csi_u	key-encoding-composition	
+src/terminal/keyboard_mode.rs	the_console_host_posture_follows_the_resize_policy_both_ways	win32-input-mode-lifecycle	
+src/terminal/kitty_graphics.rs	a_loadable_size_is_kittys	kitty-loadable-size	
+src/terminal/kitty_graphics.rs	bad_base64_keeps_command_with_empty_payload	kitty-command-parse	
+src/terminal/kitty_graphics.rs	cell_offset_and_relative_placement_keys	kitty-command-parse	
+src/terminal/kitty_graphics.rs	compose_rgba_copies_blends_and_clips	compose-rgba	
+src/terminal/kitty_graphics.rs	defaults_when_keys_absent	kitty-command-parse	
+src/terminal/kitty_graphics.rs	non_g_payload_is_none	kitty-command-parse	
+src/terminal/kitty_graphics.rs	non_utf8_control_is_none	kitty-command-parse	
+src/terminal/kitty_graphics.rs	placement_z_index_and_chunking	kitty-command-parse	
+src/terminal/kitty_graphics.rs	png_dimensions_reads_ihdr	png-dimensions	
+src/terminal/kitty_graphics.rs	query_and_delete_actions	kitty-command-parse	
+src/terminal/kitty_graphics.rs	raw_rgb_dimensions_and_medium	kitty-command-parse	
+src/terminal/kitty_graphics.rs	rgb_to_rgba_inserts_opaque_alpha	rgb-to-rgba	
+src/terminal/kitty_graphics.rs	source_rect_cursor_and_virtual_keys	kitty-command-parse	
+src/terminal/kitty_graphics.rs	transmit_and_display_png_with_id	kitty-command-parse	
+src/terminal/kitty_graphics.rs	unknown_keys_ignored_last_value_wins	kitty-command-parse	
+src/terminal/kitty_graphics.rs	zero_ids_mean_unspecified	kitty-command-parse	
+src/terminal/kitty_placeholder.rs	known_diacritic_values	kitty-diacritic-table	
+src/terminal/kitty_placeholder.rs	table_is_sorted_and_full	kitty-diacritic-table	
+src/terminal/mode_mirror.rs	a_fresh_terminal_publishes_its_fold_not_an_empty_word	mode-mirror-coherence	
+src/terminal/mode_mirror.rs	every_host_mutator_refreshes_the_mirror	mode-mirror-coherence	
+src/terminal/mode_mirror.rs	every_process_driven_mutation_refreshes_the_mirror	mode-mirror-coherence	
+src/terminal/mouse.rs	the_report_memo_repeats_only_the_same_position_in_the_same_terms	mouse-report-memo	
+src/terminal/mouse.rs	wheel_encodes_all_four_xterm_buttons	mouse-wheel-encoding	
+src/terminal/mouse.rs	wheel_modifiers_or_into_the_horizontal_codes	mouse-wheel-encoding	
+src/terminal/mouse.rs	wheel_reports_nothing_in_x10_mode	mouse-wheel-encoding	
+src/terminal/mouse.rs	wheel_reports_nothing_without_tracking	mouse-wheel-encoding	
+src/terminal/observe.rs	a_momentum_watcher_latches_at_its_crossing_and_content_activity_does_not_move_it	obs-deadline-semantics	
+src/terminal/observe.rs	a_new_screen_generation_at_an_equal_seq_is_an_advance	obs-observe-latch-step	
+src/terminal/observe.rs	a_restarted_idle_waits_its_whole_window_again	obs-deadline-semantics	
+src/terminal/observe.rs	activity_resets_the_idle_deadline	obs-deadline-semantics	
+src/terminal/observe.rs	an_undecided_row_holds_both_row_predicates_pending	obs-observe-latch-step	
+src/terminal/observe.rs	arm_is_bounded_and_fails_closed	obs-capacity	
+src/terminal/observe.rs	block_complete_latches_on_first_complete	obs-observe-latch-step	
+src/terminal/observe.rs	disarm_frees_a_slot	obs-capacity	
+src/terminal/observe.rs	idle_armed_on_a_stale_quiet_surface_waits_the_full_window	obs-deadline-semantics	
+src/terminal/observe.rs	idle_latches_at_the_deadline_not_the_observation_instant	obs-deadline-semantics	
+src/terminal/observe.rs	live_and_replay_latch_identically	obs-deadline-semantics	
+src/terminal/observe.rs	needs_arm_eval_is_exactly_the_level_triggered_predicates	obs-arm-eval-classes	
+src/terminal/observe.rs	next_deadline_is_the_minimum	obs-next-deadline-min	
+src/terminal/observe.rs	observe_at_reuses_scratch_across_batches_and_still_latches	obs-terminal-watch-arm-eval	
+src/terminal/observe.rs	row_matches_latches_in_the_one_list_on_content_advance	obs-observe-latch-step	
+src/terminal/observe.rs	rows_clear_holds_while_a_row_matches_then_latches_when_it_leaves	obs-observe-latch-step	
+src/terminal/observe.rs	rows_clear_latches_at_arm_when_nothing_matches	obs-observe-latch-step	
+src/terminal/observe.rs	rows_clear_never_latches_on_a_range_that_covers_no_visible_row	obs-observe-latch-step	
+src/terminal/observe.rs	rows_clear_range_ignores_a_match_outside_the_range	obs-observe-latch-step	
+src/terminal/observe.rs	seq_advanced_latches_at_the_batch	obs-observe-latch-step	
+src/terminal/observe.rs	surface_source_boundary_is_transport_agnostic	obs-first-matching-row	
+src/terminal/observe.rs	watch_latches_an_already_advanced_seq_before_it_returns	obs-terminal-watch-arm-eval	
+src/terminal/policy_bridge.rs	decision_matching_drop_rule_denies	pb-bridge-decision-tree	
+src/terminal/policy_bridge.rs	decision_matching_execute_rule_allows	pb-bridge-decision-tree	
+src/terminal/policy_bridge.rs	decision_matching_warn_rule_denies	pb-bridge-decision-tree	
+src/terminal/policy_bridge.rs	decision_no_rule_match_yields_fallback	pb-bridge-decision-tree	
+src/terminal/policy_bridge.rs	decision_none_engine_yields_fallback	pb-bridge-decision-tree	
+src/terminal/policy_bridge.rs	decision_origin_gate_failure_falls_through_to_wildcard	pb-bridge-decision-tree	
+src/terminal/policy_bridge.rs	deny_by_default_bridge_keeps_explicit_execute_authoritative	pb-bridge-decision-tree	
+src/terminal/policy_bridge.rs	deny_by_default_bridge_keeps_wildcard_drop_authoritative	pb-bridge-decision-tree	
+src/terminal/policy_bridge.rs	deny_by_default_bridge_treats_wildcard_execute_as_fallback	pb-bridge-decision-tree	
+src/terminal/policy_bridge.rs	drop_policy_suppresses_kitty_query_reply	pb-response-sink-gate	
+src/terminal/policy_bridge.rs	drop_policy_suppresses_response_at_the_sink	pb-response-sink-gate	
+src/terminal/policy_bridge.rs	no_engine_kitty_query_replies	pb-response-sink-gate	
+src/terminal/policy_bridge.rs	no_engine_still_replies	pb-response-sink-gate	
+src/terminal/policy_bridge.rs	resolve_allow_overrides_false_bool	pb-resolve-table	
+src/terminal/policy_bridge.rs	resolve_deny_overrides_true_bool	pb-resolve-table	
+src/terminal/policy_bridge.rs	resolve_fallback_defers_to_bool	pb-resolve-table	
+src/terminal/policy_gates.rs	an_installed_policy_costs_no_per_dispatch_evaluation_at_the_compiled_gates	pg-covered-gates-are-table-reads	
+src/terminal/policy_gates.rs	apply_policy_engine_invalidates_the_memo	pg-state-sync-invariant	
+src/terminal/policy_gates.rs	clear_policy_engine_invalidates_the_memo	pg-state-sync-invariant	
+src/terminal/policy_gates.rs	clipboard_gate_tracks_the_installed_policy	pg-state-sync-invariant	
+src/terminal/policy_gates.rs	compiled_clipboard_gates_stay_deny_by_default_under_a_wildcard_allow	pg-compiled-equals-live	
+src/terminal/policy_gates.rs	compiled_gate_matches_live_evaluation_for_every_builtin_profile	pg-compiled-equals-live	
+src/terminal/policy_gates.rs	compiled_gate_matches_the_per_dispatch_mint	pg-compiled-equals-live	
+src/terminal/policy_gates.rs	no_engine_compiles_to_fallback	pg-compiled-equals-live	
+src/terminal/policy_gates.rs	rate_limit_passthrough_reports_absence_of_an_engine	pg-response-slot-equals-id	
+src/terminal/policy_gates.rs	replacing_the_engine_invalidates_the_memo_in_both_directions	pg-state-sync-invariant	
+src/terminal/policy_gates.rs	response_slot_allows_when_the_policy_declares_no_response_bucket	pg-response-slot-equals-id	
+src/terminal/policy_gates.rs	response_slot_answers_exactly_as_the_id_does	pg-response-slot-equals-id	
+src/terminal/policy_gates.rs	response_slot_follows_the_id_not_the_declaration_order	pg-response-slot-equals-id	
+src/terminal/policy_gates.rs	response_slot_reports_absence_of_an_engine	pg-response-slot-equals-id	
+src/terminal/policy_gates.rs	response_slot_tracks_the_installed_policy	pg-state-sync-invariant	
+src/terminal/policy_gates.rs	shell_gate_falls_back_for_uncovered_subcommands	pg-compiled-equals-live	
+src/terminal/policy_gates.rs	shell_gate_stays_subcommand_sensitive	pg-compiled-equals-live	
+src/terminal/policy_gates.rs	shell_gate_tracks_the_installed_policy	pg-state-sync-invariant	
+src/terminal/policy_gates.rs	shell_gate_treats_an_absent_subcommand_as_a	pg-compiled-equals-live	
+src/terminal/policy_gates.rs	shell_table_matches_live_evaluation_for_every_covered_pair	pg-compiled-equals-live	
+src/terminal/policy_gates.rs	standard_profile_keeps_replying	pg-state-sync-invariant	
+src/terminal/policy_gates.rs	xtwinops_gate_tracks_the_installed_policy	pg-state-sync-invariant	
+src/terminal/policy_gates.rs	xtwinops_out_of_range_ps_falls_back_to_live_evaluation	pg-compiled-equals-live	
+src/terminal/policy_gates.rs	xtwinops_table_matches_live_evaluation_for_every_covered_ps	pg-compiled-equals-live	
+src/terminal/processing.rs	a_codex_enter_batch_is_one_composed_band_batch	pr-content-scroll-state-soundness	
+src/terminal/processing.rs	a_codex_phase_b_line_is_an_explained_top_anchored_band	pr-content-scroll-state-soundness	
+src/terminal/processing.rs	a_poisoned_or_mixed_batch_advances_the_epoch_without_a_band_batch	pr-post-process-scroll-verdict	
+src/terminal/processing.rs	an_erase_rewrites_cells_in_place_and_invalidates_no_host_coordinate	pr-content-scroll-state-soundness	
+src/terminal/processing.rs	bare_hide_and_vim_style_output_never_bump_the_blink_epoch	pr-repaint-blink-epoch	
+src/terminal/processing.rs	content_scroll_state_coalesces_uniform_rows_and_invalidates_mixed_batches	pr-post-process-scroll-verdict	
+src/terminal/processing.rs	content_scroll_state_invalidates_interior_and_top_anchored_regions	pr-content-scroll-state-soundness	
+src/terminal/processing.rs	content_scroll_state_survives_direct_and_ris_reset_without_double_counting	pr-post-process-scroll-verdict	
+src/terminal/processing.rs	content_scroll_state_tracks_uniform_alt_screen_scrolls	pr-content-scroll-state-soundness	
+src/terminal/processing.rs	content_scroll_state_tracks_uniform_scroll_at_saturated_history_capacity	pr-content-scroll-state-soundness	
+src/terminal/processing.rs	content_scroll_state_tracks_uniform_scroll_with_zero_history_capacity	pr-content-scroll-state-soundness	
+src/terminal/processing.rs	discarding_scrollback_evicts_history_and_moves_no_live_coordinate	pr-content-scroll-state-soundness	
+src/terminal/processing.rs	every_alt_screen_switch_advances_the_host_coordinate_epoch_exactly_once	pr-content-scroll-state-soundness	
+src/terminal/processing.rs	live_viewport_tracks_bottom_when_not_scrolled_back	viewport-pin	
+src/terminal/processing.rs	process_at_is_deterministic_under_injected_clock	pr-process-at-determinism	
+src/terminal/processing.rs	repaint_blink_epoch_bumps_once_per_claude_burst	pr-repaint-blink-epoch	
+src/terminal/processing.rs	ris_does_not_drop_csi_split_across_process_calls	pr-ris-keeps-parser-carry	
+src/terminal/processing.rs	ris_does_not_drop_utf8_split_across_process_calls	pr-ris-keeps-parser-carry	
+src/terminal/processing.rs	ris_does_not_print_a_dcs_payload_split_across_process_calls	pr-ris-keeps-parser-carry	
+src/terminal/processing.rs	ris_empties_the_parked_selection_slot_in_the_batch_that_resets	pr-ris-retires-selections	
+src/terminal/processing.rs	ris_then_enter_from_main_parks_nothing	pr-ris-retires-selections	
+src/terminal/processing.rs	scrolled_back_viewport_pins_during_live_output	viewport-pin	
+src/terminal/processing.rs	selection_splice_must_account_for_the_entire_batch_row_advance	pr-splice-accounts	
+src/terminal/processing.rs	sync_frame_unfinished_is_the_programs_account_and_survives_the_timeout	pr-sync-frame-unfinished	
+src/terminal/processing.rs	sync_open_dirty_clears_on_decstr_and_ris	pr-sync-open-dirty	
+src/terminal/processing.rs	sync_open_dirty_covers_parser_action_families	pr-sync-open-dirty	
+src/terminal/processing.rs	sync_open_dirty_tracks_the_current_episode_only	pr-sync-open-dirty	
+src/terminal/processing.rs	sync_output_disables_after_backdated_start	pr-sync-timeout	
+src/terminal/processing.rs	sync_output_survives_forward_dated_start_without_panic	pr-sync-timeout	
+src/terminal/render_cells.rs	a_hyperlink_is_underlined_and_a_program_decoration_still_wins	rc-render-cell-resolution	
+src/terminal/render_cells.rs	apron_memo_never_carries_another_terminals_row	rc-damage-scoped-equals-full	
+src/terminal/render_cells.rs	apron_memo_refreshes_cursor_without_rematerializing_the_row	rc-damage-scoped-equals-full	
+src/terminal/render_cells.rs	apron_memo_rematerializes_on_every_recolor	rc-damage-scoped-equals-full	
+src/terminal/render_cells.rs	apron_row_is_the_bottom_row_one_offset_shallower	rc-apron-row	
+src/terminal/render_cells.rs	bare_emoji_base_without_vs16_is_text_presentation	rc-render-cell-resolution	
+src/terminal/render_cells.rs	borrowed_marks_preserve_live_ring_and_tiered_rendering	history-render-parity	
+src/terminal/render_cells.rs	cell_frame_clusters_combining_match_row_accessors	rc-extras-classification	
+src/terminal/render_cells.rs	cell_frame_into_clears_compositor_pane_spans	rc-frame-scalar-stamps	
+src/terminal/render_cells.rs	cell_frame_into_tracks_live_selection_colors_and_resets	rc-frame-scalar-stamps	
+src/terminal/render_cells.rs	cell_frame_owns_live_sparse_background_and_cursor_colors	rc-frame-scalar-stamps	
+src/terminal/render_cells.rs	cell_frame_projects_the_dec_cursor_while_its_row_stays_on_screen	rc-cursor-projection	
+src/terminal/render_cells.rs	cell_frame_stamps_absolute_row_revision	rc-frame-scalar-stamps	
+src/terminal/render_cells.rs	cell_frame_stamps_history_renumber_epoch	rc-frame-scalar-stamps	
+src/terminal/render_cells.rs	cluster_row_emits_zwj_skin_keycap_not_vs16_or_plain	rc-extras-classification	
+src/terminal/render_cells.rs	cluster_row_empty_for_plain_text	rc-extras-classification	
+src/terminal/render_cells.rs	combining_marks_surface_for_diacritics_not_emoji	rc-extras-classification	
+src/terminal/render_cells.rs	combining_row_empty_for_plain_and_vs16	rc-extras-classification	
+src/terminal/render_cells.rs	combining_row_keeps_every_stacked_mark_in_order	rc-extras-classification	
+src/terminal/render_cells.rs	damage_scoped_extraction_matches_full_extract_over_mutation_corpus	rc-damage-scoped-equals-full	
+src/terminal/render_cells.rs	default_ignorable_marks_are_never_overlaid	rc-extras-classification	
+src/terminal/render_cells.rs	dmg1_every_continuity_clause_reports_its_own_cause	rc-refill-cause-classification	
+src/terminal/render_cells.rs	dmg1_fuzz_scoped_vs_full_over_random_mutation_streams	rc-damage-scoped-equals-full	
+src/terminal/render_cells.rs	dmg1_shared_scratch_across_two_terminals_never_leaks_rows	rc-damage-scoped-equals-full	
+src/terminal/render_cells.rs	frame_keeps_the_implicit_blank_from_its_own_extraction	rc-implicit-blank	
+src/terminal/render_cells.rs	images_frame_costs_the_extras_not_rows_times_cols	rc-images-frame-cost	
+src/terminal/render_cells.rs	images_frame_into_matches_per_row	rc-images-frame-equals-per-row	
+src/terminal/render_cells.rs	images_frame_into_matches_per_row_while_scrolled_back	rc-images-frame-equals-per-row	
+src/terminal/render_cells.rs	implicit_blank_uses_live_defaults_and_decscnm	rc-implicit-blank	
+src/terminal/render_cells.rs	indexed_underline_color_resolves_against_live_palette	rc-render-cell-resolution	
+src/terminal/render_cells.rs	osc_110_resets_to_configured_default_foreground	color-state-model	
+src/terminal/render_cells.rs	presentation_fingerprint_moves_with_every_resolver_input	rc-presentation-fingerprint	
+src/terminal/render_cells.rs	regional_indicator_pair_folds_into_one_flag_cluster	rc-render-cell-resolution	
+src/terminal/render_cells.rs	render_row_at_screen_ignores_display_offset	rc-render-row-at-screen	
+src/terminal/render_cells.rs	render_row_default_colors	rc-render-cell-resolution	
+src/terminal/render_cells.rs	render_row_indexed_bg_green	resolve-colors-denotation	
+src/terminal/render_cells.rs	render_row_indexed_fg_red	resolve-colors-denotation	
+src/terminal/render_cells.rs	render_row_inverse_vs16_emoji_highlights_both_halves	rc-wide-spacer-inherits-rendition	
+src/terminal/render_cells.rs	render_row_inverse_wide_char_highlights_both_halves	rc-wide-spacer-inherits-rendition	
+src/terminal/render_cells.rs	render_row_inverse_wide_char_swaps_explicit_colors_in_both_halves	rc-wide-spacer-inherits-rendition	
+src/terminal/render_cells.rs	render_row_out_of_range_is_empty	rc-render-cell-resolution	
+src/terminal/render_cells.rs	render_row_protected_text_is_visible	rc-render-cell-resolution	
+src/terminal/render_cells.rs	render_row_truecolor_fg	resolve-colors-denotation	
+src/terminal/render_cells.rs	render_row_wide_char_rules_span_both_halves	rc-wide-spacer-inherits-rendition	
+src/terminal/render_cells.rs	render_row_wide_continuation_is_blanked	rc-render-cell-resolution	
+src/terminal/render_cells.rs	scr2_debug_net_ignores_host_overlays	rc-damage-scoped-equals-full	
+src/terminal/render_cells.rs	scr2_eviction_under_a_parked_viewport_matches_the_full_extract	rc-damage-scoped-equals-full	
+src/terminal/render_cells.rs	scr2_parked_fill_publishes_no_row_revision_lane	rc-scrolled-strip-size	
+src/terminal/render_cells.rs	scr2_scrolled_scoped_extraction_matches_full_extract_across_history_ends_and_output	rc-damage-scoped-equals-full	
+src/terminal/render_cells.rs	scr2_scrolled_wheel_step_refills_only_the_exposed_strip	rc-scrolled-strip-size	
+src/terminal/render_cells.rs	sgr_decorations_surface_on_render_cells	rc-render-cell-resolution	
+src/terminal/render_cells.rs	style_policy_flows_through_apply_config	resolve-colors-denotation	
+src/terminal/render_cells.rs	tag_sequence_surfaces_as_a_cluster_not_an_overlay	rc-extras-classification	
+src/terminal/render_cells.rs	terminal_new_defaults_are_single_source	color-state-model	
+src/terminal/render_cells.rs	the_apron_follows_a_dec_line_size_change	rc-damage-scoped-equals-full	
+src/terminal/render_cells.rs	three_regional_indicators_pair_then_single	rc-render-cell-resolution	
+src/terminal/render_cells.rs	underline_color_surfaces_from_sgr58	rc-render-cell-resolution	
+src/terminal/render_cells.rs	vs15_narrowed_default_emoji_sets_text_presentation	rc-render-cell-resolution	
+src/terminal/render_cells.rs	vs16_widened_emoji_sets_emoji_presentation	rc-render-cell-resolution	
+src/terminal/render_cells.rs	wide_cjk_is_not_emoji_presentation	rc-render-cell-resolution	
+src/terminal/repaint_nudge.rs	a_click_a_wheel_notch_and_a_drag_each_count_as_a_person	rn-armed-gates	
+src/terminal/repaint_nudge.rs	a_first_answer_with_no_second_is_judged_by_what_the_engine_owes	rn-answer-protocol	
+src/terminal/repaint_nudge.rs	a_halted_session_is_never_nudged_and_the_epoch_waits_for_the_lift	rn-armed-gates	
+src/terminal/repaint_nudge.rs	a_lease_held_for_120s_defers_once_then_abandons	rn-armed-gates	
+src/terminal/repaint_nudge.rs	a_lease_on_another_tab_does_not_defer_the_nudge	rn-armed-gates	
+src/terminal/repaint_nudge.rs	a_non_answering_app_ends_with_the_pty_at_the_engine_dims	rn-hold-always-lifted	
+src/terminal/repaint_nudge.rs	a_nudge_that_gets_no_answer_never_asks_for_the_engine	rn-hold-always-lifted	
+src/terminal/repaint_nudge.rs	a_program_that_is_not_the_agent_class_is_never_held_whatever_the_mode	rn-armed-gates	
+src/terminal/repaint_nudge.rs	a_program_that_repainted_by_itself_is_not_nudged	rn-armed-gates	
+src/terminal/repaint_nudge.rs	a_program_that_repaints_without_ed2_is_tried_once_and_abandoned	rn-attempt-budget	
+src/terminal/repaint_nudge.rs	a_real_resize_meanwhile_supersedes_the_hold	rn-answer-protocol	
+src/terminal/repaint_nudge.rs	a_screen_replacement_is_an_answer_too	rn-answer-protocol	
+src/terminal/repaint_nudge.rs	a_session_never_stamped_waits_1500ms_from_attach	rn-armed-gates	
+src/terminal/repaint_nudge.rs	a_standing_selection_defers_the_nudge_then_abandons_it	rn-armed-gates	
+src/terminal/repaint_nudge.rs	an_ordinary_frame_before_a_late_answer_is_not_an_answer	rn-answer-protocol	
+src/terminal/repaint_nudge.rs	at_most_one_hold_app_wide	rn-armed-gates	
+src/terminal/repaint_nudge.rs	every_exit_path_lifts_the_hold	rn-hold-always-lifted	
+src/terminal/repaint_nudge.rs	mode_log_writes_would_nudge_and_touches_no_pty	rn-armed-gates	
+src/terminal/repaint_nudge.rs	mode_off_runs_nothing	rn-armed-gates	
+src/terminal/repaint_nudge.rs	nudge_gives_up_and_lifts_the_hold_when_nothing_answers	rn-answer-protocol	
+src/terminal/repaint_nudge.rs	nudge_heals_a_program_that_answers_at_once	rn-answer-protocol	
+src/terminal/repaint_nudge.rs	nudge_never_holds_while_a_driver_may_type_into_the_session	rn-armed-gates	
+src/terminal/repaint_nudge.rs	nudge_never_runs_within_1500ms_of_a_persons_key	rn-armed-gates	
+src/terminal/repaint_nudge.rs	nudge_skips_a_shared_session_and_a_dragged_window	rn-armed-gates	
+src/terminal/repaint_nudge.rs	nudge_stops_at_one_try_per_epoch_and_three_per_hour	rn-attempt-budget	
+src/terminal/repaint_nudge.rs	nudge_waits_for_a_late_answer_and_then_restores	rn-answer-protocol	
+src/terminal/repaint_nudge.rs	nudge_waits_out_an_open_2026_frame	rn-armed-gates	
+src/terminal/repaint_nudge.rs	the_cooldown_spaces_two_attempts_by_a_minute	rn-attempt-budget	
+src/terminal/repaint_nudge.rs	the_quiet_wait_is_bounded	rn-armed-gates	
+src/terminal/repaint_nudge.rs	the_release_waits_for_40ms_of_quiet	rn-answer-protocol	
+src/terminal/repaint_nudge.rs	the_second_size_answered_without_the_first_is_a_repaint_not_a_heal	rn-answer-protocol	
+src/terminal/resize_conpty_tests.rs	belt_setup_puts_the_continuation_at_row_zero	(§4: delete)	
+src/terminal/resize_conpty_tests.rs	conpty_column_shrink_after_conhost_cls_pushes_no_stray_row	cp-conhost-repaint-lossless	
+src/terminal/resize_conpty_tests.rs	conpty_combined_grow_and_widen_keeps_every_history_line	cp-conhost-repaint-lossless	
+src/terminal/resize_conpty_tests.rs	conpty_height_drag_keeps_command_marks_on_their_rows	cp-absolute-keys-stable	
+src/terminal/resize_conpty_tests.rs	conpty_offloaded_rows_grow_is_the_synchronous_policy	cp-conhost-repaint-lossless	
+src/terminal/resize_conpty_tests.rs	conpty_offloaded_widen_is_duplicate_free_whichever_side_of_the_reattach_the_repaint_lands	cp-conhost-repaint-lossless	
+src/terminal/resize_conpty_tests.rs	conpty_offloaded_width_round_trip_keeps_the_history_line_count	cp-conhost-repaint-lossless	
+src/terminal/resize_conpty_tests.rs	conpty_rows_grow_keeps_a_scrolled_back_reader_on_the_same_line	cp-rows-grow-shape	
+src/terminal/resize_conpty_tests.rs	conpty_rows_grow_keeps_every_history_line_across_the_conhost_repaint	cp-conhost-repaint-lossless	
+src/terminal/resize_conpty_tests.rs	conpty_rows_grow_search_index_matches_a_fresh_build_after_the_repaint	si-cached-equals-fresh	
+src/terminal/resize_conpty_tests.rs	conpty_rows_grow_under_an_alt_screen_keeps_the_saved_primary_intact	cp-conhost-repaint-lossless	
+src/terminal/resize_conpty_tests.rs	conpty_rows_only_shrink_with_a_row_below_the_cursor_demotes_the_same_rows	cp-conhost-repaint-lossless	
+src/terminal/resize_conpty_tests.rs	conpty_rows_shrink_in_the_bottom_push_corner_leaves_the_viewport_conhost_paints	cp-conhost-repaint-lossless	
+src/terminal/resize_conpty_tests.rs	conpty_rows_shrink_is_the_native_shape	cp-rows-shrink-native	
+src/terminal/resize_conpty_tests.rs	conpty_shrink_to_a_width_the_prompt_fills_exactly_keeps_every_line	cp-conhost-repaint-lossless	
+src/terminal/resize_conpty_tests.rs	conpty_shrink_with_a_row_below_the_cursor_keeps_every_line	cp-conhost-repaint-lossless	
+src/terminal/resize_conpty_tests.rs	conpty_widen_after_conhost_cls_rewraps_history_with_no_row_shifted	cp-conhost-repaint-lossless	
+src/terminal/resize_conpty_tests.rs	conpty_widen_keeps_the_boundary_fragment_where_conhost_paints_it	cp-conhost-repaint-lossless	
+src/terminal/resize_conpty_tests.rs	conpty_widen_search_finds_every_line_at_its_row	si-cached-equals-fresh	
+src/terminal/resize_conpty_tests.rs	native_combined_grow_and_widen_under_a_conhost_repaint_loses_the_history	(§4: delete when cp-conhost-repaint-lossless is Certified)	
+src/terminal/resize_conpty_tests.rs	native_offloaded_widen_under_a_conhost_repaint_duplicates_the_fragment	(§4: delete when cp-conhost-repaint-lossless is Certified)	
+src/terminal/resize_conpty_tests.rs	native_policy_matches_the_0_94_0_resize	cp-default-resize-is-native	
+src/terminal/resize_conpty_tests.rs	native_rows_grow_under_a_conhost_repaint_loses_the_revealed_lines	(§4: delete when cp-conhost-repaint-lossless is Certified)	
+src/terminal/resize_conpty_tests.rs	native_shrink_to_a_width_the_prompt_fills_exactly_loses_a_line	(§4: delete when cp-conhost-repaint-lossless is Certified)	
+src/terminal/resize_conpty_tests.rs	native_shrink_with_a_row_below_the_cursor_under_a_conhost_repaint_loses_a_line	(§4: delete when cp-conhost-repaint-lossless is Certified)	
+src/terminal/resize_conpty_tests.rs	offloaded_native_script_keeps_every_line_the_synchronous_one_keeps	offloaded-resize-equivalence	
+src/terminal/resize_journal_tests.rs	a_conpty_resize_owes_nothing	rj-render-debt	
+src/terminal/resize_journal_tests.rs	a_full_clear_a_screen_switch_and_ris_each_reset_the_debt	rj-render-debt	
+src/terminal/resize_journal_tests.rs	a_primary_screen_resize_owes_nothing	rj-render-debt	
+src/terminal/resize_journal_tests.rs	a_quiet_alt_flap_keeps_decsc_the_scroll_region_and_extras	rj-quiet-flap-identity	
+src/terminal/resize_journal_tests.rs	a_quiet_alt_flap_with_a_full_tail_is_an_identity	rj-quiet-flap-identity	
+src/terminal/resize_journal_tests.rs	a_quiet_flap_leaves_no_debt	rj-render-debt	
+src/terminal/resize_journal_tests.rs	alt_flap_with_output_between_the_halves_keeps_the_shift	rj-undo-dropped-by-output-or-switch	
+src/terminal/resize_journal_tests.rs	alt_shrink_with_a_blank_tail_only_trims	rj-quiet-flap-identity	
+src/terminal/resize_journal_tests.rs	an_alt_screen_switch_between_the_halves_drops_the_undo	rj-undo-dropped-by-output-or-switch	
+src/terminal/resize_journal_tests.rs	an_undone_flap_puts_the_selection_back	rj-quiet-flap-identity	
+src/terminal/resize_journal_tests.rs	debt_accumulates_over_a_run_of_flaps_and_is_exact_after_a_journal_overrun	rj-render-debt	
+src/terminal/resize_journal_tests.rs	every_engine_has_its_own_lifetime_token	rj-lifetime-token	
+src/terminal/resize_journal_tests.rs	full_clear_count_counts_ed2_and_home_ed0_not_ed3_el_or_mid_screen_ed0	rj-full-clear-count	
+src/terminal/resize_journal_tests.rs	input_between_the_halves_leaves_the_shift_as_debt	rj-render-debt	
+src/terminal/resize_journal_tests.rs	journal_keeps_both_halves_of_a_flap	rj-journal-ring	
+src/terminal/resize_journal_tests.rs	primary_rows_only_flap_is_lossless	rj-quiet-flap-identity	
+src/terminal/resize_journal_tests.rs	screen_replaced_counts_alt_screen_switches_and_resets	rj-screen-replaced-and-healed-by	
+src/terminal/resize_journal_tests.rs	seeding_the_debt_survives_a_checkpoint_restore_and_a_full_clear_resets_it	rj-render-debt	
+src/terminal/resize_journal_tests.rs	the_push_corner_leaves_the_bottom_row_as_debt	rj-render-debt	
+src/terminal/response_capability.rs	capability_is_zero_sized	(§4: delete)	
+src/terminal/response_capability.rs	in_module_construction_succeeds	(§4: delete (replace with a const assert))	
+src/terminal/response_capability.rs	no_engine_still_mints_some	(§4: delete)	
+src/terminal/response_rate_limiter.rs	test_response_burst_capacity_caps_at_configured_max	rl-token-bucket	
+src/terminal/response_rate_limiter.rs	test_response_defaults_are_permissive	rl-token-bucket	
+src/terminal/response_rate_limiter.rs	test_response_oversized_always_dropped	rl-token-bucket	
+src/terminal/response_rate_limiter.rs	test_response_rate_above_limit_excess_dropped	rl-token-bucket	
+src/terminal/response_rate_limiter.rs	test_response_rate_below_limit_all_delivered	rl-token-bucket	
+src/terminal/response_rate_limiter.rs	test_response_rate_replenishes_after_cooldown	rl-token-bucket	
+src/terminal/response_rate_limiter.rs	test_response_reconfigure_preserves_tokens_under_new_cap	(§4: delete)	
+src/terminal/response_rate_limiter.rs	test_response_zero_capacity_blocks_everything	rl-token-bucket	
+src/terminal/scrollback_shared_budget.rs	global_divides_equally_and_min_wins	shared-scrollback-budget	
+src/terminal/scrollback_shared_budget.rs	reconfigure_and_global_change_surface_on_next_poll	shared-scrollback-budget	
+src/terminal/scrollback_shared_budget.rs	unset_global_passes_configured_through	shared-scrollback-budget	
+src/terminal/search_budgeted.rs	an_unaffordable_regex_row_is_reported_not_passed_off	sbg-completion-equals-one-shot	
+src/terminal/search_budgeted.rs	budgeted_completion_equals_one_shot_all_modes	sbg-completion-equals-one-shot	
+src/terminal/search_budgeted.rs	budgeted_completion_equals_one_shot_over_a_corrupt_tiered_segment	sbg-completion-equals-one-shot	
+src/terminal/search_budgeted.rs	budgeted_resume_refinement_actions_are_complete	(§4: delete (move the rule to verify guards / aterm-census))	
+src/terminal/search_budgeted.rs	completed_index_is_non_resumable_and_released	sbg-cursor-validity	
+src/terminal/search_budgeted.rs	completing_stale_restart_explicitly_resets_delta_stream	sbg-cursor-validity	
+src/terminal/search_budgeted.rs	content_change_between_slices_restarts_from_scratch	sbg-cursor-validity	
+src/terminal/search_budgeted.rs	cursor_allocator_never_wraps	sbg-cursor-allocator	
+src/terminal/search_budgeted.rs	dense_results_are_delta_bounded_and_concatenate_to_one_shot	sbg-completion-equals-one-shot	
+src/terminal/search_budgeted.rs	each_step_consumes_at_most_the_budget	sbg-step-budget	
+src/terminal/search_budgeted.rs	foreign_terminal_cursor_restarts_with_a_unique_token	sbg-cursor-validity	
+src/terminal/search_budgeted.rs	invalid_regex_errors_and_keeps_no_state	sbg-error-retains-nothing	
+src/terminal/search_budgeted.rs	pattern_change_forged_cursor_and_cancel_all_restart	sbg-cursor-validity	
+src/terminal/search_budgeted.rs	search_summary_reads_completed_index_with_zero_rebuild	sbg-summary-reuse	
+src/terminal/search_index.rs	a_live_switch_to_wide_ambiguous_width_is_not_served_from_the_narrow_index	si-match-columns-are-drawn-cells	
+src/terminal/search_index.rs	a_live_switch_with_no_new_output_is_not_served_from_a_cache	si-match-columns-are-drawn-cells	
+src/terminal/search_index.rs	a_redraw_that_moves_cells_under_the_same_text_moves_the_matches	si-match-columns-are-drawn-cells	
+src/terminal/search_index.rs	a_rows_matches_do_not_change_when_it_scrolls_into_history	si-match-columns-are-drawn-cells	
+src/terminal/search_index.rs	ascii_after_a_zwj_is_found_where_either_history_tier_draws_it	si-match-columns-are-drawn-cells	
+src/terminal/search_index.rs	find_keeps_working_once_absolute_rows_pass_u32_max	si-cached-equals-fresh	
+src/terminal/search_index.rs	find_measures_ambiguous_characters_as_the_grid_draws_them	si-match-columns-are-drawn-cells	
+src/terminal/search_index.rs	find_reports_matches_in_the_cells_the_grid_drew_them_in	si-match-columns-are-drawn-cells	
+src/terminal/search_index.rs	find_reports_matches_where_either_history_tier_draws_them	si-match-columns-are-drawn-cells	
+src/terminal/search_index.rs	height_only_resize_keeps_history_searchable_with_stable_rows	si-cached-equals-fresh	
+src/terminal/search_index.rs	memory_budget_shrink_invalidates_the_cached_index	si-cached-equals-fresh	
+src/terminal/search_index.rs	release_drops_cache_then_next_search_rebuilds_identically	si-cached-equals-fresh	
+src/terminal/search_index.rs	repeat_search_reuses_cache_write_invalidates	si-cached-equals-fresh	
+src/terminal/search_index.rs	restore_checkpoint_drops_the_cached_search_index	si-cached-equals-fresh	
+src/terminal/search_index.rs	retention_shrink_invalidates_the_cached_index	si-cached-equals-fresh	
+src/terminal/search_index.rs	ring_eviction_steady_state_refreshes_and_equals_legacy	si-cached-equals-fresh	
+src/terminal/search_index.rs	scripted_mutation_mixture_keeps_the_refresh_equal_to_a_rebuild	si-cached-equals-fresh	
+src/terminal/search_index.rs	search_over_a_corrupt_tiered_segment_keeps_absolute_rows	si-cached-equals-fresh	
+src/terminal/search_index.rs	streaming_output_refreshes_incrementally_and_equals_legacy	si-cached-equals-fresh	
+src/terminal/search_index.rs	viewport_scroll_reuses_cache	si-cache-reuse-policy	
+src/terminal/search_index.rs	width_change_and_unscroll_rebuild_instead_of_refreshing	si-cached-equals-fresh	
+src/terminal/selection.rs	a_history_copy_after_a_live_ambiguous_switch_copies_the_cells_drawn	sel-copy-denotation	
+src/terminal/selection.rs	a_history_row_draws_a_flag_around_a_mark_as_the_screen_did	sel-history-cells-are-drawn-cells	
+src/terminal/selection.rs	a_history_rows_cells_name_the_cells_it_is_drawn_in	sel-history-cells-are-drawn-cells	
+src/terminal/selection.rs	a_scrollback_copy_measures_ambiguous_characters_as_the_grid_draws_them	sel-copy-denotation	
+src/terminal/selection.rs	copy_adds_no_blank_for_a_wide_glyphs_early_wrap	sel-copy-denotation	
+src/terminal/selection.rs	copy_keeps_a_space_printed_in_a_wrapped_rows_last_column	sel-copy-denotation	
+src/terminal/selection.rs	copy_keeps_wrap_boundary_spaces_in_prose_and_commands	sel-copy-denotation	
+src/terminal/selection.rs	copy_trims_a_line_that_ends_in_blanks_across_a_wrap	sel-copy-denotation	
+src/terminal/selection.rs	get_line_text_extracts_from_large_injected_scrollback_line	sel-bounded-line-text	
+src/terminal/selection.rs	get_line_text_positive_rows_are_scroll_invariant	sel-scroll-invariance	
+src/terminal/selection.rs	line_range_cells_name_the_cells_across_the_wrap	sel-history-cells-are-drawn-cells	
+src/terminal/selection.rs	line_range_cells_name_the_cells_where_a_row_measures_otherwise	sel-history-cells-are-drawn-cells	
+src/terminal/selection.rs	line_range_cells_reads_only_the_text_a_rows_cells_draw	sel-history-cells-are-drawn-cells	
+src/terminal/selection.rs	line_selection_copies_every_highlighted_row_before_column_expansion	sel-copy-denotation	
+src/terminal/selection.rs	line_text_bounded_borrows_valid_utf8_and_owns_lossy_text	sel-bounded-line-text	
+src/terminal/selection.rs	logical_line_span_joins_a_soft_wrap_and_stops_at_a_hard_newline	sel-logical-line-span	
+src/terminal/selection.rs	logical_line_span_joins_across_the_scrollback_boundary	sel-logical-line-span	
+src/terminal/selection.rs	push_row_capped_enforces_hard_byte_cap	sel-copy-caps	
+src/terminal/selection.rs	scrollback_line_range_text_bounds_scan_to_ceiling	sel-bounded-line-text	
+src/terminal/selection.rs	scrollback_line_range_text_lossy_prefix_is_bounded	sel-bounded-line-text	
+src/terminal/selection.rs	scrollback_line_range_text_rows	sel-copy-denotation	
+src/terminal/selection.rs	scrollback_selection_reads_each_history_line_once	sel-one-fetch-per-history-row	
+src/terminal/selection.rs	selection_byte_cap_is_hard_within_a_single_row	sel-copy-caps	
+src/terminal/selection.rs	selection_cap_bytes_truncates_tail	sel-copy-caps	
+src/terminal/selection.rs	selection_cap_rows_truncates_tail_preserving_start	sel-copy-caps	
+src/terminal/selection.rs	selection_copy_is_scroll_invariant	sel-scroll-invariance	
+src/terminal/selection.rs	selection_no_truncation_under_caps_is_byte_identical	sel-copy-caps	
+src/terminal/selection.rs	smart_word_at_finds_the_word_in_the_cells_the_grid_drew	sel-smart-word-in-cells	
+src/terminal/shell_api.rs	completed_command_seq_is_strictly_per_completion	sa-completed-command-seq	
+src/terminal/shell_api.rs	remove_user_var_keeps_order_queue_in_sync	(§4: delete)	
+src/terminal/shell_api.rs	set_user_var_evicts_oldest_first_deterministically	(§4: delete)	
+src/terminal/shell_api.rs	set_user_var_update_existing_does_not_evict	(§4: delete)	
+src/terminal/shell_integration_auth.rs	constant_time_eq_detects_late_mismatch	sia-ct-eq	
+src/terminal/shell_integration_auth.rs	decode_hex_32_roundtrip	sia-decode-hex	
+src/terminal/shell_integration_auth.rs	dropped_counter_saturates	sia-verify-nonce	
+src/terminal/shell_integration_auth.rs	revoke_blocks_future_verification	(§4: delete)	
+src/terminal/shell_integration_auth.rs	verify_nonce_ignores_id_in_position_1	sia-verify-nonce	
+src/terminal/shell_integration_auth.rs	verify_nonce_malformed_hex_returns_false	sia-verify-nonce	
+src/terminal/shell_integration_auth.rs	verify_nonce_matching_returns_true	sia-verify-nonce	
+src/terminal/shell_integration_auth.rs	verify_nonce_missing_id_param_returns_false	sia-verify-nonce	
+src/terminal/shell_integration_auth.rs	verify_nonce_scans_past_payload_params	sia-verify-nonce	
+src/terminal/shell_integration_auth.rs	verify_nonce_unauthorized_returns_false	sia-verify-nonce	
+src/terminal/shell_integration_auth.rs	verify_nonce_wrong_nonce_returns_false	sia-verify-nonce	
+src/terminal/state.rs	band_history_model_proves_and_catches_overwritten_replay	st-band-history-refines-model	
+src/terminal/state.rs	content_seq_advances_on_content_not_on_viewport_scroll	st-content-seq	
+src/terminal/state.rs	damage_epoch_advances_on_write_not_on_noop	st-damage-epoch	
+src/terminal/state.rs	delta_since_replays_only_fully_explained_epochs	st-delta-since	
+src/terminal/state.rs	scroll_damages_only_when_the_viewport_moves	st-damage-epoch	
+src/terminal/state.rs	terminal_band_history_conforms_through_overflow_and_rebaseline	st-band-history-refines-model	
+src/terminal/state.rs	the_band_ring_is_addressed_by_sequence_and_wraps	st-band-ring	
+src/terminal/terminal_modes_conformance.rs	a_soft_reset_that_keeps_the_sync_hold_is_the_buggy_step	tm-refines-model	
+src/terminal/terminal_modes_conformance.rs	real_mode_handlers_conform_to_terminal_modes_model	tm-refines-model	
+src/terminal/window_auth.rs	allowed_policy_mints_capability	wa-mint-iff-resolve	
+src/terminal/window_auth.rs	capability_and_authority_are_zero_sized	(§4: delete (replace with a const assert))	
+src/terminal/window_auth.rs	disallowed_policy_mints_no_capability	wa-mint-iff-resolve	
+src/terminal/window_auth.rs	explicit_xtwinops_rule_still_allows_when_legacy_bool_is_false	wa-mint-iff-resolve	
+src/terminal/window_auth.rs	minting_is_deterministic_in_policy_bit	(§4: delete)	
+src/terminal/window_auth.rs	standard_profile_wildcard_execute_does_not_overgrant_when_legacy_bool_is_false	wa-mint-iff-resolve	
+test_support/config/tests.rs	test_bidi_config_default	cfg-defaults	
+test_support/config/tests.rs	test_bidi_config_disabled	cfg-defaults	
+test_support/config/tests.rs	test_config_equality	(§4: delete)	
+test_support/config/tests.rs	test_default_config	cfg-defaults	
+test_support/generated/grapheme.rs	grapheme_ascii_printable_width_one	gr-width-bounds	
+test_support/generated/grapheme.rs	grapheme_byte_count_matches	gr-aggregate-consistency	
+test_support/generated/grapheme.rs	grapheme_width_bounded	gr-width-bounds	
+test_support/generated/grapheme.rs	grapheme_width_consistent_with_split	gr-aggregate-consistency	
+test_support/generated/scroll_pin.rs	scrollback_pin_preserves_absolute_top_during_live_output	viewport-pin	
+test_support/generated/sixel.rs	sixel_decoder_is_bounded_on_arbitrary_streams	sx-decoder-bounded	
+test_support/generated/sixel.rs	sixel_decoder_reuse_across_cycles	sx-decoder-bounded	
+test_support/generated/sixel.rs	sixel_image_span_calculations_no_panic	sx-span-total	
+test_support/grid/tests/extras_performance.rs	take_response_preserves_capacity	resp-take-response	
+tests/alt_archive_claude_like.rs	a_frame_closed_by_the_sync_timeout_is_committed	alt-archive-end-to-end	
+tests/alt_archive_claude_like.rs	a_main_screen_stream_leaves_the_archive_empty	alt-archive-end-to-end	
+tests/alt_archive_claude_like.rs	an_esu_cut_in_two_is_still_a_frame_boundary	process-chunk-invariance	
+tests/alt_archive_claude_like.rs	archive_equals_exactly_the_rows_that_scrolled_off	alt-archive-end-to-end	
+tests/alt_archive_claude_like.rs	chunked_feeds_give_an_identical_archive_and_grid	process-chunk-invariance	
+tests/alt_archive_claude_like.rs	the_archive_off_changes_nothing_else	alt-archive-noninterference	
+tests/capability_ceremony.rs	a_module_with_no_policy_carries_no_capability_ceremony	(§4: delete)	
+tests/capability_ceremony.rs	all_capability_modules_exist	(§4: delete)	
+tests/capability_ceremony.rs	capability_structs_do_not_derive_default_or_clone	(§4: delete (census guard or clippy rule))	
+tests/capability_ceremony.rs	every_capability_struct_has_private_seal	(§4: delete (census guard if the rule matters))	
+tests/capability_ceremony.rs	hyperlink_auth_keeps_the_host_minted_scheme_decision	(§4: delete)	
+tests/chunked_process_equivalence.rs	a_blanked_cell_keeps_no_extras_for_a_later_write_to_adopt	cell-extras-coherence	
+tests/chunked_process_equivalence.rs	a_rectangle_scroll_keeps_the_rows_wide_pairs_for_the_bulk_writers	cell-extras-coherence	
+tests/chunked_process_equivalence.rs	ascii_run_entering_decslrm_from_outside_wraps_at_the_right_margin	decslrm-run-wraps-at-the-right-margin	
+tests/chunked_process_equivalence.rs	chunked_process_is_byte_identical_to_whole_burst	process-chunk-invariance	
+tests/chunked_process_equivalence.rs	hangul_run_under_decslrm_matches_per_char_writes	process-chunk-invariance	
+tests/chunked_process_equivalence.rs	printed_blanks_count_toward_the_row_len_on_every_writer	row-len-is-the-written-extent	
+tests/chunked_process_equivalence.rs	random_streams_are_read_boundary_invariant	process-chunk-invariance	
+tests/chunked_process_equivalence.rs	rep_after_a_folded_emoji_repeats_the_same_character_on_every_path	rep-repeats-the-last-graphic-character	
+tests/chunked_process_equivalence.rs	ris_keeps_the_replies_queries_before_it_generated	process-chunk-invariance	
+tests/chunked_process_equivalence.rs	vt52_address_and_ascii_after_zwj_lay_out_the_same_on_every_path	vt52-address-and-ascii-after-zwj	
+tests/chunked_process_equivalence.rs	xtversion_reports_the_shared_application_identity	xtversion-reply	
+tests/codex_insert_history_scrollback.rs	codex_fresh_session_never_written_scrolls_mint_no_history	top-anchored-region-scroll-archives	
+tests/codex_insert_history_scrollback.rs	codex_fullscreen_grow_reveals_transcript_not_blanks_and_cursor_rides	content-anchored-metadata	
+tests/codex_insert_history_scrollback.rs	codex_scroll_keeps_footer_metadata_on_its_content_in_parser_order	content-anchored-metadata	
+tests/codex_insert_history_scrollback.rs	codex_scroll_repins_viewport_and_piecewise_reanchors_active_selection	content-anchored-metadata	
+tests/codex_insert_history_scrollback.rs	codex_shaped_decstbm_output_on_alternate_screen_remains_ephemeral	top-anchored-region-scroll-archives	
+tests/codex_insert_history_scrollback.rs	codex_streamed_blank_separator_line_is_archived	top-anchored-region-scroll-archives	
+tests/codex_insert_history_scrollback.rs	codex_top_anchored_decstbm_output_enters_scrollback	top-anchored-region-scroll-archives	
+tests/codex_insert_history_scrollback.rs	ordinary_full_screen_scrollback_does_not_bump_piecewise_row_revision	top-anchored-region-scroll-archives	
+tests/conformance_altscreen.rs	real_altscreen_roundtrip_conforms_to_altscreen_spec	alt-1049-roundtrip	
+tests/conformance_budgeted_search.rs	dense_result_backlog_drains_without_rescanning_or_replaying_deltas	sbg-refines-model	
+tests/conformance_budgeted_search.rs	one_turn_restart_retains_reset_and_search_id_without_a_cursor	sbg-refines-model	
+tests/conformance_budgeted_search.rs	real_terminal_reset_identity_resume_and_retirement_refine_the_model	sbg-refines-model	
+tests/conformance_budgeted_search.rs	slipped_real_steps_are_the_buggy_transitions_and_are_rejected	(§4: delete (move to aterm-spec))	
+tests/conformance_budgeted_search.rs	stale_identity_and_early_or_stuttering_drain_negative_controls_are_rejected	(§4: delete (move to aterm-spec))	
+tests/conformance_hyperlink_scheme_cap.rs	real_terminal_scheme_mints_refusals_and_gate_refine_the_model	hyperlink-auth	
+tests/conformance_observe.rs	a_row_match_latches_across_an_equal_seq_alt_screen_re_entry	watcher-row-match	
+tests/conformance_observe.rs	an_unmoved_generation_latches_nothing	watcher-seq-latch	
+tests/conformance_observe.rs	idle_baseline_is_arm_relative_not_reset_by_a_phantom_advance	watcher-idle-deadline	
+tests/conformance_observe.rs	idle_deadline_is_reset_by_alt_screen_output	watcher-idle-deadline	
+tests/conformance_observe.rs	idle_does_not_fire_before_the_deadline	watcher-idle-deadline	
+tests/conformance_observe.rs	idle_latches_identically_live_vs_replay_on_the_real_engine	watcher-idle-deadline	
+tests/conformance_observe.rs	negative_control_non_content_batch_does_not_latch	watcher-seq-latch	
+tests/conformance_observe.rs	row_match_still_latches_after_entering_the_alt_screen	watcher-row-match	
+tests/conformance_observe.rs	seq_advanced_arm_eval_does_not_disturb_a_concurrent_idle_deadline	watcher-idle-deadline	
+tests/conformance_observe.rs	seq_advanced_latches_at_arm_when_content_already_moved	watcher-seq-latch	
+tests/conformance_observe.rs	seq_advanced_latches_on_real_engine_output	watcher-seq-latch	
+tests/conformance_observe.rs	seq_watcher_latches_on_the_buffer_swap_itself	watcher-seq-latch	
+tests/conformance_observe.rs	the_kernel_change_test_conforms_to_the_screen_generation_model	watcher-seq-latch	
+tests/conformance_observe.rs	watchers_are_excluded_from_checkpoint_hydration	checkpoint-roundtrip	
+tests/conformance_read_image_seq.rs	host_bumped_seq_is_the_run_ahead_stamp_the_engine_stamp_never_is	st-damage-epoch	
+tests/conformance_read_image_seq.rs	noop_process_does_not_advance_snapshot_seq	st-damage-epoch	
+tests/conformance_read_image_seq.rs	real_cell_frame_seq_is_monotone_isolated_and_stale_detectable	st-damage-epoch	
+tests/conformance_recording.rs	replay_from_checkpoint_matches_live_engine	checkpoint-roundtrip	
+tests/conformance_recording.rs	replay_negative_control_dropped_delta_diverges	(§4: delete when checkpoint-roundtrip is Certified)	
+tests/conformance_repaint_nudge.rs	a_flap_the_program_never_saw_during_the_hold_is_a_give_up	rn-refines-model	
+tests/conformance_repaint_nudge.rs	a_halt_blocks_the_hold_and_one_during_it_is_judged	rn-refines-model	
+tests/conformance_repaint_nudge.rs	a_program_that_answers_200ms_late_is_still_repaired	rn-refines-model	
+tests/conformance_repaint_nudge.rs	a_program_that_answers_at_once_is_repaired_with_the_engine_untouched	rn-refines-model	
+tests/conformance_repaint_nudge.rs	a_program_that_never_answers_leaves_the_screen_and_the_debt_as_they_were	rn-refines-model	
+tests/conformance_repaint_nudge.rs	a_program_that_repaints_without_a_full_clear_is_tried_once_and_abandoned	rn-refines-model	
+tests/conformance_repaint_nudge.rs	a_program_that_streams_through_both_answers_is_healed	rn-refines-model	
+tests/conformance_repaint_nudge.rs	ordinary_frames_before_a_late_answer_are_not_taken_for_it	rn-refines-model	
+tests/conformance_repaint_nudge.rs	the_models_guards_reject_the_wrong_drivers	(§4: delete (move to aterm-spec))	
+tests/conformance_shared_budget.rs	forged_over_cap_share_is_rejected	(§4: delete (keep the model check in aterm-spec))	
+tests/conformance_shared_budget.rs	real_share_registry_conforms_to_spec	shared-scrollback-budget	
+tests/conformance_shared_budget.rs	real_stores_evict_to_the_shared_global	shared-scrollback-budget	
+tests/control_string_cancel.rs	a_canceled_chunk_ends_its_chunked_transfer	can-sub-cancels-every-string-consumer	
+tests/control_string_cancel.rs	a_canceled_hyperlink_is_not_opened	can-sub-cancels-every-string-consumer	
+tests/control_string_cancel.rs	a_canceled_kitty_command_draws_nothing	can-sub-cancels-every-string-consumer	
+tests/control_string_cancel.rs	a_canceled_osc_52_writes_no_clipboard	can-sub-cancels-every-string-consumer	
+tests/control_string_cancel.rs	a_canceled_query_is_not_answered	can-sub-cancels-every-string-consumer	
+tests/control_string_cancel.rs	a_canceled_title_is_not_set	can-sub-cancels-every-string-consumer	
+tests/empty_param_default.rs	a_trailing_empty_sgr_parameter_resets	empty-trailing-param-is-default	
+tests/empty_param_default.rs	count_dependent_handlers_read_a_trailing_empty_parameter_as_the_default	empty-trailing-param-is-default	
+tests/fuzz_alt_screen.rs	alt_screen_1049_roundtrip_preserves_main_and_cursor	alt-1049-roundtrip	
+tests/fuzz_process_never_panics.rs	a_decdwl_row_resized_through_its_wide_pair_stays_consistent	terminal-wf-invariant	
+tests/fuzz_process_never_panics.rs	alt_screen_resize_never_panics	terminal-wf-invariant	bottom-line-feed-scrolls-the-screen
+tests/fuzz_process_never_panics.rs	an_alt_screen_width_cut_through_a_wide_pair_drops_its_extras	extras-follow-their-glyph	
+tests/fuzz_process_never_panics.rs	process_arbitrary_bytes_never_panics	terminal-wf-invariant	
+tests/fuzz_process_never_panics.rs	process_crafted_escape_sequences_never_panics	terminal-wf-invariant	
+tests/fuzz_process_never_panics.rs	process_unicode_edges_never_panics	terminal-wf-invariant	
+tests/fuzz_process_never_panics.rs	reflow_wide_char_resize_never_panics	terminal-wf-invariant	bottom-line-feed-scrolls-the-screen
+tests/fuzz_process_never_panics.rs	resize_reflow::resize_reflow_keeps_engine_invariants	terminal-wf-invariant	
+tests/fuzz_process_never_panics.rs	resize_reflow::resize_reflow_keeps_engine_invariants_under_the_conpty_policy	absolute-keys-cover-retained-rows	
+tests/fuzz_process_never_panics/fresh.rs	fresh_terminal_chunked_escape_soup_never_panics	terminal-wf-invariant	
+tests/fuzz_process_never_panics/fresh.rs	fresh_terminal_single_batch_arbitrary_bytes_never_panics	terminal-wf-invariant	
+tests/fuzz_process_never_panics/fresh.rs	fresh_terminal_single_batch_escape_soup_never_panics	terminal-wf-invariant	
+tests/fuzz_process_never_panics/fresh.rs	fresh_tiny_grid_escape_soup_never_panics	terminal-wf-invariant	
+tests/fuzz_process_never_panics/fresh.rs	known_adversarial_corpus_is_survived	sixel-dcs-never-leaks-glyphs	
+tests/grid_column_agreement.rs	a_grapheme_folded_across_a_cluster_boundary_lives_in_the_cell_it_joined	si-match-columns-are-drawn-cells	
+tests/grid_column_agreement.rs	a_scrollback_selection_copies_the_text_the_highlight_covers	si-match-columns-are-drawn-cells	
+tests/grid_column_agreement.rs	grid_columns_agree_with_what_the_grid_paints	grid-columns-model-agreement	
+tests/grid_column_agreement.rs	grid_columns_agree_with_what_the_grid_paints_under_wide_ambiguous_width	grid-columns-model-agreement	
+tests/grid_column_agreement.rs	the_find_bar_reports_the_column_the_grid_paints	si-match-columns-are-drawn-cells	
+tests/handoff_alt_screen_checkpoint.rs	a_carried_archive_goes_on_exactly_as_the_old_engine_would	alt-archive-carry-continues	
+tests/handoff_alt_screen_checkpoint.rs	a_counters_only_carry_says_lost_and_goes_on	alt-archive-carry-continues	
+tests/handoff_alt_screen_checkpoint.rs	a_differ_state_taken_after_the_freeze_goes_on_exactly	alt-archive-carry-continues	
+tests/handoff_alt_screen_checkpoint.rs	a_resize_after_a_carried_archive_is_a_gap_that_loses_nothing	alt-archive-carry-continues	
+tests/handoff_alt_screen_checkpoint.rs	a_tail_carry_recognizes_a_scroll_back_past_its_first_row	alt-archive-carry-continues	
+tests/handoff_alt_screen_checkpoint.rs	an_adopted_composer_is_never_archived_by_the_first_resize	alt-archive-end-to-end	
+tests/handoff_alt_screen_checkpoint.rs	an_adopted_screen_resized_before_its_first_frame_archives_only_what_left	alt-archive-end-to-end	
+tests/handoff_alt_screen_checkpoint.rs	an_adopting_engine_with_the_archive_off_drops_the_carry	alt-archive-carry-continues	
+tests/handoff_alt_screen_checkpoint.rs	the_alt_blob_is_exactly_rows_records_after_leaving_the_alternate_screen	checkpoint-carry-wire-shape	
+tests/handoff_alt_screen_checkpoint.rs	the_alt_blob_is_exactly_rows_records_under_mode_1047_too	checkpoint-carry-wire-shape	
+tests/handoff_alt_screen_checkpoint.rs	the_alt_blob_is_exactly_rows_records_while_the_alternate_screen_is_up	checkpoint-carry-wire-shape	
+tests/handoff_alt_screen_checkpoint.rs	the_main_blob_is_rows_plus_its_declared_history	checkpoint-carry-wire-shape	
+tests/handoff_alt_screen_checkpoint.rs	the_primary_screen_carries_history	checkpoint-carry-wire-shape	
+tests/handoff_alt_screen_checkpoint.rs	without_the_differ_state_the_restored_screen_is_the_baseline	alt-archive-carry-continues	
+tests/handoff_colour_and_shell_carry.rs	a_command_running_across_the_handoff_completes_after_it	checkpoint-carry-continues	
+tests/handoff_colour_and_shell_carry.rs	a_fresh_numbered_restore_still_reserves_the_whole_import	absolute-keys-cover-retained-rows	
+tests/handoff_colour_and_shell_carry.rs	carried_blocks_name_the_same_lines_after_the_history_import	content-anchored-metadata	
+tests/handoff_colour_and_shell_carry.rs	colours_the_application_set_survive_over_the_new_theme	checkpoint-carry-continues	
+tests/handoff_parser_carry.rs	a_dcs_string_split_in_its_header_is_read_as_it_would_have_been	checkpoint-carry-continues	
+tests/handoff_parser_carry.rs	a_refused_carry_resumes_at_ground	refused-parser-carry-resumes-at-ground	
+tests/handoff_parser_carry.rs	a_split_sgr_across_the_handoff_applies	checkpoint-carry-continues	
+tests/handoff_parser_carry.rs	a_split_utf8_across_the_handoff_is_one_glyph	checkpoint-carry-continues	
+tests/handoff_parser_carry.rs	an_unterminated_osc_title_completes_after_the_handoff	checkpoint-carry-continues	
+tests/handoff_parser_carry.rs	every_split_of_a_mixed_stream_lands_on_the_same_screen	checkpoint-carry-continues	
+tests/handoff_parser_carry.rs	split_at_park_matches_unsplit	checkpoint-carry-continues	
+tests/handoff_saved_cursor_after_shrink.rs	a_narrowing_after_entering_the_alternate_screen_carries_the_saved_cell_through_the_rewrap	saved-cursor-follows-content	
+tests/handoff_saved_cursor_after_shrink.rs	a_restored_terminal_keeps_the_deferred_wrap_the_live_one_keeps	checkpoint-carry-continues	
+tests/handoff_saved_cursor_after_shrink.rs	a_restored_terminal_leaves_the_alternate_screen_onto_the_same_cell_after_growing_back	checkpoint-carry-continues	
+tests/handoff_saved_cursor_after_shrink.rs	a_restored_terminal_leaves_the_alternate_screen_onto_the_same_cell_at_the_same_size	checkpoint-carry-continues	
+tests/handoff_saved_cursor_after_shrink.rs	a_restored_terminal_restores_a_bare_decrc_onto_the_same_cell_as_the_live_one	checkpoint-carry-continues	
+tests/handoff_saved_cursor_after_shrink.rs	a_shrink_after_entering_the_alternate_screen_carries_the_saved_cursor_with_its_line	saved-cursor-follows-content	
+tests/handoff_saved_cursor_after_shrink.rs	a_shrink_carries_the_alternate_screen_saved_cursor_with_its_row	saved-cursor-follows-content	
+tests/handoff_saved_cursor_after_shrink.rs	a_slot_on_a_trimmed_row_is_carried_past_the_grid	checkpoint-carry-continues	
+tests/handoff_saved_cursor_after_shrink.rs	the_raw_checkpoint_is_a_fixed_point_of_restore_and_recapture	checkpoint-roundtrip	
+tests/history_shed_alt_screen.rs	shed_on_the_primary_screen_is_unchanged_and_ring_only_is_none	history-shed-contract	
+tests/history_shed_alt_screen.rs	shed_sees_and_strips_the_links_the_ring_holds	history-shed-contract	
+tests/history_shed_alt_screen.rs	shed_trims_the_primary_history_while_the_alt_screen_is_up	history-shed-contract	
+tests/image_horizon_offload.rs	a_session_that_never_drew_a_picture_never_reports_a_crossing	image-retention-horizon	
+tests/image_horizon_offload.rs	crossing_the_horizon_is_reported_and_never_silent	image-retention-horizon	
+tests/image_horizon_offload.rs	inside_the_horizon_a_scrolled_off_picture_is_whole	image-retention-horizon	
+tests/image_horizon_offload.rs	past_the_horizon_the_row_is_the_empty_row_it_always_was_under_the_picture	image-retention-horizon	
+tests/image_survives_column_reflow.rs	a_column_resize_keeps_every_tile_of_an_inline_image	extras-follow-their-glyph	
+tests/image_survives_column_reflow.rs	an_image_follows_the_text_it_was_printed_under	extras-follow-their-glyph	
+tests/image_survives_column_reflow.rs	an_over_wide_footprint_clips_instead_of_wrapping	extras-follow-their-glyph	
+tests/image_survives_column_reflow.rs	image_survives_a_combined_resize_and_an_alt_screen_round_trip	extras-follow-their-glyph	
+tests/image_survives_scrollback.rs	a_live_image_keeps_its_row_while_the_viewport_is_partly_scrolled_back	viewport-projection	
+tests/image_survives_scrollback.rs	a_scrolled_back_image_shares_one_payload_across_its_rows	history-image-payload-shared	
+tests/image_survives_scrollback.rs	an_image_scrolled_off_the_top_is_still_there_when_you_scroll_back	history-render-parity	
+tests/kitty_chunked_load.rs	a_chunk_can_quiet_the_answer_to_its_load	kitty-chunked-load-lifecycle	
+tests/kitty_chunked_load.rs	a_command_on_another_medium_ends_the_load	kitty-chunked-load-lifecycle	
+tests/kitty_chunked_load.rs	a_command_refused_before_routing_leaves_the_load_in_flight	kitty-chunked-load-lifecycle	
+tests/kitty_chunked_load.rs	a_delete_between_chunks_runs_and_ends_the_load	kitty-chunked-load-lifecycle	
+tests/kitty_chunked_load.rs	a_load_assembles_across_a_title_and_repeated_keys	kitty-chunked-load-lifecycle	
+tests/kitty_chunked_load.rs	a_prompt_or_command_start_ends_an_abandoned_load	kitty-chunked-load-lifecycle	
+tests/kitty_chunked_load.rs	a_put_between_chunks_shows_and_the_load_goes_on	kitty-chunked-load-lifecycle	
+tests/kitty_chunked_load.rs	only_a_first_chunk_kitty_accepts_holds_a_load	kitty-chunked-load-lifecycle	
+tests/kitty_graphics_delete.rs	delete_all_lowercase_clears_placements_and_keeps_the_store	kitty-delete-semantics	
+tests/kitty_graphics_delete.rs	delete_all_uppercase_frees_the_store_too	kitty-delete-semantics	
+tests/kitty_graphics_delete.rs	delete_at_cursor_clears_the_covering_placement_in_full	kitty-delete-semantics	
+tests/kitty_graphics_delete.rs	delete_at_cursor_over_empty_cell_is_a_no_op	kitty-delete-semantics	
+tests/kitty_graphics_delete.rs	delete_at_point_clears_only_the_placement_covering_that_cell	kitty-delete-semantics	
+tests/kitty_graphics_delete.rs	delete_at_point_with_z_index_needs_the_z_to_match	kitty-delete-semantics	
+tests/kitty_graphics_delete.rs	delete_by_column_and_by_row	kitty-delete-semantics	
+tests/kitty_graphics_delete.rs	delete_by_id_and_placement_id_removes_only_that_placement	kitty-delete-semantics	
+tests/kitty_graphics_delete.rs	delete_by_id_range	kitty-delete-semantics	
+tests/kitty_graphics_delete.rs	delete_by_id_touches_only_that_image_and_keeps_its_data	kitty-delete-semantics	
+tests/kitty_graphics_delete.rs	delete_by_id_uppercase_frees_that_data_and_no_other	kitty-delete-semantics	
+tests/kitty_graphics_delete.rs	delete_by_number_addresses_the_newest_image_with_that_number	kitty-delete-semantics	
+tests/kitty_graphics_delete.rs	delete_by_z_index	kitty-delete-semantics	
+tests/kitty_graphics_delete.rs	frame_delete_of_a_single_frame_image	kitty-delete-semantics	
+tests/kitty_graphics_delete.rs	kitty_delete_never_erases_another_protocols_image	kitty-delete-semantics	
+tests/kitty_graphics_delete.rs	put_with_an_existing_placement_id_moves_it	kitty-delete-semantics	
+tests/kitty_graphics_delete.rs	unaddressed_selectors_delete_nothing	kitty-delete-semantics	
+tests/kitty_graphics_delete.rs	uppercase_point_delete_frees_data_only_when_no_placement_remains	kitty-delete-semantics	
+tests/mem_budget.rs	engine_retained_heap_within_budget	(§4: move-to-bench)	
+tests/osc_param_tail.rs	a_hyperlink_uri_keeps_every_semicolon_and_is_never_silently_shortened	osc-semicolon-tail-preserved	
+tests/osc_param_tail.rs	a_title_keeps_every_semicolon_separated_field	osc-semicolon-tail-preserved	
+tests/perf_scaling.rs	engine_steady_state_processing_is_allocation_free	(§4: move-to-bench)	
+tests/replay_corpus_probe.rs	every_corpus_folds_chunk_independently	process-chunk-invariance	
+tests/replay_corpus_probe.rs	every_corpus_record_conforms_to_coalesce_model	process-chunk-invariance	
+tests/replay_offset_determinism.rs	coalescing_chunk_boundaries_do_not_change_state	process-chunk-invariance	
+tests/replay_offset_determinism.rs	from_checkpoint_hydration_continues_the_mirror	checkpoint-roundtrip	
+tests/replay_offset_determinism.rs	golden_visible_content_hash_is_pinned	(§4: delete)	
+tests/replay_offset_determinism.rs	negative_control_dropping_a_record_diverges	(§4: delete when checkpoint-roundtrip is Certified)	
+tests/replay_offset_determinism.rs	replay_from_zero_mirrors_live_at_every_offset	process-chunk-invariance	
+tests/resize_preserves_non_bmp.rs	column_reflow_preserves_parser_clusters_and_render_payloads	reflow-preserves-logical-lines	
+tests/resize_preserves_non_bmp.rs	column_reflow_preserves_ring_rgb_with_structured_extras	extras-follow-their-glyph	
+tests/resize_preserves_non_bmp.rs	column_reflow_still_preserves_non_bmp_cell	reflow-preserves-logical-lines	
+tests/resize_preserves_non_bmp.rs	font_refit_style_resize_preserves_non_bmp_cell	reflow-preserves-logical-lines	
+tests/resize_preserves_non_bmp.rs	rows_only_grow_preserves_non_bmp_cell	reflow-preserves-logical-lines	
+tests/resize_preserves_non_bmp.rs	rows_only_shrink_preserves_non_bmp_cell	reflow-preserves-logical-lines	
+tests/resize_quiet_flap_identity.rs	a_quiet_flap_is_a_styled_identity	rj-quiet-flap-identity	
+tests/resize_quiet_flap_identity.rs	resize_keeps_truecolor_in_render_row	extras-follow-their-glyph	
+tests/resize_rewrap_fidelity.rs	a_coloured_early_wrap_hole_stays_out_of_history	reflow-preserves-logical-lines	
+tests/resize_rewrap_fidelity.rs	a_cursor_after_a_printed_space_keeps_its_column	reflow-preserves-logical-lines	
+tests/resize_rewrap_fidelity.rs	a_full_rows_last_cell_survives_widening_out_of_history	reflow-preserves-logical-lines	
+tests/resize_rewrap_fidelity.rs	a_hole_a_rewrap_made_is_dropped_by_the_next_rewrap	reflow-preserves-logical-lines	
+tests/resize_rewrap_fidelity.rs	a_line_straddling_the_history_boundary_keeps_its_full_rows_last_cells	reflow-preserves-logical-lines	
+tests/resize_rewrap_fidelity.rs	a_long_run_of_printed_spaces_survives_offloaded_width_changes	reflow-preserves-logical-lines	
+tests/resize_rewrap_fidelity.rs	a_one_column_history_row_scrolled_back_styles_no_blank	extras-follow-their-glyph	
+tests/resize_rewrap_fidelity.rs	a_real_early_wrap_hole_is_dropped_on_rejoin	reflow-preserves-logical-lines	
+tests/resize_rewrap_fidelity.rs	margined_vertical_moves_keep_printed_blanks_and_wrap_holes_distinct	reflow-preserves-logical-lines
+tests/resize_rewrap_fidelity.rs	a_real_space_before_an_early_wrapped_glyph_survives_a_screen_round_trip	reflow-preserves-logical-lines	
+tests/resize_rewrap_fidelity.rs	a_restored_engine_rewraps_as_the_live_one	checkpoint-carry-continues	
+tests/resize_rewrap_fidelity.rs	a_space_written_into_a_hole_later_is_kept	reflow-preserves-logical-lines	
+tests/resize_rewrap_fidelity.rs	a_vs16_glyph_kept_narrow_in_mid_row_keeps_the_styles_after_it_in_place	extras-follow-their-glyph	
+tests/resize_rewrap_fidelity.rs	a_wide_glyph_one_column_cannot_hold_leaves_no_link_in_history	extras-follow-their-glyph	
+tests/resize_rewrap_fidelity.rs	an_edit_over_the_holes_column_ends_the_hole	reflow-preserves-logical-lines	
+tests/resize_rewrap_fidelity.rs	offloaded_tiered_history_keeps_spaces_at_reflow_chunk_ends	reflow-preserves-logical-lines	
+tests/resize_rewrap_fidelity.rs	spaces_between_emoji_clusters_survive_a_screen_round_trip	reflow-preserves-logical-lines	
+tests/resize_rewrap_fidelity.rs	tiered_history_keeps_spaces_at_reflow_chunk_ends	reflow-preserves-logical-lines	
+tests/ris_preserves_host_policy.rs	byte_stream_ris_preserves_shell_integration_nonce_requirement	host-policy-survives-reset	
+tests/ris_preserves_host_policy.rs	reset_paths_agree_on_nonce_preservation	host-policy-survives-reset	
+tests/saved_cursor_follows_resize.rs	a_bare_decsc_follows_its_line_through_a_rewrap	saved-cursor-follows-content	
+tests/saved_cursor_follows_resize.rs	a_bare_decsc_follows_its_line_when_the_rewrap_pushes_rows_into_history	saved-cursor-follows-content	
+tests/saved_cursor_follows_resize.rs	a_grow_under_the_alternate_screen_moves_the_saved_cursor_with_the_reveal	saved-cursor-follows-content	
+tests/saved_cursor_follows_resize.rs	a_maximize_under_the_alternate_screen_puts_the_prompt_under_its_command	saved-cursor-follows-content	
+tests/saved_cursor_follows_resize.rs	a_narrowing_under_the_alternate_screen_moves_the_saved_cursor_with_its_line	saved-cursor-follows-content	
+tests/saved_cursor_follows_resize.rs	a_saved_column_past_the_lines_content_keeps_its_distance	saved-cursor-follows-content	
+tests/saved_cursor_follows_resize.rs	a_slot_on_a_line_the_narrowing_dropped_stays_past_the_grid	saved-cursor-follows-content	
+tests/saved_cursor_follows_resize.rs	a_slot_past_the_grid_rides_a_reveal_below_the_content	saved-cursor-follows-content	
+tests/saved_cursor_follows_resize.rs	a_slot_past_the_grid_rides_the_deficit_fill_below_the_content	saved-cursor-follows-content	
+tests/saved_cursor_follows_resize.rs	a_width_round_trip_under_the_alternate_screen_leaves_the_saved_cursor_in_place	saved-cursor-follows-content	
+tests/saved_cursor_follows_resize.rs	the_alternate_screens_saved_cursor_follows_a_demoting_shrink	saved-cursor-follows-content	
+tests/scoped_extract_alloc.rs	ten_thousand_one_row_echoes_extract_with_zero_allocations_after_warm_up	rc-damage-scoped-equals-full	
+tests/scroll_pin_across_alt_screen.rs	a_live_screen_selection_survives_the_round_trip	selection-custody	
+tests/scroll_pin_across_alt_screen.rs	a_live_tiered_viewport_stays_live_across_a_rows_only_resize	viewport-pin	
+tests/scroll_pin_across_alt_screen.rs	a_live_viewport_stays_live_across_a_rows_only_resize	viewport-pin	
+tests/scroll_pin_across_alt_screen.rs	a_live_viewport_stays_live_across_the_round_trip	viewport-pin	
+tests/scroll_pin_across_alt_screen.rs	a_rows_only_resize_keeps_the_anchor_through_deep_capped_history	viewport-pin	
+tests/scroll_pin_across_alt_screen.rs	a_rows_only_resize_keeps_the_anchor_through_offloaded_tiered_history	viewport-pin	
+tests/scroll_pin_across_alt_screen.rs	a_rows_only_resize_keeps_the_same_line_under_the_eye	viewport-pin	
+tests/scroll_pin_across_alt_screen.rs	a_rows_only_resize_keeps_the_selection	selection-custody	
+tests/scroll_pin_across_alt_screen.rs	a_rows_only_resize_while_alt_is_up_still_re_anchors_the_parked_primary	viewport-pin	
+tests/scroll_pin_across_alt_screen.rs	a_rows_only_resize_while_on_alt_keeps_the_parked_selection	selection-custody	
+tests/scroll_pin_across_alt_screen.rs	a_rows_only_shrink_follows_a_demoted_live_row_into_history	selection-custody	
+tests/scroll_pin_across_alt_screen.rs	a_rows_only_shrink_keeps_a_scrollback_selection_over_its_own_text	selection-custody	
+tests/scroll_pin_across_alt_screen.rs	a_rows_only_shrink_under_alt_keeps_the_parked_scrollback_selection	selection-custody	
+tests/scroll_pin_across_alt_screen.rs	a_selection_made_on_alt_does_not_leak_back_to_main	selection-custody	
+tests/scroll_pin_across_alt_screen.rs	a_selection_survives_an_alt_round_trip_inside_one_batch	selection-custody	
+tests/scroll_pin_across_alt_screen.rs	a_selection_survives_an_alt_screen_app_in_every_mode	selection-custody	
+tests/scroll_pin_across_alt_screen.rs	a_shrink_absorbed_entirely_by_trailing_blanks_leaves_the_anchor_alone	selection-custody	
+tests/scroll_pin_across_alt_screen.rs	a_stranded_splice_does_not_trip_the_cross_grid_assert_on_exit	selection-custody	
+tests/scroll_pin_across_alt_screen.rs	a_width_resize_still_clears_the_selection	selection-custody	
+tests/scroll_pin_across_alt_screen.rs	a_width_resize_still_leaves_the_reader_in_history	viewport-pin	
+tests/scroll_pin_across_alt_screen.rs	a_width_resize_while_on_alt_clears_the_parked_selection	selection-custody	
+tests/scroll_pin_across_alt_screen.rs	alt_screen_scrolling_does_not_walk_the_parked_selection	selection-custody	
+tests/scroll_pin_across_alt_screen.rs	an_alt_screen_app_does_not_steal_the_reading_position	viewport-pin	
+tests/scroll_pin_across_alt_screen.rs	an_exit_and_re_entry_in_one_batch_kills_the_previous_alt_selection	selection-custody	
+tests/scroll_pin_across_alt_screen.rs	an_rmcup_mid_batch_writes_to_the_live_screen_not_into_history	viewport-pin	
+tests/scroll_pin_across_alt_screen.rs	output_before_an_smcup_in_the_same_batch_still_moves_the_pin	viewport-pin	
+tests/scroll_pin_across_alt_screen.rs	ris_then_reenter_alt_in_one_batch_leaves_no_surviving_highlight	selection-custody	
+tests/scroll_pin_across_alt_screen.rs	scrollback_evicted_while_parked_does_not_resurrect_a_dangling_anchor	selection-custody	
+tests/scroll_pin_across_alt_screen.rs	stranded_alt_buffer_bookkeeping_survives_re_entry	selection-custody	
+tests/scroll_pin_across_alt_screen.rs	the_position_survives_when_entry_and_exit_are_separate_batches	viewport-pin	
+tests/scroll_pin_across_alt_screen.rs	the_raw_alt_screen_modes_preserve_it_too	viewport-pin	
+tests/scroll_pin_across_alt_screen.rs	wholesale_destruction_while_on_alt_takes_the_parked_selection_with_it	selection-custody	
+tests/scrollback_content_integrity.rs	resize_preserves_scrollback_logical_lines_both_directions	reflow-preserves-logical-lines	
+tests/scrollback_content_integrity.rs	resize_preserves_scrollback_with_tiered_storage	reflow-preserves-logical-lines	
+tests/scrollback_content_integrity.rs	resize_round_trip_restores_known_early_line	reflow-preserves-logical-lines	
+tests/scrollback_content_integrity.rs	scrollback_preserves_line_content_in_order	scrollback-fifo	
+tests/scrollback_content_integrity.rs	synchronized_update_scrolls_nonblank_lines_into_scrollback	sync-update-is-render-only	
+tests/scrollback_preserves_extras.rs	live_view_unchanged_at_offset_zero	viewport-projection	
+tests/scrollback_preserves_extras.rs	partial_scroll_live_row_reads_correct_extras	viewport-projection	
+tests/scrollback_preserves_extras.rs	render_matches_row_text_across_offsets	viewport-projection	
+tests/scrollback_preserves_extras.rs	row_ansi_text_screen_ignores_scroll_position	viewport-projection	
+tests/scrollback_preserves_extras.rs	row_text_screen_ignores_scroll_position	viewport-projection	
+tests/scrollback_preserves_extras.rs	scroll_to_top_shows_oldest_line_first	viewport-projection	
+tests/scrollback_preserves_extras.rs	scrollback_parity_inverse_truecolor_wide_char	history-render-parity	
+tests/scrollback_preserves_extras.rs	scrollback_parity_rows	history-render-parity	
+tests/scrollback_preserves_extras.rs	scrollback_parity_underline_colour_rows	history-render-parity	
+tests/scrollback_preserves_extras.rs	scrollback_render_preserves_combining_mark	history-render-parity	
+tests/scrollback_preserves_extras.rs	scrollback_render_preserves_emoji	history-render-parity	
+tests/scrollback_preserves_extras.rs	scrollback_render_preserves_flag_pair	history-render-parity	
+tests/scrollback_preserves_extras.rs	scrollback_render_preserves_skin_tone	history-render-parity	
+tests/scrollback_preserves_extras.rs	scrollback_render_preserves_truecolor	history-render-parity	
+tests/scrollback_preserves_extras.rs	scrollback_render_preserves_zwj_cluster	history-render-parity	
+tests/scrollback_preserves_extras.rs	scrollback_row_text_preserves_combining_mark	history-render-parity	
+tests/scrollback_preserves_extras.rs	scrollback_row_text_preserves_emoji	history-render-parity	
+tests/scrollback_preserves_extras.rs	scrollback_spacer_keeps_lead_underline_colour	history-render-parity	
+tests/scrollback_preserves_extras.rs	scrollback_spacer_underline_index_reresolves_after_palette_change	history-render-parity	
+tests/scrollback_preserves_extras.rs	scrollback_underline_indexed_reresolves_after_palette_change	history-render-parity	
+tests/scrollback_preserves_extras.rs	scrollback_vs16_base_folds_skin_tone	history-render-parity	
+tests/scrollback_preserves_extras.rs	scrollback_wide_nonbase_keeps_skin_tone_split	history-render-parity	
+tests/scrollback_preserves_extras.rs	vs16_widened_spacer_carries_the_lead_underline_colour_live	history-render-parity	
+tests/scrollback_ring_materialize_parity.rs	ring_rows_materialize_identically_to_the_line_round_trip	ring-fast-materialize-equals-line-roundtrip	
+tests/scrollback_ring_materialize_parity.rs	tiered_rows_fall_back_to_the_line_path	ring-fast-materialize-equals-line-roundtrip	
+tests/scrolled_back_frame_materialize_count.rs	a_kitty_unscroll_renumbers_history_and_reopens_the_bill	viewport-memo-coherent	
+tests/scrolled_back_frame_materialize_count.rs	a_stationary_scrolled_back_repaint_materializes_no_history_rows	(§4: move-to-bench)	
+tests/scrolled_back_frame_materialize_count.rs	a_wheel_notch_pays_only_for_the_rows_that_scrolled_in	(§4: move-to-bench)	
+tests/scrolled_back_frame_materialize_count.rs	output_arriving_while_scrolled_back_reopens_the_bill	viewport-memo-coherent	
+tests/selection_custody_conformance.rs	a_bare_carriage_return_overwrite_clears_the_stale_highlight	selection-custody	
+tests/selection_custody_conformance.rs	a_fifth_disjoint_repaint_still_spares_the_gap_between_them	selection-custody	
+tests/selection_custody_conformance.rs	a_rect_copy_clears_over_its_destination_but_spares_its_source	selection-custody	
+tests/selection_custody_conformance.rs	a_region_scroll_clears_a_selection_inside_it	selection-custody	
+tests/selection_custody_conformance.rs	a_region_scroll_spares_a_selection_it_never_touched	selection-custody	
+tests/selection_custody_conformance.rs	a_reverse_region_scroll_spares_a_scrollback_selection	selection-custody	
+tests/selection_custody_conformance.rs	a_rows_grow_that_reveals_history_moves_the_selection_with_its_content	selection-custody	
+tests/selection_custody_conformance.rs	a_scroll_on_the_alt_screen_clears_rather_than_clamping_to_alt_row_zero	selection-custody	
+tests/selection_custody_conformance.rs	appending_to_the_selected_row_spares_the_highlight	selection-custody	
+tests/selection_custody_conformance.rs	changing_attributes_over_the_selection_spares_it	selection-custody	
+tests/selection_custody_conformance.rs	char_edits_on_another_line_spare_the_highlight	selection-custody	
+tests/selection_custody_conformance.rs	char_edits_on_the_selected_line_clear_the_stale_highlight	selection-custody	
+tests/selection_custody_conformance.rs	clearing_the_scrollback_still_clears_the_selection	selection-custody	
+tests/selection_custody_conformance.rs	deleting_chars_on_the_selected_line_clears_the_stale_highlight	selection-custody	
+tests/selection_custody_conformance.rs	erasing_another_line_spares_the_highlight	selection-custody	
+tests/selection_custody_conformance.rs	erasing_chars_on_the_selected_line_clears_the_stale_highlight	selection-custody	
+tests/selection_custody_conformance.rs	erasing_the_selected_line_clears_the_stale_highlight	selection-custody	
+tests/selection_custody_conformance.rs	every_print_path_records_output_damage_on_the_row_it_lands	selection-custody	
+tests/selection_custody_conformance.rs	evicting_both_endpoints_still_clears_the_selection	selection-custody	
+tests/selection_custody_conformance.rs	evicting_one_endpoint_truncates_instead_of_destroying_the_selection	selection-custody	
+tests/selection_custody_conformance.rs	four_disjoint_repaints_in_one_batch_spare_the_selection_between_them	selection-custody	
+tests/selection_custody_conformance.rs	inserting_chars_on_the_selected_line_clears_the_stale_highlight	selection-custody	
+tests/selection_custody_conformance.rs	ordinary_output_on_another_row_spares_the_highlight	selection-custody	
+tests/selection_custody_conformance.rs	ordinary_output_still_preserves_a_scrollback_selection	selection-custody	
+tests/selection_custody_conformance.rs	past_the_bound_a_selection_on_a_repainted_row_still_clears	selection-custody	
+tests/selection_custody_conformance.rs	shrinking_the_retention_limit_truncates_a_selection_it_evicted	selection-custody	
+tests/selection_custody_conformance.rs	the_output_dedup_guard_does_not_leak_into_the_next_batch	selection-custody	
+tests/selection_custody_conformance.rs	two_disjoint_repaints_in_one_batch_spare_the_selection_between_them	selection-custody	
+tests/selection_paint_vs_copy.rs	a_backwards_drag_over_a_wide_glyph_agrees_exactly_as_a_forwards_one_does	selection-paint-equals-copy	
+tests/selection_paint_vs_copy.rs	a_block_selection_over_a_wide_glyph_agrees_the_same_way_a_linear_one_does	selection-paint-equals-copy	
+tests/selection_paint_vs_copy.rs	a_combining_cluster_occupies_one_cell_and_no_edge_can_divide_it	selection-paint-equals-copy	
+tests/selection_paint_vs_copy.rs	a_drag_that_halts_between_the_halves_of_a_glyph_agrees_on_both_sides	selection-paint-equals-copy	
+tests/selection_paint_vs_copy.rs	a_selection_ending_on_a_wide_glyphs_left_half_copies_what_it_paints	selection-paint-equals-copy	
+tests/selection_paint_vs_copy.rs	a_selection_starting_on_a_wide_glyphs_right_half_copies_what_it_paints	selection-paint-equals-copy	
+tests/selection_paint_vs_copy.rs	a_selection_whose_edge_is_a_wide_glyph_in_scrollback_agrees_there_too	selection-paint-equals-copy	
+tests/selection_paint_vs_copy.rs	a_zwj_emoji_is_selected_whole_from_either_of_its_halves	selection-paint-equals-copy	
+tests/selection_scrollback_highlight.rs	selection_over_scrollback_highlights_correct_display_rows	selection-paint-equals-copy	
+tests/selection_scrollback_highlight.rs	selection_to_string_bounds_pathological_out_of_range_span	selection-to-string-bounded	
+tests/sgr_rendition_parity.rs	equivalent_sgr_encodings_arm_the_same_bce_background	sgr-denotation	
+tests/sgr_rendition_parity.rs	equivalent_sgr_encodings_render_identically	sgr-denotation	
+tests/sgr_rendition_parity.rs	erase_after_bg_sgr_inherits_that_background	sgr-denotation	
+tests/sgr_rendition_parity.rs	indexed_fg_after_truecolour_fg_is_not_contaminated	sgr-denotation	
+tests/sgr_rendition_parity.rs	many_distinct_truecolours_all_render_exactly	sgr-denotation	
+tests/shell_mark_rows_across_resize.rs	a_tab_that_grew_before_it_had_history_reads_its_marks_back	absolute-keys-cover-retained-rows	
+tests/shell_mark_rows_across_resize.rs	the_counter_covers_every_retained_row	absolute-keys-cover-retained-rows	
+tests/shell_mark_rows_across_resize.rs	the_prompt_after_a_fullscreen_agents_exit_reads_back_as_the_prompt	absolute-keys-cover-retained-rows	
+tests/stress_stability.rs	stress_grid_operations	terminal-wf-invariant	
+tests/stress_stability.rs	stress_pathological_parser	terminal-wf-invariant	
+tests/stress_stability.rs	stress_wide_characters	terminal-wf-invariant	
+tests/tab_stops_across_grid_seams.rs	an_adopted_session_keeps_the_configured_scrollback_limit	adopt-keeps-host-retention-config	
+tests/tab_stops_across_grid_seams.rs	an_adopted_session_on_the_alt_screen_keeps_its_limit_through_1049l	adopt-keeps-host-retention-config	
+tests/tab_stops_across_grid_seams.rs	an_ordinary_terminal_still_seeds_defaults_into_the_columns_a_widen_adds	tab-stops-shared-and-suppression-carried	
+tests/tab_stops_across_grid_seams.rs	tbc3_survives_the_alt_screen_switch_and_a_widen_under_it	tab-stops-shared-and-suppression-carried	
+tests/tab_stops_across_grid_seams.rs	tbc3_survives_the_seamless_update_checkpoint_and_a_widen_after_it	tab-stops-shared-and-suppression-carried	
+tests/unicode_content_generation.rs	combining_after_carriage_return_accents_the_first_cell	st-content-seq	
+tests/unicode_content_generation.rs	combining_and_presentation_changes_advance_content_generation	st-content-seq	
+tests/unicode_content_generation.rs	combining_without_a_preceding_cell_is_kept_and_advances_content	st-content-seq	
+tests/unicode_content_generation.rs	cursor_motion_empty_input_and_rejected_wide_write_do_not_advance_content	st-content-seq	
+tests/unicode_content_generation.rs	isolated_unicode_writes_and_replacements_advance_content_generation	st-content-seq	
+tests/unicode_content_generation.rs	styled_and_no_wrap_writes_use_the_same_content_clock	st-content-seq	
+tests/unicode_content_generation.rs	unicode_bulk_and_fragmented_writes_advance_content_generation	st-content-seq	
+tests/vi_motions_scrolled_back.rs	a_cleared_history_clamps_the_vi_cursor_onto_the_screen	vi-shift-clamp-contract	vi-cursor-on-grid-invariant
+tests/vi_motions_scrolled_back.rs	a_read_mixing_moves_at_the_top_keeps_the_vi_cursor_on_its_text	vi-follow-output-fold-contract	vi-cursor-custody-across-output
+tests/vi_motions_scrolled_back.rs	a_region_scrolling_into_history_leaves_the_vi_cursor_on_a_fixed_row_below_it	vi-toggle-starts-at-terminal-cursor	vi-cursor-custody-across-output
+tests/vi_motions_scrolled_back.rs	a_resize_flap_on_the_alt_screen_puts_the_vi_cursor_back_on_its_text	vi-alt-resize-undo-restores-cursor	
+tests/vi_motions_scrolled_back.rs	a_rows_resize_keeps_the_vi_cursor_on_its_text	vi-rows-resize-relabel-round-trip	
+tests/vi_motions_scrolled_back.rs	a_width_shrink_clamps_the_vi_cursor_onto_the_grid	vi-shift-clamp-contract	vi-cursor-on-grid-invariant
+tests/vi_motions_scrolled_back.rs	an_interior_region_scroll_carries_the_vi_cursor_on_its_rows_only	vi-follow-output-fold-contract	vi-cursor-custody-across-output
+tests/vi_motions_scrolled_back.rs	an_offloaded_width_change_keeps_the_vi_cursor_in_history_on_its_text	vi-shift-clamp-contract	vi-cursor-on-grid-invariant
+tests/vi_motions_scrolled_back.rs	high_middle_low_land_on_the_rows_the_window_shows	vi-high-middle-low-viewport-rows	
+tests/vi_motions_scrolled_back.rs	output_above_a_progress_bar_leaves_the_vi_cursor_on_the_bar	vi-cursor-custody-across-output	
+tests/vi_motions_scrolled_back.rs	output_past_a_full_history_leaves_the_vi_cursor_on_the_oldest_line	vi-cursor-on-grid-invariant	vi-cursor-custody-across-output
+tests/vi_motions_scrolled_back.rs	output_that_scrolls_the_screen_carries_the_vi_cursor_with_its_text	vi-cursor-custody-across-output	
+tests/vi_motions_scrolled_back.rs	two_codex_frames_in_one_read_leave_the_vi_cursor_on_the_composer	vi-cursor-custody-across-output	
+tests/vi_motions_scrolled_back.rs	word_motions_read_the_vi_line_at_every_display_offset	vi-line-frame-independent-of-viewport	vi-grid-motion-commutes-with-scroll-display
+```
+
+## 3. Coverage
+
+- 1364 tests read in 121 files. 1322 map to one of the 292 specs; 42 are not spec samples (§4).
+- The biggest collapses (primary tests): `selection-custody` (47), `checkpoint-carry-continues` (24), `resolve-colors-denotation` (21), `reflow-preserves-logical-lines` (22), `history-render-parity` (19), `ime-overlay-contract` (18), `kitty-delete-semantics` (18), `alt-archive-differ-exact` (17), `process-chunk-invariance` (17), `alt-archive-hook-commit-points` (16), `alt-archive-carry-continues` (16), `color-state-model` (16).
+- 2 specs retire no test on their own because every test they sample is primary elsewhere: `bottom-line-feed-scrolls-the-screen`, `vi-grid-motion-commutes-with-scroll-display`. They are kept because they are the lemma the primary spec is built on.
+- `process-chunk-invariance` and `terminal-wf-invariant` are the crate's master properties. Proving them
+  makes the chunking and fast-path halves of most handler specs free, the way aterm-parser's master simulation does.
+
+## 4. Tests that are not spec samples
+
+**Status (2026-10-15): deleted 26** — the two fault.rs, the_fixture_row_stops_at_the_written_prefix, the two clipboard_auth invoke_*, test_no_collisions, test_z4_table_total_handler_count, in_module_construction_succeeds, no_engine_still_mints_some, test_response_reconfigure_preserves_tokens_under_new_cap, budgeted_resume_refinement_actions_are_complete, the three shell_api user-var tests, revoke_blocks_future_verification, minting_is_deterministic_in_policy_bit, test_config_equality, all_capability_modules_exist, a_module_with_no_policy_carries_no_capability_ceremony, hyperlink_auth_keeps_the_host_minted_scheme_decision, negative_control_dropping_a_record_diverges, golden_visible_content_hash_is_pinned, stale_identity_and_early_or_stuttering_drain_negative_controls_are_rejected, the_models_guards_reject_the_wrong_drivers; then the rest of `tests/capability_ceremony.rs` (every_capability_struct_has_private_seal, capability_structs_do_not_derive_default_or_clone): each token's private `_seal` is a `Seal` with no `Clone` and no `Default`, so a derive of either does not compile. Every other row below is still present.
+
+42 tests: 38 delete, 4 move-to-bench. `delete` variants say when.
+
+| test | action | why |
+|---|---|---|
+| `src/fault.rs::unarmed_is_false_armed_is_true` | delete | Tests the thread-local registry that exists only under cfg(test)/fault-injection; production `triggered` is the constant false. |
+| `src/fault.rs::with_armed_scopes_and_disarms` | delete | Tests test infrastructure (the with_armed drop guard); no production caller. |
+| `src/render.rs::the_fixture_row_stops_at_the_written_prefix` | delete | Fixture guard. The property it reads (cell_frame_into emits only the written prefix) belongs to rc-render-cell-resolution. |
+| `src/terminal/clipboard_auth.rs::invoke_set_no_callback_is_noop` | delete | Asserts nothing observable; the no-callback arm is clipboard-invoke-forwarding plus panic-freedom. |
+| `src/terminal/clipboard_auth.rs::invoke_clear_takes_write_capability` | delete | Asserts nothing; that clear needs a ClipboardWriteCapability is the function signature. |
+| `src/terminal/csi_dispatch_table.rs::test_no_collisions` | delete | Tautology: inserts distinct enumerate() indices into a set, so it can never fail. The real no-collision property is part of csi-dispatch-table. |
+| `src/terminal/custody.rs::the_record_is_as_small_as_its_justification_claims` | delete (replace with a const assert) | A layout pin (size_of Option<CustodyTransition> = 1); state it as `const _: () = assert!(..)`. |
+| `src/terminal/handler_csi.rs::test_z4_table_total_handler_count` | delete | Duplicate: counts the 35 no-intermediate finals that test_z4_table_all_standard_sequences_resolve already resolves; its name claims 73. Covered by csi-dispatch-table. |
+| `src/terminal/response_capability.rs::in_module_construction_succeeds` | delete (replace with a const assert) | Constructs a ZST and checks size_of_val = 0: a compile-time fact. |
+| `src/terminal/response_capability.rs::capability_is_zero_sized` | delete | Duplicate of in_module_construction_succeeds; a compile-time size fact. |
+| `src/terminal/response_capability.rs::no_engine_still_mints_some` | delete | Tests the cfg(test)-only mint_for_dispatch_with_engine; the production behaviour is pb-bridge-decision-tree's None → Fallback branch. |
+| `src/terminal/response_rate_limiter.rs::test_response_reconfigure_preserves_tokens_under_new_cap` | delete | Tests reconfigure/tokens/capacity, all cfg(test) with no production caller. |
+| `src/terminal/resize_conpty_tests.rs::belt_setup_puts_the_continuation_at_row_zero` | delete | Fixture self-check; samples no production property. |
+| `src/terminal/resize_conpty_tests.rs::native_rows_grow_under_a_conhost_repaint_loses_the_revealed_lines` | delete when cp-conhost-repaint-lossless is Certified | Negative control (Native violates the ConPty spec); the proof's mutation control replaces it. |
+| `src/terminal/resize_conpty_tests.rs::native_offloaded_widen_under_a_conhost_repaint_duplicates_the_fragment` | delete when cp-conhost-repaint-lossless is Certified | Negative control (Native mutant). |
+| `src/terminal/resize_conpty_tests.rs::native_combined_grow_and_widen_under_a_conhost_repaint_loses_the_history` | delete when cp-conhost-repaint-lossless is Certified | Negative control (Native mutant). |
+| `src/terminal/resize_conpty_tests.rs::native_shrink_with_a_row_below_the_cursor_under_a_conhost_repaint_loses_a_line` | delete when cp-conhost-repaint-lossless is Certified | Negative control (Native mutant). |
+| `src/terminal/resize_conpty_tests.rs::native_shrink_to_a_width_the_prompt_fills_exactly_loses_a_line` | delete when cp-conhost-repaint-lossless is Certified | Negative control (Native mutant). |
+| `src/terminal/search_budgeted.rs::budgeted_resume_refinement_actions_are_complete` | delete (move the rule to verify guards / aterm-census) | Meta-test of the aterm_spec anchor registry; sbg-refines-model states the real claim. |
+| `src/terminal/shell_api.rs::set_user_var_evicts_oldest_first_deterministically` | delete | Tests cfg(test)-only set_user_var/user_var(s); no production code inserts user vars. |
+| `src/terminal/shell_api.rs::set_user_var_update_existing_does_not_evict` | delete | Tests cfg(test)-only set_user_var. |
+| `src/terminal/shell_api.rs::remove_user_var_keeps_order_queue_in_sync` | delete | Tests cfg(test)-only set_user_var/remove_user_var. |
+| `src/terminal/shell_integration_auth.rs::revoke_blocks_future_verification` | delete | revoke is cfg(test); the observable branch (nonce None ⇒ false) is sia-verify-nonce. |
+| `src/terminal/window_auth.rs::capability_and_authority_are_zero_sized` | delete (replace with a const assert) | A compile-time size fact. |
+| `src/terminal/window_auth.rs::minting_is_deterministic_in_policy_bit` | delete | Tautology (a pure fn called twice); wa-mint-iff-resolve pins the value. |
+| `test_support/config/tests.rs::test_config_equality` | delete | Tests derived PartialEq, a property of #[derive]. |
+| `tests/capability_ceremony.rs::every_capability_struct_has_private_seal` | delete (census guard if the rule matters) | Source-text scan; privacy of the constructor is a type-system guarantee. |
+| `tests/capability_ceremony.rs::capability_structs_do_not_derive_default_or_clone` | delete (census guard or clippy rule) | Source-text scan with a predicate that passes a derive without Default and can see an earlier item's derive. |
+| `tests/capability_ceremony.rs::all_capability_modules_exist` | delete | A registry plus a test that polices it (AGENTS.md bans this). |
+| `tests/capability_ceremony.rs::a_module_with_no_policy_carries_no_capability_ceremony` | delete | Prose-pinning over a hand-kept registry. |
+| `tests/capability_ceremony.rs::hyperlink_auth_keeps_the_host_minted_scheme_decision` | delete | Checks fn names exist in a source file; the compiler guarantees it, and hyperlink-auth is the behaviour. |
+| `tests/mem_budget.rs::engine_retained_heap_within_budget` | move-to-bench | Retained-heap ceiling via a counting allocator; a resource budget with calibration constants. |
+| `tests/perf_scaling.rs::engine_steady_state_processing_is_allocation_free` | move-to-bench | Allocation count and a 2x-input ratio; its correctness checks are sampled by history-render-parity. |
+| `tests/scrolled_back_frame_materialize_count.rs::a_stationary_scrolled_back_repaint_materializes_no_history_rows` | move-to-bench | Exact materialization count; correctness is viewport-memo-coherent. |
+| `tests/scrolled_back_frame_materialize_count.rs::a_wheel_notch_pays_only_for_the_rows_that_scrolled_in` | move-to-bench | Exact rows materialized per notch: a cost bound. |
+| `tests/conformance_recording.rs::replay_negative_control_dropped_delta_diverges` | delete when checkpoint-roundtrip is Certified | Harness negative control; the proof's mutation control replaces it. |
+| `tests/replay_offset_determinism.rs::negative_control_dropping_a_record_diverges` | delete when checkpoint-roundtrip is Certified | Harness negative control duplicating conformance_recording's. |
+| `tests/replay_offset_determinism.rs::golden_visible_content_hash_is_pinned` | delete | Golden FNV hash of rendered text: pins output, not a property. |
+| `tests/conformance_shared_budget.rs::forged_over_cap_share_is_rejected` | delete (keep the model check in aterm-spec) | Forges a model state and checks the model rejects it: a property of shared_budget_model. |
+| `tests/conformance_budgeted_search.rs::stale_identity_and_early_or_stuttering_drain_negative_controls_are_rejected` | delete (move to aterm-spec) | Touches no Terminal: a model self-test. |
+| `tests/conformance_budgeted_search.rs::slipped_real_steps_are_the_buggy_transitions_and_are_rejected` | delete (move to aterm-spec) | Hand-mutated steps against the model; the real steps are covered by sbg-refines-model. |
+| `tests/conformance_repaint_nudge.rs::the_models_guards_reject_the_wrong_drivers` | delete (move to aterm-spec) | Model-only: no machine or terminal involved. |
+
+## 5. Implied specs that look wrong, or disagree with the code
+
+1. **Mislabelled or stale tests**
+   - `src/terminal/csi_dispatch_table.rs::test_no_collisions`: the file header says it 're-derives every occupied slot and refuses a duplicate', but it inserts distinct `enumerate()` indices into a set and can never fail (§4).
+   - `src/terminal/handler_csi.rs::test_z4_table_total_handler_count`: name and doc say 73 handlers; it asserts only the 35 no-intermediate finals (§4).
+   - `src/terminal/bidi_reorder.rs::explicit_mode_also_reorders_via_the_bridge` asserts the identity `[0,1]` for pure-LTR `ab`, so it never shows that Explicit mode reorders anything.
+   - `src/terminal/handler_osc.rs::osc_52_standard_policy_wildcard_does_not_overgrant_revoked_set` never authorizes then revokes; it checks the default-denied Write.
+   - `src/terminal/observe.rs::needs_arm_eval_is_exactly_the_level_triggered_predicates`: the comment about the row predicate being wired sits above an assertion about `SeqAdvanced{after:7}`.
+   - `src/terminal/repaint_nudge.rs::a_lease_on_another_tab_does_not_defer_the_nudge` and `::a_click_a_wheel_notch_and_a_drag_each_count_as_a_person`: the names claim cross-tab and gesture-classification properties that live in the host (`app_nudge`, aterm-gui `is_person_gesture`); the machine only sees a bool or a number here.
+   - `tests/selection_custody_conformance.rs::four_disjoint_repaints_in_one_batch_spare_the_selection_between_them`: its doc says 'the bound is four, and it is exact in both directions', but `MAX_SELECTION_DAMAGE_BANDS = 8` (aterm-grid `state/presentation.rs`) and the next two tests talk about eight and nine.
+   - `tests/tab_stops_across_grid_seams.rs::an_adopted_session_keeps_the_configured_scrollback_limit` (and the alt twin) are retention tests filed in a TBC-3 suite; `tests/chunked_process_equivalence.rs::xtversion_reports_the_shared_application_identity` is a single reply-format test in a chunking suite.
+   - `tests/vi_motions_scrolled_back.rs::high_middle_low_land_on_the_rows_the_window_shows` claims the case 'once the offset reaches the screen height', but its loop stops at offset 3 < 4 rows.
+   - `tests/vi_motions_scrolled_back.rs::an_offloaded_width_change_keeps_the_vi_cursor_in_history_on_its_text`: the code keeps only the line number; text equality holds because the fixture's short lines do not rewrap. The real spec is vi-cursor-on-grid-invariant, not text custody across a reflow.
+   - `tests/vi_motions_scrolled_back.rs::two_codex_frames_in_one_read_leave_the_vi_cursor_on_the_composer` says 'the selection sees only an invalidation' but asserts nothing about the selection; `output_that_scrolls_the_screen_carries_the_vi_cursor_with_its_text` also checks the grid's viewport re-pin, which is viewport-pin, not a vi property.
+   - `tests/stress_stability.rs` (3 tests, feature `long-tests`): the doc promises 'content is not corrupted', but they check only cursor bounds and dimensions, and the default lane never runs them.
+   - `tests/mem_budget.rs::engine_retained_heap_within_budget` claims a full screen 'retains ZERO additional heap' but allows 8 KiB slack.
+2. **Tests that exercise cfg(test)-only twins instead of the production path**
+   - `bidi_reorder.rs` tests of `compute_visual_order`, `base_direction` and `Terminal::bidi_visual_order` (7 tests) exercise scalar twins with no production caller. The specs are stated over `compute_visual_order_cells` / `base_direction_from_classes`; delete the twins with these tests.
+   - `clipboard_auth.rs::{default_has_no_capabilities, authorize_*_grants_only_*, revoke_disables_future_mint, write_and_query_are_independent}` use cfg(test)-only `try_mint_*_capability` and `is_*_authorized`; production mints only through `try_mint_*_with_engine`.
+   - `colors_api.rs::{public_color_mutators_mark_full_damage_without_a_glyph_write, mutable_palette_view_updates_only_changed_reset_slots, public_palette_reset_durably_restores_built_in_baseline}`: the names say 'public', but `reset_color_palette`, `reset_palette_color_to_default` and `color_palette_mut` are cfg(test)-only.
+   - `buffer_api.rs::ring_watermark_and_truncation_counter_are_out_of_band` drives cfg(test)-only `set_ring_byte_watermark`; the doc on `scrollback_pressure_level` says hosts configure the ring watermark, but no production setter exists.
+   - `color_resolve.rs::test_dim_*`, `test_bold_*`, `test_extended_palette_color` call the cfg(test)-only `resolve_fg_color` wrapper, not `resolve_colors_raw_opts`.
+   - `render_cells.rs` `cluster_row_into`/`combining_row_into` are cfg(test) but documented 'pub(crate): consumed only by cell_frame_into'. Stale doc; they are test-only oracles, and several tests read only them.
+   - `AltArchiveBudget::{total, min_share}` and `Terminal::block_eviction_read_count` are cfg(test)-only getters that subsumed tests depend on; the replacing specs need them, or a model view, outside cfg(test).
+3. **Tests weaker than the spec they imply**
+   - `blocks_api.rs::evicted_block_returns_evicted_marker_retained_block_returns_true_output` accepts Text or Evicted for the kept block, so it never shows a retained block reads its true output.
+   - `callback_setters.rs::offloaded_resize_{primary,alt_screen}_*` check only 'after > 100 lines', not equality with a synchronous resize.
+   - `alt_archive_tests.rs::p1_viewport_random_walk_never_loses_a_row_that_left_the_top` counts duplicates but only `eprintln!`s the count.
+   - `host_traits.rs::terminal_block_access_snapshots_are_available` asserts only `!blocks.is_empty()`.
+   - `tests/scrolled_back_frame_materialize_count.rs::{output_arriving_while_scrolled_back_reopens_the_bill, a_kitty_unscroll_renumbers_history_and_reopens_the_bill}` proxy 'no stale glyphs' by a materialize count > 0 and never compare the frame to the expected rows.
+   - `handler_osc_color.rs::osc_21_query_pairs_capped_at_per_sequence_limit` counts '=' bytes in the whole reply; correct only while no value contains '='.
+   - `tests/conformance_read_image_seq.rs::host_bumped_seq_is_the_run_ahead_stamp_the_engine_stamp_never_is` asserts on a field the test mutated and follows an `assert_eq!` with a redundant `<=`.
+4. **Implied specs that are wrong, unsound or conditional**
+   - `render_cells.rs::presentation_fingerprint_moves_with_every_resolver_input` asserts that an FxHash changes when an input changes: a no-collision claim, false for a hash in general. rc-presentation-fingerprint states the sound converse.
+   - `keyboard_mode.rs::push_flags_over_255_are_masked_not_saturated`: the comment cites kitty's `val & 0x7f` for push and `257 & 0b1_1111` for set, and the samples (256 → 0, 257 → 1) cannot tell the masks apart. Read the code before fixing kitty-keyboard-protocol's MASK.
+   - `tests/alt_archive_claude_like.rs::archive_equals_exactly_the_rows_that_scrolled_off`: the archive identifies rows by voting, so 'exactly' holds only for the synthetic shifted-transcript grammar; alt-archive-end-to-end is conditioned on it.
+   - `test_support/generated/grapheme.rs::grapheme_byte_count_matches` filters out control characters although `byte_count = |s|` presumably holds for every &str; check `grapheme_width_inner` before narrowing.
+   - `conpty_dead_alt_screen_replay_tests.rs::the_same_reads_without_conhosts_mode_request_lose_the_rows_typed_after_the_kill` pins row LOSS as expected; an improvement to the unix arm turns it red. conhost-orphan-recovery states it as what the model predicts, not a requirement.
+   - `handler_write.rs::a_combining_mark_after_a_cursor_motion_uses_the_cell_to_the_left` deliberately differs from xterm while a sibling follows xterm for the no-left-cell fallback. print-cell-placement records the positional rule as a product choice.
+   - `search_index.rs::a_live_switch_with_no_new_output_is_not_served_from_a_cache` used to pin the opposite precondition until a 2026-10-11 ruling; this family's expected columns drift easily from 'cells drawn'.
+   - `aterm-types` `BufferAccess::total_lines` is documented as 'visible + scrollback', but Grid's impl returns scrollback only, and aterm-vi and `Terminal::vi_shift` rely on that (−total_lines is the topmost vi line). The doc or the name is wrong.
+   - `handler_dec.rs::xtsave_covers_every_mode_decrqm_reports` polices a hand-kept REPORTED list (the registry-plus-test shape AGENTS.md forbids). xtsave-restore-roundtrip quantifies over `handle_decrqm`'s domain instead.
+   - `tests/handoff_parser_carry.rs::a_dcs_string_split_in_its_header_is_read_as_it_would_have_been`: the expected reference depends on `cfg!(feature = "sixel")`; split it into the build-independent half and the sixel contract before proving.
+5. **Process, determinism and placement issues**
+   - `tests/conformance_altscreen.rs::real_altscreen_roundtrip_conforms_to_altscreen_spec` validates against a hand-written `AltScreen.tla` (AGENTS.md: author with `ty_model!`), spawns `ty` with a bare `std::process::Command` (not `aterm_uds::spawnfd::command`), and returns early when `ty_escalation` is None although its doc says there is no skip.
+   - `alt_archive_tests.rs::a_live_session_joins_the_process_budget_and_leaves_when_it_closes` asserts exact counts on the process-wide OnceLock pool and relies on being the only test in the binary that touches it: order-dependent under parallel tests.
+   - `alt_archive_tests.rs::apps_without_2026_are_committed_at_the_epilogue_rate_limited` is time-based but uses an injected ClockReading, so it is deterministic. Check that no wall-clock path remains.
+   - `tests/fuzz_process_never_panics/fresh.rs` seeds from `SystemTime::now()` by default (not reproducible), mentions a proptest config the crate does not use, and is mounted again by aterm-conformance under a different feature set.
+   - `resize_conpty_tests.rs::native_policy_matches_the_0_94_0_resize` holds two specs: resize ≡ Native (cp-default-resize-is-native) and a golden FNV digest re-captured at least five times. Drop the digest when the spec is proved.
+   - `render.rs::damage_record_covers_8k_glow_under_without_retaining_its_payload` partly compares `mem::size_of` totals; only its `same_content(Some(false))` half samples a spec.
+   - `checkpoint.rs::the_carry_meta_is_the_visible_carrys_meta_and_projects_no_grid` proves 'no grid projected' by arming a panicking fault point; that half needs a cost/footprint statement.
+   - Cost properties measured with cfg(test) thread_local counters wired into production bodies (`images_frame_costs_the_extras_not_rows_times_cols`, `an_installed_policy_costs_no_per_dispatch_evaluation_at_the_compiled_gates`, `scrollback_selection_reads_each_history_line_once`) need a ghost cost model, not the counters.
+   - `state.rs::band_history_model_proves_and_catches_overwritten_replay` authors its `ty_model!` inside a cfg(test) module of state.rs rather than in aterm-spec with the other models.
+   - Profile-dependent verdicts (`policy_bridge.rs::decision_origin_gate_failure_falls_through_to_wildcard`, `window_auth.rs::standard_profile_wildcard_*`, the policy_gates profile loops) depend on `aterm_policy::profiles::{standard,hardened}` data in another crate; the specs need a cross-crate profile lemma (gap 12).
+   - `processing.rs::scrolled_back_viewport_pins_during_live_output` duplicates `test_support/generated/scroll_pin.rs::scrollback_pin_preserves_absolute_top_during_live_output`; both sample viewport-pin.
+   - `test_support/generated/{grapheme,sixel}.rs` test aterm-grapheme and aterm-sixel from aterm-core's build. Their specs (gr-*, sx-*) belong in those crates' SPECS.md, and the tests should move there.
+
+## 6. Proof order (easiest high-value first)
+
+No spec here is blocked by gap 0 alone: every one also needs at least one of gaps 2, 3 or 6. So the order
+below starts with the specs whose only other blockers are the smallest Trust widenings (certified
+`&mut self` field views, gap 2; E6 body widening, gap 3), and climbs from there. Each tier lists the
+tests it retires.
+
+**Tier A: scalar, gap 2 or 3 only (land right after gap 0).**
+
+1. **`config-negotiated-modes-seed`** (gaps 2, 4; 5 tests). Its core, `apply_negotiated_mode(live, seed, v)`,
+   is straight-line code over two `&mut bool`s, the canonical first `&mut` view proof. The `apply_config`
+   half then composes it three times (gap 4).
+2. **`pr-splice-accounts`** (gap 3) and **`alt-archive-row-charge`** (gaps 3, 6). Pure `u64`/`usize`
+   arithmetic (`checked_sub`, `next_multiple_of`); each is an `omega`-class proof once `is_some_and` and
+   `next_multiple_of` are admitted.
+3. **`drain-bell-edge-flag`**, **`restore-advances-scroll-epoch-once`**, **`host-color-mutators-damage`**
+   (gap 2 only). One field read and write each, so they are the regression cases for certified views.
+4. **`vi-high-middle-low-viewport-rows`**, **`vi-shift-clamp-contract`**, **`vi-toggle-starts-at-terminal-cursor`**
+   (gaps 2, 3; 5 tests). Saturating `i32` arithmetic and `clamp` on one struct.
+5. **`sbg-cursor-allocator`** (gaps 3, 13): `fetch_update` with `checked_add`, the smallest atomic case.
+
+**Tier B: finite tables and small enum functions (gaps 1, 3; decidable by evaluation).**
+
+6. **`csi-dispatch-table`** (7 tests): evaluate the 73-entry table and `csi_hash` over 256 encodings × 256
+   finals. It also removes the tautological `test_no_collisions` and the duplicate count test (§4).
+7. **`pb-resolve-table`** (3), **`st-delta-since`**, **`sgr-extended-color-parse`**, **`png-dimensions`**,
+   **`obs-arm-eval-classes`**, **`rc-cursor-projection`**, **`damage-words-injective`**, **`kitty-diacritic-table`**,
+   **`bidi-base-direction`**, **`rc-refill-cause-classification`**, **`char-width-fast-path`** (evaluation over
+   0..=0x10FFFF).
+
+**Tier C: self-contained state machines with high test counts (gaps 1, 2, 3, then 10).**
+
+8. **`rn-armed-gates`** (16 tests) and **`rn-answer-protocol`** (9), then **`rn-attempt-budget`**,
+   **`rn-hold-always-lifted`** and the model binding **`rn-refines-model`** (8). `RepaintNudge::step` is
+   a scalar machine (an enum phase, `u64` milliseconds, bool facts); it retires 39 tests with no
+   Terminal involved.
+9. **`bell-flash-model`** (5) and **`bell-rate-limiter`** (4): one `Option<Instant>` each, once
+   aterm_time's `Instant` has an ordered-time model.
+10. **`obs-*`** (the `WatcherSet` contracts, 22 tests) and **`pb-bridge-decision-tree`** (9).
+
+**Tier D: pure byte and string functions (gaps 1, 3, 7).**
+
+11. **`format-paste-denotation`** (6), **`sanitize-title`** (4), **`hyperlink-auth`** (10),
+    **`shell-integration-nonce-hex`**, **`sia-decode-hex`**, **`sia-ct-eq`**, **`sia-verify-nonce`** (8),
+    **`parser-repr-wire-roundtrip`** (3), **`osc21-key-echoable`**, **`has-run-of-4`**, **`rgb-to-rgba`**,
+    **`alt-archive-normalize-row`**, **`kitty-command-parse`** (12). These are the first users of the
+    `&str`/`Vec<u8>` content models (gap 1) and of loop invariants over slices (gap 7).
+
+**Tier E: the highest-value single specs.**
+
+12. **`resolve-colors-denotation`** (gaps 1, 3, 4; 21 tests). Copy structs, bitflags and a palette array;
+    the dim step cites `dim_toward_bg` as an opaque callee until `dim-contrast-law` (floats) is reachable.
+13. **`rc-render-cell-resolution`** (14) and the RenderInput contracts (`ime-overlay-contract` 18,
+    `render-input-content-equality-and-clone` 8, `line-size-run-at` 5).
+
+**Tier F: the Terminal-level master properties (all of gaps 1–7 and 12).**
+
+14. **`terminal-wf-invariant`** (15 tests), then **`process-chunk-invariance`** (17), which needs aterm-parser's
+    `advance-fast-refines-utf8-step-fold` cited across crates (gap 12). These two make the chunking halves
+    of most handler specs free.
+15. The handler families: kitty (`kitty-*`, about 100 tests), selection (`selection-custody` 47,
+    `sel-*`), alt archive (`alt-archive-*`, about 85), checkpoint (`checkpoint-*`, about 50), the
+    ConPTY and resize-journal refinements, and the search index. Each needs a content model of the grid
+    (gap 1) and, for the refinements, the model→code surface (gap 10).

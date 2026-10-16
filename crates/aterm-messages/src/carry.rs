@@ -2,13 +2,11 @@
 // Copyright 2026 Andrew Yates
 
 //! The seamless-handoff carry: plain data the outgoing process ships and the
-//! successor re-seeds (`MessageCenter::carried` / `seed_carried`). Strings
-//! and ints only — the host serialises it with whatever the handoff already
-//! uses; nothing here knows a format.
+//! successor re-seeds (`MessageCenter::carried` / `seed_carried`). The host
+//! serialises it with whatever the handoff already uses.
 
-/// One live message as carried: every field a string or a number, every
-/// intent as its [`crate::model::Intent::encode`] form, the hold as its
-/// [`crate::model::Hold::encode`] word.
+/// One live message as carried: strings and numbers, each intent in its
+/// [`crate::model::Intent::encode`] form.
 #[allow(
     clippy::struct_excessive_bools,
     reason = "a plain wire record: each flag is an independent fact the handoff ships"
@@ -31,7 +29,7 @@ pub struct CarriedMessage {
     pub detail: Vec<String>,
     /// Encoded intents; an unknown one is dropped silently.
     pub actions: Vec<String>,
-    /// `default` | `for:<secs>` | `live:<secs>` | `standing` | `ask:<secs>`.
+    /// The hold, as [`crate::model::Hold::encode`] spells it.
     pub hold: String,
     /// The supersede key.
     pub key: Option<String>,
@@ -46,34 +44,26 @@ pub struct CarriedMessage {
     /// Whether the row was on glass when the parent froze.
     pub on_glass: bool,
     /// Whether the band painted `detail[0]` beside the title
-    /// (`Message::excerpt`); an older parent's rows carry `true`, and paint as
-    /// they did.
+    /// (`Message::excerpt`); an older parent's rows carry `true`.
     pub excerpt: bool,
     /// The words the row finishes with (`Message::finished`); an older
     /// parent's rows carry none and derive them from the title.
     pub finished: Option<String>,
-    /// A record about a PREVIOUS RUN (`Message::retrospective`, ruling 259):
-    /// it keeps its lower rank across the handoff (ruling 263); an older
-    /// parent's rows carry `false`.
+    /// A record about a previous run (`Message::retrospective`), which keeps
+    /// its lower rank across the handoff; an older parent's rows carry `false`.
     pub retrospective: bool,
-    /// The row is the WIRE's ([`crate::model::Origin::wire_owned`]): a
-    /// keyless `notice post` row has no `wire.` key to say so, and stays the
-    /// wire's across the handoff by this (rulings 167, 192; round 43, ruling
-    /// 415 (h)); an older parent's rows carry `false`.
+    /// The row is the wire's ([`crate::model::Origin::wire_owned`]): a keyless
+    /// `notice post` row has no `wire.` key to say so. An older parent's rows
+    /// carry `false`.
     pub wire: bool,
-    /// Duplicate posts folded into the row (`Live::repeats`, 1 = posted
-    /// once): its Retired line's `rep=`, the page's `×N` and the wire's
-    /// `rep=` (round 43, ruling 415 (j)); an older parent's rows carry 1, and
-    /// 0 reads as 1.
+    /// Duplicate posts folded into the row (`Live::repeats`, 1 = posted once);
+    /// an older parent's rows carry 1, and 0 reads as 1.
     pub repeats: u32,
 }
 
 /// Everything the successor needs: the next id and the live rows in glass
-/// order (on-glass rows first). No log lines cross: the parent writes its
-/// own record to the end and flushes its writer before it execs; the
-/// successor's record begins at Commit (design §3.7, revised 2026-09-22 —
-/// a carry captured before the freeze shipped nothing, and the lines
-/// posted under the freeze died with the parent).
+/// order (on-glass rows first). No log lines cross: the parent flushes its own
+/// record before it execs, and the successor's begins at Commit (design §3.7).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Carry {
     /// The parent's next id.

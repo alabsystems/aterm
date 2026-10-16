@@ -25,58 +25,39 @@ use crate::grapheme::{
 };
 use crate::literal::AsciiCaseInsensitiveMatches;
 
-/// Default maximum number of lines to keep in the search index cache.
-/// Eviction triggers when cache exceeds this limit, removing the oldest 25%.
-///
-/// This is the *default* only; callers that need a different bound should use
-/// `SearchIndex::with_max_cached_lines` (or
-/// `SearchIndex::set_max_cached_lines`). The default value is unchanged from
-/// the original hard-coded constant — behavior is preserved; the cap is now
-/// configurable and eviction is now observable (see
-/// [`SearchIndex::results_may_be_incomplete`]).
+/// Default maximum number of lines kept in the search index cache; once it is
+/// exceeded the oldest quarter is evicted. Set per index with
+/// [`SearchIndex::with_capacity_and_max`]; eviction is reported by
+/// [`SearchIndex::results_may_be_incomplete`].
 pub const DEFAULT_MAX_CACHED_LINES: usize = 100_000;
 
-/// Upper bound on the number of matches a single batch query
+/// Upper bound on the matches one batch query
 /// ([`SearchIndex::search_with_positions`], `search_case_insensitive`,
-/// `search_regex`) will collect before it stops scanning.
+/// `search_regex`) collects before it stops scanning.
 ///
-/// Without this bound, a query for a short, highly repetitive substring over a
-/// full scrollback (up to [`DEFAULT_MAX_CACHED_LINES`] lines, each up to the
-/// terminal width in matches) allocates one [`SearchMatch`] per occurrence —
-/// on the order of 10^7–10^8 records (hundreds of MB to >1 GB, ~24 B each) for a
-/// single query, all under the terminal lock. Batch queries cap out here;
-/// [`SearchIndex::search_results_opts`] reports the truncation via the same
-/// `incomplete` signal used for eviction so callers (cmd_search / the AI) do not
-/// treat a capped result set as exhaustive.
-///
-/// The value is chosen well above realistic result sets (a common single-char
-/// term over a 10K-line buffer is ~70K matches, all legitimately returned) so
-/// interactive highlight/count behavior is unchanged, while still bounding the
-/// worst case to ~2.4 MB of `SearchMatch` records instead of >1 GB.
+/// Unbounded, a short repetitive query over a full scrollback allocates one
+/// [`SearchMatch`] per occurrence, 10^7-10^8 records (over 1 GB) under the terminal
+/// lock. A capped result reports `incomplete` through
+/// [`SearchIndex::search_results_opts`], as eviction does. The cap sits well above
+/// realistic result sets (a common single character over a 10K-line buffer is ~70K
+/// matches) and bounds the worst case to ~2.4 MB.
 pub const MAX_SEARCH_MATCHES: usize = 100_000;
 
-/// Eviction low-water mark as a fraction `NUM/DEN` of `max_cached_lines`:
-/// [`SearchIndex::index_line`] drops the cache to
-/// `EVICTION_RETAIN_NUM/EVICTION_RETAIN_DEN · max_cached_lines` once it exceeds
-/// capacity (hysteresis, so eviction isn't re-triggered every single line), always
-/// keeping the NEWEST lines. A caller that must guarantee a FLOOR of retained lines
-/// — e.g. the terminal's visible screen, which must stay searchable no matter how
-/// small the configured history cap — sizes its capacity via
-/// [`max_cached_for_retained`], the inverse of this mark. Single source of truth for
-/// the ratio: [`evict_oldest_lines`], `max_cached_for_retained`, and the
-/// lifecycle oracle's cap-eviction mirror all read it.
+/// Eviction low-water mark as a fraction `NUM/DEN` of `max_cached_lines`: once over
+/// capacity, [`SearchIndex::index_line`] drops the cache to `NUM/DEN · max`, keeping
+/// the newest lines (hysteresis, so eviction does not re-trigger every line).
+/// `evict_oldest_lines`, [`final_evicted_prefix`] and its inverse
+/// [`max_cached_for_retained`] read it.
 pub(crate) const EVICTION_RETAIN_NUM: usize = 3;
 pub(crate) const EVICTION_RETAIN_DEN: usize = 4;
 
-/// Number of oldest rows that will be absent after indexing `total_lines`
-/// distinct, ascending line numbers into an index with `max_cached_lines`.
+/// Number of oldest rows absent after indexing `total_lines` distinct ascending line
+/// numbers into an index with `max_cached_lines`.
 ///
-/// The budgeted builder uses this to avoid verifying rows that the completed
-/// index will evict.  That is more than an optimization: if the global match
-/// cap is reached in those doomed rows, stopping verification there would
-/// otherwise omit newer matches that the final one-shot index still sees.
-/// Keep this calculation coupled to [`SearchIndex::evict_oldest_lines`] by
-/// deriving it from the same low-water constants.
+/// The budgeted builder skips verifying rows the finished index will evict. That is
+/// required, not just faster: reaching the global match cap in those doomed rows
+/// would omit newer matches the one-shot index still sees. Derived from the same
+/// low-water constants as `SearchIndex::evict_oldest_lines`.
 pub(crate) fn final_evicted_prefix(total_lines: usize, max_cached_lines: usize) -> usize {
     let max_cached_lines = max_cached_lines.max(1);
     if total_lines <= max_cached_lines {
@@ -95,16 +76,11 @@ pub(crate) fn final_evicted_prefix(total_lines: usize, max_cached_lines: usize) 
         .min(total_lines)
 }
 
-/// The smallest `max_cached_lines` capacity that keeps the newest `retained` lines
-/// safe from eviction. Because [`SearchIndex::index_line`] evicts down to a
-/// `EVICTION_RETAIN_NUM/EVICTION_RETAIN_DEN` (3/4) low-water mark, a cap of exactly
-/// `retained` would let the oldest `retained/4` of those lines be dropped; this
-/// returns the inverse — the smallest `max` with `floor(3·max/4) >= retained`.
-///
-/// Used to keep an always-searchable window (the live terminal screen) indexed even
-/// under a tiny configured scrollback cap: `max_cached_lines >=
-/// max_cached_for_retained(visible_rows)` guarantees the whole visible screen
-/// survives eviction. `retained == 0` returns 0 (nothing to protect).
+/// The smallest `max_cached_lines` that keeps the newest `retained` lines safe from
+/// eviction: eviction drops to the 3/4 low-water mark, so this is the smallest `max`
+/// with `floor(3·max/4) >= retained`. `max_cached_lines >=
+/// max_cached_for_retained(visible_rows)` keeps the whole visible screen searchable
+/// under any scrollback cap. `retained == 0` returns 0.
 #[must_use]
 pub fn max_cached_for_retained(retained: usize) -> usize {
     // floor(NUM·max/DEN) >= retained  ⟺  max >= ceil(DEN·retained/NUM); and for an
@@ -114,11 +90,8 @@ pub fn max_cached_for_retained(retained: usize) -> usize {
         .div_ceil(EVICTION_RETAIN_NUM)
 }
 
-// Deterministic test instrumentation for range-query candidate counts.
-//
-// This tracks how many candidate line IDs a lazy navigation iterator actually
-// visits, allowing scaling tests to verify that `find_next` does not depend on
-// prefix matches before the search start line.
+// Test counters, e.g. the candidates a lazy navigation iterator visits, so scaling
+// tests can check that `find_next` does not depend on matches before its start.
 #[cfg(test)]
 thread_local! {
     static SEARCH_FROM_LINE_CANDIDATES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -143,70 +116,46 @@ fn count_case_insensitive_lowered_line() {
     CASE_INSENSITIVE_LOWERED_LINES.with(|c| c.set(c.get().saturating_add(1)));
 }
 
-/// Search index using trigrams with bloom filter acceleration.
-///
-/// The index maintains:
-/// - A bloom filter for instant negative lookups
-/// - A trigram map for candidate line identification
-/// - Line content cache for match verification (with capacity-based eviction)
+/// Search index using trigrams with bloom filter acceleration: a bloom filter for
+/// negative lookups, trigram posting lists for candidate lines, and a line cache
+/// (with capacity-based eviction) for match verification.
 #[derive(Debug)]
 pub struct SearchIndex {
     /// Bloom filter for fast negative lookups.
     bloom: BloomFilter,
     /// Trigram -> line numbers mapping.
     trigrams: FxHashMap<[u8; 3], SparseBitmap>,
-    /// Cached line content for match verification.
-    /// Maps line number to line text. Evicted when exceeding `max_cached_lines`.
+    /// Cached line text by line number, for match verification.
     pub(super) lines: FxHashMap<usize, String>,
-    /// Cached column maps for search hit lines.
-    /// Built at index time and reused across searches to avoid O(G)-per-query
-    /// reconstruction (#7373).
+    /// Column maps of the cached lines, built at index time and reused by every
+    /// search.
     pub(super) column_maps: FxHashMap<usize, ColumnMap>,
-    /// Reused lowering buffer for the non-ASCII lowered-trigram pass.
-    ///
-    /// Same trick as [`CaseInsensitiveMatcher::lower_buf`]: the lowered text is
-    /// walked once and thrown away, so keeping ONE buffer whose capacity
-    /// survives across lines turns a malloc/realloc/free chain per indexed line
-    /// into a memcpy into already-owned memory. Purely a scratch cell — never
-    /// read outside the call that fills it, so it carries no state.
+    /// Reused lowering buffer for the non-ASCII lowered-trigram pass, so its capacity
+    /// survives across lines. Scratch only: never read outside the call that fills it.
     lower_scratch: String,
     /// The line number posting key 0 stands for.
     ///
-    /// Posting lists and candidate ranges hold `u32` KEYS, each a line's
-    /// offset from this base, never the line number itself: callers number
-    /// lines by absolute terminal row, which only ever grows and passes
-    /// `u32::MAX` in a long-lived tab (R15 content-1). Every cached line sits
-    /// in `key_base..=key_base + MAX_KEY`; [`make_room_for`](Self::make_room_for)
-    /// keeps it so, moving the base when a line arrives outside the window.
+    /// Posting lists and candidate ranges hold `u32` keys, each a line's offset from
+    /// this base: callers number lines by absolute terminal row, which passes
+    /// `u32::MAX` in a long-lived tab. Every cached line sits in
+    /// `key_base..=key_base + MAX_KEY`; [`make_room_for`](Self::make_room_for) keeps
+    /// it so.
     key_base: usize,
     /// Total number of indexed lines.
     line_count: usize,
-    /// Lowest line number currently present in `lines`.
-    ///
-    /// Separate from the public eviction watermark: sparse visible-content
-    /// indexing can begin above line zero without an eviction ever occurring.
-    /// Short-query ranges start here so they do not walk an empty prefix.
+    /// Lowest line number currently present in `lines`; short-query ranges start here.
+    /// Separate from the eviction watermark: sparse visible-content indexing can start
+    /// above line zero with no eviction.
     first_cached_line: usize,
     /// Next line number to index (for incremental indexing).
     next_line: usize,
     /// Maximum lines to keep in cache before eviction.
     max_cached_lines: usize,
-    /// Lowest line number still retained in the index.
-    ///
-    /// Starts at 0 and advances each time eviction drops the oldest cached
-    /// lines. Any match at a line below this watermark has been evicted and can
-    /// no longer be returned, even though [`len`](Self::len) (which tracks the
-    /// highest indexed line) keeps growing. Exposed via
-    /// [`lowest_retained_line`](Self::lowest_retained_line) so callers can tell
-    /// the AI which range of scrollback is actually searchable.
+    /// Lowest line number still retained in the index: 0 until eviction drops the
+    /// oldest lines. A match below it is gone, though [`len`](Self::len) keeps growing.
     lowest_retained_line: usize,
-    /// Whether eviction has ever dropped lines from this index.
-    ///
-    /// Once true, search results may be incomplete: matches in evicted lines
-    /// are silently absent. Surfaced via
-    /// [`results_may_be_incomplete`](Self::results_may_be_incomplete) so the
-    /// future `cmd_search` can flag truncated results to the AI rather than
-    /// presenting them as exhaustive.
+    /// Whether results may be incomplete: latched by eviction, and set either way by
+    /// [`set_history_prefix_eviction`](Self::set_history_prefix_eviction).
     eviction_occurred: bool,
     /// Guards the one-time `aterm_log` warning emitted on first eviction.
     first_eviction_warned: bool,
@@ -241,13 +190,8 @@ fn insert_posting(
     bitmap.insert(line);
 }
 
-/// Intersect a pre-sorted (ascending by len) slice of posting list references
-/// into a single owned bitmap.
-///
-/// Avoids cloning the smallest list when there are 2+ lists: the first
-/// intersection uses `&a & &b` (borrowed on both sides) which constructs the
-/// result directly. Only when there is exactly one list does a clone occur,
-/// because we need an owned bitmap for downstream consumers (#7375).
+/// Intersect posting lists sorted ascending by length into one owned bitmap. Two or
+/// more lists start from a borrowed `&a & &b`; only a lone list is cloned.
 #[cfg(test)]
 fn intersect_posting_lists(sorted_lists: &[&SparseBitmap]) -> SparseBitmap {
     #[cfg(test)]
@@ -266,15 +210,10 @@ fn intersect_posting_lists(sorted_lists: &[&SparseBitmap]) -> SparseBitmap {
 
 /// Reusable per-query case-insensitive line matcher.
 ///
-/// One- and two-byte ASCII queries take the allocation-free byte-scanner path. Longer
-/// queries use the standard library's linear-time substring search over one
-/// reusable lowercase buffer. Unicode lowercasing can change byte length and
-/// therefore additionally requires a [`LowerByteMap`] to preserve original
-/// display columns.
-///
-/// `pub(crate)` so the budgeted engine ([`crate::BudgetedSearch`]) verifies each
-/// row with the EXACT matcher the batch path uses (results-equality by
-/// construction, not by reimplementation).
+/// One- and two-byte ASCII queries on ASCII lines use the allocation-free byte
+/// scanner; others search one reused lowercase buffer, with a [`LowerByteMap`] when
+/// Unicode lowering can change byte lengths. `pub(crate)` so the budgeted engine
+/// ([`crate::BudgetedSearch`]) verifies rows with the same matcher as the batch path.
 pub(crate) struct CaseInsensitiveMatcher {
     lower_query: String,
     lower_buf: String,
@@ -371,22 +310,16 @@ impl CaseInsensitiveMatcher {
         true
     }
 
-    /// Fold-level occurrence: does `text` contain the folded query AT ALL —
-    /// including occurrences whose original span resolves to ZERO display
-    /// columns, which [`visit_matches`](Self::visit_matches) deliberately
-    /// drops from results (`start_col == end_col`)?
+    /// Whether `text` contains the folded query at all, including occurrences whose
+    /// span resolves to zero display columns, which
+    /// [`visit_matches`](Self::visit_matches) drops.
     ///
-    /// Incremental narrowing frames (isearch, SA-1) must be built from
-    /// OCCURRENCES, not reported matches. A line can hold a genuine
-    /// occurrence of `q` and report NO match, while `q + c` reports one:
-    /// inside a prepend cluster (U+0600 + digit) or across a zero-width
-    /// character (U+200B) or a combining mark, the short query spans no
-    /// display column and the one-char-longer query crosses the boundary and
-    /// does — so a reported-match frame would silently lose that line.
-    /// Fold-level containment carries the exact prefix property narrowing
-    /// rests on (`lower_fold(q + c) == lower_fold(q) + lower_fold(c)`,
-    /// per-char by construction of [`lower_fold_into`]), with no
-    /// width/column semantics in the argument at all.
+    /// Incremental narrowing frames are built from occurrences, not reported matches:
+    /// inside a prepend cluster (U+0600 + digit), or across a zero-width character
+    /// (U+200B) or combining mark, `q` can span no column and report no match while
+    /// `q + c` crosses the boundary and does. Fold-level containment has the prefix
+    /// property narrowing rests on (`lower_fold(q + c) == lower_fold(q) +
+    /// lower_fold(c)`, per character by construction of [`lower_fold_into`]).
     pub(crate) fn has_occurrence(&mut self, text: &str) -> bool {
         if self.lower_query.is_empty() {
             return false;
@@ -509,23 +442,16 @@ impl SearchIndex {
         }
     }
 
-    /// Create a new search index with expected capacity.
-    ///
-    /// Uses the default cache cap ([`DEFAULT_MAX_CACHED_LINES`]); pair with
-    /// `set_max_cached_lines` or use
-    /// [`with_capacity_and_max`](Self::with_capacity_and_max) to override it.
+    /// Create a new search index with expected capacity and the default cache cap
+    /// ([`DEFAULT_MAX_CACHED_LINES`]); see
+    /// [`with_capacity_and_max`](Self::with_capacity_and_max).
     #[must_use]
     pub fn with_capacity(expected_lines: usize) -> Self {
         Self::with_capacity_and_max(expected_lines, DEFAULT_MAX_CACHED_LINES)
     }
 
-    /// Create a new search index with an explicit cache cap.
-    ///
-    /// `max_cached_lines` is the number of distinct line entries kept before
-    /// eviction drops the oldest 25%. A value of 0 is clamped to 1 so the index
-    /// can always hold the most recent line. See
-    /// [`results_may_be_incomplete`](Self::results_may_be_incomplete) for the
-    /// eviction signal.
+    /// Create a new search index with an explicit cache cap: the distinct lines kept
+    /// before eviction drops the oldest quarter, clamped to at least 1.
     #[must_use]
     #[cfg(test)]
     pub fn with_max_cached_lines(max_cached_lines: usize) -> Self {
@@ -541,11 +467,8 @@ impl SearchIndex {
         // Reserving for rows that capacity eviction will immediately discard
         // otherwise pins the full history's hash tables for the cache lifetime.
         let expected_lines = expected_lines.min(max_cached_lines.max(1));
-        // Bound the map capacity HINTS so the Trust L0 gate can prove the
-        // pre-allocations finite. Hints only affect pre-reservation, never
-        // observable behavior: the maps grow on demand past the hint exactly
-        // as before, and real callers pass line counts far below this bound
-        // (the cap above already clamped the hint to `max_cached_lines`).
+        // Bound the map capacity hints so the Trust L0 gate can prove the
+        // pre-allocations finite; the maps still grow past them on demand.
         const MAX_CAPACITY_HINT: usize = 1 << 20;
         let line_hint = if expected_lines > MAX_CAPACITY_HINT {
             MAX_CAPACITY_HINT
@@ -608,13 +531,12 @@ impl SearchIndex {
         self.index_line_cow(line_num, Cow::Borrowed(text), None);
     }
 
-    /// Shared borrowed/owned indexing primitive. Owned text moves directly
-    /// into the retained line cache instead of being copied a second time.
+    /// Shared borrowed/owned indexing primitive; owned text moves into the line cache
+    /// without a second copy.
     ///
-    /// `cells` are the grid cells the text was read from, when the caller
-    /// has them: matches are then reported in the cells that hold them
-    /// ([`ColumnMap::with_cells`]); without them the text is walked as the
-    /// grid lays out a line written left to right ([`ColumnMap::new`]).
+    /// With `cells` (the grid cells the text was read from) matches are reported in
+    /// the cells that hold them ([`ColumnMap::with_cells`]); without, the text is
+    /// walked as a line written left to right ([`ColumnMap::new`]).
     pub(crate) fn index_line_cow(
         &mut self,
         line_num: usize,
@@ -699,15 +621,12 @@ impl SearchIndex {
         self.line_count = self.line_count.max(line_num.saturating_add(1));
         self.next_line = self.next_line.max(line_num.saturating_add(1));
 
-        // Evict oldest cached lines if over capacity
         if self.lines.len() > self.max_cached_lines {
             self.evict_oldest_lines();
         }
 
-        // Rebuild bloom filter if saturated (#7243). When the estimated FPR
-        // exceeds 50%, the bloom filter returns true for most queries, making
-        // it useless as a negative filter. Rebuild from remaining cached lines
-        // to restore its effectiveness.
+        // A saturated filter (estimated false-positive rate over 50%) passes most
+        // queries: rebuild it from the live dictionary.
         if self.bloom.is_saturated() {
             self.rebuild_bloom();
         }
@@ -725,7 +644,7 @@ impl SearchIndex {
     /// The posting key of `line`: its offset from
     /// [`key_base`](Self::key_base).
     ///
-    /// Saturating at both ends, which makes it exact as a range BOUND as well
+    /// Saturating at both ends, which makes it exact as a range bound as well
     /// as a key: every cached line's key is in `0..=MAX_KEY`, so a bound below
     /// the base clamps to 0 and one past the window to `u32::MAX`, on the far
     /// side of every key either way.
@@ -768,39 +687,26 @@ impl SearchIndex {
         )
     }
 
-    /// Make `line` keyable before it is indexed: every cached line, and
-    /// `line`, inside one window of `MAX_KEY_SPAN + 1` lines from
-    /// [`key_base`](Self::key_base).
+    /// Make `line` keyable before it is indexed: every cached line, and `line`, inside
+    /// one window of `MAX_KEY_SPAN + 1` lines from [`key_base`](Self::key_base).
     ///
-    /// Ruling (R15 content-1, 2026-10-10): the postings stay `u32` and become
-    /// offsets from a per-index base, rather than widening to `u64` and doubling
-    /// the posting memory. Callers number lines by absolute terminal row, which
-    /// passes `u32::MAX` in a long-lived tab; a line number stored as `u32`
-    /// saturated there, every posting and candidate range collapsed onto
-    /// `u32::MAX`, and every literal and regex find reported zero matches,
-    /// complete. A window is what an index holds anyway — the newest
-    /// `max_cached_lines` rows, a hundred thousand by default — so `u32`
-    /// offsets lose nothing.
+    /// Postings are `u32` offsets from a per-index base rather than `u64` line
+    /// numbers, which would double posting memory; an index holds a window anyway (the
+    /// newest `max_cached_lines` rows). The fast path, `line` already in the window,
+    /// is a subtraction and a compare. Otherwise the window moves, re-keying each
+    /// posting list in `O(1)` ([`SparseBitmap::shift`]):
     ///
-    /// The fast path, `line` already in the window, is a subtraction and a
-    /// compare. Otherwise the window moves, and re-keying costs `O(1)` per
-    /// posting list ([`SparseBitmap::shift`]):
+    /// - up (output appended past the window): the base moves to the oldest cached
+    ///   line, leaving the most room for rows to come; cached lines more than
+    ///   `MAX_KEY_SPAN` below `line` cannot share its window and are evicted, reported
+    ///   as any eviction is.
+    /// - down (an older line indexed after newer ones): the base moves as low as the
+    ///   newest line allows, so a run of ever-older lines moves it once.
     ///
-    /// - going UP (the terminal appended past the window): the base moves to the
-    ///   oldest cached line, leaving the most room for the rows still to come;
-    ///   cached lines more than `MAX_KEY_SPAN` below `line` cannot share its
-    ///   window and are evicted, reported as an eviction is.
-    /// - going DOWN (an older line indexed after newer ones): the base moves as
-    ///   low as the newest line allows, so a run of ever-older lines moves it
-    ///   once, not once per line.
-    ///
-    /// Returns `false` when `line` is older than that lowest base: it is more
-    /// than `MAX_KEY_SPAN` below the newest line, so it cannot be indexed beside
-    /// it. It is dropped, and the index reports results incomplete below the
-    /// window, as for any eviction — the newest lines are the ones an index
-    /// keeps. Neither move happens for a terminal's own windows, which span at
-    /// most the configured depth: the first fires once per 2^32 rows of
-    /// output, and the rest need a caller to index lines 2^32 apart.
+    /// Returns `false` when `line` is more than `MAX_KEY_SPAN` below the newest line:
+    /// it is dropped, and results report incomplete below the window. A terminal's
+    /// own windows span at most the configured depth, so the first move happens once
+    /// per 2^32 rows of output and the rest need lines indexed 2^32 apart.
     fn make_room_for(&mut self, line: usize) -> bool {
         if line
             .checked_sub(self.key_base)
@@ -898,10 +804,9 @@ impl SearchIndex {
         }
     }
 
-    /// Collect the full trigram set one text contributes to the POSTING maps:
-    /// the original-case windows plus the lowered pass exactly when
-    /// [`lower_need`] says the insert path ran it (the shared classifier that
-    /// keeps insert/remove/rebuild symmetric by construction — #7398, #7470).
+    /// The full trigram set `text` contributes to the posting maps: the original-case
+    /// windows plus the lowered pass exactly when [`lower_need`] says the insert path
+    /// ran it, which keeps insert, remove and rebuild symmetric.
     fn posting_trigram_set(&mut self, text: &str) -> FxHashSet<[u8; 3]> {
         let bytes = text.as_bytes();
         let mut set: FxHashSet<[u8; 3]> =
@@ -930,39 +835,24 @@ impl SearchIndex {
         set
     }
 
-    /// Posting + bloom maintenance for a row whose text GENUINELY changed
-    /// (SA-3): touch only the trigrams whose membership actually changes.
+    /// Posting and bloom maintenance for a row whose text changed: touch only the
+    /// trigrams whose membership changes. An in-place edit (the echoed prompt line, a
+    /// partial last row) shares almost every trigram between old and new text, and
+    /// removing then reinserting a shared trigram decodes, splices and re-encodes its
+    /// whole list for no change.
     ///
-    /// The predecessor (`remove_trigrams(old)` + insert-every-new-trigram)
-    /// paid a full posting-list decode → splice → re-encode round trip TWICE
-    /// per trigram occurrence of BOTH texts — O(list length) each, ~160 round
-    /// trips for one edited 80-column row, even though a typical in-place edit
-    /// (the echoed prompt line, a partial last row) shares almost every
-    /// trigram between old and new text. For a SHARED trigram the
-    /// remove-then-reinsert was the identity on the list — an EXPENSIVE
-    /// identity. This does set-difference instead:
-    ///
-    /// - old ∩ new: posting list untouched. The live delta+varint bytes have
-    ///   the canonical minimal encoding (an amortized eviction may retain a
-    ///   consumed byte prefix), so remove(row)-then-insert(row) would have
-    ///   rebuilt the same live bytes (the same canonicality
-    ///   argument the unchanged-row skip in [`index_line`] rests on — even a
-    ///   shared trigram whose list momentarily emptied and was pruned would be
-    ///   recreated with the identical single-value encoding).
-    /// - old ∖ new: removed (and pruned when emptied — #2111), exactly as
-    ///   `remove_trigrams` did.
-    /// - new ∖ old: inserted, exactly as the insert pass did. The `new_seen`
-    ///   gate also spares repeated windows the old path's per-duplicate
-    ///   decode + binary-search no-op on non-tail rows.
+    /// - old ∩ new: untouched. Live delta+varint bytes are the canonical minimal
+    ///   encoding, so remove-then-insert would rebuild the same bytes (the argument
+    ///   the unchanged-row skip in [`index_line_cow`] rests on).
+    /// - old ∖ new: removed, and pruned when emptied.
+    /// - new ∖ old: inserted; `new_seen` also skips repeated windows.
     ///
     /// Bloom insertion happens only when a trigram first enters the posting
-    /// dictionary. Shared keys are already represented; removed keys may leave
-    /// stale bits until the next rebuild, which permits only false positives.
-    /// Per changed posting the update is O(1) for the newest row and O(list
-    /// length) otherwise because a varint stream is re-encoded at a splice.
+    /// dictionary; removed keys may leave stale bits until the next rebuild, which
+    /// permits only false positives. Each changed posting costs O(1) for the newest
+    /// row and O(list length) otherwise (a varint stream is re-encoded at a splice).
     ///
-    /// [`index_line`]: Self::index_line
-    /// [`lower_need`]: crate::grapheme::lower_need
+    /// [`index_line_cow`]: Self::index_line_cow
     fn reindex_changed_row_postings(&mut self, key: u32, old_text: &str, text: &str) {
         let old_set = self.posting_trigram_set(old_text);
         let bytes = text.as_bytes();
@@ -976,7 +866,7 @@ impl SearchIndex {
                 insert_posting(&mut self.trigrams, &mut self.bloom, trigram, key);
             }
         }
-        // Lowered pass, gated by the SHARED classifier (see `index_line`).
+        // Lowered pass, gated by the shared classifier (see `index_line_cow`).
         match lower_need(text) {
             LowerNeed::None => {}
             LowerNeed::Ascii => {
@@ -993,9 +883,7 @@ impl SearchIndex {
             }
             LowerNeed::Unicode => {
                 lower_fold_into(text, &mut self.lower_scratch);
-                // Disjoint-field borrows (scratch read, bloom/trigrams
-                // written) — the exact pattern `index_line`'s Unicode arm
-                // already uses.
+                // Disjoint field borrows: scratch read, bloom and trigrams written.
                 for window in self.lower_scratch.as_bytes().windows(3) {
                     let trigram: [u8; 3] = [window[0], window[1], window[2]];
                     if new_seen.insert(trigram) && !old_set.contains(&trigram) {
@@ -1004,8 +892,7 @@ impl SearchIndex {
                 }
             }
         }
-        // Removals: trigrams only the OLD text contributed (prune emptied
-        // lists exactly as `remove_trigrams` did — #2111).
+        // Removals: trigrams only the old text contributed, pruned when emptied.
         for trigram in old_set {
             if new_seen.contains(&trigram) {
                 continue;
@@ -1019,17 +906,12 @@ impl SearchIndex {
         }
     }
 
-    /// Evict the oldest 25% of cached lines when capacity is exceeded.
-    ///
-    /// Collects and sorts cached line numbers: O(n log n), independent of
-    /// gaps in sparse line numbers (e.g. visible content at line 50000 after
-    /// scrollback lines 0-99), where a linear scan stalls (#7246).
+    /// Evict the oldest quarter of cached lines once capacity is exceeded. Sorts the
+    /// cached line numbers (O(n log n)), so gaps in sparse numbering (visible content
+    /// at line 50000 after scrollback 0-99) cost nothing.
     fn evict_oldest_lines(&mut self) {
-        // Saturating: only reachable when `lines.len() > max_cached_lines`,
-        // so the cap is far below usize::MAX / 3 on every real path and the
-        // saturation is dead code carrying the no-overflow proof for the
-        // Trust L0 gate. The 3/4 low-water ratio is named once (shared with
-        // `max_cached_for_retained`, the inverse callers size a retained floor by).
+        // Saturating never fires (the cap is below the cache size, far under
+        // `usize::MAX / 3`); it carries the L0 no-overflow proof.
         let target =
             self.max_cached_lines.saturating_mul(EVICTION_RETAIN_NUM) / EVICTION_RETAIN_DEN;
         let to_evict = self.lines.len().saturating_sub(target);
@@ -1037,30 +919,24 @@ impl SearchIndex {
             return;
         }
 
-        // Collect and sort line numbers to find the oldest entries.
         let mut line_nums: Vec<usize> = self.lines.keys().copied().collect();
         line_nums.sort_unstable();
 
-        // Remove the oldest `to_evict` entries. Explicit comparison instead
-        // of `Ord::min` so the gate sees the dominating bound for the slice
-        // below (same value always).
+        // An explicit comparison, not `Ord::min`, so the gate sees the dominating
+        // bound for the slice below.
         let evict_count = if to_evict < line_nums.len() {
             to_evict
         } else {
             line_nums.len()
         };
-        // `take` instead of slicing `line_nums[..evict_count]`: take() is
-        // panic-free, so the L0 gate has no slice-bounds obligation to carry
-        // across the (opaque to it) Vec length. Identical iteration: take(n)
-        // stops at min(n, len) and evict_count <= len by the guard above.
+        // `take`, not slicing: panic-free, so the L0 gate carries no slice-bounds
+        // obligation.
         for &line in line_nums.iter().take(evict_count) {
             self.lines.remove(&line);
             self.column_maps.remove(&line);
         }
 
-        // Advance the retained-line watermark to the smallest remaining line.
-        // Matches below this line are gone and can no longer be returned, so
-        // callers must treat results that span this range as incomplete.
+        // Matches below the new watermark are gone: results spanning it are incomplete.
         self.lowest_retained_line = line_nums
             .get(evict_count)
             .copied()
@@ -1068,21 +944,16 @@ impl SearchIndex {
         self.first_cached_line = self.lowest_retained_line;
         self.eviction_occurred = true;
 
-        // Trim every posting list to the new watermark in ONE front-drain, then
-        // prune emptied trigrams. Equivalent to removing each evicted line's
-        // trigrams one-by-one — every row below the watermark is evicted, so a
-        // posting entry is dropped iff its row is — but O(total_postings)
-        // instead of the O(evicted·len) of one-at-a-time front removals (the
-        // sortedvec container's front remove is a tail shift). See
-        // SparseBitmap::drop_below and the eviction-identity oracle.
+        // Trim every posting list to the watermark in one front-drain and prune the
+        // emptied ones: every row below it was evicted, so this drops exactly their
+        // postings in O(total postings) rather than one front removal per row.
         let watermark = self.posting_key(self.lowest_retained_line);
         self.trigrams.retain(|_, bitmap| {
             bitmap.drop_below(watermark);
             !bitmap.is_empty()
         });
 
-        // Warn once: results are now potentially incomplete for the lifetime of
-        // this index. Repeated eviction passes do not re-warn (avoids log spam).
+        // Warn once per index: results may be incomplete from here on.
         if !self.first_eviction_warned {
             self.first_eviction_warned = true;
             aterm_log::warn!(
@@ -1092,7 +963,7 @@ impl SearchIndex {
             );
         }
 
-        // Rebuild bloom filter from remaining lines (#7270).
+        // Rebuild the bloom filter from the remaining dictionary.
         self.rebuild_bloom();
     }
 
@@ -1112,20 +983,17 @@ impl SearchIndex {
         }
     }
 
-    /// Check if a query might have matches (bloom filter check).
-    ///
-    /// Returns `false` if definitely no matches exist.
-    /// Returns `true` if matches are possible (verify with actual search).
+    /// Whether `query` might have matches (bloom filter check): `false` means
+    /// definitely none.
     #[must_use]
     pub fn might_contain(&self, query: &str) -> bool {
         let bytes = query.as_bytes();
 
-        // For short queries, we can't use the bloom filter effectively
+        // Under one trigram: the bloom filter cannot rule anything out.
         if bytes.len() < 3 {
             return true;
         }
 
-        // Check if all query trigrams might exist
         for window in bytes.windows(3) {
             if !self.bloom.might_contain_bytes(window) {
                 return false;
@@ -1134,15 +1002,9 @@ impl SearchIndex {
         true
     }
 
-    /// Intersect the posting lists for every trigram in `query`.
-    ///
-    /// Shared core of `search`, `search_from_line`, and `search_before_line`:
-    /// each caller handles its own empty-query / short-query / bloom-filter
-    /// guards and candidate source, then defers to this for the intersection.
-    ///
-    /// Returns `None` when no matches are possible (a trigram is missing or the
-    /// query yields no posting lists), and `Some(bitmap)` with the intersection
-    /// otherwise. Caller is responsible for ensuring `query` has 3+ bytes.
+    /// Intersect the posting lists for every trigram in `query` (3+ bytes; the caller
+    /// handles empty, short and bloom-rejected queries). `None` when a trigram has no
+    /// postings.
     #[cfg(test)]
     fn intersect_trigrams(&self, query: &str) -> Option<SparseBitmap> {
         let mut posting_lists = self.posting_lists(query)?;
@@ -1162,9 +1024,8 @@ impl SearchIndex {
             let trigram: [u8; 3] = [window[0], window[1], window[2]];
             posting_lists.push(self.trigrams.get(&trigram)?);
         }
-        // Repeated trigrams point at the same posting bitmap. Deduplicate by
-        // identity so a long/repetitive query does not repeat the same BTree
-        // membership test (or owned intersection) once per query position.
+        // Repeated trigrams share one posting list: dedupe by identity so a repetitive
+        // query does not probe the same list once per position.
         posting_lists.sort_unstable_by_key(|bitmap| std::ptr::from_ref(*bitmap));
         posting_lists.dedup_by(|left, right| std::ptr::eq(*left, *right));
         #[cfg(test)]
@@ -1215,10 +1076,7 @@ impl SearchIndex {
         self.postings_backward(postings, upper)
     }
 
-    /// Search for a query string.
-    ///
-    /// Returns line numbers that might contain the query.
-    /// Results may include false positives but never false negatives.
+    /// Candidate lines for `query`: false positives possible, false negatives never.
     #[cfg(test)]
     pub fn search(&self, query: &str) -> impl Iterator<Item = usize> + '_ + use<'_> {
         let bytes = query.as_bytes();
@@ -1226,16 +1084,13 @@ impl SearchIndex {
         let line = move |key: u32| base.saturating_add(key as usize);
 
         if bytes.len() < 3 {
-            // Can't use trigram index for short queries
-            // Fall back to retained lines (caller must verify). Starting at the
-            // first cached absolute row avoids walking a potentially huge empty
-            // numeric prefix after long-running terminal history eviction.
+            // Under one trigram: every retained line, from the first cached row so a
+            // long-evicted numeric prefix is not walked.
             let first = self.first_cached_line.min(self.line_count);
             return SearchResult::All(self.posting_key(first)..self.posting_key(self.line_count))
                 .map(line);
         }
 
-        // Quick bloom filter check
         if !self.might_contain(query) {
             return SearchResult::None.map(line);
         }
@@ -1246,10 +1101,8 @@ impl SearchIndex {
         SearchResult::Bitmap(Box::new(result.into_iter())).map(line)
     }
 
-    /// Search with match verification and position extraction.
-    ///
-    /// Returns actual matches with column positions.
-    /// This verifies candidates against cached line content.
+    /// Verified matches of `query` with column positions, at most
+    /// [`MAX_SEARCH_MATCHES`].
     pub fn search_with_positions(&self, query: &str) -> Vec<SearchMatch> {
         // Empty query returns no matches (prevents infinite loop in find)
         if query.is_empty() {
@@ -1260,9 +1113,7 @@ impl SearchIndex {
             .collect()
     }
 
-    /// Search and return matches in the specified direction.
-    ///
-    /// Returns an iterator over matches sorted by line number.
+    /// Verified matches, sorted for `direction`.
     #[cfg(test)]
     pub fn search_ordered(&self, query: &str, direction: SearchDirection) -> Vec<SearchMatch> {
         let mut matches = self.search_with_positions(query);
@@ -1292,13 +1143,8 @@ impl SearchIndex {
         self.line_count == 0
     }
 
-    /// Clear the index.
-    ///
-    /// Resets the eviction watermark and incomplete-results signal: a cleared
-    /// index has not evicted anything, so [`results_may_be_incomplete`] is
-    /// false again until the cache cap is next exceeded.
-    ///
-    /// [`results_may_be_incomplete`]: Self::results_may_be_incomplete
+    /// Clear the index, including the eviction watermark and the incomplete-results
+    /// signal.
     pub fn clear(&mut self) {
         self.bloom.clear();
         self.trigrams.clear();
@@ -1313,22 +1159,15 @@ impl SearchIndex {
         self.first_eviction_warned = false;
     }
 
-    /// Release the index's backing allocations, not just its logical contents.
+    /// Release the index's backing allocations, not just its contents.
     ///
-    /// [`clear`](Self::clear) empties every container but a `HashMap`/`Vec`
-    /// RETAINS the capacity it grew to, so a cleared index still holds the peak
-    /// heap of its busiest moment — a logical clear frees nothing observable to
-    /// the OS. `release` instead REPLACES each container with a fresh empty one,
-    /// dropping the grown allocation back to the allocator, and resets the same
-    /// watermarks `clear` does. This is the primitive an idle-eviction policy
-    /// calls to actually reclaim a dormant document's footprint; a later
-    /// `index_line` regrows the maps from empty. The reset is byte-for-byte the
-    /// same OBSERVABLE state as `clear` (a subsequent search behaves
-    /// identically) — only the retained capacity differs.
+    /// [`clear`](Self::clear) keeps the capacity every container grew to, so a
+    /// cleared index still holds its peak heap. `release` replaces each container
+    /// with a fresh one, returning the memory, and resets the same state `clear`
+    /// does; only the retained capacity differs.
     pub fn release(&mut self) {
-        // Assign fresh containers (not `.clear()`) so the old backing buffers
-        // are dropped, not merely emptied-in-place. Bloom drops to its floor
-        // capacity, matching a freshly constructed index.
+        // Fresh containers, not `.clear()`, so the old buffers are dropped; the bloom
+        // filter returns to its floor capacity.
         self.bloom = BloomFilter::with_capacity(1000);
         self.trigrams = FxHashMap::default();
         self.lines = FxHashMap::default();
@@ -1343,46 +1182,31 @@ impl SearchIndex {
         self.first_eviction_warned = false;
     }
 
-    /// Set the maximum number of cached lines before eviction.
-    ///
-    /// A value of 0 is clamped to 1 so the index always retains at least the
-    /// most recent line. Lowering the cap below the current cache size does not
-    /// retroactively evict — eviction happens on the next [`index_line`] that
-    /// exceeds the new cap.
-    ///
-    /// [`index_line`]: Self::index_line
+    /// Set the maximum number of cached lines before eviction, clamped to at least 1.
+    /// Lowering it evicts nothing until the next [`index_line`](Self::index_line).
     #[cfg(test)]
     pub fn set_max_cached_lines(&mut self, max: usize) {
         self.max_cached_lines = max.max(1);
     }
 
-    /// State — in BOTH directions — whether the bulk build that just finished
-    /// omitted an older history prefix the source buffer still holds.
+    /// State, in both directions, whether the bulk build that just finished omitted
+    /// an older history prefix the source still holds.
     ///
-    /// `Some(base)`: the builder deliberately indexed only the newest suffix
-    /// (the configured depth cap is shallower than the retained history), so
-    /// results are incomplete below `base` and the watermark says exactly where
-    /// the searchable range starts. `None`: the WHOLE retained source window is
-    /// indexed, so results are exhaustive again and the watermark is zero.
+    /// `Some(base)`: only the newest suffix was indexed (the depth cap is shallower
+    /// than the retained history), so results are incomplete below `base`. `None`: the
+    /// whole retained source window is indexed, so results are exhaustive again.
     ///
-    /// The `None` arm is why this is a setter and not a one-way
-    /// `mark_…_evicted`. [`results_may_be_incomplete`](Self::results_may_be_incomplete)
-    /// is a LATCH on the incremental append path — an eviction there really is
-    /// unrecoverable, because the dropped text is gone and nothing re-feeds it.
-    /// A bulk builder is the opposite case: it re-establishes the index's
-    /// contents from the source on every build, so once the source's history
-    /// has fallen back under the cap (a `clear`, a scrollback eviction, a
-    /// raised cap) the index IS exhaustive, and a latched flag would make the
-    /// find bar print `N+` for the life of the session over a count it knows is
-    /// exact. Only a caller that has just (re)indexed every retained source row
-    /// may pass `None`; the GUI bulk builder is bounded by the same
-    /// `max_cached_lines` it constructs the index with, so its fed range can
-    /// never trip the internal cap eviction that this could otherwise paper
-    /// over.
+    /// A setter, not a one-way mark: append-path eviction latches
+    /// [`results_may_be_incomplete`](Self::results_may_be_incomplete) because the
+    /// dropped text is gone, but a bulk builder re-establishes the contents from the
+    /// source on every build, so once the history is back under the cap a latched
+    /// flag would print `N+` over an exact count. Only a caller that has just indexed
+    /// every retained source row may pass `None`; the GUI bulk builder feeds at most
+    /// the `max_cached_lines` it builds the index with, so internal cap eviction never
+    /// fires under it.
     ///
-    /// `first_eviction_warned` is deliberately NOT reset: it guards a
-    /// one-per-index log line, not observable result state, and re-arming it
-    /// would re-warn on every cap crossing.
+    /// `first_eviction_warned` is not reset: it guards a once-per-index log line, not
+    /// result state.
     pub(crate) fn set_history_prefix_eviction(&mut self, lowest_retained_line: Option<usize>) {
         match lowest_retained_line {
             Some(base) if base > 0 => {
@@ -1422,10 +1246,8 @@ impl SearchIndex {
             self.lines.remove(&line);
             self.column_maps.remove(&line);
         }
-        // Batch-trim postings below the retained boundary in one front-drain
-        // (see evict_oldest_lines): every removed row is < first_retained_line,
-        // so trimming each posting list to the watermark drops exactly their
-        // entries without an O(rows·len) per-row front-remove.
+        // One posting front-drain to the boundary (see `evict_oldest_lines`): every
+        // removed row is below it.
         let watermark = self.posting_key(first_retained_line);
         self.trigrams.retain(|_, bitmap| {
             bitmap.drop_below(watermark);
@@ -1436,26 +1258,15 @@ impl SearchIndex {
         self.eviction_occurred = true;
     }
 
-    /// Drop cached absolute rows below `first_retained_line` WITHOUT recording
-    /// an eviction — the complete-retention twin of `retain_history_from`.
+    /// Drop cached absolute rows below `first_retained_line` without recording an
+    /// eviction: the complete-retention twin of `retain_history_from`.
     ///
-    /// `retain_history_from` models "rows the INDEX can no longer serve": an
-    /// honesty event (results become incomplete, the retained watermark
-    /// advances). This models "rows the TERMINAL no longer retains at all":
-    /// after grid retention advances (a full ring evicting one line per
-    /// append, a scrollback-limit or memory-budget shrink), the dropped rows
-    /// are not un-searchable content — they are nonexistent content, and a
-    /// from-scratch rebuild over the surviving rows would start a FRESH index
-    /// reporting COMPLETE results. The terminal's incremental refresh
-    /// (`Terminal::indexed_search`) uses this so its observable state
-    /// (matches, [`results_may_be_incomplete`], [`lowest_retained_line`]) is
-    /// byte-identical to that from-scratch rebuild — the refresh's
-    /// behavior-identity contract — instead of diverging into a sticky
-    /// `incomplete` the rebuild path never reported.
-    ///
-    /// Callers must only use this when the dropped rows are really gone from
-    /// the source buffer; for index-side capacity trimming keep
-    /// `retain_history_from`, which reports honestly.
+    /// For rows the terminal no longer retains at all (a full ring evicting a line per
+    /// append, a scrollback-limit or memory-budget shrink), not rows the index can no
+    /// longer serve. A rebuild over the surviving rows would report complete results,
+    /// and the terminal's incremental refresh (`Terminal::indexed_search`) must match
+    /// that rebuild: matches, [`results_may_be_incomplete`], [`lowest_retained_line`].
+    /// Use it only when the dropped rows are gone from the source buffer.
     ///
     /// [`results_may_be_incomplete`]: Self::results_may_be_incomplete
     /// [`lowest_retained_line`]: Self::lowest_retained_line
@@ -1464,9 +1275,8 @@ impl SearchIndex {
         if first_retained_line <= old_first {
             return;
         }
-        // Same two-strategy stale-key collection as `retain_history_from`:
-        // small ordinary advances walk the removed numeric prefix; a sparse or
-        // large jump switches to one bounded cache scan.
+        // Small advances walk the removed numeric prefix; a sparse or large jump scans
+        // the cache once.
         let distance = first_retained_line.saturating_sub(old_first);
         let stale: Vec<usize> = if distance <= self.lines.len().saturating_mul(2) {
             (old_first..first_retained_line).collect()
@@ -1481,22 +1291,18 @@ impl SearchIndex {
             self.lines.remove(&line);
             self.column_maps.remove(&line);
         }
-        // One batched posting front-drain, exactly as `retain_history_from`
-        // (see there); only the honesty bookkeeping differs.
+        // One posting front-drain; only the eviction bookkeeping differs from
+        // `retain_history_from`.
         let watermark = self.posting_key(first_retained_line);
         self.trigrams.retain(|_, bitmap| {
             bitmap.drop_below(watermark);
             !bitmap.is_empty()
         });
         self.first_cached_line = first_retained_line.min(self.line_count);
-        // Deliberately NOT touched: `lowest_retained_line` /
-        // `eviction_occurred`. A from-scratch rebuild over the surviving rows
-        // reports complete results with a zero watermark, and this drop must
-        // be observationally indistinguishable from that rebuild. The bloom
-        // filter keeps the dropped rows' stale bits (it is a NEGATIVE filter:
-        // stale bits cost false-positive candidate visits, never results);
-        // saturation-triggered rebuilds resize it from live lines exactly as
-        // on the incremental append path.
+        // `lowest_retained_line` and `eviction_occurred` stay as they are: this drop
+        // must be indistinguishable from a rebuild over the surviving rows, which
+        // reports complete results. The bloom filter keeps the dropped rows' bits,
+        // which cost only false-positive candidate visits until a saturation rebuild.
     }
 
     /// Current maximum cached-lines cap.
@@ -1506,25 +1312,16 @@ impl SearchIndex {
         self.max_cached_lines
     }
 
-    /// The oldest line number still retained in the index.
-    ///
-    /// Returns 0 until eviction occurs. After eviction this is the lowest line
-    /// that can still produce a match; any match in scrollback below this line
-    /// has been dropped from the index. Callers (e.g. `cmd_search`) can report
-    /// the searchable range `[lowest_retained_line(), len())` to the AI.
+    /// The oldest line number still retained: 0 until eviction, then the lowest line
+    /// that can still match. The searchable range is `[lowest_retained_line(), len())`.
     #[must_use]
     pub fn lowest_retained_line(&self) -> usize {
         self.lowest_retained_line
     }
 
-    /// Whether search results may be incomplete due to eviction.
-    ///
-    /// `false` means every indexed line is still cached and search is
-    /// exhaustive over the indexed range. `true` means the cache cap has been
-    /// exceeded at least once and the oldest lines were dropped, so matches
-    /// below [`lowest_retained_line`](Self::lowest_retained_line) are silently
-    /// absent. The future `cmd_search` should pass this through so the AI is
-    /// told results are truncated rather than treating them as exhaustive.
+    /// Whether search results may be incomplete due to eviction: once the oldest lines
+    /// were dropped, matches below [`lowest_retained_line`](Self::lowest_retained_line)
+    /// are absent.
     #[must_use]
     pub fn results_may_be_incomplete(&self) -> bool {
         self.eviction_occurred
@@ -1537,15 +1334,8 @@ impl SearchIndex {
         self.lines.get(&line_num).map(|s| s.as_str())
     }
 
-    /// Search for matches starting from a given line (O(log n) for first match).
-    ///
-    /// Returns an iterator over matches in forward order (oldest to newest),
-    /// starting from `from_line`. This is efficient for `find_next` operations
-    /// as it uses range queries on the trigram index to skip earlier lines.
-    ///
-    /// # Arguments
-    /// * `query` - The search query (must be 3+ chars for trigram indexing)
-    /// * `from_line` - Start searching from this line number (inclusive)
+    /// Forward matches of `query` from `from_line` (inclusive), oldest first, range
+    /// bounded on the trigram index so `find_next` skips earlier lines.
     pub(crate) fn search_from_line<'a>(
         &'a self,
         query: &'a str,
@@ -1555,20 +1345,17 @@ impl SearchIndex {
 
         let empty = CandidateSource::empty;
 
-        // Empty query returns no matches
         if query.is_empty() {
             return SearchMatchIterator::new(self, query, empty());
         }
 
         if bytes.len() < 3 {
-            // Can't use trigram index for short queries — use lazy range
-            // instead of collecting all line numbers into a Vec (avoids O(n) alloc)
+            // Under one trigram: a lazy range, not a collected Vec.
             let first = from_line.max(self.first_cached_line.min(self.line_count));
             let source = self.line_range(first, self.line_count);
             return SearchMatchIterator::new(self, query, source);
         }
 
-        // Quick bloom filter check
         if !self.might_contain(query) {
             return SearchMatchIterator::new(self, query, empty());
         }
@@ -1577,22 +1364,14 @@ impl SearchIndex {
             return SearchMatchIterator::new(self, query, empty());
         };
 
-        // Borrow the smallest posting range and membership-check the remaining
-        // lists lazily. No full BTree clone/intersection is built before the
-        // first match, even for a one-trigram query present on every line.
+        // Drive off the smallest posting list and membership-check the rest lazily:
+        // nothing is intersected before the first match.
         let source = self.postings_forward(postings, from_line);
         SearchMatchIterator::new(self, query, source)
     }
 
-    /// Search for matches up to a given line for backward iteration.
-    ///
-    /// Returns an iterator over matches in reverse order (newest to oldest),
-    /// only considering lines before `before_line`. This is efficient for
-    /// `find_prev` operations.
-    ///
-    /// # Arguments
-    /// * `query` - The search query (must be 3+ chars for trigram indexing)
-    /// * `before_line` - Only search lines before this line number (exclusive)
+    /// Backward matches of `query` on lines before `before_line` (exclusive), newest
+    /// first, for `find_prev`.
     pub(crate) fn search_before_line<'a>(
         &'a self,
         query: &'a str,
@@ -1602,21 +1381,18 @@ impl SearchIndex {
 
         let empty = CandidateSource::empty;
 
-        // Empty query returns no matches
         if query.is_empty() {
             return SearchMatchReverseIterator::new(self, query, empty());
         }
 
         if bytes.len() < 3 {
-            // Can't use trigram index for short queries — use lazy reversed range
-            // instead of collecting all line numbers into a Vec (avoids O(n) alloc)
+            // Under one trigram: a lazy reversed range, not a collected Vec.
             let upper = before_line.min(self.line_count);
             let lower = self.first_cached_line.min(upper);
             let source = self.line_range_rev(lower, upper);
             return SearchMatchReverseIterator::new(self, query, source);
         }
 
-        // Quick bloom filter check
         if !self.might_contain(query) {
             return SearchMatchReverseIterator::new(self, query, empty());
         }
@@ -1630,60 +1406,41 @@ impl SearchIndex {
     }
 }
 
-/// Maximum pattern length for regex compilation (bytes).
-///
-/// Matches the streaming engine's default `max_pattern_len` (1024). Patterns
-/// beyond this limit are rejected before compilation to bound CPU cost.
+/// Maximum regex pattern length in bytes, the streaming engine's default
+/// `max_pattern_len`; longer patterns are refused before compiling.
 const MAX_REGEX_PATTERN_LEN: usize = 1024;
 
-/// Maximum compiled regex size (bytes) passed to `RegexBuilder::size_limit`.
+/// Maximum compiled regex size (bytes) passed to `RegexBuilder::size_limit`: 128 KiB,
+/// 2,048 instructions at `aterm-regex`'s 64 bytes per instruction, well below the
+/// engine's 10 MiB default. Mirrors `aterm-observe`'s constant, which carries the
+/// full derivation.
 ///
-/// Caps the NFA at 128 KiB — 2,048 instructions at `aterm-regex`'s
-/// 64-byte-per-instruction charge — well below the engine's 10 MiB default.
-/// Mirrors `aterm-observe`'s constant of the same name, which carries the full
-/// derivation.
-///
-/// It bounds **both** compile time and scan time. Deeply nested alternations
-/// and large repetition counts are the ReDoS-via-compilation shape, and a Pike
-/// VM's scan is linear in the haystack with the program size as its constant —
-/// so the same ceiling is what stops a thirteen-byte pattern such as
-/// `(?:x?){2000}z` (4,002 instructions, 37 ms per 4,096-column row under the
-/// old 1 MiB ceiling) from being recompiled and re-scanned on every keystroke.
-/// 128 KiB is the smallest value that still admits a 1,024-byte literal
-/// pattern, which [`MAX_REGEX_PATTERN_LEN`] permits.
+/// It bounds both compile and scan time: deep alternations and large repetition
+/// counts are the ReDoS-via-compilation shape, and a Pike VM's scan is linear in the
+/// haystack with the program size as its constant. 128 KiB is the smallest value
+/// that still admits a [`MAX_REGEX_PATTERN_LEN`]-byte literal.
 pub(crate) const REGEX_SIZE_LIMIT: usize = 128 * 1024; // 128 KiB
 
-/// Maximum DFA size (bytes) passed to `RegexBuilder::dfa_size_limit`.
-///
-/// Retained for source compatibility and still passed: `aterm-regex` is a pure
-/// Pike VM, so there is no lazy DFA for it to bound today, and the builder
-/// documents the setting as inert rather than repurposing it silently.
-/// Per-query memory is already bounded by [`REGEX_SIZE_LIMIT`] — the VM's
-/// thread set is capped by the program size. Mirrors `aterm-observe`.
+/// Maximum DFA size (bytes) passed to `RegexBuilder::dfa_size_limit`. Inert:
+/// `aterm-regex` is a pure Pike VM with no lazy DFA, and its thread set is already
+/// bounded by [`REGEX_SIZE_LIMIT`]. Passed for source compatibility; mirrors
+/// `aterm-observe`.
 pub(crate) const REGEX_DFA_SIZE_LIMIT: usize = 1 << 20; // 1 MiB
 
-/// Scan budget (work units) for one line of up to a full-width row, passed to
-/// `aterm_regex::RegexBuilder::step_limit` and the floor of every line's
-/// budget ([`regex_line_budget`]). About 4.8 ms of matching on the m21 box in
-/// release.
+/// Scan budget (work units) for one line up to a full-width row, passed to
+/// `aterm_regex::RegexBuilder::step_limit` and the floor of every line's budget
+/// ([`regex_line_budget`]); about 4.8 ms of matching in release.
 ///
-/// [`REGEX_SIZE_LIMIT`] bounds the compiled program; this bounds what running
-/// that program over a line costs, and only the two together bound a query. A
-/// Pike VM's scan is linear in the haystack with the program size as its
-/// constant, so the cost of a pattern is the *product* — and both factors come
-/// from the search box. Measured: the heaviest program the 128 KiB ceiling
-/// still admits needs ~16.7M units (19 ms) to cross one 4,096-column line,
-/// which over a 20,000-line scrollback is minutes per keystroke; this budget
-/// stops it after ~4.2M.
-///
-/// One budget pays for a whole line: `find_iter` shares it across the search
-/// it runs per match, so a pattern that re-walks the line once per match is
-/// stopped here rather than costing a multiple of it (R3). Nothing real comes
-/// near it — the most expensive pattern aterm itself ships (the IPv6 selection
-/// rule) needs ~252,000 units to find every match in a full-width line,
-/// sixteen times below. A line its scan cannot finish is reported, never
-/// passed off as finished: see [`SearchResults::cut_short_lines`]. Mirrors
-/// `aterm-observe`, whose lines are single grid rows.
+/// [`REGEX_SIZE_LIMIT`] bounds the program and this bounds running it over a line;
+/// only the two together bound a query, since its cost is their product and both
+/// come from the search box. The heaviest program the size ceiling admits needs
+/// ~16.7M units (19 ms) to cross a 4,096-column line, minutes per keystroke over a
+/// 20,000-line scrollback; this stops it after ~4.2M. One budget pays for a whole
+/// line: `find_iter` shares it across the search it runs per match. The most
+/// expensive pattern aterm ships (the IPv6 selection rule) needs ~252,000 units for a
+/// full-width line. A line its scan cannot finish is reported
+/// ([`SearchResults::cut_short_lines`]). Mirrors `aterm-observe`, whose lines are
+/// single grid rows.
 pub(crate) const REGEX_STEP_LIMIT: u64 = 1 << 22;
 
 /// Work units per byte a line longer than a full-width row gets:
@@ -1692,28 +1449,21 @@ pub(crate) const REGEX_STEP_LIMIT: u64 = 1 << 22;
 /// stays what the same text laid out in full-width rows already cost.
 pub(crate) const REGEX_STEP_PER_BYTE: u64 = REGEX_STEP_LIMIT / 4096;
 
-/// The most one line's scan may cost: 2^26 units, about 77 ms on the m21 box
-/// in release — `aterm-regex`'s own default step limit, which its docs size
-/// for the one search that actually exhausts it. Lines up to 64 KiB get
-/// [`REGEX_STEP_PER_BYTE`] in full; a longer one gets this, which still pays
-/// fifteen units a byte across a 4.3 MB line, where a literal-led pattern
-/// needs one or two.
+/// The most one line's scan may cost: 2^26 units, about 77 ms in release, which is
+/// `aterm-regex`'s own default step limit. Lines up to 64 KiB get
+/// [`REGEX_STEP_PER_BYTE`] in full; a longer one gets this, still fifteen units a byte
+/// across a 4.3 MB line, where a literal-led pattern needs one or two.
 pub(crate) const REGEX_LINE_STEP_CEILING: u64 = 1 << 26;
 
-/// The scan budget for one line of `len` bytes:
-/// `REGEX_STEP_PER_BYTE · len`, at least [`REGEX_STEP_LIMIT`] and at most
-/// [`REGEX_LINE_STEP_CEILING`].
+/// The scan budget for one line of `len` bytes: `REGEX_STEP_PER_BYTE · len`, at least
+/// [`REGEX_STEP_LIMIT`] and at most [`REGEX_LINE_STEP_CEILING`].
 ///
-/// Ruling (R15 content-2, 2026-10-10): the budget scales with the line. It
-/// was sized for one grid row, but find joins each soft-wrap run into ONE
-/// line (`join_wrapped_rows` in aterm-gui), of any length: a `cat` of a
-/// minified bundle or a single-line JSON reply makes a multi-megabyte line,
-/// whose scan ran out for every pattern — `needle` from 4.2 MB, `\w+\(` from
-/// under 1 MB — and the refusal took regex search away from the whole
-/// terminal as "bad regex". The floor keeps every row's budget what it was;
-/// the per-byte rate keeps a long line's worst case no worse per byte than a
-/// full-width row's (the R3 sizing); the ceiling keeps the pathological
-/// pattern's cost on any one line bounded in time.
+/// Find joins each soft-wrap run into one line (`join_wrapped_rows` in aterm-gui), so
+/// a minified bundle or single-line JSON reply makes a multi-megabyte line that a
+/// one-row budget would cut short for every pattern. The floor keeps every row's
+/// budget, the per-byte rate keeps a long line's worst case per byte no worse than a
+/// full-width row's, and the ceiling bounds the pathological pattern's time on any
+/// one line.
 pub(crate) fn regex_line_budget(len: usize) -> u64 {
     u64::try_from(len)
         .unwrap_or(u64::MAX)
@@ -1738,20 +1488,17 @@ pub(crate) fn scan_line<'r, 't>(
     re.find_iter_with_limit(text, regex_line_budget(text.len()))
 }
 
-/// Result of one [`SearchIndex::search_literal_narrowed`] step: the forward
-/// batch results plus the occurrence-line frame that seeds the next
-/// incremental-search narrowing step (SA-1 isearch).
+/// Result of one [`SearchIndex::search_literal_narrowed`] step: the forward batch
+/// results plus the occurrence-line frame that seeds the next narrowing step.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NarrowedSearch {
     /// Batch results, ascending — identical to the forward batch path over
     /// the same candidate universe (see the method docs).
     pub results: SearchResults,
-    /// Ascending, deduplicated retained lines whose text CONTAINS the query
-    /// at the fold level — occurrences, a strict superset of reported-match
-    /// lines (zero-display-width occurrences count; reported matches do not
-    /// include them). `None` when the walk hit the batch cap: a truncated
-    /// frame would break the narrowing subset property, so the caller must
-    /// reseed from the engine.
+    /// Ascending retained lines whose text contains the query at the fold level: a
+    /// superset of the match lines (zero-width occurrences count). `None` when the
+    /// walk hit the batch cap, since a truncated frame breaks the narrowing subset
+    /// property; the caller reseeds.
     pub occurrence_lines: Option<LineFrame>,
 }
 
@@ -1797,11 +1544,7 @@ impl std::fmt::Display for SearchOptionsError {
 impl std::error::Error for SearchOptionsError {}
 
 impl SearchIndex {
-    /// Search with match verification, supporting case-insensitive and regex modes.
-    ///
-    /// When `case_sensitive` is true and `is_regex` is false, this delegates to
-    /// the trigram-accelerated `search_with_positions`. Otherwise, it scans all
-    /// cached lines directly.
+    /// `search_with_positions_opts_direction`, forward.
     #[cfg(test)]
     pub fn search_with_positions_opts(
         &self,
@@ -1881,14 +1624,9 @@ impl SearchIndex {
         Ok((self.search_case_insensitive(query, direction), 0))
     }
 
-    /// Search with options, returning matches bundled with the eviction signal.
-    ///
-    /// Identical matching to `search_with_positions_opts`, but wraps the
-    /// result in [`SearchResults`] so the caller learns whether eviction may
-    /// have dropped matches ([`results_may_be_incomplete`]) and which line is
-    /// the oldest still searchable ([`lowest_retained_line`]). This is the
-    /// entry point intended for `cmd_search`, which must tell the AI when
-    /// results are truncated.
+    /// Forward search with options, returning the matches with the eviction signal
+    /// ([`results_may_be_incomplete`], [`lowest_retained_line`]) so a truncated result
+    /// is never read as exhaustive.
     ///
     /// [`results_may_be_incomplete`]: Self::results_may_be_incomplete
     /// [`lowest_retained_line`]: Self::lowest_retained_line
@@ -1922,10 +1660,8 @@ impl SearchIndex {
     ) -> Result<SearchResults, SearchOptionsError> {
         let (matches, cut_short) =
             self.search_matches(query, case_sensitive, is_regex, direction)?;
-        // A full result set indicates the per-query MAX_SEARCH_MATCHES cap was hit
-        // (round-8): report it via the same `incomplete` signal used for eviction so
-        // callers do not treat a capped result set as exhaustive. (Over-reports when a
-        // query has exactly MAX_SEARCH_MATCHES real matches — acceptable and honest.)
+        // A full result set means the cap was hit: report it as `incomplete`, as
+        // eviction is (over-reporting a query with exactly that many matches).
         let capped = matches.len() >= MAX_SEARCH_MATCHES;
         Ok(SearchResults::new(
             matches,
@@ -1958,7 +1694,6 @@ impl SearchIndex {
             let Some(text) = self.lines.get(&line_num) else {
                 continue;
             };
-            // Use cached column map when available (#7373).
             let fallback;
             let col_map = match self.column_maps.get(&line_num) {
                 Some(cm) => cm,
@@ -2027,17 +1762,9 @@ impl SearchIndex {
 
     /// Case-insensitive literal search across all cached lines.
     ///
-    /// Uses lowercased trigrams for bloom filter negative filtering before
-    /// scanning lines. For queries >= 3 bytes, this rejects lines that
-    /// definitely do not contain the query, avoiding the full O(n) scan
-    /// for most lines. Part of #7273.
-    ///
-    /// Uses an ASCII fast path (zero heap allocation) for the common case where
-    /// the folded query and line are pure ASCII. Candidate line IDs are yielded
-    /// lazily in ascending order: short queries use a numeric retained-line
-    /// range, while trigram queries consume the ordered intersection bitmap.
-    /// This avoids the former all-lines `Vec` allocation and sort. Unicode lines
-    /// fall back to one reusable lowercase buffer. See #6726.
+    /// Queries of 3+ bytes take candidates from the lowered trigrams (bloom filter,
+    /// then posting lists); shorter ones walk the retained-line range. Candidates come
+    /// lazily in order, and ASCII lines are matched without allocating.
     fn search_case_insensitive(&self, query: &str, direction: SearchDirection) -> Vec<SearchMatch> {
         let mut matcher = CaseInsensitiveMatcher::new(query);
         if matcher.is_empty() {
@@ -2113,26 +1840,17 @@ impl SearchIndex {
         matches
     }
 
-    /// Cheap UPPER BOUND on how many candidate lines this index's OWN
-    /// machinery would visit for a literal `query` — the number a narrowing
-    /// frame has to beat to be worth using.
+    /// Cheap upper bound on how many candidate lines this index's own machinery would
+    /// visit for a literal `query`: the number a narrowing frame has to beat.
     ///
-    /// `None` means the engine has no selectivity to offer: a query shorter
-    /// than one trigram range-scans every retained line, so any frame (a
-    /// subset of retained lines) is at least as cheap. Otherwise the bound is
-    /// the SMALLEST involved posting list — the candidate driver walks exactly
-    /// that list and binary-searches the rest — with `Some(0)` for a bloom
-    /// rejection or an absent trigram (the engine visits nothing at all).
-    ///
-    /// Why callers need it (SA-1): narrowing is only a win while the frame is
-    /// smaller than the index's own candidate set. The keystroke that turns a
-    /// COMMON prefix into a RARE query inverts that — a purpose-made probe
-    /// over 60k log-shaped lines measured the "size=" → "size=9" step at
-    /// 2.60 ms off a 60 000-line frame against 0.085 ms through the trigram
-    /// intersection, a 30x regression on exactly the keystroke whose latency
-    /// the user feels most. A frame is a subset property, not a cost
-    /// guarantee; policy layers compare against this bound and pass
-    /// `prev_lines: None` when the engine would visit fewer lines.
+    /// `None` when a query shorter than one trigram range-scans every retained line,
+    /// so any frame is at least as cheap. Otherwise the smallest involved posting list
+    /// (the driver walks it and binary-searches the rest), or `Some(0)` for a bloom
+    /// rejection or an absent trigram. Narrowing only wins while the frame is smaller
+    /// than the engine's candidate set; the keystroke that turns a common prefix into
+    /// a rare query inverts that (measured 30x slower off a 60,000-line frame than
+    /// through the intersection), so policy layers pass `prev_lines: None` when the
+    /// engine would visit fewer lines.
     #[must_use]
     pub fn literal_candidate_bound(&self, query: &str, case_sensitive: bool) -> Option<u64> {
         let folded;
@@ -2162,44 +1880,25 @@ impl SearchIndex {
         )
     }
 
-    /// One incremental-search narrowing step (SA-1, isearch): the FORWARD
-    /// literal batch walk over an optional EXPLICIT candidate-line list,
-    /// returning the batch results PLUS the fold-level occurrence lines that
-    /// seed the next step.
+    /// One incremental-search narrowing step: the forward literal batch walk over an
+    /// optional explicit candidate-line list, returning the batch results plus the
+    /// fold-level occurrence lines that seed the next step.
     ///
-    /// ## Contract
-    ///
-    /// - `prev_lines: None` runs the engine's own candidate machinery
-    ///   (short-query range / bloom + posting intersection) and is
-    ///   results-identical to
-    ///   [`search_results_opts_direction`](Self::search_results_opts_direction)
-    ///   with [`SearchDirection::Forward`] — same per-line verifiers
-    ///   (`next_literal_match` / `CaseInsensitiveMatcher::visit_matches`),
-    ///   same candidate enumeration, same cap edge (oldest retained). Pinned
-    ///   by the differential battery in `tests.rs`.
-    /// - `prev_lines: Some(frame)` replaces candidate enumeration with the
-    ///   given ascending line list and touches NO posting list and NO bloom
-    ///   probe — the per-keystroke win. The caller must pass a frame obtained
-    ///   from a previous step for a query of which this `query` is a
-    ///   byte-prefix extension, against the SAME index state. Soundness: a
-    ///   reported match of `query` on a line implies the line's folded text
-    ///   contains `lower_fold(query)` (case-insensitive) / its bytes contain
-    ///   `query` (case-sensitive), which implies containment of every prefix's
-    ///   fold — so every match line of the extended query is in the previous
-    ///   query's OCCURRENCE frame. Results are then the complete match set,
-    ///   identical to the batch walk (which merely enumerates a superset of
-    ///   candidate lines and verifies each identically).
-    /// - Direction: an UNCAPPED result is the complete ascending match set,
-    ///   which both directions of the batch path return verbatim; a CAPPED
-    ///   result equals the FORWARD batch's oldest-retaining edge only, so a
-    ///   backward caller must fall back to the batch path when
+    /// - `prev_lines: None` uses the engine's own candidates and is results-identical
+    ///   to [`search_results_opts_direction`](Self::search_results_opts_direction)
+    ///   with [`SearchDirection::Forward`]: same verifiers (`next_literal_match`,
+    ///   `CaseInsensitiveMatcher::visit_matches`), same enumeration, same cap edge.
+    ///   Pinned by the differential tests in `tests.rs`.
+    /// - `prev_lines: Some(frame)` takes candidates from the frame and touches no
+    ///   posting list or bloom filter. The frame must come from a previous step, on
+    ///   the same index state, for a query this one extends by bytes. Sound because a
+    ///   match of `query` implies the line contains every prefix's fold, so every
+    ///   match line is in the previous query's occurrence frame.
+    /// - An uncapped result is the complete ascending match set, as both batch
+    ///   directions return it; a capped one equals only the forward batch's
+    ///   oldest-retaining edge, so a backward caller falls back to the batch path when
     ///   `results.matches.len() >= MAX_SEARCH_MATCHES`.
-    /// - `occurrence_lines` is `None` when the walk was capped: a truncated
-    ///   frame would break the subset property, so the caller reseeds.
-    ///
-    /// Cost: O(candidate lines × line verify) with `Some(frame)` — no posting
-    /// decode, no intersection, no range scan; exactly the category SA-1
-    /// deletes for the grown-by-one-char keystroke.
+    /// - `occurrence_lines` is `None` when the walk was capped.
     pub fn search_literal_narrowed(
         &self,
         query: &str,
@@ -2207,8 +1906,7 @@ impl SearchIndex {
         prev_lines: Option<&LineFrame>,
     ) -> NarrowedSearch {
         if query.is_empty() {
-            // Batch parity: an empty query yields no matches; the honesty pair
-            // is the index's own (search_results_opts_direction shape).
+            // Batch parity: no matches, and the index's own eviction signal.
             return NarrowedSearch {
                 results: SearchResults::new(
                     Vec::new(),
@@ -2263,8 +1961,8 @@ impl SearchIndex {
         // key window, so its key is the frame offset.
         let mut occurrence_lines = LineFrame::with_base(self.key_base);
         let mut capped = false;
-        // ONE preparation of the needle for the whole sweep: the literal
-        // verifier runs per match and the occurrence probe per line.
+        // One prepared needle for the whole sweep: the verifier runs per match and
+        // the occurrence probe per line.
         let searcher = crate::bytesearch::Searcher::new(query.as_bytes());
         'lines: while let Some(line_num) = candidates.next() {
             let Some(text) = self.lines.get(&line_num) else {
@@ -2280,8 +1978,8 @@ impl SearchIndex {
             };
             let mut line_matched = false;
             match matcher.as_mut() {
-                // Case-sensitive: the SINGLE shared literal verifier — the
-                // same per-line sequence `SearchMatchIterator` yields.
+                // Case-sensitive: the shared literal verifier, the per-line sequence
+                // `SearchMatchIterator` yields.
                 None => {
                     let mut from_byte = 0usize;
                     while let Some((found, resume)) =
@@ -2323,9 +2021,7 @@ impl SearchIndex {
             }
         }
 
-        // Cap detection mirrors `search_results_opts_direction`: a full result
-        // set reports incomplete (over-reporting on exactly-MAX real matches
-        // is the batch path's documented, honest behavior).
+        // Cap detection as in `search_results_opts_direction`.
         let capped = capped || matches.len() >= MAX_SEARCH_MATCHES;
         NarrowedSearch {
             results: SearchResults::new(
@@ -2637,18 +2333,14 @@ impl Default for SearchIndex {
 #[path = "index_bloom_tests.rs"]
 mod index_bloom_tests;
 
-/// The regex **scan** budget, at the two entry points that take a pattern from
-/// the search box and run it over untrusted terminal content.
-///
-/// `REGEX_SIZE_LIMIT` bounds what compiles; these tests are about what a
-/// compiled pattern then costs to run, a separate axis. See `REGEX_STEP_LIMIT`.
+/// The regex scan budget at the entry points that run a search-box pattern over
+/// terminal content (`REGEX_STEP_LIMIT` derives it).
 #[cfg(test)]
 mod regex_scan_budget_tests {
     use super::*;
 
-    /// A thirteen-byte pattern that compiles happily under the 128 KiB program
-    /// ceiling (2,042 instructions) and then costs ~16.7M work units — ~19 ms
-    /// in release — to cross a single 4,096-column line.
+    /// 13 bytes, 2,042 instructions (inside the 128 KiB ceiling), ~16.7M work units to
+    /// cross one 4,096-column line.
     const EXPENSIVE: &str = "(?:x?){1020}z";
 
     fn index_with_a_wide_line() -> SearchIndex {
@@ -2659,8 +2351,6 @@ mod regex_scan_budget_tests {
         index
     }
 
-    /// The budget is actually passed. Without this the two constants below are
-    /// documentation rather than configuration.
     #[test]
     fn the_compiled_pattern_carries_the_scan_budget() {
         let re = SearchIndex::compile_regex("needle", true).expect("compiles");
@@ -2668,13 +2358,10 @@ mod regex_scan_budget_tests {
         assert!(!re.step_limit_exceeded());
     }
 
-    /// A pattern too expensive to finish a line is never answered with a list
-    /// that reads as complete: a truncated result set presented as exhaustive
-    /// is a wrong answer, and search results are read by `cmd_search` and by a
-    /// human deciding what is in their scrollback. The batch result says WHICH
-    /// lines it could not finish and keeps every other line's matches; the
-    /// matches-only API, which cannot say so, refuses; and point navigation
-    /// that found nothing anywhere refuses rather than report "no match".
+    /// A pattern too expensive to finish a line is never answered with a list that
+    /// reads as complete: the batch result counts the lines it could not finish and
+    /// keeps every other line's matches, the matches-only API refuses, and point
+    /// navigation that found nothing refuses rather than report "no match".
     #[test]
     fn a_pattern_that_cannot_finish_a_line_is_reported_never_passed_off() {
         let mut index = index_with_a_wide_line();
@@ -2725,10 +2412,8 @@ mod regex_scan_budget_tests {
         );
     }
 
-    /// The budget per line: a row up to full width keeps the R3 budget, a
-    /// longer line gets the same rate per byte, and no line gets more than
-    /// the ceiling — the bound that keeps the pathological pattern's cost on
-    /// one line finite whatever its length.
+    /// The per-line budget: a row up to full width keeps `REGEX_STEP_LIMIT`, a longer
+    /// line gets the same rate per byte, and no line gets more than the ceiling.
     #[test]
     fn the_line_budget_scales_with_the_line_under_a_ceiling() {
         assert_eq!(regex_line_budget(0), REGEX_STEP_LIMIT);
@@ -2753,11 +2438,9 @@ mod regex_scan_budget_tests {
         }
     }
 
-    /// A minified bundle, a single-line JSON reply: find joins a soft-wrapped
-    /// run into ONE line, and an ordinary pattern over such a line used to be
-    /// refused for the whole terminal ("pattern too expensive", shown as "bad
-    /// regex") — from 4.2 MB for `needle`, under 1 MB for `\w+\(`. Now it
-    /// finds every match there, and in the short lines around it.
+    /// Find joins a soft-wrapped run into one line (a minified bundle, a single-line
+    /// JSON reply): an ordinary pattern over it finds every match there and in the
+    /// short lines around it.
     #[test]
     fn ordinary_patterns_over_a_long_joined_line_find_their_matches() {
         let unit = "function a(b){return b+1};var needle_x=[1,2,3];";
@@ -2794,9 +2477,8 @@ mod regex_scan_budget_tests {
         }
     }
 
-    /// The R3 pathological pattern over a line far longer than a row stays
-    /// bounded: its scan stops at the ceiling, the line is counted cut short,
-    /// and the rows after it are still searched.
+    /// The pathological pattern over a line far longer than a row stops at the
+    /// ceiling: the line is counted cut short and the rows after it are still searched.
     #[test]
     fn the_pathological_pattern_over_a_long_line_stops_at_the_ceiling() {
         let long = "x".repeat(4_300_000);

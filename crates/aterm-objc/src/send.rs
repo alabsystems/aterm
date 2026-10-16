@@ -5,7 +5,7 @@
 //!
 //! Each helper is pure runtime: none names a framework class, selector or
 //! symbol, so they belong here rather than in a binding layer, and
-//! `aterm-gui` (re-exported from `appkit`) and `vendor/winit` share one
+//! `aterm-gui` (re-exported from `appkit`) and `crates/aterm-window` share one
 //! definition of each prototype.
 //!
 //! # Ownership
@@ -21,8 +21,185 @@
 //! prototype the function's name spells and that `recv` is a live receiver
 //! that responds to it. The wrong helper corrupts registers exactly as a wrong
 //! hand-written cast would.
+//!
+//! # The prototype check
+//!
+//! A debug build checks that assertion at every send: each helper casts through
+//! [`typed`], which compares its prototype with the runtime's own
+//! `method_getTypeEncoding` for `sel` on `recv`'s class and panics, naming both,
+//! when they differ in a way the call ABI can feel ([`abi_shape`]). That is
+//! how a signed `-requestUserAttention:` return read as unsigned was found, and
+//! no compiler sees it: the selector's types are a runtime fact.
 
-use crate::{Bool, CGPoint, CGRect, CGSize, ClassPtr, Id, Sel, msg};
+use std::ffi::CStr;
+
+use crate::{Bool, CGPoint, CGRect, CGSize, ClassPtr, Encode, Id, MsgFn, Sel, msg};
+
+/// A `(self, _cmd, …)` send prototype whose every type has an encoding: the
+/// method type string it should match, offsets aside.
+trait Prototype: MsgFn {
+    fn types() -> String;
+}
+
+macro_rules! impl_prototype {
+    ($($arg:ident),*) => {
+        impl<Ret: Encode, $($arg: Encode),*> Prototype
+            for unsafe extern "C-unwind" fn(Id, Sel, $($arg),*) -> Ret
+        {
+            fn types() -> String {
+                [Ret::ENCODING, "@:", $(<$arg as Encode>::ENCODING),*].concat()
+            }
+        }
+    };
+}
+impl_prototype!();
+impl_prototype!(A0);
+impl_prototype!(A0, A1);
+impl_prototype!(A0, A1, A2);
+impl_prototype!(A0, A1, A2, A3);
+impl_prototype!(A0, A1, A2, A3, A4);
+impl_prototype!(A0, A1, A2, A3, A4, A5);
+impl_prototype!(A0, A1, A2, A3, A4, A5, A6);
+impl_prototype!(A0, A1, A2, A3, A4, A5, A6, A7);
+impl_prototype!(A0, A1, A2, A3, A4, A5, A6, A7, A8);
+impl_prototype!(A0, A1, A2, A3, A4, A5, A6, A7, A8, A9);
+
+/// [`msg`] for `sel` on `recv`, checked in a debug build against the runtime's
+/// encoding of the method (the module's prototype check).
+///
+/// # Safety
+/// As [`msg`].
+#[inline]
+unsafe fn typed<F: Prototype>(recv: Id, sel: Sel) -> F
+where
+    F::Ret: Encode,
+{
+    #[cfg(debug_assertions)]
+    // SAFETY: `recv` is live or nil, as every helper's caller asserts.
+    unsafe {
+        check_prototype(recv, sel, F::types)
+    };
+    // SAFETY: forwarded from the caller.
+    unsafe { msg() }
+}
+
+/// Panic when the method `recv`'s class runs for `sel` has a prototype other
+/// than `expected()` in a way the call can feel. A nil receiver, or one whose
+/// class answers `sel` only by forwarding, has no method to compare.
+///
+/// # Safety
+/// `recv` must be live or nil.
+#[cfg(debug_assertions)]
+unsafe fn check_prototype(recv: Id, sel: Sel, expected: fn() -> String) {
+    if recv.is_null() {
+        return;
+    }
+    // SAFETY: `recv` is live; its class is immortal.
+    let cls = unsafe { crate::class_of(recv) };
+    // SAFETY: `cls` is live; an unimplemented selector yields `None`.
+    let Some(runtime) = (unsafe { crate::method_types(cls, sel) }) else {
+        return;
+    };
+    let runtime = crate::strip_method_offsets(&runtime);
+    let ours = expected();
+    if abi_shape(&runtime) != abi_shape(&ours) {
+        // SAFETY: `cls` is a live class.
+        let name: &CStr = unsafe { crate::class_name(cls) };
+        if swift_override_of_the_same_width(&name.to_string_lossy(), &runtime, &ours) {
+            return;
+        }
+        panic!(
+            "-[{} {sel:?}] is `{runtime}` in the runtime, but this send casts it to `{ours}`",
+            name.to_string_lossy()
+        );
+    }
+}
+
+/// A Swift class (`_Tt…`) that overrides a Foundation method encodes Swift's
+/// `Int` where the Objective-C declaration says `NSUInteger`: `+[NSScreen
+/// screens]` is a `ContiguousArrayStorage<NSScreen>` on macOS 27, whose `count`
+/// is `q@:` while `-[NSArray count]` is `Q@:`. The send follows the declaration,
+/// so for such a class a 32- or 64-bit integer's sign is not compared.
+fn swift_override_of_the_same_width(class: &str, runtime: &str, ours: &str) -> bool {
+    let sign_blind = |types: &str| -> Vec<String> {
+        abi_shape(types)
+            .into_iter()
+            .map(|t| match t.as_str() {
+                "Q" => "q".to_string(),
+                "L" => "l".to_string(),
+                "I" => "i".to_string(),
+                _ => t,
+            })
+            .collect()
+    };
+    class.starts_with("_Tt") && sign_blind(runtime) == sign_blind(ours)
+}
+
+/// The parts of a method type string a send's ABI depends on, one entry per
+/// type: every pointer (object, class, selector, block, C string, `^…`) is one
+/// `p`, since each travels in a general register; integers keep width and
+/// sign, floats their width, structs and unions their layout. Qualifiers
+/// (`r` const, `V` oneway, the `n`/`o`/`N`/`O`/`R` DO markers) go.
+fn abi_shape(types: &str) -> Vec<String> {
+    let b = types.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b"rnNoORV".contains(&b[i]) {
+            i += 1;
+            continue;
+        }
+        let end = type_end(b, i);
+        out.push(match b[i] {
+            b'@' | b'#' | b':' | b'*' | b'^' => "p".to_string(),
+            _ => types[i..end].to_string(),
+        });
+        i = end;
+    }
+    out
+}
+
+/// The index just past the one type starting at `b[i]`.
+fn type_end(b: &[u8], i: usize) -> usize {
+    match b.get(i) {
+        None => i,
+        Some(b'^') => type_end(b, i + 1),
+        Some(q) if b"rnNoORV".contains(q) => type_end(b, i + 1),
+        // `@?` is a block; `@"Name"` an object of a named class.
+        Some(b'@') => match b.get(i + 1) {
+            Some(b'?') => i + 2,
+            Some(b'"') => b[i + 2..]
+                .iter()
+                .position(|&c| c == b'"')
+                .map_or(b.len(), |q| i + 3 + q),
+            _ => i + 1,
+        },
+        Some(&open @ (b'{' | b'(' | b'[')) => {
+            let close = match open {
+                b'{' => b'}',
+                b'(' => b')',
+                _ => b']',
+            };
+            let (mut depth, mut j, mut quoted) = (0_usize, i, false);
+            while j < b.len() {
+                match b[j] {
+                    b'"' => quoted = !quoted,
+                    c if !quoted && c == open => depth += 1,
+                    c if !quoted && c == close => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return j + 1;
+                        }
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+            b.len()
+        }
+        Some(_) => i + 1,
+    }
+}
 
 /// `+alloc` on `cls` — a +1, zero-filled, uninitialised instance.
 ///
@@ -45,7 +222,7 @@ pub unsafe fn alloc(cls: ClassPtr) -> Id {
 pub unsafe fn send_v(recv: Id, sel: Sel) {
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel) = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel) = typed(recv, sel);
         f(recv, sel);
     }
 }
@@ -57,7 +234,7 @@ pub unsafe fn send_v(recv: Id, sel: Sel) {
 pub unsafe fn send_v_id(recv: Id, sel: Sel, a: Id) {
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel, Id) = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel, Id) = typed(recv, sel);
         f(recv, sel, a);
     }
 }
@@ -69,7 +246,7 @@ pub unsafe fn send_v_id(recv: Id, sel: Sel, a: Id) {
 pub unsafe fn send_v_id_id(recv: Id, sel: Sel, a: Id, b: Id) {
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel, Id, Id) = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel, Id, Id) = typed(recv, sel);
         f(recv, sel, a, b);
     }
 }
@@ -77,12 +254,12 @@ pub unsafe fn send_v_id_id(recv: Id, sel: Sel, a: Id, b: Id) {
 /// `-(void)sel:(BOOL)a`.
 ///
 /// # Safety
-/// See the module note. The argument is [`Bool`], never a Rust `bool`: on the
+/// See the module note. `a` is sent as a [`Bool`], never a Rust `bool`: on the
 /// `x86_64-apple-darwin` compat slice `BOOL` is `signed char`.
 pub unsafe fn send_v_bool(recv: Id, sel: Sel, a: bool) {
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel, Bool) = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel, Bool) = typed(recv, sel);
         f(recv, sel, Bool::new(a));
     }
 }
@@ -94,7 +271,7 @@ pub unsafe fn send_v_bool(recv: Id, sel: Sel, a: bool) {
 pub unsafe fn send_v_isize(recv: Id, sel: Sel, a: isize) {
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel, isize) = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel, isize) = typed(recv, sel);
         f(recv, sel, a);
     }
 }
@@ -106,7 +283,7 @@ pub unsafe fn send_v_isize(recv: Id, sel: Sel, a: isize) {
 pub unsafe fn send_v_usize(recv: Id, sel: Sel, a: usize) {
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel, usize) = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel, usize) = typed(recv, sel);
         f(recv, sel, a);
     }
 }
@@ -118,7 +295,7 @@ pub unsafe fn send_v_usize(recv: Id, sel: Sel, a: usize) {
 pub unsafe fn send_v_size(recv: Id, sel: Sel, a: CGSize) {
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel, CGSize) = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel, CGSize) = typed(recv, sel);
         f(recv, sel, a);
     }
 }
@@ -131,7 +308,7 @@ pub unsafe fn send_v_size(recv: Id, sel: Sel, a: CGSize) {
 pub unsafe fn send_id(recv: Id, sel: Sel) -> Id {
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel) -> Id = typed(recv, sel);
         f(recv, sel)
     }
 }
@@ -144,7 +321,7 @@ pub unsafe fn send_id(recv: Id, sel: Sel) -> Id {
 pub unsafe fn send_id_id(recv: Id, sel: Sel, a: Id) -> Id {
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel, Id) -> Id = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel, Id) -> Id = typed(recv, sel);
         f(recv, sel, a)
     }
 }
@@ -158,7 +335,7 @@ pub unsafe fn send_id_id(recv: Id, sel: Sel, a: Id) -> Id {
 pub unsafe fn send_id_id_sel_id(recv: Id, sel: Sel, a: Id, b: Sel, c: Id) -> Id {
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel, Id, Sel, Id) -> Id = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel, Id, Sel, Id) -> Id = typed(recv, sel);
         f(recv, sel, a, b, c)
     }
 }
@@ -171,7 +348,7 @@ pub unsafe fn send_id_id_sel_id(recv: Id, sel: Sel, a: Id, b: Sel, c: Id) -> Id 
 pub unsafe fn send_id_f64(recv: Id, sel: Sel, a: f64) -> Id {
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel, f64) -> Id = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel, f64) -> Id = typed(recv, sel);
         f(recv, sel, a)
     }
 }
@@ -184,7 +361,7 @@ pub unsafe fn send_id_f64(recv: Id, sel: Sel, a: f64) -> Id {
 pub unsafe fn send_id_rect(recv: Id, sel: Sel, a: CGRect) -> Id {
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel, CGRect) -> Id = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel, CGRect) -> Id = typed(recv, sel);
         f(recv, sel, a)
     }
 }
@@ -198,7 +375,7 @@ pub unsafe fn send_bool(recv: Id, sel: Sel) -> bool {
     // SAFETY: the caller pins the prototype; this is the cast for it. `Bool`
     // and not `bool`: `msg` refuses the latter, deliberately.
     unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel) -> Bool = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel) -> Bool = typed(recv, sel);
         f(recv, sel).as_bool()
     }
 }
@@ -211,7 +388,7 @@ pub unsafe fn send_bool(recv: Id, sel: Sel) -> bool {
 pub unsafe fn send_bool_sel(recv: Id, sel: Sel, a: Sel) -> bool {
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel, Sel) -> Bool = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel, Sel) -> Bool = typed(recv, sel);
         f(recv, sel, a).as_bool()
     }
 }
@@ -224,7 +401,7 @@ pub unsafe fn send_bool_sel(recv: Id, sel: Sel, a: Sel) -> bool {
 pub unsafe fn send_bool_id(recv: Id, sel: Sel, a: Id) -> bool {
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel, Id) -> Bool = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel, Id) -> Bool = typed(recv, sel);
         f(recv, sel, a).as_bool()
     }
 }
@@ -237,7 +414,7 @@ pub unsafe fn send_bool_id(recv: Id, sel: Sel, a: Id) -> bool {
 pub unsafe fn send_isize(recv: Id, sel: Sel) -> isize {
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel) -> isize = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel) -> isize = typed(recv, sel);
         f(recv, sel)
     }
 }
@@ -250,7 +427,7 @@ pub unsafe fn send_isize(recv: Id, sel: Sel) -> isize {
 pub unsafe fn send_usize(recv: Id, sel: Sel) -> usize {
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel) -> usize = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel) -> usize = typed(recv, sel);
         f(recv, sel)
     }
 }
@@ -263,7 +440,7 @@ pub unsafe fn send_usize(recv: Id, sel: Sel) -> usize {
 pub unsafe fn send_f64(recv: Id, sel: Sel) -> f64 {
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel) -> f64 = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel) -> f64 = typed(recv, sel);
         f(recv, sel)
     }
 }
@@ -284,7 +461,7 @@ pub unsafe fn send_rect(recv: Id, sel: Sel) -> CGRect {
     }
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel) -> CGRect = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel) -> CGRect = typed(recv, sel);
         f(recv, sel)
     }
 }
@@ -296,7 +473,7 @@ pub unsafe fn send_rect(recv: Id, sel: Sel) -> CGRect {
 pub unsafe fn send_v_f64(recv: Id, sel: Sel, a: f64) {
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel, f64) = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel, f64) = typed(recv, sel);
         f(recv, sel, a);
     }
 }
@@ -308,7 +485,7 @@ pub unsafe fn send_v_f64(recv: Id, sel: Sel, a: f64) {
 pub unsafe fn send_v_point(recv: Id, sel: Sel, a: CGPoint) {
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel, CGPoint) = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel, CGPoint) = typed(recv, sel);
         f(recv, sel, a);
     }
 }
@@ -320,7 +497,7 @@ pub unsafe fn send_v_point(recv: Id, sel: Sel, a: CGPoint) {
 pub unsafe fn send_v_rect(recv: Id, sel: Sel, a: CGRect) {
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel, CGRect) = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel, CGRect) = typed(recv, sel);
         f(recv, sel, a);
     }
 }
@@ -333,7 +510,7 @@ pub unsafe fn send_v_rect(recv: Id, sel: Sel, a: CGRect) {
 pub unsafe fn send_v_id_id_id(recv: Id, sel: Sel, a: Id, b: Id, c: Id) {
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel, Id, Id, Id) = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel, Id, Id, Id) = typed(recv, sel);
         f(recv, sel, a, b, c);
     }
 }
@@ -347,7 +524,7 @@ pub unsafe fn send_v_id_id_id(recv: Id, sel: Sel, a: Id, b: Id, c: Id) {
 pub unsafe fn send_v_id_isize_id(recv: Id, sel: Sel, a: Id, b: isize, c: Id) {
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel, Id, isize, Id) = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel, Id, isize, Id) = typed(recv, sel);
         f(recv, sel, a, b, c);
     }
 }
@@ -361,7 +538,7 @@ pub unsafe fn send_v_id_isize_id(recv: Id, sel: Sel, a: Id, b: isize, c: Id) {
 pub unsafe fn send_point(recv: Id, sel: Sel) -> CGPoint {
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel) -> CGPoint = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel) -> CGPoint = typed(recv, sel);
         f(recv, sel)
     }
 }
@@ -374,7 +551,7 @@ pub unsafe fn send_point(recv: Id, sel: Sel) -> CGPoint {
 pub unsafe fn send_point_point(recv: Id, sel: Sel, a: CGPoint) -> CGPoint {
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel, CGPoint) -> CGPoint = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel, CGPoint) -> CGPoint = typed(recv, sel);
         f(recv, sel, a)
     }
 }
@@ -388,7 +565,7 @@ pub unsafe fn send_point_point(recv: Id, sel: Sel, a: CGPoint) -> CGPoint {
 pub unsafe fn send_point_point_id(recv: Id, sel: Sel, a: CGPoint, b: Id) -> CGPoint {
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel, CGPoint, Id) -> CGPoint = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel, CGPoint, Id) -> CGPoint = typed(recv, sel);
         f(recv, sel, a, b)
     }
 }
@@ -408,7 +585,7 @@ pub unsafe fn send_rect_rect_id(recv: Id, sel: Sel, a: CGRect, b: Id) -> CGRect 
     }
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel, CGRect, Id) -> CGRect = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel, CGRect, Id) -> CGRect = typed(recv, sel);
         f(recv, sel, a, b)
     }
 }
@@ -422,7 +599,7 @@ pub unsafe fn send_rect_rect_id(recv: Id, sel: Sel, a: CGRect, b: Id) -> CGRect 
 pub unsafe fn send_id_usize(recv: Id, sel: Sel, a: usize) -> Id {
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel, usize) -> Id = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel, usize) -> Id = typed(recv, sel);
         f(recv, sel, a)
     }
 }
@@ -436,7 +613,7 @@ pub unsafe fn send_id_usize(recv: Id, sel: Sel, a: usize) -> Id {
 pub unsafe fn send_id_rect_f64_f64(recv: Id, sel: Sel, a: CGRect, b: f64, c: f64) -> Id {
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel, CGRect, f64, f64) -> Id = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel, CGRect, f64, f64) -> Id = typed(recv, sel);
         f(recv, sel, a, b, c)
     }
 }
@@ -450,7 +627,7 @@ pub unsafe fn send_id_rect_f64_f64(recv: Id, sel: Sel, a: CGRect, b: f64, c: f64
 pub unsafe fn send_id_f64_f64_f64_f64(recv: Id, sel: Sel, a: f64, b: f64, c: f64, d: f64) -> Id {
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel, f64, f64, f64, f64) -> Id = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel, f64, f64, f64, f64) -> Id = typed(recv, sel);
         f(recv, sel, a, b, c, d)
     }
 }
@@ -471,7 +648,7 @@ pub unsafe fn send_id_rect_usize_id_id(
 ) -> Id {
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel, CGRect, usize, Id, Id) -> Id = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel, CGRect, usize, Id, Id) -> Id = typed(recv, sel);
         f(recv, sel, a, b, c, d)
     }
 }
@@ -486,13 +663,13 @@ pub unsafe fn send_id_rect_usize_id_id(
 pub unsafe fn send_id_id_id_sel(recv: Id, sel: Sel, a: Id, b: Id, c: Sel) -> Id {
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel, Id, Id, Sel) -> Id = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel, Id, Id, Sel) -> Id = typed(recv, sel);
         f(recv, sel, a, b, c)
     }
 }
 
 // ---------------------------------------------------------------------------
-// Shapes `vendor/winit` needs. Each carries the SDK declaration it was derived
+// Shapes `crates/aterm-window` needs. Each carries the SDK declaration it was derived
 // from, since the prototype is the safety obligation.
 // ---------------------------------------------------------------------------
 
@@ -505,7 +682,7 @@ pub unsafe fn send_id_id_id_sel(recv: Id, sel: Sel, a: Id, b: Id, c: Sel) -> Id 
 pub unsafe fn send_v_rect_bool(recv: Id, sel: Sel, a: CGRect, b: bool) {
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel, CGRect, Bool) = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel, CGRect, Bool) = typed(recv, sel);
         f(recv, sel, a, Bool::new(b));
     }
 }
@@ -519,7 +696,7 @@ pub unsafe fn send_v_rect_bool(recv: Id, sel: Sel, a: CGRect, b: bool) {
 pub unsafe fn send_v_rect_id(recv: Id, sel: Sel, a: CGRect, b: Id) {
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel, CGRect, Id) = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel, CGRect, Id) = typed(recv, sel);
         f(recv, sel, a, b);
     }
 }
@@ -535,7 +712,7 @@ pub unsafe fn send_v_rect_id(recv: Id, sel: Sel, a: CGRect, b: Id) {
 pub unsafe fn send_v_id_isize(recv: Id, sel: Sel, a: Id, b: isize) {
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel, Id, isize) = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel, Id, isize) = typed(recv, sel);
         f(recv, sel, a, b);
     }
 }
@@ -560,7 +737,8 @@ pub unsafe fn send_v_id_id_usize_ptr(
 ) {
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel, Id, Id, usize, *mut core::ffi::c_void) = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel, Id, Id, usize, *mut core::ffi::c_void) =
+            typed(recv, sel);
         f(recv, sel, a, b, c, d);
     }
 }
@@ -576,7 +754,7 @@ pub unsafe fn send_v_id_id_usize_ptr(
 pub unsafe fn send_v_sel_id_f64(recv: Id, sel: Sel, a: Sel, b: Id, c: f64) {
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel, Sel, Id, f64) = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel, Sel, Id, f64) = typed(recv, sel);
         f(recv, sel, a, b, c);
     }
 }
@@ -585,14 +763,14 @@ pub unsafe fn send_v_sel_id_f64(recv: Id, sel: Sel, a: Sel, b: Id, c: f64) {
 ///
 /// `NSNotification.h` — `-addObserver:(id)observer selector:(SEL)aSelector
 /// name:(NSNotificationName)aName object:(id)anObject`. The observer is
-/// registered UNRETAINED; removing it before it dies is the caller's business.
+/// registered unretained; removing it before it dies is the caller's business.
 ///
 /// # Safety
 /// See the module note.
 pub unsafe fn send_v_id_sel_id_id(recv: Id, sel: Sel, a: Id, b: Sel, c: Id, d: Id) {
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel, Id, Sel, Id, Id) = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel, Id, Sel, Id, Id) = typed(recv, sel);
         f(recv, sel, a, b, c, d);
     }
 }
@@ -611,7 +789,7 @@ pub unsafe fn send_v_id_sel_id_id(recv: Id, sel: Sel, a: Id, b: Sel, c: Id, d: I
 pub unsafe fn send_id_idptr_usize(recv: Id, sel: Sel, a: *const Id, b: usize) -> Id {
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel, *const Id, usize) -> Id = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel, *const Id, usize) -> Id = typed(recv, sel);
         f(recv, sel, a, b)
     }
 }
@@ -636,7 +814,7 @@ pub unsafe fn send_rect_rect(recv: Id, sel: Sel, a: CGRect) -> CGRect {
     }
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel, CGRect) -> CGRect = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel, CGRect) -> CGRect = typed(recv, sel);
         f(recv, sel, a)
     }
 }
@@ -657,7 +835,7 @@ pub unsafe fn send_rect_rect(recv: Id, sel: Sel, a: CGRect) -> CGRect {
 pub unsafe fn send_isize_usize(recv: Id, sel: Sel, a: usize) -> isize {
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel, usize) -> isize = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel, usize) -> isize = typed(recv, sel);
         f(recv, sel, a)
     }
 }
@@ -688,7 +866,7 @@ pub unsafe fn send_isize_rect_id_ptr_bool(
             Id,
             *mut core::ffi::c_void,
             Bool,
-        ) -> isize = msg();
+        ) -> isize = typed(recv, sel);
         f(recv, sel, a, b, c, Bool::new(d))
     }
 }
@@ -704,7 +882,7 @@ pub unsafe fn send_isize_rect_id_ptr_bool(
 pub unsafe fn send_u16(recv: Id, sel: Sel) -> u16 {
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel) -> u16 = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel) -> u16 = typed(recv, sel);
         f(recv, sel)
     }
 }
@@ -719,7 +897,7 @@ pub unsafe fn send_u16(recv: Id, sel: Sel) -> u16 {
 pub unsafe fn send_bool_isize(recv: Id, sel: Sel, a: isize) -> bool {
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel, isize) -> Bool = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel, isize) -> Bool = typed(recv, sel);
         f(recv, sel, a).as_bool()
     }
 }
@@ -734,7 +912,7 @@ pub unsafe fn send_bool_isize(recv: Id, sel: Sel, a: isize) -> bool {
 pub unsafe fn send_v_id_bool(recv: Id, sel: Sel, a: Id, b: bool) {
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel, Id, Bool) = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel, Id, Bool) = typed(recv, sel);
         f(recv, sel, a, Bool::new(b));
     }
 }
@@ -754,7 +932,7 @@ pub unsafe fn send_v_id_bool(recv: Id, sel: Sel, a: Id, b: bool) {
 pub unsafe fn send_u32(recv: Id, sel: Sel) -> u32 {
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel) -> u32 = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel) -> u32 = typed(recv, sel);
         f(recv, sel)
     }
 }
@@ -770,7 +948,7 @@ pub unsafe fn send_u32(recv: Id, sel: Sel) -> u32 {
 pub unsafe fn send_bool_cls(recv: Id, sel: Sel, a: ClassPtr) -> bool {
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel, ClassPtr) -> Bool = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel, ClassPtr) -> Bool = typed(recv, sel);
         f(recv, sel, a).as_bool()
     }
 }
@@ -830,7 +1008,7 @@ pub unsafe fn send_id_usize_point_usize_f64_isize_id_id_id_bool_u16(
             Id,
             Bool,
             u16,
-        ) -> Id = msg();
+        ) -> Id = typed(recv, sel);
         f(recv, sel, a, b, c, d, e, f_, g, h, Bool::new(i), j)
     }
 }
@@ -888,7 +1066,7 @@ pub unsafe fn send_id_usize_point_usize_f64_isize_id_i16_isize_isize(
             i16,
             isize,
             isize,
-        ) -> Id = msg();
+        ) -> Id = typed(recv, sel);
         f(recv, sel, a, b, c, d, e, f_, g, h, i)
     }
 }
@@ -916,7 +1094,7 @@ pub unsafe fn send_id_usize_point_usize_f64_isize_id_i16_isize_isize(
 pub unsafe fn send_f32(recv: Id, sel: Sel) -> f32 {
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel) -> f32 = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel) -> f32 = typed(recv, sel);
         f(recv, sel)
     }
 }
@@ -933,7 +1111,7 @@ pub unsafe fn send_f32(recv: Id, sel: Sel) -> f32 {
 pub unsafe fn send_id_sel(recv: Id, sel: Sel, a: Sel) -> Id {
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel, Sel) -> Id = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel, Sel) -> Id = typed(recv, sel);
         f(recv, sel, a)
     }
 }
@@ -950,7 +1128,7 @@ pub unsafe fn send_id_sel(recv: Id, sel: Sel, a: Sel) -> Id {
 pub unsafe fn send_usize_usize(recv: Id, sel: Sel, a: usize) -> usize {
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel, usize) -> usize = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel, usize) -> usize = typed(recv, sel);
         f(recv, sel, a)
     }
 }
@@ -967,7 +1145,7 @@ pub unsafe fn send_usize_usize(recv: Id, sel: Sel, a: usize) -> usize {
 pub unsafe fn send_charptr(recv: Id, sel: Sel) -> *mut core::ffi::c_uchar {
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel) -> *mut core::ffi::c_uchar = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel) -> *mut core::ffi::c_uchar = typed(recv, sel);
         f(recv, sel)
     }
 }
@@ -985,7 +1163,8 @@ pub unsafe fn send_charptr(recv: Id, sel: Sel) -> *mut core::ffi::c_uchar {
 pub unsafe fn send_id_cptr_usize(recv: Id, sel: Sel, a: *const core::ffi::c_void, b: usize) -> Id {
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel, *const core::ffi::c_void, usize) -> Id = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel, *const core::ffi::c_void, usize) -> Id =
+            typed(recv, sel);
         f(recv, sel, a, b)
     }
 }
@@ -1053,7 +1232,7 @@ pub unsafe fn send_id_planeptr_isize_isize_isize_isize_bool_bool_id_isize_isize(
             Id,
             isize,
             isize,
-        ) -> Id = msg();
+        ) -> Id = typed(recv, sel);
         f(
             recv,
             sel,
@@ -1083,7 +1262,7 @@ pub unsafe fn send_id_planeptr_isize_isize_isize_isize_bool_bool_id_isize_isize(
 pub unsafe fn send_id_size(recv: Id, sel: Sel, a: CGSize) -> Id {
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel, CGSize) -> Id = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel, CGSize) -> Id = typed(recv, sel);
         f(recv, sel, a)
     }
 }
@@ -1099,7 +1278,7 @@ pub unsafe fn send_id_size(recv: Id, sel: Sel, a: CGSize) -> Id {
 pub unsafe fn send_id_id_point(recv: Id, sel: Sel, a: Id, b: CGPoint) -> Id {
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel, Id, CGPoint) -> Id = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel, Id, CGPoint) -> Id = typed(recv, sel);
         f(recv, sel, a, b)
     }
 }
@@ -1123,7 +1302,7 @@ pub unsafe fn send_id_id_point(recv: Id, sel: Sel, a: Id, b: CGPoint) -> Id {
 pub unsafe fn send_id_id_isize(recv: Id, sel: Sel, a: Id, b: isize) -> Id {
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel, Id, isize) -> Id = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel, Id, isize) -> Id = typed(recv, sel);
         f(recv, sel, a, b)
     }
 }
@@ -1145,7 +1324,7 @@ pub unsafe fn send_id_id_isize(recv: Id, sel: Sel, a: Id, b: isize) -> Id {
 pub unsafe fn send_id_usize_id(recv: Id, sel: Sel, a: usize, b: Id) -> Id {
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel, usize, Id) -> Id = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel, usize, Id) -> Id = typed(recv, sel);
         f(recv, sel, a, b)
     }
 }
@@ -1167,7 +1346,281 @@ pub unsafe fn send_id_usize_id(recv: Id, sel: Sel, a: usize, b: Id) -> Id {
 pub unsafe fn send_v_ptr_usize(recv: Id, sel: Sel, a: *mut core::ffi::c_void, b: usize) {
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel, *mut core::ffi::c_void, usize) = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel, *mut core::ffi::c_void, usize) =
+            typed(recv, sel);
         f(recv, sel, a, b);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shapes the Developer Tools helper panel needs (`aterm-gui`'s
+// `devtools_helper.rs`). Each carries the SDK declaration it was derived from;
+// a debug build checks each send against the runtime's own encoding (`typed`).
+// ---------------------------------------------------------------------------
+
+/// `-(id)sel:(NSRect)a styleMask:(NSUInteger)b backing:(NSUInteger)c defer:(BOOL)d`.
+///
+/// `NSWindow.h` — `-initWithContentRect:(NSRect)contentRect
+/// styleMask:(NSWindowStyleMask)style backing:(NSBackingStoreType)backingStoreType
+/// defer:(BOOL)flag`, encoded
+///
+/// ```text
+/// @68@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16Q48Q56B64
+/// ```
+///
+/// Both enums are `NSUInteger`. `vendor/winit`'s window delegate sends the same
+/// selector through its own longhand cast.
+///
+/// # Safety
+/// See the module note, including the ownership paragraph: as an initializer it
+/// consumes the receiver's +1 from `+alloc` and returns +1 (or nil, having
+/// released it).
+#[must_use]
+pub unsafe fn send_id_rect_usize_usize_bool(
+    recv: Id,
+    sel: Sel,
+    a: CGRect,
+    b: usize,
+    c: usize,
+    d: bool,
+) -> Id {
+    // SAFETY: the caller pins the prototype; this is the cast for it.
+    unsafe {
+        let f: unsafe extern "C-unwind" fn(Id, Sel, CGRect, usize, usize, Bool) -> Id =
+            typed(recv, sel);
+        f(recv, sel, a, b, c, Bool::new(d))
+    }
+}
+
+/// `-(id)sel:(id)a event:(id)b source:(id)c`.
+///
+/// `NSView.h` — `-beginDraggingSessionWithItems:(NSArray<NSDraggingItem *> *)items
+/// event:(NSEvent *)event source:(id<NSDraggingSource>)source`, encoded
+///
+/// ```text
+/// @40@0:8@16@24@32
+/// ```
+///
+/// # Safety
+/// See the module note, including the ownership paragraph — the result is +0
+/// and borrowed.
+#[must_use]
+pub unsafe fn send_id_id_id_id(recv: Id, sel: Sel, a: Id, b: Id, c: Id) -> Id {
+    // SAFETY: the caller pins the prototype; this is the cast for it.
+    unsafe {
+        let f: unsafe extern "C-unwind" fn(Id, Sel, Id, Id, Id) -> Id = typed(recv, sel);
+        f(recv, sel, a, b, c)
+    }
+}
+
+/// `-(void)sel:(SEL)a`.
+///
+/// `NSControl.h` — `@property (nullable) SEL action`, i.e. `-setAction:(SEL)`,
+/// encoded
+///
+/// ```text
+/// v24@0:8:16
+/// ```
+///
+/// # Safety
+/// See the module note. AppKit stores the selector and sends it to the target
+/// later; that the target answers it is the caller's obligation.
+pub unsafe fn send_v_sel(recv: Id, sel: Sel, a: Sel) {
+    // SAFETY: the caller pins the prototype; this is the cast for it.
+    unsafe {
+        let f: unsafe extern "C-unwind" fn(Id, Sel, Sel) = typed(recv, sel);
+        f(recv, sel, a);
+    }
+}
+
+/// `-(NSSize)sel`.
+///
+/// `NSCell.h` — `@property (readonly) NSSize cellSize`, encoded
+///
+/// ```text
+/// {CGSize=dd}16@0:8
+/// ```
+///
+/// Two `double`s come back in registers on both Apple ABIs (an HFA on arm64,
+/// `xmm0`/`xmm1` on x86_64), so [`msg`] picks plain `objc_msgSend`.
+///
+/// # Safety
+/// See the module note.
+#[must_use]
+pub unsafe fn send_size(recv: Id, sel: Sel) -> CGSize {
+    // SAFETY: the caller pins the prototype; this is the cast for it.
+    unsafe {
+        let f: unsafe extern "C-unwind" fn(Id, Sel) -> CGSize = typed(recv, sel);
+        f(recv, sel)
+    }
+}
+
+/// `-(NSSize)sel:(NSRect)a`.
+///
+/// `NSCell.h` — `-cellSizeForBounds:(NSRect)rect`, encoded
+///
+/// ```text
+/// {CGSize=dd}48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16
+/// ```
+///
+/// # Safety
+/// See the module note.
+#[must_use]
+pub unsafe fn send_size_rect(recv: Id, sel: Sel, a: CGRect) -> CGSize {
+    // SAFETY: the caller pins the prototype; this is the cast for it.
+    unsafe {
+        let f: unsafe extern "C-unwind" fn(Id, Sel, CGRect) -> CGSize = typed(recv, sel);
+        f(recv, sel, a)
+    }
+}
+
+/// `-(int)sel`.
+///
+/// `NSRunningApplication.h` — `@property (readonly) pid_t processIdentifier`,
+/// encoded
+///
+/// ```text
+/// i16@0:8
+/// ```
+///
+/// `pid_t` is `int`: 32 bits and SIGNED, not `NSInteger` and not the unsigned
+/// [`send_u32`].
+///
+/// # Safety
+/// See the module note.
+#[must_use]
+pub unsafe fn send_i32(recv: Id, sel: Sel) -> i32 {
+    // SAFETY: the caller pins the prototype; this is the cast for it.
+    unsafe {
+        let f: unsafe extern "C-unwind" fn(Id, Sel) -> i32 = typed(recv, sel);
+        f(recv, sel)
+    }
+}
+
+/// `-(BOOL)sel:(id)a forType:(id)b`.
+///
+/// `NSPasteboardItem.h` — `-setString:(NSString *)string
+/// forType:(NSPasteboardType)type`, encoded
+///
+/// ```text
+/// B32@0:8@16@24
+/// ```
+///
+/// (`c` for the `BOOL` on x86_64, which [`Bool`] carries.)
+///
+/// # Safety
+/// See the module note.
+pub unsafe fn send_bool_id_id(recv: Id, sel: Sel, a: Id, b: Id) -> bool {
+    // SAFETY: the caller pins the prototype; this is the cast for it.
+    unsafe {
+        let f: unsafe extern "C-unwind" fn(Id, Sel, Id, Id) -> Bool = typed(recv, sel);
+        f(recv, sel, a, b).as_bool()
+    }
+}
+
+/// `-(id)sel:(id)a isDirectory:(BOOL)b`.
+///
+/// `NSURL.h` — `+fileURLWithPath:(NSString *)path isDirectory:(BOOL)isDir`,
+/// encoded
+///
+/// ```text
+/// @28@0:8@16B24
+/// ```
+///
+/// # Safety
+/// See the module note, including the ownership paragraph — the result is +0
+/// and borrowed.
+#[must_use]
+pub unsafe fn send_id_id_bool(recv: Id, sel: Sel, a: Id, b: bool) -> Id {
+    // SAFETY: the caller pins the prototype; this is the cast for it.
+    unsafe {
+        let f: unsafe extern "C-unwind" fn(Id, Sel, Id, Bool) -> Id = typed(recv, sel);
+        f(recv, sel, a, Bool::new(b))
+    }
+}
+
+/// `-(BOOL)sel:(NSUInteger)a`.
+///
+/// `NSRunningApplication.h` —
+/// `-activateWithOptions:(NSApplicationActivationOptions)options`, encoded
+///
+/// ```text
+/// B24@0:8Q16
+/// ```
+///
+/// The options are an `NSUInteger` bitmask; [`send_bool_isize`] is its signed
+/// twin.
+///
+/// # Safety
+/// See the module note.
+pub unsafe fn send_bool_usize(recv: Id, sel: Sel, a: usize) -> bool {
+    // SAFETY: the caller pins the prototype; this is the cast for it.
+    unsafe {
+        let f: unsafe extern "C-unwind" fn(Id, Sel, usize) -> Bool = typed(recv, sel);
+        f(recv, sel, a).as_bool()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn same(a: &str, b: &str) -> bool {
+        abi_shape(a) == abi_shape(b)
+    }
+
+    #[test]
+    fn the_shape_keeps_sign_width_and_layout_and_merges_pointers() {
+        // `-requestUserAttention:`: a signed return read as unsigned.
+        assert!(!same("q@:Q", "Q@:Q"));
+        assert!(!same("f@:", "d@:"));
+        assert!(!same("S@:", "Q@:"));
+        assert!(!same("v@:{CGSize=dd}", "v@:{CGPoint=dd}"));
+        assert!(!same("v@:@", "v@:@@"), "the arity counts");
+        // Every pointer kind travels in one general register.
+        assert!(same("v@:^{CGColor=}", "v@:@"));
+        assert!(same("v@:@?", "v@:@"));
+        assert!(same("@@:r^@Q", "@@:^@Q"));
+        assert!(same("B@:#", "B@:@"));
+        assert!(same("Vv@:", "v@:"));
+        assert!(same("v@:@\"NSString\"", "v@:@"));
+        assert!(same("@@:^*qqqqBB@qq", "@@:^*qqqqBB@qq"));
+        assert_eq!(
+            abi_shape("{CGRect={CGPoint=dd}{CGSize=dd}}@:[4i]^^v"),
+            ["{CGRect={CGPoint=dd}{CGSize=dd}}", "p", "p", "[4i]", "p"]
+        );
+    }
+
+    #[test]
+    fn a_swift_override_may_differ_only_in_a_wide_integers_sign() {
+        let swift = "_TtGCs23_ContiguousArrayStorageCSo8NSScreen_$";
+        assert!(swift_override_of_the_same_width(swift, "q@:", "Q@:"));
+        assert!(swift_override_of_the_same_width(swift, "v@:i", "v@:I"));
+        // never for an Objective-C class, a narrow integer or another width
+        assert!(!swift_override_of_the_same_width(
+            "NSWindow", "q@:Q", "Q@:Q"
+        ));
+        assert!(!swift_override_of_the_same_width(swift, "v@:s", "v@:S"));
+        assert!(!swift_override_of_the_same_width(swift, "q@:", "I@:"));
+    }
+
+    /// A live send: the right prototype passes, the wrong sign panics before
+    /// the message is sent, naming both encodings.
+    #[test]
+    #[cfg(debug_assertions)]
+    fn a_send_cast_to_the_wrong_prototype_panics_in_a_debug_build() {
+        let s = crate::ns_string("four").expect("NSString");
+        // SAFETY: `-length` is `-(NSUInteger)length` on a live NSString.
+        assert_eq!(unsafe { send_usize(s.id(), crate::sel!(length)) }, 4);
+        let wrong = std::panic::catch_unwind(|| {
+            // SAFETY: never sent: the check refuses the signed prototype first.
+            unsafe { send_isize(s.id(), crate::sel!(length)) }
+        });
+        let message = wrong.expect_err("a signed read of `-length` must panic");
+        let message = message.downcast_ref::<String>().expect("a formatted panic");
+        assert!(
+            message.contains("length") && message.contains("`Q@:`") && message.contains("`q@:`"),
+            "{message}"
+        );
     }
 }

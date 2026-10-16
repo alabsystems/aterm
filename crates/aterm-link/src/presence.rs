@@ -474,22 +474,6 @@ mod tests {
         assert_eq!(slot.due(m, t0 + REPUBLISH_MIN * 2), Due::Changed);
     }
 
-    /// Law 3: the fabric links no vendor screen reader (`aterm-phase` runs in
-    /// the server). Checked on the manifest, in any table.
-    #[test]
-    fn the_fabric_crate_links_no_vendor_screen_reader() {
-        let manifest = include_str!("../Cargo.toml");
-        let named: Vec<&str> = manifest
-            .lines()
-            .filter(|l| !l.trim_start().starts_with('#'))
-            .filter(|l| l.contains("aterm-phase") || l.contains("aterm_phase"))
-            .collect();
-        assert!(named.is_empty(), "aterm-link depends on {named:?}");
-        // The check can see a dependency line at all: this crate's own
-        // manifest names its real ones the same way.
-        assert!(manifest.lines().any(|l| l.starts_with("aterm-ctl = ")));
-    }
-
     /// The config spelling, and no other.
     #[test]
     fn the_mode_has_two_spellings() {

@@ -307,9 +307,19 @@ fi
 # Detect array vs scalar to preserve bash 5.1+ array-style PROMPT_COMMAND.
 # Once per shell: in an upgrade in place PROMPT_COMMAND is already ours, and
 # capturing it as "the user's" would make the trampoline eval itself.
+#
+# Taken as an array when it holds an element at index 1, read without a fork: the
+# `$(declare -p PROMPT_COMMAND)` this used to be cost every new bash 1.5 ms before
+# its first prompt (measured 2026-10-16, bash 3.2.57). An array with nothing at
+# index 1 (one element, or a sparse one) runs the scalar way with nothing lost:
+# the trampoline replaces element 0 (a scalar assignment to an array) and evals
+# what element 0 held, and every later element still runs after it (bash 5.1+),
+# where `__aterm_preexec` skips it as a PROMPT_COMMAND element. Before 5.1 bash
+# runs element 0 alone, so for a one-element array the scalar way is the only one
+# that still runs the user's element.
 if (( __aterm_fresh_load )); then
     __aterm_prompt_cmd_is_array=0
-    if [[ "$(declare -p PROMPT_COMMAND 2>/dev/null)" == "declare -a"* ]]; then
+    if [[ -n ${PROMPT_COMMAND[1]+x} ]]; then
         __aterm_prompt_cmd_is_array=1
     fi
     __aterm_original_prompt_command="${PROMPT_COMMAND:-}"
@@ -393,12 +403,12 @@ __aterm_flags_put() {
 # framing colon is stripped from each end.
 #
 # $ATPKG_AGENTS — exported by the atpkg shell.d hook sourced just above — names
-# <prefix>/agents, which holds ONLY the claude and codex shims aterm keeps current
-# (owner decision 2026-09-10). It fails the same way: measured 2026-09-10 on m27 at
-# PATH position 14, behind /opt/homebrew/bin and ~/.local/bin, so `codex` ran a brew
-# cask that could run no command and `claude` an older native install. It is moved
-# to the front first, then the reroute directory, so PATH reads reroute, agents, …
-# — the spawn seam's own order.
+# <prefix>/agents, which holds ONLY the agent shims aterm keeps current (claude,
+# codex, agy, muse; owner decisions 2026-09-10 and 2026-10-15). It fails the same
+# way: measured 2026-09-10 on m27 at PATH position 14, behind /opt/homebrew/bin and
+# ~/.local/bin, so `codex` ran a brew cask that could run no command and `claude` an
+# older native install. It is moved to the front first, then the reroute directory,
+# so PATH reads reroute, agents, … — the spawn seam's own order.
 __aterm_path_front() {
     local __aterm_dir="$1" __aterm_p=":$PATH:" __aterm_q
     # Fixpoint by POSIX equality, not by `[[ == pattern ]]`: under
@@ -513,14 +523,17 @@ __aterm_reroute_path_front
 #     machine: agents/ is created at launch, the twin only once the managed program
 #     is installed — the exact window in which the owner typed `claude`) would keep
 #     losing to the hashed path for the life of the shell (measured 2026-09-16,
-#     bash 3.2.57 and zsh 5.9). `hash -d claude codex` forgets exactly those two
-#     names every call — a builtin, no syscall; its `2>/dev/null` (a name that was
-#     never hashed is an error) is a builtin redirection, not a fork — so every
-#     `claude`/`codex` walks PATH afresh and finds the twin the moment it exists.
-#     The names are the two agents/ holds by owner decision (2026-09-10: ONLY the
-#     claude and codex twins); a bash glob over agents/ would be generic but is
-#     not safe under a user's `failglob`/`noglob`, so the names are spelled. zsh
-#     watches the directory's listing instead and needs no names.
+#     bash 3.2.57 and zsh 5.9). `hash -d claude codex agy muse` forgets exactly
+#     those names every call — a builtin, no syscall; its `2>/dev/null` (a name that
+#     was never hashed is an error) is a builtin redirection, not a fork — so every
+#     agent name walks PATH afresh and finds the twin the moment it exists. An
+#     unhashed name earlier in the list does not stop the later ones being
+#     forgotten (measured 2026-10-15 on bash 3.2.57; bash 5.3's builtins/hash.def
+#     loops the same way). The names are atpkg::stub::AGENT_PROGRAMS, the twins
+#     agents/ holds (owner decisions 2026-09-10 and 2026-10-15); a bash glob over
+#     agents/ would be generic but is not safe under a user's `failglob`/`noglob`,
+#     so the names are spelled. zsh watches the directory's listing instead and
+#     needs no names.
 #
 # $ATERM_REROUTE_DIR is derived for a shell that predates it — the sibling
 # `<dir of $ATPKG_AGENTS>/reroute`, when it is a directory and $__ATERM_REROUTE_PASSTHROUGH is
@@ -639,9 +652,9 @@ __aterm_managed_path_live() {
                 ;;
         esac
     fi
-    # 4. The twin watch: the two managed names always walk PATH afresh.
+    # 4. The twin watch: the managed agent names always walk PATH afresh.
     if (( __aterm_managed_agents_on )); then
-        hash -d claude codex 2>/dev/null || :
+        hash -d claude codex agy muse 2>/dev/null || :
     fi
     return 0
 }
@@ -687,7 +700,7 @@ __aterm_id_suffix() {
     __aterm_flags_put "$__aterm_flags"
 }
 
-# Percent-encode a string for use in file:// URIs (RFC 3986).
+# Percent-encode a string for use in file:// URIs (RFC 3986), into REPLY.
 # Unreserved chars (A-Z a-z 0-9 - _ . ~ /) pass through; all others
 # are encoded byte-by-byte as %XX. Setting LC_ALL=C ensures multi-byte
 # UTF-8 characters are split into individual bytes for correct encoding.
@@ -696,14 +709,17 @@ __aterm_id_suffix() {
 # construction: `printf -v` (bash 3.1+, i.e. inside the documented 3.2+
 # floor) writes into a variable instead of spawning a `$(printf ...)`
 # subshell per encoded byte. A path with a single space used to cost a
-# fork; a 4-byte emoji cost four.
+# fork; a 4-byte emoji cost four. The answer is REPLY, not output: a
+# caller's `$(...)` around it was itself a fork at every prompt. The caller
+# declares `local REPLY` (bash scopes dynamically), so a user's REPLY — set
+# by `read` at one prompt, used at the next — is never touched.
 __aterm_urlencode() {
     local LC_ALL=C
     # Fast path: no byte needs encoding, so the loop would copy the string
     # verbatim. Skip it. (The class is exactly the loop's pass-through class,
     # so this is the same decision the loop would make for every byte.)
     if [[ "$1" != *[^a-zA-Z0-9_.~/-]* ]]; then
-        printf '%s' "$1"
+        REPLY="$1"
         return
     fi
     local string="$1" i char out="" byte
@@ -721,9 +737,7 @@ __aterm_urlencode() {
                out+="$byte" ;;
         esac
     done
-    # Emitted once rather than streamed per character; the sole caller already
-    # captures the whole result via `cwd=$(__aterm_urlencode "$cwd")`.
-    printf '%s' "$out"
+    REPLY="$out"
 }
 
 # Git Bash, MSYS2 and Cygwin run on Windows with a POSIX view of it: $PWD is
@@ -775,8 +789,9 @@ __aterm_report_cwd() {
         __aterm_win_cwd "$cwd"
         cwd="$__aterm_win_cwd_to"
     fi
-    cwd=$(__aterm_urlencode "$cwd")
-    __aterm_osc "7;file://${HOSTNAME:-$(hostname)}${cwd}"
+    local REPLY
+    __aterm_urlencode "$cwd"
+    __aterm_osc "7;file://${HOSTNAME:-$(hostname)}${REPLY}"
 }
 
 # Mark prompt start (OSC 133;A)
@@ -802,7 +817,8 @@ __aterm_mark_exec_finish() {
     __aterm_last_command=""
 }
 
-# Encode a string for OSC 633;E (VS Code convention).
+# Encode a string for OSC 633;E (VS Code convention), into REPLY (see
+# `__aterm_urlencode`: the caller's `local REPLY` keeps the user's).
 # Backslash-hex encodes semicolons, backslashes, and bytes <= 0x20.
 #
 # Runs once per user command, between Enter and the command actually
@@ -829,7 +845,7 @@ __aterm_encode_cmd() {
             *) result+="$char" ;;
         esac
     done
-    printf '%s' "$result"
+    REPLY="$result"
 }
 
 # The body's revision, SIGNED (633;P, the VS Code property mark): the folder
@@ -927,7 +943,9 @@ __aterm_preexec_run() {
         __aterm_managed_path_live
         __aterm_last_command="$BASH_COMMAND"
         # Report command text for session memory (OSC 633;E)
-        __aterm_osc "633;E;$(__aterm_encode_cmd "$BASH_COMMAND")${__aterm_id_suffix_str}"
+        local REPLY
+        __aterm_encode_cmd "$BASH_COMMAND"
+        __aterm_osc "633;E;${REPLY}${__aterm_id_suffix_str}"
         # Set tab title to running command (OSC 0).
         # Truncate to first 64 chars and strip control characters.
         local cmd="${BASH_COMMAND:0:64}"

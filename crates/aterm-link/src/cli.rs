@@ -90,12 +90,16 @@ aterm-link — the aterm fabric bridge
 
   aterm-link serve --fleet <F> --broker <ep> --cap-file <path>... [options]
   aterm-link ls    --fleet <F> --broker <ep> --cap-file <path>... [--attention]
-  aterm-link notify --on <attention|ask:<p>|halt>,... --exec <cmd>  (`notify` for its own usage)
+  aterm-link notify --on <attention|ask:<person>|halt>,... --exec <cmd>
+                    a command run when the fabric needs a human (`notify` for its usage)
   aterm-link broker <socket> [log] [--secret-file <path>]
                     the local bus itself (`broker` for its usage)
   aterm-link broker --tcp <host:port> --key-file <k> --secret-file <s> <log>
                     the bus on the SEALED TCP wire, always guarded (a `sealed` build)
+  aterm-link broker --repair <log>
+                    truncate a log the broker refuses as corrupt at that record
   aterm-link mint   <grant> --secret-file <path>    one capability line for --cap-file
+                    (a whole ring: `aterm fabric mint-for <node>|h-<person>`)
   aterm-link fabric ...  the same as `aterm fabric` (`fabric help` for its usage)
 
 `ls` defaults its flags from the rendezvous file `aterm fabric on` (or `join`) writes
@@ -129,10 +133,11 @@ over the sealed wire, --tcp --key-file. A flag given on the command line wins.
 
 `ls` prints one line per node and per session: <node> <host> <sid> state= inc=
 role= detail= driving= holder= hold= fabric= attention= gen= observer= epoch=
-phase= context= title=, each value pct-encoded (`12%` reads `12%25`). driving=
-always reads `-`; holder= and context= do too unless an older node wrote them,
-and role= detail= phase= title= do from a `minimal` bridge. <host> and fabric=
-are on the node's own line; a session's line reads `-` for both.
+phase= context= title= proto= aterm=, each value pct-encoded (`12%` reads `12%25`).
+driving= always reads `-`; holder= and context= do too unless an older node wrote
+them, and role= detail= phase= title= do from a `minimal` bridge. <host>, fabric=,
+proto= (the astream protocol the node speaks) and aterm= (the release it runs) are
+on the node's own line; a session's line reads `-` for them.
 
 `--tcp` alone is plaintext: trusted networks only. `--tcp --key-file` is the sealed
 wire a cross-host fleet uses; the shipped `aterm` does not carry it, and a build
@@ -149,7 +154,7 @@ pub const SEALED_BUILD_MARK: &str = "sealed TCP transport compiled in";
 /// The bridge's whole command line, as a LIBRARY entry.
 ///
 /// A library entry so the ONE `aterm` binary carries it: `aterm link ...` and
-/// the `aterm-link` symlink both land here; `src/main.rs` is a dev shim.
+/// the `aterm-link` symlink both land here.
 #[must_use]
 pub fn dispatch(args: &[String]) -> ExitCode {
     match args.first().map(String::as_str) {
@@ -332,13 +337,18 @@ const ELLIPSIS: &str = "%E2%80%A6";
 /// The row is §7's (module header). `attention_only` is §9.3's `--attention`:
 /// the same `Last` filtered on the field the notifier fires on (§4.2, A10).
 fn roster(cfg: &Config, attention_only: bool) -> std::io::Result<()> {
-    let (mut client, _closer) = transport::connect(&cfg.transport, &cfg.broker).map_err(|e| {
-        std::io::Error::new(
-            e.kind(),
-            format!("cannot connect to the broker at {}: {e}", cfg.broker),
-        )
-    })?;
-    crate::fabric::attach_caps(&mut client, cfg)?;
+    // One-shot, so bounded like every operator command: a wedged broker costs
+    // a few seconds and an error, never a hung terminal.
+    let (mut client, _closer) =
+        transport::connect(&cfg.transport, &cfg.broker, crate::fabric::IO_TIMEOUT).map_err(
+            |e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!("cannot connect to the broker at {}: {e}", cfg.broker),
+                )
+            },
+        )?;
+    transport::attach_cap_files(&mut client, &cfg.cap_files)?;
     let filter = format!("/f/{}/pub/*/*/presence", cfg.fleet);
     transport::walk_last(&mut client, &filter, |(_, subject, raw)| {
         let (body, _) = crate::body::Body::decode(raw);
@@ -369,7 +379,7 @@ fn row(subject: &str, body: &crate::body::Body) -> (String, bool) {
     let line = format!(
         "{node} {} {owner} state={} inc={} role={} detail={} driving={} \
          holder={} hold={} fabric={} attention={attention} gen={} observer={} epoch={} \
-         phase={} context={} title={}",
+         phase={} context={} title={} proto={} aterm={}",
         field("host"),
         field("state"),
         field("inc"),
@@ -393,6 +403,12 @@ fn row(subject: &str, body: &crate::body::Body) -> (String, bool) {
         field("phase"),
         field("context"),
         field("title"),
+        // A NODE's row says what it runs (`proto=` the astream protocol,
+        // `aterm=` the release); `-` on a session row and from a node whose
+        // bridge predates the tokens. Last, so every column before keeps its
+        // place.
+        field("proto"),
+        field("aterm"),
     );
     (line, escalating)
 }
@@ -561,11 +577,17 @@ pub(crate) fn default_state_dir() -> String {
 /// TWO LISTENERS — and the second host's broker serves both:
 ///
 /// * `<socket> [log]` — the LOCAL broker: a Unix socket created
-///   world-connectable — nothing chmods it and no peer uid is checked — so the
-///   boundary is the DIRECTORY you put it in, 0700. With no `--secret-file`
-///   it checks no capability on attach either; with one it is
-///   `Broker::open_guarded`: every attach must carry a capability minted under
-///   that secret, and every request is authorized against it.
+///   world-connectable — nothing chmods it and no peer uid is checked — so
+///   WHO can connect is bounded by the DIRECTORY you put it in, 0700. What a
+///   connection may SAY is the guard's: with `--secret-file` it is
+///   `Broker::open_guarded`, every attach must carry a capability minted under
+///   that secret, and every request is authorized against the grants attached.
+///   THE ROOT'S SECRET GUARDS THE ROOT'S SOCKET: with no `--secret-file`, a
+///   `mint.secret` beside the socket (`aterm fabric on`'s layout) is the
+///   secret, so a supervisor job written before `on` passed the flag comes back
+///   guarded the next time it starts the broker (an update, a login) — one
+///   that cannot be read is a refusal, never an unguarded broker. Only a socket
+///   with no secret beside it is served unguarded, and the banner says so.
 /// * `--tcp <host:port> --key-file <k> --secret-file <s> <log>` — the SECOND
 ///   HOST's broker: astream's sealed record layer
 ///   (`serve_tcp_sealed`, XChaCha20-Poly1305 under the 64-hex pre-shared key)
@@ -573,9 +595,9 @@ pub(crate) fn default_state_dir() -> String {
 ///   point of it: the pre-shared key is ONE secret every host holds, so it
 ///   keeps a stranger off the wire and says nothing about which host is
 ///   speaking. What stops the joined host publishing as the first host's node,
-///   or as a human's drive lane, is the capability it attaches — minted for
-///   its own node id by `aterm fabric mint-for` — and only a guarded broker
-///   checks one. A non-loopback bind is refused without `--allow-remote`. Only
+///   or as a human (mail delivered `trust=human`, a fleet halt or its lift),
+///   is the capability it attaches — minted for its own node id by `aterm
+///   fabric mint-for` — and only a guarded broker checks one. A non-loopback bind is refused without `--allow-remote`. Only
 ///   in a `sealed` build ([`transport::SEALED`]); a default build answers
 ///   `--tcp` by naming the feature. `--unix <socket>` serves that Unix socket
 ///   AS WELL, from the same guarded broker and log: the host that serves the
@@ -585,18 +607,35 @@ pub(crate) fn default_state_dir() -> String {
 ///
 /// The key and the secret are files, never arguments (an argv is world-readable
 /// in `ps`), and both must be mode 0600 ([`transport::check_private`]).
+///
+/// IT EXITS WHEN ITS BUILD IS REPLACED. A supervised broker is a `KeepAlive`
+/// launchd job or a `Restart=always` unit, and an update swaps the file its
+/// argv names in place: without this the old broker serves until the next
+/// login while every bridge runs the new build, so a broker-side fix — or a
+/// wire change both ends must share — never arrives. Every [`EXE_WATCH`] it
+/// looks at its executable; once the path names a different, settled file
+/// ([`replaced`]) it shuts down (the socket unlinked) and exits 0, and the
+/// supervisor starts the new build from the unchanged argv. A broker nothing
+/// supervises then stays down: run one by hand under something that restarts
+/// it, or restart it yourself.
 fn broker(args: &[String]) -> ExitCode {
+    // Capture the running image and invocation before opening the broker or
+    // announcing readiness. An update during startup must remain observable.
+    let watch = ExeWatch::capture();
     const USAGE: &str = "\
 usage: aterm link broker <socket> [log] [--secret-file <path>]
        aterm link broker --tcp <host:port> --key-file <path> --secret-file <path>
                          [--allow-remote] [--unix <socket>] <log>
+       aterm link broker --repair <log>
 
   <socket>         the Unix socket path the bridge's `--broker` names
   [log]            the durable record log (default: <socket>.log; required with --tcp)
   --secret-file    32+ raw bytes, 0600: the MINT secret. The broker becomes
                    GUARDED — every attach must carry a capability minted under
                    it (`aterm link mint`, `aterm fabric mint-for`), and each
-                   request is checked against the grants attached
+                   request is checked against the grants attached. Without it
+                   on a socket, the `mint.secret` beside <socket> is the secret
+                   when there is one (`aterm fabric on`'s root)
   --tcp <h:p>      serve the SEALED TCP wire instead of a socket: astream's
                    XChaCha20-Poly1305 record layer under the pre-shared key.
                    Only in a `sealed` build. Always guarded (--secret-file is
@@ -611,18 +650,29 @@ usage: aterm link broker <socket> [log] [--secret-file <path>]
                    passes the root's bus.sock) — a peer that can reach the TCP
                    port can hold all 64 of its pre-authentication slots without
                    the key, and nothing on the socket waits on them
+  --repair <log>   serve nothing: TRUNCATE <log> at its first CORRUPT record,
+                   which the broker refuses to open, and print how many bytes
+                   went. The records from that one on are lost — possibly
+                   acked mail — and everything before it is kept. A log that
+                   opens prints `nothing to repair`; a log a NEWER aterm wrote
+                   is refused untouched (run that release). Refused while a
+                   broker holds the log
 
-The Unix socket is created world-connectable, so its boundary is the DIRECTORY
-you put it in: use a 0700 one (`aterm fabric on` does). Without --secret-file the
-socket broker checks no capability on attach. Prints `listening <endpoint>` once
+The Unix socket is created world-connectable, so who can connect is bounded by the
+DIRECTORY you put it in: use a 0700 one (`aterm fabric on` does). A socket broker
+with no --secret-file and no mint.secret beside its socket checks no capability on
+attach, and says `(unguarded)` on stderr. Prints `listening <endpoint>` once
 it is bound — the bound TCP address when the port was 0 — and, with --unix, a
-second `listening <socket>` line once that is bound too.
+second `listening <socket>` line once that is bound too. It exits 0 within a minute
+of its executable being replaced by another build, for its supervisor (launchd
+KeepAlive, systemd Restart=always) to start that one.
 ";
     let mut tcp: Option<String> = None;
     let mut key_file: Option<String> = None;
     let mut secret_file: Option<String> = None;
     let mut unix: Option<String> = None;
     let mut allow_remote = false;
+    let mut repair = false;
     let mut words: Vec<&str> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -687,6 +737,7 @@ second `listening <socket>` line once that is bound too.
                 }
             }
             "--allow-remote" => allow_remote = true,
+            "--repair" => repair = true,
             other if other.starts_with('-') => {
                 eprintln!("aterm link broker: unknown flag `{other}`");
                 eprint!("{USAGE}");
@@ -695,6 +746,26 @@ second `listening <socket>` line once that is bound too.
             word => words.push(word),
         }
         i += 1;
+    }
+    // THE REPAIR SERVES NOTHING: one local file, and no other flag of the
+    // line means anything to it — refused rather than ignored.
+    if repair {
+        if tcp.is_some()
+            || key_file.is_some()
+            || secret_file.is_some()
+            || unix.is_some()
+            || allow_remote
+        {
+            eprintln!("aterm link broker: --repair takes <log> alone: it serves nothing");
+            eprint!("{USAGE}");
+            return ExitCode::from(2);
+        }
+        let [log] = words.as_slice() else {
+            eprintln!("aterm link broker: --repair takes exactly one <log>");
+            eprint!("{USAGE}");
+            return ExitCode::from(2);
+        };
+        return repair_log(log);
     }
     // THE BUILD FIRST: a default build answers `--tcp` by naming the feature,
     // before any other word of the line is judged — what is missing is the
@@ -776,15 +847,28 @@ second `listening <socket>` line once that is bound too.
             (bind.clone(), log)
         }
     };
-    let secret = match secret_file.as_deref().map(read_secret) {
+    // THE ROOT'S SECRET GUARDS THE ROOT'S SOCKET (the doc above). Present at
+    // all — a symlink, an unreadable file — is enough to make it the secret,
+    // so a broken one is the reader's refusal below, never an unguarded bus.
+    let secret_file = secret_file.or_else(|| {
+        let beside = std::path::Path::new(&endpoint).with_file_name(crate::enable::MINT_SECRET);
+        (tcp.is_none() && std::fs::symlink_metadata(&beside).is_ok())
+            .then(|| beside.to_string_lossy().into_owned())
+    });
+    let secret = match secret_file
+        .as_deref()
+        .map(|p| (p, transport::read_mint_secret(p)))
+    {
         None => None,
-        Some(Ok(s)) => Some(s),
-        Some(Err(e)) => {
-            eprintln!("aterm link broker: {e}");
+        Some((_, Ok(s))) => Some(s),
+        Some((path, Err(e))) => {
+            eprintln!(
+                "aterm link broker: --secret-file {}",
+                transport::describe(path, &e)
+            );
             return ExitCode::FAILURE;
         }
     };
-    let guarded = secret.is_some();
     // Whether THIS call creates the log, so a refused bind can remove the
     // empty file it would otherwise leave behind.
     let log_created_here = !std::path::Path::new(&log).exists();
@@ -796,6 +880,12 @@ second `listening <socket>` line once that is bound too.
         Ok(b) => b,
         Err(e) => {
             eprintln!("aterm link broker: open {log}: {e}");
+            // THE LAST LINE IS ATERM'S REMEDY, when the refusal has one: the
+            // supervisor appends this stderr to `<root>/broker.err`, whose last
+            // line `aterm fabric` and doctor quote ([`log_refusal_remedy`]).
+            if let Some(remedy) = log_refusal_remedy(e.kind(), &log) {
+                eprintln!("aterm link broker: {remedy}");
+            }
             return ExitCode::FAILURE;
         }
     };
@@ -844,10 +934,11 @@ second `listening <socket>` line once that is bound too.
     let beside_note = unix
         .as_deref()
         .map_or_else(String::new, |sock| format!(" and the unix socket {sock}"));
-    let guard_note = if guarded {
-        " (guarded)"
-    } else {
-        " (unguarded)"
+    // A secret that did not read stopped the broker above, so a named one
+    // here is the one guarding it.
+    let guard_note = match secret_file.as_deref() {
+        Some(path) => format!(" (guarded by {path})"),
+        None => " (unguarded: it checks no capability)".to_string(),
     };
     {
         use std::io::Write as _;
@@ -862,29 +953,266 @@ second `listening <socket>` line once that is bound too.
             "aterm link broker: {transport} on {shown}{beside_note}{guard_note}"
         );
     }
-    // The broker serves on its own threads; this one parks. `BrokerHandle` has
-    // no `join` — `asb serve` parks exactly this way — and dropping the handle
-    // would shut the broker down and unlink the socket.
-    let _keep = (handle, beside);
+    // The broker serves on its own threads; this one watches the executable.
+    // `BrokerHandle` has no `join` — `asb serve` parks the same way — and
+    // dropping the handle shuts the broker down and unlinks the socket, which
+    // is how it EXITS when its build is replaced (the doc above).
+    let keep = (handle, beside);
+    let Some(mut watch) = watch else {
+        // No executable to watch: serve until killed, as before the watch.
+        loop {
+            std::thread::park();
+        }
+    };
     loop {
-        std::thread::park();
+        std::thread::park_timeout(EXE_WATCH);
+        if watch.poll() {
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stderr(),
+                "aterm link broker: {} was replaced by another build; exiting so the supervisor \
+                 starts that one",
+                watch.path.display()
+            );
+            drop(keep);
+            return ExitCode::SUCCESS;
+        }
     }
 }
 
-/// A mint secret FILE: 0600 and at least 32 bytes — the length `mint` refuses
-/// below, for its reason (HMAC takes any key, and a short one guards nothing).
-fn read_secret(path: &str) -> Result<Vec<u8>, String> {
-    transport::check_private(path)
-        .map_err(|e| format!("--secret-file {}", transport::describe(path, &e)))?;
-    let secret = std::fs::read(path).map_err(|e| format!("--secret-file {path}: {e}"))?;
-    if secret.len() < crate::enable::SECRET_LEN {
-        return Err(format!(
-            "--secret-file {path} holds {} bytes; a mint secret is at least {}",
-            secret.len(),
-            crate::enable::SECRET_LEN
-        ));
+/// The words that OPEN aterm's remedy for a log astream refuses as CORRUPT —
+/// the last line `aterm link broker` writes before it exits, and so the last
+/// word of `<root>/broker.err` that `aterm fabric` and doctor quote. The fix
+/// they print for it ([`crate::enable::fix_for`]) is chosen on these words,
+/// which this binary writes; astream's own refusal names `asb repair`, which
+/// aterm does not ship.
+pub const CORRUPT_LOG_REMEDY: &str = "the log has a corrupt record and is not opened: run `aterm \
+                                      link broker --repair";
+
+/// The words that OPEN aterm's line for a log astream refuses because a NEWER
+/// format wrote it (`Unsupported`): no repair applies — truncating would
+/// destroy records the release that wrote them reads — so the remedy is that
+/// release. Chosen on by [`crate::enable::fix_for`], like
+/// [`CORRUPT_LOG_REMEDY`], and never answered with a repair.
+pub const NEWER_LOG_REMEDY: &str = "the log was written by a newer aterm and is not opened";
+
+/// Aterm's remedy for a broker log astream refused to open with `kind`, as one
+/// line naming `log` — `None` for a refusal with no remedy of aterm's own (a
+/// lock held, a permission), whose astream words say enough.
+///
+/// By KIND, never by astream's wording. In aterm's build (no retention, no
+/// anti-rollback) `InvalidData` from an open is the corrupt-record refusal,
+/// and `Unsupported` a record format newer than this build reads.
+#[must_use]
+pub fn log_refusal_remedy(kind: std::io::ErrorKind, log: &str) -> Option<String> {
+    match kind {
+        std::io::ErrorKind::InvalidData => Some(format!(
+            "{CORRUPT_LOG_REMEDY} '{}'` to cut it there (the records from it on are lost)",
+            log.replace('\'', "'\\''")
+        )),
+        std::io::ErrorKind::Unsupported => Some(format!(
+            "{NEWER_LOG_REMEDY}: run that aterm release or a later one — no repair applies, and \
+             {log} is untouched"
+        )),
+        _ => None,
     }
-    Ok(secret)
+}
+
+/// `aterm link broker --repair <log>`: astream's explicit, operator-invoked
+/// repair (`BrokerLog::open_repair`, the `asb repair` aterm does not ship) —
+/// the log TRUNCATED at its first corrupt record, the bytes dropped counted.
+/// Idempotent: a log that opens is left as it is and says `nothing to repair`.
+///
+/// A log that is not there is refused, not created: `open_repair` would leave
+/// an empty log behind a typo. A broker holding the log (astream's exclusive
+/// lock, `AlreadyExists`) is refused — repair it between its supervisor's
+/// restarts, or with the job stopped. A NEWER-format log is refused untouched
+/// by astream itself. The repair moves the log's identity on, so every bridge
+/// forgets the offsets it held on the cut log at its next attach.
+fn repair_log(log: &str) -> ExitCode {
+    match std::fs::metadata(log) {
+        Ok(m) if m.is_file() => {}
+        Ok(_) => {
+            eprintln!("aterm link broker --repair: {log} is not a file");
+            return ExitCode::FAILURE;
+        }
+        Err(e) => {
+            eprintln!("aterm link broker --repair: {log}: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+    let said = match astream_broker::BrokerLog::open_repair(log, astream_broker::Durability::Strict)
+    {
+        Ok((_, 0)) => format!("{log}: nothing to repair"),
+        Ok((_, dropped)) => {
+            format!("{log}: repaired, dropped {dropped} byte(s) from the corrupt record on")
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            eprintln!(
+                "aterm link broker --repair: {log} is held by a running broker ({e}); repair it \
+                 while no broker has it open"
+            );
+            return ExitCode::FAILURE;
+        }
+        Err(e) => {
+            eprintln!("aterm link broker --repair: {log}: {e}");
+            // A newer format is refused by astream on the repair too, and
+            // aterm's line names the release that reads it.
+            if e.kind() == std::io::ErrorKind::Unsupported {
+                if let Some(remedy) = log_refusal_remedy(e.kind(), log) {
+                    eprintln!("aterm link broker --repair: {remedy}");
+                }
+            }
+            return ExitCode::FAILURE;
+        }
+    };
+    use std::io::Write as _;
+    // WRITTEN, NEVER PRINTED: a closed stdout must not panic the repair.
+    let _ = writeln!(std::io::stdout().lock(), "{said}");
+    ExitCode::SUCCESS
+}
+
+/// How often a serving broker looks at its executable: slow, because a
+/// replaced build can wait half a minute and the look is one `stat`.
+const EXE_WATCH: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// What a file IS — device, inode, length and modification time — so a
+/// REPLACED executable (a new inode renamed over the path, or the same inode
+/// rewritten) is told from the one a process started from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileId {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    mtime: i64,
+    mtime_nsec: i64,
+}
+
+impl FileId {
+    /// The regular file at `path`, symlinks followed — the file a supervisor
+    /// that runs `path` would start.
+    ///
+    /// # Errors
+    ///
+    /// The `stat`, or a path that is not a regular file.
+    fn of(path: &std::path::Path) -> std::io::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::metadata(path)?;
+        if !m.is_file() {
+            return Err(std::io::Error::other(format!(
+                "{} is not a regular file",
+                path.display()
+            )));
+        }
+        Ok(Self {
+            dev: m.dev(),
+            ino: m.ino(),
+            len: m.len(),
+            mtime: m.mtime(),
+            mtime_nsec: m.mtime_nsec(),
+        })
+    }
+}
+
+/// The mapped image, rather than a pathname that an update may already have
+/// replaced. Linux exposes its full metadata through `/proc`; elsewhere the
+/// report's existing process-image probe can retain the original inode even
+/// when `current_exe` now names another file.
+enum RunningImage {
+    File(FileId),
+    #[cfg(not(target_os = "linux"))]
+    Inode(u64),
+}
+
+impl RunningImage {
+    fn capture() -> Option<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            FileId::of(std::path::Path::new("/proc/self/exe"))
+                .ok()
+                .map(Self::File)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let inode = crate::fabric::running_image_inode(std::process::id());
+            let file = std::env::current_exe()
+                .ok()
+                .and_then(|p| FileId::of(&p).ok());
+            match (file, inode) {
+                (Some(file), Some(inode)) if file.ino == inode => Some(Self::File(file)),
+                (_, Some(inode)) => Some(Self::Inode(inode)),
+                // Without an OS image answer, retain the early file snapshot.
+                // This still covers replacement after broker startup.
+                (Some(file), None) => Some(Self::File(file)),
+                (None, None) => None,
+            }
+        }
+    }
+
+    fn matches(&self, now: &FileId) -> bool {
+        match self {
+            Self::File(start) => start == now,
+            #[cfg(not(target_os = "linux"))]
+            Self::Inode(inode) => *inode == now.ino,
+        }
+    }
+}
+
+/// The supervisor's invocation, without resolving its final symlink. Watching
+/// `current_exe` on Linux instead would pin the old symlink target forever.
+fn invocation_path(
+    argv0: &std::ffi::OsStr,
+    path: Option<&std::ffi::OsStr>,
+) -> Option<std::path::PathBuf> {
+    let invocation = std::path::Path::new(argv0);
+    let file = if invocation.components().count() == 1 && !invocation.is_absolute() {
+        crate::enable::which_in(argv0, path?)?
+    } else {
+        invocation.to_path_buf()
+    };
+    std::path::absolute(file).ok()
+}
+
+struct ExeWatch {
+    path: std::path::PathBuf,
+    start: RunningImage,
+    seen: Option<FileId>,
+}
+
+impl ExeWatch {
+    fn capture() -> Option<Self> {
+        let start = RunningImage::capture()?;
+        let argv0 = std::env::args_os().next()?;
+        let path = invocation_path(&argv0, std::env::var_os("PATH").as_deref())?;
+        Some(Self {
+            path,
+            start,
+            seen: None,
+        })
+    }
+
+    fn poll(&mut self) -> bool {
+        let now = FileId::of(&self.path);
+        let changed = replaced(&self.start, self.seen.as_ref(), &now);
+        self.seen = now.ok();
+        changed
+    }
+}
+
+/// Whether the executable a broker started from has been REPLACED, so it
+/// should exit and let its supervisor (`KeepAlive`, `Restart=always`) start
+/// the new build — otherwise an update leaves the old broker serving until the
+/// next login, and broker-side fixes in the new build never run.
+///
+/// `start` is the file at start, `seen` the one the PREVIOUS look found, `now`
+/// this look's. Replaced means a different file that is SETTLED: the same on
+/// two looks running, so a build still being written is never the one the
+/// supervisor is sent to start. A path that is gone or is not a regular file
+/// (an update mid-swap, an uninstall) is not a replacement: exiting into a
+/// supervisor with nothing to start is an outage, so the broker keeps serving
+/// and looks again.
+fn replaced(start: &RunningImage, seen: Option<&FileId>, now: &std::io::Result<FileId>) -> bool {
+    matches!(now, Ok(now) if !start.matches(now) && seen == Some(now))
 }
 
 /// `serve_tcp_sealed` — in a `sealed` build. The default build never reaches
@@ -924,7 +1252,8 @@ fn mint(args: &[String]) -> ExitCode {
 usage: aterm link mint <grant> --secret-file <path>
 
   <grant>          e.g. `rw,p=<node>:/f/<fleet>/pub/<node>/>` or `ro:/f/<fleet>/pub/>`
-  --secret-file    32 raw bytes; the mint key. Keep it 0600 and off argv.
+  --secret-file    32+ raw bytes, 0600: the mint key, used byte for byte (a file
+                   any other user can read, or a shorter one, is refused)
 
 Prints one `<grant> <tag-hex>` line — append it to the file `serve --cap-file` reads.
 ";
@@ -965,23 +1294,18 @@ Prints one `<grant> <tag-hex>` line — append it to the file `serve --cap-file`
         eprint!("{USAGE}");
         return ExitCode::from(2);
     };
-    let key = match std::fs::read(secret_path) {
+    // The one reader the broker that verifies these caps reads the secret
+    // with: a group-readable or short secret is refused here as it is there.
+    let key = match transport::read_mint_secret(secret_path) {
         Ok(k) => k,
         Err(e) => {
-            eprintln!("aterm link mint: {secret_path}: {e}");
+            eprintln!(
+                "aterm link mint: --secret-file {}",
+                transport::describe(secret_path, &e)
+            );
             return ExitCode::FAILURE;
         }
     };
-    // A SHORT SECRET IS REFUSED: HMAC accepts any key length, so an empty
-    // or truncated file would mint a well-formed capability that seals nothing.
-    if key.len() < crate::enable::SECRET_LEN {
-        eprintln!(
-            "aterm link mint: {secret_path} holds {} bytes; a mint secret is at least {}",
-            key.len(),
-            crate::enable::SECRET_LEN
-        );
-        return ExitCode::FAILURE;
-    }
     match astream_cap::mint(&key, grant) {
         Ok(cap) => {
             // `<grant> <tag-hex>` in astream's one cap-file format, which every
@@ -1006,6 +1330,143 @@ mod tests {
 
     fn argv(line: &str) -> Vec<String> {
         line.split(' ').map(str::to_string).collect()
+    }
+
+    /// A REPLACED BUILD is a different, SETTLED file at the executable's
+    /// path: the same file never is; a new build renamed over the path, or
+    /// the file rewritten in place, is once two looks agree; a path that is
+    /// gone or is not a regular file never is.
+    #[test]
+    fn a_broker_exits_only_for_a_settled_replacement_of_its_executable() {
+        let dir = std::env::temp_dir().join(format!("atlink-exe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let exe = dir.join("aterm");
+        std::fs::write(&exe, b"build one").expect("write");
+        let start = FileId::of(&exe).expect("start");
+        let image = RunningImage::File(start);
+        let same = FileId::of(&exe);
+        assert!(!replaced(&image, None, &same), "the same file");
+        assert!(
+            !replaced(&image, same.as_ref().ok(), &same),
+            "the same file, looked at twice"
+        );
+        // A new build renamed over the path: replaced once it is settled.
+        std::fs::write(dir.join("aterm.new"), b"build two").expect("write");
+        std::fs::rename(dir.join("aterm.new"), &exe).expect("rename over");
+        let first = FileId::of(&exe);
+        assert!(
+            !replaced(&image, Some(&start), &first),
+            "seen once: it may still be being written"
+        );
+        let second = FileId::of(&exe);
+        assert!(replaced(&image, first.as_ref().ok(), &second), "settled");
+        // The same inode rewritten in place is a replacement too.
+        let rewritten = FileId::of(&exe).expect("now");
+        std::fs::write(&exe, b"build three, longer").expect("rewrite in place");
+        let again = FileId::of(&exe);
+        assert!(replaced(
+            &RunningImage::File(rewritten),
+            again.as_ref().ok(),
+            &FileId::of(&exe)
+        ));
+        // Gone, or a directory in its place: never — exiting would leave the
+        // supervisor nothing to start.
+        std::fs::remove_file(&exe).expect("remove");
+        let gone = FileId::of(&exe);
+        assert!(gone.is_err());
+        assert!(!replaced(&image, second.as_ref().ok(), &gone));
+        std::fs::create_dir(&exe).expect("a directory where the file was");
+        assert!(FileId::of(&exe).is_err(), "not a regular file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_executable_watch_follows_the_invocation_symlink_through_a_swap() {
+        use std::ffi::OsStr;
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let scratch = aterm_tempfile::TempDir::new().expect("scratch");
+        let dir = scratch.path();
+        let old = dir.join("build-one");
+        let new = dir.join("build-two");
+        for file in [&old, &new] {
+            std::fs::write(file, b"executable fixture").expect("write");
+            std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o700))
+                .expect("executable");
+        }
+        let invocation = dir.join("aterm");
+        symlink(&old, &invocation).expect("invocation symlink");
+        let resolved = invocation_path(OsStr::new("aterm"), Some(dir.as_os_str()))
+            .expect("bare argv0 resolved on PATH");
+        assert_eq!(resolved, invocation, "retain the final symlink");
+        assert_eq!(
+            invocation_path(invocation.as_os_str(), None),
+            Some(invocation.clone())
+        );
+        assert!(invocation_path(OsStr::new("aterm"), None).is_none());
+        let original = FileId::of(&old).expect("running image");
+        let mut watch = ExeWatch {
+            path: resolved,
+            start: RunningImage::File(original),
+            seen: None,
+        };
+        assert!(!watch.poll());
+        assert!(!watch.poll(), "an unchanged invocation keeps serving");
+
+        symlink(&new, dir.join("aterm.next")).expect("new symlink");
+        std::fs::rename(dir.join("aterm.next"), &invocation).expect("retarget atomically");
+        assert!(!watch.poll(), "one observation is not settled");
+        std::fs::remove_file(&invocation).expect("swap gap");
+        assert!(
+            !watch.poll(),
+            "a missing invocation never requests a restart"
+        );
+        symlink(&new, &invocation).expect("finish swap");
+        assert!(!watch.poll(), "the gap resets the settlement observation");
+        assert!(watch.poll(), "restart onto the new symlink target");
+        assert_eq!(FileId::of(&old).expect("old image untouched"), original);
+    }
+
+    #[test]
+    fn an_executable_watch_keeps_its_running_identity_across_readiness() {
+        let scratch = aterm_tempfile::TempDir::new().expect("scratch");
+        let invocation = scratch.path().join("aterm");
+        std::fs::write(&invocation, b"running image").expect("old image");
+        let original = FileId::of(&invocation).expect("image at startup");
+        let mut watch = ExeWatch {
+            path: invocation.clone(),
+            start: RunningImage::File(original),
+            seen: None,
+        };
+
+        // An update completes while the broker opens its log and listener,
+        // before it announces readiness. Observations still compare with the
+        // captured running image, rather than adopting the replacement.
+        let replacement = scratch.path().join("aterm.next");
+        std::fs::write(&replacement, b"replacement image").expect("replacement");
+        std::fs::rename(&replacement, &invocation).expect("replace before readiness");
+        let after_ready = FileId::of(&invocation).expect("file after readiness");
+        assert!(!watch.poll());
+        assert!(watch.poll(), "the replacement cannot become the baseline");
+        assert!(
+            !replaced(
+                &RunningImage::File(after_ready),
+                Some(&after_ready),
+                &Ok(after_ready)
+            ),
+            "negative control: a baseline captured after readiness misses the update"
+        );
+
+        // A path already replaced before the watcher is constructed must
+        // likewise be compared to the OS's mapped image, not its current file.
+        let mut already_replaced = ExeWatch {
+            path: invocation,
+            start: RunningImage::capture().expect("this process's mapped executable"),
+            seen: None,
+        };
+        assert!(!already_replaced.poll());
+        assert!(already_replaced.poll());
     }
 
     /// **`ls` PRINTS §7's ROW, AND `--attention` IS §9.3's VIEW.** The columns
@@ -1056,7 +1517,9 @@ mod tests {
                 "epoch",
                 "phase",
                 "context",
-                "title"
+                "title",
+                "proto",
+                "aterm"
             ],
             "the row must be §7's columns in §7's order, then the additions: {line}"
         );
@@ -1073,9 +1536,17 @@ mod tests {
             "phase=-",
             "context=-",
             "title=-",
+            "proto=-",
+            "aterm=-",
         ] {
             assert!(line.contains(absent), "{absent} missing from: {line}");
         }
+        // A NODE's row says what it runs, in the last two columns.
+        let (node_body, _) = crate::body::Body::decode(
+            b"v=1 t=1 state=live inc=2 fabric=connected host=m7 pid=1 proto=2 aterm=0.5.0",
+        );
+        let (line, _) = row("/f/f1/pub/n-a/node/presence", &node_body);
+        assert!(line.ends_with(" proto=2 aterm=0.5.0"), "{line}");
         // A `meta` row: the five are printed as written, in their columns.
         let (body, _) = crate::body::Body::decode(
             b"v=1 t=1 inc=4 state=live hold=0 holder=- attention=- role=worker \
@@ -1118,7 +1589,7 @@ mod tests {
         );
         assert_eq!(
             line.split_whitespace().count(),
-            18,
+            20,
             "one token per column, always: {line:?}"
         );
 

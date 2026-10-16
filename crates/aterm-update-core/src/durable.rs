@@ -19,8 +19,8 @@ pub(crate) fn sync_all(file: &File) -> std::io::Result<()> {
 /// the same point and in the same order, so a test sees the same files, renames and
 /// errors. What it drops is the drive-cache barrier. No test can observe that barrier,
 /// because it only orders the disk against a power loss. It also stalls the whole VOLUME
-/// while it runs, so every test binary the gate runs beside this one waits behind it for
-/// its own temp-dir metadata. Measured 2026-10-06: one `aterm-update-core --lib` run made
+/// while it runs, so every test binary running beside this one waits behind it for
+/// its own temp-dir metadata. Measured: one `aterm-update-core --lib` run made
 /// 36 `F_FULLFSYNC`s, every one of them the sentinel's record or its directory, and with
 /// this arm it makes none. Alone the run took 0.55 s either way; beside the aterm-primer,
 /// aterm-release and aterm-agent unit-test runs it took 0.60 s instead of 0.89-0.92 s.

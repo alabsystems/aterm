@@ -2,13 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Terminal mode bitflags used for keyboard encoding.
-//!
-//! This type captures the subset/superset of mode flags that influence keyboard
-//! sequence generation (legacy VT/xterm + Kitty keyboard protocol).
+//! Terminal mode bitflags, including those that drive keyboard encoding (legacy VT/xterm and
+//! the Kitty keyboard protocol).
 
 bitflags! {
-    /// Terminal mode flags used by keyboard encoding.
+    /// Terminal mode flags; [`TermMode::to_keyboard_mode`] projects the keyboard subset.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
     pub struct TermMode: u32 {
         /// Cursor is visible (DECTCEM).
@@ -98,12 +96,8 @@ bitflags! {
 }
 
 impl TermMode {
-    /// Build a `TermMode` from the keyboard-relevant state only.
-    ///
-    /// This is the canonical constructor for keyboard-related flags:
-    /// `APP_CURSOR`, `APP_KEYPAD`, `VT52_MODE`, 5 Kitty flags, and 3 xterm flags.
-    /// Both `aterm-core` and `aterm-alacritty-bridge` should delegate to this
-    /// rather than maintaining their own handwritten flag lists.
+    /// Build a `TermMode` from the keyboard-relevant state only: `APP_CURSOR`, `APP_KEYPAD`,
+    /// `VT52_MODE`, the five kitty flags and the three xterm flags.
     #[must_use]
     pub fn from_keyboard_state(
         app_cursor: bool,
@@ -124,7 +118,6 @@ impl TermMode {
             flags |= Self::VT52_MODE;
         }
 
-        // Kitty keyboard protocol flags
         if kitty.disambiguate() {
             flags |= Self::DISAMBIGUATE_ESC_CODES;
         }
@@ -141,7 +134,6 @@ impl TermMode {
             flags |= Self::REPORT_ASSOCIATED_TEXT;
         }
 
-        // xterm modifyOtherKeys / formatOtherKeys
         match xterm.modify_other_keys().unwrap_or(0) {
             1 => flags |= Self::XTERM_MODIFY_OTHER_KEYS_LEVEL1,
             2 => flags |= Self::XTERM_MODIFY_OTHER_KEYS_LEVEL2,
@@ -154,12 +146,7 @@ impl TermMode {
         flags
     }
 
-    /// Project the keyboard-relevant flags into `KeyboardMode`.
-    ///
-    /// This is the canonical projection from the wide `TermMode` bitset to
-    /// the narrow encoder-facing `KeyboardMode`. Both `aterm-core` and
-    /// `aterm-alacritty-bridge` should delegate to this instead of maintaining
-    /// handwritten flag-by-flag mappings.
+    /// Project the keyboard-relevant flags into the encoder-facing `KeyboardMode`.
     #[must_use]
     pub fn to_keyboard_mode(self) -> super::KeyboardMode {
         use super::KeyboardMode;

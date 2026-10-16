@@ -682,6 +682,7 @@ fn the_final_snapshot_leaves_a_held_row_alone() {
         pid: None,
         pass: "net".into(),
         started_unix: 1_700_000_000,
+        generation: None,
         heartbeat_unix: 1_700_000_100,
         overall: atpkg::progress::Overall {
             programs_done: 10,
@@ -1757,6 +1758,163 @@ fn the_route_words_are_the_consent_cards_caption() {
     assert_eq!(privacy_pane("camera"), None);
 }
 
+/// THE DEVELOPER TOOLS LINE'S TWO CAPSULES, pressed on the page (owner ask
+/// 2026-10-15): `Security` is a navigation — aterm's own Settings ▸ Security
+/// opens and the line stays; the press that opens the Developer Tools pane
+/// files the line ANSWERED (the owner did its one action) and writes NOTHING
+/// of the Full Disk Access card's: no `opened` marker, no `opened_at` (a press
+/// there is no answer to the file-access question). NEGATIVE CONTROL: the Full
+/// Disk Access capsule's press writes both.
+#[test]
+fn the_developer_tools_line_opens_security_and_never_answers_the_file_access_card() {
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    app.except(&crate::message_reporters::devtools_entry(
+        atpkg::devtools::Step::Add,
+    ));
+    let id = app.messages.digest().entries[0].id;
+    assert_eq!(
+        app.perform_message_act(wid, id.raw(), 1),
+        MessageActOutcome::Performed {
+            feedback: "Opened Settings \u{25b8} Security".to_string()
+        }
+    );
+    assert_eq!(
+        settings_view(&app, wid).map(|v| v.route),
+        Some(SettingsRoute::Security)
+    );
+    assert!(
+        app.messages.digest_entry(id).is_some(),
+        "a navigation leaves the line"
+    );
+    // A headless arm opens no pane, and the page says so. The line is filed
+    // answered either way: `act_digest` files the mover's press before it is
+    // performed (the message center's existing rule, not this line's choice).
+    assert_eq!(
+        app.perform_message_act(wid, id.raw(), 0),
+        MessageActOutcome::Refused {
+            feedback: "System Settings did not open".to_string()
+        }
+    );
+    assert!(app.messages.digest().is_empty(), "its one action: answered");
+    assert_eq!(app.consent_card_host.marker, None, "no file-access marker");
+    assert_eq!(app.consent_card_host.record.opened_at, None);
+    // The control: the Full Disk Access capsule records the card's `opened`.
+    let open_fda = Intent::OpenSystemPane {
+        pane: PANE_FULL_DISK_ACCESS.into(),
+    };
+    let fda = app.post_message(
+        Message::new(tags::PRIVACY, Severity::Info, "File access not confirmed")
+            .action(open_fda.clone()),
+    );
+    assert!(!app.perform_intent(wid, fda, open_fda));
+    assert_eq!(
+        app.consent_card_host.marker,
+        Some(crate::consent_card::Marker::Opened)
+    );
+    assert!(app.consent_card_host.record.opened_at.is_some());
+}
+
+/// THE DEVELOPER TOOLS PRESS IS THE ONE HAND-OVER (owner ask 2026-10-15): on
+/// a window the capsule opens the page through `App::hand_devtools_to_owner`,
+/// shows the helper panel, notes the shared opened marker and has the owner's
+/// return read the list, and never writes the file-access card's marker.
+/// NEGATIVE CONTROL: a page that did not open notes nothing, shows nothing and
+/// arms no return read. A windowed lane with stand-in arms stands in on a
+/// headless App; nothing reaches the OS.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_developer_tools_press_is_the_one_hand_over() {
+    use crate::devtools_helper::test_arms;
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    let now = std::time::Instant::now();
+    assert!(app.devtools_watch.wants_read(now), "the launch read");
+    let press = Intent::OpenSystemPane {
+        pane: PANE_DEVELOPER_TOOLS.into(),
+    };
+    let row = app.post_message(
+        Message::new(
+            tags::PRIVACY,
+            Severity::Info,
+            "aterm is not in Developer Tools",
+        )
+        .action(press.clone()),
+    );
+    test_arms::stand_in(&mut app, test_arms::refusing());
+    assert!(!app.perform_intent(wid, row, press.clone()));
+    assert_eq!((test_arms::opens(), test_arms::opened_notes()), (1, 0));
+    assert!(app.devtools_helper.panel().is_none(), "no page, no panel");
+    assert!(
+        !app.devtools_watch.wants_read(now),
+        "nothing to come back from"
+    );
+    test_arms::stand_in(&mut app, test_arms::opening());
+    assert!(app.perform_intent(wid, row, press));
+    assert_eq!((test_arms::opens(), test_arms::opened_notes()), (2, 1));
+    assert!(
+        app.devtools_helper
+            .panel()
+            .is_some_and(|p| p.origin() == crate::devtools_helper::Origin::Digest),
+        "the panel beside the page"
+    );
+    assert!(
+        app.devtools_watch.wants_read(now),
+        "the owner's return reads"
+    );
+    assert_eq!(app.consent_card_host.marker, None, "no file-access marker");
+    assert_eq!(app.consent_card_host.record.opened_at, None);
+}
+
+/// A DIGEST PRESS ON A LIST READ EMPTY (owner ask 2026-10-15) waits for `spctl
+/// developer-mode enable-terminal` before the page can open, and the message
+/// center files the line answered at the press (its one action). When the page
+/// then does not open, the line comes back: the owner is not left with a press
+/// that did nothing and a line put away for a month. NEGATIVE CONTROL: a page
+/// that opens leaves the line filed. Stand-in arms on a headless App; nothing
+/// reaches the OS.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_digest_press_whose_page_does_not_open_brings_its_line_back() {
+    use crate::devtools_helper::test_arms;
+    for (reach, back) in [(test_arms::refusing(), true), (test_arms::opening(), false)] {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        test_arms::stand_in(&mut app, reach);
+        app.devtools_helper.note_reading(
+            test_arms::reading(
+                aterm_containment::DevToolGrant::NotGranted,
+                test_arms::absent(0),
+            ),
+            std::time::Instant::now(),
+        );
+        app.except(&crate::message_reporters::devtools_entry(
+            atpkg::devtools::Step::Add,
+        ));
+        let id = app.messages.digest().entries[0].id;
+        let _ = app.perform_message_act(wid, id.raw(), 0);
+        assert!(
+            app.messages.digest().is_empty(),
+            "filed answered at the press"
+        );
+        assert!(
+            app.devtools_helper.listing().is_some(),
+            "the page waits for `spctl`"
+        );
+        let start = std::time::Instant::now();
+        while app.devtools_helper.listing().is_some() {
+            assert!(start.elapsed() < std::time::Duration::from_secs(60), "hang");
+            app.tick_devtools_hand_over(std::time::Instant::now());
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(
+            !app.messages.digest().is_empty(),
+            back,
+            "back exactly when the page did not open (back={back})"
+        );
+    }
+}
+
 /// `Open log` opens only an absolute, regular file under the log dir —
 /// not a relative path, not a missing file, not a regular file OUTSIDE
 /// the dir, not a `..` that lexically starts under the dir and escapes
@@ -1892,6 +2050,7 @@ fn net_read(running: bool, started: u64) -> crate::PkgProgressSnapshot {
             pid: running.then_some(7),
             pass: "net".to_string(),
             started_unix: started,
+            generation: None,
             heartbeat_unix: started,
             overall: atpkg::progress::Overall {
                 programs_done: 3,
@@ -2053,7 +2212,7 @@ fn a_routine_pass_raises_no_row_and_records_every_outcome() {
             "ok",
         ),
         (
-            "Claude Code 2.1.280 and Codex 0.156.0 are current",
+            "Claude Code 2.1.280 and Codex CLI 0.156.0 are current",
             "ready in every aterm tab",
             "ok",
         ),
@@ -2330,6 +2489,143 @@ fn empty_read(running: bool) -> crate::PkgProgressSnapshot {
         read.file.ended_unix = Some(1);
     }
     read
+}
+
+/// TC-5 — THE FIRST RUN'S ROW AT LAUNCH, NOT AT THE UPDATE'S ANNOUNCEMENT. The
+/// lane opens it ahead of its seed, unsized; the seed's exit — a retried seed's
+/// too — leaves it up; the update's announcement restates the SAME row with the
+/// size, its reads paint it, and its exit is the one fold: one open, one fold,
+/// whatever ran in between. An update that exits unclean without announcing
+/// folds it as the Fault it was; one that exits clean without announcing
+/// installed nothing, so the row is withdrawn with no Complete claimed.
+#[test]
+fn the_first_run_row_opens_ahead_of_the_seed_and_the_update_takes_it_over() {
+    let regrids = message_regrids();
+    let mut app = App::headless_for_test();
+    assert!(app.open_first_run_ahead(), "a row goes up");
+    let row = app
+        .messages
+        .live_by_key(toolchain_words::KEY_PASS)
+        .map(|l| (l.id, l.msg.title.clone()))
+        .expect("the row opens at once");
+    assert_eq!(row.1, "Installing ALab tools");
+    let row = row.0;
+    app.toolchain_pass_ended(true);
+    assert!(
+        app.messages.live(row).is_some(),
+        "the seed's exit carries it"
+    );
+    app.announce_toolchain_pass(
+        "installing 10 ALab program(s) over the network (about 3 GB on disk when finished)",
+        true,
+    );
+    let live: Vec<_> = app.messages.live_rows().map(|l| l.id).collect();
+    assert_eq!(live, vec![row], "the announcement restates it in place");
+    let stats = app
+        .messages
+        .live(row)
+        .and_then(|l| l.msg.meter.as_ref().map(|m| m.stats.clone()));
+    assert_eq!(stats.as_deref(), Some("10 programs \u{00b7} ~3 GB"));
+    app.apply_toolchain_snapshot(Some(&net_read(true, 1_700_000_000)), true);
+    assert_eq!(
+        app.messages.live_rows().map(|l| l.id).collect::<Vec<_>>(),
+        vec![row]
+    );
+    app.toolchain_pass_ended(true);
+    assert_eq!(
+        app.messages.echoes().first().map(|e| e.kind),
+        Some(EchoKind::Complete),
+        "the announced update's clean exit is its Complete"
+    );
+    app.settle_messages(Instant::now() + quiet_past_echoes());
+    assert_eq!(
+        app.messages.live_rows().count(),
+        0,
+        "the update's exit folds it"
+    );
+    assert_eq!(message_regrids(), regrids + 2, "one open, one fold");
+
+    // A retried seed is carried too; an unclean update with nothing announced folds it.
+    let regrids = message_regrids();
+    let mut app = App::headless_for_test();
+    assert!(app.open_first_run_ahead());
+    app.toolchain_pass_ended(true);
+    assert!(
+        !app.open_first_run_ahead(),
+        "a retried seed only carries the row it already holds"
+    );
+    app.toolchain_pass_ended(true);
+    assert_eq!(app.messages.live_rows().count(), 1, "still the one row");
+    app.toolchain_pass_ended(false);
+    assert_eq!(
+        app.messages.echoes().first().map(|e| e.kind),
+        Some(EchoKind::Fault),
+        "it ends as the update exited"
+    );
+    app.settle_messages(Instant::now() + quiet_past_echoes());
+    assert_eq!(app.messages.live_rows().count(), 0);
+    assert_eq!(message_regrids(), regrids + 2, "one open, one fold");
+
+    // A clean update that never announced installed nothing over the wire (an
+    // architecture no build serves): no Complete for an install that did not happen.
+    let mut app = App::headless_for_test();
+    assert!(app.open_first_run_ahead());
+    let row = app
+        .messages
+        .live_by_key(toolchain_words::KEY_PASS)
+        .map(|l| l.id)
+        .expect("the row");
+    app.toolchain_pass_ended(true);
+    app.toolchain_pass_ended(true);
+    assert!(app.messages.live(row).is_none(), "the row is gone");
+    assert!(
+        app.messages
+            .echoes()
+            .iter()
+            .all(|e| e.kind != EchoKind::Complete),
+        "{:?}",
+        app.messages.echoes()
+    );
+    assert_eq!(
+        app.messages.log().get(row).unwrap().state,
+        LogState::Retired(Retired::Withdrawn)
+    );
+}
+
+/// …and where no update follows the seed (the lane parks, or Automatic updates
+/// went off), the lane withdraws the row: no outcome claimed, nothing left on
+/// glass, and a later child's exit has nothing of it to fold. A withdrawal after
+/// an announcement took the row over leaves that child its row.
+#[test]
+fn a_first_run_row_no_update_takes_over_is_withdrawn() {
+    let mut app = App::headless_for_test();
+    app.open_first_run_ahead();
+    let row = app
+        .messages
+        .live_by_key(toolchain_words::KEY_PASS)
+        .map(|l| l.id)
+        .expect("the row");
+    app.toolchain_pass_ended(true);
+    app.withdraw_first_run_ahead();
+    assert!(app.messages.live(row).is_none());
+    assert_eq!(
+        app.messages.log().get(row).unwrap().state,
+        LogState::Retired(Retired::Withdrawn)
+    );
+    assert!(appstatus(&app).is_empty(), "{:?}", appstatus(&app));
+    app.toolchain_pass_ended(true);
+    assert_eq!(app.messages.live_rows().count(), 0);
+
+    let mut app = App::headless_for_test();
+    app.open_first_run_ahead();
+    app.toolchain_pass_ended(true);
+    app.announce_toolchain_pass("installing 10 ALab program(s) (about 3 GB)", true);
+    app.withdraw_first_run_ahead();
+    assert_eq!(
+        app.messages.live_rows().count(),
+        1,
+        "the announcing child's row"
+    );
 }
 
 /// THE FIRST-RUN ANNOUNCEMENT OPENS THE ROW BEFORE ANY SNAPSHOT (upstream
@@ -7221,7 +7517,7 @@ fn an_unchanged_managed_current_is_recorded_once_and_news_again() {
         repaint: false,
         fg_holder: 0,
         history: crate::handoff_history::AdoptedHistory::default(),
-        hold: None,
+        holds: Vec::new(),
         title: String::new(),
         supervisor: None,
         attention_owners: Vec::new(),
@@ -7231,6 +7527,7 @@ fn an_unchanged_managed_current_is_recorded_once_and_news_again() {
         render_debt: None,
         fabric: Default::default(),
         timeline_id: 0,
+        log_carry: None,
         journal_key: None,
     }];
     assert!(
@@ -7640,6 +7937,7 @@ fn r44_review_a_reload_whose_font_work_admits_the_family_closes_its_rejection() 
                     chrome: crate::tray_raster::prepare_chrome_fonts(None, None, None),
                 }),
                 warnings,
+                font_refusals: Vec::new(),
                 config,
             },
         );

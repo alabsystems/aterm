@@ -86,14 +86,14 @@ pub fn baseline_in_row_q(row_top_q: i64, row_h_q: i64, cap_h_q: i64) -> i64 {
 }
 
 /// Cap height of face `index` inside `bytes`, as a RATIO of the em size:
-/// OS/2 `sCapHeight` (via ttf-parser) over `units_per_em` when the table
+/// OS/2 `sCapHeight` (via aterm-font) over `units_per_em` when the table
 /// carries it, else the measured height of an actual `'H'` (rasterized at a
 /// reference size by the caller-supplied face). Falls back to `0.7`
 /// (the Latin norm) only when both probes fail, so the centring rule is always
 /// defined.
 #[must_use]
 pub fn cap_height_ratio(bytes: &[u8], index: u32, font: &crate::font::Font) -> f32 {
-    if let Ok(face) = ttf_parser::Face::parse(bytes, index)
+    if let Ok(face) = aterm_font::Face::parse(bytes, index)
         && let Some(cap) = face.capital_height()
         && cap > 0
     {

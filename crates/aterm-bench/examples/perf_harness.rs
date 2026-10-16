@@ -1,16 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// Wall-clock throughput harness for the `xtask perf` baseline: feeds a
+// Wall-clock throughput harness for the `verify perf` baseline: feeds a
 // deterministic, representative VT workload through `Terminal::process` and
 // prints a median-of-N throughput in MB/s as one JSON line. A release binary
-// so timing reflects the shipped build; the gate owns compare/threshold/record.
+// so timing reflects the shipped build; `verify perf` owns compare/threshold/record.
 //
 //   targo --unverified run --release -q -p aterm-bench --example perf_harness
 //   -> {"median_mbps":3142.0,"min_mbps":...,"max_mbps":...,"workload_bytes":...,"n":...,"warmup":...}
 //
 // The workload knobs (WORKLOAD_BYTES, N_ITERS, WARMUP) are echoed in the JSON,
-// which the gate records in tools/golden/perf-baseline.json.
+// which the `throughput` lane of `verify perf` records in
+// crates/aterm-verify/perf/golden/perf-baseline.json.
 
 use std::time::Instant;
 

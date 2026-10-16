@@ -1915,3 +1915,45 @@ fn a_question_whose_footer_wraps_is_read_whole() {
         assert_eq!(parse_prompt_v2(&rows), None, "{rows:#?}");
     }
 }
+
+/// ATERM-KI-1015-1 F2, the reader's half (the harness sweep of 2026-10-15,
+/// Claude Code 2.1.300 at 50 columns): the long-term policy text typed into a
+/// multi-select question's free-text row, which ticks itself, is drawn `4.
+/// [✔]Decide yourself: …` — no space after the box — with its rows at column
+/// 8, not 9. Read only as `[✔] `, the row was no option, the dialog unknown,
+/// and the question the harness had answered was escalated as one aterm
+/// "could not read whole". Read with the vendor's spacing, it is the text the
+/// harness typed, ticked, with the focus on `Submit`.
+#[test]
+fn a_ticked_free_text_row_drawn_without_a_space_is_read_whole() {
+    let (_, p, d) = read(QUESTION_MULTI_TYPED_50_2_1_300);
+    assert_eq!(p.kind, PromptKind::Question);
+    let QuestionForm::Multi {
+        options, free_text, ..
+    } = &d.form
+    else {
+        panic!("not read whole: {:?}", d.form);
+    };
+    let labels: Vec<(&str, Option<bool>)> = options
+        .iter()
+        .map(|o| (o.label.as_str(), o.checked))
+        .collect();
+    assert_eq!(
+        labels,
+        [
+            ("Unit tests (Recommended)", Some(false)),
+            ("Lint", Some(false)),
+            ("Fuzz", Some(false))
+        ]
+    );
+    assert_eq!(free_text.checked, Some(true));
+    assert!(!free_text.pristine);
+    assert_eq!(
+        free_text.text,
+        "Decide yourself: choose the option that best serves long term correctness and \
+         total value even at the cost of short term deliverables. Say which you chose and \
+         why in one line and continue without asking again. (Answered by the aterm harness \
+         by policy. The user was not asked.)"
+    );
+    assert_eq!(d.focus(), QuestionFocus::Button);
+}

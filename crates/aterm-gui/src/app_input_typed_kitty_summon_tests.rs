@@ -571,9 +571,6 @@ fn ime_and_external_local_boundaries_retire_older_candidates_before_consumers() 
     assert_boundary_dark(App::headless_for_test(), |app, wid| {
         app.on_ime_commit(wid, String::new());
     });
-    assert_boundary_dark(App::headless_for_test(), |app, wid| {
-        app.on_modifiers_changed(wid, winit::keyboard::ModifiersState::SHIFT);
-    });
 
     let mut search = App::headless_for_test();
     search.search_enter();

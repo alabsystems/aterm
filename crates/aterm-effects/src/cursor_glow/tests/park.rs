@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The park: Ink's rewrite observed as two sync brackets.
+//! The park: Ink's rewrite observed as two sync brackets ~40 ms apart, the
+//! caret parked at the start of the input, then the row rewritten to its end
+//! plus the new glyph.
 
 use super::*;
 
@@ -139,7 +141,7 @@ fn an_ink_park_after_a_stall_is_held_on_the_in_flight_pool_and_its_return_sweeps
     assert_eq!(glow.in_flight_tally().park_returns, 1);
     assert_eq!(bridged(&glow), 0);
 
-    // CONTROL: the same park over an empty pool is refused at once.
+    // Control: the same park over an empty pool is refused at once.
     let mut empty = CursorGlow::default();
     let pre = pre_roll(&mut empty, 11, t0, &c, g);
     empty.tick(
@@ -239,8 +241,7 @@ fn a_park_with_no_return_flushes_as_todays_verdict() {
 /// a same-row backward `Typed` move with no erase. The host admits a re-anchor
 /// only past two cells (`classify_move`'s `raw_dist > 2`), and the ribbon's
 /// `ribbon::RE_ANCHOR_MIN_CELLS` matches, so no cell is retracted and the mirror
-/// sits at the landing; the three-cell control re-anchors. Pinned at unit level
-/// only.
+/// sits at the landing; the three-cell control re-anchors.
 #[test]
 fn a_one_cell_park_flushed_as_typing_drains_no_cell_of_the_band() {
     let g = wide_geom();
@@ -272,7 +273,7 @@ fn a_one_cell_park_flushed_as_typing_drains_no_cell_of_the_band() {
         glow.tick(Some((11, landing)), park_at, &c, g, &mut out);
         assert!(glow.held_park.is_some(), "{back} back: held");
         assert!(leaving(&glow).is_empty(), "{back} back: nothing while held");
-        // Silence past the window: the flush, today's verdict.
+        // Silence past the window: the flush.
         let quiet = park_at + past_park_window();
         glow.tick(Some((11, landing)), quiet, &c, g, &mut out);
         assert_eq!(glow.in_flight_tally().park_flushed, 1, "{back} back");
@@ -601,12 +602,8 @@ fn pre_roll_anchored(
 /// show) can be sampled mid-bracket: the caret hidden and the print anchor
 /// advanced from the park's origin to the row's new end. The anchored lane
 /// recognises that return on the visible lane's terms and judges
-/// `origin -> end` on the key's own stamp.
-///
-/// Three shapes: the hidden frame with the print in; the hidden frame without
-/// it (the hidden-boundary control); the whole bracket seen at once on the
-/// visible lane (control). Each ends with every typed cell lit, the prompt cell
-/// dark, the mirror at the row's end, nothing flushed or forgotten.
+/// `origin -> end` on the key's own stamp. Shapes: the hidden frame with and
+/// without the print in, and the whole bracket on the visible lane (control).
 #[test]
 fn a_held_parks_return_is_recognised_on_the_anchored_lane() {
     let g = wide_geom();
@@ -749,13 +746,9 @@ fn a_park_returning_to_its_own_origin_is_not_a_re_anchor() {
 /// A park flushed after its window sweeps no prompt cell. Under a stall Ink's
 /// rewrite can come after the 0.25 s park window, so the park flushes as a typed
 /// re-anchor; its landing sweep (`re_anchor_lays_landing`, for the box-growth
-/// wrap whose landing is the wrapped glyph) runs only if a glyph sat at the
-/// landing cell when the park was held (the host's row probe). An Ink park to
-/// the input's start leaves the prompt cell dark. The verdict is unchanged:
-/// credit spent, stamp popped, ring row written, the late return refused.
-///
-/// The row probe is fed before every tick as `app_render` feeds it. Control: a
-/// park onto a program glyph (`ab` printed left of the typing) still sweeps it.
+/// wrap whose landing is the wrapped glyph) runs only if the row probe showed a
+/// glyph at the landing cell when the park was held. Control: a park onto a
+/// program glyph (`ab` printed left of the typing) still sweeps it.
 #[test]
 fn a_park_flushed_after_its_window_lights_no_blank_landing() {
     let g = wide_geom();
@@ -887,7 +880,7 @@ fn an_insert_echoed_through_an_ink_park_is_laid() {
         0,
         "the surplus cell paid by the press"
     );
-    // CONTROL: held on the insert alone, no return — flushed at its own
+    // Control: held on the insert alone, no return — flushed at its own
     // clock and refused like an unheld keyless park.
     let mut glow = CursorGlow::default();
     three_visible_echoes(&mut glow, t0, &mut out);

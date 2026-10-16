@@ -194,11 +194,9 @@ struct PasteWatch {
     completed_sent: u64,
     completed_total: u64,
     completed_failed: bool,
-    /// A paste of the burst ended Stopped short of its size (ruling 441
-    /// (v)). Inside a watch only a discard (`signal term|kill|hup|quit`,
-    /// `reset flush`) or a sever does that, since `Stop paste` removes the
-    /// watch before it stops the meters, and the rest of that paste was
-    /// dropped, not delivered.
+    /// A paste of the burst ended Stopped short of its size: the rest was dropped, not
+    /// delivered. Inside a watch only a discard (`signal term|kill|hup|quit`,
+    /// `reset flush`) or a sever does that; `Stop paste` removes the watch first.
     completed_short: bool,
     started: Instant,
     wait: SessionWait,
@@ -332,12 +330,10 @@ impl App {
         true
     }
 
-    /// A paste that stopped short (`Stop paste`, or a discard that dropped
-    /// its rest, ruling 441 (v)) says how much went (ruling 231). One entry
-    /// per paste: the row on the band becomes the `Paste stopped` record (it
-    /// fades, as a stop claims nothing), never a withdrawn `Pasting 4.2 MB`
-    /// beside a second record. A paste stopped before its row was posted is
-    /// written down alone.
+    /// A paste that stopped short (`Stop paste`, or a discard that dropped its rest) says
+    /// how much went, as one entry: the band's row becomes the `Paste stopped` record (it
+    /// fades; a stop claims nothing) rather than a withdrawn `Pasting 4.2 MB` beside a
+    /// second record. A paste stopped before its row was posted is recorded alone.
     fn record_paste_stopped(&mut self, row: Option<MessageId>, sent: u64, total: u64) {
         let detail = [format!(
             "{} of {} sent; the rest was not",
@@ -448,9 +444,8 @@ impl App {
             let sink = watch.sink.upgrade();
             let settled = watch.meters.is_empty();
             let failed = watch.completed_failed;
-            // Delivered only when every byte went (ruling 441 (v)): a paste
-            // whose rest a discard dropped ended Stopped short, and its record
-            // says how much went, never `Pasted N MB` under ✓.
+            // Done only when every byte went: a paste whose rest a discard dropped ends
+            // Stopped, and its record says how much went.
             let end = match sink {
                 None => Some(WaitEnd::Gone),
                 _ if !alive || failed => Some(WaitEnd::Gone),
@@ -613,9 +608,8 @@ mod tests {
         assert_eq!(app.messages.live_rows().count(), 0);
     }
 
-    /// A rewrap job ends on every exit: finished, it ends as it says; unwound
-    /// past the rewrap's own guard or never taken by any thread, its hold ends
-    /// the gauge `Failed`, never left running.
+    /// A rewrap job ends on every exit: finished as it says, or `Failed` when unwound or
+    /// never taken by a thread.
     #[test]
     fn a_rewrap_job_ends_on_every_exit() {
         use aterm_messages::WaitEnd;
@@ -681,12 +675,9 @@ mod tests {
         assert!(app.messages.echoes().is_empty(), "no echo");
     }
 
-    /// A large paste into a program that is not reading is watched; its row is
-    /// progress with the one `Stop paste` capsule, posted within the grace from
-    /// the paste's start and filled by the bytes the program has taken. `Stop
-    /// paste` fades the row, drops the unsent middle, closes the bracketed
-    /// paste, and the key typed after the paste (queued behind it) arrives
-    /// next.
+    /// A large paste into a stalled program posts a progress row with `Stop paste`, filled
+    /// by the bytes taken; `Stop paste` fades it, drops the unsent rest, closes the
+    /// bracket, and the key typed after the paste arrives next.
     #[test]
     fn a_large_paste_takes_its_row_and_stop_drops_only_its_rest() {
         let (mut app, sink, mut reader) = app_with_reader();
@@ -694,9 +685,8 @@ mod tests {
         paste(&mut app, body);
         app.input(WindowId(0), InputEvent::Text("K".into()), Source::Human);
         assert_eq!(app.session_waits.pastes.len(), 1, "watched");
-        // Date the first sample from the paste's own `started`, not from the
-        // clock after it, so a stalled test thread cannot eat the grace: a
-        // quarter of the grace after `started` leaves exactly three quarters.
+        // Date the first sample from the paste's own `started` so a stalled test thread
+        // cannot eat the grace.
         let started = app.session_waits.pastes[&0].started;
         let t0 = started + PROGRESS_GRACE / 4;
         assert!(
@@ -838,10 +828,8 @@ mod tests {
         );
     }
 
-    /// A width change's rewrap nobody scrolls back into takes no row and arms
-    /// nothing; a scroll toward history while it runs posts `Rewrapping
-    /// scrollback` after the grace, restated with the lines done, and the
-    /// re-attach ends it Complete.
+    /// A rewrap nobody reaches for takes no row; a scroll up into history while it runs
+    /// posts `Rewrapping N lines` after the grace, restated as lines go, ended Complete.
     #[test]
     fn a_rewrap_takes_a_row_only_when_the_person_reaches_for_history() {
         let (mut app, _sink, _reader) = app_with_reader();
@@ -915,10 +903,8 @@ mod tests {
         assert_eq!(echo.msg.finished_title(), REWRAPPED);
     }
 
-    /// A search while the history is detached is a floor (`truncated` on the
-    /// wire); the bar and the title say `none yet, history rewrapping` (never
-    /// `no matches`); the searcher is waiting on the rewrap, so its row is
-    /// posted; and at the re-attach the search runs again by itself.
+    /// A search while the history is detached is a floor (`none yet, history rewrapping`,
+    /// never `no matches`), posts the rewrap's row, and runs again at the re-attach.
     #[test]
     fn a_search_during_a_rewrap_says_partial_history_and_runs_again() {
         let (mut app, _sink, _reader) = app_with_reader();
@@ -971,10 +957,8 @@ mod tests {
         assert_eq!(plain.messages.live_rows().count(), 0);
     }
 
-    /// A torn rerun stops saying `rewrapping`: under streaming output both
-    /// full-history passes of the re-attach rerun can come back inconsistent.
-    /// The stale result is kept (dirty, still a floor), but the history is
-    /// home, so the bar and the title stop saying it is away.
+    /// A torn rerun after the re-attach keeps its stale floor but stops saying the history
+    /// is away.
     #[test]
     fn a_torn_rerun_after_the_rewrap_does_not_keep_saying_rewrapping() {
         let (mut app, _sink, _reader) = app_with_reader();
@@ -1009,10 +993,9 @@ mod tests {
         );
     }
 
-    /// A notch glide in flight when a width change detaches the history does
-    /// not compound into the aim: the resize lands the glide first, so the
-    /// detach restores the place it was going to, and a glide that meets an
-    /// unforeseen detach (a `ctl resize` off the loop) settles once.
+    /// A notch glide across a width change's detach lands on its target, not the sum of its
+    /// ticks: the loop's resize lands the glide first, and one that meets an off-loop detach
+    /// settles once.
     #[test]
     fn a_glide_across_a_rewrap_lands_on_its_target_not_the_sum_of_its_ticks() {
         let (mut app, _sink, _reader) = app_with_reader();
@@ -1175,8 +1158,8 @@ mod tests {
             assert!(!watch.completed_failed);
         }
 
-        // Joining a later paste uses the same compaction path. Its predecessor's
-        // failure must survive releasing that meter and still end the wait.
+        // Joining a later paste compacts too; a released predecessor's failure still ends
+        // the wait.
         let failed = Arc::new(BulkMeter::new());
         app.watch_paste(0, &sink, failed.clone(), 200, now);
         failed.settle_unmetered(false);
@@ -1198,11 +1181,9 @@ mod tests {
         assert_eq!(Arc::strong_count(&later), 1);
     }
 
-    /// `WaitEnd::Done` is delivery: every byte went (ruling 441 (v)). A paste
-    /// whose rest a discard dropped (`signal term`, `reset flush`: its meter
-    /// ends `Stopped` short of its size, as `BulkMeter::abandon` leaves it)
-    /// ends no Complete echo and no `Pasted 1.0 MB` under ✓; its record says
-    /// how much went (ruling 231).
+    /// `WaitEnd::Done` is delivery: every byte went. A paste whose rest a discard dropped
+    /// (its meter ends `Stopped` short, as `BulkMeter::abandon` leaves it) ends with no
+    /// Complete echo and no `Pasted 1.0 MB` under ✓; its record says how much went.
     #[test]
     fn a_paste_whose_rest_a_discard_dropped_claims_no_delivery() {
         use aterm_session::sink::BulkMeter;
@@ -1288,10 +1269,8 @@ mod tests {
         app.sample_session_waits(Instant::now() + WAIT_SAMPLE_IDLE);
     }
 
-    /// A wheel up while the history is away moves nothing (there is nothing
-    /// above to show), but the view lands where it was asked at the re-attach,
-    /// with no second scroll or unasked jump. A keystroke in between returns
-    /// the person to the prompt, and the re-attach leaves them there.
+    /// A wheel up while the history is away moves nothing, but the re-attach lands the view
+    /// where it asked; a keystroke in between brings the person back to the prompt.
     #[test]
     fn a_scroll_up_during_a_rewrap_lands_where_it_asked_at_the_reattach() {
         use aterm_types::mouse::WheelDir;

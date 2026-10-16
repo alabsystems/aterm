@@ -42,10 +42,12 @@ fn captured(position: Option<(i32, i32)>, cwd: Option<&str>, title: &str) -> Res
                 role: None,
                 attention: None,
                 questions: None,
+                autopilot: None,
                 identity: None,
                 agent: None,
                 supervised: None,
                 held: false,
+                holds: Vec::new(),
             })),
             focused_path: Vec::new(),
             zoomed: false,
@@ -171,10 +173,12 @@ fn a_real_topology_change_still_rejects_the_commit() {
             role: None,
             attention: None,
             questions: None,
+            autopilot: None,
             identity: None,
             agent: None,
             supervised: None,
             held: false,
+            holds: Vec::new(),
         }));
     assert_ne!(
         commit_layout_topology(&committed),
@@ -276,13 +280,9 @@ fn every_user_metadata_field_is_compared_and_rides_the_sidecar() {
     );
 }
 
-/// ROUND EIGHT OF THE UPDATE AUDIT, D5 (and the lead U33): THE PARK
-/// REFUSES, TYPED, A LAYOUT NO BUILD READS WHOLE. What the handoff
-/// capture's fold cannot bring within the caps failed the worker's round
-/// trip on every attempt, filed as the worker's own transient trouble, so
-/// every retry froze every tab again; now the park says it as a fact about
-/// the desk (`CaptureRefused`, retried once the desk changes). A layout
-/// within the caps is committed exactly as before: the same digest.
+/// A layout the capture's fold cannot bring within the caps is refused at the park as a fact
+/// about the desk (`CaptureRefusal`, retried once the desk changes), not as worker trouble. A
+/// layout within the caps commits to its usual digest.
 #[test]
 fn the_park_refuses_a_layout_past_the_caps_as_a_fact_about_the_desk() {
     use super::{CaptureRefusal, commit_handoff_layout};
@@ -293,8 +293,7 @@ fn the_park_refuses_a_layout_past_the_caps_as_a_fact_about_the_desk() {
         "within the caps: the digest the park always committed to"
     );
 
-    // Past the window cap, unfolded (what the capture wrote before D5):
-    // the worker's round trip would read 64 of the 65 windows back.
+    // Past the window cap, unfolded: the worker's round trip reads 64 of the 65 windows back.
     let one_window = captured(None, Some("/work"), "zsh").windows.remove(0);
     let past = RestoreManifest::new(vec![one_window; crate::restore::MAX_WINDOWS + 1]);
     let wire = past.to_toml().expect("serializes");

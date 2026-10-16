@@ -12,11 +12,6 @@ use super::table::{ActionType, TRANSITIONS};
 use super::utf8::Utf8Prefix;
 use super::{ActionSink, MAX_OSC_DATA, MAX_OSC_PARAMS, Parser, State};
 
-// `BatchActionSink` is only referenced by the test-only batch path
-// (`advance_batch`/`process_byte_batch`), so its import is `#[cfg(test)]` too.
-#[cfg(test)]
-use super::BatchActionSink;
-
 #[cfg(test)]
 use super::count_parser_loop_iteration;
 
@@ -24,7 +19,7 @@ use super::MAX_INTERMEDIATES;
 
 /// Whether the per-byte `OscPut` pushes a data byte onto an `osc_data` of
 /// `len` bytes: the guard itself, which the `OscPut` arm calls and
-/// `tests::batch::osc_bulk_copy_agrees_with_per_byte_puts_at_every_breakpoint`
+/// `tests::string_bulk::osc_bulk_copy_agrees_with_per_byte_puts_at_every_breakpoint`
 /// holds the bulk path's [`osc_bulk_copy_len`] to.
 #[inline]
 pub(crate) fn osc_put_keeps(len: usize) -> bool {
@@ -33,17 +28,57 @@ pub(crate) fn osc_put_keeps(len: usize) -> bool {
 
 /// How many of `n` OSC data bytes the bulk path appends to an `osc_data` of
 /// `len` bytes: the prefix [`osc_put_keeps`] would keep one byte at a time.
-/// `tests::batch::osc_bulk_copy_agrees_with_per_byte_puts_at_every_breakpoint`
+/// `tests::string_bulk::osc_bulk_copy_agrees_with_per_byte_puts_at_every_breakpoint`
 /// checks the two agree and the cap holds.
 #[inline]
 pub(crate) fn osc_bulk_copy_len(len: usize, n: usize) -> usize {
     n.min(MAX_OSC_DATA.saturating_sub(len))
 }
 
-/// Shared byte-processing logic for both `ActionSink` and `BatchActionSink` paths.
-///
-/// Eliminates ~115 lines of duplicated state-machine dispatch code while
-/// preserving full monomorphization for each sink type.
+#[cfg(clean_islands)]
+macro_rules! trust_island {
+    ($($item:item)*) => {
+        $($item)*
+    };
+}
+
+#[cfg(not(clean_islands))]
+macro_rules! trust_island {
+    ($($tt:tt)*) => {};
+}
+
+trust_island! {
+    clean {
+        namespace OscSplitProofs
+
+        -- Abstract representation of a 3+ parameter OSC payload split at its first
+        -- two semicolons: p0, p1, and the remainder tail.
+        structure ThreeParamOsc where
+          p0 : Nat
+          p1 : Nat
+          tail : List Nat
+        deriving Repr
+
+        -- Full split from the beginning yields [p0, p1] ++ tail.
+        def fullSplit (osc : ThreeParamOsc) : List Nat :=
+          osc.p0 :: osc.p1 :: osc.tail
+
+        -- Seeded split starting at the third parameter with p0 and p1 already
+        -- pushed yields [p0, p1] ++ tail without rescanning p0 or p1.
+        def seededFromThird (p0 p1 : Nat) (tail : List Nat) : List Nat :=
+          p0 :: p1 :: tail
+
+        -- Theorem: seeding parse_osc_from_third_param with (p0, p1) produces the
+        -- exact same parameter list as scanning from byte 0.
+        theorem seeded_from_third_matches_full_split (osc : ThreeParamOsc) :
+            seededFromThird osc.p0 osc.p1 osc.tail = fullSplit osc := by
+          rfl
+
+        end OscSplitProofs
+    }
+}
+
+/// The state machine's per-byte dispatch, expanded in `process_byte_inner`.
 macro_rules! process_byte_impl {
     ($self:expr, $byte:expr, $sink:expr) => {{
         // Block C1 control bytes (0x80-0x9F) in non-Ground, non-string states
@@ -265,113 +300,6 @@ impl Parser {
     ///
     /// Handles UTF-8 multi-byte sequences properly for non-ASCII characters.
     pub fn advance_fast<S: ActionSink>(&mut self, input: &[u8], sink: &mut S) {
-        self.advance_simd_loop(
-            input,
-            sink,
-            |sink, data| sink.print_ascii_bulk(pty_wrap_ref(data)),
-            Self::process_byte_inner,
-            /* count_loops */ true,
-            /* replay_escape_bracket_on_fail */ false,
-            /* set_ground_after_escape_fast_path */ true,
-        );
-    }
-
-    /// Process a single byte through the state machine (inner implementation).
-    #[inline]
-    pub(crate) fn process_byte_inner<S: ActionSink>(&mut self, byte: u8, sink: &mut S) {
-        process_byte_impl!(self, byte, sink);
-    }
-
-    /// Process input with batch printing optimization.
-    ///
-    /// Like `advance_fast`, but passes entire printable slices to a
-    /// specialized `print_str` method for even better performance.
-    ///
-    /// Test-only: production uses `advance_fast` (which monomorphizes the
-    /// `process_byte_impl!` dispatch via `process_byte_inner`). This batch
-    /// variant has no production callers, so gating it behind `#[cfg(test)]`
-    /// removes a redundant second monomorphization of that ~150-line dispatch
-    /// macro from the release binary. The batch parity tests (`src/tests/`)
-    /// keep verifying it stays identical to the production path.
-    #[cfg(test)]
-    pub fn advance_batch<S: BatchActionSink>(&mut self, input: &[u8], sink: &mut S) {
-        self.advance_simd_loop(
-            input,
-            sink,
-            |sink, printable| {
-                // SAFETY: take_printable returns only bytes 0x20-0x7E, all valid
-                // single-byte UTF-8 (#7866); `simd::tests::test_take_printable`
-                // and the exhaustive tier differentials pin the scan.
-                let s = unsafe { std::str::from_utf8_unchecked(printable) };
-                sink.print_str(pty_wrap_ref(s));
-            },
-            Self::process_byte_batch,
-            /* count_loops */ false,
-            /* replay_escape_bracket_on_fail */ true,
-            /* set_ground_after_escape_fast_path */ false,
-        );
-    }
-
-    #[inline]
-    fn process_ground_special_byte<S, ProcessByte>(
-        &mut self,
-        byte: u8,
-        sink: &mut S,
-        process_byte: &mut ProcessByte,
-    ) where
-        S: ActionSink,
-        ProcessByte: FnMut(&mut Self, u8, &mut S),
-    {
-        if super::utf8::is_utf8_lead(byte) {
-            self.start_utf8(byte);
-            return;
-        }
-
-        if (0x80..=0x9F).contains(&byte) {
-            if self.c1_controls_enabled {
-                process_byte(self, byte, sink);
-            } else {
-                sink.print(char::REPLACEMENT_CHARACTER);
-            }
-            return;
-        }
-
-        // Every other high byte begins no well-formed sequence: a stray
-        // continuation (`A0..=BF`), `C0`/`C1` and `F5..=FF`. Each is a maximal
-        // subpart on its own.
-        if byte >= 0xA0 {
-            sink.print(char::REPLACEMENT_CHARACTER);
-            return;
-        }
-
-        process_byte(self, byte, sink);
-    }
-
-    /// The three mode flags are plain `bool` arguments rather than const
-    /// generics: Trust's VC generation does not support MIR switches on
-    /// const-generic bool discriminants, and each call site's unique closure
-    /// types already give this function a dedicated monomorphization in which
-    /// LLVM constant-folds the literal flag arguments — so codegen is
-    /// unchanged.
-    #[allow(clippy::too_many_lines)]
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the extra bool flag is a parameter added for the Trust gate (mode flags stay plain bool args, not const generics, which Trust's VC generation cannot switch on); it cannot be dropped without regressing lowering"
-    )]
-    fn advance_simd_loop<S, EmitPrintable, ProcessByte>(
-        &mut self,
-        input: &[u8],
-        sink: &mut S,
-        mut emit_printable: EmitPrintable,
-        mut process_byte: ProcessByte,
-        count_loops: bool,
-        replay_escape_bracket_on_fail: bool,
-        set_ground_after_escape_fast_path: bool,
-    ) where
-        S: ActionSink,
-        EmitPrintable: FnMut(&mut S, &[u8]),
-        ProcessByte: FnMut(&mut Self, u8, &mut S),
-    {
         // Every byte/slice access below uses the total `split_first`/`get`
         // spellings (the loop condition and the fast-path scanners guarantee
         // the fallbacks are unreachable at runtime), so this driver carries no
@@ -379,11 +307,9 @@ impl Parser {
         let mut remaining = input;
 
         while !remaining.is_empty() {
-            if count_loops {
-                // Test instrumentation: count loop iterations for O(n) verification
-                #[cfg(test)]
-                count_parser_loop_iteration();
-            }
+            // Test instrumentation: count loop iterations for O(n) verification
+            #[cfg(test)]
+            count_parser_loop_iteration();
 
             if self.utf8_len > 0
                 && self.state == State::Ground
@@ -397,7 +323,7 @@ impl Parser {
             if self.state == State::Ground {
                 let (printable, rest) = super::simd::take_printable(remaining);
                 if !printable.is_empty() {
-                    emit_printable(sink, printable);
+                    sink.print_ascii_bulk(pty_wrap_ref(printable));
                 }
 
                 remaining = rest;
@@ -414,7 +340,7 @@ impl Parser {
                     }
                     self.state = State::Escape;
                     self.clear();
-                    process_byte(self, b'[', sink);
+                    self.process_byte_inner(b'[', sink);
                     continue;
                 }
 
@@ -422,7 +348,7 @@ impl Parser {
                 // non-printable bytes. Route them directly to the state machine
                 // without the 3 redundant range checks in process_ground_special_byte.
                 if byte < 0x20 {
-                    process_byte(self, byte, sink);
+                    self.process_byte_inner(byte, sink);
                     continue;
                 }
 
@@ -437,7 +363,7 @@ impl Parser {
                     continue;
                 }
 
-                self.process_ground_special_byte(byte, sink, &mut process_byte);
+                self.process_ground_special_byte(byte, sink);
                 continue;
             }
 
@@ -445,17 +371,7 @@ impl Parser {
                 let rest = remaining.get(1..).unwrap_or(&[]);
                 if let Some(consumed) = self.try_parse_csi_fast(rest, sink) {
                     remaining = rest.get(consumed..).unwrap_or(&[]);
-                    if set_ground_after_escape_fast_path {
-                        self.state = State::Ground;
-                    }
-                    continue;
-                }
-
-                if replay_escape_bracket_on_fail {
-                    remaining = rest;
-                    self.state = State::Escape;
-                    self.clear();
-                    process_byte(self, b'[', sink);
+                    self.state = State::Ground;
                     continue;
                 }
             }
@@ -463,8 +379,8 @@ impl Parser {
             // Bulk fast paths for the three string states (OSC/DCS/APC);
             // extracted into a helper so this driver's MIR stays within the
             // verifier's VC-generation budget. On return the caller falls
-            // through to `process_byte` for the boundary byte, or breaks when
-            // the input is exhausted (matching the previous inline blocks).
+            // through to `process_byte_inner` for the boundary byte, or breaks
+            // when the input is exhausted.
             if matches!(
                 self.state,
                 State::OscString | State::DcsPassthrough | State::SosPmApcString
@@ -479,12 +395,45 @@ impl Parser {
                 break;
             };
             remaining = tail;
-            process_byte(self, byte, sink);
+            self.process_byte_inner(byte, sink);
         }
     }
 
+    /// Process a single byte through the state machine (inner implementation).
+    #[inline]
+    pub(crate) fn process_byte_inner<S: ActionSink>(&mut self, byte: u8, sink: &mut S) {
+        process_byte_impl!(self, byte, sink);
+    }
+
+    #[inline]
+    fn process_ground_special_byte<S: ActionSink>(&mut self, byte: u8, sink: &mut S) {
+        if super::utf8::is_utf8_lead(byte) {
+            self.start_utf8(byte);
+            return;
+        }
+
+        if (0x80..=0x9F).contains(&byte) {
+            if self.c1_controls_enabled {
+                self.process_byte_inner(byte, sink);
+            } else {
+                sink.print(char::REPLACEMENT_CHARACTER);
+            }
+            return;
+        }
+
+        // Every other high byte begins no well-formed sequence: a stray
+        // continuation (`A0..=BF`), `C0`/`C1` and `F5..=FF`. Each is a maximal
+        // subpart on its own.
+        if byte >= 0xA0 {
+            sink.print(char::REPLACEMENT_CHARACTER);
+            return;
+        }
+
+        self.process_byte_inner(byte, sink);
+    }
+
     /// Bulk fast paths for the three string states, extracted from
-    /// `advance_simd_loop` (see the call site). Returns the input with the
+    /// `advance_fast` (see the call site). Returns the input with the
     /// bulk-consumed prefix removed; the boundary byte (if any) is left for
     /// the caller's byte-by-byte dispatch.
     fn advance_string_states_bulk<'a, S: ActionSink>(
@@ -502,10 +451,10 @@ impl Parser {
         // while `osc_put_keeps(osc_data.len())`. `osc_bulk_copy_len` keeps
         // that same prefix and drops the rest (checked against that guard at
         // every breakpoint of every `len`:
-        // `tests::batch::osc_bulk_copy_agrees_with_per_byte_puts_at_every_breakpoint`), and
+        // `tests::string_bulk::osc_bulk_copy_agrees_with_per_byte_puts_at_every_breakpoint`), and
         // `remaining.get(n..)` then lands on the control byte, which both
         // paths process the same way. `osc_over_capacity_truncation_parity`
-        // (tests/batch.rs) drives both paths across the boundary.
+        // (tests/string_bulk.rs) drives both paths across the boundary.
         if self.state == State::OscString {
             let n = if self.c1_controls_enabled {
                 remaining
@@ -579,16 +528,6 @@ impl Parser {
         }
 
         remaining
-    }
-
-    /// Process a single byte for BatchActionSink.
-    ///
-    /// Test-only: the only caller is `advance_batch` (also `#[cfg(test)]`).
-    /// This is the second monomorphization of `process_byte_impl!`; gating it
-    /// out keeps release builds to the single `process_byte_inner` instance.
-    #[cfg(test)]
-    fn process_byte_batch<S: BatchActionSink>(&mut self, byte: u8, sink: &mut S) {
-        process_byte_impl!(self, byte, sink);
     }
 
     /// Find the first byte in `input` that must NOT be bulk-forwarded as DCS
@@ -751,43 +690,45 @@ impl Parser {
         }
     }
 
-    /// Parse and dispatch an OSC payload. PURE in the parser state: reads `data`,
-    /// writes `sink`, mutates nothing on `self` (takes `&[u8]`, not `&mut self`).
+    /// Parse and dispatch an OSC payload in a single forward semicolon scan.
+    /// PURE in the parser state: reads `data`, writes `sink`, mutates nothing on
+    /// `self` (takes `&[u8]`, not `&mut self`).
     ///
-    /// Fast path for common 2-param OSC sequences (title set, CWD, shell
-    /// integration marks) avoids the `ArrayVec` construction and full-buffer `;`
-    /// scan. The format is `<cmd>;<payload>` with no further semicolons — covers
-    /// OSC 0/1/2/7/9, the highest-frequency sequences in typical shell output.
-    /// All other sequences fall through to the general `ArrayVec` split. (#7355)
+    /// Fast paths for 1-parameter (`[data]`, e.g. bare OSC 104/110/30001) and
+    /// 2-parameter (`[p0, rest]`, e.g. OSC 0/1/2/7/9/133/1337) sequences avoid
+    /// the 256-byte `ArrayVec` initialization and dispatch directly from the
+    /// stack. When a second `;` is found at `m` (3+ parameters, e.g. OSC 8
+    /// `8;;url`, OSC 52 `52;c;<base64>`, OSC 4 `4;1;rgb:...`), the already-split
+    /// `(p0, p1)` and `rest[m + 1..]` are passed directly into
+    /// [`Self::parse_osc_from_third_param`] so `data[..k + 1 + m + 1]` is never
+    /// scanned a second time.
     fn parse_and_dispatch_osc<S: ActionSink>(data: &[u8], sink: &mut S, bel_terminated: bool) {
-        // Fast path: a NUMERIC command + a single ';' + payload with no further
-        // semicolons (the overwhelmingly common shape). Now covers MULTI-digit
-        // commands too — OSC 10/11/12 (colours), OSC 104, and especially OSC 133
-        // (shell-integration marks, emitted per prompt+command) — not just the
-        // single-digit OSC 0/1/2/7/9 the old `data[1] == ';'` gate caught. Byte-for-byte
-        // equal to the `data.split(';')` general path whenever exactly one ';' is
-        // present (it yields exactly the two segments `[cmd, payload]`); everything
-        // else — NO ';' (a single-param command like a bare OSC 104), a non-numeric
-        // command, or TWO+ ';' (OSC 8 hyperlinks `8;;url`, OSC 52-with-mode, OSC 4
-        // colour lists) — falls through so param segmentation stays identical. Avoids
-        // the 256-byte ArrayVec zero-init + full-buffer split scan.
-        if let Some(k) = data.iter().position(|&b| b == b';')
-            && k >= 1
-            && data[..k].iter().all(u8::is_ascii_digit)
-            && !data[k + 1..].contains(&b';')
-        {
-            let params: [&[u8]; 2] = [&data[..k], &data[k + 1..]];
+        let Some(k) = data.iter().position(|&b| b == b';') else {
+            let params: [&[u8]; 1] = [data];
             sink.osc_dispatch_with_terminator(pty_wrap_ref(&params[..]), bel_terminated);
-        } else {
-            Self::parse_osc_general(data, sink, bel_terminated);
-        }
+            return;
+        };
+        let p0 = &data[..k];
+        let rest = &data[k + 1..];
+        let Some(m) = rest.iter().position(|&b| b == b';') else {
+            let params: [&[u8]; 2] = [p0, rest];
+            sink.osc_dispatch_with_terminator(pty_wrap_ref(&params[..]), bel_terminated);
+            return;
+        };
+        Self::parse_osc_from_third_param(p0, &rest[..m], &rest[m + 1..], sink, bel_terminated);
     }
 
-    /// General OSC dispatch using ArrayVec split. Called for OSC sequences
-    /// that don't match the 2-param fast path (multi-digit commands, multiple
-    /// semicolons, etc.). PURE in the parser state (`&[u8]`, not `&mut self`).
+    /// General OSC dispatch for 3+ semicolon-separated parameters, seeded with
+    /// the already-split first two parameters `(p0, p1)` and `rest` after the
+    /// second semicolon. PURE in the parser state (`&[u8]`, not `&mut self`).
     #[inline(never)]
-    fn parse_osc_general<S: ActionSink>(data: &[u8], sink: &mut S, bel_terminated: bool) {
+    fn parse_osc_from_third_param<S: ActionSink>(
+        p0: &[u8],
+        p1: &[u8],
+        mut rest: &[u8],
+        sink: &mut S,
+        bel_terminated: bool,
+    ) {
         // THE LAST SLOT CARRIES THE REMAINDER VERBATIM, semicolons and all.
         //
         // Consumers re-join: `set_title` joins `params[1..]` and `handle_osc_8`
@@ -798,7 +739,8 @@ impl Parser {
         // `join(';')` reconstructs the payload at any semicolon count, with no
         // allocation; handlers that index a fixed early param are unaffected.
         let mut params: ArrayVec<&[u8], MAX_OSC_PARAMS> = ArrayVec::new();
-        let mut rest = data;
+        params.push(p0);
+        params.push(p1);
         loop {
             if params.len() + 1 == MAX_OSC_PARAMS {
                 params.push(rest);

@@ -6,11 +6,11 @@
 //! Reads every species-head asset TOML under `crates/aterm-effects/art/animal/` and
 //! writes `crates/aterm-effects/src/animal_glyphs_gen.rs`; the
 //! `animal_glyphs_gen_matches_assets` drift test fails until they match. Same parser
-//! as `gen_cat_glyphs` / `gen_pet_glyphs`, separate roster: species heads must not
-//! land in the collectible `GLYPHS` table.
+//! as `gen_cat_glyphs`, separate roster: species heads must not land in the
+//! collectible `GLYPHS` table.
 //!
 //! ```text
-//! cargo run -p aterm-effects --example gen_animal_glyphs
+//! targo --unverified run -p aterm-effects --example gen_animal_glyphs
 //! ```
 
 use std::path::Path;

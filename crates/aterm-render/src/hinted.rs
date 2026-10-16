@@ -17,9 +17,11 @@
 //! outline fill, on the one platform whose reference renderers (Windows
 //! Terminal, VS Code, conhost) are all DirectWrite-hinted in the next window.
 //!
-//! This module is the non-CoreText twin of the macOS `ct_glyph` seam: skrifa runs the
-//! font's OWN TrueType bytecode or the FreeType-ported autohinter
-//! ([`skrifa::outline::HintingInstance`]) and hands back a grid-fitted outline
+//! This module is the non-CoreText twin of the macOS `ct_glyph` seam:
+//! aterm-font's automatic hinter ([`aterm_font::autohint::HintingInstance`],
+//! FreeType's autofit as skrifa 0.46.2 ports it, carved at TF.4 of
+//! docs/AUDIT-third-party-2026-10-15.md) — never the font's own TrueType
+//! bytecode or CFF hints, see [`HintMode`] — hands back a grid-fitted outline
 //! in pixel space, which the SAME [`crate::raster`] coverage fill as the
 //! FONT-2 variation path (`variation::varied_glyph_raster`) turns into an
 //! 8-bit mask in fontdue's metric convention
@@ -32,15 +34,20 @@
 //! mid-grey fringe (40..=215) texels drop from 59.7% to 47.7% — stems and
 //! crossbars snap to whole pixels instead of smearing across two.
 //!
-//! ADVANCES STAY LINEAR: the returned advance is the scaled `hmtx` value
-//! (identical math to fontdue's), never the hinted advance — cell geometry,
-//! wide-glyph centering and spill accounting are byte-identical to the
-//! unhinted path. Only the coverage and its integer placement change.
+//! ADVANCES STAY LINEAR: the returned advance is the scaled `hmtx` value,
+//! never the hinted advance, and it is read through the same sfnt reader and
+//! the same product as the unhinted raster at the same instance
+//! ([`crate::variation::VariedFace`]), so it is bit-identical to what `off`
+//! reports — cell geometry, wide-glyph centering and spill accounting cannot
+//! move with the mode. Only the coverage and its integer placement change.
+//! The hinter is asked for the grid fit alone: the hinting instance and the
+//! hinted outline (TF.2 of docs/AUDIT-third-party-2026-10-15.md, so the TF.4
+//! carve is the autohinter and nothing else).
 //!
 //! VARIABLE INSTANCES (Windows): every entry point carries the user-space
 //! variation coords, so the outline that gets grid-fitted is the INSTANTIATED
-//! one — `HintingInstance::new` takes the normalized location, and skrifa's
-//! hinted draw reads size + location back off the instance. That matters on
+//! one — `HintingInstance::new` normalizes them (in 16.16, as FreeType does),
+//! and the hinted draw reads size + location back off the instance. That matters on
 //! Windows for a VARIABLE primary, such as the system's own
 //! `C:\Windows\Fonts\CascadiaMono.ttf` that `font_family = "Cascadia Mono"`
 //! names: it has no separate Bold file, so BOTH the regular cut and the
@@ -48,32 +55,16 @@
 //! pinned to `LocationRef::default()` would silently reset the configured
 //! weight. (The unconfigured Windows default is the bundled STATIC Cascadia
 //! Mono PL, whose real Bold / Italic files take slot 0 like any static face.)
-//! Linux passes an empty coord slice, which normalizes to the same default
-//! location it always used.
+//! Linux passes an empty coord slice: the default location.
 //!
-//! Gated to `cfg(any(all(unix, not(target_os = "macos")), windows))` at the
-//! module declaration AND in Cargo.toml (target-gated dependency): macOS keeps
-//! CoreText byte-identically, the wasm consumer keeps fontdue byte-identically
-//! and compiles none of it.
+//! Production builds gate this to `cfg(any(all(unix, not(target_os = "macos")), windows))` at the
+//! module declaration AND in Cargo.toml (aterm-font's `hint` feature is asked
+//! for there only): macOS keeps CoreText byte-identically, the wasm consumer
+//! keeps fontdue byte-identically, and neither compiles this module (nor, in
+//! a per-package build, the hinter).
+//! macOS unit tests also compile this pure raster with embedded fonts.
 
-use skrifa::{
-    FontRef, MetadataProvider, Tag,
-    instance::{Location, Size},
-    outline::{
-        DrawSettings, Engine, HintingInstance, HintingOptions, OutlinePen, SmoothMode, Target,
-    },
-};
-
-/// Normalize user-space `(tag, value)` variation coords against `font`'s
-/// `fvar`/`avar` — the skrifa twin of `ttf_parser::Face::set_variation`, which
-/// the portable [`variation`](crate::variation) raster uses on the very same
-/// coord slice. An EMPTY slice yields the font's default location, i.e. exactly
-/// what `LocationRef::default()` meant before instances were plumbed through;
-/// tags the face does not carry are ignored, same as the ttf-parser path.
-fn location_of(font: &FontRef, coords: &[(u32, f32)]) -> Location {
-    font.axes()
-        .location(coords.iter().map(|&(tag, v)| (Tag::from_u32(tag), v)))
-}
+use aterm_font::autohint::{HintingInstance, Target};
 
 /// How the native (Linux / Windows) raster path grid-fits outlines. [`Full`](Self::Full)
 /// at construction ([`HintMode::initial`]); the host's `font_hinting` config key
@@ -83,20 +74,23 @@ fn location_of(font: &FontRef, coords: &[(u32, f32)]) -> Location {
 pub(crate) enum HintMode {
     /// FreeType-ported autohinter, normal smooth target: snaps stems and
     /// horizontal features in BOTH axes — the crispest antialiased result and
-    /// the DEFAULT. Chosen over the font's own bytecode because skrifa's
-    /// TrueType interpreter (like FreeType's v40) applies bytecode
-    /// vertical-only, which leaves the stem fringing this module exists to
-    /// remove; the autohinter is also uniform across fonts with and without
-    /// bytecode.
+    /// the DEFAULT. Chosen over the font's own bytecode because a TrueType
+    /// interpreter in FreeType's v40 mode applies bytecode vertical-only,
+    /// which leaves the stem fringing this module exists to remove; the
+    /// autohinter is also uniform across fonts with and without bytecode.
     #[default]
     Full,
     /// Autohinter, light target: vertical-only grid fit (the common desktop
     /// Linux `hintslight` look) — crossbars/tops snap, stem phases keep the
     /// designed fractional positions.
+    ///
+    /// Also what the retired `native` spelling renders as (TF.2b of
+    /// docs/AUDIT-third-party-2026-10-15.md). `native` ran the font's own
+    /// TrueType bytecode or CFF hints, and both interpreters fit vertically
+    /// only here (see [`Full`](Self::Full)), so `light` is the nearest look;
+    /// keeping the real thing would have meant carrying ~7.3k upstream lines
+    /// of interpreter into `aterm-font` for an opt-in mode.
     Light,
-    /// The font's own hinting engine when it has one (TrueType bytecode / CFF
-    /// interpreter), autohinter otherwise — FreeType's engine-selection rule.
-    Native,
     /// No grid fitting: the pure fontdue path, bit-for-bit.
     Off,
 }
@@ -105,11 +99,10 @@ impl HintMode {
     /// Parse one mode spelling of the config key (`font_hinting`, via
     /// `Renderer::set_font_hinting`). Unrecognized = the default
     /// ([`HintMode::Full`]); explicit disable spellings match the workspace's
-    /// usual off/0/none family.
+    /// usual off/0/none family; the retired `native` is [`HintMode::Light`].
     pub(crate) fn parse(s: &str) -> Self {
         match s.trim() {
-            "light" => Self::Light,
-            "native" => Self::Native,
+            "light" | "native" => Self::Light,
             "off" | "0" | "none" | "false" => Self::Off,
             _ => Self::Full,
         }
@@ -134,41 +127,21 @@ impl HintMode {
         }
     }
 
-    /// The skrifa options this mode stands for; `None` = hinting disabled.
-    fn options(self) -> Option<HintingOptions> {
-        let target = |mode| Target::Smooth {
-            mode,
-            // GETINFO's "ClearType symmetric rendering" bit assumes vertical
-            // supersampling this analytic rasterizer does not do; off keeps
-            // interpreter-hinted stems from widening into blur. Interpreter
-            // paths only — the autohinter ignores it.
-            symmetric_rendering: false,
-            // Horizontal fitting is wanted INSIDE the cell (that is the
-            // crispness); advances reported upstream stay linear regardless,
-            // see the module doc.
-            preserve_linear_metrics: false,
-        };
+    /// The hinter target this mode stands for; `None` = hinting disabled.
+    /// Horizontal fitting is wanted INSIDE the cell (that is the crispness);
+    /// advances reported upstream stay linear regardless, see the module doc.
+    fn options(self) -> Option<Target> {
         match self {
-            Self::Full => Some(HintingOptions {
-                engine: Engine::Auto(None),
-                target: target(SmoothMode::Normal),
-            }),
-            Self::Light => Some(HintingOptions {
-                engine: Engine::Auto(None),
-                target: target(SmoothMode::Light),
-            }),
-            Self::Native => Some(HintingOptions {
-                engine: Engine::AutoFallback,
-                target: target(SmoothMode::Normal),
-            }),
+            Self::Full => Some(Target::Normal),
+            Self::Light => Some(Target::Light),
             Self::Off => None,
         }
     }
 }
 
-/// Per-face-size-and-INSTANCE [`HintingInstance`] cache — the skrifa twin of
-/// the CoreText `ct_cache`. Building an instance replays `fpgm`/`prep` (or
-/// computes autohinter glyph styles), so it must not happen per glyph; keyed
+/// Per-face-size-and-INSTANCE [`HintingInstance`] cache — the hinter's twin
+/// of the CoreText `ct_cache`. Building an instance computes the autohinter's
+/// glyph styles, so it must not happen per glyph; keyed
 /// like `ct_cache` on the face bytes' POINTER identity (faces are immutable
 /// `Arc`s), collection index, the raster px bits, and the variation SLOT
 /// (`0` = default instance, `1` = the resolved primary coords, `2` = the bold
@@ -181,8 +154,8 @@ pub(crate) struct HintBank {
 
 impl HintBank {
     /// Fetch (or build + memoize) the hinting instance for one face at `px`,
-    /// at the variation `coords` discriminated by `slot`. A face skrifa cannot
-    /// parse (or a degenerate px) memoizes `None`, so the fontdue fallback is
+    /// at the variation `coords` discriminated by `slot`. A face the hinter
+    /// cannot read (or a degenerate px) memoizes `None`, so the fontdue fallback is
     /// taken WITHOUT re-attempting the build every glyph.
     ///
     /// The arity is the face's identity spelled out (`key_ptr`/`bytes`/`index`
@@ -203,10 +176,10 @@ impl HintBank {
         self.instance_with(key_ptr, bytes, index, px, mode.options(), coords, slot)
     }
 
-    /// [`Self::instance`] with the skrifa options handed in directly — the seam
+    /// [`Self::instance`] with the hinter target handed in directly — the seam
     /// the subpixel raster ([`crate::subpixel`]) uses to memoize LCD-target
     /// instances in its OWN bank (the map key does not carry the target, so one
-    /// bank must never hold two targets for the same face+px). `None` options =
+    /// bank must never hold two targets for the same face+px). `None` target =
     /// hinting disabled = no instance. The `(coords, slot)` instance discipline
     /// is the same as [`Self::instance`]'s; the subpixel raster's stage-1 set
     /// excludes variable instances, so it always passes `(&[], 0)`.
@@ -217,22 +190,18 @@ impl HintBank {
         bytes: &[u8],
         index: u32,
         px: f32,
-        options: Option<HintingOptions>,
+        target: Option<Target>,
         coords: &[(u32, f32)],
         slot: u8,
     ) -> Option<std::sync::Arc<HintingInstance>> {
-        let options = options?;
+        let target = target?;
         if !px.is_finite() || px <= 0.0 {
             return None;
         }
         self.map
             .entry((key_ptr, index, px.to_bits(), slot))
             .or_insert_with(|| {
-                let font = FontRef::from_index(bytes, index).ok()?;
-                let location = location_of(&font, coords);
-                HintingInstance::new(&font.outline_glyphs(), Size::new(px), &location, options)
-                    .ok()
-                    .map(std::sync::Arc::new)
+                HintingInstance::new(bytes, index, px, coords, target).map(std::sync::Arc::new)
             })
             .clone()
     }
@@ -244,15 +213,14 @@ impl HintBank {
     }
 }
 
-/// Map a char through the face's UNICODE cmap (skrifa's charmap — the same
-/// subtable preference as ttf-parser's `glyph_index`, which the production
-/// paths use via the renderer's memoized `primary_unicode_gid`/`unicode_gid`
-/// resolvers; this standalone form serves the module's own tests).
+/// Map a char through the face's UNICODE cmap (aterm-font's `glyph_index`,
+/// which the production paths use via the renderer's memoized
+/// `primary_unicode_gid`/`unicode_gid` resolvers; this standalone form serves
+/// the module's own tests).
 #[cfg(all(test, feature = "embedded-font"))]
 pub(crate) fn unicode_gid(bytes: &[u8], index: u32, ch: char) -> Option<u16> {
-    let font = FontRef::from_index(bytes, index).ok()?;
-    let gid: u32 = font.charmap().map(ch)?.to_u32();
-    u16::try_from(gid).ok().filter(|&g| g != 0)
+    let face = aterm_font::Face::parse(bytes, index).ok()?;
+    face.glyph_index(ch).map(|g| g.0).filter(|&g| g != 0)
 }
 
 /// Rasterize glyph `gid` of the face at `px` with `hint` applied, in the
@@ -269,7 +237,8 @@ pub(crate) fn unicode_gid(bytes: &[u8], index: u32, ch: char) -> Option<u16> {
 /// `coords` must be the SAME user-space variation coords `hint` was built at
 /// (the caller's slot discipline guarantees it): the outline comes from the
 /// instance, so the advance has to be measured at that instance too — an
-/// `HVAR`-varying face would otherwise report the default cut's width.
+/// `HVAR`-varying face would otherwise report the default cut's width. A face
+/// the sfnt reader cannot open is a `None` like any other parse failure.
 pub(crate) fn hinted_glyph_raster(
     bytes: &[u8],
     index: u32,
@@ -278,22 +247,12 @@ pub(crate) fn hinted_glyph_raster(
     hint: &HintingInstance,
     coords: &[(u32, f32)],
 ) -> Option<(usize, usize, i32, i32, f32, Vec<u8>)> {
-    let font = FontRef::from_index(bytes, index).ok()?;
-    let glyph_id = skrifa::GlyphId::from(gid);
-    let location = location_of(&font, coords);
-    // LINEAR advance (scaled hmtx — fontdue's exact math), never the hinted
-    // one: metrics upstream must not move when hinting lands (module doc).
-    let advance = font
-        .glyph_metrics(Size::new(px), &location)
-        .advance_width(glyph_id)
-        .unwrap_or(0.0);
-    let outline = font.outline_glyphs().get(glyph_id)?;
+    // LINEAR advance at the same instance, never the hinted one: metrics
+    // upstream must not move when hinting lands (module doc).
+    let advance =
+        crate::variation::VariedFace::parse(bytes, index, coords)?.linear_advance(gid, px)?;
     let mut pen = PathPen::default();
-    // Pedantic OFF: a bytecode error inside one glyph degrades to skrifa's
-    // unhinted outline of the same glyph rather than failing the raster.
-    outline
-        .draw(DrawSettings::hinted(hint, false), &mut pen)
-        .ok()?;
+    hint.draw(bytes, index, gid, &mut pen)?;
     if pen.is_blank() {
         // No outline at all (space and friends): blank raster, advance only —
         // the blank-glyph convention of the variation path.
@@ -341,10 +300,10 @@ enum Cmd {
     Close,
 }
 
-/// Collects a skrifa outline (pixels, y up) and its ink bounds, then replays
+/// Collects a hinted outline (pixels, y up) and its ink bounds, then replays
 /// it into a [`crate::raster`] grid (pixels, y DOWN, origin at the ink
 /// box's top-left) — the same mapping as `variation::OutlineToRaster`, minus
-/// the design-unit scale (skrifa already delivers pixel coordinates).
+/// the design-unit scale (the hinter already delivers pixel coordinates).
 /// `pub(crate)` for the subpixel raster ([`crate::subpixel`]), which replays
 /// the same recorded outline at 3× horizontal resolution.
 #[derive(Default)]
@@ -429,28 +388,49 @@ impl PathPen {
     }
 }
 
-impl OutlinePen for PathPen {
-    fn move_to(&mut self, x: f32, y: f32) {
+/// The recording half, in pixels (y up), as plain methods: the hinter's pen
+/// trait below and the subpixel raster's unhinted outline (which comes from the
+/// sfnt reader, not the hinter) both feed it.
+impl PathPen {
+    pub(crate) fn move_to(&mut self, x: f32, y: f32) {
         self.see(x, y);
         self.cmds.push(Cmd::Move(x, y));
     }
-    fn line_to(&mut self, x: f32, y: f32) {
+    pub(crate) fn line_to(&mut self, x: f32, y: f32) {
         self.see(x, y);
         self.cmds.push(Cmd::Line(x, y));
     }
-    fn quad_to(&mut self, cx: f32, cy: f32, x: f32, y: f32) {
+    pub(crate) fn quad_to(&mut self, cx: f32, cy: f32, x: f32, y: f32) {
         self.see(cx, cy);
         self.see(x, y);
         self.cmds.push(Cmd::Quad(cx, cy, x, y));
     }
-    fn curve_to(&mut self, c0x: f32, c0y: f32, c1x: f32, c1y: f32, x: f32, y: f32) {
+    pub(crate) fn curve_to(&mut self, c0x: f32, c0y: f32, c1x: f32, c1y: f32, x: f32, y: f32) {
         self.see(c0x, c0y);
         self.see(c1x, c1y);
         self.see(x, y);
         self.cmds.push(Cmd::Curve(c0x, c0y, c1x, c1y, x, y));
     }
-    fn close(&mut self) {
+    pub(crate) fn close(&mut self) {
         self.cmds.push(Cmd::Close);
+    }
+}
+
+impl aterm_font::OutlineSink for PathPen {
+    fn move_to(&mut self, x: f32, y: f32) {
+        PathPen::move_to(self, x, y);
+    }
+    fn line_to(&mut self, x: f32, y: f32) {
+        PathPen::line_to(self, x, y);
+    }
+    fn quad_to(&mut self, x1: f32, y1: f32, x: f32, y: f32) {
+        PathPen::quad_to(self, x1, y1, x, y);
+    }
+    fn curve_to(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, x: f32, y: f32) {
+        PathPen::curve_to(self, x1, y1, x2, y2, x, y);
+    }
+    fn close(&mut self) {
+        PathPen::close(self);
     }
 }
 
@@ -470,14 +450,7 @@ mod tests {
     }
 
     fn full_instance(px: f32) -> HintingInstance {
-        let font = FontRef::new(dejavu()).unwrap();
-        HintingInstance::new(
-            &font.outline_glyphs(),
-            Size::new(px),
-            &location_of(&font, &[]),
-            HintMode::Full.options().unwrap(),
-        )
-        .unwrap()
+        HintingInstance::new(dejavu(), 0, px, &[], HintMode::Full.options().unwrap()).unwrap()
     }
 
     /// The blit anchors must be the FLOOR of the fitted ink box: xmin <= every
@@ -533,21 +506,33 @@ mod tests {
         );
     }
 
-    /// The reported advance is LINEAR (scaled hmtx — fontdue's math), not the
-    /// hinted advance: cell geometry must not move when hinting lands.
+    /// The reported advance is LINEAR (scaled hmtx), not the hinted advance,
+    /// and it is the unhinted path's own number to the bit: cell geometry must
+    /// not move when hinting lands. JetBrains Mono's 1000-unit em is where the
+    /// two could part: FreeType's 16.16 scaling (what the hinter's own metrics
+    /// answered before TF.2) gives its 600-unit advance as 7.200058 at 12px,
+    /// the f32 product every unhinted raster reports as 7.2000003.
     #[test]
     fn advance_stays_linear() {
-        let hint = full_instance(12.0);
-        let fd =
-            crate::font::Font::from_bytes(dejavu(), crate::font::FontSettings::default()).unwrap();
-        for ch in ['M', 'i', 'W', '0'] {
-            let gid = unicode_gid(dejavu(), 0, ch).unwrap();
-            let (.., adv, _) = hinted_glyph_raster(dejavu(), 0, gid, 12.0, &hint, &[]).unwrap();
-            let fd_adv = fd.metrics(ch, 12.0).advance_width;
-            assert!(
-                (adv - fd_adv).abs() < 0.01,
-                "{ch:?}: hinted-path advance {adv} != fontdue linear advance {fd_adv}"
-            );
+        let jetbrains: &[u8] = include_bytes!("../tests/fixtures/jetbrains-mono.ttf");
+        for bytes in [dejavu(), jetbrains] {
+            let font =
+                crate::font::Font::from_bytes(bytes, crate::font::FontSettings::default()).unwrap();
+            for px in [12.0, 13.0] {
+                let hint =
+                    HintingInstance::new(bytes, 0, px, &[], HintMode::Full.options().unwrap())
+                        .unwrap();
+                for ch in ['M', 'i', 'W', '0'] {
+                    let gid = unicode_gid(bytes, 0, ch).unwrap();
+                    let (.., adv, _) = hinted_glyph_raster(bytes, 0, gid, px, &hint, &[]).unwrap();
+                    let unhinted = font.metrics(ch, px).advance_width;
+                    assert_eq!(
+                        adv.to_bits(),
+                        unhinted.to_bits(),
+                        "{ch:?} @{px}px: hinted-path advance {adv} != unhinted advance {unhinted}"
+                    );
+                }
+            }
         }
     }
 
@@ -709,7 +694,8 @@ mod tests {
     ///    slack is proportional to the outline's PERIMETER because antialiasing
     ///    and the rasterizer's own curve flattening are boundary effects.
     ///    Measured over the 11 571 (mode, ppem, glyph) combinations this sweep
-    ///    covers, the honest residual peaks at 0.029·perimeter; the pre-fix
+    ///    covered while it also ran `native`'s bytecode (retired at TF.2b),
+    ///    the honest residual peaks at 0.029·perimeter; the pre-fix
     ///    `'2'` at ppem 19 sat at 0.097·perimeter and `'?'` at ppem 17 at
     ///    0.491·perimeter, so 0.06·perimeter separates them with margin on
     ///    both sides.
@@ -724,23 +710,15 @@ mod tests {
             crate::embedded_symbols_font(),
         ));
         let chars = sweep_chars();
-        let modes = [HintMode::Full, HintMode::Light, HintMode::Native];
+        let modes = [HintMode::Full, HintMode::Light];
         let mut checked = 0usize;
         for (name, bytes) in faces {
-            let font = FontRef::new(bytes).expect("bundled face parses");
             for mode in modes {
                 for px in 12..=40 {
-                    let opts = mode
-                        .options()
-                        .expect("the three hinting modes carry options");
+                    let target = mode.options().expect("the hinting modes carry a target");
                     let px = px as f32;
-                    let hint = HintingInstance::new(
-                        &font.outline_glyphs(),
-                        Size::new(px),
-                        &location_of(&font, &[]),
-                        opts,
-                    )
-                    .expect("a hinting instance at every desktop ppem");
+                    let hint = HintingInstance::new(bytes, 0, px, &[], target)
+                        .expect("a hinting instance at every desktop ppem");
                     for &ch in &chars {
                         let Some(gid) = unicode_gid(bytes, 0, ch) else {
                             continue;
@@ -753,13 +731,8 @@ mod tests {
                         }
                         checked += 1;
                         // Re-draw the same outline to measure it against.
-                        let outline = font
-                            .outline_glyphs()
-                            .get(skrifa::GlyphId::from(gid))
-                            .expect("the gid we just rasterized still resolves");
                         let mut pen = PathPen::default();
-                        outline
-                            .draw(DrawSettings::hinted(&hint, false), &mut pen)
+                        hint.draw(bytes, 0, gid, &mut pen)
                             .expect("the outline we just drew still draws");
 
                         // 1. slack invariance
@@ -824,10 +797,10 @@ mod tests {
             let Ok(bytes) = std::fs::read(&path) else {
                 continue;
             };
-            let usable = FontRef::new(&bytes).is_ok_and(|f| {
-                f.axes()
-                    .iter()
-                    .any(|a| a.tag() == Tag::from_u32(WGHT) && a.max_value() >= 600.0)
+            let usable = aterm_font::Face::parse(&bytes, 0).is_ok_and(|f| {
+                f.variation_axes()
+                    .into_iter()
+                    .any(|a| a.tag == aterm_font::Tag(WGHT) && a.max_value >= 600.0)
             });
             if usable {
                 return (path, bytes);
@@ -843,24 +816,76 @@ mod tests {
     /// a static face normalizes everything to the default.
     #[cfg(windows)]
     #[test]
-    fn coords_normalize_into_the_location() {
+    fn coords_move_the_fitted_outline() {
         let (path, bytes) = variable_system_face();
-        let font = FontRef::new(&bytes).unwrap();
-        let default = location_of(&font, &[]);
-        assert!(
-            !default.coords().is_empty(),
-            "{path}: fixture precondition — a variable face has fvar coords"
+        let outline_of = |coords: &[(u32, f32)]| {
+            let hint = HintingInstance::new(&bytes, 0, 16.0, coords, Target::Normal).unwrap();
+            let gid = unicode_gid(&bytes, 0, 'M').unwrap();
+            let mut pen = PathPen::default();
+            hint.draw(&bytes, 0, gid, &mut pen).unwrap();
+            (pen.min_x, pen.max_x, pen.min_y, pen.max_y, pen.cmds.len())
+        };
+        let default_wght = aterm_font::Face::parse(&bytes, 0)
+            .unwrap()
+            .variation_axes()
+            .into_iter()
+            .find(|a| a.tag == aterm_font::Tag(WGHT))
+            .unwrap()
+            .def_value;
+        assert_eq!(
+            outline_of(&[]),
+            outline_of(&[(WGHT, default_wght)]),
+            "{path}: empty coords must be the fvar default location"
         );
-        assert!(
-            default.coords().iter().all(|c| c.to_f32() == 0.0),
-            "{path}: empty coords must be the fvar default location, got {:?}",
-            default.coords()
-        );
-        let bold = location_of(&font, &[(WGHT, 700.0)]);
-        assert!(
-            bold.coords().iter().any(|c| c.to_f32() != 0.0),
+        assert_ne!(
+            outline_of(&[]),
+            outline_of(&[(WGHT, 700.0)]),
             "{path}: a real wght request must move off the default location \
              (the hinter would otherwise fit the wrong cut)"
+        );
+    }
+
+    /// At a VARIABLE instance the hinted path's advance is the instantiated
+    /// unhinted raster's, to the bit: both read `hmtx` + `HVAR` at the same
+    /// coords through the same reader.
+    ///
+    /// The fixture is the bundled `engraved` display face (Cinzel, `wght`
+    /// 400..=900 with an `HVAR`), so the test runs wherever this module
+    /// compiles rather than on whatever `%WINDIR%\Fonts` holds. It has to be a
+    /// face whose ADVANCES move with the instance: a monospaced variable face
+    /// such as Windows' Cascadia Mono is the same width at every weight, so a
+    /// hinted path that measured the default cut would still pass. The CONTROL
+    /// is that regression run for real: the same call with the coords dropped
+    /// (the default cut's width, which [`hinted_glyph_raster`]'s doc warns
+    /// about) must answer differently for some probed glyph, or the equality
+    /// proves nothing.
+    #[test]
+    fn advance_at_an_instance_is_the_unhinted_one() {
+        let bytes = crate::display_face_bytes("engraved").expect("the bundled engraved face");
+        let bold = [(WGHT, 700.0)];
+        let mut moved = 0usize;
+        for px in [12.0f32, 13.0, 16.0] {
+            let hint = HintingInstance::new(bytes, 0, px, &bold, HintMode::Full.options().unwrap())
+                .unwrap();
+            for ch in ['M', 'i', 'W', '0', '&'] {
+                let gid = unicode_gid(bytes, 0, ch).unwrap();
+                let (.., adv, _) = hinted_glyph_raster(bytes, 0, gid, px, &hint, &bold).unwrap();
+                let (.., unhinted, _) =
+                    crate::variation::varied_glyph_raster(bytes, 0, &bold, gid, px).unwrap();
+                assert_eq!(
+                    adv.to_bits(),
+                    unhinted.to_bits(),
+                    "{ch:?} @{px}px wght 700: hinted advance {adv} != unhinted {unhinted}"
+                );
+                let (.., default_cut, _) =
+                    hinted_glyph_raster(bytes, 0, gid, px, &hint, &[]).unwrap();
+                moved += usize::from(default_cut.to_bits() != adv.to_bits());
+            }
+        }
+        assert!(
+            moved > 0,
+            "control: no probed advance differs between wght 700 and the default cut, \
+             so the equality above cannot tell the two instances apart"
         );
     }
 

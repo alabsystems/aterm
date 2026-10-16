@@ -4,45 +4,36 @@
 
 //! Process-wide scrollback byte-budget sharing.
 //!
-//! A host embedding several terminals in one memory space (every pane of a wasm
-//! renderer worker, or a daemon's sessions) needs a global cap on top of each
-//! `Scrollback`'s per-pane budget, so N panes cannot multiply it into an OOM.
-//! This module is the global half.
-//!
-//! Policy: equal shares, applied at touch time. A registered pane's effective
-//! budget is `min(configured, global / live_panes)`; a global of `0` leaves the
-//! configured budget alone. Each pane owner calls
-//! [`ScrollbackBudgetShare::pending_effective`] at its mutation points and
-//! forwards any value to `Terminal::set_memory_budget`, so a share change takes
-//! effect at the pane's next touch: no cross-pane locking, two atomic loads on
-//! the hot path.
-//!
-//! A busy pane cannot borrow an idle pane's share, so no usage accounting is
-//! needed and Σ(applied shares) ≤ global holds at every quiescent point (spec:
-//! `shared_budget_model`, bound in `tests/conformance_shared_budget.rs`).
+//! A host running several terminals in one memory space (a wasm renderer worker's panes, a
+//! daemon's sessions) needs a global cap on top of each `Scrollback`'s per-pane budget.
+//! Equal shares, applied at touch time: a registered pane's effective budget is
+//! `min(configured, global / live_panes)` (a global of `0` leaves it alone). Each owner
+//! polls [`ScrollbackBudgetShare::pending_effective`] at its mutation points and forwards a
+//! change to `Terminal::set_memory_budget`: no cross-pane locking, two atomic loads on the
+//! hot path. No pane borrows another's share, so Σ(applied shares) ≤ global holds at every
+//! quiescent point (spec `shared_budget_model`, bound in
+//! `tests/conformance_shared_budget.rs`).
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// Module-wide scrollback budget in bytes. `0` = unlimited (per-pane budgets
-/// only) — the default, so embedders opt in explicitly.
+/// Module-wide scrollback budget in bytes; `0` (the default) is per-pane budgets only.
 static GLOBAL_BUDGET_BYTES: AtomicUsize = AtomicUsize::new(0);
 
 /// Live registered panes ([`ScrollbackBudgetShare`] instances).
 static LIVE_SHARES: AtomicUsize = AtomicUsize::new(0);
 
-/// Set the module-wide scrollback budget (bytes; `0` = unlimited). Takes effect
-/// on each pane as it is next touched (see module docs).
+/// Set the module-wide scrollback budget (bytes; `0` = unlimited), applied to each pane at
+/// its next touch.
 pub fn set_global_scrollback_budget(bytes: usize) {
     GLOBAL_BUDGET_BYTES.store(bytes, Ordering::Relaxed);
 }
 
-/// One pane's membership in the global scrollback budget.
-///
-/// Owned by the embedder next to its `Terminal`, not inside it, so test and
-/// tool terminals do not count. Registers on construction, deregisters on drop.
+/// One pane's membership in the global scrollback budget, owned by the embedder next to
+/// its `Terminal` (so test and tool terminals do not count). Registers on construction,
+/// deregisters on drop.
 #[derive(Debug)]
 pub struct ScrollbackBudgetShare {
-    /// The pane's own configured budget (bytes) — the cap the host asked for.
+    /// The pane's own configured budget (bytes).
     configured: usize,
     /// The effective budget last returned by [`Self::pending_effective`]
     /// (`usize::MAX` = never applied, so the first poll always fires).
@@ -72,9 +63,8 @@ impl ScrollbackBudgetShare {
         self.configured
     }
 
-    /// Effective budget under the current global/membership state:
-    /// `min(configured, global / live_panes)`, floored at 1 byte (the
-    /// `Scrollback` clamp), with an unset global passing `configured` through.
+    /// Effective budget now: `min(configured, global / live_panes)`, floored at 1 byte
+    /// (the `Scrollback` clamp); an unset global passes `configured` through.
     #[must_use]
     pub fn effective(&self) -> usize {
         let global = GLOBAL_BUDGET_BYTES.load(Ordering::Relaxed);
@@ -143,8 +133,7 @@ mod tests {
             set_global_scrollback_budget(100);
             let mut a = ScrollbackBudgetShare::register(64);
             let mut b = ScrollbackBudgetShare::register(30);
-            // Two live panes: share = 50. a is capped by the share, b by its
-            // own smaller configured budget.
+            // Share 50: a is capped by it, b by its own smaller budget.
             assert_eq!(a.pending_effective(), Some(50));
             assert_eq!(b.pending_effective(), Some(30));
             // A membership change re-fires the poll on the survivor.

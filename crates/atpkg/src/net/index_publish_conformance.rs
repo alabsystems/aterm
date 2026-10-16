@@ -1,33 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! TIER-1 CONFORMANCE of the index channel's writer/reader pair to the derived model
-//! `AtpkgIndexPublishWalk` (crates/aterm-spec/src/derive/models_atpkg_index_publish.rs):
-//! the model proves that the published index tags are one run and that the walk from
-//! every verified floor lands the newest; this binds both halves to the code that ships.
+//! Conformance of the index channel's reader to the derived model `AtpkgIndexPublishWalk`
+//! (crates/aterm-spec/src/derive/models_atpkg_index_publish.rs), which proves the published
+//! index tags are one run and the walk from every verified floor lands the newest.
 //!
-//! * READER — every channel the model reaches (atpkg-index-1 published, 2..=4 each
-//!   absent, a draft or published) is served to the REAL tag walk
-//!   ([`GithubFetcher::walk_candidates`]) as download-host HEAD answers, from every floor the
-//!   model reaches, and the walk must leave the store on the newest published index.
-//! * WRITER — every decision a publisher holding a baseline faces in the model (its
-//!   baseline number, the number it aims at, the channel) is laid out as a fixture channel
-//!   and the REAL `tools/atpkg-index.sh` runs over it with UPLOAD=1 (stub gh, curl,
-//!   signers and pack mirror; no network, no key). Its outcome must be the model's one
-//!   enabled decision — `Create`, `Converge` or `Refuse` — and leave the tag as the model
-//!   does.
-//! * NEGATIVE CONTROLS — the `Buggy = 1` decisions (a baseline counted off a draft, a
-//!   number past the baseline's successor, a converge onto another publisher's bytes) are
-//!   driven too: the real indexer refuses each one the mutant takes. And the hole the
-//!   draft baseline makes — two numbers missing directly above the floor — is one the real
-//!   walk does not cross either, so a pass here is never vacuous.
+//! Every channel and floor the model reaches is served to the real tag walk
+//! ([`GithubFetcher::walk_candidates`]) as download-host HEAD answers, and the walk must land
+//! the newest published index. Negative control: the `Buggy = 1` draft-baseline hole is one
+//! the real walk does not cross either. The writer half is bound by
+//! `crates/atpkg-publish/tests/channel/conformance_index_publish.rs`.
 
 use super::GithubFetcher;
 use aterm_spec::derive::{Model, atpkg_index_publish_walk_model};
 use aterm_spec::interp::{self, State};
 use aterm_update_core::{HeadAnswer, HttpError};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::path::{Path, PathBuf};
+use std::collections::{BTreeSet, VecDeque};
 
 /// Every state `model` reaches, breadth-first over its actions.
 fn reachable(model: &Model) -> Vec<State> {
@@ -68,13 +56,13 @@ fn newest(tags: [i64; 3]) -> u64 {
     (1..=4).rev().find(|b| published(tags, *b)).unwrap_or(1)
 }
 
-/// Where the REAL walk leaves a store verified at `floor`: the newest candidate the tag
-/// walk returns (it returns the floor's own quad when nothing past it is published, or a
-/// run it cannot see across).
+/// Where the real walk leaves a store verified at `floor`: the newest candidate the tag
+/// walk returns (the floor's own quad when nothing past it is published, or a run it cannot
+/// see across).
 fn real_walk(floor: u64, tags: [i64; 3]) -> u64 {
     const PREFIX: &str = "https://github.com/alabsystems/aterm/releases/download/atpkg-index-";
     let fetcher = GithubFetcher::new("alabsystems".into()).with_index_floor(floor);
-    let mut head = |url: &str| -> Result<HeadAnswer, HttpError> {
+    let head = |url: &str| -> Result<HeadAnswer, HttpError> {
         let build = url
             .strip_prefix(PREFIX)
             .and_then(|rest| rest.strip_suffix("/index.toml"))
@@ -94,10 +82,9 @@ fn real_walk(floor: u64, tags: [i64; 3]) -> u64 {
     };
     // Every quad a candidate names downloads whole: the bind is about which number the
     // walk lands, not about an incomplete release (net.rs's own walk tests cover that).
-    let mut fetch =
-        |url: &str, _cap: u64| -> Result<Vec<u8>, String> { Ok(url.as_bytes().to_vec()) };
+    let fetch = |url: &str, _cap: u64| -> Result<Vec<u8>, String> { Ok(url.as_bytes().to_vec()) };
     let candidates = fetcher
-        .walk_candidates(&fetcher.index_slug(), &mut head, &mut fetch)
+        .walk_candidates(&fetcher.index_slug(), &head, &fetch)
         .expect("a walk over answered HEADs is never an error");
     candidates.first().map_or(floor, |newest| {
         newest
@@ -131,10 +118,10 @@ fn the_real_walk_lands_the_newest_index_on_every_channel_the_model_reaches() {
         seen.len()
     );
 
-    // NEGATIVE CONTROL: the draft baseline's hole. A's killed publish leaves a draft at 3,
-    // B's read counts it and publishes 4 on it, and 2 and 3 are missing directly above a
-    // store at 1. The model's invariant is violated there, and the real walk does not cross
-    // it either — the gap the writer's guards exist to prevent.
+    // Negative control: a killed publish leaves a draft at 3, the next publisher counts it and
+    // publishes 4, so 2 and 3 are missing directly above a store at 1. The model's invariant is
+    // violated there, and the real walk does not cross the gap either: the writer's guards
+    // exist to prevent it.
     let buggy = interp::with_buggy(&model, 1);
     let hole = reachable(&buggy)
         .into_iter()
@@ -146,442 +133,4 @@ fn the_real_walk_lands_the_newest_index_on_every_channel_the_model_reaches() {
         4,
         "two missing numbers directly above the floor are a gap no walk crosses"
     );
-}
-
-/// A sandbox holding stub gh / curl / signers / mirror and a fixture public channel, in
-/// which the REAL `tools/atpkg-index.sh` publishes — the shape `tools/test-atpkg-index-
-/// publish.sh` drives it in.
-struct Rig {
-    dir: aterm_tempfile::TempDir,
-    /// Publisher A's quad for each index number 1..=4, each built on A's previous one.
-    own: BTreeMap<u64, PathBuf>,
-    /// Another publisher's quad for 2..=4, built on the same baselines (other bytes).
-    foreign: BTreeMap<u64, PathBuf>,
-}
-
-const OWN_VALID_UNTIL: &str = "2098-01-01T00:00:00Z";
-const FOREIGN_VALID_UNTIL: &str = "2098-01-02T00:00:00Z";
-/// How many indexer runs [`Rig::publish_all`] keeps in flight: four a core, from 8 to 16.
-/// One run is about 0.25 s of CPU spread over ~65 short processes (the runs' ~15 CPU-s in
-/// all is the floor), so on a loaded machine its wall is queueing for the scheduler, and
-/// more lanes win the test a larger share of it. Measured on a 14-core machine, 16 and 32
-/// lanes were within noise of each other and 55 gained nothing more, so the cap is the
-/// lower figure: fewer processes in flight, and fewer bare `Command` spawns racing each
-/// other's pipe fds (AGENTS.md, Code).
-fn lane_count() -> usize {
-    std::thread::available_parallelism()
-        .map_or(8, |n| 4 * n.get())
-        .clamp(8, 16)
-}
-/// What [`Rig::publish`] answers: the indexer's exit 0, the channel it leaves, its transcript.
-type Run = (bool, [i64; 3], String);
-const QUAD: [&str; 4] = [
-    "index.toml",
-    "index.toml.sig",
-    "aterm-machines.toml",
-    "aterm-machines.toml.sig",
-];
-
-const STUB_ATPKG: &str = r#"#!/usr/bin/env bash
-case "${1:-}" in verify-index|verify-pkg) echo "stub-verified" ;; *) echo "atpkg stub: ${1:-}" >&2; exit 1 ;; esac
-"#;
-const STUB_KEYS: &str = r#"#!/usr/bin/env bash
-case "${1:-}" in pubkey) echo "STUBPUBKEY" ;; sign) echo "stub-sig" > "$4" ;; *) echo "atpkg-keys stub: ${1:-}" >&2; exit 1 ;; esac
-"#;
-const STUB_MIRROR: &str = "#!/usr/bin/env bash\nexit 0\n";
-/// gh over the fixture tree `$ATPKG_CONFORMANCE_FX/<owner>/<repo>/<tag>/<asset>`; a
-/// `.draft` file marks an orphaned draft, which gh shows a publisher exactly like a
-/// published release. The tree is named by the environment [`Rig::index`] hands the
-/// indexer (which its children inherit) rather than written into the stub, so every lane
-/// of [`Rig::publish_all`] execs the same two stubs over a channel of its own.
-const STUB_GH: &str = r#"#!/usr/bin/env bash
-[[ "${1:-}" == release ]] || { echo "gh stub: $*" >&2; exit 1; }
-sub="$2"; tag="${3:-}"; shift 3; repo=""; dest="."; pats=(); files=(); json=""; undraft=""
-while (( $# )); do
-	case "$1" in
-		-R) repo="$2"; shift ;; -D) dest="$2"; shift ;; -p) pats+=("$2"); shift ;;
-		--title|--notes|--jq|-q) shift ;; --json) json="$2"; shift ;; --draft=false) undraft=1 ;;
-		--clobber|--prerelease|--latest=false) ;; *) files+=("$1") ;;
-	esac
-	shift
-done
-d="${ATPKG_CONFORMANCE_FX:?}/$repo/$tag"
-case "$sub" in
-	view)
-		[[ -d "$d" ]] || { echo "release not found" >&2; exit 1; }
-		if [[ "$json" == isDraft ]]; then [[ -f "$d/.draft" ]] && echo true || echo false
-		elif [[ -n "$json" ]]; then ls "$d"; fi ;;
-	edit) [[ -d "$d" ]] || exit 1; [[ -z "$undraft" ]] || rm -f "$d/.draft" ;;
-	download)
-		[[ -d "$d" ]] || exit 1; mkdir -p "$dest"
-		for p in "${pats[@]}"; do [[ -f "$d/$p" ]] && cp "$d/$p" "$dest/"; done ;;
-	create)
-		[[ -d "$d" ]] && { echo "a release with the same tag name already exists" >&2; exit 1; }
-		mkdir -p "$d" && for f in "${files[@]}"; do cp "$f" "$d/"; done ;;
-	upload)
-		for f in "${files[@]}"; do [[ -f "$d/$(basename "$f")" ]] && exit 1; cp "$f" "$d/"; done ;;
-	*) echo "gh stub: release $sub" >&2; exit 1 ;;
-esac
-"#;
-/// curl as the download host over the same tree: a draft answers 404, like no release.
-const STUB_CURL: &str = r#"#!/usr/bin/env bash
-url=""; while (( $# )); do [[ "$1" == "--" ]] && { url="$2"; break; }; shift; done
-rel="${url#https://github.com/}"; rel="${rel%%/releases/download/*}/${rel#*/releases/download/}"
-f="${ATPKG_CONFORMANCE_FX:?}/$rel"
-if [[ -f "$f" && ! -f "$(dirname "$f")/.draft" ]]; then printf '302'; else printf '404'; fi
-"#;
-
-impl Rig {
-    fn new() -> Self {
-        let dir = aterm_tempfile::Builder::new()
-            .prefix("atpkg-index-publish-conformance-")
-            .tempdir()
-            .unwrap();
-        std::fs::create_dir_all(dir.path().join("bin")).unwrap();
-        std::fs::create_dir_all(dir.path().join("home")).unwrap();
-        for (name, body) in [
-            ("atpkg", STUB_ATPKG),
-            ("atpkg-keys", STUB_KEYS),
-            ("mirror", STUB_MIRROR),
-            ("gh", STUB_GH),
-            ("curl", STUB_CURL),
-        ] {
-            let path = dir.path().join("bin").join(name);
-            std::fs::write(&path, body).unwrap();
-            let mut perms = std::fs::metadata(&path).unwrap().permissions();
-            std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
-            std::fs::set_permissions(&path, perms).unwrap();
-        }
-        for (name, body) in [
-            ("machine.key", "stub-key\n"),
-            ("machine.toml", "id = \"m-test\"\npubkey = \"STUBPUBKEY\"\n"),
-            (
-                "aterm-machines.toml",
-                "roster_seq = 3\nvalid_until = \"2099-01-01T00:00:00Z\"\nrevoked = []\n\
-                 [[machine]]\nid = \"m-test\"\npubkey = \"STUBPUBKEY\"\n",
-            ),
-            ("aterm-machines.toml.sig", "sig\n"),
-            (
-                "pins.rs",
-                "pub const PAPER_MASTER_PUBKEYS: &[&str] = &[\n    \"STUBMASTER\",\n];\n",
-            ),
-            ("channel-token", "channel-token\n"),
-            ("programs.spec", "ay ay prebuilt-only 5\n"),
-        ] {
-            std::fs::write(dir.path().join(name), body).unwrap();
-        }
-        let mut rig = Rig {
-            dir,
-            own: BTreeMap::new(),
-            foreign: BTreeMap::new(),
-        };
-        let genesis = rig.dry_run("own-1", None, OWN_VALID_UNTIL);
-        rig.own.insert(1, genesis);
-        for n in 2..=4 {
-            let base = rig.own[&(n - 1)].join("index.toml");
-            // A's and the other publisher's quad for `n` share only the baseline they
-            // read, so they are built side by side; only A's chain is sequential.
-            let (own, foreign) = std::thread::scope(|s| {
-                let foreign = s.spawn(|| {
-                    rig.dry_run(&format!("foreign-{n}"), Some(&base), FOREIGN_VALID_UNTIL)
-                });
-                let own = rig.dry_run(&format!("own-{n}"), Some(&base), OWN_VALID_UNTIL);
-                let foreign = foreign
-                    .join()
-                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-                (own, foreign)
-            });
-            rig.own.insert(n, own);
-            rig.foreign.insert(n, foreign);
-        }
-        rig
-    }
-
-    /// Run the real indexer over the fixture channel `fx`; `(exit 0, transcript)`.
-    fn index(&self, fx: &Path, out: &Path, env: &[(&str, String)]) -> (bool, String) {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let bin = self.dir.path().join("bin");
-        let path = format!(
-            "{}:{}",
-            bin.display(),
-            std::env::var("PATH").unwrap_or_default()
-        );
-        // HERMETIC: the indexer sees exactly the environment below and nothing of the
-        // caller's (a stray token, an operator's BASELINE), so no name has to be listed
-        // for removal.
-        let tmp = self.dir.path().join("tmp");
-        let _ = std::fs::create_dir_all(&tmp);
-        // `spawnfd::command`, not a bare `Command`: sixteen of these run at once beside the
-        // other tests of this binary, and on a std without the SP-1 strip a std child inherits
-        // any descriptor another thread has open unflagged at its spawn (AGENTS.md,
-        // Code).
-        let mut cmd = aterm_uds::spawnfd::command("bash");
-        cmd.env_clear()
-            .arg(root.join("tools/atpkg-index.sh"))
-            .current_dir(self.dir.path())
-            .env("TMPDIR", &tmp)
-            .env("HOME", self.dir.path().join("home"))
-            .env("XDG_CONFIG_HOME", self.dir.path().join("home/.config"))
-            .env("PATH", path)
-            .env("ATPKG", bin.join("atpkg"))
-            .env("ATPKG_KEYS", bin.join("atpkg-keys"))
-            .env("MACHINE_KEY", self.dir.path().join("machine.key"))
-            .env("MACHINE_PUB", self.dir.path().join("machine.toml"))
-            .env("ROSTER", self.dir.path().join("aterm-machines.toml"))
-            .env("PINS_FILE", self.dir.path().join("pins.rs"))
-            .env("PROGRAMS", self.dir.path().join("programs.spec"))
-            .env("CHANNEL", "stable")
-            .env("CHANNEL_TOKEN_FILE", self.dir.path().join("channel-token"))
-            .env("MIRROR", bin.join("mirror"))
-            .env("ATPKG_CONFORMANCE_FX", fx)
-            .env("OUT", out);
-        for (k, v) in env {
-            cmd.env(k, v);
-        }
-        let output = cmd.output().expect("bash runs");
-        let log = format!(
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        (output.status.success(), log)
-    }
-
-    /// A signed, self-verified quad for the next index over `baseline` (the genesis, index
-    /// 1, when there is none), with no network. Its channel `fx` is never laid: a dry run
-    /// reads no channel, and any gh or curl question it asked would find no release.
-    fn dry_run(&self, name: &str, baseline: Option<&Path>, valid_until: &str) -> PathBuf {
-        let out = self.dir.path().join(name);
-        let mut env = vec![("VALID_UNTIL", valid_until.to_string())];
-        match baseline {
-            Some(base) => env.push(("BASELINE", base.display().to_string())),
-            None => {
-                env.push(("ALLOW_NO_BASELINE", "1".into()));
-                env.push(("INDEX_BUILD", "1".into()));
-            }
-        }
-        let (ok, log) = self.index(&self.dir.path().join("fx"), &out, &env);
-        assert!(ok, "fixture dry run {name} failed:\n{log}");
-        out
-    }
-
-    fn tag_dir(fx: &Path, build: u64) -> PathBuf {
-        fx.join("alabsystems/aterm")
-            .join(format!("atpkg-index-{build}"))
-    }
-
-    /// Lay out the public channel `fx`: 1 published, 2..=4 as `tags` codes.
-    fn lay(&self, fx: &Path, tags: [i64; 3]) {
-        let _ = std::fs::remove_dir_all(fx);
-        for build in 1..=4u64 {
-            let code = if build == 1 {
-                2
-            } else {
-                tags[build as usize - 2]
-            };
-            let source = match code {
-                0 => continue,
-                1 | 2 => &self.own[&build],
-                _ => &self.foreign[&build],
-            };
-            let tag = Self::tag_dir(fx, build);
-            std::fs::create_dir_all(&tag).unwrap();
-            for asset in QUAD {
-                std::fs::copy(source.join(asset), tag.join(asset)).unwrap();
-            }
-            if matches!(code, 1 | 3) {
-                std::fs::write(tag.join(".draft"), "").unwrap();
-            }
-        }
-    }
-
-    /// The code the fixture channel `fx` now holds at `build`.
-    fn code_at(&self, fx: &Path, build: u64) -> i64 {
-        let tag = Self::tag_dir(fx, build);
-        let Ok(bytes) = std::fs::read(tag.join("index.toml")) else {
-            return 0;
-        };
-        let mine = bytes == std::fs::read(self.own[&build].join("index.toml")).unwrap();
-        match (mine, tag.join(".draft").exists()) {
-            (true, true) => 1,
-            (true, false) => 2,
-            (false, true) => 3,
-            (false, false) => 4,
-        }
-    }
-
-    /// Publisher A, holding baseline `ba`, publishes `na` over the channel `tags`, laid
-    /// fresh in `fx`: the real indexer's exit, and the channel it leaves.
-    fn publish(&self, fx: &Path, ba: u64, na: u64, tags: [i64; 3]) -> Run {
-        self.lay(fx, tags);
-        let out = self
-            .dir
-            .path()
-            .join(format!("run-{ba}-{na}-{tags:?}").replace([' ', ',', '[', ']'], ""));
-        let _ = std::fs::remove_dir_all(&out);
-        let mut env = vec![
-            ("VALID_UNTIL", OWN_VALID_UNTIL.to_string()),
-            (
-                "BASELINE",
-                self.own[&ba].join("index.toml").display().to_string(),
-            ),
-            ("UPLOAD", "1".to_string()),
-        ];
-        if na != ba + 1 {
-            env.push(("INDEX_BUILD", na.to_string()));
-        }
-        let (ok, log) = self.index(fx, &out, &env);
-        (
-            ok,
-            [
-                self.code_at(fx, 2),
-                self.code_at(fx, 3),
-                self.code_at(fx, 4),
-            ],
-            log,
-        )
-    }
-
-    /// [`Rig::publish`] for every `(baseline, number, channel)` in `cases`, [`lane_count`] at a
-    /// time, each lane on a channel tree of its own; the results come back in `cases`
-    /// order, so the caller judges them exactly as it would one by one.
-    ///
-    /// The cases are independent: each lays its channel fresh, publishes into its own
-    /// `run-…` directory (where the indexer's publish lock also lives) and reads back only
-    /// its own channel, and the shared `HOME` and `TMPDIR` are left empty by a run (every
-    /// name the indexer makes there is a `mktemp`). One at a time they were the test's wall:
-    /// measured 2026-09-30, 62 runs of ~0.35 s each (the macOS `atpkg_lock` polls its
-    /// `lockf` holder with a 0.2 s sleep, then ~40 short processes): 23 s alone and 27 s in
-    /// a full `--lib` run, against 4.6 s alone with the lanes.
-    fn publish_all(&self, cases: &[(i64, i64, [i64; 3])]) -> Vec<Run> {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let next = AtomicUsize::new(0);
-        let mut done: Vec<(usize, Run)> = std::thread::scope(|s| {
-            let lanes: Vec<_> = (0..lane_count())
-                .map(|lane| {
-                    let next = &next;
-                    s.spawn(move || {
-                        let fx = self.dir.path().join(format!("fx-{lane}"));
-                        let mut mine = Vec::new();
-                        loop {
-                            let i = next.fetch_add(1, Ordering::Relaxed);
-                            let Some(&(ba, na, tags)) = cases.get(i) else {
-                                break mine;
-                            };
-                            mine.push((i, self.publish(&fx, ba as u64, na as u64, tags)));
-                        }
-                    })
-                })
-                .collect();
-            lanes
-                .into_iter()
-                .flat_map(|lane| {
-                    lane.join()
-                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
-                })
-                .collect()
-        });
-        done.sort_by_key(|(i, _)| *i);
-        done.into_iter().map(|(_, run)| run).collect()
-    }
-}
-
-#[test]
-fn the_real_indexer_takes_the_models_decision_on_every_channel_it_reaches() {
-    let model = atpkg_index_publish_walk_model();
-    let buggy = interp::with_buggy(&model, 1);
-    // Every decision publisher A faces while it holds a baseline: (baseline, number,
-    // channel), and whether the committed model reaches it (else only the mutant does).
-    let mut cases: BTreeMap<(i64, i64, [i64; 3]), bool> = BTreeMap::new();
-    for (m, committed) in [(&model, true), (&buggy, false)] {
-        for s in reachable(m) {
-            if s["pa"] == 1 {
-                cases
-                    .entry((s["ba"], s["na"], channel(&s)))
-                    .or_insert(committed);
-            }
-        }
-    }
-    let rig = Rig::new();
-    let decisions: Vec<(i64, i64, [i64; 3])> = cases.keys().copied().collect();
-    let runs = rig.publish_all(&decisions);
-    let mut controls: BTreeSet<&str> = BTreeSet::new();
-    let mut taken: BTreeSet<&str> = BTreeSet::new();
-    for (&(ba, na, tags), (ok, after, log)) in decisions.iter().zip(runs) {
-        let mut state = model.init_state();
-        for (var, value) in [
-            ("pa", 1),
-            ("ba", ba),
-            ("na", na),
-            ("t2", tags[0]),
-            ("t3", tags[1]),
-            ("t4", tags[2]),
-        ] {
-            state.insert(var, value);
-        }
-        let enabled: Vec<&str> = ["CreateA", "ConvergeA", "RefuseA"]
-            .into_iter()
-            .filter(|a| model.action_enabled(a, &state))
-            .collect();
-        assert_eq!(enabled.len(), 1, "one decision at {state:?}: {enabled:?}");
-        taken.insert(enabled[0]);
-        let label = format!("baseline {ba}, number {na}, channel {tags:?}");
-        match enabled[0] {
-            "RefuseA" => {
-                assert!(
-                    !ok,
-                    "{label}: the model refuses, the indexer published:\n{log}"
-                );
-                assert_eq!(after, tags, "{label}: a refusal writes nothing:\n{log}");
-                // The mutant writes here: the real indexer's refusal is the guard it drops.
-                if buggy.action_enabled("CreateA", &state)
-                    || buggy.action_enabled("ConvergeA", &state)
-                {
-                    controls.insert(if na != ba + 1 {
-                        "a number past the baseline's successor"
-                    } else if !published(tags, ba as u64) {
-                        "a baseline counted off a draft"
-                    } else {
-                        "a converge onto another publisher's bytes"
-                    });
-                }
-            }
-            decision => {
-                assert!(
-                    ok,
-                    "{label}: the model takes {decision}, the indexer refused:\n{log}"
-                );
-                assert!(model.fire(decision, &mut state));
-                if decision == "CreateA" {
-                    // The stub's create publishes in one step: the model's Create, Finish.
-                    assert!(model.fire("FinishA", &mut state));
-                }
-                assert_eq!(
-                    after,
-                    channel(&state),
-                    "{label}: {decision} leaves the channel the model says:\n{log}"
-                );
-            }
-        }
-    }
-    assert_eq!(
-        controls,
-        BTreeSet::from([
-            "a baseline counted off a draft",
-            "a converge onto another publisher's bytes",
-            "a number past the baseline's successor",
-        ]),
-        "every mutant decision is driven, and refused, at least once"
-    );
-    assert_eq!(
-        taken,
-        BTreeSet::from(["ConvergeA", "CreateA", "RefuseA"]),
-        "every decision is driven through the real indexer"
-    );
-    let committed = cases.values().filter(|c| **c).count();
-    eprintln!(
-        "index publish conformance: {} decisions ({committed} the committed model reaches)",
-        cases.len()
-    );
-    assert!(committed >= 10 && cases.len() > committed);
 }

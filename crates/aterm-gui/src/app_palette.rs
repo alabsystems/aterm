@@ -9,13 +9,22 @@
 //! `MenuTarget::menuAction:` uses ([`crate::menu`]). Active native-tab commands share the
 //! surface but carry an exact window/view/generation target and enter their reducer as
 //! `AppEvent::Action` only while that identity remains current.
+//! Theme rows ([`PaletteTarget::Theme`](crate::palette::PaletteTarget)) preview
+//! through the transient preview lane ([`crate::control_theme`]): the highlight is
+//! read once per event-loop turn ([`App::sync_palette_theme_preview`]), so a held
+//! arrow key or a pointer sweep costs one install per turn, not one per event.
+//! Enter keeps the chosen theme standing while its `theme` write is in flight
+//! ([`App::palette_choose_theme`]); Esc, or any other close, reverts.
 //! Every mutator just `request_redraw`s (the state change rides
 //! in `RepaintKey::settings_fp` via [`crate::WindowState::overlay_fp`]), and the frosted card
 //! is built by the shared `splice_settings_panel`.
 
 use crate::App;
 use crate::Wake;
-use crate::palette::{NativeCommandScope, NativeCommandTarget, PaletteLive, PaletteState};
+use crate::control_theme::PreviewHold;
+use crate::palette::{
+    NativeCommandScope, NativeCommandTarget, PaletteLive, PaletteState, PaletteTarget, PaletteTheme,
+};
 
 /// The `[keybindings]` face of a menu action, when one exists — the map that
 /// lets [`App::palette_live`] resolve each menu row's accelerator HINT from the
@@ -53,6 +62,7 @@ fn menu_binding(action: crate::menu::MenuAction) -> Option<crate::keybinding::Ac
         M::ToggleSeriousMode => K::ToggleSeriousMode,
         M::ToggleSettings => K::ToggleSettings,
         M::OpenPalette => K::OpenPalette,
+        M::ChooseTheme => K::ChooseTheme,
         M::NextTab => K::NextTab,
         M::PrevTab => K::PrevTab,
         M::RenameSession => K::RenameSession,
@@ -88,8 +98,164 @@ impl App {
         if let Some(scope) = self.native_palette_scope(wid) {
             state = state.with_native_commands(scope);
         }
+        state = state.with_themes(self.palette_themes());
         state.resolve(&self.palette_live());
         state
+    }
+
+    /// The theme the configuration draws: what a standing preview will restore,
+    /// else what is installed.
+    fn configured_theme_id(&self) -> &str {
+        self.theme_preview
+            .as_ref()
+            .map_or(self.installed_colors.id.as_str(), |preview| {
+                preview.restore.as_str()
+            })
+    }
+
+    /// The palette's Theme section, from the admitted catalog only: every
+    /// built-in (Default first, the registry's order), then each theme file that
+    /// loaded, labelled by its own `name =` verbatim (its id joins the label when
+    /// they differ, so two files sharing a name stay apart), its appearance the
+    /// row's hint. A file that did not load has no row: there is nothing to draw.
+    pub(crate) fn palette_themes(&self) -> Vec<PaletteTheme> {
+        let current = self.configured_theme_id();
+        let mut themes: Vec<PaletteTheme> = aterm_types::scheme::builtin_theme_list()
+            .into_iter()
+            .map(|builtin| PaletteTheme {
+                id: builtin.name.to_string(),
+                label: builtin.name.to_string(),
+                appearance: builtin.appearance,
+                current: builtin.name.eq_ignore_ascii_case(current),
+            })
+            .collect();
+        for (id, meta) in self.config_assets.themes.ready_themes() {
+            if aterm_types::scheme::builtin_theme(id).is_some() {
+                continue;
+            }
+            let label = if meta.display_name == id {
+                id.to_string()
+            } else {
+                format!("{}  \u{b7}  {id}", meta.display_name)
+            };
+            themes.push(PaletteTheme {
+                id: id.to_string(),
+                label,
+                appearance: meta.appearance,
+                current: id.eq_ignore_ascii_case(current),
+            });
+        }
+        themes
+    }
+
+    /// Open the command palette scoped to its Theme section (View ▸ Choose
+    /// Theme…, the `choose_theme` binding), the cursor on the configured theme.
+    /// An open command palette is closed first (reverting any preview it held),
+    /// so the scoped one starts from what the config draws.
+    pub(crate) fn open_theme_palette(&mut self) {
+        if self
+            .front()
+            .and_then(|ws| ws.palette())
+            .is_some_and(PaletteState::is_themes_only)
+        {
+            return;
+        }
+        if self.front().and_then(|ws| ws.palette()).is_some() {
+            self.palette_exit();
+        }
+        let Some(wid) = self.frontmost_window else {
+            return;
+        };
+        let state = self.palette_snapshot(wid).themes_only();
+        self.palette_open_state(wid, state);
+    }
+
+    /// Follow every open palette's theme highlight: a highlight that moved onto
+    /// a theme previews it ([`PreviewHold::Palette`], no TTL); one that moved off
+    /// the Theme section, or onto the configured theme, ends the palette's
+    /// preview; and with no palette open anywhere a palette-held preview ends
+    /// (a palette closed by another overlay, or with its window). Run once per
+    /// event-loop turn (`about_to_wait`) and at a close, so a run of moves within
+    /// one turn costs one install. Edge-triggered on each palette's highlight,
+    /// so a `theme preview` from the control socket is not fought over.
+    pub(crate) fn sync_palette_theme_preview(&mut self) {
+        let front = self.frontmost_window;
+        let mut any_open = false;
+        let mut ask: Option<Option<String>> = None;
+        let mut front_ask: Option<Option<String>> = None;
+        for (&wid, ws) in &mut self.windows {
+            let Some(palette) = ws.palette_mut() else {
+                continue;
+            };
+            any_open = true;
+            if let Some(change) = palette.take_theme_highlight_change() {
+                if Some(wid) == front {
+                    front_ask = Some(change);
+                } else {
+                    ask = Some(change);
+                }
+            }
+        }
+        let palette_held =
+            |preview: &crate::control_theme::ThemePreview| preview.hold == PreviewHold::Palette;
+        if !any_open {
+            self.end_theme_preview_if(palette_held);
+            return;
+        }
+        match front_ask.or(ask) {
+            None => {}
+            Some(Some(id)) if !id.eq_ignore_ascii_case(self.configured_theme_id()) => {
+                if let Err(why) = self.begin_theme_preview(&id, PreviewHold::Palette) {
+                    // The catalog moved under the open palette: draw what the
+                    // config draws rather than a stale highlight.
+                    aterm_log::debug!("palette theme preview {id:?}: {why}");
+                    self.end_theme_preview_if(palette_held);
+                }
+            }
+            Some(_) => {
+                self.end_theme_preview_if(palette_held);
+            }
+        }
+    }
+
+    /// The name the configuration draws on the side the OS appearance picks
+    /// now: a plain name, the side of a `dark:…,light:…` pair, or the unset
+    /// default's side. A name the catalog misses is returned as written, so
+    /// choosing what it falls back to still writes.
+    fn configured_side_name(&self) -> String {
+        crate::app_config::resolve_theme_name_value(
+            self.config.theme.as_deref(),
+            self.os_appearance,
+        )
+        .unwrap_or_else(|| crate::app_config::unset_theme_name(self.os_appearance).to_string())
+    }
+
+    /// Enter on a Theme row: keep `id` on screen while its `theme` write is in
+    /// flight ([`PreviewHold::Committing`]), so closing the palette does not
+    /// flash the old theme back, then queue exactly one write. The theme the
+    /// config already draws on this side writes nothing — a `dark:…,light:…`
+    /// pair or an unset `theme` keeps following the OS — and only ends the
+    /// palette's preview. A write that cannot be queued reverts the preview
+    /// and says why.
+    pub(crate) fn palette_choose_theme(&mut self, id: &str) {
+        if id.eq_ignore_ascii_case(&self.configured_side_name()) {
+            self.end_theme_preview_if(|preview| preview.hold == PreviewHold::Palette);
+            return;
+        }
+        let already = self
+            .theme_preview
+            .as_mut()
+            .filter(|preview| preview.id.eq_ignore_ascii_case(id));
+        if let Some(preview) = already {
+            preview.hold = PreviewHold::Committing;
+        } else if let Err(why) = self.begin_theme_preview(id, PreviewHold::Committing) {
+            self.post_message(crate::message_reporters::theme_not_saved(id, &why, false));
+            return;
+        }
+        if let Err(why) = self.queue_theme_choice(id) {
+            self.end_theme_preview_if(|preview| preview.hold == PreviewHold::Committing);
+            self.post_message(crate::message_reporters::theme_not_saved(id, &why, false));
+        }
     }
 
     /// The live predicates that resolve per-row enabled/checked, read off the front window —
@@ -347,6 +513,11 @@ impl App {
             return;
         };
         let state = self.palette_snapshot(wid);
+        self.palette_open_state(wid, state);
+    }
+
+    /// Put `state` up as the front window's palette (no-op if one is open).
+    fn palette_open_state(&mut self, wid: crate::WindowId, state: PaletteState) {
         let mut opened = false;
         if let Some(ws) = self.front_mut()
             && ws.palette().is_none()
@@ -442,6 +613,11 @@ impl App {
         }
         // Publish the now-empty tree (the overlay closed).
         self.overlay_a11y_update();
+        // Closing reverts what the palette's highlight was previewing (a theme
+        // chosen with Enter is held as Committing, which this leaves standing).
+        if closed {
+            self.end_theme_preview_if(|preview| preview.hold == PreviewHold::Palette);
+        }
         if closed
             && let Some(wid) = wid
             && let Some((x, y)) = self.windows.get(&wid).map(|window| window.last_cursor_px)
@@ -496,16 +672,23 @@ impl App {
         else {
             return;
         };
+        if let PaletteTarget::Theme(id) = target {
+            // Held as Committing before the close, so the close keeps it.
+            self.palette_choose_theme(&id);
+            self.palette_exit();
+            return;
+        }
         self.palette_exit();
         match target {
-            crate::palette::PaletteTarget::Menu(action) => {
+            PaletteTarget::Menu(action) => {
                 if let Some(proxy) = self.proxy.as_ref() {
                     let _ = proxy.send_event(Wake::MenuAction { action });
                 }
             }
-            crate::palette::PaletteTarget::Native(target) => {
+            PaletteTarget::Native(target) => {
                 let _ = self.activate_native_palette_target(&target);
             }
+            PaletteTarget::Theme(_) => {}
         }
     }
 
@@ -1277,5 +1460,291 @@ mod tests {
             rgba3, rgba2,
             "the open card re-tints off the new background"
         );
+    }
+
+    // ---- The Theme section: live preview, Enter keeps, Esc reverts ----------
+
+    use crate::control_theme::PreviewHold;
+    use crate::palette::PaletteTarget;
+
+    /// A headless App drawing `toml`, installed as a config reload would.
+    fn themed_app(toml: &str) -> App {
+        let mut app = App::headless_for_test();
+        app.config = aterm_toml::from_str(toml).expect("valid toml");
+        app.install_resolved_colors(crate::app_colorscheme::ThemeChange::ConfigReload);
+        app
+    }
+
+    /// The durable side of a theme: the config lane's text and revision, the
+    /// requests queued for it, and the in-memory `theme`.
+    fn durable(app: &App) -> (String, u64, usize, Option<String>) {
+        let snapshot = app.native_config_service.snapshot();
+        (
+            snapshot.text.to_string(),
+            snapshot.revision,
+            app.native_config_pending.len(),
+            app.config.theme.clone(),
+        )
+    }
+
+    fn front_palette(app: &App) -> &crate::palette::PaletteState {
+        app.windows[&WindowId(0)]
+            .palette()
+            .expect("the palette is open")
+    }
+
+    /// Move the cursor onto the first filtered row whose target is `id`.
+    fn highlight(app: &mut App, id: &str) {
+        let at = {
+            let palette = front_palette(app);
+            palette
+                .filtered()
+                .iter()
+                .position(|&i| palette.rows()[i].action == PaletteTarget::Theme(id.to_string()))
+                .unwrap_or_else(|| panic!("{id} is a row"))
+        };
+        let selected = {
+            let palette = front_palette(app);
+            palette
+                .filtered()
+                .iter()
+                .position(|&i| {
+                    Some(&palette.rows()[i].action) == palette.selected_target().as_ref()
+                })
+                .unwrap_or(0)
+        };
+        app.palette_move(at as isize - selected as isize);
+    }
+
+    /// `gruv` in the palette lists exactly the two Gruvbox themes among its
+    /// Theme rows, labelled by their names, their appearance the hint.
+    #[test]
+    fn palette_theme_filter_lists_both_gruvbox_rows() {
+        let mut app = themed_app("theme = \"Dracula\"\n");
+        app.palette_enter();
+        filter(&mut app, "gruv");
+        let palette = front_palette(&app);
+        let themes: Vec<(String, String)> = palette
+            .filtered()
+            .iter()
+            .map(|&i| &palette.rows()[i])
+            .filter(|row| matches!(row.action, PaletteTarget::Theme(_)))
+            .map(|row| (row.label.to_string(), row.shortcut.to_string()))
+            .collect();
+        assert_eq!(
+            themes,
+            [
+                ("Gruvbox Dark".to_string(), "dark".to_string()),
+                ("Gruvbox Light".to_string(), "light".to_string()),
+            ]
+        );
+        // The appearance is searchable too: every theme row "light" keeps is light.
+        app.palette_exit();
+        app.palette_enter();
+        filter(&mut app, "light");
+        let palette = front_palette(&app);
+        let light: Vec<&str> = palette
+            .filtered()
+            .iter()
+            .map(|&i| &palette.rows()[i])
+            .filter(|row| matches!(row.action, PaletteTarget::Theme(_)))
+            .map(|row| &*row.shortcut)
+            .collect();
+        assert!(!light.is_empty());
+        assert!(light.iter().all(|hint| *hint == "light"), "{light:?}");
+    }
+
+    /// Highlighting a theme draws it everywhere once the turn's sync runs, and
+    /// writes nothing; Esc puts back exactly what was drawn, config untouched.
+    #[test]
+    fn palette_theme_highlight_previews_and_esc_reverts() {
+        let mut app = themed_app("theme = \"Dracula\"\n");
+        let before = app.theme;
+        let durable_before = durable(&app);
+        app.palette_enter();
+        filter(&mut app, "gruv");
+        highlight(&mut app, "Gruvbox Light");
+        // A held key's repeats inside one turn: nothing is installed until the
+        // turn's sync, and then once.
+        assert_eq!(app.theme, before, "the highlight is read once per turn");
+        let fanouts = app.engine_color_fanouts;
+        app.sync_palette_theme_preview();
+        let light = aterm_types::scheme::builtin("Gruvbox Light").unwrap();
+        assert_eq!(app.theme, aterm_render::Theme::from(&light));
+        assert_eq!(app.engine_color_fanouts, fanouts + 1, "one install");
+        assert_eq!(
+            app.theme_preview.as_ref().map(|p| (p.id.as_str(), p.hold)),
+            Some(("Gruvbox Light", PreviewHold::Palette))
+        );
+        assert_eq!(
+            app.next_theme_preview_wake(),
+            None,
+            "a palette preview has no TTL"
+        );
+        // A second sync with the highlight unmoved changes nothing.
+        app.sync_palette_theme_preview();
+        assert_eq!(app.engine_color_fanouts, fanouts + 1);
+        assert_eq!(durable(&app), durable_before, "a preview writes nothing");
+
+        // Moving to the other row previews it.
+        highlight(&mut app, "Gruvbox Dark");
+        app.sync_palette_theme_preview();
+        let dark = aterm_types::scheme::builtin("Gruvbox Dark").unwrap();
+        assert_eq!(app.theme, aterm_render::Theme::from(&dark));
+
+        app.palette_input_event(
+            WindowId(0),
+            &crate::input::InputEvent::Key {
+                key: aterm_types::keyboard::Key::Named(aterm_types::keyboard::NamedKey::Escape),
+                mods: aterm_types::keyboard::Modifiers::empty(),
+                base_layout: None,
+                layout_text: None,
+                event_type: aterm_types::keyboard::KeyEventType::Press,
+            },
+        );
+        assert!(app.windows[&WindowId(0)].palette().is_none(), "Esc closes");
+        assert!(app.theme_preview.is_none(), "Esc ends the preview");
+        assert_eq!(app.theme, before, "Esc restores the configured theme");
+        assert_eq!(durable(&app), durable_before, "and writes nothing");
+    }
+
+    /// A palette closed some other way (another overlay took the slot) reverts
+    /// at the next turn's sync; a highlight that leaves the Theme section
+    /// reverts at once.
+    #[test]
+    fn palette_theme_preview_ends_when_the_highlight_or_the_palette_goes() {
+        let mut app = themed_app("theme = \"Dracula\"\n");
+        let before = app.theme;
+        app.palette_enter();
+        filter(&mut app, "gruv");
+        highlight(&mut app, "Gruvbox Light");
+        app.sync_palette_theme_preview();
+        assert_ne!(app.theme, before);
+        for _ in 0..4 {
+            app.palette_backspace(); // the cursor returns to the first (menu) row
+        }
+        assert!(
+            front_palette(&app)
+                .selected_target()
+                .is_some_and(|target| !matches!(target, PaletteTarget::Theme(_)))
+        );
+        app.sync_palette_theme_preview();
+        assert!(app.theme_preview.is_none());
+        assert_eq!(
+            app.theme, before,
+            "off the Theme section, nothing is previewed"
+        );
+
+        filter(&mut app, "gruv");
+        highlight(&mut app, "Gruvbox Light");
+        app.sync_palette_theme_preview();
+        assert_ne!(app.theme, before);
+        app.windows.get_mut(&WindowId(0)).unwrap().overlay = None;
+        app.sync_palette_theme_preview();
+        assert!(
+            app.theme_preview.is_none(),
+            "no palette, no palette preview"
+        );
+        assert_eq!(app.theme, before);
+    }
+
+    /// Negative control: moving over rows that are not themes never touches the
+    /// preview lane, and a `theme preview` from the socket survives a palette
+    /// whose highlight did not move.
+    #[test]
+    fn palette_non_theme_rows_leave_the_preview_lane_alone() {
+        let mut app = themed_app("theme = \"Dracula\"\n");
+        let before = app.theme;
+        app.palette_enter();
+        for _ in 0..5 {
+            app.palette_move(1);
+            app.sync_palette_theme_preview();
+            assert!(
+                front_palette(&app)
+                    .selected_target()
+                    .is_some_and(|target| !matches!(target, PaletteTarget::Theme(_)))
+            );
+            assert!(app.theme_preview.is_none());
+            assert_eq!(app.theme, before);
+        }
+        let now = std::time::Instant::now();
+        app.preview_theme("Nord", std::time::Duration::from_secs(60), now)
+            .expect("a built-in previews");
+        app.palette_move(1);
+        app.sync_palette_theme_preview();
+        assert_eq!(
+            app.theme_preview.as_ref().map(|p| p.id.as_str()),
+            Some("Nord"),
+            "the palette does not fight a control-socket preview"
+        );
+        app.palette_exit();
+        assert_eq!(
+            app.theme_preview.as_ref().map(|p| p.id.as_str()),
+            Some("Nord"),
+            "closing the palette ends only a palette-held preview"
+        );
+    }
+
+    /// Enter on a Theme row attempts exactly one write and keeps nothing it
+    /// could not save: headless has no event-loop proxy, so the one attempt is
+    /// refused, said once, and the screen returns to the configured theme.
+    #[test]
+    fn palette_theme_enter_attempts_one_write_and_reverts_when_refused() {
+        let mut app = themed_app("theme = \"Dracula\"\n");
+        let before = app.theme;
+        let durable_before = durable(&app);
+        app.palette_enter();
+        filter(&mut app, "gruv");
+        highlight(&mut app, "Gruvbox Light");
+        app.sync_palette_theme_preview();
+        app.palette_activate();
+        assert!(
+            app.windows[&WindowId(0)].palette().is_none(),
+            "Enter closes"
+        );
+        assert!(app.has_live_message("Couldn't save the theme"));
+        assert!(app.theme_preview.is_none(), "an unsaved choice is not kept");
+        assert_eq!(app.theme, before);
+        assert_eq!(durable(&app), durable_before);
+    }
+
+    /// View ▸ Choose Theme… (and the `choose_theme` key) opens the palette
+    /// scoped to its Theme section, the cursor on the configured theme, which
+    /// is not re-installed; its rows are exactly the theme rows.
+    #[test]
+    fn choose_theme_opens_the_scoped_palette_on_the_configured_theme() {
+        let mut app = themed_app("theme = \"Nord\"\n");
+        let fanouts = app.engine_color_fanouts;
+        app.dispatch_action(WindowId(0), crate::keybinding::Action::ChooseTheme);
+        let palette = front_palette(&app);
+        assert!(palette.is_themes_only());
+        assert_eq!(palette.highlighted_theme(), Some("Nord"));
+        // Every theme row, then the section's way to Settings ▸ Themes.
+        let scoped = palette.filtered();
+        let (browse, themes) = scoped.split_last().expect("rows");
+        assert!(
+            themes
+                .iter()
+                .all(|&i| matches!(palette.rows()[i].action, PaletteTarget::Theme(_)))
+        );
+        assert!(
+            matches!(
+                palette.rows()[*browse].action,
+                PaletteTarget::Menu(crate::menu::MenuAction::BrowseThemes)
+            ),
+            "the scoped palette ends on Browse all themes…"
+        );
+        assert!(palette.controls_lines()[0].ends_with("scope=themes"));
+        app.sync_palette_theme_preview();
+        assert!(app.theme_preview.is_none(), "opening previews nothing");
+        assert_eq!(app.engine_color_fanouts, fanouts);
+        // Opening it again is a no-op, not a toggle.
+        app.open_theme_palette();
+        assert!(front_palette(&app).is_themes_only());
+        assert_eq!(
+            crate::keybinding::Action::parse("choose_theme"),
+            Some(crate::keybinding::Action::ChooseTheme)
+        );
+        assert!(crate::keybinding::ACTION_NAMES.contains(&"choose_theme"));
     }
 }

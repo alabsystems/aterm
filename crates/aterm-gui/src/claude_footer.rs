@@ -24,8 +24,18 @@
 //!   shows it is not left to the next keystroke. Where nothing since the
 //!   process started names its model or effort, the frame compose reads
 //!   Claude's launch card off the pane (`footer::launch_card`) on every
-//!   frame while that holds, and keeps the newest reading for that process
-//!   and session (`SessionTimeline::note_claude_card`).
+//!   rebuild of the pane's text while that holds, and keeps the newest
+//!   reading for that process and session (`SessionTimeline::note_claude_card`).
+//! * AT REST, NOTHING (owner, 2026-10-15: "the user experince must be
+//!   extremely smooth and zero latency!"). The pane's text, its readings
+//!   (the rule, the lights' pill, the launch card) and the rule composed
+//!   from the facts are kept per pane ([`PaneTextCache`], [`PaneFooter`]): a
+//!   frame whose scratch and facts did not move allocates nothing, reads
+//!   nothing and composes nothing; a rebuild of the text — a keystroke, a
+//!   streamed row, a spinner's tick — reads only what its changed rows can
+//!   move ([`Readings::after`]). The work is counted (`work_counts`) and
+//!   asserted (`claude_footer_cost_tests.rs`, with the probe that measures
+//!   it).
 //! * THE LIMIT WALL. A limit the session HIT, written into its transcript
 //!   (`⧗ 5h limit · resets 3pm`), stands until its reset passes or a response
 //!   is served after it; while one shows, the resolver keeps re-reading the
@@ -71,7 +81,7 @@
 //!   as a line of type (`footer::set_facts`, owner 2026-10-14: the
 //!   spacing): letters and words `footer::FACT_PITCH` apart, the facts an
 //!   even `footer::GAP` apart, the rule running on up to them
-//!   (`compose_rule`). `[claude_footer] usage = false` hides `Σ` (shown by
+//!   (`compose_rule_spans`). `[claude_footer] usage = false` hides `Σ` (shown by
 //!   default), applied here and in the repaint key. The Claude lights
 //!   (`crate::claude_lights`) go in the same rule, left of the facts, rule
 //!   glyphs between.
@@ -113,6 +123,28 @@ use crate::{App, VisibleContentRoute, Wake, WindowId};
 /// well inside a turn and costs one small file, one tail and one `HEAD`.
 pub(crate) const RECHECK: Duration = Duration::from_secs(2);
 
+/// Whether the footer is drawn for `program`, a session's published program
+/// (its foreground argv0's basename): every name the supervisor reads as
+/// Claude Code ([`aterm_phase::program_of`]: `claude`, `claude-code`, any
+/// case), so the footer, the chips and the harness card stand wherever the
+/// host supervises Claude Code by name ([`crate::harness_host::agent_of`]).
+/// The one predicate both askers (the status sweep, `session_program`'s
+/// resolver) ask. A process so named that is not Claude Code has no
+/// `sessions/<pid>.json` (`footer::read_pid`), so nothing is painted for it.
+/// A Claude Code started as `node`, which the host supervises by its
+/// screen, gets no footer: its reader is presence's, not this resolver's.
+pub(crate) fn drawn_for(program: Option<&str>) -> bool {
+    program
+        .and_then(aterm_phase::program_of)
+        .is_some_and(|program| match program {
+            aterm_phase::Program::Claude => true,
+            aterm_phase::Program::Codex
+            | aterm_phase::Program::Agy
+            | aterm_phase::Program::Muse
+            | aterm_phase::Program::Generic => false,
+        })
+}
+
 /// One pane's painted light block, held until the write says whether its row
 /// reached the scratch (only a light the glass shows gets a hit).
 struct Lit {
@@ -124,12 +156,61 @@ struct Lit {
     /// The frame column the LIGHTS (not the title) start at.
     lights_col: usize,
     block: crate::claude_lights::Block,
+    /// The write put its row on the frame: its hits are noted.
+    shown: bool,
+}
+
+/// The footer splice's per-frame lists, kept on the window for their
+/// buffers (`WindowState::claude_footer_lists`): taken at the top of a
+/// splice and handed back EMPTY at its end, so a frame allocates none of
+/// them once they are grown — and keeps no pane's text, facts or chips past
+/// its splice.
+#[derive(Default)]
+pub(crate) struct SpliceLists {
+    panes: Vec<FooterPane>,
+    seen: Vec<SeenPane>,
+    /// Panes whose composer is on the glass with no plain rule glyph to
+    /// write into (a selection over the whole rule): nothing is painted,
+    /// but the keyboard's chord is still the lights'.
+    bare: Vec<u64>,
+    /// The rules' compositions, written as [`rule_edits`].
+    rules: Vec<RuleWrite>,
+    lit: Vec<Lit>,
+    /// The rule row's coverable cells ([`rule_mask`]), one pane's at a time.
+    mask: Vec<bool>,
+}
+
+/// One pane's composition for its composer rule ([`compose_rule_spans`],
+/// kept in the pane's [`PaneFooter`] on leaf `leaf_index`): its cells at
+/// `col` of frame row `frame_row`, `ground` the pane's blank, and `glass`
+/// the cells of it the rule already draws.
+struct RuleWrite {
+    frame_row: usize,
+    col: usize,
+    leaf_index: usize,
+    ground: RenderCell,
+    glass: std::ops::Range<usize>,
+}
+
+impl SpliceLists {
+    /// Empty every list, keeping its buffer.
+    fn clear(&mut self) {
+        self.panes.clear();
+        self.seen.clear();
+        self.bare.clear();
+        self.rules.clear();
+        self.lit.clear();
+        self.mask.clear();
+    }
 }
 
 /// One Claude Code pane's composer rule, gathered under the window borrow
 /// and painted after it (the lights need `&mut App`).
 struct FooterPane {
     session: u64,
+    /// The pane's leaf, whose [`PaneFooter`] holds what the footer shows
+    /// (the facts, filled from the kept launch card) and its composition.
+    leaf_index: usize,
     frame_row: usize,
     /// The same row as a window grid row.
     term_row: usize,
@@ -139,18 +220,29 @@ struct FooterPane {
     /// One of the rule's own glyph cells: what the separator between the
     /// lights and the facts is drawn with.
     rule: RenderCell,
-    /// What the footer shows (the facts, filled from the kept launch card).
-    facts: FooterFacts,
     blank: RenderCell,
+    /// The session's own Autopilot word and its view, read once this frame
+    /// (`App::session_autopilot`): what the harness's chips say
+    /// (`crate::claude_lights`).
+    autopilot: (
+        Option<aterm_agent::supervise::Autopilot>,
+        crate::autopilot::AutopilotView,
+    ),
 }
 
-/// The screen captured for a visible Claude pane, retained until the lights
-/// have observed this frame and the cache has dropped panes that left it.
-struct SeenPaneText {
+/// A visible Claude Code pane and the lights' reading of its rows, held
+/// until the lights have observed this frame and the cache has dropped panes
+/// that left it.
+struct SeenPane {
     leaf_index: usize,
     session: u64,
-    texts: Arc<Vec<String>>,
+    lights: LightsRead,
 }
+
+/// The lights' reading of a pane's rows (`lights::read_lights`): `None` where
+/// its reader panicked (the lights fold nothing in), else the mode and the
+/// pill under the composer — `None` without one.
+pub(crate) type LightsRead = Option<Option<aterm_agent::harness::lights::Reading>>;
 
 /// Screen text is an input to the footer and lights readers, not a separate
 /// reading of the terminal. The scratch's revision already says whether its
@@ -158,9 +250,23 @@ struct SeenPaneText {
 /// stay in front. In particular, [`undo`] restores the pre-footer revision on
 /// an unchanged frame, so effect-only paints do not walk and allocate every
 /// cell of a long Claude transcript again.
+///
+/// So are the READINGS of the text ([`Readings`]: the composer's frame, the
+/// rule's mode row, the lights' pill): taken once per rebuild of the rows and
+/// shared by every frame that reuses them — and kept across a rebuild where
+/// no row they read changed — and the footer COMPOSED from the facts
+/// ([`PaneFooter`], per leaf): a frame at rest reads nothing, copies nothing
+/// and composes nothing.
 #[derive(Debug, Default)]
 pub(crate) struct PaneTextCache {
     panes: Vec<Option<CachedPaneText>>,
+    /// Each leaf's footer as the frames before composed it.
+    footers: Vec<PaneFooter>,
+    /// The last rebuild's number: each rebuild of a pane's rows takes the
+    /// next ([`CachedPaneText::text_gen`]).
+    rebuilds: u64,
+    /// The rows a rebuild found changed ([`Self::rows`]), reused.
+    changed: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,10 +288,149 @@ struct PaneTextRegion {
     cols: usize,
 }
 
-#[derive(Debug)]
 struct CachedPaneText {
     key: PaneTextKey,
     rows: Arc<Vec<String>>,
+    /// This rebuild's number, unique in the cache: the same number, the same
+    /// cells — what lets the harness card keep its layout without looking at
+    /// them (`crate::claude_card`).
+    text_gen: u64,
+    /// The footer's and the lights' readings of `rows`: taken in the rebuild
+    /// — or kept from the last where no row they read changed
+    /// ([`Readings::after`]).
+    readings: Readings,
+    /// The Claude Code build the vendor-drift check last read these readings
+    /// for ([`note_vendor_drift`], by a hash of its version): checked again
+    /// only for another build or new readings.
+    drift: std::cell::Cell<Option<u64>>,
+    /// The launch card on `rows` for the footer's open model or effort
+    /// (`footer::launch_card`): read at most once per rebuild, and only while
+    /// the facts leave one open ([`PaneTextCache::footer_card`]).
+    footer_card: std::cell::OnceCell<Option<aterm_phase::LaunchCard>>,
+    /// The rule's coverable run and its glyph on frame row `.0`
+    /// ([`rule_mask`], `footer::rule_run`): taken at most once per rebuild —
+    /// the scratch it was read off is the one `key`'s tokens name.
+    rule_run: std::cell::Cell<Option<KeptRun>>,
+    /// The harness card's reading of `rows` (`crate::claude_card::read_card`):
+    /// taken at most once per rebuild, and only when a card is wanted — or
+    /// kept from the last rebuild where no row it reads changed
+    /// (`CardReading::holds`); shared with every frame that reuses the rows,
+    /// never copied.
+    card: std::cell::OnceCell<crate::claude_card::CardReading>,
+    /// The last reading's card, until this rebuild's reading is taken: an
+    /// equal card is the same one, shared (a card that moved back allocates
+    /// nothing).
+    card_before: std::cell::Cell<Option<Arc<crate::claude_card::CardRead>>>,
+}
+
+/// A composer rule's run read off frame row `frame_row` ([`CachedPaneText::rule_run`]):
+/// the coverable cells `start..end` and the rule's glyph — `None` where the
+/// row holds no rule to write into.
+#[derive(Debug, Clone, Copy)]
+struct KeptRun {
+    frame_row: usize,
+    run: Option<(usize, usize, RenderCell)>,
+}
+
+impl std::fmt::Debug for CachedPaneText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CachedPaneText")
+            .field("key", &self.key)
+            .field("rows", &self.rows.len())
+            .field("text_gen", &self.text_gen)
+            .field("readings", &self.readings)
+            .field("card", &self.card)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The footer's and the lights' readings of one pane's rows, every one a
+/// function of the composer's frame and the rows UNDER its bottom rule
+/// alone — read off them by construction ([`read_pane`]): the rule and the
+/// mode row under it (`footer::mode_row_under`), the mode the lights' pill
+/// names and whether one is drawn (`lights::reading_under`). So a rebuild
+/// whose changed rows leave the frame where it was and change no row under
+/// it — a keystroke's echo in the composer, a row Claude streams over it, a
+/// spinner's tick — keeps them, read as they were
+/// (`aterm_phase::phase::FrameReach::holds_under`), and searches for the
+/// frame again only where a changed row is one its search read
+/// ([`Self::after`]).
+#[derive(Debug, Clone, Copy)]
+struct Readings {
+    /// The composer's frame and the rows its search read; `None` where the
+    /// search panicked (no reading is then kept: each rebuild reads anew).
+    reach: Option<aterm_phase::phase::FrameReach>,
+    /// The footer's: where its rule is, and whether a mode row this build
+    /// reads sits under it.
+    rule: FooterRead,
+    /// The lights'.
+    lights: LightsRead,
+}
+
+impl Readings {
+    /// These readings of a pane's rows as the rows are now (`rows`), the rows
+    /// `changed` changed since: kept where none of the changed rows is one
+    /// they read, else read anew — and whether they were kept. The frame's
+    /// search runs again only where a changed row is one it read
+    /// (`FrameReach::unmoved`).
+    fn after(self, session: u64, rows: &[String], changed: &[usize]) -> (Readings, bool) {
+        let Some(reach) = self.reach else {
+            return (read_pane(session, rows, None), false);
+        };
+        let now = if reach.unmoved(changed) {
+            Some(reach)
+        } else {
+            #[cfg(test)]
+            crate::work_counts::footer_frame_searched();
+            crate::reader_guard::read_or_none(session, "Claude Code footer", rows, || {
+                aterm_phase::phase::FrameReach::of(rows)
+            })
+        };
+        match now {
+            Some(now) if reach.holds_under(&now, changed) => (
+                Readings {
+                    reach: Some(now),
+                    ..self
+                },
+                true,
+            ),
+            now => (read_pane(session, rows, now), false),
+        }
+    }
+}
+
+/// Read pane `session`'s `rows` for the footer and the lights, each reader
+/// behind the reader's panic fence (`crate::reader_guard`) as before: the
+/// composer's frame (`found`, where the caller has searched for it) and,
+/// under its bottom rule, the footer's mode row ([`read_footer`]) and the
+/// lights' pill. Where the frame's own search panics, the footer reads no
+/// rule and the lights' reader reads the rows whole, behind its own fence.
+fn read_pane(
+    session: u64,
+    rows: &[String],
+    found: Option<aterm_phase::phase::FrameReach>,
+) -> Readings {
+    #[cfg(test)]
+    crate::work_counts::footer_pane_read();
+    let reach = found.or_else(|| {
+        crate::reader_guard::read_or_none(session, "Claude Code footer", rows, || {
+            aterm_phase::phase::FrameReach::of(rows)
+        })
+    });
+    let rule =
+        reach.and_then(|reach| read_footer(session, rows, |rows| read_rule_under(rows, reach)));
+    let lights =
+        crate::reader_guard::read_or_none(session, "Claude Code lights", rows, || match reach {
+            Some(reach) => reach
+                .rules()
+                .map(|(_, bottom)| aterm_agent::harness::lights::reading_under(rows, bottom)),
+            None => aterm_agent::harness::lights::read_lights(rows),
+        });
+    Readings {
+        reach,
+        rule,
+        lights,
+    }
 }
 
 impl PaneTextCache {
@@ -193,14 +438,21 @@ impl PaneTextCache {
     /// long sequence of tab layouts).
     fn trim(&mut self, leaves: usize) {
         self.panes.truncate(leaves);
+        self.footers.truncate(leaves);
     }
 
     /// A pane that no longer shows a Claude footer must not keep its old
-    /// transcript resident just because another pane still has one.
+    /// transcript resident just because another pane still has one — nor its
+    /// facts.
     fn retain_active(&mut self, active: impl Fn(usize) -> bool) {
         for (index, cached) in self.panes.iter_mut().enumerate() {
             if !active(index) {
                 *cached = None;
+            }
+        }
+        for (index, footer) in self.footers.iter_mut().enumerate() {
+            if !active(index) && footer.from.is_some() {
+                *footer = PaneFooter::default();
             }
         }
     }
@@ -223,40 +475,512 @@ impl PaneTextCache {
             return Arc::clone(&cached.rows);
         }
         // A typed echo changes the scratch revision even when nearly every row
-        // keeps the same shape. Once the last frame's readers have gone, reuse
-        // their row buffers instead of allocating one String per row again.
-        // A still-held Arc remains an immutable snapshot; a different session
-        // or pane region also gets fresh storage rather than retaining its old
-        // transcript in the new pane's spare String capacities.
-        let mut rows = self
+        // keeps the same shape. The last rebuild's rows are compared as the
+        // new ones are read, and only the rows that changed are written: once
+        // the last frame's readers have gone, into their own buffers (the Arc
+        // itself reused); while one holds them, they stay its immutable
+        // snapshot — this rebuild's too where no row changed, else fresh
+        // storage. A different session or pane region also gets fresh storage
+        // rather than retaining its old transcript in the new pane's spare
+        // String capacities.
+        let last = self
             .panes
             .get_mut(leaf_index)
             .and_then(Option::take)
-            .filter(|cached| cached.key.session == session && cached.key.region == region)
-            .and_then(|cached| Arc::try_unwrap(cached.rows).ok())
-            .unwrap_or_default();
-        rows.resize_with(region.rows, String::new);
-        for (r, text) in rows.iter_mut().enumerate() {
-            text.clear();
-            if let Some(row) = scratch.cells.get(region.strip + region.row_off + r) {
-                text.extend(
-                    row.iter()
-                        .skip(region.col_off)
-                        .take(region.cols)
-                        .map(|c| c.ch),
-                );
-            }
-        }
-        let text = Arc::new(rows);
+            .filter(|cached| cached.key.session == session && cached.key.region == region);
+        let changed = &mut self.changed;
+        changed.clear();
+        // Row `r` of the pane: its cells in the frame (`None`: a row the frame
+        // does not hold), and their chars.
+        let span = |r: usize| {
+            scratch
+                .cells
+                .get(region.strip + region.row_off + r)
+                .map(|row| {
+                    let row = row.get(region.col_off..).unwrap_or_default();
+                    &row[..row.len().min(region.cols)]
+                })
+        };
+        let cells = |r: usize| span(r).map(|row| row.iter().map(|c| c.ch));
+        let fresh = || -> Vec<String> {
+            (0..region.rows)
+                .map(|r| cells(r).map_or_else(String::new, Iterator::collect))
+                .collect()
+        };
+        let (text, readings, drift, card, card_before) =
+            match last {
+                Some(cached) => {
+                    let mut rows = cached.rows;
+                    if let Some(texts) = Arc::get_mut(&mut rows) {
+                        texts.resize_with(region.rows, String::new);
+                        for (r, text) in texts.iter_mut().enumerate() {
+                            if !same_text(text, span(r)) {
+                                changed.push(r);
+                                text.clear();
+                                text.extend(cells(r).into_iter().flatten());
+                            }
+                        }
+                    } else {
+                        changed.extend((0..region.rows).filter(|&r| {
+                            !same_text(rows.get(r).map_or("", String::as_str), span(r))
+                        }));
+                        if !changed.is_empty() {
+                            rows = Arc::new(fresh());
+                        }
+                    }
+                    // The footer's and the lights' readings: kept where no row
+                    // they read changed, else read anew — and the drift check's
+                    // build with them.
+                    let (readings, kept) = cached.readings.after(session, &rows, changed);
+                    let drift = if kept { cached.drift.get() } else { None };
+                    // The card the last rebuild read here: kept where no row it
+                    // reads changed, else this rebuild's reading shares its card
+                    // where it is the same.
+                    let reading = cached.card.into_inner();
+                    let before = cached.card_before.into_inner();
+                    let (card, card_before) = match reading {
+                        Some(reading) if reading.holds(session, &rows, changed) => {
+                            (std::cell::OnceCell::from(reading), None)
+                        }
+                        Some(reading) => (std::cell::OnceCell::new(), reading.read.or(before)),
+                        None => (std::cell::OnceCell::new(), before),
+                    };
+                    (rows, readings, drift, card, card_before)
+                }
+                None => {
+                    let rows = Arc::new(fresh());
+                    let readings = read_pane(session, &rows, None);
+                    (rows, readings, None, std::cell::OnceCell::new(), None)
+                }
+            };
         if self.panes.len() <= leaf_index {
             self.panes.resize_with(leaf_index + 1, || None);
         }
+        #[cfg(test)]
+        crate::work_counts::pane_text_rebuilt();
+        self.rebuilds += 1;
         self.panes[leaf_index] = Some(CachedPaneText {
             key,
             rows: Arc::clone(&text),
+            text_gen: self.rebuilds,
+            readings,
+            drift: std::cell::Cell::new(drift),
+            footer_card: std::cell::OnceCell::new(),
+            rule_run: std::cell::Cell::new(None),
+            card,
+            card_before: std::cell::Cell::new(card_before),
         });
         text
     }
+
+    /// The footer's and the lights' readings of leaf `leaf_index`'s cached
+    /// rows ([`Self::rows`] took them).
+    fn readings(&self, leaf_index: usize) -> Option<Readings> {
+        Some(self.panes.get(leaf_index)?.as_ref()?.readings)
+    }
+
+    /// The vendor-drift check ([`note_vendor_drift`]) of leaf `leaf_index`'s
+    /// cached rows for build `version`: run once per reading of them and
+    /// build — again it could only find what it found, and log nothing.
+    fn note_drift(&self, leaf_index: usize, session: u64, version: Option<&str>) {
+        use std::hash::{Hash, Hasher};
+        let Some(Some(cached)) = self.panes.get(leaf_index) else {
+            return;
+        };
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        version.hash(&mut h);
+        let build = h.finish();
+        if cached.drift.replace(Some(build)) != Some(build) {
+            note_vendor_drift(session, version, &cached.rows);
+        }
+    }
+
+    /// The launch card on leaf `leaf_index`'s cached rows, while they are
+    /// `session`'s, for the footer's open model or effort
+    /// (`footer::launch_card`, behind the reader's panic fence): read at
+    /// most once per rebuild of the rows, every frame that reuses them
+    /// sharing the reading.
+    fn footer_card(&self, leaf_index: usize, session: u64) -> Option<&aterm_phase::LaunchCard> {
+        let cached = self.panes.get(leaf_index)?.as_ref()?;
+        if cached.key.session != session {
+            return None;
+        }
+        cached
+            .footer_card
+            .get_or_init(|| {
+                #[cfg(test)]
+                crate::work_counts::footer_card_read();
+                crate::reader_guard::read_or_none(
+                    session,
+                    "Claude Code launch card",
+                    &cached.rows,
+                    || footer::launch_card(&cached.rows),
+                )
+                .flatten()
+            })
+            .as_ref()
+    }
+
+    /// The run of leaf `leaf_index`'s composer rule on frame row `frame_row`
+    /// of `scratch` that aterm may cover, and the rule's glyph
+    /// ([`rule_mask_into`] into `mask`, `footer::rule_run`): read off the
+    /// scratch at most once per rebuild of the pane's rows — a frame that
+    /// reuses them has the scratch their key's tokens name, cell for cell
+    /// (what [`undo`] gives back), so its rule reads as it read.
+    fn rule_run(
+        &self,
+        leaf_index: usize,
+        scratch: &RenderInput,
+        frame_row: usize,
+        (col_off, pane_cols): (usize, usize),
+        mask: &mut Vec<bool>,
+    ) -> Option<(std::ops::Range<usize>, RenderCell)> {
+        let read = |mask: &mut Vec<bool>| {
+            #[cfg(test)]
+            crate::work_counts::footer_rule_masked();
+            let rule = rule_mask_into(mask, scratch, frame_row, col_off, pane_cols)?;
+            let run = footer::rule_run(mask)?;
+            Some((run.start, run.end, rule))
+        };
+        let run = match self.panes.get(leaf_index) {
+            Some(Some(cached)) => match cached.rule_run.get() {
+                Some(kept) if kept.frame_row == frame_row => kept.run,
+                _ => {
+                    let run = read(mask);
+                    cached.rule_run.set(Some(KeptRun { frame_row, run }));
+                    run
+                }
+            },
+            _ => read(mask),
+        };
+        run.map(|(start, end, rule)| (start..end, rule))
+    }
+
+    /// Leaf `leaf_index`'s footer, `session`'s: a pane that shows another
+    /// session starts afresh.
+    fn footer(&mut self, leaf_index: usize, session: u64) -> &mut PaneFooter {
+        if self.footers.len() <= leaf_index {
+            self.footers
+                .resize_with(leaf_index + 1, PaneFooter::default);
+        }
+        let footer = &mut self.footers[leaf_index];
+        if footer.session != session {
+            *footer = PaneFooter {
+                session,
+                ..PaneFooter::default()
+            };
+        }
+        footer
+    }
+
+    /// Leaf `leaf_index`'s footer as this frame gathered it.
+    fn footer_mut(&mut self, leaf_index: usize) -> Option<&mut PaneFooter> {
+        self.footers.get_mut(leaf_index)
+    }
+
+    /// The cells of leaf `leaf_index`'s composed rule ([`PaneFooter::compose`]).
+    fn composed(&self, leaf_index: usize) -> &[RenderCell] {
+        self.footers
+            .get(leaf_index)
+            .map_or(&[], |f| f.rule.cells.as_slice())
+    }
+
+    /// The launch card on leaf `leaf_index`'s cached rows, while they are
+    /// `session`'s (`crate::claude_card::read_card`), read at most once per
+    /// rebuild of the rows and not at all where the rebuild kept the last
+    /// reading ([`Self::rows`]): a frame that reuses them reuses the reading
+    /// — the same one, shared, so a frame allocates nothing for it — and a
+    /// rebuild whose card reads as the last one did shares that one. With
+    /// it, the number of the rows' CURRENT rebuild
+    /// (`CachedPaneText::text_gen`), which names this frame's cells — not
+    /// the rebuild a kept reading was taken in.
+    pub(crate) fn launch_card(
+        &self,
+        leaf_index: usize,
+        session: u64,
+    ) -> Option<(Arc<crate::claude_card::CardRead>, u64)> {
+        let cached = self.panes.get(leaf_index)?.as_ref()?;
+        if cached.key.session != session {
+            return None;
+        }
+        let read = cached
+            .card
+            .get_or_init(|| {
+                crate::claude_card::read_card(session, &cached.rows, cached.card_before.take())
+            })
+            .read
+            .clone()?;
+        Some((read, cached.text_gen))
+    }
+}
+
+/// One pane's footer as the frames before composed it (a leaf's, in
+/// [`PaneTextCache`]): the facts as the session's timeline held them and as
+/// the rule shows them, and the rule composed from them — so a frame whose
+/// inputs are the last one's, every frame at rest and every keystroke, takes
+/// the rule as it stands: no copy of the facts, no fit, no composition, no
+/// allocation (owner, 2026-10-15: "the user experince must be extremely
+/// smooth and zero latency!"). Each part is made anew only where what it is
+/// made of changed — compared field by field and cell by cell, never by a
+/// hash — so what it holds is always what making it anew would make.
+#[derive(Debug, Default)]
+struct PaneFooter {
+    session: u64,
+    /// What [`Self::shown`] is made of: the facts the timeline holds for the
+    /// group in front, the launch card it keeps for them, the `[claude_footer]
+    /// usage` switch.
+    from: Option<(FooterFacts, Option<aterm_phase::LaunchCard>, bool)>,
+    /// The live upgrade's note the timeline holds for the pane, whose words
+    /// the rule lays in ([`Self::lay_upgrade`]).
+    note: Option<footer::UpgradeNote>,
+    /// What the rule shows: `from`'s facts filled from its card where
+    /// nothing newer decided them (`FooterFacts::filled_from`), under its
+    /// usage switch ([`with_usage_switch`]), with the upgrade's words this
+    /// frame says.
+    shown: FooterFacts,
+    /// Moved with every change of `shown`: what the chips' room and the
+    /// composition are kept by.
+    shown_gen: u64,
+    /// The repaint key's term for `from` ([`fingerprint`]), taken
+    /// with it: the key asks for it every frame ([`Self::fingerprint_of`]).
+    fp: u64,
+    /// `footer::chips_room` of `shown` at `room` cells: `(shown_gen, room,
+    /// chips_room)`.
+    chips: Option<(u64, usize, usize)>,
+    /// The rule composed from `shown`.
+    rule: ComposedRule,
+}
+
+/// A footer rule as [`PaneFooter::compose`] composed it, and what it was
+/// composed from.
+#[derive(Debug, Default)]
+struct ComposedRule {
+    key: Option<RuleKey>,
+    /// The chips' block it was composed with (`None`: no block), copied.
+    block: Option<BlockCopy>,
+    cells: Vec<RenderCell>,
+    lights_at: Option<usize>,
+    glass: std::ops::Range<usize>,
+}
+
+/// What a footer rule is composed from, beside the chips' block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RuleKey {
+    shown_gen: u64,
+    room: usize,
+    rule: RenderCell,
+    blank: RenderCell,
+    mark_fg: [u8; 3],
+}
+
+/// Every part of a chips' block (`claude_lights::Block`) a composition
+/// reads: its chips and titles, laid in its cells, how much of the rule it
+/// holds and whether its title is a reason.
+#[derive(Debug, Default)]
+struct BlockCopy {
+    lights: Vec<RenderCell>,
+    title: Vec<RenderCell>,
+    short_title: Vec<RenderCell>,
+    reason: bool,
+    holds: usize,
+}
+
+impl BlockCopy {
+    fn is(&self, block: &crate::claude_lights::Block) -> bool {
+        self.lights == block.lights
+            && self.title == block.title
+            && self.short_title == block.short_title
+            && self.reason == block.reason
+            && self.holds == block.holds
+    }
+
+    fn copy(&mut self, block: &crate::claude_lights::Block) {
+        self.lights.clone_from(&block.lights);
+        self.title.clone_from(&block.title);
+        self.short_title.clone_from(&block.short_title);
+        self.reason = block.reason;
+        self.holds = block.holds;
+    }
+}
+
+impl PaneFooter {
+    /// Take in the facts the timeline holds (`facts`), the launch card it
+    /// keeps for them (`card`) and the usage switch: what the rule shows is
+    /// made anew only where one of them moved — a copy of each then, none
+    /// at rest. The upgrade's words stay as the last frame laid them.
+    fn note_facts(
+        &mut self,
+        facts: &FooterFacts,
+        card: Option<&aterm_phase::LaunchCard>,
+        usage: bool,
+    ) {
+        if let Some((was, kept, switch)) = &self.from
+            && was == facts
+            && kept.as_ref() == card
+            && *switch == usage
+        {
+            return;
+        }
+        let mut shown = facts.filled_from(card);
+        with_usage_switch(&mut shown, usage);
+        shown.upgrade = self.shown.upgrade.take();
+        self.shown = shown;
+        self.shown_gen += 1;
+        self.fp = fingerprint(Some(facts), card, usage);
+        self.from = Some((facts.clone(), card.cloned(), usage));
+    }
+
+    /// The repaint key's term for `session`'s `facts`, the `card` the
+    /// timeline keeps for them and the usage switch ([`fingerprint`])
+    /// where they are the ones this footer holds — taken when they were taken
+    /// in, so the key compares them rather than hashing them again. The term
+    /// does not depend on whether the card is asked for only while a model or
+    /// an effort is open: it fills nothing else (`filled_model_effort`).
+    fn fingerprint_of(
+        &self,
+        session: u64,
+        facts: &FooterFacts,
+        card: Option<&aterm_phase::LaunchCard>,
+        usage: bool,
+    ) -> Option<u64> {
+        let (was, kept, switch) = self.from.as_ref()?;
+        (self.session == session && was == facts && kept.as_ref() == card && *switch == usage)
+            .then_some(self.fp)
+    }
+
+    /// Take in the live upgrade's note the timeline holds for the pane.
+    fn note_upgrade(&mut self, note: Option<&footer::UpgradeNote>) {
+        if self.note.as_ref() != note {
+            self.note = note.cloned();
+        }
+    }
+
+    /// Lay in the upgrade's words for a composer that holds a draft or none
+    /// (`draft`; `None`: no words — no note, or the turn holds the move).
+    fn lay_upgrade(&mut self, draft: Option<bool>) {
+        let words = draft.and_then(|draft| self.note.as_ref()?.words(draft));
+        if self.shown.upgrade.as_ref() != words {
+            self.shown.upgrade = words.cloned();
+            self.shown_gen += 1;
+        }
+    }
+
+    /// The facts the rule shows.
+    fn shown(&self) -> &FooterFacts {
+        &self.shown
+    }
+
+    /// Whether the facts leave the model or the effort open, and whose they
+    /// are: the owner a launch card may be kept for.
+    fn card_owner(&self) -> Option<&footer::FactsOwner> {
+        let (facts, _, _) = self.from.as_ref()?;
+        (facts.model_open || facts.effort_open)
+            .then_some(facts.owner.as_ref())
+            .flatten()
+    }
+
+    /// The launch card the timeline keeps for the facts, as this frame read it.
+    fn kept_card(&self) -> Option<&aterm_phase::LaunchCard> {
+        self.from.as_ref()?.1.as_ref()
+    }
+
+    /// The most cells the chips may take in a rule of `room` cells
+    /// (`footer::chips_room`), kept while the facts and the room stand.
+    fn chips_room(&mut self, room: usize) -> usize {
+        match self.chips {
+            Some((shown_gen, at, chips)) if shown_gen == self.shown_gen && at == room => chips,
+            _ => {
+                let chips = footer::chips_room(&self.shown, room);
+                self.chips = Some((self.shown_gen, room, chips));
+                chips
+            }
+        }
+    }
+
+    /// The rule's composition in `room` cells with the chips' `block`, the
+    /// rule's own glyph `rule`, the pane's `blank` and the marks' `mark_fg`
+    /// (`footer::fit_rule`, [`compose_rule_spans`]): kept while every one of
+    /// them, the facts and every cell of the block are the last frame's,
+    /// else composed anew. Its cells' count, where the chips start, and the
+    /// run of the rule's own glyphs in it.
+    fn compose(
+        &mut self,
+        room: usize,
+        block: Option<&crate::claude_lights::Block>,
+        rule: RenderCell,
+        blank: RenderCell,
+        mark_fg: [u8; 3],
+    ) -> (usize, Option<usize>, std::ops::Range<usize>) {
+        let key = RuleKey {
+            shown_gen: self.shown_gen,
+            room,
+            rule,
+            blank,
+            mark_fg,
+        };
+        let composed = &mut self.rule;
+        let same_block = match (&composed.block, block) {
+            (None, None) => true,
+            (Some(kept), Some(block)) => kept.is(block),
+            _ => false,
+        };
+        if composed.key != Some(key) || !same_block {
+            #[cfg(test)]
+            crate::work_counts::footer_rule_composed();
+            let widths = block.map(|b| footer::LightsWidth {
+                chips: b.holds,
+                title: b.title.len(),
+                short: b.short_title.len(),
+                reason: b.reason,
+            });
+            let fit = footer::fit_rule(&self.shown, room, widths);
+            let (cells, lights_at, glass) =
+                compose_rule_spans(&fit, block, rule, blank, mark_fg, room);
+            composed.key = Some(key);
+            composed.cells = cells;
+            composed.lights_at = lights_at;
+            composed.glass = glass;
+            match block {
+                Some(block) => composed
+                    .block
+                    .get_or_insert_with(BlockCopy::default)
+                    .copy(block),
+                None => composed.block = None,
+            }
+        }
+        (
+            composed.cells.len(),
+            composed.lights_at,
+            composed.glass.clone(),
+        )
+    }
+}
+
+/// Whether `text` reads as `cells`' chars (`None`: a row the frame does not
+/// hold, read as empty) — compared as the chars' UTF-8 against the text's
+/// bytes, with no char decoded: every keystroke compares every cell of the
+/// pane, and most of them are one byte.
+fn same_text(text: &str, cells: Option<&[RenderCell]>) -> bool {
+    let Some(cells) = cells else {
+        return text.is_empty();
+    };
+    let mut rest = text.as_bytes();
+    for cell in cells {
+        let ch = u32::from(cell.ch);
+        if ch < 0x80 {
+            match rest.split_first() {
+                Some((&b, after)) if u32::from(b) == ch => rest = after,
+                _ => return false,
+            }
+        } else {
+            let mut utf8 = [0; 4];
+            match rest.strip_prefix(cell.ch.encode_utf8(&mut utf8).as_bytes()) {
+                Some(after) => rest = after,
+                None => return false,
+            }
+        }
+    }
+    rest.is_empty()
 }
 
 /// The loop proxy [`post_changed`] wakes through. Installed once at launch; a
@@ -867,15 +1591,21 @@ impl RosterMemo {
 }
 
 /// The roster beside the `aterm.toml` this window loads
-/// ([`accounts::default_roster_path`]): one bounded read. `None` where there
-/// is no config path and where the file is refused; a missing file is the
-/// empty roster. Under test it reads nothing: a test hands [`RosterMemo`]
+/// ([`accounts::default_roster_path`]): one bounded read, through this
+/// machine's logins (`accounts::Store::bound`). `None` where there is no
+/// config path and where the file is refused; a missing file is the empty
+/// roster. Under test it reads nothing: a test hands [`RosterMemo`]
 /// its roster.
 fn live_roster() -> Option<accounts::Roster> {
     if cfg!(test) {
         return None;
     }
-    accounts::Roster::load(&accounts::default_roster_path()?).ok()
+    let roster = accounts::Roster::load(&accounts::default_roster_path()?).ok()?;
+    // Through this machine's logins: a renewed login is its row's.
+    let now = aterm_time::unix_secs().and_then(|now| i64::try_from(now).ok())?;
+    accounts::Store::at(&crate::harness_host::harness_state()?)
+        .bound(&roster, now)
+        .ok()
 }
 
 /// What a read asks outside Claude Code's own files: a process's exec read
@@ -1107,22 +1837,28 @@ fn shows_wall(timeline: &SessionTimeline) -> bool {
         .is_some_and(|usage| usage.wall.is_some())
 }
 
-/// A fingerprint of `facts` AS SHOWN under the `[claude_footer] usage`
-/// switch ([`with_usage_switch`]) for the repaint key: `0` when there are
-/// none, so a frame with no footer keys exactly as it did before this module
-/// existed. Taken without a copy — it runs for every Claude Code pane on
-/// every frame — so with the switch off only the limit wall stands for the
-/// usage, and hidden tokens that keep growing do not move the key. The
-/// destructure names every field: a new one does not compile until it is
-/// hashed here.
-pub(crate) fn fingerprint(facts: Option<&FooterFacts>, usage: bool) -> u64 {
+/// A fingerprint of `facts` AS SHOWN — filled from the launch card `card`
+/// the timeline keeps for them (`FooterFacts::filled_from`) — under the
+/// `[claude_footer] usage` switch ([`with_usage_switch`]) for the repaint
+/// key: `0` when there are none, so a frame with no footer keys exactly as
+/// it did before this module existed. Taken without a copy — the fill's
+/// model and effort borrowed (`FooterFacts::filled_model_effort`) — so with
+/// the switch off only the limit wall stands for the usage, and hidden
+/// tokens that keep growing do not move the key. The destructure names
+/// every field: a new one does not compile until it is hashed here.
+pub(crate) fn fingerprint(
+    facts: Option<&FooterFacts>,
+    card: Option<&aterm_phase::LaunchCard>,
+    usage: bool,
+) -> u64 {
     use std::hash::{Hash, Hasher};
     let Some(facts) = facts else {
         return 0;
     };
+    let (model, effort) = facts.filled_model_effort(card);
     let FooterFacts {
-        model,
-        effort,
+        model: _,
+        effort: _,
         path,
         branch,
         repo_read_denied,
@@ -1182,12 +1918,28 @@ fn with_usage_switch(facts: &mut FooterFacts, usage: bool) {
 /// Anything else on the row is Claude's ink, and a selection or a search
 /// highlight over the rule reads as ink too: the facts give way to it. Also
 /// returns the rule cell.
+#[cfg(test)]
 fn rule_mask(
     scratch: &RenderInput,
     frame_row: usize,
     col_off: usize,
     pane_cols: usize,
 ) -> Option<(Vec<bool>, RenderCell)> {
+    let mut mask = Vec::new();
+    let rule = rule_mask_into(&mut mask, scratch, frame_row, col_off, pane_cols)?;
+    Some((mask, rule))
+}
+
+/// [`rule_mask`] laid into `mask` (cleared first; its buffer reused, so a
+/// frame allocates nothing for it): the rule cell.
+fn rule_mask_into(
+    mask: &mut Vec<bool>,
+    scratch: &RenderInput,
+    frame_row: usize,
+    col_off: usize,
+    pane_cols: usize,
+) -> Option<RenderCell> {
+    mask.clear();
     let row = scratch.cells.get(frame_row)?;
     let cells = row.get(col_off..row.len().min(col_off + pane_cols))?;
     let first = *cells.iter().find(|c| c.ch == '\u{2500}')?;
@@ -1198,16 +1950,14 @@ fn rule_mask(
     } else {
         first
     };
-    let mask = (0..pane_cols)
-        .map(|c| {
-            let col = col_off + c;
-            cells.get(c) == Some(&rule)
-                && !touches(&scratch.clusters, frame_row, &(col..col + 1))
-                && !touches(&scratch.combining, frame_row, &(col..col + 1))
-                && !touches(&scratch.images, frame_row, &(col..col + 1))
-        })
-        .collect();
-    Some((mask, rule))
+    mask.extend((0..pane_cols).map(|c| {
+        let col = col_off + c;
+        cells.get(c) == Some(&rule)
+            && !touches(&scratch.clusters, frame_row, &(col..col + 1))
+            && !touches(&scratch.combining, frame_row, &(col..col + 1))
+            && !touches(&scratch.images, frame_row, &(col..col + 1))
+    }));
+    Some(rule)
 }
 
 /// The cells aterm writes into `room` cells of the rule for one pane, and
@@ -1231,14 +1981,19 @@ fn rule_mask(
 /// and clicked.
 /// The chips' place depends on nothing a title or the facts change: a chip
 /// stays under the pointer while its title comes and goes.
-fn compose_rule(
+///
+/// Also returned: the cells between the lights and the facts that are the
+/// rule's own glyphs (`rule`, the cell the rule run is made of) — what the
+/// glass already shows there, which the splice leaves unwritten
+/// ([`rule_edits`]). Empty without lights, and where the two groups meet.
+fn compose_rule_spans(
     fit: &footer::RuleFit,
     block: Option<&crate::claude_lights::Block>,
     rule: RenderCell,
     blank: RenderCell,
     mark_fg: [u8; 3],
     room: usize,
-) -> (Vec<RenderCell>, Option<usize>) {
+) -> (Vec<RenderCell>, Option<usize>, std::ops::Range<usize>) {
     let mut out: Vec<RenderCell> = Vec::with_capacity(room);
     let mut lights_at = None;
     if let Some(block) = block.filter(|_| fit.chips) {
@@ -1292,12 +2047,58 @@ fn compose_rule(
             }
         }
     }
+    let mut glass = 0..0;
     if !out.is_empty() {
         let glyphs = room.saturating_sub(out.len() + facts.len());
+        glass = out.len()..out.len() + glyphs;
         out.extend(std::iter::repeat_n(rule, glyphs));
     }
     out.extend(facts);
-    (out, lights_at)
+    (out, lights_at, glass)
+}
+
+/// [`compose_rule_spans`]' cells and where the chips start, as the tests
+/// read a composition.
+#[cfg(test)]
+fn compose_rule(
+    fit: &footer::RuleFit,
+    block: Option<&crate::claude_lights::Block>,
+    rule: RenderCell,
+    blank: RenderCell,
+    mark_fg: [u8; 3],
+    room: usize,
+) -> (Vec<RenderCell>, Option<usize>) {
+    let (cells, lights_at, _) = compose_rule_spans(fit, block, rule, blank, mark_fg, room);
+    (cells, lights_at)
+}
+
+/// One rule's edits for [`write_edits`]: its `cells` at `col` of frame row
+/// `row`, less the run `glass` of them ([`compose_rule_spans`]) — the
+/// lights, then the facts, as two edits. The run is the rule's own glyph
+/// repeated, on cells of the rule run (`rule_mask` found each of them equal
+/// to that glyph and free of side channels), so writing it changes no cell:
+/// leaving it out keeps the glass, and costs the write and its undo the
+/// width of the rule (owner, 2026-10-15: "the user experince must be
+/// extremely smooth and zero latency!"). The head keeps `col`, the column
+/// the lights' hits are keyed by (`Lit::col`).
+fn rule_edits<'a>(
+    row: usize,
+    col: usize,
+    cells: &'a [RenderCell],
+    glass: &std::ops::Range<usize>,
+    ground: RenderCell,
+) -> impl Iterator<Item = (usize, usize, &'a [RenderCell], RenderCell)> {
+    let (head, tail) = if glass.is_empty() {
+        (cells, cells.len())
+    } else {
+        (&cells[..glass.start], glass.end)
+    };
+    [
+        (row, col, head, ground),
+        (row, col + tail, &cells[tail..], ground),
+    ]
+    .into_iter()
+    .filter(|(_, _, cells, _)| !cells.is_empty())
 }
 
 // The facts' nudges are counted in the painter's own steps.
@@ -1307,6 +2108,13 @@ const _: () = assert!(footer::NUDGES_PER_CELL == aterm_core::terminal::Script::N
 /// pane's text colour: a third of the way, so the small, low facts read
 /// without effort and still stand below the conversation's text.
 const VALUE_LIFT: f32 = 1.0 / 3.0;
+
+/// The footer's VALUE colour: Claude's gray `gray` lifted [`VALUE_LIFT`]
+/// toward the pane's ink `ink` — what the rule's values are drawn in, and the
+/// base colour of the harness card's line (`crate::claude_card`).
+pub(crate) fn value_fg(gray: [u8; 3], ink: [u8; 3]) -> [u8; 3] {
+    mix(gray, ink, VALUE_LIFT)
+}
 
 /// `a` moved `t` of the way toward `b`, per channel.
 fn mix(a: [u8; 3], b: [u8; 3], t: f32) -> [u8; 3] {
@@ -1369,13 +2177,60 @@ struct RowUndo {
 
 /// What the last footer splice overwrote in one window's scratch, with the
 /// proof that nothing has touched the scratch since. Held on the window
-/// (`WindowState::claude_footer_undo`) until [`undo`] consumes it.
-#[derive(Debug)]
+/// (`WindowState::claude_footer_undo`) until [`undo`] consumes it — and the
+/// row records a consumed write leaves, whose buffers the next write fills
+/// ([`write_edits`]): a footer painted frame after frame allocates nothing
+/// for its record once they are grown.
+#[derive(Debug, Default)]
 pub(crate) struct FooterUndo {
+    /// The write on the glass: `None` once [`undo`] consumed it, or when
+    /// nothing was written.
+    write: Option<WriteSeal>,
+    /// Its rows, `rows[..live]`; the rest are spare buffers.
+    rows: Vec<RowUndo>,
+    live: usize,
+}
+
+/// The tokens a footer write is undone against ([`FooterUndo`]).
+#[derive(Debug)]
+struct WriteSeal {
     after: Tokens,
     seq_before: u64,
     shifted_before: u64,
-    rows: Vec<RowUndo>,
+}
+
+impl FooterUndo {
+    /// The rows the write on the glass wrote — none once it is undone.
+    fn written(&self) -> &[RowUndo] {
+        if self.write.is_some() {
+            &self.rows[..self.live]
+        } else {
+            &[]
+        }
+    }
+
+    /// The cells the write on the glass put back over themselves — a cell
+    /// written with what it held. None while the rule's own glyphs between
+    /// the chips and the facts are left out of the write ([`rule_edits`]).
+    #[cfg(test)]
+    pub(crate) fn rewritten_as_they_were(&self) -> usize {
+        self.written()
+            .iter()
+            .map(|r| {
+                r.before
+                    .iter()
+                    .zip(&r.painted)
+                    .filter(|(was, now)| was == now)
+                    .count()
+            })
+            .sum()
+    }
+
+    /// Whether a write is on the glass.
+    #[cfg(test)]
+    fn is_written(&self) -> bool {
+        self.write.is_some()
+    }
 }
 
 /// The pane's exact terminal extraction that supplied its cells to this frame.
@@ -1417,14 +2272,15 @@ fn frame_source<'a>(
 /// first reader of the reuse tokens; the splice also calls it first, so a
 /// frame that presents a scratch without refilling it never paints over its
 /// own footer.
-pub(crate) fn undo(slot: &mut Option<FooterUndo>, scratch: &mut RenderInput) -> bool {
-    let Some(record) = slot.take() else {
+pub(crate) fn undo(slot: &mut FooterUndo, scratch: &mut RenderInput) -> bool {
+    let Some(seal) = slot.write.take() else {
         return false;
     };
-    if Tokens::of(scratch) != record.after {
+    let rows = &slot.rows[..std::mem::take(&mut slot.live)];
+    if Tokens::of(scratch) != seal.after {
         return false;
     }
-    let intact = record.rows.iter().all(|r| {
+    let intact = rows.iter().all(|r| {
         scratch
             .cells
             .get(r.frame_row)
@@ -1436,7 +2292,7 @@ pub(crate) fn undo(slot: &mut Option<FooterUndo>, scratch: &mut RenderInput) -> 
     }
     // Newest first: two panes side by side write the same frame row, and the
     // second write's `len_before` is the first write's padded length.
-    for r in record.rows.iter().rev() {
+    for r in rows.iter().rev() {
         let row = &mut scratch.cells[r.frame_row];
         row[r.col_off..r.col_off + r.before.len()].copy_from_slice(&r.before);
         row.truncate(r.len_before);
@@ -1444,8 +2300,8 @@ pub(crate) fn undo(slot: &mut Option<FooterUndo>, scratch: &mut RenderInput) -> 
             *slot = rev;
         }
     }
-    scratch.snapshot_seq = record.seq_before;
-    scratch.shifted_fill_seq = record.shifted_before;
+    scratch.snapshot_seq = seal.seq_before;
+    scratch.shifted_fill_seq = seal.shifted_before;
     true
 }
 
@@ -1457,7 +2313,9 @@ fn touches<T>(channel: &[Vec<(usize, T)>], row: usize, span: &std::ops::Range<us
 }
 
 /// Write each `(frame_row, col, cells, ground)` edit into `scratch` and
-/// return the record [`undo`] needs, or `None` when nothing was written. A
+/// keep in `slot` the record [`undo`] needs — none when nothing was written
+/// — its rows filled into the buffers the last consumed write left there
+/// (the edits' cells are borrowed and copied in, never moved). A
 /// row the engine trimmed short of the edit is padded with `ground` (the
 /// pane's blank), never with a painted glyph.
 ///
@@ -1479,14 +2337,16 @@ fn touches<T>(channel: &[Vec<(usize, T)>], row: usize, span: &std::ops::Range<us
 /// [`undo`] runs immediately before it, and [`undo`] either restores the
 /// footer's cells and both tokens or — the scratch having moved since — finds
 /// `snapshot_seq` moved too, which the inverse refuses as well.
-fn write_edits(
+fn write_edits<'a>(
+    slot: &mut FooterUndo,
     scratch: &mut RenderInput,
-    edits: Vec<(usize, usize, Vec<RenderCell>, RenderCell)>,
-) -> Option<FooterUndo> {
+    edits: impl IntoIterator<Item = (usize, usize, &'a [RenderCell], RenderCell)>,
+) {
     let seq_before = scratch.snapshot_seq;
     let shifted_before = scratch.shifted_fill_seq;
     let restamp = scratch.shifted_fill_seq != 0 && scratch.host_prepend_blessing();
-    let mut rows = Vec::with_capacity(edits.len());
+    slot.write = None;
+    slot.live = 0;
     for (frame_row, col_off, painted, ground) in edits {
         let span = col_off..col_off + painted.len();
         if touches(&scratch.clusters, frame_row, &span)
@@ -1498,18 +2358,38 @@ fn write_edits(
         let Some(cells) = scratch.cells.get_mut(frame_row) else {
             continue;
         };
-        let len_before = cells.len();
-        let before = cells
-            .get(col_off..len_before.min(span.end))
-            .map(<[RenderCell]>::to_vec)
-            .unwrap_or_default();
+        if slot.live == slot.rows.len() {
+            slot.rows.push(RowUndo {
+                frame_row,
+                col_off,
+                len_before: 0,
+                before: Vec::new(),
+                painted: Vec::new(),
+                rev_before: None,
+            });
+        }
+        let row = &mut slot.rows[slot.live];
+        slot.live += 1;
+        row.frame_row = frame_row;
+        row.col_off = col_off;
+        row.len_before = cells.len();
+        row.before.clear();
+        row.before.extend_from_slice(
+            cells
+                .get(col_off..row.len_before.min(span.end))
+                .unwrap_or(&[]),
+        );
         // The engine TRIMS trailing blanks: a short row is padded before it
         // is written into, as `splice_tab_menu` does.
         if cells.len() < span.end {
             cells.resize(span.end, ground);
         }
-        cells[span].copy_from_slice(&painted);
-        let rev_before = if restamp {
+        cells[span].copy_from_slice(painted);
+        #[cfg(test)]
+        crate::work_counts::footer_cells_written(painted.len());
+        row.painted.clear();
+        row.painted.extend_from_slice(painted);
+        row.rev_before = if restamp {
             scratch
                 .row_rev
                 .get_mut(frame_row)
@@ -1517,34 +2397,34 @@ fn write_edits(
         } else {
             None
         };
-        rows.push(RowUndo {
-            frame_row,
-            col_off,
-            len_before,
-            before,
-            painted,
-            rev_before,
-        });
     }
-    if rows.is_empty() {
-        return None;
+    if slot.live == 0 {
+        return;
     }
     scratch.snapshot_seq = scratch.snapshot_seq.wrapping_add(1);
     if restamp {
         scratch.shifted_fill_seq = scratch.snapshot_seq;
     }
-    Some(FooterUndo {
+    slot.write = Some(WriteSeal {
         after: Tokens::of(scratch),
         seq_before,
         shifted_before,
-        rows,
-    })
+    });
 }
 
 impl App {
-    /// The footer facts of every Claude Code session in `wid`'s visible plan
-    /// and the window's lights' GUI state (`crate::claude_lights`), folded
-    /// into one repaint-key term (`0` when none shows).
+    /// The footer facts of every Claude Code session in `wid`'s visible plan,
+    /// the Autopilot its harness chips say, the harness card on its launch
+    /// card (`crate::claude_card`), and the window's lights' GUI state
+    /// (`crate::claude_lights`), folded into one repaint-key term (`0` when
+    /// none shows).
+    ///
+    /// One pass, per Claude Code leaf one timeline lock and — where its
+    /// facts show — one Autopilot read ([`App::session_autopilot_on`], the
+    /// pass's claim clock shared), whose reading both the chips' term and
+    /// the card's take. Allocates nothing; reads the clock only for a claim
+    /// that lapses, a card whose episode is live or a light's refusal or
+    /// notice held (`claude_lights::lights_now`).
     ///
     /// scope-waiver: this is a derived repaint fingerprint of existing App
     /// state. The function owns no latch or budget; copying its scalar result
@@ -1554,12 +2434,16 @@ impl App {
         wid: WindowId,
         plan: &crate::tab_model::VisibleLeafPlan,
     ) -> u64 {
-        let mut fp = self.windows.get(&wid).map_or(0, |ws| {
-            ws.claude_lights.fingerprint(std::time::Instant::now())
-        });
+        let Some(ws) = self.windows.get(&wid) else {
+            return 0;
+        };
+        let mut fp = ws
+            .claude_lights
+            .fingerprint(crate::claude_lights::lights_now);
         let mut claude = false;
         let usage = self.config.claude_footer_usage();
-        for leaf in &plan.leaves {
+        let claims = crate::autopilot::ClaimClock::default();
+        for (index, leaf) in plan.leaves.iter().enumerate() {
             let Some(session) = self
                 .view_store
                 .get(leaf.view)
@@ -1574,17 +2458,26 @@ impl App {
             let timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
             let facts = timeline.claude_footer();
             claude |= facts.is_some();
-            // What the footer shows (`claude_footer_shown`) without its
-            // clone: `filled_from` returns `facts` unchanged unless a kept
+            // What the footer shows (the facts filled from the kept card,
+            // `FooterFacts::filled_from`) without its clone: `filled_from` returns `facts` unchanged unless a kept
             // card can fill an open model or effort, so only then is the
-            // fill built and hashed; the usage switch is applied by the hash.
+            // card asked for, its fill hashed where it stands (borrowed, never
+            // built); the usage switch is applied by the hash.
             let card = facts
                 .filter(|f| f.model_open || f.effort_open)
                 .and_then(|_| timeline.claude_card());
-            let leaf = match (facts, card) {
-                (Some(f), Some(_)) => fingerprint(Some(&f.filled_from(card)), usage),
-                (facts, _) => fingerprint(facts, usage),
-            };
+            // Taken with the facts by the pane's footer where they are the
+            // ones it holds ([`PaneFooter::fingerprint_of`]): compared, not
+            // hashed, every frame at rest.
+            let kept = facts.and_then(|f| {
+                ws.claude_footer_texts
+                    .borrow()
+                    .footers
+                    .get(index)?
+                    .fingerprint_of(session, f, timeline.claude_card(), usage)
+            });
+            let leaf = kept.unwrap_or_else(|| fingerprint(facts, card, usage));
+            let shows = facts.is_some();
             // So is the live upgrade's note ([`App::splice_claude_footer`]),
             // laid in only where there are facts to lead: both its wordings,
             // hashed beside the facts rather than cloned into them. Which one
@@ -1598,7 +2491,24 @@ impl App {
                     note.hash(&mut h);
                     h.finish()
                 });
-            fp = fp.rotate_left(7) ^ leaf ^ note.rotate_left(17);
+            let agent = crate::harness_host::agent_of(timeline.agent());
+            drop(timeline);
+            // So are the harness's chips where the facts show — the
+            // session's Autopilot and a click of it in flight
+            // (`crate::claude_lights`) — and the harness card on its launch
+            // card (`crate::claude_card`): one reading of the Autopilot for
+            // both, with the timeline's lock released.
+            let harness = if shows {
+                let (word, view, supervised) = self.session_autopilot_for(session, agent, &claims);
+                ws.claude_lights
+                    .autopilot_term(session, word, view, self.chip_glass(session))
+                    ^ self
+                        .claude_card_term(ws, index, session, view, supervised)
+                        .rotate_left(37)
+            } else {
+                0
+            };
+            fp = fp.rotate_left(7) ^ leaf ^ note.rotate_left(17) ^ harness.rotate_left(29);
         }
         // The `[claude_footer] usage` switch, live: a reload that flips it
         // asks every window for a frame (the config apply), and this term
@@ -1626,28 +2536,57 @@ impl App {
         plan: &crate::tab_model::VisibleLeafPlan,
         route: VisibleContentRoute,
     ) {
+        // The splice's lists are the window's, kept for their buffers: taken
+        // here, handed back empty.
+        let Some(mut lists) = self
+            .windows
+            .get_mut(&wid)
+            .map(|ws| std::mem::take(&mut ws.claude_footer_lists))
+        else {
+            return;
+        };
+        self.splice_claude_footer_with(wid, plan, route, &mut lists);
+        lists.clear();
+        if let Some(ws) = self.windows.get_mut(&wid) {
+            ws.claude_footer_lists = lists;
+        }
+    }
+
+    /// [`Self::splice_claude_footer`] on the window's lists (`lists`, empty
+    /// on entry).
+    fn splice_claude_footer_with(
+        &mut self,
+        wid: WindowId,
+        plan: &crate::tab_model::VisibleLeafPlan,
+        route: VisibleContentRoute,
+        lists: &mut SpliceLists,
+    ) {
+        // Every Claude Code pane on the glass, for the harness card's pass.
+        let mut cards = Vec::new();
         if let Some(ws) = self.windows.get_mut(&wid) {
             undo(&mut ws.claude_footer_undo, &mut ws.input_scratch);
+            // …and the harness card's light, the same way (`crate::claude_card`).
+            crate::claude_card::strip(&mut ws.claude_card, &mut ws.input_scratch);
             ws.claude_lights.clear_hits();
             ws.claude_footer_texts.borrow_mut().trim(plan.leaves.len());
+            cards = ws.claude_card.take_leaves();
         }
         // The footer's facts are keyed by the foreground group the status
         // sweep keeps current; with `tab_status` off that sweep does not run,
         // the group goes stale, and a new Claude Code in the tab would be
-        // painted with the last one's facts. No sweep, no footer, no lights.
+        // painted with the last one's facts. No sweep, no footer, no lights,
+        // no harness card.
         if !self.config.tab_status_or_default() {
-            if let Some(ws) = self.windows.get(&wid) {
+            if let Some(ws) = self.windows.get_mut(&wid) {
                 ws.claude_footer_texts.borrow_mut().trim(0);
+                ws.claude_card.hide_all();
             }
             return;
         }
         let mark_fg = crate::chrome_band::band_colors(self.theme).accent;
-        let mut panes: Vec<FooterPane> = Vec::new();
-        let mut seen: Vec<SeenPaneText> = Vec::new();
-        // Panes whose composer is on the glass with no plain rule glyph to
-        // write into (a selection over the whole rule): nothing is painted,
-        // but the keyboard's chord is still the lights'.
-        let mut bare: Vec<u64> = Vec::new();
+        let usage = self.config.claude_footer_usage();
+        // The pass's claim clock: every pane's Autopilot read shares it.
+        let claims = crate::autopilot::ClaimClock::default();
         {
             let Some(ws) = self.windows.get(&wid) else {
                 return;
@@ -1672,25 +2611,37 @@ impl App {
                 if source.display_offset != 0 {
                     continue;
                 }
-                // What the footer shows (`claude_footer_shown`), and — while
-                // nothing since the process started named its model or
-                // effort — the owner a launch card may be kept for.
-                let shown = {
+                // What the footer shows — its facts, filled from the launch
+                // card kept for them (`FooterFacts::filled_from`), the live
+                // upgrade's note —
+                // taken into the pane's footer ([`PaneFooter`]) only where
+                // one of them moved: a frame at rest copies none of them. And
+                // the process the facts are for (its group), which the
+                // harness card matches its card against. The pane's one
+                // timeline lock this frame: the PTY reader holds it while
+                // Claude streams.
+                let held = {
                     let timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+                    #[cfg(test)]
+                    crate::work_counts::footer_timeline_locked();
                     timeline.claude_footer().map(|facts| {
-                        let open = facts.model_open || facts.effort_open;
+                        let mut texts = ws.claude_footer_texts.borrow_mut();
+                        let footer = texts.footer(leaf_index, session);
+                        footer.note_facts(facts, timeline.claude_card(), usage);
+                        footer.note_upgrade(timeline.upgrade_note());
                         (
-                            facts.filled_from(timeline.claude_card()),
-                            open.then(|| facts.owner.clone()).flatten(),
-                            timeline.upgrade_note().cloned(),
+                            timeline.claude_footer_identity().map(|(pgid, _)| pgid),
+                            crate::harness_host::agent_of(timeline.agent()),
                         )
                     })
                 };
-                let Some((mut shown, card_owner, upgrade_note)) = shown else {
+                let Some((pgid, agent)) = held else {
                     continue;
                 };
-                let usage = self.config.claude_footer_usage();
-                with_usage_switch(&mut shown, usage);
+                // The session's Autopilot, read ONCE for this frame with no
+                // lock held (its own leaf lock alone): what the harness's
+                // chips say and whether the harness card wraps the pane.
+                let (word, view, supervised) = self.session_autopilot_for(session, agent, &claims);
                 let blank = source.implicit_blank;
                 let row_off = leaf.rect.origin.y.round().max(0.0) as usize;
                 let col_off = leaf.rect.origin.x.round().max(0.0) as usize;
@@ -1703,46 +2654,74 @@ impl App {
                     rows: pane_rows,
                     cols: pane_cols,
                 };
-                let texts = ws.claude_footer_texts.borrow_mut().rows(
+                let mut texts = ws.claude_footer_texts.borrow_mut();
+                texts.rows(leaf_index, session, &ws.input_scratch, region);
+                let texts = &mut *texts;
+                // The harness card reads the same rows, rect and strip, and
+                // the process as the facts read under that lock (what shows
+                // keeps the facts' build: `filled_from` fills the model and
+                // effort alone).
+                let version = texts.footers[leaf_index].shown().version.as_deref();
+                cards.push(crate::claude_card::card_leaf(
+                    texts,
+                    self.config.claude_footer_card(),
                     leaf_index,
                     session,
-                    &ws.input_scratch,
-                    region,
-                );
+                    crate::claude_card::PaneGeom {
+                        strip,
+                        row_off,
+                        col_off,
+                        rows: pane_rows,
+                        cols: pane_cols,
+                    },
+                    blank,
+                    view,
+                    supervised,
+                    pgid.zip(version),
+                ));
                 // The rule to write into, found by structure, behind the
                 // reader's panic fence (`read_footer`) — a screen that panics
-                // it paints nothing — unless the chrome claimed that row.
-                let read = read_footer(session, &texts, read_rule_row);
+                // it paints nothing — unless the chrome claimed that row: the
+                // reading the rows' rebuild took or kept ([`Readings`]).
+                let Some(readings) = texts.readings(leaf_index) else {
+                    continue;
+                };
+                let read = readings.rule;
                 if read.is_some_and(|r| !r.mode_row) {
-                    note_vendor_drift(session, shown.version.as_deref(), &texts);
+                    texts.note_drift(leaf_index, session, version);
                 }
                 // Nothing since this process started named its model or
                 // effort: its launch card may, read off a live REPL of its
                 // own build (`footer::launch_card`). It is read again on
-                // every frame while they stay open, and the NEWEST reading
-                // for this owner is kept (`note_claude_card`): a card read
-                // in the moment between a new owner and the new process's
-                // first paint — its predecessor's, still on the glass — is
-                // replaced as soon as the new process draws its own. A frame
-                // with no card to read (it scrolled away, a message sits
-                // under it) keeps the last reading: the card still names
-                // what the process started on. A card kept anew shows now.
-                if let Some(owner) = card_owner
-                    && let Some(card) = crate::reader_guard::read_or_none(
-                        session,
-                        "Claude Code launch card",
-                        &texts,
-                        || footer::launch_card(&texts),
-                    )
-                    .flatten()
+                // every rebuild of the pane's text while they stay open (every
+                // frame that reuses the text shares the reading), and the
+                // NEWEST reading for this owner is kept (`note_claude_card`):
+                // a card read in the moment between a new owner and the new
+                // process's first paint — its predecessor's, still on the
+                // glass — is replaced as soon as the new process draws its
+                // own. A frame with no card to read (it scrolled away, a
+                // message sits under it) keeps the last reading: the card
+                // still names what the process started on. A card kept anew
+                // shows now. A reading the timeline already keeps for these
+                // facts is no news, and takes no lock.
+                let footer = &texts.footers[leaf_index];
+                if let Some(owner) = footer.card_owner()
+                    && let Some(card) = texts.footer_card(leaf_index, session)
+                    && footer.kept_card() != Some(card)
                 {
+                    let (owner, card) = (owner.clone(), card.clone());
                     let mut timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+                    #[cfg(test)]
+                    crate::work_counts::footer_timeline_locked();
                     if let Some((pgid, _)) = timeline.claude_footer_identity()
                         && timeline.note_claude_card(pgid, &owner, card)
-                        && let Some(now) = timeline.claude_footer_shown()
+                        && let Some(facts) = timeline.claude_footer()
                     {
-                        shown = now;
-                        with_usage_switch(&mut shown, usage);
+                        texts.footer(leaf_index, session).note_facts(
+                            facts,
+                            timeline.claude_card(),
+                            usage,
+                        );
                     }
                 }
                 let on_glass = read
@@ -1750,19 +2729,24 @@ impl App {
                     .filter(|&r| !self.chrome_owns_terminal_row(wid, row_off + r));
                 let rule = on_glass.and_then(|r| {
                     let frame_row = strip + row_off + r;
-                    let (mask, rule) = rule_mask(&ws.input_scratch, frame_row, col_off, pane_cols)?;
-                    let run = footer::rule_run(&mask)?;
+                    let (run, rule) = texts.rule_run(
+                        leaf_index,
+                        &ws.input_scratch,
+                        frame_row,
+                        (col_off, pane_cols),
+                        &mut lists.mask,
+                    )?;
                     Some((frame_row, row_off + r, run, rule))
                 });
                 if on_glass.is_some() && rule.is_none() {
-                    bare.push(session);
+                    lists.bare.push(session);
                 }
                 // Every Claude Code pane is OBSERVED for its lights, painted
                 // rule or not (`App::observe_claude_lights`).
-                seen.push(SeenPaneText {
+                lists.seen.push(SeenPane {
                     leaf_index,
                     session,
-                    texts,
+                    lights: readings.lights,
                 });
                 let Some((frame_row, term_row, run, rule)) = rule else {
                     continue;
@@ -1773,107 +2757,161 @@ impl App {
                 // gate reads it with (`App::claude_composer_now`: a dim
                 // suggestion is no draft) — and not while a turn runs there:
                 // the agent's own turn holds the move then, not the person.
-                shown.upgrade = upgrade_note.and_then(|note| {
+                let footer = texts.footer(leaf_index, session);
+                let draft = footer.note.is_some().then(|| {
                     let (screen, empty) = self.claude_composer_now(session)?;
-                    (!screen.busy)
-                        .then(|| note.words(!empty).cloned())
-                        .flatten()
+                    (!screen.busy).then_some(!empty)
                 });
-                panes.push(FooterPane {
+                footer.lay_upgrade(draft.flatten());
+                lists.panes.push(FooterPane {
                     session,
+                    leaf_index,
                     frame_row,
                     term_row,
                     col_off,
                     run,
                     rule,
-                    facts: shown,
                     blank,
+                    autopilot: (word, view),
                 });
             }
+            let seen = &lists.seen;
             ws.claude_footer_texts
                 .borrow_mut()
                 .retain_active(|index| seen.iter().any(|pane| pane.leaf_index == index));
         }
-        for pane in seen {
-            self.observe_claude_lights(wid, pane.session, &pane.texts);
+        for pane in lists.seen.drain(..) {
+            self.observe_claude_lights(wid, pane.session, pane.lights);
         }
-        for session in bare {
+        for session in lists.bare.drain(..) {
             self.note_claude_footer_row(wid, session, 0);
         }
-        if panes.is_empty() {
+        // The harness card: its light now, its line in the footer's write.
+        self.compose_claude_cards(wid, cards);
+        let lines = self
+            .windows
+            .get(&wid)
+            .is_some_and(|ws| ws.claude_card.lines().next().is_some());
+        if lists.panes.is_empty() && !lines {
             return;
         }
-        let mut edits: Vec<(usize, usize, Vec<RenderCell>, RenderCell)> =
-            Vec::with_capacity(panes.len());
-        let mut lit: Vec<Lit> = Vec::new();
-        for pane in panes {
+        for pane in lists.panes.drain(..) {
             // The rule's room, and the chips' within it: beside the model,
             // which gives way last (`footer::fit_rule`). Only the CHIPS must
             // fit for the block to be drawn: the title (a hover, a
             // selection, a toggle's progress or refusal) comes along only
             // where it fits too, so pointing at a chip can never push the
-            // chips off. No chip drawn — everything as expected — and there
-            // is no block.
+            // chips off. No chip drawn — no harness host, everything as
+            // expected — and there is no block.
             let room = footer::rule_room(&pane.run);
-            let chips_room = footer::chips_room(&pane.facts, room);
+            let Some(chips_room) = self.windows.get(&wid).and_then(|ws| {
+                let mut texts = ws.claude_footer_texts.borrow_mut();
+                Some(texts.footer_mut(pane.leaf_index)?.chips_room(room))
+            }) else {
+                continue;
+            };
             // The rule is on the glass whether or not anything fits it: the
             // keyboard's chord is the lights' there (`on_key_claude_lights`).
             self.note_claude_footer_row(wid, pane.session, chips_room);
+            let (word, view) = pane.autopilot;
+            self.note_claude_autopilot(wid, pane.session, word, view);
             let block = self.claude_lights_block(wid, pane.session, pane.blank, chips_room);
-            let widths = block.as_ref().map(|b| footer::LightsWidth {
-                chips: b.lights.len(),
-                title: b.title.len(),
-                short: b.short_title.len(),
-                reason: b.reason,
+            // A block that gave up a chip for room holds all of it
+            // (`Block::holds`): the facts went before the chips, and stay
+            // gone beside fewer of them. The composition is the pane's
+            // footer's, kept while the facts, the room, the rule, the ground
+            // and every cell of the block are the last frame's
+            // ([`PaneFooter::compose`]).
+            let composed = self.windows.get(&wid).and_then(|ws| {
+                let mut texts = ws.claude_footer_texts.borrow_mut();
+                Some(texts.footer_mut(pane.leaf_index)?.compose(
+                    room,
+                    block.as_ref(),
+                    pane.rule,
+                    pane.blank,
+                    mark_fg,
+                ))
             });
-            let fit = footer::fit_rule(&pane.facts, room, widths);
-            let (cells, lights_at) =
-                compose_rule(&fit, block.as_ref(), pane.rule, pane.blank, mark_fg, room);
-            if cells.is_empty() {
+            let Some((cells, lights_at, glass)) = composed.filter(|(cells, _, _)| *cells > 0)
+            else {
+                if let Some(block) = block {
+                    self.recycle_claude_lights_block(wid, block);
+                }
                 continue;
-            }
+            };
             // Right-aligned against the rule's last glyph, which stays.
-            let col = pane.col_off + pane.run.end - 1 - cells.len();
-            if let (Some(block), Some(at)) = (block, lights_at) {
-                lit.push(Lit {
+            let col = pane.col_off + pane.run.end - 1 - cells;
+            match (block, lights_at) {
+                (Some(block), Some(at)) => lists.lit.push(Lit {
                     session: pane.session,
                     frame_row: pane.frame_row,
                     col,
                     term_row: pane.term_row,
                     lights_col: col + at,
                     block,
-                });
+                    shown: false,
+                }),
+                (Some(block), None) => self.recycle_claude_lights_block(wid, block),
+                (None, _) => {}
             }
-            edits.push((pane.frame_row, col, cells, pane.blank));
+            lists.rules.push(RuleWrite {
+                frame_row: pane.frame_row,
+                col,
+                leaf_index: pane.leaf_index,
+                ground: pane.blank,
+                glass,
+            });
         }
         {
             let Some(ws) = self.windows.get_mut(&wid) else {
                 return;
             };
-            ws.claude_footer_undo = write_edits(&mut ws.input_scratch, edits);
+            let crate::WindowState {
+                claude_footer_undo,
+                input_scratch,
+                claude_card,
+                claude_footer_texts,
+                ..
+            } = &mut **ws;
+            let texts = claude_footer_texts.borrow();
+            // The card's lines first, borrowed from the card, then the rules,
+            // borrowed from the panes' footers.
+            let card_edits = claude_card.lines().map(crate::claude_card::CardLine::edit);
+            let rules = lists.rules.iter().flat_map(|r| {
+                rule_edits(
+                    r.frame_row,
+                    r.col,
+                    texts.composed(r.leaf_index),
+                    &r.glass,
+                    r.ground,
+                )
+            });
+            write_edits(claude_footer_undo, input_scratch, card_edits.chain(rules));
             // Only a light the glass shows can be pointed at: a pane whose
             // write was skipped (`write_edits`) records none — keyed by the
             // edit's row AND column, since two panes side by side share a
             // frame row.
-            let rows = ws
-                .claude_footer_undo
-                .as_ref()
-                .map(|record| &record.rows[..])
-                .unwrap_or_default();
-            lit.retain(|l| {
-                rows.iter()
-                    .any(|r| (r.frame_row, r.col_off) == (l.frame_row, l.col))
-            });
+            let rows = claude_footer_undo.written();
+            let took = |at: (usize, usize)| rows.iter().any(|r| (r.frame_row, r.col_off) == at);
+            for l in &mut lists.lit {
+                l.shown = took((l.frame_row, l.col));
+            }
+            // So with the harness card's line: its ink and its star go where
+            // its cells did.
+            crate::claude_card::ink_lines(claude_card, input_scratch, took);
         }
-        for l in lit {
-            self.note_claude_light_hits(
-                wid,
-                l.session,
-                l.frame_row,
-                l.term_row,
-                l.lights_col,
-                &l.block,
-            );
+        for l in lists.lit.drain(..) {
+            if l.shown {
+                self.note_claude_light_hits(
+                    wid,
+                    l.session,
+                    l.frame_row,
+                    l.term_row,
+                    l.lights_col,
+                    &l.block,
+                );
+            }
+            self.recycle_claude_lights_block(wid, l.block);
         }
     }
 
@@ -1918,8 +2956,16 @@ type FooterRead = Option<RuleRead>;
 /// The footer's reading of a pane's rows: the composer's bottom rule
 /// (`aterm_phase::phase::composer_bottom`) and the mode row under it
 /// (`footer::mode_row`).
+#[cfg(test)]
 fn read_rule_row(rows: &[String]) -> FooterRead {
-    aterm_phase::phase::composer_bottom(rows).map(|rule| RuleRead {
+    read_rule_under(rows, aterm_phase::phase::FrameReach::of(rows))
+}
+
+/// [`read_rule_row`] of the frame the caller has found (`reach`): its bottom
+/// rule, and whether a mode row sits under it — of the rows under the rule
+/// alone.
+fn read_rule_under(rows: &[String], reach: aterm_phase::phase::FrameReach) -> FooterRead {
+    reach.rules().map(|(_, rule)| RuleRead {
         rule,
         mode_row: footer::mode_row_under(rows, rule).is_some(),
     })
@@ -2045,8 +3091,59 @@ pub(crate) fn read_glass(row: &[RenderCell]) -> String {
 }
 
 #[cfg(test)]
+#[path = "claude_footer_cost_tests.rs"]
+mod cost_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    /// THE FOOTER STANDS WHERE THE HOST SUPERVISES CLAUDE CODE BY NAME: the
+    /// predicate was the literal `claude`, so a `claude-code` argv0, which
+    /// the host supervised as Claude Code, got no footer, no chips and no
+    /// harness card. Every name the host reads as Claude Code by name draws
+    /// it, in any case; NEGATIVE CONTROLS: Codex, a runtime with no reader,
+    /// a shell, a near-miss name and no name at all draw none.
+    #[test]
+    fn the_footer_is_drawn_for_every_name_the_host_supervises_as_claude_code() {
+        use crate::session_timeline::AgentPublication;
+        for name in [
+            "claude",
+            "claude-code",
+            "Claude",
+            "CLAUDE-CODE",
+            "codex",
+            "node",
+            "bun",
+            "zsh",
+            "sh",
+            "claudette",
+            "claude.exe",
+            "",
+        ] {
+            let publication = AgentPublication {
+                program: Some(name.to_string()),
+                ..AgentPublication::default()
+            };
+            let host = crate::harness_host::agent_of(&publication).is_some_and(|p| match p {
+                aterm_phase::Program::Claude => true,
+                aterm_phase::Program::Codex
+                | aterm_phase::Program::Agy
+                | aterm_phase::Program::Muse
+                | aterm_phase::Program::Generic => false,
+            });
+            assert_eq!(
+                drawn_for(Some(name)),
+                host,
+                "{name:?}: the footer and the host must agree"
+            );
+        }
+        assert!(
+            drawn_for(Some("claude-code")),
+            "a claude-code argv0 is supervised, so it gets the footer"
+        );
+        assert!(!drawn_for(Some("codex")) && !drawn_for(None));
+    }
 
     /// THE CHIPS NEVER TOUCH OTHER INK (main's 35d8c4ca7, 2026-09-28, a
     /// private window on 2.1.284): drawn on Claude's mode row, a chip was
@@ -2058,16 +3155,26 @@ mod tests {
     /// whole facts, a limit wall and Σ, or none, the cell before the chips
     /// and the cell after them are blank — never a rule glyph, a title's
     /// word or a fact — and the chips always fit (main's other half: the gap
-    /// never costs the chips their place). The painted row, on the measured
-    /// screen: `claude_lights`'
+    /// never costs the chips their place). The widths are the rows' own:
+    /// a light alone, the harness's two at rest (`∞ ⚙`, 3 cells; `⤓ land ⚙`,
+    /// 8), and the two beside a light (`∞ ⚙ ⏸ plan`, 10), each with the
+    /// titles a hover gives them. The painted row, on the measured screen:
+    /// `claude_lights`'
     /// `the_effort_tail_stays_on_claudes_row_and_every_chip_stands_clear_in_the_rule`.
     #[test]
     fn the_chips_keep_a_blank_cell_on_each_side_at_every_width() {
         let blank = cell(' ', [200, 200, 200]);
         let rule = cell('\u{2500}', [90, 90, 90]);
         for facts in [facts(), facts_with_usage(), FooterFacts::default()] {
-            for chips in [1usize, 6, 8, 14] {
-                for (title, short) in [("", ""), ("Permission mode: plan  ", "plan  ")] {
+            for chips in [1usize, 3, 6, 8, 10, 14] {
+                for (title, short) in [
+                    ("", ""),
+                    ("Permission mode: plan  ", "plan  "),
+                    (
+                        "autopilot: cruise \u{2014} keeps the work moving \u{b7} click: land  ",
+                        "autopilot: cruise  ",
+                    ),
+                ] {
                     let block = crate::claude_lights::Block::of_chips(
                         row_of(&"\u{25CB}".repeat(chips), [150, 150, 150]),
                         row_of(title, [150, 150, 150]),
@@ -2435,6 +3542,20 @@ mod tests {
         assert_eq!(&**held, &["zbcd", "efgh"]);
         assert_eq!(&**next, &["zycd", "efgh"]);
         assert!(!Arc::ptr_eq(&held, &next));
+
+        // A revision that moved no row's text (a re-extract, a compose, a
+        // colour): the held snapshot IS this rebuild's, nothing allocated —
+        // under a new rebuild number, since its cells may differ. CONTROL:
+        // the rebuild above, which changed a row, was fresh storage.
+        let rebuild = |cache: &PaneTextCache| cache.panes[0].as_ref().unwrap().text_gen;
+        let before = rebuild(&cache);
+        scratch.cells[1][0].fg = [9, 9, 9];
+        scratch.snapshot_seq += 1;
+        let (same, allocations) =
+            crate::work_counts::allocations_in(|| cache.rows(0, 7, &scratch, region));
+        assert!(Arc::ptr_eq(&same, &next), "the held snapshot, shared");
+        assert_eq!(allocations, 0);
+        assert_ne!(rebuild(&cache), before, "a rebuild all the same");
     }
 
     fn vendor_frame(scratch: &mut RenderInput) {
@@ -2574,6 +3695,37 @@ mod tests {
                 .0
                 .is_empty()
         );
+        // With a harness host, the harness's two stand at the rule's left end
+        // at rest (owner, 2026-10-15), full size — Cruise's `∞` in the marks'
+        // accent itself, the gear in the pane's ink — the rule's glyphs run on
+        // to the owner's facts, unchanged at its right end.
+        let harness = crate::claude_lights::Block::of_autopilot(
+            crate::autopilot::AutopilotView::Cruise,
+            blank,
+            [0, 128, 255],
+        );
+        let widths = footer::LightsWidth {
+            chips: harness.lights.len(),
+            title: harness.title.len(),
+            short: harness.short_title.len(),
+            reason: harness.reason,
+        };
+        let fit = footer::fit_rule(&facts(), 76, Some(widths));
+        let (cells, lights) = compose_rule(&fit, Some(&harness), rule, blank, [0, 128, 255], 76);
+        assert_eq!(lights, Some(1));
+        assert_eq!(cells.len(), 76, "the rule's glyphs run on to the facts");
+        let text = text_of(&cells);
+        assert!(text.starts_with(" \u{221e} \u{2699} \u{2500}"), "{text:?}");
+        assert!(
+            text.ends_with(" \u{25C6} Opus 5.5 xhigh   \u{2302} ~/aterm   \u{2387} main "),
+            "{text:?}"
+        );
+        assert_eq!(
+            (cells[1].fg, cells[3].fg),
+            ([0, 128, 255], blank.fg),
+            "cruise in the accent, the gear in the pane's ink"
+        );
+        assert_eq!(cells[1].script, aterm_core::terminal::Script::Normal);
     }
 
     /// THE FACTS ARE PAINTED WHERE THEY ARE SET (`footer::set_facts`, whose
@@ -3027,6 +4179,7 @@ mod tests {
             label: label.into(),
             class: accounts::Class::Dedicated,
             dir: dir.map(str::to_owned),
+            ..accounts::Row::default()
         };
         accounts::Roster {
             rows: vec![row("main", None), row("work-2", Some("/logins/work-2"))],
@@ -3116,6 +4269,7 @@ mod tests {
             label: "pool-a".into(),
             class: accounts::Class::Shared,
             dir: Some("/logins/pool-a".into()),
+            ..accounts::Row::default()
         });
         let one = accounts::Roster {
             rows: two.rows[..1].to_vec(),
@@ -3389,6 +4543,52 @@ mod tests {
         s
     }
 
+    /// [`write_edits`] of owned edits into a fresh slot.
+    fn written(
+        s: &mut RenderInput,
+        edits: Vec<(usize, usize, Vec<RenderCell>, RenderCell)>,
+    ) -> FooterUndo {
+        let mut slot = FooterUndo::default();
+        write_edits(
+            &mut slot,
+            s,
+            edits
+                .iter()
+                .map(|(row, col, cells, ground)| (*row, *col, &cells[..], *ground)),
+        );
+        slot
+    }
+
+    /// THE WRITE KEEPS ITS BUFFERS: a write undone and made again — a
+    /// footer painted frame after frame — fills the rows the last one left
+    /// (its cells, what they covered, the record itself) and allocates
+    /// nothing, the cells and the undo exactly as a fresh slot's. CONTROL:
+    /// the first write into a fresh slot allocates its rows.
+    #[test]
+    fn a_footer_written_again_allocates_nothing() {
+        let mut s = engine_fill(4);
+        let original = s.cells.clone();
+        let painted = row_of("  \u{25C6} Opus 5.5 xhigh", [1, 1, 1]);
+        let chip = row_of("\u{221e} \u{2699}", [2, 2, 2]);
+        let ground = cell(' ', [0, 0, 0]);
+        let edits = [(3, 0, &painted[..], ground), (2, 30, &chip[..], ground)];
+        let mut slot = FooterUndo::default();
+        let ((), fresh) = crate::work_counts::allocations_in(|| {
+            write_edits(&mut slot, &mut s, edits);
+        });
+        assert!(fresh > 0, "CONTROL: a fresh slot allocates its rows");
+        let first = s.cells.clone();
+        for frame in 0..3 {
+            assert!(undo(&mut slot, &mut s), "frame {frame}");
+            assert_eq!(s.cells, original, "frame {frame}: undone exactly");
+            let ((), again) = crate::work_counts::allocations_in(|| {
+                write_edits(&mut slot, &mut s, edits);
+            });
+            assert_eq!(again, 0, "frame {frame}: the rows' buffers reused");
+            assert_eq!(s.cells, first, "frame {frame}: the same write");
+        }
+    }
+
     /// The whole point: the footer comes off exactly, and the scratch is an
     /// ENGINE FILL again — the state DMG-1's scoped refill, the effect-only
     /// reuse and D-2's stamp compare all require.
@@ -3397,8 +4597,8 @@ mod tests {
         let mut s = engine_fill(4);
         let original = s.cells.clone();
         let painted = row_of("  \u{25C6} Opus 5.5 xhigh", [1, 1, 1]);
-        let mut slot = write_edits(&mut s, vec![(3, 0, painted.clone(), cell(' ', [0, 0, 0]))]);
-        assert!(slot.is_some());
+        let mut slot = written(&mut s, vec![(3, 0, painted.clone(), cell(' ', [0, 0, 0]))]);
+        assert!(slot.is_written());
         assert_eq!(&s.cells[3][..painted.len()], painted.as_slice());
         assert_ne!(s.snapshot_seq, s.engine_fill_seq, "the write is declared");
         assert_eq!(
@@ -3408,7 +4608,7 @@ mod tests {
         assert_eq!(s.row_rev[3], 0, "the written row is compared by content");
         assert_eq!(s.row_rev[2], 102, "every other row keeps its stamp");
         assert!(undo(&mut slot, &mut s));
-        assert!(slot.is_none(), "consumed");
+        assert!(!slot.is_written(), "consumed");
         assert_eq!(s.cells, original, "cells and trimmed lengths restored");
         assert_eq!(s.snapshot_seq, 40);
         assert_eq!(s.engine_fill_seq, 40);
@@ -3422,21 +4622,93 @@ mod tests {
     fn a_scratch_touched_since_is_left_alone() {
         let painted = row_of("  footer", [1, 1, 1]);
         let mut s = engine_fill(3);
-        let mut slot = write_edits(&mut s, vec![(2, 0, painted.clone(), cell(' ', [0, 0, 0]))]);
+        let mut slot = written(&mut s, vec![(2, 0, painted.clone(), cell(' ', [0, 0, 0]))]);
         s.snapshot_seq += 1; // another host write
         let before = (s.cells.clone(), s.snapshot_seq, s.row_rev.clone());
         assert!(!undo(&mut slot, &mut s));
         assert_eq!((s.cells.clone(), s.snapshot_seq, s.row_rev.clone()), before);
-        assert!(slot.is_none(), "a stale record is dropped");
+        assert!(!slot.is_written(), "a stale record is dropped");
 
         let mut s = engine_fill(3);
-        let mut slot = write_edits(&mut s, vec![(2, 0, painted, cell(' ', [0, 0, 0]))]);
+        let mut slot = written(&mut s, vec![(2, 0, painted, cell(' ', [0, 0, 0]))]);
         s.cells[2][3].ch = 'X';
         assert!(
             !undo(&mut slot, &mut s),
             "the painted span must still be ours"
         );
         assert_eq!(s.cells[2][3].ch, 'X');
+    }
+
+    /// THE RULE IS WRITTEN WHERE IT CHANGES ([`rule_edits`]): a composition
+    /// with chips — the chips at the rule's left end, the facts at its right,
+    /// the rule's own glyph between — goes on as two edits, the glyphs
+    /// between left as the glass shows them: the same cells as the whole
+    /// composition written, undone to the same engine fill, for the chips'
+    /// and the facts' cells alone (`work_counts::footer_cells_written`), no
+    /// cell written over with itself. Without chips it is one edit, as
+    /// before. NEGATIVE CONTROLS: written whole, the composition costs every
+    /// cell of it and puts the middle's glyphs back over themselves; and the
+    /// sameness is the glass's — over a middle that is not the rule's glyph
+    /// (which `rule_mask` never takes into the run), the two writes differ.
+    #[test]
+    fn a_rule_with_chips_is_written_where_it_changes() {
+        let rule = cell('\u{2500}', [5, 5, 5]);
+        let ground = cell(' ', [0, 0, 0]);
+        let fill = || {
+            let mut s = engine_fill(3);
+            s.cells[2] = vec![rule; 48];
+            s
+        };
+        let mut cells = row_of(" \u{221e} \u{2699} ", [2, 2, 2]);
+        let glass = cells.len()..cells.len() + 24;
+        cells.extend(std::iter::repeat_n(rule, glass.len()));
+        cells.extend(row_of(" Opus 5.5 ", [3, 3, 3]));
+        let col = 48 - 1 - cells.len();
+        let split_write = |s: &mut RenderInput, glass: &std::ops::Range<usize>| {
+            let mut slot = FooterUndo::default();
+            let _ = crate::work_counts::take_footer_cells_written();
+            write_edits(&mut slot, s, rule_edits(2, col, &cells, glass, ground));
+            (slot, crate::work_counts::take_footer_cells_written())
+        };
+        let original = fill().cells;
+        let mut whole = fill();
+        let _ = crate::work_counts::take_footer_cells_written();
+        let mut whole_slot = written(&mut whole, vec![(2, col, cells.clone(), ground)]);
+        let whole_cost = crate::work_counts::take_footer_cells_written();
+        let mut split = fill();
+        let (mut slot, cost) = split_write(&mut split, &glass);
+        assert_eq!(split.cells, whole.cells, "the same glass");
+        assert_eq!(
+            (split.snapshot_seq, &split.row_rev),
+            (whole.snapshot_seq, &whole.row_rev),
+            "the same tokens"
+        );
+        assert_eq!(cost, cells.len() - glass.len(), "the chips and the facts");
+        assert_eq!(slot.rewritten_as_they_were(), 0);
+        assert_eq!(whole_cost, cells.len(), "CONTROL: whole, every cell");
+        assert_eq!(
+            whole_slot.rewritten_as_they_were(),
+            glass.len(),
+            "CONTROL: whole, the middle written over itself"
+        );
+        assert!(undo(&mut slot, &mut split));
+        assert!(undo(&mut whole_slot, &mut whole));
+        assert_eq!((&split.cells, &whole.cells), (&original, &original));
+        // No chips: the composition is one edit, written whole.
+        let mut bare = fill();
+        let (_, cost) = split_write(&mut bare, &(0..0));
+        assert_eq!(cost, cells.len());
+        // NEGATIVE CONTROL: a middle that is not the rule's glyph.
+        let (mut whole, mut split) = (fill(), fill());
+        for s in [&mut whole, &mut split] {
+            s.cells[2][col + glass.start + 3] = cell('x', [5, 5, 5]);
+        }
+        let _ = written(&mut whole, vec![(2, col, cells.clone(), ground)]);
+        let _ = split_write(&mut split, &glass);
+        assert_ne!(
+            split.cells, whole.cells,
+            "CONTROL: the skip keeps what is there"
+        );
     }
 
     /// Two panes side by side write one frame row; the undo peels them off
@@ -3448,7 +4720,7 @@ mod tests {
         let left = row_of("  left footer      ", [1, 1, 1]);
         let right = row_of("  right footer", [2, 2, 2]);
         let ground = cell(' ', [0, 0, 0]);
-        let mut slot = write_edits(&mut s, vec![(1, 0, left, ground), (1, 20, right, ground)]);
+        let mut slot = written(&mut s, vec![(1, 0, left, ground), (1, 20, right, ground)]);
         assert_eq!(s.cells[1].len(), 34, "padded to the right pane's edge");
         assert!(undo(&mut slot, &mut s));
         assert_eq!(s.cells, original);
@@ -3468,7 +4740,7 @@ mod tests {
         let blank = cell(' ', [200, 200, 200]);
         let (cells, _) = compose_rule(&facts, None, s.cells[2][0], blank, [0, 128, 255], 36);
         let col = 40 - 1 - cells.len();
-        let mut slot = write_edits(&mut s, vec![(2, col, cells.clone(), blank)]);
+        let mut slot = written(&mut s, vec![(2, col, cells.clone(), blank)]);
         assert_eq!(s.cells[2].len(), 40, "nothing padded");
         assert_eq!(&s.cells[2][col..39], cells.as_slice());
         assert_eq!(
@@ -3484,7 +4756,7 @@ mod tests {
         let mut s = engine_fill(2);
         let original = s.cells.clone();
         let chip = cell('\u{23F8}', [9, 9, 9]);
-        let mut slot = write_edits(&mut s, vec![(1, 30, vec![chip], blank)]);
+        let mut slot = written(&mut s, vec![(1, 30, vec![chip], blank)]);
         assert!(
             s.cells[1][12..30].iter().all(|c| *c == blank),
             "{:?}",
@@ -3501,13 +4773,11 @@ mod tests {
         let mut s = engine_fill(2);
         s.clusters[1].push((4, "e\u{301}".into()));
         let before = s.cells.clone();
-        assert!(
-            write_edits(
-                &mut s,
-                vec![(1, 0, row_of("  footer", [1, 1, 1]), cell(' ', [0, 0, 0]))]
-            )
-            .is_none()
+        let slot = written(
+            &mut s,
+            vec![(1, 0, row_of("  footer", [1, 1, 1]), cell(' ', [0, 0, 0]))],
         );
+        assert!(!slot.is_written());
         assert_eq!(s.cells, before);
         assert_eq!(s.snapshot_seq, 40, "nothing written, nothing declared");
     }
@@ -3518,7 +4788,7 @@ mod tests {
     fn only_an_untouched_engine_fill_keeps_its_stamps() {
         let mut s = engine_fill(2);
         s.snapshot_seq = 41; // e.g. the find bar, earlier this frame
-        let mut slot = write_edits(
+        let mut slot = written(
             &mut s,
             vec![(1, 0, row_of("  footer", [1, 1, 1]), cell(' ', [0, 0, 0]))],
         );
@@ -3546,7 +4816,7 @@ mod tests {
         s.rows += 1;
         s.snapshot_seq += 1;
         s.note_host_row_prepend(1, blessed);
-        let mut slot = write_edits(
+        let mut slot = written(
             &mut s,
             vec![(3, 0, row_of("  footer", [1, 1, 1]), cell(' ', [0, 0, 0]))],
         );
@@ -3794,8 +5064,10 @@ mod tests {
             shown.contains('\u{29D7}') && shown.contains('\u{03A3}'),
             "{shown:?}"
         );
-        app.config.claude_footer =
-            Some(crate::app_config::ClaudeFooterConfig { usage: Some(false) });
+        app.config.claude_footer = Some(crate::app_config::ClaudeFooterConfig {
+            usage: Some(false),
+            ..Default::default()
+        });
         frame(&mut app, wid);
         let hidden = rule(&app);
         assert!(
@@ -4006,10 +5278,10 @@ mod tests {
     }
 
     /// THE NEWEST CARD WINS: while the facts stay open the card is read on
-    /// every frame, and a newer reading replaces the kept one — a
-    /// predecessor's card of the same build, read in the moment between the
-    /// new owner and the new process's first paint, gives way the moment the
-    /// new process draws its own. A frame with no card to read (it scrolled
+    /// every rebuild of the pane's text, and a newer reading replaces the
+    /// kept one — a predecessor's card of the same build, read in the moment
+    /// between the new owner and the new process's first paint, gives way
+    /// the moment the new process draws its own. A frame with no card to read (it scrolled
     /// away) keeps the newest reading. NEGATIVE CONTROL: the stale reading
     /// is what the footer showed first (the memo read once kept it for good).
     #[test]
@@ -4234,13 +5506,13 @@ mod tests {
 
     #[test]
     fn no_facts_keys_like_no_footer() {
-        assert_eq!(fingerprint(None, true), 0);
-        assert_ne!(fingerprint(Some(&facts()), false), 0);
+        assert_eq!(fingerprint(None, None, true), 0);
+        assert_ne!(fingerprint(Some(&facts()), None, false), 0);
         let mut other = facts();
         other.branch = Some("feature".into());
         assert_ne!(
-            fingerprint(Some(&facts()), true),
-            fingerprint(Some(&other), true)
+            fingerprint(Some(&facts()), None, true),
+            fingerprint(Some(&other), None, true)
         );
     }
 
@@ -4255,7 +5527,7 @@ mod tests {
             ..facts()
         };
         for usage in [true, false] {
-            let key = |facts: &FooterFacts| fingerprint(Some(facts), usage);
+            let key = |facts: &FooterFacts| fingerprint(Some(facts), None, usage);
             assert_ne!(key(&on("main")), key(&on("work-2")), "another account");
             assert_ne!(key(&on("main")), key(&facts()), "one where there was none");
             assert_eq!(key(&on("main")), key(&on("main")), "the same account");

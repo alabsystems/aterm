@@ -126,16 +126,13 @@ fn wrap(text: &str, room: usize) -> Vec<String> {
     lines
 }
 
-/// The texts' rules (§4): ASCII only; no digit and none of `, ; " - \` (a
-/// digit could select an option, a comma draws CSV quotes around a
-/// multi-select answer, `send` reads `\n`); single spaces, none at an edge; no
-/// word over 16 cells; at most 279 bytes (below the paste-placeholder size);
-/// no `key ` (a log reader could take it for a verb). Every greedy wrap from 40
-/// to 220 columns at label columns 5 and 9, focused (one cell short) or not,
-/// joins back with one space to the text exactly, and so does the reader over
-/// the dialog 2.1.283 draws with it typed, single- and multi-select, focused
-/// and on the button, at 80, 120 and 200 columns. Negative control: the
-/// original wording breaks the rules (commas and hyphens).
+/// The texts' rules: ASCII only; no digit and none of `, ; " - \` (a digit
+/// could select an option, a comma draws CSV quotes around a multi-select
+/// answer, `send` reads `\n`); single spaces, none at an edge; no word over 16
+/// cells; at most 279 bytes (below the paste-placeholder size); no `key ` (a
+/// log reader could take it for a verb). Every wrap of them, greedy or as the
+/// dialog draws it, joins back with one space to the text exactly. Negative
+/// control: the measured wording breaks the rules (commas and hyphens).
 #[test]
 fn the_policy_texts_keep_their_rules() {
     let broken = |t: &str| -> Vec<&'static str> {
@@ -242,11 +239,10 @@ fn the_policy_texts_keep_their_rules() {
     }
 }
 
-/// THE SESSION'S WORD SET IS SPELLED ONCE, BY THE PARSER. `ask` and every
-/// priority word are what `meta set questions` accepts; the server's `meta`
-/// verb help (aterm-types) and the drive help (this crate) spell that set by
-/// hand, so a word added to [`QuestionPriority::WORDS`] must reach both or the
-/// help sends an operator to a refusal. Derived from the parser, no prose.
+/// The session's word set is spelled once, by the parser: `ask` and every
+/// priority word are what `meta set questions` accepts, and the server's
+/// `meta` help (aterm-types) and the drive help (this crate) spell that set
+/// by hand, so a word added to [`QuestionPriority::WORDS`] must reach both.
 #[test]
 fn the_shipped_help_spells_the_session_words_the_parser_accepts() {
     let words = std::iter::once("ask")
@@ -278,15 +274,10 @@ fn the_shipped_help_spells_the_session_words_the_parser_accepts() {
     }
 }
 
-/// THE FIT ESTIMATE is never below what 2.1.283 draws: the measured text
-/// typed into c1-04, c3-05, c4-04 and c4-09 (and c8-02's short-term text)
-/// took three rows at the label column (5, or 9 behind the checkbox); the
-/// estimate at the pane's 120 columns is at least that. The reworded texts
-/// fit the measured 120x44 panes, pristine; the same dialog in a pane no
-/// taller than itself does not (it would grow past its head), nor does a
-/// pane narrower than a word. NEGATIVE CONTROL: wrapped at the pane's full
-/// width with no margin, the measured c8-02 text is estimated at FEWER rows
-/// than drawn — the margin is what keeps the estimate above the vendor.
+/// The fit estimate is never below what Claude Code draws (each measured
+/// capture's text took three rows at the label column). The reworded texts fit
+/// the measured 120x44 panes, pristine, but not a pane no taller than the
+/// dialog, nor one narrower than a word.
 #[test]
 fn the_fit_estimate_is_at_or_above_the_measured_wraps() {
     let measured_rows = |rows: &[String]| -> usize {
@@ -413,10 +404,9 @@ fn the_fit_estimate_is_at_or_above_the_measured_wraps() {
             col,
             LONG_TERM_TEXT
         ));
-        // The PANE's height, never the rows a `tail=` read sent: the tight
-        // dialog read whole but drawn in a pane with the room is estimated
-        // to fit, and the roomy rows read as a pane no taller than the
-        // dialog are not.
+        // The pane's height, never the rows a `tail=` read sent: the tight
+        // dialog drawn in a pane with the room is estimated to fit, and the
+        // roomy rows read as a pane no taller than the dialog are not.
         let prompt = parse_prompt_v2(&tight).expect("a box");
         let taller = Pane {
             cols: COLS,
@@ -434,14 +424,10 @@ fn the_fit_estimate_is_at_or_above_the_measured_wraps() {
 
 // ---- the table (choose_text) ---------------------------------------------
 
-/// Single-select, every row of the table: a pristine field with no memory
-/// gets the text (the focus moved there first when it is elsewhere), under
-/// the priority's own rule; the field holding exactly that text, which the
-/// loop remembers writing, gets Enter on it; the same field remembered but
-/// empty is handed over (a text is never written twice); and every other
-/// text — a person's words, the policy text the loop does not remember
-/// writing, the text plus more, the first wording, another priority's
-/// text — is a person's.
+/// Single-select, every row of the table: a pristine field with no memory gets
+/// the text; the field holding exactly the remembered text gets Enter; one
+/// remembered but empty is handed over (a text is never written twice); every
+/// other text is a person's.
 #[test]
 fn a_single_select_is_typed_then_entered_and_anything_else_is_the_persons() {
     for p in [LONG, SHORT] {
@@ -539,12 +525,10 @@ fn a_single_select_is_typed_then_entered_and_anything_else_is_the_persons() {
     );
 }
 
-/// Multi-select, every row of the table: a pristine, unchecked field gets
-/// the text; the field holding the loop's own text, ticked, is submitted by
-/// its button — the focus moved off the field first (Enter in the field
-/// unticks it, c3c) — and never by an Enter where the text is; own text
-/// unticked, any checked option, a checked but empty field, a person's text
-/// and the text remembered but gone are handed over.
+/// Multi-select, every row of the table: a pristine, unchecked field gets the
+/// text; the loop's own text, ticked, is submitted by its button with the
+/// focus moved off the field first (Enter in the field unticks it, c3c);
+/// everything else is handed over.
 #[test]
 fn a_multi_select_is_typed_then_submitted_by_its_button_never_in_the_field() {
     for p in [LONG, SHORT] {
@@ -556,8 +540,8 @@ fn a_multi_select_is_typed_then_submitted_by_its_button_never_in_the_field() {
         let second = screen(f::QUESTION_283_TABS_SECOND);
         assert_eq!(did(&decided(&second, p, None)).0, Did::Type(3, p));
 
-        // Own text, ticked, the focus in the field: one row DOWN to the
-        // button, then Enter there — never Enter here.
+        // Own text, ticked, the focus in the field: one row down to the
+        // button, then Enter there, never Enter here.
         let typed = rewrap_free_text(f::QUESTION_283_MULTISELECT_TYPED_LONG_TERM, text, 120);
         assert_eq!(free_text_of(&typed).checked, Some(true));
         let (what, rule, subject, _) = did(&decided(&typed, p, Some(p)));
@@ -612,22 +596,236 @@ fn a_multi_select_is_typed_then_submitted_by_its_button_never_in_the_field() {
     }
 }
 
-/// The fallback said on a question read by its roles ([`said_fallback`] is
-/// every fallback's one spelling): Codex's question, no dialog, under a text
-/// priority, is answered with its recommended digit, ledgered under the word's
-/// rule, `<title> → <answer> (recommended: <why>)` and `policy <word>: <why>:
-/// <how>`. Negative control: under `recommended` it is the recommended path's
-/// own decision, unrewritten.
+/// Claude Code 2.1.300, measured: a multi-select question at 80 columns as
+/// the harness read it, the focus on option 1 and the free-text row pristine.
+const MULTI_80_2_1_300: &str = include_str!("fixtures/claude-2.1.300-question-multi-80col.txt");
+
+/// `rows` with its rules drawn `cols` cells wide: the same dialog in a pane of
+/// that width (its other rows fit any width this is used at).
+fn at_width(rows: &[String], cols: usize) -> Vec<String> {
+    rows.iter()
+        .map(|r| {
+            if !r.is_empty() && r.chars().all(|c| c == '─') {
+                "─".repeat(cols)
+            } else {
+                r.clone()
+            }
+        })
+        .collect()
+}
+
+/// Under `long-term`, a multi-select text its dialog would draw over once the
+/// focus leaves for `Submit` (Claude Code 2.1.300 at 80 columns, and at 26,
+/// 30, 34 and 40) is never typed: the tab takes its recommended option, said.
+/// Negative control: at 110 and 120 columns, where the same text was measured
+/// typed and submitted, it is typed.
+#[test]
+fn a_multi_select_text_its_dialog_would_draw_over_is_never_typed() {
+    let rows = screen(MULTI_80_2_1_300);
+    let decide_at = |cols: usize| {
+        let rows = at_width(&rows, cols);
+        let prompt = parse_prompt_v2(&rows).expect("a box");
+        let pane = Pane {
+            cols: u16::try_from(cols).expect("cols"),
+            rows: 50,
+        };
+        answer_question(&prompt, &rows, LONG, None, false, pane)
+    };
+    for cols in [80, 40] {
+        let (what, rule, subject, _) = did(&decide_at(cols));
+        assert_eq!(
+            what,
+            Did::Enter(0, AnswerTarget::Option(1)),
+            "{cols}: the recommended option, never the text: {subject}"
+        );
+        assert_eq!(rule, RULE_ANSWER_LONG_TERM);
+        assert!(
+            subject.ends_with(
+                "→ toggle Unit tests (Recommended) (recommended: the answer would not fit the \
+                 pane: the dialog would draw its button over the text's last row once the focus \
+                 left it)"
+            ),
+            "{cols}: {subject}"
+        );
+    }
+    for cols in [110, 120] {
+        assert_eq!(did(&decide_at(cols)).0, Did::Type(3, LONG), "{cols}");
+    }
+}
+
+/// Claude Code 2.1.300, measured: a multi-select's free-text row holding the
+/// long-term text, typed by hand, after `down` to `Submit`, at 39, 47 and 57
+/// columns (the dialog's rows).
+const REFLOW_2_1_300: [(u16, &str); 3] = [
+    (
+        39,
+        include_str!("fixtures/claude-2.1.300-question-multi-reflow-39col.txt"),
+    ),
+    (
+        47,
+        include_str!("fixtures/claude-2.1.300-question-multi-reflow-47col.txt"),
+    ),
+    (
+        57,
+        include_str!("fixtures/claude-2.1.300-question-multi-reflow-57col.txt"),
+    ),
+];
+
+/// Every frame measured on Claude Code 2.1.300 (the long-term text typed into
+/// a multi-select's free-text row, label column 9, then `down` to `Submit`):
+/// `(columns, the column its text was drawn from, whether `Submit` was drawn
+/// over the text's last row)`.
+const REFLOW_MEASURED: [(u16, usize, bool); 43] = [
+    (38, 8, false),
+    (39, 8, true),
+    (41, 8, false),
+    (42, 8, false),
+    (43, 8, true),
+    (44, 8, true),
+    (45, 8, false),
+    (46, 8, false),
+    (47, 8, false),
+    (48, 8, true),
+    (49, 8, true),
+    (50, 8, false),
+    (51, 8, false),
+    (52, 9, false),
+    (53, 9, false),
+    (54, 9, false),
+    (55, 9, false),
+    (56, 9, true),
+    (57, 9, true),
+    (58, 9, false),
+    (60, 9, false),
+    (62, 9, false),
+    (63, 9, true),
+    (64, 9, true),
+    (65, 9, false),
+    (70, 9, false),
+    (75, 9, false),
+    (79, 9, false),
+    (80, 9, true),
+    (81, 9, true),
+    (82, 9, false),
+    (90, 9, false),
+    (100, 9, false),
+    (101, 9, true),
+    (102, 9, true),
+    (103, 9, false),
+    (120, 9, false),
+    (143, 9, false),
+    (144, 9, false),
+    (145, 9, true),
+    (146, 9, true),
+    (147, 9, false),
+    (150, 9, false),
+];
+
+/// [`drawn_rows`]'s wrap, row by row as drawn: greedy at single spaces, a
+/// row filled to its last cell leaving the next one starting with the space
+/// between (counted, not drawn: each row is drawn trimmed).
+fn drawn_wrap(text: &str, width: usize) -> Vec<String> {
+    let mut rows = vec![String::new()];
+    let mut line = 0usize;
+    for (k, word) in text.split(' ').enumerate() {
+        if k > 0 {
+            if line >= width {
+                rows.push(String::new());
+                line = 0;
+            }
+            rows.last_mut().expect("a row").push(' ');
+            line += 1;
+        }
+        if line + word.len() > width {
+            rows.push(String::new());
+            line = 0;
+        }
+        rows.last_mut().expect("a row").push_str(word);
+        line += word.len();
+    }
+    rows.iter().map(|r| r.trim().to_string()).collect()
+}
+
+/// [`drawn_rows`] gives the measured frames' text rows where a greedy wrap
+/// differs (57 columns), and a row laid out two cells wider than drawn
+/// predicts every measured frame from the column its text was drawn from. The
+/// rule, which cannot know that column, holds at both: it never keeps where
+/// the button drew over the text, at the cost of some widths that kept.
+/// Negative control: a word wider than the row keeps nothing.
+#[test]
+fn a_multi_select_text_keeps_its_rows_only_where_the_reflow_cannot_drop_one() {
+    for (cols, capture) in REFLOW_2_1_300 {
+        let rows = screen(capture);
+        let first = rows
+            .iter()
+            .position(|r| r.contains("4. [✔]"))
+            .expect("the free-text row");
+        let byte = rows[first].find("Decide").expect("the text");
+        let col = rows[first][..byte].chars().count();
+        let drawn: Vec<String> = rows[first..]
+            .iter()
+            .take_while(|r| !r.trim_start_matches('❯').trim_start().starts_with("Submit"))
+            .map(|r| {
+                r.chars()
+                    .skip(col)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect();
+        let width = usize::from(cols) - col;
+        let wrapped = drawn_wrap(LONG_TERM_TEXT, width);
+        assert_eq!(drawn, wrapped[..drawn.len()], "{cols} columns");
+        assert_eq!(drawn_rows(LONG_TERM_TEXT, width), Some(wrapped.len()));
+    }
+    assert_ne!(
+        wrapped_rows(LONG_TERM_TEXT, 57 - 9),
+        drawn_rows(LONG_TERM_TEXT, 57 - 9),
+        "the greedy wrap is not the renderer's"
+    );
+    let gives_up = [41, 45, 50, 55, 62, 79, 100, 144];
+    for (cols, col, over) in REFLOW_MEASURED {
+        let at = |w: usize| drawn_rows(LONG_TERM_TEXT, w).expect("wraps");
+        let width = usize::from(cols) - col;
+        assert_eq!(at(width) > at(width + 2), over, "{cols} columns: the model");
+        let keeps = text_keeps_its_rows(LONG_TERM_TEXT, cols, 9);
+        assert!(!(over && keeps), "{cols} columns: drawn over, never typed");
+        assert_eq!(keeps, !over && !gives_up.contains(&cols), "{cols} columns");
+    }
+    for cols in [26, 30, 34, 40] {
+        assert!(!text_keeps_its_rows(LONG_TERM_TEXT, cols, 9), "{cols}");
+    }
+    for text in [LONG_TERM_TEXT, SHORT_TERM_TEXT] {
+        for cols in 26..=220u16 {
+            let at = |w: usize| drawn_rows(text, w).expect("wraps");
+            let label = usize::from(cols) - 9;
+            assert_eq!(
+                text_keeps_its_rows(text, cols, 9),
+                at(label) == at(label + 2) && at(label + 1) == at(label + 3),
+                "{cols}"
+            );
+            assert_eq!(drawn_rows(text, label), Some(drawn_wrap(text, label).len()));
+        }
+    }
+    assert!(!text_keeps_its_rows("Decide yourselfx", 24, 9));
+}
+
+/// Codex's question (no dialog) under a text priority, whose footer offers no notes, is answered
+/// with its recommended digit, ledgered under the word's rule and said by [`said_fallback`].
+/// Negative control: under `recommended` it is unrewritten.
 #[test]
 fn a_question_read_by_its_roles_falls_back_said_as_every_fallback_is() {
-    let rows = screen(aterm_phase::codex::fixtures::QUESTION);
+    let rows: Vec<String> = screen(aterm_phase::codex::fixtures::QUESTION)
+        .into_iter()
+        .map(|r| r.replace("tab to add notes | ", ""))
+        .collect();
     let reading = aterm_phase::read(Some("codex"), &rows, None);
     let prompt = reading.prompt.as_ref().expect("the question");
     assert!(
         prompt.question_dialog.is_none(),
         "PRECONDITION: by its roles"
     );
-    let why = "a question read by its answers' roles has no free-text row the supervisor writes";
+    let why = "a question whose footer offers no notes";
     for p in [LONG, SHORT] {
         match answer_question(prompt, &rows, p, None, false, Pane::of(&rows)) {
             Decision::Approve {
@@ -675,14 +873,11 @@ fn a_question_read_by_its_roles_falls_back_said_as_every_fallback_is() {
     }
 }
 
-/// The fallbacks, told: a tab the text would not fit, and the preview form
-/// (no free-text row), are answered with their RECOMMENDED option under the
-/// priority's rule, the subject and the journal saying why. On a
-/// multi-select that does not fit, the recommended path keeps judging its
-/// own checks (its toggle, then its button), so the fallback survives the
-/// tab's second key. The review is submitted when every question has an
-/// answer, and handed over when one was skipped. The destructive-question
-/// rule holds in a text mode.
+/// The fallbacks, told: a tab the text would not fit and the preview form take
+/// their recommended option under the priority's rule, saying why, and a
+/// multi-select's fallback survives the tab's second key. The review is
+/// submitted when every question has an answer, handed over when one was
+/// skipped.
 #[test]
 fn a_tab_the_text_cannot_go_to_is_answered_with_its_recommended_option_and_says_so() {
     let p = LONG;
@@ -784,12 +979,9 @@ fn a_tab_the_text_cannot_go_to_is_answered_with_its_recommended_option_and_says_
     assert_r10_is_the_recommended_paths(&drop, p);
 }
 
-/// In a text mode: a question with no recommended option that names a
-/// destructive act is never left to the worker (the policy text would let it
-/// take the act) but decided as the recommended path decides it: its one
-/// refusal pressed, said as a fallback under the word's rule; or, where the
-/// recommended path hands it over (no one refusal, a multi-select), handed
-/// over for the same reason.
+/// In a text mode an unmarked question naming a destructive act is never left
+/// to the worker but decided as the recommended path decides it: its one
+/// refusal, said as a fallback, or handed over where that path hands it over.
 fn assert_r10_is_the_recommended_paths(rows: &[String], p: QuestionPriority) {
     let recommended = decided(rows, QuestionPriority::Recommended, None);
     match (recommended, decided(rows, p, None)) {
@@ -863,7 +1055,7 @@ fn decide_answers_by_the_contexts_priority() {
         Did::Enter(-2, AnswerTarget::Option(1))
     );
     ctx.screen_cols = 0;
-    // Too short a PANE (its height, not the rows read): the same.
+    // Too short a pane (its height, not the rows read): the same.
     ctx.screen_rows = 14;
     assert_eq!(
         did(&decide(&reading, &rows, &ctx)).0,
@@ -1129,8 +1321,8 @@ fn verdict(d: &Decision) -> Verdict {
 }
 
 /// What the model lets the loop do at `st`, the loop's own guards granted
-/// (a person quiet, its last key taken, the queue empty): the DECISION
-/// part, the pure decider's.
+/// (a person quiet, its last key taken, the queue empty): the decision part,
+/// the pure decider's.
 fn decision_of(model: &aterm_spec::derive::Model, st: &ModelState) -> Verdict {
     let mut free = st.clone();
     for (var, v) in [
@@ -1406,12 +1598,10 @@ struct ModelReads {
 }
 
 /// [`ModelReads`] of the committed model at `Text = 1`, `Multi = multi`: its
-/// whole bounded space walked once (the interpreter's own successor
-/// function, its environment built once a state), breadth first.
-///
-/// The states met are kept in a hash set, membership being all the walk asks
-/// of it: a `BTreeSet` of value vectors cost 40% of the test's samples
-/// (measured). The walk's order is the queue's.
+/// whole bounded space walked once, breadth first (the interpreter's own
+/// successor function, its environment built once a state). The states met
+/// are kept in a hash set: a `BTreeSet` of value vectors cost 40% of the
+/// test's time.
 fn model_reads(multi: bool) -> ModelReads {
     let committed = aterm_spec::derive::supervisor_question_text_model();
     let model = aterm_spec::interp::with_consts(&committed, &[("Multi", i64::from(multi))]);
@@ -1520,23 +1710,18 @@ fn entered_on(
 }
 
 /// Tier-1 for `SupervisorQuestionText` (`Text = 1`, aterm-spec
-/// `supervisor_question_text_model`), the decision: at every reachable state,
-/// single- and multi-select, where the loop holds a fresh read, the real
-/// [`answer_question`] under each text priority (over the 2.1.283 captures as
-/// that read showed them, with the loop's memory and fallback latch,
-/// [`drawn`]) writes the text exactly where `HarnessType` is enabled, presses
-/// Enter exactly where `HarnessEnter` is, moves exactly where `HarnessMove`
-/// is, and hands over everywhere else, the loop's own guards granted
-/// ([`decision_of`]). Every verdict occurs for both forms on a text tab; Enter,
-/// a move and a hand-over on a fallback tab; Enter and a move on the review.
+/// `supervisor_question_text_model`): at every reachable state with a fresh
+/// read, single- and multi-select, the real [`answer_question`] under each
+/// text priority over [`drawn`] writes the text, presses Enter, moves, or
+/// hands over exactly where `HarnessType`, `HarnessEnter`, `HarnessMove` or
+/// nothing is enabled ([`decision_of`]). Every verdict occurs on a text tab;
+/// Enter, a move and a hand-over on a fallback tab; Enter and a move on the
+/// review.
 ///
-/// Negative controls, each caught by this comparison: (1) a blind decider
-/// taking any text in the field for its own (`OwnTextRemembered = 0`) presses
-/// Enter where the model hands over; (2) a memory-trusting decider that never
-/// compares its remembered text to the field presses Enter, or moves to the
-/// button, where the model hands over; (3) a multi-as-single decider pressing
-/// Enter on its text in a multi-select's field (`EnterWhereTyped = 1`, which
-/// unticks it) presses Enter where the model moves.
+/// Negative controls, each caught by this comparison: (1) a decider taking any
+/// text in the field for its own (`OwnTextRemembered = 0`); (2) one trusting
+/// its memory without comparing it to the field; (3) one pressing Enter on its
+/// text in a multi-select's field (`EnterWhereTyped = 1`, which unticks it).
 #[test]
 fn tier1_text_mode_decider_chooses_only_what_the_model_enables() {
     let single = model_reads(false);
@@ -1654,5 +1839,192 @@ fn tier1_text_mode_decider_chooses_only_what_the_model_enables() {
         );
         // …and on a single-select it is the real decider: nothing to catch.
         assert!(bind(of(false), p, &single_minded).is_ok());
+    }
+}
+
+/// `rows` with its notes field's text replaced by `text` (one row, as the
+/// lab's capture drew the one text it typed).
+fn noted(rows: &[String], text: &str) -> Vec<String> {
+    let mut out = rows.to_vec();
+    let at = out
+        .iter()
+        .rposition(|r| r.starts_with("  › ") && !r.contains(". "))
+        .expect("the notes row");
+    out[at] = format!("  › {text}");
+    out
+}
+
+/// A CODEX QUESTION TAKES THE WORD'S TEXT AS A NOTE UNDER `None of the above`
+/// (gap #11; 0.163.0, measured): under `long-term` / `short-term` the
+/// decision is the note ([`Choice::Note`], the word's rule, guarded on the
+/// title row), and each read's next keystroke is the one [`note_step`]
+/// names — arrows onto `None of the above` (never its digit, which answers at
+/// once), Tab there, the text into the empty field, Enter only on the field
+/// holding exactly the text the loop remembers writing. NEGATIVE CONTROLS:
+/// under `recommended` the same question is its recommended answer's digit;
+/// the field holding the same text the loop does NOT remember writing, or a
+/// person's own text, or the loop's text gone (Esc or Tab cleared it: the
+/// field empty, or closed), gets no keystroke.
+#[test]
+fn codexs_question_takes_the_text_as_a_note_under_none_of_the_above() {
+    use aterm_phase::codex::fixtures as cx;
+    let dialog = screen(cx::QUESTION_0_163);
+    let reading = aterm_phase::read(Some("codex"), &dialog, None);
+    let prompt = reading.prompt.as_ref().expect("the question");
+    assert!(
+        prompt.question_dialog.is_none(),
+        "PRECONDITION: by its roles"
+    );
+    for p in [LONG, SHORT] {
+        match answer_question(prompt, &dialog, p, None, false, Pane::of(&dialog)) {
+            Decision::Approve {
+                rule_id,
+                choice,
+                guard,
+                subject,
+                ..
+            } => {
+                assert_eq!(rule_id, p.rule_id(), "{p:?}");
+                assert_eq!(choice, Choice::Note { text: p }, "{p:?}");
+                assert_eq!(guard, row_guard(&dialog[prompt.span.0]), "{p:?}");
+                assert!(subject.contains("None of the above"), "{subject}");
+            }
+            other => panic!("{p:?}: not answered: {other:?}"),
+        }
+    }
+    assert!(
+        matches!(
+            answer_question(
+                prompt,
+                &dialog,
+                QuestionPriority::Recommended,
+                None,
+                false,
+                Pane::of(&dialog)
+            ),
+            Decision::Approve {
+                choice: Choice::Digit(1),
+                ..
+            }
+        ),
+        "the control: its recommended answer's digit"
+    );
+    let step = |text: &str, own: Option<QuestionPriority>| {
+        let rows = screen(text);
+        let p = aterm_phase::read(Some("codex"), &rows, None)
+            .prompt
+            .expect("the question");
+        (note_step(&p, &rows, LONG, own), rows)
+    };
+    let (s, rows) = step(cx::QUESTION_0_163, None);
+    let focused = rows
+        .iter()
+        .find(|r| r.starts_with("  › 1. "))
+        .expect("the focused answer");
+    assert_eq!(
+        s,
+        Ok(NoteStep::Move {
+            down: true,
+            guard: row_guard(focused)
+        })
+    );
+    let (s, rows) = step(cx::QUESTION_NONE_FOCUSED_0_163, None);
+    let none = rows
+        .iter()
+        .find(|r| r.starts_with("  › 3. None of the above"))
+        .expect("None of the above");
+    assert_eq!(
+        s,
+        Ok(NoteStep::Open {
+            guard: row_guard(none)
+        })
+    );
+    let (s, rows) = step(cx::QUESTION_NOTES_OPEN_0_163, None);
+    let field = rows
+        .iter()
+        .find(|r| r.as_str() == "  › Add notes")
+        .expect("the empty field");
+    assert_eq!(
+        s,
+        Ok(NoteStep::Type {
+            guard: row_guard(field)
+        })
+    );
+    let typed = noted(&screen(cx::QUESTION_NOTES_OPEN_0_163), LONG_TERM_TEXT);
+    let p = aterm_phase::read(Some("codex"), &typed, None)
+        .prompt
+        .expect("the question");
+    assert_eq!(
+        note_step(&p, &typed, LONG, Some(LONG)),
+        Ok(NoteStep::Enter {
+            guard: row_guard(&format!("  › {LONG_TERM_TEXT}"))
+        })
+    );
+    // The controls: the same text the loop does not remember writing; its
+    // text under another word; a person's text; the loop's text gone.
+    assert!(note_step(&p, &typed, LONG, None).is_err());
+    assert!(note_step(&p, &typed, LONG, Some(SHORT)).is_err());
+    let (s, _) = step(cx::QUESTION_NOTES_TYPED_0_163, None);
+    assert!(s.is_err_and(|why| why.contains("did not write")));
+    for text in [cx::QUESTION_NOTES_OPEN_0_163, cx::QUESTION_NOTES_ESC_0_163] {
+        let (s, _) = step(text, Some(LONG));
+        assert!(s.is_err_and(|why| why.contains("is gone")), "{text}");
+    }
+}
+
+/// A CODEX QUESTION WHOSE NOTES DO NOT READ IS ANSWERED BY ITS RECOMMENDED
+/// ANSWER, SAID: its Tab did not open the field (the loop's latch,
+/// [`NOTES_UNREAD`]), it has no `None of the above`, or its footer offers no
+/// notes — each its recommended digit under the word's rule, the fallback
+/// said as every fallback is. NEGATIVE CONTROL: with the field OPEN no digit
+/// is pressed whatever the latch says (one would be typed into it): a person
+/// answers it.
+#[test]
+fn codexs_question_falls_back_where_its_notes_do_not_read() {
+    use aterm_phase::codex::fixtures as cx;
+    let decide = |rows: &[String], fell_back: bool| {
+        let p = aterm_phase::read(Some("codex"), rows, None)
+            .prompt
+            .expect("the question");
+        answer_question(&p, rows, LONG, None, fell_back, Pane::of(rows))
+    };
+    let said = |d: &Decision, why: &str| match d {
+        Decision::Approve {
+            rule_id,
+            choice,
+            subject,
+            ..
+        } => {
+            assert_eq!(*rule_id, LONG.rule_id(), "{d:?}");
+            assert_eq!(*choice, Choice::Digit(1), "{d:?}");
+            assert!(
+                subject.ends_with(&format!("(recommended: {why})")),
+                "{subject}"
+            );
+        }
+        other => panic!("not answered: {other:?}"),
+    };
+    let dialog = screen(cx::QUESTION_0_163);
+    said(&decide(&dialog, true), NOTES_UNREAD);
+    let unnamed: Vec<String> = dialog
+        .iter()
+        .map(|r| r.replace("None of the above", "Something else"))
+        .collect();
+    said(
+        &decide(&unnamed, false),
+        "a question with no `None of the above` to write a note under",
+    );
+    let hintless: Vec<String> = dialog
+        .iter()
+        .map(|r| r.replace("tab to add notes | ", ""))
+        .collect();
+    said(
+        &decide(&hintless, false),
+        "a question whose footer offers no notes",
+    );
+    let open = screen(cx::QUESTION_NOTES_OPEN_0_163);
+    match decide(&open, true) {
+        Decision::Escalate { reason } => assert!(reason.contains(NOTES_UNREAD), "{reason}"),
+        other => panic!("the control: {other:?}"),
     }
 }

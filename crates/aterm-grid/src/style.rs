@@ -300,15 +300,13 @@ aterm_types::bitflags! {
 // StyleTable struct and impl extracted to style_table.rs.
 #[path = "style_table.rs"]
 mod style_table;
-#[cfg(any(test, feature = "testing"))]
+#[cfg(any(test, debug_assertions))]
 pub use style_table::ExtendedStyleInfo;
 pub use style_table::StyleTable;
 
 #[cfg(test)]
 #[path = "style_test_helpers.rs"]
 mod style_test_helpers;
-#[cfg(test)]
-use style_test_helpers::take_style_intern_ops;
 
 #[cfg(test)]
 #[path = "style_tests.rs"]

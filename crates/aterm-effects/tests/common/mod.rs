@@ -1,26 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Shared support for this crate's integration tests. `effects_suite` mounts it
-//! ONCE (its files reach it as `crate::common`); a binary of its own, such as
-//! `rainbow_kitty_v2_frame_cost`, declares `mod common;`. Each uses what it
-//! needs; an item some binary leaves unused carries `#[allow(dead_code)]`.
+//! Shared support for this crate's integration tests and benches. `effects_suite` mounts it
+//! once (its files reach it as `crate::common`); a binary of its own, such as
+//! `rainbow_kitty_v2_frame_cost`, declares `mod common;`, and a bench mounts it (or such a
+//! binary) by path. An item some binary leaves unused carries `#[allow(dead_code)]`.
 //!
-//! **THE BUDGET-SCALE KNOB** of the release-only perf gates
-//! (`tests/cursor_bench.rs` and `tests/rainbow_kitty_v2_frame_cost.rs`): the
-//! ONE knob both read.
-//!
-//! **THE RIBBON HOST'S PIECES**: the owner's rainbow-kitty config and a grid's
-//! geometry; the frame hold's samples as `app_render.rs` takes them from a
-//! real `Terminal` AFTER the last `process` (the content-scroll seam, the
-//! caret, the repaint blink, the caret row's probe and its neighbours, the
-//! rows the ribbon names), one free function each, so a host keeps its own
-//! order and fields and calls the pieces it samples; the plan-coverage census
-//! of a row; and the `ptyrec.py` recording parse the real-byte replays read.
-//!
-//! **THE REPLAY POOL** ([`par_map`]): a law that sweeps many independent
-//! replays runs them on a pool as wide as the threads the harness allots
-//! this binary, and judges them in order afterwards.
+//! It holds the budget-scale knob of the release perf gates (`benches/cursor_bench.rs` and
+//! `benches/rainbow_kitty_v2_frame_cost.rs`); the ribbon host's pieces: the rainbow-kitty
+//! config, a grid's geometry, and the frame hold's samples as `app_render.rs` takes them from a
+//! real `Terminal` after the last `process`, one free function each so a host keeps its own
+//! order; the plan-coverage census of a row; the `ptyrec.py` recording parse; and the replay
+//! pool ([`par_map`]).
 
 use aterm_core::grid::Cursor;
 use aterm_core::terminal::{ContentScrollDelta, ContentScrollState, Terminal};
@@ -29,36 +20,26 @@ use aterm_effects::rainbow_kitty::TypedClass;
 use aterm_effects::rainbow_kitty::witness::WITNESS_ROWS;
 use std::time::{Duration, Instant};
 
-// ---------------------------------------------------------------------------
-// THE BUDGET-SCALE KNOB
-// ---------------------------------------------------------------------------
+// The budget-scale knob.
 
-/// The knob's name — one name across both gates, so a host's scale is set
-/// once for every absolute wall-clock bound in the two binaries.
+/// The knob's name, shared by both gates.
 #[allow(dead_code)]
 pub const BUDGET_SCALE_VAR: &str = "RK_FRAME_COST_BUDGET_SCALE";
 
-/// `RK_FRAME_COST_BUDGET_SCALE=x` (a positive float, default `1.0`) multiplies
-/// the ABSOLUTE wall-clock budgets of the two release-only perf gates —
-/// §18's p50 400 µs / p90 600 µs pair in `rainbow_kitty_v2_frame_cost` (held
-/// by the engine alone and through the seam), and the four p90/median bounds
-/// in `cursor_bench` (500 / 500 / 1 000 / 2 000 µs) — and nothing else. §18
-/// (docs/design/RAINBOW-KITTY-V2.md) says only that its pair is for "the
-/// reference machine", which it does not name, and no x86_64 measurement is
-/// on record, so the knob is a precaution for a host that has none, not a fix
-/// for a known red: it widens (or tightens) absolute numbers only. Nothing
-/// structural is scaled — not the frame-cost gate's zero-alloc, idle → zero
-/// and cap laws, not cursor_bench's quad caps and shares, not the
-/// fixture-emits checks: a red there is a finding about the engine, not host
-/// noise.
+/// `RK_FRAME_COST_BUDGET_SCALE=x` (a positive float, default `1.0`) multiplies the absolute
+/// wall-clock budgets of the two release-only perf gates and nothing else: §18's p50 400 µs /
+/// p90 600 µs pair in `rainbow_kitty_v2_frame_cost` and the p90/median bounds in `cursor_bench`
+/// (500, 500 and 1 000 µs). §18 (docs/design/RAINBOW-KITTY-V2.md) names no reference machine,
+/// so the knob is for a host unlike it. Nothing structural is scaled (zero-alloc, idle → zero,
+/// quad caps and shares, the fixture-emits checks): a red there is about the engine, not the
+/// host.
 #[allow(dead_code)]
 pub fn budget_scale() -> f64 {
     parse_budget_scale(std::env::var(BUDGET_SCALE_VAR).ok().as_deref())
 }
 
-/// The scale's parse: unset, empty, unparsable, non-finite and non-positive
-/// spellings all mean `1.0` — a typo widens nothing. The floor that keeps a
-/// tiny scale from asserting `p50 ≤ 0 µs` lives in [`scaled_budget_us`].
+/// The scale's parse: unset, empty, unparsable, non-finite and non-positive spellings all mean
+/// `1.0`, so a typo widens nothing.
 #[allow(dead_code)]
 fn parse_budget_scale(raw: Option<&str>) -> f64 {
     raw.and_then(|v| v.trim().parse::<f64>().ok())
@@ -66,22 +47,18 @@ fn parse_budget_scale(raw: Option<&str>) -> f64 {
         .unwrap_or(1.0)
 }
 
-/// The absolute budget on this host: the reference number times the scale,
-/// rounded to the microsecond and floored at 1 µs — at `1.0` the reference
-/// number itself, exactly; and no scale, however small (`1e-9` rounds 400 µs
-/// to 0), turns a gate into `p50 ≤ 0 µs`.
+/// The absolute budget on this host: the reference times the scale, rounded to the microsecond
+/// and floored at 1 µs, so `1.0` gives the reference exactly and no scale turns a gate into
+/// `p50 ≤ 0 µs`.
 #[allow(dead_code)]
 pub fn scaled_budget_us(reference_us: u64, scale: f64) -> u64 {
     (reference_us as f64 * scale).round().max(1.0) as u64
 }
 
-// ---------------------------------------------------------------------------
-// THE RIBBON HOST: config and geometry
-// ---------------------------------------------------------------------------
+// The ribbon host: config and geometry.
 
-/// The owner's config as most takes ran it: rainbow kitty, tall body, dark,
-/// 240 ms, intensity 0.7. A take that ran another spells only what differs:
-/// `GlowConfig { intensity: 1.0, ..rainbow_cfg() }`.
+/// The config most takes ran: rainbow kitty, tall body, dark, 240 ms, intensity 0.7. A take
+/// that ran another spells only what differs: `GlowConfig { intensity: 1.0, ..rainbow_cfg() }`.
 #[allow(dead_code)]
 pub fn rainbow_cfg() -> GlowConfig {
     GlowConfig {
@@ -124,9 +101,7 @@ pub fn geom(rows: usize, cols: usize, cw: usize, ch: usize) -> Geom {
     }
 }
 
-// ---------------------------------------------------------------------------
-// THE RIBBON HOST: the frame hold's samples
-// ---------------------------------------------------------------------------
+// The ribbon host: the frame hold's samples.
 
 /// The host's content-scroll seam (`sync_cursor_effect_scroll`): the delta
 /// since the state the last frame saw (`seen`) — a translate or band moves
@@ -244,12 +219,10 @@ pub fn observe_ribbon_rows_where<const N: usize>(
     }
 }
 
-// ---------------------------------------------------------------------------
-// THE RIBBON HOST: the plan's census
-// ---------------------------------------------------------------------------
+// The ribbon host: the plan's census.
 
-/// A cell counts as LIT at this planned coverage — the pixel census on glass
-/// calls a cell lit at 20% of the bed.
+/// A cell counts as lit at this planned coverage; the pixel census on glass calls a cell lit
+/// at 20% of the bed.
 #[allow(dead_code)]
 pub const LIT_COV: u8 = 20;
 
@@ -296,9 +269,7 @@ pub fn holes_of(cov: &[u8]) -> Vec<(usize, usize)> {
     holes
 }
 
-// ---------------------------------------------------------------------------
-// THE RIBBON HOST: keys and recordings
-// ---------------------------------------------------------------------------
+// The ribbon host: keys and recordings.
 
 /// The host's `typed_class_for` and `glyph_shifted && !spacebar`.
 #[allow(dead_code)]
@@ -363,23 +334,13 @@ pub fn recording(src: &str, per_ms: u64) -> Vec<(u64, Rec)> {
         .collect()
 }
 
-// ---------------------------------------------------------------------------
-// THE REPLAY POOL
-// ---------------------------------------------------------------------------
+// The replay pool.
 
-/// `f` over every item, on a pool as wide as the threads the harness allots
-/// this binary (`RUST_TEST_THREADS`, as libtest reads it, else the machine's
-/// parallelism), results in `items`' order. Each item is one independent
-/// replay — its own `Terminal`, engine and clock — so where it runs changes
-/// nothing it reads, and the caller judges the results in the order it
-/// always did. A panicking item does not stop the others; once all have
-/// run, the first panic in `items`' order is re-raised with its own
-/// payload, as the serial loop would have raised it.
-///
-/// WHY: a serial sweep is one thread's wall while the binary's other threads
-/// idle. Under the merge gate's `RUST_TEST_THREADS=7`, serial → pooled:
-/// `moves_are_followed` ~49 s → 12.4 s, `zsh_isearch_band` ~26 s → 5 s,
-/// with the same instructions retired (±0.1 %).
+/// `f` over every item on a pool as wide as `RUST_TEST_THREADS` (as libtest reads it, else the
+/// machine's parallelism), results in `items`' order. Each item is one independent replay (its
+/// own `Terminal`, engine and clock), so where it runs changes nothing it reads. A panicking
+/// item does not stop the others; once all have run, the first panic in `items`' order is
+/// re-raised with its own payload, as a serial loop would raise it.
 #[allow(dead_code)]
 pub fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
     use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};

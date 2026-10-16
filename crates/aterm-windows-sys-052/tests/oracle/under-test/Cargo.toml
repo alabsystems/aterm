@@ -1,0 +1,20 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+#
+# The facade under a name that can sit beside the registry `windows-sys` in
+# one graph: the same source file, no copy (../Cargo.toml says why).
+[package]
+name = "windows-sys-052-under-test"
+version = "0.52.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "facade"
+path = "../../../src/lib.rs"
+
+[features]
+Win32 = []
+Win32_Foundation = ["Win32"]
+Win32_System = ["Win32"]
+Win32_System_Threading = ["Win32_System"]

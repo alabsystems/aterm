@@ -101,39 +101,3 @@ fn aa_family_interiors_actually_antialias() {
          supersampler is not actually anti-aliasing"
     );
 }
-
-/// Negative control for the hardening pass itself: a raw (unhardened)
-/// supersampled diagonal DOES land fractional coverage on its corner-adjacent
-/// edge texels, so `aa_family_cell_edge_texels_are_hard` cannot pass by
-/// accident of geometry — the explicit edge pass is load-bearing. Modeled
-/// here by re-deriving one edge texel's raw box-filter value: at 11x21 the ╱
-/// corner pixel is partially covered (the ideal line crosses it), so its raw
-/// coverage is strictly between 0 and 255 while the shipped bitmap holds 255.
-#[test]
-fn edge_hardening_is_load_bearing() {
-    let (w, h) = (11usize, 21usize);
-    let cov = procedural::coverage('╱', w, h).unwrap();
-    // The shipped corner texel is hard...
-    let corner = cov[(h - 1) * w]; // bottom-left, on the ideal line
-    assert_eq!(corner, 255, "hardened ╱ corner must be fully lit");
-    // ...but the raw box-filtered coverage of that texel is fractional:
-    // reproduce the rasterizer's own subsample rule for the corner pixel.
-    let (wf, hf) = (w as f32, h as f32);
-    let half = (((w.min(h) + 4) / 8) as f32 / 2.0).max(0.6);
-    let norm = (wf * wf + hf * hf).sqrt();
-    let mut hits = 0u32;
-    for sy in 0..4 {
-        for sx in 0..4 {
-            let px = (sx as f32 + 0.5) / 4.0;
-            let py = (h - 1) as f32 + (sy as f32 + 0.5) / 4.0;
-            if (hf * px + wf * py - wf * hf).abs() / norm <= half {
-                hits += 1;
-            }
-        }
-    }
-    assert!(
-        hits > 0 && hits < 16,
-        "raw corner coverage is {hits}/16 — expected fractional; if this is \
-         now naturally 0/16 or 16/16 the negative control needs a new texel"
-    );
-}

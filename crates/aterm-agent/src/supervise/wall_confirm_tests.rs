@@ -3,7 +3,7 @@
 
 //! The transcript's half of H6-HARNESS-1 on what Claude Code 2.1.294 wrote
 //! (`supervise/fixtures/claude-2.1.294-transcript-*.jsonl`, measured in
-//! `tools/real-claude-lab` on 2026-10-08).
+//! the real-Claude lab on 2026-10-08).
 
 use aterm_phase::{ApiCause, WallKind, classify_wall};
 

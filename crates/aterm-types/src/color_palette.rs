@@ -8,51 +8,29 @@ use aterm_alloc::SmallVec;
 
 use crate::Rgb;
 
-/// Sparse 256-color indexed palette for terminal emulation.
-///
-/// Maps indexed colors (0-255) to RGB values, modifiable via OSC 4:
+/// Sparse 256-color indexed palette, modifiable via OSC 4:
 /// - 0-7: Standard ANSI colors
-/// - 8-15: Bright/bold ANSI colors
-/// - 16-231: 6x6x6 color cube (216 colors)
+/// - 8-15: Bright ANSI colors
+/// - 16-231: 6x6x6 color cube
 /// - 232-255: Grayscale ramp (24 shades)
 ///
-/// Storage is TWO representations of the same map, kept in step by every
-/// mutator: the sparse `overrides` record (what serialization and OSC 4/104
-/// round-trips read, order-preserving) and the dense `cache` (what the per-cell
-/// `get` reads). See the field comments.
+/// Every mutator keeps two representations in step: the sparse `overrides` record and the
+/// dense `cache` that the per-cell `get` reads.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ColorPalette {
-    /// Only store non-default colors: (index, color) pairs.
-    /// SmallVec with inline capacity for 16 entries covers the common case
-    /// of customizing just the ANSI colors (0-15).
-    ///
-    /// This stays the AUTHORITATIVE sparse record: [`ColorPalette::overrides`]
-    /// hands it out for serialization and [`ColorPalette::overrides_count`]
-    /// reports its length, both order-preserving.
+    /// The authoritative record: non-default colors as (index, color) pairs, in insertion
+    /// order. 16 inline entries cover a theme's ANSI colors.
     overrides: SmallVec<(u8, Rgb), 16>,
-    /// Dense resolved value for every index — a pure function of `overrides`
-    /// over [`DEFAULT_COLOR_TABLE`], kept in step by every mutator.
-    ///
-    /// [`ColorPalette::get`] is on the per-CELL color-resolve path (aterm-core's
-    /// `raw_resolve` calls it for both the fg and the bg of every indexed cell,
-    /// plus a third time for the bold→bright promotion), and the sparse record
-    /// is NOT empty in practice: any configured theme `set`s all 16 ANSI slots
-    /// (`ColorScheme::to_color_palette`), and an app that repaints via OSC 4
-    /// pushes it past its 16 inline entries onto the heap. Scanning that per
-    /// cell cost up to 16 (or 256) comparisons where one array load will do, so
-    /// the resolved value is cached densely. 768 bytes per palette, two per
-    /// terminal; clones happen only on config apply and OSC 30001 push, both
-    /// cold.
-    ///
-    /// Because `cache` is a pure function of `overrides`, deriving `PartialEq`
-    /// over both fields is exactly the old `overrides`-only equality (equal
-    /// records imply equal caches): two palettes holding the same entries in a
-    /// different insertion order stay UNEQUAL, as they are today.
+    /// Dense resolved value for every index: a pure function of `overrides` over
+    /// [`DEFAULT_COLOR_TABLE`]. [`ColorPalette::get`] runs up to three times per indexed cell on
+    /// the color-resolve path, and a theme sets all 16 ANSI slots, so a scan of `overrides`
+    /// there would cost up to 16 (or 256) comparisons. Being a function of `overrides`, it
+    /// leaves the derived `PartialEq` comparing the record: the same entries in a different
+    /// insertion order are unequal.
     cache: [Rgb; 256],
 }
 
-// Hand-written so a debug dump is byte-identical to what the old derive printed
-// (`overrides` only) instead of spilling 256 cache entries.
+// Hand-written to print `overrides` only, not the 256 cache entries.
 impl core::fmt::Debug for ColorPalette {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("ColorPalette")
@@ -72,33 +50,24 @@ impl ColorPalette {
     #[rustfmt::skip]
     const ANSI_COLORS: [Rgb; 8] = [
         Rgb { r:   0, g:   0, b:   0 }, // 0: Black
-        Rgb { r: 224, g: 108, b: 117 }, // 1: Red (lifted from xterm #CD0000: pure
-                                        //    dark red is only ~3.2:1 on the dark bg
-                                        //    so git-status red read muddy; #E06C75
-                                        //    reaches ~4.5:1, still clearly red)
+        Rgb { r: 224, g: 108, b: 117 }, // 1: Red (#E06C75, ~4.5:1 on the dark bg;
+                                        //    xterm's #CD0000 is ~3.2:1)
         Rgb { r:   0, g: 205, b:   0 }, // 2: Green
         Rgb { r: 205, g: 205, b:   0 }, // 3: Yellow
-        Rgb { r:  59, g: 142, b: 234 }, // 4: Blue (lifted from xterm #0000EE: pure
-                                        //    blue is near-invisible on a dark bg —
-                                        //    two LLM judges flagged it as the
-                                        //    lowest-contrast token; #3B8EEA reads
-                                        //    cleanly while staying recognizably blue)
-        Rgb { r: 198, g: 120, b: 221 }, // 5: Magenta (lifted from #CD00CD ~3.96:1 to
-                                        //    #C678DD ~5:1, matching the blue lift)
+        Rgb { r:  59, g: 142, b: 234 }, // 4: Blue (#3B8EEA; xterm's #0000EE is
+                                        //    near-invisible on a dark bg)
+        Rgb { r: 198, g: 120, b: 221 }, // 5: Magenta (#C678DD ~5:1; xterm's
+                                        //    #CD00CD is ~3.96:1)
         Rgb { r:   0, g: 205, b: 205 }, // 6: Cyan
         Rgb { r: 229, g: 229, b: 229 }, // 7: White
     ];
 
     /// Bright ANSI colors (indices 8-15).
     #[rustfmt::skip]
-    // Bright row tempered away from raw S=1/V=1 neon primaries (two LLM judges
-    // flagged the old #FF0000/#00FF00/#FFFF00/#FF00FF/#00FFFF as "loud/harsh" — the
-    // single worst tokens in the UI) toward a modern dark palette that keeps each
-    // hue's identity. Aligns with the already-Dracula-family cursor (#50FA7B).
+    // Softened from raw S=1/V=1 primaries toward a modern dark palette that keeps each hue.
     const BRIGHT_COLORS: [Rgb; 8] = [
-        Rgb { r: 138, g: 143, b: 153 }, // 8:  Bright Black (Gray) — #8A8F99, lifted
-                                        //     from #7F7F7F so muted text/comments
-                                        //     don't recede (~6:1, still clearly dim)
+        Rgb { r: 138, g: 143, b: 153 }, // 8:  Bright Black (#8A8F99, ~6:1: muted
+                                        //     text that stays readable)
         Rgb { r: 255, g: 110, b: 103 }, // 9:  Bright Red     (#FF6E67)
         Rgb { r:  80, g: 250, b: 123 }, // 10: Bright Green   (#50FA7B)
         Rgb { r: 241, g: 250, b: 140 }, // 11: Bright Yellow  (#F1FA8C)
@@ -109,8 +78,6 @@ impl ColorPalette {
     ];
 
     /// Create a new color palette with default xterm colors.
-    ///
-    /// This is now O(1) since we start with an empty sparse map.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -120,68 +87,45 @@ impl ColorPalette {
         }
     }
 
-    /// Get the RGB value for an indexed color.
-    ///
-    /// One array load: the resolved value for every index is kept dense in
-    /// `cache` by the mutators, so this is O(1) and branchless on the per-cell
-    /// resolve path (see the `cache` field comment for why the old linear scan
-    /// over `overrides` was not free in practice).
+    /// The RGB value for an indexed color: one load from the dense cache.
     #[must_use]
     pub fn get(&self, index: u8) -> Rgb {
-        // `u8 -> usize` is always < 256, so this index is in bounds by type —
-        // and spelled as a PRIMITIVE CAST that fact is machine-checked rather
-        // than asserted in this comment. `usize::from` is a trait call whose
-        // body is not in the lowered bundle, so Trust cannot see through it and
-        // files the bounds obligation `unsupported`; `index as usize` is the
-        // identical infallible widening and PROVES. Measured on the shipped
-        // compiler, the two spellings side by side in one file: `usize::from`
-        // leaves 2 obligations unproved, `as usize` leaves none.
+        // `as usize`, not `usize::from`: Trust cannot see into the trait call and leaves the
+        // bounds obligation unproved, while the primitive cast proves it.
         self.cache[index as usize]
     }
 
-    /// Set the RGB value for an indexed color.
-    ///
-    /// If the color matches the default, removes any existing override.
-    /// Otherwise, adds or updates the override.
+    /// Set the RGB value for an indexed color; setting the default removes the override.
     pub fn set(&mut self, index: u8, color: Rgb) {
         let default = Self::default_color(index);
 
-        // Find existing override position
         let pos = self.overrides.iter().position(|&(idx, _)| idx == index);
 
         if color == default {
-            // Setting to default - remove override if present
             if let Some(p) = pos {
                 self.overrides.swap_remove(p);
             }
         } else if let Some(p) = pos {
-            // Update existing override. `p` came from `position` on this same
-            // vec so it is always in bounds; the total `get_mut` proves that to
-            // the Trust gate without changing behaviour.
+            // `p` came from `position` on this vec; the total `get_mut` shows the Trust gate
+            // it is in bounds.
             if let Some(slot) = self.overrides.get_mut(p) {
                 slot.1 = color;
             }
         } else {
-            // Add new override
             self.overrides.push((index, color));
         }
 
-        // Keep the dense cache in step. Correct for BOTH arms: on the
-        // remove-override arm `color == default`, which is precisely the value
-        // `get` must now return, so the single unconditional write covers it.
+        // One write serves both arms: on removal `color == default`.
         self.cache[index as usize] = color;
     }
 
     /// Reset a single color to its default value.
     pub fn reset_color(&mut self, index: u8) {
-        // Simply remove the override - get() will return the default
         if let Some(pos) = self.overrides.iter().position(|&(idx, _)| idx == index) {
             self.overrides.swap_remove(pos);
         }
-        // Unconditional: a no-op when there was no override, matching the old
-        // "get() falls through to the default" behaviour either way. Keyed by
-        // COLOR INDEX, not by position in `overrides`, so `swap_remove`'s
-        // reshuffle needs no fixup.
+        // Keyed by color index, not position in `overrides`, so `swap_remove`'s reshuffle needs
+        // no fixup.
         self.cache[index as usize] = Self::default_color(index);
     }
 
@@ -197,18 +141,14 @@ impl ColorPalette {
         self.overrides.len()
     }
 
-    /// The overridden (index, color) pairs — the tests' view of what the
-    /// cache must agree with.
+    /// The overridden (index, color) pairs, for tests.
     #[cfg(test)]
     fn overrides(&self) -> &[(u8, Rgb)] {
         &self.overrides
     }
 
-    /// Compute the default color for an index from the cube/grayscale arithmetic.
-    ///
-    /// `const fn` so the full 256-entry table can be built at compile time
-    /// (see [`DEFAULT_COLOR_TABLE`]); [`Self::default_color`] is just a load
-    /// from that table.
+    /// The default color for an index; `const fn` so [`DEFAULT_COLOR_TABLE`] is built at
+    /// compile time.
     const fn compute_default_color(index: u8) -> Rgb {
         match index {
             0..=7 => Self::ANSI_COLORS[index as usize],
@@ -239,29 +179,16 @@ impl ColorPalette {
         DEFAULT_COLOR_TABLE[index as usize]
     }
 
-    /// Parse an X11 color specification.
-    ///
-    /// Supports the following formats:
+    /// Parse an X11 color specification, or `None` if unrecognized:
     /// - `rgb:RR/GG/BB` (hex, 1-4 digits per component)
-    /// - `rgbi:R.RR/G.GG/B.BB` (floating-point 0.0-1.0, per X11 Xcms spec)
-    /// - `#RGB` (3 hex digits)
-    /// - `#RRGGBB` (6 hex digits)
-    /// - `#RRRGGGBBB` (9 hex digits)
-    /// - `#RRRRGGGGBBBB` (12 hex digits)
-    /// - X11 named colors (case-insensitive): `red`, `DarkSlateGray`, etc.
-    ///
-    /// Returns `None` if the format is not recognized.
+    /// - `rgbi:R.RR/G.GG/B.BB` (floating-point 0.0-1.0, per X11 Xcms)
+    /// - `#RGB`, `#RRGGBB`, `#RRRGGGBBB` or `#RRRRGGGGBBBB`
+    /// - X11 color names, case-insensitive: `red`, `DarkSlateGray`, ...
     #[must_use]
     pub fn parse_color_spec(spec: &str) -> Option<Rgb> {
         if let Some(rest) = spec.strip_prefix("rgbi:") {
-            // Format: rgbi:R/G/B (floating-point 0.0-1.0 per component)
-            // Bounded split: `splitn(4, '/')` yields the same first three
-            // fields as the former `split('/').collect::<Vec<_>>()`, and a
-            // fourth item exists iff the old Vec had len > 3. Requiring
-            // exactly three `Some`s and a `None` fourth is therefore
-            // decision-identical to the old `parts.len() != 3` check on
-            // every input, while avoiding the unbounded `collect`
-            // allocation the verifier could not bound.
+            // rgbi:R/G/B (0.0-1.0 per component). `splitn(4, '/')` with a `None` fourth item
+            // demands exactly three fields without a `collect` the verifier cannot bound.
             let mut parts = rest.splitn(4, '/');
             let (Some(rp), Some(gp), Some(bp), None) =
                 (parts.next(), parts.next(), parts.next(), parts.next())
@@ -275,9 +202,7 @@ impl ColorPalette {
 
             Some(Rgb::new(r, g, b))
         } else if let Some(rest) = spec.strip_prefix("rgb:") {
-            // Format: rgb:RR/GG/BB (1-4 hex digits per component)
-            // Bounded split — see the identical `rgbi:` discharge above:
-            // decision-identical to `split('/').collect()` + `len() != 3`.
+            // rgb:RR/GG/BB (1-4 hex digits per component), split as for `rgbi:`.
             let mut parts = rest.splitn(4, '/');
             let (Some(rp), Some(gp), Some(bp), None) =
                 (parts.next(), parts.next(), parts.next(), parts.next())
@@ -291,20 +216,14 @@ impl ColorPalette {
 
             Some(Rgb::new(r, g, b))
         } else if let Some(rest) = spec.strip_prefix('#') {
-            // Guard against multi-byte UTF-8: byte-index slicing below panics if
-            // a slice boundary falls inside a multi-byte character.
+            // Non-ASCII is refused: the arms below count one byte per digit.
             if !rest.is_ascii() {
                 return None;
             }
-            // Format: #RGB, #RRGGBB, #RRRGGGBBB, or #RRRRGGGGBBBB
-            // In every arm below the ranges are in bounds by that arm's
-            // exact `rest.len()` match and lie on char boundaries by the
-            // ASCII guard above, so `rest.get(..)` is always `Some` and
-            // each `?` is behavior-identical to the former direct slice
-            // (whose panic-freedom the verifier could not prove). Likewise
-            // a single hex digit parses to 0..=15, so `* 17` is at most
-            // 255 and never overflows: `saturating_mul(17)` is
-            // byte-identical to the former bare `* 17`.
+            // #RGB, #RRGGBB, #RRRGGGBBB or #RRRRGGGGBBBB. Each arm's ranges are in bounds by
+            // its `rest.len()` and on char boundaries by the ASCII guard, so `rest.get(..)` is
+            // always `Some`; a digit is at most 15, so `saturating_mul(17)` never saturates.
+            // Both spellings leave the verifier no panic path.
             match rest.len() {
                 3 => {
                     // #RGB
@@ -360,9 +279,7 @@ impl ColorPalette {
 
         // Scale to 8-bit based on number of digits
         let scaled = match s.len() {
-            // Nibble-doubling: for a single hex digit `value` is 0..=15, so
-            // `(value << 4) | value == value * 17` byte-for-byte, without the
-            // multiply-overflow obligation the bare `* 17` carries.
+            // For one digit `(value << 4) | value` is `value * 17`, with no overflow obligation.
             1 => (value << 4) | value, // 0-15 -> 0-255
             2 => value,                // 0-255 -> 0-255
             3 => value >> 4,           // 0-4095 -> 0-255
@@ -370,39 +287,29 @@ impl ColorPalette {
             _ => return None,
         };
 
-        // All scaled values are in 0-255 range by construction
+        // Every arm yields 0-255, so the fallback never fires.
         Some(scaled.try_into().unwrap_or(u8::MAX))
     }
 
-    /// Parse a floating-point color component (0.0-1.0), scaling to 8-bit.
-    ///
-    /// Values are clamped to \[0.0, 1.0\] and converted with rounding:
-    /// `(v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8`.
+    /// Parse a floating-point color component, clamped to \[0.0, 1.0\] and rounded to 8 bits.
     // Skip: `str::parse` absent std body; fail-closed.
     #[cfg_attr(trust_verify, trust::skip)]
     fn parse_float_component(s: &str) -> Option<u8> {
         let value: f64 = s.parse().ok()?;
-        // Clamp to valid range and convert with rounding
         let clamped = value.clamp(0.0, 1.0);
         Some((clamped * 255.0 + 0.5) as u8)
     }
 
-    /// Format a color as an X11 rgb: specification.
-    ///
-    /// Returns the color in `rgb:RRRR/GGGG/BBBB` format (16-bit per component).
+    /// Format a color as an X11 `rgb:RRRR/GGGG/BBBB` specification (16 bits per component).
     #[must_use]
     pub fn format_color_spec(color: Rgb) -> String {
-        // Scale 8-bit to 16-bit (multiply by 257 = 0x101). Expressed as
-        // `(x << 8) | x` so the Trust gate can see it never overflows: for a
-        // byte `x` the high/low halves are disjoint, so the result equals
-        // `x * 257` exactly (0x00->0x0000, 0xFF->0xFFFF).
+        // 8-bit to 16-bit is `x * 257`, spelled `(x << 8) | x` so the Trust gate sees no
+        // overflow.
         let r16 = (u16::from(color.r) << 8) | u16::from(color.r);
         let g16 = (u16::from(color.g) << 8) | u16::from(color.g);
         let b16 = (u16::from(color.b) << 8) | u16::from(color.b);
-        // Trust gate: manual `{:04x}` rendering instead of `format!` —
-        // runtime-argument `format_args!` cannot be lowered natively.
-        // Byte-identical output (a u16 is always exactly four hex digits
-        // under `{:04x}`).
+        // `push_hex4`, not `format!("{:04x}")`: runtime-argument `format_args!` cannot be
+        // lowered natively.
         let mut spec = String::from("rgb:");
         crate::trust_fmt::push_hex4(&mut spec, r16);
         spec.push('/');
@@ -413,12 +320,11 @@ impl ColorPalette {
     }
 }
 
-/// Precomputed default RGB for every 256-color index, built at compile time
-/// from [`ColorPalette::compute_default_color`]. Lets [`ColorPalette::default_color`]
-/// be a single array load instead of recomputing the cube/grayscale arithmetic.
+/// Default RGB for every 256-color index, built at compile time from
+/// [`ColorPalette::compute_default_color`].
 static DEFAULT_COLOR_TABLE: [Rgb; 256] = {
     let mut table = [Rgb::new(0, 0, 0); 256];
-    // u16 counter so the loop can reach 255 without overflowing when incremented.
+    // u16 counter: a u8 would overflow on the final increment.
     let mut i: u16 = 0;
     while i < 256 {
         table[i as usize] = ColorPalette::compute_default_color(i as u8);
@@ -431,10 +337,6 @@ static DEFAULT_COLOR_TABLE: [Rgb; 256] = {
 mod tests {
     use super::*;
 
-    // =========================================================================
-    // ColorPalette — default_color
-    // =========================================================================
-
     #[test]
     fn default_color_ansi_range() {
         // Index 0 = black
@@ -445,7 +347,7 @@ mod tests {
 
     #[test]
     fn default_color_bright_range() {
-        // Index 8 = bright black (gray), lifted to #8A8F99 for readable muted text
+        // Index 8 = bright black (gray)
         assert_eq!(ColorPalette::default_color(8), Rgb::new(138, 143, 153));
         // Index 15 = bright white
         assert_eq!(ColorPalette::default_color(15), Rgb::new(255, 255, 255));
@@ -469,10 +371,6 @@ mod tests {
         // Index 255 = last grayscale: 8 + 10*(23) = 238
         assert_eq!(ColorPalette::default_color(255), Rgb::new(238, 238, 238));
     }
-
-    // =========================================================================
-    // ColorPalette — get/set
-    // =========================================================================
 
     #[test]
     fn palette_new_has_no_overrides() {
@@ -545,10 +443,6 @@ mod tests {
         p.reset();
         assert_eq!(p.overrides_count(), 0);
     }
-
-    // =========================================================================
-    // ColorPalette — parse_color_spec
-    // =========================================================================
 
     #[test]
     fn parse_rgb_colon_format() {
@@ -658,16 +552,11 @@ mod tests {
 
     #[test]
     fn parse_color_spec_rejects_multibyte_utf8() {
-        // "你好" is 6 bytes — matches #RRGGBB length but is not ASCII.
-        // Must return None, not panic on byte-index slicing.
+        // 6 bytes: the #RRGGBB length, but not ASCII. Must return None, not panic.
         assert!(ColorPalette::parse_color_spec("#你好").is_none());
         // Single CJK char is 3 bytes — matches #RGB length.
         assert!(ColorPalette::parse_color_spec("#你").is_none());
     }
-
-    // =========================================================================
-    // ColorPalette — parse_color_spec (X11 named colors)
-    // =========================================================================
 
     #[test]
     fn parse_named_color_extended() {
@@ -720,10 +609,6 @@ mod tests {
         }
     }
 
-    // =========================================================================
-    // ColorPalette — format_color_spec
-    // =========================================================================
-
     #[test]
     fn format_color_spec_black() {
         assert_eq!(
@@ -758,19 +643,8 @@ mod tests {
         }
     }
 
-    // =========================================================================
-    // ColorPalette — performance scaling proof
-    // =========================================================================
-
-    /// The dense `cache` behind `get()` must agree with the sparse `overrides`
-    /// record for EVERY index after any mutation sequence — that equivalence is
-    /// the whole correctness argument for the O(1) lookup. Any future mutator
-    /// that forgets its cache write fails here immediately.
-    ///
-    /// Includes the case the cache design exists to make safe: removing a
-    /// MIDDLE entry, where `swap_remove` moves an unrelated override into the
-    /// freed slot. (Keying the cache by colour index rather than by position is
-    /// what makes that reshuffle need no fixup.)
+    /// The dense cache agrees with `overrides` at every index after every mutation, including
+    /// removing a middle entry, where `swap_remove` moves another override into its slot.
     #[test]
     fn palette_cache_agrees_with_overrides_after_mutations() {
         fn assert_coherent(p: &ColorPalette, what: &str) {

@@ -2,39 +2,30 @@
 // Copyright 2026 Andrew Yates
 
 //! What the worker's Bash tool's shell carries in from the person's shell
-//! startup, read so that the rm rule's proof ([`super::rm_breaker`]) and the
-//! read-only classifier ([`crate::supervise::classify`]), which model zsh 5.9
-//! and bash 3.2 under default options with no user alias or function, prove
-//! nothing where that model does not hold ([`read`],
-//! [`ShellStartup::admits`]).
+//! startup. The rm rule ([`super::rm_breaker`]) and the read-only classifier
+//! ([`crate::supervise::classify`]) model zsh 5.9 and bash 3.2 under default
+//! options with no user alias or function; this module says where that model
+//! does not hold ([`read`], [`ShellStartup::admits`]).
 //!
 //! Claude Code writes a shell snapshot at session start
 //! (`<claude dir>/shell-snapshots/snapshot-<zsh|bash>-…sh`: the login shell's
 //! non-default options, functions and aliases) and runs every Bash command as
 //! `$SHELL -c 'source <snapshot> && setopt NO_EXTENDED_GLOB NO_BARE_GLOB_QUAL
 //! && eval <command>'`, so what the snapshot carries is in force, as are
-//! `.zshenv`, `BASH_ENV` and similar, `CLAUDE_ENV_FILE` and SessionStart hook
-//! env scripts. Snapshots are not named per session, so every snapshot of the
-//! Bash tool's shell ([`tool_kinds`]) is judged; with none, or one unreadable,
-//! the startup is unknown.
+//! `.zshenv`, `BASH_ENV`, `CLAUDE_ENV_FILE` and SessionStart hook env scripts.
+//! Snapshots are not named per session, so every snapshot of the Bash tool's
+//! shell ([`tool_kinds`]) is judged; with none, or one unreadable, the startup
+//! is unknown.
 //!
-//! Fails the check ([`read`]): an option outside the inert lists
-//! ([`ZSH_INERT`], [`BASH_SET_INERT`], [`BASH_SHOPTS`]), which escalates every
-//! line; a function named for a hook `zsh -c` runs or a word of the Bash
-//! tool's own chain ([`ALWAYS_RUN`]); a `.zshenv` that changes options or runs
-//! unseen code ([`zshenv_hazard`]); bash's `BASH_ENV`, `ENV`, `SHELLOPTS`,
-//! `BASHOPTS` or `POSIXLY_CORRECT`; `CLAUDE_CODE_SHELL_PREFIX` or
-//! `CLAUDE_ENV_FILE`; a non-empty hook env script under
-//! `<claude dir>/session-env/`; and any of those variables (or `SHELL`,
-//! `CLAUDE_CODE_SHELL`, `ZDOTDIR`, `HOME`) given to the Bash tool by Claude
-//! Code's settings ([`super::git_config::WorkerEnv::settings_env_where`]).
-//!
-//! Aliases and functions fail only the lines that may run them
-//! ([`ShellStartup::admits`]): a function by any word under any quoting
-//! ([`dequotings`]), an alias by a word in command position
-//! ([`command_heads`]), or any word on a line that `eval`s its text. Claude
-//! Code's own shadows (after its `# Check for rg availability` line) are not
-//! read.
+//! Every line fails ([`read`]) on an option outside the inert lists, a function
+//! the shell runs unasked ([`ALWAYS_RUN`]), a `.zshenv` that changes options or
+//! runs unseen code ([`zshenv_hazard`]), a worker variable that puts code before
+//! the command or sets bash's options (`CLAUDE_CODE_SHELL_PREFIX`,
+//! `CLAUDE_ENV_FILE`, `BASH_ENV`, …), a settings `env` entry that changes which
+//! shell runs, what it reads first or its options, or a non-empty hook env
+//! script under `<claude dir>/session-env/`. Aliases and functions fail only the
+//! lines that may run them; Claude Code's own shadows (after its `# Check for rg
+//! availability` line) are not read.
 //!
 //! Residuals: a `.zshenv` that sources nothing and names no option is taken as
 //! setting none; another session's snapshot of the same shell stands in for a
@@ -76,11 +67,9 @@ impl Kind {
     }
 }
 
-/// What the Bash tool's shell starts with that the line models do not
-/// assume and that fails only some lines: the aliases and functions the
-/// person's startup defines, each with where it was read and whether it is
-/// an alias — and whether that shell may be zsh, under which the read-only
-/// rule takes only a plain line ([`Self::may_run_zsh`]).
+/// The aliases and functions the person's startup defines (each with where it
+/// was read and whether it is an alias), which fail only the lines that may run
+/// them, and whether the shell may be zsh ([`Self::may_run_zsh`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ShellStartup {
     names: Vec<(String, String, bool)>,
@@ -387,7 +376,7 @@ const ALWAYS_RUN: &[&str] = &[
 ];
 
 /// The variables Claude Code's settings may give the Bash tool that change
-/// which shell runs a command or what it reads first.
+/// which shell runs a command, what it reads first or its options.
 fn shell_relevant(key: &str) -> bool {
     matches!(
         key,
@@ -635,10 +624,9 @@ pub fn parse_snapshot(
     Ok(())
 }
 
-/// Record `name` (`what` it is, and whether an `alias`), or `Err` for one
-/// the shell runs whatever the line says ([`ALWAYS_RUN`], zsh's `TRAP…`
-/// functions; an alias of such a name is refused the same way, as the
-/// simplest reading of the Bash tool's own chain).
+/// Record `name` (`what` it is, and whether an `alias`), or `Err` for one the
+/// shell runs whatever the line says ([`ALWAYS_RUN`], zsh's `TRAP…`
+/// functions); an alias of such a name is refused the same way.
 fn define(state: &mut ShellStartup, name: String, what: String, alias: bool) -> Result<(), String> {
     if ALWAYS_RUN.contains(&name.as_str()) || name.starts_with("TRAP") {
         return Err(format!(
@@ -924,11 +912,10 @@ const KEEPS_COMMAND: &[&str] = &[
     "coproc",
 ];
 
-/// `Err` naming a `.zshenv` zsh reads before every command the Bash tool runs — the
-/// worker's `$ZDOTDIR`'s (else `$HOME`'s), `/etc/zshenv` and a Debian-built
-/// zsh's `/etc/zsh/zshenv` — that holds
-/// what the snapshot would not show ([`zshenv_hazard`]), or that cannot be
-/// read.
+/// `Err` naming a `.zshenv` zsh reads before every Bash tool command (the
+/// worker's `$ZDOTDIR`'s, else `$HOME`'s; `/etc/zshenv`; a Debian-built zsh's
+/// `/etc/zsh/zshenv`) that holds what the snapshot would not show
+/// ([`zshenv_hazard`]), or that cannot be read.
 fn zshenv(worker: &WorkerEnv) -> Result<(), String> {
     let dot = worker
         .var("ZDOTDIR")
@@ -988,9 +975,8 @@ pub fn zshenv_hazard(text: &str) -> Option<String> {
     None
 }
 
-/// `Err` naming a variable of the worker's that bash reads before a
-/// command or that sets its options: `BASH_ENV` (a file it sources), `ENV`,
-/// `SHELLOPTS`, `BASHOPTS`, `POSIXLY_CORRECT`.
+/// `Err` naming a variable of the worker's that makes bash read a file before
+/// a command or sets its options.
 fn bash_env(worker: &WorkerEnv) -> Result<(), String> {
     for key in [
         "BASH_ENV",

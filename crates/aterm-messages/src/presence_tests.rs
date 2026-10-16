@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The presence core proves itself without a host: a [`TestHost`] with a
-//! two-kind wall and a plain stall drives the level ranking, the fold law,
-//! the width law, the sanitizer, the painter and the idle view (design
-//! ruling 348), and the row's words against the approved mock, elision, the severity table, the
-//! story and its watermark, the tone, the durations and the ripple.
+//! The presence core without a host: a [`TestHost`] with a three-kind wall
+//! and a plain stall drives the level ranking, the fold law, the width law,
+//! the sanitizer, the painter, the idle view, and the row's words (elision,
+//! severity, the story and its watermark, the tone, durations, the ripple).
 
 use crate::ink::{BandInks, InkedCell};
 use crate::presence::{
@@ -16,11 +15,11 @@ use crate::presence::{
 };
 use crate::{Duration, Instant};
 
-/// A test host: its walls are a usage window and a full context, its stall
-/// is `(since, stopped, survived, restart)`, its harness is `harness@1`, its
-/// percent codec spells a space `%20`, and its grid is the terminal's own
-/// (`aterm_grapheme::str_grid_columns`, the measure aterm's host injects),
-/// which counts the characters it measures on this thread ([`MEASURED`]).
+/// A test host: its walls are a usage window, a full context and a retried
+/// API error, its stall is `(since, stopped, survived, restart)`, its harness
+/// is `harness@1`, its percent codec spells a space `%20`, and its grid is
+/// the terminal's own (`aterm_grapheme::str_grid_columns`), counting the
+/// characters it measures on this thread ([`MEASURED`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TestHost {}
 
@@ -101,7 +100,7 @@ impl Host for TestHost {
 
 thread_local! {
     /// The characters [`TestHost::columns`] has measured on this thread: the
-    /// WORK a walk of the row's cells does, read without a clock.
+    /// work a walk of the row's cells does, read without a clock.
     static MEASURED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -275,7 +274,7 @@ fn driven_facts() -> TFacts {
     }
 }
 
-/// THE FOLD LAW's model half: a hold that lifts leaves a story, which is not
+/// The fold law's model half: a hold that lifts leaves a story, which is not
 /// calm while held and calm after; reading it (the watermark at the story's
 /// seq) folds the row; a turn under aterm's own hand is no story at all.
 #[test]
@@ -346,11 +345,10 @@ fn the_fold_law_reads_a_story_only_when_calm() {
     assert_eq!(words(&wall, now, 0).phase, "context full");
 }
 
-/// NO JARGON ON THE ROW (ruling 366; day nine, D2): a phase the reader
-/// could not name prints no `unknown` and no age for it, and a session with
-/// no mail prints no `✉0` — the slot is gone, not zero. Controls: the same
-/// hand with a named phase prints the phase and its age, and one unread
-/// mail prints `✉1`; a pending or queued count alone still shows the slot.
+/// No jargon on the row: a phase the reader could not name prints no
+/// `unknown` and no age, and a session with no mail prints no `✉0` (the slot
+/// is gone). Controls: a named phase prints the phase and its age, one unread
+/// mail prints `✉1`, and a pending or queued count alone still shows the slot.
 #[test]
 fn the_row_prints_no_unknown_phase_and_no_empty_mail_slot() {
     let now = Instant::now();
@@ -421,9 +419,45 @@ fn the_row_prints_no_unknown_phase_and_no_empty_mail_slot() {
     );
 }
 
+/// The program's own report (OSC 7501, `Facts::program`) is the row's word
+/// where no agent reading names a phase, ahead of the shell's; a phase the
+/// screen's reader names keeps the slot (the report is display, never the
+/// verdict).
+#[test]
+fn the_programs_own_report_is_shown_only_where_the_reader_names_no_phase() {
+    let now = Instant::now();
+    let later = now + Duration::from_secs(65);
+    let facts = |phase: Option<AgentPhase<TestHost>>| TFacts {
+        agent_seq: 1,
+        agent: phase.map(|phase| AgentReading {
+            phase,
+            context_pct: None,
+        }),
+        shell: Some(("running", now)),
+        program: Some(("codex working", now)),
+        ..TFacts::default()
+    };
+    for phase in [None, Some(AgentPhase::Unknown)] {
+        let row = words(&slot_of(facts(phase), now), later, 0).fit::<TestHost>(120);
+        assert!(row.contains("codex working 1m05s"), "{row}");
+        assert!(!row.contains("running"), "{row}");
+    }
+    // Control: a phase the reader names keeps the slot.
+    let row = words(&slot_of(facts(Some(AgentPhase::Busy)), now), later, 0).fit::<TestHost>(120);
+    assert!(row.contains("busy"), "{row}");
+    assert!(!row.contains("codex working"), "{row}");
+    // Control: with no report the shell's word shows.
+    let quiet = TFacts {
+        program: None,
+        ..facts(None)
+    };
+    let row = words(&slot_of(quiet, now), later, 0).fit::<TestHost>(120);
+    assert!(row.contains("running 1m05s"), "{row}");
+}
+
 /// The width law: rtt, since, role, ctx, then the mail's and the hand's
 /// details shed, so phase, hand and mail survive to 24 columns; below that
-/// the three are CUT, all on the row down to 13 columns; nothing is ever
+/// the three are cut, all on the row down to 13 columns; nothing is ever
 /// wider than asked.
 #[test]
 fn elision_keeps_phase_hand_and_mail_to_24_and_all_three_to_13() {
@@ -511,11 +545,9 @@ fn sanitize_refuses_band_glyphs_bidi_and_control_characters() {
     );
 }
 
-/// Round fifteen content-7: the token strips what the band strips — the TAG
-/// characters (invisible ASCII an agent reading `chrome` still reads), the
-/// zero-width space, the word joiner, the BOM, the Arabic letter mark, the
-/// soft hyphen, the Mongolian vowel separator, the joiners, a Hangul filler,
-/// CGJ — on every path a free-text value takes: the token itself, a hold
+/// The token strips what the band strips (TAG characters, ZWSP, WJ, the BOM,
+/// the Arabic letter mark, the soft hyphen, U+180E, the joiners, a Hangul
+/// filler, CGJ) on every path a free-text value takes: the token, a hold
 /// reason the host's codec decoded, and the slots and sentence it lands in.
 #[test]
 fn sanitize_strips_invisible_characters_on_every_path() {
@@ -635,7 +667,7 @@ fn paint_row_is_exactly_cols_wide_with_the_glyphs_in_text_presentation() {
     assert!(hold.bold);
 }
 
-/// The band's inks and the presence text inks on the mock's dark theme.
+/// The band's inks and the presence text inks on a dark theme.
 fn band_inks() -> (BandInks, PresenceTones) {
     let c = BandInks::derive(
         crate::ink::ThemeInks {
@@ -683,13 +715,11 @@ fn grid_cells(line: &str) -> Vec<(char, bool)> {
     out
 }
 
-/// Round fifteen content-6: the width law measures in the GRID's cells. A
-/// role of seven CJK characters is fourteen columns, not seven, so at 22
-/// columns (`レビュー担当者  busy  —` is 23) it is shed, where a char count
-/// kept it and painted fourteen columns of glyphs into seven cells; a
-/// combining mark is no column at all, so `cafe\u{301} lead` keeps its slot
-/// in exactly 18. The token cap counts cells and cuts between two of them.
-/// At every width the line fits the grid's own count of it.
+/// The width law measures in the grid's cells: a role of seven CJK
+/// characters is fourteen columns, so at 22 (`レビュー担当者  busy  —` is 23) it
+/// is shed; a combining mark is no column, so `cafe\u{301} lead` keeps its
+/// slot in exactly 18. The token cap counts cells and cuts between two of
+/// them, and at every width the line fits the grid's own count.
 #[test]
 fn a_cjk_or_combining_role_is_laid_out_in_the_grids_cells() {
     let cjk = role_row("\u{30ec}\u{30d3}\u{30e5}\u{30fc}\u{62c5}\u{5f53}\u{8005}");
@@ -769,11 +799,9 @@ fn a_cjk_or_combining_role_is_laid_out_in_the_grids_cells() {
     }
 }
 
-/// Round fifteen content-6: the painter draws each word in the cells the grid
-/// gives it — a wide glyph as its lead cell and a continuation (no glyph of
-/// its own, the renderer's `wide`), a combining mark in none — so the
-/// painted row is the fitted line as the grid lays it out, cell for cell,
-/// at every width.
+/// The painter draws each word in the cells the grid gives it (a wide glyph
+/// as its lead cell and a continuation, a combining mark in none), so the
+/// painted row is the fitted line as the grid lays it out at every width.
 #[test]
 fn the_painter_draws_a_wide_glyph_in_two_cells_and_a_mark_in_none() {
     let (c, p) = band_inks();
@@ -822,15 +850,12 @@ fn the_painter_draws_a_wide_glyph_in_two_cells_and_a_mark_in_none() {
     }
 }
 
-/// Round fifteen content-6 review: a cell holds what the grid's cell holds,
-/// its opening character and 16 more (aterm-grid's `MAX_COMBINING`), and the
-/// row drops the rest, as the grid does. A wall's reset read off a hostile
-/// screen row — `1`, then 190 `~` (a band glyph the token strips) each
-/// carrying the grid's 16 marks — is ONE cell: the token is `1` and its first
-/// 16 marks, where a cap counted in cells alone let all 3,041 characters
-/// through. A token of many such cells is at most 17 characters a cell of
-/// its cap, a mark with no cell to join is dropped, and the row still
-/// measures and paints every cell as the grid lays it out.
+/// A cell holds what the grid's cell holds, its opening character and 16
+/// more (aterm-grid's `MAX_COMBINING`), and the row drops the rest. A hostile
+/// reset of `1` then 190 `~` (a glyph the token strips) each carrying 16
+/// marks is one cell: the token is `1` and its first 16 marks. A token is at
+/// most 17 characters a cell of its cap, a mark with no cell to join is
+/// dropped, and the row measures and paints every cell as the grid does.
 #[test]
 fn a_cell_holds_what_the_grids_cell_holds() {
     let marks = |n: usize| "\u{301}".repeat(n);
@@ -880,13 +905,11 @@ fn a_cell_holds_what_the_grids_cell_holds() {
     }
 }
 
-/// Round fifteen content-6 review: the walk of the row's cells is LINEAR in
-/// what it is given. Each character is measured alone and against its own
-/// cell, which holds at most 17, so the token, the fit and the painter cost
-/// a bounded few characters measured per character — counted in what the
-/// host measured, never a clock — even on a raw string no token pass bounded
-/// (one cell of 4,096 marks). The walk that measured each mark against all
-/// of its cell measured millions.
+/// The walk of the row's cells is linear in what it is given: each character
+/// is measured against its own cell, which holds at most 17, so the token,
+/// the fit and the painter measure a bounded few characters per character
+/// (counted in what the host measured, not a clock), even on a raw string of
+/// one cell with 4,096 marks.
 #[test]
 fn the_cell_walk_is_linear_in_its_string() {
     let (c, p) = band_inks();
@@ -916,7 +939,7 @@ fn the_cell_walk_is_linear_in_its_string() {
     }
 }
 
-/// THE IDLE LAW: a quiet view's fingerprint is exactly 0 at every instant,
+/// The idle law: a quiet view's fingerprint is exactly 0 at every instant,
 /// it draws no rim, and a shown row, a rim or a ripple makes it nonzero.
 #[test]
 fn fp_is_zero_on_a_quiet_view() {
@@ -945,9 +968,7 @@ fn fp_is_zero_on_a_quiet_view() {
 /// and `stopped <dur> · input queued` for a stopped job. Where the host
 /// would carry the restart ([`Host::stall_restart`]) both frozen remedies
 /// name it instead, the printed slot unchanged; a stopped job's stays
-/// `resume it`. The duration counts from the oldest unread byte. (Moved from
-/// the host's `input_stall`, where a seam test still drives a real published
-/// stall through the row.)
+/// `resume it`. The duration counts from the oldest unread byte.
 #[test]
 fn the_stall_says_frozen_or_stopped_with_the_age_and_the_remedy() {
     let now = Instant::now();
@@ -999,7 +1020,7 @@ fn the_stall_says_frozen_or_stopped_with_the_age_and_the_remedy() {
     }
 }
 
-/// Which `since` clauses print SECONDS (and so tick every second): a token
+/// Which `since` clauses print seconds (and so tick every second): a token
 /// ending in `s` right after a digit. `3 turns`, `2h05m`, `1d 22h` and a
 /// reset time do not, and a row of only those ticks once a minute.
 #[test]
@@ -1022,7 +1043,7 @@ fn a_clause_prints_seconds_only_on_a_digit_then_s() {
     assert_eq!(words_step(&row(&["2h05m", "12s"])), Duration::from_secs(1));
 }
 
-// ---- slot and words (ruling 351 (2)) ---------------------------------------
+// ---- slot and words --------------------------------------------------------
 // Over this file's seam: the usage wall is `TestWall::Usage`, the input stall
 // a `TestStall`, the slot and facts `TSlot`/`TFacts`.
 
@@ -1031,8 +1052,8 @@ fn width(s: &str) -> usize {
     s.chars().count()
 }
 
-/// THE MOCK'S FIRST BAND, verbatim: role, phase since, hand, mail with the
-/// trust glyph BEFORE the sender, ctx, fabric.
+/// The six slots in order: role, phase since, hand, mail with the trust
+/// glyph before the sender, ctx, fabric.
 #[test]
 fn the_six_slots_read_like_the_approved_mock() {
     let now = Instant::now();
@@ -1089,12 +1110,11 @@ fn elision_sheds_from_the_right_and_keeps_hand_phase_mail_to_24_columns() {
     }
 }
 
-/// RULING 270, "ONE PLACE TELLS IT": an attention whose only owner is
-/// the agent upgrade is still a FACT — `level=attention`, `why=escalation`,
-/// the tab chip's wait mark and the rim all keep it, so the stall shows at
-/// the top after its band row folds — but the presence line's phase slot
-/// does not repeat words the message band already says. NEGATIVE CONTROL:
-/// the same text from any other owner reads on the line.
+/// One place tells it: an attention whose only owner is the agent upgrade is
+/// still a fact (`level=attention`, `why=escalation`, the tab chip's wait
+/// mark), but the presence line's phase slot does not repeat words the
+/// message band already says. Negative control: the same text from any other
+/// owner reads on the line.
 #[test]
 fn an_upgrade_only_attention_keeps_its_level_and_chip_but_not_its_words() {
     let now = Instant::now();
@@ -1111,8 +1131,8 @@ fn an_upgrade_only_attention_keeps_its_level_and_chip_but_not_its_words() {
     assert_eq!(s.level(0), Level::Attention);
     assert_eq!(s.why(0), "escalation");
     assert_eq!(s.chip(0), ChipLevel::Wait);
-    // Round 18 (D1): the window's own chrome shows nothing for it — no
-    // rim and no presence row, since the line has no words to say.
+    // The window's own chrome shows nothing for it: no rim and no presence
+    // row, since the line has no words to say.
     assert_eq!(s.shown_level(0), Level::Quiet);
     assert_eq!(s.shown_level(0).rim(), Rim::None);
     assert!(!s.shown_level(0).shows_row());
@@ -1124,7 +1144,7 @@ fn an_upgrade_only_attention_keeps_its_level_and_chip_but_not_its_words() {
         w.phase,
         w.sentence
     );
-    // NEGATIVE CONTROL: another owner's attention is the line's phase.
+    // Negative control: another owner's attention is the line's phase.
     let mut other = TSlot::new(now);
     other.absorb(
         TFacts {
@@ -1149,14 +1169,11 @@ fn an_upgrade_only_attention_keeps_its_level_and_chip_but_not_its_words() {
     assert!(!words(&other, now, 0).phase.contains("Codex"));
 }
 
-/// AN ATTENTION TOLD ELSEWHERE NEVER TAKES THE ROW'S WORDS OR COLOUR
-/// (ruling 280): with a Claude upgrade stall standing (its row and record
-/// are the band's) and a story since the watermark, the row is shown at
-/// the story's level — and its words are the story's summary, its tone
-/// not Warn. Before 280 the row was shown but `words` and `tone` read the
-/// full level: no summary, painted Warn — a colour with no words.
-/// NEGATIVE CONTROL: the same story beside another owner's attention is
-/// that attention's words, in Warn.
+/// An attention told elsewhere never takes the row's words or colour: beside
+/// an upgrade stall the band tells and a story since the watermark, the row
+/// is shown at the story's level with the story's summary, its tone not
+/// Warn. Negative control: the same story beside another owner's attention
+/// reads that attention's words, in Warn.
 #[test]
 fn a_story_beside_an_attention_told_elsewhere_keeps_its_words_and_tone() {
     let now = Instant::now();
@@ -1202,7 +1219,7 @@ fn a_story_beside_an_attention_told_elsewhere_keeps_its_words_and_tone() {
 }
 
 /// Severity: hold > limited > attention > driven > story > quiet, and the
-/// rim follows the level exactly — a colour with no words is unreachable.
+/// rim follows the level exactly: a colour with no words is unreachable.
 #[test]
 fn severity_and_rim_follow_the_design_table() {
     let now = Instant::now();
@@ -1308,14 +1325,12 @@ fn severity_and_rim_follow_the_design_table() {
     assert_eq!(words(&lost, now, 0).fabric, "\u{2715} lost");
 }
 
-/// THE INCIDENT'S BAND (2026-09-24): an approval box on the screen, the
-/// supervisor's "answer this box" as typed attention, a supervisor's turn
-/// on the hand — and a published input stall. The slot stands at
-/// `Limited` (the stop rim), is not calm (a keystroke does not fold it),
-/// and its phase reads `frozen` with the stall's age and why, ahead of the
-/// attention text. A stopped job reads `stopped` and says to resume it.
-/// NEGATIVE CONTROL: the same facts with the stall cleared are the box's
-/// attention again, at `Attention`.
+/// An approval box, the supervisor's "answer this box" as typed attention, a
+/// supervisor's turn on the hand, and a published input stall: the slot
+/// stands at `Limited` (the stop rim), is not calm, and its phase reads
+/// `frozen` with the stall's age and why, ahead of the attention text. A
+/// stopped job reads `stopped` and says to resume it. Negative control: with
+/// the stall cleared the box's attention is back, at `Attention`.
 #[test]
 fn a_stall_is_limited_not_calm_and_reads_frozen_over_typed_attention() {
     let now = Instant::now();
@@ -1390,7 +1405,7 @@ fn a_stall_is_limited_not_calm_and_reads_frozen_over_typed_attention() {
     );
     assert_eq!(s.level(0), Level::Limited);
     assert_eq!(s.chip(0), ChipLevel::Stop(StopCause::Suspended));
-    // NEGATIVE CONTROL: the stall clears — the box's attention is back.
+    // Negative control: the stall clears and the box's attention is back.
     assert!(s.absorb(facts(None), later));
     assert_eq!(s.level(0), Level::Attention);
     assert_eq!(s.why(0), "prompt,escalation");
@@ -1504,7 +1519,7 @@ fn a_story_summarises_since_the_watermark_and_the_watermark_folds_it() {
             "held 1m00s, resumed 1m00s ago".to_string(),
         ]
     );
-    // The longest stop survives elision: at 40 columns the counts go first.
+    // The longest stop survives elision: at 44 columns the counts go first.
     let narrow = w.fit::<TestHost>(44);
     assert!(narrow.contains("held 1m00s"), "{narrow}");
     assert!(s.calm());
@@ -1512,11 +1527,10 @@ fn a_story_summarises_since_the_watermark_and_the_watermark_folds_it() {
     assert!(!s.level(s.story_seq).shows_row());
 }
 
-/// D10 (2026-09-24): the story an agent told while nobody looked closes
-/// when the agent LEAVES — a shell does not stand at `level=story` for a
-/// run that is over, least of all in a headless instance where no person
-/// ever acts to read it. NEGATIVE CONTROL: the same story with the agent
-/// still there stands, and a new point after the exit is news again.
+/// The story an agent told while nobody looked closes when the agent leaves:
+/// a shell does not stand at `level=story` for a run that is over, least of
+/// all headless, where no person acts to read it. A new point after the exit
+/// is news again.
 #[test]
 fn an_agents_story_closes_when_the_agent_leaves() {
     let now = Instant::now();
@@ -1683,18 +1697,11 @@ fn free_text_is_sanitized_and_the_limit_message_never_appears() {
     );
 }
 
-/// A RETRY'S NEXT TRY LAPSES WITH ITS TIME (the review of 2026-09-29): the
-/// tab printed `can't reach the API → 09:04 · 2m00s` and, once 09:04 had come
-/// and gone, kept `→ 09:04` (the countdown filtered at zero, the arrow not)
-/// and spoke `next try 09:04` — for as long as nothing re-read the session:
-/// a loop parked behind a hold after ERR halted, a worker restarting, a
-/// machine that slept. The window's fold takes an agent reading only when its
-/// sequence is newer, and a plan that lapses by the clock moves nothing, so
-/// the words themselves must drop a next try whose time has come: the wall
-/// names its cause alone again ("it shows only while that wait is real").
-/// NEGATIVE CONTROLS: a wall that names a RESET (a usage window) keeps its
-/// `→ 19:30` and its `resets` after the countdown ends, as it always did,
-/// and a retry with time left prints both.
+/// A retry's next try lapses with its time: once `until` is reached the wall
+/// names its cause alone (no `→ 09:04`, no `next try`), since a plan that
+/// lapses by the clock posts no new agent reading. Negative controls: a wall
+/// that names a reset (a usage window) keeps its `→ 19:30` and `resets` after
+/// the countdown ends, and a retry with time left prints both.
 #[test]
 fn a_retrys_next_try_lapses_with_its_time() {
     let now = Instant::now();
@@ -1788,10 +1795,9 @@ fn window_view_fp_is_zero_when_quiet_and_the_ripple_steps_nine_times() {
     assert!(v.ripple_deadline(now).is_some());
 }
 
-/// ADV-6 (model): a stalled link with no date behind it (a bridge still
-/// dialing since it attached) has no age, never `~ 0s` or "bridge stalled
-/// 0 seconds": the glyph alone, and the sentence names no figure; a dated stall still prints its
-/// seconds.
+/// A stalled link with no date (a bridge still dialing since it attached)
+/// prints the glyph alone, never `~ 0s`, and the sentence names no figure; a
+/// dated stall still prints its seconds.
 #[test]
 fn adv6_a_stall_of_unknown_age_prints_no_figure() {
     let now = Instant::now();
@@ -1826,12 +1832,10 @@ fn adv6_a_stall_of_unknown_age_prints_no_figure() {
     );
 }
 
-/// ADV-7 (model): a hold the slot first sees at its mint is not dated from
-/// the mint. Nothing in `Hold` says when it began, so the model
-/// cannot know: the first absorb is the baseline, the hold is state with
-/// no figure, and when it lifts the story says `resumed N ago` without a
-/// length it never measured. A hold that BEGINS after the baseline is
-/// dated and told in full.
+/// A hold the slot first sees at its mint is not dated from the mint:
+/// nothing in a hold says when it began, so it is state with no figure, and
+/// when it lifts the story says `resumed N ago` without a length. A hold
+/// that begins after the baseline is dated and told in full.
 #[test]
 fn adv7_a_hold_seen_at_first_sight_has_no_made_up_duration() {
     let now = Instant::now();
@@ -1872,7 +1876,7 @@ fn adv7_a_hold_seen_at_first_sight_has_no_made_up_duration() {
         vec!["since 3s".to_string(), "resumed 3s ago".to_string()]
     );
     assert!(!w.sentence.contains("held"), "{}", w.sentence);
-    // A hold that begins AFTER the baseline is dated and told in full.
+    // A hold that begins after the baseline is dated and told in full.
     let began = at + Duration::from_secs(10);
     s.absorb(
         TFacts {
@@ -1893,12 +1897,10 @@ fn adv7_a_hold_seen_at_first_sight_has_no_made_up_duration() {
     );
 }
 
-/// A WALL THE HARNESS ANSWERS IS A RECORD, NOT A STOP: an alert nobody needs
-/// to act on does not persist. A shell-plus-wall tab reads `wall:*`, and a
-/// wall the supervisor will resume by itself stands at `Note`: no rim, no
-/// chip, no warn tone, the row still there with its reset and its countdown and
-/// the words saying the harness resumes it. NEGATIVE CONTROLS: nobody answering
-/// keeps the stop; a prompt, a question or a person's hand still outranks it.
+/// A wall the harness answers is a record, not a stop: it stands at `Note`
+/// (no rim, no chip, no warn tone), the row still there with its reset, its
+/// countdown and words saying the harness resumes it. Negative controls:
+/// nobody answering keeps the stop; a prompt or a person's hand outranks it.
 #[test]
 fn a_wall_the_harness_answers_is_a_note_and_a_wall_nobody_answers_is_a_stop() {
     let now = Instant::now();
@@ -1954,7 +1956,7 @@ fn a_wall_the_harness_answers_is_a_note_and_a_wall_nobody_answers_is_a_stop() {
             .contains("resumes by itself")
     );
     // A wall the harness resumes slowly and a person can lift sooner: still a
-    // note, with the ONE action in the row and in the sentence.
+    // note, with the one action in the row and in the sentence.
     let asks = wall(WallAnswer::HarnessAsks("/model to switch"), None, None);
     assert_eq!(asks.level(looked), Level::Note);
     assert_eq!(asks.chip(looked), ChipLevel::Off);
@@ -1966,7 +1968,7 @@ fn a_wall_the_harness_answers_is_a_note_and_a_wall_nobody_answers_is_a_stop() {
         "{}",
         w.sentence
     );
-    // CONTROL: a hold, a prompt and a person's keyboard still outrank the note.
+    // Control: a prompt and a person's keyboard still outrank the note.
     let prompt = slot_of(
         TFacts {
             agent_seq: 1,

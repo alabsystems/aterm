@@ -13,5 +13,8 @@ description = "Unicode grapheme cluster segmentation and width calculation for t
 # TextShapingConfig used in production (width.rs) and in tests
 aterm-types = { workspace = true }
 
+[dev-dependencies]
+aterm-spec = { workspace = true }
+
 [lints]
 workspace = true

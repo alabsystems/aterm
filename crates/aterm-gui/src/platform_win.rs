@@ -20,8 +20,7 @@
 //! * a call into [`crate::hdr_win`] for the EDR headroom / SDR-white scale that
 //!   feeds the (opt-in, HDR-only) cursor-aurora present.
 //!
-//! Zero-sized, like the other two `AppRt` impls — the `App.apprt` field costs
-//! nothing.
+//! Preference reads have the same per-instance inert test arm as the other runtimes.
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
@@ -176,7 +175,7 @@ fn work_area_pts_from_rect(work: &Rect, scale: f64) -> Option<crate::app_window:
 // hundred lines of hand-rolled IInspectable vtable work. Every other Win32 surface in
 // this file is a flat-C leaf call, and the registry values these properties read are
 // stable, documented-by-use locations that winit's own dark-mode probe
-// (`vendor/winit/.../dark_mode.rs`, `AppsUseLightTheme`) already depends on — one of
+// (`crates/aterm-window/.../dark_mode.rs`, `AppsUseLightTheme`) already depends on — one of
 // them in the very same key. A missing value is not an error: both readers fall back
 // to the Windows default, which is what an untouched machine has.
 #[link(name = "advapi32")]
@@ -274,7 +273,7 @@ const DIB_RGB_COLORS: u32 = 0;
 ///
 /// winit does **not** write it: `Window::set_theme` drives only `SetWindowTheme` plus
 /// the undocumented `WCA_USEDARKMODECOLORS` composition attribute (see
-/// `vendor/winit/src/platform_impl/windows/dark_mode.rs::try_theme`), which is exactly
+/// `crates/aterm-window/src/platform_impl/windows/dark_mode.rs::try_theme`), which is exactly
 /// why this attribute used to read back unset for `Auto`. [`apply_chrome_appearance`]
 /// writes it explicitly for that reason — do not "simplify" it away on the assumption
 /// that winit already covers it.
@@ -538,7 +537,7 @@ pub(crate) fn read_chrome_lines(
     // qualifier in `opaque(hdr_glow)` etc. (see [`CLIENT_BACKDROP_DECLINE`]).
     // Without it the row affirmed the shortfall without ever naming a cause, and
     // the cause only existed as stderr text a windowed launch throws away.
-    let client = if aterm_gpu::dx12_visual_swapchain_active() {
+    let client = if aterm_gpu::visual_swapchain_active() {
         "visual".to_string()
     } else {
         match client_backdrop_decline() {
@@ -575,7 +574,10 @@ pub(crate) fn read_chrome_lines(
     };
     // `reduce_motion` is the SPI answer, i.e. Settings ▸ Accessibility ▸ Visual
     // effects ▸ "Animation effects" turned OFF.
-    let reduce_motion = AppRtWindows.reduce_motion();
+    let reduce_motion = AppRtWindows {
+        probe_preferences: true,
+    }
+    .reduce_motion();
     let text_scale = os_text_scale();
     // The §3.2 hook's own ground truth: broadcasts the subclass saw / wakes it
     // posted. `0/0` after a settings change means the subclass is not chained (the
@@ -628,8 +630,8 @@ fn backdrop_for(material: BackgroundMaterial) -> u32 {
 // path (attach, `apply_theme_live`, the `reload_config` theme commit) calls with
 // `theme.bg`. Rather than widen the `AppRt` trait with a Windows-only argument, the
 // last published bg is latched here and read back when a later `window_set_appearance`
-// has to resolve `Auto`. `AppRtWindows` is a ZST behind `&self`, so a static latch is
-// the only place the value can live; both seams run on the winit main thread, so
+// has to resolve `Auto`. The latch shares the published background between chrome
+// callbacks; both seams run on the winit main thread, so
 // `Relaxed` is sufficient — the atomics buy interior mutability, not synchronization.
 
 /// Sentinel for "no terminal background has been published yet". A theme bg is
@@ -1239,7 +1241,7 @@ fn apply_backdrop(hwnd: isize) {
 
 /// Push the resolved caption variant at the window: winit's `set_theme` for the
 /// uxtheme side (`SetWindowTheme` + the undocumented `WCA_USEDARKMODECOLORS`, which is
-/// all vendored winit actually drives — see `vendor/winit/.../dark_mode.rs`) AND an
+/// all vendored winit actually drives — see `crates/aterm-window/.../dark_mode.rs`) AND an
 /// explicit `DWMWA_USE_IMMERSIVE_DARK_MODE` write, because winit never touches that
 /// documented attribute and it is what `DwmGetWindowAttribute` — i.e. `aterm-ctl
 /// chrome` — reads back as ground truth.
@@ -1276,7 +1278,7 @@ fn apply_chrome_appearance(window: &Window, policy: WindowTheme) {
         // arm used to lean on is dead code. `set_theme(None)` was supposed to reach
         // winit's `should_use_dark_mode()` = `should_apps_use_dark_mode() &&
         // !is_high_contrast()` — but vendored winit's `is_high_contrast()` fills its
-        // `HIGHCONTRASTA` with `cbSize: 0` (vendor/winit/.../dark_mode.rs), which
+        // `HIGHCONTRASTA` with `cbSize: 0` (crates/aterm-window/.../dark_mode.rs), which
         // `SPI_GETHIGHCONTRAST` rejects (measured on this machine: returns FALSE,
         // struct untouched; the correct 16-byte size returns TRUE under an HC
         // scheme). So winit ALWAYS answers "not high contrast" and would happily
@@ -1349,7 +1351,7 @@ fn chrome_reassert_needed(want_dark: bool, applied: Option<u32>) -> bool {
 /// to the ONE clobber the event-driven seams structurally cannot see.
 ///
 /// WHY A FRAME PATH AND NOT AN EVENT. winit's `WM_SETTINGCHANGE` handler
-/// (`vendor/winit/.../event_loop.rs`) calls `try_theme()` on EVERY such message when
+/// (`crates/aterm-window/.../event_loop.rs`) calls `try_theme()` on EVERY such message when
 /// `preferred_theme` is `None` — which for `Auto` it always is — but emits
 /// `ThemeChanged` only when the OS-resolved theme actually MOVED. Windows broadcasts
 /// `WM_SETTINGCHANGE` for a long list of unrelated things (`SPI_SETWORKAREA` on monitor
@@ -1628,7 +1630,7 @@ fn applying_chrome() -> bool {
 ///
 /// THE HOOK MUST NOT FEED ITSELF. [`apply_chrome_appearance`] calls winit's
 /// `Window::set_theme`, which is `try_theme` → `SetWindowTheme(hwnd, …)`
-/// UNCONDITIONALLY (`vendor/winit/src/platform_impl/windows/dark_mode.rs`), and
+/// UNCONDITIONALLY (`crates/aterm-window/src/platform_impl/windows/dark_mode.rs`), and
 /// `SetWindowTheme` sends `WM_THEMECHANGED` straight back to that HWND — which is on
 /// the watch list. Because [`note_os_settings_resample`] clears the coalescer at the
 /// TOP of the re-sample (deliberately, so a racing trailing broadcast is not
@@ -1892,8 +1894,10 @@ fn install_window_subclass(window: &Window, proxy: &EventLoopProxy<Wake>) {
 /// The native Windows application-runtime. Decorates the winit-owned `HWND` with
 /// DWM chrome (immersive dark via winit + rounded corners + system backdrop) and
 /// wires the EDR/reduce-motion queries; every other method delegates to the shared
-/// cross-platform modules. Zero-sized.
-pub(crate) struct AppRtWindows;
+/// cross-platform modules.
+pub(crate) struct AppRtWindows {
+    pub(crate) probe_preferences: bool,
+}
 
 impl AppRt for AppRtWindows {
     /// Paint the window-class background brush the terminal's THEME background —
@@ -2089,11 +2093,11 @@ impl AppRt for AppRtWindows {
         // user it is "styling the caption only" would name the wrong cause and send
         // them to restart aterm over an accessibility setting.
         if effective_backdrop(backdrop_for(material)) != DWMSBT_NONE
-            && !aterm_gpu::dx12_visual_swapchain_active()
+            && !aterm_gpu::visual_swapchain_active()
         {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| {
-                if aterm_gpu::dx12_visual_swapchain_withdrawn() {
+                if aterm_gpu::visual_swapchain_withdrawn() {
                     crate::logging::stderr_line!(
                         "aterm-gui: background_material is styling the caption only \
                          (client=opaque): the client-area backdrop path was withdrawn \
@@ -2297,6 +2301,9 @@ impl AppRt for AppRtWindows {
     /// Feeds [`crate::motion::MotionPolicy`]. Fail-safe to `false` (do not reduce) if
     /// the query fails.
     fn reduce_motion(&self) -> bool {
+        if !self.probe_preferences {
+            return false;
+        }
         let mut animations_enabled: i32 = 1;
         // SAFETY: a single documented `SystemParametersInfoW` read into a local
         // `BOOL`; `ui_param`/`fw_ini` are 0 (no set), and the out-pointer is valid
@@ -2347,6 +2354,9 @@ impl AppRt for AppRtWindows {
     /// FIRST — without the store, the frame guard would keep defending a stale
     /// non-HC caption until some other seam ran `apply_chrome_appearance`.)
     fn native_appearance_preferences(&self) -> crate::native_appearance::AppearancePreferences {
+        if !self.probe_preferences {
+            return crate::native_appearance::AppearancePreferences::default();
+        }
         let _ = resync_forced_chrome_palette();
         let high_contrast = CHROME_HIGH_CONTRAST.load(Ordering::Relaxed);
         crate::native_appearance::AppearancePreferences {
@@ -2509,7 +2519,7 @@ mod tests {
         claim_os_settings_wake, colorref_swap, effective_backdrop, high_contrast_active,
         is_os_settings_message, os_text_scale, resolve_chrome_theme, resolve_forced_chrome,
         transparency_effects_enabled, validate_window_capture_transfer, watch_os_settings_message,
-        wheel_notch_from_raw, wheel_notch_scroll, work_area_pts_from_rect,
+        wheel_notch_from_raw, work_area_pts_from_rect,
     };
     use crate::app_config::{BackgroundMaterial, WindowTheme};
     use crate::native_appearance::AppearancePreferences;
@@ -2956,7 +2966,10 @@ mod tests {
         // put back whatever this worker thread had, so a machine actually running High
         // Contrast cannot leak an OS palette into the next test on this thread.
         let saved_palette = crate::chrome_band::forced_chrome();
-        let published = AppRtWindows.native_appearance_preferences();
+        let published = AppRtWindows {
+            probe_preferences: true,
+        }
+        .native_appearance_preferences();
         crate::chrome_band::install_forced_chrome(saved_palette);
         assert_eq!(
             published.reduced_transparency,
@@ -3182,14 +3195,6 @@ mod tests {
         assert_eq!(wheel_notch_from_raw(1), WheelNotch::Lines(1));
         assert_eq!(wheel_notch_from_raw(0), WheelNotch::Lines(0));
         assert_eq!(wheel_notch_from_raw(WHEEL_PAGESCROLL), WheelNotch::Page);
-    }
-
-    /// The live read is cached, and both reads agree. The VALUE belongs to the
-    /// machine's mouse settings, so this asserts only that the query is answerable
-    /// and stable — never a specific number.
-    #[test]
-    fn wheel_notch_scroll_is_stable_across_calls() {
-        assert_eq!(wheel_notch_scroll(), wheel_notch_scroll());
     }
 
     /// COLORREF is `0x00BBGGRR` while themes store `0x00RRGGBB`: the swap must move

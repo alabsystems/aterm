@@ -7,7 +7,7 @@ fn argv(words: &[&str]) -> Vec<String> {
     words.iter().map(|w| (*w).to_string()).collect()
 }
 
-/// This tab's conversation, and a SIBLING tab's in the same directory.
+/// This tab's conversation, and a sibling tab's in the same directory.
 const OURS: &str = "5f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f";
 const SIBLING: &str = "0a0b0c0d-1111-4222-8333-444455556666";
 
@@ -24,8 +24,8 @@ impl ClaudeDir {
         Self(root)
     }
 
-    /// Claude Code's record for `pid`, in the shape 2.1.280 writes
-    /// (`upgrade_tests.rs`' measured `SESSION_9162`), filed as `<file>.json`.
+    /// Claude Code's record for `pid`, in the shape of `upgrade_tests.rs`' measured
+    /// `SESSION_9162`, filed as `<file>.json`.
     fn record(&self, file: u32, pid: u32, session: &str, started: u64, status_at_ms: u64) {
         let text = format!(
             r#"{{"pid":{pid},"sessionId":"{session}","cwd":"/Users/_owner/aterm","startedAt":{},"procStart":"{}","version":"2.1.281","kind":"interactive","entrypoint":"cli","status":"idle","statusUpdatedAt":{status_at_ms}}}"#,
@@ -40,9 +40,8 @@ impl ClaudeDir {
     }
 }
 
-/// The resume line the WINDOW's footer read gives for `pid` in `dir`
-/// ([`crate::harness::footer::read_pid`], the function `aterm-gui`'s
-/// resolver calls): one read of the record, `argv` the process's own.
+/// The resume line the window's footer read gives for `pid` in `dir`
+/// ([`crate::harness::footer::read_pid`], which `aterm-gui`'s resolver calls).
 fn line_of(dir: &ClaudeDir, pid: u32, started: Option<u64>, argv: &[String]) -> Option<String> {
     use crate::harness::footer;
     let offset = |_: Option<&str>, _: i64| None;
@@ -63,14 +62,10 @@ fn line_of(dir: &ClaudeDir, pid: u32, started: Option<u64>, argv: &[String]) -> 
     .and_then(|facts| facts.resume)
 }
 
-/// Two live Claude Code processes filed under one working directory, the
-/// sibling's conversation the newer (the one `claude --continue` would
-/// resume). The command for each pid names that pid's own conversation, with
-/// its launch flags carried; never the other's, and never `--continue`. Read
-/// as the window reads it ([`line_of`]). Negative controls: a pid with no
-/// record, a record whose kernel start disagrees (a reused pid), a record
-/// filed under another pid's name, a record of another shape, and a record
-/// with no `procStart` where the kernel start is known all give no command.
+/// Two live Claude Code processes in one directory, the sibling's conversation the newer (the one
+/// `claude --continue` would resume): each pid's command names its own conversation, flags carried.
+/// Negative controls: no record, a reused pid, a record filed under another pid, a record of
+/// another shape, and no `procStart` where the kernel start is known give no command.
 #[test]
 fn two_records_in_one_directory_each_pid_resumes_its_own_conversation() {
     let dir = ClaudeDir::new("two");
@@ -117,10 +112,8 @@ fn two_records_in_one_directory_each_pid_resumes_its_own_conversation() {
     // A record of another shape.
     std::fs::write(dir.0.path().join("sessions/778.json"), r#"{"pid":778}"#).expect("write");
     assert_eq!(line_of(&dir, 778, None, &launch), None);
-    // A record with no `procStart`: the footer shows its facts, but where
-    // the kernel's start is known nothing ties the record to this process,
-    // so no line to type. With no start known the pid alone decides, as
-    // above.
+    // A record with no `procStart`: where the kernel's start is known nothing ties it to this
+    // process, so no line to type.
     std::fs::write(
         dir.0.path().join("sessions/779.json"),
         format!(r#"{{"pid":779,"sessionId":"{OURS}","cwd":"/Users/_owner/aterm"}}"#),
@@ -154,12 +147,10 @@ fn two_records_in_one_directory_each_pid_resumes_its_own_conversation() {
     );
 }
 
-/// The line carries what the relaunch carries ([`upgrade::rewrite_argv`]):
-/// every known flag verbatim, quoted only where a shell would read it, the
-/// resume family and `--effort` dropped, positionals dropped. A flag the
-/// rewrite does not know leaves the bare line; a launch that is not
-/// resumable in place (`--worktree`, `-p`) gets none; nor does an id that is
-/// not one. A script launch reads its flags after the script.
+/// The line carries what the relaunch carries ([`upgrade::rewrite_argv`]): known flags verbatim,
+/// quoted only where a shell would read them; the resume family, `--effort` and positionals
+/// dropped. An unknown flag leaves the bare line; a launch not resumable in place, or an id that
+/// is not one, gets none. A script launch reads its flags after the script.
 #[test]
 fn the_line_carries_the_launch_flags_as_the_relaunch_does() {
     let line = command(
@@ -213,14 +204,9 @@ fn the_line_carries_the_launch_flags_as_the_relaunch_does() {
     assert_eq!(bare_of("claude --continue"), None);
 }
 
-/// A resume line a reason names is never cut by a renderer that cuts:
-/// [`never_cut`] keeps it whole, else with its permission mode alone, else in
-/// its bare form, else drops its clause,
-/// and a text naming no line is rendered untouched. The renderer here is a
-/// plain byte cap with `…`, the shape of the supervisor's escalation.
-///
-/// Negative control: the same renderer given the text directly cuts the id
-/// mid-way.
+/// [`never_cut`] keeps a named resume line whole, else its permission-mode form, else its bare
+/// form, else drops the clause; text naming no line renders untouched. Negative control: the same
+/// byte-cap renderer given the text directly cuts the id.
 #[test]
 fn a_named_resume_line_is_kept_whole_bare_or_not_at_all() {
     let cap = |n: usize| {
@@ -245,9 +231,8 @@ fn a_named_resume_line_is_kept_whole_bare_or_not_at_all() {
     // Room for the id but not the tail: the whole line, the tail cut.
     let out = never_cut(&text, cap(text.len() - 5));
     assert!(out.contains(&line), "{out}");
-    // Room for its permission mode, not its other flags: the mode alone —
-    // the last flag a line gives up (round three of the joint audit of
-    // 2026-10-01; a bare line brings the orchestrator back in another mode).
+    // Room for its permission mode, not its other flags: the mode alone, the last flag a line
+    // gives up.
     let mode = format!("claude --dangerously-skip-permissions --resume {OURS}");
     let room = "memory critical: restart it, then resume with ".len() + mode.len() + 3;
     let out = never_cut(&text, cap(room));
@@ -259,8 +244,7 @@ fn a_named_resume_line_is_kept_whole_bare_or_not_at_all() {
         out.contains(&bare) && !out.contains("--dangerously"),
         "{out}"
     );
-    // Negative control: the renderer alone cuts the command — it is
-    // named, and its conversation is not.
+    // Negative control: the renderer alone cuts the command's id.
     let cut = cap(room)(&text);
     assert!(
         cut.contains("resume with claude --") && !cut.contains(OURS),
@@ -284,4 +268,206 @@ fn a_named_resume_line_is_kept_whole_bare_or_not_at_all() {
     ] {
         assert_eq!(never_cut(&plain, cap(20)), cap(20)(&plain));
     }
+}
+
+/// A Codex's thread.
+const THREAD: &str = "019a0b1c-2d3e-7f40-8a5b-6c7d8e9f0a1b";
+
+/// A CODEX'S LINE ([`codex_command`]) is `codex resume <kept flags>
+/// <thread>`, each word quoted as Claude Code's line quotes one, and steps
+/// down as Claude Code's does ([`shorter`]): its approval and sandbox flags
+/// alone ([`mode_of`]), then `codex resume <thread>` ([`bare_of`]). A word
+/// that needs quotes reads back whole. NEGATIVE CONTROLS: a thread that is
+/// not one, and a launch the rewrite refuses, give no line; a line that is
+/// all permission mode steps straight to its bare form; text that is not
+/// exactly such a line has no shorter form.
+#[test]
+fn a_codex_line_steps_down_to_its_mode_and_its_bare_form() {
+    let launch = argv(&[
+        "/opt/codex",
+        "-m",
+        "gpt-5-codex",
+        "-c",
+        "model_reasoning_effort=\"high\"",
+        "-s",
+        "read-only",
+        "-a",
+        "never",
+        "hello",
+    ]);
+    let line = codex_command(&launch, THREAD, None).expect("a line");
+    assert_eq!(
+        line,
+        format!(
+            "codex resume -m gpt-5-codex -c 'model_reasoning_effort=\"high\"' -s read-only -a \
+             never {THREAD}"
+        )
+    );
+    let mode = format!("codex resume -s read-only -a never {THREAD}");
+    let bare = format!("codex resume {THREAD}");
+    assert_eq!(mode_of(&line), Some(mode.clone()));
+    assert_eq!(bare_of(&line), Some(bare.clone()));
+    assert_eq!(shorter(&line), [mode, bare.clone()]);
+    let bypass = codex_command(
+        &argv(&["codex", "--dangerously-bypass-approvals-and-sandbox"]),
+        THREAD,
+        None,
+    )
+    .expect("a line");
+    assert_eq!(
+        mode_of(&bypass).as_ref(),
+        Some(&bypass),
+        "its mode is all of it"
+    );
+    assert_eq!(shorter(&bypass), std::slice::from_ref(&bare));
+    assert_eq!(shorter(&bare), Vec::<String>::new());
+    // Negative controls.
+    assert_eq!(codex_command(&argv(&["codex"]), "not-a-thread", None), None);
+    assert_eq!(
+        codex_command(&argv(&["codex", "--worktree"]), THREAD, None),
+        None
+    );
+    assert_eq!(
+        codex_command(&argv(&["codex", "--unknown"]), THREAD, None),
+        None
+    );
+    for text in [
+        format!("codex resume {THREAD} trailing"),
+        format!("codex resume --nope {THREAD}"),
+        format!("codex fork {THREAD}"),
+    ] {
+        assert_eq!(
+            (bare_of(&text), shorter(&text)),
+            (None, Vec::new()),
+            "{text}"
+        );
+    }
+}
+
+/// A CODEX'S LINE A REASON NAMES IS NEVER CUT ([`never_cut`]), as Claude
+/// Code's is not: whole, else its permission mode alone, else `codex resume
+/// <thread>`, else its clause dropped. A flag's value that is itself a
+/// thread id ends no line before the thread does. NEGATIVE CONTROL: the
+/// renderer alone names the command and cuts its thread away.
+#[test]
+fn a_named_codex_line_is_kept_whole_bare_or_not_at_all() {
+    let cap = |n: usize| {
+        move |s: &str| {
+            if s.len() <= n {
+                s.to_string()
+            } else {
+                format!("{}…", &s[..n - '…'.len_utf8()])
+            }
+        }
+    };
+    let launch = argv(&[
+        "codex",
+        "--profile",
+        "0a0b0c0d-1111-4222-8333-444455556666",
+        "-s",
+        "read-only",
+        "-c",
+        "model_reasoning_effort=high",
+    ]);
+    let line = codex_command(&launch, THREAD, None).expect("a line");
+    let mode = format!("codex resume -s read-only {THREAD}");
+    let bare = format!("codex resume {THREAD}");
+    let text =
+        format!("memory critical: restart it{THEN_RESUME_WITH}{line}: Memory usage critical");
+    let head = "memory critical: restart it, then resume with ".len();
+    assert_eq!(never_cut(&text, cap(500)), text);
+    let out = never_cut(&text, cap(text.len() - 5));
+    assert!(out.contains(&line), "{out}");
+    let out = never_cut(&text, cap(head + mode.len() + 3));
+    assert!(out.contains(&mode), "{out}");
+    let out = never_cut(&text, cap(head + bare.len() + 3));
+    assert!(out.contains(&bare) && !out.contains("read-only"), "{out}");
+    let out = never_cut(&text, cap(40));
+    assert!(
+        !out.contains("codex") && !out.contains("resume with"),
+        "{out}"
+    );
+    assert!(
+        out.starts_with("memory critical: restart it: Memory"),
+        "{out}"
+    );
+    // Negative control: cut by the renderer alone, the command is named and
+    // its thread is not.
+    let cut = cap(head + bare.len() + 3)(&text);
+    assert!(
+        cut.contains("resume with codex resume") && !cut.contains(THREAD),
+        "{cut}"
+    );
+}
+
+/// A CODEX STARTED UNDER `CODEX_HOME=<dir>` IS TOLD A LINE THAT CARRIES IT
+/// ([`codex_command`]), as its relaunch line does: `CODEX_HOME=<dir> codex
+/// resume <kept flags> <thread>`, the value quoted where a shell needs it and
+/// the name never (a quoted `NAME=` is a command). Its shorter forms keep it
+/// ([`shorter`]: the permission mode alone, then the bare form, each still
+/// behind the home), and a reason names it whole or not at all
+/// ([`never_cut`]). NEGATIVE CONTROLS: a Codex started with none is told no
+/// home; a home with a control character gives no line; a line whose home is
+/// not this one's spelling is no line of [`codex_command`]'s.
+#[test]
+fn a_codex_line_carries_the_codex_home_its_tui_was_started_with() {
+    let launch = argv(&["codex", "-m", "gpt-5-codex", "-s", "read-only"]);
+    let home = "/Users//x/my codex";
+    let line = codex_command(&launch, THREAD, Some(home)).expect("a line");
+    assert_eq!(
+        line,
+        format!("CODEX_HOME='/Users//x/my codex' codex resume -m gpt-5-codex -s read-only {THREAD}")
+    );
+    // Read back by a shell's rules: one assignment, then the command.
+    let words = crate::harness::upgrade_drive::last_command(&line);
+    assert_eq!(words[0], format!("CODEX_HOME={home}"));
+    assert_eq!(words[1..3], ["codex", "resume"]);
+    let mode = format!("CODEX_HOME='/Users//x/my codex' codex resume -s read-only {THREAD}");
+    let bare = format!("CODEX_HOME='/Users//x/my codex' codex resume {THREAD}");
+    assert_eq!(mode_of(&line), Some(mode.clone()));
+    assert_eq!(bare_of(&line), Some(bare.clone()));
+    assert_eq!(shorter(&line), [mode.clone(), bare.clone()]);
+    // A plain path needs no quotes.
+    assert_eq!(
+        codex_command(&argv(&["codex"]), THREAD, Some("/alt/home")),
+        Some(format!("CODEX_HOME=/alt/home codex resume {THREAD}"))
+    );
+    // A reason keeps the line whole, steps it down behind its home, or drops
+    // the clause.
+    let text =
+        format!("memory critical: restart it{THEN_RESUME_WITH}{line}: Memory usage critical");
+    let head = "memory critical: restart it, then resume with ".len();
+    let cap = |n: usize| {
+        move |s: &str| {
+            if s.len() <= n {
+                s.to_string()
+            } else {
+                format!("{}…", &s[..n - '…'.len_utf8()])
+            }
+        }
+    };
+    assert_eq!(never_cut(&text, cap(500)), text);
+    let out = never_cut(&text, cap(head + mode.len() + 3));
+    assert!(out.contains(&mode), "{out}");
+    let out = never_cut(&text, cap(head + bare.len() + 3));
+    assert!(out.contains(&bare) && !out.contains("read-only"), "{out}");
+    let out = never_cut(&text, cap(head + 10));
+    assert!(
+        !out.contains("CODEX_HOME") && !out.contains("resume with"),
+        "{out}"
+    );
+    // Negative controls.
+    assert_eq!(
+        codex_command(&launch, THREAD, None),
+        Some(format!("codex resume -m gpt-5-codex -s read-only {THREAD}"))
+    );
+    assert_eq!(codex_command(&launch, THREAD, Some("/a\nb")), None);
+    let respelled = line.replace(
+        "CODEX_HOME='/Users//x/my codex'",
+        "CODEX_HOME=\"/Users//x/my codex\"",
+    );
+    assert_eq!(
+        (bare_of(&respelled), shorter(&respelled)),
+        (None, Vec::new())
+    );
 }

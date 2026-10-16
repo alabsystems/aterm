@@ -1471,6 +1471,8 @@ impl EffectsPipeline {
             seed,
             default_bg: default_bg & 0x00FF_FFFF,
             theme_fg: theme_fg & 0x00FF_FFFF,
+            // The accent arrives with the theme ([`Self::set_matrix_rain_theme`]).
+            theme_accent: self.rain_cfg.theme_accent,
         };
         if let Some(rain) = self.rain.as_deref_mut() {
             rain.set_config(self.rain_cfg);
@@ -1479,14 +1481,19 @@ impl EffectsPipeline {
 
     /// Update theme-derived rain colors without requiring the host to replay
     /// every matrix-rain knob after a live theme change.
-    pub fn set_matrix_rain_theme(&mut self, default_bg: u32, theme_fg: u32) {
+    pub fn set_matrix_rain_theme(&mut self, default_bg: u32, theme_fg: u32, theme_accent: u32) {
         let default_bg = default_bg & 0x00FF_FFFF;
         let theme_fg = theme_fg & 0x00FF_FFFF;
-        if self.rain_cfg.default_bg == default_bg && self.rain_cfg.theme_fg == theme_fg {
+        let theme_accent = theme_accent & 0x00FF_FFFF;
+        if self.rain_cfg.default_bg == default_bg
+            && self.rain_cfg.theme_fg == theme_fg
+            && self.rain_cfg.theme_accent == theme_accent
+        {
             return;
         }
         self.rain_cfg.default_bg = default_bg;
         self.rain_cfg.theme_fg = theme_fg;
+        self.rain_cfg.theme_accent = theme_accent;
         if let Some(rain) = self.rain.as_deref_mut() {
             rain.set_config(self.rain_cfg);
         }
@@ -2022,16 +2029,20 @@ impl EffectsPipeline {
         // notes keystrokes directly, so no echo rides the frame.
         // `content_seq` advances on content mutation only. The page has no
         // audio host, so the cue is dropped.
-        let streak = self.streak.is_some().then(|| StreakGrid {
-            now,
-            cfg: self.streak_cfg,
-            seed: self.streak_seed,
-            echo: StreakEcho::default(),
-            cells: &input.cells,
-            cursor: (input.cursor_row, input.cursor_col),
-            viewport: (rows, cols),
-            content_seq: term.content_seq(),
-            geom: glow_geom,
+        let streak = self.streak.is_some().then(|| {
+            let mut cfg = self.streak_cfg;
+            cfg.intensity *= cursor_motion.amplitude(MotionEffect::OutputStreak);
+            StreakGrid {
+                now,
+                cfg,
+                seed: self.streak_seed,
+                echo: StreakEcho::default(),
+                cells: &input.cells,
+                cursor: (input.cursor_row, input.cursor_col),
+                viewport: (rows, cols),
+                content_seq: term.content_seq(),
+                geom: glow_geom,
+            }
         });
         let streak_fp = self
             .streak_grid(streak.as_ref())
@@ -5756,6 +5767,34 @@ mod tests {
             "NON-VACUITY: the streak must actually put light in nova_add"
         );
 
+        // The page-wide preference retires live comets and forbids new ones,
+        // without overwriting the configured amplitude needed when it clears.
+        p.set_reduced_motion(true);
+        for i in 40..80 {
+            p.advance(40.0);
+            term.process(format!("line {i}\r\n").as_bytes());
+            term.cell_frame_into(&mut input, 24, 80);
+            p.apply(&mut term, &mut input, 10, 20);
+            assert!(
+                input.nova_add.is_empty(),
+                "reduced motion must retire the streak"
+            );
+            assert!(!p.is_active(), "a reduced streak must not request frames");
+        }
+        p.set_reduced_motion(false);
+        let mut restored = false;
+        for i in 80..120 {
+            p.advance(40.0);
+            term.process(format!("line {i}\r\n").as_bytes());
+            term.cell_frame_into(&mut input, 24, 80);
+            p.apply(&mut term, &mut input, 10, 20);
+            restored |= !input.nova_add.is_empty();
+        }
+        assert!(
+            restored,
+            "clearing reduced motion restores the configured streak"
+        );
+
         // The same script with the streak OFF leaves the channel empty — so
         // the quads above were the streak's, and disabling it strands nothing.
         let mut q = EffectsPipeline::new();
@@ -5994,12 +6033,14 @@ mod tests {
     fn matrix_rain_theme_updates_cached_and_live_config() {
         let mut p = EffectsPipeline::new();
         p.set_matrix_rain_enabled(true);
-        p.set_matrix_rain_theme(0x0012_3456, 0x00AB_CDEF);
+        p.set_matrix_rain_theme(0x0012_3456, 0x00AB_CDEF, 0x0013_5799);
         assert_eq!(p.rain_cfg.default_bg, 0x0012_3456);
         assert_eq!(p.rain_cfg.theme_fg, 0x00AB_CDEF);
+        assert_eq!(p.rain_cfg.theme_accent, 0x0013_5799);
         let live = p.rain.as_deref().expect("enabled rain").config_for_test();
         assert_eq!(live.default_bg, 0x0012_3456);
         assert_eq!(live.theme_fg, 0x00AB_CDEF);
+        assert_eq!(live.theme_accent, 0x0013_5799);
     }
 
     #[test]

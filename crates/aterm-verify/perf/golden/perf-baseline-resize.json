@@ -1,0 +1,6 @@
+{
+  "_comment": "aterm RESIZE/REWRAP baseline (E0, audit 5.3): synchronous full-ring resizes/s at the 50k cap and offload+pump+reattach cycles/s over a 110k-line tiered fill. BIGGER-IS-BETTER; the 42s-freeze-class ABSOLUTE fences live in the gate code (RESIZE_RING_WORST_CAP_MS / RESIZE_TIERED_SYNC_WORST_CAP_MS), not this file. Re-record with targo --unverified verify perf --record resize. Recorded 2026-07-22 on the M5 Max (conservative min-of-2 medians).",
+  "resize_ring_median_rps": 14.196,
+  "resize_tiered_median_rps": 9.009,
+  "pass_ratio": 0.450
+}

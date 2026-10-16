@@ -23,7 +23,7 @@
 //! valid:    210 pass / 6 fail        invalid: 492 pass / 0 fail
 //! ```
 //!
-//! All six are TOML 1.1 DRAFTS:
+//! All six exercise TOML 1.1 additions outside this crate's TOML 1.0 target:
 //! `datetime/no-seconds`, `inline-table/newline`, `inline-table/newline-comment`
 //! and `key/empty-05` (newlines inside inline tables), `string/escape-esc`
 //! (`\e`) and `string/hex-escape` (`\x`). Those are the omissions `lib.rs`
@@ -185,9 +185,9 @@ const INVALID: &[(&str, &str)] = &[
     ),
     (
         "str = \"\\x invalid escape\"\n",
-        "`\\x` is a TOML 1.1 draft, not 1.0",
+        "`\\x` escapes are outside TOML 1.0",
     ),
-    ("str = \"\\e\"\n", "`\\e` is a TOML 1.1 draft, not 1.0"),
+    ("str = \"\\e\"\n", "`\\e` escapes are outside TOML 1.0"),
     (
         "str = \"\\uD800\"\n",
         "a lone surrogate is not a scalar value",

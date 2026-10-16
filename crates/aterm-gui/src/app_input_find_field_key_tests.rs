@@ -61,7 +61,7 @@ fn escape_closes_the_bar_and_types_nothing() {
     assert_eq!(query(&app, wid), Some((String::new(), 0)));
 }
 
-/// ⏎ ACCEPTS (closes, keeping the match), and ⇥ is inert — neither leaves its
+/// ⏎ accepts (closes, keeping the match) and ⇥ is inert; neither leaves its
 /// control character in the query.
 #[test]
 fn enter_accepts_and_tab_is_not_typed() {
@@ -93,7 +93,7 @@ fn standard_text_field_chords_edit_the_query() {
     app.search_enter();
     type_str(&mut app, wid, "beta");
 
-    // ^A → start of line, then typing inserts THERE.
+    // ^A → start of line, then typing inserts there.
     set_mods(&mut app, wid, ModifiersState::CONTROL);
     app.on_key(wid, character("a"));
     assert_eq!(query(&app, wid), Some(("beta".to_string(), 0)), "^A");
@@ -194,8 +194,8 @@ fn ime_commit_types_into_the_field_not_the_shell() {
 }
 
 /// Command chords through the real key routing: ^G aborts (restoring the
-/// pre-find viewport, like ⎋), and ⌥⌘C / ⌥⌘R flip match-case / regex, including
-/// from the composed glyph macOS puts in `logical_key` (⌥⌘C arrives as "ç").
+/// pre-find viewport, like ⎋), and ⌥⌘C / ⌥⌘R flip match-case / regex even when
+/// macOS composes the key (⌥⌘C arrives as "ç").
 #[test]
 fn command_chords_abort_and_toggle_through_the_key_path() {
     let mut app = App::headless_for_test();
@@ -216,9 +216,8 @@ fn command_chords_abort_and_toggle_through_the_key_path() {
         term_lock(&term).grid().display_offset() != origin,
         "find navigated away from the origin viewport"
     );
-    // macOS puts the ⌥-composed glyph in the event's text (ç / ®) while the
-    // logical key stays the base letter under a Cmd chord, so these arms match
-    // on `base_logical_key`.
+    // The event text carries the ⌥-composed glyph (ç / ®); these arms match on
+    // `base_logical_key`.
     set_mods(&mut app, wid, ModifiersState::SUPER | ModifiersState::ALT);
     app.on_key(wid, press(Key::Character(SmolStr::new("c")), Some("ç")));
     assert!(
@@ -277,7 +276,7 @@ fn the_field_claims_text_input_not_every_chord() {
     );
 }
 
-/// The routing predicates the OTHER input doors consult: AppKit menu equivalents
+/// The routing predicates the other input doors consult: AppKit menu equivalents
 /// (⌘V / ⌘A never reach `on_key`) and configured `[keybindings]` actions.
 #[test]
 fn other_input_doors_defer_to_an_open_field() {
@@ -357,11 +356,9 @@ fn field_editing_re_runs_the_search_but_never_reaches_the_shell() {
     );
 }
 
-/// A chord bound to `Action::Paste` pastes into the query through the real
-/// `on_key` routing: the find gate's suspension arm routes the resolved action
-/// into the field (`field_edit_action` has no `v` arm and its text tail refuses
-/// control chords, and the clipboard must not go to the PTY). The clipboard is
-/// stubbed (`PBPASTE_STUB`).
+/// A chord bound to `Action::Paste` pastes the (stubbed, `PBPASTE_STUB`)
+/// clipboard into the query through the real `on_key` routing, never into the
+/// PTY: the find gate's suspension arm routes the action into the field.
 #[test]
 fn a_bound_paste_chord_pastes_into_the_query_never_the_pty() {
     let mut app = App::headless_for_test();
@@ -487,7 +484,7 @@ fn ctrl_named_keys_are_word_motions_in_the_field_off_macos() {
         Some(SearchEdit::MoveCharLeft),
         "^B stays by-character"
     );
-    // Ctrl+Alt together qualifies for NEITHER word term (AltGr safety).
+    // Ctrl+Alt together qualifies for neither word term (AltGr safety).
     assert_eq!(
         classify(ctrl | ModifiersState::ALT, &named(NamedKey::ArrowLeft)),
         Some(SearchEdit::MoveCharLeft),

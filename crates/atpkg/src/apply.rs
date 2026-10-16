@@ -1,34 +1,29 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Coherence-group transactional apply (§7) — the headline Phase 4 logic.
+//! Coherence-group transactional apply (§7).
 //!
-//! The unit of update is a **coherence group**, not the whole channel and not a single
-//! tool. Members of the same `[programs].coherence_group` (the `rustc`-locked
-//! trust/trust-mc/ay/clean tuple) move **atomically**; a program with no group applies
-//! **independently** so one tiny tool can never wedge the trust update.
+//! The unit of update is a coherence group: members of one `[programs].coherence_group`
+//! (the `rustc`-locked trust/trust-mc/ay/clean tuple) move atomically, and a program with
+//! no group applies independently, so one tiny tool can never wedge the trust update.
 //!
-//! [`plan_groups`] partitions a channel's pinned programs into groups (pure): named groups
-//! by name, then singletons by name. (The index-level `requires` ordering went with the
-//! OS-installer protocols it served, design 2026-09-22 §5.3(b), 2026-09-24.) [`transact`]
-//! runs one group as an all-or-nothing transaction over **injected** stage/flip/rollback
-//! actions, so the sequencing is unit-tested without any network or filesystem:
+//! [`plan_groups`] partitions a channel's pinned programs into groups (pure). [`transact`]
+//! runs one group as an all-or-nothing transaction over injected stage/flip/rollback
+//! actions, so the sequencing is unit-tested without network or filesystem:
 //!
-//! 1. **Tombstone short-circuit** — if any member's [`ApplyDecision`] is
-//!    [`ApplyDecision::Tombstone`] (its pin is yanked / below floor, §7), the group cannot
-//!    form a valid tuple, so **nothing** is staged or flipped: the group tombstones.
-//! 2. **Stage-all** — stage every member that needs [`ApplyDecision::Install`]. If *any*
-//!    stage fails, **abort**: flip nothing (the group stays on its current builds).
-//! 3. **Flip-all** — only once every member staged, flip each. If a flip fails partway,
-//!    **roll back** the already-flipped members and abort.
+//! 1. **Tombstone short-circuit**: if any member's [`ApplyDecision`] is
+//!    [`ApplyDecision::Tombstone`] (pin yanked or below floor), nothing is staged or flipped.
+//! 2. **Stage-all**: stage every member that needs [`ApplyDecision::Install`]; any failure
+//!    aborts with nothing flipped.
+//! 3. **Flip-all**: only once every member staged, flip each; a failure partway rolls back
+//!    the already-flipped members and aborts.
 //!
-//! Between 2 and 3, [`transact_holding`] asks a HOLD once: an unattended pass whose group
-//! holds the Trust toolchain flips nothing while that toolchain is in use
-//! ([`TxnOutcome::Deferred`], [`crate::quiet`]).
+//! Between 2 and 3, [`transact_holding`] asks a hold once: an unattended pass whose group
+//! holds the Trust toolchain flips nothing while it is in use ([`TxnOutcome::Deferred`]).
 //!
-//! The production adapter wires stage = download + [`crate::install::verify_and_stage`],
-//! flip = [`crate::activate::activate_build`] + [`crate::activate::install_shims`], and
-//! rollback = re-point to the retained previous build.
+//! In production (`flow`) stage is download + [`crate::install::verify_and_stage`], flip is
+//! [`crate::activate::activate_build`] plus the shims (`activate::install_tools`), and
+//! rollback re-points to the retained previous build.
 
 use std::collections::BTreeMap;
 
@@ -59,7 +54,7 @@ pub fn plan_groups(index: &Index, channel: &Channel) -> Vec<Group> {
         if crate::vendor_direct::is_vendor(program) {
             continue;
         }
-        // Reachability: only programs the verified index NAMES are installable.
+        // Reachability: only programs the verified index names are installable.
         let Some(p) = index.program(program) else {
             continue;
         };
@@ -96,11 +91,10 @@ pub enum TxnOutcome {
     /// The listed members' pins are yanked/below-floor — the group is tombstoned, nothing
     /// applied (never run a revoked build).
     Tombstoned(Vec<String>),
-    /// The listed members are held by a LOCAL pin — the group's upgrade was suppressed on
-    /// its current builds. Never a Tombstone/floor bypass (a pin is consulted only after
-    /// [`crate::gate::decide`], and only when the group is NOT tombstoning); nothing was
-    /// staged or flipped. Constructed by [`crate::flow`]'s group apply directly —
-    /// [`transact`] never returns it.
+    /// The listed members are held by a local pin: the group's upgrade was suppressed on
+    /// its current builds, with nothing staged or flipped. A pin is consulted only after
+    /// [`crate::gate::decide`] and never when the group tombstones. Built by
+    /// [`crate::flow`]'s group apply; [`transact`] never returns it.
     Pinned(Vec<String>),
     /// The group is held on its current builds because `member`'s pinned `build` publishes
     /// no artifact for `triple` — a tuple that cannot fully exist on this host is a correct
@@ -112,25 +106,20 @@ pub enum TxnOutcome {
         build: u64,
         triple: String,
     },
-    /// The group holds the Trust toolchain and its FLIP WAITS FOR QUIET ([`crate::quiet`]):
-    /// an unattended pass found the toolchain it would supersede in use — leased by a run,
-    /// run from, or not known — so the listed members' new builds were STAGED (their signed
-    /// archives downloaded and checked, or their trees extracted and then set aside when a
-    /// build started during the extract) and NOTHING was flipped. `why` is what was using
-    /// it; `since` is when this wait began, what the four-hour ceiling counts from. Never
-    /// over a revoked build, and never on a person's pass. Built by [`crate::flow`]'s group
-    /// transaction, or by [`transact_holding`] through its hold.
+    /// The group holds the Trust toolchain and its flip waits for quiet ([`crate::quiet`]):
+    /// an unattended pass found the toolchain it would supersede in use (leased by a run,
+    /// run from, or not known), so the members' new builds were staged and nothing was
+    /// flipped. `why` is what was using it; `since` is when this wait began, which the
+    /// four-hour ceiling counts from. Never over a revoked build, never on a person's pass.
+    /// Built by [`crate::flow`]'s group transaction, or by [`transact_holding`].
     Deferred {
         members: Vec<String>,
         why: String,
         since: i64,
     },
     /// A member failed; the whole group was aborted. `during_flip` distinguishes a
-    /// stage-phase abort (nothing was flipped) from a flip-phase abort (already-flipped
-    /// members were rolled back). `why` is the failing step's own sentence — until
-    /// 2026-09-15 every stage failure collapsed to the two words `aborted: stage`, and
-    /// nobody could tell from the record whether the rustc group on the owner's machine
-    /// had aborted on the provenance refusal, a full disk or a bad download.
+    /// stage-phase abort (nothing flipped) from a flip-phase abort (already-flipped members
+    /// rolled back). `why` is the failing step's own sentence.
     Aborted {
         failed: String,
         during_flip: bool,
@@ -138,10 +127,9 @@ pub enum TxnOutcome {
     },
 }
 
-/// Run one coherence group as an all-or-nothing transaction over injected actions (see the
-/// module docs). `stage` answers `Err(why)` on failure — the sentence the abort carries —
-/// and `flip` returns `true` on success; `rollback` undoes a member that was flipped. Pure
-/// control flow — no I/O of its own — so it is exhaustively unit-tested.
+/// Run one coherence group as an all-or-nothing transaction over injected actions (module
+/// docs). `stage` answers `Err(why)` on failure (the sentence the abort carries), `flip`
+/// returns `true` on success, `rollback` undoes a flipped member. No I/O of its own.
 pub fn transact(
     decisions: &[(String, ApplyDecision)],
     stage: &mut dyn FnMut(&str) -> Result<(), String>,
@@ -151,11 +139,11 @@ pub fn transact(
     transact_holding(decisions, stage, &mut || None, flip, rollback)
 }
 
-/// [`transact`] with a HOLD asked once, after every member staged and before the first
+/// [`transact`] with a hold asked once, after every member staged and before the first
 /// flip: `Some((why, since))` ends the transaction [`TxnOutcome::Deferred`] with nothing
-/// flipped — the caller discards what it staged, as an abort does, and keeps the archives.
-/// Asked at the last moment on purpose: a build that started while the stage extracted a
-/// multi-gigabyte tree is seen ([`crate::quiet`]).
+/// flipped; the caller discards what it staged, as an abort does, and keeps the archives.
+/// Asked at the last moment so a build that started during a long extract is seen
+/// ([`crate::quiet`]).
 pub fn transact_holding(
     decisions: &[(String, ApplyDecision)],
     stage: &mut dyn FnMut(&str) -> Result<(), String>,
@@ -184,7 +172,7 @@ pub fn transact_holding(
         return TxnOutcome::UpToDate;
     }
 
-    // 3. Stage every member FIRST. A single failure aborts the group with nothing flipped.
+    // 3. Stage every member first. A single failure aborts the group with nothing flipped.
     for name in &installs {
         if let Err(why) = stage(name) {
             return TxnOutcome::Aborted {
@@ -252,8 +240,8 @@ repo = "aterm"
 repo = "aterm"
 "#,
         );
-        // Machine-signed through the real roster chain: `VerifiedBytes` still has no
-        // public constructor, so a fixture index must be signed like a published one.
+        // `VerifiedBytes` has no public constructor, so a fixture index is machine-signed
+        // through the real roster chain.
         crate::manifest::parse_index(&testkit::machine_signed(body.into_bytes())).unwrap()
     }
 
@@ -274,7 +262,7 @@ repo = "aterm"
     #[test]
     fn plan_groups_partitions_by_coherence_group() {
         let idx = index_with_groups();
-        // dotfiles is pinned but NOT named in the index → excluded (reachability).
+        // dotfiles is pinned but not named in the index → excluded (reachability).
         let ch = channel(&[("trust", 4821), ("ay", 18), ("ny", 9), ("dotfiles", 1)]);
         let groups = plan_groups(&idx, &ch);
         assert_eq!(
@@ -292,9 +280,8 @@ repo = "aterm"
         );
     }
 
-    /// THE CHOKEPOINT: a vendor-direct program is never planned, however the index names
-    /// and pins it — so no group lane can reinstall, downgrade or tombstone the build its
-    /// vendor lane installed with a legacy pin, yanked or not.
+    /// A vendor-direct program is never planned, however the index names and pins it, so
+    /// no group lane can reinstall, downgrade or tombstone what its vendor lane installed.
     #[test]
     fn plan_groups_excludes_vendor_direct_programs() {
         let idx = index_with_groups();
@@ -363,7 +350,7 @@ repo = "aterm"
             &mut |_| {},
         );
         assert_eq!(out, TxnOutcome::Applied(vec!["ay".into(), "trust".into()]));
-        // CRUCIAL: every stage happens before any flip (stage-all → flip-all).
+        // Every stage happens before any flip.
         assert_eq!(
             order.into_inner(),
             vec!["stage:ay", "stage:trust", "flip:ay", "flip:trust"]

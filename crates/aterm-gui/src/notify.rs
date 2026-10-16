@@ -158,10 +158,44 @@ impl NotifyMsg {
         Self::with_origin(session, title, body, false)
     }
 
-    /// One notice aterm wrote ITSELF (the herald, the consent attention path,
-    /// the embedded operator): the delivery thread drops it while
+    /// The escalation herald's notice. Only `status_item`'s herald builds a
+    /// [`HeraldNotice`](crate::status_item::HeraldNotice), so this posts only
+    /// what it decided.
+    pub(crate) fn herald(notice: &crate::status_item::HeraldNotice) -> Self {
+        Self::own(
+            notice.session,
+            Some(notice.title.to_owned()),
+            notice.body.clone(),
+        )
+    }
+
+    /// The consent attention path's notice. Only `consent_observer` builds an
+    /// [`AttentionNotice`](crate::consent_observer::AttentionNotice), so this
+    /// posts only what its gate decided.
+    pub(crate) fn consent(notice: &crate::consent_observer::AttentionNotice) -> Self {
+        Self::own(
+            notice.session,
+            Some(notice.title.to_owned()),
+            notice.body.clone(),
+        )
+    }
+
+    /// The embedded operator's notice for its `local_id`. Only `operator_host`
+    /// mints an [`OperatorVoice`](crate::operator_host::OperatorVoice).
+    pub(crate) fn operator(
+        _voice: crate::operator_host::OperatorVoice,
+        local_id: u64,
+        body: String,
+    ) -> Self {
+        Self::own(local_id, Some("aterm operator".to_owned()), body)
+    }
+
+    /// One notice aterm wrote ITSELF: the delivery thread drops it while
     /// `desktop_alerts` is off (the module doc's *`desktop_alerts`* paragraph).
-    pub(crate) fn own(session: u64, title: Option<String>, body: String) -> Self {
+    /// Private: aterm's own voice has exactly the three doors above, each
+    /// taking what only its decider makes, so a new way to interrupt the owner
+    /// is a new door written here.
+    fn own(session: u64, title: Option<String>, body: String) -> Self {
         Self::with_origin(session, title, body, true)
     }
 
@@ -280,7 +314,7 @@ pub(crate) fn spawn_delivery(
 /// they pass `desktop_alerts` instead (default off). See *aterm's own notices*
 /// in the module doc.
 #[cfg(target_os = "macos")]
-pub(crate) fn deliver(title: Option<&str>, body: &str, _silent: bool) {
+fn deliver(title: Option<&str>, body: &str, _silent: bool) {
     use aterm_uds::spawnfd::Stdio;
 
     let title = title.unwrap_or("aterm");
@@ -332,13 +366,27 @@ pub(crate) fn deliver(title: Option<&str>, body: &str, _silent: bool) {
         .status();
 }
 
+/// The update-health banner's delivery: owed to a cause only the owner can end
+/// (`App::post_update_health_banner`), so it bypasses the queue's
+/// `desktop_alerts` drop. Its one door: [`deliver`] itself is private, and only
+/// `messages_host` mints a
+/// [`HealthBannerVoice`](crate::messages_host::HealthBannerVoice).
+#[cfg(all(target_os = "macos", not(test)))]
+pub(crate) fn deliver_update_health_banner(
+    _voice: crate::messages_host::HealthBannerVoice,
+    title: &str,
+    banner: &str,
+) {
+    deliver(Some(title), banner, false);
+}
+
 /// Deliver one notification natively on Windows: a `Shell_NotifyIconW`
 /// `NIF_INFO` balloon from a transient tray icon owned by a hidden message-only
 /// window (on Win10/11 the shell renders it as a toast). Runs ONLY on the
 /// delivery thread (the window has thread affinity and blocking is fine there).
 /// Best-effort: any Win32 failure is swallowed.
 #[cfg(windows)]
-pub(crate) fn deliver(title: Option<&str>, body: &str, silent: bool) {
+fn deliver(title: Option<&str>, body: &str, silent: bool) {
     let title = title.unwrap_or("aterm");
     // An empty `szInfo` HIDES the balloon entirely, so a title-only OSC 99
     // (body absent) promotes the title into the body slot.
@@ -706,16 +754,8 @@ fn fold_to_utf16(s: &str, out: &mut [u16]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        NOTIFY_QUEUE_CAP, NotifyMsg, applescript_escape, delivers, fold_to_utf16,
-        windows_info_flags,
-    };
+    use super::{NotifyMsg, applescript_escape, delivers, fold_to_utf16, windows_info_flags};
     use std::collections::HashSet;
-    use std::sync::mpsc::TrySendError;
-
-    fn msg(session: u64) -> NotifyMsg {
-        NotifyMsg::program(session, None, "flood".to_string())
-    }
 
     /// `desktop_alerts = false` (the delivery thread's `own_alerts`) drops
     /// every notice aterm wrote itself — the herald's, the operator's, the
@@ -767,7 +807,8 @@ mod tests {
             .notice
             .expect("a first denial notifies");
         let first_tab_focused = HashSet::from([0u64]);
-        let own = NotifyMsg::own(notice.session, Some(notice.title.into()), notice.body);
+        let own = NotifyMsg::consent(&notice);
+        assert!(own.own, "the consent door speaks in aterm's own voice");
         assert!(
             delivers(&own, &first_tab_focused, true),
             "the first tab's focus does not hide an instance-level notice"
@@ -776,45 +817,6 @@ mod tests {
         assert!(
             !delivers(&first_tab, &first_tab_focused, true),
             "session 0's own notice is suppressed (control)"
-        );
-    }
-
-    /// The bounded delivery channel caps queue memory: with no receiver draining,
-    /// exactly `NOTIFY_QUEUE_CAP` `try_send`s fit, and the (N+1)th returns
-    /// `Full` WITHOUT blocking — so the engine callback drops the overflow and the
-    /// channel can never grow unbounded under an OSC 9/99/777 flood. Regression:
-    /// the queue was an UNBOUNDED `channel()` served by one blocking-subprocess
-    /// thread, so a flood grew memory without bound / spammed subprocesses.
-    #[test]
-    fn bounded_channel_drops_on_full_without_blocking() {
-        // Hold the receiver so try_send reports `Full` (a dropped rx would report
-        // `Disconnected` instead) — this mirrors the live delivery thread parked
-        // on recv() while a burst outruns the ~100ms-per-notifier drain.
-        let (tx, _rx) = std::sync::mpsc::sync_channel::<NotifyMsg>(NOTIFY_QUEUE_CAP);
-
-        // The first N messages fit in the bounded buffer.
-        for i in 0..NOTIFY_QUEUE_CAP {
-            tx.try_send(msg(i as u64))
-                .expect("the first NOTIFY_QUEUE_CAP messages fit the bounded queue");
-        }
-
-        // The (N+1)th try_send does NOT block; it returns Full so the producer
-        // drops it — queue memory stays bounded by NOTIFY_QUEUE_CAP.
-        assert!(
-            matches!(tx.try_send(msg(999)), Err(TrySendError::Full(_))),
-            "once the bounded queue is full, try_send must return Full (drop-on-full), \
-             never block or grow the queue"
-        );
-
-        // Draining one slot re-opens exactly one, confirming the bound holds
-        // steady-state (not a one-shot): after one recv, one more try_send fits,
-        // then it is Full again.
-        let _ = _rx.recv().expect("a queued message drains");
-        tx.try_send(msg(1000))
-            .expect("one drained slot admits exactly one more message");
-        assert!(
-            matches!(tx.try_send(msg(1001)), Err(TrySendError::Full(_))),
-            "the queue is Full again after refilling the single drained slot"
         );
     }
 

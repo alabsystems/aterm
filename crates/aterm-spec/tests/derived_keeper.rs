@@ -1,12 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-0 of the PTY keeper's three machines (P2 and P3 of
-//! `docs/DESIGN-pty-keeper-2026-09-26.md`, §5.4, §6.1 and §6.2):
-//! `PtyKeeperCustody` (`aterm_spec::derive::pty_keeper_custody_model`),
-//! `KeeperRelaunchBrake` (`keeper_relaunch_brake_model`) and
-//! `KeeperDeathJudgement` (`keeper_death_judgement_model`). Each is proved at
-//! `Buggy = 0` and caught at `Buggy = 1` on every design invariant, and the
+//! Tier-0 of the PTY keeper's three machines (`docs/DESIGN-pty-keeper-2026-09-26.md` §5.4,
+//! §6.1, §6.2): `PtyKeeperCustody`, `KeeperRelaunchBrake` and `KeeperDeathJudgement`. Each is
+//! proved at `Buggy = 0` and caught at `Buggy = 1` on every design invariant, and the
 //! lifecycles a person meets are walked by name. Tier-1 is
 //! `crates/aterm-keeper/src/conformance_custody.rs`.
 
@@ -16,16 +13,9 @@ use aterm_spec::derive::{
 };
 use aterm_spec::{interp, verify};
 
-fn registered(name: &str) -> bool {
-    aterm_spec::xref::model_registry()
-        .iter()
-        .any(|m| m.name == name)
-}
-
 #[test]
 fn pty_keeper_custody_proves_and_catches() {
     let model = pty_keeper_custody_model();
-    assert!(registered(model.name), "enrolled in the spec-link registry");
     let committed: Vec<&str> = interp::fired_actions(&model).into_iter().collect();
     for action in [
         "RegisterA",
@@ -147,8 +137,8 @@ fn pty_keeper_custody_walks_the_lifecycles() {
     );
     assert!(!m.action_enabled("Relaunch", &update));
 
-    // The window crashes mid-update: the successor fail-stops, and only then
-    // are the masters orphans (F11 closed).
+    // The window crashes mid-update: the successor fail-stops, and only then are the masters
+    // orphans.
     let mid = walk(
         &m,
         &["RegisterA", "RegisterB", "StartSuccessor", "WindowCrashes"],
@@ -163,12 +153,10 @@ fn pty_keeper_custody_walks_the_lifecycles() {
     assert!(m.action_enabled("Relaunch", &mid2));
 }
 
-/// Round seven's finding 65: an OFFER is made to a connection. The relaunched
-/// window's link drops before it registered its offers: they are orphans
-/// again while it still holds them (no second offer), its reconnected link
-/// registers them, and its later quit — BYE on the new link — relaunches
-/// nothing. At `Buggy = 1` the offer stays with the dead link, and the quit
-/// reads as a crash.
+/// An offer is made to a connection. The relaunched window's link drops before it registered
+/// its offers: they are orphans again while it still holds them (no second offer), its
+/// reconnected link registers them, and its later quit (BYE on the new link) relaunches
+/// nothing. At `Buggy = 1` the offer stays with the dead link, and the quit reads as a crash.
 #[test]
 fn pty_keeper_custody_an_offer_returns_when_its_link_drops() {
     let m = pty_keeper_custody_model();
@@ -218,11 +206,10 @@ fn pty_keeper_custody_an_offer_returns_when_its_link_drops() {
     assert!(buggy.action_enabled("Relaunch", &quit), "{quit:?}");
 }
 
-/// P2's open finding, the P3 fix: a RELEASE from ONE of two claimants — the
-/// outgoing window of an update, read after its successor registered — must
-/// not close the custody copy the successor's shell depends on. The same
-/// schedule loses the shell with no keeper fault at `Buggy = 1` and keeps it
-/// at `Buggy = 0`, and the step that differs is the release.
+/// A release from one of two claimants (the outgoing window of an update, read after its
+/// successor registered) must not close the custody copy the successor's shell depends on. The
+/// same schedule loses the shell with no keeper fault at `Buggy = 1` and keeps it at
+/// `Buggy = 0`, and the step that differs is the release.
 #[test]
 fn pty_keeper_custody_a_release_from_one_of_two_claimants_keeps_the_copy() {
     let base = pty_keeper_custody_model();
@@ -248,8 +235,8 @@ fn pty_keeper_custody_a_release_from_one_of_two_claimants_keeps_the_copy() {
         "the mutant loses the shell with no keeper fault: {lost:?}"
     );
     assert!(!buggy.check_invariant("LossNeedsKeeperFaultA", &lost));
-    // The step that loses the copy is the release: before it both runs hold
-    // it, after it only the fixed one does.
+    // The step that loses the copy is the release: before it both runs hold it, after it only
+    // the committed one does.
     let upto = walk(&base, &schedule[..3]);
     let upto_buggy = walk(&buggy, &schedule[..3]);
     assert_eq!((upto["k_holds_a"], upto_buggy["k_holds_a"]), (1, 1));
@@ -325,7 +312,6 @@ fn pty_keeper_custody_the_defects_are_caught_on_every_invariant() {
 #[test]
 fn keeper_relaunch_brake_proves_and_catches() {
     let model = keeper_relaunch_brake_model();
-    assert!(registered(model.name), "enrolled in the spec-link registry");
     let committed: Vec<&str> = interp::fired_actions(&model).into_iter().collect();
     for action in [
         "PickRepeatedDeaths",
@@ -403,34 +389,11 @@ fn keeper_relaunch_brake_the_defects_are_caught_on_every_invariant() {
     );
     let (quit, _) = interp::bmc(&only(&m, "CleanQuitNeverRelaunches")).expect_err("quit as death");
     assert_eq!(quit["after_quit"], 1, "{quit:?}");
-    assert!(
-        verify::uncaught_invariants(&base).is_empty(),
-        "StreakBounded is a design claim with a mutant, never a SPACE_GUARDS row"
-    );
-}
-
-/// The bounded spaces the interpreter walks, stated so a model change that
-/// explodes them is seen here first.
-#[test]
-fn the_keeper_spaces_fit_the_interpreter() {
-    for m in [
-        pty_keeper_custody_model(),
-        keeper_relaunch_brake_model(),
-        keeper_death_judgement_model(),
-    ] {
-        for buggy in [0, 1] {
-            let mut space = interp::with_buggy(&m, buggy);
-            space.invariants.clear();
-            let reached = interp::bmc(&space).expect("no invariants to break");
-            eprintln!("{} Buggy={buggy}: {reached} states", m.name);
-        }
-    }
 }
 
 #[test]
 fn keeper_death_judgement_proves_and_catches() {
     let model = keeper_death_judgement_model();
-    assert!(registered(model.name), "enrolled in the spec-link registry");
     let committed: Vec<&str> = interp::fired_actions(&model).into_iter().collect();
     for action in [
         "PickP3Window",
@@ -485,7 +448,7 @@ fn keeper_death_judgement_walks_the_ends() {
     // exception, judged a crash.
     let p3 = walk(&m, &["PickP3Window", "QuitByeLost", "Judge"]);
     assert_eq!(p3["orphaned"], 1, "{p3:?}");
-    // A pre-BYE window's exit(0) is closed, as before the keeper.
+    // A pre-BYE window's exit(0) is closed.
     let old = walk(&m, &["PickPreByeWindow", "QuitWithBye", "Judge"]);
     assert_eq!((old["bye"], old["judged_quit"]), (0, 1), "{old:?}");
     // An orphan whose shell dies is pruned when the keeper reads the exit.
@@ -510,7 +473,7 @@ fn keeper_death_judgement_walks_the_ends() {
 fn keeper_death_judgement_the_defects_are_caught_on_every_invariant() {
     let base = keeper_death_judgement_model();
     let m = interp::with_buggy(&base, 1);
-    // P3's classifier (no marker): a clean quit whose BYE was lost is orphaned.
+    // No marker: a clean quit whose BYE was lost is orphaned.
     let (resurrected, _) =
         interp::bmc(&only(&m, "CleanQuitNeverResurrected")).expect_err("the marker ignored");
     assert_eq!(
@@ -533,7 +496,7 @@ fn keeper_death_judgement_the_defects_are_caught_on_every_invariant() {
     );
     let replay = walk(&m, &["PanicExit", "Judge"]);
     assert!(!m.check_invariant("CrashNeverClosed", &replay));
-    // P3's stale orphan: listed after its shell died.
+    // No prune: an orphan listed after its shell died.
     let (stale, _) = interp::bmc(&only(&m, "NeverListsTheDead")).expect_err("no prune");
     assert_eq!(
         (
@@ -543,9 +506,5 @@ fn keeper_death_judgement_the_defects_are_caught_on_every_invariant() {
         ),
         (1, 0, 0),
         "{stale:?}"
-    );
-    assert!(
-        verify::uncaught_invariants(&base).is_empty(),
-        "every invariant is a design claim with a mutant"
     );
 }

@@ -11,7 +11,7 @@
 //
 // The payload is built with the same grid calls (`get_history_line` +
 // `row_ansi_text_screen`) and layout as `AtermTerminal::serialize`; the wasm
-// bench (tools/wasm-bench) times the real export end to end.
+// lane of `verify perf` times the real export end to end.
 
 use std::hint::black_box;
 use std::time::Instant;

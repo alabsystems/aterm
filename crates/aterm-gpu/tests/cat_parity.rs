@@ -1,13 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// Peeking-cat sprite (`cat_quads` + `cat_atlas`) CPU/GPU parity. The cat is a
-// NEAREST 1:1 regime (bake == dest size; shared RGBA texels), so its
-// effect-only delta is held to target <= 1, hard bar <= 2. Also covered:
-//   * an opaque sixel image hides the sprite on both backends;
-//   * empty cat fields are byte-identical on the GPU, also after clear_overlays;
-//   * the cached path repaints a moved cat without ghosting (cached == fresh
-//     per backend) and a settled cat takes the dirty gate.
+// Peeking-cat sprite (`cat_quads` + `cat_atlas`) CPU/GPU parity. The cat is a NEAREST 1:1
+// regime (bake == dest size, shared RGBA texels), so its effect-only delta is held to target
+// <= 1, hard bar <= 2. Also: an opaque sixel hides the sprite, a moved cat repaints without
+// ghosting and a settled one takes the dirty gate, and malformed quads are refused.
 //
 // No GPU or no font: the tests no-op.
 
@@ -69,16 +66,13 @@ fn quad_1to1(row: u16, dest: [u16; 4], src_xy: [u16; 2], alpha: u8) -> SpriteQua
     }
 }
 
-/// Cat parity. The base frame (full-block glyphs + background) is byte-exact
-/// CPU==GPU, so the measured delta is the cat's alone. Quads cover 1:1 over
-/// blank bg (opaque and partial-alpha texels), 1:1 over text, a quad-level
-/// alpha multiplier and a flipped quad. Target <= 1, hard bar <= 2.
+/// The base frame (full-block glyphs + bg) is byte-exact CPU==GPU, so the measured delta is the
+/// cat's alone: 1:1 quads over blank bg (opaque and partial-alpha texels) and over text, a
+/// quad-level alpha multiplier and a flipped quad.
 #[test]
 fn cat_effect_only_parity_pinned_over_bg_and_text() {
     let theme = Theme::default();
-    let Some((mut cpu, mut gpu)) = backends(18.0, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(18.0, theme);
     let mut win = aterm_gpu::WindowGpu::new();
     let (cw, ch) = cpu.cell_size();
     let (rows, cols) = (6usize, 16usize);
@@ -101,9 +95,9 @@ fn cat_effect_only_parity_pinned_over_bg_and_text() {
     input.cat_quads = vec![
         // Over blank bg, opaque texels (atlas top half).
         quad_1to1(3, [4, (3 * ch) as u16, 40, hh], [2, 0], 255),
-        // Over the block TEXT, opaque texels.
+        // Over the block text, opaque texels.
         quad_1to1(0, [2, 0, 48, hh], [8, 0], 255),
-        // Over blank bg, PARTIAL-alpha texels (atlas bottom half) — real blending.
+        // Over blank bg, partial-alpha texels (atlas bottom half): real blending.
         quad_1to1(
             4,
             [8, (4 * ch) as u16, 32, (ch as u16).min(30)],
@@ -137,29 +131,21 @@ fn cat_effect_only_parity_pinned_over_bg_and_text() {
     );
 }
 
-/// An opaque sixel image hides the cat on both backends (the CPU stamps
-/// sprites before the inline image, the GPU draws the cat stream in
-/// `emit_base_pre` before it), so with-cat and without-cat frames are
-/// byte-identical per backend. Full coverage of the quad is checked, so the
-/// equality cannot pass on a frame that draws nothing.
+/// An opaque sixel image hides the cat on both backends (each draws sprites before inline
+/// images), so with-cat and without-cat frames are byte-identical per backend. Full coverage
+/// of the quad is checked, so the equality cannot pass on a frame that draws nothing.
 #[test]
 fn cat_under_opaque_sixel_is_hidden_on_both_backends() {
     let theme = Theme::default();
-    let Some((mut cpu, mut gpu)) = backends(18.0, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(18.0, theme);
     let mut win = aterm_gpu::WindowGpu::new();
     let (cw, ch) = cpu.cell_size();
     let (rows, cols) = (4usize, 8usize);
 
-    // A real sixel DCS: raster 2*cw px wide x ch px tall, all opaque red,
-    // filling the 2x1-cell footprint. Images paint at their own pixel size,
-    // so the raster is built to the live cell height and `red_px` checks the
-    // coverage.
-    //
-    // Sixel writes six pixel rows per data char: `ch / 6` full bands (`~`)
-    // plus, when `ch` is not a multiple of six, one partial band with the low
-    // `ch % 6` bits set (`?` + (2^rem - 1)).
+    // A real sixel DCS: an opaque red raster 2*cw x ch px filling the 2x1-cell footprint
+    // (images paint at their own pixel size, so it is built to the live cell height). Sixel
+    // writes six pixel rows per data char: `ch / 6` full bands (`~`) plus, when `ch` is not a
+    // multiple of six, one partial band with the low `ch % 6` bits set (`?` + (2^rem - 1)).
     let mut dcs: Vec<u8> = Vec::new();
     dcs.extend_from_slice(format!("\x1bP0;0;8q\"1;1;{};{ch}#1;2;100;0;0#1", 2 * cw).as_bytes());
     for _ in 0..ch / 6 {
@@ -184,7 +170,7 @@ fn cat_under_opaque_sixel_is_hidden_on_both_backends() {
     let base_input = term.cell_frame(rows, cols);
     let mut input = term.cell_frame(rows, cols);
     input.cat_atlas = Some(Arc::new(cat_atlas(1)));
-    // The quad sits fully INSIDE the image's 2-cell footprint (opaque cover).
+    // The quad sits fully inside the image's 2-cell footprint (opaque cover).
     let hh = (ch as u16).min(32);
     input.cat_quads = vec![quad_1to1(0, [2, 0, (cw as u16) * 2 - 4, hh], [0, 0], 255)];
 
@@ -217,8 +203,7 @@ fn cat_under_opaque_sixel_is_hidden_on_both_backends() {
         "GPU: an opaque sixel must hide the cat sprite (cat draws before images)"
     );
 
-    // Control (non-vacuous): the SAME quad moved outside the image footprint
-    // paints on both backends.
+    // Control (non-vacuous): the same quad outside the image footprint paints on both backends.
     let mut moved = term.cell_frame(rows, cols);
     moved.cat_atlas = Some(Arc::new(cat_atlas(1)));
     moved.cat_quads = vec![quad_1to1(
@@ -246,9 +231,7 @@ fn cat_under_opaque_sixel_is_hidden_on_both_backends() {
 #[test]
 fn damaged_path_cat_no_ghosting_and_settled_gate_hit() {
     let theme = Theme::default();
-    let Some((mut cpu, mut gpu)) = backends(18.0, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(18.0, theme);
     let (_, ch) = cpu.cell_size();
     let (rows, cols) = (4usize, 12usize);
     // Glyph-free terminal: glyph AA overhang across a band boundary is an
@@ -279,20 +262,15 @@ fn damaged_path_cat_no_ghosting_and_settled_gate_hit() {
     );
 }
 
-/// A source rect overrunning the atlas is refused, and a quad tagged past the
-/// grid's last row is dropped, by both backends. The CPU naturally skips both
-/// (`stamp_cat_quad` bounds check; per-row stamping); the GPU needs explicit
-/// guards, since its ClampToEdge samplers would smear the atlas edge across
-/// the quad. `cat_quads` and `rain_quads` share the GPU builder.
-///
-/// The in-bounds control in each arm (same quad, legal rect) must paint, and
-/// paint the same on both backends.
+/// A source rect overrunning the atlas is refused, and a quad tagged past the grid's last row
+/// dropped, on both backends. The CPU skips both naturally (`stamp_cat_quad`'s bounds check,
+/// per-row stamping); the GPU needs explicit guards, since its ClampToEdge samplers would smear
+/// the atlas edge across the quad. `cat_quads` and `rain_quads` share the GPU builder; each
+/// arm's in-bounds control must paint, the same on both backends.
 #[test]
 fn a_malformed_sprite_quad_is_refused_on_both_backends() {
     let theme = Theme::default();
-    let Some((mut cpu, mut gpu)) = backends(18.0, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(18.0, theme);
     let mut win = aterm_gpu::WindowGpu::new();
     let (_, ch) = cpu.cell_size();
     let (rows, cols) = (6usize, 16usize);

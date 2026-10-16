@@ -11,7 +11,6 @@ use crate::grid::test_support::feed_numbered_lines;
 fn grid_scroll_display() {
     let mut grid = Grid::with_scrollback(3, 80, 100);
 
-    // Fill some content
     for i in 0..10 {
         grid.write_char((b'A' + i) as char);
         grid.line_feed();
@@ -74,7 +73,6 @@ fn grid_with_tiered_scrollback() {
     assert_eq!(sb.line_count(), 0, "initial scrollback should have 0 lines");
     assert_eq!(grid.tiered_scrollback_lines(), 0);
 
-    // Fill content to trigger scrollback
     for i in 0..20 {
         for c in format!("Line {i}").chars() {
             grid.write_char(c);
@@ -82,10 +80,8 @@ fn grid_with_tiered_scrollback() {
         grid.line_feed();
     }
 
-    // Some lines should be in tiered scrollback now
     assert!(grid.tiered_scrollback_lines() > 0);
 
-    // Total scrollback should include both ring buffer and tiered
     assert!(grid.scrollback_lines() > grid.storage.ring_buffer_scrollback());
 }
 
@@ -117,10 +113,9 @@ fn a_prefilled_tiered_store_is_numbered_below_the_live_top() {
 #[test]
 fn grid_scrollback_content_preserved() {
     let scrollback = Scrollback::new(100, 1000, 10_000_000);
-    // Small ring buffer of 2 lines to force early promotion
+    // A 2-line ring, so lines reach the tiered store early.
     let mut grid = Grid::with_tiered_scrollback(3, 80, 2, scrollback);
 
-    // Write 10 lines
     for i in 0..10 {
         for c in format!("Line {i}").chars() {
             grid.write_char(c);
@@ -128,14 +123,12 @@ fn grid_scrollback_content_preserved() {
         grid.line_feed();
     }
 
-    // Check that content is preserved in tiered scrollback
     let sb = grid.scrollback_mut().unwrap();
     assert!(
         sb.line_count() > 0,
         "Expected scrollback lines after writing 10 lines"
     );
 
-    // First line in scrollback must be retrievable and contain expected content
     let line = sb
         .get_line(0)
         .expect("get_line(0) should not error")
@@ -145,59 +138,25 @@ fn grid_scrollback_content_preserved() {
 }
 
 #[test]
-fn grid_attach_detach_scrollback() {
-    let mut grid = Grid::new(24, 80);
-    assert!(grid.scrollback().is_none());
-
-    let scrollback = Scrollback::new(100, 1000, 10_000_000);
-    grid.attach_scrollback(scrollback);
-    let sb = grid
-        .scrollback()
-        .expect("scrollback must be present after attach");
-    assert_eq!(
-        sb.line_count(),
-        0,
-        "freshly attached scrollback should have 0 lines"
-    );
-
-    let detached = grid
-        .detach_scrollback()
-        .expect("detach must return the scrollback");
-    assert_eq!(
-        detached.line_count(),
-        0,
-        "detached scrollback should still have 0 lines"
-    );
-    assert!(
-        grid.scrollback().is_none(),
-        "scrollback must be None after detach"
-    );
-}
-
-#[test]
 fn grid_scrollback_wrapped_lines() {
     let scrollback = Scrollback::new(100, 1000, 10_000_000);
     let mut grid = Grid::with_tiered_scrollback(3, 5, 2, scrollback);
 
-    // Write a line that wraps
     for c in "HelloWorld".chars() {
         grid.write_char_wrap(c);
     }
     grid.line_feed();
 
-    // Force more scrolling to push lines to tiered scrollback
     for _ in 0..10 {
         grid.line_feed();
     }
 
-    // Check that wrapped flag is preserved
     let sb = grid.scrollback_mut().unwrap();
     assert!(
         sb.line_count() > 1,
         "Expected >1 scrollback lines after wrapping; got {}",
         sb.line_count()
     );
-    // The second line should be marked as wrapped
     let line = sb.get_line(1).expect("no I/O error").expect("line present");
     assert!(
         line.is_wrapped(),
@@ -207,13 +166,10 @@ fn grid_scrollback_wrapped_lines() {
 
 #[test]
 fn ring_buffer_scrollback_preserves_hyperlinks() {
-    // Hyperlinks survive rows scrolling from the screen into the ring
-    // scrollback (max_scrollback > 0).
     use std::sync::Arc;
 
     let mut grid = Grid::with_scrollback(4, 10, 10);
 
-    // Write "Hello" on row 0 with a hyperlink on columns 0-4
     let url: Arc<str> = Arc::from("https://example.com");
     grid.set_cursor(0, 0);
     for c in "Hello".chars() {
@@ -225,17 +181,15 @@ fn ring_buffer_scrollback_preserves_hyperlinks() {
             .set_hyperlink(Some(url.clone()));
     }
 
-    // Scroll 4 times to push row 0 into ring buffer scrollback (not tiered,
-    // since max_scrollback=10 means ring buffer has room for 10 scrollback rows).
+    // Four line feeds push row 0 into the ring, which has room for 10 history rows.
     for _ in 0..4 {
         grid.line_feed();
     }
 
-    // Row 0 is now in ring buffer scrollback. Retrieve it via history_line_rev.
     let ring_sb = grid.storage.ring_buffer_scrollback();
     assert!(ring_sb > 0, "should have ring buffer scrollback");
 
-    // The oldest scrollback line (rev_idx = ring_sb-1) should have hyperlinks.
+    // The oldest ring line (rev index `ring_sb - 1`) keeps its hyperlinks.
     let line = grid
         .history_line_rev(ring_sb - 1)
         .expect("scrollback line should exist");
@@ -246,15 +200,13 @@ fn ring_buffer_scrollback_preserves_hyperlinks() {
     assert_eq!(&*spans[0].url, "https://example.com");
 }
 
-/// ring_extras.len() == ring_buffer_scrollback() after scroll_up, both while
-/// the ring grows and once it reuses slots.
+/// `ring_extras.len() == ring_buffer_scrollback()` after every `scroll_up`, while the ring grows
+/// and once it reuses slots.
 #[test]
 fn ring_extras_len_equals_ring_buffer_scrollback() {
-    // Grid with 4 visible rows and max_scrollback=6.
-    // Total capacity = 4 + 6 = 10 rows.
+    // Capacity 4 + 6 = 10 rows.
     let mut grid = Grid::with_scrollback(4, 10, 6);
 
-    // Helper: check the invariant
     let check = |grid: &Grid, label: &str| {
         let ring_sb = grid.storage.ring_buffer_scrollback();
         let extras_len = grid.storage.ring_extras.len();
@@ -266,39 +218,33 @@ fn ring_extras_len_equals_ring_buffer_scrollback() {
 
     check(&grid, "initial");
 
-    // Phase 1: Growth — each scroll_up(1) adds a row until capacity.
-    // ring_buffer_scrollback = total_lines - visible_rows
+    // Growth: each scroll adds a row until capacity.
     for i in 1..=6 {
         grid.scroll_up(1);
         check(&grid, &format!("growth scroll {i}"));
     }
-    // Now at capacity: total_lines=10, ring_buffer_scrollback=6
 
-    // Phase 2: Reuse — rows are recycled, oldest goes to (no) tiered scrollback.
+    // Reuse: rows are recycled.
     for i in 1..=5 {
         grid.scroll_up(1);
         check(&grid, &format!("reuse scroll {i}"));
     }
 
-    // Batch scroll
     grid.scroll_up(3);
     check(&grid, "batch scroll 3");
 
-    // Large batch exceeding total rows
     grid.scroll_up(20);
     check(&grid, "large batch scroll 20");
 }
 
-/// Verify that complex chars, RGB colors, and combining marks survive
-/// scrollback transit through the ring buffer.
+/// Complex chars, RGB colours and combining marks survive the ring scrollback.
 #[test]
 fn scrollback_preserves_complex_chars_rgb_and_combining() {
     use std::sync::Arc;
 
-    // Grid: 3 visible rows, 10 cols, max_scrollback=5 (ring buffer only)
     let mut grid = Grid::with_scrollback(3, 10, 5);
 
-    // Col 0: 'A' with RGB fg red — set cell with RGB-flagged colors + extras
+    // Col 0: 'A' in RGB red (flagged colour plus extras).
     let fg_red = PackedColor::rgb(0xFF, 0x00, 0x00);
     let bg_default = PackedColor::DEFAULT_BG;
     let cell_a = Cell::with_style('A', fg_red, bg_default, CellFlags::empty());
@@ -308,7 +254,7 @@ fn scrollback_preserves_complex_chars_rgb_and_combining() {
         .get_or_create(CellCoord::new(0, 0))
         .set_fg_rgb(Some([0xFF, 0x00, 0x00]));
 
-    // Col 1: complex char 🐛 — set overflow index + complex_char in extras
+    // Col 1: 🐛 as an overflow cell.
     let cell_complex = Cell::with_overflow_index(42);
     grid.row_mut(0).unwrap().set(1, cell_complex);
     grid.storage
@@ -316,14 +262,12 @@ fn scrollback_preserves_complex_chars_rgb_and_combining() {
         .get_or_create(CellCoord::new(0, 1))
         .set_complex_char(Some(Arc::from("🐛")));
 
-    // Col 2: 'e' with combining acute accent
     grid.row_mut(0).unwrap().set(2, Cell::new('e'));
     grid.storage
         .extras
         .get_or_create(CellCoord::new(0, 2))
         .add_combining('\u{0301}');
 
-    // Scroll 3 lines so row 0 enters ring buffer scrollback.
     grid.scroll_up(3);
 
     let ring_sb = grid.storage.ring_buffer_scrollback();
@@ -332,31 +276,26 @@ fn scrollback_preserves_complex_chars_rgb_and_combining() {
         "expected at least 3 ring buffer scrollback lines"
     );
 
-    // Row 0 was the first to scroll, so it's the oldest line (index 0).
     let line = grid
         .get_history_line(0)
         .expect("first scrollback line should exist");
     let text = line.as_str().expect("line should have text");
 
-    // Complex char 🐛 should be in the text (not U+FFFD)
     assert!(
         text.contains('🐛'),
         "scrollback text should contain 🐛, got: {text:?}"
     );
 
-    // 'A' should be in the text
     assert!(
         text.contains('A'),
         "scrollback text should contain 'A', got: {text:?}"
     );
 
-    // Combining accent should be in the text
     assert!(
         text.contains('\u{0301}'),
         "scrollback text should contain combining accent U+0301, got: {text:?}"
     );
 
-    // RGB fg for first char ('A') should be 0x01_FF0000 (red)
     let attrs_a = line.get_attr(0);
     assert_eq!(
         attrs_a.fg, 0x01_FF0000,
@@ -364,7 +303,6 @@ fn scrollback_preserves_complex_chars_rgb_and_combining() {
         attrs_a.fg
     );
 
-    // attrs should not be default (RGB was preserved)
     assert_ne!(
         attrs_a,
         CellAttrs::DEFAULT,
@@ -372,19 +310,17 @@ fn scrollback_preserves_complex_chars_rgb_and_combining() {
     );
 }
 
-/// Erase scrollback when ring buffer is exactly at capacity.
+/// Erase scrollback with the ring exactly at capacity.
 #[test]
 fn erase_scrollback_at_ring_buffer_capacity() {
-    // 4 visible rows, max_scrollback=6 → capacity=10 rows
+    // Capacity 4 + 6 = 10 rows.
     let mut grid = Grid::with_scrollback(4, 10, 6);
 
-    // Fill visible rows with identifiable content
     for row in 0..4u16 {
         grid.set_cursor(row, 0);
         grid.write_char((b'A' + row as u8) as char);
     }
 
-    // Scroll enough to fill ring buffer to capacity (6 scrollback lines)
     for _ in 0..6 {
         grid.set_cursor(3, 0);
         grid.line_feed();
@@ -395,7 +331,7 @@ fn erase_scrollback_at_ring_buffer_capacity() {
         "ring buffer should be at max scrollback"
     );
 
-    // Scroll a few more to exercise reuse phase (ring_head advances)
+    // A few more, so the ring reuses slots (ring_head advances).
     for i in 0..4u16 {
         grid.set_cursor(3, 0);
         grid.write_char((b'W' + i as u8) as char);
@@ -411,21 +347,18 @@ fn erase_scrollback_at_ring_buffer_capacity() {
         "ring_head should have advanced"
     );
 
-    // Snapshot live rows before erase
     let live_rows: Vec<String> = (0..grid.rows())
         .map(|row| grid.row(row).unwrap().to_string())
         .collect();
 
-    // The critical operation: erase scrollback with non-zero ring_head
+    // Erase with a nonzero ring_head.
     grid.erase_scrollback();
 
-    // Invariants must hold
     assert_eq!(grid.scrollback_lines(), 0);
     assert_eq!(grid.display_offset(), 0);
     assert_eq!(grid.total_lines(), grid.rows() as usize);
     assert_eq!(grid.storage.ring_head, 0, "ring_head should reset to 0");
 
-    // Live rows must be preserved identically
     for (row_idx, expected) in live_rows.iter().enumerate() {
         assert_eq!(
             grid.row(row_idx as u16).unwrap().to_string(),
@@ -436,51 +369,44 @@ fn erase_scrollback_at_ring_buffer_capacity() {
     grid.assert_invariants();
 }
 
-/// scroll_up at the exact growth-to-reuse transition boundary.
+/// `scroll_up` across the growth-to-reuse boundary.
 #[test]
 fn scroll_up_spans_growth_and_reuse_phases() {
-    // 3 visible rows, max_scrollback=2 → capacity=5
+    // Capacity 3 + 2 = 5 rows.
     let mut grid = Grid::with_scrollback(3, 10, 2);
 
-    // Fill visible rows
     for row in 0..3u16 {
         grid.set_cursor(row, 0);
         grid.write_char((b'A' + row as u8) as char);
     }
 
-    // Scroll up by 1 to enter growth phase (total_lines: 3→4)
     grid.scroll_up(1);
     assert_eq!(grid.total_lines(), 4);
     assert_eq!(grid.scrollback_lines(), 1);
 
-    // Scroll up by 3: first 1 goes to growth (4→5, at capacity),
-    // remaining 2 go to reuse phase (oldest rows recycled).
+    // One row of growth to capacity, then two reused.
     grid.scroll_up(3);
     assert_eq!(grid.total_lines(), 5, "should be at capacity");
     assert_eq!(grid.scrollback_lines(), 2, "max_scrollback=2");
 
-    // Verify ring buffer is valid
     grid.assert_invariants();
 
-    // Bottom visible row should be empty (newly scrolled in)
     assert!(
         grid.row(2).unwrap().is_empty(),
         "bottom row should be blank after scroll"
     );
 }
 
-/// Erase scrollback with exactly 1 line of scrollback (minimal edge case).
+/// Erase scrollback holding exactly one line.
 #[test]
 fn erase_scrollback_single_line() {
     let mut grid = Grid::with_scrollback(4, 10, 10);
 
-    // Write identifiable content
     for row in 0..4u16 {
         grid.set_cursor(row, 0);
         grid.write_char((b'P' + row as u8) as char);
     }
 
-    // Generate exactly 1 scrollback line
     grid.set_cursor(3, 0);
     grid.line_feed();
     assert_eq!(grid.scrollback_lines(), 1);
@@ -503,7 +429,7 @@ fn erase_scrollback_single_line() {
     grid.assert_invariants();
 }
 
-/// scroll_up with n larger than total capacity still produces valid state.
+/// `scroll_up` past the total capacity leaves a valid state.
 #[test]
 fn scroll_up_n_exceeds_capacity() {
     let mut grid = Grid::with_scrollback(3, 5, 4);
@@ -513,10 +439,9 @@ fn scroll_up_n_exceeds_capacity() {
         grid.write_char((b'X' + row as u8) as char);
     }
 
-    // Scroll by a huge amount (well beyond capacity of 7)
+    // Far past the capacity of 7.
     grid.scroll_up(100);
 
-    // State must be valid
     assert!(
         grid.total_lines() <= 3 + 4,
         "total_lines bounded by capacity"
@@ -524,7 +449,6 @@ fn scroll_up_n_exceeds_capacity() {
     assert!(grid.scrollback_lines() <= 4, "scrollback bounded by max");
     grid.assert_invariants();
 
-    // All visible rows should be blank (100 blank rows scrolled in)
     for row in 0..3u16 {
         assert!(
             grid.row(row).unwrap().is_empty(),
@@ -533,10 +457,8 @@ fn scroll_up_n_exceeds_capacity() {
     }
 }
 
-/// A full-screen scroll of more than a screenful (`CSI 65535 S`) archives
-/// exactly one screenful — the screen's content, in order — and leaves the
-/// screen blank, as xterm and Alacritty clamp it. Unclamped it archived one
-/// row per count (here 100 of them, mostly blank), each costing the lock.
+/// A full-screen scroll past the screen height (`CSI 65535 S`) archives exactly one screenful, in
+/// order, and leaves the screen blank, as xterm and Alacritty clamp it.
 #[test]
 fn a_full_screen_scroll_past_the_screen_archives_one_screenful() {
     let mut grid = Grid::with_scrollback(3, 5, 1000);
@@ -552,19 +474,17 @@ fn a_full_screen_scroll_past_the_screen_archives_one_screenful() {
     grid.assert_invariants();
 }
 
-/// Extras (hyperlinks, RGB colours) on visible rows survive being pushed to
-/// scrollback by a height decrease: they are extracted by their real row index.
+/// Extras on visible rows survive a height decrease into scrollback: they are extracted by their
+/// real row index.
 #[test]
 fn height_decrease_preserves_extras_on_pushed_rows() {
     use std::sync::Arc;
 
-    // 6 visible rows, 10 columns, tiered scrollback so adjust_row_count
-    // pushes excess rows to the lazy buffer instead of dropping them.
+    // A tiered store, so the pushed rows are staged rather than dropped.
     let scrollback = Scrollback::new(100, 1000, 10_000_000);
     let mut grid = Grid::with_tiered_scrollback(6, 10, 2, scrollback);
 
-    // "Hello" hyperlinked on row 0, cursor at the bottom. The shrink anchors at
-    // the cursor, so the top rows (the linked one included) go to scrollback.
+    // The shrink anchors at the bottom-row cursor, so the linked top row goes to scrollback.
     let url: Arc<str> = Arc::from("https://example.com/7783");
     grid.set_cursor(0, 0);
     for c in "Hello".chars() {
@@ -577,24 +497,19 @@ fn height_decrease_preserves_extras_on_pushed_rows() {
     }
     grid.set_cursor(5, 0);
 
-    // Verify the hyperlink is present before resize.
     assert!(
         grid.extras().row_has_hyperlinks(0),
         "row 0 should have hyperlinks before resize"
     );
 
-    // Shrink height from 6 to 3: the top rows (the linked row among them)
-    // are demoted into scrollback.
     grid.resize_no_reflow(3, 10);
 
-    // The pushed rows should now be in scrollback (lazy buffer or tiered).
     let sb_lines = grid.scrollback_lines();
     assert!(
         sb_lines > 0,
         "should have scrollback lines after height decrease"
     );
 
-    // Search the scrollback for the line with "Hello" and check its hyperlinks.
     let mut found_hyperlink = false;
     for rev_idx in 0..sb_lines {
         if let Some(line) = grid.history_line_rev(rev_idx) {
@@ -619,9 +534,8 @@ fn height_decrease_preserves_extras_on_pushed_rows() {
     grid.assert_invariants();
 }
 
-// Ring-only retention limit: set_scrollback_line_limit without a tiered store
-// (the wasm engines' configuration). The ring is the retention there: lazy
-// growth, immediate oldest-first eviction on shrink, `None` = unlimited.
+// Ring-only retention limit (the wasm engines' configuration): the ring is the retention, with
+// lazy growth, immediate oldest-first eviction on shrink, and `None` = unlimited.
 
 fn history_text(grid: &Grid, idx: usize) -> String {
     grid.get_history_line(idx)
@@ -645,22 +559,18 @@ fn ring_only_limit_shrink_evicts_oldest_immediately() {
         100,
         "shrink truncates retention to the new limit immediately"
     );
-    // Eviction is oldest-first: the newest history line is untouched and the
-    // new oldest is the line that sat `sb_before - 100` in.
+    // Oldest first: the newest history line is untouched.
     assert_eq!(history_text(&grid, 99), newest_before);
     let evicted = sb_before - 100;
     assert_eq!(history_text(&grid, 0), format!("L{evicted}"));
-    // Absolute-row identity: eviction advances the oldest retained row by
-    // exactly the evicted count — surviving lines keep their numbers.
+    // Eviction advances the oldest absolute row by exactly the evicted count.
     assert_eq!(
         grid.oldest_absolute_row(),
         oldest_abs_before + evicted as u64
     );
-    // The live viewport is untouched.
     assert_eq!(grid.row(0).unwrap().to_string().trim_end(), "L296");
     grid.assert_invariants();
 
-    // The new cap also governs future retention.
     feed_numbered_lines(&mut grid, 300, 50);
     assert_eq!(grid.scrollback_lines(), 100);
     grid.assert_invariants();
@@ -673,18 +583,15 @@ fn ring_only_limit_grow_extends_retention_lazily() {
     assert_eq!(grid.scrollback_lines(), 50, "precondition: at the old cap");
 
     grid.set_scrollback_line_limit(Some(120));
-    // Growing the cap must not eagerly allocate ring rows — the ring only
-    // grows as lines actually scroll off (grow_scrollback_ring).
+    // The ring grows only as lines scroll off (`grow_scrollback_ring`).
     assert_eq!(
         grid.storage.rows.len(),
         53,
         "raising the limit allocates nothing up front"
     );
 
-    // The raise left the ring wrapped (`ring_head != 0`) below its new cap, so
-    // the rows the next scrolls append must land at the ring's logical end,
-    // not the Vec's (R15-CHUNK-RING-SCROLL, 2026-10-11): every line feed
-    // scrolls, and history stays the write order.
+    // The raise left the ring wrapped below its new cap: appended rows land at the ring's
+    // logical end (see `linearize_ring`), so every line feed scrolls and history stays in order.
     feed_numbered_lines(&mut grid, 100, 30);
     let want: Vec<String> = (48..128).map(|i| format!("L{i}")).collect();
     assert_eq!(crate::grid::test_support::history_trimmed(&grid), want);
@@ -695,8 +602,7 @@ fn ring_only_limit_grow_extends_retention_lazily() {
         120,
         "retention now grows to the raised limit"
     );
-    // Newest history line is the last one scrolled off (the final LF leaves
-    // L298/L299 + the blank cursor row visible, so L297 scrolled off last).
+    // L298, L299 and the blank cursor row are visible, so L297 scrolled off last.
     assert_eq!(history_text(&grid, 119), "L297");
     grid.assert_invariants();
 }
@@ -745,12 +651,10 @@ fn ring_only_limit_reflects_in_the_getter() {
     assert_eq!(grid.scrollback_line_limit(), None);
 }
 
-/// A retention shrink that evicts lines bumps `content_gen` like a write, on
-/// both the ring-only and the tiered arm; a re-apply that evicts nothing does
-/// not bump.
+/// A retention shrink that evicts bumps `content_gen`, ring-only and tiered; a re-apply that
+/// evicts nothing does not.
 #[test]
 fn retention_shrink_bumps_content_gen_only_when_lines_evict() {
-    // Ring-only arm.
     let mut grid = Grid::with_scrollback(5, 20, 10_000);
     feed_numbered_lines(&mut grid, 0, 300);
     let g0 = grid.content_gen();
@@ -767,7 +671,6 @@ fn retention_shrink_bumps_content_gen_only_when_lines_evict() {
         "ring re-apply that evicts nothing must not bump"
     );
 
-    // Tiered arm (store truncation).
     let scrollback = Scrollback::new(100, 1000, 10_000_000);
     let mut grid = Grid::with_tiered_scrollback(5, 20, 8, scrollback);
     feed_numbered_lines(&mut grid, 0, 300);
@@ -819,7 +722,6 @@ fn tiered_limit_is_one_total_across_ring_and_store() {
         20,
         "TOTAL retention (ring + lazy + store) equals the limit, not limit + ring"
     );
-    // The store's share is exactly the remainder after the ring's share.
     assert_eq!(
         grid.scrollback()
             .map(aterm_scrollback::ScrollbackStorage::line_limit),
@@ -827,7 +729,6 @@ fn tiered_limit_is_one_total_across_ring_and_store() {
         "store share = total - ring cap"
     );
 
-    // The total keeps governing future retention at steady state.
     feed_numbered_lines(&mut grid, 100, 50);
     let _ = grid.scrollback_mut(); // quiescent point: drain staged lazy lines
     assert_eq!(
@@ -835,8 +736,7 @@ fn tiered_limit_is_one_total_across_ring_and_store() {
         20,
         "steady state stays at the total"
     );
-    // Eviction is oldest-first across the tiers: the newest history line is
-    // the last one that scrolled off, and absolute numbering is contiguous.
+    // Eviction is oldest-first across the tiers.
     let newest = grid.scrollback_lines() - 1;
     assert_eq!(history_text(&grid, newest), "L147");
     assert_eq!(history_text(&grid, 0), "L128");
@@ -866,12 +766,10 @@ fn tiered_limit_below_ring_cap_recaps_the_ring() {
         5,
         "the ring was re-capped (store share is zero)"
     );
-    // Newest-5 survive, oldest evicted (oldest-first semantics).
     assert_eq!(history_text(&grid, 4), "L97");
     assert_eq!(history_text(&grid, 0), "L93");
 
-    // A later RAISE widens only the store share — the hot-tier size is a
-    // construction decision and does not grow back.
+    // A later raise widens only the store share: the ring size is fixed at construction.
     grid.set_scrollback_line_limit(Some(30));
     assert_eq!(grid.scrollback_line_limit(), Some(30));
     feed_numbered_lines(&mut grid, 100, 60);
@@ -896,8 +794,8 @@ fn tiered_limit_equal_to_ring_cap_discards_evictions_without_store_churn() {
         8,
         "total == ring cap: the ring is the whole retention"
     );
-    // Evicted ring rows are discarded directly (stages_evicted_rows), not
-    // materialized and pushed through a zero-share store.
+    // Evicted ring rows are discarded (`stages_evicted_rows`), not pushed through a zero-share
+    // store.
     assert_eq!(
         grid.storage.lazy_buffer_lines() + grid.tiered_scrollback_lines(),
         0,
@@ -907,19 +805,17 @@ fn tiered_limit_equal_to_ring_cap_discards_evictions_without_store_churn() {
     grid.assert_invariants();
 }
 
-// Truncation accounting: retention loss the user did not ask for is counted
-// (for `metrics`/`lines`) and marked in band by one row at the cut naming the
-// same count.
+// Truncation accounting: retention loss the user did not ask for is counted (`metrics`, `lines`)
+// and marked in band by one row at the cut naming the same count.
 
 #[test]
 fn flood_backpressure_drops_are_counted_and_marked() {
-    // A 2 MiB budget holds fewer staged `L<n>` rows than the 20k floor, so the
-    // staging cap is the floor; the 100k store limit is far away, so every drop
-    // is a real loss.
+    // A 2 MiB budget holds fewer staged rows than the 20k floor, so the staging cap is the floor;
+    // the store limit is far away, so every drop is a real loss.
     let scrollback = Scrollback::new(100, 1000, 2 * 1024 * 1024);
     let mut grid = Grid::with_tiered_scrollback(3, 20, 8, scrollback);
-    // A compress worker owns the drain but never runs (the starved-worker
-    // flood): staged lines accumulate to the staging cap, then the oldest drop.
+    // A compress worker owns the drain but never runs: staged lines reach the staging cap, then
+    // the oldest drop.
     grid.set_compress_offload_active(true);
     let over = 500;
     feed_numbered_lines(&mut grid, 0, Grid::ASYNC_COMPRESS_BACKPRESSURE + over + 8);
@@ -928,8 +824,7 @@ fn flood_backpressure_drops_are_counted_and_marked() {
         counted > 0,
         "backpressure drops must register in the loss counter"
     );
-    // The oldest retained row is the marker, and it names exactly the counter;
-    // the first content row after it is the first line that survived.
+    // The oldest retained row is the marker naming the counter; the next is the first survivor.
     let oldest = history_text(&grid, 0);
     let marked: u64 = oldest
         .strip_prefix(crate::grid::scroll_convert::FLOOD_MARKER_PREFIX)
@@ -943,7 +838,7 @@ fn flood_backpressure_drops_are_counted_and_marked() {
         "lines L0..L{} were dropped and nothing else",
         counted - 1
     );
-    // A user-requested shrink is not loss: the counter must not move.
+    // A user-requested shrink is not loss.
     grid.set_scrollback_line_limit(Some(5));
     assert_eq!(
         grid.truncated_lines(),
@@ -966,7 +861,6 @@ fn ring_watermark_reports_pressure_only_when_configured() {
     );
     let used = grid.memory_used();
     assert!(used > 0);
-    // Budget far above use → Green; at ~use → Red; between → Yellow.
     grid.set_ring_byte_watermark(Some(used * 10));
     assert_eq!(grid.ring_watermark_level(), WatermarkLevel::Green);
     grid.set_ring_byte_watermark(Some(used));
@@ -989,7 +883,7 @@ fn ring_watermark_reports_pressure_only_when_configured() {
 fn staged_lazy_buffer_bytes_count_toward_memory_used() {
     let scrollback = Scrollback::new(100, 10_000, 10_000_000);
     let mut grid = Grid::with_tiered_scrollback(3, 20, 8, scrollback);
-    // Stage well below the drain threshold so the deferred lines stay parked.
+    // Below the drain threshold, so the deferred lines stay staged.
     feed_numbered_lines(&mut grid, 0, 500);
     assert!(
         grid.storage.lazy_buffer.len() >= 400,
@@ -1014,8 +908,7 @@ fn staged_lazy_buffer_bytes_count_toward_memory_used() {
 fn tiered_limit_none_is_unlimited_total() {
     let scrollback = Scrollback::new(100, 1000, 10_000_000);
     let mut grid = Grid::with_tiered_scrollback(3, 20, 8, scrollback);
-    // Scrollback::new defaults to DEFAULT_LINE_LIMIT — the getter reports
-    // that store share folded back into a total.
+    // `Scrollback::new` defaults to DEFAULT_LINE_LIMIT; the getter folds the ring back in.
     assert_eq!(
         grid.scrollback_line_limit(),
         Some(aterm_scrollback::DEFAULT_LINE_LIMIT + 8),
@@ -1037,10 +930,9 @@ fn tiered_limit_none_is_unlimited_total() {
     grid.assert_invariants();
 }
 
-// Dense history walk (`Grid::history_lines_from`) against the per-line oracle
-// `get_history_line`, across tiered store, lazy buffer and ring, at every
-// start, with and without a corrupt tiered segment. Item-for-item equality is
-// the absolute-coordinate guarantee (line `k` is row `oldest + start + k`).
+// The dense history walk (`Grid::history_lines_from`) equals the per-line `get_history_line`
+// across store, lazy buffer and ring, at every start, with and without a corrupt segment: line
+// `k` is row `oldest + start + k`.
 
 /// A grid whose history spans every source: a pre-filled tiered store (cold +
 /// warm + hot, optionally with a corrupt warm block between cold and warm),

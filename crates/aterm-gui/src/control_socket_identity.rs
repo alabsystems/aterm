@@ -9,11 +9,10 @@
 use crate::control_auth::SocketPlan;
 use aterm_uds::CtlListener;
 use serde::{Deserialize, Serialize};
-#[cfg(unix)]
-use std::process::Command;
 use std::sync::Mutex;
 
-pub(crate) const ENV_IDENTITY: &str = "ATERM_HANDOFF_CONTROL_SOCKET_IDENTITY";
+pub(crate) const ENV_IDENTITY: crate::handoff_env::HandoffName =
+    crate::handoff_env::HandoffName::new("ATERM_HANDOFF_CONTROL_SOCKET_IDENTITY");
 const MAX_WIRE_BYTES: usize = 2048;
 #[cfg(unix)]
 const MAX_TOKEN_BYTES: usize = 256;
@@ -311,18 +310,26 @@ pub(crate) fn republish_rebound(plan: &SocketPlan, previous: (u64, u64)) -> bool
 
 /// Clear inherited authority, then carry only this process's bound listener.
 #[cfg(unix)]
-pub(crate) fn bind_command(command: &mut Command) {
+#[expect(
+    clippy::disallowed_types,
+    reason = "the update successor's raw Command: it hands over exactly its own descriptors, which a strip at the exec would undo"
+)]
+pub(crate) fn bind_command(command: &mut std::process::Command) {
     bind_command_identity(command, published().as_ref());
 }
 
 #[cfg(unix)]
-fn bind_command_identity(command: &mut Command, identity: Option<&SocketIdentity>) {
+#[expect(
+    clippy::disallowed_types,
+    reason = "the update successor's raw Command: it hands over exactly its own descriptors, which a strip at the exec would undo"
+)]
+fn bind_command_identity(command: &mut std::process::Command, identity: Option<&SocketIdentity>) {
     // LaunchServices accepts merge-only environment additions. Removing a key
     // would force the fork fallback, so an explicit empty value clears inherited
     // authority while preserving the outgoing transport's process identity.
-    command.env(ENV_IDENTITY, "");
+    command.envs([ENV_IDENTITY.pair("")]);
     if let Some(wire) = identity.and_then(SocketIdentity::encode) {
-        command.env(ENV_IDENTITY, wire);
+        command.envs([ENV_IDENTITY.pair(wire)]);
     }
 }
 
@@ -449,11 +456,11 @@ mod tests {
         let identity = SocketIdentity::capture(&plan, &listener, &token).unwrap();
         assert_eq!(identity.directory.as_ref(), Some(&original_dir));
         // std's Command on purpose: never spawned; the shipped `bind_command_identity` takes std's.
-        let mut command = Command::new("unused-test-command");
+        let mut command = std::process::Command::new("unused-test-command");
         bind_command_identity(&mut command, Some(&identity));
         let wire = command
             .get_envs()
-            .find(|(key, _)| *key == ENV_IDENTITY)
+            .find(|(key, _)| *key == ENV_IDENTITY.name())
             .and_then(|(_, value)| value)
             .unwrap()
             .to_str()
@@ -510,19 +517,20 @@ mod tests {
         assert!(decoded == identity);
         assert!(decoded.matches_current(&plan));
         // std's Command on purpose: never spawned; the shipped `bind_command_identity` takes std's.
-        let mut command = Command::new("unused-test-command");
+        let mut command = std::process::Command::new("unused-test-command");
         command.env(ENV_IDENTITY, "inherited-authority");
         bind_command_identity(&mut command, None);
         assert!(
             command
                 .get_envs()
-                .any(|(key, value)| key == ENV_IDENTITY && value == Some(std::ffi::OsStr::new("")))
+                .any(|(key, value)| key == ENV_IDENTITY.name()
+                    && value == Some(std::ffi::OsStr::new("")))
         );
         bind_command_identity(&mut command, Some(&identity));
         assert!(
             command
                 .get_envs()
-                .any(|(key, value)| key == ENV_IDENTITY
+                .any(|(key, value)| key == ENV_IDENTITY.name()
                     && value == Some(std::ffi::OsStr::new(&wire)))
         );
         assert!(SocketIdentity::decode("").is_none());

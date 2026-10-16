@@ -2,12 +2,17 @@
 // Copyright 2026 Andrew Yates
 
 //! Codex's screen grammar, MEASURED on codex 0.156.1 (2026-09-24, a private
-//! headless aterm at 120×40; fixtures in [`fixtures`], each naming its
-//! provenance on line 1). [`crate::reader::CodexReader`] is this module
-//! behind the reader trait; nothing here reads Claude Code's screen.
+//! headless aterm at 120×40), then on 0.157.0, 0.157.1, 0.158.0, 0.159.0,
+//! 0.159.2 and 0.163.0, the managed build of 2026-10-16 (its walls, logins,
+//! approval boxes, question, stream cuts and compaction captured under the
+//! lab's stub of the Responses API at 144×50); fixtures in [`fixtures`], each
+//! naming its provenance on line 1. [`crate::reader::CodexReader`] is this
+//! module behind the reader trait; nothing here reads Claude Code's screen.
 //!
-//! **THE LAYOUT.** Codex draws inline (no alternate screen), so the screen is
-//! the transcript's tail with the live zone under it:
+//! **THE LAYOUT.** Codex draws its transcript as a column of blocks — inline
+//! (`--no-alt-screen`) or, by default, on the ALTERNATE screen (0.163.0:
+//! `modes` says `alt_screen=true`, measured in the lab 2026-10-16) — so the
+//! screen is the transcript's tail with the live zone under it:
 //!
 //! ```text
 //! › Fix the bug in calc.py …            a user message: `›` in column 0
@@ -47,8 +52,11 @@
 //! | patch approval | `Would you like to make the following edits?` | `Yes, proceed (y)` · `Yes, and don't ask again for these files (a)` · `No, …` | the same |
 //! | folder trust | `Folder access` | `Trust and continue` · `Quit` | `enter continue · esc quit` |
 //! | plan | `Implement this plan?` | `Yes, implement this plan` · `Yes, clear context and implement` · `No, stay in Plan mode` | `enter select · esc back` |
-//! | question | `Question 1/1 (1 unanswered)` | the model's answers, the recommended one `(Recommended)`, last `None of the above` | `tab to add notes \| enter to submit answer \| esc to interrupt` |
-//! | rate-limit nudge (hand-built) | `Approaching rate limits` | `Switch to <model>` · `Keep current model` · `Keep current model (never show again)` | `enter select · esc back` |
+//! | question | `Question 1/1 (1 unanswered)` | the model's answers, the recommended one `(Recommended)`, last `None of the above` | `tab to add notes \| enter to submit answer \| esc to interrupt`; its notes open, `tab or esc to clear notes \| enter to submit answer` |
+//! | rate-limit nudge (0.163.0) | `Approaching rate limits` | `Switch to <model>` · `Keep current model` · `Keep current model (never show again)` | `enter select · esc back` |
+//! | limit-increase banner (0.163.0, a workspace member) | `Usage limit reached` | `Yes (y)` · `No (default) (n)` | `enter select · esc back` |
+//! | `/permissions` (0.163.0) | `Update Model Permissions` | `Ask for approval` … `Read Only`, `(current)` after one | `enter select · esc back` |
+//! | full-access confirmation (0.163.0, a popup over the transcript) | `Enable full access?` | `Yes, continue anyway` · `Cancel` | `enter select · esc back` |
 //! | `/model` model box (0.158.0) | `Select Model and Effort` | the models, `(current)` / `(default)` after a label | `enter select · esc back` |
 //! | `/model` effort box (0.158.0) | `Select Reasoning Level for <model>` | `Low` … `Extra high`, `More reasoning…` | `enter default · s session · esc back` |
 //! | `/model` advanced box (0.158.0) | `Advanced Reasoning` | `Max` · `Ultra` | `enter default · s session · esc back` |
@@ -74,9 +82,14 @@
 //! with an empty second row ([`fixtures::DRAFT`]). A submit must come after
 //! the burst — `turn submit=guarded:^› …` submitted every time (measured).
 //!
-//! **WALLS** are `■` rows, read from the 0.156.1 binary's strings (none was
-//! reachable on the probe's account): [`WALLS`]. Everything a wall row does
-//! not name — a turn that ended on another error — is an ended turn with no
+//! **WALLS** are `■` rows, read from the 0.156.1 binary's strings and
+//! MEASURED on 0.163.0 under the lab's stub (every plan's usage wall, a
+//! workspace's credits and spend cap, the 401s, a cut stream, a 500 and a
+//! 502): [`WALLS`]. On 0.163.0 a usage wall is followed at once by the
+//! rate-limit nudge — or, for a workspace member, the limit-increase banner
+//! — which replaces the composer until a key dismisses it, then by the usage
+//! notice right-aligned over the composer. Everything a wall row does not
+//! name — a turn that ended on another error — is an ended turn with no
 //! wall.
 
 use crate::anchors::anchor_text;
@@ -236,7 +249,7 @@ fn is_user_row(row: &str) -> bool {
 /// 0.159.0 screen, read every ended turn as running and the session busy for
 /// good, and nothing that acts on an idle point ran there again: the live
 /// upgrade's carry-on after `adopted`, the relaunch's, the supervisor's own
-/// (every relaunched TUI of `tools/test-codex-live-upgrade.sh` stood at
+/// (every relaunched TUI of `targo --unverified lab codex-upgrade` stood at
 /// `adopted` for its 600 s).
 pub const END_ROW_MARKS: [&str; 2] = [" · ", " • "];
 
@@ -257,7 +270,7 @@ fn is_end_row(rows: &[String], i: usize) -> bool {
     }
     if rows[i + 1..]
         .iter()
-        .find(|r| !crate::text::trim(r).is_empty() && !is_tip_row(r))
+        .find(|r| !crate::text::trim(r).is_empty() && !is_tip_row(r) && !is_usage_notice_row(r))
         .is_some_and(|r| leading_spaces(r) != 0)
     {
         return false;
@@ -299,6 +312,32 @@ fn is_tip_row(row: &str) -> bool {
         && crate::text::trim_start(row).starts_with(const { anchor_text("codex.tip") })
 }
 
+/// The mark Codex opens its own WARNING with: the usage notice drawn
+/// right-aligned over the composer ([`is_usage_notice_row`]), and the
+/// warning cell in column 0 of the transcript (`⚠ Heads up, you have less
+/// than 25% of your 5h limit left. Run /status for a breakdown.`, measured on
+/// 0.163.0 between a turn's answer and its end row,
+/// [`fixtures::NEAR_LIMIT_5H_0_163`]) — never the agent's words.
+const WARNING: char = '⚠';
+
+/// 0.163.0's USAGE NOTICE between a turn's end (or its `■` wall) and the
+/// composer: `⚠ 5h limit: 24% left · resets at 12:14 PM · /status`, drawn
+/// RIGHT-ALIGNED (column 92 of a 144-column pane, measured 2026-10-16,
+/// [`fixtures::NEAR_LIMIT_5H_0_163`], and `only <1% left` under every usage
+/// wall once its nudge was dismissed). Known by its mark and its indent past
+/// the answer's column 2, as the tip is ([`is_tip_row`]): read as a row
+/// under the end row, it kept every turn that crossed a usage threshold
+/// running — `busy`, its end never continued.
+fn is_usage_notice_row(row: &str) -> bool {
+    leading_spaces(row) > 2 && crate::text::trim_start(row).starts_with(WARNING)
+}
+
+/// A WARNING CELL of the transcript ([`WARNING`] in column 0): Codex's own
+/// words, which end the block above them and are never the agent's.
+fn is_warning_cell(row: &str) -> bool {
+    row.starts_with(WARNING)
+}
+
 /// The last thing that ENDED a turn above `before`: an end row, or the head
 /// of a `■` block.
 fn last_end(rows: &[String], before: usize) -> Option<usize> {
@@ -314,17 +353,61 @@ fn last_end(rows: &[String], before: usize) -> Option<usize> {
 /// no blank between, and joined in, the wall's reset read `Oct 3rd 7:59 PM.
 /// Tip: Use /statusline to configure which it…`, which no clock parses — the
 /// loop waited 19 minutes, not until the reset (the owner's journal,
-/// 2026-09-27 20:56).
+/// 2026-09-27 20:56). A background terminal's status line
+/// ([`is_background_terminal_row`]) ends it too: it is the live zone's, at
+/// column 2 where a wall's own rows wrap to column 0, and drawn with no blank
+/// above it (as that tip was; not measured for this line) it read as the
+/// reset's tail, `Sep 25th 3:05 PM. 1 background terminal running · …`. So
+/// does a warning cell in column 0 ([`is_warning_cell`]). The rows joined are
+/// [`end_block_rows`]'s.
 fn block_text(rows: &[String], head: usize) -> String {
     let mut out = vec![rows[head].trim_start_matches('■').trim()];
-    for r in rows.iter().skip(head + 1) {
-        let t = crate::text::trim(r);
-        if t.is_empty() || r.starts_with(BLOCK_GLYPHS) || is_caret_row(r) || is_tip_line(r) {
-            break;
-        }
-        out.push(t);
-    }
+    out.extend(
+        rows[head + 1..end_block_rows(rows, head)]
+            .iter()
+            .map(|r| crate::text::trim(r)),
+    );
     out.join(" ")
+}
+
+/// A tip Codex hangs on its `└` gutter under a block (`  └ Tip: Run /review
+/// to get a code review of your current changes.`: under a status row on
+/// 0.158.0, under the turn's answer on 0.163.0, both measured): Codex's own
+/// row, never a tool's output or the agent's words. An answer's own paragraph
+/// opening `Tip:` has no gutter, and is none.
+fn is_tip_under(row: &str) -> bool {
+    row.starts_with(' ')
+        && crate::text::trim_start(row)
+            .strip_prefix('└')
+            .is_some_and(|t| {
+                t.trim_start()
+                    .starts_with(const { anchor_text("codex.tip") })
+            })
+}
+
+/// One past the last row of the `■` block whose head is row `head`: the head
+/// and its continuation rows (which wrap to column 0, measured), up to the
+/// first blank row, the next block or caret row, a warning cell in column 0
+/// ([`is_warning_cell`]), a TIP row (`Tip: …` however indented, or `└ Tip:
+/// …`) or the background terminals' status line
+/// ([`is_background_terminal_row`]) — never a row the block does not own: a
+/// wall's reset read with the tip 0.157.1 drew right under it parsed as no
+/// clock. The rows a wall's words are read from, and what a report keeps of
+/// a `■` block (`aterm drive report --final` and `--messages`).
+#[must_use]
+pub fn end_block_rows(rows: &[String], head: usize) -> usize {
+    rows.iter()
+        .enumerate()
+        .skip(head + 1)
+        .find(|(_, r)| {
+            crate::text::trim(r).is_empty()
+                || r.starts_with(BLOCK_GLYPHS)
+                || is_warning_cell(r)
+                || is_caret_row(r)
+                || is_tip_line(r)
+                || is_background_terminal_row(r)
+        })
+        .map_or(rows.len(), |(i, _)| i)
 }
 
 /// A row that is Codex's own TIP, however it is indented: `Tip: …`, or
@@ -342,14 +425,73 @@ enum Turn {
     Running,
     /// The row the last turn ended on.
     Ended(usize),
-    /// No turn yet: the session's card and no user message.
+    /// No turn yet: the session's card ([`is_card_title`]) and no user
+    /// message.
     Fresh,
     /// Nothing on the screen says: the message's head scrolled away.
     Unknown,
 }
 
+/// The session card's title row at `i`, as 0.158.0 on draws the card, with
+/// no box: `  >_ OpenAI Codex (v0.163.0)` at column 2, over the card's
+/// folder row at column 5 (measured on 0.158.0, 0.159.2 and 0.163.0; through
+/// 0.157 the card's `╭` corner says it). A reader that knew the corner alone
+/// read every fresh session of those builds as idle with no evidence, and
+/// nothing that acts on evidence acted there: `aterm drive task` never
+/// nudged one (measured 2026-10-16 on 0.163.0). The geometry is the test,
+/// never the words alone: the same title in a tool's output (column 4, under
+/// `└`) or quoted in an answer is no card, and a running turn read as a
+/// fresh session would be typed into.
+fn is_card_title(rows: &[String], i: usize) -> bool {
+    let opens_at = |row: &str, col: usize| {
+        let b = row.as_bytes();
+        b.len() > col && b[..col].iter().all(|&c| c == b' ') && b[col] != b' '
+    };
+    rows[i]
+        .strip_prefix("  >_ ")
+        .is_some_and(|t| t.starts_with(const { anchor_text("codex.card.title") }))
+        && rows.get(i + 1).is_some_and(|r| opens_at(r, 5))
+}
+
+/// A row of the SLASH POPUP over the composer at `c`: `› /logout  log out of
+/// Codex` in column 0, nothing but blank rows and other matches between it
+/// and the composer, whose own text is the `/…` being typed (measured on
+/// 0.163.0 with `/log` typed, [`fixtures::SLASH_LOG_0_163`]). Read as a user
+/// message, a match made the fresh session's turn run, `busy` with nothing
+/// asked. A slash command the transcript echoes has its answer under it.
+fn is_slash_match(rows: &[String], i: usize, c: usize) -> bool {
+    let typed_slash = rows[c]
+        .strip_prefix(CARETS)
+        .is_some_and(|t| t.trim_start().starts_with('/'));
+    typed_slash
+        && rows[i].starts_with("› /")
+        && rows[i + 1..c]
+            .iter()
+            .all(|r| crate::text::trim(r).is_empty() || r.starts_with("› /"))
+}
+
+/// The session card's title row ALONE and whole: `  >_ OpenAI Codex
+/// (v0.163.0)` at column 2, nothing after its version's `)`. The host's
+/// alt-screen archive keeps a frame Codex drew before the card's folder row
+/// (measured in the lab on 0.163.0, 2026-10-16: the title archived over a
+/// second copy of it, then the folder), where [`is_card_title`]'s geometry
+/// cannot hold. Read only by [`transcript_head`], where a misread drops one
+/// row from a report's views; never by the phase.
+fn is_card_title_row(row: &str) -> bool {
+    row.strip_prefix("  >_ ")
+        .and_then(|t| t.strip_prefix(const { anchor_text("codex.card.title") }))
+        .and_then(|v| crate::text::trim_end(v).strip_suffix(')'))
+        .is_some_and(|v| {
+            !v.is_empty()
+                && v.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'))
+        })
+}
+
 fn turn(rows: &[String], composer: usize) -> Turn {
-    let user = (0..composer).rev().find(|&i| is_user_row(&rows[i]));
+    let user = (0..composer)
+        .rev()
+        .find(|&i| is_user_row(&rows[i]) && !is_slash_match(rows, i, composer));
     let end = last_end(rows, composer);
     let from = user.max(end).map_or(0, |i| i + 1);
     if rows[from..composer].iter().any(|r| is_status_row(r)) {
@@ -359,7 +501,11 @@ fn turn(rows: &[String], composer: usize) -> Turn {
         (Some(u), Some(e)) if u > e => Turn::Running,
         (Some(_), None) => Turn::Running,
         (_, Some(e)) => Turn::Ended(e),
-        (None, None) if rows[..composer].iter().any(|r| r.starts_with('╭')) => Turn::Fresh,
+        (None, None)
+            if (0..composer).any(|i| rows[i].starts_with('╭') || is_card_title(rows, i)) =>
+        {
+            Turn::Fresh
+        }
         (None, None) => Turn::Unknown,
     }
 }
@@ -386,7 +532,9 @@ pub fn is_background_terminal_row(row: &str) -> bool {
 /// authoritatively. `Some(the rule)` — the turn is over and the agent's own
 /// work runs on — else `None`. The line sits under the turn's end row, where
 /// only blank rows and a tip may (so [`phase`] reads the turn still
-/// running); this read leaves [`phase`] as it is and names the break.
+/// running); this read leaves [`phase`] as it is and names the break. A `■`
+/// block ends the turn whatever is drawn under it, so [`phase`] reads a wall
+/// under the line as that wall (a usage limit `Limited`), never busy.
 #[must_use]
 pub fn background_wait(rows: &[String]) -> Option<&'static str> {
     if !rows.iter().any(|r| is_background_terminal_row(r)) {
@@ -409,7 +557,9 @@ pub fn background_wait(rows: &[String]) -> Option<&'static str> {
 /// `Some(that phase)`, else `None` (no line, or a turn still running beside
 /// the terminal). [`background_wait`] is its idle case — the break the
 /// host's own background step may take; the supervisor's save-then-wait
-/// switch takes every one of these as its point.
+/// switch takes as its point the ones [`phase`] reads busy, an end row's
+/// idle or question. A `■` block's end (a wall, an API error) [`phase`]
+/// reads as it is with the line under it, and it is an ordinary point.
 #[must_use]
 pub fn ended_under_background(rows: &[String]) -> Option<Phase> {
     if !rows.iter().any(|r| is_background_terminal_row(r)) {
@@ -428,8 +578,9 @@ pub fn ended_under_background(rows: &[String]) -> Option<Phase> {
 
 /// The phase, and whether it is evidence (module header): a box is a
 /// prompt; the status row, or a user message with no end row under it, is
-/// busy; an ended turn is limited (a usage wall), a question (the agent's
-/// last words end in `?`) or idle; a fresh session is idle. A screen with no
+/// busy; an ended turn is limited (a usage wall, under a background
+/// terminal's line too: [`background_wait`]), a question (the agent's last
+/// words end in `?`) or idle; a fresh session is idle. A screen with no
 /// composer and no box, or one whose last message's head has scrolled away
 /// with no end in sight, is `idle` NOT authoritatively.
 #[must_use]
@@ -454,13 +605,7 @@ pub fn phase(rows: &[String]) -> (Phase, bool) {
                     true,
                 );
             }
-            let asks = said_tail(rows)
-                .and_then(|t| {
-                    t.lines()
-                        .last()
-                        .map(|l| crate::text::trim_end(l).ends_with('?'))
-                })
-                .unwrap_or(false);
+            let asks = said_tail(rows).is_some_and(|t| crate::turn::asks(&t));
             (if asks { Phase::Question } else { Phase::Idle }, true)
         }
     }
@@ -497,7 +642,21 @@ pub fn interrupted(rows: &[String]) -> bool {
 
 /// Codex's wall rows by kind, from the 0.156.1 binary's strings (codex-rs
 /// `core/src/error.rs`), first match wins. Read as a `■` block's text,
-/// lowercased, `’` as `'`.
+/// lowercased, `’` as `'`. Each phrase is one literal of the binary (the
+/// drift canary looks for it there), so a status a row names is read from
+/// the row ([`CodexWall::Status`]), never spelled into a phrase.
+///
+/// MEASURED on 0.163.0 (2026-10-16, the lab's stub of the Responses API):
+/// an API key the provider refused ends the turn on `■ unexpected status 401
+/// Unauthorized: Incorrect API key provided: …` ([`fixtures::AUTH_401_API_KEY_0_163`]),
+/// a 502 on `■ unexpected status 502 Bad Gateway: …` with the body it quoted
+/// wrapped under it, a 500 on Codex's own words for it, `■ We’re currently
+/// experiencing high demand, which may cause temporary errors.` (no status
+/// on the row: [`CodexWall::HighDemand`]), and a stream cut before
+/// `response.completed` on `■ stream disconnected before completion: stream
+/// closed before response.completed` ([`CodexWall::CutOff`]) — each after
+/// Codex's own retries, drawn as `• Reconnecting... N/5 (… • esc to
+/// interrupt)` over `└ <the error>` while the turn still runs.
 pub const WALLS: &[(&str, CodexWall)] = &[
     // `You've hit your usage limit for <model>. Switch to another model now,
     // or try again at …`: one model's bucket.
@@ -519,9 +678,10 @@ pub const WALLS: &[(&str, CodexWall)] = &[
     ("access token could not be refreshed", CodexWall::Auth),
     ("please sign in again", CodexWall::Auth),
     ("selected model is at capacity", CodexWall::Overloaded),
-    ("experiencing high demand", CodexWall::Overloaded),
+    ("experiencing high demand", CodexWall::HighDemand),
     ("exceeded retry limit", CodexWall::Retry),
-    ("stream disconnected before completion", CodexWall::Retry),
+    ("unexpected status ", CodexWall::Status),
+    ("stream disconnected before completion", CodexWall::CutOff),
 ];
 
 /// What a [`WALLS`] row names.
@@ -533,9 +693,38 @@ pub enum CodexWall {
     Context,
     Auth,
     Overloaded,
-    /// The retries ran out (`exceeded retry limit, last status: 429 …`) or
-    /// the stream dropped: an API error, retryable by the status it names.
+    /// The retries ran out (`exceeded retry limit, last status: 429 …`): an
+    /// API error, retryable by the status it names.
     Retry,
+    /// `unexpected status <n> <reason>: …`: the HTTP status the API
+    /// answered with, read off the row — 401 is the login refused
+    /// ([`WallKind::Auth`]), any other an API error retryable by it.
+    Status,
+    /// Codex's own words for an HTTP 500 (`We’re currently experiencing high
+    /// demand, which may cause temporary errors.`, codex-rs's
+    /// `InternalServerError`; measured on 0.163.0 with a 500 on every try):
+    /// an API error of status 500.
+    HighDemand,
+    /// `stream disconnected before completion: …`: the reply was cut off
+    /// before it was whole ([`ApiCause::CutOff`]) — unless the row names the
+    /// status it was cut on (`last status: 503`), which is the API's answer.
+    CutOff,
+}
+
+/// The HTTP status the vendor's rule retries: 408, 409, 429 and every 5xx,
+/// and a row that names none.
+fn retryable(code: Option<u16>) -> bool {
+    code.is_none_or(|c| matches!(c, 408 | 409 | 429) || c >= 500)
+}
+
+/// The three digits after `after` in `lower` (`last status: 429 …`,
+/// `unexpected status 502 …`).
+fn status_after(lower: &str, after: &str) -> Option<u16> {
+    lower
+        .split_once(after)
+        .and_then(|(_, s)| s.get(..3))
+        .filter(|s| s.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|s| s.parse::<u16>().ok())
 }
 
 /// The wall the last turn ended on: a `■` block ([`WALLS`]) that is the
@@ -549,6 +738,11 @@ pub fn wall(rows: &[String]) -> Option<Wall> {
     let message = block_text(rows, head);
     let lower = message.replace('’', "'").to_lowercase();
     let (_, tag) = WALLS.iter().find(|(phrase, _)| lower.contains(phrase))?;
+    let server = |code: Option<u16>| WallKind::ApiError {
+        code,
+        retryable: retryable(code),
+        cause: ApiCause::Server,
+    };
     let kind = match tag {
         CodexWall::Usage => WallKind::UsageSession,
         CodexWall::Model => WallKind::ModelBucket { consent: false },
@@ -556,17 +750,20 @@ pub fn wall(rows: &[String]) -> Option<Wall> {
         CodexWall::Context => WallKind::Context,
         CodexWall::Auth => WallKind::Auth,
         CodexWall::Overloaded => WallKind::Overloaded,
-        CodexWall::Retry => {
-            let code = lower
-                .split_once("last status: ")
-                .and_then(|(_, s)| s.get(..3))
-                .and_then(|s| s.parse::<u16>().ok());
-            WallKind::ApiError {
-                code,
-                retryable: code.is_none_or(|c| matches!(c, 408 | 409 | 429) || c >= 500),
-                cause: ApiCause::Server,
-            }
-        }
+        CodexWall::Retry => server(status_after(&lower, "last status: ")),
+        CodexWall::Status => match status_after(&lower, "unexpected status ") {
+            Some(401) => WallKind::Auth,
+            code => server(code),
+        },
+        CodexWall::HighDemand => server(Some(500)),
+        CodexWall::CutOff => match status_after(&lower, "last status: ") {
+            Some(code) => server(Some(code)),
+            None => WallKind::ApiError {
+                code: None,
+                retryable: true,
+                cause: ApiCause::CutOff,
+            },
+        },
     };
     Some(Wall {
         kind,
@@ -597,10 +794,16 @@ fn reset_of(message: &str) -> Option<String> {
 
 /// The heads of Codex's own rows in an agent (`•`) block that are not the
 /// agent's words: its tool calls and notices (measured: `Ran`, `Running`,
-/// `Explored`, `Edited`, `Model changed to`, `Questions 1/1 answered`; the
-/// rest from the binary's strings). A tool row is also known by the `└`
-/// output under it.
-const TOOL_HEADS: &[&str] = &[
+/// `Explored`, `Edited`, `Model changed to`, `Questions 1/1 answered`, and on
+/// 0.163.0 `Context compacted · 0s`, `Permission selection requested: Full
+/// Access` and `Unrecognized command '/login'. …`; the rest from the binary's
+/// strings). A tool row is also known by the `└` output under it. Each is in
+/// the managed build, its trailing space aside (the vendor draws it as a span
+/// of its own): the drift canary looks for every one
+/// (`every_literal_codex_anchor_is_in_the_store_codex`). 0.163.0 spells the
+/// image row `Viewed image`; this table said `Viewed Image`, the spelling of
+/// 0.149.0's binary, which 0.163.0's does not hold.
+pub const TOOL_HEADS: &[&str] = &[
     "Ran ",
     "Running ",
     "Explored",
@@ -614,16 +817,31 @@ const TOOL_HEADS: &[&str] = &[
     "Searching ",
     "Waited",
     "Waiting",
-    "Viewed Image",
+    "Viewed image",
     "Model changed to ",
     "Questions ",
+    "Context compacted",
+    "Permission selection requested",
+    "Unrecognized command",
 ];
 
 /// The agent's last words: the last `•` block of the last turn (above its
 /// end row), the glyph and the continuation indent stripped, one line per
 /// row — the visible rows from the top when the block's head scrolled away.
 /// `None` when that block is a tool row, a notice or a `■` row, when the
-/// turn has not ended, or when there is no message in it.
+/// turn has not ended, or when there is no message in it. A tip Codex hangs
+/// under the message (`└ Tip: Use /feedback …`, measured on 0.163.0 under a
+/// whole answer, 2026-10-16) is neither a tool's output nor the agent's
+/// words: read as the first, the answer had no last words and a question it
+/// ended on read `idle`. Nor is the prompt Codex PINS on the alternate
+/// screen's top row over an answer whose head scrolled away (measured on
+/// 0.163.0 in the lab, 2026-10-16: `› Write seventy paragraphs …` drawn over
+/// paragraph 51, the answer drawn right under it): the answer's visible rows
+/// are its last words. Read as their head, a screen read whole (a pane short
+/// enough that the tail read reaches the top row) gave no last words and read
+/// `idle` under a question. A person's message ends no turn on its own — a
+/// `•` or `■` block stands between it and the end row — so a `›` row on the
+/// top row with no block under it and a drawn row right under it is that copy.
 #[must_use]
 pub fn said_tail(rows: &[String]) -> Option<String> {
     let c = composer(rows)?;
@@ -632,15 +850,18 @@ pub fn said_tail(rows: &[String]) -> Option<String> {
     };
     let head = (0..end)
         .rev()
-        .find(|&i| rows[i].starts_with(BLOCK_GLYPHS) || is_user_row(&rows[i]));
+        .find(|&i| rows[i].starts_with(BLOCK_GLYPHS) || is_user_row(&rows[i]))
+        .filter(|&h| !(h == 0 && is_pinned_prompt(rows)));
     let mut out = Vec::new();
     let from = match head {
         Some(h) => {
             let body = rows[h].strip_prefix('•')?.trim();
+            // A `└ Tip: …` under the message is Codex's (0.163.0 draws one
+            // under an answer, measured), never a tool's output.
             let tool_under = rows[h + 1..end]
                 .iter()
                 .find(|r| !crate::text::trim(r).is_empty())
-                .is_some_and(|r| crate::text::trim_start(r).starts_with('└'));
+                .is_some_and(|r| crate::text::trim_start(r).starts_with('└') && !is_tip_under(r));
             if tool_under || TOOL_HEADS.iter().any(|t| body.starts_with(t)) {
                 return None;
             }
@@ -648,11 +869,18 @@ pub fn said_tail(rows: &[String]) -> Option<String> {
             h + 1
         }
         // The message's head scrolled away: its visible rows are what the
-        // agent ended on — never `None`, which reads as "nothing asked".
-        None => 0,
+        // agent ended on — never `None`, which reads as "nothing asked" —
+        // under the prompt Codex pinned over them, when it did.
+        None => usize::from(is_pinned_prompt(rows)),
     };
+    // The agent's words end at Codex's own: a tip under them, or a warning
+    // cell (`⚠ Heads up, …`) between them and the end row — read in, the
+    // warning's full stop hid a question the agent ended on.
+    let stop = (from..end)
+        .find(|&i| is_warning_cell(&rows[i]) || is_tip_under(&rows[i]))
+        .unwrap_or(end);
     out.extend(
-        rows[from..end]
+        rows[from..stop]
             .iter()
             .map(|r| crate::text::trim(r))
             .filter(|t| !t.is_empty()),
@@ -660,8 +888,24 @@ pub fn said_tail(rows: &[String]) -> Option<String> {
     (!out.is_empty()).then(|| out.join("\n"))
 }
 
-/// Codex's `<n>% context left` footer item, when it shows one (from the
-/// binary's strings; the probe's footer showed the model and the folder).
+/// The screen's top row is a `›` row with a drawn row right under it: on the
+/// alternate screen, the prompt Codex pins over the answer it shows
+/// ([`said_tail`] says when that is the reading).
+fn is_pinned_prompt(rows: &[String]) -> bool {
+    rows.first().is_some_and(|r| is_user_row(r))
+        && rows
+            .get(1)
+            .is_some_and(|r| !crate::text::trim(r).is_empty())
+}
+
+/// Codex's `<n>% context left` footer item, when it shows one. MEASURED on
+/// 0.163.0 (2026-10-16): the DEFAULT footer draws none at any fill (6% to
+/// 99.6% of the window, idle and mid-turn, [`fixtures::CTX_DEFAULT_0_163`]);
+/// with the status line emptied (`tui.status_line=[]`) the key-hint row
+/// draws its own, right-aligned (`? for shortcuts … 99% context left`,
+/// [`fixtures::CTX_LEFT_0_163`]). A status line configured with the context
+/// items draws `Context 52% left` in the status row instead, and `/status`
+/// its `Context window: 11% left (…)` row: neither is this item.
 #[must_use]
 pub fn context_left(rows: &[String]) -> Option<u8> {
     let c = composer(rows)?;
@@ -672,6 +916,137 @@ pub fn context_left(rows: &[String]) -> Option<u8> {
         let n = tail.rsplit(|c: char| !c.is_ascii_digit()).next()?;
         n.parse().ok()
     })
+}
+
+// ---------------------------------------------------------------------------
+// The transcript, as a report reads it back.
+// ---------------------------------------------------------------------------
+
+/// What a row of Codex's TRANSCRIPT opens (module header's layout), for a
+/// reader that splits the rows into blocks (`aterm drive report --final`,
+/// `--messages`): every head is in column 0 but an end row's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Head {
+    /// `›` and a space: a person's message (its wrapped rows at column 2).
+    User,
+    /// A `•` block that is the agent's own words.
+    Said,
+    /// A `•` block that is a tool call or one of Codex's notices
+    /// (its tool heads, or `└` output right under it that is no tip), an
+    /// approval's echo (`✔ You approved codex to run …`, `✗ You canceled the
+    /// request to run …`), or a card: one with a `╭` corner, or the session
+    /// card 0.158.0 on draws with no box (`  >_ OpenAI Codex (v0.163.0)` over
+    /// its folder, read as the phase reads it to tell a fresh session, or that
+    /// title row alone and whole, as the alt-screen archive can keep it), whose
+    /// greeting, command list and art under it are Codex's, never the agent's
+    /// words.
+    Tool,
+    /// The live zone: a running turn's status row (`• Working (6s • esc to
+    /// interrupt)`), or an EMPTY composer — its mark and its placeholder
+    /// (`› Ask Codex to do anything`) — that a frame left among the rows (the
+    /// host's archive keeps the frame a reply taller than the screen replaced
+    /// in one jump: measured on 0.163.0 in the lab, 2026-10-16), the footer
+    /// under it carrying on its block. Never a person's message.
+    Status,
+    /// What ENDED a turn: an end row (`  1:39 PM`, `  Worked for 1s • 7:14
+    /// AM`) or a `■` block (an interrupt, an error, a wall), whose own rows
+    /// wrap to column 0.
+    End,
+}
+
+/// The head row `i` of `rows` opens ([`Head`]), or `None` for a row that
+/// carries on the block above it: a message's wrapped rows (column 2), a
+/// tool's `└` output and its detail rows, a `■` block's wrapped rows
+/// (column 0, measured), a card's `│` rows.
+#[must_use]
+pub fn transcript_head(rows: &[String], i: usize) -> Option<Head> {
+    let row = rows[i].as_str();
+    if is_empty_composer(row) {
+        return Some(Head::Status);
+    }
+    if row
+        .strip_prefix('›')
+        .is_some_and(|rest| rest.starts_with(char::is_whitespace))
+    {
+        return Some(Head::User);
+    }
+    if let Some(body) = row.strip_prefix('•') {
+        if is_status_row(row) {
+            return Some(Head::Status);
+        }
+        let body = body.trim();
+        // A tip under a message (`└ Tip: Run /review …`, measured on 0.163.0
+        // under a whole answer) is Codex's, not a tool's output.
+        let output_under = rows[i + 1..]
+            .iter()
+            .find(|r| !crate::text::trim(r).is_empty())
+            .is_some_and(|r| crate::text::trim_start(r).starts_with('└') && !is_tip_under(r));
+        return Some(
+            if output_under || TOOL_HEADS.iter().any(|t| body.starts_with(t)) {
+                Head::Tool
+            } else {
+                Head::Said
+            },
+        );
+    }
+    if row.starts_with('■') {
+        return Some(Head::End);
+    }
+    if row.starts_with(['✔', '✗', '╭']) || is_card_title(rows, i) || is_card_title_row(row) {
+        return Some(Head::Tool);
+    }
+    is_end_row(rows, i).then_some(Head::End)
+}
+
+/// An EMPTY composer's row: an input-line mark ([`CARETS`]) and the
+/// placeholder alone (`› Ask Codex to do anything`) — the live zone wherever
+/// it is drawn, never a person's message. A composer holding a draft cannot
+/// be told from a message by its row alone.
+#[must_use]
+pub fn is_empty_composer(row: &str) -> bool {
+    is_caret_row(row)
+        && crate::text::trim(row.trim_start_matches(CARETS))
+            == const { anchor_text("codex.composer.placeholder") }
+}
+
+/// Where the transcript ends on a Codex screen, by POSITION: the first row
+/// of its LIVE ZONE. A box's title (the box replaces the composer); else,
+/// walking up from the composer over the blank rows, the rows hanging under
+/// a status row (`└ Stream disconnected …`, `└ Making room to continue.`,
+/// `└ Tip: …`) and the status rows themselves — a running turn's (`•
+/// Working (6s • esc to interrupt)`, `• Reconnecting... 1/5 (0s • esc to
+/// interrupt)`, measured on 0.163.0) and the background terminals' status
+/// line ([`is_background_terminal_row`]) — the highest status row; else the
+/// composer's row. The end row and every `■` block stay: they ENDED a turn.
+/// With neither a box nor a composer (a screen Codex left, a frame caught
+/// mid-redraw), one past the last non-blank row.
+#[must_use]
+pub fn transcript_end(rows: &[String]) -> usize {
+    if let Some(p) = prompt(rows) {
+        return p.span.0;
+    }
+    let Some(c) = composer(rows) else {
+        return rows
+            .iter()
+            .rposition(|r| !crate::text::trim(r).is_empty())
+            .map_or(0, |i| i + 1);
+    };
+    let mut end = c;
+    let mut i = c;
+    while i > 0 {
+        let row = &rows[i - 1];
+        let t = crate::text::trim(row);
+        if is_status_row(row) || is_background_terminal_row(row) {
+            i -= 1;
+            end = i;
+        } else if t.is_empty() || (row.starts_with(' ') && t.starts_with('└')) || is_tip_row(row)
+        {
+            i -= 1;
+        } else {
+            break;
+        }
+    }
+    end
 }
 
 // ---------------------------------------------------------------------------
@@ -862,11 +1237,106 @@ pub(crate) fn codex_box(rows: &[String]) -> Option<(usize, usize)> {
     {
         last += 1;
     }
+    // The question's notes field, open between its options and its footer.
+    let last = notes_field(rows, last).map_or(last, |(_, end)| end);
     let footer = (last + 1..(last + 4).min(rows.len())).find(|&i| is_hint_footer(&rows[i]))?;
-    rows[footer + 1..]
-        .iter()
-        .all(|r| crate::text::trim(r).is_empty())
-        .then_some((first, footer))
+    let below = &rows[footer + 1..];
+    (below.iter().all(|r| crate::text::trim(r).is_empty())
+        || leading_spaces(&rows[cursor]) > POPUP_INDENT && is_composer_zone(below))
+    .then_some((first, footer))
+}
+
+/// How far past column 0 a box's cursor row is drawn when the box is a
+/// POPUP over the transcript rather than the live zone: 0.163.0's `Enable
+/// full access?` confirmation (`/permissions`, `3. Full Access`, Enter) is
+/// drawn centred, its cursor row at column 36 of a 144-column pane, with the
+/// composer and its footer still drawn under it (measured 2026-10-16,
+/// [`fixtures::FULL_ACCESS_CONFIRM_0_163`]). Every box the live zone draws
+/// puts its cursor at column 0, or 2 for the question's.
+const POPUP_INDENT: usize = 4;
+
+/// Whether `rows` are the composer's zone and nothing else: blank rows, one
+/// input line ([`CARETS`] in column 0) and the footer at column 2 under it —
+/// what a popup box leaves drawn under itself ([`POPUP_INDENT`]). Read as
+/// no box, that popup's rows under the last end row read the turn as
+/// running, and its `1. Yes, continue anyway` stood as `busy`.
+fn is_composer_zone(rows: &[String]) -> bool {
+    let mut lines = rows.iter().filter(|r| !crate::text::trim(r).is_empty());
+    lines.next().is_some_and(|r| is_caret_row(r)) && lines.all(|r| leading_spaces(r) == 2)
+}
+
+/// The question dialog's NOTES FIELD, open under the options ending at
+/// `last`, as `(its first row, its last row)`: one blank row, then `  ›
+/// <text>` at column 2 — the placeholder `Add notes` while it is empty
+/// ([`QuestionNotes`]) — and any rows its text wraps onto (indented past
+/// column 2; not measured: the one text typed was one row). Measured on
+/// 0.163.0 (2026-10-16): Tab on `› 3. None of the above` opens it
+/// ([`fixtures::QUESTION_NOTES_OPEN_0_163`]) and its footer becomes `tab or
+/// esc to clear notes | enter to submit answer`. Read as no box, the dialog
+/// with its field open was no box at all: the user's message above it read
+/// as the composer, and the session `idle` mid-question.
+fn notes_field(rows: &[String], last: usize) -> Option<(usize, usize)> {
+    let at = last + 2;
+    let row = rows.get(at)?;
+    let opens = crate::text::trim(rows.get(last + 1)?).is_empty()
+        && leading_spaces(row) == 2
+        && option(row).is_none()
+        && crate::text::trim(row)
+            .strip_prefix('›')
+            .is_some_and(|t| t.is_empty() || t.starts_with(' '));
+    if !opens {
+        return None;
+    }
+    let mut end = at;
+    while rows
+        .get(end + 1)
+        .is_some_and(|r| !crate::text::trim(r).is_empty() && leading_spaces(r) > 2)
+    {
+        end += 1;
+    }
+    Some((at, end))
+}
+
+/// The question's notes field as read ([`question_notes`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuestionNotes {
+    /// The field's first row (`  › <text>`): what a key typed into it is
+    /// guarded on.
+    pub row: usize,
+    /// Its text, the `›` stripped and wrapped rows joined with one space;
+    /// empty while the placeholder (anchor `codex.question.notes`) is drawn.
+    pub text: String,
+}
+
+/// THE OPEN NOTES FIELD of the question on `rows` (`notes_field`); `None`
+/// when no question box is up or its field is closed. A note goes with
+/// `None of the above` when Enter submits it (`answer: None of the above`
+/// over `note: <text>`, measured; the answer Codex sends is `["None of the
+/// above", "user_note: <text>"]`). Esc in the field, or Tab, CLEARS the text
+/// and closes the field, the focus staying on `None of the above` (measured:
+/// Tab reopened it empty); a digit on the dialog answers at once, notes
+/// closed or not reached.
+#[must_use]
+pub fn question_notes(rows: &[String]) -> Option<QuestionNotes> {
+    let p = prompt(rows).filter(|p| p.kind == PromptKind::Question)?;
+    let last = p.options.last()?.row;
+    let last = (last..p.span.1)
+        .take_while(|&i| i == last || is_continuation(&rows[i]))
+        .last()
+        .unwrap_or(last);
+    let (at, end) = notes_field(rows, last)?;
+    let mut text = crate::text::trim(&rows[at])
+        .trim_start_matches('›')
+        .trim()
+        .to_string();
+    if text == const { anchor_text("codex.question.notes") } {
+        text.clear();
+    }
+    for r in &rows[at + 1..=end] {
+        text.push(' ');
+        text.push_str(crate::text::trim(r));
+    }
+    Some(QuestionNotes { row: at, text })
 }
 
 /// A box footer: Enter and Esc named as keys, or 0.155.1's `Press enter to
@@ -1010,6 +1480,35 @@ fn role_of(kind: PromptKind, label: &str) -> Role {
     }
 }
 
+/// Whether the rows between a box's title and its options ask to REQUEST A
+/// LIMIT INCREASE of the workspace's owner (anchor `codex.banner.request`):
+/// the `Usage limit reached` banner a workspace MEMBER is drawn when the
+/// workspace is out of credits or the member is at the spend cap the owner
+/// set (`Request a limit increase from your owner to continue using codex.
+/// Request increase?` over `1. Yes (y)` and `› 2. No (default) (n)`,
+/// measured on 0.162.1 and on 0.163.0, [`fixtures::WALL_MEMBER_CREDITS_0_163`]).
+/// It replaces the composer under the wall, so the turn-end policy types
+/// nothing while it stands; its `Yes` notifies the owner. Read only in a box
+/// of no known kind: a question or a command's reason holding the words is
+/// the model's.
+fn is_request_banner(rows: &[String]) -> bool {
+    rows.iter()
+        .any(|r| r.contains(const { anchor_text("codex.banner.request") }))
+}
+
+/// An option's role on the limit-increase banner ([`is_request_banner`]):
+/// its `No` (`No (default)`) is the refusal that settles nothing
+/// ([`Role::Deny`]); its `Yes` asks a person — the workspace's owner — for
+/// money, and has no role any decider presses ([`Role::Other`]), whatever
+/// it is labelled.
+fn banner_role(label: &str) -> Role {
+    let l = label.trim().to_lowercase();
+    let refuses = l
+        .strip_prefix("no")
+        .is_some_and(|rest| rest.chars().next().is_none_or(|c| !c.is_alphanumeric()));
+    if refuses { Role::Deny } else { Role::Other }
+}
+
 /// The box's rows above its options: past the blank rows right above them
 /// (one or two), up to under the next run of two blank rows (or a row in
 /// column 0, or the top) — single blanks separate its fields, two separate
@@ -1111,6 +1610,10 @@ pub fn prompt(rows: &[String]) -> Option<PromptV2> {
         .enumerate()
         .all(|(k, o)| o.n.is_some_and(|n| usize::from(n) == k + 1));
     let focus = options.iter().filter(|o| o.focused).count();
+    // Only a box of no known kind: words the model wrote into a box it
+    // asked (a question, a command's reason) never remake its roles.
+    let banner =
+        kind == PromptKind::Other && !head_off_screen && is_request_banner(&rows[title_row..first]);
     if numbered && focus == 1 {
         // A box with its head cut is read by its labels alone: the approval
         // boxes' one-shot allow names them (module header's table).
@@ -1124,7 +1627,11 @@ pub fn prompt(rows: &[String]) -> Option<PromptV2> {
             kind
         };
         for o in &mut options {
-            o.role = role_of(roles_of, &o.label);
+            o.role = if banner {
+                banner_role(&o.label)
+            } else {
+                role_of(roles_of, &o.label)
+            };
         }
     }
 
@@ -1146,7 +1653,7 @@ pub fn prompt(rows: &[String]) -> Option<PromptV2> {
                     })
                     .collect()
             });
-            let reason = field(rows, top, first, "Reason:").unwrap_or_default();
+            let reason = reason_of(rows, top, first).unwrap_or_default();
             (cmd, reason, None)
         }
         PromptKind::Edit => (
@@ -1201,8 +1708,48 @@ pub fn prompt(rows: &[String]) -> Option<PromptV2> {
         footer: Some(crate::text::trim(&rows[footer]).to_string()),
         head_off_screen,
         question_dialog: None,
-        reason_rows: Vec::new(),
+        // The exec box's Reason row is its reason block: what
+        // [`PromptV2::owner_review`] reads an owner's prompt rule off.
+        reason_rows: match kind {
+            PromptKind::Bash => reason_of(rows, top, first)
+                .map(|r| vec![format!("{REASON_HEAD}{r}")])
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        },
     })
+}
+
+/// The head of the exec box's reason row, `Reason: ` (0.156.1 on).
+const REASON_HEAD: &str = "Reason: ";
+
+/// The exec box's `Reason: …` field, its rows joined with one space up to
+/// the blank row that ends it (a reason wider than the pane wraps; a rule's
+/// `requires approval by policy` at its end must read whole). Drawn three
+/// ways on 0.163.0 (measured 2026-10-16): the model's own justification of a
+/// call it escalated (`Reason: Do you want to create probe.txt outside the
+/// sandbox?`), none at all for one it escalated without a justification, and
+/// an OWNER'S PROMPT RULE's (`prefix_rule(…, decision="prompt")` in
+/// `$CODEX_HOME/rules/`): `` Reason: `/bin/zsh -lc 'touch probe.txt'`
+/// requires approval by policy``, or `` … requires approval: <the rule's
+/// justification>`` — which REPLACES the model's justification, and whose box
+/// offers no `(p)`: `1. Yes, proceed (y)`, `2. No, …` ([`fixtures::BOX_RULE_0_163`]).
+/// The row never names the rule, its file or its pattern.
+fn reason_of(rows: &[String], top: usize, first: usize) -> Option<String> {
+    let head = REASON_HEAD.trim_end();
+    let at = (top..first).find(|&i| crate::text::trim(&rows[i]).starts_with(head))?;
+    let mut parts = vec![crate::text::trim(&rows[at])[head.len()..].trim()];
+    parts.extend(
+        rows[at + 1..first]
+            .iter()
+            .map(|r| crate::text::trim(r))
+            .take_while(|t| !t.is_empty() && !t.starts_with("$ ")),
+    );
+    let reason = parts
+        .into_iter()
+        .filter(|p| !p.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!reason.is_empty()).then_some(reason)
 }
 
 /// The footer's Esc: `esc quit` exits Codex (the trust gate), `esc back`
@@ -1273,16 +1820,24 @@ pub mod fixtures {
     pub const DRAFT: &str = include_str!("fixtures/codex-0.156.1-draft.txt");
     /// After `/quit`: the resume line, then the shell.
     pub const EXIT: &str = include_str!("fixtures/codex-0.156.1-exit.txt");
-    /// HAND-BUILT: a turn that ended on the usage-limit row.
-    pub const HIT_LIMIT: &str = include_str!("fixtures/codex-0.156.1-usage-limit.txt");
+    /// 0.163.0, MEASURED (it replaced 0.156.1's hand-built wall): a turn
+    /// that ended on the usage-limit row — the weekly window of a Plus plan,
+    /// its reset on another day (`try again at Oct 17th, 2026 1:14 PM.`), the
+    /// row wrapped to column 0 after `purchase more`, Esc pressed once on the
+    /// rate-limit nudge Codex drew under it, so the usage notice (`⚠ weekly
+    /// limit: only <1% left · …`) stands right-aligned over the composer.
+    pub const HIT_LIMIT: &str =
+        include_str!("fixtures/codex-0.163.0-wall-weekly-plus-after-esc.txt");
     /// 0.157.0: the folder-trust gate at the top of a 45-row pane.
     pub const TRUST_TALL_PANE: &str = include_str!("fixtures/codex-0.157.0-trust-tall-pane.txt");
     /// 0.157.0: an ended turn, the right-aligned tip under its end row, and
     /// the two-row footer (the last 40 rows of a 45-row pane).
     pub const END_OF_TURN_TIP: &str = include_str!("fixtures/codex-0.157.0-end-of-turn-tip.txt");
-    /// HAND-BUILT (0.157.1 strings, 0.158.0 geometry): the rate-limit model
-    /// nudge.
-    pub const RATE_NUDGE: &str = include_str!("fixtures/codex-0.157.1-rate-nudge.txt");
+    /// 0.163.0, MEASURED (it replaced the 0.157.1 hand-built box, whose
+    /// switch read `Uses fewer credits for upcoming turns`): the rate-limit
+    /// model nudge after a turn whose answer said 92% of the 5h window was
+    /// used, the usage warning (`⚠ Heads up, …`) in the turn above it.
+    pub const RATE_NUDGE: &str = include_str!("fixtures/codex-0.163.0-nudge-5h-92pct.txt");
     /// 0.158.0: a fresh session at its `›` composer, the two-row footer.
     pub const IDLE_158: &str = include_str!("fixtures/codex-0.158.0-idle.txt");
     /// 0.158.0: `/model`'s model box.
@@ -1303,7 +1858,8 @@ pub mod fixtures {
     pub const GOAL_PAUSE_NONE: &str = include_str!("fixtures/codex-0.158.0-goal-pause-none.txt");
     /// HAND-BUILT around MEASURED rows (0.158.0): a goal turn running, its
     /// status row's background-terminal tail, the `└ Tip:` row, the `»`
-    /// composer and the footer's `Pursuing goal (…)`.
+    /// composer and the footer's `Pursuing goal (…)`. Kept hand-built: no
+    /// 0.163.0 capture runs a goal.
     pub const GOAL_BUSY: &str = include_str!("fixtures/codex-0.158.0-goal-busy.txt");
     /// 0.158.0: a goal turn running, its INPUT LINE drawn `»` (U+00BB), the
     /// placeholder dim at column 2 (a live 131x64 tab, read only; the
@@ -1317,7 +1873,8 @@ pub mod fixtures {
         include_str!("fixtures/codex-0.158.0-goal-next-turn.txt");
     /// HAND-BUILT from the vendor's own render of it (0.158.0, the same in
     /// 0.157.1): the `Resume paused goal?` box `codex resume` draws over a
-    /// paused goal, `Resume goal` focused.
+    /// paused goal, `Resume goal` focused. Kept hand-built: no 0.163.0
+    /// capture pauses a goal.
     pub const GOAL_RESUME: &str = include_str!("fixtures/codex-0.158.0-goal-resume.txt");
     /// 0.157.1, MEASURED: a turn that ended on the usage-limit row, which
     /// names no reset (a loopback model's `usage_limit_reached`).
@@ -1364,6 +1921,383 @@ pub mod fixtures {
     /// 0.159.2, MEASURED: a fresh session at its idle composer — no turn, no
     /// wall (the startup logo's rows dropped).
     pub const IDLE_0_159: &str = include_str!("fixtures/codex-0.159.2-idle.txt");
+    /// 0.163.0, MEASURED: a fresh session at its composer, the session card
+    /// with no box (its title row at column 2) and the launch's art.
+    pub const IDLE_0_163: &str = include_str!("fixtures/codex-0.163.0-idle.txt");
+    /// 0.163.0, MEASURED: a turn's first frame, its status row up.
+    pub const BUSY_0_163: &str = include_str!("fixtures/codex-0.163.0-busy.txt");
+    /// 0.163.0, MEASURED: the same turn, ended (`• hi`, `Worked for 1s •`).
+    pub const END_OF_TURN_0_163: &str = include_str!("fixtures/codex-0.163.0-end-of-turn.txt");
+    /// 0.163.0, MEASURED: an exec approval box.
+    pub const BOX_EXEC_0_163: &str = include_str!("fixtures/codex-0.163.0-box-exec.txt");
+    /// 0.163.0, MEASURED: a patch approval box.
+    pub const BOX_PATCH_0_163: &str = include_str!("fixtures/codex-0.163.0-box-patch.txt");
+    /// 0.163.0, MEASURED: the exec box declined with Esc.
+    pub const INTERRUPTED_0_163: &str = include_str!("fixtures/codex-0.163.0-interrupted.txt");
+
+    // The 0.163.0 lab captures (2026-10-16): the real Codex under a private
+    // headless aterm at 144x50, a scratch `CODEX_HOME`, and the lab's stub of
+    // the Responses API (`crates/aterm-lab`) answering what each line 1 says.
+
+    /// The usage wall of a Free plan (`Upgrade to Plus …`), the rate-limit
+    /// nudge Codex draws under it.
+    pub const WALL_5H_FREE_0_163: &str = include_str!("fixtures/codex-0.163.0-wall-5h-free.txt");
+    /// The same after one Esc: the nudge gone, the usage notice (`⚠ 5h
+    /// limit: only <1% left · …`) over the composer.
+    pub const WALL_5H_FREE_AFTER_ESC_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-wall-5h-free-after-esc.txt");
+    /// The usage wall of an answer that names no plan (`Try again at …`),
+    /// the nudge under it.
+    pub const WALL_5H_NOPLAN_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-wall-5h-noplan.txt");
+    /// The same after one Esc.
+    pub const WALL_5H_NOPLAN_AFTER_ESC_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-wall-5h-noplan-after-esc.txt");
+    /// The usage wall of a Plus plan (`Upgrade to Pro …, visit … to purchase
+    /// more credits or try again at …`, wrapped), the nudge under it.
+    pub const WALL_5H_PLUS_0_163: &str = include_str!("fixtures/codex-0.163.0-wall-5h-plus.txt");
+    /// The same after one Esc.
+    pub const WALL_5H_PLUS_AFTER_ESC_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-wall-5h-plus-after-esc.txt");
+    /// The Plus wall of an account that holds credits: the same row, no
+    /// nudge and no usage notice.
+    pub const WALL_5H_PLUS_CREDITS_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-wall-5h-plus-credits.txt");
+    /// The same after one Esc (`esc again to edit previous message`).
+    pub const WALL_5H_PLUS_CREDITS_AFTER_ESC_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-wall-5h-plus-credits-after-esc.txt");
+    /// The usage wall of a Pro plan (`Visit … to purchase more credits or
+    /// try again at …`), the nudge under it.
+    pub const WALL_5H_PRO_0_163: &str = include_str!("fixtures/codex-0.163.0-wall-5h-pro.txt");
+    /// The same after one Esc.
+    pub const WALL_5H_PRO_AFTER_ESC_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-wall-5h-pro-after-esc.txt");
+    /// The usage wall of a Team plan (`To get more access now, send a
+    /// request to your admin or try again at …`), the nudge under it.
+    pub const WALL_5H_TEAM_0_163: &str = include_str!("fixtures/codex-0.163.0-wall-5h-team.txt");
+    /// The same after one Esc.
+    pub const WALL_5H_TEAM_AFTER_ESC_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-wall-5h-team-after-esc.txt");
+    /// The weekly wall of a Plus plan, its reset on another day, the nudge
+    /// under it ([`HIT_LIMIT`] is the same after one Esc).
+    pub const WALL_WEEKLY_PLUS_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-wall-weekly-plus.txt");
+    /// A workspace MEMBER whose workspace is out of credits (`Your workspace
+    /// is out of credits. Ask your workspace owner to refill …`), and under it
+    /// the `Usage limit reached` banner whose `Yes` asks the owner for more
+    /// (`Request increase?`), `No (default)` focused.
+    pub const WALL_MEMBER_CREDITS_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-wall-reached-workspace-member-credits-depleted.txt");
+    /// The same after one Esc: the banner gone, the rate-limit nudge drawn.
+    pub const WALL_MEMBER_CREDITS_AFTER_ESC_0_163: &str = include_str!(
+        "fixtures/codex-0.163.0-wall-reached-workspace-member-credits-depleted-after-esc.txt"
+    );
+    /// A workspace MEMBER at the spend cap the owner set (`You hit your
+    /// spend cap set by the owner of your workspace. …`), the same banner
+    /// under it.
+    pub const WALL_MEMBER_SPEND_CAP_0_163: &str = include_str!(
+        "fixtures/codex-0.163.0-wall-reached-workspace-member-usage-limit-reached.txt"
+    );
+    /// The same after one Esc: the rate-limit nudge drawn.
+    pub const WALL_MEMBER_SPEND_CAP_AFTER_ESC_0_163: &str = include_str!(
+        "fixtures/codex-0.163.0-wall-reached-workspace-member-usage-limit-reached-after-esc.txt"
+    );
+    /// A workspace OWNER out of credits (`Usage limit reached. You've
+    /// reached your usage limit. Increase your limits …`), the nudge under it.
+    pub const WALL_OWNER_CREDITS_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-wall-reached-workspace-owner-credits-depleted.txt");
+    /// The same after one Esc.
+    pub const WALL_OWNER_CREDITS_AFTER_ESC_0_163: &str = include_str!(
+        "fixtures/codex-0.163.0-wall-reached-workspace-owner-credits-depleted-after-esc.txt"
+    );
+    /// A workspace OWNER at its usage limit: the same row, the nudge under it.
+    pub const WALL_OWNER_USAGE_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-wall-reached-workspace-owner-usage-limit-reached.txt");
+    /// The same after one Esc.
+    pub const WALL_OWNER_USAGE_AFTER_ESC_0_163: &str = include_str!(
+        "fixtures/codex-0.163.0-wall-reached-workspace-owner-usage-limit-reached-after-esc.txt"
+    );
+    /// 76% of the 5h window used: the usage warning (`⚠ Heads up, you have
+    /// less than 25% of your 5h limit left. …`, column 0, in the turn) and
+    /// the usage notice right-aligned under the turn's end row.
+    pub const NEAR_LIMIT_5H_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-near-limit-5h-76pct.txt");
+    /// The same for the weekly window.
+    pub const NEAR_LIMIT_WEEKLY_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-near-limit-weekly-76pct.txt");
+    /// 100% of the 5h window used by an account that holds credits, the
+    /// turn answered: nothing is drawn of the limit or the credits.
+    pub const CREDITS_IN_USE_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-credits-5h-100pct-answered.txt");
+    /// `/status` of a ChatGPT login (Plus) holding credits.
+    pub const STATUS_CHATGPT_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-status-card-chatgpt-credits.txt");
+    /// `/status` of the same login with its 5h window used up and credits
+    /// carrying the turn.
+    pub const STATUS_CHATGPT_CREDITS_IN_USE_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-status-card-chatgpt-credits-in-use.txt");
+    /// `/status` under an API-key provider (`Limits: data not available
+    /// yet`).
+    pub const STATUS_LAB_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-status-card-lab-provider.txt");
+    /// A status line configured with the limit items, under a ChatGPT login
+    /// (`GPT-6.1-Sol default · 5h 24% left · weekly 70% left`).
+    pub const STATUS_LINE_LIMITS_CHATGPT_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-status-line-limit-items-chatgpt.txt");
+    /// The same items under an API-key provider: the model alone.
+    pub const STATUS_LINE_LIMITS_LAB_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-status-line-limit-items-lab.txt");
+    /// An API key the provider refused: `■ unexpected status 401
+    /// Unauthorized: Incorrect API key provided: …`.
+    pub const AUTH_401_API_KEY_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-401-api-key-provider.txt");
+    /// A ChatGPT login whose refresh token expired (`■ Your access token
+    /// could not be refreshed because your refresh token has expired. …`).
+    pub const AUTH_401_REFRESH_EXPIRED_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-401-refresh-refresh-token-expired.txt");
+    /// The same, the refresh token revoked.
+    pub const AUTH_401_REFRESH_INVALIDATED_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-401-refresh-refresh-token-invalidated.txt");
+    /// The same, the refresh token already used.
+    pub const AUTH_401_REFRESH_REUSED_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-401-refresh-refresh-token-reused.txt");
+    /// A 401 after `auth.json` was replaced by another account's (`… because
+    /// you have since logged out or signed in to another account. Please sign
+    /// in again.`).
+    pub const AUTH_401_ACCOUNT_CHANGED_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-401-account-changed.txt");
+    /// The first screen of a session with no login: the sign-in choice
+    /// (`> 1. Sign in with ChatGPT`, `Press enter to continue`).
+    pub const SIGN_IN_0_163: &str = include_str!("fixtures/codex-0.163.0-signin-signed-out.txt");
+    /// The folder-trust gate of a first run in an untrusted repository's
+    /// subdirectory.
+    pub const TRUST_0_163: &str = include_str!("fixtures/codex-0.163.0-first-run-folder-trust.txt");
+    /// `/login` typed and entered: `• Unrecognized command '/login'. …` —
+    /// 0.163.0 has no login slash command.
+    pub const SLASH_LOGIN_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-slash-login-unrecognized.txt");
+    /// `/log` typed: the slash popup's one match, `/logout`.
+    pub const SLASH_LOG_0_163: &str = include_str!("fixtures/codex-0.163.0-slash-log.txt");
+    /// `/logout` and Enter: Codex left for the shell, its resume hint
+    /// printed.
+    pub const LOGOUT_0_163: &str = include_str!("fixtures/codex-0.163.0-logout-exits.txt");
+    /// `/exit` and Enter: the shell screen with the resume hint.
+    pub const EXIT_0_163: &str = include_str!("fixtures/codex-0.163.0-exit-resume-hint.txt");
+    /// An owner's PROMPT RULE (`prefix_rule(pattern=["touch"],
+    /// decision="prompt")`): the exec box's Reason row `` `/bin/zsh -lc 'touch
+    /// probe.txt'` requires approval by policy``, and two options, no `(p)`.
+    pub const BOX_RULE_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-approval-rule-prompt-touch.txt");
+    /// The same rule with a justification: `… requires approval: owner rule:
+    /// touch needs a person`.
+    pub const BOX_RULE_JUSTIFIED_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-approval-rule-prompt-touch-justification.txt");
+    /// The same rule over a call the model escalated with its own
+    /// justification: the rule's Reason row, not the model's.
+    pub const BOX_RULE_OVER_ESCALATION_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-approval-rule-prompt-touch-escalated.txt");
+    /// No rule, a call the model escalated with a justification: the Reason
+    /// row is the model's words, three options with `(p)`.
+    pub const BOX_ESCALATED_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-approval-norules-touch-escalated.txt");
+    /// No rule, an escalated call with no justification: no Reason row.
+    pub const BOX_ESCALATED_NO_REASON_0_163: &str = include_str!(
+        "fixtures/codex-0.163.0-approval-norules-touch-escalated-no-justification.txt"
+    );
+    /// A command no rule names, escalated by the model, with the touch rule
+    /// loaded: the model's Reason row, three options.
+    pub const BOX_ESCALATED_UNNAMED_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-approval-escalated-unnamed-mkdir.txt");
+    /// No rule, a plain call: no box is drawn (the command ran sandboxed).
+    pub const NO_RULE_NO_BOX_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-approval-norules-touch-no-box.txt");
+    /// The touch rule loaded, a plain call of a command it does not name: no
+    /// box.
+    pub const RULE_UNNAMED_NO_BOX_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-approval-rule-unnamed-mkdir-no-box.txt");
+    /// Plan mode's question dialog as drawn, option 1 focused.
+    pub const QUESTION_0_163: &str = include_str!("fixtures/codex-0.163.0-question-dialog.txt");
+    /// After Down Down: `› 3. None of the above` focused, the notes closed.
+    pub const QUESTION_NONE_FOCUSED_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-question-none-focused.txt");
+    /// After Tab there: the notes field open and empty (`  › Add notes`),
+    /// the footer `tab or esc to clear notes | enter to submit answer`.
+    pub const QUESTION_NOTES_OPEN_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-question-notes-open.txt");
+    /// The notes field holding typed text (`  › use the long-term option`).
+    pub const QUESTION_NOTES_TYPED_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-question-notes-typed.txt");
+    /// Enter in the notes field: the answered question in the transcript
+    /// (`answer: None of the above` / `note: …`), the turn ended.
+    pub const QUESTION_NOTES_SUBMITTED_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-question-notes-submitted.txt");
+    /// The digit 3 alone: the question answered at once, with no note.
+    pub const QUESTION_DIGIT_SUBMITS_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-question-digit3-submits.txt");
+    /// Esc in the notes field holding text: the note cleared and the field
+    /// closed, `None of the above` still focused.
+    pub const QUESTION_NOTES_ESC_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-question-notes-esc.txt");
+    /// Tab again after that Esc: the field reopened empty.
+    pub const QUESTION_NOTES_REOPENED_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-question-notes-reopen-after-esc.txt");
+    /// Esc in the empty notes field: closed the same way.
+    pub const QUESTION_NOTES_ESC_EMPTY_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-question-notes-esc-empty.txt");
+    /// Tab in the notes field holding text: cleared and closed, as Esc does.
+    pub const QUESTION_NOTES_TAB_CLEARS_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-question-notes-tab-clears.txt");
+    /// Esc on the dialog with its notes closed: the turn interrupted.
+    pub const QUESTION_INTERRUPTED_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-question-esc-dialog.txt");
+    /// A stream cut before `response.completed` (HTTP 200), mid-turn: the
+    /// partial answer, then `• Reconnecting... 1/5 (0s • esc to interrupt)`
+    /// over `└ Stream disconnected before completion: …`.
+    pub const STREAM_CUT_RETRY_1_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-stream-cut-200-text-retry-1.txt");
+    /// The same at the last retry, `5/5`.
+    pub const STREAM_CUT_RETRY_5_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-stream-cut-200-text-retry-5.txt");
+    /// The retries ran out: `■ stream disconnected before completion: stream
+    /// closed before response.completed` under the partial answer.
+    pub const STREAM_CUT_FINAL_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-stream-cut-200-final.txt");
+    /// A stream cut before any text, mid-turn: the retry rows alone.
+    pub const STREAM_CUT_NOTEXT_RETRY_1_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-stream-cut-200-notext-retry-1.txt");
+    /// The same at `5/5`.
+    pub const STREAM_CUT_NOTEXT_RETRY_5_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-stream-cut-200-notext-retry-5.txt");
+    /// The retries ran out with no text: the `■` row alone under the message.
+    pub const STREAM_CUT_NOTEXT_FINAL_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-stream-cut-200-notext-final.txt");
+    /// Two cut answers, then a whole one: mid-turn at the retry `2/5`.
+    pub const STREAM_CUT_RECOVER_RETRY_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-stream-cut-200-recover-retry-2.txt");
+    /// The same turn ended on the whole answer, no `■` row.
+    pub const STREAM_CUT_RECOVERED_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-stream-cut-200-recovered.txt");
+    /// HTTP 500 on every try, mid-turn: `• Reconnecting... 1/5` over `└
+    /// We’re currently experiencing high demand, which may cause temporary
+    /// errors.`
+    pub const HIGH_DEMAND_RETRY_1_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-stream-cut-500-retry-1.txt");
+    /// The same at `2/5`.
+    pub const HIGH_DEMAND_RETRY_2_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-stream-cut-500-retry-2.txt");
+    /// The 500's retries ran out: `■ We’re currently experiencing high
+    /// demand, …`.
+    pub const HIGH_DEMAND_FINAL_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-stream-cut-500-final.txt");
+    /// HTTP 502 on every try, mid-turn: `└ Unexpected status 502 Bad
+    /// Gateway: …` under the retry row.
+    pub const STATUS_502_RETRY_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-stream-cut-502-retry-1.txt");
+    /// The 502's retries ran out: `■ unexpected status 502 Bad Gateway: …`,
+    /// the SSE body it quotes wrapped to column 0 under it.
+    pub const STATUS_502_FINAL_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-stream-cut-502-final.txt");
+    /// The default footer after a turn at 6% of the context: no `% context
+    /// left` item.
+    pub const CTX_DEFAULT_0_163: &str = include_str!("fixtures/codex-0.163.0-ctx-turn1-15k.txt");
+    /// A turn at 89% of the context running: the default footer, no item.
+    pub const CTX_BUSY_0_163: &str = include_str!("fixtures/codex-0.163.0-ctx-busy-89pct.txt");
+    /// A pre-turn auto-compaction running: `• Compacting context (0s • esc
+    /// to interrupt)` over `└ Making room to continue.`
+    pub const COMPACTING_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-ctx-compacting-busy.txt");
+    /// The turn after that compaction ended: `• Context compacted · 0s` above
+    /// its answer, `⚠ 1 warning · f2 to view` at the key-hint row's end.
+    pub const COMPACTED_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-ctx-turn5-99pct-compacted.txt");
+    /// f2 on that warning: the warnings view, no composer.
+    pub const COMPACTION_WARNING_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-ctx-compaction-warning-f2.txt");
+    /// `/status` at 89% of the context (`Context window: 11% left (230K used
+    /// / 258K)`).
+    pub const CTX_STATUS_CARD_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-ctx-status-card-89pct.txt");
+    /// `tui.status_line=[]` (not the default): the footer's own `99% context
+    /// left`, right-aligned on the key-hint row.
+    pub const CTX_LEFT_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-ctx-nostatusline-15k.txt");
+    /// The same at 99.6%: `0% context left` beside `⚠ 1 warning · f2 to
+    /// view`.
+    pub const CTX_LEFT_FULL_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-ctx-nostatusline-99pct.txt");
+    /// The same mid-turn after a compaction: `100% context left`.
+    pub const CTX_LEFT_BUSY_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-ctx-nostatusline-busy-95pct.txt");
+    /// A status line configured with the context items (not the default):
+    /// `Context 52% left · Context 48% used` in the status row.
+    pub const CTX_STATUS_LINE_ITEMS_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-ctx-statusline-configured-50pct.txt");
+    /// `/model`'s model box.
+    pub const MODEL_PICK_0_163: &str = include_str!("fixtures/codex-0.163.0-model-picker.txt");
+    /// `/model`'s effort box for `GPT-6-Astra`.
+    pub const EFFORT_PICK_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-model-effort-picker.txt");
+    /// The effort chosen with `s`: `• Model changed to gpt-6-astra medium for
+    /// this session only` under the last turn, the footer's new model.
+    pub const MODEL_CHANGED_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-model-changed-session.txt");
+    /// `/permissions`: the `Update Model Permissions` menu.
+    pub const PERMISSIONS_0_163: &str = include_str!("fixtures/codex-0.163.0-permissions-menu.txt");
+    /// `3. Full Access` and Enter: the `Enable full access?` confirmation,
+    /// drawn centred over the transcript with the composer still under it.
+    pub const FULL_ACCESS_CONFIRM_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-permissions-full-access-confirm.txt");
+    /// Full access applied: `• Permission selection requested: Full Access`
+    /// under the last turn.
+    pub const FULL_ACCESS_APPLIED_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-permissions-full-access-applied.txt");
+    /// `codex resume <thread> -a on-request -s read-only`: the conversation
+    /// redrawn before any turn.
+    pub const RESUMED_0_163: &str = include_str!("fixtures/codex-0.163.0-resumed.txt");
+    /// The same after one turn.
+    pub const RESUMED_AFTER_TURN_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-resumed-after-turn.txt");
+    /// `/permissions` after that resume: `Read Only (current)`.
+    pub const RESUMED_PERMISSIONS_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-resumed-permissions-menu.txt");
+    /// `/permissions` after a resume with no `-a`/`-s`: `Full Access
+    /// (current)`, the session's own choice kept.
+    pub const RESUMED_NOFLAGS_PERMISSIONS_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-resumed-noflags-permissions-menu.txt");
+
+    /// 0.163.0 IN THE LAB, MEASURED (the real Codex on the ALTERNATE screen,
+    /// the lab's stub of the Responses API): Plan mode's question, raised by
+    /// a scripted `request_user_input` call, over a transcript holding an
+    /// ended turn, a declined exec box and the switch to Plan mode.
+    pub const QUESTION_LAB_0_163: &str = include_str!("fixtures/codex-0.163.0-lab-question.txt");
+    /// 0.163.0 IN THE LAB, MEASURED: that question answered by `aterm drive
+    /// answer`'s digit 2 (`Questions 1/1 answered`, `answer: Long-term`), the
+    /// next answer with a `└ Tip:` row under it, and its end row.
+    pub const QUESTION_ANSWERED_LAB_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-lab-question-answered.txt");
+    /// 0.163.0 IN THE LAB, MEASURED: a second question dismissed with Esc,
+    /// the turn ended on `■ Conversation interrupted - use /feedback if
+    /// something went wrong`.
+    pub const QUESTION_ESC_LAB_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-lab-question-esc.txt");
+    /// 0.163.0 IN THE LAB, MEASURED: a reply taller than the screen (60
+    /// paragraphs in one answer) drawn in one frame — the user's row pinned
+    /// on the screen's top row over paragraph 40, the first 39 never drawn —
+    /// its end row, the composer and the footer.
+    pub const TALL_REPLY_LAB_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-lab-tall-reply.txt");
+    /// 0.163.0 IN THE LAB, MEASURED: a reply taller than the screen STREAMED
+    /// in small deltas (70 paragraphs) — the turn's prompt PINNED on the
+    /// screen's top row over paragraph 50, while its own row and paragraphs
+    /// 1 to 49 went to the host's archive (`offscreen` `back=0`) — its end
+    /// row, the composer and the footer.
+    pub const PINNED_PROMPT_LAB_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-lab-pinned-prompt.txt");
+    /// 0.163.0 IN THE LAB, MEASURED: the same, the reply ending on a question
+    /// (`Shall I write the migration plan now?`), the prompt pinned over
+    /// paragraph 51.
+    pub const PINNED_QUESTION_LAB_0_163: &str =
+        include_str!("fixtures/codex-0.163.0-lab-pinned-question.txt");
 }
 
 #[cfg(test)]

@@ -1,30 +1,16 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! LZ4 decompression fuzz target.
+//! Fuzzes the scrollback LZ4 wrapper: decompression never panics, round-trips
+//! are exact, oversized size prefixes are rejected, truncations are handled.
 //!
-//! This fuzzer tests the inline LZ4 block decompressor with arbitrary byte
-//! sequences, verifying that it never panics and that round-trips are
-//! faithful.
-//!
-//! ## Running
-//!
-//! STOCK EXCEPTION (Trust ships no cargo-fuzz and no ASan runtime; measured
-//! 2026-09-28: `targo fuzz` → "no such command: `fuzz`"). This lane runs on a
-//! stock nightly:
+//! STOCK EXCEPTION: Trust ships no cargo-fuzz and no ASan runtime, so this lane
+//! runs on a stock nightly:
 //!
 //! ```bash
 //! cd crates/aterm-scrollback
 //! cargo +nightly fuzz run lz4_decompress -- -max_total_time=60 -timeout=10
 //! ```
-//!
-//! ## Properties Tested
-//!
-//! - `decompress_size_prepended` never panics on any input (returns `Err` for
-//!   malformed data)
-//! - Round-trip: `decompress(compress(data)) == data` for all valid inputs
-//! - Allocation bomb protection: oversized size prefixes are rejected
-//! - No memory corruption from overlapping back-references
 
 #![no_main]
 
@@ -33,23 +19,12 @@ use libfuzzer_sys::fuzz_target;
 use aterm_scrollback::lz4::{compress_prepend_size, decompress_size_prepended};
 
 fuzz_target!(|data: &[u8]| {
-    // -----------------------------------------------------------------------
-    // Property 1: decompress never panics on arbitrary input.
-    //
-    // The decompressor must return Ok or Err for any byte sequence. This is
-    // security-critical because scrollback pages stored on disk could be
-    // corrupted or tampered with.
-    // -----------------------------------------------------------------------
+    // Arbitrary input: Ok or Err, never a panic (on-disk pages can be corrupt
+    // or tampered with).
     let _ = decompress_size_prepended(data);
 
-    // -----------------------------------------------------------------------
-    // Property 2: round-trip fidelity.
-    //
-    // Use the fuzzer input as "original data" to compress, then decompress
-    // and verify the output matches. Cap the input length to avoid spending
-    // all fuzzer time on huge allocations -- 256 KiB is well above any real
-    // scrollback page size.
-    // -----------------------------------------------------------------------
+    // Round-trip, capped at 256 KiB (well above any real page) to keep the
+    // fuzzer off huge allocations.
     if data.len() <= 256 * 1024 {
         if let Ok(compressed) = compress_prepend_size(data) {
             let decompressed = decompress_size_prepended(&compressed)
@@ -63,15 +38,8 @@ fuzz_target!(|data: &[u8]| {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Property 3: allocation bomb rejection.
-    //
-    // Craft a 4-byte size prefix claiming a huge decompressed size followed
-    // by the fuzzer payload as the "block". The decompressor must reject
-    // sizes above the 64 MiB page cap without allocating.
-    // -----------------------------------------------------------------------
+    // A size prefix above the 64 MiB page cap is rejected without allocating.
     if data.len() >= 4 {
-        // Inject an oversized size prefix (65 MiB) before the rest of the data.
         let bomb_size: u32 = 65 * 1024 * 1024;
         let mut bomb_input = bomb_size.to_le_bytes().to_vec();
         bomb_input.extend_from_slice(&data[4..]);
@@ -82,13 +50,8 @@ fuzz_target!(|data: &[u8]| {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // Property 4: truncated compressed data is handled gracefully.
-    //
-    // Take valid compressed output and truncate it at every possible byte
-    // offset. The decompressor must not panic on any truncation. Only do
-    // this for small inputs to keep the fuzzer fast.
-    // -----------------------------------------------------------------------
+    // Every truncation of valid output is handled without a panic (small
+    // inputs only, to keep the fuzzer fast).
     if data.len() <= 512 {
         if let Ok(compressed) = compress_prepend_size(data) {
             for trim in 0..compressed.len() {

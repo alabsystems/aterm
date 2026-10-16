@@ -1,51 +1,35 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The motion layer (design §10.4.6, amended by rulings 136–141 on the merge
-//! with main's full-width meter): what a row's indicator looks like at one
-//! frame instant, as data the host paints — never as time folded into the
-//! layout. The [`crate::glass::Presentation`] stays TIME-FREE and
-//! fingerprinted; a [`BandMotion`] overlays only the row's
-//! SURFACE, the time slots, the glyph cell and an echo's fade, so an
-//! animation never re-runs the width law and NEVER RE-GRIDS.
+//! The motion layer (design §10.4.6): what a row's indicator looks like at one
+//! frame instant, as data the host paints. The [`crate::glass::Presentation`]
+//! stays time-free and fingerprinted; a [`BandMotion`] overlays only the row's
+//! surface, the time slots, the glyph cell and an echo's fade, so an animation
+//! never re-runs the width law and never re-grids.
 //!
-//! # Fractions of the row, not cells (ruling 140)
+//! The meter is the row: 0 % is the window's left edge and 100 % its right
+//! edge, gutters included. Motion speaks in Q16 fractions of the row ([`ROW`]);
+//! a [`Surface`] is a piecewise-linear profile of [`Tone`]s along it, and
+//! [`Surface::span`] gives any pixel span (a cell, a gutter) its mean tone,
+//! which is the sub-cell coverage under a fill's edge. Every cell is a
+//! whole-cell background tone, never meter ink (the per-cell contrast floor
+//! could repaint ink); motion is smooth because the tones move continuously.
 //!
-//! THE METER IS THE ROW (ruling 55): 0 % is the window's left edge and 100 %
-//! its right edge, gutters included. So the motion speaks in FRACTIONS of the
-//! row ([`ROW`] = the whole of it, Q16) and the host maps them onto its
-//! window's pixels: a [`Surface`] is a piecewise-linear profile of
-//! [`Tone`]s along the row, and [`Surface::span`] gives the tone of any pixel
-//! span of it — a cell, a gutter — as the MEAN over the span. That mean IS
-//! the sub-cell coverage ruling 138 asks for: the cell under a fill's edge
-//! takes `mix(track, fill, coverage)`, where coverage is the lit fraction of
-//! its window-pixel span, and the comet's soft gradient and the glint come
-//! through the same integral. Every cell is a whole-cell BACKGROUND tone —
-//! never meter ink, which the per-cell contrast floor could repaint (ruling
-//! 55's reason) — and the motion is smooth because the TONES move
-//! continuously, not because a glyph splits a cell.
-//!
-//! Everything here is clockless and integer: positions are Q16 fractions of
-//! the row, phases milliseconds. The same state at the same frame instant is
-//! the same frame on every target, so CPU, GPU, native and wasm draw
-//! identical pixels.
+//! Clockless and integer: the same state at the same frame instant is the same
+//! frame on every target (CPU, GPU, native, wasm).
 //!
 //! # The looks
 //!
-//! * **Moving, graded** — the comet for BUSY work: a soft gradient of tones
-//!   about a fifth of the row long ([`COMET_PERMILLE`]) — a tail rising as
-//!   the square of its length into a hot head, and a soft leading edge — that
-//!   enters through the window's left edge and leaves through its right, one
-//!   breathing crossing per [`COMET_PERIOD`], the next entering as it leaves
-//!   (the glyph cell keeps the row's own glyph, since the comet already
-//!   moves — ruling 251). The bar for work with a fill: its edge at the
-//!   data (sub-cell coverage), a data glide and a travelling glint (dimmed,
-//!   the glint parked, while the bytes are stalled). The echo's fill, glow
-//!   and fade on completion, over the whole row.
-//! * **Still** — the bar at its data, a busy row's unlit track, a held ✓:
-//!   the information stays, the movement goes.
-//! * **Flat** (High Contrast) — track and full fill only: a cell takes the
-//!   tone at its centre ([`Surface::flat`]), no glint, no tint, no fade.
+//! * **Moving, graded**: for busy work, the comet (a gradient a quarter of the
+//!   row long, [`COMET_PERMILLE`]: a tail rising as the square into a hot head,
+//!   then a soft leading edge) crossing the row once per [`COMET_PERIOD`], the
+//!   next entering as it leaves; the glyph cell keeps the row's glyph. For work
+//!   with a fill, the bar: its edge at the data, a data glide and a travelling
+//!   glint (dimmed, glint parked, while the bytes stall). On completion, the
+//!   echo's fill, glow and fade over the whole row.
+//! * **Still**: the bar at its data, a busy row's unlit track, a held ✓.
+//! * **Flat** (High Contrast): track and full fill only; a cell takes the tone
+//!   at its centre ([`Surface::flat`]), no glint, no tint, no fade.
 
 #![allow(
     clippy::many_single_char_names,
@@ -62,7 +46,7 @@ use crate::{
 };
 
 /// The whole row as a fraction: Q16, `0` at the window's left edge and `ROW`
-/// at its right edge (ruling 55's mapping).
+/// at its right edge.
 pub const ROW: u32 = 65_536;
 
 /// Whether the band moves: [`Pace::Moving`] on a focused, on-screen window
@@ -100,12 +84,11 @@ impl Look {
     };
 }
 
-/// One tone of the row's surface, as three mixes the host resolves against
-/// its palette: `fill` from the track toward the fill ink (the theme's cursor
-/// accent — the owner's "cursor trail theme" — `warn` on a Warn/Error row,
-/// HIGHLIGHT under High Contrast: ruling 137), then `lift` toward the glint
-/// ink (a lift of the fill tone), then `warn` toward the fault hue (each
-/// 0–255).
+/// One tone of the row's surface, as three mixes (each 0–255) the host
+/// resolves against its palette: `fill` from the track toward the fill ink
+/// (the theme's cursor accent, `warn` on a Warn/Error row, HIGHLIGHT under
+/// High Contrast), then `lift` toward the glint ink, then `warn` toward the
+/// fault hue.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub struct Tone {
     /// Track → fill.
@@ -135,10 +118,9 @@ impl Tone {
         lift: COMET_HEAD_LIFT,
         warn: 0,
     };
-    /// A determinate fill whose bytes have STALLED: a dim slate of the fill
-    /// ink that reads as DORMANT, the glint parked — the yellow `stalled`
-    /// word beside it carries the warning. (Mixing warn into the fill gives
-    /// sage green, the success hue, right beside that word.)
+    /// A determinate fill whose bytes have stalled: a dim slate of the fill
+    /// ink, the glint parked; the `stalled` word carries the warning (warn
+    /// mixed into the fill reads as the success green beside it).
     pub const STALLED: Tone = Tone {
         fill: 120,
         lift: 0,
@@ -146,11 +128,9 @@ impl Tone {
     };
 }
 
-/// A [`Tone`] read to 1/256 of a step in each channel (`0..=255·256`) —
-/// what [`Surface::span_fine`] gives a host that mixes a cell's colour and
-/// rounds it ONCE: a byte tone per cell rounds each cell's mean on its own,
-/// and at the comet's tail those ±½-step errors alternated along the row
-/// (design ruling 157).
+/// A [`Tone`] to 1/256 of a step per channel (`0..=255·256`), from
+/// [`Surface::span_fine`], for a host that mixes a cell's colour and rounds it
+/// once: per-cell byte rounding alternates ±½ step along the comet's tail.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub struct FineTone {
     /// Track → fill, ×256.
@@ -180,29 +160,28 @@ pub struct Stop {
     pub tone: Tone,
 }
 
-/// A row's surface at one frame: the tones along the WHOLE row, left edge to
-/// right edge, piecewise-linear between [`Stop`]s. Two stops at one `at` are
-/// a hard edge (the left limit, then the right). Empty: the row has no meter
-/// and no track — it paints its plain band.
+/// A row's surface at one frame: the tones along the whole row, edge to edge,
+/// piecewise-linear between [`Stop`]s. Two stops at one `at` are a hard edge
+/// (the left limit, then the right). Empty: no meter and no track, the plain
+/// band.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
 pub struct Surface {
     /// Left to right, `at` non-decreasing; the first at 0 and the last at
     /// [`ROW`] when not empty.
     pub stops: Vec<Stop>,
-    /// The flat look: a pixel span takes the tone at its CENTRE — hard edges,
-    /// whole palette inks (High Contrast). Otherwise the MEAN over the span:
-    /// sub-cell coverage.
+    /// The flat look (High Contrast): a pixel span takes the tone at its
+    /// centre, hard edges and whole palette inks. Otherwise the mean over the
+    /// span: sub-cell coverage.
     pub flat: bool,
-    /// Where a determinate fill ENDS (Q16 of the row), when it ends inside
-    /// the row: the one hard edge of the surface, which the host draws as a
-    /// crisp line through the letters — the fill's ink left of it, the
-    /// track's right of it (design ruling 242). `None` for a comet, an empty
+    /// Where a determinate fill ends (Q16 of the row), when inside the row: the
+    /// surface's one hard edge, which the host draws as a crisp line through
+    /// the letters (fill ink left, track right). `None` for a comet, an empty
     /// track and a whole fill.
     pub edge: Option<u32>,
-    /// The surface is a RAIL (design ruling 243): a measured LEVEL, drawn in
-    /// the row's lowest pixels only (below the descenders, in the warn hue)
-    /// from 0 to its level across the whole window, with the words on the
-    /// band's own ground above it. Never a fill the words ride.
+    /// The surface is a rail: a measured level, drawn in the row's lowest
+    /// pixels only (below the descenders, in the warn hue) from 0 to its level
+    /// across the window, under the band's own ground. Never a fill the words
+    /// ride.
     pub rail: bool,
 }
 
@@ -217,7 +196,7 @@ impl Surface {
         }
     }
 
-    /// This surface as a RAIL ([`Surface::rail`]).
+    /// This surface as a rail ([`Surface::rail`]).
     #[must_use]
     pub fn as_rail(mut self) -> Self {
         self.rail = true;
@@ -252,22 +231,15 @@ impl Surface {
         }
     }
 
-    /// The tone of the pixel span `[x0, x1)` of a row `w` pixels wide — a
-    /// cell, or a gutter — mapped as ruling 55 maps the fill: pixel 0 is the
-    /// row's left edge and pixel `w` its right. Graded: the MEAN tone over
-    /// the span (the sub-cell coverage of ruling 138: the cell under a fill's
-    /// edge is `mix(track, fill, coverage)`). Flat: the tone at the span's
-    /// centre — except at the row's ENDS, which keep ruling 55's honest ends
-    /// in whole cells (main's `lit.clamp(1, cols − 1)`): the span that starts
-    /// at the left edge takes the tone AT that edge, so any started fill
-    /// lights it, and the span that ends at the right edge takes the tone
-    /// just inside it, so only a whole fill does (with
-    /// the gutters in the edge columns, their centres left 1 ‰ an empty
-    /// track and lit the whole window at 99 %). A span that is the whole row
-    /// takes its centre. The centre is read as its left limit, so a span
-    /// whose centre sits exactly on a fill's edge is lit (main's "every
-    /// column whose centre is at or left of the edge"). [`Tone::TRACK`] on an empty surface or a degenerate
-    /// row.
+    /// The tone of the pixel span `[x0, x1)` (a cell or a gutter) of a row `w`
+    /// pixels wide, pixel 0 at its left edge. Graded: the mean tone over the
+    /// span, so the cell under a fill's edge is `mix(track, fill, coverage)`.
+    /// Flat: the tone at the span's centre, read as its left limit so a centre
+    /// exactly on a fill's edge is lit; but a span starting at the left edge
+    /// takes the tone at that edge (any started fill lights it), one ending at
+    /// the right edge the tone just inside it (only a whole fill lights it),
+    /// and a whole-row span its centre. [`Tone::TRACK`] on an empty surface or
+    /// a degenerate row.
     #[must_use]
     pub fn span(&self, x0: u64, x1: u64, w: u64) -> Tone {
         match self.span_sums(x0, x1, w) {
@@ -303,9 +275,9 @@ impl Surface {
         }
     }
 
-    /// The span's tone when it is a POINT (an empty surface, a degenerate
-    /// row, the flat look), else each channel's trapezoid sum scaled by
-    /// 2^20 and the span it is over.
+    /// The span's tone when it is a point (an empty surface, a degenerate row,
+    /// the flat look), else each channel's trapezoid sum scaled by 2^20 and
+    /// the span it is over.
     fn span_sums(&self, x0: u64, x1: u64, w: u64) -> Result<Tone, ([i128; 3], i128)> {
         if self.stops.is_empty() || w == 0 {
             return Ok(Tone::TRACK);
@@ -316,9 +288,9 @@ impl Surface {
                 (true, false) if x1 > x0 => 0,
                 (false, true) if x1 > x0 => ROW - 1,
                 _ => {
-                    // The LEFT limit at the centre: a column whose centre is
-                    // at or left of a fill's edge is lit (main's mapping), so
-                    // one column is lit from 500 ‰.
+                    // The left limit at the centre: a column whose centre is
+                    // at or left of a fill's edge is lit, so one column is lit
+                    // from 500 ‰.
                     let mid = (x0 + x1) * u64::from(ROW) / (2 * w);
                     u32::try_from(mid.saturating_sub(1)).unwrap_or(ROW)
                 }
@@ -353,23 +325,19 @@ impl Surface {
         Err((sum, b - a))
     }
 
-    /// The tones of `cols` equal cells across the row — the engine's own
-    /// cell-resolution reading of a frame, which the motion deadline compares
-    /// to ask only for frames that draw something new. (The host's cells sit
-    /// between its gutters; this grid is the row without them.)
+    /// The tones of `cols` equal cells across the row (no gutters): the
+    /// engine's cell-resolution reading of a frame, which the motion deadline
+    /// compares to ask only for frames that draw something new.
     #[must_use]
     pub fn cells(&self, cols: usize) -> Vec<Tone> {
         let w = cols as u64;
         (0..w).map(|c| self.span(c, c + 1, w)).collect()
     }
 
-    /// The FAULT WASH at `u` (0–255, ruling 244): every stop's fill ink
-    /// hands its coverage over to the warn ink — `fill · (1 − u)` of the fill
-    /// and `fill · u` of warn — a premultiplied cross-fade, so every point
-    /// stays inside the linear-light hull of the track, the fill and warn and
-    /// never passes through another hue (the `OkLCh` turn of ruling 156 sent a
-    /// blue fill through magenta and ochre, and a green one through lime).
-    /// The empty track keeps its own tone.
+    /// The fault wash at `u` (0–255): each stop's fill hands its coverage to
+    /// the warn ink (`fill · (1 − u)` fill, `fill · u` warn), a premultiplied
+    /// cross-fade that stays inside the track–fill–warn hull and never passes
+    /// through another hue. The empty track keeps its tone.
     #[must_use]
     fn washed(mut self, u: u8) -> Self {
         for s in &mut self.stops {
@@ -384,8 +352,8 @@ impl Surface {
         self
     }
 
-    /// Every stop drained toward the track by `keep` (0–255 of its tone
-    /// kept): a busy row's frozen comet at its Fault (ruling 244).
+    /// Every stop drained toward the track by `keep` (0–255 of its tone kept):
+    /// a busy row's frozen comet at its Fault.
     #[must_use]
     fn drained(mut self, keep: u8) -> Self {
         let k = u16::from(keep);
@@ -417,10 +385,9 @@ fn lerp_tone(a: Tone, b: Tone, num: u64, den: u64) -> Tone {
     }
 }
 
-/// Clip a profile given at positions that may lie OUTSIDE the row (a comet
-/// entering or leaving) to `[0, ROW]`: the tones at the two ends are
-/// interpolated, the points inside kept — hard edges included. Beyond the
-/// first and last point the profile is the track.
+/// Clip a profile whose positions may lie outside the row (a comet entering
+/// or leaving) to `[0, ROW]`: the end tones are interpolated, the points inside
+/// kept, hard edges included. Beyond the first and last point is the track.
 fn clipped(points: &[(i64, Tone)], flat: bool) -> Surface {
     let row = i64::from(ROW);
     let at = |x: i64| -> Tone {
@@ -442,9 +409,7 @@ fn clipped(points: &[(i64, Tone)], flat: bool) -> Surface {
             None => Tone::TRACK,
         }
     };
-    // One allocation per surface: the start, every interior point, the end
-    // (a busy row's 32-chord tail would otherwise regrow a `vec![_]` five
-    // times on every frame).
+    // One allocation per surface: the start, every interior point, the end.
     let mut stops = Vec::with_capacity(points.len() + 2);
     stops.push(Stop { at: 0, tone: at(0) });
     for &(x, tone) in points {
@@ -515,10 +480,11 @@ pub enum Anim {
 pub struct RowMotion {
     /// The row's surface, edge to edge of the window (empty: the plain band).
     pub surface: Surface,
-    /// The elapsed words of busy work.
+    /// The elapsed words of busy work; an echo's `done` or `failed` when the
+    /// row has no ETA slot.
     pub readout: Option<String>,
-    /// The ETA words, `stalled`, or the elapsed clock while the estimate is
-    /// hidden.
+    /// The ETA words or `stalled`, blank while the estimate is hidden; an
+    /// echo's `done` or `failed`.
     pub eta: Option<String>,
     /// An echo's fade: 0 opaque … 255 gone.
     pub fade: u8,
@@ -540,9 +506,9 @@ pub struct BandMotion {
 }
 
 impl BandMotion {
-    /// The repaint-key term: **0 when no row has motion or an indicator**,
-    /// else a nonzero FNV-1a over what the frame draws — never over `at`, so
-    /// two frames that draw the same surfaces are the same key.
+    /// The repaint-key term: 0 when no row has motion or an indicator, else a
+    /// nonzero FNV-1a over what the frame draws, never over `at`, so two
+    /// frames that draw the same surfaces are the same key.
     #[must_use]
     pub fn fingerprint(&self) -> u64 {
         if self.rows.iter().all(|r| *r == RowMotion::default()) {
@@ -598,9 +564,8 @@ pub(crate) fn ease_out_cubic(u: u32) -> u32 {
     u32::try_from(ONE - ((((v * v) >> 16) * v) >> 16)).unwrap_or(u32::MAX)
 }
 
-/// Ease-out quadratic: `1 − (1 − u)²` — a glide's curve (design ruling
-/// 245): its peak speed is twice its mean, at the start, and it lands with
-/// no overshoot.
+/// Ease-out quadratic: `1 − (1 − u)²`, a glide's curve: peak speed twice the
+/// mean, at the start, and no overshoot.
 #[must_use]
 pub fn ease_out_quad(u: u32) -> u32 {
     let v = ONE - u64::from(u).min(ONE);
@@ -638,10 +603,9 @@ fn permille_q16(p: u32) -> i64 {
 
 // ---- the recipes --------------------------------------------------------------
 
-/// How long a glide from `from` to `to` (permille) takes (design ruling
-/// 245): [`FILL_GLIDE`] plus [`FILL_GLIDE_PER_POINT`] for every percentage
-/// point it travels, at most [`FILL_GLIDE_MAX`] — so a big jump is not a
-/// staircase of four or five hops, and a small one still lands quickly.
+/// How long a glide from `from` to `to` (permille) takes: [`FILL_GLIDE`] plus
+/// [`FILL_GLIDE_PER_POINT`] per percentage point, at most [`FILL_GLIDE_MAX`],
+/// so a big jump is not a staircase of hops and a small one lands quickly.
 #[must_use]
 pub fn glide_span(from: u16, to: u16) -> Duration {
     let points_x10 = u64::from(from.abs_diff(to));
@@ -670,7 +634,7 @@ fn frac_fine(t: Duration, span: Duration) -> u32 {
 }
 
 /// The comet's head, Q16 of the row, `age` into its crossing: from one
-/// leading edge LEFT of the row (nothing lit) to one tail RIGHT of it
+/// leading edge left of the row (nothing lit) to one tail right of it
 /// (nothing lit), breathing, over [`COMET_PERIOD`].
 #[must_use]
 pub(crate) fn comet_head(age: Duration) -> i64 {
@@ -680,18 +644,14 @@ pub(crate) fn comet_head(age: Duration) -> i64 {
     -lead + ((i64::from(breath(frac(age, COMET_PERIOD))) * travel) >> 16)
 }
 
-/// The comet `since` into the motion: one comet on the row at a time — it
-/// enters through the window's left edge as the last one leaves through the
-/// right, so the row is never empty for longer than the crossing's last
-/// frame.
+/// The comet `since` into the motion: one comet on the row at a time, entering
+/// at the left edge as the last one leaves at the right.
 ///
-/// Graded: a tail [`COMET_PERMILLE`] − [`COMET_LEAD_PERMILLE`] of the row
-/// long, its fill rising as the square of the distance into the hot head
-/// ([`Tone::HEAD`], lifted toward the glint over the tail's last half), then
-/// a soft leading edge falling to the track over [`COMET_LEAD_PERMILLE`] —
-/// one continuous gradient with no hard edge anywhere (every stop at its own
-/// position); the window's own edges are the only ends it has. Flat: a solid
-/// segment in the full ink with hard ends, the same timing.
+/// Graded: a tail [`COMET_PERMILLE`] − [`COMET_LEAD_PERMILLE`] of the row long,
+/// its fill rising as the square of the distance into the hot head
+/// ([`Tone::HEAD`], lifted toward the glint over the tail's last half), then a
+/// soft leading edge falling to the track over [`COMET_LEAD_PERMILLE`]; no hard
+/// edge anywhere. Flat: a solid full-ink segment with hard ends, same timing.
 #[must_use]
 pub fn comet(since: Duration, graded: bool) -> Surface {
     let period = COMET_PERIOD.as_millis().max(1);
@@ -721,10 +681,8 @@ pub fn comet(since: Duration, graded: bool) -> Surface {
 }
 
 /// The tail's segments: fine enough that a cell (a tail spans ~10 cells at
-/// 60 columns, ~32 at 200) sees the curve and not the chords. At 8 the
-/// steps between neighbouring cells came in pairs and jumped at each chord's
-/// end — faint vertical stripes along the tail at capture scale (design
-/// ruling 157).
+/// 60 columns, ~34 at 200) sees the curve and not the chords; 8 showed faint
+/// vertical stripes along the tail.
 const TAIL_STOPS: i64 = 32;
 
 /// The tail's tone `k/TAIL_STOPS` of the way from its end to the head: the
@@ -761,18 +719,15 @@ pub fn glint_radius(cols: usize) -> i64 {
 }
 
 /// A raised-cosine lift of radius `r` (Q16) at distance `d` from its centre,
-/// scaled to `peak` (0–255): `peak · ½(1 + cos(π·d/r))`, 0 from `r` out —
-/// a bump with no corner anywhere, so the lift reads as light moving along
-/// the bar, not as a smudge with edges (design ruling 242). Integer: the
-/// cosine is a quintic fit, exact at both ends and the middle.
+/// scaled to `peak` (0–255): `peak · ½(1 + cos(π·d/r))`, 0 from `r` out, a
+/// bump with no corner so it reads as light moving along the bar.
 fn raised_cosine(d: i64, r: i64, peak: u8) -> u8 {
     let d = d.abs();
     if d >= r || r <= 0 {
         return 0;
     }
-    // x = d/r in Q16; ½(1 + cos πx) = 1 − smootherstep-like fit: use the
-    // exact identity ½(1 + cos πx) = cos²(πx/2), with cos(πx/2) from its
-    // Taylor series to x⁶ (error < 4e-4 over [0, 1]).
+    // ½(1 + cos πx) = cos²(πx/2), x = d/r in Q16, with cos(πx/2) by its Taylor
+    // series to the sixth power (under 2e-4 off after squaring, over [0, 1]).
     let x = (d << 16) / r; // 0..65536
     let y = (x * 102_944) >> 16; // πx/2 in Q16 (π/2 = 1.5708 → 102 944)
     let y2 = (y * y) >> 16;
@@ -791,30 +746,27 @@ pub(crate) fn bar_glints(shown: u16) -> bool {
     u32::from(shown) * 2 >= GLINT_RADIUS_PERMILLE
 }
 
-/// A determinate bar at `shown` permille OF THE ROW (ruling 55: 0 % an empty
-/// track, 100 % the window edge to edge, 50 % its middle): the fill ink from
-/// the row's left edge to the data, a hard edge there — the host draws it as
-/// a crisp line through the letters ([`Surface::edge`], ruling 242) — and
-/// the track beyond. `glint` is how far into its travel a glint is (graded
-/// bars only; it lifts the fill, never the track).
+/// A determinate bar at `shown` permille of the row (0 % an empty track, 100 %
+/// the window edge to edge): the fill ink from the left edge to the data, a
+/// hard edge there ([`Surface::edge`]), and the track beyond. `glint` is how
+/// far into its travel a glint is (graded bars only; it lifts the fill, never
+/// the track).
 #[must_use]
 pub fn bar(shown: u16, glint: Option<Duration>, graded: bool) -> Surface {
     bar_at(permille_q16(u32::from(shown)), glint, graded, 0)
 }
 
-/// [`bar`] with its edge at `edge` (Q16 of the row — a glide is read finer
-/// than a permille, ruling 245) on a row `cols` columns wide (the glint's
-/// least width, [`glint_radius`]; 0 for none).
+/// [`bar`] with its edge at `edge` (Q16 of the row, so a glide reads finer
+/// than a permille) on a row `cols` columns wide (the glint's least width,
+/// [`glint_radius`]; 0 for none).
 #[must_use]
 pub fn bar_at(edge: i64, glint: Option<Duration>, graded: bool, cols: usize) -> Surface {
     bar_in(edge, glint, graded, Tone::FULL, cols)
 }
 
-/// The bar of a download whose bytes have STALLED: the fill dimmed
-/// ([`Tone::STALLED`]) with no glint — the travelling sheen said "working"
-/// while the words said "stalled". Flat looks keep the
-/// full ink: High Contrast discards gradation, and its words carry the
-/// stall.
+/// The bar of a download whose bytes have stalled: the fill dimmed
+/// ([`Tone::STALLED`]) with no glint, so no sheen says "working" beside the
+/// `stalled` words. Flat looks keep the full ink; the words carry the stall.
 #[must_use]
 pub(crate) fn stalled_bar(shown: u16, graded: bool) -> Surface {
     let tone = if graded { Tone::STALLED } else { Tone::FULL };
@@ -888,10 +840,9 @@ fn bar_in(e: i64, glint: Option<Duration>, graded: bool, ink: Tone, cols: usize)
     }
 }
 
-/// A full bar with ONE conclusive sweep `t` into its [`ECHO_SWEEP`]: a glint
-/// about four cells wide at 80 columns ([`ECHO_SWEEP_PERMILLE`], never under
-/// a glint's least width) entering through the window's left edge and
-/// leaving through its right, eased like the glint (ruling 244).
+/// A full bar with one conclusive sweep `t` into [`ECHO_SWEEP`]: a glint about
+/// four cells wide at 80 columns ([`ECHO_SWEEP_PERMILLE`], never under a
+/// glint's least width) crossing the row edge to edge, eased like the glint.
 fn swept(t: Duration, cols: usize) -> Surface {
     let row = i64::from(ROW);
     let r = permille_q16(ECHO_SWEEP_PERMILLE).max(glint_radius(cols).min(permille_q16(60)));
@@ -924,24 +875,22 @@ fn swept(t: Duration, cols: usize) -> Surface {
     }
 }
 
-/// A busy row's still form: the unlit track (main's still busy row).
+/// A busy row's still form: the unlit track.
 #[must_use]
 pub(crate) fn track(graded: bool) -> Surface {
     Surface::uniform(Tone::TRACK, !graded)
 }
 
-/// A measured LEVEL's surface (design ruling 243): its RAIL at `level`
-/// (Q16 of the row) — the bar's geometry, drawn by the host in the row's
-/// lowest pixels in the warn hue, never as a fill the words ride, and never
-/// glinting.
+/// A measured level's surface: a rail ([`Surface::rail`]) at `level` (Q16 of
+/// the row) with the bar's geometry, never glinting.
 #[must_use]
 pub fn level_rail(level: i64, graded: bool) -> Surface {
     bar_in(level, None, graded, Tone::FULL, 0).as_rail()
 }
 
-/// How long an echo holds its slot (ruling 244): a Complete's fill glide
-/// ([`glide_span`] from where the bar stood to the window's edge), its
-/// sweep and its fade; a Fault's wash and fade; a Vanish's fade.
+/// How long an echo holds its slot: a Complete's fill glide ([`glide_span`]
+/// from where the bar stood to the window's edge), sweep and fade; a Fault's
+/// wash and fade; a Vanish's fade.
 #[must_use]
 pub fn echo_span(kind: EchoKind, from_permille: u16, indeterminate: bool) -> Duration {
     match kind {
@@ -954,27 +903,23 @@ pub fn echo_span(kind: EchoKind, from_permille: u16, indeterminate: bool) -> Dur
     }
 }
 
-/// A completion echo `t` into its span: the row's surface and the fade. The
-/// band's end of its own indicator — not a row, not pressable, not
-/// announced — over the WHOLE row (ruling 141, amended by ruling 244).
+/// A completion echo `t` into its span: the row's surface and the fade, over
+/// the whole row. Not a row: not pressable, not announced.
 ///
-/// * Complete, moving and graded: the fill glides to the window's right
-///   edge ([`glide_span`], the data glide's own curve), ONE conclusive sweep
-///   crosses the whole row ([`ECHO_SWEEP`]), then the row fades
-///   ([`ECHO_FADE`], ease-in).
-/// * Fault on a bar: the fill cross-fades to a warn WASH over what it
-///   covered ([`ECHO_FAULT_CROSS`], premultiplied — never through another
-///   hue), holds it to [`ECHO_FAULT_FLASH`], and fades; the empty track
-///   keeps its own tone.
-/// * Fault on a busy row: its comet FREEZES where the work failed and drains
-///   to the track ([`ECHO_DRAIN`]); no warn on the surface at all — the ⚠ and
-///   `failed` carry it, on a neutral row.
-/// * Vanish: the last bar fades; a busy row's comet runs on from where the
-///   row retired ([`Echo::comet_since`], ruling 162) while it fades.
-/// * Still: a full bar held (Complete), the wash held (a bar's Fault), the
-///   track (a busy Fault), blank (Vanish).
-/// * Flat: no lift, no tint and no fade; Complete wipes with a hard edge,
-///   then holds.
+/// * Complete, moving and graded: the fill glides to the right edge
+///   ([`glide_span`]), one sweep crosses the row ([`ECHO_SWEEP`]), then the row
+///   fades ([`ECHO_FADE`], ease-in).
+/// * Fault on a bar: the fill cross-fades to a warn wash over what it covered
+///   ([`ECHO_FAULT_CROSS`], premultiplied), holds to [`ECHO_FAULT_FLASH`], and
+///   fades; the empty track keeps its tone.
+/// * Fault on a busy row: the comet freezes where the work failed and drains to
+///   the track ([`ECHO_DRAIN`]); no warn on the surface, the ⚠ and `failed`
+///   carry it.
+/// * Vanish: the last bar fades; a busy row's comet runs on from where the row
+///   retired ([`Echo::comet_since`]) while it fades.
+/// * Still: a full bar (Complete), the wash (a bar's Fault), the track (a busy
+///   Fault), blank (Vanish).
+/// * Flat: no lift, tint or fade; Complete wipes with a hard edge, then holds.
 #[must_use]
 pub(crate) fn echo(e: &Echo, t: Duration, look: Look, cols: usize) -> (Surface, u8) {
     let from = if e.indeterminate { 0 } else { e.from_permille };
@@ -1036,7 +981,7 @@ pub(crate) fn echo(e: &Echo, t: Duration, look: Look, cols: usize) -> (Surface, 
 }
 
 /// [`glide`] in Q16 of the row, unquantized: the edge a glide shows at `t`,
-/// monotone toward `to` (ruling 245).
+/// monotone toward `to`.
 #[must_use]
 pub fn glide_q16(from: u16, to: u16, t: Duration) -> i64 {
     let u = i64::from(ease_out_quad(frac_fine(t, glide_span(from, to))));
@@ -1107,7 +1052,7 @@ mod tests {
         assert_eq!(glide(100, 900, span), 900);
         assert!(glide(100, 900, span / 2) > 500, "eased out");
         assert_eq!(glide(900, 100, span), 100, "down too");
-        // The span scales with the distance (ruling 245).
+        // The span scales with the distance.
         assert_eq!(glide_span(500, 500), FILL_GLIDE);
         assert_eq!(glide_span(0, 100), Duration::from_millis(250));
         assert_eq!(glide_span(0, 500), Duration::from_millis(530));
@@ -1130,13 +1075,10 @@ mod tests {
         }
     }
 
-    /// RULING 55'S MAPPING, KEPT BY RULINGS 136 AND 138: a bar's fill is a
-    /// fraction of the WINDOW — 0 % lights nothing, 100 % the whole row edge
-    /// to edge (both gutters included), 50 % exactly the left half — and the
-    /// one cell under the edge takes `mix(track, fill, coverage)`: the lit
-    /// fraction of its window-pixel span, never a glyph split. Measured over
-    /// a window of 1283 px with 7 px and 12 px gutters around 80 cells of
-    /// 15.8 px (whole pixels: the host's `MeterSpan` geometry).
+    /// A bar's fill is a fraction of the window: 0 % lights nothing, 100 % the
+    /// whole row with both gutters, 50 % exactly the left half, and the cell
+    /// under the edge takes `mix(track, fill, coverage)`. Geometry: a 1283 px
+    /// window, 7 px and 12 px gutters around 79 cells of 16 px.
     #[test]
     fn a_bar_maps_its_fraction_onto_the_window_with_edge_coverage() {
         let (w, lo, cw, cols) = (1283u64, 7u64, 16u64, 79u64);
@@ -1181,12 +1123,9 @@ mod tests {
             let t = cell(&flat, i);
             t == Tone::TRACK || t == Tone::FULL
         }));
-        // …and the ENDS keep ruling 55's honest ends in whole cells (main's
-        // `lit.clamp(1, cols − 1)`), over the host's columns, whose first
-        // and last carry the gutters out to the window's edges: any started
-        // fill lights the first, only a whole one the last (the
-        // centres left 1 ‰ an empty track and lit the whole
-        // window at 99.x %).
+        // …and at the ends, over the host's columns (the first and last carry
+        // the gutters to the window's edges): any started fill lights the
+        // first, only a whole one the last.
         let column = |s: &Surface, i: u64| {
             let x0 = if i == 0 { 0 } else { lo + i * cw };
             let x1 = if i + 1 == cols { w } else { lo + (i + 1) * cw };
@@ -1261,11 +1200,9 @@ mod tests {
         assert!(!bar_glints(10) && bar_glints(15));
     }
 
-    /// Every echo covers the whole row: a Complete echo's wipe ends at the
-    /// window's right edge (100 % is the window edge to edge); a bar's Fault
-    /// washes what the fill covered and the track keeps its own tone; a busy
-    /// row's Fault freezes its comet and drains it to the track, with no warn
-    /// on the surface at all (ruling 244).
+    /// Every echo covers the whole row: a Complete's wipe ends at the window's
+    /// right edge; a bar's Fault washes what the fill covered and leaves the
+    /// track; a busy row's Fault freezes its comet and drains it, with no warn.
     #[test]
     fn echoes_cover_the_whole_row() {
         let mut e = Echo {

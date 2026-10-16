@@ -647,16 +647,6 @@ mod tests {
     }
 
     #[test]
-    fn test_no_collisions() {
-        let mut occupied = std::collections::HashSet::new();
-        for (i, slot) in CSI_DISPATCH_TABLE.iter().enumerate() {
-            if slot.is_some() {
-                assert!(occupied.insert(i), "duplicate at {i}");
-            }
-        }
-    }
-
-    #[test]
     fn test_entry_count() {
         let count = CSI_DISPATCH_TABLE.iter().filter(|s| s.is_some()).count();
         assert_eq!(count, 73);

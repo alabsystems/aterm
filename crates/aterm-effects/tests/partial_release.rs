@@ -229,18 +229,15 @@ fn a_suffix_the_program_cleared_leaves_and_the_prefix_stands() {
         "no light over the cleared cells: {:?}",
         h.lit_cols(5)
     );
-    // A glyph landing later under the still-standing prefix is replaced text
-    // as before — and counted once more, for a different cell.
+    // A glyph landing under the standing prefix is replaced text, counted once more.
     h.program(b"\x1b[6;1HXXX\x1b[6;4H");
     assert_eq!(h.leaving(5), vec![0, 1, 2]);
     assert_eq!(h.retired(), 11);
 }
 
-/// The tail goes with the suffix: `hello world ` (the last key a typed
-/// trailing space the witness never armed) rests 200 ms, then the program
-/// clears from `w` on and parks the caret at the end. The space leaves with
-/// the cleared suffix (no standing glyph of the run lies right of it),
-/// `hello ` stands, and the cohort keeps its clock.
+/// `hello world ` (the trailing space never armed) rests 200 ms, then the program
+/// clears from `w` on: the space leaves with the cleared suffix, since no standing
+/// glyph of the run lies right of it, and the cohort keeps its clock.
 #[test]
 fn a_trailing_space_after_a_suffix_the_program_cleared_leaves_with_it() {
     let mut h = Host::at_row(5);
@@ -273,9 +270,8 @@ fn a_trailing_space_after_a_suffix_the_program_cleared_leaves_with_it() {
     );
 }
 
-/// A whole clear after a partial one is still the text gone whole: the cohort
-/// is abandoned into its retract and the row is dark inside the retract's
-/// span.
+/// A whole clear after a partial one is the text gone whole: the cohort is
+/// abandoned into its retract and the row is dark inside the retract's span.
 #[test]
 fn a_whole_clear_after_a_suffix_the_program_cleared_still_leaves_through_the_swoosh() {
     let mut h = hello(5);
@@ -300,9 +296,8 @@ fn a_whole_clear_after_a_suffix_the_program_cleared_still_leaves_through_the_swo
     );
 }
 
-/// The Ink dance on part of the line: the suffix blanked on one frame, the
-/// same text restored on the next. The stamps are lifted, the cells live
-/// again, nothing was abandoned.
+/// Ink's blank-and-restore on part of the line: the suffix blanked on one frame,
+/// the same text back on the next. The stamps lift and nothing is abandoned.
 #[test]
 fn a_partial_clear_and_an_identical_rewrite_a_frame_later_restore_the_light() {
     let mut h = hello(5);
@@ -322,14 +317,12 @@ fn a_partial_clear_and_an_identical_rewrite_a_frame_later_restore_the_light() {
     );
     assert_eq!(h.cohorts(5), vec![(false, false)]);
     h.idle(300);
-    // The eleven cells, plus the ATTACH the head carries one cell on under
-    // the caret at 11.
+    // The eleven cells, plus the attach the head carries under the caret at 11.
     let lit = h.lit_cols(5);
     assert!(
         (0..11).all(|c| lit.contains(&c)) && lit.iter().all(|&c| c <= 11),
         "and the light stands whole: {lit:?}"
     );
-    // A whole clear after the restored partial still leaves through the swoosh.
     h.program(b"\x1b[6;1H\x1b[2K\x1b[6;1H");
     assert_eq!(
         h.cohorts(5),
@@ -338,8 +331,8 @@ fn a_partial_clear_and_an_identical_rewrite_a_frame_later_restore_the_light() {
         h.cohorts(5),
         h.cells(5)
     );
-    // Each cell once: the eight the partial counted came back and are not
-    // counted again; the whole adds the three letters and the space.
+    // Each cell once: the eight the partial counted came back; the whole adds the
+    // three letters and the space.
     assert_eq!(
         h.retired(),
         12,

@@ -3,7 +3,7 @@
 
 //! Method swizzling: replacing the implementation a live class already has.
 //!
-//! The call site is `vendor/winit/src/platform_impl/macos/app.rs`'s
+//! The call site is `crates/aterm-window/src/platform_impl/macos/app.rs`'s
 //! `override_send_event`, which replaces `-[NSApplication sendEvent:]`'s IMP
 //! so winit sees `keyUp:` while Command is held. [`crate::declare`] cannot do
 //! this: `class_addMethod` returns `NO` for an existing row and
@@ -55,14 +55,13 @@
 //!
 //! # Ordering
 //!
-//! winit's version stores the previous IMP after the swap, leaving a window in
-//! which a dispatch finds it empty and panics in an `extern "C"` frame. This
-//! module publishes the original (`Release`) before the swap, so a dispatch
-//! that reaches the new IMP through libobjc's locked method-list update reads
-//! it with `Acquire`. The edge through libobjc's barriers cannot be annotated
-//! here; store-then-swap strictly dominates swap-then-store. The swap's
-//! return value is checked: if a third party swizzled inside the window, the
-//! site repairs itself and reports [`SwizzleError::Raced`].
+//! The original is published (`Release`) before the swap, so a dispatch that
+//! reaches the new IMP through libobjc's locked method-list update reads it
+//! with `Acquire`. Storing it after the swap would leave a window in which a
+//! dispatch finds the slot empty and panics in an `extern "C"` frame. The edge
+//! through libobjc's barriers cannot be annotated here. The swap's return value
+//! is checked: if a third party swizzled inside the window, the site repairs
+//! itself and reports [`SwizzleError::Raced`].
 //!
 //! # A site claims a row, not an address
 //!
@@ -671,13 +670,10 @@ impl<F: MethodFn> SwizzleSite<F> {
             });
         }
 
-        // Publish before the swap, claiming the site with a compare-exchange.
-        // Publishing first closes the window in which a dispatch reaches the
-        // new implementation with an empty slot. The compare-exchange stops two
-        // concurrent installs from both publishing, which would make the loser
-        // publish the winner's implementation as the original (a self-calling
-        // chain). The `claim()` checks above are only a fast path; the
-        // compare-exchange is what decides.
+        // Publish before the swap (module docs, Ordering). The compare-exchange
+        // stops two concurrent installs from both publishing, which would make
+        // the loser publish the winner's implementation as the original (a
+        // self-calling chain); the `claim()` checks above are only a fast path.
         let claim = Box::into_raw(Box::new(Claim {
             original: current,
             owner,

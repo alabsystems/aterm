@@ -2,10 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Callback types and infrastructure for terminal events.
-//!
-//! Callback type aliases live in the `aterm-types` crate.
-//! This module re-exports them and keeps crate-internal sink adapters.
+//! Callback types for terminal events: the `aterm-types` aliases re-exported, the
+//! color-change callbacks, and the protocol stack and buffer limits.
 
 pub use aterm_types::ColorChangeOp;
 use aterm_types::Rgb;
@@ -13,10 +11,6 @@ use aterm_types::Rgb;
 pub(super) use aterm_types::{
     AdvancedNotificationCallback, ClipboardCallback, NotificationCallback, WindowCallback,
 };
-
-// ----------------------------------------------------------------------------
-// Crate-internal callback types (depend on aterm-core modules)
-// ----------------------------------------------------------------------------
 
 /// Target of a dynamic color change (OSC 10-19, palette). See
 /// [`ColorChangeCallback`] for the callback signature.
@@ -44,10 +38,6 @@ pub(super) type ColorChangeCallback = Box<dyn FnMut(ColorTarget, Rgb, ColorChang
 /// Callback type for dynamic color queries (OSC 10/11/12 with `?`): `Some`
 /// overrides the palette color in the reply, `None` keeps it.
 pub(super) type ColorQueryCallback = Box<dyn FnMut(ColorTarget) -> Option<Rgb> + Send>;
-
-// ----------------------------------------------------------------------------
-// Constants
-// ----------------------------------------------------------------------------
 
 /// Most bytes all active DCS operations may hold (`dcs.total_bytes`); past it
 /// new DCS data is dropped until existing operations complete. Enforced in

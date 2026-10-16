@@ -8,76 +8,52 @@ use aterm_alloc::SmallVec;
 use aterm_rle::Rle;
 use std::sync::Arc;
 
-/// Absolute cap on a single deserialized line's CONTENT byte length.
+/// Absolute cap on a single deserialized line's content byte length.
 ///
-/// A legitimate stored line is one physical grid row: at most `MAX_GRID_COLS`
-/// (4096) cells, each holding at most one grapheme unit bounded by the
-/// materialization cap (`MAX_GRAPHEME_UNIT_BYTES`, ~256 B) — under ~1.05 MiB. The
-/// wire `content_len` is otherwise bounded only by the surrounding buffer (up to
-/// the 64 MiB zstd decode cap for a disk page, or the whole checkpoint body), so a
-/// crafted record could declare a multi-MiB single line that every downstream
-/// consumer (`to_string()`, search, selection, materialization) would then process
-/// unbounded — a memory-amplification DoS. 2 MiB leaves margin over the legitimate
-/// ceiling while capping the pathological line; an over-cap record is skipped
-/// (its `line_size` still advances the decode offset past it, so the rest of the
-/// block still decodes).
+/// A real stored line is one grid row: at most `MAX_GRID_COLS` (4096) cells of
+/// at most one grapheme unit (`MAX_GRAPHEME_UNIT_BYTES`, 256 B) each, under
+/// ~1.05 MiB. The wire `content_len` is otherwise bounded only by the
+/// surrounding buffer (up to the 64 MiB cold decode cap), so a crafted record
+/// could hand every consumer a multi-MiB line. An over-cap record is skipped;
+/// its `line_size` still advances the decode offset.
 pub(crate) const MAX_LINE_CONTENT_BYTES: usize = 2 * 1024 * 1024;
 
-/// Cap on a single deserialized hyperlink URL, mirroring the OSC 8 ingestion
-/// ceiling (`aterm-core`'s `MAX_HYPERLINK_URL_BYTES` = 8192). A URL reaches the
-/// grid — and thus serialization — only after passing that ingestion cap, so a
-/// legitimately serialized span's URL is always `<=` this; a larger `url_len` is
-/// a crafted checkpoint / `.dtrm` page. `MAX_LINE_CONTENT_BYTES` bounds only the
-/// CONTENT section, NOT the hyperlink section, so without this cap the per-line
-/// deserializer would `Arc::from` a multi-MiB URL and produce a stored `Line`
-/// whose retained hyperlink far exceeds the 2 MiB content invariant. An over-cap
-/// span is skipped (its bytes are still stepped over, so the rest decodes).
+/// Cap on a single deserialized hyperlink URL: the OSC 8 ingestion ceiling
+/// (`aterm-core`'s `MAX_HYPERLINK_URL_BYTES`). A larger `url_len` is a crafted
+/// checkpoint or `.dtrm` page, and [`MAX_LINE_CONTENT_BYTES`] does not cover the
+/// hyperlink section. An over-cap span is skipped; its bytes are stepped over.
 pub(crate) const MAX_HYPERLINK_URL_BYTES: usize = 8192;
 
-/// Cap on a single deserialized OSC 8 `id=` parameter, mirroring the ingestion
-/// ceiling (`aterm-core` admits ids of at most 256 bytes). An over-cap id is
-/// dropped (the span keeps its URL with `id = None`), exactly like ingestion's
-/// `id.len() <= 256` filter — the id's bytes are still stepped over so framing
-/// stays aligned.
+/// Cap on a single deserialized OSC 8 `id=`: the ingestion ceiling (`aterm-core`
+/// admits ids of at most 256 bytes). An over-cap id is dropped (the span keeps
+/// its URL with `id = None`); its bytes are still stepped over.
 pub(crate) const MAX_HYPERLINK_ID_BYTES: usize = 256;
 
-/// The most bytes ONE hyperlink span takes in a v3 record whose URL and id are
-/// within the ingestion ceilings above: `start_col:2 + end_col:2 + url_len:4 +
-/// url + id_len:4 + id`, so 8,460 bytes. What an honest writer's links can add
-/// to one line's record is at most this per column
-/// (`line_codec_block::max_linked_record_bytes`).
+/// The most bytes one hyperlink span takes in a v3 record whose URL and id are
+/// within the ceilings above: `start_col:2 + end_col:2 + url_len:4 + url +
+/// id_len:4 + id`, 8,460 bytes. An honest writer's links add at most this per
+/// column to one line's record (`line_codec_block::max_linked_record_bytes`).
 pub(crate) const MAX_HYPERLINK_SPAN_BYTES: usize =
     12 + MAX_HYPERLINK_URL_BYTES + MAX_HYPERLINK_ID_BYTES;
 
-/// Cap on the NUMBER of hyperlink spans in a single deserialized line, matching
-/// `MAX_GRID_COLS` (aterm-grid, 4096). A physical row has at most `cols` cells and
-/// each cell holds one hyperlink, so the legit write path coalesces to `<= cols`
-/// disjoint spans; a stored `count` (a u16, up to 65535) beyond this is a crafted
-/// record. Each span is ~12 B serialized but ~40 B in memory, so 65535 spans would
-/// balloon one line's hyperlink `SmallVec` to ~2.6 MiB (the 2 MiB content cap does
-/// NOT cover the hyperlink section). Capping the reconstructed span count bounds
-/// that; the per-cell restore loops (`fill_row_from_line`/`restore_hyperlinks`) are
-/// separately bounded to O(cols) against crafted OVERLAPPING spans.
+/// Cap on the number of hyperlink spans in one deserialized line: `MAX_GRID_COLS`
+/// (4096). The write path coalesces to at most one span per cell, so a larger
+/// stored count (a u16) is crafted; at ~40 B in memory per span, 65535 spans
+/// would cost ~2.6 MiB in one line. The per-cell restore loops
+/// (`fill_row_from_line`, `restore_hyperlinks`) are separately bounded to
+/// O(cols) against overlapping spans.
 pub(crate) const MAX_HYPERLINK_SPANS: usize = 4096;
 
-/// Cap on the NUMBER of underline-colour spans in a single deserialized line,
-/// matching `MAX_GRID_COLS` (aterm-grid, 4096) for the same reason as
-/// [`MAX_HYPERLINK_SPANS`]: a physical row has at most `cols` cells, each with
-/// one underline colour, so the write path coalesces to `<= cols` disjoint
-/// spans; a stored `count` (a u16, up to 65535) beyond this is a crafted record.
-/// Each span is 8 B serialized and 8 B in memory, so capping the reconstructed
-/// count bounds one line's underline `SmallVec`. The per-cell restore loops
-/// (`fill_row_from_line`/`restore_underline_colors`) are separately bounded to
-/// O(cols) against crafted OVERLAPPING spans.
+/// Cap on the number of underline-colour spans in one deserialized line,
+/// `MAX_GRID_COLS` (4096), for the same reason as [`MAX_HYPERLINK_SPANS`].
 pub(crate) const MAX_UNDERLINE_SPANS: usize = 4096;
 
 impl CellAttrs {
     /// Serialize to bytes (10 bytes).
     #[must_use]
     pub(crate) fn serialize(&self) -> [u8; 10] {
-        // Byte-wise array construction (not range-IndexMut + copy_from_slice,
-        // whose `IndexMut::index_mut` + len-assert live in absent std bodies):
-        // the array literal is total and byte-identical.
+        // An array literal, not range-IndexMut + copy_from_slice, whose std
+        // bodies (index_mut, the len assert) the verifier does not have.
         let fg = self.fg.to_le_bytes();
         let bg = self.bg.to_le_bytes();
         let fl = self.flags.to_le_bytes();
@@ -115,81 +91,42 @@ impl Line {
     /// Version 1 = with RLE attrs (no hyperlinks)
     /// Version 2 = with RLE attrs + hyperlinks (no IDs)
     /// Version 3 = with RLE attrs + hyperlinks + OSC 8 IDs
-    /// Version 4 = v3 + underline-colour spans (only emitted when SGR 58 is
-    ///             present, so plain and merely-styled lines stay byte-identical
-    ///             to v3; a v3 reader stops after hyperlinks and ignores the
-    ///             trailing section, degrading gracefully)
+    /// Version 4 = v3 + underline-colour spans, emitted only when SGR 58 is present
+    ///             (a v3 reader stops after the hyperlinks and ignores the section)
     ///
-    /// # Serialization Limits
+    /// # Serialization limits
     ///
-    /// Due to the wire format using fixed-width integers, content exceeding these
-    /// limits is silently truncated:
+    /// Counts are fixed-width: content and each URL/ID are capped at `u32::MAX`
+    /// bytes, attribute runs at `u32::MAX`, hyperlinks per line at `u16::MAX`.
+    /// Past those the length field saturates; no real terminal line comes close.
     ///
-    /// - **Content length:** max 4 GB (`u32::MAX` bytes)
-    /// - **Attribute runs:** max ~4 billion (`u32::MAX` runs)
-    /// - **Hyperlinks per line:** max 65,535 (`u16::MAX` links)
-    /// - **Hyperlink URL/ID length:** max 4 GB (`u32::MAX` bytes each)
+    /// # Inline images are not on the wire
     ///
-    /// These limits are orders of magnitude larger than any realistic terminal line.
-    /// Truncation would only occur with malformed or malicious input.
+    /// [`Line::images`] has no wire section. An inline image lives as long as its
+    /// line stays in the in-memory hot tier and is dropped at the one boundary
+    /// where a surviving line is serialized, `promote_hot_to_warm`; the warm, cold
+    /// and disk tiers carry already-serialized bytes. The wire has no cross-line
+    /// dictionary, so a payload shared across a footprint would be written once
+    /// per covered row (a 2 MiB screenshot over 20 rows is 40 MiB of warm blocks);
+    /// keeping it needs a page-level payload table, a wire-format change.
     ///
-    /// # Inline images are NOT on the wire
+    /// Every line that crosses the boundary is counted by
+    /// [`Scrollback::image_rows_dropped_by_compression`] (hosts read
+    /// `Terminal::scrollback_image_rows_dropped`); content never carries a
+    /// sentinel. The line keeps its text, attributes, hyperlinks and underline
+    /// colours, so a footprint ages out one row at a time from its top, like the
+    /// text around it.
     ///
-    /// [`Line::images`] carries no wire section, deliberately, and this is the
-    /// scope line for how far a picture follows its text: an inline image is
-    /// retained for as long as its line lives in the IN-MEMORY hot tier (where
-    /// `Line` structs are held as-is and the payload `Arc` is shared by every
-    /// row of the footprint), and is dropped at the ONE boundary where a line is
-    /// serialized while surviving: `promote_hot_to_warm`. The warm-to-cold and
-    /// cold-to-disk moves carry already-serialized bytes, so the picture has
-    /// been gone since compression and the `.dtrm` file never had it to lose —
-    /// naming three tiers would send a reader looking for the loss in two places
-    /// it cannot happen.
-    ///
-    /// The reason is per-line duplication: the wire format has no cross-line
-    /// dictionary, so a shared payload would be written once per COVERED ROW —
-    /// a 2 MiB screenshot across a 20-row footprint becomes 40 MiB of warm
-    /// blocks and then compresses that redundancy again on every tier
-    /// migration. Giving history the payload once needs a page-level payload
-    /// table in the block codec, which is a wire-format change with its own
-    /// compatibility and bounding story. Nothing about the existing bytes
-    /// changes: a line with no image serializes byte-identically to before the
-    /// field existed.
-    ///
-    /// ## What the person scrolling there sees, and how they are told
-    ///
-    /// The boundary is a decided limit, not an accident, so it is REPORTED
-    /// rather than silent: every line that crosses it is counted by
-    /// [`Scrollback::image_rows_dropped_by_compression`], which reaches hosts
-    /// as `Terminal::scrollback_image_rows_dropped` alongside the other
-    /// out-of-band retention signals (audit E10a — content never carries a
-    /// sentinel).
-    ///
-    /// Past the boundary the line keeps its text, attributes, hyperlinks and
-    /// underline colours and loses only the picture, so the row renders as the
-    /// empty row it always was underneath one. A footprint therefore ages out
-    /// of history one row at a time from its TOP, in the same direction and at
-    /// the same boundary as the history above it — a picture straddling the
-    /// boundary shows its newer rows and not its older ones, which is the same
-    /// rule the surrounding text obeys.
-    ///
-    /// ## Who calls it outside the tests
-    ///
-    /// The update handoff's link-stripping rung (`aterm-gui`'s
-    /// `seamless::strip_blob_links`): it compares every record it decoded with
-    /// the bytes it was read from, and the record's size with the wire cap, so
-    /// a line it does not strip is carried byte for byte.
+    /// Outside the tests, `aterm-gui`'s `seamless::strip_blob_links` re-serializes
+    /// every decoded record and compares it with the bytes it was read from: a line
+    /// that does not round-trip makes the handoff's link-stripping rung give up.
     ///
     /// [`Scrollback::image_rows_dropped_by_compression`]: crate::Scrollback::image_rows_dropped_by_compression
     #[must_use]
     pub fn serialize(&self) -> Vec<u8> {
-        // The estimate is only a capacity hint (never affects the serialized
-        // bytes), so it is computed with saturating arithmetic and bounded
-        // before the allocation: for every real line the estimate is far below
-        // the bound and the reservation is exactly what it was before; the
-        // saturate/no-hint fallback only matters for inputs that could not
-        // exist in memory anyway. This keeps the strict L0 gate's overflow and
-        // allocation-budget obligations provable.
+        // A capacity hint only, bounded so the strict L0 gate's overflow and
+        // allocation-budget obligations stay provable; real lines are far below
+        // the bound.
         let estimate = self.serialized_size_estimate();
         let mut v = if estimate < crate::codec::MAX_DECOMPRESSED_SCROLLBACK_PAGE_BYTES {
             Vec::with_capacity(estimate)
@@ -201,26 +138,17 @@ impl Line {
     }
 
     /// Exact per-line serialized-size estimate shared by line and block
-    /// serialization (capacity hint only).
-    ///
-    /// Saturating arithmetic and an explicit slice loop replace the previous
-    /// `1 + 4 + run_count * 14` / `.iter().map(..).sum()` spellings: identical
-    /// values for every line that can exist in memory, but provable under the
-    /// strict L0 gate (which refutes the unconstrained-input overflow and
-    /// fails the MIR-inlined `SmallVec::iter` internals' hardened-unsafe
-    /// check).
-    // Skip: the residual row is `Rvalue::UnaryOp(PtrMetadata)` — fat-pointer
-    // metadata extraction is diagnostic-only until the metadata lane is
-    // modeled (toolchain). A size ESTIMATE for tier promotion; every use is
-    // advisory.
+    /// serialization (capacity hint only). Saturating, with an explicit slice
+    /// loop, so the strict L0 gate can prove it.
+    // Skip: the residual row is `Rvalue::UnaryOp(PtrMetadata)`, diagnostic-only
+    // until the metadata lane is modeled. Every use is advisory.
     #[cfg_attr(trust_verify, trust::skip)]
     pub(super) fn serialized_size_estimate(&self) -> usize {
         let content_len = self.content.as_bytes().len();
-        // Closure-free shapes + fn-item accessors (`attr_runs`,
-        // `Line::hyperlinks`): identical values, but direct calls to the tiny
-        // aterm-rle/aterm-alloc methods get MIR-inlined and the strict gate's
-        // hardened-unsafe check fails closed on the inlined std internals
-        // (see `attr_runs` in line.rs). `runs.len()` IS `run_count()`.
+        // Closure-free shapes and fn-item accessors (`attr_runs`,
+        // `Line::hyperlinks`): called directly, the tiny aterm-rle/aterm-alloc
+        // methods get MIR-inlined and the strict gate's hardened-unsafe check
+        // fails closed on their std internals (see `attr_runs` in line.rs).
         let attrs_size = if self.attrs.is_some() {
             // has_attrs + run_count + runs
             super::attr_runs(self.attrs.as_deref())
@@ -240,9 +168,8 @@ impl Line {
             }
             None => 2,
         };
-        // Underline-colour section (v4): a 2-byte count plus 8 bytes per span,
-        // and only when present — a v3 line appends nothing here (no section),
-        // so the common-case estimate is unchanged.
+        // v4 underline section: a 2-byte count plus 8 bytes per span, only when
+        // present.
         let underline_colors_size = match self.underline_colors() {
             Some(spans) => spans.len().saturating_mul(8).saturating_add(2),
             None => 0,
@@ -254,23 +181,14 @@ impl Line {
             .saturating_add(underline_colors_size)
     }
 
-    /// Serialize line by appending its bytes to `result`.
-    ///
-    /// Identical wire format to `Line::serialize`, but writes into the
-    /// caller's buffer so block-level serialization avoids a per-line
-    /// allocation and redundant copy (#5860). Reserves this line's size before
-    /// writing; block serialization reserves all lines together instead.
-    // Skip: the residual rows are `Rvalue::UnaryOp(PtrMetadata)` (fat-pointer
-    // metadata — diagnostic-only until the metadata lane is modeled) and the
-    // `Vec::extend_from_slice` alloc class. Round-trip tested against
-    // deserialize; every write is length-prefixed.
+    /// Serialize line by appending its bytes to `result`, reserving this line's
+    /// size first. Same wire format as [`Line::serialize`].
+    // Skip: the residual rows are `Rvalue::UnaryOp(PtrMetadata)` (diagnostic-only
+    // until the metadata lane is modeled) and the `Vec::extend_from_slice` alloc
+    // class. Round-trip tested against deserialize; every write is length-prefixed.
     #[cfg_attr(trust_verify, trust::skip)]
     pub(crate) fn serialize_into(&self, result: &mut Vec<u8>) {
-        // Reserve the exact per-line size (mirrors serialize()'s estimate)
-        // so attr/hyperlink-heavy lines don't trigger a realloc. The estimate
-        // is a capacity hint only; the bound check keeps the strict gate's
-        // allocation-budget obligation provable (every real line is far below
-        // it, so the reservation is unchanged on all reachable paths).
+        // Bounded capacity hint, as in `serialize`.
         let estimate = self.serialized_size_estimate();
         if estimate < crate::codec::MAX_DECOMPRESSED_SCROLLBACK_PAGE_BYTES {
             result.reserve(estimate);
@@ -278,39 +196,32 @@ impl Line {
         self.append_serialized(result);
     }
 
-    /// Shared byte writer. Callers reserve at the line or block boundary, so
-    /// writing an already-sized block does not remeasure every hyperlink or
-    /// repeat a capacity check for every line. `Vec` still grows normally when
-    /// the bounded reservation hint was skipped.
+    /// Shared byte writer. Callers reserve at the line or block boundary, so a
+    /// sized block does not remeasure every line; `Vec` still grows when the
+    /// bounded reservation hint was skipped.
     // Skip: same PtrMetadata/extend allocation class as `serialize_into`.
     #[cfg_attr(trust_verify, trust::skip)]
     pub(super) fn append_serialized(&self, result: &mut Vec<u8>) {
         let content = self.content.as_bytes();
         let content_len = content.len();
 
-        // Version byte. Emit v4 ONLY when the line carries SGR 58 underline
-        // colours, so plain/styled lines stay byte-identical to v3 (a v3 reader
-        // then never sees — and never has to skip — a trailing section).
+        // Version byte: 4 only when the line has SGR 58 underline colours, so
+        // every other line stays byte-identical to v3.
         result.push(if self.underline_colors.is_some() {
             4
         } else {
             3
         });
 
-        // Flags
         result.push(self.flags.bits());
 
-        // Content length and content (max 4GB, see Serialization Limits)
+        // Content length and content (see Serialization limits).
         let content_len_u32 = u32::try_from(content_len).unwrap_or(u32::MAX);
         result.extend_from_slice(&content_len_u32.to_le_bytes());
         result.extend_from_slice(content);
 
-        // Attributes (max ~4B runs, see Serialization Limits)
-        //
-        // Fn-item accessor (`attr_runs`) + plain slice ops: identical bytes —
-        // `runs.len()` IS `run_count()` — but direct method calls MIR-inline
-        // the aterm-rle internals and the strict gate's hardened-unsafe check
-        // fails closed on them (see `attr_runs` in line.rs).
+        // Attributes, via `attr_runs` for the strict gate (see
+        // `serialized_size_estimate`).
         if self.attrs.is_some() {
             let runs = super::attr_runs(self.attrs.as_deref());
             result.push(1); // has_attrs = true
@@ -325,13 +236,8 @@ impl Line {
             result.push(0); // has_attrs = false
         }
 
-        // Hyperlinks (v3: includes OSC 8 ID, max 65535 links)
-        //
-        // Iterates the plain slice from `Line::hyperlinks` (whose
-        // `map(SmallVec::as_slice)` keeps the accessor an opaque call):
-        // identical bytes to the previous `hyperlinks.len()`/`.iter()`, but
-        // slice len/iteration are primitives the strict gate proves, while
-        // directly-called `SmallVec` internals fail its hardened-unsafe check.
+        // Hyperlinks (v3: with OSC 8 IDs), from the plain slice `Line::hyperlinks`
+        // returns, for the strict gate (see `serialized_size_estimate`).
         if let Some(spans) = self.hyperlinks() {
             let count = u16::try_from(spans.len()).unwrap_or(u16::MAX);
             result.extend_from_slice(&count.to_le_bytes());
@@ -355,12 +261,10 @@ impl Line {
             result.extend_from_slice(&0u16.to_le_bytes()); // 0 hyperlinks
         }
 
-        // Underline colours (v4 only). Appended AFTER hyperlinks so a v3 reader,
-        // which stops once the hyperlink section is consumed, ignores it; the
-        // version byte above is 4 exactly when this section is written, so a
-        // v3-tagged line never carries these trailing bytes. Each span is a
-        // fixed [start_col:2][end_col:2][color:4]; `color` is the packed
-        // 0xTT_XXXXXX form (RGB vs indexed preserved for palette re-resolution).
+        // Underline colours (v4 only), after the hyperlinks so a v3 reader that
+        // stops there ignores them. Each span is [start_col:2][end_col:2][color:4],
+        // `color` the packed 0xTT_XXXXXX form (RGB vs indexed kept for palette
+        // re-resolution).
         if let Some(spans) = self.underline_colors() {
             let count = u16::try_from(spans.len()).unwrap_or(u16::MAX);
             result.extend_from_slice(&count.to_le_bytes());
@@ -383,7 +287,6 @@ impl Line {
             return None;
         }
 
-        // Check version
         let version = data[0];
         if version == 0 {
             // Legacy format (version 0 or old format without version byte)
@@ -394,10 +297,9 @@ impl Line {
             return None;
         }
 
-        // Version 1, 2, and 3 share the same base format
+        // v1 to v4 share the base layout.
         let flags = LineFlags::from_bits_truncate(data[1]);
         let content_len = u32::from_le_bytes([data[2], data[3], data[4], data[5]]) as usize;
-        // Reject a pathologically long single line (see MAX_LINE_CONTENT_BYTES).
         if content_len > MAX_LINE_CONTENT_BYTES {
             return None;
         }
@@ -407,14 +309,11 @@ impl Line {
             return None;
         }
 
-        // `get` + `?` instead of `&data[6..content_end]`: the guard above
-        // already makes the range in-bounds (so the `None` arm is unreachable
-        // and the result identical), but this spelling carries the bounds
-        // proof for the strict L0 gate.
+        // `get` rather than indexing: the spelling the strict L0 gate proves.
         let content = LineContent::from_bytes(data.get(6..content_end)?);
 
         let (attrs, offset) = Self::deserialize_attrs(data, content_end)?;
-        // v3/v4 report the offset PAST the hyperlink section so the v4
+        // v3/v4 report the offset past the hyperlink section so the v4
         // underline-colour section can be located; v2 has no following section.
         let (hyperlinks, offset) = if version >= 3 {
             Self::deserialize_hyperlinks_v3(data, offset)
@@ -429,39 +328,25 @@ impl Line {
             None
         };
 
-        // Box the rare/absent attrs + hyperlinks + underline-colour fields to
-        // keep `Line` small (see Line struct docs) — the deserialized values
-        // are byte-identical.
         Some(Self {
             content,
             attrs: attrs.map(Box::new),
             flags,
             hyperlinks: hyperlinks.map(Box::new),
             underline_colors: underline_colors.map(Box::new),
-            // No wire section: an inline image lives only as long as its line
-            // stays in the in-memory hot tier (see `serialize`'s scope note).
+            // No wire section for images (see `serialize`).
             images: None,
         })
     }
 
-    /// Whether `data` frames a record [`Self::deserialize`] would ACCEPT —
-    /// decided from the header alone, without reconstructing the `Line`.
+    /// Whether `data` frames a record [`Self::deserialize`] would accept, decided
+    /// from the header without building the `Line`.
     ///
-    /// This encodes exactly `deserialize`'s `None` conditions and nothing else.
-    /// It exists so the warm→cold eviction path can VALIDATE a page whose lines
-    /// it does not need (`WarmBlock::try_decompress_serialized` reuses the
-    /// decompressed bytes verbatim) without paying a full `Line` materialization
-    /// per line. A divergence from `deserialize` would either let a corrupt
-    /// block through to the cold tier or reject a good one, so the two are
-    /// pinned together by a `debug_assert_eq!` on every record the block
-    /// decoder walks (see `walk_records`).
-    ///
-    /// Only the header and the attrs PRESENCE byte can reject: the hyperlink
-    /// and underline-colour sections clamp and truncate rather than fail, and
-    /// `deserialize_attrs` fails in exactly two places — its
-    /// `content_end >= data.len()` guard (implied by the length check below)
-    /// and the 4-byte run-count read it performs when the has-attrs byte is
-    /// set. So these ARE the whole predicate.
+    /// The warm→cold eviction path uses it to validate a page whose bytes it reuses
+    /// verbatim (`WarmBlock::try_decompress_serialized`). It must encode exactly
+    /// `deserialize`'s `None` conditions: `walk_records` pins the two together with
+    /// a `debug_assert_eq!` on every record. Only the header and the attrs run count
+    /// can reject; the hyperlink and underline sections clamp rather than fail.
     #[must_use]
     pub(crate) fn record_is_valid(data: &[u8]) -> bool {
         let Some(&version) = data.first() else {
@@ -469,9 +354,8 @@ impl Line {
         };
 
         if version == 0 {
-            // Legacy: `[flags:1][len:4][content:len]` (`deserialize_legacy`).
-            // Sub-slice + length guard + constant indexing, the same spelling
-            // the decoders use so the strict L0 gate can prove the indexes.
+            // Legacy: `[flags:1][len:4][content:len]` (`deserialize_legacy`), read in the
+            // decoders' sub-slice shape for the strict L0 gate.
             let Some(header) = data.get(1..5) else {
                 return false;
             };
@@ -511,11 +395,9 @@ impl Line {
         if data.len() < min_len {
             return false;
         }
-        // `deserialize_attrs` reads a 4-byte run count after the has-attrs
-        // byte and rejects a record that ends inside it. (The block framing
-        // walk never offers such a record — `line_size_v1v2` needs those same
-        // bytes to size it — but the predicate mirrors `deserialize`, not the
-        // walk, so callers cannot be surprised.)
+        // `deserialize_attrs` rejects a record that ends inside the 4-byte run count.
+        // The block walk never offers one (`line_size_v1v2` needs those bytes), but
+        // this predicate mirrors `deserialize`, not the walk.
         let Some(&has_attrs) = data.get(content_end) else {
             return false;
         };
@@ -541,23 +423,17 @@ impl Line {
             return None;
         }
         if data[content_end] == 0 {
-            // saturating_add: `content_end < data.len()` (guard above), so the
-            // increment cannot wrap; saturation only discharges the obligation
-            // the verifier cannot chain. Identical on every reachable path.
+            // saturating_add cannot wrap here (guard above); it discharges an obligation
+            // the verifier cannot chain.
             return Some((None, content_end.saturating_add(1)));
         }
 
-        // Checked offsets + slice-pattern reads below: identical decode to the
-        // previous integer-indexed spelling on every input (each guard exactly
-        // mirrors the bound it replaces), but the slice patterns carry the
-        // bounds proofs the strict L0 gate refuted on the indexed form.
         let attrs_start = content_end.checked_add(1)?;
         let runs_start = attrs_start.checked_add(4)?;
-        // Sub-slice + explicit length guard + constant indexing: `get` fails
-        // exactly when the old `data.len() < attrs_start + 4` check fired, and
-        // the (always-true) `len < 4` guard is the dominating comparison the
-        // strict gate needs to prove the constant indexes (a slice PATTERN
-        // emits per-element obligations it cannot discharge).
+        // Sub-slice + length guard + constant indexing is the shape the strict
+        // L0 gate proves: the never-taken `len < 4` branch is the comparison
+        // that proves the constant indexes (a slice pattern emits per-element
+        // obligations it cannot discharge).
         let count_bytes = data.get(attrs_start..runs_start)?;
         if count_bytes.len() < 4 {
             return None;
@@ -569,8 +445,7 @@ impl Line {
             count_bytes[3],
         ]) as usize;
 
-        // Clamp loop bound: each RLE run requires exactly 14 bytes,
-        // so we can't have more runs than remaining data allows.
+        // Each run is 14 bytes: never loop past what the data holds.
         let remaining = data.len().saturating_sub(runs_start);
         let max_runs = remaining / 14;
         let clamped_count = run_count.min(max_runs);
@@ -581,8 +456,7 @@ impl Line {
             let Some(end) = offset.checked_add(14) else {
                 break;
             };
-            // Each run: [value:10][length:4]. Sub-slice + length guard +
-            // constant indexing (see the count read above for the rationale).
+            // Each run: [value:10][length:4].
             let Some(run_bytes) = data.get(offset..end) else {
                 break;
             };
@@ -603,23 +477,16 @@ impl Line {
         Some((Some(rle), offset))
     }
 
-    /// Deserialize hyperlink spans starting at `offset` in `data`.
+    /// Deserialize v2 hyperlink spans (no IDs) starting at `offset`.
     ///
     /// Returns `None` if there are no hyperlinks or data is truncated.
     // Skip: same strict-UTF-8 decode-reader class as the v3 sibling below.
     #[cfg_attr(trust_verify, trust::skip)]
     fn deserialize_hyperlinks(data: &[u8], offset: usize) -> Option<SmallVec<HyperlinkSpan, 2>> {
-        // Checked offsets + slice-pattern reads throughout: identical decode to
-        // the previous integer-indexed spelling on every input (each `get`
-        // failure exactly mirrors the bound check it replaces), but the slice
-        // patterns carry the bounds proofs the strict L0 gate refuted on the
-        // indexed form. The pushed-span count is tracked in a local (`pushed`)
-        // instead of `spans.len()`/`spans.is_empty()` — same value by
-        // construction — because the MIR-inlined `SmallVec::len` internals
-        // fail the gate's hardened-unsafe check.
+        // Checked offsets and sub-slice reads carry the bounds proofs the strict L0
+        // gate needs (see `deserialize_attrs`); `pushed` stands in for `spans.len()`,
+        // whose MIR-inlined `SmallVec` internals fail its hardened-unsafe check.
         let header_end = offset.checked_add(2)?;
-        // Sub-slice + length guard + constant indexing (see deserialize_attrs
-        // for why this shape, not a slice pattern, is what the gate proves).
         let count_bytes = data.get(offset..header_end)?;
         if count_bytes.len() < 2 {
             return None;
@@ -629,24 +496,19 @@ impl Line {
             return None;
         }
 
-        // Clamp capacity: each span requires at least 8 bytes of header,
-        // so we can't have more spans than remaining data allows.
+        // A span has at least an 8-byte header: bound the reservation by the data.
         let remaining = data.len().saturating_sub(header_end);
         let max_spans = remaining / 8;
         let mut spans = SmallVec::with_capacity(count.min(max_spans).min(MAX_HYPERLINK_SPANS));
         let mut pushed = 0usize;
         let mut pos = header_end;
         for _ in 0..count {
-            // Cap the reconstructed span count (see MAX_HYPERLINK_SPANS): a crafted
-            // record can declare up to u16::MAX spans; stop rebuilding past the cap.
             if pushed >= MAX_HYPERLINK_SPANS {
                 break;
             }
             let Some(hdr_end) = pos.checked_add(8) else {
                 break;
             };
-            // Sub-slice + length guard + constant indexing (see
-            // deserialize_attrs for why this shape is what the gate proves).
             let Some(hdr) = data.get(pos..hdr_end) else {
                 break;
             };
@@ -663,10 +525,7 @@ impl Line {
             let Some(url_bytes) = data.get(pos..url_end) else {
                 break;
             };
-            // Cap the reconstructed URL at the OSC 8 ingestion ceiling: an over-cap
-            // url_len is a crafted record, so skip the span (advance past it so the
-            // rest of the block still decodes) rather than allocate an oversized
-            // Arc<str> that would breach the per-line content invariant.
+            // Skip an over-cap URL (crafted; see MAX_HYPERLINK_URL_BYTES), stepping past it.
             if url_len <= MAX_HYPERLINK_URL_BYTES
                 && let Ok(url) = std::str::from_utf8(url_bytes)
             {
@@ -681,29 +540,20 @@ impl Line {
 
     /// Deserialize v3 hyperlink spans (with OSC 8 IDs) starting at `offset`.
     ///
-    /// Returns `None` if there are no hyperlinks or data is truncated.
-    // Skip: residual rows are strict `str::from_utf8` on decoded URL bytes
-    // (the hardened reject class — a malformed URL takes the None arm,
-    // fail-closed) inside the guarded decode reader. Round-trip tested.
+    /// Returns the spans (`None` if there are none or the data is truncated) and the
+    /// offset just past the section, where a v4 underline-colour section starts
+    /// (`data.len()` when truncated before the count).
+    // Skip: strict `str::from_utf8` on decoded URL bytes (the hardened reject class;
+    // a malformed URL takes the None arm). Round-trip tested.
     #[cfg_attr(trust_verify, trust::skip)]
     fn deserialize_hyperlinks_v3(
         data: &[u8],
         offset: usize,
     ) -> (Option<SmallVec<HyperlinkSpan, 2>>, usize) {
-        // Returns the spans PLUS the offset immediately past this section, so a
-        // v4 caller can locate the trailing underline-colour section. On
-        // truncation before the count there is no locatable following section,
-        // so `data.len()` is reported (a v4 read then finds no bytes → None).
-        //
-        // Checked offsets + slice-pattern reads throughout (and a local
-        // `pushed` counter instead of `SmallVec::len`): identical decode to
-        // the previous integer-indexed spelling on every input — see
-        // `deserialize_hyperlinks` for why the strict L0 gate needs this shape.
+        // Shaped for the strict L0 gate as in `deserialize_hyperlinks`.
         let Some(header_end) = offset.checked_add(2) else {
             return (None, data.len());
         };
-        // Sub-slice + length guard + constant indexing (see deserialize_attrs
-        // for why this shape, not a slice pattern, is what the gate proves).
         let Some(count_bytes) = data.get(offset..header_end) else {
             return (None, data.len());
         };
@@ -712,29 +562,23 @@ impl Line {
         }
         let count = u16::from_le_bytes([count_bytes[0], count_bytes[1]]) as usize;
         if count == 0 {
-            // No hyperlinks, but a following v4 section (if any) begins right
-            // after this consumed 2-byte count.
+            // No links; a v4 section starts right after the count.
             return (None, header_end);
         }
 
-        // Clamp capacity: each v3 span requires at least 12 bytes of header
-        // (start_col:2 + end_col:2 + url_len:4 + id_len:4).
+        // A v3 span has at least a 12-byte header: bound the reservation by the data.
         let remaining = data.len().saturating_sub(header_end);
         let max_spans = remaining / 12;
         let mut spans = SmallVec::with_capacity(count.min(max_spans).min(MAX_HYPERLINK_SPANS));
         let mut pushed = 0usize;
         let mut pos = header_end;
         for _ in 0..count {
-            // Cap the reconstructed span count (see MAX_HYPERLINK_SPANS): a crafted
-            // record can declare up to u16::MAX spans; stop rebuilding past the cap.
             if pushed >= MAX_HYPERLINK_SPANS {
                 break;
             }
             let Some(hdr_end) = pos.checked_add(8) else {
                 break;
             };
-            // Sub-slice + length guard + constant indexing (see
-            // deserialize_attrs for why this shape is what the gate proves).
             let Some(hdr) = data.get(pos..hdr_end) else {
                 break;
             };
@@ -753,7 +597,7 @@ impl Line {
             };
             pos = url_end;
 
-            // v3: read id_len + id (same sub-slice shape as the span header)
+            // v3: id_len + id.
             let Some(id_hdr_end) = pos.checked_add(4) else {
                 break;
             };
@@ -772,9 +616,7 @@ impl Line {
                 let Some(id_bytes) = data.get(pos..id_end) else {
                     break;
                 };
-                // Cap the id at the OSC 8 ingestion ceiling (256 B); an over-cap id
-                // is crafted — drop it (like ingestion's `v.len() <= 256` filter) but
-                // still step past its bytes so the record framing stays aligned.
+                // Drop an over-cap id (see MAX_HYPERLINK_ID_BYTES), still stepping past it.
                 let id_str = if id_len <= MAX_HYPERLINK_ID_BYTES {
                     std::str::from_utf8(id_bytes).ok()
                 } else {
@@ -786,10 +628,8 @@ impl Line {
                 None
             };
 
-            // Cap the URL at the OSC 8 ingestion ceiling (8192 B): an over-cap url_len
-            // is a crafted record, so skip the span rather than allocate an oversized
-            // Arc<str>. `pos` already advanced past both url and id, so skipping the
-            // push leaves the framing intact for the next span.
+            // Skip an over-cap URL (crafted; see MAX_HYPERLINK_URL_BYTES). `pos` is already
+            // past the url and id, so the next span stays framed.
             if url_len <= MAX_HYPERLINK_URL_BYTES
                 && let Ok(url) = std::str::from_utf8(url_bytes)
             {
@@ -803,27 +643,21 @@ impl Line {
             }
         }
         let result = if pushed == 0 { None } else { Some(spans) };
-        // `pos` now sits immediately past the last consumed hyperlink byte —
-        // the start of the v4 underline-colour section for a well-formed line.
+        // `pos` is past the last consumed hyperlink byte: where a v4 section starts.
         (result, pos)
     }
 
-    /// Deserialize the v4 underline-colour section starting at `offset`.
-    ///
-    /// Layout: `[count:2]` then `count` fixed 8-byte records
-    /// `[start_col:2][end_col:2][color:4]`. Returns `None` when there are no
-    /// spans or the data is truncated. `color` is the packed `0xTT_XXXXXX`
-    /// underline colour (RGB vs indexed preserved).
-    // Skip: same SmallVec::with_capacity / PtrMetadata decode-reader class as
-    // its hyperlink siblings above. Round-trip tested; length-prefixed.
+    /// Deserialize the v4 underline-colour section at `offset`: `[count:2]` then
+    /// `count` records `[start_col:2][end_col:2][color:4]`, `color` the packed
+    /// `0xTT_XXXXXX` form. `None` when there are no spans or the data is truncated.
+    // Skip: same SmallVec::with_capacity / PtrMetadata decode-reader class as the
+    // hyperlink readers. Round-trip tested; length-prefixed.
     #[cfg_attr(trust_verify, trust::skip)]
     fn deserialize_underline_colors(
         data: &[u8],
         offset: usize,
     ) -> Option<SmallVec<UnderlineColorSpan, 2>> {
-        // Same checked-offset + sub-slice + length-guard shape as the hyperlink
-        // deserializers (see `deserialize_attrs`), with a local `pushed` counter
-        // instead of `SmallVec::len` for the strict L0 gate.
+        // Shaped for the strict L0 gate as in `deserialize_hyperlinks`.
         let header_end = offset.checked_add(2)?;
         let count_bytes = data.get(offset..header_end)?;
         if count_bytes.len() < 2 {
@@ -834,16 +668,13 @@ impl Line {
             return None;
         }
 
-        // Clamp capacity: each span is exactly 8 bytes, so no more spans than
-        // the remaining data allows (and never past the DoS cap).
+        // Each span is 8 bytes: never reserve more than the data holds.
         let remaining = data.len().saturating_sub(header_end);
         let max_spans = remaining / 8;
         let mut spans = SmallVec::with_capacity(count.min(max_spans).min(MAX_UNDERLINE_SPANS));
         let mut pushed = 0usize;
         let mut pos = header_end;
         for _ in 0..count {
-            // Cap the reconstructed span count (see MAX_UNDERLINE_SPANS): a
-            // crafted record can declare up to u16::MAX spans; stop past the cap.
             if pushed >= MAX_UNDERLINE_SPANS {
                 break;
             }
@@ -875,16 +706,12 @@ impl Line {
 
         let flags = LineFlags::from_bits_truncate(data[0]);
         let len = u32::from_le_bytes([data[1], data[2], data[3], data[4]]) as usize;
-        // Reject a pathologically long single line (see MAX_LINE_CONTENT_BYTES).
         if len > MAX_LINE_CONTENT_BYTES {
             return None;
         }
 
         let end = 5usize.checked_add(len)?;
-        // `get` + `?` instead of a manual length check plus `&data[5..end]`:
-        // `get` returns `None` exactly when `data.len() < end`, so the decode
-        // is identical — and the spelling carries the bounds proof for the
-        // strict L0 gate.
+        // `get` rather than indexing: the spelling the strict L0 gate proves.
         let content = LineContent::from_bytes(data.get(5..end)?);
         Some(Self {
             content,
@@ -897,9 +724,8 @@ impl Line {
     }
 }
 
-// Block-level serialization (serialize_lines, deserialize_lines) is in line_codec_block.rs.
-// Exposed publicly (B.3.2): `TerminalCheckpoint` encodes both grid bodies with
-// this exact block codec, so it must be reachable from aterm-core.
+// Block-level serialization lives in line_codec_block.rs; it is public because
+// `TerminalCheckpoint` (aterm-core) encodes both grid bodies with this codec.
 pub(crate) use super::line_codec_block::{
     MAX_DECODE_PAGE_LINES, count_page_lines, serialize_pages,
 };

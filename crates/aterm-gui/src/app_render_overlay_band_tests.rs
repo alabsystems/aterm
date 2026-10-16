@@ -57,11 +57,9 @@ fn overlay_band_narrows_each_pane_selection_independently() {
         "the crossed pane fails safe below the band"
     );
 
-    // The scalar `selection`/`selection_clip` must not outlive the list it
-    // duplicates: a composed frame stamps both for the focused pane, and
-    // `selection_row_key` and the per-cell predicate fall back to the scalar
-    // when `selections` is empty. Leaving it after the band drops the last
-    // entry would resurrect the unnarrowed highlight.
+    // The scalar `selection`/`selection_clip` goes with the list it
+    // duplicates: `selection_row_key` and the per-cell predicate fall back to
+    // the scalar when `selections` is empty.
     let mut composed = aterm_render::RenderInput::empty();
     composed.rows = 8;
     composed.cols = 8;
@@ -133,23 +131,20 @@ fn a_floating_chrome_card_takes_the_page_palette_over_the_terminal_background() 
         recoloured,
         "chrome that IS the terminal still follows the program's background"
     );
-    #[cfg(target_os = "linux")]
-    {
-        app.window_theme = crate::app_config::WindowTheme::Light;
-        let forced = app.chrome_card_theme(wid);
-        assert_eq!(
-            (forced.bg, forced.fg),
-            (
-                crate::native_appearance::FORCED_LIGHT_CHROME_BG,
-                crate::native_appearance::FORCED_LIGHT_CHROME_FG
-            ),
-            "a forced-light page's cards are painted on the forced-light palette"
-        );
-        assert_eq!(
-            forced.selection, app.theme.selection,
-            "the accent identity is still the terminal theme's"
-        );
-    }
+    app.window_theme = crate::app_config::WindowTheme::Light;
+    let forced = app.chrome_card_theme(wid);
+    assert_eq!(
+        (forced.bg, forced.fg),
+        (
+            crate::native_appearance::FORCED_LIGHT_CHROME_BG,
+            crate::native_appearance::FORCED_LIGHT_CHROME_FG
+        ),
+        "a forced-light page's cards are painted on the forced-light palette"
+    );
+    assert_eq!(
+        forced.selection, app.theme.selection,
+        "the accent identity is still the terminal theme's"
+    );
 }
 
 /// Robi's bubble over a forced-light native route rasters light, and dark
@@ -178,7 +173,7 @@ fn robis_bubble_over_a_forced_light_page_is_a_light_bubble() {
     let wid = WindowId(0);
     assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
     assert!(app.prepare_native_input_scratch(wid));
-    // A tip of SPACES: the bubble's centre then lands on its body, past the
+    // A tip of spaces: the bubble's centre then lands on its body, past the
     // badge disc, with no ink over it.
     app.robi_bubble = Some(crate::robi_bubble::RobiBubble::new(
         "                ",

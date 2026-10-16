@@ -1,25 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm-control`'s verb matrix run against a [`GuiHost`] that holds a real
-//! `EventLoopProxy`, plus the one claim only that host supports: a
-//! control-socket `select` reaches the window as a `Wake` redraw.
+//! `aterm-control`'s verb matrix run against a [`GuiHost`] that holds a real `EventLoopProxy`,
+//! plus the claim only that host supports: a control-socket `select` reaches the window as a
+//! `Wake` redraw.
 //!
-//! # Why a binary and not a `#[test]`
+//! `EventLoop` construction panics off the process main thread and libtest runs each `#[test]`
+//! on a spawned thread, so the unit matrix in `control_host.rs` builds its host with
+//! `proxy: None` (no redraw, `capabilities().event_loop` false). Only a target that owns
+//! `fn main` (`src/bin/aterm-redraw-conformance.rs`) can observe a repaint; a `harness = false`
+//! test would be a separate crate, and [`GuiHost`] is private to `control`.
 //!
-//! `EventLoop` construction panics off the process main thread, and libtest runs
-//! each `#[test]` on a spawned thread. So the unit matrix in `control_host.rs`
-//! builds its host with `proxy: None`, which makes
-//! [`SessionHost::request_redraw`] a no-op and `capabilities().event_loop` false.
-//! Only a target that owns `fn main` (`src/bin/aterm-redraw-conformance.rs`) can
-//! observe a repaint. A `harness = false` test would be a separate crate, and
-//! [`GuiHost`] is private to `control`.
-//!
-//! # Exit codes
-//!
-//! * `0` — every check passed and every promised redraw was delivered.
-//! * `1` — a check failed, or a redraw the host accepted never arrived.
-//! * `2` — not run: no event loop is constructible here (headless, no display).
+//! Exit codes: `0` every check passed and every promised redraw arrived; `1` a check failed or
+//! an accepted redraw never arrived; `2` not run (no event loop constructible here).
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -161,6 +154,7 @@ fn registered_session(local_id: u64, term: &Arc<Mutex<Terminal>>) -> SessionHand
         generation_look: Default::default(),
         reset_lane: Default::default(),
         update_parked: Default::default(),
+        fenced_writes: Default::default(),
     });
     SessionHandle {
         sid,

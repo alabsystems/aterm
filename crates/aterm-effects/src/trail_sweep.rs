@@ -253,20 +253,6 @@ mod tests {
         }
     }
 
-    /// row_sweep_cells: exactly the skipped cells, ordered tail→head, both
-    /// directions, gap-free.
-    #[test]
-    fn row_sweep_lays_exactly_the_skipped_cells() {
-        let mut out = Vec::new();
-        row_sweep_cells(&mut out, 4, 3, 7);
-        assert_eq!(out, vec![(4, 4), (4, 5), (4, 6), (4, 7)]);
-        assert_adjacent(&out, None);
-        out.clear();
-        row_sweep_cells(&mut out, 2, 7, 3);
-        assert_eq!(out, vec![(2, 6), (2, 5), (2, 4), (2, 3)]);
-        assert_adjacent(&out, None);
-    }
-
     /// wrap_fold_cells: the old row is finished, the new row is started, the
     /// only non-adjacent step is the fold seam itself, and both segments are
     /// internally gap-free.

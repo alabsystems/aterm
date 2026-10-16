@@ -342,6 +342,11 @@ pub(crate) struct CompletedBlock {
     pub(crate) id: u64,
     /// `None` when the shell reported no code; read as unknown, never success.
     pub(crate) exit_code: Option<i32>,
+    /// When the command started (its OSC 133 C, wall ms), if stamped: the
+    /// session log rebuilds a run the sweep never saw running from it.
+    pub(crate) started_ms: Option<u64>,
+    /// When it ended (its OSC 133 D, wall ms), if stamped.
+    pub(crate) ended_ms: Option<u64>,
 }
 
 /// A HELD PANE'S CARRIED EXIT, as its successor shows it
@@ -389,14 +394,6 @@ pub(crate) struct ActivitySample {
     /// Age of the most recent PTY output, from the session's cheap activity
     /// atomic. `None` when never observed.
     pub(crate) last_output: Option<Instant>,
-    /// Age of the most recent USER KEYSTROKE aimed at this session (the
-    /// window's key stamp, carried only for the window's focused session).
-    /// `None` when this session is nobody's typing target.
-    ///
-    /// Movement alone cannot tell typing from a background `tail -f` at a
-    /// prompt — both advance `content_seq` — so the live-typing marker needs
-    /// evidence that a human actually pressed something.
-    pub(crate) last_input: Option<Instant>,
 }
 
 /// Everything the classifier is allowed to look at. Assembling this is the
@@ -456,28 +453,6 @@ pub(crate) struct Status {
 }
 
 impl Status {
-    /// Whether this record is the LIVE typing state: `Idle` published from
-    /// prompt-entry evidence (`ShellEvidence::Entering`) with the keystroke
-    /// echo still recent, marked by the movement reason riding the record.
-    /// The phase stays `Idle` on the wire — a prompt with no foreground job
-    /// IS idle, and RFC §6 permits no stronger claim — but chrome may keep a
-    /// "Typing …" subject up while this is true. No other `Idle` candidate
-    /// carries an activity reason, so the pair is unambiguous.
-    fn typing_live(&self) -> bool {
-        self.phase == Phase::Idle && self.reasons.contains(&Reason::ContentActivity)
-    }
-
-    /// The verdict the smart-title coordinator's Entering→prompt decay keys
-    /// on (frame audit #3): `Idle` that has actually SETTLED — at a prompt
-    /// with the keystroke echo aged out past `quiet_after`. A bare `phase ==
-    /// Idle` check killed the live state: `Entering` classifies as `Idle`
-    /// unconditionally, so the decay engaged WHILE the user was typing and
-    /// the typing subject never showed at all (review finding on the audit's
-    /// fix).
-    pub(crate) fn settled_idle(&self) -> bool {
-        self.phase == Phase::Idle && !self.typing_live()
-    }
-
     fn seed(now: Instant) -> Self {
         Self {
             phase: Phase::Starting,
@@ -556,11 +531,10 @@ impl StatusFsm {
     }
 
     /// The instant at which this session could publish a transition that NO new
-    /// output would cause. Three exist: a candidate still serving its dwell,
-    /// `Running` aging into `Quiet`, and the LIVE typing `Idle` settling into
-    /// plain `Idle`. Everything else is edge-driven — a settled `Idle` pane
-    /// cannot become anything until bytes arrive — so it returns `None` and
-    /// costs the event loop nothing.
+    /// output would cause. Two exist: a candidate still serving its dwell, and
+    /// `Running` aging into `Quiet`. Everything else is edge-driven — an `Idle`
+    /// pane cannot become anything until bytes arrive — so it returns `None`
+    /// and costs the event loop nothing.
     ///
     /// THE CLOCK MUST TELL THE TRUTH (event-loop busy-rearm audit, item 1):
     /// each arm is the earliest instant at which [`StatusFsm::classify`] could
@@ -577,21 +551,14 @@ impl StatusFsm {
         if let Some((_, first_seen)) = &self.pending {
             return Some(*first_seen + self.policy.dwell);
         }
-        if self.published.phase == Phase::Running {
-            return match (self.last_movement, self.last_output) {
-                (Some(movement), Some(output)) => {
-                    Some(movement.max(output) + self.policy.quiet_after)
-                }
-                (Some(at), None) | (None, Some(at)) => Some(at + self.policy.quiet_after),
-                (None, None) => None,
-            };
+        if self.published.phase != Phase::Running {
+            return None;
         }
-        // LIVE typing settles on the movement clock alone: `typed_recently`
-        // requires movement, and ambient output cannot extend a keystroke echo.
-        self.published
-            .typing_live()
-            .then(|| self.last_movement.map(|at| at + self.policy.quiet_after))
-            .flatten()
+        match (self.last_movement, self.last_output) {
+            (Some(movement), Some(output)) => Some(movement.max(output) + self.policy.quiet_after),
+            (Some(at), None) | (None, Some(at)) => Some(at + self.policy.quiet_after),
+            (None, None) => None,
+        }
     }
 
     /// Fold one observation in. Returns `true` when the PUBLISHED status changed
@@ -636,18 +603,6 @@ impl StatusFsm {
     fn moved_recently(&self, now: Instant) -> bool {
         self.last_movement
             .is_some_and(|at| now.saturating_duration_since(at) < self.policy.quiet_after)
-    }
-
-    /// LIVE TYPING: a keystroke aimed at this session, still inside the one
-    /// activity window, AND the grid moved for it. Movement alone was the
-    /// review's regression — `EnteringCommand` is the steady state whenever a
-    /// prompt is displayed, so any background output re-stuck the typing
-    /// subject on an idle prompt.
-    fn typed_recently(&self, sample: &ActivitySample, now: Instant) -> bool {
-        sample
-            .last_input
-            .is_some_and(|at| now.saturating_duration_since(at) < self.policy.quiet_after)
-            && self.moved_recently(now)
     }
 
     fn output_recently(&self, sample: &ActivitySample, now: Instant) -> bool {
@@ -716,36 +671,16 @@ impl StatusFsm {
                     conflict,
                     outcome: None,
                 },
-                // LIVE TYPING (review follow-up to frame audit #3): prompt
-                // entry with the keystroke echo still moving the grid is the
-                // one `Idle` that is NOT settled. Same phase on the wire, but
-                // the movement reason rides the record so the chrome's typing
-                // subject can stay live WHILE the user is typing — the audit's
-                // decay killed that state by classifying `Entering` as plain
-                // `Idle` unconditionally. The echo aging out (`quiet_after`,
-                // the module's one activity window) retires the marker, which
-                // is the decay itself: an abandoned half-typed prompt settles
-                // to plain `Idle` with no new bytes at all (see `owed_wake`).
-                // `Prompt` never carries the marker — its movement is the
-                // `tail -f &` case, not a keystroke.
+                // A prompt — displayed, or with a command line being typed at
+                // it — is `Idle`, keystrokes or not: RFC §6 permits no
+                // stronger claim for a shell with no foreground job.
                 //
                 // A PROMPT REPORTS THE BLOCK IT CLOSED. The precmd's 133;D and
                 // the next prompt's 133;A arrive back to back, so the sweep
                 // meets the finished command as the block behind the prompt,
-                // never as a current `Complete` one ([`completed_block`]); both
-                // prompt arms carry its result, the typing one included (the
-                // user who typed `false` is still inside the keystroke window
-                // when its prompt comes back). A prompt that closed nothing
+                // never as a current `Complete` one ([`completed_block`]); the
+                // prompt arm carries its result. A prompt that closed nothing
                 // completed reports nothing, and the published outcome stands.
-                ShellEvidence::Entering if self.typed_recently(&evidence.activity, now) => {
-                    Candidate {
-                        phase: Phase::Idle,
-                        confidence: Confidence::Strong,
-                        reasons: vec![Reason::ShellBlock, Reason::ContentActivity],
-                        conflict: false,
-                        outcome: evidence.completed_block.map(|b| exit_outcome(b.exit_code)),
-                    }
-                }
                 ShellEvidence::Prompt | ShellEvidence::Entering => Candidate {
                     phase: Phase::Idle,
                     confidence: Confidence::Strong,
@@ -916,11 +851,141 @@ pub(crate) fn completed_block(term: &aterm_core::terminal::Terminal) -> Option<C
         // A command is running: it reports when it completes.
         Some(_) => return None,
     };
-    Some(CompletedBlock {
-        id: block.id,
-        exit_code: block.exit_code,
-    })
+    Some(CompletedBlock::of(block))
 }
+
+impl CompletedBlock {
+    /// `block`'s id, exit code and C/D stamps.
+    pub(crate) fn of(block: &aterm_types::OutputBlock) -> CompletedBlock {
+        CompletedBlock {
+            id: block.id,
+            exit_code: block.exit_code,
+            started_ms: block.command_exec_start_time_ms,
+            ended_ms: block.command_end_time_ms,
+        }
+    }
+}
+
+/// THE SESSION LOG's reading of `term`'s blocks
+/// ([`crate::session_log::BlockRead`]): the blocks from `from` on (the open
+/// `cmd` run's block, else the one past the newest the log handled; `None`:
+/// all), OLDEST first, at most [`BLOCK_READ_MAX`] that ran a command — the
+/// block executing now, each one that finished (with its stamps and exit
+/// code, the [`CompletedBlock`] [`completed_block`] reports) and each one a
+/// prompt closed with no OSC 133 D. A block that finished before `since_wall`
+/// (the log's session opened here: another process's) is passed over without
+/// counting. Blocks past the cap wait for the next sweep (`more`, which owes
+/// one, only while a block that may yet be a fact is left), so a burst of
+/// commands (`true; false` typed together, a hundred lines fed at once) is
+/// logged late, never dropped; block ids past `from` the terminal no longer
+/// holds are counted once (`dropped`) and passed (`through`), and the
+/// started-command count with the held blocks that reached C (`started`,
+/// `started_held`) says whether a command went with them. `running_detail`
+/// is the executing block's [`executing_detail`], read by the caller from the
+/// same guard; a finished block's is read here once, as the log takes each
+/// block once. Field reads
+/// (and a finished block's command row) under the guard the sweep already
+/// holds, and only of the blocks from `from` on: the walk goes newest first
+/// and stops at the cursor, so the guard pays for what is new, never for the
+/// retained history (up to a thousand blocks).
+pub(crate) fn block_read(
+    term: &aterm_core::terminal::Terminal,
+    from: Option<u64>,
+    since_wall: Option<u64>,
+    running_detail: Option<String>,
+) -> crate::session_log::BlockRead {
+    use aterm_types::BlockState;
+
+    use crate::session_log::{BlockEnd, BlockFact, BlockRead};
+    let current = term.current_block().map(|b| b.id);
+    let mut read = BlockRead {
+        from,
+        started: Some(term.started_command_seq()),
+        ..BlockRead::default()
+    };
+    // The blocks from the cursor on, newest first to the cursor, then turned
+    // oldest first.
+    let mut past: Vec<&aterm_types::OutputBlock> = term
+        .all_blocks()
+        .rev()
+        .take_while(|b| from.is_none_or(|f| b.id >= f))
+        .collect();
+    past.reverse();
+    // A block that reached C: one accepted C each.
+    let ran = |b: &aterm_types::OutputBlock| {
+        matches!(b.state, BlockState::Executing | BlockState::Complete)
+    };
+    let count = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
+    read.started_held = count(past.iter().filter(|b| ran(b)).count());
+    read.started_at_from = past.first().is_some_and(|b| Some(b.id) == from && ran(b));
+    // Block ids rise by one per prompt and the terminal holds a contiguous
+    // run of them: an oldest held id past the cursor means its history
+    // dropped the ids between, which the read passes.
+    if let (Some(f), Some(oldest)) = (from, past.first().map(|b| b.id))
+        && oldest > f
+    {
+        read.dropped = oldest - f;
+        read.through = Some(oldest - 1);
+    }
+    for (i, block) in past.iter().copied().enumerate() {
+        // The prompt that closed it: the next block's.
+        let closed_at = past.get(i + 1).and_then(|next| next.prompt_time_ms);
+        let end = match block.state {
+            BlockState::Executing if Some(block.id) == current => Some(BlockEnd::Running),
+            BlockState::Complete => Some(BlockEnd::Done(CompletedBlock::of(block))),
+            // Archived while still executing: a prompt closed it with no D (an
+            // interrupted, replaced or crashed command).
+            BlockState::Executing => Some(BlockEnd::Unended {
+                ended_ms: closed_at,
+            }),
+            // A prompt, or a command being typed: nothing ran.
+            _ => None,
+        };
+        // One that finished before the log opened here is another process's.
+        let end = end.filter(|end| {
+            let ended = match *end {
+                BlockEnd::Running => None,
+                BlockEnd::Done(done) => done.ended_ms,
+                BlockEnd::Unended { ended_ms } => ended_ms,
+            };
+            !ended.zip(since_wall).is_some_and(|(e, t)| e < t)
+        });
+        // The cap stops the walk only at a block that would be a fact: the
+        // rest (blocks that ran nothing, another process's) are passed now.
+        if end.is_some() && read.facts.len() == BLOCK_READ_MAX {
+            read.more = true;
+            read.started_unread = count(past.iter().skip(i).filter(|b| ran(b)).count());
+            break;
+        }
+        // The prompt in front that has run nothing yet is where the next
+        // command runs (it keeps its id from OSC 133 A to D): never passed.
+        let settled = Some(block.id) != current
+            || matches!(block.state, BlockState::Executing | BlockState::Complete);
+        if settled {
+            read.through = Some(block.id);
+        }
+        let Some(end) = end else {
+            continue;
+        };
+        let detail = match end {
+            BlockEnd::Running => running_detail.clone(),
+            _ => block_detail(term, block),
+        };
+        read.facts.push(BlockFact {
+            id: block.id,
+            started_ms: block.command_exec_start_time_ms,
+            end,
+            detail,
+        });
+    }
+    read
+}
+
+/// The most blocks that ran a command one [`block_read`] reports: far more
+/// than a person finishes between two sweeps. A burst past it (lines fed or
+/// typed ahead, an agent's quick `send`s) is read on at the next sweep, which
+/// the cut read owes.
+pub(crate) const BLOCK_READ_MAX: usize = 32;
 
 /// The RUNNING command of `term`'s current shell-integration block, reduced by
 /// [`command_detail`]; `None` unless a block is `Executing` and names a command.
@@ -932,6 +997,15 @@ pub(crate) fn executing_detail(term: &aterm_core::terminal::Terminal) -> Option<
     if block.state != aterm_types::BlockState::Executing {
         return None;
     }
+    block_detail(term, block)
+}
+
+/// `block`'s command reduced by [`command_detail`]: the shell's own OSC 633;E
+/// line, else its command row scraped from the screen past the prompt.
+fn block_detail(
+    term: &aterm_core::terminal::Terminal,
+    block: &aterm_types::OutputBlock,
+) -> Option<String> {
     let explicit = block
         .commandline
         .as_deref()
@@ -1259,8 +1333,8 @@ fn windows_path_so_far(head: &str) -> bool {
 /// three rules in the same words, so the wire promise matches what this
 /// returns.
 ///
-/// `title_summary/description.rs`'s `short_command` is the precedent the RFC
-/// names, but not this transform: it hides every program outside its own
+/// The retired Smart Titles summarizer's `short_command` was the precedent the
+/// RFC names, but not this transform: it hid every program outside its own
 /// allow-list as "a command", which is exactly the answer F5 found insufficient.
 pub(crate) fn command_detail(cmdline: &str) -> Option<String> {
     /// The bound on the reply: enough for `kubectl port-forward`, never a
@@ -1888,6 +1962,15 @@ pub(crate) struct StatusObserver {
     /// sweep at the classification rate asks at most every
     /// [`crate::claude_footer::RECHECK`].
     footer_asked: std::collections::HashMap<u64, FooterAsk>,
+    /// THE SESSION LOG's settle wakes ([`crate::session_log::Wakes`]): the
+    /// sessions whose turn tracker waits on a resting word, and when to tick
+    /// it. Not part of the `tab_status` subsystem either: [`Self::clear`]
+    /// leaves it, and a tick finds its own way out.
+    pub(crate) slog_wakes: crate::session_log::Wakes,
+    /// THE PROGRAM'S OWN STATE (OSC 7501), per session: which report shows
+    /// ([`crate::program_state::ProgramStateGate`]). Display only; not part
+    /// of the `tab_status` subsystem either.
+    program_states: std::collections::HashMap<u64, crate::program_state::ProgramStateGate>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2010,6 +2093,8 @@ impl StatusObserver {
             programs: program::ProgramResolver::default(),
             inputs: crate::input_stall::InputWatches::default(),
             footer_asked: std::collections::HashMap::new(),
+            slog_wakes: crate::session_log::Wakes::default(),
+            program_states: std::collections::HashMap::new(),
         }
     }
 
@@ -2024,7 +2109,7 @@ impl StatusObserver {
         pgid: i32,
         now: Instant,
     ) {
-        if program != Some("claude") || pgid <= 0 {
+        if !crate::claude_footer::drawn_for(program) || pgid <= 0 {
             // A held pane can outlive Claude with no valid foreground group;
             // it will not be retired, and the program resolver cannot name a
             // replacement to stop. Use the group we last asked for, or the
@@ -2033,7 +2118,7 @@ impl StatusObserver {
             // send another message every observation interval.
             let prior = self.footer_asked.get(&session).copied();
             if prior.is_some_and(|ask| ask.stopped)
-                || (prior.is_none() && !(pgid <= 0 && program == Some("claude")))
+                || (prior.is_none() && !(pgid <= 0 && crate::claude_footer::drawn_for(program)))
             {
                 return;
             }
@@ -2044,12 +2129,13 @@ impl StatusObserver {
             // this stop in channel order.
             if pgid > 0
                 && current.agent().program_pgid == pgid
-                && current.agent().program.as_deref() == Some("claude")
+                && crate::claude_footer::drawn_for(current.agent().program.as_deref())
             {
                 return;
             }
             let old = prior.map(|ask| ask.pgid).or_else(|| {
-                (pgid <= 0 && program == Some("claude")).then_some(current.agent().program_pgid)
+                (pgid <= 0 && crate::claude_footer::drawn_for(program))
+                    .then_some(current.agent().program_pgid)
             });
             if let Some(old) = old.filter(|old| *old > 0) {
                 self.footer_asked.insert(
@@ -2076,7 +2162,7 @@ impl StatusObserver {
             // sample cannot restart the stopped watch after that transition.
             let current = timeline.lock().unwrap_or_else(|p| p.into_inner());
             if current.agent().program_pgid != pgid
-                || current.agent().program.as_deref() != Some("claude")
+                || !crate::claude_footer::drawn_for(current.agent().program.as_deref())
             {
                 return;
             }
@@ -2465,6 +2551,20 @@ impl StatusObserver {
         }
     }
 
+    /// `session` owes ONE more observation at its ordinary deadline (the
+    /// session log's block read stopped at its cap with blocks left): the
+    /// follow-up [`Self::next_wake`] arms at the slot's next due instant,
+    /// without moving the output stamp a burst's final-frame look waits on,
+    /// so a group handback's immediate look ([`Self::agent_observe`]) stays
+    /// immediate. A level, like [`Self::note_program_answered`].
+    pub(crate) fn owe_look(&mut self, session: u64) {
+        if self.sessions.contains_key(&session)
+            && let Some(w) = self.agents.get_mut(&session)
+        {
+            w.followup = true;
+        }
+    }
+
     /// Whether this observation should read the live zone (the caller holds
     /// the terminal guard): the screen generation or the terminal's `cursor`
     /// moved since the last read, or the
@@ -2778,10 +2878,39 @@ impl StatusObserver {
         }
     }
 
+    /// Fold one sweep's OSC 7501 reading for `session`
+    /// ([`crate::program_state::ProgramStateGate::observe`]). Whether what it
+    /// shows changed.
+    pub(crate) fn observe_program_state(
+        &mut self,
+        session: u64,
+        report: aterm_core::terminal::program_state::ProgramStateReport,
+        honoured: bool,
+        group_moved: bool,
+        now: Instant,
+    ) -> bool {
+        self.program_states
+            .entry(session)
+            .or_default()
+            .observe(report, honoured, group_moved, now)
+    }
+
+    /// The program's own state report `session` shows, and since when
+    /// (`status program_state=`, the presence row).
+    pub(crate) fn program_state(
+        &self,
+        session: u64,
+    ) -> Option<(aterm_core::terminal::program_state::ProgramState, Instant)> {
+        self.program_states
+            .get(&session)
+            .and_then(crate::program_state::ProgramStateGate::shown)
+    }
+
     /// Drop a retired session's state. Without this the map would grow for the
     /// process lifetime as tabs open and close.
     pub(crate) fn retire(&mut self, session: u64) {
         self.agents.remove(&session);
+        self.program_states.remove(&session);
         let _ = self.inputs.forget(session);
         self.programs.retire(session);
         // The footer resolver's state for it too — its watch and its usage
@@ -2915,6 +3044,9 @@ impl crate::App {
             .filter_map(|id| pool.get(*id))
             .chain((!retry_only).then(|| pool.iter()).into_iter().flatten());
         let mut changed = Vec::new();
+        // The proven claims this sweep cleared: their chrome and subscribers
+        // are told once the pool is no longer borrowed (below).
+        let mut claims_cleared = Vec::new();
         // The sweep never changes pool membership: borrow each due session
         // directly instead of collecting ids, looking them up again, and
         // cloning its terminal Arc on every observation interval.
@@ -2967,21 +3099,45 @@ impl crate::App {
             // THE RESIZE LEDGER's probe: four integer loads under this guard.
             let resize_probe = crate::resize_ledger::EngineProbe::sample(&guard);
             let detail = executing_detail(&guard);
+            // THE PROGRAM'S OWN STATE (OSC 7501): one copy under this guard,
+            // gated below once the foreground move is known.
+            let program_report = guard.program_state();
+            // THE SESSION LOG's block read, from this SAME guard: every block
+            // past the log's cursor (the timeline is a strict leaf, taken here
+            // as for `program` below), written to the log once the guard is
+            // released.
+            let (from, since_wall) = {
+                let timeline = session
+                    .ctx
+                    .timeline
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                (
+                    timeline.slog().block_cursor(),
+                    timeline.slog().opened_wall(),
+                )
+            };
+            let blocks = block_read(&guard, from, since_wall, detail.clone());
             // THE AGENT VERDICT's one read of the screen, under this SAME
             // guard: the live zone's rows, only when the content moved since
             // the last read (and at most 4 Hz). Classified after the guard is
             // released — the PTY reader never waits on `aterm_phase`.
             // The published program is read here, under the guard (the
             // timeline is a strict leaf: nothing holding it takes a terminal),
-            // so the zone is judged under the program it was read with.
-            let program = session
-                .ctx
-                .timeline
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .agent()
-                .program
-                .clone();
+            // so the zone is judged under the program it was read with. With
+            // it, the agent in front as the host knows it: by its name, or a
+            // runtime like `node` by its screen (`harness_host::agent_of`).
+            let (program, front_agent) = {
+                let timeline = session
+                    .ctx
+                    .timeline
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                (
+                    timeline.agent().program.clone(),
+                    crate::harness_host::agent_of(timeline.agent()),
+                )
+            };
             // The read is the WHOLE screen, once, through the one construction
             // `status hash=` hashes ([`crate::control::screen_text`]): its hash
             // and generation are the verdict's stamp (`agent_gen=`/`agent_fp=`),
@@ -3016,8 +3172,9 @@ impl crate::App {
                     .checked_add(std::time::Duration::from_nanos(ns)),
             };
             // The keystroke stamp of the window this session is FOCUSED in —
-            // the only session a human is typing into. A background tab's
-            // sample carries `None`, so its prompt never claims live typing.
+            // the only session a human is typing into; a background tab's key
+            // is `None`. Keystrokes are job evidence: a shell cannot start a
+            // foreground child without consuming input.
             let last_input = self.windows.values().find_map(|ws| {
                 ws.front_terminal()
                     .is_some_and(|t| t.session == id)
@@ -3066,7 +3223,6 @@ impl crate::App {
                     alt_screen,
                     content_seq,
                     last_output,
-                    last_input,
                 },
             };
             // The classifier decides the PHASE; the running command is a
@@ -3102,24 +3258,55 @@ impl crate::App {
             // thread. The verdict is published on the session's timeline —
             // the store `status`, `sessions`, `await agent` and the events
             // digest all read — and a move wakes this session's subscribers
-            // now rather than on their next 250 ms tick.
+            // now rather than on their next 250 ms tick. Read through the
+            // factory's injected probe (`tcgetpgrp` in shipping), so a test
+            // puts a group in front with no process.
             let pgid = if master >= 0 {
-                crate::quit_safety::foreground_pgrp(master)
+                (self.session_factory.fg_probe)(master)
             } else {
                 -1
             };
-            let previous_group = (pgid > 0)
-                .then(|| {
-                    let mut timeline = session
-                        .ctx
-                        .timeline
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner());
-                    let previous = timeline.agent().program_pgid;
-                    timeline.note_foreground_group(pgid).then_some(previous)
-                })
-                .flatten();
+            // THE SESSION LOG's shell blocks, then a failure the person saw
+            // (`seen` above), then the foreground move, in that order
+            // (`SessionTimeline::sweep_slog`): a command the shell reported
+            // ended closes at its own D, and with it the program and agent
+            // runs that ran under it, so no child closes after its parent at
+            // the time this sweep noticed.
+            let previous_group = session
+                .ctx
+                .timeline
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .sweep_slog(&blocks, seen, pid, pgid);
             let group_changed = previous_group.is_some();
+            // THE PROVEN CLAIM LEAVES WITH ITS PROCESS (the self-claim
+            // contract, §2): a proven claim whose agent no longer leads the
+            // group in front, or has exited, is cleared as the group moves
+            // (`meta-change field=supervisor value=-`), so aterm's own lane
+            // and the agent's menu rows come back. Leaf locks, after the
+            // timeline's is let go; the process is looked at outside them.
+            if group_changed
+                && crate::session_timeline::release_proven_if_gone(
+                    &session.ctx,
+                    pgid,
+                    crate::metrics::now_us(),
+                )
+            {
+                claims_cleared.push(id);
+            }
+            // THE PROGRAM'S OWN STATE (OSC 7501, the native harness contract
+            // §6): shown only while the program in front names `codex`, and
+            // only a report newer than the sweep before the group moved.
+            // The PTY does not attribute unseen output to a writer. Display only.
+            let program_state_moved = self.session_status.observe_program_state(
+                id,
+                program_report,
+                crate::program_state::honoured_for(
+                    program.as_deref().and_then(aterm_phase::program_of),
+                ),
+                group_changed,
+                now,
+            );
             if let Some(previous) = previous_group {
                 crate::claude_footer::stop(id, previous);
                 // A program started or ended in this tab: the crash journal
@@ -3192,23 +3379,37 @@ impl crate::App {
                     .read()
                     .unwrap_or_else(|p| p.into_inner())
                     .has_rekey_channel(id);
-                let moves = self
-                    .harness
-                    .as_ref()
-                    .is_some_and(crate::harness_host::HostHandle::rekeys_agents);
-                crate::integration_notice::heal_for(channel, program.as_deref(), moves)
+                let moves = self.harness.as_ref().is_some_and(|host| {
+                    host.rekeys_agents() && front_agent.is_some_and(|agent| host.admits(agent))
+                });
+                crate::integration_notice::heal_for(channel, front_agent, moves)
             });
             let _ = self.integration_notices.observe(id, heal, now);
             let step = self
                 .session_status
                 .agent_observe(id, generation, zone, cursor, program, pgid, resolve, now);
+            // A block read cut at its cap owes the rest one more look at the
+            // slot's next due instant (after `agent_observe`, which sets the
+            // follow-up from what it read; a handback's immediate look stands).
+            if blocks.more {
+                self.session_status.owe_look(id);
+            }
             let moved = match (step.publish, stamp) {
-                (Some((word, detail, subject, reader)), Some(stamp)) => session
-                    .ctx
-                    .timeline
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .publish_agent(word, detail, subject, reader, stamp),
+                (Some((word, detail, subject, reader)), Some(stamp)) => {
+                    let (moved, wake) = {
+                        let mut timeline = session
+                            .ctx
+                            .timeline
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner());
+                        let moved = timeline.publish_agent(word, detail, subject, reader, stamp);
+                        (moved, timeline.slog_wake())
+                    };
+                    // The session log's settle wake, owed by the loop
+                    // (`session_log::Wakes`): one entry while a turn rests.
+                    self.session_status.slog_wakes.note(id, wake);
+                    moved
+                }
                 // Read, and the zone was unchanged: the verdict stands on this
                 // newer screen.
                 (None, Some(stamp)) => {
@@ -3222,6 +3423,13 @@ impl crate::App {
                 }
                 _ => false,
             };
+            // THE A/B CLOCK (Settings ▸ Harness): a moved word closes the
+            // stretch the last one opened, charged to the arm then in force.
+            // At the word's own instant: no clock is read here.
+            if moved {
+                let arm = self.harness_ab_arm(id);
+                self.harness_screen.note_phase(id, &session.ctx, arm);
+            }
             // THE RESIZE LEDGER, evaluated on this sweep so a `render` verdict
             // transition lands on the timeline (and wakes the digest) without
             // waiting for a reader. The SELF-AUDIT: an engine past the ledger
@@ -3266,8 +3474,24 @@ impl crate::App {
                     .unwrap_or_else(|p| p.into_inner())
                     .notify(id);
             }
-            if status_changed || detail_changed || seen || step.reading_changed {
+            if status_changed
+                || detail_changed
+                || seen
+                || step.reading_changed
+                || program_state_moved
+            {
                 changed.push(id);
+            }
+        }
+        // A cleared proven claim moves what a released one moves (the
+        // `Wake::MetaChanged` arm) and is pushed as `EVENT meta`.
+        for id in claims_cleared {
+            self.on_meta_changed(id);
+            if self.subscribers.any() {
+                self.subscribers
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .notify(id);
             }
         }
         // Said here, before either exit: a newcomer retry records a moved
@@ -3396,7 +3620,6 @@ impl crate::App {
                 alt_screen: false,
                 content_seq: 0,
                 last_output: None,
-                last_input: None,
             },
         };
         let moved =
@@ -3422,6 +3645,12 @@ impl crate::App {
         }
         let quieted =
             carried.is_some_and(|carried| carried.seen) && self.session_status.note_seen(session);
+        if quieted {
+            // THE SESSION LOG: the failure the carry says was seen is seen here.
+            let mut timeline = timeline.lock().unwrap_or_else(|p| p.into_inner());
+            let at = timeline.slog().now();
+            timeline.slog_mut().failure_seen(at);
+        }
         if moved || quieted {
             self.refresh_session_status_chrome(session);
         }
@@ -3441,6 +3670,12 @@ impl crate::App {
             .is_some_and(crate::os_window_focused)
             && self.focused_session_id(wid) == Some(session);
         if looking && self.session_status.note_seen(session) {
+            // THE SESSION LOG: `mark - seen` lifts the failure's need.
+            if let Some(s) = self.pool.get(session) {
+                let mut timeline = s.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+                let at = timeline.slog().now();
+                timeline.slog_mut().failure_seen(at);
+            }
             self.refresh_session_status_chrome(session);
         }
     }
@@ -3558,26 +3793,6 @@ impl crate::App {
     /// pass per window: `refresh_window_tabs` takes every tab's terminal lock,
     /// and this runs on the output path.
     pub(crate) fn refresh_session_status_chrome(&mut self, session: u64) {
-        // TITLE FOLLOWS THE SETTLED PHASE (frame audit #3): push this publish's
-        // idle verdict into the smart-title coordinator BEFORE the chrome below
-        // recomposes, so a stale "Typing a command" subject decays to the
-        // prompt-state description in the same repaint that carries the phase
-        // change — instead of holding the titlebar for minutes after `status`
-        // started answering `phase=idle`. Runs at publish (transition) rate; a
-        // verdict that moves nothing visible is a cheap flag write.
-        //
-        // SETTLED is the verdict, never bare `Idle` (review finding on the
-        // audit's fix): `Entering` classifies as `Idle`, so a bare phase check
-        // decayed the typing subject WHILE the user was typing and it never
-        // showed at all. `Status::settled_idle` keeps the verdict false while
-        // the keystroke echo is fresh and flips it once the echo has aged out.
-        //
-        // AND THE BLOCK IS RE-OBSERVED with it: a publish is the block
-        // transition itself (a job starting or ending), and for a BACKGROUND
-        // tab it is one of the only two edges that reach the title at all —
-        // its output wakes skip the observation (see
-        // `App::observe_title_subject`). The refresh below carries the result.
-        let _ = self.observe_title_subject(session);
         let mut windows = self.windows_with_focused_session(session);
         for (wid, tab_id) in self.tabs_viewing_session(session) {
             if self.refresh_tab_status_indicators(wid, tab_id) && !windows.contains(&wid) {
@@ -3596,6 +3811,9 @@ impl crate::App {
         // longer exists; without this the map would grow one entry per closed
         // tab for the process lifetime.
         self.job_probe.forget(session);
+        // Its A/B stretch is settled, and Settings ▸ Harness loses its row.
+        self.retire_harness_ab(session);
+        self.harness_screen_moved();
     }
 
     /// The bridge's roster-round status read. Each row carries the registry's
@@ -3651,9 +3869,18 @@ impl crate::App {
     /// their producers and fallback exactly aligned with that record: `hold`
     /// from the session fabric leaf, `detail` from one non-blocking terminal
     /// read or the last observed status, and `revision=0` until classified.
+    ///
+    /// And one the record does not carry, `hold_origin=<fleet|local|fleet,local|->`,
+    /// from the same read of the same leaf: whose holds stand — both, when the
+    /// fleet halted a session the owner had held. The bridge converges the
+    /// FLEET slot with the bus and must never lift the owner's LOCAL one, which
+    /// `hold=` alone cannot tell apart from it. (A bridge from before the token,
+    /// or from before two slots meeting `fleet,local`, reads the row as
+    /// malformed and retries that session's `status`.)
     fn fabric_status_fields(&self, session: u64) -> Option<String> {
         let pooled = self.pool.get(session)?;
-        let hold = u8::from(pooled.ctx.fabric.hold().is_some());
+        let holds = pooled.ctx.fabric.holds();
+        let (hold, hold_origin) = (u8::from(holds.is_held()), holds.origins());
         let detail = {
             let term = match pooled.term.try_lock() {
                 Ok(t) => Some(t),
@@ -3681,10 +3908,12 @@ impl crate::App {
         };
         Some(match agent {
             Some(word) => format!(
-                "sid={session} revision={revision} hold={hold} detail={detail} agent={word}"
+                "sid={session} revision={revision} hold={hold} hold_origin={hold_origin} \
+                 detail={detail} agent={word}"
             ),
             None => format!(
-                "sid={session} revision={revision} hold={hold} detail={detail} agent_deferred=1"
+                "sid={session} revision={revision} hold={hold} hold_origin={hold_origin} \
+                 detail={detail} agent_deferred=1"
             ),
         })
     }
@@ -3850,17 +4079,42 @@ impl crate::App {
                 t.shell_integration_posture(),
             )
         });
+        // `os_appearance= theme_side= reported_scheme= bg_dark=` (APPEAR-10),
+        // between the agent verdict and `integration=`: the OS reading and the split side it picked,
+        // then what THIS session reports to DSR 996 / mode 2031 and whether
+        // its background is dark, from the same guard. A check reads all four
+        // agree after an OS flip.
+        let appearance_probe = term
+            .as_deref()
+            .map(|t| (t.color_scheme(), t.default_background()));
         drop(term);
+        let appearance = self.appearance_status_fields(
+            appearance_probe.map(|(reported, _)| reported),
+            appearance_probe.map(|(_, bg)| bg),
+        );
         // `supervisor=<holder|->`: the live supervisor claim (`meta set
         // supervisor`), so a poll shows that something is answering this
-        // session's prompts. A leaf lock, taken after the terminal guard.
-        let supervisor = pooled
-            .ctx
-            .meta
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .live_supervisor(crate::metrics::now_us())
-            .map_or_else(|| "-".to_string(), aterm_control::wire::pct_encode);
+        // session's prompts. A leaf lock, taken after the terminal guard —
+        // and in the same read, the session's own Autopilot word.
+        //
+        // `supervisor_proven=<0|1>` beside it (2026-10-16): whether that claim
+        // is a PROVEN self-claim ([`crate::self_claim`]): the kernel proved the
+        // claim is the foreground agent's own, never the holder's spelling.
+        let (supervisor, word, land_at, claimed_here) = {
+            let meta = pooled.ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+            let now = crate::metrics::now_us();
+            let live = meta.live_supervisor(now);
+            (
+                format!(
+                    "{} supervisor_proven={}",
+                    live.map_or_else(|| "-".to_string(), aterm_control::wire::pct_encode),
+                    u8::from(meta.supervisor_proven(now)),
+                ),
+                meta.autopilot_word(),
+                meta.land_at,
+                live == Some(crate::autopilot::own_holder()),
+            )
+        };
         // `input= input_bytes= input_wait_ms= fg_rss_mb=` (2026-09-24), after
         // `integration=`: whether the program is READING its input, probed
         // live — the fact a frozen program's unmoving screen cannot show
@@ -3881,7 +4135,11 @@ impl crate::App {
         // the `gen=`/`seq=`/`hash=` stamp: whether the app has drawn over
         // content a resize displaced ([`crate::resize_ledger`]), how many
         // resizes the session took, and how many net-zero flaps.
-        let (agent, resize) = {
+        //
+        // `last_act=<act|->` (2026-10-16), from the same leaf lock: the last act
+        // an agent that supervises itself recorded (`meta set harness_act`,
+        // the timeline's `harness-act` rows).
+        let (agent, resize, supervised_agent, last_act, face) = {
             let mut timeline = pooled
                 .ctx
                 .timeline
@@ -3890,8 +4148,42 @@ impl crate::App {
             (
                 timeline.agent().wire_fields(),
                 timeline.resize_status_fields(resize_probe, crate::turn_ledger::now_ms()),
+                crate::harness_host::agent_of(timeline.agent()),
+                timeline.last_act().unwrap_or("-").to_string(),
+                timeline.task_face().map(|(face, _)| face),
             )
         };
+        // `autopilot=<off|cruise|land|->` (2026-10-15), right after
+        // `supervisor=` and its `supervisor_proven=`: the session's EFFECTIVE Autopilot while it runs an
+        // agent the harness supervises — its own word, else `[harness]
+        // autopilot`, and `off` under the master switch or with no host — and
+        // `-` for any other session ([`crate::autopilot::wire_field`]).
+        let autopilot =
+            crate::autopilot::wire_field(self.harness_posture(), word, supervised_agent);
+        // `program_state=<state>[:<kind>]|-` (2026-10-16), right after the
+        // agent verdict's fields and apart from them: what a `codex` in front
+        // reports about itself (OSC 7501, [`crate::program_state`]), for
+        // display. Never `agent=`, never an `await`'s, never a decision's.
+        let program_state = crate::program_state::wire(self.session_status.program_state(session));
+        // `land_at=<unix s|-> task=<open|landed|done|spent|theirs|->`
+        // (2026-10-16, `docs/DESIGN-harness-autopilot-2026-10-15.md` §9.3.5,
+        // §9.4.1), from the same two reads and printed just before the
+        // `gen=`/`seq=`/`hash=` stamp, which stays last: for an agent session,
+        // the instant its timed Cruise lands and its task's face under Land as
+        // its loop last told this window's host — `task=` only while that host
+        // holds the live claim — and `-` otherwise.
+        let land_at =
+            crate::autopilot::land_at_field(land_at.filter(|_| supervised_agent.is_some()));
+        let task = crate::autopilot::task_field(face, claimed_here, supervised_agent);
+        // `reset_at=<unix s|->` (2026-10-16), after `task=` and before the
+        // stamp: where this window's harness placed the wall reset of the
+        // Codex this session runs, in that Codex's own zone
+        // ([`crate::presence::reset_at_field`]) — what `aterm harness limits`
+        // places a Codex tab's wall by. A map read and the published reading.
+        let reset_at = crate::presence::reset_at_field(
+            self.session_status.agent_reading(session).1.as_ref(),
+            self.harness_resets.get(pooled.ctx.self_id.as_str()),
+        );
         // `human_ms=<ms|->`, just after `supervisor=`: how long ago a PERSON
         // last had a hand on this session through a window
         // ([`crate::human_input`]; control verbs never stamp it), `-` for
@@ -3978,9 +4270,11 @@ impl crate::App {
                  confidence=unknown reasons=- attribution={} fs_consent={} conflict=false \
                  revision=0 enabled={enabled} hold={hold} hold_advisory={hold_advisory} \
                  fabric={fabric} {fabric_tail} \
-                 identity={identity} {presence} path={path} {agent} integration={integration} \
-                 {input} supervisor={supervisor} human_ms={human_ms} human_seq={human_seq} {owner} \
-                 history_lost={history_lost} integration_rev={integration_rev} {resize} gen={generation} seq={seq} hash={hash}",
+                 identity={identity} {presence} path={path} {agent} program_state={program_state} last_act={last_act} {appearance} integration={integration} \
+                 {input} supervisor={supervisor} autopilot={autopilot} human_ms={human_ms} \
+                 human_seq={human_seq} {owner} \
+                 history_lost={history_lost} integration_rev={integration_rev} {resize} \
+                 land_at={land_at} task={task} reset_at={reset_at} gen={generation} seq={seq} hash={hash}",
                 opt(subject.as_deref()),
                 opt(detail.as_deref()),
                 consent.attribution.as_str(),
@@ -4015,9 +4309,11 @@ impl crate::App {
              detail={} confidence={} reasons={reasons} attribution={} fs_consent={} \
              conflict={} revision={} enabled={enabled} hold={hold} hold_advisory={hold_advisory} \
              fabric={fabric} {fabric_tail} \
-             identity={identity} {presence} path={path} {agent} integration={integration} \
-             {input} supervisor={supervisor} human_ms={human_ms} human_seq={human_seq} {owner} \
-             history_lost={history_lost} integration_rev={integration_rev} {resize} gen={generation} seq={seq} hash={hash}",
+             identity={identity} {presence} path={path} {agent} program_state={program_state} last_act={last_act} {appearance} integration={integration} \
+             {input} supervisor={supervisor} autopilot={autopilot} human_ms={human_ms} \
+             human_seq={human_seq} {owner} \
+             history_lost={history_lost} integration_rev={integration_rev} {resize} \
+             land_at={land_at} task={task} reset_at={reset_at} gen={generation} seq={seq} hash={hash}",
             opt(subject.as_deref()),
             status.phase.as_str(),
             status.last_outcome.as_str(),

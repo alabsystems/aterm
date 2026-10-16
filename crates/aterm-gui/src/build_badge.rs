@@ -1,17 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The subtle top-right BUILD/VERSION badge: a tiny, faint [`DrawPrim`] pill showing
-//! `v{version} · {build}` so "which build am I on" is answerable at a glance without
-//! opening About. Default OFF, toggleable via `show_build_badge` or the native Settings
-//! tab ▸ Window ▸ "Show build/version badge". It is NON-INTERACTIVE (paint only) — it never
-//! captures the mouse — so it
-//! lives in its OWN paint-only `badge_card` slot rather than the modal `settings_card`,
-//! and the composite picks the modal FIRST (`settings_card.or(badge_card)`): any modal
-//! card — the palette, or a native route such as Settings and its `/about` page — covers
-//! the badge while open, and it returns when that card closes. Built
-//! from the SAME [`DrawPrim`] chrome vocabulary as the palette (a rounded pill, hairline border, dim text) so it reads as native window chrome, not
-//! terminal grid cells. ONE structured source ([`crate::build_info`]) drives it.
+//! The top-right build/version badge: a faint [`DrawPrim`] pill showing `v{version} · {build}`.
+//! Off by default (`show_build_badge`, Settings "Show floating version pill"). It is paint-only,
+//! so it lives in its own `badge_card` slot behind the modal cards: an open overlay hides it, and
+//! a native route composes it into its own tray (`App::compose_native_route_card`).
 
 use aterm_render::Theme;
 
@@ -20,11 +13,8 @@ use crate::tray_raster::row_baseline;
 use crate::type_scale::TypeStep;
 use crate::widget::{DrawPrim, TextFace, TextWeight, TrayInput, rgba, text_prim};
 
-/// The badge caption, e.g. `v0.59 · 1783203308` — the shared app/source display
-/// version plus the build number (a release's `RELEASES.ledger` claim; HEAD's
-/// committer epoch on a dev build — see `build_info::build_number()`). Compact by
-/// design — a glanceable identity, not the full provenance (compiler flavor /
-/// commit / signature live in About).
+/// The badge caption, e.g. `v0.59 · 1783203308`: the shared display version and
+/// `build_info::build_number()`. Full provenance (compiler, commit, signature) is in About.
 pub(crate) fn badge_text() -> String {
     format!(
         "v{} \u{00b7} {}",
@@ -34,9 +24,8 @@ pub(crate) fn badge_text() -> String {
 }
 
 /// A fingerprint of everything the badge paints, folded into the frame's `RepaintKey`
-/// (`badge_fp`) so toggling the setting — or a version/build bump on a live swap —
-/// forces exactly one present. `0` is the DISABLED/absent sentinel (matching the overlay
-/// `0`-is-closed convention), so an enabled badge is never `0`.
+/// (`badge_fp`) so toggling the setting, or a version/build change on a live swap, forces
+/// exactly one present. `0` means disabled, so an enabled badge is never `0`.
 pub(crate) fn fingerprint(enabled: bool) -> u64 {
     if !enabled {
         return 0;
@@ -48,21 +37,18 @@ pub(crate) fn fingerprint(enabled: bool) -> u64 {
     h.finish() | 1
 }
 
-/// Build the badge tray: a small rounded pill pinned to the TOP-RIGHT of the tray with
-/// the `v{version} · {build}` caption. `card` is the pill's own bounds (top-right), so
-/// the shared rasterizer only paints that small region — not a full-frame canvas. PURE
-/// DrawPrims, same vocabulary as [`crate::about`].
+/// Build the badge tray: a small rounded pill pinned to the top-right with the
+/// `v{version} · {build}` caption. `card` is the pill's own bounds, so the shared rasterizer
+/// paints only that region.
 pub(crate) fn badge_tray(g: &SettingsGeom, theme: Theme) -> TrayInput {
     let r = Roles::from_theme(theme);
     let (cw, ch, px) = (g.cw, g.ch, g.font_px);
     let tray_w = g.cols as f32 * cw;
 
     let text = badge_text();
-    // Caption step (px*0.72 snaps to the 0.8 Caption factor), floored at 9px.
     let size = TypeStep::Caption.px_clamped(px, 9.0, f32::INFINITY);
     let tw = text_w(&text, size.get());
 
-    // Pill geometry: hug the text, pinned to the top-right with a small margin.
     let pad_x = 0.55 * cw;
     let pad_y = 0.22 * ch;
     let pill_w = tw + 2.0 * pad_x;
@@ -73,9 +59,8 @@ pub(crate) fn badge_tray(g: &SettingsGeom, theme: Theme) -> TrayInput {
     let y = margin_t;
     let radius = (pill_h * 0.5).min(11.0);
 
-    // Faint pill: a mostly-transparent surface fill + hairline, so the badge floats over
-    // whatever terminal content is beneath it while staying legible — subtle, not a
-    // solid chrome bar.
+    // Faint pill: a mostly-transparent fill and hairline, legible over whatever terminal
+    // content is beneath it.
     let prims: Vec<DrawPrim> = vec![
         DrawPrim::Panel {
             x,
@@ -129,9 +114,7 @@ mod tests {
     fn text_has_version_and_build() {
         let t = badge_text();
         assert!(t.starts_with('v'), "leads with v: {t}");
-        // The badge shows the shared app/source display version + the build
-        // number. Compiler provenance is not encoded here; it has its own
-        // About/control metadata rows.
+        // Compiler provenance is not on the badge; About and the control metadata carry it.
         assert!(
             t.contains(crate::build_info::version_display()),
             "has display version: {t}"
@@ -158,7 +141,6 @@ mod tests {
         assert!(x >= 0.0 && x + w <= tray_w, "inside the tray horizontally");
         assert!(y >= 0.0, "top margin non-negative");
         assert!(x + w <= tray_w, "right-aligned");
-        // Pinned right: the gap on the right is smaller than the gap on the left.
         assert!(tray_w - (x + w) < x, "hugs the right edge");
         assert!(h < 3.0 * g.ch, "compact height");
         assert!(

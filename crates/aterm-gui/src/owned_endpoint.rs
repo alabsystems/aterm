@@ -201,6 +201,10 @@ mod imp {
             let mut act: libc::sigaction = std::mem::zeroed();
             act.sa_sigaction = libc::SIG_DFL;
             libc::sigaction(sig, &act, std::ptr::null_mut());
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "the termination signal that arrived, re-raised with its default action after cleanup"
+            )]
             libc::raise(sig);
         }
     }

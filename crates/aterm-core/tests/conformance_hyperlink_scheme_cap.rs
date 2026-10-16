@@ -1,14 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance for the host-minted OSC-8 hyperlink scheme capability.
-//!
-//! Drives the real `Terminal` host API (`authorize_hyperlink_scheme` /
-//! `revoke_hyperlink_scheme`) and OSC-8 gate, projects the authorization state
-//! onto `hyperlink_scheme_cap_model`, and checks every transition, including
-//! the at-capacity refusal at `MAX_EXTRA_SCHEMES` (the model's `Cap`) and the
-//! never-allow refusal. The acceptance decision is bound via
-//! `Model::action_enabled("Accept")`.
+//! Tier-1 conformance for the host-minted OSC-8 hyperlink scheme capability: drives the
+//! real `authorize_hyperlink_scheme` / `revoke_hyperlink_scheme` and OSC-8 gate, projects
+//! the authorization state onto `hyperlink_scheme_cap_model`, and checks every
+//! transition, including the refusals at `MAX_EXTRA_SCHEMES` (the model's `Cap`) and for
+//! a never-allow scheme. The gate binds to `Model::action_enabled("Accept")`.
 //!
 //! Negative control: a fabricated never-allow admission is rejected.
 
@@ -91,7 +88,6 @@ fn real_terminal_scheme_mints_refusals_and_gate_refine_the_model() {
     assert!(!model.action_enabled("Accept", &state));
     assert!(!gate_accepts_orca(&mut term));
 
-    // Authorize the distinguished scheme.
     assert!(term.authorize_hyperlink_scheme("orca"));
     bind_transition(&model, &mut state, "Authorize", project(&term));
 

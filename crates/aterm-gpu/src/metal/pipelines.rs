@@ -4,20 +4,11 @@
 //! Builds `MTLRenderPipelineState`s from [`crate::pipeline_table`], the same
 //! rows `renderer.rs` builds its wgpu pipelines from.
 //!
-//! [`metal_blend`], [`metal_write_mask`], [`metal_format`] and
-//! [`metal_vertex_descriptor`] are total mappings off the neutral enums, so a
-//! factor added on the wgpu side fails to compile here.
-//! [`tests::every_table_row_builds_a_metal_pipeline`] builds every row on the
-//! real MSL functions with the renderer's own state.
-//!
-//! # REPLACE
-//!
-//! `renderer.rs` spells the bg and blit pipelines `wgpu::BlendState::REPLACE`
-//! (`(One, Zero)` on both halves). Metal expresses the same state as blending
-//! disabled, so [`metal_blend`] maps a REPLACE row to `None`, decided by
+//! The mappings off the table's neutral enums are total, so a variant added to
+//! the table fails to compile here until Metal spells it. Metal expresses
+//! REPLACE (`(One, Zero)` on both halves) as blending disabled, so
+//! [`metal_blend`] maps a REPLACE row to `None`, decided by
 //! [`crate::pipeline_table::Blend::is_replace`], not by name.
-//!
-//! The armed macOS renderer mints its pipeline states through [`build`].
 
 use super::ffi::{
     self, BlendFactor, BlendOperation, BlendState, ColorWriteMask, Device, Library, Obj,
@@ -30,8 +21,7 @@ use crate::pipeline_table::{
     WriteMask,
 };
 
-/// The Metal spelling of one [`Factor`]. Total, so the table's closed factor
-/// set is enforced at compile time on this side too.
+/// The Metal spelling of one [`Factor`].
 const fn metal_factor(f: Factor) -> BlendFactor {
     match f {
         Factor::Zero => BlendFactor::Zero,
@@ -46,9 +36,6 @@ const fn metal_factor(f: Factor) -> BlendFactor {
 /// [`RenderPipelineDescriptor::set_color_attachment`], or `None` for no
 /// blending: a row with `blend: None` or a row whose blend is REPLACE
 /// ([`Blend::is_replace`]).
-///
-/// Operations are mapped explicitly (today only `Add`), so a new operation
-/// fails this exhaustive mapping until Metal supports it.
 pub(crate) fn metal_blend(blend: Option<Blend>) -> Option<BlendState> {
     let b = blend?;
     if b.is_replace() {
@@ -200,7 +187,7 @@ mod tests {
     /// layouts, for both swapchain formats `pick_surface_format` can choose.
     #[test]
     fn every_table_row_builds_a_metal_pipeline() {
-        let Some(dev) = device() else { return };
+        let dev = device();
         // Six libraries serve eighteen rows: compile each once.
         let libs: HashMap<ShaderLibrary, Library> = ShaderLibrary::ALL
             .into_iter()
@@ -226,12 +213,9 @@ mod tests {
     }
 
     /// No MSL source binds `[[buffer(n)]]` at [`ffi::INSTANCE_STREAM_SLOT`]:
-    /// stage-in attributes and constant buffers share one argument table, so a
-    /// binding there would collide with the stream.
-    ///
-    /// The scan does not parse stages, so it also checks fragment bindings
-    /// (stricter, not wrong). `parity_kernel.metal` is excluded: compute kernels
-    /// use the compute argument table.
+    /// stage-in attributes and constant buffers share one argument table. The
+    /// scan also checks fragment bindings (stricter, not wrong);
+    /// `parity_kernel.metal` is excluded, as compute has its own table.
     #[test]
     fn no_msl_buffer_binding_collides_with_the_instance_stream_slot() {
         use crate::metal::shaders;
@@ -269,16 +253,15 @@ mod tests {
                 }
             }
         }
-        // A scan that finds nothing is a scan that went blind (the probe alone
+        // A scan that finds nothing went blind (`state_probe.metal` alone
         // declares two).
         assert!(
             found >= 10,
             "only {found} `buffer(n)` bindings found across seven sources — the \
              declaration style changed and this guard stopped seeing them"
         );
-        // Count down from the top of Metal's 31-entry table (wgpu-hal's
-        // principle; its own slot is 15). This pin is the contract with the MSL
-        // scan above: change one, change both.
+        // The slot counts down from the top of Metal's 31-entry table
+        // (wgpu-hal's convention); the scan above assumes this value.
         assert_eq!(ffi::INSTANCE_STREAM_SLOT, 30);
     }
 
@@ -379,8 +362,7 @@ mod tests {
                 row.name()
             );
             assert_eq!(rate, 1, "{} step rate", row.name());
-            // Slot 0 belongs to the MSL uniform blocks; a layout there is the
-            // P1 collision come back.
+            // Slot 0 belongs to the MSL uniform blocks.
             let (s0, _, _) = vd.layout_raw(0);
             assert_eq!(s0, 0, "{} lays out a stream at slot 0", row.name());
             verified += 1;
@@ -443,8 +425,8 @@ mod tests {
         assert_eq!(metal_factor(Factor::OneMinusSrcAlpha) as usize, 5);
     }
 
-    /// REPLACE — however the table spells it — must reach Metal as blending
-    /// DISABLED, and nothing else may.
+    /// REPLACE, however the table spells it, reaches Metal as blending
+    /// disabled, and nothing else does.
     #[test]
     fn only_replace_rows_disable_blending() {
         for row in ALL_PIPELINES {
@@ -458,8 +440,7 @@ mod tests {
                 row.name()
             );
         }
-        // The three rows that reach Metal with blending off, named so a fourth
-        // (or a lost one) is a diff a reviewer sees.
+        // The rows that reach Metal with blending off.
         let off: Vec<&str> = ALL_PIPELINES
             .into_iter()
             .filter(|r| metal_blend(r.spec().blend).is_none())
@@ -469,10 +450,8 @@ mod tests {
     }
 
     /// The RGB-only rows, named: both backends default to all channels, so a
-    /// row that lost `WriteMask::Color` would otherwise be silent until a
-    /// translucent window goes opaque. Both crowns (one call site) are
-    /// RGB-only; the shimmer writes all channels because it displaces the whole
-    /// rgba sample.
+    /// lost `WriteMask::Color` is silent until a translucent window goes
+    /// opaque. The shimmer writes all channels: it displaces the whole sample.
     #[test]
     fn nine_rows_are_rgb_only_and_they_are_these() {
         let rgb_only: Vec<&str> = ALL_PIPELINES

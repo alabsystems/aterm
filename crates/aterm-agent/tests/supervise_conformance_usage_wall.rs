@@ -53,13 +53,19 @@
 //! (`ConversationResumed`) is ITS history on the screen — the measured 2.1.299
 //! screen of a different limit (`resets 10:38am`), a person's turn served
 //! under it — and the real decider, which ties a served turn to the notice of
-//! the limit it waits on, waits on to the reset.
+//! the limit it waits on, waits on to the reset. So for one `/resume`d while
+//! the wall SHOWS, its countdown armed (`ArmedConversationResumed`, W1 of
+//! ATERM-KI-1015-1): the measured 2.1.300 screen of an older limit the vendor
+//! continued by itself, whose word the real decider ties to that limit's
+//! notice, not this one's.
 //! NEGATIVE CONTROLS: the loop before 2026-10-14, which read a person's turn
 //! no read saw busy as no turn, still waits after EVERY `PersonTurnServed`,
-//! before the reset too — the model's `PersonTurnUnseen`; and the loop of
+//! before the reset too — the model's `PersonTurnUnseen`; the loop of
 //! 44ed0f339, which counted a turn served under ANY limit's notice, ends the
 //! wait after every `ConversationResumed` — the model's
-//! `OtherLimitsTurnRead`.
+//! `OtherLimitsTurnRead`; and the loop of ef02ee212, which read the vendor's
+//! continuation under ANY limit's notice as this limit's, ends it after every
+//! `ArmedConversationResumed` — the model's `OtherLimitsContinuationRead`.
 //!
 //! THE OWN ACT'S TAKE WINDOW (`OwnActTyped`, `held`; round 16): the continue
 //! policy's act at a turn's end is recorded as typed (`acted`), with the real
@@ -119,6 +125,13 @@
 //! NEGATIVE CONTROL: the loop of 15248f2b3 (`uncapped`), which kept the
 //! act's print's placement, waits a day there — the model's
 //! `OlderLeftPlacedTomorrow`.
+//!
+//! USAGE CREDITS (`Credits`, accounts v2 S5): a turn the credits carry is the
+//! measured `Now using usage credits` footer on a running turn, which the real reader
+//! reads as no wall and the decider leaves alone, as the model's
+//! `NoWallOnCredits` says. NEGATIVE CONTROL: a reader that takes the notice
+//! for a spend wall disagrees at every credits state — the model's
+//! `CreditsReadAsWall`.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
@@ -132,6 +145,8 @@ use aterm_agent::supervise::policy::turn_end::{
 };
 use aterm_phase::prompt::fixtures::screen;
 use aterm_spec::derive::{Model, supervisor_usage_wall_model};
+
+use crate::common::cnst;
 
 type State = BTreeMap<&'static str, i64>;
 
@@ -148,7 +163,22 @@ type State = BTreeMap<&'static str, i64>;
 fn walled_model() -> Model {
     aterm_spec::interp::with_consts(
         &supervisor_usage_wall_model(),
-        &[("Hidden", 0), ("OwnAct", 0)],
+        &[("Hidden", 0), ("OwnAct", 0), ("Credits", 0)],
+    )
+}
+
+/// The model with usage credits carrying a turn (`Credits = 1`) beside the
+/// walls of [`walled_model`] that show and stay.
+fn credits_model() -> Model {
+    aterm_spec::interp::with_consts(
+        &supervisor_usage_wall_model(),
+        &[
+            ("Hidden", 0),
+            ("OwnAct", 0),
+            ("Credits", 1),
+            ("Leaves", 0),
+            ("Unread", 0),
+        ],
     )
 }
 
@@ -255,14 +285,6 @@ fn misplaced_before_the_print() -> Duration {
     Duration::from_secs(u64::try_from(PRINT - at).unwrap())
 }
 
-fn cnst(m: &Model, name: &str) -> i64 {
-    m.consts
-        .iter()
-        .find(|(n, _)| *n == name)
-        .map(|(_, v)| *v)
-        .unwrap_or_else(|| panic!("no const {name}"))
-}
-
 fn minutes(m: &Model, name: &str) -> Duration {
     MIN * u32::try_from(cnst(m, name)).expect("a small constant")
 }
@@ -293,10 +315,25 @@ fn rows(st: &State) -> Vec<String> {
     match st["wall"] {
         1 => walled(st["bg"] == 1),
         6 if st["other"] == 1 => resumed(),
+        6 if st["other"] == 2 => resumed_continued(),
         6 if st["unread"] == 1 => cancelled(),
         6 => left(),
+        _ if st["credits"] == 1 => on_credits(),
         _ => screen(LIVE),
     }
+}
+
+/// A RUNNING TURN CARRIED BY USAGE CREDITS: the worker at work, and Claude
+/// Code's `Now using usage credits` right-aligned on the mode row (as the
+/// 2.1.300 lab drew it, `claude-2.1.300-credits-in-use.txt`).
+fn on_credits() -> Vec<String> {
+    let mut rows = screen(LIVE);
+    let mode = rows
+        .iter()
+        .position(|r| r.contains("bypass permissions on"))
+        .expect("the mode row");
+    rows[mode] = format!("{:<115}Now using usage credits", rows[mode]);
+    rows
 }
 
 /// THE WALL'S NOTICE CANCELLED BEFORE ANY READ: the measured wall on a tab
@@ -319,6 +356,17 @@ fn cancelled() -> Vec<String> {
 fn resumed() -> Vec<String> {
     screen(include_str!(
         "../../aterm-phase/src/fixtures/claude-2.1.299-wall-session-cancelled-then-person-turn.txt"
+    ))
+}
+
+/// ANOTHER CONVERSATION'S HISTORY, `/resume`d while the wall SHOWED, its
+/// countdown armed: the measured 2.1.300 screen (W1 of ATERM-KI-1015-1) —
+/// its own older five-hour limit (`resets 8:48am`) and the vendor's
+/// continuation of it (`⏺ Usage limit reset · continuing automatically`, the
+/// reply under it), the countdown dropped.
+fn resumed_continued() -> Vec<String> {
+    screen(include_str!(
+        "../../aterm-phase/src/fixtures/claude-2.1.300-resumed-older-limit-continued-at-armed-limit.txt"
     ))
 }
 
@@ -385,6 +433,23 @@ fn reading(
 ) -> TurnEndReading {
     let r = rows(st);
     let mut read = aterm_phase::read(Some("claude"), &r, Some(2));
+    // A reader that takes usage credits for a spend wall.
+    if run.credits_as_wall && st["credits"] == 1 && read.credits.is_some() {
+        let mut w = aterm_phase::Wall {
+            kind: aterm_phase::WallKind::Spend,
+            message: "Now using usage credits".to_string(),
+            reset: None,
+            row: 0,
+            placement: aterm_phase::Placement::Footer,
+            under_call: false,
+        };
+        w.row = r.len() - 1;
+        read.phase = Phase::Limited {
+            message: w.message.clone(),
+            reset: None,
+        };
+        read.wall = Some(w);
+    }
     // The limit a cancel left that answered a turn — the act awaited, or a
     // person's asked since the last look — read in the screen's place as the
     // hostless loop reads it (`Session::turn_end_reading`): an answer the
@@ -419,6 +484,21 @@ fn reading(
     // since the limit waited on (its witness, tied to no limit).
     if run.untied && t.since_limit.as_ref().is_some_and(|s| s.served) {
         t.served_in_transcript = true;
+    }
+    // The loop of ef02ee212: the vendor's word that it went on under ANY
+    // limit's notice is this limit's (tied to none): read as if its notice
+    // were the wall's own.
+    if run.untied_continuation && t.auto_continue == Some(aterm_phase::AutoContinue::Fired) {
+        let own = aterm_phase::read(Some("claude"), &walled(false), Some(2))
+            .wall
+            .expect("the measured wall");
+        t.since_limit = Some(aterm_phase::SinceLimit {
+            kind: own.kind,
+            reset: own.reset,
+            served: false,
+            model_set: false,
+            chosen_model: None,
+        });
     }
     // The loop before round 16: inside the own act's take window a wall
     // was folded in only at the point that judged the act — read here as
@@ -455,14 +535,20 @@ fn reading(
 /// limit as an answer to an act of its own only (the NEGATIVE CONTROL of a
 /// person's turn answered so); `uncapped`, the same loop, which placed an
 /// older cancelled limit read as an act's answer on that act's print (the
-/// NEGATIVE CONTROL of a `/resume` inside the act's window).
+/// NEGATIVE CONTROL of a `/resume` inside the act's window);
+/// `untied_continuation`, the loop of ef02ee212, which read the vendor's word
+/// that it went on (`Fired`) under any limit's notice as this limit's (the
+/// NEGATIVE CONTROL of a conversation resumed at an armed limit).
 #[derive(Clone, Copy, Default)]
 struct Run {
+    /// A reader that takes usage credits for a spend wall.
+    credits_as_wall: bool,
     masked: bool,
     unseen: bool,
     blind_to_untaken: bool,
     blind_to_a_persons_turn: bool,
     untied: bool,
+    untied_continuation: bool,
     blind_in_window: bool,
     answer_read_as_taken: bool,
     blind_to_left: bool,
@@ -545,6 +631,17 @@ fn mirror(
         // The world the decider sees only through the screen: background
         // work, and the account's tokens back before the named reset.
         "BackgroundStarts" | "BackgroundEnds" | "LimitLiftedEarly" => {}
+        // A turn the credits carry: the worker at work, nothing for the
+        // decider; its end an ordinary point after real work.
+        "CreditsServes" => {}
+        "CreditsTurnEnds" => {
+            let mut quiet = after.clone();
+            quiet.insert("wall", 0);
+            let mut t = reading(&quiet, Some(LONG), real.reset, run, &real.st);
+            t.phase = Phase::Idle;
+            t.said_tail = Some("Stage done.".to_string());
+            real.st.observe(&t, now);
+        }
         // The Buggy model's misplaced reset is a wall like any other on the
         // REAL side: the real loop places the reset where the notice says.
         // Inside the own act's take window the wall answered that act at
@@ -684,7 +781,7 @@ fn mirror(
         // The notice leaves the screen: the left screen is a point, no work
         // since. Another conversation resumed there: its history is the
         // point, no work since.
-        "NoticeLeaves" | "ConversationResumed" => {
+        "NoticeLeaves" | "ConversationResumed" | "ArmedConversationResumed" => {
             let r = reading(after, None, real.reset, run, &real.st);
             real.st.observe(&r, now);
         }
@@ -713,11 +810,13 @@ fn mirror(
         | "LeftReadAsTurnEnd"
         | "PersonTurnUnseen"
         | "OtherLimitsTurnRead"
+        | "OtherLimitsContinuationRead"
         | "TakeWindowDropsWall"
         | "RetryReadAsTaken"
         | "UnreadLeftDropped"
         | "UnreadAnswerReadAsTaken"
-        | "OlderLeftPlacedTomorrow" => return false,
+        | "OlderLeftPlacedTomorrow"
+        | "CreditsReadAsWall" => return false,
         other => panic!("an action this bind does not mirror: {other}"),
     }
     true
@@ -822,18 +921,20 @@ fn tier1_the_real_reader_and_decider_continue_a_usage_wall_exactly_where_the_mod
         let states = &walked.states;
         let left = states.iter().filter(|st| st["wall"] == 6).count();
         let resumed = states.iter().filter(|st| st["other"] == 1).count();
+        let armed_resumed = states.iter().filter(|st| st["other"] == 2).count();
         let early = states
             .iter()
             .filter(|st| st["wall"] == 6 && st["due"] < cnst(&m, "ResetAt"))
             .count();
         eprintln!(
             "usage wall Tier-1 (unseen {unseen}): {} states walked, {left} of them left walls \
-             ({resumed} on a resumed conversation, {early} lifted before the reset)",
+             ({resumed} on a resumed conversation, {armed_resumed} on one resumed at the armed \
+             wall, {early} lifted before the reset)",
             states.len()
         );
         assert!(
-            states.len() > 100 && left > 20 && resumed > 5 && early > 5,
-            "{} {left} {resumed} {early}",
+            states.len() > 100 && left > 20 && resumed > 5 && armed_resumed > 5 && early > 5,
+            "{} {left} {resumed} {armed_resumed} {early}",
             states.len()
         );
     }
@@ -1010,6 +1111,54 @@ fn the_loop_that_ties_no_turn_to_its_limit_ends_the_wait_on_a_resumed_conversati
         "NoticeLeaves",
         "ConversationResumed",
         "OtherLimitsTurnRead",
+    ] {
+        assert!(buggy.fire(a, &mut st), "{a} at {st:?}");
+    }
+    assert!(!buggy.check_invariant("NoBlindAct", &st), "{st:?}");
+}
+
+/// THE LOOP OF EF02EE212 is not the model (W1 of ATERM-KI-1015-1, measured
+/// on 2.1.300 on 2026-10-15): it read the vendor's word that it went on
+/// (`Usage limit reset · continuing automatically`) as THIS limit's
+/// continuation under ANY limit's notice, so a person who `/resume`d another
+/// conversation while the wall showed, its countdown armed — that history an
+/// older limit the vendor continued by itself — ended the wait, and the
+/// continue policy typed into the standing limit (the stub's 429, 22 minutes
+/// before the reset) — the model's `OtherLimitsContinuationRead`. Walked with
+/// that reading, the real state stops waiting after EVERY
+/// `ArmedConversationResumed`, where the model's limit stands; the loop as it
+/// is (the strict walk) waits on, the vendor's word tied to this limit's own
+/// notice by the reset it names.
+#[test]
+fn the_loop_that_ties_no_continuation_to_its_limit_ends_the_wait_on_a_resume_at_an_armed_wall() {
+    let m = walled_model();
+    let run = Run {
+        untied_continuation: true,
+        ..Run::default()
+    };
+    let walked = walk(&m, false, run);
+    let resumed = walked
+        .fired
+        .get("ArmedConversationResumed")
+        .copied()
+        .unwrap_or(0);
+    let ended = walked
+        .off_after
+        .get("ArmedConversationResumed")
+        .map_or(0, Vec::len);
+    assert!(resumed > 0, "{:?}", walked.fired);
+    assert_eq!(
+        ended, resumed,
+        "every resume at the armed wall ends the wait"
+    );
+    // ... and the model's defect is that loop: it types into the standing
+    // limit before its tokens are back.
+    let buggy = aterm_spec::interp::with_buggy(&m, 1);
+    let mut st = buggy.init_state();
+    for a in [
+        "WallAppears",
+        "ArmedConversationResumed",
+        "OtherLimitsContinuationRead",
     ] {
         assert!(buggy.fire(a, &mut st), "{a} at {st:?}");
     }
@@ -1307,4 +1456,51 @@ fn the_loop_that_folds_a_wall_only_at_a_point_waits_on_nothing_in_the_window() {
         assert!(buggy.fire(a, &mut st), "{a} at {st:?}");
     }
     assert!(!buggy.check_invariant("NoBlindAct", &st), "{st:?}");
+}
+
+/// USAGE CREDITS, WALKED: every reachable state of the model with credits
+/// carrying a turn agrees with the real reader and decider — at a credits
+/// state the reader reads credits in use and no wall, and nothing is
+/// decided — and NEGATIVE CONTROL: a reader that takes the notice for a spend
+/// wall disagrees at every credits state, and nowhere else — the model's
+/// `CreditsReadAsWall`, caught by `NoWallOnCredits`.
+#[test]
+fn tier1_usage_credits_are_no_wall_where_the_model_says() {
+    let m = credits_model();
+    let walked = walk(&m, true, Run::default());
+    let on = walked
+        .states
+        .iter()
+        .filter(|st| st["credits"] == 1)
+        .collect::<Vec<_>>();
+    assert!(!on.is_empty(), "{:?}", walked.fired);
+    for st in &on {
+        let read = aterm_phase::read(Some("claude"), &rows(st), Some(2));
+        assert!(read.credits.is_some() && read.wall.is_none(), "{st:?}");
+    }
+    let off = walk(
+        &m,
+        false,
+        Run {
+            credits_as_wall: true,
+            ..Run::default()
+        },
+    )
+    .off;
+    assert!(
+        !off.is_empty(),
+        "the credits-as-wall reader agreed everywhere"
+    );
+    assert!(off.iter().all(|st| st["credits"] == 1), "{off:?}");
+    assert_eq!(
+        off.iter().collect::<BTreeSet<_>>().len(),
+        on.len(),
+        "at every credits state"
+    );
+    let buggy = aterm_spec::interp::with_buggy(&m, 1);
+    let mut st = buggy.init_state();
+    for a in ["CreditsServes", "CreditsReadAsWall"] {
+        assert!(buggy.fire(a, &mut st), "{a} at {st:?}");
+    }
+    assert!(!buggy.check_invariant("NoWallOnCredits", &st), "{st:?}");
 }

@@ -6,12 +6,6 @@ use aterm_spec::{derive::atpkg_vendor_pending_check_model, interp, verify};
 #[test]
 fn independent_vendor_results_are_bounded_and_harvested_once() {
     let model = atpkg_vendor_pending_check_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name),
-        "vendor pending lifecycle must stay enrolled in spec-link"
-    );
     verify::prove_and_catch_scalar(&model, "atpkg vendor pending check");
 
     // Fast second vendor is offered before the first check completes.

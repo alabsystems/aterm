@@ -1,25 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! aterm-gpu's integration suite: ONE test binary for every file listed below,
-//! instead of one linked and started per file.
+//! aterm-gpu's integration suite: one test binary for every file listed below;
+//! a test is named `<file>::<test>`. The shared kits mount once here — `common`
+//! (the backend pair and pixel comparisons) and `rain_common` (the rain scene) —
+//! and each file reaches them as `crate::<kit>`.
 //!
-//! Each file keeps its path (every `tests/<file>.rs` citation still resolves)
-//! and its own `#[test]`s; a test is named `<file>::<test>` here. The shared
-//! kits are mounted ONCE, here — `common` (the backend pair and the pixel
-//! comparisons) and `rain_common` (the rain scene) — and each file reaches them
-//! as `crate::<kit>`.
+//! The files share a process, so none writes the process environment (the
+//! ligature files pass their font as a family), installs a hook or an
+//! allocator, or re-executes itself. Files that force the fontdue rasterizer
+//! through the environment belong to `gpu_fontdue`.
 //!
-//! Sharing a process was checked, not assumed: no file below writes the process
-//! environment (the ligature parity files pass their font as a family, not
-//! through `ATERM_FONT`), installs a hook or an allocator, or re-executes
-//! itself. The files that force the fontdue rasterizer through the environment
-//! are `gpu_fontdue`'s.
-//!
-//! `autotests = false`: a `tests/*.rs` file that is neither a `mod` line here,
-//! a `mod` line of `gpu_fontdue.rs`, nor a `[[test]]` of its own NEVER
-//! COMPILES. Run one file's tests with
-//! `targo --unverified test -p aterm-gpu --test gpu_suite -- <file>::`.
+//! `autotests = false`: a `tests/*.rs` file that is neither a `mod` here, a
+//! `mod` of `gpu_fontdue.rs`, nor a `[[test]]` of its own never compiles. Run
+//! one file's tests with `targo --unverified test -p aterm-gpu --test gpu_suite -- <file>::`.
 
 mod common;
 #[allow(dead_code)]
@@ -59,4 +53,3 @@ mod scroll_blit_gpu;
 mod selection_highlight;
 mod snapshot_is_final;
 mod tray_present_scissor;
-mod wasm_clock_safety;

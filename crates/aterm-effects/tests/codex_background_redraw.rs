@@ -48,10 +48,8 @@ impl Host {
         self.glow.observe_print_anchor(self.term.print_anchor());
         self.term.row_cols_into(usize::from(c.row), &mut self.buf);
         self.glow.observe_row(c.row, c.col, &self.buf, self.now);
-        // The caret row's two neighbours, as the host feeds them
-        // (`EffectsPipeline::cursor_step`): the content classifiers that
-        // read the row above (a soft-wrapped caret, a lifted word) are only
-        // exercised — and their refusals only pinned — with them.
+        // The caret row's neighbours, as `EffectsPipeline::cursor_step` feeds them: the classifiers
+        // that read the row above (a soft-wrapped caret, a lifted word) need them.
         let r = usize::from(c.row);
         let rows = usize::from(self.term.rows());
         if r > 0 {
@@ -163,9 +161,8 @@ impl Host {
     }
 }
 
-/// A background redraw of an UNCHANGED composer — the row cleared and the
-/// same text laid back — keeps the typed band, whether the redraw arrives in
-/// one batch or across two frames with the cursor hidden between them.
+/// A background redraw of an unchanged composer (the row cleared and the same text laid back)
+/// keeps the typed band, in one batch or across two frames with the cursor hidden between.
 #[test]
 fn an_unchanged_composer_redrawn_in_one_batch_or_across_frames_keeps_its_typed_band() {
     let redraws: [(&str, &[&[u8]]); 2] = [
@@ -307,12 +304,11 @@ fn a_real_return_and_natural_wrap_keep_their_immediate_row_move() {
     assert_eq!(h.glow.in_flight_tally().park_returns, 0);
 }
 
-/// A shell fold is not a soft-wrapped caret (`CursorGlow::soft_wrapped_caret`)
-/// even when two keys cross it in one echo: `b` fills the pane's last column
-/// over a previously blank cell, as a soft-wrapped key does, but `c` stands on
-/// the landing row left of the caret. A frame falls between the presses and
-/// the echo, so both keys are held and their cells come from the seam's sweep.
-/// Both glyphs are lit (the classifier must read the landing row).
+/// A shell fold is not a soft-wrapped caret (`CursorGlow::soft_wrapped_caret`) even when two
+/// keys cross it in one echo: `b` fills the pane's last column over a blank cell, as a
+/// soft-wrapped key does, but `c` stands on the landing row left of the caret. A frame falls
+/// between the presses and the echo, so both keys are held and their cells come from the seam's
+/// sweep. Both glyphs light (the classifier must read the landing row).
 #[test]
 fn a_coalesced_pair_across_the_pending_margin_wrap_lights_both_glyphs() {
     let mut h = Host::new();

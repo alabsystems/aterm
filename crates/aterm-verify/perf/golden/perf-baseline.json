@@ -1,0 +1,10 @@
+{
+  "_comment": "aterm wall-clock throughput baseline (PERF-WALLCLOCK-BASELINE). Median-of-N MB/s of Terminal::process over a deterministic ~32 MiB mixed VT workload. Re-record with `targo --unverified verify perf --record throughput`. The gate fails only if measured median < median_mbps * pass_ratio; pass_ratio is generous to tolerate multi-machine/throttle variance. Recorded conservatively (a cold-start median on m3, not a warm-cache peak) so the floor stays well below any normal machine's throughput.",
+  "median_mbps": 337.435,
+  "min_mbps": 250.865,
+  "max_mbps": 364.714,
+  "workload_bytes": 33554500,
+  "n": 7,
+  "warmup": 2,
+  "pass_ratio": 0.450
+}

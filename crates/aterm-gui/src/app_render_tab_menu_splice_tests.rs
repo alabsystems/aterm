@@ -46,7 +46,6 @@ fn the_painted_card_hit_tests_back_to_the_models_action() {
     let wid = WindowId(0);
     app.tab_strip_rows = 1;
 
-    // Byte-identical with nothing open: the splice must not touch the frame.
     composed_frame(&mut app, wid);
     let before = app.windows[&wid].input_scratch.cells.clone();
     app.splice_tab_menu(wid);
@@ -64,8 +63,7 @@ fn the_painted_card_hit_tests_back_to_the_models_action() {
         .expect("the painter recorded where the card landed");
     assert_eq!(rect.row, 1, "the card hangs under the one-row band");
 
-    // Find the `Copy Session ID` row in the model, then read the pixels the
-    // splice put on that frame row.
+    // `Copy Session ID` in the model, then the frame row the splice painted for it.
     let entries = app.windows[&wid].tab_menu.as_ref().unwrap().entries.clone();
     let i = entries
         .iter()
@@ -87,8 +85,6 @@ fn the_painted_card_hit_tests_back_to_the_models_action() {
         "…and only inside the card's columns: {painted:?}"
     );
 
-    // A click in the middle of that row resolves to that entry, and the
-    // entry carries the action the dispatcher will run.
     let hit = crate::tab_menu::action_at(rect, &entries, rect.row + 1 + i, rect.col + 2)
         .expect("a live action row");
     assert_eq!(hit, i);
@@ -99,7 +95,6 @@ fn the_painted_card_hit_tests_back_to_the_models_action() {
         other => panic!("expected an action row, got {other:?}"),
     }
 
-    // …and closing it puts the frame back exactly as it was.
     assert!(app.close_tab_menu(wid));
     composed_frame(&mut app, wid);
     app.splice_tab_menu(wid);
@@ -163,8 +158,7 @@ fn a_resize_that_leaves_no_room_closes_the_card_instead_of_hiding_it() {
         "a keyboard open seeds a highlight — the row ↵ would fire"
     );
 
-    // Shrink the frame below `strip_rows + 2`, exactly what a resize drag
-    // past the minimum does, and splice again.
+    // Shrink the frame below `strip_rows + 2`, as a resize drag past the minimum does.
     {
         let ws = app.windows.get_mut(&wid).unwrap();
         ws.input_scratch.cells.truncate(2);
@@ -209,7 +203,7 @@ fn the_card_is_pinned_out_of_the_sub_row_scroll_band() {
         "and the band must never invert"
     );
 
-    // Closing it hands the band back — the card's pin is not permanent.
+    // Closing hands the band back.
     app.close_tab_menu(wid);
     composed_frame(&mut app, wid);
     {

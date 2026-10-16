@@ -199,7 +199,7 @@ impl Feel {
 }
 
 /// Three bursts of `WORDS` at `ms_per_key`, each followed by `pause_ms`.
-fn run(ms_per_key: u64, pause_ms: u64, trace: bool) -> (Vec<Seen>, Fx) {
+fn run(ms_per_key: u64, pause_ms: u64) -> (Vec<Seen>, Fx) {
     let mut f = Fx::new();
     let mut seen = Vec::new();
     let step = |f: &mut Fx, seen: &mut Vec<Seen>| {
@@ -218,21 +218,6 @@ fn run(ms_per_key: u64, pause_ms: u64, trace: bool) -> (Vec<Seen>, Fx) {
             ),
             covered: covered(&f.world, (c.row, c.col), body),
         };
-        if trace {
-            println!(
-                "f{:4} cov={} caret={:2},{:2} col={:6.2} row={:5.2} lift={:.2} {:?} {:?} left={}",
-                seen.len(),
-                s.covered,
-                c.row,
-                c.col,
-                fr.col,
-                fr.row,
-                fr.lift,
-                fr.action,
-                fr.pose,
-                fr.facing_left
-            );
-        }
         seen.push(s);
     };
     for _ in 0..3 {
@@ -268,12 +253,7 @@ fn the_escort_keeps_off_the_words_it_leads() {
     let runs: Vec<_> = CADENCES
         .iter()
         .map(|&(ms, pause, max_pct, max_flips)| {
-            (
-                ms,
-                max_pct,
-                max_flips,
-                Feel::judge(&run(ms, pause, false).0),
-            )
+            (ms, max_pct, max_flips, Feel::judge(&run(ms, pause).0))
         })
         .collect();
     for (ms, _, _, m) in &runs {
@@ -321,7 +301,7 @@ fn the_escort_keeps_off_the_words_it_leads() {
 /// proves nothing.
 #[test]
 fn the_oracle_sees_a_trailing_escort() {
-    let (seen, fx) = run(100, 1000, false);
+    let (seen, fx) = run(100, 1000);
     let cw = i32::from(CELL_W);
     let lagged: Vec<Seen> = seen
         .iter()
@@ -344,14 +324,4 @@ fn the_oracle_sees_a_trailing_escort() {
         m.covering_pct(),
         m.max_trail
     );
-}
-
-#[test]
-#[ignore = "diagnostic trace: MS=<ms per key>"]
-fn escort_feel_trace() {
-    let ms = std::env::var("MS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(100);
-    let _ = run(ms, 1000, true);
 }

@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! A REAL CONTROLLING TERMINAL, built rather than inherited: the suite's one pty fixture,
-//! which `producer_to_client` and `provision_cli` drive the binary through.
+//! which `provision_cli` drives the binary through.
 //!
 //! `atpkg-keys setup` and `join` talk to `/dev/tty` and refuse to run without one. A test
 //! harness's own terminal is not a fixture, so this builds a pty pair and makes its slave
@@ -15,6 +15,10 @@
 //! replaced failed with it, 2 runs in 360 beside a parallel opener. The child takes the
 //! slave by descriptor, not by path, so nothing here calls `ptsname(3)`, and its static
 //! buffer needs no lock.
+#![allow(
+    clippy::disallowed_types,
+    reason = "test code: a stand-in child may inherit descriptors"
+)]
 
 use std::io::{Read as _, Write as _};
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};

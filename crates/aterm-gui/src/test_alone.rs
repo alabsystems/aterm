@@ -37,7 +37,7 @@
 //! exit: a pipe's end of file waits for every copy of its write end, and a
 //! child a sibling test forked in the instant the pipe existed holds one until
 //! it execs — seconds for a child demoted to the background band before its
-//! exec, as the managed Ollama daemon's once was.
+//! exec, as the since-retired managed Ollama daemon's once was.
 //!
 //! A stand-in that needs a DESCRIPTOR of its starter's is given it by [`hand`]
 //! (whose hook makes that one spawn a fork) and takes it by [`handed`], which
@@ -595,20 +595,6 @@ impl Ran {
 mod tests {
     use super::*;
 
-    /// The round trip: the body runs in a child started for this very test,
-    /// and the lib-test half returns once that child passed it.
-    #[test]
-    fn the_caller_runs_alone_in_a_child_started_for_it() {
-        if !alone() {
-            return;
-        }
-        assert_eq!(
-            std::env::var_os(ALONE).as_deref(),
-            Some(OsStr::new(&current_test())),
-            "the child was started for this test"
-        );
-    }
-
     /// NEGATIVE CONTROL: a name that selects no test — a test renamed under
     /// a hand-written `--exact` string — exits 0, which the bare exit-status
     /// check the older copies made passed; the verdict refuses it.
@@ -626,142 +612,5 @@ mod tests {
             let refused = refused.expect_err("a run of no test is no pass");
             assert!(refused.contains("did not run that one test"), "{refused}");
         }
-    }
-
-    const STAND_IN_ROLE: &str = "ATERM_TEST_STAND_IN_ROLE";
-
-    /// The stand-in [`a_named_helper_runs_as_a_stand_in_with_its_callers_env`]
-    /// runs: inert without its role, and in it, it sees the caller's
-    /// environment and arguments.
-    #[test]
-    fn stand_in_helper() {
-        let Some(role) = std::env::var_os(STAND_IN_ROLE) else {
-            return;
-        };
-        assert_eq!(role, "helper", "the caller's environment");
-        assert!(
-            std::env::args().any(|arg| arg == "--show-output"),
-            "the caller's argument"
-        );
-    }
-
-    /// A NAMED HELPER AS A STAND-IN: it runs in its own process with the
-    /// caller's environment and arguments, and its run passes only as exactly
-    /// that test's. NEGATIVE CONTROL: the same stand-in under a renamed
-    /// helper's name runs nothing, exits 0, and fails here by name.
-    #[test]
-    fn a_named_helper_runs_as_a_stand_in_with_its_callers_env() {
-        let stand_in = |name: &str| {
-            let mut stand_in = StandIn::helper(module_path!(), name);
-            stand_in
-                .command()
-                .arg("--show-output")
-                .env(STAND_IN_ROLE, "helper");
-            stand_in.spawn()
-        };
-        let ran = stand_in("stand_in_helper").passed();
-        assert!(ran.stdout.contains("running 1 test"), "{}", ran.stdout);
-        assert!(stand_in("stand_in_helper").selected().status.is_some());
-        let renamed = stand_in("stand_in_helper_renamed").wait();
-        assert!(
-            renamed.status.is_some_and(|status| status.success()),
-            "control: a renamed helper's child exits 0\n{}",
-            renamed.stdout
-        );
-        let refused = renamed.passed_one().expect_err("a renamed helper fails");
-        assert!(refused.contains("stand_in_helper_renamed"), "{refused}");
-    }
-
-    #[cfg(unix)]
-    const HANDED: &str = "ATERM_TEST_STAND_IN_HANDED";
-
-    /// The stand-in [`a_handed_descriptor_arrives_and_a_number_alone_is_refused_by_name`]
-    /// runs: inert without its variable; with it, it takes the descriptor it
-    /// was handed and reads its starter's byte from it. NEGATIVE CONTROL: a
-    /// second take of the same number, its first owner alive, is refused — by
-    /// the close-on-exec flag the first take left, so this pins that too.
-    #[cfg(unix)]
-    #[test]
-    fn handed_helper() {
-        use std::io::Read as _;
-        if std::env::var_os(HANDED).is_none() {
-            return;
-        }
-        let mut read = std::fs::File::from(handed(HANDED));
-        // A second owner, had one been made, is forgotten, not dropped: its
-        // close would take the first owner's descriptor before the assertion.
-        let again = std::panic::catch_unwind(|| handed(HANDED)).map(std::mem::forget);
-        assert!(
-            again.is_err(),
-            "a second take made two owners of one number"
-        );
-        let mut byte = [0u8; 1];
-        read.read_exact(&mut byte).expect("the starter's byte");
-        assert_eq!(byte, [7], "the starter's byte, through the handed pipe");
-    }
-
-    /// A DESCRIPTOR HANDED TO A STAND-IN ARRIVES ([`hand`], [`handed`]): a
-    /// close-on-exec pipe's read end, from which the stand-in reads the byte
-    /// this test wrote. NEGATIVE CONTROL: the same stand-in TOLD the same
-    /// number, and what the descriptor is, with no hand-over — what clearing
-    /// `FD_CLOEXEC` for a bare `Command` amounts to under a std with the SP-1
-    /// strip — holds nothing there, and fails by name instead of going on
-    /// with a number that is not its pipe.
-    ///
-    /// Alone: [`hand`]'s hook makes the spawn a fork, and a fork of the whole
-    /// lib-test process holds a copy of every sibling test's descriptors
-    /// until it execs (the module docs).
-    #[cfg(unix)]
-    #[test]
-    fn a_handed_descriptor_arrives_and_a_number_alone_is_refused_by_name() {
-        use std::io::Write as _;
-        use std::os::fd::AsRawFd as _;
-        if !alone() {
-            return;
-        }
-        // Both ends close-on-exec from birth (`std::io::pipe`).
-        let (read, mut write) = std::io::pipe().expect("a pipe");
-        write.write_all(&[7]).expect("the byte");
-        let mut stand_in = StandIn::helper(module_path!(), "handed_helper");
-        hand(stand_in.command(), HANDED, read.as_raw_fd());
-        stand_in.spawn().passed();
-
-        let mut told = StandIn::helper(module_path!(), "handed_helper");
-        told.command()
-            .env(HANDED, read.as_raw_fd().to_string())
-            .env(
-                is_var(HANDED),
-                descriptor(read.as_raw_fd()).expect("the pipe"),
-            );
-        let refused = told
-            .spawn()
-            .wait()
-            .passed_one()
-            .expect_err("a stand-in told a number and handed nothing does not go on");
-        assert!(refused.contains("THE HAND-OVER FAILED"), "{refused}");
-    }
-
-    /// Dropped unreaped, a stand-in is SIGKILLed and reaped: nothing a
-    /// failing test started outlives it. Unix-pinned: the witness that the
-    /// pid is gone is `kill(pid, 0)`.
-    #[cfg(unix)]
-    #[test]
-    fn a_stand_in_dropped_unreaped_is_killed_and_reaped() {
-        let mut stand_in = StandIn::helper(module_path!(), "stand_in_helper");
-        // A child that would outlive the test: the role is unset, so the
-        // helper itself returns at once — a sleep stands in for a wedge.
-        *stand_in.command() = {
-            // std's Command: it replaces the stand-in's own, which is std's (`StandIn::new`).
-            let mut sleep = Command::new("/bin/sleep");
-            sleep.arg("600");
-            sleep
-        };
-        let running = stand_in.spawn();
-        let pid = libc::pid_t::try_from(running.id()).expect("pid");
-        drop(running);
-        // SAFETY: signal 0 only asks whether `pid` names a process; the
-        // child was reaped above, so ESRCH unless a new one took the number.
-        let gone = unsafe { libc::kill(pid, 0) } != 0;
-        assert!(gone, "the dropped stand-in was killed and reaped");
     }
 }

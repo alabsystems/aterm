@@ -8,9 +8,8 @@
 //!
 //! It computes the aterm-gui process closure (every workspace crate reachable
 //! from `crates/aterm-gui` over normal dependency edges) by parsing the
-//! checked-in `Cargo.toml`s directly. Not `cargo metadata`: this runs inside
-//! tools/freeze-safety-gate's build script, where a recursive cargo can
-//! deadlock on the package lock; a manifest parse is offline and fast.
+//! checked-in `Cargo.toml`s directly. Not `cargo metadata`: a manifest parse
+//! is offline, needs no toolchain, and takes milliseconds.
 //!
 //! Rules (an unclassifiable construct is a hard error, never a skip):
 //!
@@ -30,23 +29,35 @@
 //!     Forks that link into the GUI process are scanned in vendored-identity
 //!     mode: lock identities live in a per-crate namespace (`winit::…`), and
 //!     per-platform subtrees the macOS GUI does not compile are labeled
-//!     platform slices (counted, never graphed). Build-time-only patches
-//!     (pkg-config) are classified out with a justification. The registry is
+//!     platform slices (counted, never graphed). The registry is
 //!     fail-closed both ways: an unregistered patch entry, or a registered
 //!     entry missing from the patch table, from disk, or with missing slice
 //!     paths, is a hard error. Every classification is printed.
 //!   * First-party `[patch.*]` targets (under `crates/`, with no evidence of
 //!     redistribution) owe no review row; they are scanned unnamespaced if they
-//!     link into the process. See [`classify_patch_target`]: a patch path under
-//!     neither `vendor/` nor `crates/`, or a first-party path carrying a review
-//!     row, is a hard error.
+//!     link into the process. ABSORBED targets — upstream source aterm now owns
+//!     as a workspace member, which keeps its upstream license and is named by
+//!     the top-level NOTICE (`forge attest` holds those records) — owe no review
+//!     row either, but until they are carved under first-party lock discipline
+//!     they are scanned exactly as while vendored: [`ABSORBED_CRATES`] gives
+//!     each its identity namespace and platform slices, fail-closed both ways.
+//!     See [`classify_patch_target`]: a patch path under neither `vendor/` nor
+//!     `crates/`, a `crates/` path with only one of the two absorption records,
+//!     or a first-party or absorbed path carrying a review row, is a hard error.
 //!   * Drift guard: every derived crate dir must contain `src/`.
 //!
 //! The manifest parser covers the TOML subset this workspace uses (line
 //! comments, single-line basic strings, inline tables, multi-line arrays,
-//! dotted `name.workspace = true` deps). Anything else in a dependency-bearing
-//! section (git deps, `package = ` renames, multi-line strings, unknown spec
-//! keys) fails the derivation.
+//! dotted `name.workspace = true` deps, and the one-table-per-dependency form
+//! cargo itself writes, `[dependencies.<name>]` and
+//! `[target.'cfg(…)'.dependencies.<name>]`, which the absorbed winit's
+//! manifest keeps). A `package = ` rename is understood on any dependency, as
+//! cargo reads it: the walk follows a path dependency by its path, never by
+//! name, while the KEY is what features (`dep:<key>`, `<key>/feat`) and
+//! `workspace = true` name (the workspace `serde` row is
+//! `package = "aterm-serde"`, docs/AUDIT-third-party-2026-10-15.md SP.6).
+//! Anything else in a dependency-bearing section (git deps, multi-line
+//! strings, unknown spec keys) fails the derivation.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -87,12 +98,6 @@ pub enum VendoredMode {
         /// looked like when registered.
         audit: &'static str,
     },
-    /// Never linked into the shipped GUI process (a build-script host tool):
-    /// classified out, with the verification recorded.
-    BuildDepOnly {
-        /// Why (and how it was verified) this never links into the process.
-        justification: &'static str,
-    },
 }
 
 /// A vendored `[patch.*]` fork, REVIEWED and classified. See the module doc;
@@ -103,7 +108,7 @@ pub struct VendoredCrate {
     /// The declared replacement path, repo-relative (must match the patch
     /// table and exist on disk).
     pub path: &'static str,
-    /// Scanned-with-namespace, or build-dep-only.
+    /// Scanned, with its identity namespace.
     pub mode: VendoredMode,
 }
 
@@ -111,103 +116,75 @@ pub struct VendoredCrate {
 /// path entry not registered here is a hard error; an entry no longer in the
 /// patch table, or whose path or slice paths are gone, is a stale review and a
 /// hard error.
-pub const REVIEWED_VENDORED_CRATES: &[VendoredCrate] = &[
-    VendoredCrate {
-        package: "winit",
-        path: "vendor/winit",
-        mode: VendoredMode::Scanned {
-            namespace: "winit",
-            // The macOS GUI process compiles only the shared code,
-            // platform_impl/macos and the macOS-gated platform/ extension
-            // modules (2 blocking `.lock()` sites: event.rs InnerSizeWriter,
-            // macos/window_delegate.rs new_inner_size). The per-OS backends
-            // below are cfg'd out of the shipped binary and counted as slices.
-            platform_slices: &[
-                PlatformSlice {
-                    label: "linux",
-                    paths: &[
-                        "src/platform_impl/linux",
-                        "src/platform/x11.rs",
-                        "src/platform/wayland.rs",
-                        "src/platform/startup_notify.rs",
-                    ],
-                },
-                PlatformSlice {
-                    label: "windows",
-                    paths: &["src/platform_impl/windows", "src/platform/windows.rs"],
-                },
-                PlatformSlice {
-                    label: "web",
-                    paths: &["src/platform_impl/web", "src/platform/web.rs"],
-                },
-                PlatformSlice {
-                    label: "android",
-                    paths: &["src/platform_impl/android", "src/platform/android.rs"],
-                },
-                PlatformSlice {
-                    label: "ios",
-                    paths: &["src/platform_impl/ios", "src/platform/ios.rs"],
-                },
-                PlatformSlice {
-                    label: "orbital",
-                    paths: &["src/platform_impl/orbital", "src/platform/orbital.rs"],
-                },
-            ],
-            audit: "vendored upstream winit 0.30.13 (+ the Wayland DnD patch): runs ON \
-                    the main thread of the GUI process; the macOS-compiled surface is \
-                    graphed under the `winit::` namespace, the non-macOS backends are \
-                    labeled platform slices (no shipped aterm GUI compiles them today; \
-                    the wasm surface is a different process, outside this census's \
-                    one-process deadlock domain — censused since 2026-07-14 by \
-                    run_wasm_census, where lock-order is a documented vacuous \
-                    posture and L0-FREEZE is the live obligation)",
-        },
-    },
-    VendoredCrate {
-        package: "libm",
-        path: "vendor/libm",
-        mode: VendoredMode::Scanned {
-            namespace: "libm",
-            platform_slices: &[],
-            audit: "aterm-trust fork of upstream libm (overflow fixes): pure math — \
-                    ZERO lock-vocabulary sites at registration; scanned so that claim \
-                    is re-checked by the walker every run instead of by review",
-        },
-    },
-    VendoredCrate {
-        package: "indexmap",
-        path: "vendor/indexmap",
-        mode: VendoredMode::Scanned {
-            namespace: "indexmap",
-            platform_slices: &[],
-            audit: "aterm-trust fork of upstream indexmap (index-panic fix): one \
+pub const REVIEWED_VENDORED_CRATES: &[VendoredCrate] = &[VendoredCrate {
+    package: "indexmap",
+    path: "vendor/indexmap",
+    mode: VendoredMode::Scanned {
+        namespace: "indexmap",
+        platform_slices: &[],
+        audit: "aterm-trust fork of upstream indexmap (index-panic fix): one \
                     zero-arg `.read()` (extract.rs) that is core::ptr::read, \
                     categorized by the propagated raw-pointer evidence; no locks",
-        },
     },
-    VendoredCrate {
-        package: "pkg-config",
-        path: "vendor/pkg-config",
-        mode: VendoredMode::BuildDepOnly {
-            justification: "aterm-trust fork of upstream pkg-config: a build-script \
-                            host helper. Verified 2026-07-13 via `cargo tree --edges \
-                            all -i pkg-config`: reachable ONLY through the \
-                            [build-dependencies] of zstd-sys — it never links into \
-                            the shipped GUI process",
+}];
+
+/// An ABSORBED `[patch.*]` crate ([`PatchTargetKind::Absorbed`]) as the
+/// lock-order census scans it. It is a workspace member, so the path-dependency
+/// closure reaches it, but its code was written to upstream's lock discipline,
+/// not aterm's: its receiver names would merge with aterm's identities, and its
+/// per-OS backends (which no single binary links together) would meet each
+/// other through same-named fns, so the census would report cycles between
+/// locks that never coexist (measured on the winit re-home: a
+/// `shared_state`/`window_state` cycle from X11 into Windows). So it keeps the
+/// vendored-identity mode it had under `vendor/`: one namespace, the platform
+/// slices counted and labeled, never graphed. A row leaves when the carve
+/// brings the crate under the first-party discipline.
+pub struct AbsorbedCrate {
+    /// The patch table key (the crates-io package being replaced).
+    pub package: &'static str,
+    /// The replacement path, repo-relative, under `crates/`.
+    pub path: &'static str,
+    /// The identity namespace prefix (unique across every namespaced crate).
+    pub namespace: &'static str,
+    /// Per-platform subtrees not compiled into the shipped macOS binary.
+    pub platform_slices: &'static [PlatformSlice],
+    /// What the crate is and why it is still namespaced.
+    pub audit: &'static str,
+}
+
+/// The absorbed crates the census scans namespaced (see [`AbsorbedCrate`]).
+/// An absorbed `[patch]` target without a row, or a row whose target is not an
+/// absorbed `[patch]` entry at that path, is a hard error.
+pub const ABSORBED_CRATES: &[AbsorbedCrate] = &[AbsorbedCrate {
+    package: "winit",
+    path: "crates/aterm-window",
+    namespace: "winit",
+    // The macOS GUI process compiles only the shared code, platform_impl/macos
+    // and the macOS-gated platform/ extension modules (2 blocking `.lock()`
+    // sites: event.rs InnerSizeWriter, macos/window_delegate.rs
+    // new_inner_size). The per-OS backends below are cfg'd out of the macOS
+    // binary and counted as slices; graphing them is the carve's (winit-core
+    // steps 5 and 8, docs/AUDIT-third-party-2026-10-15.md).
+    platform_slices: &[
+        PlatformSlice {
+            label: "linux",
+            paths: &[
+                "src/platform_impl/linux",
+                "src/platform/x11.rs",
+                "src/platform/wayland.rs",
+            ],
         },
-    },
-    VendoredCrate {
-        package: "smol_str",
-        path: "vendor/smol_str",
-        mode: VendoredMode::Scanned {
-            namespace: "smol_str",
-            platform_slices: &[],
-            audit: "aterm-trust fork of upstream smol_str (winit's key-text string \
-                    type): ZERO lock-vocabulary sites at registration; scanned so the \
-                    claim is re-checked every run",
+        PlatformSlice {
+            label: "windows",
+            paths: &["src/platform_impl/windows", "src/platform/windows.rs"],
         },
-    },
-];
+    ],
+    audit: "winit 0.30.13, absorbed as crates/aterm-window (2026-10-15; vendored as \
+            vendor/winit before): runs ON the main thread of the GUI process; the \
+            macOS-compiled surface is graphed under the `winit::` namespace, the \
+            non-macOS backends are labeled platform slices until the carve; the wasm \
+            cells do not compile it",
+}];
 
 /// What a `[patch.crates-io]` replacement is, which decides whether it owes a
 /// review row. `vendor/` holds redistributed upstream source; `crates/` holds
@@ -220,6 +197,14 @@ pub enum PatchTargetKind {
     /// Under `crates/` with no marks of redistribution: code aterm wrote. Owes
     /// no review row, NOTICE line or `vendor/forge.toml` block.
     FirstParty,
+    /// Under `crates/`, upstream source aterm ABSORBED: a workspace member it
+    /// owns and changes like its own code, which still redistributes someone
+    /// else's work. Both records are present: the retained upstream license
+    /// file in the crate root and the top-level NOTICE naming the directory.
+    /// Owes no review row or `vendor/forge.toml` block; `targo --unverified
+    /// forge attest` holds its NOTICE line, license text and Apache-2.0 §4(b)
+    /// modification notices.
+    Absorbed,
 }
 
 /// Evidence that `dir` is third-party source this repository redistributes,
@@ -230,20 +215,12 @@ pub enum PatchTargetKind {
 ///   `targo --unverified forge attest` uses); or
 /// * a naming of the path in the top-level `NOTICE`.
 fn redistribution_evidence(root: &std::path::Path, path: &str) -> Option<String> {
-    if let Ok(entries) = std::fs::read_dir(root.join(path)) {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            let upper = name.to_uppercase();
-            if upper.starts_with("LICENSE") || upper.starts_with("COPYING") {
-                return Some(format!(
-                    "it retains an upstream license file (`{path}/{name}`)"
-                ));
-            }
-        }
+    if let Some(name) = retained_license(root, path) {
+        return Some(format!(
+            "it retains an upstream license file (`{path}/{name}`)"
+        ));
     }
-    let notice = std::fs::read_to_string(root.join("NOTICE")).unwrap_or_default();
-    if notice.contains(path) {
+    if notice_names(root, path) {
         return Some(format!(
             "the top-level NOTICE names `{path}` as redistributed"
         ));
@@ -251,12 +228,37 @@ fn redistribution_evidence(root: &std::path::Path, path: &str) -> Option<String>
     None
 }
 
+/// The first upstream license file (`LICENSE*`, `COPYING*`) in `path`'s root.
+fn retained_license(root: &std::path::Path, path: &str) -> Option<String> {
+    let mut names: Vec<String> = std::fs::read_dir(root.join(path))
+        .ok()?
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| {
+            let upper = n.to_uppercase();
+            upper.starts_with("LICENSE") || upper.starts_with("COPYING")
+        })
+        .collect();
+    names.sort();
+    names.into_iter().next()
+}
+
+/// Does the top-level NOTICE name `path`?
+fn notice_names(root: &std::path::Path, path: &str) -> bool {
+    std::fs::read_to_string(root.join("NOTICE"))
+        .unwrap_or_default()
+        .contains(path)
+}
+
 /// Classify a `[patch.crates-io]` replacement path.
 ///
 /// Location alone is not the test: `crates/aterm-lz4` is derived from
-/// lz4_flex and recorded in NOTICE as a redistribution. So a `crates/` path
-/// showing [`redistribution_evidence`] is an error (third-party source outside
-/// `vendor/` needs a human), and any location other than `vendor/` or
+/// lz4_flex and recorded in NOTICE as a redistribution. A `crates/` path with
+/// BOTH absorption records — a retained upstream license and a NOTICE line —
+/// is [`PatchTargetKind::Absorbed`]: a human decided aterm owns it and recorded
+/// that where the notary reads it. A `crates/` path with only one of the two
+/// is an error (third-party source outside `vendor/` whose redistribution is
+/// half-recorded needs a human), and any location other than `vendor/` or
 /// `crates/` is an error naming both.
 pub fn classify_patch_target(
     pkg: &str,
@@ -276,32 +278,37 @@ pub fn classify_patch_target(
              `aterm_census::scan_set::classify_patch_target` a new kind first"
         ));
     }
+    if retained_license(root, path).is_some() && notice_names(root, path) {
+        return Ok(PatchTargetKind::Absorbed);
+    }
     if let Some(why) = redistribution_evidence(root, path) {
         return Err(format!(
             "[patch] entry `{pkg}` points at `{path}`, which is under `crates/` but is NOT \
              first-party code: {why}. Treating it as first-party would skip the whole \
-             provenance family (review row, NOTICE line, retained LICENSE, Apache-2.0 \
-             section 4(b) byte-diff) for source this repository redistributes on somebody \
-             else's terms. Fail-closed, because the two wrong answers are not symmetric: \
-             move the fork under `vendor/` where the obligations are enforced, or — if the \
-             evidence is a false positive — say why in \
-             `aterm_census::scan_set::redistribution_evidence`"
+             provenance family (NOTICE line, retained LICENSE, Apache-2.0 section 4(b) \
+             byte-diff) for source this repository redistributes on somebody else's terms. \
+             Fail-closed, because the two wrong answers are not symmetric: record the \
+             absorption whole (the upstream license file in the crate root AND a NOTICE \
+             line naming `{path}`), move the fork under `vendor/` where the review \
+             obligations are enforced, or — if the evidence is a false positive — say why \
+             in `aterm_census::scan_set::redistribution_evidence`"
         ));
     }
     Ok(PatchTargetKind::FirstParty)
 }
 
-/// One vendored crate the census SCANS (resolved from the registry against
-/// the tree): the walker's vendored-identity-mode input.
+/// One vendored or absorbed crate the census SCANS namespaced (resolved from
+/// [`REVIEWED_VENDORED_CRATES`] or [`ABSORBED_CRATES`] against the tree): the
+/// walker's vendored-identity-mode input.
 #[derive(Debug)]
 pub struct ScannedVendored {
     /// The package name (== the patch table key).
     pub package: String,
     /// The identity namespace prefix (`winit` ⇒ identities `winit::…`).
     pub namespace: &'static str,
-    /// Repo-relative crate dir (`vendor/winit`).
+    /// Repo-relative crate dir (`vendor/indexmap`, `crates/aterm-window`).
     pub crate_dir: String,
-    /// Repo-relative source dir (`vendor/winit/src`) — the walk root.
+    /// Repo-relative source dir (`<crate dir>/src`) — the walk root.
     pub scan_dir: String,
     /// Labeled per-platform subtrees to count, never graph.
     pub platform_slices: &'static [PlatformSlice],
@@ -314,16 +321,18 @@ pub struct ScanSet {
     pub scan_dirs: Vec<String>,
     /// Excluded proc-macro crates: (package name, crate dir).
     pub proc_macros: Vec<(String, String)>,
-    /// The reviewed vendored `[patch.*]` crates SCANNED in vendored-identity
-    /// mode, sorted by package.
+    /// The reviewed vendored and the absorbed `[patch.*]` crates SCANNED in
+    /// vendored-identity mode, sorted by package.
     pub vendored_scanned: Vec<ScannedVendored>,
-    /// The reviewed vendored `[patch.*]` crates classified out as
-    /// build-time-only: (package, path, justification).
-    pub vendored_build_only: Vec<(String, String, &'static str)>,
     /// `[patch.*]` entries pointing at a first-party workspace member, sorted:
     /// (package, path). Printed, never review-registered; a member that links
     /// into the GUI process is already in `scan_dirs`, unnamespaced.
     pub first_party_patches: Vec<(String, String)>,
+    /// `[patch.*]` entries pointing at an ABSORBED workspace member
+    /// ([`PatchTargetKind::Absorbed`]), sorted: (package, path). Scanned like
+    /// [`Self::first_party_patches`]; listed apart because they still
+    /// redistribute upstream source.
+    pub absorbed_patches: Vec<(String, String)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -533,8 +542,12 @@ fn parse_doc(text: &str, file: &str) -> Result<Doc, String> {
 
 /// One dependency edge as declared (normal deps only).
 struct DepEdge {
-    /// The dependency key (== the package name; renames are a hard error).
+    /// The dependency key: what features name (`dep:<key>`, `<key>/feat`) and
+    /// what `workspace = true` looks up in the root table.
     key: String,
+    /// The package behind the key when `package = "…"` renames it; the key
+    /// is the package name otherwise.
+    package: Option<String>,
     /// `path = "…"` (relative to the declaring crate dir), if any.
     path: Option<String>,
     /// `workspace = true`?
@@ -558,6 +571,11 @@ struct Manifest {
 enum SectionKind {
     NormalDeps,
     ExcludedDeps,
+    /// `[dependencies.<name>]` (or a `[target.….dependencies.<name>]`): ONE
+    /// normal dependency, whose entries are its spec.
+    NormalDep(String),
+    /// The same one-table form of a dev- or build-dependency: excluded.
+    ExcludedDep,
     Features,
     Lib,
     Package,
@@ -568,25 +586,20 @@ enum SectionKind {
 
 fn classify_section(header: &str, file: &str) -> Result<SectionKind, String> {
     let h = header.trim();
+    if let Some(kind) = dependency_section(h) {
+        return Ok(kind);
+    }
     Ok(match h {
-        "dependencies" => SectionKind::NormalDeps,
-        "dev-dependencies" | "build-dependencies" => SectionKind::ExcludedDeps,
         "features" => SectionKind::Features,
         "lib" => SectionKind::Lib,
         "package" => SectionKind::Package,
         "workspace.dependencies" => SectionKind::WorkspaceDeps,
         _ if h.starts_with("patch.") => SectionKind::Patch,
         _ if h.starts_with("target.") => {
-            if h.ends_with(".dependencies") {
-                SectionKind::NormalDeps // cfg-target deps are IN (platform-independent)
-            } else if h.ends_with(".dev-dependencies") || h.ends_with(".build-dependencies") {
-                SectionKind::ExcludedDeps
-            } else {
-                return Err(format!(
-                    "{file}: unrecognized target section `[{h}]` — the derivation cannot \
-                     soundly classify it (fail-closed)"
-                ));
-            }
+            return Err(format!(
+                "{file}: unrecognized target section `[{h}]` — the derivation cannot \
+                 soundly classify it (fail-closed)"
+            ));
         }
         _ if h.contains("dependencies") => {
             return Err(format!(
@@ -598,15 +611,54 @@ fn classify_section(header: &str, file: &str) -> Result<SectionKind, String> {
     })
 }
 
+/// A dependency section header, with or without its `target.<cfg or triple>.`
+/// prefix (cfg-target deps are IN: platform-independent): the table form
+/// (`dependencies`) or cargo's one-table-per-dependency form
+/// (`dependencies.<name>`). `None` for anything else.
+fn dependency_section(h: &str) -> Option<SectionKind> {
+    let rest = match h.strip_prefix("target.") {
+        Some(target) => {
+            // The key is a quoted cfg (dots inside the quotes) or a bare triple.
+            let after = match target.chars().next()? {
+                quote @ ('\'' | '"') => {
+                    let close = target[1..].find(quote)? + 1;
+                    &target[close + 1..]
+                }
+                _ => &target[target.find('.')?..],
+            };
+            after.strip_prefix('.')?
+        }
+        None => h,
+    };
+    let (table, name) = match rest.split_once('.') {
+        Some((table, name)) => (table, Some(name.trim_matches(['"', '\'']))),
+        None => (rest, None),
+    };
+    match (table, name) {
+        ("dependencies", None) => Some(SectionKind::NormalDeps),
+        ("dependencies", Some(name)) if !name.is_empty() && !name.contains('.') => {
+            Some(SectionKind::NormalDep(name.to_string()))
+        }
+        ("dev-dependencies" | "build-dependencies", None) => Some(SectionKind::ExcludedDeps),
+        ("dev-dependencies" | "build-dependencies", Some(name))
+            if !name.is_empty() && !name.contains('.') =>
+        {
+            Some(SectionKind::ExcludedDep)
+        }
+        _ => None,
+    }
+}
+
 /// Interpret one `key = value` entry of a dependency section as a [`DepEdge`],
 /// including the dotted `name.workspace = true` form. Unknown spec keys (git,
-/// package renames, registry, …) are hard errors.
+/// registry, …) are hard errors.
 fn dep_edge(key: &str, value: &Value, file: &str) -> Result<DepEdge, String> {
     // Dotted form: `aterm-log.workspace = true`.
     if let Some(name) = key.strip_suffix(".workspace") {
         if matches!(value, Value::Bool(true)) {
             return Ok(DepEdge {
                 key: name.to_string(),
+                package: None,
                 path: None,
                 workspace: true,
                 optional: false,
@@ -624,6 +676,7 @@ fn dep_edge(key: &str, value: &Value, file: &str) -> Result<DepEdge, String> {
     }
     let mut edge = DepEdge {
         key: key.to_string(),
+        package: None,
         path: None,
         workspace: false,
         optional: false,
@@ -636,6 +689,10 @@ fn dep_edge(key: &str, value: &Value, file: &str) -> Result<DepEdge, String> {
             for (k, v) in pairs {
                 match (k.as_str(), v) {
                     ("version", Value::Str(_)) => {}
+                    // The package behind a renamed key. The walk follows a
+                    // path dependency by its path, and features name the key,
+                    // so a rename changes neither.
+                    ("package", Value::Str(p)) => edge.package = Some(p.clone()),
                     ("path", Value::Str(p)) => edge.path = Some(p.clone()),
                     ("workspace", Value::Bool(true)) => edge.workspace = true,
                     ("optional", Value::Bool(b)) => edge.optional = *b,
@@ -656,8 +713,8 @@ fn dep_edge(key: &str, value: &Value, file: &str) -> Result<DepEdge, String> {
                     (other, _) => {
                         return Err(format!(
                             "{file}: dependency `{key}` uses spec key `{other}`, which the \
-                             derivation cannot soundly classify (git/package-rename/registry \
-                             deps are out of the modeled subset — fail-closed)"
+                             derivation cannot soundly classify (git/registry deps are out \
+                             of the modeled subset — fail-closed)"
                         ));
                     }
                 }
@@ -699,6 +756,10 @@ fn load_manifest(root: &Path, dir: &str) -> Result<Manifest, String> {
                     m.deps.push(dep_edge(k, v, &file_rel)?);
                 }
             }
+            SectionKind::NormalDep(name) => {
+                m.deps
+                    .push(dep_edge(&name, &Value::Table(entries.clone()), &file_rel)?);
+            }
             SectionKind::Package => {
                 for (k, v) in entries {
                     if k == "name"
@@ -737,6 +798,7 @@ fn load_manifest(root: &Path, dir: &str) -> Result<Manifest, String> {
                 }
             }
             SectionKind::ExcludedDeps
+            | SectionKind::ExcludedDep
             | SectionKind::Ignored
             | SectionKind::WorkspaceDeps
             | SectionKind::Patch => {}
@@ -746,6 +808,66 @@ fn load_manifest(root: &Path, dir: &str) -> Result<Manifest, String> {
         return Err(format!("{file_rel}: no `[package] name` (fail-closed)"));
     }
     Ok(m)
+}
+
+/// The package name of every normal dependency `<root>/<dir>/Cargo.toml`
+/// declares (`[dependencies]` and the `[target.…]` tables; dev and build
+/// excluded), external and optional ones included. A renamed dependency
+/// answers with the package it names, not its key, so `gui = { package =
+/// "winit", … }` is still `winit`.
+pub(crate) fn normal_dependency_names(root: &Path, dir: &str) -> Result<Vec<String>, String> {
+    Ok(load_manifest(root, dir)?
+        .deps
+        .into_iter()
+        .map(|edge| edge.package.unwrap_or(edge.key))
+        .collect())
+}
+
+/// Where the manifest `text` (at `file`) turns on `dep`'s `feature` for a
+/// shipped build: an edge in `[dependencies]`, a `[target.…]` table or
+/// `[workspace.dependencies]` listing it, or a `[features]` item `dep/feature`
+/// (`dep?/feature`). Dev and build edges are not shipped and are not read.
+pub(crate) fn shipped_feature_enablers(
+    text: &str,
+    file: &str,
+    dep: &str,
+    feature: &str,
+) -> Result<Vec<String>, String> {
+    let doc = parse_doc(text, file)?;
+    let forwards = [format!("{dep}/{feature}"), format!("{dep}?/{feature}")];
+    let mut out = Vec::new();
+    for (header, entries) in &doc.sections {
+        if header.is_empty() {
+            continue;
+        }
+        match classify_section(header, file)? {
+            SectionKind::NormalDeps | SectionKind::WorkspaceDeps => {
+                for (k, v) in entries {
+                    if k != dep {
+                        continue;
+                    }
+                    if dep_edge(k, v, file)?.features.iter().any(|f| f == feature) {
+                        out.push(format!(
+                            "[{header}] {dep} = {{ features = [\"{feature}\"] }}"
+                        ));
+                    }
+                }
+            }
+            SectionKind::Features => {
+                for (k, v) in entries {
+                    let Value::Array(items) = v else { continue };
+                    if items
+                        .iter()
+                        .any(|it| matches!(it, Value::Str(s) if forwards.contains(s)))
+                    {
+                        out.push(format!("[{header}] {k} forwards {dep}/{feature}"));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(out)
 }
 
 /// Lexically normalize `base/rel` ("crates/aterm-gui" + "../aterm-buffer" =>
@@ -787,8 +909,32 @@ struct WsSpec {
 
 struct RootTables {
     ws_deps: BTreeMap<String, WsSpec>,
-    /// `[patch.*]` entries with a `path` redirect: key -> repo-relative path.
-    patches: BTreeMap<String, String>,
+    /// `[patch.*]` entries with a `path` redirect: row key -> (the package it
+    /// replaces, repo-relative path). The package is the key unless the row is
+    /// renamed (`package = "…"`).
+    patches: BTreeMap<String, (String, String)>,
+}
+
+/// A `[patch]` row's spec with a `package = "…"` rename taken out, and the
+/// package it replaces (the row key when there is none).
+///
+/// A renamed row is cargo's form for patching two version lines of one
+/// package (`windows-sys-052 = { package = "windows-sys", path = … }`). The
+/// closure walk never follows a patch row by name, and every use of the row
+/// below asks for the PACKAGE it replaces.
+fn patch_row(key: &str, value: &Value) -> (String, Value) {
+    let Value::Table(pairs) = value else {
+        return (key.to_string(), value.clone());
+    };
+    let mut package = key.to_string();
+    let mut rest = Vec::with_capacity(pairs.len());
+    for (k, v) in pairs {
+        match (k.as_str(), v) {
+            ("package", Value::Str(p)) => package = p.clone(),
+            _ => rest.push((k.clone(), v.clone())),
+        }
+    }
+    (package, Value::Table(rest))
 }
 
 fn load_root_tables(root: &Path) -> Result<RootTables, String> {
@@ -830,14 +976,16 @@ fn load_root_tables(root: &Path) -> Result<RootTables, String> {
             }
             SectionKind::Patch => {
                 for (k, v) in entries {
-                    let edge = dep_edge(k, v, file_rel)?;
+                    let (package, spec) = patch_row(k, v);
+                    let edge = dep_edge(k, &spec, file_rel)?;
                     let Some(p) = edge.path else {
                         return Err(format!(
                             "{file_rel}: `[patch]` entry `{k}` is not a path redirect — \
                              the derivation cannot classify it (fail-closed; review it)"
                         ));
                     };
-                    out.patches.insert(k.clone(), normalize_rel("", &p)?);
+                    out.patches
+                        .insert(k.clone(), (package, normalize_rel("", &p)?));
                 }
             }
             _ => {}
@@ -947,7 +1095,7 @@ struct CrateState {
 }
 
 /// Derive the aterm-gui process scan set from the workspace manifests at
-/// `root`: a pure function of the checked-in TOML, safe in a build script.
+/// `root`: a pure function of the checked-in TOML.
 /// Every error is a hard failure of the census.
 pub fn derive_gui_scan_set(root: &Path) -> Result<ScanSet, String> {
     derive_process_scan_set(root, &[GUI_ROOT_CRATE])
@@ -1100,29 +1248,79 @@ pub fn derive_process_scan_set(root: &Path, root_crates: &[&str]) -> Result<Scan
     // ---- Vendored [patch.*] forks: reviewed classifications, fail-closed
     // both ways.
     let mut vendored_scanned: Vec<ScannedVendored> = Vec::new();
-    let mut vendored_build_only: Vec<(String, String, &'static str)> = Vec::new();
     let mut first_party_patches: Vec<(String, String)> = Vec::new();
-    for (pkg, path) in &tables.patches {
-        // Only third-party source owes a review row; a patch pointing at a
-        // workspace member is covered by the closure derivation above.
-        if classify_patch_target(pkg, path, root)? == PatchTargetKind::FirstParty {
+    let mut absorbed_patches: Vec<(String, String)> = Vec::new();
+    for (pkg, path) in tables.patches.values() {
+        // Only vendored source owes a review row; a patch pointing at a
+        // workspace member, first-party or absorbed, is covered by the closure
+        // derivation above.
+        let kind = classify_patch_target(pkg, path, root)?;
+        if kind != PatchTargetKind::Vendored {
+            let what = if kind == PatchTargetKind::Absorbed {
+                "absorbed"
+            } else {
+                "first-party"
+            };
             if REVIEWED_VENDORED_CRATES.iter().any(|r| r.package == pkg) {
                 return Err(format!(
-                    "[patch] entry `{pkg}` points at first-party `{path}` but ALSO has a \
-                     REVIEWED_VENDORED_CRATES row — that registry records third-party \
-                     code this repository redistributes and must keep reviewing, and a \
-                     workspace member is neither. Remove the row (fail-closed: a false \
+                    "[patch] entry `{pkg}` points at {what} `{path}` but ALSO has a \
+                     REVIEWED_VENDORED_CRATES row — that registry records vendored \
+                     third-party code this repository must keep reviewing, and a \
+                     workspace member is not that. Remove the row (fail-closed: a false \
                      provenance claim is as wrong as a missing one)"
                 ));
             }
             if !root.join(path).join("Cargo.toml").is_file() {
                 return Err(format!(
-                    "[patch] entry `{pkg}` points at first-party `{path}`, which has no \
+                    "[patch] entry `{pkg}` points at {what} `{path}`, which has no \
                      Cargo.toml on disk — cargo cannot resolve this workspace at all \
                      (fail-closed)"
                 ));
             }
-            first_party_patches.push((pkg.clone(), path.clone()));
+            if kind == PatchTargetKind::Absorbed {
+                let Some(absorbed) = ABSORBED_CRATES.iter().find(|a| a.package == pkg) else {
+                    return Err(format!(
+                        "[patch] entry `{pkg}` points at absorbed `{path}`, which has no \
+                         ABSORBED_CRATES row — the census must be told how to scan upstream \
+                         code it does not hold to aterm's lock discipline (its identity \
+                         namespace and platform slices): add the row in \
+                         crates/aterm-census/src/scan_set.rs (fail-closed, never silent)"
+                    ));
+                };
+                if absorbed.path != path {
+                    return Err(format!(
+                        "ABSORBED_CRATES entry `{pkg}` is registered at `{}` but the [patch] \
+                         table says `{path}` — the row is STALE; update it",
+                        absorbed.path
+                    ));
+                }
+                for slice in absorbed.platform_slices {
+                    for p in slice.paths {
+                        if !root.join(path).join(p).exists() {
+                            return Err(format!(
+                                "ABSORBED_CRATES entry `{pkg}` registers platform slice `{}` \
+                                 path `{p}`, which no longer exists under `{path}` — the row \
+                                 is STALE (fail-closed)",
+                                slice.label
+                            ));
+                        }
+                    }
+                }
+                // A member, so the closure walk may have reached it; scanned
+                // namespaced instead, never twice.
+                let scan_dir = format!("{path}/src");
+                scan_dirs.retain(|d| *d != scan_dir);
+                vendored_scanned.push(ScannedVendored {
+                    package: pkg.clone(),
+                    namespace: absorbed.namespace,
+                    crate_dir: path.clone(),
+                    scan_dir,
+                    platform_slices: absorbed.platform_slices,
+                });
+                absorbed_patches.push((pkg.clone(), path.clone()));
+            } else {
+                first_party_patches.push((pkg.clone(), path.clone()));
+            }
             continue;
         }
         let Some(reviewed) = REVIEWED_VENDORED_CRATES.iter().find(|r| r.package == pkg) else {
@@ -1130,8 +1328,8 @@ pub fn derive_process_scan_set(root: &Path, root_crates: &[&str]) -> Result<Scan
                 "[patch] entry `{pkg}` (path `{path}`) is NOT in \
                  REVIEWED_VENDORED_CRATES — a vendored fork links into the process \
                  unclassified, so a human must review it: register it as Scanned \
-                 (vendored-identity mode) or BuildDepOnly with a written \
-                 justification (crates/aterm-census/src/scan_set.rs) \
+                 (vendored-identity mode) with its audit note \
+                 (crates/aterm-census/src/scan_set.rs) \
                  (fail-closed, never silent)"
             ));
         };
@@ -1186,16 +1384,6 @@ pub fn derive_process_scan_set(root: &Path, root_crates: &[&str]) -> Result<Scan
                     platform_slices,
                 });
             }
-            VendoredMode::BuildDepOnly { justification } => {
-                if justification.trim().is_empty() {
-                    return Err(format!(
-                        "REVIEWED_VENDORED_CRATES entry `{pkg}` (BuildDepOnly) has an \
-                         empty justification — the classification must record its \
-                         verification (fail-closed)"
-                    ));
-                }
-                vendored_build_only.push((pkg.clone(), path.clone(), justification));
-            }
         }
     }
     // Namespace uniqueness: two crates sharing a namespace would merge their
@@ -1213,7 +1401,7 @@ pub fn derive_process_scan_set(root: &Path, root_crates: &[&str]) -> Result<Scan
         }
     }
     for r in REVIEWED_VENDORED_CRATES {
-        if !tables.patches.contains_key(r.package) {
+        if !tables.patches.values().any(|(pkg, _)| pkg == r.package) {
             return Err(format!(
                 "REVIEWED_VENDORED_CRATES entry `{}` is no longer in the root \
                  [patch] table — a STALE review cannot keep describing the tree; \
@@ -1230,14 +1418,26 @@ pub fn derive_process_scan_set(root: &Path, root_crates: &[&str]) -> Result<Scan
         }
     }
 
+    for a in ABSORBED_CRATES {
+        if !absorbed_patches.iter().any(|(p, _)| p == a.package) {
+            return Err(format!(
+                "ABSORBED_CRATES entry `{}` (`{}`) is not an absorbed [patch] target of this \
+                 tree — a STALE row cannot keep describing it; remove or update the entry \
+                 (fail-closed)",
+                a.package, a.path
+            ));
+        }
+    }
+    vendored_scanned.sort_by(|a, b| a.package.cmp(&b.package));
     first_party_patches.sort();
+    absorbed_patches.sort();
 
     Ok(ScanSet {
         scan_dirs,
         proc_macros,
         vendored_scanned,
-        vendored_build_only,
         first_party_patches,
+        absorbed_patches,
     })
 }
 
@@ -1286,24 +1486,11 @@ pub fn render_scan_set(set: &ScanSet) -> String {
             .collect();
         let _ = writeln!(
             out,
-            "      vendored [patch] crate(s) SCANNED in vendored-identity mode \
-             (REVIEWED_VENDORED_CRATES, fail-closed both ways) — upstream process \
-             code, each crate's lock identities in its own `<crate>::…` namespace \
-             so foreign receiver names can never merge with aterm identities or \
-             each other: {}",
-            listed.join(", ")
-        );
-    }
-    if !set.vendored_build_only.is_empty() {
-        let listed: Vec<String> = set
-            .vendored_build_only
-            .iter()
-            .map(|(n, p, _)| format!("{n} ({p})"))
-            .collect();
-        let _ = writeln!(
-            out,
-            "      excluded vendored [patch] crate(s), REVIEWED build-time-only \
-             (build-script host code, never linked into the GUI process): {}",
+            "      vendored and absorbed [patch] crate(s) SCANNED in vendored-identity \
+             mode (REVIEWED_VENDORED_CRATES and ABSORBED_CRATES, fail-closed both \
+             ways) — upstream process code, each crate's lock identities in its own \
+             `<crate>::…` namespace so foreign receiver names can never merge with \
+             aterm identities or each other: {}",
             listed.join(", ")
         );
     }
@@ -1323,6 +1510,21 @@ pub fn render_scan_set(set: &ScanSet) -> String {
             listed.join(", ")
         );
     }
+    if !set.absorbed_patches.is_empty() {
+        let listed: Vec<String> = set
+            .absorbed_patches
+            .iter()
+            .map(|(n, p)| format!("{n} ({p})"))
+            .collect();
+        let _ = writeln!(
+            out,
+            "      ABSORBED [patch] target(s) — upstream source aterm owns as a workspace \
+             member (retained upstream license + NOTICE line; `forge attest` holds its \
+             notices), no review row; scanned NAMESPACED with its platform slices \
+             (ABSORBED_CRATES) until the carve, listed with the vendored crates above: {}",
+            listed.join(", ")
+        );
+    }
     out
 }
 
@@ -1338,7 +1540,7 @@ pub(crate) mod test_fixtures {
 
     use std::path::{Path, PathBuf};
 
-    use super::{REVIEWED_VENDORED_CRATES, VendoredMode};
+    use super::{ABSORBED_CRATES, REVIEWED_VENDORED_CRATES, VendoredMode};
 
     /// This checkout's root (aterm-census lives two levels under it).
     pub(crate) fn repo_root() -> PathBuf {
@@ -1364,125 +1566,11 @@ pub(crate) mod test_fixtures {
         root
     }
 
-    /// The derived GUI-process closure, pinned. A dependency change updates
-    /// this pin and the diff is the review; an unexpected delta means the
-    /// dependency graph or the derivation drifted.
-    ///
-    /// Read by scan_set's `derived_closure_matches_the_pinned_canary` (the
-    /// member list) and lock_order's
-    /// `scanned_set_covers_the_full_gui_process_closure` (the crate count).
-    ///
-    /// cfg-gated edges are in on every platform (`aterm-shell-integration`
-    /// reaches `aterm-uds` through a `cfg(any(unix, windows))` section):
-    /// scanning a file a target does not link is safe, missing one is not.
-    /// `aterm-uds` is also reached through `aterm-session`/`aterm-control`.
-    pub(crate) const PINNED_GUI_CLOSURE: &[&str] = &[
-        // aterm-gui depends on aterm-agent for the durable queue/WAL, and
-        // aterm-agent on aterm-ctl for the fleet client.
-        "crates/aterm-agent/src",
-        "crates/aterm-alloc/src",
-        "crates/aterm-bidi/src",
-        "crates/aterm-bits/src",
-        "crates/aterm-buffer/src",
-        "crates/aterm-cap/src",
-        "crates/aterm-codec/src",
-        "crates/aterm-containment/src",
-        // aterm-gui hosts the selection/block control verbs through
-        // `control_host::GuiHost`.
-        "crates/aterm-control/src",
-        "crates/aterm-core/src",
-        "crates/aterm-ctl/src",
-        // First-party SHA-256/HMAC-SHA256; holds no locks.
-        "crates/aterm-digest/src",
-        // First-party directory handles; holds no locks (the pinned-directory
-        // `flock` lives in aterm-gui).
-        "crates/aterm-dirfd/src",
-        "crates/aterm-effects/src",
-        "crates/aterm-gpu/src",
-        "crates/aterm-grapheme/src",
-        "crates/aterm-grid/src",
-        "crates/aterm-gui/src",
-        "crates/aterm-hash/src",
-        // First-party HTTP/1.1 client for the title-summary transport; holds
-        // no locks (a client owns its connection).
-        "crates/aterm-http/src",
-        // First-party JSON reader/writer for provider requests and replies;
-        // no synchronisation at all.
-        "crates/aterm-json/src",
-        // The window's `keeper_link` drives the keeper client on a worker
-        // thread; the crate's server half runs only in the keeper job.
-        "crates/aterm-keeper/src",
-        "crates/aterm-lexicon/src",
-        "crates/aterm-log/src",
-        "crates/aterm-lz4/src",
-        // The message band, durable message log and pre-App inbox engine.
-        // Depends on aterm-time only: no locks, threads, fs or sockets.
-        "crates/aterm-messages/src",
-        "crates/aterm-net/src",
-        // The first-party ObjC runtime layer (menu bar, toolbar, status item,
-        // clipboard, accessibility, platform.rs).
-        "crates/aterm-objc/src",
-        "crates/aterm-observe/src",
-        "crates/aterm-parser/src",
-        // Worker-phase and approval-box readers, reached through aterm-agent;
-        // parses screen rows without locks.
-        "crates/aterm-phase/src",
-        // Entered the closure when the first-party PNG codec replaced `png`
-        // and the second compression stack behind it (flate2 + miniz_oxide +
-        // fdeflate + simd-adler32 + adler2, 7 packages / 33,439 lines):
-        // aterm-render, aterm-gpu and aterm-effects all
-        // decode inline images through it. A normal [dependencies] edge, so it
-        // is GUI process code. Its only synchronisation is a `OnceLock` over
-        // the CRC tables — a pure function of nothing, acquiring no other lock
-        // inside its initialiser, so it cannot participate in an order.
-        // `aterm-phase` joined the GUI's closure with the fabric round that made
-        // presence carry role, phase and context (2026-09-14). A crate the shipping
-        // GUI links is a crate this census must scan, so the pin grows with it —
-        // the list is REVIEWED, which is why it is a pin and not a derivation.
-        "crates/aterm-png/src",
-        "crates/aterm-policy/src",
-        "crates/aterm-predict/src",
-        // The coding-agent primer installer: string transforms and std::fs
-        // writes under $HOME on a detached thread; holds no locks.
-        "crates/aterm-primer/src",
-        "crates/aterm-provenance/src",
-        "crates/aterm-pty/src",
-        // First-party regular-expression engine (a bounded Pike VM); no
-        // interior mutability.
-        "crates/aterm-regex/src",
-        "crates/aterm-render/src",
-        "crates/aterm-rle/src",
-        "crates/aterm-sandbox/src",
-        "crates/aterm-scene/src",
-        "crates/aterm-scrollback/src",
-        "crates/aterm-search/src",
-        "crates/aterm-selection/src",
-        "crates/aterm-session/src",
-        "crates/aterm-shell-integration/src",
-        "crates/aterm-sixel/src",
-        // The strain host's machine probe. Its only synchronisation is a
-        // `OnceLock` over the Mach host port. (Its sampler is `reading()`, not
-        // `read()`: a zero-argument `.read()` is this census's RwLock token.)
-        "crates/aterm-sysprobe/src",
-        // The first-party clock; holds no locks.
-        "crates/aterm-time/src",
-        // First-party TOML for config, themes, keybindings and toy packs,
-        // parsed on the startup path; holds no locks.
-        "crates/aterm-toml/src",
-        "crates/aterm-types/src",
-        "crates/aterm-uds/src",
-        "crates/aterm-update/src",
-        "crates/aterm-update-core/src",
-        "crates/aterm-vi/src",
-        // The winit-to-engine key map, split out of aterm-types so that
-        // linking it does not pull AppKit into aterm-ctl.
-        "crates/aterm-winit-keymap/src",
-        "crates/atpkg/src",
-    ];
-
     /// The `[patch.crates-io]` table and vendor stub trees that satisfy the
     /// reviewed-classification checks: every registered entry present, scanned
-    /// entries with a stub `src/`, and every platform-slice path existing.
+    /// entries with a stub `src/`, and every platform-slice path existing. Each
+    /// absorbed crate is a `crates/` stub with both absorption records (a
+    /// LICENSE in its root and a NOTICE line naming it).
     pub(crate) fn patch_fixture() -> (String, Vec<(String, String)>) {
         let mut table = String::from("[patch.crates-io]\n");
         let mut stubs = Vec::new();
@@ -1492,23 +1580,43 @@ pub(crate) mod test_fixtures {
                 format!("{}/Cargo.toml", r.path),
                 format!("[package]\nname = \"{}\"\n", r.package),
             ));
-            if let VendoredMode::Scanned {
+            let VendoredMode::Scanned {
                 platform_slices, ..
-            } = &r.mode
-            {
-                stubs.push((format!("{}/src/lib.rs", r.path), "// stub\n".to_string()));
-                for slice in *platform_slices {
-                    for p in slice.paths {
-                        let rel = if p.ends_with(".rs") {
-                            format!("{}/{p}", r.path)
-                        } else {
-                            format!("{}/{p}/stub.rs", r.path)
-                        };
-                        stubs.push((rel, "// stub\n".to_string()));
-                    }
+            } = &r.mode;
+            stubs.push((format!("{}/src/lib.rs", r.path), "// stub\n".to_string()));
+            for slice in *platform_slices {
+                for p in slice.paths {
+                    let rel = if p.ends_with(".rs") {
+                        format!("{}/{p}", r.path)
+                    } else {
+                        format!("{}/{p}/stub.rs", r.path)
+                    };
+                    stubs.push((rel, "// stub\n".to_string()));
                 }
             }
         }
+        let mut notice = String::from("NOTICE\n");
+        for a in ABSORBED_CRATES {
+            table.push_str(&format!("{} = {{ path = \"{}\" }}\n", a.package, a.path));
+            notice.push_str(&format!("- {} (`{}/`)\n", a.package, a.path));
+            stubs.push((
+                format!("{}/Cargo.toml", a.path),
+                format!("[package]\nname = \"{}\"\n", a.package),
+            ));
+            stubs.push((format!("{}/LICENSE", a.path), "upstream\n".to_string()));
+            stubs.push((format!("{}/src/lib.rs", a.path), "// stub\n".to_string()));
+            for slice in a.platform_slices {
+                for p in slice.paths {
+                    let rel = if p.ends_with(".rs") {
+                        format!("{}/{p}", a.path)
+                    } else {
+                        format!("{}/{p}/stub.rs", a.path)
+                    };
+                    stubs.push((rel, "// stub\n".to_string()));
+                }
+            }
+        }
+        stubs.push(("NOTICE".to_string(), notice));
         (table, stubs)
     }
 
@@ -1551,7 +1659,7 @@ pub(crate) mod test_fixtures {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scan_set::test_fixtures::{repo_root, synth_tree};
+    use crate::scan_set::test_fixtures::synth_tree;
 
     /// Base fixture + a src/lib.rs for every crate dir mentioned, so the
     /// drift guard is satisfied.
@@ -1577,135 +1685,109 @@ mod tests {
         out
     }
 
-    // ------------------------------------------------------------------
-    // The canary: the derived closure on this tree, pinned.
-    // ------------------------------------------------------------------
-
-    /// The pin is [`test_fixtures::PINNED_GUI_CLOSURE`], shared with the
-    /// lock-order census's transcript test.
-    #[test]
-    fn derived_closure_matches_the_pinned_canary() {
-        const PINNED: &[&str] = test_fixtures::PINNED_GUI_CLOSURE;
-        let set = derive_gui_scan_set(&repo_root()).expect("derivation must succeed on HEAD");
-        let mut pinned: Vec<String> = PINNED.iter().map(|s| s.to_string()).collect();
-        pinned.sort();
-        assert_eq!(
-            set.scan_dirs, pinned,
-            "\nthe DERIVED GUI-process closure changed.\n\
-             If you just added/removed a dependency of the aterm-gui graph, this is \
-             the automation working: update the pin above to the new derived set (the \
-             review diff is the audit trail).\n\
-             If you did NOT change dependencies, the derivation or the workspace \
-             drifted unexpectedly — investigate before touching the pin.\n"
-        );
-        assert!(
-            set.proc_macros.is_empty(),
-            "no proc-macro is in the GUI closure"
-        );
-        // The five reviewed vendored forks: four scanned in vendored-identity
-        // mode, pkg-config build-time-only. First-party [patch] entries are
-        // asserted separately.
-        let scanned: Vec<&str> = set
-            .vendored_scanned
-            .iter()
-            .map(|v| v.package.as_str())
-            .collect();
-        assert_eq!(
-            scanned,
-            vec!["indexmap", "libm", "smol_str", "winit"],
-            "the scanned vendored set changed"
-        );
-        assert_eq!(
-            set.vendored_build_only.len(),
-            1,
-            "pkg-config is the one build-dep-only patch"
-        );
-        assert_eq!(set.vendored_build_only[0].0, "pkg-config");
-        // The first-party patch targets, workspace members reached only by
-        // third-party consumers through the patch table:
-        //   `arrayvec`   crates/aterm-arrayvec   re-export of aterm_alloc::ArrayVec
-        //   `cfg-if`     crates/aterm-cfg-if     the cfg_if! macro
-        //   `core_maths` crates/aterm-core-maths CoreFloat over std, not libm
-        //   `libc`       crates/aterm-libc       first-party libc replacement
-        //   `log`        crates/aterm-log-shim   no-op facade (not crates/aterm-log)
-        //   `once_cell`  crates/aterm-once-cell  cells over std's OnceLock,
-        //                                        Mutex and Cell (live code)
-        //   `profiling`  crates/aterm-profiling  no-op facade
-        //   `tracing`    crates/aterm-tracing    no-op facade
-        // Sorted, as `derive` sorts them. None owes a review row.
-        assert_eq!(
-            set.first_party_patches,
-            vec![
-                ("arrayvec".to_string(), "crates/aterm-arrayvec".to_string()),
-                ("cfg-if".to_string(), "crates/aterm-cfg-if".to_string()),
-                (
-                    "core_maths".to_string(),
-                    "crates/aterm-core-maths".to_string()
-                ),
-                ("libc".to_string(), "crates/aterm-libc".to_string()),
-                ("log".to_string(), "crates/aterm-log-shim".to_string()),
-                (
-                    "once_cell".to_string(),
-                    "crates/aterm-once-cell".to_string()
-                ),
-                (
-                    "profiling".to_string(),
-                    "crates/aterm-profiling".to_string()
-                ),
-                ("tracing".to_string(), "crates/aterm-tracing".to_string()),
-            ],
-            "the first-party [patch] target set changed"
-        );
-        // Asserted per crate: one of these gaining a first-party dependant
-        // would become GUI process code. `crates/aterm-arrayvec` is the likely
-        // one; it already depends on `aterm-alloc`, which is in the closure.
-        for dir in [
-            "crates/aterm-arrayvec/src",
-            "crates/aterm-cfg-if/src",
-            "crates/aterm-core-maths/src",
-            "crates/aterm-log-shim/src",
-            "crates/aterm-profiling/src",
-            "crates/aterm-tracing/src",
-        ] {
-            assert!(
-                !set.scan_dirs.contains(&dir.to_string()),
-                "{dir} is reached only through the patch table, never through a \
-                 first-party path dependency; if that changed, the crate is now GUI \
-                 process code and belongs in PINNED_GUI_CLOSURE"
-            );
-        }
-        // winit's platform slices resolve on disk (checked in derive) and
-        // cover exactly the six non-macOS backends.
-        let winit = set
-            .vendored_scanned
-            .iter()
-            .find(|v| v.package == "winit")
-            .expect("winit is scanned");
-        let labels: Vec<&str> = winit.platform_slices.iter().map(|s| s.label).collect();
-        assert_eq!(
-            labels,
-            vec!["linux", "windows", "web", "android", "ios", "orbital"]
-        );
-    }
-
     #[test]
     fn scanned_vendored_crate_missing_src_or_slice_path_fails_closed() {
         // (a) a Scanned entry whose src/ is gone: stale registration.
         let mut files = test_fixtures::workspace_manifests(&[]);
-        files.retain(|(p, _)| p != "vendor/winit/src/lib.rs");
-        // Remove every winit src file so the src/ dir is not created at all.
-        files.retain(|(p, _)| !p.starts_with("vendor/winit/src/"));
+        files.retain(|(p, _)| !p.starts_with("vendor/indexmap/src/"));
         let err = derive("nosrcvendor", with_src(files)).expect_err("must fail");
         assert!(
-            err.contains("no `vendor/winit/src` directory"),
+            err.contains("no `vendor/indexmap/src` directory"),
             "err: {err}"
         );
-        // (b) a registered platform-slice path gone from disk: stale review.
+        // (b) a registered platform-slice path gone from disk: stale row.
         let mut files = test_fixtures::workspace_manifests(&[]);
-        files.retain(|(p, _)| p != "vendor/winit/src/platform/x11.rs");
+        files.retain(|(p, _)| p != "crates/aterm-window/src/platform/x11.rs");
         let err = derive("staleslice", with_src(files)).expect_err("must fail");
         assert!(
             err.contains("platform slice `linux` path `src/platform/x11.rs`")
+                && err.contains("STALE"),
+            "err: {err}"
+        );
+    }
+
+    /// An absorbed `[patch]` target is scanned namespaced, with its slices, and
+    /// never also as a plain member, even when the closure reaches it.
+    #[test]
+    fn an_absorbed_patch_target_is_scanned_namespaced_not_as_a_member() {
+        let absorbed = &ABSORBED_CRATES[0];
+        let mut files = test_fixtures::workspace_manifests(&[]);
+        for (path, contents) in files.iter_mut() {
+            if path == "Cargo.toml" {
+                *contents = contents.replace(
+                    "aterm-types = { path = \"crates/aterm-types\" }\n",
+                    &format!(
+                        "aterm-types = {{ path = \"crates/aterm-types\" }}\n\
+                         {} = {{ path = \"{}\" }}\n",
+                        absorbed.package, absorbed.path
+                    ),
+                );
+            }
+            if path == "crates/aterm-gui/Cargo.toml" {
+                contents.push_str(&format!("{} = {{ workspace = true }}\n", absorbed.package));
+            }
+        }
+        let set = derive("absorbed", with_src(files)).expect("derivation must succeed");
+        assert_eq!(
+            set.absorbed_patches,
+            vec![(absorbed.package.to_string(), absorbed.path.to_string())]
+        );
+        assert!(
+            !set.scan_dirs.contains(&format!("{}/src", absorbed.path)),
+            "an absorbed crate is not scanned unnamespaced: {:?}",
+            set.scan_dirs
+        );
+        let scanned = set
+            .vendored_scanned
+            .iter()
+            .find(|v| v.package == absorbed.package)
+            .expect("the absorbed crate is scanned namespaced");
+        assert_eq!(scanned.namespace, absorbed.namespace);
+        assert_eq!(scanned.crate_dir, absorbed.path);
+    }
+
+    /// An absorbed target with no ABSORBED_CRATES row, and a row whose target
+    /// left the patch table, both stop the census.
+    #[test]
+    fn the_absorbed_registry_is_fail_closed_both_ways() {
+        let absorbed = &ABSORBED_CRATES[0];
+        let mut files = test_fixtures::workspace_manifests(&[]);
+        for (path, contents) in files.iter_mut() {
+            if path == "Cargo.toml" {
+                contents.push_str("absorbed-new = { path = \"crates/aterm-absorbed-new\" }\n");
+            }
+            if path == "NOTICE" {
+                contents.push_str("- absorbed-new (`crates/aterm-absorbed-new/`)\n");
+            }
+        }
+        files.push((
+            "crates/aterm-absorbed-new/Cargo.toml".to_string(),
+            "[package]\nname = \"absorbed-new\"\n".to_string(),
+        ));
+        files.push((
+            "crates/aterm-absorbed-new/LICENSE-MIT".to_string(),
+            "MIT\n".to_string(),
+        ));
+        let err = derive("unrowed", with_src(files)).expect_err("must fail");
+        assert!(
+            err.contains("`absorbed-new`") && err.contains("no ABSORBED_CRATES row"),
+            "err: {err}"
+        );
+        let mut files = test_fixtures::workspace_manifests(&[]);
+        for (path, contents) in files.iter_mut() {
+            if path == "Cargo.toml" {
+                *contents = contents.replace(
+                    &format!(
+                        "{} = {{ path = \"{}\" }}\n",
+                        absorbed.package, absorbed.path
+                    ),
+                    "",
+                );
+            }
+        }
+        let err = derive("staleabsorbed", with_src(files)).expect_err("must fail");
+        assert!(
+            err.contains(&format!("ABSORBED_CRATES entry `{}`", absorbed.package))
                 && err.contains("STALE"),
             "err: {err}"
         );
@@ -1727,9 +1809,27 @@ mod tests {
             set.first_party_patches,
             vec![("shimmed".to_string(), "crates/aterm-shim".to_string())]
         );
-        // And it is not counted as a vendored fork in either direction.
+        // And it is not counted as a vendored fork.
         assert!(set.vendored_scanned.iter().all(|v| v.package != "shimmed"));
-        assert!(set.vendored_build_only.iter().all(|v| v.0 != "shimmed"));
+    }
+
+    /// A RENAMED patch row (cargo's form for two version lines of one package)
+    /// is recorded under the package it replaces, not its key.
+    #[test]
+    fn a_renamed_patch_row_is_recorded_under_the_package_it_replaces() {
+        let mut files = test_fixtures::workspace_manifests(&[("aterm-shim-052", "")]);
+        for (path, contents) in files.iter_mut() {
+            if path == "Cargo.toml" {
+                contents.push_str(
+                    "shimmed-052 = { package = \"shimmed\", path = \"crates/aterm-shim-052\" }\n",
+                );
+            }
+        }
+        let set = derive("renamed", with_src(files)).expect("derivation must succeed");
+        assert_eq!(
+            set.first_party_patches,
+            vec![("shimmed".to_string(), "crates/aterm-shim-052".to_string())]
+        );
     }
 
     /// A patch path under neither `vendor/` nor `crates/` is unclassifiable
@@ -1757,59 +1857,86 @@ mod tests {
     /// registry is a FALSE provenance claim, and is refused by name.
     #[test]
     fn a_review_row_for_a_first_party_patch_target_is_refused() {
-        // Asserts over the real tree: no REVIEWED_VENDORED_CRATES row points
-        // outside vendor/.
-        for r in REVIEWED_VENDORED_CRATES {
-            assert_eq!(
-                classify_patch_target(r.package, r.path, &repo_root()),
-                Ok(PatchTargetKind::Vendored),
-                "REVIEWED_VENDORED_CRATES row `{}` points at `{}`, which is not \
-                 third-party vendored source",
-                r.package,
-                r.path
-            );
+        let reviewed = &REVIEWED_VENDORED_CRATES[0];
+        let mut files = test_fixtures::workspace_manifests(&[("aterm-shim", "")]);
+        for (path, contents) in files.iter_mut() {
+            if path == "Cargo.toml" {
+                *contents = contents.replace(
+                    &format!("{} = {{ path = \"{}\" }}", reviewed.package, reviewed.path),
+                    &format!("{} = {{ path = \"crates/aterm-shim\" }}", reviewed.package),
+                );
+            }
         }
-        for (pkg, path) in [
-            ("tracing", "crates/aterm-tracing"),
-            ("profiling", "crates/aterm-profiling"),
-            ("cfg-if", "crates/aterm-cfg-if"),
-            ("arrayvec", "crates/aterm-arrayvec"),
-            ("log", "crates/aterm-log-shim"),
-            ("core_maths", "crates/aterm-core-maths"),
-            ("once_cell", "crates/aterm-once-cell"),
-        ] {
-            assert_eq!(
-                classify_patch_target(pkg, path, &repo_root()),
-                Ok(PatchTargetKind::FirstParty),
-                "{pkg} -> {path}"
-            );
-        }
+        let err = derive("misfiled", with_src(files)).expect_err("must fail");
+        assert!(
+            err.contains(&format!("`{}` points at first-party", reviewed.package))
+                && err.contains("ALSO has a REVIEWED_VENDORED_CRATES row"),
+            "err: {err}"
+        );
     }
 
-    /// The redistribution refusal fires on the real tree: `crates/aterm-lz4` is
-    /// derived from lz4_flex, retains `crates/aterm-lz4/LICENSE-MIT` and is
-    /// recorded in NOTICE, so a patch pointing at it is refused with a message
-    /// naming why. If aterm-lz4 stops being a redistribution, this test fails
-    /// so that change is confirmed on purpose.
+    /// Under `crates/`, a retained upstream license file or a NOTICE line
+    /// ALONE marks a half-recorded redistribution: refused, naming the evidence.
+    /// Both together are an absorbed crate.
     #[test]
     fn a_redistribution_under_crates_is_refused_not_called_first_party() {
-        let err = classify_patch_target("lz4_flex", "crates/aterm-lz4", &repo_root())
-            .expect_err("aterm-lz4 is derived from lz4_flex and must not read as first-party");
-        assert!(
-            err.contains("LICENSE-MIT") || err.contains("NOTICE"),
-            "the refusal must NAME the evidence so the reader can check it; got: {err}"
+        let root = synth_tree(
+            "aterm-scan-set",
+            "redistribution",
+            &[
+                (
+                    "crates/aterm-fork/LICENSE-MIT".to_string(),
+                    "MIT\n".to_string(),
+                ),
+                (
+                    "crates/aterm-noticed/src/lib.rs".to_string(),
+                    "// derived\n".to_string(),
+                ),
+                (
+                    "NOTICE".to_string(),
+                    "crates/aterm-noticed is derived from upstream\n".to_string(),
+                ),
+            ],
         );
+        let license = classify_patch_target("fork", "crates/aterm-fork", &root);
+        let notice = classify_patch_target("noticed", "crates/aterm-noticed", &root);
+        std::fs::write(root.join("crates/aterm-noticed/LICENSE"), "upstream\n")
+            .expect("write license");
+        let both = classify_patch_target("noticed", "crates/aterm-noticed", &root);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(both, Ok(PatchTargetKind::Absorbed));
+        let license = license.expect_err("a retained license is a redistribution");
+        assert!(
+            license.contains("crates/aterm-fork/LICENSE-MIT"),
+            "{license}"
+        );
+        let notice = notice.expect_err("a NOTICE line is a redistribution");
+        assert!(notice.contains("NOTICE"), "{notice}");
     }
 
     /// Negative control: a crate with no retained license file and no NOTICE
     /// line classifies FirstParty.
     #[test]
     fn a_genuine_first_party_crate_is_not_mistaken_for_a_redistribution() {
-        assert_eq!(
-            redistribution_evidence(&repo_root(), "crates/aterm-hash"),
-            None,
-            "aterm-hash is original first-party code and must show no evidence"
+        let root = synth_tree(
+            "aterm-scan-set",
+            "own",
+            &[
+                (
+                    "crates/aterm-own/src/lib.rs".to_string(),
+                    "// original\n".to_string(),
+                ),
+                (
+                    "NOTICE".to_string(),
+                    "crates/aterm-other is derived from upstream\n".to_string(),
+                ),
+            ],
         );
+        let evidence = redistribution_evidence(&root, "crates/aterm-own");
+        let kind = classify_patch_target("own", "crates/aterm-own", &root);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(evidence, None);
+        assert_eq!(kind, Ok(PatchTargetKind::FirstParty));
     }
 
     // ------------------------------------------------------------------
@@ -1898,6 +2025,109 @@ mod tests {
             "cfg-target DEV deps stay out: {:?}",
             set.scan_dirs
         );
+    }
+
+    /// Cargo's own one-table-per-dependency form, as a normalized manifest
+    /// writes it (the absorbed winit's): a dotted normal dep is followed, a
+    /// dotted cfg-target dep with a dotted cfg is followed, a dotted dev dep
+    /// stays out, and a renamed REGISTRY dep is understood (and not walked).
+    #[test]
+    fn the_one_table_dependency_form_is_followed_like_the_inline_one() {
+        let mut files = test_fixtures::workspace_manifests(&[(
+            "aterm-a",
+            "[dependencies.aterm-b]\n\
+             path = \"../aterm-b\"\n\
+             [dependencies.rwh_06]\n\
+             version = \"0.6\"\n\
+             features = [\n    \"std\",\n]\n\
+             package = \"raw-window-handle\"\n\
+             [target.'cfg(all(unix, not(any(target_os = \"ios\", target_os = \"macos\"))))'.dependencies.aterm-c]\n\
+             path = \"../aterm-c\"\n\
+             [dev-dependencies.aterm-devonly]\n\
+             path = \"../aterm-devonly\"\n",
+        )]);
+        for name in ["aterm-b", "aterm-c", "aterm-devonly"] {
+            files.push((
+                format!("crates/{name}/Cargo.toml"),
+                format!("[package]\nname = \"{name}\"\n"),
+            ));
+        }
+        let set = derive("onetable", with_src(files)).expect("derivation");
+        for followed in ["crates/aterm-b/src", "crates/aterm-c/src"] {
+            assert!(
+                set.scan_dirs.contains(&followed.to_string()),
+                "{followed} is a normal dependency: {:?}",
+                set.scan_dirs
+            );
+        }
+        assert!(
+            !set.scan_dirs
+                .contains(&"crates/aterm-devonly/src".to_string()),
+            "a dotted dev dependency stays out: {:?}",
+            set.scan_dirs
+        );
+        // A renamed path dependency in the same form is followed by its path.
+        let mut files = test_fixtures::workspace_manifests(&[(
+            "aterm-a",
+            "[dependencies.renamed]\npath = \"../aterm-b\"\npackage = \"aterm-b\"\n",
+        )]);
+        files.push((
+            "crates/aterm-b/Cargo.toml".to_string(),
+            "[package]\nname = \"aterm-b\"\n".to_string(),
+        ));
+        let set = derive("renamedpath", with_src(files)).expect("derivation");
+        assert!(
+            set.scan_dirs.contains(&"crates/aterm-b/src".to_string()),
+            "a renamed path dependency is followed by its path: {:?}",
+            set.scan_dirs
+        );
+    }
+
+    /// A renamed path dependency, as the workspace `serde` row is
+    /// (`package = "aterm-serde"`, docs/AUDIT-third-party-2026-10-15.md SP.6):
+    /// the walk follows its path, and features name its KEY, as cargo resolves
+    /// them. Naming the package where the key belongs is refused, so the key
+    /// is what activation reads.
+    #[test]
+    fn a_renamed_path_dependency_is_walked_by_path_and_activated_by_key() {
+        let manifests = |gui_feature: &str| {
+            let (patch_table, mut files) = test_fixtures::patch_fixture();
+            let mut root = String::from("[workspace]\nmembers = [\"crates/*\"]\n");
+            root.push_str("[workspace.dependencies]\n");
+            root.push_str("serde = { package = \"aterm-serde\", path = \"crates/aterm-serde\" }\n");
+            root.push_str(&patch_table);
+            files.push(("Cargo.toml".to_string(), root));
+            files.push((
+                "crates/aterm-gui/Cargo.toml".to_string(),
+                format!(
+                    "[package]\nname = \"aterm-gui\"\n\
+                     [features]\ndefault = [\"persist\"]\npersist = [\"{gui_feature}\"]\n\
+                     [dependencies]\nserde = {{ workspace = true, optional = true }}\n\
+                     quiet = {{ package = \"aterm-off\", path = \"../aterm-off\", optional = true }}\n"
+                ),
+            ));
+            for n in ["aterm-serde", "aterm-off"] {
+                files.push((
+                    format!("crates/{n}/Cargo.toml"),
+                    format!("[package]\nname = \"{n}\"\n"),
+                ));
+            }
+            with_src(files)
+        };
+        let set = derive("renamedws", manifests("dep:serde")).expect("derivation");
+        assert!(
+            set.scan_dirs
+                .contains(&"crates/aterm-serde/src".to_string()),
+            "default -> persist -> dep:serde must take in crates/aterm-serde: {:?}",
+            set.scan_dirs
+        );
+        assert!(
+            !set.scan_dirs.contains(&"crates/aterm-off/src".to_string()),
+            "an unactivated renamed optional dependency stays out: {:?}",
+            set.scan_dirs
+        );
+        let err = derive("renamedwspkg", manifests("dep:aterm-serde")).expect_err("must fail");
+        assert!(err.contains("names no dependency"), "err: {err}");
     }
 
     #[test]
@@ -2050,20 +2280,20 @@ mod tests {
         let mut files = test_fixtures::workspace_manifests(&[]);
         for (p, c) in &mut files {
             if p == "Cargo.toml" {
-                *c = c.replace("winit = { path = \"vendor/winit\" }\n", "");
+                *c = c.replace("indexmap = { path = \"vendor/indexmap\" }\n", "");
             }
         }
         let err = derive("stale", with_src(files)).expect_err("must fail");
         assert!(
-            err.contains("no longer in the root [patch] table") && err.contains("winit"),
+            err.contains("no longer in the root [patch] table") && err.contains("indexmap"),
             "err: {err}"
         );
         // (c) FORWARD existence: the registered path must exist on disk.
         let mut files = test_fixtures::workspace_manifests(&[]);
-        files.retain(|(p, _)| p != "vendor/winit/Cargo.toml");
+        files.retain(|(p, _)| p != "vendor/indexmap/Cargo.toml");
         let err = derive("gone", with_src(files)).expect_err("must fail");
         assert!(
-            err.contains("no Cargo.toml on disk") && err.contains("winit"),
+            err.contains("no Cargo.toml on disk") && err.contains("indexmap"),
             "err: {err}"
         );
     }

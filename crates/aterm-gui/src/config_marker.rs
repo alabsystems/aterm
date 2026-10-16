@@ -1,40 +1,28 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Config-directory MARKER files — the small "the person already answered
-//! this" records that sit beside `aterm.toml`.
+//! Config-directory marker files: the small "the person already answered this" records beside
+//! `aterm.toml`, read and written here by the macOS access card (`consent_card::MARKER`) and
+//! the debugger-access change (`debugger_access::CHANGE_MARKER`, `OBSERVED_MARKER`). A planted
+//! link, a directory, or an oversized file at a marker path must be neither read through,
+//! written through, nor mistaken for a record:
 //!
-//! Two surfaces read and write theirs here: the macOS access card
-//! (`consent_card::MARKER`) and the debugger-access change
-//! (`debugger_access::CHANGE_MARKER`, `OBSERVED_MARKER`). The session-connections
-//! first-use latch (`connections`) is an existence-only `create_new` file that needs
-//! neither reader nor writer. (The first-launch admin card's marker went with that
-//! card, 2026-09-24; a `packages-admin-step-dismissed` file left beside `aterm.toml`
-//! is inert.) Markers share a threat model — a planted link, a directory, or an oversized
-//! file at the marker path must be neither read through, written through, nor
-//! mistaken for a record — and until this module they shared it by copy. The
-//! rules, once:
-//!
-//! * **Reading** opens the path without following a final-component link and
-//!   checks the HANDLE (not a separate stat something could swap under) — the
-//!   same boundary the theme files use (`aterm_effects::file_feed::read_bounded_regular_utf8`).
-//!   Anything that is not a regular file of at most `max_bytes` valid UTF-8 is
-//!   `None`: not a record this machine wrote, so the surface errs toward
-//!   disclosure and shows again.
-//! * **Writing** never goes THROUGH anything already at the path: the text
-//!   lands in a fresh sibling created exclusively (`create_new`, owner-only on
-//!   unix) and is renamed over the marker — a rename replaces a planted link
-//!   rather than following it — and a non-regular occupant fails closed
-//!   (`AlreadyExists`) and is left exactly as found, the way atpkg's own prefix
-//!   markers refuse an occupied path. A text past `max_bytes` is refused
-//!   (`InvalidInput`), never truncated: a truncated record would read as a
-//!   different answer.
+//! * **Reading** opens the path without following a final-component link and checks the handle
+//!   (not a separate stat something could swap under), the boundary the theme files use
+//!   (`aterm_effects::file_feed::read_bounded_regular_utf8`). Anything but a regular file of at
+//!   most `max_bytes` valid UTF-8 is `None`, so the surface errs toward disclosure and shows
+//!   again.
+//! * **Writing** never goes through anything already at the path: the text lands in a fresh
+//!   sibling created exclusively (`create_new`, owner-only on unix) and is renamed over the
+//!   marker (a rename replaces a planted link rather than following it). A non-regular occupant
+//!   fails closed (`AlreadyExists`) and is left as found. A text past `max_bytes` is refused
+//!   (`InvalidInput`), never truncated: a truncated record would read as a different answer.
 
 use std::io::Write as _;
 use std::path::Path;
 
-/// The marker's text, when a REGULAR, non-symlink file of at most `max_bytes`
-/// sits at `path`; `None` for everything else.
+/// The marker's text, when a regular, non-symlink file of at most `max_bytes` sits at `path`;
+/// `None` for everything else.
 pub(crate) fn read_marker(path: &Path, max_bytes: usize) -> Option<String> {
     aterm_effects::file_feed::read_bounded_regular_utf8(path, max_bytes).ok()
 }
@@ -86,10 +74,9 @@ pub(crate) fn write_marker(path: &Path, text: &str, max_bytes: usize) -> std::io
     written
 }
 
-/// Remove the marker at `path`, if a REGULAR file is there. A link or a
-/// directory at the path is not a marker and is left exactly as found
-/// (`AlreadyExists`, the same refusal [`write_marker`] gives); an absent
-/// marker is not an error.
+/// Remove the marker at `path`, if a regular file is there. A link or a directory at the path
+/// is not a marker and is left as found (`AlreadyExists`, the refusal [`write_marker`] gives);
+/// an absent marker is not an error.
 pub(crate) fn remove_marker(path: &Path) -> std::io::Result<()> {
     match std::fs::symlink_metadata(path) {
         Ok(m) if m.file_type().is_file() => std::fs::remove_file(path),
@@ -116,11 +103,9 @@ mod tests {
         dir
     }
 
-    /// A record round-trips; a re-record replaces in place with no sibling
-    /// left behind; an oversized text is refused rather than truncated; an
-    /// oversized FILE is not a record; a directory at the path fails the write
-    /// closed and is left alone; on unix a planted link is neither read nor
-    /// written through.
+    /// A record round-trips and re-records in place with no sibling left; an oversized text is
+    /// refused, an oversized file is not a record, a directory fails the write closed, and on
+    /// unix a planted link is neither read nor written through.
     #[test]
     fn markers_are_exclusive_bounded_and_never_written_through() {
         let dir = scratch("roundtrip");
@@ -182,8 +167,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The parent directory is created on demand — a fresh install has no
-    /// config directory yet, and the first answer must still be recordable.
+    /// The parent directory is created on demand: a fresh install has no config directory yet.
     #[test]
     fn the_parent_directory_is_created_on_demand() {
         let dir = scratch("mkdir");

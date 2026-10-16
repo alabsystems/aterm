@@ -1,56 +1,33 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// Kitty keyboard protocol + mouse tracking encodings — conformance-level
-// locks tying DECSET/CSI bytes fed through the VT engine to the exact
-// bytes the engine encodes back toward the application.
-//
-// Specs cited inline per test:
-// - Kitty keyboard protocol: https://sw.kovidgoyal.net/kitty/keyboard-protocol/
-//   (sections: Progressive enhancement, Disambiguate escape codes,
-//    Report all keys as escape codes, modifier encoding)
-// - xterm ctlseqs "Mouse Tracking" (X10/normal/button-event/any-event
-//   tracking; 1005 UTF-8, 1006 SGR, 1015 urxvt extensions)
-//
-// The Screen harness has no keyboard/mouse encoder accessors, so these
-// tests drive `aterm_core::terminal::Terminal` directly where needed
-// (same pattern as vt_categories3.rs::term_24x80).
+// Kitty keyboard protocol and xterm mouse tracking: DECSET/CSI bytes fed
+// through the engine, and the exact bytes it encodes back to the application.
+// Specs: https://sw.kovidgoyal.net/kitty/keyboard-protocol/ and xterm ctlseqs
+// "Mouse Tracking". `Screen` has no encoder accessors, so these drive
+// `Terminal` directly.
 
 use aterm_conformance::{Screen, run};
 use aterm_core::terminal::Terminal;
 use aterm_types::keyboard::{Key, KeyboardMode, Modifiers, NamedKey, encode_key};
 use aterm_types::mouse::WheelDir;
 
-/// Feed bytes to a raw 24x80 engine `Terminal` (Screen lacks encoder access).
+/// Feed bytes to a raw 24x80 engine `Terminal`.
 fn term_24x80(input: &[u8]) -> Terminal {
     let mut t = Terminal::new(24, 80);
     t.process(input);
     t
 }
 
-// =========================================================================
-// 1. Kitty keyboard: query default flags
-// =========================================================================
-
-/// Kitty keyboard protocol, "Detection of support": `CSI ? u` queries the
-/// current enhancement flags; the terminal replies `CSI ? flags u`. With no
-/// enhancements ever requested, flags must be 0 (all progressive
-/// enhancements are opt-in; the power-on default is the legacy protocol).
+/// `CSI ? u` queries the enhancement flags (`CSI ? flags u`); every
+/// enhancement is opt-in, so a fresh terminal reports 0.
 #[test]
 fn kitty_query_default_reports_zero_flags() {
     assert_eq!(run(b"\x1b[?u").response_string(), "\x1b[?0u");
 }
 
-// =========================================================================
-// 2. Kitty keyboard: push / push / pop / pop round trip
-// =========================================================================
-
-/// Kitty keyboard protocol, "Progressive enhancement": `CSI > flags u`
-/// pushes onto the per-screen stack and makes `flags` current; `CSI < Ps u`
-/// pops Ps entries (default 1), restoring the previous flag set. Flag bits:
-/// 0b1 = disambiguate escape codes, 0b100 = report alternate keys, so
-/// 5 = disambiguate + alternates. Each step is observed via the `CSI ? u`
-/// query reply `CSI ? flags u`.
+/// `CSI > flags u` pushes onto the per-screen stack; `CSI < Ps u` pops Ps
+/// entries (default 1). Flag 0b1 disambiguates, 0b100 reports alternate keys.
 #[test]
 fn kitty_push_query_pop_round_trip() {
     let mut s = Screen::new(24, 80);
@@ -68,15 +45,8 @@ fn kitty_push_query_pop_round_trip() {
     assert_eq!(s.response_string(), "\x1b[?0u", "stack empty -> flags 0");
 }
 
-// =========================================================================
-// 3. Kitty keyboard: pop on empty stack is clamped
-// =========================================================================
-
-/// Kitty keyboard protocol, "Progressive enhancement": "If a pop request is
-/// received that empties the stack, all flags are reset" and terminals must
-/// tolerate pops larger than the stack depth — there is no underflow error.
-/// Popping a fresh (empty-stack) terminal must be a no-op that leaves the
-/// flags at 0, and a giant pop count must behave the same.
+/// A pop that empties the stack resets the flags; a pop deeper than the stack
+/// is not an error.
 #[test]
 fn kitty_pop_on_empty_stack_is_clamped_no_underflow() {
     // Single pop with nothing pushed.
@@ -89,16 +59,8 @@ fn kitty_pop_on_empty_stack_is_clamped_no_underflow() {
     );
 }
 
-// =========================================================================
-// 4. Kitty keyboard: pushed flags change key encoding (DECSET bytes -> keys)
-// =========================================================================
-
-/// Kitty keyboard protocol, "Disambiguate escape codes" (flag 0b1): "The Esc
-/// key must be reported using CSI u encoding": `CSI 27 u` (27 is the Kitty
-/// functional code for Esc). Ctrl+key no longer emits C0 controls: Ctrl+C is
-/// `CSI 99 ; 5 u` (codepoint 99 = 'c'; modifier field = 1 + ctrl(4) = 5 per
-/// the spec's modifier encoding). This is the conformance lock tying the
-/// fed `CSI > 1 u` bytes to Terminal::keyboard_mode() + encode_key output.
+/// Flag 0b1 (disambiguate): Esc is `CSI 27 u` and Ctrl+C `CSI 99 ; 5 u`
+/// (modifier field 1 + ctrl 4), not a C0 control.
 #[test]
 fn kitty_disambiguate_flag_switches_esc_and_ctrl_c_to_csi_u() {
     // Baseline: legacy protocol. Esc -> 0x1B, Ctrl+C -> 0x03 (C0 ETX).
@@ -133,10 +95,8 @@ fn kitty_disambiguate_flag_switches_esc_and_ctrl_c_to_csi_u() {
     );
 }
 
-/// Kitty keyboard protocol, "Disambiguate escape codes": keys that already
-/// have non-text legacy encodings (arrows, Home/End, F-keys...) "continue to
-/// be reported using their legacy encoding" unless flag 0b1000 (report all
-/// keys as escape codes) is also set. Plain ArrowUp must stay `CSI A`.
+/// Under disambiguate alone, keys with a legacy non-text encoding keep it:
+/// ArrowUp stays `CSI A`.
 #[test]
 fn kitty_disambiguate_keeps_legacy_arrow_encoding() {
     let t = term_24x80(b"\x1b[>1u");
@@ -148,10 +108,8 @@ fn kitty_disambiguate_keeps_legacy_arrow_encoding() {
     );
 }
 
-/// Kitty keyboard protocol, "Report all keys as escape codes" (flag 0b1000):
-/// "all keys, including those that produce text, are reported as escape
-/// codes" — a plain 'a' press becomes `CSI 97 u` instead of the byte 0x61.
-/// Set via `CSI = 8 ; 1 u` (mode 1 = set exactly these bits).
+/// Flag 0b1000 (report all keys as escape codes), set by `CSI = 8 ; 1 u`
+/// (mode 1 sets exactly these bits): a plain 'a' is `CSI 97 u`, not 0x61.
 #[test]
 fn kitty_report_all_keys_as_esc_encodes_plain_text_key_as_csi_u() {
     let t = term_24x80(b"\x1b[=8;1u");
@@ -164,9 +122,7 @@ fn kitty_report_all_keys_as_esc_encodes_plain_text_key_as_csi_u() {
     );
 }
 
-/// Kitty keyboard protocol: popping the enhancement off the stack restores
-/// the prior (here: legacy) encoding — the lifecycle is fully reversible.
-/// After `CSI > 1 u` then `CSI < u`, Esc must encode as plain 0x1B again.
+/// Popping the enhancement restores the legacy encoding: Esc is 0x1B again.
 #[test]
 fn kitty_pop_restores_legacy_encoding() {
     let t = term_24x80(b"\x1b[>1u\x1b[<u");
@@ -178,15 +134,9 @@ fn kitty_pop_restores_legacy_encoding() {
     );
 }
 
-// =========================================================================
-// 5. Mouse: mode 1000, default (X10-style) byte encoding
-// =========================================================================
-
-/// xterm ctlseqs, Mouse Tracking, "Normal tracking mode" (DECSET 1000):
-/// press/release are reported as `CSI M Cb Cx Cy` where Cb = button + 32
-/// (left=0, middle=1, right=2; release uses 3) and Cx/Cy are the 1-based
-/// position + 32. 0-based (col 10, row 5) is 1-based (11, 6), so
-/// Cx = 32+11 = 43, Cy = 32+6 = 38.
+/// DECSET 1000 (xterm ctlseqs "Mouse Tracking"): `CSI M Cb Cx Cy` with
+/// Cb = button + 32 (release is 3) and Cx/Cy = 1-based position + 32, so
+/// 0-based (10, 5) is (43, 38).
 #[test]
 fn mouse_1000_default_encoding_press_release_exact_bytes() {
     let t = term_24x80(b"\x1b[?1000h");
@@ -202,9 +152,7 @@ fn mouse_1000_default_encoding_press_release_exact_bytes() {
     );
 }
 
-/// xterm ctlseqs, Mouse Tracking: "Wheel mice may return buttons 4 and 5
-/// ... the event codes are 64 and 65" — wheel-up is button code 64, so the
-/// Cb byte is 32 + 64 = 96. Modifiers add: shift=4 (lock one combination).
+/// Wheel up is button code 64 (Cb byte 96); shift adds 4.
 #[test]
 fn mouse_1000_wheel_up_is_button_64_and_shift_adds_4() {
     let t = term_24x80(b"\x1b[?1000h");
@@ -213,7 +161,6 @@ fn mouse_1000_wheel_up_is_button_64_and_shift_adds_4() {
         Some(vec![0x1b, b'[', b'M', 96, 43, 38]),
         "wheel up: Cb = 32 + 64"
     );
-    // ctlseqs: shift adds 4 to the button code in tracking modes.
     assert_eq!(
         t.encode_mouse_press(0, 10, 5, 4),
         Some(vec![0x1b, b'[', b'M', 36, 43, 38]),
@@ -221,9 +168,7 @@ fn mouse_1000_wheel_up_is_button_64_and_shift_adds_4() {
     );
 }
 
-/// xterm ctlseqs, Mouse Tracking: the wheel block continues past 4/5 —
-/// "buttons 6 and 7" are the horizontal (tilt) wheel, event codes 66 and 67.
-/// SGR (1006) so the code is readable; a tilt-left is `CSI < 66 ; x ; y M`.
+/// The horizontal wheel is buttons 6 and 7, codes 66 and 67 (read under SGR).
 #[test]
 fn mouse_1006_horizontal_wheel_is_buttons_66_and_67() {
     let t = term_24x80(b"\x1b[?1000h\x1b[?1006h");
@@ -239,9 +184,8 @@ fn mouse_1006_horizontal_wheel_is_buttons_66_and_67() {
     );
 }
 
-/// xterm ctlseqs, Mouse Tracking: the second extension block — "buttons 8-11"
-/// — starts at Cb 128, so the thumb (back/forward) pair reports 128 and 129.
-/// Under SGR the release keeps the button identity and flips the final byte.
+/// Buttons 8-11 start at code 128: back/forward are 128 and 129, and an SGR
+/// release keeps the button and flips the final byte.
 #[test]
 fn mouse_1006_thumb_buttons_are_128_and_129() {
     use aterm_types::mouse::MouseButton;
@@ -260,15 +204,8 @@ fn mouse_1006_thumb_buttons_are_128_and_129() {
     );
 }
 
-// =========================================================================
-// 6. Mouse: SGR extended encoding (DECSET 1006)
-// =========================================================================
-
-/// xterm ctlseqs, "SGR (1006)" extended mouse mode: events are reported as
-/// `CSI < Cb ; Px ; Py M` for press and the same with final `m` for release.
-/// Unlike X10, the button code is not offset by 32 and the release event
-/// carries the original button number (the final character disambiguates),
-/// so applications can tell which button was released.
+/// DECSET 1006 (SGR): `CSI < Cb ; Px ; Py M`, final `m` for release. No +32
+/// offset, and the release keeps the button number.
 #[test]
 fn mouse_1006_sgr_press_release_keeps_button() {
     let t = term_24x80(b"\x1b[?1000h\x1b[?1006h");
@@ -293,14 +230,8 @@ fn mouse_1006_sgr_press_release_keeps_button() {
     );
 }
 
-// =========================================================================
-// 7. Mouse: urxvt extended encoding (DECSET 1015)
-// =========================================================================
-
-/// xterm ctlseqs, "URXVT (1015)" extended mouse mode: events are reported
-/// as `CSI Cb ; Px ; Py M` where Cb is the X10-style code (button + 32) in
-/// DECIMAL and the coordinates are 1-based decimal — left press at 0-based
-/// (10, 5) is `CSI 32 ; 11 ; 6 M`.
+/// DECSET 1015 (urxvt): `CSI Cb ; Px ; Py M`, Cb = button + 32 and 1-based
+/// coordinates, all decimal.
 #[test]
 fn mouse_1015_urxvt_press_form() {
     let t = term_24x80(b"\x1b[?1000h\x1b[?1015h");
@@ -310,15 +241,8 @@ fn mouse_1015_urxvt_press_form() {
     );
 }
 
-// =========================================================================
-// 8. Mouse: UTF-8 extended encoding (DECSET 1005), coords > 95
-// =========================================================================
-
-/// xterm ctlseqs, "UTF-8 (1005)" extended mouse mode: the format matches
-/// X10 (`CSI M Cb Cx Cy`) but coordinate values 96..2015 (offset value
-/// 128..2047) are emitted as 2-byte UTF-8. 0-based col 200 -> 1-based 201
-/// -> 201+32 = 233 = U+00E9 -> bytes 0xC3 0xA9; row 5 -> 6+32 = 38 stays a
-/// single byte.
+/// DECSET 1005 keeps the X10 frame but sends coordinate values 96..2015 as
+/// two-byte UTF-8: 0-based col 200 is 201 + 32 = 233 = U+00E9 (0xC3 0xA9).
 #[test]
 fn mouse_1005_utf8_two_byte_coordinate_beyond_95() {
     let t = term_24x80(b"\x1b[?1000h\x1b[?1005h");
@@ -329,19 +253,11 @@ fn mouse_1005_utf8_two_byte_coordinate_beyond_95() {
     );
 }
 
-// =========================================================================
-// 9. Mouse: X10-style coordinates beyond 223
-// =========================================================================
-
-/// xterm ctlseqs, Mouse Tracking: in the default (non-extended) encoding a
-/// coordinate byte is `Cx = 32 + x` with x 1-based, so the maximum
-/// representable position is 223 (32+223 = 255); larger positions "cannot
-/// be reported" in a single byte (xterm's MOUSE_LIMIT).
-///
-/// The frame is fixed: an application that set only DECSET 1000 reads six-byte
-/// `ESC [ M Cb Cx Cy` records, so an out-of-range coordinate is clamped to the
-/// maximum rather than answered in a form the app never enabled. Apps needing
-/// far columns enable 1006 or 1005, both unlimited.
+/// In the X10 encoding a coordinate byte is 32 + the 1-based position, so 223
+/// is the largest (xterm's MOUSE_LIMIT). An app that set only DECSET 1000 reads
+/// six-byte `ESC [ M Cb Cx Cy` records, so a farther coordinate clamps to byte
+/// 255 rather than answering in a form the app never enabled; far columns need
+/// 1006 (unlimited) or 1005 (to 2015).
 #[test]
 fn mouse_x10_coordinate_beyond_223_clamps_and_keeps_the_x10_frame() {
     let t = term_24x80(b"\x1b[?1000h"); // default X10-style encoding
@@ -379,14 +295,8 @@ fn mouse_x10_coordinate_beyond_223_clamps_and_keeps_the_x10_frame() {
     );
 }
 
-// =========================================================================
-// 10. Mouse: motion gating under 1002 (button-event) and 1003 (any-event)
-// =========================================================================
-
-/// xterm ctlseqs, "Button-event tracking" (DECSET 1002): motion is reported
-/// only while a button is down, with 32 added to the button code (left drag
-/// Cb = 0+32 -> byte 32+32 = 64). Motion with no button held (X10 "button"
-/// 3) must report nothing under 1002.
+/// DECSET 1002 reports motion only while a button is held, with 32 added to
+/// the code (left drag: Cb byte 64); buttonless motion (code 3) reports nothing.
 #[test]
 fn mouse_1002_button_event_motion_requires_held_button() {
     let t = term_24x80(b"\x1b[?1002h");
@@ -402,10 +312,8 @@ fn mouse_1002_button_event_motion_requires_held_button() {
     );
 }
 
-/// xterm ctlseqs, "Any-event tracking" (DECSET 1003): "all motion events
-/// are reported" even with no button down; a buttonless motion uses the
-/// release/no-button code 3 plus the motion offset 32, i.e. Cb = 35 ->
-/// byte 32+35 = 67.
+/// DECSET 1003 reports all motion; buttonless motion is code 3 + the motion
+/// offset 32 (Cb byte 67).
 #[test]
 fn mouse_1003_any_event_motion_without_button_uses_code_3() {
     let t = term_24x80(b"\x1b[?1003h");
@@ -416,8 +324,7 @@ fn mouse_1003_any_event_motion_without_button_uses_code_3() {
     );
 }
 
-/// xterm ctlseqs, "Normal tracking mode" (DECSET 1000) reports only press
-/// and release — no motion events at all, held button or not.
+/// DECSET 1000 reports press and release only, never motion.
 #[test]
 fn mouse_1000_normal_tracking_reports_no_motion() {
     let t = term_24x80(b"\x1b[?1000h");
@@ -425,13 +332,7 @@ fn mouse_1000_normal_tracking_reports_no_motion() {
     assert_eq!(t.encode_mouse_motion(3, 10, 5, 0), None);
 }
 
-// =========================================================================
-// 11. Mouse: no tracking mode -> no reports
-// =========================================================================
-
-/// xterm ctlseqs, Mouse Tracking: mouse reporting is opt-in via DECSET;
-/// with no tracking mode set the terminal sends NO mouse sequences. Also
-/// holds after enabling and then disabling tracking (DECRST 1000).
+/// With no tracking mode set, or after DECRST 1000, nothing is reported.
 #[test]
 fn mouse_no_tracking_mode_all_encoders_return_none() {
     let t = term_24x80(b"");
@@ -445,8 +346,7 @@ fn mouse_no_tracking_mode_all_encoders_return_none() {
     assert_eq!(t.encode_mouse_wheel(WheelDir::Up, 10, 5, 0), None);
 }
 
-/// xterm ctlseqs, "X10 compatibility mode" (DECSET 9): reports button
-/// PRESS only — no release, motion, or wheel events.
+/// DECSET 9 (X10 compatibility) reports presses only.
 #[test]
 fn mouse_mode_9_x10_compat_is_press_only() {
     let t = term_24x80(b"\x1b[?9h");

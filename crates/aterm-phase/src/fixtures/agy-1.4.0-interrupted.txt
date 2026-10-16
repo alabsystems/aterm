@@ -1,0 +1,41 @@
+# agy 1.4.0 · MEASURED 2026-10-16, `aterm ctl text --json` of a private headless aterm 120x40 (aterm 0.105.0 098c216c7), the atpkg-managed agy (Google latest) launched through its shim under the owner's signed-in account (Gemini 4 Argon, medium), scratch ATERM_STATE_HOME/XDG dirs, harness off · a turn interrupted by esc 3 s in: `  ⎿  Interrupted · What should Antigravity CLI do instead?` (8a8f99) under the prompt, then the idle composer · cursor=37,2 (visible) · account and scratch path redacted at equal length
+     ▀▀▀▀▀▀       redacted-user@example.test (Google AI Ultra)
+    ▀▀▀▀▀▀▀▀      Gemini 4 Argon (Medium)
+   ▄▀▀    ▀▀▄     /tmp/at.XXXXXX/work
+  ▄▀▀      ▀▀▄
+
+────────────────────────────────────────────────────────────
+> Write about 300 words on how ocean tides work. Do not use any tools.
+
+  Ocean tides—the rhythmic rising and falling of sea levels across the globe—are driven primarily by the
+  gravitational pull of the Moon and the Sun, combined with the rotation of the Earth.
+
+  Although the Sun is vastly more massive than the Moon, the Moon is much closer to Earth. Because gravitational
+  force weakens rapidly with distance, the Moon exerts more than twice the tidal force on our oceans as the Sun does.
+  As the Moon orbits Earth, its gravity pulls on the planet's water, drawing it outward into a bulge on the side of
+  Earth closest to the Moon.
+
+  Simultaneously, a second bulge of water forms on the exact opposite side of the planet. This happens because the
+  Earth and Moon actually orbit a shared center of mass. On the side of Earth facing away from the Moon, the outward
+  inertial (centrifugal) force of this orbital motion exceeds the Moon's weaker gravitational pull, pushing the water
+  away from the Moon.
+
+  As Earth rotates on its axis once every 24 hours, coastal areas pass through both of these tidal bulges and the
+  troughs between them. Consequently, most coastlines experience two high tides and two low tides every lunar day
+  (which lasts about 24 hours and 50 minutes due to the Moon's own movement in its orbit).
+
+  The Sun modifies this daily cycle. Twice a month, during the new and full moon phases, the Sun, Earth, and Moon
+  align. Their combined gravitational pulls reinforce one another, creating spring tides—when high tides are
+  exceptionally high and low tides are unusually low. Conversely, during the first and third quarter moon phases, the
+  Sun and Moon sit at right angles relative to Earth. The Sun’s gravity partially cancels out the Moon’s pull,
+  producing moderate neap tides with a smaller difference between high and low water. Finally, local coastline shapes
+  and ocean floor depth further amplify or dampen these global rhythms.
+
+────────────────────────────────────────────────────────────
+> Write 600 words about the history of lighthouses. No tools.
+
+  ⎿  Interrupted · What should Antigravity CLI do instead?
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+>
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+? for shortcuts                                                                                  Gemini 4 Argon · medium

@@ -1,25 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The comet nucleus cursor: under the `comet` trail style the block cursor is
-//! the comet, a frosted block fill wrapped in a round additive coma of icy
-//! light with a few facet glints twinkling on the coma's rim as it turns. It
-//! breathes off the aurora's blaze (typing heat / jump flare, from
-//! [`crate::cursor_glow::CursorGlow::blaze`]), so nucleus, coma-halo crown and
-//! dust tail are one comet:
+//! The comet cursor (`comet` trail style): the block cursor is a frosted fill
+//! wrapped in a round additive coma, with a few glints twinkling on its rim.
+//! It breathes off the aurora's blaze ([`crate::cursor_glow::CursorGlow::blaze`]):
+//! dim and slow at rest, swelling and whitening under the keys, white-hot on a
+//! jump flare.
 //!
-//! * at rest: a dim blue-white coma, slow glints, a quiet frosted tint of the
-//!   trail hue;
-//! * under the keys: the coma swells and whitens at the core, the glints spin
-//!   faster and flash brighter, the fill frosts toward white;
-//! * on a jump: the flare slams the blaze to full, so the landing nucleus
-//!   ignites white-hot and refreezes back through the trail hue.
-//!
-//! Text-safe as [`crate::cursor_rainbow`] is: the fill goes through the
-//! renderer's `floor_cursor_fill` contrast floor, and coma and glints are
-//! additive [`GlowQuad`] light with capped coverage. Clockless (pure in the
-//! injected `now`), it settles to inactive when the blaze dies (then rides the
-//! blink cadence), and emits identical premultiplied quads on CPU and Metal.
+//! Text-safe: the fill goes through the renderer's `floor_cursor_fill` contrast
+//! floor, and coma and glints are additive [`GlowQuad`] light with capped
+//! coverage. Pure in the injected `now`; it settles to inactive when the blaze
+//! dies, then rides the blink cadence.
 
 use aterm_time::Instant;
 
@@ -27,40 +18,31 @@ use aterm_render::{GlowQuad, premul_rgb};
 
 use crate::cursor_glow::Geom;
 use crate::effect_util::lerp_rgb;
-// Window-absolute: this light lands in `cursor_glow_add`, whose quads are window
-// px (the producer folds in the grid origin; the renderer adds no offset), the
-// stream `cursor_momentum`, `cursor_beam`, `cursor_phaser` and `cursor_glow`
-// also push into.
+// Window px: this light lands in `cursor_glow_add` (see `push_fx_rect`).
 use crate::effect_util::push_fx_rect as push_rect;
 
-/// Shimmer rate in turns/second: a slow glacial drift at rest, a lively glitter
-/// at full blaze. The phase advances only when frames render, so a settled
-/// nucleus shimmers at the blink cadence.
+/// Shimmer rate in turns/second, at rest and at full blaze. The phase advances
+/// only on rendered frames, so a settled nucleus shimmers at the blink cadence.
 const SHIMMER_IDLE: f32 = 0.7;
 const SHIMMER_ACTIVE: f32 = 3.2;
 
-/// Coma radius in cell-heights: the coma must swallow the block (diameter at
-/// least the cell height) or the block's corners poke out and it reads as a
-/// rectangle. Still under a cell of reach past the cell edge.
+/// Coma radius in cell-heights: the diameter must cover the cell height, or
+/// the block's corners poke out and it reads as a rectangle.
 const RADIUS_IDLE: f32 = 0.54;
 const RADIUS_MAX: f32 = 0.82;
 
-/// Innermost-core coverage (pre-intensity), cold drift to sunlit ice. The
-/// concentric discs scale down from it, and every push is also clamped by
-/// [`COV_CAP`] so the stacked light never buries a neighbouring glyph.
+/// Innermost-disc coverage before intensity, at rest and at full blaze. The
+/// outer discs scale down from it, each clamped by [`COV_CAP`].
 const COV_IDLE: f32 = 58.0;
 const COV_MAX: f32 = 148.0;
-/// Per-quad additive coverage ceiling, the light rod's and flame curtain's
-/// text-safety band. Inner discs saturate here (over the cursor cell); fringe
-/// quads that overlap neighbouring glyphs run at a fraction and stay a tint.
+/// Per-quad additive coverage ceiling: inner discs saturate here over the
+/// cursor cell; fringe quads over neighbouring glyphs stay a tint.
 const COV_CAP: f32 = 92.0;
 
-/// Facet glints twinkling on the coma rim — tiny 4-point sparks that read as
-/// sunlight catching ice crystals as the nucleus turns.
+/// Facet glints (tiny 4-point sparks) on the coma rim.
 const GLINTS: u32 = 4;
 
-/// Below this blaze the nucleus is settled: it reports inactive so the host
-/// stops the 60 fps tick and the resting nucleus rides the blink cadence.
+/// Below this blaze the nucleus reports inactive, so the host stops the tick.
 const SETTLED_BLAZE: f32 = 0.02;
 
 /// The near-white the ice freezes toward — deliberately short of pure white so
@@ -70,16 +52,14 @@ const ICE_WHITE: u32 = 0x00F2_FAFF;
 /// Resolved per-frame inputs (Copy so the host reads it out before borrowing state).
 #[derive(Clone, Copy, Debug)]
 pub struct CometConfig {
-    /// Master on/off (the `comet` style opted in AND the cursor is a focused,
-    /// visible block).
+    /// On when the `comet` style is chosen and the cursor is a focused, visible
+    /// block.
     pub enabled: bool,
-    /// Overall scale `0..1` — the reduced-motion / load-shed amplitude, folded in
-    /// by the host exactly like the aurora. 0 ⇒ fully inert (plain themed cursor).
+    /// Overall scale `0..1` (reduced motion / load shed); 0 is fully inert.
     pub intensity: f32,
-    /// The trail's base hue (`GlowConfig::color`) — the coma body freezes off
-    /// this, so nucleus and tail always read as one comet.
+    /// The trail's base hue (`GlowConfig::color`); the coma freezes off it.
     pub color: u32,
-    /// The trail's accent hue (`GlowConfig::accent`) — the coma's outer fringe.
+    /// The trail's accent hue (`GlowConfig::accent`): the coma's outer fringe.
     pub accent: u32,
 }
 
@@ -95,31 +75,28 @@ pub struct CometFrame {
     pub fp: u64,
 }
 
-/// Per-window nucleus animation state — one shimmer phase plus the last clock
-/// reading and a latched blaze. Tiny + Copy-cheap.
+/// Per-window nucleus state: shimmer phase, last clock reading, latched blaze.
 #[derive(Default)]
 pub struct CursorComet {
     /// Rolling shimmer phase in turns `0..1`.
     shimmer: f32,
     last: Option<Instant>,
-    /// Latched blaze at the last tick (so [`is_active`] answers without a clock).
+    /// Latched blaze at the last tick, so [`Self::is_active`] needs no clock.
     blaze: f32,
 }
 
 impl CursorComet {
-    /// Whether the host must keep arming the animation tick: only while the comet
-    /// is charged (typing, or a jump flare refreezing). Once settled the resting
-    /// nucleus rides the blink cadence.
+    /// Whether the host must keep arming the animation tick: only while the
+    /// comet is charged (typing, or a jump flare cooling).
     #[must_use]
     pub fn is_active(&self) -> bool {
         self.blaze > SETTLED_BLAZE
     }
 
-    /// Advance one frame at `now` with the aurora's `blaze` (`0..1`, read from
-    /// [`crate::cursor_glow::CursorGlow::blaze`] after the aurora tick), the block
-    /// cursor cell `cur` (`None`: hidden), grid `geom` and resolved `cfg`.
-    /// Appends the additive coma to `out` and returns the frosted block fill and
-    /// a fingerprint. Pure: no wall clock.
+    /// Advance one frame at `now` with the aurora's `blaze` (`0..1`, read after
+    /// the aurora tick), the block cursor cell `cur` (`None`: hidden), grid
+    /// `geom` and `cfg`. Appends the additive coma to `out`; returns the frosted
+    /// fill and a fingerprint.
     pub fn tick(
         &mut self,
         cur: Option<(u16, u16)>,
@@ -130,9 +107,8 @@ impl CursorComet {
         out: &mut Vec<GlowQuad>,
     ) -> CometFrame {
         let e = (blaze.clamp(0.0, 1.0) * cfg.intensity.clamp(0.0, 1.0)).clamp(0.0, 1.0);
-        // Inert (equal to the plain themed cursor) when off, with degenerate
-        // geometry, or at zero amplitude (reduced motion / load shed), like the
-        // rainbow block.
+        // Inert (the plain themed cursor) when off, with degenerate geometry,
+        // or at zero intensity.
         if !cfg.enabled || geom.cw == 0 || geom.ch == 0 || cfg.intensity <= 0.0 {
             self.blaze = 0.0; // inert: report settled so the host disarms the tick
             self.last = Some(now);
@@ -140,8 +116,7 @@ impl CursorComet {
         }
         self.blaze = e;
 
-        // Advance the shimmer by real dt (clamped so a long stall — e.g. the
-        // window slept — doesn't fling the phase). Livelier the hotter it burns.
+        // Advance by real dt, clamped so a long stall doesn't fling the phase.
         let dt = self
             .last
             .map(|t| now.saturating_duration_since(t).as_secs_f32())
@@ -154,11 +129,9 @@ impl CursorComet {
         // never reads as a metronome pulse.
         let breathe = 0.5 + 0.35 * phase.sin() + 0.15 * (phase * 2.3 + 0.9).sin();
 
-        // The frosted block fill: a cool tint of the trail hue at rest, frosting
-        // toward white as the blaze climbs. Capped below the additive core's
-        // near-white so the round coma, not the rectangle, is the brightest
-        // thing; the renderer floors it against the cell bg, so the glyph stays
-        // sharp.
+        // Frosted fill: a cool tint of the trail hue frosting toward white with
+        // the blaze, kept below the coma core's near-white. The renderer floors
+        // it against the cell bg, so the glyph stays sharp.
         let fill = ice_ramp(cfg.color, 0.34 + 0.40 * e + 0.05 * (breathe - 0.5));
 
         // The additive coma, drawn only over a visible in-grid cursor cell.
@@ -201,9 +174,8 @@ impl CursorComet {
         out: &mut Vec<GlowQuad>,
     ) {
         let (cw, ch) = (geom.cw as f32, geom.ch as f32);
-        // Coma centre: mid-cell. A coma is round; direction lives in the dust
-        // tail. Window px: the grid origin is folded in here, once, and every
-        // quad below derives from these two numbers.
+        // Coma centre: mid-cell, in window px (the grid origin is folded in
+        // here, once; every quad below derives from it).
         let cx = f32::from(geom.origin_x) + (cc as f32 + 0.5) * cw;
         let cy = f32::from(geom.origin_y) + (cr as f32 + 0.5) * ch;
         let radius = (RADIUS_IDLE + (RADIUS_MAX - RADIUS_IDLE) * e) * ch * (0.96 + 0.06 * breathe);
@@ -231,8 +203,7 @@ impl CursorComet {
                 continue;
             }
             let color = if rx >= 1.0 {
-                // The outermost fringe carries the ACCENT — the gas envelope a
-                // shade apart from the dust, so the head reads layered.
+                // The outer fringe carries the accent, so the head reads layered.
                 lerp_rgb(cfg.accent, ice_ramp(cfg.color, ramp_t), 0.45)
             } else {
                 ice_ramp(cfg.color, ramp_t)
@@ -242,9 +213,8 @@ impl CursorComet {
             let mut dy = -r_i;
             while dy < r_i {
                 let h = slab.min(r_i - dy);
-                // Sample the disc's half-width at the slab's vertical centre; a
-                // small travelling wobble keeps the silhouette from reading as a
-                // sticker.
+                // Half-width at the slab's vertical centre, with a small
+                // travelling wobble so the silhouette is not a sticker.
                 let ym = dy as f32 + h as f32 * 0.5;
                 let base = (r * r - ym * ym).max(0.0).sqrt();
                 let wobble = 1.0 + 0.05 * (ym * 0.55 / ch.max(1.0) * 10.0 + phase * 1.3).sin();
@@ -256,17 +226,14 @@ impl CursorComet {
             }
         }
 
-        // Facet glints: a few tiny 4-point sparks orbiting on the coma rim with
-        // the shimmer phase, each twinkling on its own offset. They ride at
-        // ~0.72·radius, off the glyph row's centre band, and each is a couple of
-        // hairline rects, so they never bury a letter.
+        // Rim glints orbit with the shimmer phase at ~0.72·radius, off the glyph
+        // row's centre band; each is two hairline rects, so no letter is buried.
         let glint_r = radius * 0.72;
         for i in 0..GLINTS {
             let fi = i as f32;
             let ang = fi / GLINTS as f32 * std::f32::consts::TAU + phase * 0.55;
             let tw = 0.5 + 0.5 * (phase * 2.0 + fi * 2.4).sin();
-            // Only the bright half of each twinkle draws — glints FLASH, they
-            // don't hover.
+            // Only the bright half of each twinkle draws: glints flash.
             if tw < 0.55 {
                 continue;
             }
@@ -331,9 +298,7 @@ mod tests {
         }
     }
 
-    /// Disabled, or zero intensity (reduced motion / load shed) at full
-    /// strength: fully inert (no fill, no coma, fp 0, settled), equal to the
-    /// plain cursor.
+    /// Disabled or zero intensity: fully inert (no fill, no coma, fp 0, settled).
     #[test]
     fn disabled_or_zero_intensity_is_inert() {
         for (why, config) in [
@@ -362,8 +327,7 @@ mod tests {
         }
     }
 
-    /// A hidden cursor draws no coma, but the fill stays resolved (harmless —
-    /// the renderer draws no cursor to fill) and the state still reports.
+    /// A hidden cursor draws no coma; the fill stays resolved.
     #[test]
     fn hidden_cursor_draws_no_coma() {
         let mut nc = CursorComet::default();
@@ -373,8 +337,7 @@ mod tests {
         assert!(f.fill.is_some());
     }
 
-    /// Full blaze swells the coma (wider extent) and shines far brighter than
-    /// the cold drift — the sunlit-ice read.
+    /// Full blaze swells the coma and shines far brighter than at rest.
     #[test]
     fn blaze_swells_and_brightens() {
         let g = geom();
@@ -491,8 +454,7 @@ mod tests {
         }
     }
 
-    /// Charged ⇒ active (host keeps the tick armed); settled blaze ⇒ inactive so
-    /// the resting nucleus rides the blink cadence at no extra wakeup cost.
+    /// Charged keeps the tick armed; a dead blaze settles to inactive.
     #[test]
     fn settles_to_inactive_when_blaze_dies() {
         let g = geom();
@@ -516,8 +478,7 @@ mod tests {
         );
     }
 
-    /// The per-frame quad budget is bounded by construction (discs + a handful
-    /// of glint crosses), far under the aurora's MAX_QUADS defence.
+    /// The quad count is bounded by construction (discs + glint crosses).
     #[test]
     fn quad_count_is_bounded() {
         let g = Geom {
@@ -555,10 +516,8 @@ mod tests {
         );
     }
 
-    /// The coma surrounds the caret in a real window. The quads land in the
-    /// window-px `cursor_glow_add` stream, so the producer must fold in the grid
-    /// origin. This geometry (pad 24, head 80 + pad_top 4) tells window from
-    /// grid-relative placement, which the origin (0,0) tests cannot.
+    /// The coma surrounds the caret in a padded, headed window: the producer
+    /// folds in the grid origin, which the origin (0,0) tests cannot tell.
     #[test]
     fn coma_surrounds_the_caret_in_a_padded_headed_window() {
         let t0 = Instant::now();

@@ -18,11 +18,14 @@
 
 use std::io;
 use std::os::unix::process::CommandExt as _;
-use std::process::Command;
 
 /// Replace this process with `command`'s program. Returns only on failure, with SIGPIPE
 /// as it was on entry.
-pub fn exec_keeping_sigpipe(command: &mut Command) -> io::Error {
+#[expect(
+    clippy::disallowed_types,
+    reason = "the update lane's exec of this process's own image, which keeps its handoff descriptors"
+)]
+pub fn exec_keeping_sigpipe(command: &mut std::process::Command) -> io::Error {
     let saved = sigpipe_disposition();
     let error = command.exec();
     if let Some(saved) = saved.as_ref() {
@@ -48,6 +51,7 @@ pub(crate) fn restore_sigpipe(saved: &libc::sigaction) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
     use std::process::Stdio;
 
     const HELPER_ENV: &str = "ATERM_EXEC_PLAIN_TEST_HELPER";

@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Bug hunt 8 through the shipping `on_key`: a press builds its key from the
-//! layout's UNSHIFTED key, and must still type what the layout typed (Caps
-//! Lock, Shift on a non-US layout), hold that character across auto-repeat,
-//! send Ctrl's control byte on a non-Latin layout, and keep Option on the
-//! named keys when `option_as_meta = false`.
+//! Layout typing through the shipping `on_key`: a press builds its key from the
+//! layout's unshifted key, yet must type what the layout typed (Caps Lock, Shift
+//! on a non-US layout), hold that character across auto-repeat, send Ctrl's
+//! control byte on a non-Latin layout, and keep Option on the named keys when
+//! `option_as_meta = false`.
 
 use crate::{App, WindowId, term_lock};
 use winit::event::{ElementState, KeyEvent};
@@ -124,14 +124,11 @@ fn ctrl_on_a_cyrillic_layout_writes_the_control_byte() {
     unsafe { libc::close(pipe) };
 }
 
-/// `option_as_meta = false` lets Option type the layout's characters, but
-/// winit gives the named keys a text too ("\x08", "\r", "\t", "\x1b"), and
-/// through the IME-commit encoder Option+Backspace wrote a bare BS (^H), the
-/// others lost Option, and under kitty report-all they wrote nothing. Only a
-/// PRINTABLE text takes the text path: Option+a still types 'å', and
-/// Option+Space a space (a guard on `Key::Character` alone sent it to the
-/// encoder as Meta+Space, `ESC SP`, mid-word for a German or Nordic typist
-/// still holding Option from `|`).
+/// `option_as_meta = false` lets Option type the layout's characters, but winit
+/// gives the named keys a text too ("\x08", "\r", "\t", "\x1b"); they keep Option
+/// through the encoder, legacy and kitty. Only printable text takes the text
+/// path: Option+a types 'å', and Option+Space a space, not Meta+Space (`ESC SP`
+/// mid-word for a German or Nordic typist still holding Option from `|`).
 #[test]
 fn option_as_meta_off_keeps_option_on_the_named_keys() {
     let named = |name, code, text: &str| {
@@ -181,10 +178,9 @@ fn option_as_meta_off_keeps_option_on_the_named_keys() {
     unsafe { libc::close(pipe) };
 }
 
-/// A native page's text field types what the terminal would: the press's key
-/// is the layout's UNSHIFTED key, and the Settings search committed it as is,
-/// so Shift+a typed 'a' and German Shift+2 typed '2'. A keypad digit is its
-/// own glyph under Shift (the encoder writes '5'), never the main row's '%'.
+/// A native page's text field types what the terminal would (Shift+a 'A',
+/// German Shift+2 '"'), though the press's key is the layout's unshifted key. A
+/// keypad digit is its own glyph under Shift ('5'), never the main row's '%'.
 #[test]
 fn a_native_text_field_types_the_shifted_and_layout_character() {
     use crate::native_settings::SettingsRoute;

@@ -37,6 +37,7 @@ fn roster(rows: &[(&str, Class, Option<&str>)]) -> Roster {
                 label: (*label).to_string(),
                 class: *class,
                 dir: dir.map(str::to_string),
+                ..Row::default()
             })
             .collect(),
     }
@@ -76,6 +77,7 @@ fn on_main() -> State {
 fn me(label: &str) -> Me<'_> {
     Me {
         account: Some(label),
+        left: None,
         default_home: true,
         stored_login: true,
     }
@@ -467,6 +469,7 @@ fn a_dir_is_used_verbatim_and_two_spellings_of_one_place_are_two_logins() {
         label: "main".into(),
         class: Class::Dedicated,
         dir: None,
+        ..Row::default()
     };
     assert_eq!(
         login_env(&main),
@@ -585,6 +588,7 @@ fn append_row_writes_only_what_the_next_read_admits() {
             label: "work-2".into(),
             class: Class::Shared,
             dir: Some(odd.into()),
+            ..Row::default()
         }
     );
     assert_eq!(
@@ -2420,8 +2424,8 @@ fn every_non_candidate_has_its_reason_by_name() {
     );
 
     // AUTH: only a login KNOWN signed out is skipped. One nobody has
-    // checked is proposed (the host's check before the move settles it),
-    // and so is one a check said works.
+    // checked is proposed (the move onto it is its check: a login wall
+    // after it strikes it signed out), and so is one a check said works.
     let enrolled = all(&r);
     let mut s = state();
     assert_eq!(s.account("work-2").auth, Auth::Unseen);
@@ -5335,6 +5339,122 @@ fn at_a_wall_the_session_is_limited_whether_or_not_its_wall_is_recorded_yet() {
     }
 }
 
+/// THE LOST LOGIN SIGNED BACK IN ([`Point::LostLogin`]): a session moved
+/// from `main`'s wall onto `work-2` finds `work-2`'s login lost (met at
+/// `seen`); the host strikes it signed out, and with every other account
+/// limited the session waits for the first of them. Once the owner signs
+/// `work-2` in again (`accounts login`: its word `ok`, written after `seen`)
+/// the same point is advised the session's OWN account, as a follow — at
+/// both of the advice's arms. NEGATIVE CONTROLS: still signed out it is the
+/// wait; so it is with the strike not on record and nothing said of the
+/// login (`unseen` is not a login that came back), and with the strike not
+/// on record and the login's `ok` from before the lost login (its
+/// enrolment's check) or of its very second — while the same state with an
+/// `ok` written after it is the login back; at a usage wall the session's
+/// own account is never advised, whatever its login says; and an account
+/// the owner pinned since is followed instead (rule 2 comes first).
+///
+/// THE CANARY'S HOLD: another session rotates onto the login signed back
+/// in, and the lost login is then that canary's to wait behind
+/// ([`StayWhy::Canary`]) — NEGATIVE CONTROLS: the account proven, it is
+/// the plain follow; the hold lapsed, the move takes the canary's place,
+/// and that commits.
+#[test]
+fn a_lost_login_signed_back_in_is_where_the_session_is_relaunched() {
+    let r = three();
+    let enrolled = all(&r);
+    let at_when = |s: &State, point: &Point, now: i64| {
+        let asked = advise(&r, s, &enrolled, &me("work-2"), point, Mode::Early, now);
+        let past = advise_past_probe(&r, s, &enrolled, &me("work-2"), point, Mode::Early, now);
+        assert_eq!(asked, past, "both arms");
+        asked
+    };
+    let at = |s: &State, point: &Point| at_when(s, point, NOW + 60);
+    let lost = Point::LostLogin { seen: NOW + 10 };
+    let follow = |to: &str, takes_canary: bool| Advice::Move {
+        to: to.into(),
+        ahead: false,
+        rotates: false,
+        takes_canary,
+    };
+    let mut moved = on_main();
+    limited(&mut moved, "main", NOW + 3 * DAY);
+    limited(&mut moved, "pool-a", NOW + 2 * DAY);
+    begin_rotation(
+        &mut moved,
+        &r,
+        &enrolled,
+        Some("main"),
+        mover("main"),
+        "work-2",
+        NOW,
+    )
+    .expect("rotates");
+    let wait = Advice::Wait {
+        until: NOW + 2 * DAY,
+    };
+    // The strike not on record: nothing says the login works.
+    assert_eq!(at(&moved, &lost), wait);
+    // …nor does the word it had before it was lost (R1): its enrolment's
+    // check, or one of the very second the lost login was met.
+    for before in [NOW - DAY, NOW + 10] {
+        let mut old = moved.clone();
+        note_auth(&mut old, "work-2", Auth::Ok, before);
+        assert_eq!(at(&old, &lost), wait, "an ok of {before}");
+    }
+    // NEGATIVE CONTROL: the same state with the sign-in after it is the
+    // login back — behind this rotation's own canary, whose hold stands.
+    let mut since = moved.clone();
+    note_auth(&mut since, "work-2", Auth::Ok, NOW + 50);
+    assert_eq!(at(&since, &lost), Advice::Stay(StayWhy::Canary));
+
+    let mut struck = moved.clone();
+    strike(&mut struck, "work-2", "s-one", &Strike::SignedOut, NOW + 30);
+    assert_eq!(struck.active.as_deref(), Some("main"), "put back");
+    // NEGATIVE CONTROL: still signed out.
+    assert_eq!(at(&struck, &lost), wait);
+
+    let mut back = struck.clone();
+    note_auth(&mut back, "work-2", Auth::Ok, NOW + 50);
+    assert_eq!(at(&back, &lost), follow("work-2", false));
+    // NEGATIVE CONTROL: a usage wall says the account is limited.
+    assert_eq!(at(&back, &wall()), wait);
+    // NEGATIVE CONTROL: the owner pinned another account since.
+    let mut pinned = back.clone();
+    pin(&mut pinned, &r, &enrolled, "main", NOW + 55).expect("pinned");
+    assert_eq!(at(&pinned, &lost), follow("main", false));
+
+    // Another session at `main`'s wall rotates onto the login signed back
+    // in first (R2): this one waits behind its canary.
+    let mut canary = back.clone();
+    let other = Mover {
+        sid: "s-two",
+        account: "main",
+    };
+    begin_rotation(
+        &mut canary,
+        &r,
+        &enrolled,
+        Some("main"),
+        other,
+        "work-2",
+        NOW + 55,
+    )
+    .expect("rotates");
+    assert_eq!(at(&canary, &lost), Advice::Stay(StayWhy::Canary));
+    // NEGATIVE CONTROL: proven, the plain follow.
+    let mut proven = canary.clone();
+    prove(&mut proven, "work-2", NOW + 58);
+    assert_eq!(at(&proven, &lost), follow("work-2", false));
+    // NEGATIVE CONTROL: the hold lapsed, the canary's place is taken.
+    let lapsed = NOW + 55 + CANARY_HOLD_S + 1;
+    assert_eq!(at_when(&canary, &lost, lapsed), follow("work-2", true));
+    let expect = canary.canary.clone();
+    let mut taken = canary.clone();
+    assert!(take_canary(&mut taken, expect.as_ref(), "s-one", lapsed).is_some());
+    assert_eq!(taken.canary.map(|c| c.sid), Some("s-one".to_string()));
+}
+
 /// EVERY ROTATION THE ADVICE GIVES COMMITS, over every small state: three
 /// accounts each never seen, fresh, low or limited; `active` nothing or any
 /// of them — proven, pinned, or not answered yet with its canary's hold
@@ -6853,7 +6973,7 @@ fn a_reset_is_allowed_only_on_the_machines_own_login_with_no_other_login_on_reco
         "this machine's own login, as the first `add` lists it"
     );
     assert_eq!(
-        Roster::parse(&append_rows("", &[("main", Class::Dedicated, None)]).expect("a row")),
+        Roster::parse(&append_row("", "main", Class::Dedicated, None).expect("a row")),
         Ok(own.clone())
     );
     assert_eq!(reset_allowed(&own, &state(), "main", started), Ok(()));
@@ -6966,7 +7086,13 @@ fn a_ledger_row_round_trips_as_one_bounded_line() {
             "reset-failed",
             "auth",
             "use",
-            "unpin"
+            "unpin",
+            "no-tap",
+            "credits",
+            "warned",
+            "renewed",
+            "login-ended",
+            "wrong-account"
         ]
     );
 
@@ -7070,6 +7196,7 @@ fn a_row_wakes_waiting_tabs_only_when_an_account_is_usable_sooner() {
         Kind::ResetUsed,
         Kind::ResetKept,
         Kind::ResetFailed,
+        Kind::Renewed,
     ];
     for kind in waking {
         assert!(wakes(kind, ""), "{}", kind.as_str());
@@ -7084,6 +7211,11 @@ fn a_row_wakes_waiting_tabs_only_when_an_account_is_usable_sooner() {
         Kind::Rotate,
         Kind::Move,
         Kind::Probe,
+        Kind::NoTap,
+        Kind::Credits,
+        Kind::Warned,
+        Kind::LoginEnded,
+        Kind::WrongAccount,
     ];
     for kind in quiet {
         assert!(!wakes(kind, "ok"), "{}", kind.as_str());
@@ -7620,6 +7752,7 @@ fn the_hosts_route_and_the_roster_meet_the_process_login_in_one_place() {
         other,
         Me {
             account: Some("pool-a"),
+            left: None,
             default_home: false,
             stored_login: false,
         }
@@ -7806,6 +7939,7 @@ fn weekly() -> StandingWall {
         at: (NOW - 10).unsigned_abs(),
         until: Some((NOW + HOUR).unsigned_abs()),
         window: Some("seven_day".to_string()),
+        credits: None,
     }
 }
 
@@ -7922,6 +8056,7 @@ fn the_recorder_records_this_process_wall_for_its_account_once() {
         at: (NOW + 30).unsigned_abs(),
         until: Some((NOW + 2 * HOUR).unsigned_abs()),
         window: Some("five_hour".to_string()),
+        credits: None,
     };
     let moved = record_wall(&store, &r, "s-two", &work, &session, NOW + 20, NOW + 40);
     assert_eq!(
@@ -9057,4 +9192,940 @@ fn the_recorder_waits_for_the_lock_a_bounded_time_and_says_it_is_held() {
     assert_eq!(record_gone(&store, "s-one", NOW + 5), Ok(true));
     // Another refusal is not the lock's.
     assert!(!Recorded::Refused("state.json: schema 2".to_string()).lock_held());
+}
+
+// ---------------------------------------------------------------------------
+// Usage credits and the vendor's warnings (accounts v2 S5)
+// ---------------------------------------------------------------------------
+
+/// The machine's own row, as a rosterless machine under `[harness]
+/// usage_notes` records it.
+fn own_row() -> Roster {
+    Roster::own()
+}
+
+/// The own row's label.
+const OWN: &str = super::super::cli::ACCOUNTS_OWN_LABEL;
+
+/// What a screen says, as true at the answer `at` (on UTC's day).
+fn said(at: i64, credits: Option<CreditsRead>, warning: Option<WarningRead>) -> UsageSaid {
+    UsageSaid {
+        at,
+        day: at.div_euclid(DAY),
+        credits,
+        warning,
+    }
+}
+
+/// Credits carrying the answer at `at`, past a window resetting at `until`.
+fn on_credits(at: i64, until: Option<i64>) -> UsageSaid {
+    said(at, Some(CreditsRead { until }), None)
+}
+
+/// Claude Code's warning, drawn after the answer at `at`, that the week (or
+/// the session window) is at `pct`, resetting at `reset`.
+fn warned(at: i64, weekly: bool, pct: u32, reset: Option<i64>) -> UsageSaid {
+    said(at, None, Some(WarningRead { weekly, pct, reset }))
+}
+
+/// The reasons of the ledger's rows of `kind`.
+fn rows_of(store: &Store, kind: Kind) -> Vec<String> {
+    store
+        .tail(50)
+        .expect("reads")
+        .into_iter()
+        .filter(|e| e.kind == kind)
+        .map(|e| e.why)
+        .collect()
+}
+
+/// `label`'s record as the store holds it at `now`.
+fn held(store: &Store, label: &str, now: i64) -> Account {
+    store.load(now).expect("ours").0.account(label)
+}
+
+/// A limit row of `window`, written at `at`, that says credits are off.
+fn off_row(at: i64, window: &str) -> StandingWall {
+    StandingWall {
+        at: at.unsigned_abs(),
+        until: Some((at + HOUR).unsigned_abs()),
+        window: Some(window.to_string()),
+        credits: Some(crate::harness::upgrade::CreditsWord::Off {
+            reason: Some("org_level_disabled".to_string()),
+            until: None,
+        }),
+    }
+}
+
+/// `label`'s credits set to `word` directly.
+fn set_credits(store: &Store, label: &str, word: Credits) {
+    let mut note = None;
+    store
+        .transact_within(&LOCK_LADDER, NOW, &mut note, |state| {
+            state.accounts.entry(label.to_string()).or_default().credits = Some(word);
+            Ok(Vec::new())
+        })
+        .expect("written");
+}
+
+/// Credits off, as a limit row an hour before [`NOW`] said.
+fn org_off() -> Credits {
+    Credits::Off(CreditsOff {
+        reason: "org_level_disabled".to_string(),
+        at: NOW - HOUR,
+        until: None,
+    })
+}
+
+/// USAGE CREDITS ARE RECORDED AS AN EPISODE, AND ITS LINE IS ONCE A DAY
+/// (accounts v2 §5.4): the first answer seen served on credits begins an
+/// episode (a `credits` row, `in use`) that is the day's line; the same
+/// answer said again — the loop's retell, another tab, a loop started again
+/// — writes nothing, and a newer one inside the episode is its newest; the
+/// episode stands to the window's reset, and an answer after it lapsed begins
+/// the next. A second episode the same LOCAL day is recorded and raises no
+/// line; the next day's does. NEGATIVE CONTROLS: a process the roster does not
+/// name, or one on a login of its own, records nothing; a screen that says
+/// nothing records nothing.
+#[test]
+fn credits_are_an_episode_and_its_line_is_once_a_day() {
+    let dir = tmp("credits");
+    let store = Store::at(dir.path());
+    let r = own_row();
+    let until = NOW + 2 * HOUR;
+    let record = |s: UsageSaid, now: i64| record_usage(&store, &r, "s-1", &stored(), &s, now);
+    let noted = |now: i64| credits_noted(&r, &store.load(now).expect("ours").0, now);
+    assert_eq!(record(said(NOW, None, None), NOW), Recorded::Unchanged);
+    assert!(noted(NOW).is_empty());
+    let first = Recorded::Usage {
+        account: OWN.to_string(),
+        events: 1,
+    };
+    assert_eq!(record(on_credits(NOW, Some(until)), NOW + 5), first);
+    assert_eq!(noted(NOW + 5), [OWN]);
+    for now in [NOW + 10 * MIN, NOW + DAY] {
+        assert_eq!(
+            record(on_credits(NOW, Some(until)), now),
+            Recorded::Unchanged,
+            "said again at {now}"
+        );
+    }
+    assert_eq!(
+        record(on_credits(NOW + HOUR, None), NOW + HOUR),
+        Recorded::Usage {
+            account: OWN.to_string(),
+            events: 0,
+        },
+        "its newest answer"
+    );
+    assert_eq!(noted(until - 1), [OWN]);
+    assert!(noted(until).is_empty(), "lapsed at the window's reset");
+    // A second episode the SAME day: recorded, no line.
+    let later = until + HOUR;
+    assert_eq!(record(on_credits(later, None), later).as_str(), "usage");
+    assert!(noted(later).is_empty(), "once a day");
+    assert!(matches!(
+        held(&store, OWN, later).credits,
+        Some(Credits::InUse(CreditsUse { told: false, .. }))
+    ));
+    assert_eq!(rows_of(&store, Kind::Credits), ["in use", "in use"]);
+    // The next day's: the line again.
+    let tomorrow = NOW + DAY;
+    record(on_credits(tomorrow, Some(tomorrow + HOUR)), tomorrow);
+    assert_eq!(noted(tomorrow), [OWN]);
+    // NEGATIVE CONTROLS: no row names the process; a login of its own.
+    let other = env_of(&[(LOGIN_ENV, "/logins/elsewhere")]);
+    let once = on_credits(NOW, None);
+    assert_eq!(
+        record_usage(&store, &r, "s-2", &other, &once, NOW),
+        Recorded::NotListed
+    );
+    let own_home = env_of(&[(HOME_ENV, "/elsewhere/.claude")]);
+    assert_eq!(
+        record_usage(&store, &r, "s-2", &own_home, &once, NOW),
+        Recorded::NotStored
+    );
+}
+
+/// Credits stand [`CREDITS_STALE_S`] past the newest answer served on them,
+/// or to the reset of the window they carried past: named, else a session
+/// window from their start. NEGATIVE CONTROL: past both, they do not.
+#[test]
+fn credits_stand_past_their_newest_answer_or_to_their_windows_reset() {
+    let c = CreditsUse {
+        since: NOW,
+        seen: NOW,
+        until: None,
+        told: true,
+    };
+    assert!(c.stands(NOW + SESSION_WINDOW_S - 1));
+    assert!(!c.stands(NOW + SESSION_WINDOW_S));
+    let worked = CreditsUse {
+        seen: NOW + 6 * HOUR,
+        ..c.clone()
+    };
+    assert!(worked.stands(NOW + 6 * HOUR + CREDITS_STALE_S - 1));
+    assert!(!worked.stands(NOW + 6 * HOUR + CREDITS_STALE_S));
+    let named = CreditsUse {
+        until: Some(NOW + DAY),
+        ..c
+    };
+    assert!(named.stands(NOW + DAY - 1));
+    assert!(!named.stands(NOW + DAY));
+}
+
+#[test]
+fn an_older_credits_notice_cannot_extend_the_newest_episode() {
+    let dir = tmp("credits-order");
+    let store = Store::at(dir.path());
+    let roster = own_row();
+    let record = |sid: &str, at: i64, until: Option<i64>, now: i64| {
+        record_usage(&store, &roster, sid, &stored(), &on_credits(at, until), now)
+    };
+    let update = Recorded::Usage {
+        account: OWN.to_string(),
+        events: 0,
+    };
+    assert_eq!(
+        record("s-new", NOW, Some(NOW + HOUR), NOW),
+        Recorded::Usage {
+            account: OWN.to_string(),
+            events: 1,
+        }
+    );
+    assert_eq!(record("s-new", NOW + MIN, None, NOW + MIN), update);
+    assert!(matches!(
+        held(&store, OWN, NOW + MIN).credits,
+        Some(Credits::InUse(CreditsUse {
+            until: Some(until),
+            ..
+        })) if until == NOW + HOUR
+    ));
+    // A redraw of this newest answer may name its reset; a later answer
+    // extends the same episode too. Keep both existing update paths.
+    assert_eq!(
+        record("s-new", NOW + MIN, Some(NOW + 2 * HOUR), NOW + MIN),
+        update
+    );
+    let newest = NOW + 2 * MIN;
+    let reset = NOW + 3 * HOUR;
+    assert_eq!(record("s-new", newest, Some(reset), newest), update);
+    assert_eq!(
+        record("s-new", newest, Some(reset), newest + 1),
+        Recorded::Unchanged
+    );
+    let before = held(&store, OWN, reset);
+    let Some(Credits::InUse(c)) = &before.credits else {
+        panic!("the account retained its episode");
+    };
+    assert_eq!((c.since, c.seen, c.until), (NOW, newest, Some(reset)));
+    assert!(reset > newest + CREDITS_STALE_S);
+    assert!(
+        !c.stands(reset),
+        "the reset and answer freshness both ended"
+    );
+    let (state, _) = store.load(reset).expect("ours");
+    assert!(credits_noted(&roster, &state, reset).is_empty());
+
+    // Another tab still has an older started notice. Its later reset is
+    // not a new word, even though its answer falls inside this episode.
+    let stale = record("s-old", NOW + MIN / 2, Some(NOW + DAY), reset);
+    let (state, _) = store.load(reset).expect("ours");
+    let after = state.account(OWN);
+    assert!(
+        credits_noted(&roster, &state, reset).is_empty(),
+        "an older tab's notice revived the digest after the newest episode ended: {:?}",
+        after.credits
+    );
+    let Some(Credits::InUse(c)) = &after.credits else {
+        panic!("the account retained its episode");
+    };
+    assert!(!c.stands(reset));
+    assert_eq!(stale, Recorded::Unchanged);
+    assert_eq!(after, before);
+    assert_eq!(rows_of(&store, Kind::Credits), ["in use"]);
+}
+
+/// AN OLDER BUILD'S STATE (no usage keys) reads as none observed, and each
+/// word this build writes reads back whole. NEGATIVE CONTROL: a credits word
+/// this build does not know reads as none.
+#[test]
+fn the_usage_keys_round_trip_and_an_older_state_reads_as_none() {
+    let mut s = state();
+    let older = s.to_json();
+    assert!(!older.contains("credits"), "{older}");
+    let read = State::from_json(&older, NOW).expect("ours");
+    assert_eq!(read.account("main").credits, None);
+    let words = [
+        Credits::InUse(CreditsUse {
+            since: NOW - HOUR,
+            seen: NOW - MIN,
+            until: Some(NOW + HOUR),
+            told: true,
+        }),
+        Credits::Off(CreditsOff {
+            reason: "out_of_credits".to_string(),
+            at: NOW - DAY,
+            until: Some(NOW + 9 * DAY),
+        }),
+        Credits::On(NOW - 2 * DAY),
+    ];
+    for word in words {
+        let a = s.accounts.entry("main".to_string()).or_default();
+        a.credits = Some(word);
+        a.credits_day = Some(NOW.div_euclid(DAY));
+        a.warned_session = Some(WindowSaid {
+            pct: Some(91),
+            reset: Some(NOW + 2 * HOUR),
+            at: NOW - MIN,
+        });
+        a.warned_week = Some(WindowSaid {
+            pct: None,
+            reset: None,
+            at: NOW - HOUR,
+        });
+        let text = s.to_json();
+        let back = State::from_json(&text, NOW).expect("ours");
+        assert_eq!(back, s, "{text}");
+        assert!(back.account("main").observed());
+    }
+    // NEGATIVE CONTROL: a word of a later build.
+    let text = s.to_json().replace("\"word\":\"on\"", "\"word\":\"maybe\"");
+    let back = State::from_json(&text, NOW).expect("ours");
+    assert_eq!(back.account("main").credits, None, "{text}");
+}
+
+/// WHAT A LIMIT ROW SAYS OF CREDITS IS THE NEWEST WORD ON THEM where it is
+/// ([`record_wall`]): `overageStatus: rejected` with its reason and return is
+/// [`Credits::Off`]; a newer row that says they are on is [`Credits::On`];
+/// one that says nothing changes nothing, and neither does an older one, nor
+/// the same row read again.
+#[test]
+fn a_limit_rows_word_on_credits_is_the_newest_word_on_them() {
+    use crate::harness::upgrade::CreditsWord;
+    let dir = tmp("credits-off");
+    let store = Store::at(dir.path());
+    let r = three();
+    let off = StandingWall {
+        credits: Some(CreditsWord::Off {
+            reason: Some("out_of_credits".to_string()),
+            until: Some((NOW + 9 * DAY).unsigned_abs()),
+        }),
+        ..weekly()
+    };
+    record_wall(&store, &r, "s-one", &stored(), &off, STARTED, NOW);
+    let read = |now: i64| held(&store, "main", now).credits;
+    let kept = Some(Credits::Off(CreditsOff {
+        reason: "out_of_credits".to_string(),
+        at: NOW - 10,
+        until: Some(NOW + 9 * DAY),
+    }));
+    assert_eq!(read(NOW), kept);
+    let silent = StandingWall {
+        at: (NOW + 60).unsigned_abs(),
+        ..weekly()
+    };
+    record_wall(&store, &r, "s-one", &stored(), &silent, STARTED, NOW + 70);
+    assert_eq!(read(NOW + 70), kept, "a row that says nothing");
+    let older_on = StandingWall {
+        at: (NOW - 600).unsigned_abs(),
+        credits: Some(CreditsWord::On),
+        ..weekly()
+    };
+    record_wall(
+        &store,
+        &r,
+        "s-one",
+        &stored(),
+        &older_on,
+        NOW - 700,
+        NOW + 80,
+    );
+    assert_eq!(read(NOW + 80), kept, "an older row undoes nothing");
+    let on = StandingWall {
+        at: (NOW + 120).unsigned_abs(),
+        credits: Some(CreditsWord::On),
+        ..weekly()
+    };
+    record_wall(&store, &r, "s-one", &stored(), &on, STARTED, NOW + 130);
+    assert_eq!(read(NOW + 130), Some(Credits::On(NOW + 120)));
+    assert_eq!(
+        record_wall(&store, &r, "s-one", &stored(), &on, STARTED, NOW + 140),
+        Recorded::Unchanged,
+        "the same row read again"
+    );
+}
+
+/// THE WEEK NEARLY USED WITH NO CREDITS IS A LINE ([`windows_full`]): the
+/// vendor's weekly warning at [`WINDOW_FULL_PCT`] with its reset more than a
+/// day off, on an account whose newest word on credits is a limit row's
+/// `off`, with that row's reason. NEGATIVE CONTROLS, each beside its rule:
+/// credits unknown, on or in use, credits back past their return, a figure
+/// under the bar, a reset within a day, and a five-hour warning alone, are no
+/// line.
+#[test]
+fn the_week_nearly_used_with_credits_off_is_a_line_and_nothing_else_is() {
+    let r = own_row();
+    let line = [(OWN.to_string(), "org_level_disabled".to_string())];
+    // `screens` recorded in turn over a fresh store whose credits are
+    // `credits`: the lines at the last one's answer.
+    let full = |credits: Option<Credits>, screens: &[UsageSaid]| {
+        let dir = tmp("window-full");
+        let store = Store::at(dir.path());
+        if let Some(word) = credits {
+            set_credits(&store, OWN, word);
+        }
+        for s in screens {
+            record_usage(&store, &r, "s-1", &stored(), s, s.at);
+        }
+        let now = screens.last().map_or(NOW, |s| s.at);
+        windows_full(&r, &store.load(now).expect("ours").0, now)
+    };
+    let nearly = warned(NOW, true, 92, Some(NOW + 3 * DAY));
+    assert_eq!(full(Some(org_off()), &[nearly]), line);
+    assert!(full(None, &[nearly]).is_empty(), "credits unknown");
+    assert!(
+        full(Some(Credits::On(NOW - HOUR)), &[nearly]).is_empty(),
+        "credits on"
+    );
+    let in_use = Credits::InUse(CreditsUse {
+        since: NOW - HOUR,
+        seen: NOW - HOUR,
+        until: None,
+        told: true,
+    });
+    assert!(full(Some(in_use), &[nearly]).is_empty(), "credits in use");
+    let back = Credits::Off(CreditsOff {
+        reason: "out_of_credits".to_string(),
+        at: NOW - HOUR,
+        until: Some(NOW - 1),
+    });
+    assert!(full(Some(back), &[nearly]).is_empty(), "credits back");
+    for (screen, why) in [
+        (warned(NOW, true, 89, Some(NOW + 3 * DAY)), "under the bar"),
+        (
+            warned(NOW, true, 95, Some(NOW + DAY - 1)),
+            "a reset within a day",
+        ),
+        (
+            warned(NOW, false, 95, Some(NOW + 3 * HOUR)),
+            "the five-hour window",
+        ),
+    ] {
+        assert!(full(Some(org_off()), &[screen]).is_empty(), "{why}");
+    }
+    // The rows: one per figure that moved, none for the same said again.
+    let dir = tmp("window-full-rows");
+    let store = Store::at(dir.path());
+    for s in [
+        nearly,
+        nearly,
+        warned(NOW + MIN, true, 93, Some(NOW + 3 * DAY)),
+        warned(NOW + 2 * MIN, false, 95, Some(NOW + 3 * HOUR)),
+    ] {
+        record_usage(&store, &r, "s-1", &stored(), &s, NOW + 2 * MIN);
+    }
+    assert_eq!(
+        rows_of(&store, Kind::Warned),
+        ["weekly 92%", "weekly 93%", "session 95%"]
+    );
+}
+
+/// A LIMIT RESET REFILLS THE WINDOW IT WAS AT, AND NO OTHER (the review of
+/// S5, rounds 3 to 5): on the one-account machine the vendor warned `96% of
+/// your weekly limit` and `91% of your session limit`, credits are off, and
+/// the week's line stands ([`windows_full`]). A reset used at the weekly wall
+/// — or lifted, the limit had reset on its own — refills the week: the newest
+/// word on it ([`WindowSaid`], no figure), so the line ends, and the weekly
+/// warning drawn before the reset and said again says nothing; one drawn
+/// after it is the newest, and a week that still fills is a line again. A
+/// reset at the SESSION wall refills the session window alone: the week is
+/// as used as it was, and its line stands — the vendor warns of the week only
+/// while little of it has passed (`yS`: none past 60%), so nothing would draw
+/// it again before the week's wall. LAST WEEK'S WEEKLY WALL, lapsed and still
+/// among the account's walls, walls nothing; the wall the reset was claimed
+/// at does, though its outcome is read after it lapsed. NEGATIVE CONTROLS: a
+/// reset kept or failed refilled nothing, and the line stands; read as walled,
+/// the lapsed wall had the session's reset refill the week; asked at the
+/// outcome, the session's lapsed wall kept its warning.
+#[test]
+fn a_limit_reset_refills_the_walled_window_and_no_other() {
+    let r = own_row();
+    let week_end = NOW + 3 * DAY;
+    let session_end = NOW + 2 * HOUR;
+    let line = [(OWN.to_string(), "org_level_disabled".to_string())];
+    let refilled = |at: i64| {
+        Some(WindowSaid {
+            pct: None,
+            reset: None,
+            at,
+        })
+    };
+    // `end`: when the outcome is read.
+    let run = |tag: &str, limit: &str, done: &ResetDone<'_>, end: i64| {
+        let dir = tmp(tag);
+        let store = Store::at(dir.path());
+        let until = if limit == WEEK_LIMIT {
+            week_end
+        } else {
+            session_end
+        };
+        for s in [
+            warned(NOW, true, 96, Some(week_end)),
+            warned(NOW + MIN, false, 91, Some(session_end)),
+        ] {
+            record_usage(&store, &r, "s-1", &stored(), &s, s.at);
+        }
+        set_credits(&store, OWN, org_off());
+        let last_week = week_end - 7 * DAY;
+        let mut note = None;
+        store
+            .transact_within(&LOCK_LADDER, NOW + 10, &mut note, |state| {
+                let mut rows = note_wall(
+                    state,
+                    OWN,
+                    WEEK_LIMIT,
+                    Some(last_week),
+                    last_week - HOUR,
+                    NOW,
+                );
+                rows.extend(note_wall(
+                    state,
+                    OWN,
+                    limit,
+                    Some(until),
+                    NOW + 10,
+                    NOW + 10,
+                ));
+                Ok(rows)
+            })
+            .expect("walled");
+        let (state, _) = store.load(NOW + 20).expect("ours");
+        assert_eq!(windows_full(&r, &state, NOW + 20), line, "the control");
+        store
+            .transact_within(&LOCK_LADDER, NOW + 30, &mut note, |state| {
+                let taken = claim_reset(state, OWN, until, "s-1", 41, START, NOW + 30);
+                assert_eq!(taken, ResetClaimed::Taken);
+                Ok(reset_outcome(state, OWN, until, "s-1", done, end))
+            })
+            .expect("recorded");
+        let (state, _) = store.load(end + 10).expect("ours");
+        let lines = windows_full(&r, &state, end + 10);
+        (dir, store, lines, state.account(OWN))
+    };
+    for done in [ResetDone::Used { left: Some(1) }, ResetDone::Lifted] {
+        let (_dir, store, lines, account) = run("reset-week", WEEK_LIMIT, &done, NOW + 40);
+        assert!(lines.is_empty(), "{done:?}: {lines:?}");
+        assert_eq!(account.warned_week, refilled(NOW + 40), "{done:?}");
+        assert_eq!(
+            account.warned_session.and_then(|w| w.pct),
+            Some(91),
+            "{done:?}"
+        );
+        let later = NOW + 2 * HOUR;
+        let before = warned(NOW, true, 96, Some(week_end));
+        assert_eq!(
+            record_usage(&store, &r, "s-2", &stored(), &before, later),
+            Recorded::Unchanged,
+            "{done:?}: drawn before the reset"
+        );
+        let after = warned(later, true, 97, Some(week_end));
+        assert_eq!(
+            record_usage(&store, &r, "s-1", &stored(), &after, later).as_str(),
+            "usage"
+        );
+        let (state, _) = store.load(later).expect("ours");
+        assert_eq!(windows_full(&r, &state, later), line, "{done:?}");
+        // The session's wall, last week's beside it: the week's line stands.
+        let (_dir, _store, lines, account) = run("reset-session", SESSION_LIMIT, &done, NOW + 40);
+        assert_eq!(lines, line, "{done:?}: the week is as used as it was");
+        assert_eq!(account.warned_session, refilled(NOW + 40), "{done:?}");
+        assert_eq!(account.warned_week.and_then(|w| w.pct), Some(96));
+    }
+    // Its outcome read once the session's wall had lapsed: still the wall
+    // the reset was claimed at.
+    let end = session_end + RESET_GRACE_S + MIN;
+    let (_dir, _store, lines, account) =
+        run("reset-session-late", SESSION_LIMIT, &ResetDone::Lifted, end);
+    assert_eq!(account.warned_session, refilled(end));
+    assert_eq!(lines, line, "the week is as used as it was");
+    // NEGATIVE CONTROL: nothing refilled.
+    for done in [ResetDone::Kept("early"), ResetDone::Failed("unread")] {
+        let (_dir, _store, lines, account) = run("reset-week-kept", WEEK_LIMIT, &done, NOW + 40);
+        assert_eq!(lines, line, "{done:?}");
+        assert_eq!(account.warned_week.and_then(|w| w.pct), Some(96));
+    }
+}
+
+/// A WARNING DRAWN BEFORE A RESET SAYS NOTHING AFTER IT, ON ANY TAB (the
+/// review of S5, round 4): tab B has been idle since its last answer, its
+/// footer still drawing `You've used 96% of your weekly limit`, when tab A
+/// meets the weekly wall and a reset refills the week. B's loop says the
+/// unchanged warning again every [`CREDITS_RETELL_S`], and a loop started
+/// again on B reads it as new — each stamped with B's newest answer, older
+/// than the refill: nothing is written and no line comes back. NEGATIVE
+/// CONTROL: the same warning stamped with the screen read's own time, as the
+/// recorder was handed it before, brings the line back minutes after the
+/// refill.
+#[test]
+fn a_warning_drawn_before_a_reset_says_nothing_after_it() {
+    let dir = tmp("warned-before-reset");
+    let store = Store::at(dir.path());
+    let r = own_row();
+    let week_end = NOW + 4 * DAY;
+    let b = warned(NOW - HOUR, true, 96, Some(week_end));
+    record_usage(&store, &r, "s-b", &stored(), &b, NOW - HOUR + 5);
+    set_credits(&store, OWN, org_off());
+    let mut note = None;
+    store
+        .transact_within(&LOCK_LADDER, NOW, &mut note, |state| {
+            let mut rows = note_wall(state, OWN, WEEK_LIMIT, Some(week_end), NOW, NOW);
+            assert_eq!(
+                claim_reset(state, OWN, week_end, "s-a", 41, START, NOW),
+                ResetClaimed::Taken
+            );
+            rows.extend(reset_outcome(
+                state,
+                OWN,
+                week_end,
+                "s-a",
+                &ResetDone::Used { left: None },
+                NOW + 10,
+            ));
+            Ok(rows)
+        })
+        .expect("reset");
+    let full = |now: i64| windows_full(&r, &store.load(now).expect("ours").0, now);
+    for now in [NOW + 10 * MIN, NOW + 20 * MIN, NOW + DAY] {
+        assert_eq!(
+            record_usage(&store, &r, "s-b", &stored(), &b, now),
+            Recorded::Unchanged,
+            "retold at {now}"
+        );
+        assert!(full(now).is_empty(), "retold at {now}");
+    }
+    // NEGATIVE CONTROL: stamped with the read's own time.
+    let read_now = UsageSaid {
+        at: NOW + 10 * MIN,
+        ..b
+    };
+    assert_eq!(
+        record_usage(&store, &r, "s-b", &stored(), &read_now, NOW + 10 * MIN).as_str(),
+        "usage"
+    );
+    assert_eq!(
+        full(NOW + 10 * MIN),
+        [(OWN.to_string(), "org_level_disabled".to_string())]
+    );
+}
+
+/// CREDITS SEEN CARRYING A SESSION ARE ON (the review of S5): the owner told
+/// that the week is nearly used with credits off ([`windows_full`]) turns
+/// them on, and the next crossing goes on, on credits — with credits on, no
+/// limit row is written that could say they are. That answer is the newest
+/// word on them: no line, then or after the episode ends and the week fills
+/// again — and the old row read again (a loop started again over a session
+/// still standing at it) is the older word, and says nothing. NEGATIVE
+/// CONTROL: a row that said them off INSIDE an episode (its credits ran out)
+/// is the newest word: the line stands, through the stale notice said again
+/// over no new answer — at the row's own second too, the row being that
+/// answer — and the row read again; a newer answer on credits is on again.
+#[test]
+fn credits_seen_in_use_after_the_row_that_said_them_off_end_its_line() {
+    let dir = tmp("credits-back-on");
+    let store = Store::at(dir.path());
+    let r = own_row();
+    let line = [(OWN.to_string(), "org_level_disabled".to_string())];
+    let full = |now: i64| windows_full(&r, &store.load(now).expect("ours").0, now);
+    let usage = |s: UsageSaid| record_usage(&store, &r, "s-1", &stored(), &s, s.at + 5);
+    let wall = |sid: &str, row: &StandingWall, now: i64| {
+        record_wall(&store, &r, sid, &stored(), row, STARTED, now);
+    };
+    let week = |at: i64, pct: u32| warned(at, true, pct, Some(NOW + 3 * DAY));
+    wall("s-1", &off_row(NOW - 10, WEEK_LIMIT), NOW);
+    usage(week(NOW, 92));
+    assert_eq!(full(NOW + 5), line);
+    // Turned on: the next crossing goes on, on credits.
+    assert_eq!(usage(on_credits(NOW + HOUR, None)).as_str(), "usage");
+    assert!(full(NOW + HOUR + 5).is_empty(), "credits are on");
+    wall("s-2", &off_row(NOW - 10, WEEK_LIMIT), NOW + HOUR + MIN);
+    assert!(full(NOW + HOUR + MIN).is_empty(), "the old row read again");
+    // The episode lapses, and the week fills again.
+    let ended = NOW + 7 * HOUR;
+    usage(week(ended, 95));
+    assert!(full(ended + 5).is_empty(), "no word of credits off stands");
+    wall("s-2", &off_row(NOW - 10, WEEK_LIMIT), ended + MIN);
+    assert!(matches!(
+        held(&store, OWN, ended + MIN).credits,
+        Some(Credits::InUse(_))
+    ));
+    assert!(full(ended + MIN).is_empty());
+    // NEGATIVE CONTROL: they run out inside the next episode.
+    let begun = ended + HOUR;
+    usage(on_credits(begun, None));
+    let ran_out = off_row(begun + HOUR, WEEK_LIMIT);
+    wall("s-1", &ran_out, begun + HOUR + 10);
+    assert_eq!(full(begun + HOUR + 10), line);
+    for stale in [begun, begun + HOUR] {
+        let said_again = on_credits(stale, None);
+        assert_eq!(
+            record_usage(
+                &store,
+                &r,
+                "s-1",
+                &stored(),
+                &said_again,
+                begun + HOUR + MIN
+            ),
+            Recorded::Unchanged,
+            "the notice at the answer of {stale}"
+        );
+        assert_eq!(full(begun + HOUR + MIN), line, "its credits ran out");
+    }
+    wall("s-1", &ran_out, begun + HOUR + 2 * MIN);
+    assert_eq!(full(begun + HOUR + 2 * MIN), line, "and read again");
+    usage(on_credits(begun + 2 * HOUR, None));
+    assert!(full(begun + 2 * HOUR + 5).is_empty(), "on again");
+}
+
+/// EACH WINDOW KEEPS ITS OWN WORD (the review of S5): Claude Code shows one
+/// warning at a time, the five-hour window's first, so the week nearly used
+/// with credits off stays a line ([`windows_full`]) when the footer turns to
+/// the session's warning — on a machine whose only reading of the week is
+/// the warning — and the week's word keeps the age of the answer it was
+/// drawn after. Of one answer, the later read of its screen stands (the
+/// footer redrawn since by an answer still too new to stamp it,
+/// [`NOTICES_DRAWN_S`]). NEGATIVE CONTROLS: a week's figure ends at its own
+/// reset, and one whose reset was not read a week after its answer.
+#[test]
+fn each_window_keeps_its_own_word() {
+    let dir = tmp("warned-windows");
+    let store = Store::at(dir.path());
+    let r = own_row();
+    set_credits(&store, OWN, org_off());
+    let usage = |s: UsageSaid| record_usage(&store, &r, "s-1", &stored(), &s, s.at);
+    let full = |now: i64| windows_full(&r, &store.load(now).expect("ours").0, now);
+    let line = [(OWN.to_string(), "org_level_disabled".to_string())];
+    let (week_end, session_end) = (NOW + 2 * DAY, NOW + 3 * HOUR);
+    usage(warned(NOW, true, 89, Some(week_end)));
+    assert!(full(NOW).is_empty(), "under the bar");
+    // The same answer's screen read again, redrawn since: the later read.
+    usage(warned(NOW, true, 92, Some(week_end)));
+    assert_eq!(full(NOW), line);
+    assert_eq!(
+        usage(warned(NOW + MIN, false, 91, Some(session_end))).as_str(),
+        "usage"
+    );
+    assert_eq!(full(NOW + MIN), line, "the week is still nearly used");
+    let a = held(&store, OWN, NOW + MIN);
+    assert_eq!(
+        (
+            a.warned_week.map(|w| (w.pct, w.at)),
+            a.warned_session.and_then(|w| w.pct)
+        ),
+        (Some((Some(92), NOW)), Some(91))
+    );
+    // NEGATIVE CONTROLS: the week's own reset; no reset read.
+    assert!(full(week_end).is_empty(), "the week has reset");
+    usage(warned(NOW + 2 * MIN, true, 94, None));
+    let end = NOW + 2 * MIN + WEEK_WINDOW_S;
+    assert_eq!(full(end - DAY - 1), line);
+    assert!(full(end - DAY).is_empty(), "a week after its answer");
+}
+
+/// THE LINE'S WEEK IS THE WARNING'S WORD, NEVER A SAMPLE'S ([`windows_full`];
+/// S5 beside S3a's usage tap): on the one-account machine the vendor warned
+/// `92% of your weekly limit`, credits are off, and the tap reads the week at
+/// 96%. A reset at the weekly wall refills the week: the line ends. The tap's
+/// sample keeps its largest figure within the reset ([`note_reading`]), and
+/// an idle tab's 96%, read afresh after the reset (a loop started again
+/// admits its first reading), is recorded with the reading's own time —
+/// ranked beside the warning's word, the week refilled was `nearly used`
+/// again. NEGATIVE CONTROLS: a sample, however new and however full, makes no
+/// line; a weekly warning drawn after the refill does.
+#[test]
+fn the_lines_week_is_the_warnings_word_never_a_samples() {
+    let dir = tmp("warned-not-sample");
+    let store = Store::at(dir.path());
+    let r = own_row();
+    set_credits(&store, OWN, org_off());
+    let week_end = NOW + 4 * DAY;
+    let usage = |s: UsageSaid| record_usage(&store, &r, "s-1", &stored(), &s, s.at);
+    let full = |now: i64| windows_full(&r, &store.load(now).expect("ours").0, now);
+    let line = [(OWN.to_string(), "org_level_disabled".to_string())];
+    let edit = |now: i64, f: &dyn Fn(&mut State) -> Vec<Event>| {
+        let mut note = None;
+        store
+            .transact_within(&LOCK_LADDER, now, &mut note, |state| Ok(f(state)))
+            .expect("written");
+    };
+    let tap = |pct: u32| Sample {
+        week_pct: Some(pct),
+        week_reset: Some(week_end),
+        ..Sample::default()
+    };
+    usage(warned(NOW, true, 92, Some(week_end)));
+    edit(NOW + MIN, &|state| {
+        note_reading(state, OWN, tap(96), NOW + MIN)
+    });
+    assert_eq!(full(NOW + MIN), line);
+    edit(NOW + 10 * MIN, &|state| {
+        let mut rows = note_wall(state, OWN, WEEK_LIMIT, Some(week_end), NOW, NOW + 10 * MIN);
+        assert_eq!(
+            claim_reset(state, OWN, week_end, "s-1", 41, START, NOW + 10 * MIN),
+            ResetClaimed::Taken
+        );
+        rows.extend(reset_outcome(
+            state,
+            OWN,
+            week_end,
+            "s-1",
+            &ResetDone::Used { left: None },
+            NOW + 11 * MIN,
+        ));
+        rows
+    });
+    assert!(full(NOW + 12 * MIN).is_empty(), "refilled");
+    let later = NOW + 2 * HOUR;
+    edit(later, &|state| note_reading(state, OWN, tap(96), later));
+    let sample = held(&store, OWN, later).sample.expect("the tap's");
+    assert_eq!(
+        (sample.week_pct, sample.at),
+        (Some(96), later),
+        "{sample:?}"
+    );
+    assert!(
+        full(later).is_empty(),
+        "the tap's figure, carried past the refill"
+    );
+    // NEGATIVE CONTROLS: a full sample; a warning after the refill.
+    edit(later + MIN, &|state| {
+        let read = Sample {
+            at: later + MIN,
+            ..tap(99)
+        };
+        note_sample(state, OWN, read, later + MIN)
+    });
+    assert!(
+        full(later + MIN).is_empty(),
+        "a sample is no word of the line's"
+    );
+    usage(warned(later + 2 * MIN, true, 93, Some(week_end)));
+    assert_eq!(full(later + 2 * MIN), line);
+}
+
+// ---------------------------------------------------------------------------
+// The usage tap's readings (design v2 §3.2)
+// ---------------------------------------------------------------------------
+
+/// A tap reading of the session window at `pct` resetting at `reset`, and
+/// the week at `week`.
+fn tapped(pct: u32, reset: i64, week: u32) -> Sample {
+    Sample {
+        session_pct: Some(pct),
+        session_reset: Some(reset),
+        week_pct: Some(week),
+        week_reset: Some(NOW + 3 * DAY),
+        at: 0,
+        by: String::new(),
+    }
+}
+
+/// THE MAX RULE AND THE HEARTBEAT: within one reset the larger figure
+/// stands (60 over a later 58, a stale process's); a newer reset takes the
+/// newer window whatever its figure; a reading for an OLDER window than the
+/// one held is never taken; a held window whose reset passed is void. A
+/// reading that changes nothing writes nothing until the heartbeat, which
+/// writes the same figures again with a row. NEGATIVE CONTROLS: the probe's
+/// `note_sample`, which takes the newer sample whole, does take the 58 — the
+/// rule is this function's — and a reading with no window writes nothing.
+#[test]
+fn a_tap_reading_keeps_the_largest_figure_within_a_window_and_writes_only_news() {
+    let mut s = state();
+    let reset = NOW + 2 * HOUR;
+    let events = note_reading(&mut s, "main", tapped(60, reset, 30), NOW);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].kind, Kind::Sample);
+    let held = |s: &State| s.accounts["main"].sample.clone().expect("a sample");
+    assert_eq!(held(&s).session_pct, Some(60));
+    assert_eq!(held(&s).at, NOW);
+    assert_eq!(held(&s).by, "0a0b");
+    // 58 in the same window: no change, no write.
+    let before = s.clone();
+    assert!(note_reading(&mut s, "main", tapped(58, reset, 30), NOW + MIN).is_empty());
+    assert_eq!(s, before, "nothing written");
+    // The same figures past the heartbeat: written again, the same figures.
+    let beat = NOW + READING_HEARTBEAT_S;
+    assert_eq!(
+        note_reading(&mut s, "main", tapped(58, reset, 30), beat).len(),
+        1
+    );
+    assert_eq!(held(&s).session_pct, Some(60));
+    assert_eq!(held(&s).at, beat);
+    // A rise in the window is news at once.
+    assert_eq!(
+        note_reading(&mut s, "main", tapped(61, reset, 30), beat + 1).len(),
+        1
+    );
+    assert_eq!(held(&s).session_pct, Some(61));
+    // An older window is never taken; a newer one is, whatever its figure.
+    let before = s.clone();
+    assert!(note_reading(&mut s, "main", tapped(90, reset - HOUR, 30), beat + 2).is_empty());
+    assert_eq!(s, before);
+    assert_eq!(
+        note_reading(&mut s, "main", tapped(3, reset + 5 * HOUR, 30), beat + 3).len(),
+        1
+    );
+    assert_eq!(held(&s).session_pct, Some(3));
+    assert_eq!(held(&s).session_reset, Some(reset + 5 * HOUR));
+    // A held window whose reset passed is void: the reading's stands.
+    let late = reset + 5 * HOUR + 1;
+    assert_eq!(
+        note_reading(&mut s, "main", tapped(1, reset - HOUR, 30), late).len(),
+        1
+    );
+    assert_eq!(held(&s).session_pct, Some(1));
+    // The week rides the same rule beside it.
+    assert_eq!(held(&s).week_pct, Some(30));
+    // No window: nothing.
+    let before = s.clone();
+    let empty = Sample {
+        session_pct: None,
+        week_pct: None,
+        ..tapped(0, reset, 0)
+    };
+    assert!(note_reading(&mut s, "main", empty, late + DAY).is_empty());
+    assert_eq!(s, before);
+    // Negative control: the probe's recorder takes the 58 whole.
+    let mut probe = state();
+    assert_eq!(
+        note_sample(
+            &mut probe,
+            "main",
+            Sample {
+                at: NOW,
+                ..tapped(60, reset, 30)
+            },
+            NOW
+        )
+        .len(),
+        1
+    );
+    assert_eq!(
+        note_sample(
+            &mut probe,
+            "main",
+            Sample {
+                at: NOW + MIN,
+                ..tapped(58, reset, 30)
+            },
+            NOW + MIN
+        )
+        .len(),
+        1
+    );
+    assert_eq!(
+        probe.accounts["main"].sample.as_ref().unwrap().session_pct,
+        Some(58)
+    );
 }

@@ -10,7 +10,7 @@
 //!
 //! That default is wrong for most of this app. aterm spawns dozens of workers —
 //! font warmers, image/video encoders, update checkers, package probes, log
-//! flushers, the smart-title LLM — and essentially all of them do work no human
+//! flushers — and essentially all of them do work no human
 //! is waiting on. Left at the default they are indistinguishable, to the
 //! scheduler, from the thread drawing the next frame. Under load that is
 //! precisely backwards: the cosmetic work keeps its share while keystroke
@@ -56,7 +56,7 @@ pub(crate) enum Role {
     /// descheduled with the UI thread queued behind it.
     Responsive,
     /// Useful work nobody is blocked on: font warming, encoding, log flushing,
-    /// smart titles, package/update probes. Must never delay a keystroke.
+    /// package/update probes. Must never delay a keystroke.
     Background,
     /// Work with NO deadline at all, which may therefore run arbitrarily late:
     /// opportunistic disk sweeps and prefetch. Yields to literally everything.
@@ -132,11 +132,12 @@ pub(crate) fn set_self(role: Role) {
 // copy inside `fork(2)` until the child's exec closes them. `fork(2)` runs on the
 // FORKING thread: aterm's address space is copied there, and the child cannot
 // run before that copy is done. So that window is paid at the forking thread's
-// class, and a `Background` thread paid it at UTILITY. The title worker starting the managed
-// Ollama daemon (`setsid` and `InheritStrip` in a `pre_exec`) is that fork
-// today; every other fork-path spawn found runs on an undeclared or a raised
-// thread (the update handoff worker, the shell spawns, the CLI's own verbs), and
-// the guard below holds for whichever demoted thread forks next.
+// class, and a `Background` thread paid it at UTILITY. The retired Smart Titles
+// worker starting its managed Ollama daemon (`setsid` and `InheritStrip` in a
+// `pre_exec`) was that fork; every other fork-path spawn found runs on an
+// undeclared or a raised thread (the update handoff worker, the shell spawns,
+// the CLI's own verbs), and the guard below holds for whichever demoted thread
+// forks next.
 //
 // MEASURED 2026-10-01 at load 128-140 on 18 cores (6 P, 12 E): from the
 // instant `fork` is called to the child's last `pre_exec` step, `/usr/bin/true`
@@ -165,8 +166,7 @@ pub(crate) fn set_self(role: Role) {
 // it is: the guard never lowers anything.
 //
 // Installed by `set_self` BEFORE it sets a class — the one way this crate
-// demotes a thread. The managed daemon's background band is untouched: its
-// parent sets it after the exec ([`demote_process_tree`]), not the fork.
+// demotes a thread.
 // ---------------------------------------------------------------------------
 #[cfg(target_os = "macos")]
 mod fork_at_default {
@@ -441,8 +441,8 @@ pub(crate) fn slice_of_self() -> Option<(u64, u64)> {
 // Measured 2026-09-15 on macOS: a thread at UTILITY (`ps` pri 20) or BACKGROUND
 // (pri 4) still starts its child at pri 31, the default band. That is the band
 // the user's shell and the program being typed into run in. So the `Background`
-// workers that launch `atpkg update`, a package verb, a login-shell PATH probe or
-// the smart-title Ollama daemon handed that work straight back to the scheduler
+// workers that launch `atpkg update`, a package verb or a login-shell PATH probe
+// handed that work straight back to the scheduler
 // as an equal of the foreground TUI: the thread yielded, and the process doing
 // the actual CPU work did not. Nothing in aterm attributes the lost time either,
 // because the starved party is a sibling process aterm launched.
@@ -487,8 +487,6 @@ const fn child_clamp(role: Role) -> Option<&'static str> {
 ///
 /// NOT FOR a child whose pid is attested the moment `spawn` returns: until
 /// `taskpolicy` execs the program, that pid is still running taskpolicy's image.
-/// The managed Ollama daemon is demoted by its parent with [`demote_process_tree`]
-/// instead.
 /// NOT FOR a child that launches an aterm either: the clamp is inherited, and
 /// docs/RELEASING.md measured an aterm under UTILITY starving its paint probe.
 ///
@@ -541,87 +539,78 @@ fn is_executable_file(path: &std::path::Path) -> bool {
     }
 }
 
-/// `sys/resource.h`: `setpriority`'s "which" for a whole process, and the value
-/// that puts it in the Darwin background band. Not in `aterm-libc`.
+// ---------------------------------------------------------------------------
+// LENDING A WAITER'S URGENCY TO THE WORKER IT WAITS ON.
+//
+// A channel donates no priority: a UI-thread caller that waits (bounded) for
+// a `Background` worker to finish what is queued waits on a UTILITY thread
+// the scheduler may run late on a busy Mac. A QoS OVERRIDE (`<pthread/qos.h>`)
+// raises the worker for exactly as long as the dependency stands, leaves the
+// class it requested alone, and may be ended from any thread — so the worker
+// ends it itself once the awaited job is done. libSystem exports, declared
+// here for the reason the next section gives.
+// ---------------------------------------------------------------------------
 #[cfg(target_os = "macos")]
-const PRIO_DARWIN_PROCESS: libc::c_int = 4;
-#[cfg(target_os = "macos")]
-const PRIO_DARWIN_BG: libc::c_int = 0x1000;
+unsafe extern "C" {
+    fn pthread_override_qos_class_start_np(
+        thread: libc::pthread_t,
+        class: libc::qos_class_t,
+        relative_priority: libc::c_int,
+    ) -> *mut std::ffi::c_void;
+    fn pthread_override_qos_class_end_np(over: *mut std::ffi::c_void) -> libc::c_int;
+}
 
-/// The most processes one [`demote_process_tree`] visits: the daemon it serves
-/// has a handful at most, and a tree forking faster than the walk must not
-/// keep the caller in it.
-#[cfg(target_os = "macos")]
-const DEMOTE_TREE_MAX: usize = 256;
+/// A worker raised to [`Role::Responsive`] until this drops — carried with
+/// the job it is waited on for, and dropped by the worker once that job is
+/// done. Inert where the platform has no override, or declined one.
+pub(crate) struct Boost {
+    #[cfg(target_os = "macos")]
+    over: Option<std::ptr::NonNull<std::ffi::c_void>>,
+}
 
-/// Put a child that is ALREADY RUNNING its own image — and every descendant it
-/// has started — in the Darwin background band, from its parent. For a child
-/// that cannot take [`command`]'s wrapper because its pid is attested the moment
-/// `spawn` returns: the managed Ollama daemon.
-///
-/// This is what `taskpolicy -b` does to itself, `setpriority(PRIO_DARWIN_PROCESS,
-/// pid, PRIO_DARWIN_BG)`, aimed at another process of this user. Measured: the
-/// target reads pri 4 against 31 bare, and a child it starts afterwards inherits
-/// pri 4. It is harsher than the UTILITY clamp [`command`] gives a `Background`
-/// child — the lowest CPU band, with disk I/O and newly opened sockets throttled —
-/// but the utility clamp exists only as a spawn attribute, and `taskpolicy -p`
-/// cannot apply one to a running pid.
-///
-/// AFTER EXEC, NEVER BETWEEN FORK AND EXEC (2026-09-30). The daemon used to demote
-/// itself in a `pre_exec`. A forked child holds a copy of every descriptor aterm
-/// has open — each tab's pty master, the control listener, locks, pipe ends —
-/// until its exec closes them, and in the background band on a loaded host that
-/// exec barely runs. Measured 2026-09-30 at load ~129 on 18 cores, fork to exec
-/// of `/usr/bin/true` from a 2 GB parent: p50 30 ms, p90 116 ms, max 1.1 s for
-/// a child that demoted itself first, against p50 3.5 ms, p90 8 ms, max 27 ms
-/// bare — and over 10 s at load ~150, long enough to hold a dead run's
-/// crash-journal lock and a retired control listener open. Std's `spawn` returns
-/// only once the child has exec'd (the EOF of its CLOEXEC error pipe), so a
-/// child demoted after it holds nothing of aterm's.
-///
-/// THE TREE, because that child runs a moment at the inherited band first: at
-/// load ~120, 5 bare children in 200 reached `main` before their parent's
-/// demotion landed, up to 170 ms later — time enough for a daemon to start
-/// something. So each process is demoted BEFORE its children are listed: a
-/// child it forks after the listing inherits the band, and one it forked before
-/// is in the listing. Only a descendant whose parent has already exited —
-/// re-parented away from the tree — escapes.
-///
-/// NOT FOR A CHILD THAT EXECS AGAIN AT ONCE. An exec copies the band into the
-/// new image as it starts and then drops the old one, so a demotion that lands
-/// between the two is lost with the old image. `spawn`'s own exec has finished
-/// that by the time it returns (0 lost in 750 demotions of `/bin/sleep` and
-/// `/bin/bash`), but macOS's `/bin/sh` is a launcher that execs `/bin/bash`
-/// straight away, and 12 in 250 demotions of it were lost. The daemon is
-/// Ollama's own image, attested as such the moment `spawn` returns. The same
-/// race can leave a descendant the sweep demotes mid-exec at the inherited
-/// band; only one started before the root's demotion is ever swept.
-///
-/// The caller must still own `pid` unreaped, so the pid names the child it
-/// spawned. Results are ignored: a scheduling hint must never be the reason a
-/// child fails. macOS only, like the daemon it serves.
+// SAFETY: the override is an opaque libSystem object that any thread may end
+// (`pthread_override_qos_class_end_np`'s contract), and only the one owner of
+// this value ever ends it.
 #[cfg(target_os = "macos")]
-pub(crate) fn demote_process_tree(pid: u32) {
-    let Ok(root) = libc::pid_t::try_from(pid) else {
-        return;
-    };
-    let mut pending = vec![root];
-    let mut visited = 0;
-    while let Some(pid) = pending.pop() {
-        if visited == DEMOTE_TREE_MAX {
-            break;
+unsafe impl Send for Boost {}
+
+impl Boost {
+    /// Raise `thread`, a worker not yet joined, while the caller waits on it.
+    pub(crate) fn start(thread: Option<&std::thread::JoinHandle<()>>) -> Boost {
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::unix::thread::JoinHandleExt as _;
+            let over = thread.and_then(|thread| {
+                let pthread = thread.as_pthread_t() as libc::pthread_t;
+                // SAFETY: the borrowed handle is not joined, so `pthread`
+                // names a thread whose handle stays valid across the call.
+                std::ptr::NonNull::new(unsafe {
+                    pthread_override_qos_class_start_np(pthread, qos_class(Role::Responsive), 0)
+                })
+            });
+            Boost { over }
         }
-        visited += 1;
-        let Ok(who) = libc::id_t::try_from(pid) else {
-            continue;
-        };
-        // SAFETY: `setpriority` on a pid takes no pointers; at worst it
-        // answers ESRCH for a process that has gone.
-        unsafe {
-            libc::setpriority(PRIO_DARWIN_PROCESS, who, PRIO_DARWIN_BG);
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = thread;
+            Boost {}
         }
-        // Listed only now, after `pid` is in the band (see above).
-        pending.extend(crate::quit_safety::child_pids(pid).unwrap_or_default());
+    }
+
+    /// Whether an override was started.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn armed(&self) -> bool {
+        self.over.is_some()
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for Boost {
+    fn drop(&mut self) {
+        if let Some(over) = self.over.take() {
+            // SAFETY: `over` came from a successful start and is ended once.
+            unsafe { pthread_override_qos_class_end_np(over.as_ptr()) };
+        }
     }
 }
 
@@ -638,8 +627,7 @@ pub(crate) fn demote_process_tree(pid: u32) {
 // reference and asserted item-for-item by its oracle ("Regenerate rather than
 // edit"), so declaring them there would be a hand edit of generated code. All
 // are ordinary libSystem exports (`<sys/qos.h>`, `<pthread/qos.h>`,
-// `<pthread.h>`), declared here the way this module already declares
-// `PRIO_DARWIN_PROCESS`/`PRIO_DARWIN_BG`.
+// `<pthread.h>`), declared here.
 //
 // Declared returning `c_uint`, NOT `libc::qos_class_t`: a `repr(u32)` enum
 // return carrying a value outside its six discriminants would be undefined
@@ -707,97 +695,6 @@ pub(crate) fn class_for(role: Role) -> u32 {
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) const UNDECLARED_CLASS: u32 = libc::qos_class_t::QOS_CLASS_DEFAULT as u32;
 
-// ---------------------------------------------------------------------------
-// READING A PROCESS'S BAND BACK.
-//
-// The band a process runs in is the BASE PRIORITY of its threads, which is
-// what `ps -o pri` shows: 31 at the band a process inherits, 4 in the Darwin
-// background band. NOT the task record's `pti_priority`: a process that
-// inherited the background band at fork keeps `pti_priority` 31 while its
-// threads run at base 4 (measured 2026-09-30 on Darwin 25.6, for the 2 s after
-// the fork), so only a process demoted by pid shows the band there.
-//
-// `struct proc_threadinfo` and its two `proc_pidinfo` flavors are in
-// `<sys/proc_info.h>` but not in `aterm-libc` (generated; see above): 112
-// bytes, `pth_priority` at offset 40, `PROC_PIDTHREADINFO` 5 and
-// `PROC_PIDLISTTHREADS` 6, all measured against the SDK on this Mac.
-#[cfg(all(test, target_os = "macos"))]
-#[repr(C)]
-struct ProcThreadInfo {
-    _user_and_system_time: [u64; 2],
-    _usage_policy_state_flags_sleep_curpri: [i32; 6],
-    priority: i32,
-    _max_priority: i32,
-    _name: [u8; 64],
-}
-
-#[cfg(all(test, target_os = "macos"))]
-const _: () = assert!(size_of::<ProcThreadInfo>() == 112);
-
-/// The base priority of a thread in the Darwin background band.
-#[cfg(all(test, target_os = "macos"))]
-pub(crate) const BACKGROUND_BAND_PRIORITY: i32 = 4;
-
-/// SIGKILLs the process group a test started, on every way out of the test,
-/// a panic included. Drop it before reaping the leader, so the group id still
-/// names that group. Takes everything only when nothing in the group forks
-/// once demoted: a starved fork can finish after the kill has walked the group.
-#[cfg(all(test, target_os = "macos"))]
-pub(crate) struct KillGroupOnDrop(pub(crate) libc::pid_t);
-
-#[cfg(all(test, target_os = "macos"))]
-impl Drop for KillGroupOnDrop {
-    fn drop(&mut self) {
-        // SAFETY: signals only the process group this test started.
-        unsafe { libc::kill(-self.0, libc::SIGKILL) };
-    }
-}
-
-/// The base priority of `pid`'s first thread — its main thread, and its only
-/// one for the shells and stand-ins the tests start — or `None` when libproc
-/// cannot answer. Async-signal-safe (two `proc_pidinfo` calls into stack
-/// records), so a `pre_exec` probe may call it.
-#[cfg(all(test, target_os = "macos"))]
-pub(crate) fn base_priority_of(pid: libc::pid_t) -> Option<i32> {
-    const PROC_PIDTHREADINFO: libc::c_int = 5;
-    const PROC_PIDLISTTHREADS: libc::c_int = 6;
-    const HANDLE: libc::c_int = size_of::<u64>() as libc::c_int;
-    const INFO: libc::c_int = size_of::<ProcThreadInfo>() as libc::c_int;
-    let mut thread: u64 = 0;
-    // SAFETY: `thread` is one writable `u64` slot, and libproc writes at most
-    // `HANDLE` bytes of thread handles into it.
-    let listed = unsafe {
-        libc::proc_pidinfo(
-            pid,
-            PROC_PIDLISTTHREADS,
-            0,
-            (&raw mut thread).cast(),
-            HANDLE,
-        )
-    };
-    if listed != HANDLE {
-        return None;
-    }
-    let mut info = std::mem::MaybeUninit::<ProcThreadInfo>::uninit();
-    // SAFETY: `info` is `INFO` writable bytes laid out as the
-    // `proc_threadinfo` this flavor fills (pinned to 112 bytes above).
-    let read = unsafe {
-        libc::proc_pidinfo(
-            pid,
-            PROC_PIDTHREADINFO,
-            thread,
-            info.as_mut_ptr().cast(),
-            INFO,
-        )
-    };
-    if read != INFO {
-        return None;
-    }
-    // SAFETY: the exact-size read initialized the whole record, and every
-    // field is a plain integer, valid for any bit pattern.
-    Some(unsafe { info.assume_init() }.priority)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -805,6 +702,70 @@ mod tests {
     // -----------------------------------------------------------------------
     // WHAT THE SCHEDULER ACTUALLY SEES
     // -----------------------------------------------------------------------
+
+    /// A [`Boost`] raises the worker's base priority while it stands and puts
+    /// it back when it drops, read off the kernel's own record of the thread
+    /// (an override is invisible to the class a thread reads of itself).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_boost_raises_the_worker_while_it_stands_and_no_longer() {
+        unsafe extern "C" {
+            fn pthread_threadid_np(thread: libc::pthread_t, id: *mut u64) -> libc::c_int;
+        }
+        /// `<sys/proc_info.h>`'s by-thread-id flavor of `PROC_PIDTHREADINFO`.
+        const PROC_PIDTHREADID64INFO: libc::c_int = 15;
+        /// `struct proc_threadinfo` (`<sys/proc_info.h>`, not in the generated
+        /// `libc`): 112 bytes, the base priority `pth_priority` at offset 40.
+        #[repr(C)]
+        struct ProcThreadInfo {
+            _user_and_system_time: [u64; 2],
+            _usage_policy_state_flags_sleep_curpri: [i32; 6],
+            priority: i32,
+            _max_priority: i32,
+            _name: [u8; 64],
+        }
+        const _: () = assert!(size_of::<ProcThreadInfo>() == 112);
+        let priority_of = |thread: libc::pthread_t| {
+            let mut id = 0u64;
+            // SAFETY: `thread` is a live, unjoined thread; `id` a writable slot.
+            assert_eq!(unsafe { pthread_threadid_np(thread, &mut id) }, 0);
+            let mut info = std::mem::MaybeUninit::<ProcThreadInfo>::uninit();
+            let size = size_of::<ProcThreadInfo>() as libc::c_int;
+            // SAFETY: `info` is `size` writable bytes laid out as the record
+            // this flavor fills (its size pinned above).
+            let read = unsafe {
+                libc::proc_pidinfo(
+                    libc::getpid(),
+                    PROC_PIDTHREADID64INFO,
+                    id,
+                    info.as_mut_ptr().cast(),
+                    size,
+                )
+            };
+            assert_eq!(read, size, "the thread's record reads");
+            // SAFETY: the exact-size read initialized every (integer) field.
+            unsafe { info.assume_init() }.priority
+        };
+        use std::os::unix::thread::JoinHandleExt as _;
+        let (declared_tx, declared) = std::sync::mpsc::channel::<()>();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let worker = std::thread::spawn(move || {
+            set_self(Role::Background);
+            let _ = declared_tx.send(());
+            let _ = released.recv();
+        });
+        declared.recv().expect("the worker declared its role");
+        let thread = worker.as_pthread_t() as libc::pthread_t;
+        let parked = priority_of(thread);
+        let boost = Boost::start(Some(&worker));
+        assert!(boost.armed(), "an unjoined thread takes an override");
+        let raised = priority_of(thread);
+        assert!(raised > parked, "boosted {raised}, parked {parked}");
+        drop(boost);
+        assert_eq!(priority_of(thread), parked, "the override ended with it");
+        let _ = release.send(());
+        worker.join().expect("the worker");
+    }
 
     /// THE CLASS, READ OFF A RUNNING THREAD. Every other QoS assertion in this
     /// crate is about text — this enum's order, or a `set_self` appearing in a
@@ -955,7 +916,7 @@ mod tests {
         );
         assert!(
             rank(Role::Responsive) > rank(Role::Background),
-            "the PTY drain must outrank font warming and smart titles"
+            "the PTY drain must outrank font warming and package probes"
         );
         assert!(
             rank(Role::Background) > rank(Role::Housekeeping),
@@ -1192,55 +1153,6 @@ mod tests {
         assert!(
             pri <= 20,
             "a Background child ran at pri {pri}, not utility (20)"
-        );
-    }
-
-    /// THE SWEEP. A child demoted from its parent runs a moment at the band it
-    /// inherited first, and whatever it starts in that moment does not inherit
-    /// the demotion. [`demote_process_tree`] takes those too. Deterministic: the
-    /// root here is a shell started bare, and its descendant demonstrably exists
-    /// (it has printed its pid) before the root is demoted.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn a_tree_demoted_from_its_root_takes_what_it_already_started() {
-        use std::io::BufRead as _;
-
-        // The root runs the descendant in the foreground and waits on it; the
-        // descendant names itself once it runs its own image, then blocks
-        // reading the stdin pipe this test holds. From then on neither forks
-        // nor execs: no demotion can land in an exec, no starved fork can
-        // escape the group kill, and the pipe's EOF ends both even without it.
-        let mut root = aterm_uds::spawnfd::command("/bin/bash")
-            .args(["-c", "/bin/bash -c 'echo $$; read -r _'; :"])
-            .process_group(0)
-            .stdin(aterm_uds::spawnfd::Stdio::piped())
-            .stdout(aterm_uds::spawnfd::Stdio::piped())
-            .stderr(aterm_uds::spawnfd::Stdio::null())
-            .spawn()
-            .unwrap();
-        let group = KillGroupOnDrop(libc::pid_t::try_from(root.id()).unwrap());
-        let mut line = String::new();
-        std::io::BufReader::new(root.stdout.take().unwrap())
-            .read_line(&mut line)
-            .unwrap();
-        let descendant: libc::pid_t = line.trim().parse().unwrap();
-        let before = base_priority_of(descendant);
-
-        demote_process_tree(root.id());
-        let after = (base_priority_of(group.0), base_priority_of(descendant));
-
-        drop(group);
-        let _ = root.wait();
-        let band = Some(BACKGROUND_BAND_PRIORITY);
-        assert!(
-            before.is_some() && before != band,
-            "the descendant must start outside the background band ({before:?}), or \
-             this proves nothing"
-        );
-        assert_eq!(after.0, band, "the root was not demoted");
-        assert_eq!(
-            after.1, band,
-            "a descendant started before its root's demotion stayed at {before:?}"
         );
     }
 

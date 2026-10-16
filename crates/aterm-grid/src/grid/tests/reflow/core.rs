@@ -9,8 +9,6 @@ use super::super::super::*;
 
 #[test]
 fn reflow_shrink_wraps_long_line() {
-    // A line of 10 chars on an 80-col terminal should wrap to 2 rows when
-    // the terminal is resized to 5 columns.
     let mut grid = Grid::new(5, 10);
     for c in "ABCDEFGHIJ".chars() {
         grid.write_char(c);
@@ -19,17 +17,14 @@ fn reflow_shrink_wraps_long_line() {
 
     grid.resize(5, 5);
 
-    // Content should reflow to 2 rows
     assert_eq!(grid.row(0).unwrap().to_string(), "ABCDE");
     assert_eq!(grid.row(1).unwrap().to_string(), "FGHIJ");
 
-    // Second row should be marked as wrapped
     assert!(grid.row(1).unwrap().is_wrapped());
 }
 
 #[test]
 fn reflow_grow_unwraps_soft_wrapped_lines() {
-    // Create a grid with a wrapped line
     let mut grid = Grid::new(5, 5);
     for c in "ABCDE".chars() {
         grid.write_char(c);
@@ -37,7 +32,7 @@ fn reflow_grow_unwraps_soft_wrapped_lines() {
     grid.line_feed();
     grid.carriage_return();
 
-    // Manually set the wrapped flag on row 1 and add more content
+    // A soft-wrapped continuation, built by hand.
     if let Some(row) = grid.row_mut(1) {
         row.set_wrapped(true);
         for (i, c) in "FGHIJ".chars().enumerate() {
@@ -49,36 +44,29 @@ fn reflow_grow_unwraps_soft_wrapped_lines() {
     assert_eq!(grid.row(1).unwrap().to_string(), "FGHIJ");
     assert!(grid.row(1).unwrap().is_wrapped());
 
-    // Resize wider to 12 columns (enough to fit all content on one line)
     grid.resize(5, 12);
 
-    // Content should merge: the wrapped continuation should unwrap
     assert_eq!(grid.row(0).unwrap().to_string(), "ABCDEFGHIJ");
-    // Row 1 should now be empty (the continuation merged up)
     assert!(grid.row(1).unwrap().is_empty() || !grid.row(1).unwrap().is_wrapped());
 }
 
 #[test]
 fn reflow_shrink_preserves_cursor_position() {
     let mut grid = Grid::new(5, 20);
-    // Write "ABCDEFGHIJ" and position cursor at column 7 ('H')
     for c in "ABCDEFGHIJ".chars() {
         grid.write_char(c);
     }
-    grid.set_cursor(0, 7); // Position at 'H'
+    grid.set_cursor(0, 7);
 
-    // Resize to 5 columns - cursor at col 7 should move to row 1, col 2
+    // Offset 7 ('H') lands on row 1, col 2.
     grid.resize(5, 5);
 
-    // "ABCDE" on row 0, "FGHIJ" on row 1
-    // Original position 7 -> row 1, col 2 (F=0, G=1, H=2)
     assert_eq!(grid.cursor_row(), 1);
     assert_eq!(grid.cursor_col(), 2);
 }
 
 #[test]
 fn reflow_grow_preserves_cursor_position() {
-    // Start with wrapped content
     let mut grid = Grid::new(5, 5);
     for c in "ABCDE".chars() {
         grid.write_char(c);
@@ -91,7 +79,6 @@ fn reflow_grow_preserves_cursor_position() {
             row.write_char(i as u16, c);
         }
     }
-    // Position cursor at row 1, col 2 ('H')
     grid.set_cursor(1, 2);
 
     grid.resize(5, 12);
@@ -105,16 +92,12 @@ fn reflow_grow_preserves_cursor_position() {
 #[test]
 fn reflow_cursor_at_chunk_boundary() {
     let mut grid = Grid::new(5, 10);
-    // Write "ABCDEFGHIJ" - fills exactly row 0 (cols 0-9)
     for c in "ABCDEFGHIJ".chars() {
         grid.write_char(c);
     }
 
-    // Col 5 ('F') is the exact boundary once shrunk to 5 columns.
     grid.set_cursor(0, 5);
 
-    // At 5 columns: "ABCDE" (offsets 0-4), "FGHIJ" (5-9); the cursor at
-    // offset 5 is on the boundary.
     grid.resize(5, 5);
 
     assert_eq!(grid.row(0).unwrap().to_string(), "ABCDE");
@@ -130,12 +113,10 @@ fn reflow_cursor_at_chunk_boundary() {
 #[test]
 fn reflow_cursor_at_wrapped_line_end() {
     let mut grid = Grid::new(5, 5);
-    // Write "ABCDE" - fills row 0 exactly (cols 0-4)
     for c in "ABCDE".chars() {
         grid.write_char(c);
     }
-    // Move to row 1 and set up wrapped continuation
-    // Note: is_wrapped means "this row is a continuation of the previous row"
+    // `is_wrapped` marks a row as the continuation of the previous one.
     grid.line_feed();
     grid.carriage_return();
     if let Some(row) = grid.row_mut(1) {
@@ -145,25 +126,18 @@ fn reflow_cursor_at_wrapped_line_end() {
         }
     }
 
-    // Position cursor at row 0, col 4 - the last valid column (on 'E')
-    // This is at the exact end of the first segment before the wrap
     grid.set_cursor(0, 4);
 
-    // Grow to 10 columns - should unwrap
     grid.resize(5, 10);
 
-    // "ABCDEFGHIJ" should now be on row 0
     assert_eq!(grid.row(0).unwrap().to_string(), "ABCDEFGHIJ");
 
-    // Cursor was at logical offset 4 (on 'E', the last char of first segment)
-    // After reflow, should stay at row 0, col 4
     assert_eq!(grid.cursor_row(), 0);
     assert_eq!(grid.cursor_col(), 4);
 }
 
 #[test]
 fn reflow_round_trip() {
-    // Shrink then grow should preserve content
     let mut grid = Grid::new(5, 10);
     for c in "ABCDEFGHIJ".chars() {
         grid.write_char(c);
@@ -180,16 +154,14 @@ fn reflow_round_trip() {
 
 #[test]
 fn reflow_without_reflow_flag() {
-    // Test resize_with_reflow_mode(ReflowMode::Disabled) just truncates
+    // `ReflowMode::Disabled` truncates instead of wrapping.
     let mut grid = Grid::new(5, 10);
     for c in "ABCDEFGHIJ".chars() {
         grid.write_char(c);
     }
 
-    // Resize without reflow - should truncate, not wrap
     grid.resize_with_reflow_mode(5, 5, ReflowMode::Disabled);
     assert_eq!(grid.row(0).unwrap().to_string(), "ABCDE");
-    // Row 1 should be empty (no wrapping occurred)
     assert!(grid.row(1).unwrap().is_empty());
 }
 
@@ -211,14 +183,12 @@ fn resize_with_reflow_noop_and_grow_preserve_logical_rows_after_scroll() {
         .collect();
     assert_eq!(before_resize, vec!['B', 'C', 'D', ' ']);
 
-    // No-op resize must not disturb logical row order.
     grid.resize_with_reflow_mode(4, 8, ReflowMode::Enabled);
     let after_noop: Vec<char> = (0..4)
         .map(|row| grid.cell(row, 0).unwrap().char())
         .collect();
     assert_eq!(after_noop, before_resize);
 
-    // Grow without trimming must preserve existing rows and append empty rows.
     grid.resize_with_reflow_mode(6, 8, ReflowMode::Enabled);
     let after_grow: Vec<char> = (0..4)
         .map(|row| grid.cell(row, 0).unwrap().char())
@@ -239,7 +209,7 @@ fn resize_with_reflow_grow_preserves_nonempty_bottom_row_after_scroll() {
         grid.write_char((b'A' + row as u8) as char);
     }
 
-    // Advance ring_head away from zero, then make the bottom logical row non-empty.
+    // Advance ring_head, then make the bottom logical row non-empty.
     grid.set_cursor(3, 0);
     grid.line_feed();
     grid.set_cursor(3, 0);
@@ -263,23 +233,19 @@ fn resize_with_reflow_grow_preserves_nonempty_bottom_row_after_scroll() {
 #[test]
 fn reflow_handles_empty_rows() {
     let mut grid = Grid::new(5, 10);
-    // Row 0 has content, rows 1-4 are empty
     for c in "Hello".chars() {
         grid.write_char(c);
     }
 
     grid.resize(5, 3);
-    // "Hel" on row 0, "lo" on row 1
     assert_eq!(grid.row(0).unwrap().to_string(), "Hel");
     assert_eq!(grid.row(1).unwrap().to_string(), "lo");
-    // Row 2 should still be empty
     assert!(grid.row(2).unwrap().is_empty());
 }
 
 #[test]
 fn reflow_preserves_hard_line_breaks() {
     let mut grid = Grid::new(5, 10);
-    // Write "ABC" then newline, then "DEF"
     for c in "ABC".chars() {
         grid.write_char(c);
     }
@@ -289,11 +255,9 @@ fn reflow_preserves_hard_line_breaks() {
         grid.write_char(c);
     }
 
-    // Neither row should be marked as wrapped
     assert!(!grid.row(0).unwrap().is_wrapped());
     assert!(!grid.row(1).unwrap().is_wrapped());
 
-    // Resize wider - hard breaks should be preserved (no unwrapping)
     grid.resize(5, 20);
     assert_eq!(grid.row(0).unwrap().to_string(), "ABC");
     assert_eq!(grid.row(1).unwrap().to_string(), "DEF");

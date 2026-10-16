@@ -59,11 +59,14 @@ impl DiskBackedScrollback {
 
     /// Remove the `n` most recent lines (Kitty unscroll spec).
     ///
-    /// Uses tier-aware back-removal: removes from hot first, then warm, then
-    /// cold — decompressing at most one boundary block/page at a time. This
-    /// bounds peak memory to ~one block regardless of total scrollback size.
+    /// Selects the newest lines across hot, warm and cold tiers, committing
+    /// the oldest affected tier first. Decompresses at most one boundary
+    /// block/page at a time, bounding peak memory to ~one block regardless of
+    /// total scrollback size.
     ///
-    /// Returns an error if decompression or I/O fails; state unchanged on error (#4638).
+    /// On decompression or I/O failure, newer RAM tiers and aggregate counters
+    /// remain unchanged. A partial disk write can still damage the cold boundary
+    /// page; the cold tier's reads fail closed for affected bytes (#4638).
     pub(crate) fn remove_newest(&mut self, n: usize) -> Result<(), ScrollbackError> {
         if n == 0 || self.line_count == 0 {
             return Ok(());
@@ -79,43 +82,83 @@ impl DiskBackedScrollback {
         let warm_remove = after_hot.min(self.warm.line_count());
         let cold_remove = after_hot - warm_remove;
 
-        // Pre-validate all fallible decompressions before modifying state (#4638).
-        if warm_remove > 0 {
-            self.warm.pre_validate_truncate_back(warm_remove)?;
-        }
+        // Cold I/O must finish before touching the RAM tiers. If cold is
+        // affected, every warm block is removed whole (infallible); otherwise
+        // the warm boundary is the only fallible step and precedes hot removal.
+        // Each tier prepares its boundary before mutation, without a separate
+        // validation pass.
+        // This order preserves newer RAM tiers and aggregate counters when the
+        // boundary operation fails. It does not roll back partial disk writes;
+        // the cold tier retains its existing fail-closed read behavior.
         if cold_remove > 0 {
-            self.cold.pre_validate_truncate_back(cold_remove)?;
-        }
-
-        // Commit. Pre-validation has confirmed every boundary block/page
-        // DECOMPRESSES, but the re-compress and (for the cold tier) the file
-        // write/sync/set_len are still fallible — pre-validation cannot exercise
-        // them. Propagate any such error with `?` instead of panicking. Each
-        // tier's `truncate_back_lines` is internally transactional (state
-        // unchanged on its own error, #4638), so a failure leaves that tier and
-        // `self.line_count` consistent for the caller to recover from.
-        // Decrement the aggregate `line_count` INCREMENTALLY as each tier's
-        // truncation commits, so a later tier's I/O error (the warm re-compress
-        // and the cold file write/sync/set_len stay fallible even after
-        // pre-validation) leaves `line_count` matching exactly the tiers that
-        // succeeded — a bulk `-= n` only on full success would overstate the
-        // removal on a partial failure and desync the aggregate from the tiers.
-        // Newest-first order (hot→warm→cold) means a partial failure trims the
-        // newest lines and leaves only the oldest boundary portion in place.
-        if hot_remove > 0 {
-            self.hot.truncate_back(hot_remove);
-            self.line_count = self.line_count.saturating_sub(hot_remove);
+            self.cold.truncate_back_lines(cold_remove)?;
         }
         if warm_remove > 0 {
             self.warm.truncate_back_lines(warm_remove)?;
-            self.line_count = self.line_count.saturating_sub(warm_remove);
         }
-        if cold_remove > 0 {
-            self.cold.truncate_back_lines(cold_remove)?;
-            self.line_count = self.line_count.saturating_sub(cold_remove);
+        if hot_remove > 0 {
+            self.hot.truncate_back(hot_remove);
         }
+        self.line_count = self.line_count.saturating_sub(n);
         self.sync_accounting();
         self.assert_bytes_used_invariant();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_cold_write_preserves_newer_tiers_and_their_accounting() {
+        for cold_remove in [1, 5] {
+            let dir = aterm_tempfile::tempdir().expect("scratch directory");
+            let path = dir.path().join("remove-newest.dtrm");
+            let config = DiskBackedScrollbackConfig::new(&path)
+                .with_hot_limit(5)
+                .with_warm_limit(10)
+                .with_block_size(5);
+            let mut sb = DiskBackedScrollback::with_config(config).expect("store");
+            for row in 0..50 {
+                sb.push_str(&format!("row {row}")).expect("append");
+            }
+            let tiers = (
+                sb.hot_line_count(),
+                sb.warm_line_count(),
+                sb.cold_line_count(),
+            );
+            assert!(tiers.0 > 0 && tiers.1 > 0 && tiers.2 > cold_remove);
+            let count = sb.line_count();
+            let budgeted = sb.budgeted_memory_used();
+            sb.cold
+                .make_file_read_only_for_test()
+                .expect("read-only file");
+
+            sb.remove_newest(tiers.0 + tiers.1 + cold_remove)
+                .expect_err("the real cold write must fail");
+
+            assert_eq!(sb.line_count(), count, "a failed removal loses no lines");
+            assert_eq!(
+                (
+                    sb.hot_line_count(),
+                    sb.warm_line_count(),
+                    sb.cold_line_count()
+                ),
+                tiers,
+                "RAM tiers must survive a cold I/O failure"
+            );
+            assert_eq!(sb.budgeted_memory_used(), budgeted);
+            sb.assert_bytes_used_invariant();
+            for row in 0..count {
+                assert_eq!(
+                    sb.get_line(row)
+                        .expect("read")
+                        .expect("retained")
+                        .to_string(),
+                    format!("row {row}")
+                );
+            }
+        }
     }
 }

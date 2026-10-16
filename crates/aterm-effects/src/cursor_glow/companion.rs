@@ -54,10 +54,8 @@ impl CursorGlow {
         self.erase_mom.value(now)
     }
 
-    /// The canonical typing-momentum metric at `now`
-    /// ([`crate::typing_momentum`]), which every rainbow kitty "earned drama"
-    /// consumer keys off (the eased `rainbow.disp` spine chases it).
-    /// `momentum_unifies_glow_and_cat_metrics` pins it against
+    /// The canonical typing-momentum metric at `now` ([`crate::typing_momentum`])
+    /// every Rainbow Kitty "earned drama" consumer keys off; the same metric as
     /// [`crate::kitty_cursor::CursorCat::momentum`].
     #[must_use]
     pub fn typing_momentum(&self, now: Instant) -> f32 {
@@ -65,13 +63,9 @@ impl CursorGlow {
     }
 
     /// Read and clear this tick's momentum pulse: `Some(instant)` iff the
-    /// ribbon took one correlated typed advance during the tick (a printable
-    /// keystroke paired with its forward / wrap / coalesced echo, the gate in
-    /// [`Self::spawn`]). The host feeds it to
-    /// [`crate::kitty_cursor::CursorCat::on_key`] with `forward = true`, so
-    /// the cat and the ribbon build momentum from one echo-correlated source;
-    /// a non-echoing keystream (a password prompt, vim vertical navigation)
-    /// pulses neither.
+    /// ribbon took one correlated typed advance this tick (the gate in
+    /// [`Self::spawn`]), so the cat and the ribbon build momentum from one
+    /// echo-correlated source; a non-echoing keystream pulses neither.
     #[must_use]
     #[cfg(test)]
     pub fn take_momentum_pulse(&mut self) -> Option<Instant> {
@@ -105,14 +99,11 @@ impl CursorGlow {
         }
     }
 
-    /// The resident pet's offer (`rk::companion` panel #10): the perk edge,
-    /// the star within reach and the ribbon's colour under the cat, as one
-    /// value for [`crate::kitty_pet::PetBrain::note_v2_offer`].
-    ///
-    /// A pure read: an idle engine offers `PetOffer::default()` and no clock,
-    /// mark or cadence moves. Call it before [`Self::take_companion_impulse`]
-    /// drains the frame's impulse, where the perk edge lives.
-    /// `PetOffer::default()` whenever v2 is not engaged.
+    /// The resident pet's offer: the perk edge, the star within reach and the
+    /// ribbon's colour under the cat, for
+    /// [`crate::kitty_pet::PetBrain::note_v2_offer`]. A pure read; call it
+    /// before [`Self::take_companion_impulse`] drains the frame's impulse,
+    /// where the perk edge lives. `PetOffer::default()` unless v2 is engaged.
     #[must_use]
     pub fn pet_offer(
         &self,
@@ -126,12 +117,11 @@ impl CursorGlow {
         }
     }
 
-    /// The cat caught the star (panel #10(b)): spend the offered star's
-    /// remaining life on the sky's own 40 ms finish. `star` is the value
-    /// [`crate::kitty_pet::PetBrain::note_v2_offer`] handed back and `at` is
-    /// the paw's landing instant. Returns whether the star was still there;
-    /// inert, and `false`, unless v2 is engaged. Nothing is drawn: the
-    /// resident's motion touches the sky only by ending a star sooner (T1).
+    /// The cat caught the star: spend the offered star's remaining life on the
+    /// sky's own 40 ms finish. `star` is what
+    /// [`crate::kitty_pet::PetBrain::note_v2_offer`] handed back and `at` the
+    /// paw's landing instant. Returns whether the star was still there; inert,
+    /// and `false`, unless v2 is engaged. Nothing is drawn.
     pub fn catch_star(&mut self, star: rk::companion::StarCatch, at: Instant) -> bool {
         self.v2.engaged() && self.v2.catch_star(star, at)
     }
@@ -161,9 +151,9 @@ impl CursorGlow {
         }
     }
 
-    /// The caret's paint at `now` for `RainbowConfig::paint` (§7.1): under
-    /// v2 the display spine floored by the landing re-light
-    /// ([`rk::Engine::caret_paint`]); otherwise [`Self::momentum_display`].
+    /// The caret's paint at `now` for `RainbowConfig::paint` (§7.1): under v2
+    /// the display spine floored by the landing re-light
+    /// ([`rk::Engine::caret_paint`]); `0.0` when v2 is not engaged.
     #[must_use]
     pub fn caret_paint(&self, now: Instant) -> f32 {
         if self.v2.engaged() {
@@ -186,19 +176,12 @@ impl CursorGlow {
         entered
     }
 
-    /// Sing-along drive (`crate::kitty_sing`): pin the canonical metric to
-    /// at least `drive`, called by the host once per frame while a
-    /// celebration is live.
-    ///
-    /// A deliberate momentum bypass, the twin of
-    /// [`crate::kitty_cursor::CursorCat::set_singing`]'s: an armed held-key
-    /// celebration is maximal flow, so the metric is driven straight to 1.0
-    /// through the one existing spine, and every legibility cap (star wash,
-    /// occupied-cell coverage, contrast floors) holds at full drive as at
-    /// earned full momentum (`full_sing_drive_holds_the_rainbow_legibility_caps`).
-    /// During wind-down (`drive < 1`) the floor eases down with the
-    /// crossfade and natural decay takes over. Uses the same `set_value`
-    /// seam as the collection hello.
+    /// Sing-along drive (`crate::kitty_sing`): pin the canonical metric to at
+    /// least `drive`, called by the host once per frame while a celebration is
+    /// live. A deliberate momentum bypass, the twin of
+    /// [`crate::kitty_cursor::CursorCat::set_singing`]: every legibility cap
+    /// holds at full drive as at earned full momentum. During wind-down
+    /// (`drive < 1`) the floor eases down and natural decay takes over.
     pub fn celebrate(&mut self, now: Instant, drive: f32) {
         self.unsettle();
         let drive = if drive.is_finite() {
@@ -226,12 +209,10 @@ impl CursorGlow {
         }
     }
 
-    /// The grief gate, [`Self::celebrate`]'s inverse. While the pet's failure
-    /// droop is on glass (`kitty_pet::PetBrain::grieving`), the host calls
-    /// this every frame: zeroing the rainbow momentum defuels the jump
-    /// meteor's star shower and terminus scatter, so the prompt after a
-    /// failed command never arrives under a celebration. Momentum re-earns
-    /// normally once the droop ends.
+    /// The grief gate, [`Self::celebrate`]'s inverse: while the pet's failure
+    /// droop is on glass (`kitty_pet::PetBrain::grieving`) the host calls this
+    /// every frame, so zeroed momentum defuels the jump meteor's star shower
+    /// and the prompt after a failed command never arrives under a celebration.
     pub fn hush_fanfare(&mut self, now: Instant) {
         self.unsettle();
         self.momentum.set_value(now, 0.0);

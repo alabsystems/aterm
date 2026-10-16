@@ -19,7 +19,6 @@ fn base_y_equals_oldest_absolute_plus_scrollback() {
         grid.scrollback_lines() > 0,
         "lines should have scrolled off"
     );
-    // base_y is the absolute row of the live/last line.
     let expected = grid.oldest_absolute_row() as usize + grid.scrollback_lines();
     assert_eq!(grid.base_y(), expected);
 }
@@ -32,11 +31,9 @@ fn display_origin_absolute_tracks_scroll() {
         grid.line_feed();
     }
 
-    // Not scrolled: top visible == base_y.
     assert_eq!(grid.display_offset(), 0);
     assert_eq!(grid.display_origin_absolute(), grid.base_y());
 
-    // Scroll up two lines into history: origin drops by exactly the offset.
     grid.scroll_display(2);
     assert_eq!(grid.display_offset(), 2);
     assert_eq!(grid.display_origin_absolute(), grid.base_y() - 2);
@@ -48,10 +45,8 @@ fn row_is_wrapped_true_on_continuation_row() {
     for c in "Hello World".chars() {
         grid.write_char_wrap(c);
     }
-    // Row 0 is the lead; row 1 is the soft-wrap continuation.
     assert_eq!(grid.row_is_wrapped(0), Some(false));
     assert_eq!(grid.row_is_wrapped(1), Some(true));
-    // Out-of-range row yields None.
     assert_eq!(grid.row_is_wrapped(999), None);
 }
 
@@ -61,23 +56,18 @@ fn row_len_is_logical_length() {
     for c in "abc".chars() {
         grid.write_char(c);
     }
-    // Last non-empty cell + 1.
     assert_eq!(grid.row_len(0), Some(3));
-    // A never-written row is blank (len 0).
     assert_eq!(grid.row_len(1), Some(0));
     assert_eq!(grid.row_len(999), None);
 }
 
 #[test]
 fn scrolled_history_wrapped_row_metadata_is_tier_aware() {
-    // After a width-shrink reflow overflows wrapped rows into tiered history, a
-    // scrolled-back history row past the ring base (where Grid::row is None)
-    // reports row_len/row_is_wrapped through the tier-aware view, as row_text
-    // does.
+    // A scrolled-back history row past the ring base (where `Grid::row` is None) reports
+    // `row_len`/`row_is_wrapped` through the tier-aware view, as `row_text` does.
     let scrollback = Scrollback::new(100, 1000, 10_000_000);
     let mut grid = Grid::with_tiered_scrollback(3, 40, 2, scrollback);
-    // Three 30-char lines fill the 3 visible rows without wrapping at 40 cols;
-    // the last has no line feed so the cursor rests on the bottom row.
+    // Three 30-char lines fill the screen with nothing scrolled off yet.
     for (i, ch) in ['A', 'B', 'C'].into_iter().enumerate() {
         for _ in 0..30 {
             grid.write_char(ch);
@@ -86,13 +76,12 @@ fn scrolled_history_wrapped_row_metadata_is_tier_aware() {
             grid.line_feed();
         }
     }
-    // Width shrink to 20: each 30-char line rewraps to a 20-col head plus a
-    // wrapped 10-col continuation, overflowing the 3-row window into history.
+    // Each 30-char line rewraps to a 20-col head plus a 10-col continuation, overflowing into
+    // history.
     grid.resize(3, 20);
     grid.scroll_to_top();
     assert!(grid.display_offset() > 0, "scrolled into history");
 
-    // The two oldest viewport rows are history rows: Grid::row is None there.
     assert!(
         grid.row(0).is_none(),
         "row 0 is past the ring base (history)"
@@ -101,11 +90,9 @@ fn scrolled_history_wrapped_row_metadata_is_tier_aware() {
         grid.row(1).is_none(),
         "row 1 is past the ring base (history)"
     );
-    // Text is already tier-aware (the sibling that always worked).
     assert_eq!(grid.row_text(0).as_deref(), Some("A".repeat(20).as_str()));
     assert_eq!(grid.row_text(1).as_deref(), Some("A".repeat(10).as_str()));
 
-    // The metadata pair is now tier-aware too (non-None, matching the content).
     assert_eq!(grid.row_len(0), Some(20), "history head-row length");
     assert_eq!(
         grid.row_is_wrapped(0),
@@ -118,7 +105,6 @@ fn scrolled_history_wrapped_row_metadata_is_tier_aware() {
         Some(true),
         "history continuation is a wrap continuation"
     );
-    // Out-of-range still yields None.
     assert_eq!(grid.row_len(999), None);
     assert_eq!(grid.row_is_wrapped(999), None);
 }

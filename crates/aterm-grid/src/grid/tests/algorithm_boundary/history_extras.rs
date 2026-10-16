@@ -6,7 +6,6 @@ use std::sync::Arc;
 
 use super::*;
 // History line API ordering (ring buffer and tiered scrollback)
-// ========================================================================
 
 #[test]
 fn try_history_line_ring_buffer_path_is_infallible() {
@@ -109,8 +108,8 @@ fn cell_extra_mut_creates_and_updates_extra_data() {
 
 // CellExtras shift_region boundary conditions
 
-/// shift_region_up on a single-row region (top == bottom) should delete the row's extras
-/// and not move anything (there's nothing below to shift up).
+/// `shift_region_up_by` on a one-row region deletes that row's extras and moves
+/// nothing.
 #[test]
 fn shift_region_up_single_row_region() {
     use crate::extra::{CellCoord, CellExtras};
@@ -143,8 +142,8 @@ fn shift_region_up_single_row_region() {
     );
 }
 
-/// shift_region_down on a single-row region (top == bottom) should delete the row's extras
-/// and not move anything (there's nothing above to shift down).
+/// `shift_region_down_by` on a one-row region drops that row's extras and moves
+/// nothing.
 #[test]
 fn shift_region_down_single_row_region() {
     use crate::extra::{CellCoord, CellExtras};
@@ -177,8 +176,8 @@ fn shift_region_down_single_row_region() {
     );
 }
 
-/// shift_region_up preserves extras at exactly top and bottom boundary rows correctly.
-/// Row at top is deleted; row at bottom shifts to bottom-1.
+/// `shift_region_up_by` over a region: the top row's extras are deleted and the
+/// bottom row's move to bottom - 1.
 #[test]
 fn shift_region_up_boundary_rows() {
     use crate::extra::{CellCoord, CellExtras};
@@ -221,8 +220,8 @@ fn shift_region_up_boundary_rows() {
     );
 }
 
-/// shift_region_down preserves extras at exactly top and bottom boundary rows correctly.
-/// Row at bottom is dropped; row at top shifts to top+1.
+/// `shift_region_down_by` over a region: the bottom row's extras are dropped
+/// and the top row's move to top + 1.
 #[test]
 fn shift_region_down_boundary_rows() {
     use crate::extra::{CellCoord, CellExtras};
@@ -255,6 +254,4 @@ fn shift_region_down_boundary_rows() {
         &['\u{0302}'],
         "old row 4 (bottom-1) should now be at row 5 (bottom)"
     );
-    // The original row 5 content should be gone
-    // Note: row 5 now has old row 4's content, the original row 5 was dropped
 }

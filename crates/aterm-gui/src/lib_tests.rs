@@ -1461,34 +1461,34 @@ fn config_parsing() {
     assert_eq!(c.gpu, Some(true));
     assert_eq!(c.scrollback_lines, Some(5000));
     // scrollback maps into the engine config: N -> cap, 0 -> unlimited (None).
-    assert_eq!(c.terminal_config().unwrap().scrollback_limit, Some(5000));
+    assert_eq!(c.applied_terminal_config().scrollback_limit, Some(5000));
     let unlimited: Config = aterm_toml::from_str("scrollback_lines = 0").unwrap();
-    assert_eq!(unlimited.terminal_config().unwrap().scrollback_limit, None);
-    // No engine-side keys -> no TerminalConfig to apply.
-    assert!(
+    assert_eq!(unlimited.applied_terminal_config().scrollback_limit, None);
+    // No engine-side keys -> the engine config an empty config has.
+    assert_eq!(
         aterm_toml::from_str::<Config>("font_px = 18.0")
             .unwrap()
-            .terminal_config()
-            .is_none()
+            .applied_terminal_config(),
+        Config::default().applied_terminal_config()
     );
     // Cursor: shape + blink -> CursorStyle variant.
     use aterm_core::terminal::CursorStyle;
     let c: Config = aterm_toml::from_str("cursor_style = \"bar\"\ncursor_blink = false").unwrap();
     assert_eq!(
-        c.terminal_config().unwrap().cursor_style,
+        c.applied_terminal_config().cursor_style,
         CursorStyle::SteadyBar
     );
     // The underline option is not supported (block and bar only): such a config degrades
     // to the bar with a one-line note. Programs may still request underline via DECSCUSR.
     let c: Config = aterm_toml::from_str("cursor_style = \"underline\"").unwrap();
     assert_eq!(
-        c.terminal_config().unwrap().cursor_style,
+        c.applied_terminal_config().cursor_style,
         CursorStyle::BlinkingBar
     );
     // Bad shape falls back (doesn't crash).
     let c: Config = aterm_toml::from_str("cursor_style = \"weird\"").unwrap();
     assert_eq!(
-        c.terminal_config().unwrap().cursor_style,
+        c.applied_terminal_config().cursor_style,
         CursorStyle::BlinkingBlock
     );
     // Partial + UNKNOWN keys/tables ignored (forward-compatible).
@@ -1526,16 +1526,16 @@ fn config_parsing() {
     assert_eq!(c.tab_strip_rows, Some(2));
     assert_eq!(Config::default().tab_strip_rows, None); // unset
     // Theme colours: hex parses; bad hex warns + is skipped (no crash).
-    use crate::app_config::parse_hex_color;
+    use aterm_types::scheme::parse_hex;
     assert_eq!(
-        parse_hex_color("#FF8800"),
+        parse_hex("#FF8800"),
         aterm_core::terminal::Rgb::new(0xFF, 0x88, 0x00).into()
     );
     assert_eq!(
-        parse_hex_color("102030"),
+        parse_hex("102030"),
         aterm_core::terminal::Rgb::new(0x10, 0x20, 0x30).into()
     );
-    assert!(parse_hex_color("#xyz").is_none() && parse_hex_color("#12345").is_none());
+    assert!(parse_hex("#xyz").is_none() && parse_hex("#12345").is_none());
     // Renderer theme from config: hex → Theme u32 (0x00RRGGBB).
     let c: Config = aterm_toml::from_str(
         "foreground = \"#102030\"\nbackground = \"#405060\"\nselection_color = \"#708090\"",
@@ -1721,7 +1721,13 @@ fn controls_prefs_projects_current_native_top_settings_tree() {
             .any(|line| line == &format!("prefs fields={}", expected_field_keys.len())),
         "compatibility field count binds the visible native setting controls"
     );
-    assert!(expected_field_keys.contains(&crate::prefs::EDIT_THEME.to_string()));
+    // No theme follows the system: Top Settings' first card leads with its
+    // Dark theme slot, a canonical `ui` record (no `field`: it is no row).
+    assert!(
+        open.iter()
+            .any(|line| line.starts_with("ui key=\"settings/theme-slot/dark\" "))
+    );
+    assert!(!expected_field_keys.contains(&crate::prefs::EDIT_THEME.to_string()));
 
     for removed in [
         "sparkle_words.orca.enabled",
@@ -1778,7 +1784,7 @@ fn theme_colors_reach_rendercell() {
     let c: Config =
         aterm_toml::from_str("foreground = \"#FF8800\"\nbackground = \"#102030\"").unwrap();
     let mut t = Terminal::new(4, 10);
-    t.apply_config(&c.terminal_config().unwrap());
+    t.apply_config(&c.applied_terminal_config());
     t.process(b"X"); // a default-styled glyph uses the configured theme colours
     let cells = t.render_row(0);
     assert_eq!(cells[0].ch, 'X');
@@ -1788,7 +1794,7 @@ fn theme_colors_reach_rendercell() {
     // The palette: SGR fg = ANSI 1 (red) → palette index 1.
     let c: Config = aterm_toml::from_str("palette = [\"#000000\", \"#AB12CD\"]").unwrap();
     let mut t = Terminal::new(4, 10);
-    t.apply_config(&c.terminal_config().unwrap());
+    t.apply_config(&c.applied_terminal_config());
     t.process(b"\x1b[31mR");
     let cells = t.render_row(0);
     assert_eq!(cells[0].ch, 'R');
@@ -1823,11 +1829,6 @@ fn named_theme_reaches_rendercell_and_chrome() {
     let th = c.theme();
     assert_eq!(th.fg, 0x00f8_f8f2, "theme fg reaches the renderer Theme");
     assert_eq!(th.bg, 0x0028_2a36, "theme bg reaches the renderer Theme");
-    // A named theme is engine-relevant, so the delta is Some (N1).
-    assert!(
-        c.terminal_config().is_some(),
-        "a named theme makes terminal_config() Some"
-    );
     // Engine default + palette reach rendered cells.
     let mut t = Terminal::new(4, 12);
     t.apply_config(&c.applied_terminal_config());
@@ -1856,19 +1857,22 @@ fn named_theme_reaches_rendercell_and_chrome() {
     assert_eq!(t2.render_row(0)[0].bg, [0x10, 0x20, 0x30]);
 }
 
-/// An unknown `theme` name falls back to Default (never panics) and still makes
-/// the engine delta `Some`. (The one-time diagnostic is emitted but not asserted:
-/// stderr capture would need a dev-dependency — this covers FALLBACK behaviour +
-/// the engine-delta contract only, per N7.)
+/// An unknown `theme` name falls back to Default (never panics), and the
+/// resolution says it fell back.
 #[test]
 fn unknown_theme_falls_back_to_default() {
     let c: Config = aterm_toml::from_str("theme = \"no-such-theme\"").unwrap();
     assert_eq!(c.theme().bg, super::Theme::default().bg);
     assert_eq!(c.theme().fg, super::Theme::default().fg);
-    assert!(
-        c.terminal_config().is_some(),
-        "a theme key makes the engine delta Some"
+    let resolved = c.resolved_colors(
+        aterm_types::Appearance::Dark,
+        &crate::app_config::ThemeCatalog::default(),
+        None,
     );
+    assert!(matches!(
+        resolved.source,
+        crate::resolved_colors::ThemeSource::DefaultFallback { .. }
+    ));
 }
 
 /// Config hot-reload keeps startup's font-size precedence (`--font-px > config >
@@ -1919,12 +1923,10 @@ fn reload_retheme_then_revert_live_terminal() {
     let themed: Config = aterm_toml::from_str("background = \"#203040\"").unwrap();
     t.apply_config(&themed.applied_terminal_config());
     assert_eq!(t.render_row(0)[0].bg, [0x20, 0x30, 0x40]);
-    // Reverting the key: an empty config has no engine *delta* (`terminal_config()`
-    // is None), but `applied_terminal_config()` still pins the engine default bg to
-    // the theme bg — so a default-styled cell reverts to the themed window
+    // Reverting the key: `applied_terminal_config()` pins the engine default bg
+    // to the theme bg — so a default-styled cell reverts to the themed window
     // background, not the engine's spec-default black.
     let empty: Config = aterm_toml::from_str("").unwrap();
-    assert!(empty.terminal_config().is_none());
     t.apply_config(&empty.applied_terminal_config());
     let theme_bg = {
         let bg = empty.theme().bg;
@@ -2009,15 +2011,7 @@ fn hot_reload_retints_tab_strip() {
     // Switch to a light scheme without invalidating: the unchanged key stale-serves. Light
     // because on Linux the band's base tone follows the theme's appearance, so two dark
     // schemes share cell 0's tone.
-    let tp = aterm_types::scheme::builtin("GitHub Light")
-        .unwrap()
-        .to_theme_parts();
-    app.theme = super::Theme {
-        fg: tp.fg,
-        bg: tp.bg,
-        cursor: tp.cursor,
-        selection: tp.selection,
-    };
+    app.theme = super::Theme::from(&aterm_types::scheme::builtin("GitHub Light").unwrap());
     app.splice_tab_strip_with(wid, 1);
     assert_eq!(
         active_bg(&app),

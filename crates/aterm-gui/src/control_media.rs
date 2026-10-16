@@ -18,7 +18,6 @@ use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
 
 use super::{AUDIT_SUBSYSTEM, ImageQueue, ImageReq};
 use crate::control_auth;
-use crate::platform::AppRt;
 use crate::{Wake, term_lock};
 
 /// Main-loop turns are normally sub-millisecond, but a debug build's first native
@@ -446,6 +445,9 @@ pub(crate) fn cmd_image_read(term: &Arc<Mutex<Terminal>>, rest: &str) -> String 
     let mut it = rest.split_whitespace();
     let r_tok = it.next();
     let c_tok = it.next();
+    if it.next().is_some() {
+        return "ERR bad args\n".to_string();
+    }
 
     // Cell mode: the image covering exactly (r, c).
     if let (Some(rs), Some(cs)) = (r_tok, c_tok) {
@@ -2453,24 +2455,48 @@ fn parse_settings_section_route(input: &str) -> Option<crate::native_settings::S
     }) {
         return Some(route);
     }
+    // Settings ▸ Harness answers to each supervised agent's names, its word
+    // and its product's (`codex`, `Claude Code`): the page holds its switch.
+    if aterm_phase::Program::ALL.into_iter().any(|p| {
+        p.supervisable()
+            && (normalized == p.name()
+                || normalized == normalize_settings_section_name(p.product()))
+    }) {
+        return Some(SettingsRoute::Harness);
+    }
     match normalized.as_str() {
         "prefs" | "preferences" | "settings" | "top" | "general" => Some(SettingsRoute::Home),
         "modified settings" => Some(SettingsRoute::Modified),
         "manual config" | "config" => Some(SettingsRoute::Manual),
         "text" | "typography" | "text and fonts" => Some(SettingsRoute::TextFonts),
         "cursor" | "cursor and motion" => Some(SettingsRoute::CursorMotion),
-        // The cat's page. "kitty" alone routes here and NOT to the Kitty Log
-        // (a read-only book with no route): a bare "kitty" from `settings
-        // section …` means the thing walking your cursor.
-        "kitty" | "cat" | "cursor cat" | "cursor pet" | "kitty pet" => {
-            Some(SettingsRoute::CursorKitty)
+        // The cursor styles' page, which was the Cursor Kitty's. "kitty" alone
+        // routes here and NOT to the Kitty Log (a read-only book with no
+        // route): a bare "kitty" from `settings section …` means the thing
+        // walking your cursor.
+        "kitty" | "cat" | "cursor cat" | "cursor pet" | "kitty pet" | "cursor kitty"
+        | "cursor style" | "styles" | "trail" | "trails" | "cursor trail" => {
+            Some(SettingsRoute::CursorStyles)
         }
+        "sounds" | "audio" | "music" | "music effects" | "volume" => Some(SettingsRoute::Sound),
         "windows" | "window and tabs" | "window & tabs" => Some(SettingsRoute::WindowTabs),
         "input" | "keyboard" | "keyboard and input" => Some(SettingsRoute::KeyboardInput),
         "update" | "software updates" => Some(SettingsRoute::SoftwareUpdate),
         // The owner's word is "log"; the log's page is Settings ▸ Messages.
         "log" | "logs" | "history" | "history log" | "activity log" | "message log"
         | "messages log" => Some(SettingsRoute::Messages),
+        // ...and to the harness's own name, the control's and the host's:
+        // what a person reaches for to turn the harness down (the Autopilot
+        // design, §5).
+        "coding agent harness" | "claude code harness" | "autopilot" | "supervisor" => {
+            Some(SettingsRoute::Harness)
+        }
+        // Its AI CLIs sub-page answers to the AI words (an agent's own
+        // names are the Harness page's, which holds its switch).
+        "ai cli" | "ai reviews" | "ai logins" => Some(SettingsRoute::Ai),
+        // Settings ▸ Themes answers to its own names, never to "theme" (the
+        // theme setting lives on Appearance).
+        "showcase" | "theme showcase" | "themes gallery" | "gallery" => Some(SettingsRoute::Themes),
         _ => None,
     }
 }
@@ -2633,6 +2659,112 @@ pub(crate) fn cmd_rain(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
         _ => return "ERR usage: rain [status|on|off|toggle]\n".to_string(),
     };
     match call_main(proxy, |tx| Wake::RainControl { op, reply: tx }) {
+        Ok(Ok(msg)) => format!("OK {msg}\n"),
+        Ok(Err(e)) => format!("ERR {e}\n"),
+        Err(e) => format!("ERR {e}\n"),
+    }
+}
+
+/// The usage line every malformed `theme` form answers with.
+pub(crate) const THEME_USAGE: &str = "usage: theme [status] | theme list | theme preview <name> \
+                                      [ttl=<secs>] | theme revert | theme commit | theme set \
+                                      <value>";
+
+/// One parsed `theme` request: a main-thread op, or `set`, which goes through
+/// the `settings set theme` lane.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ThemeForm {
+    Op(crate::control_theme::ThemeCtlOp),
+    Set(String),
+}
+
+/// Parse the `theme` verb's tail. Pure, so the grammar is provable without an
+/// event loop; `Err` carries the whole usage line. A preview name may hold
+/// spaces (`theme preview GitHub Light`) or be quoted; `ttl=` may sit anywhere
+/// after `preview`, at most once.
+pub(crate) fn parse_theme_form(rest: &str) -> Result<ThemeForm, String> {
+    use crate::control_theme::{THEME_PREVIEW_DEFAULT_TTL, THEME_PREVIEW_MAX_TTL, ThemeCtlOp};
+    let t = rest.trim();
+    let (word, tail) = match t.split_once(char::is_whitespace) {
+        Some((w, r)) => (w, r.trim()),
+        None => (t, ""),
+    };
+    let bare = |op: ThemeCtlOp| {
+        if tail.is_empty() {
+            Ok(ThemeForm::Op(op))
+        } else {
+            Err(format!("{THEME_USAGE} (got {t:?})"))
+        }
+    };
+    match word {
+        "" | "status" => bare(ThemeCtlOp::Status),
+        "list" => bare(ThemeCtlOp::List),
+        "revert" => bare(ThemeCtlOp::Revert),
+        "commit" => bare(ThemeCtlOp::Commit),
+        "set" if !tail.is_empty() => Ok(ThemeForm::Set(tail.to_string())),
+        "preview" => {
+            let tokens = split_quoted_tokens(tail)
+                .ok_or_else(|| format!("{THEME_USAGE} (unterminated quote)"))?;
+            let mut ttl = None;
+            let mut name = Vec::new();
+            for token in tokens {
+                match token.strip_prefix("ttl=") {
+                    Some(secs) => {
+                        let parsed = secs
+                            .parse::<u64>()
+                            .ok()
+                            .filter(|s| (1..=THEME_PREVIEW_MAX_TTL.as_secs()).contains(s))
+                            .ok_or_else(|| {
+                                format!(
+                                    "{THEME_USAGE} (ttl= wants 1..={} seconds, got {secs:?})",
+                                    THEME_PREVIEW_MAX_TTL.as_secs()
+                                )
+                            })?;
+                        if ttl.replace(parsed).is_some() {
+                            return Err(format!("{THEME_USAGE} (ttl= given twice)"));
+                        }
+                    }
+                    None => name.push(token),
+                }
+            }
+            let name = name.join(" ");
+            if name.is_empty() {
+                return Err(format!("{THEME_USAGE} (preview names no theme)"));
+            }
+            Ok(ThemeForm::Op(ThemeCtlOp::Preview {
+                id: name,
+                ttl: ttl.map_or(THEME_PREVIEW_DEFAULT_TTL, std::time::Duration::from_secs),
+            }))
+        }
+        _ => Err(format!("{THEME_USAGE} (got {t:?})")),
+    }
+}
+
+/// `theme …` -> the live theme ([`crate::App::theme_control`]): the bare form
+/// and `status` answer one status line, `list` answers `OK <n>` + rows
+/// (`framing_of` flips it to Lines), `preview`/`revert` drive the transient
+/// lane and answer the status line after, `commit` writes the preview's name
+/// and `set` writes `<value>`, both through the `settings set theme` lane, so
+/// their reply waits for the durable write and names any miss. Main-thread hop
+/// like `rain`; works headless.
+pub(crate) fn cmd_theme(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
+    let op = match parse_theme_form(rest) {
+        Ok(ThemeForm::Op(op)) => op,
+        Ok(ThemeForm::Set(value)) => {
+            return match call_main(proxy, |tx| Wake::SetSettingsField {
+                key: crate::prefs::EDIT_THEME.to_string(),
+                value: Some(value),
+                reply: tx,
+            }) {
+                Ok(completion) => settings_field_wire_reply(completion),
+                Err(e) => format!("ERR {e}\n"),
+            };
+        }
+        Err(usage) => return format!("ERR {usage}\n"),
+    };
+    let list = op == crate::control_theme::ThemeCtlOp::List;
+    match call_main(proxy, |tx| Wake::ThemeControl { op, reply: tx }) {
+        Ok(Ok(body)) if list => format!("OK {}\n{body}\n", body.lines().count()),
         Ok(Ok(msg)) => format!("OK {msg}\n"),
         Ok(Err(e)) => format!("ERR {e}\n"),
         Err(e) => format!("ERR {e}\n"),
@@ -3208,7 +3340,31 @@ fn spawn_cwd_refusal(form: &SpawnForm) -> Option<String> {
     match crate::spawn_folder::folder_fault(cwd)? {
         Fault::Missing => Some(format!("ERR no such folder {shown}\n")),
         Fault::Shut => Some(format!("ERR no access to folder {shown}\n")),
+        // Not this check's to say: a folder that did not answer goes on to the
+        // spawn, which starts the shell in the home folder when it is on a
+        // volume that is not local.
+        Fault::Unresponsive => None,
     }
+}
+
+/// `identity=<name>` is created (or brought up to date) HERE, on the control
+/// thread, before the spawn is posted: `ERR identity <name>: <why>` when it
+/// cannot be, and nothing is posted, so no tab is made. Provisioning primes the
+/// identity's agent files, each written with `F_FULLFSYNC`: 35-46 ms measured
+/// for a new identity (2026-10-15, seven files), which the event loop paid as
+/// one frozen turn per spawn. This thread waits for the reply anyway; the main
+/// thread's half only checks that the identity exists
+/// ([`crate::App::spawn_session_aimed`]). `None` when the request names no
+/// identity: `-` is the human's own config, and an inherited one exists by
+/// construction.
+fn spawn_identity_refusal(form: &SpawnForm) -> Option<String> {
+    let (SpawnForm::Plain { identity, .. } | SpawnForm::Connected { identity, .. }) = form;
+    let Some(IdentitySpec::Named(name)) = identity else {
+        return None;
+    };
+    crate::agent_identity::ensure(name, true)
+        .err()
+        .map(|e| format!("ERR identity {name}: {e}\n"))
 }
 
 /// Where an aimed `spawn` lands (design S3, finding F3): the FRONT window (the
@@ -3315,6 +3471,9 @@ pub(crate) fn cmd_spawn(proxy: &EventLoopProxy<Wake>, rest: &str, session: Optio
     if let Some(refusal) = spawn_cwd_refusal(&form) {
         return refusal;
     }
+    if let Some(refusal) = spawn_identity_refusal(&form) {
+        return refusal;
+    }
     let sent = match form {
         SpawnForm::Plain {
             window,
@@ -3388,12 +3547,15 @@ pub(crate) fn cmd_tab_aimed(
     }
 }
 
+/// Where a wire `tab` verb's `(active_index, tab_count)` or refusal goes.
+pub(crate) type TabCmdReply = std::sync::mpsc::Sender<Result<(usize, usize), String>>;
+
 /// The MAIN-THREAD half of the aimed `spawn`/`tab` verbs (design S3). It sits
 /// beside the verbs' control-thread half rather than in `app_tabs.rs` because
 /// it is verb POLICY — which window a wire request means, and whether a spawn
 /// may take the foreground — not tab mechanics; the mechanics it calls
-/// (`spawn_tab_session`, `apply_tab_cmd_in`) stay window-parameterised in
-/// `app_tabs.rs`, where every other caller of theirs lives.
+/// (`open_tab_off_loop`, `split_focused_pane_in_window`, `apply_tab_cmd_in`)
+/// stay window-parameterised beside every other caller of theirs.
 impl crate::App {
     /// Resolve a [`SpawnAim`] to the window it names. `Front` is `Ok(None)` —
     /// "whatever is frontmost when the spawn runs", the historical contract;
@@ -3437,15 +3599,21 @@ impl crate::App {
             .ok_or_else(|| "no window hosts the target session".to_string())
     }
 
-    /// `spawn` on the main thread: resolve the aim, spawn through the ONE
-    /// tab/split path ([`Self::spawn_tab_session`]), then apply the raise
-    /// verdict the control thread already decided ([`raise_after_spawn`]) —
-    /// only on a SUCCESSFUL spawn (a refused request must not steal the
-    /// foreground), and on the window the tab actually landed in, so an
-    /// explicit `raise=true` on an aimed spawn raises THAT window, not the
-    /// front one. The apprt decides what raising means (Windows: SW_RESTORE +
-    /// SetForegroundWindow); the default is nothing, so no other platform's
-    /// focus behaviour moves here.
+    /// `spawn` on the main thread: resolve the aim, then answer `reply`.
+    ///
+    /// A TAB ([`Self::open_tab_off_loop`]) and a SPLIT
+    /// ([`Self::split_focused_pane_in_window`]) are both spawned off the event
+    /// loop: `reply` waits with the session in flight and is answered when it
+    /// lands, with the sid once it is registered, so the reply still comes
+    /// after the sid is addressable. A split the focused pane cannot take is
+    /// refused at once, and again at landing if the window changed meanwhile.
+    /// Either way the raise verdict the control thread already decided
+    /// ([`raise_after_spawn`]) applies only to a SUCCESSFUL spawn (a refused
+    /// request must not steal the foreground), and on the window the session
+    /// actually landed in, so an explicit `raise=true` on an aimed spawn raises
+    /// THAT window, not the front one. The apprt decides what raising means
+    /// (Windows: SW_RESTORE + SetForegroundWindow); the default is nothing, so
+    /// no other platform's focus behaviour moves here.
     pub(crate) fn spawn_session_aimed(
         &mut self,
         aim: SpawnAim,
@@ -3453,33 +3621,58 @@ impl crate::App {
         split: Option<crate::pane::SplitDir>,
         raise: bool,
         identity: Option<IdentitySpec>,
-    ) -> Result<String, String> {
+        reply: std::sync::mpsc::Sender<Result<String, String>>,
+    ) {
+        let (host, identity) = match self.resolve_spawn(aim, identity) {
+            Ok(resolved) => resolved,
+            Err(why) => {
+                let _ = reply.send(Err(why));
+                return;
+            }
+        };
+        let Some(owner) = host.or(self.frontmost_window) else {
+            let _ = reply.send(Err("no window to host the session".to_string()));
+            return;
+        };
+        let then = crate::tab_spawn::TabSpawnThen::Reply { reply, raise };
+        match split {
+            None => self.open_tab_off_loop(owner, cwd.as_deref(), identity.as_deref(), then),
+            // A refusal is answered through `then`, verbatim (`ERR Split refused:
+            // this pane is 19x11 cells; ...`).
+            Some(dir) => {
+                let _ =
+                    self.split_focused_pane_in_window(owner, dir, cwd, identity.as_deref(), then);
+            }
+        }
+    }
+
+    /// The aimed `spawn`'s window and identity: [`Self::aimed_window`], and the
+    /// identity the newborn wears, checked.
+    fn resolve_spawn(
+        &self,
+        aim: SpawnAim,
+        identity: Option<IdentitySpec>,
+    ) -> Result<(Option<crate::WindowId>, Option<String>), String> {
         let host = self.aimed_window(aim)?;
         // IDENTITY (session identities, 2026-09-17): an aimed spawn inherits
         // the aimed session's identity unless `identity=` says otherwise, so a
         // worker's own `aterm ctl spawn` stays under its login instead of
-        // falling back to the human's. A named identity is created here, on
-        // the verb, and nowhere else — its failure is this spawn's reply
+        // falling back to the human's. A named identity is created on the
+        // verb, and nowhere else: by its control-thread half
+        // ([`spawn_identity_refusal`]), before this was posted. Here it is only
+        // checked, an inherited one too — its failure is this spawn's reply
         // (`ERR identity <name>: <why>`), never a shell without its env.
         let aimed = match aim {
             SpawnAim::Session(local) => self.identity_of_local(local),
             SpawnAim::Front | SpawnAim::Window(_) => None,
         };
+        let inherited = identity.is_none();
         let identity = resolve_spawn_identity(identity, aimed.as_deref());
         if let Some(name) = &identity {
-            crate::agent_identity::ensure(name, true)
+            crate::agent_identity::check_for_spawn(name, inherited)
                 .map_err(|e| format!("identity {name}: {e}"))?;
         }
-        let sid = self.spawn_tab_session(host, cwd, split, identity.as_deref())?;
-        if raise
-            && let Some(window) = host
-                .or(self.frontmost_window)
-                .and_then(|wid| self.windows.get(&wid))
-                .and_then(|ws| ws.os_window.clone())
-        {
-            self.apprt.window_bring_to_front(&window);
-        }
-        Ok(sid)
+        Ok((host, identity))
     }
 
     /// The identity label of the session with local id `local`, from the
@@ -3492,29 +3685,67 @@ impl crate::App {
     }
 
     /// `@<sid> tab …` on the main thread: [`Self::tab_cmd_bracketed`] applied
-    /// to the window hosting `session` instead of the front one.
+    /// to the window hosting `session` instead of the front one, answered on
+    /// `reply` ([`Self::tab_new_answered`] for `tab new`).
     pub(crate) fn tab_cmd_aimed(
         &mut self,
         el: &ActiveEventLoop,
         session: u64,
         action: crate::TabAction,
         by: crate::session_store::ExitActor,
-    ) -> Result<(usize, usize), String> {
-        let wid = self.hosting_window(session)?;
-        self.tab_cmd_bracketed(el, by, |app| app.apply_tab_cmd_in(wid, action))
+        reply: TabCmdReply,
+    ) {
+        let wid = self.hosting_window(session);
+        if matches!(action, crate::TabAction::New) {
+            return self.tab_new_answered(wid, reply);
+        }
+        let state = wid.and_then(|wid| {
+            self.tab_cmd_bracketed(el, by, |app| app.apply_tab_cmd_in(wid, action))
+        });
+        let _ = reply.send(state);
     }
 
     /// The flagless `tab …` on the main thread (the [`Wake::TabCmd`] arm):
     /// [`Self::tab_cmd_bracketed`] applied to the FRONT window, resolved by
     /// [`Self::apply_tab_cmd`] exactly as before so a window-less instance keeps
-    /// its `no window is focused` refusal.
+    /// its `no window is focused` refusal, answered on `reply`
+    /// ([`Self::tab_new_answered`] for `tab new`).
     pub(crate) fn tab_cmd_front(
         &mut self,
         el: &ActiveEventLoop,
         action: crate::TabAction,
         by: crate::session_store::ExitActor,
-    ) -> Result<(usize, usize), String> {
-        self.tab_cmd_bracketed(el, by, |app| app.apply_tab_cmd(action))
+        reply: TabCmdReply,
+    ) {
+        if matches!(action, crate::TabAction::New) {
+            let front = self
+                .frontmost_window
+                .ok_or_else(|| crate::app_tabs::NO_FOCUSED_WINDOW.to_string());
+            return self.tab_new_answered(front, reply);
+        }
+        let _ = reply.send(self.tab_cmd_bracketed(el, by, |app| app.apply_tab_cmd(action)));
+    }
+
+    /// `tab new` on `window`: its reply counts the new tab, so the tab's shell
+    /// spawns off the event loop and `reply` is answered once the tab is in the
+    /// window (`OK <active> <count>`), or with why it never landed. The wire
+    /// bracket's move-license fence runs first, as for every `tab` action; its
+    /// close policy and exit attribution have nothing to govern here.
+    fn tab_new_answered(&mut self, window: Result<crate::WindowId, String>, reply: TabCmdReply) {
+        match window {
+            Ok(wid) => {
+                self.clear_tab_surface_move_license(None);
+                self.open_tab_off_loop(
+                    wid,
+                    None,
+                    None,
+                    crate::tab_spawn::TabSpawnThen::Counts(reply),
+                );
+            }
+            Err(why) => {
+                let _ = reply.send(Err(why));
+            }
+        }
     }
 
     /// THE ONE wire `tab` bracket, shared by the front and aimed forms so the
@@ -3813,9 +4044,64 @@ mod fx_parse_tests {
 mod spawn_parse_tests {
     use super::{
         IdentitySpec, SpawnForm, parse_spawn_args, resolve_spawn_identity, spawn_cwd_refusal,
-        split_quoted_tokens,
+        spawn_identity_refusal, split_quoted_tokens,
     };
     use crate::connections::{ConnectedSpawnKind, ConnectedSpawnPlace};
+
+    /// `spawn identity=<name>` makes its identity on the CONTROL thread, before
+    /// anything is posted to the event loop: a name that cannot be made is this
+    /// spawn's reply, `ERR identity <name>: <why>`, which `cmd_spawn` returns
+    /// with no tab asked for. One that can is made and primed here, in both
+    /// forms, so the loop's half only checks it
+    /// ([`crate::agent_identity::check_for_spawn`]) — and that check never
+    /// makes one: a name nobody made is refused there. NEGATIVE CONTROLS: no
+    /// `identity=`, and `identity=-`, make nothing.
+    #[test]
+    fn a_named_identity_is_made_before_the_spawn_is_posted_and_its_failure_is_the_reply() {
+        let scratch = aterm_tempfile::Builder::new()
+            .prefix("aterm-spawn-identity")
+            .tempdir()
+            .expect("scratch dir");
+        let refusal = |rest: &str| spawn_identity_refusal(&parse_spawn_args(rest).expect("parses"));
+        crate::test_env::scoped("ATERM_STATE_HOME", scratch.path().join("state"), || {
+            let identities = aterm_types::dirs::identities_dir().expect("a state root");
+            for rest in [
+                "",
+                "identity=-",
+                "cwd=/tmp",
+                "connected=controller place=tab of=s-abc",
+            ] {
+                assert_eq!(refusal(rest), None, "{rest:?}");
+            }
+            assert!(!identities.exists(), "no identity named, none made");
+            let unmade = crate::agent_identity::check_for_spawn("worker", false)
+                .expect_err("the loop's check refuses an identity nobody made");
+            assert_eq!(unmade.kind(), std::io::ErrorKind::NotFound);
+            assert!(!identities.exists(), "and makes none");
+
+            assert_eq!(refusal("identity=Worker"), None);
+            assert!(
+                identities.join("worker/.claude/CLAUDE.md").is_file(),
+                "primed"
+            );
+            assert_eq!(
+                crate::agent_identity::check_for_spawn("worker", false).expect("made"),
+                identities.join("worker")
+            );
+            assert_eq!(
+                refusal("connected=controlled place=tab of=s-abc identity=reviewer"),
+                None
+            );
+            assert!(identities.join("reviewer/.codex/AGENTS.md").is_file());
+
+            // A name that cannot be made: the identities root is a file.
+            std::fs::remove_dir_all(&identities).expect("clear the root");
+            std::fs::write(&identities, b"").expect("a file in the root's place");
+            let refused = refusal("identity=worker").expect("refused on the control thread");
+            assert!(refused.starts_with("ERR identity worker: "), "{refused:?}");
+            assert!(refused.ends_with('\n') && refused.lines().count() == 1);
+        });
+    }
 
     /// AUDIT #7 FINDING 48 — `spawn cwd=<dir>` naming no folder is refused by
     /// name, in both forms, before anything is spawned: the agent that asked
@@ -4775,9 +5061,15 @@ mod video_parse_tests {
         for (alias, route) in [
             ("cursor", SettingsRoute::CursorMotion),
             ("cursor and motion", SettingsRoute::CursorMotion),
-            ("kitty", SettingsRoute::CursorKitty),
-            ("cursor pet", SettingsRoute::CursorKitty),
-            ("cursor kitty", SettingsRoute::CursorKitty),
+            ("kitty", SettingsRoute::CursorStyles),
+            ("cursor pet", SettingsRoute::CursorStyles),
+            ("cursor kitty", SettingsRoute::CursorStyles),
+            ("/cursor-kitty", SettingsRoute::CursorStyles),
+            ("cursor styles", SettingsRoute::CursorStyles),
+            ("cursor style", SettingsRoute::CursorStyles),
+            ("trail", SettingsRoute::CursorStyles),
+            ("sound", SettingsRoute::Sound),
+            ("music effects", SettingsRoute::Sound),
             ("typography", SettingsRoute::TextFonts),
             ("input", SettingsRoute::KeyboardInput),
             ("update", SettingsRoute::SoftwareUpdate),
@@ -4787,6 +5079,22 @@ mod video_parse_tests {
             ("history", SettingsRoute::Messages),
             ("activity log", SettingsRoute::Messages),
             ("messages", SettingsRoute::Messages),
+            ("harness", SettingsRoute::Harness),
+            ("/harness", SettingsRoute::Harness),
+            ("claude", SettingsRoute::Harness),
+            ("Claude Code", SettingsRoute::Harness),
+            ("claude-code", SettingsRoute::Harness),
+            ("codex", SettingsRoute::Harness),
+            ("Codex", SettingsRoute::Harness),
+            ("agy", SettingsRoute::Harness),
+            ("Antigravity CLI", SettingsRoute::Harness),
+            ("coding agent harness", SettingsRoute::Harness),
+            ("claude code harness", SettingsRoute::Harness),
+            ("autopilot", SettingsRoute::Harness),
+            ("supervisor", SettingsRoute::Harness),
+            ("themes", SettingsRoute::Themes),
+            ("/themes", SettingsRoute::Themes),
+            ("theme showcase", SettingsRoute::Themes),
         ] {
             assert_eq!(parse_settings_section_route(alias), Some(route), "{alias}");
         }
@@ -4796,12 +5104,19 @@ mod video_parse_tests {
             "bottom hud",
             "kitty log",
             "diagnostics",
+            // No agent: the generic reader's names route nowhere, and nor
+            // do an agent's the harness reads but does not supervise.
+            "generic",
+            "the program",
+            "muse",
+            "Muse Code",
         ] {
             assert_eq!(parse_settings_section_route(removed), None, "{removed}");
         }
         let usage = settings_section_usage();
         assert!(usage.contains("cursor & motion"));
         assert!(usage.contains("text & fonts"));
+        assert!(usage.contains("harness"));
         assert!(!usage.contains("performance"));
         assert!(!usage.contains("hud"));
     }
@@ -6088,29 +6403,20 @@ mod video_parse_tests {
 #[cfg(test)]
 mod call_main_within_tests {
     use std::sync::mpsc;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use super::recv_within;
 
-    /// The whole reason `call_main_within` exists: a main thread that does not
-    /// answer within the deadline degrades PROMPTLY (any `Err` drives the
-    /// roster's `window=-` dashes), instead of parking the worker for the 30 s
-    /// `call_main` default. The sender is kept live so this is a genuine
-    /// TIMEOUT, not a disconnect.
+    /// A main thread that does not answer within the deadline is the degrade
+    /// signal (any `Err` drives the roster's `window=-` dashes), named as a
+    /// timeout. The sender is kept live so this is a genuine TIMEOUT, not a
+    /// disconnect; the deadline is `recv_timeout`'s own argument.
     #[test]
     fn recv_within_degrades_on_timeout_at_the_deadline() {
         let (_tx, rx) = mpsc::channel::<u8>();
-        let start = Instant::now();
-        let r = recv_within(&rx, Duration::from_millis(20));
         assert_eq!(
-            r,
+            recv_within(&rx, Duration::from_millis(20)),
             Err("main thread did not answer within the placement deadline")
-        );
-        // THE BUDGET IS THE SUBJECT: the 20 ms deadline against the 30 s
-        // `call_main` default. Half that default is the line between them.
-        assert!(
-            start.elapsed() < super::MAIN_THREAD_REPLY_TIMEOUT / 2,
-            "returned at the deadline, not at the default"
         );
     }
 
@@ -6144,6 +6450,7 @@ mod call_main_within_tests {
             Breadcrumb::NewEvents,
             Breadcrumb::ResizeSettle,
             Breadcrumb::UpdateHandoff,
+            Breadcrumb::AboutToWaitWork,
         ] {
             assert_eq!(super::dialog_refusal_for(other), None, "{other:?}");
         }
@@ -6191,10 +6498,10 @@ mod call_main_within_tests {
         let parked = hops.post(10);
         let request = super::take_hop(crate::Wake::Hop {
             mark: parked.mark(),
-            wake: Box::new(crate::Wake::TitleSummaryReady),
+            wake: Box::new(crate::Wake::WarmupResult),
         });
         assert!(
-            matches!(request, crate::Wake::TitleSummaryReady),
+            matches!(request, crate::Wake::WarmupResult),
             "the main thread handles the request itself: {request:?}"
         );
         assert_eq!(

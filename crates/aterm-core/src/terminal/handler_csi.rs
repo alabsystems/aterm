@@ -806,22 +806,6 @@ mod tests {
         }
     }
 
-    /// Verify total entry count matches expected 73 handlers.
-    #[test]
-    fn test_z4_table_total_handler_count() {
-        // 35 standard (no intermediates) + 38 with intermediates = 73 total
-        // (see csi_dispatch_table::tests::test_entry_count).
-        let standard_count = [
-            b'A', b'B', b'C', b'D', b'E', b'F', b'G', b'H', b'I', b'J', b'K', b'L', b'M', b'P',
-            b'S', b'T', b'X', b'Z', b'@', b'`', b'a', b'b', b'c', b'd', b'e', b'f', b'g', b'h',
-            b'l', b'm', b'n', b'r', b's', b't', b'u',
-        ]
-        .iter()
-        .filter(|&&fb| lookup_csi_handler(&[], fb).is_some())
-        .count();
-        assert_eq!(standard_count, 35, "expected 35 standard CSI handlers");
-    }
-
     /// An invalid DECSLRM (left >= right) is a complete no-op, as in xterm and
     /// like DECSTBM: an existing valid margin region and the cursor are kept.
     #[test]

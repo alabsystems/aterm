@@ -12,9 +12,9 @@
 //! assert only that each call returns (Ok/Err/None/empty).
 //!
 //! These lived in `tests/fuzz_decode.rs` behind `#![cfg(any(fuzzing, feature =
-//! "fuzz"))]`, so the workspace gate — which never enables `fuzz` — compiled an
+//! "fuzz"))]`, so a workspace test run — which never enables `fuzz` — compiled an
 //! EMPTY binary and ran none of them. As unit tests they need no feature (the
-//! decoders are reachable crate-internally) and run on every push, at 10k
+//! decoders are reachable crate-internally) and run in every test run, at 10k
 //! deterministic inputs per loop. The `fuzz` feature restores the pre-move
 //! depth (90k/90k/90k/40k, see [`iters`]); the same seeds make the default run
 //! exactly the first 10k inputs of each deep stream. The deep run:
@@ -32,7 +32,7 @@
 use crate::lz4;
 use crate::{Line, deserialize_lines};
 
-/// Inputs per fuzz loop: 10k by default (every push runs these), the pre-move
+/// Inputs per fuzz loop: 10k by default (every test run runs these), the pre-move
 /// `deep` count under the `fuzz` feature.
 const fn iters(deep: u32) -> u32 {
     if cfg!(feature = "fuzz") { deep } else { 10_000 }

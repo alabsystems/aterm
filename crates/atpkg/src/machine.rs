@@ -500,8 +500,8 @@ pub fn forget_applied(layout: &crate::store::Layout) {
 }
 
 /// Record `cfg` as the applied table: temp + rename, only when the bytes differ, and only
-/// where the prefix already exists (a pass creates it; a stamp never does). Best-effort —
-/// a stamp that did not land means the next pass applies once more.
+/// where the prefix already exists (a pass or the apply queue creates it; a stamp never
+/// does). Best-effort — a stamp that did not land means the next pass applies once more.
 pub fn record_applied(layout: &crate::store::Layout, cfg: &crate::config::MachineConfig) {
     let path = applied_stamp_path(layout);
     let text = applied_fingerprint(cfg);
@@ -561,7 +561,7 @@ impl LaunchApply {
 /// slot in `machine-apply.stamp` ([`aterm_update_core::pkg_check::claim`]). A terminal
 /// session and a window opening both claim it here, so their `defaults` writes run once a
 /// day between them, not at every tab and every window; an edit to `[machine]` rides the
-/// next pass ([`changed_since_applied`]) and Settings' Apply now runs at once, unclaimed.
+/// next pass ([`changed_since_applied`]) and Settings' Apply Now runs at once, unclaimed.
 ///
 /// NOT UNDER A PRIVATE STATE ROOT (ruling 409, 2026-09-29): a development build given its
 /// own `ATERM_STATE_HOME` (AGENTS.md's recipe for a real Claude Code session keeps the

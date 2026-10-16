@@ -21,8 +21,8 @@ pub(crate) fn sync_all(file: &File) -> std::io::Result<()> {
 /// the same point and in the same order, so a test sees the same files, renames and
 /// errors. What it drops is the drive-cache barrier. No test can observe that barrier,
 /// because it only orders the disk against a power loss. It also stalls the whole
-/// VOLUME while it runs, so every test binary the gate runs beside this one waits
-/// behind it for its own temp-dir metadata. Measured 2026-10-06: one `aterm-update
+/// VOLUME while it runs, so every test binary running beside this one waits
+/// behind it for its own temp-dir metadata. Measured: one `aterm-update
 /// --lib` run made 4,492 `F_FULLFSYNC`s, 3,681 of them through this crate (the Linux
 /// lane's records and directories, `write_durable`'s ledgers, the swap's parents) and
 /// the other 811 the boot sentinel's, which `aterm-update-core` writes.

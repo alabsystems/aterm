@@ -12,9 +12,9 @@
 //!   `/etc/ssl/certs` and friends) through `rustls`'s webpki on Linux/BSD.
 //!   Anywhere else construction FAILS rather than falling back to a bundled
 //!   root set. The default, and what every endpoint without a CA file gets.
-//! * [`Trust::Roots`] — exactly the certificates in an operator-configured PEM
+//! * [`Trust::Roots`] — exactly the certificates in a caller-supplied PEM
 //!   bundle, and NOTHING else. An override, not an addition: the platform
-//!   roots are not consulted, so a bundle pins the provider to its own issuer.
+//!   roots are not consulted, so a bundle pins the endpoint to its own issuer.
 
 use std::sync::Arc;
 
@@ -27,11 +27,19 @@ pub enum Trust {
     /// Verify against the operating system's trust store.
     PlatformVerifier,
     /// Verify against exactly these DER certificates, REPLACING the platform
-    /// roots (an operator's explicit per-endpoint override).
+    /// roots (a caller's explicit per-endpoint override).
     Roots(Vec<Vec<u8>>),
 }
 
-/// Install the `ring` crypto provider as the process default, once.
+/// THE crypto provider: the one place this crate names a rustls
+/// `CryptoProvider` implementation. Today it is rustls's `ring` provider, and
+/// ring is the bridge half of the KEEP pair (docs/AUDIT-third-party-2026-10-15.md):
+/// replacing it is a change to this function, not to its callers.
+pub(crate) fn provider() -> rustls::crypto::CryptoProvider {
+    rustls::crypto::ring::default_provider()
+}
+
+/// Install `provider()` as the process default, once.
 ///
 /// Idempotent, and it tolerates another component having already installed one
 /// — `aterm-net` installs the same provider for the L3 drive, and whichever
@@ -39,7 +47,7 @@ pub enum Trust {
 pub fn init_crypto() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = provider().install_default();
     });
 }
 
@@ -53,7 +61,7 @@ pub fn client_config(trust: &Trust) -> Result<Arc<ClientConfig>, String> {
     init_crypto();
     let provider = rustls::crypto::CryptoProvider::get_default()
         .cloned()
-        .unwrap_or_else(|| Arc::new(rustls::crypto::ring::default_provider()));
+        .unwrap_or_else(|| Arc::new(provider()));
     let config = match trust {
         Trust::PlatformVerifier => {
             // `PlatformVerifier::new` is the ONLY constructor reachable from
@@ -94,11 +102,6 @@ pub fn client_config(trust: &Trust) -> Result<Arc<ClientConfig>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_platform_verifier_is_the_default_trust_model() {
-        client_config(&Trust::PlatformVerifier).expect("platform verifier builds");
-    }
 
     #[test]
     fn init_crypto_is_idempotent() {

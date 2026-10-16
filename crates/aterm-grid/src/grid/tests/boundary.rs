@@ -54,7 +54,6 @@ fn grid_insert_chars_zero_count() {
     grid.set_cursor(0, 2);
     grid.insert_chars(0);
 
-    // Should be a no-op
     assert_eq!(grid.cursor_col(), 2);
     grid.assert_invariants();
 }
@@ -100,7 +99,6 @@ fn grid_scroll_down_zero() {
 #[test]
 fn grid_insert_lines_exceeding_available() {
     let mut grid = Grid::new(5, 10);
-    // Write markers on rows 0-1 to verify they are preserved
     grid.set_cursor(0, 0);
     grid.write_char('A');
     grid.set_cursor(1, 0);
@@ -112,7 +110,6 @@ fn grid_insert_lines_exceeding_available() {
     grid.insert_lines(100);
     grid.assert_invariants();
 
-    // Rows above cursor (0, 1) must be preserved
     assert_eq!(
         grid.cell(0, 0).unwrap().char(),
         'A',
@@ -144,7 +141,6 @@ fn grid_insert_lines_exceeding_available() {
 #[test]
 fn grid_delete_lines_exceeding_available() {
     let mut grid = Grid::new(5, 10);
-    // Write markers to verify behavior
     grid.set_cursor(0, 0);
     grid.write_char('A');
     grid.set_cursor(1, 0);
@@ -159,7 +155,6 @@ fn grid_delete_lines_exceeding_available() {
     grid.delete_lines(100);
     grid.assert_invariants();
 
-    // Rows above cursor (0, 1) must be preserved
     assert_eq!(
         grid.cell(0, 0).unwrap().char(),
         'A',
@@ -228,7 +223,6 @@ fn grid_cursor_at_max_position_then_resize_down() {
     assert_eq!(grid.cursor_col(), 79);
 
     grid.resize(10, 40);
-    // Cursor should be clamped
     assert!(grid.cursor_row() < 10, "cursor row clamped after resize");
     assert!(grid.cursor_col() < 40, "cursor col clamped after resize");
     grid.assert_invariants();
@@ -237,10 +231,10 @@ fn grid_cursor_at_max_position_then_resize_down() {
 // Write consistency — ascii_blast vs char_wrap
 
 /// write_ascii_blast and write_char_wrap leave the cursor at the same position
-/// after filling a line (both wrap immediately in the grid layer).
+/// (both defer the wrap at the last column).
 #[test]
 fn write_ascii_blast_and_char_wrap_cursor_consistency() {
-    // Test 1: Fill exactly one full line via both paths
+    // Exactly one full line.
     let mut grid_blast = Grid::new(5, 10);
     let mut grid_char = Grid::new(5, 10);
 
@@ -260,7 +254,7 @@ fn write_ascii_blast_and_char_wrap_cursor_consistency() {
         "cursor col after filling one line"
     );
 
-    // Test 2: Fill partial line
+    // A partial line.
     let mut grid_blast = Grid::new(5, 10);
     let mut grid_char = Grid::new(5, 10);
 
@@ -280,7 +274,7 @@ fn write_ascii_blast_and_char_wrap_cursor_consistency() {
         "cursor col after partial line"
     );
 
-    // Test 3: Fill exactly two full lines (wrapping across line boundary)
+    // Exactly two full lines.
     let mut grid_blast = Grid::new(5, 10);
     let mut grid_char = Grid::new(5, 10);
 
@@ -300,7 +294,7 @@ fn write_ascii_blast_and_char_wrap_cursor_consistency() {
         "cursor col after filling two lines"
     );
 
-    // Test 4: Fill line plus one char (wrap + one char on new line)
+    // A full line plus one char.
     let mut grid_blast = Grid::new(5, 10);
     let mut grid_char = Grid::new(5, 10);
 

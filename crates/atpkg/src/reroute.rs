@@ -329,15 +329,20 @@ pub enum Policy {
         source_verb: Option<SourceVerb>,
     },
     /// Announce `branded` and every `lane` with the caller's arguments, then run upstream.
-    /// An empty `lanes` means "one spelling, equivalence unproven" (`tlc`).
+    /// An empty `lanes` means "one spelling, equivalence unproven" (`tlc`). `program` is
+    /// the program whose install lays `branded`, as for a direct row.
     Signpost {
         branded: &'static str,
+        program: &'static str,
         lanes: &'static [Lane],
     },
     /// Announce `branded`, then run upstream: the upstream tool is `branded`'s
     /// differential oracle. Under `[reroute] strict = true`, refuse, naming the upstream
-    /// copy's own path (a path never meets a stub).
-    Oracle { branded: &'static str },
+    /// copy's own path (a path never meets a stub). `program` as for a direct row.
+    Oracle {
+        branded: &'static str,
+        program: &'static str,
+    },
 }
 
 /// One upstream name and what a session does with it.
@@ -421,6 +426,7 @@ pub const TABLE: &[Row] = &[
         upstream: "tlc",
         policy: Policy::Signpost {
             branded: "ty",
+            program: "ty",
             lanes: &[],
         },
     },
@@ -428,6 +434,7 @@ pub const TABLE: &[Row] = &[
         upstream: "rustc",
         policy: Policy::Signpost {
             branded: "trustc",
+            program: "trust",
             lanes: RUSTC_LANES,
         },
     },
@@ -435,12 +442,16 @@ pub const TABLE: &[Row] = &[
         upstream: "cargo",
         policy: Policy::Signpost {
             branded: "targo",
+            program: EXPLICIT_LANE_PROGRAM,
             lanes: CARGO_LANES,
         },
     },
     Row {
         upstream: "z3",
-        policy: Policy::Oracle { branded: "ay" },
+        policy: Policy::Oracle {
+            branded: "ay",
+            program: "ay",
+        },
     },
 ];
 
@@ -458,6 +469,18 @@ pub fn branded_of(row: &Row) -> &'static str {
         Policy::Direct { branded, .. }
         | Policy::Signpost { branded, .. }
         | Policy::Oracle { branded, .. } => branded,
+    }
+}
+
+/// The program whose install lays a row's branded name ([`branded_of`]) — `trust` for
+/// `targo`, `trustc`, `tippy`, `trustfmt` and `trustdoc`. What a pending stub for the
+/// branded name reports on and waits for ([`crate::stub::program_of`]).
+#[must_use]
+pub fn program_of(row: &Row) -> &'static str {
+    match row.policy {
+        Policy::Direct { program, .. }
+        | Policy::Signpost { program, .. }
+        | Policy::Oracle { program, .. } => program,
     }
 }
 
@@ -961,7 +984,7 @@ fn fix_clause(fix: Option<&str>) -> String {
 /// runs (or its shim's own line will speak), else the one command that fixes it.
 fn oracle_fix(install: &Install, branded: &str) -> Option<String> {
     match install {
-        Install::Runs(_) | Install::Shim(_) => None,
+        Install::Runs(_) | Install::Shim(_) | Install::Pending(_) => None,
         Install::ShimLost => Some("`aterm pkg repair` restores its shim".to_string()),
         Install::Absent => Some(format!("`aterm pkg install {branded}` installs it")),
     }
@@ -1001,6 +1024,15 @@ impl Unrunnable {
 pub fn fallback_not_installed_message(upstream: &str, branded: &str, program: &str) -> String {
     format!(
         "aterm: running upstream '{upstream}' — {branded} is not installed (`aterm pkg install {program}` installs it)."
+    )
+}
+
+/// A DIRECT row whose branded tool's program is still to come (a pending stub stands at its
+/// name, [`Install::Pending`]), upstream running instead of a wait for it.
+#[must_use]
+pub fn fallback_pending_message(upstream: &str, branded: &str, program: &str) -> String {
+    format!(
+        "aterm: running upstream '{upstream}' — {branded} is not installed yet (it comes with {program})."
     )
 }
 
@@ -1184,7 +1216,9 @@ pub fn policy_summary(row: &Row, upstream_found: bool, strict: bool) -> String {
                 }
             }
         }
-        Policy::Signpost { branded, lanes: [] } => format!(
+        Policy::Signpost {
+            branded, lanes: [], ..
+        } => format!(
             "announced, naming '{branded} <args>' (drop-in equivalence is not yet proven){then_run}{escape}"
         ),
         Policy::Signpost { lanes, .. } => {
@@ -1217,13 +1251,13 @@ pub fn policy_summary(row: &Row, upstream_found: bool, strict: bool) -> String {
             s.push_str(&escape);
             s
         }
-        Policy::Oracle { branded } if strict && upstream_found => format!(
+        Policy::Oracle { branded, .. } if strict && upstream_found => format!(
             "refused ('{branded}' is measured against it); its own path reaches the real {upstream}{escape}"
         ),
-        Policy::Oracle { branded } if strict => format!(
+        Policy::Oracle { branded, .. } if strict => format!(
             "refused ('{branded}' is measured against it); no upstream '{upstream}' is on PATH"
         ),
-        Policy::Oracle { branded } => format!(
+        Policy::Oracle { branded, .. } => format!(
             "announced, naming '{branded}' (it is measured against {upstream}){then_run}{escape}"
         ),
     }
@@ -1910,7 +1944,7 @@ pub(crate) fn lay_with(
     // stub lands in it.
     let marker = dir.join(DIR_MARKER_FILE);
     if marker_needs_lay(std::fs::read(&marker).ok().as_deref()) {
-        crate::lay::write_in_process(&crate::lay::Executable::new(&marker, marker_body()))?;
+        crate::lay::write_regenerable(&crate::lay::Executable::new(&marker, marker_body()))?;
     }
     // Every stub whose bytes differ.
     let mut files = Vec::new();
@@ -1930,7 +1964,8 @@ pub(crate) fn lay_with(
         }
         files.push(crate::lay::Executable::new(&path, body.as_bytes()));
     }
-    files.iter().try_for_each(crate::lay::write_in_process)?;
+    // Regenerable: every seed, pass and session spawn lays again what is missing or differs.
+    files.iter().try_for_each(crate::lay::write_regenerable)?;
     if let Ok(entries) = std::fs::read_dir(&dir) {
         for entry in entries.flatten() {
             let path = entry.path();
@@ -2180,9 +2215,14 @@ fn names_what_runs(row: &Row) -> bool {
 enum Install {
     /// Its shim forwards to a build: the managed copy.
     Runs(Managed),
-    /// `bin/<branded>` stands but forwards to no build — a yanked build's tombstone, a
-    /// pending stub. It runs, and its own line says what is true of it.
+    /// `bin/<branded>` stands but forwards to no build — a yanked build's tombstone. It
+    /// runs, and its own line says what is true of it.
     Shim(PathBuf),
+    /// `bin/<branded>` is a PENDING STUB ([`crate::stub`]): its program is wanted and not
+    /// installed yet. Run, it says the install's state and waits for the program while a
+    /// pass installs it — so it is what runs only where nothing else can
+    /// ([`fallback_pending_message`]).
+    Pending(PathBuf),
     /// Its program's live build holds it, but its shim is gone
     /// ([`crate::cli::live_without_shim_of`]).
     ShimLost,
@@ -2221,7 +2261,10 @@ fn installed(layout: &Layout, branded: &str, program: &str) -> Install {
         return Install::Absent;
     };
     let shim = layout.shim(&name);
-    if crate::stub::is_pending_stub(&shim) || crate::cli::is_tombstone_shim(layout, branded) {
+    if crate::stub::is_pending_stub(&shim) {
+        return Install::Pending(shim);
+    }
+    if crate::cli::is_tombstone_shim(layout, branded) {
         return Install::Shim(shim);
     }
     if crate::cli::live_without_shim_of(layout, program, branded).is_some() {
@@ -2251,8 +2294,8 @@ enum Plan {
     /// `cargo`/`rustc` that is not Trust inside a Trust source checkout
     /// ([`trust_checkout_refusal`]).
     Refuse { say: String },
-    /// Exec a branded tool's `shim` that forwards to no build ([`Install::Shim`]),
-    /// saying nothing: the shim's own line speaks.
+    /// Exec a branded tool's `shim` that forwards to no build ([`Install::Shim`],
+    /// [`Install::Pending`]), saying nothing: the shim's own line speaks.
     Shim { shim: PathBuf, args: Vec<String> },
     /// Say `say` and exit 127: the tool to run is not there.
     Missing { say: String },
@@ -2272,19 +2315,19 @@ fn plan(row: &Row, args: &[String], machine: &Machine<'_>) -> Plan {
             say: not_on_path_message(upstream),
         },
     };
-    // The managed `branded` — or, where it cannot run, why ([`Unrunnable`]).
-    let run_branded = |branded: &str,
-                       program: &str,
+    // The managed branded tool where it stands (`install`) — or, where it cannot run, why
+    // ([`Unrunnable`]).
+    let run_branded = |install: Install,
                        args: Vec<String>,
                        say: &dyn Fn() -> String|
      -> Result<Plan, Unrunnable> {
-        match (machine.branded)(branded, program) {
+        match install {
             Install::Runs(copy) => Ok(Plan::Branded {
                 say: say(),
                 copy,
                 args,
             }),
-            Install::Shim(shim) => Ok(Plan::Shim { shim, args }),
+            Install::Shim(shim) | Install::Pending(shim) => Ok(Plan::Shim { shim, args }),
             Install::ShimLost => Err(Unrunnable::ShimLost),
             Install::Absent => Err(Unrunnable::Absent),
         }
@@ -2359,26 +2402,45 @@ fn plan(row: &Row, args: &[String], machine: &Machine<'_>) -> Plan {
             branded,
             program,
             source_verb,
-        } => run_branded(branded, program, direct_args(source_verb, shown), &|| {
-            direct_announcement(upstream, branded, (machine.upstream)().is_some())
-        })
-        .unwrap_or_else(|why| {
-            let refusal = || Plan::Missing {
-                say: why.refusal(upstream, branded, program),
-            };
-            if (machine.strict)() {
-                return refusal();
-            }
-            match (machine.upstream)() {
-                Some(target) => Plan::Upstream {
-                    say: (machine.announce)().then(|| why.fallback(upstream, branded, program)),
+        } => {
+            let install = (machine.branded)(branded, program);
+            // A PENDING STUB HOLDS NO CALL HOSTAGE (2026-10-15): the branded tool's program
+            // is still to come, so the upstream copy the caller named runs NOW, after one
+            // line saying so — never a wait of a minute or more for `trust` behind an
+            // editor's `rustfmt`. The stub runs (and waits) only where nothing else can:
+            // no upstream copy, or `[reroute] strict`.
+            if matches!(install, Install::Pending(_))
+                && !(machine.strict)()
+                && let Some(target) = (machine.upstream)()
+            {
+                return Plan::Upstream {
+                    say: (machine.announce)()
+                        .then(|| fallback_pending_message(upstream, branded, program)),
                     target,
                     args: args.to_vec(),
-                },
-                None => refusal(),
+                };
             }
-        }),
-        Policy::Signpost { branded, lanes } => {
+            run_branded(install, direct_args(source_verb, shown), &|| {
+                direct_announcement(upstream, branded, (machine.upstream)().is_some())
+            })
+            .unwrap_or_else(|why| {
+                let refusal = || Plan::Missing {
+                    say: why.refusal(upstream, branded, program),
+                };
+                if (machine.strict)() {
+                    return refusal();
+                }
+                match (machine.upstream)() {
+                    Some(target) => Plan::Upstream {
+                        say: (machine.announce)().then(|| why.fallback(upstream, branded, program)),
+                        target,
+                        args: args.to_vec(),
+                    },
+                    None => refusal(),
+                }
+            })
+        }
+        Policy::Signpost { branded, lanes, .. } => {
             // `+trust…` keeps the lane question, and the first line names that toolchain
             // as what runs.
             if upstream == "cargo"
@@ -2388,9 +2450,12 @@ fn plan(row: &Row, args: &[String], machine: &Machine<'_>) -> Plan {
             {
                 // Upstream cargo has no `trust` subcommand and no `--unverified` flag, so
                 // with targo missing there is nothing to fall back to.
-                return run_branded(branded, EXPLICIT_LANE_PROGRAM, shown.to_vec(), &|| {
-                    explicit_lane_note(upstream, branded)
-                })
+                // A pending `targo` is the stub to run: it waits for `trust` and then runs.
+                return run_branded(
+                    (machine.branded)(branded, EXPLICIT_LANE_PROGRAM),
+                    shown.to_vec(),
+                    &|| explicit_lane_note(upstream, branded),
+                )
                 .unwrap_or_else(|why| Plan::Missing {
                     say: why.refusal(upstream, branded, EXPLICIT_LANE_PROGRAM),
                 });
@@ -2412,7 +2477,7 @@ fn plan(row: &Row, args: &[String], machine: &Machine<'_>) -> Plan {
             }
         }
         // Announce, then run upstream (2026-09-29); strict refuses, naming the path.
-        Policy::Oracle { branded } => {
+        Policy::Oracle { branded, .. } => {
             if (machine.strict)() {
                 return Plan::Refuse {
                     say: oracle_message(upstream, (machine.upstream)().as_deref()),
@@ -2680,11 +2745,15 @@ fn storeless_plan(row: &Row, args: &[String], machine: &Machine<'_>) -> Plan {
 /// judged ([`plan`]). Never with [`PASSTHROUGH_ENV`]: that is the escape, and an allowed
 /// Trust cargo handing it to its tree let a stock `rustc +1.97.1` beneath it run inside a
 /// Trust checkout unjudged (2026-10-01).
+#[expect(
+    clippy::disallowed_types,
+    reason = "a pass-through by exec: its caller's descriptors are the program's"
+)]
 fn exec_upstream(target: &Path, args: &[String]) -> ExitCode {
-    // Raw: TRANSPARENT, so the caller's descriptors are the program's (B27's
-    // allow-list). Its Windows console is decided here (`Console::Quiet`, B28).
+    // Raw: TRANSPARENT, so the caller's descriptors are the program's. Its Windows
+    // console is decided here.
     let mut command = std::process::Command::new(target);
-    aterm_uds::spawn::set_flags(&mut command, aterm_uds::spawn::Console::Quiet, 0);
+    aterm_uds::spawn::set_flags(&mut command, 0);
     command.args(args).env(ANNOUNCED_ENV, "1");
     let err = crate::platform::exec_or_run(&mut command);
     eprintln!("aterm: failed to exec {}: {err}", target.display());
@@ -2716,12 +2785,16 @@ fn direct_args(source_verb: Option<SourceVerb>, args: &[String]) -> Vec<String> 
 
 /// A branded tool's managed `copy` ([`managed`]), exec'd with the managed `bin/` appended
 /// for its children and its shim's environment exported — `atpkg run`'s discipline.
+#[expect(
+    clippy::disallowed_types,
+    reason = "a pass-through by exec: its caller's descriptors are the program's"
+)]
 fn exec_branded(layout: &Layout, copy: &Managed, args: &[String]) -> ExitCode {
     let child_path =
         crate::store::append_bin_to_path(std::env::var_os("PATH").as_deref(), &layout.bin_dir());
     // Raw and console-decided, as `exec_upstream`.
     let mut command = std::process::Command::new(&copy.target);
-    aterm_uds::spawn::set_flags(&mut command, aterm_uds::spawn::Console::Quiet, 0);
+    aterm_uds::spawn::set_flags(&mut command, 0);
     command.args(args).env("PATH", child_path);
     for (name, value) in copy.env.entries() {
         command.env(name, value);

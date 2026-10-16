@@ -52,7 +52,7 @@ aterm-uds = { workspace = true }
 atpkg = { workspace = true }
 # Manifest emission, the dist/cut-state.toml resume journal, and the release.conf
 # key=value surface are all serde-derived TOML (derive comes with the workspace dep).
-serde = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 # First-party JSON (crates/aterm-json): the serde Deserializer/Serializer plus the
 # untyped `Value` and `json!`. Replaces `serde_json` and the `zmij` float formatter
 # behind it.
@@ -64,7 +64,7 @@ aterm-digest = { workspace = true }
 # Release-channel signatures are verified in the cutter itself.  The signer is
 # deliberately external/owner-only, but trusting its exit status would not bind
 # the bytes uploaded to the public key compiled into clients.
-ring = { version = "0.17.14", default-features = false }
+ring = { workspace = true }
 # Standard padded Base64 — first-party and zero-dependency. `decode_strict` is
 # the entry point every trust path uses: canonical padding REQUIRED and no
 # trailing bits, so a pinned key has exactly one spelling.
@@ -75,16 +75,8 @@ aterm-codec = { workspace = true }
 # This edge unifies ring's default features (RNG) into THIS binary's graph —
 # deliberate: the cutter is owner-only; shipped clients keep their own graphs.
 atpkg-keys = { workspace = true }
-# The merge gate's library, for the three things `ship release` must judge exactly as
-# the gate does: the ONE clean-tree judge (`identity::dirty_against`, the Trust lane's
-# rule), the build-env scrub (`differential::build_env_records`) and this machine's
-# gate lock (`snapshot::hold_machine`). Dependency-free by charter.
-aterm-verify = { workspace = true }
 
 [dev-dependencies]
-# The one trustd probe and skip line, and the bounded child runner the tests' own
-# codesign spawns use (`aterm_uds::deadline`).
-aterm-uds = { workspace = true, features = ["test-support"] }
 # Tier-1 binds the real release-floor resolver and late guard to their derived
 # lifecycle model; production release binaries retain no spec dependency.
 aterm-spec = { workspace = true }
@@ -95,6 +87,9 @@ aterm-tempfile = { workspace = true }
 # The wire `ship release` asks the owner through (`notice ask`): its tests hold every
 # ask the release can raise to the wire's own parse, so none is refused at the door.
 aterm-messages = { workspace = true }
+# The updater's own reading of a bundle's dev mark: `ship dev-app`'s tests hold the
+# plist it stamps to it, so the mark it seals is the one the updater leaves alone.
+aterm-update = { workspace = true }
 
 [lints]
 workspace = true

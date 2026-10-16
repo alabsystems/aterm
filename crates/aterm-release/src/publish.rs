@@ -50,7 +50,7 @@ pub struct CutOptions {
     /// here: the loaded material lives in `CutCtx`, and only the derived public
     /// identity is ever journaled.
     pub release_credentials: Option<PathBuf>,
-    /// Gates + a byte copy of the MEASURED bundle this clone's release built of the
+    /// Gates + a byte copy of the VERIFIED bundle this clone's release built of the
     /// checkout's commit, under its reserved number (claimed nowhere), signed into
     /// dist/ and notarized by Apple; nothing committed or published, nothing built.
     pub dry_run: bool,
@@ -59,7 +59,7 @@ pub struct CutOptions {
     /// Requested operator apply floor / yank. The emitted floor is the maximum
     /// of this value and the newest live channel manifest's carried floor.
     pub min_build: Option<u64>,
-    /// "OWNER/REPO": a full real cut of the release's MEASURED bundle published to a
+    /// "OWNER/REPO": a full real cut of the release's VERIFIED bundle published to a
     /// scratch channel under its reserved, never-pushed ledger number (spec decision
     /// 17). Like every channel an updater is pointed at, it must be public.
     pub rehearse: Option<String>,
@@ -1784,20 +1784,21 @@ pub fn preflight_release_lease(git: &dyn GitRunner) -> Result<()> {
 }
 
 /// THE CUT'S PRE-CLAIM GATES THAT NEED NOTHING `pub publish` MAKES, asked by `targo
-/// --unverified ship release` at its strict preflight, right before the stage — so a
-/// refusal that would otherwise arrive after the source is public (another machine's
-/// cut holding the release lease, a newer roster or floor on the channel) arrives with
-/// nothing public. Each is the cut's own gate, read-only, in the cut's order: the
-/// locked metadata, no process run out of a staged bundle, the release lease, the
+/// --unverified ship release` at its checks (minute one) and again right before `pub
+/// publish` — so a refusal that would otherwise arrive after the source is public
+/// (another machine's cut holding the release lease, a newer roster or floor on the
+/// channel) arrives with nothing public. Each is the cut's own gate, read-only, in the
+/// cut's order: no process run out of a staged bundle, the release lease, the
 /// channel's write permission for the release token, the signing verdict, the roster
 /// lineage and ratchet, and the channel floor for the next build number. Every
 /// refusal is returned, `(gate, the cut's own words)`; the cut asks each again before
 /// its claim, where the race with another publisher is closed.
 ///
-/// Not here, because only the publish can make it pass or only the cut's moment can
-/// ask it: the channel's source version (`gates::channel_version_gate`, true only once
-/// `pub publish` pushed), the L0 freeze-safety build, and the atomic lease create.
-/// A credentials profile that does not load leaves the signing gates to the
+/// Not here: what reads only R's tree (the locked metadata among R's commit-only gates,
+/// which the release judges at its step 4 and journals), and what only the publish can
+/// make pass or only the cut's moment can ask (the channel's source version,
+/// `gates::channel_version_gate`, true only once `pub publish` pushed; the atomic lease
+/// create). A credentials profile that does not load leaves the signing gates to the
 /// provisioning audit's profile line, which names it.
 pub fn pre_publish_gates(
     repo: &Path,
@@ -1806,9 +1807,6 @@ pub fn pre_publish_gates(
 ) -> Vec<(&'static str, String)> {
     let mut out: Vec<(&'static str, String)> = Vec::new();
     let git = GitCli::new(repo);
-    if let Err(e) = gates::locked_metadata_gate(repo) {
-        out.push(("locked metadata", e.to_string()));
-    }
     if let Err(e) =
         gates::staged_bundle_liveness_gate(&repo.join("dist"), &crate::bundle::running_processes)
     {
@@ -2287,7 +2285,7 @@ pub fn release_completed_session_without_guard(
 /// Pipeline steps in execution order, as journaled. Gates + claim precede the
 /// journal's existence (a journal on disk MEANS the claim is verified);
 /// "sign" covers copy+sign+notarize+dmg+manifest as one re-enterable unit over the
-/// MEASURED bundle the release built once (`artifact.rs`) — the cut builds nothing,
+/// VERIFIED bundle the release built once (`artifact.rs`) — the cut builds nothing,
 /// so its outputs are all functions of `(version, build_number)` and those bytes.
 /// `publish` is the ONE publication: the channel release bound, uploaded, proved
 /// and made the head ([`step_publish`]).
@@ -2301,7 +2299,7 @@ pub const STEPS: [&str; 6] = ["lock", "sign", "selfcheck", "tag", "publish", "un
 /// every authority the current publisher/signing/release-ID protocol records.
 ///
 /// Format 12 is the build-once cut: it signs the bundle the release built and
-/// MEASURE judged (its `sign` step replaces the rebuild format 11 journaled as
+/// `verify release` judged (its `sign` step replaces the rebuild format 11 journaled as
 /// `build`), and the journal names those bytes ([`Journal::artifact`],
 /// [`Journal::macho_sha256`]). A step list that changes gets a number no other
 /// cutter has written.
@@ -2427,13 +2425,13 @@ pub struct Journal {
     #[serde(default)]
     pub min_build: Option<u64>,
     /// THE BYTES THIS CUT SIGNS: the release cache's key of the bundle the release
-    /// built once and MEASURE judged (`artifact.rs`). `sign` copies exactly that
+    /// built once and `verify release` judged (`artifact.rs`). `sign` copies exactly that
     /// entry, re-proved; a resume before `sign` copies it again and never builds.
     /// `None` only where nothing is left to sign (a recovered, already-published cut).
     #[serde(default)]
     pub artifact: Option<String>,
-    /// The SHA-256 of that bundle's executable as MEASURE judged it — the key of its
-    /// `measured yes` receipt, and what the copy must still be before it is signed.
+    /// The SHA-256 of that bundle's executable as `verify release` judged it — what its
+    /// verified record names, and what the copy must still be before it is signed.
     #[serde(default)]
     pub macho_sha256: Option<String>,
     #[serde(default)]
@@ -2669,7 +2667,7 @@ impl Journal {
         }
         validate_min_build(self.min_build, self.build_number, "journaled build")?;
         // Until `sign` is journaled the cut has bytes left to sign, and they are the
-        // measured ones by name: a journal that cannot name them would have a resume
+        // verified ones by name: a journal that cannot name them would have a resume
         // sign something else — or build, which a claimed release never does.
         if !self.is_done("sign") {
             let named = |value: &Option<String>| {
@@ -2679,7 +2677,7 @@ impl Journal {
             };
             if !named(&self.artifact) || !named(&self.macho_sha256) {
                 return Err(Error::new(
-                    "release journal has not signed yet and names no measured bundle (artifact \
+                    "release journal has not signed yet and names no verified bundle (artifact \
                      key + executable sha256) to sign",
                 ));
             }
@@ -5790,7 +5788,7 @@ fn sign_manifest_with_policy(ctx: &CutCtx, manifest: &Path) -> Result<PathBuf> {
 /// signature covers. `sign_manifest_with_policy` signs the FILE this function wrote,
 /// so stamping before the write puts them inside the signed bytes by construction.
 ///
-/// A named function (not inline in `step_sign`, which needs a real measured bundle)
+/// A named function (not inline in `step_sign`, which needs a real verified bundle)
 /// so this ordering has a covering test.
 pub fn stage_manifest(
     dist: &Path,
@@ -6056,7 +6054,7 @@ pub struct CutCtx {
     /// Effective carried channel floor, already validated against `build`.
     pub min_build: Option<u64>,
     /// The release cache's key of the bundle `sign` copies and signs — the one the
-    /// release built once and MEASURE judged ([`Journal::artifact`]), for every kind
+    /// release built once and `verify release` judged ([`Journal::artifact`]), for every kind
     /// of cut. `None` only where nothing is left to sign (a recovered,
     /// already-published cut).
     pub artifact: Option<String>,
@@ -7686,81 +7684,6 @@ pub fn signature_transcript_line(signing_key: Option<&str>, machine_id: Option<&
     }
 }
 
-/// The transcript's statement of how far the built commit is from a gate (see
-/// [`gates::receipt_report`]): how many commits it sits above the newest one a gate
-/// receipt vouches for. What it builds — the published commit, and how far main has
-/// moved past it — is the `source` line's, said once. Pure, so the wording is a test.
-pub fn ungated_range_lines(receipts: &gates::ReceiptReport) -> Vec<String> {
-    let mut lines = Vec::new();
-    let named = |items: &[String]| {
-        let mut text = items.iter().take(8).cloned().collect::<Vec<_>>().join("; ");
-        if items.len() > 8 {
-            text.push_str(&format!("; … and {} more", items.len() - 8));
-        }
-        text
-    };
-    // A commit gated BY ITS TREE says whose run vouched: the receipt is about the
-    // bytes, and the few gates that read history ran on that other commit. A
-    // receipt read from another clone's store (`gates::Stores`) names the store.
-    let from = receipts
-        .gated_from
-        .as_ref()
-        .map(|store| format!(" (from the receipt store {})", store.display()))
-        .unwrap_or_default();
-    let by_tree = receipts
-        .gated_by_tree
-        .as_deref()
-        .map(|run| {
-            format!(
-                ", by its tree — the passing receipt is {run}'s{from}, a commit with the same \
-                 bytes"
-            )
-        })
-        .unwrap_or_default();
-    lines.push(match &receipts.newest_gated {
-        Some((sha, subject)) if receipts.ungated.is_empty() => {
-            format!("gate receipts: HEAD itself is gated ({sha} {subject}){by_tree}")
-        }
-        Some((sha, subject)) => format!(
-            "gate receipts: {} UNGATED commit(s) since the newest receipted commit {sha} \
-             ({subject}){by_tree}: {}",
-            receipts.ungated.len(),
-            named(&receipts.ungated)
-        ),
-        None => format!(
-            "gate receipts: no receipted commit in the newest {} first-parent commit(s) — \
-             all {} are ungated",
-            receipts.scanned,
-            receipts.ungated.len()
-        ),
-    });
-    // Gated WITH main's reds (the gate's differential verdict): they are main's to
-    // fix, and a cut from here ships them, so they are named.
-    if let Some((sha, _)) = &receipts.newest_gated
-        && !receipts.inherited.is_empty()
-    {
-        lines.push(format!(
-            "gate receipts: {sha} passed the merge contract with {} red(s) inherited from \
-             main — red there with the same failure, so not that change's, and still \
-             red: {}",
-            receipts.inherited.len(),
-            named(&receipts.inherited)
-        ));
-    }
-    if let Some(verdict) = receipts.head_verdict.as_deref()
-        && verdict != "PASS"
-    {
-        lines.push(match &receipts.head_receipt {
-            Some(path) => format!(
-                "WARNING: HEAD's own gate receipt says {verdict}: {}",
-                path.display()
-            ),
-            None => format!("WARNING: HEAD's own gate receipt says {verdict}"),
-        });
-    }
-    lines
-}
-
 /// What a REAL cut publishes, and whether its claim is a recut: the READER half of
 /// the claim contract (`aterm_spec::derive::release_claim_landing_model`; Tier-1 in
 /// tests/it/claim_landing_model.rs), whose writer is [`ledger::claim`] with
@@ -7807,14 +7730,14 @@ pub fn real_cut_version(
 pub fn rehearsal_source_line(published: &Result<gates::PublishedSource>) -> String {
     match published {
         Ok(source) => format!(
-            "a real cut signs its release's measured bundle of the published commit {} \
-             (verified {}); this run signs its release's measured bundle of the checkout's \
+            "a real cut signs its release's verified bundle of the published commit {} \
+             (verified {}); this run signs its release's verified bundle of the checkout's \
              commit",
             source.commit.get(..12).unwrap_or(&source.commit),
             source.verified_at
         ),
         Err(error) => format!(
-            "a real cut would REFUSE here — {error}; this run signs its release's measured \
+            "a real cut would REFUSE here — {error}; this run signs its release's verified \
              bundle of the checkout's commit"
         ),
     }
@@ -7884,43 +7807,45 @@ pub fn place_claim_tree(
     Ok(gates::place_cut_tree(operator, repo, &header.commit)?.path)
 }
 
-/// The bundle a REAL cut signs: its release's reservation, and the COMPLETE, measured
+/// The bundle a REAL cut signs: its release's reservation, and the COMPLETE, verified
 /// bundle the release built under it.
-pub struct MeasuredBundle {
+pub struct VerifiedBundle {
     /// What the claim lands: the number and release commit the bytes carry.
     pub reserved: ledger::Reserved,
     /// The release cache's record of the bytes, re-proved on read.
     pub complete: artifact::Complete,
-    /// The MEASURE judge's words for them.
+    /// The verified judge's words for them.
     pub line: String,
 }
 
-/// THE MEASURED BUNDLE OF THE RELEASE OF `source` (build once, 2026-10-09), read from
-/// this clone's release journal (`ship release`'s, in the git common dir): its
+/// THE VERIFIED BUNDLE OF THE RELEASE OF `source`, read from
+/// this clone's release journal (`ship release`'s, in the git common dir): its judgment
+/// of R's commit-only gates, the handoff fixture guard and the L0 censuses (the
+/// `commit-gates`, `fixture-guard` and `census` facts), its
 /// reservation of `version`, the bundle it built under that reservation — COMPLETE in
 /// the release cache, its bytes re-proved against their record — compiled by the
-/// prover `toolchain` names (the [`gates::cut_toolchain`] identity this cut's TRUST gate
-/// judges with: ONE compiler, named by the bytes, built them and proved the tree they
-/// come from), and a `measured yes` receipt filed under that bundle's executable digest
-/// by R's own suite ([`gates::measured`]). Every refusal is pre-claim: nothing is
+/// prover `toolchain` names (the [`gates::cut_toolchain`] identity: ONE compiler, named by
+/// the bytes, built them), and the record that `verify release` passed for `source`'s tree on that
+/// bundle's executable ([`gates::verified`]). Every refusal is pre-claim: nothing is
 /// burned.
 ///
 /// # Errors
-/// No release of `source` journaled here, no reservation or bundle, a bundle that is
+/// No release of `source` journaled here, R's commit-only gates, the fixture guard or
+/// the censuses not judged by it, no reservation or bundle, a bundle that is
 /// not the reservation's or whose bytes changed, bytes another prover compiled, and
-/// bytes MEASURE has not judged.
-pub fn measured_release_bundle(
+/// bytes `verify release` has not passed.
+pub fn verified_release_bundle(
     operator: &dyn GitRunner,
     repo: &Path,
     source: &str,
     version: &str,
     toolchain: &str,
-) -> Result<MeasuredBundle> {
+) -> Result<VerifiedBundle> {
     let refuse = |why: String| {
         Error::new(format!(
             "{why} — a cut (a dry run and a rehearsal too) signs only the bundle its \
-             release built once and MEASURE judged, and builds nothing itself: `{}` \
-             reserves, builds, measures and cuts. Nothing was claimed",
+             release built once and `verify release` passed, and builds nothing itself: \
+             `{}` reserves, builds, verifies and cuts. Nothing was claimed",
             crate::release::RELEASE_COMMAND
         ))
     };
@@ -7939,6 +7864,34 @@ pub fn measured_release_bundle(
             "this clone's release of {} is v{}, not v{version}",
             short(source),
             journal.version
+        )));
+    }
+    // R's commit-only gates (the changelog, the predecessor's handoff fixtures, the
+    // handoff policy, the locked metadata), the handoff fixture guard and the L0
+    // censuses are the release's, judged at its step 4 and journaled for R: the cut
+    // reads those facts, never re-derives them, and refuses without any — a cut by hand
+    // fails closed rather than skipping them. The pass record of `verify release` is no
+    // stand-in for the guard's fact: a guard filter that matches no test (a renamed
+    // module) is green in a whole-workspace test run, and only the guard's own judge
+    // refuses it.
+    let missing: Vec<String> = [
+        (
+            crate::release::COMMIT_GATES,
+            "R's commit-only gates (the changelog, the predecessor's handoff fixtures, the \
+             handoff policy, the locked metadata)",
+        ),
+        (crate::release::FIXTURE_GUARD, "the handoff fixture guard"),
+        (crate::release::CENSUS, "the L0 censuses"),
+    ]
+    .into_iter()
+    .filter(|(fact, _)| !journal.has(fact))
+    .map(|(fact, what)| format!("{what} (`{fact}`)"))
+    .collect();
+    if !missing.is_empty() {
+        return Err(refuse(format!(
+            "the release of {} has not judged {}: its journal holds no such fact for it",
+            short(source),
+            missing.join(", ")
         )));
     }
     let (Some(reserved), Some(built)) = (journal.reserved, journal.artifact) else {
@@ -7988,15 +7941,11 @@ pub fn measured_release_bundle(
             journal.prover
         )));
     }
-    let (yes, line) = gates::measured(
-        &gates::receipt_store(operator)?,
-        &complete.macho_sha256,
-        source,
-    )?;
+    let (yes, line) = gates::verified(operator, source, &complete.macho_sha256)?;
     if !yes {
-        return Err(refuse(format!("NOTHING SHIPS UNMEASURED: {line}")));
+        return Err(refuse(format!("NOTHING SHIPS UNVERIFIED: {line}")));
     }
-    Ok(MeasuredBundle {
+    Ok(VerifiedBundle {
         reserved: reserved.ledger(),
         complete,
         line,
@@ -8004,7 +7953,7 @@ pub fn measured_release_bundle(
 }
 
 /// The whole `targo --unverified ship cut` (spec §7 order): gates → claim → sign+package
-/// the measured bundle → self-check → origin tag → the ONE publication onto the channel.
+/// the verified bundle → self-check → origin tag → the ONE publication onto the channel.
 ///
 /// The version is `[workspace.package] version` as written
 /// ([`release_version_from_workspace`], which refuses a non-zero patch) — NOT from
@@ -8012,10 +7961,10 @@ pub fn measured_release_bundle(
 /// bumping Cargo.toml therefore lands on the already-published guard in
 /// [`verify::derive_cut_mode`], which names the bump.
 ///
-/// `repo` is the operator's checkout: `dist/` and the journal live there (the gate
-/// receipts are the repository's one store, shared by every worktree, and the release
-/// cache is the clone's), and the cut never moves it. Every cut signs the bundle its
-/// release built once and MEASURE judged ([`measured_release_bundle`]) and builds
+/// `repo` is the operator's checkout: `dist/` and the journal live there (the release's
+/// records are the repository's, shared by every worktree, and the
+/// release cache is the clone's), and the cut never moves it. Every cut signs the bundle
+/// its release built once and `verify release` passed ([`verified_release_bundle`]) and builds
 /// nothing: a real cut, the release of the published commit, read in the cut tree
 /// ([`gates::place_published`]); a dry run or rehearsal, the release of `repo`'s own
 /// commit, under its reserved number, claimed nowhere.
@@ -8245,9 +8194,6 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
     // ---- gates (spec §6; <5s, before anything is committed) ---------------
     let gate_opts = gates::GateOpts {
         version: version.clone(),
-        // The notes the gate judges are the checkout's: `[Unreleased]`, unless the
-        // published commit itself already carries the version's section.
-        recut: changelog::has_section(&changelog_text, &version),
         // Only a REAL cut is compared against the public channel: a dry run
         // uploads nothing and a rehearsal uploads to a scratch repo, so in
         // neither case can the channel be expected to carry this version. This
@@ -8274,39 +8220,8 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
     step(
         "",
         &format!(
-            "CHANGELOG [{}]: {} entries, no ''' · gh auth ({})",
-            if gate_opts.recut {
-                version.as_str()
-            } else {
-                "Unreleased"
-            },
-            gr.changelog_entries,
+            "gh auth ({}) · trustc ok ({}) · disk ok ({} GiB free)",
             gr.gh_account.as_deref().unwrap_or("account unknown"),
-        ),
-    );
-    step(
-        "",
-        &gates::handoff_fixtures_line(gr.handoff_fixtures.as_ref()),
-    );
-    step(
-        "",
-        &format!(
-            "handoff fixture guard: {} test(s) passed in the cut tree (every shipped \
-             producer's desks adopted by this build's consumer)",
-            gr.fixture_guard_tests
-        ),
-    );
-    step(
-        "",
-        &format!(
-            "handoff policy sealed into the bundle: {}",
-            gr.handoff_policy
-        ),
-    );
-    step(
-        "",
-        &format!(
-            "Cargo.lock exact/offline · trustc ok ({}) · disk ok ({} GiB free)",
             gr.trustc.display(),
             gr.free_disk_gib,
         ),
@@ -8328,37 +8243,54 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
             gr.processes_checked
         ),
     );
-    for line in ungated_range_lines(&gr.receipts) {
-        step("", &line);
-    }
-    // THE L0 OBLIGATIONS ARE MANDATORY. Unlike the deep gate below this is one
-    // short build, and it is the only thing standing between an ungated commit
-    // on main and a release cut from it — see `run_freeze_safety_gate`.
-    run_freeze_safety_gate(&tree)?;
-    step(
-        "gate",
-        "L0 freeze-safety gate: 6 obligations GREEN (temporal proof · main-loop · \
-         lock-order · wasm-process · scope-cardinality · lazy-init reentrancy)",
-    );
-
-    // ONE COMPILER, NAMED BY THE BYTES: the prover this cut judges the tree's TRUST
-    // facts with is the one whose trustc compiled the bundle it signs — the bundle is
-    // refused otherwise — so the facts that admit the claim are about the bytes that ship.
+    // ONE COMPILER, NAMED BY THE BYTES: the toolchain this cut names is the one whose
+    // trustc compiled the bundle it signs — the bundle is refused otherwise.
     let toolchain = gates::cut_toolchain()
         .map_err(|e| Error::new(format!("the cut cannot name its prover: {e}")))?;
-    // NOTHING SHIPS UNMEASURED, AND NOTHING IS BUILT TWICE: every cut signs the bundle
-    // its release built once, under the number it reserved, and MEASURE judged — this
-    // clone's release journal names it, the release cache holds it COMPLETE with its
-    // bytes re-proved, and the receipt filed under its executable's digest says
-    // `measured yes`. A real cut's release is of the published commit; a dry run's or
+    // NOTHING SHIPS UNVERIFIED, AND NOTHING IS BUILT TWICE: every cut signs the bundle
+    // its release built once, under the number it reserved, and `verify release` passed
+    // — this clone's release journal names it, the release cache holds it COMPLETE with
+    // its bytes re-proved, and the verified record of the tree names its executable. A
+    // real cut's release is of the published commit; a dry run's or
     // rehearsal's is of the checkout's commit, and its reserved number is claimed
     // nowhere. Pre-claim, so a refusal burns nothing.
     let source = match &published {
         Some(checkout) => checkout.source.commit.clone(),
         None => rev_parse(&git, "HEAD")?,
     };
-    let measured = measured_release_bundle(&operator, repo, &source, &version, &toolchain)?;
-    step("gate", &measured.line);
+    let verified = verified_release_bundle(&operator, repo, &source, &version, &toolchain)?;
+    // WHAT DEPENDS ONLY ON THE TREE IS READ, NEVER RE-DERIVED: R's commit-only gates,
+    // the handoff fixture guard and the L0 censuses are the release's journaled
+    // judgment (`verified_release_bundle` refused without any of them), and the guard
+    // and the censuses are in the `release` set whose pass record for R's tree that
+    // judge just read.
+    step(
+        "gate",
+        &format!(
+            "R's commit-only gates (the changelog, the predecessor's handoff fixtures, the \
+             handoff policy, the locked metadata), the handoff fixture guard and the L0 \
+             censuses: judged by its release before anything was staged (`{}`, `{}` and `{}` \
+             in this clone's release journal), the guard and the censuses passed again in \
+             `verify release` over its tree",
+            crate::release::COMMIT_GATES,
+            crate::release::FIXTURE_GUARD,
+            crate::release::CENSUS
+        ),
+    );
+    // BUT TWO OF THEM ALSO READ ORIGIN, so they are asked again at the cut's moment:
+    // the release whose handoff fixtures R must hold is the newest one whose tag is on
+    // origin, and the policy R seals is judged against what that one sealed. A version
+    // tagged since the release judged them (a peer finished a wedged cut while the long
+    // steps ran) is a new predecessor whose hop would otherwise go unguarded. Reads of
+    // seconds, pre-claim.
+    let fixtures = gates::handoff_fixture_gate_at(&git, &source, &version)?;
+    step("gate", &gates::handoff_fixtures_line(fixtures.as_ref()));
+    let policy = gates::handoff_policy_gate_at(&git, &source, &version)?;
+    step(
+        "gate",
+        &format!("handoff policy sealed into the bundle: {policy}"),
+    );
+    step("gate", &verified.line);
     if kind != CutKind::Real && !opts.linux_workers.is_empty() {
         // A Linux worker fetches the commit it builds from origin, and only a real
         // claim puts the release commit there.
@@ -8368,21 +8300,10 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
              builds from origin) cannot build it — pass --mac-only, or --linux-artifacts \
              holding pairs built from that commit by hand (`{SHIP_COMMAND} linux-build \
              --commit {}` on each Linux host that has it)",
-            &measured.reserved.commit[..12],
-            measured.reserved.commit
+            &verified.reserved.commit[..12],
+            verified.reserved.commit
         )));
     }
-    // NOTHING SHIPS UNVERIFIED BY THE WHOLE-TREE TRUST LANE: the
-    // merge contract verifies only the libraries a change touched, the heaviest
-    // excepted, so a real cut requires the whole-tree lane's facts for the tree
-    // it releases (its floors aside), from the prover that compiled its bytes, to
-    // pass this commit's floors — the deep gate's whole-tree run files them — and
-    // refuses pre-claim without that.
-    step(
-        "gate",
-        &gates::trust_receipt_gate(&git, kind == CutKind::Real, &toolchain)?,
-    );
-
     if kind == CutKind::Real {
         preflight_release_lease(&git)?;
         step("lock", "release lock is free");
@@ -8512,9 +8433,9 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
             .map_err(|e| Error::new(format!("read {}: {e}", ledger::LEDGER_FILE)))?
     };
     let tail = ledger::tail(&ledger_text)?;
-    // Every cut's number is its release's reservation — the number its measured bytes
+    // Every cut's number is its release's reservation — the number its verified bytes
     // carry — and the claim never re-numbers it.
-    let reserved = measured.reserved.build;
+    let reserved = verified.reserved.build;
     let provisional_floor = effective_min_build(opts.min_build, newest_min_build, reserved)?;
     step(
         "floor",
@@ -8535,7 +8456,7 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
                 "claim",
                 &format!(
                     "ledger tail {} ({}) → claiming the reserved {reserved} (the number the \
-                     measured bytes carry; never re-numbered)",
+                     verified bytes carry; never re-numbered)",
                     tail.build, tail.version
                 ),
             );
@@ -8550,7 +8471,7 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
             let rolls = |source: &str, main: &str| {
                 changelog::claim_changelogs(source, main, &version, &date)
             };
-            let claim = ledger::claim(&git, &tree, &plan, &measured.reserved, &rolls)?;
+            let claim = ledger::claim(&git, &tree, &plan, &verified.reserved, &rolls)?;
             step(
                 "",
                 &format!(
@@ -8587,7 +8508,7 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
                     }
                 ),
             );
-            (reserved, measured.reserved.commit.clone())
+            (reserved, verified.reserved.commit.clone())
         }
     };
     // The claim lands the reservation's number or refuses — it never re-numbers
@@ -8613,8 +8534,8 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
         build,
         commit,
         min_build,
-        artifact: Some(measured.complete.key.clone()),
-        macho_sha256: Some(measured.complete.macho_sha256.clone()),
+        artifact: Some(verified.complete.key.clone()),
+        macho_sha256: Some(verified.complete.macho_sha256.clone()),
         linux,
         manifest_signed: false,
         signature_required: signature_policy.required,
@@ -9159,62 +9080,6 @@ fn step_unlock(ctx: &mut CutCtx) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// pipeline steps
-// ---------------------------------------------------------------------------
-
-/// MANDATORY L0 gate: build `tools/freeze-safety-gate`, whose build script runs
-/// all six fail-closed obligations (temporal proof + the main-loop, lock-order,
-/// wasm-process, scope-cardinality and lazy-init-reentrancy censuses) and fails
-/// the compile on any violation.
-///
-/// WHY THIS IS NOT OPT-IN, when `tools/verify.sh --full` deliberately is. Spec
-/// decisions 15/22 make the DEEP gate opt-in: it is minutes long and it is the
-/// merge contract's job. This is one build of one dependency-free crate, MEASURED
-/// at 8.71 s from scratch and ~3.8 s warm (that crate's manifest carries the
-/// numbers), and it is the only mechanical link between "the census exists" and
-/// "what users run was checked by it".
-///
-/// The merge contract runs the censuses, but nothing makes a commit on main have
-/// passed it — there is no CI and no git hook, by owner decision — so a commit can
-/// reach origin/main ungated, `pub publish` can export it, and the release builds
-/// exactly that commit (v0.65.0 shipped a self-recursive `OnceLock` that way). This
-/// gate is the one proof that runs on every cut regardless, INLINE in the tool being
-/// run; the ungated range itself is stated in the transcript from the gate receipts
-/// ([`gates::receipt_report`]).
-///
-/// It runs BEFORE the ledger claim, so a failure costs seconds and burns no
-/// build number — the same posture as every other gate in `gates.rs`.
-fn run_freeze_safety_gate(repo: &Path) -> Result<()> {
-    let manifest = repo.join("tools/freeze-safety-gate/Cargo.toml");
-    if !manifest.is_file() {
-        return Err(Error::new(format!(
-            "the L0 freeze-safety gate is missing at {} — a release is not cut without \
-             it; restore the crate rather than deleting this gate",
-            manifest.display()
-        )));
-    }
-    let targo = crate::gates::trust_stage2_bin()?.join("targo");
-    let status = Command::new(&targo)
-        .arg("--unverified")
-        .arg("build")
-        .arg("--manifest-path")
-        .arg(&manifest)
-        .current_dir(repo)
-        .stdin(std::process::Stdio::null())
-        .status()
-        .map_err(|e| Error::new(format!("spawn {}: {e}", targo.display())))?;
-    if !status.success() {
-        return Err(Error::new(
-            "L0 FREEZE-SAFETY GATE FAILED — see the ✗ FAIL [OB-n] diagnostic(s) above. \
-             Nothing was claimed or committed. This gate has no waiver channel: fix the \
-             finding, then cut."
-                .to_string(),
-        ));
-    }
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
 // Notarize + package: the ordered middle of `step_sign`, extracted so the
 // ORDER is a tested fact
 // ---------------------------------------------------------------------------
@@ -9368,28 +9233,28 @@ pub fn notarize_and_package(
     })
 }
 
-/// The remedy for measured bytes a claimed cut can no longer sign: never a rebuild.
+/// The remedy for verified bytes a claimed cut can no longer sign: never a rebuild.
 fn spent_remedy(version: &str, build: u64) -> String {
     format!(
         "A claimed release is never rebuilt: build {build}'s number is spent, and nothing \
-         rebuilt could be the bytes MEASURE judged. `{CUT_COMMAND} --abandon v{version}` \
+         rebuilt could be the bytes `verify release` judged. `{CUT_COMMAND} --abandon v{version}` \
          withdraws it; the next release reserves, builds and measures anew"
     )
 }
 
-/// Step "sign": the MEASURED bundle, byte-copied out of the release cache and
-/// re-proved (its executable is the one MEASURE judged) → sign → notarize → DMG →
+/// Step "sign": the VERIFIED bundle, byte-copied out of the release cache and
+/// re-proved (its executable is the one `verify release` judged) → sign → notarize → DMG →
 /// provenance → manifest + notes. One re-enterable unit whose outputs are all
 /// functions of (version, build_number, release commit) and those bytes.
 ///
 /// THE CUT BUILDS NOTHING (build once, 2026-10-09). The release built the bundle
 /// once, before the claim, carrying the reserved number (`artifact.rs`), and
-/// MEASURE judged it; this step signs a copy of exactly those bytes — the copy's
+/// `verify release` judged it; this step signs a copy of exactly those bytes — the copy's
 /// executable and whole-bundle digests are the record's ([`artifact::copy_bundle`]),
-/// and the MEASURE judge is asked again ([`gates::measured`]) before the first
+/// and the verified judge is asked again ([`gates::verified`]) before the first
 /// signature. A resume before `sign` is done copies the same entry again;
 /// bytes that are gone or changed are refused, never rebuilt: the number is spent,
-/// and nothing rebuilt could be the bytes MEASURE judged.
+/// and nothing rebuilt could be the bytes `verify release` judged.
 fn step_sign(ctx: &mut CutCtx) -> Result<()> {
     if let Some(handoff) = &mut ctx.linux {
         handoff.run_workers(&ctx.version, ctx.build, &ctx.commit)?;
@@ -9403,7 +9268,7 @@ fn step_sign(ctx: &mut CutCtx) -> Result<()> {
     }
     let (Some(key), Some(macho_sha256)) = (ctx.artifact.clone(), ctx.macho_sha256.clone()) else {
         return Err(Error::new(
-            "internal: this cut names no measured bundle to sign — a cut signs only the \
+            "internal: this cut names no verified bundle to sign — a cut signs only the \
              bundle its release built once",
         ));
     };
@@ -9417,7 +9282,7 @@ fn step_sign(ctx: &mut CutCtx) -> Result<()> {
         })?
         .ok_or_else(|| {
             Error::new(format!(
-                "the measured bundle {key} is gone from the release cache ({}). {}",
+                "the verified bundle {key} is gone from the release cache ({}). {}",
                 store.display(),
                 spent_remedy(&ctx.version, ctx.build)
             ))
@@ -9440,18 +9305,14 @@ fn step_sign(ctx: &mut CutCtx) -> Result<()> {
             ctx.commit
         )));
     }
-    // NOTHING SHIPS UNMEASURED, asked again at the last moment before a signature:
-    // the receipt is keyed by these exact bytes, and judged by the suite of the
-    // release's R — the release commit's one parent.
+    // NOTHING SHIPS UNVERIFIED, asked again at the last moment before a signature: the
+    // record names these exact bytes, verified in the tree of the release's R — the
+    // release commit's one parent.
     let published = rev_parse(&GitCli::new(&ctx.tree), &format!("{}^1", ctx.commit))?;
-    let (yes, line) = gates::measured(
-        &gates::receipt_store(&GitCli::new(&ctx.repo))?,
-        &macho_sha256,
-        &published,
-    )?;
+    let (yes, line) = gates::verified(&GitCli::new(&ctx.repo), &published, &macho_sha256)?;
     if !yes {
         return Err(Error::new(format!(
-            "NOTHING SHIPS UNMEASURED: {line} — refusing to sign build {}",
+            "NOTHING SHIPS UNVERIFIED: {line} — refusing to sign build {}",
             ctx.build
         )));
     }
@@ -9462,7 +9323,7 @@ fn step_sign(ctx: &mut CutCtx) -> Result<()> {
     step(
         "bundle",
         &format!(
-            "the MEASURED bundle, byte for byte: {} → {} — executable sha256 {}… (archs [{}] · \
+            "the VERIFIED bundle, byte for byte: {} → {} — executable sha256 {}… (archs [{}] · \
              {}) · Short={} CFBundleVersion={}",
             complete.app(&store).display(),
             app.display(),
@@ -9558,7 +9419,7 @@ fn step_sign(ctx: &mut CutCtx) -> Result<()> {
         })?;
     }
     // Provenance AFTER signing: binary_sha256 must cover the SIGNED bytes, and
-    // pre_sign_sha256 names the measured ones they were signed from.
+    // pre_sign_sha256 names the verified ones they were signed from.
     let provenance_path = bundle::write_provenance(&spec, &app, &signed_by, &macho_sha256)?;
     if ctx.signature_required {
         // Bind the provenance to the fingerprint the BINARY carries — the committed
@@ -10080,12 +9941,12 @@ fn prove_publication_on_disk(ctx: &CutCtx) -> Result<Manifest> {
 /// the argv0 identities, a headless session the signed native slice drives,
 /// `codesign` and Tier APPLE — and the client-rule monotonic check.
 ///
-/// NO PAINT SMOKE (build once, 2026-10-09). The paint proof is MEASURE's: its
-/// `measuring::` paint and spin rows run the executable whose digest this bundle's
-/// copy was proved to carry before it was signed (`tools/verify.sh --measure <app>`),
-/// so a second take here judged the same pixels again under a cut's scheduling. What
-/// signing ADDS — the hardened runtime, the entitlements, the seal — is what this
-/// step runs: the signed slice must still drive a session.
+/// NO PAINT SMOKE. The paint proof is `verify release`'s: its MEASURE check runs the
+/// paint and spin rows against the executable whose digest this bundle's copy was
+/// proved to carry before it was signed, so a second take here would judge the same
+/// pixels again under a cut's scheduling. What signing ADDS — the hardened runtime, the
+/// entitlements, the seal — is what this step runs: the signed slice must still drive a
+/// session.
 fn step_selfcheck(ctx: &mut CutCtx) -> Result<()> {
     let manifest = prove_artifacts_on_disk(ctx)?;
     let app = ctx.app_path();
@@ -13249,117 +13110,6 @@ mod anonymous_readability_tests {
 }
 
 #[cfg(test)]
-mod ungated_range_statement_tests {
-    //! The transcript's statement of the ungated range.
-
-    use super::*;
-
-    fn report(ungated: usize, verdict: Option<&str>) -> gates::ReceiptReport {
-        gates::ReceiptReport {
-            newest_gated: Some((
-                "3b1f0c2aa".to_string(),
-                "fix: the last gated slice".to_string(),
-            )),
-            ungated: (0..ungated)
-                .map(|i| format!("{i:09x} commit {i}"))
-                .collect(),
-            scanned: ungated + 1,
-            head_receipt: verdict.map(|_| PathBuf::from("/repo/.git/aterm-verify/receipts/head")),
-            head_verdict: verdict.map(str::to_string),
-            gated_by_tree: None,
-            gated_from: None,
-            inherited: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn the_transcript_states_the_ungated_count_and_names_the_newest_commits() {
-        // What the cut releases is the `source` line's; these lines state receipts only.
-        let lines = ungated_range_lines(&report(136, None));
-        assert!(
-            lines[0].contains("136 UNGATED commit(s) since the newest receipted commit 3b1f0c2aa"),
-            "{lines:?}"
-        );
-        assert!(lines[0].contains("… and 128 more"), "{lines:?}");
-        assert_eq!(lines.len(), 1, "no HEAD receipt, no warning: {lines:?}");
-
-        let gated_head = ungated_range_lines(&report(0, Some("PASS")));
-        assert!(
-            gated_head[0].contains("HEAD itself is gated"),
-            "{gated_head:?}"
-        );
-        assert_eq!(gated_head.len(), 1);
-
-        // A FAIL receipt at HEAD is said out loud (stated, not refused), with the file.
-        let failed = ungated_range_lines(&report(1, Some("FAIL")));
-        assert_eq!(
-            failed.last().unwrap(),
-            "WARNING: HEAD's own gate receipt says FAIL: /repo/.git/aterm-verify/receipts/head",
-            "{failed:?}"
-        );
-    }
-
-    /// A commit gated by its TREE names the commit whose run vouched for those
-    /// bytes, whether it is HEAD or the newest gated commit below an ungated range;
-    /// one gated by its own receipt says nothing extra.
-    #[test]
-    fn a_commit_gated_by_its_tree_names_the_run_that_vouched() {
-        let by_tree = |ungated| gates::ReceiptReport {
-            gated_by_tree: Some("7f00ba1d2".to_string()),
-            ..report(ungated, Some("PASS"))
-        };
-        let head = ungated_range_lines(&by_tree(0));
-        assert_eq!(
-            head[0],
-            "gate receipts: HEAD itself is gated (3b1f0c2aa fix: the last gated slice), by its \
-             tree — the passing receipt is 7f00ba1d2's, a commit with the same bytes"
-        );
-        let below = ungated_range_lines(&by_tree(2));
-        assert!(
-            below[0].contains(
-                "since the newest receipted commit 3b1f0c2aa (fix: the last gated slice), by its \
-                 tree — the passing receipt is 7f00ba1d2's, a commit with the same bytes: "
-            ),
-            "{below:?}"
-        );
-        let own = ungated_range_lines(&report(0, Some("PASS")));
-        assert!(!own[0].contains("by its tree"), "{own:?}");
-        // From another clone's store: the store is named.
-        let foreign = ungated_range_lines(&gates::ReceiptReport {
-            gated_from: Some(PathBuf::from("/main/.git/aterm-verify/receipts")),
-            ..by_tree(0)
-        });
-        assert!(
-            foreign[0].contains(
-                "the passing receipt is 7f00ba1d2's (from the receipt store \
-                 /main/.git/aterm-verify/receipts), a commit with the same bytes"
-            ),
-            "{foreign:?}"
-        );
-    }
-
-    /// A commit gated WITH main's reds — the gate's differential verdict — has
-    /// them named on the transcript, since a cut from there ships them; a commit
-    /// gated clean adds no line.
-    #[test]
-    fn a_commit_gated_with_inherited_reds_has_them_named() {
-        let with_reds = gates::ReceiptReport {
-            inherited: vec!["tippy lint".to_string(), "-p x --lib -- flaky".to_string()],
-            ..report(0, Some("PASS"))
-        };
-        let lines = ungated_range_lines(&with_reds);
-        assert_eq!(lines.len(), 2, "{lines:?}");
-        assert_eq!(
-            lines[1],
-            "gate receipts: 3b1f0c2aa passed the merge contract with 2 red(s) inherited from \
-             main — red there with the same failure, so not that change's, and still red: \
-             tippy lint; -p x --lib -- flaky"
-        );
-        assert_eq!(ungated_range_lines(&report(0, Some("PASS"))).len(), 1);
-    }
-}
-
-#[cfg(test)]
 mod remedy_tests {
     //! ONE OPERATOR SURFACE: the cutter's remedies name
     //! the command the runbook documents, and the closing line states no deadline
@@ -13450,11 +13200,11 @@ mod rehearsal_source_tests {
             verified_at: "2026-09-22T23:37:28+00:00".into(),
         }));
         assert!(
-            line.contains("measured bundle of the published commit 48c26b0b7fad"),
+            line.contains("verified bundle of the published commit 48c26b0b7fad"),
             "{line}"
         );
         assert!(
-            line.contains("measured bundle of the checkout's commit"),
+            line.contains("verified bundle of the checkout's commit"),
             "{line}"
         );
         // NEGATIVE CONTROL: an unreadable ledger is not dressed up as a commit.

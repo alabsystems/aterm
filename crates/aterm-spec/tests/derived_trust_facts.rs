@@ -4,9 +4,9 @@
 //! Tier-0 for `TrustFactsReuse`: the whole-tree Trust lane's facts are judged only
 //! from this tree's and this prover's measurements, against these floors — every one
 //! held, whoever recorded it — a floors-only change reuses them, reused facts never
-//! verify a floor lowered without a new reason or re-labelled the way the merge
-//! contract refuses, and what the clock left undecided is measured again on its own
-//! key. Tier-1 lives in `crates/aterm-release/tests/it/trust_facts_model.rs`.
+//! verify a floor lowered without a new reason or re-labelled the way the floors'
+//! up-only rule refuses, and what the clock left undecided is measured again on its
+//! own key. Tier-1 lives in `crates/aterm-release/tests/it/trust_facts_model.rs`.
 
 use crate::walk::{committed_actions, walk};
 use aterm_spec::derive::{Model, trust_facts_reuse_model};
@@ -20,12 +20,6 @@ fn answer(m: &Model, path: &[&str]) -> (i64, i64) {
 #[test]
 fn trust_facts_prove_and_catch_every_defect_class() {
     let model = trust_facts_reuse_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name),
-        "the facts contract must stay enrolled in the spec-link registry"
-    );
     verify::prove_and_catch_scalar(&model, "trust facts reuse");
     assert!(
         verify::uncaught_invariants(&model).is_empty(),
@@ -56,7 +50,7 @@ fn trust_facts_prove_and_catch_every_defect_class() {
         ]
     );
     assert_eq!(
-        verify::audit_dead_negative_controls(&model, &mutants),
+        verify::audit_dead_negative_controls(std::slice::from_ref(&model)),
         Ok(mutants.len()),
         "{mutants:?}"
     );
@@ -65,8 +59,8 @@ fn trust_facts_prove_and_catch_every_defect_class() {
 /// The case this exists for, walked: a run's facts pass their floors; a
 /// floors-only change that raises them finds the SAME facts and fails; lowering
 /// back to the run's floor passes again, still from them; lowering BELOW the run's
-/// floor by hand is refused although the facts are found — the merge contract's
-/// up-only rule, held on the reuse path; a source change has nothing to reuse until
+/// floor by hand is refused although the facts are found — the floors' up-only
+/// rule, held on the reuse path; a source change has nothing to reuse until
 /// a run.
 #[test]
 fn a_floors_only_change_is_judged_again_from_the_same_facts() {

@@ -2,10 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Row clear and selective erase operations.
-//!
-//! Handles full row clear, partial clear (from column to end), range clear,
-//! and DECSCA-aware selective erase that preserves protected cells.
+//! Row clears: whole, range (BCE), and DECSCA-aware selective erase that
+//! preserves protected cells.
 
 use super::super::cell::Cell;
 use super::super::cell_flags::CellFlags;
@@ -20,17 +18,14 @@ impl Row {
         self.flags = RowFlags::DIRTY;
     }
 
-    /// Erase with BCE fill cell, preserving DEC line attributes.
-    ///
-    /// Like `erase()` but fills cells with `fill` instead of `Cell::EMPTY`
-    /// (BCE per VT420/xterm). For partial erases and EL; a complete-row ED
-    /// uses `reset_with()`, the same pass with line attributes dropped.
+    /// Fill the whole row with `fill` (BCE per VT420/xterm), keeping DEC line
+    /// attributes: EL 2, and the rows IL/DL and scrolls vacate. A complete-row
+    /// ED uses `reset_with()`, which drops them.
     #[inline]
     pub fn erase_with(&mut self, fill: Cell) {
         self.cells.fill(fill);
-        // BCE fill cells are not "content" for len tracking.
-        // If fill has a non-default bg, cells are still conceptually blank
-        // (space char) but we set len to cols so renderers draw the bg.
+        // A default-coloured fill leaves the row empty; a BCE background
+        // counts as content so renderers draw it.
         if fill.colors() == Cell::EMPTY.colors() {
             self.len = 0;
         } else {
@@ -39,17 +34,14 @@ impl Row {
         self.flags = (self.flags & RowFlags::LINE_ATTRIBUTES) | RowFlags::DIRTY;
     }
 
-    /// Fully reset the row with a BCE fill cell in a single pass.
-    ///
-    /// Equivalent to `clear()` then `erase_with(fill)` (cells = `fill`, len per
-    /// the BCE rule, flags = DIRTY with line attributes dropped) but writes
-    /// each cell once. Used when the scroll path recycles ring rows and by the
-    /// ED paths erasing a complete row (xterm's `ClearBufRows`: "clearing the
-    /// whole row resets the doublesize characters").
+    /// `clear()` then `erase_with(fill)` in one pass: cells = `fill`, len per
+    /// the BCE rule, flags = DIRTY with line attributes dropped. For ring rows
+    /// the scroll path recycles and ED erasing a complete row (xterm's
+    /// `ClearBufRows` resets double-size lines).
     #[inline]
     pub fn reset_with(&mut self, fill: Cell) {
         self.cells.fill(fill);
-        // BCE fill cells are not "content" for len tracking (see erase_with).
+        // The len rule of `erase_with`.
         if fill.colors() == Cell::EMPTY.colors() {
             self.len = 0;
         } else {
@@ -58,42 +50,10 @@ impl Row {
         self.flags = RowFlags::DIRTY;
     }
 
-    /// Clear cells from `start` to end of row.
-    #[cfg(test)]
-    #[inline]
-    pub(crate) fn clear_from(&mut self, start: u16) {
-        let start_usize = usize::from(start);
-        if start_usize < self.cells.len() {
-            let old_len = self.len as usize;
-
-            // Wide fixup: if cells[start-1] is a WIDE base, clearing its
-            // continuation at start would orphan it. Key on the left neighbour's
-            // WIDE bit (bit 9, unaliased), not WIDE_CONTINUATION at start: bit 10
-            // is shared with PROTECTED, so the raw check would misfire on a
-            // protected cell and corrupt cells[start-1], outside the range.
-            if start_usize > 0
-                && self.cells[start_usize - 1]
-                    .flags()
-                    .contains(CellFlags::WIDE)
-            {
-                self.cells[start_usize - 1] = Cell::EMPTY;
-            }
-
-            self.cells[start_usize..].fill(Cell::EMPTY);
-            if start_usize < old_len {
-                self.recalculate_len_up_to(start_usize);
-            }
-            self.flags |= RowFlags::DIRTY;
-        }
-    }
-
-    /// Clear cells from start to `end` (exclusive) with a BCE fill cell.
-    ///
-    /// Fills with `fill` and blanks any orphaned wide half at either boundary
-    /// to `Cell::EMPTY` (`fill = Cell::EMPTY` is the plain clear). That is the
-    /// rectangle-op rule (DECERA/DECFRA); erases following xterm's `ClearRight`
-    /// give the orphan the BCE blank via [`Row::clear_range_with_orphan`]. See
-    /// its docs for why the two differ.
+    /// Fill `start..end` with `fill` (`Cell::EMPTY` is the plain clear),
+    /// blanking an orphaned wide half at either boundary to `Cell::EMPTY`: the
+    /// rectangle-op rule (DECERA/DECFRA). See [`Row::clear_range_with_orphan`]
+    /// for the erases that give the orphan the BCE blank.
     #[inline]
     pub(crate) fn clear_range_with(&mut self, start: u16, end: u16, fill: Cell) {
         let _ = self.clear_range_with_orphan(start, end, fill, Cell::EMPTY);
@@ -118,22 +78,18 @@ impl Row {
     ///
     /// xterm rewrites a bisected pair's surviving half differently by operation:
     ///
-    /// - EL / ED reach `util.c` `ClearRight`, whose wide fixup sends both orphan
-    ///   spans through `ClearInLine2` -> `ClearCells` (`screen.c`), like the
-    ///   erased span: `' '` with `ld->color[col] = xtermColorPair(xw)`, i.e.
-    ///   the BCE background. These callers pass `orphan = fill`. (ECH follows the
-    ///   same rule, but `Grid::erase_chars` uses `Row::erase_chars_with`, which
-    ///   writes `fill` into both orphans itself.)
-    /// - DECERA / DECFRA reach `screen.c` `ScrnFillRectangle`, whose fixup is
-    ///   `Clear1Cell(ld, left - 1)` / `Clear1Cell(ld, right + 1)`: a bare clear
-    ///   without fill character or colour. The orphan is outside the rectangle,
-    ///   and a DECFRA fill glyph there would bleed past the rect. These callers
-    ///   pass `orphan = Cell::EMPTY`, as plain `clear_range_with` does.
+    /// - EL / ED reach `util.c` `ClearRight`, whose fixup sends both orphans
+    ///   through `ClearInLine2` -> `ClearCells` like the erased span: `' '` in
+    ///   the BCE background. These callers pass `orphan = fill`. (ECH follows
+    ///   the same rule through `Row::erase_chars_with`, which fills both
+    ///   orphans itself.)
+    /// - DECERA / DECFRA reach `screen.c` `ScrnFillRectangle`, whose fixup is a
+    ///   bare `Clear1Cell` without fill character or colour: the orphan is
+    ///   outside the rectangle, where a DECFRA fill glyph would bleed past it.
+    ///   These callers pass `orphan = Cell::EMPTY`.
     ///
-    /// The selective erases (DECSEL / DECSED) use `selective_clear_range`, which
-    /// never reaches here and writes `Cell::EMPTY` orphans without BCE, unlike
-    /// xterm (whose `ClearInLine2` clears each unprotected segment through
-    /// `ClearCells`).
+    /// The selective erases (DECSEL / DECSED) use `selective_clear_range`,
+    /// which writes `Cell::EMPTY` orphans without BCE, unlike xterm.
     ///
     /// `orphan` is therefore `Cell::EMPTY` or `fill`; the `len` bookkeeping
     /// below relies on that (a blank fill implies a blank orphan).
@@ -173,8 +129,8 @@ impl Row {
 
         let mut cleared_right_orphan = false;
         if end > start && end < cols && self.cells[end - 1].flags().contains(CellFlags::WIDE) {
-            // Same reasoning on the right: cells[end] is the orphaned
-            // continuation OUTSIDE the written range.
+            // Likewise on the right: cells[end] is the orphaned continuation,
+            // outside the written range.
             self.cells[end] = orphan;
             cleared_right_orphan = true;
             written_end = end + 1;
@@ -182,21 +138,16 @@ impl Row {
 
         self.cells[start..end].fill(fill);
         self.flags |= RowFlags::DIRTY;
-        // Is the right-hand orphan we just rewrote CONTENT? It is when the BCE
-        // blank carries a visible background; it is not when it is Cell::EMPTY.
+        // The right orphan is content when it got the BCE blank, not when it
+        // got Cell::EMPTY.
         let right_orphan_is_content = cleared_right_orphan && !orphan.is_empty();
         if !fill.is_empty() {
-            // Visible fill (a BCE background, a DECFRA fill character, or
-            // attribute flags): len must cover the filled range so row_text /
-            // render_row keep it (DECFRA characters are displayed per VT420/VT520
-            // even with default colors).
-            //
-            // The fill guarantees content through end-1, so len >= end; content
-            // past the rect extends len to old_len. Exception: when the only cell
-            // past the fill was the wide-continuation orphan just cleared to EMPTY
-            // (old_len == end + 1), len is exactly `end`, or a stale trailing
-            // space would appear one column past the rect. When the orphan got
-            // the visible BCE blank instead, it is content, and len covers it.
+            // A visible fill (BCE background, DECFRA glyph, attribute flags)
+            // is content through end-1; DECFRA glyphs display even with
+            // default colours (VT420/VT520). Content past the rect keeps
+            // old_len, except when the only cell past it was the continuation
+            // just cleared to EMPTY (old_len == end + 1): len is then `end`,
+            // or a stale trailing space shows one column past the rect.
             let new_end = if right_orphan_is_content {
                 (end + 1).max(old_len)
             } else if cleared_right_orphan && old_len == end + 1 {
@@ -221,14 +172,8 @@ impl Row {
         super::u16_from_usize(written_start)..super::u16_from_usize(written_end)
     }
 
-    /// Fix orphaned wide character halves at rectangular operation boundaries.
-    ///
-    /// After copying/clearing cells within columns [left, right], wide
-    /// character pairs spanning the boundary may have been bisected; clear the
-    /// orphaned half of any such pair.
-    ///
-    /// `left` and `right` are inclusive column indices. `cols` is the total
-    /// number of columns in the row.
+    /// Clear the orphaned half of any wide pair a rectangular copy/clear of
+    /// columns `[left, right]` (inclusive) bisected; `cols` is the row width.
     ///
     /// `clear_orphan_spacers` controls the two ambiguous branches (an apparent
     /// orphaned continuation whose WIDE head is not to its left). PROTECTED
@@ -286,12 +231,8 @@ impl Row {
         }
     }
 
-    /// Context-aware protection check that disambiguates the shared
-    /// `PROTECTED` / `WIDE_CONTINUATION` bit using neighbor information.
-    ///
-    /// `Cell::is_protected()` is unreliable for wide characters because
-    /// `PROTECTED` and `WIDE_CONTINUATION` share bit 10. This method
-    /// checks the previous cell to distinguish the two cases.
+    /// Whether `col` is DECSCA-protected. `Cell::is_protected()` cannot tell:
+    /// WIDE_CONTINUATION shares bit 10, so the previous cell decides.
     #[inline]
     pub(crate) fn is_cell_protected(&self, col: u16) -> bool {
         let col = col as usize;
@@ -321,13 +262,9 @@ impl Row {
         true // normal protected cell
     }
 
-    /// Context-aware wide-continuation check that disambiguates the shared
-    /// `WIDE_CONTINUATION` / `PROTECTED` bit using neighbor information.
-    ///
-    /// `Cell::is_wide_continuation()` is unreliable for protected cells
-    /// because `PROTECTED` and `WIDE_CONTINUATION` share bit 10. A true
-    /// continuation spacer always immediately follows its `WIDE` main cell;
-    /// a bit-10 cell without that neighbor is a DECSCA-protected cell.
+    /// Whether `col` is a wide continuation. `Cell::is_wide_continuation()`
+    /// cannot tell: PROTECTED shares bit 10. A real spacer immediately follows
+    /// its WIDE head; a bit-10 cell without one is DECSCA-protected.
     #[inline]
     pub fn is_cell_wide_continuation(&self, col: u16) -> bool {
         let col = col as usize;
@@ -350,11 +287,8 @@ impl Row {
         col > 0 && self.cells[col - 1].flags().contains(CellFlags::WIDE)
     }
 
-    /// Selectively clear cells from start to `end` (exclusive).
-    ///
-    /// Only erases cells that are NOT protected (DECSCA).
-    /// Protected cells are skipped. Uses context-aware protection
-    /// check to correctly handle wide characters.
+    /// Selectively clear cells from `start` to `end` (exclusive), skipping
+    /// DECSCA-protected cells (context-aware, so wide pairs are handled).
     #[inline]
     pub(crate) fn selective_clear_range(&mut self, start: u16, end: u16) {
         debug_assert!(
@@ -419,25 +353,20 @@ impl Row {
         }
     }
 
-    /// Selectively wipe characters from `start` to `end` (exclusive),
-    /// preserving visual attributes (DECSERA semantics).
+    /// Selectively wipe characters from `start` to `end` (exclusive), keeping
+    /// visual attributes (DECSERA).
     ///
-    /// Per VT520 (EK-VT520-RM, DECSERA): erased positions become spaces, but
-    /// "DECSERA does not change: visual attributes set by the select graphic
-    /// rendition (SGR) function; protection attributes set by DECSCA; line
-    /// attributes." xterm matches (ScrnWipeRectangle writes ' ' into charData
-    /// only). Contrast [`Row::selective_clear_range`] (DECSED/DECSEL), which
-    /// resets cells entirely (xterm ClearCells).
+    /// Per VT520 (EK-VT520-RM), erased positions become spaces but "DECSERA does
+    /// not change: visual attributes set by the select graphic rendition (SGR)
+    /// function; protection attributes set by DECSCA; line attributes." xterm
+    /// matches (ScrnWipeRectangle writes ' ' into charData only). Contrast
+    /// [`Row::selective_clear_range`] (DECSED/DECSEL), which resets cells.
     ///
-    /// Protected cells are skipped, using the context-aware protection check;
-    /// a wiped wide character becomes two narrow spaces (`set_char` clears
-    /// COMPLEX/WIDE/WIDE_CONTINUATION but keeps SGR flags, colors and any
-    /// interned style id).
-    ///
-    /// Each wiped column (including the wide left-boundary fixup and the
-    /// continuation co-wipe) is pushed onto `wiped`, so the caller can scrub
-    /// stale combining marks / complex-char strings from the grid extras while
-    /// keeping their truecolor.
+    /// Protected cells are skipped; a wiped wide character becomes two narrow
+    /// spaces (`set_char` clears COMPLEX/WIDE/WIDE_CONTINUATION but keeps SGR
+    /// flags, colors and any style id). Each wiped column is pushed onto
+    /// `wiped`, so the caller can scrub stale combining marks and complex-char
+    /// strings from the extras while keeping their truecolor.
     #[inline]
     pub(crate) fn selective_wipe_range(&mut self, start: u16, end: u16, wiped: &mut Vec<u16>) {
         debug_assert!(
@@ -503,11 +432,8 @@ impl Row {
         }
     }
 
-    /// Selectively clear the entire row.
-    ///
-    /// Only erases cells that are NOT protected (DECSCA).
-    /// Protected cells are skipped. Uses context-aware protection
-    /// check to correctly handle wide characters.
+    /// Selectively clear the whole row, skipping DECSCA-protected cells
+    /// (context-aware, so wide pairs are handled).
     #[inline]
     pub(crate) fn selective_clear(&mut self) {
         debug_assert!(
@@ -521,9 +447,7 @@ impl Row {
         let cols = self.cells.len();
         for col in 0..cols {
             if !self.is_cell_protected(col as u16) {
-                // If this is a WIDE cell, also clear its continuation so the
-                // forward iteration doesn't see an orphaned continuation whose
-                // WIDE parent was already cleared.
+                // A cleared WIDE head takes its continuation with it.
                 if self.cells[col].flags().contains(CellFlags::WIDE) && col + 1 < cols {
                     self.cells[col + 1] = Cell::EMPTY;
                 }

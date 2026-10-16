@@ -128,8 +128,7 @@ fn hovered_link_reuses_the_frame_plan() {
         "hover caret projection borrows the frame plan",
     );
 
-    // Negative control: the former frame shape resolved its outer plan and
-    // then let the hover consumer independently rebuild the same geometry.
+    // Negative control: the unthreaded splice rebuilds the plan itself.
     reset_visible_leaf_plan_builds();
     assert!(app.active_visible_frame_layout(wid).is_some());
     app.splice_link_target(wid);
@@ -573,15 +572,11 @@ fn output_that_swaps_the_link_under_the_pointer_is_followed_by_the_caption() {
     );
 }
 
-/// The destination is resolved once per (hover cell, engine fill) and kept
-/// as the engine's `Arc<str>`: an unchanged fill repaints the caption with
-/// no terminal lock and no copy; a changed fill re-reads once, under the
-/// fill's own hold (`App::refresh_hover_for_frame_locked`), so the frame's
-/// acquisition count is the same either way.
-///
-/// Modelled as production redraws: each refills `input_scratch`, and the
-/// strip splice and caption write bump `snapshot_seq` without a new engine
-/// fill, so a memo keyed on `snapshot_seq` would re-probe every frame.
+/// The destination is resolved once per (hover cell, engine fill): an unchanged
+/// fill repaints the caption with no terminal lock; a changed fill re-reads
+/// under the fill's own hold (`App::refresh_hover_for_frame_locked`), so the
+/// frame's acquisition count is the same either way. The strip splice bumps
+/// `snapshot_seq` without a new fill, so the memo is not keyed on it.
 #[test]
 fn the_caption_reads_its_cached_destination_until_the_frame_moves() {
     let mut app = App::headless_for_test();
@@ -695,11 +690,9 @@ const OTHER: &str = "https://other.example/";
 /// Column of the `b` in `bing.com`: `Visit ` (6) + `google.com` (10) + ` or ` (4).
 const OTHER_COL: u16 = 20;
 
-/// A hover probe deferred by a held mutex is answered by the next frame
-/// under its own hold. The pointer moves between two links while a reader
-/// holds the terminal; the next frame must present the second link, which
-/// needs (1) the fill site to re-probe on the memo's cell, not only its
-/// fill epoch (`HoverMemo::stands_for`), and (2) the caption to be a
+/// A hover probe deferred by a held mutex is answered by the next frame under
+/// its own hold. That needs the fill to re-probe on the memo's cell, not only
+/// its fill epoch (`HoverMemo::stands_for`), and the caption to be a
 /// `RepaintKey` term so the frame does not take the early-out.
 #[test]
 fn a_probe_deferred_by_a_busy_mutex_is_answered_by_the_next_frame_under_its_own_hold() {
@@ -1260,7 +1253,7 @@ fn the_caption_never_takes_the_row_the_caret_is_on() {
         .as_bytes(),
     );
 
-    // CONTROL: with no hover the caret is on the bottom row with its text.
+    // Control: with no hover the caret is on the bottom row with its text.
     let rows = compose(&mut app, wid);
     let caret_row = app.windows[&wid].input_scratch.cursor_row;
     assert_eq!(caret_row, usize::from(bottom), "the caret is on the prompt");
@@ -1460,7 +1453,7 @@ fn the_caption_never_takes_a_sibling_panes_command_line() {
             leaf.rect.size.width.round() as u16,
         )
     };
-    // The SIBLING is mid-command on ITS bottom row — which is the window's
+    // The sibling is mid-command on its bottom row, which is the window's
     // bottom row, the row the band prefers.
     let left_term = app.pool.get(left).expect("the left pane").term.clone();
     for _ in 0..left_rows.saturating_sub(1) {

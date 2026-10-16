@@ -61,9 +61,20 @@
 //! its pipes. A child that exits on time is not waited past a short grace
 //! for a descendant still holding a pipe. Children need no gate.
 //!
+//! The wait for the exit is the kernel's report of it ([`ExitWait`]: a kqueue
+//! on Darwin, a pidfd on Linux), not a sleep tick, so a 40 ms tool returns at
+//! 40 ms rather than at the next tick past it.
+//!
+//! # Several children at once: [`outputs_until`]
+//!
+//! A verification that needs five tools' answers waits for the slowest, not
+//! the sum: every child is started before any is waited for, and one
+//! `poll(2)` on this thread drains their streams and watches their exits, so
+//! it starts no thread (the boot apply runs it before the window has one).
+//!
 //! # Tests
 //!
-//! With the `test-support` feature (dev-dependencies only), [`notice_once`]
+//! In a test or debug build (never a release one), [`notice_once`]
 //! and [`trust_service_silent`]: a test that needs `trustd` to answer asks
 //! once per binary, and skips with one line on stderr when it does not;
 //! [`disk_image_service_silent`] does the same for an `hdiutil` that timed out.
@@ -76,9 +87,12 @@ use crate::spawnfd::{Child, Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(unix)]
+mod children;
+
+#[cfg(any(test, debug_assertions))]
 mod silent;
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, debug_assertions))]
 pub use silent::{
     CODESIGN_HANG, DISK_IMAGE_SKIPPED, SKIPPED, disk_image_service_silent, notice_once,
     sign_ad_hoc, trust_service_silent,
@@ -272,8 +286,9 @@ impl std::fmt::Display for RunError {
 
 impl std::error::Error for RunError {}
 
-/// The first child-exit poll, doubled up to [`POLL_MAX`]: a tool that takes
-/// tens of milliseconds is not rounded up to a fixed tick.
+/// The fallback child-exit tick where the kernel has no exit descriptor
+/// ([`ExitWait`]), doubled up to [`POLL_MAX`]: a tool that takes tens of
+/// milliseconds is not rounded up to a fixed tick.
 const POLL_MIN: Duration = Duration::from_millis(1);
 const POLL_MAX: Duration = Duration::from_millis(25);
 
@@ -303,10 +318,23 @@ pub const OUTPUT_KEEP: usize = 1024 * 1024;
 /// [`RunError::Spawn`], [`RunError::Wait`] or [`RunError::TimedOut`]; never a
 /// partial output.
 pub fn output_until(cmd: &mut Command, deadline: Instant) -> Result<Output, RunError> {
+    output_until_from(cmd, Stdio::null(), deadline)
+}
+
+/// [`output_until`] with `stdin` as the child's standard input (a file the caller opened),
+/// for a tool that reads its request there.
+///
+/// # Errors
+/// As [`output_until`].
+pub fn output_until_from(
+    cmd: &mut Command,
+    stdin: Stdio,
+    deadline: Instant,
+) -> Result<Output, RunError> {
     #[cfg(unix)]
     cmd.process_group(0);
     let mut child = cmd
-        .stdin(Stdio::null())
+        .stdin(stdin)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -320,7 +348,7 @@ pub fn output_until(cmd: &mut Command, deadline: Instant) -> Result<Output, RunE
             return Err(RunError::Spawn(e));
         }
     };
-    let mut poll = POLL_MIN;
+    let mut exit = ExitWait::new(&child);
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
@@ -330,8 +358,7 @@ pub fn output_until(cmd: &mut Command, deadline: Instant) -> Result<Output, RunE
                     end(&mut child);
                     return Err(RunError::TimedOut);
                 }
-                std::thread::sleep(poll.min(remaining));
-                poll = (poll * 2).min(POLL_MAX);
+                exit.wait(remaining);
             }
             Err(e) => {
                 end(&mut child);
@@ -351,21 +378,127 @@ pub fn output_until(cmd: &mut Command, deadline: Instant) -> Result<Output, RunE
     })
 }
 
+/// Waits for one child's exit AS THE KERNEL REPORTS IT.
+///
+/// A wait that sleeps a tick between `try_wait`s pays the rest of the tick on
+/// every child: from 1 ms doubling to 25 ms, about half again a 30-70 ms
+/// `codesign`. This one blocks on a descriptor the kernel makes readable when
+/// the child exits (Darwin: a kqueue `EVFILT_PROC`/`NOTE_EXIT`; Linux: a
+/// pidfd — [`crate::exitwatch::exit_fd`]), so the wait ends at the exit, and
+/// still at the caller's timeout. Where there is no such descriptor (Windows,
+/// a kernel without `pidfd_open`) it sleeps the old backoff tick.
+///
+/// Make it while the child is unreaped (right after the spawn), then
+/// alternate `try_wait` with [`ExitWait::wait`]:
+///
+/// ```ignore
+/// let mut exit = ExitWait::new(&child);
+/// while child.try_wait()?.is_none() {
+///     exit.wait(deadline.saturating_duration_since(Instant::now()));
+/// }
+/// ```
+#[derive(Debug)]
+pub struct ExitWait {
+    /// Readable once the child has exited; `None` when there is no such
+    /// descriptor, or once it has reported (it stays readable, and a child
+    /// the kernel has not yet made reapable must not spin on it).
+    #[cfg(unix)]
+    fd: Option<std::os::fd::OwnedFd>,
+    /// The fallback sleep, doubled up to [`POLL_MAX`].
+    tick: Duration,
+}
+
+impl ExitWait {
+    /// A wait on `child`'s exit.
+    #[must_use]
+    pub fn new(child: &Child) -> Self {
+        #[cfg(not(unix))]
+        let _ = child;
+        Self {
+            #[cfg(unix)]
+            fd: crate::exitwatch::exit_fd(child.id()),
+            tick: POLL_MIN,
+        }
+    }
+
+    /// Block until the kernel reports the child's exit or `timeout` passes,
+    /// whichever is first. Says nothing either way: the caller's `try_wait`
+    /// is the answer.
+    pub fn wait(&mut self, timeout: Duration) {
+        #[cfg(unix)]
+        if let Some(fd) = &self.fd {
+            match children::exit_reported(fd, timeout) {
+                Ok(false) => return,
+                // Reported: the next `try_wait` reaps it. Ticks from here on.
+                Ok(true) => {
+                    self.reported();
+                    return;
+                }
+                // A `poll` that cannot run (no memory): fall back to ticks.
+                Err(_) => self.reported(),
+            }
+        }
+        std::thread::sleep(self.tick.min(timeout));
+        self.tick = (self.tick * 2).min(POLL_MAX);
+    }
+
+    /// The descriptor to poll beside others, while it can still report.
+    #[cfg(unix)]
+    fn reporter(&self) -> Option<std::os::fd::RawFd> {
+        self.fd.as_ref().map(std::os::fd::AsRawFd::as_raw_fd)
+    }
+
+    /// The exit has been reported: wait on ticks from here on.
+    #[cfg(unix)]
+    fn reported(&mut self) {
+        self.fd = None;
+    }
+}
+
 /// Kill (`SIGKILL`; on Unix the child's whole process group, which
 /// [`output_until`] made it lead) and reap.
 fn end(child: &mut Child) {
     #[cfg(unix)]
-    if let Ok(pid) = i32::try_from(child.id()) {
-        unsafe extern "C" {
-            fn kill(pid: i32, sig: i32) -> i32;
-        }
-        const SIGKILL: i32 = 9;
-        // SAFETY: a plain syscall. The child is not yet reaped, so its pid —
-        // and with it the group id it leads — cannot have been reused.
-        unsafe { kill(-pid, SIGKILL) };
-    }
+    children::kill_group(child);
+    #[cfg(not(unix))]
     let _ = child.kill();
     let _ = child.wait();
+}
+
+/// Several children at once — [`output_until`] for each of `cmds`, all
+/// started before any is waited for and all held to the one `deadline`; the
+/// results come back in `cmds`' order. Each child's stdin is closed, both its
+/// streams are drained (their last [`OUTPUT_KEEP`] bytes kept), and on Unix
+/// it leads a process group of its own. A child that exits is read for at
+/// most [`DRAIN_GRACE`] more, as in [`output_until`].
+///
+/// Unlike [`output_until`], the cleanup at the deadline is BOUNDED: every
+/// child still running then has its group killed (`SIGKILL`), and all of them
+/// are reaped within `reap` of that. A child the kernel has not let go by
+/// then is left to [`crate::reaper`]; its answer is [`RunError::TimedOut`]
+/// either way. A caller on a deadline of its own (an apply before the window)
+/// cannot park on a process wedged in the kernel past its `SIGKILL`.
+///
+/// On Unix no thread is started: one `poll(2)` drains every stream and
+/// watches every exit ([`ExitWait`]'s descriptor). Elsewhere the children run
+/// one after another through [`output_until`].
+#[must_use]
+pub fn outputs_until(
+    cmds: &mut [&mut Command],
+    deadline: Instant,
+    reap: Duration,
+) -> Vec<Result<Output, RunError>> {
+    #[cfg(unix)]
+    {
+        children::outputs_until(cmds, deadline, reap)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = reap;
+        cmds.iter_mut()
+            .map(|cmd| output_until(cmd, deadline))
+            .collect()
+    }
 }
 
 /// One stream being read on a thread of its own: the tail so far, and a
@@ -416,9 +549,9 @@ mod tests {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
-    use super::{Gate, Refused};
     #[cfg(unix)]
-    use super::{RunError, output_until};
+    use super::{ExitWait, OUTPUT_KEEP, RunError, output_until, outputs_until};
+    use super::{Gate, Refused};
 
     /// The deadline the stand-in work is held to. Short, because the work never
     /// answers on its own; the assertion is that the CALL comes back.
@@ -685,5 +818,154 @@ mod tests {
             ),
             Err(RunError::Spawn(_))
         ));
+    }
+
+    /// A shell running `script` with `args` as `$0`, `$1`, ….
+    #[cfg(unix)]
+    fn sh(script: &str, args: &[&std::path::Path]) -> crate::spawnfd::Command {
+        let mut cmd = crate::spawnfd::command("/bin/sh");
+        cmd.arg("-c").arg(script).args(args);
+        cmd
+    }
+
+    /// A scratch directory of this test's own.
+    #[cfg(unix)]
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("uds-deadline-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        dir
+    }
+
+    /// The wait ends when the child does: it is the kernel's report, not the
+    /// timeout. (A wait that slept its timeout would take the hang detector.)
+    #[cfg(unix)]
+    #[test]
+    fn an_exit_wait_ends_at_the_exit() {
+        let mut child = crate::spawnfd::command("/bin/sh")
+            .args(["-c", "exit 4"])
+            .spawn()
+            .expect("spawn");
+        let mut exit = ExitWait::new(&child);
+        let begun = Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("wait") {
+                break status;
+            }
+            exit.wait(HANG);
+        };
+        assert!(begun.elapsed() < HANG, "the wait outlived the exit");
+        assert_eq!(status.code(), Some(4));
+    }
+
+    /// Every child is started before any is waited for: the first cannot
+    /// finish until the second has run, which a one-after-another run would
+    /// only reach at the deadline. Each answers with its own status and
+    /// streams, in the order given, and a tool that cannot start is its own
+    /// answer and stops nothing else. One that exits leaving a descendant on
+    /// its pipe answers after the grace, not at the (far) deadline.
+    #[cfg(unix)]
+    #[test]
+    fn several_children_run_at_once_and_each_answers_for_itself() {
+        let dir = scratch("many");
+        let flag = dir.join("flag");
+        let holder_file = dir.join("holder");
+        let mut waits = sh(
+            "while [ ! -e \"$0\" ]; do sleep 0.01; done; printf first; printf e1 >&2; exit 3",
+            &[&flag],
+        );
+        let mut missing = crate::spawnfd::command("/nonexistent/tool");
+        let mut signals = sh(": > \"$0\"; printf second", &[&flag]);
+        let mut leaves = sh("sleep 600 & echo $! > \"$0\"; echo hi", &[&holder_file]);
+        let begun = Instant::now();
+        let results = outputs_until(
+            &mut [&mut waits, &mut missing, &mut signals, &mut leaves],
+            Instant::now() + HANG * 2,
+            Duration::from_secs(1),
+        );
+        let waited = begun.elapsed();
+        kill_stray(pid_in(&holder_file));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(waited < HANG, "waited out the deadline: {waited:?}");
+        let mut results = results.into_iter();
+        let first = results.next().expect("one").expect("the first ran");
+        assert_eq!(first.status.code(), Some(3));
+        assert_eq!(first.stdout, b"first");
+        assert_eq!(first.stderr, b"e1");
+        assert!(matches!(results.next(), Some(Err(RunError::Spawn(_)))));
+        let third = results.next().expect("three").expect("the third ran");
+        assert!(third.status.success());
+        assert_eq!(third.stdout, b"second");
+        let leaves = results.next().expect("four").expect("the fourth ran");
+        assert!(leaves.status.success());
+        assert_eq!(leaves.stdout, b"hi\n");
+        assert!(results.next().is_none());
+    }
+
+    /// A child that writes far more than a pipe holds, on both streams, does
+    /// not stall against the wait: it is read while it runs, and keeps the
+    /// tail past [`OUTPUT_KEEP`].
+    #[cfg(unix)]
+    #[test]
+    fn a_child_writing_more_than_a_pipe_holds_is_drained_while_it_runs() {
+        let mut chatty = sh(
+            "head -c 300000 /dev/zero; head -c 300000 /dev/zero >&2; exit 0",
+            &[],
+        );
+        let mut flood = sh("head -c 1100000 /dev/zero | tr '\\0' a; printf END", &[]);
+        let results = outputs_until(
+            &mut [&mut chatty, &mut flood],
+            Instant::now() + HANG,
+            Duration::from_secs(1),
+        );
+        let mut results = results.into_iter();
+        let chatty = results.next().expect("one").expect("ran");
+        assert!(chatty.status.success());
+        assert_eq!(chatty.stdout.len(), 300_000);
+        assert_eq!(chatty.stderr.len(), 300_000);
+        let flood = results.next().expect("two").expect("ran");
+        assert_eq!(flood.stdout.len(), OUTPUT_KEEP);
+        assert!(flood.stdout.ends_with(b"aaaEND"), "the tail is kept");
+    }
+
+    /// At the deadline a child still running is killed with its group and
+    /// REAPED within the reserve, and the others keep their own answers: a
+    /// tool that could not start is still that, not a timeout.
+    #[cfg(unix)]
+    #[test]
+    fn at_the_deadline_the_running_child_is_killed_and_reaped_and_the_rest_keep_their_answers() {
+        let dir = scratch("many-deadline");
+        let pid_file = dir.join("pid");
+        let grandchild_file = dir.join("grandchild");
+        let mut wedged = sh(
+            "sleep 600 & echo $! > \"$1\"; echo $$ > \"$0\"; exec sleep 600",
+            &[&pid_file, &grandchild_file],
+        );
+        let mut missing = crate::spawnfd::command("/nonexistent/tool");
+        let begun = Instant::now();
+        let results = outputs_until(
+            &mut [&mut wedged, &mut missing],
+            Instant::now() + Duration::from_secs(2),
+            Duration::from_secs(1),
+        );
+        assert!(begun.elapsed() < HANG, "the call did not come back");
+        let mut results = results.into_iter();
+        assert!(matches!(results.next(), Some(Err(RunError::TimedOut))));
+        assert!(matches!(results.next(), Some(Err(RunError::Spawn(_)))));
+        // A zombie still answers `kill(pid, 0)`: gone means killed AND reaped.
+        // (A machine too loaded to start the shell in two seconds leaves no
+        // pid to look at; the timeout above still held.)
+        if let Some(pid) = pid_in(&pid_file) {
+            assert!(
+                !crate::process::pid_alive(pid),
+                "pid {pid} outlived the call"
+            );
+        }
+        if let Some(pid) = pid_in(&grandchild_file) {
+            let dead = gone(pid);
+            kill_stray((!dead).then_some(pid));
+            assert!(dead, "the child's descendant {pid} outlived the call");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

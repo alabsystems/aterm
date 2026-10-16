@@ -7,7 +7,8 @@
 //! and `transact`.
 //!
 //! Invariant: the spine is gap-free and strictly monotonic — every `apply`
-//! yields exactly one new `Seq`, and `seq == log.len()`. The derived
+//! yields exactly one new `Seq`, and `seq == log.total()` even after eviction
+//! bounds the resident ring. The derived
 //! kernel-family models in `aterm_spec::derive` (Kernel, Subscribe, Snapshot,
 //! Transact, Ring) check it, and `tests/conformance_*.rs` bind them to this
 //! code. The code itself carries no Trust source contracts.
@@ -79,9 +80,9 @@ pub enum BufferRead {}
 pub enum BufferWrite {}
 
 /// Capability witnesses, passed by reference. They are `aterm_cap`
-/// capabilities: only an [`aterm_cap::Authority`] grants one, and only the
-/// feature-sealed `Authority::root_authority` in the launcher binaries mints
-/// that. A verb called without the matching cap does not compile, and neither
+/// capabilities: only an [`aterm_cap::Authority`] grants one, and only
+/// `Authority::root_authority`, which the `launcher-mint` source guard keeps in
+/// the launcher binaries, mints that. A verb called without the matching cap does not compile, and neither
 /// does a forged one:
 ///
 /// ```compile_fail,E0423

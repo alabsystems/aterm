@@ -1,28 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The anchored CONNECTION CONFIRM/CONFIGURE card (design §3.3 + §2.5): ONE
-//! shared component serving both the drop popover (the §3.3 confirm, origin
-//! `drag`) and the Configure… sheet (the §2.5 editor, origin `menu`) — the two
-//! surfaces are the same card with a different prefill, so wire callers, the
-//! sheet, and the drop produce identical transitions through the one
+//! The anchored connection confirm/configure card: one component serving both the drop popover
+//! (origin `drag`) and the Configure… sheet (origin `menu`), the same card with a different
+//! prefill, so wire callers, the sheet and the drop make identical transitions through the one
 //! declarative [`crate::connections::connect_in`] seam.
 //!
-//! A sibling of [`crate::tab_menu`] on the [`crate::palette`] pattern: the
-//! state lives in the single modal [`crate::overlay::Overlay`] slot, so its
-//! key handling structurally sits BEFORE the terminal (`on_key_overlay_mode`
-//! runs ahead of every keybinding/`[key_sequences]`/PTY path, and the
-//! engine-neutral `App::input` gate swallows controller bytes the same way) —
-//! Enter/Esc can NEVER leak into T's PTY, the §3.3 panel's sharpest catch.
+//! A sibling of [`crate::tab_menu`] on the [`crate::palette`] pattern: the state lives in the
+//! single modal [`crate::overlay::Overlay`] slot, so its key handling sits before the terminal
+//! (`on_key_overlay_mode` runs ahead of every keybinding/`[key_sequences]`/PTY path, and the
+//! engine-neutral `App::input` gate swallows controller bytes the same way): Enter/Esc never
+//! reach T's PTY.
 //!
-//! The card names S and T by sid+title, offers a DIRECTION control
-//! (S→T / T→S / both) and a KIND control (pull / push / both), and mints
-//! NOTHING before Confirm (Enter); Esc cancels with no residue. Confirming is
-//! SET semantics (§2.5): the pair's connections become exactly what the card
-//! shows — a direction deselected that existed at open time is disconnected,
-//! a selected one is `connect`ed to the edited kind (idempotent when
-//! unchanged). Native macOS hosts this same in-grid card in the content view;
-//! there is deliberately no separate AppKit sheet.
+//! The card names S and T by sid+title, offers a direction control (S→T / T→S / both) and a kind
+//! control (pull / push / both), and mints nothing before Confirm (Enter); Esc cancels with no
+//! residue. Confirming is set semantics: the pair's connections become exactly what the card
+//! shows (a deselected direction that existed at open is disconnected, a selected one is
+//! `connect`ed to the edited kind, idempotent when unchanged). Native macOS hosts this same
+//! in-grid card in the content view; there is deliberately no separate AppKit sheet.
 
 use aterm_render::Theme;
 use aterm_session::{ConnectionKind, SessionId};
@@ -32,11 +27,10 @@ use crate::tray_raster::row_baseline;
 use crate::type_scale::TypeStep;
 use crate::widget::{DrawPrim, TextFace, TextWeight, TrayInput, rgba, text_prim};
 
-/// Which flows the card asserts, seen from the pair it was opened over
-/// (S = `src`, T = `dst`). The §3.3 DECIDED default is `SrcToDst` ("drag takes
-/// control") — but only when nothing exists yet: an existing reverse half
-/// promotes the initial selection so confirming the default never silently
-/// revokes it (deselection is always an explicit edit).
+/// Which flows the card asserts, seen from the pair it was opened over (S = `src`, T = `dst`).
+/// The default is `SrcToDst` ("drag takes control") only when nothing exists yet: an existing
+/// reverse half promotes the initial selection, so confirming the default never silently
+/// revokes it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum CardDirection {
     /// S drives T (rows minted into T's table).
@@ -80,10 +74,9 @@ pub(crate) enum ConnCardHit {
     Cancel,
 }
 
-/// What each direction of the pair held AT OPEN time — the configure prefill
-/// (derived from the live edge tables, so a wire `grant` with no
-/// [`crate::connections::ConnectionRecord`] still prefills honestly) and the
-/// baseline [`ConnCardState::plan`] diffs against on Confirm.
+/// What each direction of the pair held at open: the configure prefill (derived from the live
+/// edge tables, so a wire `grant` with no [`crate::connections::ConnectionRecord`] still
+/// prefills honestly) and the baseline [`ConnCardState::plan`] diffs against on Confirm.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub(crate) struct PairKinds {
     /// The S→T half's kind, `None` when no such rows exist.
@@ -92,11 +85,10 @@ pub(crate) struct PairKinds {
     pub dst_to_src: Option<ConnectionKind>,
 }
 
-/// The exact authority acts one Confirm performs — computed PURE from the card
-/// state so the state machine is unit-testable without an `App`; the glue
-/// executes it through [`crate::connections::connect_in`] /
-/// [`crate::connections::disconnect_kind_in`] and nothing else. Esc never
-/// produces a plan, so Esc can never mint.
+/// The exact authority acts one Confirm performs, computed purely from the card state so the
+/// state machine is unit-testable without an `App`; the glue executes it through
+/// [`crate::connections::connect_in`] / [`crate::connections::disconnect_kind_in`] and nothing
+/// else. Esc never produces a plan, so Esc can never mint.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ConnCardPlan {
     /// `(src, dst, kind)` declarative connects (set semantics — idempotent on
@@ -132,7 +124,7 @@ const MIN_CARD_CELLS: f32 = 36.0;
 /// sessions by sid (a peer that died meanwhile makes its half a logged no-op,
 /// never a wrong-target mint).
 pub(crate) struct ConnCardState {
-    /// The hosting window (T's window for a drop — §3.3 focuses it first).
+    /// The hosting window (T's window for a drop, focused first).
     pub(crate) window: crate::WindowId,
     /// S — the connection's proposing side (the dragged-from / subject session).
     pub(crate) src: SessionId,
@@ -140,7 +132,7 @@ pub(crate) struct ConnCardState {
     pub(crate) dst: SessionId,
     src_title: String,
     dst_title: String,
-    /// The audit origin this card confirms with (`menu` | `drag`, §7).
+    /// The audit origin this card confirms with (`menu` | `drag`).
     pub(crate) origin: &'static str,
     /// Strip column the card anchors under (T's chip when resolvable).
     anchor_col: u16,
@@ -158,12 +150,10 @@ pub(crate) struct ConnCardState {
 }
 
 impl ConnCardState {
-    /// Build the card over pair `src → dst`, prefilled from `prefill`: an
-    /// existing half selects itself (so confirming the initial state never
-    /// revokes silently); with nothing existing the §3.3 DECIDED default is
-    /// S→T `both` ("drag takes control"). When the two halves hold DIFFERENT
-    /// kinds the single kind control shows the S→T half's; confirming rewrites
-    /// both to what the card shows (visible before Confirm — set semantics).
+    /// Build the card over pair `src → dst`, prefilled from `prefill`: an existing half selects
+    /// itself (so confirming the initial state never revokes silently); with nothing existing
+    /// the default is S→T `both` ("drag takes control"). When the halves hold different kinds
+    /// the kind control shows the S→T half's, and confirming rewrites both to it.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         window: crate::WindowId,
@@ -216,10 +206,9 @@ impl ConnCardState {
         )
     }
 
-    /// The Confirm plan — pure §2.5 SET semantics against the open-time
-    /// baseline: selected halves become `kind` (idempotent when unchanged),
-    /// deselected halves that existed are disconnected, deselected halves that
-    /// never existed produce nothing.
+    /// The Confirm plan, set semantics against the open-time baseline: selected halves become
+    /// `kind` (idempotent when unchanged), deselected halves that existed are disconnected, and
+    /// deselected halves that never existed produce nothing.
     pub(crate) fn plan(&self) -> ConnCardPlan {
         let mut plan = ConnCardPlan::default();
         let halves = [
@@ -264,7 +253,7 @@ impl ConnCardState {
         self.cycle_value(delta);
     }
 
-    /// Cycle the FOCUSED control's value by `delta` (Left/Right), wrapping.
+    /// Cycle the focused control's value by `delta` (Left/Right), wrapping.
     pub(crate) fn cycle_value(&mut self, delta: isize) {
         self.pointer_over = None;
         self.pointer_armed = None;
@@ -286,7 +275,7 @@ impl ConnCardState {
         }
     }
 
-    /// Apply one pointer/a11y CHIP activation (`Confirm`/`Cancel` are the
+    /// Apply one pointer/a11y chip activation (`Confirm`/`Cancel` are the
     /// glue's to act on and return `false` here). Returns whether state moved.
     pub(crate) fn activate_hit(&mut self, hit: ConnCardHit) -> bool {
         match hit {
@@ -328,7 +317,7 @@ impl ConnCardState {
         changed
     }
 
-    /// Settle a left release: activation requires the SAME target at press and
+    /// Settle a left release: activation requires the same target at press and
     /// release. Returns `(changed, activated_target)`.
     pub(crate) fn pointer_release(
         &mut self,
@@ -355,9 +344,8 @@ impl ConnCardState {
         }
     }
 
-    /// The title line naming S and T by sid+title (§3.3), arrow live with the
-    /// direction control. Titles are program-influenced text — sanitized+capped
-    /// like every chrome prose line.
+    /// The title line naming S and T by sid+title, arrow live with the direction control.
+    /// Titles are program-influenced text, sanitized and capped like every chrome prose line.
     pub(crate) fn title_line(&self) -> String {
         let cap = |t: &str| {
             let s = crate::session_timeline::sanitize_presentation_line(t, 64);
@@ -389,7 +377,7 @@ impl ConnCardState {
         (0, CARD_ROWS, CARD_ROWS)
     }
 
-    /// Machine-readable lines for `controls conn-card` — the SAME facts the
+    /// Machine-readable lines for `controls conn-card`: the same facts the
     /// pixels paint, so screen == introspection.
     pub(crate) fn controls_lines(&self) -> Vec<String> {
         let direction = match self.direction {
@@ -448,9 +436,8 @@ impl ConnCardState {
     }
 }
 
-/// The card's kind spelling — the wire `kind=` vocabulary (§6). A free
-/// function because [`ConnectionKind`] is aterm-session's type (no foreign
-/// inherent impl).
+/// The card's kind spelling, the wire `kind=` vocabulary. A free function because
+/// [`ConnectionKind`] is aterm-session's type (no foreign inherent impl).
 pub(crate) fn kind_str(kind: ConnectionKind) -> &'static str {
     match kind {
         ConnectionKind::Pull => "pull",
@@ -496,8 +483,8 @@ fn kind_labels() -> [&'static str; 3] {
     ["pull", "push", "both"]
 }
 
-/// The interactive rect table — every chip and button with its exact painted
-/// rectangle, derived from the SAME layout the painter uses.
+/// The interactive rect table: every chip and button with its exact painted
+/// rectangle, derived from the same layout the painter uses.
 fn conn_card_hit_rects(
     state: &ConnCardState,
     g: &SettingsGeom,
@@ -568,10 +555,9 @@ pub(crate) fn conn_card_hit(
         .map(|(hit, _)| hit)
 }
 
-/// Paint the card: the pair title (arrow live with the direction), the two
-/// chip rows (selected chip washed+ringed, focused row's chips full-strength),
-/// and the Confirm/Cancel buttons. PURE — captured WYSIWYG through the shared
-/// tray path; the palette's shadow/panel/stroke card shape.
+/// Paint the card: the pair title (arrow live with the direction), the two chip rows (selected
+/// chip washed+ringed, focused row's chips full-strength), and the Confirm/Cancel buttons. Pure,
+/// captured WYSIWYG through the shared tray path, in the palette's shadow/panel/stroke shape.
 pub(crate) fn conn_card_tray(state: &ConnCardState, g: &SettingsGeom, theme: Theme) -> TrayInput {
     let r = Roles::from_theme(theme);
     let (cw, ch, px) = (g.cw, g.ch, g.font_px);
@@ -665,7 +651,7 @@ pub(crate) fn conn_card_tray(state: &ConnCardState, g: &SettingsGeom, theme: The
         rgba(r.text_tertiary, 0xFF),
     );
 
-    // Chips + buttons off the SHARED rect table.
+    // Chips + buttons off the shared rect table.
     for (hit, (x, y, w, h)) in conn_card_hit_rects(state, g) {
         let (label, selected, is_button) = match hit {
             ConnCardHit::Direction(d) => (
@@ -738,10 +724,9 @@ pub(crate) fn conn_card_tray(state: &ConnCardState, g: &SettingsGeom, theme: The
     }
 }
 
-/// The card's accessibility tree — four actionable nodes at STATIC ids (the
-/// card has no dynamic row set, so no epoch is needed): the two cycler rows
-/// (Click cycles their value) and the two buttons. Focus follows the focused
-/// control row.
+/// The card's accessibility tree: four actionable nodes at static ids (the card has no dynamic
+/// row set, so no epoch is needed): the two cycler rows (Click cycles their value) and the two
+/// buttons. Focus follows the focused control row.
 #[cfg(a11y_tree)]
 pub(crate) fn conn_card_a11y(state: &ConnCardState) -> accesskit::TreeUpdate {
     use accesskit::{Action, Node, NodeId, Role, Tree, TreeId, TreeUpdate};
@@ -821,9 +806,8 @@ mod tests {
         )
     }
 
-    /// An empty prefill opens at the §3.3 DECIDED default (S→T, both); an
-    /// existing half selects itself so confirming the initial state never
-    /// silently revokes it.
+    /// An empty prefill opens at the default (S→T, both); an existing half selects itself so
+    /// confirming the initial state never silently revokes it.
     #[test]
     fn prefill_derives_the_initial_selection() {
         let c = card(PairKinds::default());
@@ -844,16 +828,15 @@ mod tests {
         assert_eq!(c.direction, CardDirection::Both);
         // The single control shows the S→T half's kind when they differ.
         assert_eq!(c.kind, ConnectionKind::Push);
-        // Confirming the initial BOTH state rewrites both halves to it —
-        // visible in the card before Confirm, no silent revocation.
+        // Confirming the initial `Both` direction rewrites both halves to the shown kind,
+        // with no silent revocation.
         let plan = c.plan();
         assert_eq!(plan.disconnects, Vec::new());
         assert_eq!(plan.connects.len(), 2);
     }
 
-    /// The plan is pure §2.5 set semantics: selected halves connect at the
-    /// EDITED kind, a deselected half that existed disconnects, one that never
-    /// existed produces nothing.
+    /// The plan is set semantics: selected halves connect at the edited kind, a deselected half
+    /// that existed disconnects, one that never existed produces nothing.
     #[test]
     fn plan_diffs_the_edit_against_the_open_baseline() {
         // Configure an existing S→T pull down to push.
@@ -883,8 +866,8 @@ mod tests {
         );
         assert_eq!(plan.disconnects, vec![(sid("s-src"), sid("s-dst"))]);
 
-        // A fresh pair deselected in one direction disconnects NOTHING (it
-        // never existed) — no phantom revokes.
+        // A fresh pair deselected in one direction disconnects nothing (it
+        // never existed): no phantom revokes.
         let c2 = card(PairKinds::default());
         let plan = c2.plan();
         assert_eq!(plan.disconnects, Vec::new());
@@ -935,7 +918,7 @@ mod tests {
 
     /// Painter and hit-test share one rect table: the point at a painted
     /// chip's centre hits exactly that target, and activating a chip moves the
-    /// selection; press/release requires the SAME target.
+    /// selection; press/release requires the same target.
     #[test]
     fn hit_test_shares_the_painted_chip_rects() {
         let mut c = card(PairKinds::default());

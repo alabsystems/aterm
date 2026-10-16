@@ -1,25 +1,23 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! WHO WATCHES THE HEADS. The head watch runs in whichever aterm host is up — the window,
-//! or, with no window open, ONE terminal session — and never in both kinds at once.
-//! Two store-scoped lock files are the rendezvous; neither carries any authority (the
-//! per-vendor `.watch` files still decide whose GET a minute is, and the pass still
-//! re-verifies everything):
+//! Which aterm host runs the head watch: the window, or, with no window open, one terminal
+//! session — never both kinds at once. Two store-scoped lock files are the rendezvous;
+//! neither carries authority (the per-vendor `.watch` files still decide whose GET a minute
+//! is, and the pass re-verifies everything):
 //!
-//! * `vendor-head.hosts` — every window watching holds it SHARED for its watch's life;
-//!   the session watcher holds it EXCLUSIVE for one round of checks at a time. A window
-//!   and a session therefore never check at once, and a window that arrives waits at most
-//!   the round in flight (one short GET) before the session never gets the lock again.
-//! * `vendor-head.session` — the SEAT: the one session that may watch holds it
-//!   exclusive for its life and writes its pid into it. Every other session stands by
-//!   and tries the seat once a minute, so the second tab of a window-less Mac costs one
-//!   `flock` a minute, not a watcher.
+//! * `vendor-head.hosts` — every watching window holds it shared for its watch's life; the
+//!   session watcher holds it exclusive for one round of checks at a time. A window that
+//!   arrives waits at most the round in flight (one short GET), and while it lives the
+//!   session never gets the lock again.
+//! * `vendor-head.session` — the seat: the one session that may watch holds it exclusive
+//!   for its life and writes its pid into it. Every other session tries the seat once a
+//!   minute, so a second tab costs one `flock` a minute, not a watcher.
 //!
 //! The kernel releases both with the process, so a host that exits — cleanly or not —
 //! hands the watch on within a minute. Fail-safe both ways: a window that cannot open the
-//! rendezvous watches as it always did, and a session that cannot stands by and says so
-//! once (a window, or the next update pass, still finds the release).
+//! rendezvous watches anyway, and a session that cannot stands by and says so once (a
+//! window, or the next update pass, still finds the release).
 
 use std::fs::File;
 use std::io::{Read as _, Seek as _, Write as _};
@@ -28,7 +26,7 @@ use std::time::Duration;
 
 use super::{BUSY_RETRY, CADENCE};
 use crate::index_probe::open_private;
-use crate::lock::Flock;
+use crate::lock::{Flock, RecordLock};
 use crate::store::Layout;
 
 /// The rendezvous every watching host locks: shared by windows, exclusive per round by
@@ -43,7 +41,7 @@ const MAX_SEAT_BYTES: u64 = 64;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Host {
     /// The window's package thread: it watches whenever it is up, sharing the store's
-    /// vendor files with every other window, as it always has.
+    /// vendor files with every other window.
     Window,
     /// A terminal session: it watches only from the seat, and only while no window does.
     Session,
@@ -77,8 +75,8 @@ pub(super) struct HostClaim {
     prefix: PathBuf,
     /// A window's shared hold, kept once taken; a session's exclusive hold for one round.
     hosts: Option<Flock>,
-    /// A session's seat, kept once taken.
-    seat: Option<Flock>,
+    /// A session's seat, kept once taken with its pid record outside the locked range.
+    seat: Option<RecordLock>,
     standing: Option<Standing>,
     #[cfg(test)]
     admit_calls: u64,
@@ -127,10 +125,9 @@ impl HostClaim {
         }
     }
 
-    /// A window takes the rendezvous SHARED once and keeps it. Refused only while a
+    /// A window takes the rendezvous shared once and keeps it. Refused only while a
     /// session's round holds it, which ends within one GET: ask again in a slice. A
-    /// rendezvous it cannot open or lock is no reason to stop watching — the window
-    /// watched before there was one.
+    /// rendezvous it cannot open or lock is no reason to stop watching.
     fn admit_window(&mut self) -> Admit {
         if self.hosts.is_some() {
             return Admit::Yes;
@@ -149,7 +146,7 @@ impl HostClaim {
     }
 
     /// A session watches only from the seat and only while no window holds the
-    /// rendezvous; it then holds the rendezvous EXCLUSIVE until its round ends. Unsure —
+    /// rendezvous; it then holds the rendezvous exclusive until its round ends. Unsure —
     /// either file unopenable or unlockable — it stands by.
     fn admit_session(&mut self) -> (Admit, Standing) {
         if self.hosts.is_some() {
@@ -159,7 +156,7 @@ impl HostClaim {
             let Some(file) = open_private(&self.prefix.join(SEAT_FILE), true) else {
                 return (Admit::Later(CADENCE), Standing::Unavailable);
             };
-            match Flock::try_lock(file) {
+            match RecordLock::try_lock(file, MAX_SEAT_BYTES) {
                 Ok(mut held) => {
                     // The pid is only what `doctor` names; a failed write names none.
                     let _ = write_pid(&mut held);
@@ -188,10 +185,10 @@ impl HostClaim {
         }
     }
 
-    /// Whether this SESSION holds the rendezvous EXCLUSIVE right now. The seat and
-    /// the last admission alone are not enough: a window can take its shared hold
-    /// immediately after [`Self::end_round`]. A held toolchain move must re-admit
-    /// before looking, then keep this hold through its pass launch.
+    /// Whether this session holds the rendezvous exclusive right now. The seat and the last
+    /// admission alone are not enough: a window can take its shared hold immediately after
+    /// [`Self::end_round`]. A held toolchain move must re-admit before looking, then keep
+    /// this hold through its pass launch.
     pub(super) fn seated_session(&self) -> bool {
         self.host == Host::Session && self.seat.is_some() && self.hosts.is_some()
     }
@@ -351,10 +348,10 @@ mod tests {
         crate::testdir::layout(&format!("atpkg-hosts-{label}-"))
     }
 
-    /// THE RENDEZVOUS, CLAIM BY CLAIM (gap #28): a window's shared hold keeps every session
-    /// out; a session's round keeps a window out until the round ends, and a window that
-    /// then takes its hold keeps the session out for good; a second session never gets
-    /// past the seat while the first lives; and every release hands on at once.
+    /// A window's shared hold keeps every session out; a session's round keeps a window out
+    /// until the round ends, and a window that then takes its hold keeps the session out for
+    /// good; a second session never gets past the seat while the first lives; and every
+    /// release hands on at once.
     #[test]
     fn a_window_and_a_session_never_both_hold_the_watch() {
         let l = layout("claims");
@@ -395,7 +392,7 @@ mod tests {
         assert_eq!(admit, Admit::Later(CADENCE));
         assert!(note.unwrap().contains("an aterm window watches"));
         assert_eq!(a.admit(), (Admit::Later(CADENCE), None));
-        // A second window shares the hold, as windows always shared the watch.
+        // A second window shares the hold.
         let mut second = HostClaim::new(Host::Window, &l);
         assert_eq!(second.admit(), (Admit::Yes, None));
         drop(window);
@@ -492,14 +489,12 @@ mod tests {
         }
     }
 
-    /// TIER-1: the REAL claims against the derived model `AtpkgHeadWatchHosts`, over every
-    /// reachable step. Each reachable state is reached again by its shortest path through
-    /// real `HostClaim`s on a fresh store, each enabled action is taken through them too,
-    /// and the real hosts' holds must read as the model's successor — the window's shared
-    /// lock refused exactly while a session's round holds the exclusive one, the seat and
-    /// the round a session gets exactly when the model grants them. Negative control: the
-    /// probe design's counterexample (`Buggy=1`) is walked through the real hosts, and the
-    /// real session refuses the round the probe let it take.
+    /// The real claims against the derived model `AtpkgHeadWatchHosts`, over every
+    /// reachable step: each reachable state is reached again by its shortest path through
+    /// real `HostClaim`s on a fresh store, each enabled action is taken through them, and
+    /// the real holds must read as the model's successor. Negative control: the probe
+    /// design's counterexample (`Buggy=1`) walked through the real hosts, where the session
+    /// is refused the round the probe let it take.
     #[test]
     fn the_real_claims_refine_the_derived_model() {
         use aterm_spec::derive::atpkg_head_watch_hosts_model;
@@ -596,9 +591,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// FAIL-SAFE BOTH WAYS: a rendezvous that is not a plain file (here a directory in its
-    /// place) leaves a window watching as it always did, and a session standing by — it
-    /// cannot prove no window watches — saying so once; the report says it could not tell.
+    /// A rendezvous that is not a plain file (here a directory in its place) leaves a window
+    /// watching and a session standing by — it cannot prove no window watches — saying so
+    /// once; the report says it could not tell.
     #[test]
     fn an_unopenable_rendezvous_keeps_the_window_and_stands_the_session_by() {
         let l = layout("unopenable");

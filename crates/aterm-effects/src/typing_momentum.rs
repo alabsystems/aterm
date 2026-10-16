@@ -4,27 +4,22 @@
 //! The canonical typing-momentum metric: one leaky integrator in `[0, 1]` that
 //! every rainbow-kitty "earned drama" consumer reads.
 //!
-//! [`crate::cursor_glow::CursorGlow`] (ribbon spine → stars, fresh-ink pops,
-//! iridescence) and [`crate::kitty_cursor::CursorCat`] each hold one instance
-//! fed by the same host keystream, so every consumer reads the same number
-//! (`momentum_unifies_glow_and_cat_metrics` pins that they evolve identically).
+//! [`crate::cursor_glow::CursorGlow`] and [`crate::kitty_cursor::CursorCat`]
+//! each hold one instance fed by the same host keystream, so they read the same
+//! number (pinned by `momentum_unifies_glow_and_cat_metrics`).
 //!
-//! ## The law
-//!
-//! * **Builds only from non-delete printable typing advances.** A forward
-//!   glyph echo calls [`TypingMomentum::advance`]; deletes, kills and
-//!   navigation never do.
-//! * **Rate-normalized accrual.** Each advance credits
-//!   `RATE × min(gap, CREDIT_CAP_S)`, where `gap` is the time since the last
-//!   stamp: momentum is time spent typing, not key count. A key-repeat flood and
-//!   a human sprint build at the same [`TYPING_MOMENTUM_RATE`] per second, and a
-//!   lone key after a long pause earns at most one credit (≈ 0.23).
-//! * **Exponential decay, τ = 2 s.** An inter-word breath (0.4–0.8 s) keeps
-//!   67–82 % of an earned run, while a 3–4 s pause drains a full metric below
-//!   every visual onset. There is no idle floor.
-//! * **Deletes never build; they mildly drain.** A backspace subtracts
-//!   [`TYPING_MOMENTUM_DELETE_DRAIN`] (a kill chord twice that) and re-stamps
-//!   the clock, so the interrupted gap credit is spent.
+//! * Only non-delete printable typing advances build it
+//!   ([`TypingMomentum::advance`]); deletes, kills and navigation never do.
+//! * Each advance credits `RATE × min(gap, CREDIT_CAP_S)`, `gap` being the time
+//!   since the last stamp: momentum is time spent typing, not key count. A
+//!   key-repeat flood and a human sprint build at the same
+//!   [`TYPING_MOMENTUM_RATE`] per second, and a lone key after a long pause
+//!   earns at most one credit (≈ 0.23).
+//! * Exponential decay, τ = 2 s: an inter-word breath (0.4–0.8 s) keeps 67–82 %
+//!   of an earned run, a 3–4 s pause drains a full metric below every visual
+//!   onset. There is no idle floor.
+//! * A backspace drains [`TYPING_MOMENTUM_DELETE_DRAIN`] (a kill chord twice
+//!   that) and re-stamps the clock, spending the interrupted gap credit.
 //!
 //! With `RATE × τ = 1.3` the flood equilibrium clamps at 1.0; flat-out typing
 //! crosses the cat's 0.75 band in ~1.7 s and reaches 1.0 in ~2.9 s, the arc
@@ -32,14 +27,14 @@
 
 use aterm_time::Instant;
 
-/// Exponential decay time constant (seconds). See the module doc: prose
-/// breaths survive, thinking pauses drain — "it decays over time".
+/// Exponential decay time constant (seconds): prose breaths survive, thinking
+/// pauses drain.
 pub const TYPING_MOMENTUM_TAU: f32 = 2.0;
 
 /// Maximum accrual per wall-clock second of sustained typing. With
-/// [`TYPING_MOMENTUM_TAU`] this fixes the whole build curve:
-/// `v(t) = RATE·τ·(1 − e^(−t/τ))`, clamped at 1 — 0.45 after one second
-/// (casual-burst territory stays low), 0.75 at ~1.7 s, 1.0 at ~2.9 s.
+/// [`TYPING_MOMENTUM_TAU`] this fixes the build curve
+/// `v(t) = RATE·τ·(1 − e^(−t/τ))`, clamped at 1: ≈ 0.51 after one second,
+/// 0.75 at ~1.7 s, 1.0 at ~2.9 s.
 pub const TYPING_MOMENTUM_RATE: f32 = 0.65;
 
 /// Per-advance credit window (seconds): one keystroke credits at most
@@ -53,17 +48,15 @@ pub const TYPING_MOMENTUM_CREDIT_CAP_S: f32 = 0.35;
 /// keeps an earned run alive, a held delete un-earns it.
 pub const TYPING_MOMENTUM_DELETE_DRAIN: f32 = 0.12;
 
-/// Kill-chord drain: erasing a SPAN un-earns like ~two deletes (the same
-/// escalation the fire quench documents for Ctrl-K/U/W).
+/// Kill-chord drain: erasing a span un-earns like two deletes.
 pub const TYPING_MOMENTUM_KILL_DRAIN: f32 = 2.0 * TYPING_MOMENTUM_DELETE_DRAIN;
 
 /// Below this a lazily-decayed read snaps to exactly 0.0, so idle consumers
 /// can disarm on a clean zero instead of chasing denormal residue forever.
 const SNAP_ZERO: f32 = 0.000_5;
 
-/// The canonical leaky integrator (see the module doc for the full law).
-/// `Copy` on purpose: the style-crossfade ghost carries a frozen copy exactly
-/// like the other thermal scalars.
+/// The canonical leaky integrator (the law is in the module doc). `Copy`, so
+/// the style-crossfade ghost can carry a frozen copy.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TypingMomentum {
     /// Value at the `at` stamp (reads decay it lazily from there).
@@ -97,37 +90,35 @@ impl TypingMomentum {
         self.at = Some(now);
     }
 
-    /// One backspace: never builds, mildly drains, and spends the pending gap
-    /// credit (the stamp moves), so deletes cannot launder accrual time.
+    /// One backspace: never builds, mildly drains, and re-stamps the clock, so
+    /// deletes cannot launder accrual time.
     pub fn delete(&mut self, now: Instant) {
         self.value = (self.value(now) - TYPING_MOMENTUM_DELETE_DRAIN).max(0.0);
         self.at = Some(now);
     }
 
     /// One kill chord (Ctrl-K/U/W, Alt-D, forward Delete, word-backspace):
-    /// a span erased is ~two deletes of un-earning.
+    /// drains [`TYPING_MOMENTUM_KILL_DRAIN`].
     pub fn kill(&mut self, now: Instant) {
         self.value = (self.value(now) - TYPING_MOMENTUM_KILL_DRAIN).max(0.0);
         self.at = Some(now);
     }
 
-    /// Pin the metric to `v` at `now` — the collection hello's "guaranteed
-    /// visible at full momentum" arm and the test fixtures' warm-start.
+    /// Pin the metric to `v` (clamped to `[0, 1]`) at `now`.
     pub fn set_value(&mut self, now: Instant, v: f32) {
         self.value = v.clamp(0.0, 1.0);
         self.at = Some(now);
     }
 
-    /// Back to rest (0, unstamped) — layout/space resets only.
+    /// Back to rest (0, unstamped).
     pub fn reset(&mut self) {
         self.value = 0.0;
         self.at = None;
     }
 
     /// The analytic instant the decaying metric crosses `threshold` (`> 0`):
-    /// `stamp + τ·ln(v/threshold)`, or the stamp when already at/below it.
-    /// `None` while unstamped. Lets a consumer recover the true crossing even
-    /// when frames arrive late.
+    /// `stamp + τ·ln(v/threshold)`, or the stamp when already at/below it;
+    /// `None` while unstamped. Correct even when frames arrive late.
     #[must_use]
     pub fn low_crossing(&self, threshold: f32) -> Option<Instant> {
         let at = self.at?;
@@ -139,10 +130,10 @@ impl TypingMomentum {
     }
 
     /// A deadline at which a fresh [`Self::value`] reads at/below `threshold`
-    /// (finite, in `0..=1`). Unlike the unsnapped analytic [`Self::low_crossing`],
-    /// this includes zero: a floor below [`SNAP_ZERO`] is reached at the snap.
-    /// One millisecond past the analytic boundary handles both its strict `<`
-    /// and f32 rounding. This is one solved deadline, never periodic polling.
+    /// (finite, in `0..=1`). Unlike the unsnapped [`Self::low_crossing`], this
+    /// includes zero: a floor below [`SNAP_ZERO`] is reached at the snap. One
+    /// millisecond past the analytic boundary covers its strict `<` and f32
+    /// rounding.
     #[must_use]
     pub fn reading_low_crossing(&self, threshold: f32) -> Option<Instant> {
         debug_assert!(threshold.is_finite() && (0.0..=1.0).contains(&threshold));
@@ -226,7 +217,7 @@ mod tests {
         assert!((m.value(half) - 0.5).abs() < 0.01, "half-life at τ·ln2");
         let two_tau = t0 + Duration::from_secs_f32(2.0 * TYPING_MOMENTUM_TAU);
         assert!((m.value(two_tau) - (-2.0_f32).exp()).abs() < 0.01);
-        // A word-breath (0.6 s) keeps ~74% — prose rhythm sustains a run.
+        // A word-breath (0.6 s) keeps ~74%.
         let breath = m.value(t0 + Duration::from_millis(600));
         assert!(
             breath > 0.72,
@@ -234,8 +225,8 @@ mod tests {
         );
     }
 
-    /// A key landing after a long pause earns at most ONE capped credit:
-    /// pause time is decay time, never banked accrual.
+    /// A key landing after a long pause earns at most one capped credit: pause
+    /// time is decay time, never banked accrual.
     #[test]
     fn credit_cannot_be_banked_across_a_pause() {
         let t0 = Instant::now();
@@ -247,15 +238,15 @@ mod tests {
         let cap = TYPING_MOMENTUM_RATE * TYPING_MOMENTUM_CREDIT_CAP_S;
         assert!(first <= cap + 1e-4, "a cold first key is one capped credit");
         // The pause leaves only decay residue (0.23·e⁻⁵ ≈ 0.0015) on top of
-        // the one capped credit — nothing banked.
+        // the one capped credit.
         assert!(
             after_pause <= cap + 0.01,
             "10 s of silence buys no banked credit: {after_pause}"
         );
     }
 
-    /// The lazy `low_crossing` matches the decay law analytically — the
-    /// frame-rate-independence contract the cat's fade-out leans on.
+    /// `low_crossing` matches the decay law analytically (the cat's fade-out
+    /// relies on it being frame-rate independent).
     #[test]
     fn low_crossing_predicts_the_analytic_decay_instant() {
         let t0 = Instant::now();
@@ -318,7 +309,7 @@ mod tests {
     }
 
     /// A delete flood walks an earned run to zero (never below), and the
-    /// stamp motion means the interrupted gap credit is spent, not saved.
+    /// re-stamp spends the interrupted gap credit.
     #[test]
     fn delete_flood_walks_an_earned_run_to_zero() {
         let t0 = Instant::now();
@@ -330,8 +321,8 @@ mod tests {
             m.delete(t);
         }
         assert_eq!(m.value(t), 0.0, "a held delete run fully un-earns");
-        // One advance right after re-builds only the tiny 60 ms credit — the
-        // delete spent the clock.
+        // One advance right after re-builds only the 60 ms credit: the delete
+        // spent the clock.
         t += Duration::from_millis(60);
         m.advance(t);
         assert!(

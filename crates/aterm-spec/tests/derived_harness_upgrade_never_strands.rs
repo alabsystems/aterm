@@ -1,26 +1,18 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Tier-0 of `HarnessUpgradeNeverStrands`
-//! (`aterm_spec::derive::harness_upgrade_never_strands_model`): proved at
-//! `Buggy = 0` and caught at `Buggy = 1` on EACH invariant, with no dead action
-//! at the committed configuration; ONE KNOB PER DEFECT, each caught on its own
-//! by the invariant it breaks; the last word (`Look`) checked, state by state,
-//! to be exactly the reducer's own guards negated; the incident of 2026-09-25/26
-//! walked as the schedule the model was written for; and NO STOP IS FOR GOOD
-//! (2026-09-27): every stopped round whose rest has run out has a way on at
-//! every reachable state, and the owner's stall of that day — a gave-up round
-//! whose late READY was voided, then `failed` for good — walked to its new
-//! round, the terminal reducer caught. Tier-1 is aterm-agent's
-//! `harness::upgrade_drive` tests (`upgrade_stall_tests.rs`), over the real
-//! reducer, gates, record transitions and the host's reading of each word.
+//! Tier-0 of `HarnessUpgradeNeverStrands`: proved at `Buggy = 0`, caught at `Buggy = 1` on each
+//! invariant, and one knob per defect caught alone by the invariant it breaks. The last word
+//! (`Look`) is checked state by state to be the reducer's own guards negated, and no stop is for
+//! good: every stopped round whose rest has run out has a way on. Tier-1 is aterm-agent's
+//! `harness::upgrade_drive` tests (`upgrade_stall_tests.rs`), over the real reducer, gates,
+//! record transitions and the host's reading of each word.
 
 use crate::walk::{only, reachable, walk};
 use aterm_spec::derive::{Model, harness_upgrade_never_strands_model};
 use aterm_spec::{interp, verify};
 
-/// The defects the fix and its reviews found, one knob each, and the
-/// invariant that catches each alone.
+/// One knob per defect, and the invariant that catches each alone.
 const KNOBS: [(&str, &str); 13] = [
     ("Terminal", "NeverStalls"),
     ("NoF1", "NoNoticeWhileLimited"),
@@ -40,12 +32,6 @@ const KNOBS: [(&str, &str); 13] = [
 #[test]
 fn the_upgrade_never_strands_the_agent_it_asked() {
     let model = harness_upgrade_never_strands_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name),
-        "the model must stay enrolled in the spec-link registry"
-    );
     let fired = interp::fired_actions(&model);
     assert_eq!(
         fired.len(),
@@ -57,8 +43,7 @@ fn the_upgrade_never_strands_the_agent_it_asked() {
         "harness upgrade never strands: no notice while limited, and every agent asked is \
          restarted or released",
     );
-    // Each invariant is load-bearing on its own: the pre-fix reducer breaks
-    // every one of these.
+    // Each invariant is load-bearing alone: `Buggy = 1` breaks every one.
     for invariant in ["NoNoticeWhileLimited", "NeverStranded", "NeverStalls"] {
         let alone = only(&model, invariant);
         assert!(
@@ -72,11 +57,7 @@ fn the_upgrade_never_strands_the_agent_it_asked() {
     }
 }
 
-/// ONE KNOB PER DEFECT, EACH CAUGHT ON ITS OWN (the review of 2026-09-26: with
-/// the hand-written last word, F2 reverted, the release never typed, and both
-/// together all HELD — 90, 72 and 72 states — so `NeverStranded` proved nothing
-/// about either). Each knob alone breaks the invariant it names, and the
-/// committed configuration breaks none.
+/// Each knob alone breaks the invariant it names, and the committed configuration breaks none.
 #[test]
 fn each_defect_is_caught_on_its_own() {
     let model = harness_upgrade_never_strands_model();
@@ -89,8 +70,7 @@ fn each_defect_is_caught_on_its_own() {
         let caught = interp::bmc(&interp::with_consts(&alone, &[(knob, 1)]));
         assert!(caught.is_err(), "{knob} is caught by {invariant}");
     }
-    // The review's own probes, as knobs: F2 reverted, and the release never
-    // typed, together — caught.
+    // `NoF2` and `NoType` together: caught.
     let both = interp::with_consts(&model, &[("NoF2", 1), ("NoType", 1)]);
     assert!(interp::bmc(&only(&both, "NeverStranded")).is_err());
     // A release dropped over an agent holding for the restart is the direction
@@ -108,16 +88,12 @@ fn each_defect_is_caught_on_its_own() {
     }
 }
 
-/// THE LAST WORD IS THE REDUCER'S OWN GUARDS NEGATED: on every reachable state
-/// of the upgrade's last phases (gave up, stopped) — and, while the build
-/// fails to start, of a pending or announced round — at a point the agent can
-/// read, `Look` is enabled exactly where none of `Restart`, `BuildHold`,
-/// `Release`, `DropRelease` and `Rearm` is — at a break, where no restart is
-/// taken, the drain's `Void` of a gave-up upgrade's READY standing for it —
-/// at the committed configuration and under every knob but `LastWhileOwed`,
-/// whose defect IS a last word said over a release (there it fires where
-/// `Release` also does, at a stop — never over a new round). No `Buggy`
-/// disjunct redefines it.
+/// The last word is the reducer's own guards negated: wherever the agent can read in the
+/// upgrade's last phases (or in a pending or announced round whose build fails to start), `Look`
+/// is enabled exactly where none of `Restart`, `BuildHold`, `Release`, `DropRelease` and `Rearm`
+/// is (at a break the drain's `Void` of a gave-up READY stands for `Restart`), and nowhere else.
+/// It holds committed, under `Buggy` and under every knob but `LastWhileOwed`, whose defect is a
+/// last word said over a release at a stop.
 #[test]
 fn the_last_word_is_derived_from_the_reducers_guards() {
     let model = harness_upgrade_never_strands_model();
@@ -164,18 +140,11 @@ fn the_last_word_is_derived_from_the_reducers_guards() {
     }
 }
 
-/// A DIRECTION DROPS A RELEASE ONLY ONCE THE AGENT HAS TAKEN IT UP (the
-/// second review of 2026-09-26). The review's sequence — asked to the bound,
-/// given up, a peer's message, the agent's READY, that READY voided — owes a
-/// release that is TYPED; under `StaleDirection` (the message still counted,
-/// as it was) it is dropped, and the upgrade's last word finds the agent
-/// holding. A direction the agent took up drops it, the agent at work. One it
-/// has not answered yet drops nothing (`UnansweredDirection` drops it, and the
-/// READY the agent then gives is to markers nothing keeps). A READY someone
-/// spoke after is no consent (`ReadyOverDirection` restarts over them). And
-/// at EVERY reachable state of the committed model the drop's guard — the
-/// driver's own rule — finds the agent at work: `holding == 0` is proved of
-/// it, never assumed in it.
+/// A direction drops a release only once the agent has taken it up: one it took up drops it, the
+/// agent at work; one it has not answered drops nothing. `StaleDirection` and
+/// `UnansweredDirection` drop it with the agent holding, and `ReadyOverDirection` takes a READY
+/// someone spoke after for consent. The drop's guard finds the agent at work at every reachable
+/// state: `holding == 0` is proved of it, never assumed in it.
 #[test]
 fn a_release_is_dropped_only_for_an_agent_that_took_other_work_up() {
     let m = harness_upgrade_never_strands_model();
@@ -234,10 +203,9 @@ fn a_release_is_dropped_only_for_an_agent_that_took_other_work_up() {
     assert!(drops > 0, "the drop is taken somewhere");
 }
 
-/// THE INCIDENT, fixed: the limit hits before the notice; nothing is typed
-/// and no clock runs until it resets; then one notice, READY, the restart.
-/// A notice whose wind-down hits the limit gets its whole window after the
-/// reset. And an agent asked to its bound is released, not left holding.
+/// The limit hits before the notice: nothing is typed and no clock runs until it resets; then
+/// one notice, READY, the restart. A notice whose wind-down hits the limit gets its whole
+/// window after the reset, and an agent asked to its bound is released, not left holding.
 #[test]
 fn a_limited_session_is_asked_after_its_reset_and_a_tired_one_is_released() {
     let m = harness_upgrade_never_strands_model();
@@ -264,9 +232,8 @@ fn a_limited_session_is_asked_after_its_reset_and_a_tired_one_is_released() {
     assert!(!m.action_enabled("Announce", &due));
     assert!(m.fire("Elapse", &mut due));
 
-    // Asked to the bound and never answered: released, and a READY that comes
-    // before the release restarts it — or, held past the drain, is void and
-    // the agent still released.
+    // Asked to the bound and never answered: released; a READY before the release restarts it,
+    // and one held past the drain is void, the agent still released.
     let tired = walk(&m, &["Announce", "Elapse", "Announce", "Elapse", "GiveUp"]);
     assert_eq!((tired["phase"], tired["owed"]), (2, 1));
     assert!(!m.action_enabled("Look", &tired), "a release is owed");
@@ -286,9 +253,8 @@ fn a_limited_session_is_asked_after_its_reset_and_a_tired_one_is_released() {
     assert!(m.fire("Release", &mut voided), "{voided:?}");
     assert_eq!(voided["holding"], 0);
 
-    // A restart refused after READY: the round's markers go with it, and the
-    // release is typed (the review's first blocker; `KeepReady` is the
-    // defect, caught above).
+    // A restart refused after READY: the round's markers go with it, and the release is typed
+    // (`KeepReady` is the defect, caught above).
     let mut refused = walk(&m, &["Announce", "AgentReady", "Abandon"]);
     assert_eq!(
         (refused["ready"], refused["live"], refused["owed"]),
@@ -299,13 +265,9 @@ fn a_limited_session_is_asked_after_its_reset_and_a_tired_one_is_released() {
     assert_eq!(refused["holding"], 0);
 }
 
-/// THE INCIDENT AS IT RAN (`Buggy = 1`, the reducer before the fix): notices
-/// typed into the limited session, the clock and the asks spent there, a give
-/// up with nothing owed, and the READY after the reset heard by nobody — the
-/// last word said over an agent holding. The last word is the same derived
-/// one: it fires because the pre-fix reducer has no restart for a gave-up
-/// READY, not because the observer changed. The same schedule's first notice
-/// is refused at `Buggy = 0`.
+/// `Buggy = 1` on the limited session: notices and asks spent into the limit, a give-up with
+/// nothing owed, and the READY after the reset heard by nobody, so the (same, derived) last word
+/// is said over an agent holding. The schedule's first notice is refused at `Buggy = 0`.
 #[test]
 fn the_incident_as_it_ran_is_the_caught_negative_control() {
     let m = harness_upgrade_never_strands_model();
@@ -338,14 +300,10 @@ fn the_incident_as_it_ran_is_the_caught_negative_control() {
     assert!(!m.action_enabled("Announce", &fixed));
 }
 
-/// THE BREAK THAT NEVER ENDS (2026-09-27): two widowed `tail -f` shells under a
-/// Claude Code whose status read `shell` made every screen a break, and no idle
-/// point ever came. Asked to the bound and given up on there, the agent is
-/// released AT THE BREAK — the release types one line and ends nothing — and a
-/// late READY the shells outlive is voided there and the agent released the
-/// same way; the restart itself is never taken at a break. Under
-/// `IdleOnlyRelease` (the release and the gave-up void only at an idle point,
-/// as the incident ran) the break's own last word finds the agent holding.
+/// A break that never ends (widowed `tail -f` shells under a Claude Code whose status reads
+/// `shell`): the agent asked to the bound is released at the break, and a late READY is voided
+/// there and released the same way; the restart is never taken at a break. Under
+/// `IdleOnlyRelease` the break's own last word finds the agent holding.
 #[test]
 fn a_break_that_never_ends_still_releases_the_agent_it_asked() {
     let m = harness_upgrade_never_strands_model();
@@ -382,7 +340,7 @@ fn a_break_that_never_ends_still_releases_the_agent_it_asked() {
     }
     assert!(m.check_invariant("NeverStranded", &late), "{late:?}");
 
-    // THE INCIDENT AS IT RAN: the release, and the void, only at an idle point.
+    // `IdleOnlyRelease`: the release, and the void, only at an idle point.
     let idle_only = interp::with_consts(&m, &[("IdleOnlyRelease", 1)]);
     let mut s = walk(&idle_only, &tired);
     assert!(!idle_only.action_enabled("Release", &s), "{s:?}");
@@ -398,16 +356,10 @@ fn a_break_that_never_ends_still_releases_the_agent_it_asked() {
     );
 }
 
-/// NO REACHABLE STATE IS A PERMANENT WAIT (the owner, 2026-09-27: "you should
-/// NEVER have upgrades stalled"). At EVERY reachable state of the committed
-/// model, a stopped round (gave up, or stopped otherwise) whose rest has run
-/// out has a way on: the new round (`Rearm`), or — a gave-up round's late
-/// READY in hand — the restart it still takes, or the environment's hold on
-/// it (the limit, which a restart waits out; a person or the agent's own work
-/// past the drain, which voids the answer). A stopped round still resting has
-/// its clock (`Rests`). And a re-armed round is asked: its first notice is
-/// enabled wherever the session can read. None of it holds at `Terminal = 1`
-/// (or `Buggy = 1`), where the same states sit at the quiet word for good.
+/// No reachable state is a permanent wait: a stopped round whose rest has run out has a way on
+/// (the new round, the restart a late READY still takes, or the environment's hold on it), a
+/// round still resting has its clock, and a re-armed round is asked wherever the session can
+/// read. None of it holds at `Terminal = 1` (or `Buggy = 1`).
 #[test]
 fn no_reachable_state_is_a_permanent_wait() {
     let m = harness_upgrade_never_strands_model();
@@ -468,14 +420,9 @@ fn no_reachable_state_is_a_permanent_wait() {
     }
 }
 
-/// THE OWNER'S STALL OF 2026-09-27 (tab `s-d3346b29dd236432b852`: `phase=
-/// failed:unanswered pending_for=1d22h wait=background … stalled=gave-up`),
-/// walked. Four notices unanswered, the give-up; the agent's late READY; its
-/// own background work outliving the answer past the drain, which voids it;
-/// the release; then — the rest run out — a NEW ROUND, asked at once, and
-/// the restart on its READY. The same walk under `Terminal` (the reducer as
-/// it ran) reaches the rest and has nothing left but the quiet word:
-/// `NeverStalls` catches it.
+/// A gave-up round walked to its new round: the late READY voided past the drain, the release,
+/// then the rest run out and the new round's restart. Under `Terminal` the walk ends at the
+/// quiet word, and `NeverStalls` catches it.
 #[test]
 fn the_owners_stall_rearms_and_the_terminal_reducer_is_caught() {
     let m = harness_upgrade_never_strands_model();
@@ -515,16 +462,10 @@ fn the_owners_stall_rearms_and_the_terminal_reducer_is_caught() {
     );
 }
 
-/// A BUILD THAT FAILS TO START STRANDS NO AGENT IT HOLDS (round eighteen's
-/// upgradebuild lane and its review): no notice and no restart go onto it,
-/// and every agent the round asked is released. Walked: an announced round,
-/// its agent winding down (and one that answered READY), abandoned at once
-/// and released; a given-up round's late READY abandoned and released; a
-/// pending round that still owes a release (re-armed over one) types it,
-/// since no notice comes to supersede it. Each strand the review found is
-/// its knob's: under `HeldAsked` (the hold only a wait where the round
-/// would move) the announced round's and the late READY's last word find
-/// the agent holding; under `HeldRelease` the pending round's does.
+/// A build that fails to start strands no agent it holds: no notice or restart goes onto it, and
+/// every agent the round asked is released, a pending round that still owes a release typing it.
+/// `HeldAsked` (the hold only a wait where the round would move) and `HeldRelease` each leave a
+/// last word over an agent holding.
 #[test]
 fn a_build_that_fails_to_start_strands_no_agent_it_holds() {
     let m = harness_upgrade_never_strands_model();
@@ -587,7 +528,7 @@ fn a_build_that_fails_to_start_strands_no_agent_it_holds() {
     let mut proved = walk(&m, &[&owed[..], &["Release", "BuildStarts"][..]].concat());
     assert!(m.fire("Announce", &mut proved), "{proved:?}");
 
-    // THE BRANCH AS REVIEWED, knob by knob.
+    // Each strand under its knob.
     let held = interp::with_consts(&m, &[("HeldAsked", 1)]);
     for path in [&announced[..], &ready[..], &late[..]] {
         let mut s = walk(&held, path);

@@ -900,8 +900,9 @@ pub(crate) fn compose_native_accessibility(
     }
 
     let root = composite_root_id();
-    let mut seen_views = HashSet::with_capacity(projections.len());
-    let mut seen_nodes = HashSet::new();
+    let mut seen_views =
+        aterm_hash::FxHashSet::with_capacity_and_hasher(projections.len(), Default::default());
+    let mut seen_nodes = aterm_hash::FxHashSet::default();
     let mut child_roots = Vec::with_capacity(projections.len());
     let mut nodes = Vec::new();
     let mut routes = Vec::new();
@@ -1576,7 +1577,8 @@ mod tests {
 
     #[test]
     fn paint_only_responsive_status_copy_is_not_published_to_accessibility() {
-        const COMPLETE: &str = "On, currently silent while this window is unfocused.";
+        const COMPLETE: &str =
+            "On. Typing notes are silent while the cursor trail is off; other sounds still play.";
         let visual = crate::native_ui::fit_native_status_label(COMPLETE, 96.0);
         assert_ne!(visual, COMPLETE, "fixture must exercise responsive copy");
         let compiled = UiTree::new(

@@ -1,51 +1,37 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! PRESENCE — the per-tab agent status row's pure core (design ruling 348).
+//! The per-tab agent presence row's pure core.
 //!
-//! A window shows who is driving its session. Two surfaces, one model: the
-//! RIM, a colour-only inset border ([`Rim`], [`View::rim_glow`]), and the
-//! ROW, one chrome line under the tab bar with six fixed slots in a fixed
-//! order — role · phase since · hand · mail · ctx · fabric ([`Words`]) — so a
-//! glance reads left to right and a screen reader gets the same sentence.
+//! A window shows who is driving its session on two surfaces from one model:
+//! the rim, a colour-only inset border ([`Rim`], [`View::rim_glow`]), and the
+//! row, one chrome line under the tab bar with six slots in a fixed order
+//! (role · phase since · hand · mail · ctx · fabric, [`Words`]), so a glance
+//! and a screen reader get the same sentence.
 //!
-//! This module is everything about that row that is not SENSING: the facts a
-//! host gathers ([`Facts`]), the per-session fold and its story ([`Slot`]),
-//! the severity ([`Level`]) and what it shows ([`Rim`], [`ChipLevel`]), the
-//! words and their width law ([`words`], [`Words::fit`]), the tones and the
-//! painted cells ([`tones`], [`paint_row`]) and the per-window view the frame
-//! path reads ([`View`]). The host reads the screen, the leases, the fabric
-//! and the clock; it hands the facts in and paints the cells out.
+//! The host gathers the [`Facts`] (screen, leases, fabric, clock) and paints
+//! the cells; this module folds them per session ([`Slot`]), derives the
+//! severity ([`Level`], [`Rim`], [`ChipLevel`]), composes and fits the words
+//! ([`words`], [`Words::fit`]), paints the row ([`tones`], [`paint_row`]) and
+//! keeps the per-window [`View`]. [`drive`] sequences refresh, commit, fold,
+//! ripple, story and tick through the host's [`drive::Desk`].
 //!
-//! The SEQUENCING is here too, in [`drive`] (design ruling 353): the refresh
-//! of a session and of a window, the row's commit, the fold law, the ripple
-//! and the pulse, a told story, the one deadline and the tick. The host
-//! implements [`drive::Desk`] — its clock, its window walk, its facts, its
-//! on-screen test, its re-grid — and the driver calls it.
+//! Laws:
 //!
-//! THE LAWS, from the design (r11/presence-spec.md) and binding here:
-//!
-//! * The rim is CHANGE-DRIVEN. Nothing here reads a clock: every method that
-//!   needs the time takes `now`, and the view is rebuilt only when a fact
-//!   changes. [`View::fp`] is exactly `0` on a quiet window, so an idle
-//!   desktop pays nothing for this feature.
-//! * The rim never carries a fact the row does not say in words: [`Rim`] is
-//!   derived from [`Level`], and [`Level`] from the same [`Slot`] the words
-//!   are composed from. A colour with no sentence is unreachable.
+//! * Change-driven: nothing here reads a clock (every method takes `now`),
+//!   the view is rebuilt only when a fact changes, and [`View::fp`] is `0` on
+//!   a quiet window, so an idle desktop pays nothing.
+//! * The rim never carries a fact the row does not say in words: [`Rim`]
+//!   derives from [`Level`], and [`Level`] from the same [`Slot`] the words
+//!   come from.
 //! * No message body, command text, OSC title or limit notice text reaches
-//!   any surface: the row is agent-readable, so its text is wire text —
-//!   counts, kinds, a sender token, a phase word, a reset time — and every
-//!   free-text value passes [`sanitize_token`].
+//!   any surface: the row is agent-readable wire text (counts, kinds, a
+//!   sender token, a phase word, a reset time), and every free-text value
+//!   passes [`sanitize_token`].
 //!
-//! # The seam
-//!
-//! What the engine cannot know is injected through [`Host`], implemented on
-//! a host-local uninhabited marker: the vocabulary of an agent's WALL (its
-//! kind type and its two spellings), the host's published INPUT STALL (its
-//! type and three reads), which drive-lease holder is the host's own harness,
-//! the wire's percent codec, and the GRID's measure — how many cells a string
-//! takes ([`Host::columns`]), which the width law and the painter lay every
-//! word out by.
+//! What the engine cannot know (wall vocabulary, the input stall, the host's
+//! own lease holder, the percent codec, the grid's cell measure) comes in
+//! through [`Host`].
 
 use core::fmt::Debug;
 
@@ -85,9 +71,9 @@ pub trait Host: Copy + Eq + Debug {
     /// The word the row prints for a wall: `limited` for a usage wall, the
     /// cause of a network error, else the state it leaves the session in.
     fn wall_band(kind: Self::Wall) -> &'static str;
-    /// Whether the wall is one the harness RETRIES on its own clock (an API
-    /// error, an overload): the time a row prints beside it is the loop's
-    /// NEXT TRY, spoken so (`next try 14:05`), never a reset. Default: no.
+    /// Whether the harness retries this wall on its own clock (an API error,
+    /// an overload): the time the row prints beside it is the next try
+    /// (`next try 14:05`), never a reset. Default: no.
     fn wall_retries(kind: Self::Wall) -> bool {
         let _ = kind;
         false
@@ -98,38 +84,32 @@ pub trait Host: Copy + Eq + Debug {
     fn stall_stopped(stall: &Self::Stall) -> bool;
     /// The program outlived its restart signal.
     fn stall_survived(stall: &Self::Stall) -> bool;
-    /// The restart the host would CARRY for the stalled program, as a person
-    /// runs it (aterm's: `aterm ctl @<sid> restart pid=<leader>
-    /// if-stalled`), or `None` where it would not. Where it names one, the
-    /// spoken remedy names it — for a survivor too, in place of `signal
-    /// kill`; elsewhere the words name no command.
+    /// The restart command the host would carry for the stalled program, as a
+    /// person runs it (aterm's: `aterm ctl @<sid> restart pid=<leader>
+    /// if-stalled`), or `None`. When it names one, the spoken remedy names it,
+    /// for a survivor too in place of `signal kill`.
     fn stall_restart(stall: &Self::Stall) -> Option<&str>;
-    /// Whether `holder` is the drive-lease holder name of THIS process's own
-    /// harness (ruling 313).
+    /// Whether `holder` is the drive-lease holder name of this process's own
+    /// harness.
     fn is_aterms_holder(holder: &str) -> bool;
     /// The wire's percent encoding of a free-text token.
     fn pct_encode(s: &str) -> String;
     /// The wire's percent decoding of a token.
     fn pct_decode(s: &str) -> String;
-    /// The cells the host's terminal GRID lays `s` out in, written from a
-    /// line's first column (aterm's: `aterm_grapheme::str_grid_columns`): a
-    /// wide glyph two, a combining mark or a character the grid folds into
-    /// the cell before it none. The row's width law, its token cap and its
-    /// painter all measure with it ([`Words::fit`], [`sanitize_token`],
-    /// [`paint_row`]), so a CJK role is laid out, shed and painted in the
-    /// cells the grid would give it (round fifteen content-6: they counted
-    /// one cell per `char`). This crate links no width tables of its own (its
-    /// one dependency is the clock), so the measure is the host's; there is
-    /// no default, because a char count is the very law it replaced.
+    /// The cells the host's terminal grid lays `s` out in from a line's first
+    /// column (aterm's: `aterm_grapheme::str_grid_columns`): a wide glyph two,
+    /// a combining mark none. The width law, the token cap and the painter all
+    /// measure with it ([`Words::fit`], [`sanitize_token`], [`paint_row`]), so
+    /// a CJK role is laid out in the cells the grid gives it. This crate links
+    /// no width tables and a char count is wrong, so there is no default.
     fn columns(s: &str) -> usize;
 }
 
-/// The story ring's capacity (design §4: `Ring<256, …>`).
+/// The story ring's capacity.
 pub(crate) const STORY_CAP: usize = 256;
 
-/// How long a told story point stands in the PHASE slot (`✓ approved`) before
-/// the slot returns to the phase (the mock: "three seconds after the watcher
-/// approves it, the slot reads ✓ approved, then returns to phase").
+/// How long a told story point (`✓ approved`) stands in the phase slot before
+/// the slot returns to the phase.
 pub const TOLD_FLASH: Duration = Duration::from_secs(3);
 
 /// The longest text `ctl story` carries, in bytes — the wire cap, checked on
@@ -142,40 +122,26 @@ pub(crate) const SETTLED_GLOW: Duration = Duration::from_secs(2);
 /// The context-left percentage at and below which the row warns.
 pub(crate) const CTX_WARN_PCT: u8 = 15;
 
-/// THE ROW'S FOLD QUIET (design ruling 394): a committed row whose
-/// words went away folds — one PTY re-grid — only after it has wanted no row
-/// for this long; a want that returns first cancels the fold, and no re-grid
-/// is paid at all. Birth stays immediate. Measured 2026-09-28 on the owner's
-/// tab: an idle Claude Code on the alternate screen went stale because the
-/// window re-gridded 121x52 -> 51 -> 52 within ~0.8 ms about once a minute —
-/// a row born and folded by one sub-millisecond lease, two immediate
-/// re-grids. Claude Code repaints only when its `SIGWINCH` handler reads a
-/// CHANGED size; after the net-zero pair it read the old one and never
-/// repainted, while the alternate screen's shrink had already dropped its top
-/// row. The engine's resize undo repairs that pair only when no output lands
-/// between its halves. The value is the message band's own D1 quiet
-/// ([`crate::SHRINK_QUIET`], 1.5 s): it outlasts the measured flap (under a
-/// millisecond) by three orders of magnitude, covers the other show-then-fold
-/// sources that are not a driver's own turn (a peer's cooperative lease, a
-/// hold toggled quickly, a supervisor or attention `meta` set and unset, a
-/// fabric blip — none measured, all sub-second by nature), and a blank row
-/// standing 1.5 s is what the band already shows after its own last row goes.
+/// The row's fold quiet: a committed row whose words went away folds (one PTY
+/// re-grid) only after it has wanted no row for this long; a want that
+/// returns first cancels the fold. Birth stays immediate. A row born and
+/// folded inside one sub-millisecond lease is a net-zero re-grid pair, and
+/// Claude Code, which repaints only when `SIGWINCH` reads a changed size,
+/// then never repaints the alternate-screen row the shrink dropped. The value
+/// is the message band's own quiet ([`crate::SHRINK_QUIET`]), far longer than
+/// that flap or the other sub-second show-then-fold sources (a peer's lease, a
+/// quick hold toggle, a `meta` set and unset, a fabric blip).
 pub const FOLD_QUIET: Duration = crate::SHRINK_QUIET;
 
-/// How long a driver's LOOK can hold back a fold ([`FOLD_QUIET`] past the
+/// How long a driver's look can hold back a fold ([`FOLD_QUIET`] past the
 /// look, never later than this past the want's drop). A client handed a
-/// screen generation (`status gen=`, `text --json`) may name it in an
-/// `if-gen=` fence, and a fold committed between that read and the fenced act
-/// re-grids the screen under it: the act is refused `reason=changed` (2026-09-28
-/// review of ruling 394 — a `meta` unset, a read, the fold's timer, the
-/// refused turn; before the quiet the fold landed at the unset, ahead of the
-/// read). Each look therefore restarts the quiet, so a driver that reads and
-/// acts inside it never meets the fold (its act's lease brings the want back
-/// and cancels it). Bounded, because `status` is a POLLED record: a client
-/// polling faster than the quiet would otherwise stand the blank row until it
-/// stopped. Ten seconds covers a read judged by a model before the act (a few
-/// seconds; not measured); a driver that must hold the geometry longer holds
-/// a drive lease, under which the count does not move at all.
+/// screen generation may name it in an `if-gen=` fence, and a fold committed
+/// between that read and the fenced act would refuse the act
+/// `reason=changed`; so each look restarts the quiet, and an act inside it
+/// brings the want back. Bounded because `status` is polled: a client polling
+/// faster than the quiet would otherwise stand the blank row forever. Ten
+/// seconds covers a model judging a read (not measured); a driver that must
+/// hold the geometry longer holds a drive lease.
 pub const FOLD_LOOK_CAP: Duration = Duration::from_secs(10);
 
 /// The ripple's life (a turn submit's edge flash, or a choice pulse).
@@ -184,11 +150,11 @@ pub const RIPPLE: Duration = Duration::from_millis(300);
 /// How many distinct frames the ripple paints (nine, ~30 fps).
 pub(crate) const RIPPLE_STEPS: u32 = 9;
 
-/// The rim's inset-border alpha: the drop target's crisp frame, so a driven
-/// window's teal reads at the same weight the drag highlight always has.
+/// The rim's inset-border alpha: the drop target's, so a driven window's rim
+/// reads at the drag highlight's weight.
 pub(crate) const RIM_BORDER_ALPHA: u8 = 235;
 
-/// The wash under a HOLD (12/255, design §1): faint, readable through.
+/// The wash alpha under a hold: faint, readable through.
 pub(crate) const HOLD_WASH_ALPHA: u8 = 12;
 
 /// The ripple's peak wash, decaying to 0 over its nine steps.

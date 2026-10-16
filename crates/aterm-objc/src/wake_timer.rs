@@ -14,9 +14,9 @@
 //!
 //! That is one iteration per interval of lateness, with the run-loop lock held,
 //! so every thread touching the main run loop (`CFRunLoopWakeUp`,
-//! `CFRunLoopPerformBlock`) parks behind it. winit's waker used a 0.1 µs
-//! interval (2 ticks of the 24 MHz timebase); a process that is not scheduled
-//! for a day then spins for minutes in `__CFRunLoopDoTimer`.
+//! `CFRunLoopPerformBlock`) parks behind it. At a 0.1 µs interval (2 ticks of
+//! the 24 MHz timebase), a process not scheduled for a day spins for minutes in
+//! `__CFRunLoopDoTimer`.
 //!
 //! So the waker polls by re-arming, and its repeat interval is
 //! [`WAKE_TIMER_REPEAT_SECS`], a year: any survivable lateness costs one step.
@@ -24,15 +24,19 @@
 //! callout records that, so [`WakePlan`] never trusts a stale "already armed
 //! for now" (model: `aterm_spec::derive::run_loop_waker_model`).
 //!
-//! This module is the only place that creates a run-loop timer
-//! (`tools/grep_guard.sh` B15 fences `CFRunLoopTimerCreate` and the `NSTimer`
-//! constructors to it).
+//! This is the only place that creates a run-loop timer: the `runloop-timer`
+//! guard of `aterm-census --guards` fences `CFRunLoopTimerCreate` and the
+//! `NSTimer` constructors to it.
 
 use std::cell::Cell;
 use std::ffi::c_void;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use crate::cf::{
+    CFRelease, CFRunLoopGetMain, CFRunLoopRef, CFStringRef, kCFRunLoopCommonModes,
+    kCFRunLoopDefaultMode,
+};
 use crate::declare::MainThread;
 
 /// The repeat interval handed to CoreFoundation, in seconds: one Julian year.
@@ -193,9 +197,9 @@ pub fn mach_ticks_per_sec() -> f64 {
     1e9 * f64::from(info.denom) / f64::from(info.numer)
 }
 
-type CFRunLoopRef = *mut c_void;
+// The timer's half of CoreFoundation stays here (the `runloop-timer` guard);
+// the run loop's shared half is `crate::cf`'s.
 type CFRunLoopTimerRef = *mut c_void;
-type CFStringRef = *const c_void;
 
 #[repr(C)]
 struct CFRunLoopTimerContext {
@@ -208,9 +212,6 @@ struct CFRunLoopTimerContext {
 
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
-    static kCFRunLoopCommonModes: CFStringRef;
-    static kCFRunLoopDefaultMode: CFStringRef;
-    fn CFRunLoopGetMain() -> CFRunLoopRef;
     fn CFRunLoopGetCurrent() -> CFRunLoopRef;
     fn CFAbsoluteTimeGetCurrent() -> f64;
     fn CFRunLoopTimerCreate(
@@ -226,7 +227,6 @@ unsafe extern "C" {
     fn CFRunLoopTimerSetNextFireDate(timer: CFRunLoopTimerRef, fire_date: f64);
     fn CFRunLoopTimerGetNextFireDate(timer: CFRunLoopTimerRef) -> f64;
     fn CFRunLoopTimerInvalidate(timer: CFRunLoopTimerRef);
-    fn CFRelease(cf: *const c_void);
 }
 
 /// The callout. `info` is the timer's [`Cell`] flag, kept alive by the
@@ -265,7 +265,7 @@ impl std::fmt::Debug for WakeTimer {
 }
 
 impl WakeTimer {
-    /// The event loop's waker: the MAIN run loop, in every common mode.
+    /// The event loop's waker: the main run loop, in every common mode.
     #[must_use]
     pub fn main(_mtm: MainThread) -> Self {
         // SAFETY: plain CoreFoundation getters; the common-modes constant is

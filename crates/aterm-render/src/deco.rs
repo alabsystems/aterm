@@ -4,7 +4,7 @@
 //! Font-metric line decorations (W7): the PURE policy layer behind underline /
 //! strikethrough / overline / undercurl geometry.
 //!
-//! Three root fixes live here, each stated as a proven invariant:
+//! Four shared policies live here:
 //!
 //! * **Font tables drive the bands.** [`resolve_deco_metrics`] turns the
 //!   font's `post` underline and OS/2 strikeout tables (captured per-em at
@@ -117,8 +117,11 @@ pub fn resolve_deco_metrics(
         }
         _ => ((base + legacy_t) as i64, legacy_t as i64),
     };
-    let (underline_y, underline_t) =
-        clamp_band(uy + adjust_pos as i64, ut + adjust_thick as i64, ch);
+    let (underline_y, underline_t) = clamp_band(
+        uy.saturating_add(i64::from(adjust_pos)),
+        ut.saturating_add(i64::from(adjust_thick)),
+        ch,
+    );
     // Strikethrough: table position is the stroke TOP relative to the baseline
     // (positive above); heuristic is a third of the ascent above the baseline.
     let (sy, st) = match tables.and_then(|t| t.strikeout) {
@@ -144,8 +147,9 @@ pub fn resolve_deco_metrics(
 /// `[1, cell_h]` first, then the top into `[0, cell_h - thickness]` — the
 /// order that guarantees `top + thickness <= cell_h` for ALL inputs.
 fn clamp_band(top: i64, thickness: i64, cell_h: usize) -> (usize, usize) {
-    let t = thickness.clamp(1, cell_h as i64) as usize;
-    let y = top.clamp(0, (cell_h - t) as i64) as usize;
+    let nonnegative = |value: i64| usize::try_from(value.max(0)).unwrap_or(usize::MAX);
+    let t = nonnegative(thickness).clamp(1, cell_h);
+    let y = nonnegative(top).min(cell_h - t);
     (y, t)
 }
 
@@ -226,7 +230,7 @@ pub const UNDERCURL_SPRITE: usize = 7;
 pub fn undercurl_supported(cell_w: usize, cell_h: usize) -> bool {
     cell_w > 0
         && cell_h > 0
-        && DECO_ATLAS_SPRITES * cell_w <= DECO_ATLAS_MAX_DIM
+        && cell_w <= DECO_ATLAS_MAX_DIM / DECO_ATLAS_SPRITES
         && cell_h <= DECO_ATLAS_MAX_DIM
 }
 
@@ -305,7 +309,7 @@ pub fn underline_band(
             Some((uy, uy + t))
         }
         UnderlineStyle::Double => {
-            let gap = (2 * t).max(2);
+            let gap = t.saturating_mul(2).max(2);
             Some((uy.saturating_sub(gap), uy + t))
         }
         UnderlineStyle::Curly => Some((uy, cell_h)),

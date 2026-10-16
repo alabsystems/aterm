@@ -31,7 +31,7 @@ pub(crate) fn sync_data(file: &File) -> std::io::Result<()> {
 /// the same point and in the same order, so a test sees the same files, renames and
 /// errors. What it drops is the drive-cache barrier. No test can observe that barrier,
 /// because it only orders the disk against a power loss. It also stalls the whole VOLUME
-/// while it runs, so every test binary the gate runs beside this one waits behind it.
+/// while it runs, so every test binary running beside this one waits behind it.
 /// Measured: one `aterm-agent --lib` run made 2,561 `F_FULLFSYNC`s (17.7 s of
 /// flushing); with these arms it makes 2, and the run takes about 4 s less alone and
 /// slows its neighbours less. Off Apple targets `sync_all` already is `fsync(2)`.

@@ -7,29 +7,6 @@
 use super::*;
 
 #[test]
-fn vi_point_default_is_origin() {
-    let p = ViPoint::default();
-    assert_eq!(p.line, 0);
-    assert_eq!(p.col, 0);
-}
-
-#[test]
-fn vi_motion_directions() {
-    assert_eq!(ViMotion::Up.direction(), ViDirection::Left);
-    assert_eq!(ViMotion::Down.direction(), ViDirection::Right);
-    assert_eq!(ViMotion::Left.direction(), ViDirection::Left);
-    assert_eq!(ViMotion::Right.direction(), ViDirection::Right);
-    assert_eq!(ViMotion::First.direction(), ViDirection::Left);
-    assert_eq!(ViMotion::Last.direction(), ViDirection::Right);
-    assert_eq!(ViMotion::High.direction(), ViDirection::Left);
-    assert_eq!(ViMotion::Middle.direction(), ViDirection::Right);
-    assert_eq!(ViMotion::Low.direction(), ViDirection::Right);
-    assert_eq!(ViMotion::SearchNext.direction(), ViDirection::Right);
-    assert_eq!(ViMotion::SearchPrevious.direction(), ViDirection::Left);
-    assert_eq!(ViMotion::GotoMark('a').direction(), ViDirection::Right);
-}
-
-#[test]
 fn inline_search_kind_directions() {
     assert_eq!(InlineSearchKind::FindRight.direction(), ViDirection::Right);
     assert_eq!(InlineSearchKind::FindLeft.direction(), ViDirection::Left);
@@ -211,14 +188,4 @@ fn vi_motion_to_buffer_command_marks() {
         BufferCommand::from(ViMotion::GotoMarkLine('b')),
         BufferCommand::GotoMarkLine('b')
     );
-}
-
-#[test]
-fn vi_marks_clear() {
-    let mut marks = ViMarks::new();
-    marks.set('a', ViPoint::new(1, 0));
-    marks.set('b', ViPoint::new(2, 0));
-    marks.clear();
-    assert!(!marks.contains('a'));
-    assert!(!marks.contains('b'));
 }

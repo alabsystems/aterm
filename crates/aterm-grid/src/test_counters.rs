@@ -3,8 +3,8 @@
 // Author: Andrew Yates
 
 //! Deterministic operation counters for complexity assertions, in place of
-//! wall-clock timing. Enabled under `cfg(test)` or the `testing` feature so
-//! downstream crate tests can instrument grid operations.
+//! wall-clock timing. Compiled in test and debug builds, so downstream crate
+//! tests can instrument grid operations; never in a release build.
 //!
 //! Use the full path `std::cell::Cell`; `Cell` here is the grid cell type.
 
@@ -116,9 +116,9 @@ pub(crate) fn count_row_to_line_cell() {
 
 /// Take (read and reset) the row-to-line operation count.
 ///
-/// `pub` under `testing` because aterm-core's selection tests pin that each
+/// `pub` in a debug build because aterm-core's selection tests pin that each
 /// selected ring row is converted to a `Line` exactly once.
-#[cfg(any(test, feature = "testing"))]
+#[cfg(any(test, debug_assertions))]
 pub fn take_row_to_line_ops() -> usize {
     ROW_TO_LINE_OPS.with(|c| {
         let v = c.get();
@@ -240,7 +240,7 @@ pub(crate) fn count_ring_fast_materialize() {
 /// Feature-gated `pub` for aterm-core's parity test, which feeds real parsed
 /// scrollback. Gated on the feature alone: without it the module is
 /// `pub(crate)` and this would be dead code.
-#[cfg(feature = "testing")]
+#[cfg(debug_assertions)]
 pub fn take_ring_fast_materialize() -> usize {
     RING_FAST_MATERIALIZE.with(|c| {
         let v = c.get();
@@ -265,7 +265,7 @@ pub(crate) fn count_viewport_row_materialize() {
 /// Take (read and reset) the scrolled-back history-row materialize count.
 /// Feature-gated `pub` so aterm-core can count materializations per frame of
 /// `Terminal::cell_frame_into` over real scrollback.
-#[cfg(feature = "testing")]
+#[cfg(debug_assertions)]
 pub fn take_viewport_row_materialize() -> usize {
     VIEWPORT_ROW_MATERIALIZE.with(|c| {
         let v = c.get();

@@ -1,30 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-//! THE SCRIPT-SUPPORT MATRIX — what the renderer guarantees per writing system,
-//! written down so the guarantees are testable and the LIMITS are visible.
+//! The script-support matrix: what the renderer guarantees per writing system.
 //!
-//! Two very different properties get confused when someone says "does it support
-//! Arabic":
-//!
-//! * **COVERAGE** — every code point reaches a face that genuinely contains it,
-//!   so nothing is tofu and nothing is a bogus glyph from a face that lied about
-//!   having it (the Korean break: see `fallback_coverage_is_truthful`). This is a
-//!   hard guarantee and this file pins it for every script below.
-//! * **SHAPING** — contextual joining (Arabic), reordering and conjuncts
-//!   (Indic), and bidirectional reordering (Arabic/Hebrew). aterm shapes only
-//!   runs that land on the PRIMARY face, because that is where programming
-//!   ligatures live; a run that falls through to a fallback face is rendered
-//!   per-cell. So Arabic renders in ISOLATED forms and RTL text reads in logical
-//!   order, exactly as in the mainstream terminals.
-//!
-//! Recording the second half is the point. An untested limit is indistinguishable
-//! from a bug that nobody has hit yet, and this one has a real user cost: the
-//! Korean defect hid for so long precisely because "non-Latin looks odd" had no
-//! contract to violate.
+//! * Coverage: every code point reaches a face that genuinely contains it, so
+//!   nothing is tofu or a bogus glyph from a face that claimed it falsely (see
+//!   `fallback_coverage_is_truthful`). A hard guarantee, pinned for every
+//!   script below.
+//! * Shaping: contextual joining, Indic reordering and conjuncts, and bidi
+//!   reordering. aterm shapes only runs on the primary face, where programming
+//!   ligatures live; a run that falls to a fallback face renders per cell, so
+//!   Arabic draws in isolated forms and RTL text reads in logical order, as in
+//!   the mainstream terminals. The second test pins that limit.
 
-/// One code point per script that a terminal actually meets. Kept to
-//  single scalars: cluster behaviour is the shaping question, not this one.
+/// Sample text per script a terminal meets, checked one scalar at a time
+/// (cluster behaviour is the shaping question, not this one).
 const SAMPLES: &[(&str, &str)] = &[
     ("Latin-1", "éñü"),
     ("Greek", "αβγδεζ"),
@@ -51,9 +41,8 @@ const SAMPLES: &[(&str, &str)] = &[
     ("Box drawing", "─│┌┐└┘├┤"),
 ];
 
-/// COVERAGE, the hard guarantee: every sampled code point resolves to a face
-/// that really contains it — never `.notdef`, and never a face that merely
-/// claimed it.
+/// Coverage: every sampled code point resolves to a face that really contains
+/// it, never `.notdef` and never a face that merely claimed it.
 #[test]
 fn every_script_resolves_to_a_face_that_really_contains_it() {
     let mut r = aterm_render::Renderer::from_system(28.0, aterm_render::Theme::default())
@@ -69,9 +58,9 @@ fn every_script_resolves_to_a_face_that_really_contains_it() {
                 let Ok(bytes) = std::fs::read(&path) else {
                     continue;
                 };
-                let faces = ttf_parser::fonts_in_collection(&bytes).unwrap_or(1);
+                let faces = aterm_font::fonts_in_collection(&bytes).unwrap_or(1);
                 let real = (0..faces).any(|i| {
-                    ttf_parser::Face::parse(&bytes, i)
+                    aterm_font::Face::parse(&bytes, i)
                         .ok()
                         .and_then(|f| f.glyph_index(ch))
                         .is_some_and(|g| g.0 != 0)
@@ -83,8 +72,8 @@ fn every_script_resolves_to_a_face_that_really_contains_it() {
                     ));
                 }
             }
-            // Otherwise the runtime resolver owns it; it only ever records faces
-            // that passed a real drawability probe, so nothing to assert here.
+            // Otherwise the runtime resolver owns it, and it records only faces
+            // that passed a real drawability probe.
         }
     }
     assert!(checked > 50, "matrix ran vacuously ({checked} code points)");
@@ -95,18 +84,16 @@ fn every_script_resolves_to_a_face_that_really_contains_it() {
     );
 }
 
-/// SHAPING, the documented LIMIT: complex-script shaping runs only on the
-/// primary face. This test does not assert that Arabic is wrong — it asserts
-/// that the limit is where we think it is, so that the day someone implements
-/// fallback shaping, this fails and gets updated deliberately rather than the
-/// matrix above quietly over-promising.
+/// The documented limit: complex-script shaping runs only on the primary face.
+/// This pins where the limit is, so fallback shaping, when it lands, fails
+/// this test and the matrix is updated deliberately.
 #[test]
 fn complex_script_shaping_is_primary_face_only() {
     let mut r = aterm_render::Renderer::from_system(28.0, aterm_render::Theme::default())
         .expect("no font: build with aterm-render's default embedded-font feature");
     r.debug_block_on_lazy_fallbacks();
-    // Arabic does not live on a programming monospace primary, so every Arabic
-    // run resolves off-primary — which is exactly why it is not shaped.
+    // A programming monospace primary has no Arabic, so every Arabic run
+    // resolves off-primary, which is why it is not shaped.
     let off_primary = "السلام".chars().all(|ch| {
         r.debug_fallback_pick_path(ch).is_some() || r.debug_runtime_fallback(ch).is_some()
     });

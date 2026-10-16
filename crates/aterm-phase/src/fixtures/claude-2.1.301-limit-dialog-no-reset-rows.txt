@@ -1,0 +1,28 @@
+# claude-code 2.1.301 · MEASURED 2026-10-15, `aterm ctl text` of a private headless aterm (120x50, aterm 0.105.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake claude.ai OAuth token (`claude --subscriber`) and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · the usage-limit dialog Claude Code opened itself at a five-hour wall (autoContinueAtUsageLimit false, the reset 2 h on), 8 s after the turn, as a Max 5x subscriber (the token's scopes user:inference user:profile, the composed oauthAccount of ana@example.com seeded in the scratch .claude.json), the inline renderer, the harness off, with tengu_cedar_ember and tengu_nifty_lemur enabled in the scratch cachedGrowthBookFeatures and _CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL=1; its two at-wall reads of the usage body went to the claude.ai API base and the black hole refused them: no reset row. NOTHING was pressed on it · the lab's random project dir is spelled /private/tmp/at.lab0 here
+ ▐▛███▛█   Claude Code v2.1.301
+▝▜██████▀  Opus 5.5 · Claude Max
+ ▝▝   ▝▝   /private/tmp/at.lab0/proj
+
+
+❯ hi
+
+⏺ Hi! I am the local lab stub, not a model. (reply 1)
+
+✻ Baked for 0s · done 11:37 PM
+
+❯ a turn into the session wall
+  ⎿  You've hit your session limit · resets 1:37am (America/Los_Angeles)
+
+✻ Sautéed for 0s · done 11:37 PM
+
+❯ /rate-limit-options
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  What do you want to do?
+
+  ❯ 1. Stop and wait for limit to reset
+    2. Wait here, then continue automatically at 1:37am
+    3. Add funds to continue with usage credits
+    4. Upgrade your plan
+
+  Enter to confirm · Esc to cancel

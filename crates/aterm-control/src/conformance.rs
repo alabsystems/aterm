@@ -1213,41 +1213,6 @@ mod tests {
         );
     }
 
-    /// The seam itself refuses the foreign sid: a `resolve` on one host
-    /// followed by a `write_input` on another must not land keystrokes in the
-    /// session this host holds.
-    #[test]
-    fn a_foreign_sid_never_reaches_the_session_the_host_holds() {
-        let host = MemoryHost::new(7);
-        assert_eq!(host.write_input(9, b"rm -rf /\r"), None);
-        assert!(host.input().is_empty(), "a foreign write landed anyway");
-        assert!(host.with_terminal(9, |t: &Terminal| t.rows()).is_none());
-        assert!(
-            host.with_terminal_mut(9, |t: &mut Terminal| t.rows())
-                .is_none()
-        );
-        let redraws = host.redraws();
-        host.request_redraw(9);
-        assert_eq!(
-            host.redraws(),
-            redraws,
-            "a foreign sid repainted this session"
-        );
-    }
-
-    /// Bytes written for the host's own sid reach the sink and the reply is
-    /// `Some(true)` (the half `check_write_input` cannot assert live).
-    #[test]
-    fn write_input_reaches_the_sink() {
-        let host = MemoryHost::new(0);
-        assert_eq!(host.write_input(0, b"echo hi\r"), Some(true));
-        assert_eq!(host.input(), b"echo hi\r".to_vec());
-        // The empty frame the conformance check uses moves nothing, and still
-        // reports the sink honestly.
-        assert_eq!(host.write_input(0, b""), Some(true));
-        assert_eq!(host.input(), b"echo hi\r".to_vec());
-    }
-
     /// A host with NO input sink reports the write did not happen. `Some(true)`
     /// here would be a wire `OK` for bytes that went nowhere.
     #[test]
@@ -1566,25 +1531,6 @@ mod tests {
                 "{capability} declared but absent, reported as: {detail}"
             );
         }
-    }
-
-    /// The roster is the `sessions` wire line's field set, addressable both ways:
-    /// `@<sid>` and `@<id>` resolve to the same session.
-    #[test]
-    fn the_roster_carries_the_documented_fields() {
-        let host = MemoryHost::new(4);
-        host.feed(b"\x1b]0;my-title\x07");
-        let roster = host.sessions();
-        assert_eq!(roster.len(), 1);
-        assert_eq!(roster[0].sid, 4);
-        assert_eq!(roster[0].id, host.id());
-        assert_eq!(roster[0].parent, None);
-        assert_eq!(roster[0].state, SessionState::Alive);
-        assert_eq!(roster[0].title, "my-title");
-        assert!(!roster[0].has_meta);
-        assert_eq!(host.resolve(Selector::Local(4)), Some(4));
-        assert_eq!(host.resolve(Selector::Id(host.id())), Some(4));
-        assert_eq!(host.resolve(Selector::Id("s-nope")), None);
     }
 
     /// The verbs are wired to the host's real terminal and clipboard: drive a

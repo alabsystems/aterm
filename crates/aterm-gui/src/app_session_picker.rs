@@ -234,10 +234,13 @@ impl App {
         }
     }
 
-    /// Spawn under identity `name` — a new WINDOW (through the event loop, which
-    /// owns window creation) or a new TAB in `wid`. `create` is the picker's
-    /// new-identity row: the only menu path that may provision one, exactly as
-    /// `spawn identity=` is on the wire. A failure is posted, never silent.
+    /// Spawn under identity `name` — a new WINDOW or a new TAB in `wid`.
+    /// `create` is the picker's new-identity row: the only menu path that may
+    /// provision one, exactly as `spawn identity=` is on the wire. A failure is
+    /// posted, never silent. The shell spawns off the event loop, a tab's and a
+    /// window's alike, and so does a new identity it needs: its primer syncs
+    /// every file it writes (`tab_spawn`). Headless opens no window, as it
+    /// ignores Cmd-N.
     pub(crate) fn spawn_with_identity(
         &mut self,
         wid: WindowId,
@@ -245,28 +248,17 @@ impl App {
         name: &str,
         create: bool,
     ) {
-        let fail = |app: &mut Self, error: String| {
-            let _ = app.post_message(if window {
-                crate::message_reporters::new_window_failed(&error)
-            } else {
-                crate::message_reporters::new_tab_failed(&error)
-            });
+        let ask = crate::tab_spawn::SpawnAsk {
+            create_identity: create,
+            ..crate::tab_spawn::SpawnAsk::new(None, Some(name))
         };
-        if let Err(e) = crate::agent_identity::ensure(name, create) {
-            fail(self, format!("identity {name}: {e}"));
-            return;
-        }
-        if window {
-            match self.proxy.as_ref() {
-                Some(proxy) => {
-                    let _ = proxy.send_event(crate::Wake::CreateWindowWithIdentity {
-                        identity: name.to_string(),
-                    });
-                }
-                None => fail(self, "no event loop to host the new window".to_string()),
-            }
-        } else if let Err(e) = self.spawn_tab_session(Some(wid), None, None, Some(name)) {
-            fail(self, e);
+        let then = crate::tab_spawn::TabSpawnThen::Nothing;
+        if !window {
+            self.open_off_loop(wid, crate::tab_spawn::SpawnPlace::Tab, ask, then);
+        } else if self.headless {
+            aterm_log::info!("headless: ignoring a new window with identity {name}");
+        } else {
+            self.open_window_off_loop(ask, None, then);
         }
     }
 
@@ -596,8 +588,12 @@ mod tests {
     /// Window With Identity… lists every identity on disk by name (with how
     /// many live sessions wear it) and a last row that creates the identity the
     /// FILTER names. A name that does not parse, or one already listed, chooses
-    /// nothing and keeps the picker open; a valid new name provisions it (the
-    /// menu's one create path, as `spawn identity=` is the wire's) and closes.
+    /// nothing and keeps the picker open; a valid new name is chosen for
+    /// creation (the menu's one create path, as `spawn identity=` is the wire's)
+    /// and closes the picker. The window it asks for is spawned off the loop,
+    /// and the identity is made there, before the shell (`tab_spawn`), never in
+    /// the turn: here no event loop hosts the window, so it is said not to open,
+    /// and nothing was made.
     /// A scratch state root (`ATERM_STATE_HOME`, under the env module's lock, as
     /// the restore identity test does): no test touches the machine's real one.
     #[test]
@@ -662,28 +658,37 @@ mod tests {
         for c in "Gamma".chars() {
             app.session_picker_filter_push(wid, c);
         }
+        let picker = app.windows[&wid].session_picker().unwrap();
         assert_eq!(
-            app.windows[&wid]
-                .session_picker()
-                .unwrap()
-                .new_identity_name(),
+            picker.new_identity_name(),
             Some("gamma".to_string()),
             "the typed name is folded, as `parse_name` folds it"
         );
+        assert_eq!(
+            picker.selected_row().and_then(|row| picker.choice_for(row)),
+            Some(crate::session_picker::PickerChoice::Identity {
+                name: "gamma".to_string(),
+                create: true,
+            })
+        );
+        // A windowed instance, the one that opens windows.
+        app.headless = false;
         app.session_picker_activate(wid);
         assert!(
             app.windows[&wid].session_picker().is_none(),
             "choosing closes"
         );
         assert!(
-            root.join("gamma").is_dir(),
-            "the new identity was provisioned under the (scratch) identities root"
+            app.messages
+                .live_rows()
+                .any(|l| l.msg.title == "Couldn't open a new window"),
+            "no event loop hosts the window here, and that is said"
         );
-        assert_eq!(
-            crate::agent_identity::roster(),
-            ["alpha", "beta", "gamma"],
-            "and the roster now lists it"
+        assert!(
+            !root.join("gamma").exists(),
+            "the identity is made where the window's shell spawns, not in the turn"
         );
+        assert_eq!(crate::agent_identity::roster(), ["alpha", "beta"]);
     }
 
     /// The Connect picker lists every OTHER live session (never the subject),

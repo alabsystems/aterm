@@ -2,81 +2,54 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # The vendor corpus
 
-Bytes a real Claude Code really sent, and screens it really painted, kept so
-the harness can be judged against the program it wraps rather than against
-this repository's beliefs about that program.
-
-One directory per vendor build, named for the version:
+Hook payloads a real Claude Code sent and a screen it painted, so
+`tests/vendor_corpus.rs` judges aterm's readers against the program itself
+rather than against hand-written payloads. One directory per vendor build,
+named for its version:
 
 ```
 2.1.278/
-  manifest.toml            provenance + a digest per file
-  SessionStart/0.json      one file per payload, in arrival order
+  manifest.toml                 provenance, plus size and sha256 per file
+  SessionStart/0.json           one file per payload, in arrival order
   SessionEnd/0.json
-  PermissionRequest/0.json, /1.json    the `echo`, then the `rm`
-  PreToolUse/0.json, /1.json
-  PostToolUse/0.json, /1.json
-  screen/usage.txt         what the vendor PAINTED (rank-1 evidence)
-  screen/usage.status      the `status` line beside it
+  PermissionRequest/0.json, 1.json   the `echo`, then the `rm`
+  PreToolUse/0.json, 1.json
+  PostToolUse/0.json, 1.json
+  screen/usage.txt              one painted screen of `/usage`
+  screen/usage.status           the session's `status` line beside it
 ```
 
-## How it got here
+`screen/usage.txt` ends at the vendor's `↓` scroll indicator; the windows the
+replay reads are above it. `src/harness/usage.rs` also embeds this file with
+`include_str!`.
 
-`tools/harness-capture.sh`. It installs the harness into a scratch settings
-file, moves the installed `bridge.sh` aside and puts a recorder in its place,
-spawns a session, drives three real turns over aterm's control socket, and
-copies what the recorder caught. The recorder runs the real bridge on the same
-bytes, so a capture run is also a live harness run — what the corpus records
-and what the harness answered are one invocation, not two.
+The capture recorded through a hook bridge, and aterm installs nothing into an
+agent, so nothing in the tree re-captures this corpus.
 
-Re-run it after a Claude Code update:
+## What a green run means
 
 ```sh
-tools/harness-capture.sh              # drive a live vendor, write a corpus
-tools/harness-capture.sh --from-raw <scratch>/raw   # redact + manifest again, no vendor
 targo --unverified test -p aterm-agent --test agent_suite -- vendor_corpus::
 ```
 
-## These files are REDACTED
+- Every payload parses, carries a `session_id`, and names its directory's
+  event; each build has `PermissionRequest` and `PreToolUse` payloads.
+- The command in each `PermissionRequest`, drawn into a Bash permission box,
+  is pressed (`1`) at full power (`approve = "all"`), and at least one is a
+  box `approve = "safe"` would not press.
+- The `/usage` screen yields its windows, including
+  `seven_day_overage_included` from `Current week (Fable)`; the `status` line,
+  the negative control, yields none.
 
-What the vendor sends names the machine it ran on: the owner's home, the
-scratch directory's random name, the per-session scratchpad, the session
-UUIDs. Those are rewritten to stable placeholders before the manifest is
-computed — `/Users//owner`, `/tmp/aterm-capture`, `00000001-0000-4000-8000-…`
-— including the vendor's own dash-mangled spelling of a project directory,
-where `/`, `.` and `_` all become `-`.
+A green run says nothing about what a later vendor build sends.
 
-Everything the corpus exists for survives that: every key, every nesting,
-every type, every field the harness reads and every field it must tolerate
-without reading. A path becomes a path of the same shape; a UUID becomes a
-UUID; two payloads that shared a session id still share one.
+## Redaction
 
-The digests in `manifest.toml` are of the **redacted** files — the ones
-checked in. They detect an edit to what is here, which is what they are for.
-A fixture is an observation: to change one, re-capture.
-
-## What a green `vendor_corpus` run means
-
-For every payload this vendor build was observed to send, the harness reaches
-a decision, that decision agrees with the pure policy that is supposed to
-reach it, an event-class hook prints nothing, a decide-class hook prints
-either nothing or a well-formed decision naming its own event, and every
-firing leaves a ledger row. It does not mean the vendor will not send
-something else tomorrow. It means that the day it does, a re-capture says so.
-
-## What is NOT in here, and why
-
-`StopFailure` and `PostModelSwitch` are not captured: one needs a real API
-failure and the other a real model switch, and neither can be caused on
-demand without faking the condition. They are exercised by the hand-written
-suites in `src/harness/*_tests.rs`.
-
-`Notification` is not here either: the vendor sends it when it wants the
-human's attention, and the three turns this capture drives did not produce
-one. Nothing in the replay requires it.
-
-`screen/usage.txt` is ONE SCREEN, not the whole `/usage` page — it ends on
-the vendor's own `↓` scroll indicator, so the "What's contributing to your
-limits usage?" body below the fold is not in the corpus. The three windows
-the replay reads (`Current session`, `Current week (all models)`, `Current
-week (Fable)`) are all above it.
+Machine names are rewritten before the manifest is computed: the home to
+`/Users//owner`, the scratch directory to `/tmp/aterm-capture`, the session
+scratchpad root to `/tmp/claude-agent`, each UUID to a distinct placeholder
+(`00000001-0000-4000-8000-000000000001`, …), and the same paths in the
+vendor's dash-mangled project-directory spelling (`/`, `.` and `_` become
+`-`). Keys, nesting, types and path shapes survive, and payloads that shared a
+session id still share one. The manifest's digests are of the redacted files
+and record what was captured: a fixture is an observation, so never edit one.

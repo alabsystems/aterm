@@ -35,7 +35,7 @@ fn a_child_that_never_returns_is_killed_at_the_deadline() {
     let mut cmd = Command::new("/bin/sh");
     cmd.arg("-c").arg("sleep 120");
     let started = std::time::Instant::now();
-    let got = capture_bounded(cmd, Duration::from_millis(250), None, 1024);
+    let got = capture_bounded(cmd, Duration::from_millis(250), 1024);
     let why = got.expect_err("a hung child is an error, not a wait");
     assert!(why.contains("deadline"), "{why}");
     assert!(
@@ -54,51 +54,51 @@ fn a_child_that_never_returns_is_killed_at_the_deadline() {
 // one that emptied. Once the capture gives up, the group must have no member
 // left, with a minute's hang detector for reaping an orphan.
 //
-// A take is the verdict only when its fixture wrote the report and the
-// capture gave up on the path the test is named for; a take starved past its
-// deadline runs again on a wider budget, up to a minute.
+// The capture takes its deadline only once the fixture has written its report
+// (the `after_spawn` step, [`settle_until`]), so one take is the verdict
+// whatever the load.
 #[cfg(unix)]
 const HANG_S: u64 = 300;
 
 /// Capture `script` (which writes `"<$$> <its pgid>"` to `$PGIDF`, then hangs
-/// for `$HANG_S`) until a take's fixture has run and the capture gave up on
-/// `path`: the group, and how long the capture took. Panics when the capture's
-/// child does not lead its own process group.
+/// for `$HANG_S`), its deadline taken once the report is written, and check
+/// it gave up on `path`: the group, and how long the capture took. Panics
+/// when the capture's child does not lead its own process group.
 #[cfg(unix)]
 fn capture_a_hanging_group(tag: &str, script: &str, path: &str) -> (libc::pid_t, Duration) {
-    let mut last = String::from("no take ran");
-    for budget in [200, 2_000, 60_000].map(Duration::from_millis) {
-        let tmp = temp_dir(tag);
-        let pgid_file = tmp.path().join("pgid");
-        let mut cmd = Command::new("/bin/sh");
-        cmd.arg("-c")
-            .arg(script)
-            .env("PGIDF", &pgid_file)
-            .env("HANG_S", HANG_S.to_string());
-        let started = std::time::Instant::now();
-        let why = capture_bounded(cmd, budget, None, 1024)
-            .expect_err("a hung child is an error, not a wait");
-        let took = started.elapsed();
-        let report = std::fs::read_to_string(&pgid_file).unwrap_or_default();
-        let mut words = report
-            .split_whitespace()
-            .map(|word| word.parse::<libc::pid_t>().ok().filter(|&id| id > 1));
-        let (Some(Some(pid)), Some(Some(pgid))) = (words.next(), words.next()) else {
-            last = format!("the fixture wrote no report ({report:?}); the capture said: {why}");
-            continue;
-        };
-        assert_eq!(
-            pgid, pid,
-            "the capture's child does not lead its own process group (it is in \
-             {pgid}), so no group kill can reach what it leaves running"
-        );
-        if !why.contains(path) {
-            last = format!("the capture gave up on another path: {why}");
-            continue;
-        }
-        return (pgid, took);
-    }
-    panic!("no take tested the {path:?} path, even on a minute's budget: {last}");
+    let tmp = temp_dir(tag);
+    let pgid_file = tmp.path().join("pgid");
+    let mut cmd = Command::new("/bin/sh");
+    cmd.arg("-c")
+        .arg(script)
+        .env("PGIDF", &pgid_file)
+        .env("HANG_S", HANG_S.to_string());
+    let observed = Arc::new(CaptureLifecycleObservation::default());
+    let report = pgid_file.clone();
+    settle_until(&observed, move || {
+        std::fs::read_to_string(&report).is_ok_and(|r| r.ends_with('\n'))
+    });
+    let started = std::time::Instant::now();
+    let why = capture_bounded_impl(cmd, Duration::from_millis(200), 1024, Some(observed))
+        .expect_err("a hung child is an error, not a wait");
+    let took = started.elapsed();
+    let report = std::fs::read_to_string(&pgid_file).unwrap_or_default();
+    let mut words = report
+        .split_whitespace()
+        .map(|word| word.parse::<libc::pid_t>().ok().filter(|&id| id > 1));
+    let (Some(Some(pid)), Some(Some(pgid))) = (words.next(), words.next()) else {
+        panic!("the fixture wrote no report ({report:?}); the capture said: {why}");
+    };
+    assert_eq!(
+        pgid, pid,
+        "the capture's child does not lead its own process group (it is in \
+         {pgid}), so no group kill can reach what it leaves running"
+    );
+    assert!(
+        why.contains(path),
+        "the capture gave up on another path: {why}"
+    );
+    (pgid, took)
 }
 
 /// Whether process group `pgid` has emptied — every member killed and reaped —
@@ -164,37 +164,34 @@ fn a_descendant_holding_stdout_is_killed_with_its_process_group() {
 // wrote a `ready` file — two libtest process starts, in series, inside the
 // capture's own 2 s budget, which runs from `spawn` returning. Under load the
 // deadline won: its group kill took the not-yet-escaped holder with it (the
-// stdout test then failed "escaped holder did not exit"), or the child's own
-// 2 s wait for `ready` gave up and it exited non-zero (the stdin test's
-// `got.success()`). Then the holder was forked in the capture child's pre-exec
-// hook, so the escape happened inside `spawn`.
+// test then failed "escaped holder did not exit"), or the child's own 2 s
+// wait for `ready` gave up and it exited non-zero. Then the holder was forked
+// in the capture child's pre-exec hook, so the escape happened inside `spawn`.
 //
 // Now (2026-10-01) the capture's `Command` runs no hook: on Darwin it is one
 // `posix_spawn` (`aterm_uds::spawnfd`). The capture child is ONE copy of this
 // test binary, staged as [`escaped_holder_stage`]: it forks the holder, which
 // calls setsid(), writes the `escaped` marker and says so over a pipe; the
 // child exits once it has. What keeps the escape ahead of the deadline is the
-// capture's test-only `after_spawn` step ([`settle_on_escape`]), which waits
-// for the marker before the capture takes its deadline — so the escape
+// capture's test-only `after_spawn` step ([`settle_until`]), which waits for
+// the marker before the capture takes its deadline — so the escape
 // happens-before the deadline on every run, whatever the load. The holder
-// never execs, so it closes every descriptor above 2 and keeps only the capture
-// pipe under test, until the test writes `done` (its own two-minute cap is the
-// last resort, past the stdin test's minute of hang detector). Only
-// async-signal-safe calls run in the forked holder.
+// never execs, so it closes every descriptor above 2 and keeps only the
+// capture's stdout, until the test writes `done` (its own two-minute cap is
+// the last resort). Only async-signal-safe calls run in the forked holder.
 #[cfg(unix)]
 const ESCAPED_HOLDER_CAP_TICKS: u32 = 2_400; // x 50 ms
 
-/// Present in the environment: this test binary IS an escape test's capture
-/// child, holding the fd it names (0: its stdin, 1: its stdout).
+/// Present in the environment: this test binary IS the escape test's capture
+/// child.
 #[cfg(unix)]
 const ESCAPE_STAGE: &str = "ATERM_ALIGN_ESCAPE_STAGE";
 
 /// A capture child — this test binary, staged as [`escaped_holder_stage`] —
-/// that forks a holder of the capture's fd `held` (0: its stdin, 1: its
-/// stdout), which LEAVES the child's process group and writes `escaped`; the
-/// child then exits 0.
+/// that forks a holder of the capture's stdout, which LEAVES the child's
+/// process group and writes `escaped`; the child then exits 0.
 #[cfg(unix)]
-fn escaped_pipe_command(held: libc::c_int, done: &Path, exited: &Path, escaped: &Path) -> Command {
+fn escaped_pipe_command(done: &Path, exited: &Path, escaped: &Path) -> Command {
     let mut cmd = Command::new(std::env::current_exe().expect("the test binary"));
     cmd.args([
         "--exact",
@@ -203,43 +200,40 @@ fn escaped_pipe_command(held: libc::c_int, done: &Path, exited: &Path, escaped: 
         "--test-threads=1",
         "--quiet",
     ])
-    .env(ESCAPE_STAGE, held.to_string())
+    .env(ESCAPE_STAGE, "1")
     .env("ATERM_ALIGN_ESCAPE_DONE", done)
     .env("ATERM_ALIGN_ESCAPE_EXITED", exited)
     .env("ATERM_ALIGN_ESCAPE_ESCAPED", escaped);
     cmd
 }
 
-/// The capture's `after_spawn` step for an escape test: wait for the holder's
-/// `escaped` marker, so the escape happens before the capture's deadline (a
-/// hang detector of a minute, not a budget).
+/// The capture's `after_spawn` step: wait until the child has done what a
+/// test needs done before the capture takes its deadline (`ready`: the
+/// escaped holder's marker, a fixture's report) — a hang detector of a
+/// minute, not a budget.
 #[cfg(unix)]
-fn settle_on_escape(observed: &CaptureLifecycleObservation, escaped: &Path) {
-    let escaped = escaped.to_path_buf();
+fn settle_until(observed: &CaptureLifecycleObservation, ready: impl Fn() -> bool + Send + 'static) {
     *observed
         .after_spawn
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(move || {
-        let until = std::time::Instant::now() + Duration::from_secs(60);
-        while !escaped.exists() && std::time::Instant::now() < until {
+        let until = std::time::Instant::now() + HANG_DETECTOR;
+        while !ready() && std::time::Instant::now() < until {
             std::thread::sleep(Duration::from_millis(5));
         }
     }));
 }
 
-/// THE CAPTURE CHILD of the escape tests, when [`ESCAPE_STAGE`] is set (and
+/// THE CAPTURE CHILD of the escape test, when [`ESCAPE_STAGE`] is set (and
 /// nothing at all otherwise): fork the holder, wait until it has left this
 /// process's group, exit.
 #[cfg(unix)]
 #[test]
 fn escaped_holder_stage() {
     use std::os::unix::ffi::OsStrExt as _;
-    let Some(held) = std::env::var(ESCAPE_STAGE)
-        .ok()
-        .and_then(|held| held.parse::<libc::c_int>().ok())
-    else {
+    if std::env::var_os(ESCAPE_STAGE).is_none() {
         return;
-    };
+    }
     let path = |var: &str| {
         let path = std::env::var_os(var).expect("the staged paths");
         std::ffi::CString::new(path.as_bytes()).expect("a path with no NUL")
@@ -281,11 +275,11 @@ fn escaped_holder_stage() {
                     libc::close(marker);
                 }
                 while libc::write(sync[1], b"e".as_ptr().cast(), 1) < 0 && interrupted() {}
-                // Keep ONLY the pipe under test: the other stdio slot goes to
-                // /dev/null, and every descriptor above 2 is closed.
+                // Keep ONLY the pipe under test: stdin goes to /dev/null, and
+                // every descriptor above 2 is closed.
                 let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
                 if null >= 0 {
-                    libc::dup2(null, if held == 0 { 1 } else { 0 });
+                    libc::dup2(null, 0);
                 }
                 for fd in 3..top {
                     libc::close(fd);
@@ -373,7 +367,6 @@ impl Drop for EscapedHolderGuard {
 struct CaptureObservedState {
     child_reaped: bool,
     reader_done: bool,
-    writer_done: bool,
 }
 
 #[cfg(unix)]
@@ -382,7 +375,6 @@ impl From<&CaptureLifecycleObservation> for CaptureObservedState {
         Self {
             child_reaped: observed.child_reaped.load(Ordering::Acquire),
             reader_done: observed.reader_done.load(Ordering::Acquire),
-            writer_done: observed.writer_done.load(Ordering::Acquire),
         }
     }
 }
@@ -400,11 +392,9 @@ fn assert_capture_return_conforms(
     let mut state = model.init_state();
     state.insert("child_reaped", i64::from(observed.child_reaped));
     state.insert("reader_done", i64::from(observed.reader_done));
-    state.insert("writer_done", i64::from(observed.writer_done));
     state.insert("deadline", i64::from(deadline));
     assert_eq!(state["child_reaped"], 1, "the direct child was reaped");
     assert_eq!(state["reader_done"], 1, "the stdout worker was joined");
-    assert_eq!(state["writer_done"], 1, "the stdin worker was joined");
     assert!(
         model.action_enabled("Return", &state),
         "the real capture returned at a model-forbidden state: {state:?}"
@@ -434,13 +424,13 @@ fn escaped_descendant_holding_stdout_cannot_retain_a_reader_thread() {
     let exited = tmp.path().join("exited");
     let escaped = tmp.path().join("escaped");
     let mut holder = EscapedHolderGuard::new(done.clone(), exited.clone());
-    let cmd = escaped_pipe_command(1, &done, &exited, &escaped);
+    let cmd = escaped_pipe_command(&done, &exited, &escaped);
     let observed = Arc::new(CaptureLifecycleObservation::default());
-    settle_on_escape(&observed, &escaped);
+    let marker = escaped.clone();
+    settle_until(&observed, move || marker.exists());
     let result = capture_bounded_impl(
         cmd,
         Duration::from_secs(2),
-        None,
         1024,
         Some(Arc::clone(&observed)),
     );
@@ -458,53 +448,11 @@ fn escaped_descendant_holding_stdout_cannot_retain_a_reader_thread() {
     assert_capture_return_conforms(returned, true, "reader_done");
 }
 
-#[cfg(unix)]
 #[test]
-fn escaped_descendant_holding_stdin_cannot_retain_a_writer_thread() {
-    let tmp = temp_dir("escaped-stdin");
-    let done = tmp.path().join("done");
-    let exited = tmp.path().join("exited");
-    let escaped = tmp.path().join("escaped");
-    let mut holder = EscapedHolderGuard::new(done.clone(), exited.clone());
-    let cmd = escaped_pipe_command(0, &done, &exited, &escaped);
-    let observed = Arc::new(CaptureLifecycleObservation::default());
-    settle_on_escape(&observed, &escaped);
-    // The child exits at once, so a passing capture never waits on this
-    // budget. It is five minutes, and the holder's own cap two, so a writer
-    // left running until the deadline crosses, or until the HOLDER lets go,
-    // returns far past the minute's hang detector asserted below (AGENTS.md:
-    // never a latency budget), which a loaded machine's spawn cannot reach.
-    let budget = Duration::from_secs(300);
-    let started = std::time::Instant::now();
-    let result = capture_bounded_impl(
-        cmd,
-        budget,
-        Some(vec![b'x'; 1 << 20]),
-        1024,
-        Some(Arc::clone(&observed)),
-    );
-    let elapsed = started.elapsed();
-    let returned = CaptureObservedState::from(observed.as_ref());
-    let holder_held_on = !exited.exists();
-    holder.release();
-    let got = result.expect("the direct child exited after its helper escaped");
-    assert!(got.success());
-    assert!(
-        holder_held_on,
-        "the capture returned only once the escaped holder had exited"
-    );
-    assert!(
-        elapsed < HANG_DETECTOR,
-        "the stdin writer ran on to the capture's deadline or the holder's cap: {elapsed:?}"
-    );
-    assert_capture_return_conforms(returned, false, "writer_done");
-}
-
-#[test]
-fn stdin_reaches_the_child_and_stdout_is_capped() {
+fn stdout_is_capped_and_the_exit_code_reported() {
     let mut cmd = Command::new("/bin/sh");
-    cmd.arg("-c").arg("cat");
-    let got = capture_bounded(cmd, HANG_DETECTOR, Some(b"hello".to_vec()), 1024).expect("it runs");
+    cmd.arg("-c").arg("printf 'hello'");
+    let got = capture_bounded(cmd, HANG_DETECTOR, 1024).expect("it runs");
     assert_eq!(got.stdout, b"hello");
     assert!(got.success());
 
@@ -512,21 +460,14 @@ fn stdin_reaches_the_child_and_stdout_is_capped() {
     // caller asked for loses the tail rather than the whole answer.
     let mut cmd = Command::new("/bin/sh");
     cmd.arg("-c").arg("printf 'aaaaaaaaaaaaaaaaaaaa'");
-    let got = capture_bounded(cmd, HANG_DETECTOR, None, 4).expect("it runs");
+    let got = capture_bounded(cmd, HANG_DETECTOR, 4).expect("it runs");
     assert_eq!(got.stdout, b"aaaa");
-
-    // A child that never reads its stdin cannot block the writer.
-    let mut cmd = Command::new("/bin/sh");
-    cmd.arg("-c").arg("printf 'ignored\\n'");
-    let got =
-        capture_bounded(cmd, HANG_DETECTOR, Some(vec![b'x'; 256 * 1024]), 1024).expect("it runs");
-    assert_eq!(got.stdout, b"ignored\n");
 
     // The exit code is REPORTED, never swallowed: the caller decides what a
     // non-zero means.
     let mut cmd = Command::new("/bin/sh");
     cmd.arg("-c").arg("exit 7");
-    let got = capture_bounded(cmd, HANG_DETECTOR, None, 16).expect("it runs");
+    let got = capture_bounded(cmd, HANG_DETECTOR, 16).expect("it runs");
     assert_eq!(got.code, Some(7));
     assert!(!got.success());
 }

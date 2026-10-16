@@ -343,15 +343,7 @@ fn shot(app: &mut App) -> Instant {
 
 /// A builtin scheme as the renderer's theme.
 fn scheme(name: &str) -> aterm_render::Theme {
-    let parts = aterm_types::scheme::builtin(name)
-        .expect("a builtin scheme")
-        .to_theme_parts();
-    aterm_render::Theme {
-        fg: parts.fg,
-        bg: parts.bg,
-        cursor: parts.cursor,
-        selection: parts.selection,
-    }
+    aterm_render::Theme::from(&aterm_types::scheme::builtin(name).expect("a builtin scheme"))
 }
 
 fn content(app: &App, wid: WindowId) {
@@ -409,6 +401,7 @@ fn first_run_read_at(extracted: u64) -> crate::PkgProgressSnapshot {
             pid: Some(7),
             pass: "net".to_string(),
             started_unix: 1_700_000_000,
+            generation: None,
             heartbeat_unix: 1_700_000_000,
             overall: atpkg::progress::Overall {
                 programs_done: 3,
@@ -424,8 +417,8 @@ fn first_run_read_at(extracted: u64) -> crate::PkgProgressSnapshot {
     }
 }
 
-/// Record the pass's answers (the roster, the R6 markers); they are records
-/// and must leave the glass unchanged.
+/// Record the pass's answers (the roster, the machine-settings and
+/// managed-agent markers); they are records and leave the glass unchanged.
 fn record_the_answers(app: &mut App) {
     app.record_toolchain_outcome(toolchain_words::installed(INSTALLED));
     app.post_machine_settings("universal-control disabled");
@@ -524,8 +517,8 @@ fn message_band_visual_capture() {
     ));
     app.settle_messages(Instant::now() + PROGRESS_GRACE);
     assert_eq!(app.message_band_rows, 0, "a self-retry is a record");
-    // The rows, one scene each, at the four widths — every row one a
-    // reporter really posts, shot 2 s after its motion epoch.
+    // The rows, one scene each, at every capture width: each a row a reporter
+    // really posts, shot 2 s after its motion epoch.
     type Scene = (&'static str, fn(&mut App));
     let scenes: [Scene; 27] = [
         ("01-first-run-announced", |app| {
@@ -542,7 +535,7 @@ fn message_band_visual_capture() {
             ));
         }),
         // A download a person started (Check for Updates): the animated
-        // row with its ETA (design ruling 220).
+        // row with its ETA.
         ("06-downloading", |app| {
             app.note_update_check_asked(true);
             app.note_update_progress(&aterm_update::Progress::Downloading {
@@ -599,11 +592,9 @@ fn message_band_visual_capture() {
         ("11-landed", |app| {
             app.post_update_landed("0.92.0", 1234, 0);
         }),
-        // A lane that stopped: a row the person acts on, main's words and
-        // the `Install now` press (ruling 143; was U17's press-failed row).
+        // A stopped lane whose attempt failed for a reason the person can
+        // act on: its short cause beside the title, and `Install now`.
         ("11b-update-did-not-apply", |app| {
-            // A stopped lane whose attempt failed for a reason the person
-            // can act on: its few words beside the title (ruling 246).
             app.note_update_outcome(update_words::needs_install_because(
                 "Couldn't install aterm v0.92.0",
                 update_words::short_cause("rename: No space left on device (os error 28)"),
@@ -730,7 +721,7 @@ fn message_band_visual_capture() {
                 "could not reach the index",
             ));
         }),
-        // The lane's one retry promise, on the stopped-lane row.
+        // The lane's retry promise is a record: the band takes no row.
         ("11c-install-tries-again", |app| {
             app.note_update_outcome(update_words::needs_install(
                 "Couldn't install aterm v0.92.0",
@@ -756,7 +747,7 @@ fn message_band_visual_capture() {
             }
             app.replace_config_messages(warns.into_messages());
         }),
-        // The session rows whose repeated detail line went.
+        // The session rows, with no repeated detail line.
         ("35-shell-lost", |app| {
             app.post_message(crate::message_reporters::shell_lost_in_update(
                 "the pty handed over was closed (os error 9)",
@@ -841,7 +832,7 @@ fn message_band_visual_capture() {
     }
     // The first-run sequence (the silent lane): the live row, the pass's
     // answers recorded behind it (no row), then the child's exit folds the
-    // row: its Complete echo, and one D1 quiet later the band gives it back.
+    // row: its Complete echo, and one `SHRINK_QUIET` later the band gives it back.
     app.clear_messages_for_test();
     app.announce_toolchain_pass(FIRST_RUN, true);
     app.apply_toolchain_snapshot(Some(&first_run_read()), true);
@@ -995,7 +986,7 @@ fn wire_and_glint_scenes(app: &mut App, dir: &std::path::Path, windows: &[(&str,
     );
     let at = shot(app);
     shoot(app, "75-notice-failed", at);
-    // 76: the GLINT mid-travel over a settled bar at 57 %: a quarter, half
+    // 76: the glint mid-travel over a settled bar at 57 %: a quarter, half
     // and three quarters of the way across.
     app.clear_messages_for_test();
     let mut download = Download {
@@ -1025,7 +1016,7 @@ fn wire_and_glint_scenes(app: &mut App, dir: &std::path::Path, windows: &[(&str,
 
 /// Waits inside a session: a large paste to a slow program and a scrollback
 /// rewrap, each mid-way with its ETA and at its Complete echo, at every
-/// width and on GitHub Light.
+/// width on the default ground and GitHub Light, and on the other grounds.
 fn session_wait_scenes(app: &mut App, dir: &std::path::Path, windows: &[(&str, WindowId)]) {
     use aterm_messages::waits::{paste_row, rewrap_row};
     let shoot = |app: &mut App, name: &str, at: Instant| {
@@ -1124,8 +1115,8 @@ fn session_wait_scenes(app: &mut App, dir: &std::path::Path, windows: &[(&str, W
     app.clear_messages_for_test();
 }
 
-/// A light update pass's read (design ruling 224): `claude` done, `codex`
-/// downloading `done` of its 60 MB — `1 of 2 programs`, network busy.
+/// A light update pass's read: `claude` done, `codex` downloading `done` of
+/// its 60 MB — `1 of 2 programs`, network busy.
 fn check_update_read(done: u64) -> crate::PkgProgressSnapshot {
     let mut programs = std::collections::BTreeMap::new();
     let program = |phase, bytes_done, bytes_total| atpkg::progress::ProgramProgress {
@@ -1150,6 +1141,7 @@ fn check_update_read(done: u64) -> crate::PkgProgressSnapshot {
             pid: Some(9),
             pass: "net".to_string(),
             started_unix: 1_700_000_500,
+            generation: None,
             heartbeat_unix: 1_700_000_500,
             overall: atpkg::progress::Overall {
                 programs_done: 1,
@@ -1330,15 +1322,14 @@ fn strain_row(
         .hold(Hold::Live {
             stale_after: aterm_messages::STALE_STRAIN,
         })
-        // The engine's declaration: the one load the kind explains
-        // (design ruling 221).
+        // The one load the kind explains.
         .loads([kind.load()])
         .meter(Meter {
             load: named.then(|| kind.load()),
             ..Meter::level(permille, stats)
         })
         .no_excerpt();
-    // The navigation to the tab the title names (ruling 243).
+    // The navigation to the tab the title names.
     match strain::culprit_tab(culprit) {
         Some(show) => msg.action(show),
         None => msg,
@@ -1775,7 +1766,7 @@ fn message_band_composition_capture() {
     composition_scenes(&mut app, &dir, &windows);
 }
 
-/// The motion frame sequences at 80 and 120 columns.
+/// The motion frame sequences, at every capture width.
 #[allow(
     clippy::too_many_lines,
     reason = "one sequence per motion form, read top to bottom"
@@ -2022,8 +2013,7 @@ fn motion_sequences(app: &mut App, dir: &std::path::Path, windows: &[(&str, Wind
             &ROW_GROUNDS,
         );
     }
-    // The DOWNLOAD'S ETA (scene 27): 6 s of steady samples, latched, and
-    // no load words.
+    // The download's ETA: 6 s of steady samples, latched, and no load words.
     app.clear_messages_for_test();
     let mut eta = Download {
         total: 74_000_000,
@@ -2151,10 +2141,10 @@ fn motion_sequences(app: &mut App, dir: &std::path::Path, windows: &[(&str, Wind
     }
 }
 
-/// Full-width meter scenes at every capture width: a Warn row whose fill
-/// wears `warn`, and a Primary, a Secondary and `Details ›` over the fill
-/// (95 %) and the track (50 %), resting and lit. Paint fixtures are posted
-/// straight into the center, since the painter is under test.
+/// Full-width meter scenes at every capture width: a Warn row's fill, chips
+/// over the fill (95 %) and the track (50 %), resting and lit, and the comet
+/// alone and under chips on the themed grounds. Fixtures are posted straight
+/// into the center, since the painter is under test.
 fn merged_design_scenes(app: &mut App, dir: &std::path::Path, windows: &[(&str, WindowId)]) {
     use aterm_messages::{Hold, Intent, Message, Meter, Severity, tags};
     let live = Hold::Live {
@@ -2240,8 +2230,8 @@ fn merged_design_scenes(app: &mut App, dir: &std::path::Path, windows: &[(&str, 
                     app.windows.get_mut(&wid).unwrap().band_hover = None;
                 }
             }
-            // …and on the light themes (ruling 155): the chips over the
-            // fill and over the track, the Primary lit over the fill.
+            // …and on the light themes: the chips over the fill and over the
+            // track, the Primary lit over the fill.
             for scheme_name in LIGHT_SCHEMES {
                 let theme = scheme(scheme_name);
                 let slug = scheme_name.to_lowercase().replace(' ', "-");
@@ -2352,7 +2342,7 @@ fn merged_design_scenes(app: &mut App, dir: &std::path::Path, windows: &[(&str, 
     }
 }
 
-/// The light builtin schemes the chips and the comet are shot on.
+/// The light builtin schemes the chips are shot on.
 const LIGHT_SCHEMES: [&str; 3] = ["GitHub Light", "Solarized Light", "Catppuccin Latte"];
 
 /// Every non-default ground the motion is shot on: a dark theme with a
@@ -2364,14 +2354,12 @@ const THEMED_SCHEMES: [&str; 4] = [
     "Catppuccin Latte",
 ];
 
-/// THE MOTION FILMSTRIPS (design §10.12): for each motion form, the band
-/// row at 32 injected instants stacked into one PNG — the comet's sweep,
-/// the glint's travel, the Complete echo, the Fault echo, a busy row's
-/// Fault echo and a glide — at 80 columns in a window with gutters that
-/// is not a whole number of cells wide ([`glass_window`]), into
-/// `<dir>/filmstrips`; then the comet, the glint and both echoes on Tokyo
-/// Night and the light themes (rulings 155–158). Ignored by default, like the
-/// frames.
+/// The motion filmstrips, into `<dir>/filmstrips`: for each motion form (the
+/// comet's sweep, the glint's travel, a glide, the Complete and Fault echoes,
+/// a busy row's Fault echo, the strain gauge's rise) the band row at 32
+/// injected instants stacked into one PNG, at 80 columns in a
+/// [`glass_window`]; the comet, the glint and both echoes also on
+/// [`THEMED_SCHEMES`].
 #[test]
 #[ignore = "visual capture: needs a system font; run with --ignored"]
 fn message_band_motion_filmstrips() {
@@ -2441,7 +2429,7 @@ fn message_band_motion_filmstrips() {
             scheme(scheme_name),
         );
     }
-    // A BUSY row's Fault echo: the flash over the comet's track.
+    // A busy row's Fault echo: the flash over the comet's track.
     let failed_at = epoch + COMET_PERIOD + COMET_PERIOD / 3;
     let busy = app
         .messages
@@ -2491,7 +2479,7 @@ fn message_band_motion_filmstrips() {
     let resolved = jump + Duration::from_secs(1);
     let id = download.id.expect("posted");
     assert!(app.messages.resolve(id, Outcome::Ok, resolved));
-    // The wipe (its glide from 80 %), the one sweep, the fade (ruling 244).
+    // The wipe (its glide from 80 %), the one sweep, the fade.
     strip(
         &mut app,
         "echo-complete",
@@ -2560,9 +2548,9 @@ fn message_band_motion_filmstrips() {
             );
         }
     }
-    // THE STRAIN GAUGE (ruling 208): a level that rises from 40 % to 90 %
-    // between two readings — the glide, and nothing moving once it lands
-    // — on the default ground and a light one.
+    // The strain gauge: a level that rises from 40 % to 90 % between two
+    // readings (the glide, then nothing moving once it lands) on the default
+    // ground and a light one.
     use aterm_messages::Severity;
     use aterm_messages::strain::{Culprit, StrainKind};
     let tab2 = Culprit::Session {
@@ -2617,10 +2605,7 @@ fn message_band_motion_filmstrips() {
     }
 }
 
-// -----------------------------------------------------------------------
-// The web band's golden: this host's band, frame by frame, for the web
-// module to be held to.
-// -----------------------------------------------------------------------
+// The web band's golden: this host's band, frame by frame, for the web module.
 
 /// The golden the web module's `the_web_band_is_the_native_golden` reads.
 const WEB_GOLDEN: &str = concat!(
@@ -2756,15 +2741,8 @@ fn web_fnv_more(mut h: u64, bytes: &[u8]) -> u64 {
 }
 
 /// [`web_fnv`] of CPU-frame pixels (`0xAARRGGBB`, `AA` the inverted alpha)
-/// read as the RGBA bytes the golden digests: `R, G, B, 0xff - AA` each.
-///
-/// STRAIGHT FROM THE FRAME (2026-10-05, gate speed). Until then every frame
-/// was first copied whole into an RGBA `Vec<u8>` through a per-pixel
-/// `flat_map`, though a line reads only the rows above the grid and the
-/// band's: that copy was 89% of the test's samples (7,729 of 8,692), and
-/// the test took 14.9 s of CPU run alone, 2.3 s without it. The bytes
-/// hashed, and their order, are the copy's, so every digest is the
-/// committed golden's.
+/// read as the RGBA bytes the golden digests: `R, G, B, 0xff - AA` each,
+/// hashed straight from the frame with no RGBA copy.
 fn web_fnv_pixels(pixels: &[u32]) -> u64 {
     pixels.iter().fold(WEB_FNV_BASIS, |h, &p| {
         web_fnv_more(
@@ -2846,14 +2824,9 @@ fn web_portable(theme: aterm_render::Theme) -> aterm_render::Renderer {
 
 /// This host's golden, as text: the themes, the scenes and every frame.
 ///
-/// ONE THREAD PER THEME (2026-09-30, gate speed). Each theme's frames are
-/// drawn on an App of their own ([`web_golden_theme_frames`]) and the
-/// blocks are joined in the golden's theme order, so the text is the one
-/// the single pass wrote, line for line — the golden it is compared with
-/// says so on every run. The single pass drew the four themes one after
-/// another on one thread: 15.7 s of CPU, run alone, the fifth-longest test
-/// of the gate's `-p aterm-gui --lib` binary; on four, 5.1 s alone and 3.9 s
-/// in that binary at `RUST_TEST_THREADS=7` (measured 2026-09-30).
+/// Each theme's frames are drawn on a thread and App of their own
+/// ([`web_golden_theme_frames`]) and joined in the golden's theme order, so
+/// the text is a single sequential pass's, line for line.
 fn web_golden_text() -> String {
     use std::fmt::Write as _;
     let scheme = |name: &str| aterm_types::scheme::builtin(name).expect("builtin scheme");
@@ -2866,17 +2839,7 @@ fn web_golden_text() -> String {
     )];
     for name in ["GitHub Light", "Catppuccin Latte", "Solarized Light"] {
         let s = scheme(name);
-        let t = s.to_theme_parts();
-        themes.push((
-            name,
-            aterm_render::Theme {
-                fg: t.fg,
-                bg: t.bg,
-                cursor: t.cursor,
-                selection: t.selection,
-            },
-            s.to_color_palette(),
-        ));
+        themes.push((name, aterm_render::Theme::from(&s), s.to_color_palette()));
     }
     let mut out = String::new();
     let _ = writeln!(
@@ -2901,13 +2864,15 @@ fn web_golden_text() -> String {
     for (name, t, pal) in &themes {
         let _ = writeln!(
             out,
-            "theme\t{name}\t{:06x}\t{:06x}\t{:06x}\t{:06x}\t{:06x}\t{:06x}",
+            "theme\t{name}\t{:06x}\t{:06x}\t{:06x}\t{:06x}\t{:06x}\t{:06x}\t{:06x}\t{:06x}",
             t.fg,
             t.bg,
             t.cursor,
             t.selection,
             rgb(pal.get(4)),
-            rgb(pal.get(6))
+            rgb(pal.get(6)),
+            rgb(pal.get(1)),
+            rgb(pal.get(3))
         );
     }
     for (name, lines, shots) in WEB_SCENES {

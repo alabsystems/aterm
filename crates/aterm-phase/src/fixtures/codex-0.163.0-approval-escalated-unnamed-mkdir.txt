@@ -1,0 +1,51 @@
+# codex-cli 0.163.0 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (144x50, aterm 0.105.0) running the real Codex, launched by path with a scratch `CODEX_HOME`, the lab provider `base_url=http://127.0.0.1:<port>/v1`, `wire_api = "responses"`, a fake `env_key` (a local stub of the Responses API, crates/aterm-lab) · CODEX_HOME/rules/default.rules holds only prefix_rule(pattern=["touch"], decision="prompt"); codex -a on-request -s workspace-write; a scripted code-mode exec tool call runs tools.exec_command({cmd: "mkdir probe-dir", sandbox_permissions: "require_escalated", justification: "Do you want to create probe-dir outside the sandbox?"}), a command no rule names, escalated by the model: the approval box
+
+  >_ OpenAI Codex (v0.163.0)
+     /private/tmp/at.GpBF/proj
+
+
+› create probe.txt with touch
+
+
+✗ You canceled the request to run touch probe.txt
+
+• Failed (exit 1) touch probe.txt
+  └ (no output)
+
+■ Conversation interrupted - use /feedback if something went wrong
+
+
+› make the probe-dir directory
+
+
+• Hi! I am the local lab stub, not a model. (reply 4)
+
+  Worked for <1s • 11:21 AM
+
+
+› make probe-dir, escalated
+
+
+• Running mkdir probe-dir
+
+
+
+
+
+
+
+
+  Would you like to run the following command?
+
+  Environment: local
+
+  Reason: Do you want to create probe-dir outside the sandbox?
+
+  $ mkdir probe-dir
+
+
+› 1. Yes, proceed (y)
+  2. Yes, and don't ask again for commands that start with `mkdir probe-dir` (p)
+  3. No, and tell Codex what to do differently (esc)
+
+  Press enter to confirm or esc to cancel

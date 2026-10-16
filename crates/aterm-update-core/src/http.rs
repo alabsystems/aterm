@@ -172,6 +172,79 @@ fn curl_fetch(args: &[&str], url: &str) -> Result<std::process::Output, String> 
 /// fresh pipe per attempt means no failed attempt's bytes can survive.
 const CURL_ATTEMPTS: u32 = 3;
 
+/// How long this process holds a link down once a request spent every attempt reaching no
+/// host ([`attempt_again`]): a pass's lanes ask within seconds of one another, and a verdict
+/// older than this is asked afresh, retries and all.
+const LINK_DOWN_HOLDS: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// When a request in this process last spent its attempts on a link that reached no host,
+/// until a request reaches one: ONE offline verdict for every lane of the process, so a
+/// second request on a dead link — the set completion's resolve after the pass's own, on an
+/// offline first launch — is answered by its first attempt instead of paying the same backoff
+/// again ([`attempt_again`]).
+static LINK_DOWN_SINCE: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+/// What an attempt says of the link ([`link_after`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Link {
+    /// It reached no host, with nothing left to try: the link is down.
+    Down,
+    /// A host answered, whatever it said: the link is up.
+    Reached,
+    /// Neither, or not yet.
+    Unknown,
+}
+
+/// Whether curl's `exit` says it reached no host at all: the proxy or the host name did not
+/// resolve (5, 6), or no route led to it, or nothing answered the connect (7). A second try a
+/// moment later meets the same; a timeout (28), a broken transfer or a refused handshake does
+/// not say so, and keeps its honest retries.
+fn reached_no_host(exit: Option<i32>) -> bool {
+    matches!(exit, Some(5..=7))
+}
+
+/// What attempt `attempt` of a request's `attempts`, ended with curl's `exit`, says of the
+/// link, and whether another attempt is worth its backoff — `known_down` when this process
+/// already holds the link down. Pure: [`attempt_again`] keeps the verdict. An attempt that
+/// reached no host retries only while the link is not known down, and holds it down once a
+/// request has spent every one of its retries on it (a one-attempt hint never says so on its
+/// own); one a host answered (a status, `-f`'s exit 22) brings it back up; every other
+/// failure retries as it always did.
+fn link_after(exit: Option<i32>, attempt: u32, attempts: u32, known_down: bool) -> (Link, bool) {
+    let last = attempt >= attempts;
+    if reached_no_host(exit) {
+        let down = known_down || (last && attempts > 1);
+        (
+            if down { Link::Down } else { Link::Unknown },
+            !last && !known_down,
+        )
+    } else if matches!(exit, Some(0 | 22)) {
+        (Link::Reached, !last)
+    } else {
+        (Link::Unknown, !last)
+    }
+}
+
+/// [`link_after`] over this process's verdict ([`LINK_DOWN_SINCE`]), which it updates: whether
+/// a request makes another attempt after attempt `attempt` of its `attempts` ended with
+/// `exit`.
+// Skip: a process-global verdict behind a std Mutex and the monotonic clock (absent std
+// bodies); the decision itself is the pure `link_after`.
+#[cfg_attr(trust_verify, trust::skip)]
+fn attempt_again(exit: Option<i32>, attempt: u32, attempts: u32) -> bool {
+    let mut since = LINK_DOWN_SINCE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let known_down = since.is_some_and(|at| at.elapsed() <= LINK_DOWN_HOLDS);
+    let (link, again) = link_after(exit, attempt, attempts, known_down);
+    match link {
+        Link::Down => *since = Some(std::time::Instant::now()),
+        Link::Reached => *since = None,
+        Link::Unknown => {}
+    }
+    again
+}
+
 /// Whether an HTTP status is worth another in-process attempt: the transient
 /// server-side set curl itself calls retryable (`man curl`, `--retry`).
 ///
@@ -209,22 +282,33 @@ pub struct HeadAnswer {
 /// status trailer, so no file sink is needed. No `-f`: a 404 is an answer this lane
 /// reads, not a failure. No `--retry`: the stdout capture is retried per process (see
 /// [`CURL_ATTEMPTS`]; a concatenated hop would be parsed as one).
-fn head_args() -> [&'static str; 8] {
+fn head_args() -> [&'static str; 10] {
     head_args_with_timeout("30")
 }
 
-fn head_args_with_timeout(timeout_secs: &'static str) -> [&'static str; 8] {
+fn head_args_with_timeout(timeout_secs: &'static str) -> [&'static str; 10] {
     [
         "-sS",
         "-I",
         "--max-redirs",
         "0",
+        // A black-holed TCP/TLS setup fails at the connect bound, not at the wall clock.
+        "--connect-timeout",
+        SMALL_CONNECT_SECS,
         "--max-time",
         timeout_secs,
         "-w",
         "\n%{http_code}",
     ]
 }
+
+/// The CONNECT bound (DNS, TCP and TLS) of a HEAD or a small-document GET, in seconds. A
+/// dropped SYN or a half-up VPN otherwise held each attempt to its whole `--max-time`, so a
+/// pass's first request could spend 93 s (three 30 s attempts and the sleeps between them)
+/// before it called the machine offline; bounded, the three attempts take 18 s. A host that
+/// answers connects in well under a second, and each attempt still gets the full wall clock
+/// for its transfer.
+const SMALL_CONNECT_SECS: &str = "5";
 
 /// The status and `Location` of ONE hop of `url`, anonymously, without following it.
 ///
@@ -265,8 +349,9 @@ fn head_no_redirect_with(url: &str, args: &[&str], attempts: u32) -> Result<Head
         }
         let last = attempt >= attempts;
         let out = curl_fetch(args, url).map_err(HttpError::Transport)?;
+        let again = attempt_again(out.status.code(), attempt, attempts);
         if !out.status.success() {
-            if !last {
+            if again {
                 continue;
             }
             return Err(HttpError::Transport(format!(
@@ -347,13 +432,15 @@ fn require_https_url(url: &str) -> Result<(), String> {
 /// signature covers. Asset downloads therefore stay unclassified; every public/private
 /// verdict is taken from the discovery step that always runs first — the evergreen
 /// pointer's HEAD ([`head_no_redirect`]).
-fn download_bytes_args(cap: &str) -> [&str; 9] {
+fn download_bytes_args(cap: &str) -> [&str; 11] {
     [
         "-fsSL",
         // Redirects (GitHub's 302 to object storage) may only land on https —
         // `-L` alone would also follow http/ftp(s), a MITM downgrade vector.
         "--proto-redir",
         "=https",
+        "--connect-timeout",
+        SMALL_CONNECT_SECS,
         "--max-time",
         "60",
         "--max-filesize",
@@ -389,6 +476,7 @@ pub fn download_bytes(asset_url: &str, max_filesize: u64) -> Result<Vec<u8>, Str
             std::thread::sleep(std::time::Duration::from_secs(1 << (attempt - 2)));
         }
         let out = curl_fetch(&download_bytes_args(&cap), asset_url)?;
+        let again = attempt_again(out.status.code(), attempt, CURL_ATTEMPTS);
         if out.status.success() {
             return Ok(out.stdout);
         }
@@ -404,7 +492,7 @@ pub fn download_bytes(asset_url: &str, max_filesize: u64) -> Result<Vec<u8>, Str
         if let Some(verdict) = classify_asset_failure(asset_url, &stderr) {
             return Err(verdict);
         }
-        if attempt >= CURL_ATTEMPTS {
+        if !again {
             return Err(format!(
                 "curl asset download failed ({}): {}",
                 out.status,
@@ -513,6 +601,13 @@ fn curl_http_error_code(stderr: &str) -> Option<u16> {
 /// can never fetch (curl exit 56, "Maximum file size exceeded"), which reads as
 /// a network failure and never escalates.
 pub const RELEASE_ASSET_DOWNLOAD_BOUND: u64 = 2_147_483_648;
+
+// The bound must cover the ~775 MB batteries-included container: a private
+// lower copy is how 0.15.0 shipped a 512 MiB client cap against 775 MB
+// containers, so every install failed the download as a "network" failure
+// that never escalates. Checked at compile time (test builds, as before).
+#[cfg(test)]
+const _: () = assert!(RELEASE_ASSET_DOWNLOAD_BOUND > 800_000_000);
 
 /// The wall-clock backstop for a file-sink asset download, DERIVED from the size cap
 /// instead of fixed.
@@ -1491,7 +1586,7 @@ fn vendor_get_within(
         let step = vendor_get_step(
             &run,
             &String::from_utf8_lossy(&dump),
-            attempt >= bounds.attempts,
+            !attempt_again(run.exit, attempt, bounds.attempts),
             url,
             cap,
             if_none_match,
@@ -1532,7 +1627,8 @@ pub fn vendor_content_length(url: &str) -> Result<u64, HttpError> {
             stdout: &stdout,
             stderr: &stderr,
         };
-        if let Step::Done(result) = vendor_head_step(&run, attempt >= CURL_ATTEMPTS, url) {
+        let last = !attempt_again(run.exit, attempt, CURL_ATTEMPTS);
+        if let Step::Done(result) = vendor_head_step(&run, last, url) {
             return result;
         }
     }
@@ -1669,6 +1765,7 @@ mod tests {
         download_to_resumable_https_only, head_args, keep_partial, keep_partial_after_failure,
         location_header, part_path, range_refused, resume_plan, transient_status, vendor_get_args,
     };
+    use super::{Link, link_after};
     use aterm_uds::spawnfd::Command;
 
     /// The curl binary is platform-selected: a pinned absolute path on unix (no
@@ -1763,19 +1860,6 @@ mod tests {
         );
     }
 
-    /// The bound is GitHub's own per-asset ceiling, so the only thing that can
-    /// strand a payload is GitHub refusing to host it. A private lower copy is
-    /// how 0.15.0 shipped a 512 MiB client cap against 775 MB containers:
-    /// every install accepted the manifest and then failed the download every
-    /// interval, as a "network" failure that never escalates.
-    #[test]
-    fn release_asset_bound_is_githubs_ceiling_and_covers_batteries_included() {
-        assert_eq!(RELEASE_ASSET_DOWNLOAD_BOUND, 2 * 1024 * 1024 * 1024);
-        // A claim about a constant belongs at COMPILE time; a runtime assert
-        // over constants can never fail a run that compiled.
-        const { assert!(RELEASE_ASSET_DOWNLOAD_BOUND > 800_000_000) };
-    }
-
     /// The download ceiling must scale with the payload it is supposed to admit. A
     /// FIXED 600 s is decoupled from `--max-filesize` in exactly the way the 512 MiB
     /// client cap was decoupled from the 775 MB container: the shipped batteries
@@ -1865,6 +1949,67 @@ mod tests {
             );
         }
     }
+    /// ONE OFFLINE VERDICT, NOT ONE PER REQUEST. A request that reaches no host (the name or
+    /// the proxy does not resolve, nothing answers the connect) retries with its backoff while
+    /// the link is not known down, and holds it down once its last attempt fails the same way
+    /// (a one-attempt hint never holds it down on its own word); a request after it on the
+    /// dead link stops at its first such failure. A timeout or a
+    /// broken transfer says nothing of the link and keeps every retry, known down or not, and
+    /// any host's answer brings the link back up.
+    #[test]
+    fn a_link_known_down_is_not_paid_for_twice() {
+        for no_host in [5, 6, 7] {
+            let exit = Some(no_host);
+            // A request with retries: they go on until the last, which holds the link down.
+            assert_eq!(
+                link_after(exit, 1, 3, false),
+                (Link::Unknown, true),
+                "{no_host}"
+            );
+            assert_eq!(
+                link_after(exit, 3, 3, false),
+                (Link::Down, false),
+                "{no_host}"
+            );
+            // On a link already known down, its first such failure is its last.
+            assert_eq!(
+                link_after(exit, 1, 3, true),
+                (Link::Down, false),
+                "{no_host}"
+            );
+            // A one-attempt hint consults the verdict and never makes one on its own.
+            assert_eq!(
+                link_after(exit, 1, 1, false),
+                (Link::Unknown, false),
+                "{no_host}"
+            );
+        }
+        for transient in [Some(28), Some(35), Some(52), Some(56), None] {
+            for known_down in [false, true] {
+                assert_eq!(
+                    link_after(transient, 1, 3, known_down),
+                    (Link::Unknown, true),
+                    "{transient:?}"
+                );
+                assert_eq!(
+                    link_after(transient, 3, 3, known_down),
+                    (Link::Unknown, false),
+                    "{transient:?}"
+                );
+            }
+        }
+        for answered in [0, 22] {
+            assert_eq!(
+                link_after(Some(answered), 1, 3, true),
+                (Link::Reached, true)
+            );
+            assert_eq!(
+                link_after(Some(answered), 1, 1, true),
+                (Link::Reached, false)
+            );
+        }
+    }
+
     /// Conditional requests exist ONLY on the vendor lane: no GitHub lane's option list
     /// carries an `If-None-Match`.
     #[test]
@@ -2526,6 +2671,26 @@ mod tests {
         assert!(err.to_string().contains("non-https"), "{err}");
         let err = super::head_no_redirect_quick("http://github.com/x").unwrap_err();
         assert!(err.to_string().contains("non-https"), "{err}");
+    }
+
+    /// The HEAD lanes and the small-document GET bound the CONNECT apart from the wall
+    /// clock, so a black-holed TCP/TLS setup fails each attempt in seconds — and the bound
+    /// is an option, ahead of the `--` that guards the URL.
+    #[test]
+    fn the_small_lanes_bound_the_connect_ahead_of_the_url_guard() {
+        let small = super::download_bytes_args("5000000");
+        let quick = super::head_args_with_timeout("5");
+        let head = head_args();
+        for lane in [&head[..], &quick[..], &small[..]] {
+            let v = curl_argv(lane, WEB_ASSET);
+            let bound = v
+                .iter()
+                .position(|a| a == "--connect-timeout")
+                .unwrap_or_else(|| panic!("no connect bound: {v:?}"));
+            assert_eq!(v[bound + 1], "5", "{v:?}");
+            let dashdash = v.iter().position(|a| a == "--").expect("`--` present");
+            assert!(bound < dashdash, "{v:?}");
+        }
     }
 
     /// The `Location` reader takes the LAST block's value (the hop we kept), matches

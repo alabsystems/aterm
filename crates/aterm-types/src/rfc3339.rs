@@ -8,10 +8,10 @@
 //! `YYYY-MM-DDTHH:MM:SSZ` shape). Pure functions only: callers keep their own
 //! clock reads. The crates that do not depend on this one keep a date
 //! formatter of their own: `aterm-messages` (no dependencies, by design),
-//! `aterm-spec`'s report date and `xtask`'s perf date.
+//! `aterm-spec`'s report date and `verify perf`'s date.
 //!
-//! PARSING has one home too. [`parse_utc`] is the strict inverse of
-//! [`format_rfc3339`] and the default for every reader; [`parse_utc_fractional`]
+//! PARSING has one home too. [`parse_utc`] inverts [`format_rfc3339`] through
+//! year 9999 and is the default for every reader; [`parse_utc_fractional`]
 //! additionally admits a fractional-seconds field, for the records whose
 //! writer stamps one (the package pass end, `….000000000Z`; Claude Code's
 //! transcript stamps, `….796Z`). Neither reads a zone offset: `…+05:30` names a
@@ -21,12 +21,12 @@
 //! offsets ON PURPOSE, applying them, over this module's calendar.
 
 /// Days since 1970-01-01 → proleptic-Gregorian `(year, month, day)` —
-/// Howard Hinnant's branch-free `civil_from_days`. Pure and total.
+/// Howard Hinnant's `civil_from_days`. Pure and total for every `i64` day.
 #[must_use]
 pub fn civil_from_days(days: i64) -> (i64, i64, i64) {
     // Shift the epoch from 1970-01-01 to 0000-03-01 so leap days land at the
     // end of each 400-year era.
-    let z = days + 719_468;
+    let z = i128::from(days) + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = z - era * 146_097; // day-of-era      [0, 146096]
     let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
@@ -34,27 +34,33 @@ pub fn civil_from_days(days: i64) -> (i64, i64, i64) {
     let mp = (5 * doy + 2) / 153; // month, shifted so Mar = 0  [0, 11]
     let d = doy - (153 * mp + 2) / 5 + 1; // day-of-month  [1, 31]
     let m = if mp < 10 { mp + 3 } else { mp - 9 }; // month  [1, 12]
-    let y = yoe + era * 400 + i64::from(m <= 2); // Jan/Feb belong to the next year
-    (y, m, d)
+    let y = yoe + era * 400 + i128::from(m <= 2); // Jan/Feb belong to the next year
+    // An i64 day spans fewer than 2^55 years; the canonical month and day
+    // are bounded above. All three values therefore fit i64 exactly.
+    (y as i64, m as i64, d as i64)
 }
 
 /// Civil `(year, month, day)` → days since 1970-01-01 — Howard Hinnant's
-/// `days_from_civil`, the exact inverse of [`civil_from_days`]. Field
-/// validation is the CALLER's policy: out-of-range months/days extrapolate
-/// arithmetically instead of erroring.
+/// `days_from_civil`. Inverts [`civil_from_days`] over every `i64` day.
+/// Field validation is the caller's policy: out-of-range months/days
+/// extrapolate arithmetically instead of erroring. Results beyond the `i64`
+/// day range saturate, so arbitrary `i64` fields remain total.
 #[must_use]
 pub fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let (y, m, d) = (i128::from(y), i128::from(m), i128::from(d));
     let y = if m <= 2 { y - 1 } else { y };
     let era = if y >= 0 { y } else { y - 399 } / 400;
     let yoe = y - era * 400; // [0, 399]
     let mp = if m > 2 { m - 3 } else { m + 9 }; // month, shifted so Mar = 0
     let doy = (153 * mp + 2) / 5 + d - 1; // day-of-year (Mar 1 = 0)
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // day-of-era
-    era * 146_097 + doe - 719_468
+    let days = era * 146_097 + doe - 719_468;
+    days.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
 }
 
 /// Format seconds-since-Unix-epoch as an RFC3339 UTC instant
-/// (`YYYY-MM-DDTHH:MM:SSZ`). The calendar date comes from
+/// (`YYYY-MM-DDTHH:MM:SSZ` through year 9999). Larger years are written in
+/// full, extending that shape beyond the parsers' four-digit year. The calendar date comes from
 /// [`civil_from_days`]; time-of-day is a plain `secs % 86400` split. Pure and
 /// total for all `u64` inputs.
 ///
@@ -89,8 +95,10 @@ pub fn format_rfc3339(secs: u64) -> String {
 /// it), or `None` for anything else. Exactly 20 bytes: a zone offset, a bare
 /// stamp with no `Z`, a fractional-seconds field, a space for the `T` and any
 /// trailing byte are all refused, as is a field out of range (month 1-12, day
-/// 1-31, hour 0-23, minute 0-59, second 0-60 for a leap second). The exact
-/// inverse of [`format_rfc3339`] over its whole range.
+/// 1-31, hour 0-23, minute 0-59, second 0-60). Days and leap seconds are
+/// normalized arithmetically, without validating a month's length or the
+/// leap-second schedule. Inverts [`format_rfc3339`] from the epoch through
+/// `9999-12-31T23:59:59Z`; larger formatted years are refused.
 #[must_use]
 pub fn parse_utc(s: &str) -> Option<i64> {
     let b = s.as_bytes();
@@ -191,6 +199,7 @@ mod tests {
             1_751_328_000,
             1_785_801_600,
             4_102_444_800,
+            253_402_300_799, // the last second of year 9999
         ] {
             let stamp = format_rfc3339(secs);
             assert_eq!(parse_utc(&stamp), Some(secs as i64), "{stamp}");
@@ -201,6 +210,17 @@ mod tests {
             parse_utc("1969-12-31T23:59:59Z"),
             Some(-1),
             "pre-epoch is signed"
+        );
+        assert_eq!(format_rfc3339(253_402_300_800), "10000-01-01T00:00:00Z");
+        for secs in [253_402_300_800, u64::MAX] {
+            let extended = format_rfc3339(secs);
+            assert_eq!(parse_utc(&extended), None, "{extended}");
+            assert_eq!(parse_utc_fractional(&extended), None, "{extended}");
+        }
+        assert_eq!(
+            parse_utc("2000-02-30T00:00:00Z"),
+            parse_utc("2000-03-01T00:00:00Z"),
+            "numeric field admission preserves arithmetic normalization"
         );
         for bad in [
             "",
@@ -267,16 +287,43 @@ mod tests {
     #[test]
     fn days_from_civil_inverts_civil_from_days() {
         for days in [
-            0_i64, 1, 58, 59, 60, 364, 365, 730, 20_000, 146_096, 146_097, 1_000_000,
+            i64::MIN,
+            i64::MIN + 1,
+            -865_566,
+            -865_565,
+            -719_469,
+            -719_468,
+            -146_097,
+            -365,
+            -1,
+            0,
+            1,
+            58,
+            59,
+            60,
+            364,
+            365,
+            730,
+            20_000,
+            146_096,
+            146_097,
+            1_000_000,
+            i64::MAX - 719_468,
+            i64::MAX - 1,
+            i64::MAX,
         ] {
             let (y, m, d) = civil_from_days(days);
             assert_eq!(days_from_civil(y, m, d), days);
+            assert!((1..=12).contains(&m) && (1..=31).contains(&d));
+            if let Some(era_later) = days.checked_add(146_097) {
+                assert_eq!(civil_from_days(era_later), (y + 400, m, d));
+            }
         }
-        // Pre-epoch day counts round-trip too: the shared math is total, and
-        // the pre-1970 rejection some call sites apply is THEIR policy.
-        for days in [-1_i64, -365, -146_097, -719_468] {
-            let (y, m, d) = civil_from_days(days);
-            assert_eq!(days_from_civil(y, m, d), days);
-        }
+        let (y, m, d) = civil_from_days(i64::MIN);
+        assert_eq!(days_from_civil(y, m, d - 1), i64::MIN);
+        let (y, m, d) = civil_from_days(i64::MAX);
+        assert_eq!(days_from_civil(y, m, d + 1), i64::MAX);
+        assert_eq!(days_from_civil(i64::MIN, 1, 1), i64::MIN);
+        assert_eq!(days_from_civil(i64::MAX, 12, 31), i64::MAX);
     }
 }

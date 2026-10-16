@@ -20,6 +20,15 @@ use aterm_messages::{
     Restatement, STALE_TAILED, STALE_UPDATE, STALL_AFTER, Severity, Tone, Unit, WallStamp, tags,
 };
 
+/// The instant a test mints and feeds in: the engine itself reads no clock.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "test code: the one instant a test mints and feeds in"
+)]
+fn minted_now() -> Instant {
+    Instant::now()
+}
+
 fn ms(n: u64) -> Duration {
     Duration::from_millis(n)
 }
@@ -158,7 +167,7 @@ const LOOKS: [Look; 4] = [Look::MOVING, Look::STILL, FLAT, FLAT_STILL];
 /// bytes stop at the returned instant and the stall is due `STALL_AFTER`
 /// later.
 fn fed(start: u64) -> (MessageCenter, MessageId, Instant) {
-    let now = Instant::now();
+    let now = minted_now();
     let mut c = MessageCenter::new(MessageLog::empty(), now);
     let id = c.post(download(start), stamp(), now).id;
     c.commit_rows(now, 3);
@@ -261,7 +270,7 @@ fn deadlines_never_miss_a_change_the_motion_draws() {
     let mut missed = Vec::new();
     for cols in [60usize, 80, 120] {
         for look in LOOKS {
-            let now = Instant::now();
+            let now = minted_now();
             let mut c = MessageCenter::new(MessageLog::empty(), now);
             c.post(busy("Installing Homebrew"), stamp(), now);
             c.commit_rows(now, 3);
@@ -317,7 +326,7 @@ fn deadlines_never_miss_a_change_the_motion_draws() {
     for end in ["complete", "fault", "vanish"] {
         for indeterminate in [false, true] {
             for look in LOOKS {
-                let now = Instant::now();
+                let now = minted_now();
                 let mut c = MessageCenter::new(MessageLog::empty(), now);
                 let msg = if indeterminate {
                     busy("Installing Homebrew")
@@ -471,7 +480,7 @@ fn stream(seed: u64, n: usize) -> Vec<(u64, Amount)> {
 #[test]
 fn the_eta_never_speaks_from_too_little_and_never_goes_negative_or_absurd() {
     for seed in 0..64u64 {
-        let base = Instant::now();
+        let base = minted_now();
         let mut t = ProgressTrack::default();
         let readings = stream(seed, 200);
         let (mut since, mut seen, mut prev_done) = (0u64, 0usize, None::<u64>);
@@ -530,7 +539,7 @@ fn the_eta_never_speaks_from_too_little_and_never_goes_negative_or_absurd() {
 #[test]
 fn an_overdue_eta_stops_promising_under_five_seconds() {
     for unit in [Unit::Steps, Unit::Items] {
-        let base = Instant::now();
+        let base = minted_now();
         let mut t = ProgressTrack::default();
         let mut now = base;
         for k in 0..20u64 {
@@ -568,7 +577,7 @@ fn an_overdue_eta_stops_promising_under_five_seconds() {
 /// at `ELAPSED_AFTER`.
 #[test]
 fn the_elapsed_clock_ticks_exactly_on_its_deadlines() {
-    let now = Instant::now();
+    let now = minted_now();
     let mut c = MessageCenter::new(MessageLog::empty(), now);
     c.post(busy("Installing Homebrew"), stamp(), now);
     c.commit_rows(now, 3);
@@ -594,7 +603,7 @@ fn the_elapsed_clock_ticks_exactly_on_its_deadlines() {
 /// the epoch is) and have the band and the description read the same one.
 #[test]
 fn the_elapsed_clock_survives_a_same_activity_supersede() {
-    let now = Instant::now();
+    let now = minted_now();
     let mut c = MessageCenter::new(MessageLog::empty(), now);
     c.post(
         busy("Installing ALab toolchain")
@@ -646,7 +655,7 @@ fn the_elapsed_clock_survives_a_same_activity_supersede() {
 fn a_fault_echo_never_wakes_through_its_hold() {
     for indeterminate in [false, true] {
         for cols in [60usize, 80, 120] {
-            let now = Instant::now();
+            let now = minted_now();
             let mut c = MessageCenter::new(MessageLog::empty(), now);
             let msg = if indeterminate {
                 busy("Installing Homebrew")

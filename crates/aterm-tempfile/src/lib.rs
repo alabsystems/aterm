@@ -5,7 +5,7 @@
 //!
 //! A drop-in for the parts of the `tempfile` crate aterm uses: `TempDir`,
 //! `Builder`, and the free function `tempdir()`. Tests that run a stand-in
-//! script also get `stand_in` (feature `stand-in`).
+//! script also get `stand_in` (test and debug builds).
 
 // Register the `trust` tool namespace so the FFI/CSPRNG wrappers below can
 // carry `#[cfg_attr(trust_verify, trust::skip)]`; inert off-Trust.
@@ -19,8 +19,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Generate a unique temporary name component from the pid, a process-wide
-/// counter and OS randomness, so names do not collide across processes.
+/// Generate a temporary name component from the pid, a process-wide counter
+/// and OS randomness. The counter separates names in this process; callers
+/// retry `AlreadyExists` to handle a collision with another process's name.
 // Skipped under Trust: the body is `String` assembly, whose panic-freedom
 // obligations are the allocator's; the verifier exhausts its budget on them.
 #[cfg_attr(trust_verify, trust::skip)]
@@ -95,8 +96,6 @@ fn os_random_u64() -> u64 {
 /// this only breaks ties between processes started in the same nanosecond.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 fn no_csprng_fallback() -> u64 {
-    // wasm-clock-guard: allow — compiled for every target except
-    // wasm32-unknown-unknown, whose twin is the next function down.
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         // Equals `d.as_nanos() as u64` (the truncating cast is mod 2^64, as is
@@ -116,7 +115,8 @@ fn no_csprng_fallback() -> u64 {
 /// This target has no OS CSPRNG, so this is the only seed, and
 /// `std::time::SystemTime::now()` panics there ("time not implemented on this
 /// platform"). aterm-tempfile reaches `aterm-wasm` through `aterm-grid`, and
-/// `crates/aterm-gpu/tests/wasm_clock_safety.rs` guards against clock reads.
+/// the browser cells' lint (`crates/aterm-time/wasm32/clippy.toml`) refuses
+/// std's clock there.
 ///
 /// The seed is a process-wide counter mixed by a splitmix-style finalizer.
 /// With one wasm instance per module and no fork, the counter alone keeps
@@ -137,9 +137,8 @@ fn no_csprng_fallback() -> u64 {
 }
 
 // getentropy(2) first, a bounded device read last: the workspace's one
-// entropy pattern (see `aterm_uds::rand`). `tools/grep_guard.sh` allows the
-// "/dev/urandom" literal only in this file and aterm-uds; this crate is
-// zero-dependency, so it carries its own twin with one inline libc extern.
+// entropy pattern (see `aterm_uds::rand`). This crate is zero-dependency, so
+// it carries its own twin with one inline libc extern.
 #[cfg(unix)]
 // Skipped under Trust: an inline `getentropy(2)` FFI call plus a raw device
 // read, a syscall boundary with nothing verifiable in it.
@@ -259,6 +258,18 @@ impl TempDir {
         let dir = dir.as_ref();
         for _ in 0..5 {
             let name = unique_name(prefix);
+            // A prefix contributes to one complete file name, never to its
+            // parent path. Compare the raw name too, since components alone
+            // would normalize separators or a leading "./" away.
+            let mut components = Path::new(&name).components();
+            if !matches!(components.next(), Some(std::path::Component::Normal(part)) if part == name.as_str())
+                || components.next().is_some()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "a temporary directory prefix must not contain a path",
+                ));
+            }
             let path = dir.join(name);
             // Mode 0o700, as upstream `tempfile`, so the contents are not
             // world-traversable; O_EXCL/AlreadyExists still guards the
@@ -287,6 +298,13 @@ impl TempDir {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Keep the directory and its contents after this guard is consumed. The caller
+    /// takes responsibility for removing the returned path.
+    #[must_use]
+    pub fn keep(mut self) -> PathBuf {
+        std::mem::take(&mut self.path)
+    }
 }
 
 impl Drop for TempDir {
@@ -295,7 +313,9 @@ impl Drop for TempDir {
     // dropped `TempDir`.
     #[cfg_attr(trust_verify, trust::skip)]
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
+        if !self.path.as_os_str().is_empty() {
+            let _ = fs::remove_dir_all(&self.path);
+        }
     }
 }
 
@@ -318,7 +338,8 @@ impl Builder {
         Self::default()
     }
 
-    /// Set the prefix for the temporary name.
+    /// Set the prefix for the temporary name. Path separators and Windows
+    /// drive prefixes are refused when the directory is created.
     // Skipped under Trust: `str::to_owned` allocates and the reassignment
     // drops the prior `Option<String>`; nothing verifiable.
     #[cfg_attr(trust_verify, trust::skip)]
@@ -393,7 +414,7 @@ pub fn tempdir() -> io::Result<TempDir> {
 ///
 /// Returns an error if `path` has no file name or the stand-in cannot be written
 /// or moved into place.
-#[cfg(all(unix, any(test, feature = "stand-in")))]
+#[cfg(all(unix, any(test, debug_assertions)))]
 pub fn stand_in(path: &Path, body: &str) -> io::Result<()> {
     if path.file_name().is_none() {
         return Err(io::Error::new(
@@ -424,7 +445,7 @@ pub fn stand_in(path: &Path, body: &str) -> io::Result<()> {
 /// absent or not `body`. A link is kept only when [`is_stand_in`] holds for it.
 /// A link that fails, or a copy not owned by `dir`'s owner, is an error that
 /// leaves the shared copy (already assessed) as it was.
-#[cfg(all(target_os = "macos", any(test, feature = "stand-in")))]
+#[cfg(all(target_os = "macos", any(test, debug_assertions)))]
 fn link_shared(tmp: &Path, dir: &Path, body: &[u8]) -> io::Result<()> {
     use std::os::unix::fs::DirBuilderExt as _;
     let cache = call0(std::env::temp_dir).join("aterm-stand-ins");
@@ -454,7 +475,7 @@ fn link_shared(tmp: &Path, dir: &Path, body: &[u8]) -> io::Result<()> {
 /// Whether `file` is a regular file holding exactly `body`, mode 0555, owned by
 /// whoever owns `dir`: what was checked is the inode itself, which only its
 /// owner can change.
-#[cfg(all(target_os = "macos", any(test, feature = "stand-in")))]
+#[cfg(all(target_os = "macos", any(test, debug_assertions)))]
 fn is_stand_in(file: &Path, dir: &Path, body: &[u8]) -> bool {
     use std::os::unix::fs::MetadataExt as _;
     let (Ok(meta), Ok(owner)) = (fs::symlink_metadata(file), fs::metadata(dir)) else {
@@ -467,7 +488,7 @@ fn is_stand_in(file: &Path, dir: &Path, body: &[u8]) -> bool {
 }
 
 /// Create `path` (it must not exist) holding `body`, then make it mode 0555.
-#[cfg(all(unix, any(test, feature = "stand-in")))]
+#[cfg(all(unix, any(test, debug_assertions)))]
 fn write_read_only(path: &Path, body: &[u8]) -> io::Result<()> {
     use std::io::Write as _;
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
@@ -487,7 +508,7 @@ fn write_read_only(path: &Path, body: &[u8]) -> io::Result<()> {
 
 /// 64-bit FNV-1a: names the shared copy. A collision costs a rewrite, never a
 /// wrong stand-in: [`is_stand_in`] compares the bytes.
-#[cfg(all(target_os = "macos", any(test, feature = "stand-in")))]
+#[cfg(all(target_os = "macos", any(test, debug_assertions)))]
 fn fnv1a(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, &byte| {
         (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
@@ -511,6 +532,20 @@ mod tests {
     }
 
     #[test]
+    fn keeping_a_directory_transfers_cleanup_to_the_caller() {
+        let parent = tempdir().expect("parent");
+        let dir = TempDir::new_in(parent.path()).expect("child");
+        fs::write(dir.path().join("artifact"), b"retained").expect("artifact");
+        let kept = dir.keep();
+        assert_eq!(
+            fs::read(kept.join("artifact")).expect("retained"),
+            b"retained"
+        );
+        fs::remove_dir_all(kept).expect("caller cleanup");
+        assert_eq!(fs::read_dir(parent.path()).expect("parent").count(), 0);
+    }
+
+    #[test]
     fn builder_prefix() {
         let dir = Builder::new()
             .prefix("myprefix_")
@@ -525,6 +560,35 @@ mod tests {
         assert_eq!(inner.path().parent(), Some(dir.path()));
         let name = inner.path().file_name().unwrap().to_str().unwrap();
         assert!(name.starts_with("inner_"), "name: {name}");
+    }
+
+    #[test]
+    fn a_prefix_cannot_escape_the_requested_parent() {
+        let root = tempdir().expect("root");
+        let parent = root.path().join("inside");
+        fs::create_dir(&parent).expect("parent");
+        let absolute = root.path().join("outside_");
+        for prefix in ["../outside_", "nested/child_", absolute.to_str().unwrap()] {
+            let error = Builder::new()
+                .prefix(prefix)
+                .tempdir_in(&parent)
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{prefix:?}");
+        }
+        #[cfg(windows)]
+        for prefix in [r"..\outside_", r"C:outside_"] {
+            let error = Builder::new()
+                .prefix(prefix)
+                .tempdir_in(&parent)
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{prefix:?}");
+        }
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+        assert_eq!(fs::read_dir(&parent).unwrap().count(), 0);
+        for prefix in ["", ".", "..", "ordinary_"] {
+            let dir = Builder::new().prefix(prefix).tempdir_in(&parent).unwrap();
+            assert_eq!(dir.path().parent(), Some(parent.as_path()));
+        }
     }
 
     /// One body, one read-only inode (on macOS); another body, its own; a shared

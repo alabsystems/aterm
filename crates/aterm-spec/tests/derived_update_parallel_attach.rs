@@ -13,12 +13,6 @@ use aterm_spec::{
 #[test]
 fn the_handoff_rebuilds_in_the_attach_pass_and_proves_only_when_every_window_painted() {
     let model = native_update_successor_attach_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name),
-        "the successor attach machine must stay enrolled in the spec-link registry"
-    );
     verify::prove_and_catch_scalar(&model, "successor attach");
     let done = |s: &interp::State| {
         s["proved"] == 1
@@ -66,6 +60,33 @@ fn the_handoff_rebuilds_in_the_attach_pass_and_proves_only_when_every_window_pai
         "a cold launch owes no proof"
     );
 
+    // THE COLD DRAIN: the park pass may run a slice, which leaves the rest of
+    // the rebuild owed to the next park; a degraded handoff rebuilds whole.
+    let mut drain = model.init_state();
+    for action in [
+        "Widen",
+        "StartCold",
+        "Attach0",
+        "LeaveResume",
+        "Present0",
+        "RebuildSliceAtPark",
+        "RebuildSliceAtPark",
+    ] {
+        assert!(model.fire(action, &mut drain), "{action}: {drain:?}");
+    }
+    assert_eq!((drain["queued"], drain["draining"]), (1, 1), "{drain:?}");
+    assert!(model.fire("RebuildAtPark", &mut drain));
+    assert_eq!((drain["queued"], drain["draining"]), (0, 0), "{drain:?}");
+    let mut degraded = model.init_state();
+    for action in ["StartDegraded", "Attach0", "LeaveResume", "Present0"] {
+        assert!(model.fire(action, &mut degraded), "{action}: {degraded:?}");
+    }
+    assert!(
+        !model.action_enabled("RebuildSliceAtPark", &degraded),
+        "{degraded:?}"
+    );
+    assert!(model.action_enabled("RebuildAtPark", &degraded));
+
     // NEGATIVE CONTROLS: each invariant's historical or tempting defect.
     let buggy = interp::with_buggy(&model, 1);
     let mut cold_early = buggy.init_state();
@@ -100,18 +121,37 @@ fn the_handoff_rebuilds_in_the_attach_pass_and_proves_only_when_every_window_pai
         !buggy.check_invariant("ProofNeedsDrainedAndPainted", &trap),
         "the multi-window trap: a proof at window 0's first present alone"
     );
+    let mut sliced_handoff = buggy.init_state();
+    for action in [
+        "StartDegraded",
+        "Attach0",
+        "LeaveResume",
+        "Present0",
+        "RebuildSliceHanded",
+    ] {
+        assert!(
+            buggy.fire(action, &mut sliced_handoff),
+            "{action}: {sliced_handoff:?}"
+        );
+    }
+    assert!(!buggy.check_invariant("HandedRebuildsWhole", &sliced_handoff));
+    let mut sliced_early = buggy.init_state();
+    for action in ["StartCold", "Attach0", "RebuildSliceBeforePaint"] {
+        assert!(
+            buggy.fire(action, &mut sliced_early),
+            "{action}: {sliced_early:?}"
+        );
+    }
+    assert!(
+        buggy.check_invariant("ColdRestoreAfterFirstPaint", &sliced_early),
+        "a slice leaves the rebuild owed, so the whole-pass invariant cannot see it"
+    );
+    assert!(!buggy.check_invariant("ColdSlicesAfterFirstPaint", &sliced_early));
 }
 
 #[test]
 fn the_successor_proves_under_fairness_and_an_unkicked_window_never_does() {
     let model = native_update_successor_attach_model();
     let live = native_update_successor_attach_liveness();
-    assert!(
-        aterm_spec::xref::liveness_registry()
-            .iter()
-            .any(|(registered, obligation)| registered.name == model.name
-                && obligation.name == live.name),
-        "the successor attach liveness must stay enrolled"
-    );
     verify::liveness_proves_and_catches_tiered(&model, &live, "NativeUpdateSuccessorAttach");
 }

@@ -2,17 +2,15 @@
 // Copyright 2026 Andrew Yates
 
 //! Typing-momentum glow: the cursor glows with how fast you type and cools when
-//! you stop. While warm it does not blink (owner, 2026-09-08).
+//! you stop. While warm it does not blink.
 //!
 //! # Not [`crate::typing_momentum::TypingMomentum`]
 //!
-//! That metric is rate-normalised (a key-repeat flood and a 30 ms sprint build
-//! at the same pace; `flood_and_sprint_build_at_the_same_pace`), so it cannot
-//! glow brighter for faster typing; its τ = 2 s arc gates cat drama; and it
-//! advances only on echo-correlated spawns inside an enabled `CursorGlow`. This
-//! glow is a cursor feature for any style or shape, trail on or off. It reuses
-//! the integrator pattern (a `Copy` state, an `Option<Instant>` stamp, lazy
-//! decay, snap-to-zero), which keeps it pure in the injected `now`.
+//! That metric is rate-normalised (time spent typing, not key count), so it cannot glow brighter
+//! for faster typing; its τ = 2 s arc gates cat drama; and it advances only on echo-correlated
+//! typing inside an enabled `CursorGlow`. This glow is a cursor feature for any style or shape,
+//! trail on or off. It reuses the integrator pattern (a `Copy` state, an `Option<Instant>` stamp,
+//! lazy decay, snap-to-zero), which keeps it pure in the injected `now`.
 //!
 //! # The law
 //!
@@ -30,15 +28,13 @@
 //!
 //! # What it draws
 //!
-//! A soft additive halo around the cursor cell (three stacked discs, premul
-//! coverage capped at [`COV_CAP`]) and a warm tint on the block body, both
-//! ramping amber → gold → white-hot. On a light theme the halo is a source-over
-//! veil ending at deep orange, since white sinks into paper. Everything is
-//! quantised to `u8` so the fingerprint settles and the lane releases once the
-//! light stops changing, even while the value is still > 0. The halo is in
-//! window px (`Geom::cell_center` + `push_fx_rect`), the `cursor_glow_add`
-//! stream's contract (`halo_surrounds_the_caret_in_a_padded_headed_window`); at
-//! origin (0,0) it matches the grid form.
+//! A soft additive halo around the cursor cell (three stacked discs, premul coverage capped at
+//! [`COV_CAP`]) and a warm tint on the block body, both ramping amber → gold → white-hot (deep
+//! orange on a light theme, since white sinks into paper). Everything is quantised to `u8`, so
+//! the fingerprint settles and the lane releases once the light stops changing, even while the
+//! value is still > 0. The halo is in window px (`Geom::cell_center` + `push_fx_rect`), the
+//! `cursor_glow_add` stream's contract: the renderer adds no offset, so a grid-relative centre
+//! would be right only at origin (0,0).
 //!
 //! Off (disabled, intensity 0, degenerate geometry, no cursor, or cold) equals
 //! no effect: `fill: None`, `hot: false`, `fp: 0`, scratch untouched.
@@ -47,11 +43,6 @@ use aterm_render::{GlowQuad, premul_rgb};
 use aterm_time::Instant;
 
 use crate::cursor_glow::Geom;
-// Window-absolute: the halo lands in `cursor_glow_add`, whose quads are window
-// px (the producer folds in the grid origin; the renderer adds no offset). A
-// grid-relative centre would match only at origin (0,0) and float into the
-// chrome band in a real window. The Fire arm in `cursor_glow/spawn.rs` notes
-// the same trap.
 use crate::effect_util::mix_rgb;
 use crate::effect_util::push_fx_rect as push_rect;
 
@@ -61,14 +52,11 @@ pub const MOMENTUM_GLOW_KEY_CREDIT: f32 = 0.10;
 /// The cool-down time constant in seconds (half-life ≈ 0.83 s).
 pub const MOMENTUM_GLOW_TAU_S: f32 = 1.2;
 
-/// At or above this the cursor is hot: blink suppressed, halo drawn. Below it
-/// the cursor is exactly the configured one. Matches the rainbow twinkle's
-/// settled-energy floor.
+/// At or above this the cursor is hot: blink suppressed, halo drawn. Below it the cursor is
+/// exactly the configured one. Matches the rainbow twinkle's settled-energy floor.
 ///
-/// `TypingRate::hot` and `TypingRate::cold_at` compare the raw decayed rate,
-/// while [`MomentumGlow::tick`] compares the rate scaled by `intensity`, so
-/// `hot` describes typing, not drawing. For the glass read
-/// `MomentumGlow::is_active` (the latched, post-intensity value).
+/// `TypingRate::cold_at` compares the raw decayed rate, while [`MomentumGlow::tick`] compares the
+/// rate scaled by `intensity`; for what is on glass read `MomentumGlow::is_active`.
 pub const MOMENTUM_GLOW_HOT: f32 = 0.02;
 
 /// Snap-to-exact-zero threshold: below this the value reads 0 and the state
@@ -110,7 +98,7 @@ impl TypingRate {
         }
     }
 
-    /// One PRINTABLE key at `now`: decay to `now`, credit, clamp to 1, stamp.
+    /// One printable key at `now`: decay to `now`, credit, clamp to 1, stamp.
     pub fn on_key(&mut self, now: Instant, tau: f32) {
         self.value = (self.value(now, tau) + MOMENTUM_GLOW_KEY_CREDIT).min(1.0);
         self.at = Some(now);
@@ -134,8 +122,8 @@ impl TypingRate {
 /// Host-side inputs for one tick.
 #[derive(Clone, Copy, Debug)]
 pub struct MomentumGlowConfig {
-    /// The user's switch (default ON) ANDed with the host's gates: serious
-    /// mode, focus, live viewport.
+    /// The user's switch (default on) combined with the host's gates: serious mode, focus, live
+    /// viewport.
     pub enabled: bool,
     /// `0..=1` — the motion amplitude × load-shed envelope, folded by the host.
     pub intensity: f32,
@@ -146,8 +134,7 @@ pub struct MomentumGlowConfig {
     /// The resolved cursor colour `0x00RRGGBB` — what the tint is built from.
     pub base: u32,
     pub dark_theme: bool,
-    /// Whether the cursor is a BLOCK (the body tint applies) — bar/underline
-    /// get the halo only.
+    /// Whether the cursor is a block (the body tint applies); bar/underline get the halo only.
     pub block: bool,
 }
 
@@ -156,7 +143,7 @@ pub struct MomentumGlowConfig {
 pub struct MomentumGlowFrame {
     /// The block body tint, `None` when cold, off, or not a block.
     pub fill: Option<u32>,
-    /// HOT: the host pins a Blinking* style to its Steady* twin.
+    /// Hot: the host pins a Blinking* style to its Steady* twin.
     pub hot: bool,
     /// Fingerprint of everything visible; 0 when nothing is.
     pub fp: u64,
@@ -173,8 +160,8 @@ pub struct MomentumGlow {
 }
 
 impl MomentumGlow {
-    /// One PRINTABLE key. The host calls this for glyph-producing keys only
-    /// (never a bare modifier, never delete/kill/navigation).
+    /// One printable key. The host calls this for glyph-producing keys only (never a bare
+    /// modifier, never delete/kill/navigation).
     pub fn on_key(&mut self, now: Instant, tau_s: f32) {
         self.rate.on_key(now, tau_s);
     }
@@ -254,11 +241,8 @@ impl MomentumGlow {
         let tint = ramp(a, cfg.dark_theme);
         let fill = cfg.block.then(|| mix_rgb(cfg.base, tint, 0.55 * s));
 
-        // The halo: three stacked discs around the cell centre, reaching
-        // `radius_cells` beyond the cell at full momentum. The centre is the
-        // cell's window-px centre (`origin + (index + 0.5)·cell`) and the discs
-        // go through `push_fx_rect`, so the light sits on the caret in a padded,
-        // headed window.
+        // The halo: three stacked discs around the cell's window-px centre, reaching
+        // `radius_cells` beyond the cell at full momentum.
         let (cw, ch) = (geom.cw as f32, geom.ch as f32);
         let (cx, cy) = geom.cell_center(cr, cc);
         let rx_full = cw * (0.55 + cfg.radius_cells * s);
@@ -267,7 +251,11 @@ impl MomentumGlow {
             [(1.00, 0.40, 0.0), (0.70, 0.70, 0.35), (0.42, 1.00, 0.7)];
         let cov_core = (COV_CAP * a).min(COV_CAP);
         let slab = ((ch * 0.125) as i32).max(2);
-        for &(scale, cov_x, warm) in &discs {
+        // The halo is additive light: on a light ground it cannot show on the
+        // paper and would only bleach the letters and the trail's ink around
+        // the caret, so there the warm caret is the whole glow.
+        let discs: &[(f32, f32, f32)] = if cfg.dark_theme { &discs } else { &[] };
+        for &(scale, cov_x, warm) in discs {
             let (rx, ry) = (rx_full * scale, ry_full * scale);
             if rx < 1.0 || ry < 1.0 {
                 continue;
@@ -497,8 +485,8 @@ mod tests {
         );
     }
 
-    /// HOT after one key, and cold once the value drops below the floor —
-    /// the host reads this to pin a Blinking* style to its Steady* twin.
+    /// Hot after one key, and cold once the value drops below the floor: the host reads this to
+    /// pin a Blinking* style to its Steady* twin.
     #[test]
     fn blink_is_suppressed_while_hot_and_returns_when_cold() {
         let t0 = Instant::now();

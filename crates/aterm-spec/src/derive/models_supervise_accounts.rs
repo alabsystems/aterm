@@ -1,221 +1,139 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The supervisor's ACCOUNT ROTATION (aterm-agent `harness/accounts.rs`,
-//! `docs/DESIGN-claude-accounts-2026-10-01.md` §6 and §10): which Claude Code
-//! account each session of one home runs on, as usage limits come and go.
+//! The supervisor's Claude Code account machines (aterm-agent `harness/accounts.rs`,
+//! `docs/DESIGN-claude-accounts-2026-10-01.md` §6 and §10).
 //!
-//! One home runs on ONE account at a time (`active`). A session at a usage
-//! wall, or ahead of one, is moved to the next account of the owner's roster —
-//! fresh before low, dedicated before shared — by a rotation that ONE session
-//! makes alone; the others follow only once the account it chose has served a
-//! response, and take that session's place when it has been silent for ten
-//! minutes. The owner's `use <label>` pins an account and everyone follows.
-//! A machine rotates at most so many times an hour.
+//! * [`supervisor_account_rotation_model`]: which account each session of one home runs on.
+//!   One home runs on one account at a time (`active`). A session at a usage wall, or ahead
+//!   of one, moves to the next account of the roster (fresh before low, dedicated before
+//!   shared) by a rotation one session makes alone; the others follow once the chosen
+//!   account has served a response, and take that session's place after ten silent
+//!   minutes. The owner's `use <label>` pins an account and everyone follows. Rotations an
+//!   hour are capped. Tier-1: aterm-agent `tests/supervise_conformance_account_rotation.rs`
+//!   walks every state against the real `accounts::advise`, its transactions, and
+//!   `decide_turn_end`.
+//! * [`supervisor_usage_probe_model`] (`docs/SPEC-claude-accounts-probe-2026-10-01.md` §5):
+//!   the `/usage` probe that feeds a move ahead of a wall.
+//! * [`supervisor_limit_reset_model`] (`docs/SPEC-claude-accounts-resets-2026-10-02.md`
+//!   §5): taking the owner's limit reset a wall dialog offers.
 //!
-//! STATUS: the model is authored here, not derived from the code. Tier-0 is
-//! `tests/derived_supervise.rs`; Tier-1 is aterm-agent's
-//! `tests/supervise_conformance_account_rotation.rs`, which walks every state
-//! of this model against the real `accounts::advise` and its transactions,
-//! and against the real turn-end decider (`supervise::policy::turn_end`'s
-//! `decide_turn_end`, over a real `TurnEndState`) fed that advice as a host
-//! hands it over. Nothing here has run against two real accounts.
-//!
-//! And THE `/usage` PROBE that feeds the move ahead of a wall
-//! ([`supervisor_usage_probe_model`], `docs/SPEC-claude-accounts-probe-
-//! 2026-10-01.md` §5): the loop types `/usage`, reads the Settings panel
-//! once it is settled, and closes it with an Escape — written only where it
-//! lands on the panel and nowhere else. Tier-0 is `tests/derived_supervise.rs`;
-//! its Tier-1 (the real `Session` over the scripted server, every `/usage`
-//! and every Escape projected onto the model) is the loop's to add with the
-//! probe itself.
-//!
-//! And THE LIMIT RESET ([`supervisor_limit_reset_model`], `docs/SPEC-claude-
-//! accounts-resets-2026-10-02.md` §5): at a wall whose dialog offers the
-//! owner's limit reset, the loop takes the grant row and answers the
-//! confirmation it opens — Enter only on the exact one, past the vendor's
-//! guard, on a claim still in flight, and an Escape for anything else.
-//! Tier-0 is `tests/derived_supervise.rs`; its Tier-1 (the real `Session`
-//! over a scripted server whose dialog reacts to what is written, every key
-//! projected onto the model) is the loop's to add with the step. Nothing of
-//! it has been seen on a real screen: the vendor's side is READ in the
-//! 2.1.287 bundle.
+//! The models are authored, not derived from the code. Tier-0 is
+//! `tests/derived_supervise.rs`; Tier-1 for the probe and the reset is aterm-agent
+//! `supervise/run_engine_tests.rs`, over a scripted server. The vendor's side of both is read
+//! from the Claude Code 2.1.287 bundle, never seen on a screen.
 
 use super::{Liveness, Model};
 
-/// ACCOUNT ROTATION (aterm-agent `harness/accounts.rs`: `advise`,
-/// `begin_rotation`, `take_canary`, `prove`, `strike`, `pin`, `unpin`,
-/// `note_wall`, `note_sample`, `forget_session`, and `condition`; and
-/// `supervise/policy/turn_end.rs`: `decide_turn_end`, `restarted`, `acted`,
-/// `account_point`, `account_answer`).
+/// Account rotation (aterm-agent `harness/accounts.rs`: `advise`, `begin_rotation`,
+/// `take_canary`, `prove`, `strike`, `pin`, `unpin`, `note_wall`, `note_sample`,
+/// `forget_session`, `condition`; `supervise/policy/turn_end.rs`: `decide_turn_end`,
+/// `restarted`, `acted`, `account_point`, `account_answer`).
 ///
-/// THE ROSTER is three accounts, numbered as a candidate sorts: `1` and `2`
-/// are DEDICATED (`1` is the one the roster's key puts first), `3` is SHARED.
-/// `d1`, `d2`, `sh` are their conditions: 0 fresh (usable or never seen), 1
-/// low, 2 limited (a wall stands).
+/// The roster is three accounts, numbered as a candidate sorts: `1` and `2` dedicated (`1`
+/// first by the roster's key), `3` shared. `d1`, `d2`, `sh` are their conditions: 0 fresh
+/// (usable or never seen), 1 low, 2 limited (a wall stands).
 ///
-/// THE MACHINE'S STATE: `act` the active account (0 none: a machine that has
-/// never rotated); `run` what the supervisor READS of `act`, kept true by
-/// every step that changes it — 0 nothing to run on (no active account, or a
-/// limited one), 1 low, 2 fresh; `prov` 1 once `act` has served a response
-/// since it was chosen (or is the owner's word); `prev` the account a strike
-/// goes back to while `act` is not proven (0 none) and `pp` 1 when THAT
-/// account had served when it was left; `hold` 1 while the canary's hold
-/// stands — the one session on an account that has not answered holds the
-/// others back, for ten minutes and no longer; `pin` the account the owner
-/// pinned (0 none); `rot` the rotations made this hour, against `Budget`.
+/// The machine:
+/// * `act` — the active account (0: never rotated). `run` — what the supervisor reads of
+///   `act`, kept true by every step that changes it: 0 nothing to run on (none, or
+///   limited), 1 low, 2 fresh.
+/// * `prov` — 1 once `act` has served a response since it was chosen (or is the owner's
+///   word). `prev` — where a strike goes back to while `act` is unproven (0 none); `pp` — 1
+///   when that account had served when it was left.
+/// * `hold` — 1 while the canary's hold stands: the one session on an unanswered account
+///   holds the others back, for ten minutes. `pin` — the owner's pinned account (0 none).
+///   `rot` — rotations this hour, against `Budget`.
 ///
-/// TWO SESSIONS: `s1`, `s2` the account each one's process runs under. A
-/// session whose account is limited is AT ITS WALL, unless its turn ended
-/// without one (`Leave…`: a wall another tab recorded); any other point is a
-/// plain turn end. `jobs` 1 while session 1's agent has background work, so
-/// the host cannot relaunch it (the environment's, and NOT fair: it may never
-/// end). `w1`, `w2` 1 while the session waits its wall out, asleep until
-/// something wakes it. `n1`, `n2` 1 while the session stands at the NOTICE of
-/// a wall the owner's word has just lifted (`Use…` of the account it is on,
-/// with that account limited): its screen still shows the limit, and its
-/// account can be run on. Like the record of the last step below, the notice
-/// is the instant's: every step of the world's forgets it.
+/// Two sessions:
+/// * `s1`, `s2` — each process's account. A session on a limited account is at its wall,
+///   unless its turn ended without one (`Leave…`: a wall another tab recorded).
+/// * `jobs` — 1 while session 1's agent has background work, so the host cannot relaunch
+///   it (the environment's, and not fair).
+/// * `w1`, `w2` — 1 while the session sleeps out its wall.
+/// * `n1`, `n2` — 1 while the session stands at the notice of a wall the owner's `Use…`
+///   just lifted: its screen still shows the limit, but its account can be run on. Every
+///   world step forgets it.
 ///
-/// THE LAST STEP: `mv` the session a move was just made for (0: the last step
-/// was not a session's move), with `pa` and `ph` what `act` and `hold` were
-/// BEFORE it. Every other step clears the three. They are the history the
-/// laws about a move are stated over, written from the pre-state by every
-/// move, sound or not; no step reports on itself.
+/// The last step's record, which the move laws are stated over: `mv` the session a move was
+/// just made for (0 none), `pa` and `ph` what `act` and `hold` were before it, `pw` 1 when
+/// it was made at that session's wall. Every move writes them from the pre-state, sound or
+/// not; no step reports on itself. Every other step clears them, except the move's own
+/// continuation (`Resumed…`, `CarriesOnAfterAnEarlyMove`), which sets only `cx`: 1 once a
+/// continuation of the move's own was typed into the relaunched session.
 ///
-/// THE WORLD: a session hits its account's limit (`Wall…`; the canary's own,
-/// struck, is the `Strike`); a `/usage` read shows it low (`Low…`); a window
-/// resets (`Reset…`); the owner pins and unpins (`Use…`, `Unpin`); the
-/// agent's jobs start and end; the account a rotation chose answers with a
-/// response (`Served`) or with a wall of its own (`Strike`); the canary's
-/// hold ends (`Lapse`).
+/// The world: walls (`Wall…`; the canary's own, struck, is `Strike`), `/usage` reads
+/// showing low (`Low…`), window resets (`Reset…`), the owner's pin (`Use…`, `Unpin`), the
+/// agent's jobs, the chosen account answering (`Served`) or walling (`Strike`), and the
+/// hold ending (`Lapse`).
 ///
-/// THE SUPERVISOR: `Move1`, `Move2` take the advice a session gets at its
-/// point — the canary's place, design §6's rule 2 (follow), rule 3 (at a
-/// wall) and rule 4 (ahead of it) — and make the move in one step; `Leave1`,
-/// `Leave2` are the same at a plain turn end on a limited account; `Wait1`,
-/// `Wait2` put a session at its wall to sleep when there is no move to make;
-/// `Resume1`, `Resume2` continue a session at the notice of a wall the owner
-/// lifted — where it is, at once and once (design §6, "The owner lifted this
-/// wall": the roster's `Resume`, answered by the turn-end policy with that
-/// wall's own continuation; no relaunch, nothing committed).
-/// In the real code a move is three hands: the roster's advice
-/// (`accounts::advise`), the turn-end policy's decision on it
-/// (`Restart::Account`, `at: Wall` at a wall and `at: Ahead` at a plain turn
-/// end; a wait cut to the instant the reason for it ends, or to the roster's
-/// next opening where that comes first — the instant a `Reset…` stands for),
-/// and the host's relaunch. `jobs` is the host's `wait:changed`: the policy
-/// holds the point on its restart back-off and records nothing, so the move
+/// The supervisor: `Move…` takes the advice a session gets at its point (the canary's
+/// place; design §6 rule 2, follow; rule 3, at a wall; rule 4, ahead of one) and makes the
+/// move in one step; `Leave…` is the same at a plain turn end on a limited account; `Wait…`
+/// sleeps a session at its wall when there is no move; `Resume…` continues a session at a
+/// lifted wall's notice in place, at once and once (the roster's `Resume`; no relaunch,
+/// nothing committed); `Resumed…` types the wall's `usage-resume@v1` into a session just
+/// moved at its wall, once (the relaunch itself types nothing; the accounts design v2,
+/// §3.5). In the code a move is the roster's advice, the turn-end decision on it
+/// (`Restart::Account`, `at: Wall` or `at: Ahead`), and the host's relaunch. `jobs` is the
+/// host's `wait:changed`: the policy holds the point on its restart back-off, so the move
 /// is asked again.
 ///
-/// # What is NOT modelled
+/// # Not modelled
 ///
-/// * TIME. No instant, no ladder and no 15-minute rule: a `Wait`'s instant and
-///   its preference for a dedicated account; "low only when nothing is usable
-///   within 15 minutes"; THE LEAVE GUARD (a session is not moved early off an
-///   account whose low window resets within 15 minutes — here every low
-///   account is one to leave, and it is low until its `Reset…`, however near
-///   that is); the hold's ten minutes (`Lapse` is the clock, and is not fair);
-///   and the hour lapsing (`rot` only grows: the model is ONE rotation hour,
-///   and `Budget` is how many rotations it has left).
-/// * The week that resets soonest: `1` before `2` stands for whatever the
-///   roster's key says of two dedicated accounts alike in freshness.
-/// * A login that is signed out or not enrolled, the login-wall strike and a
-///   move that failed with no word about the account.
-/// * THE PROBE (its own model, [`supervisor_usage_probe_model`]: here a
-///   `Low…` step IS the settled read, already recorded), a reset offer
-///   about to expire, and limit resets. One thing of the probe's is this
-///   model's too: no `Low…` step is about the active account while it has
-///   not answered — and the real roster does not advise the probe there
-///   either (`accounts::advise`: the unproven active is never probed).
-/// * `accounts = "off"` and rule 1's stays: the model is `early`, on a
-///   session the roster governs.
-/// * The compare-and-sets as steps of their own. A rotation, and a take of
-///   the canary's place, are advised, committed and relaunched at once; a
-///   relaunch the host refuses is undone (`Strike::NotMoved`) and is no step
-///   at all. Tier-1 drives the lost compare-and-set and the undo of both
-///   against the real transactions.
-/// * WHICH session is the canary: `hold` is the machine's, and the session a
-///   rotation moved is on the account it chose at once. So a canary still on
-///   its old account (its relaunch never came) is not a state here.
-/// * Session 2's jobs, and which walls rotate (a session or weekly limit and
-///   a model bucket do, a spend or credit wall never: the wall here is one
-///   that does).
-/// * THE SESSION'S OWN BOUNDS (design §6, "Bounds. Per session"), which are
-///   the turn-end policy's memory of its one session and no variable here:
-///   the LATCH (a relaunch asked at a wall that the host answers with a word
-///   that is no wait — `refused:…`, `failed:…`: a line that cannot hold the
-///   login, a launch that cannot be carried — is not asked again while that
-///   wall stands, or until the accounts' news reaches the session — the
-///   owner's word, an account proven or struck), the same ahead of a wall
-///   for the one account refused,
-///   the CAP of four moves a session makes in an hour, and the move not yet
-///   ANSWERED (until a turn asked under the new login has been served, a
-///   session asks for no move ahead of a wall). A `Move…` is enabled here
-///   wherever the roster allows it; under any of the four the real decider
-///   gives today's action instead, and never a move this model does not
-///   make. So `NoWaitWhileOneIsUsable` and the liveness claim are about a
-///   session whose host MAKES the relaunch or says `wait:`: one it has
-///   refused waits its wall out beside a usable account, for the rest of
-///   that wall. Tier-1 binds each bound around every ask of the walk and
-///   along a carried history.
-/// * A LIFTED NOTICE THAT OUTLASTS A STEP OF THE WORLD'S. `Resume…` is the
-///   step right after the owner's word, and the model carries the notice no
-///   further: any step of the world's forgets it (`n1`, `n2`), and the
-///   session is from then on at a plain turn end, its next act the
-///   continuation — the reading "the continuation went at once". The real
-///   notice stands on the screen until something is typed, so the real
-///   session may still be at it when a wall is recorded on that account
-///   again (then it is an ordinary wall: rotated from), when the owner's
-///   word moves on to another account or a proven fresh one is active (then
-///   that is followed first), or within another account's canary's hold
-///   (then it waits for the hold); the roster's unit tests sweep those. Nor
-///   is the row's DATE a variable: the real `Resume` asks that the row the
-///   session stands at was written before the clearing (Tier-1 asks about
-///   such a row at every `Resume…`, and its control is the same wall with
-///   no dated row, which is rotated from), and "once per clearing" is the
-///   policy's memory of the clearing's instant (Tier-1, at every `Use…`
-///   taken with a session at that account's wall). What the account answers
-///   the continuation with — a served turn, or a new limit, which is an
-///   ordinary `Wall…` and ends the pin — is the world's next step here.
-/// * THE CONTINUATION AFTER A MOVE: a move made at a wall owes that wall's
-///   resume at the relaunched prompt (bound in Tier-1 at every move made);
-///   here a moved session is simply on its new account.
-/// * What slices 3 and 4 put in the HOST and the policy beside this rule,
-///   each unit-tested there: the lost login right after a move (the account
-///   struck signed-out and the next one asked for, no `/login` typed while a
-///   candidate remains); the pre-flight (`claude auth status` under the
-///   candidate's login before the signal); the check that the relaunched
-///   process's environment names the account, and the way back when it
-///   leaves unanswered; and THE WAKE — here every step that could change a
-///   sleeper's answer clears `w1`/`w2`, where the real session is decided
-///   again by the host's stamp for a ledger row (`Served`, `Strike`, the
-///   owner's word) and by its own wait's instant for the clock: the hold's
-///   end or the hour's, or any account's reset where that comes first
-///   (Tier-1 reads every held session's wait a minute from each `Reset…`).
-/// * `accounts = "wall"` (move only at the wall): rule 4 and `Leave…` (a
-///   rotation ahead of a wall) are then never advised, and nothing is
-///   probed. The model is `early`; Tier-1 walks both modes, `wall` as its
-///   control.
-/// * What a sample showed under a wall the owner clears: `Use…` makes a
-///   limited account fresh.
-/// * What wakes a sleeper beyond the steps named above. A wall recorded on
-///   the canary's account wakes nobody (no ledger row of that kind does), so
-///   a session asleep for the hold sleeps on to the hold's end though it
-///   could rotate at once: `NoWaitWhileOneIsUsable` and the liveness claim
-///   both read "within the canary's hold" for that reason.
+/// * Time: a `Wait`'s instant and its preference for a dedicated account; "low only when
+///   nothing is usable within 15 minutes"; the leave guard (no early move off an account
+///   whose low window resets within 15 minutes; here a low account is one to leave until
+///   its `Reset…`); the hold's ten minutes (`Lapse`, not fair); the hour lapsing (`rot`
+///   only grows: the model is one rotation hour).
+/// * The week that resets soonest: `1` before `2` stands for the roster's key on two
+///   dedicated accounts alike in freshness.
+/// * Signed-out or unenrolled logins, the login-wall strike, a move that failed with no
+///   word about the account.
+/// * The probe ([`supervisor_usage_probe_model`]; a `Low…` step is its settled read), a
+///   reset offer about to expire, limit resets. Shared with the probe: no `Low…` is about
+///   an unanswered active account (`accounts::advise` never probes it).
+/// * `accounts = "off"` and rule 1's stays: the model is `early`. `accounts = "wall"` (no
+///   rule 4, no `Leave…`, no probe) is Tier-1's control.
+/// * Compare-and-sets as steps: a rotation or a canary take is advised, committed and
+///   relaunched at once; a refused relaunch is undone (`Strike::NotMoved`) and is no step.
+///   Tier-1 drives the lost compare-and-set and both undos against the real transactions.
+/// * Which session is the canary: `hold` is the machine's, and a rotated session is on the
+///   chosen account at once, so a canary still on its old account is not a state here.
+/// * Session 2's jobs, and which walls rotate (session, weekly and model-bucket limits do;
+///   spend and credit walls never; the wall here is one that does).
+/// * The per-session bounds (design §6, "Bounds. Per session"), held in the turn-end
+///   policy's memory: the latch after a relaunch the host answers `refused:…` or
+///   `failed:…`, the cap of four moves an hour, and no move ahead of a wall until a turn
+///   under the new login was served. `Move…` is enabled wherever the roster allows; under a
+///   bound the real decider gives its non-account action. So `NoWaitWhileOneIsUsable` and
+///   the liveness claim are about a session whose host makes the relaunch or says `wait:`.
+///   Tier-1 binds each bound.
+/// * A lifted notice outlasting a world step: the model reads the continuation as going at
+///   once. The real notice stands until something is typed (the roster's unit tests sweep
+///   what can happen meanwhile), and `Resume`'s row date and "once per clearing" are bound
+///   in Tier-1.
+/// * The continuation after a move, beyond `cx`: the point's own act after a move ahead of
+///   a wall, and that the wall's resume goes at the relaunched session's first point.
+///   Tier-1 binds both at every move.
+/// * The host's and policy's own steps, unit-tested there: the lost login right after a
+///   move, the check that the relaunched environment names the account, and the wake (here
+///   every step that could change a sleeper's answer clears `w1`/`w2`).
+/// * What a sample showed under a wall the owner clears: `Use…` makes a limited account
+///   fresh.
+/// * A wall recorded on the canary's account wakes nobody, so a session asleep for the hold
+///   sleeps to the hold's end though it could rotate: `NoWaitWhileOneIsUsable` and the
+///   liveness claim read "within the canary's hold" for that reason.
 ///
-/// # What the laws do NOT forbid
+/// # What the laws allow
 ///
-/// * At its wall a session takes the place of a silent canary on a LOW
-///   account while a fresh one is free: nobody rotates past an account that
-///   can be run on and has not answered.
-/// * With the hour's rotations spent, a session at its wall joins a proven
-///   `active` that is low while a fresh account is free, rather than wait the
-///   wall out beside an account it can run on.
-/// * `Served` and `Strike` are the vendor's and are not fair: an account that
-///   never answers stays unproven for good. What changed is that it no longer
-///   holds anyone: each session takes the canary's place in turn.
+/// * At its wall a session takes a silent canary's place on a low account while a fresh one
+///   is free: nobody rotates past an account that can be run on and has not answered.
+/// * With the hour's rotations spent, a session at its wall joins a proven low `active`
+///   while a fresh account is free, rather than wait beside an account it can run on.
+/// * `Served` and `Strike` are the vendor's and not fair: an account that never answers
+///   stays unproven, but holds nobody past its hold; each session takes the canary's place
+///   in turn.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn supervisor_account_rotation_model() -> Model {
@@ -244,12 +162,14 @@ pub fn supervisor_account_rotation_model() -> Model {
             var mv = 0;
             var pa = 0;
             var ph = 0;
+            var pw = 0;
+            var cx = 0;
 
             // ---- the world ----
-            // Every step of the world's forgets the record of the last move
-            // (`mv`, `pa`, `ph`): the laws over it are about a move just made.
-            // And the notice of a wall the owner lifted (`n1`, `n2`): it is
-            // continued at once, or the model reads it as continued.
+            // Every world step forgets the last move's record (`mv`, `pa`, `ph`,
+            // `pw`, `cx`) and a lifted wall's notice (`n1`, `n2`): the laws over
+            // them are about a move just made, and the notice is continued at
+            // once or read as continued.
             action JobsStart when (jobs == 0) {
                 jobs = 1;
                 n1 = 0;
@@ -257,6 +177,8 @@ pub fn supervisor_account_rotation_model() -> Model {
                 mv = 0;
                 pa = 0;
                 ph = 0;
+                pw = 0;
+                cx = 0;
             }
             // The relaunch asked for on the back-off finds the host free.
             action JobsEnd when (jobs == 1) {
@@ -267,13 +189,15 @@ pub fn supervisor_account_rotation_model() -> Model {
                 mv = 0;
                 pa = 0;
                 ph = 0;
+                pw = 0;
+                cx = 0;
             }
-            // A session on the account hits its usage limit. Walls are OBSERVED:
-            // one is recorded only by a session running on that account. A wall
-            // on the pinned account ends the pin. On an account that has not
-            // answered yet this is the wall recorded with NO strike (`note_wall`):
-            // `active` stays, nobody is woken, and whoever is at a wall rotates
-            // past it. The canary's own wall, struck, is the `Strike` below.
+            // A session on the account hits its usage limit. Walls are observed:
+            // only a session running on the account records one. A wall on the
+            // pinned account ends the pin. On an unanswered account this is the
+            // wall recorded with no strike (`note_wall`): `active` stays, nobody
+            // is woken, and whoever is at a wall rotates past it. The canary's
+            // own wall, struck, is `Strike`.
             action WallD1 when (d1 <= 1 && (s1 == 1 || s2 == 1)) {
                 d1 = 2;
                 run = if act == 1 { 0 } else { run };
@@ -283,6 +207,8 @@ pub fn supervisor_account_rotation_model() -> Model {
                 mv = 0;
                 pa = 0;
                 ph = 0;
+                pw = 0;
+                cx = 0;
             }
             action WallD2 when (d2 <= 1 && (s1 == 2 || s2 == 2)) {
                 d2 = 2;
@@ -293,6 +219,8 @@ pub fn supervisor_account_rotation_model() -> Model {
                 mv = 0;
                 pa = 0;
                 ph = 0;
+                pw = 0;
+                cx = 0;
             }
             action WallSh when (sh <= 1 && (s1 == 3 || s2 == 3)) {
                 sh = 2;
@@ -303,10 +231,12 @@ pub fn supervisor_account_rotation_model() -> Model {
                 mv = 0;
                 pa = 0;
                 ph = 0;
+                pw = 0;
+                cx = 0;
             }
-            // A settled `/usage` read on the account shows it low. It is read
-            // from a session that has had a response there, so never from an
-            // account still waiting for its first.
+            // A settled `/usage` read shows the account low. It is read from a
+            // session that has had a response there, so never from an account
+            // still waiting for its first.
             action LowD1 when (
                 d1 == 0 && (s1 == 1 || s2 == 1) && (prov == 1 || act == 0 || 2 <= act)
             ) {
@@ -317,6 +247,8 @@ pub fn supervisor_account_rotation_model() -> Model {
                 mv = 0;
                 pa = 0;
                 ph = 0;
+                pw = 0;
+                cx = 0;
             }
             action LowD2 when (
                 d2 == 0 && (s1 == 2 || s2 == 2) && (prov == 1 || act <= 1 || act == 3)
@@ -328,6 +260,8 @@ pub fn supervisor_account_rotation_model() -> Model {
                 mv = 0;
                 pa = 0;
                 ph = 0;
+                pw = 0;
+                cx = 0;
             }
             action LowSh when (sh == 0 && (s1 == 3 || s2 == 3) && (prov == 1 || act <= 2)) {
                 sh = 1;
@@ -337,6 +271,8 @@ pub fn supervisor_account_rotation_model() -> Model {
                 mv = 0;
                 pa = 0;
                 ph = 0;
+                pw = 0;
+                cx = 0;
             }
             // The account's window resets: it is fresh, and whoever waits
             // decides again (the wait's instant has come).
@@ -350,6 +286,8 @@ pub fn supervisor_account_rotation_model() -> Model {
                 mv = 0;
                 pa = 0;
                 ph = 0;
+                pw = 0;
+                cx = 0;
             }
             action ResetD2 when (1 <= d2) {
                 d2 = 0;
@@ -361,6 +299,8 @@ pub fn supervisor_account_rotation_model() -> Model {
                 mv = 0;
                 pa = 0;
                 ph = 0;
+                pw = 0;
+                cx = 0;
             }
             action ResetSh when (1 <= sh) {
                 sh = 0;
@@ -372,13 +312,13 @@ pub fn supervisor_account_rotation_model() -> Model {
                 mv = 0;
                 pa = 0;
                 ph = 0;
+                pw = 0;
+                cx = 0;
             }
-            // The owner's word, `accounts use <label>`: its walls are cleared
-            // (what a sample showed is not), and it is active, proven and
-            // pinned. The canary's record goes. The wake marker is touched.
-            // A session that stood at one of those walls stands at its notice
-            // from here, on an account that can be run on (`n1`, `n2`): it is
-            // continued there (`Resume…`).
+            // The owner's `accounts use <label>`: its walls are cleared (not what
+            // a sample showed), and it is active, proven and pinned; the canary's
+            // record goes and sleepers wake. A session at one of those walls now
+            // stands at its notice (`n1`, `n2`), continued by `Resume…`.
             action UseD1 when (pin == 0 || 2 <= pin) {
                 d1 = if d1 == 2 { 0 } else { d1 };
                 act = 1;
@@ -395,6 +335,8 @@ pub fn supervisor_account_rotation_model() -> Model {
                 mv = 0;
                 pa = 0;
                 ph = 0;
+                pw = 0;
+                cx = 0;
             }
             action UseD2 when (pin <= 1 || pin == 3) {
                 d2 = if d2 == 2 { 0 } else { d2 };
@@ -412,6 +354,8 @@ pub fn supervisor_account_rotation_model() -> Model {
                 mv = 0;
                 pa = 0;
                 ph = 0;
+                pw = 0;
+                cx = 0;
             }
             action UseSh when (pin <= 2) {
                 sh = if sh == 2 { 0 } else { sh };
@@ -429,6 +373,8 @@ pub fn supervisor_account_rotation_model() -> Model {
                 mv = 0;
                 pa = 0;
                 ph = 0;
+                pw = 0;
+                cx = 0;
             }
             action Unpin when (1 <= pin) {
                 pin = 0;
@@ -439,6 +385,8 @@ pub fn supervisor_account_rotation_model() -> Model {
                 mv = 0;
                 pa = 0;
                 ph = 0;
+                pw = 0;
+                cx = 0;
             }
             // The account a rotation chose answers a session on it. With a
             // response: it is proven, and only now is it followed.
@@ -454,13 +402,13 @@ pub fn supervisor_account_rotation_model() -> Model {
                 mv = 0;
                 pa = 0;
                 ph = 0;
+                pw = 0;
+                cx = 0;
             }
             // With a wall of its own: it is struck (limited), and `active` goes
-            // back to the account it was rotated from — PROVEN OR NOT AS THAT
-            // ACCOUNT WAS when it was left (`pp`): one that never served is not
-            // followed for having been gone back to. Nobody else was moved. The
-            // struck account is never the one gone back to, so what is read of
-            // that one is its own condition.
+            // back to the account it was rotated from, proven only if that one
+            // had served when it was left (`pp`). Nobody else was moved. The
+            // struck account is never the one gone back to.
             action Strike when (1 <= run && prov == 0 && (s1 == act || s2 == act)) {
                 d1 = if act == 1 { 2 } else { d1 };
                 d2 = if act == 2 { 2 } else { d2 };
@@ -486,9 +434,11 @@ pub fn supervisor_account_rotation_model() -> Model {
                 mv = 0;
                 pa = 0;
                 ph = 0;
+                pw = 0;
+                cx = 0;
             }
             // The canary's hold ends: its ten minutes pass, or its agent ends.
-            // `active` is NOT put back. Whoever waited for it decides again.
+            // `active` is not put back; whoever waited for it decides again.
             action Lapse when (1 <= act && prov == 0 && hold == 1) {
                 hold = 0;
                 w1 = 0;
@@ -498,42 +448,41 @@ pub fn supervisor_account_rotation_model() -> Model {
                 mv = 0;
                 pa = 0;
                 ph = 0;
+                pw = 0;
+                cx = 0;
             }
 
             // ---- the supervisor: session 1 at its point ----
-            // The move is made when the host can relaunch the session; while
-            // the agent's jobs run it is refused and nothing has changed.
+            // While the agent's jobs run the relaunch is refused and nothing
+            // changes.
             action Move1 when (
                 w1 == 0 && jobs == 0 && (
-                    // THE CANARY'S PLACE. `active` is another account, can be
-                    // run on and has not answered, and its canary's hold has
-                    // lapsed: this session takes the place — at its wall
-                    // whatever is left of the account, ahead of one only onto
-                    // a fresh account.
+                    // The canary's place: `active` is another account, can be
+                    // run on, has not answered, and its canary's hold lapsed.
+                    // At its wall the session takes it whatever is left of it;
+                    // ahead of one, only a fresh account.
                     ((s1 > act || act > s1) && 1 <= run && prov == 0 && hold == 0
                         && (run == 2
                             || (s1 == 1 && d1 == 2) || (s1 == 2 && d2 == 2)
                             || (s1 == 3 && sh == 2)))
-                    // RULE 2, the follow: `active` is another account, proven,
-                    // and fresh or the owner's pin. A proven account that is
-                    // low and not pinned is not followed for its own sake; at
-                    // this session's wall it is what is left when no fresh
-                    // account is, or the hour is spent — and is rotated past
-                    // for a fresh one otherwise (the update decides which).
+                    // Rule 2, the follow: `active` is another account, proven,
+                    // and fresh or pinned. A proven low unpinned account is
+                    // followed only at this session's wall, when no fresh account
+                    // is free or the hour is spent (else the update rotates past
+                    // it).
                     || ((s1 > act || act > s1) && 1 <= run && prov == 1
                         && (run == 2 || 1 <= pin
                             || (s1 == 1 && d1 == 2) || (s1 == 2 && d2 == 2)
                             || (s1 == 3 && sh == 2)))
-                    // RULE 3, at its wall with nothing to follow: `active` is
+                    // Rule 3, at its wall with nothing to follow: `active` is
                     // nothing to run on, another account is not limited, and
                     // the hour is not spent.
                     || (((s1 == 1 && d1 == 2) || (s1 == 2 && d2 == 2) || (s1 == 3 && sh == 2))
                         && run == 0 && rot <= Budget - 1 && (d1 <= 1 || d2 <= 1 || sh <= 1))
-                    // RULE 4, ahead of its wall: its account is low, no pin
-                    // holds, a FRESH account is free and the hour is not
-                    // spent; `active` is nothing to run on, or is proven and
-                    // low (its own account, or another one, rotated past).
-                    // Never from an account that has not answered.
+                    // Rule 4, ahead of its wall: its account is low, no pin, a
+                    // fresh account is free, the hour is not spent, and `active`
+                    // is nothing to run on or proven and low. Never from an
+                    // account that has not answered.
                     || (((s1 == 1 && d1 == 1) || (s1 == 2 && d2 == 1) || (s1 == 3 && sh == 1))
                         && pin == 0 && rot <= Budget - 1 && (d1 == 0 || d2 == 0 || sh == 0)
                         && (run == 0 || (prov == 1 && run == 1)))
@@ -564,7 +513,7 @@ pub fn supervisor_account_rotation_model() -> Model {
                         && rot <= Budget - 1)
                 { if (d1 == 0 || d2 == 0 || sh == 0) { 2 } else { 1 } } else { run };
                 // A rotation's account has not answered yet, remembers where a
-                // strike goes back to and whether THAT account had served, and
+                // strike goes back to and whether that account had served, and
                 // counts toward the hour. Following changes none of these.
                 prov = if run == 0
                     || (prov == 1 && run == 1 && pin == 0 && (d1 == 0 || d2 == 0 || sh == 0)
@@ -594,11 +543,11 @@ pub fn supervisor_account_rotation_model() -> Model {
                 mv = 1;
                 pa = act;
                 ph = hold;
+                pw = if (s1 == 1 && d1 == 2) || (s1 == 2 && d2 == 2) || (s1 == 3 && sh == 2) { 1 } else { 0 };
+                cx = 0;
             }
-            // A PLAIN TURN END ON A LIMITED ACCOUNT: the wall is one another tab
-            // recorded, and this session's own turn ended without one. It is
-            // left as a low account is, and more readily: for a fresh account
-            // only, and never onto a low one.
+            // A plain turn end on a limited account: the wall is one another tab
+            // recorded, and the session is left as one on a low account is.
             action Leave1 when (
                 w1 == 0 && jobs == 0
                 && ((s1 == 1 && d1 == 2) || (s1 == 2 && d2 == 2) || (s1 == 3 && sh == 2))
@@ -657,11 +606,12 @@ pub fn supervisor_account_rotation_model() -> Model {
                 mv = 1;
                 pa = act;
                 ph = hold;
+                pw = 0;
+                cx = 0;
             }
-            // No move to make at its wall, so it sleeps: the host cannot
-            // relaunch it (its jobs); an account that has not answered is out
-            // and its canary's hold stands; the hour's rotations are spent; or
-            // every other account is limited too.
+            // No move to make at its wall, so it sleeps: its jobs block the
+            // relaunch; an unanswered account's canary hold stands; the hour's
+            // rotations are spent; or every other account is limited too.
             action Wait1 when (
                 w1 == 0
                 && ((s1 == 1 && d1 == 2) || (s1 == 2 && d2 == 2) || (s1 == 3 && sh == 2))
@@ -675,13 +625,14 @@ pub fn supervisor_account_rotation_model() -> Model {
                 mv = 0;
                 pa = 0;
                 ph = 0;
+                pw = 0;
+                cx = 0;
             }
-            // THE OWNER LIFTED THIS WALL (design §6, between rules 2 and 3): the
-            // session stands at the notice of the wall the owner's word just
-            // cleared, on an account that can be run on. It is continued
-            // THERE, at once — the wall's own continuation typed, no relaunch
-            // (so the agent's jobs do not hold it) and nothing committed —
-            // once: the notice is behind it.
+            // The owner lifted this wall (design §6, between rules 2 and 3): the
+            // session stands at the notice of a wall the owner's word cleared, on
+            // an account that can be run on. It is continued there, once, at once:
+            // the wall's own continuation typed, no relaunch (so the agent's jobs
+            // do not hold it), nothing committed.
             action Resume1 when (
                 w1 == 0 && n1 == 1
                 && ((s1 == 1 && d1 <= 1) || (s1 == 2 && d2 <= 1) || (s1 == 3 && sh <= 1))
@@ -690,6 +641,16 @@ pub fn supervisor_account_rotation_model() -> Model {
                 mv = 0;
                 pa = 0;
                 ph = 0;
+                pw = 0;
+                cx = 0;
+            }
+
+            // The wall's resume after a move made at this session's wall (the
+            // accounts design v2, §3.5): the move cut a turn short, so the
+            // continuation that wall would have had at its reset is typed at the
+            // relaunched session's first point, once.
+            action Resumed1 when (mv == 1 && pw == 1 && cx == 0) {
+                cx = 1;
             }
 
             // ---- the supervisor: session 2 at its point (the same rule) ----
@@ -757,6 +718,8 @@ pub fn supervisor_account_rotation_model() -> Model {
                 mv = 2;
                 pa = act;
                 ph = hold;
+                pw = if (s2 == 1 && d1 == 2) || (s2 == 2 && d2 == 2) || (s2 == 3 && sh == 2) { 1 } else { 0 };
+                cx = 0;
             }
             action Leave2 when (
                 w2 == 0
@@ -816,6 +779,8 @@ pub fn supervisor_account_rotation_model() -> Model {
                 mv = 2;
                 pa = act;
                 ph = hold;
+                pw = 0;
+                cx = 0;
             }
             action Wait2 when (
                 w2 == 0
@@ -829,13 +794,10 @@ pub fn supervisor_account_rotation_model() -> Model {
                 mv = 0;
                 pa = 0;
                 ph = 0;
+                pw = 0;
+                cx = 0;
             }
-            // THE OWNER LIFTED THIS WALL (design §6, between rules 2 and 3): the
-            // session stands at the notice of the wall the owner's word just
-            // cleared, on an account that can be run on. It is continued
-            // THERE, at once — the wall's own continuation typed, no relaunch
-            // (so the agent's jobs do not hold it) and nothing committed —
-            // once: the notice is behind it.
+            // A lifted wall's notice, continued in place (`Resume1`'s rule).
             action Resume2 when (
                 w2 == 0 && n2 == 1
                 && ((s2 == 1 && d1 <= 1) || (s2 == 2 && d2 <= 1) || (s2 == 3 && sh <= 1))
@@ -844,16 +806,21 @@ pub fn supervisor_account_rotation_model() -> Model {
                 mv = 0;
                 pa = 0;
                 ph = 0;
+                pw = 0;
+                cx = 0;
+            }
+
+            // The wall's resume after a move made at this session's wall, once
+            // (`Resumed1`'s rule).
+            action Resumed2 when (mv == 2 && pw == 1 && cx == 0) {
+                cx = 1;
             }
 
             // ---- the defects (dead at the committed config) ----
-            // Each is session 1's or session 2's wrong step, or the world's
-            // wall nobody read, and records itself as any move does (`mv`,
-            // `pa`, `ph` from the state before it): no defect marks itself.
-            // A session a defect moves leaves its notice as one a sound move
-            // does (`n1`, `n2`).
-            // A defect fires wherever its guard holds, which at `Buggy = 1`
-            // includes a state an earlier defect left.
+            // Each is a session's wrong step, or a world wall nobody read. Each
+            // records itself as a sound move does (`mv`, `pa`, `ph`, `pw` from the
+            // pre-state; `n1`, `n2` cleared) and fires wherever its guard holds,
+            // which at `Buggy = 1` includes states an earlier defect left.
             //
             // A rotation on a stale reading: the account it moves to is limited.
             action RotatesIntoALimited when (
@@ -872,6 +839,8 @@ pub fn supervisor_account_rotation_model() -> Model {
                 mv = 1;
                 pa = act;
                 ph = hold;
+                pw = 1;
+                cx = 0;
             }
             // A wall on the active account that nobody read: it still reads as
             // one to run on, and the others are moved into it.
@@ -885,6 +854,8 @@ pub fn supervisor_account_rotation_model() -> Model {
                 mv = 0;
                 pa = 0;
                 ph = 0;
+                pw = 0;
+                cx = 0;
             }
             // The shared account taken while a dedicated one is fresh.
             action SharedFirst when (
@@ -903,6 +874,8 @@ pub fn supervisor_account_rotation_model() -> Model {
                 mv = 1;
                 pa = act;
                 ph = hold;
+                pw = 1;
+                cx = 0;
             }
             // A low account taken while a fresh one is free (the dedicated one
             // first, whatever is left of it).
@@ -922,6 +895,8 @@ pub fn supervisor_account_rotation_model() -> Model {
                 mv = 1;
                 pa = act;
                 ph = hold;
+                pw = 1;
+                cx = 0;
             }
             // The herd: the other session follows an account that has not
             // served a response yet, while its canary's hold stands.
@@ -934,8 +909,10 @@ pub fn supervisor_account_rotation_model() -> Model {
                 mv = 2;
                 pa = act;
                 ph = hold;
+                pw = if (s2 == 1 && d1 == 2) || (s2 == 2 && d2 == 2) || (s2 == 3 && sh == 2) { 1 } else { 0 };
+                cx = 0;
             }
-            // Today's rule: the wall is waited out, with a fresh account free.
+            // The wall waited out with a fresh account free.
             action WaitsOnTheWall when (
                 Buggy == 1 && w1 == 0 && jobs == 0 && s1 == 1 && d1 == 2 && d2 == 0
                 && run == 0 && rot <= Budget - 1
@@ -944,6 +921,8 @@ pub fn supervisor_account_rotation_model() -> Model {
                 mv = 0;
                 pa = 0;
                 ph = 0;
+                pw = 0;
+                cx = 0;
             }
             // The early move made under the owner's pin.
             action MovesEarlyUnderAPin when (
@@ -962,6 +941,8 @@ pub fn supervisor_account_rotation_model() -> Model {
                 mv = 1;
                 pa = act;
                 ph = hold;
+                pw = 0;
+                cx = 0;
             }
             // One more rotation with the hour's spent.
             action RotatesPastTheBreaker when (
@@ -980,29 +961,34 @@ pub fn supervisor_account_rotation_model() -> Model {
                 mv = 1;
                 pa = act;
                 ph = hold;
+                pw = 1;
+                cx = 0;
             }
-            // Today's rule at the wall the owner lifted: the notice is waited
-            // out to its own reset, on an account that can be run on (what
-            // every such session did until 2026-10-01: told to rotate, which
-            // the pin refuses, and asked again on every back-off rung).
+            // The notice of a wall the owner lifted waited out to its own reset,
+            // on an account that can be run on.
             action WaitsAtTheLiftedWall when (Buggy == 1 && w1 == 0 && jobs == 0 && n1 == 1) {
                 w1 = 1;
                 n1 = 0;
                 mv = 0;
                 pa = 0;
                 ph = 0;
+                pw = 0;
+                cx = 0;
+            }
+            // After a move made ahead of a wall, the relaunch's own carry-on is
+            // typed: "decide for yourself" where the point would have had no such
+            // word.
+            action CarriesOnAfterAnEarlyMove when (Buggy == 1 && mv == 1 && pw == 0 && cx == 0) {
+                cx = 1;
             }
 
             // ---- the laws ----
-            // The four about a session's move are stated over what can be SEEN
-            // after it — where the session is, what `active` is, what each
-            // account's condition is — against the record of the state before
-            // it. None reads a mark a step sets on itself: a `Move` that picked
-            // wrong IS the violation, whatever it says of itself.
+            // The four move laws compare what can be seen after the move (where
+            // the session is, `active`, each account's condition) with the record
+            // of the state before it; none reads a mark a step sets on itself.
             //
-            // Nobody is moved into a limited account: what is read of `active`
-            // is true (it is followed only while it can be run on), and a
-            // session just moved is not on a limited account.
+            // Nobody is moved into a limited account: what is read of `active` is
+            // true, and a session just moved is not on a limited account.
             invariant NeverIntoALimitedAccount:
                 (run == 0 || (act == 1 && d1 <= 1) || (act == 2 && d2 <= 1)
                     || (act == 3 && sh <= 1))
@@ -1016,12 +1002,10 @@ pub fn supervisor_account_rotation_model() -> Model {
             invariant DedicatedBeforeShared:
                 mv == 0 || act == pa || (mv == 1 && s1 <= 2) || (mv == 2 && s2 <= 2)
                 || (1 <= d1 && 1 <= d2);
-            // A session just moved is on a LOW account only when no account at
-            // all is fresh — the one it left included, so nobody goes from a
-            // fresh account to a low one — or when it joined `active` rather
-            // than rotated: in the place of a canary (nobody rotates past an
-            // account that has not answered), under the owner's pin, or with
-            // the hour's rotations spent.
+            // A session just moved is on a low account only when no account at
+            // all is fresh (the one it left included), or when it joined `active`
+            // rather than rotated: in a canary's place, under the owner's pin, or
+            // with the hour's rotations spent.
             invariant FreshBeforeLow:
                 mv == 0
                 || (mv == 1
@@ -1037,16 +1021,12 @@ pub fn supervisor_account_rotation_model() -> Model {
             // canary whose hold had lapsed.
             invariant OnlyAProvenActiveIsFollowed:
                 mv == 0 || act > pa || pa > act || prov == 1 || ph == 0;
-            // A session sleeps only at its wall, and only for a reason the
-            // design names: the agent's jobs, WITHIN THE CANARY'S HOLD, the
-            // breaker, or nothing usable. (The hold is the reason while it
-            // stands even once a wall is recorded on the canary's account:
-            // that wall wakes nobody, and the hold's end does.) The real
-            // session has one reason more, which is no variable here: its
-            // own latch, after a relaunch its host refused (not modelled).
-            // A session at the notice of a wall the owner lifted is on an
-            // account that is not limited, so it never sleeps there: waited
-            // out, that notice is `WaitsAtTheLiftedWall`.
+            // A session sleeps only at its wall, and only for the agent's jobs,
+            // within the canary's hold (even once a wall is recorded on the
+            // canary's account: that wall wakes nobody), the breaker, or nothing
+            // usable. The real session's latch after a refused relaunch is not
+            // modelled. A session at a lifted wall's notice is on an account that
+            // is not limited, so it never sleeps there (`WaitsAtTheLiftedWall`).
             invariant NoWaitWhileOneIsUsable:
                 (w1 == 0 || (
                     ((s1 == 1 && d1 == 2) || (s1 == 2 && d2 == 2) || (s1 == 3 && sh == 2))
@@ -1066,41 +1046,32 @@ pub fn supervisor_account_rotation_model() -> Model {
             // While the pin holds, `active` is the account the owner named.
             invariant TheOwnersWordHolds: pin == 0 || (act == pin && prov == 1);
             invariant NoPingPong: rot <= Budget;
+            // A move made ahead of a wall types nothing of its own: the one
+            // continuation a move owes is the wall's resume, after a move made
+            // at one.
+            invariant NothingTypedAfterAnEarlyMove: cx == 0 || pw == 1;
         }
     }
 }
 
-/// EVERY USABLE ACCOUNT IS TRIED ([`supervisor_account_rotation_model`]):
-/// `[]<>(session 1 is not at its wall \/ its agent's jobs run \/ the canary's
-/// hold stands \/ the hour's rotations are spent \/ every other account is
-/// limited)` — on every fair behaviour, a session does not sit at a usage wall
-/// for good while an account it could be moved to is usable.
+/// `EveryUsableAccountIsTried` ([`supervisor_account_rotation_model`]): `[]<>(session 1 is
+/// not at its wall \/ its agent's jobs run \/ the canary's hold stands \/ the hour's
+/// rotations are spent \/ every other account is limited)`. A session does not sit at a
+/// usage wall for good while an account it could move to is usable.
 ///
-/// Fairness assumed, and nothing more: the supervisor takes the advice a
-/// session gets at its point and makes the move (`Move1`: the design's
-/// `Advise` and `Move`, which are one step here) — so the claim is about a
-/// session whose host MAKES the relaunch once the agent's jobs let it. A
-/// relaunch the host refuses for good (a line that cannot hold the login)
-/// latches the real session for the rest of that wall, and is no step of
-/// this model's (its "not modelled" list). The world is NOT fair. The
-/// agent's jobs may run for ever, and then the session stays where it is.
-/// The account a rotation chose may never answer — and that is no exception
-/// any more: the claim excepts only the canary's HOLD, which the clock ends,
-/// and once it has lapsed the fair step is this session taking the canary's
-/// place. (The clock itself is not assumed fair here: `Lapse` may never come,
-/// and then the hold stands. `tests/derived_supervise.rs` also checks the
-/// reading with the clock fair and no exception for the canary at all.)
+/// Fair: only `Move1`, so the claim is about a session whose host makes the relaunch once
+/// the jobs allow it; a relaunch refused for good latches the real session for that wall
+/// (not modelled). The world is not fair: the jobs may run for ever, the chosen account may
+/// never answer, and `Lapse` may never come. Only the canary's hold is excepted; once it
+/// lapses, the fair step takes the canary's place. `tests/derived_supervise.rs` also checks
+/// the reading with `Lapse` fair and no canary exception, and session 2's twin under
+/// `Move2`. The two do not hold as one conjunction: walls that keep resetting can leave one
+/// session or the other at its wall at every instant.
 ///
-/// The claim is session 1's. Session 2's twin (the same goal over `s2`, under
-/// `Move2`) is checked beside it in `tests/derived_supervise.rs`; the two do
-/// not hold as ONE conjunction, because walls that keep resetting can leave
-/// one session or the other at its wall at every instant while each keeps
-/// being moved.
-///
-/// Broken alone by `WaitsOnTheWall`: today's rule, a wall waited out with a
-/// fresh account free.
+/// Broken alone by `WaitsOnTheWall`.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
+#[crate::liveness(crate::derive::supervisor_account_rotation_model)]
 pub fn supervisor_account_rotation_liveness() -> Liveness {
     use super::{and_, cst, eq, int, le, or_, var};
     let on = |account: i64| eq(var("s1"), int(account));
@@ -1136,95 +1107,71 @@ pub fn supervisor_account_rotation_liveness() -> Liveness {
     }
 }
 
-/// THE `/usage` PROBE (aterm-agent `supervise/turn_end_loop.rs` and
-/// `run.rs`: `Session::usage_probe`, `Session::usage_panel_look`; the gate
-/// `TurnEndState::probe_point`; the reader `harness::usage::usage_panel_read`
-/// and `aterm_phase::settings_panel`; `docs/SPEC-claude-accounts-probe-
-/// 2026-10-01.md` §3, §5): the loop types `/usage` into an idle Claude Code,
-/// reads the Settings panel it opens, and closes it with an Escape. The
-/// property the owner's sessions need: NOTHING IS WRITTEN WHERE IT COULD
-/// LAND ANYWHERE ELSE — no `/usage` over a panel or under a person's hand,
-/// no Escape without the panel on the grid, under a hand or into a running
-/// turn (where Escape stops the turn) — nothing is recorded from a panel
-/// that is not settled or was not read whole by the step that opened it,
-/// and a panel the loop opened is never forgotten.
+/// The `/usage` probe (aterm-agent `supervise/turn_end_loop.rs`: `Session::usage_probe`,
+/// `Session::usage_panel_look`; the gate `TurnEndState::probe_point`; the readers
+/// `harness::usage::usage_panel_read` and `aterm_phase::settings_panel`;
+/// `docs/SPEC-claude-accounts-probe-2026-10-01.md` §3, §5): the loop types `/usage` into an
+/// idle Claude Code, reads the Settings panel it opens, and closes it with an Escape.
+/// Nothing is written where it could land anywhere else: no `/usage` over a panel or under
+/// a person's hand; no Escape without the panel on the grid, under a hand, or into a
+/// running turn (where Escape stops the turn). Nothing is recorded from a panel that is not
+/// settled or was not read whole by the step that opened it, and a panel the loop opened is
+/// never forgotten.
 ///
-/// `pan` is the harness's panel on the screen: 0 none, 1 open and
-/// UNSETTLED (loading, refreshing, an enrich error, its tail under the
-/// fold), 2 open and settled. `ph` is the loop's memory: 0 idle, 1 the
-/// host's claim taken, 2 `/usage` typed and the read in flight (the loop's
-/// `Owed`, and what the session ledger's `typed` row says to a later loop),
-/// 3 closing (the host was told; what is left is the Escape, and seeing the
-/// panel gone). `own` is 1 while the panel is one THIS step opened and has
-/// read without a break: a person's key, a hold, a turn or a loop restart
-/// ends it. `hand` a person's keystroke within the grace; `hold` the session
-/// halted (the server refuses every write: no step here writes under one,
-/// sound or not); `turn` a turn running. `tries` the Escapes that did not
-/// take, to `Tries`, and `told` 1 once the host was told the panel is stuck.
+/// State:
+/// * `pan` — the harness's panel: 0 none, 1 open and unsettled (loading, refreshing, an
+///   enrich error, its tail under the fold), 2 open and settled.
+/// * `ph` — the loop's memory: 0 idle, 1 the host's claim taken, 2 `/usage` typed and the
+///   read in flight (the loop's `Owed`, and the ledger's `typed` row for a later loop),
+///   3 closing (the host was told; the Escape and seeing the panel gone remain).
+/// * `own` — 1 while the panel is one this step opened and has read without a break; a
+///   person's key, a hold, a turn or a loop restart ends it.
+/// * `hand` — a person's keystroke within the grace; `hold` — the session halted (no step
+///   writes under one); `turn` — a turn running.
+/// * `tries` — Escapes that did not take, up to `Tries`; `told` — 1 once the host was told
+///   the panel is stuck.
 ///
-/// THE HISTORY, written from the PRE-STATE by every step of its kind, sound
-/// or not — no step reports on itself: every Escape writes `blind` (no panel
-/// was on the grid), `handkey` (a person's hand) and `turnkey` (a turn
-/// running); every `/usage` writes `handkey` and `stacked` (a panel open, or
-/// one still owed); every sample writes `stale` (the panel was not settled)
-/// and `foreign` (it was not this step's to read). `booked` is the one mark a
-/// defect alone writes: the probe is no act of the turn-end policy's (no
-/// budget, no awaited act), which is a claim that the step does NOT do
-/// something. `bad` is 1 once any defect fired: each fires only from a state
-/// the sound loop reaches, so the `Buggy = 1` space stays walkable.
+/// History marks, written from the pre-state by every step of a kind, sound or not: each
+/// Escape writes `blind` (no panel on the grid), `handkey` and `turnkey`; each `/usage`
+/// writes `handkey` and `stacked` (a panel open or still owed); each sample writes `stale`
+/// (not settled) and `foreign` (not this step's to read). Only a defect writes `booked`:
+/// the probe is no act of the turn-end policy's (no budget, no awaited act). `bad` is 1
+/// once any defect fired; each fires only from a state the sound loop reaches.
 ///
-/// THE WORLD: the panel opens after the Enter (`Opens`), settles and
-/// unsettles (a refresh); a person types and their grace ends; the session
-/// is held and released; a turn starts and ends — and the vendor may retire
-/// the panel at a turn's boundary (`TurnRetiresThePanel`: READ in the
-/// 2.1.287 bundle, not measured); a person closes the panel; the loop is
-/// restarted (`LoopRestarts`: a successor reads the ledger, so a panel typed
-/// for stays owed, and nothing else is remembered).
+/// A turn may retire the panel at its boundary (`TurnRetiresThePanel`, read from the
+/// vendor's bundle). On `LoopRestarts` a successor reads the ledger, so a panel typed for
+/// stays owed, and nothing else is remembered.
 ///
-/// THE SUPERVISOR: `Claim` (the host's claim, at an idle point with nobody's
-/// hand on the session), `Type` (the fenced `/usage` and its Enter),
-/// `TypeSkipped` (the write was skipped or refused: nothing owed),
-/// `GiveUpNotOpened` (the composer is back and no panel came: NO KEY),
-/// `Sample` (a settled panel this step read whole), `NoSample` (the read's
-/// bound ran out, or the tail is under the fold: the host is told why),
-/// `EscCloses` / `EscFails` (the guarded Escape, only with the panel on the
-/// grid, nobody's hand, no hold and no turn — and only once the host was
-/// told, or for a panel not this step's to read; a failed one climbs the
-/// ladder and at `Tries` tells the host, ONCE, and goes on trying),
-/// `SeesGone` (the panel is gone: the probe is over).
+/// The supervisor: `Claim` (at an idle point, no hand); `Type` (the fenced `/usage` and its
+/// Enter); `TypeSkipped` (the write skipped or refused); `GiveUpNotOpened` (the composer is
+/// back and no panel came: no key); `Sample` (a settled panel this step read whole);
+/// `NoSample` (the read's bound ran out, or the tail is under the fold: the host is told
+/// why); `EscCloses` / `EscFails` (the guarded Escape: panel on the grid, no hand, hold or
+/// turn, and only once the host was told or for a panel not this step's; a failed one
+/// climbs the ladder, tells the host once at `Tries`, and keeps trying); `SeesGone` (the
+/// probe is over).
 ///
-/// # What is NOT modelled
+/// # Not modelled
 ///
-/// * TIME: the open wait, the settle wait, the ladder's pauses, the
-///   person's grace as a duration (`GraceEnds` is the clock), the 90 s
-///   between any two accounts' claims and the 180 s for one (the roster's
-///   unit tests).
-/// * WHAT THE LOOP CAN KNOW OF A HAND. `hand` is the world's truth and the
-///   sound steps read it. A successor loop reads no person stamp from before
-///   it started, so the real loop lets a panel it took up from the ledger
-///   stand one grace in its own sight before it presses (the spec's P19):
-///   that wait is the loop's unit tests'.
-/// * The gates that are not this screen's: the renderer (`alt_screen`), the
-///   fences a host must know, the fold latch per grid size, the point
-///   decided again after the probe, the sample bound to the claimed process.
-/// * A person's OWN `/usage` panel: `pan` is the harness's. The residual the
-///   spec states (a person who opens `/usage` right after a loop died
-///   mid-probe has it closed after two idle minutes) is `LoopRestarts` then
-///   `Opens` here.
-/// * Two accounts. Nothing here has run against a real session at all: the
-///   model is authored from the spec and the vendor's bundle.
+/// * Time: the open and settle waits, the ladder's pauses, the grace as a duration
+///   (`GraceEnds` is the clock), the 90 s between any two accounts' claims and 180 s for
+///   one (the roster's unit tests).
+/// * What the loop can know of a hand: `hand` is the world's truth. A successor reads no
+///   person stamp from before it started, so the real loop lets a panel taken up from the
+///   ledger stand one grace before it presses (the spec's P19; the loop's unit tests).
+/// * Gates that are not this screen's: the renderer (`alt_screen`), the fences, the fold
+///   latch per grid size, the point decided again after the probe, the sample bound to the
+///   claimed process.
+/// * A person's own `/usage` panel. One opened right after a loop died mid-probe is closed
+///   after two idle minutes (`LoopRestarts` then `Opens` here).
+/// * Two accounts.
 ///
-/// # The defects (`Buggy = 1`), each dead at the committed config and caught
-/// alone by its own law
+/// # Defects (`Buggy = 1`), each caught alone by its own law
 ///
-/// `EscOnTheOpenTimeout` (an Escape when the panel never came: at an idle
-/// composer it does nothing, and a second one within the vendor's window
-/// opens Rewind); `EscUnderAHand`, `TypeUnderAHand`; `EscIntoATurn` (it
-/// stops the turn); `TypeOverAPanel` (a second `/usage` while one is open or
-/// owed); `TypeBooksAnAct`; `SampleUnsettled`; `SampleNotRead` (after a
-/// restart or a break); `EscFailsUntold` (the ladder's last rung reached and
-/// nobody told); `GoesIdleAtTheLastTry` (the loop gives the panel up at
-/// `Tries` and never looks at it again — also the liveness claim's mutant).
+/// `EscOnTheOpenTimeout` (at an idle composer an Escape does nothing, and a second within
+/// the vendor's window opens Rewind); `EscUnderAHand`, `TypeUnderAHand`; `EscIntoATurn`;
+/// `TypeOverAPanel`; `TypeBooksAnAct`; `SampleUnsettled`; `SampleNotRead`;
+/// `EscFailsUntold`; `GoesIdleAtTheLastTry` (also the liveness mutant).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn supervisor_usage_probe_model() -> Model {
@@ -1484,27 +1431,20 @@ pub fn supervisor_usage_probe_model() -> Model {
     }
 }
 
-/// EVERY OPENED PANEL CLOSES ([`supervisor_usage_probe_model`]): `[]<>(no
-/// panel is open \/ a person's hand is on the session \/ it is held \/ a
-/// turn runs)` — on every fair behaviour, a panel the harness opened does not
-/// stand for good while nothing stands in the Escape's way.
+/// `EveryOpenedPanelCloses` ([`supervisor_usage_probe_model`]): `[]<>(no panel is open \/
+/// a person's hand is on the session \/ it is held \/ a turn runs)`. A panel the harness
+/// opened does not stand for good while nothing blocks the Escape.
 ///
-/// Fairness assumed, and nothing more: the read ends (`NoSample`: its bound
-/// runs out, whatever the panel shows), and an Escape pressed for ever at a
-/// panel is taken at last (`EscCloses`: the loop presses on its ladder with
-/// no last rung, and the vendor's `confirm:no` closes the dialog). THE
-/// WORLD IS NOT FAIR, and is not assumed to be: a person may type for ever, a
-/// hold may never lift, a turn may never end — each is an EXCEPTION in the
-/// goal and not a fairness assumption, because a person, a hold and a turn
-/// taking turns can keep the Escape disabled at every instant while each of
-/// them ends infinitely often (so fairness of `GraceEnds`, `HoldOff` and
-/// `TurnEnds` would not carry the claim, and none is claimed). Nor is the
-/// loop's own restart: after one the panel is still owed, and closed.
+/// Fair: the read ends (`NoSample`: its bound runs out) and an Escape pressed for ever is
+/// taken (`EscCloses`: the ladder has no last rung). A person, a hold and a turn are
+/// exceptions in the goal, not fairness: taking turns, they can keep the Escape disabled at
+/// every instant while each ends infinitely often. After a loop restart the panel is still
+/// owed, and closed.
 ///
-/// Broken alone by `GoesIdleAtTheLastTry`: a loop that gives up at `Tries`
-/// and never looks at the panel again leaves it open for good.
+/// Broken alone by `GoesIdleAtTheLastTry`.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
+#[crate::liveness(crate::derive::supervisor_usage_probe_model)]
 pub fn supervisor_usage_probe_liveness() -> Liveness {
     use super::{eq, int, or_, var};
     Liveness {
@@ -1519,159 +1459,97 @@ pub fn supervisor_usage_probe_liveness() -> Liveness {
     }
 }
 
-/// THE LIMIT RESET (`docs/SPEC-claude-accounts-resets-2026-10-02.md` §3,
-/// §5; aterm-agent `supervise/policy/reset.rs`: `confirm_verdict`;
-/// `harness/accounts.rs`: `claim_reset`, `reset_in_flight`, `reset_outcome`;
-/// the readers of `aterm_phase::reset`; and the loop's step, which the spec
-/// names `reset_take`, `reset_run` and `reset_look`): at a usage wall whose
-/// dialog offers the owner's limit reset, the loop takes the grant row,
-/// reads the confirmation that opens, and presses Enter on `Yes, use my
-/// reset` — or Escapes it. A reset is the owner's scarce purchase, so the
-/// property is: ONE ATTEMPT A WALL, AND NO KEY THAT COULD SPEND ANYTHING
-/// ELSE — the row is taken once, on a claim made for it, and never the
-/// weekly row that can stand in its slot; Enter is written only on the
-/// exact confirmation of the row this loop took, past the vendor's guard,
-/// with the focus on Yes and the claim still in flight; nothing is typed
-/// and nothing is keyed under a person's hand; only the vendor's own line
-/// says a reset was spent; a kept or failed attempt is final; nobody is
-/// moved off an account while its reset is being made; and a confirmation
-/// the loop opened is never forgotten.
+/// The limit reset (`docs/SPEC-claude-accounts-resets-2026-10-02.md` §3, §5; aterm-agent
+/// `supervise/policy/reset.rs` `confirm_verdict`; `harness/accounts.rs` `claim_reset`,
+/// `reset_in_flight`, `reset_outcome`; `supervise/reset_loop.rs` `reset_take`,
+/// `reset_look`, `reset_run`; the readers of `aterm_phase::reset`): at a usage wall whose
+/// dialog offers the owner's limit reset, the loop takes the grant row, reads the
+/// confirmation that opens, and presses Enter on `Yes, use my reset`, or Escapes it. A
+/// reset is the owner's scarce purchase, so: one attempt a wall, on a claim made for it,
+/// never the weekly row that can stand in its slot; Enter only on the exact confirmation of
+/// the row this loop took, past the vendor's guard, focus on Yes, claim still in flight;
+/// nothing keyed under a person's hand; only the vendor's line says a reset was spent; a
+/// kept or failed attempt is final; nobody is moved off an account while its reset is being
+/// made; a confirmation the loop opened is never forgotten.
 ///
-/// `dlg` is the vendor's box on session one's screen: 0 none, 1 the wall
-/// dialog with the GRANT row (`Use your reset now (…)`), 2 the wall dialog
-/// with the WEEKLY row in that slot (`Reset your session limit now`, which
-/// claims at once), 3 the dialog's title over `Checking for a reset…`, 4
-/// the confirmation, exact, 5 a confirmation the loop must keep (its
-/// early-use line, or whatever else `confirm_verdict` keeps it for:
-/// another limit, a count or a day that is not the row's, a deadline that
-/// does not qualify), 6 the confirmation's title over `Resetting your
-/// limits…`. `guard` is 1 while the confirmation is inside the vendor's
-/// guard (confirm and cancel are refused for 250 ms from its mount);
-/// `focus` is 1 while its focus is on Yes, where it opens.
+/// State:
+/// * `dlg` — the vendor's box on session one's screen: 0 none, 1 the wall dialog with the
+///   grant row (`Use your reset now (…)`), 2 with the weekly row in that slot (`Reset your
+///   session limit now`, which claims at once), 3 the title over `Checking for a reset…`,
+///   4 the exact confirmation, 5 one the loop must keep (`confirm_verdict`: the early-use
+///   line, another limit, a count or day not the row's, a deadline that does not qualify),
+///   6 the title over `Resetting your limits…`.
+/// * `guard` — 1 inside the vendor's guard (confirm and cancel refused for 250 ms from
+///   mount); `focus` — 1 on Yes, where it opens.
+/// * `claim` — the machine's one slot for this wall: 0 none, 1 session one's and in
+///   flight, 2 done (an outcome recorded, or lapsed: attempted either way).
+/// * `ph` — the loop's memory, kept in the session ledger for a later loop: 0 idle, 1 row
+///   taken, 2 Enter written, 3 Escape written. `own` — 1 while this loop took the row; a
+///   restart ends it.
+/// * `line` — the vendor's transcript line: 0 none, 1 `Limits reset` (spent), 2 the limit
+///   lifted by itself, 3 `Reset kept`, 4 anything else (a failure).
+/// * `s2` — another session on the account: 0 working, 1 at the wall, 2 moved, 3 continued
+///   in place.
+/// * `hand` — a person's keystroke within the grace; `hold` — the session halted (no step
+///   writes under one).
 ///
-/// `claim` is the machine's one slot for this wall: 0 none, 1 session
-/// one's and in flight, 2 done — an outcome recorded, or lapsed with none:
-/// attempted either way. `ph` is the loop's memory, which the session
-/// ledger keeps for a later loop: 0 idle, 1 the row taken, 2 the Enter
-/// written, 3 the Escape written. `own` is 1 while the row was taken by
-/// THIS loop: a restart ends it. `line` is what the vendor has said of the
-/// attempt, in the transcript: 0 nothing, 1 `Limits reset` (a reset
-/// SPENT), 2 the limit had lifted by itself, 3 `Reset kept`, 4 any other
-/// line (a failure). `s2` is another session on the same account: 0
-/// working, 1 at the wall, 2 moved to another account, 3 continued where
-/// it is. `hand` a person's keystroke within the grace; `hold` the session
-/// halted (the server refuses every write: no step here writes under one,
-/// sound or not).
+/// History marks, written from the pre-state by every step of a kind, sound or not: each
+/// row take writes `twice` (no claim in flight for it, a step still owed, or a line already
+/// said at this wall), `weekly` and `handkey`; each Enter writes `early` (not the exact
+/// confirmation), `blind` (inside the guard, focus off Yes, another loop's row, or a claim
+/// no longer in flight) and `handkey`; each Escape and wait-row press writes `handkey`;
+/// each claim writes `retried` (a kept or failed line stands); each move of session two
+/// writes `moved` (claim in flight, or a spent or lifted line said). Only defects write
+/// `typed` (a typed command) and `falseused` (a spend recorded away from its line). `bad`
+/// is 1 once any defect fired; each fires only from a state the sound loop reaches, so the
+/// `Buggy = 1` space stays walkable.
 ///
-/// THE HISTORY, written from the PRE-STATE by every step of its kind, sound
-/// or not — no step reports on itself: every take of a row writes `twice`
-/// (no claim was in flight for it, a step was still owed, or a line had
-/// already been said at this wall), `weekly` (the dialog held the weekly
-/// row) and `handkey` (a person's hand); every Enter writes `early` (the
-/// confirmation was not the exact one), `blind` (inside the guard, the
-/// focus off Yes, a row another loop took, or a claim no longer in flight)
-/// and `handkey`; every Escape and every press of the wait row writes
-/// `handkey`; every claim writes `retried` (a kept or failed line stands);
-/// every move of session two writes `moved` (the claim in flight, or a
-/// spent or lifted line said). `typed` and `falseused` are the two marks a
-/// defect alone writes, each a claim that the loop does NOT do something:
-/// it types no command, and it records a spend nowhere but at the line
-/// that says so. `bad` is 1 once any defect fired: each fires only from a
-/// state the sound loop reaches, so the `Buggy = 1` space stays walkable.
+/// The world may open the wall dialog again at the same wall, under a step still owed too.
+/// A loop restart leaves the step owed where the ledger's last row stands, no longer this
+/// loop's own. Of the supervisor's steps, a dropped Enter or Escape leaves the confirmation
+/// to be judged again; `Escape` is allowed at the exact confirmation too (nothing obliges a
+/// spend) and at a `Checking…` that outlasts its bound, never at `Resetting…`; `S2Moves`
+/// is rotation rule 3.
 ///
-/// THE WORLD: the vendor opens the wall dialog, with the grant row or with
-/// the weekly row in its slot (`WallOpens`, `WallOpensWeekly`: it may come
-/// again at the same wall, under a step still owed too); the taken row's
-/// check ends in the confirmation, in one the loop must keep, or in an
-/// answer line and no confirmation (`OpensTheConfirmation`,
-/// `OpensAnInexactConfirmation`, `OpensAnAnswer`); the guard's 250 ms pass
-/// (`GuardEnds`); the focus moves (`FocusMoves`); a person types and their
-/// grace ends; the session is held and released; the vendor answers its
-/// claim (`ServerAnswersSpent`, `ServerAnswersLifted`,
-/// `ServerAnswersFailed`); the claim's ten minutes pass (`ClaimLapses`);
-/// the loop is restarted (`LoopRestarts`: a successor reads the session
-/// ledger, so the step stays owed where its last row stands, and is no
-/// longer this loop's own); the other session reaches the wall
-/// (`S2AtWall`).
+/// # Not modelled
 ///
-/// THE SUPERVISOR: `Claim` (the host's claim, taken last: the grant row
-/// read by its template, nobody's hand, no step owed); `TakeRow` (the
-/// row's arrows and Enter, on a claim just made for it: the dialog is its
-/// title over `Checking…` from there); `Enter` / `EnterDropped` (the fenced
-/// Enter on Yes; one the vendor drops leaves the confirmation standing,
-/// and it is judged again); `Escape` / `EscapeDropped` (the guarded
-/// Escape: at any confirmation of a step that is owed, past the guard —
-/// the exact one too, for nothing here makes the loop spend — and at a
-/// `Checking…` that outlasts its bound; never at `Resetting…`);
-/// `ReadLine` (the step's end: no pending line and no confirmation is on
-/// the screen, the transcript's line is read, or its bound has run out,
-/// and the host is told: the claim is done and the loop idle); `PressWait`
-/// (`limit-wait@v1`'s press of the wait row, with no step owed); and the
-/// host's advice to the other session at the wall: `S2Waits` (a moment,
-/// while the claim is in flight: it changes nothing, and is here for where
-/// it is enabled), `S2Resumes` (a spent or lifted line was recorded, which
-/// cleared the walls: it continues where it is), `S2Moves` (the roster's
-/// rule 3, as ever: no claim in flight and no reset made).
+/// * Time: the two 24 h qualifying rules, the loop's wait bounds, the Escape ladder and its
+///   one `inform`, the three Enters before an Escape, the settle as a duration (`GuardEnds`
+///   is the clock). One assumption: the claim's ten minutes do not run out over a reset in
+///   the making (`ClaimLapses` is disabled at `Resetting…` and over an unread spent or
+///   lifted line; else "every claim ends" would hold whatever the loop did). The vendor
+///   bounds its claim at 35 s and the loop its read at 10 s, so the real Enter must not be
+///   written on a claim about to lapse, or another session could be moved off an account
+///   whose reset lands a moment later.
+/// * The default-login rule, the zone, every text: `dlg` 4 against 5 is all the reader and
+///   `confirm_verdict` make of a confirmation.
+/// * A person's own confirmation, Enter or Escape: `hand` only stops the loop's keys.
+/// * A row press that never lands. A claim with no row taken ends by the clock here; the
+///   real loop records it kept when it leaves the dialog.
+/// * `Resetting…` outlasting the loop's bound: the vendor answers first here.
+/// * What the weekly row or a typed command does once written.
+/// * The other session beyond its advice (its own dialog, its jobs, the rotation of
+///   [`supervisor_account_rotation_model`]); a second wall or account: `claim == 2` is this
+///   wall's tombstone for good.
+/// * `[harness] limit_reset` off: then the supervisor has only `PressWait`, and a
+///   successor's `Escape` of a step an earlier loop opened (the loop's unit tests).
 ///
-/// # What is NOT modelled
+/// # Defects (`Buggy = 1`) and the law each breaks
 ///
-/// * TIME: the two 24 h rules a reset qualifies by, the loop's bounds on
-///   each wait, the Escape's ladder and its one `inform`, the three Enters
-///   before an Escape, the settle as a duration (`GuardEnds` is the clock,
-///   and a refused key re-arming the guard is no step). And ONE THING OF
-///   TIME THE MODEL ASSUMES: the claim's ten minutes do not run out over a
-///   reset in the making. `ClaimLapses` is not enabled at `Resetting…`, nor
-///   over a spent or lifted line the loop has not read yet: the vendor
-///   bounds its claim at 35 s and the loop its read at 10 s, against ten
-///   minutes — so the real Enter must not be written on a claim about to
-///   lapse, or another session could be moved off an account whose reset
-///   lands a moment later. With a clock free to end any claim, "every claim
-///   ends" would hold whatever the loop did.
-/// * The default-login rule, the zone, every text. `dlg` 4 against 5 is the
-///   whole of what the reader and `confirm_verdict` make of a confirmation.
-/// * A PERSON'S OWN confirmation: `dlg` is the box the harness's row
-///   opened, and one opened with no step of the harness's is answered by
-///   the ordinary rules. Nor a person's own Enter or Escape on the
-///   harness's box: `hand` only stops the loop's keys.
-/// * A row's press that never lands: `TakeRow` is the press seen through.
-///   A claim made with no row taken is ended by the clock here; the real
-///   loop records it kept when it leaves the dialog.
-/// * `Resetting…` outlasting the loop's bound on it: the vendor's answer
-///   comes first here.
-/// * What the weekly row or a typed command does once written: the state a
-///   defect leaves stands for "the wrong thing is in flight".
-/// * The other session beyond the advice it is given: its own dialog
-///   (`limit-wait@v1` answers it as ever), its jobs, and the rotation
-///   itself ([`supervisor_account_rotation_model`]). And a second wall or a
-///   second account: `claim == 2` is this wall's tombstone for good.
-/// * `[harness] limit_reset` off: then no step of the supervisor's but
-///   `PressWait` exists, and a successor's `Escape` (`own = 0`) of a step
-///   an earlier loop opened, which ends with nobody told (the loop's unit
-///   tests).
-/// * Anything SEEN. Every text and every transition of the vendor's reset
-///   program here is READ in the 2.1.287 bundle; none has been on a screen.
-///
-/// # The defects (`Buggy = 1`), each dead at the committed config
-///
-/// `TakeRowUnclaimed` (the row taken with no claim made, on one that is
-/// done, or under a step still owed) and `NeverReadsTheLine` (the dialog
-/// gone after its Enter, the loop goes idle and tells nobody: the claim
-/// stays its own, and at the dialog's next mount the row is taken again —
-/// also the first liveness claim's mutant): `OneAttemptPerWall`. `EnterTheInexactConfirmation`:
-/// `EnterOnlyOnTheExactConfirmation`. `EnterInsideTheGuard`,
-/// `EnterOffYes`, `EnterAsASuccessor`, `EnterOnALapsedClaim`:
-/// `EnterOnlyPastTheGuardOnYes`. `TakeRowByItsPlace` (the slot's row,
-/// whatever it says): `NeverTheWeeklyRow`. `TypesTheCommand`:
-/// `NeverTheTypedCommand`. `S2MovesUnderAReset`:
-/// `NoMoveOffAnAccountBeingReset`. `TakeRowUnderAHand`, `EnterUnderAHand`,
-/// `EscapeUnderAHand`, `PressWaitUnderAHand`: `NothingKeyedUnderAHand`.
-/// `UsedRecordedAtEnter` (the Enter taken for the spend):
-/// `OnlyTheLineSaysSpent`. `ClaimsAgainAfterAFailure`:
-/// `AFailureIsNotRetried` where the claim is made — and
-/// `OneAttemptPerWall` a step later, where its row is taken: the same
-/// defect seen twice. `StopsTryingItsEscape` (the loop gives a confirmation
-/// up after an Escape that did not take — also the second liveness claim's
-/// mutant): `AnOpenConfirmationIsOwed`.
+/// * `TakeRowUnclaimed`, `NeverReadsTheLine` (also `EveryClaimEnds`'s mutant):
+///   `OneAttemptPerWall`.
+/// * `EnterTheInexactConfirmation`: `EnterOnlyOnTheExactConfirmation`.
+/// * `EnterInsideTheGuard`, `EnterOffYes`, `EnterAsASuccessor`, `EnterOnALapsedClaim`:
+///   `EnterOnlyPastTheGuardOnYes`.
+/// * `TakeRowByItsPlace`: `NeverTheWeeklyRow`. `TypesTheCommand`: `NeverTheTypedCommand`.
+/// * `S2MovesUnderAReset`: `NoMoveOffAnAccountBeingReset`.
+/// * `TakeRowUnderAHand`, `EnterUnderAHand`, `EscapeUnderAHand`, `PressWaitUnderAHand`:
+///   `NothingKeyedUnderAHand`.
+/// * `UsedRecordedAtEnter`: `OnlyTheLineSaysSpent`.
+/// * `ClaimsAgainAfterAFailure`: `AFailureIsNotRetried`, and `OneAttemptPerWall` a step
+///   later.
+/// * `StopsTryingItsEscape` (also `EveryHarnessConfirmationCloses`'s mutant):
+///   `AnOpenConfirmationIsOwed`.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn supervisor_limit_reset_model() -> Model {
@@ -2075,29 +1953,22 @@ pub fn supervisor_limit_reset_model() -> Model {
     }
 }
 
-/// EVERY CLAIM ENDS ([`supervisor_limit_reset_model`]): `[]<>(no claim is
-/// in flight)` — on every fair behaviour a claim, which holds every other
-/// session of the account at its wall, does not stay in flight for good.
+/// `EveryClaimEnds` ([`supervisor_limit_reset_model`]): `[]<>(no claim is in flight)`. A
+/// claim holds every other session of the account at its wall, so it must not stay in
+/// flight for good.
 ///
-/// Fairness assumed, and nothing more. THE LOOP'S: its step ends
-/// (`ReadLine`: with no pending line and no confirmation on the screen, the
-/// line is read, or its bound runs out, and the host is told). THE CLOCK'S:
-/// a claim with no outcome lapses (`ClaimLapses`) — which is what ends one
-/// whose loop never took the row, or whose confirmation stands under a
-/// person's hand for good. THE VENDOR'S: its own claim is answered, if only
-/// by its timeout (`ServerAnswersFailed`: it bounds the call at 35 s, READ).
-/// Nothing is assumed of a person, of a hold, of the loop's keys or of what
-/// the vendor's check opens.
+/// Fair: the loop's step ends (`ReadLine`), a claim with no outcome lapses (`ClaimLapses`:
+/// what ends one whose row was never taken, or whose confirmation stands under a hand for
+/// good), and the vendor answers its claim, if only by its 35 s timeout
+/// (`ServerAnswersFailed`). Nothing is assumed of a person, a hold, the loop's keys or what
+/// the vendor's check opens. The clock alone does not carry it: over a reset in the making
+/// the claim does not lapse, so a spent or lifted line ends its claim only by being read.
 ///
-/// The clock alone does not carry it: over a reset in the making the model's
-/// claim does not lapse (the model's doc says what that assumes of the real
-/// one), so a spent or lifted line ends its claim only by being read.
-///
-/// Broken alone by `NeverReadsTheLine`: the loop that goes idle at the
-/// dialog's end leaves the claim of a reset that was spent in flight for
-/// good, and every other session of the account waiting on it.
+/// Broken alone by `NeverReadsTheLine`, which leaves a spent reset's claim in flight and
+/// every other session of the account waiting on it.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
+#[crate::liveness(crate::derive::supervisor_limit_reset_model)]
 pub fn supervisor_limit_reset_claim_liveness() -> Liveness {
     use super::{eq, int, or_, var};
     Liveness {
@@ -2109,28 +1980,21 @@ pub fn supervisor_limit_reset_claim_liveness() -> Liveness {
     }
 }
 
-/// EVERY HARNESS CONFIRMATION CLOSES ([`supervisor_limit_reset_model`]):
-/// `[]<>(no confirmation is on the screen \/ a person's hand is on the
-/// session \/ it is held)` — on every fair behaviour, a confirmation the
-/// harness's row opened, and the claiming line that follows its Enter, does
-/// not stand for good while nothing stands in the Escape's way.
+/// `EveryHarnessConfirmationCloses` ([`supervisor_limit_reset_model`]): `[]<>(no
+/// confirmation is on the screen \/ a person's hand is on the session \/ it is held)`. A
+/// confirmation the harness's row opened, and the claiming line after its Enter, does not
+/// stand for good while nothing blocks the Escape.
 ///
-/// Fairness assumed, and nothing more: the vendor's guard ends
-/// (`GuardEnds`: its 250 ms), an Escape pressed for ever at a confirmation
-/// is taken at last (`Escape`: the loop presses on a ladder with no last
-/// rung), and the vendor answers its own claim, if only by its timeout
-/// (`ServerAnswersFailed`). THE WORLD IS NOT FAIR, and is not assumed to
-/// be: a person may type for ever and a hold may never lift — each is an
-/// EXCEPTION in the goal and not a fairness assumption, because a person
-/// and a hold taking turns can keep the Escape disabled at every instant
-/// while each of them ends infinitely often. Nor is the loop's own restart:
-/// after one the confirmation is still owed, and Escaped.
+/// Fair: the guard ends (`GuardEnds`), an Escape pressed for ever is taken (`Escape`: the
+/// ladder has no last rung), and the vendor answers its claim, if only by its timeout
+/// (`ServerAnswersFailed`). A person and a hold are exceptions in the goal, not fairness:
+/// taking turns, they can keep the Escape disabled at every instant while each ends
+/// infinitely often. After a loop restart the confirmation is still owed.
 ///
-/// Broken alone by `StopsTryingItsEscape`: a loop that gives the
-/// confirmation up after an Escape that did not take leaves it open for
-/// good.
+/// Broken alone by `StopsTryingItsEscape`.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
+#[crate::liveness(crate::derive::supervisor_limit_reset_model)]
 pub fn supervisor_limit_reset_confirmation_liveness() -> Liveness {
     use super::{eq, int, le, or_, var};
     Liveness {

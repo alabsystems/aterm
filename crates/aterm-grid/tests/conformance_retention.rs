@@ -4,8 +4,7 @@
 //! Unified total retention limit: derived spec plus Tier-1 binding to the real
 //! `Grid`.
 //!
-//! The `ty_model!` source is `include!`d from `retention_limit_spec.rs`, the
-//! same file `build.rs` checks at compile time.
+//! The `ty_model!` source is `include!`d from `retention_limit_spec.rs`.
 //!
 //! - Tier 0: `TotalBounded` (ring + store <= the one limit) proves at `Buggy=0`
 //!   and is caught at `Buggy=1` (store capped at the limit, ring on top).
@@ -127,8 +126,7 @@ fn run_lockstep(n: usize) -> Vec<(BTreeMap<&'static str, i64>, BTreeMap<&'static
 
 // Tests
 
-/// Tier 0 backstop (the build.rs gate runs the same check at compile time; this
-/// duplicates it in the test suite so `cargo test` alone also proves it).
+/// Tier 0: `TotalBounded` proves at `Buggy=0` and is caught at `Buggy=1`.
 #[test]
 fn retention_limit_spec_model_checked_in_trust() {
     verify::prove_and_catch_scalar(&retention_limit_model(), "unified retention limit spec");

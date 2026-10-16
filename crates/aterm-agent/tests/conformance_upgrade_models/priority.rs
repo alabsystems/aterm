@@ -1,12 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! HarnessModelPriority, Tier-1: the live upgrade's model priority list
-//! (`aterm_agent::harness::upgrade_models`), its writers (`Priority::admit`,
-//! the owner's `set`) and its reader (`upgrade_models::target`), driven over
-//! every reachable state of the derived model and projected back onto it,
-//! with a defective writer and a head-of-list reader as the caught negative
-//! controls.
+//! HarnessModelPriority, Tier-1: the live upgrade's model priority list, its writers
+//! (`Priority::admit`, the owner's `models set`) and its reader (`list_target` over
+//! `offered`), driven over every reachable model state. Negative controls: a defective
+//! writer and a head-of-list reader.
 
 use std::collections::{BTreeSet, VecDeque};
 
@@ -15,10 +13,6 @@ use aterm_agent::harness::upgrade_models::{self as models, Change, Evidence, Pri
 use aterm_spec::derive::{Model, harness_model_priority_model};
 
 use super::{Vars, assert_forged_rejected, assert_transition};
-
-// ===========================================================================
-// HarnessModelPriority — the list's writers and its reader
-// ===========================================================================
 
 const A0: &str = "claude-opus-4-8";
 const A1: &str = "claude-opus-5";
@@ -114,9 +108,8 @@ fn known_in(s: &Vars) -> impl Fn(&str) -> bool + '_ {
 
 type Admit = dyn Fn(&mut Priority, &str, &dyn Fn(&str) -> bool) -> Option<Change>;
 
-/// The writer bind: from every reachable state, every candidate through
-/// `admit`, projected back, checked against the model's action for that
-/// candidate. Returns every disagreement (empty for the shipped writer).
+/// The writer bind: every candidate through `admit` from every reachable state,
+/// checked against the model's action for it. Returns every disagreement.
 fn writer_disagreements(model: &Model, states: &[Vars], admit: &Admit) -> Vec<String> {
     let candidates = [
         (A3, "AdmitNewerOpus"),
@@ -174,8 +167,8 @@ fn shipped_admit(p: &mut Priority, id: &str, known: &dyn Fn(&str) -> bool) -> Op
     p.admit(id, "conformance", known, 0)
 }
 
-/// The writer as it was before the newest-listed check: strictly newer than
-/// the family's best-RANKED member only.
+/// A writer without the newest-listed check: strictly newer than the family's
+/// best-ranked member only.
 fn pre_fix_admit(p: &mut Priority, id: &str, known: &dyn Fn(&str) -> bool) -> Option<Change> {
     let (family, version) = models::family_version(id)?;
     if p.rank(id).is_some() || !known(id) {
@@ -199,11 +192,9 @@ fn pre_fix_admit(p: &mut Priority, id: &str, known: &dyn Fn(&str) -> bool) -> Op
     })
 }
 
-/// Evidence under which exactly the ids the state marks available are
-/// usable, each unavailable one refused for a different reason: absent from
-/// the served catalog, deprecated, needing a newer Claude Code, denied by the
-/// account, or a disabled option — five of `availability`'s refusal paths on
-/// the reader's input (the build-does-not-know path is `known`'s, above).
+/// Evidence under which exactly the ids the state marks available are usable, each
+/// unavailable one refused by a different path of `availability`: not served,
+/// deprecated, needs a newer Claude Code, denied, or a disabled option.
 fn evidence_for(s: &Vars) -> Evidence {
     let mut ev = Evidence {
         served: Some(Vec::new()),
@@ -282,8 +273,8 @@ fn reader_disagreements(model: &Model, states: &[Vars], reader: &Reader) -> Vec<
 }
 
 fn shipped_reader(list: &Priority, ev: &Evidence) -> Option<String> {
-    // The live upgrade's model half asks exactly this, once per sweep
-    // (`upgrade_drive`'s `ModelCtx::read`; `None`: no `availableModels`).
+    // What the live upgrade asks once per sweep (`upgrade_drive`'s `ModelCtx::offer`;
+    // `None`: no `availableModels`).
     let offered = models::offered(list, "2.1.300", ev, Some(&baked_all()), None);
     models::list_target(list, &offered).map(str::to_string)
 }
@@ -386,8 +377,7 @@ fn upgrade_priority_writers_and_reader_are_the_models_on_every_reachable_state()
         "select the first available",
     );
 
-    // Negative controls on the model: a forged downgrade and a forged
-    // cross-family write offered as the writer's own steps are refused.
+    // Negative controls: a forged downgrade and a forged cross-family write are refused.
     let mut down = with_list(
         &known,
         &[
@@ -425,9 +415,9 @@ fn upgrade_priority_writers_and_reader_are_the_models_on_every_reachable_state()
     assert!(!model.check_invariant("AutoInsertIsNewerThanTheFamilysBest", &down));
 }
 
-/// Negative controls for the priority binds: the writer as it was before the
-/// newest-listed check, and a reader that answers the head of the list, are
-/// each caught by the same enumeration that passes the shipped code.
+/// Negative controls: a writer without the newest-listed check, and a reader that
+/// answers the head of the list, are each caught by the enumeration that passes the
+/// shipped code.
 #[test]
 fn upgrade_priority_binds_catch_a_pre_fix_writer_and_a_head_reader() {
     let model = harness_model_priority_model();
@@ -448,9 +438,8 @@ fn upgrade_priority_binds_catch_a_pre_fix_writer_and_a_head_reader() {
     );
 }
 
-/// The history the real writers keep is the provenance the journal needs;
-/// `ingest` (the pass's path into `admit`) admits from recommendations only
-/// what the model's writer admits.
+/// `ingest` (the pass's path into `admit`) admits from recommendations only what the
+/// model's writer admits.
 #[test]
 fn upgrade_priority_ingest_admits_only_what_the_model_admits() {
     let model = harness_model_priority_model();

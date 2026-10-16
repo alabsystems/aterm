@@ -155,20 +155,12 @@ fn scrollback_clear() {
     assert_eq!(sb.cold_line_count(), 0);
 }
 
-/// Verify content fidelity through multiple full tier transition cycles.
-///
-/// Pushes enough lines to trigger multiple hot→warm→cold eviction cycles,
-/// with varied content lengths to exercise different compression ratios.
-/// Verifies every line reads back correctly from whichever tier it ended up in.
-///
-/// This catches data corruption in the LZ4 (warm) and Zstd (cold) codecs,
-/// off-by-one errors in tier index arithmetic, and decompression cache
-/// coherence issues.
+/// Content survives many hot→warm→cold cycles: lines of varied length read back
+/// exactly from whichever tier they end in, forward, reverse, random-access and
+/// through the iterator.
 #[test]
 fn tier_transition_content_fidelity_multi_cycle() {
-    // Very small limits: hot=3, warm=6, block_size=3.
-    // With block_size=3, each warm block holds 3 lines.
-    // warm_limit=6 means 2 blocks before eviction to cold.
+    // hot=3, warm=6, block_size=3: two warm blocks before eviction to cold.
     let mut sb = Scrollback::with_block_size(3, 6, 10_000_000, 3);
 
     let total_lines = 60;

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance for journal-v5 one-shot GitHub POST authority.
+//! Tier-1 conformance for the release journal's one-shot GitHub POST authority.
 
 use crate::{ledger, publish, sign};
 
@@ -38,13 +38,9 @@ fn context(root: &Path, with_journal: bool) -> CutCtx {
     let journal_path = root.join("nested/dist/cut-state.toml");
     CutCtx {
         verify_pubkey: None,
-        // No credentials: this model exercises journal/state transitions, not signing.
+        // No credentials: journal/state transitions only, no signing.
         credentials: None,
-        // Tier APPLE inactive — NOT because the shipped anchor is (it has been armed
-        // since 2026-08-15, which is what this line used to claim), but because this
-        // model covers the
-        // one-shot POST intents; a resolved Apple tier would be a certificate
-        // this test has no business needing.
+        // The Apple tier is inactive because this model covers only the one-shot POST intents.
         apple: sign::AppleTier::Inactive,
         repo: root.to_path_buf(),
         tree: root.to_path_buf(),
@@ -62,9 +58,8 @@ fn context(root: &Path, with_journal: bool) -> CutCtx {
         linux: None,
         signature_required: false,
         signature_pubkey: None,
-        // Unattributed, as a FORK's cut is: with no master pinned no roster authorizes
-        // anything and no roster asset ships (this tree's master has been armed since
-        // 2026-08-15).
+        // Unattributed, as a fork's cut is: with no master pinned, no roster authorizes
+        // anything and none ships.
         signature_machine_id: None,
         attribution: None,
         roster: None,
@@ -120,8 +115,8 @@ fn real_guard_and_fsynced_journal_refine_one_shot_model() {
     assert!(ctx.journal_path.parent().unwrap().is_dir());
     drop(permit);
 
-    // Crash before POST destroys only the process-local permit. The real guard
-    // loaded from disk and the model both refuse to mint/issue another one.
+    // A crash before the POST destroys only the process-local permit; the guard loaded from
+    // disk and the model both refuse another.
     step(&model, &mut state, "Crash", "crash destroys create permit");
     step(
         &model,
@@ -171,9 +166,8 @@ fn lost_response_converges_visible_create_and_upload_without_repost() {
         DurablePostDecision::AwaitVisibility
     );
     assert!(!model.action_enabled("IssueCreatePost", &state));
-    // NEGATIVE CONTROL: the real decision converges only on a visible object, so
-    // a landed POST whose answer was lost waits. Taking that POST at its word
-    // converges a draft nobody has re-listed.
+    // Negative control: the real decision converges only on a visible object, so a landed POST
+    // whose answer was lost waits; taking it at its word converges an unlisted draft.
     assert!(!model.action_enabled("ConvergeCreatedDraft", &state));
     let buggy = aterm_spec::interp::with_buggy(&model, 1);
     let trusted = buggy.successors("ConvergeCreatedDraft", &state)[0].clone();
@@ -213,7 +207,7 @@ fn lost_response_converges_visible_create_and_upload_without_repost() {
         "exact asset convergence",
     );
 
-    // Explicit negative control for the retired retry policy.
+    // Negative control: a resume that posts again after a crash.
     let mut retry = buggy.init_state();
     assert!(buggy.fire("PersistCreateIntent", &mut retry));
     assert!(buggy.fire("Crash", &mut retry));
@@ -222,24 +216,17 @@ fn lost_response_converges_visible_create_and_upload_without_repost() {
     assert!(!buggy.check_invariant("LostCreatePermitCannotPost", &retry));
 }
 
-/// AN UPLOAD INTENT IS SPENT ONLY ON A POST THAT PROVABLY CREATED NOTHING — over the
-/// real journal, and against the derived model. `upload_channel_asset` settles every
-/// finished upload POST through `CutCtx::settle_upload_intent`; this drives that settle
-/// with what curl says, over a journal that is really written and read back, and asks
-/// the one question a resume asks next: may the asset be POSTed again?
+/// An upload intent is spent only on a POST that provably created nothing, over the real
+/// journal and the derived model. This drives `CutCtx::settle_upload_intent` with curl's
+/// answers and asks what a resume asks next: may the asset be POSTed again?
 ///
-/// A POST curl never sent (exit 2) or the server answered with a 4xx (a token that
-/// expired mid-cut, a throttle, a refused upload) created nothing: its intent is
-/// retracted, the durable list `--abandon` withdraws from loses only that name, and the
-/// resume may post it once more. Everything else can hide a stored object and keeps its
-/// intent — the NEGATIVE CONTROLS, the rows a blanket retraction would get wrong: with the
-/// intent standing the resume decides `AwaitVisibility` and mints no permit.
-///
-/// Each row is also projected onto `ReleaseDurablePostIntent`, whose world it is: a POST
-/// that created nothing is `IssueRefusedUploadPost`, one that may have landed is
-/// `IssueUploadPost`, and the model's `RetractUploadIntent` is enabled for exactly the
-/// rows the real settle retracts. The blanket retraction is replayed on the model's
-/// mutant and lands an object no intent names.
+/// A POST curl never sent (exit 2) or the server answered with a 4xx created nothing: its
+/// intent is retracted and the resume may post once more. Everything else can hide a stored
+/// object and keeps its intent, so the resume decides `AwaitVisibility` and mints no permit.
+/// Each row is projected onto `ReleaseDurablePostIntent` (`IssueRefusedUploadPost` or
+/// `IssueUploadPost`), whose `RetractUploadIntent` is enabled for exactly the rows the real
+/// settle retracts; a blanket retraction, replayed on the mutant, leaves an object no intent
+/// names.
 #[test]
 fn an_upload_intent_is_freed_by_a_post_that_created_nothing_and_by_nothing_else() {
     use publish::PostOutcome::{NeverSent, Refused, Unknown};
@@ -253,8 +240,7 @@ fn an_upload_intent_is_freed_by_a_post_that_created_nothing_and_by_nothing_else(
     let buggy = aterm_spec::interp::with_buggy(&model, 1);
 
     // One upload POST that finished as `out`, settled by a cut of `kind`: the verdict, the
-    // journal as read back from disk, and whether the resume may post `NAME` again (the
-    // shipping decision, then the real permit).
+    // journal read back from disk, and whether the resume may post `NAME` again.
     let settled = |kind: CutKind, out: &ledger::RunOut| {
         let mut ctx = context(&root, true);
         ctx.kind = kind;
@@ -287,8 +273,8 @@ fn an_upload_intent_is_freed_by_a_post_that_created_nothing_and_by_nothing_else(
         // What the journal held when the settle returned, not after the repost above.
         (verdict, on_disk.upload_intents, reposts)
     };
-    // The model, at the moment the upload POST has finished: `created_nothing` is the
-    // world (the POST was refused or never left), which the process knows only then.
+    // The model when the upload POST has finished: `created_nothing` is the world (refused or
+    // never left), which the process knows only then.
     let posted = |created_nothing: bool| {
         let mut state = model.init_state();
         for action in [
@@ -319,8 +305,8 @@ fn an_upload_intent_is_freed_by_a_post_that_created_nothing_and_by_nothing_else(
         )
     };
 
-    // Freed: only this POST's intent goes — the durable list `--abandon` withdraws from
-    // still names every other upload this cut made — and the resume may post it again.
+    // Freed: only this POST's intent goes (the `--abandon` list still names every other
+    // upload), and the resume may post it again.
     for (label, finished, verdict) in [
         (
             "curl refused its own arguments",
@@ -336,8 +322,7 @@ fn an_upload_intent_is_freed_by_a_post_that_created_nothing_and_by_nothing_else(
         assert_eq!(intents, [OTHER], "{label}");
         assert!(reposts, "{label}");
 
-        // The model: retractable, and once retracted the resume may persist a fresh
-        // intent (and so a fresh permit) — the same answer as `reposts`.
+        // The model: retractable, and once retracted a fresh intent may persist.
         let mut state = posted(true);
         assert!(
             model.action_enabled("RetractUploadIntent", &state),
@@ -351,8 +336,8 @@ fn an_upload_intent_is_freed_by_a_post_that_created_nothing_and_by_nothing_else(
         );
     }
 
-    // NEGATIVE CONTROLS: each of these can hide a delivered request and keeps its intent
-    // (so the resume waits for visibility), and none is misread as a refusal.
+    // Negative controls: each can hide a delivered request, so it keeps its intent (the resume
+    // waits for visibility) and is never misread as a refusal.
     for (label, finished) in [
         ("502: the edge can hide a stored object", http(502)),
         ("500", http(500)),
@@ -373,9 +358,8 @@ fn an_upload_intent_is_freed_by_a_post_that_created_nothing_and_by_nothing_else(
         assert_eq!(intents, [NAME, OTHER], "{label}");
         assert!(!reposts, "{label}");
 
-        // The model refuses to retract a POST that may have landed, and with the intent
-        // standing it refuses a fresh one; the mutant retracts it anyway and leaves an
-        // object no intent names.
+        // The model refuses to retract a POST that may have landed, and a fresh intent while
+        // the old one stands; the mutant retracts anyway and leaves an object no intent names.
         let state = posted(false);
         assert!(
             !model.action_enabled("RetractUploadIntent", &state),
@@ -393,11 +377,9 @@ fn an_upload_intent_is_freed_by_a_post_that_created_nothing_and_by_nothing_else(
         );
     }
 
-    // THE ANSWERED 4xx RE-PROVES THE LEASE; THE NEVER-SENT EXIT DOES NOT. This cut is REAL
-    // and holds no lease, as a process fenced out of its claim would find. A refusal it
-    // cannot prove it still owns keeps its intent (the journal on disk is untouched and the
-    // resume waits) and says why; curl's exit 2, which a round-7 audit found under memory
-    // pressure, is retracted with no further call that could fail.
+    // An answered 4xx re-proves the lease; the never-sent exit does not. This real cut holds no
+    // lease, like a process fenced out of its claim: a refusal it cannot prove it owns keeps its
+    // intent and says why, while curl's exit 2 is retracted with no further call that can fail.
     let (got, intents, reposts) = settled(CutKind::Real, &http(422));
     let why = got.expect_err("a refusal from a process that cannot prove its lease");
     assert!(
@@ -418,8 +400,7 @@ fn an_upload_intent_is_freed_by_a_post_that_created_nothing_and_by_nothing_else(
     assert_eq!(intents, [OTHER]);
     assert!(reposts);
 
-    // The mutant a resumed process is: the refusal it retracts on died with the process
-    // that saw it (`IssueRefusedUploadPost`, then a crash, keeps it in the mutant).
+    // Mutant: a resumed process retracting on a refusal that died with the process that saw it.
     let mut crashed = buggy.init_state();
     for action in [
         "PersistCreateIntent",
@@ -448,12 +429,11 @@ fn an_upload_intent_is_freed_by_a_post_that_created_nothing_and_by_nothing_else(
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// WHAT THE UPLOAD DOES NEXT is one pure decision (`publish::after_upload_post`), read by
-/// the live `upload_channel_asset` and by the fake GitHub alike, so a row of this table
-/// is the live behaviour. The probe is a network call: never asked when the POST provably
-/// never left, best-effort after a refusal (an object there is converged on and the
-/// journal names it again — `422 already_exists` is a 4xx too — but a probe that fails
-/// leaves the refusal standing), and load-bearing after an unknowable outcome.
+/// What the upload does after its POST is one pure decision (`publish::after_upload_post`),
+/// shared by `upload_channel_asset` and the fake GitHub. The probe is never asked when the POST
+/// provably never left, best-effort after a refusal (`422 already_exists` is a 4xx too, so an
+/// object there is converged on; a failed probe leaves the refusal standing), and decisive after
+/// an unknown outcome.
 #[test]
 fn what_an_upload_does_after_its_post_is_one_table() {
     use publish::AfterUploadPost::{Ambiguous, Converge, NeverSent, Refused};
@@ -467,13 +447,12 @@ fn what_an_upload_does_after_its_post_is_one_table() {
         (verdict.map_err(|error| error.to_string()), asked)
     };
 
-    // Never sent: local and provable, so the probe is never asked — even one that would
-    // have found an object.
+    // Never sent: local and provable, so the probe is never asked.
     assert_eq!(decide(PostOutcome::NeverSent, Ok(true)), (Ok(NeverSent), 0));
     assert_eq!(decide(PostOutcome::NeverSent, Err(())), (Ok(NeverSent), 0));
 
     // Refused: one best-effort probe. Visible converges and asks the journal to name it;
-    // absent, or a probe that fails, is the refusal as reported.
+    // absent, or a failed probe, is the refusal as reported.
     assert_eq!(
         decide(PostOutcome::Refused, Ok(true)),
         (Ok(Converge { journal: true }), 1)
@@ -481,8 +460,8 @@ fn what_an_upload_does_after_its_post_is_one_table() {
     assert_eq!(decide(PostOutcome::Refused, Ok(false)), (Ok(Refused), 1));
     assert_eq!(decide(PostOutcome::Refused, Err(())), (Ok(Refused), 1));
 
-    // Unknown: the probe decides, and the intent was never retracted, so a visible object
-    // is already named. A probe that fails fails the step — the intent stands.
+    // Unknown: the probe decides; the intent was never retracted, so a visible object is
+    // already named. A failed probe fails the step and the intent stands.
     assert_eq!(
         decide(PostOutcome::Unknown, Ok(true)),
         (Ok(Converge { journal: false }), 1)
@@ -504,8 +483,7 @@ fn absent_cleanup_selector_is_fail_closed_for_issued_or_unknown_intent() {
             publish::AbsentDraftDecision::RetainOwnerAwaitVisibility
         );
     }
-    // The operator answers for a LOST journal only. A journal that PROVES a POST was
-    // issued still wins — there, delayed visibility is the only explanation left.
+    // The operator answers for a lost journal only; a journal proving a POST still wins.
     assert_eq!(
         publish::absent_draft_decision(None, true),
         publish::AbsentDraftDecision::AbandonProvenNoPost
@@ -518,9 +496,8 @@ fn absent_cleanup_selector_is_fail_closed_for_issued_or_unknown_intent() {
         AbandonProvenNoPost, DeleteIssuedVisible, RefuseUnknownOrInconsistent,
         RetainIssuedAwaitVisibility,
     };
-    // `bound` = the visible draft targets the recovery claim's commit, i.e. the remote
-    // itself proves the object is this claim's. It is the ONLY thing that may stand in
-    // for a lost journal, and only when a draft is actually visible.
+    // `bound`: the visible draft targets the recovery claim's commit, so the remote proves it
+    // is this claim's. Only that stands in for a lost journal, and only with a visible draft.
     for (knowledge, visible, bound, expected) in [
         (Some(false), false, false, AbandonProvenNoPost),
         (Some(false), true, false, RefuseUnknownOrInconsistent),
@@ -555,9 +532,8 @@ const RECOVERY_TAG: &str = "v0.55.0";
 const RECOVERY_CLAIM: &str = "0123456789abcdef0123456789abcdef01234567";
 const OTHER_COMMIT: &str = "fedcba9876543210fedcba9876543210fedcba98";
 
-/// Project one recovery observation onto `ReleaseHistoricalRecovery`: what the
-/// journal knows (`None` = lost), and whether a draft is visible and bound to the
-/// claim's commit — the shipping `claim_bound_draft`, which only a visible draft has.
+/// Project one recovery observation onto `ReleaseHistoricalRecovery`: what the journal knows
+/// (`None` = lost), and whether a draft is visible and bound to the claim's commit.
 fn recovery_state(model: &Model, knowledge: Option<bool>, visible: bool, bound: bool) -> State {
     let mut state = model.init_state();
     let learned = match knowledge {
@@ -580,14 +556,10 @@ fn recovery_state(model: &Model, knowledge: Option<bool>, visible: bool, bound: 
     state
 }
 
-/// The delete authority for one row as the private draft leg held it — a
-/// helper retired with that leg by the publish-once decruft (fd6dd6377):
-/// delete only when `draft_cleanup_decision` says so AND the draft found
-/// passes `validate_release_object_capability` against the claim's commit.
-/// Its successor, `publish::withdraw_unpublished_release`, makes the same
-/// `draft_cleanup_decision` but binds the draft by its asset names
-/// (`channel::binds_to_version`), so this row pins the decision function and
-/// the capability check, not the successor's binding.
+/// The delete authority for one row: `draft_cleanup_decision` says delete and the draft passes
+/// `validate_release_object_capability` against the claim's commit.
+/// `publish::withdraw_unpublished_release` makes the same decision but binds the draft by its
+/// asset names (`channel::binds_to_version`), which this does not pin.
 fn real_deletes(knowledge: Option<bool>, visible: bool, bound: bool) -> bool {
     let draft = publish::ReleaseObjectIdentity {
         id: 7,
@@ -607,9 +579,8 @@ fn real_deletes(knowledge: Option<bool>, visible: bool, bound: bool) -> bool {
         .is_ok()
 }
 
-/// The healthy model's delete authority at a projected state: `DeleteExactDraft`
-/// now, or once the remote's claim binding has answered a lost journal. Each step
-/// taken is checked to be the model transition it claims to be.
+/// The healthy model's delete authority at a projected state: `DeleteExactDraft` now, or once
+/// the remote's claim binding has answered a lost journal.
 fn model_deletes(model: &Model, state: &State) -> bool {
     let mut paths = vec![state.clone()];
     paths.extend(model.successors("LearnIssuedIntentFromClaimBinding", state));
@@ -623,12 +594,10 @@ fn model_deletes(model: &Model, state: &State) -> bool {
     })
 }
 
-/// Tier-1 for `ReleaseHistoricalRecovery`: every row of the shipping cleanup
-/// selector — `draft_cleanup_decision` composed with the capability check the
-/// delete runs, and `absent_draft_decision` with and without the operator's
-/// `--no-draft-was-posted` — is projected onto the model, and the model's healthy
-/// actions admit exactly what the shipping code does. The mutants are replayed on
-/// the rows the shipping code refuses.
+/// Tier-1 for `ReleaseHistoricalRecovery`: every row of the cleanup selector
+/// (`draft_cleanup_decision` with the delete's capability check, and `absent_draft_decision`
+/// with and without `--no-draft-was-posted`) is projected onto the model, whose healthy actions
+/// admit exactly what the code does; the mutants are replayed on the rows the code refuses.
 #[test]
 fn recovery_cleanup_selector_refines_the_historical_recovery_model() {
     let model = release_historical_recovery_model();
@@ -645,12 +614,11 @@ fn recovery_cleanup_selector_refines_the_historical_recovery_model() {
                 "delete authority for {knowledge:?}, visible={visible}, bound={bound}"
             );
             if visible {
-                // A visible draft is never abandoned around: the absent-listing
-                // lane is the only abandon, and it is not this one.
+                // A visible draft is never abandoned: only the absent-listing lane abandons.
                 assert!(!model.action_enabled("AbandonProvenNoPost", &state));
                 assert!(!model.action_enabled("AbandonOnOperatorNoPostAnswer", &state));
             }
-            // NEGATIVE CONTROLS on the rows the shipping code refuses to delete.
+            // Negative controls on the rows the shipping code refuses to delete.
             if visible && !bound {
                 assert!(!real);
                 if knowledge.is_none() {
@@ -660,9 +628,8 @@ fn recovery_cleanup_selector_refines_the_historical_recovery_model() {
                     unbound_lost_journal = true;
                 }
                 if knowledge == Some(true) {
-                    // `draft_cleanup_decision` alone says delete here; only the
-                    // capability check refuses, and skipping it deletes someone
-                    // else's draft.
+                    // `draft_cleanup_decision` alone says delete; only the capability check
+                    // refuses, and skipping it deletes someone else's draft.
                     assert_eq!(
                         publish::draft_cleanup_decision(knowledge, visible, bound),
                         publish::DraftCleanupDecision::DeleteIssuedVisible
@@ -678,8 +645,8 @@ fn recovery_cleanup_selector_refines_the_historical_recovery_model() {
     }
     assert!(unbound_lost_journal && unbound_issued);
 
-    // The absent listing: abandon on a journal that proves no POST, or on the
-    // operator's answer for a LOST journal — never over a journal proving one.
+    // The absent listing abandons on a journal proving no POST, or on the operator's answer for
+    // a lost journal, never over a journal proving one.
     for knowledge in [Some(false), Some(true), None] {
         let state = recovery_state(&model, knowledge, false, false);
         for operator_asserts_no_post in [false, true] {
@@ -695,7 +662,7 @@ fn recovery_cleanup_selector_refines_the_historical_recovery_model() {
             );
         }
         match knowledge {
-            // The answer folded into `--old-publisher-stopped`: unlock with no one
+            // Mutant: the answer folded into `--old-publisher-stopped`, unlocking with no one
             // answering for the lost journal.
             None => {
                 let unlocked = buggy.successors("AbandonUnknownAbsent", &state)[0].clone();
@@ -710,9 +677,8 @@ fn recovery_cleanup_selector_refines_the_historical_recovery_model() {
         }
     }
 
-    // The owner's lease is released only after the tag cleanup. The order lives in
-    // `recover_under_fence`, whose every branch runs against GitHub, so it is
-    // asserted as source (the idiom of `every_release_body_post_reads_through_the_bound`).
+    // The owner's lease is released only after the tag cleanup. `recover_under_fence` runs
+    // only against GitHub, so the order is asserted on its source.
     let src = include_str!("../../src/publish.rs");
     let start = src
         .find("fn recover_under_fence(")
@@ -738,10 +704,9 @@ fn recovery_cleanup_selector_refines_the_historical_recovery_model() {
 
 #[test]
 fn curl_transport_preflight_requires_every_no_retry_post_option() {
-    // `--upload-file` is in this set because the asset leg STREAMS: a
-    // batteries-included DMG is over a gigabyte and `--data-binary @file`
-    // buffers it whole (2026-08-19, `out of memory` after a full notarized
-    // build). A curl that cannot stream must fail the preflight, not the upload.
+    // `--upload-file` is required because the asset leg streams: a batteries-included DMG is
+    // over a gigabyte and `--data-binary @file` buffers it whole. A curl that cannot stream
+    // fails the preflight, not the upload.
     let help = "--data-binary --fail-with-body --header --request --retry \
                 --show-error --silent --upload-file --url";
     publish::validate_one_shot_curl_help(help).unwrap();

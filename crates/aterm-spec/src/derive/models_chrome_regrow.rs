@@ -264,6 +264,7 @@ pub fn chrome_regrow_floor_model() -> Model {
 /// host keeps stepping.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
+#[crate::liveness(crate::derive::chrome_regrow_floor_model)]
 pub fn chrome_regrow_floor_liveness() -> Liveness {
     Liveness {
         name: "TheGridRegrows",

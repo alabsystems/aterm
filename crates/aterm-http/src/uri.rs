@@ -4,15 +4,16 @@
 //! Absolute `http`/`https` URL parsing — the slice of RFC 3986 an HTTP client
 //! actually needs, and no more.
 //!
-//! This is deliberately NOT a general URI type. It accepts exactly what the
-//! title-summary worker can be pointed at (an absolute `http://` or `https://`
-//! URL with an optional port and path/query) and rejects everything else, so a
+//! This is deliberately NOT a general URI type. It accepts exactly what a
+//! configured endpoint may be (an absolute `http://` or `https://` URL with an
+//! optional port and path/query) and rejects everything else, so a
 //! malformed or hostile endpoint string fails at parse time rather than
 //! becoming a surprising connection. In particular:
 //!
-//! * userinfo (`user:pass@host`) is REJECTED, not stripped — the endpoint
-//!   policy in `title_summary` already requires credential-free URLs, and a
-//!   parser that silently dropped credentials would make that check vacuous;
+//! * userinfo (`user:pass@host`) is REJECTED, not stripped — an endpoint
+//!   policy that requires credential-free URLs needs the parser to refuse
+//!   them, and a parser that silently dropped credentials would make that
+//!   check vacuous;
 //! * a control character or space anywhere in the string is rejected, so a
 //!   header cannot be smuggled through the request line;
 //! * an empty host is rejected, as is a port that is not a `u16`.
@@ -258,7 +259,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_the_shapes_the_worker_is_pointed_at() {
+    fn parses_a_loopback_and_a_remote_endpoint() {
         let u = Uri::parse("http://127.0.0.1:11434/api/chat").unwrap();
         assert_eq!(u.scheme(), Scheme::Http);
         assert_eq!(u.host(), "127.0.0.1");

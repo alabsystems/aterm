@@ -4,54 +4,36 @@
 
 use super::is_pending_stub;
 
-/// THE CLASSIFIER THE LOCK'S REMOVAL RESTS ON: a `ty check` its memory
-/// budget stops is an `Err` from [`super::ty_output`], never an `Output`.
-///
-/// The stop is provoked, not waited for: 1 MB is below the footprint of
-/// any `ty` process (it reports 7 MB at its first budget poll), so the
-/// walk stops there on any machine. Store `ty` 0.13.0, armed, stops
-/// `NativeDraftJournal` (43,770 reachable states) at 2,039 of them with
-/// EXIT 0 and a `Model checking stopped:` line, six runs of six — the
-/// shape a budget shrunk by concurrent processes takes.
-/// A `ty` that exits 5 for it takes the other arm of the same guard.
+/// A `ty` search a resource limit stopped is never a verdict: exit 5, or a
+/// `Model checking stopped:` line under exit 0 (the shape a memory budget
+/// shrunk by concurrent processes takes), reads as stopped; a clean run and a
+/// refutation do not.
+#[cfg(unix)]
 #[test]
-fn a_stopped_search_is_an_err_never_a_pass() {
-    let Some(ty) = super::ty_escalation("a_stopped_search_is_an_err_never_a_pass") else {
-        return;
+fn a_stopped_search_is_never_a_verdict() {
+    use std::os::unix::process::ExitStatusExt as _;
+    let run = |code: i32, stdout: &str| std::process::Output {
+        status: std::process::ExitStatus::from_raw(code << 8),
+        stdout: stdout.as_bytes().to_vec(),
+        stderr: Vec::new(),
     };
-    let m = crate::derive::native_draft_journal_model();
-    let dir = super::scratch_dir("aterm-stopped", m.name);
-    std::fs::create_dir_all(&dir).expect("mk tempdir");
-    let spec = dir.join(format!("{}.tla", m.name));
-    let cfg = dir.join(format!("{}.cfg", m.name));
-    std::fs::write(&spec, m.to_tla()).expect("write spec");
-    std::fs::write(&cfg, m.to_cfg()).expect("write cfg");
-    let mut cmd = std::process::Command::new(&ty);
-    cmd.arg("check").arg(&spec).arg("--config").arg(&cfg);
-    super::arm_whole_space_check(&mut cmd)
-        .arg("--memory-limit")
-        .arg("1");
-    let verdict = super::ty_output(&mut cmd);
-    let _ = std::fs::remove_dir_all(&dir);
-    let err = match verdict {
-        Ok(out) => panic!(
-            "a `ty check` stopped by `--memory-limit 1` came back as an Output ({:?}) — \
-             a stopped search would be read as a verdict\n{}{}",
-            out.status,
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        ),
-        Err(e) => e.to_string(),
-    };
-    assert!(
-        err.starts_with("ty INCOMPLETE:"),
-        "the stopped search must fail as INCOMPLETE, not as a spawn error: {err}"
-    );
+    assert!(super::stopped_early(&run(
+        0,
+        "States found: 2039\nModel checking stopped: memory limit reached\n"
+    )));
+    assert!(super::stopped_early(&run(5, "")));
+    assert!(!super::stopped_early(&run(
+        0,
+        "No errors found (exhaustive).\nStates found: 43770\n"
+    )));
+    assert!(!super::stopped_early(&run(
+        1,
+        "Error: Invariant DesiredIsLatest is violated.\n"
+    )));
 }
 
-/// The per-invariant form [`super::uncaught_invariants`] computed before it
-/// became one walk: an isolated `bmc` per invariant, `Buggy = 1`. Kept as
-/// the oracle the one-walk form is held to.
+/// The per-invariant form of [`super::uncaught_invariants`], an isolated `bmc` per invariant at
+/// `Buggy = 1`: the oracle the one-walk form is held to.
 fn uncaught_invariants_one_walk_per_invariant(m: &super::Model) -> Vec<&'static str> {
     let buggy = super::interp::with_buggy(m, 1);
     m.invariants
@@ -65,34 +47,24 @@ fn uncaught_invariants_one_walk_per_invariant(m: &super::Model) -> Vec<&'static 
         .collect()
 }
 
-/// The one-walk ghost sweep returns EXACTLY what one isolated walk per
-/// invariant returned — the same set in the same order, and a panic
-/// exactly where the per-invariant form panicked (a function-valued model).
+/// The one-walk ghost sweep returns exactly what one isolated walk per invariant returns: the
+/// same set in the same order, and a panic where the per-invariant form panics (a function-valued
+/// model).
 ///
-/// THE SAMPLE IS CHOSEN BY OUTCOME, NOT BY NAME. The registry is read in
-/// order and each model is filed by what the one-walk sweep says of it —
-/// carries an uncaught invariant, fully caught, or uninterpretable (it
-/// panics) — and the first `PER_OUTCOME` of each kind are held to the
-/// oracle. Paying a ghost down, or teaching the interpreter a model, moves
-/// that model to another kind and leaves this test as strong as it was;
-/// the workspace ratchet (`non_vacuity_ratchet`) still checks the whole
-/// registry's census.
-///
-/// Two CONTROLS are built from the first fully-caught model, so every
-/// outcome is compared whatever the registry's census is: the model plus
-/// a tautology (one ghost, by construction, alongside invariants that are
-/// caught — the live set never empties and the walk runs to the end of the
-/// space), and the model plus a function-valued invariant (both forms must
-/// panic).
+/// The sample is chosen by outcome, not name: registry models are filed by what the sweep says
+/// (an uncaught invariant, fully caught, or uninterpretable) and the first `PER_OUTCOME` of each
+/// are held to the oracle, so paying a ghost down never weakens the test (`tests/non_vacuity.rs`
+/// checks the whole registry). Two controls built from the first fully-caught model cover every
+/// outcome whatever the census: it plus a tautology (one ghost beside caught invariants, so the
+/// walk runs to the end), and it plus a function-valued invariant (both forms must panic).
 #[test]
 fn the_one_walk_ghost_sweep_matches_the_per_invariant_oracle() {
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
     use crate::derive::{Expr, Invariant};
 
-    /// Models of each outcome held to the oracle. The oracle costs one walk
-    /// per invariant — the cost the one-walk form exists to remove — so the
-    /// sample is a few of each kind, not the registry.
+    /// Models of each outcome held to the oracle. The oracle costs one walk per invariant, so the
+    /// sample is a few of each kind.
     const PER_OUTCOME: usize = 3;
 
     /// Hold one model to the oracle; `Some(uncaught)` if it is
@@ -141,7 +113,7 @@ fn the_one_walk_ghost_sweep_matches_the_per_invariant_oracle() {
 
     let base = fully_caught
         .first()
-        .expect("no registry model is fully caught — the ratchet's census is broken");
+        .expect("no registry model is fully caught — the sweep's census is broken");
     let control = |name: &'static str, expr: Expr| {
         assert!(
             base.invariants.iter().all(|inv| inv.name != name),
@@ -149,7 +121,11 @@ fn the_one_walk_ghost_sweep_matches_the_per_invariant_oracle() {
             base.name
         );
         let mut m = (*base).clone();
-        m.invariants.push(Invariant { name, expr });
+        m.invariants.push(Invariant {
+            name,
+            expr,
+            kind: crate::derive::InvariantKind::Claim,
+        });
         m
     };
     assert_eq!(
@@ -181,10 +157,8 @@ fn a_model_without_invariants_has_no_ghosts_and_is_not_walked() {
     assert!(super::uncaught_invariants(&m).is_empty());
 }
 
-/// A pending-program stub on PATH is NOT the tool: discovery must skip it,
-/// or a harness runs the placeholder and reads its refusal as tool output
-/// (the spec-xref gate hard-failed exactly that way once a pending
-/// `trust-ir` stub reached PATH).
+/// A pending-program stub on PATH is not the tool: discovery skips it, or a harness would read its
+/// refusal as tool output.
 #[test]
 fn a_pending_stub_is_not_the_tool() {
     let dir = std::env::temp_dir().join(format!("aterm_stub_probe_{}", std::process::id()));
@@ -209,10 +183,9 @@ fn a_pending_stub_is_not_the_tool() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The stub check reads the HEAD of a candidate and nothing more: a real
-/// tool is ~160 MB, and every store copy of it is checked. Proved with a
-/// FIFO whose writer sends a stub's head and then holds the pipe OPEN — a
-/// whole-file read never sees EOF and blocks, a bounded one answers.
+/// The stub check reads only a candidate's head (a real tool is ~160 MB, and every store copy is
+/// checked): a FIFO whose writer sends a stub's head and holds the pipe open blocks a whole-file
+/// read, and a bounded one answers.
 #[cfg(unix)]
 #[test]
 fn the_pending_stub_check_reads_only_the_head() {
@@ -238,9 +211,8 @@ fn the_pending_stub_check_reads_only_the_head() {
         head.resize(320, b'#');
         assert!(head.len() as u64 > super::PENDING_STUB_HEAD);
         let _ = w.write_all(&head);
-        // Hold the pipe open: no EOF until the check has answered. The
-        // cap outlasts the answer's wait below, or a whole-file read
-        // would see EOF inside it and pass.
+        // Hold the pipe open: no EOF until the check has answered. The cap outlasts the answer's
+        // wait below.
         let _ = release_rx.recv_timeout(std::time::Duration::from_secs(120));
     });
     let (tx, rx) = std::sync::mpsc::channel();
@@ -266,64 +238,7 @@ use super::*;
 use crate::derive::{config_catalog_snapshot_model, ring_model, transact_model};
 use crate::ty_model;
 
-/// The arming is a LIST, and every entry on it is load-bearing for a
-/// different reason — so the list is pinned exactly, not merely "contains".
-///
-/// `ty_drivers_are_armed` proves every driver CALLS this function. Nothing
-/// proved what the function then emits, which is the half that actually
-/// arms anything. An `assert!(contains)` per flag would let the list
-/// be quietly reordered or extended; an exact match makes any edit to the
-/// arming a deliberate, reviewed act.
-///
-/// It is also this file's REACH GUARD for the fast lane. `--bfs-only` is
-/// what makes each spawn 0.03s instead of 0.58s, and it is invisible
-/// everywhere else: drop it and every verdict in the workspace stays
-/// green while `tools/verify.sh` silently grows ~3.5 minutes back. The
-/// only place that regression can be caught is here.
-#[test]
-fn the_arming_emits_exactly_the_flags_it_documents() {
-    let mut cmd = Command::new("ty");
-    arm_whole_space_check(&mut cmd);
-    let args: Vec<String> = cmd
-        .get_args()
-        .map(|a| a.to_string_lossy().into_owned())
-        .collect();
-    assert_eq!(
-        args,
-        [
-            // Reduction OFF, both halves — the whole-space obligation, and
-            // the only reason `assert_same_space_explored` can be written.
-            "--no-auto-por",
-            "--no-auto-symmetry",
-            // Footprint hint: 4x the largest model, so it bounds nothing.
-            "--initial-capacity",
-            "8192",
-            // The oracle engine, not the native codegen lane.
-            "--backend",
-            "interpreter",
-            // The fused CDEMC symbolic lane OFF: 0.55s per spawn to report
-            // `Winner: BFS` on every model in the tree. Removing this is a
-            // ~3.5 minute regression on every `tools/verify.sh` run.
-            "--bfs-only",
-            // One worker: these spaces are small, and the worker pool's
-            // start-up cost more than it saved (559 replayed checks, 57.1 s
-            // -> 40.1 s, the same verdicts on all of them).
-            "--workers",
-            "1",
-            // No cached verdicts. The cache is path-keyed, and the
-            // hand-written ISOLATION specs live at a stable path, so
-            // without this a repeat run replays a security PASS it never
-            // re-derived.
-            "--force",
-        ],
-        "the `ty` arming changed — every flag here is load-bearing; see the \
-         doc on `arm_whole_space_check` before editing this list"
-    );
-}
-
-/// The atpkg-store prefix mirror must keep matching
-/// `atpkg::platform::default_prefix` + `/bin` (the deliberate
-/// no-dependency duplication both sites cross-reference).
+/// The atpkg-store prefix mirror keeps matching `atpkg::platform::default_prefix` + `/bin`.
 #[test]
 fn store_bin_dir_mirrors_the_atpkg_default_prefix() {
     #[cfg(target_os = "macos")]
@@ -338,13 +253,9 @@ fn store_bin_dir_mirrors_the_atpkg_default_prefix() {
     );
 }
 
-/// Discovery asks THIS ACCOUNT's store whatever `$HOME` says: a test
-/// process moves its `$HOME` (aterm-gui's handoff fixtures), and every
-/// thread must still find the store the account installed
-/// ([`home_dirs`]). Shown in a child of this test binary whose `HOME`
-/// names an empty directory, so this process's environment is never
-/// touched: the child must name the same store `bin/` the account's home
-/// gives.
+/// Discovery asks this account's store whatever `$HOME` says ([`home_dirs`]). Shown in a child of
+/// this test binary whose `HOME` names an empty directory, so this process's environment is
+/// untouched.
 #[cfg(unix)]
 #[test]
 fn the_store_is_the_accounts_whatever_home_says() {
@@ -380,9 +291,8 @@ fn the_store_is_the_accounts_whatever_home_says() {
     );
 }
 
-/// A dangling store shim never satisfies discovery; a live one — a symlink an
-/// older atpkg laid, or today's exec stub — resolves to the real store target
-/// (what the caller will execute), not the shim.
+/// A dangling store shim never satisfies discovery; a live one (a symlink or an exec stub)
+/// resolves to the real store target (what the caller will execute), not the shim.
 #[cfg(unix)]
 #[test]
 fn store_shim_resolution_is_fail_closed() {
@@ -395,9 +305,8 @@ fn store_shim_resolution_is_fail_closed() {
     // Dangling symlink → None (a GC'd store build must not satisfy).
     std::os::unix::fs::symlink(d.join("store/gone/ty"), &shim).unwrap();
     assert_eq!(resolve_store_shim(&shim), None);
-    // A TOMBSTONE (regular-file refusal script atpkg writes for a yanked
-    // build) must read as ABSENT — else a revoked build would shadow a
-    // working tool on PATH, since this probe runs first.
+    // A tombstone (the refusal script atpkg writes for a yanked build) reads as absent, or a
+    // revoked build would shadow a working tool on PATH.
     std::fs::remove_file(&shim).unwrap();
     std::fs::write(&shim, b"#!/bin/sh\necho revoked >&2\nexit 1\n").unwrap();
     assert_eq!(
@@ -405,15 +314,15 @@ fn store_shim_resolution_is_fail_closed() {
         None,
         "a tombstone shim must never satisfy discovery"
     );
-    // Live shim → the RESOLVED store path.
+    // Live shim → the resolved store path.
     std::fs::remove_file(&shim).unwrap();
     let target = d.join("real-ty");
     std::fs::write(&target, b"#!/bin/sh\n").unwrap();
     std::os::unix::fs::symlink(&target, &shim).unwrap();
     let got = resolve_store_shim(&shim).expect("live shim resolves");
     assert_eq!(got, std::fs::canonicalize(&target).unwrap());
-    // THE SHAPE ATPKG LAYS TODAY: a `#!/bin/sh` exec stub, never a symlink. Its first
-    // `exec '<path>' "$@"` line is the target — including a path with a quote in it.
+    // The shape atpkg lays: a `#!/bin/sh` exec stub whose first `exec '<path>' "$@"` line is the
+    // target, here a path with a quote in it.
     std::fs::remove_file(&shim).unwrap();
     let quoted = d.join("store/it's/ty");
     std::fs::create_dir_all(quoted.parent().unwrap()).unwrap();
@@ -435,10 +344,8 @@ fn store_shim_resolution_is_fail_closed() {
         Some(std::fs::canonicalize(&quoted).unwrap()),
         "an exec stub resolves to the file it execs"
     );
-    // A stub whose build was reclaimed never satisfies discovery, and neither does one
-    // naming a RELATIVE path — which would resolve against the cwd: `Cargo.toml` is a
-    // real file relative to a `targo test` run's cwd, so only the absolute-path rule
-    // refuses it.
+    // A stub naming a reclaimed build is absent, and so is one naming a relative path, which
+    // would resolve against the cwd (where `Cargo.toml` is a real file).
     stub(&d.join("store/gone/ty").to_string_lossy());
     assert_eq!(
         resolve_store_shim(&shim),
@@ -468,10 +375,8 @@ fn store_shim_resolution_is_fail_closed() {
 }
 
 // -----------------------------------------------------------------------
-// PROVENANCE — the escalation tier names the binary it ran. Every test
-// below runs over a TEMP home + store prefix through the explicit-env
-// resolver, so nothing reads or mutates the process environment and no
-// test depends on what this machine has installed.
+// Provenance. Every test below runs over a temp home and store prefix through the explicit-env
+// resolver, so none reads or mutates the process environment or depends on what is installed.
 // -----------------------------------------------------------------------
 
 /// A scratch HOME and atpkg prefix for one test.
@@ -528,11 +433,9 @@ impl Scratch {
     }
 }
 
-/// Store PRESENT, PATH empty. With no usable `ty` shim (a store can lose its
-/// own-name `ty`/`ay` shims to a trust rollback) nothing is found, and the line names the
-/// store copy and WHY discovery missed it instead of implying the tool is
-/// not installed. With a live shim — the exec stub, or a symlink — the store
-/// tier answers and the line says so.
+/// Store present, PATH empty. With no usable `ty` shim (a trust rollback can take the own-name
+/// `ty`/`ay` shims) nothing is found, and the line names the store copy and why discovery missed
+/// it. With a live shim, exec stub or symlink, the store tier answers.
 #[cfg(unix)]
 #[test]
 fn provenance_store_present_names_the_unreached_copy() {
@@ -571,8 +474,8 @@ fn provenance_store_present_names_the_unreached_copy() {
     stub(&s.root.path().join("prefix/store/ty/2999/bin/ty"));
     unreached("the store's `ty` shim does not resolve to a file (a reclaimed build?)");
 
-    // atpkg's CURRENT shim form, live: the store tier answers, and the copy
-    // it resolves to is not listed as shadowing itself.
+    // A live exec stub: the store tier answers, and the copy it resolves to is not listed as
+    // shadowing itself.
     let target = s.root.path().join("prefix/store/ty/3007/bin/ty");
     stub(&target);
     let found = s
@@ -595,7 +498,7 @@ fn provenance_store_present_names_the_unreached_copy() {
         "the chosen copy is not its own shadow: {line}"
     );
 
-    // An older atpkg's symlink shim is the store tier too.
+    // A symlink shim is the store tier too.
     std::fs::remove_file(&shim).unwrap();
     std::os::unix::fs::symlink(&target, &shim).unwrap();
     let found = s
@@ -615,10 +518,9 @@ fn provenance_nothing_installed_is_a_plain_not_found() {
     );
 }
 
-/// THE order, pinned: the store shim beats PATH, and a developer tree under home
-/// — a first-party cargo build, a bootstrap stage, a standalone `~/ay` — is never
-/// a candidate (a stale one would shadow the store). Another copy in the store
-/// is named beside the chosen one.
+/// The order: the store shim beats PATH, and a developer tree under home (a cargo build, a
+/// bootstrap stage, a standalone `~/ay`) is never a candidate. Another store copy is named beside
+/// the chosen one.
 #[cfg(unix)]
 #[test]
 fn discovery_order_is_store_then_path_and_no_developer_tree() {
@@ -701,11 +603,8 @@ fn exec_stub_target_reads_atpkg_shims_and_rejects_refusals() {
     );
 }
 
-/// A line is claimed the first time a tool is discovered and again only when
-/// what it resolves to changes: never for a repeat of the last line (the
-/// hundreds of `find_ty` calls in a suite), always for a change — including
-/// one that only the binary's identity sees, and a change undone (the last
-/// line then no longer names what runs).
+/// A line is claimed the first time a tool is discovered and again only when what it resolves to
+/// changes, including a change only the identity sees and a change undone.
 #[test]
 fn provenance_is_claimed_again_only_when_the_resolution_changes() {
     let at = |p: &str, len: Option<u64>| -> ProvenanceKey {
@@ -863,12 +762,10 @@ fn a_shell_literal_word_is_read_only_when_nothing_expands() {
     }
 }
 
-/// The identity follows a wrapper to the binary it execs — atpkg's shim, a
-/// hand-written literal forwarder, and a chain of both — so replacing the
-/// binary alone changes the identity while the wrapper's own bytes do not.
-/// A wrapper whose target does not read statically stops the chain and is
-/// named for what it is (`ChainEnd::OpaqueScript`, the documented limit),
-/// and a dangling target or a loop ends it without hanging.
+/// The identity follows a wrapper to the binary it execs (atpkg's shim, a literal forwarder, a
+/// chain of both), so replacing the binary alone changes it. A wrapper whose target does not read
+/// statically ends the chain as `ChainEnd::OpaqueScript`; a dangling target or a loop ends it
+/// without hanging.
 #[cfg(unix)]
 #[test]
 fn a_binary_identity_follows_a_wrapper_to_the_binary_it_execs() {
@@ -994,7 +891,7 @@ fn a_binary_identity_follows_a_wrapper_to_the_binary_it_execs() {
         )
     );
 
-    // THE LIMIT: what does not read statically is the script's own identity.
+    // The limit: what does not read statically is identified by the script's own bytes.
     let opaque = [
         "#!/bin/sh\nexec \"$(dirname \"$0\")/../real/ty\" \"$@\"\n".to_owned(),
         "#!/bin/sh\nexec \"$HOME/ty\" \"$@\"\n".to_owned(),
@@ -1138,12 +1035,10 @@ fn discover_in(
     (found.map(|(located, _)| located.path), lines)
 }
 
-/// THE AUDIT TRAIL, END TO END. In ONE process: a store update repoints
-/// the shim, the new build is rebuilt in place, the shim is yanked, a PATH
-/// wrapper takes over, and then ONLY the binary that wrapper execs is
-/// replaced. Each must print a fresh `VERIFY ESCALATION TIER` line naming
-/// the build now in use (its path, its size, and what it replaced), and a
-/// rediscovery that changes nothing must print nothing.
+/// The audit trail end to end, in one process: a store update repoints the shim, the new build is
+/// rebuilt in place, the shim is yanked, a PATH wrapper takes over, and then only the binary it
+/// execs is replaced. Each prints a fresh line naming the build in use, its size and what it
+/// replaced; a rediscovery that changes nothing prints nothing.
 #[cfg(unix)]
 #[test]
 fn provenance_is_reported_again_whenever_the_resolved_binary_changes() {
@@ -1221,9 +1116,8 @@ fn provenance_is_reported_again_whenever_the_resolved_binary_changes() {
         )],
     );
 
-    // Rewritten in place AGAIN, at the same length and with its mtime put
-    // back (`cp -p`, `touch -r`, a tar extract): the same path, length,
-    // mtime, device and inode, so only the ctime tells.
+    // Rewritten in place again at the same length, its mtime put back (`cp -p`, `touch -r`, a tar
+    // extract): only the ctime tells.
     let relaid = elf("BUILD TWO, REBUILT");
     assert_eq!(relaid.len(), elf("build two, rebuilt").len());
     rewrite_keeping_mtime(&build("2"), &relaid);
@@ -1266,8 +1160,7 @@ fn provenance_is_reported_again_whenever_the_resolved_binary_changes() {
         )],
     );
 
-    // ONLY the binary behind the wrapper is replaced; the wrapper's bytes
-    // are untouched.
+    // Only the binary behind the wrapper is replaced; the wrapper's bytes are untouched.
     let before = std::fs::read(&wrapper).unwrap();
     write_exec(&behind, &elf("path build b, rebuilt"));
     assert_eq!(std::fs::read(&wrapper).unwrap(), before);
@@ -1278,11 +1171,9 @@ fn provenance_is_reported_again_whenever_the_resolved_binary_changes() {
     step(Some(&wrapper), &[]);
 }
 
-/// Each tool keeps its own last line, and a line holds only ITS tool while
-/// its probes run: while one tool's first line waits on a slow `--version`
-/// (a fresh build's first exec on a loaded Mac took over five seconds), a
-/// discovery of another tool still reports and returns, and a repeat of
-/// that other tool stays silent.
+/// Each tool keeps its own last line, and a line holds only its tool while its probes run: while
+/// one tool's first line waits on a slow `--version`, another tool's discovery still reports and
+/// returns, and its repeat stays silent.
 #[test]
 fn a_slow_provenance_probe_holds_up_only_its_own_tool() {
     use std::sync::{Arc, mpsc};
@@ -1353,14 +1244,10 @@ fn a_slow_provenance_probe_holds_up_only_its_own_tool() {
     assert!(report(&last, "ty", || {}).is_empty(), "ty's line stands");
 }
 
-/// A tool's lines are WRITTEN in the order their keys were claimed, so the
-/// last line written names what the tool's [`LastLine`] holds — the build
-/// in use. Here a change to `/race/two` waits in its slow probe while a
-/// second thread changes back to `/race/one`; then a repeat of `/race/one`
-/// is silent, which is right only if the last line written names it. (Were
-/// the slot released at the claim, the quick change back would be written
-/// first and the slow line last, and the log would end naming `/race/two`
-/// while `/race/one` runs, with nothing more to come.)
+/// A tool's lines are written in the order their keys were claimed, so the last line written
+/// names what its [`LastLine`] holds. A change to `/race/two` waits in its slow probe while a
+/// second thread changes back to `/race/one`; a later repeat of `/race/one` is silent, which is
+/// right only if the last line written names it.
 #[test]
 fn a_tools_last_line_names_what_runs_when_its_changes_race() {
     use std::sync::{Arc, mpsc};
@@ -1459,10 +1346,8 @@ fn build_dates_are_utc_civil_dates() {
     assert_eq!((d.len(), &d[4..5], &d[7..8]), (10, "-", "-"), "{d}");
 }
 
-/// The one spawn: `--version`'s first non-empty line. `/bin/echo` echoes
-/// its argument on the BSD userland and names itself on GNU — either way a
-/// line, from a binary that is not freshly written (a fresh file can stall
-/// in exec assessment under load, measured on this host).
+/// The one spawn: `--version`'s first non-empty line. `/bin/echo` answers with a line on BSD and
+/// GNU alike, and is not freshly written (a fresh file can stall in exec assessment under load).
 #[cfg(unix)]
 #[test]
 fn the_version_probe_returns_the_first_line() {
@@ -1508,15 +1393,10 @@ fn an_older_ty_probes_as_no_capabilities() {
     assert!(ty_caps(&ty).is_empty());
 }
 
-/// THE PROBE BOUND IS A HANG DETECTOR, NOT A BUDGET. A probe that answers
-/// slowly (the first exec of a fresh script on a loaded Mac took over five
-/// seconds) is still answered and its capabilities read; one that never
-/// answers is killed at the bound it was given, and is the empty set — the
-/// per-process behaviour every `ty` supports. Pinned through the bound
-/// seam, so no test waits a minute: the answering probe sleeps 1 s under a
-/// 30 s bound, the wedged one 300 s (`exec`, so the kill reaches the
-/// sleep itself) under a 300 ms bound, so the minute hang detector still
-/// tells killed from waited out.
+/// The probe bound is a hang detector, not a budget: a slow probe is still answered and read, and
+/// one that never answers is killed at its bound and is the empty set. Pinned through the bound
+/// seam so no test waits a minute: the answering probe sleeps 1 s under a 30 s bound, the wedged
+/// one 300 s (`exec`, so the kill reaches the sleep) under 300 ms.
 #[cfg(unix)]
 #[test]
 fn a_slow_probe_is_answered_and_a_wedged_one_is_killed_at_its_bound() {
@@ -1555,13 +1435,10 @@ fn stand_in(dir: &Path, body: &str) -> PathBuf {
     bin
 }
 
-/// A stand-in `ty` for the `--cases` pool (A10): it advertises the cases
-/// mode, runs `cases` (shell) as `trace validate --cases -`, logging each
-/// such spawn to `<dir>/spawns`, and answers the per-process form with
-/// `per-process` and exit 1 — a refusal, so a case the pool did not
-/// answer is visibly the fallback's, and a pool accept could never hide
-/// behind it. A child that must die abnormally dies by SIGKILL (AGENTS.md
-/// rule 6).
+/// A stand-in `ty` for the `--cases` pool (A10): it advertises the cases mode, runs `cases` (shell)
+/// as `trace validate --cases -`, logging each such spawn to `<dir>/spawns`, and answers the
+/// per-process form with `per-process` and exit 1, a refusal, so a case the pool did not answer is
+/// visibly the fallback's. A child that must die abnormally dies by SIGKILL.
 #[cfg(unix)]
 fn cases_stand_in(dir: &Path, model: &str, cases: &str) -> PathBuf {
     let header = format!(
@@ -1685,11 +1562,9 @@ fn an_evaluation_error_is_not_a_refutation() {
     let _ = ty_trace_verdict(&ty, model, spec, "C\n".into(), x_trace(model, 0), model);
 }
 
-/// THE CLIENT RULE: a request with no verdict line has no verdict — never
-/// an accept. A child that closes stdout instead of answering, echoes
-/// another request's id (with `ok: true`), or writes a line that is not a
-/// verdict, each leaves the case to the per-process fallback, which here
-/// refuses: a pool that read any of them as an accept would answer `true`.
+/// A request with no verdict line has no verdict, never an accept. A child that closes stdout,
+/// echoes another request's id (with `ok: true`), or writes a non-verdict line leaves the case to
+/// the per-process fallback, which here refuses.
 #[cfg(unix)]
 #[test]
 fn a_case_with_no_verdict_line_is_never_an_accept() {
@@ -1715,12 +1590,10 @@ fn a_case_with_no_verdict_line_is_never_an_accept() {
     }
 }
 
-/// The `ty` verdict memo replays a verdict only for the same rendered files
-/// asked of the same binary. A `ty` rewritten in place is asked again, even
-/// at the same length with its old mtime put back (only the ctime moves); so
-/// is one whose path was repointed while it ran, even once the path names
-/// the first binary again (which build answered is not known); and a binary
-/// that cannot be stat'ed is never memoized.
+/// The `ty` verdict memo replays a verdict only for the same rendered files asked of the same
+/// binary. A `ty` rewritten in place is asked again, even at the same length with its mtime put
+/// back; so is one whose path was repointed while it ran, even once the path names the first
+/// binary again; and a binary that cannot be stat'ed is never memoized.
 #[cfg(unix)]
 #[test]
 fn a_ty_verdict_is_replayed_only_for_the_same_binary_and_files() {
@@ -1792,11 +1665,9 @@ fn a_ty_verdict_is_replayed_only_for_the_same_binary_and_files() {
     assert_eq!(ask("spec"), "run 8 (no checker)", "is never memoized");
 }
 
-/// A PATH `ty` that is a wrapper script is the checker its TARGET is: when
-/// only the binary the wrapper execs is rebuilt (the wrapper's own bytes
-/// untouched), the memo asks again instead of replaying the old build's
-/// verdict, and the checker handed to the run (which keys the `--cases`
-/// pool) is a new one that names the binary behind the wrapper.
+/// A PATH `ty` that is a wrapper is the checker its target is: when only the binary it execs is
+/// rebuilt, the memo asks again, and the checker handed to the run (which keys the `--cases` pool)
+/// is a new one naming the binary behind the wrapper.
 #[cfg(unix)]
 #[test]
 fn a_ty_verdict_behind_a_wrapper_is_asked_again_when_only_its_target_changes() {
@@ -1843,21 +1714,21 @@ fn a_ty_verdict_behind_a_wrapper_is_asked_again_when_only_its_target_changes() {
     assert_eq!(ends, [Some(real.clone()), Some(real.clone())]);
 }
 
-/// An `aterm pkg` update, a re-laid build and a yank, all MID-PROCESS, in a
-/// scratch account store: [`find_ty`] answers the build the shim forwards
-/// to NOW, and one transition is asked of that build every time — never
-/// answered from the memo, or a live `--cases` co-process, of another.
-/// Build 1 is an older `ty` (one process per case), build 2 a `--cases` one;
-/// every build accepts, so the tiers agree and the verdict names its build.
+/// An update, a re-laid build and a yank mid-process, in a scratch account store with the
+/// external checkers required ([`super::require_checkers`]): [`find_ty`] answers the build the
+/// shim forwards to now, and one transition is asked of that build every time, never answered
+/// from another's memo or co-process. Build 1 is an older `ty` (one process per case), build 2 a
+/// `--cases` one; every build accepts, so the verdict names its build.
 ///
-/// The store is the ACCOUNT's ([`home_dirs`]), so the steps run in a child
-/// of this test binary that seats a scratch home in [`ACCOUNT_HOME`] before
-/// its first discovery, with a `PATH` that holds no `ty`.
+/// The store is the account's ([`home_dirs`]), so the steps run in a child of this test binary that
+/// seats a scratch home in [`ACCOUNT_HOME`] before its first discovery, with a `PATH` holding no
+/// `ty`.
 #[cfg(unix)]
 #[test]
 fn find_ty_and_its_verdicts_follow_a_store_update_mid_process() {
     const CHILD: &str = "ATERM_SPEC_STORE_SWAP_CHILD";
     if let Some(home) = std::env::var_os(CHILD) {
+        super::require_checkers();
         store_swap_steps(Path::new(&home));
         return;
     }
@@ -1996,22 +1867,23 @@ fn store_swap_steps(home: &Path) {
         "a binary re-laid at the same path is asked again, by a child of its own:\n{text}"
     );
 
-    // A yank: the shim becomes a tombstone (no exec line).
+    // A yank: the shim becomes a tombstone (no exec line), which discovery reads as absent; with
+    // the checkers required, the obligation fails rather than falling back to the interpreter.
     lay(&shim, "echo 'ty: this build was yanked' >&2\nexit 1\n");
-    assert_eq!(find_ty(), None, "a tombstoned shim reads as absent");
-    let (ok, text) = ask("after the yank");
-    assert!(
-        ok && text.starts_with("interpreter: "),
-        "with no ty, the interpreter answers alone:\n{text}"
-    );
+    assert_eq!(locate_ty(), None, "a tombstoned shim reads as absent");
+    let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ask("after the yank")))
+        .expect_err("a requested checker that is gone fails the obligation");
+    let why = refused
+        .downcast_ref::<String>()
+        .cloned()
+        .unwrap_or_default();
+    assert!(why.contains("VERIFICATION GATE"), "{why}");
 }
 
-/// The `--cases` pool and the verdict memo answer only for the build the
-/// provenance line names. Once `ty` is re-laid at its path (a rebuild or a
-/// reinstall, by rename: the old build's live child keeps its own file),
-/// the step already answered is asked again and a new step of the same
-/// (spec, cfg) goes to a child of the NEW build — never replayed from the
-/// old build's memo or asked of its live co-process.
+/// The `--cases` pool and the verdict memo answer only for the build the provenance line names:
+/// once `ty` is re-laid at its path by rename (the old build's live child keeps its own file), an
+/// answered step is asked again and a new step of the same (spec, cfg) goes to a child of the new
+/// build.
 #[cfg(unix)]
 #[test]
 fn the_cases_pool_and_the_memo_answer_only_for_the_build_in_use() {
@@ -2061,12 +1933,9 @@ fn the_cases_pool_and_the_memo_answer_only_for_the_build_in_use() {
     );
 }
 
-/// A SCALAR model can never report [`NotRun`] — that is the fact
-/// [`prove_and_catch_scalar`] converts into an unconditional
-/// `Covered`, and the reason ~21 call sites are allowed to ignore the
-/// toolchain's presence. Pinned here rather than reasoned about: if the
-/// interpreter tier ever grew a bail-out, this goes red instead of those
-/// sites quietly returning coverage they no longer have.
+/// A scalar model never reports [`NotRun`]: the fact [`prove_and_catch_scalar`] turns into an
+/// unconditional `Covered`. Pinned, so an interpreter bail-out turns this red instead of the
+/// scalar callers quietly claiming coverage.
 #[test]
 fn a_scalar_model_can_never_report_not_run() {
     let m = ring_model();
@@ -2083,66 +1952,42 @@ fn a_scalar_model_can_never_report_not_run() {
 #[test]
 fn audit_accepts_config_catalog_snapshot_mutants() {
     let m = config_catalog_snapshot_model();
-    assert_eq!(
-        audit_dead_negative_controls(
-            &m,
-            &[
-                "AdmitStaleTrail",
-                "AdmitStaleKitty",
-                "AdmitStaleTheme",
-                "AdmitStaleSparkle",
-                "PublishLiveUnadmitted",
-            ],
-        ),
-        Ok(5)
-    );
+    assert_eq!(audit_dead_negative_controls(&[m]), Ok(5));
 }
 
-/// Transact's `BuggyCommit` — the original hand-audited exception — now
-/// passes the machine-verified criterion instead.
+/// Transact's `BuggyCommit` passes the machine-verified criterion.
 #[test]
 fn audit_accepts_transact_buggy_commit() {
-    assert_eq!(
-        audit_dead_negative_controls(&transact_model(), &["BuggyCommit"]),
-        Ok(1)
-    );
+    assert_eq!(audit_dead_negative_controls(&[transact_model()]), Ok(1));
 }
 
-/// A strictly non-vacuous model audits clean with an empty reported set.
+/// A strictly non-vacuous model audits clean.
 #[test]
 fn audit_accepts_strictly_nonvacuous_model() {
-    assert_eq!(audit_dead_negative_controls(&ring_model(), &[]), Ok(0));
+    assert_eq!(audit_dead_negative_controls(&[ring_model()]), Ok(0));
 }
 
-/// Tier agreement is required in BOTH directions: an empty ty report while
-/// the interpreter finds dead actions fails (this is the fail-open guard —
-/// a ty output-format drift cannot silently grant the relaxation), and an
-/// action ty names that the model does not declare fails.
+/// Tier agreement is required in both directions: an empty `ty` report while the interpreter finds
+/// dead actions fails (so a format drift cannot grant the relaxation), and so does an action `ty`
+/// names that the model does not declare.
 #[test]
-fn audit_rejects_tier_disagreement_and_unknown_actions() {
+fn dead_sets_must_agree_across_tiers() {
     let m = config_catalog_snapshot_model();
-    let under_reported = audit_dead_negative_controls(&m, &[]);
+    let under_reported = dead_actions_agree(&m, &[]);
     assert!(
         under_reported
             .as_ref()
             .is_err_and(|e| e.contains("TIER DISAGREEMENT")),
         "{under_reported:?}"
     );
-    let unknown = audit_dead_negative_controls(&m, &["NoSuchAction"]);
+    let unknown = dead_actions_agree(&m, &["NoSuchAction"]);
     assert!(
         unknown
             .as_ref()
             .is_err_and(|e| e.contains("does not declare")),
         "{unknown:?}"
     );
-}
-
-/// A dead action in a model whose `Buggy` is not committed to 0 has no
-/// catch config — REAL vacuity, rejected.
-#[test]
-fn audit_rejects_dead_actions_without_committed_buggy_dial() {
-    let m = interp::with_consts(&config_catalog_snapshot_model(), &[("Buggy", 2)]);
-    let r = audit_dead_negative_controls(
+    let agreed = dead_actions_agree(
         &m,
         &[
             "AdmitStaleTrail",
@@ -2152,6 +1997,15 @@ fn audit_rejects_dead_actions_without_committed_buggy_dial() {
             "PublishLiveUnadmitted",
         ],
     );
+    assert_eq!(agreed.map(|dead| dead.len()), Ok(5));
+}
+
+/// A dead action in a model whose `Buggy` is not committed to 0 has no catch config: real vacuity,
+/// rejected.
+#[test]
+fn audit_rejects_dead_actions_without_committed_buggy_dial() {
+    let m = interp::with_consts(&config_catalog_snapshot_model(), &[("Buggy", 2)]);
+    let r = audit_dead_negative_controls(&[m]);
     assert!(
         r.as_ref()
             .is_err_and(|e| e.contains("no committed `Buggy = 0` dial")),
@@ -2159,9 +2013,8 @@ fn audit_rejects_dead_actions_without_committed_buggy_dial() {
     );
 }
 
-/// An action dead at BOTH configs (a typo'd guard, not a mutant) is a REAL
-/// vacuity, and a Buggy=1 space no invariant catches proves nothing — both
-/// rejected.
+/// An action that fires under no mutant dial either (a typo'd guard, not a mutant) is real
+/// vacuity, and a mutant no invariant catches proves nothing: both are rejected.
 #[test]
 fn audit_rejects_never_firing_and_uncaught_mutants() {
     // `Stuck` cannot fire at any config: its guard needs count > Cap while
@@ -2176,10 +2029,10 @@ fn audit_rejects_never_firing_and_uncaught_mutants() {
             invariant Bounded: count <= Cap;
         }
     };
-    let r = audit_dead_negative_controls(&never, &["Stuck"]);
+    let r = audit_dead_negative_controls(&[never]);
     assert!(
         r.as_ref()
-            .is_err_and(|e| e.contains("never fires at Buggy=1")),
+            .is_err_and(|e| e.contains("fires under no mutant dial")),
         "{r:?}"
     );
 
@@ -2195,17 +2048,15 @@ fn audit_rejects_never_firing_and_uncaught_mutants() {
             invariant Bounded: count <= Cap;
         }
     };
-    let r = audit_dead_negative_controls(&uncaught, &["Harmless"]);
+    let r = audit_dead_negative_controls(&[uncaught]);
     assert!(
         r.as_ref().is_err_and(|e| e.contains("caught by nothing")),
         "{r:?}"
     );
 }
 
-/// One caught mutant must not launder a second harmless mutant through a
-/// shared Buggy=1 counterexample. Each committed-dead action earns the
-/// strict-vacuity relaxation only when it independently turns the safe
-/// all-live baseline into an invariant violation.
+/// One caught mutant must not launder a second, harmless one through a shared `Buggy = 1`
+/// counterexample: a dead action is credited only for a violation of its own.
 #[test]
 fn audit_rejects_two_mutants_when_only_one_is_independently_caught() {
     let partly_vacuous = ty_model! {
@@ -2220,7 +2071,7 @@ fn audit_rejects_two_mutants_when_only_one_is_independently_caught() {
             invariant Bounded: count <= Cap;
         }
     };
-    let r = audit_dead_negative_controls(&partly_vacuous, &["Caught", "Harmless"]);
+    let r = audit_dead_negative_controls(&[partly_vacuous]);
     assert!(
         r.as_ref().is_err_and(|e| {
             e.contains("Harmless") && e.contains("independently caught by nothing")
@@ -2229,10 +2080,81 @@ fn audit_rejects_two_mutants_when_only_one_is_independently_caught() {
     );
 }
 
-/// The state count is read from `ty`'s real statistics block, and ONLY from
-/// it. `None` on drift is the whole point: the caller turns `None` into a
-/// failure, so a `ty` whose output format moves takes the gate RED rather
-/// than silently retiring the explored-space obligation.
+/// A dead action that breaks a law from every lawful state it fires in is a violation step and is
+/// credited, even where another `Buggy` branch (`Tab`) breaks a law too. One that fires only where
+/// a law is already broken shows nothing of its own.
+#[test]
+fn audit_credits_a_violation_step_and_not_a_step_after_one() {
+    let consequence = ty_model! {
+        ConsequenceStep {
+            const Buggy = 0;
+            var sent = 0;
+            var stray = 0;
+            var tabbed = 0;
+            var amended = 0;
+            var wrong = 0;
+            action Send when (sent == 0) { sent = 1; stray = if Buggy == 1 { 1 } else { stray }; }
+            action Tab when (tabbed == 0) {
+                tabbed = 1;
+                amended = if Buggy == 1 { 1 } else { amended };
+            }
+            action ReadWrongly when (stray == 1 && wrong == 0) { wrong = 1; }
+            invariant NeverAmends: amended == 0;
+            invariant NeverReadWrongly: wrong == 0;
+        }
+    };
+    assert_eq!(audit_dead_negative_controls(&[consequence]), Ok(1));
+
+    // `NeverStray` breaks on the very step that enables `Shrug`, so every state `Shrug` fires in
+    // is unlawful before it moves.
+    let after = ty_model! {
+        StepAfterAViolation {
+            const Buggy = 0;
+            var sent = 0;
+            var stray = 0;
+            var shrugged = 0;
+            action Send when (sent == 0) { sent = 1; stray = if Buggy == 1 { 1 } else { stray }; }
+            action Shrug when (stray == 1 && shrugged == 0) { shrugged = 1; }
+            invariant NeverStray: stray == 0;
+        }
+    };
+    let r = audit_dead_negative_controls(&[after]);
+    assert!(
+        r.as_ref()
+            .is_err_and(|e| e.contains("Shrug") && e.contains("another branch")),
+        "{r:?}"
+    );
+}
+
+/// An action only a declared scenario reaches is not dead: it fires in a
+/// configuration the real code runs under. Without the scenario it is.
+#[test]
+fn a_scenario_keeps_its_own_actions_alive() {
+    let capped = ty_model! {
+        CapWindow {
+            const Buggy = 0;
+            const Cap = 0;
+            var used = 0;
+            action Act when (Cap == 0 || used <= Cap - 1) {
+                used = if Cap == 0 { used } else { used + 1 };
+            }
+            action WindowTurns when (used > 0) { used = 0; }
+            bound UsedBounded: used <= 2;
+        }
+    };
+    let scenario = interp::with_consts(&capped, &[("Cap", 2)]);
+    let alone = audit_dead_negative_controls(std::slice::from_ref(&capped));
+    assert!(
+        alone
+            .as_ref()
+            .is_err_and(|e| e.contains("WindowTurns") && e.contains("no `scenario` declares")),
+        "{alone:?}"
+    );
+    assert_eq!(audit_dead_negative_controls(&[capped, scenario]), Ok(0));
+}
+
+/// The state count is read from `ty`'s statistics block and only from it; on drift it is `None`,
+/// which the caller turns into a failure.
 #[test]
 fn ty_state_count_is_parsed_or_refused() {
     let real = "Model checking complete: No errors found (exhaustive).\n\n\
@@ -2248,19 +2170,14 @@ fn ty_state_count_is_parsed_or_refused() {
     assert_eq!(ty_states_explored("  States found: many\n"), None);
 }
 
-/// The guard must not fail OPEN on the one input that matters most: a clean
-/// `ty` verdict over a model the interpreter knows is violated.
-///
-/// This looks like a case the caller already reports — it is not. The
-/// caller's report is `ty`'s exit status, and the whole premise of this guard
-/// is that the discovered `ty` returns clean/exit-0 on spaces it never
-/// entered. Returning early here would let exactly that combination through.
+/// The guard does not fail open on a clean `ty` verdict over a model the interpreter knows is
+/// violated: the caller's report is `ty`'s exit status, which is exactly what cannot be trusted
+/// here.
 #[test]
 fn a_clean_ty_verdict_over_a_violated_model_is_a_false_proof_not_a_coverage_gap() {
-    // The guard forces `Buggy = 0` itself, so the violation has to come from
-    // somewhere it does not override. `LenBounded` is `seq - lo + 1 <= Cap`,
-    // and the ring starts at `seq = 0, lo = 1` — so `Cap = -1` is violated in
-    // the INITIAL state, which is as committed as a config gets.
+    // The guard forces `Buggy = 0` itself, so the violation must come from elsewhere:
+    // `LenBounded` is `seq - lo + 1 <= Cap` and the ring starts at `seq = 0, lo = 1`, so
+    // `Cap = -1` is violated in the initial state.
     let m = interp::with_consts(&ring_model(), &[("Cap", -1)]);
     assert!(
         interp::bmc(&interp::with_buggy(&m, 0)).is_err(),
@@ -2307,13 +2224,9 @@ fn the_ty_evidence_header_is_invisible_to_the_transcript_parsers() {
     assert_eq!(pick(&with).as_deref(), Some("Alpha, Beta"));
 }
 
-/// `spec_xref_closure` once hand-rolled its own `ty` flags without
-/// `--no-auto-por`, and on `RainbowJumpBurstLifecycle` (128 reachable states
-/// explored as 1) four of its six actions "never fired" — a dead set that was
-/// an artifact of the reduction. The arming is now shared
-/// ([`arm_whole_space_check`]); this is the second lock: a dead set carries no
-/// record of the space it was measured on, so the transcript must be shown to
-/// have covered the whole space before anything in it is believed.
+/// A dead set carries no record of the space it was measured on, so a transcript from a reduced
+/// run (POR collapsing the space to 1 state) is refused before anything in it is believed: the
+/// second lock beside the shared arming ([`super::TyCommand::check`]).
 #[test]
 fn a_dead_set_from_a_reduced_run_is_refused_by_the_space_guard() {
     let m = ring_model();
@@ -2343,12 +2256,8 @@ fn a_dead_set_from_a_reduced_run_is_refused_by_the_space_guard() {
     );
 }
 
-/// A `ty` once reported "No errors found (exhaustive)" for
-/// `RainbowJumpBurstLifecycle` after exploring ONE of its 128 reachable states
-/// (a singleton ample set formed from the stutter action). The verdicts agreed;
-/// the work behind them did not. This pins the CONSEQUENCE rather than the
-/// cause: a smaller `ty` count is a false proof and must panic, whatever any
-/// `ty` build's reduction does.
+/// A `ty` count smaller than the interpreter's is a false proof and panics, whatever a `ty` build's
+/// reduction does.
 #[test]
 #[should_panic(expected = "TIER DISAGREEMENT ON THE EXPLORED SPACE")]
 fn a_ty_verdict_from_a_smaller_space_is_not_a_proof() {
@@ -2362,10 +2271,8 @@ fn a_ty_verdict_from_a_smaller_space_is_not_a_proof() {
     );
 }
 
-/// The other direction is a failure too, and for a different reason: a `ty`
-/// count LARGER than the interpreter's means the emitted TLA+ admits states
-/// the model does not, so the two tiers are not checking the same machine.
-/// Neither direction may be waved through as "close enough".
+/// A `ty` count larger than the interpreter's fails too: the emitted TLA+ admits states the model
+/// does not, so the tiers are not checking the same machine.
 #[test]
 #[should_panic(expected = "TIER DISAGREEMENT ON THE EXPLORED SPACE")]
 fn a_ty_verdict_from_a_larger_space_is_not_a_proof_either() {

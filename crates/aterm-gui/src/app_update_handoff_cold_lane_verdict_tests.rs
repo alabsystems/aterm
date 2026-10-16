@@ -13,7 +13,7 @@ fn artifact() -> String {
     "ab".repeat(32)
 }
 
-/// The boot swap's step-5 refusal, spelled as `install_location_refusal` spells it.
+/// The boot swap's step-5 refusal, as aterm-update's `install_location_refusal` spells it.
 fn install_location_refusal() -> String {
     format!(
         "{}: /Applications/aterm.app; this install cannot update itself",
@@ -64,8 +64,8 @@ fn the_cold_lane_honours_a_cached_refusal_before_it_relaunches() {
         );
     }
 
-    // NEGATIVE CONTROLS: a person's apply is not answered by the cache (the
-    // seamless lane's rule), the QA seam has no artifact, and a pass relaunches.
+    // Negative controls: a person's apply is not answered by the cache (the seamless lane's
+    // rule), the QA seam has no artifact, and a pass relaunches.
     assert!(
         app.cold_lane_verdict_gate(ApplyMode::Immediate, Some(&ticket))
             .is_ok()
@@ -81,8 +81,8 @@ fn the_cold_lane_honours_a_cached_refusal_before_it_relaunches() {
     );
 }
 
-/// No verdict yet: the arm-time read the first attempt outran is waited for —
-/// as activity, bounded — and the attempt after it relaunches under its answer.
+/// No verdict yet: the arm-time read the first attempt outran is waited for (as activity,
+/// bounded) and the attempt after it relaunches under its answer.
 #[test]
 fn the_cold_lane_waits_for_a_verdict_being_read_and_no_longer() {
     let mut app = crate::App::headless_for_test();
@@ -110,8 +110,8 @@ fn the_cold_lane_waits_for_a_verdict_being_read_and_no_longer() {
         app.cold_lane_verdict_gate(ApplyMode::Automatic, Some(&ticket))
             .is_err_and(|error| !error.is_activity_deferred())
     );
-    // …and a read that ended with NOTHING on record (a check that did not
-    // finish) is not waited for: the lane relaunches as it always did.
+    // …and a read that ended with nothing on record (a check that did not finish) is not
+    // waited for: the lane relaunches.
     let other = target.saturating_add(1);
     let ended = ApplyAttemptTicket::for_test(other, COMMIT, &artifact());
     app.handoff_preverify_in_flight = Some(crate::PreverifyInFlight {
@@ -128,20 +128,10 @@ fn the_cold_lane_waits_for_a_verdict_being_read_and_no_longer() {
     );
 }
 
-/// Round eight, S1's second review (P3): a read that ENDED WITHOUT A VERDICT —
-/// the apply lock a stopped sibling holds, past its wait — is never cached as a
-/// verdict, so the cold lane saw nothing, relaunched, and its successor (this
-/// build) waited on the same lock in its boot swap and refused: the window
-/// closed and reopened at every retry of the transient schedule, and every six
-/// hours for good once it converged. Now that read's moment answers the
-/// attempt: a `Failed` with the passing reason, which the synchronous arm books
-/// TRANSIENT (no cached refusal stands behind it, and it is no person's to
-/// clear), and nothing is relaunched. A later attempt's read of the same target
-/// is waited for even once the per-target window is spent, and it is ITS answer
-/// that counts.
-///
-/// RED before: the gate returned `Ok` on the ended read, and the cold arm went
-/// on to write the layout and `exec`.
+/// A read that ended without a verdict (a stopped sibling holding the apply lock past its wait)
+/// answers the attempt with a transient `Failed` carrying the passing reason, and nothing is
+/// relaunched: the successor's boot swap would wait on the same lock. A later read of the same
+/// target is waited for even once the per-target window is spent.
 #[test]
 fn a_read_that_ended_without_a_verdict_answers_the_cold_lane() {
     let mut app = crate::App::headless_for_test();
@@ -191,7 +181,7 @@ fn a_read_that_ended_without_a_verdict_answers_the_cold_lane() {
             "no person's to clear: {message}"
         );
     }
-    // What the synchronous arm books it by: no cached refusal, so TRANSIENT.
+    // What the synchronous arm books it by: no cached refusal, so transient.
     assert_eq!(app.cached_handoff_preverification(&ticket), None);
     assert_eq!(app.cached_handoff_refusal_reason(target), None);
     assert_eq!(
@@ -199,8 +189,8 @@ fn a_read_that_ended_without_a_verdict_answers_the_cold_lane() {
         crate::app_native::PhysicalFailureShape::Transient
     );
 
-    // The next attempt's arm-time read, still running: waited for — as
-    // activity — although the window is spent.
+    // The next attempt's arm-time read, still running, is waited for although the window is
+    // spent.
     let done = Arc::new(AtomicBool::new(false));
     app.handoff_preverify_in_flight = Some(crate::PreverifyInFlight {
         done: Arc::clone(&done),
@@ -219,8 +209,8 @@ fn a_read_that_ended_without_a_verdict_answers_the_cold_lane() {
             .is_ok()
     );
 
-    // NEGATIVE CONTROLS: a passing moment older than a verdict's freshness, and
-    // another artifact's, answer nothing; a person's apply is not answered.
+    // Negative controls: a passing moment older than a verdict's freshness, and another
+    // artifact's, answer nothing; a person's apply is not answered.
     *app.handoff_preverified
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
@@ -244,19 +234,12 @@ fn a_read_that_ended_without_a_verdict_answers_the_cold_lane() {
     );
 }
 
-/// A READ THAT ENDED WAITING FOR AN UPDATE CHECK TO CONFIRM THE STAGE'S SIGNER
-/// IS NO FAILURE OF THE COLD LANE (round eight, #503's review). The successor's
-/// boot swap would wait the same way (gate 4d), so nothing is relaunched; and
-/// the wait lasts until a check reads the machine roster, which no attempt does,
-/// so it is a deferral (activity's error: charged nothing) and not the `Failed`
-/// the synchronous arm books on the transient budget. The automatic lane holds
-/// for the check with its intent kept, due when the hold next asks the stage.
-///
-/// RED before: the read's passing answer was the attempt's `Failed`, booked as a
-/// transient physical failure — 600 s, 1800 s, then a 6 h stand-down.
+/// A read that ended waiting for an update check to confirm the stage's signer defers the cold
+/// lane (charged nothing) instead of relaunching into the boot swap's same wait (gate 4d); the
+/// automatic lane holds for the check with its intent kept.
 #[test]
 fn a_read_waiting_for_a_roster_confirmation_defers_the_cold_lane_and_holds() {
-    // The new hold books its wait as the standing refusal.
+    // The hold books its wait in the update ledger as the standing refusal.
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
     let mut app = crate::App::headless_for_test();
     let target = crate::running_build_number().saturating_add(1);
@@ -318,10 +301,7 @@ fn a_read_waiting_for_a_roster_confirmation_defers_the_cold_lane_and_holds() {
         ),
         "the wait is the standing refusal, not a failure"
     );
-    // A PERSON'S PRESS IS NOT RELAUNCHED INTO IT EITHER (#503's second review):
-    // the successor's gate 4d would wait the same way, so the press closed and
-    // reopened the window and installed nothing. The wait is no verdict on the
-    // bytes, so it binds a person's press too; it re-arms nothing.
+    // A person's press is not relaunched into the wait either, and arms nothing.
     app.auto_apply_intent = None;
     let error = app
         .cold_lane_verdict_gate(ApplyMode::Immediate, Some(&ticket))
@@ -332,11 +312,8 @@ fn a_read_waiting_for_a_roster_confirmation_defers_the_cold_lane_and_holds() {
         "and names the wait: {error}"
     );
     assert_eq!(app.auto_apply_intent, None, "a person's press arms nothing");
-    // A CHECK THAT REPORTED THE STAGE SINCE ends that knowledge: it may have
-    // confirmed the stage, so the read (begun before it) and the hold (answered
-    // before it) answer nothing, and a person's press relaunches into the swap's
-    // own gate. The automatic lane, which would read the stage again, has no
-    // stage to read here and goes on; it never books the stale wait as a failure.
+    // A check that reported the stage since may have confirmed it, so the older read and hold
+    // answer nothing.
     app.roster_wait_check_reported(target);
     assert!(
         app.cold_lane_verdict_gate(ApplyMode::Immediate, Some(&ticket))
@@ -350,13 +327,9 @@ fn a_read_waiting_for_a_roster_confirmation_defers_the_cold_lane_and_holds() {
     );
 }
 
-/// A CACHED REFUSAL THAT IS ONLY THE WAIT FOR A ROSTER CONFIRMATION IS HELD,
-/// NEVER BOOKED (round eight, #503's second review). A refused cold relaunch no
-/// longer seeds the wait as a verdict (`ColdRelaunch::seed`), but whatever puts
-/// one in the cache, the automatic cold lane's `Some(false)` arm used to answer
-/// it with the `Failed` the synchronous arm books on the transient budget. It
-/// holds for the check instead, its intent kept. CONTROL: any other cached
-/// refusal is still the attempt's `Failed`.
+/// A cached refusal that is only the wait for a roster confirmation holds the automatic cold
+/// lane for the check with its intent kept, never a `Failed` on the transient budget; any other
+/// cached refusal is still the attempt's `Failed`.
 #[test]
 fn a_cached_roster_wait_holds_the_cold_lane_and_is_never_its_failure() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -395,7 +368,7 @@ fn a_cached_roster_wait_holds_the_cold_lane_and_is_never_its_failure() {
         "its intent kept, due when the hold asks again"
     );
     assert!(app.auto_apply_manual_only.is_none(), "no latch");
-    // CONTROL: a verdict is still the attempt's failure.
+    // Control: a verdict is still the attempt's failure.
     app.auto_apply_roster_wait = None;
     cache(&app, install_location_refusal());
     let error = app
@@ -425,8 +398,7 @@ fn the_verdict_is_read_before_the_layout_is_written_and_the_process_replaced() {
         .find("aterm_update::exec_keeping_sigpipe(&mut command)")
         .expect("and execs");
     assert!(gate < layout && layout < exec);
-    // …and hands its successor the lane's budget and the relaunch mark (#1's
-    // and #7's reviews), on the command it execs.
+    // …and hands its successor the lane's budget and the relaunch mark on the command it execs.
     let budget = src[arm..]
         .find("bind_cold_lane_budget(")
         .expect("the cold arm carries the budget");
@@ -460,9 +432,9 @@ fn a_refused_cold_relaunch_answers_its_own_first_attempt() {
         running,
     )
     .expect("the cold lane's relaunch of this build");
-    // NEGATIVE CONTROLS: an update that landed (the swap re-exec names the
-    // build it came FROM), a launch with no binding (a person's; the QA seam's
-    // same-image relaunch binds none), a half binding.
+    // Negative controls: an update that landed (the swap re-exec names the build it came
+    // from), a launch with no binding (a person's, or the QA seam's same-image relaunch), a
+    // half binding.
     for (from, build) in [
         (Some("1"), Some(target_text.as_str())),
         (None, Some(target_text.as_str())),
@@ -508,8 +480,8 @@ fn a_refused_cold_relaunch_answers_its_own_first_attempt() {
         assert!(relaunch.seed(&quiet).is_none());
     }
 
-    // The new process's first automatic attempt is answered by it — no
-    // relaunch — and the arm-time read does not replace it with a second one.
+    // The new process's first automatic attempt is answered by it, with no relaunch, and the
+    // arm-time read does not replace it.
     let mut app = crate::App::headless_for_test();
     app.seed_refused_cold_relaunch(seed, Instant::now());
     assert!(
@@ -539,13 +511,9 @@ fn a_refused_cold_relaunch_answers_its_own_first_attempt() {
     ));
 }
 
-/// Round eight, #1's review: the refusal answers the first automatic attempt
-/// HOWEVER LATE IT COMES. The copy in the verdict cache lapses with every
-/// verdict's freshness, and an attempt held back past it (a person typing in a
-/// document tab keeps the automatic lane waiting up to its ladder) found no
-/// verdict and relaunched into the same refusal — unbooked, so the carried
-/// budget never counted it. The refusal is kept apart until an automatic read
-/// takes it, and it answers exactly once. A person's apply does not take it.
+/// A refused cold relaunch answers the first automatic attempt however late it comes, and
+/// exactly once: the refusal outlives the verdict cache's freshness. A person's apply does not
+/// take it.
 #[test]
 fn a_refused_cold_relaunch_answers_a_late_first_attempt_once() {
     use std::ffi::OsStr;
@@ -622,8 +590,7 @@ fn a_refused_cold_relaunch_answers_a_late_first_attempt_once() {
     );
 }
 
-/// Round eight, #1's review: THE BUDGET CROSSES THE `exec` INTACT, for exactly
-/// the artifact it is about.
+/// The cold lane's budget crosses the `exec` intact, for exactly the artifact it is about.
 #[test]
 fn the_cold_lane_budget_round_trips_for_its_own_artifact_only() {
     use super::{CarriedFailures, CarriedVerdict, ColdLaneBudget};
@@ -682,11 +649,9 @@ fn the_cold_lane_budget_round_trips_for_its_own_artifact_only() {
     assert_eq!(seed.dmg_sha256, Some([0xab; 32]));
 }
 
-/// Round eight, #1's review (P4): THE WIRING, pinned where it lives. The launch
-/// reads whether it is the cold lane's relaunch BEFORE the boot apply consumes
-/// the binding, turns the apply's outcome into the seed after it, and hands the
-/// seed to the `App` before the startup reconcile can arm the automatic lane. A
-/// test that builds the seeded `App` by hand stays green without any of it.
+/// The wiring in `main_entry`: the launch reads whether it is the cold lane's relaunch before
+/// the boot apply consumes the binding, turns the apply's outcome into the seed after it, and
+/// hands the seed to the `App` before the startup reconcile can arm the automatic lane.
 #[test]
 fn main_entry_seeds_the_refusal_before_the_lane_can_arm() {
     let src = include_str!("lib.rs");

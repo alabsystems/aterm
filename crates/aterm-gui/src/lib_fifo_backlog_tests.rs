@@ -71,8 +71,7 @@ fn the_two_gates_are_bounded() {
     );
 }
 
-/// Findings 4 and 5 of the review: the panel-rate effect lane only where
-/// the presenter can absorb it.
+/// The panel-rate effect lane runs only where the presenter can absorb it.
 #[test]
 fn panel_rate_needs_a_presenter_that_absorbs_it() {
     assert!(present_queue_admits_panel_rate(PresentQueue::NonBlocking));
@@ -89,8 +88,8 @@ fn panel_rate_needs_a_presenter_that_absorbs_it() {
     assert!(present_queue_admits_panel_rate(PresentQueue::Unknown));
 }
 
-/// A discrete FIFO: frames shown one per vblank, vblanks at
-/// `phase + k * P`. Returns each frame's (present, glass) pair.
+/// A discrete FIFO: frames shown one per vblank, from `first_vblank` every `P`. Returns each
+/// shown frame's present-to-glass latency.
 fn glass_times(presents: &[Instant], first_vblank: Instant, end: Instant) -> Vec<Duration> {
     let mut queue: VecDeque<Instant> = VecDeque::new();
     let mut out = Vec::new();
@@ -109,9 +108,9 @@ fn glass_times(presents: &[Instant], first_vblank: Instant, end: Instant) -> Vec
     out
 }
 
-/// Drive a panel-rate effect train with one echo landing 3 ms after an effect frame,
-/// through the lane's real rules (phase-locked slot, the post-present rebase
-/// `rebase_pending_trail_tick_after_present`, and the drain gate when `yield_to_fifo`).
+/// Drive a panel-rate effect train with one echo landing 3 ms after an effect frame, through the
+/// lane's rules: the phase-locked slot, the post-present rebase (as in
+/// `rebase_pending_trail_tick_after_present`), and the real drain gate when `yield_to_fifo`.
 /// Returns every frame's glass latency, in present order.
 fn run(yield_to_fifo: bool) -> (Vec<Instant>, Vec<Duration>) {
     let t0 = Instant::now();
@@ -132,8 +131,8 @@ fn run(yield_to_fifo: bool) -> (Vec<Instant>, Vec<Duration>) {
             break;
         }
         if content {
-            // The echo's own floor (counted from the last CONTENT present,
-            // long ago here) must not hold it: only one frame is pending.
+            // The echo's own floor (counted from the last content present, long ago here)
+            // must not hold it: only one frame is pending.
             let last_content = t0;
             let floor = content_floor_after_fifo_drain(
                 P / 2,

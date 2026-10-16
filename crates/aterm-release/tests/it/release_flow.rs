@@ -3,20 +3,20 @@
 
 //! `ship release`'s step machine ([`crate::release`]) driven against a fake world: a
 //! scratch release directory (the journal and the run claim are real files), and a
-//! [`Backend`] whose git, engine, receipts, children, clock and owner's aterm are in
+//! [`Backend`] whose git, engine, records, children, clock and owner's aterm are in
 //! memory. What the machine owns is what these tests hold it to: the order, the
 //! skip-by-facts rule, the resume after a stop at each step, the final line's shape,
 //! the dry run, the owner ask while the long steps run, the READY candidate kept, one
-//! run per clone and the re-exec guard.
+//! run per clone and the re-exec guard, and the prepare with its visible half's re-asks.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 use crate::provision::{AskWords, Audited, Finding};
 use crate::release::{
-    AfterCut, Answer, Artifact, Backend, Candidate, CutState, EngineRows, Facts, JOURNAL_FILE,
-    Journal, Prover, RUNNING_CHILD_FILE, RUNNING_FILE, Ran, Refusal, ReleaseOptions, Reservation,
-    Step, run_with,
+    AfterCut, Answer, Artifact, Backend, Beside, Besides, Built, Candidate, CutState, EngineNow,
+    EngineRows, Facts, JOURNAL_FILE, Journal, Prover, RUNNING_CHILD_FILE, RUNNING_FILE, Ran,
+    Refusal, ReleaseOptions, Reservation, Step, run_with,
 };
 use crate::release_steps::Real;
 
@@ -49,15 +49,16 @@ struct World {
     newest: Option<String>,
     cut: Option<CutState>,
     attested: Option<String>,
-    trusted: BTreeSet<String>,
-    /// The executable digests a MEASURE receipt says `measured yes` about.
-    measured: BTreeSet<String>,
+    /// The executable digests a verified record names.
+    verified: BTreeSet<String>,
     /// origin's ledger tail.
     tail: u64,
     /// The release cache: key → (its build number, its executable digest, its app).
     artifacts: BTreeMap<String, (u64, String, PathBuf)>,
     /// The build fails.
     build_fails: bool,
+    /// The L0 censuses find something.
+    census_finds: bool,
     /// A peer's release claims past the reservation as the cut starts — after the
     /// release's last look, before the cut's own claim.
     overtaken_at_cut: bool,
@@ -66,16 +67,18 @@ struct World {
     claim_lands_unjournaled: bool,
     // behaviours
     machine_refusals: Vec<Refusal>,
-    /// The preflight's own blocks (the receipts are the machine's to add).
-    blocks: Vec<(bool, Refusal)>,
+    /// The preflight's own blocks: R's commit-only gates and the engine's readiness.
+    blocks: Vec<Refusal>,
     audits: VecDeque<Vec<Finding>>,
-    trust_code: i32,
-    trust_verifies: bool,
-    pending: Vec<String>,
-    measure_code: i32,
-    measure_measures: bool,
-    measure_starved: bool,
+    verify_code: i32,
+    verify_passes: bool,
+    /// The clone leaves R's tree while `verify release` runs: the backend records nothing.
+    verify_moves: bool,
     stage_stages: bool,
+    /// The publish records R before failing at sign-release.
+    publish_code: i32,
+    /// Commits whose source release carries the signed manifest pair.
+    source_attested: BTreeSet<String>,
     cut_code: i32,
     cut_finishes: bool,
     /// The cut claims a build (else it refused before its claim).
@@ -86,9 +89,9 @@ struct World {
     stage_panics: bool,
     /// The shape check's answer.
     after_cut: Result<String, Refusal>,
-    /// `publish/post-promote --latest`'s exit once the shape passed, read as the real
-    /// backend reads it (`release_steps::site_outcome`).
-    site_code: i32,
+    /// How `ship site --latest` ends once the shape passed, read as the real backend
+    /// reads it (`release_steps::site_outcome`).
+    site: Result<crate::site::Outcome, crate::site::Failure>,
     own_cutter: bool,
     asks: Vec<String>,
     resolved: Vec<String>,
@@ -103,19 +106,17 @@ struct World {
     judge_down: bool,
     /// The engine sync after the stage fails.
     stage_sync_fails: bool,
-    /// The lock is busy when the release takes it again after the owner's wait.
-    relock_busy: bool,
     /// The signal a step's child was ended by, once one arrived.
     signal: Option<i32>,
     /// The step whose child a signal ends.
     signal_at: Option<&'static str>,
-    /// What the world does once the MEASURE run ends.
-    after_measure: Option<fn(&mut World)>,
+    /// What the world does once `verify release` ends.
+    after_verify: Option<fn(&mut World)>,
     /// What the world does while the release next sleeps (an owner wait).
     after_sleep: Option<fn(&mut World)>,
     /// Tags in this clone only (a leftover).
     local_tags: BTreeSet<String>,
-    /// The real backend's spawn path and interrupt, for the trust step's child: that
+    /// The real backend's spawn path and interrupt, for the verify step's child: that
     /// child is `/bin/sh -c <script> sh <dir>`, run as a step's child really is.
     real: Option<(Real, String, PathBuf)>,
     /// The build whose handoff fixtures the release cache holds staged.
@@ -126,6 +127,22 @@ struct World {
     generator_refuses: bool,
     /// The landing's push fails (not a lost race).
     landing_fails: bool,
+    /// The prover the world resolves (TRUST_STAGE2_BIN, the journal's, the store's).
+    prover: Prover,
+    /// The engine's code now, and the engine that staged the attestation in publish/.out.
+    engine: String,
+    staged_by: Option<String>,
+    /// Whether the run claim was still on disk when the PREPARED line was said.
+    running_at_prepared: Option<bool>,
+    /// The stage leaves a step child's note behind, its process gone.
+    child_note_at_stage: bool,
+    /// Origin does not answer `git ls-remote`.
+    ls_remote_down: bool,
+    /// A peer's `pub stage aterm` moved the staging tier's main since R was attested; a
+    /// stage of R attests it as it is again.
+    peer_staged: bool,
+    /// What the world does at each engine sync, in turn (`None`: nothing).
+    after_sync: VecDeque<Option<fn(&mut World)>>,
 }
 
 impl World {
@@ -156,30 +173,29 @@ impl World {
             newest: Some(OLD.into()),
             cut: None,
             attested: None,
-            trusted: BTreeSet::new(),
-            measured: BTreeSet::new(),
+            verified: BTreeSet::new(),
             tail: 1_791_500_000,
             artifacts: BTreeMap::new(),
             build_fails: false,
+            census_finds: false,
             overtaken_at_cut: false,
             claim_lands_unjournaled: false,
             machine_refusals: Vec::new(),
             blocks: Vec::new(),
             audits: VecDeque::new(),
-            trust_code: 0,
-            trust_verifies: true,
-            pending: Vec::new(),
-            measure_code: 0,
-            measure_measures: true,
-            measure_starved: false,
+            verify_code: 0,
+            verify_passes: true,
+            verify_moves: false,
             stage_stages: true,
+            publish_code: 0,
+            source_attested: BTreeSet::new(),
             cut_code: 0,
             cut_finishes: true,
             cut_claims: true,
             latest_lags: false,
             stage_panics: false,
             after_cut: Ok("the release's shape checked".into()),
-            site_code: 0,
+            site: Ok(crate::site::Outcome::Synced { deployed: true }),
             own_cutter: true,
             asks: Vec::new(),
             resolved: Vec::new(),
@@ -189,10 +205,9 @@ impl World {
             cut_gate_refusals: Vec::new(),
             judge_down: false,
             stage_sync_fails: false,
-            relock_busy: false,
             signal: None,
             signal_at: None,
-            after_measure: None,
+            after_verify: None,
             after_sleep: None,
             local_tags: BTreeSet::new(),
             real: None,
@@ -200,7 +215,33 @@ impl World {
             fixtures_on_main: false,
             generator_refuses: false,
             landing_fails: false,
+            prover: prover(),
+            engine: "e7e7e7e7e7".into(),
+            staged_by: None,
+            running_at_prepared: None,
+            child_note_at_stage: false,
+            ls_remote_down: false,
+            peer_staged: false,
+            after_sync: VecDeque::new(),
         }
+    }
+
+    /// The handoff fixture guard's child.
+    fn guard(&mut self) -> Result<String, Refusal> {
+        self.calls.push("guard".into());
+        Ok("the handoff fixture guard passes (3 test(s))".into())
+    }
+
+    /// The L0 censuses' child.
+    fn census(&mut self) -> Result<String, Refusal> {
+        self.calls.push("census".into());
+        if self.census_finds {
+            return Err(Refusal::new(
+                "L0 CENSUS FINDING in /clone — its diagnostics name it",
+                "fix it on main",
+            ));
+        }
+        Ok("the L0 censuses pass".into())
     }
 
     /// A signal arrives while `step`'s child runs: the child ends, the release sees it.
@@ -318,6 +359,9 @@ impl Backend for World {
         }
     }
     fn say(&mut self, line: &str) {
+        if line.starts_with("PREPARED") {
+            self.running_at_prepared = Some(World::release_dir(self).join(RUNNING_FILE).exists());
+        }
         self.out.push(line.to_string());
     }
     fn interrupted(&mut self) -> Option<i32> {
@@ -355,7 +399,7 @@ impl Backend for World {
         ));
     }
     fn prover(&mut self, _journaled: Option<&str>) -> Result<Prover, String> {
-        Ok(prover())
+        Ok(self.prover.clone())
     }
     fn lease(&mut self, _prover: &Prover) {
         self.calls.push("lease".into());
@@ -390,6 +434,9 @@ impl Backend for World {
     }
     fn origin_tag_now(&mut self, tag: &str) -> Result<Option<String>, String> {
         self.calls.push(format!("ls-remote {tag}"));
+        if self.ls_remote_down {
+            return Err("origin did not answer".into());
+        }
         // a finished cut published its version's tag, on the release commit
         if let Some(cut) = self.cut.as_ref().filter(|cut| cut.finished)
             && tag == format!("v{}", cut.version)
@@ -412,6 +459,24 @@ impl Backend for World {
             rev: mine.cloned(),
         }
     }
+    fn engine_now(&mut self, staged: &str) -> Result<EngineNow, String> {
+        self.calls.push("engine-now".into());
+        let now = if staged == self.engine {
+            EngineNow::Same(format!("the engine is the one that staged ({staged})"))
+        } else {
+            EngineNow::Moved(format!(
+                "the engine's code moved since it staged: {staged}..{}",
+                self.engine
+            ))
+        };
+        Ok(now)
+    }
+    fn staging_moved(&mut self) -> Result<Option<String>, String> {
+        self.calls.push("staging-now".into());
+        let why = "the staging tier's main moved since R was attested (555555555..666666666: a \
+                   peer's pub stage), and pub promote refuses that attestation";
+        Ok(self.peer_staged.then(|| why.to_string()))
+    }
     fn cut_journal(&mut self) -> Option<CutState> {
         self.cut.clone()
     }
@@ -420,6 +485,9 @@ impl Backend for World {
     }
     fn sync(&mut self) -> Result<String, Refusal> {
         self.calls.push("sync".into());
+        if let Some(Some(then)) = self.after_sync.pop_front() {
+            then(self);
+        }
         Ok("engine synced".into())
     }
     fn bump(&mut self, _from: &str, to: &str, _prover: &Prover) -> Result<String, Refusal> {
@@ -440,11 +508,14 @@ impl Backend for World {
         self.interrupt_at("move");
         Ok(())
     }
-    fn own_cutter(&mut self, _commit: &str) -> Result<String, String> {
+    fn own_cutter(&mut self, _commit: &str) -> Result<String, crate::cutter::NotOwn> {
         if self.own_cutter {
             Ok("its own".into())
         } else {
-            Err("built from another commit".into())
+            Err(crate::cutter::NotOwn {
+                why: "built from another commit".into(),
+                fix: "the verdict's own remedy".into(),
+            })
         }
     }
     fn reexec(&mut self, _prover: &Prover) -> Refusal {
@@ -474,17 +545,20 @@ impl Backend for World {
             }
             Some(_) => Answer::no("the release cache holds no COMPLETE bundle for it"),
         };
-        let measured = match artifact.filter(|_| built.yes) {
-            None => Answer::no("its bundle is not built yet (step 7)"),
-            Some(a) => yes(&self.measured, "MEASURED", &a.macho_sha256),
+        let verified = match artifact.filter(|_| built.yes) {
+            None => Answer::no("its bundle is not built yet (step 5)"),
+            Some(a) => yes(&self.verified, "PASSED", &a.macho_sha256),
         };
+        // promotable only naming the engine that staged it, as the real reader holds it
+        let attested =
+            self.attested.as_deref() == Some(c.commit.as_str()) && self.staged_by.is_some();
         Facts {
             cut: self.cut.clone(),
             engine: self.engine_rows(Some(&c.commit)),
-            attested: self.attested.as_deref() == Some(c.commit.as_str()),
-            trusted: yes(&self.trusted, "VERIFIED", &c.commit),
+            attested,
+            staged_by: self.staged_by.clone().filter(|_| attested),
             built,
-            measured,
+            verified,
             fixtures: if self.fixtures_on_main {
                 Answer::yes(format!("v{}'s handoff fixtures are on main", c.version))
             } else {
@@ -495,12 +569,12 @@ impl Backend for World {
     fn disk(&mut self) -> (Option<u64>, bool) {
         (Some(self.free), true)
     }
-    fn preflight(&mut self, _c: &Candidate, dry: bool, again: bool) -> Vec<(bool, Refusal)> {
+    fn commit_gates(&mut self, _c: &Candidate, dry: bool) -> Vec<Refusal> {
         self.calls.push(
-            match (dry, again) {
-                (true, _) => "preflight-dry",
-                (false, true) => "preflight-again",
-                (false, false) => "preflight",
+            if dry {
+                "commit-gates-dry"
+            } else {
+                "commit-gates"
             }
             .into(),
         );
@@ -510,9 +584,12 @@ impl Backend for World {
         self.calls.push("cut-gates".into());
         self.cut_gate_refusals.clone()
     }
-    fn fixture_guard(&mut self, _p: &Prover) -> Result<String, Refusal> {
-        self.calls.push("guard".into());
-        Ok("the handoff fixture guard passes (3 test(s))".into())
+    fn stage_beside(&mut self, c: &Candidate, p: &Prover, beside: Beside) -> Besides {
+        Besides {
+            stage: beside.stage.then(|| self.stage(c, p)),
+            guard: beside.guard.then(|| self.guard()),
+            census: beside.census.then(|| self.census()),
+        }
     }
     fn stage_fixtures(
         &mut self,
@@ -588,51 +665,6 @@ impl Backend for World {
         self.withdrawn.push(key.to_string());
         Ok("OK done=7 how=withdrawn".into())
     }
-    fn trust_pending(&mut self, _c: &Candidate, _p: &Prover) -> Vec<String> {
-        self.pending.clone()
-    }
-    fn trust_lane(&mut self, _p: &Prover, remeasure: bool) -> Ran {
-        self.calls.push(
-            if remeasure {
-                "trust --remeasure"
-            } else {
-                "trust"
-            }
-            .into(),
-        );
-        if self.interrupt_at("trust") {
-            return ran(-1);
-        }
-        if let Some((real, script, dir)) = &mut self.real {
-            let mut cmd = std::process::Command::new("/bin/sh");
-            cmd.args(["-c", script.as_str(), "sh"]).arg(dir.as_path());
-            return real.logged(Step::Trust, &mut cmd);
-        }
-        if self.trust_verifies {
-            self.trusted.insert(self.head.clone());
-        }
-        ran(self.trust_code)
-    }
-    fn lock(&mut self, _caller: &str) -> Result<String, Refusal> {
-        self.calls.push("lock".into());
-        // a signal while it waits in line: the wait stops, nothing taken
-        if self.interrupt_at("lock") {
-            return Err(Refusal::new(
-                "stopped waiting for this machine's gate after 3 s — this waiter was interrupted",
-                "wait",
-            )
-            .could_not_run());
-        }
-        if self.relock_busy && self.calls.iter().any(|c| c.starts_with("sleep")) {
-            return Err(
-                Refusal::new("the gate lock is held by a peer's gate", "wait").could_not_run(),
-            );
-        }
-        Ok("held".into())
-    }
-    fn unlock(&mut self) {
-        self.calls.push("unlock".into());
-    }
     fn origin_tail(&mut self) -> Option<u64> {
         Some(self.tail)
     }
@@ -647,50 +679,82 @@ impl Backend for World {
     }
     fn build(
         &mut self,
-        _c: &Candidate,
+        c: &Candidate,
         reserved: &Reservation,
-        _p: &Prover,
-    ) -> Result<Artifact, Refusal> {
+        p: &Prover,
+        fixtures: bool,
+    ) -> Built {
         self.calls.push("build".into());
-        if self.build_fails {
-            return Err(Refusal::new(
+        let artifact = if self.build_fails {
+            Err(Refusal::new(
                 "the build did not finish (ship build exited 1)",
                 "read its log",
-            ));
+            ))
+        } else {
+            let key = format!("{:0>64}", reserved.build);
+            let macho = format!("m{}", reserved.build);
+            let app = PathBuf::from(format!("/cache/{key}/aterm.app"));
+            self.artifacts
+                .insert(key.clone(), (reserved.build, macho.clone(), app.clone()));
+            Ok(Artifact {
+                key,
+                app,
+                macho_sha256: macho,
+                build: reserved.build,
+            })
+        };
+        Built {
+            artifact,
+            fixtures: fixtures.then(|| self.stage_fixtures(c, reserved, p)),
         }
-        let key = format!("{:0>64}", reserved.build);
-        let macho = format!("m{}", reserved.build);
-        let app = PathBuf::from(format!("/cache/{key}/aterm.app"));
-        self.artifacts
-            .insert(key.clone(), (reserved.build, macho.clone(), app.clone()));
-        Ok(Artifact {
-            key,
-            app,
-            macho_sha256: macho,
-            build: reserved.build,
-        })
     }
-    fn measure(&mut self, _p: &Prover, app: &Path) -> (Ran, bool) {
-        self.calls.push("measure".into());
-        if self.measure_measures {
-            let macho = self
-                .artifacts
+    fn verify(&mut self, _c: &Candidate, _p: &Prover, artifact: &Artifact) -> Result<Ran, Refusal> {
+        self.calls.push("verify".into());
+        assert!(
+            self.artifacts
                 .values()
-                .find(|(_, _, a)| a == app)
-                .map(|(_, macho, _)| macho.clone())
-                .expect("MEASURE is handed a bundle the build made");
-            self.measured.insert(macho);
+                .any(|(_, macho, app)| *app == artifact.app && *macho == artifact.macho_sha256),
+            "`verify release` is handed a bundle the build made"
+        );
+        if self.interrupt_at("verify") {
+            return Ok(ran(-1));
         }
-        if let Some(then) = self.after_measure {
+        if let Some((real, script, dir)) = &mut self.real {
+            let mut cmd = aterm_uds::spawnfd::command("/bin/sh");
+            cmd.args(["-c", script.as_str(), "sh"]).arg(dir.as_path());
+            return Ok(real.logged(Step::Verify, &mut cmd));
+        }
+        if self.verify_moves {
+            return Err(Refusal::new(
+                "the clone moved during `verify release`, so its pass is not ccccccccc's — \
+                 nothing was recorded",
+                "put the clone back at ccccccccc and clean",
+            )
+            .could_not_run());
+        }
+        if self.verify_passes {
+            self.verified.insert(artifact.macho_sha256.clone());
+        }
+        if let Some(then) = self.after_verify {
             then(self);
         }
-        (ran(self.measure_code), self.measure_starved)
+        Ok(ran(self.verify_code))
     }
     fn stage(&mut self, c: &Candidate, _p: &Prover) -> Result<Ran, Refusal> {
         self.calls.push("stage".into());
         assert!(!self.stage_panics, "a bug in the release");
         if self.stage_stages {
             self.attested = Some(c.commit.clone());
+            self.staged_by = Some(self.engine.clone());
+            self.peer_staged = false;
+            if self.child_note_at_stage {
+                // a step's child that ended, its note left behind
+                std::fs::write(
+                    World::release_dir(self).join(RUNNING_CHILD_FILE),
+                    "pid 999\nstarted Thu Oct  9 01:00:00 2026\nstep stage\n",
+                )
+                .unwrap();
+            }
             if self.stage_sync_fails {
                 return Err(Refusal::new(
                     "the engine is not a fast-forward of its origin/main (its audit rows are \
@@ -706,8 +770,22 @@ impl Backend for World {
         self.calls.push("publish".into());
         let r = self.head.clone();
         self.published.insert(r.clone(), "e1e1e1e1e1".into());
-        self.newest = Some(r);
-        Ok(ran(0))
+        self.newest = Some(r.clone());
+        if self.publish_code == 0 {
+            self.source_attested.insert(r);
+        }
+        Ok(ran(self.publish_code))
+    }
+    fn source_publication(&mut self, c: &Candidate) -> Result<(), Refusal> {
+        self.calls.push("source-publication".into());
+        if self.source_attested.contains(&c.commit) {
+            Ok(())
+        } else {
+            Err(Refusal::new(
+                "the source publication is incomplete: SHA256SUMS.sig is missing",
+                "finish pub sign-release aterm, then run the release again",
+            ))
+        }
     }
     fn cut(&mut self, args: &[String], _p: &Prover) -> Ran {
         self.calls.push(format!("cut {}", args[3..].join(" ")));
@@ -762,7 +840,7 @@ impl Backend for World {
     fn after_cut(&mut self, version: &str) -> Result<AfterCut, Refusal> {
         self.calls.push(format!("after-cut {version}"));
         let shape = self.after_cut.clone()?;
-        let site = crate::release_steps::site_outcome(ran(self.site_code))?;
+        let site = crate::release_steps::site_outcome(&self.site, vec!["== site".into()])?;
         Ok(AfterCut {
             note: format!("{shape}; {}", site.note),
             ..site
@@ -794,6 +872,18 @@ fn passes() -> Vec<Finding> {
     }]
 }
 
+/// A gap this machine's operator closes: it refuses where the audit finds it.
+fn machine_gap() -> Vec<Finding> {
+    vec![Finding {
+        label: "x86 slice",
+        state: Audited::Gap {
+            what: "no x86_64 std".into(),
+            fix: "add it".into(),
+            owner: false,
+        },
+    }]
+}
+
 // (a) end to end ----------------------------------------------------------------
 
 #[test]
@@ -813,45 +903,59 @@ fn a_bump_runs_every_step_in_order_and_ends_released() {
         .calls
         .iter()
         .map(String::as_str)
-        .filter(|c| {
-            !matches!(*c, "audit" | "lease" | "unlock" | "cut-gates") && !c.starts_with("ls-remote")
-        })
+        .filter(|c| !matches!(*c, "audit" | "lease" | "cut-gates") && !c.starts_with("ls-remote"))
         .collect();
+    // the real stage first (the preflight, then it beside the guard and the censuses),
+    // the fixture generator beside the build, and the engine asked again right before
+    // the publish
     assert_eq!(
         order,
         [
             "sync",
             "bump",
             "move cccc",
-            "preflight",
+            "commit-gates",
+            "stage",
             "guard",
-            "trust",
-            "lock",
+            "census",
             "reserve",
             "build",
-            "measure",
-            "preflight-again",
             "stage-fixtures",
-            "stage",
+            "verify",
+            "sync",
+            "engine-now",
+            "staging-now",
             "publish",
+            "source-publication",
             "sync",
             "cut --mac-only",
             "after-cut 0.6.0",
             "land-fixtures",
         ]
     );
+    // two provisioning audits: the checks', and the publish's
+    assert_eq!(w.count("audit"), 2, "{:?}", w.calls);
     for step in Step::ALL {
         assert!(w.step_line(step).contains(" ok "), "{step:?}: {:#?}", w.out);
     }
     let j = w.journal().unwrap();
     assert_eq!((j.version.as_str(), j.commit.as_str()), ("0.6.0", BUMP));
-    assert!(j.bumped && j.finished() && j.has("fixture-guard") && j.has("after-cut"));
+    for fact in [
+        crate::release::COMMIT_GATES,
+        crate::release::FIXTURE_GUARD,
+        crate::release::CENSUS,
+        crate::release::FIXTURES_STAGED,
+        "after-cut",
+    ] {
+        assert!(j.has(fact), "{fact}: {j:?}");
+    }
+    assert!(j.bumped && j.finished());
     assert!(
         !w.release_dir().join(RUNNING_FILE).exists(),
         "the claim goes with the run"
     );
     // every step that ran is measured for the next ETA
-    assert!(w.times.contains("\ttrust\t") && w.times.contains("\tcut\t"));
+    assert!(w.times.contains("\tverify\t") && w.times.contains("\tcut\t"));
 }
 
 #[test]
@@ -863,12 +967,10 @@ fn a_second_run_finds_everything_done_and_only_checks() {
     assert_eq!(code, 0, "{:#?}", w.out);
     assert!(last.starts_with("RELEASED aterm 0.6.0"), "{last}");
     for step in [
-        Step::PreflightEarly,
-        Step::Trust,
-        Step::Lock,
-        Step::Measure,
-        Step::Preflight,
         Step::Stage,
+        Step::Build,
+        Step::Verify,
+        Step::Ready,
         Step::Publish,
         Step::Cut,
         Step::AfterCut,
@@ -880,17 +982,25 @@ fn a_second_run_finds_everything_done_and_only_checks() {
         );
     }
     for never in [
-        "bump", "trust", "measure", "stage", "publish", "lock", "guard",
+        "bump",
+        "commit-gates",
+        "verify",
+        "stage",
+        "publish",
+        "guard",
+        "census",
     ] {
         assert_eq!(w.count(never), 0, "{never}: {:?}", w.calls);
     }
-    assert!(!w.calls.iter().any(|c| c.starts_with("cut")));
+    assert!(!w.calls.iter().any(|c| c.starts_with("cut ")));
 }
 
 // (a') the release's own handoff fixtures ---------------------------------------------
 
-/// A generator that refuses refuses the release at the strict preflight: before the
-/// stage, the publish and the cut's claim, so nothing is public and no number burned.
+/// A generator that refuses refuses the release at the build step, beside which it runs:
+/// before the publish and the cut's claim, so nothing is public and no number burned —
+/// and the bundle built beside it is kept, so the run after the fix stages the fixtures
+/// alone, building nothing again.
 #[test]
 fn a_generator_that_refuses_refuses_the_release_before_its_claim() {
     let mut w = World::new();
@@ -898,13 +1008,11 @@ fn a_generator_that_refuses_refuses_the_release_before_its_claim() {
     let (code, last) = w.run(bump());
     assert_eq!(code, 1, "{:#?}", w.out);
     assert!(
-        last.starts_with(
-            "REFUSED at 9/14 preflight: the release's handoff fixture generator refuses"
-        ),
+        last.starts_with("REFUSED at 5/11 build: the release's handoff fixture generator refuses"),
         "{last}"
     );
     assert!(last.contains("nothing public"), "{last}");
-    for call in ["stage", "publish", "land-fixtures"] {
+    for call in ["verify", "publish", "land-fixtures"] {
         assert_eq!(w.count(call), 0, "{call}: {:?}", w.calls);
     }
     assert!(
@@ -913,14 +1021,27 @@ fn a_generator_that_refuses_refuses_the_release_before_its_claim() {
         w.calls
     );
     assert!(w.cut.is_none(), "nothing claimed");
+    assert!(
+        w.journal().unwrap().artifact.is_some(),
+        "the bundle is kept"
+    );
 
-    // fixed on main: the same reservation is staged and the release goes on
+    // fixed on main: the same reservation is staged, nothing built again, and the
+    // release goes on
     w.generator_refuses = false;
     w.calls.clear();
     let (code, last) = w.run(mac());
     assert_eq!(code, 0, "{last}\n{:#?}", w.out);
-    assert_eq!(w.count("stage-fixtures"), 1, "{:?}", w.calls);
-    assert_eq!(w.count("reserve"), 0, "{:?}", w.calls);
+    assert_eq!(
+        (
+            w.count("stage-fixtures"),
+            w.count("reserve"),
+            w.count("build")
+        ),
+        (1, 0, 0),
+        "{:?}",
+        w.calls
+    );
     assert!(w.fixtures_on_main);
 }
 
@@ -935,7 +1056,7 @@ fn fixtures_staged_and_not_landed_are_landed_by_the_next_run() {
     assert_eq!(code, 1, "{:#?}", w.out);
     assert!(
         last.starts_with(
-            "REFUSED at 13/14 after-cut: handoff fixtures: git push origin main failed"
+            "REFUSED at 10/11 after-cut: handoff fixtures: git push origin main failed"
         ),
         "{last}"
     );
@@ -971,7 +1092,7 @@ fn fixtures_staged_and_not_landed_are_landed_by_the_next_run() {
 }
 
 /// Fixtures already on main (landed by an earlier run, or by hand) are left alone: no
-/// staging, no landing, and step 13 skips once its shape half is done too.
+/// staging, no landing, and step 10 skips once its shape half is done too.
 #[test]
 fn fixtures_already_on_main_are_left_alone() {
     let mut w = World::new();
@@ -985,7 +1106,7 @@ fn fixtures_already_on_main_are_left_alone() {
         w.calls
     );
     assert!(
-        w.step_line(Step::Preflight)
+        w.step_line(Step::Build)
             .contains("v0.6.0's handoff fixtures are on main"),
         "{:#?}",
         w.out
@@ -1007,22 +1128,16 @@ fn fixtures_already_on_main_are_left_alone() {
 fn a_run_stopped_at_any_step_resumes_there_and_repeats_nothing_done() {
     type Break = fn(&mut World);
     type Mend = fn(&mut World);
-    let cases: [(Step, Break, Mend); 6] = [
+    let cases: [(Step, Break, Mend); 5] = [
         (
-            Step::Trust,
-            |w| w.trust_verifies = false,
-            |w| w.trust_verifies = true,
-        ),
-        (
-            Step::Measure,
+            Step::Verify,
             |w| {
-                w.measure_measures = false;
-                w.measure_code = 3;
-                w.measure_starved = true;
+                w.verify_passes = false;
+                w.verify_code = 3;
             },
             |w| {
-                w.measure_measures = true;
-                w.measure_code = 0;
+                w.verify_passes = true;
+                w.verify_code = 0;
             },
         ),
         (
@@ -1075,8 +1190,7 @@ fn a_run_stopped_at_any_step_resumes_there_and_repeats_nothing_done() {
         // nothing the first run finished is run again
         for (call, done_by) in [
             ("bump", Step::Commit),
-            ("trust", Step::Trust),
-            ("measure", Step::Measure),
+            ("verify", Step::Verify),
             ("stage", Step::Stage),
             ("publish", Step::Publish),
         ] {
@@ -1108,8 +1222,13 @@ fn a_cut_claimed_and_stopped_resumes_with_resume() {
     let (code, _) = w.run(mac());
     assert_eq!(code, 0, "{:#?}", w.out);
     assert!(w.calls.iter().any(|c| c == "cut --resume"), "{:?}", w.calls);
-    // past the claim, the preflights are past too
-    assert_eq!(w.count("preflight"), 0);
+    // past the claim, every pre-claim gate is past too
+    assert_eq!(
+        w.count("commit-gates") + w.count("cut-gates"),
+        0,
+        "{:?}",
+        w.calls
+    );
 }
 
 // (c) the final line --------------------------------------------------------------
@@ -1117,13 +1236,13 @@ fn a_cut_claimed_and_stopped_resumes_with_resume() {
 #[test]
 fn a_refusal_is_one_line_naming_the_step_why_what_is_public_and_the_remedy() {
     let mut w = World::new();
-    w.trust_verifies = false;
-    w.trust_code = 1;
+    w.verify_passes = false;
+    w.verify_code = 1;
     let (code, last) = w.run(bump());
     assert_eq!(code, 1);
     assert!(
-        last.starts_with("REFUSED at 5/14 trust: the whole-tree trust lane did not pass (exit 1; ")
-            && last.contains(" — nothing public. fix the library on main"),
+        last.starts_with("REFUSED at 6/11 verify: `verify release` failed for ")
+            && last.contains(" — nothing public. fix what it names on main"),
         "{last}"
     );
     assert_eq!(
@@ -1138,7 +1257,7 @@ fn a_refusal_is_one_line_naming_the_step_why_what_is_public_and_the_remedy() {
     w.cut_code = 1;
     let (_, last) = w.run(bump());
     assert!(
-        last.starts_with("REFUSED at 12/14 cut: the cut did not finish (ship cut exited 1)")
+        last.starts_with("REFUSED at 9/11 cut: the cut did not finish (ship cut exited 1)")
             && last.contains(
                 " — the source of v0.6.0 is public (alabsystems e1e1e1e1e), no build claimed. "
             )
@@ -1148,16 +1267,15 @@ fn a_refusal_is_one_line_naming_the_step_why_what_is_public_and_the_remedy() {
 
     // a step that decided nothing is a resumable stop, exit 3, the candidate kept
     let mut w = World::new();
-    w.trust_verifies = false;
-    w.trust_code = 2;
-    w.pending = vec!["aterm-render".into()];
+    w.verify_passes = false;
+    w.verify_code = 3;
     let (code, last) = w.run(bump());
     assert_eq!(code, 3, "{last}");
     assert!(
         last.starts_with(
-            "REFUSED at 5/14 trust: COULD NOT RUN — the trust lane decided nothing \
-                          about aterm-render"
-        ) && last.contains("targo --unverified ship release again"),
+            "REFUSED at 6/11 verify: COULD NOT RUN — `verify release` could not run every \
+             check for "
+        ) && last.contains("targo --unverified ship release"),
         "{last}"
     );
     assert!(
@@ -1175,7 +1293,7 @@ fn a_run_that_stops_unexpectedly_still_ends_in_one_line_and_resumes() {
     assert_eq!(code, 1);
     assert!(
         last.starts_with(
-            "REFUSED at 10/14 stage: targo --unverified ship release stopped unexpectedly — \
+            "REFUSED at 4/11 stage: targo --unverified ship release stopped unexpectedly — \
              nothing public. Read "
         ) && last.ends_with("then run it again to resume"),
         "{last}"
@@ -1187,7 +1305,13 @@ fn a_run_that_stops_unexpectedly_still_ends_in_one_line_and_resumes() {
     w.stage_panics = false;
     w.calls.clear();
     assert_eq!(w.run(mac()).0, 0, "{:#?}", w.out);
-    assert_eq!(w.count("trust") + w.count("measure"), 0, "{:?}", w.calls);
+    // what passed before the stop is not asked again: the bump, the preflight
+    assert_eq!(
+        w.count("bump") + w.count("commit-gates"),
+        0,
+        "{:?}",
+        w.calls
+    );
 }
 
 // (d) the dry run ------------------------------------------------------------------
@@ -1204,7 +1328,7 @@ fn a_dry_run_plans_every_step_says_every_refusal_and_changes_nothing() {
     assert_eq!(code, 1, "{:#?}", w.out);
     assert!(
         last.starts_with(
-            "DRY RUN aterm 0.6.0 from bbbbbbbbb: a real run would refuse at 1/14 \
+            "DRY RUN aterm 0.6.0 from bbbbbbbbb: a real run would refuse at 1/11 \
                           checks: this clone is not on main"
         ),
         "{last}"
@@ -1222,13 +1346,15 @@ fn a_dry_run_plans_every_step_says_every_refusal_and_changes_nothing() {
     let mutating = [
         "sync",
         "bump",
-        "trust",
-        "lock",
-        "measure",
+        "commit-gates",
         "stage",
-        "publish",
         "guard",
+        "census",
+        "reserve",
+        "build",
         "stage-fixtures",
+        "verify",
+        "publish",
         "land-fixtures",
     ];
     for call in mutating {
@@ -1245,11 +1371,17 @@ fn a_dry_run_plans_every_step_says_every_refusal_and_changes_nothing() {
     let (code, last) = w.run(dry);
     assert_eq!(code, 0, "{last}");
     assert!(last.contains("a real run would go ahead, about "), "{last}");
-    // and plans the release's own handoff fixtures: written before the claim, landed
-    // after the cut
+    // and plans the real stage beside the guard and the censuses, and the release's own
+    // handoff fixtures: written beside the build, landed after the cut
     assert!(
-        w.step_line(Step::Preflight)
-            .contains("would write v0.6.0's handoff fixtures for the build step 7 reserves"),
+        w.step_line(Step::Stage)
+            .contains("would run, beside each other: pub stage aterm --commit <the bump commit>"),
+        "{:#?}",
+        w.out
+    );
+    assert!(
+        w.step_line(Step::Build)
+            .contains("would write v0.6.0's handoff fixtures for the build it reserves"),
         "{:#?}",
         w.out
     );
@@ -1284,7 +1416,7 @@ fn a_dry_run_and_a_real_run_meet_the_same_step_one_refusals() {
     let (code, real) = w.run(bump());
     assert_eq!(code, 1);
     assert!(
-        real.starts_with("REFUSED at 1/14 checks: only 4 GiB free on /c"),
+        real.starts_with("REFUSED at 1/11 checks: only 4 GiB free on /c"),
         "{real}"
     );
 }
@@ -1292,12 +1424,9 @@ fn a_dry_run_and_a_real_run_meet_the_same_step_one_refusals() {
 #[test]
 fn a_preflight_block_is_met_at_minute_one_by_a_dry_bump_and_a_real_run_alike() {
     let block = || {
-        vec![(
-            false,
-            Refusal::new(
-                "handoff fixtures — the handoff fixtures of v0.5.0 are not checked in",
-                "generate them at tag v0.5.0",
-            ),
+        vec![Refusal::new(
+            "handoff fixtures — the handoff fixtures of v0.5.0 are not checked in",
+            "generate them at tag v0.5.0",
         )]
     };
     let mut w = World::new();
@@ -1308,36 +1437,40 @@ fn a_preflight_block_is_met_at_minute_one_by_a_dry_bump_and_a_real_run_alike() {
     });
     assert_eq!(code, 1, "{dry}");
     assert!(
-        dry.contains("would refuse at 4/14 preflight-early: the preflight BLOCKED (1 finding(s))"),
+        dry.contains("would refuse at 4/11 stage: the preflight BLOCKED (1 finding(s))"),
         "{dry}"
     );
     assert!(w.said("| handoff fixtures — the handoff fixtures of v0.5.0 are not checked in"));
     assert!(
-        w.step_line(Step::PreflightEarly)
-            .contains("BLOCKED (1 finding(s), above)")
+        w.step_line(Step::Stage)
+            .contains("the preflight BLOCKED (1 finding(s), above)")
     );
     let mut w = World::new();
     w.blocks = block();
     let (code, real) = w.run(bump());
     assert_eq!(code, 1);
     assert!(
-        real.starts_with("REFUSED at 4/14 preflight-early: the preflight BLOCKED (1 finding(s))"),
+        real.starts_with("REFUSED at 4/11 stage: the preflight BLOCKED (1 finding(s))"),
         "{real}"
     );
-    assert_eq!(
-        w.count("trust"),
-        0,
-        "refused before the hours of the trust lane"
+    // refused in seconds: before the stage, the guard and the censuses
+    for never in ["stage", "guard", "census"] {
+        assert_eq!(w.count(never), 0, "{never}: {:?}", w.calls);
+    }
+    assert!(
+        !w.journal().unwrap().has(crate::release::COMMIT_GATES),
+        "a refused preflight is no fact the cut could read"
     );
-    // the receipts alone (steps 5-8 answer them) never block at minute one
+    // a preflight that passes is journaled for R, and asked once
     let mut w = World::new();
     assert_eq!(w.run(bump()).0, 0, "{:#?}", w.out);
     assert!(
-        w.step_line(Step::PreflightEarly)
-            .contains("no block but the 2 receipt block(s) steps 5-8 answer"),
+        w.step_line(Step::Stage)
+            .contains("the preflight passes: R's commit-only gates"),
         "{:#?}",
         w.out
     );
+    assert_eq!(w.count("commit-gates"), 1, "{:?}", w.calls);
 }
 
 // (e) the owner, asked once, while the long steps run ---------------------------------
@@ -1345,26 +1478,25 @@ fn a_preflight_block_is_met_at_minute_one_by_a_dry_bump_and_a_real_run_alike() {
 #[test]
 fn an_owner_gap_is_asked_once_the_long_steps_run_and_the_release_waits_then_goes_on() {
     let mut w = World::new();
-    // open for the audits at 4, before 5, 7 and 8, at 9 and its first re-audit; closed after
-    w.audits = VecDeque::from([
-        owner_gap(),
-        owner_gap(),
-        owner_gap(),
-        owner_gap(),
-        owner_gap(),
-        owner_gap(),
-        passes(),
-    ]);
+    // open at the checks' audit and at the publish's; closed at its first re-audit
+    w.audits = VecDeque::from([owner_gap(), owner_gap(), passes()]);
     let (code, last) = w.run(bump());
     assert_eq!(code, 0, "{last}\n{:#?}", w.out);
     assert_eq!(w.asks, ["release.notary"], "asked exactly once");
     assert_eq!(w.resolved, ["release.notary"], "resolved when it closed");
-    let trust = w.calls.iter().position(|c| c == "trust").unwrap();
-    let measure = w.calls.iter().position(|c| c == "measure").unwrap();
-    let waited = w.calls.iter().position(|c| c == "sleep 600").unwrap();
-    let stage = w.calls.iter().position(|c| c == "stage").unwrap();
+    assert_eq!(
+        w.count("audit"),
+        3,
+        "two audits and one re-audit: {:?}",
+        w.calls
+    );
+    // asked at the checks, before the stage; waited on at the publish, after the long
+    // steps
+    let at = |call: &str| w.calls.iter().position(|c| c == call).unwrap();
     assert!(
-        trust < waited && measure < waited && waited < stage,
+        at("ask release.notary") < at("stage")
+            && at("verify") < at("sleep 600")
+            && at("sleep 600") < at("publish"),
         "{:?}",
         w.calls
     );
@@ -1375,26 +1507,19 @@ fn an_owner_gap_is_asked_once_the_long_steps_run_and_the_release_waits_then_goes
         .collect();
     assert_eq!(waiting.len(), 1, "said once: {waiting:?}");
     assert!(
-        waiting[0].contains("is READY (trusted, built once, measured); nothing public"),
+        waiting[0].contains("is READY (built once, verified); nothing public"),
         "{}",
         waiting[0]
     );
-    // the lock is let go while it waits, and taken again
-    let unlock = w.calls.iter().position(|c| c == "unlock").unwrap();
-    let relock = w.calls.iter().rposition(|c| c == "lock").unwrap();
-    assert!(unlock < waited && waited < relock, "{:?}", w.calls);
     assert!(w.journal().unwrap().asks.is_empty());
     // the owner's wait is not the step's own time
-    let preflight_secs: Vec<u64> = w
+    let publish_secs: Vec<u64> = w
         .times
         .lines()
-        .filter(|l| l.contains("\tpreflight\t"))
+        .filter(|l| l.contains("\tpublish\t"))
         .filter_map(|l| l.rsplit('\t').next()?.parse().ok())
         .collect();
-    assert!(
-        preflight_secs.iter().all(|s| *s < 600),
-        "{preflight_secs:?}"
-    );
+    assert!(publish_secs.iter().all(|s| *s < 600), "{publish_secs:?}");
 }
 
 #[test]
@@ -1411,10 +1536,12 @@ fn a_machine_gap_refuses_before_the_long_steps_and_a_dry_run_says_it_would_wait(
     let (code, last) = w.run(bump());
     assert_eq!(code, 1);
     assert!(
-        last.starts_with("REFUSED at 4/14 preflight-early: this machine's provisioning"),
+        last.starts_with("REFUSED at 1/11 checks: this machine's provisioning"),
         "{last}"
     );
-    assert_eq!(w.count("trust"), 0);
+    for never in ["bump", "stage"] {
+        assert_eq!(w.count(never), 0, "{never}: {:?}", w.calls);
+    }
 
     let mut w = World::new();
     w.audits = VecDeque::from([owner_gap()]);
@@ -1424,7 +1551,7 @@ fn a_machine_gap_refuses_before_the_long_steps_and_a_dry_run_says_it_would_wait(
     });
     assert_eq!(code, 0, "{last}");
     assert!(
-        last.contains("and wait for the owner at 9/14 preflight"),
+        last.contains("and wait for the owner at 8/11 publish"),
         "{last}"
     );
     assert!(w.said("WOULD WAIT  for the owner: notary"));
@@ -1441,15 +1568,16 @@ fn an_audit_that_could_not_ask_is_a_resumable_stop_where_it_is_needed() {
     let (code, last) = w.run(bump());
     assert_eq!(code, 3, "{last}");
     assert!(
-        last.starts_with("REFUSED at 9/14 preflight: COULD NOT RUN — this machine's provisioning")
+        last.starts_with("REFUSED at 8/11 publish: COULD NOT RUN — this machine's provisioning")
             && last.ends_with("(the candidate is kept)"),
         "{last}"
     );
     assert_eq!(
-        w.count("trust"),
+        w.count("verify"),
         1,
         "the long steps ran before it was needed"
     );
+    assert_eq!(w.count("publish"), 0, "{:?}", w.calls);
 }
 
 // (f) the READY candidate is kept --------------------------------------------------
@@ -1457,32 +1585,14 @@ fn an_audit_that_could_not_ask_is_a_resumable_stop_where_it_is_needed() {
 #[test]
 fn a_bare_rerun_keeps_the_ready_candidate_and_commit_replaces_it_out_loud() {
     let mut w = World::new();
-    w.audits = VecDeque::from([owner_gap()]);
-    // stop it at the wait: a machine refusal there is not reachable, so the owner's
-    // gap holds and the fake's sleep is ended by making the next audit refuse
-    w.audits = VecDeque::from([
-        owner_gap(),
-        owner_gap(),
-        owner_gap(),
-        owner_gap(),
-        owner_gap(),
-        vec![Finding {
-            label: "x86 slice",
-            state: Audited::Gap {
-                what: "no x86_64 std".into(),
-                fix: "add it".into(),
-                owner: false,
-            },
-        }],
-    ]);
+    // stop it at the wait at the publish, READY: the owner's gap holds, and the fake's
+    // sleep is ended by making the next audit refuse
+    w.audits = VecDeque::from([owner_gap(), owner_gap(), machine_gap()]);
     let (code, _) = w.run(bump());
     assert_eq!(code, 1);
     let j = w.journal().unwrap();
     assert_eq!(j.commit, BUMP);
-    assert!(
-        w.trusted.contains(BUMP) && w.macho().is_some_and(|m| w.measured.contains(&m)),
-        "READY"
-    );
+    assert!(w.macho().is_some_and(|m| w.verified.contains(&m)), "READY");
     // main moves on
     w.history.push(NEXT.into());
     w.versions.insert(NEXT.into(), "0.6.0".into());
@@ -1492,25 +1602,11 @@ fn a_bare_rerun_keeps_the_ready_candidate_and_commit_replaces_it_out_loud() {
     assert_eq!(code, 0, "{last}");
     assert!(w.said("its READY candidate is kept"), "{:#?}", w.out);
     assert_eq!(w.journal().unwrap().commit, BUMP, "never chases main");
-    assert_eq!(w.count("trust") + w.count("measure"), 0);
+    assert_eq!(w.count("verify"), 0);
 
     // --commit replaces an unpublished candidate, saying what it costs
     let mut w = World::new();
-    w.audits = VecDeque::from([
-        owner_gap(),
-        owner_gap(),
-        owner_gap(),
-        owner_gap(),
-        owner_gap(),
-        vec![Finding {
-            label: "x86 slice",
-            state: Audited::Gap {
-                what: "no x86_64 std".into(),
-                fix: "add it".into(),
-                owner: false,
-            },
-        }],
-    ]);
+    w.audits = VecDeque::from([owner_gap(), owner_gap(), machine_gap()]);
     let _ = w.run(bump());
     w.history.push(NEXT.into());
     w.versions.insert(NEXT.into(), "0.6.0".into());
@@ -1525,7 +1621,7 @@ fn a_bare_rerun_keeps_the_ready_candidate_and_commit_replaces_it_out_loud() {
             "DECISION: --commit {} replaces the unpublished candidate v0.6.0 from {}",
             &NEXT[..9],
             &BUMP[..9]
-        )) && l.contains("costs a whole-tree Trust lane")),
+        )) && l.contains("costs a `verify release` run")),
         "{:#?}",
         w.out
     );
@@ -1569,7 +1665,7 @@ fn a_second_run_in_the_same_clone_is_refused_naming_the_first() {
     assert_eq!(code, 1);
     assert!(
         last.starts_with(
-            "REFUSED at 1/14 checks: another targo --unverified ship release is running in this \
+            "REFUSED at 1/11 checks: another targo --unverified ship release is running in this \
              clone (pid 777, since Thu Oct  9 01:00:00 2026)"
         ),
         "{last}"
@@ -1604,8 +1700,8 @@ fn a_cutter_that_is_not_rs_own_reexecs_once_and_a_reexec_that_still_is_not_refus
     assert_eq!(code, 1);
     assert_eq!(w.count("reexec"), 0, "no loop");
     assert!(
-        last.starts_with("REFUSED at 3/14 commit: this cutter was rebuilt at")
-            && last.contains("targo clean --release -p aterm-release"),
+        last.starts_with("REFUSED at 3/11 commit: this cutter was rebuilt at")
+            && last.contains("the verdict's own remedy (nothing was claimed)"),
         "{last}"
     );
 }
@@ -1635,12 +1731,13 @@ fn forget_drops_the_journal_unless_a_run_is_live() {
     assert!(w.journal().is_none());
 }
 
-// (h) what can change while the long steps run, asked again before the stage ----------
+// (h) what the cut would refuse: at minute one, and again right before the publish -----
 
-/// The disk the trust lane and MEASURE fill, and a rostered peer cutting the version
-/// meanwhile, are asked again at step 9: the refusal arrives with nothing public.
+/// The disk MEASURE fills, and a rostered peer cutting the version
+/// meanwhile, are asked again right before the publish: the refusal arrives with nothing
+/// public (R staged on the private tier only).
 #[test]
-fn the_disk_and_the_tag_are_asked_again_before_the_stage() {
+fn the_disk_and_the_tag_are_asked_again_before_the_publish() {
     type Change = fn(&mut World);
     let changes: [(Change, &str); 2] = [
         (|w| w.free = 4, "only 4 GiB free — the cut needs 10"),
@@ -1653,24 +1750,27 @@ fn the_disk_and_the_tag_are_asked_again_before_the_stage() {
     ];
     for (change, why) in changes {
         let mut w = World::new();
-        w.after_measure = Some(change);
+        w.after_verify = Some(change);
         let (code, last) = w.run(bump());
         assert_eq!(code, 1, "{last}");
         assert!(
-            last.starts_with("REFUSED at 9/14 preflight: the preflight BLOCKED")
-                && last.contains(" — nothing public. "),
+            last.starts_with(
+                "REFUSED at 8/11 publish: asked again right before the publish, the cut would \
+                 refuse (1 finding(s))"
+            ) && last.contains(" — nothing public. "),
             "{last}"
         );
         assert!(w.said(&format!("| {why}")), "{why}: {:#?}", w.out);
-        assert_eq!(w.count("stage") + w.count("publish"), 0, "{:?}", w.calls);
+        assert_eq!(w.count("publish"), 0, "{:?}", w.calls);
+        assert!(w.published.is_empty(), "nothing public");
     }
 }
 
 /// The cut's own read-only pre-claim gates (the release lease another machine holds,
-/// a roster or floor the channel moved) refuse at step 9, before anything is public —
-/// and a dry run reports them.
+/// a roster or floor the channel moved) refuse at minute one, at the checks, before
+/// anything changes — and a dry run reports them there.
 #[test]
-fn the_cuts_read_only_gates_refuse_before_the_stage_and_a_dry_run_says_so() {
+fn the_cuts_read_only_gates_refuse_at_minute_one_and_a_dry_run_says_so() {
     let held = || {
         vec![Refusal::new(
             "release lease — the release lock is held by claim abcdef; nothing was claimed",
@@ -1682,12 +1782,14 @@ fn the_cuts_read_only_gates_refuse_before_the_stage_and_a_dry_run_says_so() {
     let (code, last) = w.run(bump());
     assert_eq!(code, 1);
     assert!(
-        last.starts_with("REFUSED at 9/14 preflight: the preflight BLOCKED (1 finding(s))")
+        last.starts_with("REFUSED at 1/11 checks: the cut would refuse (1 finding(s))")
             && last.contains("nothing public"),
         "{last}"
     );
     assert!(w.said("| release lease — the release lock is held by claim abcdef"));
-    assert_eq!(w.count("stage"), 0);
+    for never in ["bump", "stage"] {
+        assert_eq!(w.count(never), 0, "{never}: {:?}", w.calls);
+    }
     let mut w = World::new();
     w.cut_gate_refusals = held();
     let (code, dry) = w.run(ReleaseOptions {
@@ -1696,119 +1798,173 @@ fn the_cuts_read_only_gates_refuse_before_the_stage_and_a_dry_run_says_so() {
     });
     assert_eq!(code, 1);
     assert!(
-        dry.contains("would refuse at 9/14 preflight: the preflight BLOCKED"),
+        dry.contains("would refuse at 1/11 checks: the cut would refuse (1 finding(s))"),
         "{dry}"
     );
 }
 
-/// A judge that cannot answer is no "no": it stops at minute one as COULD NOT RUN,
-/// never after the hours of the lane whose receipt it would then not read either.
+/// A judge that cannot answer is no "no": it stops at step 4 as COULD NOT RUN, never
+/// after the hours of the steps whose record it would then not read either.
 #[test]
 fn a_judge_that_cannot_answer_stops_at_minute_one() {
+    // resumed with step 4 journaled already (a COULD NOT RUN at `verify release`): still
+    // stopped at step 4, before the long steps
     let mut w = World::new();
+    w.verify_passes = false;
+    w.verify_code = 3;
+    assert_eq!(w.run(bump()).0, 3, "{:#?}", w.out);
+    assert!(w.journal().unwrap().has(crate::release::COMMIT_GATES));
     w.judge_down = true;
-    let (code, last) = w.run(bump());
+    w.calls.clear();
+    let (code, last) = w.run(mac());
     assert_eq!(code, 3, "{last}");
     assert!(
         last.starts_with(
-            "REFUSED at 4/14 preflight-early: COULD NOT RUN — the cutter's own judge could \
-             not answer"
+            "REFUSED at 4/11 stage: COULD NOT RUN — the cutter's own judge could not answer"
         ),
         "{last}"
     );
-    assert_eq!(w.count("trust") + w.count("measure"), 0, "{:?}", w.calls);
+    assert_eq!(w.count("verify"), 0, "{:?}", w.calls);
 }
 
-/// THE RE-CHECK RIGHT BEFORE WHAT GOES PUBLIC. The stage and the publish may each wait
-/// for the owner at their provisioning, after step 9 asked; so what the cut would
-/// refuse is asked again after that wait, the last thing before `pub stage` and before
-/// `pub publish` — and what changed during the wait refuses there, nothing (more) public.
+/// The ledger row is written before sign-release. A nonzero publish refuses once,
+/// and its row must not let a re-run claim or ship before that missing work is done.
 #[test]
-fn what_changes_while_the_stage_or_publish_waits_is_asked_again_right_before_it() {
-    // every run: the re-check (the tag on origin now, then the cut's gates) is the last
-    // thing asked before each
+fn a_publish_that_recorded_source_but_failed_signing_cannot_be_skipped_into_a_cut() {
     let mut w = World::new();
-    assert_eq!(w.run(bump()).0, 0, "{:#?}", w.out);
-    for step in ["stage", "publish"] {
-        let at = w.calls.iter().position(|c| c == step).unwrap();
-        let before: Vec<&str> = w.calls[..at]
-            .iter()
-            .rev()
-            .take(2)
-            .map(String::as_str)
-            .collect();
-        assert_eq!(
-            before,
-            ["cut-gates", "ls-remote v0.6.0"],
-            "{step}: {:?}",
-            w.calls
-        );
-    }
-
-    // the owner is waited on at the stage, and a rostered peer cuts v0.6.0 meanwhile
-    let mut w = World::new();
-    w.audits = VecDeque::from([
-        passes(),
-        passes(),
-        passes(),
-        passes(),
-        passes(),
-        owner_gap(),
-        passes(),
-    ]);
-    w.after_sleep = Some(|w| {
-        w.origin_tags.insert("v0.6.0".into(), NEXT.into());
-    });
+    w.publish_code = 1;
     let (code, last) = w.run(bump());
     assert_eq!(code, 1, "{last}");
     assert!(
-        last.starts_with(
-            "REFUSED at 10/14 stage: asked again right before the stage, the cut would refuse \
-             (1 finding(s))"
-        ) && last.contains(" — nothing public. "),
+        last.contains("pub publish recorded") && last.contains("exited 1"),
         "{last}"
     );
-    assert!(
-        w.said("| v0.6.0 is on origin now (at ddddddddd)"),
-        "{:#?}",
-        w.out
-    );
-    assert_eq!(w.count("sleep 600"), 1, "{:?}", w.calls);
-    assert_eq!(w.count("stage") + w.count("publish"), 0, "{:?}", w.calls);
+    assert!(w.published.contains_key(BUMP) && w.cut.is_none());
 
-    // the owner is waited on at the publish, and the disk fills meanwhile
-    let mut w = World::new();
-    w.audits = VecDeque::from([
-        passes(),
-        passes(),
-        passes(),
-        passes(),
-        passes(),
-        passes(),
-        owner_gap(),
-        passes(),
-    ]);
-    w.after_sleep = Some(|w| w.free = 4);
-    let (code, last) = w.run(bump());
+    w.calls.clear();
+    let (code, last) = w.run(mac());
     assert_eq!(code, 1, "{last}");
+    assert!(last.contains("source publication is incomplete"), "{last}");
+    assert_eq!(w.count("publish"), 0, "{:?}", w.calls);
+    assert_eq!(w.count("source-publication"), 1, "{:?}", w.calls);
     assert!(
-        last.starts_with(
-            "REFUSED at 11/14 publish: asked again right before the publish, the cut would \
-             refuse (1 finding(s))"
-        ) && last.contains(" — nothing public. "),
-        "{last}"
-    );
-    assert!(
-        w.said("| only 4 GiB free — the cut needs 10"),
-        "{:#?}",
-        w.out
-    );
-    assert_eq!(
-        (w.count("stage"), w.count("publish")),
-        (1, 0),
+        !w.calls.iter().any(|call| call.starts_with("cut ")),
         "{:?}",
         w.calls
     );
+    assert!(w.cut.is_none(), "nothing was claimed");
+
+    // The owner finishes the signing work the refusal names. Reuse the verified
+    // candidate and the already published source without another public write.
+    w.source_attested.insert(BUMP.into());
+    w.calls.clear();
+    let (code, last) = w.run(mac());
+    assert_eq!(code, 0, "{last}");
+    for never in ["build", "verify", "stage", "publish"] {
+        assert_eq!(w.count(never), 0, "{never}: {:?}", w.calls);
+    }
+    assert_eq!(w.count("source-publication"), 1, "{:?}", w.calls);
+    assert!(w.cut.as_ref().is_some_and(|cut| cut.finished));
+}
+
+/// AUDIT 2 BEFORE EVERY FRESH CUT. A run that published and then stopped short of the
+/// claim leaves a re-run whose publish is skipped, and whose cut claims straight after:
+/// the waiting audit, and what the cut would refuse, are asked at the publish step all
+/// the same — an owner gap opened since (Apple's agreement lapsed) is waited on before
+/// the claim, never met after it with a build spent.
+#[test]
+fn a_fresh_cut_whose_publish_is_skipped_is_audited_and_waits_before_its_claim() {
+    let mut w = World::new();
+    w.cut_claims = false;
+    w.cut_code = 1;
+    let (code, last) = w.run(bump());
+    assert_eq!(code, 1, "{last}");
+    assert!(last.starts_with("REFUSED at 9/11 cut"), "{last}");
+    assert!(w.published.contains_key(BUMP) && w.cut.is_none());
+
+    // open at the checks' audit and at the one before the cut; closed at its re-audit
+    w.cut_claims = true;
+    w.cut_code = 0;
+    w.audits = VecDeque::from([owner_gap(), owner_gap(), passes()]);
+    w.calls.clear();
+    let (code, last) = w.run(mac());
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    assert_eq!(w.count("publish"), 0, "{:?}", w.calls);
+    assert_eq!(w.count("audit"), 3, "{:?}", w.calls);
+    assert_eq!(w.asks, ["release.notary"], "asked exactly once");
+    assert_eq!(w.resolved, ["release.notary"], "resolved when it closed");
+    let sleep = w.calls.iter().position(|c| c == "sleep 600").unwrap();
+    let gates = w.calls.iter().rposition(|c| c == "cut-gates").unwrap();
+    let cut = w.calls.iter().position(|c| c.starts_with("cut ")).unwrap();
+    assert!(sleep < gates && gates < cut, "{:?}", w.calls);
+    let publish = w.step_line(Step::Publish);
+    assert!(
+        publish.contains(" skip ")
+            && publish.contains("asked again before the cut it does not publish for"),
+        "{publish}"
+    );
+}
+
+/// THE RE-CHECK RIGHT BEFORE WHAT GOES PUBLIC. The publish audits the provisioning
+/// first, and may wait there for the owner — hours; so what the cut would refuse is
+/// asked again after that wait, the last thing before the engine's re-ask and `pub
+/// publish` — and what changed during the wait refuses there, nothing public.
+#[test]
+fn what_changes_while_the_publish_waits_is_asked_again_right_before_it() {
+    // every run: the publish's audit, then the re-check (the tag on origin now, then the
+    // cut's gates), then the engine and the staging tier, then the publish
+    let mut w = World::new();
+    assert_eq!(w.run(bump()).0, 0, "{:#?}", w.out);
+    let at = w.calls.iter().position(|c| c == "publish").unwrap();
+    let before: Vec<&str> = w.calls[..at]
+        .iter()
+        .rev()
+        .take(6)
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        before,
+        [
+            "staging-now",
+            "engine-now",
+            "sync",
+            "cut-gates",
+            "ls-remote v0.6.0",
+            "audit",
+        ],
+        "{:?}",
+        w.calls
+    );
+
+    // the owner is waited on at the publish, and meanwhile a rostered peer cuts v0.6.0 —
+    // or the disk fills
+    type Change = fn(&mut World);
+    let changes: [(Change, &str); 2] = [
+        (
+            |w| {
+                w.origin_tags.insert("v0.6.0".into(), NEXT.into());
+            },
+            "| v0.6.0 is on origin now (at ddddddddd)",
+        ),
+        (|w| w.free = 4, "| only 4 GiB free — the cut needs 10"),
+    ];
+    for (change, why) in changes {
+        let mut w = World::new();
+        w.audits = VecDeque::from([passes(), owner_gap(), passes()]);
+        w.after_sleep = Some(change);
+        let (code, last) = w.run(bump());
+        assert_eq!(code, 1, "{last}");
+        assert!(
+            last.starts_with(
+                "REFUSED at 8/11 publish: asked again right before the publish, the cut would \
+                 refuse (1 finding(s))"
+            ) && last.contains(" — nothing public. "),
+            "{last}"
+        );
+        assert!(w.said(why), "{why}: {:#?}", w.out);
+        assert_eq!(w.count("sleep 600"), 1, "{:?}", w.calls);
+        assert_eq!(w.count("publish"), 0, "{:?}", w.calls);
+    }
 }
 
 /// A `--bump` is refused BEFORE its push by what would refuse the commit it makes: the
@@ -1822,20 +1978,20 @@ fn a_bump_is_refused_before_its_push_by_what_would_refuse_its_commit() {
             |w| {
                 w.origin_tags.insert("v0.6.0".into(), NEXT.into());
             },
-            "REFUSED at 1/14 checks: v0.6.0 is already cut (its tag is on origin)",
+            "REFUSED at 1/11 checks: v0.6.0 is already cut (its tag is on origin)",
         ),
         (
             |w| {
                 w.local_tags.insert("v0.6.0".into());
             },
-            "REFUSED at 1/14 checks: tag v0.6.0 exists in this clone and not on origin — a \
+            "REFUSED at 1/11 checks: tag v0.6.0 exists in this clone and not on origin — a \
              leftover",
         ),
         (
             |w| {
                 w.origin_tags.insert("v0.5.0".into(), NEXT.into());
             },
-            "REFUSED at 1/14 checks: bbbbbbbbb does not contain v0.5.0's claim commit ddddddddd",
+            "REFUSED at 1/11 checks: bbbbbbbbb does not contain v0.5.0's claim commit ddddddddd",
         ),
     ];
     for (change, want) in cases {
@@ -1859,39 +2015,20 @@ fn a_bump_is_refused_before_its_push_by_what_would_refuse_its_commit() {
     }
 }
 
-/// A wait for the machine's lock that a signal stops — at step 6, and taken again after
-/// a wait for the owner — ends the run in its INTERRUPTED line, exit 130, never a
-/// COULD NOT RUN about the lock.
+/// A wait for the owner that a signal stops ends the run in its INTERRUPTED line, exit
+/// 130, with nothing staged.
 #[test]
-fn a_signal_while_waiting_for_the_lock_ends_the_run_interrupted() {
+fn a_signal_while_waiting_for_the_owner_ends_the_run_interrupted() {
     let mut w = World::new();
-    w.signal_at = Some("lock");
+    w.audits = VecDeque::from([passes(), owner_gap(), passes()]);
+    w.after_sleep = Some(|w| w.signal = Some(15));
     let (code, last) = w.run(bump());
     assert_eq!(code, 130, "{last}");
     assert!(
-        last.starts_with("INTERRUPTED at 6/14 lock (by SIGTERM) — nothing public."),
+        last.starts_with("INTERRUPTED at 8/11 publish (by SIGTERM)"),
         "{last}"
     );
-    assert_eq!(w.count("measure"), 0, "{:?}", w.calls);
-
-    // the relock after the owner's wait at step 9
-    let mut w = World::new();
-    w.audits = VecDeque::from([
-        passes(),
-        passes(),
-        passes(),
-        passes(),
-        owner_gap(),
-        passes(),
-    ]);
-    w.after_sleep = Some(|w| w.signal_at = Some("lock"));
-    let (code, last) = w.run(bump());
-    assert_eq!(code, 130, "{last}");
-    assert!(
-        last.starts_with("INTERRUPTED at 9/14 preflight (by SIGTERM)"),
-        "{last}"
-    );
-    assert_eq!(w.count("stage"), 0, "{:?}", w.calls);
+    assert_eq!(w.count("publish"), 0, "{:?}", w.calls);
 }
 
 /// An exec forgets every signal this process caught, so a signal caught during step 3
@@ -1904,7 +2041,7 @@ fn a_signal_in_the_commit_step_ends_the_run_before_the_reexec() {
     let (code, last) = w.run(bump());
     assert_eq!(code, 130, "{last}");
     assert!(
-        last.starts_with("INTERRUPTED at 3/14 commit (by SIGTERM)"),
+        last.starts_with("INTERRUPTED at 3/11 commit (by SIGTERM)"),
         "{last}"
     );
     assert_eq!(w.count("reexec"), 0, "{:?}", w.calls);
@@ -1918,7 +2055,7 @@ fn an_engine_sync_after_the_stage_that_fails_refuses_the_stage() {
     let (code, last) = w.run(bump());
     assert_eq!(code, 1);
     assert!(
-        last.starts_with("REFUSED at 10/14 stage: the engine is not a fast-forward")
+        last.starts_with("REFUSED at 4/11 stage: the engine is not a fast-forward")
             && last.contains("audit-rows.jsonl"),
         "{last}"
     );
@@ -1927,17 +2064,17 @@ fn an_engine_sync_after_the_stage_that_fails_refuses_the_stage() {
 
 // (i) interrupted, never orphaned ------------------------------------------------------
 
-/// A signal ends the step's child; the release ends in ONE line, exit 130, its lock let
-/// go and its claim gone, and the same command resumes there.
+/// A signal ends the step's child; the release ends in ONE line, exit 130, its claim
+/// gone, and the same command resumes there.
 #[test]
 fn an_interrupt_ends_the_run_in_one_line_and_it_resumes() {
     let mut w = World::new();
-    w.signal_at = Some("trust");
+    w.signal_at = Some("verify");
     let (code, last) = w.run(bump());
     assert_eq!(code, 130, "{last}");
     assert_eq!(
         last,
-        "INTERRUPTED at 5/14 trust (by SIGTERM) — nothing public. Run targo --unverified ship \
+        "INTERRUPTED at 6/11 verify (by SIGTERM) — nothing public. Run targo --unverified ship \
          release again to resume"
     );
     assert_eq!(w.out.last().unwrap(), &last);
@@ -1948,27 +2085,24 @@ fn an_interrupt_ends_the_run_in_one_line_and_it_resumes() {
     assert_eq!(w.run(mac()).0, 0, "{:#?}", w.out);
     assert_eq!(w.count("bump"), 0);
 
-    // at the cut, the line says the cut resumes, and the lock is let go
+    // at the cut, the line says the cut resumes
     let mut w = World::new();
     w.signal_at = Some("cut");
     let (code, last) = w.run(bump());
     assert_eq!(code, 130);
     assert!(
         last.starts_with(
-            "INTERRUPTED at 12/14 cut (by SIGTERM) — build 1791600000 of v0.6.0 is claimed."
+            "INTERRUPTED at 9/11 cut (by SIGTERM) — build 1791600000 of v0.6.0 is claimed."
         ) && last.contains("The cut stopped with this run; running the command again resumes it."),
         "{last}"
     );
-    let locked = w.calls.iter().rposition(|c| c == "lock").unwrap();
-    let unlocked = w.calls.iter().rposition(|c| c == "unlock").unwrap();
-    assert!(locked < unlocked, "{:?}", w.calls);
 }
 
 /// The probe mode of [`a_real_sigterm_reaches_the_steps_group_and_ends_interrupted`]:
 /// set, the test is the release itself (its own process, its own signal handlers).
 const INTERRUPT_PROBE: &str = "ATERM_RELEASE_INTERRUPT_PROBE";
 
-/// The trust step's child in the probe: a shell (the step's child, its group's leader)
+/// The verify step's child in the probe: a shell (the step's child, its group's leader)
 /// and a subshell it leaves running (another member of that group), each writing what
 /// it was sent once its trap is armed. Bounded, so nothing outlives a broken run long.
 const PROBE_STEP: &str = r#"d="$1"
@@ -1981,14 +2115,14 @@ wait
 "#;
 
 /// A REAL INTERRUPT, END TO END. The release (a process of its own: this test binary
-/// re-run as the probe) runs its trust step's child through the real spawn path; a
+/// re-run as the probe) runs its verify step's child through the real spawn path; a
 /// SIGTERM sent to the RELEASE alone reaches every member of the step's group (the
 /// child and the subshell it left running), the release waits for the step to end, and
 /// its last line is `INTERRUPTED …`, exit 130.
 #[cfg(unix)]
 #[test]
 fn a_real_sigterm_reaches_the_steps_group_and_ends_interrupted() {
-    use std::process::{Command, Stdio};
+    use aterm_uds::spawnfd::{Stdio, command};
     use std::time::{Duration, Instant};
     if let Some(dir) = std::env::var_os(INTERRUPT_PROBE) {
         let dir = PathBuf::from(dir);
@@ -2003,7 +2137,7 @@ fn a_real_sigterm_reaches_the_steps_group_and_ends_interrupted() {
         std::process::exit(code);
     }
     let scratch = aterm_tempfile::tempdir().unwrap();
-    let mut probe = Command::new(std::env::current_exe().unwrap())
+    let mut probe = command(std::env::current_exe().unwrap())
         .args([
             "--exact",
             "release_flow::a_real_sigterm_reaches_the_steps_group_and_ends_interrupted",
@@ -2031,7 +2165,7 @@ fn a_real_sigterm_reaches_the_steps_group_and_ends_interrupted() {
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    let sent = Command::new("kill")
+    let sent = command("kill")
         .args(["-TERM", &probe.id().to_string()])
         .status()
         .unwrap();
@@ -2056,7 +2190,7 @@ fn a_real_sigterm_reaches_the_steps_group_and_ends_interrupted() {
         .unwrap_or_else(|| panic!("no INTERRUPTED line: {said}"));
     assert_eq!(
         last,
-        "INTERRUPTED at 5/14 trust (by SIGTERM) — nothing public. Run targo --unverified ship \
+        "INTERRUPTED at 6/11 verify (by SIGTERM) — nothing public. Run targo --unverified ship \
          release again to resume"
     );
 }
@@ -2070,7 +2204,7 @@ fn a_step_left_running_by_a_killed_run_holds_the_clone() {
     std::fs::create_dir_all(w.release_dir()).unwrap();
     std::fs::write(
         w.release_dir().join(RUNNING_CHILD_FILE),
-        "pid 888\nstarted Thu Oct  9 01:30:00 2026\nstep trust\n",
+        "pid 888\nstarted Thu Oct  9 01:30:00 2026\nstep verify\n",
     )
     .unwrap();
     w.alive.insert(888, "Thu Oct  9 01:30:00 2026".into());
@@ -2078,7 +2212,7 @@ fn a_step_left_running_by_a_killed_run_holds_the_clone() {
     assert_eq!(code, 1);
     assert!(
         last.starts_with(
-            "REFUSED at 1/14 checks: the trust step of a targo --unverified ship release that \
+            "REFUSED at 1/11 checks: the verify step of a targo --unverified ship release that \
              was killed is still running in this clone (pid 888"
         ) && last.contains("kill -TERM 888 — the step's own process, never its group"),
         "{last}"
@@ -2089,7 +2223,48 @@ fn a_step_left_running_by_a_killed_run_holds_the_clone() {
     assert_eq!(w.run(bump()).0, 0, "{:#?}", w.out);
 }
 
-// (j) the owner's asks: delivered, carried, withdrawn; the lock let go while he is waited on
+/// A STEP RUNS SEVERAL CHILDREN BESIDE EACH OTHER (the stage, the guard, the censuses),
+/// each noted on its own: any one still alive after its run was killed holds the clone,
+/// named; the notes of the ones that ended hold nothing, and the next run clears them.
+#[test]
+fn every_child_a_killed_step_left_running_holds_the_clone() {
+    let mut w = World::new();
+    let dir = w.release_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    let note = |pid: u32| {
+        std::fs::write(
+            crate::release::child_note(&dir, pid),
+            format!(
+                "pid {pid}\nstarted Thu Oct  9 01:30:0{} 2026\nstep stage\n",
+                pid % 10
+            ),
+        )
+        .unwrap();
+    };
+    note(801);
+    note(802);
+    // a stray file that only looks like a note is none
+    std::fs::write(dir.join(format!("{RUNNING_CHILD_FILE}.x")), "pid 803\n").unwrap();
+    w.alive.insert(802, "Thu Oct  9 01:30:02 2026".into());
+    let (code, last) = w.run(bump());
+    assert_eq!(code, 1);
+    assert!(
+        last.starts_with(
+            "REFUSED at 1/11 checks: the stage step of a targo --unverified ship release that \
+             was killed is still running in this clone (pid 802"
+        ),
+        "{last}"
+    );
+    assert_eq!(crate::release::child_notes(&dir).len(), 2);
+    w.alive.clear();
+    assert_eq!(w.run(bump()).0, 0, "{:#?}", w.out);
+    assert!(
+        crate::release::child_notes(&dir).is_empty(),
+        "the dead children's notes are cleared"
+    );
+}
+
+// (j) the owner's asks: delivered, carried, withdrawn
 
 /// An ask the owner's aterm did not take is raised again at the next audit, and is
 /// journaled only once delivered.
@@ -2097,14 +2272,8 @@ fn a_step_left_running_by_a_killed_run_holds_the_clone() {
 fn an_ask_that_was_not_delivered_is_raised_again() {
     let mut w = World::new();
     w.undelivered = 1;
-    w.audits = VecDeque::from([
-        owner_gap(),
-        owner_gap(),
-        owner_gap(),
-        owner_gap(),
-        owner_gap(),
-        passes(),
-    ]);
+    // the checks' ask is not delivered; the publish's audit raises it again
+    w.audits = VecDeque::from([owner_gap(), owner_gap(), passes()]);
     let (code, last) = w.run(bump());
     assert_eq!(code, 0, "{last}\n{:#?}", w.out);
     assert_eq!(w.count("ask release.notary"), 2, "{:?}", w.calls);
@@ -2114,16 +2283,26 @@ fn an_ask_that_was_not_delivered_is_raised_again() {
 }
 
 /// A check that got no answer resolves nothing: owner gap, COULD NOT RUN, owner gap is
-/// ONE ask, resolved only when the check passes.
+/// ONE ask, resolved only when the check passes — here across two runs, the first
+/// stopped by `verify release` after the checks asked.
 #[test]
 fn a_check_that_could_not_run_keeps_the_ask_open() {
     let mut w = World::new();
+    w.audits = VecDeque::from([owner_gap()]);
+    w.verify_passes = false;
+    w.verify_code = 1;
+    let (code, last) = w.run(bump());
+    assert_eq!(code, 1, "{last}");
+    assert_eq!(w.journal().unwrap().asks, ["release.notary"], "journaled");
+
     let unanswered = vec![Finding {
         label: "notary",
         state: Audited::CouldNotRun("Apple's notary service did not answer".into()),
     }];
-    w.audits = VecDeque::from([owner_gap(), unanswered, owner_gap(), owner_gap(), passes()]);
-    let (code, last) = w.run(bump());
+    w.audits = VecDeque::from([unanswered, owner_gap(), passes()]);
+    w.verify_passes = true;
+    w.verify_code = 0;
+    let (code, last) = w.run(mac());
     assert_eq!(code, 0, "{last}\n{:#?}", w.out);
     assert_eq!(w.asks, ["release.notary"], "one ask");
     assert_eq!(
@@ -2136,65 +2315,20 @@ fn a_check_that_could_not_run_keeps_the_ask_open() {
         .iter()
         .position(|l| l.contains("the owner closed release.notary"))
         .unwrap();
-    let staged_at = w
+    let published_at = w
         .out
         .iter()
-        .position(|l| l.starts_with("[10/14] stage"))
+        .position(|l| l.starts_with("[ 8/11] publish") && l.contains(" ok "))
         .unwrap();
-    let preflight_at = w
+    let publish_at = w
         .out
         .iter()
-        .position(|l| l.starts_with("[ 9/14] preflight") && l.contains(" start "))
+        .position(|l| l.starts_with("[ 8/11] publish") && l.contains(" start "))
         .unwrap();
     assert!(
-        preflight_at < resolved_at && resolved_at < staged_at,
+        publish_at < resolved_at && resolved_at < published_at,
         "{:#?}",
         w.out
-    );
-}
-
-/// While the owner is waited on, the machine's lock stays let go: it is taken again
-/// once, only when the audit passes — and a lock still busy then is a resumable stop.
-#[test]
-fn the_owner_wait_holds_no_lock_and_a_busy_lock_after_it_is_a_resumable_stop() {
-    let mut w = World::new();
-    w.audits = VecDeque::from([
-        owner_gap(),
-        owner_gap(),
-        owner_gap(),
-        owner_gap(),
-        owner_gap(),
-        owner_gap(),
-        owner_gap(),
-        passes(),
-    ]);
-    let (code, last) = w.run(bump());
-    assert_eq!(code, 0, "{last}");
-    assert_eq!(w.count("sleep 600"), 3, "{:?}", w.calls);
-    let first_sleep = w.calls.iter().position(|c| c == "sleep 600").unwrap();
-    let last_sleep = w.calls.iter().rposition(|c| c == "sleep 600").unwrap();
-    assert!(
-        !w.calls[first_sleep..last_sleep].iter().any(|c| c == "lock"),
-        "no lock taken between the polls: {:?}",
-        w.calls
-    );
-    assert_eq!(w.count("lock"), 2, "step 6, then once after the wait");
-
-    let mut w = World::new();
-    w.relock_busy = true;
-    w.audits = VecDeque::from([
-        owner_gap(),
-        owner_gap(),
-        owner_gap(),
-        owner_gap(),
-        owner_gap(),
-        passes(),
-    ]);
-    let (code, last) = w.run(bump());
-    assert_eq!(code, 3, "{last}");
-    assert!(
-        last.starts_with("REFUSED at 9/14 preflight: COULD NOT RUN — the gate lock is held"),
-        "{last}"
     );
 }
 
@@ -2203,36 +2337,12 @@ fn the_owner_wait_holds_no_lock_and_a_busy_lock_after_it_is_a_resumable_stop() {
 #[test]
 fn asks_are_carried_over_a_replaced_candidate_and_withdrawn_by_forget() {
     let mut w = World::new();
-    w.audits = VecDeque::from([
-        owner_gap(),
-        owner_gap(),
-        owner_gap(),
-        owner_gap(),
-        owner_gap(),
-        vec![Finding {
-            label: "x86 slice",
-            state: Audited::Gap {
-                what: "no x86_64 std".into(),
-                fix: "add it".into(),
-                owner: false,
-            },
-        }],
-    ]);
+    w.audits = VecDeque::from([owner_gap(), owner_gap(), machine_gap()]);
     let _ = w.run(bump());
     assert_eq!(w.journal().unwrap().asks, ["release.notary"]);
     w.history.push(NEXT.into());
     w.versions.insert(NEXT.into(), "0.6.0".into());
-    w.audits = VecDeque::from([
-        owner_gap(),
-        vec![Finding {
-            label: "x86 slice",
-            state: Audited::Gap {
-                what: "no x86_64 std".into(),
-                fix: "add it".into(),
-                owner: false,
-            },
-        }],
-    ]);
+    w.audits = VecDeque::from([owner_gap(), machine_gap()]);
     let (code, _) = w.run(ReleaseOptions {
         commit: Some(NEXT.into()),
         ..mac()
@@ -2251,13 +2361,37 @@ fn asks_are_carried_over_a_replaced_candidate_and_withdrawn_by_forget() {
     assert!(w.journal().is_none());
 }
 
+/// An ask the checks delivered before the release had a journal, on a run that then
+/// stops before step 3 journals it, is withdrawn before the final line: no standing row
+/// outlives a run that left nothing able to resolve or withdraw it.
+#[test]
+fn an_ask_no_journal_took_is_withdrawn_when_the_run_stops_before_step_3() {
+    let mut w = World::new();
+    w.audits = VecDeque::from([owner_gap()]);
+    w.cut_gate_refusals = vec![Refusal::new(
+        "release lease — the release lock is held by claim abcdef; nothing was claimed",
+        "on the machine that cut it: targo --unverified ship release",
+    )];
+    let (code, last) = w.run(bump());
+    assert_eq!(code, 1, "{last}");
+    assert!(last.starts_with("REFUSED at 1/11 checks"), "{last}");
+    assert!(w.journal().is_none(), "nothing journaled");
+    assert_eq!(w.asks, ["release.notary"]);
+    assert_eq!(w.withdrawn, ["release.notary"]);
+    assert_eq!(
+        w.out.last().unwrap(),
+        &last,
+        "the final line is the last line"
+    );
+}
+
 // (k) a claim forgotten, the site, the successor, the re-exec, --forget ---------------
 
 /// NO CLAIM IS HELD TO A PROVER, because no resume compiles. The cut claims bytes the
-/// release already built and measured, and its journal (`dist/cut-state.toml`) names
+/// release already built and verified, and its journal (`dist/cut-state.toml`) names
 /// them, so a resume signs those bytes whatever prover it runs under. `--forget` around
 /// a claimed, unfinished cut therefore drops nothing its resume needs: the run after it
-/// resumes the claim with `--resume`, and never reserves, builds or measures again.
+/// resumes the claim with `--resume`, and never reserves, builds or verifies again.
 #[test]
 fn a_claim_forgotten_and_resumed_is_never_built_again() {
     let mut w = World::new();
@@ -2290,20 +2424,22 @@ fn a_claim_forgotten_and_resumed_is_never_built_again() {
     );
     assert!(w.calls.iter().any(|c| c == "cut --resume"), "{:?}", w.calls);
     assert_eq!(
-        (w.count("reserve"), w.count("build"), w.count("measure")),
+        (w.count("reserve"), w.count("build"), w.count("verify")),
         (0, 0, 0),
         "{:?}",
         w.calls
     );
 }
 
-/// A machine with no site checkout (post-promote exit 3, nothing touched) ends the
+/// A machine with no site checkout (`ship site` touched nothing) ends the
 /// release: the site is a hand step, journaled and said — in the step, the final line
 /// and every later run — never a refusal a re-run here would only repeat.
 #[test]
 fn a_site_this_machine_cannot_sync_is_a_recorded_hand_step_and_the_release_ends() {
     let mut w = World::new();
-    w.site_code = 3;
+    w.site = Ok(crate::site::Outcome::NoCheckout(
+        "site checkout not found — set SITE_DIR or skip with --skip-site (looked in /s)".into(),
+    ));
     let (code, last) = w.run(bump());
     assert_eq!(code, 0, "{last}\n{:#?}", w.out);
     assert!(
@@ -2336,32 +2472,49 @@ fn a_site_this_machine_cannot_sync_is_a_recorded_hand_step_and_the_release_ends(
         skipped.contains(" skip ") && skipped.contains(crate::release::SITE_BY_HAND),
         "{skipped}"
     );
-    // the step keeps the hook's own line: where it looked, or what the checkout lacks
-    let lacks = "post-promote: site checkout at /s has no executable deploy.sh — not a usable \
-                 site checkout; set SITE_DIR or skip with --skip-site";
-    let deferred = crate::release_steps::site_outcome(Ran {
-        code: 3,
-        detail: vec![
-            "$ \"publish/post-promote\" \"--latest\"".into(),
-            lacks.into(),
-        ],
-    })
+    // the step keeps the sync's own line: where it looked, or what the checkout lacks
+    let lacks = "site checkout at /s has no executable deploy.sh — not a usable site checkout; \
+                 set SITE_DIR or skip with --skip-site";
+    let deferred = crate::release_steps::site_outcome(
+        &Ok(crate::site::Outcome::NoCheckout(lacks.into())),
+        Vec::new(),
+    )
     .unwrap();
     assert!(deferred.site_deferred, "{deferred:?}");
-    assert_eq!(
-        deferred.note,
-        format!(
-            "publish/post-promote said: {}",
-            &lacks["post-promote: ".len()..]
-        )
+    assert_eq!(deferred.note, format!("ship site said: {lacks}"));
+    // asked for no deploy (SITE_NO_DEPLOY): said as not deployed, never as already shown
+    let undeployed =
+        crate::release_steps::site_outcome(&Ok(crate::site::Outcome::NoDeploy), Vec::new())
+            .unwrap();
+    assert!(
+        undeployed.note.contains("NOT deployed") && !undeployed.note.contains("already"),
+        "{undeployed:?}"
+    );
+    assert!(!undeployed.site_deferred);
+    // a failed sync is a stop that names the failure and keeps the transcript's end
+    let failed = crate::release_steps::site_outcome(
+        &Err(crate::site::Failure(
+            "push to origin main failed (above)".into(),
+        )),
+        vec!["  remote: refused".into()],
+    )
+    .unwrap_err();
+    assert!(
+        failed
+            .why
+            .contains("the site sync failed: push to origin main failed"),
+        "{failed:?}"
     );
     // exit 4 (deployed, the live site not agreeing yet) is still a stop to retry
     let mut w = World::new();
-    w.site_code = 4;
+    w.site = Ok(crate::site::Outcome::LiveDisagrees {
+        deployed: true,
+        why: Vec::new(),
+    });
     let (code, last) = w.run(bump());
     assert_eq!(code, 1);
     assert!(
-        last.starts_with("REFUSED at 13/14 after-cut: the site is deployed"),
+        last.starts_with("REFUSED at 10/11 after-cut: the site is deployed"),
         "{last}"
     );
 }
@@ -2385,7 +2538,7 @@ fn a_shape_refusal_names_its_way_out_and_following_it_ships_the_successor() {
         assert_eq!(code, 1);
         assert!(
             last.starts_with(
-                "REFUSED at 13/14 after-cut: alabsystems/aterm v0.6.0 does NOT carry the \
+                "REFUSED at 10/11 after-cut: alabsystems/aterm v0.6.0 does NOT carry the \
                  one-lean-download shape (1 problem(s))"
             ) && last.contains(
                 "ship its successor from current main with targo --unverified ship release \
@@ -2506,6 +2659,7 @@ fn forget_takes_no_flag_it_would_ignore() {
         &["release", "--forget", "--bump"],
         &["release", "--forget", "--commit", "origin/main"],
         &["release", "--forget", "--mac-only"],
+        &["release", "--forget", "--prepare"],
     ] {
         let refused = parse(bad).unwrap_err();
         assert!(refused.starts_with("--forget drops"), "{bad:?}: {refused}");
@@ -2514,6 +2668,439 @@ fn forget_takes_no_flag_it_would_ignore() {
         parse(&["release", "--forget", "--verbose", "--engine", "/e"]),
         Ok(crate::cli::Cmd::Release(o)) if o.forget && o.verbose
     ));
+}
+
+// (p) prepare, then release -------------------------------------------------------------
+
+/// `--prepare` runs the heavy half and stops before the publish: PREPARED in the journal
+/// with the prover it held, the clone's run markers let go before its line, which names
+/// the command that finishes it (a dry run plans both halves). A bare run then asks the
+/// live world again before anything is public: a prover that is not the prepared build
+/// refuses at step 1, nothing published or claimed; the prover back, it asks the
+/// provisioning, the tag, the ledger tail and the engine — which moved since it staged,
+/// so the stage runs again — and goes on from the publish, nothing heavy run again.
+#[test]
+fn a_prepare_stops_before_the_publish_and_the_bare_run_reasks_then_releases() {
+    let mut w = World::new();
+    let prepare = ReleaseOptions {
+        prepare: true,
+        ..bump()
+    };
+    let (code, last) = w.run(ReleaseOptions {
+        dry_run: true,
+        ..prepare.clone()
+    });
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    assert!(
+        last.contains("a real --prepare would go ahead and stop PREPARED after 7/11 ready")
+            && last.contains("then targo --unverified ship release would finish it"),
+        "{last}"
+    );
+    assert!(w.said("--prepare would stop here"), "{:#?}", w.out);
+    assert!(w.step_line(Step::Cut).contains(" plan "), "{:#?}", w.out);
+    assert!(w.journal().is_none(), "a dry run writes no journal");
+
+    // the heavy half, then the stop
+    w.calls.clear();
+    w.child_note_at_stage = true;
+    let (code, last) = w.run(prepare);
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    assert!(
+        last.starts_with(&format!(
+            "PREPARED aterm 0.6.0 (build 1791600000) from {} — built once, verified and \
+             staged; nothing public — ",
+            &BUMP[..9]
+        )) && last.ends_with(". Finish it: targo --unverified ship release"),
+        "{last}"
+    );
+    for heavy in ["build", "verify", "stage"] {
+        assert_eq!(w.count(heavy), 1, "{heavy}: {:?}", w.calls);
+    }
+    assert_eq!(w.count("publish"), 0, "{:?}", w.calls);
+    assert!(
+        !w.calls.iter().any(|c| c.starts_with("cut ")),
+        "{:?}",
+        w.calls
+    );
+    assert!(
+        w.cut.is_none() && w.published.is_empty(),
+        "nothing claimed or public"
+    );
+    // the run's markers let go before its line (the release holds no machine lock)
+    assert_eq!(
+        w.running_at_prepared,
+        Some(false),
+        "the claim goes before the line"
+    );
+    assert!(!w.release_dir().join(RUNNING_CHILD_FILE).exists());
+    let j = w.journal().unwrap();
+    let prepared = j.prepared.clone().expect("PREPARED is journaled");
+    assert_eq!(prepared.prover, "/store/trust/9192/bin");
+    assert_eq!(prepared.trustc, prover().commit);
+    assert_eq!(prepared.build, 1_791_600_000);
+    assert_eq!(Some(prepared.macho_sha256.clone()), w.macho());
+    assert_eq!(prepared.engine, w.engine);
+    assert!(!j.finished());
+
+    // another prover: refused at step 1, nothing public, nothing claimed
+    w.child_note_at_stage = false;
+    w.prover = Prover {
+        bin: PathBuf::from("/store/trust/9300/bin"),
+        commit: "fd87ed4a0060000000000000000000000000000".into(),
+        source: "TRUST_STAGE2_BIN".into(),
+    };
+    w.calls.clear();
+    let (code, last) = w.run(mac());
+    assert_eq!(code, 1, "{last}\n{:#?}", w.out);
+    assert!(
+        last.starts_with(
+            "REFUSED at 1/11 checks: v0.6.0 was PREPARED with the prover /store/trust/9192/bin"
+        ) && last.contains("this run's is /store/trust/9300/bin"),
+        "{last}"
+    );
+    assert!(
+        last.contains("--prepare (the build and `verify release` again"),
+        "{last}"
+    );
+    for never in ["sync", "build", "verify", "stage", "publish"] {
+        assert_eq!(w.count(never), 0, "{never}: {:?}", w.calls);
+    }
+    assert!(w.cut.is_none() && w.published.is_empty());
+    assert_eq!(
+        w.journal().unwrap().prepared,
+        Some(prepared),
+        "the prepare is kept"
+    );
+
+    // the prepared prover back, and the engine moved since it staged
+    w.prover = prover();
+    w.engine = "f1f1f1f1f1".into();
+    w.calls.clear();
+    let (code, last) = w.run(mac());
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    assert!(
+        last.starts_with("RELEASED aterm 0.6.0 (build 1791600000)"),
+        "{last}"
+    );
+    for never in [
+        "bump",
+        "commit-gates",
+        "guard",
+        "census",
+        "reserve",
+        "build",
+        "verify",
+    ] {
+        assert_eq!(w.count(never), 0, "{never}: {:?}", w.calls);
+    }
+    let at = |call: &str| {
+        w.calls
+            .iter()
+            .position(|c| c == call)
+            .unwrap_or_else(|| panic!("{call}: {:?}", w.calls))
+    };
+    // asked first, before the stage again: the provisioning, the tag, the engine
+    for asked in ["audit", "ls-remote v0.6.0", "engine-now"] {
+        assert!(at(asked) < at("stage"), "{asked}: {:?}", w.calls);
+    }
+    // the stage again, by the engine as it is now, then the publish and the cut
+    assert_eq!(w.count("stage"), 1, "{:?}", w.calls);
+    assert!(
+        at("stage") < at("publish") && at("publish") < at("cut --mac-only"),
+        "{:?}",
+        w.calls
+    );
+    assert!(w.said("v0.6.0 was PREPARED at "), "{:#?}", w.out);
+    assert!(w.journal().unwrap().finished());
+}
+
+/// ONLY A CLAIMED CUT IS PAST ITS PREPARE. A visible half that published and then
+/// stopped short of the claim — a peer's release claimed past the reservation as the cut
+/// started — leaves the source public, nothing claimed, and its PREPARED record stale: the
+/// next bare run refuses before anything heavy (the ledger reached the prepared build),
+/// keeping the record; `--prepare` reserves anew, builds and verifies, and records
+/// PREPARED again over the published source; and the bare run after it releases that
+/// build, nothing heavy run again.
+#[test]
+fn a_prepare_overtaken_after_its_publish_is_prepared_again_then_released() {
+    let mut w = World::new();
+    let (code, last) = w.run(ReleaseOptions {
+        prepare: true,
+        ..bump()
+    });
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    let first = w.journal().unwrap().prepared.unwrap();
+
+    // the visible half publishes; a peer claims past the reservation as the cut starts
+    w.overtaken_at_cut = true;
+    let (code, last) = w.run(mac());
+    assert_eq!(code, 1, "{last}\n{:#?}", w.out);
+    assert!(last.starts_with("REFUSED at 9/11 cut"), "{last}");
+    assert!(
+        w.published.contains_key(BUMP) && w.cut.is_none(),
+        "public, nothing claimed"
+    );
+
+    // the bare run refuses: the ledger reached the prepared build — nothing heavy runs
+    w.calls.clear();
+    let (code, last) = w.run(mac());
+    assert_eq!(code, 1, "{last}\n{:#?}", w.out);
+    assert!(
+        last.starts_with("REFUSED at 4/11 stage: the PREPARED v0.6.0 is stale"),
+        "{last}"
+    );
+    assert!(
+        w.said(&format!(
+            "origin's ledger tail {} reached the reserved build {}",
+            first.build, first.build
+        )),
+        "{:#?}",
+        w.out
+    );
+    for never in ["build", "verify", "stage", "publish"] {
+        assert_eq!(w.count(never), 0, "{never}: {:?}", w.calls);
+    }
+    assert_eq!(
+        w.journal().unwrap().prepared,
+        Some(first.clone()),
+        "the record is kept"
+    );
+
+    // `--prepare` makes it fresh over the published source: reserved anew, built, verified
+    w.calls.clear();
+    let (code, last) = w.run(ReleaseOptions {
+        prepare: true,
+        ..mac()
+    });
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    let fresh = w.journal().unwrap().prepared.unwrap();
+    assert!(fresh.build > first.build, "{fresh:?}");
+    let from = &BUMP[..9];
+    let want = format!("PREPARED aterm 0.6.0 (build {}) from {from}", fresh.build);
+    assert!(
+        last.starts_with(&want) && last.contains("the source of v0.6.0 is public"),
+        "{last}"
+    );
+    assert_eq!(
+        (w.count("reserve"), w.count("build"), w.count("verify")),
+        (1, 1, 1),
+        "{:?}",
+        w.calls
+    );
+    assert_eq!(
+        (w.count("stage"), w.count("publish")),
+        (0, 0),
+        "{:?}",
+        w.calls
+    );
+    assert_eq!(Some(fresh.macho_sha256.clone()), w.macho());
+    assert!(w.cut.is_none(), "nothing claimed");
+
+    // the bare run asks again and releases the fresh build
+    w.calls.clear();
+    let (code, last) = w.run(mac());
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    assert!(
+        last.starts_with(&format!("RELEASED aterm 0.6.0 (build {})", fresh.build)),
+        "{last}"
+    );
+    for never in ["build", "verify", "stage", "publish"] {
+        assert_eq!(w.count(never), 0, "{never}: {:?}", w.calls);
+    }
+    assert_eq!(w.cut.as_ref().unwrap().build, fresh.build);
+}
+
+/// What the visible half could not ask is a resumable stop, the prepare kept; and the
+/// engine it publishes by is asked once more right before `pub publish`, after a sync:
+/// one a peer moved after the re-ask at 4/11 is no stop — R is staged again there, by
+/// the engine as it is now, and released, nothing heavy run again.
+#[test]
+fn a_prepared_release_stops_on_what_it_cannot_ask_and_stages_again_before_the_publish() {
+    let mut w = World::new();
+    let (code, last) = w.run(ReleaseOptions {
+        prepare: true,
+        ..bump()
+    });
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    let prepared = w.journal().unwrap().prepared.unwrap();
+
+    // origin does not answer: COULD NOT RUN at minute one, nothing public, the prepare
+    // kept
+    w.ls_remote_down = true;
+    w.calls.clear();
+    let (code, last) = w.run(mac());
+    assert_eq!(code, 3, "{last}\n{:#?}", w.out);
+    assert!(
+        last.starts_with(
+            "REFUSED at 1/11 checks: COULD NOT RUN — what the cut would refuse could not be \
+             asked (1 question(s))"
+        ),
+        "{last}"
+    );
+    assert!(
+        w.said("| cannot ask origin whether v0.6.0 is cut: origin did not answer"),
+        "{:#?}",
+        w.out
+    );
+    for never in ["sync", "build", "verify", "stage", "publish"] {
+        assert_eq!(w.count(never), 0, "{never}: {:?}", w.calls);
+    }
+    assert_eq!(w.journal().unwrap().prepared, Some(prepared.clone()));
+
+    // origin back; a peer moves the engine after the re-ask: the sync right before the
+    // publish brings it (the step-2 sync, then the publish's)
+    w.ls_remote_down = false;
+    let moved: fn(&mut World) = |w| w.engine = "f2f2f2f2f2".into();
+    w.after_sync = VecDeque::from([None, Some(moved)]);
+    w.calls.clear();
+    let (code, last) = w.run(mac());
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    assert!(
+        last.starts_with("RELEASED aterm 0.6.0 (build 1791600000)"),
+        "{last}"
+    );
+    assert!(
+        w.said("is staged again by the engine as it is now, before the publish"),
+        "{:#?}",
+        w.out
+    );
+    let at = |call: &str| w.calls.iter().position(|c| c == call).unwrap();
+    assert!(
+        at("engine-now") < at("stage") && at("stage") < at("publish"),
+        "{:?}",
+        w.calls
+    );
+    assert_eq!(
+        (w.count("stage"), w.count("publish")),
+        (1, 1),
+        "{:?}",
+        w.calls
+    );
+    assert_eq!(
+        w.staged_by.as_deref(),
+        Some("f2f2f2f2f2"),
+        "by the engine as it is"
+    );
+    for never in ["reserve", "build", "verify"] {
+        assert_eq!(w.count(never), 0, "{never}: {:?}", w.calls);
+    }
+}
+
+/// EVERY RELEASE PUBLISHES BY THE ENGINE THAT STAGED IT. The stage comes before the long
+/// steps now, hours before the publish, and the engine checkout is shared: one whose code
+/// moved meanwhile stages R again right before the publish — never a stop — and only
+/// then publishes.
+#[test]
+fn an_engine_moved_while_the_long_steps_ran_stages_again_before_the_publish() {
+    let mut w = World::new();
+    w.after_verify = Some(|w| w.engine = "f3f3f3f3f3".into());
+    let (code, last) = w.run(bump());
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    assert_eq!(w.count("stage"), 2, "{:?}", w.calls);
+    let staged: Vec<usize> = w
+        .calls
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.as_str() == "stage")
+        .map(|(i, _)| i)
+        .collect();
+    let at = |call: &str| w.calls.iter().position(|c| c == call).unwrap();
+    assert!(
+        staged[0] < at("build") && at("verify") < staged[1] && staged[1] < at("publish"),
+        "{:?}",
+        w.calls
+    );
+    assert_eq!(w.staged_by.as_deref(), Some("f3f3f3f3f3"));
+    // the same engine all along: one stage
+    let mut w = World::new();
+    assert_eq!(w.run(bump()).0, 0, "{:#?}", w.out);
+    assert_eq!(w.count("stage"), 1, "{:?}", w.calls);
+}
+
+/// A STAGING TIER A PEER MOVED STAGES AGAIN TOO. `pub promote` refuses an attestation
+/// whose `<repo>-staging` main moved since it was made (any peer's `pub stage aterm`),
+/// and the stage is hours before the publish: the staging tier is asked again right
+/// before the publish, and one that moved stages R again by the same engine — never a
+/// refusal at the publish that every re-run would meet again.
+#[test]
+fn a_staging_tier_moved_while_the_long_steps_ran_stages_again_before_the_publish() {
+    let mut w = World::new();
+    w.after_verify = Some(|w| w.peer_staged = true);
+    let (code, last) = w.run(bump());
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    assert_eq!(w.count("stage"), 2, "{:?}", w.calls);
+    let staged: Vec<usize> = w
+        .calls
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.as_str() == "stage")
+        .map(|(i, _)| i)
+        .collect();
+    let at = |call: &str| w.calls.iter().position(|c| c == call).unwrap();
+    assert!(
+        at("verify") < at("staging-now")
+            && at("staging-now") < staged[1]
+            && staged[1] < at("publish"),
+        "{:?}",
+        w.calls
+    );
+    assert!(
+        w.said("the staging tier's main moved since R was attested")
+            && w.said("is staged again by the engine as it is now, before the publish"),
+        "{:#?}",
+        w.out
+    );
+    // asked once more after the stage, which attested the staging tier as it is
+    assert_eq!(w.count("staging-now"), 2, "{:?}", w.calls);
+    assert_eq!(
+        w.staged_by.as_deref(),
+        Some("e7e7e7e7e7"),
+        "the same engine"
+    );
+}
+
+/// STEP 4'S WORK RUNS BESIDE EACH OTHER, AND WHAT PASSED IS KEPT. A census finding refuses
+/// the release at 4/11, in minute one, with nothing public (R staged on the private tier
+/// only) and before the build — and the stage and the guard that passed beside it
+/// are journaled, so the run after the fix runs the censuses alone.
+#[test]
+fn a_census_finding_refuses_at_the_stage_and_keeps_what_passed_beside_it() {
+    let mut w = World::new();
+    w.census_finds = true;
+    let (code, last) = w.run(bump());
+    assert_eq!(code, 1, "{last}\n{:#?}", w.out);
+    assert!(
+        last.starts_with("REFUSED at 4/11 stage: L0 CENSUS FINDING")
+            && last.contains("nothing public"),
+        "{last}"
+    );
+    for call in ["stage", "guard", "census"] {
+        assert_eq!(w.count(call), 1, "{call}: {:?}", w.calls);
+    }
+    assert_eq!(w.count("build"), 0, "{:?}", w.calls);
+    let j = w.journal().unwrap();
+    assert!(
+        j.has(crate::release::COMMIT_GATES)
+            && j.has(crate::release::FIXTURE_GUARD)
+            && !j.has(crate::release::CENSUS),
+        "{j:?}"
+    );
+
+    w.census_finds = false;
+    w.calls.clear();
+    let (code, last) = w.run(mac());
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    assert_eq!(
+        (
+            w.count("commit-gates"),
+            w.count("stage"),
+            w.count("guard"),
+            w.count("census")
+        ),
+        (0, 0, 0, 1),
+        "{:?}",
+        w.calls
+    );
 }
 
 // the pure pieces -------------------------------------------------------------------
@@ -2573,11 +3160,11 @@ fn relative_path_flags_are_anchored_once_where_the_release_started() {
 
 #[test]
 fn estimates_are_the_median_of_the_last_five_runs() {
-    let tsv = "1\t0.1.0\ttrust\t100\n2\t0.1.0\ttrust\t900\n3\t0.2.0\ttrust\t300\n\
-               4\t0.3.0\ttrust\t200\n5\t0.4.0\ttrust\t50\n6\t0.5.0\ttrust\t400\n\
+    let tsv = "1\t0.1.0\tverify\t100\n2\t0.1.0\tverify\t900\n3\t0.2.0\tverify\t300\n\
+               4\t0.3.0\tverify\t200\n5\t0.4.0\tverify\t50\n6\t0.5.0\tverify\t400\n\
                7\t0.5.0\tcut\t60\nnot a row\n";
     let est = crate::release::estimates(tsv);
-    assert_eq!(est.get("trust"), Some(&300), "of 900 300 200 50 400");
+    assert_eq!(est.get("verify"), Some(&300), "of 900 300 200 50 400");
     assert_eq!(est.get("cut"), Some(&60));
     assert_eq!(crate::release::fmt_dur(42), "42s");
     assert_eq!(crate::release::fmt_dur(185), "3m05s");
@@ -2595,29 +3182,33 @@ fn a_public_version_is_major_minor_zero() {
 
 // (i) build once ---------------------------------------------------------------------
 
-/// A RESUME NEVER BUILDS AGAIN. A release stopped after its build — at MEASURE, which
-/// refused, and then at the cut, after its claim — re-runs every later step and never
-/// the build or the reservation: MEASURE judges the bundle the build made (the same
-/// app, the same executable digest), and the cut claims the number those bytes carry.
+/// A RESUME NEVER BUILDS AGAIN. A release stopped after its build — at `verify release`,
+/// which refused, and then at the cut, after its claim — re-runs every later step and
+/// never the build or the reservation: `verify release` judges the bundle the build
+/// made (the same app, the same executable digest), and the cut claims the number those
+/// bytes carry.
 #[test]
 fn a_resumed_release_never_builds_again() {
     let mut w = World::new();
-    w.measure_measures = false;
-    w.measure_code = 1;
+    w.verify_passes = false;
+    w.verify_code = 1;
     let (code, last) = w.run(bump());
     assert_eq!(code, 1, "{last}");
-    assert!(last.starts_with("REFUSED at 8/14 measure"), "{last}");
+    assert!(last.starts_with("REFUSED at 6/11 verify"), "{last}");
     let built = w.journal().unwrap().artifact.unwrap();
     assert_eq!((w.count("reserve"), w.count("build")), (1, 1));
 
-    w.measure_measures = true;
-    w.measure_code = 0;
+    w.verify_passes = true;
+    w.verify_code = 0;
     w.cut_finishes = false;
     w.cut_code = 1;
     let (code, last) = w.run(mac());
     assert_eq!(code, 1, "{last}");
     assert!(w.step_line(Step::Build).contains(" skip "), "{:#?}", w.out);
-    assert!(w.said(&format!("        judges: {}", built.app.display())));
+    assert!(w.said(&format!(
+        "        runs: {}",
+        crate::release::verify_command(&built.app.display().to_string())
+    )));
     assert_eq!(
         w.journal().unwrap().artifact.unwrap(),
         built,
@@ -2638,30 +3229,224 @@ fn a_resumed_release_never_builds_again() {
         "{last}"
     );
     assert_eq!(
-        (w.count("reserve"), w.count("build"), w.count("measure")),
+        (w.count("reserve"), w.count("build"), w.count("verify")),
         (1, 1, 2),
-        "built once, measured again only after its refusal: {:?}",
+        "built once, verified again only after its refusal: {:?}",
         w.calls
     );
 }
 
+/// `verify release` decides step 6 by its exit alone: a FAIL (1) refuses naming the
+/// command that reruns it; any other exit (3: a check could not run or was skipped; 2: a
+/// refused command line) is a resumable stop, never a pass; and a pass whose record
+/// cannot be read is a resumable stop too.
+#[test]
+fn the_verify_step_refuses_on_any_exit_but_a_recorded_pass() {
+    for (code, passes, exit, why) in [
+        (
+            1,
+            false,
+            1,
+            "`verify release` failed for ccccccccc (exit 1)",
+        ),
+        (
+            3,
+            false,
+            3,
+            "COULD NOT RUN — `verify release` could not run every check for ccccccccc (exit 3",
+        ),
+        (
+            2,
+            false,
+            3,
+            "COULD NOT RUN — `verify release` could not run every check for ccccccccc (exit 2",
+        ),
+        (
+            0,
+            false,
+            3,
+            "COULD NOT RUN — `verify release` passed for ccccccccc, and its record cannot be read",
+        ),
+    ] {
+        let mut w = World::new();
+        w.verify_code = code;
+        w.verify_passes = passes;
+        let (got, last) = w.run(bump());
+        assert_eq!(got, exit, "{last}");
+        assert!(
+            last.starts_with(&format!("REFUSED at 6/11 verify: {why}")),
+            "{last}"
+        );
+        if code != 0 {
+            assert!(
+                last.contains("targo --unverified run -q -p aterm-verify -- release --app /cache/"),
+                "the rerun command is named: {last}"
+            );
+        }
+        assert_eq!(w.count("publish"), 0, "nothing public: {:?}", w.calls);
+    }
+}
+
+/// A PASS FROM A CLONE THAT LEFT R IS NO PASS: the backend records nothing, the step
+/// stops resumably before anything is staged, and the next run verifies again.
+#[test]
+fn a_verify_run_the_clone_moved_under_records_nothing_and_runs_again() {
+    let mut w = World::new();
+    w.verify_moves = true;
+    let (code, last) = w.run(bump());
+    assert_eq!(code, 3, "{last}");
+    assert!(
+        last.starts_with(
+            "REFUSED at 6/11 verify: COULD NOT RUN — the clone moved during `verify release`"
+        ),
+        "{last}"
+    );
+    assert!(w.verified.is_empty(), "{:?}", w.verified);
+    assert_eq!(w.count("publish"), 0, "nothing public: {:?}", w.calls);
+
+    w.verify_moves = false;
+    let (code, last) = w.run(mac());
+    assert_eq!(code, 0, "{last}");
+    assert_eq!(w.count("verify"), 2, "{:?}", w.calls);
+}
+
+/// STEP 7 AS AN AGENT RUNS IT: the real backend runs the release's own `targo` —
+/// `<prover>/targo --unverified run -q -p aterm-verify -- release --app <app>` — in the
+/// clone, and only its exit 0 from a clone at R's tree and clean, before and after,
+/// writes the verified record of R's tree on the bundle's executable.
+#[cfg(unix)]
+#[test]
+fn the_real_verify_step_runs_the_verify_cli_in_the_clone_and_records_only_a_pass() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let repo = dir.path().join("clone");
+    crate::ledger::testing::init(
+        &repo,
+        &[
+            ("user.name", "Test"),
+            ("user.email", "test@example.invalid"),
+            ("commit.gpgsign", "false"),
+        ],
+    );
+    let git = crate::ledger::testing::Git::new(&repo);
+    use crate::ledger::GitRunner as _;
+    let commit = |msg: &str| {
+        let made = git
+            .git(&["commit", "-q", "--allow-empty", "-m", msg])
+            .unwrap();
+        assert!(made.success());
+        crate::ledger::rev_parse(&git, "HEAD").unwrap()
+    };
+    std::fs::write(repo.join("other.txt"), "another tree").unwrap();
+    assert!(git.git(&["add", "other.txt"]).unwrap().success());
+    let other = commit("another tree");
+    assert!(git.git(&["rm", "-q", "other.txt"]).unwrap().success());
+    let r = commit("R");
+    let bin = dir.path().join("prover/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let said = dir.path().join("said");
+    let mode = dir.path().join("mode");
+    // The stand-in: says how it was run, then leaves the clone as `mode` asks.
+    std::fs::write(
+        bin.join("targo"),
+        format!(
+            "#!/bin/sh\necho \"$PWD $*\" > '{said}'\ncase \"$(cat '{mode}')\" in\n  \
+             dirty) echo stray > stray.txt ;;\n  move) git checkout -q --detach {other} ;;\nesac\n\
+             exit \"$(cat '{code}')\"\n",
+            said = said.display(),
+            mode = mode.display(),
+            code = dir.path().join("code").display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(bin.join("targo"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let prover = Prover { bin, ..prover() };
+    let artifact = Artifact {
+        key: "k".into(),
+        app: dir.path().join("cache/aterm.app"),
+        macho_sha256: "ab".repeat(32),
+        build: 1,
+    };
+    let cand = Candidate {
+        commit: r.clone(),
+        version: "0.6.0".into(),
+        why: String::new(),
+        bump_from: None,
+    };
+    let mut real = Real::new(&repo, None, true, false).expect("a backend");
+    let record = |r: &str| crate::gates::verified(&git, r, &"ab".repeat(32)).unwrap().0;
+    let set = |code: &str, how: &str| {
+        std::fs::write(dir.path().join("code"), code).unwrap();
+        std::fs::write(&mode, how).unwrap();
+    };
+
+    set("1", "");
+    let ran = Backend::verify(&mut real, &cand, &prover, &artifact).expect("it ran");
+    assert_eq!(ran.code, 1);
+    assert!(!record(&r), "a failure records nothing");
+    let repo_seen = std::fs::canonicalize(&repo).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&said).unwrap().trim(),
+        format!(
+            "{} --unverified run -q -p aterm-verify -- release --app {}",
+            repo_seen.display(),
+            artifact.app.display()
+        )
+    );
+
+    // A pass that dirtied the clone, or moved it off R's tree, is no pass.
+    for how in ["dirty", "move"] {
+        set("0", how);
+        let refused =
+            Backend::verify(&mut real, &cand, &prover, &artifact).expect_err("the clone moved");
+        assert!(refused.could_not_run, "{refused:?}");
+        assert!(
+            refused
+                .why
+                .starts_with("the clone moved during `verify release`"),
+            "{refused:?}"
+        );
+        assert!(!record(&r), "{how}: nothing is recorded");
+        let _ = std::fs::remove_file(repo.join("stray.txt"));
+        assert!(
+            git.git(&["checkout", "-q", "--detach", &r])
+                .unwrap()
+                .success()
+        );
+    }
+
+    // A clone that is not clean as the step starts never runs the checks.
+    std::fs::write(repo.join("stray.txt"), "before").unwrap();
+    std::fs::remove_file(&said).unwrap();
+    set("0", "");
+    let refused = Backend::verify(&mut real, &cand, &prover, &artifact).expect_err("a dirty clone");
+    assert!(refused.could_not_run, "{refused:?}");
+    assert!(!said.exists(), "nothing ran");
+    assert!(!record(&r));
+    std::fs::remove_file(repo.join("stray.txt")).unwrap();
+
+    let ran = Backend::verify(&mut real, &cand, &prover, &artifact).expect("it ran");
+    assert_eq!(ran.code, 0);
+    assert!(record(&r), "a pass is recorded for R's tree on these bytes");
+}
+
 /// A REFUSED RELEASE BURNS NO BUILD NUMBER. The number is reserved and built before
-/// anything is claimed: a release that refuses anywhere before its cut — here MEASURE
-/// says the bytes did not measure — has pushed nothing to the ledger. When another
-/// release claims past the reservation meanwhile, the next run reserves anew and
-/// builds and measures those new bytes (the old ones carry a number that is gone), and
-/// the cut claims the new number.
+/// anything is claimed: a release that refuses anywhere before its cut — here `verify
+/// release` fails — has pushed nothing to the ledger. When another release claims past
+/// the reservation meanwhile, the next run reserves anew and builds and verifies those
+/// new bytes (the old ones carry a number that is gone), and the cut claims the new
+/// number.
 #[test]
 fn a_refused_release_burns_no_build_number() {
     let mut w = World::new();
-    w.measure_measures = false;
-    w.measure_code = 1;
+    w.verify_passes = false;
+    w.verify_code = 1;
     let tail = w.tail;
     let (code, _) = w.run(bump());
     assert_eq!(code, 1);
     assert_eq!(w.tail, tail, "nothing claimed: the ledger is untouched");
     assert!(
-        !w.calls.iter().any(|c| c.starts_with("cut")),
+        !w.calls.iter().any(|c| c.starts_with("cut ")),
         "{:?}",
         w.calls
     );
@@ -2670,8 +3455,8 @@ fn a_refused_release_burns_no_build_number() {
 
     // A peer's release claims past the reservation while this one is stopped.
     w.tail = first.build;
-    w.measure_measures = true;
-    w.measure_code = 0;
+    w.verify_passes = true;
+    w.verify_code = 0;
     let (code, last) = w.run(mac());
     assert_eq!(code, 0, "{last}\n{:#?}", w.out);
     assert!(
@@ -2694,15 +3479,15 @@ fn a_refused_release_burns_no_build_number() {
 }
 
 /// A reservation the ledger reaches while the release runs is never re-numbered — its
-/// bytes carry it — and never claimed: overtaken while MEASURE judged it, the release
-/// stops there saying so; overtaken as the cut starts, the cut refuses before its
-/// claim. Either way nothing was burned, and the next run reserves anew, builds and
-/// measures those bytes, and the cut claims their number.
+/// bytes carry it — and never claimed: overtaken while `verify release` judged it, the
+/// release stops there saying so; overtaken as the cut starts, the cut refuses before
+/// its claim. Either way nothing was burned, and the next run reserves anew, builds and
+/// verifies those bytes, and the cut claims their number.
 #[test]
 fn an_overtaken_reservation_is_built_again_never_renumbered() {
-    // overtaken while MEASURE ran
+    // overtaken while `verify release` ran
     let mut w = World::new();
-    w.after_measure = Some(|w| {
+    w.after_verify = Some(|w| {
         let reserved = w.journal().unwrap().reserved.unwrap();
         w.tail = reserved.build;
     });
@@ -2711,19 +3496,19 @@ fn an_overtaken_reservation_is_built_again_never_renumbered() {
     let stale = w.journal().unwrap().reserved.unwrap();
     assert!(
         last.starts_with(&format!(
-            "REFUSED at 8/14 measure: COULD NOT RUN — origin's ledger reached the reservation \
-             while it was measured: its reserved build {} is at or below origin's ledger tail \
+            "REFUSED at 6/11 verify: COULD NOT RUN — origin's ledger reached the reservation \
+             while it was verified: its reserved build {} is at or below origin's ledger tail \
              {} — another release claimed past it",
             stale.build, stale.build
         )),
         "{last}"
     );
     assert!(
-        !w.calls.iter().any(|c| c.starts_with("cut")),
+        !w.calls.iter().any(|c| c.starts_with("cut ")),
         "{:?}",
         w.calls
     );
-    w.after_measure = None;
+    w.after_verify = None;
     let (code, last) = w.run(mac());
     assert_eq!(code, 0, "{last}\n{:#?}", w.out);
     let fresh = w.journal().unwrap().reserved.unwrap();
@@ -2736,7 +3521,7 @@ fn an_overtaken_reservation_is_built_again_never_renumbered() {
     w.overtaken_at_cut = true;
     let (code, last) = w.run(bump());
     assert_eq!(code, 1, "{last}");
-    assert!(last.starts_with("REFUSED at 12/14 cut"), "{last}");
+    assert!(last.starts_with("REFUSED at 9/11 cut"), "{last}");
     let stale = w.journal().unwrap().reserved.unwrap();
     assert!(
         w.calls
@@ -2748,7 +3533,7 @@ fn an_overtaken_reservation_is_built_again_never_renumbered() {
     let (code, last) = w.run(mac());
     assert_eq!(code, 0, "{last}\n{:#?}", w.out);
     assert!(w.step_line(Step::Build).contains(" ok "), "{:#?}", w.out);
-    assert!(w.step_line(Step::Measure).contains(" ok "), "{:#?}", w.out);
+    assert!(w.step_line(Step::Verify).contains(" ok "), "{:#?}", w.out);
     let fresh = w.journal().unwrap().reserved.unwrap();
     assert!(fresh.build > stale.build);
     assert_eq!(w.cut.as_ref().unwrap().build, fresh.build);
@@ -2758,14 +3543,14 @@ fn an_overtaken_reservation_is_built_again_never_renumbered() {
 /// origin's tail is the reservation's line and main holds its release commit, but the
 /// cut stopped between its push and its journal. The re-run says exactly that — the
 /// number is spent, nothing was signed or published under it — and reserves anew,
-/// builds and measures, and the cut claims the fresh number.
+/// builds and verifies, and the cut claims the fresh number.
 #[test]
 fn a_claim_that_landed_unjournaled_is_named_as_this_clones() {
     let mut w = World::new();
     w.claim_lands_unjournaled = true;
     let (code, last) = w.run(bump());
     assert_eq!(code, 1, "{last}");
-    assert!(last.starts_with("REFUSED at 12/14 cut"), "{last}");
+    assert!(last.starts_with("REFUSED at 9/11 cut"), "{last}");
     assert!(w.cut.is_none(), "no cut journal");
     let spent = w.journal().unwrap().reserved.unwrap();
     assert_eq!(w.tail, spent.build, "the claim landed");

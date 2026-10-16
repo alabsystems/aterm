@@ -5,8 +5,8 @@
 //! `tracing` facade. Every macro expands to nothing.
 //!
 //! Published under the package name `tracing` so `[patch.crates-io]` redirects
-//! the four third-party consumers — the vendored winit fork, `softbuffer`,
-//! `tiny-xlib` and `zbus` — here. It replaces `tracing`, `tracing-core` and
+//! its four upstream consumers — the absorbed winit (`crates/aterm-window`),
+//! `softbuffer`, `tiny-xlib` and `zbus` — here. It replaces `tracing`, `tracing-core` and
 //! `tracing-attributes` (and `pin-project-lite` on mac and windows).
 //!
 //! # Why a no-op is behaviourally identical
@@ -51,9 +51,12 @@
 //!   macro argument DOES warn (`unused_variables`, `dead_code`,
 //!   `unused_unsafe`, `unused_imports`).
 //!
-//! Every affected file is third-party (`vendor/winit` and registry copies),
-//! none built with `-D warnings`. A `let _ = &$value;` per field was rejected:
-//! taking a reference is evaluation, and would run e.g. winit's
+//! Every affected file but one is a registry copy, built with
+//! `--cap-lints allow`. The one is `crates/aterm-window`, the absorbed winit: a
+//! workspace member held to `-D warnings`, so a binding there that only feeds a
+//! log line carries a `_` name (`Err(_err) => warn!("… {_err}")`), which still
+//! compiles if a real `tracing` comes back. A `let _ = &$value;` per field was
+//! rejected: taking a reference is evaluation, and would run e.g. winit's
 //! `unsafe { old.name() }` on a callsite upstream leaves untouched. Zero
 //! evaluation also means `trace_span!("{}", task_name)` never moves
 //! `task_name` (zbus reuses it).

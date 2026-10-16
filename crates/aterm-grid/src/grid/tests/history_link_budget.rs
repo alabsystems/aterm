@@ -2,14 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! The OSC 8 payload uncompressed history holds is counted and held to its
-//! byte budget (`grid::ring_extras`), in the ring and in the lazy buffer's
-//! staged rows: past it the oldest rows lose their links and keep their text,
-//! and a normal link workload keeps every link.
-//!
-//! "Held" is measured by walking history, not by the grid's own sums: the
-//! distinct URL `Arc`s history rows still reach, each counted once. Once a row
-//! has scrolled off the live map, those reads are the only owners left.
+//! The OSC 8 payload uncompressed history holds (ring and lazy-buffer staged rows) is counted and
+//! held to its byte budget (`grid::ring_extras`): past it the oldest rows lose their links and
+//! keep their text; a normal link workload keeps every link. "Held" is measured by walking
+//! history, not by the grid's own sums: the distinct URL `Arc`s history rows still reach, each
+//! counted once.
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
@@ -134,11 +131,9 @@ fn history_bytes_over(linked: &Grid, plain: &Grid) -> usize {
     history(linked) - history(plain)
 }
 
-/// A program printing a distinct 8 KiB link in every cell (the ring holds all
-/// of it): `history_link_bytes` and the links history really holds stay within
-/// the budget, the oldest rows lose their links whole and keep their text, and
-/// `memory_used` counts what the kept rows hold. Then a width reflow (the
-/// ring's bulk take + re-insert) keeps the bound and the sums.
+/// A distinct 8 KiB link in every cell, all in the ring: counted and held link bytes stay within
+/// the budget, the oldest rows lose their links whole and keep their text, `memory_used` counts
+/// the kept rows, and a width reflow keeps the bound.
 #[test]
 fn ring_link_flood_is_held_to_the_budget_oldest_first() {
     // Ring-only, deep enough that no flood row leaves the ring: the budget is
@@ -165,8 +160,7 @@ fn ring_link_flood_is_held_to_the_budget_oldest_first() {
         held > budget / 2,
         "strips to the low-water mark, not to nothing: {held} of {budget}"
     );
-    // Counted: the kept rows' links are in `memory_used` (a ring row used to
-    // charge its struct only). Bounded: nothing else of the flood is.
+    // Counted: the kept rows' links are in `memory_used`. Bounded: nothing else of the flood is.
     assert!(
         accounted >= kept * kept_row_floor(),
         "memory_used must count the {kept} kept rows' links ({accounted} bytes over plain)"
@@ -183,10 +177,8 @@ fn ring_link_flood_is_held_to_the_budget_oldest_first() {
     assert!(held_after <= budget, "a reflow re-homes, never re-grows");
 }
 
-/// The same flood with the compression worker owning the drain (the GUI's
-/// mode): rows pass the ring into the lazy buffer's staged rows, which hold
-/// them uncompressed. Staged links count against the same budget, oldest
-/// first, in `memory_used` and in the staged-byte sum the flood path weighs.
+/// The same flood with the compression worker owning the drain (the GUI's mode): staged rows
+/// count against the same budget, in `memory_used` and in the staged-byte sum.
 #[test]
 fn staged_link_flood_under_offload_is_held_to_the_budget() {
     // A ring shallower than the rows the budget keeps linked, so the kept
@@ -239,10 +231,8 @@ fn staged_link_flood_under_offload_is_held_to_the_budget() {
     );
 }
 
-/// The control: a GUI-shaped tab (default store, the 80-column ring) keeps
-/// every link of an ordinary workload, a few hundred links to one URL, each
-/// its own OSC 8 (its own `Arc`), then one 8 KiB link spanning a few hundred
-/// rows (one `Arc` the per-span charge counts once per row).
+/// The control: a GUI-shaped tab keeps every link of an ordinary workload (a few hundred
+/// same-URL links, each its own `Arc`, then one 8 KiB link spanning a few hundred rows).
 #[test]
 fn ordinary_link_workloads_keep_every_link() {
     const EACH: usize = 300;
@@ -291,9 +281,8 @@ fn linked_on_screen(grid: &Grid) -> usize {
         .count()
 }
 
-/// A shed (a lowered budget) while the viewport is scrolled back strips the
-/// links of rows on screen: the content generation moves, so the viewport
-/// memo drops the rows it built with links, and the screen is redrawn.
+/// A shed (a lowered budget) under a scrolled-back viewport moves the content generation and
+/// redraws the rows it unlinks.
 #[test]
 fn a_shed_under_a_scrolled_back_viewport_redraws_the_rows_it_unlinks() {
     const LINKED: usize = 40;
@@ -336,11 +325,9 @@ fn a_shed_under_a_scrolled_back_viewport_redraws_the_rows_it_unlinks() {
     grid.assert_invariants();
 }
 
-/// The window's pressure shed runs with the viewport at the bottom. Rows the
-/// viewport built while scrolled back, linked, must not be served again once
-/// the shed unlinked them and the reader scrolls back: the strip moves the
-/// content generation even when nothing on screen changed. (Without it, a
-/// debug build panics: "viewport row memo served a stale row".)
+/// A shed with the viewport at the bottom still moves the content generation, so rows the
+/// viewport memo built linked are not served again on a later scroll back (debug builds panic:
+/// "viewport row memo served a stale row").
 #[test]
 fn a_shed_at_the_bottom_unlinks_the_rows_a_later_scroll_back_reads() {
     let mut grid = Grid::with_tiered_scrollback(ROWS, COLS, 200, Scrollback::with_defaults());
@@ -367,10 +354,9 @@ fn a_shed_at_the_bottom_unlinks_the_rows_a_later_scroll_back_reads() {
     grid.assert_invariants();
 }
 
-/// The window's width change hands the store and ring history to a reflow
-/// worker; rows written meanwhile refill the ring and are stripped again,
-/// and the re-attach puts the job's history back IN FRONT of them (the strip
-/// cursor already past 0). The bound and the running sums hold through it.
+/// An offloaded width change: rows written meanwhile refill the ring and are stripped again, then
+/// the re-attach puts the job's history in front of them (the strip cursor already past 0). The
+/// bound and the running sums hold through it.
 #[test]
 fn an_offloaded_width_change_keeps_the_link_bound_through_its_reattach() {
     let mut grid = Grid::with_tiered_scrollback(ROWS, COLS, 300, Scrollback::with_defaults());

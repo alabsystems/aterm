@@ -1,11 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Test-only: the width law (design ruling 305): one intent reads one way
-//! across the band at every width, whatever each row's title length.
-//! Without it, at 60 columns a config row kept `Open aterm.toml` while the
-//! next read `Edit`, and two upgrade rows stacked read `Not today` above
-//! `Tomorrow`, by title length alone.
+//! Test-only: the width law. One intent reads one way across the band at
+//! every width, whatever each row's title length.
 
 use crate::center::MessageCenter;
 use crate::glass::{
@@ -48,11 +45,10 @@ fn labels(p: &Presentation) -> Vec<Vec<String>> {
         .collect()
 }
 
-/// THE LINK GOES BEFORE AN AUTHORED LABEL SHORTENS (ruling 305): the row
-/// body opens Details at every width, so where dropping `Details ›` alone
-/// fits the row, the authored capsule keeps its words — `Open aterm.toml`,
-/// never `Edit` beside a sibling row that kept it. A row that does not fit
-/// even so still takes the short forms.
+/// The row body opens Details at every width, so where dropping `Details ›`
+/// alone fits the row, the authored capsule keeps its words (`Open
+/// aterm.toml`, never `Edit` beside a sibling row that kept it). A row that
+/// does not fit even so still takes the short forms.
 #[test]
 fn the_link_goes_before_an_authored_label_shortens() {
     let row = |title: &str| {
@@ -70,7 +66,7 @@ fn the_link_goes_before_an_authored_label_shortens() {
             "Details \u{203a}".to_string()
         ]]
     );
-    // Too long even without the link: the short form, as before.
+    // Too long even without the link: the short form.
     let p = band(
         vec![row("Couldn't apply the cursor trail's second pack now")],
         60,
@@ -78,11 +74,9 @@ fn the_link_goes_before_an_authored_label_shortens() {
     assert_eq!(labels(&p), vec![vec!["Edit".to_string()]]);
 }
 
-/// ONE INTENT READS ONE WAY ACROSS THE BAND (ruling 305): a label one row at
-/// this width had to paint short is painted short on every row carrying it.
-/// Laid out alone, the waiting row keeps `Not today` (the control: the rule
-/// is not vacuous); beneath a row that had to shorten it, it reads `Not
-/// now` too.
+/// A label one row at this width had to paint short is painted short on every
+/// row carrying it. Alone, the waiting row keeps `Not today` (the control);
+/// beneath a row that had to shorten it, it reads `Not now` too.
 #[test]
 fn one_intent_reads_one_way_across_the_band() {
     let waits = || {
@@ -151,11 +145,9 @@ fn one_intent_reads_one_way_across_the_band() {
     );
 }
 
-/// THE TIME WORDS READ ONE WAY ACROSS THE BAND (ruling 305): forced short,
-/// a row that had room for `10 s left` paints `10s left`, and the cells it
-/// saves buy nothing a wider row did not have (its excerpt and stats are the
-/// ones it had) — at EVERY width it took the long form, not only at 120,
-/// where the stats fit either way.
+/// Forced short, a row that had room for `10 s left` paints `10s left`, and
+/// the cells it saves buy nothing (its excerpt and stats are the ones it had)
+/// at every width where it took the long form.
 #[test]
 fn forced_short_time_words_take_the_short_slot_and_spend_nothing() {
     let spec = RowSpec {
@@ -180,7 +172,7 @@ fn forced_short_time_words_take_the_short_slot_and_spend_nothing() {
             l.stats.as_ref().map(|(_, s)| s.clone()),
         )
     };
-    // Every width where the row's own layout takes the LONG time words: the
+    // Every width where the row's own layout takes the long time words: the
     // forced short form paints `ETA_SHORT_W` and buys nothing with the rest.
     let mut long_widths = 0;
     let mut three_cells_matter = false;
@@ -200,9 +192,8 @@ fn forced_short_time_words_take_the_short_slot_and_spend_nothing() {
             text(&own),
             "{cols}: the saved cells bought an extra"
         );
-        // NON-VACUITY: somewhere in the sweep the three cells the short
-        // form saves would buy more excerpt or the stats, had they been
-        // spent — so a forced row that spent them is caught here.
+        // Non-vacuity: somewhere in the sweep the three cells the short form
+        // saves would buy more excerpt or the stats, had they been spent.
         let wider = layout_row(&spec, cols + (crate::ETA_W - ETA_SHORT_W), &char_width);
         if !wider.eta_short && text(&wider) != text(&own) {
             three_cells_matter = true;
@@ -218,17 +209,11 @@ fn forced_short_time_words_take_the_short_slot_and_spend_nothing() {
     );
 }
 
-/// A WHOLE LEAD CLAUSE IS NOT A STUB (ruling 402).
-/// At the default 100 columns the overdue upgrade row took ruling 380 (c)'s
-/// longer title (`Couldn't upgrade Claude in tab 1 yet`) and left its
-/// excerpt 20 cells where the floor asks 23, so it painted no word of how
-/// long the move had waited (`behind for 7 h: its turn…`). The
-/// clause before the excerpt's first `: ` is a whole statement: it stands,
-/// with no ellipsis, where the floor would drop the excerpt. The controls: a
-/// wider row still cuts through the second clause; a lead of one word or
-/// under twelve cells (`was`, `line 3`) says nothing alone and is dropped,
-/// as before; and narrowing never shows more words, nor brings the excerpt
-/// back once it went.
+/// The clause before the excerpt's first `: ` is a whole statement: it stands,
+/// with no ellipsis, where the floor would drop the excerpt. Controls: a wider
+/// row still cuts through the second clause; a lead of one word or under
+/// twelve cells (`was`, `line 3`) is dropped; narrowing never shows more
+/// words, nor brings the excerpt back once it went.
 #[test]
 fn a_whole_lead_clause_stands_where_the_floor_would_drop_the_excerpt() {
     let row = |why: &str| {
@@ -259,8 +244,7 @@ fn a_whole_lead_clause_stands_where_the_floor_would_drop_the_excerpt() {
         ]]
     );
     assert_eq!(excerpt(why, 100).as_deref(), Some("behind for 7 h"));
-    // Wide enough for the floor: the cut through the second clause, as
-    // before.
+    // Wide enough for the floor: the cut through the second clause.
     let wide = excerpt(why, 103).expect("the floor's cut");
     assert!(
         wide.starts_with("behind for 7 h: ") && wide.ends_with('\u{2026}'),
@@ -300,8 +284,7 @@ fn a_whole_lead_clause_stands_where_the_floor_would_drop_the_excerpt() {
 }
 
 /// Narrowing from 200 to 8 columns never shows more of an excerpt's words,
-/// nor brings it back once it went (ruling 402's monotone law); `excerpt`
-/// is the row's excerpt at a width.
+/// nor brings it back once it went; `excerpt` is the row's excerpt at a width.
 fn narrowing_holds(excerpt: &dyn Fn(usize) -> Option<String>) {
     let bare = |s: &str| s.trim_end_matches('\u{2026}').to_string();
     let mut prev: Option<Option<String>> = None;
@@ -321,16 +304,11 @@ fn narrowing_holds(excerpt: &dyn Fn(usize) -> Option<String>) {
     }
 }
 
-/// THE AGENT'S ROW SAYS HOW LONG TOO (ruling 404). The agent's ONE overdue row stands for its
-/// stalled tabs
-/// (`Couldn't upgrade Claude in 2 tabs yet`), and its excerpt names each
-/// tab and how long: `tab 1 for 7 h · tab 3 for 2 h`. It has no `: `, so
-/// ruling 402's clause did not reach it, and at 100 columns the row said no
-/// word of the wait. Its first ` · ` piece is a whole statement as a `: `
-/// clause is: it stands, with no ellipsis, where the floor would drop the
-/// excerpt. The controls: the cut through the second piece at 103; dropped
-/// at 90; a first piece under twelve cells (`tab 1`) is not offered; and
-/// narrowing stays monotone.
+/// The agent's one overdue row for several tabs (`tab 1 for 7 h · tab 3 for
+/// 2 h`) has no `: `; its first ` · ` piece is a whole statement too and
+/// stands where the floor would drop the excerpt. Controls: the cut through
+/// the second piece at 103, dropped at 90, a first piece under twelve cells
+/// not offered, and narrowing monotone.
 #[test]
 fn a_first_piece_stands_where_the_floor_would_drop_the_excerpt() {
     let tabs = |word| Intent::AgentUpgradeTabs {
@@ -377,14 +355,9 @@ fn a_first_piece_stands_where_the_floor_would_drop_the_excerpt() {
     narrowing_holds(&|cols| excerpt(why, cols));
 }
 
-/// A CUT THAT ADDS NO WORD TO THE LEAD IS THE LEAD (ruling 404). At 103 columns the floor's cut of
-/// `behind for
-/// 26 h: its turn is still running` was `behind for 26 h:…` — the clause
-/// with its joint dangling, a worse stub than the narrower row's whole
-/// `behind for 26 h`; the agent's row did the same with a ` · ` piece
-/// (`tab 1 for 26 h ·…`). A cut that says no word past the lead clause
-/// paints the clause whole instead. The controls: one column wider the cut
-/// adds `its` and stands; narrowing stays monotone.
+/// A cut that says no word past the lead clause (`behind for 26 h:…`, the
+/// joint dangling) paints the clause whole instead; one column wider the cut
+/// adds `its` and stands. The same holds for a ` · ` piece.
 #[test]
 fn a_cut_that_adds_no_word_to_the_lead_is_the_lead() {
     let one = |why: &str, cols: usize| {

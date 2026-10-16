@@ -1,13 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm keeper serve|status|start|stop` — the verbs `crates/aterm` routes
-//! here.
+//! `aterm keeper serve|status|start|stop`, the verbs `crates/aterm` routes here.
 //!
-//! A window registers its terminals with a keeper only under `[keeper]
-//! enabled = true` in `aterm.toml`, and nothing starts one by itself. `start`
-//! submits one (a transient `launchctl submit` job), `stop` removes it,
-//! `serve` is what the job runs, and `status` asks one what it holds.
+//! `start` submits a keeper as a transient `launchctl submit` job, `stop` removes it, `serve` is
+//! what the job runs, and `status` asks one what it holds. Nothing starts a keeper by itself.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -177,11 +174,9 @@ fn serve(args: &Args, version: &str) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    // Every start first removes the copies of code that keepers which have
-    // ended (a crash, a logout) left. Then a keeper whose peers check its code
-    // runs from its own copy of it, so an update deleting the build it started
-    // from leaves it checkable: `run_from_own_copy` returns only when it could
-    // not.
+    // Sweep the copies of code that ended keepers (a crash, a logout) left. A keeper whose peers
+    // check its code then runs from its own copy, so an update that deletes its build leaves it
+    // checkable; `run_from_own_copy` returns only when it could not.
     let code = crate::code::code_dir();
     let own_copy = code.as_deref().and_then(crate::code::own_copy);
     let exe = crate::code::origin_exe(own_copy.is_some());
@@ -504,9 +499,8 @@ fn start(args: &Args, version: &str) -> ExitCode {
             ExitCode::FAILURE
         };
     }
-    // The socket is resolved HERE, in the caller's environment, because a
-    // launchd job's is not the caller's (`$TMPDIR`, `$XDG_RUNTIME_DIR`); its
-    // directory is made here too, for the log beside it.
+    // The socket is resolved in the caller's environment and passed as `--sock`: a launchd job's
+    // `$TMPDIR` and `$XDG_RUNTIME_DIR` are not the caller's. Its directory is made now (the log).
     if let Err(e) = fresh_log(&log) {
         eprintln!("aterm keeper start: {}: {e}", log.display());
         return ExitCode::FAILURE;
@@ -547,9 +541,8 @@ fn start(args: &Args, version: &str) -> ExitCode {
     ExitCode::FAILURE
 }
 
-/// How long `stop` waits for the keeper to end after `launchctl remove`. A
-/// hang detector, not a budget: launchd ends a submitted job that outlives
-/// its SIGTERM with SIGKILL (measured 2026-10-01: 5 s).
+/// How long `stop` waits for the keeper to end after `launchctl remove`: a hang detector, not a
+/// budget (launchd SIGKILLs a submitted job that outlives its SIGTERM; measured 5 s).
 #[cfg(unix)]
 const STOP_WAIT: Duration = Duration::from_secs(60);
 
@@ -610,9 +603,8 @@ fn stop(args: &Args, version: &str) -> ExitCode {
             ExitCode::FAILURE
         }
     };
-    // The keeper could not remove the copy of its code it ran from while it
-    // ran: now it has ended, that copy goes, with any a crash or a logout
-    // left. A live keeper's copy is kept.
+    // The ended keeper's copy of its code goes now, with any a crash or a logout left; a live
+    // keeper's copy is kept.
     if let Some(dir) = crate::code::code_dir() {
         crate::code::sweep(&dir, crate::server::born);
     }
@@ -721,9 +713,8 @@ fn status(args: &Args, version: &str) -> ExitCode {
 mod tests {
     use super::*;
 
-    /// A dial's error is read as what it is: a keeper that failed the
-    /// identity check (and only that) is `NotOurs`; no socket or a stale one
-    /// is `Nothing`; anything else keeps its words.
+    /// Only a failed identity check is `NotOurs`; no socket or a stale one is `Nothing`;
+    /// anything else keeps its words.
     #[cfg(unix)]
     #[test]
     fn a_dial_error_is_read_as_what_it_is() {
@@ -794,12 +785,10 @@ mod tests {
         assert_eq!(status_pid("keeper=running\nsocket=/p/k.sock"), None);
     }
 
-    /// `start` submits only when no job is loaded and nothing answers, and
-    /// says `keeper=running` only when this build's keeper answered — never
-    /// from launchd's word alone (a job that restarts every 10 s is loaded).
-    /// Only when the label and the socket are this build's own is the job's
-    /// pid given as the keeper's, and a refused keeper offered `stop` then
-    /// `start`.
+    /// `start` submits only when no job is loaded and nothing answers, and says `keeper=running`
+    /// only when this build's keeper answered, never from launchd's word alone (a job that
+    /// restarts every 10 s is loaded). Only for this build's own label and socket is the job's pid
+    /// the keeper's, and a refused keeper offered `stop` then `start`.
     #[cfg(unix)]
     #[test]
     fn start_says_running_only_when_this_builds_keeper_answers() {

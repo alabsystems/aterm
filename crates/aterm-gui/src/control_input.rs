@@ -458,7 +458,7 @@ pub(crate) fn control_fence(verb: &str, rest: &str, fenced_write: bool) -> Optio
 /// one place (the plain, the guarded and both cross-session arms answer it).
 pub(crate) const KEY_USAGE: &str = "ERR usage: key [id=<epoch>:<producer>:<seq>] [if=<re>] \
                                     [if-gen=<epoch>.<seq>] [if-fp=<hex16>] [if-human=<n>] \
-                                    [unread=ok] <name> — enter tab esc space backspace delete \
+                                    [if-supervisor=<holder>] [unread=ok] <name> — enter tab esc space backspace delete \
                                     up down left right home end pageup pagedown f1..f12 (opt \
                                     +mods, e.g. ctrl+c)\n";
 
@@ -513,11 +513,37 @@ pub(crate) struct LeadingInputOptions {
     /// (`crate::input_stall::admission`: its refusal, and its warning), for a
     /// driver that means to queue.
     pub unread_ok: bool,
+    /// The `if-supervisor=<holder>` fence (the self-claim contract, §2): the
+    /// write lands only while `<holder>` holds the session's live supervisor
+    /// claim, read under the meta lock right before the write
+    /// ([`crate::session_timeline::supervisor_fence`]). The window host's
+    /// loop fences every write with its own holder, so no keystroke of its
+    /// lands after a proven self-claim replaced it. Taken on
+    /// [`SUPERVISOR_FENCED_VERBS`].
+    pub if_supervisor: Option<String>,
     /// A leading option that was recognized but malformed (a guard with no
     /// pattern, an option given twice). Carried rather than answered here so the
     /// dispatch answers it AFTER the halt gate: a halted session must say
     /// `ERR halted` whatever the rest of the line looks like.
     pub refusal: Option<String>,
+}
+
+/// The verbs that take a leading `if-supervisor=<holder>` fence: every verb
+/// a supervisor types into its session with. On `paste` it is the ONE
+/// leading option (its body is raw: nothing else is taken off it).
+pub(crate) const SUPERVISOR_FENCED_VERBS: &[&str] = &["send", "key", "paste", "turn"];
+
+/// The refusal for a malformed `if-supervisor=` value.
+const IF_SUPERVISOR_USAGE: &str =
+    "ERR usage: if-supervisor=<holder> needs the holder the claim was made under\n";
+
+/// One `if-supervisor=<holder>` value into `opts`: a holder token, once.
+fn take_if_supervisor(opts: &mut LeadingInputOptions, value: &str) {
+    if !crate::session_timeline::valid_owner_token(value) || value == "-" {
+        opts.refusal = Some(IF_SUPERVISOR_USAGE.to_string());
+    } else if opts.if_supervisor.replace(value.to_string()).is_some() {
+        opts.refusal = Some("ERR usage: if-supervisor= given twice\n".to_string());
+    }
 }
 
 /// Take the LEADING options off a keyed/guarded verb's argument tail.
@@ -577,8 +603,16 @@ pub(crate) fn take_app_unread_ok<'a>(verb: &str, rest: &'a str) -> (bool, &'a st
 pub(crate) fn take_leading_options(verb: &str, rest: &str) -> (LeadingInputOptions, String) {
     let keyed = crate::pty_idem::is_keyed_verb(verb);
     let guarded = is_guarded_verb(verb);
+    let supervised = SUPERVISOR_FENCED_VERBS.contains(&verb);
     let mut opts = LeadingInputOptions::default();
     if !keyed && !guarded {
+        // `paste`'s body is raw: only a leading `if-supervisor=<holder>` and
+        // the one space after it are taken off, and nothing else.
+        if supervised && let Some(after) = rest.strip_prefix("if-supervisor=") {
+            let (value, body) = after.split_once(' ').unwrap_or((after, ""));
+            take_if_supervisor(&mut opts, value);
+            return (opts, body.to_string());
+        }
         return (opts, rest.to_string());
     }
     let mut cur = rest.trim_start();
@@ -670,6 +704,12 @@ pub(crate) fn take_leading_options(verb: &str, rest: &str) -> (LeadingInputOptio
                     );
                 }
             }
+            cur = tail;
+            consumed = true;
+            continue;
+        }
+        if supervised && let Some(value) = head.strip_prefix("if-supervisor=") {
+            take_if_supervisor(&mut opts, value);
             cur = tail;
             consumed = true;
             continue;
@@ -1040,6 +1080,13 @@ pub(crate) fn cmd_send_fenced(
 /// OS's business from the post onward. Read the result through `metrics`
 /// (`n_key_write` only ever moves on the hardware path) or `text`.
 pub(crate) fn cmd_hwkey(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
+    // A sudo password sheet is answered by a person only: `hwkey` posts real
+    // NSEvents that could reach its secure field, so it is refused while one
+    // stands (`docs/DESIGN-sudo-askpass-2026-10-15.md` §3.5).
+    #[cfg(target_os = "macos")]
+    if crate::askpass_sheet::sheets_open() {
+        return "ERR hwkey: a sudo password sheet is up\n".to_string();
+    }
     let spec = match crate::hwkey::parse_hwkey(rest) {
         Ok(s) => s,
         Err(e) => return e,
@@ -2817,6 +2864,66 @@ mod tests {
             assert!(!o.unread_ok, "{verb}");
             assert_eq!(tail, "unread=ok x", "{verb}");
         }
+    }
+
+    /// `if-supervisor=<holder>` leads on `key`, `send` and `turn` beside the
+    /// other options, and is the ONE leading option `paste` takes (its body is
+    /// raw: the one space after it goes, nothing else). A value that is no
+    /// holder token, or a second one, is a carried refusal — never typed.
+    #[test]
+    fn if_supervisor_is_the_claim_fence_on_every_typing_verb() {
+        for verb in ["key", "send", "turn"] {
+            let (o, tail) =
+                take_leading_options(verb, "if-supervisor=aterm-harness@9 if-gen=3.15 1");
+            assert_eq!(
+                o.if_supervisor.as_deref(),
+                Some("aterm-harness@9"),
+                "{verb}"
+            );
+            assert_eq!(o.refusal, None, "{verb}");
+            let want = if verb == "turn" { "if-gen=3.15 1" } else { "1" };
+            assert_eq!(tail, want, "{verb}");
+        }
+        let (o, tail) = take_leading_options("paste", "if-supervisor=h@1  two spaces");
+        assert_eq!(o.if_supervisor.as_deref(), Some("h@1"));
+        assert_eq!(tail, " two spaces", "only the separating space goes");
+        // NEGATIVE CONTROLS: paste takes no other option, and an option that
+        // does not lead is text.
+        let (o, tail) = take_leading_options("paste", "if=x if-supervisor=h@1 hi");
+        assert_eq!(
+            (o.if_supervisor, tail.as_str()),
+            (None, "if=x if-supervisor=h@1 hi")
+        );
+        assert_eq!(
+            take_leading_options("send", "hello if-supervisor=h@1").1,
+            "hello if-supervisor=h@1"
+        );
+        assert_eq!(
+            take_leading_options("feed", "if-supervisor=h@1 0d").1,
+            "if-supervisor=h@1 0d"
+        );
+        for bad in [
+            "if-supervisor= 1",
+            "if-supervisor=- 1",
+            "if-supervisor=a\u{7f} 1",
+        ] {
+            assert_eq!(
+                take_leading_options("key", bad).0.refusal.as_deref(),
+                Some(IF_SUPERVISOR_USAGE),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(
+            take_leading_options("key", "if-supervisor=a if-supervisor=a 1")
+                .0
+                .refusal
+                .as_deref(),
+            Some("ERR usage: if-supervisor= given twice\n")
+        );
+        assert!(
+            KEY_USAGE.contains("[if-supervisor=<holder>]"),
+            "{KEY_USAGE}"
+        );
     }
 
     /// `if-human=<n>` parses to the person count `status human_seq=` prints,

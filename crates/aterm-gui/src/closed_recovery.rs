@@ -239,10 +239,12 @@ mod tests {
             role: None,
             attention: None,
             questions: None,
+            autopilot: None,
             identity: None,
             agent: None,
             supervised: None,
             held: false,
+            holds: Vec::new(),
         })
     }
 
@@ -366,12 +368,10 @@ mod tests {
         assert_eq!(ledger.candidate(0).unwrap().value, unavailable);
     }
 
-    /// Tier-1 for `ClosedRecoveryLedgers`, driven through the App's shipping close
-    /// and reopen paths: `close_active_tab` on a two-leaf tab, `close_tab_at` on a
-    /// one-leaf tab, `reopen_last_closed_view` and `reopen_last_closed_tab`. The
-    /// App's ledgers are rebuilt with the model's capacities (2 views, 3 tabs), so
-    /// the real `push` saturates where the model's clamp does. Which ledger each
-    /// close records into is the App's choice, never the test's.
+    /// Tier-1 conformance for `ClosedRecoveryLedgers` through the App's shipping close and
+    /// reopen paths (`close_active_tab` on a two-leaf tab, `close_tab_at` on a one-leaf tab,
+    /// `reopen_last_closed_view`/`_tab`), with the ledgers rebuilt at the model's capacities (2
+    /// views, 3 tabs). Which ledger each close records into is the App's choice, never the test's.
     #[test]
     fn dual_ledgers_tier1_conform_and_reject_double_record_negative_control() {
         use aterm_spec::derive::closed_recovery_ledgers_model;

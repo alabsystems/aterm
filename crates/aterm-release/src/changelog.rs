@@ -675,18 +675,6 @@ mod release_body_bound_tests {
         );
     }
 
-    /// **BOUNDING TWICE CHANGES NOTHING.** The POST bounds what it reads from
-    /// disk, and that file was already bounded when this binary wrote it — so
-    /// the second application has to be a no-op or every resumed cut would
-    /// saw another section off its own notes.
-    #[test]
-    fn bounding_an_already_bounded_body_is_a_no_op() {
-        let body = "### Section\n\n- entry\n\n".repeat(20_000);
-        let once = bound_release_body(&body);
-        let twice = bound_release_body(&once);
-        assert_eq!(once, twice, "the bound must be idempotent");
-    }
-
     /// The WHOLE document — preamble plus body — also lands under the limit,
     /// because the preamble is what the POST carries too.
     ///

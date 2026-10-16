@@ -8,11 +8,9 @@ use super::*;
 /// mark and nothing else.
 const MARK_GLYPHS: [char; 4] = ['▁', '▔', '▐', '▌'];
 
-/// The composed frame's ring: every cell carrying a mark glyph, as
-/// `(row, col, glyph)` in composite coordinates.
-///
-/// Each one is checked to still be a DIVIDER cell (the seam is its ground),
-/// which is what proves the mark never reached a cell some pane owns.
+/// The composed frame's ring: every cell outside header chrome carrying a mark glyph, as
+/// `(row, col, glyph)`. Each is asserted to stand on a divider cell, so the mark never
+/// reaches a cell a pane owns.
 fn ring(app: &App, wid: WindowId) -> Vec<(usize, usize, char)> {
     let seam = divider_cell(app.theme);
     let input = &app.windows[&wid].input_scratch;
@@ -43,8 +41,7 @@ fn ring(app: &App, wid: WindowId) -> Vec<(usize, usize, char)> {
     out
 }
 
-/// Header chrome covers the mark's top run inside its own cells. The
-/// remaining divider cells still show which pane owns the keyboard.
+/// [`expected_ring`] minus the cells header chrome covers.
 fn expected_visible_ring(
     app: &App,
     wid: WindowId,
@@ -66,9 +63,9 @@ fn expected_visible_ring(
         .collect()
 }
 
-/// The ring a pane rectangle SHOULD produce, derived from the layout alone:
-/// the divider run on each side that exists, inked on the side facing the
-/// pane, with the horizontal runs reaching the corners.
+/// The ring a pane rectangle should produce, from the layout alone: the divider run on each
+/// side that exists, inked on the side facing the pane, the horizontal runs reaching the
+/// corners.
 fn expected_ring(
     rows: usize,
     cols: usize,
@@ -135,8 +132,7 @@ fn pure_split() -> (App, WindowId, u64, u64) {
     (app, wid, left, right)
 }
 
-/// The typed wake wakes the companion, not Sparkle Words: an unfocused window
-/// being typed into keeps its cursor companion, but the word engine is not
+/// A typed wake into an unfocused window keeps its cursor companion, but Sparkle Words are not
 /// presentable.
 #[test]
 fn a_typed_wake_wakes_the_companion_but_not_sparkle_words_in_a_split() {
@@ -166,13 +162,9 @@ fn a_typed_wake_wakes_the_companion_but_not_sparkle_words_in_a_split() {
     );
 }
 
-/// …and the single-pane present takes the same predicate
-/// ([`sparkle_words_presentable`]) over the same input, `motion_focus` —
-/// which a typed wake does not move although `cursor_fx_focus` does. This
-/// pins the predicate and that input, not the single-pane call site: that
-/// present cannot run glass-less, so reverting its input to the woken focus
-/// would leave this test green. Only the composed pass above is driven
-/// through its real caller.
+/// The single-pane present uses the same predicate ([`sparkle_words_presentable`]) over
+/// `motion_focus`, which a typed wake does not move though `cursor_fx_focus` does. This pins
+/// the predicate and its input, not that call site (it cannot run glass-less).
 #[test]
 fn sparkle_words_presentability_ignores_the_typed_wake() {
     let mut app = App::headless_for_test();
@@ -213,10 +205,8 @@ fn focus_pure_pane(app: &mut App, wid: WindowId, session: u64) {
     app.sync_window(wid);
 }
 
-/// The PROPERTY: a split's ring is around the pane taking keystrokes, and
-/// moving pane focus moves the ring. The expected ring is derived from the
-/// pane tree's own layout, so this also pins that the mark never lands
-/// anywhere but the divider gaps that touch that one pane.
+/// A split's ring surrounds the pane taking keystrokes and follows pane focus. The expected
+/// ring comes from the layout, so the mark lands only in the divider gaps touching that pane.
 #[test]
 fn a_pure_split_rings_the_pane_that_takes_keystrokes_and_follows_the_focus() {
     let (mut app, wid, left, right) = pure_split();
@@ -268,12 +258,9 @@ fn a_pure_split_rings_the_pane_that_takes_keystrokes_and_follows_the_focus() {
     assert_eq!(ring(&app, wid), on_the_right, "and back again");
 }
 
-/// A MIXED terminal/native split marks a NATIVE leaf exactly like a terminal
-/// one. This is the case the mark has to get right and cannot inspect: a
-/// native leaf's pixels are a rasterized tray blitted over the composite, so
-/// nothing about its content is available to a compositor pass — but its
-/// layout rectangle and the `leaf.focused` flag that gives this frame its
-/// cursor and title both are, and those are all the ring is made of.
+/// A mixed terminal/native split marks a native leaf like a terminal one: the ring is made of
+/// the leaf's layout rectangle and `leaf.focused`, never its content (a native leaf's pixels
+/// are a tray blitted over the composite).
 #[test]
 fn a_mixed_split_rings_the_native_leaf_when_the_native_leaf_takes_keys() {
     let mut app = App::headless_for_test();
@@ -349,10 +336,9 @@ fn a_mixed_split_rings_the_native_leaf_when_the_native_leaf_takes_keys() {
     );
 }
 
-/// Two gates that must silence the ring on a real composite, and a negative
-/// control proving the fixture would otherwise show one. An unfocused window
-/// is the important half: two windows can show a split at once, and only one
-/// of them can honestly claim a pane.
+/// An unfocused window and the setting off each silence the ring (the first compose is the
+/// negative control): of two windows showing a split, only the one with the keyboard claims
+/// a pane.
 #[test]
 fn an_unfocused_window_and_the_setting_off_each_compose_a_plain_seam_grid() {
     let t0 = Instant::now();
@@ -380,10 +366,8 @@ fn an_unfocused_window_and_the_setting_off_each_compose_a_plain_seam_grid() {
     );
 }
 
-/// The mark costs the panes nothing. Composing with it on and with it off
-/// must leave every cell inside both pane rectangles byte-identical — the
-/// whole reason the mark lives in the divider gap rather than in the panes'
-/// ink is that no pane's content, however it is drawn, can be affected by it.
+/// The mark lives in the divider gap, so composing with it on or off leaves every cell
+/// outside the ring byte-identical.
 #[test]
 fn the_mark_leaves_every_cell_of_every_pane_byte_identical() {
     let t0 = Instant::now();

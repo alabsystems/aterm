@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Test-only: regression repros across the engine. Each test states the
-//! behaviour the design names (§1, §10 rulings) and failed on the code it was
-//! written against.
+//! Regression repros across the engine: each test states the behaviour it
+//! pins.
 
 use crate::carry::{CarriedMessage, Carry};
 use crate::center::{EchoKind, MessageCenter, Outcome};
@@ -97,12 +96,10 @@ fn drained(c: &mut MessageCenter) -> Vec<LogLine> {
 
 // ---- center ---------------------------------------------------------------
 
-/// §1.4: a row that leaves the glass without retiring is
-/// demoted, and its patience clock re-bases so it re-anchors on its return.
-/// A host heartbeat (`messages_host::restatement_of` carries
-/// `hold: Some(msg.hold)`, the hold unchanged) must not move that patience
-/// back to the post: the row was shown for 20 s and is queued behind a
-/// warn, not "never seen".
+/// A row that leaves the glass without retiring is demoted, and its patience
+/// re-bases so it re-anchors on its return. A host heartbeat restating the
+/// unchanged hold (`messages_host::restatement_of`) must not move that
+/// patience back to the post.
 #[test]
 fn a_hold_restate_keeps_a_demoted_rows_patience() {
     let now = t0();
@@ -146,11 +143,8 @@ fn a_hold_restate_keeps_a_demoted_rows_patience() {
     assert_eq!(glass_ids(&c), vec![a], "A returns when W folds");
 }
 
-/// The module doc: the echo holds its slot for at most
-/// 850 ms, "the shrink clock starts at the resolve and SHRINK_QUIET outlasts
-/// the echo"; §10.4.3: the flourish fits inside `SHRINK_QUIET`, zero extra
-/// re-grids. The quiet shrink must not cut a Complete echo and hide the row
-/// that survives it (nor restart that row's hold).
+/// The quiet shrink never cuts a Complete echo that outlasts `SHRINK_QUIET`
+/// and hides the row that survives it, nor restarts that row's hold.
 #[test]
 fn the_quiet_shrink_never_hides_the_row_beside_a_complete_echo() {
     let start = t0();
@@ -190,10 +184,9 @@ fn the_quiet_shrink_never_hides_the_row_beside_a_complete_echo() {
     }
 }
 
-/// `revision()`: "Bumps on every observable change — the
-/// Settings projection gate". A reveal that moves rows on and off the glass
-/// changes every `on_glass` the page projects (`showing now` / `waiting to
-/// show`), so it must move the revision.
+/// `revision()` bumps on every observable change: a reveal that moves rows
+/// on and off the glass changes every `on_glass` the page projects, so it
+/// moves the revision.
 #[test]
 fn a_reveal_that_moves_the_glass_bumps_the_revision() {
     let start = t0();
@@ -228,13 +221,12 @@ fn a_reveal_that_moves_the_glass_bumps_the_revision() {
     );
 }
 
-/// The host's contract (messages_host.rs
-/// `App::seed_carried_messages`, `PARKED_PARENT_ID_RESERVE`): the parked
-/// parent keeps minting in `[next_id, next_id + reserve)` until Commit and
-/// this process mints above it, "so no id is handed out twice". A squatter
-/// the seed moves off a carried number must land above the band, never on
-/// the parent's next id. The host reserves BEFORE the seed (ruling 415 (d));
-/// this test replays that order, and the host's
+/// The host's contract (`messages_host.rs` `App::seed_carried_messages`,
+/// `PARKED_PARENT_ID_RESERVE`): the parked parent keeps minting in
+/// `[next_id, next_id + reserve)` until Commit and this process mints above
+/// it. A squatter the seed moves off a carried number lands above the band,
+/// never on the parent's next id. The host reserves before the seed; this
+/// test replays that order, and the host's
 /// `a_record_the_seed_moves_off_a_carried_id_lands_above_the_parked_band`
 /// pins the order itself.
 #[test]
@@ -294,11 +286,10 @@ fn a_squatter_moved_by_the_seed_lands_above_the_parents_band() {
 
 // ---- log --------------------------------------------------------------------
 
-/// Ruling 198 (wire.rs `ReadQuery::select`): "ascending by
-/// id … with since=, the OLDEST ones above the id, so a reader paging with
-/// the last id it saw never skips a record". A replay collision mints a
-/// fresh id above the file's top; paging one at a time from `since=2` must
-/// still deliver 3, 4 and 5.
+/// `ReadQuery::select` returns records ascending by id, with `since=` the
+/// oldest ones above it, so a reader paging with the last id it saw never
+/// skips one: after a replay collision mints a fresh id above the file's
+/// top, paging one at a time from `since=2` still delivers 3, 4 and 5.
 #[test]
 fn paging_after_a_replay_collision_skips_no_record() {
     let mut log = MessageLog::empty();
@@ -333,10 +324,10 @@ fn paging_after_a_replay_collision_skips_no_record() {
     );
 }
 
-/// `merge_reloaded` (finding 41): a record the ring holds
-/// that the boot read as `Stale` takes the ending the file has; one post is
-/// one record. A collision-remapped record whose title changed when it
-/// retired must not come back as a second entry beside the boot's Stale one.
+/// `merge_reloaded`: a record the ring holds that the boot read as `Stale`
+/// takes the ending the file has, one post one record; a collision-remapped
+/// record whose title changed when it retired does not come back as a second
+/// entry.
 #[test]
 fn a_remapped_record_retired_after_the_boot_merges_into_one() {
     let boot_lines = || {
@@ -381,11 +372,9 @@ fn a_remapped_record_retired_after_the_boot_merges_into_one() {
     );
 }
 
-/// The module doc and §1.6: "a line cut short by a crash
-/// mid-append — anywhere, inside its last value included — fails to decode
-/// instead of reading as a shorter record". A torn Posted line with the next
-/// append glued on (O_APPEND after a short write) must not decode as a
-/// record mixing the two lines.
+/// A line cut short by a crash mid-append fails to decode instead of reading
+/// as a shorter record: a torn Posted line with the next append glued on
+/// never decodes as a record mixing the two.
 #[test]
 fn a_torn_line_glued_to_the_next_never_decodes() {
     let a = LogLine::Posted(LogRecord::from_posted(
@@ -410,10 +399,10 @@ fn a_torn_line_glued_to_the_next_never_decodes() {
     );
 }
 
-/// `replay_all` (ruling 270, day three's fix): raise past
-/// every id in the file first, so a collision's fresh id is above the file's
-/// own and never renumbers a later record. One ceiling id in the file (a
-/// corrupt or hand-edited line) must not switch that off.
+/// `replay_all` raises past every id in the file first, so a collision's
+/// fresh id is above the file's own and never renumbers a later record; one
+/// ceiling id in the file (a corrupt or hand-edited line) must not switch
+/// that off.
 #[test]
 fn a_ceiling_id_never_brings_back_the_renumbering_cascade() {
     let mut log = MessageLog::empty();
@@ -434,10 +423,9 @@ fn a_ceiling_id_never_brings_back_the_renumbering_cascade() {
     );
 }
 
-/// The module doc and `LogLine::decode`: every word comes
-/// back under the model's caps, "so a hand-edited or hostile line cannot put
-/// in the ring what `post` would never have admitted"; `post` keeps at most
-/// `MAX_ACTIONS` intents.
+/// `LogLine::decode` brings every word back under the model's caps, so a
+/// hand-edited or hostile line cannot put in the ring what `post` would never
+/// admit: at most `MAX_ACTIONS` intents.
 #[test]
 fn a_decoded_record_offers_at_most_max_actions() {
     let mut rec = LogRecord::from_posted(mid(4), stamp(1), &info("x"));
@@ -464,10 +452,10 @@ fn a_decoded_record_offers_at_most_max_actions() {
 
 // ---- carry ------------------------------------------------------------------
 
-/// Rulings 167/192 and `Origin::wire_owned`: "a carried
-/// wire row stays the wire's". A keyless wire row (a `notice post … sev=warn`
-/// with no `key=`) carried across the handoff must still file its Retired
-/// line on the wire's shelf, beside its Posted line.
+/// A carried wire row stays the wire's (`Origin::wire_owned`): a keyless
+/// wire row (`notice post … sev=warn` with no `key=`) carried across the
+/// handoff files its Retired line on the wire's shelf, beside its Posted
+/// line.
 #[test]
 fn a_keyless_wire_row_stays_the_wires_after_the_carry() {
     let now = t0();
@@ -511,10 +499,9 @@ fn a_keyless_wire_row_stays_the_wires_after_the_carry() {
     );
 }
 
-/// §1.4 invariant 7 (the Retired line carries `rep=N`),
-/// the page's `×N` and `messages`' `rep=`: `carried()` names what does not
-/// cross (echoes, estimator, load, motion epoch), and the duplicate count is
-/// not among them.
+/// A row's duplicate count (the Retired line's `rep=N`, the page's `×N`)
+/// crosses the handoff: `carried()` drops echoes, the estimator, load and
+/// the motion epoch, not the count.
 #[test]
 fn a_rows_repeats_cross_the_handoff() {
     let now = t0();
@@ -538,10 +525,9 @@ fn a_rows_repeats_cross_the_handoff() {
 
 // ---- wire -------------------------------------------------------------------
 
-/// `page::MessageView::of` follows `wire::message_row`'s words:
-/// the live row's while it is live. A live row restated to Warn reads Warn on
-/// the glass and the page; `messages` must print `sev=warn` and its `sev=`
-/// floor must select it.
+/// `messages` reads a live row's current severity, as the glass and the page
+/// do: a live row restated to Warn prints `sev=warn`, and the `sev=` floor
+/// selects it.
 #[test]
 fn messages_reads_a_live_rows_restated_severity() {
     let now = t0();
@@ -576,10 +562,8 @@ fn messages_reads_a_live_rows_restated_severity() {
     );
 }
 
-/// Rulings 164/196: the title form runs on the STRIPPED title,
-/// so an invisible character cannot hide a trailing period (pinned for
-/// `Build failed.\u{2060}`). A space before the invisible character must not
-/// either.
+/// The title form runs on the stripped title, so an invisible character
+/// cannot hide a trailing period, with or without a space before it.
 #[test]
 fn an_invisible_tail_after_a_space_hides_no_period() {
     for line in [
@@ -597,10 +581,9 @@ fn an_invisible_tail_after_a_space_hides_no_period() {
     }
 }
 
-/// Ruling 189 (`a_tab_on_the_wire_is_a_space`): whitespace on
-/// the wire is a space before the strip, or the strip glues words and ` -- `
-/// never splits the detail off. U+2028/U+2029 are whitespace the strip
-/// removes.
+/// Whitespace on the wire is a space before the strip (as
+/// `a_tab_on_the_wire_is_a_space` pins), or the strip glues words and ` -- `
+/// never splits the detail off; U+2028/U+2029 included.
 #[test]
 fn a_line_separator_on_the_wire_is_a_space() {
     let parsed = NoticeRequest::parse("post script sev=warn Deploy\u{2028}failed -- a\u{2029}b");
@@ -611,9 +594,8 @@ fn a_line_separator_on_the_wire_is_a_space() {
     assert_eq!(p.detail, vec!["a b"]);
 }
 
-/// The grammar `<title>[ -- <detail>]`: a separator with an
-/// empty tail is no detail, never part of the title (the mirror of ruling
-/// 182's bare `--`).
+/// The grammar `<title>[ -- <detail>]`: a separator with an empty tail is no
+/// detail, never part of the title.
 #[test]
 fn a_separator_with_an_empty_tail_leaves_the_title() {
     let parsed = NoticeRequest::parse("post script sev=warn Deploy failed -- ");
@@ -630,9 +612,8 @@ fn a_separator_with_an_empty_tail_leaves_the_title() {
     assert!(p.stats.is_empty(), "{:?}", p.stats);
 }
 
-/// Ruling 182: "The wire's numbers are plain digits; its
-/// grammar edges are refusals"; `parse_read_args` refuses "any token the
-/// grammar does not name".
+/// The wire's numbers are plain digits and its grammar edges are refusals:
+/// `parse_read_args` refuses a signed number.
 #[test]
 fn messages_refuses_a_signed_number() {
     assert_eq!(parse_read_args("+5"), Err(crate::wire::READ_USAGE));
@@ -651,10 +632,9 @@ fn band(msgs: &[Message], cols: usize) -> Presentation {
     c.presentation(cols, &char_width, None, Links::Painted)
 }
 
-/// `glass.rs`: "what is gone at one width is gone at
-/// every narrower one"; §10.4.5 and `fit_fixed`: the cells a shorter capsule
-/// frees "never re-buy an excerpt a wider row already gave up". A label
-/// forced short by ruling 305 (a sibling row went short at this width) must
+/// What is gone at one width is gone at every narrower one, and the cells a
+/// shorter capsule frees never re-buy an excerpt a wider row gave up
+/// (`fit_fixed`): a label forced short because a sibling row went short does
 /// not hand its saved cells to the excerpt.
 #[test]
 fn a_forced_short_label_never_brings_the_excerpt_back() {
@@ -698,11 +678,10 @@ fn a_forced_short_label_never_brings_the_excerpt_back() {
     assert!(seen_whole && gone_at.is_some(), "the sweep saw both");
 }
 
-/// Ruling 305(b): a row forced to the short time words
-/// "pays the long width's room" and "the cells it saves buy nothing";
-/// `allocate_extras`: "the elapsed slot above leaves its forced cells unspent
-/// the same way". A busy row's forced short elapsed slot must leave its
-/// excerpt, stats and load slot exactly as its own layout has them.
+/// A row forced to the short time words pays the long width's room and the
+/// cells it saves buy nothing (`allocate_extras`): a busy row's forced short
+/// elapsed slot leaves its excerpt, stats and load slot exactly as its own
+/// layout has them.
 #[test]
 fn a_forced_short_elapsed_slot_spends_nothing() {
     let spec = RowSpec {
@@ -749,11 +728,9 @@ fn a_forced_short_elapsed_slot_spends_nothing() {
     );
 }
 
-/// `keep_command`: the tail is cut on a word boundary
-/// "as long as the command itself survives the cut whole; when even the
-/// command's own words are too long, as much of THEM as fits". A `Run `…``
-/// sentence whose command cannot survive whole keeps as much of the command
-/// as fits, never its first token alone.
+/// `keep_command`: when a `Run `…`` sentence's command cannot survive the
+/// cut whole, as much of the command as fits is kept, never its first token
+/// alone.
 #[test]
 fn a_run_sentence_keeps_as_much_of_its_command_as_fits() {
     let detail = "Run `x --flag-long-option-value-here` please";
@@ -768,9 +745,9 @@ fn a_run_sentence_keeps_as_much_of_its_command_as_fits() {
 
 // ---- presence ---------------------------------------------------------------
 
-/// `View::ripple_deadline`: "The next instant this view's
-/// PIXELS change on their own." At the instant it names the step has moved,
-/// and while the ripple runs it is never before `now`.
+/// `View::ripple_deadline` names the next instant the pixels change: at that
+/// instant the step has moved, and while the ripple runs it is never before
+/// `now`.
 #[test]
 fn the_ripple_deadline_names_an_instant_the_step_moves() {
     let start = Instant::now();
@@ -796,11 +773,10 @@ fn the_ripple_deadline_names_an_instant_the_step_moves() {
 
 // ---- marks and reloads across the handoff --------------------------------
 
-/// Rulings 270, 415 (l) and 416 (c): a row restated to another mark retires
-/// under the mark it SHOWS, written on its Retired line when it differs from
-/// the Posted line's. The ring's record reads the shown mark while the row
-/// lives, so the line is weighed against `logged_mark`,
-/// never against the record: a replay of the file reads the shown mark.
+/// A row restated to another mark retires under the mark it shows, written on
+/// its Retired line when it differs from the Posted line's. The ring's record
+/// reads the shown mark while the row lives, so the line is weighed against
+/// `logged_mark`, never the record: a replay of the file reads the shown mark.
 #[test]
 fn a_restated_mark_still_rides_the_retired_line() {
     let now = t0();
@@ -842,10 +818,10 @@ fn a_restated_mark_still_rides_the_retired_line() {
     assert_eq!(file.get(id).map(|r| r.severity), Some(Severity::Info));
 }
 
-/// Rulings 415 (l) and 416 (c), the same across a seed over the file's Posted line:
-/// the parent restated its row Warn → Info, the successor's boot load holds
-/// the parent's Posted line (Warn), and the row the seed re-opens takes that
-/// line's mark as the one it was logged under, so its Retired line says Info.
+/// The same across a seed: the parent restated its row Warn → Info, the
+/// successor's boot load holds the parent's Posted line (Warn), and the row
+/// the seed re-opens takes that line's mark as the one it was logged under,
+/// so its Retired line says Info.
 #[test]
 fn a_seeded_rows_restated_mark_rides_its_retired_line() {
     let now = t0();
@@ -895,10 +871,10 @@ fn a_seeded_rows_restated_mark_rides_its_retired_line() {
     );
 }
 
-/// Rulings 415 (c) and 416 (c): `commit_rows` moves the revision when its own
-/// rebalance moves the glass though the count stands: a restate raises a
-/// queued row's severity (a restate never re-ranks), and the commit that
-/// follows puts it on the one-row glass.
+/// `commit_rows` moves the revision when its own rebalance moves the glass
+/// though the count stands: a restate raises a queued row's severity (a
+/// restate never re-ranks), and the following commit puts it on the one-row
+/// glass.
 #[test]
 fn a_commit_that_moves_the_glass_bumps_the_revision() {
     let now = t0();
@@ -930,11 +906,11 @@ fn a_commit_that_moves_the_glass_bumps_the_revision() {
     );
 }
 
-/// Rulings 415 (f) and 416 (a): a record the SEED moved off a carried number (another
-/// writer's, under the parent's row's id) keeps its file id, so Commit's
-/// reload merges its ending into it once its words have changed: one post,
-/// one record. Both kinds of squatter: the file's own record of that number,
-/// and one a boot collision had loaded under it (its file id is another).
+/// A record the seed moved off a carried number (another writer's, under the
+/// parent's row's id) keeps its file id, so Commit's reload merges its ending
+/// into it once its words have changed: one post, one record. Both kinds of
+/// squatter: the file's own record of that number, and one a boot collision
+/// had loaded under it.
 #[test]
 fn a_squatter_the_seed_moved_merges_its_ending_on_reload() {
     let other = || posted(4, 100, tags::TOOLCHAIN, "Updating ALab tools");
@@ -1016,11 +992,11 @@ fn a_squatter_the_seed_moved_merges_its_ending_on_reload() {
     }
 }
 
-/// Rulings 415 (l) and 416 (b), the late park: the parent posted its row (Warn) after
-/// the successor's boot load, restated it to Info and parked. The seed has no
-/// Posted line to weigh the mark against and takes the carried Info; Commit's
-/// reload reads the file's Posted line (Warn), and the row's Retired line must
-/// carry Info so the file reads what the row showed (ruling 270).
+/// The late park: the parent posted its row (Warn) after the successor's boot
+/// load, restated it to Info and parked. The seed has no Posted line to weigh
+/// the mark against and takes the carried Info; Commit's reload reads the
+/// file's Posted line (Warn), and the row's Retired line still carries Info,
+/// so the file reads what the row showed.
 #[test]
 fn a_late_parked_rows_restated_mark_rides_its_retired_line() {
     let now = t0();
@@ -1074,12 +1050,11 @@ fn a_late_parked_rows_restated_mark_rides_its_retired_line() {
 
 // ---- progress -------------------------------------------------------------
 
-/// Rulings 265/266: a count's patience is
-/// max(STALL_AFTER, COUNT_STALL_GAPS × its own mean gap between advances),
-/// and restarts when a held phase ends; the plateau the held phase sat
-/// through is "the plan, not a stall", so it is no part of the count's pace.
-/// A count that moved once a second before a two-minute verify, and then
-/// really stops, says `stalled` 10 s after the phase ends.
+/// A count's patience is max(STALL_AFTER, COUNT_STALL_GAPS × its own mean gap
+/// between advances) and restarts when a held phase ends; the plateau is no
+/// part of the count's pace. A count that moved once a second before a
+/// two-minute held phase, and then really stops, says `stalled` 10 s after
+/// the phase ends.
 #[test]
 fn a_held_plateau_never_inflates_the_counts_pace() {
     let base = t0();
@@ -1095,7 +1070,7 @@ fn a_held_plateau_never_inflates_the_counts_pace() {
     for k in 0..=4u64 {
         t.observe(at(k * 1000), steps(k * 10, Unit::Steps));
     }
-    // A program verifies for two minutes: the fill holds, re-fed every 2 s.
+    // A two-minute held phase: the fill holds, re-fed every 2 s.
     for k in 0..=60u64 {
         let now = at(4_000 + k * 2_000);
         t.observe(now, steps(40, Unit::HeldSteps));
@@ -1114,10 +1089,8 @@ fn a_held_plateau_never_inflates_the_counts_pace() {
 
 // ---- words: the finished-verb table ----------------------------------------
 
-/// Rulings 259/263/265: a live row withdrawn by a
-/// Fault is logged `… stopped`, by a Vanish `… ended`, with its live title
-/// as the first detail line. The rewrap row's title leads with
-/// `Rewrapping`, a band title of this very crate.
+/// A live row withdrawn by a Fault is logged `… stopped` (by a Vanish
+/// `… ended`), with its live title as the first detail line.
 #[test]
 fn a_failed_rewrap_is_logged_stopped() {
     let now = t0();
@@ -1141,9 +1114,8 @@ fn a_failed_rewrap_is_logged_stopped() {
     );
 }
 
-/// The paste row withdrawn because its session
-/// went away (a Vanish) is logged `Pasting ended`, not in its in-flight
-/// words.
+/// A paste row withdrawn because its session went away (a Vanish) is logged
+/// `Pasting ended`, not in its in-flight words.
 #[test]
 fn a_paste_whose_session_went_away_is_logged_ended() {
     let now = t0();
@@ -1190,11 +1162,10 @@ fn view_at(at_unix_ms: u64) -> MessageView {
     }
 }
 
-/// Rulings 262/273: the page is sectioned by the
-/// reader's LOCAL day; what a screen reader hears for a row agrees with the
-/// header it sits under. At UTC−7 on Tuesday 08:00, an entry of Sunday
-/// 20:00 (36 h ago) sits under `Sunday` and an entry of Friday 20:00 local
-/// (Saturday 03:00 UTC) under `Friday`.
+/// The page is sectioned by the reader's local day, and what a screen reader
+/// hears for a row agrees with its header: at UTC−7 on Tuesday 08:00, an
+/// entry of Sunday 20:00 (36 h ago) sits under `Sunday` and one of Friday
+/// 20:00 local (Saturday 03:00 UTC) under `Friday`.
 #[test]
 fn the_spoken_when_agrees_with_the_local_day_header() {
     let off: i64 = -25_200;
@@ -1219,10 +1190,8 @@ fn the_spoken_when_agrees_with_the_local_day_header() {
 
 // ---- waits: line counts -----------------------------------------------------
 
-/// `lines_words`' doc (`950`, `12K`, `340K`,
-/// `1.2M`, `12M`) and its M branch: a figure that would round to ten of the
-/// tenths unit reads as the whole unit, so 9,950–9,999 lines read `10K`,
-/// never `10.0K`.
+/// `lines_words`: a figure that would round to ten of the tenths unit reads
+/// as the whole unit, so 9,950–9,999 lines read `10K`, never `10.0K`.
 #[test]
 fn a_count_that_rounds_to_ten_thousand_reads_10k() {
     assert_eq!(lines_words(9_949), "9.9K");
@@ -1241,10 +1210,9 @@ fn marks(c: &mut MessageCenter, id: MessageId) -> ((Severity, Glyph), Option<(Se
     (ring, file.get(id).map(|r| (r.severity, r.glyph)))
 }
 
-/// Rulings 270 and 415 (l), and `keep_as_record`'s
-/// doc: a row retires under the mark it shows, and the ring and the file
-/// agree. A stall entry restated Warn, then kept as an Info record, reads
-/// Info in the ring (the page, `messages sev=`) as in the file.
+/// A row retires under the mark it shows, and the ring and the file agree: a
+/// stall entry restated Warn, then kept as an Info record (`keep_as_record`),
+/// reads Info in the ring (the page, `messages sev=`) as in the file.
 #[test]
 fn a_record_kept_under_its_first_mark_reads_it_in_the_ring() {
     let now = t0();
@@ -1279,9 +1247,8 @@ fn a_record_kept_under_its_first_mark_reads_it_in_the_ring() {
     assert_eq!(ring, info_mark, "the ring reads the mark the file does");
 }
 
-/// The second trigger: a restate to Info that also
-/// folds the row (`hold: LogOnly`) retires it under Info; the ring must not
-/// keep the Warn an earlier restate showed.
+/// A restate to Info that also folds the row (`hold: LogOnly`) retires it
+/// under Info; the ring does not keep the Warn an earlier restate showed.
 #[test]
 fn a_row_restated_back_to_info_and_folded_reads_info_in_the_ring() {
     let now = t0();
@@ -1324,12 +1291,11 @@ fn a_row_restated_back_to_info_and_folded_reads_info_in_the_ring() {
 
 // ---- log: the reload merge --------------------------------------------------
 
-/// Finding 41 and ruling 415 (f): the reload merge
-/// gives a Stale record the ending the FILE has for THAT record. Two records
-/// of one stamp, tag and title: the first folded, the second still open when
-/// aterm stopped. The successor's own post evicts the first from its full
-/// ring before Commit; the merge must not hand the first's ending to the
-/// second.
+/// The reload merge gives a Stale record the ending the file has for that
+/// record: of two records with one stamp, tag and title (the first folded,
+/// the second still open when aterm stopped), the successor's own post
+/// evicts the first from its full ring before Commit, and the merge must not
+/// hand the first's ending to the second.
 #[test]
 fn the_reload_merge_never_hands_one_records_ending_to_its_twin() {
     let lines = || {
@@ -1381,14 +1347,13 @@ fn the_reload_merge_never_hands_one_records_ending_to_its_twin() {
     );
 }
 
-/// Ruling 259 (a count a determinate row shows and its fill agree) and
-/// ruling 441 (a): the band FLOORS a fill to its percent and `count_span`
-/// ROUNDS each count's permille, so a fill measured finer than its count is
-/// held one permille under the PERCENT the next count paints, never at it:
-/// `3 of 10 programs` at 45 % paints `39%`, not `4 of 10`'s `40%`; `9 of 10`
-/// never fills the whole bar while one is left; `1 of 3` stops at `65%`,
+/// A determinate row's count and its fill agree: the band floors a fill to
+/// its percent and `count_span` rounds each count's permille, so a fill
+/// measured finer than its count is held one permille under the percent the
+/// next count paints: `3 of 10 programs` at 45 % paints `39%`, not `4 of
+/// 10`'s `40%`; `9 of 10` never fills the bar; `1 of 3` stops at `65%`
 /// because `2 of 3` paints `66%` (667). Every count of every total up to
-/// twelve, wherever the two counts' own percents differ at all.
+/// twelve, wherever the two counts' percents differ.
 #[test]
 fn a_measured_fill_never_paints_the_next_counts_percent() {
     let fill = |fill: u16, stats: &str, amount: bool| {
@@ -1425,11 +1390,10 @@ fn a_measured_fill_never_paints_the_next_counts_percent() {
     assert!(reached.is_empty(), "{reached:#?}");
 }
 
-/// Ruling 175 (`load=` only while the row shows its load words) and ruling
-/// 246 (the work's own primary load shows only while other work is
-/// measurably slowed) are one rule for the band and the `messages` line
-/// (ruling 441 (b), `Live::said_load`): a download row whose `network busy`
-/// the band does not paint must not print `load=network`.
+/// The band and the `messages` line share one load rule (`Live::said_load`):
+/// the work's own primary load shows only while other work is measurably
+/// slowed, so a download row whose `network busy` the band does not paint
+/// prints no `load=network`.
 #[test]
 fn messages_prints_load_only_where_the_glass_says_it() {
     let now = t0();
@@ -1509,12 +1473,12 @@ impl Host for Plain {
     }
 }
 
-/// Ruling 267 keeps `still open when aterm stopped` for a record replayed
-/// open from a process that was killed or crashed. A seamless handoff is a
-/// graceful end of the parent: the rows its carry did not take (an
-/// unrevealed row, the strain level) are closed by the parent at Commit
-/// (`MessageCenter::close_uncarried`, ruling 441 (d)), never read in the
-/// successor as cut off by a crash.
+/// `still open when aterm stopped` is for a record replayed open from a
+/// process that was killed or crashed. A seamless handoff ends the parent
+/// gracefully: the rows its carry did not take (an unrevealed row, the strain
+/// level) are closed by the parent at Commit
+/// (`MessageCenter::close_uncarried`), never read in the successor as cut
+/// off by a crash.
 #[test]
 fn rows_the_carry_drops_are_not_read_as_a_crash_in_the_successor() {
     let now = t0();

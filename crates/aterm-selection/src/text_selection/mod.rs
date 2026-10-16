@@ -376,7 +376,10 @@ impl TextSelection {
     /// which excludes the whole end row — retreat to the previous row with
     /// `end_col = u16::MAX`. Shared by `side_adjusted_bounds`, `contains`, and
     /// `project_range` so all sites agree on the selected region.
-    fn apply_side_adjustment(ns: SelectionAnchor, ne: SelectionAnchor) -> (i32, u16, i32, u16) {
+    fn apply_side_adjustment(
+        ns: SelectionAnchor,
+        ne: SelectionAnchor,
+    ) -> Option<(i32, u16, i32, u16)> {
         let start_col = if ns.side == SelectionSide::Right {
             ns.col.saturating_add(1)
         } else {
@@ -386,12 +389,14 @@ impl TextSelection {
             if ne.col > 0 {
                 (ne.row, ne.col - 1)
             } else {
-                (ne.row - 1, u16::MAX)
+                // An end before the first representable row contains no cells.
+                // Saturating here would instead select that entire row.
+                (ne.row.checked_sub(1)?, u16::MAX)
             }
         } else {
             (ne.row, ne.col)
         };
-        (ns.row, start_col, end_row, end_col)
+        Some((ns.row, start_col, end_row, end_col))
     }
 
     /// Get side-adjusted selection bounds matching the visual highlight.
@@ -400,7 +405,8 @@ impl TextSelection {
     /// have been adjusted for sub-cell side positioning. A `Right`-sided start
     /// shifts `start_col` forward by 1; a `Left`-sided end shifts `end_col`
     /// backward by 1. This matches the column range used by [`Self::contains`]
-    /// and [`Self::project_range`].
+    /// and [`Self::project_range`]. `Lines` selections cover whole rows and
+    /// return columns `0..=u16::MAX`, independent of anchor sides.
     ///
     /// Returns `None` if no selection is active or if the selection is empty
     /// after side adjustment.
@@ -412,7 +418,13 @@ impl TextSelection {
         let ns = self.normalized_start();
         let ne = self.normalized_end();
 
-        let (start_row, start_col, end_row, end_col) = Self::apply_side_adjustment(ns, ne);
+        // Full-line selections ignore sub-cell sides and columns everywhere:
+        // copy, hit-testing and rendering must resolve the same row span even
+        // while a drag or shift-click has not called `expand_lines`.
+        if self.selection_type == SelectionType::Lines {
+            return Some((ns.row, 0, ne.row, u16::MAX));
+        }
+        let (start_row, start_col, end_row, end_col) = Self::apply_side_adjustment(ns, ne)?;
         if start_row > end_row || (start_row == end_row && start_col > end_col) {
             return None;
         }
@@ -535,7 +547,7 @@ impl TextSelection {
     /// [`Self::truncated`]).
     ///
     /// Rows are live-screen coordinates, scrollback negative. The valid range is
-    /// `-floor` (the deepest retained-history row) up to `max_rows`; the lower
+    /// `-floor` (the deepest retained-history row) up to, excluding, `max_rows`; the lower
     /// bound is the scrollback floor, not the visible height, or ordinary output
     /// would clear a selection still pinned on screen (#4056).
     pub fn adjust_for_scroll(&mut self, delta: i32, max_rows: i32, floor: i32) -> bool {
@@ -558,7 +570,7 @@ impl TextSelection {
 
         // Above the live bottom there is no content to clamp onto: clear. The
         // control socket's `select` verb relies on this for out-of-range rows.
-        if new_start_row > max_rows || new_end_row > max_rows {
+        if new_start_row >= max_rows || new_end_row >= max_rows {
             self.clear();
             return false;
         }
@@ -665,7 +677,7 @@ impl TextSelection {
         let new_start_row = remap(self.start.row);
         let new_end_row = remap(self.end.row);
         let min_row = floor.saturating_neg();
-        if new_start_row > max_rows || new_end_row > max_rows {
+        if new_start_row >= max_rows || new_end_row >= max_rows {
             self.clear();
             return false;
         }
@@ -715,41 +727,28 @@ impl TextSelection {
     /// own it will divide one. Anything painting cells wants
     /// [`Self::contains_cell`], which counts a glyph whole.
     pub fn contains(&self, row: i32, col: u16) -> bool {
-        if self.state == SelectionState::None {
+        let Some((start_row, start_col, end_row, end_col)) = self.side_adjusted_bounds() else {
             return false;
-        }
-
-        let ns = self.normalized_start();
-        let ne = self.normalized_end();
+        };
 
         match self.selection_type {
-            SelectionType::Lines => row >= ns.row && row <= ne.row,
-            SelectionType::Block => {
-                let (start_row, start_col, end_row, end_col) = Self::apply_side_adjustment(ns, ne);
-                aterm_types::selection::selection_contains_block(
-                    row,
-                    usize::from(col),
-                    start_row,
-                    usize::from(start_col),
-                    end_row,
-                    usize::from(end_col),
-                )
-            }
+            SelectionType::Block => aterm_types::selection::selection_contains_block(
+                row,
+                usize::from(col),
+                start_row,
+                usize::from(start_col),
+                end_row,
+                usize::from(end_col),
+            ),
             // Simple, Semantic, and future variants are linear.
-            _ => {
-                let (start_row, start_col, end_row, end_col) = Self::apply_side_adjustment(ns, ne);
-                if start_row > end_row || (start_row == end_row && start_col > end_col) {
-                    return false;
-                }
-                aterm_types::selection::selection_contains_linear(
-                    row,
-                    usize::from(col),
-                    start_row,
-                    usize::from(start_col),
-                    end_row,
-                    usize::from(end_col),
-                )
-            }
+            _ => aterm_types::selection::selection_contains_linear(
+                row,
+                usize::from(col),
+                start_row,
+                usize::from(start_col),
+                end_row,
+                usize::from(end_col),
+            ),
         }
     }
 
@@ -759,16 +758,7 @@ impl TextSelection {
     /// after side adjustment. `last_col` is the rightmost column index for
     /// `Lines` selection expansion.
     pub fn project_range(&self, last_col: u16) -> Option<SelectionProjection> {
-        if self.state == SelectionState::None {
-            return None;
-        }
-
-        let ns = self.normalized_start();
-        let ne = self.normalized_end();
-        let (start_row, start_col, end_row, end_col) = Self::apply_side_adjustment(ns, ne);
-        if start_row > end_row {
-            return None;
-        }
+        let (start_row, start_col, end_row, end_col) = self.side_adjusted_bounds()?;
         // `Lines` spans whole rows whatever the sub-cell sides say.
         if self.selection_type == SelectionType::Lines {
             return Some(SelectionProjection {
@@ -778,9 +768,6 @@ impl TextSelection {
                 end_col: last_col,
                 is_block: false,
             });
-        }
-        if start_row == end_row && start_col > end_col {
-            return None;
         }
         Some(SelectionProjection {
             start_row,
@@ -793,12 +780,17 @@ impl TextSelection {
 
     /// Expand the selection to include the entire cell on both ends.
     ///
-    /// Sets the start side to `Left` and the end side to `Right`, ensuring
-    /// that `project_range` will not clip partial cells.
+    /// Sets the earlier anchor's side to `Left` and the later anchor's side
+    /// to `Right`, ensuring that `project_range` will not clip either endpoint.
     pub fn include_all(&mut self) {
         if self.state != SelectionState::None {
-            self.start.side = SelectionSide::Left;
-            self.end.side = SelectionSide::Right;
+            if self.start <= self.end {
+                self.start.side = SelectionSide::Left;
+                self.end.side = SelectionSide::Right;
+            } else {
+                self.start.side = SelectionSide::Right;
+                self.end.side = SelectionSide::Left;
+            }
         }
     }
 

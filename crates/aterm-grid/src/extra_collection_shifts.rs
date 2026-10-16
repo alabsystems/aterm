@@ -2,9 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Region and column shift operations for [`CellExtras`]: scroll-region
-//! shifts and insert/delete character column shifts, all O(E) drain-rebuild
-//! since they affect subsets of rows.
+//! Region and column shifts for [`CellExtras`]: scroll-region shifts and ICH/DCH
+//! column shifts. Each touches a subset of rows, so each drain-rebuilds (O(E)).
 
 use aterm_hash::FxHashMap;
 
@@ -12,38 +11,41 @@ use super::extra_collection::CellExtras;
 use crate::extra::{CellCoord, CellExtra};
 
 impl CellExtras {
-    /// Batch shift rows up within a bounded region by `n`.
-    ///
-    /// Rows in `[top, top + n)` are deleted. Rows in `[top + n, bottom]` are
-    /// shifted up by `n`. Rows outside `[top, bottom]` are preserved.
-    /// Single HashMap drain-rebuild: O(E) regardless of `n`.
-    ///
-    /// Combines offset compaction and region shift into one pass to avoid
-    /// the double drain-rebuild that `compact()` + shift would require.
+    /// Shift rows up within `[top, bottom]` by `n`: rows `[top, top + n)` drop,
+    /// `[top + n, bottom]` shift up, rows outside stay. One drain-rebuild (O(E)
+    /// for any `n`) that also compacts the row offset.
     pub(crate) fn shift_region_up_by(&mut self, top: u16, bottom: u16, n: u16) {
-        // Shift the dense rings (RGB truecolor + complex chars) the same way as
-        // the HashMap below; ring-only entries never spill to the HashMap, so a
-        // wholesale wipe would drop truecolor for rows outside the region.
+        // The dense rings shift the same way (in every shift below): ring-only
+        // entries never reach the map, so a wholesale wipe would drop truecolor
+        // and complex chars outside the region.
         self.shift_rings_region_up(top, bottom, n);
         if n == 0 || self.data.is_empty() {
             return;
         }
-        #[cfg(any(test, feature = "testing"))]
+        #[cfg(any(test, debug_assertions))]
         crate::test_counters::count_extras_shift_ops(self.data.len());
+        // No pending offset and no entry inside `[top, bottom]`: the rebuild
+        // would be an identity copy.
         let offset = self.take_row_offset();
+        if offset == 0
+            && !self
+                .data
+                .keys()
+                .any(|coord| (top..=bottom).contains(&coord.row))
+        {
+            return;
+        }
         let shift_start = top.checked_add(n);
         let mut new_data =
             FxHashMap::with_capacity_and_hasher(self.data.len(), aterm_hash::FxBuildHasher);
         for (coord, extra) in self.data.drain() {
-            // Apply accumulated row offset: convert internal -> external row.
-            // Entries with internal row < offset are stale -- drop them.
+            // Internal row < offset: stale, drop.
             if coord.row < offset {
                 continue;
             }
             let ext_row = coord.row - offset;
 
             if ext_row < top || ext_row > bottom {
-                // Outside region: preserve with external coords
                 new_data.insert(CellCoord::new(ext_row, coord.col), extra);
                 continue;
             }
@@ -51,36 +53,36 @@ impl CellExtras {
             if let Some(shift_start) = shift_start
                 && ext_row >= shift_start
             {
-                // Within region and below deleted rows: shift up by n
                 new_data.insert(CellCoord::new(ext_row - n, coord.col), extra);
             }
-            // Rows in [top, top + n) are deleted, including the top row.
         }
         self.data = new_data;
         self.enforce_hyperlink_limit();
     }
 
-    /// Shift rows down within `[top, bottom]` by `n`. Rows in `[bottom-n+1, bottom]`
-    /// dropped; `[top, bottom-n]` shifted. O(E) drain-rebuild.
-    ///
-    /// Combines offset compaction and region shift into one pass to avoid
-    /// the double drain-rebuild that `compact()` + shift would require.
+    /// Shift rows down within `[top, bottom]` by `n`: rows `[bottom-n+1, bottom]`
+    /// drop, `[top, bottom-n]` shift down. One drain-rebuild that also compacts
+    /// the row offset.
     pub(crate) fn shift_region_down_by(&mut self, top: u16, bottom: u16, n: u16) {
-        // Shift the dense rings the SAME way as the HashMap — see
-        // shift_region_up_by.
         self.shift_rings_region_down(top, bottom, n);
         if n == 0 || self.data.is_empty() {
             return;
         }
-        #[cfg(any(test, feature = "testing"))]
+        #[cfg(any(test, debug_assertions))]
         crate::test_counters::count_extras_shift_ops(self.data.len());
         let offset = self.take_row_offset();
+        if offset == 0
+            && !self
+                .data
+                .keys()
+                .any(|coord| (top..=bottom).contains(&coord.row))
+        {
+            return;
+        }
         let drop_start = bottom.saturating_sub(n.saturating_sub(1));
         let mut new_data =
             FxHashMap::with_capacity_and_hasher(self.data.len(), aterm_hash::FxBuildHasher);
         for (coord, extra) in self.data.drain() {
-            // Apply accumulated row offset: convert internal -> external row.
-            // Entries with internal row < offset are stale -- drop them.
             if coord.row < offset {
                 continue;
             }
@@ -88,7 +90,7 @@ impl CellExtras {
 
             if ext_row >= top && ext_row <= bottom {
                 if ext_row < drop_start {
-                    // saturating_add: prevent u16 overflow (result fits per caller invariant)
+                    // ext_row + n <= bottom, so this never saturates.
                     new_data.insert(CellCoord::new(ext_row.saturating_add(n), coord.col), extra);
                 }
             } else {
@@ -99,14 +101,9 @@ impl CellExtras {
         self.enforce_hyperlink_limit();
     }
 
-    /// Shift extras up within a rectangular region `[top, bottom] × [left, right]`.
-    ///
-    /// Rows `[top, top + n)` within the column range are deleted.
-    /// Rows `[top + n, bottom]` within the column range shift up by `n`.
-    /// Entries outside the column range `[left, right]` are preserved unchanged.
-    /// Entries outside the row range `[top, bottom]` are preserved unchanged.
-    ///
-    /// Used by `scroll_region_up_margined` (DECLRMM).
+    /// Shift extras up within the rect `[top, bottom] × [left, right]` (DECLRMM
+    /// scroll and DL): rows `[top, top + n)` drop, rows `[top + n, bottom]` move
+    /// up by `n`, entries outside the rect stay.
     pub(crate) fn shift_rect_up_by(
         &mut self,
         top: u16,
@@ -115,13 +112,11 @@ impl CellExtras {
         right: u16,
         n: u16,
     ) {
-        // Shift the dense rings within the rect the SAME way as the HashMap —
-        // see shift_region_up_by.
         self.shift_rings_rect_up(top, bottom, left, right, n);
         if n == 0 || self.data.is_empty() {
             return;
         }
-        #[cfg(any(test, feature = "testing"))]
+        #[cfg(any(test, debug_assertions))]
         crate::test_counters::count_extras_shift_ops(self.data.len());
         let offset = self.take_row_offset();
         let shift_start = top.checked_add(n);
@@ -139,25 +134,19 @@ impl CellExtras {
                 continue;
             }
 
-            // Inside the rect: shift up or drop.
             if let Some(shift_start) = shift_start
                 && ext_row >= shift_start
             {
                 new_data.insert(CellCoord::new(ext_row - n, coord.col), extra);
             }
-            // Rows in [top, top + n) within the column range are deleted.
         }
         self.data = new_data;
         self.enforce_hyperlink_limit();
     }
 
-    /// Shift extras down within a rectangular region `[top, bottom] × [left, right]`.
-    ///
-    /// Rows `[bottom - n + 1, bottom]` within the column range are dropped.
-    /// Rows `[top, bottom - n]` within the column range shift down by `n`.
-    /// Entries outside the column range or row range are preserved unchanged.
-    ///
-    /// Used by `scroll_region_down_margined` (DECLRMM).
+    /// Shift extras down within the rect `[top, bottom] × [left, right]`
+    /// (DECLRMM scroll and IL): rows `[top, bottom - n]` move down by `n`, rows
+    /// `[bottom - n + 1, bottom]` drop, entries outside the rect stay.
     pub(crate) fn shift_rect_down_by(
         &mut self,
         top: u16,
@@ -166,13 +155,11 @@ impl CellExtras {
         right: u16,
         n: u16,
     ) {
-        // Shift the dense rings within the rect the SAME way as the HashMap —
-        // see shift_region_up_by.
         self.shift_rings_rect_down(top, bottom, left, right, n);
         if n == 0 || self.data.is_empty() {
             return;
         }
-        #[cfg(any(test, feature = "testing"))]
+        #[cfg(any(test, debug_assertions))]
         crate::test_counters::count_extras_shift_ops(self.data.len());
         let offset = self.take_row_offset();
         let drop_start = bottom.saturating_sub(n.saturating_sub(1));
@@ -190,11 +177,9 @@ impl CellExtras {
                 continue;
             }
 
-            // Inside the rect: shift down or drop.
             if ext_row < drop_start {
                 new_data.insert(CellCoord::new(ext_row.saturating_add(n), coord.col), extra);
             }
-            // Rows in [drop_start, bottom] within the column range are dropped.
         }
         self.data = new_data;
         self.enforce_hyperlink_limit();
@@ -203,14 +188,9 @@ impl CellExtras {
     /// Extract every entry on `internal_row` in `[start_col, max_col)`, removing
     /// it from the map, and return the `(col, extra)` pairs.
     ///
-    /// The map is keyed by coordinate, so the column range (at most `cols`
-    /// wide) can be probed in O(width) lookups instead of iterating every key
-    /// in the grid-wide map (O(E), all rows). A scan is still cheaper when the
-    /// map is small relative to the range, so each call picks.
-    ///
-    /// The two branches extract in different orders, which is unobservable:
-    /// the caller's reinsert loop is order-independent and the shift is
-    /// injective on destination keys.
+    /// Probes the column range (O(width)) unless the map is smaller than the
+    /// range, where a key scan is cheaper. The two branches extract in different
+    /// orders, which is unobservable: the caller's reinsert is order-independent.
     fn take_row_range(
         &mut self,
         internal_row: u16,
@@ -222,8 +202,7 @@ impl CellExtras {
         let width = usize::from(max_col.saturating_sub(start_col));
         if width.saturating_mul(2) <= self.data.len() {
             for col in start_col..max_col {
-                // `internal_row` is already offset-mapped — key it directly
-                // rather than re-mapping through `internal_coord`.
+                // `internal_row` is already offset-mapped.
                 if let Some(extra) = self.data.remove(&CellCoord::new(internal_row, col)) {
                     extracted.push((col, extra));
                 }
@@ -246,25 +225,20 @@ impl CellExtras {
 
     /// Shift columns right within a single row for ICH (Insert Character).
     ///
-    /// Columns in `[start_col, max_col - count)` shift right by `count`.
-    /// Columns in `[start_col, start_col + count)` are cleared (new blanks).
-    /// Columns that shift past `max_col` are dropped.
-    /// Only extracts and reinserts entries on the target row — non-target rows
-    /// are never moved and no new HashMap is allocated.
+    /// Columns in `[start_col, max_col - count)` shift right by `count`;
+    /// `[start_col, start_col + count)` are cleared; columns pushed past
+    /// `max_col` drop. Only the target row's entries move.
     pub fn shift_cols_right(&mut self, row: u16, start_col: u16, count: u16, max_col: u16) {
-        // Shift the dense rings on this row the same way as the HashMap, keeping
-        // unaffected cells' truecolor/complex chars (and other rows') on ICH.
         self.shift_rings_cols_right(row, start_col, count, max_col);
         if count == 0 || self.data.is_empty() {
             return;
         }
-        #[cfg(any(test, feature = "testing"))]
+        #[cfg(any(test, debug_assertions))]
         crate::test_counters::count_extras_shift_ops(self.data.len());
         let internal_row = self.internal_row(row);
         // Extract all affected entries, then reinsert shifted, so a destination
-        // cannot collide with a not-yet-processed source key. Only columns in
-        // [start_col, max_col) are extracted; entries at or past max_col are
-        // outside the margin (DECLRMM) and stay in place, as in shift_cols_left.
+        // cannot collide with a not-yet-processed source key. Entries at or past
+        // max_col are outside the margin (DECLRMM) and stay in place.
         let extracted = self.take_row_range(internal_row, start_col, max_col);
         for (col, extra) in extracted {
             let new_col = col.saturating_add(count);
@@ -272,39 +246,31 @@ impl CellExtras {
                 self.data
                     .insert(CellCoord::new(internal_row, new_col), extra);
             }
-            // Extras that shift past max_col are dropped
         }
         self.maybe_shrink();
     }
 
     /// Shift columns left within a single row for DCH (Delete Character).
     ///
-    /// Columns in `[start_col, start_col + count)` are deleted.
-    /// Columns in `[start_col + count, max_col)` shift left by `count`.
-    /// Only extracts and reinserts entries on the target row — non-target rows
-    /// are never moved and no new HashMap is allocated.
+    /// Columns in `[start_col, start_col + count)` are deleted; columns in
+    /// `[start_col + count, max_col)` shift left by `count`. Only the target
+    /// row's entries move.
     pub(crate) fn shift_cols_left(&mut self, row: u16, start_col: u16, count: u16, max_col: u16) {
-        // Shift the dense rings on this row the SAME way as the HashMap — see
-        // shift_cols_right.
         self.shift_rings_cols_left(row, start_col, count, max_col);
         if count == 0 || self.data.is_empty() {
             return;
         }
-        #[cfg(any(test, feature = "testing"))]
+        #[cfg(any(test, debug_assertions))]
         crate::test_counters::count_extras_shift_ops(self.data.len());
         let internal_row = self.internal_row(row);
         let shift_start = start_col.saturating_add(count);
-        // Two-phase extract-then-reinsert (same rationale as shift_cols_right).
-        // Only extract columns within [start_col, max_col); columns at or beyond
-        // max_col are outside the margin boundary and must be preserved in place.
+        // Extract then reinsert, as in shift_cols_right.
         let extracted = self.take_row_range(internal_row, start_col, max_col);
         for (col, extra) in extracted {
             if col >= shift_start {
-                // After deletion range: shift left by count
                 self.data
                     .insert(CellCoord::new(internal_row, col - count), extra);
             }
-            // Columns in [start_col, start_col + count) are deleted
         }
         self.maybe_shrink();
     }
@@ -316,26 +282,23 @@ mod tests {
 
     use super::*;
 
-    /// Helper: create a CellExtra with an fg RGB color to make `has_data()` true.
+    /// An extra whose fg RGB makes `has_data()` true.
     fn extra_with_fg(r: u8, g: u8, b: u8) -> CellExtra {
         let mut e = CellExtra::default();
         e.set_fg_rgb(Some([r, g, b]));
         e
     }
 
-    /// Helper: create a CellExtra with a hyperlink to test hyperlink-bearing entries.
     fn extra_with_hyperlink(url: &str) -> CellExtra {
         let mut e = CellExtra::default();
         e.set_hyperlink(Some(Arc::from(url)));
         e
     }
 
-    /// Helper: insert an extra at external (row, col) into the collection.
     fn insert(extras: &mut CellExtras, row: u16, col: u16, extra: CellExtra) {
         extras.set(CellCoord::new(row, col), extra);
     }
 
-    /// Helper: check that an extra exists at external (row, col) and has fg RGB.
     fn has_fg_at(extras: &CellExtras, row: u16, col: u16) -> bool {
         extras
             .get(CellCoord::new(row, col))
@@ -343,16 +306,13 @@ mod tests {
             .is_some()
     }
 
-    /// Helper: get the fg RGB value at (row, col).
     fn fg_at(extras: &CellExtras, row: u16, col: u16) -> Option<[u8; 3]> {
         extras
             .get(CellCoord::new(row, col))
             .and_then(|e| e.fg_rgb())
     }
 
-    // =========================================================================
     // shift_region_up_by
-    // =========================================================================
 
     #[test]
     fn test_shift_region_up_full_screen() {
@@ -360,7 +320,6 @@ mod tests {
         for r in 0..5u16 {
             insert(&mut extras, r, 0, extra_with_fg(r as u8, 0, 0));
         }
-        // Full-screen region [0, 23], shift up by 3: rows 0-2 deleted, rows 3-4 -> 0-1
         extras.shift_region_up_by(0, 23, 3);
         assert_eq!(extras.len(), 2);
         assert_eq!(fg_at(&extras, 0, 0), Some([3, 0, 0]));
@@ -373,21 +332,16 @@ mod tests {
         insert(&mut extras, 5, 0, extra_with_fg(50, 0, 0));
         insert(&mut extras, 10, 0, extra_with_fg(100, 0, 0));
 
-        // Simulate prior full-screen scrolls to accumulate offset
+        // Accumulate a row offset.
         extras.shift_rows_up_by(0, 2);
-        // Now external row 5 means what was row 7, etc.
-        // Insert at new external row 3 (internal = 3 + offset)
+        // Then insert at external row 3 (internal 3 + offset).
         insert(&mut extras, 3, 1, extra_with_fg(30, 0, 0));
 
-        // Region shift should handle the offset correctly
         extras.shift_region_up_by(0, 23, 1);
-        // Entry at external row 3 should move to 2
         assert_eq!(fg_at(&extras, 2, 1), Some([30, 0, 0]));
     }
 
-    // =========================================================================
     // shift_region_down_by
-    // =========================================================================
 
     #[test]
     fn test_shift_region_down_drops_bottom_rows() {
@@ -396,7 +350,6 @@ mod tests {
         insert(&mut extras, 9, 0, extra_with_fg(90, 0, 0));
         insert(&mut extras, 5, 0, extra_with_fg(50, 0, 0));
 
-        // Region [0, 9], shift down by 2: rows [8, 9] dropped, row 5 -> 7
         extras.shift_region_down_by(0, 9, 2);
         assert_eq!(fg_at(&extras, 7, 0), Some([50, 0, 0]));
         assert!(!has_fg_at(&extras, 8, 0), "bottom rows should be dropped");
@@ -409,15 +362,12 @@ mod tests {
         insert(&mut extras, 0, 0, extra_with_fg(1, 0, 0));
         insert(&mut extras, 9, 0, extra_with_fg(9, 0, 0));
 
-        // Region [0, 9], shift down by 1: row 9 dropped, row 0 -> 1
         extras.shift_region_down_by(0, 9, 1);
         assert_eq!(fg_at(&extras, 1, 0), Some([1, 0, 0]));
         assert!(!has_fg_at(&extras, 9, 0) || fg_at(&extras, 9, 0) != Some([9, 0, 0]));
     }
 
-    // =========================================================================
     // shift_rect_up_by
-    // =========================================================================
 
     #[test]
     fn test_shift_rect_up_zero_n_is_noop() {
@@ -430,14 +380,10 @@ mod tests {
     #[test]
     fn test_shift_rect_up_only_affects_column_range() {
         let mut extras = CellExtras::new();
-        // Inside rect column range
         insert(&mut extras, 4, 10, extra_with_fg(40, 10, 0));
-        // Outside rect column range (same row, col < left)
         insert(&mut extras, 4, 2, extra_with_fg(40, 2, 0));
-        // Outside rect column range (same row, col > right)
         insert(&mut extras, 4, 20, extra_with_fg(40, 20, 0));
 
-        // Rect [2, 8] x [5, 15], shift up by 2: row 4, col 10 is inside
         extras.shift_rect_up_by(2, 8, 5, 15, 2);
         assert_eq!(
             fg_at(&extras, 2, 10),
@@ -459,12 +405,9 @@ mod tests {
     #[test]
     fn test_shift_rect_up_deletes_top_rows_in_rect() {
         let mut extras = CellExtras::new();
-        // Row at top of rect (will be deleted)
         insert(&mut extras, 2, 10, extra_with_fg(20, 0, 0));
-        // Row below deleted range
         insert(&mut extras, 5, 10, extra_with_fg(50, 0, 0));
 
-        // Rect [2, 8] x [5, 15], shift up by 2: row 2 in [2, 3] deleted, row 5 -> 3
         extras.shift_rect_up_by(2, 8, 5, 15, 2);
         assert!(
             !has_fg_at(&extras, 2, 10),
@@ -480,9 +423,7 @@ mod tests {
     #[test]
     fn test_shift_rect_up_preserves_outside_row_range() {
         let mut extras = CellExtras::new();
-        // Entry above rect row range
         insert(&mut extras, 0, 10, extra_with_fg(1, 0, 0));
-        // Entry below rect row range
         insert(&mut extras, 15, 10, extra_with_fg(150, 0, 0));
 
         extras.shift_rect_up_by(2, 8, 5, 15, 1);
@@ -490,9 +431,7 @@ mod tests {
         assert_eq!(fg_at(&extras, 15, 10), Some([150, 0, 0]));
     }
 
-    // =========================================================================
     // shift_rect_down_by
-    // =========================================================================
 
     #[test]
     fn test_shift_rect_down_zero_n_is_noop() {
@@ -505,14 +444,10 @@ mod tests {
     #[test]
     fn test_shift_rect_down_only_affects_column_range() {
         let mut extras = CellExtras::new();
-        // Inside rect column range
         insert(&mut extras, 3, 10, extra_with_fg(30, 10, 0));
-        // Outside rect column range (col < left)
         insert(&mut extras, 3, 2, extra_with_fg(30, 2, 0));
-        // Outside rect column range (col > right)
         insert(&mut extras, 3, 20, extra_with_fg(30, 20, 0));
 
-        // Rect [2, 8] x [5, 15], shift down by 2
         extras.shift_rect_down_by(2, 8, 5, 15, 2);
         assert_eq!(
             fg_at(&extras, 5, 10),
@@ -534,13 +469,9 @@ mod tests {
     #[test]
     fn test_shift_rect_down_drops_bottom_rows_in_rect() {
         let mut extras = CellExtras::new();
-        // Row near bottom (will be dropped when shifted into drop zone)
         insert(&mut extras, 8, 10, extra_with_fg(80, 0, 0));
-        // Row at top of rect (will shift down)
         insert(&mut extras, 2, 10, extra_with_fg(20, 0, 0));
 
-        // Rect [2, 8] x [5, 15], shift down by 2: drop_start = 8 - (2-1) = 7
-        // Row 8 >= drop_start(7), so dropped. Row 2 < 7, so shifted to 4.
         extras.shift_rect_down_by(2, 8, 5, 15, 2);
         assert!(!has_fg_at(&extras, 8, 10), "bottom row in rect dropped");
         assert_eq!(
@@ -550,16 +481,13 @@ mod tests {
         );
     }
 
-    // =========================================================================
     // shift_cols_right (ICH)
-    // =========================================================================
 
     #[test]
     fn test_shift_cols_right_drops_past_max_col() {
         let mut extras = CellExtras::new();
         insert(&mut extras, 0, 78, extra_with_fg(78, 0, 0));
 
-        // Shift right by 5, max_col=80: col 78 + 5 = 83 >= 80, dropped
         extras.shift_cols_right(0, 0, 5, 80);
         assert!(
             !has_fg_at(&extras, 0, 78),
@@ -574,7 +502,6 @@ mod tests {
         insert(&mut extras, 0, 2, extra_with_fg(20, 0, 0));
         insert(&mut extras, 0, 10, extra_with_fg(100, 0, 0));
 
-        // Shift right from col 5: col 2 untouched, col 10 -> 13
         extras.shift_cols_right(0, 5, 3, 80);
         assert_eq!(
             fg_at(&extras, 0, 2),
@@ -591,12 +518,10 @@ mod tests {
     #[test]
     fn test_shift_cols_right_preserves_beyond_max_col() {
         let mut extras = CellExtras::new();
-        // An entry at col 70 >= max_col (50), past a DECLRMM right margin at col
-        // 49, stays in place rather than being extracted and dropped.
+        // Col 70 is past a DECLRMM right margin at col 49.
         insert(&mut extras, 0, 70, extra_with_fg(70, 0, 0));
         insert(&mut extras, 0, 10, extra_with_fg(100, 0, 0));
 
-        // ICH 3 at col 5, max_col=50: col 10 -> 13, col 70 untouched.
         extras.shift_cols_right(0, 5, 3, 50);
         assert_eq!(
             fg_at(&extras, 0, 70),
@@ -606,9 +531,7 @@ mod tests {
         assert_eq!(fg_at(&extras, 0, 13), Some([100, 0, 0]));
     }
 
-    // =========================================================================
     // shift_cols_left (DCH)
-    // =========================================================================
 
     #[test]
     fn test_shift_cols_left_deletes_range() {
@@ -617,7 +540,6 @@ mod tests {
         insert(&mut extras, 0, 6, extra_with_fg(60, 0, 0));
         insert(&mut extras, 0, 7, extra_with_fg(70, 0, 0));
 
-        // Delete 3 at col 5: cols [5, 6, 7] all deleted
         extras.shift_cols_left(0, 5, 3, 80);
         assert!(!has_fg_at(&extras, 0, 5));
         assert!(!has_fg_at(&extras, 0, 6));
@@ -631,7 +553,6 @@ mod tests {
         insert(&mut extras, 0, 2, extra_with_fg(20, 0, 0));
         insert(&mut extras, 0, 10, extra_with_fg(100, 0, 0));
 
-        // Delete at col 5, count 3: col 2 untouched, col 10 -> 7
         extras.shift_cols_left(0, 5, 3, 80);
         assert_eq!(
             fg_at(&extras, 0, 2),
@@ -644,7 +565,6 @@ mod tests {
     #[test]
     fn test_shift_cols_left_preserves_beyond_max_col() {
         let mut extras = CellExtras::new();
-        // Entry at col 85 which is >= max_col (80) should be preserved in place
         insert(&mut extras, 0, 85, extra_with_fg(85, 0, 0));
         insert(&mut extras, 0, 10, extra_with_fg(100, 0, 0));
 
@@ -657,18 +577,14 @@ mod tests {
         assert_eq!(fg_at(&extras, 0, 7), Some([100, 0, 0]));
     }
 
-    // =========================================================================
-    // Edge cases: boundary coordinates
-    // =========================================================================
+    // Boundary coordinates
 
     #[test]
     fn test_shift_region_up_boundary_at_top_equals_n() {
-        // When top + n > bottom, all entries in region should be deleted
         let mut extras = CellExtras::new();
         insert(&mut extras, 5, 0, extra_with_fg(50, 0, 0));
         insert(&mut extras, 6, 0, extra_with_fg(60, 0, 0));
 
-        // Region [5, 6], shift up by 2: both rows are in [top, top + n) so deleted
         extras.shift_region_up_by(5, 6, 2);
         assert_eq!(
             extras.len(),
@@ -679,14 +595,11 @@ mod tests {
 
     #[test]
     fn test_shift_region_down_n_equals_region_size() {
-        // When n equals (bottom - top + 1), all entries should be dropped
         let mut extras = CellExtras::new();
         insert(&mut extras, 0, 0, extra_with_fg(1, 0, 0));
         insert(&mut extras, 1, 0, extra_with_fg(2, 0, 0));
         insert(&mut extras, 2, 0, extra_with_fg(3, 0, 0));
 
-        // Region [0, 2], shift down by 3: drop_start = 2 - (3-1) = 0
-        // All rows >= 0 within region are in drop zone
         extras.shift_region_down_by(0, 2, 3);
         assert_eq!(extras.len(), 0, "all dropped when n covers whole region");
     }
@@ -694,10 +607,8 @@ mod tests {
     #[test]
     fn test_shift_region_up_single_entry_at_boundary() {
         let mut extras = CellExtras::new();
-        // Entry exactly at bottom of region
         insert(&mut extras, 10, 0, extra_with_fg(100, 0, 0));
 
-        // Region [5, 10], shift up by 3: row 10 >= shift_start(8), so shifted to 7
         extras.shift_region_up_by(5, 10, 3);
         assert_eq!(fg_at(&extras, 7, 0), Some([100, 0, 0]));
     }
@@ -705,11 +616,8 @@ mod tests {
     #[test]
     fn test_shift_cols_right_at_max_col_boundary() {
         let mut extras = CellExtras::new();
-        // Entry at max_col - 1
         insert(&mut extras, 0, 79, extra_with_fg(79, 0, 0));
 
-        // Shift right by 1 from col 79: 79 + 1 = 80, but max_col is 80,
-        // so 80 < 80 is false => dropped
         extras.shift_cols_right(0, 79, 1, 80);
         assert_eq!(
             extras.len(),
@@ -725,15 +633,11 @@ mod tests {
             insert(&mut extras, 0, col, extra_with_fg(col as u8, 0, 0));
         }
 
-        // Delete 10 at col 0: everything in [0, 10) deleted
         extras.shift_cols_left(0, 0, 10, 80);
-        // Only row 0 entries existed, all in delete range
         assert_eq!(extras.len(), 0);
     }
 
-    // =========================================================================
-    // Multi-column entries and data preservation
-    // =========================================================================
+    // Data preservation
 
     #[test]
     fn test_shift_region_up_preserves_extra_data() {
@@ -745,7 +649,6 @@ mod tests {
             extra_with_hyperlink("https://example.com"),
         );
 
-        // Region [0, 23], shift up by 3
         extras.shift_region_up_by(0, 23, 3);
         let entry = extras.get(CellCoord::new(2, 3));
         assert!(entry.is_some(), "shifted entry should exist");
@@ -765,15 +668,11 @@ mod tests {
         assert_eq!(&**url, "https://test.dev");
     }
 
-    // =========================================================================
-    // Scroll region (DECSTBM) simulation
-    // =========================================================================
+    // Scroll region (DECSTBM)
 
     #[test]
     fn test_decstbm_scroll_up_within_margins() {
-        // Simulate DECSTBM scroll region [5, 15] scrolling up by 1
         let mut extras = CellExtras::new();
-        // Entries at various positions
         insert(&mut extras, 3, 0, extra_with_fg(30, 0, 0)); // above region
         insert(&mut extras, 5, 0, extra_with_fg(50, 0, 0)); // at top (will be deleted)
         insert(&mut extras, 10, 0, extra_with_fg(100, 0, 0)); // middle
@@ -802,7 +701,6 @@ mod tests {
 
     #[test]
     fn test_decstbm_scroll_down_within_margins() {
-        // Simulate DECSTBM scroll region [5, 15] scrolling down by 1
         let mut extras = CellExtras::new();
         insert(&mut extras, 3, 0, extra_with_fg(30, 0, 0)); // above region
         insert(&mut extras, 5, 0, extra_with_fg(50, 0, 0)); // at top
@@ -830,13 +728,10 @@ mod tests {
         );
     }
 
-    // =========================================================================
-    // DECLRMM rectangular scroll simulation
-    // =========================================================================
+    // DECLRMM rectangular scroll
 
     #[test]
     fn test_declrmm_rect_scroll_up() {
-        // Simulate left-right margin scroll: rect [2, 8] x [10, 30]
         let mut extras = CellExtras::new();
         insert(&mut extras, 2, 15, extra_with_fg(21, 5, 0)); // top row, in col range (deleted)
         insert(&mut extras, 5, 15, extra_with_fg(51, 5, 0)); // mid, in col range (shifted)
@@ -880,30 +775,20 @@ mod tests {
         );
     }
 
-    // =========================================================================
-    // Multiple entries, same row different cols
-    // =========================================================================
+    // RGB-ring shifts: `set_rgb_ring_range` truecolor lives only in the dense
+    // ring; a shift moves or clears only the affected ring cells.
 
-    // =========================================================================
-    // RGB-ring shifts: truecolor set via set_rgb_ring_range lives only in the
-    // dense ring, never in the HashMap. Shift ops must move/clear only the
-    // affected ring cells and keep everything else.
-    // =========================================================================
-
-    /// Helper: write a bg RGB into the dense ring at (row, col).
+    /// Writes a bg RGB into the dense ring at (row, col).
     fn set_ring_bg(extras: &mut CellExtras, row: u16, col: u16, rgb: [u8; 3]) {
         extras.set_rgb_ring_range(row, col, col + 1, None, Some(rgb), 24, 80);
     }
 
     #[test]
     fn test_region_up_preserves_out_of_region_ring_bg() {
-        // The exact repro class for ORACLE BUG A: a truecolor cell ABOVE the
-        // scroll region must keep its bg after an in-region SU.
         let mut extras = CellExtras::new();
         set_ring_bg(&mut extras, 0, 0, [75, 255, 115]); // above region
         set_ring_bg(&mut extras, 14, 3, [1, 2, 3]); // inside region
 
-        // Region rows [12, 17], scroll up by 4.
         extras.shift_region_up_by(12, 17, 4);
 
         assert_eq!(
@@ -917,7 +802,6 @@ mod tests {
     fn test_region_up_shifts_in_region_ring_bg() {
         let mut extras = CellExtras::new();
         set_ring_bg(&mut extras, 7, 0, [10, 20, 30]); // inside, below deleted rows
-        // Region [5, 20], up by 2: row 7 -> row 5.
         extras.shift_region_up_by(5, 20, 2);
         assert_eq!(extras.bg_rgb_for(5, 0), Some([10, 20, 30]), "row 7 -> 5");
         assert_eq!(extras.bg_rgb_for(7, 0), None, "old position cleared/moved");
@@ -928,7 +812,6 @@ mod tests {
         let mut extras = CellExtras::new();
         set_ring_bg(&mut extras, 22, 0, [9, 9, 9]); // below region (preserved)
         set_ring_bg(&mut extras, 3, 1, [4, 5, 6]); // inside region
-        // Region [0, 10], down by 2: row 3 -> 5.
         extras.shift_region_down_by(0, 10, 2);
         assert_eq!(extras.bg_rgb_for(5, 1), Some([4, 5, 6]), "row 3 -> 5");
         assert_eq!(extras.bg_rgb_for(22, 0), Some([9, 9, 9]), "below preserved");
@@ -940,7 +823,6 @@ mod tests {
         set_ring_bg(&mut extras, 0, 5, [50, 0, 0]);
         set_ring_bg(&mut extras, 0, 10, [100, 0, 0]);
         set_ring_bg(&mut extras, 1, 5, [15, 0, 0]); // other row untouched
-        // ICH 3 at col 5: col 5 -> 8, col 10 -> 13.
         extras.shift_cols_right(0, 5, 3, 80);
         assert_eq!(extras.bg_rgb_for(0, 8), Some([50, 0, 0]));
         assert_eq!(extras.bg_rgb_for(0, 13), Some([100, 0, 0]));
@@ -969,7 +851,6 @@ mod tests {
         let mut extras = CellExtras::new();
         set_ring_bg(&mut extras, 5, 12, [40, 10, 0]); // inside rect
         set_ring_bg(&mut extras, 5, 2, [40, 2, 0]); // outside col range
-        // Rect [2,8] x [10,30], up by 2: (5,12) -> (3,12); (5,2) untouched.
         extras.shift_rect_up_by(2, 8, 10, 30, 2);
         assert_eq!(
             extras.bg_rgb_for(3, 12),
@@ -990,10 +871,42 @@ mod tests {
         insert(&mut extras, 5, 10, extra_with_fg(50, 10, 0));
         insert(&mut extras, 5, 79, extra_with_fg(50, 79, 0));
 
-        // Region [0, 23], shift up by 3: row 5 -> 2, all cols preserved
         extras.shift_region_up_by(0, 23, 3);
         assert_eq!(fg_at(&extras, 2, 0), Some([50, 0, 0]));
         assert_eq!(fg_at(&extras, 2, 10), Some([50, 10, 0]));
         assert_eq!(fg_at(&extras, 2, 79), Some([50, 79, 0]));
+    }
+
+    #[test]
+    fn test_shift_region_out_of_region_extras_skip_drain_rebuild() {
+        let mut extras = CellExtras::new();
+        insert(
+            &mut extras,
+            0,
+            0,
+            extra_with_hyperlink("https://status-top.example"),
+        );
+        insert(
+            &mut extras,
+            23,
+            0,
+            extra_with_hyperlink("https://status-bottom.example"),
+        );
+
+        // The fast path leaves the map untouched, so the entry keeps its address.
+        let before_ptr = extras.get(CellCoord::new(0, 0)).unwrap() as *const CellExtra;
+        extras.shift_region_up_by(2, 20, 3);
+        let after_up_ptr = extras.get(CellCoord::new(0, 0)).unwrap() as *const CellExtra;
+        assert_eq!(
+            before_ptr, after_up_ptr,
+            "up shift outside region must not reallocate"
+        );
+
+        extras.shift_region_down_by(2, 20, 3);
+        let after_down_ptr = extras.get(CellCoord::new(0, 0)).unwrap() as *const CellExtra;
+        assert_eq!(
+            before_ptr, after_down_ptr,
+            "down shift outside region must not reallocate"
+        );
     }
 }

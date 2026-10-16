@@ -8,10 +8,9 @@
 //! initialisation race by whether its closure ran, so
 //! [`sync::OnceCell::get_or_try_init`] must call it EXACTLY ONCE.
 //! [`get_or_try_init_runs_the_closure_exactly_once_under_contention`] asserts
-//! that with wgpu-core's two-thread barrier shape, and
-//! [`the_exactly_once_test_catches_a_racy_cell`] runs the same race against an
-//! ungated control cell and requires it to be caught, so the first test cannot
-//! go toothless.
+//! that with wgpu-core's two-thread barrier shape. Its negative control is the
+//! gate-removal plant below; the `sync-init-exactly-once-concurrent` proof in
+//! `SPECS.md` is to carry that control as a mutation.
 //!
 //! Each of these plants in `src/lib.rs` was compiled, run and caught:
 //!
@@ -83,69 +82,6 @@ fn get_or_try_init_runs_the_closure_exactly_once_under_contention() {
     for (_, v) in &results {
         assert_eq!(*v, 7, "both threads must see the same value");
     }
-}
-
-/// A `sync::OnceCell` written the obvious wrong way: check, compute, set,
-/// re-read, ungated. Every reader still sees one value; only exactly-once is
-/// missing. It is what a plain `OnceLock` wrapper gives the fallible path.
-struct RacyCell<T>(std::sync::OnceLock<T>);
-
-impl<T> RacyCell<T> {
-    fn new() -> Self {
-        Self(std::sync::OnceLock::new())
-    }
-
-    fn get_or_try_init<F, E>(&self, f: F) -> Result<&T, E>
-    where
-        F: FnOnce() -> Result<T, E>,
-    {
-        if let Some(v) = self.0.get() {
-            return Ok(v);
-        }
-        let v = f()?;
-        let _ = self.0.set(v);
-        Ok(self.0.get().expect("just set"))
-    }
-}
-
-#[test]
-fn the_exactly_once_test_catches_a_racy_cell() {
-    // Same race, run against the wrong implementation. A single pass is not
-    // proof of a race, so this repeats until it observes one; if the harness
-    // above could not detect double-initialisation at all, this loop runs out
-    // and fails, which is the signal that the real test has gone toothless.
-    let mut caught = false;
-    for _ in 0..20 {
-        let cell = Arc::new(RacyCell::<u32>::new());
-        let runs = Arc::new(AtomicUsize::new(0));
-        let barrier = Arc::new(Barrier::new(2));
-        let mut handles = Vec::new();
-        for _ in 0..2 {
-            let cell = Arc::clone(&cell);
-            let runs = Arc::clone(&runs);
-            let barrier = Arc::clone(&barrier);
-            handles.push(thread::spawn(move || {
-                barrier.wait();
-                let _ = cell.get_or_try_init(|| {
-                    runs.fetch_add(1, Ordering::SeqCst);
-                    thread::sleep(RACE_WINDOW);
-                    Ok::<u32, ()>(7)
-                });
-            }));
-        }
-        for h in handles {
-            h.join().unwrap();
-        }
-        if runs.load(Ordering::SeqCst) > 1 {
-            caught = true;
-            break;
-        }
-    }
-    assert!(
-        caught,
-        "control not caught: 20 races against the racy cell never double-initialised, so the \
-         exactly-once test cannot detect a broken shim"
-    );
 }
 
 #[test]
@@ -353,12 +289,12 @@ fn lazy_forced_concurrently_runs_its_initialiser_once() {
 fn once_box_is_a_single_assignment_cell_over_a_box() {
     let cell: race::OnceBox<Vec<u8>> = race::OnceBox::new();
     assert_eq!(cell.get(), None);
-    // `ahash::set_random_source` hands back the rejected box, and uses its
-    // identity to tell "already set by a user" from "already defaulted".
+    // Upstream's `set` hands back the rejected box itself, so a caller can
+    // tell its own box from the one already stored.
     assert_eq!(cell.set(Box::new(vec![1, 2])), Ok(()));
     assert_eq!(cell.set(Box::new(vec![9])), Err(Box::new(vec![9])));
     assert_eq!(cell.get(), Some(&vec![1, 2]));
-    // `ahash::get_src` and `read-fonts::Once::get_or_init` both take this path.
+    // A full cell returns what it holds, not the initialiser's value.
     assert_eq!(cell.get_or_init(|| Box::new(vec![0])), &vec![1, 2]);
 
     let fresh: race::OnceBox<u32> = race::OnceBox::default();

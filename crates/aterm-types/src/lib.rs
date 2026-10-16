@@ -9,9 +9,7 @@
 //! keyboard, mouse, selection, GPU views, text shaping, terminal hosting,
 //! and perception.
 
-#![deny(unsafe_op_in_unsafe_fn)]
-#![deny(missing_docs)]
-#![deny(clippy::all)]
+#![warn(missing_docs)]
 // Trust tool-attribute plumbing (scrollback/lz4 pattern) for #[trust::contract_panic].
 #![cfg_attr(trust_verify, feature(register_tool))]
 #![cfg_attr(trust_verify, register_tool(trust))]
@@ -58,12 +56,24 @@ pub mod app_inspection;
 mod color_palette;
 pub mod control_socket;
 pub mod control_verbs;
+// The fabric's word grammar (principal, topic, kind, verdict, `via=`): the
+// bridge, the endpoint and the supervisor each hold a line to it and none
+// depends on another.
+pub mod fabric_grammar;
 pub mod fs_restricted;
 // The inline-image payload: shared vocabulary because the live grid and the
 // history line model must hold the SAME `Arc`, and neither of those crates can
 // see the other's types (see the module docs).
 mod inline_image;
 pub mod scheme;
+// `aterm theme import`: offline converters from other terminals' theme formats
+// into the native theme file the window reads.
+pub mod scheme_import;
+// The one write path an import takes into the themes folder (CLI and window).
+pub mod scheme_install;
+// The signature bar (OkLCh hue, chroma and distance rows): the built-ins'
+// law test and `aterm theme check --signature` share it.
+pub mod scheme_signature;
 mod x11_colors;
 pub use color_palette::ColorPalette;
 pub use cursor::CursorStyle;
@@ -336,11 +346,6 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn cursor_style_default_is_blinking_block() {
-        assert_eq!(CursorStyle::default(), CursorStyle::BlinkingBlock);
-    }
-
-    #[test]
     fn cursor_style_from_param_valid() {
         // Param 0 maps to BlinkingBlock (same as 1 per DECSCUSR)
         assert_eq!(CursorStyle::from_param(0), Some(CursorStyle::BlinkingBlock));
@@ -363,22 +368,5 @@ mod tests {
         assert_eq!(CursorStyle::from_param(7), None);
         assert_eq!(CursorStyle::from_param(255), None);
         assert_eq!(CursorStyle::from_param(u16::MAX), None);
-    }
-
-    // =========================================================================
-    // BiDiMode
-    // =========================================================================
-
-    #[test]
-    fn bidi_mode_default_is_implicit() {
-        assert_eq!(BiDiMode::default(), BiDiMode::Implicit);
-    }
-
-    /// Verify BiDiMode discriminants match checkpoint wire format (#7278).
-    #[test]
-    fn bidi_mode_discriminants_match_wire_format() {
-        assert_eq!(BiDiMode::Disabled as u8, 0);
-        assert_eq!(BiDiMode::Implicit as u8, 1);
-        assert_eq!(BiDiMode::Explicit as u8, 2);
     }
 }

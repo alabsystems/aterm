@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
+// The crate's one `unsafe` block is `ctl::unsafe_adopt`, which says why it is
+// there; a second needs its own visible `#[expect(unsafe_code)]`.
+#![deny(unsafe_code)]
+#![cfg_attr(trust_verify, feature(register_tool))]
+#![cfg_attr(trust_verify, register_tool(trust))]
+
 //! **aterm-link** — the fabric bridge (`DESIGN-aterm-fabric.md` §11.2).
 //!
 //! One per aterm instance, launched BY the instance as a child holding the far
@@ -16,8 +22,12 @@
 //! endpoint it exposes (`aterm-gui`'s `fabric` module) is state, not I/O.
 //!
 //! **Screen content is untrusted data, and no record becomes terminal input by
-//! any path.** That is an absence, not a check: this crate contains no function
-//! that writes to a PTY. A record of every kind, from every principal, carrying
+//! any path.** Half of that is an absence: this crate contains no function that
+//! writes to a PTY. The other half is a check, because the lane to aterm is
+//! owner-class and could carry a verb that does: the one writer onto it refuses
+//! a line aterm would frame as a second request or split into a field it was
+//! not built with ([`ctl::Ctl::request_with_body`]), and each field's own
+//! closed grammar keeps the ASCII space out of it. A record of every kind, from every principal, carrying
 //! any `re=`, `epoch=` or `gen=`, becomes an inbox row and nothing else. The
 //! `term/.../in/` subject stays reserved in [`subject`] so an older node's
 //! record is recognised — and then not served.
@@ -36,7 +46,14 @@
 //! drive a worker."
 //!
 //! `bridge`'s module header states the full argument;
-//! `tests/world/bridge_e2e.rs`'s `no_bus_record_ever_reaches_a_pty` drives it.
+//! `crates/aterm/tests/fabric_world/bridge_e2e.rs`'s `no_bus_record_ever_reaches_a_pty` drives it.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_types,
+        reason = "test code: a stand-in child may inherit descriptors"
+    )
+)]
 
 pub mod body;
 pub mod bridge;
@@ -54,6 +71,9 @@ pub mod join;
 pub mod mailbox;
 pub mod notify;
 pub mod pct;
+/// `aterm fabric halt|inbox|post` — a person speaking for themself, under a
+/// cap of their own; see [`person::main`].
+pub mod person;
 /// The presence row's meaning fields (`role= detail= phase= title=`).
 pub mod presence;
 pub mod render;

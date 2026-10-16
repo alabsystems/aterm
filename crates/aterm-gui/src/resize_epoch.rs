@@ -1,51 +1,42 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE RENDER EPOCH: the resize ledger's second judge, read from the engine's
-//! debt instead of from the shape of a run.
+//! The render epoch: the resize ledger's second judge, read from the engine's debt
+//! instead of from the shape of a run.
 //!
-//! WHY A SECOND JUDGE. The ledger judges NET-ZERO RUNS, and a run closes when
-//! the app draws. A flap whose halves an app frame separates is therefore two
-//! net-changed runs and neither is judged (the ledger's named blind spot,
-//! measured 2026-09-28: a diff frame between the halves leaves every row one
-//! higher, `render=` reads `displaced` and then `ok` after 1.2 s, and only
-//! `cast drift` says so). The engine's undo makes the QUIET flap an identity
-//! but cannot help once anything is written, so the residual is exactly the
-//! shape the run judge cannot see, and a repair needs a trigger that does not
-//! depend on run shape.
+//! The ledger judges net-zero runs, and a run closes when the app draws, so a flap
+//! whose halves an app frame separates is two net-changed runs and neither is judged
+//! (the ledger's named blind spot: every row ends one higher and only `cast drift`
+//! says so). The engine's undo makes the quiet flap an identity but cannot help once
+//! anything is written, so a repair needs a trigger that does not depend on run shape.
 //!
-//! THE EPOCH. An epoch opens at the first alternate-screen resize after the
-//! screen was last repainted from scratch and remembers the geometry BEFORE it
-//! (`start`). The engine's [`Terminal::render_debt`] says what is owed: `(0, 0)`
-//! when every row sits where the program painted it. The epoch is AT RISK when
-//! the debt is not zero, the geometry is back at `start` and
-//! [`RISK_AFTER_MS`] has passed since the last resize: a program that compares
-//! the size it reads with the size it drew for can never read the intermediate
-//! size again, so it has no reason to repaint. While the geometry differs from
-//! `start` the program's handler is still to read a CHANGE and repaints, so the
-//! epoch is only `displaced`. Whether the program has drawn since is
-//! information (`drew=`), not a condition: an undrawn residual (a mode set
-//! between the halves, an idle tab) is as displaced as a drawn one.
+//! An epoch opens at the first alternate-screen resize after the screen was last
+//! repainted from scratch and remembers the geometry before it (`start`). The
+//! engine's [`Terminal::render_debt`] says what is owed: `(0, 0)` when every row sits
+//! where the program painted it. The epoch is at risk when the debt is not zero, the
+//! geometry is back at `start` and [`RISK_AFTER_MS`] has passed since the last
+//! resize: a program that compares the size it reads with the size it drew for can
+//! never read the intermediate size again, so it has no reason to repaint. While the
+//! geometry differs from `start` the program's handler still reads a change and
+//! repaints, so the epoch is only `displaced`. Whether the program has drawn since is
+//! information (`drew=`), not a condition: an undrawn residual (a mode set between
+//! the halves, an idle tab) is as displaced as a drawn one.
 //!
-//! THE CLASS. Whether an epoch at risk is ACCUSED depends on the program:
-//! [`ProgramClass::Agent`] (the presence classifier reads Claude Code, the one
-//! program whose repaint contract, an ED 2 on a CHANGED size read and nothing on
-//! an unchanged one, was measured), [`ProgramClass::Learned`] (a run of THIS
-//! session was healed by a full clear while it was still within
-//! [`RISK_AFTER_MS`] of its last resize: the session has shown it clears when
-//! resized), or [`ProgramClass::Unknown`]. An unknown program that repaints with
-//! cursor addressing and no ED 2 is indistinguishable from one that missed, so
-//! its at-risk epoch reads `unjudged` (a word on `status` and `resizes`, never
-//! pushed as an event) instead of accusing it.
+//! Whether an epoch at risk is accused depends on the program's class:
+//! [`ProgramClass::Agent`] (Claude Code, the one program whose repaint contract, an
+//! ED 2 on a changed size read and nothing on an unchanged one, was measured),
+//! [`ProgramClass::Learned`] (a run of this session was healed by a full clear within
+//! [`RISK_AFTER_MS`] of its last resize), or [`ProgramClass::Unknown`]. An unknown
+//! program that repaints with cursor addressing and no ED 2 is indistinguishable from
+//! one that missed, so its at-risk epoch reads `unjudged` (on `status` and `resizes`,
+//! never pushed as an event).
 //!
-//! WHEN IT LOOKS. The ledger books every resize at the one funnel and, when that
-//! leaves an epoch open, registers the epoch's next look at `last_resize +
-//! RISK_AFTER_MS` ([`note_look`]); the event loop folds that instant under
-//! `DeadlineOwner::RenderEpoch` and runs the look ([`crate::App`]'s
-//! `observe_render_epochs`). An idle machine folds nothing. The status sweep and
-//! `subscribe` only READ the verdict.
-//!
-//! No clock is read here: the host passes `now_ms`.
+//! The ledger books every resize at the one funnel and, when that leaves an epoch
+//! open, registers its next look at `last_resize + RISK_AFTER_MS` ([`note_look`]);
+//! the event loop folds that instant under `DeadlineOwner::RenderEpoch` and runs the
+//! look (`App::observe_render_epochs`). An idle machine folds nothing; the status
+//! sweep and `subscribe` only read the verdict. No clock is read here: the host
+//! passes `now_ms`.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -219,11 +210,11 @@ impl Epoch {
     }
 }
 
-/// The soonest instant any ledger wants an epoch look (timeline ms), `u64::MAX`
-/// for none. A process-wide MINIMUM: a ledger only ever LOWERS it
-/// ([`note_look`]); the event loop's look ([`take_looks`]) resets it and every
-/// ledger re-registers what it still owes. A stale early value costs one walk
-/// that finds nothing due; it can never be later than a registered look.
+/// The soonest instant any ledger wants an epoch look (timeline ms), `u64::MAX` for
+/// none. A process-wide minimum: a ledger only ever lowers it ([`note_look`]); the
+/// event loop's look ([`take_looks`]) resets it and every ledger re-registers what it
+/// still owes. A stale early value costs one walk that finds nothing due; it can never
+/// be later than a registered look.
 static NEXT_LOOK_MS: AtomicU64 = AtomicU64::new(u64::MAX);
 
 /// A ledger owes a look at `at_ms`.
@@ -246,13 +237,12 @@ pub(crate) fn take_looks() {
     NEXT_LOOK_MS.store(u64::MAX, Ordering::Release);
 }
 
-/// Bumped whenever an epoch of the agent class is at `desync-risk` and
-/// untried, or a superseded repair's epoch is back at risk
-/// ([`returned_at_risk`]): the event loop's cue to walk the sessions, arm the
-/// repaint nudge (`crate::app_nudge`) and raise what is owed. Noted by
-/// whichever path judged the epoch (the loop's own look, a `status` read, a
-/// `subscribe` tick). A GENERATION, not a flag: every `App` compares it with
-/// the one it last scanned, so no reader consumes another's cue.
+/// Bumped whenever an epoch of the agent class is at `desync-risk` and untried, or a
+/// superseded repair's epoch is back at risk ([`returned_at_risk`]): the event loop's
+/// cue to walk the sessions, arm the repaint nudge (`crate::app_nudge`) and raise
+/// what is owed. Noted by whichever path judged the epoch (the loop's own look, a
+/// `status` read, a `subscribe` tick). A generation, not a flag: every `App` compares
+/// it with the one it last scanned, so no reader consumes another's cue.
 static NUDGE_DUE: AtomicU64 = AtomicU64::new(0);
 
 /// An agent-class epoch at `desync-risk` is owed the loop's walk: tell it.
@@ -637,15 +627,14 @@ impl EpochBook {
     }
 }
 
-/// THE END OF A SUPERSEDED REPAIR, the epoch judge's half of the repaint
-/// nudge (`RepaintNudge`'s `Report`). A real resize that left the engine
-/// elsewhere ended the attempt `superseded`: the program was given a size of its
-/// own. If that resize does not last, the epoch comes back to `desync-risk` -
-/// rows still owed, read at this look, the geometry back at its start, the risk
-/// wait spent - with its one try spent, and that is the give-up the same attempt
-/// is when the resize comes back inside its wait. `Some(id)` once; the window
-/// raises the digest line (`App::arm_nudges`). A repaint by the program closes
-/// the epoch first and nothing is said, as for any attempt.
+/// The end of a superseded repair, the epoch judge's half of the repaint nudge
+/// (`RepaintNudge`'s `Report`). A real resize that left the engine elsewhere ended
+/// the attempt `superseded` (the program was given a size of its own). If that
+/// resize does not last, the epoch comes back to `desync-risk` (rows still owed, the
+/// geometry back at its start, the risk wait spent) with its one try spent: the same
+/// give-up as a resize that comes back inside its wait. `Some(id)` once; the window
+/// raises the digest line (`App::arm_nudges`). A repaint by the program closes the
+/// epoch first and nothing is said.
 #[cfg_attr(
     test,
     aterm_spec::refines(
@@ -661,7 +650,7 @@ fn returned_at_risk(epoch: &mut Epoch) -> Option<u64> {
 
 /// `epoch <e> t=<ms> geom=<start>><now> shift=<+-k> pushed=<k> drew=<0|1>
 /// class=<agent|learned|unknown> verdict=<open|desync-risk|unjudged|healed|
-/// restored> by=<app|undo|-> tried=<0|1>`
+/// restored> by=<app|undo|nudge|-> tried=<0|1>`
 pub(crate) fn wire_epoch(out: &mut String, epoch: &Epoch) {
     use std::fmt::Write as _;
     let geom = |(rows, cols): (u16, u16)| format!("{cols}x{rows}");

@@ -6,53 +6,35 @@
 
 use super::Model;
 
-/// The writer/reader contract behind `ERR main thread stalled <N>s; retry`.
-/// The WRITER is the watchdog's beat (`beat_into`), which
-/// stamps the heartbeat's time on every root entry. The READER is
-/// `main_stall`, which a control worker asks before it posts a hop to the main
-/// thread. The hop count `call_main` keeps (`control_media::Hops`) and the
-/// census reset `metrics reset` runs are the other two actors.
+/// The writer/reader contract behind `ERR main thread stalled <N>s; retry`, which spares a verb
+/// that needs a stuck main thread from waiting out its whole reply deadline. The writer is the
+/// watchdog's beat (`beat_into`), stamping the heartbeat's time on every root entry; the reader
+/// is `main_stall`, which a control worker asks before posting a hop to the main thread. The
+/// hop count `call_main` keeps (`control_media::Hops`) and `metrics reset` are the other actors.
 ///
-/// The 2026-09-28 incident is the reason for it. The main thread was stuck in
-/// AppKit's scene setup before the whole process stopped running, and a verb
-/// that needed the main thread could only post its hop and wait out its whole
-/// reply deadline for a thread that could not answer, though the heartbeat
-/// already showed the thread stuck.
-///
-/// Time is in ticks of half the bar (`Bar = 2`). `quiet` is the ground truth,
-/// ticks since the main thread last entered a root. `stamp`/`stamp_age` are
-/// what the writer left for the reader. `waiting` is a worker waiting for its
-/// hop's reply, `hop` that hop while the main thread has not yet taken it
-/// (what `Hops` counts), and `waited` how long the worker has waited. `root`
-/// is 0 at the idle park (`AboutToWait`), 1 at a work root, and 2 at a
-/// designed freeze: startup, the initial state; a dialog; the update handoff.
-/// `Answer` is the main thread taking the hop and answering it in the same
-/// turn. `Take` is the main thread taking it and queueing its reply
-/// (`settings set`, answered turns later by the config worker's completion),
-/// and `Reply` is that reply. `Probe` records the reader's verdict (`refused`)
-/// and, at the same instant, the truth (`stalled`): a work root with no beat
-/// for the bar, or the idle park with a hop not yet taken that has waited the
-/// bar and no beat in it. A hop already taken, whose worker waits on a queued
-/// reply, waits on the config worker, not on the main thread.
+/// Time is in ticks of half the bar (`Bar = 2`). `quiet` is the ground truth, ticks since the
+/// main thread last entered a root; `stamp`/`stamp_age` are what the writer left the reader.
+/// `waiting` is a worker awaiting its hop's reply, `hop` that hop while not yet taken (what
+/// `Hops` counts), `waited` how long it has waited. `root` is 0 at the idle park
+/// (`AboutToWait`), 1 at a work root, 2 at a designed freeze (startup, a dialog, the update
+/// handoff). `Answer` takes the hop and answers in the same turn; `Take` takes it and queues
+/// the reply (`settings set`, answered later by the config worker), and `Reply` is that reply.
+/// `Probe` records the reader's verdict (`refused`) and the truth (`stalled`): a work root with
+/// no beat for the bar, or the idle park with an untaken hop that has waited the bar with no
+/// beat. A taken hop whose worker awaits a queued reply waits on the config worker, not on the
+/// main thread.
 ///
 /// * `NeverRefusesAMovingMainThread`: a refusal only when stalled.
 /// * `RefusesAStalledMainThread`: a stall is always refused.
 ///
-/// `Buggy = 1` admits one of three defects, each caught by an invariant.
-/// `MutateCensusStamp` has the reader take the turn census's open stamp,
-/// which a reset zeroes, for the heartbeat's time: a `metrics reset` under a
-/// stall then reads as a thread that never beat, and the stalled thread's
-/// verbs wait out their deadlines again. `MutateHeartbeatOnly` judges a
-/// waiting hop on the heartbeat's age alone: the first verb after an idle
-/// longer than the bar makes every verb that arrives while it is answered
-/// look stalled. `MutateCountsUntilReply` counts a hop until its worker gets
-/// the reply, not until the main thread takes it: a `settings set` whose
-/// write takes the bar makes a healthy thread, parked idle behind it, refuse
-/// every other main-thread verb. Tier-1 (`aterm-gui`'s watchdog test
-/// `main_stall_conforms_to_the_stall_refusal_model`) drives the real
-/// `beat_into`, `TurnLedger::reset`, `Hops`, `take_hop` and `main_stall` in
-/// lockstep with this machine, and replays all three defects on the real
-/// reader.
+/// `Buggy = 1` admits one of three defects. `MutateCensusStamp` reads the turn census's open
+/// stamp, which `metrics reset` zeroes, as the heartbeat's time, so a reset under a stall reads
+/// as a thread that never beat. `MutateHeartbeatOnly` judges a waiting hop on the heartbeat's
+/// age alone, so verbs arriving after an idle longer than the bar look stalled.
+/// `MutateCountsUntilReply` counts a hop until its reply rather than until it is taken, so a
+/// slow `settings set` makes a healthy idle thread refuse other verbs. Tier-1: aterm-gui's
+/// `main_stall_conforms_to_the_stall_refusal_model` drives the real `beat_into`,
+/// `TurnLedger::reset`, `Hops`, `take_hop` and `main_stall` in lockstep and replays all three.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn main_thread_stall_refusal_model() -> Model {

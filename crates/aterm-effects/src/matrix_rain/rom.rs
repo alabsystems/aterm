@@ -38,7 +38,7 @@ enum Stroke {
 
 use Stroke::{D, L};
 
-/// The 64 recipes. Order is the field's glyph index (`glyph_at() % 64`):
+/// The 64 recipes. Order is the field's glyph index (the hash `% 64`):
 /// 0..=39 katakana-like, 40..=49 digits, 50..=63 symbols/kanji-like.
 const RECIPES: [&[Stroke]; ROM_GLYPHS] = [
     // -- katakana-like forms (simplified straight-stroke approximations) ----
@@ -280,25 +280,18 @@ pub fn rasterize_master() -> RomMaster {
 
 /// The decorative master, rasterized at most once per process.
 ///
-/// The material path needs a copy on every charset change (routinely while
-/// output streams), so it forks this memoized master with a 12 KB copy instead
-/// of re-rasterizing ~55k plots. Process-wide rather than per engine because
-/// each `EffectsPipeline` builds its own rain engine; `RomMaster` is
-/// `Send + Sync`.
+/// The material path forks it (a 12 KB copy) on every charset change instead
+/// of re-rasterizing ~55k plots. Process-wide because each `EffectsPipeline`
+/// builds its own rain engine; `RomMaster` is `Send + Sync`.
 pub(crate) fn decorative_master() -> &'static RomMaster {
     static DECORATIVE: OnceLock<RomMaster> = OnceLock::new();
     DECORATIVE.get_or_init(rasterize_master)
 }
 
-/// The embedded bitmap for one literal material character. The supported
-/// families cover Basic/Latin text, Greek, terminal box/block drawing, and
-/// Hiragana. Unsupported code points are skipped by the material sampler; they
-/// are never substituted with a different-looking character and therefore can
-/// never make the "real output" contract dishonest.
-///
-/// One binary search over [`super::bitmap_font`], the in-tree public-domain
-/// glyph table, where this used to walk a seven-table fallback chain through a
-/// third-party trait. Same answer for every code point in Unicode.
+/// The embedded 8x8 bitmap (from `bitmap_font`) for one literal material
+/// character: Basic/Latin text, Greek, box/block drawing and Hiragana. The
+/// sampler skips an unsupported code point rather than substituting a
+/// different-looking character, so the rain only ever shows real output.
 #[must_use]
 pub fn material_bitmap(c: char) -> Option<[u8; 8]> {
     super::bitmap_font::bitmap(c)

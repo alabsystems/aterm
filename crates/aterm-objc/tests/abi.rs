@@ -2,25 +2,14 @@
 // Copyright 2026 Andrew Yates
 
 //! The two ABI facts that differ between the arm64 slice and the x86_64 compat
-//! slice `lipo`d into the same universal binary: what `BOOL` is, and which
-//! `objc_msgSend` a struct return goes through.
+//! slice of the universal binary: what `BOOL` is, and which `objc_msgSend` a
+//! struct return goes through.
 //!
-//! # What is proved here, and by what
-//!
-//! This box is arm64 and cannot execute the x86_64 slice ("bad CPU type"), so
-//! the two halves of each claim have different evidence and the difference is
-//! stated rather than blurred:
-//!
-//! * **arm64 — EXECUTION.** The tests below run. They do not hard-code `"B"`:
-//!   they read the encoding the SYSTEM's own compiler emitted for a Foundation
-//!   method and compare this crate's constant against it, so the assertion is
-//!   whatever the running platform says and would fail on x86_64 if the `cfg`
-//!   arms were wrong.
-//! * **x86_64 — CODEGEN.** Measured with `clang -arch x86_64 -S` on this box:
-//!   `@encode(BOOL)` is `"c"` and `__OBJC_BOOL_IS_BOOL` is `0`; a 32-byte
-//!   struct return compiles to `callq _objc_msgSend_stret` while a 16-byte one
-//!   compiles to plain `_objc_msgSend`. The Rust side's x86_64 arms are
-//!   type-checked but NOT executed here.
+//! The arm64 half executes here, against encodings Foundation's own compiler
+//! emitted, so it would fail on x86_64 if the `cfg` arms were wrong. The x86_64
+//! half is codegen evidence (`clang -arch x86_64 -S`: `@encode(BOOL)` is `"c"`,
+//! a 32-byte struct return calls `_objc_msgSend_stret`, a 16-byte one plain
+//! `_objc_msgSend`); the Rust x86_64 arms are type-checked, not executed.
 
 #![cfg(target_os = "macos")]
 
@@ -35,11 +24,8 @@ unsafe extern "C" {
     fn method_getTypeEncoding(m: *const c_void) -> *const c_char;
 }
 
-/// Seventeen bytes: one over the register threshold. A newtype rather than a
-/// bare `[u8; 17]` because `returns_indirectly` now takes `R: Encode`, and the
-/// orphan rule puts an array out of this crate's reach — which is the bound
-/// doing its job, since a bare array is exactly the kind of type nobody has
-/// stated an ABI for.
+/// Seventeen bytes: one over the register threshold. A newtype because
+/// `returns_indirectly` takes `R: Encode` and a bare array has no stated ABI.
 #[repr(C)]
 struct B17([u8; 17]);
 // SAFETY: `#[repr(C)]` over a 17-byte array of `signed char`; no field is
@@ -66,11 +52,9 @@ unsafe impl Encode for B16 {
     const ENCODING: &'static str = "{B16=[2Q]}";
 }
 
-/// `struct __attribute__((packed)) { char
-/// c; long q; }`. Nine bytes, so `size_of` alone says "registers"; the `q` sits
-/// at offset 1, so the System V x86-64 classification is MEMORY and clang sends
-/// it through `_objc_msgSend_stret`. MEASURED — see `returns_indirectly`'s
-/// table.
+/// `struct __attribute__((packed)) { char c; long q; }`: nine bytes, so
+/// `size_of` alone says "registers", but the `q` at offset 1 makes it MEMORY on
+/// System V x86-64 (`_objc_msgSend_stret`; see `returns_indirectly`'s table).
 #[repr(C, packed)]
 struct PackedCharLong {
     c: i8,
@@ -83,24 +67,10 @@ unsafe impl Encode for PackedCharLong {
     const HAS_UNALIGNED_FIELDS: bool = true;
 }
 
-/// A WRAPPER around a packed struct, not a packed struct itself.
-///
-/// `HAS_UNALIGNED_FIELDS` was documented non-transitively — "whether `Self`
-/// places any field at an offset that is not a multiple of that field's own
-/// alignment". This type has exactly ONE field, at offset 0, whose own
-/// alignment is 1, so the documented rule answers `false` for it. CODEGEN-PROVED
-/// with `clang -arch x86_64 -O1 -S` (this box cannot execute that slice) that
-/// the right answer is `true`: the call lands on `_objc_msgSend_stret`, and the
-/// LLVM IR reads
-///
-/// ```text
-/// call void @objc_msgSend_stret(ptr … sret(%struct.Wrap) align 1 %2, …)
-/// ```
-///
-/// — the hidden result pointer in `RDI`, i.e. exactly the register shift
-/// `returns_indirectly` describes. The rule is now stated transitively, and
-/// the impl below writes the answer as the FIELD's rather than hand-typing
-/// `true`, so it cannot go stale.
+/// A wrapper around a packed struct: one field, at offset 0, alignment 1, yet
+/// `clang -arch x86_64 -O1 -S` returns it through `_objc_msgSend_stret`
+/// (`sret(%struct.Wrap) align 1`, the hidden pointer in `RDI`). So
+/// `HAS_UNALIGNED_FIELDS` is transitive, and the impl takes the field's answer.
 #[repr(C)]
 struct WrapPacked {
     inner: PackedCharLong,
@@ -113,8 +83,8 @@ unsafe impl Encode for WrapPacked {
     const HAS_UNALIGNED_FIELDS: bool = <PackedCharLong as Encode>::HAS_UNALIGNED_FIELDS;
 }
 
-/// The same defect through an ARRAY rather than a field: `struct { Packed9 a[1]; }`.
-/// Also `_objc_msgSend_stret`, also `false` under the old wording.
+/// The same through an array, `struct { Packed9 a[1]; }`: also
+/// `_objc_msgSend_stret`.
 #[repr(C)]
 struct ArrayOfOnePacked {
     a: [PackedCharLong; 1],
@@ -125,9 +95,7 @@ unsafe impl Encode for ArrayOfOnePacked {
     const HAS_UNALIGNED_FIELDS: bool = <PackedCharLong as Encode>::HAS_UNALIGNED_FIELDS;
 }
 
-/// The third shape, and the one that kills any "but it is under 16 bytes"
-/// intuition from the other side: padded out to exactly 16 bytes, still
-/// `_objc_msgSend_stret`.
+/// Padded to exactly 16 bytes, and still `_objc_msgSend_stret`.
 #[repr(C)]
 struct WrapPaddedTo16 {
     inner: PackedCharLong,
@@ -143,9 +111,7 @@ unsafe impl Encode for WrapPaddedTo16 {
 fn the_unaligned_rule_is_transitive_and_a_wrapper_proves_it() {
     let x86 = cfg!(target_arch = "x86_64");
 
-    // Each of the three has ONE outermost field (or element) at offset 0 whose
-    // own alignment is 1 — so the non-transitive wording this test was written
-    // to refute answers `false` for all three.
+    // Each has one outermost field (or element) at offset 0 with alignment 1.
     assert_eq!((size_of::<WrapPacked>(), align_of::<WrapPacked>()), (9, 1));
     assert_eq!(
         (
@@ -163,13 +129,8 @@ fn the_unaligned_rule_is_transitive_and_a_wrapper_proves_it() {
         "under the size threshold"
     );
 
-    // The claim itself, arch-independently: all three answer `true`, and the
-    // non-transitive wording would have answered `false` for all three. This
-    // assertion is the one that fires on THIS box; the entry-point consequence
-    // below is x86_64-only and therefore codegen-proved, not run.
-    // `const` blocks, so a wrong answer is a BUILD failure rather than a test
-    // failure — these are associated consts, and clippy is right that asserting
-    // one at run time is the weaker spelling.
+    // Arch-independent, and in `const` blocks so a wrong answer fails the
+    // build.
     const {
         assert!(<WrapPacked as Encode>::HAS_UNALIGNED_FIELDS);
         assert!(<ArrayOfOnePacked as Encode>::HAS_UNALIGNED_FIELDS);
@@ -178,26 +139,18 @@ fn the_unaligned_rule_is_transitive_and_a_wrapper_proves_it() {
         assert!(!<B16 as Encode>::HAS_UNALIGNED_FIELDS);
     }
 
-    // CODEGEN-PROVED, `clang -arch x86_64 -O1 -S`, reading which symbol the
-    // call lands on. Every row here is `_objc_msgSend_stret`:
-    //
-    //   struct Wrap    { struct Packed9 inner; }               9  1  stret
-    //   struct WrapPad { struct Packed9 inner; char pad[7]; }  16  1  stret
-    //   struct ArrOne  { struct Packed9 a[1]; }                9  1  stret
-    //   struct NineChars { char c[9]; }                        9  1  plain
+    // All three go through `_objc_msgSend_stret` on x86_64 (clang's table is
+    // on `Encode::HAS_UNALIGNED_FIELDS`).
     assert_eq!(returns_indirectly::<WrapPacked>(), x86);
     assert_eq!(returns_indirectly::<ArrayOfOnePacked>(), x86);
     assert_eq!(returns_indirectly::<WrapPaddedTo16>(), x86);
 
-    // `NineChars` is the control and the reason this is not a size rule in
-    // disguise: same 9 bytes, same alignment 1, no packing anywhere in its
-    // tree, plain `objc_msgSend`.
+    // The control: same 9 bytes and alignment 1, no packing, plain
+    // `objc_msgSend`.
     assert!(!returns_indirectly::<NineChars>());
 
-    // The pair `WrapPaddedTo16` / `B16` is the sharpest form of it: both are
-    // exactly 16 bytes, and on x86_64 they take DIFFERENT entry points. (On
-    // arm64 there is one entry point and both are `false`, which is the whole
-    // reason this crate's x86_64 half is codegen-proved rather than run.)
+    // `WrapPaddedTo16` and `B16` are both 16 bytes and take different entry
+    // points on x86_64.
     assert_eq!(size_of::<WrapPaddedTo16>(), size_of::<B16>());
     assert!(!returns_indirectly::<B16>(), "16 aligned bytes: registers");
     assert_eq!(
@@ -207,8 +160,7 @@ fn the_unaligned_rule_is_transitive_and_a_wrapper_proves_it() {
          back into a size test"
     );
 
-    // And the prototypes resolve to different SYMBOLS, which is the whole
-    // consequence. Only the arm64 arm executes on this box.
+    // The prototypes resolve to different symbols on x86_64.
     // SAFETY: neither pointer is called — the test only compares addresses.
     let (plain, wrapped) = unsafe {
         let plain: unsafe extern "C-unwind" fn(Id, Sel) -> B16 = msg();
@@ -222,7 +174,7 @@ fn the_unaligned_rule_is_transitive_and_a_wrapper_proves_it() {
     }
 }
 
-/// The type encoding the SYSTEM compiler emitted for `cls`'s `name`, or `None`
+/// The type encoding the system compiler emitted for `cls`'s `name`, or `None`
 /// if that class does not implement it.
 fn platform_encoding(cls: &'static CStr, name: &'static CStr) -> Option<String> {
     let cls = class(cls);
@@ -245,11 +197,9 @@ fn platform_encoding(cls: &'static CStr, name: &'static CStr) -> Option<String> 
 
 #[test]
 fn bool_encoding_matches_what_foundation_itself_emits() {
-    // `-[NSObject isEqual:]` and `-[NSObject respondsToSelector:]` both return
-    // `BOOL`, and their encodings were written by the compiler that built
-    // Foundation for THIS architecture. Compiler-emitted encodings carry byte
-    // offsets ("B24@0:8@16"), so only the leading return-type letter is
-    // compared — which is the whole claim.
+    // `BOOL`-returning `NSObject` methods, encoded by the compiler that built
+    // Foundation for this architecture. Compiler encodings carry offsets
+    // ("B24@0:8@16"), so only the leading return-type letter is compared.
     let mut checked = 0;
     for sel in [c"isEqual:", c"respondsToSelector:", c"isProxy"] {
         let Some(enc) = platform_encoding(c"NSObject", sel) else {
@@ -270,10 +220,8 @@ fn bool_encoding_matches_what_foundation_itself_emits() {
         "no BOOL-returning NSObject method was readable"
     );
 
-    // The value side of the same fact: one byte on both arches, and the
-    // conversion is `!= 0` rather than a transmute, so no bit pattern is
-    // invalid. On x86_64 `BOOL` is `signed char` and a sender may legally pass
-    // any non-zero byte for YES; a Rust `bool` there would be UB.
+    // One byte on both arches, and conversion is `!= 0`, so no bit pattern is
+    // invalid (an x86_64 sender may pass any non-zero byte for YES).
     assert_eq!(size_of::<Bool>(), 1);
     assert!(Bool::YES.as_bool());
     assert!(!Bool::NO.as_bool());
@@ -293,9 +241,7 @@ fn bool_encoding_matches_what_foundation_itself_emits() {
 
 #[test]
 fn the_struct_encodings_match_what_foundation_itself_emits() {
-    // Same technique against `CGRect`: `-[NSValue rectValue]` is compiled by
-    // the system compiler, so its encoding is the platform's own spelling of
-    // the layout this crate hard-codes.
+    // `-[NSValue rectValue]` gives the platform's own spelling of `CGRect`.
     let Some(enc) = platform_encoding(c"NSValue", c"rectValue") else {
         return;
     };
@@ -308,7 +254,7 @@ fn the_struct_encodings_match_what_foundation_itself_emits() {
 
 #[test]
 fn the_indirect_return_rule_matches_the_c_abi() {
-    // MEASURED with clang, `-arch x86_64 -S -O1`, one selector per return type:
+    // From clang, `-arch x86_64 -S -O1`, one selector per return type:
     //
     //   struct of 2 long   (16 bytes) -> _objc_msgSend
     //   struct of 2 double (16 bytes) -> _objc_msgSend
@@ -319,9 +265,8 @@ fn the_indirect_return_rule_matches_the_c_abi() {
     //   long double                   -> _objc_msgSend_fpret  (not expressible
     //                                    in Rust, so not bound)
     //
-    // The threshold is therefore exactly "larger than 16 bytes", and on arm64
-    // there is no threshold at all because the indirect-result pointer has its
-    // own register.
+    // The threshold is "larger than 16 bytes"; arm64 has none, because the
+    // indirect-result pointer has its own register.
     let x86 = cfg!(target_arch = "x86_64");
     assert_eq!(returns_indirectly::<CGRect>(), x86, "CGRect is 32 bytes");
     assert_eq!(returns_indirectly::<B17>(), x86, "17 bytes");
@@ -333,11 +278,9 @@ fn the_indirect_return_rule_matches_the_c_abi() {
     assert!(!returns_indirectly::<Bool>());
     assert!(!returns_indirectly::<()>());
 
-    // The size-only rule got this one WRONG, silently, and it was the crate's
-    // only fail-silent gap. Nine bytes is under the 16-byte threshold, so the
-    // old `size_of`-only test said "registers"; clang sends it through
-    // `_objc_msgSend_stret`, which would have shifted every argument by one
-    // register on the slice this repo ships.
+    // Nine packed bytes are under the 16-byte threshold, yet clang sends them
+    // through `_objc_msgSend_stret`: a size-only rule would shift every argument
+    // by one register on x86_64.
     assert_eq!(size_of::<PackedCharLong>(), 9);
     assert_eq!(align_of::<PackedCharLong>(), 1);
     assert!(
@@ -349,10 +292,8 @@ fn the_indirect_return_rule_matches_the_c_abi() {
         x86,
         "a 9-byte packed struct is MEMORY-classed on x86_64 despite its size"
     );
-    // And the discriminating pair: `size_of` and `align_of` cannot tell these
-    // apart, so no `const` predicate over them could have closed this — the
-    // answer has to come from the type's author. Both are 9/1; only one is
-    // MEMORY.
+    // `size_of` and `align_of` cannot tell these apart (both 9/1); only the
+    // type's author knows which one is MEMORY.
     assert_eq!(
         (size_of::<PackedCharLong>(), align_of::<PackedCharLong>()),
         (size_of::<NineChars>(), align_of::<NineChars>()),
@@ -363,8 +304,8 @@ fn the_indirect_return_rule_matches_the_c_abi() {
     );
 }
 
-/// Nine bytes, alignment one, NOT packed: `struct { char c[9]; }`, which clang
-/// sends through plain `_objc_msgSend`. Same size and same alignment as
+/// Nine bytes, alignment one, not packed: `struct { char c[9]; }`, which clang
+/// sends through plain `_objc_msgSend`. Same size and alignment as
 /// [`PackedCharLong`], opposite ABI.
 #[repr(C)]
 struct NineChars([u8; 9]);
@@ -375,14 +316,10 @@ unsafe impl Encode for NineChars {
 
 #[test]
 fn the_entry_point_is_chosen_by_the_return_type() {
-    // `msg` hands back a function pointer; which SYMBOL it points at is the
-    // whole of D4. On x86_64 a >16-byte return must land on a different symbol
-    // from an object return; on arm64 there is only one symbol, and asserting
-    // that is what proves the crate is not smuggling a `_stret` reference into
-    // a binary whose `libobjc` does not export one (that would be a load-time
-    // failure in the shipped app, not a compile error here).
-    //
-    // Only the arm64 arm EXECUTES on this box; the x86_64 arm is type-checked.
+    // Which symbol `msg` points at is the claim. On x86_64 a >16-byte return
+    // lands on a different symbol from an object return; on arm64 there is one,
+    // so no `_stret` reference reaches a binary whose `libobjc` exports none (a
+    // load-time failure in the shipped app). Only the arm64 arm executes here.
     // SAFETY: neither pointer is called — the test only compares addresses.
     let (plain, big, point) = unsafe {
         let plain: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();

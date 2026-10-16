@@ -4,22 +4,13 @@
 
 //! The host's OSC 8 hyperlink decision: which URI schemes the grid may carry.
 //!
-//! `OSC 8 ; params ; URI ST` sets the `current_hyperlink` that subsequent
-//! printable characters are tagged with. Acceptance depends on the URI alone,
-//! in [`super::handler_osc`]: the byte cap, the control-character scan, the
-//! BiDi-override refusal (CVE-2021-42574), and the scheme allowlist (the
-//! built-in safe set plus extra schemes the host minted through
-//! [`HyperlinkAuth::authorize_scheme`]). There is no on/off switch for OSC 8.
-//!
-//! Tagging a cell is not following a link. The click-time boundary is in the
-//! host: `aterm-gui`'s `is_safe_url` re-checks the scheme before
-//! `open_url_external`, and `aterm_gui::link_target`'s caption discloses the
-//! destination, since OSC 8 text and target can be unrelated. This module
-//! decides which URIs the grid may carry; the host decides what a click opens.
-
-// ---------------------------------------------------------------------------
-// Host-minted extra schemes.
-// ---------------------------------------------------------------------------
+//! OSC 8 acceptance depends on the URI alone (in [`super::handler_osc`]: the
+//! byte cap, control-character and BiDi-override scans, and the scheme
+//! allowlist); this module holds the extra schemes a host minted through
+//! [`HyperlinkAuth::authorize_scheme`]. There is no on/off switch for OSC 8.
+//! Tagging a cell is not following a link: at click time `aterm-gui`'s
+//! `is_safe_url` re-checks the scheme before `open_url_external`, and
+//! `aterm_gui::link_target`'s caption discloses the destination.
 
 /// Hard cap on host-minted extra schemes; a host mints one or two app schemes
 /// (`orca`). Abstract twin: `Cap` in `aterm_spec::derive::hyperlink_scheme_cap_model`.
@@ -29,11 +20,9 @@ pub(crate) const MAX_EXTRA_SCHEMES: usize = 4;
 /// the per-URI `eq_ignore_ascii_case` comparisons in the OSC-8 hot path.
 pub(crate) const MAX_EXTRA_SCHEME_LEN: usize = 32;
 
-/// Schemes refused even when the host asks — execution/exfiltration primitives
-/// no terminal hyperlink should ever carry. Matching is case-insensitive and
-/// also refuses `+`/`-`/`.`-suffixed spellings (`javascript.` etc.), so the
-/// never-allow decision cannot be evaded by RFC 3986 scheme-charset suffixes
-/// that some URL parsers normalize away.
+/// Schemes refused even when the host asks: execution/exfiltration primitives.
+/// Matching is case-insensitive and also refuses `+`/`-`/`.`-suffixed spellings
+/// (`javascript.`), which some URL parsers normalize away.
 const NEVER_ALLOW_SCHEMES: &[&str] = &["javascript", "data", "file", "vbscript", "about", "blob"];
 
 /// Whether `scheme` (without the trailing `:`) has the RFC 3986 §3.1 shape
@@ -58,10 +47,6 @@ fn is_never_allowed(lowered: &str) -> bool {
     let trimmed = lowered.trim_end_matches(['+', '-', '.']);
     NEVER_ALLOW_SCHEMES.contains(&trimmed)
 }
-
-// ---------------------------------------------------------------------------
-// Authorization state.
-// ---------------------------------------------------------------------------
 
 /// The host-minted extra-scheme set for OSC 8 URIs.
 ///
@@ -132,10 +117,6 @@ impl HyperlinkAuth {
         &self.extra_schemes
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

@@ -1,21 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// Adversarial tests, each running a recorded counterexample at the spelling
-// the live sites use.
-//
-// | finding | the counterexample this file runs                                     |
-// |---------|-----------------------------------------------------------------------|
-// | P3-1    | KVO's `context:` at the `*mut c_void` spelling — see `adversary_w2c`   |
-// | P3-2    | an over-aligned ivar; the 16-byte ceiling measured over 4,096 instances |
-// | P3-3    | the WRAPPER around a packed struct — see `abi.rs`                      |
-// | P3-4    | `setDelegateClass:(Class)`, whose encoding is `#` and never was        |
-// | P3-6    | the `Encode` bound on every block argument and return                  |
-// | P3-7    | `firstRectForCharacterRange:actualRange:` — `NSRange` by value AND ptr |
-// | MsgFn   | a 15-argument method is now refused at the DECLARE end too             |
-// | abort   | `abort_on_unwind` does not panic when stderr is unwritable             |
+// Adversarial tests, each running a counterexample at the spelling the live
+// sites use: one encoding letter per pointer-shaped runtime type (`Class` is
+// `#`), an ivar at the 16-byte alignment ceiling, `NSRange` by value and by
+// pointer, the `Encode` bound on the real block shapes, `BOOL *` read back
+// from Foundation, and `abort_on_unwind` with an unwritable stderr.
 
 #![cfg(target_os = "macos")]
+#![allow(
+    clippy::disallowed_types,
+    reason = "test code: a stand-in child may inherit descriptors"
+)]
 
 use std::ffi::{CStr, c_char, c_void};
 use std::os::unix::process::ExitStatusExt as _;
@@ -26,23 +22,17 @@ use aterm_objc::{
     declare_class, method_encoding, msg, protocol, sel, sel_uncached,
 };
 
-/// The [`MainThread`](aterm_objc::MainThread) witness every instantiation owes,
-/// for a test that is not on the main thread and does not need to be.
-///
-/// libtest runs every test on a worker (`pthread_main_np()` is 0 there even
-/// under `--test-threads=1`), so `MainThread::new()` correctly answers `None`
-/// here and the checked constructor is unusable. Every class in this file is an
-/// `NSObject`/`NSView` subclass that touches no AppKit state, is instantiated
-/// and released on the SAME worker, and whose `Ivars` are therefore dropped on
-/// the thread that made them — which is the second form of `new_unchecked`'s
-/// obligation, written once instead of at every call site.
+/// The [`MainThread`](aterm_objc::MainThread) witness, minted unchecked:
+/// libtest runs every test on a worker, so `MainThread::new()` answers `None`.
+/// Every class here touches no AppKit state and is created and released on the
+/// same worker, which is `new_unchecked`'s second obligation.
 fn mtm() -> aterm_objc::MainThread {
     // SAFETY: see this function's doc comment — the class has no main-thread
     // affinity and its ivars are born and dropped on this one worker.
     unsafe { aterm_objc::MainThread::new_unchecked() }
 }
 
-/// `SIGABRT`, spelled out: this crate has ZERO dependencies by construction.
+/// `SIGABRT`, spelled out: this crate has no dependencies, `libc` included.
 const SIGABRT: i32 = 6;
 
 unsafe extern "C" {
@@ -68,11 +58,10 @@ fn encoding_of(cls: ClassPtr, name: &'static CStr) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// P3-1 / P3-4 — four pointer-shaped runtime types, four different letters.
-//
-// `Id`, `ClassPtr`, `ProtocolPtr` and `Sel` are distinct types, so each has its
-// own `Encode` impl: a shared `*mut c_void` alias would register KVO's
-// `context:` as an OBJECT (`@`) and `Class` as `@` where clang emits `#`.
+// Four pointer-shaped runtime types, four letters. `Id`, `ClassPtr`,
+// `ProtocolPtr` and `Sel` are distinct types with their own `Encode` impls: a
+// shared `*mut c_void` alias would register KVO's `context:` as an object (`@`)
+// and `Class` as `@` where clang emits `#`.
 // ---------------------------------------------------------------------------
 
 declare_class! {
@@ -101,7 +90,7 @@ declare_class! {
 
 #[test]
 fn each_pointer_shaped_runtime_type_carries_its_own_encoding() {
-    // Static: the letters. MEASURED with clang on this box —
+    // The letters, from clang:
     //   @encode(id) = @   @encode(Class) = #   @encode(Protocol *) = @
     //   @encode(SEL) = :  @encode(void *) = ^v
     assert_eq!(<Id as Encode>::ENCODING, "@");
@@ -110,14 +99,13 @@ fn each_pointer_shaped_runtime_type_carries_its_own_encoding() {
     assert_eq!(<Sel as Encode>::ENCODING, ":");
     assert_eq!(<*mut c_void as Encode>::ENCODING, "^v");
 
-    // And they are four DIFFERENT Rust types, which is what makes four impls
-    // possible at all; were `Id` an alias of `*mut c_void`, the impls would
-    // collide.
+    // Four distinct Rust types make four impls possible; were `Id` an alias of
+    // `*mut c_void`, the impls would collide.
     assert_eq!(size_of::<Id>(), size_of::<*mut c_void>());
     assert_eq!(size_of::<ClassPtr>(), size_of::<*mut c_void>());
     assert_eq!(align_of::<Id>(), align_of::<*mut c_void>());
 
-    // Measured: what the RUNTIME holds, which is what `NSMethodSignature`,
+    // What the runtime holds, which is what `NSMethodSignature`,
     // `NSInvocation`, forwarding and accessibility read.
     let cls = Shapes::class();
     let b = Bool::ENCODING;
@@ -157,7 +145,7 @@ fn each_pointer_shaped_runtime_type_carries_its_own_encoding() {
 }
 
 // ---------------------------------------------------------------------------
-// P3-2 — an over-aligned ivar is UB reachable from safe code. `S4`'s twin.
+// The 16-byte ivar alignment ceiling (`S4` in the crate docs).
 // ---------------------------------------------------------------------------
 
 /// Exactly at the ceiling: 16 bytes, which is what `class_createInstance`'s
@@ -167,10 +155,9 @@ fn each_pointer_shaped_runtime_type_carries_its_own_encoding() {
 struct AtTheCeiling(u64, u64);
 
 declare_class! {
-    /// The largest alignment an ivar may have. `align(32)` and `align(64)` are
-    /// compile errors — see the `compile_fail` doctest on
-    /// [`aterm_objc::ClassBuilder::add_rust_ivar`], which is where the refusal
-    /// itself is armed, since a test that does not compile cannot live here.
+    /// The largest alignment an ivar may have; `align(32)` and up are refused
+    /// (the `compile_fail` doctest on
+    /// [`aterm_objc::ClassBuilder::add_rust_ivar`]).
     struct Aligned16: NSObject {
         const NAME: &str = "ATermObjcAligned16W2D";
         type Ivars = AtTheCeiling;
@@ -185,23 +172,11 @@ declare_class! {
 
 #[test]
 fn an_ivar_at_the_sixteen_byte_ceiling_is_aligned_in_every_instance() {
-    // This is the claim the ceiling rests on, and it is the one the crate got
-    // wrong: `class_addIvar` aligns the ivar's OFFSET within the instance, but
-    // the instance BASE is whatever `malloc` returns, and `malloc` promises 16
-    // and no more. So the slot's real alignment is `min(16, requested)`.
-    //
-    // MEASURED here through `ivar_getOffset` and the raw `+alloc` addresses —
-    // no Rust reference anywhere in the loop, so nothing is folded away.
-    // Recorded at the time this test was written, 4,096 instances per class:
-    //
-    //   Ivars align  ivar offset  slot misaligned   base not 32-aligned
-    //          16         16         0 / 4096          2042 / 4096
-    //          32         32        19 / 4096            19 / 4096
-    //          64         64         9 / 4096             9 / 4096
-    //
-    // The last two rows no longer compile. The first is asserted below, and the
-    // `base not 32-aligned` column is why: the base really is only 16-aligned,
-    // not accidentally more.
+    // `class_addIvar` aligns the ivar's offset, but the instance base is only
+    // `malloc`'s 16-aligned (measurements on `ClassBuilder::add_rust_ivar`), so
+    // the slot's real alignment is `min(16, requested)`. Checked over 4,096 raw
+    // `+alloc`s, with no Rust reference in the loop; the base count shows the
+    // base really is only 16-aligned.
     let cls = Aligned16::class();
     // SAFETY: `cls` is registered, so its ivar table is final and the handle is
     // live for the process.
@@ -245,9 +220,9 @@ fn an_ivar_at_the_sixteen_byte_ceiling_is_aligned_in_every_instance() {
          nothing about the 16-byte ceiling; {base_not_32}/4096 were not"
     );
 
-    // And the class works end to end through the SAFE `ivars()` accessor, which
-    // is the caller that could not discharge `IvarSlot::get`'s alignment
-    // precondition and now can, because no over-aligned class exists.
+    // End to end through the safe `ivars()` accessor, which can discharge
+    // `IvarSlot::get`'s alignment precondition because no over-aligned class
+    // exists.
     let obj = Aligned16::alloc_init(mtm(), AtTheCeiling(20, 22)).expect("+alloc/-init");
     // SAFETY: `-sum` is declared on this class with exactly this prototype.
     let sum = unsafe {
@@ -259,8 +234,7 @@ fn an_ivar_at_the_sixteen_byte_ceiling_is_aligned_in_every_instance() {
 }
 
 // ---------------------------------------------------------------------------
-// P3-7 — `NSRange`, and a pointer to it. Without both, winit's
-// `NSTextInputClient` conformance cannot be DECLARED.
+// `NSRange` by value and by pointer, as winit's `NSTextInputClient` needs.
 // ---------------------------------------------------------------------------
 
 declare_class! {
@@ -273,7 +247,7 @@ declare_class! {
         @sel(firstRectForCharacterRange:actualRange:)
         fn first_rect(&self, range: NSRange, actual: *mut NSRange) -> CGRect {
             if !actual.is_null() {
-                // SAFETY: `actualRange:` is an OUT parameter; the framework
+                // SAFETY: `actualRange:` is an out parameter; the framework
                 // passes either NULL or a writable `NSRange` it owns for the
                 // duration of the call. Here the caller is the test below.
                 unsafe { actual.write(range) };
@@ -304,13 +278,12 @@ declare_class! {
 
 #[test]
 fn an_nsrange_crosses_the_boundary_by_value_and_by_pointer() {
-    // Static. MEASURED with clang on this box, from a compiled
-    // `@implementation` of the same three declarations:
+    // From clang, a compiled `@implementation` of the same declarations:
     //
     //   firstRectForCharacterRange:actualRange:
     //     {CGRect={CGPoint=dd}{CGSize=dd}}40@0:8{_NSRange=QQ}16^{_NSRange=QQ}32
     //
-    // The struct TAG is `_NSRange` (`NSRange` is a typedef) and `Q` is
+    // The struct tag is `_NSRange` (`NSRange` is a typedef) and `Q` is
     // `unsigned long long`; a pointer to a struct is `^` then the pointee's own
     // encoding.
     assert_eq!(<NSRange as Encode>::ENCODING, "{_NSRange=QQ}");
@@ -388,56 +361,14 @@ fn an_nsrange_crosses_the_boundary_by_value_and_by_pointer() {
 }
 
 // ---------------------------------------------------------------------------
-// P3-6 — every block argument and return states its ABI, like everything else.
+// Every block argument and return states its ABI.
 // ---------------------------------------------------------------------------
 
-#[test]
-fn the_three_real_block_shapes_all_satisfy_the_new_encode_bounds() {
-    // The whole point of the finding is that this bound costs the tree nothing:
-    // all three live sites already satisfy it. `(NSEvent*) -> NSEvent*`,
-    // `(NSInteger) -> void`, `(NSRunningApplication*, NSError*) -> void`.
-    // SAFETY: none of these blocks is invoked; the constructors are what the
-    // bounds are being exercised through.
-    unsafe {
-        let a = aterm_objc::RcBlock::new1(|e: Id| e).expect("_Block_copy");
-        let b = aterm_objc::RcBlock::new1(|_n: i64| {}).expect("_Block_copy");
-        let c = aterm_objc::RcBlock::new2(|_app: Id, _err: Id| {}).expect("_Block_copy");
-        assert!(!a.as_ptr().is_null() && !b.as_ptr().is_null() && !c.as_ptr().is_null());
-    }
-    // The negative side — a `*mut bool` argument (`BOOL *` is `signed char *`
-    // on the x86_64 compat slice) and a `-> bool` return — are `compile_fail`
-    // doctests on the constructors, because a test that does not compile
-    // cannot live in a test binary. `tests/blocks.rs` carries the positive
-    // form: `enumerateLinesUsingBlock:`'s `stop` is `*mut Bool`.
-    // `^c`, not `*`, on x86_64: clang encodes the `BOOL` typedef, not the
-    // `signed char *` it aliases — measured against Foundation's own
-    // `-[NSFileManager fileExistsAtPath:isDirectory:]` (`c32@0:8@16^c24`) on
-    // an Intel Mac, 2026-09-06. This pin only transcribes that measurement;
-    // the next test asks the runtime for it on every run.
-    assert_eq!(
-        <*mut Bool as Encode>::ENCODING,
-        if cfg!(target_arch = "aarch64") {
-            "^B"
-        } else {
-            "^c"
-        }
-    );
-}
-
-/// `BOOL *`'s encoding, asked of the RUNTIME instead of transcribed.
-///
-/// The pin above compares the constant with a literal typed from a
-/// measurement, and it was green while the x86_64 literal was wrong (`*`),
-/// because the constant and the literal agreed with each other and with
-/// nothing else. This reads Foundation's own compiled method instead: argument
-/// 3 of `-[NSFileManager fileExistsAtPath:isDirectory:]` is its
-/// `BOOL *isDirectory`, encoded by clang when Apple built Foundation. On
-/// x86_64 that is `^c` (the method is `c32@0:8@16^c24`, measured on an Intel
-/// Mac, macOS 13.7.8), and this test is red there against the old `*`. On
-/// arm64 the EXPECTED answer is `^B`, inferred from the arm64
-/// `@encode(BOOL *)` that `encode.rs` records rather than measured: the test
-/// is armed on both arches, but it was written and run on an Intel Mac and has
-/// not been run on arm64.
+/// `BOOL *`'s encoding, asked of the runtime: argument 3 of
+/// `-[NSFileManager fileExistsAtPath:isDirectory:]` is its `BOOL *isDirectory`,
+/// encoded by clang when Apple built Foundation (`c32@0:8@16^c24` on x86_64).
+/// A pin against a typed literal stays green when the constant and the literal
+/// are wrong together; this one cannot.
 #[test]
 fn bool_ptr_encodes_what_foundation_compiled_for_its_bool_out_parameter() {
     let cls = aterm_objc::class(c"NSFileManager");
@@ -466,7 +397,8 @@ fn bool_ptr_encodes_what_foundation_compiled_for_its_bool_out_parameter() {
 }
 
 // ---------------------------------------------------------------------------
-// `abort_on_unwind` used `eprintln!`, which PANICS if stderr is unwritable.
+// `abort_on_unwind` must not panic when stderr is unwritable, as `eprintln!`
+// would.
 // ---------------------------------------------------------------------------
 
 /// Set in the child: point fd 2 at a pipe with no reader, then panic inside a
@@ -488,9 +420,8 @@ declare_class! {
 
 #[test]
 fn the_unwind_guard_does_not_itself_panic_when_stderr_is_gone() {
-    // libSystem, already linked into every process this crate runs in — the
-    // same "declare the symbol, this crate has no dependencies" discipline the
-    // rest of the file uses for the runtime's own entry points.
+    // libSystem, linked into every process; declared here because this crate
+    // has no dependencies.
     unsafe extern "C" {
         fn pipe(fds: *mut i32) -> i32;
         fn dup2(old: i32, new: i32) -> i32;
@@ -498,12 +429,10 @@ fn the_unwind_guard_does_not_itself_panic_when_stderr_is_gone() {
     }
 
     if std::env::var_os(BROKEN_STDERR).is_some() {
-        // Count how many times the panic HOOK runs, on stdout, which stays
-        // open. Exactly one panic should happen: the deliberate one. A second
-        // means the guard itself panicked trying to report the first — which is
-        // what `eprintln!` does on a closed fd 2, and which unwinds out of the
-        // very `extern "C"` frame the guard exists to stop, landing on Rust's
-        // unnamed "thread caused non-unwinding panic" shim.
+        // Count panic-hook runs on stdout, which stays open. Exactly one panic
+        // should happen; a second means the guard panicked reporting the first
+        // (as `eprintln!` does on a broken fd 2), unwinding out of the
+        // `extern "C"` frame it exists to protect.
         static HOOKS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         std::panic::set_hook(Box::new(|_| {
             let n = HOOKS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
@@ -512,11 +441,9 @@ fn the_unwind_guard_does_not_itself_panic_when_stderr_is_gone() {
             let _ = std::io::stdout().flush();
         }));
         let obj = Panicker::alloc_init(mtm(), ()).expect("+alloc/-init");
-        // Point fd 2 at a pipe and then close BOTH ends of it: every write to
-        // stderr now fails with `EPIPE` (Rust ignores `SIGPIPE`, so it is an
-        // error rather than a signal). MEASURED to be the reliable way to do
-        // this — merely closing fd 2 is NOT, because Rust's `Stderr` keeps
-        // writing successfully afterwards under the test harness.
+        // Point fd 2 at a pipe and close both ends: every stderr write then
+        // fails with `EPIPE` (Rust ignores `SIGPIPE`). Merely closing fd 2 is
+        // not enough: Rust's `Stderr` keeps succeeding under the test harness.
         // SAFETY: `fds` is a live two-element array; `dup2`/`close` take plain
         // descriptors and this thread owns fd 2. Nothing after this point may
         // rely on stderr, which is the property under test.

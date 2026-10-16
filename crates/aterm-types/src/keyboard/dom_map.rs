@@ -2,34 +2,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! DOM (`KeyboardEvent.key`) → engine keyboard mapping.
+//! DOM [`KeyboardEvent.key`] → engine [`Key`]/[`NamedKey`] mapping: the web sibling of
+//! `aterm-winit-keymap`, here so the wasm bindings (`aterm-wasm`, `aterm-gpu-web`) share one
+//! table. Pure `&str` matching, so no feature gate.
 //!
-//! The reusable bridge from a browser's [UI Events `KeyboardEvent.key`] value to
-//! the engine's bridge-agnostic [`Key`]/[`NamedKey`], the web sibling of
-//! the `aterm-winit-keymap` crate (K-2): it lives here so the wasm bindings
-//! (`aterm-wasm`, `aterm-gpu-web`) share ONE table instead of each host hand-rolling a
-//! legacy-only TS encoder that drifts (the old embedder encoder dropped
-//! Shift/Ctrl/Alt on arrows/nav keys and could never speak the Kitty protocol
-//! the engine advertises).
-//!
-//! No feature gate: the mapping is pure `&str` matching with no platform deps.
-//!
-//! [UI Events `KeyboardEvent.key`]: https://www.w3.org/TR/uievents-key/
+//! [`KeyboardEvent.key`]: https://www.w3.org/TR/uievents-key/
 
 use super::{Key, KeyEventType, KeyboardMode, Modifiers, NamedKey, encode_key_with_layout};
 
-/// Encode a DOM keyboard event against an EXPLICIT [`KeyboardMode`] — the one
-/// implementation behind both wasm bindings' instance `encode_key` (live
-/// `Terminal::keyboard_mode()`) and their free `encode_key_with_mode` (a
-/// host-mirrored mode snapshot), shared here so the two can never drift.
+/// Encode a DOM keyboard event against an explicit [`KeyboardMode`]: the one implementation
+/// behind both wasm bindings' `encode_key` (live mode) and `encode_key_with_mode` (a
+/// host-mirrored snapshot).
 ///
-/// `key` is a DOM `KeyboardEvent.key` value (see [`map_dom_key`]); `mods` is
-/// the engine [`Modifiers`] bitfield (SHIFT=1, ALT=2, CTRL=4, SUPER=8);
-/// `event_type` is 0=Press, 1=Repeat, 2=Release (anything else is refused,
-/// never guessed); `base_layout_key` is the physical key's US-QWERTY char for
-/// Kitty `REPORT_ALTERNATE_KEYS`. Returns `None` when the event encodes to
-/// nothing (e.g. a release without the Kitty protocol) or the key has no
-/// terminal encoding (modifier-only / IME / unidentified DOM keys).
+/// `key` is a DOM `KeyboardEvent.key` value ([`map_dom_key`]); `mods` the [`Modifiers`] bits;
+/// `event_type` 0=Press, 1=Repeat, 2=Release (anything else is refused); `base_layout_key` the
+/// physical key's US-QWERTY char for Kitty `REPORT_ALTERNATE_KEYS`. `None` when the event
+/// encodes to nothing (e.g. a release without Kitty) or the key does not map.
 #[must_use]
 pub fn encode_dom_key(
     key: &str,
@@ -55,25 +43,20 @@ pub fn encode_dom_key(
     if bytes.is_empty() { None } else { Some(bytes) }
 }
 
-/// Map a DOM [`KeyboardEvent.key`] value into the engine's [`Key`].
+/// Map a DOM [`KeyboardEvent.key`] value into the engine's [`Key`]. `None` for values the
+/// engine must not guess an encoding for: IME/composition values (`"Dead"`, `"Process"`,
+/// `"Compose"`, multi-codepoint strings), `"Unidentified"`, and named keys no terminal sequence
+/// covers.
 ///
-/// Returns `None` for keys the engine must not guess an encoding for:
-/// modifier-only keys (`"Shift"`, `"Control"`, `"Alt"`, `"Meta"`, …), IME /
-/// composition values (`"Dead"`, `"Process"`, `"Compose"`, multi-codepoint
-/// strings), `"Unidentified"`, and the long tail of named DOM keys (TV /
-/// launch / browser keys) no terminal escape sequence covers.
-///
-/// `" "` maps to [`NamedKey::Space`], not `Key::Character(' ')`, mirroring
-/// `aterm_winit_keymap::map_named_key` — the legacy encoder's named-Space arm carries
-/// the Ctrl+Space → NUL and Alt+Space → ESC SP semantics the encoder tests
-/// pin (`tests_legacy.rs`), and its Kitty code (32) matches the character form.
+/// `" "` maps to [`NamedKey::Space`], as `aterm_winit_keymap::map_named_key` does: the legacy
+/// encoder's named Space arm carries Ctrl+Space → NUL and Alt+Space → ESC SP, and its Kitty
+/// code (32) matches the character form.
 ///
 /// [`KeyboardEvent.key`]: https://www.w3.org/TR/uievents-key/
 #[must_use]
 pub fn map_dom_key(key: &str) -> Option<Key> {
-    // A single-codepoint value is a printable character key ("a", "A", "@",
-    // "é", "あ"…). Multi-codepoint strings are IME/composed text, not a single
-    // key event.
+    // A single codepoint is a character key ("a", "@", "é", "あ"); a longer string is
+    // IME/composed text.
     let mut chars = key.chars();
     if let Some(c) = chars.next()
         && chars.next().is_none()
@@ -87,15 +70,9 @@ pub fn map_dom_key(key: &str) -> Option<Key> {
     map_dom_named_key(key).map(Key::Named)
 }
 
-/// Map a named (multi-character) DOM key value into the engine's [`NamedKey`].
-///
-/// Covers the full set the engine can encode and a browser can report:
-/// navigation, editing, locks, system keys, `F1`–`F35` (browsers report at
-/// least up to `F24`; the extended range costs nothing), and the media/audio
-/// cluster. `None` for everything else — including the modifier keys, which
-/// DOM reports as standalone `keydown`s that have no legacy encoding and are
-/// only reportable under Kitty `REPORT_ALL_KEYS_AS_ESC` (a host that wants
-/// them can add the mapping then; until that exists, never guess).
+/// Map a named (multi-character) DOM key value into the engine's [`NamedKey`]: navigation,
+/// editing, locks, system keys, `F1`–`F35`, the modifiers (Left-canonical) and the media/audio
+/// cluster. `None` for everything else.
 #[must_use]
 fn map_dom_named_key(key: &str) -> Option<NamedKey> {
     Some(match key {
@@ -158,11 +135,8 @@ fn map_dom_named_key(key: &str) -> Option<NamedKey> {
         "F33" => NamedKey::F33,
         "F34" => NamedKey::F34,
         "F35" => NamedKey::F35,
-        // Modifier keys, canonicalized to the Left variants (DOM `key` does
-        // not carry the side; `location` would, but the winit path performs
-        // the same Left-canonicalization). Safe to map for every mode: the
-        // encoder reports modifier keys ONLY under Kitty
-        // `REPORT_ALL_KEYS_AS_ESC` and encodes nothing otherwise.
+        // Modifier keys, canonicalized to Left (DOM `key` carries no side; the winit path
+        // does the same). The encoder reports them only under Kitty `REPORT_ALL_KEYS_AS_ESC`.
         "Shift" => NamedKey::ShiftLeft,
         "Control" => NamedKey::ControlLeft,
         "Alt" => NamedKey::AltLeft,
@@ -180,9 +154,8 @@ fn map_dom_named_key(key: &str) -> Option<NamedKey> {
         "AudioVolumeDown" => NamedKey::AudioVolumeDown,
         "AudioVolumeUp" => NamedKey::AudioVolumeUp,
         "AudioVolumeMute" => NamedKey::AudioVolumeMute,
-        // "AltGraph"/"Fn" (no NamedKey variants), IME/composition ("Dead",
-        // "Process", "Compose"), "Unidentified", and TV/launch/browser keys:
-        // no terminal encoding.
+        // "AltGraph"/"Fn" (no NamedKey variants), IME/composition, "Unidentified",
+        // TV/launch/browser keys: no terminal encoding.
         _ => return None,
     })
 }
@@ -202,9 +175,7 @@ mod tests {
 
     #[test]
     fn space_maps_to_the_named_form_legacy_expects() {
-        // DOM reports the space bar as the literal " " string. The engine's
-        // legacy encoder pins Ctrl+Space → NUL on the NAMED Space arm
-        // (tests_legacy.rs), mirroring aterm-winit-keymap's Space → NamedKey::Space.
+        // The legacy encoder's Ctrl+Space → NUL lives on the named Space arm.
         assert_eq!(map_dom_key(" "), Some(Key::Named(NamedKey::Space)));
     }
 
@@ -276,10 +247,8 @@ mod tests {
 
     #[test]
     fn modifier_keys_map_left_canonical() {
-        // Modifier keydowns map (Left-canonical) so Kitty
-        // REPORT_ALL_KEYS_AS_ESC apps can receive them; the ENCODER keeps
-        // them silent in every other mode, so no legacy byte can ever be
-        // guessed for a bare "Shift".
+        // Mapped so Kitty REPORT_ALL_KEYS_AS_ESC apps receive them; the encoder keeps them
+        // silent in every other mode.
         assert_eq!(map_dom_key("Shift"), Some(Key::Named(NamedKey::ShiftLeft)));
         assert_eq!(
             map_dom_key("Control"),
@@ -295,7 +264,7 @@ mod tests {
 
     #[test]
     fn modifier_keys_encode_only_under_report_all() {
-        // Every non-report-all mode: silence (press AND release).
+        // Every non-report-all mode: silence, press and release.
         for mode in [
             KeyboardMode::empty(),
             KeyboardMode::DISAMBIGUATE_ESC_CODES,
@@ -347,9 +316,7 @@ mod tests {
 
     #[test]
     fn encode_dom_key_text_release_requires_report_all() {
-        // `REPORT_EVENT_TYPES` does not turn text-producing keys into escape
-        // reports. Their releases remain unrepresentable until report-all is
-        // negotiated; this is Codex's 1|2|4 mode.
+        // `REPORT_EVENT_TYPES` alone (mode 1|2|4) does not report a text key's release.
         let events = KeyboardMode::DISAMBIGUATE_ESC_CODES | KeyboardMode::REPORT_EVENT_TYPES;
         assert!(encode_dom_key("a", 0, 2, None, events).is_none());
         assert!(encode_dom_key("Enter", 0, 2, None, events).is_none());

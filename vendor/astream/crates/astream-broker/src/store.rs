@@ -5,10 +5,12 @@
 //! `astream_engine::store`/`durable` (longest intact in-order prefix) and tightens
 //! it: only a TORN TAIL — an incomplete trailing frame, or a zero-filled tail, the
 //! signatures of an interrupted write — is truncated on open. A complete-but-corrupt
-//! frame, a record-format (`BREC_VERSION`) mismatch, or an offset gap FOLLOWED BY MORE
-//! BYTES is corruption, and [`BrokerLog::open_with`] refuses to open rather than
-//! silently truncating what may be acked data ([`BrokerLog::open_repair`] is the
-//! explicit, data-losing repair). Adds exactly-once **ingest**: a `(producer_id,
+//! frame, an older record format (`BREC_VERSION`) this build no longer reads, or an
+//! offset gap FOLLOWED BY MORE BYTES is corruption, and [`BrokerLog::open_with`]
+//! refuses to open rather than silently truncating what may be acked data
+//! ([`BrokerLog::open_repair`] is the explicit, data-losing repair). A record in a
+//! NEWER format is neither: every open refuses it by name (`ErrorKind::Unsupported`),
+//! and no repair touches it. Adds exactly-once **ingest**: a `(producer_id,
 //! producer_seq)` idempotency key maps to the original `Offset`, so a re-sent publish
 //! is NOT re-appended and returns the offset it first got — the precise pair, NOT the
 //! engine's monotonic high-water (which would wrongly reject a producer legitimately
@@ -231,6 +233,17 @@ pub struct BrokerLog {
     /// [`stage_will_fire`](Self::stage_will_fire)); its wills fire on the leader and
     /// arrive by replication like every other record.
     replica: bool,
+    /// WHICH log this is, and which incarnation of its offsets ([`LogIdentity`]),
+    /// with what the open that settled it saw. Durable in the `<log>.id` sidecar,
+    /// settled on every open before it returns; on a replica, its leader's.
+    ///
+    /// [`LogIdentity`]: crate::LogIdentity
+    identity: crate::logid::Sidecar,
+    /// Set once THIS open refused a replicated record because the log already holds
+    /// a DIFFERENT record at its offset: the log is not its leader's spine there, so
+    /// it does not take its leader's identity again before a reopen settles it anew
+    /// ([`adopt_identity`](Self::adopt_identity)).
+    diverged: bool,
     /// The producer-id BINDING table: `producer id -> (principal, the offset of the
     /// /a/bind record that bound it)`. Rebuilt on open from those records, so a
     /// binding survives a broker restart. It is belt-and-braces on top of the 64-bit
@@ -351,7 +364,7 @@ fn read_base(path: &Path) -> io::Result<Offset> {
 /// log's sidecars are written at fixed names beside it, and `create_new` (O_EXCL)
 /// never follows a symlink: a link planted at one of those names by someone who can
 /// write the log directory cannot redirect the write onto another file.
-fn create_fresh(path: &Path, opts: &mut OpenOptions) -> io::Result<File> {
+pub(crate) fn create_fresh(path: &Path, opts: &mut OpenOptions) -> io::Result<File> {
     match std::fs::remove_file(path) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -659,7 +672,7 @@ fn replica_marker_path(path: &Path) -> std::path::PathBuf {
 /// — survives a power loss. `sync_data` on the file alone never persists the entry
 /// that names it.
 #[cfg(unix)]
-fn sync_parent_dir(path: &Path) -> io::Result<()> {
+pub(crate) fn sync_parent_dir(path: &Path) -> io::Result<()> {
     let parent = match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
@@ -687,7 +700,7 @@ fn sync_parent_dir(path: &Path) -> io::Result<()> {
     }
 }
 #[cfg(not(unix))]
-fn sync_parent_dir(_path: &Path) -> io::Result<()> {
+pub(crate) fn sync_parent_dir(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
@@ -729,11 +742,19 @@ impl BrokerLog {
     /// Recovery distinguishes a TORN TAIL from CORRUPTION: an incomplete trailing
     /// frame or a zero-filled tail (an interrupted write) is truncated, durably. A
     /// complete frame that does not decode (bad CRC/magic/version), a record whose
-    /// payload does not parse (a `BREC_VERSION` mismatch — e.g. an older-format log —
-    /// or a foreign file), or an offset gap, when MORE BYTES FOLLOW or the frame is
-    /// itself complete, is corruption: this returns `InvalidData` naming the offset
-    /// and byte, and leaves the file UNTOUCHED. Use [`open_repair`](Self::open_repair)
-    /// to truncate at that point explicitly.
+    /// payload does not parse (an older `BREC_VERSION` this build no longer reads, or a
+    /// foreign file), or an offset gap, when MORE BYTES FOLLOW or the frame is itself
+    /// complete, is corruption: this returns `InvalidData` naming the offset and byte,
+    /// and leaves the file UNTOUCHED. Use [`open_repair`](Self::open_repair) to
+    /// truncate at that point explicitly.
+    ///
+    /// A record in a NEWER format than this build reads (its version byte above
+    /// [`BREC_VERSION`](crate::BREC_VERSION)) is not corruption: a newer astream wrote
+    /// it. This returns `Unsupported`, saying so, and `open_repair` refuses it the same
+    /// way — the file is untouched either way.
+    ///
+    /// Settles the log's [`identity`](Self::identity) and records it in `<log>.id`
+    /// before returning; an open that cannot write that sidecar fails.
     ///
     /// Takes an exclusive advisory lock on the file: a second open of the same log
     /// (this or another process) fails `AlreadyExists` until the first is closed. On a
@@ -789,6 +810,12 @@ impl BrokerLog {
     /// corrupt record and everything after it — possibly acked data; this is the
     /// explicit, operator-invoked repair, never the default). A clean log or a merely
     /// torn tail opens exactly as `open_with` would.
+    ///
+    /// A repair that truncates records advances the log's
+    /// [`identity`](Self::identity) generation (durably, before the first byte is
+    /// cut): later appends reuse the cut offsets, so every offset a client persisted
+    /// before the repair is meaningless after it. A record in a NEWER format is not
+    /// repaired: it is refused `Unsupported`, exactly as by `open_with`.
     pub fn open_repair(
         path: impl AsRef<Path>,
         durability: Durability,
@@ -1032,6 +1059,40 @@ impl BrokerLog {
                 ));
             }
         }
+        // A record in a NEWER format than this build reads was WRITTEN, not damaged:
+        // its payload passed the frame CRC (and, at rest, authentication) before its
+        // version byte was read. It is refused by name on EVERY open, `open_repair`
+        // included — truncating it would destroy records the release that wrote them
+        // reads — and the file is left untouched.
+        if let Tail::Newer {
+            offset,
+            at_byte,
+            version,
+        } = &scanned.tail
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "{}: the record at offset {offset} (byte {at_byte}) is in record format \
+                     v{version}, written by a newer astream; this build reads up to v{}: \
+                     upgrade astream to open this log (the file is untouched, and no repair \
+                     applies)",
+                    path.display(),
+                    crate::brecord::BREC_VERSION
+                ),
+            ));
+        }
+        // The log's identity is settled HERE, before a repair cuts a byte, so the
+        // generation bump that cut owes clients is durable before its evidence is gone.
+        let identity = crate::logid::open(
+            path,
+            created,
+            replica,
+            matches!(scanned.tail, Tail::Corrupt { .. }),
+            &existing[..scanned.valid_len],
+            base.0,
+            base.0 + scanned.records.len() as u64,
+        )?;
         let valid_len = scanned.valid_len;
         let dropped = (existing.len() - valid_len) as u64;
         if dropped > 0 {
@@ -1100,6 +1161,8 @@ impl BrokerLog {
             file,
             path: path.to_path_buf(),
             replica,
+            identity,
+            diverged: false,
             mirror,
             records,
             base,
@@ -1185,6 +1248,48 @@ impl BrokerLog {
     /// permanently diverges it and fences its link.
     pub fn is_replica(&self) -> bool {
         self.replica
+    }
+
+    /// WHICH log this is, and which incarnation of its offsets — settled (and made
+    /// durable in `<log>.id`) by the open, or adopted from a leader by a replica. A
+    /// client that persisted an offset under any other identity must not apply it
+    /// here: see [`LogIdentity`](crate::LogIdentity).
+    pub fn identity(&self) -> crate::LogIdentity {
+        self.identity.identity
+    }
+
+    /// Take `leader` as this log's identity, durably — what a REPLICA does with the
+    /// identity its leader sends beside each replicated record, so a client that
+    /// fails over to it keeps its offsets. `through` is the highest offset of the
+    /// committed replicated records that carried it.
+    ///
+    /// Taken only when those records reach this log's NEWEST record: a leader ships
+    /// in order from its confirmed prefix, so every record below `through` was
+    /// appended or compared byte for byte first, and the whole log is the leader's.
+    /// An echo of a shared PREFIX vouches for nothing above it — a follower that
+    /// kept records its leader has since cut (and renumbered as a new generation)
+    /// matches the leader below the cut and not above, and would otherwise tell a
+    /// client that fails over that the leader's offsets name its own records. And
+    /// never in an open that refused a replicated record for holding a different one
+    /// at its offset.
+    ///
+    /// `Ok(false)`, changing nothing, on a log that is not a replica (its records are
+    /// its own, so its identity is too), one that already carries `leader`, or one
+    /// those two rules leave on its own identity.
+    pub(crate) fn adopt_identity(
+        &mut self,
+        leader: crate::LogIdentity,
+        through: Offset,
+    ) -> io::Result<bool> {
+        if !self.replica
+            || self.diverged
+            || through.0.checked_add(1) != Some(self.next.0)
+            || self.identity.identity == leader
+        {
+            return Ok(false);
+        }
+        self.identity = crate::logid::adopt(&self.path, &self.identity, leader)?;
+        Ok(true)
     }
 
     /// Declare this log a REPLICA — for an operator standing a follower up on a log
@@ -1577,6 +1682,7 @@ impl BrokerLog {
                 // will-firing for every producer on the broker for good.
                 return Ok((rec.seq, true));
             }
+            self.diverged = true;
             return Err(StageErr::Diverged(format!(
                 "replica diverged at offset {}: a different record is already held there",
                 rec.seq.0
@@ -2531,14 +2637,23 @@ enum Tail {
     /// length field on the very LAST record also looks like an incomplete frame.)
     Torn,
     /// The intact prefix is followed by bytes that are present but WRONG: a complete
-    /// frame with a bad CRC/magic/version, a record payload that does not parse (a
-    /// `BREC_VERSION` mismatch, a foreign file), or an offset gap. Truncating here
-    /// would destroy every record after it — possibly acked data — so the default open
-    /// refuses instead.
+    /// frame with a bad CRC/magic/version, a record payload that does not parse (an
+    /// OLDER record format this build no longer reads, a foreign file), or an offset
+    /// gap. Truncating here would destroy every record after it — possibly acked data
+    /// — so the default open refuses instead.
     Corrupt {
         offset: u64,
         at_byte: usize,
         reason: String,
+    },
+    /// The intact prefix is followed by a record in a NEWER format (`version` above
+    /// `BREC_VERSION`) — written by a newer astream, not damaged: the frame's CRC
+    /// (and, at rest, its authentication) held before the version byte was read.
+    /// Neither corruption nor repairable: every open refuses it, by name.
+    Newer {
+        offset: u64,
+        at_byte: usize,
+        version: u8,
     },
 }
 
@@ -2567,9 +2682,14 @@ fn later_record_exists(rest: &[u8], key: Option<&[u8; 32]>) -> bool {
                 // cannot parse (and whose index we do not know here), but a 32-bit-CRC
                 // -valid frame is strong evidence of a real sealed record, so treat its
                 // presence as a rotted length field (corruption), not a torn tail.
+                // A newer-format record counts: it was written, so the frame before it
+                // is a rotted length, not a torn write to cut.
                 let real = match key {
                     Some(_) => true,
-                    None => BrokerRecord::from_payload(&d.frame.payload).is_some(),
+                    None => {
+                        BrokerRecord::from_payload(&d.frame.payload).is_some()
+                            || crate::brecord::newer_format(&d.frame.payload, None).is_some()
+                    }
                 };
                 if real {
                     return true;
@@ -2653,9 +2773,22 @@ fn scan(bytes: &[u8], key: Option<&[u8; 32]>, base: u64) -> Scan {
                         );
                     }
                     None => {
+                        if let Some(version) =
+                            crate::brecord::newer_format(&payload, Some(expected))
+                        {
+                            return Scan {
+                                records: out,
+                                valid_len: pos,
+                                tail: Tail::Newer {
+                                    offset: expected,
+                                    at_byte: pos,
+                                    version,
+                                },
+                            };
+                        }
                         return corrupt(
                             out,
-                            "record payload does not parse (BREC_VERSION mismatch or malformed)"
+                            "record payload does not parse (an older BREC_VERSION, or malformed)"
                                 .to_string(),
                         );
                     }
@@ -2952,23 +3085,30 @@ mod tests {
         drop(log);
     }
 
-    /// A record-format mismatch (an older/newer BREC_VERSION) mid-log, an offset gap
-    /// followed by more records, and a complete-but-invalid LAST frame are all
-    /// corruption (refused), not torn tails — none of them is the shape of an
-    /// interrupted write.
+    /// The stored payload of `rec(seq, 1, seq + 1)` stamped with record format
+    /// `version`, framed — a record a build of that version would have written.
+    fn record_in_format(seq: u64, version: u8) -> Vec<u8> {
+        let mut payload = rec(seq, 1, seq + 1).encode().unwrap()[12..].to_vec();
+        payload[0] = version;
+        Frame::new(payload).encode().unwrap()
+    }
+
+    /// An OLDER record format mid-log (one this build no longer reads), an offset gap
+    /// followed by more records, a complete-but-invalid LAST frame, a frame whose
+    /// length runs past the end with a newer-format record intact behind it (a rotted
+    /// length, not an interrupted write), and a newer version byte on a payload that
+    /// does not carry its own offset are all corruption: refused, the file untouched,
+    /// and only the explicit `open_repair` truncates.
     #[test]
-    fn version_mismatch_gap_and_bad_last_frame_are_corruption_not_torn() {
+    fn an_older_format_a_gap_and_a_bad_last_frame_are_corruption_not_torn() {
         let one = rec(0, 1, 1).encode().unwrap();
         let mut good = Vec::new();
         for i in 0..3 {
             good.extend_from_slice(&rec(i, 1, i + 1).encode().unwrap());
         }
-        // (a) a record whose payload carries BREC_VERSION+1, followed by a good one.
-        let mut alien_payload = rec(3, 1, 4).encode().unwrap()[12..].to_vec();
-        alien_payload[0] = BREC_VERSION + 1;
-        let alien = Frame::new(alien_payload).encode().unwrap();
+        // (a) a record whose payload carries BREC_VERSION-1, followed by a good one.
         let mut a = good.clone();
-        a.extend_from_slice(&alien);
+        a.extend_from_slice(&record_in_format(3, BREC_VERSION - 1));
         a.extend_from_slice(&rec(4, 1, 5).encode().unwrap());
         // (b) an offset gap (seq 5 where 3 is expected) followed by more bytes.
         let mut b = good.clone();
@@ -2979,16 +3119,34 @@ mod tests {
         let mut bad = rec(3, 1, 4).encode().unwrap();
         bad[20] ^= 0x55;
         c.extend_from_slice(&bad);
-        for (tag, bytes, want_offset) in [("alien", a, 3u64), ("gap", b, 3), ("badlast", c, 3)] {
+        // (d) a frame whose length field claims more bytes than the log holds, with a
+        // NEWER-format record intact after it.
+        let mut d = good.clone();
+        let mut rotted = rec(3, 1, 4).encode().unwrap();
+        rotted[4..8].copy_from_slice(&100_000u32.to_le_bytes());
+        d.extend_from_slice(&rotted);
+        d.extend_from_slice(&record_in_format(4, BREC_VERSION + 1));
+        // (e) a newer version byte on a payload that does not carry its own offset —
+        // the shape of a sealed record read without its key (a random first byte).
+        let mut e = good.clone();
+        let mut foreign = rec(3, 1, 4).encode().unwrap()[12..].to_vec();
+        foreign[0] = BREC_VERSION + 1;
+        foreign[1..9].copy_from_slice(&9u64.to_le_bytes());
+        e.extend_from_slice(&Frame::new(foreign).encode().unwrap());
+        let cases = [
+            ("older", a),
+            ("gap", b),
+            ("badlast", c),
+            ("rotted", d),
+            ("unplaced", e),
+        ];
+        for (tag, bytes) in cases {
             let (_tmp, path) = tmp(&format!("corrupt_{tag}"));
             let _ = std::fs::remove_file(&path);
             std::fs::write(&path, &bytes).unwrap();
             let err = BrokerLog::open(&path).err().expect("must refuse to open");
             assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{tag}");
-            assert!(
-                err.to_string().contains(&format!("offset {want_offset}")),
-                "{tag}: {err}"
-            );
+            assert!(err.to_string().contains("offset 3"), "{tag}: {err}");
             assert_eq!(
                 std::fs::metadata(&path).unwrap().len(),
                 bytes.len() as u64,
@@ -3002,6 +3160,46 @@ mod tests {
             );
             assert_eq!(dropped as usize, bytes.len() - 3 * one.len(), "{tag}");
             drop(log);
+        }
+    }
+
+    /// A record in a NEWER format than this build reads — mid-log or as the last frame
+    /// — was written by a newer astream, not damaged: every open refuses it as
+    /// `Unsupported`, naming its offset and without pointing at a repair, and
+    /// `open_repair` refuses it the same way rather than truncating it. The file is
+    /// never touched.
+    #[test]
+    fn a_newer_format_is_refused_by_name_and_never_repaired() {
+        let mut good = Vec::new();
+        for i in 0..3 {
+            good.extend_from_slice(&rec(i, 1, i + 1).encode().unwrap());
+        }
+        let mut mid = good.clone();
+        mid.extend_from_slice(&record_in_format(3, BREC_VERSION + 1));
+        mid.extend_from_slice(&rec(4, 1, 5).encode().unwrap());
+        let mut last = good.clone();
+        last.extend_from_slice(&record_in_format(3, u8::MAX));
+        for (tag, bytes) in [("mid", mid), ("last", last)] {
+            let (_tmp, path) = tmp(&format!("newer_{tag}"));
+            let _ = std::fs::remove_file(&path);
+            std::fs::write(&path, &bytes).unwrap();
+            for repair in [false, true] {
+                let err = if repair {
+                    BrokerLog::open_repair(&path, Durability::Strict).err()
+                } else {
+                    BrokerLog::open(&path).err()
+                }
+                .expect("a newer format must not open");
+                assert_eq!(err.kind(), io::ErrorKind::Unsupported, "{tag} {repair}");
+                let msg = err.to_string();
+                assert!(msg.contains("offset 3"), "{tag} {repair}: {msg}");
+                assert!(!msg.contains("asb repair"), "{tag} {repair}: {msg}");
+                assert_eq!(
+                    std::fs::read(&path).unwrap(),
+                    bytes,
+                    "{tag} {repair}: the file is untouched"
+                );
+            }
         }
     }
 

@@ -1,0 +1,19 @@
+{
+  "_comment": "aterm WASM-BENCH baseline (E0): the SHIPPED wasm modules (CPU aterm-wasm + GPU aterm-gpu-web) driven under node by crates/aterm-verify/perf/wasm/bench.mjs — ingest, scroll/typing present, search build/query, restore, GPU wasm-side frame build. All BIGGER-IS-BETTER. Re-record with targo --unverified verify perf --record wasm (needs node + a wasm32-capable stable toolchain). Recorded 2026-07-22 on the M5 Max, node v26.3.0 (conservative min-of-2 medians). scroll_present RATCHETED 2026-07-23 after the E7 whole-row scroll blit (368 -> 1.6k fps; conservative floor below the min-of-2 medians 1613/1702). Wave-6 present lanes (uniform_flood / scrolled_stream / styled_scrub) ADDED 2026-09-25 on the M5 Max under a loaded box (load ~30), node v26.0.0, min-of-2 medians; the other keys were left as recorded. process_str ingest keys (str_ascii / str_nonascii) ADDED 2026-10-16 for the wasm-platform WP.7 string boundary, on an Apple M4 Pro with no wasm-opt (binaryen absent): node v26.0.0, the min of 12 interleaved medians of the PRE-opt module, so lenient against a post-opt run on the reference box; the other keys were left as recorded.",
+  "wasm_cpu_ingest_mixed_mbps": 342.969,
+  "wasm_cpu_ingest_replog_mbps": 401.345,
+  "wasm_cpu_ingest_str_ascii_mbps": 204.000,
+  "wasm_cpu_ingest_str_nonascii_mbps": 158.800,
+  "wasm_cpu_scroll_present_fps": 1500.000,
+  "wasm_cpu_typing_present_fps": 562.145,
+  "wasm_cpu_search_build_klps": 180.766,
+  "wasm_cpu_search_query_qps": 1149.720,
+  "wasm_cpu_restore_hz": 1571.917,
+  "wasm_cpu_uniform_flood_present_fps": 44839.701,
+  "wasm_cpu_scrolled_stream_present_fps": 25407.447,
+  "wasm_cpu_styled_scrub_present_fps": 610.959,
+  "wasm_gpu_ingest_mixed_mbps": 352.792,
+  "wasm_gpu_frame_build_fps": 50948.924,
+  "wasm_gpu_scroll_frame_build_fps": 28035.581,
+  "pass_ratio": 0.450
+}

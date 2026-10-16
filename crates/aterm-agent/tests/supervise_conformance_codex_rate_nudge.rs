@@ -2,31 +2,28 @@
 // Copyright 2026 Andrew Yates
 
 //! Tier-1 for `SupervisorCodexRateNudge` (aterm-spec
-//! `supervisor_codex_rate_nudge_model`): the real approval decider
-//! (`decide_screen` on the rate-limit nudge and the `/model` picker), the real
-//! turn-end decider (`decide_turn_end` with its `TurnEndState`) and the real
-//! goal stop (`TurnEndState::goal_stop`) driven along every reachable state of
-//! the model. The answer to Codex's `Approaching rate limits` (switch only near
-//! the limit, stop the goal while switched, save the work once on the cheaper
-//! model, restore the thread's own model, hold until the window resets) is the
-//! model's, state for state.
+//! `supervisor_codex_rate_nudge_model`): the real approval decider (`decide_screen`
+//! on the rate-limit nudge and the `/model` picker), the real turn-end decider
+//! (`decide_turn_end` with its `TurnEndState`) and the real goal stop
+//! (`TurnEndState::goal_stop`) driven along every reachable state of the model. The
+//! answer to Codex's `Approaching rate limits` (switch only near the limit, stop the
+//! goal while switched, save the work once on the cheaper model, restore the
+//! thread's own model, hold until the window resets) is the model's, state for state.
 //!
-//! The projection: `model` is the footer's first field; `goal` and `paused`
-//! its right side; `near` Codex's usage reading; `sandbox` the fall read off
-//! the rollouts; `shown` the nudge box (a hand-built fixture); `turn` a busy
-//! reading; `person` a person's keystroke as the loop's real `RunningTurn`
-//! sees it (never the model's bit); `cov` a person's hand in the turn the box
-//! covered; `ph` and `stops` the real switch's phase and stops; `over` the
-//! save's own turn run past `WIND_DOWN_BOUND`. Every other turn runs [`TURN`].
+//! The projection: `model` is the footer's first field; `goal` and `paused` its right
+//! side; `near` Codex's usage reading; `sandbox` the fall read off the rollouts;
+//! `shown` the nudge box; `turn` a busy reading; `person` a person's keystroke as the
+//! loop's real `RunningTurn` sees it; `cov` a person's hand in the turn the box
+//! covered; `ph` and `stops` the real switch's phase and stops; `over` the save's own
+//! turn run past `WIND_DOWN_BOUND`. Every other turn runs [`TURN`].
 //!
-//! At every state the real deciders press, stop, type and tell exactly where
-//! the model's corresponding actions are enabled, and a host restart at every
-//! open phase (ledger rows read back with `open_wind_down`), mid-turn and
-//! between an Esc and its interrupted point decides the same. Negative
-//! controls: every `Buggy = 1` branch is enabled somewhere the real deciders
-//! answer otherwise; the grace-only and carried-span readings of a person
-//! ([`Hand`]) disagree with the model; and a restart that reads nothing back
-//! types `keep going` where the model allows none.
+//! At every state the real deciders press, stop, type and tell exactly where the
+//! model's actions are enabled, and a host restart (ledger rows read back with
+//! `open_wind_down`) at every open phase, mid-turn and between an Esc and its
+//! interrupted point decides the same. Negative controls: every `Buggy = 1` branch
+//! is enabled somewhere the real deciders answer otherwise; the grace-only and
+//! carried-span readings of a person ([`Hand`]) disagree with the model; and a
+//! restart that reads nothing back types `keep going` where the model allows none.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
@@ -159,6 +156,10 @@ fn reading(
         thread_model: None,
         upgrade_goal: false,
         account: None,
+        autopilot: aterm_agent::supervise::Autopilot::Cruise,
+        login_label: None,
+        login_superseded: false,
+        login_notice: None,
     }
 }
 
@@ -174,7 +175,7 @@ struct Real {
     /// The strict walk: a host restart is taken mid-turn at every turn end
     /// of an open switch ([`restart_mid_turn`]).
     strict: bool,
-    /// The turn running now as the LOOP keeps it (`Session::running`).
+    /// The turn running now as the loop keeps it (`Session::running`).
     hand: RunningTurn,
     /// The carried-span reading of the same turn, a negative control.
     round3: Round3,
@@ -300,11 +301,10 @@ enum Hand {
     Round3,
 }
 
-/// What the real goal stop says over the loop's busy reads of the turn
-/// running at `st` — its first, and one [`TURN`] into its span, past the
-/// grace — a person's hand read the `hand` way, the turn's busy work the
-/// loop's span of it: the first read that stops or tells decides (an Esc on
-/// the save's own turn is `StopWindDown`).
+/// What the real goal stop says over the loop's busy reads of the turn running at
+/// `st` (its first, and one [`TURN`] into its span, past the grace), a person's hand
+/// read the `hand` way: the first read that stops or tells decides (an Esc on the
+/// save's own turn is `StopWindDown`).
 fn stop_word(real: &Real, st: &State) -> &'static str {
     stop_word_as(real, st, Hand::Loop)
 }
@@ -385,9 +385,9 @@ fn decide_here(real: &Real, st: &State) -> (TurnEndAction, bool) {
     (a, told(&at.take_wind_events()))
 }
 
-/// The real `/model` restore: the picker's measured boxes, answered only
-/// while the restore is in flight — the thread's own model by Enter, `More
-/// reasoning…` by Enter, `Ultra` by `s` (this conversation).
+/// The real `/model` restore: the picker's measured boxes, answered only while the
+/// restore is in flight: the thread's own model by Enter, `More reasoning…` by
+/// Enter, `Ultra` by `s`.
 fn picks(real: &Real, st: &State) {
     let c = ctx(real, st);
     assert_eq!(
@@ -495,7 +495,7 @@ fn restarted_decides_the_same(real: &Real, st: &State, live: &TurnEndAction, tel
         word(live, st["paused"] == 1),
         "a restarted loop decides otherwise at {st:?}: {got:?} vs {live:?}"
     );
-    // The notes said ride the rows (`told=`): a restart raises none again.
+    // The notes already told ride the rows (`told=`): a restart raises none again.
     assert_eq!(
         fresh_tells, tells,
         "a restarted loop tells otherwise at {st:?}"
@@ -542,11 +542,10 @@ fn restart_mid_turn(real: &Real, before: &State, after: &State, r: &TurnEndReadi
     }
 }
 
-/// Mirror one model action on the real side (the model has fired it). The
-/// turn-end policy's actions are the real decider's own acts; one it does
-/// not take (a `Buggy` branch) is refused (`false`): the walk does not
-/// descend through it. Every turn that runs after it, the box not up, has
-/// had the loop's first busy read ([`RunningTurn::busy`]).
+/// Mirror one model action on the real side (the model has fired it). A turn-end act
+/// the real decider does not take (a `Buggy` branch) returns `false`: the walk does
+/// not descend. Every turn that runs after it, the box not up, has had the loop's
+/// first busy read ([`RunningTurn::busy`]).
 fn mirror(action: &str, before: &State, after: &State, real: &mut Real) -> bool {
     if !mirror_act(action, before, after, real) {
         return false;
@@ -837,7 +836,7 @@ fn walk(m: &Model, strict: bool) -> Found {
                 format!("the real nudge answer is {pressed}"),
                 &mut found,
             );
-            // Each buggy press refused where the real decider KEEPS.
+            // Each buggy press refused where the real decider keeps.
             for b in ["NudgeRewinds", "PressAtFar"] {
                 if m.action_enabled(b, &st) && pressed == "PressKeep" {
                     found.buggy_refused.insert(b);
@@ -1012,10 +1011,9 @@ fn tier1_the_real_deciders_switch_stop_save_restore_and_hold_exactly_where_the_m
         found.states, found.words
     );
 
-    // The anchors are linked, name the one projection, and were ENTERED by
-    // the walk; every other action of the machine — Codex's, the clock's, a
-    // person's, the `Buggy = 1` members — is waived by name, none of them
-    // bound.
+    // The anchors are linked, name the one projection, and were entered by the
+    // walk; every other action (Codex's, the clock's, a person's, the `Buggy = 1`
+    // members) is waived by name.
     let mut anchored: Vec<(&str, &str)> = xref::refinements()
         .filter(|a| a.machine == "SupervisorCodexRateNudge")
         .map(|a| {
@@ -1051,10 +1049,9 @@ fn tier1_the_real_deciders_switch_stop_save_restore_and_hold_exactly_where_the_m
     }
 }
 
-/// Negative controls: every `Buggy = 1` branch is enabled at some reachable
-/// state where the real deciders answer otherwise, so a green walk is not
-/// vacuous. A restart that reads nothing back types `keep going` into the owed
-/// wind-down, where the model allows no continuation.
+/// Negative controls: every `Buggy = 1` branch is enabled at some reachable state
+/// where the real deciders answer otherwise; a restart that reads nothing back types
+/// `keep going` into the owed wind-down, where the model allows no continuation.
 #[test]
 fn the_buggy_branches_and_a_forgetful_restart_are_not_the_real_deciders() {
     let m = supervisor_codex_rate_nudge_model();
@@ -1067,8 +1064,7 @@ fn the_buggy_branches_and_a_forgetful_restart_are_not_the_real_deciders() {
             found.buggy_refused
         );
     }
-    // The grace-only and carried-span readings of a person are caught by the
-    // walk.
+    // The grace-only and carried-span readings of a person are caught by the walk.
     let strict = walk(&m, false);
     assert!(
         strict.grace_only_stops > 0,

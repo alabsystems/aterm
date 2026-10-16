@@ -1,13 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-//! Alt-screen (mode 1049) round-trip correctness fuzz.
-//!
-//! `ESC[?1049h` saves the cursor and switches to a cleared alternate buffer;
-//! `ESC[?1049l` switches back and restores the cursor. This paints a distinctive
-//! main screen, enters the alt buffer, writes arbitrary content, exits, and
-//! asserts the main screen and cursor are restored byte for byte.
-//! Deterministic.
+//! Alt-screen (mode 1049) round-trip fuzz: paint a distinctive main screen, enter the alt
+//! buffer, write arbitrary content, leave, and require the main screen and cursor restored
+//! exactly. Deterministic.
 
 use aterm_core::terminal::Terminal;
 
@@ -34,8 +30,8 @@ fn read_screen(term: &Terminal) -> Vec<String> {
     out
 }
 
-/// Scribble arbitrary content (this runs inside the alt buffer — it must not be
-/// able to reach back and mutate the saved main screen).
+/// Scribble arbitrary content inside the alt buffer; none of it may reach the saved main
+/// screen.
 fn scribble(s: &mut u64, term: &mut Terminal) {
     const SAMPLES: &[&[u8]] = &[
         b"alt scratch content ",
@@ -60,7 +56,7 @@ fn alt_screen_1049_roundtrip_preserves_main_and_cursor() {
     let mut s: u64 = 0xA17E_5C2E_BEEF_0042;
     let mut term = Terminal::new(24, 80);
     for it in 0..2000u32 {
-        // Ensure we are on the main screen, then paint a distinctive picture.
+        // On the main screen, paint a distinctive picture.
         term.process(b"\x1b[?1049l\x1b[2J\x1b[H");
         let lines = 1 + next(&mut s) % 12;
         for line in 0..lines {
@@ -70,17 +66,15 @@ fn alt_screen_1049_roundtrip_preserves_main_and_cursor() {
             }
             term.process(b"more text\r\n");
         }
-        // Move the cursor somewhere non-trivial, then snapshot main + cursor.
+        // A non-trivial cursor, then snapshot main + cursor.
         term.process(b"\x1b[7;13H");
         let main_before = read_screen(&term);
         let cur_before = term.cursor();
 
-        // Enter the alt buffer, scribble, leave.
         term.process(b"\x1b[?1049h");
         scribble(&mut s, &mut term);
         term.process(b"\x1b[?1049l");
 
-        // The main screen and cursor must be byte-identical to the snapshot.
         assert_eq!(
             read_screen(&term),
             main_before,

@@ -2,12 +2,12 @@
 // Copyright 2026 Andrew Yates
 //
 // Cursor-shape regression for the CPU renderer: DECSCUSR bytes (CSI Ps SP q)
-// fed through a real Terminal drive the rendered cursor SHAPE end-to-end
+// fed through a real Terminal drive the rendered cursor shape end to end
 // (bytes -> engine -> pixels). CPU fills are exact, so each shape is asserted
 // as an exact pixel pattern against `Theme::cursor`:
 //   - block: the whole cursor cell, glyph "cut out" in the cell bg;
-//   - underline: ONLY the bottom strip (max(2, cell_h/8) px), glyph normal;
-//   - bar: ONLY the left strip (max(2, cell_w/8) px), glyph normal;
+//   - underline: only the bottom strip (max(2, cell_h/8) px), glyph normal;
+//   - bar: only the left strip (max(2, cell_w/8) px), glyph normal;
 //   - hollow block (frontend override): outline yes, center no;
 //   - blink phase off (Blinking* styles only) and DECTCEM-hidden: no cursor.
 
@@ -304,7 +304,7 @@ fn blink_phase_off_suppresses_blinking_styles_only() {
         "blink phase on -> full block again"
     );
 
-    // A STEADY style ignores the phase entirely.
+    // A steady style ignores the phase entirely.
     let mut steady = term_with(b"\x1b[2 q");
     r.set_cursor_blink_phase(false);
     let f = r.render_input(&steady.cell_frame(2, 4));
@@ -355,7 +355,7 @@ fn underline_and_bar_keep_glyph_in_normal_colors() {
     let (cw, ch) = r.cell_size();
     let strip = (ch / 8).max(2);
     // Put the cursor back ON the 'a' it just typed, with an underline cursor:
-    // the glyph must be drawn normally (light fg pixels ABOVE the strip), not
+    // the glyph must be drawn normally (light fg pixels above the strip), not
     // cut out as the block style does.
     let mut term = term_with(b"a\x1b[1;1H\x1b[4 q");
     let f = r.render_input(&term.cell_frame(2, 4));
@@ -401,8 +401,8 @@ fn bolt_cursor_paints_the_lightning_silhouette() {
         assert_eq!((ry, h), (y, 1), "bolt: strip {y} must be its own row");
         assert!(w >= 1 && x + w <= cw, "bolt: strip {y} escapes the cell");
     }
-    // The lightning tells: the left edge drifts LEFT down each limb, takes one
-    // hard RIGHTWARD jump at the waist (the notch), and the tail tapers to a
+    // The lightning tells: the left edge drifts left down each limb, takes one
+    // hard rightward jump at the waist (the notch), and the tail tapers to a
     // tip far narrower than the top stroke, ending left of where it started.
     let jumps: Vec<usize> = rects
         .windows(2)
@@ -446,7 +446,7 @@ fn bolt_cursor_honours_the_fill_override_and_keeps_the_glyph() {
     let (cw, ch) = r.cell_size();
     const LASER: u32 = 0x00FF_E01A;
     r.set_cursor_style_override(Some(CursorStyle::Bolt));
-    // Cursor back on the 'a' it typed: the bolt paints OVER the glyph (no block
+    // Cursor back on the 'a' it typed: the bolt paints over the glyph (no block
     // cut-out), recoloured to the host's laser hue via the fill override.
     let mut term = term_with(b"a\x1b[1;1H");
     let mut input = term.cell_frame(2, 4);

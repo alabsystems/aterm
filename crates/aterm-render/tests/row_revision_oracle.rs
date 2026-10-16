@@ -1,32 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! D-2 DIFFERENTIAL ORACLE for the per-row revision lane.
+//! Differential oracle for the per-row revision lane.
 //!
-//! `compute_dirty_rows` is documented as THE single source of truth for the
-//! dirty row set — the CPU damage path and the GPU scissored repaint both read
-//! it, precisely so the two cannot diverge. D-2 gives it a second way to answer
-//! the CELL half of the per-row question (compare the engine's per-row revision
-//! instead of every cell of every row). This file pins the two answers together.
+//! `compute_dirty_rows` is the single source of truth for the dirty row set
+//! (the CPU damage path and the GPU scissored repaint both read it). The
+//! revision lane answers its cell half by comparing the engine's per-row
+//! revision instead of every cell; this file pins that answer to the
+//! brute-force one. A missed stamp is a stale frame, so every row the
+//! reference calls dirty must be dirty under the lane (over-reporting only
+//! costs a repaint), and the `DirtyDecision` shapes must agree.
 //!
-//! THE BAR: a missed damage stamp is a STALE FRAME on the user's screen — far
-//! worse than the work saved. So the assertion is directional and absolute:
-//!
-//!   * every row the BRUTE-FORCE reference calls dirty must be dirty under the
-//!     stamp lane (a superset — over-reporting only costs a repaint), and
-//!   * the two `DirtyDecision` shapes must agree (`FullRepaint` is decided
-//!     before either arm runs, so a divergence there would be a real bug).
-//!
-//! THE REFERENCE IS NOT A DEBUG FLAG: `RenderInput::invalidate_row_revisions`
-//! disowns the lane on a clone, which drives `compute_dirty_rows` down the exact
-//! whole-grid compare it used before D-2. The reference is therefore the shipping
-//! code path every refused frame still takes, so this oracle keeps checking the
-//! stamp path forever rather than once.
-//!
-//! NON-VACUITY: a corpus that never arms a mutator proves nothing about it, and
-//! a corpus that never REACHES the stamp lane proves nothing at all. Both are
-//! asserted at the end — per-mutator arming counts, and a floor on how many
-//! steps actually took the stamp lane.
+//! The reference is a shipping path, not a debug flag:
+//! `RenderInput::invalidate_row_revisions` disowns the lane on a clone, which
+//! sends `compute_dirty_rows` down the whole-grid compare every refused frame
+//! takes. Non-vacuity is asserted at the end: per-mutator arming counts, and
+//! that the steady-state steps reached the lane.
 
 use aterm_core::render::RenderInput;
 use aterm_core::terminal::Terminal;
@@ -42,9 +31,9 @@ struct Step {
     name: &'static str,
     /// Engine-side mutation, applied under the "lock" before the extract.
     engine: fn(&mut Terminal),
-    /// Host-side mutation of the freshly filled snapshot, applied AFTER the
-    /// extract — the producers that write the same scratch the engine just
-    /// filled. Must follow the shipping discipline: bump `snapshot_seq`.
+    /// Host-side mutation of the freshly filled snapshot, applied after the
+    /// extract; like the shipping producers, it bumps `snapshot_seq` on a cell
+    /// write.
     host: fn(&mut RenderInput),
 }
 
@@ -67,9 +56,8 @@ fn host_prediction_ghost(input: &mut RenderInput) {
     input.snapshot_seq = input.snapshot_seq.wrapping_add(1);
 }
 
-/// The sparkle/deco shape: a per-cell animated-ink foreground override plus a
-/// decoration sprite. Neither is a CELL write, so neither bumps the seq — this
-/// step exists to prove the lane stays correct when only non-cell channels move.
+/// The sparkle/deco shape: a non-cell channel (the word decorations) moves and
+/// the seq does not; the lane stays correct when only non-cell channels move.
 fn host_sparkle(input: &mut RenderInput) {
     input.word_decorations.clear();
 }
@@ -85,19 +73,12 @@ fn host_preedit(input: &mut RenderInput) {
     input.snapshot_seq = input.snapshot_seq.wrapping_add(1);
 }
 
-/// The TAB-STRIP SPLICE shape: shift every per-row channel down by one and
-/// prepend a host-painted row, exactly as
-/// `aterm_gui::app_render::prepend_strip_rows` does — including the D-2 SPLICE
-/// bookkeeping, which is the part that makes this a shift rather than a
-/// disowning. `note_host_row_prepend` gives the chrome row the `0`/UNKNOWN
-/// sentinel and moves every engine stamp to its new index, so the frame after a
-/// strip appears is judged on stamps that still describe their own rows.
-///
-/// The FULL strip lifecycle (a persistent strip across frames, a strip whose row
-/// COUNT changes, the un-splice that hands the scratch back to the engine) is
-/// oracled against the real splice in `aterm_gui::app_render::strip_lane_oracle`,
-/// which is where that code lives; this step exists so THIS corpus keeps meeting
-/// a spliced frame from every prior state it can reach.
+/// The tab-strip splice shape: shift every per-row channel down by one and
+/// prepend a host-painted row as `aterm_gui::app_render::prepend_strip_rows`
+/// does, including `note_host_row_prepend`, which gives the chrome row the `0`
+/// sentinel and moves every engine stamp to its new index. The full strip
+/// lifecycle is oracled in `aterm_gui::app_render::strip_lane_oracle`; this
+/// step makes this corpus meet a spliced frame from every prior state.
 fn host_strip_splice(input: &mut RenderInput) {
     let blank = input.cells.first().and_then(|r| r.first()).copied();
     let Some(blank) = blank else { return };
@@ -310,7 +291,7 @@ fn corpus() -> Vec<Step> {
     ]
 }
 
-/// The BRUTE-FORCE reference verdict: the same call on lane-disowned clones, so
+/// The brute-force verdict: the same call on lane-disowned clones, so
 /// `compute_dirty_rows` takes its exact whole-grid compare.
 fn reference(prev: &RenderInput, cur: &RenderInput, dirty: &mut Vec<bool>) -> DirtyDecision {
     let mut p = prev.clone();
@@ -325,9 +306,8 @@ fn stamped_dirty_rows_match_the_brute_force_oracle_over_a_mutation_corpus() {
     let mut term = Terminal::new(ROWS as u16, COLS as u16);
     term.process(b"seed line one\r\nseed line two\r\nseed line three\r\n");
 
-    // The presented-frame shape: a resident scratch the engine refills, and a
-    // resident copy of the last presented frame (the GPU's `prev_input` / the
-    // CPU cache's `input`).
+    // A resident scratch the engine refills, and a resident copy of the last
+    // presented frame (the GPU's `prev_input` / the CPU cache's `input`).
     let mut scratch = RenderInput::empty();
     term.cell_frame_into(&mut scratch, ROWS, COLS);
     term.take_damage();
@@ -341,8 +321,8 @@ fn stamped_dirty_rows_match_the_brute_force_oracle_over_a_mutation_corpus() {
     let mut lane_by_step: BTreeMap<&'static str, usize> = BTreeMap::new();
 
     let steps = corpus();
-    // Two passes: the second one re-enters every mutator from a DIFFERENT prior
-    // state, which is where an order-dependent stamp bug shows up.
+    // Two passes: the second re-enters every mutator from a different prior
+    // state, where an order-dependent stamp bug shows.
     for pass in 0..2 {
         for step in &steps {
             (step.engine)(&mut term);
@@ -392,9 +372,8 @@ fn stamped_dirty_rows_match_the_brute_force_oracle_over_a_mutation_corpus() {
                     if stamped_dirty.iter().any(|d| *d) {
                         stamp_lane_nonempty += 1;
                     }
-                    // Exactness, not merely safety: the lane must not silently
-                    // degrade into "everything is dirty" — that would pass the
-                    // superset check while forfeiting the whole point.
+                    // Exactness too: a lane that degraded into "everything is
+                    // dirty" would pass the superset check.
                     let extra = stamped_dirty
                         .iter()
                         .zip(&reference_dirty)
@@ -413,7 +392,7 @@ fn stamped_dirty_rows_match_the_brute_force_oracle_over_a_mutation_corpus() {
         }
     }
 
-    // NON-VACUITY 1: every mutator in the corpus actually ran.
+    // Non-vacuity 1: every mutator in the corpus ran.
     for step in &steps {
         assert!(
             armed.get(step.name).copied().unwrap_or(0) >= 2,
@@ -421,11 +400,8 @@ fn stamped_dirty_rows_match_the_brute_force_oracle_over_a_mutation_corpus() {
             step.name
         );
     }
-    // NON-VACUITY 2: the STEADY-STATE class — the frames D-2 exists to make
-    // cheap — genuinely reached the stamp lane. A raw total would not do: it can
-    // be met entirely by frames that happen to fall back, which is exactly how a
-    // fixture silently stops testing what it claims to. Every name below is a
-    // frame the shipping app produces constantly.
+    // Non-vacuity 2: each steady-state frame, the class the lane exists to make
+    // cheap, reached the stamp lane (a raw total could be met by fallbacks).
     for name in [
         "idle",
         "type_one_char",
@@ -452,18 +428,16 @@ fn stamped_dirty_rows_match_the_brute_force_oracle_over_a_mutation_corpus() {
     );
 }
 
-/// The precise hazard the mark-clock exists for: a SECOND write to an
-/// already-damaged row, straddling an extract, with the damage taken in between.
-/// The damage BITSET is identical before and after that second write, so a
-/// revision fold keyed on the bits alone would hand both snapshots the same
-/// stamp and the frame would go stale.
+/// The mark-clock's hazard: a second write to an already-damaged row, straddling
+/// an extract, leaves the damage bitset unchanged, so a fold keyed on the bits
+/// alone would give both snapshots the same stamp.
 #[test]
 fn a_second_write_to_an_already_damaged_row_changes_its_revision() {
     let mut term = Terminal::new(ROWS as u16, COLS as u16);
     term.process(b"\x1b[1;1Hbaseline");
     term.take_damage();
 
-    // Damage row 0, extract WITHOUT consuming (the standalone-renderer shape).
+    // Damage row 0 and extract without consuming (the standalone-renderer shape).
     term.process(b"\x1b[1;1HAAA");
     let first = term.cell_frame(ROWS, COLS);
     // Same row, different content, same bitset.
@@ -491,24 +465,21 @@ fn a_second_write_to_an_already_damaged_row_changes_its_revision() {
     assert!(dirty[0], "row 0 must be dirty");
 }
 
-/// A FOREIGN consumer taking the damage between two extracts must not erase a
-/// row change from the lane: `take_damage` clears the bits for everyone, so the
-/// fold has to happen on the way out.
+/// A foreign consumer taking the damage between two extracts cannot erase a row
+/// change from the lane: `take_damage` clears the bits for everyone, so the fold
+/// happens on the way out.
 #[test]
 fn a_foreign_take_damage_between_extracts_cannot_lose_a_row() {
     let mut term = Terminal::new(ROWS as u16, COLS as u16);
-    // Burn the fresh terminal's FULL damage session first: a full-damage extract
-    // deliberately publishes no lane, so a fixture that started there would test
-    // the fallback, not the lane.
+    // Burn the fresh terminal's full-damage session first: a full-damage
+    // extract publishes no lane.
     term.process(b"warm");
     term.take_damage();
     term.process(b"\x1b[1;1Hbaseline\r\nsecond row");
 
-    // Extract while the damage is still PENDING, so the extract's own fold
-    // stamps every row. Without this the rows would still carry the `0`
-    // no-stamp sentinel, the consumer would fall back to the exact compare, and
-    // this test would pass for the wrong reason — it would prove nothing about
-    // the fold on the way out.
+    // Extract while the damage is pending, so the extract's own fold stamps
+    // every row; rows still on the `0` sentinel would take the exact compare
+    // and prove nothing about the fold.
     let mut scratch = RenderInput::empty();
     term.cell_frame_into(&mut scratch, ROWS, COLS);
     term.take_damage();
@@ -545,9 +516,9 @@ fn a_foreign_take_damage_between_extracts_cannot_lose_a_row() {
     );
 }
 
-/// An idle frame must stay an EXACT gate hit: nothing changed, so the lane must
-/// report zero dirty rows. If the fold double-stamped (once at the extract, once
-/// at `take_damage`) every previously-typed row would re-report forever.
+/// An idle frame after a typed row reports no dirty rows; a fold that
+/// double-stamped (at the extract and at `take_damage`) would re-report every
+/// typed row forever.
 #[test]
 fn an_idle_frame_after_a_typed_row_reports_no_dirty_rows() {
     let mut term = Terminal::new(ROWS as u16, COLS as u16);
@@ -585,9 +556,8 @@ fn an_idle_frame_after_a_typed_row_reports_no_dirty_rows() {
     );
 }
 
-/// Two DIFFERENT terminals mint revisions from independent clocks, so their
-/// stamps are numerically unrelated. A scratch that changed hands must never
-/// have one terminal's revision read as the other's.
+/// Two terminals mint revisions from independent clocks, so one's stamps are
+/// never read as the other's.
 #[test]
 fn two_terminals_never_share_a_revision_lane() {
     let mut a = Terminal::new(ROWS as u16, COLS as u16);

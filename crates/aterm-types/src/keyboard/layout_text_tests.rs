@@ -2,14 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! The layout's own character on a text press (`encode_key_with_text`), Caps
-//! Lock's capital when no layout says, and Ctrl on a non-Latin layout.
-//!
-//! The window hands the encoder the layout's UNSHIFTED key (winit's
-//! `key_without_modifiers`) plus the modifiers, and the engine re-derived the
-//! typed glyph from the US table: German Shift+2 wrote `@` (the layout types
-//! `"`), AZERTY's number row could not type a digit, Russian Shift+ф wrote
-//! `ф`, Caps Lock + a wrote `a`, and Russian Ctrl+С wrote `с` instead of ^C.
+//! The layout's own character on a text press (`encode_key_with_text`), Caps Lock's capital
+//! when no layout says, and Ctrl on a non-Latin layout. Without layout text the engine derives
+//! the glyph from the US table, which is wrong elsewhere (German Shift+2 types `"`).
 
 use super::{
     Key, KeyEventType, KeyboardMode, Modifiers, NamedKey, encode_key, encode_key_with_layout,
@@ -56,8 +51,8 @@ fn kitty(flags: u8) -> KeyboardMode {
 
 #[test]
 fn caps_lock_types_the_capital_when_no_layout_says() {
-    // A controller key (no layout text): Caps Lock capitalizes the letter, as
-    // xterm's XLookupString and the OS do. It used to type 'a'.
+    // A controller key (no layout text): Caps Lock capitalizes the letter, as xterm's
+    // XLookupString and the OS do.
     let a = Key::Character('a');
     for mode in [KeyboardMode::empty(), kitty(1), kitty(5)] {
         assert_eq!(encode_key(&a, CAPS, mode), b"A", "caps+a under {mode:?}");
@@ -67,8 +62,7 @@ fn caps_lock_types_the_capital_when_no_layout_says() {
         encode_key(&Key::Character('ф'), CAPS, KeyboardMode::empty()),
         "Ф".as_bytes()
     );
-    // A chord keeps its own encoding, and report-all keeps its key code with
-    // the capital as the text (unchanged).
+    // A chord keeps its own encoding; report-all keeps the key code, the capital as text.
     assert_eq!(encode_key(&a, CAPS | CTRL, KeyboardMode::empty()), [0x01]);
     assert_eq!(encode_key(&a, CAPS | ALT, KeyboardMode::empty()), b"\x1ba");
     assert_eq!(encode_key(&a, CAPS, kitty(24)), b"\x1b[97;65;65u");
@@ -164,10 +158,9 @@ fn kitty_reports_the_layouts_character_beside_the_unshifted_key_code() {
     assert_eq!(press('ф', SHIFT, kitty(24), 'a', 'Ф'), b"\x1b[1092;2;1060u");
     // Caps Lock alone composes text but is not Shift: no shifted key.
     assert_eq!(press('a', CAPS, kitty(29), 'a', 'A'), b"\x1b[97;65;65u");
-    // Caps Lock + Shift on Linux, where the window is never told of the lock:
-    // xkb's Lock cancels Shift on a letter, so the TEXT is 'a', but the shifted
-    // key is the Shift LEVEL, which no lock touches — 'A' (65), as kitty
-    // reports it. Dropping it (the layout's 'a' equals the key) lost it.
+    // Caps Lock + Shift on Linux, where the window is never told of the lock: xkb's Lock
+    // cancels Shift on a letter, so the text is 'a', but the shifted key is the Shift level,
+    // which no lock touches: 'A' (65), as kitty reports it.
     assert_eq!(press('a', SHIFT, KeyboardMode::empty(), 'a', 'a'), b"a");
     assert_eq!(press('a', SHIFT, kitty(13), 'a', 'a'), b"\x1b[97:65;2u");
     assert_eq!(press('a', SHIFT, kitty(29), 'a', 'a'), b"\x1b[97:65;2;97u");
@@ -175,9 +168,8 @@ fn kitty_reports_the_layouts_character_beside_the_unshifted_key_code() {
         press('ф', SHIFT, kitty(13), 'a', 'ф'),
         b"\x1b[1092:1060:97;2u"
     );
-    // A layout whose Shift level IS another lowercase letter keeps it: Swiss
-    // German Shift+ö is é (233), French Linux Shift+* is µ (181). Read as Caps
-    // Lock's doing they came out as É and Greek Μ.
+    // A layout whose Shift level is another lowercase letter keeps it: Swiss German Shift+ö is
+    // é (233), French Linux Shift+* is µ (181).
     assert_eq!(
         press('ö', SHIFT, kitty(12), ';', 'é'),
         b"\x1b[246:233:59;2u"
@@ -239,8 +231,8 @@ fn the_layouts_character_never_replaces_a_chord() {
 
 #[test]
 fn ctrl_on_a_non_latin_layout_sends_the_us_letters_control_byte() {
-    // Russian Ctrl+С (the C key) and Ctrl+В (the D key): ETX and EOT, as
-    // Terminal.app and iTerm2 send them. They wrote 'с' and 'в'.
+    // Russian Ctrl+С (the C key) and Ctrl+В (the D key): ETX and EOT, as Terminal.app and
+    // iTerm2 send them.
     let ctrl = |c: char, mods, mode, base| {
         encode_key_with_layout(&Key::Character(c), mods, mode, KeyEventType::Press, base)
     };
@@ -271,8 +263,7 @@ fn ctrl_on_a_non_latin_layout_sends_the_us_letters_control_byte() {
         ),
         b"\x1b[27;5;99~"
     );
-    // Kitty reports the layout's key, with the US key in the base-layout
-    // field for the application to resolve (unchanged).
+    // Kitty reports the layout's key, with the US key in the base-layout field.
     assert_eq!(ctrl('с', CTRL, kitty(1), Some('c')), b"\x1b[1089;5u");
     assert_eq!(ctrl('с', CTRL, kitty(5), Some('c')), b"\x1b[1089::99;5u");
     // Only a letter on a US letter key: AZERTY 'é' sits on the 2 key, and

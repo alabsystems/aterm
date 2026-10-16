@@ -25,9 +25,6 @@ aterm-spec = { workspace = true, optional = true }
 
 [dev-dependencies]
 aterm-spec = { workspace = true }
-# The one trustd probe and skip line, and the bounded child runner for the
-# tests' own codesign spawns (`aterm_uds::deadline`).
-aterm-uds = { workspace = true, features = ["test-support"] }
 # The tests' real PTYs (kernel_custody's pairs, the server tests' masters):
 # both ends close-on-exec from birth, and a `/dev/ptmx` open that lost the
 # kernel's race redriven. Tests only: the keeper itself links aterm-uds alone.

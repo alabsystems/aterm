@@ -42,7 +42,6 @@ use std::io;
 use std::os::fd::{AsRawFd as _, BorrowedFd, OwnedFd, RawFd};
 use std::os::unix::fs::FileTypeExt as _;
 use std::path::Path;
-use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -53,6 +52,29 @@ pub const FLAG: &str = "--lifeline-fd";
 
 /// The descriptor number [`Lifeline::arm`] hands the child: its stdin.
 pub const STDIN: RawFd = 0;
+
+/// A launcher that can place the lifeline's reader at stdin and name that slot in the child's
+/// argv: `spawnfd`'s `Command` and std's.
+pub trait LifelineCommand {
+    /// Place `far` at stdin and append the matching `--lifeline-fd 0` arguments.
+    fn set_lifeline(&mut self, far: File);
+}
+
+impl LifelineCommand for crate::spawnfd::Command {
+    fn set_lifeline(&mut self, far: File) {
+        self.arg(FLAG).arg(STDIN.to_string()).stdin(far);
+    }
+}
+
+#[expect(
+    clippy::disallowed_types,
+    reason = "compatibility for a throwaway launcher's std Command (tests and the verify CLI)"
+)]
+impl LifelineCommand for std::process::Command {
+    fn set_lifeline(&mut self, far: File) {
+        self.arg(FLAG).arg(STDIN.to_string()).stdin(far);
+    }
+}
 
 /// The launcher's end of a lifeline: the held write side of the FIFO whose read
 /// side the instance watches. Dropping it, or the launcher dying, cuts the
@@ -76,9 +98,9 @@ impl Lifeline {
     ///
     /// # Errors
     /// The FIFO could not be made or opened (see [`Lifeline::open`]).
-    pub fn arm(cmd: &mut Command, dir: &Path) -> io::Result<Self> {
+    pub fn arm(cmd: &mut impl LifelineCommand, dir: &Path) -> io::Result<Self> {
         let (lifeline, far) = Self::open(dir)?;
-        cmd.arg(FLAG).arg(STDIN.to_string()).stdin(far);
+        cmd.set_lifeline(far);
         Ok(lifeline)
     }
 
@@ -128,7 +150,11 @@ impl Lifeline {
 ///
 /// # Errors
 /// The FIFO could not be made or opened (see [`Lifeline::open`]).
-pub fn arm_for_process(cmd: &mut Command, dir: &Path) -> io::Result<()> {
+#[expect(
+    clippy::disallowed_types,
+    reason = "a throwaway launcher's std Command (tests and the verify CLI)"
+)]
+pub fn arm_for_process(cmd: &mut std::process::Command, dir: &Path) -> io::Result<()> {
     /// The held ends, kept for the life of the process: never dropped, so the
     /// kernel closes each when the process ends and at no other moment.
     static HELD: std::sync::Mutex<Vec<Lifeline>> = std::sync::Mutex::new(Vec::new());
@@ -153,18 +179,13 @@ fn make_fifo(path: &Path) -> io::Result<()> {
     }
 }
 
-/// Whether descriptor `number` could be taken over as a lifeline — every check
-/// [`adopt`] makes, and nothing it does: `number` and every other descriptor are
-/// left exactly as they were (the one private copy the checks read through is
-/// closed again before this returns).
+/// Whether descriptor `number` could be taken over as a lifeline: every check [`adopt`] makes
+/// and nothing it does (the private copy the checks read through is closed before this
+/// returns).
 ///
-/// For a launch that must refuse a bad lifeline BEFORE work that cannot wait for
-/// the adoption: an aterm window's boot apply runs first and may replace the
-/// image, which must then find the launcher's lifeline at the same number — so it
-/// is adopted after, and a usage error is caught here, before (round eight of the
-/// update audit, #28's review: `--lifeline-fd 0` typed at a prompt was refused
-/// only after the boot apply had swapped in a staged build and counted a trial
-/// launch of it, and three such mistakes walked a healthy build into its revert).
+/// For a launch that must refuse a bad lifeline before work that cannot wait for the adoption:
+/// an aterm window's boot apply may replace the image, which must then find the lifeline at
+/// the same number, so the window checks before the apply and adopts after it.
 ///
 /// # Errors
 /// Exactly [`adopt`]'s.
@@ -383,6 +404,7 @@ mod tests {
     use super::*;
     use std::io::Read as _;
     use std::os::fd::AsFd as _;
+    use std::process::Command;
 
     /// `fcntl(2)`'s status-flag setter (4 on every supported Unix) and
     /// `O_NONBLOCK`, which differs: 0x0004 on Darwin, 0x0800 on Linux.
@@ -536,8 +558,7 @@ mod tests {
             let _ = tx.send(wait_for_cut(OwnedFd::from(far)));
         });
         drop(lifeline);
-        // A hang detector; the answer arrives as soon as the watcher's read
-        // returns.
+        // A hang detector.
         let cut = rx
             .recv_timeout(Duration::from_secs(60))
             .expect("the watcher never saw the cut");
@@ -551,10 +572,10 @@ mod tests {
     #[test]
     fn an_armed_child_reads_end_of_file_when_the_launcher_lets_go() {
         let dir = scratch("child");
-        let mut cmd = Command::new("/bin/sh");
+        let mut cmd = crate::spawnfd::command("/bin/sh");
         // The appended flag lands in sh's `$@`, where nothing reads it.
         cmd.arg("-c").arg("cat >/dev/null; echo done").arg("sh");
-        cmd.stdout(std::process::Stdio::piped());
+        cmd.stdout(crate::spawnfd::Stdio::piped());
         let lifeline = Lifeline::arm(&mut cmd, &dir).expect("arm");
         let args: Vec<_> = cmd
             .get_args()
@@ -603,8 +624,7 @@ mod tests {
             }
         }
         let dir = scratch("killed");
-        // `spawnfd`'s: the launcher holds its stdio and nothing else of this
-        // process, not another test thread's pipe for as long as it lives.
+        // `spawnfd`'s, so the launcher holds no other test thread's pipe.
         let mut launcher =
             crate::spawnfd::command(std::env::current_exe().expect("the test binary"))
                 .arg("a_sigkilled_launcher_cuts_its_process_lifeline")
@@ -768,10 +788,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A pipe or FIFO end open for writing is refused and left open: adopting
-    /// the launcher's read-write end (e.g. `exec 9<>fifo` then
-    /// `--lifeline-fd 9`) would make the instance a writer of its own lifeline.
-    /// A pipe's bare write end is refused too, since a read on it fails at once.
+    /// A pipe or FIFO end open for writing (`exec 9<>fifo` then `--lifeline-fd 9`, or a bare
+    /// write end) is refused and left open.
     #[test]
     fn adopt_refuses_an_end_open_for_writing() {
         let dir = scratch("writable");
@@ -816,12 +834,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// [`check`] gives [`adopt`]'s verdicts and does nothing: a lifeline it passes
-    /// is still the same open FIFO end at the same number with the same flags —
-    /// still adoptable, and still cut by its launcher — and a refusal names what
-    /// the number is and leaves it open (round eight of the update audit, #28's
-    /// review: the window refuses a bad lifeline before its boot apply, and adopts
-    /// the good one after it).
+    /// [`check`] gives [`adopt`]'s verdicts and moves nothing: a lifeline it passes is the same
+    /// FIFO end at the same number with the same flags, still adoptable, and a refusal leaves
+    /// the number open.
     #[test]
     fn check_judges_like_adopt_and_moves_nothing() {
         let dir = scratch("check");
@@ -861,9 +876,8 @@ mod tests {
         assert!(err.to_string().contains("a regular file"), "{err}");
         assert_ne!(fd_flags(raw), -1, "a refused number is left open");
 
-        // A number no descriptor can have (`RawFd::MAX` is past every
-        // descriptor table). A number found free would not do: another test may
-        // open it before `adopt` takes and closes it.
+        // A number no descriptor can have: one merely found free could be opened by another
+        // test before `adopt` looks.
         let closed = RawFd::MAX;
         assert_eq!(fd_flags(closed), -1, "no descriptor is numbered {closed}");
         let err = adopt(closed).expect_err("a closed number is refused");

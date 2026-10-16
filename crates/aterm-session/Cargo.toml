@@ -17,13 +17,9 @@ default = []
 # `#[refines]`/`#[spec_unmodeled]` anchors binding the `SinkWriter` PTY-master
 # fd-lifecycle (sink.rs) to the derived `fd_lifecycle_model()` (machine
 # `FdLifecycle`). OFF by default (byte-identical production sink, no
-# `aterm-spec`/`inventory`); the workspace `spec_xref_closure` gate (aterm-gui's
+# `aterm-spec`); the workspace `spec_xref_closure` gate (aterm-gui's
 # test build) enables it to COLLECT the anchors cross-crate, exactly like aterm-pty.
 spec-anchors = ["dep:aterm-spec"]
-# Test-only: expose the sink's read-only accounting (`reply_reserved`,
-# `is_severed`) to downstream crates' tests — aterm-gui's egress-contract
-# suite asserts on them. Resolver 2 keeps this out of every production build.
-testing = []
 
 [dependencies]
 aterm-pty = { workspace = true }
@@ -31,8 +27,7 @@ aterm-pty = { workspace = true }
 # getentropy(2) with a bounded read_exact fallback, BCryptGenRandom on Windows,
 # hex encoding checked exhaustively by
 # `rand::tests::hex_encode_is_exact_lowercase_and_injective`). Session ids and
-# launch nonces mint through it, which is the rule `tools/grep_guard.sh` B4
-# exists to hold — and it is why this crate needs no `rand_core`.
+# launch nonces mint through it — and it is why this crate needs no `rand_core`.
 # Dependency-free leaf, so it adds no third-party package.
 aterm-uds = { workspace = true }
 # Optional: only pulled in by the off-by-default `spec-anchors` feature, which arms

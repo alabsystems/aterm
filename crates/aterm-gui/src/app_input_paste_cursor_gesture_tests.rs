@@ -184,11 +184,9 @@ fn delivered_paste_then_hop(
     (spawns, licence, width)
 }
 
-/// The delivered paste: the writer thread's completed write publishes the
-/// insert's priced width, the prelude arms the engine with it, and an echo
-/// hop of that width is licensed as one insert sweep. The same hop without
-/// the receipt applied declines `no-fresh-hint`, and a hop wider than the
-/// insert declines too.
+/// A delivered paste's receipt carries its priced width, and an echo hop of that
+/// width is licensed as one insert sweep. Without the receipt applied the hop is
+/// program output; a hop wider than the insert declines too.
 #[cfg(unix)]
 #[test]
 fn a_delivered_paste_lights_its_span_as_one_sweep() {
@@ -237,19 +235,12 @@ fn a_multiline_or_tabbed_paste_is_an_insert_of_unknown_width() {
     assert_eq!(spawns, 0, "…and an echo past the cap is not");
 }
 
-/// A queued key's receipt re-stamps only the window that typed it. With
-/// two windows on one session, the dispatch banks the press credit and the
-/// v2 `Typed` on the dispatching window's engine alone, so the ticket's
-/// typed half names that window and is applied there only; window B, which
-/// banked nothing, stays unlicensed. The insert half stays session-wide (a
+/// A queued key's receipt re-stamps only the window that typed it: the dispatch
+/// banks the press credit on the dispatching window's engine alone, so the
+/// ticket's typed half names that window and is applied there only; window B,
+/// which banked nothing, stays unlicensed. The insert half is session-wide (a
 /// paste needs no per-window credit), so B still arms a delivered paste's
-/// licence.
-/// scope-waiver: "session-wide" names the insert half's fan-out (every
-/// window fronting the session reads its receipt), not a safety budget or
-/// a multiplying enforcer.
-///
-/// Also run under `comet`, reading A's classic-trail typed twin beside its
-/// glow; B's trail is read dark.
+/// licence. Also run under `comet`, reading A's classic-trail typed twin.
 #[cfg(unix)]
 #[test]
 fn a_queued_keys_receipt_stamps_only_the_window_that_typed_it() {
@@ -414,14 +405,11 @@ fn a_queued_keys_receipt_stamps_only_the_window_that_typed_it() {
     }
 }
 
-/// Drive the production delivery edge (the render prelude inside
-/// [`App::cursor_frame`]): a real paste through `App::input`, the FIFO
-/// writer landing it, and one prelude tick presenting the echo hop
-/// `(2, 2) → (2, 2 + hop)`. With `baselined`, a seed tick first reads the
-/// register (the window's `delivery_seen` baseline); without it the
-/// baseline is forgotten before the paste (a session switch, a first
-/// read). Returns `(spawns, the ring's last licence token,
-/// `delivery_seen`)`.
+/// A real paste through `App::input` and the FIFO writer, then one
+/// [`App::cursor_frame`] prelude tick presenting the echo hop
+/// `(2, 2) → (2, 2 + hop)`. Without `baselined` the window's `delivery_seen` is
+/// forgotten before the paste (a session switch, a first read). Returns
+/// `(spawns, the ring's last licence token, delivery_seen)`.
 #[cfg(unix)]
 fn prelude_paste_then_hop(
     text: &str,
@@ -494,16 +482,11 @@ fn prelude_paste_then_hop(
     out
 }
 
-/// The production delivery edge: the prelude's receipt application in
-/// `cursor_frame` (the `(session, serial)` baseline, the freshness skip,
-/// the Rainbow Kitty gate, the `latest` advance). The prelude reads a real
-/// paste's receipt on the frame observing the echo, the hop of exactly its
-/// width is laid `licence=insert`, and the serial is recorded as seen. A
-/// window with no baseline baselines at the newest serial and applies
-/// nothing (the same hop is program output), still recording the serial.
-///
-/// Fails under an inverted freshness gate, a baseline that applies on the
-/// first read, or a `latest` that does not advance.
+/// The prelude in `cursor_frame` applies a real paste's receipt on the frame
+/// observing the echo (the hop of exactly its width is `licence=insert`) and
+/// records the serial as seen. A window with no baseline baselines at the
+/// newest serial and applies nothing. Fails under an inverted freshness gate, a
+/// baseline that applies on the first read, or a `latest` that does not advance.
 #[cfg(unix)]
 #[test]
 fn the_render_prelude_applies_a_delivered_paste_and_baselines_a_fresh_window() {
@@ -526,11 +509,9 @@ fn the_render_prelude_applies_a_delivered_paste_and_baselines_a_fresh_window() {
     );
 }
 
-/// A paste followed by a loaded frame's worth of queued typing keeps the
-/// paste's oldest receipt (the glow engine holds up to 128 unpaid keys).
-/// Drives real App input, the ordered writer and the production render
-/// prelude; the first observed echo stays visible and the paste's insert
-/// receipt owns its own first echo.
+/// A paste followed by a frame's worth of queued keys (the glow engine holds up
+/// to 128 unpaid) keeps its oldest receipt through the real writer and render
+/// prelude, and the paste's insert receipt owns its own first visible echo.
 #[cfg(unix)]
 #[test]
 fn a_paste_before_33_to_128_queued_keys_keeps_its_first_visible_echo() {
@@ -730,10 +711,9 @@ fn a_delayed_paste_frame_leaves_later_queued_keys_for_their_own_echo() {
         "later queued keys have not echoed yet"
     );
 
-    // Tier 1: one model credit represents this 33-key batch. Project the
-    // shipping engine's first-frame decision onto the derived licence
-    // transition; the typed-class verdict (insert still armed, keys spent)
-    // is the refused negative control.
+    // One model credit stands for this 33-key batch: project the engine's
+    // first-frame decision onto the derived licence transition; the
+    // typed-class verdict (insert still armed, keys spent) is refused.
     let model = aterm_spec::derive::cursor_hint_license_model();
     let mut before = model.init_state();
     for action in [

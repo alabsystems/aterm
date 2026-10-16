@@ -6,9 +6,9 @@
 //! command blocks, and a command running across the update, which must still
 //! complete (`completed_command_seq` moves) when its `D` arrives.
 //!
-//! These drive the GUI's seamless path (`checkpoint_carry` on the outgoing
-//! engine, `restore_checkpoint` into a configured successor). Negative control:
-//! a successor that adopts only the cells loses all of it.
+//! These drive the GUI's seamless path (`checkpoint_carry` on the outgoing engine,
+//! `restore_checkpoint` into a configured successor). Negative control: a successor that
+//! adopts only the cells loses all of it.
 
 use aterm_core::config::TerminalConfig;
 use aterm_core::terminal::{Rgb, Terminal};
@@ -17,7 +17,8 @@ const ROWS: u16 = 12;
 const COLS: u16 = 60;
 const CARRY: usize = 256;
 
-/// A host theme that, like the GUI's, lets applications recolour the palette.
+/// A host theme from a host that opted in to palette reconfigure (the GUI's
+/// `allow_palette_reconfigure` defaults off), so applications may recolour it.
 fn theme(fg: Rgb) -> TerminalConfig {
     TerminalConfig {
         default_foreground: fg,
@@ -95,7 +96,7 @@ fn colours_the_application_set_survive_over_the_new_theme() {
         "an un-overridden palette entry is the successor's"
     );
 
-    // Negative control: the cells-only adopt the old carry performed.
+    // Negative control: a cells-only adopt.
     let mut cells_only = cp.clone();
     cells_only.color = Default::default();
     let mut old = successor();
@@ -147,16 +148,11 @@ fn a_command_running_across_the_handoff_completes_after_it() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// The shell carry meets the history carry.
-//
-// The seamless adopt restores the checkpoint (continuing the source's absolute
-// numbering, marks at the source's rows), reserves keys for the history sidecar
-// the import brings after Commit, then attaches it. The carried marks must keep
-// naming their lines, so a command running across the update completes with
-// exactly the source's output span. These drive restore + reserve + attach as
-// the GUI's adopt does.
-// ---------------------------------------------------------------------------
+// The shell carry meets the history carry. The seamless adopt restores the checkpoint
+// (continuing the source's absolute numbering, marks at the source's rows), reserves keys
+// for the history sidecar the import brings after Commit, then attaches it. The carried
+// marks must keep naming their lines, so a command running across the update completes
+// with exactly the source's output span.
 
 use aterm_core::grid::OlderHistory;
 use aterm_core::scrollback::Line;
@@ -231,9 +227,8 @@ fn carried_blocks_name_the_same_lines_after_the_history_import() {
         "a finished block reads its own output after the import"
     );
 
-    // The command running across the update ends after it (the next prompt
-    // closes its span): its output is exactly the source's, not the imported
-    // history above it.
+    // The command running across the update ends after it (the next prompt closes its
+    // span): its output is exactly the source's, not the imported history above it.
     for t in [&mut source, &mut next] {
         t.process(b"done\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ ");
     }

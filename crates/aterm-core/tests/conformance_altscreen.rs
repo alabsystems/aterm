@@ -4,7 +4,7 @@
 //! Tier-1 trace conformance: binds the real `Terminal` alt-screen (DEC mode
 //! 1049) round-trip to the `AltScreen.tla` design spec.
 //!
-//! aterm-spec-models' `model_check.rs` proves `MainRestoredAfterRoundTrip` on
+//! `spec-check specs` (aterm-spec) proves `MainRestoredAfterRoundTrip` on
 //! the spec (after 1049h…1049l the main cells and cursor are unchanged) and
 //! catches the botched restore at `Buggy=TRUE`. This test drives the real
 //! `Terminal` through `WriteMain → Enter → Scribble → Leave` via `process`,
@@ -25,21 +25,17 @@
 //! `term.is_alternate_screen()`; the ghost `mainSaved` is the main cells at the
 //! first `Enter`.
 //!
-//! Without `ty` on its canonical path the test fails; there is no skip.
+//! Only `ty` reads the hand-written spec, so the test is `#[ignore]`d and
+//! named `…_under_ty`: `-- --ignored _under_ty` runs it, and it fails
+//! without `ty`.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use aterm_core::terminal::Terminal;
-use aterm_spec::verify::ty_escalation;
 
 /// Spec `CONSTANT Cells` / `MaxVal` (from `AltScreen.cfg`).
 const CELLS: usize = 3;
 const MAXVAL: i64 = 2;
-
-// verification gate (honesty ratchet, batteries-on) in `aterm_spec::verify`:
-// verification is always required — an absent Trust `ty` fails the test with the
-// install hint (`aterm pkg install ty`).
 
 /// The abstract spec state — the projection target.
 #[derive(Clone, PartialEq, Debug)]
@@ -213,15 +209,9 @@ fn validate(
     )
     .expect("write cfg");
     std::fs::write(&trace_f, transition_trace(prev, next, action)).expect("write trace");
-    let mut cmd = Command::new(ty);
-    cmd.arg("trace")
-        .arg("validate")
-        .arg(&trace_f)
-        .arg("--spec")
-        .arg(&spec_f)
-        .arg("--config")
-        .arg(&cfg_f);
-    let out = aterm_spec::verify::ty_output(&mut cmd).expect("run ty trace validate");
+    let out = aterm_spec::verify::TyCommand::trace_validate(ty, &trace_f, &spec_f, &cfg_f)
+        .output()
+        .expect("run ty trace validate");
     let combined = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
@@ -231,12 +221,9 @@ fn validate(
 }
 
 #[test]
-fn real_altscreen_roundtrip_conforms_to_altscreen_spec() {
-    // tiered: a committed hand-written `.tla` — external-tool
-    // obligation; runs only where the Trust toolchain is installed.
-    let Some(ty) = ty_escalation("AltScreen conformance") else {
-        return;
-    };
+#[ignore = "needs Trust ty: `targo --unverified test -- --ignored _under_ty`"]
+fn real_altscreen_roundtrip_conforms_to_altscreen_spec_under_ty() {
+    let ty = aterm_spec::verify::required_ty();
     let committed =
         std::fs::read_to_string(spec_path("AltScreen.tla")).expect("read AltScreen.tla");
     let dir = std::env::temp_dir().join(format!("aterm-altscreen-conf-{}", std::process::id()));

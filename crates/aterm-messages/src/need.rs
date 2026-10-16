@@ -1,36 +1,28 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE RULE AT THE DOOR (owner rule, 2026-09-28): a message outlives a glance
-//! only if it says WHY a person is needed and WHAT the one action is.
+//! The rule at the door: a message outlives a glance only if it says why a person is
+//! needed and what the one action is. The rule is a type:
 //!
-//! *"Don't continue to persist alerts to the user that are not actionable as a
-//! general design rule."* The rule is a TYPE:
+//! * A message classed by the rule ([`crate::Message::now`]) gets its hold from its
+//!   [`Ask`]: a reason from a closed vocabulary with no word for "waiting" or "retrying"
+//!   ([`StandingWhy`]) and the one action that changes the outcome ([`Then`]), never a
+//!   snooze. A persistent hold ([`Hold::Standing`], [`Hold::Ask`]) carries a [`Persist`]
+//!   seal only an [`Ask`] (and the carry decoder) can mint. A row an older parent carried
+//!   across an update is adopted once, and the reporters re-assert it at Commit.
+//! * A person needed but not now ([`Need::Later`]) is an exception, kept in the digest
+//!   ([`crate::MessageCenter::digest`]), which can never ask for a band row.
+//! * Everything else is a record.
 //!
-//! * A message classed by the rule ([`Message::now`]) gets its hold from its
-//!   [`Ask`], which asks for a reason from a closed vocabulary that has no
-//!   word for "waiting" or "retrying" ([`StandingWhy`]) and for the one action
-//!   that changes the outcome ([`Then`]) — never a snooze. A persistent hold
-//!   ([`Hold::Standing`], [`Hold::Ask`]) is SEALED: it carries a [`Persist`]
-//!   token that only an [`Ask`] (and the carry decoder) can mint, so a
-//!   reporter cannot write one by hand. A row an older parent carried across
-//!   an update is adopted once, and the reporters re-assert it at Commit.
-//! * A person who is needed but not NOW ([`Need::Later`]) is an EXCEPTION: it
-//!   is kept in the digest ([`crate::MessageCenter::digest`]), which the band
-//!   cannot seat — it can never ask for a row.
-//! * Everything else is a RECORD.
+//! The types cannot prove the words true: a producer can still write [`Why::OnlyYou`] for
+//! a fact that heals itself. The small vocabulary, the roster tests that assert the class
+//! of every state a producer can reach, and [`LaterAsk::outlasted`] (`None` until a wait
+//! has outlasted a named [`Horizon`]) guard that.
 //!
-//! What the types cannot do is prove the words true: a producer can still
-//! write [`Why::OnlyYou`] for a fact that heals itself. What stops that is the
-//! size of the vocabulary (one screen), the roster tests that assert the class
-//! of every state a producer can reach, and [`LaterAsk::outlasted`], which
-//! returns `None` until a wait has outlasted a NAMED [`Horizon`].
+//! # The locks (each a `compile_fail` doctest with its rustc error code)
 //!
-//! # The locks (each is a `compile_fail` doctest with its rustc error code)
-//!
-//! A persistent hold cannot be written by hand — the bare spelling is a type
-//! error, a forged token has no constructor, and the decision row's seal is
-//! not optional:
+//! A persistent hold cannot be written by hand: the bare spelling is a type error, a
+//! forged token has no constructor, and the decision row's seal is not optional:
 //!
 //! ```compile_fail,E0308
 //! use aterm_messages::{Hold, Message, Severity, tags};
@@ -112,16 +104,13 @@ use crate::model::{Hold, Intent, UpgradeWord};
 use crate::text::clip;
 use crate::{Duration, HOLD_ASK, HOLD_GESTURE, HOLD_STAGED_MANUAL, HOLD_WARN, KEY_CAP};
 
-/// Chars of a [`Reason`]: one clause a person reads at a glance. 90, the cap the
-/// upgrade and resume streams already hold their words to, so an entry's
-/// one-line form (`what \u{2014} why \u{2192} then`, 48 + 90 + 90 + 6) fits a detail
-/// line (`DETAIL_LINE_CAP` = 240).
+/// Chars of a [`Reason`]: one clause read at a glance. At 90 an entry's one-line form
+/// (`what — why → then`, 48 + 90 + 90 + 6) fits a detail line ([`crate::DETAIL_LINE_CAP`]).
 pub const REASON_CAP: usize = 90;
 /// Chars of a [`Step`]: one imperative sentence (see [`REASON_CAP`]).
 pub const STEP_CAP: usize = 90;
-/// The longest a transient row may hold: two minutes (the crash-last-time
-/// row's hold, `HOLD_LAUNCH`). Past it a hold is a PERSISTENT one, and only a
-/// [`Need::Now`] may persist.
+/// The longest a transient row may hold: two minutes (the GUI's crash-last-time
+/// `HOLD_LAUNCH`). Past it a hold is persistent, and only a [`Need::Now`] may persist.
 pub const MAX_TRANSIENT: Duration = Duration::from_secs(120);
 /// An open exception files itself (`Retired::Unseen`) after this long: nothing
 /// waits forever, and nothing is lost — the log keeps its words.
@@ -129,44 +118,37 @@ pub const DIGEST_EXPIRY: Duration = Duration::from_hours(14 * 24);
 /// Open exceptions kept. The 13th files the oldest, lowest-severity one
 /// (`Retired::Evicted`), with its log line.
 pub const DIGEST_CAP: usize = 12;
-/// A family pass that no longer names an entry starts its clock; the entry
-/// ends (`Resolved`) once it has gone unnamed this long, at the next look OR at
-/// the digest's own settle (`MessageCenter::settle_digest`, armed by
-/// `MessageCenter::digest_deadline`), whichever comes first. A look that names
-/// it again clears the clock, so a fact that flickers neither ends nor
-/// re-posts and the digest never writes a `resolved` and a `posted` line for
-/// one continuing fact. The end is TIME-based because a reporter's looks are
-/// not: the upgrade's are sent only when its rows CHANGE (no timer of its own),
-/// so a row that left in one change would otherwise wait for a second look
-/// that never comes.
+/// How long an entry a family pass no longer names stays open before it ends
+/// (`Resolved`), at the next look or at the digest's own settle
+/// (`MessageCenter::settle_digest`, armed by `MessageCenter::digest_deadline`), whichever
+/// comes first. A look that names it again clears the clock, so a flickering fact neither
+/// ends nor re-posts. Time-based because a reporter's looks are not: the upgrade sends
+/// them only when its rows change.
 pub const RESOLVE_AFTER: Duration = Duration::from_mins(10);
-/// A filed exception (`Dismissed`, `Answered`, `Unseen`, `Evicted`) is kept in
-/// the log's ring this long after its FILING, whatever else is posted: twice
-/// the longest quiet span ([`Resurface::MAX`]), so a dismissal still holds
-/// and the back-off ([`Resurface::backed_off`]) can still count the filings
-/// that earned its span. The ring is counted in records, so without this 512
-/// unrelated records would forget a dismissal that still holds.
+/// How long a filed exception (`Dismissed`, `Answered`, `Unseen`, `Evicted`) stays in the
+/// log's ring after its filing, whatever else is posted: twice [`Resurface::MAX`], so a
+/// dismissal still holds and [`Resurface::backed_off`] can count the filings that earned
+/// its span. The ring is counted in records, so without this [`crate::LOG_CAP`] unrelated
+/// records would forget a dismissal that still holds.
 pub const FILED_KEEP: Duration = Duration::from_hours(180 * 24);
 /// [`FILED_KEEP`] in milliseconds.
 pub(crate) const FILED_KEEP_MS: u64 = 180 * 86_400_000;
 const _: () = assert!(FILED_KEEP.as_secs() * 1000 == FILED_KEEP_MS);
 const _: () = assert!(FILED_KEEP_MS >= 2 * Resurface::MAX.millis());
-/// Two restatements of one entry that change only its words are at least this
-/// far apart: holder counts and ages move every look, and a menu that rebuilds
-/// every minute for a number is noise. A change of severity or of a capsule
+/// The least gap between two restatements of one entry that change only its words
+/// (holder counts and ages move every look). A change of severity or of a capsule
 /// restates at once.
 pub const RESTATE_QUIET: Duration = Duration::from_mins(10);
-/// A standing row the owner has read (it folded) or answered is not raised
-/// again for this long, unless its key changes: the once-only rule the
-/// reporters each wrote for themselves, in one place.
+/// A standing row the owner has read (it folded) or answered is not raised again for this
+/// long, unless its key changes.
 pub const STANDING_QUIET: Duration = Duration::from_hours(24);
 
 // ---------------------------------------------------------------------------
 // Words
 // ---------------------------------------------------------------------------
 
-/// Stems a REASON may not lean on: it says why a person is needed, not that
-/// something is pending.
+/// Stems a reason may not lean on: it says why a person is needed, not that something
+/// is pending.
 const WAITING_STEMS: [&str; 10] = [
     "waiting",
     "retry",
@@ -179,13 +161,13 @@ const WAITING_STEMS: [&str; 10] = [
     "eventually",
     "automatically",
 ];
-/// Leading words of a STEP that are a snooze, not an action.
+/// Leading words of a step that are a snooze, not an action.
 const SNOOZE_LEADS: [&str; 8] = [
     "skip", "snooze", "dismiss", "ignore", "wait", "defer", "postpone", "not",
 ];
 
-/// One clause: WHY a person, and not the machine, is needed. Sanitized and
-/// capped at [`REASON_CAP`].
+/// One clause: why a person, and not the machine, is needed. Sanitized and capped at
+/// [`REASON_CAP`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Reason(String);
 
@@ -202,9 +184,8 @@ impl Reason {
         &self.0
     }
 
-    /// Why these words are not a reason a person is needed, or `None`: empty,
-    /// or leaning on "waiting" / "retrying" / "will heal" — a fact aterm, the
-    /// vendor or the clock will end is a record, not a reason to interrupt.
+    /// Why these words are not a reason a person is needed, or `None`: empty, or leaning
+    /// on "waiting" / "retrying" / "will heal".
     #[must_use]
     pub fn fault(&self) -> Option<&'static str> {
         let words = self.0.to_lowercase();
@@ -236,9 +217,8 @@ impl Step {
         &self.0
     }
 
-    /// Why these words are not ONE ACTION, or `None`: empty; a snooze in
-    /// words (`Skip this build`, `Dismiss it`, `Wait for it`); or two
-    /// actions in a sentence (`; ` or ` or `).
+    /// Why these words are not one action, or `None`: empty; a snooze in words (`Skip
+    /// this build`, `Wait for it`); or two actions in a sentence (`; ` or ` or `).
     #[must_use]
     pub fn fault(&self) -> Option<&'static str> {
         let words = self.0.to_lowercase();
@@ -255,9 +235,8 @@ impl Step {
     }
 }
 
-/// WHY A PERSON IS NEEDED. Closed: there is no word for "waiting", "retrying"
-/// or "healing" — a fact aterm, the vendor or the clock will end is a record,
-/// not a reason to interrupt.
+/// Why a person is needed. Closed: there is no word for "waiting", "retrying" or
+/// "healing"; a fact aterm, the vendor or the clock will end is a record.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Why {
     /// A step no software can take: a browser sign-in, a macOS switch, a
@@ -299,8 +278,8 @@ impl Why {
     }
 }
 
-/// The reasons that may OUTLAST a look — a subset of [`Why`]: a question or a
-/// failed gesture is transient by nature and cannot stand.
+/// The reasons that may outlast a look, a subset of [`Why`]: a question or a failed
+/// gesture is transient by nature.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StandingWhy {
     /// See [`Why::OnlyYou`].
@@ -335,9 +314,9 @@ impl From<StandingWhy> for Why {
 // The one action
 // ---------------------------------------------------------------------------
 
-/// A button that MOVES the outcome. Only whitelisted constructors exist: none
-/// for `Not today`, `Skip version`, `Not now`, `Details`, `Show tab` or
-/// `Open log` — a snooze, a decline or a navigation is not "the one action".
+/// A button that moves the outcome. Only whitelisted constructors exist: none for `Not
+/// today`, `Skip version`, `Not now`, `Details`, `Show tab` or `Open log`, since a snooze,
+/// a decline or a navigation is not the one action.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Mover(Intent);
 
@@ -393,8 +372,8 @@ impl Mover {
     }
 }
 
-/// THE ONE ACTION: a sentence that says it, and (when one press does it) the
-/// button. Built by [`Then::press`] or [`Then::step`] only.
+/// The one action: a sentence that says it, and (when one press does it) the button.
+/// Built by [`Then::press`] or [`Then::step`] only.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Then {
     step: Step,
@@ -444,7 +423,7 @@ impl Then {
 // Spans, fingerprints, horizons
 // ---------------------------------------------------------------------------
 
-/// How long a TRANSIENT ask stays: a named span, never a number.
+/// How long a transient ask stays: a named span, never a number.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Span {
     /// A failed gesture (12 s).
@@ -473,20 +452,16 @@ impl Span {
     }
 }
 
-/// The identity of a FACT (not of its moving parts): the key its entry is
-/// filed under, so a dismissal is remembered by the fact and a changed cause
-/// is news. Composed `family.subject.cause` and held to the key cap; a subject
-/// too long for the cap is shortened with a stable hash suffix.
+/// The identity of a fact (not of its moving parts): the key its entry is filed under,
+/// so a dismissal is remembered by the fact and a changed cause is news.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Fingerprint(String);
 
 impl Fingerprint {
-    /// `family.subject.cause`; `cause` is a short lowercase word
-    /// (`own-work`, `typed-draft`, `denied`). The whole is held to the key cap
-    /// ([`KEY_CAP`]): the family and the cause are kept, and a subject that
-    /// does not fit is shortened with a stable hash suffix (`s-3e79b5b~a1b2`)
-    /// — or, when even eight characters of it do not fit, replaced by the
-    /// hash alone.
+    /// `family.subject.cause`; `cause` is a short lowercase word (`own-work`,
+    /// `typed-draft`, `denied`). Held to [`KEY_CAP`]: the family and the cause are kept,
+    /// and a subject that does not fit is shortened to at most 12 chars and a stable hash
+    /// suffix (`s-3e79b5b~a1b2`), or to `~` and the hash alone when there is no room.
     #[must_use]
     pub fn new(family: &str, subject: &str, cause: &str) -> Self {
         let family = clip(family, 24);
@@ -530,8 +505,7 @@ impl Resurface {
     /// A fact about the owner's own choice (tmux, a wrapper, Full Disk
     /// Access declined): a month.
     pub const CHOICE: Self = Self(30);
-    /// The longest a fact stays put away, however often it is dismissed: three
-    /// months. A dismissal never hides a fact for good.
+    /// The longest a fact stays put away, however often it is dismissed: three months.
     pub const MAX: Self = Self(90);
 
     /// The quiet span in milliseconds, for a first dismissal.
@@ -540,12 +514,9 @@ impl Resurface {
         self.0 as u64 * 86_400_000
     }
 
-    /// The quiet span after the `n`th dismissal of the same fact inside
-    /// [`FILED_KEEP`] (`n` counts this one): the base, then four times it, then
-    /// at most [`Self::MAX`] — and it stays there while the owner keeps
-    /// putting the fact away. A fact the owner keeps putting away is one they
-    /// have decided to live with (tab 1 is an orchestrator whose work does
-    /// not end by itself); asking every week is a nag, not a reminder.
+    /// The quiet span after the `n`th dismissal of the same fact inside [`FILED_KEEP`]
+    /// (`n` counts this one): the base, then four times it, then at most [`Self::MAX`],
+    /// where it stays: a fact the owner keeps putting away is one they live with.
     #[must_use]
     pub const fn backed_off(self, n: u32) -> u64 {
         let mut ms = self.millis();
@@ -562,8 +533,8 @@ impl Resurface {
     }
 }
 
-/// A NAMED horizon: how long a self-healing fact may go on before it is worth
-/// a line in the digest. The field is private: a call site cannot invent one.
+/// A named horizon: how long a self-healing fact may go on before it is worth a line in
+/// the digest. The field is private: a call site cannot invent one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Horizon(Duration);
 
@@ -588,23 +559,20 @@ impl Horizon {
 // The asks
 // ---------------------------------------------------------------------------
 
-/// THE SEAL on a persistent hold: [`Hold::Standing`] and [`Hold::Ask`] carry
-/// one, and it has no public constructor and a private field, so only this
-/// crate mints it — from an [`Ask`] (the hold the ask earns) or from the carry
-/// decoder (a parent already admitted the row). A reporter that wants a row
-/// past a glance writes `.now(Ask::standing(..))`; there is no other way to
-/// spell it.
+/// The seal on a persistent hold ([`Hold::Standing`], [`Hold::Ask`]): no public
+/// constructor, so only this crate mints it, from an [`Ask`] or the carry decoder. A
+/// reporter that wants a row past a glance writes `.now(Ask::standing(..))`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Persist(());
 
 impl Persist {
-    /// The token. Crate only: the ask and the carry decoder are its issuers.
+    /// The token.
     pub(crate) const fn mint() -> Self {
         Self(())
     }
 }
 
-/// The owner is needed NOW: why, the one action, and how long it stays.
+/// The owner is needed now: why, the one action, and how long it stays.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Ask {
     why: Why,
@@ -636,10 +604,10 @@ impl Ask {
         }
     }
 
-    /// A standing ask: it outlasts a look, so the reason must be one that no
-    /// retry ends ([`StandingWhy`]). The fact's identity is the row's KEY
-    /// (the door demotes a standing row that has none): once the owner has read
-    /// it, the same key is not raised again for [`STANDING_QUIET`].
+    /// A standing ask: it outlasts a look, so the reason must be one no retry ends
+    /// ([`StandingWhy`]). The fact's identity is the row's key (the door demotes a
+    /// standing row without one); once read, the same key is not raised again for
+    /// [`STANDING_QUIET`].
     #[must_use]
     pub fn standing(why: StandingWhy, then: Then) -> Self {
         Self {
@@ -649,10 +617,9 @@ impl Ask {
         }
     }
 
-    /// A DECISION ROW: a question that waits for a yes or a no, ranks first
-    /// and leaves on `Not now`, a supersede or its ten minutes ([`Hold::Ask`]).
-    /// A decision persists past a glance, so it is a [`Why::Question`] and it
-    /// still names the one action that answers it.
+    /// A decision row: a question that waits for a yes or a no, ranks first and leaves
+    /// on `Not now`, a supersede or its ten minutes ([`Hold::Ask`]). It still names the
+    /// one action that answers it.
     #[must_use]
     pub fn question(why: Reason, then: Then) -> Self {
         Self {
@@ -733,7 +700,7 @@ fn why_fault(why: &Why) -> Option<&'static str> {
     }
 }
 
-/// WHY AN EXCEPTION IS IN THE DIGEST.
+/// Why an exception is in the digest.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LaterWhy {
     /// A person is needed for something that can wait a day.
@@ -769,9 +736,8 @@ impl LaterAsk {
         }
     }
 
-    /// A self-healing fact, promoted only once it has gone on for `horizon`:
-    /// `None` while `age` is under it. The only way to show a fact that heals
-    /// itself is to wait it out.
+    /// A self-healing fact, promoted only once it has gone on for `horizon`: `None`
+    /// while `age` is under it.
     #[must_use]
     pub fn outlasted(
         what: Reason,
@@ -792,9 +758,8 @@ impl LaterAsk {
         })
     }
 
-    /// An exception the replayed log left open: only its words survive a
-    /// restart, so the ask is rebuilt from them (the reporter re-asserts the
-    /// real one at its first look). Crate only.
+    /// An exception the replayed log left open, rebuilt from its words (the reporter
+    /// re-asserts the real one at its first look). Crate only.
     pub(crate) fn adopted(why: &str, then: &str, key: &str) -> Self {
         Self {
             why: LaterWhy::Person(Why::OnlyYou(Reason::new(why))),
@@ -804,11 +769,9 @@ impl LaterAsk {
         }
     }
 
-    /// Take the ACTION half of `other` (what the owner's press does, and how
-    /// long a dismissal holds), keeping this ask's reason: the words of an
-    /// entry move at most once per `RESTATE_QUIET`, what a press does never
-    /// waits. An adopted entry carries a stand-in action (no `Mover`); its
-    /// reporter's next look brings the real one. Crate only.
+    /// Take the action half of `other` (what a press does, how long a dismissal holds),
+    /// keeping this ask's reason: an entry's words move at most once per `RESTATE_QUIET`,
+    /// what a press does never waits. Crate only.
     pub(crate) fn take_action_of(&mut self, other: &LaterAsk) {
         if self.then != other.then {
             self.then = other.then.clone();
@@ -887,8 +850,7 @@ fn hours_words(d: Duration) -> String {
 /// The closed list of transient rows that ask nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NoticeKind {
-    /// The crash-last-time rows the owner asked for (design C11): a loss
-    /// already suffered, two minutes.
+    /// The crash-last-time rows: a loss already suffered, two minutes.
     LastRun,
     /// A script's warn or error over the socket (`notice post`): it can name
     /// no reason and no capsule, so it never persists.
@@ -908,13 +870,13 @@ impl NoticeKind {
     }
 }
 
-/// What a message IS to the person. The engine derives the hold, the band
+/// What a message is to the person. The engine derives the hold, the band
 /// eligibility and the channel from it; a producer cannot choose them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Need {
-    /// Not yet classified: what [`crate::Message::new`] makes. It may be a
-    /// transient row or a record, never a persistent one (the seal,
-    /// [`Persist`]); the door cuts a transient hold past [`MAX_TRANSIENT`].
+    /// Not yet classified: what [`crate::Message::new`] makes. A transient row or a
+    /// record, never a persistent one ([`Persist`]); the door cuts a transient hold past
+    /// [`MAX_TRANSIENT`].
     Unclassified,
     /// The log only.
     Record,

@@ -374,6 +374,7 @@ mod tests {
             generation_look: Default::default(),
             reset_lane: Default::default(),
             update_parked: Default::default(),
+            fenced_writes: Default::default(),
         });
         SessionHandle {
             sid,

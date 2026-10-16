@@ -1,36 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! PROOF (uniform-period shades) — phase-keyed ░▒▓ dithers tile with a
-//! uniform 2-pixel period across cell seams at ANY cell width; the classic
-//! doubled-dither-line at odd widths is impossible.
+//! Phase-keyed ░▒▓ dithers tile with a uniform 2-pixel period across cell
+//! seams at any cell width. With cell-local parity, an odd width (9) lights
+//! the last column of one cell and the first of the next: a doubled line at
+//! every seam.
 //!
-//! Two-tier proof, same idiom as `presentation_gate.rs`:
-//!
-//! * Tier-0 (abstract): `aterm_spec::derive::shade_phase_model()` — the
-//!   ty-checked twin. Its invariant (`lit + parity = 1`: the pattern is a
-//!   function of ABSOLUTE column parity) is exactly the law asserted here;
-//!   its `Buggy = 1` branch (cell-LOCAL parity, the shipped defect) yields
-//!   the counterexample at the first seam of a 9-wide cell. Checked by the
-//!   real Trust `ty` in aterm-spec's `derived_ring_ty.rs`.
-//! * Tier-1 (this file): the SAME invariant checked against the REAL
-//!   rasterizer + key plumbing: compose adjacent cells exactly as the blit
-//!   does — `coverage_phased` with the phase `shade_phase_key` derives from
-//!   each cell's absolute pixel origin — and assert global 2-periodicity
-//!   over odd/even width lattices (exhaustive for the parity domain), plus a
-//!   negative control reproducing the pre-fix doubled line.
-//!
-//! The audited defect: at `cell_w = 9`, cell-local parity put a lit column
-//! at local x ∈ {0,2,4,6,8} in EVERY cell, so absolute columns 8 and 9 (the
-//! seam) were BOTH lit — a doubled dither line at every seam
-//! (procedural.rs's old `shade`).
+//! The ty-checked twin is `aterm_spec::derive::shade_phase_model()` (invariant
+//! `lit + parity = 1`, the pattern a function of absolute column parity;
+//! `Buggy = 1` is cell-local parity). This file checks the same law on the real
+//! rasterizer and key plumbing (`coverage_phased` with the phase
+//! `shade_phase_key` derives), over odd/even widths and pads.
 
 use aterm_render::{FaceId, GlyphClass, GlyphKey, StyleBits, procedural};
 
-/// Compose `cells` horizontal repeats of `ch` at `cell_w x cell_h`, each cell
-/// keyed with the phase of its own absolute pixel origin — exactly what the
-/// CPU blit / GPU quad emission hand to the rasterizer (`pad + col * cell_w`,
-/// row twin). Returns the composed `cells*cell_w x cell_h` coverage strip.
+/// Compose `cells` horizontal repeats of `ch` at `cell_w x cell_h`, each keyed
+/// with the phase of its absolute pixel origin (`pad + col * cell_w`), as the
+/// CPU blit and GPU quad emission do. Returns the `cells*cell_w x cell_h` strip.
 fn compose_row(
     ch: char,
     cell_w: usize,
@@ -58,11 +44,8 @@ fn compose_row(
     strip
 }
 
-/// THE law: at every width parity (including the audited cell_w=9) and pad
-/// parity, a run of shade cells is globally 2-periodic in x — every column's
-/// pattern equals the column two to its right, ACROSS seams. A doubled line
-/// (two adjacent equal columns at the seam where the pattern demands
-/// alternation) breaks this.
+/// At every width and pad parity, a run of shade cells is globally 2-periodic
+/// in x: every column equals the column two to its right, across seams.
 #[test]
 fn adjacent_shade_cells_tile_with_uniform_period() {
     for ch in ['░', '▒', '▓'] {
@@ -87,17 +70,14 @@ fn adjacent_shade_cells_tile_with_uniform_period() {
     }
 }
 
-/// Negative control (the pre-fix defect is real and this suite catches it):
-/// composing PHASE-LESS cells at cell_w = 9 doubles the ▒ checkerboard line
-/// at the seam — the exact banding the audit verified — and violates the
-/// uniform-period law the test above enforces.
+/// Negative control: phase-less cells at `cell_w = 9` double the ▒ line at the
+/// seam and break the uniform-period law.
 #[test]
 fn cell_local_parity_would_double_the_seam_line() {
     let (cw, chh) = (9usize, 19usize);
     let w = 2 * cw;
     let strip = compose_row('▒', cw, chh, 2, 0, false);
-    // Columns 8 (last of cell 0) and 9 (first of cell 1) hold the SAME
-    // pattern under cell-local parity: both are "even" locally.
+    // Columns 8 and 9 are both "even" under cell-local parity.
     let same_at_seam = (0..chh).all(|y| strip[y * w + cw - 1] == strip[y * w + cw]);
     assert!(
         same_at_seam,
@@ -112,10 +92,9 @@ fn cell_local_parity_would_double_the_seam_line() {
     );
 }
 
-/// The phased shade is the SAME pattern, just re-anchored: phase (1,0) equals
-/// the unphased pattern sampled one absolute column over — so phase variants
-/// never invent a new dither, they only align it. Also: shades stay hard
-/// 0/255 at every phase (they remain in the CPU==GPU exactness domain).
+/// A phase variant is the base pattern re-anchored, not a new dither: phase
+/// (1,0) is the unphased pattern one absolute column over. Shades stay hard
+/// 0/255 at every phase (the CPU==GPU exactness domain).
 #[test]
 fn phase_variants_are_shifted_not_reinvented() {
     for ch in ['░', '▒', '▓'] {
@@ -141,9 +120,9 @@ fn phase_variants_are_shifted_not_reinvented() {
     }
 }
 
-/// `shade_phase_key` folds the documented bits for shades ONLY, keyed on the
-/// pixel-origin parity, and leaves every other key untouched (so the fold is
-/// safe to apply unconditionally at the blit/quad sites).
+/// `shade_phase_key` folds the phase bits into shade keys only, keyed on the
+/// pixel-origin parity, and leaves every other key untouched, so the blit and
+/// quad sites apply it unconditionally.
 #[test]
 fn shade_phase_key_folds_only_shades() {
     let px_q = GlyphKey::quantize_px(18.0);
@@ -178,11 +157,9 @@ fn shade_phase_key_folds_only_shades() {
     assert_eq!(aterm_render::shade_phase_key(gid, 9, 19), gid);
 }
 
-/// End-to-end (CPU frame): a rendered row of ▒ is globally 2-periodic in x
-/// across the whole run — including every cell seam — whatever the host
-/// font's cell width turns out to be, and with an ODD interior pad (which
-/// flips every cell's absolute phase; pre-fix, an odd pad or an odd cell
-/// width broke the period at seams).
+/// End-to-end on a CPU frame: a rendered ▒ run is globally 2-periodic in x,
+/// seams included, at the host font's cell width and an odd pad (which flips
+/// every cell's absolute phase).
 #[test]
 fn rendered_shade_run_is_globally_periodic() {
     use aterm_core::terminal::Terminal;

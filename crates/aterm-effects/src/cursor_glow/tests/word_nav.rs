@@ -17,11 +17,9 @@ fn wordnav_row(fill: u16) -> [char; 40] {
     row
 }
 
-/// (1) zsh: the shell integration binds `\e[1;3D`/`\e[1;3C` to
-/// backward-/forward-word, and zsh echoes a word move as a caret-only
-/// `\x08`×n / `ESC[nC` (the caret never hides). Twenty alternating
-/// Option+Left/Right must sound twenty times. The control showing the rest of
-/// this block is about the seam, not the keys.
+/// zsh's shell integration binds `\e[1;3D`/`\e[1;3C` to backward-/forward-word, and zsh echoes a
+/// word move as a caret-only `\x08`×n / `ESC[nC` (the caret never hides): twenty alternating
+/// Option+Left/Right sound twenty times.
 #[test]
 fn twenty_word_keys_in_zsh_sound_twenty_times() {
     let g = geom();
@@ -51,11 +49,10 @@ fn twenty_word_keys_in_zsh_sound_twenty_times() {
     assert_eq!(glow.admission_tally().declined, 0);
 }
 
-/// (2) An Ink-style TUI (Claude Code's shape): every repaint is `ESC[?25l` …
-/// rewrite … `CUP` … `ESC[?25h`, and a multi-KiB frame arrives in 1024-byte
-/// slices, so a present can land while the caret is hidden. The next visible
-/// tick is a hidden→visible relocation, which the nav bridge admits. Twenty
-/// word keys, twenty cues.
+/// An Ink-style TUI (Claude Code's shape): every repaint is `ESC[?25l` … rewrite … `CUP` …
+/// `ESC[?25h`, and a multi-KiB frame arrives in 1024-byte slices, so a present can land while the
+/// caret is hidden. The next visible tick is a hidden→visible relocation, which the nav bridge
+/// admits: twenty word keys, twenty cues.
 #[test]
 fn twenty_word_keys_through_an_ink_repaint_sound_twenty_times() {
     // Both arms: the pane the host names under its frame hold (the nav
@@ -112,8 +109,8 @@ fn twenty_word_keys_through_an_ink_repaint(paned: bool) {
     );
 }
 
-/// (3) A PAIR 60 ms APART is two gestures, not one: Option+Left twice
-/// inside a third of the nav licence window, each with its own echo.
+/// Option+Left twice, 60 ms apart (inside a third of the nav licence window), each with its own
+/// echo, is two gestures.
 #[test]
 fn a_word_pair_sixty_milliseconds_apart_sounds_twice() {
     let g = geom();
@@ -141,10 +138,9 @@ fn a_word_pair_sixty_milliseconds_apart_sounds_twice() {
     assert_eq!((cues.nav, cues.meteor), (2, 0), "two keys, two ticks");
 }
 
-/// (4) Anti-stray control, and why the bridge yields to the nav hint rather
-/// than the hide window: a program relocating its caret across a hidden
-/// repaint with no key behind it mints nothing, and neither does the same
-/// relocation under a stale nav hint.
+/// A program relocating its caret across a hidden repaint with no key behind it mints nothing,
+/// and neither does the same relocation under a stale nav hint: the bridge keys on the nav hint,
+/// not the hide window.
 #[test]
 fn a_hidden_program_relocation_with_no_fresh_key_still_sounds_nothing() {
     let g = geom();
@@ -177,7 +173,7 @@ fn a_hidden_program_relocation_with_no_fresh_key_still_sounds_nothing() {
     );
     assert_eq!(glow.spawns(), 0);
 
-    // A STALE nav key (older than NAV_HINT_FRESH) is not a witness either.
+    // A stale nav key (older than `NAV_HINT_FRESH`) is not a witness either.
     let stale = t0 + Duration::from_millis(100);
     glow.note_motion(stale);
     glow.tick(
@@ -248,8 +244,8 @@ fn the_nav_bridge_never_reaches_back_to_a_source_the_key_did_not_move_from() {
         "a 3.4 s-old source is not the cell this key moved from"
     );
 
-    // The same key, with the caret visible one hide window before it, IS
-    // bridged — that is the Ink/DECTCEM shape the bridge exists for.
+    // The same key, with the caret visible one hide window before it, is bridged: the
+    // Ink/DECTCEM shape the bridge exists for.
     let mut glow = CursorGlow::default();
     let seen = t0;
     glow.tick(Some((2, 42)), seen, &c, g, &mut typed_scratch());
@@ -274,10 +270,9 @@ fn the_nav_bridge_never_reaches_back_to_a_source_the_key_did_not_move_from() {
     assert_eq!((cues.nav, cues.meteor), (1, 0));
 }
 
-/// (5) The word kill (Ctrl-W, Option+Backspace): one `KillWord` per chord.
-/// Its voice rides the erase detector's poof edge, so the caret retreat it
-/// produces stays inert, exactly once: an unwitnessed kill must not swallow
-/// the next real word move as a second retreat.
+/// The word kill (Ctrl-W, Option+Backspace) sounds one `KillWord` per chord on the erase
+/// detector's poof edge, and its caret retreat stays inert exactly once: an unwitnessed kill must
+/// not swallow the next real word move as a second retreat.
 #[test]
 fn each_word_kill_sounds_once_and_never_eats_the_next_word_move() {
     let g = geom();
@@ -337,12 +332,10 @@ fn each_word_kill_sounds_once_and_never_eats_the_next_word_move() {
     );
 }
 
-/// (7) A kill's retreat that lands with a band move or a scroll is still the
-/// kill's. The host replays band moves and scrolls, then drops the row probe,
-/// which clears `kill_hint`; the pending retreat carries its own clock
-/// (bounded by the kill's window, superseded by a real navigation press), so
-/// it keeps its class. Three shapes (band move, scroll, band move with an
-/// intermediate no-move frame) against the control with neither.
+/// A kill's retreat that lands with a band move or a scroll is still the kill's. The host
+/// replays band moves and scrolls, then drops the row probe, which clears `kill_hint`; the
+/// pending retreat carries its own clock (bounded by the kill's window, superseded by a real
+/// navigation press), so it keeps its class.
 #[test]
 fn a_kill_retreat_landing_with_a_band_move_or_a_scroll_is_not_a_navigation_meteor() {
     #[derive(Clone, Copy, Debug)]
@@ -436,16 +429,13 @@ fn a_kill_retreat_landing_with_a_band_move_or_a_scroll_is_not_a_navigation_meteo
     }
 }
 
-/// (6) The held park and the nav bridge never give two verdicts on one move;
-/// their order is pinned both ways:
+/// The held park and the nav bridge never give two verdicts on one move:
 ///
 /// 1. The park is judged first: a navigation press flushes a held park
-///    (`note_motion` -> `flush_held_park`) before stamping `nav_hint`, so
-///    Ink's park keeps its own `Move` and the word key inherits nothing.
-/// 2. The bridge then only chooses a source cell, and `spawn` chooses
-///    park-or-spawn after it, where `park_candidate` refuses while the nav
-///    hint is fresh. So a landing the nav bridge admits is never swallowed as
-///    a park: the word hop sounds and the ring carries its licensed row.
+///    (`note_motion` -> `flush_held_park`) before stamping `nav_hint`, so Ink's park keeps its
+///    own `Move` and the word key inherits nothing.
+/// 2. The bridge then only chooses a source cell, and `park_candidate` refuses while the nav hint
+///    is fresh, so a landing the bridge admits is never swallowed as a park.
 #[test]
 fn a_word_key_judges_a_held_park_before_its_own_landing_is_bridged() {
     let g = wide_geom();
@@ -454,8 +444,8 @@ fn a_word_key_judges_a_held_park_before_its_own_landing_is_bridged() {
     let mut glow = CursorGlow::default();
     let t0 = Instant::now();
 
-    // Ink's park: a same-row backward rewrite under a fresh typed stamp,
-    // HELD for the return that usually follows (no ring row yet).
+    // Ink's park: a same-row backward rewrite under a fresh typed stamp, held for the return that
+    // usually follows (no ring row yet).
     let pre = pre_roll(&mut glow, 11, t0, &c, g);
     let rows_before = ring_rows(&glow).len();
     let k = pre + Duration::from_millis(85);
@@ -520,5 +510,48 @@ fn a_word_key_judges_a_held_park_before_its_own_landing_is_bridged() {
         glow.in_flight_tally().park_flushed,
         1,
         "nothing was parked behind the nav hint: no second flush exists"
+    );
+}
+
+#[test]
+fn forward_word_hop_after_unspent_typed_credit_still_sounds_nav() {
+    let mut glow = CursorGlow::default();
+    let t0 = Instant::now();
+    let c = cfg(GlowStyle::RainbowKitty, true);
+    let g = wide_geom();
+    glow.tick(Some((5, 10)), t0, &c, g, &mut typed_scratch());
+
+    // Simulate unspent typed credits from earlier typing that did not advance
+    // the caret (e.g. a TUI chord or swallowed key), then wait past TYPE_HINT_FRESH.
+    for i in 0..4 {
+        glow.note_typed(t0 + Duration::from_millis(10 + i * 10));
+    }
+    let hop = t0 + Duration::from_millis(600);
+    // Option+b backward word hop to col 4, then Option+f forward word hop back to col 8.
+    glow.note_motion(hop);
+    glow.tick(
+        Some((5, 4)),
+        hop + Duration::from_millis(16),
+        &c,
+        g,
+        &mut typed_scratch(),
+    );
+    let back_cues = wordnav_drain(&mut glow);
+    assert_eq!(back_cues.nav + back_cues.meteor, 1, "Option+b sounds");
+
+    let fwd_hop = hop + Duration::from_millis(120);
+    glow.note_motion(fwd_hop);
+    glow.tick(
+        Some((5, 8)),
+        fwd_hop + Duration::from_millis(16),
+        &c,
+        g,
+        &mut typed_scratch(),
+    );
+    let fwd_cues = wordnav_drain(&mut glow);
+    assert_eq!(
+        fwd_cues.nav + fwd_cues.meteor,
+        1,
+        "Option+f forward word hop must sound as nav even when old unspent typed credits exist"
     );
 }

@@ -1,0 +1,33 @@
+# serde corpus `custom-words`: one case per line, `<id> TAB ok|err TAB <answer>`.
+# ok: the value written back out; err: the error's Display. \n \t \r \\ and
+# \u{..} escape control characters; an ok longer than 4096 bytes is its
+# FNV-1a digest and length. docs/AUDIT-third-party-2026-10-15.md, SP.3.
+base	ok	[RawCustomEntry { words: ["shipit", "deployed"], ink: Some(Shorthand("rainbow")), burst: Some(RawBurst { kind: "starburst", chance: Some(40) }), graphic: Some(RawGraphic { collection: "cats" }) }]
+empty	ok	[]
+ink/table	ok	[RawCustomEntry { words: ["shipit", "deployed"], ink: Some(Table { colorway: "twotone:#112233,#445566", sweep_once: None }), burst: Some(RawBurst { kind: "starburst", chance: Some(40) }), graphic: Some(RawGraphic { collection: "cats" }) }]
+ink/table-sweep	ok	[RawCustomEntry { words: ["shipit", "deployed"], ink: Some(Table { colorway: "rainbow", sweep_once: Some(true) }), burst: Some(RawBurst { kind: "starburst", chance: Some(40) }), graphic: Some(RawGraphic { collection: "cats" }) }]
+ink/table-unknown-key	ok	[RawCustomEntry { words: ["shipit", "deployed"], ink: Some(Table { colorway: "rainbow", sweep_once: None }), burst: Some(RawBurst { kind: "starburst", chance: Some(40) }), graphic: Some(RawGraphic { collection: "cats" }) }]
+ink/table-missing-colorway	err	TOML parse error at line 3, column 7\n  |\n3 | ink = { sweep_once = true }\n  |       ^^^^^^^^^^^^^^^^^^^^^\ndata did not match any variant of untagged enum RawInk\n
+ink/table-wrong-sweep	err	TOML parse error at line 3, column 7\n  |\n3 | ink = { colorway = "rainbow", sweep_once = "yes" }\n  |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\ndata did not match any variant of untagged enum RawInk\n
+ink/integer	err	TOML parse error at line 3, column 7\n  |\n3 | ink = 5\n  |       ^\ndata did not match any variant of untagged enum RawInk\n
+ink/array-one	err	TOML parse error at line 3, column 7\n  |\n3 | ink = ["rainbow"]\n  |       ^^^^^^^^^^^\ndata did not match any variant of untagged enum RawInk\n
+ink/array-two	err	TOML parse error at line 3, column 7\n  |\n3 | ink = ["rainbow", true]\n  |       ^^^^^^^^^^^^^^^^^\ndata did not match any variant of untagged enum RawInk\n
+ink/array-empty	err	TOML parse error at line 3, column 7\n  |\n3 | ink = []\n  |       ^^\ndata did not match any variant of untagged enum RawInk\n
+ink/empty-table	err	TOML parse error at line 3, column 7\n  |\n3 | ink = {}\n  |       ^^\ndata did not match any variant of untagged enum RawInk\n
+missing/words	ok	[RawCustomEntry { words: [], ink: Some(Shorthand("rainbow")), burst: Some(RawBurst { kind: "starburst", chance: Some(40) }), graphic: Some(RawGraphic { collection: "cats" }) }]
+missing/burst-kind	ok	[RawCustomEntry { words: ["shipit", "deployed"], ink: Some(Shorthand("rainbow")), burst: Some(RawBurst { kind: "", chance: Some(40) }), graphic: Some(RawGraphic { collection: "cats" }) }]
+unknown/entry	ok	[RawCustomEntry { words: ["shipit", "deployed"], ink: Some(Shorthand("rainbow")), burst: Some(RawBurst { kind: "starburst", chance: Some(40) }), graphic: Some(RawGraphic { collection: "cats" }) }]
+unknown/root	ok	[RawCustomEntry { words: ["shipit", "deployed"], ink: Some(Shorthand("rainbow")), burst: Some(RawBurst { kind: "starburst", chance: Some(40) }), graphic: Some(RawGraphic { collection: "cats" }) }]
+wrong-type/words-string	err	TOML parse error at line 2, column 9\n  |\n2 | words = "shipit"\n  |         ^^^^^^^^\ninvalid type: string "shipit", expected a sequence\n
+wrong-type/words-mixed	err	TOML parse error at line 2, column 20\n  |\n2 | words = ["shipit", 3]\n  |                    ^\ninvalid type: integer `3`, expected a string\n
+wrong-type/graphic-string	err	TOML parse error at line 5, column 11\n  |\n5 | graphic = "cats"\n  |           ^^^^^^\ninvalid type: string "cats", expected struct RawGraphic\n
+array-for-table/burst	ok	[RawCustomEntry { words: ["shipit", "deployed"], ink: Some(Shorthand("rainbow")), burst: Some(RawBurst { kind: "starburst", chance: Some(40) }), graphic: Some(RawGraphic { collection: "cats" }) }]
+array-for-table/burst-short	ok	[RawCustomEntry { words: ["shipit", "deployed"], ink: Some(Shorthand("rainbow")), burst: Some(RawBurst { kind: "starburst", chance: None }), graphic: Some(RawGraphic { collection: "cats" }) }]
+array-for-table/burst-long	err	TOML parse error at line 4, column 9\n  |\n4 | burst = ["starburst", 40, 1]\n  |         ^^^^^^^^^^^^^^^^^^^^\ninvalid length 3, expected 2 elements\n
+table-for-array/custom	err	TOML parse error at line 1, column 1\n  |\n1 | [sparkle_words.custom]\n  | ^^^^^^^^^^^^^^^^^^^^^^\ninvalid type: map, expected a sequence\n
+array-for-table/sparkle-words	ok	[]
+int/chance-u32-overflow	err	TOML parse error at line 4, column 40\n  |\n4 | burst = { kind = "starburst", chance = 4294967296 }\n  |                                        ^^^^^^^^^^\ninvalid value: integer `4294967296`, expected u32\n
+int/chance-negative	err	TOML parse error at line 4, column 40\n  |\n4 | burst = { kind = "starburst", chance = -1 }\n  |                                        ^^\ninvalid value: integer `-1`, expected u32\n
+zero/chance-negative-int	ok	[RawCustomEntry { words: ["shipit", "deployed"], ink: Some(Shorthand("rainbow")), burst: Some(RawBurst { kind: "starburst", chance: Some(0) }), graphic: Some(RawGraphic { collection: "cats" }) }]
+float/chance-nan	err	TOML parse error at line 4, column 40\n  |\n4 | burst = { kind = "starburst", chance = nan }\n  |                                        ^^^\ninvalid type: floating point `NaN`, expected u32\n
+float/chance-inf	err	TOML parse error at line 4, column 40\n  |\n4 | burst = { kind = "starburst", chance = inf }\n  |                                        ^^^\ninvalid type: floating point `inf`, expected u32\n

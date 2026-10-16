@@ -3,8 +3,8 @@
 
 //! PEM certificate-bundle decoding — the one PEM label this client accepts.
 //!
-//! A configured CA bundle is an explicit trust OVERRIDE for a single provider
-//! endpoint, so the parser is deliberately strict and deliberately narrow:
+//! A configured CA bundle is an explicit trust OVERRIDE for a single endpoint,
+//! so the parser is deliberately strict and deliberately narrow:
 //!
 //! * only `CERTIFICATE` blocks are decoded. A `PRIVATE KEY`, a `TRUSTED
 //!   CERTIFICATE`, or any other label in the file is an ERROR, not something to
@@ -191,8 +191,8 @@ mod tests {
         // than they think they configured.
         //
         // The BEGIN label is assembled from two literals rather than written
-        // out, and that is not cosmetic. `tools/grep_guard.sh` B6 holds ZERO
-        // TOLERANCE for a PEM private-key header anywhere in the tracked tree,
+        // out, and that is not cosmetic. The export's secret scan holds ZERO
+        // TOLERANCE for a PEM private-key header in anything published,
         // deliberately with no allowlist, because the cost of a real key
         // landing in a published repo is unbounded. A test that needs the label
         // in order to prove the label is REJECTED would otherwise be

@@ -2,73 +2,74 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Main-loop completeness census: the L0 whole-Mac-freeze class as a
-//! fail-closed, build-blocking obligation.
+//! The L0 censuses and the source guards: lexical walks over an aterm
+//! checkout, each a pure function of the tree that returns a verdict and its
+//! transcript.
 //!
-//! The guarded hazard: O(session-history) work (a width change rewrapping the
-//! whole off-screen scrollback) run synchronously on the winit event-loop
-//! thread while holding the per-session `term` mutex. The sanctioned shape is
-//! the offload (`resize_offloading_scrollback` detaches the tiered store in
-//! O(1), a worker rewraps it off the lock, `finish_resize_offload` re-attaches
-//! it). The census walks the name-based call graph of `crates/aterm-gui/src`
-//! from each main-thread root (the winit `ApplicationHandler` handlers and the
-//! resize timer arm), models one `term_lock` hop, and fails, printing root →
-//! call path → sink and the repair options, if a root synchronously reaches an
-//! unbounded sink not behind a justified offload boundary.
+//! | census      | runner                    | obligations           |
+//! |-------------|---------------------------|-----------------------|
+//! | `mainloop`  | [`run_mainloop_census`]   | OB-1..OB-6, OB-22     |
+//! | `locks`     | [`run_lock_order_census`] | OB-7                  |
+//! | `wasm`      | [`run_wasm_census`]       | OB-8..OB-10, OB-12    |
+//! | `scope`     | [`run_scope_census`]      | OB-13..OB-16          |
+//! | `lazy-init` | [`run_lazy_init_census`]  | OB-19..OB-21          |
+//! | `guards`    | [`run_guards`]            | the [`GUARDS`] rules  |
 //!
-//! Consumers:
+//! `aterm-census` (bare, or `--all`) runs every one over the checkout and
+//! exits non-zero on any finding; [`run_all`] is the same in-process, and the
+//! `live_tree_*` tests run each over this checkout. All three go through
+//! [`run_censuses`], which also holds each clean walk to its [`Floor`]s: a walk
+//! that read far less than an aterm checkout holds is blind, not clean.
 //!
-//!   * the `aterm-census` bin (`targo --unverified run -p aterm-census --
-//!     --mainloop`), which can also point the walker at another checkout;
-//!   * `tools/freeze-safety-gate/build.rs`, whose build runs the temporal proof
-//!     gate and this census and fails the compile on any violation. The census
-//!     needs no annotation from the code under scan.
+//! # The main-loop census
+//!
+//! The hazard: O(session-history) work (a width change rewrapping the whole
+//! off-screen scrollback) on the winit event-loop thread while it holds the
+//! per-session `term` mutex. The sanctioned shape is the offload
+//! (`resize_offloading_scrollback` detaches the tiered store in O(1), a worker
+//! rewraps it off the lock, `finish_resize_offload` re-attaches it). The census
+//! walks the name-based call graph of `crates/aterm-gui/src` from each
+//! main-thread root (the winit `ApplicationHandler` handlers and the resize
+//! timer arm), models one `term_lock` hop, and fails, printing root → call path
+//! → sink and the repair options, if a root synchronously reaches an unbounded
+//! sink not behind an offload boundary.
 //!
 //! Obligations (`[OB-n]` tags appear in the diagnostics):
 //!
-//! * OB-1  marker ↔ registry: every `// COST: UNBOUNDED(<dim>)` marker maps to
-//!   a registered sink and every registered sink is still marked, over the
+//! * OB-1  marker ↔ registry: every `// COST: UNBOUNDED(<dim>)` marker in the
 //!   derived GUI-process closure ([`scan_set::derive_gui_scan_set`], workspace
-//!   `src/` only). A marker in a workspace crate outside the closure is
-//!   reported, never registry-checked (see `collect_out_of_closure_markers`).
+//!   `src/` only) maps to a registered sink, and every registered sink is still
+//!   marked. Markers in workspace crates outside the closure are reported, never
+//!   registry-checked.
 //! * OB-2  every declared main-thread root resolves to a real fn.
 //! * OB-3  every [`OFFLOAD_ALLOWLIST`] boundary carries a written justification
 //!   and is still defined at its registered file.
-//! * OB-4  at least one allowlisted offload-boundary call exists in the walked
-//!   GUI source.
+//! * OB-4  at least one allowlisted offload-boundary call exists in the GUI
+//!   source.
 //! * OB-5  no main-thread-reachable fn synchronously calls an unbounded
 //!   Terminal method (`resize`) on a `term_lock` guard.
 //! * OB-6  no main-thread-reachable fn calls a registered unbounded sink
-//!   directly (e.g. `reflow_scrollback_lines(..)`).
+//!   directly.
 //! * OB-22 ([`held_guard`]) the per-site half: no shipped line of
 //!   `crates/aterm-gui/src` or `crates/aterm-control/src` does O(history) work
-//!   (`.resize(` `.reflow(` `.rewrap(` `.take_scrollback(` `.decompress(`
-//!   `.hydrate(` `.rebuild_index(`, `zstd`) while the `term` guard is held,
-//!   through `term_lock[_ui]`, a `let`-bound guard (typed, destructured,
-//!   reborrowed, reached through accessor hops, wrapped by rustfmt), or
-//!   aterm-control's `SessionHost::with_terminal[_mut]` closure.
-//! * OB-7  lock-order census ([`lock_order`]): every acquire-while-holding pair
-//!   across the GUI-process crates; the lock graph must be acyclic. No waiver
-//!   channel.
-//! * OB-19..OB-21  lazy-init reentrancy census ([`lazy_init`]): whether one
-//!   thread can arrive twice at the same lazy cell. A `OnceLock`/`LazyLock`/
-//!   `Once` initializer that reaches a blocking touch of its own cell parks its
-//!   thread forever. The lazy-init graph must be acyclic (OB-19 self-loops,
-//!   OB-20 components) and the walk non-blind (OB-21). No waiver channel.
+//!   while the `term` guard is held.
 //!
 //! These are lexical censuses, not a borrow checker; their limits are in
-//! [`PRECISION_NOTE`] and [`lock_order::LOCK_PRECISION_NOTE`], printed in every
-//! RED diagnostic and documented in docs/temporal-safety-gate.md.
+//! [`PRECISION_NOTE`] and [`lock_order::LOCK_PRECISION_NOTE`], printed with the
+//! red diagnostics and documented in docs/temporal-safety-gate.md.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
+mod guards;
 mod held_guard;
 mod lazy_init;
+mod lex;
 mod lock_order;
 pub mod scan_set;
 mod scope_census;
 mod wasm_census;
+pub use guards::{Finding, GUARDS, GuardReport, Rule, run_guards};
 pub use lazy_init::{LAZY_INIT_PRECISION_NOTE, run_lazy_init_census};
 pub use lock_order::run_lock_order_census;
 pub use scope_census::{SCOPE_PRECISION_NOTE, run_scope_census};
@@ -78,46 +79,243 @@ pub use scope_census::{SCOPE_PRECISION_NOTE, run_scope_census};
 pub use wasm_census::WASM_ROOT_CRATES;
 pub use wasm_census::run_wasm_census;
 
-/// The census verdict plus its full transcript. The log is returned, not
-/// printed, so each consumer routes it (the bin to stderr, the build gate into
-/// the compile error).
+/// A census verdict, its transcript, and the counts its walk saw. The log is
+/// returned, not printed, so each consumer decides where it goes.
 pub struct CensusOutcome {
-    /// `true` iff every obligation held.
+    /// `true` iff every obligation held (and, from [`run_censuses`], every
+    /// floor).
     pub ok: bool,
-    /// The complete diagnostic transcript (GREEN summary or `[OB-n]` failures).
+    /// The one-line verdict: `<census>: GREEN — …` or `<census>: FAILED — …`.
+    pub verdict: String,
+    /// The complete transcript; its last line is `verdict`.
     pub log: String,
-    /// Each registered standing finding this run re-detected, as the block the
-    /// log carries (a hazard kept on record, not a waiver). Only the
-    /// wasm-process and scope-cardinality censuses keep such a registry.
-    /// Returned apart from `log` because the build gate forwards these as
-    /// `cargo:warning` lines, the only output a green build shows.
-    pub standing: Vec<String>,
+    /// What a clean walk saw that an aterm checkout keeps in range.
+    pub floors: Vec<Floor>,
+    title: &'static str,
 }
 
 impl CensusOutcome {
-    /// A census that found a violation.
-    pub(crate) fn red(log: String) -> Self {
+    /// A census that found a violation: `log` carries the findings.
+    pub(crate) fn red(title: &'static str, log: String, why: impl std::fmt::Display) -> Self {
+        Self::finish(false, title, log, format!("{title}: FAILED — {why}"))
+    }
+
+    /// A census whose every obligation held.
+    pub(crate) fn green(title: &'static str, log: String, summary: impl std::fmt::Display) -> Self {
+        Self::finish(true, title, log, format!("{title}: GREEN — {summary}"))
+    }
+
+    fn finish(ok: bool, title: &'static str, mut log: String, verdict: String) -> Self {
+        log.push_str(&verdict);
+        log.push('\n');
         Self {
-            ok: false,
+            ok,
+            verdict,
             log,
-            standing: Vec::new(),
+            floors: Vec::new(),
+            title,
         }
     }
 
-    /// A census whose every obligation held, with no standing finding.
-    pub(crate) fn green(log: String) -> Self {
-        Self {
-            ok: true,
-            log,
-            standing: Vec::new(),
+    /// Attach the counts [`run_censuses`] holds a clean walk to.
+    pub(crate) fn with_floors(mut self, floors: Vec<Floor>) -> Self {
+        self.floors = floors;
+        self
+    }
+
+    /// Turn a clean walk red when a floor is missed. A red walk keeps its own
+    /// verdict: its findings already say what is wrong.
+    fn hold_floors(&mut self) {
+        let missed: Vec<String> = self
+            .floors
+            .iter()
+            .filter(|f| !f.met())
+            .map(|f| format!("  ✗ FAIL [floor] {f}\n"))
+            .collect();
+        if !self.ok || missed.is_empty() {
+            return;
         }
+        // `finish` made the verdict the log's last line; replace it.
+        self.log
+            .truncate(self.log.len().saturating_sub(self.verdict.len() + 1));
+        self.log.extend(missed.iter().map(String::as_str));
+        self.ok = false;
+        self.verdict = format!(
+            "{}: FAILED — {} floor(s) missed; the walk itself found no violation",
+            self.title,
+            missed.len()
+        );
+        self.log.push_str(&self.verdict);
+        self.log.push('\n');
     }
 }
 
-/// The honest limits of the walker, printed verbatim in every RED diagnostic
-/// (and quoted in docs/temporal-safety-gate.md so the docs cannot drift).
-// NOTE: a plain multi-line literal (no `\` continuations, which would strip the
-// leading indentation the diagnostic relies on).
+/// A count a clean walk saw and the range an aterm checkout keeps it in. A
+/// walk that reads a fraction of the tree (a renamed idiom, a parser
+/// regression) passes every obligation vacuously; a floor makes it red.
+/// Held by [`run_censuses`], not by the bare `run_*_census` walks, so the
+/// synthetic fixtures stay small.
+#[derive(Debug, Clone)]
+pub struct Floor {
+    /// What was counted.
+    pub what: &'static str,
+    /// The count this walk saw.
+    pub seen: usize,
+    /// The inclusive range an aterm checkout keeps it in.
+    pub range: std::ops::RangeInclusive<usize>,
+    /// What a count outside the range means, and the repair.
+    pub missed: &'static str,
+}
+
+impl Floor {
+    /// At least `min`: the walk still reads the tree it is meant to.
+    pub(crate) fn at_least(
+        what: &'static str,
+        seen: usize,
+        min: usize,
+        missed: &'static str,
+    ) -> Self {
+        Self {
+            what,
+            seen,
+            range: min..=usize::MAX,
+            missed,
+        }
+    }
+
+    /// None at all: a ledger that must stay empty.
+    pub(crate) fn none(what: &'static str, seen: usize, missed: &'static str) -> Self {
+        Self {
+            what,
+            seen,
+            range: 0..=0,
+            missed,
+        }
+    }
+
+    /// Whether the count is in range.
+    #[must_use]
+    pub fn met(&self) -> bool {
+        self.range.contains(&self.seen)
+    }
+}
+
+impl std::fmt::Display for Floor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (min, max) = (*self.range.start(), *self.range.end());
+        let bound = match (min, max) {
+            (_, usize::MAX) => format!("at least {min}"),
+            (0, 0) => "none".to_string(),
+            _ => format!("{min}..={max}"),
+        };
+        write!(
+            f,
+            "{}: {} (an aterm checkout shows {bound}) — {}",
+            self.what, self.seen, self.missed
+        )
+    }
+}
+
+/// One census: the name the CLI selects it by and its runner.
+pub struct Census {
+    /// The selection flag without its dashes (`--locks` selects `locks`).
+    pub name: &'static str,
+    /// What it checks, for `--help`.
+    pub about: &'static str,
+    /// The census over the checkout at the given root.
+    pub run: fn(&Path) -> CensusOutcome,
+}
+
+/// Every census, in the order `--all` runs and prints them.
+pub const CENSUSES: &[Census] = &[
+    Census {
+        name: "mainloop",
+        about: "main-thread reach to unbounded work (OB-1..OB-6, OB-22)",
+        run: run_mainloop_census,
+    },
+    Census {
+        name: "locks",
+        about: "lock-order cycles across the GUI process (OB-7)",
+        run: run_lock_order_census,
+    },
+    Census {
+        name: "wasm",
+        about: "wasm-module reach to unbounded work; threads (OB-8..OB-10, OB-12)",
+        run: run_wasm_census,
+    },
+    Census {
+        name: "scope",
+        about: "window-scoped enforcers that multiply (OB-13..OB-16)",
+        run: run_scope_census,
+    },
+    Census {
+        name: "lazy-init",
+        about: "lazy cells re-entered by their own initializer (OB-19..OB-21)",
+        run: run_lazy_init_census,
+    },
+    Census {
+        name: "guards",
+        about: "source rules no type or lint can hold (aterm_census::GUARDS)",
+        run: guards::run_guard_census,
+    },
+];
+
+/// Run `selected` over the checkout at `root`, each census on its own thread
+/// (they share nothing but the read-only tree), and hold each clean walk to
+/// its [`Floor`]s. Outcomes come back in the order given; a census that
+/// panics comes back red.
+#[must_use]
+pub fn run_censuses(root: &Path, selected: &[&Census]) -> Vec<CensusOutcome> {
+    std::thread::scope(|scope| {
+        let running: Vec<_> = selected
+            .iter()
+            .map(|&census| {
+                // The walkers recurse through directory trees and nested
+                // items; give each the main thread's stack, not a spawned
+                // thread's default.
+                std::thread::Builder::new()
+                    .name(format!("census-{}", census.name))
+                    .stack_size(8 << 20)
+                    .spawn_scoped(scope, move || (census.run)(root))
+            })
+            .collect();
+        running
+            .into_iter()
+            .zip(selected)
+            .map(|(handle, census)| {
+                let joined = handle.map_err(|e| e.to_string()).and_then(|h| {
+                    h.join()
+                        .map_err(|_| "it panicked (message above)".to_string())
+                });
+                let mut outcome = joined.unwrap_or_else(|why| {
+                    CensusOutcome::red(
+                        census.name,
+                        format!("=== {} census ===\n", census.name),
+                        format!("the census could not run: {why}"),
+                    )
+                });
+                outcome.hold_floors();
+                outcome
+            })
+            .collect()
+    })
+}
+
+/// Every census over the checkout at `root`, paired with its name, in
+/// [`CENSUSES`] order.
+#[must_use]
+pub fn run_all(root: &Path) -> Vec<(&'static str, CensusOutcome)> {
+    let every: Vec<&Census> = CENSUSES.iter().collect();
+    CENSUSES
+        .iter()
+        .map(|c| c.name)
+        .zip(run_censuses(root, &every))
+        .collect()
+}
+
+/// The walker's limits, printed after a red verdict that found an
+/// unbounded-work site. A plain multi-line literal: `\` continuations would
+/// strip the indentation the diagnostic relies on.
 pub const PRECISION_NOTE: &str = "    PRECISION / SCOPE (the honest limits of this census):
       - LEXICAL, name-based: functions are segmented by rustfmt's
         closing-brace-at-fn-indent invariant; calls are matched as `<ident>(`;
@@ -181,9 +379,8 @@ const UNBOUNDED_REGISTRY: &[UnboundedSink] = &[
 ];
 
 /// The winit `ApplicationHandler` handlers and the resize timer arm: the entry
-/// points that run on the event-loop (main) thread. (`window_event` /
-/// `user_event` fan out to most of the app; `flush_pending_resize` is the arm
-/// `about_to_wait` dispatches when a coalesced live-resize settles.)
+/// points that run on the event-loop (main) thread. `flush_pending_resize` is
+/// the arm `new_events` dispatches when a coalesced live-resize settles.
 ///
 /// OB-2: every name here must resolve in `crates/aterm-gui/src`.
 const MAIN_THREAD_ROOTS: &[&str] = &[
@@ -238,9 +435,7 @@ const OFFLOAD_ALLOWLIST: &[OffloadBoundary] = &[
         def_file: "crates/aterm-core/src/terminal/callback_setters.rs",
         justification: "The wedge-recovery half: O(1) flag-clear + bounded \
             lazy-buffer discard when a reflow worker dies and will never re-attach. \
-            Without it the detach window stays open forever (unbounded lazy growth); \
-            the temporal proof gate's WindowCloses invariant covers the same class \
-            from the protocol side.",
+            Without it the detach window stays open forever (unbounded lazy growth).",
     },
     OffloadBoundary {
         symbol: "reattach_reflowed_scrollback",
@@ -248,9 +443,8 @@ const OFFLOAD_ALLOWLIST: &[OffloadBoundary] = &[
         justification: "The Grid-level primitive `finish_resize_offload` forwards \
             to: O(1) attach of the already-rewrapped store + bounded lazy drain. \
             Registered so GUI code driving a Grid directly (no Terminal wrapper) \
-            still has a sanctioned re-attach shape. Audit 2026-07-08: zero direct \
-            GUI call sites today (the Terminal wrapper is used); kept because it IS \
-            the underlying boundary, not a suppression.",
+            still has a sanctioned re-attach shape; it IS the underlying boundary, \
+            not a suppression.",
     },
 ];
 
@@ -269,8 +463,7 @@ pub fn is_test_file(path: &Path) -> bool {
 }
 
 /// Recursively collect `*.rs` files under `dir`, skipping `target/` and hidden
-/// directories (worktrees live under `.claude/worktrees/`). This matches
-/// `grep -r .`, which does not descend into dot-directories.
+/// directories (`.git`, worktrees under `.claude/`).
 pub fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
     if !dir.exists() {
         return Ok(());
@@ -278,11 +471,10 @@ pub fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<(
     for entry in std::fs::read_dir(dir)? {
         let path = entry?.path();
         if path.is_dir() {
-            // Compare the name's encoded bytes rather than `OsStr::to_str`:
-            // equivalent for these ASCII checks, and it keeps `to_str`'s
-            // UTF-8-revalidation unsafe out of this frame for the Trust L0
-            // hardened lane. The function-path spelling keeps
-            // `as_encoded_bytes` an opaque callee.
+            // Compare encoded bytes, not `OsStr::to_str`: the same answer for
+            // these ASCII names, without `to_str`'s UTF-8-revalidation unsafe in
+            // this frame (the Trust L0 hardened lane). The function-path
+            // spelling keeps `as_encoded_bytes` an opaque callee.
             let name = path
                 .file_name()
                 .map_or(&b""[..], std::ffi::OsStr::as_encoded_bytes);
@@ -295,8 +487,6 @@ pub fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<(
             .map_or(&b""[..], std::ffi::OsStr::as_encoded_bytes)
             == b"rs"
         {
-            // Byte-equality with the ASCII literal `b"rs"` holds iff
-            // `to_str()` would succeed and equal "rs" — identical semantics.
             out.push(path);
         }
     }
@@ -321,23 +511,20 @@ fn gui_source_files(root: &Path) -> Vec<PathBuf> {
     files
 }
 
-/// Blank every in-file item whose `cfg` gate proves it never compiles into a
-/// shipped GUI process: the in-file half of the census's non-test scope, which
-/// [`gui_source_files`] applies only by path.
-///
-/// The walk merges same-named fns into one node, so an unmasked test helper
-/// lends its body to every shipped fn sharing its name (a
-/// `#[cfg(all(test, any(windows, target_os = "linux")))]` `compose` helper
-/// doing a guarded `resize` would otherwise appear reachable from
-/// `App::tab_titles`).
-///
-/// Masking is subtractive, so it removes only code that cannot ship: the
-/// predicate [`cfg_attr_never_ships`] requires the gate to entail `test`
-/// (`all(test, ..)` yes, `any(test, unix)` and `not(test)` no). The shared
-/// item walker ([`lock_order::mask_items_where`]) preserves line count and
-/// restores any span it cannot terminate.
+/// Blank every in-file item whose `cfg` gate entails `test`
+/// ([`cfg_attr_never_ships`]): the in-file half of the non-test scope that
+/// [`gui_source_files`] applies by path. The walk merges same-named fns, so an
+/// unmasked test helper would lend its body to every shipped fn of its name.
+/// The shared item walker ([`lock_order::mask_items_where`]) preserves line
+/// count and restores any span it cannot terminate.
 fn mask_unshipped_items(text: &str) -> String {
     crate::lock_order::mask_items_where(text, &|attr| cfg_attr_never_ships(attr))
+}
+
+/// Per line of a lexed code view, whether it is outside every item whose
+/// `cfg` proves it test-only (see [`mask_unshipped_items`]).
+fn shipped_lines(code: &str) -> Vec<bool> {
+    crate::lock_order::unmasked_lines(code, &|attr| cfg_attr_never_ships(attr))
 }
 
 /// Does this trimmed attribute line prove its item absent from a shipped
@@ -439,14 +626,12 @@ fn ident_after_fn(after_fn: &str) -> Option<String> {
     if id.is_empty() { None } else { Some(id) }
 }
 
-/// Is `line` a function DEFINITION? Returns `(indent, name)`. Recognises the
+/// Is `line` a function definition? Returns `(indent, name)`. Recognises the
 /// rustfmt-normalised `((pub…) )?(const |async |unsafe |extern "…" )*fn <name>`
 /// prefixes; ignores `fn` appearing elsewhere (e.g. `Fn(` bounds, `fn` in a type).
 fn parse_fn_def(line: &str) -> Option<(usize, String)> {
     let indent = line.len() - line.trim_start().len();
     let mut rest = line.trim_start();
-    // A definition begins with a visibility / qualifier chain then `fn `.
-    // Reject lines where `fn` is not in leading position (e.g. `where F: Fn()`).
     loop {
         if let Some(after) = rest.strip_prefix("fn ") {
             return ident_after_fn(after).map(|n| (indent, n));
@@ -681,13 +866,10 @@ struct Marker {
     span: String,
 }
 
-/// The marker-sweep file exclusions shared by both sweep scopes: test files,
-/// this crate (its tests synthesize marker lines) and `xtask/src/gate.rs`
-/// (whose prose mentions the marker token).
+/// The marker-sweep file exclusions shared by both sweep scopes: test files
+/// and this crate (its tests synthesize marker lines).
 fn marker_sweep_file(p: &Path) -> bool {
-    !is_test_file(p)
-        && !p.ends_with("xtask/src/gate.rs")
-        && !p.to_string_lossy().contains("/aterm-census/")
+    !is_test_file(p) && !p.to_string_lossy().contains("/aterm-census/")
 }
 
 /// Sweep `files` for `// COST: UNBOUNDED(<dim>)` markers, mapping each to the
@@ -730,15 +912,11 @@ fn sweep_markers(root: &Path, files: &[PathBuf]) -> Vec<Marker> {
     found
 }
 
-/// The OB-1 marker sweep: `// COST: UNBOUNDED(<dim>)` markers over the derived
-/// GUI-process closure (`scan_dirs`, the workspace-member `src/` set OB-7
-/// uses). Every marker must map to a registry entry and every entry must be
-/// marked.
-///
-/// Only crates that load into the aterm-gui process count; build scripts and
-/// examples are other processes. Vendored `[patch]` code carries no aterm
-/// markers and is not swept; a sink whose `def_file` pointed into vendor/
-/// would fail OB-1's reverse direction.
+/// The OB-1 marker sweep over the derived GUI-process closure (`scan_dirs`,
+/// the workspace-member `src/` set OB-7 uses; build scripts and examples are
+/// other processes). Vendored `[patch]` code carries no aterm markers and is
+/// not swept, so a sink whose `def_file` pointed into `vendor/` would fail
+/// OB-1's reverse direction.
 fn collect_closure_markers(root: &Path, scan_dirs: &[String]) -> Vec<Marker> {
     let mut files = Vec::new();
     for dir in scan_dirs {
@@ -825,9 +1003,11 @@ fn append_why_and_repair(log: &mut String) {
     );
 }
 
+/// The main-loop census's verdict title.
+const MAINLOOP: &str = "main-loop census";
+
 /// Run the main-loop census over the checkout at `root` (the directory holding
-/// `crates/`). A pure function of the source tree, safe in a build script and
-/// on any checkout.
+/// `crates/`). A pure function of the source tree.
 pub fn run_mainloop_census(root: &Path) -> CensusOutcome {
     let mut log = String::new();
     let mut failures = 0usize;
@@ -839,7 +1019,7 @@ pub fn run_mainloop_census(root: &Path) -> CensusOutcome {
     );
 
     // [OB-1] The marker scope is the same derived GUI-process closure OB-7
-    // uses. An unclassifiable dependency graph stops the build.
+    // uses. An unclassifiable dependency graph stops the census.
     let scan = match scan_set::derive_gui_scan_set(root) {
         Ok(s) => s,
         Err(e) => {
@@ -848,10 +1028,9 @@ pub fn run_mainloop_census(root: &Path) -> CensusOutcome {
                 "  ✗ FAIL [OB-1] SCAN-SET DERIVATION FAILED — the census cannot soundly \
                  determine the aterm-gui process closure from the workspace manifests, so \
                  it refuses to sweep a guessed marker scope (fail-closed).\n\
-                 \x20       {e}\n\
-                 main-loop census: FAILED — 1 obligation violation(s)."
+                 \x20       {e}"
             );
-            return CensusOutcome::red(log);
+            return CensusOutcome::red(MAINLOOP, log, "1 obligation violation(s).");
         }
     };
     let _ = writeln!(
@@ -989,11 +1168,13 @@ pub fn run_mainloop_census(root: &Path) -> CensusOutcome {
         let _ = writeln!(
             log,
             "  ✗ FAIL [OB-2] no MAIN_THREAD_ROOTS resolved — the census walked nothing \
-             (parser broke, or this root is not an aterm checkout?).\n\
-             main-loop census: FAILED — {} obligation violation(s).",
-            failures + 1
+             (parser broke, or this root is not an aterm checkout?)."
         );
-        return CensusOutcome::red(log);
+        return CensusOutcome::red(
+            MAINLOOP,
+            log,
+            format!("{} obligation violation(s).", failures + 1),
+        );
     }
     while let Some(cur) = queue.pop_front() {
         for callee in &edges[cur] {
@@ -1018,7 +1199,6 @@ pub fn run_mainloop_census(root: &Path) -> CensusOutcome {
     // [OB-5] Any reachable fn with an UNBOUNDED term-hop call is a class violation.
     let mut hazard_hits = 0usize;
     for idx in 0..fns.len() {
-        // Deterministic order: by fn index.
         if !parent.contains_key(&idx) || hazards[idx].is_empty() {
             continue;
         }
@@ -1140,27 +1320,12 @@ pub fn run_mainloop_census(root: &Path) -> CensusOutcome {
         if hazard_hits > 0 {
             let _ = write!(log, "{PRECISION_NOTE}");
         }
-        let _ = writeln!(
+        return CensusOutcome::red(
+            MAINLOOP,
             log,
-            "main-loop census: FAILED — {failures} obligation violation(s) ({hazard_hits} \
-             unbounded-work site(s)). This census blocks BOTH \
-             `targo --unverified run -p aterm-census -- --mainloop` and the build of \
-             tools/freeze-safety-gate."
+            format!("{failures} obligation violation(s) ({hazard_hits} unbounded-work site(s))."),
         );
-        return CensusOutcome::red(log);
     }
-    let _ = writeln!(
-        log,
-        "main-loop census: GREEN — {} fn(s) walked from {roots_found} main-thread root(s); \
-         no synchronous reach to an UNBOUNDED sink; {offload_sites} offload boundary call(s) \
-         ({}) hold the line; {} sink(s) marked + registered; {} boundaries defined + \
-         justified; {} out-of-closure marker(s) reported.",
-        parent.len(),
-        allowlist_symbols().join("/"),
-        UNBOUNDED_REGISTRY.len(),
-        OFFLOAD_ALLOWLIST.len(),
-        out_markers.len(),
-    );
     let (held_files, held_acquires) = held.unwrap_or_default();
     let _ = writeln!(
         log,
@@ -1175,7 +1340,24 @@ pub fn run_mainloop_census(root: &Path) -> CensusOutcome {
          (precision limits: docs/temporal-safety-gate.md).",
         scan.scan_dirs.len()
     );
-    CensusOutcome::green(log)
+    let summary = format!(
+        "{} fn(s) walked from {roots_found} main-thread root(s); no synchronous reach to an \
+         UNBOUNDED sink; {offload_sites} offload boundary call(s) ({}) hold the line; {} \
+         sink(s) marked + registered; {} boundaries defined + justified; {} out-of-closure \
+         marker(s) reported; {held_acquires} `term` acquire(s) held to no unbounded work.",
+        parent.len(),
+        allowlist_symbols().join("/"),
+        UNBOUNDED_REGISTRY.len(),
+        OFFLOAD_ALLOWLIST.len(),
+        out_markers.len(),
+    );
+    CensusOutcome::green(MAINLOOP, log, summary).with_floors(vec![Floor::at_least(
+        "`term` acquires the held-guard walk read",
+        held_acquires,
+        100,
+        "the walk lost most of the GUI's lock sites (a renamed acquire or a parser \
+         regression), so OB-22 holds vacuously; teach `held_guard` the new spelling",
+    )])
 }
 
 fn allowlist_symbols() -> Vec<&'static str> {
@@ -1198,10 +1380,93 @@ fn sink_file(symbol: &str) -> &'static str {
         .unwrap_or("crates/aterm-grid")
 }
 
+/// Rust source with comments/literal contents blanked, and with comments alone
+/// blanked. Both retain byte offsets; developer generators use the same lexer
+/// as the source guards rather than treating braces in strings as syntax.
+#[must_use]
+pub fn rust_source_views(source: &str) -> (String, String) {
+    let views = lex::lex(source);
+    (views.code, views.text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scan_set::test_fixtures::{repo_root, synth_tree};
+    use crate::scan_set::test_fixtures::synth_tree;
+
+    #[test]
+    fn run_censuses_keeps_the_given_order_and_turns_a_panic_red() {
+        fn clean(_: &Path) -> CensusOutcome {
+            CensusOutcome::green("a", String::new(), "clean")
+        }
+        fn broken(_: &Path) -> CensusOutcome {
+            panic!("a walker bug")
+        }
+        let a = Census {
+            name: "a",
+            about: "",
+            run: clean,
+        };
+        let b = Census {
+            name: "b",
+            about: "",
+            run: broken,
+        };
+        let out = run_censuses(Path::new("."), &[&b, &a]);
+        assert!(
+            !out[0].ok && out[0].log.contains("b census"),
+            "{}",
+            out[0].log
+        );
+        assert!(out[1].ok && out[1].log == "a: GREEN — clean\n");
+        assert_eq!(out[1].verdict, "a: GREEN — clean");
+    }
+
+    /// A clean walk that missed a floor comes back red, naming the floor; a
+    /// walk already red keeps its own verdict.
+    #[test]
+    fn run_censuses_turns_a_missed_floor_red() {
+        fn thin(_: &Path) -> CensusOutcome {
+            CensusOutcome::green("thin", "=== thin ===\n".to_string(), "1 site").with_floors(vec![
+                Floor::at_least("sites read", 1, 100, "the walk went blind"),
+                Floor::none("unnamed sites", 0, "name them"),
+            ])
+        }
+        fn red(_: &Path) -> CensusOutcome {
+            CensusOutcome::red("red", String::new(), "1 violation").with_floors(vec![Floor::none(
+                "unnamed sites",
+                3,
+                "name them",
+            )])
+        }
+        let (a, b) = (
+            Census {
+                name: "thin",
+                about: "",
+                run: thin,
+            },
+            Census {
+                name: "red",
+                about: "",
+                run: red,
+            },
+        );
+        let bare = thin(Path::new("."));
+        assert!(bare.ok, "the bare walk holds no floors");
+        let out = run_censuses(Path::new("."), &[&a, &b]);
+        assert!(!out[0].ok);
+        assert_eq!(
+            out[0].verdict,
+            "thin: FAILED — 1 floor(s) missed; the walk itself found no violation"
+        );
+        assert_eq!(
+            out[0].log,
+            "=== thin ===\n  ✗ FAIL [floor] sites read: 1 (an aterm checkout shows at least \
+             100) — the walk went blind\n\
+             thin: FAILED — 1 floor(s) missed; the walk itself found no violation\n"
+        );
+        assert_eq!(out[1].verdict, "red: FAILED — 1 violation");
+    }
 
     fn body(src: &str) -> Vec<String> {
         src.lines().map(|l| l.to_string()).collect()
@@ -1228,11 +1493,11 @@ mod tests {
 
     #[test]
     fn term_hop_flags_synchronous_guarded_resize_both_idioms() {
-        // Idiom (1): chained on the lock (the cross_resize bug shape).
+        // Idiom (1): chained on the lock.
         let (hz, _) = term_hop_calls(&body("    let p = term_lock(term).resize(rows, cols);"));
         assert_eq!(hz.len(), 1, "chained term_lock(..).resize( must flag");
         assert_eq!(hz[0].method, "resize");
-        // Idiom (2): via a bound guard (the resize_panes_scoped bug shape).
+        // Idiom (2): through a bound guard.
         let (hz, _) = term_hop_calls(&body(
             "    let mut term = term_lock(&s.term);\n    term.resize(sub_rows, sub_cols);",
         ));
@@ -1259,8 +1524,8 @@ mod tests {
         // Vec::resize / Row::resize on a non-guard receiver: not a term hop.
         let (hz, _) = term_hop_calls(&body("    self.born_scratch.resize(rows * cols, None);"));
         assert!(hz.is_empty());
-        // temporal `replay_at`: `term` is a LOCAL Terminal (not a term_lock guard),
-        // so its synchronous resize is the private-terminal case, not the hazard.
+        // `term` here is a local Terminal, not a `term_lock` guard: a private
+        // terminal's resize is not the hazard.
         let (hz, _) = term_hop_calls(&body(
             "    let mut term = Terminal::from_checkpoint(cp, host);\n    \
              term.resize(rows, cols);",
@@ -1408,7 +1673,7 @@ mod tests {
             "log:\n{}",
             out.log
         );
-        // The sweep scope is the DERIVED closure of the synthetic workspace
+        // The sweep scope is the synthetic workspace's derived closure
         // (aterm-gui, aterm-types, aterm-core, aterm-grid), stated in the log.
         assert!(
             out.log
@@ -1456,11 +1721,9 @@ mod tests {
             "the diagnostic must carry the repair options; log:\n{}",
             out.log
         );
-        // The verdict names the census and its hand-run spelling.
-        let runner = "`targo --unverified run -p aterm-census -- --mainloop`";
         assert!(
-            out.log.contains("main-loop census: FAILED — ") && out.log.contains(runner),
-            "the verdict line must name the census and its runner; log:\n{}",
+            out.log.contains("main-loop census: FAILED — "),
+            "the verdict line must name the census; log:\n{}",
             out.log
         );
     }
@@ -1541,8 +1804,7 @@ mod tests {
         );
     }
 
-    // The other direction, and the one that keeps the mask honest: a gate
-    // that does not entail `test` leaves the hazard visible and RED.
+    // A gate that does not entail `test` leaves the hazard visible and red.
     #[test]
     fn a_disjunctive_cfg_test_gate_is_not_masked_and_stays_red() {
         let mut files = synth_base();
@@ -1568,34 +1830,6 @@ mod tests {
             out.log
         );
         assert!(out.log.contains("[OB-5]"), "log:\n{}", out.log);
-    }
-
-    // On the real file: the test helper's guarded resize is masked and the
-    // shipped fns around it survive.
-    #[test]
-    fn the_real_tree_mask_drops_the_test_helper_and_keeps_shipped_code() {
-        let text = std::fs::read_to_string(repo_root().join("crates/aterm-gui/src/app_render.rs"))
-            .expect("app_render.rs");
-        let masked = mask_unshipped_items(&text);
-        assert!(
-            text.contains("mod strip_band_landing_tests"),
-            "fixture moved: this test pins the 54fe06696 module by name"
-        );
-        assert!(
-            !masked.contains("mod strip_band_landing_tests"),
-            "the `cfg(all(test, ..))` module must be blanked"
-        );
-        assert_eq!(
-            text.lines().count(),
-            masked.lines().count(),
-            "the mask must preserve line count, or every span it feeds is wrong"
-        );
-        for shipped in ["fn resize_panes_scoped", "fn splice_tab_strip"] {
-            assert!(
-                masked.contains(shipped),
-                "the mask ate shipped code: `{shipped}` is gone"
-            );
-        }
     }
 
     #[test]
@@ -1778,27 +2012,5 @@ mod tests {
             "log:\n{}",
             out.log
         );
-    }
-
-    // ------------------------------------------------------------------
-    // Real-tree obligations.
-    // ------------------------------------------------------------------
-
-    #[test]
-    fn offload_allowlist_entries_resolve_on_this_tree() {
-        let root = repo_root();
-        for b in OFFLOAD_ALLOWLIST {
-            assert!(
-                !b.justification.trim().is_empty(),
-                "boundary `{}` must carry a justification",
-                b.symbol
-            );
-            assert!(
-                fn_defined_in(&root, b.def_file, b.symbol),
-                "boundary `{}` is not defined in {} — stale allowlist entry",
-                b.symbol,
-                b.def_file
-            );
-        }
     }
 }

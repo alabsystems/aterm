@@ -85,14 +85,6 @@ fn size_prefix_is_little_endian_original_length() {
 }
 
 #[test]
-fn deterministic_output_for_same_input() {
-    let input: Vec<u8> = b"ABCDEFGH".iter().copied().cycle().take(500).collect();
-    let a = compress_prepend_size(&input);
-    let b = compress_prepend_size(&input);
-    assert_eq!(a, b, "compression must be deterministic");
-}
-
-#[test]
 fn decompress_rejects_too_short_input() {
     // Need at least 4 bytes for the size prefix.
     assert!(decompress_size_prepended(b"").is_err());

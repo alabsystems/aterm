@@ -6,7 +6,7 @@
 //! the `App` methods that consume them (font, scale, backend, resize, reload,
 //! fullscreen).
 
-use aterm_core::terminal::{ColorPalette, CursorStyle, Rgb};
+use aterm_core::terminal::{CursorStyle, Rgb};
 use aterm_render::Theme;
 use winit::dpi::PhysicalSize;
 
@@ -14,7 +14,6 @@ use crate::input::{InputEvent, Source};
 use crate::platform::AppRt;
 use crate::{
     App, Backend, FONT_PX, FONT_PX_MAX, FONT_PX_MIN, PresentTarget, WindowId, keybinding, launch,
-    term_lock,
 };
 
 /// Platform default for decoration drawn over content: `true` everywhere except
@@ -40,6 +39,7 @@ pub(crate) const DEFAULT_DECORATIVE_EFFECTS: bool = !cfg!(windows);
 /// no-op; text, comments and asset generations are versioned separately by the
 /// native config service.
 #[derive(Default, Clone, PartialEq, serde::Deserialize)]
+#[cfg_attr(test, derive(Debug))]
 #[serde(default)]
 pub(crate) struct Config {
     /// Glyph size in physical px (`--font-px` outranks it for one launch).
@@ -67,9 +67,14 @@ pub(crate) struct Config {
     /// Theme: indexed palette colours, `#RRGGBB`, by 0-based index (0–15 are the
     /// ANSI/bright set; up to 256). e.g. `palette = ["#1d1f21", "#cc6666", …]`.
     pub(crate) palette: Option<Vec<String>>,
-    /// Motion policy: `"auto"` (default: follow Reduce Motion live on macOS,
-    /// sample the Windows animations switch at window attach, no reduction
-    /// elsewhere), `"full"` or `"reduced"`. Governs every decorative animation
+    /// Theme: single indexed palette slots, `#RRGGBB`, by 0-based index as the
+    /// key, applied after `palette`: `palette_overrides = { 12 = "#88c0d0" }`.
+    /// A slot not named keeps the theme's colour, so one tuned slot follows
+    /// every theme instead of pinning the slots before it.
+    pub(crate) palette_overrides: Option<std::collections::BTreeMap<String, String>>,
+    /// Motion policy: `"auto"` (default: follow live macOS/Windows preferences,
+    /// sample GNOME's animation preference on Linux when available), `"full"`
+    /// or `"reduced"`. Governs every decorative animation
     /// through one [`crate::motion::MotionPolicy`]; unknown values fall back to
     /// `auto`, and unfocused windows always show static effects. Hot-reloadable.
     pub(crate) motion: Option<String>,
@@ -110,13 +115,15 @@ pub(crate) struct Config {
     /// unknown fields/effects rejected, every scalar clamped); an unreadable or
     /// invalid pack is skipped with a warning, never disabling the whole trail.
     pub(crate) cursor_trail_packs: Option<Vec<String>>,
-    /// Trail sound effects: each style's sound palette plays softly on the same
-    /// spawn edge that lights the trail. Default on; silent whenever the trail is
-    /// off, motion is reduced or the window is unfocused. `trail_sounds = false`
-    /// mutes them.
+    /// Music effects (Settings ▸ Sound): the master switch for every synth
+    /// voice (`sound_policy::voice_gain`). Default on. Each style's typing
+    /// notes play softly on the spawn edge that lights the trail, so only they
+    /// need a drawn trail; which voices also follow focus or a reduced motion
+    /// policy is the voice table's (`sound_policy::Voice`).
+    /// `trail_sounds = false` mutes all of them.
     pub(crate) trail_sounds: Option<bool>,
     /// Trail sound volume, `0.0`–`1.0` (default `0.4`: a lone keystroke peaks
-    /// around −22 dBFS). Config-file only.
+    /// around −22 dBFS). Settings ▸ Sound ▸ "Sound volume".
     pub(crate) trail_sound_volume: Option<f32>,
     /// Trail sound ambient bed (default on): the per-style background texture
     /// behind fast typing. `false` gates the bed mixer entirely (zero samples
@@ -253,13 +260,19 @@ pub(crate) struct Config {
     pub(crate) stream_fade: Option<bool>,
     /// Stream-fade duration in milliseconds. Default 90, clamped to 16..=1000.
     pub(crate) stream_fade_ms: Option<u64>,
-    /// Built-in colour scheme by name, e.g. `theme = "Dracula"` (case-insensitive):
-    /// sets default fg/bg, cursor, selection and the ANSI 0–15 palette. The
-    /// individual colour keys layer on top. An unknown name warns and uses the
-    /// default. See [`aterm_types::scheme`].
+    /// The colour theme by name: a built-in (case-insensitive), e.g.
+    /// `theme = "Dracula"`, or a themes-folder id. It sets default fg/bg,
+    /// cursor, selection and the ANSI 0–15 palette; the individual colour keys
+    /// layer on top. An unknown name warns and uses the default. See
+    /// [`aterm_types::scheme`] and `aterm help themes`.
     ///
-    /// `theme = "dark:<name>,light:<name>"` follows the live OS appearance (see
-    /// [`crate::app_colorscheme`]); a missing side uses the built-in default.
+    /// `theme = "dark:<name>,light:<name>"` follows the OS appearance, read
+    /// independently of the window chrome ([`crate::os_appearance`]: macOS's
+    /// application appearance, the XDG portal or gsettings on Linux, the
+    /// system setting on Windows; a headless instance reads none). A missing
+    /// side draws the named side's built-in pair (`dark:Gruvbox Dark` is
+    /// Gruvbox Light on a light OS), else the named side itself. Unset, it is
+    /// [`UNSET_THEME`]: Default on a dark OS, Default Light on a light one.
     /// See [`Self::resolve_theme_name`].
     pub(crate) theme: Option<String>,
     /// Interactive shell (config `shell`): a program name resolved with smart
@@ -412,53 +425,6 @@ pub(crate) struct Config {
     /// in-grid strip; label ink flips black/white by luminance. Absent uses the
     /// translucent system default. Hot-reloadable.
     pub(crate) active_tab_color: Option<String>,
-    /// Generate a live Activity fallback as terminal output changes. Default ON;
-    /// `false` disables generation while preserving both the stable Title and any
-    /// authored Description supplied by the session.
-    pub(crate) descriptive_titles: Option<bool>,
-    /// How live title descriptions are produced: `builtin` (default, local and
-    /// deterministic), `ollama`, `openai-compatible`, or `off`.
-    pub(crate) title_summary_provider: Option<TitleSummaryProvider>,
-    /// Model identifier used by an LLM summary provider. Defaults to the small
-    /// quantized local model `qwen3.5:4b-q4_K_M`.
-    pub(crate) title_summary_model: Option<String>,
-    /// Explicit chat-completions endpoint for an LLM summary provider. When this
-    /// is absent/blank, Ollama uses an aterm-owned per-process ephemeral loopback
-    /// endpoint; an OpenAI-compatible provider must configure one explicitly.
-    pub(crate) title_summary_endpoint: Option<String>,
-    /// Optional path to a bearer-token file for an OpenAI-compatible endpoint.
-    /// The token is intentionally indirect so it need not live in `aterm.toml`.
-    pub(crate) title_summary_token_file: Option<String>,
-    /// End-to-end HTTP request timeout for model providers, in seconds.
-    /// Defaults to 20 and is clamped to 1..=120.
-    pub(crate) title_summary_timeout_seconds: Option<u64>,
-    /// Proxy policy for remote model requests. `environment` (default) honors
-    /// the standard HTTP(S)_PROXY/ALL_PROXY/NO_PROXY environment, and a proxy
-    /// setting it cannot use fails the request; `direct` bypasses it.
-    /// Aterm's attested managed Ollama is always direct regardless of this key.
-    pub(crate) title_summary_proxy_mode: Option<TitleSummaryProxyMode>,
-    /// Optional path to a PEM CA bundle for private remote model services. This
-    /// is path-only: certificate material does not live in the config file. When
-    /// configured, this bundle replaces platform roots for that provider.
-    pub(crate) title_summary_ca_file: Option<String>,
-    /// Minimum time between live-description refreshes, in seconds. Defaults
-    /// to 15 and is clamped to 5..=300.
-    pub(crate) title_summary_interval_seconds: Option<u64>,
-    /// Number of recent terminal lines supplied to the summarizer. Defaults to
-    /// 24 and is clamped to 4..=80.
-    pub(crate) title_summary_context_lines: Option<usize>,
-    /// Include recent terminal output in the summary context. Default ON.
-    pub(crate) title_summary_include_output: Option<bool>,
-    /// Permit an untrusted summary service. Default OFF; this is the explicit
-    /// privacy gate for remote endpoints and pre-existing loopback listeners.
-    /// Aterm's own managed, cloud-disabled Ollama child does not need consent.
-    pub(crate) title_summary_allow_remote: Option<bool>,
-    /// Composition of application title and live description in tab labels.
-    /// Defaults to `title-description`.
-    pub(crate) tab_title_format: Option<TitleFormat>,
-    /// Composition of application title and live description in the native
-    /// window title. Defaults to `title-description`.
-    pub(crate) window_title_format: Option<TitleFormat>,
     /// Master switch for per-session status classification. Default on; `false`
     /// stops the classifier entirely.
     pub(crate) tab_status: Option<bool>,
@@ -541,7 +507,8 @@ pub(crate) struct Config {
     /// clamped 0.30..=3.0). Absent means `1.0`. Hot-reloadable.
     pub(crate) stem_gamma: Option<f32>,
     /// Linux/Windows glyph grid-fitting: `"full"` (default, both axes, crispest),
-    /// `"light"` (vertical only), `"native"` (the font's bytecode), or `"off"`.
+    /// `"light"` (vertical only), or `"off"`. The retired `"native"` (the font's
+    /// own bytecode until TF.2b) renders as `"light"`, with a config warning.
     /// Unknown spellings mean `"full"`. Inert on macOS. Hot-reloadable (drops
     /// the glyph atlas).
     pub(crate) font_hinting: Option<String>,
@@ -654,10 +621,26 @@ pub(crate) struct Config {
     /// ends of two socketpairs at fds 3 and 4, speaking `Scope::Bridge`. Absent
     /// means no fabric. Development builds may override it with
     /// `ATERM_FABRIC_COMMAND`. See [`FabricConfig`], [`crate::fabric_launch`].
+    ///
+    /// NO SETTINGS ROW, on purpose: which program gets the bridge authority is a
+    /// launcher intent, not a preference, and a Settings row is one an
+    /// Owner-scope client can drive through `settings set`. The point of putting
+    /// `deliver`/`hold` behind a descriptor is that no token unlocks them, and
+    /// `fabric attach` arms only the command this key names
+    /// (`fabric_launch::command_on_disk`): a writable `fabric.command` would hand
+    /// the Owner token the choice back, for this process and every later launch.
+    /// Edit `[fabric] command` in aterm.toml (validated by `--validate-config`),
+    /// or run `aterm fabric on`.
     pub(crate) fabric: Option<FabricConfig>,
     /// Embedded operator (`[operator]`): the experimental in-process observer and
     /// attention queue behind `aterm fleet manage`. Absent means off. See
     /// [`OperatorConfig`] and [`crate::operator_host`].
+    ///
+    /// NO SETTINGS ROW, on purpose: an agent-infrastructure opt-in read once at
+    /// launch, not a preference, and off by default because a new profile's
+    /// allowlist is empty; a Settings toggle an Owner-scope client can drive
+    /// would put a resident observer in every process one click away. Edit
+    /// `[operator] enabled = true` in aterm.toml (`docs/OPERATOR-EMBEDDED.md`).
     pub(crate) operator: Option<OperatorConfig>,
     /// Self-update (`[update]`): whether the updater runs, how a staged build
     /// applies, and (development builds only) which GitHub repo it pulls from.
@@ -718,102 +701,13 @@ pub(crate) struct Config {
     /// lines under other tables and non-TOML text); set in [`Config::parse`].
     #[serde(skip)]
     pub(crate) harness: HarnessPolicy,
+    /// The `[ai]` table and the fleet document it resolves over ([`AiPolicy`],
+    /// docs/DESIGN-ai-connections-2026-10-16.md §6), read by the AI layer's own
+    /// lenient reader, the one `aterm ai` uses; set in [`Config::parse`]. Live:
+    /// an edit re-runs the window's look (`App::ai_config_changed`).
+    #[serde(skip)]
+    pub(crate) ai: AiPolicy,
 }
-
-/// Source used to produce a terminal's live, human-readable description.
-///
-/// The config spelling is deliberately closed: a typo is rejected while
-/// deserializing `aterm.toml` instead of silently selecting a network service.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
-pub(crate) enum TitleSummaryProvider {
-    /// Fast in-process heuristics; no model, subprocess, or network access.
-    #[default]
-    #[serde(rename = "builtin")]
-    Builtin,
-    /// A local Ollama `/api/chat` endpoint.
-    #[serde(rename = "ollama")]
-    Ollama,
-    /// An explicitly configured OpenAI-compatible chat endpoint.
-    #[serde(rename = "openai-compatible")]
-    OpenAiCompatible,
-    /// Do not generate descriptions (the terminal-supplied title still works).
-    #[serde(rename = "off")]
-    Off,
-}
-
-impl TitleSummaryProvider {
-    /// Canonical `aterm.toml` token, also used by the Settings selector.
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Builtin => "builtin",
-            Self::Ollama => "ollama",
-            Self::OpenAiCompatible => "openai-compatible",
-            Self::Off => "off",
-        }
-    }
-}
-
-/// Proxy behavior for opt-in remote title-summary providers.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
-pub(crate) enum TitleSummaryProxyMode {
-    /// Honor HTTP_PROXY, HTTPS_PROXY, ALL_PROXY, and NO_PROXY from the aterm
-    /// process.
-    #[default]
-    #[serde(rename = "environment")]
-    Environment,
-    /// Connect directly, ignoring proxy environment variables.
-    #[serde(rename = "direct")]
-    Direct,
-}
-
-impl TitleSummaryProxyMode {
-    /// Canonical `aterm.toml` token, also used by the Settings selector.
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Environment => "environment",
-            Self::Direct => "direct",
-        }
-    }
-}
-
-/// Which parts of a tab's identity are shown, and in which order.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
-pub(crate) enum TitleFormat {
-    #[serde(rename = "title")]
-    Title,
-    #[serde(rename = "description")]
-    Description,
-    #[default]
-    #[serde(rename = "title-description")]
-    TitleDescription,
-    #[serde(rename = "description-title")]
-    DescriptionTitle,
-}
-
-impl TitleFormat {
-    /// Canonical `aterm.toml` token, also used by the Settings selector.
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Title => "title",
-            Self::Description => "description",
-            Self::TitleDescription => "title-description",
-            Self::DescriptionTitle => "description-title",
-        }
-    }
-}
-
-pub(crate) const DEFAULT_TITLE_SUMMARY_MODEL: &str = "qwen3.5:4b-q4_K_M";
-pub(crate) const EXAMPLE_EXPLICIT_OLLAMA_TITLE_SUMMARY_ENDPOINT: &str =
-    "http://127.0.0.1:11434/api/chat";
-pub(crate) const DEFAULT_TITLE_SUMMARY_INTERVAL_SECONDS: u64 = 15;
-pub(crate) const MIN_TITLE_SUMMARY_INTERVAL_SECONDS: u64 = 5;
-pub(crate) const MAX_TITLE_SUMMARY_INTERVAL_SECONDS: u64 = 300;
-pub(crate) const DEFAULT_TITLE_SUMMARY_CONTEXT_LINES: usize = 24;
-pub(crate) const MIN_TITLE_SUMMARY_CONTEXT_LINES: usize = 4;
-pub(crate) const MAX_TITLE_SUMMARY_CONTEXT_LINES: usize = 80;
-pub(crate) const DEFAULT_TITLE_SUMMARY_TIMEOUT_SECONDS: u64 = 20;
-pub(crate) const MIN_TITLE_SUMMARY_TIMEOUT_SECONDS: u64 = 1;
-pub(crate) const MAX_TITLE_SUMMARY_TIMEOUT_SECONDS: u64 = 120;
 
 /// Tab status bounds, shared with `prefs` so a Settings save never writes a
 /// value the resolver would clamp.
@@ -830,21 +724,8 @@ const NOMINAL_TAB_STATUS_OBSERVE_INTERVAL_MS: u64 = 250;
 /// zero and turn every output burst into a classification.
 const MIN_TAB_STATUS_OBSERVE_INTERVAL_MS: u64 = 50;
 
-/// Whether two renderer themes paint the same. `aterm_render::Theme` has no
-/// `PartialEq`; the exhaustive destructure makes a new field a compile error
-/// here instead of a change that escapes the comparison.
-pub(crate) fn theme_eq(a: Theme, b: Theme) -> bool {
-    let Theme {
-        fg,
-        bg,
-        cursor,
-        selection,
-    } = a;
-    (fg, bg, cursor, selection) == (b.fg, b.bg, b.cursor, b.selection)
-}
-
 /// Pack an [`Rgb`] as the renderer's `0x00RRGGBB`.
-fn rgb_u32(c: Rgb) -> u32 {
+pub(crate) fn rgb_u32(c: Rgb) -> u32 {
     (u32::from(c.r) << 16) | (u32::from(c.g) << 8) | u32::from(c.b)
 }
 
@@ -910,6 +791,7 @@ impl<'de> serde::Deserialize<'de> for FontList {
 /// enabled  = true          # the friendly default
 /// ```
 #[derive(Default, Clone, PartialEq, serde::Deserialize)]
+#[cfg_attr(test, derive(Debug))]
 #[serde(default)]
 pub(crate) struct SparkleWordsConfig {
     /// Master switch. Absent ⇒ ON (default); `false` ⇒ no matching, no decorations.
@@ -1030,7 +912,8 @@ fn read_and_fingerprint_path_feed_with_reader(
 
 /// Word-decoration runtime compiled for one admitted config generation. File
 /// reads, Toy Pack compilation and lexicon construction happen before it
-/// reaches the event loop.
+/// reaches the event loop; only the launch's kitty-command vocabulary may land
+/// after it ([`TrickVocabulary`]).
 #[derive(Clone)]
 pub(crate) struct PreparedSparkleRuntime {
     resolved: Option<crate::word_decorations::Resolved>,
@@ -1040,7 +923,62 @@ pub(crate) struct PreparedSparkleRuntime {
     /// it neither keeps the word engine alive nor disappears with it; compiled
     /// regardless of the master switch (dispatch checks it). Replaced per
     /// generation; the input path borrows it only at word boundaries.
-    tricks: std::sync::Arc<aterm_lexicon::TrickLexicon>,
+    tricks: TrickVocabulary,
+}
+
+/// One generation's kitty-command vocabulary: compiled before the generation is
+/// handed over ([`Self::compiled`]), or still compiling on its own worker
+/// ([`Self::compiling`]). The launch takes the second: the 365 KB `tricks.toml`
+/// parse (~9 ms) was the longest leg of the config-runtime worker the boot joins
+/// before the first window (`startup_prepare_config_join_ms`), for a table only a
+/// typed pet command reads. Until it lands the generation answers the EMPTY
+/// vocabulary (`TrickLexicon::default`), which classifies nothing.
+#[derive(Clone)]
+struct TrickVocabulary(std::sync::Arc<std::sync::OnceLock<aterm_lexicon::TrickLexicon>>);
+
+impl TrickVocabulary {
+    fn compiled(langs: Vec<String>) -> Self {
+        let vocabulary = Self(std::sync::Arc::default());
+        let _ = vocabulary.0.set(compile_trick_vocabulary(&langs));
+        vocabulary
+    }
+
+    /// Compile on an `aterm-tricks-compile` worker and land in place, or inline
+    /// when no thread can start. `Background`: nothing waits on it — the input
+    /// path reads whatever has landed and never blocks.
+    fn compiling(langs: Vec<String>) -> Self {
+        let vocabulary = Self(std::sync::Arc::default());
+        let landing = std::sync::Arc::clone(&vocabulary.0);
+        let worker_langs = langs.clone();
+        let spawned = std::thread::Builder::new()
+            .name("aterm-tricks-compile".into())
+            .spawn(move || {
+                crate::qos::set_self(crate::qos::Role::Background);
+                let _ = landing.set(compile_trick_vocabulary(&worker_langs));
+            });
+        if spawned.is_err() {
+            let _ = vocabulary.0.set(compile_trick_vocabulary(&langs));
+        }
+        vocabulary
+    }
+
+    fn get(&self) -> &aterm_lexicon::TrickLexicon {
+        static EMPTY: std::sync::OnceLock<aterm_lexicon::TrickLexicon> = std::sync::OnceLock::new();
+        self.0
+            .get()
+            .unwrap_or_else(|| EMPTY.get_or_init(aterm_lexicon::TrickLexicon::default))
+    }
+}
+
+/// The embedded kitty-command vocabulary for `langs`. Its data problems indicate
+/// bad embedded data, never user error.
+fn compile_trick_vocabulary(langs: &[String]) -> aterm_lexicon::TrickLexicon {
+    let refs: Vec<&str> = langs.iter().map(String::as_str).collect();
+    let tricks = aterm_lexicon::TrickLexicon::with_languages(&refs);
+    for conflict in tricks.conflicts() {
+        crate::logging::stderr_line!("aterm-gui: kitty commands vocabulary: {conflict}");
+    }
+    tricks
 }
 
 /// One consistent generation of every path-backed effect feed. Each consumer
@@ -1054,9 +992,10 @@ pub(crate) struct PreparedPathFeedGeneration {
 }
 
 impl PreparedSparkleRuntime {
-    /// This generation's kitty-command vocabulary, borrowed for one press.
+    /// This generation's kitty-command vocabulary, borrowed for one press: the
+    /// empty one while the launch's compile has not landed.
     pub(crate) fn tricks(&self) -> &aterm_lexicon::TrickLexicon {
-        &self.tricks
+        self.tricks.get()
     }
 
     /// Custom-spec consumers for this generation (valid Toy Packs, then inline
@@ -1124,6 +1063,9 @@ pub(crate) fn path_feed_read_count() -> usize {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TrailPackCatalog {
     pub(crate) packs: std::collections::HashMap<String, aterm_effects::cursor_glow::TrailParams>,
+    /// Each loaded pack's own words from its manifest, by id, for the
+    /// Cursor Styles list ([`TrailPackLabel`]).
+    pub(crate) labels: std::collections::HashMap<String, TrailPackLabel>,
     pub(crate) ids: Vec<String>,
     pub(crate) diagnostics: Vec<String>,
     /// Presentation parsed once per asset generation so redraw does not rescan
@@ -1151,10 +1093,16 @@ pub(crate) const MAX_WALLPAPER_SOURCE_DIMENSION: usize = 8192;
 pub(crate) const MAX_WALLPAPER_KEEP_DIMENSION: usize = 4096;
 
 /// Installed-theme discovery keeps a bounded, deterministic prefix and reads
-/// every file under a hard byte limit.
+/// every file under a hard byte limit. This many files are opened and parsed;
+/// files that never reach a read (a name shadowing a built-in, an unsafe or
+/// non-UTF-8 name) only get a diagnostic row and do not count against it.
 pub(crate) const MAX_USER_THEME_FILES: usize = 128;
-const MAX_USER_THEME_CANDIDATES: usize = 512;
-/// Total directory entries inspected before theme discovery fails closed.
+/// `.conf` candidates kept, sorted, from the folder scan (the lowest names
+/// win). The config watcher's directory stamp shares this cap, so a stamp never
+/// sees an edit discovery ignores.
+pub(crate) const MAX_USER_THEME_CANDIDATES: usize = 512;
+/// Directory entries inspected before enumeration stops. Discovery keeps the
+/// candidates gathered up to that point and marks the catalog truncated.
 pub(crate) const MAX_USER_THEME_DIRECTORY_ENTRIES: usize = 4_096;
 pub(crate) const MAX_USER_THEME_FILE_BYTES: usize = aterm_types::scheme::MAX_USER_THEME_FILE_BYTES;
 const MAX_THEME_SOURCE_ID_BYTES: usize = 2 * 1024;
@@ -1162,8 +1110,87 @@ const MAX_THEME_REASON_BYTES: usize = 320;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ThemeAssetResolution {
-    Ready(aterm_types::ColorScheme),
+    /// Parsed and admitted; boxed because the meta doubles the row.
+    Ready(Box<AdmittedTheme>),
     Invalid(std::sync::Arc<str>),
+    /// The file's name is a built-in's (ASCII case-insensitive, `Default`
+    /// included). The built-in wins; the row only says why the file is unused.
+    Shadowed(&'static str),
+    /// The file's stem is not UTF-8, so no config value can name it; the row
+    /// carries the lossy spelling.
+    Unreadable,
+}
+
+/// A theme file that loaded: its colours and its identity
+/// ([`aterm_types::scheme::ThemeMeta`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AdmittedTheme {
+    scheme: aterm_types::ColorScheme,
+    meta: aterm_types::scheme::ThemeMeta,
+}
+
+impl AdmittedTheme {
+    /// Admit a parsed file whose id (file stem) is `id`: an omitted
+    /// `appearance` is measured by the chrome's one classifier.
+    fn admit(mut parsed: aterm_types::scheme::ParsedTheme, id: &str) -> Self {
+        let measured = measured_appearance(parsed.scheme.background);
+        let meta = aterm_types::scheme::ThemeMeta::admit(&mut parsed, id, measured);
+        Self {
+            scheme: parsed.scheme,
+            meta,
+        }
+    }
+}
+
+/// The appearance a background measures as, by the one dark/light rule
+/// ([`aterm_messages::ink::bg_is_light`]).
+pub(crate) fn measured_appearance(bg: aterm_types::Rgb) -> aterm_types::Appearance {
+    if aterm_messages::ink::bg_is_light([bg.r, bg.g, bg.b]) {
+        aterm_types::Appearance::Light
+    } else {
+        aterm_types::Appearance::Dark
+    }
+}
+
+/// Why one custom-theme row did or did not load, as [`ThemeCatalog::listing`]
+/// reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ThemeEntryStatus<'a> {
+    Ready,
+    /// Read but refused (syntax, size, unsafe name, case collision).
+    Invalid(&'a str),
+    /// Named like this built-in, which always wins.
+    Shadowed(&'static str),
+    /// A file name that is not UTF-8, listed under its lossy spelling.
+    Unreadable,
+}
+
+impl ThemeEntryStatus<'_> {
+    /// The one-line reason a non-ready row did not load.
+    pub(crate) fn reason(self) -> Option<String> {
+        match self {
+            Self::Ready => None,
+            Self::Invalid(reason) => Some(reason.to_string()),
+            Self::Shadowed(builtin) => Some(format!(
+                "shadowed by the built-in theme {builtin}, which always wins; rename the file \
+                 (e.g. \"{builtin} (mine).conf\")"
+            )),
+            Self::Unreadable => {
+                Some("the file name is not valid UTF-8, so no config can name it; rename it".into())
+            }
+        }
+    }
+}
+
+/// How much of the themes folder discovery looked at and kept.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ThemeCatalogLimits {
+    /// Regular `.conf` files seen while enumerating (a floor when the
+    /// directory-entry cap stopped the scan).
+    pub(crate) seen: usize,
+    /// Files opened and parsed (ready or invalid), at most
+    /// [`MAX_USER_THEME_FILES`].
+    pub(crate) kept: usize,
 }
 
 /// One bounded custom-theme file. Invalid entries are kept for diagnostics but
@@ -1185,6 +1212,7 @@ struct ThemeAsset {
 pub(crate) struct ThemeCatalog {
     entries: Vec<ThemeAsset>,
     truncated: bool,
+    limits: ThemeCatalogLimits,
 }
 
 /// Live watcher failures that keep the last admitted catalog. Deterministic
@@ -1208,16 +1236,29 @@ impl ThemeCatalog {
     ) -> std::sync::Arc<Self> {
         let entries = schemes
             .into_iter()
-            .map(|(name, scheme)| ThemeAsset {
-                fingerprint: stable_asset_fingerprint(0x54, name.as_bytes(), 0, 0, &[]),
-                source_id: std::sync::Arc::from(name.clone()),
-                name,
-                resolution: ThemeAssetResolution::Ready(scheme),
+            .map(|(name, scheme)| {
+                // A scheme handed in whole has the appearance it says.
+                let parsed = aterm_types::scheme::ParsedTheme {
+                    scheme,
+                    description: None,
+                    author: None,
+                    appearance_declared: true,
+                };
+                ThemeAsset {
+                    fingerprint: stable_asset_fingerprint(0x54, name.as_bytes(), 0, 0, &[]),
+                    source_id: std::sync::Arc::from(name.clone()),
+                    resolution: ThemeAssetResolution::Ready(Box::new(AdmittedTheme::admit(
+                        parsed, &name,
+                    ))),
+                    name,
+                }
             })
             .collect::<Vec<_>>();
+        let kept = entries.len();
         std::sync::Arc::new(Self {
             entries: normalize_theme_entries(entries),
             truncated: false,
+            limits: ThemeCatalogLimits { seen: kept, kept },
         })
     }
 
@@ -1257,7 +1298,9 @@ impl ThemeCatalog {
         after_scan: impl FnOnce(),
     ) -> Result<Self, ThemeCatalogWatchError> {
         let mut candidates = std::collections::BTreeSet::new();
+        let mut links = std::collections::BTreeSet::new();
         let mut truncated = false;
+        let mut seen = 0usize;
         let read_dir = match std::fs::read_dir(directory) {
             Ok(read_dir) => read_dir,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -1265,14 +1308,16 @@ impl ThemeCatalog {
             }
             Err(_) => return Err(ThemeCatalogWatchError::DirectoryUnreadable),
         };
-        let mut observed_entries = 0usize;
-        for result in read_dir.take(MAX_USER_THEME_DIRECTORY_ENTRIES + 1) {
-            observed_entries += 1;
-            if observed_entries > MAX_USER_THEME_DIRECTORY_ENTRIES {
-                return Ok(Self {
-                    entries: Vec::new(),
-                    truncated: true,
-                });
+        for (index, result) in read_dir
+            .take(MAX_USER_THEME_DIRECTORY_ENTRIES + 1)
+            .enumerate()
+        {
+            // Past the entry cap the scan stops but keeps what it gathered:
+            // a folder full of strays degrades to a bounded prefix, never to
+            // an empty catalog.
+            if index == MAX_USER_THEME_DIRECTORY_ENTRIES {
+                truncated = true;
+                break;
             }
             let entry = match result {
                 Ok(entry) => entry,
@@ -1289,38 +1334,73 @@ impl ThemeCatalog {
                 Err(_) => continue,
             };
             // `is_file` is false for symlinks: a theme cannot escape the
-            // admitted directory through an attacker-swapped link.
-            if !file_type.is_file()
-                || entry.path().extension() != Some(std::ffi::OsStr::new("conf"))
-            {
+            // admitted directory through an attacker-swapped link. A linked
+            // `.conf` is still listed, never opened, so its row says why it
+            // does not load.
+            if entry.path().extension() != Some(std::ffi::OsStr::new("conf")) {
                 continue;
             }
+            if file_type.is_symlink() {
+                links.insert(entry.path());
+            } else if !file_type.is_file() {
+                continue;
+            }
+            seen = seen.saturating_add(1);
             candidates.insert(entry.path());
             if candidates.len() > MAX_USER_THEME_CANDIDATES {
                 candidates.pop_last();
                 truncated = true;
             }
         }
-        if candidates.len() > MAX_USER_THEME_FILES {
-            truncated = true;
-        }
         after_scan();
 
         let mut entries = Vec::new();
-        for path in candidates.into_iter().take(MAX_USER_THEME_FILES) {
-            let Some(name) = path.file_stem().and_then(std::ffi::OsStr::to_str) else {
+        let mut kept = 0usize;
+        for path in candidates {
+            let source_id = bounded_asset_text(&path.to_string_lossy(), MAX_THEME_SOURCE_ID_BYTES);
+            let Some(stem) = path.file_stem() else {
                 continue;
             };
-            // Built-ins always win, so an identically named file is neither
-            // advertised nor capable of changing the built-in palette.
-            if aterm_types::scheme::builtin(name).is_some() {
+            let Some(name) = stem.to_str() else {
+                entries.push(diagnostic_theme_asset(
+                    &stem.to_string_lossy(),
+                    &source_id,
+                    ThemeAssetResolution::Unreadable,
+                ));
+                continue;
+            };
+            // Built-ins always win, so an identically named file never
+            // changes the built-in palette; its row says why it is unused.
+            if let Some(builtin) = builtin_theme_name(name) {
+                entries.push(diagnostic_theme_asset(
+                    name,
+                    &source_id,
+                    ThemeAssetResolution::Shadowed(builtin),
+                ));
                 continue;
             }
-            let source_id = bounded_asset_text(&path.to_string_lossy(), MAX_THEME_SOURCE_ID_BYTES);
             if let Err(reason) = safe_user_theme_name(name) {
                 entries.push(invalid_theme_asset(name, &source_id, reason));
                 continue;
             }
+            // Diagnostic only: the link is never opened (in watch mode a
+            // refused open would block every reload) and never counts
+            // against the file cap.
+            if links.contains(&path) {
+                entries.push(invalid_theme_asset(
+                    name,
+                    &source_id,
+                    "symlinks are not followed; copy the file into the themes folder",
+                ));
+                continue;
+            }
+            // The file cap counts only files that are actually read, so
+            // shadowing and misnamed files cannot push valid themes out.
+            if kept == MAX_USER_THEME_FILES {
+                truncated = true;
+                break;
+            }
+            kept += 1;
 
             let bytes = match read_bounded_theme_file(&path) {
                 Ok(bytes) => bytes,
@@ -1346,8 +1426,8 @@ impl ThemeCatalog {
                     continue;
                 }
             };
-            match aterm_types::scheme::parse_scheme_str(text) {
-                Ok(scheme) => entries.push(ThemeAsset {
+            match aterm_types::scheme::parse_theme_str(text) {
+                Ok(parsed) => entries.push(ThemeAsset {
                     name: name.to_string(),
                     source_id,
                     fingerprint: stable_asset_fingerprint(
@@ -1357,7 +1437,9 @@ impl ThemeCatalog {
                         0,
                         &bytes,
                     ),
-                    resolution: ThemeAssetResolution::Ready(scheme),
+                    resolution: ThemeAssetResolution::Ready(Box::new(AdmittedTheme::admit(
+                        parsed, name,
+                    ))),
                 }),
                 Err(error) => {
                     entries.push(invalid_theme_asset(name, &source_id, &error.to_string()))
@@ -1367,6 +1449,7 @@ impl ThemeCatalog {
         Ok(Self {
             entries: normalize_theme_entries(entries),
             truncated,
+            limits: ThemeCatalogLimits { seen, kept },
         })
     }
 
@@ -1375,17 +1458,75 @@ impl ThemeCatalog {
             .iter()
             .filter_map(|entry| match &entry.resolution {
                 ThemeAssetResolution::Ready(_) => Some(entry.name.as_str()),
-                ThemeAssetResolution::Invalid(_) => None,
+                ThemeAssetResolution::Invalid(_)
+                | ThemeAssetResolution::Shadowed(_)
+                | ThemeAssetResolution::Unreadable => None,
             })
     }
 
-    /// Every custom theme the folder held, by name, with the reason it did
-    /// not load (`None` for one that loaded).
-    pub(crate) fn listing(&self) -> impl Iterator<Item = (&str, Option<&str>)> {
-        self.entries.iter().map(|entry| match &entry.resolution {
-            ThemeAssetResolution::Ready(_) => (entry.name.as_str(), None),
-            ThemeAssetResolution::Invalid(reason) => (entry.name.as_str(), Some(&**reason)),
+    /// Each loaded custom theme's id (file stem, what config writes) with its
+    /// identity: display name, description, appearance and warnings.
+    pub(crate) fn ready_themes(
+        &self,
+    ) -> impl Iterator<Item = (&str, &aterm_types::scheme::ThemeMeta)> {
+        self.entries
+            .iter()
+            .filter_map(|entry| match &entry.resolution {
+                ThemeAssetResolution::Ready(theme) => Some((entry.name.as_str(), &theme.meta)),
+                ThemeAssetResolution::Invalid(_)
+                | ThemeAssetResolution::Shadowed(_)
+                | ThemeAssetResolution::Unreadable => None,
+            })
+    }
+
+    /// The identity of the theme `id` names, by the same lookup as
+    /// [`Self::resolve`]: a built-in first, then a loaded custom theme.
+    pub(crate) fn meta(&self, id: &str) -> Option<aterm_types::scheme::ThemeMeta> {
+        if let Some(builtin) = aterm_types::scheme::builtin_theme(id) {
+            return Some(aterm_types::scheme::ThemeMeta::of_builtin(builtin));
+        }
+        self.ready_themes()
+            .find(|(name, _)| name.eq_ignore_ascii_case(id))
+            .map(|(_, meta)| meta.clone())
+    }
+
+    /// Where the loaded custom theme `id` was read from (its file path, bounded
+    /// as discovery recorded it), by the lookup [`Self::resolve`] uses for
+    /// files. `None` for a built-in or a name that did not load.
+    pub(crate) fn source_path(&self, id: &str) -> Option<&str> {
+        self.entries
+            .iter()
+            .find(|entry| {
+                matches!(entry.resolution, ThemeAssetResolution::Ready(_))
+                    && entry.name.eq_ignore_ascii_case(id)
+            })
+            .map(|entry| &*entry.source_id)
+    }
+
+    /// Every custom theme file discovery kept a row for, by name, with its
+    /// status: loaded, refused with a reason, shadowed by a built-in, or
+    /// unnameable. Only [`Self::ready_names`] reach the picker.
+    pub(crate) fn listing(&self) -> impl Iterator<Item = (&str, ThemeEntryStatus<'_>)> {
+        self.entries.iter().map(|entry| {
+            let status = match &entry.resolution {
+                ThemeAssetResolution::Ready(_) => ThemeEntryStatus::Ready,
+                ThemeAssetResolution::Invalid(reason) => ThemeEntryStatus::Invalid(reason),
+                ThemeAssetResolution::Shadowed(builtin) => ThemeEntryStatus::Shadowed(builtin),
+                ThemeAssetResolution::Unreadable => ThemeEntryStatus::Unreadable,
+            };
+            (entry.name.as_str(), status)
         })
+    }
+
+    /// Whether the folder held more than discovery keeps (entries, candidates
+    /// or files); the kept rows are then a bounded prefix.
+    pub(crate) fn truncated(&self) -> bool {
+        self.truncated
+    }
+
+    /// How many `.conf` files discovery saw and how many it read.
+    pub(crate) fn limits(&self) -> ThemeCatalogLimits {
+        self.limits
     }
 
     /// Resolve a built-in or parsed user theme, case-insensitively, without
@@ -1394,20 +1535,22 @@ impl ThemeCatalog {
         if let Some(scheme) = aterm_types::scheme::builtin(name) {
             return Ok(scheme);
         }
-        match self
-            .entries
-            .iter()
-            .find(|entry| entry.name.eq_ignore_ascii_case(name))
-        {
-            Some(ThemeAsset {
-                resolution: ThemeAssetResolution::Ready(scheme),
-                ..
-            }) => Ok(scheme.clone()),
-            Some(ThemeAsset {
-                source_id,
-                resolution: ThemeAssetResolution::Invalid(reason),
-                ..
-            }) => Err(format!("{} is invalid ({reason})", source_id)),
+        // Shadowed rows are unreachable (the built-in answered above) and an
+        // unreadable row's lossy name is not the file's, so neither resolves.
+        let found = self.entries.iter().find_map(|entry| {
+            if !entry.name.eq_ignore_ascii_case(name) {
+                return None;
+            }
+            match &entry.resolution {
+                ThemeAssetResolution::Ready(theme) => Some(Ok(theme.scheme.clone())),
+                ThemeAssetResolution::Invalid(reason) => {
+                    Some(Err(format!("{} is invalid ({reason})", entry.source_id)))
+                }
+                ThemeAssetResolution::Shadowed(_) | ThemeAssetResolution::Unreadable => None,
+            }
+        });
+        match found {
+            Some(resolved) => resolved,
             None if self.truncated => Err(
                 "no built-in or loaded custom theme by that name (the themes folder holds more \
                  files than aterm loads)"
@@ -1432,14 +1575,32 @@ impl ThemeCatalog {
 
 /// Canonicalize custom theme names case-insensitively, like built-ins. Names
 /// that collide by case (`Work.conf` vs `work.conf`) collapse to one invalid
-/// sentinel rather than letting directory order pick a palette.
-fn normalize_theme_entries(mut entries: Vec<ThemeAsset>) -> Vec<ThemeAsset> {
-    entries.sort_by(|left, right| {
-        left.name
-            .to_ascii_lowercase()
-            .cmp(&right.name.to_ascii_lowercase())
-            .then_with(|| left.name.cmp(&right.name))
+/// sentinel rather than letting directory order pick a palette. Shadowed and
+/// unreadable rows never resolve, so they keep one row per file and take no
+/// part in collisions.
+fn normalize_theme_entries(entries: Vec<ThemeAsset>) -> Vec<ThemeAsset> {
+    let (diagnostic, resolvable): (Vec<_>, Vec<_>) = entries.into_iter().partition(|entry| {
+        matches!(
+            entry.resolution,
+            ThemeAssetResolution::Shadowed(_) | ThemeAssetResolution::Unreadable
+        )
     });
+    let mut normalized = collapse_case_collisions(resolvable);
+    normalized.extend(diagnostic);
+    normalized.sort_by(theme_entry_order);
+    normalized
+}
+
+fn theme_entry_order(left: &ThemeAsset, right: &ThemeAsset) -> std::cmp::Ordering {
+    left.name
+        .to_ascii_lowercase()
+        .cmp(&right.name.to_ascii_lowercase())
+        .then_with(|| left.name.cmp(&right.name))
+        .then_with(|| left.source_id.cmp(&right.source_id))
+}
+
+fn collapse_case_collisions(mut entries: Vec<ThemeAsset>) -> Vec<ThemeAsset> {
+    entries.sort_by(theme_entry_order);
     let mut normalized = Vec::with_capacity(entries.len());
     while !entries.is_empty() {
         let end = entries[1..]
@@ -1477,6 +1638,33 @@ fn invalid_theme_asset(name: &str, source_id: &std::sync::Arc<str>, reason: &str
             MAX_THEME_REASON_BYTES,
         )),
     }
+}
+
+/// A diagnostic-only row (shadowed or unreadable): kept for listings, never
+/// resolved.
+fn diagnostic_theme_asset(
+    name: &str,
+    source_id: &std::sync::Arc<str>,
+    resolution: ThemeAssetResolution,
+) -> ThemeAsset {
+    let tag: &[u8] = match resolution {
+        ThemeAssetResolution::Shadowed(builtin) => builtin.as_bytes(),
+        _ => b"unreadable",
+    };
+    ThemeAsset {
+        name: name.to_string(),
+        source_id: std::sync::Arc::clone(source_id),
+        fingerprint: stable_asset_fingerprint(0x53, source_id.as_bytes(), 0, 0, tag),
+        resolution,
+    }
+}
+
+/// The built-in a file stem names (ASCII case-insensitive, `Default`
+/// included), spelled canonically: the same match `scheme::builtin` makes.
+fn builtin_theme_name(name: &str) -> Option<&'static str> {
+    aterm_types::scheme::builtin_names()
+        .into_iter()
+        .find(|builtin| builtin.eq_ignore_ascii_case(name))
 }
 
 fn safe_user_theme_name(name: &str) -> Result<(), &'static str> {
@@ -1658,10 +1846,36 @@ impl ConfigAssetCatalog {
     }
 }
 
+/// A loaded pack's own words, from its manifest: the `name` it gave (none
+/// where it gave none, so the list names it by its id) and its
+/// `description`, both trimmed and never empty.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TrailPackLabel {
+    pub(crate) name: Option<String>,
+    pub(crate) description: Option<String>,
+}
+
+impl TrailPackLabel {
+    /// The words `metadata` carries. The manifest compiler writes "Trail
+    /// Pack" for a manifest with no name, which is no name of its own.
+    fn from_metadata(metadata: &aterm_effects::trail_pack::TrailPackMetadata) -> Self {
+        let words = |text: &str| Some(text.trim().to_string()).filter(|text| !text.is_empty());
+        Self {
+            name: words(&metadata.name).filter(|name| name != "Trail Pack"),
+            description: metadata.description.as_deref().and_then(words),
+        }
+    }
+}
+
 impl TrailPackCatalog {
     #[cfg(test)]
     pub(crate) fn empty() -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self::default())
+    }
+
+    /// The manifest's words for the loaded pack `id`.
+    pub(crate) fn label(&self, id: &str) -> Option<&TrailPackLabel> {
+        self.labels.get(id)
     }
 
     pub(crate) fn get(&self, id: &str) -> Option<aterm_effects::cursor_glow::TrailParams> {
@@ -1746,6 +1960,7 @@ impl Default for TrailPackCatalog {
     fn default() -> Self {
         Self {
             packs: std::collections::HashMap::new(),
+            labels: std::collections::HashMap::new(),
             ids: Vec::new(),
             diagnostics: Vec::new(),
             resolved_style_raw: crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE.into(),
@@ -1782,6 +1997,7 @@ pub(crate) struct CursorGlowInputs {
 /// one specular sweep, then constant). Applies to emphasis, profanity and
 /// feline words when `sparkle_words.enabled` is on.
 #[derive(Default, Clone, PartialEq, serde::Deserialize)]
+#[cfg_attr(test, derive(Debug))]
 #[serde(default)]
 pub(crate) struct SparkleInkConfig {
     /// Emit ink at all. Default TRUE (under the master switch).
@@ -1800,6 +2016,7 @@ pub(crate) struct SparkleInkConfig {
 /// `[sparkle_words.emphasis]`: ink-only hype words. The built-in lexicon has
 /// none; `extra_words` populates it.
 #[derive(Default, Clone, PartialEq, serde::Deserialize)]
+#[cfg_attr(test, derive(Debug))]
 #[serde(default)]
 pub(crate) struct SparkleEmphasisConfig {
     /// Decorate emphasis words. Default TRUE (takes effect only when the master
@@ -1813,6 +2030,7 @@ pub(crate) struct SparkleEmphasisConfig {
 
 /// `[sparkle_words.profanity]` — the randomized, self-terminating sparkle.
 #[derive(Default, Clone, PartialEq, serde::Deserialize)]
+#[cfg_attr(test, derive(Debug))]
 #[serde(default)]
 pub(crate) struct SparkleProfanityConfig {
     /// Enable the non-feline Sparkle Words toy. Default true. Also gates
@@ -1854,6 +2072,7 @@ pub(crate) struct SparkleProfanityConfig {
 
 /// `[sparkle_words.feline]` — the Keyword Kitties product.
 #[derive(Default, Clone, PartialEq, serde::Deserialize)]
+#[cfg_attr(test, derive(Debug))]
 #[serde(default)]
 pub(crate) struct SparkleFelineConfig {
     /// Decorate cat/kitty words. Default TRUE (takes effect only when master on).
@@ -1888,6 +2107,7 @@ pub(crate) struct SparkleFelineConfig {
 /// input-path summon (typing `dog`/`puppy`/… after sustained typing); the
 /// screen scanner never draws it.
 #[derive(Default, Clone, PartialEq, serde::Deserialize)]
+#[cfg_attr(test, derive(Debug))]
 #[serde(default)]
 pub(crate) struct SparkleCanineConfig {
     /// Summon dogs for typed canine words. Default TRUE (takes effect only
@@ -1909,6 +2129,7 @@ pub(crate) struct SparkleCanineConfig {
 /// Config-file only. `enabled` sits under the `[sparkle_words] enabled` master
 /// and is independent of the other families.
 #[derive(Default, Clone, PartialEq, serde::Deserialize)]
+#[cfg_attr(test, derive(Debug))]
 #[serde(default)]
 pub(crate) struct SparkleTricksConfig {
     /// Let typed kitty commands move the pet and flash the word. Default TRUE
@@ -1925,6 +2146,7 @@ pub(crate) struct SparkleTricksConfig {
 /// absent key equals a default-valued one. Purely visual: the grid is never
 /// mutated.
 #[derive(Default, Clone, PartialEq, serde::Deserialize)]
+#[cfg_attr(test, derive(Debug))]
 #[serde(default)]
 pub(crate) struct MatrixRainConfig {
     /// Master switch. Absent ⇒ OFF (costume mode is opt-in).
@@ -1979,6 +2201,7 @@ pub(crate) struct MatrixRainConfig {
 /// ([`Config::presence_band_enabled`], [`Config::presence_rim_enabled`]). The
 /// toggles write the leaf keys through the serialized config lane.
 #[derive(Default, Clone, PartialEq, serde::Deserialize)]
+#[cfg_attr(test, derive(Debug))]
 #[serde(default)]
 pub(crate) struct PresenceConfig {
     /// The band row under the tab bar. Absent ⇒ shown (its fold law applies);
@@ -1997,6 +2220,7 @@ pub(crate) struct PresenceConfig {
 /// away, and it has one reader in `aterm-agent`. There is no fast-mode key:
 /// aterm draws no fast chip (Claude Code's own `↯` marks fast mode).
 #[derive(Default, Clone, PartialEq, serde::Deserialize)]
+#[cfg_attr(test, derive(Debug))]
 #[serde(default)]
 pub(crate) struct ClaudeFooterConfig {
     /// `Σ` — Claude's working time and the session's merged token totals in
@@ -2005,10 +2229,19 @@ pub(crate) struct ClaudeFooterConfig {
     /// have so many different model stats." `false` hides it; the limit wall
     /// (`⧗`) shows either way.
     pub(crate) usage: Option<bool>,
+    /// THE HARNESS CARD (`crate::claude_card`, design
+    /// `docs/DESIGN-harness-autopilot-2026-10-15.md` §3): the rainbow border,
+    /// kitty and `enhanced by aterm harness` line Claude Code's launch card
+    /// wears while the harness carries the session. ON BY DEFAULT (absent and
+    /// `true` are the same, [`Config::claude_footer_card`]); `false` leaves
+    /// the vendor's card bare. A GUI table's switch, like `usage`: `[harness]`
+    /// only takes power away.
+    pub(crate) card: Option<bool>,
 }
 
 /// The `[render]` table: how aterm repairs a displaced Claude Code tab.
 #[derive(Default, Clone, PartialEq, serde::Deserialize)]
+#[cfg_attr(test, derive(Debug))]
 #[serde(default)]
 pub(crate) struct RenderConfig {
     /// `repaint_nudge`: `"on"` (DEFAULT: aterm tells that one program its
@@ -2042,6 +2275,86 @@ pub(crate) struct HarnessPolicy {
     pub(crate) notes: Vec<String>,
 }
 
+/// THE `[ai]` TABLE AS THE WINDOW HOLDS IT (docs/DESIGN-ai-connections-
+/// 2026-10-16.md §6): this machine's table, read by
+/// [`aterm_agent::ai::config::read`] (the reader `aterm ai` uses: only `[ai]`
+/// keys interpreted, unusable values noted, invalid TOML read as defaults), and the fleet document it
+/// resolves over, read whole when the config is parsed. Part of [`Config`]'s
+/// `PartialEq`, so an edit of either is not deduped: the fleet document is a
+/// path feed ([`Config::path_feed_paths`]), and its edit re-posts the config.
+///
+/// The fleet document is the one `[ai] fleet` names, else `ai-fleet.toml`
+/// beside `aterm.toml` when it exists, as `aterm ai` finds it
+/// ([`aterm_agent::ai::config::load`]). Nothing here grants anything: the one
+/// grant, `reviewers`, has no Settings row.
+#[derive(Default, Clone, Debug, PartialEq)]
+pub(crate) struct AiPolicy {
+    /// This machine's `[ai]` table.
+    pub(crate) local: aterm_agent::ai::config::Local,
+    /// What the reader said about it, one line each.
+    pub(crate) notes: Vec<String>,
+    /// The fleet document's candidate path: explicitly named, else beside
+    /// `aterm.toml`. Retained while absent so the watcher sees it appear.
+    pub(crate) fleet_path: Option<std::path::PathBuf>,
+    /// The fleet document as read: admitted with its notes, or why it was
+    /// refused.
+    pub(crate) fleet: Option<Result<(aterm_agent::ai::config::Fleet, Vec<String>), String>>,
+}
+
+impl AiPolicy {
+    /// The table `text` — the whole `aterm.toml` — writes, over the fleet
+    /// document it names or the one beside the canonical `aterm.toml`.
+    pub(crate) fn read(text: &str) -> Self {
+        // A test reads no file beside the person's own `aterm.toml`: what its
+        // config says is all it gets ([`Self::read_beside`] takes a folder).
+        #[cfg(test)]
+        let beside: Option<std::path::PathBuf> = None;
+        #[cfg(not(test))]
+        let beside = config_path().and_then(|path| path.parent().map(std::path::Path::to_path_buf));
+        Self::read_beside(text, beside.as_deref())
+    }
+
+    /// [`Self::read`] with `aterm.toml`'s folder given: the fleet document is
+    /// `[ai] fleet`, else `ai-fleet.toml` in `dir` when it exists, read as
+    /// `aterm ai` reads it ([`aterm_agent::ai::config::load_fleet`]: at most
+    /// 64 KiB, a symbolic link followed, refused whole or admitted).
+    pub(crate) fn read_beside(text: &str, dir: Option<&std::path::Path>) -> Self {
+        use aterm_agent::ai::config;
+        let (local, notes) = config::read(text);
+        let fleet_path = local
+            .fleet
+            .clone()
+            .or_else(|| dir.map(|dir| dir.join(config::FLEET_FILE)));
+        let config_path = dir.map(|dir| dir.join("aterm.toml"));
+        let admitted_path = config::fleet_path(&local, config_path.as_deref());
+        let fleet = admitted_path.as_deref().map(config::load_fleet);
+        Self {
+            local,
+            notes,
+            fleet_path,
+            fleet,
+        }
+    }
+
+    /// Every choice, resolved: this machine's table over the fleet
+    /// document's row for it, its top level and the built-in defaults
+    /// ([`aterm_agent::ai::config::resolve`]).
+    pub(crate) fn settings(&self) -> aterm_agent::ai::config::Settings {
+        aterm_agent::ai::config::resolve(
+            &self.local,
+            self.fleet_path.as_deref(),
+            self.fleet.clone(),
+            self.notes.clone(),
+        )
+    }
+
+    /// Whether the window looks at the AI CLIs and says what needs a person
+    /// (`[ai] enabled`, on by default; never from a fleet document).
+    pub(crate) fn enabled(&self) -> bool {
+        self.local.enabled.unwrap_or(true)
+    }
+}
+
 impl HarnessPolicy {
     /// The policy `text` — the whole `aterm.toml` — writes.
     pub(crate) fn read(text: &str) -> Self {
@@ -2055,25 +2368,108 @@ impl HarnessPolicy {
         Self { policy, notes }
     }
 
-    /// The policy as Settings ▸ Harness shows it: `Automatic` at full-power
-    /// defaults, `Off` when the master switch is, else
-    /// `Automatic · limited: <key: value> · …`, plus `· yours: <key>, …` for
-    /// non-limiting changes. Classification is
-    /// `SupervisorConfig::against_default`'s; this only formats it.
+    /// The policy as Settings ▸ Harness says it aloud (the switch's spoken label
+    /// and the save's feedback): `Automatic` at full power, `Off: …` when the
+    /// master switch is, else what limits it in the words of the Harness rows
+    /// ("Approve permission boxes set to Safe") and, for limits only the file
+    /// holds, how many — Modified lists those keys. Never a TOML key or value,
+    /// and never a change that takes no power away (an answer text, the
+    /// question priority: its own row says Changed). Classification is
+    /// `SupervisorConfig::against_default`'s; this only words it.
     pub(crate) fn words(&self) -> String {
         if !self.policy.enabled {
             return "Off: no agent session is supervised".to_string();
         }
-        let written = self.policy.against_default();
-        let mut words = "Automatic".to_string();
-        if !written.limits.is_empty() {
-            words += &format!(" \u{b7} limited: {}", written.limits.join(" \u{b7} "));
+        let limits = self.limits();
+        if limits.is_empty() {
+            return "Automatic".to_string();
         }
-        if !written.own.is_empty() {
-            words += &format!(" \u{b7} yours: {}", written.own.join(", "));
+        let mut parts: Vec<String> = limits
+            .iter()
+            .filter_map(|limit| match limit {
+                HarnessLimit::Row { label, value } => Some(format!("{label} set to {value}")),
+                HarnessLimit::File => None,
+            })
+            .collect();
+        let in_file = file_limits(&limits);
+        if in_file > 0 {
+            parts.push(format!(
+                "{in_file} {} in aterm.toml",
+                if in_file == 1 { "setting" } else { "settings" }
+            ));
         }
-        words
+        format!("Automatic, limited by {}", parts.join("; "))
     }
+
+    /// How many of the limits only aterm.toml holds — no Settings row shows
+    /// them, so the master switch's row says "Limited in Manual" for them
+    /// (`native_settings::cross_field_constraints`), from the same reading
+    /// [`Self::words`] counts them by.
+    pub(crate) fn file_limits(&self) -> usize {
+        file_limits(&self.limits())
+    }
+
+    /// Each key that takes power away, by its Harness row where it has one
+    /// ([`harness_limit_row`]).
+    fn limits(&self) -> Vec<HarnessLimit> {
+        self.policy
+            .against_default()
+            .limits
+            .iter()
+            .map(|limit| {
+                harness_limit_row(limit).map_or(HarnessLimit::File, |(label, value)| {
+                    HarnessLimit::Row { label, value }
+                })
+            })
+            .collect()
+    }
+}
+
+/// One limit [`HarnessPolicy::words`] names.
+enum HarnessLimit {
+    /// A key with a Harness row: the row's label and the value as the row
+    /// shows it.
+    Row { label: &'static str, value: String },
+    /// A key only aterm.toml holds.
+    File,
+}
+
+/// How many of `limits` only the file holds.
+fn file_limits(limits: &[HarnessLimit]) -> usize {
+    limits
+        .iter()
+        .filter(|limit| matches!(limit, HarnessLimit::File))
+        .count()
+}
+
+/// The Harness row a limit `against_default` names (`approve: safe`,
+/// `autopilot: land`, `codex: off`) is set on — its label and the value as
+/// the row shows it — read from the one registry the rows are drawn from
+/// ([`crate::prefs::NESTED_LEAVES`]), so a row added there is a row here.
+/// An agent's limit is named by the agent (`codex: off`), its row by its
+/// table's key (`harness.codex.enabled`). A Bool row's limit is its Off; an
+/// Enum row's, the words its segment or picker shows for the value
+/// ([`crate::native_settings::setting_choice_label`]). `None`: a limit only
+/// aterm.toml holds.
+fn harness_limit_row(limit: &str) -> Option<(&'static str, String)> {
+    let (leaf, shown) = limit.split_once(": ")?;
+    let agent = format!("harness.{leaf}.enabled");
+    let key = if crate::prefs::agent_switch(&agent).is_some() {
+        agent
+    } else {
+        format!("harness.{leaf}")
+    };
+    let row = crate::prefs::NESTED_LEAVES
+        .iter()
+        .find(|row| row.key == key)?;
+    let value = match row.kind {
+        crate::prefs::EditKind::Bool => "Off".to_string(),
+        crate::prefs::EditKind::Enum { .. } => {
+            crate::native_settings::setting_choice_label(row.key, shown)
+        }
+        _ => return None,
+    };
+    Some((row.label, value))
 }
 
 /// The `[output_streak]` table (`docs/DESIGN-output-streak-2026-08-30.md`). On
@@ -2084,6 +2480,7 @@ impl HarnessPolicy {
 /// Additive light only: cells are never mutated, and `OVER_INK_COV_CAP` keeps
 /// text legible. `aterm_effects::output_streak` re-clamps every numeric value.
 #[derive(Default, Clone, PartialEq, serde::Deserialize)]
+#[cfg_attr(test, derive(Debug))]
 #[serde(default)]
 pub(crate) struct OutputStreakConfig {
     /// Master switch. Absent means on except on Windows (see
@@ -2115,7 +2512,7 @@ pub(crate) struct OutputStreakConfig {
 ///
 /// ```toml
 /// [packages]
-/// # enabled      = true    # Automatic updates — THE switch (default true)
+/// # enabled      = true    # Keep ALab tools up to date — THE switch (default true)
 /// # auto_install = true    # install the ALab toolset nobody named: the first-run
 /// #                        # fill and new members of the signed set (default TRUE,
 /// #                        # batteries included; uninstall/exclude/enabled=false win)
@@ -2126,9 +2523,10 @@ pub(crate) struct OutputStreakConfig {
 /// `seed_install` as `auto_install` when that is unset. `channel`/`include` are
 /// ignored; `prefix`, `account` and `owner/repo` links are development-only.
 #[derive(Default, Clone, PartialEq, serde::Deserialize)]
+#[cfg_attr(test, derive(Debug))]
 #[serde(default)]
 pub(crate) struct PackagesConfig {
-    /// Automatic updates — THE switch. Absent ⇒ ON.
+    /// Keep ALab tools up to date — THE switch. Absent ⇒ ON.
     pub(crate) enabled: Option<bool>,
     /// Legacy spelling of `enabled`: `auto_update = false` reads as off
     /// ([`Config::packages_enabled`]); Settings drops it when writing `enabled`.
@@ -2230,6 +2628,7 @@ impl PrivacyWarmup {
 /// `auto_accept` is parsed but unimplemented; setting it earns a
 /// `--validate-config` warning naming the grant that does work.
 #[derive(Default, Clone, PartialEq, serde::Deserialize)]
+#[cfg_attr(test, derive(Debug))]
 #[serde(default)]
 pub(crate) struct PrivacyConfig {
     /// Master for the consent lane. Absent means on. Off, every consent field
@@ -2298,6 +2697,7 @@ pub(crate) struct PrivacyConfig {
 /// refused, a missing Trust tool not replaced by upstream, a stub that cannot
 /// reach atpkg failing closed) (owner, 2026-09-08).
 #[derive(Default, Clone, PartialEq, serde::Deserialize)]
+#[cfg_attr(test, derive(Debug))]
 #[serde(default)]
 pub(crate) struct RerouteConfig {
     pub(crate) announce: Option<bool>,
@@ -2308,6 +2708,7 @@ pub(crate) struct RerouteConfig {
 /// this build's PTY keeper (`aterm keeper start`) so a launch after a crash
 /// reattaches its shells.
 #[derive(Default, Clone, PartialEq, serde::Deserialize)]
+#[cfg_attr(test, derive(Debug))]
 #[serde(default)]
 pub(crate) struct KeeperConfig {
     pub(crate) enabled: Option<bool>,
@@ -2328,6 +2729,7 @@ impl Config {
 /// `atpkg::config::MachineConfig` must resolve the same defaults
 /// (`machine_defaults_agree_across_the_two_config_readers`).
 #[derive(Default, Clone, PartialEq, serde::Deserialize)]
+#[cfg_attr(test, derive(Debug))]
 #[serde(default)]
 pub(crate) struct MachineConfig {
     /// `"off"` (default) writes `com.apple.universalcontrol Disable`/`DisableMagicEdges`
@@ -2359,6 +2761,7 @@ pub(crate) struct MachineConfig {
 /// persistent `aterm-network-drive.token` beside its `[net] key`; only when that
 /// file is unusable does the listener use a per-launch token printed at startup.
 #[derive(Default, Clone, PartialEq, serde::Deserialize)]
+#[cfg_attr(test, derive(Debug))]
 #[serde(default)]
 pub(crate) struct NetConfig {
     /// Inbound numeric `IP:port` for the TLS listener (`"0.0.0.0:7100"`,
@@ -2383,6 +2786,7 @@ pub(crate) struct NetConfig {
 /// closed session ([`crate::net_connections::dial_relay`]). Without them only
 /// the cert `fingerprint` is enforced.
 #[derive(Clone, PartialEq, serde::Deserialize)]
+#[cfg_attr(test, derive(Debug))]
 pub(crate) struct Connection {
     /// The name you `dial` (e.g. `"work-box"`). Unique within the registry.
     pub(crate) name: String,
@@ -2419,6 +2823,7 @@ pub(crate) struct Connection {
 /// `status hold_advisory=fabric-lost`; `hold_on_bridge_lost = true` instead
 /// holds each `reason=fabric-lost origin=fleet` before any relaunch.
 #[derive(Default, Clone, PartialEq, serde::Deserialize)]
+#[cfg_attr(test, derive(Debug))]
 #[serde(default)]
 pub(crate) struct FabricConfig {
     /// The bridge command line. Absent or blank ⇒ the fabric is off.
@@ -2439,6 +2844,7 @@ pub(crate) struct FabricConfig {
 /// thread, a WAL under the state root and a place in the self-update path
 /// (`docs/OPERATOR-EMBEDDED.md`). Read once, at launch.
 #[derive(Default, Clone, PartialEq, serde::Deserialize)]
+#[cfg_attr(test, derive(Debug))]
 #[serde(default)]
 pub(crate) struct OperatorConfig {
     /// Start the embedded operator. Absent ⇒ `false`.
@@ -2470,6 +2876,7 @@ impl Config {
 /// This only chooses the source. The pinned Team ID and Apple notarization
 /// anchor authenticity, so a repointed source cannot stage an untrusted bundle.
 #[derive(Default, Clone, PartialEq, serde::Deserialize)]
+#[cfg_attr(test, derive(Debug))]
 #[serde(default)]
 pub(crate) struct UpdateConfig {
     /// "Check for updates automatically" (Settings ▸ Software Update). Absent
@@ -2596,85 +3003,111 @@ pub(crate) fn search_index_depth(config: &Config) -> usize {
         .map_or(aterm_core::search::DEFAULT_MAX_CACHED_LINES, |n| n as usize)
 }
 
-/// Resolve a plain or appearance-split theme selector permissively: an
-/// unrecognized segment beside a valid `dark:`/`light:` side is ignored and an
-/// omitted side is Default. Shared by the renderer and Settings preview.
+/// What an unset `theme` means, written as the selector it equals: aterm's own
+/// look follows the OS, Default on a dark appearance and its pair Default
+/// Light on a light one, so a light-mode OS with no config gets a light
+/// terminal under its light window chrome. A value that names no theme at all
+/// (blank, or a split whose every segment is unusable) draws the same.
+pub(crate) const UNSET_THEME: &str = "dark:Default,light:Default Light";
+
+/// The built-in an unset (or nameless) `theme` draws for `appearance`:
+/// [`UNSET_THEME`]'s side.
+pub(crate) fn unset_theme_name(appearance: aterm_types::Appearance) -> &'static str {
+    match appearance {
+        aterm_types::Appearance::Dark => "Default",
+        aterm_types::Appearance::Light => "Default Light",
+    }
+}
+
+/// Resolve a plain or appearance-split theme selector permissively through
+/// the one grammar ([`aterm_types::scheme::ThemeSelector`]): a segment it cannot
+/// use is ignored (and reported by [`theme_selector_notice`]), and a side the
+/// value omits draws the named side's built-in pair, else the named side.
+/// Shared by the renderer and Settings preview.
 pub(crate) fn resolve_theme_name_value(
     raw: Option<&str>,
     appearance: aterm_types::Appearance,
 ) -> Option<String> {
-    let raw = raw?;
-    // A "split" is any comma-segment whose key (before ':') is dark|light.
-    let is_split = raw.split(',').any(|seg| {
-        seg.split_once(':').is_some_and(|(k, _)| {
-            matches!(k.trim().to_ascii_lowercase().as_str(), "dark" | "light")
-        })
-    });
-    if !is_split {
-        return Some(raw.trim().to_string());
+    let (selector, _) = aterm_types::scheme::ThemeSelector::parse(raw?);
+    selector.name_for(appearance).map(str::to_string)
+}
+
+/// The selector issues in a `theme` value, as one sentence that also says what
+/// each appearance draws instead; `None` when the value parses cleanly.
+pub(crate) fn theme_selector_notice(raw: Option<&str>) -> Option<String> {
+    use aterm_types::scheme::ThemeSelector;
+    let (selector, issues) = ThemeSelector::parse(raw?);
+    if issues.is_empty() {
+        return None;
     }
-    let want = match appearance {
-        aterm_types::Appearance::Light => "light",
-        aterm_types::Appearance::Dark => "dark",
+    let mut message = issues
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ");
+    // What a split draws for the side it leaves unset: the named side's
+    // built-in pair, else the named side. With no name at all, what an unset
+    // `theme` draws ([`UNSET_THEME`]).
+    let unset = |side| selector.name_for(side).map(str::to_string);
+    let follows_os = || {
+        format!(
+            "the unset default is used ({} in dark mode, {} in light mode)",
+            unset_theme_name(aterm_types::Appearance::Dark),
+            unset_theme_name(aterm_types::Appearance::Light),
+        )
     };
-    for seg in raw.split(',') {
-        if let Some((key, name)) = seg.split_once(':')
-            && key.trim().eq_ignore_ascii_case(want)
-            && !name.trim().is_empty()
-        {
-            return Some(name.trim().to_string());
+    let consequence = match (&selector, selector.name_for(aterm_types::Appearance::Dark)) {
+        (_, None) => Some(follows_os()),
+        (ThemeSelector::Split { dark: None, .. }, Some(_)) => {
+            unset(aterm_types::Appearance::Dark).map(|name| format!("dark mode uses {name:?}"))
         }
+        (ThemeSelector::Split { light: None, .. }, Some(_)) => {
+            unset(aterm_types::Appearance::Light).map(|name| format!("light mode uses {name:?}"))
+        }
+        _ => None,
+    };
+    if let Some(consequence) = consequence {
+        message.push_str("; ");
+        message.push_str(&consequence);
     }
-    None
+    Some(message)
 }
 
 impl Config {
     /// Parse `aterm.toml` text: the typed config plus the `[harness]` policy
-    /// ([`HarnessPolicy::read`]). Every load (launch and config service) goes
+    /// ([`HarnessPolicy::read`]) and the `[ai]` table with its fleet document
+    /// ([`AiPolicy::read`]). Every load (launch and config service) goes
     /// through here.
     pub(crate) fn parse(text: &str) -> Result<Self, aterm_toml::Error> {
         let mut config: Self = aterm_toml::from_str(text)?;
         config.harness = HarnessPolicy::read(text);
+        config.ai = AiPolicy::read(text);
         Ok(config)
     }
 
     /// Config used when `text` does not parse: all defaults, but `[harness]`
     /// lines still read (its reader is line-based), so a limit there survives a
-    /// typo elsewhere.
+    /// typo elsewhere. `[ai]`'s reader reads a file that is not TOML as an
+    /// empty table, with a note.
     pub(crate) fn stand_in(text: &str) -> Self {
         Self {
             harness: HarnessPolicy::read(text),
+            ai: AiPolicy::read(text),
             ..Self::default()
         }
     }
 
     /// Scheme name this config selects for `appearance`, honouring
     /// `theme = "dark:<name>,light:<name>"`. A plain value applies to both; an
-    /// omitted side is `None` (built-in Default). Prefixes are case- and
-    /// space-insensitive; the name keeps its case.
+    /// omitted side draws the named side's built-in pair, else the named side,
+    /// and `None` means no name at all (which draws [`unset_theme_name`]). Prefixes are case-
+    /// and space-insensitive; the name keeps its case.
     pub(crate) fn resolve_theme_name(&self, appearance: aterm_types::Appearance) -> Option<String> {
         resolve_theme_name_value(self.theme.as_deref(), appearance)
     }
 
-    /// Base color scheme for `appearance` (see [`Self::resolve_theme_name`]): the
-    /// named built-in, a user theme file of that name, or
-    /// [`aterm_types::ColorScheme::default`]. Callers layer the per-key color
-    /// overrides on top.
-    fn base_scheme_for_with_themes(
-        &self,
-        appearance: aterm_types::Appearance,
-        themes: &ThemeCatalog,
-    ) -> aterm_types::ColorScheme {
-        // Resolves silently (a bad name gives Default); [`theme_misses`] reports
-        // it against the same catalog.
-        match self.resolve_theme_name(appearance) {
-            None => aterm_types::ColorScheme::default(),
-            Some(name) => themes.resolve(&name).unwrap_or_default(),
-        }
-    }
-
-    /// The renderer theme (clear colour, cursor, selection): the scheme's chrome
-    /// ([`Self::base_scheme_for_with_themes`]) with per-key color overrides applied.
+    /// The renderer theme (clear colour, cursor, selection): the resolved
+    /// colours' chrome ([`Self::resolved_colors`]).
     #[cfg(test)]
     pub(crate) fn theme(&self) -> Theme {
         self.theme_for(aterm_types::Appearance::Dark)
@@ -2688,34 +3121,51 @@ impl Config {
     }
 
     /// Renderer theme resolved exclusively from the immutable custom-theme
-    /// catalog carried by the active config snapshot.
+    /// catalog carried by the active config snapshot: the projection of
+    /// [`Self::resolved_colors`].
     pub(crate) fn theme_for_with_assets(
         &self,
         appearance: aterm_types::Appearance,
         themes: &ThemeCatalog,
     ) -> Theme {
-        let tp = self
-            .base_scheme_for_with_themes(appearance, themes)
-            .to_theme_parts();
-        let mut t = Theme {
-            fg: tp.fg,
-            bg: tp.bg,
-            cursor: tp.cursor,
-            selection: tp.selection,
-        };
-        if let Some(c) = self.foreground.as_deref().and_then(parse_hex_color) {
-            t.fg = rgb_u32(c);
-        }
-        if let Some(c) = self.background.as_deref().and_then(parse_hex_color) {
-            t.bg = rgb_u32(c);
-        }
-        if let Some(c) = self.cursor_color.as_deref().and_then(parse_hex_color) {
-            t.cursor = rgb_u32(c);
-        }
-        if let Some(c) = self.selection_color.as_deref().and_then(parse_hex_color) {
-            t.selection = rgb_u32(c);
-        }
-        t
+        self.resolved_colors(appearance, themes, None).theme()
+    }
+
+    /// [`Self::theme_for_with_assets`] before the per-key color overrides
+    /// (`foreground`, `background`, `cursor_color`, `selection_color`): the
+    /// color theme alone, including the standing trial, which native pages
+    /// draw their palette from. `None` when no override is set, since then
+    /// the two are the same.
+    pub(crate) fn theme_before_color_overrides(
+        &self,
+        appearance: aterm_types::Appearance,
+        themes: &ThemeCatalog,
+        preview: Option<&str>,
+    ) -> Option<Theme> {
+        let overridden = [
+            &self.foreground,
+            &self.background,
+            &self.cursor_color,
+            &self.selection_color,
+        ]
+        .into_iter()
+        .any(|color| {
+            color
+                .as_deref()
+                .and_then(aterm_types::scheme::parse_hex)
+                .is_some()
+        });
+        overridden.then(|| {
+            // The same resolver with the four overrides left out.
+            let bare = Config {
+                foreground: None,
+                background: None,
+                cursor_color: None,
+                selection_color: None,
+                ..self.clone()
+            };
+            bare.resolved_colors(appearance, themes, preview).theme()
+        })
     }
 
     /// Whether Alt/Option sends ESC-prefixed (Meta) sequences. Default `true`,
@@ -2743,121 +3193,6 @@ impl Config {
     pub(crate) fn copy_on_select_or_default(&self) -> bool {
         self.copy_on_select
             .unwrap_or(cfg!(not(target_os = "linux")))
-    }
-
-    /// Master switch for generated live Activity. Default on; `false` or
-    /// `title_summary_provider = "off"` keeps Title/Description composition and
-    /// disables only the generated fallback.
-    pub(crate) fn descriptive_titles_or_default(&self) -> bool {
-        self.descriptive_titles.unwrap_or(true)
-    }
-
-    /// Resolved description provider. The built-in, entirely local summarizer
-    /// is the safe default.
-    pub(crate) fn title_summary_provider_or_default(&self) -> TitleSummaryProvider {
-        self.title_summary_provider.unwrap_or_default()
-    }
-
-    /// Resolved LLM model identifier. Blank values behave like an absent key so
-    /// the Settings text field cannot accidentally select an empty model name.
-    pub(crate) fn title_summary_model_or_default(&self) -> &str {
-        self.title_summary_model
-            .as_deref()
-            .map(str::trim)
-            .filter(|model| !model.is_empty())
-            .unwrap_or(DEFAULT_TITLE_SUMMARY_MODEL)
-    }
-
-    /// Explicit endpoint for the resolved provider. An absent Ollama value stays
-    /// `None` (the worker picks a private ephemeral endpoint); an
-    /// OpenAI-compatible provider fails closed without one. In-process and
-    /// disabled providers ignore it.
-    pub(crate) fn title_summary_endpoint_or_default(&self) -> Option<&str> {
-        let configured = self
-            .title_summary_endpoint
-            .as_deref()
-            .map(str::trim)
-            .filter(|endpoint| !endpoint.is_empty());
-        match self.title_summary_provider_or_default() {
-            TitleSummaryProvider::Ollama | TitleSummaryProvider::OpenAiCompatible => configured,
-            TitleSummaryProvider::Builtin | TitleSummaryProvider::Off => None,
-        }
-    }
-
-    /// Optional bearer-token file, with blank Settings values normalized away.
-    pub(crate) fn title_summary_token_file(&self) -> Option<&str> {
-        self.title_summary_token_file
-            .as_deref()
-            .map(str::trim)
-            .filter(|path| !path.is_empty())
-    }
-
-    /// Provider request timeout, bounded so a failed service cannot strand the
-    /// single summary worker indefinitely and an accidental zero is still useful.
-    pub(crate) fn title_summary_timeout_seconds_or_default(&self) -> u64 {
-        self.title_summary_timeout_seconds
-            .unwrap_or(DEFAULT_TITLE_SUMMARY_TIMEOUT_SECONDS)
-            .clamp(
-                MIN_TITLE_SUMMARY_TIMEOUT_SECONDS,
-                MAX_TITLE_SUMMARY_TIMEOUT_SECONDS,
-            )
-    }
-
-    /// Proxy policy for remote providers. Managed local Ollama overrides this
-    /// at the transport boundary and always connects directly.
-    pub(crate) fn title_summary_proxy_mode_or_default(&self) -> TitleSummaryProxyMode {
-        self.title_summary_proxy_mode.unwrap_or_default()
-    }
-
-    /// Optional additional CA bundle path, with blank Settings values removed.
-    pub(crate) fn title_summary_ca_file(&self) -> Option<&str> {
-        self.title_summary_ca_file
-            .as_deref()
-            .map(str::trim)
-            .filter(|path| !path.is_empty())
-    }
-
-    /// Refresh cadence in seconds, bounded so live descriptions neither hammer
-    /// a provider nor become effectively static after a mistyped value.
-    pub(crate) fn title_summary_interval_seconds_or_default(&self) -> u64 {
-        self.title_summary_interval_seconds
-            .unwrap_or(DEFAULT_TITLE_SUMMARY_INTERVAL_SECONDS)
-            .clamp(
-                MIN_TITLE_SUMMARY_INTERVAL_SECONDS,
-                MAX_TITLE_SUMMARY_INTERVAL_SECONDS,
-            )
-    }
-
-    /// Recent terminal lines made available to a summarizer, with a fixed
-    /// privacy/performance bound.
-    pub(crate) fn title_summary_context_lines_or_default(&self) -> usize {
-        self.title_summary_context_lines
-            .unwrap_or(DEFAULT_TITLE_SUMMARY_CONTEXT_LINES)
-            .clamp(
-                MIN_TITLE_SUMMARY_CONTEXT_LINES,
-                MAX_TITLE_SUMMARY_CONTEXT_LINES,
-            )
-    }
-
-    /// Whether recent output, rather than only title/process metadata, may be
-    /// included in description context. Default ON.
-    pub(crate) fn title_summary_include_output_or_default(&self) -> bool {
-        self.title_summary_include_output.unwrap_or(true)
-    }
-
-    /// Explicit privacy gate for remote or otherwise unattested providers.
-    pub(crate) fn title_summary_allow_remote_or_default(&self) -> bool {
-        self.title_summary_allow_remote.unwrap_or(false)
-    }
-
-    /// Resolved tab-label composition.
-    pub(crate) fn tab_title_format_or_default(&self) -> TitleFormat {
-        self.tab_title_format.unwrap_or_default()
-    }
-
-    /// Resolved native-window-title composition.
-    pub(crate) fn window_title_format_or_default(&self) -> TitleFormat {
-        self.window_title_format.unwrap_or_default()
     }
 
     /// Whether aterm primes detected coding agents on each fresh session spawn.
@@ -3000,11 +3335,18 @@ impl Config {
                 .unwrap_or(true)
     }
 
-    /// Whether `word` (a trick token as typed) is on
-    /// `[sparkle_words.tricks] ignore_words`. Both sides use the lexicon's fold
-    /// without elongation folding (`purr` does not cover `purrrrr`). Allocates
-    /// only when the list is non-empty; runs once per fire.
-    pub(crate) fn kitty_trick_ignored(&self, word: &str) -> bool {
+    /// Whether a fire is on `[sparkle_words.tricks] ignore_words`: its `word`
+    /// (the trick token as typed) or one of its `commands`. A name glued to
+    /// its command fires the whole run, and its command is the other half, so
+    /// `坐下` on the list holds back `猫咪坐下` too, and a listed name holds
+    /// back nothing. Both sides use the lexicon's fold without elongation
+    /// folding (`purr` does not cover `purrrrr`). Allocates only when the list
+    /// is non-empty; runs once per fire.
+    pub(crate) fn kitty_trick_ignored<'w>(
+        &self,
+        word: &str,
+        commands: impl IntoIterator<Item = &'w str>,
+    ) -> bool {
         let Some(ignore) = self
             .sparkle_words
             .as_ref()
@@ -3014,8 +3356,11 @@ impl Config {
         else {
             return false;
         };
-        let folded = aterm_lexicon::fold(word);
-        ignore.iter().any(|w| aterm_lexicon::fold(w) == folded)
+        let listed = |surface: &str| {
+            let folded = aterm_lexicon::fold(surface);
+            ignore.iter().any(|w| aterm_lexicon::fold(w) == folded)
+        };
+        listed(word) || commands.into_iter().filter(|c| *c != word).any(listed)
     }
 
     /// Secure keyboard entry (default off, like every security opt-in: it
@@ -3200,7 +3545,7 @@ impl Config {
     pub(crate) fn cursor_trail_color_u32(&self) -> Option<u32> {
         self.cursor_trail_color
             .as_deref()
-            .and_then(parse_hex_color)
+            .and_then(aterm_types::scheme::parse_hex)
             .map(rgb_u32)
     }
 
@@ -3235,7 +3580,7 @@ impl Config {
     pub(crate) fn active_tab_color_rgb(&self) -> Option<[u8; 3]> {
         self.active_tab_color
             .as_deref()
-            .and_then(parse_hex_color)
+            .and_then(aterm_types::scheme::parse_hex)
             .map(|c| [c.r, c.g, c.b])
     }
 
@@ -3243,7 +3588,7 @@ impl Config {
     pub(crate) fn cursor_trail_accent_u32(&self) -> Option<u32> {
         self.cursor_trail_accent
             .as_deref()
-            .and_then(parse_hex_color)
+            .and_then(aterm_types::scheme::parse_hex)
             .map(rgb_u32)
     }
 
@@ -3433,6 +3778,10 @@ impl Config {
                     }
                 };
                 let (metadata, params) = pack.into_parts();
+                loaded.labels.insert(
+                    metadata.id.clone(),
+                    TrailPackLabel::from_metadata(&metadata),
+                );
                 loaded.packs.insert(metadata.id, params);
             }
         }
@@ -3664,23 +4013,19 @@ impl Config {
     /// startup, before the event loop).
     #[cfg(test)]
     pub(crate) fn prepare_sparkle_runtime(&self) -> PreparedSparkleRuntime {
-        self.prepare_sparkle_runtime_with_fingerprint().0
+        self.prepare_sparkle_runtime_with_fingerprint(TrickVocabulary::compiled)
+            .0
     }
 
-    fn prepare_sparkle_runtime_with_fingerprint(&self) -> (PreparedSparkleRuntime, u64) {
+    fn prepare_sparkle_runtime_with_fingerprint(
+        &self,
+        tricks: fn(Vec<String>) -> TrickVocabulary,
+    ) -> (PreparedSparkleRuntime, u64) {
         let (parts, fingerprint) = self.sparkle_runtime_parts_with_fingerprint();
         let langs = self.sparkle_languages();
-        // The kitty-command vocabulary uses the same worker and `languages` as the
-        // word lexicon and is compiled whether or not a word engine resolved.
-        // Its data problems indicate bad embedded data, never user error.
-        let tricks = {
-            let refs: Vec<&str> = langs.iter().map(String::as_str).collect();
-            let tricks = aterm_lexicon::TrickLexicon::with_languages(&refs);
-            for conflict in tricks.conflicts() {
-                crate::logging::stderr_line!("aterm-gui: kitty commands vocabulary: {conflict}");
-            }
-            std::sync::Arc::new(tricks)
-        };
+        // The kitty-command vocabulary uses the same `languages` as the word
+        // lexicon and is compiled whether or not a word engine resolved.
+        let tricks = tricks(langs.clone());
         let resolved = parts.map(|(cfg, override_toml)| {
             let refs: Vec<&str> = langs.iter().map(String::as_str).collect();
             let lexicon = aterm_lexicon::Lexicon::with_languages_and_override(
@@ -3705,10 +4050,12 @@ impl Config {
     }
 
     /// Files this config names by path whose content is applied state: the
-    /// Sparkle lexicon and Toy Packs (unless `[sparkle_words]` is disabled) and
+    /// Sparkle lexicon and Toy Packs (unless `[sparkle_words]` is disabled),
     /// the Trail Packs, capped at [`MAX_ACTIVE_TOY_PACKS`] and expanded like the
-    /// loaders. The config watcher stats these beside `aterm.toml`;
-    /// [`PathFeedFps`] decides from the bytes whether anything changed.
+    /// loaders, and the AI fleet document ([`AiPolicy`]). The config watcher
+    /// stats these beside `aterm.toml`; [`PathFeedFps`] decides from the bytes
+    /// whether anything changed — and for the fleet document, which the parse
+    /// reads whole, `Config`'s own `PartialEq`.
     pub(crate) fn path_feed_paths(&self) -> Vec<std::path::PathBuf> {
         let mut paths = Vec::new();
         if let Some(sparkle) = self
@@ -3735,6 +4082,7 @@ impl Config {
                 .take(MAX_ACTIVE_TOY_PACKS)
                 .map(|path| sparkle_expand_tilde(path)),
         );
+        paths.extend(self.ai.fleet_path.clone());
         paths
     }
 
@@ -3744,8 +4092,9 @@ impl Config {
     /// built-in name, or one that is not a file stem, opens none), the custom
     /// kitty sprite, the wallpaper, and the path feeds
     /// ([`Self::path_feed_paths`]). At most `2 + 2 + 1 + 2 ×
-    /// MAX_ACTIVE_TOY_PACKS` paths. `main_entry` stamps them beside the file's
-    /// text before its early warm (`crate::WarmConfigRead`), so an edit to one
+    /// MAX_ACTIVE_TOY_PACKS + 1` paths (the last the AI fleet document).
+    /// `main_entry` stamps them beside the file's text before its early warm
+    /// (`crate::WarmConfigRead`), so an edit to one
     /// during the dial's hold is warmed again before any carried present.
     ///
     /// Not listed, on purpose:
@@ -3805,7 +4154,22 @@ impl Config {
     /// independent transactions; combining their two immutable results needs
     /// no filesystem-wide snapshot or stability assumption.
     pub(crate) fn prepare_path_feed_generation(&self) -> PreparedPathFeedGeneration {
-        let (sparkle, deco) = self.prepare_sparkle_runtime_with_fingerprint();
+        self.prepare_path_feed_generation_with(TrickVocabulary::compiled)
+    }
+
+    /// [`Self::prepare_path_feed_generation`] for the launch's config-runtime
+    /// worker, which the boot joins before the first window: identical, except
+    /// that the kitty-command vocabulary compiles on its own worker
+    /// ([`TrickVocabulary::compiling`]) instead of inside that join.
+    pub(crate) fn prepare_launch_path_feed_generation(&self) -> PreparedPathFeedGeneration {
+        self.prepare_path_feed_generation_with(TrickVocabulary::compiling)
+    }
+
+    fn prepare_path_feed_generation_with(
+        &self,
+        tricks: fn(Vec<String>) -> TrickVocabulary,
+    ) -> PreparedPathFeedGeneration {
+        let (sparkle, deco) = self.prepare_sparkle_runtime_with_fingerprint(tricks);
         let (trail_packs, trail) = self.resolve_trail_pack_catalog_with_fingerprint();
         PreparedPathFeedGeneration {
             sparkle,
@@ -3905,7 +4269,7 @@ impl Config {
             .palette
             .unwrap_or_default()
             .iter()
-            .filter_map(|s| parse_hex_color(s))
+            .filter_map(|s| aterm_types::scheme::parse_hex(s))
             .map(rgb_u32)
             .collect();
         // The explicit `[sparkle_words] reduced_motion` override; the OS Reduce
@@ -4096,36 +4460,22 @@ impl Config {
             .unwrap_or(true)
     }
 
-    /// The `[harness] enabled` RESOLVED bit (default TRUE): whether the
-    /// window supervises the agent sessions it hosts — the Settings ▸ Harness
-    /// row. It is the SUPERVISOR'S bit ([`Self::harness`], read by the
-    /// table's one reader), so the row and the supervisor cannot disagree:
-    /// absent is ON; an explicit off (`false`, `"no"`, `"off"`, `0`) — or one
-    /// filed under another table — is OFF; and a value that says neither
-    /// (`enabled = "maybe"`) is no setting and leaves it ON (owner ruling of
-    /// 2026-09-25: only an explicit setting takes power away).
-    pub(crate) fn harness_enabled(&self) -> bool {
-        self.harness.policy.enabled
+    /// The `[claude_footer] card` RESOLVED bit (default TRUE): whether Claude
+    /// Code's launch card wears the harness card while the harness carries the
+    /// session. See [`ClaudeFooterConfig::card`].
+    pub(crate) fn claude_footer_card(&self) -> bool {
+        self.claude_footer
+            .as_ref()
+            .and_then(|c| c.card)
+            .unwrap_or(true)
     }
 
-    /// Resolved `[harness] approve` level (`all`, `safe` or `none`; default
-    /// `all`), from the same reader as [`Self::harness_enabled`]. An off
-    /// spelling is `none`; a non-level value keeps `all` (owner, 2026-09-24).
-    pub(crate) fn harness_approve(&self) -> &'static str {
-        use aterm_agent::supervise::config::Approve;
-        match self.harness.policy.approve {
-            Approve::All => "all",
-            Approve::Safe => "safe",
-            Approve::None => "none",
-        }
-    }
-
-    /// Resolved `[harness] question_priority` (default `recommended`): answer
-    /// with the recommended option or by the `long-term` / `short-term` policy
-    /// text. From the same reader as [`Self::harness_enabled`]; an unreadable
-    /// value keeps the default and disables `answer_questions` (fail closed).
-    pub(crate) fn harness_question_priority(&self) -> aterm_agent::supervise::QuestionPriority {
-        self.harness.policy.question_priority
+    /// `[harness.<agent>] enabled` as the supervisor's reader took it: whether
+    /// `agent` is left out of its `off` list. The agent's own switch, apart
+    /// from the master switch (`SupervisorConfig::on_for` is both); default
+    /// on, and an off spelling or a misplaced `false` reads off.
+    pub(crate) fn harness_agent_enabled(&self, agent: aterm_phase::Program) -> bool {
+        !self.harness.policy.off.contains(&agent)
     }
 
     /// The `[harness]` reader's notes as config notices (`config harness.<key>:
@@ -4247,7 +4597,8 @@ impl Config {
     ///
     /// Names only: paths are resolved by
     /// `aterm_containment::consent::folder_paths`, because a protected path
-    /// literal here would raise a system modal (`tools/grep_guard.sh` B13).
+    /// literal here would raise a system modal (the census guard
+    /// `protected-folder`).
     /// Unknown names are kept for the validator and skipped by the resolver.
     pub(crate) fn privacy_warmup_folders(&self) -> Vec<String> {
         self.privacy
@@ -4328,11 +4679,13 @@ impl Config {
     /// result always carries `enabled: true` and host gating decides whether an
     /// engine exists.
     ///
-    /// `default_bg`/`theme_fg` are the live renderer theme (`0x00RR_GGBB`).
+    /// `default_bg`/`theme_fg`/`theme_accent` (its cursor) are the live renderer
+    /// theme (`0x00RR_GGBB`).
     pub(crate) fn matrix_rain_params(
         &self,
         default_bg: u32,
         theme_fg: u32,
+        theme_accent: u32,
     ) -> crate::matrix_rain::RainConfig {
         use crate::matrix_rain::{RAIN_ALPHA_CAP, RAIN_ALPHA_FLOOR, RainHue};
         let mr = self.matrix_rain.clone().unwrap_or_default();
@@ -4347,7 +4700,7 @@ impl Config {
             .map(|a| (a.min(u32::from(RAIN_ALPHA_CAP)) as u8).max(head_floor));
         let hue = match mr.hue.as_deref().map(str::trim) {
             Some(h) if h.eq_ignore_ascii_case("theme") => RainHue::Theme,
-            Some(h) if h.starts_with('#') => match parse_hex_color(h) {
+            Some(h) if h.starts_with('#') => match aterm_types::scheme::parse_hex(h) {
                 Some(c) => RainHue::Custom(rgb_u32(c)),
                 // Malformed hex fails CLOSED to the stock green — a typo must
                 // never abort the whole config load or invent a colour.
@@ -4382,6 +4735,7 @@ impl Config {
             seed: mr.seed.unwrap_or(0),
             default_bg: default_bg & 0x00FF_FFFF,
             theme_fg: theme_fg & 0x00FF_FFFF,
+            theme_accent: theme_accent & 0x00FF_FFFF,
         }
     }
 
@@ -4757,15 +5111,6 @@ impl Config {
         }
     }
 
-    /// Selected-text foreground as `0x00RRGGBB` when `selection_foreground`
-    /// parses; `None` uses the renderer's contrast-floor default.
-    pub(crate) fn selection_foreground_u32(&self) -> Option<u32> {
-        self.selection_foreground
-            .as_deref()
-            .and_then(parse_hex_color)
-            .map(rgb_u32)
-    }
-
     /// Whether the selection band dims while unfocused. Default off.
     pub(crate) fn selection_inactive_or_default(&self) -> bool {
         self.selection_inactive.unwrap_or(false)
@@ -4896,10 +5241,21 @@ impl Config {
                  loaded Trail Pack)",
                 default = crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE,
                 options = crate::prefs::CURSOR_TRAIL_STYLES.join("|"),
+                // A listed style first; else an alias, which loads as the
+                // style it names.
                 suggestion = crate::native_config_language::nearest_enum_value(
                     raw,
                     crate::prefs::CURSOR_TRAIL_STYLES
                 )
+                .or_else(|| {
+                    crate::native_config_language::nearest_enum_value(
+                        raw,
+                        &crate::prefs::CURSOR_TRAIL_STYLE_ALIASES
+                            .iter()
+                            .map(|(alias, _)| *alias)
+                            .collect::<Vec<_>>(),
+                    )
+                })
                 .map_or_else(String::new, |near| format!(" — did you mean {near:?}?")),
             )),
         }
@@ -5015,7 +5371,9 @@ pub(crate) struct RenderKnobs {
     pub(crate) line_height: f32,
     /// `minimum_contrast` → `Backend::set_minimum_contrast` (blit-time).
     pub(crate) minimum_contrast: f32,
-    /// `selection_foreground` → `Backend::set_selection_fg` (blit-time).
+    /// The resolved selected-text foreground (`selection_foreground` in
+    /// `aterm.toml`, else the theme's) → `Backend::set_selection_fg`
+    /// (blit-time).
     pub(crate) selection_fg: Option<u32>,
     /// `selection_inactive` → `Backend::set_selection_inactive`, folded with
     /// the live focus at the per-window present seam (`redraw_window`).
@@ -5053,14 +5411,19 @@ pub(crate) enum KnobChange {
 }
 
 impl RenderKnobs {
-    /// Resolve the knob values from a config (defaults are the byte-identical
-    /// pre-W5 renderer state).
-    pub(crate) fn from_config(cfg: &Config) -> Self {
+    /// Resolve the knob values from a config and the colours it resolves to
+    /// (defaults are the byte-identical pre-W5 renderer state). `colors`
+    /// supplies the selected-text foreground, so a theme file's
+    /// `selection_foreground` reaches the renderer as well as the engine.
+    pub(crate) fn from_config(
+        cfg: &Config,
+        colors: &crate::resolved_colors::ResolvedColors,
+    ) -> Self {
         Self {
             line_height: cfg.line_height_or_default(),
             // The effective floor: raised to WCAG AA while translucent.
             minimum_contrast: cfg.effective_minimum_contrast(),
-            selection_fg: cfg.selection_foreground_u32(),
+            selection_fg: colors.selection_fg().map(rgb_u32),
             selection_inactive: cfg.selection_inactive_or_default(),
             adjust_baseline: cfg.adjust_baseline_or_default(),
             adjust_underline: (
@@ -5155,7 +5518,13 @@ impl GlyphRasterKnobs {
 
 impl Default for RenderKnobs {
     fn default() -> Self {
-        Self::from_config(&Config::default())
+        let config = Config::default();
+        let colors = config.resolved_colors(
+            aterm_types::Appearance::Dark,
+            &ThemeCatalog::default(),
+            None,
+        );
+        Self::from_config(&config, &colors)
     }
 }
 
@@ -6239,52 +6608,15 @@ fn append_extra_words_entry(out: &mut String, class: &str, words: Option<&[Strin
     ));
 }
 
-/// Parse a `#RRGGBB` (or bare `RRGGBB`) hex colour; `None` on malformed input.
-pub(crate) fn parse_hex_color(s: &str) -> Option<Rgb> {
-    let h = s.trim();
-    let h = h.strip_prefix('#').unwrap_or(h);
-    if h.len() != 6 || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return None;
-    }
-    Some(Rgb::new(
-        u8::from_str_radix(&h[0..2], 16).ok()?,
-        u8::from_str_radix(&h[2..4], 16).ok()?,
-        u8::from_str_radix(&h[4..6], 16).ok()?,
-    ))
-}
-
 impl Config {
-    /// Engine `TerminalConfig` deltas this config implies, or `None` when
-    /// nothing engine-side is set; [`Self::terminal_config_for`] at the default
-    /// (Dark) appearance. Test-only.
-    #[cfg(test)]
-    pub(crate) fn terminal_config(&self) -> Option<aterm_core::config::TerminalConfig> {
-        self.terminal_config_for(aterm_types::Appearance::Dark)
-    }
-
-    /// [`Self::terminal_config`] resolved for a specific OS `appearance` — picks the
-    /// matching side of a `dark:…,light:…` split theme (see [`Self::resolve_theme_name`]).
-    #[cfg(test)]
-    pub(crate) fn terminal_config_for(
-        &self,
-        appearance: aterm_types::Appearance,
-    ) -> Option<aterm_core::config::TerminalConfig> {
-        self.terminal_config_for_with_assets(appearance, &ThemeCatalog::default())
-    }
-
-    /// Engine config resolved against the same parsed theme catalog carried by
-    /// the active config snapshot. This path cannot reopen a theme file.
-    pub(crate) fn terminal_config_for_with_assets(
-        &self,
-        appearance: aterm_types::Appearance,
-        themes: &ThemeCatalog,
-    ) -> Option<aterm_core::config::TerminalConfig> {
+    /// The engine config's non-colour keys (cursor shape, scrollback, BiDi,
+    /// width, faint, security opt-ins) over the engine defaults. Colours come
+    /// from [`Self::resolved_colors`] in [`Self::applied_terminal_config_from`].
+    pub(crate) fn engine_behaviour_config(&self) -> aterm_core::config::TerminalConfig {
         let mut tc = aterm_core::config::TerminalConfig::default();
-        let mut any = false;
         if let Some(n) = self.scrollback_lines {
             // 0 → unlimited (None); N → cap at N lines.
             tc.scrollback_limit = (n != 0).then_some(n);
-            any = true;
         }
         if self.cursor_style.is_some() || self.cursor_blink.is_some() {
             let blink = self.cursor_blink.unwrap_or(true);
@@ -6326,101 +6658,6 @@ impl Config {
                 }
             };
             tc.cursor_blink = blink;
-            any = true;
-        }
-        // A named theme seeds the engine fg/bg, cursor and ANSI palette; the
-        // per-key colors below override individual slots.
-        if self.resolve_theme_name(appearance).is_some() {
-            // A theme that is absent or invalid resolves to Default here in
-            // silence; [`theme_load_notices`] says so, once per launch or reload.
-            let s = self.base_scheme_for_with_themes(appearance, themes);
-            tc.default_foreground = s.foreground;
-            tc.default_background = s.background;
-            if let Some(cur) = s.cursor {
-                tc.cursor_color = Some(cur);
-            }
-            if let Some(sel) = s.selection {
-                tc.selection_background = Some(sel);
-            }
-            tc.custom_palette = Some(s.to_color_palette());
-            any = true;
-        }
-        // Theme colours → engine `default_*`/`cursor_color`. The engine resolves
-        // these into each `RenderCell.fg/bg`, so this is NOT a renderer change.
-        for (key, raw, slot) in [
-            ("foreground", &self.foreground, 0u8),
-            ("background", &self.background, 1),
-            ("cursor_color", &self.cursor_color, 2),
-        ] {
-            if let Some(s) = raw {
-                match parse_hex_color(s) {
-                    Some(rgb) => {
-                        match slot {
-                            0 => tc.default_foreground = rgb,
-                            1 => tc.default_background = rgb,
-                            _ => tc.cursor_color = Some(rgb),
-                        }
-                        any = true;
-                    }
-                    None => crate::logging::stderr_line!(
-                        "aterm-gui: config {key}: expected #RRGGBB, got {s:?}"
-                    ),
-                }
-            }
-        }
-        // Mirror the selection colour into the engine so OSC 21 queries report it.
-        if let Some(s) = &self.selection_color {
-            match parse_hex_color(s) {
-                Some(rgb) => {
-                    tc.selection_background = Some(rgb);
-                    any = true;
-                }
-                None => {
-                    crate::logging::stderr_line!(
-                        "aterm-gui: config selection_color: expected #RRGGBB, got {s:?}"
-                    )
-                }
-            }
-        }
-        // Selected-text foreground is OSC 19 state; mirror it so queries, 119,
-        // RIS and new sessions share the configured baseline.
-        if let Some(s) = &self.selection_foreground {
-            match parse_hex_color(s) {
-                Some(rgb) => {
-                    tc.selection_foreground = Some(rgb);
-                    any = true;
-                }
-                None => {
-                    crate::logging::stderr_line!(
-                        "aterm-gui: config selection_foreground: expected #RRGGBB, got {s:?}"
-                    )
-                }
-            }
-        }
-        // Indexed palette (engine `custom_palette`): explicit entries layer on
-        // top of the theme's ANSI palette, else start empty.
-        if let Some(entries) = &self.palette {
-            let mut pal = tc.custom_palette.take().unwrap_or_else(ColorPalette::new);
-            let mut ok = false;
-            for (i, hex) in entries.iter().take(256).enumerate() {
-                match parse_hex_color(hex) {
-                    Some(rgb) => {
-                        pal.set(i as u8, rgb);
-                        ok = true;
-                    }
-                    None => {
-                        crate::logging::stderr_line!(
-                            "aterm-gui: config palette[{i}]: expected #RRGGBB, got {hex:?}"
-                        )
-                    }
-                }
-            }
-            // Keep the (possibly theme-seeded) palette if any override landed OR a
-            // theme already populated it; else leave custom_palette unset (as before).
-            if ok || self.theme.is_some() {
-                tc.custom_palette = Some(pal);
-                any = true;
-            }
         }
         // BiDi mode (engine `BiDiConfig.mode`; applied by Terminal::apply_config).
         if let Some(b) = self.bidi.as_deref() {
@@ -6433,7 +6670,6 @@ impl Config {
                     "aterm-gui: config bidi: expected implicit|disabled|explicit, got {other:?}"
                 ),
             }
-            any = true;
         }
         // East-Asian Ambiguous width (engine `ambiguous_width_double`).
         if let Some(w) = self.ambiguous_width.as_deref() {
@@ -6444,45 +6680,31 @@ impl Config {
                     "aterm-gui: config ambiguous_width: expected narrow|wide, got {other:?}"
                 ),
             }
-            any = true;
         }
-        // Style-attribute policy (W5e/f): bold-to-bright promotion + faint
-        // opacity, resolved by the engine's color resolution into RenderCell.
-        if let Some(v) = self.bold_is_bright {
-            tc.bold_is_bright = v;
-            any = true;
-        }
+        // Faint opacity (W5f), resolved by the engine's color resolution into
+        // RenderCell; bold-to-bright rides with the colours.
         if self.faint_opacity.is_some() {
             tc.faint_opacity = self.faint_opacity_or_default();
-            any = true;
         }
         // Security opt-ins (all fail-closed by default in TerminalConfig). Only a
         // present key changes the flag, so omitting them keeps the safe default.
         if let Some(v) = self.allow_osc52_query {
             tc.allow_osc52_query = v;
-            any = true;
         }
         if let Some(v) = self.allow_window_ops {
             tc.allow_window_ops = v;
-            any = true;
         }
         if let Some(v) = self.allow_notifications {
             tc.allow_notifications = v;
-            any = true;
         }
         if let Some(v) = self.allow_palette_reconfigure {
             tc.allow_palette_reconfigure = v;
-            any = true;
         }
-        any.then_some(tc)
+        tc
     }
 
-    /// The engine [`TerminalConfig`] to apply: [`Self::terminal_config`] with the
-    /// default fg/bg pinned to the renderer [`Self::theme`].
-    ///
-    /// The engine's spec default background is black, but the window clears to
-    /// the theme background; pinning makes a default cell paint exactly the
-    /// window colour. `theme()` already folds in `foreground`/`background`.
+    /// The engine [`TerminalConfig`] to apply at the default (Dark)
+    /// appearance. Test-only.
     #[cfg(test)]
     pub(crate) fn applied_terminal_config(&self) -> aterm_core::config::TerminalConfig {
         self.applied_terminal_config_for(aterm_types::Appearance::Dark)
@@ -6499,28 +6721,17 @@ impl Config {
         self.applied_terminal_config_for_with_assets(appearance, &ThemeCatalog::default())
     }
 
-    /// Complete engine projection from an admitted, immutable theme catalog.
+    /// Complete engine projection from an admitted, immutable theme catalog:
+    /// [`Self::resolved_colors`] through [`Self::applied_terminal_config_from`].
+    /// Test-only: the App installs one resolution through
+    /// `App::install_colors`, which projects it once.
+    #[cfg(test)]
     pub(crate) fn applied_terminal_config_for_with_assets(
         &self,
         appearance: aterm_types::Appearance,
         themes: &ThemeCatalog,
     ) -> aterm_core::config::TerminalConfig {
-        let mut tc = self
-            .terminal_config_for_with_assets(appearance, themes)
-            .unwrap_or_default();
-        let theme = self.theme_for_with_assets(appearance, themes);
-        let rgb = |c: u32| {
-            Rgb::new(
-                ((c >> 16) & 0xff) as u8,
-                ((c >> 8) & 0xff) as u8,
-                (c & 0xff) as u8,
-            )
-        };
-        tc.default_foreground = rgb(theme.fg);
-        tc.default_background = rgb(theme.bg);
-        tc.cursor_color = Some(rgb(theme.cursor));
-        tc.selection_background = Some(rgb(theme.selection));
-        tc
+        self.applied_terminal_config_from(&self.resolved_colors(appearance, themes, None))
     }
 }
 
@@ -6778,11 +6989,22 @@ pub(crate) fn font_px_load_notice(config: &Config) -> Option<String> {
     ))
 }
 
+/// Everything about the configured `theme` the window cannot draw as written:
+/// the selector's grammar issues ([`theme_selector_notice`]) first, then
+/// [`theme_catalog_misses`]. The band carries them as [`theme_load_notices`], so a
+/// typo in a split side is said live like every other unavailable theme.
+pub(crate) fn theme_misses(config: &Config, themes: &ThemeCatalog) -> Vec<String> {
+    theme_selector_notice(config.theme.as_deref())
+        .into_iter()
+        .chain(theme_catalog_misses(config, themes))
+        .collect()
+}
+
 /// Each configured `theme` name the window cannot use against `themes`, and that it
 /// draws Default instead: one sentence per name, so a plain name missing from both
-/// appearances is said once. `--validate-config` and Manual print these words; the
-/// band carries them as [`theme_load_notices`].
-pub(crate) fn theme_misses(config: &Config, themes: &ThemeCatalog) -> Vec<String> {
+/// appearances is said once. `--validate-config` and Manual print these words
+/// (their selector issues come from the config-language checks instead).
+pub(crate) fn theme_catalog_misses(config: &Config, themes: &ThemeCatalog) -> Vec<String> {
     let mut misses = Vec::new();
     for appearance in [
         aterm_types::Appearance::Dark,
@@ -7331,15 +7553,9 @@ impl ReloadRenderSnapshot {
             }
         }
 
-        // Theme colours feed both the engine defaults and the renderer; re-derive
-        // the engine config from the hybrid config so both stay consistent.
-        let terminal_config = app
-            .config
-            .applied_terminal_config_for_with_assets(app.os_appearance, &app.config_assets.themes);
-        for session in app.pool.iter() {
-            term_lock(&session.term).apply_config(&terminal_config);
-        }
-        app.session_factory.terminal_config = Some(terminal_config);
+        // Theme colours feed both the engine defaults and the renderer; install
+        // the hybrid config's colours so both stay consistent.
+        app.install_resolved_colors(crate::app_colorscheme::ThemeChange::Rollback);
         app.sparkle_dirty = true;
         app.rain_dirty = true;
     }
@@ -7361,6 +7577,7 @@ fn restore_render_config_fields(target: &mut Config, previous: &Config) {
         cursor_color,
         selection_color,
         palette,
+        palette_overrides,
         theme,
         font_family,
         font_family_bold,
@@ -7472,7 +7689,7 @@ impl App {
         self.rain_dirty = false;
         let bg = self.theme.bg & 0x00FF_FFFF;
         let fg = self.theme.fg & 0x00FF_FFFF;
-        let cfg = self.config.matrix_rain_params(bg, fg);
+        let cfg = self.config.matrix_rain_params(bg, fg, self.theme.cursor);
         self.rain = Some(cfg);
         for (wid, ws) in self.windows.iter_mut() {
             if let Some(e) = ws.fx.rain_mut() {
@@ -8337,12 +8554,24 @@ impl App {
             Backend::Gpu(g) => g.set_theme(new_theme),
         }
         self.introspect_gpu.invalidate_present();
+        self.publish_theme_chrome();
+        // Also reached directly on OS appearance flips; refresh the font fork so
+        // dark-nudge and theme-dependent raster state keep up.
+        self.sync_chrome_fonts();
+    }
+
+    /// Push the installed [`Self::theme`] to the native chrome around every
+    /// window: the seamless titlebar colour, the Linux CSD variant, the native
+    /// toolbar strip's appearance, and each window's strip and raster caches.
+    /// Shared by [`Self::apply_theme_live`] and a config reload's backend
+    /// rebuild, which bakes the theme in itself.
+    fn publish_theme_chrome(&mut self) {
         // Linux CSD: the header's light/dark variant follows this theme under
         // `window_theme = auto`, so re-push it. macOS/Windows chrome already
         // tracks via `window_set_background_color` / DWM.
         #[cfg(target_os = "linux")]
         let linux_chrome_theme = self.chrome_theme_for_apprt();
-        let bg = new_theme.bg;
+        let bg = self.theme.bg;
         let apprt = &self.apprt;
         let toolbars = &self._toolbars;
         let strip_dark = crate::tab_bar::theme_is_dark(bg);
@@ -8362,9 +8591,6 @@ impl App {
                 crate::toolbar::set_active_tab_color(handle, self.config.active_tab_color_rgb());
             }
         }
-        // Also reached directly on OS appearance flips; refresh the font fork so
-        // dark-nudge and theme-dependent raster state keep up.
-        self.sync_chrome_fonts();
     }
 
     /// Handle `WindowEvent::ScaleFactorChanged`: re-derive the auto-scaled font
@@ -8593,21 +8819,9 @@ impl App {
         }
         self.theme_catalog_generation = self.theme_catalog_generation.saturating_add(1);
         self.publish_config_assets(std::sync::Arc::clone(&snapshot.assets));
-
-        let applied = self
-            .config
-            .applied_terminal_config_for_with_assets(self.os_appearance, &snapshot.assets.themes);
-        for session in self.pool.iter() {
-            term_lock(&session.term).apply_config(&applied);
-        }
-        self.session_factory.terminal_config = Some(applied);
-
-        let theme = self
-            .config
-            .theme_for_with_assets(self.os_appearance, &snapshot.assets.themes);
-        if !theme_eq(theme, self.theme) {
-            self.apply_theme_live(theme);
-        }
+        // A file nothing draws changes no projection, so it costs no session
+        // fan-out and no theme swap.
+        self.install_resolved_colors(crate::app_colorscheme::ThemeChange::CatalogReload);
         self.publish_native_config_snapshot(&snapshot);
 
         // A theme file arriving or leaving changes whether the configured theme
@@ -8862,6 +9076,7 @@ impl App {
             sparkle: prepared_sparkle,
             fonts: mut prepared_fonts,
             warnings: mut font_prepare_warnings,
+            font_refusals,
         } = generation;
         // The lane never writes the supervisor's policy: the watcher's read is its
         // one writer (`config_watcher::observed_harness`,
@@ -8910,6 +9125,7 @@ impl App {
             // starts from the current base.
             self.publish_config_assets(std::sync::Arc::clone(&config_snapshot.assets));
             self.publish_native_config_snapshot(&config_snapshot);
+            self.publish_settings_font_refusals(font_refusals);
             self.refresh_path_feeds(fresh_feeds);
             self.finish_native_config_external_admission(&admitted_baseline);
             // Text-derived diagnostics still run: a misspelled key leaves no trace
@@ -8950,7 +9166,6 @@ impl App {
             );
             return;
         }
-
         // Renderer construction is the one fallible step; snapshot its authority
         // first so only this slice rolls back if the font build fails.
         let reload_render_before = ReloadRenderSnapshot::capture(self);
@@ -8991,9 +9206,15 @@ impl App {
         // window's Claude Code panes show — an idle background window too,
         // which no other branch below repaints.
         let claude_footer_changed = self.config.claude_footer != config.claude_footer;
+        // `[ai]` or its fleet document moved: the AI CLIs are looked at again
+        // (or no longer), after the swap so the look reads the new table.
+        let ai_changed = self.config.ai != config.ai;
         self.config = config.clone();
         if claude_footer_changed {
             self.redraw_every_window();
+        }
+        if ai_changed {
+            self.ai_config_changed();
         }
         // Secure Keyboard Entry is PROCESS-level (Carbon secure input), so a
         // config commit records the wish here, once, beside the swap — not per
@@ -9034,9 +9255,12 @@ impl App {
         self.apply_serious_mode(config.serious_mode_or_default());
         self.publish_config_assets(std::sync::Arc::clone(&config_snapshot.assets));
         self.publish_native_config_snapshot(&config_snapshot);
-        // Smart-title settings apply live: revoke queued provider work and
-        // repaint tab/window composition.
-        self.reconfigure_title_summaries();
+        self.publish_settings_font_refusals(font_refusals);
+        // Tab chrome reads config live (the connection mark's opt-out among it), so
+        // rebuild and repaint every window's strip now rather than at its next
+        // unrelated refresh.
+        let windows: Vec<WindowId> = self.windows.keys().copied().collect();
+        self.refresh_tab_chrome_windows(windows);
         // Tab status policy is copied into each classifier at construction, so
         // push it to existing sessions and the event loop's wait deadline.
         self.reconfigure_session_status();
@@ -9064,11 +9288,6 @@ impl App {
         // Re-publish the Settings ▸ Packages projection (memory-only) so consent
         // changes show immediately.
         self.publish_native_packages_state();
-        // Palette authority changed: retire only a resident pet's contrast sample,
-        // keeping position, action and breed.
-        for ws in self.windows.values_mut() {
-            ws.fx.companion_mut().invalidate_colors();
-        }
         // A Sparkle Words reload retires word episodes and done marks but keeps
         // the cursor companion's placement and sprite caches.
         if sparkle_feed_changed {
@@ -9076,14 +9295,21 @@ impl App {
                 ws.fx.decos_mut().hard_reset_words();
             }
         }
-        let applied_tc = config.applied_terminal_config_for_with_assets(
+        // A changed config ends a theme preview (`theme preview`, a palette
+        // choice), the rolled-back half of a rejected rebuild included, except
+        // a Settings trial that still draws ([`ThemeChange::keeps_preview`]):
+        // that one stands in for `theme` here, so the reload installs once.
+        // `self.config` and the catalog are this generation's by now.
+        self.settle_theme_preview(crate::app_colorscheme::ThemeChange::ConfigReload);
+        // The colours this generation draws, resolved once: the renderer theme
+        // and knobs below and the engine install at the end all project it.
+        let colors = config.resolved_colors(
             self.os_appearance,
             &config_snapshot.assets.themes,
+            self.theme_preview
+                .as_ref()
+                .map(|preview| preview.id.as_str()),
         );
-        for s in self.pool.iter() {
-            term_lock(&s.term).apply_config(&applied_tc);
-        }
-        self.session_factory.terminal_config = Some(applied_tc);
         // `allow_kitty_file_transfer` is a session-factory setting; refresh it so
         // new tabs pick it up (existing sessions keep their spawn-time policy).
         self.session_factory.allow_kitty_file_transfer =
@@ -9218,7 +9444,38 @@ impl App {
         // Post warnings, one row per family. A fresh (possibly empty) set first
         // resolves every live `config.` row, so fixed issues clear; windows
         // repaint.
-        self.replace_config_messages_after_font_work(warns.into_messages(), family_admitted);
+        // A font Settings is showing says on its own row that it was not
+        // found, beside the status line, and a wallpaper that did not load
+        // says so on the Wallpaper page: the banner would repeat it and push
+        // the page down. The problem stays in Settings ▸ Messages. A hand
+        // edit made with no Settings in front still raises the banner, and so
+        // does a cursor sprite, which no Settings page shows.
+        let settings_in_front = self
+            .frontmost_window
+            .and_then(|wid| self.active_native_view(wid))
+            .is_some_and(|(instance, _)| {
+                self.native_runtime
+                    .app(instance)
+                    .is_some_and(|app| app.kind() == crate::native_app::AppKind::Settings)
+            });
+        let messages = warns
+            .into_messages()
+            .into_iter()
+            .map(|msg| {
+                let shown_in_settings = msg.key.as_deref().is_some_and(|key| {
+                    key == ConfigFamily::Fonts.key()
+                        || key == crate::message_reporters::KEY_FONT_FAMILY
+                        || (key == ConfigFamily::Assets.key()
+                            && config_snapshot.assets.kitty_sprite.diagnostic().is_none())
+                });
+                if settings_in_front && shown_in_settings {
+                    msg.record()
+                } else {
+                    msg
+                }
+            })
+            .collect::<Vec<_>>();
+        self.replace_config_messages_after_font_work(messages, family_admitted);
         self.option_as_meta = config.option_as_meta_or_default();
         self.confirm_multiline_paste = config.confirm_multiline_paste_or_default();
         // Copy-on-select applies from the next selection.
@@ -9243,8 +9500,8 @@ impl App {
         let new_window_theme = config.window_theme_or_default();
         if new_window_theme != self.window_theme {
             self.window_theme = new_window_theme;
-            // Chrome painters resolve from this field too (Linux
-            // `chrome_palette_theme`), and the strip row cache fingerprint has no
+            // Chrome painters resolve from this field too
+            // (`chrome_palette_theme`), and the strip row cache fingerprint has no
             // theme term, so drop it and the present caches as `apply_theme_live`
             // does. Native pages re-lower via the compile stamp.
             for ws in self.windows.values_mut() {
@@ -9367,8 +9624,7 @@ impl App {
 
         // Renderer theme, font size and family: rebuild only when something the
         // backend bakes in changed, so a comment edit costs nothing visible.
-        let new_theme =
-            config.theme_for_with_assets(self.os_appearance, &config_snapshot.assets.themes);
+        let new_theme = colors.theme();
         // Re-derive the auto font with the same HiDPI logic as attach and scale
         // changes, so an unrelated edit does not shrink it to the 12px base. An
         // explicit font is honored and re-pins `font_px_explicit`.
@@ -9404,7 +9660,7 @@ impl App {
         self.font_px_explicit =
             reload_font_pin(font_explicit_now, new_font_px, new_default_font_px);
         // The renderer bakes the theme in, so any change needs a backend rebuild.
-        let theme_changed = !theme_eq(new_theme, self.theme);
+        let theme_changed = new_theme != self.theme;
         let font_changed = (new_font_px - self.font_px).abs() >= 0.5;
         // Effective family keeps `--font` > config > platform default, via the
         // same `effective_font_family` as startup and `--show-config`. A rejected
@@ -9438,7 +9694,7 @@ impl App {
         // Renderer knobs: one KnobChange per changed key. `line_height` changes
         // cell geometry and takes the full rebuild path; the rest are
         // appearance-only pushes.
-        let new_knobs = RenderKnobs::from_config(&config);
+        let new_knobs = RenderKnobs::from_config(&config, &colors);
         let knob_changes = self.render_knobs.diff(&new_knobs);
         self.render_knobs = new_knobs;
         // Font config: update the source of truth before installing the
@@ -9495,6 +9751,9 @@ impl App {
                 }
             }
         }
+        // A rejected rebuild rolls the render config back and installs the
+        // colours of that config itself, so this generation's must not follow.
+        let mut rolled_back = false;
         if backend_rebuild_needed {
             self.theme = new_theme;
             self.font_family = effective_family;
@@ -9505,36 +9764,17 @@ impl App {
                 .finish_reload_render_transaction_with(reload_render_before, move |app| {
                     app.rebuild_backend_with_prepared(prepared)
                 });
+            rolled_back = !rebuild_succeeded;
             // Publish theme-dependent native chrome only after the fallible face
             // commit, so a rejected family cannot leave the titlebar out of step.
             if rebuild_succeeded && theme_changed {
-                let bg = self.theme.bg;
-                let apprt = &self.apprt;
-                let toolbars = &self._toolbars;
-                let strip_dark = crate::tab_bar::theme_is_dark(bg);
-                for (wid, ws) in self.windows.iter_mut() {
-                    ws.last_strip_fp = None;
-                    // Keep the seamless titlebar colour in step with the new
-                    // terminal bg (no-op off macOS).
-                    if let Some(w) = ws.os_window.as_ref() {
-                        apprt.window_set_background_color(w, bg);
-                    }
-                    // And the native toolbar strip's appearance with it (same rationale
-                    // as apply_theme_live): labels must contrast with the NEW backdrop.
-                    if let Some(handle) = toolbars.get(wid) {
-                        crate::toolbar::set_strip_dark(handle, strip_dark);
-                        crate::toolbar::set_active_tab_color(
-                            handle,
-                            self.config.active_tab_color_rgb(),
-                        );
-                    }
-                }
+                self.publish_theme_chrome();
             }
         } else if theme_changed {
-            // Colour-only edit: the face and atlas stay valid, so push the theme
-            // onto the live backend instead of a full rebuild. Shaping, typography
-            // and render knobs changed in the same save apply live here too;
-            // `apply_theme_live` handles cache invalidation.
+            // Colour-only edit: the face and atlas stay valid, so the theme goes
+            // onto the live backend (`install_colors` below, through
+            // `apply_theme_live`) instead of a full rebuild. Shaping, typography
+            // and render knobs changed in the same save apply live here first.
             self.font_family = effective_family;
             if shaping_changed {
                 self.backend.set_text_shaping(self.text_shaping.clone());
@@ -9553,7 +9793,6 @@ impl App {
             for &change in &knob_changes {
                 self.apply_render_knob(change);
             }
-            self.apply_theme_live(new_theme);
         } else if shaping_changed || typography_changed || !knob_changes.is_empty() {
             // Shaping/typography-only edit: push settings onto the live backend.
             // The setters drop shared atlas/glyph caches as needed; also drop each
@@ -9584,6 +9823,12 @@ impl App {
             if let Some(w) = self.front().and_then(|ws| ws.os_window.as_ref()) {
                 w.request_redraw();
             }
+        }
+        // The one theme-install path: engine palette and reported scheme on every
+        // session and the factory, a live theme swap when the chrome changed, and
+        // every colour-derived invalidation.
+        if !rolled_back {
+            self.install_colors(colors, crate::app_colorscheme::ThemeChange::ConfigReload);
         }
         // The live fast path skips `rebuild_backend`'s `sync_chrome_fonts`, so
         // refresh the font fork after every backend setter has landed.
@@ -9826,7 +10071,10 @@ copy_on_select = true
         let (variations, _) = candidate.font_variation_requests();
         app.font_variations = variations;
         app.font_weight_dark_nudge = candidate.font_weight_dark_nudge_or_default();
-        app.render_knobs = RenderKnobs::from_config(&candidate);
+        app.render_knobs = RenderKnobs::from_config(
+            &candidate,
+            &candidate.resolved_colors(app.os_appearance, &app.config_assets.themes, None),
+        );
         app.font_config = FontConfig::from_config(&candidate).0;
         app.refresh_all_window_metrics();
         assert_ne!(app.windows[&wid].metrics, old_metrics, "candidate is live");
@@ -9894,7 +10142,7 @@ copy_on_select = true
         assert_eq!(app.default_font_px, old_default_font_px);
         assert_eq!(app.font_px, old_font_px);
         assert_eq!(app.font_px_explicit, old_font_px_explicit);
-        assert!(super::theme_eq(app.theme, old_theme));
+        assert_eq!(app.theme, old_theme);
         assert_eq!(app.font_family, old_family);
         assert_eq!(app.text_shaping, old_shaping);
         assert_eq!(app.text_blending, old_blending);
@@ -9974,7 +10222,7 @@ copy_on_select = true
 }
 
 #[cfg(test)]
-mod descriptive_title_config_tests {
+mod config_policy_tests {
 
     /// With `cursor_trail = false`, a config save does not warm the effect
     /// pipelines (the only ones still reachable build within a frame).
@@ -9996,148 +10244,93 @@ mod descriptive_title_config_tests {
             "the warm rides the trail's own platform default, never its own opinion"
         );
     }
-    use super::{
-        Config, DEFAULT_TITLE_SUMMARY_MODEL, TitleFormat, TitleSummaryProvider,
-        TitleSummaryProxyMode,
-    };
+    use super::Config;
 
     fn cfg(source: &str) -> Config {
-        aterm_toml::from_str(source).expect("valid descriptive-title config")
+        aterm_toml::from_str(source).expect("valid config")
     }
 
+    /// SMART TITLES' KEYS STILL LOAD (the feature was retired on 2026-10-15). A
+    /// real `aterm.toml` that still sets every one of them — including two closed
+    /// enums whose values this `Config` no longer knows,
+    /// `title_summary_provider = "ollama"` and `tab_title_format = "description"`
+    /// — loads with every other setting intact, and each key is told, once, in
+    /// the retired-key family, that it does nothing. Refusing the file instead
+    /// would put the whole window on `Config::stand_in`: every other setting back
+    /// at its default.
     #[test]
-    fn descriptive_title_defaults_are_safe_and_useful() {
-        let config = Config::default();
-        assert!(config.descriptive_titles_or_default());
-        assert_eq!(
-            config.title_summary_provider_or_default(),
-            TitleSummaryProvider::Builtin
+    fn a_config_that_still_sets_smart_title_keys_loads_with_every_other_setting() {
+        const RETIRED: &[(&str, &str)] = &[
+            ("descriptive_titles", "true"),
+            ("title_summary_provider", "\"ollama\""),
+            ("title_summary_model", "\"qwen3.5:4b-q4_K_M\""),
+            (
+                "title_summary_endpoint",
+                "\"http://127.0.0.1:11434/api/chat\"",
+            ),
+            ("title_summary_token_file", "\"/tmp/aterm-summary-token\""),
+            ("title_summary_timeout_seconds", "42"),
+            ("title_summary_proxy_mode", "\"direct\""),
+            ("title_summary_ca_file", "\"/tmp/private-model-ca.pem\""),
+            ("title_summary_interval_seconds", "15"),
+            ("title_summary_context_lines", "24"),
+            ("title_summary_include_output", "false"),
+            ("title_summary_allow_remote", "true"),
+            ("tab_title_format", "\"description\""),
+            ("window_title_format", "\"description-title\""),
+        ];
+        let others = concat!(
+            "theme = \"Nord\"\n",
+            "font_px = 17.0\n",
+            "scrollback_lines = 4321\n",
+            "tab_status_badge = false\n",
+            "[harness]\n",
+            "limit_reset = true\n",
         );
-        assert_eq!(
-            config.title_summary_model_or_default(),
-            DEFAULT_TITLE_SUMMARY_MODEL
-        );
-        assert_eq!(
-            config.title_summary_endpoint_or_default(),
-            None,
-            "the in-process provider has no endpoint"
-        );
-        assert_eq!(config.title_summary_token_file(), None);
-        assert_eq!(config.title_summary_timeout_seconds_or_default(), 20);
-        assert_eq!(
-            config.title_summary_proxy_mode_or_default(),
-            TitleSummaryProxyMode::Environment
-        );
-        assert_eq!(config.title_summary_ca_file(), None);
-        assert_eq!(config.title_summary_interval_seconds_or_default(), 15);
-        assert_eq!(config.title_summary_context_lines_or_default(), 24);
-        assert!(config.title_summary_include_output_or_default());
-        assert!(!config.title_summary_allow_remote_or_default());
-        assert_eq!(
-            config.tab_title_format_or_default(),
-            TitleFormat::TitleDescription
-        );
-        assert_eq!(
-            config.window_title_format_or_default(),
-            TitleFormat::TitleDescription
-        );
-    }
+        // The retired keys are top-level, so they sit above the first table.
+        let retired: String = RETIRED
+            .iter()
+            .map(|(key, value)| format!("{key} = {value}\n"))
+            .collect();
+        let source = format!("{retired}{others}");
 
-    #[test]
-    fn every_descriptive_title_key_parses_and_resolves() {
-        let config = cfg(r#"
-descriptive_titles = false
-title_summary_provider = "openai-compatible"
-title_summary_model = "acme/terminal-summarizer"
-title_summary_endpoint = "https://llm.example.test/v1/chat/completions"
-title_summary_token_file = "/tmp/aterm-summary-token"
-title_summary_timeout_seconds = 42
-title_summary_proxy_mode = "direct"
-title_summary_ca_file = "/tmp/private-model-ca.pem"
-title_summary_interval_seconds = 42
-title_summary_context_lines = 36
-title_summary_include_output = false
-title_summary_allow_remote = true
-tab_title_format = "description-title"
-window_title_format = "description"
-"#);
-        assert!(!config.descriptive_titles_or_default());
-        assert_eq!(
-            config.title_summary_provider_or_default(),
-            TitleSummaryProvider::OpenAiCompatible
+        let loaded = Config::parse(&source).expect("retired keys never fail the file");
+        let baseline = Config::parse(others).expect("the other settings parse alone");
+        assert!(
+            loaded == baseline,
+            "every other setting loads exactly as it would without the retired keys"
         );
-        assert_eq!(
-            config.title_summary_model_or_default(),
-            "acme/terminal-summarizer"
+        assert!(
+            loaded != Config::stand_in(&source),
+            "the file is not replaced by the stand-in defaults"
         );
-        assert_eq!(
-            config.title_summary_endpoint_or_default(),
-            Some("https://llm.example.test/v1/chat/completions")
-        );
-        assert_eq!(
-            config.title_summary_token_file(),
-            Some("/tmp/aterm-summary-token")
-        );
-        assert_eq!(config.title_summary_timeout_seconds_or_default(), 42);
-        assert_eq!(
-            config.title_summary_proxy_mode_or_default(),
-            TitleSummaryProxyMode::Direct
-        );
-        assert_eq!(
-            config.title_summary_ca_file(),
-            Some("/tmp/private-model-ca.pem")
-        );
-        assert_eq!(config.title_summary_interval_seconds_or_default(), 42);
-        assert_eq!(config.title_summary_context_lines_or_default(), 36);
-        assert!(!config.title_summary_include_output_or_default());
-        assert!(config.title_summary_allow_remote_or_default());
-        assert_eq!(
-            config.tab_title_format_or_default(),
-            TitleFormat::DescriptionTitle
-        );
-        assert_eq!(
-            config.window_title_format_or_default(),
-            TitleFormat::Description
-        );
-    }
+        assert_eq!(loaded.theme.as_deref(), Some("Nord"));
+        assert_eq!(loaded.font_px, Some(17.0));
+        assert_eq!(loaded.scrollback_lines, Some(4321));
+        assert_eq!(loaded.tab_status_badge, Some(false));
 
-    #[test]
-    fn providers_have_closed_tokens_and_provider_aware_endpoints() {
-        for (token, expected) in [
-            ("builtin", TitleSummaryProvider::Builtin),
-            ("ollama", TitleSummaryProvider::Ollama),
-            ("openai-compatible", TitleSummaryProvider::OpenAiCompatible),
-            ("off", TitleSummaryProvider::Off),
-        ] {
-            let config = cfg(&format!("title_summary_provider = \"{token}\""));
-            assert_eq!(config.title_summary_provider_or_default(), expected);
-            assert_eq!(expected.as_str(), token);
+        // The notice: one retired-key line per key, in source order, and none
+        // of them in the ignored ("unknown to this build") family or among the
+        // values a reader could not use.
+        let warnings = crate::native_config_language::key_warnings(&source);
+        assert!(warnings.ignored.is_empty(), "{:?}", warnings.ignored);
+        assert_eq!(
+            warnings.retired.len(),
+            RETIRED.len(),
+            "{:?}",
+            warnings.retired
+        );
+        for ((line, (key, _)), number) in warnings.retired.iter().zip(RETIRED).zip(1..) {
+            assert_eq!(
+                line,
+                &format!(
+                    "line {number}: {key} does nothing: Smart Titles was removed; safe to delete"
+                )
+            );
         }
-        assert!(aterm_toml::from_str::<Config>("title_summary_provider = \"remote\"").is_err());
-
-        assert_eq!(
-            cfg("title_summary_provider = \"ollama\"").title_summary_endpoint_or_default(),
-            None,
-            "absent Ollama endpoint is selected privately at runtime"
-        );
-        assert_eq!(
-            cfg("title_summary_provider = \"ollama\"\n\
-                 title_summary_endpoint = \"  http://localhost:9999/chat  \"")
-            .title_summary_endpoint_or_default(),
-            Some("http://localhost:9999/chat")
-        );
-        assert_eq!(
-            cfg("title_summary_provider = \"openai-compatible\"")
-                .title_summary_endpoint_or_default(),
-            None,
-            "OpenAI-compatible endpoints are explicit"
-        );
-        assert_eq!(
-            cfg("title_summary_provider = \"builtin\"\n\
-                 title_summary_endpoint = \"https://stale.example.test/chat\"")
-            .title_summary_endpoint_or_default(),
-            None,
-            "non-network providers ignore stale endpoint settings"
+        assert!(
+            super::unaccepted_value_notices(&source, &[]).is_empty(),
+            "a retired key's value is never reported as a value its reader rejects"
         );
     }
 
@@ -10208,90 +10401,14 @@ window_title_format = "description"
             );
         }
     }
-
-    #[test]
-    fn title_formats_have_closed_canonical_tokens() {
-        for (token, expected) in [
-            ("title", TitleFormat::Title),
-            ("description", TitleFormat::Description),
-            ("title-description", TitleFormat::TitleDescription),
-            ("description-title", TitleFormat::DescriptionTitle),
-        ] {
-            let config = cfg(&format!("tab_title_format = \"{token}\""));
-            assert_eq!(config.tab_title_format_or_default(), expected);
-            assert_eq!(expected.as_str(), token);
-        }
-        assert!(aterm_toml::from_str::<Config>("tab_title_format = \"title_only\"").is_err());
-        assert!(aterm_toml::from_str::<Config>("window_title_format = \"both\"").is_err());
-    }
-
-    #[test]
-    fn title_summary_proxy_modes_have_closed_canonical_tokens() {
-        for (token, expected) in [
-            ("environment", TitleSummaryProxyMode::Environment),
-            ("direct", TitleSummaryProxyMode::Direct),
-        ] {
-            let config = cfg(&format!("title_summary_proxy_mode = \"{token}\""));
-            assert_eq!(config.title_summary_proxy_mode_or_default(), expected);
-            assert_eq!(expected.as_str(), token);
-        }
-        assert!(
-            aterm_toml::from_str::<Config>("title_summary_proxy_mode = \"automatic\"").is_err()
-        );
-    }
-
-    #[test]
-    fn numeric_bounds_and_blank_text_values_are_normalized() {
-        assert_eq!(
-            cfg("title_summary_interval_seconds = 0").title_summary_interval_seconds_or_default(),
-            5
-        );
-        assert_eq!(
-            cfg("title_summary_interval_seconds = 999").title_summary_interval_seconds_or_default(),
-            300
-        );
-        assert_eq!(
-            cfg("title_summary_context_lines = 0").title_summary_context_lines_or_default(),
-            4
-        );
-        assert_eq!(
-            cfg("title_summary_context_lines = 999").title_summary_context_lines_or_default(),
-            80
-        );
-        assert_eq!(
-            cfg("title_summary_timeout_seconds = 0").title_summary_timeout_seconds_or_default(),
-            1
-        );
-        assert_eq!(
-            cfg("title_summary_timeout_seconds = 999").title_summary_timeout_seconds_or_default(),
-            120
-        );
-
-        let blank = cfg("title_summary_provider = \"ollama\"\n\
-             title_summary_model = \"   \"\n\
-             title_summary_endpoint = \"   \"\n\
-             title_summary_token_file = \"   \"\n\
-             title_summary_ca_file = \"   \"");
-        assert_eq!(
-            blank.title_summary_model_or_default(),
-            DEFAULT_TITLE_SUMMARY_MODEL
-        );
-        assert_eq!(
-            blank.title_summary_endpoint_or_default(),
-            None,
-            "blank Ollama endpoint remains automatic"
-        );
-        assert_eq!(blank.title_summary_token_file(), None);
-        assert_eq!(blank.title_summary_ca_file(), None);
-    }
 }
 
 #[cfg(test)]
 mod cfg_engine_tests {
     use super::{
-        Config, KittySpriteAsset, MAX_KITTY_SPRITE_FILE_BYTES, MAX_USER_THEME_FILE_BYTES,
-        MAX_USER_THEME_FILES, ThemeCatalog, TrailPackCatalog, ignored_key_notices,
-        unaccepted_value_notices,
+        Config, KittySpriteAsset, MAX_KITTY_SPRITE_FILE_BYTES, MAX_USER_THEME_DIRECTORY_ENTRIES,
+        MAX_USER_THEME_FILE_BYTES, MAX_USER_THEME_FILES, ThemeCatalog, ThemeCatalogLimits,
+        ThemeEntryStatus, TrailPackCatalog, ignored_key_notices, unaccepted_value_notices,
     };
     #[cfg(unix)]
     use super::{ThemeCatalogWatchError, read_bounded_theme_file};
@@ -10414,8 +10531,238 @@ mod cfg_engine_tests {
         assert!(names.windows(2).all(|pair| pair[0] < pair[1]));
         assert_eq!(names[0], "Theme-000");
         assert_eq!(names[MAX_USER_THEME_FILES - 1], "Theme-127");
-        assert!(catalog.truncated);
+        assert!(catalog.truncated());
         assert_ne!(catalog.fingerprint(), 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A user file's `name =` is its display name while the file stem stays
+    /// the id `resolve()` and `meta()` key on; description and author ride
+    /// along, an omitted `appearance` is measured from the background, and a
+    /// defect is a warning, not a refusal.
+    #[test]
+    fn theme_catalog_meta_shows_name_and_keys_on_the_stem() {
+        use aterm_types::Appearance;
+        use aterm_types::scheme::{AppearanceSource, ThemeWarning};
+        let dir = theme_fixture_dir("meta");
+        std::fs::write(
+            dir.join("studio.conf"),
+            "name = Studio Night\ndescription = deep navy\nauthor = Jo\n\
+             foreground = #c0caf5\nbackground = #1a1b26\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("paper.conf"),
+            "foreground = #202020\nbackground = #fafafa\ncolor7 = #fafafa\n",
+        )
+        .unwrap();
+        let catalog = ThemeCatalog::discover_in(&dir);
+        assert_eq!(
+            catalog.ready_names().collect::<Vec<_>>(),
+            ["paper", "studio"]
+        );
+
+        let studio = catalog.meta("STUDIO").expect("the stem is the id");
+        assert_eq!(studio.display_name, "Studio Night");
+        assert_eq!(studio.description.as_deref(), Some("deep navy"));
+        assert_eq!(studio.author.as_deref(), Some("Jo"));
+        assert_eq!(studio.appearance, Appearance::Dark);
+        assert_eq!(studio.appearance_source, AppearanceSource::Measured);
+        assert!(studio.warnings.is_empty(), "{:?}", studio.warnings);
+        assert!(catalog.resolve("studio").is_ok());
+        // Negative control: the display name is not an id.
+        assert!(catalog.resolve("Studio Night").is_err());
+        assert_eq!(catalog.meta("Studio Night"), None);
+
+        // No `appearance` and a light background: Light, not a silent Dark,
+        // in the meta and in the scheme the renderer gets.
+        let paper = catalog.meta("paper").expect("paper loaded");
+        assert_eq!(paper.display_name, "paper");
+        assert_eq!(paper.appearance, Appearance::Light);
+        assert_eq!(
+            catalog.resolve("paper").unwrap().appearance,
+            Appearance::Light
+        );
+        assert_eq!(
+            paper.warnings,
+            vec![ThemeWarning::AnsiMatchesBackground { slot: 7 }]
+        );
+        assert_eq!(
+            catalog
+                .ready_themes()
+                .map(|(id, meta)| (id, meta.display_name.as_str()))
+                .collect::<Vec<_>>(),
+            [("paper", "paper"), ("studio", "Studio Night")]
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Built-in law: every built-in's declared appearance is what the one
+    /// dark/light classifier measures its background as, and its meta is its
+    /// identity row (the catalog answers built-ins first).
+    #[test]
+    fn theme_catalog_builtin_meta_matches_the_classifier() {
+        use super::measured_appearance;
+        let catalog = ThemeCatalog::empty();
+        for theme in aterm_types::scheme::builtin_theme_list() {
+            let scheme = aterm_types::scheme::builtin(theme.name).expect("listed");
+            assert_eq!(
+                measured_appearance(scheme.background),
+                theme.appearance,
+                "{}",
+                theme.name
+            );
+            let meta = catalog.meta(theme.name).expect("a built-in has meta");
+            assert_eq!(meta.display_name, theme.name);
+            assert_eq!(meta.pair.as_deref(), theme.pair);
+            assert_eq!(meta.description.as_deref(), Some(theme.description));
+        }
+        assert_eq!(catalog.meta("no such theme"), None);
+    }
+
+    /// A file named like a built-in (any ASCII case, `Default` included)
+    /// gets a Shadowed row naming the built-in, never reaches the picker, and
+    /// cannot change what the name resolves to. Negative control: a file with
+    /// its own name is Ready.
+    #[test]
+    fn theme_catalog_lists_a_file_shadowing_a_builtin() {
+        for (file, row, builtin) in [
+            ("Nord", "Nord", "Nord"),
+            ("nord", "nord", "Nord"),
+            ("default", "default", "Default"),
+        ] {
+            let dir = theme_fixture_dir("shadow");
+            write_theme(&dir.join(format!("{file}.conf")), "#010203", "#fefdfc");
+            write_theme(&dir.join("Work.conf"), "#ddeeff", "#102030");
+            let catalog = ThemeCatalog::discover_in(&dir);
+            let listing = catalog.listing().collect::<Vec<_>>();
+            assert!(
+                listing.contains(&(row, ThemeEntryStatus::Shadowed(builtin))),
+                "{file}: {listing:?}"
+            );
+            assert!(listing.contains(&("Work", ThemeEntryStatus::Ready)));
+            assert_eq!(catalog.ready_names().collect::<Vec<_>>(), ["Work"]);
+            assert_eq!(
+                catalog.resolve(file).unwrap(),
+                aterm_types::scheme::builtin(builtin).unwrap(),
+                "the built-in still wins for {file}"
+            );
+            assert!(
+                ThemeEntryStatus::Shadowed(builtin)
+                    .reason()
+                    .is_some_and(|reason| reason.contains(builtin))
+            );
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// Both `Nord.conf` and `nord.conf` shadow the same built-in; on a
+    /// case-sensitive volume each keeps its own row instead of collapsing
+    /// into a case-collision sentinel, and `Nord` still resolves to the
+    /// built-in.
+    #[test]
+    fn theme_catalog_keeps_a_row_per_case_variant_shadowing_a_builtin() {
+        let dir = theme_fixture_dir("shadow-twins");
+        write_theme(&dir.join("Nord.conf"), "#010203", "#fefdfc");
+        write_theme(&dir.join("nord.conf"), "#030201", "#fcfdfe");
+        let files = std::fs::read_dir(&dir).unwrap().count();
+        let catalog = ThemeCatalog::discover_in(&dir);
+        let listing = catalog.listing().collect::<Vec<_>>();
+        assert_eq!(listing.len(), files, "{listing:?}");
+        assert!(
+            listing
+                .iter()
+                .all(|(_, status)| *status == ThemeEntryStatus::Shadowed("Nord")),
+            "{listing:?}"
+        );
+        assert_eq!(
+            catalog.resolve("Nord").unwrap(),
+            aterm_types::scheme::builtin("Nord").unwrap()
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The file cap counts files that are read, so files filtered out by
+    /// name (shadowing, unsafe) cannot push valid themes out. Negative
+    /// control: one more readable file trips the cap and marks truncation.
+    #[test]
+    fn theme_catalog_caps_files_after_the_name_filters() {
+        let dir = theme_fixture_dir("cap-after-filter");
+        write_theme(&dir.join("Nord.conf"), "#010203", "#fefdfc");
+        write_theme(&dir.join("Dracula.conf"), "#010203", "#fefdfc");
+        for index in 0..MAX_USER_THEME_FILES {
+            write_theme(
+                &dir.join(format!("Theme-{index:03}.conf")),
+                "#ddeeff",
+                "#102030",
+            );
+        }
+        let catalog = ThemeCatalog::discover_in(&dir);
+        assert_eq!(catalog.ready_names().count(), MAX_USER_THEME_FILES);
+        assert!(!catalog.truncated());
+        assert_eq!(
+            catalog.limits(),
+            ThemeCatalogLimits {
+                seen: MAX_USER_THEME_FILES + 2,
+                kept: MAX_USER_THEME_FILES,
+            }
+        );
+        assert_eq!(
+            catalog
+                .listing()
+                .filter(|(_, status)| matches!(status, ThemeEntryStatus::Shadowed(_)))
+                .count(),
+            2
+        );
+
+        write_theme(&dir.join("Theme-999.conf"), "#ddeeff", "#102030");
+        let over = ThemeCatalog::discover_in(&dir);
+        assert_eq!(over.ready_names().count(), MAX_USER_THEME_FILES);
+        assert!(over.truncated());
+        assert!(over.resolve("Theme-999").is_err());
+        assert_eq!(over.limits().kept, MAX_USER_THEME_FILES);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A folder past the directory-entry cap keeps the bounded prefix it
+    /// gathered instead of dropping every theme.
+    #[test]
+    fn theme_catalog_past_the_entry_cap_keeps_a_prefix() {
+        let dir = theme_fixture_dir("entry-cap");
+        for index in 0..=MAX_USER_THEME_DIRECTORY_ENTRIES {
+            std::fs::write(
+                dir.join(format!("Theme-{index:04}.conf")),
+                "foreground = #ddeeff\nbackground = #102030\n",
+            )
+            .unwrap();
+        }
+        let catalog = ThemeCatalog::discover_in(&dir);
+        assert!(catalog.truncated());
+        let ready = catalog.ready_names().collect::<Vec<_>>();
+        assert_eq!(ready.len(), MAX_USER_THEME_FILES);
+        assert!(catalog.resolve(ready[0]).is_ok());
+        assert_eq!(catalog.limits().seen, MAX_USER_THEME_DIRECTORY_ENTRIES);
+        let live = ThemeCatalog::try_discover_in(&dir).expect("a truncated scan is not a failure");
+        assert_eq!(live.ready_names().count(), MAX_USER_THEME_FILES);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A file whose stem is not UTF-8 gets an Unreadable row under its lossy
+    /// name; no config value can resolve to it. (macOS volumes refuse such
+    /// names, so this runs where the filesystem admits them.)
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn theme_catalog_lists_a_non_utf8_file_name() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = theme_fixture_dir("non-utf8");
+        let path = dir.join(std::ffi::OsStr::from_bytes(b"Caf\xff.conf"));
+        write_theme(&path, "#ddeeff", "#102030");
+        let catalog = ThemeCatalog::discover_in(&dir);
+        let listing = catalog.listing().collect::<Vec<_>>();
+        assert_eq!(listing, [("Caf\u{FFFD}", ThemeEntryStatus::Unreadable)]);
+        assert!(catalog.ready_names().next().is_none());
+        assert!(catalog.resolve("Caf\u{FFFD}").is_err());
+        assert_eq!(catalog.limits().kept, 0);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -10452,6 +10799,16 @@ mod cfg_engine_tests {
         #[cfg(unix)]
         {
             assert!(catalog.resolve("Alias").is_err());
+            // The link gets a row naming why, without being opened.
+            let alias = catalog.listing().find(|(name, _)| *name == "Alias");
+            assert!(
+                matches!(alias, Some((_, ThemeEntryStatus::Invalid(why))) if why.contains("symlink")),
+                "{alias:?}"
+            );
+            assert!(
+                ThemeCatalog::try_discover_in(&dir).is_ok(),
+                "a linked theme never blocks a live reload"
+            );
             assert!(
                 read_bounded_theme_file(&dir.join("Alias.conf")).is_err(),
                 "the handle-level open must reject a symlink even if it is swapped in after scanning"
@@ -10723,9 +11080,7 @@ mod cfg_engine_tests {
 
     #[test]
     fn bidi_disabled_maps_to_engine() {
-        let tc = cfg("bidi = \"disabled\"")
-            .terminal_config()
-            .expect("bidi sets engine config");
+        let tc = cfg("bidi = \"disabled\"").applied_terminal_config();
         assert_eq!(tc.bidi.mode, BiDiMode::Disabled);
     }
 
@@ -11030,7 +11385,7 @@ mod cfg_engine_tests {
             ),
         ] {
             assert_eq!(
-                cfg(source).terminal_config().unwrap().cursor_style,
+                cfg(source).applied_terminal_config().cursor_style,
                 expected,
                 "registered spelling must resolve identically in the runtime: {source}"
             );
@@ -11039,25 +11394,19 @@ mod cfg_engine_tests {
 
     #[test]
     fn bidi_runtime_is_trimmed_case_insensitive_and_accepts_registered_aliases() {
-        let tc = cfg("bidi = \" Explicit \"").terminal_config().unwrap();
+        let tc = cfg("bidi = \" Explicit \"").applied_terminal_config();
         assert_eq!(tc.bidi.mode, BiDiMode::Explicit);
-        let tc = cfg("bidi = \" ON \"").terminal_config().unwrap();
+        let tc = cfg("bidi = \" ON \"").applied_terminal_config();
         assert_eq!(tc.bidi.mode, BiDiMode::Implicit);
     }
 
     #[test]
     fn ambiguous_width_runtime_is_trimmed_case_insensitive_and_accepts_aliases() {
-        let tc = cfg("ambiguous_width = \" wide \"")
-            .terminal_config()
-            .unwrap();
+        let tc = cfg("ambiguous_width = \" wide \"").applied_terminal_config();
         assert!(tc.ambiguous_width_double);
-        let tc = cfg("ambiguous_width = \" NARROW \"")
-            .terminal_config()
-            .unwrap();
+        let tc = cfg("ambiguous_width = \" NARROW \"").applied_terminal_config();
         assert!(!tc.ambiguous_width_double);
-        let tc = cfg("ambiguous_width = \" DOUBLE \"")
-            .terminal_config()
-            .unwrap();
+        let tc = cfg("ambiguous_width = \" DOUBLE \"").applied_terminal_config();
         assert!(tc.ambiguous_width_double);
     }
 
@@ -11204,10 +11553,13 @@ mod cfg_engine_tests {
 
     #[test]
     fn absent_keys_leave_engine_defaults_and_no_config() {
-        // No engine-affecting keys -> terminal_config() is None (GUI skips apply).
-        assert!(cfg("font_px = 14.0").terminal_config().is_none());
+        // A key with no engine side projects exactly what an empty config does.
+        assert_eq!(
+            cfg("font_px = 14.0").applied_terminal_config(),
+            Config::default().applied_terminal_config()
+        );
         // bidi default stays Implicit when only an unrelated key is set elsewhere.
-        let tc = cfg("bidi = \"implicit\"").terminal_config().unwrap();
+        let tc = cfg("bidi = \"implicit\"").applied_terminal_config();
         assert_eq!(tc.bidi.mode, BiDiMode::Implicit);
     }
 
@@ -11215,8 +11567,7 @@ mod cfg_engine_tests {
     fn security_flags_opt_in() {
         let tc = cfg("allow_osc52_query = true\nallow_window_ops = true\n\
              allow_notifications = true\nallow_palette_reconfigure = true")
-        .terminal_config()
-        .unwrap();
+        .applied_terminal_config();
         assert!(tc.allow_osc52_query);
         assert!(tc.allow_window_ops);
         assert!(tc.allow_notifications);
@@ -11227,7 +11578,7 @@ mod cfg_engine_tests {
     fn security_flags_fail_closed_when_absent() {
         // A config that sets only an unrelated engine key must NOT enable any
         // security flag — they stay fail-closed (default false).
-        let tc = cfg("scrollback_lines = 5000").terminal_config().unwrap();
+        let tc = cfg("scrollback_lines = 5000").applied_terminal_config();
         assert!(!tc.allow_osc52_query);
         assert!(!tc.allow_window_ops);
         assert!(!tc.allow_notifications);
@@ -11525,6 +11876,7 @@ mod cfg_engine_tests {
                 sparkle,
                 fonts: None,
                 warnings: Vec::new(),
+                font_refusals: Vec::new(),
             },
         );
         assert_eq!(
@@ -11563,6 +11915,7 @@ mod cfg_engine_tests {
                     sparkle,
                     fonts: None,
                     warnings: Vec::new(),
+                    font_refusals: Vec::new(),
                 },
             );
         }
@@ -11647,6 +12000,7 @@ mod cfg_engine_tests {
                 sparkle,
                 fonts: None,
                 warnings: Vec::new(),
+                font_refusals: Vec::new(),
             },
         );
         let key = crate::message_reporters::ConfigFamily::UnacceptedValues.key();
@@ -12113,10 +12467,22 @@ mod cfg_engine_tests {
 /// `Backend` call, so there is no fan-out.
 #[cfg(test)]
 mod w5_knob_tests {
-    use super::{Config, KnobChange, RenderKnobs};
+    use super::{Config, KnobChange, RenderKnobs, ThemeCatalog};
 
     fn cfg(toml: &str) -> Config {
         aterm_toml::from_str(toml).expect("valid toml")
+    }
+
+    /// The knobs `toml` resolves to, against no theme files.
+    fn knobs_of(c: &Config) -> RenderKnobs {
+        RenderKnobs::from_config(
+            c,
+            &c.resolved_colors(
+                aterm_types::Appearance::Dark,
+                &ThemeCatalog::default(),
+                None,
+            ),
+        )
     }
 
     /// (a) parse + clamp for every new renderer/engine key.
@@ -12178,9 +12544,9 @@ mod w5_knob_tests {
         );
         assert!(!cfg("underline_skip_descenders = false").underline_skip_descenders_or_default());
 
-        assert_eq!(Config::default().selection_foreground_u32(), None);
+        assert_eq!(knobs_of(&Config::default()).selection_fg, None);
         assert_eq!(
-            cfg("selection_foreground = \"#102030\"").selection_foreground_u32(),
+            knobs_of(&cfg("selection_foreground = \"#102030\"")).selection_fg,
             Some(0x0010_2030)
         );
 
@@ -12231,7 +12597,7 @@ mod w5_knob_tests {
     /// (a) the engine keys land on exactly one `TerminalConfig` field each.
     #[test]
     fn engine_keys_map_to_terminal_config() {
-        let tc = cfg("bold_is_bright = false").terminal_config().unwrap();
+        let tc = cfg("bold_is_bright = false").applied_terminal_config();
         assert!(!tc.bold_is_bright);
         let base = aterm_core::config::TerminalConfig::default();
         assert_eq!(
@@ -12239,16 +12605,18 @@ mod w5_knob_tests {
             "only the one field moved"
         );
 
-        let tc = cfg("faint_opacity = 0.25").terminal_config().unwrap();
+        let tc = cfg("faint_opacity = 0.25").applied_terminal_config();
         assert_eq!(tc.faint_opacity, 0.25);
         assert_eq!(
             tc.bold_is_bright, base.bold_is_bright,
             "only the one field moved"
         );
 
-        // Defaults: absent keys leave the engine defaults (and alone produce
-        // no engine config at all — the GUI skips apply).
-        assert!(cfg("line_height = 1.2").terminal_config().is_none());
+        // Defaults: absent keys leave the engine config an empty config has.
+        assert_eq!(
+            cfg("line_height = 1.2").applied_terminal_config(),
+            Config::default().applied_terminal_config()
+        );
     }
 
     /// (a) `cursor_break_ligatures` maps to `LigatureMode::CursorDisabled`,
@@ -12336,7 +12704,7 @@ mod w5_knob_tests {
         let c: Config = aterm_toml::from_str(&out).expect("round-trips through serde");
         assert_eq!(c.line_height_or_default(), 1.35);
         assert_eq!(c.minimum_contrast_or_default(), 4.5);
-        assert_eq!(c.selection_foreground_u32(), Some(0x00AA_BBCC));
+        assert_eq!(knobs_of(&c).selection_fg, Some(0x00AA_BBCC));
         assert!(c.selection_inactive_or_default());
         assert_eq!(c.cursor_break_ligatures, Some(true));
         assert_eq!(c.bold_is_bright, Some(false));
@@ -12381,7 +12749,7 @@ mod w5_knob_tests {
             ),
         ];
         for (toml, expected) in cases {
-            let knobs = RenderKnobs::from_config(&cfg(toml));
+            let knobs = knobs_of(&cfg(toml));
             let changes = base.diff(&knobs);
             assert_eq!(
                 changes,
@@ -12390,7 +12758,7 @@ mod w5_knob_tests {
             );
         }
         // And reverting diffs back to exactly one change per key too.
-        let all = RenderKnobs::from_config(&cfg(
+        let all = knobs_of(&cfg(
             "line_height = 1.5\nminimum_contrast = 4.5\nadjust_baseline = 2",
         ));
         assert_eq!(all.diff(&base).len(), 3, "one change per reverted key");
@@ -12404,7 +12772,7 @@ mod w5_knob_tests {
     fn translucency_couples_opacity_to_the_contrast_floor() {
         let base = RenderKnobs::default();
         // Default floor (1.0) + glass → BOTH the opacity and the auto-floor fire.
-        let glass = RenderKnobs::from_config(&cfg("background_opacity = 0.6"));
+        let glass = knobs_of(&cfg("background_opacity = 0.6"));
         let changes = base.diff(&glass);
         assert!(
             changes.contains(&KnobChange::BackgroundOpacity(0.6)),
@@ -12417,9 +12785,8 @@ mod w5_knob_tests {
         assert_eq!(changes.len(), 2, "exactly the opacity + the auto-floor");
 
         // A user who already set a >= 4.5 floor: only the opacity moves.
-        let glass_hi =
-            RenderKnobs::from_config(&cfg("background_opacity = 0.6\nminimum_contrast = 7.0"));
-        let hi_base = RenderKnobs::from_config(&cfg("minimum_contrast = 7.0"));
+        let glass_hi = knobs_of(&cfg("background_opacity = 0.6\nminimum_contrast = 7.0"));
+        let hi_base = knobs_of(&cfg("minimum_contrast = 7.0"));
         assert_eq!(
             hi_base.diff(&glass_hi),
             vec![KnobChange::BackgroundOpacity(0.6)],
@@ -12452,7 +12819,7 @@ mod w5_knob_tests {
             super::BackgroundMaterial::None,
             "a valid material must resolve to a real variant, not silently to None"
         );
-        let knobs = RenderKnobs::from_config(&cfg("background_material = \"hud\""));
+        let knobs = knobs_of(&cfg("background_material = \"hud\""));
         assert!(
             RenderKnobs::default()
                 .diff(&knobs)
@@ -12794,13 +13161,15 @@ mod output_streak_cfg_tests {
         );
     }
 
-    /// Settings ▸ Harness words: each limited key named in the supervisor's KEYS
-    /// order as `<key>: <value>`; a rewritten text named apart as `yours`;
-    /// `trust_roots` only where `safe` reads it; `Off` outranks every limit.
-    /// Negative control: no table is `Automatic`.
+    /// Settings ▸ Harness words: a limit with a Harness row named by that row
+    /// and its value as the row shows it, the limits only the file holds
+    /// counted (Modified lists their keys), a change that takes no power away
+    /// never named, and never a TOML key or value; `Off` outranks every limit.
+    /// Negative controls: no table, and a non-limiting change, are `Automatic`.
     #[test]
-    fn the_harness_words_name_every_limit_in_key_order() {
-        assert_eq!(super::HarnessPolicy::read("").words(), "Automatic");
+    fn the_harness_words_say_each_limit_in_the_rows_words() {
+        let read = super::HarnessPolicy::read;
+        assert_eq!(read("").words(), "Automatic");
         let all = "[harness]\nheadless = false\napprove = \"none\"\ntrust_roots = []\n\
                    answer_questions = false\nanswer_text = \"ask me\"\n\
                    dismiss_surveys = false\ncontinue = false\ncontinue_text = \"go\"\n\
@@ -12810,49 +13179,131 @@ mod output_streak_cfg_tests {
                    compact_on_context_wall = false\nrelaunch = false\nupgrade = false\n\
                    human_grace_s = 600\n";
         assert_eq!(
-            super::HarnessPolicy::read(all).words(),
-            "Automatic \u{b7} limited: headless: off \u{b7} approve: none \
-             \u{b7} answer_questions: off \u{b7} dismiss_surveys: off \u{b7} continue: off \
-             \u{b7} continue_per_hour: 2 \u{b7} retry_api_errors: off \u{b7} probe_api: off \
-             \u{b7} resume_limits: off \u{b7} limit_wait: off \u{b7} accounts: off \
-             \u{b7} model_fallback: off \u{b7} compact_on_context_wall: off \u{b7} relaunch: off \
-             \u{b7} upgrade: off \u{b7} human_grace_s: 600 \
-             \u{b7} yours: answer_text, continue_text, rules_file"
+            read(all).words(),
+            "Automatic, limited by Approve permission boxes set to None; Answer questions set \
+             to Off; 14 settings in aterm.toml"
+        );
+        for words in [read(all).words()] {
+            for key in aterm_agent::supervise::config::KEYS {
+                assert!(
+                    !key.contains('_') || !words.contains(key),
+                    "{key} is a file's word, not the row's: {words}"
+                );
+            }
+            assert!(!words.contains(": "), "no `key: value`: {words}");
+        }
+        assert_eq!(
+            read("[harness]\napprove = \"safe\"\n").words(),
+            "Automatic, limited by Approve permission boxes set to Safe"
+        );
+        // No trust root is the default, so an empty list under `safe` is no
+        // limit, and a person's own folders take no power away.
+        for table in [
+            "[harness]\napprove = \"safe\"\ntrust_roots = []\n",
+            "[harness]\napprove = \"safe\"\ntrust_roots = [\"~/src/app*\"]\n",
+        ] {
+            assert_eq!(
+                read(table).words(),
+                "Automatic, limited by Approve permission boxes set to Safe",
+                "{table}"
+            );
+        }
+        // `accounts`: `wall` is a limit of `early`; `early`, the default, is none
+        // (NEGATIVE CONTROL).
+        assert_eq!(
+            read("[harness]\naccounts = \"wall\"\n").words(),
+            "Automatic, limited by 1 setting in aterm.toml"
+        );
+        // NEGATIVE CONTROLS: what takes no power away is the owner's own and
+        // is never named — its own row, where it has one, says Changed.
+        for table in [
+            "[harness]\naccounts = \"early\"\n",
+            "[harness]\nanswer_text = \"ask me\"\n",
+            "[harness]\nquestion_priority = \"long-term\"\n",
+            "[harness]\nlimit_reset = true\n",
+            "[harness]\nlimit_reset = false\n",
+            "[harness]\nusage_tap = true\n",
+            "[harness]\nusage_tap = false\n",
+            "[harness]\nusage_notes = true\n",
+            "[harness]\nusage_notes = false\n",
+        ] {
+            assert_eq!(read(table).words(), "Automatic", "{table}");
+        }
+        assert!(!read("").policy.limit_reset);
+        assert!(!read("").policy.usage_notes);
+        let off = format!("{all}enabled = false\n");
+        assert_eq!(read(&off).words(), "Off: no agent session is supervised");
+        // Every limit set on a row of the Harness page is named by that row,
+        // an agent's own switch and the default Autopilot too, in the table's
+        // order with the agents last; only a key with no row is the file's.
+        assert_eq!(
+            read("[harness.claude]\nenabled = false\n").words(),
+            "Automatic, limited by Supervise Claude Code sessions set to Off"
         );
         assert_eq!(
-            super::HarnessPolicy::read("[harness]\napprove = \"safe\"\ntrust_roots = []\n").words(),
-            "Automatic \u{b7} limited: approve: safe \u{b7} trust_roots: off"
+            read("[harness]\nautopilot = \"land\"\n[harness.codex]\nenabled = false\n").words(),
+            "Automatic, limited by Default autopilot set to Land; Supervise Codex sessions set \
+             to Off"
         );
         assert_eq!(
-            super::HarnessPolicy::read("[harness]\nanswer_text = \"ask me\"\n").words(),
-            "Automatic \u{b7} yours: answer_text"
-        );
-        // `accounts`: `wall` is a limit of `early` and named; `early`, the
-        // default, is none (NEGATIVE CONTROL).
-        assert_eq!(
-            super::HarnessPolicy::read("[harness]\naccounts = \"wall\"\n").words(),
-            "Automatic \u{b7} limited: accounts: wall"
+            read("[harness]\nautopilot = \"off\"\nrelaunch = false\n").words(),
+            "Automatic, limited by Default autopilot set to Off; 1 setting in aterm.toml"
         );
         assert_eq!(
-            super::HarnessPolicy::read("[harness]\naccounts = \"early\"\n").words(),
-            "Automatic"
+            read("[harness]\nrelaunch = false\n").words(),
+            "Automatic, limited by 1 setting in aterm.toml"
         );
-        // `limit_reset`: its `true` gives the supervisor more, so it is named
-        // as the owner's own choice and never as a limit; `false`, the
-        // default, names nothing (NEGATIVE CONTROL).
-        assert_eq!(
-            super::HarnessPolicy::read("[harness]\nlimit_reset = true\n").words(),
-            "Automatic \u{b7} yours: limit_reset"
-        );
-        assert_eq!(
-            super::HarnessPolicy::read("[harness]\nlimit_reset = false\n").words(),
-            "Automatic"
-        );
-        assert!(!super::HarnessPolicy::read("").policy.limit_reset);
-        assert_eq!(
-            super::HarnessPolicy::read(&format!("{all}enabled = false\n")).words(),
-            "Off: no agent session is supervised"
-        );
+        assert_eq!(read("[harness]\nrelaunch = false\n").file_limits(), 1);
+        assert_eq!(read("[harness]\napprove = \"none\"\n").file_limits(), 0);
+    }
+
+    /// NO ROW OF THE HARNESS PAGE IS BLAMED ON THE FILE: every value any
+    /// `harness.*` row of the registry (`prefs::NESTED_LEAVES`, the rows
+    /// the page draws) can take that takes power away is named by that row's
+    /// label and counted as no file limit — a row added there is classified
+    /// with no code here. The master switch reads Off whole. NEGATIVE
+    /// CONTROL: `relaunch`, a key with no row, is the file's.
+    #[test]
+    fn every_harness_rows_limit_is_named_by_its_row() {
+        let read = super::HarnessPolicy::read;
+        let mut limited = Vec::new();
+        for leaf in crate::prefs::NESTED_LEAVES
+            .iter()
+            .filter(|leaf| leaf.key.starts_with("harness."))
+            .filter(|leaf| leaf.key != crate::prefs::EDIT_HARNESS_ENABLED)
+        {
+            let (table, key) = leaf.key.rsplit_once('.').expect("a dotted key");
+            let values: Vec<String> = match leaf.kind {
+                crate::prefs::EditKind::Bool => vec!["false".to_string()],
+                crate::prefs::EditKind::Enum { options } => options
+                    .iter()
+                    .map(|option| format!("\"{option}\""))
+                    .collect(),
+                kind => panic!("{}: a {kind:?} row", leaf.key),
+            };
+            for value in values {
+                let source = format!("[{table}]\n{key} = {value}\n");
+                let policy = read(&source);
+                if policy.policy.against_default().limits.is_empty() {
+                    continue;
+                }
+                let words = policy.words();
+                assert!(words.contains(leaf.label), "{source}: {words}");
+                assert!(!words.contains("aterm.toml"), "{source}: {words}");
+                assert_eq!(policy.file_limits(), 0, "{source}");
+                limited.push(leaf.key);
+            }
+        }
+        for key in [
+            crate::prefs::EDIT_HARNESS_CLAUDE_ENABLED,
+            crate::prefs::EDIT_HARNESS_CODEX_ENABLED,
+            crate::prefs::EDIT_HARNESS_AUTOPILOT,
+            crate::prefs::EDIT_HARNESS_APPROVE,
+            crate::prefs::EDIT_HARNESS_ANSWER_QUESTIONS,
+        ] {
+            assert!(limited.contains(&key), "{key} limits: {limited:?}");
+        }
+        assert_eq!(read("[harness]\nrelaunch = false\n").file_limits(), 1);
     }
 
     #[test]
@@ -12891,13 +13342,8 @@ mod output_streak_cfg_tests {
             assert!(c.harness.notes.is_empty(), "{word}: {:?}", c.harness.notes);
             assert_eq!(policy.question_priority, want);
             assert!(policy.answer_questions && policy.session_questions);
-            assert_eq!(c.harness_question_priority(), want);
             assert!(c.harness_notices().is_empty());
         }
-        assert_eq!(
-            Config::default().harness_question_priority(),
-            QuestionPriority::Recommended
-        );
         for text in [
             "[harness]\nquestion_priority = \"long_term\"\n",
             "[harness]\nquestion_priority = true\n",
@@ -12963,7 +13409,6 @@ mod output_streak_cfg_tests {
             vec!["~/a*".to_string(), "/b".to_string()]
         );
         assert_eq!(policy.model_fallback, None);
-        assert!(set.harness_enabled());
         // A reload that changes only a policy key is a changed Config.
         assert!(set != cfg(&text.replace("continue = false", "continue = true")));
 
@@ -12990,11 +13435,14 @@ mod output_streak_cfg_tests {
         .ignored;
         assert!(ignored.iter().any(|l| l.contains("contine")), "{ignored:?}");
         // An explicit off spelled `"no"` is OFF; `"yes"` is ON.
-        assert!(!cfg("[harness]\nenabled = \"no\"\n").harness_enabled());
-        assert!(cfg("[harness]\nenabled = \"yes\"\n").harness_enabled());
+        assert!(!cfg("[harness]\nenabled = \"no\"\n").harness.policy.enabled);
+        assert!(cfg("[harness]\nenabled = \"yes\"\n").harness.policy.enabled);
         assert_eq!(
-            cfg("[harness]\napprove = \"everything\"\n").harness_approve(),
-            "all"
+            cfg("[harness]\napprove = \"everything\"\n")
+                .harness
+                .policy
+                .approve,
+            aterm_agent::supervise::config::Approve::All
         );
         // The config language's domain check stands down for a value the reader
         // already named. Negative control: without the reader's note it speaks.
@@ -13009,7 +13457,7 @@ mod output_streak_cfg_tests {
 
         // A `false` below another table's header still limits, and is said.
         let misplaced = cfg("[packages]\nharness.enabled = false\n");
-        assert!(!misplaced.harness_enabled());
+        assert!(!misplaced.harness.policy.enabled);
         assert!(
             misplaced.harness_notices()[0].contains("`packages.harness.enabled`"),
             "{:?}",
@@ -13712,7 +14160,7 @@ mod headless_boot_metrics_tests {
 
 #[cfg(test)]
 mod split_theme_tests {
-    use super::Config;
+    use super::{Config, ThemeCatalog, theme_misses, theme_selector_notice};
     use aterm_types::Appearance;
 
     fn cfg(toml: &str) -> Config {
@@ -13787,29 +14235,124 @@ mod split_theme_tests {
         );
     }
 
-    /// A split that OMITS one side resolves that appearance to `None` (built-in
-    /// Default), while the present side still resolves.
+    /// A split that OMITS one side draws the side it names for both
+    /// appearances, rather than a Default the user never chose.
     #[test]
-    fn split_omitted_side_is_default() {
+    fn split_omitted_side_draws_the_named_side() {
         let c = cfg(r#"theme = "light:GitHub Light""#);
-        assert_eq!(c.resolve_theme_name(Appearance::Dark), None);
+        for appearance in [Appearance::Dark, Appearance::Light] {
+            assert_eq!(
+                c.resolve_theme_name(appearance).as_deref(),
+                Some("GitHub Light")
+            );
+        }
+        assert_eq!(c.theme_for(Appearance::Dark).bg, 0x00FF_FFFF);
+        // A clean one-sided split is not a selector issue.
+        assert!(theme_misses(&c, &ThemeCatalog::empty()).is_empty());
+    }
+
+    /// A split that omits a side draws the named side's built-in pair first:
+    /// `dark:Gruvbox Dark` on a light OS is Gruvbox Light, end to end. A user
+    /// theme has no pair, so it serves both sides (negative control).
+    #[test]
+    fn split_omitted_side_draws_the_builtin_pair() {
+        let c = cfg(r#"theme = "dark:Gruvbox Dark""#);
         assert_eq!(
             c.resolve_theme_name(Appearance::Light).as_deref(),
-            Some("GitHub Light")
+            Some("Gruvbox Light")
         );
-        // The dark side renders the built-in Default background.
         assert_eq!(
-            c.theme_for(Appearance::Dark).bg,
-            aterm_types::ColorScheme::default().to_theme_parts().bg
+            c.theme_for(Appearance::Light),
+            cfg(r#"theme = "Gruvbox Light""#).theme_for(Appearance::Light)
+        );
+        assert_ne!(
+            c.theme_for(Appearance::Light),
+            c.theme_for(Appearance::Dark)
+        );
+        let user = cfg(r#"theme = "dark:Studio""#);
+        assert_eq!(
+            user.resolve_theme_name(Appearance::Light).as_deref(),
+            Some("Studio")
+        );
+        // The notice for a split with an unusable side names what that side
+        // actually draws: the pair, not the named side.
+        let notice = theme_selector_notice(Some("dark:Gruvbox Dark,lite:x")).expect("an issue");
+        assert!(
+            notice.ends_with(r#"light mode uses "Gruvbox Light""#),
+            "{notice}"
         );
     }
 
-    /// No `theme` key → `None` for both appearances (built-in Default everywhere).
+    /// Selector issues reach the band through `theme_misses`, alongside catalog
+    /// misses; a clean selector adds none (negative control).
+    #[test]
+    fn theme_misses_include_selector_issues() {
+        let themes = ThemeCatalog::empty();
+        let misses = |theme: &str| {
+            theme_misses(
+                &Config {
+                    theme: Some(theme.to_string()),
+                    ..Default::default()
+                },
+                &themes,
+            )
+        };
+        let selector = |theme: &str| theme_selector_notice(Some(theme));
+        // dark:A,dark:B draws A and still reports the duplicate.
+        let c = cfg(r#"theme = "dark:Nord,dark:Dracula""#);
+        assert_eq!(
+            c.resolve_theme_name(Appearance::Dark).as_deref(),
+            Some("Nord")
+        );
+        assert_eq!(
+            misses("dark:Nord,dark:Dracula"),
+            vec![selector("dark:Nord,dark:Dracula").unwrap()]
+        );
+        // An unknown mode beside a good side: one selector notice, no catalog miss.
+        assert_eq!(misses("dark:Nord,lite:Dracula").len(), 1);
+        // A selector issue and a missing theme are both said.
+        assert_eq!(misses("dark:Nord,light:Nope,light:Dracula").len(), 2);
+        // Negative controls: clean selectors add no selector notice.
+        for clean in ["Nord", "dark:Nord,light:GitHub Light", "dark:Nord"] {
+            assert_eq!(selector(clean), None, "{clean:?}");
+            assert!(misses(clean).is_empty(), "{clean:?}");
+        }
+        assert!(theme_selector_notice(None).is_none());
+    }
+
+    /// No `theme` key → `None` for both appearances: no name, so each side
+    /// draws [`super::unset_theme_name`].
     #[test]
     fn absent_theme_is_none() {
         let c = cfg("font_px = 14.0");
         assert_eq!(c.resolve_theme_name(Appearance::Dark), None);
         assert_eq!(c.resolve_theme_name(Appearance::Light), None);
+    }
+
+    /// The unset rule is the selector it is written as: `UNSET_THEME` parses
+    /// cleanly, each side names [`super::unset_theme_name`], both are
+    /// built-ins of their own appearance, and they are each other's pair, so
+    /// `theme = "dark:Default"` and an unset value draw the same light side.
+    #[test]
+    fn unset_theme_is_the_default_pair_split() {
+        use aterm_types::scheme::{ThemeSelector, builtin_pair, builtin_theme};
+        let (selector, issues) = ThemeSelector::parse(super::UNSET_THEME);
+        assert!(issues.is_empty(), "{issues:?}");
+        for side in [Appearance::Dark, Appearance::Light] {
+            let name = super::unset_theme_name(side);
+            assert_eq!(selector.name_for(side), Some(name), "{side:?}");
+            let builtin = builtin_theme(name).expect("a built-in");
+            assert_eq!(builtin.appearance, side, "{name}");
+        }
+        assert_eq!(
+            builtin_pair(super::unset_theme_name(Appearance::Dark)),
+            Some(super::unset_theme_name(Appearance::Light))
+        );
+        // A value that names nothing says it draws the unset default; a clean
+        // value says nothing (negative control).
+        let notice = theme_selector_notice(Some("dark:,light:")).expect("an issue");
+        assert!(notice.contains("Default Light"), "{notice}");
+        assert_eq!(theme_selector_notice(Some(super::UNSET_THEME)), None);
     }
 
     /// The engine config (palette + default/cursor colors) also tracks the split,
@@ -14075,6 +14618,58 @@ mod reload_dedupe_tests {
         );
         assert_eq!(exact.trail_packs.ids, ["deferred-trail"]);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The launch's generation is handed to the boot's join while its
+    /// kitty-command vocabulary still compiles, and lands the same vocabulary a
+    /// reload's generation carries: a typed pet command works once it is in.
+    #[test]
+    fn the_launch_generation_lands_the_same_kitty_vocabulary_after_the_join() {
+        let config = cfg("[sparkle_words]\nlanguages = [\"en\", \"es\"]\n");
+        let reload = config.prepare_path_feed_generation();
+        let launch = config.prepare_launch_path_feed_generation();
+        aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "the launch generation's kitty vocabulary to land",
+            || launch.sparkle.tricks.0.get().map(|_| ()),
+        );
+        let mut scratch = String::new();
+        assert!(
+            reload
+                .sparkle
+                .tricks()
+                .classify("sit", &mut scratch)
+                .is_some(),
+            "negative control: a compiled vocabulary knows `sit`"
+        );
+        for word in ["sit", "kitty", "please", "siéntate", "sientate", "compile"] {
+            assert_eq!(
+                launch.sparkle.tricks().classify(word, &mut scratch),
+                reload.sparkle.tricks().classify(word, &mut scratch),
+                "{word}"
+            );
+        }
+        assert_eq!(
+            launch.sparkle.tricks().surface_count(),
+            reload.sparkle.tricks().surface_count()
+        );
+    }
+
+    /// Until the launch's compile lands, a press reads the EMPTY vocabulary
+    /// without waiting for it, and nothing fires.
+    #[test]
+    fn an_unlanded_kitty_vocabulary_classifies_nothing() {
+        let unlanded = super::TrickVocabulary(std::sync::Arc::default());
+        let mut scratch = String::new();
+        assert_eq!(unlanded.get().classify("sit", &mut scratch), None);
+        assert_eq!(unlanded.get().surface_count(), 0);
+        assert!(
+            super::TrickVocabulary::compiled(vec!["en".to_string()])
+                .get()
+                .classify("sit", &mut scratch)
+                .is_some(),
+            "negative control: the compiled vocabulary knows `sit`"
+        );
     }
 
     #[test]
@@ -14349,15 +14944,8 @@ mod theme_live_tests {
             false,
         ));
 
-        let tp = aterm_types::scheme::builtin("Dracula")
-            .unwrap()
-            .to_theme_parts();
-        let new_theme = aterm_render::Theme {
-            fg: tp.fg,
-            bg: tp.bg,
-            cursor: tp.cursor,
-            selection: tp.selection,
-        };
+        let new_theme =
+            aterm_render::Theme::from(&aterm_types::scheme::builtin("Dracula").unwrap());
         assert_ne!(
             app.theme.bg, new_theme.bg,
             "test needs a real colour change"
@@ -14397,13 +14985,14 @@ mod matrix_rain_cfg_tests {
     /// Stock dark-theme chrome, as the renderer knows it (`0x00RR_GGBB`).
     const BG: u32 = 0x0011_1318;
     const FG: u32 = 0x00D0_D0D0;
+    const CURSOR: u32 = 0x0050_FA7B;
 
     /// The enabled-gated composition of `matrix_rain_enabled` and
     /// `matrix_rain_params`, used by the parameter tests below.
     fn rain(toml: &str) -> Option<RainConfig> {
         let cfg = aterm_toml::from_str::<Config>(toml).expect("valid toml");
         cfg.matrix_rain_enabled()
-            .then(|| cfg.matrix_rain_params(BG, FG))
+            .then(|| cfg.matrix_rain_params(BG, FG, CURSOR))
     }
 
     /// Off by default: an absent table, a table without `enabled`, and
@@ -14430,13 +15019,13 @@ mod matrix_rain_cfg_tests {
     fn params_resolve_independent_of_enabled() {
         let disabled = aterm_toml::from_str::<Config>("[matrix_rain]\nenabled = false\nfps = 24")
             .unwrap()
-            .matrix_rain_params(BG, FG);
+            .matrix_rain_params(BG, FG, CURSOR);
         let enabled = aterm_toml::from_str::<Config>("[matrix_rain]\nenabled = true\nfps = 24")
             .unwrap()
-            .matrix_rain_params(BG, FG);
+            .matrix_rain_params(BG, FG, CURSOR);
         assert_eq!(disabled, enabled, "the enabled bit never shapes the params");
         assert_eq!(disabled.fps, 24, "knobs still resolve while disabled");
-        let absent = Config::default().matrix_rain_params(BG, FG);
+        let absent = Config::default().matrix_rain_params(BG, FG, CURSOR);
         assert_eq!(absent.fps, 30, "absent table synthesizes the §12 defaults");
         assert_eq!(absent.default_bg, BG);
         assert_eq!(absent.theme_fg, FG);
@@ -15071,7 +15660,7 @@ mod matrix_rain_cfg_tests {
     fn theme_channels_are_masked() {
         let c = aterm_toml::from_str::<Config>("[matrix_rain]\nenabled = true")
             .unwrap()
-            .matrix_rain_params(0xFF11_1318, 0xFFD0_D0D0);
+            .matrix_rain_params(0xFF11_1318, 0xFFD0_D0D0, 0xFF50_FA7B);
         assert_eq!(c.default_bg, 0x0011_1318);
         assert_eq!(c.theme_fg, 0x00D0_D0D0);
     }
@@ -15802,30 +16391,6 @@ mod trail_style_resolution_tests {
         }
     }
 
-    /// [`effective_trail_style_token`] returns what `resolve_trail_style`
-    /// settled on.
-    #[test]
-    fn the_effective_token_never_disagrees_with_the_resolver() {
-        let catalog = TrailPackCatalog::empty();
-        let extra = ["phasr", "", "  ", "pack:", "pack:not-loaded", " NYAN "];
-        let aliases = crate::prefs::CURSOR_TRAIL_STYLE_ALIASES
-            .iter()
-            .map(|&(alias, _)| alias);
-        for raw in crate::prefs::CURSOR_TRAIL_STYLES
-            .iter()
-            .copied()
-            .chain(aliases)
-            .chain(extra)
-        {
-            let resolved = resolve_trail_style(raw, &catalog);
-            assert_eq!(
-                effective_trail_style_token(raw),
-                resolved.canonical.unwrap_or(raw.trim()),
-                "raw {raw:?}"
-            );
-        }
-    }
-
     /// Bloom radius is per style (1.8 for the rainbow kitty, 2.2 otherwise), and
     /// `cursor_trail_bloom_radius` overrides all of them.
     #[test]
@@ -15857,49 +16422,6 @@ mod trail_style_resolution_tests {
                 catalog.presentation_for(config.cursor_trail_style_raw())
             ),
             1.8
-        );
-    }
-}
-
-#[cfg(test)]
-mod launch_notice_tests {
-    /// The launch-time notice names the path, the problem and the consequence —
-    /// "every setting is running at its default" (an invalid file still reads its
-    /// `[harness]` lines, `Config::stand_in`, and says so).
-    #[test]
-    fn launch_config_notice_names_the_consequence_and_the_path() {
-        let path = std::path::Path::new("/home/ana/.config/aterm/aterm.toml");
-        let unreadable = super::launch_config_notice(
-            path,
-            super::LaunchConfigProblem::Unreadable(&"permission denied (os error 13)"),
-        );
-        assert!(
-            unreadable.starts_with("aterm.toml could not be read at launch (permission denied"),
-            "{unreadable}"
-        );
-        assert!(
-            unreadable.contains("every setting is running at its default"),
-            "{unreadable}"
-        );
-        assert!(
-            unreadable.contains("/home/ana/.config/aterm/aterm.toml"),
-            "{unreadable}"
-        );
-        let invalid = super::launch_config_notice(
-            path,
-            super::LaunchConfigProblem::Invalid(&"expected `=` at line 3"),
-        );
-        assert!(
-            invalid.starts_with("aterm.toml is not a valid configuration (expected `=`"),
-            "{invalid}"
-        );
-        assert!(
-            invalid.contains("the window's settings except [harness] are at their defaults"),
-            "{invalid}"
-        );
-        assert!(
-            invalid.contains("Fix /home/ana/.config/aterm/aterm.toml"),
-            "{invalid}"
         );
     }
 }

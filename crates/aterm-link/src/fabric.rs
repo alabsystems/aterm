@@ -11,15 +11,20 @@
 //!                 [--tcp <host:port> --key-file <path> [--allow-remote]]
 //! aterm fabric off [--dry-run] [--service launchd|systemd|none]
 //! aterm fabric doctor
-//! aterm fabric mint-for <node-id>|new [--out <cap>] [--fleet <F>]
+//! aterm fabric mint-for <node-id>|new|<person> [--out <cap>] [--fleet <F>] [--expires <N>d|<N>h]
 //! aterm fabric join --broker <host:port> --tcp --key-file <k> --cap-file <c> [...]
+//! aterm fabric halt  --cap-file <person-cap> <reason>|off
+//! aterm fabric inbox --cap-file <person-cap> [--peek]
+//! aterm fabric post  --cap-file <person-cap> to=@<sid>@<node> kind=<k> [re=<off>] <text>
 //! aterm fabric help
 //! ```
 //!
 //! `on`, `off` and `doctor` are [`crate::enable`]: turning the fabric on in
 //! one command, proving it, and naming the fix for each warning below.
 //! `mint-for` and `join` are [`crate::join`]: a second host joins the fleet
-//! over the sealed transport.
+//! over the sealed transport, and a person gets a cap of their own.
+//! `halt`, `inbox` and `post` are [`crate::person`]: that person halting the
+//! fleet, reading their mail and answering it, under their cap.
 //!
 //! THE OWNER'S COMMAND, AND IT TAKES NO ARGUMENTS. Everything it needs is in the
 //! `[fabric] command` aterm launches its bridge from: the fleet, the broker, the
@@ -32,8 +37,9 @@
 //! instance control sockets ([`crate::enable::Rendezvous`]) is read for the
 //! command it mirrors; with none of the three, the report says the fabric is
 //! off and where it looked. One more source is read when all are empty: a
-//! running instance's bridge — armed by hand (`aterm ctl fabric attach <argv>`)
-//! or launched from a development build's `$ATERM_FABRIC_COMMAND` seam —
+//! running instance's bridge — armed with a command its aterm.toml named then
+//! and no longer does, or launched from a development build's
+//! `$ATERM_FABRIC_COMMAND` seam —
 //! is carrying mail all the same, so its command is used and the missing config
 //! is a WARNING.
 //!
@@ -61,7 +67,10 @@
 //!   not cover `/f/<fleet>/>`, or a broker that dies between the two — is `yes,
 //!   but the bus cannot be read: <its own reason>`, a WARNING, and exit 1. It is
 //!   not `reachable yes`: with no head there is no roster, no traffic and no
-//!   standing halt to report.
+//!   standing halt to report. THE GUARD IS MEASURED TOO ([`BrokerView::guarded`]):
+//!   one more attach, of a grant minted under a secret no broker holds, which a
+//!   guarded broker refuses — a broker that acknowledges it checks no
+//!   capability, whatever its job says, and that is a WARNING.
 //! * BRIDGES — one row per aterm instance on this machine, found by the same
 //!   rendezvous walk `aterm ctl instances` makes ([`aterm_ctl::local_instances`])
 //!   and asked `fabric status` under the Owner token beside its socket: its
@@ -81,16 +90,18 @@
 //!   no other read verb reports; an unhandled task's or ask's age is the `t=` of
 //!   its record on the bus.
 //! * NODES — every node row on the presence roster, as the node published it
-//!   (`host=`, `state=`, `fabric=`), with its live-session count, `this` for
-//!   the node the command's state dir names, `local` for another instance on
-//!   this machine, and `remote` for one only the bus knows. A remote node is
+//!   (`host=`, `state=`, `fabric=`, and `proto=`/`aterm=`: the astream
+//!   protocol it speaks and the aterm release it runs), with its live-session
+//!   count, `this` for the node the command's state dir names, `local` for
+//!   another instance on this machine, and `remote` for one only the bus
+//!   knows. A remote node is
 //!   never a BRIDGES row: that table is this machine's instances.
 //! * TRAFFIC — the last ten records under `/f/<F>/>`, metadata only.
 //!
 //! A GUARDED BROKER is read through the caps' own faces. A node's ring never
-//! grants `/f/<F>/>`, and the broker a second host dials is always guarded
-//! (`aterm link broker --tcp`), so on one the whole-fleet reads above are
-//! refused `unauthorized`. The head query then asks the first granted face
+//! grants `/f/<F>/>`, and every broker `aterm fabric on` runs is guarded (the
+//! one-host socket and the sealed TCP wire alike), so on one the whole-fleet
+//! reads above are refused `unauthorized`. The head query then asks the first granted face
 //! (the head is global), and TRAFFIC, the deadline scan and the task ages read
 //! each granted face and merge by offset ([`BrokerView::faces`]) — the report
 //! reads what this node may read, and BROKER's `reads` line says so.
@@ -98,9 +109,11 @@
 //!   loses mail. A `stalled` bridge is one: its instance's mail queues and none
 //!   arrives until the link is back. Another is a node the bus's OWN roster
 //!   calls `state=gone` while the instance whose node it is says
-//!   `fabric=connected` — a second bridge sharing the state dir exited and
-//!   fired its will, so every peer reading the fleet's directory saw a live
-//!   node as dead.
+//!   `fabric=connected` — a second bridge sharing the node id exited and
+//!   fired its will (measured with one state dir, before its lock; still
+//!   possible with a copy of the dir), so every peer reading the fleet's
+//!   directory saw a live node as dead. A third is an instance whose bridge
+//!   STANDS BY because another holds its state dir (`reason=state-locked`).
 //!
 //! ## Privacy
 //!
@@ -139,10 +152,15 @@ usage: aterm fabric [status] [--json]
                         [--tcp <host:port> --key-file <path> [--allow-remote]]
        aterm fabric off [--dry-run] [--service launchd|systemd|none]
        aterm fabric doctor [--retire-ghosts [--yes]]
-       aterm fabric mint-for <node-id>|new [--out <cap>] [--fleet <F>]
+       aterm fabric mint-for <node-id>|new|h-<name>|a-<name> [--out <cap>] [--fleet <F>]
+                             [--expires <N>d|<N>h]
        aterm fabric join --broker <host:port> --tcp --key-file <path> --cap-file <path>
                          [--node <id>] [--accept-from <p>,...] [--dry-run]
                          [--service launchd|systemd|none]
+       aterm fabric halt  --cap-file <person-cap> <reason>|off
+       aterm fabric inbox --cap-file <person-cap> [--peek]
+       aterm fabric post  --cap-file <person-cap> to=@<sid>@<node> kind=<k> [re=<off>]
+                          [--] <text>
        aterm fabric help
 
 The fabric's state on one screen, and the one command that turns it on. `status`
@@ -152,18 +170,21 @@ instance control sockets (fabric.toml) is read when the file has no command.
 
   status           the default. Seven sections: CONFIG (where the command came from,
                    its fleet, node id and cap-file grants), BROKER (a real connect,
-                   attach and head query, plus the broker's pid and launchd job),
+                   attach and head query, whether it checks capabilities, plus the
+                   broker's pid and launchd job),
                    NODES (every node on the bus's presence roster: host=, state=,
-                   fabric= and its live sessions, `this` marking this one and
-                   `remote` a node only the bus knows — a joined second host),
+                   fabric=, proto= and aterm= — the astream protocol it speaks and
+                   the aterm release it runs — and its live sessions, `this`
+                   marking this one and `remote` a node only the bus knows — a
+                   joined second host),
                    BRIDGES (every aterm instance on this machine and its bridge),
                    SESSIONS (each session's phase, running program, hold and inbox
                    numbers, the broadcast topics it has opted into, and its node
                    once the fleet has two — a remote node's too, from its
                    presence), TRAFFIC (the last 10 bus records) and
                    WARNINGS (what makes `connected` a lie or loses mail). On a
-                   GUARDED broker whose grants do not cover /f/<F>/> (the sealed
-                   one always is) every read is made over the faces the cap files
+                   GUARDED broker whose grants do not cover /f/<F>/> (every one
+                   `on` runs) every read is made over the faces the cap files
                    grant, and BROKER says which
   --json           status only: the same data as one JSON object
   tail             follow the bus live, one line per record, until Ctrl-C
@@ -180,18 +201,21 @@ instance control sockets (fabric.toml) is read when the file has no command.
                    checked, the root (~/.local/share/aterm-fabric) made 0700, a node
                    id provisioned once, a mint secret and the node's 8 grants minted
                    (as one transaction), the broker installed and started under launchd
-                   (macOS) or systemd --user (Linux) and probed for real, `[fabric]
-                   command` written to aterm.toml (atomically, previous file kept
-                   as .bak), the rendezvous file written 0600, every running aterm
-                   instance armed with `fabric attach <argv>`, then a note posted
-                   from a session to itself and awaited back through the broker
-                   within 5 s; `aterm fabric` status prints last. A second `on`
-                   changes nothing and says so per step
+                   (macOS) or systemd --user (Linux) — the login's supervisors, so it
+                   stops at logout — and probed for real, `[fabric] command` written
+                   to aterm.toml (atomically, previous file kept as .bak), the
+                   rendezvous file written 0600, every running aterm instance armed
+                   with `fabric attach <argv>`, then a note posted from a session to
+                   itself and awaited back through the broker within 5 s; `aterm
+                   fabric` status prints last. A second `on` changes nothing and says
+                   so per step. A host that JOINED another's fleet is refused (`on`
+                   would leave it), and a bare `on` keeps the --tcp its job serves
   --dry-run        on/off/join only: print every step and touch nothing (join
                    still PROBES the remote broker, and the first attach of a
                    node's cap binds its producer id there: one hidden /a/bind
                    record in the first host's log, which the real join writes)
-  --fleet <F>      on and mint-for only: the fleet name (on: default local;
+  --fleet <F>      on and mint-for only: the fleet name (on: the fleet this root
+                   is configured for, else local — another is refused until `off`;
                    mint-for: this host's fleet)
   --service <s>    on/off/join only: launchd | systemd | none — `none` means the
                    broker is kept alive by something else (it must already answer),
@@ -232,10 +256,22 @@ instance control sockets (fabric.toml) is read when the file has no command.
                    a fresh n-<16 hex>; a malformed id, THIS host's own id, and a
                    host that JOINED another host's fleet (its node cap was not
                    minted under its secret) are refused
+  mint-for h-<name>
+                   any build, on the host that holds the mint secret: a PERSON's
+                   cap (a-<name> for an agent with a cap of its own) — the
+                   grants inbox and post below use: a send lane to any session in
+                   their name (trust=human for h-), their mail lane and its cursor,
+                   and the presence roster; a human also gets their own halt row
   --out <cap>      mint-for only: write the cap there, 0600, never over a different
                    file and never through a symlink; an identical one already there
                    is made 0600 (default: the 8 lines on stdout, the guidance on
                    stderr). The last lines are the `join` to run on the other host
+  --expires <N>d|<N>h
+                   mint-for only: stamp every grant `exp=` that far from now; the
+                   broker refuses the ring from that instant on, so a copied cap
+                   stops working by itself. Renew it by minting again and
+                   running `join` with the new cap: that host's bridge attaches
+                   it at its next redial. Without it the ring never expires
   join             on the SECOND host (a `sealed` build): check the key (64 hex,
                    0600) and the cap (0600, exactly one node's 8 grants — the node
                    and the fleet are read from it; a DIFFERENT node id already here
@@ -251,12 +287,28 @@ instance control sockets (fabric.toml) is read when the file has no command.
                    out through the REMOTE broker and back within 5 s. A second
                    `join` changes nothing and says so
   --broker <h:p>   join only: the first host's broker, as this host reaches it
-  --cap-file <c>   join only: this node's cap, from the first host's `mint-for`
   --node <id>      join only: assert this host's node id (must be the cap's)
   --accept-from <p>,...
                    join only: principals whose task arrives as a task, not a note —
                    the first host's node, for a manager there (this node is always
                    listed)
+  halt <reason>    as the human a --cap-file names: hold EVERY session on the
+                   fleet (hold=1 origin=fleet, ERR halted to every PTY-reaching
+                   verb), as each node reads the row. `halt off` withdraws that
+                   person's halt; nothing else lifts it (the Owner's `hold off` is
+                   ERR denied, and `fabric off` leaves the row for the next `on`)
+  inbox            as that person: the mail agents posted `to=<person>` (asks,
+                   reports, receipts, undeliverable/expired notices) since the last
+                   inbox, then everything it read is marked read, mail or none (one
+                   commit record) — the cursor is the broker's, so every host
+                   agrees. --peek marks nothing. Each ask prints its answer
+  post             as that person, to ONE session: to=@<sid>@<node> (what inbox
+                   prints), kind= ask|answer|task|report|note (default note),
+                   re=<off> to answer one; the rest of the line is the text. A
+                   human's task arrives as a task on every node; an a-<name>'s only
+                   where --accept-from lists it
+  --cap-file <c>   halt/inbox/post: the person's cap (`mint-for h-<name> --out`);
+                   join: this node's cap, from the first host's `mint-for`
 
 A message body never prints without `tail --bodies`; `status`, `tail` and `doctor`
 write nothing to disk. Exit status: 0 healthy, 1 a warning was printed (or the
@@ -285,10 +337,12 @@ const TRAFFIC_SCAN_MAX: u64 = 1 << 20;
 /// work and nobody has taken it.
 pub const STALE_WORK_MS: u64 = 10 * 60 * 1000;
 
-/// The per-read bound on every socket this report opens. An instance whose
-/// control thread is wedged, or a broker that accepted and never answers, must
-/// cost the operator a few seconds and a warning — never a hung terminal.
-const IO_TIMEOUT: Duration = Duration::from_secs(3);
+/// The bound on every socket this report and the operator's one-shot broker
+/// commands open: the dial, the sealed handshake, and each read and write
+/// ([`transport::connect`]). An instance whose control thread is wedged, a
+/// black-holed host, or a broker that accepted and never answers must cost the
+/// operator a few seconds and a warning — never a hung terminal.
+pub(crate) const IO_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// The kinds a session was GIVEN as work — the ones whose age is a warning.
 const WORK_KINDS: [&str; 2] = ["task", "ask"];
@@ -334,6 +388,9 @@ pub enum Cmd {
     MintFor(crate::join::MintForOpts),
     /// `aterm fabric join …` ([`crate::join::join`]).
     Join(crate::join::JoinOpts),
+    /// `aterm fabric halt|inbox|post --cap-file <cap> …` ([`crate::person`]):
+    /// the verb, and what it was told.
+    Person(String, crate::person::PersonCmd),
 }
 
 /// Parse argv (everything after `fabric`). Every refusal names the word.
@@ -348,11 +405,20 @@ pub fn parse_args(args: &[String]) -> Result<Cmd, String> {
         Some(v @ ("status" | "tail" | "on" | "off" | "doctor" | "mint-for" | "join")) => {
             (v, &args[1..])
         }
+        // A PERSON'S VERBS have their own grammar (a message, a reason) and
+        // their own parser.
+        Some(v @ ("halt" | "inbox" | "post")) => {
+            return Ok(match crate::person::parse(v, &args[1..])? {
+                Some(cmd) => Cmd::Person(v.to_string(), cmd),
+                None => Cmd::Help,
+            });
+        }
         Some("help" | "-h" | "--help") => return Ok(Cmd::Help),
         Some(flag) if flag.starts_with('-') => ("status", args),
         Some(other) => {
             return Err(format!(
-                "unknown subcommand `{}` (status, tail, on, off, doctor, mint-for, join or help)",
+                "unknown subcommand `{}` (status, tail, on, off, doctor, mint-for, join, halt, \
+                 inbox, post or help)",
                 safe(other, 64)
             ));
         }
@@ -378,6 +444,9 @@ pub fn parse_args(args: &[String]) -> Result<Cmd, String> {
             (_, "-h" | "--help") => return Ok(Cmd::Help),
             // `mint-for`: one positional, the node id (or `new`), and two flags.
             ("mint-for", "--out") => mint.out = Some(value()?),
+            ("mint-for", "--expires") => {
+                mint.expires = Some(crate::join::parse_lifetime(&value()?)?);
+            }
             ("mint-for", "--fleet") => {
                 let f = value()?;
                 if !crate::subject::is_fleet(&f) {
@@ -496,8 +565,8 @@ pub fn parse_args(args: &[String]) -> Result<Cmd, String> {
     }
     if verb == "mint-for" && mint.node.is_empty() {
         return Err(format!(
-            "mint-for needs a node id: the joining host's (its <root>/link-state/node), or `{}` \
-             for a fresh one",
+            "mint-for needs a node id: the joining host's (its <root>/link-state/node), `{}` \
+             for a fresh one, or a person (h-<name>)",
             crate::join::NEW_NODE
         ));
     }
@@ -543,6 +612,10 @@ pub fn main(args: &[String]) -> ExitCode {
         Ok(Cmd::Doctor { retire_ghosts, yes }) => crate::enable::doctor(retire_ghosts, yes),
         Ok(Cmd::MintFor(opts)) => crate::join::mint_for(&opts),
         Ok(Cmd::Join(opts)) => crate::join::join(&opts),
+        Ok(Cmd::Person(verb, cmd)) => match configured() {
+            Ok(cfg) => crate::person::main(&verb, &cmd, &cfg),
+            Err(code) => code,
+        },
         Err(e) => {
             eprintln!("aterm fabric: {e}");
             eprint!("{USAGE}");
@@ -810,6 +883,46 @@ pub fn serve_flags(command: &str) -> Option<Vec<String>> {
     Some(words[at + 1..].iter().map(|w| (*w).to_string()).collect())
 }
 
+/// The PROGRAM a bridge command runs — what [`serve_flags`] leaves out: its
+/// first word RESOLVED to the file it names (a bare word looked up on this
+/// process's `$PATH`, then every symlink followed), so `aterm` on PATH, the
+/// bundle it links into and an `aterm-link` link to the same file are one
+/// program; and any further words before the `link serve` verb, as written
+/// (`sh -c /tmp/x link serve …` is `/bin/sh -c /tmp/x`). A word that names no
+/// file is kept as written. `None` when the command is not a bridge.
+///
+/// Two commands with the same flags and different programs are two bridges:
+/// a substituted program holds the instance's `Scope::Bridge` lane, so it is
+/// named, never reported as this one (audit r4-17).
+#[must_use]
+pub fn bridge_program(command: &str) -> Option<String> {
+    let words: Vec<&str> = command.split_whitespace().collect();
+    let at = (0..words.len()).find(|&i| is_link_verb(&words, i, "serve"))?;
+    // `aterm link serve`: the `link` before the verb is the verb's own word.
+    let end = if words[at - 1] == "link" && at >= 2 {
+        at - 1
+    } else {
+        at
+    };
+    let mut program = vec![resolve_program(words[0])];
+    program.extend(words[1..end].iter().map(|w| (*w).to_string()));
+    Some(program.join(" "))
+}
+
+/// A program word as the file it names: a word with a `/` as a path, a bare
+/// word on `$PATH` ([`crate::enable::which_in`]), each canonicalized. The
+/// word itself when it names nothing.
+fn resolve_program(word: &str) -> String {
+    let path = if word.contains('/') {
+        Some(PathBuf::from(word))
+    } else {
+        std::env::var_os("PATH")
+            .and_then(|p| crate::enable::which_in(std::ffi::OsStr::new(word), &p))
+    };
+    path.and_then(|p| std::fs::canonicalize(p).ok())
+        .map_or_else(|| word.to_string(), |p| p.to_string_lossy().into_owned())
+}
+
 /// The bridge command's `Config`, through the bridge's own parser.
 pub(crate) fn bridge_config(command: &str) -> Result<Config, String> {
     let flags = serve_flags(command).ok_or_else(|| {
@@ -940,12 +1053,29 @@ pub struct BrokerView {
     pub endpoint: String,
     /// `unix`, `tcp` or `tcp+sealed`.
     pub transport: &'static str,
-    /// Whether a broker ANSWERED — a connect and a `Hello` round trip.
+    /// Whether a broker ANSWERED — a connect and a `Hello` round trip, in
+    /// this build's astream protocol.
     pub reachable: bool,
     /// Why it is not reachable, or why the cap file was refused.
     pub error: Option<String>,
+    /// A broker that answered the `Hello` in ANOTHER astream protocol
+    /// (astream's `ProtocolMismatch`): nothing either side sends can be read
+    /// by the other, so it is not `reachable`, and this names why.
+    pub protocol: Option<astream_broker::ProtocolMismatch>,
+    /// The last line the broker's supervisor captured from its stderr
+    /// (`<root>/broker.err`) and how old it is, read only when the broker
+    /// does not answer: the broker's own reason it is not running — a log it
+    /// refuses to open, an address in use — which `fabric on` otherwise only
+    /// points at ([`crate::enable::supervisor_last_word`]).
+    pub last_word: Option<String>,
     /// Whether every cap was attached, so the bus can be read.
     pub attached: bool,
+    /// Whether the broker refused the ring as LAPSED (astream's
+    /// [`astream_broker::BrokerRefusal::is_expired`]): genuine grants whose
+    /// `exp=` has passed, at the attach or on the head query. Its remedy is
+    /// the same ring minted again with a later expiry ([`CAP_LAPSED`]), not
+    /// another fleet, secret or node.
+    pub cap_expired: bool,
     /// The pid serving it, from the process table.
     pub pid: Option<u32>,
     /// The launchd job running that pid (macOS).
@@ -965,7 +1095,32 @@ pub struct BrokerView {
     /// step proves it — so a report is never held up by that port's
     /// handshake slots.
     pub serves_tcp: Option<String>,
+    /// Whether the broker CHECKS capabilities, MEASURED rather than read off
+    /// its argv: after the cap files attached and the head answered, the probe
+    /// attaches one grant minted under a secret no broker holds
+    /// ([`GUARD_PROBE_SECRET`]). A guarded broker refuses it (`Some(true)`); one
+    /// that acknowledges it checks nothing (`Some(false)`) — whatever its job
+    /// says, the cap-forced `<src>`, `trust=human` and per-human halts then
+    /// rest on nothing. `None` when no cap file was attached or the bus was
+    /// not read.
+    pub guarded: Option<bool>,
+    /// The executable the broker process was started as (its argv's first
+    /// word) when that path now names a DIFFERENT file than the one it runs:
+    /// it runs a REPLACED BUILD — an update swapped the file and this broker
+    /// predates the swap, so the broker-side fixes of the build on disk are
+    /// not running. A broker of this build exits on its own within a minute of
+    /// a swap (`aterm link broker`); one from before it waits for a login or
+    /// for `aterm fabric on`. `None` when it runs the file its argv names, or
+    /// when this host cannot say ([`replaced_build`]).
+    pub replaced: Option<String>,
 }
+
+/// The secret the guard probe mints its one throwaway grant under
+/// ([`BrokerView::guarded`]). Public by design — it only has to differ from
+/// every real mint secret, which `on` draws from the entropy source — and
+/// the grant is read-only and unbound, so even a broker it were valid on
+/// would bind no producer id for it.
+const GUARD_PROBE_SECRET: &[u8] = b"aterm fabric guard probe: no broker's secret";
 
 impl BrokerView {
     /// Whether the BUS WAS READ: the connect, the `Hello`, every attach AND
@@ -992,23 +1147,69 @@ impl BrokerView {
             broker_pid_tcp(procs, &self.endpoint)
         };
         self.launchd = self.pid.and_then(launchd_label);
+        self.replaced = self.pid.and_then(|pid| {
+            let cmd = &procs.iter().find(|p| p.pid == pid)?.cmd;
+            replaced_build(pid, cmd)
+        });
     }
 }
 
-/// One connection with a read and write bound on the socket underneath.
-///
-/// The connect itself is bounded too on TCP (a black-holed address costs
-/// IO_TIMEOUT, not the OS's SYN-retry schedule). The sealed wire keeps its
-/// handshake's own deadline, and every read and write after it is bounded
-/// through the closer — the one handle on the socket under the record layer — so
-/// a broker that completes the handshake and then never answers costs the
-/// operator IO_TIMEOUT, not a hung terminal.
-fn connect_bounded(t: &Transport, endpoint: &str) -> io::Result<Conn> {
-    let within = matches!(t, Transport::Tcp).then_some(IO_TIMEOUT);
-    let (conn, closer) = transport::connect_within(t, endpoint, within)?;
-    closer.set_read_timeout(Some(IO_TIMEOUT))?;
-    closer.set_write_timeout(Some(IO_TIMEOUT))?;
-    Ok(conn)
+/// The path the process `pid` was started as — `cmd`'s first word, which a
+/// supervisor runs again on restart — when the file there now is NOT the
+/// image `pid` runs: a replaced build ([`BrokerView::replaced`]). `None` when
+/// it is the same file, or when this host cannot say: a relative argv, no
+/// `/proc` (Linux) or `lsof` (macOS) answer, a path that is gone.
+fn replaced_build(pid: u32, cmd: &str) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let exe = cmd
+        .split_whitespace()
+        .next()
+        .filter(|w| w.starts_with('/'))?;
+    let running = running_image_inode(pid)?;
+    let now = std::fs::metadata(exe).ok()?.ino();
+    (now != running).then(|| exe.to_string())
+}
+
+/// The inode of the executable image `pid` runs, whatever has happened to its
+/// path since: `/proc/<pid>/exe` follows to it even once it is unlinked.
+#[cfg(target_os = "linux")]
+pub(crate) fn running_image_inode(pid: u32) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(format!("/proc/{pid}/exe"))
+        .ok()
+        .map(|m| m.ino())
+}
+
+/// The inode of the executable image `pid` runs: the first `txt` entry
+/// `lsof` lists for it, which keeps the inode the process mapped after a new
+/// file is renamed over its path ([`lsof_first_inode`]).
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn running_image_inode(pid: u32) -> Option<u64> {
+    let out = aterm_uds::spawnfd::command("/usr/sbin/lsof")
+        .args([
+            "-n",
+            "-P",
+            "-a",
+            "-p",
+            &pid.to_string(),
+            "-d",
+            "txt",
+            "-F",
+            "i",
+        ])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    lsof_first_inode(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// The first `i<inode>` field of `lsof -F i` output — the process's first
+/// `txt` file, its executable (`p<pid>` and `f<fd>` lines come first).
+#[cfg(any(not(target_os = "linux"), test))]
+fn lsof_first_inode(text: &str) -> Option<u64> {
+    text.lines()
+        .find_map(|l| l.strip_prefix('i').and_then(|n| n.parse().ok()))
 }
 
 /// The faces a report may read when the broker is guarded and `/f/<F>/>` is
@@ -1033,14 +1234,34 @@ pub fn readable_faces(fleet: &str, cap_files: &[String]) -> Vec<String> {
     faces.into_iter().collect()
 }
 
-/// Whether a broker error is the GUARD refusing a read (as opposed to a
-/// broken connection or a dead broker) — the one error a narrower read can
-/// answer.
+/// Whether the broker ANSWERED with a refusal ([`astream_broker::broker_refusal`])
+/// as opposed to a broken connection or a dead broker — the one error a
+/// narrower read can answer, and the one a forged attach draws from a broker
+/// that checks capabilities.
+///
+/// Read off the reply, not its words, and not narrowed to `ERR_UNAUTHORIZED`:
+/// a broker older than that code sends every guard refusal as `ERR_REFUSED`,
+/// and a narrower read retried after any other refusal costs one round trip
+/// and still reports the first error.
 fn refused(e: &io::Error) -> bool {
-    e.to_string().contains("unauthorized")
+    astream_broker::broker_refusal(e).is_some()
 }
 
-/// Reach the broker FOR REAL: connect, `Hello`, attach every cap, head query.
+/// Whether the broker refused a LAPSED capability — its own expiry refusal,
+/// told by astream ([`astream_broker::BrokerRefusal::is_expired`]), never by
+/// matching its words here.
+fn lapsed(e: &io::Error) -> bool {
+    astream_broker::broker_refusal(e).is_some_and(astream_broker::BrokerRefusal::is_expired)
+}
+
+/// The words `aterm fabric`'s warning for a lapsed ring is built from
+/// ([`BrokerView::cap_expired`]), and that `doctor` picks the renewal by
+/// ([`crate::enable::fix_for`]). Aterm's own words, so the remedy never rests
+/// on the broker's.
+pub const CAP_LAPSED: &str = "refuses this node's cap as lapsed";
+
+/// Reach the broker FOR REAL: connect, `Hello` (does a broker answer at all),
+/// the whole ring attached ([`transport::attach_ring`]), head query.
 pub(crate) fn probe_broker(cfg: &Config, procs: &[Proc]) -> (BrokerView, Option<Conn>) {
     let mut view = BrokerView {
         endpoint: cfg.broker.clone(),
@@ -1049,32 +1270,51 @@ pub(crate) fn probe_broker(cfg: &Config, procs: &[Proc]) -> (BrokerView, Option<
     };
     view.locate(procs);
     let started = Instant::now();
-    let mut conn = match connect_bounded(&cfg.transport, &cfg.broker) {
-        Ok(c) => c,
+    // Bounded from the dial on: a black-holed sealed host 1 costs `fabric join`
+    // and this report IO_TIMEOUT, not the OS's SYN schedule.
+    let mut conn = match transport::connect(&cfg.transport, &cfg.broker, IO_TIMEOUT) {
+        Ok((c, _)) => c,
         Err(e) => {
             view.error = Some(format!("connect: {e}"));
+            view.last_word = supervisor_last_word(cfg);
             return (view, None);
         }
     };
     if let Err(e) = conn.hello() {
-        view.error = Some(format!("the socket accepted but no broker answered: {e}"));
+        // A BROKER DID ANSWER, in a protocol this build cannot read: say that,
+        // not "nobody answered" — the remedy is a release, not a restart.
+        match astream_broker::protocol_mismatch(&e) {
+            Some(skew) => {
+                view.protocol = Some(*skew);
+                view.error = Some(format!(
+                    "a broker answered in another astream protocol: {e}"
+                ));
+            }
+            None => {
+                view.error = Some(format!("the socket accepted but no broker answered: {e}"));
+                view.last_word = supervisor_last_word(cfg);
+            }
+        }
         return (view, None);
     }
     view.reachable = true;
+    let mut ring = Vec::new();
     for path in &cfg.cap_files {
-        let caps = match read_cap_file(path) {
-            Ok(c) => c,
+        match read_cap_file(path) {
+            Ok(caps) => ring.extend(caps),
             Err(e) => {
                 view.error = Some(format!("cap file {path}: {e}"));
                 return (view, None);
             }
-        };
-        for cap in caps {
-            if let Err(e) = conn.attach(&cap.grant, &cap.tag) {
-                view.error = Some(format!("the broker refused `{}`: {e}", cap.grant));
-                return (view, None);
-            }
         }
+    }
+    if let Err(e) = transport::attach_ring(&mut conn, &ring) {
+        view.cap_expired = lapsed(&e);
+        view.error = Some(format!(
+            "the broker refused the ring in {}: {e}",
+            cfg.cap_files.join(" ")
+        ));
+        return (view, None);
     }
     view.attached = true;
     // THE HEAD IS GLOBAL, whichever filter asks: the whole fleet first, and on
@@ -1095,6 +1335,7 @@ pub(crate) fn probe_broker(cfg: &Config, procs: &[Proc]) -> (BrokerView, Option<
                     view.faces = Some(faces);
                 }
                 None => {
+                    view.cap_expired = lapsed(&e);
                     view.error = Some(format!("head query: {e}"));
                     return (view, None);
                 }
@@ -1106,7 +1347,61 @@ pub(crate) fn probe_broker(cfg: &Config, procs: &[Proc]) -> (BrokerView, Option<
         }
     }
     view.rtt_ms = Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
+    // THE GUARD, MEASURED (`BrokerView::guarded`). A refused attach is an
+    // answer on a live connection — the ring already attached is untouched —
+    // so the report goes on reading through `conn`; a transport error says
+    // nothing about the guard and leaves it unknown.
+    if !cfg.cap_files.is_empty() {
+        if let Ok(probe) = astream_cap::mint(
+            GUARD_PROBE_SECRET,
+            &format!("ro:{}", crate::subject::fleet_filter(&cfg.fleet)),
+        ) {
+            view.guarded = match conn.attach(&probe.filter, &probe.tag) {
+                Ok(_) => Some(false),
+                Err(e) if refused(&e) => Some(true),
+                Err(_) => None,
+            };
+        }
+    }
     (view, Some(conn))
+}
+
+/// The last word of the broker's supervisor for the fabric root `cfg` points
+/// into ([`BrokerView::last_word`]): the root's `broker.err`, through the one
+/// reader `fabric on` uses ([`crate::enable::supervisor_last_word`]). `None`
+/// for a command with no root, or a root whose supervisor wrote nothing.
+fn supervisor_last_word(cfg: &Config) -> Option<String> {
+    let local = if matches!(cfg.transport, Transport::Unix) {
+        None
+    } else {
+        crate::enable::Rendezvous::read().ok().flatten()
+    };
+    supervisor_last_word_for(cfg, local.as_ref())
+}
+
+fn supervisor_last_word_for(
+    cfg: &Config,
+    local: Option<&crate::enable::Rendezvous>,
+) -> Option<String> {
+    let root = crate::enable::root_of(&cfg.transport, &cfg.broker, cfg.cap_files.first())?;
+    if !matches!(cfg.transport, Transport::Unix) {
+        // A joined host's cap directory is local, but its broker is not.
+        // Only this same root's recorded SERVED wire can attribute local
+        // supervisor stderr to a TCP/sealed endpoint. The role metadata is
+        // sufficient; neither a cap nor a key is opened to establish it.
+        let local = local?;
+        if local.key_file.is_some()
+            || local.serves_tcp.as_deref() != Some(cfg.broker.as_str())
+            || !local
+                .serves_key_file
+                .as_ref()
+                .is_some_and(|key| !key.is_empty())
+            || crate::enable::root_of(&Transport::Unix, &local.broker, None)? != root
+        {
+            return None;
+        }
+    }
+    crate::enable::supervisor_last_word(&root)
 }
 
 // ---------------------------------------------------------------------------
@@ -1169,7 +1464,7 @@ pub fn traffic_of(fleet: &str, off: u64, subject: &str, raw: &[u8]) -> Traffic {
 }
 
 /// [`traffic_of`] over a body already decoded.
-fn traffic_of_body(fleet: &str, off: u64, subject: &str, body: Body) -> Traffic {
+pub(crate) fn traffic_of_body(fleet: &str, off: u64, subject: &str, body: Body) -> Traffic {
     let relayed = body.via.is_some();
     let segs: Vec<&str> = subject.split('/').collect();
     let seg = |i: usize| safe(segs.get(i).copied().unwrap_or("-"), 128);
@@ -1532,7 +1827,8 @@ pub struct LocalSession {
     pub posts: Option<u64>,
     /// Every row above the watermark, for the age check.
     pub unhandled: Vec<MsgMeta>,
-    /// The last recorded hold transition's `(reason, origin)`, when held.
+    /// The last recorded hold transition's `(reason, origins)`, when held
+    /// ([`last_hold`]): `fleet,local` when both slots stand.
     pub hold_why: Option<(String, String)>,
     /// The BROADCAST TOPICS this session has opted into (`topic ls`), in topic
     /// order. Empty (the default) means it receives no broadcast at all — which
@@ -1568,8 +1864,19 @@ pub struct InstanceView {
     pub link_age_ms: Option<u64>,
     /// `fabric status`'s `supervised=`.
     pub supervised: Option<bool>,
+    /// `fabric status`'s `build=` — the instance's own build — and
+    /// `bridge_build=`, the build its bridge named in `hello` (absent from an
+    /// instance or a bridge from before the handshake).
+    pub build: Option<String>,
+    pub bridge_build: Option<String>,
+    /// `fabric status`'s `lane_faults=`: how many of its bridge's lines the
+    /// instance could not parse.
+    pub lane_faults: Option<u64>,
     /// The command it runs (or was launched with), decoded.
     pub command: Option<String>,
+    /// The PROGRAM that command runs ([`bridge_program`]): resolved when the
+    /// report was read, so a substituted program is named beside its flags.
+    pub program: Option<String>,
     /// Its bridge child pid(s), from the process table.
     pub bridge_pids: Vec<u32>,
     /// The node its bridge answers as, from that command's state dir.
@@ -1646,8 +1953,15 @@ pub fn fill_inbox(s: &mut LocalSession, header0: &str, posts: &[String], full: &
     s.unread = Some((s.unhandled.len() as u64).saturating_sub(s.pending.unwrap_or(0)));
 }
 
-/// The `(reason, origin)` of the LAST `kind=hold` transition in a `timeline`
-/// reply, when it put the hold on.
+/// The `(reason, origins)` of the LAST `kind=hold` transition in a `timeline`
+/// reply, when the session was held after it.
+///
+/// An endpoint holds one slot per origin, and each `hold` row says what stands
+/// after its transition: `reason=`/`origin=` the first hold (the fleet's when
+/// both stand), `hold_origin=` every origin standing — `fleet,local` for the
+/// fleet's halt beside the owner's own stop, which is what this returns as the
+/// origins then. A row from an endpoint before the two slots names its one
+/// hold's `origin=`, which is returned as it is.
 #[must_use]
 pub fn last_hold(timeline: &[String]) -> Option<(String, String)> {
     let row = timeline
@@ -1661,7 +1975,10 @@ pub fn last_hold(timeline: &[String]) -> Option<(String, String)> {
     }
     Some((
         crate::pct::decode(kv(row, "reason").unwrap_or("?")),
-        kv(row, "origin").unwrap_or("?").to_string(),
+        kv(row, "hold_origin")
+            .or_else(|| kv(row, "origin"))
+            .unwrap_or("?")
+            .to_string(),
     ))
 }
 
@@ -1746,9 +2063,15 @@ fn read_instance(pid: u32, sock: &str, procs: &[Proc], sessions: bool) -> Option
             v.rtt_ms = kv(h, "rtt_ms").and_then(|n| n.parse().ok());
             v.link_age_ms = kv(h, "link_age_ms").and_then(|n| n.parse().ok());
             v.supervised = kv(h, "supervised").map(|s| s == "1");
+            v.build = kv(h, "build").filter(|b| *b != "-").map(str::to_string);
+            v.bridge_build = kv(h, "bridge_build")
+                .filter(|b| *b != "-")
+                .map(str::to_string);
+            v.lane_faults = kv(h, "lane_faults").and_then(|n| n.parse().ok());
             v.command = kv(h, "command")
                 .filter(|c| *c != "-")
                 .map(crate::pct::decode);
+            v.program = v.command.as_deref().and_then(bridge_program);
         }
         Err(e) => {
             v.error = Some(e);
@@ -1871,6 +2194,11 @@ pub struct NodeRow {
     pub state: String,
     /// Its `fabric=`.
     pub fabric: String,
+    /// The astream protocol it speaks (`proto=`), `-` from a node whose
+    /// bridge predates the token.
+    pub proto: String,
+    /// The aterm release it runs (`aterm=`), `-` likewise.
+    pub aterm: String,
 }
 
 /// Everything `status` found.
@@ -1883,6 +2211,9 @@ pub struct Report {
     /// Whether its program lies in a cargo target directory
     /// ([`in_cargo_target_dir`]).
     pub program_in_target_dir: bool,
+    /// The PROGRAM the command runs ([`bridge_program`]), resolved when the
+    /// report was read — what each instance's own is compared with.
+    pub program: Option<String>,
     /// The config file looked in, if any.
     pub config_path: Option<PathBuf>,
     /// The parsed bridge config.
@@ -2034,10 +2365,12 @@ pub fn gather() -> Result<Report, Off> {
         .split_whitespace()
         .next()
         .is_some_and(|p| in_cargo_target_dir(Path::new(p)));
+    let program = bridge_program(&command);
     let mut report = Report {
         source,
         command,
         program_in_target_dir,
+        program,
         config_path,
         cfg,
         presence,
@@ -2117,18 +2450,18 @@ fn in_cargo_target_dir(program: &Path) -> bool {
 }
 
 /// Every standing fleet halt: `(human, reason)` for each `Last{/f/<F>/fleet/*/halt}`
-/// row that says `state=on`. A read failure is an empty list — the presence
-/// rows' `hold=` still shows a halt the nodes applied.
+/// row a bridge applies — a human's row that says `state=on`, read by the
+/// bridge's own rule ([`crate::subject::parse_halt`]), so this never reports a
+/// halt no bridge holds a session for. A read failure is an empty list — the
+/// presence rows' `hold=` still shows a halt the nodes applied.
 fn fleet_halts(conn: &mut Conn, fleet: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let filter = format!("/f/{fleet}/fleet/*/halt");
     let _ = transport::walk_last(conn, &filter, |(_, subject, raw)| {
-        let line = String::from_utf8_lossy(raw);
-        if kv(&line, "state") == Some("on") {
-            let who = subject.split('/').nth(4).unwrap_or("-");
+        if let Some(row) = crate::subject::parse_halt(fleet, subject, raw).filter(|r| r.on) {
             out.push((
-                safe(who, 64),
-                crate::pct::decode(kv(&line, "reason").unwrap_or("-")),
+                safe(row.human, 64),
+                crate::pct::decode(row.reason.as_deref().unwrap_or("-")),
             ));
         }
         Ok(())
@@ -2156,6 +2489,8 @@ fn join_sessions(report: &mut Report, roster: Option<&crate::glance::Glance>) {
                     host: crate::pct::decode(row.field("host")),
                     state: row.field("state").to_string(),
                     fabric: row.field("fabric").to_string(),
+                    proto: row.field("proto").to_string(),
+                    aterm: crate::pct::decode(row.field("aterm")),
                 });
             } else {
                 bus.entry(row.owner.clone()).or_default().push(row);
@@ -2283,10 +2618,30 @@ fn warnings(
         }
     }
 
-    if !r.broker.reachable {
+    if let Some(skew) = r.broker.protocol {
+        w.push(format!(
+            "the broker at {broker} speaks astream protocol {} and this aterm speaks {}: \
+             neither can read what the other sends, so no record lands and none is delivered",
+            skew.broker, skew.client
+        ));
+    } else if !r.broker.reachable {
+        // THE BROKER'S OWN WORD, when its supervisor captured one: the reason
+        // it is not running is usually there, and a restart into the same
+        // refusal is not the remedy for it.
+        let last = r.broker.last_word.as_deref().map_or_else(String::new, |l| {
+            format!("; its supervisor's broker.err, {}", safe(l, 256))
+        });
         w.push(format!(
             "the broker at {broker} does not answer ({}): no record lands and none is \
-             delivered",
+             delivered{last}",
+            safe(r.broker.error.as_deref().unwrap_or("unknown"), 256)
+        ));
+    } else if r.broker.cap_expired {
+        // A LAPSED RING is not a ring that does not cover the fleet: the same
+        // grants, minted again with a later `exp=`, are the cure.
+        w.push(format!(
+            "the broker at {broker} {CAP_LAPSED} (its grants' `exp=` has passed): no record of \
+             this node lands and none is delivered to it — {}",
             safe(r.broker.error.as_deref().unwrap_or("unknown"), 256)
         ));
     } else if !r.broker.read_ok() {
@@ -2295,32 +2650,25 @@ fn warnings(
             safe(r.broker.error.as_deref().unwrap_or("unknown"), 256)
         ));
     }
+    if let (Some(pid), Some(exe)) = (r.broker.pid, &r.broker.replaced) {
+        w.push(format!(
+            "the broker (pid {pid}) runs a replaced build: {} is another file than the one it \
+             started from, so the broker-side fixes of the build on disk are not running",
+            safe(exe, 256)
+        ));
+    }
+    if r.broker.guarded == Some(false) {
+        w.push(format!(
+            "the broker at {broker} checks no capability (it accepted one it cannot verify): \
+             any process that reaches it can publish as any node or human, and set or lift any \
+             fleet halt"
+        ));
+    }
 
     if let Some(e) = &r.discovery_error {
         w.push(format!(
             "cannot list this machine's aterm instances: {}",
             safe(e, 512)
-        ));
-    }
-    // Bridges sharing one state dir share one node id, so they are ONE node on
-    // the bus: each reads that node's whole inbox lane (a group subscription
-    // resumes every member from the one committed cursor), and a bridge files a
-    // record for a session its own instance does not host as `undeliverable
-    // reason=not-hosted` (`Bridge::on_inbox_record`).
-    let mut by_state: BTreeMap<String, Vec<u32>> = BTreeMap::new();
-    for inst in &r.instances {
-        if let (Some(dir), Some(true)) = (&inst.state_dir, inst.supervised) {
-            by_state.entry(dir.clone()).or_default().push(inst.pid);
-        }
-    }
-    for (dir, pids) in by_state.iter().filter(|(_, p)| p.len() > 1) {
-        let list: Vec<String> = pids.iter().map(u32::to_string).collect();
-        w.push(format!(
-            "instances {} run bridges on ONE state dir ({}), so as ONE node: both read \
-             that node's whole inbox lane, and each files the mail for the other's \
-             sessions as undeliverable (not-hosted)",
-            list.join(", "),
-            safe(dir, 256)
         ));
     }
     let config_flags = serve_flags(&r.command);
@@ -2349,6 +2697,32 @@ fn warnings(
                 "instance {pid}'s bridge is down (fabric=disconnected): its sessions get no \
                  mail and their posts queue; aterm relaunches the bridge"
             )),
+            // ONE STATE DIR IS ONE BRIDGE (`bridge::hold_state_dir`): this
+            // instance's bridge found its `--state` held and stands by, carrying
+            // nothing, until the holder exits. The holder is named when it is an
+            // instance in this report.
+            (Some("stalled"), _) if inst.reason.as_deref() == Some("state-locked") => {
+                let holder = r
+                    .instances
+                    .iter()
+                    .find(|o| {
+                        o.pid != pid
+                            && o.state_dir.is_some()
+                            && o.state_dir == inst.state_dir
+                            && o.reason.as_deref() != Some("state-locked")
+                    })
+                    .map_or_else(
+                        || "another bridge".to_string(),
+                        |o| format!("instance {}'s bridge", o.pid),
+                    );
+                w.push(format!(
+                    "instance {pid}'s bridge stands by (fabric=stalled reason=state-locked): \
+                     {holder} holds its state dir {}, and one state dir is one node — its \
+                     sessions receive no mail and no fleet halt, and their posts queue until \
+                     that bridge exits",
+                    safe(inst.state_dir.as_deref().unwrap_or("-"), 256)
+                ));
+            }
             // THE BRIDGE IS UP AND ITS LINK IS NOT: it redials with back-off
             // (100 ms to 5 s) and says nothing in between — a killed, wedged or
             // misnamed broker. `reason=starting` is the token between the
@@ -2362,14 +2736,29 @@ fn warnings(
                      {broker}"
                 ));
             }
-            (Some("stalled"), _) => w.push(format!(
-                "instance {pid}'s bridge is attached but its broker link is down \
-                 (fabric=stalled reason={}, last ack {}): its posts queue and no mail \
-                 arrives from the broker at {broker}",
-                safe(inst.reason.as_deref().unwrap_or("-"), 32),
-                inst.link_age_ms
-                    .map_or_else(|| "never".to_string(), |a| format!("{} ago", age(a)))
-            )),
+            (Some("stalled"), _) => {
+                let reason = inst.reason.as_deref().unwrap_or("-");
+                // A DIAL NOTHING ANSWERS, on the broker this report probed
+                // and found silent: the supervisor's last word goes with it,
+                // quoted as on the broker's own warning, so the fix for this
+                // bridge is the one that line names (a log the broker refuses,
+                // an address in use) rather than a restart into the same
+                // refusal (`enable::fix_for`).
+                let last = match (reason, r.broker.last_word.as_deref()) {
+                    ("no-socket" | "refused", Some(l)) if same_broker && !r.broker.reachable => {
+                        format!("; its supervisor's broker.err, {}", safe(l, 256))
+                    }
+                    _ => String::new(),
+                };
+                w.push(format!(
+                    "instance {pid}'s bridge is attached but its broker link is down \
+                     (fabric=stalled reason={}, last ack {}): its posts queue and no mail \
+                     arrives from the broker at {broker}{last}",
+                    safe(reason, 32),
+                    inst.link_age_ms
+                        .map_or_else(|| "never".to_string(), |a| format!("{} ago", age(a)))
+                ));
+            }
             // OWED AND SILENT: the helper itself is wedged, holding both lanes
             // open and answering nothing (a dead broker reads `stalled`, a dead
             // helper `disconnected`).
@@ -2390,14 +2779,47 @@ fn warnings(
             )),
             _ => {}
         }
+        // A BRIDGE OF ANOTHER BUILD THAN ITS INSTANCE, as the two named
+        // themselves (`hello`, `fabric status build=`): `[fabric] command`
+        // names another `aterm` than this one — a dev build first on PATH, a
+        // sealed build, the installed CLI an update replaced. Said, because
+        // the two speak the older lane of the two and a line one cannot parse
+        // holds its mail back; refused nowhere.
+        if let (Some(theirs), Some(ours)) = (&inst.bridge_build, &inst.build) {
+            if theirs != ours {
+                w.push(format!(
+                    "instance {pid}'s bridge is another build than the instance: bridge {}, \
+                     instance {}",
+                    safe(theirs, 64),
+                    safe(ours, 64)
+                ));
+            }
+        }
+        if let Some(n) = inst.lane_faults.filter(|n| *n > 0) {
+            w.push(format!(
+                "instance {pid} could not parse {n} of its bridge's lines (lane_faults={n}): \
+                 the mail they carried is held back on the bus, not lost"
+            ));
+        }
+        // THE PROGRAM IS COMPARED TOO, not only the flags: a substituted
+        // program armed with this command's flags holds the instance's bridge
+        // lane, and is named rather than reported as this bridge (r4-17).
+        let program_differs = inst.program.is_some() && inst.program != r.program;
         if inst.supervised == Some(true)
-            && inst.command.as_deref().and_then(serve_flags) != config_flags
+            && (inst.command.as_deref().and_then(serve_flags) != config_flags || program_differs)
             && r.source != Source::Instance(pid)
         {
             let differs = own.as_ref().map_or_else(
                 || "it cannot be parsed as a bridge".to_string(),
                 |c| {
                     let mut d = Vec::new();
+                    if program_differs {
+                        d.push(format!(
+                            "program {} (not {})",
+                            safe(inst.program.as_deref().unwrap_or("-"), 256),
+                            safe(r.program.as_deref().unwrap_or("-"), 256)
+                        ));
+                    }
                     for (flag, theirs, ours) in [
                         ("--fleet", &c.fleet, &r.cfg.fleet),
                         ("--broker", &c.broker, &r.cfg.broker),
@@ -2427,9 +2849,10 @@ fn warnings(
         }
         // What the FLEET'S OWN DIRECTORY says about this instance's node: a
         // `connected` bridge whose node the bus retains as `state=gone` is
-        // invisible to every peer (e.g. a second bridge on the same state dir
-        // exited and its will fired; the survivor never republishes presence
-        // unprompted).
+        // invisible to every peer (measured 2026-09-14: a second bridge on the
+        // same state dir exited and its will fired over the survivor, which
+        // never republishes presence unprompted — the case the state dir's
+        // lock now refuses, kept for a copy of the dir on another machine).
         if inst.fabric.as_deref() == Some("connected") {
             if let Some(row) = inst
                 .node
@@ -2557,6 +2980,24 @@ fn warnings(
             safe(reason, 128)
         ));
     }
+    // A HALT THIS NODE KEEPS WITH NO ROW ON THE BUS. Read on a bus log since
+    // replaced, it stands on the state dir alone (`bridge::apply_fleet_halts`),
+    // so no `Last` above shows it and the sessions it holds read HELD with no
+    // halter named; only its human's own row on this log lifts it.
+    let kept = if r.cfg.state_dir.is_empty() {
+        BTreeMap::new()
+    } else {
+        crate::state::StateDir::peek(&r.cfg.state_dir).standing_halts(&r.cfg.fleet)
+    };
+    for (who, halt) in kept.into_iter().filter(|(_, h)| h.kept) {
+        w.push(format!(
+            "{}'s fleet halt (reason={}) stands on this node with no row on the bus: it was \
+             read on a bus log since replaced, and only {0}'s own `state=off` on this log \
+             lifts it",
+            safe(&who, 64),
+            safe(&crate::pct::decode(&halt.reason), 128)
+        ));
+    }
     w
 }
 
@@ -2566,7 +3007,7 @@ fn warnings(
 
 /// The local clock's offset from UTC in seconds, from `date +%z`; `None` when it
 /// cannot be run, and then every time prints in UTC and says so.
-fn local_offset() -> Option<i64> {
+pub(crate) fn local_offset() -> Option<i64> {
     static OFFSET: std::sync::OnceLock<Option<i64>> = std::sync::OnceLock::new();
     *OFFSET.get_or_init(|| {
         let out = aterm_uds::spawnfd::command("date")
@@ -2615,7 +3056,7 @@ pub fn clock(t_ms: u64, now_ms: u64, offset: i64) -> String {
 }
 
 /// How the times in this report are zoned, for the header.
-fn zone_label(offset: Option<i64>) -> String {
+pub(crate) fn zone_label(offset: Option<i64>) -> String {
     match offset {
         None => "times UTC".to_string(),
         Some(o) => {
@@ -2715,20 +3156,6 @@ pub fn node_where(r: &Report, node: &str) -> &'static str {
     }
 }
 
-/// Attach every cap in `cfg`'s cap files to `conn`.
-///
-/// # Errors
-///
-/// A cap file that cannot be read, or a cap the broker refused.
-pub(crate) fn attach_caps(conn: &mut Conn, cfg: &Config) -> io::Result<()> {
-    for path in &cfg.cap_files {
-        for cap in read_cap_file(path)? {
-            conn.attach(&cap.grant, &cap.tag)?;
-        }
-    }
-    Ok(())
-}
-
 /// The report's node, and a broker connection with its caps attached: what a
 /// doctor action on this node's presence rows starts from.
 fn node_conn(report: &Report) -> io::Result<(&str, Conn)> {
@@ -2746,8 +3173,8 @@ fn report_node(report: &Report) -> io::Result<&str> {
 
 /// A broker connection with this node's caps attached.
 fn connect_attached(cfg: &Config) -> io::Result<Conn> {
-    let (mut conn, _closer) = transport::connect(&cfg.transport, &cfg.broker)?;
-    attach_caps(&mut conn, cfg)?;
+    let (mut conn, _closer) = transport::connect(&cfg.transport, &cfg.broker, IO_TIMEOUT)?;
+    transport::attach_cap_files(&mut conn, &cfg.cap_files)?;
     Ok(conn)
 }
 
@@ -2761,18 +3188,35 @@ fn connect_attached(cfg: &Config) -> io::Result<Conn> {
 /// ([`crate::bridge::adoptable`]).
 ///
 /// The sequence comes from the state dir, in the CURRENT incarnation's range,
-/// and is reserved durably before the publish. That is safe only because the
-/// caller refused when a bridge was running; see `enable::retire_ghosts_action`.
+/// reserved durably before the publish by the bridge's own reservation
+/// ([`crate::state::StateDir::reserve_next_sequence`]) — and under the
+/// bridge's own lock ([`crate::state::StateDir::lock_bridge`]), held for the
+/// whole run, so a bridge that starts meanwhile stands by rather than
+/// reserving from the same counter. `enable::retire_ghosts_action` asks a
+/// running bridge instead; the lock is what makes "no bridge is running" a
+/// fact here rather than that caller's reading of the instance list.
 ///
 /// # Errors
 ///
-/// The broker, the caps, the state dir, or a row that is no longer on the bus.
+/// The broker, the caps, the state dir (held by a bridge included), or a row
+/// that is no longer on the bus.
 pub fn publish_exited(report: &Report, ghosts: &[(String, String)]) -> io::Result<usize> {
     let cfg = &report.cfg;
     // The state dir before the broker: a retirement reserves its sequences
-    // there, so a state dir that cannot open never costs a connection.
+    // there, so a state dir that cannot open — or that a bridge holds — never
+    // costs a connection.
     let node = report_node(report)?;
     let state = crate::state::StateDir::open(&cfg.state_dir)?;
+    let _held = state.lock_bridge().map_err(|e| {
+        if e.kind() == io::ErrorKind::WouldBlock {
+            io::Error::new(
+                e.kind(),
+                format!("{e}: a running bridge retires these itself — re-run so it is asked"),
+            )
+        } else {
+            e
+        }
+    })?;
     let mut conn = connect_attached(cfg)?;
     // The rows as they stand, so the retirement carries their own fields.
     let mut live: BTreeMap<String, String> = BTreeMap::new();
@@ -2785,23 +3229,27 @@ pub fn publish_exited(report: &Report, ghosts: &[(String, String)]) -> io::Resul
     })?;
 
     let producer_id = astream_cap::producer_id_of(node);
-    let base = state.incarnation() << 32;
-    let mut seq = state.sequence().max(base);
+    let inc = state.incarnation();
     let mut done = 0;
     for (sid, _) in ghosts {
         let Some(body) = live.get(sid) else { continue };
         let rewritten = retired_body(body);
         let subject = crate::subject::session_face(&cfg.fleet, node, sid, "presence");
-        seq += 1;
-        state.reserve_sequence(seq)?;
+        let seq = state.reserve_next_sequence(inc)?;
         let (off, deduped) = conn.publish(producer_id, seq, &subject, rewritten.as_bytes())?;
         // A DEDUPED PUBLISH IS A FAILURE: the broker answers a re-sent
         // `(producer_id, seq)` with the original offset and appends nothing,
         // so the row would still read `live` while this reported success.
+        // `seq` is written without a flush (`crate::state`'s module doc), so
+        // a power loss can roll it back below what the bus holds: this run
+        // does not roll the incarnation past that, a bridge's attach does.
         if deduped {
             return Err(io::Error::other(format!(
                 "the broker deduped the retirement of @{sid} at @{off}: this node's \
-                 sequence {seq} was already used — is a bridge running?"
+                 sequence {seq} was already used under its producer id — by a copy of this \
+                 state dir, a holder of the node cap, or this node before a power loss rolled \
+                 its sequence file back (start the instance once, so its bridge moves to a \
+                 new incarnation, and run this again)"
             )));
         }
         done += 1;
@@ -3064,10 +3512,12 @@ fn render_nodes(r: &Report) -> String {
                 safe(&n.node, 64),
                 node_where(r, &n.node).to_string(),
                 format!(
-                    "host={} state={} fabric={}",
+                    "host={} state={} fabric={} proto={} aterm={}",
                     safe(&n.host, 64),
                     safe(&n.state, 16),
-                    safe(&n.fabric, 16)
+                    safe(&n.fabric, 16),
+                    safe(&n.proto, 8),
+                    safe(&n.aterm, 64)
                 ),
                 live_sessions_on(r, &n.node).to_string(),
             ]
@@ -3242,16 +3692,36 @@ pub fn render_text(r: &Report) -> String {
     ));
     kvs.push((
         "pid",
-        match (b.pid, &b.launchd) {
-            (Some(p), Some(l)) => format!("{p} (launchd {})", safe(l, 128)),
-            (Some(p), None) => format!("{p}"),
-            (None, _) => "- (no `link broker` process serves this socket)".to_string(),
-        },
+        format!(
+            "{}{}",
+            match (b.pid, &b.launchd) {
+                (Some(p), Some(l)) => format!("{p} (launchd {})", safe(l, 128)),
+                (Some(p), None) => format!("{p}"),
+                (None, _) => "- (no `link broker` process serves this socket)".to_string(),
+            },
+            b.replaced
+                .as_deref()
+                .map_or_else(String::new, |exe| format!(
+                    " — RUNS A REPLACED BUILD: {} is another file now",
+                    safe(exe, 256)
+                ))
+        ),
     ));
     kvs.push((
         "bus head",
         b.head.map_or_else(|| "-".to_string(), |h| format!("@{h}")),
     ));
+    if let Some(guarded) = b.guarded {
+        kvs.push((
+            "guard",
+            if guarded {
+                "yes — it refused a capability it cannot verify, so every attach is checked"
+                    .to_string()
+            } else {
+                "NO — it accepted a capability it cannot verify: it checks none".to_string()
+            },
+        ));
+    }
     if let Some(faces) = &b.faces {
         kvs.push((
             "reads",
@@ -3305,6 +3775,11 @@ pub fn render_text(r: &Report) -> String {
             },
             node,
             bus,
+            // THE PROGRAM IT WAS ARMED WITH, resolved ([`bridge_program`]):
+            // the flags alone cannot say which process holds the lane.
+            i.program
+                .as_deref()
+                .map_or_else(|| "-".to_string(), |p| safe(p, 256)),
         ]);
     }
     // Another node's row is in NODES, above: this table is this machine's
@@ -3321,9 +3796,10 @@ pub fn render_text(r: &Report) -> String {
                 "BRIDGE",
                 "NODE",
                 "ON THE BUS",
+                "PROGRAM",
             ],
             &rows,
-            &[true, false, false, true, false, false],
+            &[true, false, false, true, false, false, false],
         );
     }
 
@@ -3574,6 +4050,7 @@ pub fn render_json(r: &Report) -> String {
                     ),
                 ),
                 ("command", J::opt_s(i.command.as_deref())),
+                ("program", J::opt_s(i.program.as_deref())),
                 ("node", J::opt_s(i.node.as_deref())),
                 ("error", J::opt_s(i.error.as_deref())),
             ])
@@ -3651,6 +4128,8 @@ pub fn render_json(r: &Report) -> String {
                 ("host", J::s(&n.host)),
                 ("state", J::s(&n.state)),
                 ("fabric", J::s(&n.fabric)),
+                ("proto", J::s(&n.proto)),
+                ("aterm", J::s(&n.aterm)),
                 ("this", J::Bool(r.node.as_deref() == Some(n.node.as_str()))),
                 ("where", J::s(node_where(r, &n.node))),
                 ("sessions", J::Num(live_sessions_on(r, &n.node) as u64)),
@@ -3695,6 +4174,7 @@ pub fn render_json(r: &Report) -> String {
                     }),
                 ),
                 ("command", J::s(&r.command)),
+                ("program", J::opt_s(r.program.as_deref())),
                 ("fleet", J::s(&r.cfg.fleet)),
                 ("node", J::opt_s(r.node.as_deref())),
                 ("presence", J::s(r.presence.name())),
@@ -3714,12 +4194,15 @@ pub fn render_json(r: &Report) -> String {
                 ("transport", J::s(b.transport)),
                 ("reachable", J::Bool(b.reachable)),
                 ("attached", J::Bool(b.attached)),
+                ("cap_expired", J::Bool(b.cap_expired)),
                 ("error", J::opt_s(b.error.as_deref())),
                 ("pid", J::opt_n(b.pid.map(u64::from))),
                 ("launchd", J::opt_s(b.launchd.as_deref())),
                 ("head", J::opt_n(b.head)),
                 ("rtt_ms", J::opt_n(b.rtt_ms)),
                 ("serves_tcp", J::opt_s(b.serves_tcp.as_deref())),
+                ("guarded", b.guarded.map_or(J::Null, J::Bool)),
+                ("replaced_build", J::opt_s(b.replaced.as_deref())),
                 (
                     "faces",
                     b.faces
@@ -3829,6 +4312,24 @@ pub fn tail_line(t: &Traffic, now_ms: u64, offset: i64, bodies: bool) -> String 
 }
 
 fn tail_main(bodies: bool, from: Option<u64>, filter: Option<&str>) -> ExitCode {
+    let cfg = match configured() {
+        Ok(cfg) => cfg,
+        Err(code) => return code,
+    };
+    match tail(&cfg, bodies, from, filter) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("aterm fabric tail: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// The bridge command this host's fabric runs, parsed — found the way `status`
+/// finds it (the seam, aterm.toml, the rendezvous file, then a hand-armed
+/// running bridge): what `tail` and a person's verbs read the fleet, the
+/// broker and its transport off. A failure is printed, and is the exit (2).
+fn configured() -> Result<Config, ExitCode> {
     let resolved = match resolve_command(command_seam().as_deref(), config_path().as_deref()) {
         Ok(Some((_, c))) => c,
         Ok(None) => {
@@ -3838,7 +4339,7 @@ fn tail_main(bodies: bool, from: Option<u64>, filter: Option<&str>) -> ExitCode 
                 Ok(r) => r.map(|(_, c)| c),
                 Err(e) => {
                     eprintln!("{}", Off::Unreadable(e).message());
-                    return ExitCode::from(2);
+                    return Err(ExitCode::from(2));
                 }
             };
             let found = from_rendezvous.or_else(|| {
@@ -3853,29 +4354,19 @@ fn tail_main(bodies: bool, from: Option<u64>, filter: Option<&str>) -> ExitCode 
                 Some(c) => c,
                 None => {
                     eprintln!("{}", Off::NoCommand(config_path()).message());
-                    return ExitCode::from(2);
+                    return Err(ExitCode::from(2));
                 }
             }
         }
         Err(e) => {
             eprintln!("{}", Off::Unreadable(e).message());
-            return ExitCode::from(2);
+            return Err(ExitCode::from(2));
         }
     };
-    let cfg = match bridge_config(&resolved) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("{}", Off::Unreadable(e).message());
-            return ExitCode::from(2);
-        }
-    };
-    match tail(&cfg, bodies, from, filter) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("aterm fabric tail: {e}");
-            ExitCode::FAILURE
-        }
-    }
+    bridge_config(&resolved).map_err(|e| {
+        eprintln!("{}", Off::Unreadable(e).message());
+        ExitCode::from(2)
+    })
 }
 
 /// Whether `f` is a SUBJECT FILTER this command will subscribe to.
@@ -3905,9 +4396,11 @@ fn is_subject_filter(f: &str) -> bool {
 /// or stdout goes away.
 fn tail(cfg: &Config, bodies: bool, from: Option<u64>, want: Option<&str>) -> io::Result<()> {
     let broker = safe(&cfg.broker, 256);
-    let (mut conn, _closer) = transport::connect(&cfg.transport, &cfg.broker)
+    // Bounded until the subscription is open (the attach, the head query);
+    // following it is parking in `recv`, so the read bound comes off there.
+    let (mut conn, closer) = transport::connect(&cfg.transport, &cfg.broker, IO_TIMEOUT)
         .map_err(|e| io::Error::new(e.kind(), format!("the broker at {broker}: {e}")))?;
-    attach_caps(&mut conn, cfg)?;
+    transport::attach_cap_files(&mut conn, &cfg.cap_files)?;
     let whole = match want {
         // A FILTER NARROWS THE SUBSCRIPTION, it does not widen the CAPS. It
         // must stay in the configured fleet (the heading names it); a subtree
@@ -3985,7 +4478,11 @@ fn tail(cfg: &Config, bodies: bool, from: Option<u64>, want: Option<&str>) -> io
         return tail_faces(cfg, &faces, start, bodies, offset.unwrap_or(0), &mut out);
     }
     let mut sub = conn.subscribe(start, &filter)?;
-    while let Some((off, subject, raw)) = sub.recv()? {
+    closer.set_read_timeout(None)?;
+    while let Some((off, subject, raw)) = sub
+        .recv_live(&closer, astream_broker::IDLE_MARK_DEADLINE)
+        .map_err(|e| silent_link(e, &broker))?
+    {
         let t = traffic_of(&cfg.fleet, off, &subject, &raw);
         let line = tail_line(&t, crate::now_ms(), offset.unwrap_or(0), bodies);
         if writeln!(out, "{line}").and_then(|()| out.flush()).is_err() {
@@ -3997,12 +4494,38 @@ fn tail(cfg: &Config, bodies: bool, from: Option<u64>, want: Option<&str>) -> io
     )))
 }
 
+/// A tail's subscription error, with a link that went SILENT said in words:
+/// `recv_live` fails `WouldBlock`/`TimedOut` once a broker that marks its idle
+/// tails has sent nothing past the liveness deadline — a peer gone without a
+/// FIN, which a bare errno would not say.
+fn silent_link(e: io::Error, broker: &str) -> io::Error {
+    match e.kind() {
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => io::Error::new(
+            e.kind(),
+            format!(
+                "the broker at {broker} went silent: nothing in {} s on a link it marks every \
+                 {} s, so the link is gone (resume with --from)",
+                astream_broker::IDLE_MARK_DEADLINE.as_secs(),
+                astream_broker::IDLE_MARK.as_secs()
+            ),
+        ),
+        _ => e,
+    }
+}
+
 /// `tail` over SEVERAL granted faces — one connection and one subscription
 /// each, every record forwarded to this thread and printed as it arrives. A
 /// record two faces both match (a node's post to one of its own sessions is
-/// on its write lane and its read lane) is printed once: the offsets printed
-/// are remembered, and forgotten below the lowest one still in flight so the
-/// memory is bounded by how far the faces are apart, not by the log.
+/// on its write lane and its read lane) is printed once: the newest 4096
+/// offsets printed are remembered, far more than two faces of one log can be
+/// apart.
+///
+/// The hand-off is a RENDEZVOUS, so memory is bounded by the faces, not by the
+/// bus: a stdout that stops draining (a paused pager) stops every face's
+/// reader at its next record, its socket fills, and the broker is pushed back
+/// on exactly as the single-subscription tail pushes it — dropping a face
+/// that stays wedged past its stream write bound, which ends this tail with
+/// the offsets it printed (resume with `--from`).
 fn tail_faces(
     cfg: &Config,
     faces: &[String],
@@ -4013,21 +4536,28 @@ fn tail_faces(
 ) -> io::Result<()> {
     use std::sync::mpsc;
     let broker = safe(&cfg.broker, 256);
-    let (tx, rx) = mpsc::channel::<io::Result<(u64, String, Vec<u8>)>>();
+    let (tx, rx) = mpsc::sync_channel::<io::Result<(u64, String, Vec<u8>)>>(0);
     for face in faces {
-        let (mut conn, _closer) = transport::connect(&cfg.transport, &cfg.broker)?;
-        attach_caps(&mut conn, cfg)?;
+        let (mut conn, closer) = transport::connect(&cfg.transport, &cfg.broker, IO_TIMEOUT)?;
+        transport::attach_cap_files(&mut conn, &cfg.cap_files)?;
         let mut sub = conn.subscribe(start, face)?;
+        closer.set_read_timeout(None)?;
         let tx = tx.clone();
+        let broker = broker.clone();
         std::thread::spawn(move || loop {
-            match sub.recv() {
+            match sub
+                .recv_live(&closer, astream_broker::IDLE_MARK_DEADLINE)
+                .map_err(|e| silent_link(e, &broker))
+            {
                 Ok(Some(rec)) => {
                     if tx.send(Ok(rec)).is_err() {
                         return;
                     }
                 }
                 Ok(None) => {
-                    let _ = tx.send(Err(io::Error::other("closed")));
+                    let _ = tx.send(Err(io::Error::other(format!(
+                        "the broker at {broker} closed a face's stream"
+                    ))));
                     return;
                 }
                 Err(e) => {
@@ -4040,9 +4570,7 @@ fn tail_faces(
     drop(tx);
     let mut printed: BTreeSet<u64> = BTreeSet::new();
     while let Ok(next) = rx.recv() {
-        let Ok((off, subject, raw)) = next else {
-            break;
-        };
+        let (off, subject, raw) = next?;
         if !printed.insert(off) {
             continue;
         }
@@ -4258,12 +4786,18 @@ mod tests {
         // `mint-for` and `join`, each with its own flags only.
         use crate::join::{JoinOpts, MintForOpts};
         assert_eq!(
-            parse_args(&argv("mint-for n-m7 --out /tmp/m7.cap")),
+            parse_args(&argv("mint-for n-m7 --out /tmp/m7.cap --expires 30d")),
             Ok(Cmd::MintFor(MintForOpts {
                 node: "n-m7".to_string(),
                 out: Some("/tmp/m7.cap".to_string()),
                 fleet: None,
+                expires: Some(30 * 24 * 3_600_000),
             }))
+        );
+        assert!(parse_args(&argv("mint-for n-m7 --expires soon")).is_err());
+        assert!(
+            parse_args(&argv("join --expires 30d")).is_err(),
+            "--expires is mint-for's"
         );
         assert_eq!(
             parse_args(&argv("mint-for new")),
@@ -4635,6 +5169,40 @@ mod tests {
         assert!(bridge_config("aterm link serve --fleet lab").is_err());
     }
 
+    /// **A BRIDGE'S PROGRAM IS THE FILE ITS FIRST WORD NAMES** (r4-17): one
+    /// file under another spelling — a symlink, the `aterm-link` alias linked
+    /// to it — is one program; another file, or another program running it
+    /// (`sh -c`), is not, whatever flags follow.
+    #[cfg(unix)]
+    #[test]
+    fn a_bridges_program_is_the_file_it_runs_under_any_spelling() {
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("al-prog")
+            .tempdir()
+            .expect("scratch");
+        let at = |name: &str| dir.path().join(name).to_string_lossy().into_owned();
+        std::fs::write(at("aterm"), b"#!/bin/sh\n").expect("program");
+        std::fs::write(at("other"), b"#!/bin/sh\n").expect("another program");
+        std::os::unix::fs::symlink(at("aterm"), at("aterm-link")).expect("alias");
+        std::os::unix::fs::symlink(at("aterm"), at("on-path")).expect("link");
+        let flags = "--fleet lab --broker /tmp/b.sock --state /s";
+        let program = |head: String| bridge_program(&format!("{head} {flags}"));
+        let ours = program(format!("{} link serve", at("aterm")));
+        assert!(ours.is_some());
+        assert_eq!(program(format!("{} serve", at("aterm-link"))), ours);
+        assert_eq!(program(format!("{} link serve", at("on-path"))), ours);
+        assert_ne!(program(format!("{} link serve", at("other"))), ours);
+        let shell = program(format!("/bin/sh -c {} link serve", at("aterm")));
+        assert_ne!(shell, ours);
+        assert!(
+            shell
+                .as_deref()
+                .is_some_and(|p| p.ends_with(&format!(" -c {}", at("aterm")))),
+            "{shell:?}"
+        );
+        assert_eq!(bridge_program("aterm link ls --fleet lab"), None);
+    }
+
     /// THE PROCESS TABLE finds the broker by the socket it serves.
     #[test]
     fn the_process_table_names_the_broker() {
@@ -4724,6 +5292,29 @@ mod tests {
             Some(("main broken".to_string(), "local".to_string()))
         );
         assert_eq!(last_hold(&tl[..1]), None);
+        // Two slots: the row names its first hold and every origin standing,
+        // and a fleet lift that leaves the owner's stop says what stands.
+        let both = [
+            tl.clone(),
+            vec![
+                "event 6 t=6 kind=hold 1 reason=stop origin=fleet hold_origin=fleet,local"
+                    .to_string(),
+            ],
+        ]
+        .concat();
+        assert_eq!(
+            last_hold(&both),
+            Some(("stop".to_string(), "fleet,local".to_string()))
+        );
+        let left = [
+            both,
+            vec!["event 7 t=7 kind=hold 1 reason=mine origin=local hold_origin=local".to_string()],
+        ]
+        .concat();
+        assert_eq!(
+            last_hold(&left),
+            Some(("mine".to_string(), "local".to_string()))
+        );
     }
 
     /// TRAFFIC IS METADATA: every face classifies, trust comes from the address,
@@ -4869,6 +5460,7 @@ mod tests {
             source: Source::File(PathBuf::from("/c/aterm.toml")),
             command: CMD.to_string(),
             program_in_target_dir: false,
+            program: bridge_program(CMD),
             config_path: Some(PathBuf::from("/c/aterm.toml")),
             cfg: bridge_config(CMD).expect("a bridge command"),
             presence: crate::presence::Mode::Meta,
@@ -4891,6 +5483,7 @@ mod tests {
                 link_age_ms: Some(3_000),
                 supervised: Some(true),
                 command: Some(CMD.to_string()),
+                program: bridge_program(CMD),
                 bridge_pids: vec![101],
                 node: Some("n-a".to_string()),
                 state_dir: Some("/s".to_string()),
@@ -4910,6 +5503,382 @@ mod tests {
 
     fn warned(r: &Report) -> Vec<String> {
         warnings(r, &BTreeMap::new(), &[])
+    }
+
+    /// A bridge config that reaches `broker` over the Unix wire with no cap.
+    #[cfg(unix)]
+    fn unix_config(broker: &std::path::Path) -> Config {
+        Config {
+            fleet: "f".to_string(),
+            broker: broker.to_string_lossy().into_owned(),
+            transport: Transport::Unix,
+            cap_files: Vec::new(),
+            state_dir: String::new(),
+            accept_from: Vec::new(),
+            sock: None,
+            token: None,
+            presence: crate::presence::Mode::Meta,
+            receipts: false,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_a_locally_served_broker_is_diagnosed_from_local_supervisor_stderr() {
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("broker-role")
+            .tempdir()
+            .unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("broker.err"), "old-local-broker-refusal\n").unwrap();
+        let unix = unix_config(&root.join("bus.sock"));
+        assert!(
+            supervisor_last_word_for(&unix, None).is_some(),
+            "the local socket keeps its supervisor's word"
+        );
+        let mut tcp = unix.clone();
+        tcp.transport = Transport::Tcp;
+        tcp.broker = "remote.example:7000".to_string();
+        tcp.cap_files = vec![root.join("node.cap").to_string_lossy().into_owned()];
+        let local = crate::enable::Rendezvous {
+            fleet: "f".into(),
+            broker: unix.broker.clone(),
+            node: "n-local".into(),
+            cap_file: tcp.cap_files[0].clone(),
+            state: root.join("link-state").to_string_lossy().into_owned(),
+            command: format!("aterm link serve --fleet f --broker {}", unix.broker),
+            key_file: None,
+            serves_tcp: Some("127.0.0.1:7000".into()),
+            serves_key_file: Some(root.join("fleet.key").to_string_lossy().into_owned()),
+        };
+        let mut joined = local.clone();
+        joined.broker.clone_from(&tcp.broker);
+        joined.key_file.clone_from(&local.serves_key_file);
+        joined.serves_tcp = None;
+        joined.serves_key_file = None;
+        joined.command = format!("aterm link serve --fleet f --broker {} --tcp", tcp.broker);
+        // Parse the actual deployment record format, rather than inventing a
+        // report-only role, and keep the former local broker's error file.
+        let joined = crate::enable::Rendezvous::parse(&joined.render()).unwrap();
+        assert_eq!(
+            supervisor_last_word_for(&tcp, Some(&joined)),
+            None,
+            "a joined host's old local stderr says nothing about its remote broker"
+        );
+        assert_eq!(
+            supervisor_last_word_for(&tcp, None),
+            None,
+            "a cap directory alone does not prove where the broker runs"
+        );
+        let local = crate::enable::Rendezvous::parse(&local.render()).unwrap();
+        tcp.broker = local.serves_tcp.clone().unwrap();
+        assert!(
+            supervisor_last_word_for(&tcp, Some(&local)).is_some(),
+            "the same root explicitly serves this sealed endpoint locally"
+        );
+        tcp.broker = "another.example:7000".into();
+        assert_eq!(
+            supervisor_last_word_for(&tcp, Some(&local)),
+            None,
+            "the local served endpoint is not authority for a different broker"
+        );
+    }
+
+    /// **A BROKER IN ANOTHER ASTREAM PROTOCOL IS NAMED, NOT "NOBODY ANSWERED"**
+    /// (r2-03). A stand-in answers `Hello` with the exact bytes a broker one
+    /// protocol away sends — its "malformed request" refusal, stamped with
+    /// ITS version — and the probe says a broker answered in another
+    /// protocol, the report warns with both numbers, and doctor's remedy is a
+    /// release, not "start the broker". Negative control: the same reply in
+    /// this build's own protocol is a broker refusing, and reads as before.
+    #[cfg(unix)]
+    #[test]
+    fn a_broker_in_another_protocol_is_named_with_both_versions() {
+        use astream_broker::proto::PROTO_VERSION;
+        use astream_broker::proto::{encode_response, read_frame, write_frame, Response};
+        let probe_against = |version: u8| {
+            let dir = aterm_tempfile::Builder::new()
+                .prefix("al-proto")
+                .tempdir()
+                .expect("scratch");
+            let sock = dir.path().join("bus.sock");
+            let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
+            std::thread::spawn(move || {
+                let Ok((mut c, _)) = listener.accept() else {
+                    return;
+                };
+                if let Ok(Some(_hello)) = read_frame(&mut c) {
+                    let mut reply = encode_response(&Response::Error {
+                        code: astream_broker::proto::ERR_REFUSED,
+                        msg: "malformed request".to_string(),
+                    });
+                    reply[0] = version;
+                    let _ = write_frame(&mut c, &reply);
+                }
+            });
+            let (view, _) = probe_broker(&unix_config(&sock), &[]);
+            (view, dir)
+        };
+        let (view, _dir) = probe_against(PROTO_VERSION + 1);
+        let skew = view.protocol.expect("the mismatch is named");
+        assert_eq!(
+            (skew.broker, skew.client),
+            (PROTO_VERSION + 1, PROTO_VERSION)
+        );
+        assert!(!view.reachable, "{view:?}");
+        assert!(
+            view.error
+                .as_deref()
+                .is_some_and(|e| e.starts_with("a broker answered in another astream protocol")),
+            "{view:?}"
+        );
+        let mut r = healthy();
+        r.broker = view;
+        let w = warned(&r);
+        let warning = w
+            .iter()
+            .find(|l| l.contains("speaks astream protocol"))
+            .unwrap_or_else(|| panic!("no protocol warning: {w:#?}"));
+        assert!(
+            warning.contains(&format!(
+                "protocol {} and this aterm speaks {PROTO_VERSION}",
+                PROTO_VERSION + 1
+            )) && !warning.contains("does not answer"),
+            "{warning}"
+        );
+        assert!(
+            crate::enable::fix_for(warning, &crate::enable::Role::OneHost { fleet: None })
+                .contains("different releases"),
+            "{}",
+            crate::enable::fix_for(warning, &crate::enable::Role::OneHost { fleet: None })
+        );
+        // In this build's own protocol it is a broker refusing the Hello.
+        let (view, _dir) = probe_against(PROTO_VERSION);
+        assert!(view.protocol.is_none(), "{view:?}");
+        assert!(
+            view.error
+                .as_deref()
+                .is_some_and(|e| e.contains("no broker answered: malformed request")),
+            "{view:?}"
+        );
+    }
+
+    /// **A BROKER THAT DOES NOT ANSWER IS SHOWN WITH ITS OWN LAST WORD** (r2-02):
+    /// the root's `broker.err`, its last non-empty line and its age, beside the
+    /// warning, and doctor sends the operator to the cause rather than to a
+    /// restart that meets the same refusal. A root whose supervisor wrote
+    /// nothing has no such clause.
+    #[cfg(unix)]
+    #[test]
+    fn a_broker_that_does_not_answer_is_shown_with_its_supervisors_last_line() {
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("al-err")
+            .tempdir()
+            .expect("scratch");
+        let cfg = unix_config(&dir.path().join("bus.sock"));
+        let (view, _) = probe_broker(&cfg, &[]);
+        assert_eq!(view.last_word, None, "nothing was written");
+        std::fs::write(
+            dir.path().join("broker.err"),
+            "aterm link broker: open bus.log: earlier\n\
+             aterm link broker: open bus.log: record format v9: refused\n",
+        )
+        .expect("broker.err");
+        let (view, _) = probe_broker(&cfg, &[]);
+        assert!(!view.reachable);
+        let mut r = healthy();
+        r.broker = view;
+        let w = warned(&r);
+        let warning = w
+            .iter()
+            .find(|l| l.contains("does not answer (connect:"))
+            .unwrap_or_else(|| panic!("no unreachable warning: {w:#?}"));
+        assert!(
+            warning.contains("; its supervisor's broker.err, written ")
+                && warning
+                    .ends_with("ago: aterm link broker: open bus.log: record format v9: refused"),
+            "{warning}"
+        );
+        assert!(
+            crate::enable::fix_for(warning, &crate::enable::Role::OneHost { fleet: None })
+                .contains("fix that first"),
+            "{}",
+            crate::enable::fix_for(warning, &crate::enable::Role::OneHost { fleet: None })
+        );
+    }
+
+    /// **A BRIDGE WHOSE DIAL NOTHING ANSWERS CARRIES THE BROKER'S LAST WORD
+    /// TOO** (r2-02): its `reason=no-socket|refused` warning quotes the
+    /// supervisor's `broker.err` as the broker's own warning does, so doctor's
+    /// fix for that bridge is the line's — the shipped repair for a corrupt
+    /// record, a release for a log a newer aterm wrote — never "`on` starts
+    /// it" into the same refusal. NEGATIVE CONTROLS: a bridge armed with
+    /// ANOTHER broker than the one probed, and a stall for another reason,
+    /// quote nothing and keep their own fixes.
+    #[cfg(unix)]
+    #[test]
+    fn a_bridge_dial_nothing_answers_quotes_the_brokers_last_word() {
+        use std::io::ErrorKind as K;
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("al-dial")
+            .tempdir()
+            .expect("scratch");
+        let cfg = unix_config(&dir.path().join("bus.sock"));
+        let role = crate::enable::Role::OneHost { fleet: None };
+        let report = |kind: K, reason: &str, command: Option<String>| {
+            let line = crate::cli::log_refusal_remedy(kind, "/r/bus.log").expect("a remedy");
+            std::fs::write(
+                dir.path().join("broker.err"),
+                format!("aterm link broker: open /r/bus.log: x — {line}\n"),
+            )
+            .expect("broker.err");
+            let (view, _) = probe_broker(&cfg, &[]);
+            assert!(!view.reachable && view.last_word.is_some(), "{view:?}");
+            let mut r = healthy();
+            r.broker = view;
+            let inst = &mut r.instances[0];
+            inst.fabric = Some("stalled".to_string());
+            inst.reason = Some(reason.to_string());
+            if let Some(c) = command {
+                inst.command = Some(c);
+            }
+            let w = warned(&r);
+            let bridge = w
+                .iter()
+                .find(|l| l.contains("broker link is down"))
+                .unwrap_or_else(|| panic!("no bridge warning: {w:#?}"))
+                .clone();
+            let broker = w
+                .iter()
+                .find(|l| l.contains("does not answer (connect:"))
+                .unwrap_or_else(|| panic!("no broker warning: {w:#?}"))
+                .clone();
+            (bridge, broker)
+        };
+        let fix = |w: &str| crate::enable::fix_for(w, &role);
+        for reason in ["no-socket", "refused"] {
+            let (bridge, broker) = report(K::InvalidData, reason, None);
+            assert!(
+                bridge.contains("; its supervisor's broker.err, written ")
+                    && bridge.contains(crate::cli::CORRUPT_LOG_REMEDY),
+                "{bridge}"
+            );
+            assert!(fix(&bridge).starts_with(&fix(&broker)), "{}", fix(&bridge));
+            assert!(fix(&bridge).contains("--repair"), "{}", fix(&bridge));
+            let (bridge, broker) = report(K::Unsupported, reason, None);
+            assert!(bridge.contains(crate::cli::NEWER_LOG_REMEDY), "{bridge}");
+            assert!(
+                fix(&bridge).starts_with(&fix(&broker)) && !fix(&bridge).contains("--repair"),
+                "{}",
+                fix(&bridge)
+            );
+        }
+        // Another broker than the one probed: its dial says nothing about it.
+        let other = CMD.replace("/tmp/b.sock", "/elsewhere/b.sock");
+        assert_ne!(other, CMD, "PRECONDITION: the command names /tmp/b.sock");
+        let (bridge, _) = report(K::InvalidData, "refused", Some(other));
+        assert!(!bridge.contains("broker.err"), "{bridge}");
+        assert!(fix(&bridge).contains("starts it"), "{}", fix(&bridge));
+        // A stall that is not a dial nothing answered quotes nothing.
+        let (bridge, _) = report(K::InvalidData, "no-ack", None);
+        assert!(!bridge.contains("broker.err"), "{bridge}");
+    }
+
+    /// **A LAPSED RING IS NAMED AS LAPSED, AND ITS FIX IS A RENEWAL** (audit
+    /// 16). A guarded broker refuses a node's ring once its `exp=` has passed;
+    /// the report's own probe tells that refusal by astream's
+    /// `BrokerRefusal::is_expired` — never by the broker's words — and the
+    /// warning says [`CAP_LAPSED`], whose fix (doctor's) is the same ring
+    /// minted again with a later expiry, on every role. NEGATIVE CONTROL: the
+    /// same ring minted under another secret is refused as well, and is not
+    /// lapsed — it keeps the "could not be read" warning and its remedy.
+    #[cfg(unix)]
+    #[test]
+    fn a_lapsed_ring_is_named_and_its_fix_is_a_renewal() {
+        use crate::enable::{Joined, Role};
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("al-lapsed")
+            .tempdir()
+            .expect("scratch");
+        let secret = vec![0x5a_u8; 32];
+        let broker = astream_broker::Broker::open_guarded(dir.path().join("b.log"), secret.clone())
+            .expect("a guarded broker");
+        let socket = dir.path().join("b.sock");
+        let _server = broker.serve(&socket).expect("serve the broker");
+        let cap = dir.path().join("node.cap");
+        let mut cfg = unix_config(&socket);
+        cfg.cap_files = vec![cap.to_string_lossy().into_owned()];
+        let probe = |key: &[u8], exp: &str| {
+            let lines: String = crate::enable::node_grants("f", "n-a")
+                .iter()
+                .map(|g| {
+                    let c = astream_cap::mint(key, &g.replacen(':', exp, 1)).expect("mint");
+                    format!("{}\n", astream_cap::capfile::format_line(&c.filter, &c.tag))
+                })
+                .collect();
+            std::fs::write(&cap, lines).expect("the cap file");
+            let (view, _) = probe_broker(&cfg, &[]);
+            let mut r = healthy();
+            r.broker = view;
+            r
+        };
+        let roles = [
+            Role::OneHost { fleet: None },
+            Role::Joined(Joined {
+                fleet: "f".to_string(),
+                broker: "m100.local:7000".to_string(),
+                key_file: Some("/r/fleet.key".to_string()),
+                cap_file: Some("/r/node.cap".to_string()),
+                accept_from: None,
+            }),
+        ];
+
+        let r = probe(&secret, ",exp=1:");
+        assert!(
+            r.broker.reachable && r.broker.cap_expired && !r.broker.read_ok(),
+            "{:?}",
+            r.broker
+        );
+        let w = warned(&r);
+        let warning = w
+            .iter()
+            .find(|l| l.contains(CAP_LAPSED))
+            .unwrap_or_else(|| panic!("no lapsed warning: {w:#?}"));
+        assert!(!warning.contains("could not be read"), "{warning}");
+        let [here, joined] = roles
+            .each_ref()
+            .map(|role| crate::enable::fix_for(warning, role));
+        assert!(
+            here.contains("lapsed") && here.contains("move <root>/node.cap aside"),
+            "{here}"
+        );
+        assert!(
+            joined.contains("mint-for <this node> --out <cap> --expires")
+                && joined.contains("replaces /r/node.cap")
+                && !joined.contains("aterm fabric on"),
+            "{joined}"
+        );
+
+        // NEGATIVE CONTROL: refused, and not lapsed.
+        let r = probe(&[0xa5_u8; 32], ":");
+        assert!(
+            r.broker.reachable && !r.broker.cap_expired,
+            "{:?}",
+            r.broker
+        );
+        let w = warned(&r);
+        assert!(
+            w.iter().any(|l| l.contains("could not be read"))
+                && !w.iter().any(|l| l.contains(CAP_LAPSED)),
+            "{w:#?}"
+        );
+        // And the ring under the broker's own secret, with no `exp=`, reads.
+        let r = probe(&secret, ":");
+        assert!(
+            r.broker.read_ok() && !r.broker.cap_expired,
+            "{:?}",
+            r.broker
+        );
     }
 
     /// **NODES LISTS EVERY NODE AND SAYS WHICH ONE THIS IS.** A
@@ -4994,6 +5963,7 @@ mod tests {
             host: "m7".to_string(),
             state: "live".to_string(),
             fabric: "connected".to_string(),
+            ..NodeRow::default()
         }];
         let text = render_text(&lonely);
         assert!(
@@ -5040,6 +6010,62 @@ mod tests {
         );
         assert_eq!(in_filters("lab", None), ["/f/lab/in/>"]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A PROCESS RUNNING A REPLACED BUILD IS NAMED, by the path its argv
+    /// starts with: a process started from a copied executable runs the file
+    /// at its path (not replaced); once another file is renamed over that
+    /// path, it is — and a relative argv says nothing either way.
+    #[test]
+    fn a_process_whose_executable_was_replaced_is_named() {
+        let dir = std::env::temp_dir().join(format!("atfab-exe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let exe = dir.join("slp");
+        let copy = |to: &Path| {
+            std::fs::copy("/bin/sleep", to).expect("copy /bin/sleep");
+            // A copied Apple binary is signed ad hoc before it is run.
+            if cfg!(target_os = "macos") {
+                let signed = aterm_uds::spawnfd::command("codesign")
+                    .args(["--force", "--sign", "-"])
+                    .arg(to)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .expect("codesign");
+                assert!(signed.success(), "codesign {}", to.display());
+            }
+        };
+        copy(&exe);
+        let mut child = aterm_uds::spawnfd::command(&exe)
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("run the copy");
+        let shown = exe.to_string_lossy().into_owned();
+        let cmd = format!("{shown} 60");
+        let before = replaced_build(child.id(), &cmd);
+        copy(&dir.join("slp.new"));
+        std::fs::rename(dir.join("slp.new"), &exe).expect("rename a new build over it");
+        let after = replaced_build(child.id(), &cmd);
+        let relative = replaced_build(child.id(), "slp 60");
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(before, None, "it runs the file at its path");
+        assert_eq!(
+            after.as_deref(),
+            Some(shown.as_str()),
+            "a new file is at its path"
+        );
+        assert_eq!(relative, None, "a relative argv names no file");
+        let lsof =
+            "p57558\nftxt\ni366658160\nn/x/slp\nftxt\ni1152921500312609216\nn/usr/lib/dyld\n";
+        assert_eq!(lsof_first_inode(lsof), Some(366_658_160));
+        assert_eq!(lsof_first_inode(""), None);
     }
 
     /// THE TCP BROKER'S PID is found by the port a client dials — its own
@@ -5102,6 +6128,7 @@ mod tests {
             host: "-".to_string(),
             state: "gone".to_string(),
             fabric: "disconnected".to_string(),
+            ..NodeRow::default()
         }];
         one(&r, "state=gone");
         one(&r, "sees this node dead");
@@ -5115,12 +6142,14 @@ mod tests {
                 host: "-".to_string(),
                 state: "live".to_string(),
                 fabric: "connected".to_string(),
+                ..NodeRow::default()
             },
             NodeRow {
                 node: "n-far".to_string(),
                 host: "box".to_string(),
                 state: "gone".to_string(),
                 fabric: "disconnected".to_string(),
+                ..NodeRow::default()
             },
         ];
         assert_eq!(warned(&ok), Vec::<String>::new());
@@ -5176,6 +6205,27 @@ mod tests {
             "connected (rtt 2 ms, acked 3s ago)"
         );
 
+        // A bridge of another build than its instance, as the two named
+        // themselves; the same build, or a side that named none, says nothing.
+        let mut r = healthy();
+        r.instances[0].build = Some("0.104.0+g0123456789ab".to_string());
+        r.instances[0].bridge_build = Some("0.104.0+g0123456789ab".to_string());
+        assert_eq!(warned(&r), Vec::<String>::new());
+        r.instances[0].bridge_build = None;
+        assert_eq!(warned(&r), Vec::<String>::new());
+        r.instances[0].bridge_build = Some("0.98.0+gfedcba987654".to_string());
+        one(
+            &r,
+            "instance 100's bridge is another build than the instance: bridge \
+             0.98.0+gfedcba987654, instance 0.104.0+g0123456789ab",
+        );
+        // And the lines the instance could not parse, which hold mail back.
+        let mut r = healthy();
+        r.instances[0].lane_faults = Some(0);
+        assert_eq!(warned(&r), Vec::<String>::new());
+        r.instances[0].lane_faults = Some(3);
+        one(&r, "instance 100 could not parse 3 of its bridge's lines");
+
         // dropped > 0.
         let mut r = healthy();
         r.instances[0].sessions[0].dropped = Some(2);
@@ -5219,6 +6269,53 @@ mod tests {
         );
         ages.insert(("s-one".to_string(), 40), r.now_ms - 9 * 60 * 1000);
         assert!(warnings(&r, &ages, &[]).is_empty(), "a note is not work");
+    }
+
+    /// **A STANDING HALT IS ONE A BRIDGE APPLIES.** The status reads the
+    /// fleet's halt face by the bridge's own rule: an `a-` service's or a
+    /// node's `state=on` row holds no session anywhere, nor does a human's row
+    /// whose `state=on` the bridge's body decoder does not read (a tab is no
+    /// token separator), so none of them is reported as a halt. Negative
+    /// control: the reader this replaced (`state=on` from any principal, split
+    /// on any whitespace) reports four halts here.
+    #[cfg(unix)]
+    #[test]
+    fn the_status_reports_only_a_halt_a_bridge_applies() {
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("al-halt")
+            .tempdir()
+            .expect("the broker dir");
+        let socket = dir.path().join("b.sock");
+        let broker = astream_broker::Broker::open(dir.path().join("b.log")).expect("a broker");
+        let _server = broker.serve(&socket).expect("serve the broker");
+        let (mut conn, _closer) = transport::connect(
+            &transport::Transport::Unix,
+            &socket.to_string_lossy(),
+            Duration::from_secs(60),
+        )
+        .expect("connect");
+        for (seq, subject, body) in [
+            (
+                1,
+                "/f/f1/fleet/h-andrew/halt",
+                "v=1 t=1 state=on reason=main%20broken",
+            ),
+            (2, "/f/f1/fleet/a-svc/halt", "v=1 t=1 state=on reason=svc"),
+            (3, "/f/f1/fleet/n-node/halt", "v=1 t=1 state=on reason=node"),
+            (4, "/f/f1/fleet/h-bea/halt", "v=1 t=1\tstate=on reason=tab"),
+            (
+                5,
+                "/f/f1/fleet/h-cy/halt",
+                "v=1 t=1 state=off reason=lifted",
+            ),
+        ] {
+            conn.publish(91, seq, subject, body.as_bytes())
+                .expect("publish a halt row");
+        }
+        assert_eq!(
+            fleet_halts(&mut conn, "f1"),
+            vec![("h-andrew".to_string(), "main broken".to_string())]
+        );
     }
 
     /// **AN ASK PAST ITS DEADLINE WITH NO REPLY IS A WARNING (R8), AND THE RULE
@@ -5360,14 +6457,46 @@ mod tests {
             "{:#?}",
             warned(&r)
         );
+        // THE SAME FLAGS UNDER ANOTHER PROGRAM is another bridge, and named
+        // (r4-17) — the flags alone cannot say which process holds the lane.
+        let mut r = healthy();
+        let substitute = CMD.replacen("aterm link", "/bin/sh -c /tmp/x link", 1);
+        r.instances[0].command = Some(substitute.clone());
+        r.instances[0].program = bridge_program(&substitute);
+        one(
+            &r,
+            &format!(
+                "instance 100's bridge was armed with a different command than [fabric] command \
+                 in /c/aterm.toml: it runs program {} (not {})",
+                r.instances[0]
+                    .program
+                    .as_deref()
+                    .expect("a bridge's program"),
+                r.program.as_deref().expect("the report's program")
+            ),
+        );
+        assert!(
+            r.instances[0]
+                .program
+                .as_deref()
+                .is_some_and(|p| p.ends_with(" -c /tmp/x")),
+            "the words before `link serve` are the program's: {:?}",
+            r.instances[0].program
+        );
 
-        // Two bridges on one state dir.
+        // A second instance whose bridge found the state dir held.
         let mut r = healthy();
         let mut twin = r.instances[0].clone();
         twin.pid = 200;
         twin.sessions.clear();
+        twin.fabric = Some("stalled".to_string());
+        twin.reason = Some("state-locked".to_string());
         r.instances.push(twin);
-        one(&r, "instances 100, 200 run bridges on ONE state dir (/s)");
+        one(
+            &r,
+            "instance 200's bridge stands by (fabric=stalled reason=state-locked): instance \
+             100's bridge holds its state dir /s",
+        );
 
         // An instance that did not answer.
         let mut r = healthy();
@@ -5402,6 +6531,37 @@ mod tests {
         assert!(w
             .iter()
             .any(|l| l.contains("h-andrew has a fleet halt standing (reason=stop)")));
+
+        // A fleet halt this node keeps with no row on the bus (a replaced log),
+        // and one it holds with its row there, which the line above covers.
+        let mut r = healthy();
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("al-kept")
+            .tempdir()
+            .expect("a state dir");
+        r.cfg.state_dir = dir.path().to_string_lossy().into_owned();
+        let st = crate::state::StateDir::open(dir.path()).expect("open");
+        let halt = |reason: &str, kept| crate::state::StandingHalt {
+            reason: reason.to_string(),
+            kept,
+        };
+        st.set_standing_halts(
+            "lab",
+            &BTreeMap::from([
+                ("h-andrew".to_string(), halt("main%20broken", true)),
+                ("h-bea".to_string(), halt("stop", false)),
+            ]),
+        )
+        .expect("write");
+        let w = warned(&r);
+        assert!(
+            w.iter().any(|l| l.contains(
+                "h-andrew's fleet halt (reason=main broken) stands on this node with no row \
+                 on the bus"
+            )),
+            "{w:#?}"
+        );
+        assert!(!w.iter().any(|l| l.contains("h-bea's")), "{w:#?}");
 
         // A LIVE presence row for this machine's node that no instance hosts.
         let mut r = healthy();

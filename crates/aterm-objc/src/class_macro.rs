@@ -113,7 +113,7 @@ macro_rules! __aterm_objc_count {
 /// Define an Objective-C class at runtime.
 ///
 /// aterm's replacement for objc2's `declare_class!`, shaped by the declared
-/// classes in `aterm-gui` and `vendor/winit` (see [`crate::declare`]).
+/// classes in `aterm-gui` and `crates/aterm-window` (see [`crate::declare`]).
 ///
 /// ```ignore
 /// aterm_objc::declare_class! {
@@ -144,10 +144,10 @@ macro_rules! __aterm_objc_count {
 /// * `-dealloc` — drops the Rust ivars, then `[super dealloc]`.
 /// * One `extern "C"` trampoline per `@sel(…)` method, with the correct type
 ///   encoding and a panic guard (a Rust panic aborts with the method's name).
-///   An `NSException` raised inside is contained through [`crate::exception`]:
-///   Rust `Drop`s on the unwound frames run and the method returns the inert
-///   zero of its return type. `@abort_on_exception` after `@sel(…)` keeps the
-///   abort; `-dealloc` always does.
+///   An `NSException` raised inside is contained through [`crate::exception`]
+///   and the method returns the inert zero of its return type.
+///   `@abort_on_exception` after `@sel(…)` keeps the abort; `-dealloc` always
+///   does.
 ///
 /// # Differences from objc2
 ///
@@ -275,7 +275,7 @@ macro_rules! declare_class {
         #[repr(C)]
         $vis struct $name {
             /// The instance's real storage belongs to the Objective-C runtime;
-            /// this type is a zero-sized marker AT that address, never a value.
+            /// this type is a zero-sized marker at that address, never a value.
             _opaque: [u8; 0],
             /// Makes the type `!Send`/`!Sync`: every declared class in aterm is
             /// main-thread AppKit state.
@@ -331,14 +331,12 @@ macro_rules! declare_class {
                         unsafe extern "C" fn __dealloc(__this: $crate::Id, _cmd: $crate::Sel) {
                             let __guard = ::std::panic::catch_unwind(
                                 ::std::panic::AssertUnwindSafe(|| {
-                                    // `get()`, not `$name::meta()`: -dealloc
-                                    // runs only on an instance, which exists
-                                    // only after `class()` returned, so the
-                                    // cell is set. A non-blocking peek also
-                                    // satisfies the lazy-init reentrancy
-                                    // census, which reads any call inside the
-                                    // initializer as re-entry, and can never
-                                    // park a -dealloc on the main thread.
+                                    // `get()`, not `$name::meta()`: an
+                                    // instance exists only after `class()`
+                                    // returned, so the cell is set. A
+                                    // non-blocking peek never parks a -dealloc
+                                    // on the main thread, and the lazy-init
+                                    // census does not read it as re-entry.
                                     let __meta = META.get().expect(
                                         "-dealloc runs only on an instance, \
                                          which cannot exist before the class \
@@ -420,14 +418,12 @@ macro_rules! declare_class {
                                 ),
                             )
                         };
-                        // `catch_unwind` outside, Objective-C `@try` inside. A
-                        // Rust panic is not swallowed by `@catch (id)`: it runs
-                        // its drops and aborts at the outer guard with its
-                        // message. An `NSException` is caught by the inner
-                        // wrapper after every Rust `Drop` between the raise and
-                        // here has run, and the method returns its inert zero
-                        // (under `@abort_on_exception` it reaches the outer
-                        // guard and aborts). See `crate::exception`.
+                        // `catch_unwind` outside, `@try` inside (see
+                        // `crate::exception`). A Rust panic is not swallowed by
+                        // `@catch (id)`: it aborts at the outer guard. An
+                        // `NSException` is contained by the inner wrapper and the
+                        // method returns its inert zero, or under
+                        // `@abort_on_exception` reaches the outer guard.
                         unsafe extern "C" fn __tramp(
                             __this: $crate::Id,
                             _cmd: $crate::Sel,
@@ -468,8 +464,6 @@ macro_rules! declare_class {
                             __b.add_method(
                                 $crate::sel!($($sel_tok)+),
                                 __tramp as *const ::core::ffi::c_void,
-                                // One semicolon, then a comma-separated list,
-                                // as `method_encoding!` expects.
                                 &$crate::method_encoding!(
                                     $crate::__aterm_objc_ret!($($ret)?) ; $($argty),*
                                 ),

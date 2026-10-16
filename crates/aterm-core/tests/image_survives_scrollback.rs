@@ -1,16 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-//! Inline images survive the scrollback boundary.
-//!
-//! An inline image (iTerm2 OSC 1337 `File=`, and the sixel path that reuses the
-//! same placement) is one `ImageRef` per covered cell in the grid's
-//! `CellExtras` side table; a footprint row that scrolls off the top must carry
-//! its refs into history so scrolling back shows the picture.
-//!
-//! These tests drive the real `Terminal`: OSC 1337 in, line feeds to push it
-//! off the top, `scroll_to_top`, then the render snapshot the GUI and GPU
-//! renderer consume (`cell_frame(...).images`).
+//! Inline images survive the scrollback boundary: an inline image (OSC 1337 `File=`, and
+//! sixel through the same placement) is one `ImageRef` per covered cell in the grid's
+//! `CellExtras` side table, and a footprint row that scrolls off the top carries its refs
+//! into history, so the render snapshot (`cell_frame(..).images`) shows the picture again.
 
 use aterm_core::render::RenderInput;
 use aterm_core::terminal::Terminal;
@@ -33,14 +27,9 @@ fn frame_image_cells(frame: &RenderInput) -> Vec<(usize, usize, u16, u16)> {
     v
 }
 
-/// A 4x3 image printed at the top, then pushed off the top by ordinary output,
-/// is still there when the user scrolls back to it.
-///
-/// Checks the user-visible outcome only: history has two tiers (a ring that
-/// carries extras directly, and the `Line` store), and the picture comes back
-/// through either. The `Line` round trip itself is pinned in `aterm_grid`
-/// (`scrollback_images::a_scrolled_off_image_row_round_trips_through_a_line_back_to_per_cell_refs`
-/// and `the_ring_fast_materializer_agrees_with_the_line_round_trip_on_an_image_row`).
+/// A 4x3 image pushed off the top by ordinary output is whole when scrolled back to,
+/// through either history tier (the extras-carrying ring or the `Line` store). The `Line`
+/// round trip itself is pinned in aterm-grid's `scrollback_images` tests.
 #[test]
 fn an_image_scrolled_off_the_top_is_still_there_when_you_scroll_back() {
     let mut term = Terminal::new(10, 20);
@@ -107,15 +96,11 @@ fn a_scrolled_back_image_shares_one_payload_across_its_rows() {
     );
 }
 
-/// A partial scroll puts history above and live content below in one frame, and
-/// a live image has to land where the text it sits in landed.
-///
-/// The image cells live in the grid's side table at live coordinates while the
-/// viewport is drawn through `display_offset`, so a frame that reads that table
-/// at the raw viewport row paints a live picture `display_offset` rows too high
-/// — over whatever history is occupying those rows. Only a partial scroll shows
-/// it: at offset 0 the two coordinate spaces coincide, and scrolled fully to the
-/// top there is no live row on screen to misplace.
+/// A partial scroll puts history above and live content below in one frame, and a live
+/// image lands where its text landed. The image cells sit in the side table at live
+/// coordinates while the viewport is drawn through `display_offset`; only a partial scroll
+/// can misplace them (at offset 0 the two coincide, and scrolled fully to the top no live
+/// row is on screen).
 #[test]
 fn a_live_image_keeps_its_row_while_the_viewport_is_partly_scrolled_back() {
     let mut term = Terminal::new(10, 20);

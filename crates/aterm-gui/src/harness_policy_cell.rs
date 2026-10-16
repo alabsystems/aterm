@@ -7,8 +7,9 @@
 //! [`HarnessPolicyCell::offer`], and `offer` cannot be called without a
 //! [`StampedHarnessPolicy`]. A stamp is made only by
 //! [`HarnessStampSource::stamp`], and the one source is the config watcher's
-//! (`config_watcher::spawn`): each read of `aterm.toml` it posts is stamped
-//! with the next generation. So "the watcher is the policy's one writer"
+//! (`config_watcher::watch`, the thread `config_watcher::spawn` starts): each
+//! read of `aterm.toml` it posts is stamped with the next generation. So "the
+//! watcher is the policy's one writer"
 //! (design `docs/DESIGN-trust-temporal-models-2026-09-29.md` §1, §3a) is what
 //! the types say, and `offer` is a join: a stamp no newer than the one in
 //! force changes nothing, wherever its wake lands.
@@ -98,6 +99,12 @@ impl HarnessPolicyCell {
     /// The policy in force.
     pub(crate) fn get(&self) -> &HarnessPolicy {
         &self.policy
+    }
+
+    /// The generation of the policy in force (`0`: the launch read): what
+    /// `harness policy` answers as `gen=` and its event names.
+    pub(crate) fn generation(&self) -> u64 {
+        self.in_force
     }
 }
 

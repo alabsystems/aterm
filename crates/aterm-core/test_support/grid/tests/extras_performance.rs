@@ -4,15 +4,13 @@
 
 //! Terminal-coupled extras performance test.
 
-/// `take_response()` preserves buffer capacity: the caller gets the data and
-/// the next `process()` cycle reuses the existing allocation.
+/// `take_response()` keeps the buffer's allocation for the next `process()` cycle.
 #[test]
 fn take_response_preserves_capacity() {
     use crate::terminal::Terminal;
 
     let mut term = Terminal::new(24, 80);
 
-    // Generate a response by sending a Device Status Report request.
     term.process(b"\x1b[5n"); // DSR — terminal should respond with \x1b[0n
     let initial_capacity = term.response_buffer_capacity();
     assert!(
@@ -23,14 +21,12 @@ fn take_response_preserves_capacity() {
     let response = term.take_response();
     assert!(response.is_some(), "should have response after DSR");
 
-    // After take_response, the internal buffer retains its heap allocation.
     assert_eq!(
         term.response_buffer_capacity(),
         initial_capacity,
         "take_response should preserve response buffer capacity"
     );
 
-    // Second cycle reuses the existing allocation.
     term.process(b"\x1b[5n");
     let response2 = term.take_response();
     assert!(response2.is_some(), "should have response after second DSR");

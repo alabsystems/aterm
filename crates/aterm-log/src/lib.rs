@@ -45,8 +45,6 @@
 //! set_max_level(LevelFilter::Info);
 //! ```
 
-#![deny(clippy::all)]
-#![deny(unsafe_op_in_unsafe_fn)]
 // Under the Trust verifier, register the `trust` tool namespace so the
 // `#[cfg_attr(trust_verify, trust::skip)]` opt-out on `__log` resolves; plain
 // rustc never sets `trust_verify`, so this is inert off-Trust.
@@ -157,11 +155,71 @@ pub const MAX_RECORD_BYTES: usize = 512;
 /// and they arrive a few times a day, so they keep twice the text.
 pub const MAX_ALERT_RECORD_BYTES: usize = 1024;
 
-/// Whether a log file of `len` bytes has outgrown [`MAX_LOG_BYTES`] and should
-/// be rotated.
-#[must_use]
-pub fn should_rotate(len: u64) -> bool {
-    len > MAX_LOG_BYTES
+// A contracted fn is written once, through `trust_contract_fn!`: under Trust's
+// verifying session (`cfg(trust_verify)`) it carries its native `ensures`
+// clause, and every other compiler (stock rustc in the foreign cells) gets the
+// plain fn and never parses the clause. The cited theorem is stated over
+// `trust_import_aterm_log__<fn>`, the kernel definition Trust mints from the
+// compiled body, so the proof is about this code, not a copy of it.
+#[cfg(trust_verify)]
+macro_rules! trust_contract_fn {
+    (
+        $(#[$meta:meta])*
+        $vis:vis fn $name:ident($($arg:ident : $arg_ty:ty),* $(,)?) -> $ret:ident
+        clauses [$($clauses:tt)+]
+        { $($body:tt)* }
+    ) => {
+        $(#[$meta])*
+        $vis fn $name($($arg: $arg_ty),*) -> $ret
+            $($clauses)+
+        { $($body)* }
+    };
+}
+
+#[cfg(not(trust_verify))]
+macro_rules! trust_contract_fn {
+    (
+        $(#[$meta:meta])*
+        $vis:vis fn $name:ident($($arg:ident : $arg_ty:ty),* $(,)?) -> $ret:ident
+        clauses [$($clauses:tt)+]
+        { $($body:tt)* }
+    ) => {
+        $(#[$meta])*
+        $vis fn $name($($arg: $arg_ty),*) -> $ret { $($body)* }
+    };
+}
+
+#[cfg(trust_verify)]
+macro_rules! verify_island {
+    ($($tt:tt)*) => {
+        $($tt)*
+    };
+}
+
+#[cfg(not(trust_verify))]
+macro_rules! verify_island {
+    ($($tt:tt)*) => {};
+}
+
+trust_contract_fn! {
+    /// Whether a log file of `len` bytes has outgrown [`MAX_LOG_BYTES`] and should
+    /// be rotated.
+    #[must_use]
+    pub fn should_rotate(len: u64) -> bool
+    clauses [ensures result == (len > 4194304) by should_rotate_is_threshold]
+    {
+        len > MAX_LOG_BYTES
+    }
+}
+
+// Spec `should-rotate-threshold` (SPECS.md): for every length, rotation is due
+// exactly past MAX_LOG_BYTES = 4 MiB. Kernel-checked against the compiled body.
+verify_island! {
+    clean {
+        theorem should_rotate_is_threshold (len : UInt64) :
+            trust_import_aterm_log__should_rotate len = decide (4194304 < len) := by
+          simp only [trust_import_aterm_log__should_rotate]
+    }
 }
 
 /// The body cap for a record at `level`: [`MAX_ALERT_RECORD_BYTES`] for WARN
@@ -310,21 +368,6 @@ static LOGGER: std::sync::OnceLock<&'static dyn Log> = std::sync::OnceLock::new(
 /// Set the global maximum log level.
 pub fn set_max_level(level: LevelFilter) {
     MAX_LEVEL.store(level as usize, Ordering::Relaxed);
-}
-
-/// Get the current maximum log level. Test-only: the macros read the level
-/// through [`__log`]'s own gate.
-#[cfg(test)]
-#[must_use]
-fn max_level() -> LevelFilter {
-    match MAX_LEVEL.load(Ordering::Relaxed) {
-        0 => LevelFilter::Off,
-        1 => LevelFilter::Error,
-        2 => LevelFilter::Warn,
-        3 => LevelFilter::Info,
-        4 => LevelFilter::Debug,
-        _ => LevelFilter::Trace,
-    }
 }
 
 /// Install a global logger. Returns `Err` if one is already installed.
@@ -636,10 +679,6 @@ pub mod env {
 mod tests {
     use super::*;
 
-    // Serializes tests that set the process-global max level and then assert it.
-    // Callers recover a poisoned lock so one failing test does not cascade.
-    static LEVEL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn test_level_ordering() {
         assert!(Level::Error < Level::Warn);
@@ -664,15 +703,6 @@ mod tests {
         assert!(LevelFilter::Warn < LevelFilter::Info);
         assert!(LevelFilter::Info < LevelFilter::Debug);
         assert!(LevelFilter::Debug < LevelFilter::Trace);
-    }
-
-    #[test]
-    fn test_max_level_round_trips() {
-        let _guard = LEVEL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        set_max_level(LevelFilter::Debug);
-        assert_eq!(max_level(), LevelFilter::Debug);
-        set_max_level(LevelFilter::Off);
-        assert_eq!(max_level(), LevelFilter::Off);
     }
 
     #[test]
@@ -704,12 +734,6 @@ mod tests {
     }
 
     #[test]
-    fn test_set_logger_error_display() {
-        let err = SetLoggerError(());
-        assert_eq!(err.to_string(), "logger already set");
-    }
-
-    #[test]
     fn test_parse_level_filter_names() {
         assert_eq!(LevelFilter::parse("off"), Some(LevelFilter::Off));
         assert_eq!(LevelFilter::parse("error"), Some(LevelFilter::Error));
@@ -732,14 +756,6 @@ mod tests {
         assert_eq!(LevelFilter::parse("verbose"), None);
         assert_eq!(LevelFilter::parse("info,debug"), None);
         assert_eq!(LevelFilter::parse("3"), None);
-    }
-
-    #[test]
-    fn test_should_rotate_threshold() {
-        assert!(!should_rotate(0));
-        assert!(!should_rotate(MAX_LOG_BYTES));
-        assert!(should_rotate(MAX_LOG_BYTES + 1));
-        assert!(should_rotate(u64::MAX));
     }
 
     #[test]

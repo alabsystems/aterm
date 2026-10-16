@@ -6,10 +6,10 @@
 //! A release builds its unsigned universal `aterm.app` ONCE — both architecture
 //! slices at once, from the snapshot of the reserved release commit's git objects
 //! (`buildplan::run`, [`crate::snapshot`]) — and keeps it here, in the clone's
-//! release cache: `<clone>-release.noindex/artifacts/<key>/`. MEASURE judges THESE
-//! bytes (`tools/verify.sh --measure <app>`, whose receipt is filed under the
-//! executable's SHA-256), and the cut signs, notarizes and packages a byte copy of
-//! them ([`copy_bundle`]): what MEASURE judged is what ships. The cut never builds.
+//! release cache: `<clone>-release.noindex/artifacts/<key>/`. `verify release --app
+//! <app>` judges THESE bytes (MEASURE among its checks; the release records the pass
+//! with the executable's SHA-256), and the cut signs, notarizes and packages a byte copy
+//! of them ([`copy_bundle`]): what was verified is what ships. The cut never builds.
 //!
 //! KEYED BY WHAT THE BUNDLE WAS BUILT AS ([`key`]): the version, the build number,
 //! the release commit (which fixes every source byte and, through its lockfile's
@@ -80,8 +80,8 @@ pub struct Complete {
     pub archs: String,
     /// The executable's own `--diagnose` `compiler:` line.
     pub compiler_line: String,
-    /// SHA-256 of `aterm.app/Contents/MacOS/aterm`: what MEASURE's receipt is filed
-    /// under, and what the cut's copy must still be before it signs.
+    /// SHA-256 of `aterm.app/Contents/MacOS/aterm`: what the verified record names, and
+    /// what the cut's copy must still be before it signs.
     pub macho_sha256: String,
     /// [`bundle_digest`] of the whole bundle.
     pub bundle_digest: String,
@@ -259,7 +259,7 @@ pub fn prove(complete: &Complete, app: &Path) -> Result<(), String> {
     let macho = macho_sha256(app)?;
     if macho != complete.macho_sha256 {
         return Err(format!(
-            "{}'s executable is {macho}, not the {} built (and measured) as build {} of \
+            "{}'s executable is {macho}, not the {} built (and verified) as build {} of \
              v{} — the bytes changed after the build; they are never shipped",
             app.display(),
             complete.macho_sha256,
@@ -279,6 +279,25 @@ pub fn prove(complete: &Complete, app: &Path) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// This Mac's physical memory in bytes (`sysctl -n hw.memsize`); `None` when it will not
+/// say.
+pub(crate) fn host_memory_bytes() -> Option<u64> {
+    let out = std::process::Command::new("/usr/sbin/sysctl")
+        .args(["-n", "hw.memsize"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .ok()
+        .filter(|&bytes: &u64| bytes > 0)
 }
 
 /// Whether the two slices may build at once: the peaks the newest COMPLETE build in
@@ -320,7 +339,7 @@ pub fn slices_fit(store: &Path, memory: Option<u64>) -> bool {
 /// fixes (`publish::expected_embedded_update_pin`).
 ///
 /// An entry whose bytes changed after its build is not reused: before a claim nothing
-/// rests on it, so it is removed and built again (and measured again); after a claim
+/// rests on it, so it is removed and built again (and verified again); after a claim
 /// the cut never calls this — it refuses such bytes ([`read`]).
 ///
 /// # Errors
@@ -363,7 +382,7 @@ pub fn build(repo: &Path, identity: &Identity) -> Result<Complete, String> {
         Err(e) => return Err(format!("remove the unfinished {}: {e}", dir.display())),
     }
     crate::snapshot::private_dir(&dir, "release artifact")?;
-    let memory = aterm_verify::exec::host_memory_bytes().map(|(bytes, _)| bytes);
+    let memory = host_memory_bytes();
     let built = crate::buildplan::run(&crate::buildplan::BuildPlan {
         repo_root: repo.to_path_buf(),
         commit: identity.commit.clone(),
@@ -461,7 +480,7 @@ fn write_complete(dir: &Path, complete: &Complete) -> Result<(), String> {
 
 /// A BYTE COPY of the store's bundle at `to` (absent), re-proved against the record
 /// before anything signs it: the copy's executable and whole-bundle digests are the
-/// built ones — so the bytes the cut signs are the bytes MEASURE judged. Files keep
+/// built ones — so the bytes the cut signs are the bytes `verify release` judged. Files keep
 /// their bytes and modes, links their targets; nothing else is carried.
 ///
 /// # Errors
@@ -469,7 +488,7 @@ fn write_complete(dir: &Path, complete: &Complete) -> Result<(), String> {
 pub fn copy_bundle(complete: &Complete, from: &Path, to: &Path) -> Result<(), String> {
     if to.exists() {
         return Err(format!(
-            "{} exists — the measured bundle is copied into a fresh place",
+            "{} exists — the verified bundle is copied into a fresh place",
             to.display()
         ));
     }
@@ -614,13 +633,12 @@ fn short(sha: &str) -> &str {
 /// `targo --unverified ship build` — THE ONE BUILD OF A RELEASE BUNDLE, into the
 /// release cache, or the COMPLETE one found there, its bytes re-proved:
 ///
-/// * STEP 7 OF `ship release`, which runs it as the step's child: the candidate this
+/// * The `ship release` build step, which runs it as its child: the candidate this
 ///   clone's unfinished release journal reserved (`release.toml` [reserved]) — its
 ///   build number and release commit;
 /// * with no release in progress (no journal, or a finished one): HEAD's bundle under
 ///   a provisional number — `max(HEAD's ledger tail + 1, now)`, claimed nowhere — the
-///   bundle `tools/verify.sh --measure <app>` (or `--full <app>`) measures between
-///   releases, on a clean checkout of HEAD, whose suite judges it.
+///   bundle `verify measure --app <app>` judges between releases.
 ///
 /// # Errors
 /// A release in progress that has not reserved yet, and [`build`]'s.
@@ -635,7 +653,7 @@ pub fn run_build(repo: &Path) -> Result<(), crate::ledger::Error> {
             let reserved = journal.reserved.ok_or_else(|| {
                 crate::ledger::Error::new(format!(
                     "this clone's release of v{} from {} reserves no identity yet — `{}` \
-                     reserves it at step 7 and builds it then (`{} --forget` drops that \
+                     reserves it during the build step (`{} --forget` drops that \
                      release, and `ship build` then builds HEAD under a provisional number)",
                     journal.version,
                     short(&journal.commit),
@@ -665,9 +683,8 @@ pub fn run_build(repo: &Path) -> Result<(), crate::ledger::Error> {
     );
     if provisional {
         println!(
-            "    measure it from a clean checkout of {}: tools/verify.sh --measure {}",
-            short(&complete.commit),
-            app.display()
+            "    measure it: targo --unverified run -q -p aterm-verify -- measure --app {}",
+            crate::release::shell_word(&app.display().to_string())
         );
     }
     Ok(())

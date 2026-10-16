@@ -98,9 +98,9 @@
 //!   ([`still_gone`]);
 //! * a cells cache whose `.checkout` names a checkout SEEN to be no longer a
 //!   workspace — its folder there without a `Cargo.toml`, or the folder that
-//!   held it there without it — the one rule `xtask gate cells` sweeps by
-//!   too ([`checkout`]: a checkout that cannot be read, is away, or lies
-//!   where it is never looked at is not gone).
+//!   held it there without it — the one rule atpkg's build cache sweep
+//!   applies too ([`checkout`]: a checkout that cannot be read, is away, or
+//!   lies where it is never looked at is not gone).
 //!
 //! An owner owns only what lies INSIDE its folder: a `target*` link in a
 //! scratchpad that points out of the session's directory (a scratch
@@ -149,7 +149,7 @@ pub const MAX_SESSION_ENTRIES: usize = 100_000;
 const MAX_ANCESTORS: usize = 32;
 
 /// When a cells cache's checkout is gone: the one rule, shared as source
-/// with `xtask gate cells`' own sweep.
+/// with atpkg's build cache sweep.
 #[path = "disk_checkout.rs"]
 pub mod checkout;
 
@@ -677,7 +677,9 @@ pub fn running_claude_census(home: Option<&Path>) -> ClaudeCensus {
     claude_census(processes, home)
 }
 
-/// The cells cache root `xtask gate cells` uses by default.
+/// The cells cache root (`$XDG_CACHE_HOME/aterm/cells`, else
+/// `~/.cache/aterm/cells`): a retired layout nothing writes now, whose
+/// leftovers the watch reclaims.
 #[must_use]
 pub fn cells_root(home: &Path, xdg_cache: Option<&Path>) -> PathBuf {
     xdg_cache
@@ -1669,8 +1671,7 @@ fn live_records(claude_dir: &Path) -> Registry {
 }
 
 /// A cells cache's owner: gone only when its checkout is SEEN to be no
-/// longer a workspace ([`checkout::gone`], the rule `xtask gate cells`
-/// sweeps by too).
+/// longer a workspace ([`checkout::gone`]).
 fn cell_owner(checkout: Option<&Path>, key: &Path, home: Option<&Path>) -> Owned {
     let Some(checkout) = checkout else {
         return Owned::Live("its .checkout names no checkout".to_owned());

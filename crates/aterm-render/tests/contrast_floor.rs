@@ -2,36 +2,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Tier-1 conformance for the MINIMUM-CONTRAST FLOOR (W5b): the shipping
-//! [`aterm_render::floor_fg_contrast`] delivers, for EVERY `fg`/`bg`/ratio,
+//! Conformance for the minimum-contrast floor: for every `fg`/`bg`/ratio,
+//! [`aterm_render::floor_fg_contrast`] delivers
 //!
 //! ```text
 //! contrast(floor_fg_contrast(fg, bg, r), bg) >= min(r, max_achievable(bg))
 //! ```
 //!
-//! where `max_achievable(bg) = max(contrast(BLACK, bg), contrast(WHITE, bg))`
-//! — the highest WCAG ratio ANY color can reach against `bg` (relative
-//! luminance is bounded by the black/white poles). In words: the floor
-//! delivers the requested ratio whenever the background physically admits it,
-//! and the best achievable contrast otherwise. This is the bound the config
-//! key `minimum_contrast` (and the OSC-12 cursor floor riding the same
-//! function) promises the user.
+//! where `max_achievable(bg) = max(contrast(BLACK, bg), contrast(WHITE, bg))`: the
+//! requested ratio whenever the background admits it, else the best achievable. This is
+//! what `minimum_contrast` (and the OSC-12 cursor floor on the same function) promises.
 //!
-//! ## Two-tier proof
-//!
-//! * **Tier-0 (abstract, model-checked by the Trust `ty` compiler)** — the
-//!   `ContrastFloor` derived model (`aterm_spec::derive::contrast_floor_model`)
-//!   carries the same `FloorDelivers` invariant over an abstract contrast
-//!   lattice. `targo --unverified test -p aterm-spec` runs the REAL `ty` binary over the
-//!   whole bounded state space: it PROVES the invariant at `Buggy=0` and
-//!   CATCHES the old midpoint pole rule at `Buggy=1` (counterexample).
-//! * **Tier-1 (concrete, this file)** — the bound is checked against an
-//!   INDEPENDENT WCAG oracle (contrast re-derived here from the sRGB EOTF,
-//!   not shared with the shipping code) exhaustively over all grayscale
-//!   `fg × bg` pairs and over a dense RGB lattice, at ratios across the whole
-//!   `1..=21` domain. The old pole rule (`L(bg) > 0.5` picks black, so
-//!   mid-luminance backgrounds fall back to the WEAKER pole) is the Tier-0
-//!   model's `Buggy=1` negative control above, so it has no copy here.
+//! The ty model `aterm_spec::derive::contrast_floor_model` proves the same
+//! `FloorDelivers` invariant over an abstract lattice and catches a midpoint pole rule
+//! (`L(bg) > 0.5` picks black) at `Buggy=1`. This file checks the bound against an
+//! independent WCAG oracle (re-derived from the sRGB EOTF), exhaustively on grayscale
+//! and over a dense RGB lattice.
 
 use aterm_render::{floor_fg_contrast, floor_min_contrast_fg};
 
@@ -79,8 +65,7 @@ const RATIOS: [f32; 7] = [1.0, 1.5, 3.0, 4.5, 7.0, 10.0, 21.0];
 // The bound, exhaustively on grayscale.
 // ---------------------------------------------------------------------------
 
-/// All 256×256 grayscale pairs × 7 ratios spanning the knob's domain: the
-/// floored fg meets `min(r, max_achievable(bg))` on every single input.
+/// All 256×256 grayscale pairs at 7 ratios spanning the knob's domain meet the bound.
 #[test]
 fn floor_meets_bound_grayscale_exhaustive() {
     let mut floored = 0u32; // non-vacuity: the floor must actually engage
@@ -113,10 +98,8 @@ fn floor_meets_bound_grayscale_exhaustive() {
 // The bound on a dense full-color lattice.
 // ---------------------------------------------------------------------------
 
-/// RGB lattice (5 values/channel for fg = 125 colors, 8/channel for bg = 512
-/// backgrounds) × the extreme + AA ratios: the bound holds for cross-hue
-/// pairs too — including every MID-LUMINANCE background, the regime the old
-/// pole rule got wrong.
+/// An RGB lattice (125 fgs, 512 bgs) at 4.5 and 21: the bound holds for cross-hue pairs,
+/// including mid-luminance backgrounds, where a midpoint pole rule picks the weaker pole.
 #[test]
 fn floor_meets_bound_rgb_lattice() {
     let fg_vals: Vec<u32> = (0..5u32).map(|i| i * 255 / 4).collect();
@@ -165,9 +148,8 @@ fn floor_meets_bound_rgb_lattice() {
 // The wrapper's documented exemptions stay pinned.
 // ---------------------------------------------------------------------------
 
-/// `floor_min_contrast_fg` deliberately exempts `min <= 1` (knob off) and
-/// `fg == bg` (SGR 8 conceal must stay concealed) — the ONLY inputs where the
-/// bound above does not apply. Everything else delegates to the proven floor.
+/// `floor_min_contrast_fg` exempts exactly `min <= 1` (knob off) and `fg == bg` (SGR 8
+/// conceal stays concealed); everything else delegates to the floor.
 #[test]
 fn wrapper_exemptions_are_exactly_off_and_conceal() {
     let (fg, bg) = (gray(120), gray(128));

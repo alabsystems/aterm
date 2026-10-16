@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The three syscalls the server loop makes that `aterm-uds` has no wrapper
-//! for: `poll(2)`, a non-blocking `waitpid(2)` for the one kind of child the
-//! keeper has (`/usr/bin/open`), and raising `RLIMIT_NOFILE` to its hard limit
-//! (the keeper holds one descriptor per terminal). Nothing here touches a PTY.
+//! The syscalls `aterm-uds` has no wrapper for: `poll(2)`, a non-blocking `waitpid(2)` for the
+//! keeper's one kind of child (the relaunch's `/usr/bin/open`), and raising `RLIMIT_NOFILE` to
+//! its hard limit (the keeper holds one descriptor per terminal).
 
 /// `struct pollfd`.
 #[repr(C)]

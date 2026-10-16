@@ -71,7 +71,7 @@ impl aterm_messages::presence::Host for Native {
     type Stall = crate::input_stall::InputStallFact;
 
     fn wall_wire(kind: aterm_phase::WallKind) -> &'static str {
-        wall_word(kind)
+        kind.wire()
     }
 
     /// A wall that reads `limited` (a usage window, a model bucket, spend, an
@@ -347,8 +347,7 @@ pub(crate) struct RetryPlan {
 }
 
 impl RetryPlan {
-    /// The plan for a try at `at_unix`, its clock read at that instant (spawns
-    /// a subprocess: worker threads only, never the window's).
+    /// The plan for a try at `at_unix`, its clock read at that instant.
     pub(crate) fn at(at_unix: i64) -> Self {
         Self::with_offset(at_unix, local_offset_at(at_unix))
     }
@@ -400,22 +399,72 @@ pub(crate) fn with_retry_plan(
     Some(agent)
 }
 
-/// `wall:<kind>` for a wall kind: `status agent=`'s spelling, `wall:` and
-/// [`aterm_phase::WallKind::name`] (pinned by a test). Static because a
-/// published verdict word is.
-pub(crate) fn wall_word(kind: aterm_phase::WallKind) -> &'static str {
-    use aterm_phase::WallKind as K;
-    match kind {
-        K::UsageSession => "wall:usage-session",
-        K::UsageWeekly => "wall:usage-weekly",
-        K::ModelBucket { .. } => "wall:model-bucket",
-        K::Spend => "wall:spend",
-        K::Context => "wall:context",
-        K::Auth => "wall:auth",
-        K::ApiError { .. } => "wall:api-error",
-        K::Overloaded => "wall:overloaded",
-        K::Memory => "wall:memory",
+/// A Codex's wall reset as its supervisor placed it: the notice's reset words
+/// and the unix second they name in that Codex's OWN zone, or `None` where its
+/// zone could not be read and no reset is guessed. Placed by the harness worker
+/// (`harness_host::WorkerIdle::place_reset`, through the agent's process), off
+/// the window's thread: Codex prints its `try again at` time in its own
+/// process's zone, which a `TZ` the tab's shell exported sets and this
+/// process never sees, so the window's own placement
+/// ([`countdown_to_reset`]) can name another time than the one the loop
+/// continues at.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PlacedReset {
+    /// The reset words placed, as the notice printed them.
+    pub(crate) words: String,
+    /// Where they fall, in unix seconds; `None`: not placeable.
+    pub(crate) at_unix: Option<i64>,
+}
+
+/// The countdown of a wall whose reset words the supervisor placed
+/// ([`PlacedReset`]): the wall's `until` is the placement's, or none where it
+/// placed none or its time has passed — never the window's own reading of the
+/// same words. A wall whose words are other than the placed ones (another
+/// notice since) keeps the screen's reading; so does every wall with no
+/// placement, which is the local zone's ([`countdown_to_reset`]). The wall's
+/// kind and words stay the screen's.
+pub(crate) fn with_placed_reset(
+    agent: Option<AgentReading>,
+    placed: Option<&PlacedReset>,
+    now_unix: i64,
+    now: Instant,
+) -> Option<AgentReading> {
+    let Some(placed) = placed else {
+        return agent;
+    };
+    let mut agent = agent?;
+    if let AgentPhase::Wall {
+        reset: Some(reset),
+        until,
+        ..
+    } = &mut agent.phase
+        && *reset == sanitize_token(&placed.words, 32)
+    {
+        *until = placed
+            .at_unix
+            .and_then(|at| u64::try_from(at - now_unix).ok())
+            .filter(|&ahead| ahead > 0)
+            .and_then(|ahead| now.checked_add(Duration::from_secs(ahead)));
     }
+    Some(agent)
+}
+
+/// The `status` record's `reset_at=` (2026-10-16): the unix second the
+/// harness placed `agent`'s wall reset at ([`PlacedReset`], in that Codex's
+/// own zone), as the tab's countdown reads it ([`with_placed_reset`]) — only
+/// while the reading is a wall whose reset words are the placed ones and the
+/// placement named a time; `-` otherwise (no placement, another notice since,
+/// a zone it could not read). `aterm harness limits` places a Codex tab's
+/// wall by it, so the CLI says the time the loop continues at, not a time in
+/// its own zone.
+pub(crate) fn reset_at_field(agent: Option<&AgentReading>, placed: Option<&PlacedReset>) -> String {
+    let at = placed.and_then(|placed| match &agent?.phase {
+        AgentPhase::Wall {
+            reset: Some(reset), ..
+        } if *reset == sanitize_token(&placed.words, 32) => placed.at_unix,
+        _ => None,
+    });
+    at.map_or_else(|| "-".to_string(), |at| at.to_string())
 }
 
 /// The server's agent verdict on one screen: not an agent, or an agent's
@@ -493,8 +542,8 @@ impl AgentVerdict {
 /// The one adapter between a session's screen and its published agent verdict.
 /// Per-vendor screen knowledge stays in `aterm_phase`
 /// ([`aterm_phase::identify`]); this decides which reader to ask, if any:
-/// - a foreground program that is an identified agent (`claude`, `codex`) gets
-///   its reader;
+/// - a foreground program that is an identified agent (`claude`, `codex`,
+///   `agy`, `muse`) gets its reader;
 /// - a `known_agent` (identified by its screen earlier in this foreground job)
 ///   keeps that agent's reader;
 /// - a runtime an agent runs under ([`aterm_phase::may_host_agent`]), or no
@@ -515,7 +564,7 @@ pub(crate) fn agent_verdict(
     cursor: Cursor,
     now: Instant,
 ) -> AgentVerdict {
-    use aterm_phase::{Program, ScreenReader};
+    use aterm_phase::ScreenReader;
     // The live zone ([`live_zone`]); `whole` is read again for a box whose head
     // the zone cuts.
     let whole = rows;
@@ -533,16 +582,16 @@ pub(crate) fn agent_verdict(
     } else if frame_may_identify {
         let reader = match aterm_phase::identify(None, rows) {
             // A box the zone cut names its program on the whole screen.
-            r if r.program() == Program::Generic && whole.len() > rows.len() => {
+            r if !names_agent(r.program()) && whole.len() > rows.len() => {
                 aterm_phase::identify(None, whole)
             }
             r => r,
         };
-        match reader.program() {
-            Program::Generic => return AgentVerdict::NotAgent,
-            // The identity is carried across the job's boxes and drafts.
-            _ => (reader, true),
+        if !names_agent(reader.program()) {
+            return AgentVerdict::NotAgent;
         }
+        // The identity is carried across the job's boxes and drafts.
+        (reader, true)
     } else {
         return AgentVerdict::NotAgent;
     };
@@ -560,6 +609,19 @@ pub(crate) fn agent_verdict(
         by_frame,
         subject,
         program: reader.program(),
+    }
+}
+
+/// Whether the reader a screen sniff answered ([`aterm_phase::identify`])
+/// names an agent: every program's but the generic reader's, which is the
+/// answer for a screen that names none.
+fn names_agent(program: aterm_phase::Program) -> bool {
+    match program {
+        aterm_phase::Program::Claude
+        | aterm_phase::Program::Codex
+        | aterm_phase::Program::Agy
+        | aterm_phase::Program::Muse => true,
+        aterm_phase::Program::Generic => false,
     }
 }
 
@@ -741,13 +803,13 @@ fn prompt_detail(p: &aterm_phase::PromptV2) -> String {
 /// the engine never read one notice two ways. `None` when the words cannot be
 /// read, the notice names another zone, or the reset is past; the row then
 /// prints the reset time alone. The reset is placed with the offset that holds
-/// at it ([`local_offset_at_cached`]), so a daylight-saving change between now
-/// and the reset is honoured.
+/// at it ([`local_offset_at`]), so a daylight-saving change between now and the
+/// reset is honoured.
 pub(crate) fn countdown_to_reset(reset: &str) -> Option<Duration> {
     countdown_in(
         reset,
         limit::unix_now(),
-        &local_offset_at_cached,
+        &local_offset_at,
         local_zone().as_deref(),
     )
 }
@@ -794,71 +856,105 @@ fn local_zone() -> Option<String> {
             return Some(tz.to_string());
         }
     }
-    let link = std::fs::read_link("/etc/localtime").ok()?;
+    local_zone_at(std::path::Path::new("/etc/localtime"))
+}
+
+/// The zone named by this host's localtime link. The path is injected for
+/// tests, which replace only a scratch link and never the machine's timezone.
+fn local_zone_at(path: &std::path::Path) -> Option<String> {
+    // Offsets are read in the current system zone. Re-read its identity too:
+    // retaining an old name would admit its notices against the new offsets.
+    let link = std::fs::read_link(path).ok()?;
     let s = link.to_str()?;
     let i = s.find("zoneinfo/")?;
     Some(s[i + "zoneinfo/".len()..].to_string())
 }
 
-/// The local clock's offset from UTC in seconds, from `date +%z`, read once;
-/// `None` where it cannot be run (then no figure is printed). Settings ▸
-/// Packages reads its clock per instant instead ([`local_offset_at`]).
-#[cfg(unix)]
+/// The local clock's offset from UTC in seconds, read once per process
+/// ([`local_offset_at`]); `None` where it cannot be read (then no figure is
+/// printed). Settings ▸ Packages reads its clock per instant instead.
 pub(crate) fn local_offset_s() -> Option<i64> {
     static OFFSET: OnceLock<Option<i64>> = OnceLock::new();
-    *OFFSET.get_or_init(|| {
-        let out = aterm_uds::spawnfd::command("date")
-            .arg("+%z")
-            .stdin(aterm_uds::spawnfd::Stdio::null())
-            .stderr(aterm_uds::spawnfd::Stdio::null())
-            .output()
-            .ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        limit::parse_zone(String::from_utf8_lossy(&out.stdout).trim())
-    })
+    *OFFSET.get_or_init(|| local_offset_at(limit::unix_now()))
 }
 
-#[cfg(not(unix))]
-pub(crate) fn local_offset_s() -> Option<i64> {
-    None
+/// `struct tm` (`<time.h>`), the same on Darwin and glibc: nine `int`s, then
+/// the BSD/GNU `tm_gmtoff` and `tm_zone`. Not in `libc` (generated; see
+/// `crate::qos`), so declared here with the calls that refresh and fill it.
+#[cfg(unix)]
+#[repr(C)]
+struct Tm {
+    _date_and_time: [libc::c_int; 9],
+    tm_gmtoff: libc::c_long,
+    _tm_zone: *const libc::c_char,
+}
+
+#[cfg(all(unix, target_pointer_width = "64"))]
+const _: () = assert!(size_of::<Tm>() == 56);
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn localtime_r(clock: *const libc::time_t, result: *mut Tm) -> *mut Tm;
+    fn tzset();
 }
 
 /// The local zone's offset from UTC at the instant `unix`, in seconds (the
-/// offset daylight saving gives that instant): [`limit::offset_at`] with no zone
-/// named. Spawns a subprocess per call, so workers only (Settings ▸ Packages'
-/// clock, `packages_screen::LocalClock::read`); `None` where `date` cannot say.
+/// offset daylight saving gives that instant), from the C library's own zone
+/// rules — `localtime_r`'s `tm_gmtoff`, under this process's `TZ` as `date`
+/// reads it, in-process instead of spawning `date` (once, and once per
+/// quarter hour, before). Another zone's offset still takes `date`
+/// ([`limit::offset_at`]):
+/// reading one in-process would mean setting `TZ`, which no thread may do
+/// beside others. Refreshing with `tzset` follows a replaced system zone as
+/// [`local_zone`] follows it: `localtime_r` alone need not reload the rules
+/// (glibc otherwise retains its first system zone). An explicit `TZ` still
+/// takes precedence; this never changes it. `None` where the platform cannot
+/// say.
+#[cfg(unix)]
 pub(crate) fn local_offset_at(unix: i64) -> Option<i64> {
-    limit::offset_at(None, unix)
+    refreshed_local_offset_at(
+        unix,
+        || {
+            // SAFETY: `tzset` takes no pointers, serializes its C-library zone
+            // state, and reads the environment without changing it, as does
+            // `localtime_r`. No thread may mutate `TZ` beside these readers.
+            unsafe { tzset() }
+        },
+        native_local_offset_at,
+    )
 }
 
-/// [`local_offset_at`] for the UI thread: the offset read at the start of the
-/// quarter hour `unix` falls in (zones change offset on a quarter hour of UTC),
-/// memoized per quarter hour, so a countdown re-read on every classification
-/// spawns no `date` and still uses the offset that holds then. A bounded memo:
-/// the oldest quarter hours go.
-pub(crate) fn local_offset_at_cached(unix: i64) -> Option<i64> {
-    use std::collections::VecDeque;
-    use std::sync::Mutex;
-    const QUARTER: i64 = 15 * 60;
-    const KEPT: usize = 32;
-    static MEMO: Mutex<VecDeque<(i64, Option<i64>)>> = Mutex::new(VecDeque::new());
-    let memo = || {
-        MEMO.lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    };
-    let quarter = unix.div_euclid(QUARTER);
-    if let Some(&(_, offset)) = memo().iter().find(|(q, _)| *q == quarter) {
-        return offset;
+/// Refresh before each read, including the candidate instants used to place a
+/// countdown. The provider is injected so tests can replace a cached zone
+/// without touching the host's timezone or this process's environment.
+#[cfg(unix)]
+fn refreshed_local_offset_at(
+    unix: i64,
+    refresh: impl FnOnce(),
+    read: impl FnOnce(i64) -> Option<i64>,
+) -> Option<i64> {
+    refresh();
+    read(unix)
+}
+
+#[cfg(unix)]
+fn native_local_offset_at(unix: i64) -> Option<i64> {
+    let clock: libc::time_t = unix;
+    let mut tm = std::mem::MaybeUninit::<Tm>::zeroed();
+    // SAFETY: `clock` is a live `time_t` and `tm` a writable, correctly laid
+    // out `struct tm` (its size pinned above); `localtime_r` writes only it.
+    let filled = unsafe { localtime_r(&clock, tm.as_mut_ptr()) };
+    if filled.is_null() {
+        return None;
     }
-    let offset = local_offset_at(quarter.saturating_mul(QUARTER));
-    let mut memo = memo();
-    if memo.len() >= KEPT {
-        memo.pop_front();
-    }
-    memo.push_back((quarter, offset));
-    offset
+    // SAFETY: a non-null answer filled every field; all are plain integers
+    // or a pointer this never reads.
+    Some(unsafe { tm.assume_init() }.tm_gmtoff)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn local_offset_at(_unix: i64) -> Option<i64> {
+    None
 }
 
 #[cfg(test)]
@@ -1145,7 +1241,7 @@ mod tests {
             K::Memory,
         ];
         for kind in kinds {
-            assert_eq!(wall_word(kind), format!("wall:{}", kind.name()));
+            assert_eq!(kind.wire(), format!("wall:{}", kind.name()));
             let phase = AgentPhase::Wall {
                 kind,
                 reset: None,
@@ -1760,6 +1856,146 @@ mod tests {
         assert!(said.sentence.contains("resets 7:30pm"), "{}", said.sentence);
     }
 
+    /// THE `status` RECORD'S `reset_at=` ([`reset_at_field`]) is the unix
+    /// second the harness placed a Codex's wall reset at, while the reading's
+    /// wall shows the words it placed — what `aterm harness limits` places
+    /// that wall by. CONTROLS, each `-`: no placement; a placement that named
+    /// no time (its zone unread); another notice's words since; a wall with
+    /// no words; a phase that is no wall; no reading.
+    #[test]
+    fn the_status_records_reset_at_is_the_placed_reset_of_the_wall_shown() {
+        use aterm_phase::WallKind;
+        let wall = |reset: Option<&str>| AgentReading {
+            phase: AgentPhase::Wall {
+                kind: WallKind::UsageSession,
+                reset: reset.map(str::to_string),
+                until: None,
+            },
+            context_pct: None,
+        };
+        let placed = |words: &str, at: Option<i64>| PlacedReset {
+            words: words.to_string(),
+            at_unix: at,
+        };
+        let at = Some(1_789_664_100);
+        assert_eq!(
+            reset_at_field(Some(&wall(Some("4:10 PM"))), Some(&placed("4:10 PM", at))),
+            "1789664100"
+        );
+        for (agent, placement) in [
+            (Some(wall(Some("4:10 PM"))), None),
+            (Some(wall(Some("4:10 PM"))), Some(placed("4:10 PM", None))),
+            (Some(wall(Some("5:20 PM"))), Some(placed("4:10 PM", at))),
+            (Some(wall(None)), Some(placed("4:10 PM", at))),
+            (
+                Some(AgentReading {
+                    phase: AgentPhase::Idle,
+                    context_pct: None,
+                }),
+                Some(placed("4:10 PM", at)),
+            ),
+            (None, Some(placed("4:10 PM", at))),
+        ] {
+            assert_eq!(
+                reset_at_field(agent.as_ref(), placement.as_ref()),
+                "-",
+                "{agent:?} {placement:?}"
+            );
+        }
+    }
+
+    /// A CODEX'S RESET COUNTS DOWN TO WHERE ITS SUPERVISOR PLACED IT: the band
+    /// placed a Codex's `try again at 4:10 PM` in this process's zone, while the
+    /// loop placed it in the Codex's own (a `TZ` the tab's shell exported), so a
+    /// tab whose zone differs from aterm's counted down to another time than
+    /// the one the supervisor continues at. The placement's `until` replaces
+    /// the window's; one the supervisor could not place, or one past, shows the
+    /// reset words alone. CONTROLS, each leaving the reading as the screen
+    /// made it: no placement, another notice's words, a wall with no words, a
+    /// phase that is no wall, and no reading.
+    #[test]
+    fn a_codex_wall_counts_down_to_the_reset_its_supervisor_placed() {
+        use aterm_phase::WallKind;
+        const NOW_UNIX: i64 = 1_789_660_500;
+        let now = t0();
+        let local = now.checked_add(Duration::from_secs(7 * 3600));
+        let wall = |reset: Option<&str>| {
+            Some(AgentReading {
+                phase: AgentPhase::Wall {
+                    kind: WallKind::UsageSession,
+                    reset: reset.map(str::to_string),
+                    until: local,
+                },
+                context_pct: None,
+            })
+        };
+        let placed = |words: &str, at: Option<i64>| PlacedReset {
+            words: words.to_string(),
+            at_unix: at,
+        };
+        let until = |agent: Option<AgentReading>| match agent.map(|a| a.phase) {
+            Some(AgentPhase::Wall { until, .. }) => until,
+            other => panic!("still a wall: {other:?}"),
+        };
+        let lay =
+            |agent, placed: Option<&PlacedReset>| with_placed_reset(agent, placed, NOW_UNIX, now);
+        // The supervisor's placement, an hour ahead, not the window's seven.
+        let got = lay(
+            wall(Some("4:10 PM")),
+            Some(&placed("4:10 PM", Some(NOW_UNIX + 3600))),
+        );
+        assert_eq!(
+            until(got.clone()),
+            now.checked_add(Duration::from_secs(3600))
+        );
+        let Some(AgentReading {
+            phase: AgentPhase::Wall { kind, reset, .. },
+            ..
+        }) = got
+        else {
+            panic!("still a wall");
+        };
+        assert_eq!(
+            (kind, reset.as_deref()),
+            (WallKind::UsageSession, Some("4:10 PM")),
+            "the kind and the words are the screen's"
+        );
+        // Not placeable, or past: the words alone, never the window's guess.
+        assert_eq!(
+            until(lay(wall(Some("4:10 PM")), Some(&placed("4:10 PM", None)))),
+            None
+        );
+        assert_eq!(
+            until(lay(
+                wall(Some("4:10 PM")),
+                Some(&placed("4:10 PM", Some(NOW_UNIX - 60)))
+            )),
+            None
+        );
+        // CONTROLS: the reading is returned as it was.
+        let other = placed("4:10 PM", Some(NOW_UNIX + 3600));
+        for (name, agent, placed) in [
+            ("no placement", wall(Some("4:10 PM")), None),
+            (
+                "another notice's words",
+                wall(Some("5:20 PM")),
+                Some(&other),
+            ),
+            ("no words", wall(None), Some(&other)),
+            (
+                "not a wall",
+                Some(AgentReading {
+                    phase: AgentPhase::Idle,
+                    context_pct: None,
+                }),
+                Some(&other),
+            ),
+        ] {
+            assert_eq!(lay(agent.clone(), placed), agent, "{name}");
+        }
+        assert_eq!(lay(None, Some(&other)), None);
+    }
+
     /// A tall pane with a short transcript (an API error on row 8, the composer
     /// pinned on rows 46-48 of 50): the verdict reads the wall and its cause,
     /// with the cursor on the caret as the sweep hands it.
@@ -1909,7 +2145,7 @@ mod tests {
         // time with the offset THEN, as it must, and this expectation is built with
         // today's.
         if let Some(offset) = local_offset_s()
-            && local_offset_at_cached(limit::unix_now() + 2 * 3600) == Some(offset)
+            && local_offset_at(limit::unix_now() + 2 * 3600) == Some(offset)
         {
             let local = limit::unix_now() + offset + 2 * 3600;
             let tod = local.rem_euclid(86_400);
@@ -1922,6 +2158,94 @@ mod tests {
             );
         }
         assert_eq!(countdown_to_reset("soon"), None);
+    }
+
+    /// The in-process offset reads what `date +%z` reads — the reference the
+    /// process spawned before — at instants across a year and on each side of
+    /// the US and EU daylight-saving switches of 2026, so whichever zone this
+    /// machine is in, a switch it has is crossed. Both read this process's
+    /// `TZ` (the test sets none: no thread may set it beside others).
+    #[cfg(unix)]
+    #[test]
+    fn the_in_process_offset_is_the_one_date_reads() {
+        const JAN_1_2026: i64 = 1_767_225_600;
+        let switches = [
+            1_772_964_000, // 2026-03-08 10:00 UTC: US clocks go forward
+            1_774_746_000, // 2026-03-29 01:00 UTC: EU clocks go forward
+            1_792_890_000, // 2026-10-25 01:00 UTC: EU clocks go back
+            1_793_523_600, // 2026-11-01 09:00 UTC: US clocks go back
+        ];
+        let instants = (0..12)
+            .map(|month| JAN_1_2026 + month * 30 * 86_400)
+            .chain(switches.iter().flat_map(|&at| [at - 1, at]));
+        let mut compared = 0;
+        for at in instants {
+            let Some(reference) = limit::offset_at(None, at) else {
+                continue;
+            };
+            assert_eq!(local_offset_at(at), Some(reference), "at {at}");
+            compared += 1;
+        }
+        assert!(compared > 0, "`date` answered for no instant");
+    }
+
+    /// A system timezone replacement changes the zone identity as well as
+    /// its offsets. A notice naming the former zone must not be interpreted
+    /// with the new zone's clock. Every filesystem operation is scratch-only.
+    #[cfg(unix)]
+    #[test]
+    fn the_countdown_tracks_replacement_of_the_local_zone_link() {
+        let dir = aterm_tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("localtime");
+        std::os::unix::fs::symlink("/usr/share/zoneinfo/America/Los_Angeles", &path).unwrap();
+        let now = 1_789_812_000_i64;
+        // Like libc, this provider retains its first zone until refreshed.
+        // Replace its source alongside the scratch link, never the real TZ.
+        let source_offset = std::cell::Cell::new(-7 * 3600);
+        let cached_offset = std::cell::Cell::new(-7 * 3600);
+        let offset_at = |unix| {
+            refreshed_local_offset_at(
+                unix,
+                || cached_offset.set(source_offset.get()),
+                |_| Some(cached_offset.get()),
+            )
+        };
+        let old = local_zone_at(&path);
+        assert_eq!(old.as_deref(), Some("America/Los_Angeles"));
+        assert_eq!(
+            countdown_in("5pm (America/Los_Angeles)", now, &offset_at, old.as_deref()),
+            Some(Duration::from_secs(14 * 3600))
+        );
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink("/usr/share/zoneinfo/Etc/UTC", &path).unwrap();
+        source_offset.set(0);
+        let current = local_zone_at(&path);
+        assert_eq!(current.as_deref(), Some("Etc/UTC"));
+        // Negative control: reading the cached rules without the refresh would
+        // accept this new-zone notice but place it seven hours too late.
+        assert_eq!(
+            countdown_in(
+                "5pm (Etc/UTC)",
+                now,
+                &|_| Some(cached_offset.get()),
+                current.as_deref(),
+            ),
+            Some(Duration::from_secs(14 * 3600))
+        );
+        assert_eq!(
+            countdown_in(
+                "5pm (America/Los_Angeles)",
+                now,
+                &offset_at,
+                current.as_deref(),
+            ),
+            None,
+            "the former zone's notice must not use the new zone's offset"
+        );
+        assert_eq!(
+            countdown_in("5pm (Etc/UTC)", now, &offset_at, current.as_deref()),
+            Some(Duration::from_secs(7 * 3600))
+        );
     }
 
     /// The band, its spoken sentence and the greyed menu row all read a hold

@@ -37,11 +37,10 @@
 //! assert_eq!(hardened.profile, aterm_policy::Profile::Hardened);
 //! ```
 
-#![deny(clippy::all)]
-#![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "toml")]
 use serde::{Deserialize, Serialize};
 
 pub mod aliases;
@@ -66,8 +65,9 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// `NetworkUntrusted` being the bottom is load-bearing: the built-in profiles
 /// use `origin_min = NetworkUntrusted` as the "allow from any origin" floor.
 /// The order is pinned by exhaustive proofs in `tests.rs`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "PascalCase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "toml", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "toml", serde(rename_all = "PascalCase"))]
 #[non_exhaustive]
 pub enum OriginTag {
     /// Host-minted: host application code, system config, cannot be forged by
@@ -137,8 +137,9 @@ impl OriginTag {
 /// [`profiles`]. The profile field is redundant with the rule set (the rules
 /// *are* the profile) but the tag is carried so that the FFI surface and host
 /// UIs can display the profile's common name and reason about refinement.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "PascalCase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "toml", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "toml", serde(rename_all = "PascalCase"))]
 #[non_exhaustive]
 pub enum Profile {
     /// xterm-compatible, `unmatched = Execute`. Legacy testing only.
@@ -159,8 +160,9 @@ pub enum Profile {
 /// The `Ask` and `Rewrite` variants carry no inline payload in the TOML
 /// schema; the referenced prompt is named by a sibling rule field
 /// ([`Rule::prompt_id`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "toml", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "toml", serde(rename_all = "snake_case"))]
 #[non_exhaustive]
 pub enum Response {
     /// Silently drop the sequence. No host observable side effect.
@@ -180,15 +182,16 @@ pub enum Response {
 // ---------------------------------------------------------------------------
 
 /// Policy defaults: fallthrough behavior when no rule matches (§4.1).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "toml", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "toml", serde(deny_unknown_fields))]
 pub struct Defaults {
     /// Response used when evaluation falls through every rule.
     pub unmatched: Response,
     /// Whether OSC 133 / OSC 633 shell-integration sequences require a
     /// 64-hex-digit nonce. Mirrors
     /// `TerminalModes::require_shell_integration_nonce` (§6.4).
-    #[serde(default)]
+    #[cfg_attr(feature = "toml", serde(default))]
     pub shell_integration_require_nonce: bool,
 }
 
@@ -203,8 +206,9 @@ pub struct Defaults {
 /// byte's origin wins. A rule that matches by selector but fails the origin
 /// test does **not** short-circuit — evaluation continues with the next rule
 /// (§4.2). This lets operators write fallback rules for the same selector.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "toml", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "toml", serde(deny_unknown_fields))]
 pub struct Rule {
     /// Sequence selector in its raw string form; compiled by
     /// [`selector::SequenceSelector::parse`].
@@ -216,10 +220,16 @@ pub struct Rule {
     pub response: Response,
     /// Named rate-limit reference. Resolved against [`Policy::rate_limits`] by
     /// id. `None` means "no rate limit on this rule".
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(
+        feature = "toml",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
     pub rate_limit: Option<String>,
     /// Prompt identifier, only meaningful when `response == Ask`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(
+        feature = "toml",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
     pub prompt_id: Option<String>,
 }
 
@@ -230,8 +240,9 @@ pub struct Rule {
 /// Named token-bucket configuration (§3.1).
 ///
 /// Schema only; bucket state lives in the engine's [`limits::RateLimiterSet`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "toml", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "toml", serde(deny_unknown_fields))]
 pub struct RateLimit {
     /// Identifier referenced by [`Rule::rate_limit`].
     pub id: String,
@@ -242,7 +253,7 @@ pub struct RateLimit {
     pub refill_per_second: u32,
     /// Hard cap on a single sequence's consumption, independent of the
     /// bucket's current level. `0` means "no per-sequence cap".
-    #[serde(default)]
+    #[cfg_attr(feature = "toml", serde(default))]
     pub per_sequence_max: u32,
 }
 
@@ -252,11 +263,12 @@ pub struct RateLimit {
 
 /// Root policy document (§3.1 + Appendix A).
 ///
-/// The TOML document a policy file parses into ([`Policy::to_toml`] writes it
-/// back). Checkpoints deliberately omit it; the host re-installs the engine
-/// after a restore.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// The TOML document a policy file parses into (`Policy::to_toml`, behind the
+/// `toml` feature, writes it back). Checkpoints deliberately omit it; the host
+/// re-installs the engine after a restore.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "toml", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "toml", serde(deny_unknown_fields))]
 pub struct Policy {
     /// Schema version. Must equal [`SCHEMA_VERSION`]; the reader rejects any
     /// other value (§5.1).
@@ -266,13 +278,14 @@ pub struct Policy {
     /// Fallthrough defaults for unmatched dispatches.
     pub defaults: Defaults,
     /// Ordered rule list. First match (modulo origin fallthrough) wins.
-    #[serde(default)]
+    #[cfg_attr(feature = "toml", serde(default))]
     pub rules: Vec<Rule>,
     /// Named rate-limit table. Referenced by `Rule::rate_limit`.
-    #[serde(default)]
+    #[cfg_attr(feature = "toml", serde(default))]
     pub rate_limits: Vec<RateLimit>,
 }
 
+#[cfg(feature = "toml")]
 impl Policy {
     /// Serialize this policy as a TOML string (§5.1).
     ///

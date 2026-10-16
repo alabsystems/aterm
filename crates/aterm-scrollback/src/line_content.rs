@@ -7,41 +7,31 @@ use super::INLINE_SIZE;
 
 /// Fixed-capacity inline byte buffer for short scrollback lines.
 ///
-/// Holds up to `INLINE_SIZE` (32) bytes inline. The length is stored as a `u8`
-/// because it is provably bounded by `INLINE_SIZE` (asserted at compile time
-/// below: `INLINE_SIZE <= u8::MAX`), saving 7 bytes per line versus the
-/// `usize` length a generic `SmallVec` would carry — and the hot tier keeps
-/// one `Line` per scrollback row, so this is a direct per-line resident-memory
-/// reduction.
+/// Holds up to `INLINE_SIZE` (32) bytes inline. The length is a `u8` (bounded by
+/// `INLINE_SIZE`, asserted below), saving 7 bytes on every hot-tier `Line`
+/// against a `usize` length.
 #[derive(Debug, Clone)]
 pub(crate) struct InlineBuf {
     buf: [u8; INLINE_SIZE],
     len: u8,
 }
 
-// `len: u8` is only sound while the inline capacity fits in a `u8`. If
-// `INLINE_SIZE` is ever raised above 255, this must widen accordingly.
+// `len: u8` holds only while the inline capacity fits in a `u8`.
 const _: () = assert!(INLINE_SIZE <= u8::MAX as usize);
 
 impl InlineBuf {
     /// Create from a slice. Caller guarantees `bytes.len() <= INLINE_SIZE`.
-    // Skip: the body's one open is `copy_from_slice`'s len-mismatch assert,
-    // which lives in the ABSENT std body — and both sub-slices here are
-    // `..n` ranges (provably equal length; the `if let (Some, Some)` makes
-    // the bounds total), so the panic is unreachable in every real state.
-    // Audited. Re-measured 2026-09-27 on seal 321aaeda7 with this skip removed: INCONCLUSIVE (1 of 2
-    // unknown). Needed from $HOME/trust, in a promoted seal: a conditional
-    // `copy_from_slice` len==len caller-side template; then drop this.
+    // Skip: the one open is `copy_from_slice`'s len-mismatch assert, in the
+    // absent std body; both sub-slices are `..n`, so it cannot fire. Drop the
+    // skip once Trust has a conditional `copy_from_slice` len==len template.
     #[cfg_attr(trust_verify, trust::skip)]
     #[inline]
     fn from_slice(bytes: &[u8]) -> Self {
         debug_assert!(bytes.len() <= INLINE_SIZE);
         let mut buf = [0u8; INLINE_SIZE];
         let n = bytes.len();
-        // Checked copy: `n <= INLINE_SIZE` by contract, but invisible to the
-        // panic-freedom verifier — use total `get_mut`/`get` so there is no
-        // slice-bounds panic path. Both sub-slices are length `n`, so
-        // `copy_from_slice` is total too. Identical for every reachable state.
+        // Total `get_mut`/`get`: `n <= INLINE_SIZE` by contract, but the
+        // panic-freedom verifier cannot see it.
         if let (Some(dst), Some(src)) = (buf.get_mut(..n), bytes.get(..n)) {
             dst.copy_from_slice(src);
         }
@@ -51,10 +41,8 @@ impl InlineBuf {
 
     #[inline]
     fn as_slice(&self) -> &[u8] {
-        // `len <= INLINE_SIZE` by construction (`from_slice` asserts it). Use a
-        // CHECKED access (`get`, which is total) instead of the panicking index, so
-        // there is no slice-bounds panic path to prove away — `unwrap_or` falls back
-        // to the whole buffer for the (unreachable) `len > INLINE_SIZE` case.
+        // Checked `get`: `len <= INLINE_SIZE` by construction, so the fallback is
+        // unreachable and there is no slice-bounds panic path to prove away.
         self.buf.get(..self.len as usize).unwrap_or(&self.buf)
     }
 
@@ -94,21 +82,14 @@ impl LineContent {
         }
     }
 
-    /// Create from an OWNED buffer, taking it over instead of copying it.
+    /// Create from an owned buffer, taking it over instead of copying it.
     ///
-    /// Every row materialized out of the grid ring builds its text into a fresh
-    /// `String` that dies one line later; routing that buffer through
-    /// [`from_bytes`](Self::from_bytes) makes the >32-byte case (i.e. any
-    /// full-width output row) pay a second allocation plus a full memcpy plus
-    /// the first buffer's free. Moving it makes that exactly one allocation and
-    /// zero copies.
-    ///
-    /// The shrink keeps `Line::memory_used()` — which counts `Vec::capacity`,
-    /// and which the scrollback byte budget is enforced against — reporting the
-    /// same exact-fit size `from_bytes` produced. It is a no-op (and so free)
-    /// in the common case where the caller sized its buffer exactly, and where
-    /// it does fire it replaces today's unconditional malloc+memcpy+free with a
-    /// single (usually in-place) realloc.
+    /// A row materialized out of the grid builds its text into a fresh `String`;
+    /// moving it saves the second allocation and copy that
+    /// [`from_bytes`](Self::from_bytes) makes for any line over 32 bytes. The
+    /// shrink keeps `Line::memory_used()` (which counts `Vec::capacity` and backs
+    /// the byte budget) at the exact-fit size `from_bytes` produces; it is a
+    /// no-op when the caller sized the buffer exactly.
     #[must_use]
     pub(crate) fn from_vec(mut bytes: Vec<u8>) -> Self {
         if bytes.len() <= INLINE_SIZE {

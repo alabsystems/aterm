@@ -1,30 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE MESSAGE BAND ON THE RENDERER'S FRAME — the one composition every host
-//! runs to turn the engine's resolved band rows (`aterm_messages::ink`,
-//! design ruling 324 of docs/DESIGN-unified-messages-2026-09-21.md) into this
-//! renderer's input: the [`RenderCell`] write ([`cell`], [`rows`]), each row's
-//! pixel raster placed on the frame ([`on_frame`], with [`band_icon`] and the
-//! private `rail_px`), the composed stack's seams ([`seal_stack`],
-//! [`DIVIDER_ALPHA`], [`floor_rings`], the private `give_seam_to_rails`, and
-//! the seams drawn as 1 px rails that leave the words a clear row,
-//! [`RAIL_SEAM_MIN_CELL_H`]), the gutters' chrome bleed
-//! ([`band_bleed`], [`band_row_edges`]) and the splice that puts it all above
-//! the grid ([`compose_band`], over the engine's
-//! [`RenderInput::prepend_host_rows`]).
+//! The message band on the renderer's frame: the one composition every host runs to turn
+//! the engine's resolved band rows (`aterm_messages::ink`, see
+//! docs/DESIGN-unified-messages-2026-09-21.md) into this renderer's input. That is the
+//! [`RenderCell`] write ([`rows`]), each row's pixel raster on the frame ([`on_frame`]),
+//! the stack's seams ([`seal_stack`], [`floor_rings`], [`RAIL_SEAM_MIN_CELL_H`]), the
+//! gutters' chrome bleed ([`band_bleed`], [`band_row_edges`]) and the splice above the
+//! grid ([`compose_band`]).
 //!
-//! ONE TABLE, BOTH HOSTS (ruling 331, amending 326 (e) and (h), which called
-//! this host code while there was one host). The macOS/Linux/Windows window
-//! (`aterm-gui`) and the web module (`aterm-wasm`) render through the SAME CPU
-//! rasterizer, so the code that feeds it lives beside it: moved verbatim from
-//! `aterm-gui`'s `chrome_band`, `message_band` and `app_render`, which keep
-//! their old names as re-exports and thin wrappers. What stays in a host is
-//! what only that host has: the High Contrast latch (the Windows writer), the
-//! Linux CSD base, the presence row, the palette read and the pointer.
+//! It lives beside the CPU rasterizer because the native window (`aterm-gui`) and the web
+//! module (`aterm-wasm`) both render through it. A host keeps only what it alone has: the
+//! High Contrast latch, the Linux CSD base, the presence row, the palette read and the
+//! pointer.
 //!
-//! Pure: no clock, no platform, no state. Rows RESERVE space above the grid —
-//! nothing here overlays a terminal cell.
+//! Pure: no clock, no platform, no state. Rows reserve space above the grid; nothing here
+//! overlays a terminal cell.
 
 use aterm_core::render::{HostRowPixels, RenderInput};
 use aterm_core::terminal::{RenderCell, UnderlineStyle};
@@ -52,36 +43,29 @@ pub fn cell(ch: char, fg: [u8; 3], bg: [u8; 3], bold: bool, seam: bool) -> Rende
         strikethrough: false,
         overline: seam,
         underline_color: None,
-        // A band whose cells all share one ink needs no seam colour: the
-        // overline already paints in `fg`. A band that varies its ink sets this
-        // per row (see `link_target::caption_row`), because a seam is a
-        // STRUCTURAL edge and must not brighten under the words it happens to
-        // pass beneath.
+        // One ink per band needs no seam colour: the overline paints in `fg`. A band
+        // that varies its ink sets this per row (`link_target::caption_row`), because a
+        // structural edge must not brighten under the words.
         overline_color: None,
         script: aterm_core::terminal::Script::Normal,
     }
 }
 
-/// A `cols`-wide row of blank chrome cells in `fg` on `bg` (with a top seam
-/// when `seam`).
+/// A `cols`-wide row of blank chrome cells in `fg` on `bg` (with a top seam when `seam`).
 #[must_use]
 pub fn blank_row(cols: usize, fg: [u8; 3], bg: [u8; 3], seam: bool) -> Vec<RenderCell> {
     vec![cell(' ', fg, bg, false, seam); cols]
 }
 
-/// One EMPTY band row, in the same colours a painted row uses. The compose
-/// pads with this when the geometry has committed more rows than the cache
-/// holds, so a reserved row is never a hole the terminal's own top row shows
-/// through.
+/// One empty band row in a painted row's colours: [`compose_band`] pads with it.
 #[must_use]
 pub fn blank_band_row(cols: usize, inks: &BandInks) -> Vec<RenderCell> {
     blank_row(cols, inks.label, inks.bar_bg, false)
 }
 
-/// The renderer's drawn icon for the engine's (ruling 322: one set in two
-/// tables — the engine's [`Icon`] and the core's [`BandIcon`] — held together
-/// by `band_icon_ids_match_the_renderers`). A `const fn`, not a `From`: the
-/// orphan rule forbids an impl between two foreign types here.
+/// The renderer's drawn icon for the engine's ([`Icon`] and [`BandIcon`] are one set in two
+/// tables, held together by `band_icon_ids_match_the_renderers`). A `const fn`, not a
+/// `From`: the orphan rule forbids an impl between two foreign types here.
 #[must_use]
 pub const fn band_icon(icon: Icon) -> BandIcon {
     use BandIcon as B;
@@ -102,12 +86,9 @@ pub const fn band_icon(icon: Icon) -> BandIcon {
     }
 }
 
-/// The rail band's height on a `cell_h`-pixel row: about an eighth of it —
-/// two pixels on a 1x cell, three on a 24-pixel one, never under two — in
-/// the row's lowest pixels (design ruling 243). A level's rail is at most
-/// this: the renderer fits it, with its words lifted clear, into the room
-/// the face leaves ([`RowRaster::clear_rail`], ruling 248); a bar's glint
-/// drawn there sits under its words' descenders as before.
+/// The rail band's height on a `cell_h`-pixel row: about an eighth of it, never under two
+/// pixels, in the row's lowest pixels. A level's rail is at most this; the renderer fits
+/// it, words lifted clear, into the room the face leaves ([`RowRaster::clear_rail`]).
 #[must_use]
 fn rail_px(cell_h: usize) -> usize {
     ((cell_h + 4) / 8).max(2)
@@ -187,9 +168,8 @@ pub type PaintedBand = (
 );
 
 /// Write the engine's resolved rows (`aterm_messages::ink::paint_band`) as
-/// [`RenderCell`]s, keeping each metered row's gutter edges and its raster.
-/// No row carries the hairline that closes the chrome against the terminal:
-/// only the COMPOSED stack knows which row is last ([`seal_stack`]).
+/// [`RenderCell`]s, keeping each metered row's gutter edges and its raster. No row carries
+/// the closing hairline: only the composed stack knows which row is last ([`seal_stack`]).
 #[must_use]
 pub fn rows(resolved: Vec<Resolved>) -> PaintedBand {
     let n = resolved.len();
@@ -197,14 +177,10 @@ pub fn rows(resolved: Vec<Resolved>) -> PaintedBand {
     let mut edges = Vec::with_capacity(n);
     let mut rasters = Vec::with_capacity(n);
     for r in resolved {
-        // The gutters continue the cells ACTUALLY painted at the row's two
-        // edges — a chip the width law put at column 0 (a degenerate narrow
-        // row) wears its own fill, not the meter's, and an echo's fade mixes
-        // both — so a tone changes only together with its edge cell: the
-        // renderer's no-epoch contract (`ChromeBleed::row_edges`).
-        // A busy row's comet is the same surface, so its gutters light as it
-        // enters and leaves. The pixel raster, where there is one, is drawn
-        // over both (and dirties its row on its own).
+        // The gutters continue the cells actually painted at the row's edges (a chip at
+        // column 0 wears its own fill, an echo's fade mixes both), so a tone changes only
+        // with its edge cell: the renderer's no-epoch contract (`ChromeBleed::row_edges`).
+        // The pixel raster, if any, draws over both and dirties its own row.
         let row: Vec<RenderCell> = r
             .cells
             .iter()
@@ -224,11 +200,8 @@ pub fn rows(resolved: Vec<Resolved>) -> PaintedBand {
     (rows, edges, rasters)
 }
 
-/// CLOSE a band's content-facing BOTTOM edge, in place, across the WHOLE row and
-/// in ONE tone — for chrome that sits ABOVE the terminal (the message band and
-/// the presence row): after every write, in the band's own ink rather than each
-/// cell's, because a seam is a STRUCTURAL edge and must not brighten under the
-/// words it happens to pass beneath.
+/// Close a band's bottom edge in place across the whole row in the band's own ink, not
+/// each cell's: a seam is a structural edge and must not brighten under the words above it.
 fn seal_band_bottom(row: &mut [RenderCell], ink: [u8; 3]) {
     for cell in row.iter_mut() {
         cell.underline = UnderlineStyle::Single;
@@ -236,38 +209,27 @@ fn seal_band_bottom(row: &mut [RenderCell], ink: [u8; 3]) {
     }
 }
 
-/// How strongly the divider between stacked band rows shows the seam's ink
-/// over the band (design ruling 260): a hairline that separates, softer than
-/// the seam that closes the stack.
+/// How strongly the divider between stacked band rows shows the seam's ink over the band:
+/// a hairline that separates, softer than the seam that closes the stack.
 pub const DIVIDER_ALPHA: f32 = 0.35;
 
-/// CLOSE THE COMPOSED CHROME STACK against the terminal: the LAST row carries the
-/// seam (the private `seal_band_bottom`, in `inks.label`), every row above it carries a
-/// divider and no seam. `forced` says an OS-forced palette is up (a host's High
-/// Contrast latch): the divider is then the seam's own ink.
+/// Close the composed chrome stack against the terminal: the last row carries the seam (in
+/// `inks.label`), every row above it a divider. `forced` says an OS-forced palette is up (a
+/// host's High Contrast latch): the divider is then the seam's own ink.
 ///
-/// THE SEAM BELONGS TO THE STACK, NOT TO THE PAINTER'S LAST ROW. The compose
-/// PADS the cache with [`blank_band_row`] when the geometry has committed more
-/// rows than are on the glass (every dismissal or retirement, for the
-/// `SHRINK_QUIET` 1.5 s before the count follows, or until the last echo ends
-/// when one runs longer (design ruling 415 (b)) — and for as long as a handoff
-/// freeze holds it), and TRIMS it when the count is below it (the handoff
-/// successor); a presence row may sit above it with no band row after it.
-/// Sealing the stack after it is composed covers the painted, padded, trimmed
-/// and presence-only shapes with one rule. No band or presence cell uses
-/// underline for anything else, so clearing it above the last row erases
-/// nothing but a stale seam.
+/// The seam belongs to the stack, not the painter's last row: the compose pads the cache
+/// with [`blank_band_row`] when the geometry has committed more rows than it holds (after a
+/// dismissal, for `SHRINK_QUIET` or while an echo runs, and through a handoff freeze),
+/// trims it when the count is below it, and a presence row may sit above with no band row
+/// after it. Sealing after composition covers every shape with one rule. No band or
+/// presence cell uses underline otherwise, so clearing it above the last row erases only a
+/// stale seam.
 pub fn seal_stack(rows: &mut [Vec<RenderCell>], inks: &BandInks, forced: bool) {
     let Some((last, above)) = rows.split_last_mut() else {
         return;
     };
-    // STACKED ROWS STAY APART (design ruling 260): every row above the last
-    // carries a 1 px DIVIDER, the seam's ink at [`DIVIDER_ALPHA`] over the
-    // band — two rows of the same ground no longer run together into one
-    // slab. A rail lit in a row's lowest pixels takes its place there, as it
-    // takes the seam's ([`give_seam_to_rails`]).
-    // Under an OS-forced palette every ink is a system colour: the divider is
-    // the seam's own.
+    // A 1 px divider keeps two rows of one ground apart; a lit rail takes its place
+    // ([`give_seam_to_rails`]).
     let divider = if forced {
         inks.label
     } else {
@@ -282,12 +244,10 @@ pub fn seal_stack(rows: &mut [Vec<RenderCell>], inks: &BandInks, forced: bool) {
     seal_band_bottom(last, inks.label);
 }
 
-/// A RAIL (the strain gauge, ruling 243) runs in its row's lowest pixels,
-/// where the stack's closing seam runs too when the row is the last: where
-/// the rail is lit it IS the row's lower edge, so the seam gives way to it
-/// cell by cell (a cell at least half lit). `cells` are the composed rows
-/// (`rasters` keyed by their row), `cols` cells of `cell_w` px starting `pad`
-/// px into the frame.
+/// A rail (the strain gauge) runs in its row's lowest pixels, where the closing seam runs
+/// on the last row: where the rail is lit it is the row's lower edge, so the seam gives
+/// way cell by cell (a cell at least half lit). `cells` are the composed rows, `rasters`
+/// keyed by row, `cols` cells of `cell_w` px starting `pad` px into the frame.
 fn give_seam_to_rails(
     cells: &mut [Vec<RenderCell>],
     rasters: &[ChromeRaster],
@@ -324,69 +284,47 @@ fn give_seam_to_rails(
     }
 }
 
-/// The smallest cell height, in px, at which the stack's seam is drawn as a
-/// RAIL (below). The rail lifts the words by what a one-pixel rail and its
-/// clear row need beyond the face's foot room ([`crate::chrome_fit`]: two
-/// pixels on a face that leaves none), and never by more than the face leaves
-/// above its tallest letter. Measured with the macOS default face
-/// (`band_seam_clearance.rs`): a 15 px type (18 px cell) and up lifts the two
-/// pixels and leaves the clear row; a 14 px type (16 px cell) has one pixel of
-/// head room and would lift one, so the words would touch the rail. Under this
-/// the seam stays the face's underline, as every stack drew it before.
+/// The smallest cell height, in px, at which the stack's seam is drawn as a rail. The rail
+/// lifts the words by what a 1 px rail and its clear row need beyond the face's foot room
+/// ([`crate::chrome_fit`]), never more than the face's head room. Measured with the macOS
+/// default face (`band_seam_clearance.rs`): an 18 px cell (15 px type) leaves the clear
+/// row; a 16 px cell has one pixel of head room, so the words would touch the rail. Below
+/// this the seam stays the face's underline.
 pub const RAIL_SEAM_MIN_CELL_H: usize = 18;
 
-/// Whether a band in a `cell_h` px cell can close its rows with RAILS that
-/// keep the words one clear pixel row off them: the cell reaches
-/// [`RAIL_SEAM_MIN_CELL_H`], and — when the host measured it ([`BandFrame::room`])
-/// — the face's `(head, foot)` room pays for a 1 px rail plus its clear row,
-/// `head + foot >= 2` (the lift [`crate::chrome_fit`] makes is `2 − foot`,
-/// and never more than `head`).
+/// Whether a band in a `cell_h` px cell can close its rows with rails that keep the words
+/// one clear pixel row off them: the cell reaches [`RAIL_SEAM_MIN_CELL_H`] and, when the
+/// host measured it ([`BandFrame::room`]), the face's `(head, foot)` room pays for a 1 px
+/// rail plus its clear row, `head + foot >= 2` (the lift [`crate::chrome_fit`] makes is
+/// `2 − foot`, never more than `head`).
 ///
-/// The cell height alone is a proxy for the room, measured with one face (the
-/// macOS default; see the const). It does not hold for every face. MEASURED
-/// 2026-09-30 for Cascadia Mono PL, the Windows default, at every size from 8
-/// to 64 px. On its vendor line its `j` descended to the full descent, so it
-/// left NO foot room at any size, and the default 16 px had no head room
-/// either. On the line it is drawn on now (its deepest letter plus the
-/// hinter's pixel, `crate::bundled::letter_descent_floor`) it has one to four
-/// rows of foot room at every size, but its hinted `$` and capitals still
-/// reach the cell's top row at many: every cell the proxy admits (18 px and
-/// up) pays for the rail — the default 16 px's 21 px cell is `(0, 2)` — but
-/// two: 14 px's 18 px cell and 18 px's 23 px one, each `(0, 1)`. JetBrains
-/// Mono has at least a pixel each of head and foot room at every size
-/// measured (12 to 40 px).
-/// Without the measure the words' descenders end on the rail's own row.
+/// The cell height alone is a proxy measured with the macOS default face. It fails for
+/// Cascadia Mono PL (the Windows default), whose hinted `$` and capitals reach the cell's
+/// top row: of the cells the proxy admits, 14 px (18 px cell) and 18 px (23 px cell)
+/// measure `(0, 1)`, and without the measure their descenders end on the rail's own row.
+/// JetBrains Mono has at least a pixel each of head and foot room at 12 to 40 px.
 #[must_use]
 pub fn seam_can_rail(cell_h: usize, room: Option<(usize, usize)>) -> bool {
     cell_h >= RAIL_SEAM_MIN_CELL_H && room.is_none_or(|(head, foot)| head + foot >= 2)
 }
 
-/// Whether a NATIVE host hands the band its face's measured room
-/// ([`BandFrame::room`]): on Windows only. Its default face, Cascadia Mono PL,
-/// is the one the cell-height proxy does not hold for ([`seam_can_rail`]).
-/// macOS's default face is the one the proxy was measured with, and Linux's,
-/// JetBrains Mono, has the room at every size measured: those hosts keep the
-/// proxy alone and draw what they drew. The web hosts never measure.
+/// Whether a native host measures the face's room ([`BandFrame::room`]): Windows only, as
+/// its default Cascadia Mono PL is the face the cell-height proxy fails for
+/// ([`seam_can_rail`]). macOS's default face is the one the proxy was measured with, and
+/// Linux's JetBrains Mono has the room at every size measured. Web hosts never measure.
 pub const NATIVE_HOST_MEASURES_ROOM: bool = cfg!(windows);
 
-/// The [`BandFrame::room`] a native host composes with: the face's `(head,
-/// foot)` from `measure` ([`crate::Renderer::band_room`]) where the host
-/// measures it ([`NATIVE_HOST_MEASURES_ROOM`]), else `None`. The ONE choice
-/// the GUI's compose and the seam-clearance tests both make, so the tests
-/// check the configuration that ships on each platform; `measure` runs only
-/// where its answer is used.
+/// The [`BandFrame::room`] a native host composes with: `measure`'s `(head, foot)`
+/// ([`crate::Renderer::band_room`]) where [`NATIVE_HOST_MEASURES_ROOM`], else `None`. The
+/// GUI's compose and the seam-clearance tests share it, so the tests check what ships.
 pub fn native_host_room(measure: impl FnOnce() -> (usize, usize)) -> Option<(usize, usize)> {
     NATIVE_HOST_MEASURES_ROOM.then(measure)
 }
 
-/// Whether the composed stack's seams are drawn as RAILS: the cell and the
-/// face can pay for them ([`seam_can_rail`]) and no composed row carries a
-/// pixel raster of a kind that owns the row's foot already — a strain rail, an
-/// outlined capsule (stands on the underline, ruling 254), or `own` columns
-/// (the rail would leave holes under a chip that keeps its own fill). A plain
-/// row, and a row whose raster only lays a ground or draws icons, take it. The
-/// choice is the STACK's, never a row's: one seam style per stack (ruling 260's
-/// "one style").
+/// Whether the composed stack's seams are drawn as rails: the cell and face can pay for
+/// them ([`seam_can_rail`]) and no composed row's raster already owns the row's foot (a
+/// strain rail, an outlined capsule, or `own` columns, under which the rail would leave
+/// holes). One seam style per stack, never per row.
 fn seam_rails_the_stack(
     rasters: &[ChromeRaster],
     composed: usize,
@@ -400,20 +338,13 @@ fn seam_rails_the_stack(
             .all(|m| m.rail.is_empty() && m.rail_h == 0 && m.rings.is_empty() && m.own.is_empty())
 }
 
-/// THE SEAM AS A RAIL (the band's foot room; amends rulings 248, 254 and 256
-/// where a stack allows it — [`seam_rails_the_stack`]). The face's underline
-/// runs two pixels under the baseline, through the descenders of `p`, `g` and
-/// `y`, and the words end on the row's last pixel row with nothing under
-/// them. Instead the closing seam becomes a 1 px rail on the LAST pixel row
-/// ([`ChromeRaster::clear_rail`], ruling 248's machinery), which lifts the
-/// row's words two pixels clear of it: one clear row between the descenders
-/// and the seam, and no glyph ink crossing any line. Every row above carries
-/// its divider the same way (one style per stack). `rows` are the composed
-/// stack (`seal_stack` already stamped its underlines: they are cleared here,
-/// no band cell uses underline for anything else) and `rasters` the frame's
-/// chrome rasters, keyed by row; a row that has a raster takes the rail on it,
-/// any other gets one that lays nothing else. `frame_w` px wide, edge to edge,
-/// so the gutters are covered ([`crate::chrome_rail_covers_gutters`]).
+/// Draw the seams as rails. The face's underline runs through the descenders of `p`, `g`
+/// and `y`; instead each seam becomes a 1 px rail on the row's last pixel row
+/// ([`ChromeRaster::clear_rail`]) that lifts the words two pixels, leaving one clear row
+/// and no glyph ink crossing any line. The last row gets the seam, every row above its
+/// divider. `seal_stack`'s underlines are cleared here (no band cell uses underline for
+/// anything else). Rails are `frame_w` px wide, edge to edge, so the gutters are covered
+/// ([`crate::chrome_rail_covers_gutters`]).
 fn rail_the_seams(
     rows: &mut [Vec<RenderCell>],
     rasters: &mut Vec<ChromeRaster>,
@@ -457,20 +388,12 @@ fn rail_the_seams(
     }
 }
 
-/// GIVE EACH OUTLINED CAPSULE ITS FLOOR (ruling 254): the cells between a
-/// ring's two rounded ends ([`chrome_ring_floor_cols`]) carry a single
-/// underline in the ring's colour, on whichever row the ring sits. The ring
-/// builder stands the pill on the underline's rows and leaves its straight
-/// floor to these cells, so the renderer's descender ink-skip carves the
-/// floor round a `p` exactly as it carves the seam. On the stack's LAST row
-/// the seam hands its two end cells to the ring ([`ChromeRing::seam`]): the
-/// builder draws the seam there itself, meeting the pill's rounded foot
-/// antialiased, and the pill's floor carries the line on in the ring's
-/// colour — one edge, and no seam pixel crosses the pill's inside. Run after
-/// [`seal_stack`] (and after the seam gives way to a lit rail), each frame the
-/// stack is composed; `rasters` are the frame's chrome rasters, keyed by their
-/// row. A band with no outlined capsule (every web row: no capsules there)
-/// leaves the rows as they are.
+/// Give each outlined capsule its floor: the cells between a ring's rounded ends
+/// ([`chrome_ring_floor_cols`]) carry a single underline in the ring's colour, so the
+/// descender ink-skip carves the floor as it carves the seam. On the stack's last row the
+/// seam hands its end cells to the ring ([`ChromeRing::seam`]), which draws it meeting the
+/// pill's rounded foot, so no seam pixel crosses the pill's inside. Runs after
+/// [`seal_stack`] and the rail hand-off; `rasters` are keyed by row.
 pub fn floor_rings(rows: &mut [Vec<RenderCell>], rasters: &mut [ChromeRaster]) {
     for m in rasters {
         let Some(row) = rows.get_mut(usize::from(m.row)) else {
@@ -510,11 +433,9 @@ pub fn floor_rings(rows: &mut [Vec<RenderCell>], rasters: &mut [ChromeRaster]) {
     }
 }
 
-/// The chrome bleed's per-row gutter tones for the message band's METERED
-/// rows (ruling 55): band row `i` is chrome row `first + i`, and only the
-/// rows the geometry has committed (`committed`) carry any — a cached row the
-/// geometry has not committed is not on glass. Packed `0x00RRGGBB`, at most
-/// [`CHROME_ROW_EDGES`] (the band's three rows).
+/// The chrome bleed's per-row gutter tones for the band's metered rows: band row `i` is
+/// chrome row `first + i`, and only the `committed` rows carry any (an uncommitted cached
+/// row is not on glass). Packed `0x00RRGGBB`, at most [`CHROME_ROW_EDGES`].
 #[must_use]
 pub fn band_row_edges(
     first: usize,
@@ -580,23 +501,15 @@ pub struct BandFrame {
     pub room: Option<(usize, usize)>,
 }
 
-/// SPLICE THE BAND onto the just-composed frame `dst`: the painted `rows`
-/// (and their `rasters`) trimmed or padded to the `committed` count the
-/// geometry owns, under an optional row `above` them (a host's presence
-/// row), prepended above the grid ([`RenderInput::prepend_host_rows`] with
-/// `pixels`), each raster placed at its composed row ([`on_frame`]), the stack
-/// sealed ([`seal_stack`]), the seam given to a lit rail
-/// (the private `give_seam_to_rails`), the seams drawn as 1 px rails that
-/// leave the words a clear row above them where the stack allows it
-/// ([`seam_can_rail`]: the band's foot room) and each outlined capsule
-/// floored ([`floor_rings`]). Returns how many rows it prepended (`0`: nothing to
-/// compose, `dst` untouched).
+/// Splice the band onto the just-composed frame `dst`, above the grid
+/// ([`RenderInput::prepend_host_rows`]): the painted `rows` and `rasters` trimmed or padded
+/// to the `committed` count, under an optional row `above` (a host's presence row), each
+/// raster placed ([`on_frame`]), the stack sealed ([`seal_stack`]), the seams drawn as
+/// rails where the stack allows it ([`seam_can_rail`]), and each outlined capsule floored
+/// ([`floor_rings`]). Returns the rows prepended (`0`: `dst` untouched).
 ///
-/// SYMMETRIC: over-supply is trimmed, and UNDER-supply is padded with
-/// [`blank_band_row`]. The window was SIZED for `committed` rows; composing
-/// fewer makes every later row land one short, so the terminal's own top row
-/// is drawn under the band — the row the geometry owns, with nothing in it, is
-/// the honest picture.
+/// Under-supply is padded with [`blank_band_row`]: the window was sized for `committed`
+/// rows, and composing fewer would show the terminal's top row under the band.
 #[allow(
     clippy::too_many_arguments,
     reason = "the one compose both hosts call: every input is a plain value of the frame it composes"
@@ -642,10 +555,8 @@ pub fn compose_band(
         pool,
         pixels,
     );
-    // THE METER AT PIXEL RESOLUTION (ruling 242): each painted band row's
-    // raster, placed on the frame (its column 0 is `lo` window pixels in)
-    // at the row's composed index — a strip prepended later shifts it with
-    // every other per-row channel.
+    // Each painted row's raster at its composed index; a strip prepended later shifts it
+    // with every other per-row channel.
     let above_n = usize::from(above.is_some());
     for (i, raster) in rasters.iter().take(rows.len()).enumerate() {
         if let Some(r) = raster
@@ -655,10 +566,8 @@ pub fn compose_band(
                 .push(on_frame(r, row, at.lo, at.frame_w, at.cell_h));
         }
     }
-    // The closing seam goes on whichever row the COMPOSED stack ends with — a
-    // painted row, a padded one, or the row above alone — never on the
-    // painter's last row, which the pad and trim above can bury or cut off.
-    // Rows `0..composed` are exactly this stack: a strip is prepended later.
+    // The seam goes on the composed stack's last row (painted, padded, or the row above
+    // alone), never the painter's last row. Rows `0..composed` are exactly this stack.
     seal_stack(&mut dst.cells[..composed], inks, forced);
     give_seam_to_rails(
         &mut dst.cells[..composed],
@@ -667,8 +576,7 @@ pub fn compose_band(
         at.pad,
         at.cell_w,
     );
-    // THE SEAM AS A RAIL where the stack allows it: the words keep one clear
-    // pixel row above it, no glyph crosses it (the band's foot room).
+    // Rails where the stack allows them: the words keep one clear pixel row above.
     if seam_rails_the_stack(&dst.chrome_rasters, composed, at.cell_h, at.room) {
         rail_the_seams(
             &mut dst.cells[..composed],
@@ -678,11 +586,8 @@ pub fn compose_band(
             at.frame_w,
         );
     }
-    // An outlined capsule (ruling 249) stands on the row's underline and
-    // its floor IS its cells' underline, in the ring's colour (ruling
-    // 254): on the last row the seam runs up to the pill's foot (the
-    // ring draws it across its end cells) and the floor carries it on,
-    // instead of cutting through the pill's inside.
+    // An outlined capsule's floor is its cells' underline in the ring's colour; on the
+    // last row the seam runs up to the pill's foot instead of through its inside.
     floor_rings(&mut dst.cells[..composed], &mut dst.chrome_rasters);
     composed
 }
@@ -704,11 +609,8 @@ mod tests {
         )
     }
 
-    /// A resolved cell's CONTINUATION is the render cell's `wide` (round
-    /// fifteen content-6): the presence row paints a CJK role's glyph as its
-    /// lead cell and a continuation, and the renderer draws the lead across
-    /// both (`materialized_cell_span` is 2), where a lone cell would squeeze
-    /// the glyph into one.
+    /// A resolved cell's continuation is the render cell's `wide`, so the renderer draws a
+    /// CJK lead cell across both.
     #[test]
     fn a_continuation_is_the_render_cells_wide_half() {
         let c = inks();
@@ -731,9 +633,8 @@ mod tests {
         assert_eq!(crate::materialized_cell_span(&rows[0], 2), 1);
     }
 
-    /// Every `char` the renderer draws as a band icon is the engine's icon of
-    /// that char, and no other char is an engine icon (ruling 322): the two
-    /// tables this map joins, held together where both are linked.
+    /// Every char the renderer draws as a band icon is the engine's icon of that char, and
+    /// no other char is an engine icon.
     #[test]
     fn band_icon_ids_match_the_renderers() {
         for ch in (0..=0x10_ffffu32).filter_map(char::from_u32) {
@@ -748,10 +649,8 @@ mod tests {
         }
     }
 
-    /// A frame with no committed row and nothing above it is not touched; a
-    /// short cache is PADDED to the committed count and a long one TRIMMED,
-    /// and only the composed stack's last row carries the seam, the rows above
-    /// it the divider.
+    /// No committed row leaves the frame untouched; a short cache is padded and a long one
+    /// trimmed, and only the composed stack's last row carries the seam.
     #[test]
     fn compose_pads_trims_and_seals_the_stack_it_composes() {
         let c = inks();

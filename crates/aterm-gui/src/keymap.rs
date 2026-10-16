@@ -68,10 +68,21 @@ pub(crate) fn modifiers_from_winit(mods: ModifiersState) -> Modifiers {
 /// deliberately: a real, kernel-only round-trip.)
 #[cfg(target_os = "macos")]
 #[must_use]
-pub(crate) fn lock_modifiers() -> Modifiers {
+fn lock_modifiers() -> Modifiers {
     match hid_lock_state::caps_lock() {
         Some(true) => Modifiers::CAPS_LOCK,
         Some(false) | None => Modifiers::empty(),
+    }
+}
+
+/// The lock-key source an `App` holds: the platform read ([`lock_modifiers`])
+/// windowed, [`no_lock_modifiers`] headless. The platform read is private to this
+/// module, so a headless-constructible path can reach it only through this choice.
+pub(crate) fn lock_modifier_source(headless: bool) -> fn() -> Modifiers {
+    if headless {
+        no_lock_modifiers
+    } else {
+        lock_modifiers
     }
 }
 
@@ -201,7 +212,7 @@ mod hid_lock_state {
 /// approved list; there is no std alternative).
 #[cfg(windows)]
 #[must_use]
-pub(crate) fn lock_modifiers() -> Modifiers {
+fn lock_modifiers() -> Modifiers {
     #[link(name = "user32")]
     unsafe extern "system" {
         fn GetKeyState(vkey: i32) -> i16;
@@ -226,7 +237,7 @@ pub(crate) fn lock_modifiers() -> Modifiers {
 /// wired.
 #[cfg(not(any(target_os = "macos", windows)))]
 #[must_use]
-pub(crate) fn lock_modifiers() -> Modifiers {
+fn lock_modifiers() -> Modifiers {
     Modifiers::empty()
 }
 
@@ -626,7 +637,7 @@ const SHIFT_STATE_CTRL_ALT: u8 = 0b0000_0110;
 /// [`layout_shift_state`], is separately `#[cfg(windows)]` and stays that way.
 /// While a `not(any(macos, linux))` gate sat here, the body and its four
 /// de-DE/AltGr regression tests were read by NO compiler in this repository: the
-/// host suite gated them out on both machines this team owns. `test` in the gate
+/// host suite gated them out on both machines this team owns. `test` in the cfg
 /// is what keeps them compiled and run on every host, where nothing calls this
 /// outside `mod tests`.
 #[must_use]

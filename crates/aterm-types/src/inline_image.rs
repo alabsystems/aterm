@@ -1,98 +1,64 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The raw payload of an inline image placement (iTerm2 OSC 1337 `File=`, the
-//! sixel path that reuses the same placement, and Kitty graphics).
+//! The raw payload of an inline image placement (iTerm2 OSC 1337 `File=`, sixel, Kitty
+//! graphics).
 //!
-//! ## Why this lives in the vocabulary crate
-//!
-//! One placement is referenced from TWO storage models that cannot see each
-//! other: the live grid's `CellExtras` side table (`aterm-grid`) and the history
-//! line model (`aterm-scrollback`, which `aterm-grid` is built on top of). The
-//! payload has to be the SAME allocation on both sides — a row that scrolls off
-//! the top hands its `Arc` to history, and a scrolled-back row hands the very
-//! same `Arc` back to the renderer, whose decode cache is keyed by pointer
-//! identity. A type defined in either of those crates could only be shared with
-//! the other by copying it, which would re-decode (and re-charge memory for) one
-//! picture once per row of history it covers.
-//!
-//! The engine stores the bytes as delivered plus the [`ImageFormat`] hint, and
-//! the renderer decodes once per distinct payload. (The engine decodes a PNG
-//! only to compose Kitty animation frames, which yields raw pixels.)
+//! It lives in the vocabulary crate because one placement is referenced from two storage
+//! models that cannot see each other, the live grid's `CellExtras` (`aterm-grid`) and the
+//! history line model (`aterm-scrollback`), and must be the same `Arc` on both sides: the
+//! renderer's decode cache is keyed by pointer identity, and a copy would re-decode and
+//! re-charge memory once per history row it covers. The engine keeps the bytes as delivered
+//! (it decodes PNG only to compose Kitty animation frames).
 
-/// Source encoding of an inline image's raw payload.
-///
-/// The engine stores the raw bytes plus this hint, and the renderer decodes
-/// once. Only PNG is decoded today; an unknown format degrades to drawing
-/// nothing.
+/// Source encoding of an inline image's raw payload. Only PNG is decoded; an unknown format
+/// draws nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageFormat {
     /// PNG (`\x89PNG\r\n…`). The one container format the renderer decodes.
     Png,
-    /// Already-decoded, packed RGBA8 pixels (`[r, g, b, a]` per pixel,
-    /// row-major over `width`). Used by the sixel path, which decodes the
-    /// raster in the engine (the `aterm-sixel` crate) since sixel has no
-    /// container the renderer's PNG decoder could read. `ImageData.bytes` then
-    /// holds exactly `4 * width * height` bytes; the renderer resamples them to
-    /// the footprint directly (no codec). A composed Kitty animation frame is
-    /// raw pixels too.
+    /// Already-decoded packed RGBA8, row-major over `width`: sixel rasters (decoded in the
+    /// engine by `aterm-sixel`) and composed Kitty animation frames. `ImageData.bytes` holds
+    /// exactly `4 * width * height` bytes, resampled to the footprint with no codec.
     RawRgba8 {
         /// Source raster width in pixels.
         width: u16,
         /// Source raster height in pixels.
         height: u16,
     },
-    /// Anything else (JPEG, GIF, …) — kept verbatim but not drawn yet.
+    /// Anything else (JPEG, GIF, …): kept verbatim, not drawn.
     Unknown,
 }
 
-/// An inline image placed on the grid (iTerm2 OSC 1337 `File=`).
-///
-/// Decoupled from the cells: the (possibly large) payload is stored ONCE behind
-/// an `Arc` and every covered cell holds a cheap `ImageRef` into it with its own
-/// sub-cell coordinates. The engine keeps the RAW (undecoded) bytes — it has no
-/// image codec — and the renderer decodes them to RGBA a single time, keyed by
-/// the `Arc`'s pointer identity, then blits the cell's slice of the result.
+/// An inline image placed on the grid. The payload is stored once behind an `Arc`; each
+/// covered cell holds an `ImageRef` with its own sub-cell coordinates, and the renderer decodes
+/// once per `Arc` (keyed by pointer identity) and blits each cell's slice.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageData {
     /// Raw, undecoded payload (e.g. the PNG file bytes) as delivered.
     pub bytes: Vec<u8>,
     /// Encoding hint for the renderer's decoder.
     pub format: ImageFormat,
-    /// Footprint width in CELLS (how many columns the image spans).
+    /// Footprint width in cells.
     pub cols: u16,
-    /// Footprint height in CELLS (how many rows the image spans).
+    /// Footprint height in cells.
     pub rows: u16,
-    /// Kitty `z=` stacking order. `< 0` draws BEHIND the cell's text (the glyph
-    /// paints on top); `>= 0` (the default for iTerm2/Sixel and `z=0` Kitty) draws
-    /// OVER the cell, which keeps the historical "image owns the cell" behavior.
+    /// Kitty `z=` stacking order: `< 0` draws behind the cell's text, `>= 0` (iTerm2, sixel,
+    /// Kitty's default) over it.
     pub z_index: i32,
-    /// CHROME-BAND LIFT, in device px: how far this image's raster extends ABOVE
-    /// its first covered cell row, into the window's chrome band (`pad_top +
-    /// head`). `0` for every terminal-content image — the engine's OSC 1337 /
-    /// sixel / Kitty constructors never set it, so nothing an application prints
-    /// can draw outside its own cells. Non-zero ONLY for the host's tab-strip
-    /// band raster (`aterm-gui`'s pixel band), whose design needs the one canvas
-    /// a cell-quantised footprint cannot give it: the full optical band from the
-    /// window's top edge down. Renderers honour it by (a) decoding the footprint
-    /// `lift` px taller than `rows·cell_h` and (b) letting the FIRST footprint
-    /// row's tile paint `[y0 − lift, y0)` as well as its own cell band; rows past
-    /// the first read their source `lift` px lower. With `0` both clauses are
-    /// arithmetic no-ops, byte-identical to the pre-lift renderers.
+    /// Chrome-band lift, in device px: how far the raster extends above its first row into the
+    /// window's chrome band. Only the host's tab-strip raster (`aterm-gui`) sets it; the engine's
+    /// constructors leave `0`, so no application output draws outside its cells. Renderers
+    /// decode the footprint `lift` px taller and let the first row's tile also paint
+    /// `[y0 − lift, y0)`; later rows read their source `lift` px lower.
     pub band_lift_px: u16,
-    /// Where the raster starts inside its first cell, in device px `(x, y)`
-    /// (Kitty `X=`/`Y=`, each less than a cell): the renderer lays the raster
-    /// out in the part of the footprint from that point on, and leaves the
-    /// strip before it transparent. `(0, 0)` for every other image.
+    /// Where the raster starts inside its first cell, in device px `(x, y)` (Kitty `X=`/`Y=`);
+    /// the strip before it stays transparent. `(0, 0)` for every other image.
     pub cell_offset_px: (u16, u16),
-    /// How the source raster maps onto the footprint: [`ImageScaling::Fit`]
-    /// (the default), [`ImageScaling::Stretch`] or [`ImageScaling::PixelExact`].
-    /// Which one is right depends on what the PROGRAM named — see the variants.
+    /// How the source raster maps onto the footprint.
     pub scaling: ImageScaling,
-    /// The sub-rectangle of the source raster this placement shows (Kitty
-    /// `x=`/`y=`/`w=`/`h=`), or `None` for the whole raster — which every
-    /// protocol but Kitty always passes. The renderer crops FIRST, then applies
-    /// [`scaling`](Self::scaling) to what is left.
+    /// The sub-rectangle of the source raster shown (Kitty `x=`/`y=`/`w=`/`h=`), or `None` for
+    /// all of it. The renderer crops first, then applies [`scaling`](Self::scaling).
     pub source_rect: Option<SourceRect>,
 }
 
@@ -125,39 +91,22 @@ pub fn layer_order(z_index: i32, kitty: Option<KittyPlacementTag>) -> (i32, u32,
     (z_index, image, serial)
 }
 
-/// How a placement's source raster maps onto its cell footprint.
-///
-/// The footprint is always a whole number of cells; what differs is what the
-/// program asked the pixels to do inside it.
+/// How a placement's source raster maps onto its whole-cell footprint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum ImageScaling {
-    /// FIT: scale the raster, aspect PRESERVED, into the largest box that fits
-    /// the footprint and centre it there, the rest fully transparent. Right when
-    /// the program named the target in CELLS (`File=width=40;height=8`, Kitty
-    /// `c=`/`r=`, the host's own chrome rasters): it asked for a cell-sized
-    /// picture, so filling the cells it asked for is the spec — without
-    /// distorting it, since the cell box is only a whole-cell approximation of
-    /// the picture's shape.
+    /// Scale, aspect preserved, into the largest box that fits the footprint, centred, the
+    /// rest transparent. For a target named in cells (`File=width=40;height=8`, Kitty
+    /// `c=`/`r=`, the host's chrome rasters).
     #[default]
     Fit,
-    /// STRETCH: scale the raster to the WHOLE footprint, aspect ignored. Only an
-    /// explicit request earns it — iTerm2's `preserveAspectRatio=0` ("stretch
-    /// to fill, ignore the inherent ratio"), where the program sized both axes
-    /// itself and wants exactly that box filled.
+    /// Scale to the whole footprint, aspect ignored: only on explicit request (iTerm2's
+    /// `preserveAspectRatio=0`).
     Stretch,
-    /// PIXEL-EXACT: draw the source ONE SOURCE PIXEL TO ONE DEVICE PIXEL,
-    /// anchored at the footprint's TOP-LEFT, the remainder fully transparent (a
-    /// partial cell at the right/bottom edge simply goes unpainted).
-    ///
-    /// This is for the protocols that name PIXELS. A sixel raster's footprint is
-    /// DERIVED from its pixel size by rounding UP to whole cells, so scaling the
-    /// raster back out to that rounded box is pure rounding noise: a 40x12 sixel
-    /// in a 9x17 cell box would be magnified to 45x14 and a 4x6 sprite to 9x14
-    /// (2.25x), with an interpolating resample that destroys exactly the 1-px
-    /// features such an image is drawn out of. xterm, foot, mlterm, wezterm,
-    /// contour and mintty all draw sixel 1:1, and every sixel-emitting tool
-    /// sizes its output to the reported cell geometry on that assumption. Kitty
-    /// graphics transmitted WITHOUT `c=`/`r=` are the same case.
+    /// One source pixel to one device pixel, anchored top-left, the remainder transparent.
+    /// For protocols that name pixels: a sixel footprint is the pixel size rounded up to whole
+    /// cells, so scaling to it would only magnify rounding noise and blur 1-px features
+    /// (xterm, foot, mlterm, wezterm, contour and mintty all draw sixel 1:1). Kitty graphics
+    /// sent without `c=`/`r=` are the same case.
     PixelExact,
 }
 
@@ -202,24 +151,15 @@ impl SourceRect {
 }
 
 impl ImageData {
-    /// Heap bytes this payload owns — the raster, not the struct.
-    ///
-    /// Used by the history line model to charge each covered row its SHARE of
-    /// one shared placement (`payload_bytes() / rows`), so a footprint that is
-    /// retained whole is charged exactly once no matter how many lines carry it.
+    /// Heap bytes this payload owns (the raster, not the struct).
     #[must_use]
     #[inline]
     pub fn payload_bytes(&self) -> usize {
         self.bytes.capacity()
     }
 
-    /// This payload's per-ROW share of [`payload_bytes`](Self::payload_bytes).
-    ///
-    /// `rows` is the footprint height, so summing the share over every covered
-    /// row recovers the payload exactly once (up to integer truncation, which is
-    /// bounded by `rows` bytes in total). Dropping one line therefore drops
-    /// exactly that line's share of the picture from the memory budget, which is
-    /// the accounting a per-row FULL copy would get wrong by a factor of `rows`.
+    /// This payload's per-row share of [`payload_bytes`](Self::payload_bytes): summed over the
+    /// footprint's rows it recovers the payload once (less at most `rows` bytes of truncation).
     #[must_use]
     #[inline]
     pub fn per_row_bytes(&self) -> usize {

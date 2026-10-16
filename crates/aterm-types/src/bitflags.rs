@@ -1,10 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Declarative bitflags macro (zero external dependencies).
-//!
-//! Drop-in replacement for the `bitflags` crate covering the API surface
-//! used in aterm: construction, testing, set operations, and raw access.
+//! Declarative bitflags macro standing in for the `bitflags` crate: construction, testing, set
+//! operations and raw access.
 
 /// Define a bitflags struct with named constants and standard set operations.
 ///
@@ -62,6 +60,20 @@ macro_rules! bitflags {
             #[must_use]
             pub const fn from_bits_truncate(bits: $T) -> Self {
                 Self { bits: bits & Self::__all_bits() }
+            }
+
+            /// Every defined flag set.
+            #[inline]
+            #[must_use]
+            pub const fn all() -> Self {
+                Self { bits: Self::__all_bits() }
+            }
+
+            /// Create from raw bits, keeping any bits no flag defines.
+            #[inline]
+            #[must_use]
+            pub const fn from_bits_retain(bits: $T) -> Self {
+                Self { bits }
             }
 
             /// Create from raw bits, returning `None` if unknown bits are set.
@@ -241,9 +253,8 @@ mod tests {
         }
     }
 
-    /// Every constructor and operator, as the bits it must produce. A generated
-    /// flag type is only as sound as these: `!` and `from_bits_truncate` must
-    /// drop undefined bits.
+    /// Every constructor and operator, as the bits it must produce; `!` and
+    /// `from_bits_truncate` drop undefined bits.
     #[test]
     fn operations_produce_expected_bits() {
         use TestFlags as F;
@@ -264,6 +275,9 @@ mod tests {
             ("not A", !F::A, 0b0000_0110),
             ("not empty", !F::empty(), 0b0000_0111),
             ("from_bits_truncate", F::from_bits_truncate(0xFF), 0x07),
+            ("all", F::all(), 0x07),
+            // Keeps what no flag defines, unlike `from_bits_truncate`.
+            ("from_bits_retain", F::from_bits_retain(0xF1), 0xF1),
             ("|=", assigned(F::A, |f| *f |= F::B), 3),
             ("&=", assigned(F::AB, |f| *f &= F::A), 1),
             ("^", F::AB ^ F::A, 2),
@@ -276,6 +290,11 @@ mod tests {
             ("empty is empty", F::empty().is_empty()),
             ("not empty is all", (!F::empty()).is_all()),
             ("A|B|C is all", (F::A | F::B | F::C).is_all()),
+            ("all is all", F::all().is_all()),
+            (
+                "a retained unknown bit is not all",
+                !F::from_bits_retain(0x08).is_all(),
+            ),
             ("from_bits keeps defined bits", F::from_bits(0x07).is_some()),
             (
                 "from_bits rejects unknown bits",

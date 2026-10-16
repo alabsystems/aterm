@@ -3,36 +3,29 @@
 
 //! Per-session asciicast v2 recording of the child's program output.
 //!
-//! [`CastRecorder`] accumulates coalesced PTY-output bursts as asciicast v2 events (a
-//! JSON header line, then `[t, "o", "<data>"]` per burst and `[t, "r", "<cols>x<rows>"]`
-//! per resize) and [`CastRecorder::to_asciicast`] serializes them into text that
+//! [`CastRecorder`] keeps PTY-output bursts and resizes as asciicast v2 events (a JSON
+//! header line, then `[t, "o", "<data>"]` / `[t, "r", "<cols>x<rows>"]` lines) that
 //! `asciinema play`/`agg` accept.
 //!
-//! 1. Every chunk is JSON-escaped and UTF-8-lossy decoded; PTY output is binary and
-//!    splits multibyte sequences across reads, and raw bytes would invalidate the JSON.
-//! 2. Output only: the recorder is fed `buf[..r]` at the reader-thread tap. The
-//!    terminal's own query replies (`take_response()`) must never appear as `"o"`
-//!    events; keeping them out is the caller's contract.
-//! 3. Timestamps are non-decreasing from one epoch captured at construction, in the
-//!    order events are written (the engine's, below).
-//! 4. Bounded: payload and entry budgets with drop-oldest.
+//! - Payloads are JSON-escaped and UTF-8-lossy: PTY output is binary and splits
+//!   multibyte sequences across reads.
+//! - Output only: the terminal's own query replies (`take_response()`) never appear as
+//!   `"o"` events; keeping them out is the caller's contract.
+//! - Timestamps are non-decreasing from one epoch, in engine order (below).
+//! - Bounded by payload and entry budgets, drop-oldest, evictions disclosed.
 //!
-//! The recorder does no fs/socket/lock work; the GUI feeds it from a dedicated writer
-//! thread, so the reader's hot path never serializes under `term_lock`.
+//! The recorder does no fs/socket/lock work; a dedicated writer thread feeds it, so the
+//! reader's hot path never serializes under `term_lock`.
 //!
-//! ## The engine's order, not arrival order
-//! A burst arrives via the writer thread and a resize via the thread that resized
-//! (the main thread's window pass, a control worker's `resize`), each after its
-//! `term_lock` hold. Stamped on arrival, a resize could land on the wrong side of a
-//! burst the engine processed first, and a replay (`cast frames`, `cast drift`) would
-//! re-lay the alternate screen at the wrong moment. So each burst and resize carries
-//! the engine's resize ordinal (`Terminal::resize_ordinal`, under its lifetime token),
-//! read inside the hold that applied it ([`CastCuts`], [`ResizeStamp`]), plus a time on
-//! this recorder's timeline (a resize's read in its hold; a burst's at arrival, before
-//! the reader's first hold, so no clock is read under the lock). The recorder inserts
-//! by that order: a burst processed after resize `k` sorts after it and before resize
-//! `k+1`. A burst whose slices straddle a resize is cut there. Unstamped calls
-//! (tests) append.
+//! ## Engine order, not arrival order
+//! Bursts arrive via the writer thread and resizes via whichever thread resized, each
+//! after its `term_lock` hold. Stamped on arrival, a resize could land on the wrong side
+//! of a burst the engine processed first, and `cast frames`/`cast drift` would re-lay
+//! the alternate screen at the wrong moment. So each burst and resize carries the
+//! engine's resize ordinal (`Terminal::resize_ordinal`, under its lifetime token), read
+//! inside the hold that applied it ([`CastCuts`], [`ResizeStamp`]), and the recorder
+//! inserts by that order; a burst whose slices straddle a resize is cut there.
+//! Unstamped calls (tests) append.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -41,8 +34,7 @@ use std::time::{Duration, Instant};
 
 use aterm_core::terminal::Terminal;
 
-/// Default byte budget for the retained event payloads: a flood cannot balloon
-/// RAM past this, and an idle terminal costs nothing (no events ⇒ no bytes).
+/// Default byte budget for retained event payloads; an idle terminal costs nothing.
 pub(crate) const DEFAULT_BUDGET_BYTES: usize = 4 * 1024 * 1024;
 
 /// Cap on retained events as well as payload: a long interactive session can emit
@@ -212,8 +204,7 @@ impl ResizeStamp {
 }
 
 impl Event {
-    /// The event's timestamp (seconds since the recording's t0), for keyframe
-    /// expansion ([`CastSnapshot::fold_frames`]).
+    /// The event's time since the recorder's epoch.
     fn t(&self) -> Duration {
         match self {
             Event::Output { t, .. } | Event::Resize { t, .. } => *t,
@@ -236,18 +227,16 @@ impl Event {
     fn cost(&self) -> usize {
         match self {
             Event::Output { data, .. } => data.len(),
-            // A resize payload is tiny + fixed-ish; charge its rendered length.
+            // A resize charges about its rendered length.
             Event::Resize { .. } => 16,
         }
     }
 }
 
-/// Accumulates program-output bursts as asciicast v2 and serializes them.
-///
-/// Construct with the child's initial grid size; feed coalesced output bursts
-/// with [`record_output`](Self::record_output) and geometry changes with
-/// [`record_resize`](Self::record_resize); render with
-/// [`to_asciicast`](Self::to_asciicast).
+/// Accumulates program-output bursts and resizes as asciicast v2 and serializes them.
+/// Constructed with the child's initial grid size; fed by
+/// [`record_burst`](Self::record_burst) and
+/// [`record_resize_stamped`](Self::record_resize_stamped).
 pub(crate) struct CastRecorder {
     /// asciicast v2 header width (cols), snapshotted at construction.
     width: u16,
@@ -263,8 +252,7 @@ pub(crate) struct CastRecorder {
     /// ([`to_asciicast`](Self::to_asciicast)) because a truncated recording's leading
     /// ANSI state is incomplete.
     evicted: u64,
-    /// The last emitted timestamp, so we clamp deltas to be non-decreasing even
-    /// if a caller hands a `t` that went backwards.
+    /// The last emitted timestamp; an unstamped event's `t` is clamped up to it.
     last_t: Duration,
     /// Monotonic epoch of this recorder's timeline, captured at construction. Reader
     /// bursts are stamped against it ([`epoch`](Self::epoch)) and resize instants are
@@ -534,8 +522,7 @@ impl CastRecorder {
         self.events.len()
     }
 
-    /// Count of drop-oldest evictions so far (0 ⇒ the recording is complete from
-    /// t0; > 0 ⇒ the head was truncated and `to_asciicast` discloses it).
+    /// Drop-oldest evictions so far.
     #[must_use]
     #[cfg(test)]
     pub(crate) fn evicted(&self) -> u64 {
@@ -575,15 +562,11 @@ impl CastRecorder {
         } else {
             Duration::ZERO
         };
-        // Header: a small fixed-shape object; width/height are plain integers so
-        // no escaping is needed. The disclosure note is a static ASCII literal.
-        // A burst the READER dropped (a full writer queue) is disclosed the same
-        // way, `aterm_dropped`, and only when there was one. Every recording
-        // says which resize law made it (`aterm_resize_undo`: the engine hands
-        // an alternate-screen shrink's rows back to a grow that follows it with
-        // nothing output between), so `cast drift` replays it under that law and
-        // a key-less recording (an older aterm, a saved file) is matched to its
-        // screen instead. Players ignore the key, as they do the others.
+        // Header: integers and static ASCII, so nothing needs escaping; players ignore
+        // the `aterm_*` keys. `aterm_resize_undo` names the engine's resize law (an
+        // alternate-screen shrink's rows go back to a grow that follows with no output
+        // between) so `cast drift` replays under it; a recording without the key is
+        // matched to its screen instead.
         let mut out = format!(
             "{{\"version\": 2, \"width\": {}, \"height\": {}, \"aterm_resize_undo\": 1",
             self.width, self.height
@@ -740,8 +723,7 @@ impl CastSnapshot {
         let base = first.t();
         let span = last.t().saturating_sub(base);
         let mut term = Terminal::new(self.height, self.width);
-        // Single forward fold: `idx` never rewinds, and frame targets are monotone
-        // non-decreasing, so each event is processed exactly once across all frames.
+        // `idx` never rewinds and targets never decrease: each event is processed once.
         let mut idx = 0usize;
         let mut frames = Vec::with_capacity(count);
         for k in 1..=count {
@@ -800,8 +782,8 @@ fn incomplete_tail_len(bytes: &[u8]) -> usize {
 }
 
 /// JSON-escape raw bytes as a string body: longest valid UTF-8 runs go through
-/// [`json_escape`], and each invalid byte becomes one U+FFFD (incomplete trailing
-/// leads are carried by the caller and never reach here).
+/// [`json_escape`](crate::control::json_escape), and each invalid byte becomes one U+FFFD
+/// (incomplete trailing leads are carried by the caller and never reach here).
 fn json_escape_bytes(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() + 2);
     let mut i = 0;
@@ -831,17 +813,6 @@ fn json_escape_bytes(bytes: &[u8]) -> String {
     out
 }
 
-// ===========================================================================
-// ByteFanout: the live, byte-lossless output channel
-// ===========================================================================
-//
-// `CastRecorder` is a pull snapshot (the `cast` verb); `ByteFanout` is its push twin.
-// The reader thread tees every output burst (the same `Arc<[u8]>`, one refcount) to
-// each live subscriber's queue. Unlike `subscribe screen/cells`, which coalesces, the
-// `bytes` stream keeps every nonempty burst between wakes; only a flood past the
-// per-subscriber byte or entry budget drops oldest, reported as a counted gap. The
-// producer never blocks (push + drop-oldest under a leaf mutex).
-
 /// One subscriber's byte- and entry-bounded, drop-oldest queue of output bursts.
 #[derive(Default)]
 struct ByteQueue {
@@ -859,9 +830,11 @@ struct ByteSlot {
     queue: Mutex<ByteQueue>,
 }
 
-/// The per-session live byte fan-out, held in `SessionCtx` (for `subscribe … bytes`
-/// registration) and cloned into the reader thread. With no subscribers `tee` exits
-/// after one atomic load without touching the `slots` mutex.
+/// The per-session live byte fan-out behind `subscribe … bytes`, the push twin of the
+/// `cast` snapshot: the reader tees every output burst (the same `Arc<[u8]>`) to each
+/// subscriber's queue. Unlike `subscribe screen/cells`, which coalesce, it keeps every
+/// nonempty burst between drains; only a flood past a subscriber's byte or entry budget
+/// drops oldest, counted as a gap. Held in `SessionCtx`, cloned into the reader thread.
 pub(crate) struct ByteFanout {
     slots: Mutex<Vec<Arc<ByteSlot>>>,
     next_id: AtomicU64,
@@ -899,10 +872,11 @@ impl ByteFanout {
 
     /// Push `burst` (an `Arc` bump) into every live subscriber's queue, dropping each
     /// queue's oldest bursts past its byte or entry budget and counting dropped bytes.
-    /// Never blocks: a slow subscriber cannot backpressure the reader. Zero
-    /// subscribers costs one atomic load. A burst racing a new subscription may be
-    /// skipped; a subscriber is owed only bursts teed after its slot push, which
-    /// `live`'s increment-before-push guarantees it sees.
+    /// Never waits on a subscriber: `slots` and the queues are leaf locks, each held
+    /// briefly, so a slow subscriber cannot backpressure the reader. Zero subscribers
+    /// costs one atomic load. A burst racing a new subscription may be skipped; a
+    /// subscriber is owed only bursts teed after its slot push, which `live`'s
+    /// increment-before-push guarantees it sees.
     #[cfg_attr(
         test,
         aterm_spec::refines(
@@ -941,8 +915,8 @@ impl ByteFanout {
             id,
             queue: Mutex::new(ByteQueue::default()),
         });
-        // Publish the count BEFORE the slot so `tee` can never early-out past a
-        // fully-registered subscriber (see `live`).
+        // Publish the count before the slot so `tee` never early-outs past a
+        // registered subscriber (see `live`).
         self.live.fetch_add(1, Ordering::Release);
         self.slots
             .lock()
@@ -960,7 +934,7 @@ impl ByteFanout {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .retain(|s| s.id != id);
-        // Decrement AFTER removal (mirror of `subscribe`'s order).
+        // Decrement after removal, mirroring `subscribe`.
         self.live.fetch_sub(1, Ordering::Release);
     }
 
@@ -981,8 +955,8 @@ pub(crate) struct ByteSubscription {
 }
 
 impl ByteSubscription {
-    /// Take ALL queued bursts (in arrival order) and the dropped-byte count since
-    /// the previous drain, resetting both. Loss-free between drains up to budget.
+    /// Take every queued burst (in arrival order) and the dropped-byte count since the
+    /// previous drain, resetting both. Loss-free between drains up to budget.
     #[must_use]
     pub(crate) fn drain(&self) -> (Vec<Arc<[u8]>>, u64) {
         let mut q = self.slot.queue.lock().unwrap_or_else(|p| p.into_inner());
@@ -1003,9 +977,9 @@ impl Drop for ByteSubscription {
 mod tests {
     use super::*;
 
-    /// Tier-1: drive both shipping queues through the real entry ceiling and project
-    /// every one-byte append onto the derived model; a payload-only rule is the
-    /// negative control at the first count eviction.
+    /// Drives both shipping queues through the real entry ceiling, projecting every
+    /// one-byte append onto the derived model; a payload-only rule is the negative
+    /// control at the first count eviction.
     #[test]
     fn tiny_output_retention_conforms() {
         use aterm_spec::{derive::output_retention_model, interp};
@@ -1103,7 +1077,7 @@ mod tests {
         rec.record_output(Duration::from_millis(1000), b"\r\nZZZ");
         let frames = rec.snapshot().fold_frames(2);
         assert_eq!(frames.len(), 2, "asked for 2 keyframes");
-        // Frame 1 (~500ms) has the early output but NOT the 1000ms output.
+        // Frame 1 (~500ms) has the early output but not the 1000ms output.
         let row0_f1 = &frames[0].1[0];
         assert!(row0_f1.contains("AAA") && !row0_f1.contains("ZZZ"));
         // Frame 2 (final) has both.
@@ -1124,7 +1098,7 @@ mod tests {
         let count = 5;
         let got = snap.fold_frames(count);
         assert_eq!(got.len(), count);
-        // Reference: independently re-fold a FRESH engine per frame target.
+        // Reference: re-fold a fresh engine per frame target.
         let span = Duration::from_millis(300); // base is 0 here
         for (k, (_, rows)) in got.iter().enumerate() {
             let target = span * ((k + 1) as u32) / (count as u32);
@@ -1169,12 +1143,11 @@ mod tests {
         let rec = CastRecorder::new(120, 40);
         let cast = rec.to_asciicast();
         let header = cast.lines().next().unwrap();
-        // Hand-parse the three fields we promise (no serde dep in-tree).
         assert!(header.starts_with('{') && header.ends_with('}'));
         assert!(header.contains("\"version\": 2"));
         assert!(header.contains("\"width\": 120"));
         assert!(header.contains("\"height\": 40"));
-        // An empty recording is JUST the header line (one line, idle costs none).
+        // An empty recording is just the header line.
         assert_eq!(cast.lines().count(), 1);
         assert_eq!(rec.event_count(), 0);
     }
@@ -1205,7 +1178,7 @@ mod tests {
             parse_event(e1),
             (0.250, "o".to_string(), "a\tb\"c\\d\r".to_string())
         );
-        // And the RAW line really did escape them (no bare control byte / quote).
+        // The raw line escapes them: no bare tab or quote.
         assert!(
             e1.contains("\\t") && e1.contains("\\\"") && e1.contains("\\\\") && e1.contains("\\r")
         );
@@ -1220,8 +1193,7 @@ mod tests {
         assert!(lines.next().is_none());
     }
 
-    /// Timestamps are monotonic non-decreasing even when a caller hands a `t`
-    /// that went backwards (deltas clamp to ≥ 0).
+    /// Timestamps stay non-decreasing when a caller's `t` goes backwards.
     #[test]
     fn timestamps_are_monotonic() {
         let mut rec = CastRecorder::new(80, 24);
@@ -1250,35 +1222,30 @@ mod tests {
         rec.record_output(Duration::ZERO, b"\x1b[0m\x07\x00");
         let cast = rec.to_asciicast();
         let line = cast.lines().nth(1).unwrap();
-        // The RAW wire line uses \u00XX for every C0 control — never a bare byte.
+        // The wire line spells every C0 control as \u00XX, never a bare byte.
         assert!(line.contains("\\u001b") && line.contains("\\u0007") && line.contains("\\u0000"));
-        // Strip the framing brackets; the inner JSON carries no bare control byte.
         assert!(!line.as_bytes().iter().any(|&b| b < 0x20));
         // And it decodes back to exactly the original control bytes.
         let payload = parse_event(line).2;
         assert_eq!(payload, "\u{1b}[0m\u{7}\u{0}");
     }
 
-    /// Drop-oldest keeps the recording bounded under a flood; the newest event
-    /// always survives and the header is unaffected.
+    /// Drop-oldest keeps the recording bounded under a flood and counts every eviction.
     #[test]
     fn budget_drops_oldest() {
-        // Tiny budget: each "o" payload below is ~4 bytes, so only a few fit.
+        // Tiny budget: only two of these 4-byte payloads fit.
         let mut rec = CastRecorder::with_budget(80, 24, 10);
         for i in 0..100u32 {
             rec.record_output(Duration::from_millis(i as u64), b"abcd");
         }
-        // Bounded well under 100 events.
         assert!(rec.event_count() < 10, "unbounded: {}", rec.event_count());
         let cast = rec.to_asciicast();
-        // Header still present and valid.
         assert!(cast.lines().next().unwrap().contains("\"version\": 2"));
-        // Timestamps of the survivors are still monotonic.
         let ts: Vec<f64> = cast.lines().skip(1).map(|l| parse_event(l).0).collect();
         for w in ts.windows(2) {
             assert!(w[1] >= w[0]);
         }
-        // Every dropped head event is COUNTED (never a silent loss).
+        // Every dropped head event is counted.
         assert!(rec.evicted() > 0, "evictions counted: {}", rec.evicted());
     }
 
@@ -1287,31 +1254,26 @@ mod tests {
     #[test]
     fn eviction_is_disclosed_and_timestamps_rebased() {
         let mut rec = CastRecorder::with_budget(80, 24, 10);
-        // 4-byte bursts one SECOND apart; the tiny budget keeps only the newest
-        // few, evicting the head (including the t=0 event).
+        // 4-byte bursts one second apart; the tiny budget evicts the head, t=0 included.
         for i in 0..100u32 {
             rec.record_output(Duration::from_secs(u64::from(i)), b"abcd");
         }
         assert!(rec.evicted() > 0, "head was evicted");
         let cast = rec.to_asciicast();
         let header = cast.lines().next().unwrap();
-        // Header stays valid v2 and now carries the truncation disclosure.
         assert!(header.starts_with('{') && header.ends_with('}'));
         assert!(header.contains("\"version\": 2"));
         assert!(header.contains("aterm_truncated"), "disclosed: {header}");
         assert!(header.contains("\"evicted_events\""));
-        // First surviving event is rebased to t=0 (no minutes-long leading idle).
         let first_ts = parse_event(cast.lines().nth(1).unwrap()).0;
         assert_eq!(first_ts, 0.0, "first survivor rebased to 0");
-        // Survivor timestamps stay monotonic after the rebase.
         let ts: Vec<f64> = cast.lines().skip(1).map(|l| parse_event(l).0).collect();
         for w in ts.windows(2) {
             assert!(w[1] >= w[0]);
         }
     }
 
-    /// An untruncated recording keeps the plain 3-field header and absolute timestamps
-    /// (no rebase, no disclosure field).
+    /// An untruncated recording keeps absolute timestamps and no `aterm_truncated` field.
     #[test]
     fn no_eviction_keeps_plain_header_and_absolute_timestamps() {
         let mut rec = CastRecorder::new(80, 24);
@@ -1320,15 +1282,13 @@ mod tests {
         assert_eq!(rec.evicted(), 0);
         let cast = rec.to_asciicast();
         assert!(!cast.contains("aterm_truncated"), "no false disclosure");
-        // Original absolute timestamps preserved (not rebased to 0).
         assert_eq!(parse_event(cast.lines().nth(1).unwrap()).0, 0.100);
         assert_eq!(parse_event(cast.lines().nth(2).unwrap()).0, 0.400);
     }
 
-    /// A burst the READER dropped (its `try_send` failed) is disclosed in the
-    /// header as `aterm_dropped`, beside `aterm_truncated` when both happened,
-    /// and carried by the snapshot `cast drift` reads. With no drop the header
-    /// is the plain header (the resize-law key and nothing else), byte for byte.
+    /// A burst the reader dropped (failed `try_send`) is disclosed as `aterm_dropped`,
+    /// beside `aterm_truncated` when both happened, and carried by the snapshot `cast
+    /// drift` reads. With no drop the header is exactly the plain one.
     #[test]
     fn a_dropped_burst_is_disclosed_in_the_header() {
         let mut rec = CastRecorder::new(80, 24);
@@ -1384,10 +1344,9 @@ mod tests {
         assert_eq!(rec.snapshot().drift_input().0.resize_undo, Some(true));
     }
 
-    /// `cast drift` reads the snapshot on the SAME timeline the `cast` text
-    /// prints (rebased after an eviction), so the server's analysis and a
-    /// client's analysis of the fetched text see the same events — and a run's
-    /// `t=` is findable in the asciicast.
+    /// `cast drift` reads the snapshot on the timeline the `cast` text prints (rebased
+    /// after an eviction), so server and client analyses see the same events and a
+    /// run's `t=` is findable in the text.
     #[test]
     fn drift_input_matches_the_asciicast_text() {
         let mut rec = CastRecorder::with_budget(80, 24, 40);
@@ -1429,8 +1388,8 @@ mod tests {
         }
     }
 
-    /// Raw program-output bytes round-trip exactly (ESC/CSI/SGR, tab, quote, backslash,
-    /// CR/LF escaped on the wire and decoded back identically).
+    /// Raw program-output bytes (ESC/CSI/SGR, tab, quote, backslash, CR/LF) round-trip
+    /// exactly through the wire escaping.
     #[test]
     fn raw_bytes_round_trip_exactly() {
         let mut rec = CastRecorder::new(80, 24);
@@ -1441,8 +1400,7 @@ mod tests {
         assert_eq!(payload.as_bytes(), raw, "raw bytes must round-trip exactly");
     }
 
-    /// A genuinely invalid byte (a lone continuation mid-stream, not a trailing
-    /// lead) is still rendered as exactly one U+FFFD in place.
+    /// A lone continuation byte mid-stream renders as one U+FFFD in place.
     #[test]
     fn genuinely_invalid_byte_still_fffd() {
         let mut rec = CastRecorder::new(80, 24);
@@ -1452,8 +1410,8 @@ mod tests {
         assert_eq!(payload, "A\u{fffd}B");
     }
 
-    /// A trailing incomplete lead is CARRIED (not replaced); the next burst that
-    /// completes it produces the whole character.
+    /// A trailing incomplete lead is carried, not replaced: the burst that completes it
+    /// emits the whole character.
     #[test]
     fn trailing_incomplete_lead_is_carried_not_replaced() {
         let mut rec = CastRecorder::new(80, 24);
@@ -1491,7 +1449,7 @@ mod tests {
         // First 2 bytes of '€': carried, nothing emitted.
         rec.record_output_shared(Duration::from_millis(1), Arc::from(&[0xE2u8, 0x82][..]));
         assert_eq!(rec.event_count(), 0, "incomplete lead must be carried");
-        // Final byte + a NEW dangling lead: emits '€', carries the lead.
+        // Final byte + a new dangling lead: emits '€', carries the lead.
         rec.record_output_shared(Duration::from_millis(2), Arc::from(&[0xACu8, 0xC3][..]));
         assert_eq!(rec.event_count(), 1);
         let payload = parse_event(rec.to_asciicast().lines().nth(1).unwrap()).2;
@@ -1502,8 +1460,7 @@ mod tests {
         assert_eq!(last, "é");
     }
 
-    /// An empty shared burst records nothing (parity with the borrowing path,
-    /// which never pushed zero-length events).
+    /// An empty shared burst records nothing.
     #[test]
     fn shared_empty_burst_records_nothing() {
         let mut rec = CastRecorder::new(80, 24);
@@ -1511,8 +1468,8 @@ mod tests {
         assert_eq!(rec.event_count(), 0);
     }
 
-    /// ITEM 2: `tee` delivers EVERY burst (incl. non-UTF-8) to ALL subscribers,
-    /// byte-exact and every-frame (no coalescing).
+    /// `tee` delivers every burst (non-UTF-8 included) to every subscriber, byte-exact
+    /// and uncoalesced.
     #[test]
     fn byte_fanout_tees_every_burst_to_all_subscribers() {
         let fan = Arc::new(ByteFanout::new());
@@ -1527,13 +1484,12 @@ mod tests {
             assert_eq!(bursts.len(), 2, "every burst delivered, no coalesce");
             assert_eq!(&bursts[0][..], b"\x1b[31m");
             assert_eq!(&bursts[1][..], &[0x80, 0xff, 0x00]);
-            // A second drain is empty (queue consumed).
             assert_eq!(sub.drain().0.len(), 0);
         }
     }
 
-    /// A full queue drops OLDEST and counts the dropped bytes; the producer never
-    /// blocks. The newest burst always survives.
+    /// A full queue drops oldest and counts the dropped bytes; the newest burst
+    /// survives.
     #[test]
     fn byte_fanout_full_queue_drops_oldest_and_counts() {
         let fan = Arc::new(ByteFanout::with_budget(10));
@@ -1542,13 +1498,11 @@ mod tests {
             fan.tee(&Arc::from(&b"abcd"[..])); // 4 bytes each, budget 10
         }
         let (bursts, dropped) = sub.drain();
-        // Bounded well under 100 retained; the rest counted as dropped.
         assert!(bursts.len() <= 3, "queue bounded: {}", bursts.len());
         assert!(
             dropped >= 4 * (100 - bursts.len() as u64),
             "dropped counted: {dropped}"
         );
-        // The newest burst is retained.
         assert_eq!(&bursts.last().unwrap()[..], b"abcd");
     }
 
@@ -1564,10 +1518,8 @@ mod tests {
         fan.tee(&Arc::from(&b"x"[..])); // safe no-op
     }
 
-    /// The zero-subscriber early-out never desynchronizes delivery: bursts teed before
-    /// a subscription are unseen, every burst after `subscribe` returns is delivered,
-    /// and the fast path re-arms at the subscribe/drop edges (including a second
-    /// subscription after the count returns to zero).
+    /// The zero-subscriber early-out re-arms at each subscribe/drop edge: a subscriber
+    /// gets every burst teed after `subscribe` returns and none before.
     #[test]
     fn byte_fanout_zero_subscriber_fast_path_rearms_across_lifecycle() {
         let fan = Arc::new(ByteFanout::new());
@@ -1646,8 +1598,8 @@ mod tests {
             assert!(ts.windows(2).all(|w| w[0] <= w[1]), "{order:?}: {ts:?}");
         }
 
-        // The negative control: the same arrivals on the old taps (each
-        // stamped `now()` on arrival, appended) misplace the resize.
+        // Negative control: stamping each arrival `now()` and appending misplaces
+        // the resize.
         let mut old = CastRecorder::new(20, 8);
         old.record_output(old.now(), b"A");
         old.record_output(old.now(), b"B");
@@ -1663,7 +1615,7 @@ mod tests {
             let mut rec = CastRecorder::new(20, 8);
             let mut term = Terminal::new(8, 20);
             let mut cuts = CastCuts::default();
-            // The reader's one reading, before its first hold.
+            // Arrival time, read once before the reader's first hold.
             let arrived = rec.now();
             hold(&mut term, &mut cuts, 0, b"head");
             hold(&mut term, &mut cuts, 4, b"+more");
@@ -1818,10 +1770,8 @@ mod tests {
         assert_eq!(kinds(&rec), ["r:20x7", "o:new"]);
     }
 
-    /// The cast queue preallocates `CAST_QUEUE_CAP` (1024) slots per session, so the
-    /// stamped burst's size is per-session memory: 16 bytes of shared bytes, a 24-byte
-    /// first stamp, one pointer for cuts and an 8-byte time. Pinned so growth is a
-    /// decision.
+    /// The cast queue preallocates `CAST_QUEUE_CAP` (1024) slots per session, so a
+    /// stamped burst's size is per-session memory. Pinned so growth is a decision.
     #[test]
     fn a_stamped_burst_stays_small_in_the_queue() {
         assert_eq!(std::mem::size_of::<Arc<[u8]>>(), 16);
@@ -1829,34 +1779,28 @@ mod tests {
         assert_eq!(std::mem::size_of::<CastBurst>(), 56);
     }
 
-    // ---- test helper: a minimal asciicast-event parser ----
-
     /// Parse one event line `[<f64>, "<code>", "<json-string>"]` into
-    /// `(t, code, unescaped_payload)`, strictly enough to stand in for an asciinema-style
-    /// reader.
+    /// `(t, code, unescaped_payload)`, as strictly as an asciinema-style reader.
     fn parse_event(line: &str) -> (f64, String, String) {
         let inner = line
             .strip_prefix('[')
             .and_then(|s| s.strip_suffix(']'))
             .unwrap_or_else(|| panic!("not a JSON array: {line}"));
-        // t: up to the first comma.
         let (t_str, after_t) = inner.split_once(',').expect("missing comma after t");
         let t: f64 = t_str.trim().parse().expect("t is not an f64");
-        // code: the next quoted string.
         let after_t = after_t.trim_start();
         let (code, after_code) = parse_json_string(after_t);
         let after_code = after_code.trim_start();
         let after_code = after_code
             .strip_prefix(',')
             .expect("missing comma after code");
-        // data: the final quoted string (rest of the array).
         let (data, tail) = parse_json_string(after_code.trim_start());
         assert!(tail.trim().is_empty(), "trailing junk after data: {tail:?}");
         (t, code, data)
     }
 
     /// Parse a leading JSON string literal, returning (unescaped, remainder).
-    /// Recognizes the exact escapes [`json_escape`] produces.
+    /// Recognizes the escapes `json_escape` produces.
     fn parse_json_string(s: &str) -> (String, &str) {
         let chars: Vec<char> = s.chars().collect();
         assert_eq!(
@@ -1881,7 +1825,7 @@ mod tests {
                         'n' => out.push('\n'),
                         'r' => out.push('\r'),
                         't' => out.push('\t'),
-                        // control.rs json_escape emits short forms for 0x08/0x0C.
+                        // `json_escape` emits the short forms for 0x08/0x0C.
                         'b' => out.push('\u{8}'),
                         'f' => out.push('\u{c}'),
                         'u' => {

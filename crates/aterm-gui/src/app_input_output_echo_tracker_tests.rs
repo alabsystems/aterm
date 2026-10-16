@@ -82,11 +82,9 @@ fn enter(mods: TMods, event_type: KeyEventType) -> InputEvent {
     }
 }
 
-/// A receipt is never reported before its dispatch: the receipt instant is the
-/// stamp's instant bounded by the reader's `now` (`stamp_on_frame_clock`), so a
-/// key dispatched after the frame's `now` would otherwise be receipted before
-/// its dispatch. Drives that deterministically with a ticket dispatched after
-/// the snapshot.
+/// A receipt is never reported before its dispatch, though `stamp_on_frame_clock`
+/// bounds its instant by the reader's `now`: the ticket here is dispatched after
+/// that `now`.
 #[cfg(unix)]
 #[test]
 fn a_receipt_is_never_reported_before_the_dispatch_it_receipts() {
@@ -140,10 +138,8 @@ fn a_receipt_is_never_reported_before_the_dispatch_it_receipts() {
 }
 
 /// The delivery register: a ticketed write publishes its receipt when the sink
-/// accepts the bytes; a failed write publishes none. The prelude's read hands
-/// each receipt over once per window, by serial, oldest first, and a window with
-/// no baseline gets the newest serial and nothing to apply. Two completions in
-/// one read (a multi-file drop) are both handed over, in completion order.
+/// accepts the bytes, a failed write none. Each read hands receipts over once, by
+/// serial, in completion order; a read with no baseline gets the newest serial.
 #[cfg(unix)]
 #[test]
 fn a_ticketed_write_publishes_a_delivery_receipt_the_prelude_reads_once() {
@@ -166,8 +162,8 @@ fn a_ticketed_write_publishes_a_delivery_receipt_the_prelude_reads_once() {
     assert_eq!(fresh.latest, 0);
     assert!(fresh.items.iter().all(Option::is_none));
 
-    // Two ticketed writes complete in REVERSE acceptance order (the real
-    // race: an older writer descheduled after its acceptance).
+    // Two ticketed writes complete in reverse acceptance order (an older
+    // writer descheduled after its acceptance).
     let first = tracker.begin_ticketed(OutputEchoInput::Echoable, Some(ticket(63)));
     let first_receipt = input::seam_egress_receipt(
         &term,
@@ -235,7 +231,7 @@ fn a_ticketed_write_publishes_a_delivery_receipt_the_prelude_reads_once() {
         })
     );
 
-    // An EMPTY ticket and an un-ticketed write publish nothing.
+    // An empty ticket and an un-ticketed write publish nothing.
     let empty = tracker.begin_ticketed(
         OutputEchoInput::Echoable,
         Some(DeliveryTicket {
@@ -264,8 +260,8 @@ fn a_ticketed_write_publishes_a_delivery_receipt_the_prelude_reads_once() {
     plain.finish(r, &sink);
     assert_eq!(tracker.deliveries_after(&sink, Some(3), now).latest, 3);
 
-    // A FAILED write (a dead sink) publishes no receipt: a swallowed
-    // queued key stays revoked, a swallowed paste arms nothing.
+    // A failed write (a dead sink) publishes no receipt: a swallowed queued
+    // key stays revoked, a swallowed paste arms nothing.
     let dead = SinkWriter::new(-1);
     let failed = tracker.begin_ticketed(OutputEchoInput::Echoable, Some(ticket(8)));
     let r = input::seam_egress_receipt(
@@ -369,16 +365,11 @@ fn the_delivery_ring_holds_a_frames_worth_of_receipts() {
     }
 }
 
-/// An eviction is reported once, on the read that jumps past it. A receipt still
-/// in the spill holds `latest` back; reads at that baseline report no loss, the
-/// read that resolves the held receipts and advances reports it exactly once, and
-/// the next read reports none. The shape: a wedged foreground (Ctrl-S, a stalled
-/// child) with more than `DELIVERY_RING` keys typed behind a paste, each held in
-/// the spill.
-///
-/// A filled `O_NONBLOCK` pipe wedges the sink deterministically: one non-parking
-/// byte seeds the spill, then `DELIVERY_RING + 1` ticketed blocking writes queue
-/// behind it; reading the pipe out lets the drainer land them.
+/// An eviction is reported once, on the read that advances past it: a receipt
+/// held in the spill holds `latest` back, and reads at that baseline report no
+/// loss. The shape is a wedged foreground (Ctrl-S, a stalled child) with more
+/// than `DELIVERY_RING` keys typed behind a paste; a filled `O_NONBLOCK` pipe
+/// wedges the sink deterministically.
 #[cfg(unix)]
 #[test]
 fn an_eviction_is_reported_once_on_the_read_that_advances_past_it() {
@@ -704,10 +695,9 @@ fn accepted_editor_input_discounts_but_enter_opens_the_turn_immediately() {
     let term = Mutex::new(Terminal::new(24, 80));
     let tracker = Arc::new(OutputEchoTracker::default());
     // Every sample anchors on a fresh clock, as the host's frame loop does.
-    // Stamps are placed at the instant they were read (`stamp_on_frame_clock`),
-    // so the paste receipt and the Enter, microseconds apart and handed over by
-    // different samples, stay ordered whatever the scheduler does. The
-    // production shape (a sample late in its frame) is driven by
+    // Stamps sit at the instant they were read (`stamp_on_frame_clock`), so the
+    // paste receipt and the Enter, handed over by different samples, stay
+    // ordered. The late-in-frame shape is
     // `a_turn_boundary_sampled_late_in_its_frame_still_retires_the_paste_before_it`.
     let now = std::time::Instant::now();
     let mut streak = aterm_effects::output_streak::OutputStreak::new(1);
@@ -785,15 +775,10 @@ fn accepted_editor_input_discounts_but_enter_opens_the_turn_immediately() {
 }
 
 /// The Enter is placed where it was read, however late in its frame it is
-/// sampled. The host reads `frame_started` at the top of a frame and samples echo
-/// evidence after the render work; when a paste and the Enter behind it are
-/// handed over by consecutive frames, the Enter must still map after the paste,
-/// or the streak discounts the response as echo. A re-sampled boundary must also
-/// stay put, since the verdict's latch (`verdict_armed`) spends an Enter by its
-/// instant.
-///
-/// Deterministic: the frame's prelude is a sleep far longer than the gap between
-/// the paste and the Enter.
+/// sampled: the host reads `frame_started` before the render work and samples
+/// after it, and an Enter handed over a frame after its paste must still map
+/// after the paste, or the streak discounts the response as echo. A re-sampled
+/// boundary stays put, since `verdict_armed` spends an Enter by its instant.
 #[cfg(unix)]
 #[test]
 fn a_turn_boundary_sampled_late_in_its_frame_still_retires_the_paste_before_it() {
@@ -825,7 +810,7 @@ fn a_turn_boundary_sampled_late_in_its_frame_still_retires_the_paste_before_it()
     streak.note_keystroke(paste_at);
     assert!(!streak.note_output(2, &[(2, 0, 0)], frame_n, paste.input_hot));
 
-    // The Enter lands; frame N+1 reads its clock, renders, THEN samples.
+    // The Enter lands; frame N+1 reads its clock, renders, then samples.
     write(
         &enter(TMods::empty(), KeyEventType::Press),
         input::EgressMode::Interactive,
@@ -924,11 +909,9 @@ fn drain_pipe(reader: &mut std::fs::File, sink: &SinkWriter) {
     assert!(sink.egress_drained_to_kernel(), "the spill drained");
 }
 
-/// A drained publish settles every receipt the spill had held, at its own stamp:
-/// the spill is empty then, so they reached the kernel no later than this write.
-/// So receipt instants stay monotone in serial order, and a spill that restarts
-/// before the next read cannot re-hold an older receipt and withhold a newer,
-/// delivered one.
+/// A drained publish settles every receipt the spill had held at its own stamp
+/// (they reached the kernel no later than this write), so receipt instants stay
+/// monotone in serial order even when a spill restarts before the next read.
 #[cfg(unix)]
 #[test]
 fn a_drained_publish_settles_every_receipt_the_spill_had_held() {
@@ -1034,10 +1017,9 @@ fn a_drained_publish_settles_every_receipt_the_spill_had_held() {
 }
 
 /// A contended spill probe never holds a receipt on a drained sink: the writer
-/// probes with the parking predicate, so a held receipt means bytes are still in
-/// the spill. A thread spinning on the parking probe contends the spill mutex
-/// while ticketed writes publish on a drained sink; every receipt must be stamped
-/// at its publish.
+/// probes with the parking predicate, so a held receipt means bytes really are in
+/// the spill. A thread spinning on that probe contends the spill mutex while
+/// ticketed writes publish; every receipt is stamped at its publish.
 #[cfg(unix)]
 #[test]
 fn a_contended_spill_probe_never_holds_a_receipt_on_a_drained_sink() {

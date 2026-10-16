@@ -1,0 +1,37 @@
+# muse 1.4.9-R6297.1 · MEASURED 2026-10-16, `aterm ctl text --json` of a private headless aterm 120x40 (aterm 0.105.0 4328f43b1), the atpkg-managed muse (Meta latest) launched through its shim with a scratch HOME, `--provider echo --echo-delay-ms 6000` (Meta's offline echo provider: no login, no model), harness on (muse is not supervised) · a turn running, caught by `await match '^◈.Thinking'`: the status row's diamond is the third of the three glyphs muse cycles through (◇ ◈ ◆, 381 status frames over three turns; the verb is `Working` at first, then `Thinking`), `◈ Thinking (0s · esc to interrupt)`, under seven earlier echo turns · cursor=33,2 (visible) · user and scratch path redacted at equal length
+$ cd /tmp/av.XXXXXX/mwork && HOME=/Users//user00/.aterm-muse-lab muse --provider echo --echo-delay-ms 6000
+
+  Muse Code 1.4.9
+
+❯ hello muse
+
+◆ echo: hello muse
+
+❯ second turn
+
+◆ echo: second turn
+
+❯ third turn
+
+◆ echo: third turn
+
+❯ turn 1
+
+◆ echo: turn 1
+
+❯ turn 2
+
+◆ echo: turn 2
+
+❯ turn 3
+
+◆ echo: turn 3
+
+❯ glyph probe 1
+
+◈ Thinking (0s · esc to interrupt)
+
+── Voice input (⌥ + v to start) ────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  echo · /private/tmp/av.XXXXXX/mwork · Auto-review

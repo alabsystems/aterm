@@ -139,6 +139,11 @@ pub(crate) enum Action {
     /// Toggle the own-rendered, cross-platform command PALETTE overlay
     /// (`App::toggle_palette`; default Ctrl+Shift+P off macOS, ⇧⌘P via the menu on macOS).
     OpenPalette,
+    /// Open the command palette scoped to its Theme section (View ▸ Choose
+    /// Theme… — `App::open_theme_palette`): the highlighted theme is previewed
+    /// live, Enter keeps it, Esc reverts. Unbound by default; bind it in
+    /// `[keybindings]` (e.g. `ctrl+shift+k = "choose_theme"`).
+    ChooseTheme,
     /// Toggle vi (keyboard copy-mode) on the focused pane (VI-1): a keyboard-driven
     /// cursor for motion + selection over the screen and scrollback, no chord bound by
     /// default — bind it in `[keybindings]` (e.g. `ctrl+shift+space = "toggle_vi_mode"`).
@@ -214,6 +219,7 @@ pub(crate) const ACTION_NAMES: &[&str] = &[
     "toggle_matrix_rain",
     "toggle_serious_mode",
     "open_palette",
+    "choose_theme",
     "toggle_vi_mode",
     "rename_session",
     "select_all",
@@ -410,6 +416,7 @@ impl Action {
             "toggle_matrix_rain" => Action::ToggleMatrixRain,
             "toggle_serious_mode" => Action::ToggleSeriousMode,
             "open_palette" => Action::OpenPalette,
+            "choose_theme" => Action::ChooseTheme,
             "toggle_vi_mode" => Action::ToggleViMode,
             "rename_session" => Action::RenameSession,
             "select_all" => Action::SelectAll,

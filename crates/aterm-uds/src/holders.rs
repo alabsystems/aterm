@@ -45,10 +45,10 @@
 //!
 //! Nor is a table with NO descriptor in it: libproc answers its listing with
 //! 0 and `errno` left clear, where a refusal sets `errno` (`list_fds`). A
-//! process that closed them all holds nothing. Measured 2026-10-01: a gate
-//! harness's process-group anchor (a Python that `closerange`s every
-//! descriptor and waits) read as unknown, and kept every gone owner's build
-//! directory on the machine from the disk watch while any such anchor ran.
+//! process that closed them all holds nothing. A test harness's process-group
+//! anchor (a Python that `closerange`s every descriptor and waits) once read as
+//! unknown, and kept every gone owner's build directory on the machine from the
+//! disk watch while any such anchor ran.
 //!
 //! ONE WALK SERVES A SET OF DEVICES ([`scan_holders_of`]). The walk costs the
 //! same whichever devices it looks for — every process of the uid, every vnode
@@ -468,7 +468,7 @@ fn list_fds(pid: i32) -> Result<Vec<(i32, u32)>, Failed> {
 
 #[cfg(target_vendor = "apple")]
 fn vnode_rdev(pid: i32, fd: i32) -> Result<u32, Failed> {
-    let mut buf = vec![0u8; ffi::VNODE_PATH_SIZE];
+    let mut buf = [0u8; ffi::VNODE_PATH_SIZE];
     let size = i32::try_from(buf.len()).map_err(|_| Failed::Other)?;
     clear_errno();
     // SAFETY: `buf` is exactly the structure this flavor fills.

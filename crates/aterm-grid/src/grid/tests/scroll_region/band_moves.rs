@@ -2,17 +2,15 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The row-band move record (`RowBandMoves`): the numbers behind
-//! `coordinates_invalidated`, so a host that caches screen coordinates (the
-//! ribbon under a Codex composer) can translate instead of discard.
+//! The row-band move record (`RowBandMoves`) behind `coordinates_invalidated`, so a host that
+//! caches screen coordinates (the ribbon under a Codex composer) can translate instead of discard.
 //!
-//! The shapes are Codex CLI's (57x151 cells): an Enter is `ESC[12;57r ESC[12;1H`
-//! and five reverse indices on that region; a streamed line before the viewport
-//! reaches the screen bottom is one reverse index on `[vt..57]` then an LF that
-//! does not scroll; a streamed line with the viewport at the bottom is the
-//! top-anchored archival scroll `ESC[1;52r ESC[52;1H \r\n`. The grid has no
-//! parser, so each sequence is driven through the `Grid` methods the VT handler
-//! calls; byte-verbatim replays live in `aterm-core`'s processing tests.
+//! The shapes are Codex CLI's (57x151): an Enter is `ESC[12;57r ESC[12;1H` and five reverse
+//! indices; a streamed line before the viewport reaches the bottom is one reverse index on
+//! `[vt..57]` then an LF that does not scroll; one with the viewport at the bottom is the
+//! top-anchored archival scroll `ESC[1;52r ESC[52;1H \r\n`. The grid has no parser, so each is
+//! driven through the `Grid` methods the VT handler calls; byte-verbatim replays live in
+//! `aterm-core`'s processing tests.
 
 use super::*;
 use crate::{AbsoluteRowUpdate, ROW_BAND_MOVES_PER_BATCH, RowBandMove, RowBandMoves};
@@ -81,10 +79,9 @@ fn a_codex_phase_a_line_records_the_viewport_band_and_no_splice() {
     );
 }
 
-/// `ESC[1;52r ESC[52;1H \r\n` with transcript on screen: the archival scroll
-/// records band `[0..=51]` moving up one row beside its splice (the splice is
-/// the history insertion point, the band the screen transform), and history
-/// grows by one row.
+/// `ESC[1;52r ESC[52;1H \r\n` with transcript on screen: the archival scroll records band
+/// `[0..=51]` moving up one row beside its splice (the history insertion point), and history grows
+/// by one row.
 #[test]
 fn a_top_anchored_archival_scroll_records_the_transcript_band_beside_its_splice() {
     let mut grid = codex_grid();

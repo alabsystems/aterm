@@ -9,19 +9,21 @@
 //! was already root/release-signature-verified upstream, §8). Given the signed
 //! [`Artifact`] and a downloaded archive on disk, [`verify_and_stage`] enforces, in order:
 //!
-//! 1. **Download integrity** — the COMPRESSED asset's SHA-256 equals the signed
-//!    `artifact.sha256`. A corrupted/substituted download is refused before extraction.
+//! 1. **Download integrity** — the COMPRESSED asset's digest equals the signed one
+//!    ([`Artifact::digest`]: its `sha256`, or a vendor row's `sha512`), checked by
+//!    [`check_signed_digest`]. A corrupted/substituted download is refused before
+//!    extraction.
 //! 2. **Slip-safe staging** — into a scratch SIBLING of the build dir, through the lane
 //!    the signed row's `payload` names ([`stage_payload`]): the `.tar.zst`
 //!    extraction for a release bundle, or one of the `https` protocol lanes (`tar-zst` /
 //!    `tar-gz` / `zip` archives with `strip_components` and in-root symlinks, a
-//!    `raw-binary` that becomes `bin/<entry>`, a `dmg` whose single `.app` is copied
-//!    out of the mounted image), then the row's `links` as relative symlinks under
-//!    `bin/`. Every archive entry is vetted before a byte is written and size-capped from
-//!    the signed `disk_installed`. The live tree is never extracted over.
+//!    `raw-binary` or `tar-gz-binary` that becomes `bin/<entry>`, a `dmg` whose single
+//!    `.app` is copied out of the mounted image), then the row's `links` as relative
+//!    symlinks under `bin/`. Every archive entry is vetted before a byte is written and
+//!    size-capped from the signed `disk_installed`. The live tree is never extracted over.
 //! 3. **Apply-time re-verify (TOCTOU)** — the extracted tree's [`crate::tree::tree_root`]
 //!    equals the signed `artifact.tree_root` (when the producer set one). An already-
-//!    extracted tree can't be re-checked against the compressed `sha256`, so this closes
+//!    extracted tree can't be re-checked against the compressed digest, so this closes
 //!    the extract→activate window: a file swapped post-extraction moves the root.
 //!    The root is folded BY THE EXTRACTOR as it writes
 //!    (`crate::extract::extract_tar_zst_tree`) instead of by re-reading the whole
@@ -46,11 +48,11 @@ use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
 use crate::extract::{
-    ExtractError, ExtractOptions, TreeAccumulator, extract_tar_gz_tree, extract_tar_zst_tree,
-    extract_zip_tree,
+    ExtractError, ExtractOptions, FrameChecksum, TreeAccumulator, extract_tar_gz_tree,
+    extract_tar_zst_tree, extract_zip_tree,
 };
-use crate::manifest::Artifact;
-use crate::tree::{DeclaredModes, file_sha256, tree_root, tree_root_declared};
+use crate::manifest::{Artifact, DigestAlg};
+use crate::tree::{DeclaredModes, tree_root, tree_root_declared};
 
 /// Opt-in belt-and-suspenders, a DEVELOPMENT SEAM (`aterm_types::dev_seam!` — a shipped
 /// binary does not read it): when this is set to a non-empty value, [`verify_and_stage`]
@@ -68,8 +70,13 @@ const DISK_REVERIFY_ENV: &str = "ATPKG_STAGE_DISK_REVERIFY";
 pub enum StageError {
     /// I/O while hashing / preparing the staging dir.
     Io(std::io::Error),
-    /// The compressed asset's SHA-256 did not match the signed `artifact.sha256`.
-    Sha256Mismatch { expected: String, got: String },
+    /// The compressed asset's digest did not match the signed one ([`Artifact::digest`]),
+    /// named by its algorithm. `expected` is empty for a row that signs no digest.
+    DigestMismatch {
+        alg: DigestAlg,
+        expected: String,
+        got: String,
+    },
     /// Extraction failed (tar-slip escape, size cap, or tar/zstd error).
     Extract(ExtractError),
     /// The extracted tree's `tree_root` did not match the signed `artifact.tree_root`.
@@ -99,8 +106,8 @@ impl std::fmt::Display for StageError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             StageError::Io(e) => write!(f, "io: {e}"),
-            StageError::Sha256Mismatch { expected, got } => {
-                write!(f, "asset sha256 mismatch: expected {expected}, got {got}")
+            StageError::DigestMismatch { alg, expected, got } => {
+                write!(f, "asset {alg} mismatch: expected {expected}, got {got}")
             }
             StageError::Extract(e) => write!(f, "extract: {e}"),
             StageError::TreeRootMismatch { expected, got } => {
@@ -158,6 +165,27 @@ fn io_step(step: &str, e: std::io::Error) -> StageError {
     StageError::Io(std::io::Error::new(e.kind(), m))
 }
 
+/// THE download-integrity gate: whether `file` holds the bytes `artifact`'s signed digest
+/// ([`Artifact::digest`]) names — the stage's step 1, and every place that asks the same
+/// question before it (a carried archive, a group member's fresh download). A row that
+/// signs no digest matches no file.
+///
+/// # Errors
+/// [`StageError::DigestMismatch`] naming the algorithm, or [`StageError::Io`] when `file`
+/// does not read.
+pub(crate) fn check_signed_digest(artifact: &Artifact, file: &Path) -> Result<(), StageError> {
+    let (alg, expected) = artifact.digest().unwrap_or((DigestAlg::Sha256, ""));
+    let got = crate::tree::file_digest(file, alg).map_err(|e| io_step("read the archive", e))?;
+    if expected.is_empty() || !got.eq_ignore_ascii_case(expected) {
+        return Err(StageError::DigestMismatch {
+            alg,
+            expected: expected.to_string(),
+            got,
+        });
+    }
+    Ok(())
+}
+
 /// Uncompressed-size cap for extraction: twice the signed `disk_installed`, at least
 /// 1 MiB, so a decompression bomb is bounded by the *signed* size, never an
 /// attacker-chosen tar header. A `disk_installed` of 0 (older/loose manifest) falls back
@@ -167,8 +195,8 @@ fn io_step(step: &str, e: std::io::Error) -> StageError {
 /// structure around it (headers, padding, extension records — `extract::TooLargeReason::
 /// StructureCap`), so the whole decompressed stream is at most twice this. The packers
 /// sign `disk_installed` as the larger of the files' apparent sizes and half the
-/// decompressed stream (`atpkg_disk_installed`, tools/atpkg-publish-lib.sh), so a bundle
-/// they sign fits either allowance by construction; the factor of two is headroom for a
+/// decompressed stream (`atpkg_publish::artifact::tarwrite`), so a bundle they sign fits
+/// either allowance by construction; the factor of two is headroom for a
 /// row signed by an older packer, whose `disk_installed` counted content alone.
 fn size_cap(artifact: &Artifact) -> u64 {
     let signed = artifact.cost.disk_installed;
@@ -213,15 +241,9 @@ pub fn verify_and_stage(
     build_dir: &Path,
     hooks: &StageHooks<'_>,
 ) -> Result<String, StageError> {
-    // 1. Download integrity — the compressed asset's sha256 must match the signed value,
+    // 1. Download integrity — the compressed asset's digest must match the signed value,
     //    BEFORE we spend any work extracting it.
-    let got = file_sha256(archive).map_err(|e| io_step("read the archive", e))?;
-    if !got.eq_ignore_ascii_case(&artifact.sha256) {
-        return Err(StageError::Sha256Mismatch {
-            expected: artifact.sha256.clone(),
-            got,
-        });
-    }
+    check_signed_digest(artifact, archive)?;
 
     // 2. Extract into a scratch SIBLING (tar-slip-safe, size-capped from the signed size).
     //    The live tree is untouched throughout. Any scratch left by a killed earlier run is
@@ -255,7 +277,7 @@ pub fn verify_and_stage(
     let (extracted_root, modes) = match stage_payload_modes(artifact, archive, &incoming) {
         Ok(staged) => staged,
         Err(e) => {
-            let _ = std::fs::remove_dir_all(&incoming);
+            let _ = crate::store::remove_tree(&incoming);
             return Err(e);
         }
     };
@@ -292,12 +314,12 @@ pub fn verify_and_stage(
         let got = match reverified_root(&incoming, extracted_root, disk_reverify_armed(), &modes) {
             Ok(r) => r,
             Err(e) => {
-                let _ = std::fs::remove_dir_all(&incoming);
+                let _ = crate::store::remove_tree(&incoming);
                 return Err(io_step("re-walk the staged tree", e));
             }
         };
         if !got.eq_ignore_ascii_case(&artifact.tree_root) {
-            let _ = std::fs::remove_dir_all(&incoming);
+            let _ = crate::store::remove_tree(&incoming);
             return Err(StageError::TreeRootMismatch {
                 expected: artifact.tree_root.clone(),
                 got,
@@ -313,13 +335,13 @@ pub fn verify_and_stage(
     if let Some(pre_swap) = hooks.pre_swap
         && let Err(e) = pre_swap(&incoming)
     {
-        let _ = std::fs::remove_dir_all(&incoming);
+        let _ = crate::store::remove_tree(&incoming);
         return Err(e);
     }
     let sidecars = match hooks.sidecars.map(|render| render(&root)).transpose() {
         Ok(sidecars) => sidecars.unwrap_or_default(),
         Err(e) => {
-            let _ = std::fs::remove_dir_all(&incoming);
+            let _ = crate::store::remove_tree(&incoming);
             return Err(e);
         }
     };
@@ -327,7 +349,7 @@ pub fn verify_and_stage(
         .iter()
         .find(|(suffix, _)| !crate::store::STAGE_SIDECAR_SUFFIXES.contains(suffix))
     {
-        let _ = std::fs::remove_dir_all(&incoming);
+        let _ = crate::store::remove_tree(&incoming);
         return Err(payload2(
             "sidecar suffix the store does not reclaim: ",
             suffix,
@@ -347,20 +369,28 @@ pub fn verify_and_stage(
     //
     //     First the verified root is opened from the scratch's `0700` to the mode every
     //     directory in a build has ([`crate::extract::safe_mode`], `0755`): every user of
-    //     a system prefix runs from it, and by now every member has its final mode.
+    //     a system prefix runs from it, and by now every member has its final mode. A
+    //     single-binary build's `bin/` is then sealed against its vendor's own in-place
+    //     updater ([`crate::store::seal_bin`]); nothing writes into the tree after this.
     if let Err(e) = crate::platform::set_mode(&incoming, crate::extract::safe_mode(0, true)) {
-        let _ = std::fs::remove_dir_all(&incoming);
+        let _ = crate::store::remove_tree(&incoming);
         return Err(io_step("give the staged tree the build's mode", e));
     }
+    if crate::vendor::is_binary_payload(&artifact.payload)
+        && let Err(e) = crate::store::seal_bin(&incoming)
+    {
+        let _ = crate::store::remove_tree(&incoming);
+        return Err(io_step("seal the build's bin", e));
+    }
     if let Err(e) = crate::store::sync_tree(&incoming) {
-        let _ = std::fs::remove_dir_all(&incoming);
+        let _ = crate::store::remove_tree(&incoming);
         return Err(io_step("flush the staged tree", e));
     }
 
     // 4. SWAP. Marker down first (mid-swap, the build is honestly not complete), then the
     //    old tree aside, then the verified tree into place, then the old tree reclaimed.
     if let Err(e) = swap_into_place(build_dir, &incoming) {
-        let _ = std::fs::remove_dir_all(&incoming);
+        let _ = crate::store::remove_tree(&incoming);
         return Err(io_step("swap the staged tree into place", e));
     }
 
@@ -590,6 +620,8 @@ fn check_developer_id(
 ///   in-root symlinks admitted ([`crate::extract::ExtractOptions`]), modes sanitized to
 ///   `0755`/`0644` exactly as for a release bundle;
 /// * `raw-binary` — the download IS the binary: it becomes `bin/<entry>`, mode `0755`;
+/// * `tar-gz-binary` — a gzip tar of exactly one regular file at its root: that file
+///   becomes `bin/<entry>`, mode `0755`, exactly as a `raw-binary` of its bytes would;
 /// * `dmg` — the single `.app` at the image root, copied with `ditto` and no ACL, then
 ///   given the same modes as every other lane ([`crate::extract::safe_mode`]:
 ///   [`vet_copied_tree`]), macOS only. Its links, contents and extended attributes are
@@ -642,13 +674,31 @@ pub(crate) fn stage_payload_modes(
         strip_components: artifact.strip_components,
         in_root_symlinks: true,
     };
+    // A row that signs no `tree_root` has nothing to compare the decoded tree against
+    // ([`verify_and_stage`] step 3), so its zstd frames must carry the producer's content
+    // checksum: either the signed root or the checksum catches a decoding defect. In
+    // practice that is a release bundle (`payload = ""`) from a packer that predates
+    // `tree_root` (`zstd -19`, which writes the checksum); an `https` row signs a root
+    // (`crate::vendor::check_row`) and the vendor-direct lanes take no `tar-zst`.
+    let checksum = if artifact.tree_root.is_empty() {
+        FrameChecksum::Required
+    } else {
+        FrameChecksum::IfPresent
+    };
     let mut folded: Option<TreeAccumulator> = match artifact.payload.as_str() {
         "" => Some(
-            extract_tar_zst_tree(archive, dest, cap, MAX_ENTRIES, ExtractOptions::default())
-                .map_err(StageError::Extract)?,
+            extract_tar_zst_tree(
+                archive,
+                dest,
+                cap,
+                MAX_ENTRIES,
+                ExtractOptions::default(),
+                checksum,
+            )
+            .map_err(StageError::Extract)?,
         ),
         "tar-zst" => Some(
-            extract_tar_zst_tree(archive, dest, cap, MAX_ENTRIES, vendor)
+            extract_tar_zst_tree(archive, dest, cap, MAX_ENTRIES, vendor, checksum)
                 .map_err(StageError::Extract)?,
         ),
         "tar-gz" => Some(
@@ -659,7 +709,7 @@ pub(crate) fn stage_payload_modes(
             extract_zip_tree(archive, dest, cap, MAX_ENTRIES, vendor)
                 .map_err(StageError::Extract)?,
         ),
-        "raw-binary" => Some(stage_raw_binary(archive, dest, &artifact.entry, cap)?),
+        "raw-binary" | "tar-gz-binary" => Some(stage_binary(artifact, archive, dest, cap)?),
         "dmg" => {
             stage_dmg(archive, dest)?;
             None
@@ -689,24 +739,26 @@ fn payload2(head: &str, detail: &str) -> StageError {
     StageError::Payload(format!("{head}{detail}"))
 }
 
-/// The `raw-binary` lane: the download becomes `bin/<entry>` at mode `0755` — under the
-/// platform's EXECUTABLE spelling of the logical name (`bin/claude` on Unix,
-/// `bin/claude.exe` on Windows: [`crate::store::ToolName::exe_file`], the file the shim
-/// forwards to) — through the very write loop the archive lanes use, so the one file
-/// folds into the digest exactly as an archived `bin/<entry>` would.
-fn stage_raw_binary(
+/// The single-binary lanes: the download (`raw-binary`), or the one regular file at the
+/// root of its gzip tar (`tar-gz-binary`, [`crate::extract::stage_tar_gz_member`]),
+/// becomes `bin/<entry>` at mode `0755` — under the platform's EXECUTABLE spelling of the
+/// logical name (`bin/claude` on Unix, `bin/claude.exe` on Windows:
+/// [`crate::store::ToolName::exe_file`], the file the shim forwards to) — through the very
+/// write loop the archive lanes use, so the one file folds into the digest exactly as an
+/// archived `bin/<entry>` would.
+fn stage_binary(
+    artifact: &Artifact,
     archive: &Path,
     dest: &Path,
-    entry: &str,
     cap: u64,
 ) -> Result<TreeAccumulator, StageError> {
     // Belt and braces over `vendor::check_row` (which the client ran before download):
     // this function is also the AUTHORING producer, and a separator here would be a
     // path, not a name.
-    let Some(tool) = crate::store::ToolName::new(entry) else {
+    let Some(tool) = crate::store::ToolName::new(&artifact.entry) else {
         return Err(payload2(
-            "raw-binary entry is not a single admissible tool name: ",
-            entry,
+            "the entry is not a single admissible tool name: ",
+            &artifact.entry,
         ));
     };
     std::fs::create_dir_all(dest).map_err(StageError::Io)?;
@@ -720,9 +772,13 @@ fn stage_raw_binary(
     crate::extract::make_dir_exact(dest, &bin, Path::new("bin"), &mut tree)
         .map_err(StageError::Extract)?;
     let target = bin.join(tool.exe_file());
-    let file = std::fs::File::open(archive).map_err(StageError::Io)?;
-    let written =
-        crate::extract::stage_file(file, &target, 0o755, cap).map_err(StageError::Extract)?;
+    let written = if artifact.payload == "tar-gz-binary" {
+        crate::extract::stage_tar_gz_member(archive, &target, 0o755, cap)
+    } else {
+        let file = std::fs::File::open(archive).map_err(StageError::Io)?;
+        crate::extract::stage_file(file, &target, 0o755, cap)
+    }
+    .map_err(StageError::Extract)?;
     let rel = crate::extract::rel_bytes_under(dest, &target).map_err(StageError::Extract)?;
     tree.record_file(rel, written.mode, written.content_sha_hex);
     Ok(tree)
@@ -1254,9 +1310,9 @@ impl Drop for Mount {
 /// verifies `--deep --strict` before and after its modes are changed).
 ///
 /// The tree root contract could change at no cost: no published index row uses
-/// `kind = "app-bundle"`, `payload = "dmg"` (index 68 names exactly the 12 programs of
-/// tools/atpkg-programs.spec: ten release bundles, and codex and claude, https `binary`
-/// rows whose vendor-direct lane admits nothing else, `vendor_direct::resolve::admit`).
+/// `kind = "app-bundle"`, `payload = "dmg"` (index 68 names exactly 12 programs: the ten
+/// release bundles of `atpkg_publish::programs::PROGRAMS`, and codex and claude, https
+/// `binary` rows whose vendor-direct lane admits nothing else, `vendor_direct::resolve::admit`).
 /// So a `dmg` tree's `tree_root` now folds `755` or `644` in every file's mode slot,
 /// never the image's own bits, and a future `dmg` row is signed against that sanitized
 /// tree (the root [`stage_payload`] returns over the image).
@@ -1476,7 +1532,7 @@ fn swap_into_place(build_dir: &Path, incoming: &Path) -> std::io::Result<()> {
     let superseded = crate::store::superseded_dir(build_dir);
     let retired = match superseded {
         Some(ref old) if build_dir.exists() => {
-            let _ = std::fs::remove_dir_all(old);
+            let _ = crate::store::remove_tree(old);
             if let Err(e) = std::fs::rename(build_dir, old) {
                 // The swap could not even BEGIN. A rename that returns an error has not
                 // moved anything, so the old tree is provably still at `build_dir`,
@@ -1500,7 +1556,7 @@ fn swap_into_place(build_dir: &Path, incoming: &Path) -> std::io::Result<()> {
         return Err(e);
     }
     if retired && let Some(ref old) = superseded {
-        let _ = std::fs::remove_dir_all(old);
+        let _ = crate::store::remove_tree(old);
     }
     Ok(())
 }
@@ -1529,7 +1585,7 @@ fn restore_outgoing(old: &Path, build_dir: &Path, was_complete: bool) -> bool {
 mod tests {
     use super::*;
     use crate::manifest::{Artifact, Cost};
-    use std::io::Write;
+    use crate::tree::file_sha256;
     use std::path::PathBuf;
 
     fn tmp(label: &str) -> crate::testdir::Dir {
@@ -1559,13 +1615,11 @@ mod tests {
         out
     }
 
-    /// zstd-compress a raw tar stream (plus its two zero end-of-archive blocks) to `path`.
+    /// Write a raw tar stream (plus its two zero end-of-archive blocks) to `path` as one
+    /// zstd frame.
     fn seal(path: PathBuf, mut tar: Vec<u8>) -> PathBuf {
         tar.resize(tar.len() + 1024, 0);
-        let f = std::fs::File::create(&path).unwrap();
-        let mut enc = zstd::Encoder::new(f, 0).unwrap();
-        enc.write_all(&tar).unwrap();
-        enc.finish().unwrap();
+        std::fs::write(&path, crate::extract::fixtures::zstd_bytes(&tar)).unwrap();
         path
     }
 
@@ -1595,6 +1649,7 @@ mod tests {
             kind: "binary".into(),
             asset: "ay-18.tar.zst".into(),
             sha256: sha256.into(),
+            sha512: String::new(),
             tree_root: tree_root.into(),
             size: 0,
             reloc: "self-contained".into(),
@@ -1646,6 +1701,7 @@ mod tests {
             1 << 20,
             1000,
             ExtractOptions::default(),
+            FrameChecksum::IfPresent,
         )
         .unwrap()
         .declared_modes();
@@ -1727,13 +1783,63 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            matches!(err, StageError::Sha256Mismatch { .. }),
+            matches!(err, StageError::DigestMismatch { .. }),
             "got {err:?}"
         );
         assert!(
             !build.exists(),
             "nothing should be staged on a sha mismatch"
         );
+        let _ = std::fs::remove_dir_all(&b.dir);
+    }
+
+    /// A row that signs a sha512 is gated by it: the matching archive stages, and one whose
+    /// sha512 differs is refused naming that algorithm — even when the value it carries is
+    /// the archive's sha256. A row that signs both digests or neither has no gate, and is
+    /// refused before extraction too.
+    #[test]
+    fn a_sha512_row_is_gated_by_its_sha512() {
+        let b = bundle("sha512");
+        let sha512 = crate::tree::file_sha512(&b.archive).unwrap();
+        let by_512 = |sha256: &str, sha512: &str| Artifact {
+            sha256: sha256.into(),
+            sha512: sha512.into(),
+            ..b.art.clone()
+        };
+        let build = b.build();
+        verify_and_stage(&by_512("", &sha512), &b.archive, &build, &StageHooks::NONE).unwrap();
+        assert!(crate::store::build_is_complete(&build));
+        let other = b.dir.join("store/ay/19");
+        let err = verify_and_stage(
+            &by_512("", &b.art.sha256),
+            &b.archive,
+            &other,
+            &StageHooks::NONE,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, StageError::DigestMismatch { alg: DigestAlg::Sha512, got, .. } if *got == sha512),
+            "{err:?}"
+        );
+        assert!(
+            err.to_string()
+                .starts_with("asset sha512 mismatch: expected "),
+            "{err}"
+        );
+        for (sha256, sha512) in [(b.art.sha256.as_str(), sha512.as_str()), ("", "")] {
+            let err = verify_and_stage(
+                &by_512(sha256, sha512),
+                &b.archive,
+                &other,
+                &StageHooks::NONE,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(&err, StageError::DigestMismatch { expected, .. } if expected.is_empty()),
+                "{err:?}"
+            );
+        }
+        assert!(!other.exists(), "nothing staged past a refused digest");
         let _ = std::fs::remove_dir_all(&b.dir);
     }
 
@@ -1753,6 +1859,71 @@ mod tests {
             "a tree_root mismatch must remove the partial stage"
         );
         let _ = std::fs::remove_dir_all(&b.dir);
+    }
+
+    /// ZC.5's rule (docs/AUDIT-third-party-2026-10-15.md): a row that signs no
+    /// `tree_root` has nothing to compare its decoded tree against, so its zstd frame must
+    /// carry the producer's content checksum. Over the release-bundle lane and the
+    /// `tar-zst` vendor lane: the bundle's tar in a frame WITHOUT one is refused in
+    /// extraction and nothing is staged; signing its root admits that same frame (the root
+    /// is the check there), and the checksummed frame stages with no root.
+    #[test]
+    fn an_unsigned_tree_root_requires_the_frame_checksum() {
+        let dir = tmp("frame-checksum");
+        let mut tar = tar_entry("bin/ay", b"#!/bin/true\nthe ay binary");
+        tar.resize(tar.len() + 1024, 0);
+        let bare = dir.join("bare.tar.zst");
+        let mut zst = Vec::new();
+        aterm_zstd::frame::write_raw(&mut zst, &tar, aterm_zstd::frame::Checksum::Omitted).unwrap();
+        std::fs::write(&bare, zst).unwrap();
+        let checked = make_archive(&dir);
+        // The bare frame's root, learned by extracting it once (never from the stage).
+        let probe = dir.join("probe");
+        let modes = crate::extract::extract_tar_zst_tree(
+            &bare,
+            &probe,
+            1 << 20,
+            1000,
+            ExtractOptions::default(),
+            FrameChecksum::IfPresent,
+        )
+        .unwrap()
+        .declared_modes();
+        let root = tree_root_declared(&probe, &modes).unwrap();
+        std::fs::remove_dir_all(&probe).unwrap();
+
+        for payload in ["", "tar-zst"] {
+            let row = |archive: &Path, root: &str| {
+                let mut a = vendor_artifact(archive, payload, root);
+                if payload.is_empty() {
+                    a.protocol = "github-release".into();
+                }
+                a
+            };
+            let build = dir.join(format!("store/ay-{payload}/18"));
+            let err =
+                verify_and_stage(&row(&bare, ""), &bare, &build, &StageHooks::NONE).unwrap_err();
+            assert!(
+                matches!(err, StageError::Extract(_))
+                    && err.to_string().contains("no content checksum"),
+                "{payload:?}: got {err:?}"
+            );
+            assert!(!build.exists(), "{payload:?}: nothing is staged");
+            assert!(scratch_beside(&build).is_empty(), "{payload:?}: no scratch");
+
+            verify_and_stage(&row(&bare, &root), &bare, &build, &StageHooks::NONE)
+                .unwrap_or_else(|e| panic!("{payload:?}, root signed: {e}"));
+            let unsigned = dir.join(format!("store/ay-{payload}/19"));
+            verify_and_stage(&row(&checked, ""), &checked, &unsigned, &StageHooks::NONE)
+                .unwrap_or_else(|e| panic!("{payload:?}, checksummed: {e}"));
+            for b in [&build, &unsigned] {
+                assert_eq!(
+                    std::fs::read(b.join("bin/ay")).unwrap(),
+                    b"#!/bin/true\nthe ay binary",
+                    "{payload:?}"
+                );
+            }
+        }
     }
 
     /// THE GOVERNING INVARIANT: a stage whose EXTRACTION fails must not have uninstalled
@@ -2411,6 +2582,7 @@ mod tests {
             1 << 20,
             1000,
             ExtractOptions::default(),
+            FrameChecksum::IfPresent,
         )
         .unwrap();
         let modes = tree.declared_modes();
@@ -2461,6 +2633,7 @@ mod tests {
             1 << 20,
             1000,
             ExtractOptions::default(),
+            FrameChecksum::IfPresent,
         )
         .unwrap();
         let modes = tree.declared_modes();
@@ -2500,7 +2673,6 @@ mod tests {
     use crate::extract::fixtures::{ZipMember, gzip_bytes, tar_bytes, zip_bytes};
 
     /// An https artifact over `archive`, signed for ITS bytes and for `root`.
-    #[cfg(unix)]
     fn vendor_artifact(archive: &Path, payload: &str, root: &str) -> Artifact {
         let mut a = artifact(&file_sha256(archive).unwrap(), root);
         a.kind = if payload == "dmg" {
@@ -2634,17 +2806,17 @@ mod tests {
     /// made from the same tree on the same macOS build ([`dmg_fixture_key`]), a copy of
     /// exactly those bytes.
     ///
-    /// WHY (measured 2026-10-05, 14 cores, macOS 25G83): `hdiutil create` is nearly all
-    /// of these tests' time, and none of it is the lane under test. One create of these
-    /// ~17 KB images takes 4.0-5.1 s idle, made of `diskimages-helper`'s one-second
-    /// progress polls, a 1.8 s finalize and a 0.5 s exit. No create flag helped beyond
-    /// which one-second tick it finished on (`-noatomic` averaged 4.20 s against 4.54 s
-    /// over six runs each). Each test took 5.3 s alone. Three side by side under 28
-    /// spinning loops spent 19-20 s of 21-33 s in it, and the merge gate timed the tests
-    /// at 36.8-49.9 s. Each test images a DIFFERENT tree, so within one process there is
-    /// nothing to share; the work that repeats is the same image, run after run. With
-    /// the image filed here, the three take 0.63-0.81 s idle against 5.6-5.7 s, and
-    /// 4.0-6.3 s against 16.7-19.8 s inside the whole lib run under 14 spinning loops.
+    /// WHY (measured on 14 cores, macOS 25G83): `hdiutil create` is nearly all of these
+    /// tests' time, and none of it is the lane under test. One create of these ~17 KB
+    /// images takes 4.0-5.1 s idle, made of `diskimages-helper`'s one-second progress
+    /// polls, a 1.8 s finalize and a 0.5 s exit. No create flag helped beyond which
+    /// one-second tick it finished on (`-noatomic` averaged 4.20 s against 4.54 s over six
+    /// runs each). Each test took 5.3 s alone. Three side by side under 28 spinning loops
+    /// spent 19-20 s of 21-33 s in it, and a loaded whole-workspace run timed the tests at
+    /// 36.8-49.9 s. Each test images a DIFFERENT tree, so within one process there is
+    /// nothing to share; the work that repeats is the same image, run after run. With the
+    /// image filed here, the three take 0.63-0.81 s idle against 5.6-5.7 s, and 4.0-6.3 s
+    /// against 16.7-19.8 s inside the whole lib run under 14 spinning loops.
     ///
     /// A hit is byte for byte an image `hdiutil create` wrote with identical flags on
     /// this OS build from a tree identical in every entry's path, kind, mode, contents
@@ -2919,7 +3091,7 @@ mod tests {
         let d = tmp("vendor-zst");
         let expected = gh_expected_root(&d);
         let zst = d.join("gh.tar.zst");
-        std::fs::write(&zst, zstd::encode_all(&gh_tar()[..], 0).unwrap()).unwrap();
+        std::fs::write(&zst, crate::extract::fixtures::zstd_bytes(&gh_tar())).unwrap();
         let mut art = vendor_artifact(&zst, "tar-zst", &expected);
         art.strip_components = 1;
         let build = d.join("store/gh/18");
@@ -2988,6 +3160,229 @@ mod tests {
             assert!(matches!(err, StageError::Payload(_)), "{bad:?}: {err:?}");
             assert!(!build.exists(), "{bad:?}");
         }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The `tar-gz-binary` lane on agy's measured shape — one regular file `antigravity`,
+    /// mode `0755`, at the archive root: it becomes `bin/agy` at `0755` (a `0644` member
+    /// too: the lane's one file is the executable), the root the stage folds with no
+    /// signed root to compare (the vendor-direct row) is the one a hand-laid `bin/agy`
+    /// walks to, and the darwin Developer ID gate asks about `bin/agy` as the one Mach-O
+    /// its shim runs.
+    #[cfg(unix)]
+    #[test]
+    fn a_one_member_tar_gz_binary_stages_its_file_at_bin_entry_0755() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let d = tmp("vendor-tgzbin");
+        let mut body = thin_macho();
+        body.extend((0..300_000usize).map(|i| (i % 251) as u8));
+        let replica = d.join("replica");
+        lay(&replica, "bin/agy", &body, 0o755);
+        let expected = tree_root(&replica).unwrap();
+        for member_mode in [0o755, 0o644] {
+            let gz = d.join(format!("agy-1.3.6-{member_mode:o}.tar.gz"));
+            let tar = tar_bytes(&[("antigravity", b'0', "", &body, member_mode)]);
+            std::fs::write(&gz, gzip_bytes(&tar)).unwrap();
+            let mut art = vendor_artifact(&gz, "tar-gz-binary", "");
+            art.entry = "agy".into();
+            let asked = std::cell::RefCell::new(Vec::new());
+            let verify = |path: &Path, _: std::time::Instant| {
+                asked.borrow_mut().push(path.to_path_buf());
+                Ok::<(), aterm_update_core::codesign::CodesignError>(())
+            };
+            let gate =
+                |tree: &Path| check_developer_id(tree, "EQHXZ8M8AV", &["agy".into()], &verify);
+            let hooks = StageHooks {
+                pre_swap: Some(&gate),
+                sidecars: None,
+            };
+            let build = d.join(format!("store/agy-{member_mode:o}/1000001000003000006"));
+            let root = verify_and_stage(&art, &gz, &build, &hooks).unwrap();
+            assert_eq!(root, expected, "{member_mode:o}");
+            assert_eq!(tree_root(&build).unwrap(), expected, "{member_mode:o}");
+            assert_eq!(std::fs::read(build.join("bin/agy")).unwrap(), body);
+            let mode = std::fs::metadata(build.join("bin/agy"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o7777, 0o755, "{member_mode:o}");
+            let asked = asked.into_inner();
+            assert!(
+                asked.len() == 1 && asked[0].ends_with("bin/agy"),
+                "{asked:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A single-binary build's `bin/` is SEALED `0555` on both lanes: agy's own updater,
+    /// which writes `agy.<nanos>.old` beside the store build, cannot write there. Every
+    /// removal of a store tree still takes it: a re-stage's swap retires and reclaims the
+    /// sealed tree, `discard_build` (gc's reclaim, an aborted stage) removes it, and so
+    /// does `uninstall`. The control: a plain `remove_dir_all` of the sealed tree fails,
+    /// so the unseal is what each removal needs.
+    #[cfg(unix)]
+    #[test]
+    fn a_single_binary_builds_bin_is_sealed_and_every_removal_still_takes_it() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let d = tmp("vendor-sealed");
+        let layout = crate::store::Layout {
+            prefix: d.to_path_buf(),
+        };
+        let body: Vec<u8> = (0..4096usize).map(|i| (i % 251) as u8).collect();
+        let raw = d.join("agy-raw");
+        std::fs::write(&raw, &body).unwrap();
+        let gz = d.join("agy.tar.gz");
+        let tar = tar_bytes(&[("antigravity", b'0', "", &body, 0o755)]);
+        std::fs::write(&gz, gzip_bytes(&tar)).unwrap();
+        let bin_mode = |build: &Path| {
+            std::fs::metadata(build.join("bin"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777
+        };
+        for (n, (payload, dl)) in [("raw-binary", &raw), ("tar-gz-binary", &gz)]
+            .into_iter()
+            .enumerate()
+        {
+            let mut art = vendor_artifact(dl, payload, "");
+            art.entry = "agy".into();
+            let build = layout.build_dir("agy", n as u64 + 1);
+            let root = verify_and_stage(&art, dl, &build, &StageHooks::NONE).unwrap();
+            assert_eq!(bin_mode(&build), 0o555, "{payload}");
+            assert_eq!(tree_root(&build).unwrap(), root, "{payload}: no root moved");
+            let write = std::fs::write(build.join("bin/agy.1792104288627296000.old"), b"x");
+            assert_eq!(
+                write.map_err(|e| e.kind()),
+                Err(std::io::ErrorKind::PermissionDenied),
+                "{payload}"
+            );
+            // A re-stage over the sealed build (repair): the old tree is retired and gone.
+            verify_and_stage(&art, dl, &build, &StageHooks::NONE).unwrap();
+            assert!(scratch_beside(&build).is_empty(), "{payload}");
+            assert!(
+                std::fs::remove_dir_all(&build).is_err(),
+                "{payload}: control"
+            );
+            crate::store::discard_build(&build);
+            assert!(!build.exists(), "{payload}: discard takes the sealed tree");
+            verify_and_stage(&art, dl, &build, &StageHooks::NONE).unwrap();
+        }
+        crate::ops::uninstall(&layout, "agy").unwrap();
+        assert!(!layout.prefix.join("store/agy").exists());
+    }
+
+    /// Every `tar-gz-binary` that is not exactly one regular file at the archive root is
+    /// refused and leaves no build, marker or scratch: a second member, a directory, a
+    /// symlink, a hard link, a device, a nested or dotted name, an empty archive, a member
+    /// past the signed size cap, and a gzip that is not one or is cut short. The control:
+    /// a member of exactly the cap stages.
+    #[cfg(unix)]
+    #[test]
+    fn a_tar_gz_binary_that_is_not_one_root_file_is_refused() {
+        use crate::extract::{ExtractError, ExtractReject as R, TooLargeReason};
+        #[derive(Debug)]
+        enum Want {
+            Rejected(R, &'static str),
+            ContentCap,
+            Io,
+        }
+        let d = tmp("vendor-tgzbin-bad");
+        let body = thin_macho();
+        let cap = size_cap(&artifact("", ""));
+        let at_cap = vec![7u8; usize::try_from(cap).unwrap()];
+        let past_cap = vec![7u8; at_cap.len() + 1];
+        let file = |name| (name, b'0', "", &body[..], 0o755);
+        let one = gzip_bytes(&tar_bytes(&[file("antigravity")]));
+        let cases = [
+            (
+                "two members",
+                tar_bytes(&[file("antigravity"), file("LICENSE")]),
+                Want::Rejected(R::NotSingleFile, "LICENSE"),
+            ),
+            (
+                "a directory",
+                tar_bytes(&[("antigravity/", b'5', "", b"", 0o755)]),
+                Want::Rejected(R::DisallowedKind, "antigravity/"),
+            ),
+            (
+                "a symlink",
+                tar_bytes(&[("antigravity", b'2', "/bin/sh", b"", 0o777)]),
+                Want::Rejected(R::DisallowedKind, "antigravity"),
+            ),
+            (
+                "a hard link",
+                tar_bytes(&[("antigravity", b'1', "agy", b"", 0o755)]),
+                Want::Rejected(R::DisallowedKind, "antigravity"),
+            ),
+            (
+                "a device",
+                tar_bytes(&[("antigravity", b'3', "", b"", 0o644)]),
+                Want::Rejected(R::DisallowedKind, "antigravity"),
+            ),
+            (
+                "a nested name",
+                tar_bytes(&[file("dir/antigravity")]),
+                Want::Rejected(R::NotSingleFile, "dir/antigravity"),
+            ),
+            (
+                "a dotted name",
+                tar_bytes(&[file("./antigravity")]),
+                Want::Rejected(R::NotSingleFile, "./antigravity"),
+            ),
+            (
+                "an empty archive",
+                tar_bytes(&[]),
+                Want::Rejected(R::NotSingleFile, ""),
+            ),
+            (
+                "a member past the cap",
+                tar_bytes(&[("antigravity", b'0', "", &past_cap, 0o755)]),
+                Want::ContentCap,
+            ),
+        ]
+        .map(|(label, tar, want)| (label, gzip_bytes(&tar), want))
+        .into_iter()
+        .chain([
+            (
+                "a tar that is not gzipped",
+                tar_bytes(&[file("antigravity")]),
+                Want::Io,
+            ),
+            ("a gzip cut short", one[..one.len() / 2].to_vec(), Want::Io),
+        ]);
+        for (i, (label, bytes, want)) in cases.enumerate() {
+            let dl = d.join(format!("{i}.tar.gz"));
+            std::fs::write(&dl, bytes).unwrap();
+            let mut art = vendor_artifact(&dl, "tar-gz-binary", "");
+            art.entry = "agy".into();
+            let build = d.join(format!("store/agy-{i}/1"));
+            let Err(StageError::Extract(e)) =
+                verify_and_stage(&art, &dl, &build, &StageHooks::NONE)
+            else {
+                panic!("{label}: not an extract refusal");
+            };
+            let met = match (&want, &e) {
+                (Want::Rejected(why, path), ExtractError::Rejected(r, p)) => {
+                    r == why && p == Path::new(path)
+                }
+                (Want::ContentCap, ExtractError::TooLarge(TooLargeReason::ContentCap))
+                | (Want::Io, ExtractError::Io { .. }) => true,
+                _ => false,
+            };
+            assert!(met, "{label}: want {want:?}, got {e}");
+            assert!(!build.exists(), "{label}");
+            assert!(scratch_beside(&build).is_empty(), "{label}");
+        }
+        let dl = d.join("at-cap.tar.gz");
+        let tar = tar_bytes(&[("antigravity", b'0', "", &at_cap, 0o755)]);
+        std::fs::write(&dl, gzip_bytes(&tar)).unwrap();
+        let mut art = vendor_artifact(&dl, "tar-gz-binary", "");
+        art.entry = "agy".into();
+        let build = d.join("store/agy-at-cap/1");
+        verify_and_stage(&art, &dl, &build, &StageHooks::NONE).unwrap();
+        assert_eq!(std::fs::read(build.join("bin/agy")).unwrap(), at_cap);
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -4150,7 +4545,7 @@ image-alias     : /tmp/stage/bar.dmg
         assert!(!asked.get(), "the hook saw an unverified tree");
         let err =
             verify_and_stage(&artifact("deadbeef", ""), &b.archive, &build, &hooks).unwrap_err();
-        assert!(matches!(err, StageError::Sha256Mismatch { .. }), "{err:?}");
+        assert!(matches!(err, StageError::DigestMismatch { .. }), "{err:?}");
         assert!(!asked.get(), "the hook saw bytes that failed their digest");
         // Non-vacuity: the same hook on the honest row is asked.
         verify_and_stage(&b.art, &b.archive, &build, &hooks).unwrap();

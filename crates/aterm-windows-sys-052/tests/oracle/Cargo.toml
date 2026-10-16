@@ -1,0 +1,17 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+#
+# THE CONFORMANCE ORACLE for crates/aterm-windows-sys-052 (WB.1,
+# docs/AUDIT-third-party-2026-10-15.md), in ITS OWN WORKSPACE, the
+# libc-oracle/ layout: no `[patch.crates-io]` here, so `windows-sys =
+# "=0.52.0"` reaches the registry crate the aterm workspace's
+# `windows-sys-052` row hides from every member. under-test/ gives the facade a
+# second package name over the SAME src/lib.rs, because one package may not
+# depend on two semver-compatible copies of one name.
+#
+# Nothing in the aterm workspace builds this. `./run.sh` runs it (STOCK
+# EXCEPTION: rustup's stable carries the x86_64- and aarch64-pc-windows-msvc
+# std, which Trust does not ship). Cargo.lock pins the registry side.
+[workspace]
+resolver = "2"
+members = ["under-test", "conformance"]

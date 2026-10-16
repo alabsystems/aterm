@@ -27,33 +27,15 @@ use crate::native_document_journal::{
 use crate::native_editor::{EditorCommand, EditorEffect, Selection};
 use crate::{App, WindowId};
 
-fn config_search_range(source: &str, query: &str) -> Option<std::ops::Range<usize>> {
-    if query.is_ascii() {
-        let needle = query.as_bytes();
-        return (!needle.is_empty())
-            .then(|| {
-                source
-                    .as_bytes()
-                    .windows(needle.len())
-                    .position(|candidate| candidate.eq_ignore_ascii_case(needle))
-            })
-            .flatten()
-            .map(|start| start..start + needle.len());
-    }
-    source
-        .find(query)
-        .map(|start| start..start.saturating_add(query.len()))
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ConfigEditorRevealDecision {
     Select {
         requested: String,
         range: std::ops::Range<usize>,
     },
-    SeedSearch {
-        requested: String,
-    },
+    /// The key is not in the file: add it (or, where no value is known,
+    /// say how), never a Search that cannot match.
+    AddAbsent { requested: String },
 }
 
 /// Resolve only an in-document Settings → Manual target. Filesystem authority
@@ -65,21 +47,14 @@ pub(crate) fn config_editor_reveal_decision(
 ) -> Result<ConfigEditorRevealDecision, String> {
     const MAX_TARGET_BYTES: usize = 512;
 
-    let requested = match target {
-        crate::native_app::ConfigEditorTarget::Key(key)
-        | crate::native_app::ConfigEditorTarget::Search(key) => key.trim(),
-    };
+    let crate::native_app::ConfigEditorTarget::Key(key) = target;
+    let requested = key.trim();
     if requested.is_empty() || requested.len() > MAX_TARGET_BYTES {
         return Err("Manual reveal target is empty or too long".to_string());
     }
-    let direct = match target {
-        crate::native_app::ConfigEditorTarget::Key(key) => {
-            crate::native_config_language::config_key_source_range(source, key)
-        }
-        crate::native_app::ConfigEditorTarget::Search(query) => config_search_range(source, query),
-    };
+    let direct = crate::native_config_language::config_key_source_range(source, key);
     Ok(direct.map_or_else(
-        || ConfigEditorRevealDecision::SeedSearch {
+        || ConfigEditorRevealDecision::AddAbsent {
             requested: requested.to_string(),
         },
         |range| ConfigEditorRevealDecision::Select {
@@ -87,6 +62,97 @@ pub(crate) fn config_editor_reveal_decision(
             range,
         },
     ))
+}
+
+/// How an absent key was added: so that adding it changes nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AbsentKeyAdded {
+    /// At its default value.
+    AtDefault,
+    /// No single literal default to write (a list, a path with none): an
+    /// example value, commented out.
+    Commented,
+}
+
+/// The edit that adds `key`, absent from `source`, where TOML reads it — a
+/// top-level key among the root keys, a dotted key in its table — so that
+/// the file means what it meant: at the value Settings shows as its default,
+/// else the schema's documented default, else the schema's example as a
+/// COMMENT (an example value is a choice, and Save would make it). Formatting
+/// elsewhere is kept: the edit is the smallest span the two texts differ in.
+/// `None` for a key with no value to offer.
+fn absent_key_edit(
+    source: &str,
+    key: &str,
+) -> Option<(
+    crate::native_config_language::ConfigCompletionEdit,
+    AbsentKeyAdded,
+)> {
+    let (item, added_as) = match crate::native_settings::settings_default_raw(key) {
+        // A Settings row: its default, or nothing where that is words.
+        Some(raw) => (
+            crate::prefs::typed_toml_item(key, &raw?).ok()?,
+            AbsentKeyAdded::AtDefault,
+        ),
+        // A key only aterm.toml holds: its documented default, else the value
+        // completion would offer, commented out.
+        None => {
+            let (literal, added_as) =
+                match crate::native_config_language::config_key_default_literal(key) {
+                    Some(literal) => (literal, AbsentKeyAdded::AtDefault),
+                    None => (
+                        crate::native_config_language::config_key_example_literal(key)?,
+                        AbsentKeyAdded::Commented,
+                    ),
+                };
+            let value = literal.parse::<aterm_toml::edit::Value>().ok()?;
+            (aterm_toml::edit::Item::Value(value), added_as)
+        }
+    };
+    let mut added = crate::prefs::with_toml_item(source, key, item).ok()?;
+    if added_as == AbsentKeyAdded::Commented {
+        let value = crate::native_config_language::config_key_source_range(&added, key)?;
+        let line_start = added[..value.start].rfind('\n').map_or(0, |at| at + 1);
+        added.insert_str(line_start, "# ");
+    }
+    let prefix = source
+        .bytes()
+        .zip(added.bytes())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let mut prefix = prefix;
+    while !source.is_char_boundary(prefix) || !added.is_char_boundary(prefix) {
+        prefix -= 1;
+    }
+    let room = (source.len() - prefix).min(added.len() - prefix);
+    let mut suffix = source
+        .bytes()
+        .rev()
+        .zip(added.bytes().rev())
+        .take(room)
+        .take_while(|(a, b)| a == b)
+        .count();
+    while !source.is_char_boundary(source.len() - suffix)
+        || !added.is_char_boundary(added.len() - suffix)
+    {
+        suffix -= 1;
+    }
+    let replacement = prefix..source.len() - suffix;
+    let insertion = added[prefix..added.len() - suffix].to_string();
+    (!insertion.is_empty()).then(|| {
+        let caret = insertion.len();
+        (
+            crate::native_config_language::ConfigCompletionEdit {
+                expected: source[replacement.clone()].to_string(),
+                replacement,
+                insertion,
+                post_insert_selection: caret..caret,
+                display: key.to_string(),
+                help: String::new(),
+            },
+            added_as,
+        )
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -98,16 +164,16 @@ struct PendingDocumentClose {
 }
 
 /// Latest explicit durability intent received while an older generation is in
-/// flight.  The document owns this latch rather than the initiating view: a
-/// repeated Save or a close/Quit barrier must survive view focus changes and be
-/// pumped immediately after the current atomic save reduces.
+/// flight. The document owns it, not the initiating view, so a repeated Save or
+/// a close/Quit barrier survives focus changes; it is pumped as soon as the
+/// current atomic save reduces.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PendingDocumentSaveIntent {
     seq: aterm_buffer::Seq,
     source_view: crate::tab_model::ViewId,
 }
 
-/// One document's leaves inside a larger window/quit close plan.  The plan is
+/// One document's leaves inside a larger window/quit close plan. The plan is
 /// immutable once armed: `DocumentStore::prepare_close` freezes the exact head
 /// sequence and editing is rejected until durability either succeeds or the
 /// close is explicitly retried.
@@ -394,9 +460,9 @@ fn native_document_queue() -> Result<&'static std::sync::mpsc::SyncSender<Native
                                     &path,
                                     key,
                                     &plan,
-                                    // This IS the worker thread: no frame to
-                                    // drop, so ride out the whole fork window
-                                    // rather than lose the append.
+                                    // The worker thread: no frame to drop, so
+                                    // ride out the whole fork window rather
+                                    // than lose the append.
                                     JournalLockPatience::Worker,
                                 );
                                 let _ = proxy.send_event(crate::Wake::NativeDocumentJournaled {
@@ -478,37 +544,128 @@ fn prepare_config_save_observation(
     }))
 }
 
+/// The draft-journal store, or why there is none, settled at its first look.
+///
+/// Opening it reads the per-install journal secret, and a FIRST launch mints
+/// that secret behind two `F_FULLFSYNC` barriers (`load_or_mint_journal_secret`):
+/// 15.7 ms of the UI thread before the first window on an idle disk, and far more
+/// under the first launch's package writes. Nothing before a document needs the
+/// store, so the running App opens it on a worker ([`Self::opening`]) and the
+/// first look (`as_ref`, `as_mut`, `available_mut`, `unavailable`) joins that
+/// worker if it is still opening.
+struct JournalSlot {
+    settled: std::cell::OnceCell<Result<DocumentJournalStore, String>>,
+    opening: std::cell::Cell<Option<std::thread::JoinHandle<Result<DocumentJournalStore, String>>>>,
+}
+
+impl JournalSlot {
+    /// A slot already settled to `store`.
+    fn open(store: Result<DocumentJournalStore, String>) -> Self {
+        Self {
+            settled: std::cell::OnceCell::from(store),
+            opening: std::cell::Cell::new(None),
+        }
+    }
+
+    /// A slot `open` settles on an `aterm-journal-open` worker, or inline when no
+    /// thread can start. `Responsive`, the floor for work the UI thread may wait
+    /// on (`qos`).
+    fn opening<F>(open: F) -> Self
+    where
+        F: FnOnce() -> Result<DocumentJournalStore, String> + Send + 'static,
+    {
+        // Handed over only once the worker exists, so a failed spawn still has
+        // `open` to run inline.
+        let (open_tx, open_rx) = std::sync::mpsc::sync_channel::<F>(1);
+        let spawned = std::thread::Builder::new()
+            .name("aterm-journal-open".into())
+            .spawn(move || {
+                crate::qos::set_self(crate::qos::Role::Responsive);
+                match open_rx.recv() {
+                    Ok(open) => open(),
+                    Err(_) => Err("document recovery is unavailable".to_string()),
+                }
+            });
+        match spawned {
+            Ok(worker) => {
+                let _ = open_tx.send(open);
+                Self {
+                    settled: std::cell::OnceCell::new(),
+                    opening: std::cell::Cell::new(Some(worker)),
+                }
+            }
+            Err(_) => Self::open(open()),
+        }
+    }
+
+    fn settle(&self) -> &Result<DocumentJournalStore, String> {
+        self.settled.get_or_init(|| match self.opening.take() {
+            Some(worker) => worker.join().unwrap_or_else(|_| {
+                Err("document recovery is unavailable: opening its journal panicked".to_string())
+            }),
+            None => Err("document recovery is unavailable".to_string()),
+        })
+    }
+
+    fn as_ref(&self) -> Option<&DocumentJournalStore> {
+        self.settle().as_ref().ok()
+    }
+
+    fn as_mut(&mut self) -> Option<&mut DocumentJournalStore> {
+        self.available_mut().ok()
+    }
+
+    /// The store, or the reason there is none.
+    fn available_mut(&mut self) -> Result<&mut DocumentJournalStore, String> {
+        let _ = self.settle();
+        match self.settled.get_mut() {
+            Some(Ok(store)) => Ok(store),
+            Some(Err(reason)) => Err(reason.clone()),
+            None => Err("document recovery is unavailable".to_string()),
+        }
+    }
+
+    fn unavailable(&self) -> Option<&str> {
+        self.settle().as_ref().err().map(String::as_str)
+    }
+
+    /// A slot settled to a test store at `root`.
+    #[cfg(test)]
+    fn for_test(root: std::path::PathBuf) -> Self {
+        Self::open(Ok(
+            DocumentJournalStore::for_test(root).expect("test journal root")
+        ))
+    }
+}
+
 pub(crate) struct DocumentHostRuntime {
     pub(crate) grants: DocumentGrantStore,
     pub(crate) persistence: DocumentPersistenceStore,
-    journals: Option<DocumentJournalStore>,
-    journal_unavailable: Option<String>,
+    journals: JournalSlot,
     recovery_status: BTreeMap<DocumentId, String>,
     /// Journal intents that observed a full worker queue. This is an ID-only,
     /// latest-wins latch: full encoded plans are released before insertion and
     /// rebuilt from `DocumentJournalStore` when a worker receive frees a slot.
     journal_retries: JournalRetrySet,
-    /// A journal write LANDED while an update handoff was parked — after the
-    /// successor may have read the image it restores from. The Commit check
-    /// reads the image as the successor's copy, so a landing it cannot order
-    /// against the successor's read fails that check (`Wait:`); the rollback
+    /// A journal write landed while an update handoff was parked, after the
+    /// successor may have read its restore image. The Commit check fails
+    /// (`Wait:`) on a landing it cannot order against that read; the rollback
     /// clears it. Set from every completion path
     /// ([`App::note_document_journal_landing`]).
     journal_landed_while_parked: bool,
-    /// TEST SEAM — the headless App has no document worker, so its journal
-    /// effects run inline. When `Some`, appends are held here instead, for a
-    /// test to run later exactly as the worker would
-    /// (`App::run_held_journal_append_for_test`):
-    /// how a conformance test puts an append in flight across a park.
+    /// Test seam: the headless App has no document worker, so journal effects
+    /// run inline. When `Some`, appends are held here for a test to run later as
+    /// the worker would (`App::run_held_journal_append_for_test`), putting an
+    /// append in flight across a park.
     #[cfg(test)]
     held_journal_appends: Option<Vec<HeldJournalAppend>>,
-    /// TEST SEAM — [`Self::held_journal_appends`] for re-seats
+    /// Test seam: [`Self::held_journal_appends`] for re-seats
     /// (`App::run_held_journal_reseat_for_test`).
     #[cfg(test)]
     held_journal_reseats: Option<Vec<HeldJournalReseat>>,
-    /// TEST SEAM — every test App is headless, and a headless successor
-    /// restores no document tab ([`App::successor_restores_document_tabs`]).
-    /// Set, the App answers as a windowed one does, so a test can carry drafts.
+    /// Test seam: a headless successor restores no document tab
+    /// ([`App::successor_restores_document_tabs`]). Set, the App answers as a
+    /// windowed one, so a test can carry drafts.
     #[cfg(test)]
     carry_as_windowed_for_test: bool,
     /// Documents whose on-disk generation no longer matches the saver baseline.
@@ -519,20 +676,18 @@ pub(crate) struct DocumentHostRuntime {
     pending_saves: BTreeMap<DocumentId, PendingDocumentSaveIntent>,
     pending_closes: BTreeMap<DocumentId, Vec<PendingDocumentClose>>,
     /// OS-window closes are all-or-nothing across every document leaf in that
-    /// window.  No tab/view is detached while any member still lacks its exact
+    /// window: no tab or view is detached while any member still lacks its exact
     /// durable checkpoint.
     pending_window_closes: BTreeMap<WindowId, DocumentClosePlan>,
     /// Whole-app Quit waits on one process-wide plan before update application or
     /// event-loop exit. It supersedes (without partially applying) window plans.
     pending_quit: Option<DocumentClosePlan>,
-    /// Document admissions currently running on an `aterm-document-admit` worker
-    /// (the two-phase open; see [`App::begin_document_admission`]). Keyed by the
-    /// requesting WINDOW and the exact request, so a second gesture for the same
-    /// file in the same window while the first is still reading coalesces onto
-    /// it instead of spawning a second read — while the same file requested from
-    /// another window is its own read, delivered to that window; a completion for
-    /// a window that closed meanwhile can therefore never swallow a live
-    /// window's tab. A completion is matched by ticket and never applied twice.
+    /// Admissions running on an `aterm-document-admit` worker (the two-phase
+    /// open; see [`App::begin_document_admission`]). Keyed by requesting window
+    /// and request: a repeat in the same window coalesces onto the read in
+    /// flight, while another window's request is its own read, so a completion
+    /// for a closed window never swallows a live window's tab. A completion is
+    /// matched by ticket and applied at most once.
     admissions: BTreeMap<(WindowId, DocumentAdmissionKey), PendingDocumentAdmission>,
     next_admission: u64,
 }
@@ -545,15 +700,20 @@ impl Default for DocumentHostRuntime {
 
 impl DocumentHostRuntime {
     pub(crate) fn new() -> Self {
-        let (journals, journal_unavailable) = match DocumentJournalStore::system_default() {
-            Ok(store) => (Some(store), None),
-            Err(error) => (None, Some(error)),
-        };
+        Self::with_journals(JournalSlot::open(DocumentJournalStore::system_default()))
+    }
+
+    /// The running App's runtime: its journal store opens on a worker
+    /// ([`JournalSlot::opening`]), so the boot never waits on the secret's mint.
+    pub(crate) fn opening() -> Self {
+        Self::with_journals(JournalSlot::opening(DocumentJournalStore::system_default))
+    }
+
+    fn with_journals(journals: JournalSlot) -> Self {
         Self {
             grants: DocumentGrantStore::new(),
             persistence: DocumentPersistenceStore::default(),
             journals,
-            journal_unavailable,
             recovery_status: BTreeMap::new(),
             journal_retries: JournalRetrySet::default(),
             journal_landed_while_parked: false,
@@ -575,14 +735,11 @@ impl DocumentHostRuntime {
     }
 }
 
-/// Identity of one two-phase document open while its admission is in flight:
-/// the exact URI the caller asked for and the app that will host it. Two
-/// requests with the same key IN THE SAME WINDOW are the same read and
-/// coalesce; a Markdown and an Editor open of one file are two different tabs
-/// and do not, and neither do requests from two different windows (each window
-/// gets the tab it asked for). The two-phase path is for DOCUMENTS only — the
-/// Manual config editor, the one caller that binds config symlinks, stays
-/// synchronous by design — so the symlink rule is not part of the identity.
+/// Identity of one two-phase open in flight: the exact URI and the hosting app.
+/// The same key in the same window coalesces; Markdown and Editor opens of one
+/// file, or requests from two windows, do not. Only documents take the
+/// two-phase path (the Manual config editor, which binds config symlinks, stays
+/// synchronous), so the symlink rule is not part of the key.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct DocumentAdmissionKey {
     pub(crate) uri: String,
@@ -603,11 +760,10 @@ struct PendingDocumentAdmission {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DocumentAdmissionTicket(u64);
 
-/// An `aterm-document-admit` worker that has run this long without reporting is
-/// treated as abandoned for COALESCING purposes only: a new request for the same
-/// file starts a fresh read rather than joining a wait that may never end (an
-/// unreachable network volume, a download that stalled). If the old worker does
-/// return later, its ticket no longer matches and its result is dropped.
+/// An `aterm-document-admit` worker silent this long counts as abandoned for
+/// coalescing only: a new request for the file starts a fresh read rather than
+/// join a wait that may never end (an unreachable volume, a stalled download).
+/// A late result no longer matches its ticket and is dropped.
 const DOCUMENT_ADMISSION_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// What the worker hands back through `Wake::DocumentAdmitted`: the request it
@@ -646,10 +802,9 @@ impl DocumentAdmission {
     }
 }
 
-/// Why a worker's completion did NOT install a tab. The split is what the
-/// `Wake::DocumentAdmitted` arm needs: a dropped completion is bookkeeping and
-/// goes to the log only; a failed one answers a gesture the user made and is
-/// shown to them.
+/// Why a worker's completion installed no tab. A dropped completion is
+/// bookkeeping and only logged; a failed one answers the user's gesture and is
+/// shown.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum DocumentAdmissionRejected {
     /// Nothing to tell the user: the ticket was superseded or already consumed,
@@ -810,20 +965,63 @@ impl App {
                 buffer.ensure_primary_visible(&snapshot.text, buffer.viewport_lines());
                 state.status = Some(format!("Revealed {requested} in aterm.toml"));
             }
-            ConfigEditorRevealDecision::SeedSearch { requested } => {
-                let origin = buffer.primary_selection().head.min(snapshot.text.len());
-                buffer.minibuffer = crate::native_editor::Minibuffer::Search {
-                    query: requested.clone(),
-                    origin,
+            ConfigEditorRevealDecision::AddAbsent { requested } => {
+                buffer.minibuffer = crate::native_editor::Minibuffer::Inactive;
+                let Some((edit, added_as)) = absent_key_edit(&snapshot.text, &requested) else {
+                    // No value to offer (a table, a map): say how, on a
+                    // footer nothing else covers.
+                    let note = format!(
+                        "{requested} is not in aterm.toml yet. Add it on a line of its own; \
+                         completion offers its values."
+                    );
+                    state.status = Some(note.clone());
+                    state.reveal_status = Some(note);
+                    return Ok(());
                 };
-                state.status = Some(match target {
-                    crate::native_app::ConfigEditorTarget::Key(_) => {
-                        format!("{requested} is not set in aterm.toml · completion can add it")
+                // One undoable, unsaved edit, through the same path an
+                // accepted completion takes.
+                let _ = self.dispatch_editor_event(
+                    instance,
+                    view,
+                    &AppEvent::EditorConfigCompletion(edit),
+                )?;
+                let text = self
+                    .document_store
+                    .snapshot(document)
+                    .ok_or_else(|| "native config document disappeared during reveal".to_string())?
+                    .text;
+                let Some(crate::native_app::AppViewState::Editor(state)) =
+                    self.native_runtime.view_state_mut(view)
+                else {
+                    return Err("native config editor view disappeared during reveal".to_string());
+                };
+                if let Some(buffer) = state.buffer.as_mut() {
+                    if let Some(range) =
+                        crate::native_config_language::config_key_source_range(&text, &requested)
+                    {
+                        buffer.selections = vec![crate::native_editor::Selection {
+                            anchor: range.start,
+                            head: range.end,
+                        }];
+                        buffer.primary = 0;
                     }
-                    crate::native_app::ConfigEditorTarget::Search(_) => {
-                        "No match in aterm.toml · search is open".to_string()
-                    }
-                });
+                    buffer.minibuffer = crate::native_editor::Minibuffer::Inactive;
+                    buffer.ensure_primary_visible(&text, buffer.viewport_lines());
+                }
+                let note = match added_as {
+                    // Short enough for the 80x24 footer.
+                    AbsentKeyAdded::AtDefault => format!(
+                        "Added {requested} at its default, which changes nothing. Undo removes it."
+                    ),
+                    // A comment changes nothing; its example value is a
+                    // placeholder to replace, not a default.
+                    AbsentKeyAdded::Commented => format!(
+                        "Added {requested} as a comment, which changes nothing. Set it, then \
+                         remove the #."
+                    ),
+                };
+                state.status = Some(note.clone());
+                state.reveal_status = Some(note);
             }
         }
         Ok(())
@@ -1010,6 +1208,8 @@ impl App {
             ) {
                 state.config_completion_selected = 0;
                 state.config_completion_interaction = None;
+                // An edit or caret move: the reveal's note has been read.
+                state.reveal_status = None;
             }
             let reduced = match event {
                 #[cfg(any(a11y_tree, test))]
@@ -1224,12 +1424,10 @@ impl App {
             }
             match reduced {
                 Ok(effects) => {
-                    // EditorWorkspace owns view-local selection, viewport,
-                    // chord, preedit, and minibuffer state outside the generic
-                    // NativeRuntime reducer. Publish the same monotonic view
-                    // revision that ordinary native reducers advance so cache
-                    // stamps and control-socket inspection never retain an old
-                    // caret/modeline after a handled editor event.
+                    // EditorWorkspace owns view-local editor state outside the
+                    // generic NativeRuntime reducer, so advance the view revision
+                    // here too: cache stamps and control-socket inspection must
+                    // not keep an old caret/modeline.
                     state.common.presentation_revision =
                         state.common.presentation_revision.saturating_add(1);
                     effects
@@ -1303,14 +1501,10 @@ impl App {
         let journal_result = self
             .native_documents
             .journals
-            .as_mut()
-            .ok_or_else(|| {
-                self.native_documents
-                    .journal_unavailable
-                    .clone()
-                    .unwrap_or_else(|| "document journal is unavailable".to_string())
-            })
+            .available_mut()
             .and_then(|journals| journals.observe_commit(&snapshot));
+        let journal_result =
+            journal_result.and_then(|()| self.checkpoint_commit_back_on_disk(&snapshot));
         if let Err(message) = journal_result.and_then(|()| self.drive_document_journal(document)) {
             self.set_document_recovery_status(document, Some(message));
         }
@@ -1331,6 +1525,62 @@ impl App {
         }
     }
 
+    /// A COMMIT THAT PUTS BACK THE BYTES ON DISK IS CLEAN: an Undo (or any
+    /// edit) whose text is exactly what aterm last saw in the file moves the
+    /// checkpoint to it, as an unchanged refresh does
+    /// ([`Self::install_stable_file_observation`]), so the title loses its
+    /// dot, Save goes quiet, the tab reads clean, a close needs no save and
+    /// the journal drops the draft instead of autosaving it. Only with no
+    /// save in flight or owed and no disk conflict: an older save still
+    /// landing could put other bytes on disk after the buffer read clean.
+    fn checkpoint_commit_back_on_disk(
+        &mut self,
+        snapshot: &crate::document_store::DocumentSnapshot,
+    ) -> Result<(), String> {
+        let document = snapshot.id;
+        if self.document_store.dirty(document) != Some(true)
+            || self.native_documents.persistence.save_in_flight(document)
+            || self.native_documents.inflight.contains(&document)
+            || self.native_documents.pending_saves.contains_key(&document)
+            || self.native_documents.disk_conflicts.contains(&document)
+        {
+            return Ok(());
+        }
+        let Some(observed) = self.native_documents.persistence.observed(document) else {
+            return Ok(());
+        };
+        let bytes = snapshot.text.as_bytes();
+        if !observed.exists
+            || observed.len != bytes.len() as u64
+            || observed.content != crate::native_document_io::ContentFingerprint::of(bytes)
+            || !self
+                .native_documents
+                .persistence
+                .observed_text_matches(document, snapshot.text.as_ref())
+        {
+            return Ok(());
+        }
+        self.document_store
+            .checkpoint_ack(document, snapshot.seq)
+            .map_err(|error| format!("could not mark the unchanged file durable: {error:?}"))?;
+        // What the footer said of the edit ("Draft autosaved", "Added … Undo
+        // removes it") is over: it says the buffer is the file again.
+        for (_, _, view) in self.document_native_views(document) {
+            self.set_editor_view_status(view, "No unsaved changes");
+        }
+        if let Some(journals) = self.native_documents.journals.as_mut() {
+            journals.request_checkpoint(
+                crate::native_document_io::DurableCheckpoint {
+                    document,
+                    seq: snapshot.seq,
+                    source: crate::native_document_io::DurableSource::StableFileObservation,
+                },
+                snapshot.text.clone(),
+            )?;
+        }
+        Ok(())
+    }
+
     fn drive_document_journal(&mut self, document: DocumentId) -> Result<(), String> {
         self.drive_document_journal_once(document).map(|_| ())
     }
@@ -1345,8 +1595,8 @@ impl App {
         } else {
             None
         };
-        // THE RE-SEAT FENCE follows the handoff attempt: while a successor may
-        // be restoring from these journals, none is re-seated under it
+        // The re-seat fence follows the handoff attempt: no journal is
+        // re-seated under a successor that may be restoring from it
         // (`DocumentJournalStore::set_reseat_fenced`).
         let fenced = self.update_handoff_in_flight();
         loop {
@@ -1394,11 +1644,10 @@ impl App {
                         });
                         return Ok(JournalDriveOutcome::Enqueued);
                     }
-                    // NO worker to hand this to (`proxy` is None, so the queue
-                    // was never built), and this is the thread that owns `App`.
-                    // It takes the frame-sized budget for that reason, and its
-                    // refusal flows to `set_document_recovery_status` exactly as
-                    // any other journal failure does.
+                    // No worker (`proxy` is None, so the queue was never built)
+                    // and this thread owns `App`: take the frame-sized budget. A
+                    // refusal reaches `set_document_recovery_status` like any
+                    // other journal failure.
                     let result =
                         execute_journal_append(&path, key, &plan, JournalLockPatience::EventLoop);
                     let completion = self
@@ -1523,7 +1772,11 @@ impl App {
                 journals.complete_append(document, generation, result)
             });
         self.note_document_journal_landing(&completion);
-        if matches!(&completion, JournalCompletion::Durable { .. }) {
+        // A clean document holds no draft: its landing is the checkpoint's
+        // pruning, never news for the footer.
+        if matches!(&completion, JournalCompletion::Durable { .. })
+            && self.document_store.dirty(document) == Some(true)
+        {
             for (_, _, view) in self.document_native_views(document) {
                 self.set_editor_view_status(view, "Draft autosaved");
             }
@@ -1539,8 +1792,8 @@ impl App {
     }
 
     /// An append or checkpoint that failed while a re-seat was owed most likely
-    /// failed BECAUSE of it (a successor's image on disk): drive the re-seat
-    /// now rather than at the next keystroke. A re-seat's own failure is never
+    /// failed because of it (a successor's image on disk): drive the re-seat now
+    /// rather than at the next keystroke. A re-seat's own failure is never
     /// re-driven from here, so a journal that keeps refusing cannot spin.
     fn drive_owed_document_journal_reseat(&mut self, document: DocumentId) {
         if self
@@ -1598,19 +1851,17 @@ impl App {
         }
     }
 
-    /// Whether one document's unsaved draft rides an update to the successor
-    /// — the per-document half of the Relaunch preflight
+    /// Whether one document's unsaved draft rides an update to the successor:
+    /// the per-document half of the Relaunch preflight
     /// (`App::native_update_close_preflight`), asked when the update starts and
     /// again at its Commit.
     ///
-    /// CARRIED means: the journal store proved the editor's current head
-    /// durable (fsync'd file and directory, the exact append proof), nothing is
-    /// writing or owed, the file on disk is the one the draft was made against
-    /// as far as this process has observed, and the image on disk — read back
-    /// now, every record checksummed — replays to exactly the editor's text over
-    /// exactly that file ([`verify_carried_draft`]). The successor restores the
-    /// document by reopening its file, which replays that image; the file
-    /// itself is never written.
+    /// Carried means the journal store proved the head durable (file and
+    /// directory fsync'd) with nothing writing or owed, the file is the one the
+    /// draft was made against as far as this process has seen, and the image on
+    /// disk, read back and checksummed, replays to exactly the editor's text
+    /// ([`verify_carried_draft`]). The successor reopens the file, which replays
+    /// the image; the file itself is never written.
     pub(crate) fn draft_carry(&self, document: DocumentId) -> DraftCarry {
         let Some(head) = self.document_store.snapshot(document) else {
             return DraftCarry::Refused("the document is no longer open".to_string());
@@ -1629,8 +1880,8 @@ impl App {
             return DraftCarry::Refused(format!(
                 "it has no draft journal ({})",
                 self.native_documents
-                    .journal_unavailable
-                    .as_deref()
+                    .journals
+                    .unavailable()
                     .unwrap_or("document recovery is unavailable")
             ));
         };
@@ -1689,18 +1940,14 @@ impl App {
         }
     }
 
-    /// Whether this process's update successor reopens its document tabs — and
-    /// its Settings tabs, from the same layout, with their carried field drafts
-    /// (plan P2-2): the one predicate every carried piece of unsaved native
-    /// state rides by. The
-    /// seamless successor restores the handed-over layout — every editor leaf
-    /// by reopening its file, which replays the draft — only when it has a
-    /// window to put them in (`main_entry` takes the handoff layout only when
-    /// not headless); a headless successor restores none, so no draft of a
-    /// headless process is carried. Nor is one off unix: only the unix overlap
-    /// handoff hands a layout over, and the Windows lane replaces the app cold
-    /// (spawn, then exit — `apply_staged_update_now`), which reopens nothing
-    /// and does not read the safety token's carried count.
+    /// Whether this process's update successor reopens its document tabs (and
+    /// its Settings tabs, from the same layout, with their field drafts): the one
+    /// predicate every carried piece of unsaved native state rides by. The
+    /// successor restores the handed-over layout only when it has a window
+    /// (`main_entry` takes the handoff layout only when not headless), so a
+    /// headless process carries no draft. Nor does one off unix: the Windows lane
+    /// replaces the app cold (spawn, then exit; `apply_staged_update_now`) and
+    /// reopens nothing.
     pub(crate) fn successor_restores_document_tabs(&self) -> bool {
         #[cfg(test)]
         if self.native_documents.carry_as_windowed_for_test {
@@ -1775,20 +2022,17 @@ impl App {
         }
     }
 
-    /// Drive every journal owing work nothing is doing (a re-seat, or a head
-    /// the last failed append left behind) — run before an update asks whether
-    /// each unsaved draft can be carried, so a transient journal failure is
-    /// retried by the update itself instead of holding it until the next
-    /// keystroke.
+    /// Drive every journal owing work nothing is doing (a re-seat, or a head a
+    /// failed append left behind) before an update asks whether each unsaved
+    /// draft can be carried, so the update itself retries a transient failure.
     ///
-    /// ONLY AN UNSAVED DRAFT'S FAILED WRITE is retried here. The update carries
-    /// those drafts and says why it cannot when a journal keeps refusing
-    /// (`DraftCarryRefusal::AppendFailed` / `ReseatFailed`). Any other
-    /// journal's retry — a saved document's re-seat after a rollback, say —
-    /// would only be a write in flight when the preflight asks, holding the
-    /// update ("Wait:") without a word for as long as the failure lasts, over a
-    /// document it has nothing to carry of. That one is retried at its
-    /// document's next drive, and by the next rollback's re-seat.
+    /// Only an unsaved draft's failed write is retried here; the update reports
+    /// a journal that keeps refusing (`DraftCarryRefusal::AppendFailed` /
+    /// `ReseatFailed`). Retrying any other journal (a saved document's re-seat
+    /// after a rollback, say) would only put a write in flight when the
+    /// preflight asks, holding the update ("Wait:") silently over a document
+    /// with nothing to carry; that one retries at its document's next drive or
+    /// the next rollback's re-seat.
     pub(crate) fn drive_owed_document_journals(&mut self) {
         let Some(journals) = self.native_documents.journals.as_ref() else {
             return;
@@ -1816,9 +2060,7 @@ impl App {
     /// of one user share.
     #[cfg(test)]
     pub(crate) fn use_document_journal_root_for_test(&mut self, root: std::path::PathBuf) {
-        self.native_documents.journals =
-            Some(DocumentJournalStore::for_test(root).expect("test journal root"));
-        self.native_documents.journal_unavailable = None;
+        self.native_documents.journals = JournalSlot::for_test(root);
     }
 
     /// The journal identity this App's store gives `document`'s URI.
@@ -1968,7 +2210,11 @@ impl App {
                 journals.complete_rewrite(document, generation, result)
             });
         self.note_document_journal_landing(&completion);
-        if matches!(&completion, JournalCompletion::Durable { .. }) {
+        // A clean document holds no draft: its landing is the checkpoint's
+        // pruning, never news for the footer.
+        if matches!(&completion, JournalCompletion::Durable { .. })
+            && self.document_store.dirty(document) == Some(true)
+        {
             for (_, _, view) in self.document_native_views(document) {
                 self.set_editor_view_status(view, "Draft autosaved");
             }
@@ -2185,26 +2431,68 @@ impl App {
             .persistence
             .observed(document)
             .ok_or_else(|| "document persistence baseline disappeared".to_string())?;
+        let save_in_flight = self.native_documents.persistence.save_in_flight(document);
         let reduction = crate::native_document_io::reduce_file_watch(
             crate::native_document_io::FileWatchInput {
                 baseline,
                 observed,
                 document_dirty: self.document_store.dirty(document).unwrap_or(false),
-                save_in_flight: self.native_documents.persistence.save_in_flight(document),
+                save_in_flight,
             },
         );
+        // A fingerprint match is only a candidate for unchanged content. A
+        // fresh read with different exact bytes follows the ordinary external
+        // change path even when its fingerprint and metadata collide. Unknown
+        // exact baselines also fail closed until explicitly re-observed. A
+        // prior exact image may confirm this fresh read after a save rebind,
+        // but a live save still owns admission of the current version.
+        let reduction = if observed.exists
+            && matches!(
+                reduction,
+                crate::native_document_io::FileWatchReduction::Unchanged
+                    | crate::native_document_io::FileWatchReduction::RebindEquivalent { .. }
+            )
+            && (!self
+                .native_documents
+                .persistence
+                .last_observed_text_matches(document, observed_text)
+                || (save_in_flight
+                    && !self
+                        .native_documents
+                        .persistence
+                        .observed_text_matches(document, observed_text)))
+        {
+            let change = crate::native_document_io::VersionConflict::Content;
+            if save_in_flight {
+                crate::native_document_io::FileWatchReduction::DeferredSaving { change }
+            } else if self.document_store.dirty(document).unwrap_or(false) {
+                crate::native_document_io::FileWatchReduction::ConflictDirty { change }
+            } else {
+                crate::native_document_io::FileWatchReduction::ReloadClean { change }
+            }
+        } else {
+            reduction
+        };
         match reduction {
             crate::native_document_io::FileWatchReduction::Unchanged => {
-                if self.native_documents.disk_conflicts.contains(&document) {
+                let cleared_conflict = self.native_documents.disk_conflicts.contains(&document);
+                if cleared_conflict
+                    || !self
+                        .native_documents
+                        .persistence
+                        .observed_text_matches(document, observed_text)
+                {
                     // The target returned to the admitted baseline. Explicitly
-                    // re-accept it so a reducer-level save conflict is cleared
-                    // together with the host/UI latch.
+                    // re-accept the fresh exact read, including one confirming
+                    // the prior image after a fingerprint-only save rebind.
                     self.native_documents
                         .persistence
-                        .accept_observation(document, observed)
+                        .accept_observation(document, observed, observed_text)
                         .map_err(|error| {
                             format!("could not clear resolved disk conflict: {error:?}")
                         })?;
+                }
+                if cleared_conflict {
                     self.set_document_disk_conflict(document, false);
                     self.set_document_recovery_status(document, None);
                     for (_, _, view) in self.document_native_views(document) {
@@ -2218,7 +2506,7 @@ impl App {
             crate::native_document_io::FileWatchReduction::RebindEquivalent { .. } => {
                 self.native_documents
                     .persistence
-                    .accept_observation(document, observed)
+                    .accept_observation(document, observed, observed_text)
                     .map_err(|error| {
                         format!("could not refresh equivalent disk baseline: {error:?}")
                     })?;
@@ -2342,7 +2630,7 @@ impl App {
         };
         self.native_documents
             .persistence
-            .accept_observation(document, observed)
+            .accept_observation(document, observed, observed_text)
             .map_err(|error| format!("could not accept refreshed file version: {error:?}"))?;
         self.document_store
             .checkpoint_ack(document, seq)
@@ -2815,9 +3103,9 @@ impl App {
             .unwrap_or_default();
         let mut deferred = Vec::new();
         for close in pending {
-            // A larger OS-window/whole-app plan owns teardown atomically.  Letting
-            // an older tab-close completion detach here would visibly apply only
-            // part of that plan before the other documents are durable.
+            // A pending window or Quit plan owns teardown atomically; detaching
+            // an older tab close here would apply part of it before its other
+            // documents are durable.
             if self.native_documents.pending_quit.is_some()
                 || self
                     .native_documents
@@ -2908,15 +3196,11 @@ impl App {
         if !self.windows.contains_key(&window) {
             return Ok(true);
         }
-        // Re-derive the plan on EVERY gesture, not only the first. The window
-        // whose barrier is already armed stays interactive, so a repeated close
-        // — exactly what a user does when the window does not appear to close —
-        // can arrive after a document was opened into it. Reusing the plan
-        // captured by the first gesture would report the window ready while that
-        // later document is still dirty and authorize a teardown that strands
-        // its view in `view_store` with no tab to reach it from. Re-deriving is
-        // not extra work in the common case: an unchanged window yields an equal
-        // plan, and `drive_document_close_plan` was already re-run per gesture.
+        // Re-derive the plan on every gesture: the armed window stays
+        // interactive, so a repeated close can follow a document opened into it.
+        // A reused plan would report ready while that document is dirty and
+        // strand its view in `view_store` with no tab. An unchanged window
+        // yields an equal plan.
         let plan = self.document_close_plan_for_window(window)?;
         self.native_documents
             .pending_window_closes
@@ -2928,10 +3212,10 @@ impl App {
         Ok(ready)
     }
 
-    /// Arm the process-wide clean-Quit barrier.  This enumerates documents from
-    /// `DocumentStore`, not only visible tabs, so a dirty suspended document can
-    /// never be skipped.  A Ready verdict permits deferred-update application and
-    /// event-loop exit; Waiting keeps every window/view alive.
+    /// Arm the process-wide clean-Quit barrier. It enumerates documents from
+    /// `DocumentStore`, not only visible tabs, so a dirty suspended document is
+    /// never skipped. Ready permits deferred-update application and event-loop
+    /// exit; Waiting keeps every window and view alive.
     pub(crate) fn prepare_quit_document_shutdown(&mut self) -> Result<bool, String> {
         self.prepare_quit_document_shutdown_inner(true)
     }
@@ -2975,7 +3259,7 @@ impl App {
     }
 
     fn prepare_quit_document_shutdown_inner(&mut self, start_saves: bool) -> Result<bool, String> {
-        // Re-derived on EVERY gesture, as the window barrier is: the app stays
+        // Re-derived on every gesture, as the window barrier is: the app stays
         // interactive while a Quit's saves run, so a repeated Quit can find a
         // document opened since the first one, which a reused plan would skip.
         let plan = self.document_close_plan_for_quit();
@@ -2987,27 +3271,22 @@ impl App {
         Ok(ready)
     }
 
-    /// Called after an async save reduction.  A pending Quit wins over individual
-    /// window closes.  Returning `true` consumes a now-ready Quit plan; ready window
-    /// ids are batch-detached and consumed, ready for `close_window_logical`.
+    /// Called after an async save reduction. A pending Quit wins over window
+    /// closes. Returning `true` consumes a now-ready Quit plan; ready window ids
+    /// are batch-detached and consumed, ready for `close_window_logical`.
     pub(crate) fn take_ready_document_shutdowns(
         &mut self,
     ) -> Result<(bool, Vec<WindowId>), String> {
         if let Some(plan) = self.native_documents.pending_quit.clone() {
             if self.document_close_plan_ready(&plan)? {
-                // The first native-app preflight happened before the asynchronous
-                // checkpoint. A Settings draft (or another native blocker) may
-                // have appeared while the save worker was running, so obtain fresh
-                // reducer-owned readiness at the irreversible exit boundary.
+                // The native-app preflight ran before the async checkpoint; a
+                // Settings draft (or another native blocker) may have appeared
+                // since, so re-ask at the irreversible exit boundary.
                 if !self.prepare_quit_native_shutdown()? {
                     return Ok((false, Vec::new()));
                 }
-                // `plan` froze when the barrier armed, and a document opened and
-                // edited while its saves ran is absent from it; the editor
-                // reducer answers `Ready` unconditionally, so the native preflight
-                // above cannot see that document's edits either. Re-plan against
-                // the store's CURRENT documents, exactly as the window arm below
-                // does, and exit only once that plan is ready too.
+                // Re-plan against the store's current documents, as the window
+                // arm below does: the frozen `plan` misses any opened since.
                 let fresh = self.document_close_plan_for_quit();
                 if fresh != plan {
                     self.native_documents.pending_quit = Some(fresh.clone());
@@ -3038,28 +3317,21 @@ impl App {
                 continue;
             };
             if self.document_close_plan_ready(&plan)? {
-                // Do not detach the now-durable document edges until every native
-                // leaf is still ready. The UI remains live while checkpoints run,
-                // and a newly-created Settings draft must retain the complete
-                // window topology and surface its exact recovery payload.
+                // Detach nothing until every native leaf is still ready: the UI
+                // stays live while checkpoints run, and a new Settings draft must
+                // keep the whole window and surface its recovery payload.
                 if !self
                     .prepare_window_native_shutdown(window, crate::native_app::CloseScope::Window)?
                 {
                     continue;
                 }
-                // `plan` froze when the barrier armed, and the window stayed
-                // interactive for the whole checkpoint, so a document opened
-                // after that instant is absent from it. Nothing else proves such
-                // a document durable: the editor reducer answers `Ready`
-                // unconditionally and delegates durability to this host, so the
-                // native sweep above cannot see its unsaved edits either.
-                // Committing the frozen plan would detach only the documents it
-                // lists and then drop the tab tree, stranding the late
-                // document's view in `view_store` with no tab and no window to
-                // reach it from — permanently dirty, and permanently refusing
-                // every update apply. Re-plan against the window's CURRENT
-                // leaves; an unchanged plan takes exactly the path it did
-                // before.
+                // `plan` froze when the barrier armed, so a document opened
+                // since is absent from it; the editor reducer answers `Ready`
+                // unconditionally, so the native sweep above misses its edits
+                // too. Committing the frozen plan would strand that document's
+                // view in `view_store` with no tab or window, dirty for good and
+                // refusing every update apply. Re-plan against the window's
+                // current leaves.
                 let fresh = self.document_close_plan_for_window(window)?;
                 if fresh != plan {
                     self.native_documents
@@ -3326,7 +3598,7 @@ impl App {
         }
     }
 
-    /// Two-phase open of one local document in the FRONTMOST window (File ▸ Open
+    /// Two-phase open of one local document in the frontmost window (File ▸ Open
     /// Markdown / Open File in Editor). See [`Self::request_document_tab_in_window`].
     pub(crate) fn request_document_tab(
         &mut self,
@@ -3339,18 +3611,16 @@ impl App {
         self.request_document_tab_in_window(wid, kind, uri)
     }
 
-    /// Two-phase open of one local document in one exact host window — the form
-    /// every MAIN-THREAD gesture uses (file drop, the Open… menu items).
+    /// Two-phase open of one local document in one exact host window, the form
+    /// every main-thread gesture uses (file drop, the Open… menu items).
     ///
-    /// Phase one, here, validates the window/kind/URI and hands the read to an
-    /// `aterm-document-admit` worker. Phase two, `Wake::DocumentAdmitted` →
-    /// [`Self::complete_document_admission`], mints the grant and installs the
+    /// Phase one validates the window, kind and URI and hands the read to an
+    /// `aterm-document-admit` worker; phase two (`Wake::DocumentAdmitted` →
+    /// [`Self::complete_document_admission`]) mints the grant and installs the
     /// tab. The event loop never blocks on the read: an evicted iCloud Drive
-    /// item downloads on the worker (which opts INTO materialization for
-    /// itself), an unreachable network volume times out on the worker, and the
-    /// main-thread watchdog sees neither. Without an event-loop proxy (the
-    /// headless test harness) the admission runs inline and the result is
-    /// [`DocumentAdmission::Opened`].
+    /// item downloads, and an unreachable volume times out, on the worker.
+    /// Without an event-loop proxy (headless tests) the admission runs inline
+    /// and returns [`DocumentAdmission::Opened`].
     pub(crate) fn request_document_tab_in_window(
         &mut self,
         wid: WindowId,
@@ -3370,7 +3640,7 @@ impl App {
         )
     }
 
-    /// Synchronous open in the FRONTMOST window: the control socket's `app open
+    /// Synchronous open in the frontmost window: the control socket's `app open
     /// markdown|editor` verb (`app_control::open_app`), which answers its client
     /// with the installed view. Same caller rules as
     /// [`Self::open_document_tab_in_window`]; user gestures use
@@ -3383,24 +3653,18 @@ impl App {
     }
 
     /// Open or focus a canonical local document in one exact host window,
-    /// SYNCHRONOUSLY: the bounded read runs on the calling thread.
+    /// synchronously: the bounded read runs on the calling thread. The window
+    /// identity is kept through grant and tab install, so a late focus change
+    /// cannot redirect the document.
     ///
-    /// Window-system gestures such as file drops carry the window they landed on.
-    /// Keeping that identity through grant acquisition and tab installation prevents
-    /// a late focus change from redirecting the document into another window.
-    ///
-    /// WHO MAY CALL THIS. Callers that need the installed tab before they can
-    /// continue — session restore (tab order and the active tab are read back
-    /// immediately), the Markdown ▸ Edit effect and the Recovery tab's reopen
-    /// (each completes a native operation with the outcome), and the unit
-    /// tests — plus the Manual config editor, whose caller binds the config
-    /// service to the freshly-opened document in the same call. User GESTURES
-    /// must not: `drop_file` and `choose_and_open_document` go through
-    /// [`Self::request_document_tab_in_window`] so the event loop never waits
-    /// on a download. On the main thread this form still cannot hang on a
-    /// dataless file — the main thread's materialization policy is OFF
-    /// ([`crate::dataless_files`]), so such a read fails fast as
-    /// `NotDownloaded` — but it does wait out a network volume's timeout.
+    /// For callers that need the installed tab to continue: session restore, the
+    /// Markdown ▸ Edit effect, the Recovery tab's reopen, tests, and the Manual
+    /// config editor (which binds the config service to the document in the
+    /// same call). User gestures (`drop_file`, `choose_and_open_document`) go
+    /// through [`Self::request_document_tab_in_window`] instead. On the main
+    /// thread a dataless file fails fast as `NotDownloaded` (materialization is
+    /// off there; [`crate::dataless_files`]), but a network volume's timeout is
+    /// waited out.
     pub(crate) fn open_document_tab_in_window(
         &mut self,
         wid: WindowId,
@@ -3435,7 +3699,7 @@ impl App {
         Ok(())
     }
 
-    /// The blocking half of an open, on the CALLING thread: resolve, read,
+    /// The blocking half of an open, on the calling thread: resolve, read,
     /// validate. Pure with respect to `App`, so a worker can run it.
     fn admit_document_now(
         uri: &str,
@@ -3456,20 +3720,18 @@ impl App {
         wid: WindowId,
         key: DocumentAdmissionKey,
     ) -> Result<DocumentAdmission, String> {
-        // Coalescing is PER WINDOW: the caller has checked that `wid` exists, so
-        // a hit here is a live window's own in-flight read. Another window's
-        // read of the same file is a different entry and never joined — its
-        // completion installs there (or is dropped if it closed), not here.
+        // Coalescing is per window: a hit is this live window's own read in
+        // flight. Another window's read of the file is a separate entry and
+        // installs there (or is dropped if that window closed).
         if let Some(pending) = self.native_documents.admissions.get(&(wid, key.clone()))
             && pending.started.elapsed() < DOCUMENT_ADMISSION_STALE_AFTER
         {
             return Ok(DocumentAdmission::Coalesced(pending.ticket));
         }
         let Some(proxy) = self.proxy.clone() else {
-            // No event loop to report back to: the headless harness. Admit
-            // inline so the tests that read the tab straight back keep their
-            // synchronous contract; the state machine above is exercised by its
-            // own tests through `complete_document_admission`.
+            // No event loop to report back to (headless tests): admit inline so
+            // tests that read the tab straight back stay synchronous;
+            // `complete_document_admission` has its own tests.
             let admitted = Self::admit_document_now(&key.uri, false)?;
             return self
                 .install_admitted_document(wid, key.kind, &key.uri, admitted)
@@ -3480,9 +3742,9 @@ impl App {
         let spawned = std::thread::Builder::new()
             .name("aterm-document-admit".to_string())
             .spawn(move || {
-                // THIS thread may wait for a download: the user asked for the
-                // file, and this thread is nobody's event loop. The policy is
-                // thread-scoped, so the main thread's OFF is untouched.
+                // This thread may wait for a download: the user asked for the
+                // file and this is nobody's event loop. The policy is
+                // thread-scoped; the main thread's stays off.
                 if let Err(errno) = crate::dataless_files::set_thread_materialize_policy(
                     crate::dataless_files::MaterializePolicy::On,
                 ) {
@@ -3532,15 +3794,12 @@ impl App {
         ticket
     }
 
-    /// Phase two of the two-phase open, on the main thread: the worker's
-    /// verdict arrives through `Wake::DocumentAdmitted`. Applies it only when
-    /// the pending entry still holds the same ticket (a superseded read is
-    /// dropped), only when the requesting window still exists (a closed window
-    /// drops it cleanly — the pending entry is retired and nothing is
-    /// registered), and otherwise mints the grant and installs the tab exactly
-    /// as the synchronous opener does. `Ok` carries the opener's status line;
-    /// `Err` says whether the outcome was silently dropped or failed for a reason
-    /// the user should see.
+    /// Phase two of the two-phase open, on the main thread, from
+    /// `Wake::DocumentAdmitted`. Dropped when the pending entry holds another
+    /// ticket (superseded) or the requesting window closed (the entry is
+    /// retired, nothing registered); otherwise mints the grant and installs the
+    /// tab as the synchronous opener does. `Err` says whether the outcome was
+    /// dropped silently or failed for a reason the user should see.
     pub(crate) fn complete_document_admission(
         &mut self,
         outcome: DocumentAdmissionOutcome,
@@ -3561,14 +3820,12 @@ impl App {
                 )));
             }
         }
-        // Retire the entry BEFORE any early return: a failed or orphaned
-        // admission must never keep a later open of the same file coalescing
-        // onto a result that has already been consumed.
+        // Retire the entry before any early return, so a later open of the same
+        // file never coalesces onto a result already consumed.
         self.native_documents.admissions.remove(&slot);
         let (wid, key) = slot;
-        // The outcome names the window the request was made in (it is part of
-        // the pending entry's identity); a window that closed while the worker
-        // was reading drops the result — nothing is minted or registered.
+        // A window that closed while the worker read drops the result: nothing
+        // is minted or registered.
         if !self.windows.contains_key(&wid) {
             return Err(DocumentAdmissionRejected::Dropped(format!(
                 "requesting window closed before {} was admitted",
@@ -3642,9 +3899,10 @@ impl App {
                 .as_ref()
                 .ok_or_else(|| {
                     self.native_documents
-                        .journal_unavailable
-                        .clone()
-                        .unwrap_or_else(|| "document recovery is unavailable".to_string())
+                        .journals
+                        .unavailable()
+                        .unwrap_or("document recovery is unavailable")
+                        .to_string()
                 })?
                 .inspect_open(&granted.grant.canonical_uri, granted.text.as_bytes())?;
             let recovered = decision.recovered_text.clone();
@@ -3696,7 +3954,7 @@ impl App {
         };
         self.native_documents
             .persistence
-            .register(document, granted.grant.id, granted.observed)
+            .register(document, granted.grant.id, granted.observed, &granted.text)
             .map_err(|error| format!("document persistence failed: {error:?}"))?;
         if existing.is_some() {
             let _ = self.refresh_native_document(document)?;
@@ -3735,10 +3993,9 @@ impl App {
             indicators: crate::tab_model::TabIndicators::default(),
             conn: None,
             closable: true,
-            // The tooltip carries the EXACT URI this tab was opened with. The
-            // grant's canonical form (symlinks resolved — `/private/var/…` on
-            // macOS) stays the internal identity for dedup and persistence,
-            // but the user is shown the location they actually asked for.
+            // The tooltip carries the exact URI this tab was opened with; the
+            // grant's canonical form (symlinks resolved, `/private/var/…` on
+            // macOS) stays the internal identity for dedup and persistence.
             tooltip: Some(format!("{} · {}", kind.display_name(), uri)),
         };
         let state = match kind {
@@ -3781,10 +4038,9 @@ impl App {
             return Err(error);
         }
         if let Some(notice) = recovery_notice {
-            // AN UPDATE'S SUCCESSOR recovering a draft is the update carrying
-            // it: the outgoing process certified exactly this journal before it
-            // let the update start, so say what happened rather than suggest a
-            // crash.
+            // An update's successor recovering a draft is the update carrying
+            // it (the outgoing process certified this journal before the update
+            // started), so say that rather than suggest a crash.
             let message = match notice {
                 crate::native_document_journal::RecoveryNotice::Recovered
                     if self.incoming_handoff_pending =>
@@ -3895,14 +4151,14 @@ impl App {
     }
 }
 
-/// Create a missing config file without truncating an existing file, then return
-/// the exact logical path used by the native document-grant boundary.
+/// Create a missing config file without truncating an existing one, and return
+/// the logical path the document-grant boundary uses.
 ///
-/// Authority is resolved before the first filesystem mutation. Creation then
-/// goes through the same locked, compare-and-swap host as ordinary saves. Manual
-/// binds every existing symlink component before any mutation, so dotfiles layouts
-/// may use parent-directory or final-file links without allowing a later swap to
-/// redirect creation or publication. Ordinary document grants remain symlink-free.
+/// Authority is resolved before the first mutation; creation goes through the
+/// same locked compare-and-swap host as saves. Manual binds every existing
+/// symlink component first, so dotfiles layouts may link the parent directory
+/// or the file itself without a later swap redirecting creation or publication.
+/// Ordinary document grants stay symlink-free.
 fn ensure_config_file(path: &std::path::Path) -> Result<std::path::PathBuf, String> {
     if !path.is_absolute() {
         return Err(format!("config path must be absolute: {}", path.display()));
@@ -3990,19 +4246,59 @@ mod tests {
     use crate::native_editor::Minibuffer;
     use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
 
-    /// Upper bound for "refused without blocking".
-    ///
-    /// The property these guards defend is that opening a special file (a FIFO with
-    /// no writer) or contending a held lock REFUSES rather than parking the UI
-    /// thread. A genuine failure of that property blocks FOREVER, so any finite
-    /// bound catches it and the exact value only decides how fast the report comes.
-    ///
-    /// It is therefore a HANG DETECTOR, a minute, and never a latency budget: a
-    /// saturated host stretches this suite ~2x, and a bound picked for an idle one
-    /// turns a correctness guard into a flake. (Measured: the same class of tight
-    /// deadline in `control.rs`'s `read_until` failed exactly this way.) One second
-    /// looked generous and was not.
+    /// Bound for "refused without blocking": opening a writerless FIFO or
+    /// contending a held lock must refuse rather than park the UI thread. A real
+    /// failure blocks forever, so this is a one-minute hang detector, never a
+    /// latency budget.
     const REFUSES_WITHOUT_BLOCKING: std::time::Duration = aterm_spec::wait::MUST_HAPPEN;
+
+    /// The running App's journal store opens on a worker: the slot is built
+    /// while its opener is still held, and the first look takes the store that
+    /// opener made, secret minted.
+    #[test]
+    fn the_journal_store_opens_on_a_worker_the_boot_does_not_wait_for() {
+        let root = std::env::temp_dir().join(format!(
+            "aterm-journal-opening-{}-{}",
+            std::process::id(),
+            aterm_time::since_epoch().unwrap().as_nanos()
+        ));
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let opener_root = root.clone();
+        let mut slot = JournalSlot::opening(move || {
+            release_rx
+                .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                .map_err(|_| "the opener was never released".to_string())?;
+            DocumentJournalStore::for_test(opener_root)
+        });
+        assert!(
+            !root.join(".journal-key").exists(),
+            "nothing is opened before the held opener runs"
+        );
+        release_tx.send(()).unwrap();
+        assert!(
+            slot.as_mut().is_some(),
+            "the first look settles to the store"
+        );
+        assert!(
+            root.join(".journal-key").exists(),
+            "the opener minted the secret"
+        );
+        assert_eq!(slot.unavailable(), None);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A store that could not open is unavailable at every look, with the
+    /// opener's reason.
+    #[test]
+    fn a_journal_store_that_could_not_open_says_why() {
+        let mut slot = JournalSlot::opening(|| Err("no private state directory".to_string()));
+        assert_eq!(slot.unavailable(), Some("no private state directory"));
+        assert!(slot.as_ref().is_none());
+        assert_eq!(
+            slot.available_mut().err().as_deref(),
+            Some("no private state directory")
+        );
+    }
 
     /// Tier-1 guard binding: the exact generic admission primitive used by the
     /// shipping document worker agrees with the derived bounded-queue model at
@@ -4129,10 +4425,8 @@ mod tests {
     }
 
     fn file_uri(path: &std::path::Path) -> String {
-        // Built by the SHIPPING encoder, not a hand-rolled `format!` — the
-        // latter is malformed on Windows (drive letter + backslashes after the
-        // authority slot), so every test funnelling through here failed to even
-        // open its document there.
+        // The shipping encoder: a hand-rolled `format!` is malformed on Windows
+        // (drive letter and backslashes after the authority).
         crate::native_document_host::path_to_file_uri(path).unwrap()
     }
 
@@ -4146,10 +4440,8 @@ mod tests {
         }
     }
 
-    /// The chord that opens the editor's INCREMENTAL SEARCH on THIS platform:
-    /// `C-s` everywhere except Windows, where `C-s` is Save (audit I9 — the
-    /// reflex every Windows app owes its user) and isearch answers to `M-s`.
-    /// One helper so a test about the search MINIBUFFER never has to know which.
+    /// The chord that opens the editor's incremental search on this platform:
+    /// `C-s`, except on Windows, where `C-s` is Save and isearch is `M-s`.
     fn isearch_key() -> InputEvent {
         let mods = if cfg!(windows) {
             Modifiers::ALT
@@ -4293,8 +4585,8 @@ mod tests {
             app.begin_document_admission(wid, key.clone()),
             Ok(DocumentAdmission::Coalesced(ticket))
         );
-        // A DIFFERENT kind for the same file is a different tab, not a duplicate:
-        // in the headless harness it admits inline.
+        // A different kind for the same file is a different tab, not a
+        // duplicate; headless, it admits inline.
         let other = admission_key(&uri, AppKind::Markdown);
         assert!(
             matches!(
@@ -4362,12 +4654,9 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    /// Coalescing is per window. The same file requested from a second window
-    /// while the first window's read is in flight is its OWN admission — so when
-    /// the first window closes before its worker returns, its completion is
-    /// dropped and the second window still gets the tab it asked for. Without
-    /// the window in the key the second request would have joined the first
-    /// window's read and been dropped along with it.
+    /// Coalescing is per window: the same file from a second window while the
+    /// first window's read is in flight is its own admission, so the first
+    /// window closing before its worker returns drops only its own completion.
     #[test]
     fn same_file_from_another_window_is_its_own_admission_not_a_coalesce() {
         let (dir, uri) = admission_fixture("two-windows", b"# twice\n");
@@ -4405,8 +4694,8 @@ mod tests {
         .unwrap();
         let document = app.document_store.id_for_uri(&canonical).unwrap();
         assert_eq!(app.document_native_views(document).len(), 1);
-        // A duplicate gesture in the live window, while ITS read is in flight,
-        // is the case that coalesces.
+        // A duplicate gesture in the live window while its read is in flight is
+        // the case that coalesces.
         let ticket = app.mint_document_admission(live, key.clone());
         assert_eq!(
             app.begin_document_admission(live, key.clone()),
@@ -4557,26 +4846,8 @@ mod tests {
         pending
     }
 
-    /// Replays the in-flight save and panics with the save's own error text.
-    ///
-    /// NOT decoration. When this replay fails, the panic used to read only
-    /// `called Result::unwrap() on an Err value`, which names neither the stage
-    /// nor the cause — and this call is the ONE fallible step in these tests, so
-    /// an intermittent failure here left nothing to diagnose. On-disk forensics
-    /// of four leaked fixtures showed the replay reaching `open_write_lock`'s
-    /// `set_permissions` (lock ctime 89-280ms after its mtime) and then failing
-    /// before any temp file existed (fixture dir mtime still equal to the
-    /// rename's ctime). That narrows the failure to the FIVE exits between those
-    /// two points in `commit_atomic_bytes_with_seed` and CANNOT distinguish
-    /// them: `try_lock` WouldBlock ("busy"), `try_lock` Error ("could not
-    /// acquire save lock"), the post-lock `validate_atomic_target` ("could not
-    /// canonicalize the process temporary root" / TargetRetargeted /
-    /// SymlinkComponent), `observe_file` ("target changed while it was being
-    /// observed"), or `detect_version_conflict` ("File changed on disk"). A
-    /// bounded WouldBlock retry has since been added for the proven
-    /// flock-fork-inheritance hazard, but that is MITIGATION, not a proven cure
-    /// for THIS flake. Surface the message so the next occurrence names its own
-    /// exit. (Root-cause record: git log --grep save-latch-flake)
+    /// Replays the in-flight save and panics with the save's own error text, so
+    /// a failure names its stage and cause rather than a bare `unwrap` on `Err`.
     fn finish_inflight_save_for_test(
         app: &mut App,
         document: DocumentId,
@@ -4620,8 +4891,7 @@ mod tests {
         fs::write(&config, "window_theme = \"dark\"\n").unwrap();
         let journal_root = dir.join("private-drafts");
         let mut app = App::headless_for_test();
-        app.native_documents.journals =
-            Some(DocumentJournalStore::for_test(journal_root.clone()).unwrap());
+        app.native_documents.journals = JournalSlot::for_test(journal_root.clone());
 
         let canonical = crate::native_document_host::path_to_file_uri(
             &fs::canonicalize(&config).expect("canonical config path"),
@@ -4659,8 +4929,7 @@ mod tests {
         fs::write(&config, "window_theme = \"dark\"\n").unwrap();
         let journal_root = dir.join("private-drafts");
         let mut app = App::headless_for_test();
-        app.native_documents.journals =
-            Some(DocumentJournalStore::for_test(journal_root.clone()).unwrap());
+        app.native_documents.journals = JournalSlot::for_test(journal_root.clone());
         let canonical = crate::native_document_host::path_to_file_uri(
             &fs::canonicalize(&config).expect("canonical config path"),
         )
@@ -4690,13 +4959,9 @@ mod tests {
         let error = app
             .ensure_and_open_config_editor_path_in_window(WindowId(0), &config)
             .expect_err("held journal lock must report busy");
-        // This bound is a LIVENESS check, not a budget check — see
-        // `REFUSES_WITHOUT_BLOCKING`. The SIZE of the wait this open can incur is
-        // pinned deterministically, without a clock, by the guard test named on
-        // `native_document_journal::JournalLockPatience::EventLoop`;
-        // tightening the bound here toward a frame would
-        // re-create exactly the load-sensitive assertion this constant was raised
-        // to escape.
+        // A liveness bound, not a budget (see `REFUSES_WITHOUT_BLOCKING`); the
+        // wait's size is pinned without a clock by the guard test named on
+        // `native_document_journal::JournalLockPatience::EventLoop`.
         assert!(started.elapsed() < REFUSES_WITHOUT_BLOCKING);
         assert!(error.contains("busy"), "{error}");
         assert!(error.contains("retry opening Manual"), "{error}");
@@ -4704,8 +4969,7 @@ mod tests {
 
         // Released by LOCK_UN (the guard's drop), not by the close alone: a child
         // another test is forking holds this descriptor until it execs, and the
-        // retry below has the event loop's 25 ms journal-lock budget (the fd-copy
-        // sweep of 2026-09-27).
+        // retry below has only the event loop's 25 ms journal-lock budget.
         drop(held);
         app.ensure_and_open_config_editor_path_in_window(WindowId(0), &config)
             .expect("Manual retry succeeds after the lock is released");
@@ -5183,9 +5447,8 @@ mod tests {
         assert!(save.enabled, "busy failure remains explicitly retryable");
 
         // Released by LOCK_UN (the guard's drop), not by the close alone: a fork's
-        // copy outlives the close until its exec (measured up to 523 ms here), and
-        // the retry's preflight gives up after 500 ms (the fd-copy sweep of
-        // 2026-09-27).
+        // copy outlives the close until its exec (up to 523 ms measured), and the
+        // retry's preflight gives up after 500 ms.
         drop(held);
         app.save_document_checkpoint(document, view)
             .expect("Manual Save retry succeeds after lock release");
@@ -5354,6 +5617,11 @@ mod tests {
             "{first_save}"
         );
         assert!(first_save.contains("Save is available"), "{first_save}");
+
+        // A watcher can arrive before the person's next Save. Its actual
+        // identical read must not turn the safe rebind into a disk conflict.
+        app.refresh_open_config_editor_observation(&save_observation)
+            .unwrap();
 
         let after = app.document_store.snapshot(document).unwrap();
         assert_eq!(after.seq, draft.seq);
@@ -5591,13 +5859,10 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    /// NumLock off, the keypad 1 is KP_End. Through the real key path
-    /// (`App::on_key` -> `keymap::build_key_input` -> `App::input`) the
-    /// editor receives `NumpadEnd` — the identity DECKPAM and kitty need on
-    /// the PTY side — and the native reducer folds it onto End, so the caret
-    /// moves to the line end exactly as the same press did before the seam
-    /// told the keypad apart (when the reducer's `_ => None` arm swallowed
-    /// it instead).
+    /// NumLock off, keypad 1 is KP_End. Through the real key path
+    /// (`App::on_key` -> `keymap::build_key_input` -> `App::input`) the editor
+    /// receives `NumpadEnd` (the identity DECKPAM and kitty need on the PTY
+    /// side) and the native reducer folds it onto End.
     #[test]
     fn numlock_off_keypad_end_moves_the_editor_caret_to_the_line_end() {
         let dir = std::env::temp_dir().join(format!(
@@ -6158,7 +6423,10 @@ mod tests {
             })
             .map(|node| node.key.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(selected, ["editor/config-completion/0"]);
+        // The caret moved off the context the list was opened for, onto a
+        // name nobody is typing: the list waits to be asked for again, and
+        // the stale selection paints nowhere.
+        assert!(selected.is_empty(), "{selected:?}");
 
         drive_native(&mut app, key(Key::Named(NamedKey::Tab), Modifiers::empty()));
         let AppViewState::Editor(state) = app.native_runtime.view_state(view).unwrap() else {
@@ -6348,7 +6616,7 @@ mod tests {
     }
 
     #[test]
-    fn settings_manual_handoff_reveals_an_existing_key_and_seeds_absent_search() {
+    fn settings_manual_handoff_reveals_an_existing_key_and_adds_an_absent_one() {
         let dir = std::env::temp_dir().join(format!(
             "aterm-config-editor-target-handoff-{}",
             std::process::id()
@@ -6391,43 +6659,156 @@ mod tests {
         )
         .unwrap();
         let (instance, view) = app.active_native_view(wid).unwrap();
+        // Never a Search for a key the file does not have: the key is added
+        // where TOML reads it, at its default, as one unsaved edit, with the
+        // value selected for typing over.
+        let document = app.native_runtime.document_id(instance).unwrap();
+        let text = app.document_store.snapshot(document).unwrap().text;
+        let added = crate::native_config_language::config_key_source_range(&text, "gpu")
+            .expect("gpu is in the buffer now");
+        assert!(text.starts_with(&source), "nothing else moved: {text:?}");
         let AppViewState::Editor(state) = app.native_runtime.view_state(view).unwrap() else {
             panic!("config editor view")
         };
+        let buffer = state.buffer.as_ref().unwrap();
         assert_eq!(
-            state.buffer.as_ref().unwrap().minibuffer,
-            crate::native_editor::Minibuffer::Search {
-                query: "gpu".to_string(),
-                origin: value_start + "\"/bin/zsh\"".len(),
-            }
+            buffer.minibuffer,
+            crate::native_editor::Minibuffer::Inactive
         );
+        assert_eq!(buffer.primary_selection().range(), added);
         assert!(
             state
                 .status
                 .as_deref()
                 .unwrap()
-                .contains("gpu is not set in aterm.toml"),
-            "absent target explains the ready search/completion fallback"
+                .starts_with("Added gpu at its default"),
+            "{:?}",
+            state.status
         );
+        assert_eq!(state.reveal_status, state.status, "the footer says it");
         assert!(app.native_runtime.config_editor_enabled(instance));
-
-        // A free-text Settings search is not a key: nothing to add, only no match.
-        app.ensure_and_open_config_editor_path_at_in_window(
-            wid,
-            &path,
-            Some(&crate::native_app::ConfigEditorTarget::Search(
-                "Nord".to_string(),
-            )),
-        )
-        .unwrap();
-        let AppViewState::Editor(state) = app.native_runtime.view_state(view).unwrap() else {
-            panic!("config editor view")
-        };
-        assert_eq!(
-            state.status.as_deref(),
-            Some("No match in aterm.toml · search is open")
-        );
+        let _ = fs::write(&path, "");
         let _ = fs::remove_dir_all(dir);
+    }
+
+    /// The edit that adds an absent key puts it where TOML reads it: a
+    /// top-level key ahead of the first table, a dotted key in its table.
+    #[test]
+    fn an_absent_key_is_added_where_toml_reads_it() {
+        let source = "agents_auto_prime = false\n[update]\nenabled = false\n";
+        let apply = |key: &str| {
+            let (edit, added_as) = absent_key_edit(source, key).expect("an edit");
+            let mut text = source.to_string();
+            text.replace_range(edit.replacement.clone(), &edit.insertion);
+            (text, added_as)
+        };
+        let (text, added_as) = apply(crate::prefs::EDIT_SCROLLBACK);
+        assert_eq!(added_as, AbsentKeyAdded::AtDefault);
+        let key_at = text.find("scrollback").unwrap();
+        assert!(
+            key_at < text.find("[update]").unwrap(),
+            "a root key stays out of [update]: {text}"
+        );
+        let parsed: aterm_toml::Value = aterm_toml::from_str(&text).unwrap();
+        assert!(
+            parsed.get(crate::prefs::EDIT_SCROLLBACK).is_some(),
+            "{text}"
+        );
+        let (text, _) = apply("update.auto_apply");
+        let parsed: aterm_toml::Value = aterm_toml::from_str(&text).unwrap();
+        assert!(parsed["update"]["auto_apply"].as_bool().is_some(), "{text}");
+        assert_eq!(parsed["update"]["enabled"].as_bool(), Some(false));
+        // A table has no value to add.
+        assert!(absent_key_edit(source, "harness").is_none());
+    }
+
+    /// Opening a key only aterm.toml holds never changes what the file means:
+    /// the key comes in at its DOCUMENTED default (disk.auto_free_gib is 10,
+    /// "0: off"; disk.apply is false, never the consent to remove files), and
+    /// a key with no single default comes in as a comment. CONTROL: a key with
+    /// a Settings row still gets the row's default.
+    #[test]
+    fn an_absent_key_is_added_at_its_default_or_commented_out() {
+        let source = "agents_auto_prime = false\n[update]\nenabled = false\n";
+        let apply = |key: &str| {
+            let (edit, added_as) = absent_key_edit(source, key).expect("an edit");
+            let mut text = source.to_string();
+            text.replace_range(edit.replacement.clone(), &edit.insertion);
+            (text, added_as)
+        };
+        let (text, added_as) = apply("disk.auto_free_gib");
+        assert_eq!(added_as, AbsentKeyAdded::AtDefault, "{text}");
+        let parsed: aterm_toml::Value = aterm_toml::from_str(&text).unwrap();
+        assert_eq!(
+            parsed["disk"]["auto_free_gib"].as_integer(),
+            i64::try_from(aterm_agent::harness::disk::Config::default().auto_free_gib).ok(),
+            "{text}"
+        );
+        let (text, added_as) = apply("disk.apply");
+        assert_eq!(added_as, AbsentKeyAdded::AtDefault, "{text}");
+        let parsed: aterm_toml::Value = aterm_toml::from_str(&text).unwrap();
+        assert_eq!(parsed["disk"]["apply"].as_bool(), Some(false), "{text}");
+        // A text's default is its text, never the empty example the harness
+        // refuses ("expected a non-empty text").
+        let (text, added_as) = apply("harness.continue_text");
+        assert_eq!(added_as, AbsentKeyAdded::AtDefault, "{text}");
+        let parsed: aterm_toml::Value = aterm_toml::from_str(&text).unwrap();
+        assert_eq!(
+            parsed["harness"]["continue_text"].as_str(),
+            Some(
+                aterm_agent::supervise::SupervisorConfig::default()
+                    .continue_text
+                    .as_str()
+            ),
+            "{text}"
+        );
+        let (text, added_as) = apply(crate::prefs::EDIT_GPU);
+        assert_eq!(added_as, AbsentKeyAdded::AtDefault, "{text}");
+        let parsed: aterm_toml::Value = aterm_toml::from_str(&text).unwrap();
+        assert_eq!(
+            parsed[crate::prefs::EDIT_GPU].as_bool(),
+            Some(true),
+            "{text}"
+        );
+        // Every key only aterm.toml holds: at its documented default, or
+        // commented out; the file still parses either way.
+        for entry in crate::native_config_language::config_schema() {
+            if crate::native_settings::settings_default_raw(entry.key).is_some() {
+                continue;
+            }
+            let Some((edit, added_as)) = absent_key_edit(source, entry.key) else {
+                continue;
+            };
+            let mut text = source.to_string();
+            text.replace_range(edit.replacement.clone(), &edit.insertion);
+            if let Err(error) = aterm_toml::from_str::<aterm_toml::Value>(&text) {
+                panic!("{}: {error}\n{text}", entry.key);
+            }
+            match added_as {
+                AbsentKeyAdded::Commented => assert!(
+                    crate::native_config_language::config_key_source_range(&text, entry.key)
+                        .is_none(),
+                    "{}: commented out\n{text}",
+                    entry.key
+                ),
+                // The value written is the documented default, as TOML
+                // reads it back.
+                AbsentKeyAdded::AtDefault => {
+                    let literal =
+                        crate::native_config_language::config_key_default_literal(entry.key)
+                            .unwrap_or_else(|| panic!("{}: a documented default", entry.key));
+                    let written =
+                        crate::native_config_language::config_key_source_range(&text, entry.key)
+                            .map(|range| text[range].to_string());
+                    assert_eq!(
+                        written.as_deref(),
+                        Some(literal.as_str()),
+                        "{}\n{text}",
+                        entry.key
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -6818,6 +7199,340 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    /// AN UNDO BACK TO THE BYTES ON DISK IS CLEAN: the document's checkpoint
+    /// moves to it, so Save is quiet, the editor and the tab read clean, a
+    /// close is ready with no save, and the file is not written. NEGATIVE
+    /// CONTROLS: an undo that leaves other text stays dirty, and so does one
+    /// made while a save of other bytes is still in flight, which then lands
+    /// those bytes and leaves the buffer dirty against them.
+    #[test]
+    fn an_undo_back_to_the_saved_text_leaves_the_document_clean() {
+        let dir = std::env::temp_dir().join(format!("aterm-app-undo-clean-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("undo.txt");
+        fs::write(&path, "abc").unwrap();
+        let mtime = || fs::metadata(&path).unwrap().modified().unwrap();
+        let before = mtime();
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.open_document_tab(AppKind::Editor, &file_uri(&path))
+            .unwrap();
+        let (instance, view) = app.active_native_view(wid).unwrap();
+        let document = app.native_runtime.document_id(instance).unwrap();
+        let enabled = |app: &App, action: &str| {
+            app.native_runtime
+                .commands(instance, view)
+                .unwrap()
+                .into_iter()
+                .find(|command| command.id.as_str() == action)
+                .expect("editor command")
+                .enabled
+        };
+        let editor_dirty = |app: &App| {
+            let Some(NativeApp::Editor(editor)) = app.native_runtime.app(instance) else {
+                panic!("editor app");
+            };
+            editor.dirty
+        };
+        let type_text = |app: &mut App, text: &str| {
+            app.dispatch_native_event(
+                wid,
+                AppEvent::TextInput(TextInputEvent::Commit(text.to_string())),
+            )
+            .unwrap();
+        };
+        let undo = |app: &mut App| {
+            app.dispatch_native_event(
+                wid,
+                AppEvent::Action(crate::native_app::ActionInvocation {
+                    id: crate::native_ui::ActionId::new("editor/undo"),
+                    value: None,
+                }),
+            )
+            .unwrap();
+        };
+
+        type_text(&mut app, "x");
+        assert_eq!(app.document_store.dirty(document), Some(true));
+        assert!(enabled(&app, "editor/save") && editor_dirty(&app));
+        undo(&mut app);
+        assert_eq!(
+            app.document_store.snapshot(document).unwrap().text.as_ref(),
+            "abc"
+        );
+        assert_eq!(app.document_store.dirty(document), Some(false));
+        assert!(!enabled(&app, "editor/save"), "Save is quiet");
+        assert!(!editor_dirty(&app), "the editor reads clean");
+        let Some(AppViewState::Editor(state)) = app.native_runtime.view_state(view) else {
+            panic!("editor view");
+        };
+        assert_eq!(state.status.as_deref(), Some("No unsaved changes"));
+        let views = [crate::document_store::DocumentViewId(view.get())];
+        assert!(matches!(
+            app.document_store.prepare_close(document, &views),
+            Ok(crate::document_store::DocumentCloseReadiness::Ready { .. })
+        ));
+        app.document_store.abort_close(document).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "abc");
+        assert_eq!(mtime(), before, "nothing was written");
+
+        // An undo that leaves other text than the file's is still a change.
+        type_text(&mut app, "x");
+        type_text(&mut app, "y");
+        undo(&mut app);
+        assert_ne!(
+            app.document_store.snapshot(document).unwrap().text.as_ref(),
+            "abc"
+        );
+        assert_eq!(app.document_store.dirty(document), Some(true));
+        undo(&mut app);
+        assert_eq!(
+            app.document_store.snapshot(document).unwrap().text.as_ref(),
+            "abc"
+        );
+        assert_eq!(app.document_store.dirty(document), Some(false));
+
+        // A save of other bytes still in flight: the undo is not clean yet,
+        // and once those bytes land it is a change against them.
+        type_text(&mut app, "z");
+        let saving = begin_inflight_save_for_test(&mut app, document);
+        undo(&mut app);
+        assert_eq!(
+            app.document_store.snapshot(document).unwrap().text.as_ref(),
+            "abc"
+        );
+        assert_eq!(app.document_store.dirty(document), Some(true));
+        finish_inflight_save_for_test(&mut app, document, view, saving);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "zabc");
+        assert_eq!(app.document_store.dirty(document), Some(true));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_content_fingerprint_collision_does_not_mark_an_edit_saved() {
+        // This measured equal-length FNV collision also exercises the legacy
+        // journal-name migration. A fingerprint is not byte equality.
+        const SAVED: &str = "file:///Users//alice/Downloads/7ykhvtpwaxxug.txt";
+        const EDITED: &str = "file:///Users//alice/Downloads/vwelffjwxnsmb.txt";
+        assert_ne!(SAVED, EDITED);
+        assert_eq!(SAVED.len(), EDITED.len());
+        assert_eq!(
+            crate::native_document_io::ContentFingerprint::of(SAVED.as_bytes()),
+            crate::native_document_io::ContentFingerprint::of(EDITED.as_bytes())
+        );
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let path = scratch.path().join("collision.txt");
+        fs::write(&path, SAVED).unwrap();
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.open_document_tab(AppKind::Editor, &file_uri(&path))
+            .unwrap();
+        let (instance, view) = app.active_native_view(wid).unwrap();
+        let document = app.native_runtime.document_id(instance).unwrap();
+        let before = app.document_store.snapshot(document).unwrap();
+        let outcome = app.document_store.transact(
+            document,
+            before.seq,
+            vec![crate::document_store::TextEdit {
+                range: 0..before.text.len(),
+                insert: EDITED.into(),
+            }],
+        );
+        assert!(matches!(
+            outcome,
+            crate::document_store::DocumentTxnOutcome::Committed { .. }
+        ));
+        app.publish_editor_commit(document, view);
+        assert_eq!(
+            app.document_store.dirty(document),
+            Some(true),
+            "different bytes must retain their unsaved checkpoint"
+        );
+        assert!(
+            app.native_runtime
+                .commands(instance, view)
+                .unwrap()
+                .iter()
+                .any(|command| command.id.as_str() == "editor/save" && command.enabled)
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), SAVED);
+    }
+
+    #[test]
+    fn a_saved_image_replaces_the_exact_undo_clean_baseline() {
+        const BEFORE: &str = "file:///Users//alice/Downloads/7ykhvtpwaxxug.txt";
+        const SAVED: &str = "file:///Users//alice/Downloads/vwelffjwxnsmb.txt";
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let path = scratch.path().join("saved-collision.txt");
+        fs::write(&path, BEFORE).unwrap();
+        let mut app = App::headless_for_test();
+        app.open_document_tab(AppKind::Editor, &file_uri(&path))
+            .unwrap();
+        let (instance, view) = app.active_native_view(WindowId(0)).unwrap();
+        let document = app.native_runtime.document_id(instance).unwrap();
+        let replace = |app: &mut App, text: &str| {
+            let head = app.document_store.snapshot(document).unwrap();
+            assert!(matches!(
+                app.document_store.transact(
+                    document,
+                    head.seq,
+                    vec![crate::document_store::TextEdit {
+                        range: 0..head.text.len(),
+                        insert: text.into(),
+                    }]
+                ),
+                crate::document_store::DocumentTxnOutcome::Committed { .. }
+            ));
+        };
+        replace(&mut app, SAVED);
+        // Real editor commits publish their new journal head before a save can
+        // complete. A direct store transaction alone has not done that yet.
+        app.publish_editor_commit(document, view);
+        let saving = begin_inflight_save_for_test(&mut app, document);
+        finish_inflight_save_for_test(&mut app, document, view, saving);
+        assert_eq!(fs::read_to_string(&path).unwrap(), SAVED);
+        assert_eq!(app.document_store.dirty(document), Some(false));
+        replace(&mut app, BEFORE);
+        app.publish_editor_commit(document, view);
+        assert_eq!(
+            app.document_store.dirty(document),
+            Some(true),
+            "an older colliding image is not the newly saved file"
+        );
+        replace(&mut app, SAVED);
+        app.publish_editor_commit(document, view);
+        assert_eq!(
+            app.document_store.dirty(document),
+            Some(false),
+            "the exact newly saved image is clean"
+        );
+    }
+
+    #[test]
+    fn stable_observations_do_not_treat_colliding_text_as_identical_bytes() {
+        const BEFORE: &str = "file:///Users//alice/Downloads/7ykhvtpwaxxug.txt";
+        const OBSERVED: &str = "file:///Users//alice/Downloads/vwelffjwxnsmb.txt";
+        for dirty in [false, true] {
+            let scratch = aterm_tempfile::tempdir().unwrap();
+            let path = scratch.path().join("observed-collision.txt");
+            fs::write(&path, BEFORE).unwrap();
+            let mut app = App::headless_for_test();
+            app.open_document_tab(AppKind::Editor, &file_uri(&path))
+                .unwrap();
+            let (instance, view) = app.active_native_view(WindowId(0)).unwrap();
+            let document = app.native_runtime.document_id(instance).unwrap();
+            if dirty {
+                let head = app.document_store.snapshot(document).unwrap();
+                assert!(matches!(
+                    app.document_store.transact(
+                        document,
+                        head.seq,
+                        vec![crate::document_store::TextEdit {
+                            range: 0..head.text.len(),
+                            insert: "private draft".into(),
+                        }]
+                    ),
+                    crate::document_store::DocumentTxnOutcome::Committed { .. }
+                ));
+                app.publish_editor_commit(document, view);
+            }
+            fs::write(&path, OBSERVED).unwrap();
+            let reduction = app.refresh_native_document(document).unwrap();
+            if dirty {
+                assert!(
+                    matches!(
+                        reduction,
+                        crate::native_document_io::FileWatchReduction::ConflictDirty { .. }
+                    ),
+                    "different observed bytes must preserve the draft conflict: {reduction:?}"
+                );
+                assert_eq!(
+                    app.document_store.snapshot(document).unwrap().text.as_ref(),
+                    "private draft"
+                );
+                assert!(app.native_documents.disk_conflicts.contains(&document));
+            } else {
+                assert!(
+                    matches!(
+                        reduction,
+                        crate::native_document_io::FileWatchReduction::ReloadClean { .. }
+                    ),
+                    "different observed bytes must reload the clean document: {reduction:?}"
+                );
+                let head = app.document_store.snapshot(document).unwrap();
+                assert_eq!(head.text.as_ref(), OBSERVED);
+                assert_eq!(app.document_store.dirty(document), Some(false));
+                assert!(matches!(
+                    app.document_store.transact(
+                        document,
+                        head.seq,
+                        vec![crate::document_store::TextEdit {
+                            range: 0..head.text.len(),
+                            insert: BEFORE.into(),
+                        }]
+                    ),
+                    crate::document_store::DocumentTxnOutcome::Committed { .. }
+                ));
+                app.publish_editor_commit(document, view);
+                assert_eq!(
+                    app.document_store.dirty(document),
+                    Some(true),
+                    "the pre-refresh image must not remain the exact clean baseline"
+                );
+            }
+            assert_eq!(fs::read_to_string(&path).unwrap(), OBSERVED);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fresh_colliding_read_after_a_save_rebind_keeps_the_draft_conflict() {
+        const BEFORE: &str = "file:///Users//alice/Downloads/7ykhvtpwaxxug.txt";
+        const COLLISION: &str = "file:///Users//alice/Downloads/vwelffjwxnsmb.txt";
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let path = scratch.path().join("rebound-collision.txt");
+        let replacement = scratch.path().join("replacement.txt");
+        fs::write(&path, BEFORE).unwrap();
+        let mut app = App::headless_for_test();
+        app.open_document_tab(AppKind::Editor, &file_uri(&path))
+            .unwrap();
+        let (instance, view) = app.active_native_view(WindowId(0)).unwrap();
+        let document = app.native_runtime.document_id(instance).unwrap();
+        let head = app.document_store.snapshot(document).unwrap();
+        assert!(matches!(
+            app.document_store.transact(
+                document,
+                head.seq,
+                vec![crate::document_store::TextEdit {
+                    range: 0..head.text.len(),
+                    insert: "private draft".into(),
+                }]
+            ),
+            crate::document_store::DocumentTxnOutcome::Committed { .. }
+        ));
+        app.publish_editor_commit(document, view);
+        fs::write(&replacement, BEFORE).unwrap();
+        fs::rename(&replacement, &path).unwrap();
+        let save = app.save_document_checkpoint(document, view).unwrap_err();
+        assert!(save.contains("Disk version refreshed"), "{save}");
+        assert!(!app.native_documents.disk_conflicts.contains(&document));
+
+        fs::write(&path, COLLISION).unwrap();
+        let reduction = app.refresh_native_document(document).unwrap();
+        assert!(matches!(
+            reduction,
+            crate::native_document_io::FileWatchReduction::ConflictDirty { .. }
+        ));
+        assert!(app.native_documents.disk_conflicts.contains(&document));
+        assert_eq!(app.document_store.dirty(document), Some(true));
+        assert_eq!(
+            app.document_store.snapshot(document).unwrap().text.as_ref(),
+            "private draft"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), COLLISION);
+    }
+
     #[test]
     fn markdown_edit_action_completes_its_reader_status_after_editor_focus() {
         let dir =
@@ -7048,15 +7763,9 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    /// The window-close document plan is captured once, when the barrier arms,
-    /// and the window deliberately stays interactive while its checkpoint runs.
-    /// A document opened in that same window afterwards is therefore absent from
-    /// the frozen plan, so nothing proves its durability before
-    /// `escalate_document_shutdown` hands the window to `close_window_logical`.
-    /// That teardown drops the tab tree and the `WindowState` regardless, and the
-    /// only refusal it can raise — `remove_view_link` returning `None` — is
-    /// discarded, leaving the unsaved document's view in `view_store` with no tab
-    /// and no window to reach it from.
+    /// A document opened in a window after its close barrier armed is absent
+    /// from the frozen plan; the ready path must re-plan, or the teardown strands
+    /// its dirty view in `view_store` with no tab or window.
     #[test]
     fn window_close_plan_frozen_before_a_later_document_cannot_orphan_its_dirty_view() {
         let dir = std::env::temp_dir().join(format!(
@@ -7089,7 +7798,7 @@ mod tests {
                 .unwrap()
         );
 
-        // The still-interactive window opens a SECOND document and dirties it.
+        // The still-interactive window opens a second document and dirties it.
         app.open_document_tab(AppKind::Editor, &file_uri(&late))
             .unwrap();
         let (late_instance, late_view) = app.active_native_view(wid).unwrap();
@@ -7124,14 +7833,10 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    /// The armed window-close plan is reachable from two boundaries, and both
-    /// commit it. `take_ready_document_shutdowns` re-plans against the window's
-    /// current leaves before committing; this one — the close GESTURE repeated
-    /// while the first checkpoint is still running, which is what a user does
-    /// when the window does not close — reuses the stored plan verbatim
-    /// (`pending_window_closes` is only filled when absent). A ready verdict here
-    /// authorizes `close_window` to run `close_window_logical` immediately, so it
-    /// must not be granted while a document opened after the arming is dirty.
+    /// A repeated close gesture (what a user does when the window does not
+    /// close) must not report ready while a document opened after the arming is
+    /// dirty: a ready verdict lets `close_window` run `close_window_logical` at
+    /// once.
     #[test]
     fn repeated_window_close_gesture_cannot_commit_a_stale_document_plan() {
         let dir = std::env::temp_dir().join(format!(
@@ -7161,7 +7866,7 @@ mod tests {
                 .unwrap()
         );
 
-        // The still-interactive window opens a SECOND document and dirties it.
+        // The still-interactive window opens a second document and dirties it.
         app.open_document_tab(AppKind::Editor, &file_uri(&late))
             .unwrap();
         let (late_instance, late_view) = app.active_native_view(wid).unwrap();
@@ -7173,12 +7878,9 @@ mod tests {
         .unwrap();
         assert_eq!(app.document_store.dirty(late_document), Some(true));
 
-        // Second close gesture, this one authorized to save. Readiness alone is
-        // not the property under test: because the plan is re-derived, this
-        // gesture legitimately checkpoints the late document alongside the
-        // planned one and may clear the window. What must never happen is the
-        // window reporting ready while that document is still unsaved, or a
-        // teardown that leaves its view behind with no tab to reach it from.
+        // Second gesture, authorized to save. It may checkpoint the late
+        // document too and clear the window; it must never report ready while
+        // that document is unsaved, or leave its view without a tab.
         let ready = app
             .prepare_window_document_shutdown_inner(wid, true)
             .unwrap();
@@ -7208,15 +7910,8 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    /// The Quit twin of `window_close_plan_frozen_before_a_later_document_cannot_orphan_its_dirty_view`.
-    /// The Quit barrier arms on a dirty document and the app stays interactive
-    /// while its save runs, so a SECOND document is opened and edited
-    /// meanwhile. When the planned save landed, the plan frozen at arming
-    /// granted the exit with the late document unsaved on disk — and, its
-    /// journal append still queued behind that save on the one document
-    /// worker, in neither the file nor the draft journal once the process
-    /// exited. The grant re-plans against the store's current documents: it
-    /// is withheld until the late document is saved too.
+    /// The Quit twin of the window-close frozen-plan test: a document opened and
+    /// edited while the Quit's save runs withholds the exit until it is saved too.
     #[test]
     fn quit_plan_frozen_before_a_later_document_cannot_exit_over_its_edits() {
         let dir =
@@ -7243,7 +7938,7 @@ mod tests {
         // Quit: the one dirty document arms the barrier.
         assert!(!app.prepare_quit_document_shutdown_inner(false).unwrap());
 
-        // The still-interactive app opens a SECOND document and dirties it.
+        // The still-interactive app opens a second document and dirties it.
         app.open_document_tab(AppKind::Editor, &file_uri(&late))
             .unwrap();
         let (late_instance, late_view) = app.active_native_view(wid).unwrap();
@@ -7284,10 +7979,9 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    /// The same late document, reached through the Quit GESTURE repeated while
-    /// the first save runs — what a person does when the app does not quit. A
-    /// gesture that reused the plan frozen at arming checkpointed only the
-    /// planned document and answered ready, an exit over the late one's edits.
+    /// The same late document, reached by repeating the Quit gesture while the
+    /// first save runs: the repeat re-plans and cannot answer ready over the late
+    /// document's edits.
     #[test]
     fn repeated_quit_gesture_cannot_exit_over_a_later_document() {
         let dir =
@@ -7334,13 +8028,11 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    /// The same late document, reached through a Quit that was READY when it
-    /// deferred behind an update handoff (`DeferredHandoffTeardown::CleanQuitReady`):
-    /// the app stays interactive while the handoff rolls back, and the replay
-    /// asked only the native barrier, which the editor answers `Ready` whatever
-    /// its document holds, so it exited over the late document's edits. The
-    /// replay asks the document barrier too: the Quit stays pending, saving,
-    /// and goes once the late document is saved.
+    /// The same late document, reached through a Quit that was ready when it
+    /// deferred behind an update handoff (`DeferredHandoffTeardown::CleanQuitReady`).
+    /// The replay asks the document barrier, not only the native one (where the
+    /// editor answers `Ready` whatever it holds), so the Quit stays pending and
+    /// goes once the late document is saved.
     #[cfg(unix)]
     #[test]
     fn a_quit_ready_behind_an_update_cannot_exit_over_a_document_edited_meanwhile() {
@@ -8142,8 +8834,7 @@ mod tests {
 
         {
             let mut crashed = App::headless_for_test();
-            crashed.native_documents.journals =
-                Some(DocumentJournalStore::for_test(journal_root.clone()).unwrap());
+            crashed.native_documents.journals = JournalSlot::for_test(journal_root.clone());
             crashed.open_document_tab(AppKind::Editor, &uri).unwrap();
             crashed
                 .dispatch_native_event(
@@ -8167,8 +8858,7 @@ mod tests {
         }
 
         let mut reopened = App::headless_for_test();
-        reopened.native_documents.journals =
-            Some(DocumentJournalStore::for_test(journal_root.clone()).unwrap());
+        reopened.native_documents.journals = JournalSlot::for_test(journal_root.clone());
         reopened.open_document_tab(AppKind::Editor, &uri).unwrap();
         let (instance, _) = reopened.active_native_view(WindowId(0)).unwrap();
         let document = reopened.native_runtime.document_id(instance).unwrap();
@@ -8210,8 +8900,7 @@ mod tests {
 
         {
             let mut crashed = App::headless_for_test();
-            crashed.native_documents.journals =
-                Some(DocumentJournalStore::for_test(journal_root.clone()).unwrap());
+            crashed.native_documents.journals = JournalSlot::for_test(journal_root.clone());
             crashed.open_document_tab(AppKind::Editor, &uri).unwrap();
             crashed
                 .dispatch_native_event(
@@ -8223,8 +8912,7 @@ mod tests {
         fs::write(&path, "external\n").unwrap();
 
         let mut reopened = App::headless_for_test();
-        reopened.native_documents.journals =
-            Some(DocumentJournalStore::for_test(journal_root.clone()).unwrap());
+        reopened.native_documents.journals = JournalSlot::for_test(journal_root.clone());
         reopened.open_document_tab(AppKind::Editor, &uri).unwrap();
         let (instance, _) = reopened.active_native_view(WindowId(0)).unwrap();
         let document = reopened.native_runtime.document_id(instance).unwrap();

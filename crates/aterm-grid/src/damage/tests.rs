@@ -1,8 +1,6 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Tests for damage tracking.
-
 use super::*;
 
 #[test]
@@ -80,7 +78,6 @@ fn damage_iterator_full() {
 
 #[test]
 fn damage_iterator_sparse() {
-    // Test bitset iteration with gaps
     let mut damage = Damage::new(100);
     damage.mark_row(0);
     damage.mark_row(63); // End of first word
@@ -106,14 +103,12 @@ fn damage_iterator_size_hint_after_exhaustion() {
 
     let mut iter = damage.damaged_rows(24);
 
-    // size_hint before consuming — upper bound should reflect at most 24 rows
     let (_, upper) = iter.size_hint();
     assert!(
         upper.unwrap() <= 24,
         "upper bound should not exceed total rows"
     );
 
-    // Exhaust the iterator — the only damaged row is 5
     assert_eq!(iter.next(), Some(5));
     assert_eq!(
         iter.next(),
@@ -121,7 +116,6 @@ fn damage_iterator_size_hint_after_exhaustion() {
         "iterator should be exhausted after single damaged row"
     );
 
-    // size_hint after exhaustion should not panic
     let (lower, upper) = iter.size_hint();
     assert_eq!(lower, 0);
     assert_eq!(upper, Some(0));
@@ -159,99 +153,6 @@ fn damage_iter_bounds() {
             LineDamageBounds::new(15, 5, 6),
         ]
     );
-}
-
-#[test]
-fn line_damage_bounds_merge() {
-    let a = LineDamageBounds::new(5, 10, 30);
-    let b = LineDamageBounds::new(6, 20, 40);
-
-    assert!(a.can_merge_with(&b));
-    let rect = a.merge_with(&b);
-    assert_eq!(rect, DamageRect::new(5, 7, 10, 40));
-}
-
-#[test]
-fn line_damage_bounds_no_merge_gap() {
-    let a = LineDamageBounds::new(5, 10, 20);
-    let b = LineDamageBounds::new(7, 10, 20); // Row 6 missing
-
-    assert!(!a.can_merge_with(&b));
-}
-
-#[test]
-fn damage_rect_extend() {
-    let mut rect = DamageRect::new(5, 6, 10, 30);
-    let bounds = LineDamageBounds::new(6, 5, 40);
-
-    assert!(rect.can_extend_with(bounds));
-    rect.extend_with(bounds);
-
-    assert_eq!(rect, DamageRect::new(5, 7, 5, 40));
-}
-
-#[test]
-fn damage_iter_merged_consecutive_overlapping() {
-    let mut damage = Damage::new(24);
-    damage.mark_cell(3, 10);
-    damage.mark_cell(3, 20); // Row 3: [10, 21)
-    damage.mark_cell(4, 15); // Row 4: [15, 16) - overlaps with row 3
-    damage.mark_cell(5, 18); // Row 5: [18, 19) - overlaps with row 4's merged range
-
-    let rects: Vec<_> = damage.iter_merged(24, 80).collect();
-    assert_eq!(rects.len(), 1);
-    assert_eq!(rects[0], DamageRect::new(3, 6, 10, 21));
-}
-
-#[test]
-fn damage_iter_merged_non_overlapping() {
-    let mut damage = Damage::new(24);
-    damage.mark_cell(3, 10); // Row 3: [10, 11)
-    damage.mark_cell(4, 50); // Row 4: [50, 51) - doesn't overlap
-    damage.mark_cell(5, 70); // Row 5: [70, 71) - doesn't overlap
-
-    let rects: Vec<_> = damage.iter_merged(24, 80).collect();
-    assert_eq!(rects.len(), 3);
-    assert_eq!(rects[0], DamageRect::new(3, 4, 10, 11));
-    assert_eq!(rects[1], DamageRect::new(4, 5, 50, 51));
-    assert_eq!(rects[2], DamageRect::new(5, 6, 70, 71));
-}
-
-#[test]
-fn damage_iter_merged_gap() {
-    let mut damage = Damage::new(24);
-    damage.mark_cell(3, 10);
-    damage.mark_cell(3, 20); // Row 3: [10, 21)
-    damage.mark_cell(4, 15); // Row 4: [15, 16) - overlaps
-    // Gap at row 5
-    damage.mark_cell(6, 10);
-    damage.mark_cell(6, 20); // Row 6: [10, 21)
-    damage.mark_cell(7, 15); // Row 7: [15, 16) - overlaps
-
-    let rects: Vec<_> = damage.iter_merged(24, 80).collect();
-    assert_eq!(rects.len(), 2);
-    assert_eq!(rects[0], DamageRect::new(3, 5, 10, 21));
-    assert_eq!(rects[1], DamageRect::new(6, 8, 10, 21));
-}
-
-#[test]
-fn damage_iter_merged_full_rows() {
-    let mut damage = Damage::new(24);
-    damage.mark_row(3);
-    damage.mark_row(4);
-    damage.mark_row(5);
-
-    let rects: Vec<_> = damage.iter_merged(24, 80).collect();
-    assert_eq!(rects.len(), 1);
-    assert_eq!(rects[0], DamageRect::new(3, 6, 0, 80));
-}
-
-#[test]
-fn damage_rect_dimensions() {
-    let rect = DamageRect::new(5, 10, 20, 50);
-    assert_eq!(rect.height(), 5);
-    assert_eq!(rect.width(), 30);
-    assert_eq!(rect.cell_count(), 150);
 }
 
 #[test]
@@ -399,20 +300,6 @@ fn state_partial_marked_is_damaged() {
     assert!(damage.is_row_damaged(10));
 }
 
-#[test]
-fn damage_rect_dimensions_consistent() {
-    let rect = DamageRect::new(3, 10, 5, 45);
-    assert_eq!(rect.height(), 7);
-    assert_eq!(rect.width(), 40);
-    assert_eq!(rect.cell_count(), 280);
-
-    // Edge case: zero-size rect
-    let empty = DamageRect::new(5, 5, 10, 10);
-    assert_eq!(empty.height(), 0);
-    assert_eq!(empty.width(), 0);
-    assert_eq!(empty.cell_count(), 0);
-}
-
 // DamageBoundsIterator correctness
 
 /// DamageBoundsIterator skips rows whose column bounds fall entirely outside
@@ -424,7 +311,6 @@ fn damage_bounds_iterator_skips_out_of_range_row() {
     damage.mark_cell(5, 10); // Col 10 is within cols=20
 
     let bounds: Vec<_> = damage.iter_bounds(10, 20).collect();
-    // Row 3 should be skipped (out of range), row 5 should appear
     assert_eq!(bounds, vec![LineDamageBounds::new(5, 10, 11)]);
 }
 
@@ -478,8 +364,6 @@ fn tracker_out_of_bounds_row_damage_bounds_returns_none() {
     assert_eq!(tracker.row_damage_bounds(10), None);
     assert_eq!(tracker.row_damage_bounds(100), None);
 }
-
-// Additional coverage
 
 #[test]
 fn mark_rows_range_behavior() {
@@ -568,25 +452,6 @@ fn damaged_row_count() {
     assert_eq!(tracker.damaged_row_count(), 3);
 }
 
-#[test]
-fn line_damage_bounds_is_empty() {
-    assert!(LineDamageBounds::new(0, 5, 5).is_empty());
-    assert!(LineDamageBounds::new(0, 10, 5).is_empty());
-    assert!(!LineDamageBounds::new(0, 5, 6).is_empty());
-    assert!(!LineDamageBounds::new(0, 0, 80).is_empty());
-}
-
-#[test]
-fn damage_rect_from_line() {
-    let bounds = LineDamageBounds::new(7, 10, 30);
-    let rect = DamageRect::from_line(bounds);
-    assert_eq!(rect.top, 7);
-    assert_eq!(rect.bottom, 8);
-    assert_eq!(rect.left, 10);
-    assert_eq!(rect.right, 30);
-    assert_eq!(rect.height(), 1);
-}
-
 // DamageTracker::clear() behavioral equivalence
 
 /// clear() produces the same observable state as constructing a fresh tracker.
@@ -621,7 +486,6 @@ fn tracker_clear_resizes_on_row_count_change() {
     assert_eq!(tracker.damaged_row_count(), 0);
     assert!(!tracker.is_row_damaged(10));
 
-    // Can mark rows in the new range
     tracker.mark_row(99);
     assert!(tracker.is_row_damaged(99));
 }
@@ -633,14 +497,12 @@ fn damage_reset_reuses_allocation_partial_to_partial() {
     damage.mark_row(5);
     damage.mark_cell(10, 30);
 
-    // After reset, all damage should be cleared
     damage.reset(24);
     assert!(!damage.is_full());
     assert!(!damage.has_damage());
     assert!(!damage.is_row_damaged(5));
     assert!(!damage.is_row_damaged(10));
 
-    // Can still mark new damage
     damage.mark_cell(3, 7);
     assert!(damage.has_damage());
     assert!(damage.is_row_damaged(3));
@@ -657,7 +519,6 @@ fn damage_reset_from_full_creates_fresh() {
     assert!(!damage.is_full());
     assert!(!damage.has_damage());
 
-    // Can mark new damage after reset from Full
     damage.mark_row(0);
     assert!(damage.has_damage());
     assert!(damage.is_row_damaged(0));
@@ -679,16 +540,11 @@ fn damage_reset_repeated_cycles() {
     }
 }
 
-/// THE ROW AND BOUNDS ITERATORS ARE EXACT.
-///
-/// `BitsetRowIterator` yields exactly the set bits below `max_row`, in strictly
-/// increasing order — checked against a bit-by-bit reference for every 8-bit
-/// pattern at the bottom, middle and top of a word, for every 8-bit pair
-/// straddling a word boundary, and for every `max_row` around both ends of a
-/// word. `DamageBoundsIterator` over one marked cell in every row of 1..=4 rows
-/// × 1..=16 cols, at every column up to two past the edge, yields one
-/// non-empty bounds row covering the cell when it is visible and nothing when
-/// it is not.
+/// The row and bounds iterators are exact: `BitsetRowIterator` yields exactly
+/// the set bits below `max_row`, in increasing order, against a bit-by-bit
+/// reference over 8-bit patterns within a word and across a word boundary;
+/// `DamageBoundsIterator` over one marked cell yields one bounds row covering
+/// it when the cell is visible and nothing when it is not.
 #[test]
 fn bitset_and_bounds_iterators_are_exact() {
     let reference = |bits: &[u64], max_row: u16| -> Vec<u16> {

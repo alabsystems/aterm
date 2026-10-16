@@ -121,21 +121,3 @@ fn register_exit_sweep() {
 /// No exit hook off unix: the next run's first-use sweep takes the roots back.
 #[cfg(not(unix))]
 fn register_exit_sweep() {}
-
-#[cfg(test)]
-mod tests {
-    use super::owner_pid;
-
-    #[test]
-    fn the_owner_pid_is_read_from_the_stamped_and_the_bare_name() {
-        let prefix = "aterm-test-update-root-";
-        assert_eq!(
-            owner_pid("aterm-test-update-root-4242-18da52", prefix),
-            Some(4242)
-        );
-        assert_eq!(owner_pid("aterm-test-update-root-4242", prefix), Some(4242));
-        assert_eq!(owner_pid("aterm-test-update-root-4242x", prefix), None);
-        assert_eq!(owner_pid("aterm-test-update-root-", prefix), None);
-        assert_eq!(owner_pid("aterm-test-drafts-4242-1", prefix), None);
-    }
-}

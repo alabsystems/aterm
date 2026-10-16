@@ -1,26 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// W4 — CURSOR INK INTEGRITY (partition / no-bleed). Two-tier proof:
-//
-//  * Tier-1 (this file, plain cargo): the PIXEL-LEVEL invariant on the real
-//    renderer — "cursor rendering writes ONLY within the cursor rect; the
-//    complement of the rect is byte-identical to the no-cursor frame" — swept
-//    over every cursor column × style on a row mixing a ligature ('=>'), a
-//    wide (CJK) lead + continuation and plain cells; plus the two audit pins
-//    (cursor on the '>' of '=>' leaves the '=' cell untouched; cursor on a
-//    CJK lead inverts BOTH cells). The pure clip/slicing seams (`clip_span`,
-//    `cursor_cutout_cols`, `glyph_quad`'s x-clip) are proven by exhaustive
-//    lattice enumeration with non-vacuity + pre-fix negative controls.
-//  * Tier-0: the derived ty model `cursor_cutout_clip_model`
-//    (crates/aterm-spec/src/derive.rs) carries the SAME tiling + no-bleed
-//    invariant abstractly; `derived_ring_ty.rs` has the real `ty` prove it at
-//    Buggy=0 and REQUIRES a counterexample at Buggy=1 (the pre-W4 unclipped
-//    cut-out that repainted a ligature's lead cells in bg).
-//
-// GPU: the identical geometry drives the quad slicing (`glyph_quad` with
-// `Scale::clip_x0/clip_x1`); crates/aterm-gpu/tests/ligature_parity.rs binds
-// the GPU frames to these CPU frames pixel-for-pixel (<=8 LSB blend tolerance).
+// Cursor ink integrity: cursor rendering writes only within the cursor rect, and every
+// pixel outside it is byte-identical to the no-cursor frame. Swept over every column and
+// steady style on a row mixing a ligature, a wide lead and plain cells; the pure clip
+// seams (`clip_span`, `cursor_cutout_cols`, `glyph_quad`'s x-clip) are checked
+// exhaustively on small lattices. The ty model `cursor_cutout_clip_model` carries the same
+// invariant (aterm-spec's `derived_ring_ty.rs`); aterm-gpu's `ligature_parity.rs` binds the
+// GPU frames to these.
 
 use aterm_core::terminal::{CursorStyle, Terminal};
 use aterm_render::{
@@ -76,9 +63,9 @@ fn frame_with_cursor(r: &mut Renderer, col: Option<usize>) -> Frame {
     r.render_input(&term.cell_frame(ROWS, COLS))
 }
 
-/// The exact pixel rects the cursor paints for `style` at `col` — the SAME
-/// geometry the renderer uses: `for_each_cursor_rect` over the (block-widened on a
-/// wide lead) cursor width. `wide_lead` mirrors `draw_cursor`'s probe.
+/// The pixel rects the cursor paints for `style` at `col`, from the renderer's own
+/// geometry: `for_each_cursor_rect` over the cursor width (block-widened on a wide lead).
+/// `wide_lead` mirrors `draw_cursor`'s probe.
 fn cursor_rect_union(
     style: CursorStyle,
     col: usize,
@@ -99,22 +86,13 @@ fn in_rects(rects: &[[usize; 4]], x: usize, y: usize) -> bool {
         .any(|&[rx, ry, rw, rh]| x >= rx && x < rx + rw && y >= ry && y < ry + rh)
 }
 
-/// THE PARTITION / NO-BLEED INVARIANT, swept: for EVERY cursor column and every
-/// steady cursor style, each pixel OUTSIDE the cursor rect is byte-identical to
-/// the cursor-hidden frame. Pre-W4 this failed on three counts: a block cursor
-/// on the '>' of '=>' repainted the arrow's lead-cell ink in bg; a block cursor
-/// on a CJK lead erased the ideograph's right half; and the fill/cut-out pair
-/// mismatched on wide leads. Non-vacuity: at least one column must CHANGE
-/// pixels inside its rect (the cursor is really drawn).
+/// Partition / no-bleed, swept: for every cursor column and steady style, each pixel
+/// outside the cursor rect matches the cursor-hidden frame. Non-vacuity: some cursor
+/// changes a pixel inside its rect.
 ///
-/// `Bolt` is in the sweep and is the reason the word "every" is safe to write.
-/// It is the only style whose `for_each_cursor_rect` arm emits ONE strip PER PIXEL ROW
-/// with a per-row-varying x and width; every other arm emits 1 or 4
-/// axis-aligned rects. It also arrives via `set_cursor_style_override` rather
-/// than a DECSCUSR parameter, so it is invisible to anyone enumerating escape
-/// codes — it was omitted here until this sweep was audited. `CursorStyle` is
-/// `#[non_exhaustive]`, so nothing but this list forces the coverage: a NEW
-/// steady shape must be added here by hand.
+/// `Bolt` is the one style that emits a strip per pixel row with a varying x and width, and
+/// it is set only through `set_cursor_style_override`, never DECSCUSR. `CursorStyle` is
+/// `#[non_exhaustive]`, so a new steady shape must be added to this list by hand.
 #[test]
 fn cursor_touches_only_its_rect_all_columns_and_styles() {
     let mut r = renderer();
@@ -137,7 +115,7 @@ fn cursor_touches_only_its_rect_all_columns_and_styles() {
                 (hidden.width, hidden.height),
                 "cursor must not change frame dimensions"
             );
-            // The wide-lead probe mirrors draw_cursor: the NEXT cell is wide.
+            // The wide-lead probe mirrors draw_cursor: the next cell is wide.
             let mut term = Terminal::new(ROWS as u16, COLS as u16);
             term.process(TEXT);
             let input = term.cell_frame(ROWS, COLS);
@@ -168,11 +146,8 @@ fn cursor_touches_only_its_rect_all_columns_and_styles() {
     );
 }
 
-/// AUDIT PIN: a block cursor on the '>' of '=>' leaves the '=' cell
-/// byte-identical to the no-cursor frame — AND that cell genuinely carries the
-/// ligature's lead ink (non-bg pixels), so the assert is non-vacuous. Pre-W4
-/// the unclipped cut-out repainted the arrow's lead-cell ink in bg (invisible
-/// ink), which this pin catches.
+/// A block cursor on the '>' of '=>' leaves the '=' cell (which carries ligature ink)
+/// byte-identical to the no-cursor frame.
 #[test]
 fn block_on_ligature_tail_leaves_lead_cell_identical() {
     let mut r = renderer();
@@ -204,11 +179,8 @@ fn block_on_ligature_tail_leaves_lead_cell_identical() {
     );
 }
 
-/// Cursor on a ligature LEAD cell: the covering glyph's slice over the cursor
-/// cell is recoloured (cut out) while the rest of the arrow survives. Pre-W4
-/// the lead's empty placeholder produced NO cut-out, hiding the arrow's lead
-/// ink entirely under the fill. Assert the cursor cell shows BOTH the fill and
-/// recoloured ink, and (from the sweep invariant) the '>' cell is untouched.
+/// A block cursor on a ligature lead cell recolours the covering glyph's slice over that
+/// cell and leaves the '>' cell untouched.
 #[test]
 fn block_on_ligature_lead_recolors_covering_slice() {
     let mut r = renderer();
@@ -240,10 +212,8 @@ fn block_on_ligature_lead_recolors_covering_slice() {
     );
 }
 
-/// AUDIT PIN: a block cursor on a CJK (wide) lead inverts BOTH cells as one —
-/// the fill spans the glyph's 2-cell footprint — with no erasure anywhere.
-/// Pre-W4 the single-cell fill plus the full-glyph bg re-blit erased the
-/// ideograph's right half (bg-on-bg in the continuation cell, no cursor there).
+/// A block cursor on a wide lead fills both cells of the glyph and leaves its neighbours
+/// untouched.
 #[test]
 fn block_on_wide_lead_inverts_both_cells() {
     let mut r = renderer();
@@ -257,7 +227,7 @@ fn block_on_wide_lead_inverts_both_cells() {
         }
         out
     };
-    // BOTH cells of the wide glyph carry the cursor fill (the widened rect).
+    // Both cells of the wide glyph carry the cursor fill (the widened rect).
     assert!(
         band(&f, 5).contains(&CURSOR),
         "the wide LEAD cell must show the block cursor fill"
@@ -272,16 +242,12 @@ fn block_on_wide_lead_inverts_both_cells() {
     assert_eq!(band(&f, 7), band(&hidden, 7), "right neighbour untouched");
 }
 
-// ---------------------------------------------------------------------------
-// Pure-seam lattice proofs (always-on, no font needed).
-// ---------------------------------------------------------------------------
+// Pure-seam lattice proofs (no font needed).
 
-/// EXHAUSTIVE lattice proof of [`clip_span`]'s partition law (the Tier-1
-/// binding of the `CursorCutoutClip` ty model): for every glyph extent and
-/// window on the lattice, the three sub-window spans tile the extent EXACTLY —
-/// every covered x lands in exactly one span — and the middle span never exits
-/// the window (no-bleed). Includes the pre-fix NEGATIVE control (an unclipped
-/// middle bleeds) and a non-vacuity control (some case has all three slices).
+/// Exhaustive lattice check of [`clip_span`]: the three sub-window spans tile the glyph
+/// extent exactly and the middle span never leaves the window. Includes a non-vacuity
+/// control (some case has all three slices) and a negative control (an unclipped middle
+/// bleeds).
 #[test]
 fn clip_span_slices_tile_exactly() {
     const LO: i64 = -1_000; // widened sentinels (the blit callers use i32::MIN/MAX)
@@ -321,9 +287,8 @@ fn clip_span_slices_tile_exactly() {
                     if left.is_some() && mid.is_some() && right.is_some() {
                         three_way += 1;
                     }
-                    // NEGATIVE control: the pre-W4 cut-out used the WHOLE glyph
-                    // extent as its "slice". Whenever the window strictly clips,
-                    // that violates the no-bleed law this test enforces.
+                    // Negative control: an unclipped cut-out (the whole glyph extent)
+                    // violates no-bleed somewhere on this lattice.
                     let unclipped = (len > 0).then_some((gx0, gx0 + len));
                     if let Some((ulo, uhi)) = unclipped
                         && mid != unclipped
@@ -346,12 +311,9 @@ fn clip_span_slices_tile_exactly() {
     );
 }
 
-/// EXHAUSTIVE lattice proof that [`glyph_quad`]'s x-clip slices the quad at
-/// device-pixel x with the matching integer UV shift: for every lattice case,
-/// emulated NEAREST sampling of the three slices covers EXACTLY the pixels the
-/// unclipped quad covers (disjointly) and samples the IDENTICAL atlas texel at
-/// every pixel — quad slicing loses no texels. xs ∈ {1, 2} covers the DECDWL
-/// doubled path (half-texel UV starts, same as the proven y-path `v_top`).
+/// Exhaustive lattice check that [`glyph_quad`]'s x-clip slices a quad with the matching
+/// UV shift: emulated NEAREST sampling of the three slices covers exactly the unclipped
+/// quad's pixels, disjointly, at identical texels. `xs = 2` covers the DECDWL path.
 #[test]
 fn glyph_quad_x_slices_tile_and_preserve_texels() {
     let (aw, ah) = (64.0f32, 64.0f32);
@@ -438,11 +400,9 @@ fn glyph_quad_x_slices_tile_and_preserve_texels() {
     );
 }
 
-/// EXHAUSTIVE proof of [`cursor_cutout_cols`] over the complete 2^9 × cc plan
-/// lattice: the returned range contains `cc`, is all-`Ligated` exactly when
-/// `plan[cc]` is (else it is `{cc}`), and is MAXIMAL (its neighbours are not
-/// `Ligated`). This is the source-set policy both renderers share, so proving
-/// it here proves them equal by construction.
+/// Exhaustive over every 9-column plan: [`cursor_cutout_cols`] returns a range containing
+/// `cc` that is the maximal all-`Ligated` run when `plan[cc]` is `Ligated`, else `{cc}`.
+/// Both renderers take their cut-out columns from this function.
 #[test]
 fn cursor_cutout_cols_exhaustive() {
     const N: usize = 9;

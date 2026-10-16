@@ -3,12 +3,13 @@
 
 //! HTTP/1.1 request building and response parsing.
 //!
-//! Scope is set by what the title-summary worker actually does: one request per
-//! connection, a known-length body, `Connection: close`, and NO redirect
-//! following (a summary endpoint that redirects is a misconfiguration, and
-//! chasing it is how a bearer token reaches a host the operator never named).
-//! There is no connection pool and no HTTP/2, because one bounded worker
-//! making one call at a time needs neither.
+//! Scope was set by the caller it was written for (the title-summary worker,
+//! retired 2026-10-15): one request per connection, a known-length body,
+//! `Connection: close`, and NO redirect following (an API endpoint that
+//! redirects is a misconfiguration, and chasing it is how a bearer token
+//! reaches a host the caller never named).
+//! There is no connection pool and no HTTP/2, because a caller making one
+//! bounded call at a time needs neither.
 //!
 //! # Hardening
 //!
@@ -264,7 +265,7 @@ impl RequestBuilder<'_> {
         let target = Uri::parse(&self.endpoint)
             // The raw endpoint is NEVER echoed. `uri::parse` rejects userinfo
             // rather than stripping it, precisely so a credential cannot ride
-            // along — and this error reaches stderr through the GUI worker, so
+            // along — and a caller may print this error to stderr, so
             // interpolating the string that just failed to parse would print
             // the password of the one endpoint shape the policy exists to
             // refuse. The caller already holds the configured value to
@@ -419,8 +420,10 @@ fn render_request(
         // generates. Two `Host` or two `Content-Length` lines is a
         // request-smuggling signature — intermediaries disagree about which
         // one is authoritative — and a second `Connection` header could
-        // resurrect keep-alive under a body framing that assumes close.
-        if GENERATED_HEADERS
+        // resurrect keep-alive under a body framing that assumes close. The
+        // body is sent verbatim, so Transfer-Encoding cannot override its
+        // generated Content-Length either.
+        if RESERVED_HEADERS
             .iter()
             .any(|generated| name.eq_ignore_ascii_case(generated))
         {
@@ -432,29 +435,52 @@ fn render_request(
     head
 }
 
-/// Headers [`render_request`] emits itself; a caller cannot override or
-/// duplicate one. The proxy credential is the proxy URL's alone: one a caller
-/// set would duplicate it, or ride a tunnel to the origin.
-const GENERATED_HEADERS: &[&str] = &[
+/// Headers whose wire meaning [`render_request`] owns. The body always uses
+/// Content-Length, and the proxy credential is the proxy URL's alone.
+const RESERVED_HEADERS: &[&str] = &[
     "host",
     "content-length",
+    "transfer-encoding",
     "connection",
     "proxy-authorization",
 ];
 
+/// HTTP field names are nonempty tokens, shared by request validation and
+/// response parsing so neither accepts separators the other rejects.
+fn valid_header_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
+fn valid_header_value(value: &str) -> bool {
+    value.bytes().all(|b| b == b'\t' || b >= 0x20 && b != 0x7f)
+}
+
 /// Reject a header whose name or value could terminate the header block early.
 fn validate_header(name: &str, value: &str) -> Result<(), Error> {
-    if name.is_empty()
-        || !name
-            .bytes()
-            .all(|b| b.is_ascii_graphic() && !matches!(b, b':' | b'(' | b')' | b',' | b'/'))
-    {
+    if !valid_header_name(name) {
         return Err(Error::Invalid(format!("invalid header name: {name:?}")));
     }
-    if value
-        .bytes()
-        .any(|b| b == b'\r' || b == b'\n' || b == 0 || (b < 0x20 && b != b'\t'))
-    {
+    if !valid_header_value(value) {
         return Err(Error::Invalid(format!(
             "header {name} has a value containing a control character"
         )));
@@ -585,7 +611,10 @@ fn read_header_fields<R: Read>(
         let (name, value) = line
             .split_once(':')
             .ok_or_else(|| Error::Protocol(format!("header without a colon: {line:?}")))?;
-        headers.push((name.trim().to_owned(), value.trim().to_owned()));
+        if !valid_header_name(name) || !valid_header_value(value) {
+            return Err(Error::Protocol("invalid response header field".to_owned()));
+        }
+        headers.push((name.to_owned(), value.trim_matches([' ', '\t']).to_owned()));
     }
 }
 
@@ -784,10 +813,10 @@ fn read_chunked<R: Read>(reader: &mut R, limit: usize) -> Result<Vec<u8>, Error>
         // name up to usize::MAX. Unchecked, `body.len() + size` panics outright in
         // debug and WRAPS in release — and a wrapped sum slips under the `> limit`
         // cap, makes `resize` TRUNCATE rather than grow, and then `read_exact`
-        // panics on the slice range. Either way the title-summary worker thread
-        // unwinds and stays dead for the life of the process, taking the managed
-        // Ollama reap loop with it. Reachable from any endpoint the operator
-        // configures, or from whatever won the race for a loopback port.
+        // panics on the slice range. Either way the calling worker thread unwinds
+        // and stays dead for the life of the process, taking whatever it owns with
+        // it. Reachable from any endpoint a caller is pointed at, or from
+        // whatever won the race for a loopback port.
         let total = body
             .len()
             .checked_add(size)
@@ -864,28 +893,6 @@ mod tests {
             body
         });
         (endpoint, server)
-    }
-
-    #[test]
-    fn plain_stub_drains_fragmented_request_head_and_body() {
-        // A deterministic stream that exposes the head and body in pieces;
-        // no sleeps or scheduler timing can make the single-read control pass.
-        let fragments = || {
-            std::io::Cursor::new(b"POST /requ")
-                .chain(std::io::Cursor::new(
-                    b"est HTTP/1.1\r\nContent-Length: 2\r\n\r\n",
-                ))
-                .chain(std::io::Cursor::new(b"{"))
-                .chain(std::io::Cursor::new(b"}"))
-        };
-        let mut old_read = [0; 1024];
-        let first = fragments().read(&mut old_read).unwrap();
-        assert_eq!(&old_read[..first], b"POST /requ");
-        assert!(
-            !old_read[..first].ends_with(b"\r\n\r\n{}"),
-            "one successful read does not consume the request"
-        );
-        assert_eq!(read_plain_request(&mut fragments()), b"{}");
     }
 
     #[test]
@@ -1059,6 +1066,7 @@ mod tests {
             &[
                 ("Host".to_owned(), "evil.test".to_owned()),
                 ("Content-Length".to_owned(), "0".to_owned()),
+                ("tRaNsFeR-EnCoDiNg".to_owned(), "chunked".to_owned()),
                 ("connection".to_owned(), "keep-alive".to_owned()),
                 ("Content-Type".to_owned(), "application/json".to_owned()),
             ],
@@ -1068,6 +1076,10 @@ mod tests {
         assert!(head.contains("Host: a.test\r\n"), "{head}");
         assert_eq!(head.matches("Content-Length:").count(), 1, "{head}");
         assert!(head.contains("Content-Length: 9\r\n"), "{head}");
+        assert!(
+            !head.to_ascii_lowercase().contains("transfer-encoding:"),
+            "{head}"
+        );
         assert_eq!(
             head.to_lowercase().matches("connection:").count(),
             1,
@@ -1099,6 +1111,52 @@ mod tests {
         // A bearer token and a content type are ordinary values.
         assert!(validate_header("Authorization", "Bearer abc.def-123").is_ok());
         assert!(validate_header("Content-Type", "application/json").is_ok());
+    }
+
+    #[test]
+    fn header_names_use_the_same_token_grammar_in_both_directions() {
+        const PUNCTUATION: &str = "!#$%&'*+-.^_`|~";
+        for byte in 0u8..=127 {
+            let name = format!("X{}Field", char::from(byte));
+            let valid = byte.is_ascii_alphanumeric() || PUNCTUATION.contains(char::from(byte));
+            assert_eq!(validate_header(&name, "ok").is_ok(), valid, "{name:?}");
+            // On the wire a colon ends the name, so X:Field: ok is the
+            // legitimate field X with the value Field: ok.
+            let valid_response = valid || byte == b':';
+            let raw = format!("HTTP/1.1 204 No Content\r\n{name}: ok\r\n\r\n");
+            assert_eq!(
+                parse(raw.as_bytes(), 1024).is_ok(),
+                valid_response,
+                "{name:?}"
+            );
+        }
+        for name in ["", "Content-Length ", " Content-Length", "X-é"] {
+            assert!(validate_header(name, "0").is_err(), "{name:?}");
+            let raw = format!("HTTP/1.1 204 No Content\r\n{name}: 0\r\n\r\n");
+            assert!(
+                matches!(parse(raw.as_bytes(), 1024), Err(Error::Protocol(_))),
+                "{name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn response_headers_preserve_values_and_reject_controls() {
+        for byte in (0u8..=31).chain([127]).filter(|b| *b != b'\t') {
+            let mut raw = b"HTTP/1.1 204 No Content\r\nX-Field: before".to_vec();
+            raw.push(byte);
+            raw.extend_from_slice(b"after\r\n\r\n");
+            assert!(
+                matches!(parse(&raw, 1024), Err(Error::Protocol(_))),
+                "{byte}"
+            );
+            assert!(
+                validate_header("X-Field", &format!("before{}after", char::from(byte))).is_err()
+            );
+        }
+        let raw = "HTTP/1.1 204 No Content\r\nX-Field: \t\u{a0}value\u{a0}\t \r\n\r\n";
+        let response = parse(raw.as_bytes(), 1024).unwrap();
+        assert_eq!(response.header("x-field"), Some("\u{a0}value\u{a0}"));
     }
 
     fn parse(raw: &[u8], limit: usize) -> Result<Response, Error> {

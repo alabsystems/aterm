@@ -1,26 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! "Sparkle words": render-time text decorations driven by whole-word lexical
-//! matching.
+//! "Sparkle words": render-time decorations on whole words the lexicon
+//! matches.
 //!
-//! * **Profanity** (the "fuck" family across major languages): a randomized,
-//!   self-terminating sparkle, seeded-deterministic (replay-safe). Each
-//!   occurrence sparkles for a bounded window, then goes steady, so a static
-//!   word on screen never keeps a core busy.
-//! * **Feline** (cat / kitty / kitten across major languages): a peeking cat
-//!   head that slides out above (or below) the word, dwells and descends, once
-//!   per occurrence. When the cat cannot draw (style, cell floors, narrow
-//!   words, top row, `MAX_CATS` overflow) only the word's ink plays.
-//! * **Animated ink** (emphasis / profanity / feline): the matched glyphs are
-//!   recolored through [`InkCell`] fg overrides — a two-tone gradient with one
-//!   specular sweep, settling to constant bytes (a fixed point, not a decay to
-//!   default fg).
+//! * **Profanity**: rainbow ink with a per-appearance chance of a supernova
+//!   (or the classic nova / randomized sparkle styles).
+//! * **Feline** and the animal roster: a head that peeks out above (or below)
+//!   the word, dwells and descends, once per occurrence; when it cannot draw,
+//!   only the word's ink plays.
+//! * **Ink**: matched glyphs recolored through [`InkCell`] fg overrides that
+//!   settle to constant bytes.
 //!
-//! This module owns the host-side state machine: it scans the visible grid when
-//! the damage epoch advances (text into [`Occurrence`]s), then ticks an
-//! animation each frame that emits [`WordDecoration`]s + [`InkCell`]s into
-//! scratch buffers the renderer composites. Grid cells, copied text and
+//! Everything is seeded-deterministic and self-terminating. The engine scans
+//! the visible grid when the damage epoch advances (into [`Occurrence`]s) and
+//! each frame emits [`WordDecoration`]s, [`InkCell`]s, free sprites and nova
+//! quads into buffers the renderer composites. Grid cells, copied text and
 //! recordings are never touched.
 
 use aterm_time::Instant;
@@ -42,8 +37,8 @@ use crate::cat_baker::{BakeKeyV4, CatBaker, CatColorKey, CatTile, EyesFrame, PAT
 use crate::kitty_registry::{
     KittyLook, KittyMagic, KittyShownAs, KittySighting, KittyType, TRAIT_BOW, TRAIT_CROWN,
 };
-// Shared color math lives in the leaf `color_math` module (so `nova.rs` builds
-// without this state machine); imported, not re-exported.
+// Color math lives in the leaf `color_math` (so `nova.rs` builds without this
+// module); imported, not re-exported.
 use crate::cat_glyphs_gen::{CatGlyphId, GLYPHS, GlyphDef};
 use crate::color_math::{hsv2rgb, hue_nudge, relative_luminance};
 use crate::genome::{
@@ -138,9 +133,8 @@ const MAX_ANIMALS: usize = 8;
 const CAT_DESCEND_MS: u64 = 320;
 /// v3 §1.2 optional pre-descend anticipation lift (~50% of genomes).
 const CAT_ANTICIPATION_MS: u64 = 60;
-/// Peek dwell cap (v3 §1.2): `450 + 3750 + 380 = 4580 < 4800`, so a whole peek
-/// born after a driven capture script starts finishes before its `t = 5 s`
-/// settled capture.
+/// Peek dwell cap (v3 §1.2): the longest peek, `450 + 3750 + 380 = 4580 ms`,
+/// ends before a driven capture's `t = 5 s` settled frame.
 const CAT_DWELL_CAP_MS: u64 = 3750;
 /// v3 §1.2 twin-desync dwell jitter: `dwell_base − mix(ident) % 300`.
 const CAT_DWELL_JITTER_MS: u64 = 300;
@@ -150,7 +144,7 @@ const CAT_DWELL_MAGIC_BONUS_MS: u64 = 500;
 /// cols + this are born-settled (no entrance, no roll, static ink) and never
 /// written to `done_marks`.
 const RESIZE_SETTLE_MS: u64 = 500;
-/// v3 §1.1 fix #2 `done_marks` LRU capacity.
+/// `done_marks` LRU capacity (v3 §1.1).
 const DONE_MARKS_CAP: usize = 65_536;
 /// Null link for the done-mark LRU's `u32` indices. The entry cap is far below
 /// it, so every resident node has a representable index.
@@ -206,7 +200,7 @@ pub enum ProfanityStyle {
     /// `style = "nova"`: the §6 classic nova. No size floor — the ring band
     /// count clamps below 2r = 60 px (§6.3). Ignores `supernova_chance`.
     Nova,
-    /// `style = "sparkle"`: exactly the v1 path (`supernova_chance` ignored).
+    /// `style = "sparkle"`: the randomized sparkle (`supernova_chance` ignored).
     Sparkle,
 }
 
@@ -248,33 +242,20 @@ pub struct EffectGeom {
 }
 
 /// The host's per-frame view of the cursor companion, for the
-/// one-cat-per-caret suppression ([`WordDecorations::tick`]).
+/// one-cat-per-caret suppression ([`WordDecorations::tick`]). Hosts get
+/// `body_px` from [`crate::kitty_pet::PetFrame::body_px`] or
+/// [`WordDecorations::kitty_cursor_footprint`].
 ///
-/// * `cell` — the visible caret cell, if any. Drives the per-episode claim
-///   ([`WordDecorations::companion_claim`]) and the caret-on-span gate. `None`
-///   while a DECTCEM hide fades a resident pet; the body rect below still owns
-///   pixel custody then.
-/// * `body_px` — the companion's live drawn sprite in grid pixels
-///   `(x0, x1, y0, y1)`, right/bottom exclusive, for either animal. The pet
-///   ([`crate::kitty_pet`]) stands wherever it walked; the flying head sits
-///   about 1.75 cells right of and 0.4 rows above the caret. Hosts get the rect
-///   from [`crate::kitty_pet::PetFrame::body_px`] or
-///   [`WordDecorations::kitty_cursor_footprint`] (the emission's own dest
-///   math). `None` falls back to the caret band alone.
-/// * `guards_caret` — whether the caret's own cell band is companion glass too.
-///   True for the flying head (it and the caret read as one unit); false for
-///   the pet, which guards only its body.
-///
-/// Two rects, not one union: the union would be far greedier than either and
-/// suppress legitimate "peeks beside the companion" cats
-/// (`a_feline_word_away_from_the_caret_still_peeks_beside_the_companion`).
+/// Two rects, not one union: the union would suppress legitimate "peeks
+/// beside the companion" cats.
 #[derive(Clone, Copy, Debug)]
 pub struct CompanionOnGlass {
     /// The visible caret cell `(row, col)` in pre-splice grid coords. `None`
     /// only for a still-visible resident body whose caret is currently hidden.
     pub cell: Option<(u16, u16)>,
-    /// The companion's live drawn sprite `(x0, x1, y0, y1)` in grid pixels.
-    /// `None` only when the host could not resolve one this frame.
+    /// The companion's live drawn sprite `(x0, x1, y0, y1)` in grid pixels,
+    /// right/bottom exclusive. `None` only when the host could not resolve one
+    /// this frame.
     pub body_px: Option<(i32, i32, i32, i32)>,
     /// Does the caret cell's own band belong to the companion as well? True
     /// for the caret-escorting flying head, false for the resident pet.
@@ -328,11 +309,9 @@ impl CompanionOnGlass {
                         let ch = i32::from(geom.cell_h);
                         let x0 = i32::from(col) * cw;
                         let y0 = i32::from(row) * ch;
-                        // Two cells wide from the caret column, the caret's
-                        // own row band. Not grown to the head's extent (that is
-                        // `body_px`): a cat peeking up from a word below may
-                        // pass through rows above the caret, see
-                        // `a_feline_word_away_from_the_caret_still_peeks_beside_the_companion`.
+                        // Two cells wide, the caret's own row band; not the
+                        // head's extent (that is `body_px`), so a cat peeking
+                        // up past the caret's rows still draws.
                         Some((x0, x0 + 2 * cw, y0, y0 + ch))
                     })
                     .flatten(),
@@ -429,15 +408,10 @@ pub struct RobiShowFrame {
     pub frame: crate::robi::RobiFrame,
 }
 
-/// What one [`WordDecorations::robi`] call put on glass.
-///
-/// Two facts, because a fresh baker (config reload, font-size step) can spend
-/// the shared bake budget on the ladder and defer the body. The host must not
-/// install the click-to-dismiss hit-box over an invisible body (a click there
-/// writes `robi = false`).
-///
-/// [`Self::body_px`] is the rect the emitter really drew, resolved from the
-/// slices it stamped (the held body's size on a deferred frame).
+/// What one [`WordDecorations::robi`] call put on glass. A fresh baker can
+/// spend the bake budget on the ladder and defer the body, and the host must
+/// not hang the click-to-dismiss hit-box (a click writes `robi = false`) over
+/// an invisible body.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RobiEmission {
     /// Fingerprint fold for the host's early-out (ladder + body, whatever
@@ -597,8 +571,7 @@ pub struct DecoConfig {
     /// `[sparkle_words.feline] magic` (§10): Fortune (1/512) / Nebula (1/1024)
     /// rare cats. `false` ⇒ every cat takes the ordinary build.
     pub feline_magic: bool,
-    /// `[sparkle_words.profanity] style` (§10): supernova vs the exact v1
-    /// sparkle.
+    /// `[sparkle_words.profanity] style` (§10).
     pub profanity_style: ProfanityStyle,
     /// `[sparkle_words.profanity] magic` (§10): Quasar (1/512) / Singularity
     /// (1/1024) rare novas. `false` ⇒ every nova takes the ordinary build.
@@ -632,8 +605,9 @@ pub struct DecoConfig {
 impl DecoConfig {
     /// Scan options derived from the config (borrows the `ignore` set).
     ///
-    /// Public so the typed-word detector (`aterm-gui`'s `kitty_summon`) scans
-    /// with the same `allow_bare_cat` / `cjk_single_char` / `ignore` policy.
+    /// Public so the typed-word detector ([`crate::kitty_summon`], fed by the
+    /// host input path) scans with the same `allow_bare_cat` /
+    /// `cjk_single_char` / `ignore` policy.
     pub fn scan_opts(&self) -> ScanOptions<'_> {
         ScanOptions {
             allow_bare_cat: self.allow_bare_cat,
@@ -643,10 +617,10 @@ impl DecoConfig {
     }
 }
 
-/// The per-class default spec from the live config knobs: Profanity =
-/// Rainbow plus SuperNova@chance (or classic Nova / Sparkle), Feline = Cats
-/// plus SelfGlow, Emphasis = TwoTone. TwoTone defaults carry the class base pair and are
-/// genome-hue-nudged at emission (custom TwoTone colors apply raw, see
+/// The per-class default spec from the live config knobs: Profanity = Rainbow
+/// plus SuperNova@chance (or classic Nova / Sparkle), Feline = Cats plus
+/// SelfGlow, Emphasis = TwoTone. TwoTone defaults carry the class base pair and
+/// are genome-hue-nudged at emission (custom TwoTone colors apply raw, see
 /// `Occurrence::custom`).
 fn class_default_spec(class: Class, cfg: &DecoConfig) -> WordEffectSpec {
     match class {
@@ -655,8 +629,8 @@ fn class_default_spec(class: Class, cfg: &DecoConfig) -> WordEffectSpec {
             ink: Some(InkSpec {
                 colorway: match cfg.profanity_style {
                     ProfanityStyle::Rainbow => crate::spec::rainbow_ink().colorway,
-                    // The nova/sparkle ink anchors stay the v2 class pair
-                    // (the nova palette overrides them through InkFx).
+                    // The nova/sparkle ink anchors are the class pair (the
+                    // nova palette overrides them through `InkFx`).
                     _ => Colorway::TwoTone {
                         c0: 0x00FF_D447,
                         c1: 0x00FF_7CE5,
@@ -844,7 +818,7 @@ struct Episode {
     /// v3 §1.1 per-axis done flags. `peek_done`: the graphic one-shot ran to
     /// completion (descend finished / paw faded out) — zero quads forever.
     peek_done: bool,
-    /// v3: the graphic one-shot started (the birth-latched phase clock began
+    /// The graphic one-shot started (the birth-latched phase clock began
     /// ticking) — the done-mark write condition on departure.
     peek_started: bool,
     /// Set at ignition grant (detonation is the point of no return); the
@@ -859,8 +833,8 @@ struct Episode {
     /// active_until, fingerprint folds, sightings or burst rolls; emits only
     /// the settled ink.
     born_done: bool,
-    /// v3 §1.1 fix #4: born during the resize-settle window — same inert
-    /// emission as `born_done` but never written to `done_marks`.
+    /// Born during the resize-settle window (v3 §1.1): the `born_done` inert
+    /// emission, but never written to `done_marks`.
     born_settled: bool,
     /// v3 §1.2 arm freezing: Cat vs Paw (+ fallback cause), stored at first
     /// emission decision; every later tick dispatches from the stored arm.
@@ -894,10 +868,10 @@ struct Episode {
     /// reads it to tell a classic nova's window from a supernova's.
     burst_kind: Option<BurstKind>,
     /// Curse bonk one-shot latch: set only at the fresh birth of a Profanity
-    /// episode with the typed witness (`live_caret_completion`), cleared when
-    /// the tick queues its [`CurseCue`] (a full cue vec leaves it armed).
-    /// Born-done/born-settled births, alignment adoptions and ambiguous forms
-    /// deferred at the caret never set it.
+    /// episode with the typed witness (caret completion plus keystroke),
+    /// cleared when the tick queues its [`CurseCue`] (a full cue vec leaves it
+    /// armed). Inert births, adoptions and deferred ambiguous forms never set
+    /// it.
     bonk_pending: bool,
     /// This episode's done mark is already stamped under its current
     /// `(ident, ctx_fp)` while resident ([`WordDecorations::stamp_spent_marks`]).
@@ -959,7 +933,7 @@ impl Episode {
                 || self.born_done)
     }
 
-    /// v3: born-done and born-settled episodes share the inert emission path.
+    /// Born-done and born-settled episodes share the inert emission path.
     fn inert(&self) -> bool {
         self.born_done || self.born_settled
     }
@@ -969,9 +943,9 @@ impl Episode {
 /// guarantees, so the host gates them separately.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CurseCueKind {
-    /// A Profanity episode born with the live caret one past the token
-    /// (`live_caret_completion`). Output, scrollback redraws and pastes that
-    /// leave the caret elsewhere never produce it.
+    /// A Profanity episode born with the live caret one past the token and a
+    /// committed keystroke within reach. Output, redraws and pastes never
+    /// produce it.
     Typed,
     /// Supernova ignition grant (§3.2): an on-screen curse whose burst roll
     /// escalated is detonating. Fires for output content too (hence its own
@@ -1024,10 +998,9 @@ const MAX_PEEK_CUES: usize = 8;
 /// Caret position alone ([`PendingBirth::at_live_cursor`]) is no evidence of
 /// typing: a shell or TUI parks the caret at the line it just drew, so a pure
 /// redraw would re-arm a suppressed cat. Only a keystroke
-/// ([`WordDecorations::note_typed_edit`]) distinguishes typed from redrawn
-/// (owner, 2026-08-09).
-/// The window bridges key commit and echo arrival (sub-millisecond locally,
-/// up to a few hundred ms over a loaded ssh link).
+/// ([`WordDecorations::note_typed_edit`]) tells typed from redrawn, and it is
+/// the only re-arm (never a timer). The window bridges key commit and echo
+/// arrival (sub-millisecond locally, a few hundred ms over a loaded ssh link).
 pub(crate) const TYPED_EDIT_WITNESS_MS: u64 = 750;
 
 /// How far from a token the recorded edit caret may sit and still count as an
@@ -1074,13 +1047,11 @@ struct PendingBirth {
     /// The token ends exactly at the live input caret. With a tainted prior
     /// episode this is evidence of retyping rather than a passive redraw.
     live_caret_completion: bool,
-    /// The live caret touches the token (inside it or the cell after, the
-    /// ambiguity-suppression window): the "word just typed" witness for the
-    /// feline re-arm policy. A resident spent episode absent for a full rescan
-    /// may not transfer onto such a candidate, and with resident evidence the
-    /// colliding done mark is deleted rather than honored, so a kitty retyped
-    /// after `clear` is born fresh. Without resident evidence a parked caret
-    /// proves nothing and born-done stands.
+    /// The live caret touches the token (inside it or the cell after): the
+    /// "word just typed" witness for the feline re-arm. A spent episode absent
+    /// for a full rescan may not transfer onto such a candidate, and a
+    /// colliding done mark is deleted rather than honored when the keystroke
+    /// witness agrees.
     at_live_cursor: bool,
 }
 
@@ -1157,12 +1128,9 @@ fn alignment_edge(
     {
         return None;
     }
-    // A spent (`peek_done`) feline episode that missed a full rescan may not
-    // transfer onto the candidate at the live caret: ident and the exact-context
-    // edge cannot tell a redraw from a retype at the same column, and a word
-    // that vanished and returned under the caret is new. Applies to every tier
-    // (the fast path defers such a candidate; tier 0 would readopt it). Gap ≤ 1
-    // (merely moved by scroll or reflow) still transfers.
+    // A spent feline episode that missed a full rescan may not transfer onto
+    // the candidate at the live caret: no tier can tell a redraw from a retype
+    // there. Gap ≤ 1 (moved by scroll or reflow) still transfers.
     if occ.class == Class::Feline
         && ep.peek_done
         && candidate.at_live_cursor
@@ -1204,13 +1172,10 @@ fn alignment_edge(
 /// rolling-window history regardless of its owner.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct IgnitionReservation {
-    /// The scan scope that requested it ([`WordDecorations::scan_scope`]): the
-    /// bound pane, or the session an unsplit host declared. The rolling-window
-    /// count spans every scope, but a pending slot may only be cancelled by its
-    /// own scope, since other scopes' episodes live in parked persist maps.
-    ///
-    /// `None` means no scope; it is an `Option` because 0 is a valid session
-    /// id and must not share a cancellation bucket with unscoped scans.
+    /// The scan scope that requested it ([`WordDecorations::scan_scope`]). The
+    /// rolling-window count spans every scope, but only the requesting scope
+    /// may cancel a pending slot (other scopes' episodes are parked). An
+    /// `Option` because 0 is a valid session id.
     pane: Option<u64>,
     owner: u64,
     start: Instant,
@@ -1218,7 +1183,7 @@ struct IgnitionReservation {
 }
 
 /// One live (quad-emitting) nova this frame, resolved by the §6.4 prepass: the
-/// read-only hand-off to the pure emitters, the gaze hook and blast coupling.
+/// read-only hand-off to the pure emitters and the blast coupling.
 #[derive(Clone, Copy)]
 struct NovaLive {
     /// Index into `WordDecorations::occ`.
@@ -1264,8 +1229,8 @@ struct Occurrence {
     /// independent of row/column.
     form_id: FormId,
     seed: u64,
-    /// The §3.6 episode identity (`mix(seed ^ ordinal·ORDINAL_MIX)`) — the key
-    /// the gaze map and the idle-event scheduler address this cat by.
+    /// The §3.6 episode identity (`mix(seed ^ ordinal·ORDINAL_MIX)`), the
+    /// persist-map key.
     ident: u64,
     appeared: Instant,
     /// The episode's frozen genome (§3.6), copied out of the persist map every
@@ -1294,11 +1259,11 @@ struct Occurrence {
     /// The row has a DEC double-width/height size (§5.7): no cat there; ink
     /// only.
     dec_line: bool,
-    /// v3 §1.1: copied from the episode's born-done/born-settled flags at
-    /// rescan — the inert emission gate (settled ink bytes only).
+    /// The episode's born-done/born-settled flags, copied at rescan (v3 §1.1):
+    /// the inert emission gate (settled ink bytes only).
     inert: bool,
-    /// v3 §6: the resolved effect spec (per-word override, else the class
-    /// default) — the tick dispatches on its axes, not on `class`.
+    /// The resolved effect spec (per-word override, else the class default,
+    /// v3 §6): the tick dispatches on its axes, not on `class`.
     spec: WordEffectSpec,
     /// `spec` came from a `[[sparkle_words.custom]]` override: bypasses the
     /// class gate; custom TwoTone colors apply raw (no genome hue nudge).
@@ -1334,22 +1299,18 @@ struct DoneMarkNode {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct DoneMarkMutation {
     evicted: Option<u64>,
-    /// Number of intrusive-list node writes. This is an implementation-level
-    /// constant-work witness used by the Tier-1 model binding below.
+    /// Intrusive-list node writes: the constant-work witness the
+    /// `DoneMarkLruBound` binding in the tests checks.
     link_writes: u8,
 }
 
 /// Deterministic bounded LRU for completed one-shot identities.
 struct DoneMarkLru {
-    /// KEYED HASH (hashclock-1 review, ruling 2026-10-10). The keys are
-    /// `ident ^ ctx_fp`, and `ctx_fp` is a SimHash of the words a pane's
-    /// program prints around the match. Both are mixed without a secret, so
-    /// avalanche mixing does not stop precomputation: a program can search
-    /// offline for contexts whose keys share one bucket and control tag under
-    /// Fx on every aterm, and the map holds up to [`DONE_MARKS_CAP`] of them
-    /// for the session. A [`KeyedHashMap`] keeps that chain short. It is
-    /// probed only at episode births and departures, so its price is not
-    /// measurable. Eviction order comes from the intrusive `nodes` list,
+    /// Keyed: a key is `ident ^ ctx_fp`, where `ctx_fp` is a SimHash of text
+    /// the pane's program prints, mixed without a secret, so under Fx a program
+    /// could precompute contexts that share one bucket and hold up to
+    /// [`DONE_MARKS_CAP`] of them. Probed only at births and departures, so the
+    /// keyed hash costs nothing measurable. Eviction order comes from `nodes`,
     /// never map iteration.
     index: KeyedHashMap<u64, u32>,
     nodes: Vec<DoneMarkNode>,
@@ -1614,35 +1575,20 @@ pub enum KittySpriteSource {
 /// Exact memo of `visible row text -> lexicon matches`, the rescan's dominant
 /// cost.
 ///
-/// Any PTY byte advances the damage epoch, so under output every presented
-/// frame re-tokenises the whole viewport on the main thread, inside the
-/// present that carries the keystroke echo. The scanner is a pure function of
-/// `(row text, ScanOptions, Lexicon)`, so an unchanged row's tokenise+lookup
-/// becomes one hash lookup. Everything downstream of the match list (ordinals,
-/// identity, fast path, births, ink capture, alignment) still runs on every
-/// row, so the decoration set is unchanged.
+/// Any PTY byte advances the damage epoch, so under output every frame
+/// re-tokenises the viewport on the main thread, inside the present that
+/// carries the keystroke echo. The scanner is a pure function of `(row text,
+/// ScanOptions, Lexicon)`, so an unchanged row costs one hash lookup; everything
+/// downstream of the match list still runs on every row.
 ///
-/// Keyed by row text, not row index: under scrolling output row `r` holds what
-/// row `r + k` held last frame, so text keys hit for every line that moved.
+/// Keyed by row text, not row index, so scrolled lines hit. Capacity is two
+/// generations of `fit`: a full hot generation is demoted to cold wholesale
+/// (dropping the previous cold). Retired buffers are kept in `spare` and
+/// refilled, so an all-miss frame does not allocate per row.
 ///
-/// Capacity is two generations of `fit`: a full hot generation is demoted to
-/// cold wholesale (dropping the previous cold), so at least one screenful is
-/// retained and the memo never grows without bound. Keys are exact strings.
-///
-/// Retired generations' heap buffers are kept (`spare`) and refilled, so an
-/// all-miss frame (a full-screen TUI repaint) does not malloc/free per row on
-/// the render thread.
-///
-/// KEYED HASH (hashclock-1, ruling 2026-10-10): both generations are
-/// [`KeyedHashMap`]s because the keys are row text a pane's program prints.
-/// The cap bounds how many rows are resident, not how many share a bucket.
-/// Under the unkeyed Fx, rows precomputed to collide make each probe compare
-/// up to both generations, `4 * rows` keys, so a rescan's cost grows with the
-/// square of the viewport's rows. The hunt called that negligible at ordinary
-/// sizes. The memo follows the renderer's text memos anyway: the rule then
-/// needs no size argument that a later cap change could break, and the price
-/// is small. A 50x200 rescan of ordinary prose measured 402-424 us before and
-/// 389-401 us after.
+/// Both generations are [`KeyedHashMap`]s because the keys are text a pane's
+/// program prints: under unkeyed Fx, precomputed colliding rows would make a
+/// rescan cost grow with the square of the viewport's rows.
 #[derive(Default)]
 struct ScanMemo {
     hot: KeyedHashMap<String, Vec<Match>>,
@@ -1653,11 +1599,8 @@ struct ScanMemo {
     spare: Vec<(String, Vec<Match>)>,
     /// Live per-generation entry cap (from the viewport row count).
     gen_cap: usize,
-    /// Fingerprint of the other two scanner inputs the resident entries were
-    /// produced under: the [`ScanOptions`] and the [`Lexicon`]
-    /// ([`scan_inputs_fp`]). The memo keys on row text alone, so this guards
-    /// callers that swap a gate or lexicon without `hard_reset`; a stale entry
-    /// would keep decorating a word the user just denied or disabled.
+    /// [`scan_inputs_fp`] of the gates and lexicon the entries were scanned
+    /// under; a change retires them.
     inputs_fp: u64,
     /// Test-only: force every probe to miss so the equivalence battery can
     /// drive a second engine down the always-re-lex path.
@@ -1768,9 +1711,8 @@ impl ScanMemo {
     /// Record a freshly scanned row, refilling a retired entry's buffers rather
     /// than allocating per miss (see the `spare` field).
     fn remember(&mut self, text: &str, matches: &[Match]) {
-        // `bypass` switches the memo off entirely: the equivalence battery's
-        // control engine and the cost probe's `memo=false` legs must run the
-        // pre-memo path without this bookkeeping.
+        // `bypass` switches the memo off entirely, bookkeeping included (the
+        // equivalence battery's control engine, the cost probe's `memo=false`).
         #[cfg(test)]
         if self.bypass {
             return;
@@ -1835,21 +1777,16 @@ fn scan_opts_fp(opts: &ScanOptions<'_>) -> u64 {
 /// The memo's full retirement key: the scan gates ([`scan_opts_fp`]) plus the
 /// identity of the lexicon the entries were scanned against.
 ///
-/// The scanner reads `(text, opts, lexicon)`; without the lexicon in the key a
-/// swapped lexicon (changed `languages`, edited `[[entry]]` override, unloaded
-/// Toy Pack) would keep answering with the old one's matches, and
-/// `Match::form_id` is unique only within its own instance. `hard_reset` is
-/// the intended rebuild hook, but the cache does not rely on callers.
+/// The scanner reads `(text, opts, lexicon)`, so a swapped lexicon (changed
+/// `languages`, edited `[[entry]]` override, unloaded Toy Pack) must retire the
+/// memo even without a `hard_reset`; `Match::form_id` is unique only within its
+/// own instance. The key must be O(1) (keystroke path; aterm-lexicon exposes no
+/// build digest):
 ///
-/// The key must be O(1) (it runs on the keystroke path and aterm-lexicon
-/// exposes no build digest):
-///
-/// * the instance address: production holds the lexicon in an `Arc` and
-///   publishes a new one on rebuild, so the address is stable for a live memo
-///   and distinct between simultaneously live lexicons;
+/// * the instance address: production publishes a new `Arc` on rebuild, so the
+///   address is stable for a live memo and distinct between live lexicons;
 /// * `spaced_form_count()`, separating a rebuild that reuses the freed address.
-///   Two lexicons at one address with equal counts would still collide; a
-///   build-time digest in aterm-lexicon would close that.
+///   Two lexicons at one address with equal counts would still collide.
 fn scan_inputs_fp(lexicon: &Lexicon, opts: &ScanOptions<'_>) -> u64 {
     // `fnv_mix_u64` is the whole-scalar FNV-1a step, over the same prime the
     // gate fold above mixes bytes with.
@@ -1902,30 +1839,14 @@ pub struct WordDecorations {
     /// §3.6 identity persistence: `ident → Episode`, cap [`PERSIST_CAP`],
     /// oldest-`last_seen` eviction, [`GRACE_TTL`] sweep at rescan end.
     ///
-    /// Fx, NOT KEYED, by ruling (hashclock-1 review, 2026-10-10), as is
-    /// `seed_ordinals` below. A pane's program steers these keys: an ident
-    /// mixes `(column, class, lexicon form, ordinal)` without a secret, so
-    /// being "already mixed" is no defense. The bound is the domain, which
-    /// aterm sets: the columns of this grid, the shipped or configured
-    /// lexicon forms, and ordinals. A program picks keys from it and cannot
-    /// add to it. Enumerating every builtin form with its possessive variants
-    /// (4,068 form hashes) at every column, the most idents that share one
-    /// bucket and control tag of this map's 1,024-bucket table are 13 at 80
-    /// columns, 23 at 200 and 36 at 500. With ordinals up to 3 the figure at
-    /// 200 columns is 52. A higher ordinal costs one more occurrence of the
-    /// same word in the same column in one rescan, and those fillers take
-    /// persist slots too. Each compare in such a chain is an integer compare,
-    /// and [`PERSIST_CAP`] caps the chain in any case.
-    ///
-    /// Keying is not free here, as it is for the done marks. `tick` probes
-    /// this map several times per live occurrence per frame. On a 50x200
-    /// screen at the 128-occurrence cap (release, ten interleaved runs), the
-    /// keyed map raised a static tick's median from 9.6-13.1 us to 15.4-18.4
-    /// us and a busy tick's from 14.3-19.8 us to 20.5-24.8 us, while keying
-    /// the done marks alone stayed within run-to-run noise. That cost would
-    /// be paid on every frame to cap a chain the domain already holds to a
-    /// few dozen compares. A key derived from free text, such as a row or a context
-    /// SimHash, has no such bound and is keyed: see [`ScanMemo`] and
+    /// Fx, not keyed, like `seed_ordinals`. A pane's program steers these keys
+    /// (an ident mixes `(column, class, lexicon form, ordinal)` without a
+    /// secret), but only within a domain aterm sets: the grid's columns, the
+    /// lexicon's forms and ordinals. Over every builtin form at every column, the
+    /// worst shared bucket holds 13 idents at 80 columns, 23 at 200, 36 at 500,
+    /// and [`PERSIST_CAP`] caps any chain. `tick` probes this map several times
+    /// per occurrence per frame, and keying it measured 35-50% slower ticks. Keys
+    /// from free text have no such bound and are keyed: see [`ScanMemo`] and
     /// [`DoneMarkLru::index`].
     ///
     /// Both iteration sites are order-independent (`align_pending` sorts;
@@ -1934,12 +1855,9 @@ pub struct WordDecorations {
     /// Per-rescan row-major count of same-seed occurrences — the §3.6 ordinal
     /// source. Resident so the rescan allocates nothing after warmup.
     ///
-    /// Fx under the ruling on `persist` above: a seed mixes `(column, class,
-    /// lexicon form)` from the same finite domain. The map holds at most the
-    /// rescan's 128 occurrences, and the largest set of reachable seeds that
-    /// shares one bucket and tag of its 256-bucket table is 49 at 200 columns
-    /// and 98 at 500. A rescan's worst case is then about 128 probes of up to
-    /// 98 integer compares each, a few microseconds.
+    /// Fx for the reason on `persist`: a seed mixes `(column, class, lexicon
+    /// form)`, at most 128 entries, worst shared bucket 98 seeds at 500 columns
+    /// (a few microseconds per rescan).
     seed_ordinals: FxHashMap<u64, u64>,
     /// §3.2 SimHash vote accumulator (resident scratch; zero allocation).
     votes: VoteScratch,
@@ -1976,13 +1894,10 @@ pub struct WordDecorations {
     /// never re-emits the old coat beside its departing ghost. Cleared with the
     /// atlas.
     pet_last_tile: Option<(u16, u16, crate::pet_glyphs_gen::PetGlyphId, u8, u8)>,
-    /// Each departing body's last-resolved tile `(id, ax, ay)` (sharing
-    /// [`Self::pet_last_tile`] would strobe both bodies), keyed by the ghost
-    /// itself (`PetDepartureSprite::id`) and found by it in whichever slot of
-    /// the lane the ghost stands this frame: a ghost carried across a boundary
-    /// may land in another slot, and keeps its hold; a slot reborn under
-    /// another ghost never wears this one's. Twice the lane, so the holds of
-    /// one frame's ghosts never evict each other ([`Self::hold_departure_tile`]).
+    /// Each departing body's last-resolved tile `(id, ax, ay)`, keyed by the
+    /// ghost's id (`PetDepartureSprite::id`), not its lane slot, so a ghost
+    /// keeps its hold across slots and a reborn slot never wears another's.
+    /// Twice the lane, so one frame's ghosts never evict each other.
     pet_depart_tiles: [Option<(u32, u16, u16)>; PET_DEPART_HOLDS],
     /// The dog roster's exact-size tile cache ([`crate::dog_baker`]) for the
     /// typed-word dog cameo, through the shared atlas's `host_tile`.
@@ -2036,8 +1951,8 @@ pub struct WordDecorations {
     /// / suppressed alt screen). `thaw` shifts stored timestamps forward by the
     /// freeze duration.
     frozen_at: Option<Instant>,
-    /// v3 §1.1 fix #4: the resize-settle deadline — births before it (or on a
-    /// rescan that itself changed cols) are born-settled.
+    /// The resize-settle deadline (v3 §1.1): births before it (or on a rescan
+    /// that itself changed cols) are born-settled.
     settle_until: Option<Instant>,
     /// Whether the host cannot present this window (unfocused or
     /// deco-suspended), synced by [`Self::set_presentable`]. Inverted so the
@@ -2054,39 +1969,23 @@ pub struct WordDecorations {
     /// v3 §1.1 alignment scratch: the seed group's old episodes, pulled out of
     /// the persist map for rekeying (resident).
     align_old: Vec<(u64, Episode)>,
-    /// One cat per caret, as a per-episode claim: the occurrence ident the live
-    /// cursor companion is answering. Released when the companion leaves glass;
-    /// while it is up, re-resolved every tick to the word under the caret (with
-    /// the [`Self::caret_word`] fallback) and kept over non-feline ground.
-    ///
-    /// A claim rather than a per-frame caret test because the companion
-    /// outlives the caret's visit (`DISCOVERY_HOLD`, `kitty_cursor.rs`), and the
-    /// word's own peek would otherwise pop a twin cat beside it. It follows the
-    /// caret because the resident pet ([`crate::kitty_pet`]) keeps `companion`
-    /// set indefinitely, so a one-time claim would freeze on the first word.
-    ///
-    /// Pane-scoped (parked in [`ParkedPane`]): the feline scanner runs in every
-    /// pane.
+    /// One cat per caret: the occurrence ident the live cursor companion is
+    /// answering. Released when the companion leaves glass; while it is up,
+    /// re-resolved every tick to the word under the caret (or
+    /// [`Self::caret_word`]) and kept over non-feline ground. A claim, not a
+    /// caret test, because the companion outlives the caret's visit
+    /// (`DISCOVERY_HOLD`); it follows the caret because the resident pet never
+    /// leaves. Pane-scoped.
     companion_claim: Option<u64>,
-    /// The occurrence the caret was last seen on, recorded by the rescan (the
-    /// only pass always handed the caret).
-    ///
-    /// Fallback for [`Self::companion_claim`]: the companion reaches glass only
-    /// the frame after the tick that summoned it, by which time the caret may
-    /// have moved past the word. Overwritten only by a fresh hit, consulted
-    /// only for an ident still in `occ`. Pane-scoped and reset-cleared like the
-    /// claim.
+    /// The occurrence the caret was last seen on, recorded by the rescan: the
+    /// [`Self::companion_claim`] fallback, since the companion reaches glass a
+    /// frame after the tick that summoned it. Overwritten only by a fresh hit;
+    /// pane-scoped and reset-cleared like the claim.
     caret_word: Option<u64>,
-    /// The caret cell the last cursor-bearing rescan observed: where the
-    /// user's hands are.
-    ///
-    /// The edit witness ([`Self::note_typed_edit`]) comes from the host input
-    /// path, which knows only when and into which pane a key went; this
-    /// supplies the place. It is the pre-echo caret, which for a word being
-    /// typed sits on (or one past) that word (owner, 2026-08-09).
-    ///
-    /// Only a cursor-bearing rescan overwrites it (the cell-less `rescan` keeps
-    /// the last observation), and it is pane-parked like `caret_word`.
+    /// The caret cell the last cursor-bearing rescan observed: the place half
+    /// of the edit witness ([`Self::note_typed_edit`] knows only when and which
+    /// pane). It is the pre-echo caret, on (or one past) a word being typed.
+    /// The cell-less `rescan` keeps the last value; pane-parked.
     last_caret: Option<(u16, u16)>,
     /// Alignment scratch (v3 §1.1): the DP's traceback decisions, one byte per
     /// (old, candidate) cell, [`ALIGN_DECISION_CELLS`] in all.
@@ -2116,7 +2015,7 @@ pub struct WordDecorations {
     /// [`MAX_IGNITION_RESERVATIONS`].
     ignitions: Vec<IgnitionReservation>,
     /// Per-tick scratch: this frame's live novas (≤ MAX_ACTIVE_NOVAS), read by
-    /// the gaze hook (§5.8), the blast coupling (§6.5) and the profanity arm.
+    /// the blast coupling (§6.5) and the burst arm.
     novas: Vec<NovaLive>,
     /// v3 §3.2 per-tick scratch: this frame's live supernova
     /// (≤ [`supernova::MAX_ACTIVE_SUPERNOVAE`] = 1; prepass-filled).
@@ -2125,16 +2024,11 @@ pub struct WordDecorations {
     /// live) supernovae; classic nova ignitions are deferred while inside it.
     super_until: Option<Instant>,
     /// §3.2 burst-mutex fast path: an upper bound on the end of any burst
-    /// window this engine has granted ([`burst_mutex_end`] over every map it
-    /// owns). `None` until the first grant.
-    ///
-    /// When `now >= hint`, [`Self::super_prepass`]'s busy scan would skip
-    /// every entry, so it is skipped outright (exact, not conservative).
-    ///
-    /// Monotone: an over-held hint costs one wasted walk, an under-held one
-    /// would let two burst windows overlap. Folded only at the two ignition
-    /// grants and shifted by [`Self::thaw`]; everything else can only shrink
-    /// the true max. Engine-wide so it covers parked shards too.
+    /// window this engine has granted, parked shards included. Once `now`
+    /// reaches it, [`Self::super_prepass`] skips its busy scan (exact). It may
+    /// over-hold (one wasted walk) but never under-hold, or two burst windows
+    /// could overlap: it is folded at the two ignition grants and shifted by
+    /// [`Self::thaw`], and nothing else can raise the true max.
     burst_hint: Option<Instant>,
     /// Session-scoped birth sequence, incremented on every persist miss: the
     /// supernova roll's decorrelation term (v3 §3.2). Survives `reset()` and
@@ -2146,22 +2040,15 @@ pub struct WordDecorations {
     /// age out of [`supernova::COMBO_WINDOW_MS`] at the next charge, and
     /// `reset()`/`hard_reset()` clear it.
     combo_births: Vec<Instant>,
-    /// The last committed edit keystroke ([`TypedEdit`]), the causal half of
-    /// the feline/profanity re-arm witness.
-    ///
-    /// Window-wide, not parked (one keyboard); the pane it landed in is stored
-    /// in the value and checked against `bound`. No reset clears it: it
-    /// self-expires after [`TYPED_EDIT_WITNESS_MS`].
+    /// The last committed edit keystroke ([`TypedEdit`]). Window-wide, not
+    /// parked (one keyboard); its pane is stored in the value. No reset clears
+    /// it: it self-expires after [`TYPED_EDIT_WITNESS_MS`].
     typed_edit: Option<TypedEdit>,
     /// The trick flash ([`crate::trick_flash`]): the word just typed to the pet
     /// (`sit`, the `good` of `good kitty`) flashing rainbow for about a second.
-    /// Noted by the input path ([`Self::note_trick_typed`]), found by the
-    /// rescan, painted by `tick`.
-    ///
-    /// One slot per engine, not parked (one keyboard); the pane is stored in
-    /// the value and every hook compares it to [`Self::scan_scope`]. Unlike
-    /// `typed_edit`, a reset clears it ([`Self::reset_word_transient_state`]),
-    /// since it holds grid cells and captured colours.
+    /// One slot per engine, not parked (one keyboard); its pane is stored and
+    /// compared to [`Self::scan_scope`]. Unlike `typed_edit`, a reset clears it
+    /// (it holds grid cells and captured colours).
     trick_flash: TrickFlash,
     /// Per-tick scratch (§6.5): `(occurrence index, nova index)` pairs, each
     /// live nova's ≤ MAX_COUPLING_WORDS nearest ink-bearing occurrences.
@@ -2188,13 +2075,10 @@ pub struct WordDecorations {
     /// multiply it; a non-bracketing host keeps one prologue per tick.
     host_brackets_frames: bool,
     /// The one-body law: has a cursor-companion body already reached this host
-    /// frame's free stream?
-    ///
-    /// The host decides which companion owns a frame
-    /// (`app_render::cursor_companion_duty`); the two companion emitters check
-    /// this latch so a second body in the same frame is refused. Armed only for
-    /// a bracketing host ([`Self::host_brackets_frames`]); gallery/preview/test
-    /// hosts emit several companions into separate buffers.
+    /// frame's free stream? The host picks the owner
+    /// ([`crate::companion::cursor_companion_duty`]); both companion emitters
+    /// refuse a second body. Armed only for a bracketing host; gallery, preview
+    /// and test hosts emit several companions into separate buffers.
     companion_body_drawn: bool,
 }
 
@@ -2459,13 +2343,9 @@ impl WordDecorations {
         self.reset_transient_state();
     }
 
-    /// Move the live fields into `key`'s parked slot, leaving a blank slate.
-    /// `key` owns that state: the pane a composed host bound or the session an
-    /// unsplit host declared. Both share one id space (the composed renderer's
-    /// `bind_pane` key is `r.session`), so a session keeps one slot whether it
-    /// is a pane or a whole grid.
-    ///
-    /// Overwrites an older slot under `key`: the live fields are newer.
+    /// Move the live fields into `key`'s parked slot (overwriting it), leaving
+    /// a blank slate. Panes and declared sessions share one id space (the
+    /// composed renderer's `bind_pane` key is `r.session`).
     fn park_live_state(&mut self, key: u64) {
         let mut slot = ParkedPane::default();
         slot.swap(self);
@@ -2478,8 +2358,7 @@ impl WordDecorations {
     /// Every visible pane drives this engine in turn, so each has its own
     /// damage epoch, column count, episode map, done marks and rescan sequence;
     /// otherwise panes would share spent one-shots, alternating widths would
-    /// pin `born_settled`, and the `REKEY_MAX_SEQ_GAP` window would break
-    /// (owner, 2026-07-28).
+    /// pin `born_settled`, and the `REKEY_MAX_SEQ_GAP` window would break.
     pub fn bind_pane(&mut self, key: u64, px_origin: (i32, i32)) {
         self.pane_px = px_origin;
         match self.bound {
@@ -2489,8 +2368,18 @@ impl WordDecorations {
                 // The live fields hold window-wide state (one pane covering the
                 // whole grid) whose words just moved: the v3 §1.1 "pane-space
                 // change → transient reset". Not `reset()`, which would also
-                // wipe the correctly scoped parked panes.
+                // wipe the correctly scoped parked panes. Nor a trick flash
+                // found in a pane: it is that pane's (`retain_panes` already
+                // dropped one whose pane left), so closing the bound pane
+                // never kills a sibling's flash at the next bind.
+                let flash = self
+                    .trick_flash
+                    .found_in_a_pane()
+                    .then(|| std::mem::take(&mut self.trick_flash));
                 self.reset_bound();
+                if let Some(flash) = flash {
+                    self.trick_flash = flash;
+                }
             }
         }
         let mut slot = self.parked.remove(&key).unwrap_or_else(ParkedPane::fresh);
@@ -2499,33 +2388,23 @@ impl WordDecorations {
     }
 
     /// Declare which session the live fields describe on a host that binds no
-    /// pane (the unsplit renderer and its capture twin).
+    /// pane (the unsplit renderer and its capture twin). Without it `bound` is
+    /// `None`, which session tests such as [`Self::typed_edit_witness`] read as
+    /// a wildcard, so tab A's keystroke could re-arm a spent cat in tab B.
+    /// Idempotent; single-grid hosts call it every frame before rescan/tick.
     ///
-    /// Without it `bound` is `None`, which session tests such as
-    /// [`Self::typed_edit_witness`] read as a wildcard, so tab A's keystroke
-    /// could re-arm a spent cat in tab B. The wildcard remains only for hosts
-    /// that name no session (hostless wasm/web builds, raw engine tests).
-    /// Idempotent and cheap; single-grid hosts call it every frame before the
-    /// rescan/tick pair.
-    ///
-    /// - A change of session forces a rescan: `occ` belongs to one grid, and
-    ///   [`Self::needs_rescan`]'s epoch test cannot see a switch between two
-    ///   terminals whose counters coincide.
-    /// - A declaration outranks a disagreeing binding: nothing unbinds when a
-    ///   window stops compositing, so a stale `bound` would reject the unsplit
-    ///   tab's own keystrokes. The bound pane's state is parked, as
-    ///   `bind_pane` would.
-    /// - Each tab parks its episodes under its session. Idents fold no row or
-    ///   session, and alignment picks candidates by `form_id`, so a shared map
-    ///   would let tab A's spent episode answer for tab B's identical word.
-    ///   Keys match `bind_pane`'s, pruned by [`Self::retain_panes`].
-    /// - Parking uses [`Self::park_live_state`] and leaves [`Self::bound`]
-    ///   alone: `pane_px`, [`Self::retain_panes`] and `caret_of_pane` read
-    ///   `bound` as "a composed host is compositing this pane".
-    /// - The first declaration adopts the live fields instead of parking: they
-    ///   are that session's own state, and swapping in a fresh slate would
-    ///   replay its cats (see also
-    ///   `typed_edit_survives_a_split_collapse_to_one_pane`).
+    /// - A change of session forces a rescan (two terminals' epoch counters
+    ///   can coincide).
+    /// - A declaration retires a disagreeing binding, parking the pane's state:
+    ///   nothing unbinds when a window stops compositing, and a stale `bound`
+    ///   would refuse the unsplit tab's own keystrokes.
+    /// - Each tab parks its episodes under its session: idents fold no row or
+    ///   session, so a shared map would let tab A's spent episode answer for
+    ///   tab B. Keys match `bind_pane`'s, pruned by [`Self::retain_panes`].
+    /// - Declaring never binds: `pane_px`, `retain_panes` and `caret_of_pane`
+    ///   read `bound` as "a composed host is compositing this pane".
+    /// - The first declaration adopts the live fields as that session's own;
+    ///   a fresh slate would replay its cats.
     pub fn set_scan_session(&mut self, session: Option<u64>) {
         // Whether the live fields still hold the outgoing declaration's state.
         // Retiring a disagreeing binding parks the pane's state and leaves a
@@ -2577,18 +2456,13 @@ impl WordDecorations {
     }
 
     /// Declare the absolute row of the top visible line (`RenderInput::base_y`,
-    /// captured under the same lock as the cells) for the next rescan in the
-    /// current scan scope. Call it beside [`Self::set_scan_session`] /
-    /// [`Self::bind_pane`], before the rescan.
+    /// read under the same lock as the cells) for the next rescan in the current
+    /// scan scope, beside [`Self::set_scan_session`] / [`Self::bind_pane`].
     ///
-    /// Used by the trick flash: `sit⏎` on the bottom row scrolls before its echo
-    /// is scanned, so the engine tests the exact row
-    /// `caret.row − (base_y_now − base_y_then)` instead of guessing upward.
-    ///
-    /// Optional: without it every scroll delta reads as zero and the flash
-    /// falls back to its bounded upward search. The value is keyed to its scope
-    /// and spent by the next rescan, so declare it before every rescan of a
-    /// pane whose keys can reach [`Self::note_trick_typed`].
+    /// The trick flash uses it to find `sit⏎` after the echo scrolled: it tests
+    /// row `caret.row − (base_y_now − base_y_then)`. Without it every delta
+    /// reads as zero and the flash falls back to a bounded upward search. Spent
+    /// by the next rescan in its scope.
     pub fn set_scan_base_y(&mut self, base_y: Option<i64>) {
         let scope = self.scan_scope();
         self.trick_flash.declare_base_y(scope, base_y);
@@ -2734,10 +2608,7 @@ impl WordDecorations {
         self.have_scanned = false;
         self.last_epoch = 0;
         self.active_until = None;
-        // The tokenise memo is valid only against the lexicon + scan gates that
-        // produced it; clearing it here keeps a reloaded deny-list or language
-        // set from being ignored on unchanged rows. A cold memo costs only
-        // warm-up.
+        // The memo is valid only for the lexicon and gates that produced it.
         self.scan_memo.clear();
         self.ink_base_fg.clear();
         self.ink_cols.clear();
@@ -2755,7 +2626,7 @@ impl WordDecorations {
         // §F4.2: pending sightings die with the state.
         self.sightings.clear();
         self.unlogged.clear();
-        // Curse-BONK cues die with the state too (their episode latches just
+        // Curse bonk cues die with the state too (their episode latches just
         // cleared with `persist` — no orphaned sound may outlive its word).
         self.curse_cues.clear();
         // Peek cues too: no orphaned bat may outlive its peek.
@@ -2787,10 +2658,11 @@ impl WordDecorations {
     }
 
     /// Resume after [`freeze`](Self::freeze): shifts every stored timestamp
-    /// (`appeared`, `nova_start`, `phase_start`, gaze changes, limiter slots,
-    /// `active_until`, the settle deadline) forward by the freeze duration, so
-    /// animations resume where they paused. `last_seen` is shifted too, so
-    /// occluded episodes keep their remaining grace. No-op when not frozen.
+    /// (`appeared`, `last_seen`, `nova_start`, `phase_start`, `peek_pause`,
+    /// limiter slots, `active_until`, the settle deadline, the burst mutex and
+    /// its hint) forward by the freeze duration, so animations resume where
+    /// they paused and occluded episodes keep their remaining grace. No-op when
+    /// not frozen.
     pub fn thaw(&mut self, now: Instant) {
         let Some(t0) = self.frozen_at.take() else {
             return;
@@ -2880,17 +2752,10 @@ impl WordDecorations {
         self.peek_cues.drain(..)
     }
 
-    /// Sync whether the host can present this window right now (focused and not
-    /// deco-suspended, as for the companion's `set_collection_presentable`).
-    ///
-    /// While away nothing renders, so nothing is scanned, and every feline word
-    /// that arrived meanwhile would be born at once on return. Returning to
-    /// presentable therefore latches `spend_next_births`: the next rescan's
-    /// births are born-settled (no entrance, no burst roll, settled ink), as if
-    /// their peek elapsed unwatched. Only retyping
-    /// ([`Self::note_typed_edit`]) plays such a word's cat again.
-    ///
-    /// `now` is unused; kept for host API compatibility (owner, 2026-08-09).
+    /// Sync whether the host can present this window (focused and not
+    /// deco-suspended). Nothing is scanned while away, so on return
+    /// `spend_next_births` latches: the next rescan's births are born-settled,
+    /// as if their peek elapsed unwatched. `now` is unused (API compatibility).
     pub fn set_presentable(&mut self, _now: Instant, presentable: bool) {
         if self.away != presentable {
             return; // no transition (`away` is the inverse of `presentable`)
@@ -2914,25 +2779,12 @@ impl WordDecorations {
         self.cat_baker.atlas()
     }
 
-    /// Emit the cat flying in front of the cursor, with the `rainbow kitty`
-    /// ribbon as its wake. The lifecycle lives host-side
-    /// ([`crate::kitty_cursor::CursorCat`]); this bakes the CatBaker cat (happy,
-    /// or a wink) or a user sprite into the shared free atlas and stamps one
-    /// companion-body `OverText`/NEAREST [`FreeSprite`] just ahead of the
-    /// cursor cell, centred on its row, at `alpha`. Sing-along notes stream
-    /// just behind the body.
-    ///
-    /// Primes the baker itself (the emission `tick` bails early when no
-    /// cat-words are on screen). Near the right margin the cat clamps to the
-    /// grid edge, rising up to half a cell rather than covering the glyphs.
-    /// When the desired tile cannot bake this frame it falls back to the
-    /// resident Open-eyes tile, emitting nothing only when none is resident.
-    ///
-    /// Call after `tick`, appending into the same `free` buffer.
-    ///
-    /// The lead ([`Self::KITTY_LEAD_NUM`]/[`Self::KITTY_LEAD_DEN`]) is 3/4 of a
-    /// cell from the cursor cell's right edge: escorting the cursor without
-    /// crowding the glyph being typed.
+    /// The flying cursor kitty's dest rect for `layout`, from the emitter's own
+    /// sizing and placement math. It flies 3/4 cell
+    /// ([`Self::KITTY_LEAD_NUM`]/[`Self::KITTY_LEAD_DEN`]) past the cursor
+    /// cell's right edge, centred on its row; near the right margin it clamps
+    /// to the grid edge, rising up to half a cell rather than covering glyphs.
+    /// `None` when disabled, geometry-less, or the grid is narrower than the cat.
     #[must_use]
     pub fn kitty_cursor_footprint(&self, layout: KittyCursorLayout) -> Option<CatFootprint> {
         let KittyCursorLayout {
@@ -3136,19 +2988,24 @@ impl WordDecorations {
         i32::from(cell_w).saturating_mul(Self::KITTY_LEAD_NUM) / Self::KITTY_LEAD_DEN
     }
 
-    /// Time constant, in seconds, of the settled placement follower — each
-    /// settled frame the drawn body closes `1 - exp(-dt/PLACE_TAU)` of its
-    /// remaining gap to the bob-excluded rest target (Appendix A of
-    /// DESIGN-kitty-motion-2026-08-19: the per-key x hop and the margin rise
-    /// staircase are the teleports left after the authenticated fold seam).
-    /// Sibling law to `kitty_cursor::DISP_TAU` (0.13 s), the same exponential
-    /// on the POSE spine; placement follows slightly QUICKER than the pose so
-    /// the body reads as escorting the caret, never dragged behind it: at a
-    /// 16 ms frame the staircase's worst `cell_h/2` step lands as ~2 px
-    /// moves, while a one-cell hop still completes within ~4·tau ≈ a third
-    /// of a second.
+    /// Time constant, in seconds, of the settled placement follower: each
+    /// settled frame the drawn body closes `1 - exp(-dt/PLACE_TAU)` of its gap
+    /// to the bob-excluded rest target, smoothing the per-key x hop and the
+    /// margin-rise staircase (Appendix A of DESIGN-kitty-motion-2026-08-19).
+    /// Quicker than the pose's `kitty_cursor::DISP_TAU` (0.13 s) so the body
+    /// escorts the caret rather than trailing it: at 16 ms frames a `cell_h/2`
+    /// step lands as ~2 px moves, and a one-cell hop completes in ~0.3 s.
     const PLACE_TAU: f32 = 0.08;
 
+    /// Emit the cat flying in front of the cursor, with the `rainbow kitty`
+    /// ribbon as its wake. The lifecycle lives host-side
+    /// ([`crate::kitty_cursor::CursorCat`]); this bakes the CatBaker cat or a
+    /// user sprite into the shared free atlas and stamps one companion-body
+    /// `OverText`/NEAREST [`FreeSprite`] at [`Self::kitty_cursor_footprint`],
+    /// with the sing-along notes behind it. Primes the baker itself; a non-open
+    /// eye frame that cannot bake falls back to the resident Open-eyes tile.
+    /// Call after `tick`, into the same `free` buffer. The settled, clockless
+    /// path; hosts that fold use [`Self::kitty_cursor_at_placement`].
     pub fn kitty_cursor(
         &mut self,
         frame: KittyCursorFrame,
@@ -3517,23 +3374,12 @@ impl WordDecorations {
         true
     }
 
-    /// Emit the full-body pet ([`crate::kitty_pet`]) as one free sprite.
-    ///
-    /// Unlike [`Self::kitty_cursor`], the pet has its own position and stands
-    /// on the row's baseline:
-    ///
-    /// * `x` comes from the brain's fractional column, not the cursor cell.
-    /// * The sprite's bottom edge sits on `(row + 1)·cell_h`, lifted by the
-    ///   brain's arc; squash and stretch scale about the feet.
-    /// * `flip_x` carries facing (art is authored facing right).
-    ///
-    /// Returns `None` when the pet is invisible or its tile has not baked yet
-    /// (the shared bake budget may be spent; the pose lands next frame).
-    ///
-    /// Also draws the breed handoff's departing bodies
-    /// ([`crate::kitty_pet::PetFrame::departures`]) in the old `(coat, iris)`
-    /// and the palette each one's body was drawn in, each with its own held
-    /// tile.
+    /// Emit the full-body pet ([`crate::kitty_pet`]) as one free sprite, at the
+    /// brain's fractional column with its feet on `(row + 1)·cell_h` (lifted by
+    /// the arc; squash and stretch about the feet), plus its motes and the
+    /// breed handoff's departing bodies, each in its own look and held tile.
+    /// `None` when the pet is invisible or another companion body owns the
+    /// frame; a frame whose tiles have not baked still returns its fingerprint.
     pub fn pet_cursor(&mut self, frame: PetCursorFrame, free: &mut Vec<FreeSprite>) -> Option<u64> {
         let PetCursorFrame {
             geom,
@@ -3627,12 +3473,10 @@ impl WordDecorations {
         });
 
         // ── the pet's mote lane ─────────────────────────────────────────────
-        // Landing dust, sleep z's, purr notes: accents resolved by the brain
-        // and painted here. Motes are never grid-aligned or text-coloured
-        // (rotated, scaling, drifting, fading, accent-tinted), so none can read
-        // as a terminal glyph. Tiles bake white at a few rotation buckets and
-        // are tinted per sprite; a bake-budget miss lands next frame. Pushed
-        // before the body, so a fresh mote emerges from behind the cat.
+        // Landing dust, sleep z's, purr notes. Never grid-aligned or
+        // text-coloured, so none reads as a terminal glyph; white tiles at a few
+        // rotation buckets, tinted per sprite. Pushed before the body, so a
+        // fresh mote emerges from behind the cat.
         let mut mote_sprites: [Option<FreeSprite>; crate::kitty_pet::PET_MOTES_MAX] =
             [None; crate::kitty_pet::PET_MOTES_MAX];
         let grid_w = i32::from(geom.cols).saturating_mul(i32::from(geom.cell_w));
@@ -3691,19 +3535,15 @@ impl WordDecorations {
             });
         }
         // ── the departing bodies (the breed handoff's outgoing kitties) ────
-        // Each ghost draws like the live body (its own
-        // [`crate::pet_baker::PetBakeKey`] and `host_id`, the same feet-anchored
-        // `body_px` via a synthetic [`PetFrame`], at its own stance) in its old
-        // `(coat, iris)` and its own palette.
-        // Held tiles (`pet_depart_tiles`, one per ghost) absorb bake misses
-        // without strobing. Ghosts push first, so they run off behind the
-        // live pet.
+        // Each ghost draws like the live body (its own `PetBakeKey`, the same
+        // feet-anchored `body_px`) in its old `(coat, iris)` and palette; held
+        // tiles absorb bake misses. Ghosts push first, so they run off behind
+        // the live pet.
         let mut depart_sprites: [Option<FreeSprite>; crate::kitty_pet::PET_DEPARTURES_MAX] =
             [None; crate::kitty_pet::PET_DEPARTURES_MAX];
         for (slot, d) in depart_sprites.iter_mut().zip(pet.departures) {
-            // A GHOST ON ITS OWN GLASS stands in another pane's cells: never
-            // this lane's ([`Self::pet_own_glass`] places it). Its held tile
-            // is its own and stays.
+            // A ghost on its own glass stands in another pane's cells
+            // ([`Self::pet_own_glass`] draws it); its held tile stays.
             let Some(d) = d.filter(|d| !d.own_glass) else {
                 continue;
             };
@@ -3764,11 +3604,9 @@ impl WordDecorations {
         }
     }
 
-    /// ONE DEPARTING BODY'S SPRITE at `geom`, in that grid's own pixels: the
-    /// live lane's ghost law, shared by [`Self::pet_cursor`] and
-    /// [`Self::pet_own_glass`]. Baked in the ghost's own palette, else
-    /// `colors` (the frame's). The ghost's id keys its held tile
-    /// (`pet_depart_tiles`).
+    /// One departing body's sprite at `geom`, in that grid's pixels, shared by
+    /// [`Self::pet_cursor`] and [`Self::pet_own_glass`]. Baked in the ghost's
+    /// own palette, else `colors`; its id keys its held tile.
     fn pet_departure_sprite(
         &mut self,
         d: crate::kitty_pet::PetDepartureSprite,
@@ -3777,17 +3615,15 @@ impl WordDecorations {
         colors: CatColorKey,
         (nat_w, nat_h): (u16, u16),
     ) -> Option<FreeSprite> {
-        // The ghost rides the live pet's own PRESENCE envelope
-        // (`lane_alpha`): if the pet is fading off the glass, its ghosts
-        // fade with it — but never the ARRIVAL ramp, which belongs to the
-        // incoming body alone. The composed `pet.alpha` here would launch the
-        // leaver at 6% beside a 6% arriver on the swap frame (§1.1(a)).
+        // The ghost rides the live pet's presence envelope (`lane_alpha`) but
+        // never the arrival ramp, which belongs to the incoming body: the
+        // composed `pet.alpha` would launch the leaver at 6% beside a 6%
+        // arriver on the swap frame.
         let alpha = (u16::from(d.alpha) * u16::from(pet.lane_alpha) / 255) as u8;
         if alpha == 0 {
             return None;
         }
-        // THE GHOST'S OWN HOLD (the field's docstring): found by its id,
-        // never by its slot, so no other ghost's tile is ever worn.
+        // The ghost's own hold, found by its id, never by its slot.
         let held = self
             .pet_depart_tiles
             .iter()
@@ -3816,7 +3652,7 @@ impl WordDecorations {
         let (ax, ay) = resolved.or(held)?;
         let ghost = crate::kitty_pet::PetFrame {
             alpha,
-            // The ghost's frame IS its composed byte — `body_px` and the
+            // The ghost's lane alpha is its composed byte: `body_px` and the
             // sprite read the same value, and the lane factor is already
             // folded in above.
             lane_alpha: alpha,
@@ -3853,10 +3689,9 @@ impl WordDecorations {
             tint: 0x00FF_FFFF,
             alpha,
             flip_x: d.facing_left,
-            // A re-sighting ghost stands on glass a NEW screen owns, or on
-            // its own glass nobody observes any more
-            // (`PetDepartureSprite::under_ink`): beneath whatever ink is
-            // there, so the text in front of it stays legible.
+            // A re-sighting ghost stands on glass a new screen owns, or on its
+            // own unobserved glass (`PetDepartureSprite::under_ink`): beneath
+            // the ink, so the text stays legible.
             z: if d.under_ink {
                 FreeZ::UnderText
             } else {
@@ -3866,17 +3701,13 @@ impl WordDecorations {
         })
     }
 
-    /// THE GHOST ON ITS OWN GLASS (`PetDepartureSprite::own_glass`): a
-    /// split-pane focus switch's fading half — the old body in the pane the
-    /// focus left, still on glass beside the new one. The departure in
-    /// `slot` is drawn at THAT pane's grid (`own`: its cols and rows, at this
-    /// frame's cell metrics), moved to its pane `origin` in window-grid
-    /// pixels and cropped to that pane, so it stands exactly where the body
-    /// was drawn and never crosses a divider; beneath the text (its
-    /// `under_ink`). Pushed into `free`, the WINDOW's channel — a pane's
-    /// placement would put it in the focused pane, or crop it away. Ghosts
-    /// in different panes are drawn one call each, each at its own pane
-    /// (`CompanionFrame::glass`).
+    /// Draw the departure in `slot` on its own glass
+    /// (`PetDepartureSprite::own_glass`): a split-pane focus switch's fading
+    /// half, the old body still in the pane the focus left. It is drawn at that
+    /// pane's grid (`own`: its cols and rows at this frame's cell metrics),
+    /// moved to the pane's window-grid `origin` and cropped to it, beneath the
+    /// text. Pushed into `free`, the window's channel: a pane's placement would
+    /// put it in the focused pane. One call per ghost (`CompanionFrame::glass`).
     ///
     /// Call it right after a [`Self::pet_cursor`] that drew this frame's pet
     /// (`Some`): it rides that call's baker frame, one-body claim and
@@ -3935,13 +3766,11 @@ impl WordDecorations {
         drew.then_some(fp)
     }
 
-    /// THE PET'S INK PROBE (the 0.19.0 gauntlet's F1 seam), for hosts:
-    /// `(spans, live_row)`, where `spans[r]` is viewport row `r`'s inked
-    /// columns as a half-open `[first, end)` span (`(0, 0)` = blank) and
-    /// `live_row` is the newest inked row on glass — the live output edge
-    /// the pet's watch hugs (F5). Refreshed by every rescan from the same
-    /// row walk that feeds the lexicon; between rescans the content has not
-    /// changed, so neither has the ink.
+    /// The pet's ink probe, for hosts: `(spans, live_row)`, where `spans[r]` is
+    /// viewport row `r`'s inked columns as a half-open `[first, end)` span
+    /// (`(0, 0)` = blank) and `live_row` is the newest inked row on glass, the
+    /// output edge the pet's watch hugs. Refreshed by every rescan from the row
+    /// walk that feeds the lexicon.
     ///
     /// Pass both to [`crate::kitty_pet::PetBrain::sense_ink`]
     /// (`sense_ink(0, spans, live_row)`) just before that brain's `tick`.
@@ -4129,16 +3958,10 @@ impl WordDecorations {
     const DOG_TRAIL_DEN: i32 = 4;
 
     /// Emit the typed-word dog cameo ([`crate::dog_cameo`]) as one free sprite
-    /// just behind the cursor cell, centred on its row, at the envelope alpha.
-    ///
-    /// Same two-door bake as the pet: the breed rasterizes into
-    /// [`crate::dog_baker::DogBaker`], then enters the shared atlas through
-    /// `host_tile`; a miss re-emits the last resolved tile. Near the left
-    /// margin the dog clamps to the grid edge, rising up to half a cell rather
-    /// than covering the glyph being typed.
-    ///
-    /// Call after `tick`, appending into the same `free` buffer. Returns a
-    /// fingerprint fold for the host's early-out, `None` when nothing drew.
+    /// just behind the cursor cell, centred on its row. Same two-door bake as
+    /// the pet; a miss re-emits the last resolved tile. Near the left margin it
+    /// clamps and rises rather than covering the glyph being typed. Call after
+    /// `tick`; returns the early-out fingerprint, `None` when nothing drew.
     pub fn dog_cameo(&mut self, frame: DogCameoFrame, free: &mut Vec<FreeSprite>) -> Option<u64> {
         let DogCameoFrame {
             geom,
@@ -4234,20 +4057,12 @@ impl WordDecorations {
         Some(fp)
     }
 
-    /// Emit the Robi show ([`crate::robi`]): the robot body at the evaluated
-    /// frame's pose/anchor, plus his ladder as vertically tiling segments.
-    ///
-    /// Same two-door bake as the pet ([`crate::robi_baker::RobiBaker`], then
-    /// `host_tile`); a miss re-emits the last resolved body. The ladder draws
-    /// [`FreeZ::UnderText`] so text stays readable through it; Robi walks
-    /// [`FreeZ::OverText`].
-    ///
-    /// `anchor_y`/`bar` may be negative (above row 0): the host's strip splice
-    /// shifts free sprites down, which is how Robi reaches the tab bar.
-    ///
-    /// Call after `tick`, appending into the same `free` buffer. Returns what
-    /// was drawn ([`RobiEmission`]: fingerprint and the body rect when a body
-    /// landed), `None` when nothing was emitted.
+    /// Emit the Robi show ([`crate::robi`]): the body at the frame's
+    /// pose/anchor plus his ladder as tiling segments ([`FreeZ::UnderText`], so
+    /// text reads through it; Robi walks [`FreeZ::OverText`]). Same two-door
+    /// bake as the pet; a miss re-emits the last resolved body. `anchor_y`/`bar`
+    /// may be negative: the strip splice shifts free sprites down, which is how
+    /// Robi reaches the tab bar. Call after `tick`; `None` when nothing drew.
     pub fn robi(
         &mut self,
         show: RobiShowFrame,
@@ -4482,11 +4297,8 @@ impl WordDecorations {
     /// Record a committed edit keystroke (printable/IME glyph, backspace,
     /// line/word kill) in `pane` (`None` from a host that binds no pane).
     ///
-    /// The caret is no witness that a human typed: a shell or TUI parks it at
-    /// the line it just drew, so `at_live_cursor` / `live_caret_completion`
-    /// are satisfied by pure repaints. This seam is fed from the host's input
-    /// path, never PTY output, and supplies the causality a re-arm needs
-    /// (owner, 2026-08-09).
+    /// Fed from the host's input path, never PTY output: the caret alone is no
+    /// witness of typing (see [`TYPED_EDIT_WITNESS_MS`]).
     ///
     /// Call it for content-changing keys only; navigation (arrows, Home/End)
     /// must not license a re-arm.
@@ -4504,23 +4316,15 @@ impl WordDecorations {
         });
     }
 
-    /// Record that `word` was just typed to the pet in `pane` (the typed-line
-    /// listener [`crate::typed_tricks`] fired), so the word flashes rainbow
-    /// once the rescan finds it (the crate-private `trick_flash` module).
+    /// Record that `word` was just typed to the pet in `pane` (the
+    /// [`crate::typed_tricks`] listener fired), so the word flashes rainbow
+    /// once the rescan finds it. `word` is the raw trick token; `back_chars`
+    /// counts the typed characters between it and the caret (0 for `sit␣`, 6
+    /// for the `good` of `good kitty␣`).
     ///
-    /// `word` is the raw trick token (never the pet's name); `back_chars` is
-    /// how many typed characters lie between it and the caret: 0 for `sit␣`,
-    /// 6 for the `good` of `good kitty␣`.
-    ///
-    /// Like `note_typed_edit`, fed from the host input path only, so program
-    /// output, pastes and raw controller bytes never mint a flash (`echo sit`
-    /// stays plain). The place comes from the named pane's pre-echo caret
-    /// (`caret_of_pane`) and the base-y its last cursor-bearing rescan
-    /// recorded.
-    ///
-    /// Fail-silent: a pane with no caret observation stores nothing, and a
-    /// flash in its opening third of a second is not cut off by a new one.
-    /// Constant work into fixed inline buffers, no allocation.
+    /// Fed from the host input path only, so output and pastes never mint a
+    /// flash. The place comes from the pane's pre-echo caret and recorded
+    /// base-y. Fail-silent without a caret observation; allocation-free.
     pub fn note_trick_typed(
         &mut self,
         now: Instant,
@@ -4563,16 +4367,8 @@ impl WordDecorations {
     }
 
     /// The last scanned caret belonging to `pane`: the live fields when they are
-    /// that pane's (or nothing is bound), its parked slot otherwise.
-    ///
-    /// `None` means no caret observation for that pane;
-    /// [`Self::typed_edit_reached`] then abstains, and
-    /// [`Self::typed_edit_witness`] refuses the key once the scan reaches a
-    /// different pane.
-    ///
-    /// The `bound.is_none()` arm can only mismatch for a key recorded for a
-    /// session the unsplit host is not showing, which the witness's session
-    /// test already refuses.
+    /// that pane's (or nothing is bound), its parked slot otherwise. `None`
+    /// means no observation: [`Self::typed_edit_reached`] then abstains.
     fn caret_of_pane(&self, pane: Option<u64>) -> Option<(u16, u16)> {
         match pane {
             // The host names no pane: the live fields are its one grid.
@@ -4612,16 +4408,10 @@ impl WordDecorations {
     }
 
     /// Whether a live, unspent edit keystroke witnesses this pane's scan at
-    /// `now` (see [`TYPED_EDIT_WITNESS_MS`] and [`Self::note_typed_edit`]).
-    ///
-    /// The scan's side is [`Self::scan_scope`] (the bound pane, or the session
-    /// an unsplit host declared via [`Self::set_scan_session`]); `None` matches
-    /// only when one side genuinely names no session. A host that records keys
-    /// with no pane has one grid, so its `None` crosses no divider.
-    ///
-    /// Public so hosts can check the input seam is wired: a host that never
-    /// calls [`Self::note_typed_edit`] would silently demote every retype to a
-    /// redraw. The engine reads it at alignment time.
+    /// `now` (see [`TYPED_EDIT_WITNESS_MS`]): its pane must match
+    /// [`Self::scan_scope`], and `None` on either side matches (a host that
+    /// records keys with no pane has one grid). Public so hosts can check the
+    /// input seam is wired; without it every retype reads as a redraw.
     #[must_use]
     pub fn typed_edit_witness(&self, now: Instant) -> bool {
         self.typed_edit.is_some_and(|e| {
@@ -4829,8 +4619,8 @@ impl WordDecorations {
         context: Option<(EffectGeom, u32)>,
         cursor: Option<(u16, u16)>,
     ) {
-        // v3 §1.1 fix #3: frozen ⇒ no-op, exactly like [`rescan`](Self::rescan)
-        // (the pending rescan stays pending — `last_epoch` untouched).
+        // Frozen ⇒ no-op, as in [`rescan`](Self::rescan) (`last_epoch`
+        // untouched, so the rescan stays pending).
         if self.frozen_at.is_some() {
             return;
         }
@@ -4905,17 +4695,11 @@ impl WordDecorations {
         );
     }
 
-    /// The trick flash's rescan half, one routine over both row sources
-    /// (`load_row` fills `row_buf` with one viewport row). With no flash noted
-    /// it is one `Option` test (plus a memo probe when the host declares
-    /// `base_y`).
-    ///
-    /// With one noted in this scan scope it finds the typed word on the caret's
-    /// row (shifted by the scroll `set_scan_base_y` reported) or re-verifies a
-    /// word already found, and ends the flash when the text is gone, the width
-    /// changed, or the pane is scanned without a cursor (a scrollback view).
-    /// It creates no occurrence or episode, so identity, done marks, caps and
-    /// the flash limiter never see it.
+    /// The trick flash's rescan half over either row source (`load_row` fills
+    /// `row_buf`). With a flash noted in this scope it finds the typed word on
+    /// the caret's row (shifted by the `set_scan_base_y` scroll) or re-verifies
+    /// it, and ends the flash when the text is gone, the width changed, or the
+    /// pane is scanned without a cursor. It creates no occurrence or episode.
     #[allow(
         clippy::too_many_arguments,
         reason = "threads the rescan's geometry, caret, clock, config and row source to the flash; the dense_scan_cutoff shape"
@@ -4963,22 +4747,12 @@ impl WordDecorations {
     }
 
     /// Bottom-priority row cutoff for a match-saturated screen: the first row
-    /// the restarted scan should include so that everything from it to the
-    /// bottom fits under [`MAX_OCCURRENCES`].
-    ///
-    /// Top-down truncation would starve the bottom rows (the prompt). Here rows
-    /// are walked bottom-up spending the budget and whole rows are dropped
-    /// top-down; the kept suffix is still scanned top-down, preserving
-    /// row-major order.
-    ///
-    /// The per-row estimate overcounts (raw matches before class/ambiguity
-    /// gates), so the restarted scan never overflows inside the kept rows. A
-    /// single row estimating past the whole cap is kept and truncates within
-    /// itself.
-    ///
-    /// Every row is visited so `scan_row_occupied` stays truthful for skipped
-    /// rows (the taint sweep reads it). Runs only after a saturated top-down
-    /// scan, off the per-keystroke hot path.
+    /// the restarted scan keeps so everything below fits under
+    /// [`MAX_OCCURRENCES`]. Rows are costed bottom-up and whole top rows
+    /// dropped, so the prompt keeps its slots; the kept suffix is still scanned
+    /// top-down. The estimate overcounts (raw matches), so the restart never
+    /// overflows; a single row past the cap is kept and truncates itself.
+    /// Every row is visited so `scan_row_occupied` stays truthful.
     fn dense_scan_cutoff(
         &mut self,
         rows: usize,
@@ -5139,8 +4913,7 @@ impl WordDecorations {
             &self.scan_matches
         };
         // Test-only mutation switch for the rebuild below
-        // (`memo_hit_without_the_scan_chars_rebuild_trips_the_guard`); absent
-        // in shipping builds.
+        // (`memo_hit_without_the_scan_chars_rebuild_trips_the_guard`).
         #[cfg(test)]
         let rebuild_scan_chars = !self.mutate_skip_scan_chars_rebuild;
         #[cfg(not(test))]
@@ -5189,11 +4962,8 @@ impl WordDecorations {
             let live_caret_completion = cursor.is_some_and(|(cursor_row, cursor_col)| {
                 cursor_row == r as u16 && cursor_col == end_col.saturating_add(1)
             });
-            // The caret is on the token (or the cell after): the user is typing
-            // here. Ident folds no row and the exact-context edge has no
-            // recency bound, so this witness keeps a retyped kitty from
-            // inheriting a spent ancestor (the fast-path guard below,
-            // `alignment_edge`, and the fresh-birth done-mark deletion).
+            // The caret is on the token (or the cell after): the typing witness
+            // that keeps a retyped kitty from inheriting a spent ancestor.
             let at_live_cursor =
                 cursor.is_some_and(|cell| caret_on_span(cell, r as u16, start_col, end_col));
             // A per-word override wins over the class default for any class
@@ -5225,11 +4995,9 @@ impl WordDecorations {
                 o
             };
             let ident = mix(seed ^ ordinal.wrapping_mul(ORDINAL_MIX));
-            // Fast path: a persist hit on the same row is a continuation —
-            // adopt the episode, refresh grace, skip SimHash. Anything else
-            // (a miss, or a hit on another row) defers to the rescan-end
-            // alignment; the context fingerprint is computed here while the
-            // row's char stream is in scope.
+            // Fast path: a same-row persist hit adopts the episode and skips
+            // SimHash; anything else defers to the rescan-end alignment, with
+            // the context fingerprint computed while the row is in scope.
             let seq = self.rescan_seq;
             let ttl = self.grace_override.unwrap_or(GRACE_TTL);
             let mut inert = false;
@@ -5241,11 +5009,7 @@ impl WordDecorations {
                         && !(ep.continuity_tainted
                             && (m.class == Class::Feline
                                 || (m.class == Class::Profanity && live_caret_completion)))
-                        // Typed-retype guard (as in `alignment_edge`): a spent
-                        // feline graphic absent for a full rescan (gap ≥ 2) may
-                        // not adopt the word now at the live caret; it defers
-                        // and is born fresh. Gap ≤ 1 keeps adopting, so a
-                        // finished kitty at an idle prompt does not re-arm.
+                        // Typed-retype guard, as in `alignment_edge`.
                         && !(m.class == Class::Feline
                             && at_live_cursor
                             && ep.peek_done
@@ -5344,8 +5108,6 @@ impl WordDecorations {
                         if cell.wide {
                             continue;
                         }
-                        // (`ink_bg` was already captured above from this
-                        // same first lead cell, ink-bearing or not.)
                         self.ink_base_fg.push(cell.fg);
                         self.ink_cols.push(c);
                     }
@@ -5378,8 +5140,8 @@ impl WordDecorations {
                     Class::Animal => m
                         .species
                         .and_then(|s| animal_glyph_from_key(lexicon.species_code(s))),
-                    // The agreed cross-branch seam: a canine word is the
-                    // animal roster's dog — one species, two summon paths.
+                    // A canine word is the animal roster's dog: one species,
+                    // two summon paths.
                     Class::Canine => animal_glyph_from_key("dog"),
                     _ => None,
                 },
@@ -5392,8 +5154,9 @@ impl WordDecorations {
     }
 
     /// Shared rescan epilogue: the row-anchored alignment over deferred
-    /// candidates, the §3.6 grace sweep (the done-mark write path), the §5.8
-    /// gaze sweep, resize-settle bookkeeping, and the epoch/geometry update.
+    /// candidates, the §3.6 grace sweep (the done-mark write path), the cat
+    /// text-clearance pass, resize-settle bookkeeping, and the epoch/geometry
+    /// update.
     fn rescan_end(
         &mut self,
         mut out: Vec<Occurrence>,
@@ -5508,18 +5271,12 @@ impl WordDecorations {
     }
 
     /// Two-dimensional redraw alignment (v3 §1.1). Deferred candidates group by
-    /// exact lexicon surface. An old episode can bid when (a) its
-    /// position-bearing seed is unchanged (vertical scroll / neighbor churn),
-    /// or (b) its frozen context matches (horizontal reflow); exact-seed edges
-    /// outrank context edges. Recent leftovers then get a bounded, monotone
-    /// reading-order match within a two-row window, so soft-wrap/status
-    /// redraws cannot fake fresh births; older grace-only entries never take
-    /// that weak arm.
-    ///
-    /// A new log-tail occurrence outside the window stays fresh. Matched
-    /// episodes move to the candidate's ident; unmatched old episodes
-    /// grace-expire and unmatched candidates take the normal
-    /// fresh/born-done/born-settled path.
+    /// exact lexicon surface; an old episode bids when its seed is unchanged
+    /// (vertical scroll) or its frozen context matches (horizontal reflow),
+    /// seed edges first. Recent leftovers get a bounded monotone match within
+    /// two rows, so soft-wrap/status redraws cannot fake births. Matched
+    /// episodes move to the candidate's ident; unmatched old ones grace-expire;
+    /// unmatched candidates are born.
     fn align_pending(
         &mut self,
         out: &mut [Occurrence],
@@ -5531,12 +5288,9 @@ impl WordDecorations {
             return;
         }
         let seq = self.rescan_seq;
-        // The causal half of the re-arm witness, sampled once per rescan: caret
-        // position alone is satisfied by a repaint, so every "retyped" decision
-        // below also needs a committed edit keystroke
-        // ([`Self::note_typed_edit`]). One rescan sees one caret, and
-        // `spend_typed_edit` must not change the answer mid-pass
-        // (owner, 2026-08-09).
+        // The causal half of the re-arm witness ([`Self::note_typed_edit`]),
+        // sampled once per rescan: one rescan sees one caret, and
+        // `spend_typed_edit` must not change the answer mid-pass.
         let typed_witness = self.typed_edit_witness(now);
         // Set when a re-arm used the keystroke, so it is spent at the tail: one
         // key completes one word.
@@ -5623,14 +5377,11 @@ impl WordDecorations {
             self.align_old
                 .sort_unstable_by_key(|(k, ep)| (ep.last_row, ep.last_col, *k));
 
-            // One monotone sequence-alignment DP covers all three evidence arms.
-            // Stationary survivors are primary (the log-rotation
-            // discriminator), then maximum cardinality prevents greedy ties from
-            // manufacturing births during reflow. Exact seed outranks exact
-            // context, which outranks bounded recent continuity; reading-order
-            // distance is the final cost. Monotonicity keeps twins from
-            // crossing. Two rolling score rows plus one decision byte per cell:
-            // no hot allocation.
+            // One monotone alignment DP over all three evidence arms: stationary
+            // survivors first (the log-rotation discriminator), then maximum
+            // cardinality (no births manufactured by greedy ties), then seed >
+            // context > recent continuity, then reading-order distance.
+            // Monotonicity keeps twins from crossing.
             winner[..group_len].fill(None);
             prev_scores[..=group_len].fill(AlignScore::default());
             decisions[1..=group_len].fill(2); // row zero: skip candidate
@@ -5686,11 +5437,8 @@ impl WordDecorations {
             }
             let group_class = out[usize::from(pending[group[0]].occ_idx)].class;
             let has_tainted_old = self.align_old.iter().any(|(_, ep)| ep.continuity_tainted);
-            // Typed = a committed edit keystroke that landed within reach of
-            // this token, and the caret on the token. The keystroke makes it
-            // causal, its cell makes it about this word, and the caret says the
-            // token ends where typing stopped. See `typed_reentry` below and
-            // [`TYPED_EDIT_REACH_COLS`].
+            // Typed = a committed keystroke within reach of this token (causal,
+            // and about this word) and the caret at the token's end.
             let group_has_live_caret_completion = group
                 .iter()
                 .any(|&k| typed_here[k] && pending[k].live_caret_completion);
@@ -5698,11 +5446,10 @@ impl WordDecorations {
             // shell parks the caret on the line it drew) proves a human typed,
             // so both classes also require the keystroke witness.
             //
-            // The keys a typed candidate in this group will be born under. The
-            // unmatched-old sweep below deletes a spent ancestor's guard only for
-            // these keys, so retyping one occurrence does not unprotect another
-            // (owner, 2026-08-09).
-            // Bounded by MAX_OCCURRENCES.
+            // The keys a typed candidate in this group will be born under
+            // (≤ MAX_OCCURRENCES). The unmatched-old sweep below deletes a spent
+            // ancestor's guard only for these keys, so retyping one occurrence
+            // does not unprotect another.
             let mut typed_keys = [0u64; MAX_OCCURRENCES];
             let mut typed_keys_len = 0usize;
             for &k in group.iter() {
@@ -5742,22 +5489,14 @@ impl WordDecorations {
                     // Fresh episode: done_marks lookup is free here — ctx_fp
                     // was already computed on the (deferred) miss path.
                     let key = occ.ident ^ pending[k].ctx_fp;
-                    // Typed re-entry: `typed_here[k]` (a committed edit
-                    // keystroke that landed within reach of this token, which no
-                    // PTY output can synthesize) plus the class's caret witness
-                    // (owner, 2026-08-09).
-                    // Taint alone only proves the screen changed, and caret
-                    // position alone is satisfied by a shell parking its caret
-                    // after a repaint. A typed re-entry re-arms: neither a prior
-                    // done mark nor the old episode's departure may make it
-                    // inert, and for feline its colliding session done mark is
-                    // deleted rather than honored.
-                    //
-                    // Resident old evidence (`group_has_old`) is not required:
-                    // an episode grace-expires after `GRACE_TTL` but its done
-                    // mark lives for the session, so a retype after the grace
-                    // window would otherwise be born done. A passive
-                    // re-appearance has no keystroke and so does not re-arm.
+                    // Typed re-entry: `typed_here[k]` (a committed keystroke
+                    // within reach of this token, which no PTY output can
+                    // synthesize) plus the class's caret witness. It re-arms:
+                    // neither a prior done mark nor the old episode's departure
+                    // makes it inert, and a feline's colliding done mark is
+                    // deleted. Resident old evidence is not required, since a
+                    // done mark outlives its episode's `GRACE_TTL`; a passive
+                    // re-appearance has no keystroke and does not re-arm.
                     let typed_reentry = typed_here[k]
                         && ((group_class == Class::Feline && pending[k].at_live_cursor)
                             || (group_class == Class::Profanity
@@ -5778,25 +5517,19 @@ impl WordDecorations {
                     ep.last_col = occ.start_col;
                     ep.cat_colors = occ.cat_colors;
                     ep.burst_kind = occ.spec.burst.map(|b| b.kind);
-                    // The session birth sequence advances on every persist miss;
-                    // the burst-axis roll is decided once here for every
-                    // `BurstKind` (per appearance, so repeats of a word at the
-                    // same prompt decorrelate; chance 100 = always) and stored so
-                    // alignment transfers it. Skipped for born-done/born-settled
-                    // episodes.
+                    // `birth_seq` advances on every persist miss; the burst roll
+                    // is decided once here, per appearance (repeats decorrelate),
+                    // and stored so alignment transfers it.
                     self.birth_seq = self.birth_seq.wrapping_add(1);
                     if !(born_done || born_settled)
                         && let Some(b) = occ.spec.burst
                         && b.chance_pct > 0
                     {
-                        // §3.2b f-bomb combo: a typed f-bomb (the bonk witness
-                        // below) charges the streak before the decode, so this
-                        // birth counts itself. Redraws, scrollback and output
-                        // ride the ambient level without feeding it; classic
-                        // novas and custom bursts neither charge nor escalate. A
-                        // configured chance of 0 stays an absolute off-switch.
-                        // `typed_here[k]` keeps a scrolling build log (caret one
-                        // past its last token) from charging it.
+                        // §3.2b f-bomb combo: a typed f-bomb charges the streak
+                        // before the decode, so this birth counts itself; other
+                        // births ride the ambient level. Classic novas and
+                        // custom bursts neither charge nor escalate, and chance
+                        // 0 stays an absolute off-switch.
                         let level = if b.kind == BurstKind::SuperNova {
                             let typed = typed_here[k]
                                 && group_class == Class::Profanity
@@ -5817,13 +5550,9 @@ impl WordDecorations {
                         ep.burst_tier = supernova::tier_for(draw, level);
                     }
                     // Curse bonk typed witness, latched at the only fresh-birth
-                    // site: a Profanity episode born with the caret one past the
-                    // token and a committed edit keystroke within reach (the
-                    // pair `typed_reentry` trusts). Redraws and output either
-                    // adopt an existing episode or lack the witness; ambiguous
-                    // live-caret forms never became occurrences; inert births
-                    // stay silent. The keystroke half matters because this makes
-                    // a sound, and output leaves the caret one past a curse too.
+                    // site: caret one past the token and a committed keystroke
+                    // within reach (output leaves the caret one past a curse
+                    // too, and this makes a sound). Inert births stay silent.
                     if !(born_done || born_settled)
                         && typed_here[k]
                         && group_class == Class::Profanity
@@ -5856,12 +5585,10 @@ impl WordDecorations {
                 {
                     // Typed re-entry closes the old episode as an intentional
                     // retype and must not leave a done mark that makes the new
-                    // token inert. It requires the same typed witness (caret and
-                    // keystroke, folded into `group_has_at_live_cursor` /
-                    // `group_has_live_caret_completion`) as the birth site above,
-                    // otherwise a repaint would delete the mark and re-arm the
-                    // cat. Key-matched, not group-wide: retyping one `kitty` must
-                    // not strip another's guard (owner, 2026-08-09).
+                    // token inert. Same typed witness as the birth site above,
+                    // else a repaint would delete the mark and re-arm the cat.
+                    // Key-matched, not group-wide: retyping one `kitty` must not
+                    // strip another's guard.
                     let old_key = old_ident ^ ep.ctx_fp;
                     if group_class == Class::Feline
                         && !typed_keys[..typed_keys_len].contains(&old_key)
@@ -5889,30 +5616,20 @@ impl WordDecorations {
         }
     }
 
-    /// Advance the animation one frame and emit this frame's decorations into
-    /// `out`, animated-ink fg overrides into `ink` (sorted `(row, col)` unique,
-    /// the [`InkCell`] invariant: emission is row-major over non-overlapping
-    /// matches, and the trick flash's cells are merged in order, replacing on
-    /// an equal cell), peeking cats into `free` (one [`FreeSprite`] per cat plus
-    /// its gaze-light dots, paired with [`WordDecorations::free_atlas`]), and
-    /// supernova additive light into `nova` (§6; premultiplied `0x00RRGGBB`
-    /// row-band GlowQuads for the `nova_add` channel).
+    /// Advance the animation one frame and emit into `out` (decorations), `ink`
+    /// (fg overrides, sorted unique `(row, col)`: row-major emission, the trick
+    /// flash merged in order), `free` (one [`FreeSprite`] per cat, paired with
+    /// [`WordDecorations::free_atlas`]) and `nova` (§6 premultiplied row-band
+    /// GlowQuads for `nova_add`).
     ///
-    /// `companion` is the host's view of the cursor companion
-    /// ([`CompanionOnGlass`]) when one (the flying head
-    /// [`WordDecorations::kitty_cursor`] or the pet
-    /// [`WordDecorations::pet_cursor`]) is drawn into this `free` stream this
-    /// frame, else `None`. Its `cell` drives the one-cat-per-caret suppression
-    /// (the claim at the top of the tick, [`WordDecorations::companion_claim`],
-    /// and the caret-on-span gate), and its `body_px` is the pixel-yield box
-    /// (`CatTick::companion_px`). Callers read it under the Terminal lock they
-    /// already hold. `sel` is the selection view read under the same lock
-    /// (§6.4). `_focused` is unused (native hosts demote unfocused windows to
-    /// `reduced_motion`).
+    /// `companion` is the cursor companion drawn into this `free` stream this
+    /// frame, if any: its `cell` drives the one-cat-per-caret claim and
+    /// caret-on-span gate, its `body_px` the pixel yield. `sel` is the
+    /// selection view (§6.4); `_focused` is unused (hosts demote unfocused
+    /// windows to `reduced_motion`).
     ///
     /// Returns a fingerprint that changes every frame while anything animates
-    /// (so the repaint early-out never skips a live frame) and is stable
-    /// otherwise. Empty outputs with fp `0` mean nothing to draw.
+    /// and is stable otherwise; empty outputs with fp `0` mean nothing to draw.
     #[allow(
         clippy::too_many_arguments,
         reason = "the per-frame tick threads the clock, config, geometry, companion view, selection view, focus gate, and four output scratches through one call; a wrapper struct would relocate the list, not simplify it"
@@ -5930,9 +5647,9 @@ impl WordDecorations {
         free: &mut Vec<FreeSprite>,
         nova: &mut Vec<GlowQuad>,
     ) -> u64 {
-        // One cat per caret (owner, 2026-08-12): the companion's cell feeds
-        // both the claim below and the `caret_on_span` gate, so the word it
-        // answers never grows an ambient twin.
+        // One cat per caret: the companion's cell feeds both the claim below
+        // and the `caret_on_span` gate, so the word it answers never grows an
+        // ambient twin.
         let companion_at = companion.and_then(|c| c.cell);
         out.clear();
         ink.clear();
@@ -5986,19 +5703,17 @@ impl WordDecorations {
                 }
             }
         }
-        // v3 §1.1 fix #3: a frozen engine emits nothing and advances nothing
-        // (defensive — hosts skip the tick while suspended; `thaw` restores).
+        // A frozen engine emits nothing and advances nothing (defensive: hosts
+        // skip the tick while suspended; `thaw` restores).
         if self.frozen_at.is_some() {
             self.novas.clear();
             self.coupling.clear();
             return 0;
         }
         if self.occ.is_empty() {
-            // Trick flash on a wordless screen (`sit` at a clean prompt, the
-            // common case). This arm returns before `frame` advances and
-            // disarms the scheduler, so the flash arms this pane's own deadline
-            // and folds its own clock into the fingerprint, or it would freeze
-            // mid-ramp. With no flash, the three lines below run unchanged.
+            // Trick flash on a wordless screen (`sit` at a clean prompt): this
+            // arm returns before `frame` advances, so the flash arms its own
+            // deadline and folds its own clock, or it would freeze mid-ramp.
             let mut fp = FNV64_OFFSET;
             let scope = self.scan_scope();
             if let Some(until) =
@@ -6034,20 +5749,18 @@ impl WordDecorations {
         // emitted after it (baking needs `self.cat_baker`, which the loop holds).
         // `MAX_ACTIVE_SUPERNOVAE = 1`, so one slot suffices.
         let mut nuke_pending: Option<(u64, i32, i32)> = None;
-        // Supernova prepass first: it owns the global burst mutex
-        // (`super_until`, from its persist-wide scan, so a live window holds
-        // even while its word is scrolled off) that the classic nova prepass
-        // defers behind, and it defers its own ignition behind a live classic
-        // window. The windows never overlap, so this pass's `nova_add` share is
-        // bounded by `max(3·392, S_max) ≤ MAX_NOVA_QUADS`. Prism wake appends
-        // outside this budget (`nova::MAX_NOVA_QUADS`).
+        // Supernova prepass first: it owns the burst mutex (`super_until`) the
+        // classic prepass defers behind, and defers behind a live classic
+        // window itself. The windows never overlap, so this pass's `nova_add`
+        // share stays within `max(3·392, S_max) ≤ MAX_NOVA_QUADS`; prism wake
+        // appends outside it.
         if let Some(until) = self.super_prepass(now, cfg, geom, sel) {
             arm_until(&mut active_until, until);
         }
         // §6.4 nova prepass: limiter grants, window expiry, and this frame's
         // live-nova and coupling scratch, before the emission loop so ink
-        // coupling (§6.5) and the gaze hook (§5.8) see every live nova. Keeps
-        // the scheduler armed through delayed ignitions.
+        // coupling (§6.5) sees every live nova. Keeps the scheduler armed
+        // through delayed ignitions.
         if let Some(until) = self.nova_prepass(now, cfg, geom, sel) {
             arm_until(&mut active_until, until);
         }
@@ -6098,11 +5811,8 @@ impl WordDecorations {
             unlogged: &self.unlogged,
             sightings: &mut self.sightings,
             peek_cues: &mut self.peek_cues,
-            // The companion's footprint (`CatTick::companion_px`): both animals
-            // pass the rect the host is about to draw (the pet's body wherever
-            // it walked, the head ~1.75 cells right of and ~0.4 rows above the
-            // caret). Neither is at the caret cell, so a caret band alone would
-            // under-cover them.
+            // The rect the host is about to draw; neither animal sits on the
+            // caret cell, so a caret band alone would under-cover it.
             companion_px: companion.map_or_else(CompanionFootprint::default, |c| c.footprint(geom)),
         };
         let mut cats = 0usize;
@@ -6186,21 +5896,10 @@ impl WordDecorations {
                         break 'graphic; // Done: zero quads forever (duty pin)
                     }
                     // One cat per caret, part 2: the companion the host draws is
-                    // this word's cat (typing `kitty` summons it at the caret),
-                    // so this word must not draw a second one. Two ways to be
-                    // that word:
-                    //
-                    // - the claim: it follows each feline word the caret reaches
-                    //   and holds over non-feline ground, so a keystroke past the
-                    //   word cannot lift the veto while the companion flies;
-                    // - the caret still on the span (the rescan's
-                    //   `at_live_cursor` predicate), covering a companion that
-                    //   appears while the caret sits on a different feline word.
-                    //
-                    // Per-occurrence and graphic-only: other feline words still
-                    // peek and this word's ink still plays. Gated here, not in
-                    // `cat_eligible`, so the arm census and Kitty Log are
-                    // untouched (the host logs the typed word itself).
+                    // this word's cat, so the word draws none. It is that word
+                    // by the claim (which holds while the companion flies) or by
+                    // the caret on the span. Graphic-only: ink still plays, and
+                    // the arm census and Kitty Log are untouched.
                     let vetoed_by = |cell: Option<(u16, u16)>| {
                         cell.is_some_and(|c| caret_on_span(c, occ.row, occ.start_col, occ.end_col))
                     };
@@ -6217,8 +5916,6 @@ impl WordDecorations {
                             break 'graphic; // tag without shipped art: ink only
                         };
                         let eligible = peek_eligible(occ, geom);
-                        // Both operands are already computed, so the eager form
-                        // is used.
                         let arm = peek.arm.unwrap_or(if !eligible {
                             KittyShownAs::PawFallbackFloor
                         } else if animals < MAX_ANIMALS {
@@ -6277,8 +5974,8 @@ impl WordDecorations {
                                 &mut active_until,
                             );
                         }
-                        // A stored Cat under a mid-episode floor flip emits
-                        // nothing (the peek clock keeps running to Done).
+                        // A stored Cat that cannot draw emits nothing while
+                        // its peek clock is paused (`peek_pause`).
                     }
                 }
             }
@@ -6442,14 +6139,9 @@ impl WordDecorations {
                 }
             }
         }
-        // The nuke cloud, emitted post-loop (`nuke_pending`): three baked tiles
-        // (base surge, column, head), each resolved by `nuke_draw` into a
-        // dest-rect transform, alpha and tint. They ride the FreeSprite lane
-        // because the cloud is art, not additive light over text.
-        //
-        // Back-to-front, so the head occludes the column. The fourth pass is the
-        // molten core: the cap tile again, smaller and hotter, on top (one tint
-        // per sprite).
+        // The nuke cloud (`nuke_pending`): base surge, column and head tiles,
+        // each placed by `nuke_draw`, drawn back to front, then the cap tile
+        // again as the smaller, hotter core. Art, so the FreeSprite lane.
         if let Some((t, cx, cy)) = nuke_pending {
             for (slot, part, core) in [
                 (0usize, crate::nuke::NukePart::Skirt, false),
@@ -6482,7 +6174,7 @@ impl WordDecorations {
                 if dest_w > grid_w {
                     continue; // a grid narrower than the cloud stays clear
                 }
-                // Anchored on the blast, standing ON the word's row and
+                // Anchored on the blast, standing on the word's row and
                 // growing upward from it.
                 let base_y = cy + i32::from(geom.cell_h) / 2;
                 let dy = (d.dy_cells * f32::from(geom.cell_h)).round() as i32;
@@ -6516,11 +6208,8 @@ impl WordDecorations {
                 ep.logged = true;
             }
         }
-        // In-dwell life (blink, ear twitch, knead, flutter) is a pure function
-        // of the dwell clock riding the is_active frame pacing; after Done
-        // nothing wakes. A rebake must repaint, so the `free_atlas` version
-        // joins the fingerprint whenever cat sprites are on screen; settled
-        // cats fold a stable version.
+        // A rebake must repaint, so the atlas version joins the fingerprint
+        // whenever cat sprites are on screen.
         if !free.is_empty() {
             fp = fnv_mix_u64(fp, self.cat_baker.version());
         }
@@ -6549,22 +6238,16 @@ impl WordDecorations {
 
     /// Episode prepass, before emission each tick:
     ///
-    /// * **Arm freezing**: a feline episode's Cat-vs-Paw arm (+ fallback cause)
-    ///   is stored at the first emission decision; `MAX_CATS` counts visible
-    ///   non-done stored-Cat episodes. A stored fallback arm has drawn nothing,
-    ///   so it is re-decided each tick and may upgrade to Cat once (playing
-    ///   from the top); a stored Cat is never downgraded.
-    /// * **Birth-latched phase clock**: `phase_start` latches in
-    ///   [`Episode::fresh`]; the prepass only advances flags off the elapsed
-    ///   clock. The clock suspends while a stored Cat is ineligible to draw
-    ///   (`peek_pause`) and shifts forward on resume.
-    /// * **Per-axis one-shot flags**: peek started/done (with a wall-clock
-    ///   completion sweep for scrolled-off mid-peek episodes), sparkle-burst
-    ///   started/done (incl. the ≤ 2 s residual fade), ink-sweep
-    ///   started/done — the `done_marks` write condition.
+    /// * **Arm freezing**: a graphic episode's Cat-vs-Paw arm is stored at the
+    ///   first emission decision (`MAX_CATS` counts visible, non-done stored
+    ///   Cats). A stored fallback drew nothing, so it is re-decided each tick
+    ///   and may upgrade to Cat once; a stored Cat is never downgraded.
+    /// * **Phase clock**: latched at birth; it pauses (`peek_pause`) while a
+    ///   stored Cat cannot draw and shifts forward on resume.
+    /// * **One-shot flags** per axis (peek, burst, ink sweep): the
+    ///   `done_marks` write condition.
     ///
-    /// Born-done / born-settled episodes are skipped. Direct-built occurrences
-    /// without episodes are untouched (emission keys off `appeared`).
+    /// Inert episodes and direct-built occurrences are skipped.
     fn episode_prepass(&mut self, now: Instant, cfg: &DecoConfig, geom: EffectGeom) {
         // §5.2 slot census over the visible occurrences only: grace-only
         // episodes cannot emit, and counting them would let departed history
@@ -6760,26 +6443,18 @@ impl WordDecorations {
     /// Departure paths (grace expiry, `reset_bound`, eviction) write marks only
     /// when an episode leaves the persist map. An episode replaced in place by
     /// a redraw never leaves, so without this stamp the newcomer's
-    /// `touch_done` misses and replays the cat on every repaint.
+    /// `touch_done` misses and replays the cat on every repaint. The write
+    /// condition is departure's ([`Episode::one_shot_started`]), so a repaint
+    /// during the rise or dwell also finds a mark; [`Episode::ledger_stamped`]
+    /// limits it to one LRU touch per episode per identity. A genuine retype
+    /// still re-arms: `typed_reentry` deletes the mark first.
     ///
-    /// The write condition is departure's ([`Episode::one_shot_started`]), so
-    /// a repaint during the rise or dwell also finds a mark. That excludes
-    /// `born_settled` and fallback arms that drew nothing.
-    ///
-    /// Reduced motion advances no axis, so nothing is stamped (a born-done
-    /// replacement would show no cat at all, where an armed one shows the same
-    /// static pose). [`Episode::ledger_stamped`] limits this to one LRU touch
-    /// per episode per identity. A genuine retype still re-arms:
-    /// `typed_reentry` deletes the mark first.
-    ///
-    /// A horizontally reflowed episode may leave a mark at its pre-reflow key
-    /// as well; that errs toward fewer cats, and deleting the old key could
-    /// drop an older episode's guard.
-    ///
-    /// The scrolled-off sweep writes only `peek_done` per entry, so fusing it
-    /// into this walk leaves the stamp order and LRU order unchanged. The
-    /// stamp is outside the `reduced_motion` guard (born-done births set their
-    /// flags regardless).
+    /// Reduced motion advances no axis, so it stamps only flags already set
+    /// (born-done births set theirs regardless): an armed replacement shows the
+    /// same static pose, where a born-done one would show no cat. A
+    /// horizontally reflowed episode may also leave a mark at its pre-reflow
+    /// key; that errs toward fewer cats, and deleting the old key could drop
+    /// an older episode's guard.
     fn stamp_spent_marks(&mut self, now: Instant, reduced_motion: bool) {
         let seq = self.rescan_seq;
         // Disjoint field borrows: the ledger is written from a walk of the
@@ -6842,15 +6517,11 @@ impl WordDecorations {
         );
     }
 
-    /// §3.2 supernova prepass (runs before the classic nova prepass). For every
-    /// rolled (`Episode::burst_roll`) rainbow occurrence: grant ignition
-    /// through the shared flash limiter (a full ignition), enforce
-    /// `MAX_ACTIVE_SUPERNOVAE = 1` (a second roll defers, earlier occurrence
-    /// wins), defer while the word is selected or any classic nova window is
-    /// live (the mutex is two-way), expire finished windows into `nova_done`,
-    /// fill this frame's `supers` scratch, and publish the global burst mutex
-    /// (`super_until`) from the persist-wide scan, so a scrolled-off live
-    /// window holds it for its whole run. `burst_done` is set at the grant.
+    /// §3.2 supernova prepass, before the classic one. For each rolled rainbow
+    /// occurrence: grant ignition through the flash limiter, one supernova at a
+    /// time (earlier wins), deferred while selected or while any classic window
+    /// is live; expire finished windows; fill `supers`; and publish
+    /// `super_until` from the persist-wide scan.
     fn super_prepass(
         &mut self,
         now: Instant,
@@ -6867,18 +6538,12 @@ impl WordDecorations {
         }
         self.prune_ignitions(now);
         let mut until: Option<Instant> = None;
-        // Any granted, still-running window occupies the mutex, even before
-        // its (possibly delayed) start and even when its word is not visible,
-        // so a second roll never overlaps it. Two-way: a live classic nova
-        // blocks a supernova ignition just as a supernova blocks classic grants
-        // in `nova_prepass`; otherwise this pass's `nova_add` share could exceed
-        // MAX_NOVA_QUADS. The stored `burst_kind` tells the windows apart. Live
-        // supernova ends fold into `super_until` here, from the persist-wide
-        // scan.
-        //
-        // Parked panes' shards count too (the mutex is window-wide; checked by
-        // the census's supernova-burst-mutex aggregator). Every live end folds
-        // into the returned wake, so a deferred grant wakes at the window end.
+        // Any granted, unfinished window holds the mutex, even before its
+        // delayed start and while its word is off screen. Two-way: a live
+        // classic nova blocks a supernova ignition, as a supernova blocks
+        // classic grants, or the `nova_add` share could exceed MAX_NOVA_QUADS.
+        // Parked shards count too (the census's supernova-burst-mutex
+        // aggregator checks this).
         let mut busy = false;
         // O(1) skip ([`Self::burst_hint`]): every end in this map is `<= hint`,
         // so once `now` reaches it the walk would change nothing. Debug builds
@@ -7105,8 +6770,7 @@ impl WordDecorations {
                 start,
                 center_px: (cx, cy),
                 r_max,
-                // The one full decode left on this path — per LIVE nova, not
-                // per occurrence.
+                // The one full decode on this path, per live nova.
                 feats: nova_features(occ.genome.gkey),
                 magic: if cfg.profanity_magic {
                     nova_magic(occ.genome.magic)
@@ -7159,20 +6823,12 @@ fn burst_center(occ: &Occurrence, geom: EffectGeom) -> (i32, i32) {
     (cx, cy)
 }
 
-/// The ignition grant both burst prepasses share: the point of no return.
-/// Requests the §6.4 flash slot (overlap distance `2·r_max`) and, when
-/// granted:
-///
-/// - latches `nova_start` and folds the window into the monotone burst-mutex
-///   hint ([`WordDecorations::burst_hint`]) through the predicate the busy scan
-///   reads (two-way: classic windows raise it too);
-/// - sets `burst_done`, so a burst scrolled off mid-blast never replays;
-/// - queues the curse bonk detonation cue at the grant, inheriting the
-///   limiter's rate cap and once-per-episode guarantee. Profanity only; the
-///   host drops it unless the `bonk_detonation` knob opted in.
-///
-/// Returns `false` when the limiter refused (nothing written). A free function
-/// so the caller keeps its disjoint `&mut persist` borrow.
+/// The ignition grant both burst prepasses share, the point of no return.
+/// Requests the §6.4 flash slot (overlap distance `2·r_max`); when granted it
+/// latches `nova_start`, folds the window into the burst-mutex hint, sets
+/// `burst_done` (a burst scrolled off mid-blast never replays) and, for
+/// profanity, queues the `Detonated` bonk cue. `false` when refused (nothing
+/// written). A free function so the caller keeps its `&mut persist` borrow.
 #[allow(
     clippy::too_many_arguments,
     reason = "the prepass's disjoint field borrows, split around its live `&mut persist` entry"
@@ -7233,17 +6889,14 @@ fn grant_pane_ignition(
     )
 }
 
-/// §6.4 window-wide ignition limiter: the earliest slot ≥ `now` admitting a new
-/// ignition — fewer than 2 in the trailing rolling second, tightening to fewer
-/// than 1 when a counted ignition's region overlaps the candidate's (center
-/// distance < 2·R_max). Callers grant in row-major order, so delays form a
-/// deterministic queue. Each episode requests at most one slot, and stale
-/// future owners are pruned before granting; a reused numeric identity gets a
-/// distinct reservation. The hard cap fails closed (`None`) rather than drop
-/// safety history. Modeled as the `FlashLimiter` and
-/// `IgnitionReservationLifecycle` ty specs.
-///
-/// `center` is in window pixels (see [`grant_pane_ignition`]).
+/// §6.4 window-wide ignition limiter: the earliest slot ≥ `now` with fewer than
+/// 2 ignitions in the trailing rolling second, or fewer than 1 when a counted
+/// region overlaps the candidate's (center distance < 2·R_max). Row-major
+/// callers make the delays a deterministic queue; each episode requests at
+/// most one slot, after stale future owners are pruned
+/// ([`WordDecorations::prune_ignitions`]). The hard cap fails closed (`None`)
+/// rather than drop safety history. Modeled as `FlashLimiter` and
+/// `IgnitionReservationLifecycle`. `center` is in window pixels.
 fn grant_ignition(
     igns: &mut Vec<IgnitionReservation>,
     pane: Option<u64>,
@@ -7317,8 +6970,8 @@ fn emit_nova_axis(
 ) {
     if let Some(nv) = novas.iter().find(|n| usize::from(n.idx) == oi).copied() {
         let t = now.saturating_duration_since(nv.start).as_millis() as u64;
-        // The live window keeps the scheduler armed and the fp
-        // changing every frame (the v1 anti-skip rule).
+        // The live window keeps the scheduler armed and the fp changing every
+        // frame, so the present early-out never skips a live frame.
         let until = nv.start + Duration::from_millis(u64::from(nv.feats.duration_ms));
         arm_until(active_until, until);
         *fp = fnv_mix_u64(*fp, frame.wrapping_mul(0x9E37_79B1));
@@ -7547,8 +7200,7 @@ fn emit_super_axis(
                     dy: -((i32::from(geom.cell_h) / 3).min(127) as i8),
                     glyph: DecoGlyph::Star4,
                     blend: DecoBlend::Add,
-                    // The one gold — the warm ember over the rainbow, from the
-                    // family palette rather than its own 0x00FF_F2C8.
+                    // The one gold: the warm ember over the rainbow.
                     color: crate::effect_util::twinkle_rgb(true),
                     alpha: scale_u8(cfg.intensity * 0.30 * f),
                 };
@@ -7830,10 +7482,7 @@ struct CatGeom {
     x: u16,
 }
 
-// ───────── §5.2 pub geometry helpers (the demo/gallery source) ─────────
-//
-// The §13 demo and the kitty-gallery example use these instead of copying the
-// formulas.
+// ───────── §5.2 pub geometry helpers (shared with the demo and gallery) ─────────
 
 /// §5.2 base art height before age scaling: `Hart = round(1.7·ch)`. The fitted
 /// result stays inside the two-row band above the word plus its chin slice.
@@ -7967,9 +7616,8 @@ fn ease_out_back(p: f32, amp: f32) -> f32 {
 /// eight values (`(0.06 + a 2-bit genome field × 0.04) × {1.0, 1.3}` in
 /// [`emit_peek`]), so a memo avoids re-solving per frame.
 fn overshoot_c(amp: f32) -> f32 {
-    // Past the reachable set with headroom. A ninth amplitude (only a custom
-    // spec could produce one) simply misses and pays the solve — i.e. what
-    // every call paid before.
+    // Past the reachable set with headroom; a ninth amplitude (only a custom
+    // spec could produce one) misses and pays the solve.
     const SLOTS: usize = 16;
     thread_local! {
         static MEMO: std::cell::RefCell<[(u32, f32); SLOTS]> =
@@ -8015,8 +7663,8 @@ fn ease_in_out_cubic(p: f32) -> f32 {
 
 // ───────── v3 §1.2 peek-cycle timing (pure fns of genome + ident) ─────────
 //
-// These decode as salted mixes of `gkey` rather than dedicated genome bits —
-// see [`DWELL_SALT`]. The printed ranges are preserved exactly.
+// These decode as salted mixes of `gkey` rather than dedicated genome bits;
+// see [`DWELL_SALT`].
 
 /// Dwell base over the spec range (`2200..=3598 ms` default) in 4 genome
 /// steps (step `(hi − lo)/3` — 466 ms at the default range).
@@ -8052,10 +7700,9 @@ fn has_accessory(magic: u64) -> bool {
     accessory_variant_v4(magic).is_some()
 }
 
-/// Total peek length: Rise + Dwell + optional anticipation + Descend.
-/// Worst case `450 + 3750 + 60 + 320 = 4580 ms < 4800 ms` — the driven A2
-/// gate holds from the episode's post-script birth, including rare cats (the
-/// dwell cap binds any custom spec range too).
+/// Total peek length: Rise + Dwell + optional anticipation + Descend. Worst
+/// case `450 + 3750 + 60 + 320 = 4580 ms` ([`CAT_DWELL_CAP_MS`] binds custom
+/// spec ranges and rare cats too).
 fn peek_total_ms(ident: u64, gkey: u64, magical: bool, range: (u32, u32)) -> u64 {
     CAT_RISE_MS
         + peek_dwell_ms(ident, gkey, magical, range)
@@ -8063,7 +7710,7 @@ fn peek_total_ms(ident: u64, gkey: u64, magical: bool, range: (u32, u32)) -> u64
         + CAT_DESCEND_MS
 }
 
-/// The caret sits ON the token span (or in the cell right after it). The one
+/// The caret sits on the token span (or in the cell right after it). The one
 /// span predicate shared by the ambiguous-prefix defer, the `at_live_cursor`
 /// retype witness, and the one-cat-per-caret suppression — features that must
 /// stay in agreement about what "at the caret" means.
@@ -8085,42 +7732,29 @@ fn arm_until(active_until: &mut Option<Instant>, until: Instant) {
     *active_until = Some(active_until.map_or(until, |d| d.max(until)));
 }
 
-/// v3 done-mark write: insert (or refresh) the episode's mark under the ident
-/// current at departure time. Keyed `ident ^ ctx_fp`; `ctx_fp` is stored
-/// explicitly because a horizontal redraw can rekey the position-bearing seed
-/// while the episode's frozen genome stays unchanged. LRU: cap
-/// [`DONE_MARKS_CAP`], O(1) oldest-touch eviction.
+/// Done-mark write (v3 §1.1): insert (or refresh) the episode's mark under the
+/// ident current at departure. Keyed `ident ^ ctx_fp`; `ctx_fp` is stored
+/// because a horizontal redraw can rekey the position-bearing seed while the
+/// frozen genome stays unchanged.
 fn mark_done(marks: &mut DoneMarkLru, ident: u64, ep: &Episode) {
     let key = ident ^ ep.ctx_fp;
     marks.insert(key);
 }
 
-/// v3 done-mark lookup with touch-on-hit (LRU refresh).
+/// Done-mark lookup with touch-on-hit (LRU refresh).
 fn touch_done(marks: &mut DoneMarkLru, key: u64) -> bool {
     marks.touch(key)
 }
 
-/// The ambient cat's idle life: a peeking word-cat's own animation
-/// (owner, 2026-08-04).
+/// The ambient cat's idle life during the dwell: a slow genome-phased bob and
+/// a slower lateral sway, small on purpose.
 ///
-/// A pure function of the dwell-relative clock and the genome, deliberately
-/// not [`crate::kitty_cursor::CatPose`], which walks stateful state driven by
-/// the typing metric that a screen-scanned word does not have. Being
-/// stateless means:
-///
-/// * no new field on `Episode`, nothing to advance in `episode_prepass`;
-/// * `emit_peek` stays a pure function of `(now, genome, ident, PeekView)`;
-/// * no new bake keys: the pose rides the dest rect, so the eye frame stays
-///   `Open` and the atlas budget is untouched.
-///
-/// Two genome-phased channels (a slow vertical bob and a slower lateral sway),
-/// small on purpose: the peek is ambient.
-///
-/// Pure translation: the dest size is pinned by
-/// `shipping_cat_sprites_preserve_authored_aspect_and_uniform_age_scale`
-/// (authored aspect) and `one_shot_peek_conformance_real_engine` (exact rest
-/// reveal), so the cat moves rather than reshapes. During the dwell the
-/// window is the whole tile, so a translated cat is still whole.
+/// A pure function of the dwell-relative clock and the genome, not
+/// [`crate::kitty_cursor::CatPose`] (stateful, driven by a typing metric a
+/// scanned word lacks): no `Episode` field, no new bake key (the eye frame
+/// stays `Open`), and `emit_peek` stays pure. Pure translation, so the dest
+/// size pinned by `shipping_cat_sprites_preserve_authored_aspect_and_uniform_age_scale`
+/// and `one_shot_peek_conformance_real_engine` is unchanged.
 #[derive(Clone, Copy)]
 struct CatIdlePose {
     bob_px: i32,
@@ -8134,7 +7768,7 @@ impl CatIdlePose {
         lead_px: 0,
     };
 
-    /// `td_ms` is the DWELL-relative clock (zero at the end of the rise), so the
+    /// `td_ms` is the dwell-relative clock (zero at the end of the rise), so the
     /// entrance and the exit keep their authored kinematics exactly.
     fn breathing(td_ms: u64, gkey: u64, cell_h: u16) -> Self {
         // A whole device pixel either way on a ~1.7-cell-tall head: enough to
@@ -8202,8 +7836,7 @@ fn push_cat_free(
 }
 
 /// The per-tick mutable context the feline arm threads through [`emit_cat`]:
-/// the baker plus the §F4.2 Kitty Log scratch (v4 cats bake their own eyes, so
-/// there is no live gaze map / cursor / nova hook any more).
+/// the bakers plus the §F4.2 Kitty Log scratch.
 struct CatTick<'a> {
     baker: &'a mut CatBaker,
     /// The animal roster's exact-size cache — [`emit_animal`] bakes here, then
@@ -8219,25 +7852,10 @@ struct CatTick<'a> {
     /// [`MAX_PEEK_CUES`]) — recorded at the sighting's once-per-episode
     /// edge, with the dest rect the sighting deliberately does not carry.
     peek_cues: &'a mut Vec<PeekCue>,
-    /// The pixels the live cursor companion occupies, if one is up.
-    ///
-    /// A pixel box rather than a word test: an ambient cat peeks two rows up
-    /// or down (`cat_peek_down`), so a word on a different row can still land
-    /// its head on the companion, stacking two cats at the caret.
-    ///
-    /// Two rects, each sized to what is really there:
-    ///
-    /// * the sprite ([`CompanionOnGlass::body_px`]): the pet's live body
-    ///   ([`crate::kitty_pet::PetFrame::body_px`]) or the flying head's dest
-    ///   ([`WordDecorations::kitty_cursor_footprint`]), which sits ~1.75 cells
-    ///   right of and ~0.4 rows above the caret;
-    /// * the caret band ([`CompanionOnGlass::guards_caret`]): a 2-cell × 1-row
-    ///   box on the caret, for the caret-escorting head only.
-    ///
-    /// A cell-granular box or a union would be too greedy and suppress the
-    /// "peeks beside the companion" case
-    /// (`a_feline_word_away_from_the_caret_still_peeks_beside_the_companion`),
-    /// so the rects are collided separately.
+    /// The pixels the live cursor companion occupies, if one is up: a pixel
+    /// box rather than a word test, since an ambient cat peeks two rows up or
+    /// down and can land on the companion from another row. See
+    /// [`CompanionOnGlass`] for the two rects.
     companion_px: CompanionFootprint,
 }
 
@@ -8308,7 +7926,7 @@ fn emit_cat(
         None
     };
     let variant = special.unwrap_or_else(|| cat_variant_v4(occ.genome.gkey));
-    // Accessories overlay a plain HEAD only (never a special).
+    // Accessories overlay a plain head only (never a special).
     let accessory = if special.is_none() && cfg.feline_magic {
         accessory_variant_v4(occ.genome.magic)
     } else {
@@ -8351,15 +7969,12 @@ fn emit_cat(
     ) else {
         return;
     };
-    // §F4.2 Kitty Log: body sprites actually landed for this cat — queue its
-    // once-per-episode sighting (the post-loop pass flips Episode::logged). v4
-    // cats are all peeking heads; the only per-identity trait the authored roster
-    // still carries into the log is the overlay accessory (bow / crown).
+    // §F4.2 Kitty Log: a body landed, so queue this cat's once-per-episode
+    // sighting (the post-loop pass flips `Episode::logged`). The only
+    // per-identity trait logged is the overlay accessory (bow / crown).
     if ctx.unlogged.contains(&occ.ident) && ctx.sightings.len() < MAX_OCCURRENCES {
-        // The pet's word-cat bat: the positioned twin of the
-        // sighting below, on the same once-per-episode edge (a body sprite
-        // actually landed) — with the dest rect that is final right here
-        // and nowhere else. Cap-truncation drops the gag, never the log.
+        // The pet's bat cue rides the same edge, with the dest rect that is
+        // final only here. Cap-truncation drops the gag, never the log.
         if ctx.peek_cues.len() < MAX_PEEK_CUES {
             ctx.peek_cues.push(PeekCue {
                 row: occ.row,
@@ -8390,15 +8005,12 @@ fn emit_cat(
     }
 }
 
-/// The species-head twin of [`emit_cat`]: the same one-shot peek with
-/// everything the genome wardrobe owns deleted. No magic, no specials, no
-/// accessories, no age scale, no kitten bounce, no paw fallback, and no Kitty
-/// Log sighting and no peek cue: the log is the feline collectible surface
-/// (§F4.2) — a camel is not a collectible cat — and the pet's word-cat bat
-/// answers cats, not camels. The tile rides the exact-size [`AnimalBaker`]
-/// cache into the shared atlas through the `host_tile` door (the pet's path),
-/// so a deferred bake defers the sprite one beat exactly like a deferred cat
-/// bake.
+/// The species-head twin of [`emit_cat`]: the same one-shot peek without the
+/// genome wardrobe (no magic, specials, accessories, age scale, kitten bounce
+/// or paw fallback), and with no Kitty Log sighting or peek cue (the log and
+/// the pet's bat are for cats). The tile rides the exact-size [`AnimalBaker`]
+/// into the shared atlas through `host_tile`, so a deferred bake defers the
+/// sprite one beat like a deferred cat.
 #[allow(
     clippy::too_many_arguments,
     reason = "pure per-occurrence emission over tick-local accumulators, exactly like emit_cat"
@@ -8451,20 +8063,17 @@ fn emit_animal(
 /// The one-shot peek cycle both rosters share (v3 §1.2):
 ///
 /// ```text
-/// Rise (450 ms, ease_out_back, genome overshoot,
-///       eyes closed → open at p ≥ 0.85)
+/// Rise (450 ms, ease_out_back, genome overshoot)
 /// → Dwell (genome 2200..3598 ms − mix(ident) % 300; +500 ms magic/accessory,
-///          cap 3750; authored pose/accessory variation)
+///          cap 3750; idle bob and sway)
 /// → Descend (320 ms easeInOutCubic; optional 60 ms anticipation lift on
-///            ~50% of genomes; eyes Closed-happy at the near-stationary top)
+///            ~50% of genomes)
 /// → Done (zero quads, forever for this episode)
 /// ```
 ///
-/// Emission is a pure function of `(now, genome, ident, PeekView)` plus the
-/// roster's resolved geometry `g` and `bake` door. The cycle rides
-/// `active_until` (frame-paced while live). `reduced_motion` shows the static
-/// settled pose while the word is visible. Returns the landed dest span
-/// `(top, bottom)` when a body sprite was pushed.
+/// A pure function of `(now, genome, ident, PeekView)` plus the roster's
+/// geometry `g` and `bake` door; `reduced_motion` shows the static settled
+/// pose. Returns the landed dest span `(top, bottom)` when a body was pushed.
 #[allow(
     clippy::too_many_arguments,
     reason = "pure per-occurrence emission over tick-local accumulators, exactly like emit_ink; a carrier struct would rename the list, not shrink it"
@@ -8486,7 +8095,7 @@ fn emit_peek<'a>(
     active_until: &mut Option<Instant>,
 ) -> Option<(i32, i32)> {
     let ch = i32::from(geom.cell_h);
-    // §5.6 v2.6: the REST reveal — full Hart for every identity.
+    // §5.6 rest reveal: full Hart for every identity.
     let rest = i32::from(cat_rest_reveal(g.hart));
     // Entrance overshoot amplitude from a free v4 bit window (bits 15–16 sit
     // above the v4 art layout 0..=14, so they never fragment the bake key).
@@ -8501,18 +8110,13 @@ fn emit_peek<'a>(
     let total = CAT_RISE_MS + dwell + antic + CAT_DESCEND_MS;
     let dwell_end = CAT_RISE_MS + dwell;
 
-    // Phase resolution. reduced_motion pins the static settled pose (t is
-    // never consulted); otherwise the clock runs from the birth-latched
-    // phase start — the entrance plays when the word first appears,
-    // regardless of focus; an occluded window simply misses frames and the
-    // cat never replays on refocus.
+    // reduced_motion pins the static settled pose; otherwise the clock runs
+    // from the birth-latched phase start, regardless of focus.
     let (t, in_rise, in_dwell) = if cfg.reduced_motion {
-        // v3 one-shot × reduced motion: a completed peek stays done (no
-        // static resurrection under the W11b unfocused→reduced demotion).
-        // The clock latched at birth, so the pose shows from the first
-        // presented frame and the flags never advance while reduced — the
-        // pose persists. An unlatched clock (defensive; `fresh` always
-        // latches) shows nothing.
+        // A completed peek stays done under reduced motion (unfocused windows
+        // are demoted to it). The clock latched at birth, so the pose shows
+        // from the first presented frame and the flags never advance while
+        // reduced. An unlatched clock (defensive) shows nothing.
         if peek.peek_done || peek.start.is_none() {
             return None;
         }
@@ -8534,12 +8138,9 @@ fn emit_peek<'a>(
         (t, t < CAT_RISE_MS, t >= CAT_RISE_MS && t < dwell_end)
     };
     let td = t.saturating_sub(CAT_RISE_MS); // dwell-relative clock
-    // Every peek frame changes bytes (rise, descend, and the dwell's idle
-    // pose, `CatIdlePose`), so the frame term is folded throughout and the
-    // present early-out never skips them. This costs presents, not wakeups:
-    // `arm_until` already keeps the scheduler armed for the whole peek, and
-    // nothing wakes once it is done. Reduced motion pins the static pose and
-    // folds nothing.
+    // Every peek frame changes bytes (rise, descend, idle pose), so the frame
+    // term is folded throughout; `arm_until` already keeps the scheduler armed
+    // for the peek, so this costs presents, not wakeups.
     if !cfg.reduced_motion {
         *fp = fnv_mix_u64(*fp, frame.wrapping_mul(0x9E37_79B1));
     }
@@ -8583,8 +8184,8 @@ fn emit_peek<'a>(
     // lifts the dest past rest; kittens land with a 2 px bounce early in the
     // dwell; the pre-descend anticipation lifts 2 px.
     let vh = reveal.min(rest);
-    // §5.2 v2.9 overshoot clamp: `lift ≤ 2·ch − (Hart − chin)` — the head band
-    // (which spans rows r−2 and r−1) must never lift into row r−3.
+    // §5.2 overshoot clamp: `lift ≤ 2·ch − (Hart − chin)`, so the head band
+    // (rows r−2 and r−1) never lifts into row r−3.
     let lift = (reveal - rest)
         .max(0)
         .max(antic_lift)
@@ -8597,15 +8198,10 @@ fn emit_peek<'a>(
         0
     };
     let row_top = i32::from(occ.row) * ch;
-    // Heads are the two-band peeking head. Up (the authored pose) anchors the
-    // chin slice at the word row's top edge and rises into the two rows above.
-    // Down mirrors it: the chin tucks behind the row's bottom edge and the head
-    // slides out from under the word into the two rows below. Both reveal the
-    // art top-down from a fixed anchor.
-    //
-    // A top-row word has no rows above, so down is its only side; the
-    // direction comes from [`cat_peek_plan`] at rescan rather than a viewport
-    // clamp here, which would park the head on the line that summoned it.
+    // Up anchors the chin slice at the word row's top edge and rises into the
+    // two rows above; Down tucks it behind the bottom edge and slides into the
+    // two rows below. The direction comes from [`cat_peek_plan`] at rescan,
+    // not a viewport clamp, which would park the head on its own line.
     let (mut top, mut bottom) = if occ.cat_peek_down {
         let rest_top = row_top + ch - i32::from(g.chin);
         let top = rest_top + lift - bounce;
@@ -8627,24 +8223,18 @@ fn emit_peek<'a>(
         top -= over;
         bottom -= over;
     }
-    // Where the cut falls: a peek slides out from behind the word, so the art
-    // may only be cut at the text line, never in open space. Up pins `bottom`
-    // at the word row and shows the art's top rows. Down feeds the art's
-    // bottom `vh` rows, so the head lowers out from under the line and pulls
-    // back behind it whole (owner, 2026-08-04).
-    //
-    // `cat_rest_reveal` is the identity on `hart`, so `rest` is the tile height
-    // and `rest - vh` the part still hidden behind the line.
+    // The art is only ever cut at the text line: Up pins `bottom` at the word
+    // row and shows the art's top rows; Down feeds its bottom `vh` rows, so the
+    // head lowers out from under the line. `rest` is the tile height
+    // (`cat_rest_reveal` is the identity), `rest - vh` the hidden part.
     let src_y0 = if occ.cat_peek_down {
         i32::from(tile.ay) + (rest - vh).max(0)
     } else {
         i32::from(tile.ay)
     };
-    // Yield to the companion, in pixels: a word anywhere can land its peek
-    // where the cursor companion is, and `tick`'s word-space veto cannot see
-    // the final dest rect. Returning here equals not pushing; the caller logs
-    // a Kitty Log sighting only when a body landed, and the episode is
-    // untouched. A cat merely beside the companion still draws.
+    // Yield to the companion in pixels, on the final dest rect `tick`'s
+    // word-space veto cannot see. Returning equals not pushing (no sighting);
+    // a cat merely beside the companion still draws.
     if ctx
         .companion_px
         .stacked_on(i32::from(g.x), i32::from(g.w), top, bottom)
@@ -8652,12 +8242,9 @@ fn emit_peek<'a>(
         return None;
     }
     let n_free = free.len();
-    // One FreeSprite per cat covering the whole dest rect `[top, bottom)`; the
-    // dirty row-union and the CPU/GPU free streams handle banding.
-    // The idle pose applies during the dwell only: rise and descend have
-    // authored kinematics (overshoot, anticipation lift, kitten landing
-    // bounce), and the pose also waits for the kitten's 2 px landing bounce to
-    // finish, since two vertical motions together read as mush.
+    // One FreeSprite per cat over `[top, bottom)`. The idle pose applies only
+    // in the dwell after the kitten's landing bounce: two vertical motions
+    // together read as mush.
     let pose = if in_dwell && !in_bounce && !cfg.reduced_motion {
         CatIdlePose::breathing(td, occ.genome.gkey, geom.cell_h)
     } else {
@@ -8684,9 +8271,8 @@ fn ink_pair(class: Class) -> Option<(u32, u32)> {
         Class::Emphasis => Some((0x007C_C8FF, 0x00C8_9AFF)),
         Class::Profanity => Some((0x00FF_D447, 0x00FF_7CE5)),
         Class::Feline => Some((0x00F7_A8B8, 0x00FF_D9C2)),
-        // Warm meadow pair — only reachable through a custom TwoTone override
-        // (the class default rides the feline's SelfGlow), kept so the anchor
-        // exists the day a user recolors an animal word.
+        // Warm meadow pair. The class default is SelfGlow, so only a custom
+        // TwoTone animal word reaches it (as its §6.5 coupling base).
         Class::Animal => Some((0x00FF_C98A, 0x00B9_E8A3)),
         Class::Canine => None,
     }
@@ -8898,9 +8484,9 @@ fn emit_ink(
             col,
             color: u32_to_rgb3(color),
         };
-        // The frame term keeps the fp changing on every animating frame (the v1
-        // anti-skip rule); folded mid-FNV-chain so it diffuses per cell. The
-        // §6 dip ramp / coupling pulse count as animating (fx.frame_live).
+        // The frame term keeps the fp changing on every animating frame (the
+        // §6 dip ramp / coupling pulse included); folded mid-FNV-chain so it
+        // diffuses per cell.
         *fp = fold_ink(*fp, &cell);
         if animating || fx.frame_live {
             *fp ^= frame.wrapping_mul(0x9E37_79B1);
@@ -8994,11 +8580,8 @@ fn emit_rainbow_ink(
         )
     };
     // §3.1 legibility guard: minimum contrast over u ∈ {0, ⅓, ⅔, 1} (a single
-    // mid-gradient sample misses yellow/cyan washout).
-    //
-    // The four guard hues do not depend on `strength`, so they are computed
-    // once here rather than per pass; the values and their order are
-    // unchanged, so output is bit-identical.
+    // mid-gradient sample misses yellow/cyan washout). The guard hues do not
+    // depend on `strength`, so they are computed once.
     let guard_hues = [
         hue_at(0.0),
         hue_at(1.0 / 3.0),
@@ -9011,7 +8594,7 @@ fn emit_rainbow_ink(
         &guard_hues,
         lum_bg,
     );
-    // Per-LEAD-CELL hue (§3.1): u indexes lead cells, not columns.
+    // Per-lead-cell hue (§3.1): u indexes lead cells, not columns.
     let denom = f32::from(occ.ink_cells.saturating_sub(1)).max(1.0);
     for i in 0..occ.ink_cells as usize {
         let col = base_cols[occ.ink_base + i];
@@ -9285,7 +8868,7 @@ fn cat_color_context_footprint(
 /// Which way the two-band head enters relative to its trigger word.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum PeekDir {
-    /// The classic peek: the head rises into the two rows ABOVE the word and
+    /// The classic peek: the head rises into the two rows above the word and
     /// looks over it, chin slice tucked behind the word row's top edge.
     Up,
     /// The mirrored peek: the head slides down out from under the word into
@@ -9293,10 +8876,6 @@ enum PeekDir {
     /// for a top-row word, where there is no room above.
     Down,
 }
-
-// A settled feline word stays settled until it is retyped: the only re-arm is
-// the user's own keystroke ([`WordDecorations::note_typed_edit`]), never a
-// timer (owner, 2026-08-09).
 
 /// Occupancy ceiling for a candidate head band, as a fraction of sampled cells
 /// carrying a visible glyph.
@@ -9347,16 +8926,10 @@ fn band_occupancy(
 }
 
 /// Resolve the head's entry direction for one prospective cat, or `None` when
-/// neither side can host it.
-///
-/// Both candidate bands are scored by [`band_occupancy`] and the clearer side
-/// wins, with the word's own row folded into each score (the cells beside the
-/// word, which the chin slice tucks behind) so a cat prefers the side whose
-/// neighbouring text it disturbs least. Ties go to [`PeekDir::Up`] — the
-/// authored pose. A band that runs off the viewport is unavailable, which is
-/// what forces the top row to [`PeekDir::Down`] and the bottom row to
-/// [`PeekDir::Up`]; when both are available but both exceed
-/// [`CAT_MAX_BAND_OCCUPANCY`], the surface is a text wall and no cat draws.
+/// neither side can host it. Both bands are scored by [`band_occupancy`] (the
+/// word's own row folded in) and the clearer wins, ties to [`PeekDir::Up`]. A
+/// band off the viewport is unavailable (so the top row peeks down); both
+/// over [`CAT_MAX_BAND_OCCUPANCY`] is a text wall and no cat draws.
 fn cat_peek_plan(
     cells: &[Vec<RenderCell>],
     geom: EffectGeom,
@@ -9459,12 +9032,10 @@ fn class_tag(c: Class) -> u64 {
     match c {
         Class::Profanity => 1,
         Class::Feline => 2,
-        // 3 was the deleted orca class's tag: left unused, so no other
-        // class's seed moves.
+        // 3 is retired (a deleted class): tags are seed inputs, so no class is
+        // renumbered.
         Class::Emphasis => 4,
         Class::Canine => 5,
-        // 5 is spoken for: the dog-summon branch's Canine tag (branch
-        // benji-dog-summon) — the seeds must not collide at merge.
         Class::Animal => 6,
     }
 }
@@ -9476,7 +9047,7 @@ fn glyph_id(g: DecoGlyph) -> u64 {
         DecoGlyph::Dot => 2,
         DecoGlyph::Plus => 3,
         DecoGlyph::Paw => 4,
-        // 5 was the deleted droplet sprite's id: left unused.
+        // 5 is retired: ids are fingerprint inputs.
         DecoGlyph::RingArc => 6,
         DecoGlyph::Shade => 7,
     }
@@ -9499,12 +9070,10 @@ fn fold_deco(mut h: u64, d: &WordDecoration) -> u64 {
     h
 }
 
-/// Fold one [`FreeSprite`] into the frame fingerprint — the `fold_deco`/
-/// `fold_ink` sibling for the free-overlay channel (overlay doc §3.3): every field,
-/// including `z` and `sampler` (a same-rect Under→Over flip must change
-/// `deco_fp`, or the Tier-0 early-out would swallow it) and the signed
-/// `x`/`y` as their i32 bit patterns. The paired `free_atlas` version is
-/// folded once per tick at the existing atlas-version fold site.
+/// Fold one [`FreeSprite`] into the frame fingerprint, every field: `z` and
+/// `sampler` too (a same-rect Under→Over flip must change `deco_fp` or the
+/// early-out would swallow it), and the signed `x`/`y` as i32 bit patterns.
+/// The paired `free_atlas` version is folded once per tick.
 fn fold_free(mut h: u64, s: &FreeSprite) -> u64 {
     for x in [
         u64::from(s.x as u32), // i32 bit pattern (signed off-grid origins)
@@ -9610,19 +9179,16 @@ mod tests {
             p60 as f32 <= 3.2,
             "sparkle words flash {p60} times a second — over the 3.2 Hz bound"
         );
-        // …and it is the family's law, not a private one that merely happens to
-        // take seconds: the same input, the same envelope as every other star.
+        // ...and it is the shared envelope every other star uses.
         for (s, t) in [(0u64, 0.11f32), (12_345, 0.4), (0xFFFF_FFFF, 1.7)] {
             let phase = (s & 0xff) as f32 / 255.0 * std::f32::consts::TAU;
             assert_eq!(twinkle(s, t), crate::effect_util::twinkle_env(t, phase));
         }
     }
 
-    /// A cat drawn on top of the companion yields; one merely passing nearby
-    /// does not. The near-miss geometry is the away cat from
-    /// `a_feline_word_away_from_the_caret_still_peeks_beside_the_companion`
-    /// (x=8, y=76, w=33, h=28), which grazes the caret's row by 4 of its 28
-    /// pixels, so the gate is a coverage fraction, not a plain intersection.
+    /// A cat stacked on the companion yields; one grazing it does not (the away
+    /// cat overlaps the caret row by 4 of its 28 px), so the gate is a coverage
+    /// fraction, not an intersection.
     #[test]
     fn only_a_cat_stacked_on_the_companion_yields() {
         // A caret box two cells wide by one cell tall at (row 3, col 0),
@@ -9634,7 +9200,7 @@ mod tests {
             !cat_is_stacked_on(companion, 8, 33, 76, 104),
             "a cat peeking up from a word rows below only grazes the caret row"
         );
-        // Squarely on the companion — the reported bug.
+        // Squarely on the companion.
         assert!(
             cat_is_stacked_on(companion, 2, 20, 58, 82),
             "a cat drawn over the companion must yield"
@@ -9648,14 +9214,9 @@ mod tests {
         assert!(!cat_is_stacked_on(companion, 0, 0, 60, 60));
     }
 
-    /// The yield is collided against the flying head's real sprite: the head
-    /// flies a 3/4-cell lead past the caret cell and stands
-    /// [`WordDecorations::COMPANION_CELL_H`] cells tall centred on the caret
-    /// row (~1.75 cells right, ~0.4 rows up), nearly disjoint from a
-    /// caret-anchored band. A word-cat drawn squarely on the head must yield.
-    ///
-    /// Every rectangle comes from
-    /// [`WordDecorations::kitty_cursor_footprint`], never a literal.
+    /// The yield collides against the flying head's real sprite (from
+    /// [`WordDecorations::kitty_cursor_footprint`]), ~1.75 cells right of and
+    /// ~0.4 rows above the caret: a word-cat drawn on the head yields.
     #[test]
     fn an_ambient_cat_on_the_flying_head_yields_to_it() {
         let geom = EffectGeom {
@@ -9680,7 +9241,7 @@ mod tests {
             head.y,
             head.y + i32::from(head.h),
         );
-        // The head really is off the caret cell — the premise of the bug.
+        // Precondition: the head is off the caret cell.
         assert!(
             head.x >= i32::from(geom.cell_w),
             "the head leads the caret column by more than a whole cell (x = {})",
@@ -9704,9 +9265,7 @@ mod tests {
             "the caret band alone cannot see the head — this WAS the bug"
         );
 
-        // The caret band is kept, not replaced: a cat on the glyph being typed
-        // still yields (the promise `only_a_cat_stacked_on_the_companion_yields`
-        // pins), and it is the band that catches it, not the head rect.
+        // The caret band still catches a cat on the glyph being typed.
         assert!(
             fixed.stacked_on(2, 20, 58, 82),
             "a cat on the caret cell still yields"
@@ -9716,10 +9275,7 @@ mod tests {
             "non-vacuous: the caret band is what catches the caret cat"
         );
 
-        // ...and the yield is no greedier: the away cat from
-        // `a_feline_word_away_from_the_caret_still_peeks_beside_the_companion`
-        // still draws against both rects, which is why they are collided
-        // separately.
+        // ...and no greedier: the away cat still draws against both rects.
         assert!(
             !fixed.stacked_on(8, 33, 76, 104),
             "the away cat still peeks beside the companion"
@@ -9738,9 +9294,8 @@ mod tests {
         );
     }
 
-    /// The one-body law at the door the sprites come through: whichever
-    /// companion body lands first owns the host frame, and the second is
-    /// refused — the structural backstop behind the host's custody law.
+    /// The one-body law: the first companion body to land owns the host frame
+    /// and the second is refused.
     #[test]
     fn one_host_frame_admits_exactly_one_companion_body() {
         use crate::kitty_cursor::CursorCatPlacementFrame;
@@ -9866,8 +9421,8 @@ mod tests {
             cjk_single_char: false,
             feline_style: FelineStyle::Cat,
             feline_magic: true,
-            // The v1 batteries pin exact v1 sparkle behavior; the nova
-            // battery flips this to `Nova` explicitly.
+            // The sparkle batteries pin the sparkle style; the nova battery
+            // sets `Nova` itself.
             profanity_style: ProfanityStyle::Sparkle,
             profanity_magic: true,
             supernova_chance: 30,
@@ -9902,8 +9457,8 @@ mod tests {
             cat_peek_down: false,
             dec_line: false,
             inert: false,
-            // Direct-built occurrences resolve their spec from the test cfg
-            // (v1 sparkle batteries), exactly like the rescan would.
+            // Direct-built occurrences resolve their spec from the test cfg,
+            // as the rescan would.
             spec: class_default_spec(class, &cfg()),
             custom: false,
             species: None,
@@ -9959,8 +9514,8 @@ mod tests {
         assert_ne!(fp1, fp2, "animating sparkle fingerprint changes each frame");
         assert!(wd.is_active(now));
 
-        // v3 §1.2 graphics-decay: after the animation window the residual
-        // spark fades (still animating), then self-terminates to ZERO decos.
+        // v3 §1.2 graphics decay: the residual spark fades after the animation
+        // window, then self-terminates to zero decos.
         let fading = now + Duration::from_millis(c.anim_ms + 50);
         tick_deco(&mut wd, fading, &c, &mut out);
         assert_eq!(out.len(), 1, "the residual spark is fading");
@@ -10028,9 +9583,8 @@ mod tests {
         let mut out = Vec::new();
         tick_deco(&mut wd, now, &c, &mut out);
 
-        // "fuck" → profanity sparkles (Add) on row 0. `tick_deco` passes an
-        // all-zero geometry, which trips the §5.7 cell-metric floor, so "cats"
-        // draws no graphic at all — and no arm draws a Paw glyph regardless.
+        // "fuck" sparkles (Add) on row 0; the all-zero geometry trips the §5.7
+        // floor, so "cats" draws no graphic.
         assert!(
             out.iter()
                 .any(|d| matches!(d.blend, DecoBlend::Add) && d.row == 0),
@@ -10045,9 +9599,8 @@ mod tests {
         );
     }
 
-    /// Exact token: `fix` and its near-misses never inherit the profanity
-    /// rainbow, whether typed incrementally or overwriting a live `fuck` at the
-    /// same row/column. Pins lexical classification and stale episode eviction.
+    /// `fix` and its near-misses never take or inherit the profanity rainbow,
+    /// typed incrementally or overwriting a live `fuck` in place.
     #[test]
     fn fix_never_triggers_or_inherits_profanity_rainbow() {
         let lex = Lexicon::with_languages(&["en"]);
@@ -10083,9 +9636,8 @@ mod tests {
         wd.rescan(&term, 4, 48, &lex, &c, 10, now);
         assert!(wd.occ.iter().any(|o| o.class == Class::Profanity));
 
-        // Same-position replacement must evict the visible occurrence
-        // immediately; the 10 s persistence grace may retain identity metadata,
-        // but it must never emit for absent text.
+        // Same-position replacement evicts the visible occurrence at once; grace
+        // may keep identity metadata but never emits for absent text.
         term.process(b"\rfix\x1b[K");
         wd.rescan(&term, 4, 48, &lex, &c, 11, now + Duration::from_millis(16));
         assert!(wd.occ.iter().all(|o| o.class != Class::Profanity));
@@ -10110,11 +9662,8 @@ mod tests {
         assert!(deco.is_empty() && ink.is_empty() && free.is_empty() && nova.is_empty());
     }
 
-    /// Live cursor: `fut` and `futu` are Romanian profanity forms but also
-    /// transient tokens while typing `future`. Even with Romanian (or every
-    /// language) enabled these ambiguous forms wait for a delimiter. Exact
-    /// `fuck` is immediate; every incomplete prefix, `fuc` included, stays
-    /// ordinary.
+    /// Ambiguous forms at the live caret (`fut`, `futu` while typing `future`)
+    /// wait for a delimiter with `ro` or every language on; `fuck` is immediate.
     #[test]
     fn ambiguous_future_prefix_waits_for_delimiter_in_ro_and_all() {
         let mut c = cfg();
@@ -10169,17 +9718,14 @@ mod tests {
         }
     }
 
-    /// Exact completion: `fuc` is ordinary text at the live caret and in
-    /// settled snapshots; the fourth character is the first point at which the
-    /// profanity episode and its typed cue may exist.
+    /// `fuc` is ordinary; the fourth character is the first that may create
+    /// the episode and its typed cue.
     #[test]
     fn fuc_is_ordinary_and_only_complete_fuck_activates() {
         let lex = Lexicon::with_languages(&["all"]);
         let mut c = cfg();
         c.profanity_style = ProfanityStyle::Rainbow;
-        // This pins completion (`fuc` ordinary, `fuck` cues once), not the
-        // detonation rate, so the supernova roll is off: a won roll would add a
-        // second cue.
+        // Pins completion, not detonation: a won supernova roll adds a cue.
         c.supernova_chance = 0;
         let t0 = Instant::now();
         let model = aterm_spec::derive::exact_profanity_completion_model();
@@ -10227,9 +9773,8 @@ mod tests {
         term.process(b"k");
         assert!(model.fire("TypeK", &mut state));
         let completed_at = t0 + Duration::from_millis(24);
-        // The `k` is a committed KEY: the bonk's typed witness now needs the
-        // keystroke as well as the caret's completion position, because a
-        // passive output line parks the caret one past a curse too.
+        // The `k` is a committed key: the bonk's typed witness needs it as well
+        // as the caret position, since output parks the caret there too.
         wd.note_typed_edit(completed_at, None);
         wd.rescan(&term, 2, 48, &lex, &c, 4, completed_at);
         assert!(wd.occ.iter().any(|o| o.class == Class::Profanity));
@@ -10250,10 +9795,8 @@ mod tests {
         assert_eq!(completion_cues, 1, "complete `fuck` must cue once");
         assert_eq!(state["episode"], completion_cues as i64);
 
-        // Negative control: the real cue counts separate the healthy model from
-        // the `Buggy=1` early activation, whose `fuc` already holds an episode
-        // and whose `k` restarts a second one instead of continuing it. The
-        // real scan drained no cue at `fuc` and exactly one at `k`.
+        // Negative control: `Buggy=1` (an episode already at `fuc`) diverges
+        // from the real cue counts (none at `fuc`, one at `k`).
         let buggy = aterm_spec::interp::with_buggy(&model, 1);
         let mut early = buggy.init_state();
         for action in ["TypeF", "TypeU", "TypeC"] {
@@ -10265,9 +9808,8 @@ mod tests {
         assert!(!model.check_invariant("CompletionCreatesExactlyOneEpisode", &early));
     }
 
-    /// The shipping renderer scans an already-resolved cell snapshot rather
-    /// than calling `rescan(&Terminal)`. Pin the explicit cursor plumbing on
-    /// that path so the live window and introspection captures cannot drift.
+    /// The snapshot scan path carries the cursor too, so it defers ambiguous
+    /// forms exactly like `rescan(&Terminal)`.
     #[test]
     fn snapshot_cursor_defers_ambiguous_form_until_delimiter() {
         let (rows, cols) = (2usize, 48usize);
@@ -10330,12 +9872,8 @@ mod tests {
         }
     }
 
-    /// Bounded causal discriminator for a spent profanity episode: a tainted
-    /// token completed at the live caret is a fresh armed episode; a passive
-    /// output word ending at the cursor stays spent. `Buggy=1` combines the two
-    /// single-signal faults (unconditional transfer suppresses live retyping;
-    /// caret-only re-arming relights passive output), and both must produce
-    /// counterexamples.
+    /// Model of the spent-profanity re-arm rule. `Buggy=1` combines both
+    /// single-signal faults (unconditional transfer; caret-only re-arm).
     fn live_profanity_retype_model() -> aterm_spec::derive::Model {
         use aterm_spec::ty_model;
         ty_model! {
@@ -10395,10 +9933,8 @@ mod tests {
         assert!(!buggy.check_invariant("NoPassiveCaretRearm", &passive));
     }
 
-    /// Tier-1 binding for the negative side of the causal rule. `Terminal`
-    /// naturally leaves its cursor immediately after passive output, so this
-    /// fixture would be misclassified by a caret-only policy. After true
-    /// identity expiry, the done mark must still make the returning word inert.
+    /// Passive output leaves the cursor after the word; after identity expiry
+    /// the done mark still keeps it inert (a caret-only policy would re-arm).
     #[test]
     fn passive_output_at_terminal_cursor_stays_spent() {
         let model = live_profanity_retype_model();
@@ -10442,10 +9978,8 @@ mod tests {
         assert!(model.check_invariant("NoPassiveCaretRearm", &state));
     }
 
-    /// Tier-1 drive of the real recognizer/alignment path: after a spent `fuck`
-    /// and intervening `fix`, an incomplete `fuc` stays ordinary and a complete
-    /// live `fuck` allocates one fresh episode. A second complete retype after
-    /// incremental `future` must re-arm independently.
+    /// After a spent `fuck` and `fix`, `fuc` stays ordinary and a live `fuck`
+    /// re-arms once; a second retype after `future` re-arms again.
     #[test]
     fn repeated_complete_fuck_rearms_while_fuc_stays_ordinary() {
         let model = live_profanity_retype_model();
@@ -10498,9 +10032,7 @@ mod tests {
         );
 
         live.process(b"k");
-        // The `k` was typed: the profanity re-arm needs the keystroke as well
-        // as the caret-completion position, since passive output also parks the
-        // caret one past a word.
+        // The `k` was typed: the profanity re-arm needs the keystroke too.
         wd.note_typed_edit(first_retype_at + Duration::from_millis(8), None);
         wd.rescan(
             &live,
@@ -10557,9 +10089,7 @@ mod tests {
         let second_retype_at = t0 + Duration::from_millis(192);
         let mut repeated = Terminal::new(4, 48);
         repeated.process(b"fuck");
-        // Its own keystroke: the witness is spent by the first retype above, so
-        // a second armed retype needs a second key — which is exactly what the
-        // hand at the keyboard supplies.
+        // The first retype spent the witness; this one needs its own key.
         wd.note_typed_edit(second_retype_at, None);
         wd.rescan(&repeated, 4, 48, &lex, &c, 13, second_retype_at);
         assert!(model.fire("TypeLive", &mut state));
@@ -10576,10 +10106,8 @@ mod tests {
         assert!(model.check_invariant("NoLiveRetypeTransferred", &state));
     }
 
-    /// A Codex composer may repaint the row several times while `fix` is being
-    /// typed, then restore an older output line containing `fuck`. Those
-    /// unrelated nonblank frames are feline retype evidence only; they must not
-    /// re-arm the spent profanity and make the harmless token look causal.
+    /// Composer repaints while `fix` is typed, then a restored `fuck` line: the
+    /// spent profanity does not re-arm.
     #[test]
     fn fix_churn_cannot_rearm_spent_profanity_on_restore() {
         let lex = Lexicon::with_languages(&["en"]);
@@ -10720,10 +10248,8 @@ mod tests {
         assert!(out.is_empty(), "no false positives expected, got {out:?}");
     }
 
-    /// Builtin `en` lexicon plus an emphasis override for `ultrathink`. This
-    /// mirrors a user's `[sparkle_words.emphasis] extra_words = ["ultrathink"]`
-    /// — since the builtin ships zero emphasis forms, `extra_words` (compiled
-    /// into exactly this kind of override entry) is the only emphasis path.
+    /// Builtin `en` plus an emphasis override for `ultrathink`: what a user's
+    /// `extra_words` compiles to (the builtin ships no emphasis forms).
     fn lex_with_emphasis() -> Lexicon {
         Lexicon::with_languages_and_override(
             &["en"],
@@ -10734,12 +10260,8 @@ mod tests {
         .expect("emphasis override parses")
     }
 
-    /// The hot-path snapshot scan is byte-identical to the term-walking scan:
-    /// `rescan_from_cells` over a `cell_frame_into` snapshot must produce the
-    /// same occurrences (span, class, identity, genome, local cat palette,
-    /// ink capture) and the
-    /// same §5.7 `dec_line` flags as `rescan(&term)`, including on rows with
-    /// wide (CJK) glyphs and on DECDWL double-width rows.
+    /// `rescan_from_cells` over a `cell_frame_into` snapshot matches
+    /// `rescan(&term)` byte for byte, wide (CJK) and DECDWL rows included.
     #[test]
     fn rescan_from_cells_matches_term_rescan() {
         let (rows, cols) = (5usize, 48usize);
@@ -10828,9 +10350,8 @@ mod tests {
         );
     }
 
-    /// Every field of the decoration set the renderer reads, plus the resident
-    /// ink buffers those fields index into — the full equivalence surface for
-    /// the [`ScanMemo`] battery below.
+    /// Every decoration field the renderer reads plus the ink buffers they
+    /// index: the [`ScanMemo`] battery's equivalence surface.
     fn deco_state(wd: &WordDecorations) -> (Vec<String>, Vec<[u8; 3]>, Vec<u16>, Vec<u64>) {
         let occ = wd
             .occ
@@ -10863,23 +10384,16 @@ mod tests {
                 )
             })
             .collect();
-        // Episode identities too: a memo that returned a stale match list would
-        // show up here (as a different persist population) even on a frame
-        // whose visible occurrences happened to coincide.
+        // Episode identities too: a stale match list shows up as a different
+        // persist population even when visible occurrences coincide.
         let mut idents: Vec<u64> = wd.persist.keys().copied().collect();
         idents.sort_unstable();
         (occ, wd.ink_base_fg.clone(), wd.ink_cols.clone(), idents)
     }
 
-    /// The tokenise memo is a pure-function cache, so a memoized engine and an
-    /// always-re-lex engine driven through the same frames agree on every
-    /// rescan.
-    ///
-    /// The sequence covers what makes incremental scanning hard: a partial
-    /// word under the live caret (the `ambiguous` gate is cursor-dependent),
-    /// soft-wrapped words, wide CJK leads (shifting the char→column map),
-    /// DECDWL rows, scrolling (text moves to a different row index), repeated
-    /// lines, and a screen clear.
+    /// A memoized engine and an always-re-lex engine agree on every rescan
+    /// through partial words at the caret, soft wraps, wide CJK leads, DECDWL
+    /// rows, scrolling, repeated lines and a clear.
     #[test]
     fn scan_memo_frames_are_identical_to_an_always_rescanning_engine() {
         let (rows, cols) = (14usize, 44usize);
@@ -10905,9 +10419,8 @@ mod tests {
             b"plain build output, nothing to match\r\n",
             "\u{5BBD}\u{5BBD} kitty ultrathink\r\n".as_bytes(),
             b"\x1b#6cat nap\r\n",
-            // Incremental typing at a prompt: only the caret row's text moves,
-            // and `fu`/`fuc` sit under the caret (the provisional-collision
-            // gate) before `fuck` settles.
+            // Incremental typing: `fu`/`fuc` sit under the caret (the
+            // provisional-collision gate) before `fuck` settles.
             b"$ fu",
             b"c",
             b"k",
@@ -10977,10 +10490,8 @@ mod tests {
         );
     }
 
-    /// The rescan fires only on a damage-epoch change, so a deny-list edit on
-    /// an idle grid forces no re-lex. `ScanMemo::fit`'s options fingerprint
-    /// retires the stale entries, or a newly ignored word would keep
-    /// sparkling.
+    /// A deny-list edit on an idle grid retires the memo (`ScanMemo::fit`), or
+    /// a newly ignored word would keep sparkling.
     #[test]
     fn scan_memo_retires_when_the_scan_gates_change() {
         let (rows, cols) = (3usize, 32usize);
@@ -11015,10 +10526,8 @@ mod tests {
         );
     }
 
-    /// The lexicon must be part of the retirement fingerprint
-    /// ([`scan_inputs_fp`]): with the same cells and `ScanOptions` but
-    /// `languages = ["en","ro"]` → `["en"]`, every row hits, and without the
-    /// lexicon in the key the switched-off Romanian form would stay decorated.
+    /// The lexicon is in the retirement key ([`scan_inputs_fp`]): switching
+    /// `languages` from `["en","ro"]` to `["en"]` undecorates the `ro` form.
     #[test]
     fn scan_memo_retires_when_the_lexicon_changes() {
         let (rows, cols) = (3usize, 32usize);
@@ -11082,9 +10591,8 @@ mod tests {
         );
     }
 
-    /// hashclock-1: the probe class of hash `h` in a 256-bucket hashbrown
-    /// table, its starting bucket and its 7-bit control tag. Keys that share
-    /// one are a chain: every probe among them compares each of them.
+    /// The probe class of hash `h` in a 256-bucket hashbrown table: starting
+    /// bucket and 7-bit control tag. Keys sharing one form a chain.
     fn probe_class(h: u64) -> (u64, u64) {
         (h & 0xff, h >> 57)
     }
@@ -11102,15 +10610,10 @@ mod tests {
             .unwrap_or(0)
     }
 
-    /// 128 of `candidate`'s keys that share probe class `(0, 0)` under the
-    /// unkeyed Fx, found by plain search, as a program precomputes them
-    /// offline once for every aterm. Asserts the set is one full chain under
-    /// Fx, so a test built on it is not vacuous.
-    ///
-    /// Under a keyed hasher the same keys must spread like any others: with a
-    /// random key, 9 or more of 128 landing in one of 2^15 classes has
-    /// probability below 2^-70, so a bound of 8 is no flake. The property is
-    /// structural, not a timing.
+    /// 128 of `candidate`'s keys sharing probe class `(0, 0)` under unkeyed Fx
+    /// (asserted, so the set is one full chain). Under a keyed hasher, 9+ of
+    /// 128 in one of 2^15 classes has probability below 2^-70, so a bound of 8
+    /// is no flake.
     fn fx_flood<K: std::hash::Hash>(candidate: impl Fn(u32) -> K) -> Vec<K> {
         use std::hash::BuildHasher;
         let fx = |k: &K| aterm_hash::FxBuildHasher.hash_one(k);
@@ -11127,11 +10630,8 @@ mod tests {
         flood
     }
 
-    /// hashclock-1 (ruling 2026-10-10): the memo is keyed by row text a pane's
-    /// program prints, so it hashes under a per-process secret. Under Fx the
-    /// precomputed rows ([`fx_flood`]) shared one bucket of a 256-bucket
-    /// generation and one control tag, so each probe compared every row.
-    /// Under the memo's own hashers they must spread like ordinary text.
+    /// Rows precomputed to share one Fx bucket and tag ([`fx_flood`]) spread
+    /// under the memo's keyed hashers.
     #[test]
     fn scan_memo_spreads_rows_precomputed_to_collide() {
         use std::hash::BuildHasher;
@@ -11164,14 +10664,9 @@ mod tests {
         }
     }
 
-    /// hashclock-1 review (ruling 2026-10-10): a done mark is keyed
-    /// `ident ^ ctx_fp`, and `ctx_fp` is a SimHash of the words a pane's
-    /// program prints around the match, so a program can search offline for
-    /// contexts whose marks collide. Avalanche mixing is no defense: the keys
-    /// here are a real ident XORed with mixed values standing in for those
-    /// SimHashes, and under Fx 128 of them ([`fx_flood`]) share one bucket
-    /// and tag, so each birth's probe compared every mark. Under the LRU
-    /// index's own hasher they must spread.
+    /// Done marks (`ident ^ ctx_fp`, a SimHash of program output) precomputed
+    /// to share one Fx bucket and tag ([`fx_flood`]) spread under the LRU
+    /// index's keyed hasher.
     #[test]
     fn done_marks_spread_keys_precomputed_to_collide() {
         use std::hash::BuildHasher;
@@ -11198,12 +10693,8 @@ mod tests {
         );
     }
 
-    /// Two rows whose char streams differ in length (a wide CJK lead makes the
-    /// second one char shorter), so a memo hit that skipped the `scan_chars`
-    /// rebuild would leave char-indexed spans past the end of the previous
-    /// row's stream (an out-of-bounds `chars[pos - 1]` in
-    /// `genome::simhash_ctx`). Drives that mutation and shows the named guard
-    /// fires rather than a crash.
+    /// Rows whose char streams differ in length (a wide CJK lead): a memo hit
+    /// that skipped the `scan_chars` rebuild trips the named guard, not a panic.
     #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "scan_chars must mirror scan_text")]
@@ -11228,10 +10719,8 @@ mod tests {
         wd.rescan_from_cells(&snap.cells, &snap.line_sizes, rows, cols, &lex, &c, 2, now);
     }
 
-    /// The unmutated shape of the same fixture: the guard above may not be a
-    /// tripwire the healthy hit path stumbles over. The second frame is served
-    /// entirely from the memo (so every row runs the assertion under a stale
-    /// candidate stream) and lands on the same decoration set.
+    /// The unmutated fixture: an all-memo second frame keeps the guard quiet
+    /// and the decoration set unchanged.
     #[test]
     fn memo_hit_over_a_wide_row_keeps_the_frame_and_the_guard_quiet() {
         let (rows, cols) = (4usize, 24usize);
@@ -11333,10 +10822,8 @@ mod tests {
         blank.bg = dark;
         snap.cells[occupied_row].resize(occupied_col + 1, blank);
         snap.cells[occupied_row][occupied_col].ch = 'X';
-        // A sparse blocker must not veto. Cats draw `FreeZ::UnderText`, so one
-        // glyph (or a TUI prompt frame) in the band costs legibility nothing —
-        // the head simply picks the clearer side.
-        // Only a wall on both sides yields, which is what the fill below builds.
+        // A sparse blocker does not veto (cats draw under text); only a wall on
+        // both sides, built below, does.
         wd.rescan_from_cells_with_geom_at_cursor(
             &snap.cells,
             &snap.line_sizes,
@@ -11504,10 +10991,8 @@ mod tests {
         };
 
         let provisional_cells = body_cells(provisional.genome);
-        // Pick a genome whose body footprint differs from the provisional one,
-        // then wall every cell in the symmetric difference. A single blocker no
-        // longer decides anything (see `CAT_MAX_BAND_OCCUPANCY`), so the fixture
-        // has to move real occupancy for the two plans to diverge.
+        // Pick a genome whose body footprint differs from the provisional one
+        // and wall the symmetric difference, so the two plans diverge.
         let (transferred, blocked_cells) = (0..10_000u64)
             .find_map(|seed| {
                 let genome = Genome {
@@ -11597,9 +11082,8 @@ mod tests {
     ) -> (Vec<InkCell>, u64) {
         let lex = lex_with_emphasis();
         let epoch = term.damage_epoch();
-        // hard_reset: the ink batteries re-run the same words repeatedly; a
-        // transient reset would flush done marks and make the second run
-        // born-done (settled ink) — not what these tests measure.
+        // A hard reset, so repeated runs are not born-done (a transient reset
+        // keeps done marks).
         wd.hard_reset();
         wd.rescan(term, rows, cols, &lex, c, epoch, scanned);
         let mut out = Vec::new();
@@ -11633,10 +11117,8 @@ mod tests {
         )
     }
 
-    /// The ink sweep SETTLES: after `sweep_ms + 250 ms` the emitted bytes are
-    /// constant across frames (a stable fixed point), the fingerprint stops
-    /// changing, `is_active` disarms — and the settled bytes equal the
-    /// reduced-motion static gradient (the §4.2 endpoint identity).
+    /// After `sweep_ms + 250 ms` the ink bytes and fingerprint are constant,
+    /// `is_active` disarms, and the bytes equal the reduced-motion gradient.
     #[test]
     fn ink_settles_to_constant_bytes_and_disarms() {
         let mut term = Terminal::new(2, 48);
@@ -11711,14 +11193,12 @@ mod tests {
         assert_eq!(fp_a, fp_b);
     }
 
-    /// §4.4 truncation: MAX_INK_CELLS is a whole-word row-major prefix — the
-    /// first occurrence that does not fit gets no ink (never partial), later
-    /// ones none either, and re-emission is a stable fixed point.
+    /// §4.4: `MAX_INK_CELLS` truncates whole words row-major (never partial)
+    /// and re-emission is a stable fixed point.
     #[test]
     fn ink_truncation_is_whole_word_and_stable() {
-        // 4 x 10-col emphasis words per row => 40 lead cells/row. 512 / 40 =
-        // 12 full rows + 3 words (30 cells, 510 total); word 52 (row 12, 4th)
-        // must get no ink rather than its first 2 cells.
+        // 4 × 10-col words per row = 40 lead cells/row: 12 rows + 3 words fill
+        // 510 of 512, so word 52 gets no ink rather than 2 cells.
         let rows = 20usize;
         let cols = 44usize;
         let mut term = Terminal::new(rows as u16, cols as u16);
@@ -11757,9 +11237,8 @@ mod tests {
         assert_eq!(fp_a, fp_b);
     }
 
-    /// §4.3 legibility guard: light pastel ink on a light background pulls the
-    /// mix toward the captured base fg until the word's mid-gradient ink clears
-    /// 2.5:1 — pinned by replicating the deterministic eighth-step pull.
+    /// §4.3 legibility guard: pastel ink on a light background pulls toward the
+    /// base fg in eighth-steps until the mid-gradient clears `MIN_INK_CONTRAST`.
     #[test]
     fn ink_legibility_guard_pulls_on_light_bg() {
         let mut term = Terminal::new(2, 48);
@@ -11796,18 +11275,16 @@ mod tests {
         }
     }
 
-    /// The emphasis gate: `emphasis = false` drops the class at rescan;
-    /// `ink_enabled = false` emits no ink for any class (profanity/feline keep
-    /// their sprite effects, tested elsewhere).
+    /// `emphasis = false` drops the class at rescan; `ink_enabled = false`
+    /// emits no ink for any class.
     #[test]
     fn emphasis_and_ink_gates() {
         let mut term = Terminal::new(2, 48);
         term.process(b"ultrathink and a kitten say fuck");
         let mut wd = WordDecorations::default();
         let now = Instant::now();
-        // v2.9: feline ink is a glow pulse that starts at 0 and ramps in, so we
-        // sample mid-pulse (350 ms = the first envelope peak) where all three
-        // ink-bearing classes are live.
+        // Feline ink is a glow pulse from 0, so sample at its first peak
+        // (350 ms), where all three ink-bearing classes are live.
         let lit = now + Duration::from_millis(350);
         // All gates on: ink covers emphasis + feline + profanity glyph spans.
         let (ink, _) = ink_at(&mut wd, &mut term, 2, 48, &cfg(), now, lit);
@@ -11830,9 +11307,8 @@ mod tests {
         assert_ne!(fp, 0);
     }
 
-    /// The suppressed-alt-screen / master-off arms call `reset()` then tick with
-    /// the same scratch: a stale ink vec from the previous frame must come back
-    /// empty (byte-identical off), fp 0.
+    /// After `reset()`, the next tick with the same scratch returns empty ink
+    /// and fp 0 (the suppressed-alt-screen / master-off arms).
     #[test]
     fn reset_clears_stale_ink_on_next_tick() {
         let mut term = Terminal::new(2, 48);
@@ -11854,7 +11330,7 @@ mod tests {
         assert!(!wd.is_active(now));
     }
 
-    // ───────────────── §3.6 genome / persistence battery (P2) ─────────────────
+    // ───────────────── §3.6 genome / persistence battery ─────────────────
 
     fn lex() -> Lexicon {
         Lexicon::with_languages(&["en"])
@@ -11868,9 +11344,8 @@ mod tests {
             .expect("a feline occurrence")
     }
 
-    /// §13 `genome_frozen_across_neighbor_churn`: churn a neighbor and its SGR
-    /// color, then rescan. The persist hit keeps both the frozen genome and
-    /// palette; kill + grace-expire lets the re-appearance resolve new context.
+    /// §13 `genome_frozen_across_neighbor_churn`: neighbor and SGR churn keep the
+    /// frozen genome and palette; after grace expiry the word resolves anew.
     #[test]
     fn genome_frozen_across_neighbor_churn() {
         let lex = lex();
@@ -11908,7 +11383,7 @@ mod tests {
         wd.rescan(&blank, 2, 64, &lex, &c, 3, t0 + Duration::from_secs(12));
         assert!(wd.persist.is_empty(), "grace expiry sweeps the episode");
 
-        // Re-appearance rolls a FRESH genome from the churned context.
+        // Re-appearance rolls a fresh genome from the churned context.
         wd.rescan(&churned, 2, 64, &lex, &c, 4, t0 + Duration::from_secs(13));
         assert_ne!(
             feline(&wd).genome.gkey,
@@ -11923,9 +11398,8 @@ mod tests {
         assert_eq!(feline(&wd).appeared, t0 + Duration::from_secs(13));
     }
 
-    /// §13 `grace_survives_one_epoch`: a word occluded for one rescan (the
-    /// print-erase-print loop) keeps its genome, its `appeared`, and its spent
-    /// nova — exactly the B-3 fix.
+    /// §13 `grace_survives_one_epoch`: a word occluded for one rescan keeps its
+    /// genome, `appeared` and spent nova.
     #[test]
     fn grace_survives_one_epoch() {
         let lex = lex();
@@ -11937,7 +11411,7 @@ mod tests {
         wd.rescan(&term, 2, 64, &lex, &c, 1, t0);
         let g1 = feline(&wd).genome;
         let ident = mix(feline(&wd).seed); // ordinal 0
-        // Simulate P4: this episode's one nova has been spent.
+        // Simulate a spent nova for this episode.
         wd.persist.get_mut(&ident).expect("episode").nova_done = true;
 
         // Occlude exactly one rescan (a clear+redraw race).
@@ -11960,10 +11434,9 @@ mod tests {
         );
     }
 
-    /// §13 `magic_position_independent`: the same sentence at three
-    /// indentations/rows rolls the same magic outcome (no ident/col/row folded
-    /// into the magic stream, §3.5) while the base genomes stay siblings
-    /// (`gkey` folds in the position-bearing seed — the deliberate §15.2 split).
+    /// §13 `magic_position_independent`: the same sentence at three positions
+    /// rolls the same magic (§3.5) while `gkey`, which folds in the seed,
+    /// differs.
     #[test]
     fn magic_position_independent() {
         let lex = lex();
@@ -11987,9 +11460,8 @@ mod tests {
     }
 
     /// §13 `ordinal_transfer_is_episode_only`: when one of two context-identical
-    /// same-seed twins scrolls off, the survivor's ordinal shift lands it on the
-    /// departed twin's entry — transferring only episode state (appeared /
-    /// nova_done, suppressing a re-flash) and never mutating the coat (§3.6 C-3).
+    /// twins scrolls off, the survivor lands on the departed twin's entry,
+    /// taking only episode state, never the coat (§3.6).
     #[test]
     fn ordinal_transfer_is_episode_only() {
         let lex = lex();
@@ -12012,7 +11484,7 @@ mod tests {
         );
         let seed = cats[0].seed;
         let ident0 = mix(seed); // ordinal 0 — the row-major FIRST twin
-        // The first twin's nova fires (P4 simulation); the second's does not.
+        // The first twin's nova fires (simulated); the second's does not.
         wd.persist.get_mut(&ident0).expect("twin 0").nova_done = true;
 
         // The first twin scrolls off; the survivor's ordinal shifts 1 → 0.
@@ -12064,11 +11536,8 @@ mod tests {
                 wd.pending.capacity(),
                 wd.align_old.capacity(),
                 wd.align_decisions.capacity(),
-                // The tokenise memo is resident scratch under the same rule:
-                // once every visible row's text is memoized, a rescan neither
-                // inserts nor rotates, so a growing capacity here would mean
-                // the memo is missing every frame (a silent regression to the
-                // full re-tokenise it exists to remove).
+                // The memo too: with every row memoized a rescan neither
+                // inserts nor rotates, so growth means it misses every frame.
                 wd.scan_memo.hot.capacity(),
                 wd.scan_memo.cold.capacity(),
             ]
@@ -12082,10 +11551,8 @@ mod tests {
         wd.rescan(&term_b, 4, 64, &lex, &c, 2, t0);
         tick_ink(&mut wd, t0, &c, &mut out, &mut ink);
         let warm = caps(&wd);
-        // The alignment DP's 66 KB decision plane is lent to `align_pending`
-        // via `mem::take` and handed back at the tail. A missed handback would
-        // reallocate the plane every damaged frame yet pass the capacity
-        // comparison below (0 == 0), so it is checked directly.
+        // The DP decision plane is lent via `mem::take`; a missed handback
+        // would reallocate it every frame yet pass the capacity check (0 == 0).
         assert!(
             wd.align_decisions.capacity() >= ALIGN_DECISION_CELLS,
             "align_pending must hand its decision plane back"
@@ -12102,11 +11569,8 @@ mod tests {
         );
     }
 
-    /// §13 allocation, miss side: a full-screen TUI repaint whose every row's
-    /// text is new each frame misses on every probe, and each miss's key and
-    /// match-list buffers come from the generation the memo just retired. After
-    /// warm-up such a frame allocates nothing; `fresh_buffers` (bumped only
-    /// when the pool runs dry) is the witness.
+    /// §13 allocation, miss side: an all-new full-screen repaint misses every
+    /// probe, yet after warm-up refills retired buffers (`fresh_buffers` stays).
     #[test]
     fn allocation_regression_all_miss_repaint_reuses_retired_buffers() {
         let lex = lex();
@@ -12123,10 +11587,8 @@ mod tests {
             term.process(b"\x1b[H");
             for r in 0..rows {
                 line.clear();
-                // Fixed-width frame tag: a counter that widens from 99 to 100
-                // would shift every match's column, and columns seed identities
-                // — persist churn that has nothing to do with the buffers this
-                // test is about.
+                // Fixed-width frame tag: a widening counter would shift match
+                // columns, which seed identities (unrelated persist churn).
                 for digit in [1000u64, 100, 10, 1] {
                     let d = u8::try_from(e / digit % 10).expect("one digit");
                     line.push(char::from(b'0' + d));
@@ -12142,9 +11604,8 @@ mod tests {
             term.cell_frame_into(&mut snap, rows, cols);
             wd.rescan_from_cells(&snap.cells, &snap.line_sizes, rows, cols, &lex, &c, e, t0);
         };
-        // Warm-up: several full generations (`gen_cap` is two screenfuls, so a
-        // rotation lands every `gen_cap / rows` frames) plus the episode
-        // machinery reaching its high-water capacities.
+        // Warm-up: several full generations (a rotation every `gen_cap / rows`
+        // frames) plus the episode machinery's high-water capacities.
         for e in 1..=60u64 {
             repaint(&mut wd, &mut term, e);
         }
@@ -12185,9 +11646,8 @@ mod tests {
             "resident capacities must not grow on the all-miss path either"
         );
 
-        // Non-vacuity, and the size of what the pool returns: the same frames
-        // on an engine that allocates per miss (the path as first shipped) buy
-        // a key + match-list pair for every row of every frame.
+        // Non-vacuity: an engine that allocates per miss buys a key + match-list
+        // pair for every row of every frame.
         let mut control = WordDecorations::default();
         control.scan_memo.no_recycle = true;
         let mut control_term = Terminal::new(rows as u16, cols as u16);
@@ -12207,14 +11667,9 @@ mod tests {
 
     // ────────────── SparkleIdentity Tier-1 conformance (design §9) ──────────────
 
-    /// Project the real persist map onto the model's observables and assert they
-    /// match the model state after each fired transition. `rolls` is the
-    /// externally-counted number of accepted/stored fresh-episode genomes; a
-    /// deferred candidate may compute a disposable provisional genome before
-    /// alignment transfers the survivor's frozen one.
-    /// `nova` is only comparable while the episode exists (the model keeps its
-    /// counter through Absent; the real counter dies with the entry — identical
-    /// observable behavior, since nothing can ignite in Absent).
+    /// Project the real persist map onto the model's observables and assert
+    /// they match after each transition. `rolls` counts stored fresh genomes;
+    /// `nova` is compared only while the episode exists.
     fn assert_projection(
         wd: &WordDecorations,
         ident: u64,
@@ -12235,27 +11690,23 @@ mod tests {
             "accepted fresh-episode genome generations must match the model"
         );
         if state != 0 {
-            // v3: a born-done episode pre-spends `nova_done` without a fire —
-            // the model's per-episode `nova` counts fires, so born-done
-            // projects as 0 (the identity-level guard is the model's `done`).
+            // Born-done pre-spends `nova_done` without a fire; the model counts
+            // fires, so it projects as 0.
             let ep = &wd.persist[&ident];
             let nova = i64::from(ep.nova_done && !ep.born_done);
             assert_eq!(nova, st[&"nova"], "projected nova must match the model");
         }
     }
 
-    /// Three same-width snapshots for the repeated-surface cardinality proof.
-    /// The two original `kitty` occurrences are spent survivors. `moved`
-    /// changes both neighbors, rows, and columns without changing count;
-    /// `grown` adds exactly one distant third occurrence.
+    /// Frames for the repeated-surface proof: two spent `kitty`s, `moved`
+    /// (new neighbors, rows, columns; same count), `grown` (one more).
     fn repeated_kitty_reflow_frames() -> (Terminal, Terminal, Terminal) {
         let mut original = Terminal::new(6, 48);
         original.process(b"\x1b[1;1Hold alpha kitty tail\x1b[3;1Hold bravo kitty tail");
 
         let mut moved = Terminal::new(6, 48);
-        // Both exact-surface/seed episodes move down one row. Old row 2 is
-        // equidistant from new rows 1 and 3, reproducing the greedy-bid hole:
-        // it must retry row 3 after old row 0 wins row 1, not become fresh.
+        // Both episodes move down a row; old row 2 is equidistant from new rows
+        // 1 and 3 and must take row 3 after row 0 wins row 1.
         moved.process(b"\x1b[2;1Hnew gamma kitty purrs\x1b[4;1Hnew delta kitty sleeps");
 
         let mut grown = Terminal::new(6, 48);
@@ -12265,13 +11716,9 @@ mod tests {
         (original, moved, grown)
     }
 
-    /// Tier-1: drive the real persist map through
-    /// appear → ignite → horizontal rekey → changed-context/wrapped rekey →
-    /// vanish → re-hit-within-grace → grace-expiry → re-appear with a fake
-    /// clock, firing the ty-proven
-    /// `SparkleIdentity` model's actions alongside and checking the projected
-    /// `(state, rolls, nova)` trace at every step (the aterm-buffer
-    /// `conformance_*` idiom; Tier-0 lives in aterm-spec/tests/derived_ring_ty.rs).
+    /// Tier-1: drive the real persist map through appear, ignite, rekeys,
+    /// vanish, grace re-hit, expiry and re-appear alongside the
+    /// `SparkleIdentity` model, checking `(state, rolls, nova)` at every step.
     #[test]
     fn sparkle_identity_conformance_real_persist_map() {
         let m = aterm_spec::derive::sparkle_identity_model();
@@ -12296,15 +11743,14 @@ mod tests {
         assert_eq!(feline(&wd).appeared, t0);
         assert_projection(&wd, ident, rolls, &st);
 
-        // Ignite (P4 simulation, while live): the episode's one nova is spent.
+        // Ignite (simulated, while live): the episode's one nova is spent.
         wd.persist.get_mut(&ident).expect("live episode").nova_done = true;
         assert!(m.fire("Ignite", &mut st));
         assert_projection(&wd, ident, rolls, &st);
         assert!(m.check_invariant("OneNovaPerEpisode", &st));
 
-        // Rekey: a same-width redraw indents the same logical sentence. The
-        // position-bearing ident changes, but the old episode transfers: no
-        // genome roll, no appeared reset, and the spent nova remains spent.
+        // Rekey: an indented redraw changes the ident but transfers the episode
+        // (no roll, no `appeared` reset, nova stays spent).
         let mut moved = Terminal::new(2, 48);
         moved.process(b" a fluffy kitty naps");
         let old_ident = ident;
@@ -12329,12 +11775,8 @@ mod tests {
         );
         assert!(m.check_invariant("PlayedOnce", &st));
 
-        // ContextMove: the same sentence is now preceded by a changed status
-        // token and crosses the 48-column wrap boundary. Thus both viewport
-        // position and row-local context change, while the exact `kitty`
-        // surface remains the same logical occurrence. A fresh probe proves
-        // the candidate context really differs from the frozen episode (so
-        // this cannot pass through the old exact-context fallback by luck).
+        // ContextMove: a changed status token and the 48-column wrap move both
+        // position and context; the probe proves the context really differs.
         let mut context_moved = Terminal::new(2, 48);
         context_moved
             .process(b"build output changed; wrapping follows here.    status a bright kitty naps");
@@ -12418,9 +11860,8 @@ mod tests {
         assert!(wd.persist.is_empty(), "true identity death");
         assert_projection(&wd, ident, rolls, &st);
 
-        // v3 §1.3 born-done lockstep: the re-appearance from the done set is
-        // a new episode (fresh roll — settled ink needs the genome) that
-        // enters born-done: `PlayedOnce` holds and Ignite stays disabled.
+        // v3 §1.3: the re-appearance from the done set is a new episode (fresh
+        // roll) born done: `PlayedOnce` holds and Ignite stays disabled.
         wd.rescan(&context_moved, 2, 48, &lex, &c, 8, at(22));
         rolls += 1;
         assert!(m.fire("Appear", &mut st));
@@ -12438,10 +11879,8 @@ mod tests {
         assert!(m.check_invariant("GenomeFrozen", &st));
     }
 
-    /// Negative control for the `Rekey` arm: deliberately discard the old map
-    /// entry before the same-width horizontal redraw. The genuine scanner then
-    /// takes its fresh-birth path, reproducing Buggy=1 exactly: a second roll,
-    /// lost spent guard, and a second fire that violates `PlayedOnce`.
+    /// Negative control for `Rekey`: discarding the old entry before the
+    /// redraw gives Buggy=1's second roll and second fire.
     #[test]
     fn sparkle_identity_negative_control_missing_rekey_is_buggy_trace() {
         let healthy = aterm_spec::derive::sparkle_identity_model();
@@ -12469,8 +11908,7 @@ mod tests {
         wd.persist.get_mut(&old_ident).expect("live").nova_done = true;
         assert!(buggy.fire("Ignite", &mut st));
 
-        // Fault injection: omission of the rekey transfer makes the shipping
-        // scanner observe a persist miss and exercise its real fresh path.
+        // Fault injection: no rekey transfer, so the scanner takes its fresh path.
         wd.persist.clear();
         wd.done_marks.clear();
         wd.rescan(&moved, 2, 48, &lex, &c, 2, t0 + Duration::from_secs(1));
@@ -12495,12 +11933,8 @@ mod tests {
         );
     }
 
-    /// Negative control for changed-context recognition completeness. Removing
-    /// the live episode before the same exact surface moves across a wrap with
-    /// a new status neighbor forces the real scanner down its fresh-allocation
-    /// arm. That is the `ContextMove` Buggy=1 transition: births and rolls stay
-    /// mutually consistent, but the logical move is unrecognized, a false
-    /// birth occurs, and the spent nova can fire again.
+    /// Negative control for `ContextMove`: removing the live episode before the
+    /// wrap-crossing move gives Buggy=1's false birth and second fire.
     #[test]
     fn sparkle_identity_negative_control_context_move_false_birth() {
         let healthy = aterm_spec::derive::sparkle_identity_model();
@@ -12528,8 +11962,7 @@ mod tests {
         wd.persist.get_mut(&old_ident).expect("live").nova_done = true;
         assert!(buggy.fire("Ignite", &mut st));
 
-        // Fault injection at the recognizer boundary: with no transferable
-        // episode, the unchanged lexical surface necessarily becomes fresh.
+        // Fault injection: with no transferable episode the surface is fresh.
         wd.persist.clear();
         wd.done_marks.clear();
         let births_before = wd.birth_seq;
@@ -12580,10 +12013,8 @@ mod tests {
         );
     }
 
-    /// Soundness complement to ContextMove: equal FormId and proximity are
-    /// insufficient after the incremental scans produced by genuine typing.
-    /// A retyped nearby `kitty` must remain a fresh, armed episode — the
-    /// reliability direction requested for repeated typing.
+    /// ContextMove's soundness complement: a retyped nearby `kitty` with equal
+    /// FormId stays a fresh, armed episode.
     #[test]
     fn unrelated_changed_column_retype_remains_fresh_and_armed() {
         let lex = lex();
@@ -12599,9 +12030,8 @@ mod tests {
         let old = feline(&wd).clone();
         wd.persist.get_mut(&old.ident).expect("old live").nova_done = true;
 
-        // Real key-by-key typing produces nonmatching damage scans before the
-        // complete token exists. Those scans make this ineligible for the
-        // sequence-gap <= 2 clear/redraw continuity arm.
+        // Key-by-key typing yields nonmatching scans first, which rule out the
+        // seq-gap ≤ 2 continuity arm.
         for (i, partial) in [
             b"\x1b[2;1Hstatus a noisy k purrs".as_slice(),
             b"\x1b[2;1Hstatus a noisy ki purrs".as_slice(),
@@ -12717,10 +12147,8 @@ mod tests {
         assert!(model.check_invariant("NoFalseTransfers", &state));
     }
 
-    /// A single coalesced partial-token frame is sufficient overwrite
-    /// evidence. Even though the complete kitty returns at the same key inside
-    /// the two-scan weak-continuity window, the tainted feline episode must not
-    /// take either the same-row fast path or an alignment edge.
+    /// One coalesced partial-token frame is overwrite evidence: the returning
+    /// kitty takes neither the fast path nor an alignment edge.
     #[test]
     fn recent_same_column_retype_after_one_partial_is_fresh_and_armed() {
         let model = aterm_spec::derive::sparkle_reflow_cardinality_model();
@@ -12762,15 +12190,8 @@ mod tests {
         assert!(model.check_invariant("NoFalseTransfers", &state));
     }
 
-    /// Done-mark poisoning: the replaced episode from one explicit kitty
-    /// retype must not make the next explicit retype born-done. Each
-    /// partial→complete cycle is a new armed episode at the same identity key.
-    ///
-    /// The fixtures end at the token: a re-arm needs a caret witness, not just
-    /// a changed screen, so the retype leaves the cursor one past the typed
-    /// `y`. A caret parked elsewhere is a repaint, not a re-arm
-    /// (`a_repaint_with_the_caret_elsewhere_plays_no_second_cat`)
-    /// (owner, 2026-08-09).
+    /// The episode replaced by one explicit kitty retype does not make the next
+    /// retype born-done; each cycle ends with the caret one past the `y`.
     #[test]
     fn two_consecutive_recent_kitty_retypes_both_arm() {
         let model = aterm_spec::derive::sparkle_retype_rearm_model();
@@ -12785,9 +12206,7 @@ mod tests {
         let mut wd = WordDecorations::default();
         wd.rescan(&complete, 4, 48, &lex, &c, 1, t0);
         let ident = feline(&wd).ident;
-        // PRECONDITION the fixture depends on: the caret really is the typing
-        // witness (one cell past the token), otherwise this test would pass
-        // vacuously through some other arm.
+        // Precondition: the caret is one cell past the token (the witness).
         {
             let occ = feline(&wd);
             assert_eq!(
@@ -12815,9 +12234,7 @@ mod tests {
 
             let complete_seq = partial_seq + 1;
             let appeared = t0 + Duration::from_millis(16 * (complete_seq - 1));
-            // One keystroke per retype: a repaint also parks the caret, so each
-            // cycle brings the key that finished the word, and since the
-            // witness is spent on use, cycle 2 needs its own.
+            // One keystroke per retype: the witness is spent on use.
             wd.note_typed_edit(appeared, None);
             wd.rescan(&complete, 4, 48, &lex, &c, complete_seq, appeared);
             assert!(model.fire("TypeAgain", &mut state));
@@ -12845,29 +12262,9 @@ mod tests {
         assert!(model.check_invariant("EveryRetypeArmed", &state));
     }
 
-    /// A redraw does not bring back a spent cat: one cat per kitty word.
-    ///
-    /// Two mechanisms hold this:
-    ///
-    /// 1. the feline re-arm does not accept `continuity_tainted` alone, since
-    ///    taint is set whenever an unseen episode's old row comes back
-    ///    nonblank (a status line, a TUI repaint or a prompt redraw);
-    /// 2. the done mark is written when the one-shot starts, not only on
-    ///    departure, so a cat replaced in place by a redraw leaves a mark.
-    ///
-    /// The caret alone is not a witness either: a shell or TUI parks it on the
-    /// line it drew. The arms vary where the caret lands and whether a
-    /// committed edit keystroke ([`WordDecorations::note_typed_edit`]) was
-    /// seen; arm 2 has the same grid bytes as the genuine retype in arm 3 but
-    /// no keystroke. All arms run the same three frames (type, blank-over,
-    /// restore), so the verdict depends on the witness alone.
-    ///
-    /// One keystroke re-arms at most once: within [`TYPED_EDIT_WITNESS_MS`] a
-    /// repainting TUI could put the word back under the caret many times, so
-    /// the witness is spent on re-arm ([`WordDecorations::spend_typed_edit`]).
-    /// The three cycles run inside one witness window: cycle 1 rides its key
-    /// and arms, cycle 2 has no key and stays inert, cycle 3 brings a new key
-    /// and arms, showing cycle 2's silence is the spend.
+    /// One keystroke re-arms at most one cat however many repaints follow: in
+    /// one witness window, cycle 1 rides its key and arms, cycle 2 (no key)
+    /// stays inert, cycle 3 brings a new key and arms.
     #[test]
     fn one_keystroke_re_arms_one_cat_however_many_repaints_follow() {
         let lex = lex();
@@ -12887,16 +12284,13 @@ mod tests {
             "PRECONDITION: the first typed kitty is armed"
         );
 
-        // Every cycle is `spend the one-shot -> blank the word -> put it back
-        // under the caret`, i.e. exactly what a repaint loop looks like from
-        // the grid's side. `key` is the only thing that varies.
+        // Each cycle: spend the one-shot, blank the word, restore it under the
+        // caret (a repaint loop); only `key` varies.
         let mut out = Vec::new();
         let mut cycle = |wd: &mut WordDecorations, seq: u64, base_ms: u64, key: bool| -> bool {
             wd.persist.get_mut(&ident).expect("live kitty").nova_done = true;
-            // The tick is what stamps the ledger (`episode_prepass` ->
-            // `stamp_spent_marks`), and the stamp is what makes the next birth
-            // born-done unless something re-arms it. Without this the cycles
-            // would all arm for the boring reason that no guard exists.
+            // The tick stamps the ledger (`stamp_spent_marks`), the guard a
+            // re-arm must overcome.
             tick_deco(wd, at(base_ms), &c, &mut out);
             let done_key = ident ^ wd.persist[&ident].ctx_fp;
             assert!(
@@ -12938,10 +12332,8 @@ mod tests {
         );
     }
 
-    /// Every precondition is asserted so the test cannot rot into a vacuous
-    /// pass: the first cat must really be armed, must really play to
-    /// completion, must really stamp the ledger, and the old episode must
-    /// really be tainted before the verdict is read.
+    /// Each arm varies the caret and keystroke over the same frames; only a
+    /// typed retype plays a second cat. Every precondition is asserted.
     #[test]
     fn a_repaint_with_the_caret_elsewhere_plays_no_second_cat() {
         let lex = lex();
@@ -12950,22 +12342,17 @@ mod tests {
         let (rows, cols) = (g.rows as usize, g.cols as usize);
         let t0 = Instant::now();
 
-        // The word as the user typed it: the caret is the cell right after the
-        // `y`, which is what "I just typed this" looks like on a real grid.
+        // As typed: the caret is the cell right after the `y`.
         let mut typed = Terminal::new(g.rows, g.cols);
         typed.process(b"hello kitty");
-        // The intervening repaint frame: same row, nonblank, word gone. This is
-        // the only thing a redraw actually proves, and it is what sets
-        // `continuity_tainted`.
+        // The repaint: same row, nonblank, word gone (sets `continuity_tainted`).
         let mut overwritten = Terminal::new(g.rows, g.cols);
         overwritten.process(b"hello ------");
-        // The restored frame, caret parked elsewhere — a status-line/prompt
-        // repaint puts the word back and leaves the cursor on another row.
+        // The word restored with the cursor parked on another row.
         let mut restored_elsewhere = Terminal::new(g.rows, g.cols);
         restored_elsewhere.process(b"hello kitty\r\n\r\n$ ");
 
-        // `play` runs the real one-shot to completion and returns the engine
-        // with the ledger in whatever state the shipping code left it.
+        // `play` runs the real one-shot to completion.
         let play = |wd: &mut WordDecorations, ident: u64| {
             let mut at = t0;
             for _ in 0..120 {
@@ -12978,11 +12365,8 @@ mod tests {
             at
         };
 
-        // The third arm's intermediate frame: a genuine incremental retype —
-        // the user backspaced to `kitt` and is about to finish the word. Its
-        // caret sits ON the partial token, which is what typing looks like from
-        // the grid's side, and it separates "the caret happened to be parked
-        // here" from "the caret walked here one keystroke ago".
+        // The retype arm's intermediate frame: backspaced to `kitt`, caret on
+        // the partial token, as typing looks from the grid.
         let mut partial = Terminal::new(g.rows, g.cols);
         partial.process(b"hello kitt");
 
@@ -12994,9 +12378,7 @@ mod tests {
                 &restored_elsewhere,
                 false,
             ),
-            // Byte-identical to the retype arm below (same frames, caret
-            // parked right after the `y`) except that no key was committed: a
-            // redraw that leaves the caret on the word is still a redraw.
+            // The retype arm's frames without a committed key: still a redraw.
             (
                 "repaint that PARKS THE CARET ON THE WORD",
                 &overwritten,
@@ -13044,8 +12426,7 @@ mod tests {
             );
 
             let births_before = wd.birth_seq;
-            // The causal witness, supplied only where a key was pressed; the
-            // host's input path feeds it and PTY output cannot produce it.
+            // The causal witness, only where a key was pressed.
             if keystroke {
                 wd.note_typed_edit(played_at + Duration::from_millis(30), None);
             }
@@ -13091,12 +12472,8 @@ mod tests {
         }
     }
 
-    /// A redraw mid-animation does not replay the cat.
-    ///
-    /// Most repaints land inside a cat's multi-second one-shot. If the mark
-    /// were written only when the peek finished, a repaint during the rise or
-    /// dwell would find no mark and replay the entrance, so the mark is
-    /// written when the one-shot starts, departure's own condition.
+    /// A redraw during the rise or dwell does not replay the cat: the mark is
+    /// written when the one-shot starts.
     #[test]
     fn a_repaint_midway_through_the_cat_plays_no_second_cat() {
         let lex = lex();
@@ -13161,15 +12538,9 @@ mod tests {
         );
     }
 
-    /// Capacity-boundary regression for the alignment transaction:
-    ///
-    /// 1. pull one stale, untainted old kitty from a full persist map;
-    /// 2. admit a changed-context/column occurrence as a fresh episode; then
-    /// 3. offer the unmatched old episode back for grace.
-    ///
-    /// Step 3 must not be a raw `HashMap::insert` — that produces entry 513.
-    /// Grace history must lose this capacity race while the freshly visible
-    /// kitty remains armed and resident.
+    /// At a full persist map, an unmatched old kitty offered back for grace
+    /// after a fresh move loses the capacity race (no entry 513); the fresh
+    /// kitty stays armed and resident.
     #[test]
     fn persist_cap_drops_unmatched_grace_after_fresh_move() {
         let model = aterm_spec::derive::sparkle_persist_capacity_model();
@@ -13213,11 +12584,9 @@ mod tests {
         }
         assert_eq!(wd.persist.len(), PERSIST_CAP);
 
-        // More than the weak-continuity window of blank scans leaves the old
-        // episode untainted, while the final changed context and column defeat
-        // both exact evidence arms. This specifically exercises the ordinary
-        // unmatched-grace capacity admission (typed-feline reentry has its own
-        // explicit re-arm policy and regression below).
+        // Blank scans past the weak-continuity window leave the old episode
+        // untainted; the changed context and column defeat both exact arms,
+        // so this exercises the ordinary unmatched-grace admission.
         for i in 0..3 {
             let blank = Terminal::new(4, 48);
             wd.rescan(
@@ -13323,9 +12692,8 @@ mod tests {
         assert!(model.check_invariant("RecognitionComplete", &state));
     }
 
-    /// Tier-1 negative controls for the two stale exact-evidence actions. Each
-    /// fault changes only the recognizer boundary, then lets the genuine
-    /// shipping transfer/fresh path produce the Buggy model's observable state.
+    /// Negative controls for the two stale exact-evidence actions: each fault
+    /// changes only the recognizer boundary and reproduces the Buggy state.
     #[test]
     fn reflow_taint_and_blank_grace_negative_controls_match_buggy_model() {
         let healthy = aterm_spec::derive::sparkle_reflow_cardinality_model();
@@ -13556,12 +12924,9 @@ mod tests {
         );
     }
 
-    /// Tier-1 group binding for `SparkleReflowCardinality`: two repeated exact
-    /// surfaces survive a context-changing 2→2 redraw without births/re-arming;
-    /// a subsequent 2→3 redraw transfers those two and births exactly the
-    /// single net-new occurrence. Association is checked as a multiset because
-    /// repeated equal surfaces are intentionally ambiguous; lifecycle
-    /// cardinality is the safety property.
+    /// Tier-1 binding for `SparkleReflowCardinality`: two repeated surfaces
+    /// survive a context-changing 2→2 redraw with no births, and 2→3 births
+    /// exactly one (association checked as a multiset).
     #[test]
     fn sparkle_reflow_cardinality_conformance_repeated_surfaces() {
         let model = aterm_spec::derive::sparkle_reflow_cardinality_model();
@@ -13582,9 +12947,8 @@ mod tests {
             wd.persist.get_mut(&o.ident).expect("old live").nova_done = true;
         }
 
-        // Compute the moved candidates independently. This pins that both
-        // fingerprints changed, so the positive pass cannot accidentally take
-        // the exact-context arm instead of the one under test.
+        // Both fingerprints changed, so the pass cannot take the exact-context
+        // arm.
         let mut probe = WordDecorations::default();
         probe.rescan(&moved, 6, 48, &lex, &c, 1, t0);
         assert_eq!(probe.occ.len(), 2);
@@ -13664,10 +13028,8 @@ mod tests {
         assert!(model.check_invariant("NoFalseBirths", &growth));
     }
 
-    /// Negative control for the repeated-surface group proof. Clearing the
-    /// transferable old group emulates an exact-context gate that rejects every
-    /// changed candidate: real 2→2 creates/arms two, and real 2→3 creates/arms
-    /// three. Both traces match `Buggy=1` and violate the net-growth bounds.
+    /// Negative control: clearing the transferable old group makes 2→2 arm two
+    /// and 2→3 arm three, matching `Buggy=1`.
     #[test]
     fn sparkle_reflow_cardinality_negative_control_context_gate() {
         let mut buggy = aterm_spec::derive::sparkle_reflow_cardinality_model();
@@ -13712,11 +13074,8 @@ mod tests {
         run(&grown, "GrowOne");
     }
 
-    /// Negative control: a grace-less map (TTL zero — v1's `prev_appeared`
-    /// semantics) reproduces exactly the model's `Buggy = 1` trace: the re-hit
-    /// re-rolls the genome (`GenomeFrozen` violated) and loses the spent-nova
-    /// guard (`OneNovaPerEpisode` violated on the next ignition) — so the
-    /// conformance pass above is provably non-vacuous.
+    /// Negative control: a grace-less map (TTL zero) reproduces `Buggy = 1`:
+    /// the re-hit re-rolls and the spent-nova guard is lost.
     #[test]
     fn sparkle_identity_negative_control_graceless_map_is_buggy_trace() {
         let healthy = aterm_spec::derive::sparkle_identity_model();
@@ -13754,11 +13113,8 @@ mod tests {
             "grace-less: the episode dies with one epoch"
         );
 
-        // The re-hit that should continue the episode is a fresh miss: the
-        // genome re-rolls — the Buggy model's Rehit does exactly that. The
-        // done_marks layer would mask that amnesia (the graceless departure
-        // writes a mark and the re-hit would be born-done), so this control —
-        // which models a mark-less engine — must drop them.
+        // The re-hit is a fresh miss and re-rolls, as Buggy's Rehit does. Done
+        // marks would mask it (born-done), so this mark-less control drops them.
         wd.done_marks.clear();
         wd.rescan(&term, 2, 48, &lex, &c, 3, t0 + Duration::from_secs(2));
         rolls += 1;
@@ -13777,13 +13133,12 @@ mod tests {
             !healthy.check_invariant("GenomeFrozen", &st),
             "births=1 rolls=2 must violate GenomeFrozen"
         );
-        // And the lost guard admits a second ignition (Buggy guard allows it):
-        // OneNovaPerEpisode is violated — the WCAG anti-strobe property.
+        // The lost guard admits a second ignition: `OneNovaPerEpisode` fails.
         assert!(buggy.fire("Ignite", &mut st));
         assert!(!healthy.check_invariant("OneNovaPerEpisode", &st));
     }
 
-    // ───────────────────── §5 peeking-cat battery (P3) ─────────────────────
+    // ───────────────────── §5 peeking-cat battery ─────────────────────
 
     /// 10×20 reference cell over a 6×20 grid (§7's reference geometry class).
     fn geom20() -> EffectGeom {
@@ -13808,8 +13163,7 @@ mod tests {
         let lex = lex();
         let mut snap = aterm_core::render::RenderInput::default();
         term.cell_frame_into(&mut snap, rows, cols);
-        // Blank snapshot rows arrive trimmed (possibly empty) — take the bg
-        // from the first row that actually has a cell.
+        // Snapshot rows may arrive trimmed: take the bg from the first cell.
         let bg = snap
             .cells
             .iter()
@@ -13832,12 +13186,8 @@ mod tests {
         wd
     }
 
-    /// A `kitty` typed inside a TUI prompt box must summon a cat, exactly like
-    /// one echoed onto a clear transcript line. A prompt frame puts `╭──╮`
-    /// directly above the input line and `│` on both sides of it, so any
-    /// clearance rule that vetoes on a single glyph in the band makes this
-    /// case impossible. Cats draw `FreeZ::UnderText`, so the frame renders
-    /// over the fur at full contrast and nothing is lost by allowing it.
+    /// A `kitty` inside a TUI prompt box (`╭──╮` above, `│` beside) still gets
+    /// a cat: the frame draws over the fur.
     #[test]
     fn tui_prompt_box_frame_still_summons_a_cat() {
         let (rows, cols) = (6usize, 20usize);
@@ -13863,11 +13213,8 @@ mod tests {
         );
     }
 
-    /// The top-line rule: a row-0 word has no rows above it, so the plan
-    /// resolves to `PeekDir::Down` and the head slides out from under the
-    /// word. Every emitted pixel sits strictly below the word row, so the
-    /// decorated text is never covered (a viewport clamp that slides an Up
-    /// sprite into view would cover it).
+    /// A row-0 word peeks `Down`: every pixel sits below the word row, never
+    /// over the text.
     #[test]
     fn top_row_word_peeks_down_under_the_word_never_over_it() {
         let (rows, cols) = (6usize, 20usize);
@@ -13896,14 +13243,8 @@ mod tests {
         }
     }
 
-    /// The refocus storm: a non-presenting window never rescans, so words
-    /// that arrived while unfocused are new to the engine on refocus, all owed
-    /// an entrance at once. Refocus spends those births instead of playing
-    /// them.
-    ///
-    /// Distinct from `born_unfocused_entrance_never_replays_on_refocus`, which
-    /// covers episodes whose clock started during an unfocused rescan; here
-    /// no rescan ran while unfocused.
+    /// Words that arrived while the window was not presenting (no rescan ran)
+    /// are spent on return, not all played at once.
     #[test]
     fn words_arriving_while_away_never_storm_on_return() {
         let (rows, cols) = (6usize, 20usize);
@@ -13918,8 +13259,7 @@ mod tests {
         wd.set_presentable(t0, true);
         wd.rescan(&term, rows, cols, &lex, &c, 1, t0);
 
-        // The user leaves. The host stops presenting, so no rescan runs while a
-        // build log full of feline words scrolls past.
+        // Away: no rescan runs while feline words scroll past.
         wd.set_presentable(t0 + Duration::from_secs(1), false);
         term.process(b"kitty\r\nkitty\r\nkitty\r\nkitty");
 
@@ -13942,8 +13282,7 @@ mod tests {
             );
         }
 
-        // Only the first rescan back is suppressed: typing right after refocus
-        // still earns its cat.
+        // Only the first rescan back is spent: typing after refocus earns a cat.
         term.process(b"\r\nkitty");
         let after = back + Duration::from_secs(1);
         wd.rescan(&term, rows, cols, &lex, &c, 3, after);
@@ -13956,12 +13295,8 @@ mod tests {
         assert_eq!(fresh, 1, "the newly typed word is armed normally");
     }
 
-    /// No timer re-arm: a spent feline word left on screen never plays again
-    /// on its own. Only the user's keystroke may re-arm a cat.
-    ///
-    /// The first cat must draw and finish (both asserted); the word then stays
-    /// on screen for half an hour of simulated viewing, rescanned under a
-    /// bumping damage epoch like a cursor blink or TUI redraw.
+    /// No timer re-arm: a spent feline word left on screen (rescanned for half
+    /// an hour) never plays again without a keystroke.
     #[test]
     fn a_settled_kitty_on_screen_never_plays_again_without_a_keystroke() {
         let (rows, cols) = (6usize, 20usize);
@@ -13976,7 +13311,7 @@ mod tests {
         wd.rescan(&term, rows, cols, &lex, &c, 1, t0);
         let ident = feline(&wd).ident;
 
-        // PRECONDITION: the word's one cat really plays, and really ends.
+        // Precondition: the word's one cat really plays, and really ends.
         let (first, _, _) = tick_cat(&mut wd, t0 + Duration::from_millis(100), &c, g);
         assert!(!first.is_empty(), "PRECONDITION: the first cat draws");
         let spent = t0 + Duration::from_secs(8);
@@ -13987,11 +13322,8 @@ mod tests {
         );
         let done_key = ident ^ wd.persist[&ident].ctx_fp;
 
-        // Half an hour of viewing an unchanged grid, with a redraw twice a
-        // second (cursor blink, status line, TUI repaint), each bumping the
-        // damage epoch and followed by a frame. A spent occurrence is
-        // republished inert on every rescan, so any re-arm would show on the
-        // next rescan.
+        // Half an hour of an unchanged grid redrawn twice a second, each redraw
+        // bumping the damage epoch.
         let mut drew_again = Vec::new();
         for i in 0..3600u64 {
             let at = spent + Duration::from_millis(500 * (i + 1));
@@ -14016,9 +13348,7 @@ mod tests {
         );
     }
 
-    /// The direction is chosen, not fixed: with the rows above walled and the
-    /// rows below clear, an interior word flips to the downward peek rather
-    /// than losing its cat.
+    /// With the rows above walled and below clear, an interior word peeks down.
     #[test]
     fn busy_band_above_flips_the_peek_downward() {
         let (rows, cols) = (6usize, 20usize);
@@ -14037,9 +13367,8 @@ mod tests {
         assert!(occ.cat_peek_down, "it takes the clear side instead");
     }
 
-    /// A feline occurrence with a hand-picked genome (`magic = 100` is outside
-    /// every §3.5 window ⇒ an ordinary cat). Idents keyed off (row, start) so
-    /// multi-cat tests get distinct gaze/idle identities.
+    /// A feline occurrence with a hand-picked ordinary genome; idents keyed off
+    /// (row, start) so multi-cat tests get distinct identities.
     fn cat_occ(row: u16, start: u16, end: u16, gkey: u64, now: Instant) -> Occurrence {
         Occurrence {
             row,
@@ -14051,9 +13380,8 @@ mod tests {
             seed: 0xCA7,
             ident: mix(0xCA7 ^ (u64::from(row) << 32) ^ u64::from(start)),
             appeared: now,
-            // Magic word decodes bare: cat window (% 4096 = 100) misses every
-            // magic build, accessory window ((>> 24) % 4096 = 200) misses
-            // every accessory — no +500 ms dwell bonus, no key fragmenting.
+            // The magic word decodes bare: no magic build, no accessory, so no
+            // dwell bonus.
             genome: Genome {
                 gkey,
                 magic: (200 << 24) | 100,
@@ -14072,9 +13400,8 @@ mod tests {
         }
     }
 
-    /// v3: a mid-DWELL sample instant guaranteed quiet for adult head cats:
-    /// past the rise + kitten bounce, before the earliest possible in-dwell
-    /// event (blink starts at ≥ 0.35 · 1901 ms ≈ 665 ms into the dwell).
+    /// A mid-dwell sample instant (from birth): past the rise and the kitten
+    /// bounce, well before the shortest dwell ends.
     const DWELL_QUIET_MS: u64 = 950;
 
     /// gkey with age = Adult (Gray 0b11 @ v4 bits 13–14 → ord 2).
@@ -14089,10 +13416,8 @@ mod tests {
         tick_cat_at(wd, now, cfg, geom, None, true)
     }
 
-    /// [`tick_cat`] with an explicit companion cell + focus state (the
-    /// one-cat-per-caret gate / §5.6 idle-life batteries). Returns the
-    /// free-overlay sprite stream (overlay Phase 4: the peeking cats ride
-    /// `free_sprites`).
+    /// [`tick_cat`] with an explicit companion cell and focus state; returns
+    /// the free-sprite stream.
     fn tick_cat_at(
         wd: &mut WordDecorations,
         now: Instant,
@@ -14131,10 +13456,8 @@ mod tests {
         (fr, out, fp)
     }
 
-    /// Typed-kitty reliability: incremental prompt input creates the episode
-    /// exactly when the final `y` lands, and the top-row entrance is visible
-    /// on the first animation sample (five damage rescans, not a pre-filled
-    /// fixture).
+    /// Incremental typing creates the episode when the final `y` lands, and
+    /// the top-row entrance is visible on the first animation sample.
     #[test]
     fn incrementally_typed_kitty_always_starts_a_visible_top_row_cat() {
         let lex = lex();
@@ -14184,16 +13507,9 @@ mod tests {
         );
     }
 
-    /// A peeking cat is only ever cut by the text line: on a Down peek the
-    /// cat drops below the text and pulls back up, never clipped at the
-    /// bottom in open space (owner, 2026-08-04).
-    ///
-    /// A row-0 word resolves `cat_peek_plan` to Down, and the reveal is a
-    /// source-window crop, so which edge of the art the window keeps decides
-    /// whether the cat reads as sliding or sliced. On a Down peek the art's
-    /// bottom edge is always on screen: `ay + h` is constant across every
-    /// frame of the rise and descend, and only the top edge moves, along the
-    /// text line.
+    /// A downward peek is cut only at the text line: the art's bottom edge
+    /// (`ay + h`) stays fixed through rise and descend, and only the top edge
+    /// moves.
     #[test]
     fn a_downward_peek_is_cut_only_at_the_text_line() {
         let lex = lex();
@@ -14201,7 +13517,7 @@ mod tests {
         let g = geom20();
         let t0 = Instant::now();
         let (rows, cols) = (usize::from(g.rows), usize::from(g.cols));
-        // ROW 0: no rows above, so the peek plan must resolve DOWN.
+        // Row 0 has no rows above, so the peek plan must resolve down.
         let mut term = Terminal::new(g.rows, g.cols);
         term.process(b"\x1b[1;6Hkitty");
         let mut snap = aterm_core::render::RenderInput::default();
@@ -14230,8 +13546,7 @@ mod tests {
             "a row-0 word has no habitable side above it — the plan must peek DOWN"
         );
 
-        // Walk the whole episode: rise, dwell, descend. The atlas bakes at most
-        // two tiles a frame, so early frames may legitimately emit nothing.
+        // Rise, dwell, descend; early frames may emit nothing (bake budget).
         let mut seen: Vec<(u16, u16, u16)> = Vec::new(); // (y, h, ay)
         for ms in (0..(CAT_RISE_MS + DWELL_QUIET_MS + CAT_DESCEND_MS + 400)).step_by(16) {
             let (free, _, _) =
@@ -14263,21 +13578,10 @@ mod tests {
         );
     }
 
-    /// One cat per caret. Typing a feline word makes the host force the
-    /// cursor companion visible at the caret (the collection hello, which
-    /// bypasses the trail config), while the ambient scanner matches the
-    /// echoed word and peeks its own cat a couple of cells away, on the same
-    /// rows, for an overlapping ~3 s. [`WordDecorations::tick`] and
-    /// [`WordDecorations::kitty_cursor`] both append to the same `free` stream
-    /// without reading each other's placement, and on a first discovery the
-    /// companion adopts the word-cat's look, so without the suppression the
-    /// pair are twins.
-    ///
-    /// The companion is this word's cat, so the ambient peek yields to it. Two
-    /// sibling tests pin the scope of that yielding: its width
-    /// ([`a_feline_word_away_from_the_caret_still_peeks_beside_the_companion`])
-    /// and its duration
-    /// ([`the_claimed_word_stays_quiet_while_the_companion_holds`]).
+    /// One cat per caret: the companion summoned at the caret is this word's
+    /// cat, so the word's ambient peek yields. Scope siblings:
+    /// [`a_feline_word_away_from_the_caret_still_peeks_beside_the_companion`]
+    /// and [`the_claimed_word_stays_quiet_while_the_companion_holds`].
     #[test]
     fn a_word_under_the_companion_never_peeks_a_second_cat() {
         let lex = lex();
@@ -14285,8 +13589,7 @@ mod tests {
         let g = geom20();
         let t0 = Instant::now();
         let (rows, cols) = (usize::from(g.rows), usize::from(g.cols));
-        // `kitty` echoed at a prompt: row 3, cols 5..=9, caret parked one cell
-        // past its last — the shape a live typed word actually has.
+        // `kitty` at row 3, cols 5..=9, caret one past its last.
         let mut term = Terminal::new(g.rows, g.cols);
         term.process(b"\x1b[4;6Hkitty");
         let caret = (3u16, 10u16);
@@ -14321,8 +13624,7 @@ mod tests {
             assert_eq!((occ.row, occ.start_col, occ.end_col), (3, 5, 9));
             wd
         };
-        // One host frame in `redraw_window` order: the engine tick, then the
-        // companion emission, sharing one free stream.
+        // One host frame: the engine tick, then the companion, one free stream.
         let frame = |wd: &mut WordDecorations, now: Instant, companion: Option<(u16, u16)>| {
             let (mut free, _, _) = tick_cat_at(wd, now, &c, g, companion, true);
             if let Some(cell) = companion {
@@ -14343,9 +13645,8 @@ mod tests {
             }
             free
         };
-        // The atlas bakes at most two tiles per frame, so settle both engines
-        // over a few mid-dwell frames: the assertion must read the emission
-        // decision, never a transient bake budget.
+        // Settled over mid-dwell frames, so the assertion reads the emission
+        // decision, not the two-tile bake budget.
         let mut wd = scan();
         let mut ctl = scan();
         let (mut fixed, mut control) = (Vec::new(), Vec::new());
@@ -14361,8 +13662,7 @@ mod tests {
                 .copied()
                 .collect()
         };
-        // Control: with no companion on glass the word peeks exactly as it
-        // always has — this is the loved ambient feature, still reachable.
+        // Control: with no companion on glass the word peeks as usual.
         assert_eq!(
             ambient(&control).len(),
             1,
@@ -14379,12 +13679,8 @@ mod tests {
         );
     }
 
-    /// The double cursor cat: the companion holds for `DISCOVERY_HOLD`
-    /// (2.8 s) while the next keystroke walks the caret one cell past the
-    /// word. A veto that only asked "is the caret on this span now" would lift
-    /// mid-flight and let the word's wall-clock peek pop an identical ambient
-    /// cat beside the companion. [`WordDecorations::companion_claim`] makes the
-    /// yield last exactly as long as the companion does.
+    /// The companion holds for `DISCOVERY_HOLD` while the caret walks one cell
+    /// past the word; the claim keeps the word's peek quiet for that long.
     #[test]
     fn the_claimed_word_stays_quiet_while_the_companion_holds() {
         let lex = lex();
@@ -14392,13 +13688,11 @@ mod tests {
         let g = geom20();
         let t0 = Instant::now();
         let (rows, cols) = (usize::from(g.rows), usize::from(g.cols));
-        // `kitty` echoed at a prompt: row 3, cols 5..=9, caret parked one past
-        // its last — the shape a typed word has the instant it completes.
+        // `kitty` at row 3, cols 5..=9, caret one past its last.
         let mut term = Terminal::new(g.rows, g.cols);
         term.process(b"\x1b[4;6Hkitty");
         let on_span = (3u16, 10u16);
-        // One keystroke later: off the span by exactly one cell, the smallest
-        // possible move.
+        // One keystroke later: one cell off the span.
         let past_span = (3u16, 11u16);
         assert!(
             caret_on_span(on_span, 3, 5, 9) && !caret_on_span(past_span, 3, 5, 9),
@@ -14430,8 +13724,7 @@ mod tests {
             assert_eq!((occ.row, occ.start_col, occ.end_col), (3, 5, 9));
             wd
         };
-        // One host frame in `redraw_window` order: the engine tick, then the
-        // companion emission, sharing one free stream.
+        // One host frame: the engine tick, then the companion, one free stream.
         let frame = |wd: &mut WordDecorations, now: Instant, companion: Option<(u16, u16)>| {
             let (mut free, _, _) = tick_cat_at(wd, now, &c, g, companion, true);
             if let Some(cell) = companion {
@@ -14454,15 +13747,13 @@ mod tests {
         };
         let mut wd = scan();
         let mut ctl = scan();
-        // The companion arrives while the caret is still on the word — these
-        // are the frames that must take the claim.
+        // Companion frames with the caret on the word take the claim.
         for k in 0..6u64 {
             let now = t0 + Duration::from_millis(100 + 16 * k);
             frame(&mut wd, now, Some(on_span));
         }
-        // The keystroke lands: the caret has moved on, the companion has not.
-        // Settled over several frames so the assertion reads the emission
-        // decision, never a transient two-tile bake budget.
+        // The caret moves on, the companion stays (settled over frames past
+        // the two-tile bake budget).
         let (mut held, mut control) = (Vec::new(), Vec::new());
         for k in 0..6u64 {
             let now = t0 + Duration::from_millis(DWELL_QUIET_MS + 16 * k);
@@ -14475,9 +13766,8 @@ mod tests {
                 .copied()
                 .collect()
         };
-        // The control pins the clock: at these very instants the word's peek is
-        // still live, so the silence below is the claim doing the work and not
-        // the one-shot having quietly run out under us.
+        // The control proves the peek is still live, so the silence is the
+        // claim at work.
         assert_eq!(
             ambient(&control).len(),
             1,
@@ -14494,24 +13784,9 @@ mod tests {
         );
     }
 
-    /// The lag half of the double cursor cat, which the claim alone cannot
-    /// reach.
-    ///
-    /// The claim can only be taken on a tick where the companion is already
-    /// on glass, but the companion is summoned by the tick that first scans
-    /// the word (the host drains the Kitty Log and calls `on_collect` after
-    /// `tick`, and the summon's alpha resolves on the next redraw). By the
-    /// earliest claiming tick the next keystroke has carried the caret past
-    /// `end_col + 1`, so the claim never latches and the word's own peek
-    /// pops a twin.
-    ///
-    /// This timeline has no on-span companion frame at all: the caret is one
-    /// cell past the word before the companion exists.
-    /// [`WordDecorations::caret_word`], recorded by the rescan, closes it.
-    ///
-    /// Near the right margin both placements clamp to `grid_w - w`
-    /// ([`WordDecorations::kitty_cursor_footprint`], [`cat_geometry_for`]),
-    /// so the twins stack at the same x.
+    /// The companion arrives a frame after the tick that scanned its word, by
+    /// which time the caret is past the span, so the claim never latches;
+    /// [`WordDecorations::caret_word`] still names the word and no twin pops.
     #[test]
     fn the_summoning_word_is_claimed_even_after_the_caret_moved_on() {
         let lex = lex();
@@ -14519,15 +13794,12 @@ mod tests {
         let g = geom20();
         let t0 = Instant::now();
         let (rows, cols) = (usize::from(g.rows), usize::from(g.cols));
-        // `kitty` echoed at a prompt: row 3, cols 5..=9. The rescan sees the
-        // caret parked one past its last — the shape a typed word has the
-        // instant it completes, and the only observation that can name the
-        // summoning word.
+        // `kitty` at row 3, cols 5..=9, caret one past its last: the only scan
+        // that can name the summoning word.
         let mut term = Terminal::new(g.rows, g.cols);
         term.process(b"\x1b[4;6Hkitty");
         let on_span = (3u16, 10u16);
-        // One keystroke later — and this is the first caret any companion frame
-        // ever sees.
+        // One keystroke later: the first caret any companion frame sees.
         let past_span = (3u16, 11u16);
         assert!(
             caret_on_span(on_span, 3, 5, 9) && !caret_on_span(past_span, 3, 5, 9),
@@ -14581,8 +13853,7 @@ mod tests {
         };
         let mut wd = scan();
         let mut ctl = scan();
-        // No warm-up: the companion's first frame already has the caret off the
-        // span, exactly as a typist produces it.
+        // No warm-up: the companion's first frame already has the caret off.
         let (mut held, mut control) = (Vec::new(), Vec::new());
         for k in 0..6u64 {
             let now = t0 + Duration::from_millis(DWELL_QUIET_MS + 16 * k);
@@ -14595,8 +13866,8 @@ mod tests {
                 .copied()
                 .collect()
         };
-        // The control pins the clock: the word is genuinely still mid-peek at
-        // these instants, so silence below is the claim, not an expiry.
+        // The control proves the word is still mid-peek: the silence is the
+        // claim.
         assert_eq!(
             ambient(&control).len(),
             1,
@@ -14610,19 +13881,9 @@ mod tests {
         assert_eq!(held.len(), 1, "exactly one cat on glass");
     }
 
-    /// Count, not presence: exactly one companion body per frame, on every
-    /// frame of the run.
-    ///
-    /// A second identical body passes non-emptiness and placement checks by
-    /// hiding under the first, so the invariant is a count. The frame follows
-    /// the host order (`app_render::redraw_window`): one `tick` into the
-    /// shared free stream, then one `kitty_cursor` appending to it. `tick` is
-    /// the only thing that clears the stream, so a host emitting the
-    /// companion twice, or onto an uncleared stream, accumulates bodies here.
-    ///
-    /// Ambient word-cats use `FreeZ::UnderText`; with no sing drive and no
-    /// supernova the companion is the only `OverText` emitter, so the z-slot
-    /// is the census key.
+    /// Exactly one companion body per host frame (`redraw_window` order: one
+    /// `tick`, one `kitty_cursor`), counted by the `OverText` z-slot, since a
+    /// second identical body would hide under the first.
     #[test]
     fn every_host_frame_emits_exactly_one_companion_body() {
         let (rows, cols) = (6usize, 20usize);
@@ -14630,13 +13891,11 @@ mod tests {
         let g = geom20();
         let t0 = Instant::now();
         let mut term = Terminal::new(rows as u16, cols as u16);
-        // Row 2, with clear rows above it so the ambient peek is eligible — the
-        // stream is meant to carry both families here.
+        // Row 2, clear rows above: the stream carries both families.
         term.process(b"\r\n\r\nkitty on a wire");
         let mut wd = scan_grid(&mut term, rows, cols, &c, g, t0);
-        // Row 4 is blank and off every occurrence's span, so the one-cat-per-
-        // caret veto never fires: the census has to come out at one body on its
-        // own, not because the ambient cat was suppressed.
+        // Row 4 is off every span, so the veto never fires and the count of
+        // one body is earned.
         let caret = (4u16, 2u16);
         let mut bodies_seen = 0usize;
         for k in 0..16u64 {
@@ -14670,19 +13929,16 @@ mod tests {
             );
             bodies_seen += bodies.len();
         }
-        // Non-vacuity: the companion really does reach the shared stream (a
-        // frame or two may legitimately defer on the shared two-bake budget,
-        // so this is a floor, not an equality).
+        // Non-vacuity: the companion reaches the stream (a floor; frames may
+        // defer on the bake budget).
         assert!(
             bodies_seen > 0,
             "the companion never reached the free stream — the census is vacuous"
         );
     }
 
-    /// The other half of the one-cat-per-caret rule: suppression is scoped to
-    /// the single occurrence under the companion. A feline word elsewhere on
-    /// screen still peeks in the very same frame, byte-identical to the frame
-    /// with no companion at all.
+    /// Suppression is scoped to the word under the companion: a feline word
+    /// elsewhere peeks byte-identically to a frame with no companion.
     #[test]
     fn a_feline_word_away_from_the_caret_still_peeks_beside_the_companion() {
         let lex = lex();
@@ -14765,10 +14021,8 @@ mod tests {
         );
     }
 
-    /// The ambient animal roster, real engine end to end: typed animal words
-    /// (settled, with the caret parked elsewhere so the live-caret deferral
-    /// has released them) each peek their own species head, cats and animals
-    /// in separate budget pools, no Kitty Log rows for animals.
+    /// Settled animal words each peek their own species head, in a pool
+    /// separate from cats, with no Kitty Log rows.
     #[test]
     fn animal_words_peek_their_species_heads() {
         let lex = lex();
@@ -14812,8 +14066,7 @@ mod tests {
             wd.occ.iter().all(|o| o.class == Class::Animal),
             "both words classify as animals"
         );
-        // Tick into the dwell: both heads should be on glass. First frames may
-        // defer on the two-bakes-per-frame budget; the settled frame may not.
+        // Into the dwell: both heads on glass once the bake budget settles.
         let mut free = Vec::new();
         for k in 0..6u64 {
             let now = t0 + Duration::from_millis(DWELL_QUIET_MS + 16 * k);
@@ -14833,13 +14086,8 @@ mod tests {
         );
     }
 
-    /// The resident companion: the claim follows the caret to each new feline
-    /// word while a companion stays up.
-    ///
-    /// The resident pet never leaves glass, so a claim that released only
-    /// when the companion went `None` would stay on the session's first
-    /// feline word, and later words would be protected only by the one-cell
-    /// caret-on-span arm, letting an ambient twin pop out under the pet.
+    /// While the resident pet stays up, the claim follows the caret to each new
+    /// feline word, not just the session's first.
     #[test]
     fn a_second_feline_word_typed_while_the_companion_stays_up_is_claimed_too() {
         let lex = lex();
@@ -14861,9 +14109,7 @@ mod tests {
         wd.rescan(&term, rows, cols, &lex, &c, 1, t0);
         ctl.rescan(&term, rows, cols, &lex, &c, 1, t0);
         let a_ident = feline(&wd).ident;
-        // The pet is up from here to the end of the test — the companion cell
-        // never goes `None` for `wd`. The caret still sits on A: the claim
-        // latches, exactly as it always did.
+        // The pet stays up from here on; with the caret on A the claim latches.
         for k in 0..6u64 {
             let now = t0 + Duration::from_millis(100 + 16 * k);
             tick_cat_at(&mut wd, now, &c, g, Some(caret_a), true);
@@ -14874,9 +14120,7 @@ mod tests {
             Some(a_ident),
             "the first word is claimed while the caret sits on it"
         );
-        // Burn A's one-shot fully out (a claimed peek burns, it does not
-        // pause — worst-case window 4580 ms), so every under-text sprite
-        // sampled below can only belong to B.
+        // Burn A's one-shot out (worst case 4580 ms), so later sprites are B's.
         let a_spent = t0 + Duration::from_millis(5000);
         tick_cat_at(&mut wd, a_spent, &c, g, Some(caret_a), true);
         tick_cat_at(&mut ctl, a_spent, &c, g, None, true);
@@ -14884,9 +14128,7 @@ mod tests {
             wd.persist[&a_ident].peek_done,
             "word A's one-shot has burned out"
         );
-        // Word B: a second feline word typed on the bottom row while the pet
-        // never left — columns clear of A, so B's overhead rows are empty and
-        // its peek is eligible on its own merits.
+        // Word B on the bottom row, columns clear of A, while the pet stays up.
         term.process(b"\x1b[6;13Hkitty");
         let caret_b = (5u16, 17u16);
         assert_eq!(
@@ -14914,10 +14156,8 @@ mod tests {
             Some(b_ident),
             "the claim FOLLOWED the caret to word B — pet-blind latching kept it on A"
         );
-        // The caret leaves the row (the Enter after the word) and stays off
-        // both spans for B's whole peek window. Without the re-target the
-        // claim still names A, the span arm no longer covers B, and B pops
-        // its ambient twin out from under the pet.
+        // The caret leaves both spans for B's whole peek; without the
+        // re-target the claim would still name A and B would pop a twin.
         let away = (1u16, 0u16);
         let mut control_peeked = false;
         for k in 0..46u64 {
@@ -14936,10 +14176,8 @@ mod tests {
         );
     }
 
-    /// The pet's body is the yield box: the pixel-yield layer collides against
-    /// the resident pet's live drawn body (~2.8 columns × 1.70 rows, wherever
-    /// it wandered), not a 2-cell band at the caret, so a word underneath it
-    /// stays down.
+    /// The yield box is the pet's live body, not a caret band: a word under
+    /// it stays down.
     #[test]
     fn a_word_under_the_pet_body_never_peeks() {
         let lex = lex();
@@ -14947,9 +14185,7 @@ mod tests {
         let g = geom20();
         let t0 = Instant::now();
         let (rows, cols) = (usize::from(g.rows), usize::from(g.cols));
-        // The feline word peeks up from the bottom row; the caret sits rows
-        // away on a bare line, off every span — the word-space layers (claim,
-        // caret-on-span) never fire, so this isolates the pixel yield.
+        // The caret sits rows away, off every span, isolating the pixel yield.
         let mut term = Terminal::new(g.rows, g.cols);
         term.process(b"\x1b[6;1Hkitty\x1b[4;1H");
         let caret = (3u16, 0u16);
@@ -14983,9 +14219,7 @@ mod tests {
                 .copied()
                 .collect()
         };
-        // First: where does the ambient cat actually land? The control twin
-        // answers in pixels (settled over a few frames — the assertion must
-        // read the emission decision, never a transient bake budget).
+        // Where the ambient cat lands, from the control twin (settled frames).
         let mut ctl = scan();
         let mut control = Vec::new();
         for k in 0..6u64 {
@@ -14995,17 +14229,13 @@ mod tests {
         let cats = ambient(&control);
         assert_eq!(cats.len(), 1, "the word peeks with nothing on glass");
         let cat = cats[0];
-        // A pet-shaped body — the authored ART_ROWS × ART_ASPECT box at these
-        // cell metrics — standing ON the peeking head: feet on the cat's
-        // bottom edge, centred over it. The animal is sitting right where the
-        // word wants to rise, rows away from the caret.
+        // A pet-shaped body (ART_ROWS × ART_ASPECT) standing on the peeking
+        // head, rows away from the caret.
         let nat_h = (crate::kitty_pet::ART_ROWS * f32::from(g.cell_h)).round() as i32;
         let nat_w = (nat_h as f32 * crate::kitty_pet::ART_ASPECT).round() as i32;
         let feet = cat.y + i32::from(cat.h);
         let x0 = cat.x + i32::from(cat.w) / 2 - nat_w / 2;
-        // The body remains visible for a bounded fade when DECTCEM hides the
-        // caret. No stale cell may be invented on that frame: pixel custody by
-        // the exact live body must be sufficient on its own.
+        // No caret cell (DECTCEM hidden): the live body alone must hold custody.
         let companion = CompanionOnGlass::at_body(None, (x0, x0 + nat_w, feet - nat_h, feet));
         let mut wd = scan();
         for k in 0..6u64 {
@@ -15018,10 +14248,8 @@ mod tests {
         }
     }
 
-    /// The scope pin's third leg — 33fe1939's narrow promise, re-sworn for
-    /// the pet: yielding is a collision rule, not a mode. A feline word away
-    /// from both the caret and the pet's body peeks byte-identically to a
-    /// frame with nothing on glass at all.
+    /// Yielding is a collision rule, not a mode: a feline word away from both
+    /// the caret and the pet peeks as if nothing were on glass.
     #[test]
     fn a_feline_word_away_from_both_caret_and_pet_still_peeks() {
         let lex = lex();
@@ -15029,10 +14257,8 @@ mod tests {
         let g = geom20();
         let t0 = Instant::now();
         let (rows, cols) = (usize::from(g.rows), usize::from(g.cols));
-        // Same stage as `a_word_under_the_pet_body_never_peeks`, but the pet
-        // now stands in the top-right corner — feet on row 1's baseline,
-        // flank against the right edge — nowhere near the word's rise at the
-        // bottom-left.
+        // The `a_word_under_the_pet_body_never_peeks` stage, with the pet in the
+        // top-right corner, far from the word's rise.
         let mut term = Terminal::new(g.rows, g.cols);
         term.process(b"\x1b[6;1Hkitty\x1b[4;1H");
         let caret = (3u16, 0u16);
@@ -15088,11 +14314,8 @@ mod tests {
         );
     }
 
-    /// Typed-kitty reliability: type `kitty`, let its cat finish, `clear`,
-    /// retype `kitty` at the same column. The retype re-keys identically
-    /// (ident folds no row; blank clears never taint), so without the
-    /// caret-on-word witness it would adopt the spent episode. The witness
-    /// makes it a fresh episode that plays a second cat.
+    /// `kitty`, its cat done, `clear`, retype at the same column: the retype
+    /// keys identically, and the typed witness makes it a fresh second cat.
     #[test]
     fn clear_then_retype_at_same_prompt_plays_a_second_cat() {
         let lex = lex();
@@ -15116,7 +14339,7 @@ mod tests {
             "the first cat's one-shot has completed"
         );
 
-        // `clear`: one BLANK frame (grace, never taint), prompt returns home.
+        // `clear`: one blank frame (grace, never taint), prompt returns home.
         term.process(b"\x1b[2J\x1b[H");
         wd.rescan(
             &term,
@@ -15129,13 +14352,10 @@ mod tests {
         );
         assert!(wd.occ.iter().all(|o| o.class != Class::Feline));
 
-        // Retype at the exact same row and column: same seed, same ordinal,
-        // same context fingerprint — the maximally colliding retype.
+        // Same row and column: same seed, ordinal and context fingerprint.
         term.process(b"kitty");
         let retyped_at = done_t + Duration::from_millis(32);
-        // The retype half of "retype": the caret lands after the `y` either
-        // way, so the keystroke is what makes this a retype rather than a
-        // redraw (see `WordDecorations::note_typed_edit`).
+        // The keystroke makes it a retype rather than a redraw.
         wd.note_typed_edit(retyped_at, None);
         wd.rescan(
             &term,
@@ -15164,16 +14384,8 @@ mod tests {
         );
     }
 
-    /// A genuine retype after grace expiry still plays a cat.
-    ///
-    /// A spent episode grace-expires after [`GRACE_TTL`] (10 s) and writes its
-    /// session-lived done mark on the way out, so the feline re-arm cannot
-    /// require a still-resident old episode (`group_has_old`): erase `kitty`,
-    /// wait past the TTL, retype it at the same prompt and column, and it must
-    /// not be born done.
-    ///
-    /// The fixture asserts the episode is gone from `persist` and the mark is
-    /// still there before judging the retype.
+    /// A retype after the episode grace-expired (its done mark lives on) still
+    /// plays a cat; the fixture asserts the episode is gone and the mark stays.
     #[test]
     fn a_retype_after_the_episode_expired_still_plays_its_cat() {
         let lex = lex();
@@ -15197,8 +14409,7 @@ mod tests {
         );
         let done_key = first.ident ^ wd.persist[&first.ident].ctx_fp;
 
-        // Erase it, then let the grace TTL run out with the screen empty: this
-        // is a user who cleared, went and did something else, and came back.
+        // Erase it and let the grace TTL run out on an empty screen.
         term.process(b"\x1b[2J\x1b[H");
         wd.rescan(
             &term,
@@ -15222,8 +14433,7 @@ mod tests {
              which is the asymmetry the bug lived in"
         );
 
-        // Retype it at the same prompt and the same column — the maximally
-        // colliding retype, a full TTL after the first one.
+        // Retype at the same column, a full TTL later.
         term.process(b"kitty");
         let retyped_at = expired_at + Duration::from_millis(400);
         wd.note_typed_edit(retyped_at, None);
@@ -15245,14 +14455,8 @@ mod tests {
         );
     }
 
-    /// The keystroke's place matters, not just its time and pane: a key
-    /// committed elsewhere must not license a repaint that drops a spent
-    /// `kitty` under the caret.
-    ///
-    /// The two arms are identical (same word, frames, text, restored caret
-    /// after the `y`, keystroke instant and unbound pane) except where the
-    /// caret stood when the key was committed: on the word (a genuine retype)
-    /// or five rows away (an unrelated edit).
+    /// A key committed five rows away does not license a repaint that drops a
+    /// spent `kitty` under the caret; the same key on the word does.
     #[test]
     fn an_unrelated_edit_does_not_license_a_repaint_replay() {
         let lex = lex();
@@ -15261,17 +14465,14 @@ mod tests {
         let (rows, cols) = (g.rows as usize, g.cols as usize);
         let t0 = Instant::now();
 
-        // `kitty` on row 2; rows below carry an ordinary prompt so the far arm
-        // has somewhere real for the caret to be.
+        // `kitty` on row 2, a prompt below for the far arm's caret.
         let base = b"\r\n\r\nkitty\r\n\r\n$ ok".as_slice();
-        // The gap frame: row 2 overwritten (nonblank — this is what taints),
-        // everything else untouched. The two arms then park the caret
-        // differently without changing a single cell.
+        // The gap frame: row 2 overwritten nonblank (the taint); the arms then
+        // park the caret differently.
         let gap = b"\x1b[3;1H------".as_slice();
         let park_on_word = b"\x1b[3;7H".as_slice(); // row 2, col 6 — beside `kitty`
         let park_far_away = b"\x1b[6;11H".as_slice(); // row 5, col 10 — the prompt
-        // The restore frame: the word comes back and the caret is parked one
-        // past the `y`, which is what both a retype and a TUI redraw look like.
+        // Restore: the word returns with the caret one past the `y`.
         let restore = b"\x1b[3;1Hkitty \x1b[3;6H".as_slice();
 
         let mut verdicts = Vec::new();
@@ -15306,9 +14507,8 @@ mod tests {
                  arguing about the same branch"
             );
 
-            // The keystroke. Identical in both arms: same instant, same pane,
-            // well inside TYPED_EDIT_WITNESS_MS. Only the caret it was typed
-            // at differs, and that caret was captured by the rescan above.
+            // The keystroke, identical in both arms but for the caret it was
+            // typed at.
             let key_at = gap_at + Duration::from_millis(20);
             wd.note_typed_edit(key_at, None);
             assert!(
@@ -15332,8 +14532,7 @@ mod tests {
                 "{label}: PRECONDITION — the restore is a FRESH birth in both \
                  arms; only its armed/inert verdict may differ"
             );
-            // The restored caret lands on the word in both arms, so only the
-            // keystroke's place can separate the verdicts below.
+            // The restored caret is on the word in both arms.
             assert!(
                 wd.last_caret.is_some_and(|cell| caret_on_span(
                     cell,
@@ -15364,19 +14563,9 @@ mod tests {
         );
     }
 
-    /// Split panes: the typed witness takes its caret from the destination
-    /// session, not from whichever pane is currently bound.
-    ///
-    /// `note_typed_edit` is fed from the host's input thread and tags the
-    /// destination session. The compositor binds each pane in turn, so "pane A
-    /// is bound while you type in pane B" is the normal case.
-    ///
-    /// Both panes hold the same text, taint, restore and `kitty` at the same
-    /// cell, so pane A's caret is always a plausible answer for pane B's word.
-    /// The arms differ only in which pane's caret is parked on the word, and
-    /// the verdict is whether pane B's cat plays. Reading the bound pane's
-    /// caret would invert both arms: a real retype in B refused, and a key
-    /// five rows away in B licensed by A's caret.
+    /// The typed witness takes its caret from the pane the key went to, not the
+    /// bound one: both panes hold identical text and the arms differ only in
+    /// which pane's caret is on the word.
     #[test]
     fn a_split_keystroke_is_attributed_to_the_pane_it_was_typed_in() {
         let lex = lex();
@@ -15388,8 +14577,7 @@ mod tests {
 
         // Identical in both panes: `kitty` on row 2, a prompt on row 5.
         let base = b"\r\n\r\nkitty\r\n\r\n$ ok".as_slice();
-        // Row 2 overwritten (nonblank — this is what taints the continuity, so
-        // the re-appearance argues on the typed witness rather than on grace).
+        // Row 2 overwritten nonblank: the taint.
         let gap = b"\x1b[3;1H------".as_slice();
         let park_on_word = b"\x1b[3;7H".as_slice(); // row 2, col 6 — beside `kitty`
         let park_far_away = b"\x1b[6;11H".as_slice(); // row 5, col 10 — the prompt
@@ -15398,8 +14586,7 @@ mod tests {
         const PANE_A: u64 = 1;
         const PANE_B: u64 = 2;
 
-        // Drive one pane through base → cat → one-shot done → taint, leaving
-        // its caret wherever `park` says. Returns the word's ident.
+        // Prime one pane: cat, one-shot done, taint, caret per `park`.
         let prime = |wd: &mut WordDecorations, term: &mut Terminal, park: &[u8], label: &str| {
             term.process(base);
             wd.rescan(term, rows, cols, &lex, &c, 1, t0);
@@ -15430,15 +14617,13 @@ mod tests {
             let mut wd = WordDecorations::default();
             let mut term_a = Terminal::new(g.rows, g.cols);
             let mut term_b = Terminal::new(g.rows, g.cols);
-            // Disjoint pixel origins, like the split limiter tests: two panes
-            // side by side, each with its own grid.
+            // Two panes side by side, disjoint pixel origins.
             wd.bind_pane(PANE_A, (0, 0));
             prime(&mut wd, &mut term_a, park_a, label);
             wd.bind_pane(PANE_B, (400, 0));
             let ident_b = prime(&mut wd, &mut term_b, park_b, label);
 
-            // The seam. Composition left pane A bound (its `tick` ran last, or
-            // the companion's rebind was skipped) — and the user types in B.
+            // Pane A is left bound while the user types in B.
             wd.bind_pane(PANE_A, (0, 0));
             let key_at = at(5036);
             wd.note_typed_edit(key_at, Some(PANE_B));
@@ -15495,18 +14680,8 @@ mod tests {
         (cp.row, cp.col)
     }
 
-    /// A split that collapses back to one pane keeps its typed witness.
-    ///
-    /// When the live-field pane leaves the layout, `retain_panes` unbinds and
-    /// the survivor's state stays parked, while the single-pane renderer
-    /// drives the live fields and re-stamps `last_caret` on every rescan. So
-    /// for the survivor's session after a collapse:
-    ///
-    /// * the live caret is current and the parked copy is frozen, so the
-    ///   recorded place comes from the live fields even though the pane has a
-    ///   parked slot; and
-    /// * the unbound wildcard still admits the key, or a window that was ever
-    ///   split would stop re-arming.
+    /// After a split collapses, the survivor's keys are witnessed from the live
+    /// caret (its parked copy is frozen), and the unbound wildcard admits them.
     #[test]
     fn a_collapsed_split_still_witnesses_the_survivors_keystrokes() {
         let lex = lex();
@@ -15516,8 +14691,7 @@ mod tests {
         let t0 = Instant::now();
         let mut wd = WordDecorations::default();
 
-        // Two panes; the survivor (1) is scanned first and then parked, so its
-        // parked caret freezes at row 0.
+        // The survivor (pane 1) is scanned and parked: its parked caret freezes.
         let mut survivor = Terminal::new(g.rows, g.cols);
         survivor.process(b"kitty");
         wd.bind_pane(1, (0, 0));
@@ -15530,8 +14704,7 @@ mod tests {
         assert_eq!(wd.bound, None, "PRECONDITION: the live pane departed");
         assert!(wd.parked.contains_key(&1), "PRECONDITION: pane 1 is parked");
 
-        // The single-pane renderer takes over pane 1's grid, and the user has
-        // moved the caret since.
+        // The single-pane renderer takes over; the caret has moved since.
         survivor.process(b"\r\n\r\nkitty");
         wd.rescan(
             &survivor,
@@ -15562,8 +14735,7 @@ mod tests {
             "and an unbound single-grid scan must still witness the key, or a \
              window that was once split never re-arms again"
         );
-        // Also under a declared tab scope: once the single-pane renderer names
-        // the survivor's own session, the same key is still witnessed.
+        // Also once the renderer declares the survivor's session.
         wd.set_scan_session(Some(1));
         assert!(
             wd.typed_edit_witness(key_at),
@@ -15571,15 +14743,9 @@ mod tests {
         );
     }
 
-    /// A declared session retires a binding that disagrees with it.
-    ///
-    /// One window can hold a split tab and an unsplit one, and nothing unbinds
-    /// when the user moves between them: the composed renderer stops, and
-    /// `bound` keeps naming a pane not on glass. Unretired, that stale binding
-    /// would make the witness refuse every key in the unsplit tab.
-    ///
-    /// Both directions are asserted on the same engine, so neither can pass
-    /// by the fixture never witnessing anything.
+    /// A declared session retires a stale pane binding (nothing unbinds when
+    /// the user moves from a split tab to an unsplit one), or every key in the
+    /// unsplit tab would be refused. Both directions are asserted.
     #[test]
     fn declaring_an_unsplit_session_retires_a_stale_pane_binding() {
         let lex = lex();
@@ -15635,21 +14801,9 @@ mod tests {
         );
     }
 
-    /// A keystroke is a claim about one session, and an unsplit window has
-    /// several.
-    ///
-    /// `WordDecorations` is per window and the unsplit renderer binds no pane,
-    /// so the witness must test the declared session: a key committed in tab
-    /// A must not, within [`TYPED_EDIT_WITNESS_MS`], license a repaint in tab
-    /// B to re-arm a spent cat.
-    ///
-    /// The arms are identical in grid, clock, taint, restore and repaint and
-    /// differ only in which tab the host says the key landed in. The first arm
-    /// proves the fixture re-arms, and the witness precondition is asserted as
-    /// an equality against that discriminator.
-    ///
-    /// The tab on glass is held fixed: tab B's own first sighting of a word
-    /// owes a cat, pinned by `identical_words_in_two_tabs_each_get_their_own_cat`.
+    /// On an unsplit window, a key committed in tab A does not license a
+    /// repaint in tab B to re-arm a spent cat. The arms differ only in the
+    /// key's tab; the first proves the fixture re-arms.
     #[test]
     fn an_edit_in_one_tab_does_not_license_another_tabs_replay_when_unsplit() {
         let lex = lex();
@@ -15665,8 +14819,8 @@ mod tests {
         const TAB_B: u64 = 12;
 
         let base = b"\r\n\r\nkitty\r\n\r\n$ ok".as_slice();
-        // Row 2 overwritten nonblank: the taint is what makes the
-        // re-appearance argue on the typed witness rather than on grace.
+        // Row 2 overwritten nonblank: the taint makes the return argue on the
+        // typed witness.
         let gap = b"\x1b[3;1H------".as_slice();
         let park_on_word = b"\x1b[3;7H".as_slice(); // row 2, col 6 — beside `kitty`
         let restore = b"\x1b[3;1Hkitty \x1b[3;6H".as_slice();
@@ -15696,8 +14850,7 @@ mod tests {
                 "{label}: PRECONDITION — the overwrite taints"
             );
 
-            // The user commits an edit key — in the tab on glass, or in the
-            // other one. Everything else about the two arms is identical.
+            // The edit key, in the tab on glass or the other one.
             let key_at = at(5036);
             wd.note_typed_edit(key_at, Some(key_tab));
             assert_eq!(
@@ -15734,19 +14887,10 @@ mod tests {
         );
     }
 
-    /// An episode belongs to the tab whose grid produced it.
-    ///
-    /// Identity is `mix(seed_of(column, class, form) ^ ordinal)` with no row
-    /// or session, so `kitty` at column 0 of tab A and tab B share an ident.
-    /// [`WordDecorations::set_scan_session`] parks each tab's `persist` map and
-    /// `done_marks`, so A's spent one-shot does not answer for B.
-    ///
-    /// The two tabs are separate `Terminal`s with identical text at identical
-    /// cells, and the test asserts both occurrences resolve to the same ident:
-    /// the separation is in the map, not the key. The control arm (a second
-    /// rescan+tick of tab A at tab B's clock offsets) keeps "each tab plays"
-    /// from being "every rescan plays", and the return arm proves tab A's
-    /// spent state was parked rather than wiped.
+    /// `kitty` at the same cell in two tabs shares an ident, yet each tab plays
+    /// its own cat: [`WordDecorations::set_scan_session`] parks each tab's map.
+    /// A control arm and a return arm rule out "every rescan plays" and
+    /// "tab A's state was wiped".
     #[test]
     fn identical_words_in_two_tabs_each_get_their_own_cat() {
         let lex = lex();
@@ -15759,8 +14903,7 @@ mod tests {
         const TAB_A: u64 = 31;
         const TAB_B: u64 = 32;
 
-        // Two tabs are two terminals. Identical bytes, so identical text at
-        // identical cells — the collision the shared map could not tell apart.
+        // Two terminals with identical text at identical cells.
         let text = b"\r\n\r\nkitty\r\n\r\n$ ok".as_slice();
         let mut tab_a = Terminal::new(g.rows, g.cols);
         tab_a.process(text);
@@ -15769,7 +14912,7 @@ mod tests {
 
         let mut wd = WordDecorations::default();
 
-        // ── TAB A: the word appears and plays its one cat, to completion.
+        // ── tab A: the word appears and plays its one cat, to completion.
         wd.set_scan_session(Some(TAB_A));
         wd.rescan(&tab_a, rows, cols, &lex, &c, 1, t0);
         let a_ident = feline(&wd).ident;
@@ -15782,8 +14925,7 @@ mod tests {
              two arms below distinguishable"
         );
 
-        // ── control: the same tab, rescanned and ticked exactly as tab B will
-        // be. Once per kitty word still means once.
+        // ── control: tab A rescanned and ticked as tab B will be.
         wd.rescan(&tab_a, rows, cols, &lex, &c, 2, at(5016));
         let (cats, _, _) = tick_cat(&mut wd, at(5116), &c, g);
         assert!(
@@ -15791,7 +14933,7 @@ mod tests {
             "one tab, one cat: a plain repaint of the same word must stay silent"
         );
 
-        // ── TAB B: the user switches. Same word, same cell, different session.
+        // ── tab B: the user switches. Same word, same cell, different session.
         wd.set_scan_session(Some(TAB_B));
         wd.rescan(&tab_b, rows, cols, &lex, &c, 1, at(5116));
         let b_ident = feline(&wd).ident;
@@ -15807,8 +14949,7 @@ mod tests {
              a shared map hands it tab A's spent episode and it never appears"
         );
 
-        // ── and back: tab A's state was parked, not discarded. Its word is
-        // still spent (nothing replays), and tab B's tick did not advance it.
+        // ── back: tab A's state was parked; its word is still spent.
         wd.set_scan_session(Some(TAB_A));
         wd.rescan(&tab_a, rows, cols, &lex, &c, 3, at(5232));
         let (cats, _, _) = tick_cat(&mut wd, at(5332), &c, g);
@@ -15818,17 +14959,8 @@ mod tests {
         );
     }
 
-    /// The unbound scan's flash reservations are not session 0's.
-    ///
-    /// [`IgnitionReservation::pane`] labels a pending §6.4 slot with the scope
-    /// that queued it, since only that scope's `persist` map can say whether
-    /// the owning episode is alive. A "no scope" label must not alias session
-    /// 0, or session 0's prune would miss the unbound owner in its own map and
-    /// cancel a still-queued nova.
-    ///
-    /// The fixture queues a pending slot with no scope, then prunes under
-    /// session 0. The third grant is deferred by the rolling-second cap, so
-    /// there is a future slot to lose.
+    /// An unscoped pending ignition is not session 0's: a prune under session
+    /// 0 must not cancel the still-queued nova.
     #[test]
     fn an_unbound_scans_pending_ignition_is_not_session_zeros_to_cancel() {
         let t0 = Instant::now();
@@ -15868,12 +15000,8 @@ mod tests {
         );
     }
 
-    /// Slot starvation: a screenful of cat words arms all 8 §5.2 slots; the
-    /// user clears and types `kitty` while those episodes are scrolled off
-    /// mid-peek (grace-resident for up to 10 s). A census counting invisible
-    /// history would leave the typed word an invisible overflow arm forever;
-    /// visible-only counting draws it, and the wall-clock sweep retires the
-    /// scrolled-off peeks on schedule.
+    /// A `kitty` typed while 8 scrolled-off cats are mid-peek still draws: the
+    /// slot census counts visible occurrences only.
     #[test]
     fn typed_kitty_after_dense_cat_output_is_not_slot_starved() {
         let lex = lex();
@@ -15901,8 +15029,7 @@ mod tests {
             "the dense screen arms every slot"
         );
 
-        // Clear and type `kitty` one second in: all 12 episodes are grace-
-        // resident and the 8 armed cats are still mid-peek by wall clock.
+        // One second in: 12 grace-resident episodes, 8 cats still mid-peek.
         term.process(b"\x1b[2J\x1b[Hkitty");
         let t1 = t0 + Duration::from_millis(1000);
         wd.rescan(&term, g.rows as usize, g.cols as usize, &lex, &c, 2, t1);
@@ -15919,9 +15046,8 @@ mod tests {
             "the typed kitty draws even right after cat-word-dense output"
         );
 
-        // Wall-clock completion: by +6 s every armed peek (visible or
-        // scrolled off) is past its ≤ 4580 ms one-shot. The scrolled-off
-        // episodes can only get there via the prepass sweep.
+        // By +6 s every armed peek is done; the scrolled-off ones only via the
+        // prepass sweep.
         tick_cat(&mut wd, t1 + Duration::from_millis(6000), &c, g);
         assert!(
             wd.persist
@@ -15931,10 +15057,8 @@ mod tests {
         );
     }
 
-    /// Clearance pause: output landing in the two rows above a dwelling cat
-    /// hides it (per-frame eligibility). The one-shot clock pauses while
-    /// ineligible and resumes where it left off; a running clock would burn
-    /// the peek to Done while invisible.
+    /// Output over a dwelling cat hides it and pauses its clock; it resumes
+    /// where it left off instead of burning to Done while invisible.
     #[test]
     fn occlusion_mid_dwell_pauses_the_peek_and_resumes_when_rows_clear() {
         let (rows, cols) = (6usize, 20usize);
@@ -15970,15 +15094,13 @@ mod tests {
         let (cats, _, _) = tick_cat(&mut wd, t0 + Duration::from_millis(600), &c, g);
         assert!(!cats.is_empty(), "the kitty is peeking mid-dwell");
 
-        // A background job floods the body footprint rows mid-dwell. Blank
-        // snapshot rows arrive trimmed (possibly empty), so extend them from
-        // a blank template cell before stamping the text.
+        // Output floods the footprint rows mid-dwell (trimmed snapshot rows are
+        // extended from a blank cell first).
         let mut template = snap.cells[3][0];
         template.ch = ' ';
         template.wide = false;
-        // Both candidate bands must be walled: a head whose upward band is
-        // occupied simply peeks DOWN instead, so occluding only rows 1-2 would
-        // relocate the cat rather than pause it.
+        // Wall both bands: with only the upper one walled the cat would peek
+        // down rather than pause.
         for r in [1usize, 2, 4, 5] {
             snap.cells[r].resize(cols, template);
             for cell in &mut snap.cells[r] {
@@ -16048,11 +15170,8 @@ mod tests {
         );
     }
 
-    /// Cap bias: with more raw matches than [`MAX_OCCURRENCES`], top-down
-    /// truncation would starve the bottom rows, where the prompt lives. The
-    /// bottom-priority cutoff keeps the typed word's row (dropping whole top
-    /// rows instead), preserves row-major order within kept rows, and is
-    /// stable across rescans.
+    /// Past [`MAX_OCCURRENCES`], whole top rows drop so the prompt row keeps its
+    /// slots, in row-major order, stable across rescans.
     #[test]
     fn bottom_rows_keep_occurrence_slots_on_a_match_saturated_screen() {
         let (rows, cols) = (5usize, 160usize);
@@ -16070,9 +15189,8 @@ mod tests {
         let mut wd = WordDecorations::default();
         wd.rescan(&term, rows, cols, &lex, &c, 1, t0);
 
-        // Budget check: kitty row estimates 2 (1 match + the caret preview
-        // reserve), rows 3..1 cost 40 each, and row 0 (40) does not fit — so
-        // the kept suffix is rows 1-4: 3·40 + 1 occurrences.
+        // Budget: the kitty row costs 2, rows 3..1 cost 40 each, row 0 does not
+        // fit, so rows 1-4 keep 3·40 + 1 occurrences.
         assert_eq!(wd.occ.len(), 121, "kept suffix is rows 1..=4");
         assert!(
             wd.occ.iter().all(|o| o.row >= 1),
@@ -16096,8 +15214,7 @@ mod tests {
             "skipped dense rows still record truthful occupancy for the taint sweep"
         );
 
-        // Stability: an identical rescan keeps the same suffix and continues
-        // (rather than rebirths) the prompt kitty.
+        // An identical rescan keeps the suffix and continues the prompt kitty.
         wd.rescan(
             &term,
             rows,
@@ -16129,9 +15246,8 @@ mod tests {
         }
     }
 
-    /// Rise + descend (overlay Phase 4): the body sprite animates a
-    /// source-rect reveal anchored at the art top (ears enter first) with the
-    /// dest bottom pinned at `word_top + chin`; mid-motion emits no gaze dots.
+    /// Rise and descend reveal the art top-down with the dest bottom pinned at
+    /// `word_top + chin`.
     #[test]
     fn free_rise_and_descend_reveal_window() {
         let now = Instant::now();
@@ -16166,8 +15282,8 @@ mod tests {
                  (ease-out-back overshoot lifts the DEST, capped by vh = min(reveal, rest))"
             );
             assert_eq!((body.aw, body.ah), (body.w, body.h), "NEAREST 1:1 window");
-            // Overshoot lifts the dest ABOVE the pinned rest bottom, never
-            // below it; mid-descend (no lift) sits exactly at it.
+            // Overshoot lifts the dest above the pinned rest bottom, never
+            // below; mid-descend sits exactly at it.
             assert!(
                 body.y + i32::from(body.h) <= rest_bottom,
                 "the dest bottom never drops below word_top + chin at t={t_ms}"
@@ -16177,8 +15293,7 @@ mod tests {
                 (FreeZ::UnderText, FreeSampler::Nearest)
             );
         }
-        // Early rise is a strictly partial reveal that grows monotonically,
-        // and the descend shrinks back below the rest window.
+        // Early rise is a partial, growing reveal; the descend shrinks it.
         let (fr_a, _, _) = tick_cat(
             &mut mk(),
             now + Duration::from_millis(120),
@@ -16207,10 +15322,8 @@ mod tests {
         assert!(fr.is_empty(), "Done: zero sprites forever");
     }
 
-    /// `fold_free` covers every field — z and sampler included (overlay doc
-    /// §3.3: a same-rect Under→Over flip must move `deco_fp`, or the Tier-0
-    /// early-out swallows a real content change) — and the signed origin by
-    /// bit pattern.
+    /// `fold_free` covers every field, z and sampler included, and the signed
+    /// origin by bit pattern.
     #[test]
     fn fold_free_covers_every_field_including_z_and_sampler() {
         let s = FreeSprite {
@@ -16264,16 +15377,8 @@ mod tests {
         );
     }
 
-    /// The keyword kitty is alive while it sits there: the settled cat
-    /// breathes and sways during the dwell (owner, 2026-08-04).
-    ///
-    /// Three things hold at once:
-    ///
-    /// 1. the settled cat moves;
-    /// 2. it never changes size, because the authored aspect and the rest reveal
-    ///    are contractual (`shipping_cat_sprites_preserve_authored_aspect…`,
-    ///    `one_shot_peek_conformance_real_engine`);
-    /// 3. reduced motion keeps it perfectly still.
+    /// The settled cat moves during the dwell, never changes size, and holds
+    /// still under reduced motion.
     #[test]
     fn a_settled_keyword_kitty_breathes_without_resizing() {
         let now = Instant::now();
@@ -16284,8 +15389,7 @@ mod tests {
             have_scanned: true,
             ..WordDecorations::default()
         };
-        // Sample the settled middle, well clear of the entrance and the kitten
-        // bounce, at a spread of instants across the dwell.
+        // Sample across the dwell, clear of the entrance and the bounce.
         let sample = |wd: &mut WordDecorations, c: &DecoConfig, ms: u64| {
             let (fr, _, _) = tick_cat(wd, now + Duration::from_millis(ms), c, g);
             fr.iter()
@@ -16314,8 +15418,7 @@ mod tests {
             origins.len() > 1,
             "a settled word-cat must be alive, not a sticker: {origins:?}"
         );
-        // 2. …by translation only. Size and source window never move, so the
-        //    authored aspect survives and no frame can trigger a rebake.
+        // 2. …by translation only: size and source window never move.
         let sizes: std::collections::BTreeSet<(u16, u16, u16, u16)> =
             frames.iter().map(|f| (f.2, f.3, f.4, f.5)).collect();
         assert_eq!(
@@ -16342,8 +15445,7 @@ mod tests {
         );
     }
 
-    /// §5.6 kitten build: 1.3× overshoot + the 2 px landing bounce (dest-rect
-    /// offsets only) — the bounce peak sits 2 px below the settled rest.
+    /// §5.6 kitten: the landing bounce peaks 2 px below the settled rest.
     #[test]
     fn kitten_landing_bounce_moves_dest_two_px() {
         let now = Instant::now();
@@ -16368,12 +15470,8 @@ mod tests {
             "the bounce is animating"
         );
         let (frs, _, _) = tick_cat(&mut wd, now + Duration::from_millis(900), &c, g);
-        // The settled cat breathes (`CatIdlePose`), so the 900 ms frame is
-        // offset by that instant's idle bob. The pose is a pure function of
-        // (dwell clock, genome), so the offset is recovered exactly and the
-        // bounce beat stays pinned to the device pixel. The bounce frame needs
-        // no correction: the idle pose is suppressed for the whole `in_bounce`
-        // window so the authored beat lands clean.
+        // The 900 ms frame carries that instant's idle bob (pure, so recovered
+        // exactly); the bounce frame has none, the pose is off while bouncing.
         let settled_bob = CatIdlePose::breathing(900 - CAT_RISE_MS, 0, g.cell_h).bob_px;
         assert_eq!(
             bottom(&frb),
@@ -16384,14 +15482,9 @@ mod tests {
         assert!(wd.is_active(now + Duration::from_millis(900)));
     }
 
-    // ───────────────────── §5.8 gaze battery (P3) ─────────────────────
-
     // ─────────────── v3 §1.2 in-dwell life battery (pure time) ───────────────
 
-    /// v3 §1.2 duty pin: after Done
-    /// the episode emits ZERO quads, `is_active` is false, and the fp is
-    /// frozen — zero wakes forever (no deadline ever arms: the one-shot peek is
-    /// covered by `is_active`).
+    /// v3 §1.2 duty pin: after Done, zero quads, `is_active` false, fp frozen.
     #[test]
     fn post_done_duty_pin_no_deadline_no_activity_zero_quads() {
         let now = Instant::now();
@@ -16416,10 +15509,8 @@ mod tests {
         assert_eq!(fp1, fp2, "the post-Done fp is frozen (zero wakes)");
     }
 
-    /// The peek phase clock latches at birth ([`Episode::fresh`]), before any
-    /// tick, so the entrance plays from the word's first appearance: quads land
-    /// on the very first ticked frame (no latch tick required), and same-frame
-    /// siblings rise together (no stagger).
+    /// The peek clock latches at birth: quads land on the first ticked frame
+    /// and same-frame siblings rise together.
     #[test]
     fn fresh_episode_latches_phase_clock_at_birth() {
         let lex = lex();
@@ -16442,8 +15533,7 @@ mod tests {
         }
         // The very first ticked frame is mid-rise — no prior latch tick.
         let (fr, _, _) = tick_cat_at(&mut wd, t0 + Duration::from_millis(100), &c, g, None, true);
-        // The word row a sprite belongs to: its dest bottom is pinned at
-        // `word_row_top + chin`, so the bottom pixel maps into the word row.
+        // A sprite's word row: its bottom pixel (pinned at `row_top + chin`).
         let rows_at = |fr: &[FreeSprite]| -> std::collections::BTreeSet<i32> {
             fr.iter()
                 .map(|s| (s.y + i32::from(s.h) - 1).div_euclid(20))
@@ -16456,10 +15546,8 @@ mod tests {
         );
     }
 
-    /// An episode born while the window is unfocused runs on the
-    /// same birth-latched wall clock — a focus flip never re-latches it, so
-    /// once the peek window has elapsed a refocus shows no entrance, and a
-    /// rescan of the unchanged grid never replays the spent episode.
+    /// An episode born unfocused runs on its birth clock: refocus after the
+    /// window shows no entrance and a rescan never replays it.
     #[test]
     fn born_unfocused_entrance_never_replays_on_refocus() {
         let lex = lex();
@@ -16470,12 +15558,10 @@ mod tests {
         let mut term = Terminal::new(4, 20);
         term.process(b"\r\n\r\nnice kitty");
         wd.rescan(&term, 4, 20, &lex, &c, 1, t0);
-        // Unfocused presents: the clock is already running (latched at
-        // birth) — nothing here re-arms or defers it.
+        // Unfocused presents: the clock latched at birth keeps running.
         tick_cat_at(&mut wd, t0, &c, g, None, false);
         tick_cat_at(&mut wd, t0 + Duration::from_millis(200), &c, g, None, false);
-        // Refocus far past every reachable peek total (450+3750+380=4580):
-        // the one-shot elapsed by wall time — no entrance, no re-latch.
+        // Refocus past every peek total (4580 ms): no entrance, no re-latch.
         let t_focus = t0 + Duration::from_millis(6_000);
         let (fr, _, _) = tick_cat_at(&mut wd, t_focus, &c, g, None, true);
         assert!(fr.is_empty(), "no entrance replay on refocus: {fr:?}");
@@ -16512,9 +15598,8 @@ mod tests {
         assert!(!wd.is_active(t_focus + Duration::from_millis(200)));
     }
 
-    /// v3 §1.2 twin desync: same-seed twins carry distinct idents, so their
-    /// dwells differ by the `mix(ident) % 300` jitter — their descend frames
-    /// are never in lockstep.
+    /// v3 §1.2 twin desync: same-seed twins' dwells differ by the ident jitter,
+    /// so their descends are never in lockstep.
     #[test]
     fn twin_desync_dwells_and_descend_frames_differ() {
         let seed = seed_of(2, Class::Feline, aterm_lexicon::form_hash("kitty"));
@@ -16524,9 +15609,7 @@ mod tests {
         let d0 = peek_dwell_ms(id0, g0, false, (2200, 3598));
         let d1 = peek_dwell_ms(id1, g0, false, (2200, 3598));
         assert_ne!(d0, d1, "the twin-desync jitter separates the dwells");
-        // Emission-level: at the earlier twin's mid-descend instant, the two
-        // twins' reveals differ (one descending, one still dwelling or
-        // further along) — drive two single-cat engines at the same clock.
+        // At the earlier twin's mid-descend instant the two reveals differ.
         let now = Instant::now();
         let run = |ident: u64| {
             let mut o = cat_occ(2, 2, 6, g0, now);
@@ -16546,9 +15629,8 @@ mod tests {
         assert_ne!(q0, q1, "twin descend frames differ (desync jitter)");
     }
 
-    /// v3 §1.1 fix #3: freeze/thaw mid-rise — the cat resumes at exactly the
-    /// same phase (a cat frozen at 44% rise is at 44% after thaw), nothing
-    /// completes while invisible, and the one-shot still runs to Done once.
+    /// Freeze/thaw mid-rise resumes at the same phase; nothing completes while
+    /// frozen, and the one-shot still runs to Done once.
     #[test]
     fn freeze_thaw_mid_rise_resumes_at_same_phase() {
         let lex = lex();
@@ -16571,8 +15653,7 @@ mod tests {
         let (q_c, _, _) = tick_cat_at(&mut ctl, at(200), &c, g, None, true);
         assert_eq!(q_a, q_c, "twin engines agree pre-freeze");
         assert!(!q_a.is_empty(), "mid-rise quads present");
-        // Freeze one for 5 s, then thaw: its clock shifted by the freeze
-        // duration, so its t = 5200 frame equals the control's t = 200 one.
+        // Frozen 5 s then thawed: its t = 5200 frame equals the control's 200.
         wd.freeze(at(200));
         let (q_frozen, _, fp_frozen) = {
             let mut out = Vec::new();
@@ -16615,11 +15696,8 @@ mod tests {
         );
     }
 
-    /// Tier-1 conformance (v3 §1.3): the real engine projects onto the
-    /// ty-proven `OneShotPeek` model — Rise/Dwell/Descend/Done phase steps,
-    /// occlusion shorter than GRACE_TTL (no re-Rise), freeze/thaw mid-rise
-    /// (same phase, no extra Start), and a post-expiry re-appearance entering
-    /// Born-done (the healthy `Repeek` is a no-op; `NoRepeek` holds).
+    /// Tier-1 conformance (v3 §1.3) with the `OneShotPeek` model: phase steps,
+    /// short occlusion, freeze/thaw mid-rise, and a born-done re-appearance.
     #[test]
     fn one_shot_peek_conformance_real_engine() {
         let m = aterm_spec::derive::one_shot_peek_model();
@@ -16646,8 +15724,7 @@ mod tests {
         let expected_h = u32::from(cat_geometry(&o, g, variant).hart);
         let dwell = peek_dwell_ms(o.ident, o.genome.gkey, false, (2200, 3598));
         let total = peek_total_ms(o.ident, o.genome.gkey, false, (2200, 3598));
-        // Rise begins at birth (the phase clock latches in Episode::fresh;
-        // the rescan above is the birth at t0): model Start.
+        // Rise begins at birth (the rescan above): model Start.
         tick_cat_at(&mut wd, t0, &c, g, None, true);
         assert!(m.fire("Start", &mut st));
         let (q, _, _) = tick_cat_at(&mut wd, at(100), &c, g, None, true);
@@ -16664,8 +15741,7 @@ mod tests {
         );
         // Everything below runs on the shifted clock (freeze added 3000 ms).
         let sh = |ms: u64| at(3000 + ms);
-        // Dwell: model Step (Rise → Dwell). v4 cats bake their own eyes, so the
-        // dwell is a steady body sprite — no live blink to time.
+        // Dwell: model Step (Rise → Dwell).
         let (q_dwell, _, _) = tick_cat_at(&mut wd, sh(CAT_RISE_MS + 300), &c, g, None, true);
         assert!(
             q_dwell.iter().map(|p| u32::from(p.h)).sum::<u32>() >= expected_h,
@@ -16704,8 +15780,7 @@ mod tests {
         let (q, _, _) = tick_cat_at(&mut wd, sh(total + 20), &c, g, None, true);
         assert!(q.is_empty(), "Done");
         assert!(m.fire("Finish", &mut st));
-        // Post-expiry re-appearance: born-done — the healthy model's Repeek
-        // is a no-op (phase stays Done, rises stays 1).
+        // Post-expiry re-appearance is born-done; the model's Repeek is a no-op.
         wd.rescan(&blank, 6, 20, &lex, &c, 4, sh(total + 100));
         let expired = sh(total + 100 + 15_000);
         wd.rescan(&blank, 6, 20, &lex, &c, 5, expired);
@@ -16735,8 +15810,7 @@ mod tests {
         assert_eq!(st[&"rises"], 1, "exactly one entrance, ever");
     }
 
-    /// §10: `feline.magic = false` pins the ordinary build — the Nebula magic
-    /// window renders with no entrance aura (and no magic bake).
+    /// §10: `feline.magic = false` pins the ordinary build (no magic bake).
     #[test]
     fn feline_magic_off_disables_rare_cats() {
         let now = Instant::now();
@@ -16758,12 +15832,11 @@ mod tests {
         );
     }
 
-    // ───────────────── §5.2/§5.4 v2.2 geometry battery ─────────────────
+    // ───────────────── §5.2/§5.4 geometry battery ─────────────────
 
-    /// Exercise the shipping occurrence -> geometry -> BakeKey -> atlas path,
-    /// not the natural-aspect gallery helper. Both a normal head and the tall
-    /// Maneki special retain their authored viewbox proportions, while the age
-    /// axis scales both dimensions together.
+    /// Through the shipping occurrence → geometry → BakeKey → atlas path, a
+    /// normal head and the tall Maneki keep their authored aspect, and age
+    /// scales both dimensions together.
     #[test]
     fn shipping_cat_sprites_preserve_authored_aspect_and_uniform_age_scale() {
         let now = Instant::now();
@@ -16818,11 +15891,8 @@ mod tests {
         );
     }
 
-    /// §5.2 v2.9 overshoot clamp: the 2-band head occupies rows {r−2, r−1, r};
-    /// across the whole entrance + overshoot + bounce, no quad ever crosses
-    /// into row r−3. (With the taller Hart the head has two full rows of
-    /// headroom, so the `lift ≤ 2·ch − (Hart − chin)` clamp is purely
-    /// defensive — the natural overshoot never reaches it.)
+    /// §5.2: across entrance, overshoot and bounce the 2-band head stays in
+    /// rows {r−2, r−1, r}, never r−3.
     #[test]
     fn entrance_overshoot_never_crosses_into_row_r_minus_3() {
         let now = Instant::now();
@@ -16843,8 +15913,7 @@ mod tests {
             rows: 6,
             cols: 20,
         };
-        // Uniform kitten scaling still leaves the complete sprite inside rows
-        // {1, 2, 3} (r−2 = row 1); overshoot must not lift it into row 0.
+        // The kitten sprite stays in rows {1, 2, 3}; overshoot never reaches 0.
         let mut min_y = i32::MAX;
         for t in (10..620u64).step_by(5) {
             let (fr, _, _) = tick_cat(&mut wd, now + Duration::from_millis(t), &c, g);
@@ -16862,11 +15931,8 @@ mod tests {
 
     // ────────── v3 §1.1 alignment / done-marks / reset-table battery ──────────
 
-    /// v3 §1.1 fix #1, rotation at constant count (the log-tail case): the top
-    /// twin leaves and a new bottom twin enters in one rescan. Row-anchored
-    /// alignment pins the surviving episode to its physical word (mid-dwell
-    /// cats never teleport), the new bottom twin plays (fresh episode), and
-    /// the departed top twin grace-expires.
+    /// v3 §1.1 log-tail rotation at constant count: the survivor keeps its
+    /// episode, the new bottom twin plays, the departed one grace-expires.
     #[test]
     fn rotation_alignment_plays_new_twin_and_pins_survivor() {
         let model = aterm_spec::derive::sparkle_reflow_cardinality_model();
@@ -16890,8 +15956,7 @@ mod tests {
         assert_eq!((cats[0].ident, cats[1].ident), (id0, id1));
         wd.persist.get_mut(&id0).expect("top twin").nova_done = true;
         wd.persist.get_mut(&id1).expect("surviving twin").nova_done = true;
-        // Rotate: the top twin (row 0) scrolls off, a new twin enters at
-        // row 4 — the row multiset changes at constant count.
+        // The top twin scrolls off, a new twin enters at row 4.
         let mut rotated = Terminal::new(6, 64);
         rotated.process(b"\r\n\r\ndear kitty friend\r\n\r\ndear kitty friend");
         let t1 = t0 + Duration::from_secs(1);
@@ -16906,11 +15971,10 @@ mod tests {
             .cloned()
             .collect();
         assert_eq!(cats2.len(), 2);
-        // The row-2 survivor moved ordinal 1 → 0: it keeps its episode
-        // (appeared = t0 — mid-dwell stays pinned to its physical word).
+        // The row-2 survivor (ordinal 1 → 0) keeps its episode.
         assert_eq!(cats2[0].row, 2);
         assert_eq!(cats2[0].appeared, t0, "the survivor keeps its episode");
-        // The new bottom twin (row 4, ordinal 1) is FRESH: it plays.
+        // The new bottom twin (row 4, ordinal 1) is fresh: it plays.
         assert_eq!(cats2[1].row, 4);
         assert_eq!(cats2[1].appeared, t1, "the new bottom twin plays");
         assert!(!wd.persist[&id1].born_done, "fresh, not born-done");
@@ -16930,16 +15994,14 @@ mod tests {
         assert_eq!(transferred_spent, state[&"transferred"]);
         assert_eq!(fresh_armed, state[&"armed"]);
         assert!(model.check_invariant("NoFalseTransfers", &state));
-        // Gaze rekeyed with the survivor: nothing dangles on the old ident.
         assert!(
             wd.persist.contains_key(&id0) && wd.persist.contains_key(&id1),
             "both live idents hold episodes"
         );
     }
 
-    /// Maximum-cardinality negative space: with no stationary anchor, a global
-    /// one-row insertion must transfer every twin. Three occurrences exercise
-    /// the augmenting-chain shape that a greedy first-bid matcher loses.
+    /// With no stationary anchor, a global one-row insertion transfers all
+    /// three twins (the augmenting chain a greedy matcher loses).
     #[test]
     fn global_insertion_transfers_dense_triple_without_births() {
         let lex = lex();
@@ -16976,9 +16038,8 @@ mod tests {
         assert!(wd.occ.iter().all(|o| wd.persist[&o.ident].nova_done));
     }
 
-    /// v3 §1.1 fix #1 skip semantics: old rows [0, 5] vs new [5, 20] must
-    /// resolve 0→unmatched, 5→5, 20→fresh — the unmatched old episode never
-    /// falls back to a farther occurrence (naive in-order pairing is wrong).
+    /// v3 §1.1 skip semantics: old rows [0, 5] vs new [5, 20] resolve
+    /// 0→unmatched, 5→5, 20→fresh (no fallback to a farther occurrence).
     #[test]
     fn alignment_skip_semantics_old_episode_goes_unmatched() {
         let lex = lex();
@@ -17014,9 +16075,8 @@ mod tests {
         );
     }
 
-    /// v3 §1.1 write path, transient `reset()`: the flush pass writes every
-    /// started episode's done mark before clearing, and the same logical line
-    /// re-enters born-done; `hard_reset()` clears the marks and replays.
+    /// v3 §1.1: `reset()` flushes started episodes' marks so the line re-enters
+    /// born-done; `hard_reset()` clears them and replays.
     #[test]
     fn reset_flush_writes_marks_and_reentry_is_born_done() {
         let lex = lex();
@@ -17055,10 +16115,8 @@ mod tests {
         assert!(!q.is_empty(), "hard_reset makes re-ignition reachable");
     }
 
-    /// v3 §1.1: alignment moves done-mark responsibility with the episode —
-    /// a shrink transfers the surviving twin's episode to its new ident, and
-    /// when it later grace-expires the mark is written under the ident
-    /// current at departure, so the next same-context appearance is born-done.
+    /// v3 §1.1: a transferred episode that later grace-expires writes its mark
+    /// under its departure ident, so the next appearance is born-done.
     #[test]
     fn transfer_then_expire_writes_mark_under_departure_ident() {
         let lex = lex();
@@ -17072,21 +16130,18 @@ mod tests {
         wd.rescan(&twins, 6, 64, &lex, &c, 1, t0);
         // Start both one-shots.
         tick_cat_at(&mut wd, t0 + Duration::from_millis(100), &c, g, None, true);
-        // Shrink: the ROW-0 twin scrolls off; the row-2 survivor shifts to
-        // ordinal 0 via alignment (its episode transfers to the new ident).
+        // The row-0 twin scrolls off; the survivor's episode moves to ordinal 0.
         let mut lone = Terminal::new(6, 64);
         lone.process(b"\r\n\r\ndear kitty friend");
         wd.rescan(&lone, 6, 64, &lex, &c, 2, at(1));
         let survivor = feline(&wd).clone();
         assert_eq!(survivor.appeared, t0, "the survivor kept its episode");
-        // Everything expires (> GRACE_TTL blank): the transferred episode's
-        // mark is written under its current (post-transfer) ident.
+        // Past GRACE_TTL blank: the mark is written under the post-transfer ident.
         let blank = Terminal::new(6, 64);
         wd.rescan(&blank, 6, 64, &lex, &c, 3, at(15));
         assert!(wd.persist.is_empty());
         assert!(!wd.done_marks.is_empty(), "expiry wrote the done marks");
-        // The lone layout re-enters: the survivor's word is born-done under
-        // exactly the transferred key (ident at departure ^ ctx_fp).
+        // The lone layout re-enters born-done under the transferred key.
         wd.rescan(&lone, 6, 64, &lex, &c, 4, at(16));
         assert!(
             wd.persist[&survivor.ident].born_done,
@@ -17094,10 +16149,8 @@ mod tests {
         );
     }
 
-    /// v3 §1.1 fix #4 resize-settle: births during a cols change (and until
-    /// the first rescan at stable cols + 500 ms) are born-settled — no
-    /// entrance, static ink, and never written to `done_marks`; births after
-    /// the window play normally.
+    /// v3 §1.1 resize-settle: births until a stable-cols rescan past 500 ms are
+    /// born-settled and unmarked; later births play.
     #[test]
     fn resize_settle_births_are_inert_and_unmarked() {
         let lex = lex();
@@ -17106,8 +16159,7 @@ mod tests {
         let t0 = Instant::now();
         let at = |ms: u64| t0 + Duration::from_millis(ms);
         let mut wd = WordDecorations::default();
-        // Establish cols = 40 on an empty grid, then a width step to 32
-        // arrives together with a new word — the interactive-resize birth.
+        // cols 40 on an empty grid, then a step to 32 with a new word.
         let empty40 = Terminal::new(4, 40);
         wd.rescan(&empty40, 4, 40, &lex, &c, 1, t0);
         let mut narrower = Terminal::new(4, 32);
@@ -17140,9 +16192,8 @@ mod tests {
 
     // ───────────────────── §F4.2 Kitty Log recording ─────────────────────
 
-    /// §F4.2: one sighting per episode — recorded on the first present where
-    /// quads land, silent across later frames and grace re-hits, recounted
-    /// only on true episode death (grace expiry), exactly the §3.6 semantics.
+    /// §F4.2: one sighting per episode, on the first frame quads land, silent
+    /// across grace re-hits, recounted only after episode death.
     #[test]
     fn kitty_sighting_once_per_episode_across_occlusion() {
         let lex = lex();
@@ -17155,8 +16206,7 @@ mod tests {
         term.process(b"\r\n\r\na happy kitty naps");
         let blank = Terminal::new(4, 20);
         wd.rescan(&term, 4, 20, &lex, &c, 1, t0);
-        // The first present at t0 is at reveal 0 (the clock latched at
-        // birth = t0 — nothing lands yet)…
+        // At t0 the reveal is 0: nothing lands yet…
         tick_cat_at(&mut wd, t0, &c, g, None, true);
         assert_eq!(
             wd.drain_kitty_sightings().count(),
@@ -17181,8 +16231,8 @@ mod tests {
             0,
             "a grace re-hit never recounts"
         );
-        // v3 §1.1: true episode death (grace expiry) writes the done mark, so
-        // the re-appearance is born-done — inert, and it logs NOTHING.
+        // Grace expiry writes the done mark: the re-appearance is born-done
+        // and logs nothing.
         wd.rescan(&blank, 4, 20, &lex, &c, 4, at(15));
         assert!(wd.persist.is_empty());
         wd.rescan(&term, 4, 20, &lex, &c, 5, at(16));
@@ -17199,8 +16249,7 @@ mod tests {
             0,
             "a born-done re-appearance logs nothing (§1.1 inertness)"
         );
-        // hard_reset (fresh start is user intent): the marks clear and the
-        // next appearance records again — exactly 1.
+        // `hard_reset` clears the marks: the next appearance records again.
         wd.hard_reset();
         wd.rescan(&term, 4, 20, &lex, &c, 6, at(17));
         tick_cat_at(&mut wd, at(17), &c, g, None, true); // latch the phase clock
@@ -17219,7 +16268,7 @@ mod tests {
         );
     }
 
-    // ───────────────────── §6 supernova battery (P4) ─────────────────────
+    // ───────────────────── §6 supernova battery ─────────────────────
 
     fn cfg_nova() -> DecoConfig {
         DecoConfig {
@@ -17282,10 +16331,8 @@ mod tests {
         s
     }
 
-    /// §6.4 item 1 / §13: one flash per identity episode, across occlusion —
-    /// the full phase ride (Dip emits nothing, Flash crowns, Ring emits quads,
-    /// window end settles to the ember residual with a stable fp), then a
-    /// grace re-hit never re-ignites, and only true identity death re-arms.
+    /// §6.4: one flash per episode across occlusion (phase ride, then a grace
+    /// re-hit never re-ignites); only identity death re-arms.
     #[test]
     fn nova_one_flash_per_episode_across_occlusion() {
         let lex = lex();
@@ -17305,8 +16352,7 @@ mod tests {
         // Flash: the star-glint crown blooms.
         let (q, _, _, _, _) = tick_nova(&mut wd, at(180), &c, g, None, None);
         assert!(!q.is_empty(), "the flash crown emits additive quads");
-        // Ring window: quads live, and the fp changes across frames (the
-        // anti-skip rule folds the frame term + every nova quad).
+        // Ring window: quads live and the fp changes every frame.
         let (q1, _, _, _, fp1) = tick_nova(&mut wd, at(500), &c, g, None, None);
         assert!(!q1.is_empty(), "ring quads");
         let (_, _, _, _, fp2) = tick_nova(&mut wd, at(516), &c, g, None, None);
@@ -17320,14 +16366,13 @@ mod tests {
                 > 1,
             "ballistic debris motes on the Add stream, got {out:?}"
         );
-        // v3 §1.2 graphics-decay: past the window the ember residual fades
-        // (still animating) for ≤ 2 s…
+        // Past the window the ember residual fades for ≤ 2 s…
         let (q, out, _, _, _) = tick_nova(&mut wd, at(2600), &c, g, None, None);
         assert!(q.is_empty(), "the fade emits nothing on the nova stream");
         assert_eq!(out.len(), 1, "the ember spark is fading");
         assert!(matches!(out[0].blend, DecoBlend::Add));
         assert!(wd.is_active(at(2600)), "the ember fade is animating");
-        // …then ZERO decos + fp-stable + disarmed, forever.
+        // …then zero decos, a stable fp and disarmed, forever.
         let (q, out, _, _, fpa) = tick_nova(&mut wd, at(3600), &c, g, None, None);
         assert!(q.is_empty() && out.is_empty(), "the ember faded to nothing");
         let (_, _, _, _, fpb) = tick_nova(&mut wd, at(3616), &c, g, None, None);
@@ -17347,9 +16392,8 @@ mod tests {
             "a grace re-hit must not strobe (nova_done survives)"
         );
         assert!(!wd.is_active(at(5300)));
-        // v3 §1.1 fix #2, the inverted rebirth stanza: true identity death
-        // (grace expiry) writes the done mark, so a post-expiry re-appearance
-        // is born-done — no re-ignition, ever; only the settled ink shows.
+        // Grace expiry writes the done mark, so the re-appearance is born-done:
+        // no re-ignition, only the settled ink.
         wd.rescan(&blank, 2, 20, &lex, &c, 4, at(16_000));
         assert!(wd.persist.is_empty(), "grace expiry sweeps the episode");
         wd.rescan(&term, 2, 20, &lex, &c, 5, at(17_000));
@@ -17367,8 +16411,7 @@ mod tests {
             "born-done still shows the settled ink bytes"
         );
         assert!(!wd.is_active(at(17_300)), "born-done is inert (zero wakes)");
-        // hard_reset branch: re-ignition is still reachable when the user
-        // asks for a fresh start (§1.1 reset table).
+        // `hard_reset` re-arms ignition (a user-asked fresh start).
         wd.hard_reset();
         wd.rescan(&term, 2, 20, &lex, &c, 6, at(18_000));
         tick_nova(&mut wd, at(18_000), &c, g, None, None); // grant
@@ -17376,10 +16419,8 @@ mod tests {
         assert!(!q.is_empty(), "hard_reset makes re-ignition reachable");
     }
 
-    /// Tier-1 binding for `DoneMarkLruBound`: fill the real bounded LRU, touch
-    /// its oldest key, then replace at capacity. The model's resident/eviction
-    /// counters match, the exact deterministic order is checked, and the real
-    /// mutation touches a fixed number of links independent of cardinality.
+    /// Tier-1 binding for `DoneMarkLruBound`: fill, touch the oldest, replace at
+    /// capacity; counters, order and constant link work match the model.
     #[test]
     fn done_mark_lru_real_order_and_constant_work_conform() {
         const CAP: usize = 3;
@@ -17413,9 +16454,8 @@ mod tests {
         assert!(model.check_invariant("ConstantSelection", &state));
         marks.assert_valid();
 
-        // Negative control: the previous `iter().min_by_key` implementation
-        // examines every resident. The Buggy model records those three probes
-        // and rejects the exact at-cap transition the real LRU handled above.
+        // Negative control: a `min_by_key` scan over every resident (the Buggy
+        // model's three probes) fails the same at-cap transition.
         let mut buggy = aterm_spec::derive::done_mark_lru_model();
         for cst in &mut buggy.consts {
             if cst.0 == "Buggy" {
@@ -17431,10 +16471,8 @@ mod tests {
         assert!(!buggy.check_invariant("ConstantSelection", &bad));
     }
 
-    /// The shipping 65,536-entry boundary: after one warm fill, thousands of
-    /// deterministic replacements reuse the same slots and hash allocation.
-    /// `link_writes <= 6` is the structural constant-work oracle; it cannot
-    /// accidentally pass through a cardinality-sized scan.
+    /// At the 65,536-entry cap, thousands of replacements reuse the same slots
+    /// and allocation, each within `link_writes <= 6`.
     #[test]
     fn done_mark_lru_full_capacity_replacement_is_bounded_and_growth_free() {
         const MAX_LINK_WRITES: u8 = 6;
@@ -17457,10 +16495,8 @@ mod tests {
             assert!(mutation.link_writes <= MAX_LINK_WRITES);
             assert_eq!(marks.len(), DONE_MARKS_CAP);
         }
-        // HashMap's reported capacity may decrease as removals leave
-        // tombstones, even though its bucket allocation is unchanged. It must
-        // never exceed the fully-warmed allocation; the intrusive node/free
-        // storage remains byte-for-byte fixed.
+        // The map's reported capacity may drop with tombstones but never exceeds
+        // the warmed allocation; node/free storage is fixed.
         assert!(
             marks.index.capacity() <= capacities.0,
             "replacement unexpectedly grew the warmed hash allocation"
@@ -17523,12 +16559,9 @@ mod tests {
         assert!(wd.ignitions.len() <= MAX_IGNITION_RESERVATIONS);
     }
 
-    /// Tier-1 binding for `IgnitionReservationLifecycle`: the real limiter
-    /// grants one immediate and two delayed overlapping slots, cancels only a
-    /// departed future owner, preserves fired history after owner departure,
-    /// and migrates a pending slot into recent history at its start instant.
-    /// The expiry-only negative control retains two ownerless future slots and
-    /// projects exactly onto the model's Buggy counterexample.
+    /// Tier-1 binding for `IgnitionReservationLifecycle`: grants, cancelling a
+    /// departed future owner, keeping fired history, and pending-to-recent
+    /// migration; an expiry-only sweep matches the Buggy counterexample.
     #[test]
     fn ignition_reservation_lifecycle_real_queue_conforms() {
         let model = aterm_spec::derive::ignition_reservation_lifecycle_model();
@@ -17569,8 +16602,7 @@ mod tests {
         wd.prune_ignitions(t1);
         assert_reservation_projection(&wd, t1, &state);
 
-        // A new owner can use the newly-open current slot without disturbing
-        // owner 3's already-reserved future cadence.
+        // A new owner takes the open slot without disturbing owner 3's.
         assert_eq!(reserve_overlapping(&mut wd, 4, t1), t1);
         assert!(model.fire("ReserveNow", &mut state));
         assert_reservation_projection(&wd, t1, &state);
@@ -17589,8 +16621,7 @@ mod tests {
             assert!(model.check_invariant(invariant, &state), "{invariant}");
         }
 
-        // Negative control: an expiry-only sweep leaves both future slots after
-        // their owners depart. Drive the Buggy model in lockstep.
+        // Negative control: an expiry-only sweep keeps both ownerless slots.
         let mut buggy = aterm_spec::derive::ignition_reservation_lifecycle_model();
         for cst in &mut buggy.consts {
             if cst.0 == "Buggy" {
@@ -17614,11 +16645,9 @@ mod tests {
         assert!(!buggy.check_invariant("FutureOwned", &bad));
     }
 
-    /// Tier-1 binding for `IgnitionReservationRekey`: a limiter-delayed nova
-    /// is rekeyed exactly as the alignment pass moves its episode, survives
-    /// pruning under the new owner, and keeps an overlapping competitor out of
-    /// its rolling safety window. The negative control performs a persist-only
-    /// rekey and demonstrates the resulting simultaneous flashes.
+    /// Tier-1 binding for `IgnitionReservationRekey`: a delayed nova's slot is
+    /// rekeyed with its episode, survives pruning and keeps a competitor out;
+    /// a persist-only rekey (negative control) double-flashes.
     #[test]
     fn ignition_reservation_rekey_real_queue_conforms() {
         let model = aterm_spec::derive::ignition_reservation_rekey_model();
@@ -17646,8 +16675,7 @@ mod tests {
             blocker += 1;
         }
 
-        // The first overlapping flash occupies t0, so the episode under test
-        // receives a delayed t1 slot.
+        // A blocker holds t0, so the episode under test gets t1.
         assert_eq!(reserve_overlapping(&mut wd, blocker, t0), t0);
         let original_start =
             grant_ignition(&mut wd.ignitions, None, old_owner, t0, (100, 100), 88.0)
@@ -17659,9 +16687,7 @@ mod tests {
             .nova_start = Some(original_start);
         assert!(model.fire("GrantDelayed", &mut state));
 
-        // Drive the real scanner/alignment transaction: the same exact surface
-        // moves horizontally, so align_pending pulls the old episode and calls
-        // the atomic rekey funnel under its new occurrence identity.
+        // A horizontal move: `align_pending` rekeys the episode and its slot.
         wd.rescan(&moved, 2, 48, &lexicon, &config, 2, rekey_at);
         let new_owner = wd.occ[0].ident;
         assert_eq!(new_owner, expected_new_owner);
@@ -17678,8 +16704,7 @@ mod tests {
         assert!(model.fire("Prune", &mut state));
         assert_eq!(wd.ignitions.len(), 2);
 
-        // The preserved t1 slot pushes an overlapping competitor to t2; no
-        // flash can share the original episode's trailing one-second window.
+        // The preserved t1 slot pushes an overlapping competitor to t2.
         let mut competitor = blocker + 1;
         while wd.persist.contains_key(&competitor) {
             competitor += 1;
@@ -17695,9 +16720,8 @@ mod tests {
             assert!(model.check_invariant(invariant, &state), "{invariant}");
         }
 
-        // Negative control: rekey only the persist map. Prune cannot find owner
-        // 2 and drops its future slot, even though episode 22 still carries
-        // nova_start=t1 and will flash then.
+        // Negative control: a persist-only rekey loses owner 2's future slot
+        // while episode 22 still flashes at t1.
         let mut buggy = aterm_spec::derive::ignition_reservation_rekey_model();
         for cst in &mut buggy.consts {
             if cst.0 == "Buggy" {
@@ -17729,10 +16753,8 @@ mod tests {
         assert!(!buggy.check_invariant("NoOverlappingFlash", &bad_state));
     }
 
-    /// Ten thousand vanished delayed owners are the backlog shape that would
-    /// accumulate without pruning. Pruning each unconsumed future slot leaves
-    /// only the one fired safety record, and the resident Vec stops growing
-    /// after warmup.
+    /// Ten thousand vanished delayed owners leave one fired record, and the
+    /// reservation Vec stops growing after warmup.
     #[test]
     fn vanished_classic_nova_flood_has_constant_reservation_storage() {
         let t0 = Instant::now();
@@ -17758,16 +16780,13 @@ mod tests {
         assert_eq!(wd.ignitions[0].owner, 1);
     }
 
-    /// §6.4 item 2 / §13: the window-wide limiter — two disjoint-region
-    /// ignitions fill the rolling second; a third arriving 200 ms later is
-    /// delayed deterministically to the earliest allowed slot (t0 + 1 s), and
-    /// the queued Dip still fires.
+    /// §6.4: two disjoint ignitions fill the rolling second; a third 200 ms
+    /// later is delayed to t0 + 1 s and still fires.
     #[test]
     fn limiter_delays_third_of_three_ignitions_deterministically() {
         let lex = lex();
         let c = cfg_nova();
-        // Rows 0 / 6 / 12 at cell 10×20: pairwise center distance ≥ 120 px >
-        // 2·R_max ≤ 88 px — no overlap tightening in this variant.
+        // Rows 0 / 6 / 12: center distance ≥ 120 px > 2·R_max, no overlap.
         let g = EffectGeom {
             cell_w: 10,
             cell_h: 20,
@@ -17805,10 +16824,7 @@ mod tests {
         );
     }
 
-    /// §6.4 item 2 / §13 overlap tightening: two candidates whose regions
-    /// overlap (center distance < 2·R_max) tighten the limiter to ≤ 1 per
-    /// rolling second — the second ignition is pushed a full window out even
-    /// though the plain cap (2/s) had room.
+    /// §6.4: overlapping regions tighten the limiter to one per rolling second.
     #[test]
     fn limiter_tightens_to_one_per_second_on_overlap() {
         let lex = lex();
@@ -17828,10 +16844,8 @@ mod tests {
         );
     }
 
-    /// A persist identity is a current owner label, not a globally unique
-    /// reservation nonce. If a later episode legitimately reuses that number
-    /// while the former episode remains only as fired safety history, it must
-    /// receive a new limiter decision instead of aliasing the old start.
+    /// A reused owner number gets a new limiter decision rather than aliasing a
+    /// fired episode's start.
     #[test]
     fn limiter_reused_owner_label_does_not_alias_fired_episode() {
         let t0 = Instant::now();
@@ -17856,17 +16870,11 @@ mod tests {
         assert_eq!(ignitions.len(), 2);
     }
 
-    /// Tier-1 conformance for the §9 `FlashLimiter` ty model (§7.5 ledger row
-    /// "FlashLimiter (§6.4/§9)" — the limiter is the WCAG 2.3.1 argument, so
-    /// this binding is what lets v2 ship with no per-frame flash audit): the
-    /// real window-wide limiter (`grant_ignition`) is driven by a scripted
-    /// ignition storm and every decision is projected onto the derived model —
-    /// grants map to `Ignite` (the model's guard must admit each one), delays
-    /// map to a disabled `Ignite` guard whose re-enabling `Shift` tick (250 ms
-    /// slots, 4-slot rolling second) coincides exactly with the real granted
-    /// slot, and `IgnitionBound` + `RegionFlashPairs` hold along the whole
-    /// trace, for both the disjoint (Overlap = 0) and the overlapping
-    /// (Overlap = 1, tightened to ≤ 1/s) storms.
+    /// Tier-1 conformance for `FlashLimiter`, the WCAG 2.3.1 argument: an
+    /// ignition storm through `grant_ignition` projects onto the model (grants
+    /// as `Ignite`, delays as its disabled guard re-enabled by `Shift`), with
+    /// `IgnitionBound` and `RegionFlashPairs` holding for disjoint and
+    /// overlapping storms.
     #[test]
     fn flash_limiter_conformance_real_limiter_projects_onto_model() {
         let tick = Duration::from_millis(250);
@@ -17884,8 +16892,7 @@ mod tests {
         assert!(m.fire("Ignite", &mut st), "the model admits ignition 2");
         assert!(m.check_invariant("IgnitionBound", &st));
         assert!(m.check_invariant("RegionFlashPairs", &st));
-        // The third request, 200 ms in: the real limiter delays it to the
-        // window edge; the model's Ignite guard is disabled at that tick.
+        // The third request, 200 ms in, is delayed; the model's Ignite is off.
         assert!(
             !m.action_enabled("Ignite", &st),
             "the model refuses a 3rd in-window ignition"
@@ -17904,8 +16911,7 @@ mod tests {
             t0 + IGNITION_WINDOW,
             "the real limiter delays to t0 + 1 s"
         );
-        // Roll the second out in 250 ms model ticks: Ignite re-enables on
-        // exactly the tick that reaches the real limiter's granted slot.
+        // In 250 ms model ticks, Ignite re-enables at the real granted slot.
         for k in 1u32..=4 {
             assert!(m.fire("Shift", &mut st));
             assert_eq!(
@@ -17937,9 +16943,8 @@ mod tests {
             !mo.action_enabled("Ignite", &st),
             "overlap tightens the model to ≤ 1 per rolling second"
         );
-        // 50 px < 2·R_max = 88 px: the real limiter pushes the overlapping
-        // second ignition a full window out even though the plain 2/s cap
-        // had room — the §6.4 item 2 tightening.
+        // 50 px < 2·R_max = 88 px: the overlapping second ignition is pushed a
+        // full window out.
         let b = grant_ignition(&mut igns, None, 2, t0, (150, 100), 88.0).expect("capacity");
         assert_eq!(
             b,
@@ -17959,15 +16964,9 @@ mod tests {
         assert!(mo.check_invariant("RegionFlashPairs", &st));
     }
 
-    /// Negative control for the Tier-1 binding above (the §9 `Buggy = 1`
-    /// twin, non-vacuity): an overlap-BLIND limiter — `grant_ignition` called
-    /// with `overlap_dist = 0`, so no center distance is ever `< 0` and the
-    /// §6.4 item 2 tightening never engages — reproduces exactly the model's
-    /// `Buggy = 1, Overlap = 1` counterexample trace: two overlapping
-    /// ignitions land in one rolling second (4 luminance-transition pairs on
-    /// the shared region), the buggy model admits the trace, and the healthy
-    /// model's `IgnitionBound` and `RegionFlashPairs` both reject the
-    /// projected state — the WCAG violation `ty` catches in Tier-0.
+    /// Negative control: an overlap-blind limiter (`overlap_dist = 0`)
+    /// reproduces `Buggy = 1, Overlap = 1`: two overlapping ignitions in one
+    /// second, rejected by `IgnitionBound` and `RegionFlashPairs`.
     #[test]
     fn flash_limiter_negative_control_overlap_blind_limiter_is_buggy_trace() {
         let mut healthy = aterm_spec::derive::flash_limiter_model();
@@ -17984,8 +16983,8 @@ mod tests {
         }
         let t0 = Instant::now();
         let mut igns = Vec::new();
-        // Centers 50 px apart (genuinely overlapping regions), but the blind
-        // limiter never sees it: both ignite at t0 — the strobe.
+        // Overlapping centers 50 px apart, unseen by the blind limiter: both
+        // ignite at t0.
         let a = grant_ignition(&mut igns, None, 1, t0, (100, 100), 0.0).expect("capacity");
         let b = grant_ignition(&mut igns, None, 2, t0, (150, 100), 0.0).expect("capacity");
         assert_eq!(
@@ -18000,8 +16999,7 @@ mod tests {
             buggy.fire("Ignite", &mut st),
             "Buggy = 1 admits the second overlapping in-window ignition"
         );
-        // …and the healthy model rejects the projected state on both
-        // invariants: 2 ignitions > 1 under overlap, 2 + 2 = 4 pairs > 3.
+        // …and the healthy model rejects it: 2 ignitions > 1, 4 pairs > 3.
         assert!(
             !healthy.check_invariant("IgnitionBound", &st),
             "2 overlapping ignitions in one second must violate IgnitionBound"
@@ -18012,9 +17010,8 @@ mod tests {
         );
     }
 
-    /// §6.4 item 6 / §13: a nova never ignites while its word is selected —
-    /// ignition defers to deselection (then queues through the limiter) — and
-    /// an already-active nova's quads attenuate over selected cells.
+    /// §6.4: a selected word's nova defers ignition until deselection, and an
+    /// active nova's quads drop over selected cells.
     #[test]
     fn selection_defers_ignition_and_attenuates_active_novas() {
         let lex = lex();
@@ -18043,8 +17040,7 @@ mod tests {
         // Deselection: the ignition queues through the limiter from now.
         tick_nova(&mut wd, at(800), &c, g, None, None);
         assert_eq!(ignition_starts(&wd), vec![Some(at(800))]);
-        // An active nova over a fresh selection: quads over selected cells
-        // drop (host-side per-quad, both backends identical by construction).
+        // An active nova's quads over freshly selected cells drop.
         let (q_free, _, _, _, _) = tick_nova(&mut wd, at(1300), &c, g, None, None);
         assert!(
             !q_free.is_empty(),
@@ -18058,9 +17054,8 @@ mod tests {
         assert!(q_sel.len() < q_free.len());
     }
 
-    /// §6.4 item 5 / §13: `reduced_motion` ⇒ a static glint only — no dip, no
-    /// flash, no ring, no debris; the ember tint + one static spark from
-    /// frame 0, byte-stable forever.
+    /// §6.4: under `reduced_motion` a nova is a static glint (ember tint plus
+    /// one spark), byte-stable from frame 0.
     #[test]
     fn reduced_motion_nova_is_a_static_glint() {
         let lex = lex();
@@ -18089,7 +17084,7 @@ mod tests {
         assert_eq!(out1, out2);
         assert_eq!(ink1, ink2, "the ember-tinted static gradient holds");
         assert_eq!(fp1, fp2);
-        // The spark carries the palette's ember tone (not the v1 palette).
+        // The spark carries the palette's ember tone.
         let occ = &wd.occ[0];
         let feats = nova_features(occ.genome.gkey);
         let (_, ember) = nova::ember_pair(nova::palette(feats.palette), None);
@@ -18099,9 +17094,8 @@ mod tests {
         }
     }
 
-    /// §6.1/§6.4 item 3 / §13: the word's own ink during its nova — the Dip
-    /// dims the envelope ~35 %, the sweep is frozen at the settled gradient
-    /// for the whole window, and the spent nova leaves the ember tint.
+    /// §6.1/§6.4: during its nova the word's ink dips ~35 % with the sweep
+    /// frozen, and the spent nova leaves the ember tint.
     #[test]
     fn nova_dip_freezes_sweep_and_embers_ink() {
         let lex = lex();
@@ -18114,8 +17108,7 @@ mod tests {
         term.process(b"oh fuck");
         wd.rescan(&term, 2, 20, &lex, &c, 1, t0);
         tick_nova(&mut wd, t0, &c, g, None, None); // grant at t0
-        // Frozen: mid-window frames are byte-identical despite the live sweep
-        // window (the settled gradient held for the whole nova second).
+        // Frozen: mid-window frames are byte-identical.
         let (_, _, ink_a, _, _) = tick_nova(&mut wd, at(600), &c, g, None, None);
         let (_, _, ink_b, _, _) = tick_nova(&mut wd, at(700), &c, g, None, None);
         assert_eq!(ink_a, ink_b, "the sweep is frozen during the nova window");
@@ -18126,7 +17119,7 @@ mod tests {
             let dimmed = dim_rgb(rgb3_to_u32(s.color), nova::dip_envelope(60));
             assert_eq!(rgb3_to_u32(d.color), dimmed, "dip = envelope × settled ink");
         }
-        // The exact-v1 sparkle style at the same instants sweeps (not frozen).
+        // The sparkle style at the same instants sweeps (not frozen).
         let c_v1 = cfg();
         let mut wd2 = WordDecorations::default();
         wd2.rescan(&term, 2, 20, &lex, &c_v1, 1, t0);
@@ -18139,8 +17132,7 @@ mod tests {
             sweep_a, sweep_b,
             "control: the v1 sweep moves between frames"
         );
-        // Spent: the ink anchors shift to the ember pair (settled bytes use
-        // the ember gradient, not the live palette endpoints).
+        // Spent: the ink anchors shift to the ember pair.
         let (_, _, ink_ember, _, _) = tick_nova(&mut wd, at(2600), &c, g, None, None);
         assert_ne!(
             ink_ember, ink_a,
@@ -18148,10 +17140,8 @@ mod tests {
         );
     }
 
-    /// §6.5 / §13 coupling: byte-deterministic (same text + same tick instants
-    /// ⇒ identical ink, replay-reproducible), the pulse actually fires on a
-    /// neighbor word, and the applied pulse holds |ΔL| ≤ 5 % against the
-    /// un-pulsed control run.
+    /// §6.5 coupling is byte-deterministic, fires on a neighbor word, and
+    /// holds |ΔL| ≤ 5 % against the un-pulsed control.
     #[test]
     fn coupling_pulse_is_deterministic_and_luminance_bounded() {
         let lex = lex_with_emphasis();
@@ -18189,8 +17179,8 @@ mod tests {
             a, b,
             "coupling is a pure function of (center, t, span): replay-exact"
         );
-        // Control: the v1 sparkle style has no coupling; the frames where the
-        // nova run deviates from it are exactly the pulse window.
+        // Control: the sparkle style has no coupling, so the frames that differ
+        // are the pulse window.
         let control = run(ProfanityStyle::Sparkle);
         let mut pulsed_frames = 0usize;
         for (fa, fc) in a.iter().zip(&control) {
@@ -18215,9 +17205,8 @@ mod tests {
         );
     }
 
-    /// §6.1 magic variants through the full host tick: the Quasar's jets and
-    /// the Singularity's Over-blend RingArc shadow both reach the output
-    /// streams (the emitter-level shapes are pinned in `nova::tests`).
+    /// §6.1: the Quasar's jets and the Singularity's Over-blend RingArc reach
+    /// the host tick's output streams.
     #[test]
     fn quasar_and_singularity_ride_the_host_tick() {
         const QUASAR_MAGIC: u64 = 0; // (0 >> 12) % 4096 = 0 → Quasar
@@ -18284,8 +17273,7 @@ mod tests {
         assert!(!out.iter().any(|d| matches!(d.glyph, DecoGlyph::RingArc)));
     }
 
-    /// §6.3 caps through the host tick: >3 concurrent novas — the 4th (row-
-    /// major last) skips straight to Ember (its episode spends without quads).
+    /// §6.3: of four concurrent novas the row-major last skips to Ember.
     #[test]
     fn excess_concurrent_novas_skip_to_ember() {
         let now = Instant::now();
@@ -18328,8 +17316,7 @@ mod tests {
                 custom: false,
                 species: None,
             };
-            // All four already granted (bypassing the limiter — this pins the
-            // concurrency cap, not the rate limiter).
+            // All four pre-granted: this pins the concurrency cap, not the rate.
             let mut e = Episode::fresh(now, o.genome, o.seed, o.row, 0);
             e.nova_start = Some(now);
             wd.persist.insert(o.ident, e);
@@ -18349,9 +17336,8 @@ mod tests {
         );
     }
 
-    /// §10/§12: DEC double-width rows are supported like ink — the nova
-    /// anchors via the ROW advance (2× the cell width on DECDWL), so the ring
-    /// centers over the glyphs the user sees instead of the logical columns.
+    /// §10/§12: on a DECDWL row the nova anchors via the row advance (2× cell
+    /// width), centring over the glyphs the user sees.
     #[test]
     fn dec_rows_anchor_nova_via_row_advance() {
         let now = Instant::now();
@@ -18422,8 +17408,7 @@ mod tests {
         };
         let normal = run(false);
         let dec = run(true);
-        // Span cols 4..=7 at cw = 10: center 60 px; at the DECDWL advance
-        // (20 px) it is 120 px.
+        // Cols 4..=7: center 60 px at cw 10, 120 px at the DECDWL advance.
         assert!(
             (normal - 60.0).abs() < 8.0,
             "single-width anchor ≈ 60 px, got {normal}"
@@ -18436,8 +17421,7 @@ mod tests {
 
     // ───────────────── v3 §6 spec framework + §3.1/§3.2 battery ─────────────────
 
-    /// Rainbow profanity default with the supernova roll disabled (the driven
-    /// default-scenario shape).
+    /// Rainbow profanity with supernova chance `chance`.
     fn cfg_rainbow(chance: u8) -> DecoConfig {
         DecoConfig {
             profanity_style: ProfanityStyle::Rainbow,
@@ -18496,8 +17480,7 @@ mod tests {
     }
 
     /// §6: a custom spec on a builtin profanity form fires with
-    /// `[profanity] enabled = false` (override bypasses the class gate) and
-    /// beats the class default regardless of the match's class.
+    /// `[profanity] enabled = false` and beats the class default.
     #[test]
     fn custom_on_builtin_profanity_fires_with_class_disabled() {
         let (mut c, lex) = lex_with_customs(
@@ -18525,10 +17508,7 @@ mod tests {
         assert!(wd2.occ.is_empty(), "profanity off + no override = no scan");
     }
 
-    /// §6: a graphic-only custom word with ink disabled still scans and shows
-    /// the peeking cat (the emphasis resolve gate is
-    /// `enabled && (ink_enabled || has_custom_specs)` — resolver-level; the
-    /// engine honors `cfg.emphasis` as folded).
+    /// §6: a graphic-only custom word with ink disabled still scans and peeks.
     #[test]
     fn graphic_only_custom_word_with_ink_off_shows_a_cat() {
         let (mut c, lex) = lex_with_customs(
@@ -18616,10 +17596,8 @@ mod tests {
         assert_eq!(wd.occ[0].class, Class::Emphasis);
     }
 
-    /// §3.1 rainbow freeze battery: two ticks past the freeze emit identical
-    /// InkCells and identical fingerprints; `is_active == false` with
-    /// non-empty settled ink; the light-theme twin holds the same contract;
-    /// a done-born rainbow is byte-identical to a naturally-settled one.
+    /// §3.1: past the freeze, ink and fingerprint are identical on both themes,
+    /// `is_active` is false, and a done-born rainbow matches a settled one.
     #[test]
     fn rainbow_freeze_is_byte_stable_on_both_themes_and_done_born() {
         let t0 = Instant::now();
@@ -18684,13 +17662,11 @@ mod tests {
         );
     }
 
-    /// §3.2 roll: decorrelated across appearances (session birth_seq), never
-    /// under chance = 0, always under chance = 100, and the stored decision
-    /// transfers across row alignment.
+    /// §3.2 roll: decorrelated across appearances, never at chance 0, always
+    /// at 100, and transferred by alignment.
     #[test]
     fn supernova_roll_decorrelates_and_transfers_across_alignment() {
-        // Function-level shape: the salted mix over birth sequences hits both
-        // outcomes at 10%.
+        // The salted mix over birth sequences hits both outcomes at 10%.
         let roll_seed = 0xABCD_EF12_3456_7890u64;
         let outcomes: Vec<bool> = (1..=200u64)
             .map(|s| mix(roll_seed ^ s ^ supernova::SUPERNOVA_SALT) % 100 < 10)
@@ -18707,8 +17683,7 @@ mod tests {
         wd.rescan(&term, 6, 20, &lex, &c, 1, t0);
         let id0 = wd.occ[0].ident;
         assert!(wd.persist[&id0].burst_roll, "chance = 100 always escalates");
-        // Redraw the word two rows lower (same column ⇒ same seed): row
-        // alignment moves the episode — and the roll — with it.
+        // Two rows lower, same column: alignment moves the episode and roll.
         term.process(b"\x1b[2J\x1b[3;1Hoh fuck");
         wd.rescan(&term, 6, 20, &lex, &c, 2, t0 + Duration::from_millis(100));
         assert_eq!(wd.occ[0].appeared, t0, "the episode transferred");
@@ -18721,8 +17696,8 @@ mod tests {
         let mut wd0 = WordDecorations::default();
         wd0.rescan(&term, 6, 20, &lex, &c0, 1, t0);
         assert!(!wd0.persist[&wd0.occ[0].ident].burst_roll);
-        // Independence: the same word/column/context born repeatedly (hard
-        // resets keep the session birth_seq) sees both outcomes at 50%.
+        // Repeated births of the same word (hard resets keep `birth_seq`) see
+        // both outcomes at 50%.
         let c50 = cfg_rainbow(50);
         let mut seen = [false; 2];
         for e in 0..30u64 {
@@ -18736,9 +17711,8 @@ mod tests {
         );
     }
 
-    /// §3.2: MAX_ACTIVE_SUPERNOVAE = 1 + the global burst mutex — a second
-    /// rolled supernova and a classic nova both defer while the first
-    /// supernova is granted/live, then grant after its window.
+    /// §3.2: a second supernova and a classic nova defer while the first is
+    /// granted or live, then grant after its window.
     #[test]
     fn supernova_mutex_serializes_bursts() {
         let (table, lex_frag) = custom_table(
@@ -18796,14 +17770,9 @@ mod tests {
         assert!(start_of(&wd, 2).is_some(), "the mutex released the nova");
     }
 
-    /// The burst mutex holds for the supernova's full
-    /// window even while its word is scrolled off mid-blast — the episode
-    /// stays live on grace with `nova_start` set, and `super_prepass` must
-    /// publish `super_until` from the persist-wide busy scan (not only the
-    /// visible-occurrence loop). A visible classic-nova occurrence defers
-    /// for the whole window, and when the word scrolls back on mid-window
-    /// the supernova owns the whole quad channel (the shared `nova_add`
-    /// backstop clamp never binds).
+    /// The burst mutex holds for the supernova's full window even while its
+    /// word is scrolled off (`super_until` comes from the persist-wide scan):
+    /// a visible classic nova defers throughout.
     #[test]
     fn scrolled_off_supernova_window_still_defers_classic_grants() {
         let (table, lex_frag) = custom_table(
@@ -18826,8 +17795,7 @@ mod tests {
         tick_nova(&mut wd, t0, &c, g, None, None);
         let fuck = wd.occ[0].ident;
         assert_eq!(wd.persist[&fuck].nova_start, Some(t0), "supernova granted");
-        // Mid-window the profanity scrolls off and the classic-nova word
-        // appears: the episode survives on grace; the mutex must hold.
+        // Mid-window the word scrolls off; the mutex holds on grace.
         let mut term2 = Terminal::new(8, 20);
         term2.process(b"\r\nboom");
         wd.rescan(&term2, 8, 20, &lexicon, &c, 2, at(300));
@@ -18855,9 +17823,8 @@ mod tests {
             wd.persist[&boom].nova_start.is_none(),
             "still deferred mid-window while scrolled off"
         );
-        // Back on-screen mid-window (shockwave phase): emission resumes with
-        // the whole quad channel to itself — the classic contributed zero
-        // quads, so the shared backstop clamp never binds.
+        // Back on-screen mid-window: the classic contributed nothing, so the
+        // supernova has the whole quad channel.
         let mut term3 = Terminal::new(8, 20);
         term3.process(b"fuck\r\nboom");
         wd.rescan(&term3, 8, 20, &lexicon, &c, 3, at(1500));
@@ -18886,9 +17853,8 @@ mod tests {
         );
     }
 
-    /// §3.2b F-BOMB combo, the headline guarantee: five f-bombs typed inside
-    /// the window make the fifth a certain mushroom cloud — even at a 1%
-    /// configured chance — and the streak decays back to nothing on its own.
+    /// §3.2b: five typed f-bombs make the fifth a certain Nuke even at a 1%
+    /// chance, and the streak decays on its own.
     #[test]
     fn fbomb_combo_five_typed_fucks_go_nuclear_then_decay() {
         let lexicon = lex();
@@ -18897,14 +17863,13 @@ mod tests {
         let at = |ms: u64| t0 + Duration::from_millis(ms);
         let mut wd = WordDecorations::default();
         let mut term = Terminal::new(4, 40);
-        // Keystroke-real typing: every char lands as its own damage rescan,
-        // so each completed word is a live caret completion (the same typed
-        // witness the bonk trusts) and charges the streak.
+        // One rescan per char, so each completed word is a live caret
+        // completion and charges the streak.
         let mut epoch = 1u64;
         for (i, ch) in b"fuck fuck fuck fuck fuck".iter().enumerate() {
             term.process(&[*ch]);
-            // Each char is a committed key, which the typed witness requires
-            // on top of the caret's position.
+            // Each char is a committed key: the typed witness needs it as well
+            // as the caret position.
             wd.note_typed_edit(at(100 * (i as u64 + 1)), None);
             wd.rescan(&term, 4, 40, &lexicon, &c, epoch, at(100 * (i as u64 + 1)));
             epoch += 1;
@@ -18924,12 +17889,10 @@ mod tests {
         // The chance ladder is already certain one level down.
         let ep4 = &wd.persist[&wd.occ[3].ident];
         assert_eq!(ep4.burst_tier, supernova::SuperTier::Nuke,);
-        // 31 s of silence: every entry ages out of COMBO_WINDOW_MS. The next
-        // typed f-bomb starts a fresh streak of one.
+        // 31 s of silence ages every entry out: a fresh streak of one.
         for (i, ch) in b" fuck".iter().enumerate() {
             term.process(&[*ch]);
-            // Each char is a committed key, which the typed witness requires
-            // on top of the caret's position.
+            // A committed key per char.
             wd.note_typed_edit(at(2400 + 31_000 + 100 * (i as u64 + 1)), None);
             wd.rescan(
                 &term,
@@ -18950,10 +17913,7 @@ mod tests {
         );
     }
 
-    /// §3.2b: `cat`ted output — a whole line of f-bombs arriving in one
-    /// damage burst with the caret elsewhere — never feeds the streak. It
-    /// still rolls at the ambient (here: cold) level, so nothing about the
-    /// classic per-appearance behavior changes.
+    /// §3.2b: output f-bombs (caret elsewhere) never charge the streak.
     #[test]
     fn fbomb_combo_output_fucks_do_not_charge() {
         let lexicon = lex();
@@ -18976,9 +17936,7 @@ mod tests {
         }
     }
 
-    /// §3.2b: `hard_reset` cools the streak (the fresh-start contract every
-    /// other transient shares; `birth_seq` alone stays session-scoped). The
-    /// 30-rebirth decorrelation pin above relies on exactly this.
+    /// §3.2b: `hard_reset` cools the streak (`birth_seq` alone survives).
     #[test]
     fn fbomb_combo_cools_on_hard_reset() {
         let lexicon = lex();
@@ -18989,8 +17947,7 @@ mod tests {
         let mut term = Terminal::new(4, 40);
         for (i, ch) in b"fuck fuck".iter().enumerate() {
             term.process(&[*ch]);
-            // Each char is a committed key, which the typed witness requires
-            // on top of the caret's position.
+            // A committed key per char.
             wd.note_typed_edit(at(100 * (i as u64 + 1)), None);
             wd.rescan(
                 &term,
@@ -19007,11 +17964,8 @@ mod tests {
         assert!(wd.combo_births.is_empty(), "a fresh start cools the combo");
     }
 
-    /// §3.2b × §1.1 fix #3: combo heat decays in engine-clock time even
-    /// across a freeze — the ring is deliberately not thaw-shifted (it is
-    /// window-wide while `frozen_at` is pane-scoped; shifting would let one
-    /// pane's freeze resurrect a sibling pane's dead streak). Three f-bombs,
-    /// a 60 s freeze, and the streak is cold on resume.
+    /// §3.2b: combo heat decays in engine-clock time across a freeze (the ring
+    /// is window-wide, `frozen_at` per pane): cold after a 60 s freeze.
     #[test]
     fn fbomb_combo_cools_across_freeze_thaw() {
         let lexicon = lex();
@@ -19023,8 +17977,7 @@ mod tests {
         let mut epoch = 1u64;
         for (i, ch) in b"fuck fuck fuck".iter().enumerate() {
             term.process(&[*ch]);
-            // Each char is a committed key, which the typed witness requires
-            // on top of the caret's position.
+            // A committed key per char.
             wd.note_typed_edit(at(100 * (i as u64 + 1)), None);
             wd.rescan(&term, 4, 40, &lexicon, &c, epoch, at(100 * (i as u64 + 1)));
             epoch += 1;
@@ -19034,8 +17987,7 @@ mod tests {
         wd.thaw(at(62_000));
         for (i, ch) in b" fuck".iter().enumerate() {
             term.process(&[*ch]);
-            // Each char is a committed key, which the typed witness requires
-            // on top of the caret's position.
+            // A committed key per char.
             wd.note_typed_edit(at(62_100 + 100 * (i as u64 + 1)), None);
             wd.rescan(
                 &term,
@@ -19055,10 +18007,7 @@ mod tests {
         );
     }
 
-    /// §3.2b end-to-end: five typed f-bombs, ticked through the serialized
-    /// detonation chain — the fifth's guaranteed Nuke must put actual cloud
-    /// sprites on the free lane during its window (the pure emitters passing
-    /// their own tests proves nothing about the host's emission arm).
+    /// §3.2b: the fifth typed f-bomb's Nuke puts cloud sprites on the free lane.
     #[test]
     fn fbomb_combo_nuke_cloud_reaches_the_free_lane() {
         let lexicon = lex();
@@ -19076,8 +18025,7 @@ mod tests {
         term.process(b"\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n");
         for (i, ch) in b"fuck fuck fuck fuck fuck".iter().enumerate() {
             term.process(&[*ch]);
-            // Each char is a committed key, which the typed witness requires
-            // on top of the caret's position.
+            // A committed key per char.
             wd.note_typed_edit(at(60 * (i as u64 + 1)), None);
             wd.rescan(
                 &term,
@@ -19091,9 +18039,7 @@ mod tests {
         }
         let ep5 = &wd.persist[&wd.occ[4].ident];
         assert_eq!(ep5.burst_tier, supernova::SuperTier::Nuke);
-        // Tick the whole chain at 100 ms cadence; the free lane must carry
-        // cloud sprites at some point (feline is absent, so any free sprite
-        // in a nuke window is the cloud).
+        // With no feline words, any free sprite in a nuke window is the cloud.
         let mut cloud_frames = 0u32;
         for ms in (1500..20_000).step_by(100) {
             let (.., fr, _) = tick_nova(&mut wd, at(ms), &c, g, None, None);
@@ -19108,11 +18054,8 @@ mod tests {
         );
     }
 
-    /// §3.2b tier-aware occupancy: the prepass books the mutex for the tier's
-    /// window, not a flat `SUPER_TOTAL_MS`. A Nuke's episode stays live (and
-    /// defers classic grants) through its full 3600 ms cloud, so the next
-    /// grant cannot overlap the cap/stem fade. A Flash keeps the classic
-    /// 2400 ms occupancy (upward-only floor).
+    /// §3.2b: a Nuke holds the mutex (deferring classic grants) for its full
+    /// 3600 ms cloud; a Flash keeps the classic 2400 ms.
     #[test]
     fn nuke_window_holds_the_mutex_for_its_full_cloud() {
         let (table, lex_frag) = custom_table(
@@ -19134,8 +18077,7 @@ mod tests {
         wd.rescan(&term, 8, 20, &lexicon, &c, 1, t0);
         let fuck = wd.occ[0].ident;
         let boom = wd.occ[1].ident;
-        // Force the jackpot regardless of this draw's decode: the window
-        // must follow the stored tier.
+        // Force the tier: the window must follow the stored tier.
         {
             let ep = wd.persist.get_mut(&fuck).expect("fresh episode");
             ep.burst_roll = true;
@@ -19178,10 +18120,8 @@ mod tests {
             "the classic grant lands after the cloud"
         );
 
-        // The mirror case: only the Nuke extends occupancy. A Flash keeps the
-        // classic 2400 ms window (the emitter has no short Flash arc — see
-        // the prepass comment), so it must free the mutex right where the
-        // classic supernova does, not squat to NUKE_TOTAL_MS.
+        // Only the Nuke extends occupancy: a Flash frees the mutex at the
+        // classic 2400 ms.
         let mut term = Terminal::new(8, 20);
         term.process(b"fuck\r\nboom");
         let mut wd = WordDecorations::default();
@@ -19218,10 +18158,8 @@ mod tests {
         );
     }
 
-    /// The live burst windows, window-wide — the bound pane's episodes and every
-    /// parked shard's — projected onto `SupernovaBurstMutex`'s variables through
-    /// the engine's own mutex predicate (`burst_mutex_end`). A window that ended
-    /// by `now` is retired.
+    /// The live burst windows of the bound pane and every parked shard,
+    /// projected onto `SupernovaBurstMutex` through `burst_mutex_end`.
     fn burst_mutex_projection(
         wd: &WordDecorations,
         now: Instant,
@@ -19249,12 +18187,9 @@ mod tests {
         .collect()
     }
 
-    /// Tier-1 bind of `aterm_spec::derive::supernova_burst_mutex_model()`: drive
-    /// the real `super_prepass`/`nova_prepass` grants across a bound pane and a
-    /// parked one, and check every grant the engine made against the model's
-    /// `action_enabled` at the state it was made in (retirements first, then
-    /// supernova grants, then classic ones — the engine's own pass order), and
-    /// every observed state against the model's invariants.
+    /// Tier-1 binding for `SupernovaBurstMutex`: every real grant across a bound
+    /// and a parked pane is enabled in the model at its state (engine pass
+    /// order), and every state satisfies the invariants.
     #[test]
     fn real_burst_grants_conform_to_the_supernova_mutex_model() {
         let model = aterm_spec::derive::supernova_burst_mutex_model();
@@ -19303,8 +18238,7 @@ mod tests {
         let t0 = Instant::now();
         let at = |ms: u64| t0 + Duration::from_millis(ms);
 
-        // Pane 1: two supernova words and a classic one. Only one supernova may
-        // hold the mutex, and the classic defers behind it.
+        // Pane 1: two supernova words and a classic one; one supernova holds.
         let mut wd = WordDecorations::default();
         wd.bind_pane(1, (0, 0));
         let mut term_a = Terminal::new(8, 20);
@@ -19338,8 +18272,7 @@ mod tests {
             "both of pane 2's grants defer"
         );
 
-        // The parked window ends: pane 2's supernova takes the mutex, its classic
-        // still waits (super_prepass runs first).
+        // The parked window ends: pane 2's supernova takes the mutex first.
         let t1 = first_end + Duration::from_millis(100);
         let s = check(&mut wd, t1, &c, g, "pane 2 after the parked window");
         assert_eq!(
@@ -19358,8 +18291,8 @@ mod tests {
             "the mutex released the nova"
         );
 
-        // Negative control: the grant shapes the engine must never make are
-        // shapes the model rejects, so the checks above are not vacuous.
+        // Negative control: the forbidden grant shapes are ones the model
+        // rejects.
         let state = |supers: i64, classics: i64| {
             [
                 ("supers", supers),
@@ -19383,8 +18316,7 @@ mod tests {
         );
     }
 
-    /// §3.2 selection × wash: full-width detonation wash rows are split
-    /// around the selected span (never washed over, never wholesale-deleted).
+    /// §3.2: wash rows split around the selected span.
     #[test]
     fn supernova_wash_splits_around_selection() {
         let lex = lex();
@@ -19415,8 +18347,7 @@ mod tests {
             Some(sv),
         );
         assert!(!q.is_empty(), "mid-detonation wash present");
-        // Wash pieces on the selected row (crown motes are narrow; wash
-        // remainders span many cells): split into left + right, ≤ 3 per row.
+        // Wash pieces on the selected row split into left + right, ≤ 3 per row.
         let wash1: Vec<&GlowQuad> = q
             .iter()
             .filter(|x| x.row == 1 && i32::from(x.w) > 4 * 10)
@@ -19438,11 +18369,8 @@ mod tests {
                 "no quad overlaps the selected px span [80, 120): {x:?}"
             );
         }
-        // Tier-1 composition binding for the readability ceiling: splitting
-        // duplicates a wash quad's color into disjoint left/right geometry, so
-        // a naive per-row byte sum grows even though no pixel sees both pieces.
-        // Project the real post-split stream by row + x + y and prove the renderer
-        // can never accumulate more than the pure emitter's hard channel cap.
+        // Splitting duplicates a wash color into disjoint pieces, so check per
+        // pixel that the post-split stream never exceeds the emitter's cap.
         for row in 0..g.rows {
             for px in 0..u32::from(g.cols) * u32::from(g.cell_w) {
                 let y0 = u32::from(row) * u32::from(g.cell_h);
@@ -19469,8 +18397,7 @@ mod tests {
         }
     }
 
-    /// §3.2: reduced_motion suppresses the supernova outright (static rainbow
-    /// only, no grant, no quads).
+    /// §3.2: `reduced_motion` suppresses the supernova (static rainbow only).
     #[test]
     fn supernova_suppressed_under_reduced_motion() {
         let lex = lex();
@@ -19496,11 +18423,8 @@ mod tests {
 
     // ──────────── one-shot × reduced-motion regression battery ────────────
 
-    /// One-shot × reduced motion: native hosts demote unfocused
-    /// windows to `reduced_motion` (the W11b motion fold), so a completed
-    /// one-shot must not resurrect as a static sprite on focus loss — cat,
-    /// paw, nova ember, and sparkle residual alike — and must stay gone on
-    /// refocus.
+    /// A completed one-shot (cat, paw, nova ember, sparkle residual) does not
+    /// resurrect under `reduced_motion` (unfocused demotion) or on refocus.
     #[test]
     fn full_play_then_reduce_resurrects_nothing() {
         let lex = lex();
@@ -19512,8 +18436,7 @@ mod tests {
             r.reduced_motion = true;
             r
         };
-        // Cat: play the peek to Done, then reduce — zero sprites forever.
-        // Row 2 so the two-band peeking head has its eye row (r−2) on-screen.
+        // Cat (row 2, head on-screen): play to Done, then reduce: no sprites.
         let c = cfg();
         let mut cat_term = Terminal::new(4, 20);
         cat_term.process(b"\r\n\r\na happy kitty naps");
@@ -19536,8 +18459,7 @@ mod tests {
             "…and stays gone on refocus"
         );
 
-        // Paw (`style = "paw"`): the paw style draws no graphic at all (ink
-        // still plays elsewhere), so the feline output is empty at every phase.
+        // Paw style draws no graphic, so the feline output is always empty.
         let mut c_paw = cfg();
         c_paw.feline_style = FelineStyle::Paw;
         let mut wd = WordDecorations::default();
@@ -19551,8 +18473,7 @@ mod tests {
         let (_, out, _) = tick_cat_at(&mut wd, at(4_050), &reduce(&c_paw), g, None, true);
         assert!(out.is_empty(), "reduced motion resurrects nothing");
 
-        // Nova ember: window + ≤ 2 s ember fade complete, then reduce — the
-        // static glint must not come back.
+        // Nova ember: after the window and fade, reduce: no static glint.
         let c_nova = cfg_nova();
         let mut term = Terminal::new(2, 20);
         term.process(b"oh fuck");
@@ -19604,11 +18525,8 @@ mod tests {
         assert!(out.is_empty(), "no static-spark resurrection: {out:?}");
     }
 
-    /// A word born in an unfocused
-    /// window under `reduced_motion` (the W11b demotion) shows the static
-    /// pose immediately — the phase clock latched at birth — logs exactly
-    /// once, and its clock elapses by wall time, so an un-reduce/refocus
-    /// past the peek window replays no entrance.
+    /// A word born unfocused under `reduced_motion` shows the static pose at
+    /// once, logs once, and replays no entrance after the peek window.
     #[test]
     fn born_unfocused_reduced_shows_static_pose_and_never_replays() {
         let lex = lex();
@@ -19633,8 +18551,7 @@ mod tests {
         assert_eq!(fr1, fr2, "the pose persists while reduced");
         assert_eq!(out1, out2);
         assert_eq!(wd.drain_kitty_sightings().count(), 0, "exactly once");
-        // Un-reduce + refocus far past every reachable peek total: the clock
-        // elapsed by wall time — no entrance replay, the one-shot is spent.
+        // Un-reduce and refocus past every peek total: no replay.
         let c_full = cfg();
         let (fr, _, _) = tick_cat_at(&mut wd, at(60_000), &c_full, g, None, true);
         assert!(
@@ -19658,10 +18575,7 @@ mod tests {
         assert_eq!(wd.drain_kitty_sightings().count(), 0);
     }
 
-    /// The pet's word-cat bat: a peek that actually lands records
-    /// exactly one positioned cue — the sighting's once-per-episode edge,
-    /// with the dest rect the sighting deliberately does not carry — and
-    /// later frames of the same episode record nothing.
+    /// A landed peek records exactly one positioned cue; later frames none.
     #[test]
     fn a_peek_landing_records_one_positioned_cue() {
         let lex = lex();
@@ -19696,10 +18610,8 @@ mod tests {
         );
     }
 
-    /// Accessibility preserved: a pure OS-reduce-motion user with a
-    /// focused window still gets the static pose immediately (the clock
-    /// latched at birth), it logs exactly once, and the flags never
-    /// advance — the pose persists indefinitely, byte-stable.
+    /// A focused reduce-motion user gets the static pose at once, logged once,
+    /// byte-stable.
     #[test]
     fn reduced_from_birth_focused_shows_static_pose_and_logs_once() {
         let lex = lex();
@@ -19727,12 +18639,8 @@ mod tests {
         assert!(!wd.is_active(at(60_000)), "static = zero wakes");
     }
 
-    /// Deliberate deviation (pinned): un-reducing
-    /// after a static showing marks the peek done. The phase clock latched
-    /// at birth (the static pose is this episode's showing); once the
-    /// never-animated peek window has elapsed, the first
-    /// `reduced_motion = false` tick latches `peek_done` — zero free
-    /// sprites, no entrance replay, zero wakes.
+    /// Un-reducing after a static showing, past the peek window, marks the
+    /// peek done: no entrance replay.
     #[test]
     fn un_reduce_after_static_showing_marks_the_peek_done() {
         let lex = lex();
@@ -19746,8 +18654,7 @@ mod tests {
         term.process(b"\r\n\r\na happy kitty naps");
         let mut wd = WordDecorations::default();
         wd.rescan(&term, 4, 20, &lex, &c_red, 1, t0);
-        // Focused reduced tick: the static pose shows (the phase clock
-        // latched at birth).
+        // Focused reduced tick: the static pose shows.
         let (fr, out, _) = tick_cat_at(&mut wd, t0, &c_red, g, None, true);
         assert!(
             !fr.is_empty() || !out.is_empty(),
@@ -19767,9 +18674,7 @@ mod tests {
             !wd.persist[&cat].peek_done,
             "flags hold while reduced (the pose persists)"
         );
-        // Un-reduce far past every reachable peek_total: the first
-        // non-reduced tick spends the one-shot instead of replaying the
-        // entrance, since the static showing was the showing.
+        // Un-reduce past every peek total: the first tick spends the one-shot.
         let (fr, _, _) = tick_cat_at(&mut wd, at(60_000), &c, g, None, true);
         assert!(
             fr.is_empty(),
@@ -19785,10 +18690,8 @@ mod tests {
         assert!(fr.is_empty(), "the peek stays spent (done forever)");
     }
 
-    /// Frozen-state kill: an introspection capture during a
-    /// `perf_reduced` freeze must not rescan (grace-expiring and done-marking
-    /// every episode against the suspended clock) or tick the frozen engine —
-    /// episodes survive byte-for-byte and resume in place after thaw.
+    /// A capture during a freeze neither rescans nor ticks: episodes survive
+    /// byte for byte and resume after thaw.
     #[test]
     fn capture_during_freeze_preserves_episodes_byte_for_byte() {
         let lex = lex();
@@ -19825,15 +18728,11 @@ mod tests {
         };
         let before = snap(&wd);
         assert!(!before.is_empty(), "the fixture built episodes");
-        // The ledger before the freeze: the first present started the peek,
-        // and a started one-shot is stamped in place (`stamp_spent_marks`).
-        // The frozen rescan must add nothing (no grace expiry or departure
-        // mark against a suspended clock).
+        // The marks before the freeze; the frozen rescan must add none.
         let marks_before: std::collections::BTreeSet<u64> =
             wd.done_marks.index.keys().copied().collect();
         wd.freeze(at(100));
-        // A capture-driven rescan 20 s into the freeze (> GRACE_TTL), against
-        // a BLANK grid: both entry points must no-op.
+        // A capture rescan 20 s into the freeze, on a blank grid: a no-op.
         let mut blank = Terminal::new(4, 20);
         wd.rescan(&blank, 4, 20, &lex, &c, 2, at(20_000));
         assert!(wd.needs_rescan(2), "the pending rescan stays pending");
@@ -19868,8 +18767,7 @@ mod tests {
             "frozen tick no-ops"
         );
         assert_eq!(snap(&wd), before);
-        // Thaw + the deferred rescan: the peek resumes ~100 ms in (shifted
-        // clocks) — neither Done nor born-done.
+        // Thaw and rescan: the peek resumes ~100 ms in.
         wd.thaw(at(20_000));
         wd.rescan(&term, 4, 20, &lex, &c, 2, at(20_000));
         assert!(!wd.needs_rescan(2));
@@ -19884,9 +18782,8 @@ mod tests {
         assert!(!wd.persist[&cat.ident].peek_done && !cat.inert);
     }
 
-    /// Two-way burst mutex: a supernova must not ignite while a
-    /// classic nova window is live — combined `nova_add` would exceed the
-    /// 1536 budget — and grants only after the classic window ends.
+    /// Two-way burst mutex: a live classic nova defers the supernova grant
+    /// until its window ends.
     #[test]
     fn live_classic_nova_defers_the_supernova_grant() {
         let (table, lex_frag) = custom_table(
@@ -19938,13 +18835,8 @@ mod tests {
         );
     }
 
-    /// Eclipse veil × selection: the light-theme detonation's Over-blend Shade
-    /// stamps are dropped over selected cells — the renderer selection freeze
-    /// covers only the Add stream, so without the host-side filter a
-    /// mid-eclipse selection would be washed over by the veil. The filter must
-    /// key on the blend, not the Shade glyph: the light-theme charge motes and
-    /// rainbow debris are Over decos too, so a debris-phase frame must punch
-    /// through a selection identically.
+    /// The eclipse veil and every other Over-blend supernova deco drop over
+    /// selected cells (the renderer freezes only the Add stream).
     #[test]
     fn selection_mid_eclipse_punches_through_the_veil() {
         let lex = lex();
@@ -19990,10 +18882,8 @@ mod tests {
             shade.iter().any(|d| d.row == 1),
             "the selected ROW keeps its unselected veil cells (punch-through, not row deletion)"
         );
-        // BLEND-keyed regression: a light-theme DEBRIS-phase frame (t = 1800 ms
-        // — Over-blend Dot/Star4 motes, no Shade in sight). Discover where a
-        // mote lands without a selection, select that cell, and re-present:
-        // the blend-keyed filter must drop it; a Shade-keyed one would not.
+        // A debris-phase frame (Over-blend motes, no Shade): the filter keys on
+        // the blend, so a selected mote cell drops.
         let td = t0 + Duration::from_millis(1800);
         let (_, out_free, ..) = tick_nova(&mut wd, td, &c, g, None, None);
         let mote = out_free
@@ -20019,10 +18909,8 @@ mod tests {
         );
     }
 
-    /// `chance_pct` beyond SuperNova: the birth roll gates every
-    /// burst kind — a starburst at chance = 0 never fires (no quads, no
-    /// residual, no reduced-motion spark, zero wakes); chance = 100 always
-    /// fires (the class-default posture).
+    /// `chance_pct` gates every burst kind: a starburst at 0 never fires, at
+    /// 100 always does.
     #[test]
     fn burst_chance_pct_gates_starburst_rolls() {
         let t0 = Instant::now();
@@ -20064,10 +18952,8 @@ mod tests {
         assert!(!out.is_empty(), "chance = 100 always fires");
     }
 
-    /// Theme branch without ink: `[sparkle_words.ink]
-    /// enabled = false` must not send a light-theme supernova down the
-    /// (invisible-on-white) dark additive-wash path — the lead-cell bg is
-    /// captured for every occurrence, so the eclipse branch still fires.
+    /// With ink disabled, a light-theme supernova still takes the eclipse
+    /// branch (the lead-cell bg is captured for every occurrence).
     #[test]
     fn ink_disabled_light_bg_still_takes_the_eclipse_branch() {
         let lex = lex();
@@ -20091,8 +18977,7 @@ mod tests {
             "…but the lead-cell bg is still captured for the theme branch"
         );
         tick_nova(&mut wd, t0, &c, g, None, None); // grant at t0
-        // Mid-detonation: the light-theme eclipse (Over-blend veil), not the
-        // dark wash.
+        // Mid-detonation: the light-theme eclipse, not the dark wash.
         let (q, out, ..) = tick_nova(&mut wd, t0 + Duration::from_millis(500), &c, g, None, None);
         let veil = out
             .iter()
@@ -20106,19 +18991,16 @@ mod tests {
         assert_eq!(wash, 0, "no full-viewport additive wash on a light bg");
     }
 
-    /// §3.1 span clamp: `span_used = min(span_deg,
-    /// 100°·(lead_cells − 1))` — the full 300° across 4 leads, a 100°
-    /// two-step on 2 leads, and the 1-lead word rides the temporal drift
-    /// then freezes at exactly its t = 0 (genome base hue) bytes.
+    /// §3.1 span clamp: 300° across 4 leads, a 100° two-step on 2, and a 1-lead
+    /// word that drifts then freezes at its t = 0 bytes.
     #[test]
     fn rainbow_span_clamps_to_lead_cells() {
         let t0 = Instant::now();
         let c = cfg_rainbow(0);
         let fg = [220u8, 220, 220];
         let strength = c.ink_strength;
-        // A gkey whose guard never binds at full strength on black for any
-        // of the three spans (all four u samples clear MIN_INK_CONTRAST), so
-        // the expected bytes are the raw formula.
+        // A gkey whose guard never binds on black, so the bytes are the raw
+        // formula.
         let clears = |gkey: u64, span: f32| {
             [0.0f32, 1.0 / 3.0, 2.0 / 3.0, 1.0].iter().all(|u| {
                 let h = hsv2rgb(
@@ -20184,8 +19066,7 @@ mod tests {
             expect(100.0, 2),
             "2 leads take the readable 100° two-step"
         );
-        // 1 lead: span_used = 0 — the cell drifts over time, then freezes at
-        // exactly the t = 0 (genome base hue) bytes.
+        // 1 lead: no span; the cell drifts, then freezes at its t = 0 bytes.
         let mut wd = build(1);
         let (_, _, ink0, _, _) = tick_nova(&mut wd, t0, &c, geom20(), None, None);
         assert_eq!(
@@ -20210,11 +19091,8 @@ mod tests {
         assert!(!wd.is_active(settle), "settled = idle");
     }
 
-    /// §3.1 legibility guard: the rainbow guard
-    /// samples u ∈ {0, ⅓, ⅔, 1} — a single mid-gradient sample is blind to
-    /// endpoint washout, so this pins a case where u = 0.5 clears at full
-    /// strength while another sample fails, and asserts every emitted cell
-    /// still clears [`MIN_INK_CONTRAST`] (the guard pulled).
+    /// §3.1: the rainbow guard samples four points, so a word whose mid sample
+    /// passes while an endpoint fails is still pulled to [`MIN_INK_CONTRAST`].
     #[test]
     fn rainbow_guard_samples_four_points_not_just_mid() {
         let t0 = Instant::now();
@@ -20231,8 +19109,7 @@ mod tests {
             );
             contrast_ratio(mix_rgb(rgb3_to_u32(fg), h, strength), bg32)
         };
-        // The mid-only blindness witness: full-strength mid passes, some
-        // 4-sample point fails.
+        // A gkey whose mid sample passes at full strength while another fails.
         let gkey = (0..10_000u64)
             .find(|g| {
                 sample(*g, 0.5) >= MIN_INK_CONTRAST
@@ -20259,17 +19136,14 @@ mod tests {
         let settle = t0 + Duration::from_millis(2_600);
         let (_, _, ink, _, _) = tick_nova(&mut wd, settle, &c, geom20(), None, None);
         assert_eq!(ink.len(), 4);
-        // The 4 emitted lead cells sit exactly at the guard's sample points
-        // (u ∈ {0, ⅓, ⅔, 1}): every one must clear the bound.
+        // The 4 lead cells sit at the guard's sample points; each clears.
         for cell in &ink {
             assert!(
                 contrast_ratio(rgb3_to_u32(cell.color), bg32) >= MIN_INK_CONTRAST,
                 "guarded cell washes out: {cell:?}"
             );
         }
-        // And the guard genuinely pulled — the failing sample's raw
-        // full-strength bytes were not emitted (a mid-only guard would have
-        // left them).
+        // The guard pulled: the failing sample's raw bytes were not emitted.
         let denom = 3.0f32;
         let raw: Vec<[u8; 3]> = (0..4u16)
             .map(|i| {
@@ -20292,10 +19166,8 @@ mod tests {
         );
     }
 
-    /// The kitty cursor ([`WordDecorations::kitty_cursor`]) bakes the sprite into
-    /// the shared free atlas and stamps the companion just ahead of the cursor
-    /// cell, vertically centred on its row. Shipping emission is exactly the
-    /// body sprite—no auxiliary decoration sprites. Deterministic + headless.
+    /// [`WordDecorations::kitty_cursor`] emits exactly its body sprite, just
+    /// ahead of the cursor cell and centred on its row.
     #[test]
     fn kitty_emits_only_its_body_in_front_of_the_cursor() {
         let g = geom20(); // 10×20 cells, 6×20 grid.
@@ -20342,8 +19214,8 @@ mod tests {
         assert_eq!(s.aw, s.w, "NEAREST 1:1 width");
         assert_eq!(s.ah, s.h, "NEAREST 1:1 height");
         assert!(s.w > 0 && s.h > 0);
-        // In front with a clear gap: the sprite's left edge sits past the cursor
-        // cell's right edge (col 6 starts at x=60), within a cell of it.
+        // The sprite's left edge is past the cursor cell's right edge (x=60),
+        // within a cell of it.
         let cursor_right = 6 * i32::from(g.cell_w);
         let old_v056_x = cursor_right + i32::from(g.cell_w) / 4;
         assert_eq!(
@@ -20383,14 +19255,8 @@ mod tests {
         assert!(none.is_empty());
     }
 
-    /// Singing notes stream from the cat: with a non-zero sing drive the
-    /// ♪/♫ sprites emit beside the body — ring-capped at `MAX_NOTES` even
-    /// under a hostile full ring, rainbow-tinted through the `tint` channel
-    /// over one white-baked tile per kind, and alpha-scaled by the drive so
-    /// the wind-down crossfade eases the stream out. (User-sprite path: one
-    /// body bake leaves budget for the note tile in the same frame; on the
-    /// built-in path the shared two-bake budget can defer a second note kind
-    /// by one frame.)
+    /// With a sing drive, ♪/♫ sprites emit beside the body, capped at
+    /// `MAX_NOTES`, rainbow-tinted over white tiles, alpha-scaled by the drive.
     #[test]
     fn singing_notes_stream_ring_capped_tinted_and_drive_scaled() {
         use crate::kitty_sing::{MAX_NOTES, NOTE_TINTS, NoteKind, NoteSprite};
@@ -20461,17 +19327,9 @@ mod tests {
         assert_eq!(plain.len(), 1, "no note work at rest — just the body");
     }
 
-    /// Age changes the cursor cat through uniform pixel dimensions, not a
-    /// redundant non-visual cache discriminator. At this tiny metric Kitten and
-    /// Adolescent round to the same exact box, so the second presentation must
-    /// hit the existing atlas tile.
-    ///
-    /// The metric is chosen for the shipping
-    /// [`WordDecorations::COMPANION_CELL_H`]: at `cell_h = 4` the 0.82 and 0.93
-    /// age scales both round to 6 px, while Elder (1.15) rounds to 8 — so the
-    /// alias below is a real rounding collision, not "this fixture cannot tell
-    /// ages apart at all". The Elder probe asserts exactly that, keeping the
-    /// test from rotting into a vacuous pass if the constant moves again.
+    /// Age is a pixel dimension, not a cache key: at `cell_h = 4` Kitten and
+    /// Adolescent round to one box (6 px) and share a tile, while Elder (8 px)
+    /// does not.
     #[test]
     fn cursor_age_rounding_alias_reuses_the_exact_size_bake() {
         let geom = EffectGeom {
@@ -20513,8 +19371,7 @@ mod tests {
             after_kitten,
             "dimensionally identical ages must be a cache hit"
         );
-        // Non-vacuity: the age axis really does resize this fixture — the
-        // assertion above is a rounding collision, not a dead axis.
+        // Non-vacuity: Elder really is a different size here.
         let elder = emit(&mut wd, CatAge::Elder);
         assert_ne!(
             (elder.w, elder.h),
@@ -20523,19 +19380,15 @@ mod tests {
         );
     }
 
-    /// The escort is enlarged: its drawn height stays above a numeric floor
-    /// (above the former 1.45 factor) and within the baker's `2·cell_h` slot at
-    /// every age, the two halves of [`WordDecorations::COMPANION_CELL_H`]'s
-    /// rationale. The ceiling keeps a future bump from clamping the age axis
-    /// flat.
+    /// The escort's drawn height stays above a floor and within the `2·cell_h`
+    /// slot at every age (see [`WordDecorations::COMPANION_CELL_H`]).
     #[test]
     fn the_cursor_escort_really_grew_and_still_fits_its_slot() {
         let g = geom20(); // cell_h = 20 ⇒ the slot is 40 px.
         let mut wd = WordDecorations::default();
         let emit = |wd: &mut WordDecorations, age| {
-            // One emission per frame: the atlas admits two bakes per frame and
-            // each age is its own tile, so without the per-frame prologue the
-            // later ages would silently fail to bake and read as 0 px.
+            // One emission per frame: each age is its own tile, and the atlas
+            // admits two bakes per frame.
             wd.cat_baker_ready = false;
             let mut sprites = Vec::new();
             wd.kitty_cursor(
@@ -20558,8 +19411,7 @@ mod tests {
             assert_eq!(sprites.len(), 1, "the escort drew");
             sprites[0].h
         };
-        // A 1.45 factor would put the Adult escort at 1.45·1.04 = 1.508 cells
-        // (30 px here); the floor is above that.
+        // The floor sits above 1.45·1.04 = 1.508 cells (30 px here).
         let adult = emit(&mut wd, CatAge::Adult);
         assert!(
             i32::from(adult) >= 34,
@@ -20587,21 +19439,15 @@ mod tests {
         );
     }
 
-    /// The maneki's raised paw, read from the generated table (the runtime's
-    /// source of truth, not the asset TOML), took one transform about one
-    /// origin across the layers that draw it, so the `outline` keyline still
-    /// contains the `coat` fill it traces. A keyline peeled off the fill is a
-    /// coat sub-path escaping its outline sub-path, so containment is pinned.
-    /// The paw is also enlarged and not flattened against the viewbox edge
-    /// where the codegen clamps.
+    /// The maneki's raised paw (from the generated table) is enlarged, not
+    /// clamped flat, and its `outline` keyline still contains its `coat` fill.
     #[test]
     fn the_maneki_raised_paw_grew_with_its_keyline_intact() {
         use crate::cat_glyphs_gen::{CatGlyphId, GLYPHS, GlyphRole};
         use aterm_scene::vector::PathSeg;
 
         let glyph = &GLYPHS[CatGlyphId::SpecManeki as usize];
-        // Sub-path index 2 of `outline`/`coat` is the raised arm (0 = head,
-        // 1 = body, 3 = the seated cat's lower foot).
+        // Sub-path 2 of `outline`/`coat` is the raised arm.
         let arm = |role: GlyphRole| -> (u16, u16, u16, u16) {
             let layer = glyph
                 .layers
@@ -20640,10 +19486,7 @@ mod tests {
              {outline:?} vs coat {coat:?}"
         );
 
-        // BIGGER: the authored arm spanned 40/150 of the viewbox width and
-        // 88/170 of its height before the 1.5x; normalized coordinates are
-        // `v / extent` in `u16` fixed point, so the post-scale spans must clear
-        // those by a wide margin.
+        // Enlarged: the unscaled arm spanned 40/150 × 88/170 of the viewbox.
         let one = f64::from(aterm_scene::vector::FIXED_ONE);
         let w_span = f64::from(outline.2 - outline.0) / one;
         let h_span = f64::from(outline.3 - outline.1) / one;
@@ -20652,15 +19495,12 @@ mod tests {
             "the raised paw must be visibly larger: spans {w_span:.3} x {h_span:.3}"
         );
 
-        // Not clamped: the codegen pins anything outside the viewbox to the
-        // edge, which would flatten the paw against it. A sub-path that
-        // actually touches `FIXED_ONE` on the right is the signature.
+        // Not clamped: the codegen pins out-of-viewbox points to the edge.
         assert!(
             outline.2 < aterm_scene::vector::FIXED_ONE,
             "the paw must fit inside the (widened) viewbox, not be clamped flat"
         );
-        // And the whiskers must paint before the paw's pink pads, or those
-        // hairlines bisect the pad at the enlarged size.
+        // Whiskers paint before the paw pads, or they bisect the pads.
         let role_at = |role: GlyphRole| {
             glyph
                 .layers
@@ -20676,19 +19516,8 @@ mod tests {
 
     // ───────── one cat per animal word, centred on the word ─────────
 
-    /// One typed animal word, one cat, sitting on the word's centre (owner,
-    /// 2026-08-12).
-    ///
-    /// * Exactly one sprite: `push_cat_free` emits one per cat, so a second
-    ///   head can only come from a second emitter.
-    /// * Its authored visual centre is on the word span's midpoint, checked
-    ///   for an odd word (`cat`, 3 cells) and an even one (`cats`, 4): an even
-    ///   span's midpoint falls on a cell boundary and an odd one's mid-cell,
-    ///   so a ±½-cell error in the span arithmetic shows on one of them.
-    ///
-    /// Sampled under reduced motion, where the settled pose is byte-exact. The
-    /// full-motion arm asserts the same centre within one pixel, the bound of
-    /// the `CatIdlePose::breathing` sway.
+    /// One typed animal word grows exactly one cat, its authored centre on the
+    /// span midpoint for an odd (`cat`) and an even (`cats`) word.
     #[test]
     fn one_typed_animal_word_grows_exactly_one_cat_centred_on_its_span() {
         let lex = lex();
@@ -20700,9 +19529,8 @@ mod tests {
         let cw = i32::from(g.cell_w);
         let at = Instant::now() + Duration::from_millis(DWELL_QUIET_MS);
 
-        // One cat per word, its authored centre on the span midpoint, and the
-        // sprite entirely off both viewport edges (a clamped head would satisfy
-        // the centre check by accident at a margin column).
+        // One cat, centred on the span, clear of both viewport edges (a clamped
+        // head could pass the centre check by accident).
         let measure = |word: &str, cfg: &DecoConfig, slack: i32| {
             let t0 = Instant::now();
             let mut term = Terminal::new(g.rows, g.cols);
@@ -20729,9 +19557,7 @@ mod tests {
                  clamp is standing in for the centring law: {cat:?}"
             );
 
-            // The span midpoint from first principles: the left edge of the
-            // word's first cell and the right edge of its last, deliberately
-            // not `cat_geometry_for`'s own expression.
+            // The span midpoint from first principles, not `cat_geometry_for`.
             let mid = (i32::from(occ.start_col) + i32::from(occ.end_col) + 1) * cw / 2;
             let variant = special_variant_v4(occ.genome.magic)
                 .unwrap_or_else(|| cat_variant_v4(occ.genome.gkey));
@@ -20750,33 +19576,20 @@ mod tests {
         for word in ["cat", "cats"] {
             // Reduced motion: the settled pose, so the anchor is byte-exact.
             measure(word, &still, 0);
-            // Full motion: the same anchor plus the idle sway, whose amplitude
-            // is `clamp(0.06·cell_h, 1, 2) · 0.8` — under 1 px at this cell.
+            // Full motion: the idle sway is under 1 px at this cell.
             measure(word, &c, 1);
         }
     }
 
-    /// Where the maneki's enlarged paw can be seen.
-    ///
-    /// * Not on the floor: [`KittyLook::for_launch`] decodes `variant` through
-    ///   [`crate::genome::cat_variant_v4`], which indexes `HEADS`, and
-    ///   `SpecManeki` is not in it, so a user who never pins a favourite never
-    ///   wears the Lucky Bean.
-    /// * In the discovery lane: an ambient word-cat resolves its variant as
-    ///   `special_variant_v4(magic).unwrap_or(head)`, so the maneki appears
-    ///   (1/512 of feline sightings), is logged with that variant, and a
-    ///   collected one can be pinned as the favourite, which the cursor
-    ///   companion then wears.
-    ///
-    /// This pins that path end to end: a look carrying `SpecManeki` survives
-    /// `normalized()`, and [`authored_cat_size`], the one sizing law for every
-    /// cat on glass, fits it by the maneki's own widened aspect.
+    /// The maneki is off the launch roster (`cat_variant_v4` indexes `HEADS`)
+    /// but on the discovery path: a `SpecManeki` look survives `normalized()`
+    /// and [`authored_cat_size`] fits it by its own widened aspect.
     #[test]
     fn the_enlarged_maneki_is_off_the_launch_roster_but_on_the_discovery_path() {
         use crate::cat_glyphs_gen::{CatGlyphId, GLYPHS, HEADS};
         use crate::genome::CatAge;
 
-        // ── the skeptic's half: never rolled by the launch floor ────────────
+        // ── never rolled by the launch floor ────────────────────────────────
         assert!(
             !HEADS.contains(&CatGlyphId::SpecManeki),
             "PRECONDITION: the maneki is a SPECIAL, not a head"
@@ -20795,8 +19608,7 @@ mod tests {
         // ── the other half: a collected maneki reaches the companion ────────
         let maneki = KittyLook {
             variant: CatGlyphId::SpecManeki,
-            // Specials wear no accessory; `normalized` enforces it, and asking
-            // for one here proves the clamp does not also drop the special.
+            // Specials wear no accessory: `normalized` drops it, not the special.
             accessory: Some(CatGlyphId::AccBow),
             coat: 3,
             iris: 5,
@@ -20810,19 +19622,13 @@ mod tests {
         );
 
         // ── and the widened art is what the emitter sizes by ────────────────
-        // The paw is scaled 1.5x about the shoulder and the viewbox is 166
-        // wide, giving an authored aspect of 976. The aspect is the sprite
-        // geometry's only handle on the art, so it witnesses that the enlarged
-        // drawing reaches glass.
+        // The paw scaled 1.5x in a 166-wide viewbox gives aspect 976.
         let aspect = GLYPHS[CatGlyphId::SpecManeki as usize].aspect_x1000;
         assert_eq!(
             aspect, 976,
             "the maneki's authored aspect must carry the widened paw"
         );
-        // A HEAD is a wide crop (every one of them is taller-than-tall in the
-        // other direction, aspect ≥ 1145); a full-cat special is a tall body.
-        // No head shares 976, so the sprite dims below identify the maneki and
-        // could not be satisfied by some other glyph slipping through.
+        // Heads have aspect ≥ 1145; no glyph but the maneki has 976.
         assert!(
             HEADS
                 .iter()
@@ -20830,12 +19636,9 @@ mod tests {
             "the maneki's aspect must be distinguishable from every head's"
         );
 
-        // ── and the widened art is what the sizing law fits by ──────────────
-        // `authored_cat_size` is the single funnel every cat on glass passes
-        // through — the ambient word-cat's `cat_geometry_for` and the
-        // companion's own bake both call it — so asking it directly is asking
-        // what reaches glass, without borrowing another effect's lifecycle to
-        // do it.
+        // ── and the sizing law fits it ──────────────────────────────────────
+        // `authored_cat_size` is the one funnel every cat on glass passes
+        // through.
         let g = geom20();
         let (w, h) = authored_cat_size(
             maneki.variant,
@@ -20857,9 +19660,9 @@ mod tests {
         );
     }
 
-    /// A user-supplied sprite ([`WordDecorations::set_kitty_sprite_source`]) overrides the
-    /// built-in homage: it is nearest-resampled to fit the slot (aspect
-    /// preserved) and flown; clearing it restores the homage. Headless.
+    /// A user sprite ([`WordDecorations::set_kitty_sprite_source`]) is
+    /// nearest-resampled into the slot, aspect kept, and flown; clearing it
+    /// restores the built-in cat.
     #[test]
     fn kitty_flies_a_user_sprite_when_set() {
         let g = geom20(); // ch = 20 ⇒ slot 80×40, height cap 1.8·ch = 36.
@@ -20929,10 +19732,8 @@ mod tests {
         assert_ne!(body.w, 72, "homage has its own dimensions");
     }
 
-    /// The custom image follows the same exact prospective-footprint contract
-    /// as built-in art. At the two hard viewport edges it stays present: the
-    /// right edge clamps horizontally, while row zero deliberately presents
-    /// the visible lower portion of a body centred above the first baseline.
+    /// The custom sprite's footprint matches emission, clamping at the right
+    /// edge and showing the lower part of the body on row zero.
     #[test]
     fn custom_kitty_footprint_matches_emission_at_interior_right_and_top_edges() {
         let g = geom20();
@@ -21005,10 +19806,8 @@ mod tests {
         );
     }
 
-    /// A same-dimension asset replacement is still a new paint generation: it
-    /// rebases an in-flight line fold, addresses freshly baked pixels, and an
-    /// invalid replacement then fails closed without retaining either body or
-    /// source identity from the last valid generation.
+    /// A same-size asset replacement rebases a fold and repaints; an invalid
+    /// one fails closed, keeping nothing of the last valid generation.
     #[test]
     fn custom_kitty_hot_reload_rebases_repaints_and_invalid_replacement_is_dark() {
         use crate::kitty_cursor::{CatFoldDirection, CatFoldFrame, CursorCatPlacementFrame};
@@ -21156,9 +19955,7 @@ mod tests {
         );
     }
 
-    /// The later/right-shifted anchor remains a preference, not permission to
-    /// leave the grid: body stretch and forward pose lead clamp together at the
-    /// right margin.
+    /// Body stretch and forward lead clamp together at the right margin.
     #[test]
     fn cursor_cat_body_clamps_after_right_shift_stretch_and_lead() {
         let g = geom20();
@@ -21193,10 +19990,8 @@ mod tests {
         assert!(body.x >= 0, "body never crosses the left edge");
     }
 
-    /// The classic kitty pays for a forward line fold with two edge-local
-    /// body beats. The only right→left discontinuity happens while both
-    /// samples are wholly off glass; the logical palette footprint stays at
-    /// the live new-row caret throughout.
+    /// A forward line fold switches sides only while both samples are off
+    /// glass; the palette footprint stays at the live caret.
     #[test]
     fn cursor_cat_fold_leaves_and_arrives_off_glass_without_edge_clamp() {
         use crate::kitty_cursor::{CatFoldDirection, CatFoldFrame, CursorCatPlacementFrame};
@@ -21296,11 +20091,8 @@ mod tests {
             "the arriving body starts wholly left-offstage: {left_off:?}"
         );
 
-        // The target remains live during entry. Advancing three cells changes
-        // the logical target now; the landing is no snap in either direction:
-        // the first settled frame continues from the entry body through the
-        // settled follower, and the glide converges onto exactly the same
-        // bytes the direct emitter would draw there.
+        // The target moves during entry; the landing glides onto exactly the
+        // direct emitter's bytes, no snap.
         let advanced = (4, 3);
         let (entry_place, entry_body) = emit(
             &mut wd,
@@ -21423,9 +20215,8 @@ mod tests {
         assert!(right_off.flip_x);
         assert!(right_off.x >= grid_w);
 
-        // A second authenticated fold may arrive before the first has landed
-        // (fast typing or Backspace correction). Its first pixel sample starts
-        // at the body actually emitted last frame, not at either logical caret.
+        // A second fold before the first lands starts from the body emitted
+        // last frame.
         let reentered_at = started + Duration::from_millis(150);
         let reentered = |progress| CursorCatPlacementFrame {
             sampled_at: reentered_at + Duration::from_secs_f32(progress * 0.28),
@@ -21443,8 +20234,8 @@ mod tests {
             "a reentrant fold is C0-continuous with the last emitted body"
         );
 
-        // A temporarily missing target retires the old coordinate space. The
-        // same still-live fold stamp cannot restart when valid metrics return.
+        // A missing target retires the coordinate space; the same fold stamp
+        // cannot restart.
         let zero_width = EffectGeom { cell_w: 0, ..g };
         assert!(
             wd.resolve_kitty_cursor_placement(layout(zero_width, (3, 0)), reentered(0.1))
@@ -21454,8 +20245,7 @@ mod tests {
         assert!(!reappeared.in_motion());
         assert!(body.x >= 0 && body.x + i32::from(body.w) <= grid_w);
 
-        // Source replacement resets even when it resolves to the same built-in
-        // dimensions; cached pixels/origins never cross an asset identity seam.
+        // A source replacement resets even at the same built-in dimensions.
         wd.set_kitty_sprite_source(KittySpriteSource::BuiltIn);
         let (replaced, _) = emit(&mut wd, g, (3, 0), reentered(0.3));
         assert!(!replaced.in_motion());
@@ -21471,9 +20261,8 @@ mod tests {
         );
         assert!(body.x >= 0 && body.x + i32::from(body.w) <= 210);
 
-        // A host-side coordinate-space seam has no new asset or geometry key to
-        // force a reset, so its explicit rebase seam must settle the still-live
-        // fold token rather than replaying it on the next coherent frame.
+        // An explicit rebase settles the live fold token rather than replaying
+        // it.
         let torn_at = reentered_at + Duration::from_millis(160);
         let torn_fold = |progress| CursorCatPlacementFrame {
             sampled_at: torn_at + Duration::from_secs_f32(progress * 0.28),
@@ -21491,8 +20280,7 @@ mod tests {
         assert!(!rebased.in_motion());
         assert!(body.x >= 0 && body.x + i32::from(body.w) <= 210);
 
-        // Session identity is part of the placement key. Even a quick tab/pane
-        // switch rebaselines instead of carrying signed pixels to another grid.
+        // The session is in the placement key: a tab switch rebaselines.
         let session_fold_at = torn_at + Duration::from_millis(80);
         let session_fold = |progress| CursorCatPlacementFrame {
             sampled_at: session_fold_at + Duration::from_secs_f32(progress * 0.28),
@@ -21586,11 +20374,9 @@ mod tests {
         );
     }
 
-    /// Tier-1 bind for `CursorCatFold`: project the real resolver/emitter onto
-    /// the model after every forward and reverse placement leg. The old pure
-    /// footprint emitter is retained as a deliberate mutant: it changes edges
-    /// with both frames on glass, is rejected by the healthy transition, and
-    /// is admitted exactly by `Buggy=1`.
+    /// Tier-1 binding for `CursorCatFold` after every forward and reverse leg;
+    /// the pure footprint emitter, a mutant that switches edges on glass, is
+    /// rejected by the healthy model and admitted by `Buggy=1`.
     #[test]
     fn cursor_cat_fold_conformance_real_placement_and_teleport_mutant() {
         use crate::kitty_cursor::{CatFoldDirection, CatFoldFrame, CursorCatPlacementFrame};
@@ -21778,9 +20564,8 @@ mod tests {
         let next = project(placement, sprite, 1, false, 2);
         assert_step(&state, &next, "Finish", "reverse settles on right edge");
 
-        // Negative control: the compatibility emitter is the pre-fix pure
-        // placement law. Both frames intersect the viewport, yet their sides
-        // differ with no off-glass history between them.
+        // Negative control: the pure placement law switches sides with both
+        // frames on glass.
         let mut mutant_wd = WordDecorations::default();
         let mut free = Vec::new();
         let frame = |cursor| KittyCursorFrame {
@@ -21844,10 +20629,8 @@ mod tests {
         assert!(buggy_ok, "Buggy=1 must reproduce the mutant: {why}");
     }
 
-    /// Boundary RISE proof: when the right-edge clamp pushes the footprint
-    /// back across the cursor cell, the body rises half a cell instead of
-    /// covering the glyphs. At the top edge the rise backs off entirely, so
-    /// the established top-row presentation is never lifted off-grid.
+    /// When the right-edge clamp pushes the body back over the cursor cell it
+    /// rises half a cell; at the top edge the rise backs off.
     #[test]
     fn right_edge_clamp_rises_the_companion_instead_of_covering_the_text() {
         let g = geom20();
@@ -21913,14 +20696,9 @@ mod tests {
         );
     }
 
-    /// APPENDIX-A residue proof (the margin staircase): with the fold seam in
-    /// place, authenticated wraps already glide, but per-key motion inside a
-    /// line was still a raw snap — at the right margin the boundary rise
-    /// stepped by up to `cell_h/2` in one frame per keystroke. The settled
-    /// follower (`PLACE_TAU`) must turn that staircase into a glide: typing
-    /// one character per 16 ms frame across the clamp region may never move
-    /// the drawn body more than a few px per frame, and once the keys stop
-    /// the follower must land on the exact bytes of the raw placement law.
+    /// The margin staircase glides: typing a key per 16 ms frame across the
+    /// clamp region moves the body only a few px per frame (`PLACE_TAU`), and
+    /// it lands on the raw placement's exact bytes once keys stop.
     #[test]
     fn margin_staircase_glides_instead_of_stepping_per_key() {
         use crate::kitty_cursor::CursorCatPlacementFrame;
@@ -22009,11 +20787,8 @@ mod tests {
         );
     }
 
-    /// Composition law: the settled follower and the fold seam share one
-    /// continuity ledger (`last_sprite`). A fold that starts while the body
-    /// is still mid-glide must begin its Exit at the body actually drawn
-    /// last frame — the glide position — never at the raw settled law the
-    /// follower had not yet reached.
+    /// A fold started mid-glide exits from the body drawn last frame (the
+    /// shared `last_sprite`), not the raw settled target.
     #[test]
     fn a_fold_started_mid_glide_exits_from_the_glide_position() {
         use crate::kitty_cursor::{CatFoldDirection, CatFoldFrame, CursorCatPlacementFrame};
@@ -22057,8 +20832,7 @@ mod tests {
             facing_left: false,
         };
 
-        // Cross the rise onset (ccol 14 -> 16 at this geometry) so the
-        // follower is genuinely lagging when the fold interrupts it.
+        // Cross the rise onset so the follower lags when the fold interrupts.
         let _ = emit(&mut wd, (3, 14), settled(t0));
         let _ = emit(&mut wd, (3, 15), settled(t0 + Duration::from_millis(16)));
         let mid = emit(&mut wd, (3, 16), settled(t0 + Duration::from_millis(32)));
@@ -22097,11 +20871,8 @@ mod tests {
         );
     }
 
-    /// Compat path proof: a `sampled_at: None` settled placement (the direct
-    /// [`WordDecorations::kitty_cursor`] wrapper — settings preview and
-    /// other direct callers) draws the raw footprint byte-for-byte and never
-    /// reads or writes the follower's ledger, even while a resolver-path
-    /// glide is live on the same engine.
+    /// The clockless [`WordDecorations::kitty_cursor`] path draws the raw
+    /// footprint and never touches the follower, even mid-glide.
     #[test]
     fn compat_settled_emission_is_the_raw_footprint_and_ignores_the_glide() {
         use crate::kitty_cursor::CursorCatPlacementFrame;
@@ -22234,18 +21005,13 @@ mod tests {
         assert!(free.is_empty());
     }
 
-    /// Accessory sightings: a Bow-decoding magic word's sighting must carry
-    /// `TRAIT_BOW` — the kitty-log accessory counters key off exactly these
-    /// bits (`accessory_trait_bits`; the bits→counter ledger side is pinned in
-    /// `aterm-gui::kitty_log` and its observe-chain test). If the traits
-    /// assembly stops or'ing the accessory bits, those counters silently never
-    /// increment. The overlay accessory (`accessory_variant_v4`) drives the bit.
+    /// A Bow cat's sighting carries `TRAIT_BOW`, which the kitty-log accessory
+    /// counters key off (`accessory_trait_bits`).
     #[test]
     fn bow_cat_sighting_carries_trait_bow() {
         use crate::kitty_registry::{TRAIT_BOW, accessory_trait_bits};
         let now = Instant::now();
-        // cat window (`% 4096` = 100) misses every magic build; accessory
-        // window (`(>> 24) % 4096` = 64 ∈ 0..=127) decodes Bow.
+        // No magic build (`% 4096` = 100); the accessory window decodes Bow.
         let magic = (64u64 << 24) | 100;
         assert_eq!(genome::cat_accessory(magic), Some(genome::Accessory::Bow));
         assert_eq!(
@@ -22266,8 +21032,7 @@ mod tests {
         let mut e = Episode::fresh(o.appeared, o.genome, o.seed, o.row, 0);
         e.phase_start = Some(o.appeared);
         wd.persist.insert(o.ident, e);
-        // Drain across a few ticks (bakes land ≤ 2/frame) — the first landed
-        // present queues the episode's one sighting.
+        // Drain across a few ticks (bakes land ≤ 2/frame).
         let mut s: Vec<KittySighting> = Vec::new();
         for k in 0..4u64 {
             tick_cat_at(
@@ -22314,12 +21079,9 @@ mod tests {
         assert_eq!(s[0].traits & TRAIT_BOW, 0, "the bare twin carries no bow");
     }
 
-    // ───────────────────── curse-BONK cue battery ─────────────────────
+    // ───────────────────── curse bonk cue battery ─────────────────────
 
-    /// Typed-witness provenance, positive arm: a curse typed at the prompt
-    /// (caret one past the token at rescan) records exactly one
-    /// `CurseCueKind::Typed` cue at the next tick, then never again — the
-    /// episode latch is a one-shot.
+    /// A curse typed at the prompt records one `Typed` cue, once.
     #[test]
     fn typed_curse_birth_records_one_bonk_cue() {
         let lex = lex();
@@ -22344,16 +21106,13 @@ mod tests {
         // One-shot: the same episode never re-cues on later ticks.
         tick_deco(&mut wd, t0 + Duration::from_millis(16), &c, &mut out);
         assert_eq!(wd.drain_curse_cues().count(), 0);
-        // …and a passive redraw of the same content (caret parked after the
-        // word, episode adopted on the fast path) births nothing new.
+        // …and a passive redraw (fast-path adoption) births nothing.
         wd.rescan(&term, 4, 32, &lex, &c, 2, t0 + Duration::from_millis(32));
         tick_deco(&mut wd, t0 + Duration::from_millis(48), &c, &mut out);
         assert_eq!(wd.drain_curse_cues().count(), 0);
     }
 
-    /// Typed-witness provenance, negative arm: `cat`-style output containing
-    /// a curse leaves the caret at the next prompt, not one past the token —
-    /// no typed cue may fire, no matter how long the word decorates.
+    /// Curse output that leaves the caret at the next prompt never cues `Typed`.
     #[test]
     fn onscreen_curse_output_never_records_a_typed_bonk() {
         let lex = lex();
@@ -22378,9 +21137,7 @@ mod tests {
         }
     }
 
-    /// Multilingual for free via `Class::Profanity`: typed zh / ja / ko / en
-    /// curses (CJK compounds matched by the no-space scanner, wide-cell caret
-    /// arithmetic included) each surface exactly one typed cue.
+    /// Typed zh / ja / ko / en curses each surface one typed cue.
     #[test]
     fn multilingual_typed_curses_bonk_zh_ja_ko_en() {
         let lex = Lexicon::with_languages(&["all"]);
@@ -22390,8 +21147,7 @@ mod tests {
             let mut term = Terminal::new(2, 32);
             term.process(word.as_bytes());
             let mut wd = WordDecorations::default();
-            // A typed curse: the bonk's witness is the caret's completion
-            // position and a committed key, so the fixture must supply both.
+            // Typed: caret completion plus a committed key.
             wd.note_typed_edit(t0, None);
             wd.rescan(&term, 2, 32, &lex, &c, 1, t0);
             let mut out = Vec::new();
@@ -22402,9 +21158,8 @@ mod tests {
         }
     }
 
-    /// Ignore lists suppress the sound with the light: the folded spaced
-    /// surface and the raw CJK compound both silence their bonk through the
-    /// same `ScanOptions::ignore` deny set (no occurrence ⇒ no cue).
+    /// Ignore lists silence the bonk with the decoration, for folded spaced
+    /// surfaces and raw CJK compounds alike.
     #[test]
     fn ignore_lists_suppress_the_bonk_with_the_decoration() {
         let lex = Lexicon::with_languages(&["all"]);
@@ -22430,19 +21185,14 @@ mod tests {
         }
     }
 
-    /// `dmg` is not a curse: Vietnamese `đm` folds `đ` → `d` into the bare key
-    /// `dm`, which the live caret would complete one keystroke into `dmg`
-    /// with the typed witness supplied. The lexicon's marks-required gate
-    /// keeps the bare skeleton silent; the tone-marked form the entry lists
-    /// ("Tone marks essential") still cues exactly once (owner, 2026-08-29).
+    /// `dmg` never bonks: the bare `dm` skeleton of Vietnamese `đm` is held by
+    /// the lexicon's marks-required gate, while the marked form cues once.
     #[test]
     fn typing_dmg_never_bonks_but_the_marked_vietnamese_form_does() {
         let lex = lex();
         let c = cfg();
         let t0 = Instant::now();
-        // Negative arm: d, m, g one committed keystroke at a time. The old
-        // behavior fired `CurseCueKind::Typed` at the 'm' (token "dm"
-        // complete at the caret); no keystroke may cue now.
+        // Negative arm: d, m, g one key at a time; no keystroke may cue.
         let mut term = Terminal::new(2, 32);
         let mut wd = WordDecorations::default();
         let mut out = Vec::new();
@@ -22458,8 +21208,7 @@ mod tests {
                 &b"dmg"[..=i]
             );
         }
-        // Positive arm: the real Vietnamese abbreviation, typed with its
-        // tone mark, still records exactly one typed cue.
+        // Positive arm: the tone-marked form cues once.
         let mut term = Terminal::new(2, 32);
         let mut wd = WordDecorations::default();
         term.process("đm".as_bytes());
@@ -22471,13 +21220,8 @@ mod tests {
         assert_eq!(cues[0].kind, CurseCueKind::Typed);
     }
 
-    /// Detonation edge, one row per profile: a rolled supernova (the rainbow
-    /// profile) and a highlighted profanity in the `style = "nova"`
-    /// classic-nova profile each cue `Detonated` exactly once, at the ignition
-    /// grant (inheriting the flash limiter + `burst_done`), none on the
-    /// running blast — and an output curse detonating cues Detonated without a
-    /// Typed cue: the two kinds keep their provenance separate for the host's
-    /// two knobs.
+    /// A rolled supernova and a classic nova each cue `Detonated` once, at the
+    /// grant; an output curse detonating cues no `Typed`.
     #[test]
     fn supernova_detonation_cues_at_the_grant_edge_once() {
         let lex = lex();
@@ -22488,9 +21232,8 @@ mod tests {
             let mut term = Terminal::new(6, 20);
             term.process(b"oh fuck");
             let mut wd = WordDecorations::default();
-            // Typed, and the fixture says so: the bonk's witness is the caret's
-            // completion position and a committed key. `wd2` below deliberately
-            // omits it — that arm is the output case.
+            // Typed: caret completion plus a committed key (`wd2` below omits
+            // it: the output case).
             wd.note_typed_edit(t0, None);
             wd.rescan(&term, 6, 20, &lex, &c, 1, t0);
             tick_nova(&mut wd, t0, &c, g, None, None);
@@ -22528,9 +21271,7 @@ mod tests {
         }
     }
 
-    /// Boundedness + state drop (the hostless/wasm rule the sightings
-    /// follow): an undrained tick's cues are cleared at the next tick's
-    /// start, and `reset()` drops pending cues with the state.
+    /// Undrained cues clear at the next tick's start, and `reset()` drops them.
     #[test]
     fn curse_cues_clear_at_tick_start_and_on_state_drop() {
         let lex = lex();
@@ -22565,10 +21306,8 @@ mod tests {
         );
     }
 
-    /// Pane binding: effects run in every pane. Every visible pane drives one
-    /// engine in turn, so each pane has its own grid and episode state while
-    /// the two safety budgets (the §6.4 flash limiter, the §3.2 supernova
-    /// mutex) stay shared (owner, 2026-07-28).
+    /// Pane binding: each pane has its own grid and episode state; the flash
+    /// limiter and supernova mutex stay window-wide.
     mod pane_binding {
         use super::*;
 
@@ -22622,10 +21361,8 @@ mod tests {
             wd.persist.get(&ident)
         }
 
-        /// T9 — failure mode (a). `last_epoch` is per pane, so a pane that has
-        /// never scanned still asks for its first scan after a sibling scanned
-        /// at the same epoch, and a pane that has scanned is not re-scanned
-        /// merely because a sibling was.
+        /// `last_epoch` is per pane: a sibling's scan neither satisfies nor
+        /// forces this pane's.
         #[test]
         fn bound_panes_keep_independent_damage_epochs() {
             let c = cfg();
@@ -22651,10 +21388,7 @@ mod tests {
             );
         }
 
-        /// T10 — failure mode (b), the one that would have shipped flat ink
-        /// forever in exactly the layout this change targets: one engine driven
-        /// at alternating pane widths sees `cols_changed` on every rescan, so
-        /// `settle_until` re-arms forever and no birth is ever played.
+        /// Alternating pane widths do not re-arm `settle_until` forever.
         #[test]
         fn unequal_pane_widths_do_not_pin_born_settled() {
             let c = cfg();
@@ -22680,10 +21414,8 @@ mod tests {
             );
         }
 
-        /// T11 — failure mode (c). The same word at the same column in two
-        /// panes is two different sightings: pane 2 births its own episode at
-        /// its own instant instead of adopting (and inheriting the spent
-        /// one-shots of) pane 1's.
+        /// The same word at the same column in two panes gets its own episode in
+        /// each.
         #[test]
         fn identical_words_in_two_panes_each_get_their_own_cat() {
             let c = cfg();
@@ -22717,10 +21449,8 @@ mod tests {
             );
         }
 
-        /// T12 — failure mode (d), the subtlest: alignment's "recent" window is
-        /// `REKEY_MAX_SEQ_GAP = 2` rescans. A shared counter advances once per
-        /// pane per frame, so at three panes the window closes inside a single
-        /// frame and every word looks stale to its own next scan.
+        /// Per-pane rescan sequences: a shared counter would close the
+        /// `REKEY_MAX_SEQ_GAP` window within one frame at three panes.
         #[test]
         fn pane_ticks_do_not_inflate_rescan_seq() {
             let c = cfg();
@@ -22739,10 +21469,7 @@ mod tests {
             );
         }
 
-        /// T13 — failure mode (e). `MAX_BAKES_PER_FRAME` and the baker's LRU
-        /// clock are per presented frame. One `begin_host_frame` per frame is
-        /// what keeps a four-pane window at two bakes instead of eight, into
-        /// the one atlas every pane's sprites address.
+        /// One `begin_host_frame` keeps a four-pane window at two bakes.
         #[test]
         fn one_host_frame_bakes_at_most_two_tiles_across_panes() {
             let c = cfg();
@@ -22770,12 +21497,8 @@ mod tests {
             );
         }
 
-        /// T14 — failure mode (f), and the accessibility claim this whole
-        /// design exists to protect: the §6.4 flash limiter is WINDOW-wide
-        /// (WCAG 2.3.1). Two panes flashing at the same pane-local spot are two
-        /// flashes in two different places, so they must not overlap-tighten
-        /// each other into a cap of one — and a third flash in the same rolling
-        /// second is still deferred, across panes.
+        /// The flash limiter is window-wide: same pane-local spots in two panes
+        /// do not overlap-tighten, and a third flash in the second is deferred.
         #[test]
         fn flash_limiter_stays_window_wide_across_panes() {
             let t0 = Instant::now();
@@ -22811,10 +21534,8 @@ mod tests {
             );
         }
 
-        /// T16 — the cross-pane cancellation. `prune_ignitions` cancels a
-        /// future slot whose owner is absent from `persist`; every other pane's
-        /// episodes are parked out of that map, so without the pane label one
-        /// pane's tick silently cancels its sibling's queued nova.
+        /// One pane's prune does not cancel a sibling's queued nova (its owner
+        /// is parked out of `persist`; the pane label protects it).
         #[test]
         fn a_panes_pending_ignition_survives_another_panes_tick() {
             let t0 = Instant::now();
@@ -22849,8 +21570,8 @@ mod tests {
             );
         }
 
-        /// A pane the window stops showing takes its state with it, and the
-        /// live binding is dropped when its own pane is the one that vanished.
+        /// A departed pane's state goes, and so does the live binding if it was
+        /// that pane's.
         #[test]
         fn retain_panes_evicts_departed_panes() {
             let c = cfg();
@@ -22868,9 +21589,7 @@ mod tests {
             );
             assert_eq!(wd.bound, None, "and pane 3's live binding with it");
             assert!(wd.occ.is_empty(), "a departed pane leaves no occurrences");
-            // The survivor is untouched. Retiring the pane that left must not
-            // fold over the panes that stayed: closing the focused pane of a
-            // split would otherwise blank the cats in every other pane.
+            // The survivor is untouched by the departed pane's reset.
             wd.bind_pane(1, (0, 0));
             assert!(
                 feline_episode(&wd).is_some(),
@@ -22908,11 +21627,8 @@ mod pet_handoff_emission_tests {
         }
     }
 
-    /// The swap frame never wears the old coat twice: the live body's
-    /// deferred-bake fallback ([`WordDecorations::pet_last_tile`]) is
-    /// look-keyed. When the worn pair flips on a frame whose shared bake
-    /// budget is spent, the held old-look tile is refused (the old-look ghost
-    /// wears that coat) and the new look lands on the next budgeted frame.
+    /// Under bake pressure a look flip refuses the old look's held tile
+    /// ([`WordDecorations::pet_last_tile`]); the new look lands next frame.
     #[test]
     fn a_look_flip_refuses_the_old_looks_held_tile_under_bake_pressure() {
         let mut wd = WordDecorations::default();
@@ -22952,11 +21668,8 @@ mod pet_handoff_emission_tests {
             wd.pet_last_tile.is_some_and(|(.., c, i)| (c, i) == (3, 1)),
             "the held tile carries look A"
         );
-        // A new frame whose shared two-bake budget word-cats already spent
-        // (the prologue run by hand so the budget can be drained first) —
-        // and the worn pair flips. Look B's fresh insert is refused by the
-        // budget, and the look-keyed fallback must refuse look A's held
-        // tile: no body this frame, never the old coat on the new look.
+        // A frame whose bake budget is spent, and the worn pair flips: the new
+        // look cannot bake and the old look's hold is refused.
         wd.cat_baker.begin_frame(geom.cell_w, geom.cell_h);
         wd.animal_baker.begin_frame(geom.cell_w, geom.cell_h);
         wd.cat_baker_ready = true;
@@ -23005,10 +21718,8 @@ mod pet_stays_inside_the_grid_tests {
         cols: 80,
     };
 
-    /// A resident standing on terminal row 0 (a cleared screen, a fresh
-    /// prompt, or a full-screen TUI with its cursor at the top) with a sleep
-    /// `z` at its head anchor. The mote's `row` is the pet's row minus
-    /// `head_anchor`'s 0.61 (rounded to −0.66 against a caret row).
+    /// A resident pet on row 0 with a sleep `z` at its head anchor (above the
+    /// grid before clamping).
     fn sleeper_on_the_top_row() -> crate::kitty_pet::PetFrame {
         let mut motes = [None; crate::kitty_pet::PET_MOTES_MAX];
         motes[0] = Some(crate::kitty_pet::PetMoteSprite {
@@ -23022,8 +21733,7 @@ mod pet_stays_inside_the_grid_tests {
         });
         crate::kitty_pet::PetFrame {
             alpha: 255,
-            // A settled sleeper: no arrival ramp is in flight, so the lane
-            // byte and the body byte are the same presence.
+            // A settled sleeper: lane and body alpha agree.
             lane_alpha: 255,
             action: crate::kitty_pet::PetAction::Sleep,
             pose: crate::pet_glyphs_gen::PetGlyphId::PetSleep0,
@@ -23041,13 +21751,8 @@ mod pet_stays_inside_the_grid_tests {
         }
     }
 
-    /// A held tile never survives the atlas it names.
-    ///
-    /// `CatBaker::begin_frame` wipes the shared atlas whenever the cell metric
-    /// moves, as `reset_transient_state` does. A hold is a raw `(ax, ay)` band,
-    /// so after a wipe it would name whatever the re-bake put there (on a
-    /// font-size step, dog art under the pet body or another ghost's pose);
-    /// all four holds are dropped on that path too.
+    /// A cell-metric change (which wipes the shared atlas) drops every held
+    /// tile.
     #[test]
     fn a_metric_change_drops_every_held_tile() {
         let mut wd = WordDecorations::default();
@@ -23065,9 +21770,7 @@ mod pet_stays_inside_the_grid_tests {
             },
         ));
 
-        // Positive control: the same metric must not throw the frame's work away
-        // — without this the guard could pass by clearing unconditionally, which
-        // would strobe the companion every frame.
+        // Positive control: an unchanged metric keeps the holds.
         wd.drop_holds_if_metric_moved(GEOM.cell_w, GEOM.cell_h);
         assert!(
             wd.pet_last_tile.is_some() && wd.pet_depart_tiles[0].is_some(),
@@ -23085,16 +21788,8 @@ mod pet_stays_inside_the_grid_tests {
         assert!(wd.robi_last_body.is_none(), "the robot's hold survived");
     }
 
-    /// Nothing decorative leaves the terminal grid.
-    ///
-    /// `FreeSprite` takes a signed origin so a sprite can peek off-grid, and
-    /// the host's tab-strip splice shifts every free sprite down by
-    /// `strip_rows · cell_h`, so a negative y lands on the tab strip. The pet
-    /// stands 1.7 rows tall on its baseline and its motes are born ~0.6 rows
-    /// above it, so both `body_px` and the mote emitter clamp y as well as x.
-    ///
-    /// Robi is the deliberate exception: he is opt-in, has his own emitter,
-    /// and climbing the ladder past the top is his act.
+    /// A pet on row 0 emits no sprite above the grid (a negative y would land
+    /// on the tab strip after the splice). Robi is the deliberate exception.
     #[test]
     fn a_pet_on_row_zero_emits_no_sprite_above_the_grid() {
         let mut wd = WordDecorations::default();
@@ -23102,8 +21797,7 @@ mod pet_stays_inside_the_grid_tests {
         let pet = sleeper_on_the_top_row();
         let grid_w = i32::from(GEOM.cols) * i32::from(GEOM.cell_w);
         let grid_h = i32::from(GEOM.rows) * i32::from(GEOM.cell_h);
-        // The two-door bake takes a few frames to land body and mote (the shared
-        // budget is two bakes per host frame), so drive it until both are up.
+        // Drive frames until both body and mote land (two bakes per frame).
         let mut seen = 0usize;
         for _ in 0..12 {
             wd.begin_host_frame();
@@ -23146,9 +21840,7 @@ mod pet_stays_inside_the_grid_tests {
         );
     }
 
-    /// The clamp is a bound, not a rewrite: a pet in the middle of the grid draws
-    /// at exactly the rect it always did, and the emitted sprite still is
-    /// `body_px` (the "one copy of the math" law the emitter documents).
+    /// Mid-grid the clamp changes nothing: the emitted sprite is `body_px`.
     #[test]
     fn a_pet_in_open_grid_is_untouched_and_still_matches_body_px() {
         let mut wd = WordDecorations::default();
@@ -23200,9 +21892,8 @@ mod pet_stays_inside_the_grid_tests {
 mod dog_cameo_emission_tests {
     use super::*;
 
-    /// The dog cameo emits exactly one free sprite behind the cursor once its
-    /// tile lands (retrying the two-door bake across frames like the pet), and
-    /// the sprite never overlaps the cursor cell away from the left margin.
+    /// The dog cameo emits one free sprite behind the cursor, never over the
+    /// cursor cell away from the left margin.
     #[test]
     fn dog_cameo_emits_one_trailing_sprite() {
         let mut wd = WordDecorations::default();
@@ -23225,8 +21916,7 @@ mod dog_cameo_emission_tests {
             alpha: 255,
         };
         let mut free = Vec::new();
-        // The shared bake budget may defer the first frames; a real visit
-        // spans ~190 frames, so retry a handful like the host would.
+        // The bake budget may defer the first frames; retry like the host.
         let mut fp = None;
         for frame_i in 0..8 {
             // Per-frame prologue the host's `tick` normally performs.
@@ -23252,16 +21942,8 @@ mod dog_cameo_emission_tests {
         assert!(s.w > 0 && s.h > 0);
     }
 
-    /// A held dog tile is the breed it was baked for.
-    ///
-    /// "dog dog dog" is a parade: `DogCameo::on_summon` never re-rolls onto
-    /// the resident breed, so a re-summon always changes the animal. The
-    /// deferred-bake fallback re-emits the last resolved band, which belongs
-    /// to the previous breed, so the hold is look-keyed like `pet_last_tile`.
-    ///
-    /// Positive control first, on the same starvation: a matching look still
-    /// falls back, so the refusal is look-keyed and not the budget blanking
-    /// every deferred frame.
+    /// A held dog tile is refused to another breed (a re-summon always changes
+    /// breed); the same breed still falls back to it.
     #[test]
     fn a_held_dog_tile_is_refused_to_another_breed() {
         let geom = EffectGeom {
@@ -23288,8 +21970,7 @@ mod dog_cameo_emission_tests {
             alpha: 255,
         };
         let mut wd = WordDecorations::default();
-        // Each palette is a fresh bake key, so two of them spend the shared
-        // two-bake budget and the third must take the held-tile path.
+        // Two fresh palettes spend the budget; the third takes the hold path.
         fn spend_budget_then(
             wd: &mut WordDecorations,
             warm: [DogCameoFrame; 2],
@@ -23311,8 +21992,7 @@ mod dog_cameo_emission_tests {
             free.clear();
             wd.dog_cameo(frame(look(0), accent), &mut free);
         }
-        // Every warm-up palette must be unseen — a repeat is an atlas hit and
-        // spends no bake, which silently un-starves the frame.
+        // Warm-up palettes must be unseen (a repeat is an atlas hit).
         // Control: starved, same breed ⇒ the hold is used.
         assert!(
             spend_budget_then(
@@ -23324,8 +22004,7 @@ mod dog_cameo_emission_tests {
             "a starved frame must still re-emit the held tile for its OWN breed \
              — without this the refusal below would prove nothing"
         );
-        // The refusal: starved, a DIFFERENT breed ⇒ no sprite rather than the
-        // resident breed wearing the newcomer's fade.
+        // Starved, another breed: no sprite rather than the wrong breed.
         assert!(
             spend_budget_then(
                 &mut wd,
@@ -23373,15 +22052,8 @@ mod robi_emission_tests {
         }
     }
 
-    /// A ladder is not a robot.
-    ///
-    /// Robi's body bakes as one tile and enters the shared atlas as three
-    /// stacked slices, so a cold baker mid-climb (a config reload, or the
-    /// font-size step that drops every held tile) spends the frame's two
-    /// shared bakes on the ladder plus the body's first slice and defers the
-    /// rest: only the ladder is drawn. That frame must not report a drawn
-    /// robot, since `redraw_window` hangs his click-to-dismiss hit-box on the
-    /// answer and one click on empty grid would write `robi = false`.
+    /// A frame where a cold baker drew only the ladder reports no body, so the
+    /// host hangs no click-to-dismiss hit-box on empty grid.
     #[test]
     fn a_ladder_only_frame_reports_no_body() {
         let g = geom(60, 20);
@@ -23395,9 +22067,7 @@ mod robi_emission_tests {
             .expect("the ladder drew, so something was emitted");
         let body_sprites = free.iter().filter(|s| s.z == FreeZ::OverText).count();
         let ladder_sprites = free.iter().filter(|s| s.z == FreeZ::UnderText).count();
-        // Anti-vacuity: this must be the ladder-only frame the finding names,
-        // not an empty one — `body_px: None` on a frame that drew nothing at
-        // all would prove nothing about the hit-box.
+        // Non-vacuity: the ladder did draw this frame.
         assert!(
             ladder_sprites > 0,
             "fixture: the ladder must have drawn on the first frame"
@@ -23413,8 +22083,7 @@ mod robi_emission_tests {
             first.body_px
         );
 
-        // And the very next frame, with the slices landed, does report the body
-        // — at exactly the rect its slices occupy.
+        // The next frame, slices landed, reports the body at their rect.
         wd.begin_host_frame();
         free.clear();
         let second = wd
@@ -23442,9 +22111,8 @@ mod robi_emission_tests {
         );
     }
 
-    /// The ladder reaches the bar on a tall window: the stack is bounded by
-    /// the window (one segment is taller than one cell row), not by a
-    /// constant, so the climb never ends on a ladder that stops mid-air.
+    /// On a tall window the ladder reaches the bar: the stack is bounded by
+    /// the window, not a constant.
     #[test]
     fn the_ladder_reaches_the_top_of_a_tall_window() {
         for (rows, cell_h) in [(24u16, 20u16), (60, 20), (80, 20), (100, 34), (120, 16)] {
@@ -23454,8 +22122,7 @@ mod robi_emission_tests {
             let (_, lh) = crate::robi::ladder_tile_px(&g);
             let mut wd = WordDecorations::default();
             let mut free = Vec::new();
-            // The ladder tile is one bake; give it a couple of frames in case
-            // the body's slices take the budget first.
+            // A few frames, in case the body's slices take the budget first.
             let mut segments = Vec::new();
             for _ in 0..4 {
                 wd.begin_host_frame();
@@ -23474,9 +22141,8 @@ mod robi_emission_tests {
                 .iter()
                 .min()
                 .unwrap_or_else(|| panic!("{rows}x{cell_h}: the ladder never drew"));
-            // The stack is discrete, so its top segment starts within one tile
-            // of `top_y` (the loop's own `- lh/4` slack is what lets it reach
-            // the bar). Anything further down is the cap having truncated it.
+            // The top segment starts within one tile of `top_y`; lower means
+            // the cap truncated the stack.
             assert!(
                 top < ladder.top_y + i32::from(lh),
                 "{rows} rows @ {cell_h} px: the stack stops at y={top}, {} px short of \
@@ -23489,10 +22155,8 @@ mod robi_emission_tests {
     }
 }
 
-/// The trick flash's hooks, pinned against the engine's private state (the
-/// flash's own battery, which drives the public surface on both rescan twins,
-/// lives with the flash in `trick_flash.rs`): what `tick` arms and what it
-/// leaves verbatim, and what a reset leaves behind.
+/// The trick flash's engine hooks against private state: what `tick` arms and
+/// what a reset leaves (the flash's own battery is in `trick_flash.rs`).
 #[cfg(test)]
 mod trick_flash_hook_tests {
     use super::*;
@@ -23524,10 +22188,8 @@ mod trick_flash_hook_tests {
         wd.rescan(term, 4, 40, &lex, &c, 2, t0);
     }
 
-    /// The wordless arm with no flash is the pre-feature path, verbatim: a
-    /// stale scratch comes back empty, the fingerprint is the literal 0, and
-    /// the deadline is `None` — not merely in the past. A pending flash (noted,
-    /// not yet found) changes none of that.
+    /// With no live flash (even a pending one), a wordless tick returns empty
+    /// ink, fp 0 and a `None` deadline.
     #[test]
     fn a_wordless_screen_with_no_flash_still_returns_fp_zero_and_disarms() {
         let t0 = Instant::now();
@@ -23554,9 +22216,8 @@ mod trick_flash_hook_tests {
         }
     }
 
-    /// A LIVE flash on a wordless screen arms this pane's own deadline at
-    /// exactly the flash's end — the wake `is_active` already reads, never a
-    /// new term — and the first tick past it puts the verbatim path back.
+    /// A live flash on a wordless screen arms exactly its own end, and the
+    /// first tick past it returns to the flashless path.
     #[test]
     fn a_live_flash_on_a_wordless_screen_arms_exactly_its_own_window() {
         let t0 = Instant::now();
@@ -23578,9 +22239,8 @@ mod trick_flash_hook_tests {
         assert_eq!(wd.active_until, None);
     }
 
-    /// At the tail the flash only ever extends the tick-local deadline: a
-    /// feline word's longer glow keeps its own end, and once that word has
-    /// settled a new flash is the only thing armed.
+    /// The flash only extends the tick's deadline: a longer feline glow keeps
+    /// its end, and after it settles a new flash is the only thing armed.
     #[test]
     fn beside_other_ink_the_flash_extends_the_deadline_and_never_shortens_it() {
         let t0 = Instant::now();
@@ -23597,8 +22257,7 @@ mod trick_flash_hook_tests {
         assert!(FELINE_GLOW_MS > u64::from(FLASH_MS));
         assert_eq!(wd.active_until, Some(glow_end), "the longer window stands");
         assert!(ink.iter().any(|cell| (8..=10).contains(&cell.col)));
-        // After both (and inside the identity grace, so `kitty` stays the
-        // same spent episode): a settled feline word arms nothing…
+        // After both, within grace: a settled feline word arms nothing…
         let later = t0 + Duration::from_secs(2);
         tick(&mut wd, later, &mut ink);
         assert_eq!(wd.active_until, None);
@@ -23618,11 +22277,8 @@ mod trick_flash_hook_tests {
         assert_eq!(flashed, [12, 13, 14, 15]);
     }
 
-    /// The flash twin of `reset_clears_stale_ink_on_next_tick`: the
-    /// suppressed-alt-screen / master-off arms call `reset()` and tick with
-    /// the same scratch. The flash holds cells captured from the grid that
-    /// just died, so it must go with it — and stay gone when the very same
-    /// text is scanned again.
+    /// The flash twin of `reset_clears_stale_ink_on_next_tick`: `reset()` drops
+    /// a live flash, and rescanning the same text does not bring it back.
     #[test]
     fn reset_clears_a_live_trick_flash_on_the_next_tick() {
         let t0 = Instant::now();
@@ -23654,10 +22310,8 @@ mod trick_flash_hook_tests {
         }
     }
 
-    /// A frozen engine neither locates nor paints: both hooks sit behind the
-    /// frozen returns, and the thaw finds the flash exactly where the clock
-    /// left it (its window is a claim about the keyboard, not about one
-    /// pane's suspended grid, so it is not thaw-shifted).
+    /// A frozen engine neither locates nor paints the flash, and thaw finds it
+    /// where the clock left it (the flash is not thaw-shifted).
     #[test]
     fn a_frozen_engine_neither_finds_nor_paints_the_flash() {
         let t0 = Instant::now();
@@ -23683,10 +22337,9 @@ mod trick_flash_hook_tests {
     }
 }
 
-// Tier-1 bind for `NovaPhase` on the host engine (the grant, the spent mark,
-// `hard_reset`, the thaw shift): a child of this module so it can read the
-// episode the host keeps for a word. The `_tests.rs` name keeps its engine out
-// of the shipped-code census (it builds a `WordDecorations` of its own).
+// Tier-1 binding for `NovaPhase` on the host engine, a child module so it can
+// read the host's episodes. The `_tests.rs` name keeps its engine out of the
+// shipped-code census.
 #[cfg(test)]
 #[path = "nova_host_conformance_tests.rs"]
 mod nova_host_conformance;

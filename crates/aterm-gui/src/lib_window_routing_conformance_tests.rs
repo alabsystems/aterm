@@ -125,12 +125,11 @@ pub(crate) fn run_conformance() {
     );
     validated += 1;
 
-    // ConnectedCreateWindow: a fourth window validated against the connections mint arm.
-    // The connected seam needs a real `ActiveEventLoop`, so drive the same logical mint
-    // it routes through (`create_window_logical` → `install_window_state`); the
-    // hosted-origin guard (`win_count > 0`) holds with three live windows. Origin
-    // resolution is pinned by `connected_spawn_tests`; negative control (d) keeps this
-    // non-vacuous.
+    // ConnectedCreateWindow: a fourth window validated against the connections mint arm,
+    // through the logical install a window's landing ends in (`install_window_state`);
+    // the hosted-origin guard (`win_count > 0`) holds with three live windows. The real
+    // connected window's booking and landing are validated below; origin resolution is
+    // pinned by `connected_spawn_tests`; negative control (d) keeps this non-vacuous.
     let prev = next;
     let sid3 = app.next_session_id;
     let _wid3 = app.insert_logical_window(stub_session(sid3), 24, 80);
@@ -146,6 +145,44 @@ pub(crate) fn run_conformance() {
          ConnectedCreateWindow\n--- ty ---\n{out}"
     );
     validated += 1;
+
+    // A window a person opens (Cmd-N, the menu, a picker row, `spawn connected=
+    // place=window`) is spawned off the loop (`tab_spawn`): the turn books it,
+    // minting its id, and the landing makes it frontmost. The pair is one
+    // create, validated across both through the real booking
+    // (`App::reserve_window`) and landing (`App::install_spawned`, the inert OS
+    // arm). Negative control (e) keeps it non-vacuous.
+    let mut next = next;
+    for action in ["CreateWindow", "ConnectedCreateWindow"] {
+        let prev = next;
+        let (sid, wid) = crate::tab_spawn::test_support::book_window(
+            &mut app,
+            None,
+            crate::tab_spawn::SpawnAdmission::Plain,
+            crate::tab_spawn::TabSpawnThen::Nothing,
+        );
+        assert!(
+            app.install_spawned_tab(crate::tab_spawn::TabSpawned {
+                id: sid,
+                window: wid,
+                session: Ok(stub_session(sid)),
+                reader_gate: None,
+            }),
+            "the booked window lands"
+        );
+        assert!(
+            app.structural_invariants_ok(),
+            "invariants hold after a window lands"
+        );
+        next = project(&app, false);
+        let (ok, out) = validate_transition(action, prev, next);
+        assert!(
+            ok,
+            "real off-loop window booking + landing {prev:?} -> {next:?} must conform \
+             to {action}\n--- ty ---\n{out}"
+        );
+        validated += 1;
+    }
 
     // RaiseSession: raise session 0 while the newest window is frontmost, through the
     // real `raise_session_by_id`. Headless there is no OS focus, so the step may be the
@@ -274,12 +311,24 @@ pub(crate) fn run_conformance() {
          rejected — a connected window mint requires a live hosted origin\n--- ty ---\n{o}"
     );
 
+    // (e) A window that lands without taking the front: its booking minted the
+    // id, but the landing left `frontmost` where it was.
+    let prev_behind = [2, 1, 3, 0];
+    let next_behind = [3, 1, 4, 0];
+    let (ok, o) = validate_transition("CreateWindow", prev_behind, next_behind);
+    assert!(
+        !ok,
+        "NEGATIVE CONTROL (landed behind) {prev_behind:?} -> {next_behind:?} MUST be \
+         rejected — a new window becomes frontmost\n--- ty ---\n{o}"
+    );
+
     let _ = std::fs::remove_dir_all(&dir);
     crate::logging::stderr_line!(
         "App window-routing Tier-1 conformance: {validated} real transitions \
-         (2 CreateWindow + the ConnectedCreateWindow mint + a RaiseSession + the \
-         close-down-to-exit chain) strictly validated against the WindowRouting spec; \
-         negative controls (missed exit, early exit, raise-to-unallocated, \
-         mint-after-exit) all rejected."
+         (2 CreateWindow + the ConnectedCreateWindow mint + 2 off-loop window \
+         booking-and-landing pairs + a RaiseSession + the close-down-to-exit chain) \
+         strictly validated against the WindowRouting spec; negative controls (missed \
+         exit, early exit, raise-to-unallocated, mint-after-exit, landed-behind) all \
+         rejected."
     );
 }

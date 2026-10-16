@@ -143,17 +143,26 @@ fn unlabeled_sessions_record_cwd_changes_and_closed_sessions_are_forgotten() {
 }
 
 /// Every production close path uses `detach_session_view`: one of multiple
-/// views must preserve both the PTY and its live activity, while the final
-/// detach revokes snapshots/retries/provider work before the id can be reused.
+/// views must preserve both the PTY and its per-session chrome state, while
+/// the final detach retires it (presented labels, chrome, drift) before the id
+/// can be reused.
 #[test]
-fn final_view_detach_retires_smart_title_state_exactly_once() {
+fn final_view_detach_retires_per_session_chrome_state_exactly_once() {
     let mut app = App::headless_for_test();
-    app.note_title_activity(0);
-    assert!(app.title_summary_tracks_session(0));
+    // A title the clean fast path declines (a spinner glyph), so the refresh
+    // below fills the per-session label cache.
+    let term = app.pool.get(0).expect("session 0").term.clone();
+    term.lock()
+        .unwrap()
+        .process("\x1b]2;✳ private title\x07".as_bytes());
     app.refresh_window_tabs(WindowId(0));
     assert!(
+        app.chrome_labels.tracks(0),
+        "the test warms the presented-label cache"
+    );
+    assert!(
         app.session_chrome.contains_key(&0),
-        "the test warms the authored/generated chrome cache"
+        "the test warms the authored chrome cache"
     );
     let drift_time = Instant::now();
     app.title_drift.seen.insert(0, 7);
@@ -180,7 +189,7 @@ fn final_view_detach_retires_smart_title_state_exactly_once() {
         "the first of two views keeps the shared session alive"
     );
     assert!(
-        app.title_summary_tracks_session(0),
+        app.chrome_labels.tracks(0),
         "auxiliary state belongs to the live shared session"
     );
     assert!(app.session_chrome.contains_key(&0));
@@ -197,7 +206,7 @@ fn final_view_detach_retires_smart_title_state_exactly_once() {
         app.detach_session_view(0),
         "the final view owns session teardown"
     );
-    assert!(!app.title_summary_tracks_session(0));
+    assert!(!app.chrome_labels.tracks(0));
     assert!(!app.session_chrome.contains_key(&0));
     assert!(!app.session_chrome_expiry.pending());
     assert!(!app.title_drift.pending.contains(&0));
@@ -209,76 +218,4 @@ fn final_view_detach_retires_smart_title_state_exactly_once() {
     assert!(!window.tab_chrome_titles.contains_key(&0));
     assert!(!window.tab_chrome_titles_by_tab.contains_key(&tab_id));
     assert!(!app.detach_session_view(0), "a repeated detach is a no-op");
-}
-
-#[test]
-fn quiet_session_discovery_is_active_first_and_one_snapshot_per_turn() {
-    let mut app = App::headless_for_test();
-    app.config.descriptive_titles = Some(true);
-    app.config.title_summary_provider = Some(crate::app_config::TitleSummaryProvider::Builtin);
-    app.pool.insert(stub_session(7));
-    assert_eq!(app.focused_session_id(WindowId(0)), Some(0));
-    assert!(!app.title_summary_tracks_session(0));
-    assert!(!app.title_summary_tracks_session(7));
-    assert!(app.next_title_summary_retry().is_some());
-
-    app.retry_title_observations();
-    assert!(app.title_summary_tracks_session(0));
-    assert!(
-        !app.title_summary_tracks_session(7),
-        "only the active missing session is snapshotted in the first turn"
-    );
-    assert!(app.next_title_summary_retry().is_some());
-
-    app.retry_title_observations();
-    assert!(app.title_summary_tracks_session(7));
-}
-
-#[test]
-fn disabled_title_activity_gate_clears_retry_before_terminal_locking() {
-    let mut app = App::headless_for_test();
-    app.config.descriptive_titles = Some(true);
-    app.config.title_summary_provider = Some(crate::app_config::TitleSummaryProvider::Builtin);
-    let term = app.pool.get(0).unwrap().term.clone();
-    let guard = term.lock().unwrap();
-    app.note_title_activity(0);
-    assert!(
-        app.title_summary_tracks_session(0),
-        "the lock race schedules a bounded retry"
-    );
-
-    app.config.title_summary_provider = Some(crate::app_config::TitleSummaryProvider::Off);
-    app.note_title_activity(0);
-    assert!(!app.title_summary_tracks_session(0));
-    drop(guard);
-}
-
-#[test]
-fn contended_quiet_session_honors_deferred_retry_without_hot_spin() {
-    let mut app = App::headless_for_test();
-    app.config.descriptive_titles = Some(true);
-    app.config.title_summary_provider = Some(crate::app_config::TitleSummaryProvider::Builtin);
-    let term = app.pool.get(0).unwrap().term.clone();
-    let guard = term.lock().unwrap();
-    // The fold reads at an instant taken BEFORE the contended observation arms
-    // its 4 ms retry, so the arm is still ahead of the fold however long this
-    // thread is descheduled afterwards; the stall below takes that descheduling
-    // on purpose. Folded at a second `Instant::now()` after the arm, as this
-    // test once did, a thread descheduled past the ladder's base saw its own
-    // arm come due, floored it to the fold's `now + 4 ms`, and failed with the
-    // product right. The clock moves a whole millisecond before the arm, so a
-    // rediscovery floored to `now + 4 ms` can never coincide with the arm.
-    let now = Instant::now();
-    std::thread::sleep(Duration::from_millis(1));
-    app.retry_title_observations();
-    assert!(app.title_summary_tracks_session(0));
-    std::thread::sleep(Duration::from_millis(10));
-    let armed = app.title_summaries.next_retry();
-    assert!(armed.is_some_and(|at| at > now), "{armed:?}");
-    assert_eq!(
-        app.next_title_summary_retry_at(now),
-        armed,
-        "a known contended session must not be rediscovered at Instant::now"
-    );
-    drop(guard);
 }

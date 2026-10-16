@@ -10,13 +10,8 @@
 
 use super::types::MouseEncoding;
 
-/// Encode mouse coordinates in X10 format.
-///
-/// Format: ESC [ M Cb Cx Cy
-/// Coordinates are 1-indexed and offset by 32 (space character).
-/// Limited to column/row 223 (223 + 32 = 255 = max single byte).
-/// Coordinates beyond 223 are clamped. Applications needing larger
-/// terminal support should enable SGR encoding (mode 1006) instead.
+/// Encode mouse coordinates in X10 format: `ESC [ M Cb Cx Cy`, 1-based and offset by 32.
+/// Coordinates past 223 (223 + 32 = 255) are clamped; SGR (mode 1006) has no such limit.
 #[must_use]
 pub fn encode_x10(cb: u8, col: u16, row: u16) -> Vec<u8> {
     let cx = (col.saturating_add(1).min(223) as u8).saturating_add(32);
@@ -42,15 +37,9 @@ fn encode_utf8_coord(coord: u16, output: &mut Vec<u8>) {
     }
 }
 
-/// Encode mouse coordinates in UTF-8 format.
-///
-/// Format: ESC [ M Cb Cx Cy (all values after M are UTF-8 encoded)
-/// Like X10 but uses UTF-8 encoding for values > 127, supporting up to 2015.
-///
-/// Per xterm: ALL values after M — including the button code — are UTF-8
-/// encoded. When modifier masks (Shift=4, Alt=8, Ctrl=16) combine with
-/// scroll wheel (64+) or additional buttons (128+), cb+32 can exceed 127
-/// and requires 2-byte UTF-8 encoding. (#7498)
+/// Encode mouse coordinates in UTF-8 format (mode 1005): `ESC [ M Cb Cx Cy` with every value
+/// after M UTF-8 encoded, the button code included (xterm), up to 2015. With modifier bits on
+/// a wheel (64+) or extra button (128+) code, cb+32 exceeds 127 and takes two bytes (#7498).
 #[must_use]
 pub fn encode_utf8(cb: u8, col: u16, row: u16) -> Vec<u8> {
     let mut result = vec![0x1b, b'[', b'M'];
@@ -61,14 +50,9 @@ pub fn encode_utf8(cb: u8, col: u16, row: u16) -> Vec<u8> {
     result
 }
 
-/// Append `val` to `buf` as decimal digits, allocation-free.
-///
-/// The zero-allocation counterpart of `val.to_string()`: the mouse encoders run
-/// once per pointer sample under DEC 1002/1003 tracking, so the three throwaway
-/// `String`s the `to_string()` form allocated per report are pure waste. Same
-/// idiom (and same Trust discipline) as `keyboard::encode::write_u32`.
-// Skip: pushes into a `Vec<u8>` — absent std body (alloc class). The emitted
-// bytes are pinned by this module's unit tests and by the protocol vector suite.
+/// Append `val` to `buf` as decimal digits, allocation-free: the encoders run once per pointer
+/// sample under DEC 1002/1003 tracking. Same idiom as `keyboard::encode::write_u32`.
+// Skip: pushes into a `Vec<u8>`, an absent std body (alloc class); the tests pin the bytes.
 #[cfg_attr(trust_verify, trust::skip)]
 #[allow(clippy::cast_possible_truncation)]
 fn push_dec_u16(buf: &mut Vec<u8>, val: u16) {
@@ -76,24 +60,17 @@ fn push_dec_u16(buf: &mut Vec<u8>, val: u16) {
         buf.push(b'0');
         return;
     }
-    // Extract decimal digits least-significant-first into a fixed 8-slot scratch
-    // (u16::MAX is 5 digits), then append most-significant-first. Like `write_u32`
-    // this uses only the literal divisor 10 (no runtime-divisor division for the
-    // Trust gate to guard against a zero divisor), masks every scratch index into
-    // the array's 0..=7 range, masks the remainder to a byte before the cast so the
-    // narrowing is provably lossless (`n % 10 <= 9`, so `& 0xFF` is identity), and
-    // forms each byte with `wrapping_add` (the digit is 0..=9, so it never actually
-    // wraps) — no div-by-zero, index-out-of-bounds, or `b'0' + digit` overflow
-    // obligation.
+    // Digits go least-significant-first into an 8-slot scratch (u16::MAX has 5), then out in
+    // reverse, as in `write_u32`: a literal divisor, masked indices and remainder, and
+    // `wrapping_add` on a 0..=9 digit leave the Trust gate nothing to discharge.
     let mut digits = [0u8; 8];
     let mut n = val;
     let mut count = 0usize;
     while n > 0 && count < 5 {
         digits[count & 7] = b'0'.wrapping_add(((n % 10) & 0xFF) as u8);
         n /= 10;
-        // saturating: `count < 5` guards the increment and `count > 0` the
-        // decrement — exact on every path; the verifier cannot chain either
-        // loop condition into the arithmetic.
+        // Saturating is exact (`count < 5`, `count > 0`); the verifier cannot carry the loop
+        // conditions into the arithmetic.
         count = count.saturating_add(1);
     }
     while count > 0 {
@@ -110,9 +87,7 @@ fn push_dec_u16(buf: &mut Vec<u8>, val: u16) {
 // Skip: Vec push/extend — absent std bodies (alloc class).
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn encode_sgr(cb: u8, col: u16, row: u16, release: bool) -> Vec<u8> {
-    // Trust gate: manual byte assembly instead of `write!` — runtime-argument
-    // `format_args!` cannot be lowered natively. Byte-identical output
-    // (decimal `{}` of the integers, then the ASCII final byte).
+    // Manual byte assembly, not `write!`: Trust cannot lower a runtime-argument `format_args!`.
     let mut buf = Vec::with_capacity(19);
     buf.extend_from_slice(b"\x1b[<");
     push_dec_u16(&mut buf, u16::from(cb));
@@ -132,10 +107,8 @@ pub fn encode_sgr(cb: u8, col: u16, row: u16, release: bool) -> Vec<u8> {
 // Skip: Vec push/extend — absent std bodies (alloc class).
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn encode_urxvt(cb: u16, col: u16, row: u16) -> Vec<u8> {
-    // Trust gate: see `encode_sgr`.
-    // 20 = ESC [ (2) + cb (<=5) + ';' + col (<=5) + ';' + row (<=5) + 'M'. The
-    // callers inside this crate cap `cb` at 287 (3 digits), but the function is
-    // `pub`, so size for the u16 worst case rather than reallocating on it.
+    // Manual bytes, as in `encode_sgr`. 20 covers the u16 worst case (ESC [, three 5-digit
+    // numbers, two ';', 'M'); `encode_mouse` passes a cb of at most 255.
     let mut buf = Vec::with_capacity(20);
     buf.extend_from_slice(b"\x1b[");
     push_dec_u16(&mut buf, cb);
@@ -147,45 +120,25 @@ pub fn encode_urxvt(cb: u16, col: u16, row: u16) -> Vec<u8> {
     buf
 }
 
-/// Dispatch to the appropriate encoding format.
-///
-/// This is a convenience function that selects the encoding based on
-/// `MouseEncoding` and delegates to the format-specific encoder.
-///
-/// For URXVT, `cb` is automatically offset by 32 (callers pass the raw code).
+/// Encode in `encoding`'s format. For URXVT `cb` is offset by 32 here (callers pass the raw
+/// code).
 ///
 /// # Out-of-range X10 coordinates keep X10 framing
 ///
-/// A coordinate past 222 (1-based 223, byte 255) has no single-byte
-/// representation, so [`encode_x10`] clamps it to that maximum. It does NOT
-/// change the output FORM.
-///
-/// This encoder used to emit the SGR (1006) form instead whenever either
-/// coordinate went out of range — which silently handed an application a
-/// protocol it never enabled. An app that set only mode 1000 scans for the
-/// fixed 6-byte `ESC [ M Cb Cx Cy` frame; `ESC [ < 0 ; 251 ; 6 M` does not
-/// match it, so the parameter bytes are most likely passed through as literal
-/// input. On a wide terminal (>223 columns) that turned every far-right click
-/// into typed garbage. The frame an application asked for is the frame it
-/// gets; an app that wants coordinates past 223 enables SGR (1006) or UTF-8
-/// (1005) itself, and both are honoured here without a limit.
+/// A coordinate past 222 (1-based 223, byte 255) has no single-byte form, so [`encode_x10`]
+/// clamps it; the output form never changes. An app that enabled only mode 1000 parses the
+/// fixed 6-byte `ESC [ M Cb Cx Cy` frame, and an SGR report would reach it as typed garbage.
+/// An app that wants coordinates past 223 enables SGR (1006) or UTF-8 (1005).
 #[must_use]
 pub fn encode_mouse(cb: u8, col: u16, row: u16, encoding: MouseEncoding, release: bool) -> Vec<u8> {
-    // Release signalling is FORMAT-specific, so it is decided here where the
-    // actual output form is known: legacy single-byte forms (X10/UTF-8/urxvt)
-    // replace the button with 3 (identity lost, per xterm); SGR keeps
-    // the button identity and uses the 'm' final byte instead. Callers pass
-    // the ORIGINAL button — substituting earlier would leak the legacy
-    // button-3 into the SGR fallback (#7473). The release keeps only the
-    // modifier bits (Shift 4, Alt 8, Ctrl 16; motion 32 is never set here):
-    // the extension bits 64 and 128 name the button, so a thumb button's
-    // release kept as 128|3 read as a button-11 PRESS. xterm's
-    // `BtnCode(-1)` sends 3 for every legacy release.
+    // Release signalling is format-specific. The legacy forms (X10/UTF-8/urxvt) send button 3
+    // with only the modifier bits (Shift 4, Alt 8, Ctrl 16; motion 32 is never set on a
+    // release), as xterm's `BtnCode(-1)` does: bits 64 and 128 name the button, and 128|3
+    // would read as a button-11 press. SGR keeps the button and ends in 'm', which is why
+    // callers pass the original button (#7473).
     let legacy_cb = if release { (cb & 0b0011_1100) | 3 } else { cb };
     match encoding {
-        // X10 encoding uses single bytes for coordinates (max 223 + 32 = 255).
-        // Out-of-range coordinates are CLAMPED by `encode_x10`; the framing
-        // never changes under the application's feet (see this fn's docs).
+        // X10 clamps out-of-range coordinates; the framing never changes (see the docs).
         MouseEncoding::X10 => encode_x10(legacy_cb, col, row),
         MouseEncoding::Utf8 => encode_utf8(legacy_cb, col, row),
         MouseEncoding::Sgr | MouseEncoding::SgrPixel => encode_sgr(cb, col, row, release),
@@ -301,18 +254,15 @@ mod tests {
         assert_eq!(result, encode_x10(0, 10, 5));
     }
 
-    /// IN RANGE: the last column the X10 byte form can name. 0-based 222 is
-    /// 1-based 223 is byte 255 — the boundary the clamp is measured against.
+    /// In range: 0-based 222 is 1-based 223 is byte 255, the last column X10 can name.
     #[test]
     fn encode_mouse_x10_in_range_is_the_six_byte_frame() {
         let result = encode_mouse(0, 222, 5, MouseEncoding::X10, false);
         assert_eq!(result, vec![0x1b, b'[', b'M', 32, 255, 38]);
     }
 
-    /// PAST 222: still the six-byte X10 frame, coordinate clamped — NEVER the
-    /// SGR form. The audit case: 24x260 with only DECSET 1000 set, a click at
-    /// 0-based column 250 used to emit `ESC [ < 0 ; 251 ; 6 M`, a 1006 report
-    /// the application never enabled and cannot parse.
+    /// Past 222: still the six-byte X10 frame, coordinate clamped, never the SGR form an app
+    /// with only DECSET 1000 set cannot parse.
     #[test]
     fn encode_mouse_x10_past_222_clamps_and_keeps_x10_framing() {
         let result = encode_mouse(0, 250, 5, MouseEncoding::X10, false);
@@ -326,8 +276,7 @@ mod tests {
             b"\x1b[<0;251;6M".to_vec(),
             "the pre-fix SGR fallback is exactly what must not come back"
         );
-        // Both axes out of range, and a RELEASE: still six bytes, and the
-        // legacy button-3 substitution the X10 form requires.
+        // Both axes out of range, and a release: still six bytes, with the legacy button 3.
         let release = encode_mouse(0, 400, 300, MouseEncoding::X10, true);
         assert_eq!(release, vec![0x1b, b'[', b'M', 32 + 3, 255, 255]);
     }
@@ -360,10 +309,7 @@ mod tests {
         assert_eq!(result, encode_sgr(0, 10, 5, false));
     }
 
-    /// Regression test: u16::MAX (65535) coordinates must not overflow or panic.
-    ///
-    /// Bug #2775 fix: mouse encoders with u16::MAX coordinates previously could
-    /// overflow in the +1 offset calculation. `saturating_add(1)` prevents this.
+    /// u16::MAX coordinates do not overflow the +1 offset (#2775).
     #[test]
     fn sgr_u16_max_coordinates_no_overflow() {
         let result = encode_sgr(0, u16::MAX, u16::MAX, false);
@@ -372,7 +318,7 @@ mod tests {
         assert_eq!(result, expected);
     }
 
-    /// Regression test: URXVT encoding with u16::MAX coordinates.
+    /// URXVT with u16::MAX coordinates does not overflow.
     #[test]
     fn urxvt_u16_max_coordinates_no_overflow() {
         let result = encode_urxvt(32, u16::MAX, u16::MAX);
@@ -380,7 +326,7 @@ mod tests {
         assert_eq!(result, expected);
     }
 
-    /// Regression test: X10 encoding with u16::MAX coordinates clamps correctly.
+    /// X10 with u16::MAX coordinates clamps.
     #[test]
     fn x10_u16_max_coordinates_clamps() {
         let result = encode_x10(0, u16::MAX, u16::MAX);

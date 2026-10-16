@@ -14,12 +14,6 @@ use aterm_spec::{interp, verify};
 #[test]
 fn typed_rekey_proves_catches_and_has_no_dead_action() {
     let model = typed_rekey_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name),
-        "the typed re-key must stay enrolled in the spec-link registry"
-    );
     let fired = interp::fired_actions(&model);
     assert_eq!(
         fired.len(),
@@ -100,7 +94,6 @@ fn typed_rekey_the_no_way_back_design_is_caught_on_every_invariant() {
     assert_eq!((b["settled"], b["sh"], b["eng"]), (1, 1, 2), "{b:?}");
     let (c, _) = interp::bmc(&only(&m, "NoLiveKeyInAFile")).expect_err("in a file");
     assert_eq!((c["settled"], c["file"], c["eng"]), (1, 1, 2), "{c:?}");
-    assert!(verify::uncaught_invariants(&typed_rekey_model()).is_empty());
     // The upgrade's own defect: an EMPTY first line, which an older sweep's
     // key-only line reads as the key — the working shell left signing nothing.
     let mut empty = m.init_state();

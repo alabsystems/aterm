@@ -7,16 +7,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "TLA+ models of aterm's kernel/security/concurrency invariants (ROADMAP WS-I), model-checked by `ty` from the test suite."
+description = "TLA+ models of aterm's kernel/security/concurrency invariants (ROADMAP WS-I), model-checked by `ty` from `spec-check`."
 
-# No code deps: the model-check test (tests/model_check.rs) shells out to the
-# `ty` TLA+ checker over the specs in `specs/`. The .tla/.cfg files ARE the crate.
-
-[dev-dependencies]
-# Test-only: the single shared verification-gate policy (the `ty` escalation tier —
-# absent, a NOT RUN notice names it and the test returns). Test-only so the
-# production crate stays dep-free — the .tla/.cfg files remain the whole crate.
-aterm-spec = { workspace = true }
+# No code deps: `spec-check specs` (aterm-spec) model-checks the specs in
+# `specs/` with `ty`. The .tla/.cfg files ARE the crate.
 
 [lints]
 workspace = true

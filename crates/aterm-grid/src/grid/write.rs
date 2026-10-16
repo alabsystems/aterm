@@ -2,19 +2,10 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Character writing operations for the terminal grid.
-//!
-//! This module provides methods for writing characters to the grid with
-//! various styling and wrapping options. Includes:
-//! - Basic character writes (`write_char`)
-//! - Autowrap writes (`write_char_wrap`)
-//! - Fast ASCII path (`write_ascii_blast`, `write_ascii_run_styled`)
-//! - Wide character handling (via write_split.rs in production)
-//! - Style-ID resolution (`resolve_style_to_colors`)
-//!
-//! Test-only convenience methods (`write_char_styled`, `write_char_with_style_id`,
-//! etc.) are in the `#[cfg(test)]` block below. Production code uses the split
-//! write/advance primitives in `write_split.rs`.
+//! Character writes: `write_char`, the ASCII bulk paths (`write_cell_run`,
+//! `write_ascii_blast`, `write_ascii_run_styled_packed`), style-ID resolution, and the
+//! stale-extras probe every writer shares. Wide characters and the split write/advance
+//! primitives are in `write_split.rs`; test-only combined helpers in `write_test_helpers.rs`.
 
 use super::{
     Cell, CellCoord, CellFlags, ColorType, ExtendedStyle, Grid, PackedColor, PackedColors, StyleId,
@@ -53,9 +44,19 @@ impl StaleExtras {
     /// Probe `row` before a write over `[start, end)`. Call only when the
     /// extras map is non-empty, keeping plain writes branch-only; allocates
     /// only when an overwritten cell carries an entry.
+    #[inline]
+    pub(super) fn probe(row: &crate::Row, start: u16, end: u16) -> Self {
+        if !row.any_has_extras_in_range(start, end)
+            && !row.flags().contains(crate::row::RowFlags::HAS_WIDE_CHARS)
+        {
+            return Self::NONE;
+        }
+        Self::probe_cold(row, start, end)
+    }
+
     #[cold]
     #[inline(never)]
-    pub(super) fn probe(row: &crate::Row, start: u16, end: u16) -> Self {
+    fn probe_cold(row: &crate::Row, start: u16, end: u16) -> Self {
         let mut overwritten = Vec::new();
         for col in start..end {
             if row.get(col).is_some_and(Cell::has_extras) {
@@ -73,6 +74,46 @@ impl StaleExtras {
 
     fn is_empty(&self) -> bool {
         self.overwritten.is_empty() && self.halves == [None, None]
+    }
+}
+
+// A `clean { … }` island is Clean surface that only a Trust rustc can parse. A
+// stock rustc (the cross cells of `verify cells`, the x86_64-apple-darwin
+// compat slice) parses a cfg'd-out module's body all the same, so the island's
+// module goes through this macro, which drops its tokens there and emits them
+// unchanged under `cfg(trust_verify)`.
+#[cfg(trust_verify)]
+macro_rules! verify_island {
+    ($($tt:tt)*) => {
+        $($tt)*
+    };
+}
+
+#[cfg(not(trust_verify))]
+macro_rules! verify_island {
+    ($($tt:tt)*) => {};
+}
+
+verify_island! {
+    mod stale_extras_probe_proofs {
+        // When no cell in `[start, end)` carries `HAS_EXTRAS` (`span_has_extras = false`)
+        // and the row carries no wide characters (`row_has_wide = false`), neither
+        // `overwritten` nor `halves` can contain any column, so `StaleExtras::probe`
+        // is identically `StaleExtras::NONE`.
+        clean {
+            section StaleExtrasProbeGate
+            theorem FastSkipSoundWhenNoSpanExtrasAndNoWide :
+                forall (span_has_extras row_has_wide : Prop),
+                    Not span_has_extras ->
+                    Not row_has_wide ->
+                    Not (Or span_has_extras row_has_wide) :=
+                fun (span_has_extras row_has_wide : Prop)
+                    (h_no_span : Not span_has_extras)
+                    (h_no_wide : Not row_has_wide) =>
+                    fun (h_or : Or span_has_extras row_has_wide) =>
+                        Or.elim h_or h_no_span h_no_wide
+            end StaleExtrasProbeGate
+        }
     }
 }
 
@@ -98,13 +139,9 @@ pub(crate) struct StaleGlyph {
 }
 
 impl Grid {
-    /// Remove what [`StaleExtras::probe`] found for a row that has just been
-    /// overwritten.
-    ///
-    /// Otherwise an overwritten cell's entry (hyperlink, combining marks,
-    /// underline color, RGB overflow) would linger, and a later styled write's
-    /// `get_or_create` at that coordinate would merge the stale data (e.g. an
-    /// old hyperlink) into the new cell.
+    /// Remove what [`StaleExtras::probe`] found for a row that has just been overwritten, so a
+    /// later styled write's `get_or_create` there cannot merge a stale entry (an old hyperlink,
+    /// combining mark, underline colour, RGB overflow) into the new cell.
     #[inline]
     pub(super) fn remove_stale_extras(&mut self, row: u16, stale: StaleExtras) {
         if !stale.is_empty() {
@@ -137,8 +174,8 @@ impl Grid {
         self.stale_extras_pair_cold(row, col, width)
     }
 
-    /// Out-of-line probe for [`Self::stale_extras_pair`] — only reached when
-    /// the extras map is non-empty, keeping the hot write bodies lean.
+    /// Out-of-line probe for [`Self::stale_extras_pair`], reached only when the extras map is
+    /// non-empty.
     #[cold]
     #[inline(never)]
     fn stale_extras_pair_cold(&self, row: u16, col: u16, width: u16) -> StaleGlyph {
@@ -179,34 +216,24 @@ impl Grid {
         }
     }
 
-    /// Drop the extras-map entries in `cols` of visible row `row` whose cells
-    /// no longer claim one.
+    /// Drop the extras-map entries in `cols` of visible row `row` whose cells no longer claim
+    /// one.
     ///
-    /// A cell's HAS_EXTRAS bit is its claim on the entry keyed to its
-    /// coordinate (`HAS_EXTRAS ⇔ entry`, which [`Self::assert_extras_claimed`]
-    /// checks). An operation that blanks or replaces cells outside the writers'
-    /// stale-entry probe clears the bit with the cell and leaves the entry
-    /// keyed to it: a wide pair's orphaned half, a pair bisected by ICH, DCH,
-    /// ECH or EL, a selective erase, a rectangle copy or shift, VS16 or VS15
-    /// reshaping a pair. A later write there with an extras style adopts it
-    /// (`get_or_create`), so an old combining mark, skin tone, link or underline
-    /// colour reappears on new text, and the readers that do not gate on the
-    /// bit (`cell_extra`, `hyperlink_at`, checkpoint serialization) see it at
-    /// once. Every such operation calls this over the columns it may have
-    /// blanked. A cell that kept the bit keeps its entry: a protected cell a
-    /// selective erase skipped, a cell a shift moved together with its entry.
-    /// A cell without the bit keeps only truecolor fg/bg bytes, which a BCE
-    /// blank owns through the RGB marker in its packed colours (reflow harvests
-    /// them from the dense ring into the map); stale bytes under a cell whose
-    /// colours are not truecolor are never read.
+    /// A cell's HAS_EXTRAS bit is its claim on the entry keyed to its coordinate
+    /// (`HAS_EXTRAS ⇔ entry`, checked by [`Self::assert_extras_claimed`]). Operations outside
+    /// the writers' stale-entry probe that blank or replace cells (a wide pair's orphaned half;
+    /// a pair bisected by ICH, DCH, ECH or EL; a selective erase; a rectangle copy or shift;
+    /// VS16/VS15 reshaping a pair) clear the bit but leave the entry, which a later
+    /// extras-style write would adopt (`get_or_create`) and ungated readers (`cell_extra`,
+    /// `hyperlink_at`, checkpoint serialization) see at once. Each calls this over the columns
+    /// it may have blanked, and the bit decides.
     ///
-    /// Ruling 2026-10-10 (r15 C2): the bit, not each caller's knowledge of
-    /// which cells its fixups touched, decides; the one primitive serves every
-    /// such operation, and the writers' probe ([`StaleExtras`]) reaches it for
-    /// the halves their fixups blank.
+    /// A cell that kept the bit keeps its entry. A cell without it keeps only truecolor fg/bg
+    /// bytes, which a BCE blank owns through the RGB marker in its packed colours; under a cell
+    /// whose colours are not truecolor they are never read.
     ///
-    /// Cost: nothing while the map is empty or holds no entry on the row; else
-    /// a flag read per column and a hash probe per column without the bit.
+    /// Cost: nothing while the map is empty or holds no entry on the row; else a flag read per
+    /// column and a hash probe per column without the bit.
     pub fn drop_unclaimed_extras(&mut self, row: u16, cols: core::ops::Range<u16>) {
         if self.storage.extras.is_empty() || cols.is_empty() {
             return;
@@ -241,30 +268,21 @@ impl Grid {
         }
     }
 
-    /// Advance cursor to next visual line for autowrap.
+    /// Advance the cursor to the next line for autowrap, with `line_feed()`'s scroll-region
+    /// behaviour:
+    /// - at the region bottom: scroll the region up;
+    /// - above it: move down one row;
+    /// - below it: move down unless at the screen bottom (xterm `xtermIndex`: below the region
+    ///   is CursorDown clamped at `max_row`, never a display scroll).
     ///
-    /// Mirrors `line_feed()` scroll-region behavior:
-    /// - At region bottom: scroll region up
-    /// - Above region bottom: move cursor down one row
-    /// - Below region bottom: move down unless at screen bottom, then nothing
-    ///   (xterm xtermIndex: `cur_row > bot_marg` is CursorDown, clamped at
-    ///   `max_row`, so wrapping below the region never scrolls the display)
-    ///
-    /// The row the wrapped content flows into is marked wrapped:
-    /// - when moving to a real next row;
-    /// - when the scroll region scrolls on wrap, for both a partial region and
-    ///   the full screen: the recycled destination row is a soft-wrap
-    ///   continuation, so reflow / selection / copy must see it as one line.
+    /// The row the wrapped content flows into is marked wrapped, including a row recycled by
+    /// a scroll, so reflow, selection and copy see one line.
     #[inline]
     pub(crate) fn advance_autowrap_line(&mut self) {
-        // The wrap fact: every autowrap line advance goes through this fn, so
-        // the serial bumps here and nowhere else, unconditionally, since even
-        // the clamped bottom-of-screen arm below is a wrap the caret observer
-        // must see.
+        // Every autowrap line advance comes through here, so the wrap serial bumps here
+        // only, and unconditionally: the clamped bottom-of-screen arm is a wrap too.
         self.storage.wrap_serial += 1;
-        // Determine whether the cursor was within the horizontal margins before
-        // moving it: with DECLRMM active and the cursor inside, wrap to the left
-        // margin; otherwise to column 0.
+        // Inside DECLRMM margins the wrap lands on the left margin, else on column 0.
         let margins = self.storage.horizontal_margins();
         let orig_col = self.storage.cursor.col;
         let in_margins = !margins.is_full(self.storage.cols)
@@ -280,22 +298,19 @@ impl Grid {
                 self.mark_row_wrapped(self.storage.cursor.row);
             }
             std::cmp::Ordering::Equal => {
-                // With DECLRMM active and the cursor within the margins, use a
-                // rectangular scroll so cells outside the margins are untouched.
+                // Inside DECLRMM margins, scroll the rectangle so cells outside them stay.
                 if in_margins {
                     self.scroll_region_up_margined(1, margins.left, margins.right);
                 } else {
                     self.scroll_region_up(1);
                 }
-                // The recycled destination row receives the soft-wrap
-                // continuation, so mark it wrapped (as in the `Less` branch), or
-                // copy would add a newline and reflow would split the line.
+                // The recycled row holds the soft-wrap continuation: mark it wrapped, or copy
+                // adds a newline and reflow splits the line.
                 self.mark_row_wrapped(self.storage.cursor.row);
             }
             std::cmp::Ordering::Greater => {
-                // Below the scroll region: cursor-down only, clamped at the
-                // last screen row (xterm CursorDown) — never a display
-                // scroll. Matches `line_feed()`.
+                // Below the scroll region: cursor-down clamped at the last row, never a
+                // scroll (as `line_feed()`).
                 if self.storage.cursor.row < self.storage.visible_rows.saturating_sub(1) {
                     self.storage.cursor.row = self.storage.cursor.row.saturating_add(1);
                     self.mark_row_wrapped(self.storage.cursor.row);
@@ -304,21 +319,18 @@ impl Grid {
         }
     }
 
-    /// Write a character at cursor position and advance cursor.
-    ///
-    /// Non-BMP characters (U+10000+) are stored in the overflow table
-    /// with the COMPLEX flag set, preserving the full codepoint.
+    /// Write a character at the cursor and advance it, without wrapping. A non-BMP char
+    /// (U+10000+) keeps its codepoint in the overflow table, with COMPLEX set.
     ///
     /// REQUIRES: self.storage.cursor.row < self.storage.visible_rows
     /// ENSURES: self.storage.cursor.col <= self.storage.max_col_for_row(self.storage.cursor.row)
     pub fn write_char(&mut self, c: char) {
         let cursor_row = self.storage.cursor.row;
         let cursor_col = self.storage.cursor.col;
-        // Drop a stale extras-map entry before overwriting.
         let stale = self.stale_extras_pair(cursor_row, cursor_col, 1);
         let is_non_bmp = (c as u32) > Cell::MAX_DIRECT_CODEPOINT;
-        // Write a BMP placeholder for non-BMP chars (Row only handles u16).
-        // The real character is stored in the overflow table below.
+        // Row cells hold BMP only: a non-BMP char writes U+FFFD, and its codepoint goes to the
+        // overflow table below.
         let write_c = if is_non_bmp { '\u{FFFD}' } else { c };
         if let Some(row) = self.row_mut(cursor_row) {
             row.write_char(cursor_col, write_c);
@@ -332,7 +344,6 @@ impl Grid {
             self.set_cell_complex_char(cursor_row, cursor_col, s);
         }
 
-        // Advance cursor
         let max_col = self.storage.max_col_for_row(cursor_row);
         if self.storage.cursor.col < max_col {
             self.storage.cursor.col += 1;
@@ -342,10 +353,8 @@ impl Grid {
         );
     }
 
-    /// Resolve a StyleId to PackedColor values and CellFlags.
-    ///
-    /// This helper method looks up the style and converts it to the format
-    /// needed for cell writes. Returns (fg, bg, flags).
+    /// Resolve a `StyleId` to the `(fg, bg, flags)` a cell write takes; `extra_flags` are
+    /// added to the style's own.
     #[inline]
     pub fn resolve_style_to_colors(
         &self,
@@ -353,7 +362,6 @@ impl Grid {
         extra_flags: CellFlags,
     ) -> (PackedColor, PackedColor, CellFlags) {
         if let Some(ext_style) = self.storage.styles.extended(style_id) {
-            // Convert extended style back to PackedColor format
             let fg = match ext_style.fg_type {
                 ColorType::Default => PackedColor::DEFAULT_FG,
                 ColorType::Indexed => PackedColor::indexed(ext_style.fg_index),
@@ -374,7 +382,6 @@ impl Grid {
                 ExtendedStyle::attrs_to_cell_flags(ext_style.style.attrs).union(extra_flags);
             (fg, bg, flags)
         } else {
-            // Fallback to default style
             (
                 PackedColor::DEFAULT_FG,
                 PackedColor::DEFAULT_BG,
@@ -383,15 +390,13 @@ impl Grid {
         }
     }
 
-    #[doc(hidden)] // Write char with deferred autowrap. Pub for crate benchmarks only.
+    #[doc(hidden)] // Write a char with deferred autowrap (test-only).
     #[cfg(test)]
     pub fn write_char_wrap(&mut self, c: char) {
-        // Resolve any deferred wrap before writing
         self.resolve_pending_wrap();
 
         let cursor_row = self.storage.cursor.row;
         let cursor_col = self.storage.cursor.col;
-        // Drop a stale extras-map entry before overwriting.
         let stale = self.stale_extras_pair(cursor_row, cursor_col, 1);
         let is_non_bmp = (c as u32) > Cell::MAX_DIRECT_CODEPOINT;
         let write_c = if is_non_bmp { '\u{FFFD}' } else { c };
@@ -407,7 +412,6 @@ impl Grid {
             self.set_cell_complex_char(cursor_row, cursor_col, s);
         }
 
-        // Advance cursor with deferred wrap
         let max_col = self.storage.max_col_for_row(cursor_row);
         if self.storage.cursor.col < max_col {
             self.storage.cursor.col += 1;
@@ -417,14 +421,9 @@ impl Grid {
         debug_assert!(self.storage.cursor.row < self.storage.visible_rows);
     }
 
-    /// Fast path: fill N consecutive cells with the same character and style.
-    ///
-    /// Creates a template `Cell` from the given ASCII byte and style, then
-    /// bulk-writes it using `Row::fill_cell_run` (which lowers to a memset-like
-    /// operation for 8-byte cells). Handles autowrap: when the run exceeds the
-    /// current line, wraps to the next line and continues filling.
-    ///
-    /// Returns the total number of cells written.
+    /// Fill `count` cells with one ASCII byte and style (`Row::fill_cell_run`, a slice fill),
+    /// wrapping to the next line when the run passes the end of the current one. Returns the
+    /// number of cells written.
     ///
     /// REQUIRES: `byte` is printable ASCII (0x20..=0x7E), insert mode OFF, auto-wrap ON
     /// REQUIRES: the cursor is not outside a DECSLRM span
@@ -447,8 +446,7 @@ impl Grid {
         let template = Cell::from_ascii_styled(byte, colors, flags);
         let mut written = 0;
         let mut remaining = count;
-        // hoisted per run — zero per-cell cost when the extras map
-        // is empty (the common plain-text case).
+        // Hoisted per run: no per-cell cost when the extras map is empty.
         let scan_stale = !self.storage.extras.is_empty();
 
         while remaining > 0 {
@@ -457,7 +455,7 @@ impl Grid {
             let cursor_row = self.storage.cursor.row;
             let cursor_col = self.storage.cursor.col;
 
-            // Pre-compute margin clamp before mutable borrow.
+            // The margin clamp, computed before the row's mutable borrow.
             let margin_clamp = if self.storage.has_horizontal_margins {
                 let margins = self.storage.horizontal_margins();
                 if !margins.is_full(self.storage.cols)
@@ -472,13 +470,11 @@ impl Grid {
                 None
             };
 
-            // Combined row access + effective cols: single ring-buffer lookup
             let Some((row, effective_cols)) = self.storage.row_mut_with_effective_cols(cursor_row)
             else {
                 break;
             };
 
-            // Clamp effective cols by right margin when DECLRMM is active.
             let effective_cols = if let Some(clamp) = margin_clamp {
                 effective_cols.min(clamp)
             } else {
@@ -496,28 +492,25 @@ impl Grid {
 
             let to_write_u16 = u16::try_from(to_write).unwrap_or(u16::MAX);
 
-            // Capture stale-extras columns before the overwrite clobbers the
-            // HAS_EXTRAS flags; the entries are removed after the row borrow
-            // ends.
+            // Probe before the overwrite clears the HAS_EXTRAS bits; remove once the row
+            // borrow ends.
             let stale = if scan_stale {
                 StaleExtras::probe(row, cursor_col, cursor_col + to_write_u16)
             } else {
                 StaleExtras::NONE
             };
 
-            // Bulk fill — Row::fill_cell_run uses slice::fill() (memset-like).
             row.fill_cell_run(cursor_col, to_write_u16, template);
 
             self.remove_stale_extras(cursor_row, stale);
 
-            // Mark damage for the row (row-level is faster than per-cell).
             self.storage.mark_content_row(cursor_row);
 
             *last_byte = Some(byte);
             written += to_write;
             remaining -= to_write;
 
-            // Advance cursor with deferred wrap at end of line.
+            // Defer the wrap after the last batch; wrap now if more data follows.
             let new_col = cursor_col + to_write_u16;
             if new_col > max_col {
                 if remaining == 0 {
@@ -536,7 +529,7 @@ impl Grid {
         written
     }
 
-    /// Fast path: write printable ASCII bytes directly as u64 cells.
+    /// Write printable default-style ASCII bytes directly as cells.
     ///
     /// REQUIRES: all bytes 0x20..=0x7E, default style, insert mode OFF, auto-wrap ON
     /// REQUIRES: the cursor is not outside a DECSLRM span
@@ -550,15 +543,12 @@ impl Grid {
         }
         let mut written = 0;
         let mut remaining = ascii;
-        // hoisted per run — zero per-cell cost when the extras map
-        // is empty (the common plain-text case).
         let scan_stale = !self.storage.extras.is_empty();
         while !remaining.is_empty() {
             self.resolve_pending_wrap(); // deferred wrap
             let cursor_row = self.storage.cursor.row;
             let cursor_col = self.storage.cursor.col;
 
-            // Pre-compute margin clamp before mutable borrow.
             let margin_clamp = if self.storage.has_horizontal_margins {
                 let margins = self.storage.horizontal_margins();
                 if !margins.is_full(self.storage.cols)
@@ -573,13 +563,11 @@ impl Grid {
                 None
             };
 
-            // Combined row access + effective cols: single ring-buffer lookup
             let Some((row, effective_cols)) = self.storage.row_mut_with_effective_cols(cursor_row)
             else {
                 break;
             };
 
-            // Clamp effective cols by right margin when DECLRMM is active.
             let effective_cols = if let Some(clamp) = margin_clamp {
                 effective_cols.min(clamp)
             } else {
@@ -587,29 +575,22 @@ impl Grid {
             };
 
             let max_col = effective_cols.saturating_sub(1);
-            // How many chars can we write on this line?
             let available = (effective_cols.saturating_sub(cursor_col)) as usize;
             let to_write = remaining.len().min(available);
 
             if to_write == 0 {
-                // At end of line, need to wrap
                 self.advance_autowrap_line();
                 continue;
             }
 
-            // to_write bounded by effective_cols (u16) — saturate for safety
             let to_write_u16 = u16::try_from(to_write).unwrap_or(u16::MAX);
 
-            // Capture stale-extras columns before the overwrite clobbers the
-            // HAS_EXTRAS flags; the entries are removed after the row borrow
-            // ends.
             let stale = if scan_stale {
                 StaleExtras::probe(row, cursor_col, cursor_col + to_write_u16)
             } else {
                 StaleExtras::NONE
             };
 
-            // Write directly to row cells
             if let Some(target) = row.cells_mut_with_fixup(cursor_col, to_write_u16) {
                 debug_assert_eq!(target.len(), to_write);
                 for (cell, &byte) in target.iter_mut().zip(remaining[..to_write].iter()) {
@@ -617,26 +598,21 @@ impl Grid {
                 }
             }
 
-            // Update row len to include written content
             row.update_len(cursor_col + to_write_u16);
 
             self.remove_stale_extras(cursor_row, stale);
 
-            // Mark damage for the row (mark_row is faster than per-cell)
             self.storage.mark_content_row(cursor_row);
 
             written += to_write;
             remaining = &remaining[to_write..];
 
-            // Advance cursor with deferred wrap at end of line
             let new_col = cursor_col + to_write_u16;
             if new_col > max_col {
                 if remaining.is_empty() {
-                    // Last batch — defer wrap (cursor stays at last col)
                     self.storage.cursor.col = max_col;
                     self.storage.mark_pending_wrap();
                 } else {
-                    // More data coming — wrap now to continue writing
                     self.advance_autowrap_line();
                 }
             } else {
@@ -649,7 +625,7 @@ impl Grid {
         written
     }
 
-    /// Fast path: write styled ASCII bytes with autowrap and deferred wrapping.
+    /// Write styled ASCII bytes with autowrap and deferred wrapping.
     ///
     /// REQUIRES: all bytes 0x20..=0x7E, no RGB overflow, insert mode OFF
     /// ENSURES: result <= ascii.len(), self.storage.cursor.row < self.storage.visible_rows
@@ -667,10 +643,7 @@ impl Grid {
         self.write_ascii_run_styled_packed(ascii, colors, flags, last_byte)
     }
 
-    /// Fast path: write styled ASCII bytes with pre-computed packed colors.
-    ///
-    /// Like `write_ascii_run_styled` but accepts pre-computed `PackedColors`
-    /// to avoid redundant `convert_colors` when the caller already has them.
+    /// Write styled ASCII bytes with autowrap and deferred wrapping, given packed colors.
     ///
     /// REQUIRES: all bytes 0x20..=0x7E, no RGB overflow, insert mode OFF
     /// REQUIRES: the cursor is not outside a DECSLRM span
@@ -691,18 +664,14 @@ impl Grid {
 
         let mut written = 0;
         let mut remaining = ascii;
-        // hoisted per run — zero per-cell cost when the extras map
-        // is empty (the common plain-text case).
         let scan_stale = !self.storage.extras.is_empty();
 
         while !remaining.is_empty() {
-            // Resolve deferred wrap before writing next batch
             self.resolve_pending_wrap();
 
             let cursor_row = self.storage.cursor.row;
             let cursor_col = self.storage.cursor.col;
 
-            // Pre-compute margin clamp before mutable borrow.
             let margin_clamp = if self.storage.has_horizontal_margins {
                 let margins = self.storage.horizontal_margins();
                 if !margins.is_full(self.storage.cols)
@@ -717,13 +686,11 @@ impl Grid {
                 None
             };
 
-            // Combined row access + effective cols: single ring-buffer lookup
             let Some((row, effective_cols)) = self.storage.row_mut_with_effective_cols(cursor_row)
             else {
                 break;
             };
 
-            // Clamp effective cols by right margin when DECLRMM is active.
             let effective_cols = if let Some(clamp) = margin_clamp {
                 effective_cols.min(clamp)
             } else {
@@ -732,29 +699,22 @@ impl Grid {
 
             let max_col = effective_cols.saturating_sub(1);
 
-            // How many chars can we write on this line?
             let available = (effective_cols.saturating_sub(cursor_col)) as usize;
             let to_write = remaining.len().min(available);
 
             if to_write == 0 {
-                // At end of line, need to wrap
                 self.advance_autowrap_line();
                 continue;
             }
 
-            // to_write bounded by effective_cols (u16) — saturate for safety
             let to_write_u16 = u16::try_from(to_write).unwrap_or(u16::MAX);
 
-            // Capture stale-extras columns before the overwrite clobbers the
-            // HAS_EXTRAS flags; the entries are removed after the row borrow
-            // ends.
             let stale = if scan_stale {
                 StaleExtras::probe(row, cursor_col, cursor_col + to_write_u16)
             } else {
                 StaleExtras::NONE
             };
 
-            // Write styled cells directly to row
             if let Some(target) = row.cells_mut_with_fixup(cursor_col, to_write_u16) {
                 debug_assert_eq!(target.len(), to_write);
                 for (cell, &byte) in target.iter_mut().zip(remaining[..to_write].iter()) {
@@ -762,15 +722,13 @@ impl Grid {
                 }
             }
 
-            // Update row len to include written content
             row.update_len(cursor_col + to_write_u16);
 
             self.remove_stale_extras(cursor_row, stale);
 
-            // Mark damage for the row (mark_row is faster than per-cell)
             self.storage.mark_content_row(cursor_row);
 
-            // Track last byte for REP
+            // Last byte, for REP.
             if let Some(&last) = remaining[..to_write].last() {
                 *last_byte = Some(last);
             }
@@ -778,15 +736,12 @@ impl Grid {
             written += to_write;
             remaining = &remaining[to_write..];
 
-            // Advance cursor with deferred wrap at end of line
             let new_col = cursor_col + to_write_u16;
             if new_col > max_col {
                 if remaining.is_empty() {
-                    // Last batch — defer wrap (cursor stays at last col)
                     self.storage.cursor.col = max_col;
                     self.storage.mark_pending_wrap();
                 } else {
-                    // More data coming — wrap now to continue writing
                     self.advance_autowrap_line();
                 }
             } else {
@@ -811,13 +766,8 @@ impl Grid {
         }
     }
 
-    /// Mark a cell as complex and store the character string in overflow.
-    ///
-    /// This is used for non-BMP characters (emoji, etc.) that cannot fit
-    /// in the 16-bit char_data field of the packed Cell.
-    ///
-    /// The cell at (row, col) should already have been written. This method
-    /// sets the COMPLEX flag and stores the string in CellExtras.
+    /// Mark an already-written cell COMPLEX and store `s` in its `CellExtras`: non-BMP
+    /// characters (emoji) do not fit the cell's 16-bit char data.
     ///
     /// REQUIRES: row < self.storage.visible_rows
     /// REQUIRES: col < self.storage.cols
@@ -827,7 +777,6 @@ impl Grid {
         if let Some(r) = self.row_mut(row)
             && let Some(cell) = r.get_mut(col)
         {
-            // Set COMPLEX flag and clear char_data (we'll use overflow)
             let mut flags = cell.flags();
             flags.insert(CellFlags::COMPLEX);
             cell.set_flags(flags);
@@ -835,13 +784,9 @@ impl Grid {
             cell.set_has_extras(true);
         }
 
-        // Store the string in the overflow table
         let extra = self.storage.extras.get_or_create(CellCoord::new(row, col));
         extra.set_complex_char(Some(Arc::from(s)));
 
         self.storage.mark_content_cell(row, col);
     }
 }
-
-// write_test_helpers declared in parent mod.rs to keep module paths stable
-// for cross-crate consumers (aterm-core tests import through grid::, not grid::write::).

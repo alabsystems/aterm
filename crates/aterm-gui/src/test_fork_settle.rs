@@ -13,17 +13,9 @@
 //! that strips its child passes the gate first (`InheritStrip::prepare`), but
 //! this binary's test helpers fork on their own.
 //!
-//! In this test binary the gate is armed by the first headless `App`: its
-//! appearance read (`native_appearance_preferences` → NSWorkspace →
-//! CFPreferences → `os_log_create`) is the process's first libnotify call, and
-//! it runs on one test thread while others fork. Measured 2026-10-01, load
-//! 100-150 on 18 cores, `title_summary:: qos:: --test-threads 16` looped 360
-//! times: 8 runs lost a forked child that way — a `sleep 30` "disappeared
-//! before identity capture" (its `waitid` status: killed, SIGKILL), a stand-in
-//! daemon or a `/usr/bin/true` that exited on signal 9, a shell that died
-//! before printing its child's pid — each with the crash report above, named
-//! after the test binary. With the gate passed at load, 0 in 360, run beside
-//! them.
+//! Explicit native observer tests still reach NSWorkspace while process tests
+//! fork. Test Apps use inert preference probes; the native runtime tests and
+//! process helpers nevertheless share libnotify's process-global fork state.
 //!
 //! So the gate is passed once, at image load, before the harness has started a
 //! thread; from then on `_notify_fork_child` in any child takes the built

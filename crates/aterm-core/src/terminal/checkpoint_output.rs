@@ -3,48 +3,30 @@
 // Author: Andrew Yates
 
 //! The in-flight output state of a [`TerminalCheckpoint`](super::TerminalCheckpoint):
-//! what a program set in the ENGINE, not the parser, that output still to
-//! come relies on (round eight of the update audit, finding 502).
+//! what a finished sequence left in the engine (not the parser) that output still
+//! queued on the PTY at a seamless-update park relies on. The parser carry
+//! (`checkpoint_parser`) continues a sequence split at the park; this carries:
 //!
-//! A seamless update can park over output still queued on the PTY, and the
-//! successor reads the queued bytes after Commit. The parser carry
-//! (`checkpoint_parser`) continues a sequence split at the park; this
-//! continues the state a FINISHED sequence left in the engine:
+//! * the REP (`CSI b`) character, raw, so `X` then `CSI 40 b` repeats wherever
+//!   the park falls;
+//! * an SGR 58 underline colour, raw (`0x01_RRGGBB` or `0x02_0000NN`), which the
+//!   pen ([`StyleRepr`](super::StyleRepr)) does not hold;
+//! * an open OSC 8 link and its `id=`, so the rest of the link's text is linked;
+//! * a VT52 `ESC Y` waiting for its row and column bytes, which would otherwise
+//!   print as text;
+//! * a just-written ZWJ (U+200D), so the emoji after it joins the previous cell;
+//! * the XTPUSHSGR stack (`CSI # {`), so a later XTPOPSGR restores the pushed pen;
+//! * the XTSAVE'd DEC private modes (`CSI ? Ps s`), so a later XTRESTORE restores
+//!   them.
 //!
-//! * the character REP (`CSI b`) repeats, raw, as the engine keeps it — a
-//!   program that writes `X` and then `CSI 40 b` gets its 40 repeats wherever
-//!   the park falls between the two;
-//! * an SGR 58 underline colour, raw (`0x01_RRGGBB` or `0x02_0000NN`), which
-//!   the pen ([`StyleRepr`](super::StyleRepr)) does not hold;
-//! * an open OSC 8 link and its `id=`, so the rest of the link's text is
-//!   linked (text written unlinked stays so in the scrollback for good);
-//! * a VT52 `ESC Y` waiting for its row and column bytes, which would
-//!   otherwise print as text;
-//! * a zero-width joiner (U+200D) just written, so the emoji that follows it
-//!   joins the previous cell (`👨` ZWJ | `💻` is one two-cell glyph, not two,
-//!   and the rest of the line keeps its columns);
-//! * the XTPUSHSGR stack (`CSI # {`), at most `SGR_STACK_MAX_DEPTH` entries,
-//!   so an XTPOPSGR (`CSI # }`) after the park puts back the pen pushed before
-//!   it instead of leaving the pushed-over style in force;
-//! * the XTSAVE'd DEC private modes (`CSI ? Ps s`), so an XTRESTORE after the
-//!   park puts each mode back instead of leaving it as the program set it in
-//!   between (autowrap left off, say).
+//! [`OutputStateRepr`] crosses as one additive `CheckpointMeta` key, absent when
+//! none of it is set. A consumer that predates it ignores the key, so a hop to an
+//! older build still re-parks over queued output for an open link or a VT52 address
+//! ([`Terminal::output_state_in_flight`]) and loses the rest.
 //!
-//! [`OutputStateRepr`] crosses as one additive `CheckpointMeta` key, absent
-//! when none of it is set. A producer that predates it writes no key, and its
-//! meta restores exactly as before (none of it set); a consumer that predates
-//! it ignores the key, so the seamless capture still re-parks over queued
-//! output on a hop to an older build for the two states it always re-parked
-//! for, an open link and a VT52 address ([`Terminal::output_state_in_flight`]);
-//! that hop loses the rest as it always did. A restore puts each value through
-//! the engine's own door, never past it: the link through the OSC 8 handler,
-//! so this engine's scheme allowlist and caps decide it as they decide a link
-//! a program sends; a saved mode only when this engine's XTSAVE could have
-//! saved it; the SGR stack cut to this engine's depth.
-//!
-//! The PTY keeper's META (`aterm-gui`'s `seamless::keeper_meta`) carries none
-//! of it: that META is a sample resent only when the modes change, so its
-//! in-flight state may be hours stale at a crash.
+//! The PTY keeper's META (`aterm-gui`'s `seamless::keeper_meta`) carries none of
+//! it: that META is resent only when the modes change, so its in-flight state may
+//! be hours stale at a crash.
 
 use super::transient_state::Vt52CursorState;
 use super::{SGR_STACK_MAX_DEPTH, SgrPushMask, SgrStackEntry, Terminal};
@@ -116,9 +98,8 @@ pub struct SavedModeRepr {
     pub set: bool,
 }
 
-/// The engine's in-flight output state (see the module docs). `Default` is
-/// none of it set, which is what a fresh engine holds and what a checkpoint
-/// from a producer before this projection restores.
+/// The engine's in-flight output state (see the module docs). `Default` is none of
+/// it set: a fresh engine, or a producer that predates the key.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct OutputStateRepr {
@@ -182,10 +163,9 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
-/// Read a carried [`OutputStateRepr`], or the default when the value is not
-/// one. `CheckpointMeta` is parsed whole (as with `lenient_title`), and state
-/// a successor can live without must not cost the screen: an unreadable
-/// value restores as an older producer's absent key does.
+/// Read a carried [`OutputStateRepr`], or the default when the value is not one:
+/// `CheckpointMeta` is parsed whole (as with `lenient_title`), and state a successor
+/// can live without must not cost the screen.
 #[cfg(feature = "serde")]
 pub(super) fn lenient_output_state<'de, D>(deserializer: D) -> Result<OutputStateRepr, D::Error>
 where
@@ -240,25 +220,21 @@ impl Terminal {
                     .iter()
                     .map(|(&mode, &set)| SavedModeRepr { mode, set })
                     .collect();
-                // The map's order is not the wire's: the meta bytes are
-                // digested as sent.
+                // The map's order is arbitrary and the meta bytes are digested as
+                // sent, so sort.
                 saved.sort_unstable_by_key(|saved| saved.mode);
                 saved
             },
         }
     }
 
-    /// Install a carried [`OutputStateRepr`], replacing this engine's: a
-    /// restore makes the engine the one that was checkpointed, so what the
-    /// checkpoint does not hold is cleared. The link goes through the OSC 8
-    /// handler itself, which refuses what it would refuse from a program (an
-    /// over-cap URI, a scheme this engine does not allow, a control or bidi
-    /// override); a refused link costs the link's continuation, nothing else.
-    /// A REP character that is a control is dropped: the engine never records
-    /// one. The SGR stack keeps its newest `SGR_STACK_MAX_DEPTH` entries, as
-    /// XTPUSHSGR evicts the oldest; a saved mode this engine's XTSAVE could not
-    /// have saved (one `query_dec_mode` does not know) is dropped, which also
-    /// bounds the map.
+    /// Install a carried [`OutputStateRepr`], replacing this engine's (what the
+    /// checkpoint does not hold is cleared). Each value goes through the engine's own
+    /// door: the link through the OSC 8 handler, which refuses what it would refuse from
+    /// a program (a refused link costs only its continuation); a control REP character
+    /// is dropped, as the engine never records one; the SGR stack keeps its newest
+    /// `SGR_STACK_MAX_DEPTH` entries, as XTPUSHSGR evicts the oldest; a saved mode
+    /// `query_dec_mode` does not know is dropped, which also bounds the map.
     pub(super) fn apply_output_state_repr(&mut self, repr: &OutputStateRepr) {
         self.transient.last_graphic_char = repr.rep.filter(|c| !c.is_control());
         self.transient.current_underline_color = repr.underline_color;
@@ -284,9 +260,8 @@ impl Terminal {
             })
             .collect();
         // Closed first: the handler ignores a URI it refuses, which would leave
-        // this engine's own link open. The `id=` parameter cannot hold `:` or
-        // `;` (the handler splits on both), so a carried id rebuilds the
-        // parameter it came from exactly.
+        // this engine's own link open. An `id=` cannot hold `:` or `;` (the handler
+        // splits on both), so a carried id rebuilds its parameter exactly.
         self.transient.current_hyperlink = None;
         self.transient.current_hyperlink_id = None;
         let known: Vec<SavedModeRepr> = {

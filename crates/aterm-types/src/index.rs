@@ -2,15 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Grid indexing types for terminal coordinates.
-//!
-//! Provides `Line`, `Column`, `Point`, and related types used to address
-//! cells in a terminal grid.
+//! Grid indexing types (`Line`, `Column`, `Dimensions`) for terminal coordinates.
 
 use std::fmt;
 use std::ops::{Add, Sub};
 
-/// Grid dimensions trait for Point/Line arithmetic.
+/// Grid dimensions for line and column arithmetic.
 pub trait Dimensions {
     /// Total lines in the buffer (visible + scrollback).
     fn total_lines(&self) -> usize;
@@ -21,11 +18,8 @@ pub trait Dimensions {
 
     /// Index for the last column.
     #[must_use]
-    // Skip: a trait DEFAULT method dispatching to `Self::columns()` — the
-    // implementor is caller-chosen (aterm-grid implements `Dimensions` for
-    // `Grid`), so the callee is unknowable here. This is the irreducible
-    // open-world dispatch class: `Dimensions` is genuinely public and
-    // downstream-implementable, so the closed-world rung cannot apply.
+    // Skip: a default method dispatching to `Self::columns()`; `Dimensions` is public and
+    // implemented downstream (aterm-grid's `Grid`), so the callee is unknowable here.
     #[cfg_attr(trust_verify, trust::skip)]
     fn last_column(&self) -> Column {
         Column(self.columns().saturating_sub(1))
@@ -33,50 +27,33 @@ pub trait Dimensions {
 
     /// Topmost line in history.
     #[must_use]
-    // Skip: same irreducible open-world dispatch as `last_column` — a trait
-    // DEFAULT method calling caller-implemented `Self` methods. `Dimensions`
-    // is public and implemented downstream (aterm-grid for `Grid`), so the
-    // closed-world rung cannot apply.
+    // Skip: open-world dispatch, as `last_column`.
     #[cfg_attr(trust_verify, trust::skip)]
     fn topmost_line(&self) -> Line {
-        // Clamp to i32::MAX before negation to prevent silent truncation.
-        // `try_from(..).unwrap_or(MAX)` is the same clamp as
-        // `.min(i32::MAX as usize) as i32`, and `0 - n` with `n >= 0` cannot
-        // overflow, so the saturating subtraction is exact.
+        // Clamp to i32::MAX before negating; `0 - n` with `n >= 0` cannot overflow.
         let clamped = i32::try_from(self.history_size()).unwrap_or(i32::MAX);
         Line(0i32.saturating_sub(clamped))
     }
 
     /// Bottommost line in the viewport.
     #[must_use]
-    // Skip: same irreducible open-world dispatch as `last_column` — a trait
-    // DEFAULT method calling caller-implemented `Self` methods. `Dimensions`
-    // is public and implemented downstream (aterm-grid for `Grid`), so the
-    // closed-world rung cannot apply.
+    // Skip: open-world dispatch, as `last_column`.
     #[cfg_attr(trust_verify, trust::skip)]
     fn bottommost_line(&self) -> Line {
-        // Clamp to i32::MAX to prevent silent truncation on extreme sizes.
-        // `try_from(..).unwrap_or(MAX)` is the same clamp as
-        // `.min(i32::MAX as usize) as i32`.
+        // Clamp to i32::MAX on extreme sizes.
         Line(i32::try_from(self.screen_lines().saturating_sub(1)).unwrap_or(i32::MAX))
     }
 
     /// Number of lines in scrollback history.
     #[must_use]
-    // Skip: same irreducible open-world dispatch as `last_column` — a trait
-    // DEFAULT method calling caller-implemented `Self` methods. `Dimensions`
-    // is public and implemented downstream (aterm-grid for `Grid`), so the
-    // closed-world rung cannot apply.
+    // Skip: open-world dispatch, as `last_column`.
     #[cfg_attr(trust_verify, trust::skip)]
     fn history_size(&self) -> usize {
         self.total_lines().saturating_sub(self.screen_lines())
     }
 }
 
-/// Convenience `Dimensions` for `(lines, columns)` tuples
-/// used in tests and lightweight grid simulations.
-///
-/// All lines are visible (no scrollback): `screen_lines() == total_lines()`.
+/// `Dimensions` for `(lines, columns)` tuples, with no scrollback.
 impl Dimensions for (usize, usize) {
     fn total_lines(&self) -> usize {
         self.0
@@ -98,10 +75,8 @@ pub struct Line(pub i32);
 
 impl fmt::Display for Line {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Trust gate: `write!(f, "{}", ..)` needs a runtime-argument
-        // `format_args!`, which the native lowering cannot model. The nested
-        // `{}` always formats with default options (it never inherits `f`'s
-        // flags), so `to_string()` + `write_str` is byte-identical.
+        // Trust gate: `write!` needs a runtime-argument `format_args!` the native lowering
+        // cannot model; `to_string()` + `write_str` is byte-identical.
         f.write_str(&self.0.to_string())
     }
 }
@@ -187,8 +162,7 @@ pub struct Column(pub usize);
 
 impl fmt::Display for Column {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Trust gate: byte-identical to `write!(f, "{}", self.0)`; see
-        // `Display for Line`.
+        // Trust gate: see `Display for Line`.
         f.write_str(&self.0.to_string())
     }
 }

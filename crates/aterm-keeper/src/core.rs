@@ -1,20 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE PURE KEEPER: the custody table, the §5.4 death classifier, offer
-//! exclusivity and the relaunch brake — every decision the keeper makes, and
-//! nothing that touches the operating system.
+//! The pure keeper: the custody table, the §5.4 death classifier, offer exclusivity and the
+//! relaunch brake. Every decision the keeper makes, and nothing that touches the OS.
 //!
-//! The core owns no descriptor. It tells its caller what to do with the ones
-//! the caller holds ([`Out::Keep`], [`Out::Close`], [`Out::Offer`]), and it asks
-//! the world three questions through [`KeeperEnv`]: who holds a master (the
-//! holder scan), whether a shell is still the process it registered, and
-//! whether a pid is still the process that connected. Time is a caller-supplied
-//! millisecond clock. That is what lets the Tier-1 bind
-//! (`src/conformance_custody.rs`) drive the REAL decisions through every
-//! bounded event sequence against `PtyKeeperCustody` and `KeeperRelaunchBrake`
-//! (`aterm_spec::derive`), and the server (`crate::server`) run the same code
-//! over real sockets and a real kernel.
+//! The core owns no descriptor: it tells its caller what to do with the ones the caller holds
+//! ([`Out`]), asks the world through [`KeeperEnv`], and reads a caller-supplied millisecond
+//! clock. So the Tier-1 bind (`src/conformance_custody.rs`) drives the real decisions against
+//! the models, and the server runs the same code over real sockets and the kernel.
 //!
 //! A record's life (per master, keyed by its `st_rdev`):
 //!
@@ -27,13 +20,11 @@
 //!   REGISTER ◀── Offered{to} ◀── HELLO/ADOPT, holder scan empty, shell alive
 //! ```
 //!
-//! The keeper KEEPS its copy through an offer (duplicate, never move: F9). An
-//! offer whose recipient dies before it registers goes back to Orphaned.
-//!
-//! A HELD record waits for its successor: the successor's REGISTER claims it;
-//! once nothing holds it, it is an orphan — unless the successor never took
-//! part (never said HELLO here) and ended with `exit(0)` after a clean Commit,
-//! which is a quit and closes it (§5.4 row 3, `KeeperCore::resolve_holds`).
+//! An offer duplicates the custody copy, never moves it (F9); one whose recipient dies before it
+//! registers goes back to Orphaned. A held record waits for its successor's REGISTER; once
+//! nothing holds it, it is an orphan, unless the successor never said HELLO here and ended with
+//! `exit(0)` after a clean Commit, which is a quit and closes it (§5.4 row 3,
+//! `KeeperCore::resolve_holds`).
 
 use std::collections::BTreeMap;
 
@@ -60,12 +51,10 @@ pub const PENDING_TTL_MS: u64 = 30_000;
 pub const HELLO_DEADLINE_MS: u64 = 15_000;
 /// A relaunched window alive this long resets the brake's streak.
 pub const HEALTHY_MS: u64 = 30 * 60_000;
-/// How long after the keeper runs `open` an App HELLO is still taken as that
-/// relaunch answering, even past [`HELLO_DEADLINE_MS`]: a build that boots
-/// slower than the deadline is a failed relaunch at the deadline AND the
-/// keeper's own launch when it finally says HELLO — never a manual launch
-/// that resets the brake (which would let a slow-booting crash loop relaunch
-/// forever). §6.2's five-minute "died early" window.
+/// How long after the keeper runs `open` an App HELLO still counts as that relaunch answering,
+/// even past [`HELLO_DEADLINE_MS`]: a slow-booting build is a failed relaunch at the deadline and
+/// the keeper's own launch at its HELLO, never a manual launch that resets the brake (a
+/// slow-booting crash loop would relaunch forever). §6.2's five-minute "died early" window.
 pub const LATE_HELLO_MS: u64 = 5 * 60_000;
 /// How often a record held for a handoff is re-scanned with no PENDING alive:
 /// the successor that holds it may die, or may never register.
@@ -87,19 +76,15 @@ pub enum Holders {
     Unknown,
 }
 
-/// The three questions the core asks of the world. The server answers them from
-/// the kernel; the Tier-1 runner answers them from the model's state.
+/// What the core asks of the world. The server answers from the kernel; the Tier-1 runner from
+/// the model's state.
 pub trait KeeperEnv {
     /// Who, other than the keeper, holds a descriptor for `rdev`.
     fn holders(&mut self, rdev: Rdev) -> Holders;
-    /// [`Self::holders`] for each of `rdevs`, in order, from ONE look at the
-    /// world. The core asks only this, once per pass over its records: the
-    /// server's answer is a walk of every process of the uid and every vnode
-    /// descriptor of each, whatever it looks for, so one walk serves the
-    /// whole set (one walk PER record holds the keeper's only thread for
-    /// seconds at a large desk's death, through a boot HELLO's two-second
-    /// wait, and every two seconds of a hold). A world that answers per
-    /// device needs nothing more.
+    /// [`Self::holders`] for each of `rdevs`, in order, from one look at the world. The core asks
+    /// only this, once per pass: the server's answer walks every process of the uid and each
+    /// one's vnode descriptors, so one walk serves the whole set (a walk per record would hold the
+    /// keeper's only thread for seconds at a large desk's death).
     fn holders_of(&mut self, rdevs: &[Rdev]) -> Vec<Holders> {
         rdevs.iter().map(|rdev| self.holders(*rdev)).collect()
     }
@@ -108,32 +93,27 @@ pub trait KeeperEnv {
     /// Whether `pid` is still the process born at `birth` (or, with no birth
     /// record, whether it names any live process of ours).
     fn pid_alive(&mut self, pid: u32, birth: Option<Birth>) -> bool;
-    /// What the crash marker `marker` names for the window `pid` says now
-    /// (§5.4 row 3's cross-check). A world that cannot read markers answers
-    /// [`MarkerEvidence::Unknown`]: no evidence, and the classifier then judges
-    /// as it did before the cross-check.
+    /// What the crash marker `marker` names for the window `pid` says now (§5.4 row 3's
+    /// cross-check). A world that cannot read markers answers [`MarkerEvidence::Unknown`].
     fn marker(&mut self, pid: u32, marker: &MarkerRef) -> MarkerEvidence {
         let _ = (pid, marker);
         MarkerEvidence::Unknown
     }
 }
 
-/// What a window's crash marker says (`aterm-gui`'s `crash_signal`: created
-/// empty at every start, `flock`ed by its owner for the owner's whole life,
-/// unlinked by the owner's exit path — `exit(3)`'s `atexit` handler and
-/// `clean_exit_now` — and written only by the fatal-signal handler).
+/// What a window's crash marker says (`aterm-gui`'s `crash_signal`: created empty at every start,
+/// `flock`ed by its owner for its whole life, unlinked by its exit path, and written only by the
+/// fatal-signal handler).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MarkerEvidence {
     /// No marker named, or none that could be read: no evidence.
     Unknown,
-    /// The marker is gone: its owner's exit path ran and unlinked it (or
-    /// another start's sweep removed a dead one — which is why a Released
-    /// marker alone never makes a quit: the wait status must say `exit(0)`
-    /// too).
+    /// The marker is gone: its owner's exit path unlinked it, or another start's sweep removed a
+    /// dead one (so a Released marker alone never makes a quit: the status must say `exit(0)`).
     Released,
-    /// The marker is still there and its lock is free: its owner died without
-    /// running its exit path (a signal, SIGKILL, jetsam). Also a consumed
-    /// `.seen` marker: another start already read it as such a death.
+    /// The marker is still there and its lock is free: its owner died without running its exit
+    /// path (a signal, SIGKILL, jetsam). Also a consumed `.seen` marker: another start already
+    /// read it as such a death.
     Dead,
     /// The marker is still there and someone holds its lock: its owner, or a
     /// forked child that inherited the descriptor. No evidence of an end.
@@ -162,7 +142,7 @@ pub enum Out {
         code: RefuseCode,
         rdev: Rdev,
     },
-    /// Start watching this pid's exit (a PENDING successor).
+    /// Start watching this pid's exit (a PENDING successor, a hold's holder, an orphan's shell).
     WatchPid(u32),
     /// Relaunch the app (`/usr/bin/open -a <own bundle>`).
     Relaunch,
@@ -171,20 +151,17 @@ pub enum Out {
 /// The §5.4 verdict on one dead peer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Verdict {
-    /// A live successor still holds the masters, or this window's own
-    /// unexpired PENDING names a live pid, or this window's `exit(0)` came
-    /// with the end of the successor its own PENDING named (the Commit to a
-    /// successor that died first): hold, and judge by the successor's end.
+    /// A live successor still holds the masters, or this window's own unexpired PENDING names a
+    /// live pid, or its `exit(0)` came with the end of the successor its own PENDING named (a
+    /// Commit to a successor that died first): hold, and judge by the successor's end.
     Handoff,
     /// BYE read before EOF: close its masters now.
     Quit,
-    /// No BYE arrived, but the window ended with `exit(0)` AND its crash
-    /// marker is gone — its exit path ran and removed it: a quit whose BYE was
-    /// lost (the link was reconnecting, the write did not land). Close, as a
-    /// quit: a clean quit is never read as a crash.
+    /// No BYE arrived, but the window ended with `exit(0)` and its crash marker is gone: a quit
+    /// whose BYE was lost (the link was reconnecting, the write did not land). Close.
     CleanExit,
-    /// A peer that never spoke BYE-capable AKP1 ended with `exit(0)`: a
-    /// pre-keeper build reached by rollback. Close, as today.
+    /// A peer that never spoke BYE-capable AKP1 ended with `exit(0)`: a pre-keeper build reached
+    /// by rollback. Close.
     CleanPreKeeper,
     /// Anything else: a signal, a non-zero exit, a lost BYE. Orphan and
     /// relaunch under the brake.
@@ -194,9 +171,7 @@ pub enum Verdict {
 /// The evidence the classifier reads, in its table's order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DeathEvidence {
-    /// A live successor holds a master this peer claimed, or this peer's own
-    /// unexpired PENDING names a live pid, or this peer's `exit(0)` came with
-    /// the end of the successor its own PENDING named.
+    /// A successor holds this peer's masters ([`Verdict::Handoff`]'s three cases).
     pub successor_holds: bool,
     /// BYE was read before EOF.
     pub bye: bool,
@@ -215,23 +190,16 @@ pub fn exited_zero(status: i32) -> bool {
     status & 0x7f == 0 && (status >> 8) & 0xff == 0
 }
 
-/// THE CLASSIFIER (§5.4), evidence read in the table's order. Unknown evidence
-/// resolves toward today's behaviour, except for a keeper-aware peer that died
-/// without BYE — the case the keeper exists for.
+/// The §5.4 classifier, evidence read in the table's order.
 ///
-/// ROW 3's CROSS-CHECK, the crash marker. A quit and a crash are told apart by
-/// two independent witnesses that must AGREE before a missing BYE is read as a
-/// quit: the kernel's wait status says `exit(0)`, and the window's own crash
-/// marker is gone (its exit path unlinked it). Either alone is not enough:
-/// an unwinding panic exits 101 through the same `atexit` that removes the
-/// marker, and another start's sweep can remove a SIGKILLed window's dead
-/// marker; a bare `_exit(0)` that skipped the exit path leaves the marker —
-/// a crash is never read as a quit. A pre-keeper peer (no BYE capability)
-/// that ended with `exit(0)` is closed as before, unless its marker says it
-/// never ran its exit path. `KeeperDeathJudgement` (`aterm_spec::derive`) is
-/// the machine; its mutants are this function without the marker (a lost BYE
-/// resurrects a clean quit) and with the marker trusted alone (a panic read
-/// as a quit).
+/// A missing BYE is read as a quit only when two independent witnesses agree: the wait status
+/// says `exit(0)`, and the window's crash marker is gone (its exit path unlinked it). Either alone
+/// is not enough: an unwinding panic exits 101 through the same `atexit` that removes the marker,
+/// another start's sweep can remove a SIGKILLed window's dead marker, and a bare `_exit(0)` that
+/// skipped the exit path leaves the marker. A pre-keeper peer (no BYE capability) that ended with
+/// `exit(0)` is closed unless its marker says it never ran its exit path. The machine is
+/// `KeeperDeathJudgement`; its mutants drop the marker (a lost BYE resurrects a clean quit) or
+/// trust it alone (a panic read as a quit).
 #[must_use]
 #[cfg_attr(
     any(test, feature = "spec-anchors"),
@@ -277,11 +245,10 @@ pub enum BrakeDecision {
     Hold,
 }
 
-/// THE RELAUNCH BRAKE, a writer/reader pair (§6.2): [`RelaunchBrake::decide`]
-/// READS the streak to choose relaunch-or-hold and WRITES the decision back —
-/// a relaunch counts toward the streak, a spent streak is recorded as a HOLD in
-/// its own field, never as a deadline sentinel a later read could take as
-/// "already elapsed" (the `retry_after = 0` crash loop, as a relaunch storm).
+/// The relaunch brake (§6.2), a writer/reader pair: [`RelaunchBrake::decide`] reads the streak to
+/// choose relaunch or hold and writes the decision back. A spent streak is recorded as a hold in
+/// its own field, never as a deadline sentinel a later read could take as already elapsed (a
+/// relaunch storm).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RelaunchBrake {
     streak: u32,
@@ -481,10 +448,8 @@ pub struct PendingSuccessor {
     pub pid: u32,
     pub birth: Option<Birth>,
     pub expires: u64,
-    /// The window that named it, as a PROCESS (its pid and birth, as a BYE
-    /// is the process's: [`KeeperCore::bye`]): only that window's masters
-    /// wait on this successor. Another window's update in flight holds none
-    /// of them.
+    /// The window process (pid and birth) that named it: only that window's masters wait on this
+    /// successor.
     pub from_pid: u32,
     pub from_birth: Option<Birth>,
     /// When the successor's `wait(2)` status was read, and what it was.
@@ -547,24 +512,20 @@ pub struct CustodyView {
     pub orphan_b: bool,
 }
 
-/// THE KEEPER. See the module docs.
+/// The keeper's state and every decision it makes. See the module docs.
 #[derive(Clone, Debug)]
 pub struct KeeperCore {
     records: BTreeMap<Rdev, Record>,
     peers: BTreeMap<ConnId, Peer>,
-    /// The updates in flight, keyed by the window process that sent each
-    /// (pid and birth; every such process runs its own update lane, so two
-    /// can overlap): each
-    /// successor has neither registered nor been read to its end, and its
-    /// PENDING has not expired. A window's newer PENDING replaces its own,
-    /// never another window's — one slot for the whole keeper let a second
-    /// window's PENDING erase the first's, whose Commit to a successor that
-    /// died first then read as a quit and hung up every shell it carried.
+    /// The updates in flight, keyed by the window process (pid and birth) that sent each: every
+    /// such process runs its own update lane, so two can overlap. Each successor has neither
+    /// registered nor been read to its end, and its PENDING has not expired. A window's newer
+    /// PENDING replaces only its own: erasing another window's would make that window's Commit to
+    /// a successor that died first read as a quit and hang up every shell it carried.
     pending: Vec<PendingSuccessor>,
-    /// Each window process's newest PENDING once it is no longer in flight,
-    /// kept until that window is judged: whether its `exit(0)` was its
-    /// Commit to a successor that died first ([`Self::peer_died`]). Keyed
-    /// by the sending process too, for the same reason.
+    /// Each window process's newest PENDING once it is no longer in flight, kept until that window
+    /// is judged: whether its `exit(0)` was its Commit to a successor that died first
+    /// ([`Self::peer_died`]). Keyed by the sending process too.
     settled: Vec<PendingSuccessor>,
     brake: RelaunchBrake,
     relaunch: RelaunchState,
@@ -578,21 +539,18 @@ pub struct KeeperCore {
     ends: EndCounts,
     /// The newest verdict the classifier gave.
     last_verdict: Option<Verdict>,
-    /// The `wait(2)` status of each process a hold waits on that ended without
-    /// ever saying HELLO here as a window — or that died before its outgoing
-    /// window's Commit was judged ([`Self::peer_died`]) — kept until its holds
-    /// are judged ([`Self::resolve_holds`]).
+    /// The `wait(2)` status of each process a hold waits on that ended without ever saying HELLO
+    /// here as a window, or that died before its outgoing window's Commit was judged
+    /// ([`Self::peer_died`]), kept until its holds are judged ([`Self::resolve_holds`]).
     quiet_ends: BTreeMap<u32, i32>,
 }
 
 impl KeeperCore {
-    /// A keeper with an empty table. `can_relaunch`: whether a relaunch has a
-    /// bundle to open; without one the keeper holds orphans for the next
-    /// manual launch and never relaunches.
+    /// A keeper with an empty table. `can_relaunch`: whether a relaunch has a bundle to open;
+    /// without one the keeper holds orphans for the next manual launch and never relaunches.
     ///
-    /// The custody machine's actions that are not the keeper's own code — the
-    /// window's, the update's, launchd's — are waived here, each with where its
-    /// keeper half is.
+    /// The custody machine's actions that are not the keeper's own code (the window's, the
+    /// update's, launchd's) are waived here, each with where its keeper half is.
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
         aterm_spec::spec_unmodeled(
@@ -776,17 +734,13 @@ impl KeeperCore {
         true
     }
 
-    /// The window on `conn` named its crash marker in its HELLO. The keeper
-    /// keeps it only when the marker is there NOW with its lock held — the
-    /// window is alive and holds it — so that its later absence can only mean
-    /// the window's exit path removed it. A marker that is not held (a wrong
-    /// directory, a start armed without the lock, a stranger's claim) is no
-    /// evidence and is dropped: the window is judged as one that named none.
+    /// The window on `conn` named its crash marker in its HELLO. The keeper keeps it only when
+    /// the marker is there now with its lock held, so that its later absence can only mean the
+    /// window's exit path removed it. A marker that is not held is no evidence and is dropped.
     /// `true` when kept.
     ///
-    /// `KeeperDeathJudgement`'s environment — the window's build and end, the
-    /// evidence degrading, the shell's own end — is waived here, beside the
-    /// keeper's recording of the one piece of it the window names.
+    /// `KeeperDeathJudgement`'s environment (the window's build and end, the evidence degrading,
+    /// the shell's own end) is waived here.
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
         aterm_spec::spec_unmodeled(
@@ -922,10 +876,8 @@ impl KeeperCore {
                     hello: Some((conn, now)),
                 };
             }
-            // A HELLO that arrives after its relaunch's deadline is still the
-            // keeper's own launch: it counts toward the streak (its early
-            // death is decided like any relaunched window's) and never resets
-            // the brake.
+            // A HELLO after its relaunch's deadline is still the keeper's own launch: it counts
+            // toward the streak and never resets the brake.
             _ if self
                 .last_relaunch_at
                 .is_some_and(|at| now < at.saturating_add(LATE_HELLO_MS)) =>
@@ -968,10 +920,9 @@ impl KeeperCore {
         }
     }
 
-    /// THE OFFER RULE: every Orphaned record whose master no live process
-    /// holds (the holder scan) and whose shell is still the one registered is
-    /// offered to `conn` and marked Offered to it. The keeper KEEPS its copy. A
-    /// record whose shell is gone is closed: there is nothing left to keep.
+    /// The offer rule: every Orphaned record whose master no live process holds (the holder scan)
+    /// and whose shell is still the one registered is offered to `conn` and marked Offered to it;
+    /// the keeper keeps its copy. A record whose shell is gone is closed.
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
         aterm_spec::refines(
@@ -1067,16 +1018,13 @@ impl KeeperCore {
         }
         // The successor a PENDING named has registered: that update landed.
         self.retire_pending(|p, _| p.pid == pid);
-        // ONE PROCESS IS ONE CLAIMANT, held by its NEWEST connection. A link whose
-        // write timed out reconnects and registers every master again, and the
-        // keeper, reading one frame per connection per turn, can take those
-        // REGISTERs before the old connection's EOF: counted twice, one window
-        // would spend both claim slots and its update successor's REGISTER at
-        // Commit be refused. So a claimant of the same
-        // process (pid and birth, as a RELEASE and a BYE are the process's) on an
-        // OLDER connection is replaced — as one whose EOF was already read always
-        // was — and a REGISTER still in flight on an older connection, read after
-        // the newer one's, leaves the claim where it is.
+        // One process is one claimant, held by its newest connection. A link whose write timed
+        // out reconnects and registers every master again, and those REGISTERs can be read before
+        // the old connection's EOF: counted twice, one window would spend both claim slots and
+        // its update successor's REGISTER at Commit be refused. So a claimant of the same process
+        // (pid and birth, or the pid once that connection's EOF was read) on an older connection
+        // is replaced, and a REGISTER still in flight on an older connection, read after the
+        // newer one's, leaves the claim where it is.
         let same_process: Vec<ConnId> = self
             .peers
             .iter()
@@ -1176,16 +1124,13 @@ impl KeeperCore {
         )
     )]
     pub fn release(&mut self, conn: ConnId, rdev: Rdev) -> Vec<Out> {
-        // A claimant of the SAME process (pid and birth) is this connection's
-        // own claim: a window whose link dropped while it lived, and which
-        // closed a tab before its link reconnected, registers on the new link
-        // only what it still holds, then sends that tab's RELEASE — whose
-        // record only the dropped link claims. Refused, the closed tab's shell
-        // lived on in the keeper until the whole window ended.
-        let me = self.peers.get(&conn).map(|p| (p.pid, p.birth));
+        // A claimant of the same process (pid and birth) is this connection's own claim: a window
+        // that closed a tab while its link was down registers on the new link only what it still
+        // holds, then sends that tab's RELEASE for a record only the dropped link claims.
+        let peers = &self.peers;
+        let me = peers.get(&conn).map(|p| (p.pid, p.birth));
         let mine = |c: &ConnId| {
-            *c == conn
-                || me.is_some_and(|me| self.peers.get(c).is_some_and(|p| (p.pid, p.birth) == me))
+            *c == conn || me.is_some_and(|me| peers.get(c).is_some_and(|p| (p.pid, p.birth) == me))
         };
         let allowed = self.records.get(&rdev).is_some_and(|rec| {
             rec.claimants.iter().any(mine) || rec.state == RecordState::Offered { to: conn }
@@ -1197,28 +1142,19 @@ impl KeeperCore {
                 rdev,
             }];
         }
-        // TWO CLAIMANTS (an update's outgoing window and its successor, both
-        // registered between the successor's Commit and the outgoing window's
-        // `_exit`): a RELEASE from one ends only ITS claim while another
-        // PROCESS still claims the master. The outgoing window's late
-        // `Session::drop` must not close the copy the successor's shell lives
-        // on — the successor crashing next would lose it with no keeper fault
-        // (`PtyKeeperCustody`'s `OutgoingReleasesA`). A successor that closes
-        // the tab while the outgoing window still claims it leaves the record
-        // to that claimant's end, which the classifier judges with the shell
-        // already hung up (F3): closed. Claimants of the SAME process (a link
-        // that dropped and reconnected) are one claimant.
-        let pid_of = |c: &ConnId| self.peers.get(c).map(|p| p.pid);
-        let releaser = pid_of(&conn);
-        let others_hold = self.records.get(&rdev).is_some_and(|rec| {
-            rec.claimants
-                .iter()
-                .any(|c| *c != conn && (releaser.is_none() || pid_of(c) != releaser))
-        });
+        // Two claimants (an update's outgoing window and its successor, between the Commit and
+        // the outgoing window's `_exit`): a RELEASE from one ends only its claim while another
+        // process still claims the master, so the outgoing window's late `Session::drop` cannot
+        // close the copy the successor's shell lives on (`OutgoingReleasesA`). A successor's tab
+        // close leaves the record to the outgoing window's end, which finds the shell hung up
+        // (F3) and closes it. Connections of the same process are one claimant.
+        let others_hold = self
+            .records
+            .get(&rdev)
+            .is_some_and(|rec| rec.claimants.iter().any(|c| !mine(c)));
         if others_hold {
             if let Some(rec) = self.records.get_mut(&rdev) {
-                rec.claimants
-                    .retain(|c| *c != conn && (releaser.is_none() || pid_of(c) != releaser));
+                rec.claimants.retain(|c| !mine(c));
             }
             return Vec::new();
         }
@@ -1228,12 +1164,9 @@ impl KeeperCore {
 
     /// BYE: quit intent. The peer's end is judged when its EOF and exit arrive.
     ///
-    /// The intent is the PROCESS's, whichever of its links carried it: a
-    /// window whose link dropped and reconnected (the same pid and birth) quit
-    /// on every one of them, so the dead link's end, judged at the same exit,
-    /// never reads as a crash that brings the window back
-    /// (`PtyKeeperCustody`'s `RelaunchedWindowQuits`, whose mutant marks only
-    /// the link that carried it).
+    /// The intent is the process's, whichever of its links carried it: a window whose link
+    /// dropped and reconnected (the same pid and birth) quit on all of them, so the dead link's
+    /// end never reads as a crash that brings the window back (`RelaunchedWindowQuits`).
     pub fn bye(&mut self, conn: ConnId) {
         let Some(who) = self.peers.get(&conn).map(|p| (p.pid, p.birth)) else {
             return;
@@ -1277,11 +1210,9 @@ impl KeeperCore {
         vec![Out::WatchPid(pid)]
     }
 
-    /// Every update in flight that `done` says is no longer in flight (its
-    /// successor registered or was read to its end, or its PENDING expired)
-    /// leaves [`Self::pending`]. Its record is kept for the judgement of the
-    /// window that named it ([`Self::settled`], replacing only that window's
-    /// older one), unless that window is judged already. Whether any left.
+    /// Move every update `done` says is no longer in flight (its successor registered or was read
+    /// to its end, or its PENDING expired) from `pending` to `settled`, replacing only its
+    /// window's older one, unless that window is judged already. Whether any left.
     fn retire_pending(
         &mut self,
         done: impl Fn(&PendingSuccessor, &BTreeMap<ConnId, Peer>) -> bool,
@@ -1308,21 +1239,13 @@ impl KeeperCore {
         !retired.is_empty()
     }
 
-    /// The connection read EOF. Alone it decides nothing about a CLAIM: the
-    /// peer's death is judged when the kernel's exit status arrives too (a
-    /// registered window's link that dropped while it lives is `LinkDrops`,
-    /// whose mutant orphans here).
+    /// The connection read EOF. Alone it decides nothing about a claim: the peer's death is judged
+    /// when the kernel's exit status arrives too (`LinkDrops`, whose mutant orphans here).
     ///
-    /// An OFFER, though, was made to the CONNECTION, and nothing registers on a
-    /// connection that is gone: every record offered to `conn` is an orphan
-    /// again now, its leader watched again (`RelaunchedLinkDrops`, whose mutant
-    /// leaves the offer with the dead link). Left Offered to a dead connection
-    /// while its window lives, no ADOPT and no later launch could be offered
-    /// it, and the window's eventual end read it back as a fresh orphan. A
-    /// window that took the descriptor before its link dropped still holds it,
-    /// so the holder scan keeps a second offer away ([`Self::offers_for`]), and
-    /// its reconnected link may REGISTER it ([`Self::register`] proves
-    /// possession, not the offer).
+    /// Nothing registers on a gone connection, so every record offered to `conn` is an orphan
+    /// again, its leader watched again (`RelaunchedLinkDrops`). A window that took the descriptor
+    /// first still holds it: the holder scan keeps a second offer away ([`Self::offers_for`]), and
+    /// its reconnected link may REGISTER it ([`Self::register`] proves possession, not the offer).
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
         aterm_spec::refines(
@@ -1400,13 +1323,10 @@ impl KeeperCore {
         out
     }
 
-    /// STALE ORPHANS: every Orphaned record whose shell is no longer the
-    /// process it registered is closed now — there is nothing left to keep,
-    /// the copy's close hangs up whatever else still sits on the slave, as the
-    /// window closing an exited shell's tab would, and `aterm keeper status`
-    /// never lists it nor an offer carry it. Run on every exit the keeper sees
-    /// (it watches each orphan's leader) and when a watch could not be armed
-    /// because the leader was already gone.
+    /// Close every Orphaned record whose shell is no longer the process it registered, hanging up
+    /// whatever still sits on the slave as closing an exited shell's tab would. Runs on every exit
+    /// the keeper sees (it watches each orphan's leader) and when a leader was gone before its
+    /// watch could be armed.
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
         aterm_spec::refines(
@@ -1511,15 +1431,11 @@ impl KeeperCore {
 
     /// Ask the brake, and turn its answer into the lane's next state.
     ///
-    /// THE STREAK IS RELAUNCHES IN A ROW. A death decided [`HEALTHY_MS`] or
-    /// more after the keeper's last relaunch (or with none yet) ends no
-    /// relaunch early: whatever that relaunch brought back lived that long,
-    /// so the streak starts over before the brake is asked. The lane's own
-    /// reset ([`Self::run_relaunch`]) sees only a relaunched window that keeps
-    /// its first connection: one that hands its desk to an update's successor
-    /// leaves the lane Idle, and one whose link dropped and came back is never
-    /// `connected` again — without this, crashes weeks apart were one streak
-    /// and the fourth was never relaunched. A crash loop's deaths come within
+    /// The streak counts relaunches in a row: a death [`HEALTHY_MS`] or more after the keeper's
+    /// last relaunch (or with none yet) resets it before the brake is asked. The lane's own reset
+    /// ([`Self::run_relaunch`]) sees only a relaunched window that keeps its first connection, so
+    /// without this a window that handed its desk to an update's successor, or whose link
+    /// reconnected, would make crashes weeks apart one streak. A crash loop's deaths come within
     /// minutes of each relaunch, and still spend it.
     fn after_decision(&mut self, now: u64, clean: bool) -> RelaunchState {
         if self
@@ -1535,14 +1451,11 @@ impl KeeperCore {
         }
     }
 
-    /// Judge every peer whose death evidence is complete, or whose grace ran
-    /// out: a peer is dead when its EOF and its exit status have both arrived,
-    /// or one has and [`DEATH_GRACE_MS`] passed without the other while the
-    /// process no longer lives. A peer whose link dropped while its process
-    /// lives keeps its claims — an EOF alone is never a death (the
-    /// `BuggyOfferOnEof` mutant). A window whose own update successor is gone
-    /// waits, within the grace, for that successor's end
-    /// ([`Self::awaits_successor_end`]).
+    /// Judge every peer whose death evidence is complete: its EOF and its exit status have both
+    /// arrived, or one has and [`DEATH_GRACE_MS`] passed without the other while the process no
+    /// longer lives. An EOF alone is never a death (the model's `Buggy` defect at `LinkDrops`). A
+    /// window whose own update successor is gone waits, within the grace, for that successor's
+    /// end ([`Self::awaits_successor_end`]).
     fn settle(&mut self, now: u64, env: &mut dyn KeeperEnv) -> Vec<Out> {
         let mut out = Vec::new();
         let ready: Vec<ConnId> = self
@@ -1574,18 +1487,13 @@ impl KeeperCore {
         out
     }
 
-    /// THE COMMIT AND ITS SUCCESSOR'S END ARE JUDGED TOGETHER. A window that
-    /// ended with `exit(0)` and no BYE while the successor its own PENDING
-    /// names is gone, its end not read yet — both died within the Commit's
-    /// milliseconds, and the successor's exit watch reports it in the same
-    /// turn — waits for that end, at most [`DEATH_GRACE_MS`] past its own:
-    /// whether it handed its masters to a successor that crashed or quit
-    /// depends on it ([`Self::peer_died`]). A successor whose end never
-    /// arrives (its watch could not be armed: it was gone before the PENDING
-    /// was read, a rolled-back update) leaves the window judged on the rest.
-    /// The PENDING is read where `peer_died` reads it — in flight or
-    /// `settled` (its successor's first REGISTER was read, or it expired
-    /// before the Commit): the read order must not decide the verdict.
+    /// A Commit and its successor's end are judged together. A window that ended with `exit(0)`
+    /// and no BYE while the successor its own PENDING names is gone, its end not read yet (both
+    /// die within the Commit's milliseconds), waits for that end, at most [`DEATH_GRACE_MS`] past
+    /// its own: whether it handed its masters to a successor that crashed or quit depends on it
+    /// ([`Self::peer_died`]). A successor whose end never arrives (its watch could not be armed)
+    /// leaves the window judged on the rest. The PENDING is read where `peer_died` reads it, in
+    /// flight or `settled`, so the read order cannot decide the verdict.
     fn awaits_successor_end(&self, p: &Peer, now: u64, env: &mut dyn KeeperEnv) -> bool {
         let Some((exited_at, status)) = p.exit else {
             return false;
@@ -1697,10 +1605,9 @@ impl KeeperCore {
         if returned_offers && !peer.bye {
             orphaned_any = true;
         }
-        // Only this window's OWN update holds its masters. Another window's
-        // PENDING in flight names no successor of these: read as one, a
-        // quit's masters were held for a successor that never takes them,
-        // then orphaned — the shells outlived the quit.
+        // Only this window's own update holds its masters: another window's PENDING names no
+        // successor of these, and read as one it would hold a quit's masters for a successor
+        // that never takes them, then orphan them.
         let own_pending = self.pending.iter().copied().find(|p| {
             p.named_by(&peer)
                 && p.ended.is_none()
@@ -1709,17 +1616,13 @@ impl KeeperCore {
         });
         let pending_live = own_pending.is_some();
         let status = peer.exit.map(|(_, s)| s);
-        // THE COMMIT WHOSE SUCCESSOR DIED FIRST. An update's Commit
-        // `_exit(0)`s with the crash marker removed (`clean_exit_now`: handing
-        // off IS a clean end) and no BYE — row 3's quit, to the classifier.
-        // When the successor this window's own PENDING named ended at the
-        // same time (read no earlier than DEATH_GRACE_MS before this window's
-        // own end, or waited for: [`Self::awaits_successor_end`]), that
-        // `exit(0)` handed its masters to it: a handoff, the hold judged at
-        // once by the successor's end ([`Self::resolve_holds`]) — its crash
-        // orphans, its quit closes. Read as a quit, every shell the update
-        // carried was hung up. A rolled-back update's successor ended long
-        // before its window's later quit, which stays a quit.
+        // A Commit whose successor died first: the Commit `_exit(0)`s with the marker removed
+        // (`clean_exit_now`) and no BYE, a quit to the classifier. When the successor this
+        // window's own PENDING named ended no more than DEATH_GRACE_MS before this window's end
+        // (or was waited for, [`Self::awaits_successor_end`]), that `exit(0)` handed it the
+        // masters: a handoff judged at once by the successor's end ([`Self::resolve_holds`]). A
+        // rolled-back update's successor ended long before its window's later quit, which stays
+        // a quit.
         let last_evidence = peer.eof_at.max(peer.exit.map(|(at, _)| at)).unwrap_or(now);
         let fell = self
             .pending
@@ -1739,8 +1642,8 @@ impl KeeperCore {
             (Some(m), false) => env.marker(peer.pid, m),
             _ => MarkerEvidence::Unknown,
         };
-        // Whether this peer ended as a quit does, the successor aside: what a
-        // hold it leaves remembers for its own judgement.
+        // Whether this peer ended as a quit does, the successor aside: a hold it leaves keeps
+        // this for its own judgement.
         let outgoing_clean = peer.bye || status.is_some_and(exited_zero);
         let mut verdicts = Vec::new();
         // Who holds them, asked once for all of them (and not at all when the
@@ -1767,11 +1670,9 @@ impl KeeperCore {
             match verdict {
                 Verdict::Handoff => {
                     self.ends.handoff += 1;
-                    // The process the hold waits on, whose end judges it: the
-                    // PENDING successor, or the one holder the scan found
-                    // (watched here; a PENDING's is watched already). An end
-                    // recorded before this hold is not this hold's — except
-                    // the end of the successor that died first, which is.
+                    // The process the hold waits on: the PENDING successor, or the one holder
+                    // the scan found (watched here; a PENDING's is watched already). An end
+                    // recorded before this hold is not this hold's, except the fallen successor's.
                     let successor = match (&scan, fell) {
                         (_, Some((pid, _))) => Some(pid),
                         (None, None) => own_pending.map(|p| p.pid),
@@ -1882,10 +1783,9 @@ impl KeeperCore {
         out
     }
 
-    /// A PENDING ended (its successor died, or it expired), or a held master's
-    /// holder let go: every Held record no live process holds is an orphan now
-    /// (F11: a crash mid-update) — unless the successor it waited on never
-    /// took part and quit (§5.4 row 3), when it is closed.
+    /// A PENDING ended (its successor died, or it expired), or a held master's holder let go:
+    /// every Held record no live process holds is an orphan now (F11: a crash mid-update), unless
+    /// the successor it waited on never took part and quit (§5.4 row 3): then it is closed.
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
         aterm_spec::refines(
@@ -1913,12 +1813,10 @@ impl KeeperCore {
         let mut orphaned = false;
         let scans = env.holders_of(&held);
         for (rdev, holders) in held.into_iter().zip(scans) {
-            // THE AWAITED PROCESS ENDED WHILE ANOTHER STILL HOLDS THE MASTER:
-            // it handed it on (its own update's Commit `_exit(0)`s), so its end
-            // judges nothing any more. The hold waits on the holder instead —
-            // the one the scan found, watched, as `peer_died` takes it — and
-            // keeps how the awaited process ended beside the outgoing window's
-            // end: a crash anywhere in the chain still orphans.
+            // The awaited process ended while another still holds the master: it handed it on
+            // (its own update's Commit `_exit(0)`s), so its end judges nothing. The hold waits
+            // on the holder the scan found instead, and keeps how the awaited process ended
+            // beside the outgoing window's end: a crash anywhere in the chain still orphans.
             if let Holders::Held(pids) = &holders
                 && let Some(rec) = self.records.get_mut(&rdev)
                 && let RecordState::Held {
@@ -1948,16 +1846,11 @@ impl KeeperCore {
             let Some(rec) = self.records.get(&rdev) else {
                 continue;
             };
-            // §5.4 ROW 3, FOR THE SUCCESSOR: the hold waited on a process that
-            // never said HELLO here as a window — an update's successor with
-            // its keeper off, or a build before the keeper — and it ended with
-            // `exit(0)`, after an outgoing window that ended as a quit does
-            // (its Commit): that successor quit, and nothing claimed custody
-            // of its shells. Close, as with no keeper at all. Any other end —
-            // a signal, a non-zero exit, none read, an outgoing window that
-            // crashed — orphans, as before. (The successor that died first,
-            // before its outgoing window's Commit was judged, is judged by the
-            // end `peer_died` recorded for it, whether or not it took part.)
+            // §5.4 row 3 for the successor: the hold waited on a process that never said HELLO
+            // here as a window, and it ended with `exit(0)` after an outgoing window that ended
+            // as a quit does (its Commit): it quit with nothing claiming its shells, so close.
+            // Any other end orphans. A successor that died before its outgoing window was judged
+            // is judged by the end `peer_died` recorded for it.
             let quit = match rec.state {
                 RecordState::Held {
                     successor: Some(pid),
@@ -2204,9 +2097,8 @@ mod tests {
         );
         // Unknown status, keeper-aware, no BYE: the case the keeper exists for.
         assert_eq!(classify_death(e(false, false, true, None)), Verdict::Crash);
-        // ROW 3's CROSS-CHECK. exit(0) with the marker gone: the exit path ran,
-        // the BYE was lost — a quit, for a keeper-aware peer and a pre-keeper
-        // one alike.
+        // Row 3's cross-check: exit(0) with the marker gone is a quit whose BYE was lost, for a
+        // keeper-aware peer and a pre-keeper one alike.
         use MarkerEvidence::{Dead, Held, Released, Unknown};
         assert_eq!(
             classify_death(m(true, Some(0), Released)),
@@ -2235,8 +2127,8 @@ mod tests {
                 "{status:?} {marker:?}"
             );
         }
-        // A pre-keeper exit(0) is closed on no marker evidence as before, but
-        // never over a marker that says the exit path did not run.
+        // A pre-keeper exit(0) closes on no marker evidence, never over a marker that says the
+        // exit path did not run.
         assert_eq!(
             classify_death(m(false, Some(0), Unknown)),
             Verdict::CleanPreKeeper
@@ -2305,11 +2197,8 @@ mod tests {
         assert!(k.peers()[&2].relaunched);
     }
 
-    /// ONE LOOK AT THE HOLDERS PER PASS: a crashed window's 200 masters are
-    /// judged, and offered to the next window's boot HELLO, after one scan each
-    /// time — not one uid-wide scan per master, which the server runs on its
-    /// only thread while the HELLO waits two seconds for its WELCOME. The
-    /// offers are the same.
+    /// A crashed window's 200 masters are judged, and offered to the next boot HELLO, after one
+    /// holder scan each time, not one uid-wide scan per master.
     #[test]
     fn a_crashed_desk_is_judged_and_offered_after_one_holder_scan() {
         let mut k = KeeperCore::new(true);
@@ -2337,12 +2226,8 @@ mod tests {
         assert!(w.scans <= 1, "one HELLO took {} holder scans", w.scans);
     }
 
-    /// A HOLD FOR A SUCCESSOR THAT NEVER REGISTERS:
-    /// a pre-keeper successor, or one with its keeper off, holds all 100 of an
-    /// updated window's masters for its whole life. The hold is re-read every
-    /// `HOLD_RESCAN_MS`, and each pass is ONE scan for every held master, not
-    /// one per master. NEGATIVE CONTROL: the masters stay held throughout (the
-    /// scan still finds the successor).
+    /// A successor that never registers holds 100 masters: one scan per `HOLD_RESCAN_MS` pass.
+    /// Negative control: the masters stay held throughout.
     #[test]
     fn a_long_hold_is_rescanned_once_per_pass() {
         let mut k = KeeperCore::new(true);
@@ -2444,8 +2329,8 @@ mod tests {
         assert_eq!(k.tick(5, &mut w), vec![Out::Relaunch]);
     }
 
-    /// Another window's update in flight holds none of THIS window's
-    /// masters: its quit closes them, and the updating window's claim stands.
+    /// Another window's update in flight holds none of this window's masters: its quit closes
+    /// them, and the updating window's claim stands.
     #[test]
     fn a_quit_beside_another_windows_update_closes_its_masters() {
         let mut k = KeeperCore::new(true);
@@ -2463,19 +2348,12 @@ mod tests {
         assert_eq!(k.records()[&10].state, RecordState::Claimed);
     }
 
-    /// THE COMMIT WHOSE SUCCESSOR DIED FIRST: the successor an update's
-    /// PENDING named crashes right after the Commit, and the keeper reads its
-    /// end before — or while — it judges the outgoing window's `exit(0)`,
-    /// whose crash marker `clean_exit_now` removed. That `exit(0)` handed the
-    /// masters on: orphans, each end counted a crash, whether the successor's
-    /// end was read first or was still on its way, whether the successor had
-    /// registered one of them, or the PENDING expired before the Commit —
-    /// and whether ANOTHER window process's update overlaps this one
-    /// (`beside`: 1, its PENDING read while this one is in flight; 2, its
-    /// successor registering after this one's), which must erase neither this
-    /// window's PENDING nor its settled record. A rolled-back update's
-    /// successor, ended long before its window's later quit with the BYE
-    /// lost, leaves that quit a quit.
+    /// A Commit whose successor died first orphans the masters, each end counted a crash: whether
+    /// the successor's end is read first or later, whether it registered one of them, whether the
+    /// PENDING expired before the Commit, and whether another window's update overlaps (`beside`:
+    /// 1, its PENDING read while this one is in flight; 2, its successor registering after). A
+    /// rolled-back update's successor, ended long before its window's later quit, leaves that quit
+    /// a quit.
     #[test]
     fn a_commit_whose_successor_died_first_orphans_the_master() {
         for (aware, read_first, rolled_back, expired, beside) in [
@@ -2591,10 +2469,9 @@ mod tests {
         assert_eq!(outs, vec![Out::Welcome { conn: 2, offers: 0 }]);
     }
 
-    /// A successor that takes no part UPDATES IN TURN: its own Commit
-    /// `_exit(0)`s while ITS successor holds the master. That exit is a
-    /// handoff, not a quit: the hold waits on the new holder, whose crash
-    /// orphans the shell and whose quit closes it.
+    /// A successor that takes no part updates in turn: its Commit `_exit(0)`s while its own
+    /// successor holds the master, a handoff, so the hold waits on the new holder, whose crash
+    /// orphans and whose quit closes.
     #[test]
     fn a_quiet_successor_that_hands_the_master_on_is_judged_by_the_next_ones_end() {
         for (status, orphaned) in [(9, true), (0, false)] {
@@ -2678,10 +2555,8 @@ mod tests {
         assert_eq!(k.release(2, 10), vec![Out::Close(10)]);
     }
 
-    /// The outgoing window of an update releases a master AFTER its successor
-    /// registered it, and the successor then crashes. The custody copy must
-    /// still be there, so the shell is orphaned for the next window — not hung
-    /// up with no keeper fault.
+    /// The outgoing window releases a master after its successor registered it, and the successor
+    /// then crashes: the custody copy is still there, so the shell is orphaned.
     #[test]
     fn a_late_release_from_the_outgoing_window_keeps_the_successors_copy() {
         let mut k = KeeperCore::new(true);
@@ -2709,9 +2584,8 @@ mod tests {
         assert_eq!(k.records()[&10].state, RecordState::Orphaned);
     }
 
-    /// The same process twice (a link that dropped and came back, its old
-    /// connection not yet judged) is ONE claimant, held by the newer link: its
-    /// release closes.
+    /// The same process on two links (its old connection not yet judged) is one claimant, held by
+    /// the newer link: its release closes.
     #[test]
     fn a_release_from_a_reconnected_link_is_the_last_claim() {
         let mut k = KeeperCore::new(true);
@@ -2726,12 +2600,30 @@ mod tests {
         assert_eq!(k.release(2, 10), vec![Out::Close(10)]);
     }
 
-    /// A window whose link reconnected before the keeper read its old
-    /// connection's EOF must not claim each master on BOTH connections: the two
-    /// claim slots would be spent on one process, the update successor's
-    /// REGISTER at its Commit refused (`TooManyClaimants`), and its later quit
-    /// would leave the shells as orphans with a relaunch due. One process is
-    /// one claimant, held by its newest connection.
+    #[test]
+    fn a_release_keeps_the_claim_of_a_reused_pid() {
+        let mut k = KeeperCore::new(true);
+        let mut w = World::default();
+        for conn in [1, 2] {
+            assert!(k.accept(
+                conn,
+                500,
+                Some(Birth {
+                    seconds: conn,
+                    micros: 0
+                })
+            ));
+            k.hello(conn, PeerClass::App, CAP_SENDS_BYE, conn, &mut w);
+            k.register(conn, hdr(10, 900), vec![], 10);
+        }
+        assert_eq!(k.records()[&10].claimants, vec![1, 2]);
+        assert!(k.release(1, 10).is_empty());
+        assert_eq!(k.records()[&10].claimants, vec![2]);
+        assert_eq!(k.release(2, 10), vec![Out::Close(10)]);
+    }
+
+    /// A link that reconnected before its old connection's EOF was read claims each master once,
+    /// or the update successor's REGISTER would be refused (`TooManyClaimants`).
     #[test]
     fn a_reconnected_link_leaves_room_for_the_update_successors_claim() {
         let mut k = KeeperCore::new(false);
@@ -2819,9 +2711,8 @@ mod tests {
         );
     }
 
-    /// STALE ORPHANS: an orphan whose shell dies is closed on its leader's
-    /// exit — the keeper asked to watch it when it orphaned it — without
-    /// waiting for a HELLO, and `status` no longer lists it.
+    /// An orphan whose shell dies is closed at its leader's exit, without waiting for a HELLO, and
+    /// `status` no longer lists it.
     #[test]
     fn an_orphan_whose_shell_dies_is_pruned_at_once() {
         let mut k = KeeperCore::new(false);
@@ -2852,10 +2743,9 @@ mod tests {
         assert_eq!(k.records().len(), 0);
     }
 
-    /// ROW 3's CROSS-CHECK through the core: a window that named a HELD marker
-    /// at HELLO and ended with `exit(0)`, no BYE and its marker gone is a quit;
-    /// the same end with the marker still there is a crash; a marker that was
-    /// not held at HELLO is not evidence at all.
+    /// Row 3's cross-check through the core: a window that named a held marker at HELLO and ended
+    /// with `exit(0)`, no BYE and its marker gone is a quit; with the marker still there, a crash;
+    /// a marker not held at HELLO is no evidence.
     #[test]
     fn a_lost_bye_with_the_marker_gone_is_a_quit() {
         let marker = MarkerRef {
@@ -2935,12 +2825,10 @@ mod tests {
         assert_eq!(k.brake().streak(), 0);
     }
 
-    /// A RELAUNCHED WINDOW THAT LIVES ON is no failed relaunch, whether it
-    /// hands its desk to an update's successor or its link drops and comes
-    /// back: crashes a week apart are relaunched at once every time, each the
-    /// first of its streak. (A crash loop — deaths minutes after each
-    /// relaunch — still holds: `the_relaunch_lane_waits_for_hello_and_backs_off`
-    /// and `a_slow_booting_crash_loop_is_still_braked`.)
+    /// A relaunched window that lives on (it hands its desk to an update's successor, or its link
+    /// reconnects) is no failed relaunch: crashes a week apart are each relaunched at once. A crash
+    /// loop is still braked (`the_relaunch_lane_waits_for_hello_and_backs_off`,
+    /// `a_slow_booting_crash_loop_is_still_braked`).
     #[test]
     fn a_relaunched_window_that_lives_on_does_not_spend_the_brake() {
         const WEEK: u64 = 7 * 24 * 3_600_000;
@@ -3027,14 +2915,9 @@ mod tests {
         );
     }
 
-    /// An offer is made to a CONNECTION: when that connection drops while its
-    /// window lives — the window's boot HELLO timed out, or the keeper's own
-    /// send of the OFFER failed — the offer returns to Orphaned at the EOF, so
-    /// an ADOPT from the same window's next link (or the next launch) is
-    /// offered it again; it never stays Offered to a dead connection for the
-    /// window's lifetime. And the window's later QUIT, whose BYE arrives on its
-    /// new link, relaunches nothing: a BYE is the process's, whichever of its
-    /// links carried it.
+    /// An offer is made to a connection: when it drops while its window lives, the offer returns
+    /// to Orphaned at the EOF, so the window's next link's ADOPT is offered it again. The window's
+    /// later quit, its BYE on the new link, relaunches nothing.
     #[test]
     fn an_offer_whose_link_drops_while_its_window_lives_is_offered_again() {
         let mut k = KeeperCore::new(true);
@@ -3089,13 +2972,9 @@ mod tests {
         );
     }
 
-    /// A window's link drops while the window lives, and a tab closes before
-    /// the link reconnects: the reconnected link registers only the masters
-    /// the window still holds, then sends the closed tab's RELEASE. The record
-    /// is claimed only by the dropped link, a connection of the SAME process,
-    /// so the RELEASE is the window's own and must close the custody copy now
-    /// — refused as NotClaimant, the closed tab's shell would live on in the
-    /// keeper until the whole window ended.
+    /// A tab closes while its window's link is down: the reconnected link registers only what the
+    /// window still holds, then sends the closed tab's RELEASE for a record only the dropped link
+    /// (the same process) claims. The RELEASE closes the custody copy now.
     fn a_tab_closed_while_its_link_was_down(eof_first: bool) {
         let mut k = KeeperCore::new(true);
         let mut w = World::default();
@@ -3151,10 +3030,8 @@ mod tests {
         a_tab_closed_while_its_link_was_down(false);
     }
 
-    /// NEGATIVE CONTROL: the same-process rule is the process's, not any
-    /// window's. Another window (another pid) may not release a master it
-    /// never claimed, and a later process at the same pid (another birth) is
-    /// not the one that claimed it.
+    /// Negative control: the same-process rule is the process's. Another pid may not release a
+    /// master it never claimed, nor a later process at the same pid (another birth).
     #[test]
     fn another_process_may_not_release_what_a_dropped_link_claimed() {
         let mut k = KeeperCore::new(true);
@@ -3208,10 +3085,8 @@ mod late_hello_tests {
         }
     }
 
-    /// A build that boots slower than HELLO_DEADLINE_MS and crashes after its
-    /// HELLO: every relaunch's late HELLO must still be that relaunch
-    /// answering, never a manual launch that resets the brake — or the brake
-    /// never holds and the keeper relaunches it forever.
+    /// A build that boots slower than HELLO_DEADLINE_MS and crashes after its HELLO: each late
+    /// HELLO is still that relaunch answering, never a manual launch that resets the brake.
     #[test]
     fn a_slow_booting_crash_loop_is_still_braked() {
         let mut k = KeeperCore::new(true);

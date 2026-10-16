@@ -3,41 +3,24 @@
 
 //! A line revived after a rest wears the stops it had.
 //!
-//! The take: a shell line typed at 12 cps, a rest past the swoosh (every cell
-//! gone, inside the five-second chain window), then the hand types on at the
-//! line's end. The seam's typed-run revive (`CursorGlow::hand_v2_typed_sweep`)
-//! re-lays the whole retired run on the key's frame
-//! (`codex_particle_replay.rs`
-//! `codex_same_row_continuation_restores_the_exact_retired_prefix` pins that the
-//! prefix returns). These laws pin its colour: every revived column takes back
-//! the stop it had and the key's cell continues the walk one step past the
-//! line's last cell. Without them the re-lay would mint a cohort continuing
-//! `last_walk` (one past the run's end) anchored at the run's first column,
-//! shifting every column `len` stops on.
+//! The take: a shell line typed at 12 cps, a rest past the swoosh (every cell gone, inside the
+//! five-second chain window), then a key at the line's end. The seam's typed-run revive
+//! (`CursorGlow::hand_v2_typed_sweep`) re-lays the retired run on the key's frame; every revived
+//! column takes back its stop (C2, `Cohort::anchor_col`) and the key's cell continues the walk
+//! one step past the line's last cell. Left alone, the re-lay would mint a cohort continuing
+//! `last_walk` at the run's first column, shifting every column `len` stops on. How it holds:
 //!
-//! This follows C2 (`Cohort::anchor_col`: `t` is a function of position, so a
-//! cell backspaced and retyped takes back its stop) and the ribbon's rebirth law
-//! (`ribbon.rs` `a_rebirth_after_a_finished_swoosh_continues_the_walk_s_pace`).
-//! How it holds:
+//! * a cell laid beside a run still lit on its row joins that run's walk by position
+//!   (`Ribbon::join_cohort`);
+//! * when the key's echo lands a frame late the key is held and the re-lay goes first, carrying
+//!   the walk origin read off the run's standing cells (`RecentTypedRun::origin`,
+//!   `ribbon::Revive`);
+//! * a run no later key saw standing has its walk read on the frame that lays it
+//!   (`CursorGlow::read_fresh_run_origin`);
+//! * a typed fold's landing is remembered as the row's typed run
+//!   (`CursorGlow::remember_fold_landing`), so the revive re-lays the fold glyph too.
 //!
-//! * a cell laid beside a run still lit on its row takes that run's walk by
-//!   position (`Ribbon::join_cohort`), so when the key's cell is laid first the
-//!   re-lay joins it on the line's own stops;
-//! * when the key's echo lands a frame late the key is held and the re-lay goes
-//!   first, so the seam reads the run's walk origin off its standing cells
-//!   (`RecentTypedRun::origin`) and names the re-lay with it
-//!   (`rk::ribbon::Revive`);
-//! * a run no later key saw standing (one key, or a fold glyph) has its walk read
-//!   on the frame that lays it (`CursorGlow::read_fresh_run_origin`);
-//! * a typed fold's landing (the continuation row's head from the pane's first
-//!   column) is remembered as the row's typed run
-//!   (`CursorGlow::remember_fold_landing`), so the revive re-lays the fold glyph
-//!   too.
-//!
-//! Folds are read behind each shape `walk_census`'s [`Fold`] models (the
-//! kernel's cooked-mode echo, bash readline, zsh zle). Controls: the same key
-//! inside the grace keeps every stop, and after the same rest with a prefix
-//! glyph rewritten (no revive) the key's cell is exactly the walk continued.
+//! Folds are read behind each shape `walk_census`'s [`Fold`] models.
 
 use crate::walk_census::*;
 use aterm_effects::rainbow_kitty::ribbon::{CHAIN_GAP_MAX, WALK_LAY_RATE, walk_t};
@@ -153,9 +136,8 @@ fn revived_shaped(
 }
 
 /// The colour law for one revived take: every lit column of `row` kept its
-/// stop, and the key's cell (text `n`) is the walk one step past the line's last
-/// cell, `walk_t(n)` (every take's line is on a cold walk, [`assert_cold_walk`],
-/// so the fast leg counts too: a one-key line steps `1/16`). `None` when it
+/// stop, and the key's cell (text `n`) is `walk_t(n)`, one step past the
+/// line's last cell on the cold walk ([`assert_cold_walk`]). `None` when it
 /// holds, else what broke.
 fn stops_kept(
     s: &Shell,
@@ -248,12 +230,9 @@ const LATE_ECHO_MS: u64 = 20;
 /// The frame train's period.
 const FRAME_MS: u64 = 16;
 
-/// The same law when the key's echo lands a frame late. The engine holds a key
-/// whose echo has not landed (`Ribbon::hold_typed`), so on the echo's frame the
-/// key's cell comes from the seam's sweep after the revive's `Sweep`
-/// (`CursorGlow::hand_v2_typed_sweep`). The re-lay mints with no run lit on its
-/// row, so the position law cannot place it; the seam's named revive must, on
-/// one row and on a wrapped line's second row.
+/// The same law when the key's echo lands a frame late: the engine holds the
+/// key (`Ribbon::hold_typed`), the re-lay mints with no run lit on its row, so
+/// the position law cannot place it and the seam's named revive must.
 #[test]
 fn a_line_revived_when_the_key_s_echo_lands_a_frame_late_keeps_its_stops() {
     let mut broken = Vec::new();
@@ -286,7 +265,7 @@ fn a_line_revived_when_the_key_s_echo_lands_a_frame_late_keeps_its_stops() {
         s.key(' ');
         s.idle(SETTLE_MS);
         let after = stops(&s);
-        // The premise: the key was HELD — a frame presented between its
+        // The premise: the key was held — a frame presented between its
         // press and its echo, the line's text not yet grown.
         let held = s
             .snaps
@@ -314,13 +293,10 @@ fn a_line_revived_when_the_key_s_echo_lands_a_frame_late_keeps_its_stops() {
     assert!(broken.is_empty(), "{}", broken.join("\n"));
 }
 
-/// A run no key saw standing comes back on its own walk. A run the hand rested
-/// right after (one key; behind the kernel echo, the fold glyph alone or two or
+/// A run no key saw standing (one key; the kernel fold glyph alone, or two or
 /// three under a coalesced fold) has its walk read on the frame that lays it
-/// (`CursorGlow::read_fresh_run_origin`), so behind a frame-late echo, where the
-/// re-lay is laid before the key's cell, it still comes back on its stops. Every
-/// take: no revived cell dark, every stop kept ([`stops_kept`]); behind the late
-/// echo, a frame presented the press alone.
+/// (`CursorGlow::read_fresh_run_origin`), so it comes back on its stops even
+/// behind a frame-late echo, where the re-lay is laid before the key's cell.
 #[test]
 fn a_run_no_key_saw_standing_comes_back_on_its_own_walk() {
     // (what, line, the run's text range, fold, echo ms, coalesced fold)
@@ -424,17 +400,11 @@ fn a_run_no_key_saw_standing_comes_back_on_its_own_walk() {
     assert!(broken.is_empty(), "{}", broken.join("\n"));
 }
 
-/// No hole at the fold: the revive re-lays the typed run the seam remembered for
-/// the key's row (`RecentTypedRun`). Behind the kernel's cooked-mode echo
-/// ([`Fold::Kernel`]: `cat`, `read` without `-e`) the glyph that fills the
-/// margin parks the caret there and the next glyph is written at the next row's
-/// column 0 by the terminal's wrap, a move across rows laid by the fold's sweep.
-/// That landing is remembered as the row's typed run, so after the rest the row
-/// comes back from its first glyph. bash readline and zsh zle fold on the key
-/// that fills the margin (`<glyph> \r`), so their run already starts at column
-/// 0. Each fold shape is read behind a 2 ms echo and a frame-late one, and every
-/// revived row wears its stops ([`stops_kept`]). Control: the single-row line,
-/// revived from its first glyph.
+/// No hole at the fold. Behind the kernel's cooked-mode echo ([`Fold::Kernel`]) the glyph after
+/// the margin is written at the next row's column 0 by the terminal's wrap, and that landing is
+/// remembered as the row's typed run; readline and zle fold on the key that fills the margin, so
+/// their run already starts at column 0. Each shape behind a 2 ms echo and a frame-late one.
+/// Control: the single-row line.
 #[test]
 fn a_wrapped_line_revived_after_a_rest_lights_its_second_row_from_its_first_glyph() {
     let (_, _, after) = revived(LINE_CELLS, 0..LINE_CELLS, "one row");
@@ -448,8 +418,8 @@ fn a_wrapped_line_revived_after_a_rest_lights_its_second_row_from_its_first_glyp
         ("kernel echo", Fold::Kernel, Echo::After(2)),
         ("readline", Fold::Readline, Echo::After(2)),
         ("zle", Fold::Zle, Echo::After(2)),
-        // …and each behind an echo a frame late (§43's order: the key
-        // HELD, the revive's re-lay laid before its cell).
+        // …and each behind an echo a frame late (§43: the key held, the
+        // revive's re-lay laid before its cell).
         (
             "kernel echo a frame late",
             Fold::Kernel,

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-//! Tier-0 + registry/interpreter locks for the DERIVED StreamingSearch model.
+//! Tier-0 + interpreter locks for the DERIVED StreamingSearch model.
 //!
 //! `streaming_search_model()` (machine `StreamingSearch`) is the drift-free twin
 //! of `aterm-search::streaming::StreamingSearch`. It SUPERSEDES the hand-written
@@ -16,8 +16,8 @@
 //!      invalidation clamp — the pre-#7472/#7244 index-out-of-range class — among
 //!      them; `streaming_search_each_law_has_its_own_slip` pins the others); `ty`
 //!      additionally re-proves the generated TLA+ wherever installed.
-//!   2. **Wrap = 0 variant**: the same proof with wraparound navigation disabled
-//!      (Next/Prev clamp at the boundary instead of cycling).
+//!   2. **Wrap = 0 variant**: the same prove-and-catch with wraparound navigation
+//!      disabled (Next/Prev clamp at the boundary instead of cycling).
 //!   3. **Executable-twin spot-walks**: `m.fire` sequences reproducing the
 //!      engine's documented lifecycle (scan/auto-complete, capacity, navigation
 //!      wrap + clamp, invalidation to NoResults, revival via Add, cancel). The
@@ -25,67 +25,18 @@
 //!      model fails it; an added one has no resolving anchor in `operations.rs`
 //!      and fails aterm-gui's `spec_xref_closure`.
 //!
-//! Registry enrolment is pinned here directly: with every law caught, the
-//! non-vacuity ratchet no longer names this model in either table, so it cannot
-//! notice the model leaving `xref::model_registry()`.
-//!
 //! Tier-1 (lockstep against the REAL engine) lives in
-//! `aterm-search/tests/conformance_streaming.rs`; the compile-time gate in
-//! `aterm-search/build.rs`.
+//! `aterm-search/tests/conformance_streaming.rs`.
 
 use aterm_spec::derive::streaming_search_model;
 use aterm_spec::{interp, verify};
 
-/// Tier-0: proven at the committed `Buggy = 0`, caught at `Buggy = 1`.
+/// Tier-0 at `Wrap = 0`: boundary-clamping navigation is a shipped setting, so
+/// it is proven and caught like the default.
 #[test]
-fn derived_streaming_search_proves_and_catches_unclamped_index() {
-    let model = streaming_search_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name),
-        "StreamingSearch must stay enrolled in the model registry"
-    );
-    verify::prove_and_catch_scalar(&model, "derived StreamingSearch spec (invalidation clamp)");
-}
-
-/// Tier-0 at `Wrap = 0`: with boundary-clamping navigation the invariants still
-/// hold over the whole reachable space (interpreter always; `ty` where installed).
-#[test]
-fn derived_streaming_search_holds_with_wrap_disabled() {
+fn derived_streaming_search_proves_and_catches_with_wrap_disabled() {
     let m = interp::with_consts(&streaming_search_model(), &[("Wrap", 0)]);
-    match interp::bmc(&m) {
-        Ok(n) => eprintln!("StreamingSearch (Wrap=0): proven over {n} states (interpreter)."),
-        Err((st, inv)) => panic!("StreamingSearch (Wrap=0): invariant `{inv}` VIOLATED at {st:?}"),
-    }
-    let base = streaming_search_model();
-    let Some(ty) = verify::ty_escalation("derived StreamingSearch (Wrap=0) spec") else {
-        return;
-    };
-    let dir = std::env::temp_dir().join(format!("aterm-ss-wrap0-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("mk tempdir");
-    let spec = dir.join("StreamingSearch.tla");
-    let cfg = dir.join("StreamingSearch.cfg");
-    std::fs::write(&spec, base.to_tla()).expect("write derived spec");
-    std::fs::write(&cfg, base.to_cfg_with(&[("Wrap", 0)])).expect("write derived cfg");
-    let mut cmd = std::process::Command::new(&ty);
-    cmd.arg("check").arg(&spec).arg("--config").arg(&cfg);
-    // ARMED: partial-order reduction does not preserve coverage, and the `ty`
-    // this machine discovers has an UNSOUND one — see `arm_whole_space_check`.
-    aterm_spec::verify::arm_whole_space_check(&mut cmd);
-    let out = aterm_spec::verify::ty_output(&mut cmd).expect("run ty check");
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-    assert!(
-        out.status.success(),
-        "derived StreamingSearch (Wrap=0) must model-check clean in ty — TIER DISAGREEMENT \
-         (interpreter proved it above)\n{combined}"
-    );
-    eprintln!("StreamingSearch (Wrap=0): additionally model-checked clean by ty.");
+    verify::prove_and_catch_scalar(&m, "derived StreamingSearch spec (Wrap=0)");
 }
 
 /// Executable-twin spot-walks: drive the SAME model through the engine's

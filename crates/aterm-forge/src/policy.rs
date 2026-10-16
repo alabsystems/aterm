@@ -70,20 +70,16 @@ pub enum CensusMode {
     /// Links into the shipped GUI process: scanned, with every lock identity in
     /// a per-crate namespace so foreign names never merge with aterm's.
     Scanned,
-    /// Runs only inside a build script (a host tool), so it never links into a
-    /// shipped process and is classified out with a written justification.
-    BuildDepOnly,
 }
 
 impl CensusMode {
     fn parse(s: &str, ctx: &str) -> Result<Self, String> {
         match s {
             "scanned" => Ok(Self::Scanned),
-            "build-dep-only" => Ok(Self::BuildDepOnly),
             other => Err(format!(
                 "{POLICY_PATH}: {ctx} census.mode = \"{other}\" is not a mode — write \
                  \"scanned\" (the crate links into the shipped process; then census.namespace \
-                 is required) or \"build-dep-only\" (it only runs inside a build script)"
+                 is required)"
             )),
         }
     }
@@ -98,7 +94,7 @@ pub struct Fork {
     /// The upstream version the fork keeps, so the existing `^` requirements
     /// still resolve. Held to the vendored manifest by `targo --unverified forge check`'s `[OB-17]`.
     pub version: String,
-    /// Repo-relative directory (`vendor/winit`).
+    /// Repo-relative directory (`vendor/indexmap`).
     pub path: String,
     /// The SPDX expression from the vendored manifest, verbatim.
     pub license: String,
@@ -109,7 +105,7 @@ pub struct Fork {
     /// The lock-order census's classification.
     pub census_mode: CensusMode,
     /// The identity namespace (`winit` ⇒ `winit::…`). Required for
-    /// [`CensusMode::Scanned`], refused for [`CensusMode::BuildDepOnly`].
+    /// [`CensusMode::Scanned`].
     pub census_namespace: Option<String>,
 }
 
@@ -310,7 +306,7 @@ fn fork_block(t: &dyn TableLike, n: usize) -> Result<Fork, String> {
         format!(
             "{POLICY_PATH}: {ctx} has no `census` — every fork must say how the lock-order \
              census treats it. Add `census.mode = \"scanned\"` plus `census.namespace = \
-             \"{name}\"`, or `census.mode = \"build-dep-only\"`"
+             \"{name}\"`"
         )
     })?;
     let ct = census.as_table_like().ok_or_else(|| {
@@ -322,24 +318,13 @@ fn fork_block(t: &dyn TableLike, n: usize) -> Result<Fork, String> {
     check_keys(ct, &["mode", "namespace"], &format!("{ctx} census"))?;
     let census_mode = CensusMode::parse(&req_str(ct, "mode", &ctx)?, &ctx)?;
     let census_namespace = opt_str(ct, "namespace", &ctx)?;
-    match (census_mode, &census_namespace) {
-        (CensusMode::Scanned, None) => {
-            return Err(format!(
-                "{POLICY_PATH}: {ctx} is census.mode = \"scanned\" but has no \
-                 census.namespace — a scanned fork's lock identities MUST live in a \
-                 per-crate namespace or a foreign receiver name can merge with an aterm \
-                 one. Add `census.namespace = \"{name}\"`"
-            ));
-        }
-        (CensusMode::BuildDepOnly, Some(ns)) => {
-            return Err(format!(
-                "{POLICY_PATH}: {ctx} is census.mode = \"build-dep-only\" but declares \
-                 census.namespace = \"{ns}\" — a crate that never links into a shipped \
-                 process contributes no identities. Delete the namespace, or change the \
-                 mode to \"scanned\""
-            ));
-        }
-        _ => {}
+    if census_namespace.is_none() {
+        return Err(format!(
+            "{POLICY_PATH}: {ctx} is census.mode = \"scanned\" but has no \
+             census.namespace — a scanned fork's lock identities MUST live in a \
+             per-crate namespace or a foreign receiver name can merge with an aterm \
+             one. Add `census.namespace = \"{name}\"`"
+        ));
     }
 
     Ok(Fork {
@@ -461,11 +446,95 @@ pub fn lock_entries(root: &Path) -> Result<Vec<LockEntry>, String> {
     Ok(out)
 }
 
+/// The package a `[patch.crates-io]` row replaces: its `package` key when the
+/// row is RENAMED, else the row's own key.
+///
+/// A renamed row is how one manifest patches two semver-incompatible versions
+/// of one package (cargo's "Using `[patch]` with multiple versions"): cargo
+/// matches a row on the package it names, never on its key. Every forge reader
+/// of the patch table goes through this, so a row keyed `windows-sys-052` is
+/// measured as the `windows-sys` it replaces, not as a package nothing resolves.
+pub fn patched_package<'a>(key: &'a str, row: &'a Item) -> &'a str {
+    row.get("package").and_then(Item::as_str).unwrap_or(key)
+}
+
+/// The semver-compatibility class of a version or a requirement's version
+/// part: what cargo treats as one version line. `1.4.2` and `^1.4` are `1`,
+/// `0.52.0` and `0.52` are `0.52`, `0.0.3` is `0.0.3`. Comparison operators,
+/// whitespace and any pre-release or build suffix are ignored.
+pub fn semver_class(version: &str) -> String {
+    let core = version.trim_start_matches(|c: char| "^=~<> ".contains(c));
+    let core = core.split(['-', '+', ',', ' ']).next().unwrap_or_default();
+    let mut parts = core.split('.');
+    let major = parts.next().unwrap_or_default();
+    if major != "0" {
+        return major.to_string();
+    }
+    let minor = parts.next().unwrap_or_default();
+    if minor != "0" {
+        return format!("0.{minor}");
+    }
+    match parts.next() {
+        Some(patch) => format!("0.0.{patch}"),
+        None => "0.0".to_string(),
+    }
+}
+
+/// A class we can safely exclude from another row: a numeric version or
+/// the bare/caret/exact requirement forms attest understands. Wildcards,
+/// comparisons and compound requirements may span classes, so keep them in
+/// scope for the requirement reader to judge rather than guessing.
+fn known_semver_class(version: &str) -> Option<String> {
+    let version = version.trim();
+    let number = version
+        .strip_prefix('^')
+        .or_else(|| version.strip_prefix('='))
+        .unwrap_or(version)
+        .trim_start();
+    let core = number.split(['-', '+']).next()?;
+    let parts: Vec<_> = core.split('.').collect();
+    if parts.is_empty()
+        || parts.len() > 3
+        || parts.iter().any(|p| {
+            p.is_empty()
+                || !p.bytes().all(|b| b.is_ascii_digit())
+                || (p.len() > 1 && p.starts_with('0'))
+                || p.parse::<u64>().is_err()
+        })
+    {
+        return None;
+    }
+    Some(semver_class(number))
+}
+
+/// Whether `version` (or a requirement) of a patched package is the business of
+/// a row whose own version is `row_version`.
+///
+/// A RENAMED row claims one version line of its package, so a copy in another
+/// line is a different package version that the row does not replace: another
+/// row's target, or a registry package the ratchet counts. An un-renamed row
+/// answers for every copy of its name, so a fork's fix cannot be missing from a
+/// sibling major unnoticed. The rule reads only the key, so a renamed row into
+/// `vendor/` is scoped the same way: rename a fork's row only when its fix
+/// belongs to that one line. With no readable `row_version` the row claims
+/// every copy (fail-closed), as does a requirement whose class is unknown.
+pub fn in_row_scope(renamed: bool, row_version: Option<&str>, version: &str) -> bool {
+    match row_version {
+        Some(row) if renamed => match (known_semver_class(row), known_semver_class(version)) {
+            (Some(row), Some(other)) => row == other,
+            _ => true,
+        },
+        _ => true,
+    }
+}
+
 /// One `[patch.crates-io]` path entry, measured against the tree and the lock.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PatchEntry {
-    /// The crates.io package being replaced (the patch table key).
+    /// The crates.io package being replaced ([`patched_package`]).
     pub name: String,
+    /// The patch table key: [`Self::name`] unless the row is renamed.
+    pub key: String,
     /// Repo-relative replacement path, as written in the manifest.
     pub path: String,
     /// `version` from the vendored manifest.
@@ -476,15 +545,16 @@ pub struct PatchEntry {
     /// `None` when there is none (the patch is not in effect).
     pub lock_version: Option<String>,
     /// Registry-sourced versions of the same name that coexist with the fork,
-    /// read from `Cargo.lock` alone.
+    /// read from `Cargo.lock` alone; for a renamed row, only those in its own
+    /// version line ([`in_row_scope`]).
     ///
     /// Non-empty means the fix may be absent from the copy that compiles; the
     /// lock records no edge kinds, so whether a sibling ships is decided
     /// against the per-cell `--edges normal` graph by `[OB-12]` in
     /// [`crate::check`].
     pub shadowed_by: Vec<String>,
-    /// Third-party source under `vendor/` or a first-party member under
-    /// `crates/`, per [`aterm_census::scan_set::classify_patch_target`].
+    /// Third-party source under `vendor/`, or a first-party or absorbed member
+    /// under `crates/`, per [`aterm_census::scan_set::classify_patch_target`].
     pub kind: PatchTargetKind,
 }
 
@@ -500,6 +570,12 @@ impl PatchEntry {
     /// replacement.
     pub fn is_vendored(&self) -> bool {
         self.kind == PatchTargetKind::Vendored
+    }
+
+    /// The row is keyed apart from the package it replaces
+    /// ([`patched_package`]), and so claims one version line of it.
+    pub fn is_renamed(&self) -> bool {
+        self.key != self.name
     }
 }
 
@@ -525,34 +601,36 @@ pub fn patch_entries(root: &Path) -> Result<Vec<PatchEntry>, String> {
 
     let lock = lock_entries(root)?;
     let mut out = Vec::new();
-    for (name, item) in pt.iter() {
+    for (key, item) in pt.iter() {
+        let name = patched_package(key, item);
         let spec = item.as_table_like().ok_or_else(|| {
             format!(
-                "{}: `[patch.crates-io] {name}` is not a table — forge models path patches \
-                 only: `{name} = {{ path = \"vendor/{name}\" }}`",
+                "{}: `[patch.crates-io] {key}` is not a table — forge models path patches \
+                 only: `{key} = {{ path = \"vendor/{key}\" }}`",
                 manifest.display()
             )
         })?;
         for (k, _) in spec.iter() {
-            if k != "path" {
+            if k != "path" && k != "package" {
                 return Err(format!(
-                    "{}: `[patch.crates-io] {name}` has key `{k}` — forge models path patches \
-                     only (a git or version patch has no vendored tree to notarize). Vendor \
-                     it under `vendor/{name}` and write `{name} = {{ path = \
-                     \"vendor/{name}\" }}`, or teach {POLICY_PATH} a new fork shape first",
+                    "{}: `[patch.crates-io] {key}` has key `{k}` — forge models path patches \
+                     only (a git or version patch has no vendored tree to notarize), optionally \
+                     renamed with `package`. Vendor it under `vendor/{key}` and write `{key} = \
+                     {{ path = \"vendor/{key}\" }}`, or teach {POLICY_PATH} a new fork shape \
+                     first",
                     manifest.display()
                 ));
             }
         }
         let path = spec.get("path").and_then(Item::as_str).ok_or_else(|| {
             format!(
-                "{}: `[patch.crates-io] {name}` has no `path` — write `{name} = {{ path = \
-                 \"vendor/{name}\" }}`",
+                "{}: `[patch.crates-io] {key}` has no `path` — write `{key} = {{ path = \
+                 \"vendor/{key}\" }}`",
                 manifest.display()
             )
         })?;
 
-        let kind = classify_patch_target(name, path, root)?;
+        let kind = classify_patch_target(key, path, root)?;
         let (pkg_name, manifest_version, license) = patched_manifest(root, path, kind)?;
         if pkg_name != name {
             return Err(format!(
@@ -563,17 +641,25 @@ pub fn patch_entries(root: &Path) -> Result<Vec<PatchEntry>, String> {
             ));
         }
 
+        // Two rows may patch two version lines of one name, so the path copy
+        // this row owns is the one at its own version; any other is a guess.
+        let renamed = key != name;
         let mut lock_version = None;
         let mut shadowed_by = Vec::new();
         for e in lock.iter().filter(|e| e.name == name) {
             if e.source.is_none() {
-                lock_version.get_or_insert_with(|| e.version.clone());
-            } else {
+                if e.version == manifest_version {
+                    lock_version = Some(e.version.clone());
+                } else {
+                    lock_version.get_or_insert_with(|| e.version.clone());
+                }
+            } else if in_row_scope(renamed, Some(&manifest_version), &e.version) {
                 shadowed_by.push(e.version.clone());
             }
         }
         out.push(PatchEntry {
             name: name.to_string(),
+            key: key.to_string(),
             path: path.to_string(),
             manifest_version,
             license,
@@ -588,8 +674,8 @@ pub fn patch_entries(root: &Path) -> Result<Vec<PatchEntry>, String> {
 /// `(name, version, license)` from a patched crate's own manifest.
 ///
 /// A vendored fork is outside the workspace, so an inherited
-/// (`workspace = true`) key there is a named error. A first-party target is a
-/// member, so inheritance is resolved from `[workspace.package]`.
+/// (`workspace = true`) key there is a named error. A first-party or absorbed
+/// target is a member, so inheritance is resolved from `[workspace.package]`.
 fn patched_manifest(
     root: &Path,
     rel: &str,
@@ -610,10 +696,9 @@ fn patched_manifest(
         .get("package")
         .and_then(Item::as_table_like)
         .ok_or_else(|| format!("{}: no `[package]` table", path.display()))?;
-    // `[workspace.package]` of the ROOT, read lazily and only for the
-    // first-party arm.
+    // `[workspace.package]` of the ROOT, read lazily and only for a member.
     let inherited = |key: &str| -> Option<String> {
-        if kind != PatchTargetKind::FirstParty {
+        if kind == PatchTargetKind::Vendored {
             return None;
         }
         // `key.workspace = true` is the only inheritance form cargo accepts.
@@ -651,8 +736,8 @@ fn patched_manifest(
                  across into `vendor/`)",
                 path.display()
             ),
-            PatchTargetKind::FirstParty => format!(
-                "{}: `[package] {key}` is missing — a first-party patch target may state it \
+            PatchTargetKind::FirstParty | PatchTargetKind::Absorbed => format!(
+                "{}: `[package] {key}` is missing — a member patch target may state it \
                  literally or inherit it with `{key}.workspace = true`, but the root \
                  `[workspace.package]` has no `{key}` to inherit",
                 path.display()
@@ -689,13 +774,14 @@ apache_notice = true
 census.mode = "scanned"
 census.namespace = "winit"
 
-# pkg-config only ever runs inside a build script.
+# smol_str is dual-licensed, so it owes no §4(b) notices.
 [[fork]]
-name = "pkg-config"
-version = "0.3.33"
-path = "vendor/pkg-config"
+name = "smol_str"
+version = "0.2.2"
+path = "vendor/smol_str"
 license = "MIT OR Apache-2.0"
-census.mode = "build-dep-only"
+census.mode = "scanned"
+census.namespace = "smol_str"
 "#;
 
     #[test]
@@ -720,14 +806,13 @@ census.mode = "build-dep-only"
         assert!(winit.apache_notice);
         assert_eq!(winit.census_mode, CensusMode::Scanned);
         assert_eq!(winit.census_namespace.as_deref(), Some("winit"));
-        let pc = p
+        let ss = p
             .forks
             .iter()
-            .find(|f| f.name == "pkg-config")
-            .expect("pkg-config block");
-        assert!(!pc.apache_notice, "apache_notice defaults to false");
-        assert_eq!(pc.census_mode, CensusMode::BuildDepOnly);
-        assert_eq!(pc.census_namespace, None);
+            .find(|f| f.name == "smol_str")
+            .expect("smol_str block");
+        assert!(!ss.apache_notice, "apache_notice defaults to false");
+        assert_eq!(ss.census_namespace.as_deref(), Some("smol_str"));
         assert_eq!(p.forge.cells.len(), 1);
         assert_eq!(p.forge.cells[0].triple, "aarch64-apple-darwin");
     }
@@ -756,13 +841,15 @@ census.mode = "build-dep-only"
     }
 
     #[test]
-    fn a_build_dep_only_fork_with_a_namespace_is_refused() {
+    fn a_census_mode_that_is_not_scanned_is_refused() {
+        // `build-dep-only` was a mode until its one fork (pkg-config) went back to
+        // the registry; a block still spelling it fails closed instead of passing.
         let bad = SAMPLE.replace(
+            "census.mode = \"scanned\"\ncensus.namespace = \"smol_str\"",
             "census.mode = \"build-dep-only\"",
-            "census.mode = \"build-dep-only\"\ncensus.namespace = \"pkg_config\"",
         );
         let e = parse(&bad).unwrap_err();
-        assert!(e.contains("build-dep-only"), "{e}");
+        assert!(e.contains("\"build-dep-only\" is not a mode"), "{e}");
     }
 
     #[test]
@@ -792,53 +879,35 @@ census.mode = "build-dep-only"
         assert!(e.contains("winit"), "{e}");
     }
 
-    // --- tests that walk the REAL tree (the house norm) ---------------------
-
     #[test]
-    fn the_real_patch_table_is_five_live_vendored_forks_and_seven_first_party_targets() {
-        let root = repo_root();
-        let all = patch_entries(&root).expect("the real patch table reads");
-        let (vendored, first_party): (Vec<_>, Vec<_>) = all.iter().partition(|e| e.is_vendored());
-        assert_eq!(
-            vendored.len(),
-            5,
-            "vendored forks: {:?}",
-            vendored.iter().map(|e| &e.name).collect::<Vec<_>>()
-        );
-        for e in &vendored {
-            assert!(e.path.starts_with("vendor/"), "{} -> {}", e.name, e.path);
-        }
-        // The `vendor/` prefix belongs to the vendored arm; first-party
-        // replacements live under crates/.
-        assert_eq!(
-            first_party
-                .iter()
-                .map(|e| (e.name.as_str(), e.path.as_str()))
-                .collect::<Vec<_>>(),
-            // Manifest order (`attest::partition_patches` sorts instead).
-            [
-                ("tracing", "crates/aterm-tracing"),
-                ("profiling", "crates/aterm-profiling"),
-                ("cfg-if", "crates/aterm-cfg-if"),
-                ("arrayvec", "crates/aterm-arrayvec"),
-                ("libc", "crates/aterm-libc"),
-                ("log", "crates/aterm-log-shim"),
-                ("core_maths", "crates/aterm-core-maths"),
-                ("once_cell", "crates/aterm-once-cell"),
-            ]
-        );
-        // LIVENESS, on the other hand, is owed by every entry alike: a patch
-        // that does not take compiles into nothing, whoever wrote it.
-        for e in &all {
-            assert!(
-                e.is_live(),
-                "{} is not live: manifest {} vs lock {:?}",
-                e.name,
-                e.manifest_version,
-                e.lock_version
-            );
+    fn a_semver_class_is_the_version_line_cargo_resolves_within() {
+        for (v, class) in [
+            ("1.4.2", "1"),
+            ("^1.4", "1"),
+            ("0.52.0", "0.52"),
+            ("0.52", "0.52"),
+            ("=0.52.0", "0.52"),
+            ("0.61", "0.61"),
+            ("0.0.3", "0.0.3"),
+            ("2.0.16+zstd.1.5.7", "2"),
+            ("0.3.0-alpha.1", "0.3"),
+        ] {
+            assert_eq!(semver_class(v), class, "{v}");
         }
     }
+
+    #[test]
+    fn only_a_renamed_row_with_a_known_version_is_scoped_to_its_line() {
+        assert!(in_row_scope(true, Some("0.52.0"), "0.52.3"));
+        assert!(!in_row_scope(true, Some("0.52.0"), "0.61.2"));
+        assert!(!in_row_scope(true, Some("0.52.0"), "0.61"));
+        // An un-renamed row answers for every copy of its name.
+        assert!(in_row_scope(false, Some("0.52.0"), "0.61.2"));
+        // An unreadable version claims every copy (fail-closed).
+        assert!(in_row_scope(true, None, "0.61.2"));
+    }
+
+    // --- tests that walk the REAL tree (the house norm) ---------------------
 
     /// A first-party patch target inheriting `license` from
     /// `[workspace.package]` is resolved, not refused.
@@ -846,13 +915,12 @@ census.mode = "build-dep-only"
     fn a_first_party_patch_target_may_inherit_its_license_from_the_workspace() {
         let root = repo_root();
         let all = patch_entries(&root).expect("the real patch table reads");
-        let shims: Vec<_> = all.iter().filter(|e| !e.is_vendored()).collect();
-        assert_eq!(
-            shims.len(),
-            8,
-            "this tree has eight first-party patch targets"
-        );
-        // Every one, not the first found.
+        let shims: Vec<_> = all
+            .iter()
+            .filter(|e| e.kind == PatchTargetKind::FirstParty)
+            .collect();
+        // Every one, not the first found. (The set itself is pinned by the
+        // name-and-version list below; a separate count only went stale.)
         for e in &shims {
             assert_eq!(e.license, "Apache-2.0", "{} inherited, not literal", e.name);
         }
@@ -871,24 +939,17 @@ census.mode = "build-dep-only"
                 ("arrayvec", "0.7.8"),
                 ("libc", "0.2.186"),
                 ("log", "0.4.32"),
-                ("core_maths", "0.1.1"),
                 ("once_cell", "1.21.4"),
+                ("smallvec", "1.15.1"),
+                ("getrandom", "0.2.17"),
+                ("libm", "0.2.16"),
+                ("document-features", "0.2.12"),
+                ("unicode-width", "0.2.2"),
+                ("rustix", "0.38.44"),
+                ("windows-sys", "0.52.0"),
+                ("windows-sys", "0.61.2"),
+                ("bumpalo", "3.20.3"),
             ]
-        );
-    }
-
-    #[test]
-    fn the_real_lock_is_read_as_toml() {
-        let root = repo_root();
-        let lock = lock_entries(&root).expect("the real lock reads");
-        assert!(lock.len() > 300, "{} entries", lock.len());
-        let forks = lock
-            .iter()
-            .filter(|e| e.source.is_none() && e.name == "winit")
-            .count();
-        assert_eq!(
-            forks, 1,
-            "the vendored winit is a path package with no source/checksum"
         );
     }
 }

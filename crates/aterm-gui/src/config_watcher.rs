@@ -3,49 +3,33 @@
 
 //! Live config hot-reload watcher.
 //!
-//! A single background thread observes the user config file
-//! (`config_path()` — `$XDG_CONFIG_HOME/aterm/aterm.toml`, else
-//! `~/.config/aterm/aterm.toml`) every 500 ms and, when its
-//! bounded content/target generation changes, posts a
-//! [`Wake::ConfigReloadObserved`](crate::Wake) with those exact admitted bytes;
-//! the UI thread never reopens the pathname and only applies the immutable
-//! observation (see `App::reload_config_observation`). The same worker fingerprints the bounded user-theme
-//! directory; when it changes, the worker parses a complete
-//! [`ThemeCatalog`](crate::app_config::ThemeCatalog)
-//! and hands only that immutable result to the event loop.
+//! One background thread observes the user config file (`config_path()`) every 500 ms and, when
+//! its bounded content/target generation changes, posts a
+//! [`Wake::ConfigReloadObserved`](crate::Wake) carrying the exact admitted bytes; the UI thread
+//! never reopens the pathname and only applies the observation
+//! (`App::reload_config_observation`). The same worker fingerprints the user-theme directory and,
+//! on a change, hands the event loop a complete immutable
+//! [`ThemeCatalog`](crate::app_config::ThemeCatalog).
 //!
-//! WHY poll, not a filesystem-notification crate: this codebase is
-//! hardened, dependency-conscious, and sandbox-sensitive (the `Containment`
-//! mode denies reads/writes under `~/.config/aterm`). A bounded
-//! observation loop adds ZERO new dependencies, no inotify/FSEvents/kqueue file
-//! descriptors, and no surprising behavior under a sandbox profile. Config
-//! failures are posted as typed, de-duplicated status edges while the previous
-//! live generation remains active. Recovery posts a matching clear edge. Theme
-//! polling backs off to 2 s while stable and is metadata-only: bounded path/file identity, mtime, and
-//! ctime (where the platform exposes it) select a candidate edge; theme bytes are
-//! read only while preparing that changed generation. A timestamp-preserving
-//! rewrite or atomic replacement therefore cannot leave the process stale on
-//! macOS/Linux without continuously hashing tens of MiB of theme data.
+//! It polls rather than using a filesystem-notification crate: no new dependency, no
+//! inotify/FSEvents/kqueue descriptors, and nothing surprising under the `Containment` sandbox.
+//! Failures are typed, de-duplicated status edges while the previous live generation stays
+//! active; recovery posts a matching clear edge. Theme polling backs off to 2 s while stable and
+//! is metadata-only: path/file identity, mtime and ctime (where exposed) select a candidate
+//! edge, so a timestamp-preserving rewrite or atomic replacement is seen on macOS/Linux without
+//! hashing tens of MiB of theme data; theme bytes are read only while preparing a changed
+//! generation.
 //!
-//! THE PATH FEEDS ride the config's own edge. The files `aterm.toml` names by
-//! path whose content is applied state — the Sparkle Words lexicon, Toy Packs
-//! and Trail Packs ([`crate::app_config::Config::path_feed_paths`]) — are
-//! stamped beside it, metadata only, on the same 500 ms poll; a change to one
-//! of them re-posts the current config observation, and the UI's existing
-//! reload admission re-reads the feeds and compares their content
-//! fingerprints (`refresh_path_feeds`). So editing only the lexicon hot-reloads
-//! it, a `touch` that changes no byte stays a no-op, and there is one reload
-//! path, not two.
+//! The path feeds — files `aterm.toml` names whose content is applied state (the Sparkle Words
+//! lexicon, Toy Packs, Trail Packs; [`crate::app_config::Config::path_feed_paths`]) — are
+//! stamped beside it, metadata only, on the same poll. A change to one re-posts the current
+//! config observation, and the UI's reload admission re-reads the feeds and compares content
+//! fingerprints (`refresh_path_feeds`): editing only the lexicon hot-reloads it, a `touch` stays
+//! a no-op, and there is one reload path.
 //!
-//! Two hard rules borrowed from the notification/clipboard threads:
-//!
-//! 1. **Never block the UI thread.** The watcher performs bounded file
-//!    observation and theme discovery itself, then posts immutable values with
-//!    `EventLoopProxy::send_event`; the UI thread only validates/reduces memory
-//!    and remains the sole owner of the renderer, window, and per-tab engines.
-//! 2. **Self-terminating.** When the proxy `send_event` fails (the event loop is
-//!    gone — the app is exiting), the loop breaks and the thread ends. It also
-//!    exits as soon as the proxy can't be reached, so it never outlives the app.
+//! The thread never blocks the UI thread: it observes and discovers itself and posts immutable
+//! values with `EventLoopProxy::send_event`, while the UI thread stays the sole owner of the
+//! renderer, window and engines. It ends when `send_event` fails because the event loop is gone.
 
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -55,12 +39,29 @@ use winit::event_loop::EventLoopProxy;
 
 use crate::Wake;
 
-// THE SUPERVISOR POLICY HAS ONE WRITER, PROVED BY THE COMPILER — see the
-// sibling `config_watcher_island.rs`, whose `clean { … }` island the Clean
-// kernel checks during every Trust-lane build ([`observed_harness`]).
+// The supervisor policy's one-writer proof (see `observed_harness`): the `clean { … }` island
+// in `config_watcher_island.rs`, which the Clean kernel checks in every Trust-lane build.
 #[cfg(clean_islands)]
 #[path = "config_watcher_island.rs"]
 mod island;
+
+// The same protocol declared as a finite model the compiler checks for safety and progress
+// with no authored proof (`config_watcher_protocol_island.rs`). Its `import Trust.Protocol`
+// needs a Trust newer than the installed seal, so it mounts on the seal lane
+// (`--cfg trust_seals`); the installed trustfmt cannot parse its notation, hence the skip and
+// its `aterm_verify::fmt::EXCLUDED` row.
+#[cfg(all(clean_islands, trust_seals))]
+#[rustfmt::skip]
+#[path = "config_watcher_protocol_island.rs"]
+mod protocol_island;
+
+// The writers of `config.harness`, the policy's mirror, bound to the
+// `Wake::HarnessPolicyObserved` arm (`config_watcher_binding_island.rs`). Its own
+// `--cfg trust_binding` on top of the seal lane: a declared binding runs Trust's spawn census,
+// about 25 minutes on this crate under a stage-1 compiler.
+#[cfg(all(clean_islands, trust_seals, trust_binding))]
+#[path = "config_watcher_binding_island.rs"]
+mod binding_island;
 
 /// How often the watcher observes the config file. 500 ms is imperceptible for
 /// an interactive "save and see it apply" loop. Healthy idle polls read only
@@ -197,10 +198,8 @@ impl WatchStatusState {
         let mut messages: Vec<String> = Vec::with_capacity(2);
         if let Some(kind) = self.config {
             let mut message = failure_message(kind).to_string();
-            // "Kept unchanged" protects a loaded configuration. When the launch
-            // could not read the file there is none: say what is actually
-            // running, so the reload refusal cannot read as "your settings are
-            // safe" over a window on all-defaults (glass hunt 2026-09-01, #2).
+            // "Kept unchanged" protects a loaded configuration; when the launch
+            // could not read the file there is none, so say what is running.
             if let Some(notice) = crate::app_config::launch_load_failure() {
                 // An invalid file still had its [harness] lines read at launch
                 // (`Config::stand_in`); an unreadable one had nothing read.
@@ -308,16 +307,11 @@ impl FailureLatch {
 
 /// Spawn the single, process-wide config-watcher thread.
 ///
-/// `path` is the resolved config path (from `config_path()`); `None` means there
-/// is no config path at all (no `$XDG_CONFIG_HOME` and no `$HOME`), in which case
-/// we spawn nothing — there is nothing to watch, and the no-config startup path
-/// stays byte-identical. The thread captures `proxy` (an [`EventLoopProxy`]) and
-/// posts [`Wake::ConfigReloadObserved`] on every admitted content/target change.
-///
-/// `startup_config_baseline` is the exact generation admitted earlier in startup.
-/// The worker compares its first observation against that baseline, so an edit in
-/// the load→watch handoff is delivered immediately while an unchanged launch
-/// config is not redundantly re-applied.
+/// `path` is the resolved config path; with neither it nor a theme directory nothing is
+/// spawned. The thread posts [`Wake::ConfigReloadObserved`] on every admitted content/target
+/// change. `startup_config_baseline` is the generation admitted earlier in startup: the first
+/// observation is compared against it, so an edit in the load→watch handoff is delivered at once
+/// and an unchanged launch config is not re-applied.
 pub(crate) fn spawn(
     path: Option<std::path::PathBuf>,
     startup_config_baseline: Option<crate::native_document_host::AtomicFileBaseline>,
@@ -329,292 +323,276 @@ pub(crate) fn spawn(
         return;
     }
     std::thread::spawn(move || {
-        // Baselines are sampled once on the worker. A later success after a
-        // failed sample remains an edge even when its recovered bytes match the
-        // pre-failure generation, so failure and generation state stay separate.
-        // Stamp before the exact read: a mutation during this handoff therefore
-        // remains an edge on the first poll instead of becoming the baseline.
-        let mut last_config_stamp = path
-            .as_deref()
-            .and_then(|path| config_path_stamp(path).ok());
-        let initial_config = path.as_deref().map(config_file_observation);
-        // The path feeds the observed config names, and their metadata stamp
-        // taken BEFORE the UI reads them: a later edit is always an edge.
-        let mut feed_paths = match initial_config.as_ref() {
-            Some(Ok(observation)) => feed_paths_of(&observation.text).unwrap_or_default(),
-            _ => Vec::new(),
-        };
-        let mut last_feed_stamp = path_feed_stamp(&feed_paths);
-        let mut config_needs_retry = initial_config.as_ref().is_some_and(Result::is_err);
-        let mut config_failure = FailureLatch::default();
-        // THE ONE WRITER OF THE SUPERVISOR'S POLICY (2026-09-29): the
-        // `[harness]` policy the window runs, as last posted
-        // ([`observed_harness`], [`post_harness`]). This thread reads the file
-        // in disk order and its wakes arrive in send order, so the window runs
-        // the `[harness]` of the newest file read — whatever the config lane's
-        // workers finish when. `None` until the first post, which is made
-        // unconditionally: the launch read and this one may differ.
-        let mut last_harness = None;
-        // Every post carries the next generation of this one source, so the
-        // window's adoption is a join (`harness_policy_cell`).
-        let mut harness_stamps = crate::harness_policy_cell::HarnessStampSource::new();
-        if let Some(initial) = initial_config.as_ref()
-            && let Some(policy) = observed_harness(path.as_deref(), initial)
-            && !post_harness(
-                send_harness(&proxy),
-                &mut last_harness,
-                &mut harness_stamps,
-                policy,
-            )
-        {
-            return;
-        }
-        if let Some(Err(error)) = initial_config.as_ref()
-            && !post_status(
-                &proxy,
-                &mut config_failure,
-                WatchTarget::Config,
-                Some(config_failure_kind(error)),
-            )
-        {
-            return;
-        }
-        if let Some(Ok(observation)) = initial_config
-            && initial_config_observation_changed(startup_config_baseline.as_ref(), &observation)
-            && proxy
-                .send_event(Wake::ConfigReloadObserved(observation))
-                .is_err()
-        {
-            return;
-        }
+        watch(
+            path,
+            startup_config_baseline,
+            initial_themes,
+            proxy,
+            theme_dir,
+        )
+    });
+}
 
-        let initial_theme_stamp = theme_dir.as_deref().map(theme_directory_stamp);
-        let mut theme_poll = ThemePollSchedule::new(Instant::now(), initial_theme_stamp.clone());
-        // Theme discovery happened before this worker was spawned and has no
-        // persisted file baseline. Treat the first successful poll as a
-        // reconciliation edge so an edit in that startup gap cannot be lost.
-        let mut last_theme_stamp = None;
-        let mut theme_failure = FailureLatch::default();
-        if let Some(Err(kind)) = initial_theme_stamp.as_ref()
-            && !post_status(&proxy, &mut theme_failure, WatchTarget::Themes, Some(*kind))
-        {
-            return;
+/// The config-watcher thread [`spawn`] starts. A fn, not the closure, because it makes the
+/// policy's one stamp source, in a body the source's seal names in `madeBy`
+/// (`harness_policy_cell_island.rs`): a closure could be handed on and run elsewhere.
+fn watch(
+    path: Option<std::path::PathBuf>,
+    startup_config_baseline: Option<crate::native_document_host::AtomicFileBaseline>,
+    initial_themes: Arc<crate::app_config::ThemeCatalog>,
+    proxy: EventLoopProxy<Wake>,
+    theme_dir: Option<std::path::PathBuf>,
+) {
+    // Baselines are sampled once on the worker. A later success after a
+    // failed sample remains an edge even when its recovered bytes match the
+    // pre-failure generation, so failure and generation state stay separate.
+    // Stamp before the exact read: a mutation during this handoff therefore
+    // remains an edge on the first poll instead of becoming the baseline.
+    let mut last_config_stamp = path
+        .as_deref()
+        .and_then(|path| config_path_stamp(path).ok());
+    let initial_config = path.as_deref().map(config_file_observation);
+    // The path feeds the observed config names, and their metadata stamp
+    // taken before the UI reads them: a later edit is always an edge.
+    let mut feed_paths = match initial_config.as_ref() {
+        Some(Ok(observation)) => feed_paths_of(&observation.text).unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    let mut last_feed_stamp = path_feed_stamp(&feed_paths);
+    let mut config_needs_retry = initial_config.as_ref().is_some_and(Result::is_err);
+    let mut config_failure = FailureLatch::default();
+    // The `[harness]` policy last posted; this thread is its one writer (see
+    // `observed_harness`). `None` until the first post, made unconditionally: the launch read
+    // and this one may differ.
+    let mut last_harness = None;
+    // Every post carries the next generation of this one source, so the
+    // window's adoption is a join (`harness_policy_cell`).
+    let mut harness_stamps = crate::harness_policy_cell::HarnessStampSource::new();
+    if let Some(initial) = initial_config.as_ref()
+        && let Some(policy) = observed_harness(path.as_deref(), initial)
+        && !post_harness(
+            send_harness(&proxy),
+            &mut last_harness,
+            &mut harness_stamps,
+            policy,
+        )
+    {
+        return;
+    }
+    if let Some(Err(error)) = initial_config.as_ref()
+        && !post_status(
+            &proxy,
+            &mut config_failure,
+            WatchTarget::Config,
+            Some(config_failure_kind(error)),
+        )
+    {
+        return;
+    }
+    if let Some(Ok(observation)) = initial_config
+        && initial_config_observation_changed(startup_config_baseline.as_ref(), &observation)
+        && proxy
+            .send_event(Wake::ConfigReloadObserved(observation))
+            .is_err()
+    {
+        return;
+    }
+
+    let initial_theme_stamp = theme_dir.as_deref().map(theme_directory_stamp);
+    let mut theme_poll = ThemePollSchedule::new(Instant::now(), initial_theme_stamp.clone());
+    // Theme discovery happened before this worker was spawned and has no
+    // persisted file baseline. Treat the first successful poll as a
+    // reconciliation edge so an edit in that startup gap cannot be lost.
+    let mut last_theme_stamp = None;
+    let mut theme_failure = FailureLatch::default();
+    if let Some(Err(kind)) = initial_theme_stamp.as_ref()
+        && !post_status(&proxy, &mut theme_failure, WatchTarget::Themes, Some(*kind))
+    {
+        return;
+    }
+    let mut themes = initial_themes;
+    // Set at Commit: the next discovered catalogue is posted even if equal.
+    let mut theme_repost = false;
+    loop {
+        std::thread::sleep(POLL_INTERVAL);
+        // A seamless successor drops every config wake before its Commit, so at Commit the
+        // next polls re-read and re-post the file and the theme catalogue as they stand: the
+        // `[harness]` policy and both statuses are posted once per change and would otherwise
+        // never arrive, and a dropped edit would wait for the next save.
+        if REPOST_AFTER_COMMIT.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            last_harness = None;
+            config_failure.forget();
+            config_needs_retry = true;
+            theme_failure.forget();
+            last_theme_stamp = None;
+            theme_repost = true;
         }
-        let mut themes = initial_themes;
-        // Set at Commit: the next discovered catalogue is posted even if equal.
-        let mut theme_repost = false;
-        loop {
-            std::thread::sleep(POLL_INTERVAL);
-            // A seamless successor drops every config wake that arrives
-            // before its Commit, so at Commit the next polls re-read and
-            // re-post the file and the theme catalogue as they stand (review
-            // rounds 3 to 5, 2026-09-29): the `[harness]` policy and both
-            // statuses are posted once per change and would otherwise never
-            // arrive, a readable edit dropped then would wait for the next
-            // save, and a theme change seen then for the next theme edit.
-            if REPOST_AFTER_COMMIT.swap(false, std::sync::atomic::Ordering::Relaxed) {
-                last_harness = None;
-                config_failure.forget();
-                config_needs_retry = true;
-                theme_failure.forget();
-                last_theme_stamp = None;
-                theme_repost = true;
-            }
-            if let Some(path) = path.as_deref() {
-                match config_path_stamp(path) {
-                    Err(kind) => {
-                        config_needs_retry = true;
-                        if !post_status(
-                            &proxy,
-                            &mut config_failure,
-                            WatchTarget::Config,
-                            Some(kind),
-                        ) {
+        if let Some(path) = path.as_deref() {
+            match config_path_stamp(path) {
+                Err(kind) => {
+                    config_needs_retry = true;
+                    if !post_status(&proxy, &mut config_failure, WatchTarget::Config, Some(kind)) {
+                        break;
+                    }
+                }
+                Ok(stamp) => {
+                    // A path feed moved under an unchanged `aterm.toml`: the
+                    // same edge as the config's own, so the current
+                    // observation is re-posted and admission re-reads feeds.
+                    let feeds_moved = path_feed_stamp(&feed_paths) != last_feed_stamp;
+                    let candidate = prepare_config_edge_with(
+                        last_config_stamp.as_ref(),
+                        stamp,
+                        config_needs_retry || feeds_moved,
+                        || config_file_observation(path),
+                    );
+                    if let Some((stamp, observation)) = candidate {
+                        // The policy first, for a refused file as for a readable one: the
+                        // window runs the newest read's `[harness]`, and a readable
+                        // observation's admission reports under it.
+                        if let Some(policy) = observed_harness(Some(path), &observation)
+                            && !post_harness(
+                                send_harness(&proxy),
+                                &mut last_harness,
+                                &mut harness_stamps,
+                                policy,
+                            )
+                        {
                             break;
                         }
-                    }
-                    Ok(stamp) => {
-                        // A path feed moved under an unchanged `aterm.toml`: the
-                        // same edge as the config's own, so the current
-                        // observation is re-posted and admission re-reads feeds.
-                        let feeds_moved = path_feed_stamp(&feed_paths) != last_feed_stamp;
-                        let candidate = prepare_config_edge_with(
-                            last_config_stamp.as_ref(),
-                            stamp,
-                            config_needs_retry || feeds_moved,
-                            || config_file_observation(path),
-                        );
-                        if let Some((stamp, observation)) = candidate {
-                            // THE POLICY FIRST, for a refused file as for a
-                            // readable one: the window runs the `[harness]` of
-                            // the newest read, and a readable observation's
-                            // admission then reports under the policy it runs.
-                            if let Some(policy) = observed_harness(Some(path), &observation)
-                                && !post_harness(
-                                    send_harness(&proxy),
-                                    &mut last_harness,
-                                    &mut harness_stamps,
-                                    policy,
-                                )
-                            {
-                                break;
-                            }
-                            match observation {
-                                Ok(observation) => {
-                                    // Re-derive the feed set from THIS text and stamp it
-                                    // before posting, so an edit racing the UI's read is
-                                    // the next poll's edge. An unparseable config keeps
-                                    // the last known set (admission rejects the text).
-                                    if let Some(paths) = feed_paths_of(&observation.text) {
-                                        feed_paths = paths;
-                                    }
-                                    last_feed_stamp = path_feed_stamp(&feed_paths);
-                                    // Acknowledge only after the exact sampled generation is
-                                    // enqueued. The UI never races a second pathname read.
-                                    if proxy
-                                        .send_event(Wake::ConfigReloadObserved(observation))
-                                        .is_err()
-                                    {
-                                        break;
-                                    }
-                                    // Readability is not admission. TOML parsing, asset
-                                    // preparation, and versioned-service synchronization
-                                    // still run asynchronously; only their exact-baseline
-                                    // success may clear the native warning. Reset this
-                                    // worker latch silently so a later host error begins
-                                    // a fresh failure epoch.
-                                    config_failure.clear_silently();
-                                    config_needs_retry = false;
-                                    last_config_stamp = Some(stamp);
+                        match observation {
+                            Ok(observation) => {
+                                // Re-derive the feed set from this text and stamp it
+                                // before posting, so an edit racing the UI's read is
+                                // the next poll's edge. An unparseable config keeps
+                                // the last known set (admission rejects the text).
+                                if let Some(paths) = feed_paths_of(&observation.text) {
+                                    feed_paths = paths;
                                 }
-                                Err(error) => {
-                                    config_needs_retry = true;
-                                    // Retain the last admitted metadata stamp. A
-                                    // same-stamp recovery must retry the exact read
-                                    // rather than treating metadata alone as proof.
-                                    if !post_status(
-                                        &proxy,
-                                        &mut config_failure,
-                                        WatchTarget::Config,
-                                        Some(config_failure_kind(&error)),
-                                    ) {
-                                        break;
-                                    }
+                                last_feed_stamp = path_feed_stamp(&feed_paths);
+                                // Acknowledge only after the exact sampled generation is
+                                // enqueued. The UI never races a second pathname read.
+                                if proxy
+                                    .send_event(Wake::ConfigReloadObserved(observation))
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                                // Readability is not admission. TOML parsing, asset
+                                // preparation, and versioned-service synchronization
+                                // still run asynchronously; only their exact-baseline
+                                // success may clear the native warning. Reset this
+                                // worker latch silently so a later host error begins
+                                // a fresh failure epoch.
+                                config_failure.clear_silently();
+                                config_needs_retry = false;
+                                last_config_stamp = Some(stamp);
+                            }
+                            Err(error) => {
+                                config_needs_retry = true;
+                                // Retain the last admitted metadata stamp. A
+                                // same-stamp recovery must retry the exact read
+                                // rather than treating metadata alone as proof.
+                                if !post_status(
+                                    &proxy,
+                                    &mut config_failure,
+                                    WatchTarget::Config,
+                                    Some(config_failure_kind(&error)),
+                                ) {
+                                    break;
                                 }
                             }
                         }
                     }
                 }
             }
-
-            if let Some(directory) = theme_dir.as_deref()
-                && theme_poll.due(Instant::now())
-            {
-                let sample = match theme_directory_stamp(directory) {
-                    Err(kind) => {
-                        if !post_status(&proxy, &mut theme_failure, WatchTarget::Themes, Some(kind))
-                        {
-                            break;
-                        }
-                        Err(kind)
-                    }
-                    Ok(stamp) => {
-                        let sampled_stamp = stamp.clone();
-                        match prepare_theme_edge_with(
-                            directory,
-                            last_theme_stamp.as_ref(),
-                            stamp,
-                            || {
-                                crate::app_config::ThemeCatalog::try_discover_in(directory)
-                                    .map(Arc::new)
-                                    .map_err(theme_discovery_failure_kind)
-                            },
-                        ) {
-                            None => {
-                                // A complete metadata scan also proves recovery from
-                                // a transient stamp failure when the generation did
-                                // not otherwise change. No theme bytes are reopened.
-                                if !post_status(
-                                    &proxy,
-                                    &mut theme_failure,
-                                    WatchTarget::Themes,
-                                    None,
-                                ) {
-                                    break;
-                                }
-                                Ok(sampled_stamp)
-                            }
-                            Some(Err(kind)) => {
-                                if !post_status(
-                                    &proxy,
-                                    &mut theme_failure,
-                                    WatchTarget::Themes,
-                                    Some(kind),
-                                ) {
-                                    break;
-                                }
-                                Err(kind)
-                            }
-                            Some(Ok((stable_stamp, discovered))) => {
-                                if theme_repost || *discovered != *themes {
-                                    if proxy
-                                        .send_event(Wake::ThemeCatalogChanged(Arc::clone(
-                                            &discovered,
-                                        )))
-                                        .is_err()
-                                    {
-                                        break;
-                                    }
-                                    themes = discovered;
-                                    theme_repost = false;
-                                }
-                                // The catalogue and acknowledgement were derived
-                                // from one coherent sample. A racing mutation stays
-                                // unacknowledged and is retried next poll.
-                                last_theme_stamp = Some(stable_stamp.clone());
-                                if !post_status(
-                                    &proxy,
-                                    &mut theme_failure,
-                                    WatchTarget::Themes,
-                                    None,
-                                ) {
-                                    break;
-                                }
-                                Ok(stable_stamp)
-                            }
-                        }
-                    }
-                };
-                theme_poll.observed(Instant::now(), sample);
-            }
         }
-    });
+
+        if let Some(directory) = theme_dir.as_deref()
+            && theme_poll.due(Instant::now())
+        {
+            let sample = match theme_directory_stamp(directory) {
+                Err(kind) => {
+                    if !post_status(&proxy, &mut theme_failure, WatchTarget::Themes, Some(kind)) {
+                        break;
+                    }
+                    Err(kind)
+                }
+                Ok(stamp) => {
+                    let sampled_stamp = stamp.clone();
+                    match prepare_theme_edge_with(
+                        directory,
+                        last_theme_stamp.as_ref(),
+                        stamp,
+                        || {
+                            crate::app_config::ThemeCatalog::try_discover_in(directory)
+                                .map(Arc::new)
+                                .map_err(theme_discovery_failure_kind)
+                        },
+                    ) {
+                        None => {
+                            // A complete metadata scan also proves recovery from
+                            // a transient stamp failure when the generation did
+                            // not otherwise change. No theme bytes are reopened.
+                            if !post_status(&proxy, &mut theme_failure, WatchTarget::Themes, None) {
+                                break;
+                            }
+                            Ok(sampled_stamp)
+                        }
+                        Some(Err(kind)) => {
+                            if !post_status(
+                                &proxy,
+                                &mut theme_failure,
+                                WatchTarget::Themes,
+                                Some(kind),
+                            ) {
+                                break;
+                            }
+                            Err(kind)
+                        }
+                        Some(Ok((stable_stamp, discovered))) => {
+                            if theme_repost || *discovered != *themes {
+                                if proxy
+                                    .send_event(Wake::ThemeCatalogChanged(Arc::clone(&discovered)))
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                                themes = discovered;
+                                theme_repost = false;
+                            }
+                            // The catalogue and acknowledgement were derived
+                            // from one coherent sample. A racing mutation stays
+                            // unacknowledged and is retried next poll.
+                            last_theme_stamp = Some(stable_stamp.clone());
+                            if !post_status(&proxy, &mut theme_failure, WatchTarget::Themes, None) {
+                                break;
+                            }
+                            Ok(stable_stamp)
+                        }
+                    }
+                }
+            };
+            theme_poll.observed(Instant::now(), sample);
+        }
+    }
 }
 
 /// The largest refused config [`observed_harness`] still reads (8 MiB).
 const MAX_REJECTED_HARNESS_READ: u64 = 8 << 20;
 
-/// The `[harness]` policy of one watcher read — the ONE writer of the policy
-/// the window runs (2026-09-29; `App::adopt_harness_policy` has no other
-/// caller). A readable file's is the one its text writes, exactly what
-/// `Config::parse` reads; a file the reload refuses for its ENCODING or SIZE
-/// still writes `[harness]` lines, read lossily from a bounded re-read as the
-/// launch reads them, so a limit saved beside a stray byte holds at once, as
-/// it would at the next launch. `None` for any other refusal, and for a file
-/// gone or unreadable by the re-read: nothing written, nothing posted.
+/// The `[harness]` policy of one watcher read: this thread is the one writer of the policy the
+/// window runs (`App::adopt_harness_policy` handles only its wake). A readable file's policy is
+/// what its text writes, as `Config::parse` reads it; a file the reload refuses for its encoding
+/// or size still has its `[harness]` lines read lossily from a bounded re-read, as the launch
+/// reads them, so a limit saved beside a stray byte holds at once. `None` for any other refusal
+/// and for a file the re-read cannot open: nothing is posted.
 ///
-/// WHY ONE WRITER (review rounds 1 to 5, 2026-09-29): the policy used to be
-/// adopted by the config lane when a generation was admitted, and by this
-/// thread for a refused file — two writers, two queues. The lane's workers
-/// (preparation, the font catalogue, the reconciliation fence) finish in no
-/// order this thread controls, so a valid edit still in the lane when the
-/// next save was refused landed afterwards and lifted the refused file's kill
-/// switch; each patch (an override, its candidate, a post order) left an
-/// invariant spread across modules that the next review broke. With this
-/// thread the only writer and its wakes in send order, the running policy is
-/// the newest read's by construction. The `clean { … }` island in
-/// `config_watcher_island.rs` states the protocol and the kernel checks it at
-/// every Trust build.
+/// One writer because the config lane's workers (preparation, the font catalogue, the
+/// reconciliation fence) finish in no order this thread controls: a second writer there let a
+/// valid edit still in the lane land after a refused save and lift its kill switch. With this
+/// thread the only writer and its wakes in send order, the running policy is the newest read's
+/// by construction; `config_watcher_island.rs` states the protocol for the Clean kernel.
 fn observed_harness(
     path: Option<&std::path::Path>,
     observation: &Result<
@@ -713,7 +691,7 @@ fn post_status(
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ConfigPathStamp(u64);
 
-/// The path feeds a config TEXT names (`Config::path_feed_paths`), or `None`
+/// The path feeds a config text names (`Config::path_feed_paths`), or `None`
 /// when the text does not parse.
 fn feed_paths_of(text: &str) -> Option<Vec<std::path::PathBuf>> {
     crate::app_config::Config::parse(text)
@@ -810,16 +788,11 @@ fn config_path_stamp(path: &std::path::Path) -> Result<ConfigPathStamp, WatchFai
     Ok(ConfigPathStamp(hasher.finish()))
 }
 
-/// One safe, bounded generation observation of the config's logical path.
-///
-/// This deliberately reuses the exact config/Manual file-capability reader:
-/// its baseline includes a content fingerprint, regular-file identity, metadata
-/// token, and the complete admitted symlink binding. The Manual analysis limit
-/// bounds every candidate-edge read; healthy idle polls stop at
-/// [`config_path_stamp`]. An oversized file receives the same stable fail-closed
-/// result instead of being streamed without a cap. Keeping the typed error
-/// variant makes readable↔unreadable transitions observable and lets
-/// Settings/Manual explain the rejection without exposing host paths.
+/// One safe, bounded generation observation of the config's logical path, through the
+/// config/Manual file-capability reader: its baseline includes a content fingerprint,
+/// regular-file identity, metadata token and the complete admitted symlink binding. Manual's
+/// limit bounds every candidate-edge read (an oversized file fails closed rather than
+/// streaming), and the typed error lets Settings/Manual explain a rejection without host paths.
 #[cfg(test)]
 fn config_file_stamp(
     path: &std::path::Path,
@@ -957,7 +930,6 @@ impl ThemePollSchedule {
 /// The first content read happens only in `try_discover_in` after this stamp has
 /// selected a real candidate edge.
 fn theme_directory_stamp(path: &std::path::Path) -> Result<ThemeDirectoryStamp, WatchFailureKind> {
-    const MAX_CANDIDATES: usize = 512;
     let directory_metadata = match std::fs::metadata(path) {
         Ok(metadata) => Some(metadata),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -999,7 +971,7 @@ fn theme_directory_stamp(path: &std::path::Path) -> Result<ThemeDirectoryStamp, 
             }
             count = count.saturating_add(1);
             candidates.insert(entry.path());
-            if candidates.len() > MAX_CANDIDATES {
+            if candidates.len() > crate::app_config::MAX_USER_THEME_CANDIDATES {
                 candidates.pop_last();
             }
         }
@@ -1141,13 +1113,9 @@ pub(crate) mod tests {
         theme_directory_stamp,
     };
 
-    /// EDITING ONLY THE LEXICON HOT-RELOADS IT
-    /// (`docs/sparkle-words-design.md` §non-goals, retired 2026-09-25). The
-    /// feeds the config names are stamped beside it; a rewrite of the lexicon
-    /// file — same length, mtime restored — under an unchanged `aterm.toml`
-    /// moves the feed stamp, which is what re-posts the observation. RED
-    /// before: the watcher stamped `aterm.toml` alone, so the edit waited for
-    /// the next config save. Control: an idle poll moves nothing.
+    /// Editing only the lexicon hot-reloads it: the feeds the config names are stamped beside it,
+    /// so a same-length, mtime-restored lexicon rewrite under an unchanged `aterm.toml` moves the
+    /// feed stamp and re-posts the observation. Control: an idle poll moves nothing.
     #[cfg(unix)]
     #[test]
     fn a_lexicon_edit_under_an_unchanged_config_is_a_reload_edge() {
@@ -1204,7 +1172,7 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// A DISABLED Sparkle table names no feed (it has no consumer), and the
+    /// A disabled Sparkle table names no feed (it has no consumer), and the
     /// lists are capped exactly as their loaders cap them.
     #[test]
     fn path_feed_paths_follow_their_consumers() {
@@ -1231,6 +1199,73 @@ pub(crate) mod tests {
         ))
         .unwrap();
         assert_eq!(packs.path_feed_paths().len(), 8, "the loaders' cap");
+
+        // The optional default fleet stays watched while absent, including
+        // after deletion, so its creation and recreation are config edges.
+        let scratch = aterm_tempfile::Builder::new()
+            .prefix("aterm-config-watch-ai-fleet-")
+            .tempdir()
+            .unwrap();
+        let dir = scratch.path();
+        let fleet = dir.join(aterm_agent::ai::config::FLEET_FILE);
+        let read = || crate::app_config::Config {
+            ai: crate::app_config::AiPolicy::read_beside("", Some(dir)),
+            ..crate::app_config::Config::default()
+        };
+        let absent = read();
+        assert!(matches!(
+            absent.ai.settings().fleet,
+            aterm_agent::ai::config::FleetState::None
+        ));
+        let feeds = absent.path_feed_paths();
+        assert_eq!(feeds, vec![fleet.clone()]);
+        let missing_stamp = path_feed_stamp(&feeds);
+        assert_eq!(path_feed_stamp(&feeds), missing_stamp, "idle is no edge");
+
+        std::fs::write(&fleet, "schema = 1\npreferred = \"codex\"\n").unwrap();
+        assert_ne!(
+            path_feed_stamp(&feeds),
+            missing_stamp,
+            "creation is an edge"
+        );
+        let present = read();
+        assert_eq!(present.ai.settings().preferred.0.id, "codex");
+        let present_stamp = path_feed_stamp(&present.path_feed_paths());
+        std::fs::remove_file(&fleet).unwrap();
+        assert_ne!(
+            path_feed_stamp(&feeds),
+            present_stamp,
+            "deletion is an edge"
+        );
+        let deleted = read();
+        assert_eq!(
+            deleted.path_feed_paths(),
+            feeds,
+            "absence retains the watch"
+        );
+        assert!(matches!(
+            deleted.ai.settings().fleet,
+            aterm_agent::ai::config::FleetState::None
+        ));
+        let explicit = crate::app_config::AiPolicy::read_beside(
+            &format!("[ai]\nfleet = {:?}\n", fleet.display().to_string()),
+            Some(dir),
+        );
+        assert!(
+            matches!(
+                explicit.settings().fleet,
+                aterm_agent::ai::config::FleetState::Refused { .. }
+            ),
+            "an explicitly requested missing document is still refused"
+        );
+        let missing_stamp = path_feed_stamp(&deleted.path_feed_paths());
+        std::fs::write(&fleet, "schema = 1\npreferred = \"agy\"\n").unwrap();
+        assert_ne!(
+            path_feed_stamp(&feeds),
+            missing_stamp,
+            "recreation is an edge"
+        );
+        assert_eq!(read().ai.settings().preferred.0.id, "agy");
     }
 
     #[test]
@@ -1441,7 +1476,7 @@ pub(crate) mod tests {
             }
         }
 
-        /// The file changes on disk: the kill switch goes in REFUSED (a stray
+        /// The file changes on disk: the kill switch goes in refused (a stray
         /// non-UTF-8 byte), approvals go in readable.
         fn write(&mut self, approve: bool) {
             let action = if approve { "WriteOn" } else { "WriteOff" };
@@ -1492,7 +1527,7 @@ pub(crate) mod tests {
             });
         }
 
-        /// The config lane admits a generation carrying its OWN parse — the
+        /// The config lane admits a generation carrying its own parse — the
         /// real `apply_prepared_config_generation`, fed a stale file.
         fn admit(&mut self, approve: bool) {
             let action = if approve { "AdmitOn" } else { "AdmitOff" };
@@ -1528,6 +1563,7 @@ pub(crate) mod tests {
                         sparkle,
                         fonts: None,
                         warnings: Vec::new(),
+                        font_refusals: Vec::new(),
                     },
                 );
             });
@@ -1553,16 +1589,12 @@ pub(crate) mod tests {
         }
     }
 
-    /// TIER-1 FOR `HarnessPolicyOneWriter` (2026-09-29). The watcher is the
-    /// supervisor policy's one writer: this drives the real read
-    /// (`observed_harness`), the real post and dedupe (`post_harness`), the
-    /// window's real handler and the real admission path through writes of a
-    /// refused kill switch and a readable approval, polls before and after a
-    /// seamless Commit, and stale admissions of both policies landing at the
-    /// worst moments — validating every transition against the derived model
-    /// with the interpreter and `ty`, and its invariant after each. NEGATIVE
-    /// CONTROL: the step the design this replaced took (a stale admission
-    /// moving the policy) is rejected by the same model.
+    /// Tier-1 for `HarnessPolicyOneWriter`: drives the real read (`observed_harness`), post and
+    /// dedupe (`post_harness`), the window's handler and the admission path through writes of a
+    /// refused kill switch and a readable approval, polls around a seamless Commit, and stale
+    /// admissions of both policies at the worst moments, validating every transition and
+    /// invariant against the derived model. Negative control: a stale admission moving the
+    /// policy is rejected.
     #[test]
     fn the_watcher_is_the_policys_one_writer() {
         let dir =
@@ -1634,7 +1666,7 @@ pub(crate) mod tests {
             "the newest read runs"
         );
 
-        // NEGATIVE CONTROL: an admission that moves the policy.
+        // Negative control: an admission that moves the policy.
         let before = drive.state();
         let mut mutant = before.clone();
         mutant.insert("in_force", 1 - before["in_force"]);
@@ -1654,14 +1686,11 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// EVERY WATCHER READ CARRIES ITS `[harness]` POLICY, A REFUSED ONE TOO
-    /// (2026-09-29). A readable file's policy is exactly the one
-    /// `Config::parse` reads from the same text; a file refused for a stray
-    /// non-UTF-8 byte, or past the reload's size limit, still writes its
-    /// `[harness]` lines, read lossily as the launch reads them — so a kill
-    /// switch saved beside the byte holds at once. NEGATIVE CONTROLS: a
-    /// refusal of another kind writes no policy, and neither does a refused
-    /// file gone before the re-read — never the defaults.
+    /// Every watcher read carries its `[harness]` policy, a refused one too: a readable file's
+    /// is what `Config::parse` reads; a file refused for a stray non-UTF-8 byte or its size
+    /// still has its `[harness]` lines read lossily, so a kill switch saved beside the byte holds
+    /// at once. Negative controls: another refusal, or a refused file gone before the re-read,
+    /// writes no policy (never the defaults).
     #[test]
     fn every_watcher_read_carries_its_harness_policy() {
         use crate::native_document_host::DocumentHostError;
@@ -1949,16 +1978,10 @@ pub(crate) mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        // Laid, and removed, by four threads (2026-10-06, gate speed). Beside
-        // `F_FULLFSYNC` writers, as the gate runs this beside other binaries,
-        // every create and unlink here waits for the volume's next commit, and
-        // calls from several threads wait for the same one. Beside eight
-        // spinners and three such writers this test took 27.1-30.1 s on one
-        // thread and 13.9-14.4 s on four (1.6-1.8 CPU-s against 1.2-1.5); alone,
-        // 0.22 s and 0.15 s. Four is the knee: laying and removing the 4,097
-        // files took 19.8-20.9 s on one thread (0.6 CPU-s), 10.2-10.9 s on four
-        // (0.9-1.0) and 9.5-9.6 s on eight (1.9-2.0). The stamp reads the
-        // names and file types, which are the same whichever thread made each.
+        // Laid and removed by four threads: beside `F_FULLFSYNC` writers (as `verify test` runs
+        // it) every create and unlink waits for the volume's next commit, and four threads halve
+        // the wait (about 28 s to 14 s; eight gain little). The stamp reads names and file
+        // types, the same whichever thread made each.
         let noise = (0..=crate::app_config::MAX_USER_THEME_DIRECTORY_ENTRIES)
             .map(|index| dir.join(format!("noise-{index:04}")))
             .collect::<Vec<_>>();
@@ -1987,7 +2010,8 @@ pub(crate) mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        for index in 0..520 {
+        let cap = crate::app_config::MAX_USER_THEME_CANDIDATES;
+        for index in 0..cap + 8 {
             std::fs::write(
                 dir.join(format!("Theme-{index:04}.conf")),
                 "foreground = #112233\n",
@@ -1995,8 +2019,8 @@ pub(crate) mod tests {
             .unwrap();
         }
         let stamp = theme_directory_stamp(&dir).unwrap();
-        assert_eq!(stamp.inspected_entries, 520);
-        assert_eq!(stamp.candidate_metadata, 512);
+        assert_eq!(stamp.inspected_entries, cap + 8);
+        assert_eq!(stamp.candidate_metadata, cap);
 
         let mut content_loads = 0;
         let result = prepare_theme_edge_with(&dir, Some(&stamp), stamp.clone(), || {
@@ -2022,7 +2046,7 @@ pub(crate) mod tests {
         let empty = theme_directory_stamp(&dir).unwrap();
         let mut schedule = ThemePollSchedule::new(start, Some(Ok(empty.clone())));
 
-        // The first reconciliation remains at the old 500 ms deadline.
+        // The first reconciliation stays at the 500 ms deadline.
         assert!(!schedule.due(start + POLL_INTERVAL - std::time::Duration::from_nanos(1)));
         let first = start + POLL_INTERVAL;
         assert!(schedule.due(first));
@@ -2032,7 +2056,7 @@ pub(crate) mod tests {
         assert!(schedule.due(idle_due));
 
         // An independent theme edit is observed at the bounded idle deadline;
-        // its next sample gets the original 500 ms cadence.
+        // its next sample gets the 500 ms cadence.
         std::fs::write(dir.join("Work.conf"), "foreground = #112233\n").unwrap();
         let created = theme_directory_stamp(&dir).unwrap();
         schedule.observed(idle_due, Ok(created.clone()));

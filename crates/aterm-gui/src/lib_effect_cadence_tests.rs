@@ -1,17 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! RESPONSIVENESS: the cursor-effect train follows the PANEL, not a fixed
-//! 60 fps. These pin [`super::effect_tick_interval`] — the one seam that
-//! turns a per-window refresh sample into the animation cadence.
+//! The cursor-effect train follows the panel's refresh, not a fixed 60 fps: these pin
+//! [`super::effect_tick_interval`] and the effect present lane built on it.
 use super::{AURORA_TICK_INTERVAL, MIN_EFFECT_TICK_INTERVAL, effect_tick_interval};
 use std::time::Duration;
 
-/// The panel's refresh is the effect cadence, within two floors. Each row is (label,
-/// reported refresh period) → expected tick interval: a fast panel drives the train at
-/// its own rate; a slow panel keeps its slower period; an unknown refresh falls back to
-/// 60 fps (never the bulk-output pacing floor); a reported rate faster than any real
-/// display is capped.
+/// The panel's refresh is the effect cadence, within two floors: an unknown refresh falls back
+/// to 60 fps (never the bulk-output pacing floor), and a rate faster than any real display is
+/// capped.
 #[test]
 fn the_effect_train_runs_at_the_panels_refresh_within_its_floors() {
     let hz = |millihertz: u64| Duration::from_nanos(1_000_000_000_000 / millihertz);
@@ -54,8 +51,7 @@ fn the_effect_train_runs_at_the_panels_refresh_within_its_floors() {
         super::MIN_FRAME_INTERVAL,
         "the output-pacing floor is not a refresh rate"
     );
-    // The pre-fix expression, as the negative control: it disagrees exactly
-    // at the fast panel, and by the full 8.3 ms this change buys back.
+    // Negative control: clamping to 60 fps disagrees exactly at the fast panel, by 8.3 ms.
     let capped = promotion.max(AURORA_TICK_INTERVAL);
     assert_eq!(
         capped, AURORA_TICK_INTERVAL,
@@ -69,9 +65,8 @@ fn the_effect_train_runs_at_the_panels_refresh_within_its_floors() {
 }
 
 /// Drawable-pool headroom: the armed lane is the panel period stretched, so effect-only
-/// presents stay below the refresh rate and `nextDrawable` finds a free drawable. The
-/// panel-rate negative control is what parked the main thread. This is the 120 Hz arm;
-/// the 60 Hz arm is the next test.
+/// presents stay below the refresh rate and `nextDrawable` finds a free drawable (a
+/// panel-rate lane parks the main thread).
 #[test]
 fn the_effect_lane_presents_strictly_slower_than_the_panel_refreshes() {
     let promotion = Duration::from_nanos(1_000_000_000_000 / 120_000); // 120 Hz
@@ -81,7 +76,7 @@ fn the_effect_lane_presents_strictly_slower_than_the_panel_refreshes() {
         capped > effect_tick_interval(Some(promotion)),
         "a lane that presents once per refresh keeps the Metal pool empty"
     );
-    // The kill switch's arm: byte-for-byte the old cadence, same binary.
+    // A divisor of 1 is the uncapped panel-rate lane (there is no env switch for it).
     assert_eq!(
         super::effect_present_interval_with(Some(promotion), 1),
         effect_tick_interval(Some(promotion)),
@@ -244,19 +239,17 @@ fn a_parked_acquire_drops_the_window_to_the_halving_until_the_lane_idles() {
     );
 }
 
-/// The decoration latch is sized for the halved lane (`deco_anim_hold`): on the Intel
-/// arm the present right after the latch refresh can park and halve the lane, and a
-/// latch counted in the panel-rate lane would then expire before the round trip and
-/// freeze the decoration. Off that arm the lane never stretches and the hold is unchanged.
+/// The decoration latch (`deco_anim_hold`) counts in the halved lane on every host: where the
+/// lane runs at panel rate, a park right after the latch refresh halves it, and a latch counted
+/// at panel rate would expire before the round trip and freeze the decoration.
 #[test]
 fn the_decoration_latch_is_sized_for_the_lane_a_park_stretches_it_to() {
     let hz60 = Duration::from_nanos(1_000_000_000_000 / 60_000);
     let halved =
         super::effect_present_interval_with(Some(hz60), super::EFFECT_PRESENT_PANEL_PERIODS);
     let panel_rate = super::effect_present_interval_with(Some(hz60), 1);
-    // The arithmetic, host-independent: counted in the panel-rate lane the
-    // latch is too short for the stretched one; counted in the halved lane
-    // it is not.
+    // Host-independent: counted in the panel-rate lane the latch is too short for the
+    // stretched one; counted in the halved lane it is not.
     assert!(
         panel_rate * super::DECO_ANIM_LEVEL_FRAMES < halved * 3,
         "which is why the latch may not count in the lane the window is on"

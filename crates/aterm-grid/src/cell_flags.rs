@@ -7,7 +7,8 @@
 /// Cell flags, packed into the Cell's 16-bit flags field.
 ///
 /// ## Bit allocation
-/// - Bits 0-7: visual attributes (bold, dim, italic, underline, blink, inverse, hidden, strikethrough)
+/// - Bits 0-7: visual attributes (bold, dim, italic, underline, blink, inverse,
+///   hidden, strikethrough)
 /// - Bit 8: double underline
 /// - Bit 9: wide character
 /// - Bit 10: wide continuation / protected (shared; a spacer's protection is its lead's)
@@ -42,8 +43,7 @@ impl CellFlags {
     pub const DOUBLE_UNDERLINE: Self = Self(1 << 8);
     /// Wide character (occupies 2 cells).
     pub const WIDE: Self = Self(1 << 9);
-    /// Wide character continuation (spacer cell).
-    /// Shares bit with PROTECTED - mutually exclusive.
+    /// Wide character continuation (spacer cell); shares bit 10 with PROTECTED.
     pub const WIDE_CONTINUATION: Self = Self(1 << 10);
     /// Protected from selective erase (DECSCA). Shares bit 10 with
     /// WIDE_CONTINUATION; only non-spacer cells use it for protection.
@@ -52,21 +52,16 @@ impl CellFlags {
     pub const SUPERSCRIPT: Self = Self(1 << 11);
     /// Subscript text (SGR 74).
     pub const SUBSCRIPT: Self = Self(1 << 12);
-    /// Overline text (SGR 53) - encoded as SUPERSCRIPT | SUBSCRIPT.
-    /// Mutually exclusive with SUPERSCRIPT and SUBSCRIPT (same combination
-    /// encoding pattern as DOTTED_UNDERLINE and DASHED_UNDERLINE).
-    pub const OVERLINE: Self = Self((1 << 11) | (1 << 12)); // SUPERSCRIPT | SUBSCRIPT
+    /// Overline text (SGR 53), encoded as SUPERSCRIPT | SUBSCRIPT, so exclusive
+    /// with both.
+    pub const OVERLINE: Self = Self((1 << 11) | (1 << 12));
     /// Curly underline.
     pub const CURLY_UNDERLINE: Self = Self(1 << 13);
 
-    // Underline styles: UNDERLINE, DOUBLE_UNDERLINE and CURLY_UNDERLINE alone are
-    // single, double and curly; UNDERLINE | CURLY is dotted (SGR 4:4) and
-    // DOUBLE | CURLY is dashed (SGR 4:5).
-
     /// Dotted underline (SGR 4:4) - encoded as UNDERLINE | CURLY_UNDERLINE.
-    pub const DOTTED_UNDERLINE: Self = Self((1 << 3) | (1 << 13)); // UNDERLINE | CURLY_UNDERLINE
+    pub const DOTTED_UNDERLINE: Self = Self((1 << 3) | (1 << 13));
     /// Dashed underline (SGR 4:5) - encoded as DOUBLE_UNDERLINE | CURLY_UNDERLINE.
-    pub const DASHED_UNDERLINE: Self = Self((1 << 8) | (1 << 13)); // DOUBLE_UNDERLINE | CURLY_UNDERLINE
+    pub const DASHED_UNDERLINE: Self = Self((1 << 8) | (1 << 13));
 
     /// Cell uses StyleId instead of inline colors.
     /// When set, the colors field stores a StyleId in its low 16 bits.
@@ -171,7 +166,7 @@ impl CellFlags {
         (self.0 & Self::USES_STYLE_ID.0) != 0
     }
 
-    /// Get only the core flags (excluding COMPLEX).
+    /// Get only the core flags (bits 0-13: without USES_STYLE_ID and COMPLEX).
     #[must_use]
     #[inline]
     #[cfg(test)]
@@ -180,7 +175,7 @@ impl CellFlags {
     }
 
     /// Mask for the extended flags (bits 11-13).
-    pub const EXTENDED_FLAGS_MASK: u16 = 0x3800; // bits 11-13
+    pub const EXTENDED_FLAGS_MASK: u16 = 0x3800;
 
     /// Get only the extended flags (bits 11-13).
     #[must_use]
@@ -220,8 +215,7 @@ impl CellFlags {
     }
 }
 
-// Standard library bitwise operator implementations for Alacritty compatibility.
-// These allow using `flags & Flags::DIM` and similar patterns.
+// Bitwise operators (`flags & CellFlags::DIM`), for Alacritty-style callers.
 
 impl std::ops::BitAnd for CellFlags {
     type Output = Self;
@@ -407,7 +401,6 @@ mod tests {
     #[test]
     fn contains_requires_all_bits() {
         let f = CellFlags::SUPERSCRIPT; // only bit 11
-        // OVERLINE is bits 11+12 -- SUPERSCRIPT alone does not contain OVERLINE
         assert!(!f.contains(CellFlags::OVERLINE));
     }
 
@@ -419,7 +412,7 @@ mod tests {
         assert!(f.contains(CellFlags::OVERLINE));
     }
 
-    // ---- Bitwise operators (the std traits, for Alacritty compatibility) ----
+    // ---- Bitwise operators ----
 
     #[test]
     fn bitor_operator() {

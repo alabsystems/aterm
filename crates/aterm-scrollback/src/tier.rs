@@ -30,9 +30,78 @@ fn take_warm_find_block_steps() -> usize {
     })
 }
 
-// ============================================================================
-// Warm Tier - LZ4 compressed blocks
-// ============================================================================
+#[cfg(clean_islands)]
+macro_rules! trust_island {
+    ($($item:item)*) => {
+        $($item)*
+    };
+}
+
+#[cfg(not(clean_islands))]
+macro_rules! trust_island {
+    ($($tt:tt)*) => {};
+}
+
+trust_island! {
+    clean {
+        namespace WarmTierOffset
+
+        -- State of the WarmTier cumulative index:
+        -- cum_start tracks dead prefix length, cumulative_base tracks dropped line total,
+        -- and live_lines tracks the surviving logical line count.
+        structure IndexState where
+            cum_start : Nat
+            cumulative_base : Nat
+            live_blocks : Nat
+            live_lines : Nat
+        deriving Repr
+
+        def emptyState : IndexState :=
+            { cum_start := 0, cumulative_base := 0, live_blocks := 0, live_lines := 0 }
+
+        def pushBlock (s : IndexState) (block_lines : Nat) : IndexState :=
+            { cum_start := s.cum_start
+            , cumulative_base := s.cumulative_base
+            , live_blocks := s.live_blocks + 1
+            , live_lines := s.live_lines + block_lines }
+
+        def dropFrontBlock (s : IndexState) (front_lines : Nat) : IndexState :=
+            { cum_start := s.cum_start + 1
+            , cumulative_base := s.cumulative_base + front_lines
+            , live_blocks := s.live_blocks - 1
+            , live_lines := s.live_lines - front_lines }
+
+        def compactDeadPrefix (s : IndexState) : IndexState :=
+            { cum_start := 0
+            , cumulative_base := s.cumulative_base
+            , live_blocks := s.live_blocks
+            , live_lines := s.live_lines }
+
+        theorem empty_has_zero_offset :
+            And (emptyState.cum_start = 0) (emptyState.cumulative_base = 0) := by
+            exact And.intro rfl rfl
+
+        theorem compact_preserves_live_lines (s : IndexState) :
+            (compactDeadPrefix s).live_lines = s.live_lines := by
+            rfl
+
+        theorem compact_preserves_cumulative_base (s : IndexState) :
+            (compactDeadPrefix s).cumulative_base = s.cumulative_base := by
+            rfl
+
+        theorem compact_resets_cum_start (s : IndexState) :
+            (compactDeadPrefix s).cum_start = 0 := by
+            rfl
+
+        theorem push_then_drop_roundtrip_trace :
+            And ((dropFrontBlock (pushBlock (pushBlock emptyState 5) 7) 5).live_lines = 7)
+                (And ((dropFrontBlock (pushBlock (pushBlock emptyState 5) 7) 5).cumulative_base = 5)
+                     ((dropFrontBlock (pushBlock (pushBlock emptyState 5) 7) 5).cum_start = 1)) := by
+            exact And.intro rfl (And.intro rfl rfl)
+
+        end WarmTierOffset
+    }
+}
 
 /// Consecutive decompression failures before a warm block is quarantined.
 /// 3 failures = conclusive evidence of persistent corruption.
@@ -40,14 +109,10 @@ pub(crate) const QUARANTINE_THRESHOLD: u8 = 3;
 
 /// Decompressed-block cache slots.
 ///
-/// TWO, not one. A render frame walks the visible rows top-to-bottom, which
-/// maps to ASCENDING scrollback indices, so a viewport straddling a block
-/// boundary used to thrash a single-slot cache: miss on block B (the slot held
-/// B+1 from the previous frame) → full LZ4 decode + page deserialization, cross
-/// the boundary → miss on B+1 → a second full decode, frame ends holding B+1 →
-/// the next frame repeats it exactly. A viewport spans at most two blocks
-/// (`DEFAULT_BLOCK_SIZE` is 100 lines), so two slots turn that steady state
-/// into hits. More slots would only help walk-back and cost more bookkeeping.
+/// A render frame walks the visible rows top-to-bottom (ascending scrollback
+/// indices), so with one slot a viewport straddling a block boundary decodes
+/// both blocks every frame. A viewport spans at most two blocks
+/// (`DEFAULT_BLOCK_SIZE` is 100 lines), so two slots turn that into hits.
 const CACHE_SLOTS: usize = 2;
 
 /// The decompressed-block cache itself: one `(block_index, lines)` pair per
@@ -56,10 +121,9 @@ const CACHE_SLOTS: usize = 2;
 type BlockCache = RefCell<[Option<(usize, Vec<Line>)>; CACHE_SLOTS]>;
 
 /// A compressed block of lines (LZ4).
-// Skip (propagates to the derive-generated impls — the checker consults the
-// impl subject for macro-generated items): the derived Clone's field clones
-// (`Vec<u8>` etc.) are the idiomatic-alloc class the campaign skips
-// (`Line::clone` precedent). Verify-only; behavior unchanged.
+// Skip (propagates to the derived impls: the checker consults the impl subject
+// for macro-generated items): the derived Clone's field clones are the
+// idiomatic-alloc class, as `Line::clone`.
 #[cfg_attr(trust_verify, trust::skip)]
 #[derive(Debug, Clone)]
 pub(crate) struct WarmBlock {
@@ -78,7 +142,7 @@ impl WarmBlock {
     /// The block reports `line_count` lines but its compressed data cannot be
     /// decompressed. Used to test error paths in cold tier push and warm-to-cold
     /// eviction where re-compression fails.
-    #[cfg(any(test, feature = "testing"))]
+    #[cfg(any(test, debug_assertions))]
     pub(crate) fn with_corrupt_data(line_count: usize) -> Self {
         Self {
             // Invalid LZ4: valid 4-byte size prefix (small) + garbage payload
@@ -97,16 +161,9 @@ impl WarmBlock {
     /// Create a warm block from a serialized page of `line_count` lines.
     #[must_use]
     fn from_page(line_count: usize, serialized: &[u8]) -> Self {
-        // `compress_prepend_size` fails only when the input exceeds
-        // u32::MAX bytes. A warm block holds at most `block_size` hot lines,
-        // whose serialization is always well under 4 GiB, so the `Err` arm
-        // is unreachable on every real input. Producing an empty buffer
-        // there — rather than the former `.expect(...)` panic — is therefore
-        // behavior-identical on all real inputs while discharging the Trust
-        // L0 panic-freedom obligation (same "no-op under the documented
-        // invariant" discharge as the `saturating_*` fixes in this crate).
-        // (Unreachable `Err` ⇒ empty buffer; clippy's `manual_unwrap_or_default`
-        // requires the combinator form of the same discharge.)
+        // `compress_prepend_size` fails only past u32::MAX bytes, which a warm
+        // page never reaches; the empty-buffer fallback discharges the Trust L0
+        // panic-freedom obligation.
         let compressed = crate::lz4::compress_prepend_size(serialized).unwrap_or_default();
 
         Self {
@@ -132,9 +189,8 @@ impl WarmBlock {
 
     /// Record a decompression failure. Returns true if block just became quarantined.
     ///
-    /// Production callers should use `decompress()` which tracks failures
-    /// internally. This method is retained for test scenarios that need to
-    /// force a quarantine state without actual decompression.
+    /// Production code goes through `decompress()`, which tracks failures; this
+    /// forces a quarantine in tests.
     #[cfg(test)]
     pub(crate) fn record_failure(&self) -> bool {
         let failures = self.decompress_failures.get().saturating_add(1);
@@ -151,8 +207,8 @@ impl WarmBlock {
 
     /// Get a specific line by index within this block.
     #[cfg(test)]
-    // Skip: the block lookup + decompress path — same guarded-index/decode class
-    // as the cold tier's `get_line`. Round-trip and ARENA-SCROLL tested.
+    // Skip: the block lookup + decompress path, the same guarded-index/decode
+    // class as the cold tier's `get_line`. Round-trip tested.
     #[cfg_attr(trust_verify, trust::skip)]
     pub(crate) fn get_line(&self, idx: usize) -> Result<Option<Line>, super::ScrollbackError> {
         if idx >= self.line_count {
@@ -164,9 +220,9 @@ impl WarmBlock {
 
     /// Convert to cold-codec-compressed data for cold tier storage.
     ///
-    /// Re-compresses with zstd (better ratio) when the `zstd` feature is on, and
-    /// with the LZ4 codec otherwise. Returns the compressed data and line count,
-    /// or an error if decompression/re-compression fails.
+    /// Decodes the LZ4 block and re-encodes it with the cold codec. Returns the
+    /// compressed data and line count, or an error if decompression or
+    /// re-compression fails.
     pub(crate) fn to_cold_compressed(&self) -> Result<(Vec<u8>, usize), super::ScrollbackError> {
         // Reuse the LZ4-decompressed serialized bytes directly (normal path) instead
         // of deserialize→re-serialize on every eviction — see `decompress_serialized_page`.
@@ -178,13 +234,11 @@ impl WarmBlock {
 
 /// Warm tier: LZ4 compressed blocks in RAM.
 ///
-/// Uses cumulative line counts for O(log B) block lookup and caches the
-/// last decompressed block to avoid redundant decompression on sequential access.
-///
-/// The `front_offset` field enables O(1) line-limit enforcement: instead of
-/// decompressing the boundary block to remove a few oldest lines, we simply
-/// advance the offset. The first block is dropped when fully consumed. This
-/// mirrors the cold tier's front_offset pattern from `cold_tier.rs`.
+/// O(log B) block lookup over cumulative line counts, with recently
+/// decompressed blocks cached for sequential access. `front_offset` makes
+/// line-limit enforcement O(1): the oldest lines are consumed by advancing it,
+/// without decompressing, and the first block drops once fully consumed (as in
+/// the cold tier).
 #[derive(Debug)]
 pub(crate) struct WarmTier {
     /// Compressed blocks.
@@ -194,9 +248,19 @@ pub(crate) struct WarmTier {
     /// Lines logically consumed from the first block. Avoids decompression
     /// during line-limit truncation — blocks are dropped when fully consumed.
     front_offset: usize,
-    /// Cumulative line counts: `cumulative[i]` = total lines in blocks `0..=i`.
-    /// These are physical counts (not adjusted for front_offset).
+    /// Cumulative line counts: for live block `i` (`0..blocks.len()`),
+    /// `cumulative_lines[cum_start + i] - cumulative_base` = total physical
+    /// lines in live blocks `0..=i` (not adjusted for `front_offset`).
+    ///
+    /// Stored with a dead-prefix index (`cum_start`) and base offset
+    /// (`cumulative_base`) so front-eviction (`pop_front`,
+    /// `truncate_front_lines`) is O(1) amortized instead of O(B) per pop.
     cumulative_lines: Vec<usize>,
+    /// Dead-prefix length of `cumulative_lines` (entries of dropped blocks).
+    cum_start: usize,
+    /// Absolute cumulative value at the current front: total physical lines
+    /// in all blocks dropped since the last compaction/clear/rebuild.
+    cumulative_base: usize,
     /// Cache of recently decompressed blocks: `(block_index, lines)` per slot,
     /// filled round-robin. See [`CACHE_SLOTS`] for why there is more than one.
     last_block_cache: BlockCache,
@@ -217,6 +281,8 @@ impl WarmTier {
             line_count: 0,
             front_offset: 0,
             cumulative_lines: Vec::new(),
+            cum_start: 0,
+            cumulative_base: 0,
             last_block_cache: RefCell::new([const { None }; CACHE_SLOTS]),
             cache_next: Cell::new(0),
             bytes_used: Cell::new(std::mem::size_of::<Self>()),
@@ -240,14 +306,13 @@ impl WarmTier {
 
     /// Push a batch of lines (compresses them).
     ///
-    /// Bounded by BYTES as well as lines: the batch becomes as many
+    /// Bounded by bytes as well as lines: the batch becomes as many
     /// consecutive blocks as keep each block's serialized page within
     /// [`MAX_DECOMPRESSED_SCROLLBACK_PAGE_BYTES`](crate::codec::MAX_DECOMPRESSED_SCROLLBACK_PAGE_BYTES),
-    /// the most a reader decodes. A batch of rows whose every cell carries its
-    /// own 8 KiB link passes it, and a block its reader refused would be
-    /// unreadable until eviction quarantined it. Every line an honest grid
-    /// makes fits a page alone (`line_codec_block` asserts it), and the
-    /// cumulative index takes blocks of any size.
+    /// the most a reader decodes. Rows whose every cell carries its own 8 KiB
+    /// link exceed it, and a block its reader refused would be unreadable until
+    /// eviction quarantined it. Every line an honest grid makes fits a page
+    /// alone (`line_codec_block` asserts it).
     pub(crate) fn push_block(&mut self, lines: &[Line]) {
         let pages = serialize_pages(lines, crate::codec::MAX_DECOMPRESSED_SCROLLBACK_PAGE_BYTES);
         for (line_count, page) in pages {
@@ -264,15 +329,13 @@ impl WarmTier {
             .cumulative_lines
             .last()
             .copied()
-            .unwrap_or(0)
+            .unwrap_or(self.cumulative_base)
             .saturating_add(block.line_count());
         self.cumulative_lines.push(cumulative);
         self.blocks.push_back(block);
-        // Saturating: the counters track bytes of memory this process actually
-        // holds, so the true sum always fits in `usize` and the saturation can
-        // never fire on a real path — it just discharges the strict L0 gate's
-        // unconstrained-input overflow counterexamples (same idiom as the
-        // saturating line/byte counters above).
+        // Saturating: the counters track bytes this process holds, so the true
+        // sum fits; saturation only discharges the strict L0 gate's
+        // unconstrained-input overflow counterexamples.
         self.budgeted_bytes = self.budgeted_bytes.saturating_add(block_bytes);
         let bytes_used = self.bytes_used.get().saturating_add(block_bytes);
         self.bytes_used.set(Self::adjust_bytes(
@@ -284,19 +347,17 @@ impl WarmTier {
 
     /// Pop the oldest block.
     ///
-    /// If `front_offset > 0`, the front block is partially consumed. In that
-    /// case the block is decompressed, trimmed, and recompressed so the
-    /// returned block contains only surviving lines. This is the same work
-    /// that `evict_warm_to_cold` would do anyway (LZ4→Zstd recompression),
-    /// and pop_front is much less frequent than truncation.
+    /// A partially consumed front block (`front_offset > 0`) is decompressed,
+    /// trimmed and recompressed first, so the returned block holds only
+    /// surviving lines; eviction recompresses it for cold anyway.
     pub(crate) fn pop_front(&mut self) -> Option<WarmBlock> {
         self.materialize_front_offset();
         let old_index_bytes = self.index_bytes();
         let block = self.blocks.pop_front()?;
         self.line_count = self.line_count.saturating_sub(block.line_count());
         self.budgeted_bytes = self.budgeted_bytes.saturating_sub(block.compressed_size());
-        // Rebuild cumulative index after removing front element.
-        self.rebuild_cumulative();
+        // Advance cumulative index front in O(1) amortized instead of O(B) rebuild.
+        self.drop_front_index_entries(1);
         // Invalidate cache (block indices shifted).
         self.clear_cache();
         let bytes_used = self
@@ -311,12 +372,10 @@ impl WarmTier {
         Some(block)
     }
 
-    /// Insert a corrupted warm block at the front (oldest position).
-    ///
-    /// Used by quarantine tests (#5947) to simulate a corrupt block that
-    /// fails eviction to cold tier, and — through the `testing` feature — by
-    /// downstream conformance tests of readers that must survive one.
-    #[cfg(any(test, feature = "testing"))]
+    /// Insert a corrupted warm block at the front (oldest position): a corrupt
+    /// block that fails eviction to cold, for quarantine tests and, in a debug
+    /// build, downstream readers that must survive one.
+    #[cfg(any(test, debug_assertions))]
     pub(crate) fn push_front_corrupt(&mut self, line_count: usize) {
         let block = WarmBlock::with_corrupt_data(line_count);
         self.push_front(block);
@@ -344,29 +403,68 @@ impl WarmTier {
         ));
     }
 
+    /// Live (non-dropped) region of the cumulative index. Total `get` keeps
+    /// this obligation-free even if `cum_start` were out of sync.
+    #[inline]
+    pub(super) fn live_cumulative(&self) -> &[usize] {
+        self.cumulative_lines.get(self.cum_start..).unwrap_or(&[])
+    }
+
+    /// Drop the first `k` live cumulative entries in O(1) amortized: advance
+    /// `cum_start` and `cumulative_base`, leaving every surviving value
+    /// untouched (`surviving - new_base == old_surviving - old_base`).
+    ///
+    /// When the dead prefix grows past the live suffix (with a 64-entry floor),
+    /// compact in one `drain(..cum_start)` pass.
+    pub(super) fn drop_front_index_entries(&mut self, k: usize) {
+        if k == 0 {
+            return;
+        }
+        let live_len = self.live_cumulative().len();
+        if k >= live_len {
+            self.cumulative_lines.clear();
+            self.cum_start = 0;
+            self.cumulative_base = 0;
+            return;
+        }
+        // `1 <= k < live_len`, so `cum_start + k - 1 < cumulative_lines.len()`.
+        let last_dropped = self.cum_start.saturating_add(k).saturating_sub(1);
+        self.cumulative_base = self
+            .cumulative_lines
+            .get(last_dropped)
+            .copied()
+            .unwrap_or(self.cumulative_base);
+        self.cum_start = self.cum_start.saturating_add(k);
+        // Amortized compaction once dead > live (and at least 64 entries): one
+        // O(dead) move. `cumulative_base` stays the baseline for the compacted
+        // slice, so surviving entries are not rewritten.
+        if self.cum_start >= 64
+            && self.cum_start > self.cumulative_lines.len().saturating_sub(self.cum_start)
+        {
+            let dead = self.cum_start;
+            self.cumulative_lines.drain(..dead);
+            self.cum_start = 0;
+        }
+    }
+
     /// Find the block containing the given line index via binary search.
     // Skip: the binary search over the cumulative index — its residual rows are
     // the guarded-index class the verifier cannot chain (the codec twin carries
     // the same). Step-counted and unit-tested.
     #[cfg_attr(trust_verify, trust::skip)]
     fn find_block(&self, line_idx: usize) -> Option<usize> {
-        // Plain `&mut usize` step counter (was a `fn()`/closure callback):
-        // mechanical caller update for the `binary_search_counted` signature
-        // change (see codec.rs) — tests fold the total into the same
-        // thread-local the old per-step callback incremented, so the
-        // observable count is unchanged.
         let mut steps = 0usize;
-        let result = super::binary_search_counted(
-            &self.cumulative_lines,
-            line_idx.saturating_add(1),
-            &mut steps,
-        );
+        let target = line_idx
+            .saturating_add(self.cumulative_base)
+            .saturating_add(1);
+        let live = self.live_cumulative();
+        let result = super::binary_search_counted(live, target, &mut steps);
         #[cfg(test)]
         count_warm_find_block_steps(steps);
         match result {
             Ok(idx) => Some(idx),
             Err(idx) => {
-                if idx < self.cumulative_lines.len() {
+                if idx < live.len() {
                     Some(idx)
                 } else {
                     None
@@ -376,11 +474,13 @@ impl WarmTier {
     }
 
     /// Rebuild cumulative line counts from blocks.
-    // Skip: same std-iterator `next` absent-body class as `evict_bytes`.
-    // Rebuilds the cumulative index from owned blocks; unit-tested.
+    // Skip: same std-iterator `next` absent-body class as the cold tier's
+    // `evict_bytes`. Rebuilds the cumulative index from owned blocks; unit-tested.
     #[cfg_attr(trust_verify, trust::skip)]
-    fn rebuild_cumulative(&mut self) {
+    pub(crate) fn rebuild_cumulative(&mut self) {
         self.cumulative_lines.clear();
+        self.cum_start = 0;
+        self.cumulative_base = 0;
         let mut total: usize = 0;
         for block in &self.blocks {
             total = total.saturating_add(block.line_count());
@@ -390,14 +490,12 @@ impl WarmTier {
 
     /// Get a line by index (0 = oldest visible line across all blocks).
     ///
-    /// Uses O(log B) binary search on cumulative line counts and caches the
-    /// last decompressed block to avoid redundant decompression on sequential access.
-    /// Adjusts for `front_offset`: logical index 0 maps to physical position
-    /// `front_offset` within the first block.
-    ///
-    /// Returns `Ok(None)` for out-of-bounds, `Err` for decompression failures.
-    // Skip: the block lookup + decompress path — the guarded-index/decode
-    // class (twin of the cold tier's `get_line`). ARENA-SCROLL tested.
+    /// O(log B) lookup on the cumulative counts, with decompressed blocks cached
+    /// for sequential access; logical index 0 is physical position
+    /// `front_offset` in the first block. `Ok(None)` out of bounds, `Err` on
+    /// decompression failure.
+    // Skip: the block lookup + decompress path, the guarded-index/decode class
+    // (twin of the cold tier's `get_line`).
     #[cfg_attr(trust_verify, trust::skip)]
     pub(crate) fn get_line(&self, idx: usize) -> Result<Option<Line>, super::ScrollbackError> {
         if idx >= self.line_count {
@@ -416,9 +514,7 @@ impl WarmTier {
             )));
         };
 
-        // Check cache first — scan every slot; hit semantics are unchanged, a
-        // straddling viewport just stops evicting the block it is about to
-        // read again.
+        // Check every cache slot first.
         {
             let cache = self.last_block_cache.borrow();
             if let Some((_, lines)) = cache
@@ -438,7 +534,7 @@ impl WarmTier {
             }
         }
 
-        // Decompress and cache — skip quarantined blocks immediately (#5947).
+        // Decompress and cache; a quarantined block fails fast.
         let Some(block) = self.blocks.get(block_idx) else {
             return Err(super::ScrollbackError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -462,8 +558,7 @@ impl WarmTier {
     }
 
     // Front-truncation (truncate_front_lines) is in tier_front_truncation.rs.
-    // Back-removal methods (pre_validate_truncate_back, truncate_back_lines)
-    // are in tier_back_removal.rs.
+    // Back-removal (truncate_back_lines) is in tier_back_removal.rs.
 
     /// Clear all blocks.
     pub(crate) fn clear(&mut self) {
@@ -471,8 +566,10 @@ impl WarmTier {
         self.line_count = 0;
         self.front_offset = 0;
         self.cumulative_lines.clear();
+        self.cum_start = 0;
+        self.cumulative_base = 0;
         self.clear_cache();
-        // Saturating: both terms are real in-memory sizes (see push_block).
+        // Saturating: both terms are real in-memory sizes (see push_compressed).
         self.bytes_used
             .set(std::mem::size_of::<Self>().saturating_add(self.index_bytes()));
         self.budgeted_bytes = 0;
@@ -491,10 +588,8 @@ impl WarmTier {
         self.budgeted_bytes
     }
 
-    /// Replace the oldest warm block's compressed data with garbage.
-    ///
-    /// Test seam used to force warm-tier decompression failure during eviction
-    /// paths.
+    /// Test seam: replace the oldest warm block's compressed data with garbage
+    /// to force decompression failure on eviction paths.
     #[cfg(test)]
     pub(crate) fn corrupt_oldest_block(&mut self) {
         if let Some(block) = self.blocks.front_mut() {
@@ -512,12 +607,11 @@ impl WarmTier {
         }
     }
 
-    /// Saturating folds for the same strict-gate reason as
-    /// [`push_block`](Self::push_block) (identical on every real path).
+    /// Saturating folds for the strict gate, as in
+    /// [`push_compressed`](Self::push_compressed).
     ///
-    /// cfg: callers are the test suite and `DiskBackedScrollback`'s
-    /// debug-build invariant recomputation (`disk-tier`); `Scrollback`'s own
-    /// recomputation is test-only, so this exact cfg avoids dead code in
+    /// Callers are the test suite and `DiskBackedScrollback`'s debug-build
+    /// invariant recomputation (`disk-tier`); this cfg avoids dead code in
     /// non-test default-feature debug builds.
     #[cfg(any(test, all(debug_assertions, feature = "disk-tier")))]
     #[must_use]
@@ -550,35 +644,29 @@ impl WarmTier {
     }
 
     fn index_bytes(&self) -> usize {
-        // Saturating: a real Vec's capacity in bytes always fits in `usize`
-        // (see push_block for the idiom rationale).
+        // Saturating: a real Vec's capacity in bytes fits (see push_compressed).
         self.cumulative_lines
             .capacity()
             .saturating_mul(std::mem::size_of::<usize>())
     }
 
     fn cache_block(&self, block_idx: usize, lines: Vec<Line>) {
-        // TOTAL-before → TOTAL-after, deliberately: with more than one slot the
-        // delta is NOT the inserted entry's own size, because filling a slot
-        // also drops whatever it held. `bytes_used` must stay equal to
-        // `recompute_memory_used()` (which sums every slot via `cached_bytes`),
-        // or the accounting-drift assert in `scrollback_accounting.rs` fires.
-        // Both `cached_bytes()` calls sit OUTSIDE the `borrow_mut` scope: it
-        // borrows the same `RefCell`.
+        // Total before → total after: filling a slot also drops what it held, so
+        // the delta is not the new entry's size. `bytes_used` must equal
+        // `recompute_memory_used()` or the drift assert in
+        // `scrollback_accounting.rs` fires. Both `cached_bytes()` calls sit
+        // outside the `borrow_mut` scope, which borrows the same `RefCell`.
         let old_cache_bytes = self.cached_bytes();
         {
             let mut cache = self.last_block_cache.borrow_mut();
             let slot = self.cache_next.get() % CACHE_SLOTS;
-            // `slot < CACHE_SLOTS` by construction, so the `else` arm is
-            // unreachable; skipping the fill there is a no-op under that
-            // invariant (the cache is a pure memo — a missed fill only costs a
-            // later decompression) and keeps the write index-panic-free.
+            // `slot < CACHE_SLOTS`, so the `else` is unreachable; a missed fill
+            // would only cost a later decompression.
             if let Some(entry) = cache.get_mut(slot) {
                 *entry = Some((block_idx, lines));
             }
-            // Saturating: `slot` is already < CACHE_SLOTS, so this cannot
-            // overflow on any real path (same strict-gate idiom as the byte
-            // counters above); the modulo keeps the cursor in range regardless.
+            // saturating_add cannot overflow (`slot < CACHE_SLOTS`); the modulo
+            // keeps the cursor in range.
             self.cache_next.set(slot.saturating_add(1) % CACHE_SLOTS);
         }
         let new_cache_bytes = self.cached_bytes();
@@ -589,11 +677,11 @@ impl WarmTier {
         ));
     }
 
-    /// Drop EVERY cached block.
+    /// Drop every cached block.
     ///
-    /// Clear-all is an invariant, not laziness: `pop_front`/`push_front`
-    /// renumber every block, so a surviving entry keyed by its old index would
-    /// serve the WRONG scrollback lines. Never make this selective.
+    /// Clear-all is an invariant: `pop_front`/`push_front` renumber every block,
+    /// so a surviving entry keyed by its old index would serve the wrong lines.
+    /// Never make this selective.
     fn clear_cache(&self) {
         let old_cache_bytes = self.cached_bytes();
         *self.last_block_cache.borrow_mut() = [const { None }; CACHE_SLOTS];
@@ -602,13 +690,12 @@ impl WarmTier {
             .set(self.bytes_used.get().saturating_sub(old_cache_bytes));
     }
 
-    // Skip: `RefCell::borrow` PANICS on a conflicting active borrow (its
+    // Skip: `RefCell::borrow` panics on a conflicting active borrow (its
     // documented contract — deliberately excluded from totality). The cache
     // is single-threaded and never re-entrantly borrowed; unit-tested.
     #[cfg_attr(trust_verify, trust::skip)]
     fn cached_bytes(&self) -> usize {
-        // Saturating fold over every slot (see `cache_lines_bytes` for the
-        // idiom rationale).
+        // Saturating fold over every slot (see push_compressed).
         let cache = self.last_block_cache.borrow();
         let mut total = 0usize;
         for (_, lines) in cache.iter().flatten() {
@@ -618,8 +705,7 @@ impl WarmTier {
     }
 
     fn cache_lines_bytes(lines: &[Line]) -> usize {
-        // Saturating fold (identical to the previous `.sum()` for any lines
-        // that exist in memory — see push_block for the idiom rationale).
+        // Saturating fold (see push_compressed).
         let mut total = 0usize;
         for line in lines {
             total = total.saturating_add(line.memory_used());

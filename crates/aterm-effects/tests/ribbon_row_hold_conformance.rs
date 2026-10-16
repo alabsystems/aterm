@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Real ribbon clocks bind the derived renewal protocol to shipping code.
+//! The real ribbon's row clocks conform to `aterm-spec`'s
+//! `ribbon_row_hold_model`: a gesture renews only its own row's cohort.
 
 use std::time::{Duration, Instant};
 
@@ -119,8 +120,8 @@ fn typing_and_erase_renew_only_their_own_row_and_conform() {
             assert!(model.check_invariant("OnlyOwnerRenews", &state));
             assert!(model.check_invariant("OwnerKeepsItsLease", &state));
 
-            // Historical defect: the same key renews the other row too.
-            // It must fail both the real trace relation and the invariant.
+            // Negative control: a global hold (the key renews the other row
+            // too) fails both the trace relation and the invariant.
             let mut global_hold = state.clone();
             global_hold.insert(if owner == 0 { "clock1" } else { "clock0" }, stamp);
             assert!(!model.successors(action, &before).contains(&global_hold));

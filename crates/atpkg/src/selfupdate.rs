@@ -1,231 +1,106 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! THE SELF-UPDATE INTERCEPT (2026-09-19): a vendor's own self-update verb typed on the
-//! MANAGED name — `claude update`, `claude upgrade`, `claude install [latest] [--force]`,
-//! `codex update` — is answered by aterm's package manager, which is the only thing that
-//! can move the copy that name runs.
+//! The self-update intercept: a vendor's own self-update verb typed on the managed name
+//! (`claude update`, `claude upgrade`, `claude install [latest] [--force]`, `codex update`)
+//! is answered by aterm's package manager, the only thing that can move the copy that name
+//! runs. Design and measurements: `docs/DESIGN-vendor-self-update-2026-09-19.md`.
 //!
-//! Owner, 2026-09-19, verbatim: *"when executing `claude install latest` or similar for
-//! codex and other aterm atpkg managed programs, aterm reports that these packages are
-//! automatically managed by atpkg to keep to the latest version (and then does a check to
-//! make sure that they are updated and then actually updates) via the standard pkg
-//! manager."*
+//! * The twin's block ([`crate::platform::sh_selfupdate_prelude`]) matches the first token
+//!   exactly (`case "$1" in update|upgrade|install) … exec "$__atpkg" __selfupdate 'claude'
+//!   '<prefix>' -- "$@"`): `claude -p update` is a prompt, and commander's optional-valued
+//!   `--debug [filter]` swallows the `install` of `claude --debug install`, so scanning
+//!   past `$1` would hijack sessions; the accepted miss is that `claude --bare update` runs
+//!   the vendor's updater. The verbs come from the vendor row
+//!   ([`VendorSpec::self_update_verbs`]), validated shell-safe at render; no line is a
+//!   literal `exec '` or `export `, so readers of the twin's target and env are unaffected.
+//!   When the co-located `atpkg` is not executable the arm falls through to the twin's own
+//!   `exec`: never a stranded tool.
+//! * `bin/` carries the same block (`crate::activate::reconcile_agents` lays the primary
+//!   with it): outside aterm the rc hook puts only `bin/` on `PATH` (`crate::hooks`), and
+//!   the vendor's updater run there would rewrite `~/.claude.json` for a native install.
+//!   The verb's forward `exec`s `bin/<program>` under the same pid, and [`REENTRY_VAR`]
+//!   then runs the store build instead of handing over again.
+//! * The hidden verb (`cli::cmd_selfupdate`) re-checks the argv with [`classify`]. Help
+//!   forwards to the vendor after one stderr note. An honoured shape prints one announce
+//!   line and runs the standard update as a foreground child (`update <program>
+//!   --wait-lock` [`WAIT_LOCK_SECS`], `ATPKG_SPAWNER_PID` set, stdio inherited), so the real
+//!   dispatch edge runs and the child prints what a typed `aterm pkg update claude` does,
+//!   plus the wait lane's markers (`cli::SEED_BUSY_MARKER`; on a terminal a spinner,
+//!   `cli::lock_wait_spinner`). A held store is waited for, visibly; Ctrl-C ends the wait.
+//!   Every other shape is declined on stderr with exit 2: never run silently, never handed
+//!   to the vendor's updater, no bypass and no environment knob. The child's stdout line is
+//!   the verdict; this module adds one stderr line only when the child did not decide
+//!   (exit 1, a signal, exit 75).
 //!
-//! # What was true before (measured 2026-09-19)
+//! "Current" is the vendor's head (`docs/DESIGN-atpkg-vendor-direct-updates-2026-09-22.md`
+//! §1.7): the child runs the vendor-direct lane ([`crate::vendor_direct`]). The lines name
+//! versions, never a store build id.
 //!
-//! * The managed `claude` (2.1.278) carries `install [options] [target]` — target
-//!   `stable`, `latest` or a version, option `--force` — and `update|upgrade` (a
-//!   commander alias: `claude upgrade --help` prints `Usage: claude update|upgrade`).
-//!   Its shim exports only `DISABLE_AUTOUPDATER=1`, which stops the BACKGROUND check and
-//!   nothing else: `DISABLE_AUTOUPDATER=1 claude update` printed `Claude Code is up to
-//!   date (2.1.278)` and exited 0, and `agents/claude update` — the twin, the copy every
-//!   shell runs — printed the same. So with upstream ahead of the signed pin the vendor's
-//!   updater would have written `~/.local/share/claude/versions/<v>` and repointed
-//!   `~/.local/bin/claude`: a copy this name never runs (`docs/TOOLCHAIN-PACKAGE-MANAGER.md`
-//!   §17.12), wasted bandwidth, and a `claude doctor` complaint — the vendor's verb did
-//!   the opposite of what the person typing it meant.
-//! * `codex` has exactly one such verb, `update` (`codex-rs/cli/src/main.rs`,
-//!   `Subcommand::Update`, no alias, no flags, read 2026-09-19). On the store copy it
-//!   bails — the path matches no install method it knows (`InstallMethod::Other`) — with
-//!   a sentence pointing at the vendor's own channels. It was not run on this machine
-//!   (`codex` hangs off a TTY here), so its exact stderr is inferred from source, never
-//!   quoted by a test.
+//! Accepted exposure: a twin laid against an older co-located `atpkg` (the app downgraded)
+//! answers `__selfupdate` with `unknown verb`, exit 2, until that atpkg re-lays it; a newer
+//! twin against an older table forwards verbatim (`row_for` answers `None`). For agy, whose
+//! updater rewrites the store build in place, the store seals a single-binary build's
+//! `bin/` ([`crate::store::seal_bin`]), so its `update` refuses rather than mutate the tree.
 //!
-//! # The mechanism
+//! Scope: the agent programs ([`crate::vendor_direct::VENDORS`]). `gh` has no self-update
+//! verb, `brew` manages what it installs, and none has an `agents/` twin. On Windows the
+//! `.cmd` twin carries no block ([`crate::platform::twin_prelude`]): a `"%~1"=="update"`
+//! line expands user text, and a `"` in an argument can end the batch with the tool never
+//! run.
 //!
-//! Two halves, the shape of the retired landing hand-over ([`crate::landing`]):
-//!
-//! * **The twin's block** ([`crate::platform::sh_selfupdate_prelude`]), the whole of the
-//!   twin's prelude: `case "$1" in update|upgrade|install) … exec "$__atpkg"
-//!   __selfupdate 'claude' '<prefix>' -- "$@"; …; esac`. THE FIRST TOKEN, EXACTLY, and
-//!   nothing else: `claude -p update` is a prompt, and `claude --debug install` is not an
-//!   install at all — commander's `--debug [filter]` takes an OPTIONAL value and swallows
-//!   `install` as the filter (measured: it prints the top-level usage). Any scan past `$1`
-//!   would hijack a session whose first word happens to be `update`, which is far worse
-//!   than the recorded false negative: `claude --bare update` runs the vendor's updater
-//!   as before this existed. The verbs are DATA from [`ROSTER`], validated shell-safe at
-//!   render; the program and prefix are single-quoted; `"$@"` is verbatim; no line of
-//!   the block is a literal `exec '` or an `export `, so every reader of the twin's
-//!   target and env answers as before. THE EXEC IS THE GUARANTEE: when the embedded
-//!   co-located `atpkg` is not executable the arm falls through to the twin's own
-//!   exports and store `exec`, and the vendor's verb runs as it did before (review,
-//!   2026-09-16), never a stranded tool.
-//! * **`bin/` carries the same block** (audit 2026-10-02). Outside an aterm session —
-//!   Terminal, iTerm, an editor's terminal, ssh — the rc hook puts `bin/` on PATH and not
-//!   `agents/` (`crate::hooks`, the 2026-09-22 gate), so where the person keeps no copy of
-//!   their own `bin/<program>` IS the managed name, and before this `claude update` there
-//!   ran the vendor's updater on the managed copy: measured on 2.1.287 and 2.1.288 in a
-//!   network-jailed scratch HOME, it wrote `installMethod: native` into `~/.claude.json`
-//!   and fetched the vendor's latest for a native install. The agents reconcile lays the
-//!   primary with the twin's block (`crate::activate::reconcile_agents`), so the two files
-//!   are byte for byte the same. The verb's forward (help, a pass-through) `exec`s
-//!   `bin/<program>` — so does every atpkg shipped since 2026-09-19 — under the same pid,
-//!   and the block's re-entry guard ([`REENTRY_VAR`]) runs the store build then instead of
-//!   handing over again, whichever atpkg the block names.
-//! * **The hidden verb** (`cli::cmd_selfupdate`): re-checks the argv in Rust with
-//!   [`classify`] — help never mutates (`-h`/`--help` forwards to the vendor after one
-//!   stderr note), a shape aterm can honour prints ONE announce line and runs the
-//!   STANDARD update as a foreground child (`<embedded atpkg> update <program>
-//!   --wait-lock 1800` — [`WAIT_LOCK_SECS`], the window's own bound — with
-//!   `ATPKG_SPAWNER_PID` set and stdio inherited) so the real dispatch edge — the store
-//!   lock, the orphan watch — is what runs and
-//!   the child's own lines are byte-identical to a typed `aterm pkg update claude` —
-//!   plus, because the child is a `--wait-lock` caller, the wait lane's stdout markers
-//!   a typed verb never prints (measured 2026-09-19 under a held lock, stdout a pipe:
-//!   `atpkg: lock-waiting: …` after the 2 s grace, `atpkg: lock-acquired: …` when the
-//!   holder lets go, `atpkg: seed-busy: …` at the 75 ending; `cli::SEED_BUSY_MARKER`
-//!   records the exception — on a person's terminal the wait is a stderr spinner
-//!   instead, `cli::lock_wait_spinner`, and the markers become sentences or nothing,
-//!   `cli::human_marker`). A store another pass holds is WAITED FOR, the whole 30 minutes —
-//!   a typed `claude update` asks FOR the update, so it waits for a pass already running
-//!   it, never silently (those markers), and Ctrl-C ends the wait. Every other shape
-//!   (`install stable`, `install 2.1.200`, an unknown token) is DECLINED on stderr with
-//!   exit 2 — never run silently, and never handed to the vendor's own updater, which
-//!   installs a copy this name never runs; there is no bypass and no environment knob
-//!   (owner, 2026-09-19: *"remove all these env flags so that aterm works correctly by
-//!   default"*). The child's own stdout line is the verdict an agent reads (`atpkg:
-//!   claude 2.1.278 → 2.1.280 (Anthropic latest)` / `atpkg: claude 2.1.280 is Anthropic's
-//!   latest` / `held by local pin`); this module adds exactly one stderr line only when
-//!   the child did not decide (exit 1 → the version you have stays, how to retry; exit
-//!   75 → another pass held the store for the whole wait and is the one moving packages).
-//!
-//! "Current" is THE VENDOR'S HEAD (`docs/DESIGN-atpkg-vendor-direct-updates-2026-09-22.md`
-//! §1.7): the child runs the vendor-direct lane ([`crate::vendor_direct`]), which reads
-//! the vendor's `latest` pointer, verifies the build on this client under the vendor's
-//! own anchors, and installs it — no ALab index sits in between. The lines name
-//! versions (the `.vendor` record's), never a store build id.
-//!
-//! # Exposure accepted, like `__landing`'s
-//!
-//! A twin laid by THIS client against an OLDER co-located `atpkg` (the app downgraded
-//! before its first pass re-lays the twin) answers `__selfupdate` with `unknown verb`
-//! exit 2 — loud, non-mutating, only for a self-update verb (a plain `claude` never
-//! touches the arm), and self-healing: that older atpkg's first `reconcile_agents` re-lays
-//! the twin without the block. `bin/` heals later — such an atpkg re-lays a primary only
-//! when the program's next build lands — with the same loud, non-mutating ending until
-//! then. The reverse — a NEWER twin's roster against this verb's older one — forwards to
-//! the tool verbatim (`row_for` answers `None`).
-//!
-//! # Scope
-//!
-//! [`crate::stub::AGENT_PROGRAMS`] only, one [`Row`] each, pinned by a test in both
-//! directions. Out by argument: `gh` has no self-update verb (`gh upgrade` is unknown;
-//! `gh extension upgrade` moves extensions), `emacs` none, `brew update`/`upgrade` IS the
-//! sanctioned manager of an OS-installed, system-satisfied member, and the Command Line
-//! Tools are Apple's `softwareupdate`'s. None of them has an `agents/` twin to intercept
-//! in anyway. A future vendor member joins by one row.
-//!
-//! # Windows: TARGET, rendered empty
-//!
-//! The `.cmd` twin is byte-unchanged ([`crate::platform::cmd_selfupdate_prelude`] answers
-//! `""` on every input, with the intended text in its doc): a `"%~1"=="update"` line
-//! expands user text on a batch line, and an argument carrying a `"` can end the batch
-//! with the tool never run — the strand the Unix rule forbids — on a platform no machine
-//! of this repo runs. The Rust half is platform-neutral, so landing the segment later is
-//! a renderer change.
-//!
-//! Every function here is PURE — no process, no I/O, no exit-code value of its own (the
-//! exit-code registry scan in [`crate::lock`] reads `cli.rs`, where the relay is literal
-//! arms; the verb's usage line lives there too, beside `cmd_landing`'s) — so every line
-//! and every verdict is pinned on every platform.
+//! Every function here is pure and builds no exit code: the relay and the verb's usage line
+//! live in `cli.rs`, the file the exit-code scan in [`crate::lock`]'s tests reads. So every
+//! line and verdict is pinned on every platform.
 
 use std::ffi::OsStr;
 use std::io;
 use std::path::Path;
 
+use crate::vendor_direct::VendorSpec;
+
 /// The hidden verb the twin's block execs: `atpkg __selfupdate <program> [<abs prefix>]
-/// -- [args…]` — the grammar of [`crate::landing::HandOver`], reused verbatim. Unlisted,
-/// dispatched before the verb match and before the store lock, like `__landing`: the
-/// CHILD it spawns takes the lock through the real dispatch edge; the verb itself never
-/// mutates the store.
+/// -- [args…]`, the grammar of [`crate::landing::HandOver`]. Unlisted and dispatched before
+/// the store lock, like `__landing`: the child it spawns takes the lock, and the verb
+/// itself never mutates the store.
 pub const HIDDEN_VERB: &str = "__selfupdate";
 
-/// THE BLOCK'S RE-ENTRY GUARD (audit 2026-10-02): the block hands over as
-/// `__ATPKG_SELFUPDATE_PID=$$ exec "$__atpkg" __selfupdate …`, and a block that finds this
-/// variable equal to its OWN `$$` lets the verb through to the store build instead of
-/// handing over again. Why: the verb's forward (help, a pass-through) `exec`s `bin/<program>`
-/// — every atpkg shipped since 2026-09-19 does — and `bin/` carries the block too now, so
-/// without the guard `claude update --help` handed over to itself forever (measured: 518
-/// notes in 4 s against the installed atpkg). The hand-over and the forward are both
-/// `exec(2)`, so the re-entered shim runs under the SAME pid, which is what the guard
-/// matches; a `claude update` typed anywhere else runs under a pid no environment names, so
-/// the variable is no bypass a person could leave set, and it needs no newer atpkg to work.
+/// The block's re-entry guard: the block hands over as `__ATPKG_SELFUPDATE_PID=$$ exec
+/// "$__atpkg" __selfupdate …`, and a block that finds this variable equal to its own `$$`
+/// runs the store build instead of handing over again. The verb's forward (help, a
+/// pass-through) `exec`s `bin/<program>`, which carries the block too, so without the guard
+/// `claude update --help` hands over to itself forever. Hand-over and forward are both
+/// `exec(2)`, so the re-entered shim has the same pid; a `claude update` typed anywhere else
+/// has a pid no environment names, so the variable is no bypass a person could leave set.
 pub const REENTRY_VAR: &str = "__ATPKG_SELFUPDATE_PID";
 
-/// The child's `--wait-lock` bound, in seconds: THIRTY MINUTES, a constant — the one
-/// every scheduled pass waits ([`aterm_update_core::pkg_check::PASS_WAIT_LOCK_SECS`]: the
-/// window's `ATPKG_WAIT_LOCK_SECS` and the terminal session's pass bind that same
-/// constant, so the three cannot drift). A
-/// typed `claude update` asks FOR the update, so it waits for a pass already running it —
-/// the window loop's, a landing, a typed `aterm pkg` verb — and the wait is never silent:
-/// the child prints `lock-waiting:` after the 2 s grace and `lock-acquired:` when it gets
-/// the store, and Ctrl-C ends it. There is no environment knob for it (owner, 2026-09-19: *"remove all
-/// these env flags so that aterm works correctly by default"*); an in-process test
-/// drives the 75 ending with a 1 s bound through `cli::selfupdate_check`'s parameter.
+/// The child's `--wait-lock` bound in seconds: thirty minutes, the bound every scheduled
+/// pass waits ([`aterm_update_core::pkg_check::PASS_WAIT_LOCK_SECS`]). A typed
+/// `claude update` asks for the update, so it waits for a pass already running one, never
+/// silently, and Ctrl-C ends it. No environment knob shortens it; the in-process test
+/// passes its own bound through `cli::selfupdate_check`'s parameter.
 pub const WAIT_LOCK_SECS: u64 = aterm_update_core::pkg_check::PASS_WAIT_LOCK_SECS;
 
-/// One rostered agent program: the verbs its twin intercepts and the measurement the row
-/// rests on. Its lines name the product and vendor from [`crate::vendor_direct::VENDORS`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Row {
-    /// The program, as [`crate::stub::AGENT_PROGRAMS`] spells it.
-    pub program: &'static str,
-    /// The vendor's self-update verbs, exactly as typed as `$1`; each must pass
-    /// [`is_shell_safe_verb`] (it lands in a `case` pattern). EMPTY means "this member
-    /// has no self-updater and its twin carries no block" — an explicit decision, never
-    /// a missing row (the coherence test forces a row per agent program).
-    pub verbs: &'static [&'static str],
-    /// Where the verbs come from — the measurement, dated, so a reader of the table can
-    /// tell a fact from a guess.
-    pub measured: &'static str,
-}
-
-/// The roster. Programs in [`crate::stub::AGENT_PROGRAMS`]' order, one row each — pinned
-/// both ways by `the_roster_is_the_agent_programs_and_every_verb_is_a_shell_word`.
-pub const ROSTER: &[Row] = &[
-    Row {
-        program: "claude",
-        verbs: &["update", "upgrade", "install"],
-        measured: "claude 2.1.278 `--help`, 2026-09-19: `install [options] [target]` \
-                   (stable|latest|<version>; --force), `update|upgrade`; \
-                   DISABLE_AUTOUPDATER=1 leaves `claude update` live (measured exit 0, \
-                   `up to date`)",
-    },
-    Row {
-        program: "codex",
-        verbs: &["update"],
-        measured: "openai/codex codex-rs/cli/src/main.rs `Subcommand::Update` (no alias, \
-                   no flags), read 2026-09-19; not run on this box (codex hangs off a TTY)",
-    },
-];
-
-/// The row for `program`, or `None` for a program that is not rostered — a twin laid by
-/// a NEWER client against this older roster forwards to the tool verbatim.
+/// `program`'s vendor row, or `None` for a non-agent program: a twin laid by a newer client
+/// against this older table forwards to the tool verbatim.
 #[must_use]
-pub fn row_for(program: &str) -> Option<&'static Row> {
-    ROSTER.iter().find(|r| r.program == program)
+pub fn row_for(program: &str) -> Option<&'static VendorSpec> {
+    crate::vendor_direct::spec(program)
 }
 
-/// The verbs `program`'s twin intercepts; EMPTY for an unknown program and for a member
-/// whose row says it has none — what [`crate::activate::reconcile_agents`] hands the
-/// renderer, which renders no block for an empty list.
+/// The verbs `program`'s twin intercepts: empty for an unknown program or a row with none,
+/// and an empty list renders no block ([`crate::activate::reconcile_agents`]).
 #[must_use]
 pub fn verbs_of(program: &str) -> &'static [&'static str] {
-    row_for(program).map_or(&[], |r| r.verbs)
+    row_for(program).map_or(&[], |r| r.self_update_verbs)
 }
 
-/// `^[a-z][a-z0-9-]*$` and not `esac` — a word that is inert inside a `sh` `case`
-/// pattern (no glob character, no `|`, no `)`, no quote, no space) and inside a `#`
-/// comment line. `esac` is the ONE word the regex admits that is not inert there (POSIX
-/// shell grammar rule 4 reserves it where a pattern list starts): measured 2026-09-19,
-/// `case "$1" in\n  esac)` is a parse error in /bin/sh, bash, dash, zsh and ksh, so the
-/// whole twin would die at line 3 on EVERY invocation — the stranded tool the renderer's
-/// fail-closed rule exists to forbid — while `in`, `case`, `if`, `then`, `fi`, `do`,
-/// `done` and `while` all parse and match as ordinary pattern words (the same run), so
-/// they are not refused. The renderer refuses a whole block over one verb that fails
-/// this, fail-closed; the program name is held to the same rule because it lands in the
-/// note line too.
+/// `^[a-z][a-z0-9-]*$` and not `esac`: a word inert inside a `sh` `case` pattern and a `#`
+/// comment line. `esac` is the one such word that is not (POSIX grammar rule 4 reserves it
+/// where a pattern list starts: `esac)` is a parse error in sh, bash, dash, zsh and ksh, and
+/// would kill the twin on every run); `in`, `case`, `if`, `then`, `fi`, `do`, `done` and
+/// `while` parse as ordinary pattern words. The renderer refuses the whole block over one
+/// failing verb; the program name is held to the same rule (it lands in the note line).
 #[must_use]
 pub fn is_shell_safe_verb(v: &str) -> bool {
     let mut chars = v.chars();
@@ -234,8 +109,7 @@ pub fn is_shell_safe_verb(v: &str) -> bool {
         && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
-/// What the verb does with the user's argv (after the twin's `--`), decided by
-/// [`classify`] and nothing else.
+/// What the verb does with the user's argv, decided by [`classify`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict<'a> {
     /// `-h`/`--help` before any literal `--`: one stderr note, then the vendor's own
@@ -248,8 +122,8 @@ pub enum Verdict<'a> {
     Check {
         /// The verb typed (`update`, `upgrade`, `install`).
         verb: &'a str,
-        /// The words the announce line echoes, as typed, verb first: `update`,
-        /// `install latest`, `install --force latest`.
+        /// The words as typed, verb first: `update`, `install latest`,
+        /// `install --force latest`.
         words: String,
     },
     /// A shape aterm cannot honour: one stderr line, exit 2, nothing run.
@@ -259,40 +133,31 @@ pub enum Verdict<'a> {
 /// Why a shape is declined — each its own sentence ([`declined_line`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decline<'a> {
-    /// `install stable`: aterm updates the program from the vendor's `latest` and installs
-    /// no other channel.
+    /// `install stable`: aterm installs from the vendor's `latest` and no other channel.
     NotAChannel { verb: &'a str, target: &'a str },
-    /// `install 2.1.200` / `install v2.1.200`: aterm updates from the vendor's latest; a
-    /// version of the user's choosing cannot be honoured (`aterm pkg rollback` and `pin`
-    /// can).
+    /// `install 2.1.200` / `install v2.1.200`: a version of the user's choosing cannot be
+    /// honoured (`aterm pkg rollback` and `pin` can).
     Version { verb: &'a str, target: &'a str },
-    /// Anything else after the verb (`update now`, `install --foo`, a repeated word):
-    /// not a shape the updater answers, and not one to hand to the vendor's installer
-    /// silently either.
+    /// Anything else after the verb (`update now`, `install --foo`, a repeated word).
     Shape { verb: &'a str, rest: &'a [String] },
 }
 
-/// Classify the user's argv (AFTER the twin's `--`) against `row` — pure, on every
-/// platform. The `sh` side already guaranteed `$1` is one of the row's verbs; this
-/// re-checks, because a hand-typed `atpkg __selfupdate claude -- …` arrives here too.
+/// Classify the user's argv (after the twin's `--`) against `row`. The `sh` side already
+/// matched `$1`; this re-checks, because a hand-typed `atpkg __selfupdate claude -- …`
+/// arrives here too.
 ///
 /// The rules, in order:
-/// 1. any `-h` or `--help` among the arguments BEFORE a literal `--` ⇒ [`Verdict::Help`]
-///    (a bare word `help` is NOT help: commander reads it as an operand);
-/// 2. `args[0]` not one of `row.verbs`, or no args ⇒ [`Verdict::PassThrough`];
-/// 3. `update` / `upgrade` with no further token ⇒ `Check`; with any ⇒ `Declined(Shape)`;
-/// 4. `install` whose operands are drawn only from the closed set {`latest`, `--force`},
-///    each at most once ⇒ `Check` with the words as typed (a bare `install` is a check of
-///    the vendor's latest; Claude's own default target for a bare `install` was NOT
-///    measured); else
-///    the first operand not starting with `-` decides: `stable` ⇒ `Declined(NotAChannel)`,
-///    a version (a leading digit, or `v` + digit) ⇒ `Declined(Version)`, anything else or
-///    none ⇒ `Declined(Shape)`.
-///
-/// Nothing here names a program: the verbs come from the row, and the `install` grammar
-/// belongs to the verb `install` wherever a row carries it.
+/// 1. any `-h` or `--help` before a literal `--` ⇒ [`Verdict::Help`] (a bare `help` is not:
+///    commander reads it as an operand);
+/// 2. `args[0]` not one of `row.self_update_verbs`, or no args ⇒ [`Verdict::PassThrough`];
+/// 3. a verb other than `install` with no further token ⇒ `Check`; with any ⇒
+///    `Declined(Shape)`;
+/// 4. `install` whose operands are drawn from {`latest`, `--force`}, each at most once ⇒
+///    `Check` with the words as typed; else the first operand not starting with `-`
+///    decides: `stable` ⇒ `Declined(NotAChannel)`, a version (a leading digit, or `v` +
+///    digit) ⇒ `Declined(Version)`, anything else or none ⇒ `Declined(Shape)`.
 #[must_use]
-pub fn classify<'a>(row: &Row, args: &'a [String]) -> Verdict<'a> {
+pub fn classify<'a>(row: &VendorSpec, args: &'a [String]) -> Verdict<'a> {
     if args
         .iter()
         .take_while(|a| a.as_str() != "--")
@@ -304,7 +169,7 @@ pub fn classify<'a>(row: &Row, args: &'a [String]) -> Verdict<'a> {
         return Verdict::PassThrough;
     };
     let verb = verb.as_str();
-    if !row.verbs.contains(&verb) {
+    if !row.self_update_verbs.contains(&verb) {
         return Verdict::PassThrough;
     }
     if verb != "install" {
@@ -359,12 +224,10 @@ fn looks_like_version(s: &str) -> bool {
     }
 }
 
-/// The child's argv: `update <program> --wait-lock <bound>` — the window's shape
-/// (`aterm-gui`'s `run_atpkg_pass`) minus `--progress-file`, which is the window's
-/// byte-parsed channel and never a terminal's. `bound` is [`WAIT_LOCK_SECS`] in
-/// production and a test's own seconds in a test; the pair is ALWAYS there, so a held
-/// store is always waited for. The edge strips the flag only when `args[0]` is
-/// `seed|update|install`, which `update` is.
+/// The child's argv: `update <program> --wait-lock <bound>`, the window's shape
+/// (`aterm-gui`'s `run_atpkg_pass`) minus its `--progress-file`. The bound is always
+/// there, so a held store is always waited for; the edge strips `--wait-lock` only for
+/// `seed`, `update` and `install`.
 #[must_use]
 pub fn child_args(program: &str, bound: u64) -> Vec<String> {
     vec![
@@ -375,18 +238,11 @@ pub fn child_args(program: &str, bound: u64) -> Vec<String> {
     ]
 }
 
-/// [`child_args`] as the executable at `binary` must be handed them: verbatim when its
-/// file stem is `atpkg` — the thin bin, the bundle's `atpkg` argv0 alias (the one binary
-/// dispatches on argv0, and `current_exe()` through a symlink keeps the symlink's name,
-/// measured 2026-09-19) — and behind the `pkg` verb otherwise. The one shipped binary is
-/// `aterm`, and its front door reads a bare `update` as aterm's OWN app-update lane
-/// (`aterm_cli::Verb::Update`), never as a package verb: measured on the installed
-/// bundle, `aterm update claude --wait-lock 60` answered `aterm: unknown update
-/// sub-command "claude"` and that lane's own operands (`status|check`), exit 2 — so a
-/// sibling-less `aterm` (a dev build copied out of `target/`, a bundle missing the alias
-/// symlink) whose verb fell back to `current_exe()` announced a check that never ran and
-/// relayed that usage refusal as the update's status (review finding). Any other name
-/// is the front door too, so `pkg` is the rule and `atpkg` the one exception.
+/// [`child_args`] for the executable at `binary`: verbatim when its file stem is `atpkg`
+/// (the thin bin, or the bundle's argv0 alias: `current_exe()` through a symlink keeps the
+/// symlink's name), else behind `pkg`, because the one binary's front door reads a bare
+/// `update` as aterm's own app-update lane (`aterm_cli::Verb::Update`) and refuses
+/// `update claude`.
 #[must_use]
 pub fn child_argv(binary: &Path, program: &str, bound: u64) -> Vec<String> {
     let is_atpkg = binary
@@ -402,9 +258,7 @@ pub fn child_argv(binary: &Path, program: &str, bound: u64) -> Vec<String> {
     v
 }
 
-/// The longest echo of user-typed text any line here carries, in bytes; the rest is
-/// `…`. A 200-byte "version" is a hostile or mistyped argument either way, and a TTY line
-/// is not the place to reproduce it.
+/// The longest echo of user-typed text any line carries, in bytes; the rest is `…`.
 const ECHO_CAP: usize = 64;
 
 /// A user-typed token as the lines echo it: plain when every byte is printable ASCII
@@ -438,15 +292,13 @@ fn echo_words(args: &[String]) -> String {
     capped
 }
 
-/// The row's canonical verb spelling for the lines that name ONE verb (`claude update`
-/// here runs …): the first verb of the row — `update` for both members today.
-fn lead_verb(row: &Row) -> &'static str {
-    row.verbs.first().copied().unwrap_or("update")
+/// The verb the lines name: the row's first, `update` for every row that has one.
+fn lead_verb(row: &VendorSpec) -> &'static str {
+    row.self_update_verbs.first().copied().unwrap_or("update")
 }
 
-/// The version the store's active build is (`2.1.280`; a legacy index build `build N`),
-/// or `(no version recorded)` when the layout has no active build of the program — offline
-/// words (`ops::active_builds` reads the `bin/` shims).
+/// The active build's version (`2.1.280`; `build N` for a legacy index build), or
+/// `(no version recorded)` with none.
 fn build_words(build: Option<u64>) -> String {
     build.map_or_else(
         || String::from("(no version recorded)"),
@@ -454,51 +306,31 @@ fn build_words(build: Option<u64>) -> String {
     )
 }
 
-/// `(product, vendor)` for the row's program — `("Claude Code", "Anthropic")` — from the
-/// vendor table; the program itself and `its vendor` for a row the table lacks (the
-/// roster and the table are the same programs, pinned by a test).
-fn keeper(row: &Row) -> (&'static str, &'static str) {
-    crate::vendor_direct::spec(row.program)
-        .map_or((row.program, "its vendor"), |s| (s.product, s.vendor))
-}
-
-/// The announce line, stderr, before the child: `` atpkg: aterm updates Claude Code from
-/// Anthropic — you have 2.1.278; checking now: `aterm pkg update claude` `` — facts in the order a person needs them (owner,
-/// 2026-09-22: *"more concise and with facts, like the current version, that this triggers
-/// a check"*): who updates it and from whom, what you HAVE (`have` is
-/// [`crate::vendor_direct::have_words`] of the active build, read offline before the
-/// child: the version of a vendor-direct build, the version an earlier pass recorded for
-/// a legacy index build, else `build N`; `(no version recorded)` with none), that a check
-/// is running NOW and the verb that runs it. Nothing about the download: a typed pass
-/// draws the one-line meter (`crate::meter` — bytes, rate, time left) under this line,
-/// so "downloads silently, ~1 min" (2026-09-23) became false the day the meter landed
-/// and is gone. No claim that the running copy is the latest: a pin or a rollback may
-/// hold it, and the child's verdict line says so.
-/// The words typed are not echoed: they are the line above this one in every transcript.
+/// The announce line, stderr, before the child: who updates the program and from whom,
+/// what you have (`have`, [`crate::vendor_direct::have_words`] of the active build, read
+/// offline), and that a check runs now. Nothing about the download (the child draws a
+/// meter) and no claim of being latest (a pin or rollback may hold it; the child's
+/// verdict says so). The words typed are not echoed: they are the line above it.
 #[must_use]
-pub fn announce_line(row: &Row, have: &str) -> String {
+pub fn announce_line(row: &VendorSpec, have: &str) -> String {
     let p = row.program;
-    let (product, vendor) = keeper(row);
+    let (product, vendor) = (row.product, row.vendor);
     format!(
         "atpkg: aterm updates {product} from {vendor} — you have {have}; checking now: `aterm \
          pkg update {p}`"
     )
 }
 
-/// The declined line, stderr, exit 2, nothing run — one sentence per [`Decline`]. The
-/// target and the argv are echoed through the escape-and-cap rule ([`echo_words`]). No
-/// sentence names a bypass: the vendor's own installer is never run through the managed
-/// name, because the copy it installs is one this name never runs — and there is no
-/// environment knob that would (owner, 2026-09-19).
+/// The declined line, stderr, exit 2, nothing run: one sentence per [`Decline`], user text
+/// through [`echo_words`]. No sentence names a bypass: the vendor's installer is never run
+/// through the managed name, whose copy it does not install.
 #[must_use]
-pub fn declined_line(row: &Row, d: &Decline<'_>) -> String {
+pub fn declined_line(row: &VendorSpec, d: &Decline<'_>) -> String {
     let p = row.program;
-    let (product, vendor) = keeper(row);
-    // State first (`not run`), then the one action, then at most one caveat — the
-    // announce line's shape (owner, 2026-09-22: concise, facts, less cruft). A and B
-    // name `{verb} latest` as the correction because that is the direct swap for a
-    // refused `stable` or version; B's one caveat is rollback (a person who typed a
-    // version usually wants the one before), A's is the pin.
+    let (product, vendor) = (row.product, row.vendor);
+    // State first (`not run`), then the one action (`{verb} latest`, the direct swap for a
+    // refused channel or version), then at most one caveat: the pin, or rollback for a
+    // person who typed a version.
     match d {
         Decline::NotAChannel { verb, target } => format!(
             "atpkg: `{p} {verb} {target}` not run — aterm updates {product} from {vendor} and \
@@ -523,12 +355,10 @@ pub fn declined_line(row: &Row, d: &Decline<'_>) -> String {
     }
 }
 
-/// The help note, stderr, then the vendor's own help: `` atpkg: on this copy `claude
-/// update` is answered by `aterm pkg update claude` (aterm help pkg) — the vendor's own
-/// help follows `` — so an agent reading the output learns what the verb does under
-/// aterm before the vendor's text describes the vendor's updater.
+/// The help note, stderr, ahead of the vendor's own help, so an agent learns what the verb
+/// does under aterm before the vendor's text describes the vendor's updater.
 #[must_use]
-pub fn help_line(row: &Row) -> String {
+pub fn help_line(row: &VendorSpec) -> String {
     let p = row.program;
     format!(
         "atpkg: here `{p} {}` runs `aterm pkg update {p}` (`aterm help pkg`) — the vendor's \
@@ -537,12 +367,10 @@ pub fn help_line(row: &Row) -> String {
     )
 }
 
-/// The disabled line, stderr, exit 1, nothing run: the manager is off, and its one cause
-/// is a build that pins no root key, so the line names it — and the vendor's updater is
-/// NOT handed the verb either, because the copy it would install is one this name never
-/// runs.
+/// The disabled line, stderr, exit 1, nothing run: the manager is off because the build
+/// pins no root key. The vendor's updater is not handed the verb either.
 #[must_use]
-pub fn disabled_line(row: &Row, build: Option<u64>) -> String {
+pub fn disabled_line(row: &VendorSpec, build: Option<u64>) -> String {
     let p = row.program;
     format!(
         "atpkg: this aterm build updates nothing (it pins no release key) — {p} {} stays; a \
@@ -551,12 +379,11 @@ pub fn disabled_line(row: &Row, build: Option<u64>) -> String {
     )
 }
 
-/// The epilogue for a child that exited non-zero on its own (offline, a flow error, a
-/// lock I/O error, a panic), stderr, after whatever the child printed. Not every such
-/// exit printed a verdict naming the version it keeps, so this line names it, and the
-/// retry.
+/// The epilogue for a child that exited non-zero on its own (offline, a flow error, a lock
+/// I/O error, a panic): not every such exit names the version it keeps, so this line does,
+/// and the retry.
 #[must_use]
-pub fn incomplete_line(row: &Row, build: Option<u64>) -> String {
+pub fn incomplete_line(row: &VendorSpec, build: Option<u64>) -> String {
     let p = row.program;
     format!(
         "atpkg: {p} {} stays; `{p} {}` tries again",
@@ -568,7 +395,7 @@ pub fn incomplete_line(row: &Row, build: Option<u64>) -> String {
 /// The epilogue for a child a signal stopped: it printed no verdict, so this line says
 /// what stays, and the retry.
 #[must_use]
-pub fn stopped_line(row: &Row, build: Option<u64>) -> String {
+pub fn stopped_line(row: &VendorSpec, build: Option<u64>) -> String {
     let p = row.program;
     format!(
         "atpkg: the {p} check was stopped before it finished — {p} {} stays; `{p} {}` tries \
@@ -578,19 +405,19 @@ pub fn stopped_line(row: &Row, build: Option<u64>) -> String {
     )
 }
 
-/// The epilogue for exit 75, stderr, after the child's lock sentence: another pass — the
-/// window's own update, or a typed verb — held the store for the whole `bound`
-/// ([`wait_words`]: `30 min` for the production [`WAIT_LOCK_SECS`]) and IS the one
-/// moving packages; the build stays until it finishes. What turns "refusing to mutate
-/// the store concurrently" into "the update you asked for is already running".
+/// The epilogue for exit 75, stderr, after the child's lock sentence: another pass held the
+/// store for the whole `bound` and is doing the update; the build stays until it finishes.
 #[must_use]
-pub fn contended_line(row: &Row, build: Option<u64>, bound: u64, holder_is_person: bool) -> String {
+pub fn contended_line(
+    row: &VendorSpec,
+    build: Option<u64>,
+    bound: u64,
+    holder_is_person: bool,
+) -> String {
     let p = row.program;
-    // On a person's terminal the child prints nothing on a timed-out wait, so there this
-    // line is the whole report: who holds the store, the wait spent, what stays, and the
-    // retry. The holder record marks a person only for a typed verb without
-    // `--wait-lock`; an intercept child (another `claude update`) or a piped verb is not
-    // marked, so an unmarked holder is named neutrally.
+    // On a person's terminal the child prints nothing on a timed-out wait, so this line is
+    // the whole report. The holder record marks a person only for a typed verb without
+    // `--wait-lock`, so an unmarked holder is named neutrally.
     let holder = if holder_is_person {
         "another `aterm pkg` command"
     } else {
@@ -605,9 +432,8 @@ pub fn contended_line(row: &Row, build: Option<u64>, bound: u64, holder_is_perso
     )
 }
 
-/// A wait bound as a person reads it: `N s` under two minutes, else `N min` — `30 min`
-/// for [`WAIT_LOCK_SECS`], `1 s` for the in-process test's bound — with a remainder
-/// spelled out (`2 min 30 s`), so the line never rounds what the child actually waited.
+/// A wait bound as a person reads it: `N s` under two minutes, else `N min` with any
+/// remainder spelled out (`2 min 30 s`), so the line never rounds the wait.
 pub(crate) fn wait_words(secs: u64) -> String {
     if secs < 120 {
         let mut s = secs.to_string();
@@ -625,11 +451,10 @@ pub(crate) fn wait_words(secs: u64) -> String {
 }
 
 /// The prefix cross-check refusal, stderr, exit 2, nothing run: the twin's operand names
-/// one store, `store::resolve_configured` in this environment names another (a shell
-/// whose `HOME` or `aterm.toml` differs from the one the twin was laid for) — and a
-/// child `update` would move THAT store, not the one this twin runs.
+/// one store and `store::resolve_configured` here another (a different `HOME` or
+/// `aterm.toml`), and a child `update` would move the wrong one.
 #[must_use]
-pub fn prefix_mismatch_line(row: &Row, operand: &Path, resolved: &Path) -> String {
+pub fn prefix_mismatch_line(row: &VendorSpec, operand: &Path, resolved: &Path) -> String {
     let p = row.program;
     format!(
         "atpkg: this {p} lives under {} but atpkg here resolves {} — run `aterm pkg update \
@@ -639,8 +464,8 @@ pub fn prefix_mismatch_line(row: &Row, operand: &Path, resolved: &Path) -> Strin
     )
 }
 
-/// The spawn failure, stderr, exit 126 — the `could not run` shape `cmd_landing` prints
-/// for a failed exec, plus the typed spelling of the same check.
+/// The spawn failure, stderr, exit 126: `cmd_landing`'s `could not run` shape plus the
+/// typed spelling of the same check.
 #[must_use]
 pub fn could_not_run_line(atpkg: &Path, program: &str, err: &io::Error) -> String {
     format!(
@@ -651,17 +476,13 @@ pub fn could_not_run_line(atpkg: &Path, program: &str, err: &io::Error) -> Strin
 }
 
 /// The `which` surface's trailing sentence for a rostered agent program: `` `claude
-/// update` here runs `aterm pkg update claude` `` — appended for every rostered member
-/// whether or not its shim exports an env (codex exports none, so `ShimEnv::fix_line`
-/// is `None` there and could not carry it). "Here" is shell-local, and `cli::which_line`
-/// appends it only where it is true (review, 2026-09-19): the laid `agents/` twin is
-/// current AND carries the hand-over (`cli::agent_twin_intercepts` — so never the `.cmd`
-/// twin, never a twin from before the block) AND `agents/` is on THIS shell's `PATH`; a
-/// shell whose `PATH` holds only `bin/` runs `bin/<program>`, which carried no block until
-/// 2026-10-02 (`claude update` there was the vendor's updater) and is not what the
-/// predicate reads, so the sentence is withheld there — an under-claim.
+/// update` here runs `aterm pkg update claude` ``, separate from `ShimEnv::fix_line`, which
+/// is `None` for a program that exports no env. `cli::which_line` appends it only where it
+/// is true: the laid `agents/` twin is current and carries the hand-over
+/// (`cli::agent_twin_intercepts`, so never the `.cmd` twin) and `agents/` is on this
+/// shell's `PATH`. A shell with only `bin/` gets no sentence, an under-claim.
 #[must_use]
-pub fn which_sentence(row: &Row) -> String {
+pub fn which_sentence(row: &VendorSpec) -> String {
     let p = row.program;
     format!("`{p} {}` here runs `aterm pkg update {p}`", lead_verb(row))
 }
@@ -674,55 +495,27 @@ mod tests {
         v.iter().map(|s| (*s).to_string()).collect()
     }
 
-    fn claude() -> &'static Row {
+    fn claude() -> &'static VendorSpec {
         row_for("claude").unwrap()
     }
 
-    fn codex() -> &'static Row {
+    fn codex() -> &'static VendorSpec {
         row_for("codex").unwrap()
     }
 
-    /// THE ROSTER IS THE AGENT PROGRAMS, both directions, in the same order — a new
-    /// agent member must decide here whether it has a self-updater (a row with
-    /// `verbs: &[]` says "no" out loud). Every verb is a `case`-pattern-safe word, unique
-    /// within its row, and every row carries a dated measurement.
+    /// Each row's verbs are `case`-pattern-safe words, unique within the row, and so is its
+    /// program (the note line holds it).
     #[test]
-    fn the_roster_is_the_agent_programs_and_every_verb_is_a_shell_word() {
-        let rostered: Vec<&str> = ROSTER.iter().map(|r| r.program).collect();
-        assert_eq!(
-            rostered,
-            crate::stub::AGENT_PROGRAMS,
-            "same members, same order"
-        );
-        for row in ROSTER {
-            assert!(
-                crate::stub::is_agent_program(row.program),
-                "{} is not an agent program",
-                row.program
-            );
-            assert!(
-                !row.verbs.is_empty(),
-                "{}: verbs (today both have one)",
-                row.program
-            );
+    fn every_self_update_verb_is_a_shell_word() {
+        for row in crate::vendor_direct::VENDORS {
             let mut seen = std::collections::BTreeSet::new();
-            for v in row.verbs {
+            for v in row.self_update_verbs {
                 assert!(is_shell_safe_verb(v), "{}: {v:?}", row.program);
                 assert!(seen.insert(*v), "{}: {v} twice", row.program);
             }
             assert!(
                 is_shell_safe_verb(row.program),
                 "the note line holds the program"
-            );
-            assert!(
-                row.measured.contains("2026-09-19"),
-                "{}: dated",
-                row.program
-            );
-            assert!(
-                crate::vendor_direct::spec(row.program).is_some(),
-                "{}: its lines name the vendor table's product and vendor",
-                row.program
             );
         }
         assert_eq!(verbs_of("claude"), &["update", "upgrade", "install"]);
@@ -733,8 +526,7 @@ mod tests {
         for ok in ["update", "upgrade", "install", "self-update", "v2"] {
             assert!(is_shell_safe_verb(ok), "{ok}");
         }
-        // `esac` is the one regex-admitted word that breaks a `case` pattern (measured
-        // 2026-09-19: a parse error in sh, bash, dash, zsh and ksh, the tool never run).
+        // `esac` is the one regex-admitted word that breaks a `case` pattern.
         for bad in [
             "", "Update", "up|date)", "up date", "*", "-x", "2go", "cl'aude", "a\n", "esac",
         ] {
@@ -753,13 +545,8 @@ mod tests {
         );
     }
 
-    /// THE CLASSIFICATION TABLE, one assertion per rule of [`classify`]'s doc, negative
-    /// controls included: the first token exactly (`--bare update`, `-p update`,
-    /// `-- update` and the word `help` all pass through), help before every shape
-    /// (`upgrade -x --help`), a `--help` behind the user's own `--` is data (and
-    /// `update` takes no operands, so it is declined), the closed `install` set each at
-    /// most once, `stable` a channel, a digit or `v`+digit a version, anything else a
-    /// shape — and codex, whose row carries only `update`.
+    /// One assertion per rule of [`classify`]'s doc, negative controls included, and codex,
+    /// whose row carries only `update`.
     #[test]
     fn classify_is_the_first_token_exactly_and_help_never_checks() {
         let c = claude();
@@ -869,7 +656,7 @@ mod tests {
                 rest: &rest
             })
         );
-        // A NON-VACUITY control on the help rule: without the `-h` the same argv checks.
+        // Without the `-h` the same argv checks.
         assert!(matches!(
             classify(c, &a(&["install", "latest"])),
             Verdict::Check { .. }
@@ -881,16 +668,9 @@ mod tests {
         assert!(!looks_like_version(""));
     }
 
-    /// EVERY LINE, BYTE-EXACT, for claude and codex: the announce for the three typed
-    /// shapes, the three declines, help, disabled, incomplete, contended (the production
-    /// bound 1800 rendered `30 min`, a test's 1 rendered `1 s`, build Some and None),
-    /// prefix mismatch, could-not-run, and the `which` sentence. Every line starts
-    /// `atpkg: ` (the `which` sentence is the one that does not: it is appended to a
-    /// `which` row, which carries no prefix), names the program only through its row,
-    /// names NO environment variable (owner, 2026-09-19: no env knobs; the first cut's
-    /// declined and disabled lines advertised an escape hatch and its contended line a
-    /// wait knob, and both are gone), and a hostile target — a newline, quotes, 200
-    /// bytes — is escaped and capped before it reaches a terminal.
+    /// Every line, byte-exact, for claude and codex. Each starts `atpkg: ` (the `which`
+    /// sentence, appended to a `which` row, does not), names the program only through its
+    /// row, names no environment variable, and escapes and caps a hostile target.
     #[test]
     fn every_line_is_exact() {
         let c = claude();
@@ -898,11 +678,8 @@ mod tests {
         let v2_1_280 = crate::vendor_direct::Version::parse("2.1.280")
             .unwrap()
             .build_id();
-        // The announce line: what you HAVE, from the active build alone — the version of
-        // a vendor-direct build, `build N` for a legacy index build, `(no version
-        // recorded)` with none — then the check running now and its verb; the words
-        // typed are not echoed. Under 180 bytes in every render (the 2026-09-19 line
-        // was 315, the 2026-09-22 one 200).
+        // The announce line: what you have, then the check running now and its verb; the
+        // words typed are not echoed, and every render stays under 180 bytes.
         assert_eq!(
             announce_line(c, "2.1.280"),
             "atpkg: aterm updates Claude Code from Anthropic — you have 2.1.280; checking now: \
@@ -923,10 +700,9 @@ mod tests {
             "atpkg: aterm updates Codex CLI from OpenAI — you have 0.156.0; checking now: \
              `aterm pkg update codex`"
         );
-        // The words are the vendor-direct module's, offline: a vendor-direct build id
-        // decodes to its version, a legacy index build renders as `build N` unless an
-        // earlier pass recorded its version in the program stamp, none is `(no version
-        // recorded)` — `have_words` over an empty layout, so no stamp.
+        // `have_words` over an empty layout (no program stamp): a vendor-direct build id
+        // decodes to its version, a legacy index build is `build N`, none is
+        // `(no version recorded)`.
         let empty = crate::store::Layout {
             prefix: std::env::temp_dir().join(format!("atpkg-announce-{}", std::process::id())),
         };
@@ -1051,8 +827,7 @@ mod tests {
             "atpkg: another `aterm pkg` command is still running after 1 s — codex (no version \
              recorded) stays; `codex update` again when it finishes"
         );
-        // Every line: state first, the one action, at most one caveat — and none longer
-        // than the announce line's own bound.
+        // No line over 230 bytes, and none names the mechanism.
         for line in [
             declined_line(
                 c,
@@ -1073,8 +848,7 @@ mod tests {
                 "no mechanism words: {line}"
             );
         }
-        // The bound as a person reads it: seconds under two minutes, else minutes, a
-        // remainder spelled out — never rounded.
+        // The bound as a person reads it, the remainder never rounded.
         for (secs, words) in [
             (1, "1 s"),
             (60, "60 s"),
@@ -1208,10 +982,8 @@ mod tests {
         assert!(contended_line(x, None, 5, false).contains("after 5 s "));
     }
 
-    /// The child's argv: the standard update with the FIXED bound — `update <program>
-    /// --wait-lock 1800` in production ([`WAIT_LOCK_SECS`]), the pair always present (a
-    /// held store is always waited for; there is no `0` and no knob), never the window's
-    /// `--progress-file` — and the executable decides the leading verb.
+    /// The child's argv: the standard update with the fixed bound, never the window's
+    /// `--progress-file`, and the executable decides the leading verb.
     #[test]
     fn the_child_argv_is_the_standard_update_with_the_fixed_wait() {
         assert_eq!(
@@ -1229,11 +1001,8 @@ mod tests {
                 .any(|s| s.contains("progress")),
             "never the window's --progress-file"
         );
-        // The executable decides the leading verb: an `atpkg`-named one (the thin bin,
-        // the bundle's argv0 alias, `.exe` or not) takes the argv verbatim; the one
-        // binary under its own name — or any other — takes it behind `pkg`, because the
-        // front door reads a bare `update` as aterm's app-update lane (measured: exit 2,
-        // `unknown update sub-command "claude"`).
+        // An `atpkg`-named executable takes the argv verbatim; any other takes it behind
+        // `pkg`, because the front door reads a bare `update` as aterm's app-update lane.
         for atpkg in [
             "/Applications/aterm.app/Contents/MacOS/atpkg",
             "/x/target/debug/atpkg",

@@ -4,23 +4,20 @@
 //! A `--headless` launch must never become an app at all — not one that can
 //! take the keyboard, and not one LaunchServices or the WindowServer knows.
 //!
-//! HISTORY, two rungs. Until 2026-09-21 `aterm --headless` built the real
-//! AppKit event loop, and for an UNBUNDLED binary winit's
-//! `applicationDidFinishLaunching:` made it a REGULAR app
-//! (`setActivationPolicy:`) and sent `activateIgnoringOtherApps:YES`. Every
-//! conformance probe and every headless test in this directory launches that
-//! binary, dozens of times per `tools/verify.sh` run, and each launch yanked
-//! keyboard focus from whatever the developer was typing into while owning no
-//! window at all. `aterm_gui::launch_posture` made it `Prohibited`. That still
-//! built an `NSApplication`, whose initialisation checks the process in with
-//! LaunchServices and opens its WindowServer connection — which makes
-//! WindowServer run a synchronous TCC preflight of the binary on its main
-//! thread (AGENTS.md). Since 2026-09-26 headless builds winit's
-//! display-free loop (`vendor/winit/src/platform_impl/macos/headless.rs`), which
-//! never creates the application object, so LaunchServices holds NO record for
-//! the pid: `policy=none`. That is what this pins now; the `Prohibited` value it
-//! pinned before is what a regression back to the AppKit loop would read, and it
-//! fails here. (`window_server_census_live_headless.rs` reads the WindowServer
+//! WHY. Every conformance probe and every headless test in this directory
+//! launches the binary, dozens of times per test run. On the AppKit event loop
+//! an UNBUNDLED binary is made a REGULAR app by winit's
+//! `applicationDidFinishLaunching:` (`setActivationPolicy:`) and activated
+//! (`activateIgnoringOtherApps:YES`), yanking keyboard focus from whatever the
+//! developer is typing into; and even a `Prohibited` `NSApplication` checks the
+//! process in with LaunchServices and opens its WindowServer connection — which
+//! makes WindowServer run a synchronous TCC preflight of the binary on its main
+//! thread (AGENTS.md). So headless builds winit's display-free loop
+//! (`crates/aterm-window/src/platform_impl/macos/headless.rs`), which never
+//! creates the application object, and LaunchServices holds NO record for the
+//! pid: `policy=none`, which this pins. A regression back to the AppKit loop
+//! reads `Prohibited` and fails here.
+//! (`window_server_census_live_headless.rs` reads the WindowServer
 //! half from tccd's log.) This is the only kind of test that can see it, because
 //! the effect lives in LaunchServices and the WindowServer, not inside the
 //! process.
@@ -45,6 +42,10 @@
 //! carry their own `athl` prefix, distinct from every other file in the suite.
 
 #![cfg(target_os = "macos")]
+#![allow(
+    clippy::disallowed_types,
+    reason = "test code: a stand-in child may inherit descriptors"
+)]
 
 use std::io::Read;
 use std::path::Path;
@@ -278,9 +279,8 @@ fn probe(tool: &ProbeTool, pid: u32) -> Result<Posture, String> {
 }
 
 /// The one honest reason this test cannot run at all, as a SKIP reason: no
-/// probe tool. (The gate's `--no-windows` is the windowed stages' opt-out;
-/// this test opens no window, so it has none — until 2026-09-24 it read the
-/// `ATERM_SKIP_GUI_SMOKE` export a flag replaced.) A missing WindowServer session
+/// probe tool. (`verify --no-windows` is the windowed checks' opt-out; this
+/// test opens no window, so it has none.) A missing WindowServer session
 /// (an SSH login, a CI box) is deliberately NOT a skip — `ioreg -c IOHIDSystem`
 /// exits 0 whether or not the class matches, so the `gui_smoke_unavailable`
 /// rung it would copy never fires, and skipping on `SSH_CONNECTION` would

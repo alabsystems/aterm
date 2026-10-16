@@ -235,7 +235,7 @@ impl InputLedger {
     /// Move every stamp (each run's and the birth) `by` into the past,
     /// saturating: the history ages together, so every bound stays a lower bound.
     /// Tests only ([`crate::sink::SinkWriter::backdate_input_for_testing`]).
-    #[cfg(any(test, feature = "testing"))]
+    #[cfg(any(test, debug_assertions))]
     pub fn backdate(&mut self, by: Duration) {
         let back = |at: Instant| at.checked_sub(by).unwrap_or(at);
         self.born = back(self.born);

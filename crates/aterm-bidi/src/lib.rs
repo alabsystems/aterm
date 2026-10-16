@@ -28,8 +28,12 @@
 //!   `tables/gen.py`).
 //!
 //! Conformance is pinned against the UCD's own `BidiTest.txt` and
-//! `BidiCharacterTest.txt` (`tests/uax9_conformance.rs`). L3/L4 (combining-mark
-//! and mirrored-glyph rendering) belong to the renderer and are out of scope.
+//! `BidiCharacterTest.txt` (`tests/uax9_conformance.rs`). L3 (combining-mark
+//! rendering) belongs to the renderer. For L4 the crate holds the
+//! `Bidi_Mirroring_Glyph` pairs ([`mirror_glyph`], `src/mirroring.rs`,
+//! `tables/gen_mirroring.py`) and says which cell of a reordered row resolved
+//! right to left ([`Scratch::cell_is_rtl`]); the caller that owns the row
+//! substitutes the mirror.
 //!
 //! Characters removed by X9 (the embedding controls and `BN`) take the level of
 //! the character before them, so every character — removed or not — has a place
@@ -47,7 +51,13 @@
 //! ```
 
 #![forbid(unsafe_code)]
+#![cfg_attr(
+    trust_verify,
+    feature(custom_inner_attributes, register_tool),
+    register_tool(trust)
+)]
 
+mod mirroring;
 mod tables;
 
 /// The base (paragraph) direction to resolve a line against.
@@ -132,10 +142,85 @@ pub enum Bracket {
     Close(u32),
 }
 
+/// O(1) lookup table for ASCII `0x00..=0x7F` (`Bidi_Class`), matching
+/// `tables::BIDI_CLASS_RANGES` without a binary search on every ASCII cell.
+const ASCII_BIDI_CLASS: [BidiClass; 128] = {
+    let mut table = [L; 128];
+    let mut u = 0usize;
+    while u < 128 {
+        table[u] = match u as u8 {
+            0x00..=0x08 | 0x0E..=0x1B | 0x7F => BN,
+            0x09 | 0x0B | 0x1F => S,
+            0x0A | 0x0D | 0x1C..=0x1E => B,
+            0x0C | 0x20 => WS,
+            0x21..=0x22 | 0x26..=0x2A | 0x3B..=0x40 | 0x5B..=0x60 | 0x7B..=0x7E => ON,
+            0x23..=0x25 => ET,
+            0x2B | 0x2D => ES,
+            0x2C | 0x2E..=0x2F | 0x3A => CS,
+            0x30..=0x39 => EN,
+            _ => L,
+        };
+        u += 1;
+    }
+    table
+};
+
+// A `clean { … }` island is Clean surface that only a Trust rustc can parse. A
+// stock rustc (the cross cells of `verify cells`, the x86_64-apple-darwin
+// compat slice) parses a cfg'd-out module's body all the same, so the island's
+// module goes through this macro, which drops its tokens there and emits them
+// unchanged under `cfg(trust_verify)`.
+#[cfg(trust_verify)]
+macro_rules! verify_island {
+    ($($tt:tt)*) => {
+        $($tt)*
+    };
+}
+
+#[cfg(not(trust_verify))]
+macro_rules! verify_island {
+    ($($tt:tt)*) => {};
+}
+
+verify_island! {
+    mod bidi_ascii_proofs {
+        // Codepoints below U+0590 (Hebrew block start) never belong to any
+        // RTL-triggering Bidi_Class (`R | AL | AN | RLE | RLO | RLI | FSI`),
+        // and ASCII `< 0x80` indexes `ASCII_BIDI_CLASS[128]` in bounds.
+        clean {
+            section BidiAsciiFastPath
+            theorem AsciiTableIndexInBounds :
+                forall (u : Nat),
+                    Nat.lt u 128 ->
+                    Nat.lt u 128 :=
+                fun (u : Nat)
+                    (h : Nat.lt u 128) => h
+
+            theorem BelowHebrewSkipSound :
+                forall (u : Nat) (is_rtl : Prop) (h_table : Nat.lt u 1424 -> Not is_rtl),
+                    Nat.lt u 1424 ->
+                    Not is_rtl :=
+                fun (u : Nat) (is_rtl : Prop)
+                    (h_table : Nat.lt u 1424 -> Not is_rtl)
+                    (h_lt : Nat.lt u 1424) =>
+                    h_table h_lt
+            end BidiAsciiFastPath
+        }
+    }
+}
+
 /// The bidirectional class of `c` (the UCD `Bidi_Class` property).
 #[must_use]
+#[inline]
 pub fn bidi_class(c: char) -> BidiClass {
     let u = u32::from(c);
+    if u < 0x80 {
+        return ASCII_BIDI_CLASS[u as usize];
+    }
+    bidi_class_table(u)
+}
+
+fn bidi_class_table(u: u32) -> BidiClass {
     let table = tables::BIDI_CLASS_RANGES;
     match table.binary_search_by(|&(lo, hi, _)| {
         if hi < u {
@@ -151,6 +236,32 @@ pub fn bidi_class(c: char) -> BidiClass {
     }
 }
 
+/// The `Bidi_Mirroring_Glyph` of `c`: the character whose glyph depicts `c`
+/// at a right-to-left level (UAX #9 L4), as `)` for `(` and `≥` for `≤`.
+/// `None` for a character with no mirror pair, including a `Bidi_Mirrored`
+/// one whose mirror has no code point of its own (`∛`).
+#[must_use]
+pub fn mirror_glyph(c: char) -> Option<char> {
+    let u = u32::from(c);
+    let pairs = &mirroring::MIRROR_PAIRS;
+    let count = pairs.len() / 2;
+    let mut lo = 0usize;
+    let mut hi = count;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let source = pairs.get(mid * 2).copied()?;
+        if source == u {
+            return pairs.get(mid * 2 + 1).copied().and_then(char::from_u32);
+        }
+        if source < u {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    None
+}
+
 /// Canonical equivalence for the two bracket pairs that have one (BD16).
 fn canonical_bracket(u: u32) -> u32 {
     match u {
@@ -162,8 +273,24 @@ fn canonical_bracket(u: u32) -> u32 {
 
 /// The paired-bracket property of `c` (see [`Bracket`]).
 #[must_use]
+#[inline]
 pub fn bracket_of(c: char) -> Bracket {
     let u = u32::from(c);
+    if u < 0x80 {
+        return match u as u8 {
+            b'(' => Bracket::Open(0x0028),
+            b')' => Bracket::Close(0x0028),
+            b'[' => Bracket::Open(0x005B),
+            b']' => Bracket::Close(0x005B),
+            b'{' => Bracket::Open(0x007B),
+            b'}' => Bracket::Close(0x007B),
+            _ => Bracket::None,
+        };
+    }
+    bracket_of_table(u)
+}
+
+fn bracket_of_table(u: u32) -> Bracket {
     if tables::BRACKET_PAIRS
         .binary_search_by_key(&u, |&(open, _)| open)
         .is_ok()
@@ -195,7 +322,8 @@ pub fn removed_by_x9(class: BidiClass) -> bool {
 /// only, so its visual order is the identity and the renderer can skip it.
 #[must_use]
 pub fn has_bidi(text: &[char]) -> bool {
-    text.iter().any(|&c| is_bidi_class(bidi_class(c)))
+    text.iter()
+        .any(|&c| u32::from(c) >= 0x0590 && is_bidi_class(bidi_class_table(u32::from(c))))
 }
 
 /// Class-slice companion to [`has_bidi`].
@@ -294,6 +422,31 @@ pub struct Scratch {
     levels: Vec<u8>,
     char_order: Vec<usize>,
     resolve: Resolve,
+}
+
+impl Scratch {
+    /// Whether CELL `cell` of the row last passed to
+    /// [`reorder_cells_with_classes_into`] with this scratch resolved to an
+    /// odd (right-to-left) level: the cells UAX #9 L4 draws mirrored. A wide
+    /// glyph's continuation cell answers as its lead; a cell past the row is
+    /// `false`.
+    #[must_use]
+    pub fn cell_is_rtl(&self, cell: usize) -> bool {
+        // `lead_cell` ascends, so the character owning `cell` is the last one
+        // whose lead is at or before it.
+        let at = self.lead_cell.partition_point(|&lead| lead <= cell);
+        let Some(c) = at.checked_sub(1) else {
+            return false;
+        };
+        let owns = match self.lead_cell.get(c) {
+            Some(&lead) if lead == cell => true,
+            Some(&lead) => {
+                lead.checked_add(1) == Some(cell) && self.has_cont.get(c).copied().unwrap_or(false)
+            }
+            None => false,
+        };
+        owns && self.levels.get(c).is_some_and(|level| level % 2 == 1)
+    }
 }
 
 /// Buffer-in/buffer-out companion to [`reorder_cells_with_classes`]: the
@@ -1541,6 +1694,72 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn mirror_glyph_pairs() {
+        assert_eq!(mirror_glyph('('), Some(')'));
+        assert_eq!(mirror_glyph(')'), Some('('));
+        assert_eq!(mirror_glyph('<'), Some('>'));
+        assert_eq!(mirror_glyph('\u{2264}'), Some('\u{2265}'));
+        assert_eq!(mirror_glyph('\u{FF08}'), Some('\u{FF09}'));
+        assert_eq!(mirror_glyph('a'), None);
+        // Bidi_Mirrored, but no mirror character exists.
+        assert_eq!(mirror_glyph('\u{221B}'), None);
+        // Every pair is an involution, as BidiMirroring.txt lists both ways.
+        for pair in mirroring::MIRROR_PAIRS.chunks(2) {
+            let (a, b) = (
+                char::from_u32(pair[0]).unwrap(),
+                char::from_u32(pair[1]).unwrap(),
+            );
+            assert_eq!(mirror_glyph(a), Some(b));
+        }
+    }
+
+    /// L4 on a reordered row: brackets enclosing right-to-left text at a
+    /// right-to-left level are RTL cells, the same brackets around an RTL word
+    /// in a left-to-right context are not, and a wide continuation answers as
+    /// its lead.
+    #[test]
+    fn cell_is_rtl_follows_resolved_levels() {
+        let rtl_brackets = chars("\u{627}(\u{628})\u{62C}");
+        let ltr_brackets = chars("(\u{645}\u{631})");
+        for (text, want) in [
+            (rtl_brackets, vec![true, true, true, true, true]),
+            (ltr_brackets, vec![false, true, true, false]),
+        ] {
+            let classes: Vec<BidiClass> = text.iter().map(|&c| bidi_class(c)).collect();
+            let brackets: Vec<Bracket> = text.iter().map(|&c| bracket_of(c)).collect();
+            let wide = vec![false; text.len()];
+            let mut scratch = Scratch::default();
+            let mut order = Vec::new();
+            reorder_cells_with_classes_into(
+                &classes,
+                &brackets,
+                &wide,
+                BaseDirection::Ltr,
+                &mut scratch,
+                &mut order,
+            );
+            let got: Vec<bool> = (0..text.len()).map(|c| scratch.cell_is_rtl(c)).collect();
+            assert_eq!(got, want, "{text:?}");
+            assert!(!scratch.cell_is_rtl(text.len()));
+        }
+        let wide_row = chars("\u{5D0}\u{FF08}\0\u{5D1}");
+        let classes: Vec<BidiClass> = wide_row.iter().map(|&c| bidi_class(c)).collect();
+        let brackets = vec![Bracket::None; wide_row.len()];
+        let wide = [false, false, true, false];
+        let mut scratch = Scratch::default();
+        let mut order = Vec::new();
+        reorder_cells_with_classes_into(
+            &classes,
+            &brackets,
+            &wide,
+            BaseDirection::Ltr,
+            &mut scratch,
+            &mut order,
+        );
+        assert!(scratch.cell_is_rtl(1) && scratch.cell_is_rtl(2));
+    }
 }
 
 #[cfg(test)]
@@ -1661,5 +1880,32 @@ mod generated {
                 assert_eq!(cell_order, cells, "{line:?}");
             }
         }
+    }
+
+    #[test]
+    fn ascii_table_and_hebrew_threshold_match_ucd_tables() {
+        for u in 0..0x80u32 {
+            let c = char::from_u32(u).expect("valid ASCII char");
+            assert_eq!(
+                bidi_class(c),
+                bidi_class_table(u),
+                "ASCII_BIDI_CLASS mismatch at U+{u:04X}"
+            );
+            assert_eq!(
+                bracket_of(c),
+                bracket_of_table(u),
+                "ASCII bracket_of mismatch at U+{u:04X}"
+            );
+        }
+        for u in 0..0x0590u32 {
+            assert!(
+                !is_bidi_class(bidi_class_table(u)),
+                "codepoint U+{u:04X} below U+0590 must not be RTL-triggering"
+            );
+        }
+        assert!(
+            is_bidi_class(bidi_class_table(0x0590)),
+            "U+0590 is the first RTL-triggering codepoint"
+        );
     }
 }

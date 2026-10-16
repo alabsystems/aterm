@@ -1,40 +1,27 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The `video … keys` self-evaluation: correlate pre-routing input attempts
-//! against the frames this recording actually captured.
+//! The `video … keys` self-evaluation: correlate pre-routing input attempts against the
+//! frames this recording captured.
 //!
-//! # What this instrument can and cannot say
+//! It is a sampling instrument: a key's effect is seen at the next captured frame, so every
+//! reading is bounded below by the recorder's sampling grid, published beside it
+//! (`capture_floor_ms`). Two limits are disclosed in band; neither filters anything (every
+//! correlated attempt stays in `n` and the percentiles):
 //!
-//! It is a sampling instrument: it sees the terminal only on captured frames,
-//! so a key's effect is noticed at the next captured frame, never when the
-//! pixels changed. Every reading is bounded below by the recorder's sampling
-//! grid, and that bound is published beside it (`capture_floor_ms`).
+//! 1. **The capture floor.** At `N` fps an attempt waits up to `1000/N` ms for the next
+//!    look, so a 1 ms and a 15 ms echo read the same at 30 fps. Field names say
+//!    `frame_change` or `capture_`, never latency; `at_capture_floor_n` counts readings that
+//!    are a bound rather than a measurement.
+//! 2. **Cross-attribution during sustained typing.** The observed change is the first
+//!    fingerprint move after the attempt, often the previous key's echo, so readings come
+//!    out faster than reality. A fingerprint cannot say which key moved it, but the cadence
+//!    is observable: when `attempt_gap_p50_ms` is no slower than `frame_change_max_ms`,
+//!    `attempts_outpace_readings` flags the take as ambiguous.
 //!
-//! Two limits are disclosed in band:
-//!
-//! 1. **The capture floor.** At `N` fps an attempt waits up to `1000/N` ms for
-//!    the recorder's next look, so a 1 ms and a 15 ms echo read the same at
-//!    30 fps. Field names say `frame_change` or `capture_`, never latency, and
-//!    `at_capture_floor_n` counts readings that are a bound rather than a
-//!    measurement.
-//!
-//! 2. **Cross-attribution during sustained typing.** The observed change is
-//!    the first whole-frame fingerprint move after the attempt, which while
-//!    typing is often the previous key's echo, so readings come out faster
-//!    than reality. This is not detectable per attempt (a fingerprint cannot
-//!    say which key moved it). What is observable is the cadence:
-//!    `attempt_gap_p50_ms` against `frame_change_max_ms`. When keys arrive no
-//!    slower than the readings, `attempts_outpace_readings` flags the whole
-//!    take as ambiguous.
-//!
-//! Neither disclosure filters anything: every correlated attempt stays in `n`
-//! and in the percentiles.
-//!
-//! Key→photon latency is out of reach here. The nearest instrument is `ctl
-//! metrics percentiles` (`input_p50/p95/p99_ms`), sampled per keystroke with
-//! no sampling floor; it stops at present return, and its own bounds are
-//! documented on `crate::control::control_query::cmd_metrics`.
+//! Key→photon latency is out of reach here. The nearest instrument is `ctl metrics
+//! percentiles` (`input_p50/p95/p99_ms`), sampled per keystroke, with its bounds documented
+//! on `crate::control::control_query::cmd_metrics`.
 
 /// One correlated attempt, before it is rendered to JSON.
 struct Correlated {
@@ -60,7 +47,7 @@ fn us_to_ms(us: u64) -> f64 {
     us as f64 / 1000.0
 }
 
-/// `p` as a fractional index into a sorted slice (`len/2` for p50).
+/// The `numer/denom` quantile of a sorted slice (`1, 2` is p50).
 fn pct(sorted: &[f64], numer: usize, denom: usize) -> f64 {
     sorted[(sorted.len() * numer / denom).min(sorted.len() - 1)]
 }
@@ -237,10 +224,8 @@ pub(crate) fn analysis_block(inputs: &[(u64, String)], frames: &[(u64, u64)]) ->
     let interval_field = capture_interval_us(frames)
         .map(us_to_ms)
         .map_or_else(|| "null".to_string(), |ms| format!("{ms:.1}"));
-    // Ambiguity is stated for the take, not per row: keys arriving no slower
-    // than the readings means some attempt was pressed while a previous one's
-    // change was outstanding, so the set may be shifted by a key. `None` for a
-    // single attempt.
+    // Ambiguity is stated for the take, not per row: keys arriving no slower than the
+    // readings mean a key was pressed while an earlier one's change was outstanding.
     let attempt_gap_ms = attempt_gap_p50_us(inputs).map(us_to_ms);
     let gap_field = attempt_gap_ms.map_or_else(|| "null".to_string(), |ms| format!("{ms:.1}"));
     let outpaced = attempt_gap_ms.is_some_and(|gap| gap <= max);
@@ -296,7 +281,7 @@ mod tests {
 
     /// `(t_us, serialized input row)` — the shape `inputs[]` rows take here.
     type Inputs = Vec<(u64, String)>;
-    /// `(t_us, seq)` — captured frame stamps.
+    /// `(t_us, fingerprint)` captured frames.
     type Frames = Vec<(u64, u64)>;
 
     /// A take from an explicit world model: the terminal echoes `echo_us` after

@@ -2,16 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Tests for the PROTECTED / WIDE_CONTINUATION bit-10 aliasing class.
-//!
-//! The two flags share bit 10, so a raw `contains(WIDE_CONTINUATION)` misfires
-//! on DECSCA-protected cells and a lone `cells[col-1].WIDE` check misfires on a
-//! dangling WIDE head. The row char-op fixups use the context-aware
-//! `is_cell_wide_continuation` (bit 10 on cells[col] and a WIDE head at col-1).
-//! `fixup_wide_boundary`, whose head is already clobbered, keeps the
-//! char == ' ' spacer heuristic for whole-row rect copies but suppresses it
-//! (clear_orphan_spacers=false) for the DECLRMM column shifts, whose orphans the
-//! bounded shift helper already fixed.
+//! PROTECTED and WIDE_CONTINUATION share bit 10. The char-op fixups use the
+//! context-aware `is_cell_wide_continuation` so they never misread a
+//! DECSCA-protected cell as a spacer; `fixup_wide_boundary` keeps its ' '
+//! spacer heuristic only when `clear_orphan_spacers` is set (whole-row rect
+//! copies), not for the DECLRMM column shifts.
 
 use super::*;
 use crate::{Cell, CellFlags, PackedColor, StyleId};
@@ -134,8 +129,8 @@ fn bounded_ich_dch_preserve_protected_cell_outside_the_margin() {
 
 #[test]
 fn fixup_wide_boundary_preserves_protected_visible_cells() {
-    // fixup_wide_boundary's orphan-continuation branches must not blank a
-    // DECSCA-protected VISIBLE cell (non-space) — only genuine ' ' spacers.
+    // The orphan-continuation branches blank only ' ' spacers, never a
+    // protected visible cell.
     let fg = PackedColor::DEFAULT_FG;
     let bg = PackedColor::DEFAULT_BG;
     let _ = (fg, bg);
@@ -241,10 +236,9 @@ fn write_over_a_genuine_wide_continuation_still_clears_the_orphaned_head() {
 
 #[test]
 fn fixup_wide_boundary_suppressed_preserves_protected_spaces() {
-    // The DECLRMM column shifts (DECIC/DECDC/SL/SR/DECBI/DECFI) call
-    // fixup_wide_boundary with clear_orphan_spacers=false, so a protected space
-    // at the boundary (indistinguishable from an orphaned spacer) survives,
-    // including one column past the right margin.
+    // The DECLRMM column shifts pass clear_orphan_spacers=false, so a protected
+    // space at the boundary (indistinguishable from an orphaned spacer)
+    // survives, including one column past the right margin.
     let protected_space = protected(' ');
 
     // Left boundary: protected space at `left`, non-wide left neighbor.

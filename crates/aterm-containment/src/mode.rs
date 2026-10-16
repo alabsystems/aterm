@@ -2,32 +2,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Containment mode enum — the 4 security levels.
-//!
-//! Level encoding: Master=3, User=2, Safety=1, Containment=0 (pinned by the
-//! tests below). Higher value = more capability. Non-escalation means mode can
-//! only decrease or stay the same.
+//! The four containment levels: Master=3, User=2, Safety=1, Containment=0; a higher level
+//! is more capability.
 
 use std::fmt;
 
-/// The 4 containment modes, ordered by decreasing capability.
+/// The 4 containment modes, ordered by capability ([`Self::level`]); the crate-root table says
+/// what each enforces.
 ///
-/// Enforcement is stated in [`crate::actuator`]; the crate-root table
-/// summarises it.
-///
-/// - **Master**: full trust, developer mode. No confinement.
-/// - **User**: the default. No confinement; the shell keeps aterm's own
-///   resource limits.
-/// - **Safety**: resource limits (soft rlimits, which the shell's rc or its
-///   program can raise; the Job Object on Windows), no OS sandbox.
-/// - **Containment**: hostile agent. The macOS Seatbelt sandbox: no network,
-///   writes confined to the temp roots, no read or write of the credential and
-///   private-data stores, plus Safety's limits as hard limits, which the
-///   program cannot raise. Refuses to start where no OS sandbox exists.
-///
-/// Set only by the launcher (`--containment` / `--sandbox` / `--no-sandbox`);
-/// aterm cannot upgrade its own mode, and it is immutable after
-/// initialization.
+/// Set only by the launcher (`--containment` / `--sandbox` / `--no-sandbox`); aterm cannot
+/// upgrade its own mode, and it is immutable after initialization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 #[non_exhaustive]
@@ -62,7 +46,7 @@ impl ContainmentMode {
         }
     }
 
-    /// Parse from string (case-insensitive). Used for flag parsing.
+    /// Parse a mode name, case-insensitively.
     #[must_use]
     pub(crate) fn from_str_loose(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
@@ -77,8 +61,6 @@ impl ContainmentMode {
 
 impl fmt::Display for ContainmentMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // `write_str`, keeping `format_args!` (which the Trust strict gate
-        // cannot always model) out of this MIR.
         f.write_str(self.name())
     }
 }
@@ -99,9 +81,8 @@ impl Ord for ContainmentMode {
 #[derive(Debug, Clone)]
 pub struct ParseModeError(pub(crate) String);
 
-// Hand-written `Display`/`Error`: no runtime-argument `format_args!`, whose
-// unsafe `fmt::Arguments::new` constructor the Trust strict gate's native
-// lowering fails closed on.
+// Hand-written `Display`/`Error`: no runtime-argument `format_args!`, which the Trust strict
+// gate fails closed on.
 impl fmt::Display for ParseModeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("invalid containment mode: ")?;
@@ -158,34 +139,27 @@ mod tests {
         assert_eq!(ContainmentMode::Containment.to_string(), "Containment");
     }
 
-    /// Verify parse rejects inputs that could bypass mode selection.
-    /// An attacker controlling the `--containment` value might try numeric
-    /// values, padding, or similar to escalate.
+    /// Only an exact mode name (any case) parses: no number, padding, prefix or NUL.
     #[test]
     fn test_parse_rejects_bypass_attempts() {
-        // Numeric values (the level encoding) must not be accepted
+        // The level encoding is not a name.
         assert!("0".parse::<ContainmentMode>().is_err());
         assert!("1".parse::<ContainmentMode>().is_err());
         assert!("2".parse::<ContainmentMode>().is_err());
         assert!("3".parse::<ContainmentMode>().is_err());
 
-        // Padding / whitespace
         assert!(" master".parse::<ContainmentMode>().is_err());
         assert!("master ".parse::<ContainmentMode>().is_err());
         assert!("master\n".parse::<ContainmentMode>().is_err());
 
-        // Substring / prefix
         assert!("mast".parse::<ContainmentMode>().is_err());
         assert!("contain".parse::<ContainmentMode>().is_err());
 
-        // Empty
         assert!("".parse::<ContainmentMode>().is_err());
 
-        // Null byte injection
         assert!("master\0".parse::<ContainmentMode>().is_err());
     }
 
-    /// Verify that all 4 display strings round-trip through parse.
     #[test]
     fn test_display_parse_roundtrip() {
         for mode in [
@@ -200,7 +174,6 @@ mod tests {
         }
     }
 
-    /// Verify ParseModeError includes the rejected input for diagnostics.
     #[test]
     fn test_parse_error_includes_input() {
         let err = "bogus".parse::<ContainmentMode>().unwrap_err();

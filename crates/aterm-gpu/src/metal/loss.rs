@@ -393,7 +393,7 @@ mod tests {
     /// the same selectors a real loss would use, and the latch stays unlost.
     #[test]
     fn a_real_completed_command_buffer_reports_completed_and_never_latches() {
-        let Some(dev) = device() else { return };
+        let dev = device();
         let queue = dev.new_command_queue().expect("queue");
         let latch = LossLatch::new();
 

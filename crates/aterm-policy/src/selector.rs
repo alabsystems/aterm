@@ -43,6 +43,7 @@
 
 use core::fmt;
 
+#[cfg(feature = "toml")]
 use serde::{Deserialize, Serialize};
 
 use crate::aliases;
@@ -59,8 +60,9 @@ use crate::aliases;
 /// byte is significant — the byte is carried as the `suffix` field so both
 /// `CSI t` (any `t`) and `CSI 20 t` (parameter `20`, final `t`) can be
 /// expressed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "UPPERCASE")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[cfg_attr(feature = "toml", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "toml", serde(rename_all = "UPPERCASE"))]
 #[non_exhaustive]
 pub enum FunctionKind {
     /// OSC (Operating System Command) — `ESC ]`.

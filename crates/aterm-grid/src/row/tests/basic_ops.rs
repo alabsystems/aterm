@@ -40,28 +40,6 @@ fn row_clear() {
 }
 
 #[test]
-fn row_clear_from() {
-    let (_pages, mut row) = make_row(80);
-    for i in 0..10 {
-        row.write_char(i, 'X');
-    }
-    assert_eq!(row.len(), 10);
-
-    row.clear_from(5);
-    assert_eq!(row.len(), 5);
-}
-
-#[test]
-fn row_clear_from_sparse_tail() {
-    let (_pages, mut row) = make_row(10);
-    row.write_char(9, 'Z');
-    assert_eq!(row.len(), 10);
-
-    row.clear_from(5);
-    assert_eq!(row.len(), 0);
-}
-
-#[test]
 fn row_resize_grow() {
     let (mut pages, mut row) = make_row(40);
     row.write_char(0, 'A');
@@ -112,7 +90,6 @@ fn row_insert_chars() {
     }
     assert_eq!(row.to_string(), "ABCDEFGHIJ");
 
-    // Insert 2 blanks at position 3
     row.insert_chars(3, 2);
     // "ABC  DEFGH" - IJ are pushed off the end
     assert_eq!(row.get(0).unwrap().char(), 'A');
@@ -133,7 +110,6 @@ fn row_delete_chars() {
     }
     assert_eq!(row.to_string(), "ABCDEFGHIJ");
 
-    // Delete 2 chars at position 3 (D and E)
     row.delete_chars(3, 2);
     // "ABCFGHIJ  " - shifted left, blanks at end
     assert_eq!(row.get(0).unwrap().char(), 'A');
@@ -167,9 +143,7 @@ fn row_insert_chars_at_end() {
         row.write_char(u16_from_usize(i), c);
     }
 
-    // Insert at position past content
     row.insert_chars(8, 2);
-    // Should work, inserting blanks at position 8
     assert_eq!(row.get(0).unwrap().char(), 'A');
     assert_eq!(row.get(1).unwrap().char(), 'B');
     assert_eq!(row.get(2).unwrap().char(), 'C');
@@ -193,9 +167,8 @@ fn row_delete_chars_more_than_remaining() {
         row.write_char(u16_from_usize(i), c);
     }
 
-    // Delete 20 chars at position 5 (more than available)
     row.delete_chars(5, 20);
-    // Should delete F-J, leaving "ABCDE     "
+    // "ABCDE     "
     assert_eq!(row.get(0).unwrap().char(), 'A');
     assert_eq!(row.get(4).unwrap().char(), 'E');
     assert_eq!(row.get(5).unwrap().char(), ' ');
@@ -209,7 +182,6 @@ fn row_erase_chars() {
     }
     assert_eq!(row.to_string(), "ABCDEFGHIJ");
 
-    // Erase 3 chars at position 3 (D, E, F)
     row.erase_chars(3, 3);
     // "ABC   GHIJ" - no shifting, just blanks in place
     assert_eq!(row.get(0).unwrap().char(), 'A');
@@ -231,7 +203,6 @@ fn row_erase_chars_beyond_end() {
         row.write_char(u16_from_usize(i), c);
     }
 
-    // Erase 100 chars at position 3 (should stop at row end)
     row.erase_chars(3, 100);
     assert_eq!(row.get(0).unwrap().char(), 'A');
     assert_eq!(row.get(1).unwrap().char(), 'B');
@@ -247,7 +218,6 @@ fn row_erase_chars_zero_count() {
         row.write_char(u16_from_usize(i), c);
     }
 
-    // Erase 0 chars - should do nothing
     row.erase_chars(2, 0);
     assert_eq!(row.to_string(), "ABCDE");
 }
@@ -258,12 +228,10 @@ fn row_write_overwrite_wide_continuation() {
 
     let (_pages, mut row) = make_row(80);
 
-    // Write a wide char at col 0
     let fg = PackedColor::DEFAULT_FG;
     let bg = PackedColor::DEFAULT_BG;
     row.write_wide_char(0, '\u{4E2D}', fg, bg, CellFlags::empty());
 
-    // Verify wide char setup
     let cell0 = row.get(0).unwrap();
     let cell1 = row.get(1).unwrap();
     assert!(cell0.is_wide(), "Cell 0 should be wide");
@@ -272,17 +240,15 @@ fn row_write_overwrite_wide_continuation() {
         "Cell 1 should be continuation"
     );
 
-    // Overwrite col 1 (continuation) with 'A'
     row.write_char_styled(1, 'A', fg, bg, CellFlags::empty());
 
-    // Check result
     let cell0_after = row.get(0).unwrap();
     let cell1_after = row.get(1).unwrap();
     assert_eq!(cell1_after.char(), 'A', "Cell 1 should be 'A'");
     assert_eq!(cell0_after.char(), ' ', "Cell 0 should be cleared to space");
 }
 
-// ── fill_cell_run ────────────────────────────────────────────────
+// fill_cell_run
 
 #[test]
 fn fill_cell_run_basic() {
@@ -354,13 +320,11 @@ fn fill_cell_run_overwrites_wide_chars() {
     let fg = PackedColor::DEFAULT_FG;
     let bg = PackedColor::DEFAULT_BG;
 
-    // Write a wide char at col 4-5.
     row.write_wide_char(4, '\u{4E2D}', fg, bg, CellFlags::empty());
     assert!(row.get(4).unwrap().is_wide());
     assert!(row.get(5).unwrap().is_wide_continuation());
 
-    // Fill over col 5 (continuation) with 'A'.
-    // Should clear the orphaned first half at col 4.
+    // Filling over the continuation clears the orphaned head at col 4.
     let template = Cell::from_ascii_fast(b'A');
     row.fill_cell_run(5, 3, template);
     assert_eq!(

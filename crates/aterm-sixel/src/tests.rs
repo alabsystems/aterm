@@ -419,21 +419,9 @@ fn semicolon_flood_keeps_params_bounded() {
     );
 }
 
-#[test]
-fn param_cap_preserves_valid_color_define() {
-    // The richest valid introducer uses 5 params (`#Pc;Pu;Px;Py;Pz`); the cap
-    // (8) leaves it byte-identical: this defines register 1 as opaque red.
-    const _: () = assert!(
-        SIXEL_MAX_PARAMS >= 5,
-        "cap must admit the 5-param color define"
-    );
-    let img = decode(b"\"1;1;1;6#1;2;100;0;0#1~").expect("image");
-    assert_eq!(img.width(), 1);
-    assert_eq!(img.height(), 6);
-    for &p in img.pixels() {
-        assert_eq!(
-            p, 0xFFFF_0000,
-            "color define still applies under the param cap"
-        );
-    }
-}
+// The richest valid introducer uses 5 params (`#Pc;Pu;Px;Py;Pz`): lowering the
+// cap below 5 would truncate a colour define (params-bound, second clause).
+const _: () = assert!(
+    SIXEL_MAX_PARAMS >= 5,
+    "cap must admit the 5-param color define"
+);

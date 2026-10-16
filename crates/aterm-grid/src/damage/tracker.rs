@@ -12,13 +12,10 @@ pub struct DamageTracker {
     row_bounds: Vec<RowDamageBounds>,
     /// Monotone count of mark calls, including marks that set no new bit.
     ///
-    /// The per-row revision fold (`GridPresentation::fold_row_revisions`) uses
-    /// it to tell a row written again since the last fold from one merely still
-    /// marked; the bitset is identical in both cases.
-    ///
-    /// Survives `clear`, since a rewind would make a later mark compare equal
-    /// to a pre-reset fold. `Damage::Full` has no tracker, so the fold's full
-    /// arm re-stamps unconditionally.
+    /// `GridPresentationState::fold_row_revisions` uses it to tell a row written
+    /// again since the last fold from one merely still marked (the bitset is the
+    /// same). It survives `clear`: a rewind would make a later mark compare equal
+    /// to a pre-reset fold.
     pub(crate) mark_seq: u64,
 }
 
@@ -146,11 +143,9 @@ impl DamageTracker {
         let needed_bounds = rows as usize;
 
         if self.row_bits.len() == needed_words && self.row_bounds.len() == needed_bounds {
-            // Same size: zero in-place — no heap allocation.
             self.row_bits.fill(0);
             self.row_bounds.fill(RowDamageBounds::default());
         } else {
-            // Row count changed (resize): must reallocate.
             self.row_bits.clear();
             self.row_bits.resize(needed_words, 0);
             self.row_bounds.clear();

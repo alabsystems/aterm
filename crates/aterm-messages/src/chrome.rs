@@ -1,93 +1,60 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE WINDOW'S CHROME REGROW FLOOR (design ruling 414) — after a
-//! window's chrome rows ROSE (its grid shrank), no chrome source lets them
-//! FALL (the grid grows back) inside [`CHROME_REGROW_SETTLE`].
+//! The window's chrome regrow floor: after a window's chrome rows rise (its
+//! grid shrinks), no chrome source lets them fall (the grid grows back) inside
+//! [`CHROME_REGROW_SETTLE`].
 //!
-//! A window's chrome rows — the tab strip, the message band and the presence
-//! row — are reserved out of its terminal grid, so every change of their
-//! total re-grids the window: an engine resize and a `SIGWINCH` to every
-//! session it shows. Each source already spaces its OWN fall from its own
-//! rise: the band's D1 hysteresis shrinks only after [`crate::SHRINK_QUIET`]
-//! (1.5 s) of wanting less, and the presence row folds only after
-//! [`crate::presence::FOLD_QUIET`] (1.5 s, ruling 394) — so no source makes a
-//! shrink-then-grow pair by itself. Two sources still did, because neither
-//! law reads the other's rise (measured 2026-09-29 on main `8b24e99a4`, in
-//! real windows, against a stand-in that reads its size 20 ms after the
-//! signal and writes a spinner tick every 5 ms): the presence row BORN 4–6 ms
-//! before the band's own quiet shrink; a band row RISING 11–13 ms before the
-//! presence row's timed fold; a band row rising 3–6 ms before a person's
-//! keypress folds a presence row that has already stood its quiet. On the
-//! alternate screen that net-zero pair shifts every row up one, and a program
-//! that repaints only when its `SIGWINCH` handler reads a CHANGED size (Claude
-//! Code) reads the old size after both and never repaints. The grid's resize
-//! undo (aterm-grid `grid/resize_undo.rs`) makes such a pair an exact identity
-//! only while nothing is written between its halves; the spinner tick between
-//! them drops it, and the screen stayed shifted (3 of 3, 3 of 3 and 2 of 3
-//! runs).
+//! The tab strip, the message band and the presence row are reserved out of
+//! the window's grid, so every change of their total re-grids it. Each source
+//! spaces its own fall from its own rise ([`crate::SHRINK_QUIET`],
+//! [`crate::presence::FOLD_QUIET`]), but neither reads the other's rise, so
+//! two sources can make a shrink-then-grow pair milliseconds apart. On the
+//! alternate screen that pair shifts every row up one, and a program that
+//! repaints only when its `SIGWINCH` handler reads a changed size (Claude
+//! Code) never repaints; the grid's resize undo (aterm-grid
+//! `grid/resize_undo.rs`) restores the screen only when nothing is written
+//! between the halves.
 //!
-//! THE FLOOR. The host notes every RISE of a window's chrome rows
-//! ([`RegrowFloor::rose`]): the presence row's birth on that window, a band
-//! row reaching the glass and a tab-strip rise on every window. A source's
-//! own quiet FALL then also waits the floor, [`RegrowFloor::floor`] —
-//! [`CHROME_REGROW_SETTLE`] past the last rise — through [`fall_allowed`];
-//! the fall's deadline is the later of its own and the floor ([`at_floor`]).
-//! A RISE is never delayed (the grow-then-shrink order is benign: the shrink
-//! trims the blank row the grow appended, so a quiet pair is an exact
-//! identity), and two falls are exempt by name, as they already are from the
-//! sources' own quiet: the WINDOW's (a real window that can no longer afford
-//! a row gets it back at once) and the person's View-menu hide of the
-//! presence band. The tab strip's fall (a person's edit of Settings) is not
-//! floored either: the strip is a host-only source this engine never sees,
-//! so the host notes its rise on every window's floor and re-grids its fall
-//! at once. The band's fall is global — it re-grids every window — so it
-//! waits the LATEST floor of every window with glass ([`latest`]). A window
-//! without glass never re-grids for its chrome, so it has no floor.
+//! The host notes every rise ([`RegrowFloor::rose`]): the presence row's birth
+//! on that window, a band row reaching the glass, and a tab-strip rise on every
+//! window. A source's own quiet fall then also waits the floor
+//! ([`fall_allowed`], [`at_floor`]). A rise is never delayed: grow-then-shrink
+//! trims the blank row the grow appended, an exact identity. Three falls are
+//! not floored: the window's own (it can no longer afford a row), the person's
+//! View-menu hide of the presence band, and the tab strip's (a host-only
+//! source the host re-grids at once). The band's fall re-grids every window,
+//! so it waits the [`latest`] floor of every window with glass; a window
+//! without glass has no floor.
 //!
-//! Clockless like the rest of the engine: every instant is the host's `now`.
-//! The derived model is aterm-spec's `ChromeRegrowFloor`
-//! (`models_chrome_regrow.rs`): `NoQuickRegrow` (no floored fall inside the
-//! settle of the last rise, whichever source rose), `TheAnchorIsTheLastRise`
-//! (the floor counts from the last rise, never re-anchored by another step),
-//! and the liveness `TheGridRegrows` (a waiting fall is applied once its own
-//! quiet and the floor have run).
+//! Every instant is the host's `now`. The derived model is aterm-spec's
+//! `ChromeRegrowFloor` (`models_chrome_regrow.rs`: `NoQuickRegrow`,
+//! `TheAnchorIsTheLastRise`, and the liveness `TheGridRegrows`).
 
 use crate::{Duration, Instant};
 
-/// The least span between a RISE of a window's chrome rows (its grid shrank)
-/// and the next unforced FALL (the grid grows back), whichever sources moved.
+/// The least span between a rise of a window's chrome rows (its grid shrank)
+/// and the next unforced fall, whichever sources moved. 400 ms:
 ///
-/// 400 ms, because:
-///
-/// * the cross-source pairs came 3–13 ms apart, and a program's `SIGWINCH`
-///   handler reads the size 5–30 ms after the signal (Claude Code): 400 ms is
-///   more than ten times the slowest read, so the program has read the shrunk
-///   size, and repainted for it, before the grid grows back — each size the
-///   grid takes is a size it reads;
-/// * it is wider than the resize ledger's run gap (250 ms, `RUN_GAP_MS` in
-///   aterm-gui), so a spaced rise and fall the program drew between are two
-///   runs, each judged for itself; a pair with nothing drawn between still
-///   joins, however late, and the grid's resize undo makes that quiet pair an
-///   identity (`none`);
-/// * it is shorter than every source's own quiet ([`crate::SHRINK_QUIET`],
-///   [`crate::presence::FOLD_QUIET`], both 1.5 s), so a source's own rise is
-///   never the binding floor: the floor binds only across sources, and adds
-///   at most 400 ms to a fall that another source's rise just preceded.
+/// * over ten times the slowest `SIGWINCH` size read (5–30 ms, Claude Code),
+///   so the program reads and repaints each size the grid takes;
+/// * wider than the resize ledger's run gap (`RUN_GAP_MS` in aterm-gui,
+///   250 ms), so a spaced rise and fall the program drew between are two runs;
+/// * shorter than each source's own quiet ([`crate::SHRINK_QUIET`],
+///   [`crate::presence::FOLD_QUIET`]), so the floor binds only across sources.
 pub const CHROME_REGROW_SETTLE: Duration = Duration::from_millis(400);
 
-/// One window's regrow floor: when its chrome rows last ROSE. The host keeps
-/// it in that window's own state and notes each rise there; the engine's fall
-/// laws read the floor.
+/// One window's regrow floor: when its chrome rows last rose. The host keeps
+/// it in that window's state and notes each rise there; the engine's fall laws
+/// read the floor.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RegrowFloor {
     last_rise: Option<Instant>,
 }
 
 impl RegrowFloor {
-    /// The window's chrome rows rose at `now`. The floor keeps the LATEST
-    /// rise: a stale `now` (an earlier instant than one already noted) moves
-    /// nothing, so it can never hasten a fall.
+    /// The window's chrome rows rose at `now`. The floor keeps the latest rise:
+    /// a stale `now` moves nothing, so it can never hasten a fall.
     pub fn rose(&mut self, now: Instant) {
         self.last_rise = Some(self.last_rise.map_or(now, |x| x.max(now)));
     }
@@ -130,7 +97,7 @@ pub fn latest(floors: impl IntoIterator<Item = Option<Instant>>) -> Option<Insta
     floors.into_iter().flatten().max()
 }
 
-/// Whether a re-grid of chrome rows from `reserved` to `rows` is a RISE (the
+/// Whether a re-grid of chrome rows from `reserved` to `rows` is a rise (the
 /// grid shrinks), which the host notes on every window it re-grids.
 #[must_use]
 pub fn is_rise(reserved: u16, rows: u16) -> bool {
@@ -171,8 +138,6 @@ mod tests {
         assert_eq!(at_floor(t0 + ms(900), f.floor()), t0 + ms(900));
     }
 
-    /// THE ANCHOR IS THE LAST RISE: a later rise moves the floor on, and a
-    /// stale instant (earlier than one noted) never moves it back.
     #[test]
     fn the_floor_counts_from_the_latest_rise_and_never_moves_back() {
         let t0 = Instant::now();
@@ -204,8 +169,6 @@ mod tests {
         assert!(!is_rise(2, 1));
     }
 
-    /// The span's reasons, pinned: wider than the ledger's run gap (250 ms)
-    /// and shorter than both sources' own quiet.
     #[test]
     fn the_settle_sits_between_the_run_gap_and_the_sources_quiet() {
         assert_eq!(CHROME_REGROW_SETTLE, ms(400));

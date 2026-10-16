@@ -1,0 +1,42 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+# `[patch.crates-io]` matches on PACKAGE name, so this must be called `libm`;
+# the directory keeps the `aterm-` prefix so it reads as ours (precedent:
+# crates/aterm-profiling).
+name = "libm"
+# A SEMVER CONTRACT with the consumers, not an aterm release number: naga 29
+# asks `^0.2.6`, num-traits 0.2.19 `^0.2.0`. 0.2.16 is the version the retired
+# vendor/libm fork carried and upstream's latest, so the lock line does not move
+# and no registry 0.2.x in the graph can outrank the shim (a lower shim leaves
+# the patch row replacing NOTHING, with no warning; `forge check` flags it).
+version = "0.2.16"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "First-party `libm` facade for aterm: the 68 functions naga and num-traits name, forwarded to std (replaces the vendored libm fork)"
+
+[lib]
+name = "libm"
+path = "src/lib.rs"
+# No unit tests live in src/; tests/ holds the recorded differential.
+test = false
+
+[dependencies]
+# None: the point is that the 19,867-line fork and its build script leave.
+
+[features]
+# Upstream's feature names, with no effect: a missing name some dependency asks
+# for is a resolve error (num-traits takes the default set). None may ever gain
+# a `dep:`.
+default = ["arch"]
+arch = []
+force-soft-floats = []
+unstable = ["unstable-intrinsics", "unstable-float"]
+unstable-float = []
+unstable-intrinsics = []
+unstable-public-internals = []
+
+[lints]
+workspace = true

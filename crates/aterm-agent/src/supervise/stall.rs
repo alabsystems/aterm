@@ -39,10 +39,11 @@
 //! held or suspected ([`Session::stall_suspect`], set by a refused or warned
 //! key). Every `status` the loop reads is checked ([`Session::note_status`]);
 //! while a stall is in hand ([`Session::stall_in_hand`]) nothing is pressed,
-//! typed, badged or mailed ([`Session::withhold_badge`], [`ASK_WITHHELD`]).
+//! typed, badged or mailed ([`Session::withhold_badge`], [`WITHHELD`]).
 //! A host that does not measure input ([`Caps::input`]) costs at most one extra
 //! `status` per connection.
 
+use super::super::journal::{ATTENTION_SKIPPED, ESCALATED_BEHIND, FROZEN};
 use super::escalate::status_field;
 use super::*;
 use crate::harness::resume::{AfterRestart, RELAUNCH_WORDS, restart_command};
@@ -77,13 +78,14 @@ pub(super) struct StallRead {
     hand: Option<String>,
 }
 
-/// The mail word of an escalation whose own `status` read reported the
-/// stall ([`Session::escalate`]): an ask to answer a point no answer can
-/// reach is not mailed; the hold's own mail tells the manager what is
-/// wrong ([`frozen_mail_text`]). The attention word too, of an ask whose
-/// badge a stall in hand kept down ([`Session::withhold_badge`]).
-pub(super) const ASK_WITHHELD: &str =
-    "skipped: the same status says the worker is not reading its input";
+/// Why an ask is withheld while a stall is in hand: the mail word of an
+/// escalation whose own `status` read reported the stall
+/// ([`Session::escalate`], `mail=skipped: <this>`) — an ask to answer a point
+/// no answer can reach is not mailed; the hold's own mail tells the manager
+/// what is wrong ([`frozen_mail_text`]) — and the attention word of an ask
+/// whose badge a stall in hand kept down ([`Session::withhold_badge`],
+/// [`ATTENTION_SKIPPED`] then this: no badge, so no person's wait).
+pub(super) const WITHHELD: &str = "the same status says the worker is not reading its input";
 
 /// Whether a `status` reply carries a measured `input=` word. An absent field
 /// (an older aterm) and `input=-` (not macOS, not a tty) are both no.
@@ -326,7 +328,7 @@ impl<C: Ctl> Session<'_, C> {
 
     /// Before an ask's badge goes up ([`Self::escalate`]): `true` when a stall
     /// is in hand ([`Self::stall_in_hand`]), so no badge is raised and nothing
-    /// is mailed; journaled with [`ASK_WITHHELD`]. With no manager, reads
+    /// is mailed; journaled with [`WITHHELD`]. With no manager, reads
     /// `status` here for this alone, unless the host measures nothing
     /// ([`Caps::input`]) or a stall is already suspected.
     pub(super) fn withhold_badge(
@@ -348,12 +350,12 @@ impl<C: Ctl> Session<'_, C> {
             return Ok(false);
         }
         let mail = if self.manager.is_none() {
-            "skipped: no --inbox and no $ATERM_PARENT_SESSION_ID"
+            "skipped: no --inbox and no $ATERM_PARENT_SESSION_ID".to_string()
         } else {
-            ASK_WITHHELD
+            format!("skipped: {WITHHELD}")
         };
         review.note(&format!(
-            "ESCALATED seq={seq} attention={ASK_WITHHELD} mail={mail}"
+            "ESCALATED seq={seq} {ATTENTION_SKIPPED}{WITHHELD} mail={mail}"
         ));
         Ok(true)
     }
@@ -405,7 +407,11 @@ impl<C: Ctl> Session<'_, C> {
     /// "answer this box" the moment it cleared), the escalated box and the
     /// policy's due decision are forgotten, one `kind=ask` goes to the
     /// manager while the fabric is connected, and the episode is journaled
-    /// `FROZEN …`. Nothing is pressed or typed here or while it stands.
+    /// `FROZEN …` ([`FROZEN`]). Nothing is pressed or typed here or while it
+    /// stands. The badge's end is that line's: its `attention=<reply>` is the
+    /// unset's, read back by the harness's stats as the end of the person's
+    /// wait the badge opened (no `CLEARED` line follows); behind another
+    /// supervisor it is [`ATTENTION_SKIPPED`]'s, nothing touched.
     pub(super) fn hold_for_stall(
         &mut self,
         read: StallRead,
@@ -423,8 +429,11 @@ impl<C: Ctl> Session<'_, C> {
         self.stall_termed = false;
         let behind = self.claim.watching_behind().map(str::to_string);
         let (attention, mail) = if let Some(holder) = behind {
-            let skipped = format!("skipped: another supervisor ({holder}) answers this session");
-            (skipped.clone(), skipped)
+            let why = format!("{ESCALATED_BEHIND} ({holder}) answers this session");
+            (
+                format!("{ATTENTION_SKIPPED}{why}"),
+                format!("skipped: {why}"),
+            )
         } else {
             let attention = self.unset_if_ours(|t| !t.starts_with(ATTENTION_PREFIX))?;
             if self.attention_ours.is_none() {
@@ -452,12 +461,11 @@ impl<C: Ctl> Session<'_, C> {
                 }
                 Some(_) => format!("skipped: no fabric (fabric={})", read_rest.fabric),
             };
-            (attention, mail)
+            (format!("attention={attention}"), mail)
         };
         let dash = || "-".to_string();
         review.note(&format!(
-            "FROZEN seq={seq} input={} wait_ms={} bytes={} rss_mb={} attention={attention} \
-             mail={mail}",
+            "{FROZEN} seq={seq} input={} wait_ms={} bytes={} rss_mb={} {attention} mail={mail}",
             stall.word,
             stall.wait_ms.map_or_else(dash, |v| v.to_string()),
             stall.bytes.map_or_else(dash, |v| v.to_string()),
@@ -520,7 +528,7 @@ impl<C: Ctl> Session<'_, C> {
             || !review.unattended()
             || !relaunched
             || !hands_off
-            || self.claim.watching_behind().is_some()
+            || self.claim.remedies_withheld()
         {
             return Ok(());
         }

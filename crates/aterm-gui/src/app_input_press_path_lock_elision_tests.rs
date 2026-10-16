@@ -33,15 +33,11 @@ fn character_event(ch: char, state: ElementState) -> winit::event::KeyEvent {
     )
 }
 
-/// An App whose session capability (not merely the window's mirror) writes
-/// to an observer pipe: the release path routes through
-/// `pool.get(session).ctx.sink`, so a window-only mirror would report
-/// silence for bytes that really flowed.
-///
-/// Returns the pipe's nonblocking read end. The sink owns the write end, as
-/// a shipping session owns its master: the fd closes with the last
-/// `Arc<SinkWriter>`, so no write of this App's can reach a parallel test's
-/// pipe on a recycled number.
+/// An App whose session capability (not merely the window's mirror) writes to
+/// an observer pipe, since the release path writes through
+/// `pool.get(session).ctx.sink`. Returns the nonblocking read end. The sink owns
+/// the write end, so the fd closes with the last `Arc<SinkWriter>` and no write
+/// can reach a parallel test's pipe on a recycled number.
 #[cfg(unix)]
 fn app_observing_pty() -> (App, i32) {
     use std::os::fd::{FromRawFd, OwnedFd};
@@ -74,11 +70,10 @@ fn drain(pipe: i32) -> Vec<u8> {
     bytes[..read as usize].to_vec()
 }
 
-/// Drive the real key route, including trail licensing and the Cmd-S/R
-/// boundary. The fence classifies the press `on_key` builds anyway
-/// (`physical_press`, dispatched as built), so an ordinary typed press
-/// normalizes nothing: only a binding lookup, the paste test of a fenced
-/// chord or the Cmd-S/R check asks for the base key.
+/// Through the real key route, an ordinary typed press normalizes no base key:
+/// the fence classifies the press `on_key` builds anyway (`physical_press`).
+/// Only a binding lookup, a fenced chord's paste test or the Cmd-S/R check asks
+/// for the base key.
 #[cfg(unix)]
 #[test]
 fn ordinary_typed_press_normalizes_no_base_key() {
@@ -90,11 +85,9 @@ fn ordinary_typed_press_normalizes_no_base_key() {
     assert_eq!(normalizations, 0, "no normalization for a typed press");
 }
 
-/// A keypad press and its release carry one identity. `build_key_input`
-/// resolves a physical KP_5 to `Numpad5` at press time, the press owner
-/// stores that key, and the release replays it, so under kitty
-/// `DISAMBIGUATE | REPORT_EVENT_TYPES` the pair is `CSI 57404 u` then
-/// `CSI 57404;1:3 u`, never a keypad press paired with a main-row release.
+/// A keypad press and its release carry one identity: the press owner stores the
+/// `Numpad5` `build_key_input` resolved, so under kitty `DISAMBIGUATE |
+/// REPORT_EVENT_TYPES` the pair is `CSI 57404 u` then `CSI 57404;1:3 u`.
 #[cfg(unix)]
 #[test]
 fn a_keypad_press_and_its_release_report_the_same_keypad_key() {
@@ -127,15 +120,10 @@ fn a_keypad_press_and_its_release_report_the_same_keypad_key() {
     );
 }
 
-/// A plain Enter at the real input boundary arms `note_return` (its
-/// coalesced response move is licensed, consume-once) without wiping the
-/// banked typed stamps of keys whose echoes are still in flight.
-///
-/// A stamp is a licence only while its press is unpaid, and the Return's
-/// take is class-aware: a same-row forward hop with a typed pair is a
-/// glyph's echo, never the Return's move, so `g`'s and `i`'s echoes are
-/// licensed by their own presses, the Return is kept for the row change it
-/// licenses, and the flood after that is refused.
+/// A plain Enter at the real input boundary arms `note_return` (its response
+/// move is licensed, consume-once) without wiping the banked typed stamps of
+/// keys whose echoes are still in flight: a same-row forward hop with a typed
+/// pair is a glyph's echo, licensed by its own press, never the Return's move.
 #[cfg(unix)]
 #[test]
 fn plain_enter_licenses_its_response_and_keeps_banked_stamps() {
@@ -205,7 +193,7 @@ fn plain_enter_licenses_its_response_and_keeps_banked_stamps() {
             1,
             "a bare Enter's response move is licensed by note_return alone"
         );
-        // …and consumed ONCE: the program flood after it stays dark.
+        // …and consumed once: the program flood after it stays dark.
         ws.fx.cursor_mut().glow.tick(
             Some((3, 0)),
             b1 + Duration::from_millis(16),
@@ -261,9 +249,8 @@ fn plain_enter_licenses_its_response_and_keeps_banked_stamps() {
     let _ = drain(pipe);
     let ws = app.windows.get_mut(&wid).unwrap();
     // The first observed move is `g`'s echo (a same-row `+1` with a typed
-    // pair), licensed by its own stamp and press and not the Return's: the
-    // Return hint is kept for its own row change and `i`'s press stays in
-    // flight.
+    // pair), licensed by its own press; the Return hint is kept for its row
+    // change and `i`'s press stays in flight.
     let e1 = Instant::now();
     ws.fx
         .cursor_mut()
@@ -279,15 +266,13 @@ fn plain_enter_licenses_its_response_and_keeps_banked_stamps() {
         1,
         "`i` is still in flight after `g`'s echo — the Return forgot nothing"
     );
-    // …the bank survived it (the second glyph's stamp is still there —
-    // the pre-fix `clear_typed` would have emptied it)…
+    // …the bank survived it (the second glyph's stamp is still there)…
     let e2 = e1 + Duration::from_millis(16);
     assert!(
         ws.fx.cursor_mut().glow.move_licensed(e2),
         "banked typed stamps must survive a plain Enter"
     );
-    // …and licenses `i`'s echo: the in-flight glyph echo that precedes
-    // a Return's own move is lit by its credit (§17.3).
+    // …and licenses `i`'s echo, which precedes the Return's own move.
     ws.fx
         .cursor_mut()
         .glow
@@ -298,8 +283,7 @@ fn plain_enter_licenses_its_response_and_keeps_banked_stamps() {
         "the in-flight glyph echo after a plain Enter is licensed"
     );
     assert_eq!(ws.fx.cursor_mut().glow.in_flight_tally().credits, 0);
-    // The Return's own move — the row change — is licensed by
-    // `note_return` (was: deterministic no-fresh-hint +1 per Enter).
+    // The Return's own move (the row change) is licensed by `note_return`.
     ws.fx.cursor_mut().glow.tick(
         Some((2, 0)),
         e1 + Duration::from_millis(32),
@@ -383,9 +367,9 @@ fn only_a_plain_tab_arms_the_delivered_insert_stamp() {
         1,
         "a plain Tab is a delivered insert of unknown width"
     );
-    // The classifier's own word, every modifier: the gesture class stays
-    // (a reverse menu-complete is a completion sweep to the classic
-    // trail), the insert does not.
+    // The classifier, every modifier: the gesture class stays (a reverse
+    // menu-complete is a completion sweep to the classic trail), the insert
+    // does not.
     for mods in [
         Modifiers::SHIFT,
         Modifiers::CTRL,
@@ -499,8 +483,7 @@ fn tab_arms_a_user_gesture_and_keeps_banked_stamps() {
         "banked typed stamps must survive a mid-burst Tab"
     );
 
-    // BARE Tab on an empty bank: the sweep can only be funded by
-    // `note_user_gesture` itself — the direct red for the arm.
+    // Bare Tab on an empty bank: only `note_user_gesture` can fund the sweep.
     let (mut bare, bare_pipe) = app_observing_pty();
     bare.config.cursor_trail = Some(true);
     bare.config.cursor_trail_style = Some("rainbow kitty".to_string());
@@ -539,7 +522,7 @@ fn tab_arms_a_user_gesture_and_keeps_banked_stamps() {
         1,
         "a bare Tab's sweep is licensed by note_user_gesture alone"
     );
-    // …and consumed ONCE: the program move after it stays dark.
+    // …and consumed once: the program move after it stays dark.
     ws.fx.cursor_mut().glow.tick(
         Some((3, 0)),
         b1 + Duration::from_millis(16),
@@ -554,15 +537,11 @@ fn tab_arms_a_user_gesture_and_keeps_banked_stamps() {
     );
 }
 
-/// A bare ⌃V (Claude Code's clipboard-image insert) arms the
-/// delivered-insert class at the dispatch boundary beside the gesture
-/// class, bank-preserving: in-flight glyph echoes stay licensed and the
-/// app's `[Image #1] ` echo (an 11-cell same-row hop) is laid as one insert
-/// sweep. The Control release between the press and the echo runs
-/// `clear_move_license` (which wipes the typed bank) and must not kill the
-/// insert; the second half re-runs the shape with that fence. A raw ⌃V
-/// that echoes nothing (a shell's quoted-insert) leaves a stamp that
-/// expires unspent.
+/// A bare ⌃V (Claude Code's clipboard-image insert) arms the delivered-insert
+/// class beside the gesture class, bank-preserving: in-flight glyph echoes stay
+/// licensed and the `[Image #1] ` echo (an 11-cell same-row hop) is one insert
+/// sweep. The second pass runs the Control release's `clear_move_license`
+/// (which wipes the typed bank) before the echo; the insert survives it.
 #[cfg(unix)]
 #[test]
 fn a_ctrl_v_press_arms_an_insert_and_keeps_banked_stamps() {
@@ -679,30 +658,20 @@ fn a_ctrl_v_press_arms_an_insert_and_keeps_banked_stamps() {
     }
 }
 
-/// A press keeps the glow's hand on its row exactly when the seam does.
-/// The engine reads the hand's row (where the last licensed typed echo
-/// landed) to tell a status tick inside a hesitated key's window from that
-/// key's echo. Every route a press takes closes the licence cohort ahead of
-/// it (`on_key`'s pre-dispatch fence, `App::input`'s entry fence, the
-/// dispatch arm, a modifier edge, the control socket's fence
-/// (`control_input::control_fence`, fed as `handle` feeds it), the menu's
-/// fence), and whether the hand keeps its row is the one classification
-/// (`press_fence`) every route asks.
+/// A press keeps the glow's hand on its row exactly when the seam does. The
+/// engine reads the hand's row (where the last licensed typed echo landed) to
+/// tell a status tick inside a hesitated key's window from that key's echo.
+/// Every route a press takes (`on_key`'s pre-dispatch fence, `App::input`'s entry
+/// fence, the dispatch arm, a modifier edge, `control_input::control_fence`, the
+/// menu's fence) closes the licence cohort ahead of it, and all of them ask the
+/// one classification, `press_fence`, whether the hand keeps its row.
 ///
-/// Observed, not read: after the press, the next key (3 s on, on the glow's
-/// clock) is followed 3 ms later by a status row's advance ending on that
-/// key's glyph. A hand kept on the caret's row refuses it `program-row`; a
-/// hand taken off lets `spawn` judge it as the key's echo.
-///
-/// Kept: Backspace, an arrow, Home, Ctrl-A, Ctrl-W and Delete through the
-/// seam, a physical Backspace and Left, a Shift edge, a paste through the
-/// seam, ⌘V through `on_key` and the menu, Enter into a program's composer
-/// (the alternate screen, or a command the shell says is running), and
-/// behind the control fence `key left`, `key ctrl+w`, `ctrl w`,
-/// `key shiftleft`, `key left type=release` and `paste`. Taken: Ctrl-R
-/// (zle's minibuffer), Escape (vi's `/` after it), ⌘← (the window's
-/// command, no line edit), Enter at a shell prompt, and `key esc` behind
-/// the control fence.
+/// Observed: 3 s after the press the next key is followed 3 ms later by a status
+/// row's advance ending on that key's glyph; a hand kept on the caret's row
+/// refuses it `program-row`, a hand taken off lets `spawn` judge it as the echo.
+/// Kept: line edits, a Shift edge, a paste, ⌘V, Enter into a program's composer.
+/// Taken: Ctrl-R (zle's minibuffer), Escape (vi's `/` after it), ⌘← (no line
+/// edit), Enter at a shell prompt.
 #[cfg(unix)]
 #[test]
 fn a_press_keeps_the_glow_s_hand_on_its_row_exactly_when_the_seam_does() {
@@ -1087,12 +1056,9 @@ use aterm_core::selection::SelectionType;
 use aterm_core::terminal::Terminal;
 use winit::keyboard::ModifiersState;
 
-/// A bare modifier press leaves `on_key` before the lock-state RPC, the
-/// press scope and the encoder: no `lock_modifiers` call, no bytes, the
-/// physical press recorded as Consumed (so its release pairs and is
-/// swallowed), and `input_hot` left dark. Under kitty
-/// REPORT_ALL_KEYS_AS_ESC the modifier is a reported key: the RPC runs and
-/// `ESC[57441u` is written.
+/// A bare modifier press leaves `on_key` before the lock-state RPC and the
+/// encoder: no bytes, recorded Consumed (its release pairs and is swallowed),
+/// `input_hot` dark. Under kitty report-all it is a reported key (`ESC[57441;2u`).
 #[cfg(unix)]
 #[test]
 fn a_bare_modifier_press_skips_the_ladder_unless_kitty_reports_all_keys() {
@@ -1262,7 +1228,7 @@ fn unmapped_mac_keys_skip_hid_while_mapped_keys_keep_legacy_and_kitty_parity() {
     assert!(drain(pipe).is_empty());
     assert_eq!(READS.load(Ordering::Relaxed), 0);
     // Caps Lock (the HID read) capitalizes the letter: xterm applies Lock,
-    // kitty and Terminal.app send the OS's 'A'. It used to type 'a'.
+    // kitty and Terminal.app send the OS's 'A'.
     app.on_key(wid, character_event('a', ElementState::Pressed));
     assert_eq!(drain(pipe), b"A");
     app.on_key(wid, arrow(ElementState::Pressed));
@@ -1324,7 +1290,7 @@ fn mapped_press_keeps_caps_when_kitty_arrives_between_hid_and_egress() {
     assert_eq!(drain(pipe), b"\x1b[1;65A");
 }
 
-/// A bare MODIFIER or LOCK key as winit really delivers it.
+/// A bare modifier or lock key as winit really delivers it.
 fn modifier_event(
     named: winit::keyboard::NamedKey,
     code: KeyCode,
@@ -1429,7 +1395,7 @@ fn cmd_arrows_are_the_deliberate_return_to_live() {
         assert!(super::scrollback_chord(ModifiersState::SUPER, &down).is_none());
         assert!(super::scrollback_chord(ModifiersState::SUPER, &up).is_none());
     }
-    // ⌘⌥arrow stays pane focus; the new chord must not shadow it.
+    // ⌘⌥arrow stays pane focus; ⌘-arrow must not shadow it.
     assert!(
         super::scrollback_chord(ModifiersState::SUPER | ModifiersState::ALT, &down).is_none(),
         "cmd+alt+arrow belongs to pane focus"
@@ -1444,13 +1410,11 @@ fn cmd_arrows_are_the_deliberate_return_to_live() {
     assert!(super::scrollback_chord(ModifiersState::empty(), &down).is_none());
 }
 
-/// Selection custody for modifier keys the engine has no `NamedKey` for:
-/// AltGr and laptop/macOS `Fn`. `map_logical_key` returns `None`, so the
-/// press never reaches the seam and the terminal half is safe. The window
-/// half needs an explicit arm: `cancel_press_scroll_motion` runs off
-/// `keymap::press_is_inert`, which answers from the winit key, so resting
-/// on AltGr must not kill an in-flight momentum scroll. Asserted on
-/// `scroll_frac_px`, the banked sub-row residual that cancel drops.
+/// Selection custody for modifier keys the engine has no `NamedKey` for (AltGr,
+/// `Fn`): `map_logical_key` returns `None`, so the press never reaches the
+/// seam. The window half needs its own arm (`keymap::press_is_inert` answers
+/// from the winit key), so resting on AltGr keeps an in-flight scroll's
+/// `scroll_frac_px` residual.
 #[test]
 fn unmapped_modifier_keys_are_inert_too() {
     use winit::keyboard::NamedKey as WNamed;
@@ -1490,12 +1454,9 @@ fn unmapped_modifier_keys_are_inert_too() {
     assert_eq!(term_lock(&term).grid().display_offset(), 0);
 }
 
-/// Selection custody through the shipping `App::on_key` in the event order
-/// macOS produces: winit queues the bare modifier's `KeyboardInput` before
-/// the matching `ModifiersChanged`, so on the ⌘ keydown
-/// `ws.mods.super_key()` is still `false`, the bare-Cmd swallow does not
-/// fire, and the press reaches the seam. It must not snap the viewport or
-/// clear the selection. Asserted at every step and for both orderings.
+/// Selection custody in macOS's event order: winit queues a bare ⌘'s
+/// `KeyboardInput` before its `ModifiersChanged`, so the bare-Cmd swallow does
+/// not fire and the press reaches the seam; it still must not snap or deselect.
 #[test]
 fn bare_command_keydown_is_inert_in_either_modifier_order() {
     for settled_first in [false, true] {
@@ -1545,13 +1506,10 @@ fn bare_command_keydown_is_inert_in_either_modifier_order() {
     }
 }
 
-/// An inert press is inert about the move licence too. Option+Left/Right
-/// have no key-time cue, so a word move's sound is minted when the echo's
-/// caret delta is licensed by the press's `nav_hint`. macOS delivers
-/// `flags_changed` as a synthesized `KeyboardInput` Pressed for
-/// `Named(Alt|Shift|…)`; a bare modifier types, moves and writes nothing,
-/// so it must not clear the previous hop's licence while its echo is in
-/// flight. Every intent-bearing press still does.
+/// An inert press keeps the move licence: an Option+Left/Right word move's sound
+/// is minted when its echo is licensed by the press's `nav_hint`, and macOS
+/// delivers `flags_changed` as a `KeyboardInput` press, so a bare modifier must
+/// not clear the licence while the echo is in flight. An intent-bearing press does.
 #[test]
 fn a_bare_modifier_press_does_not_revoke_a_word_moves_licence() {
     use std::time::Instant;
@@ -1581,6 +1539,10 @@ fn a_bare_modifier_press_does_not_revoke_a_word_moves_licence() {
             assert!(ws.fx.cursor_mut().glow.move_licensed(now));
         }
         app.on_key(wid, modifier_event(named, code, ElementState::Pressed));
+        if keeps {
+            app.on_modifiers_changed(wid, winit::keyboard::ModifiersState::ALT);
+            app.on_modifiers_changed(wid, winit::keyboard::ModifiersState::empty());
+        }
         let ws = &app.windows[&wid];
         assert_eq!(
             (
@@ -1636,11 +1598,9 @@ fn every_bare_modifier_and_lock_key_is_inert() {
     );
 }
 
-/// A seam-bound keystroke lands the whole press-path snap without a
-/// caller-side `snap_to_bottom` (a third terminal-mutex acquisition per
-/// key): the seam's lock scope pulls the viewport to the live bottom, and
-/// the lock-free window half cancels the wheel glide's banked residual so
-/// no momentum tail eases the view off the prompt.
+/// A seam-bound keystroke snaps without a caller-side `snap_to_bottom` (a third
+/// terminal lock per key): the seam's lock scope pulls the viewport to live, and
+/// the lock-free window half drops the glide's banked residual.
 #[cfg(unix)]
 #[test]
 fn a_seam_bound_press_snaps_the_viewport_and_kills_the_glide_residual() {
@@ -1671,17 +1631,11 @@ fn a_seam_bound_press_snaps_the_viewport_and_kills_the_glide_residual() {
 }
 
 /// Selection custody: a bare Cmd chord no shortcut claims is swallowed
-/// (terminals never forward Cmd combos), and swallowing it does not move
-/// the viewport; it writes nothing, so it expresses no typing intent.
-/// Typing still snaps (pinned by
-/// `a_seam_bound_press_snaps_the_viewport_and_kills_the_glide_residual`).
-/// The window half still runs: `j` is not a modifier, so the banked glide
-/// residual is dropped.
-///
-/// On Linux there is no swallow (`HARDCODED_SUPER_CHORDS` off): Super
-/// belongs to the desktop, so an unclaimed Super chord falls through to the
-/// seam encoder, whose legacy encoding ignores the Super bit as
-/// xterm/gnome-terminal do. Super+J types `j` and snaps like any keystroke.
+/// (terminals never forward Cmd combos) and writes nothing, so it does not move
+/// the viewport; its window half still drops the banked glide residual. On Linux
+/// (`HARDCODED_SUPER_CHORDS` off) Super belongs to the desktop: the chord falls
+/// through to the seam, whose legacy encoding ignores Super as xterm does, so
+/// Super+J types `j` and snaps.
 #[cfg(unix)]
 #[test]
 fn a_swallowed_cmd_chord_no_longer_snaps_the_viewport() {
@@ -1799,10 +1753,9 @@ fn legacy_release_is_byte_silent_and_skips_the_seam() {
     unsafe { libc::close(pipe) };
 }
 
-/// Negative control: the guard never eats a real release report. With
-/// Kitty `REPORT_EVENT_TYPES` negotiated (`CSI > 2 u`) the press publishes
-/// "relevant" and the CSI-u release report reaches the PTY. Ctrl+A, because
-/// a bare printable key produces text and has no representable release
+/// Negative control for the elision above: with Kitty `REPORT_EVENT_TYPES`
+/// (`CSI > 2 u`) the press publishes "relevant" and the release report reaches
+/// the PTY. Ctrl+A, since a bare printable key has no representable release
 /// even in this mode.
 #[cfg(unix)]
 #[test]
@@ -1850,13 +1803,11 @@ fn kitty_event_type_release_still_reports() {
     unsafe { libc::close(pipe) };
 }
 
-/// Selection custody for the two byte-producing press payloads that carry
-/// no event type: a `[key_sequences]`-bound chord forwards
-/// `InputEvent::KeySequence(bytes)`, and the `option_as_meta = false` /
-/// IME-commit fallback forwards `InputEvent::Text` (a key on a non-US
-/// layout). `repeat_literal` replays the payload verbatim, so the seam
-/// cannot read the repeat off the event; [`PressPhase`] carries it, so an
-/// auto-repeat does not re-run the press-path snap+clear.
+/// Selection custody for the two byte-producing press payloads with no event
+/// type: a `[key_sequences]` chord's `InputEvent::KeySequence` and the
+/// `option_as_meta = false` / IME-commit fallback's `InputEvent::Text`.
+/// `repeat_literal` replays the payload verbatim, so `PressPhase` carries the
+/// repeat and an auto-repeat does not re-run the press-path snap+clear.
 #[test]
 fn a_held_literal_payload_repeats_without_re_taking_the_reading_position() {
     for (code, payload) in [
@@ -1885,12 +1836,11 @@ fn a_held_literal_payload_repeats_without_re_taking_the_reading_position() {
             );
         }
 
-        // Mid-hold the user wheels back into history and drags a new
-        // selection — the exact case Phase 1 exists to protect.
+        // Mid-hold the user wheels back into history and drags a new selection.
         let _ = scrolled_back_with_a_selection(&mut app, wid);
         let offset = term_lock(&term).grid().display_offset();
 
-        // …and the key is STILL down: more auto-repeat ticks arrive.
+        // …and the key is still down: more auto-repeat ticks arrive.
         for tick in 0..3 {
             app.route_physical_repeat(wid, physical);
             let t = term_lock(&term);
@@ -1907,16 +1857,14 @@ fn a_held_literal_payload_repeats_without_re_taking_the_reading_position() {
     }
 }
 
-/// Selection custody: an inert modifier press means no snap, no clear, no
-/// blink reset and no glide cancel. Reaching for ⇧ to shift-click-extend
-/// while scrolled back must not snap the cursor solid or restart its
-/// period. The gate is on inertness only, never on auto-repeat: a repeat
-/// tick and an ordinary press still keep the cursor solid.
+/// Selection custody: an inert modifier press (⇧ to shift-click-extend) leaves
+/// the blink alone. The gate is on inertness only, never on auto-repeat: a
+/// repeat tick and an ordinary press still keep the cursor solid.
 #[test]
 fn a_bare_modifier_leaves_the_blink_alone_while_typing_and_repeats_reset_it() {
     use winit::keyboard::NamedKey as WNamed;
-    // Park the cursor mid-blink-OFF with a live blink deadline, as a settled
-    // idle window between two blinks really sits.
+    // Park the cursor in the blink's off phase with a live deadline, as an
+    // idle window sits between two blinks.
     fn park_blink_off(app: &mut App, wid: WindowId, deadline: std::time::Instant) {
         let ws = app.windows.get_mut(&wid).expect("window");
         ws.blink_phase = false;
@@ -1954,7 +1902,7 @@ fn a_bare_modifier_leaves_the_blink_alone_while_typing_and_repeats_reset_it() {
         );
     }
 
-    // The SEAM half: the same press arriving as an engine event (a controller
+    // The seam half: the same press arriving as an engine event (a controller
     // verb, or a held modifier routed to its press-time session).
     park_blink_off(&mut app, wid, deadline);
     let _ = app.input(
@@ -1992,7 +1940,7 @@ fn a_bare_modifier_leaves_the_blink_alone_while_typing_and_repeats_reset_it() {
         "a repeat tick must keep the cursor solid mid-hold"
     );
 
-    // CONTROL 2: ordinary typing, unchanged.
+    // Control 2: ordinary typing, unchanged.
     park_blink_off(&mut app, wid, deadline);
     app.on_key(wid, character_event('a', ElementState::Pressed));
     assert!(
@@ -2006,17 +1954,11 @@ fn a_bare_modifier_leaves_the_blink_alone_while_typing_and_repeats_reset_it() {
     );
 }
 
-/// Selection custody's hidden-session press gate. `input_to_hidden_session`
-/// is reached only by auto-repeat ticks of a held key aimed at a session no
-/// window fronts any more; they must not reset that background session's
-/// reading position.
-///
-/// The hidden-session lock is unconditional and taken on the UI thread, so
-/// an inert press must take it once and do nothing under it (`disturbs`
-/// short-circuits before every read). Pinned as an operation count, not a
-/// wall-clock number: a second acquisition or a self-deadlock fails here.
-/// The viewport and selection half is
-/// `a_repeat_into_a_hidden_session_leaves_its_viewport_and_selection_alone`.
+/// Selection custody's hidden-session press gate: `input_to_hidden_session`
+/// (auto-repeat ticks aimed at a session no window fronts) takes the
+/// unconditional hidden-session lock on the UI thread, so an inert press takes
+/// it once and does nothing under it (`disturbs` short-circuits). Pinned as an
+/// operation count: a second acquisition or a self-deadlock fails here.
 #[test]
 fn an_inert_press_to_a_hidden_session_takes_the_terminal_lock_once() {
     use crate::stub_session;
@@ -2081,8 +2023,8 @@ fn a_repeat_into_a_hidden_session_leaves_its_viewport_and_selection_alone() {
         event_type,
     };
 
-    // The auto-repeat ticks of the hold: the SAME press continuing. They must
-    // not take custody a second time.
+    // The hold's auto-repeat ticks (the same press continuing) must not take
+    // custody a second time.
     for _ in 0..4 {
         app.input_to_hidden_session(
             hidden_session,
@@ -2121,8 +2063,8 @@ fn a_repeat_into_a_hidden_session_leaves_its_viewport_and_selection_alone() {
         "a bare modifier expresses no intent, hidden or not"
     );
 
-    // …and the CONTROL: a genuine press still takes custody, so the gate is a
-    // scoped exclusion and not a blanket "hidden input never disturbs".
+    // …and the control: a genuine press still takes custody, so the gate is a
+    // scoped exclusion, not a blanket "hidden input never disturbs".
     app.input_to_hidden_session(
         hidden_session,
         held(KeyEventType::Press),
@@ -2137,12 +2079,9 @@ fn a_repeat_into_a_hidden_session_leaves_its_viewport_and_selection_alone() {
     assert!(!t.text_selection().has_selection(), "…and still deselects");
 }
 
-/// A pinned control request (`Wake::Input { session: Some(..) }`) whose
-/// session fronts no window by the time it is applied: a view-bound gesture
-/// has nothing to act on and is dropped. It is neither handed to the
-/// keyboard-only hidden seam (whose press custody would class it a typing
-/// press, snapping and deselecting the hidden session) nor retargeted to the
-/// tab now on screen.
+/// A pinned control request (`Wake::Input { session: Some(..) }`) for a session
+/// that fronts no window is dropped when view-bound: neither handed to the
+/// keyboard-only hidden seam (which would snap and deselect) nor retargeted.
 #[test]
 fn a_pinned_view_gesture_for_a_hidden_session_is_dropped() {
     use crate::input::{InputOutcome, ScrollIntent};
@@ -2179,11 +2118,9 @@ fn a_pinned_view_gesture_for_a_hidden_session_is_dropped() {
     assert!(t.text_selection().has_selection(), "selection left alone");
 }
 
-/// The `display_offset() != 0` guard the hidden path never had, pinned on the
-/// shared helper that now owns it. The guard is what makes the returned
-/// `scrolled` flag mean "the reading position ACTUALLY moved" — the change-gated
-/// repaint the seam runs off it — so a helper that snapped unconditionally would
-/// report a viewport move on every keystroke of a live terminal.
+/// `apply_press_custody` reports only what it changed: its `display_offset() != 0`
+/// guard makes `scrolled` mean the reading position actually moved (the seam's
+/// change-gated repaint runs off it), so a live terminal's keystroke reports none.
 #[test]
 fn press_custody_reports_only_the_disturbances_it_actually_caused() {
     use aterm_core::selection::{SelectionSide, SelectionType};
@@ -2229,10 +2166,8 @@ fn press_custody_reports_only_the_disturbances_it_actually_caused() {
     assert!(!scrolled.text_selection().has_selection());
 }
 
-/// Selection custody: ⌘↓ returns to live with the selection intact, driven
-/// through the shipping `App::on_key`
-/// (`cmd_arrows_are_the_deliberate_return_to_live` covers only the pure
-/// `scrollback_chord` classifier).
+/// Selection custody: ⌘↓ through the shipping `App::on_key` returns to live
+/// with the selection intact.
 #[test]
 fn cmd_down_returns_to_live_through_on_key_without_clearing_the_selection() {
     use winit::keyboard::NamedKey as WNamed;
@@ -2267,10 +2202,8 @@ fn cmd_down_returns_to_live_through_on_key_without_clearing_the_selection() {
              naming the same text"
         );
     } else {
-        // On Linux ⌘(Super) belongs to the desktop: the chord falls through
-        // to the encoder and lands in the PTY like any other key, so the
-        // viewport returns to live and the selection clears. The claimed
-        // chord this test guards exists only where the suite is compiled in.
+        // On Linux Super belongs to the desktop: the chord reaches the PTY like
+        // any key, so the viewport returns to live and the selection clears.
         let _ = offset_before;
         assert_eq!(
             t.grid().display_offset(),
@@ -2283,4 +2216,37 @@ fn cmd_down_returns_to_live_through_on_key_without_clearing_the_selection() {
             "…clearing the selection exactly as typing any key does"
         );
     }
+}
+
+/// A single-cell printable `InputEvent::Text` commit (`ctl type` or single-char
+/// IME commit) arms predictive local echo just like a `Key::Character` press,
+/// while multi-char or double-width text commits flush pending predictions.
+#[cfg(unix)]
+#[test]
+fn single_char_text_event_arms_predictive_local_echo() {
+    let (mut app, pipe) = app_observing_pty();
+    let wid = WindowId(0);
+    app.config.predictive_echo = Some("always".into());
+    app.predict_mode_cache = None;
+
+    assert_eq!(
+        app.input(wid, InputEvent::Text("q".into()), Source::Controller),
+        crate::input::InputOutcome::Ok
+    );
+    assert_eq!(drain(pipe), b"q");
+    assert!(
+        !app.windows[&wid].predictor.idle(),
+        "a single-width printable Text commit arms predictive local echo"
+    );
+
+    // Multi-char text commits flush any pending prediction.
+    assert_eq!(
+        app.input(wid, InputEvent::Text("ab".into()), Source::Controller),
+        crate::input::InputOutcome::Ok
+    );
+    assert_eq!(drain(pipe), b"ab");
+    assert!(
+        app.windows[&wid].predictor.idle(),
+        "a multi-char Text commit flushes pending predictions"
+    );
 }

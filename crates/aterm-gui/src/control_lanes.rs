@@ -259,6 +259,17 @@ impl Outbox {
         self.sent < self.bytes.len()
     }
 
+    /// Zero initialized reply bytes before clearing, reusing or freeing the
+    /// buffer. Replies can contain askpass secrets; `clear()` alone leaves
+    /// them in the allocation. Volatile stores prevent elision of this pass.
+    fn scrub(&mut self) {
+        for byte in self.bytes.iter_mut() {
+            // SAFETY: `byte` is a valid, aligned, initialized place for a `u8`
+            // for the whole call; the volatile store the optimizer may not drop.
+            unsafe { std::ptr::write_volatile(byte, 0) };
+        }
+    }
+
     /// Deliver what the peer takes: `Ok(true)` once all of it is out,
     /// `Ok(false)` when a non-blocking socket has no room left. A blocking
     /// socket that reports no room (a write timeout) fails.
@@ -275,6 +286,11 @@ impl Outbox {
                 Err(error) => return Err(error),
             }
         }
+        // The delivered bytes may include a relayed secret; zero them before
+        // the buffer is cleared or freed (neither `clear()` nor `Vec::new()`
+        // does). Done once the whole answer is out, so a `WouldBlock` return
+        // above leaves the not-yet-sent bytes in place.
+        self.scrub();
         // A large answer's buffer is not kept for the next one.
         if self.bytes.capacity() > 8 * READ_BUFFER {
             self.bytes = Vec::new();
@@ -283,6 +299,33 @@ impl Outbox {
         }
         self.sent = 0;
         Ok(true)
+    }
+}
+
+impl Drop for Outbox {
+    fn drop(&mut self) {
+        // A connection dropped before its answer was fully delivered (an error
+        // or hangup mid-reply) must not leave a relayed secret in freed heap.
+        self.scrub();
+    }
+}
+
+#[cfg(test)]
+mod outbox_scrub_tests {
+    use super::Outbox;
+
+    /// After an answer is delivered, `sent == bytes.len()`; `scrub` must still
+    /// zero the WHOLE buffer, not the (now empty) unsent tail — a relayed
+    /// secret lives in the delivered span. Guards against scrubbing
+    /// `bytes[sent..]`, which with `sent == len` would zero nothing.
+    #[test]
+    fn scrub_zeroes_the_whole_delivered_buffer() {
+        let mut out = Outbox::default();
+        out.bytes
+            .extend_from_slice(b"OK askpass secret=73336372337420\n");
+        out.sent = out.bytes.len();
+        out.scrub();
+        assert!(out.bytes.iter().all(|&b| b == 0), "{:?}", out.bytes);
     }
 }
 
@@ -964,6 +1007,11 @@ impl Lanes {
         // A blocking verb served here gives the lane back when this caller
         // hangs up (`super::caller_hung_up`).
         let _hangup = super::ServingFd::enter(stream);
+        // A connection a lane serves was accepted on the instance's own
+        // listener: its kernel peer pid may prove a self-claim
+        // (`super::serving_peer_pid`).
+        #[cfg(unix)]
+        let _direct = super::DirectPeer::enter();
         let mut reader = lane_reader(stream, std::mem::take(carry));
         let mut served = false;
         let scope = match *scope {
@@ -1657,3 +1705,48 @@ impl Drop for Serving<'_> {
 #[cfg(all(test, unix))]
 #[path = "control_lanes_conformance.rs"]
 mod conformance;
+
+#[cfg(test)]
+mod outbox_delivery_tests {
+    use super::{CtlStream, Outbox};
+    use std::io::Read as _;
+    use std::time::Duration;
+
+    #[test]
+    fn delivery_preserves_the_wire_and_erases_the_retained_reply() {
+        let (server, mut peer) = CtlStream::pair().expect("private control pair");
+        let hang_detector = Some(Duration::from_secs(60));
+        server.set_write_timeout(hang_detector).unwrap();
+        peer.set_read_timeout(hang_detector).unwrap();
+        let reply = b"OK askpass secret=74657374\n";
+        let mut out = Outbox::default();
+        out.bytes.extend_from_slice(reply);
+        let allocation = out.bytes.as_ptr();
+        let capacity = out.bytes.capacity();
+        assert!(
+            capacity <= 8 * super::READ_BUFFER,
+            "exercise retained storage"
+        );
+
+        assert!(out.deliver(&server, false).unwrap());
+        let mut received = vec![0; reply.len()];
+        peer.read_exact(&mut received).unwrap();
+        assert_eq!(received, reply, "delivery must preserve every wire byte");
+        assert!(out.bytes.is_empty());
+        assert_eq!(out.sent, 0);
+        assert_eq!(out.bytes.capacity(), capacity);
+        assert_eq!(out.bytes.as_ptr(), allocation);
+        // SAFETY: exactly this prefix was initialized above. Delivery kept the
+        // allocation, and clearing a Vec<u8> leaves its bytes initialized. Read
+        // only that known prefix through MaybeUninit, never unused capacity or
+        // a freed allocation.
+        let retained: Vec<u8> = out.bytes.spare_capacity_mut()[..reply.len()]
+            .iter()
+            .map(|byte| unsafe { byte.assume_init() })
+            .collect();
+        assert!(
+            retained.iter().all(|byte| *byte == 0),
+            "delivered reply remains in the reusable allocation: {retained:?}"
+        );
+    }
+}

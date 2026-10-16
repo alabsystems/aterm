@@ -13,9 +13,11 @@
 //!   at the end of `spawn_session` ([`register`]);
 //! * META — each registered terminal's Repaint-rung scalar state
 //!   (`seamless::keeper_meta`: no grids, no nonce, at most 4 KiB at any
-//!   width), sent when its fingerprint changes, at most every [`META_POLL`],
-//!   and tried again each pass until it is sent; DEC 2026 and `?25` are masked
-//!   out of the fingerprint (§11 M9: they churn per frame);
+//!   width) and its session's fabric (`fabric::KeeperCarry`: the hold, the
+//!   topics, an id lease, the queued post ids, the owed receipts' count),
+//!   sent when either changes, at most every [`META_POLL`], and tried again
+//!   each pass until it is sent; DEC 2026 and `?25` are masked out of the
+//!   fingerprint (§11 M9: they churn per frame);
 //! * RELEASE — from `Session::drop` ([`release`]);
 //! * PENDING — the update successor's pid, in both seamless-update lanes,
 //!   written before the grant ([`pending_before_grant`]);
@@ -132,7 +134,10 @@ enum Phase {
 struct Tracked {
     rdev: u64,
     term: Weak<Mutex<Terminal>>,
-    last: Option<Fingerprint>,
+    fabric: Weak<crate::fabric::SessionFabric>,
+    /// What the last META SENT said: the terminal's fingerprint and the
+    /// session's fabric.
+    last: Option<(Fingerprint, crate::fabric::KeeperCarry)>,
 }
 
 #[cfg(unix)]
@@ -817,6 +822,23 @@ fn admit_recovered(
     }
     let tag = Tag::decode(tag).ok_or("carries a tag this build does not read")?;
     let sid = tag.sid.clone().ok_or("carries no session id")?;
+    // THE SESSION'S FABRIC, as its last META said it (the fabric audit's
+    // fourth round, findings 2-5; `fabric::KeeperCarry`): the sid and its
+    // agent survive the crash, so its hold stands again, its broadcast
+    // opt-ins resume from the bridge's cursors, its ids count on above the
+    // dead window's, and the posts it was told are queued are retired dead
+    // `not-carried` — all through `seed_adopted_fabric`, before the session
+    // answers a verb.
+    let fabric = crate::seamless::recovered_fabric(meta);
+    if fabric.topics_lost > 0 || fabric.queued_lost > 0 {
+        aterm_log::warn!(
+            "keeper: session {sid}'s last META had no room to name {} broadcast opt-in(s) and {} \
+             queued post(s); the opt-ins are not restored (`topic add` them again), and whether \
+             those posts were sent is not known",
+            fabric.topics_lost,
+            fabric.queued_lost
+        );
+    }
     Ok(crate::spawn::Adopted {
         // From here the master is released if it becomes no session.
         keeper: Some(Claim::of_tag(header.rdev, &tag)),
@@ -831,20 +853,22 @@ fn admit_recovered(
         repaint: true,
         frozen_path: tag.frozen,
         identity: tag.identity,
-        topics: Vec::new(),
+        topics: fabric.topics,
         fg_holder: 0,
         rekey: tag.rekey,
         loader: tag.loader,
         history: crate::handoff_history::AdoptedHistory::default(),
-        hold: None,
+        holds: fabric.holds,
         title: String::new(),
         supervisor: None,
         attention_owners: Vec::new(),
         claim_grace: false,
         outgoing_build: None,
         render_debt: None,
-        fabric: Default::default(),
+        fabric: fabric.carry,
         timeline_id: 0,
+        // A crashed window's shell: no manifest carried its log's counters.
+        log_carry: None,
         journal_key: None,
     })
 }
@@ -926,6 +950,7 @@ fn register_unix(session: &crate::Session) -> bool {
         Tracked {
             rdev,
             term: Arc::downgrade(&session.term),
+            fabric: Arc::downgrade(&session.ctx.fabric),
             last: None,
         },
     );
@@ -1031,9 +1056,11 @@ pub(crate) fn bye() {
 }
 
 /// The META pump: one thread, started with the live link, that looks at every
-/// registered terminal every [`META_POLL`] and sends its META when the
-/// fingerprint moved. `try_lock` only: a busy terminal is looked at next time,
-/// never waited for.
+/// registered terminal every [`META_POLL`] and attempts its META when the
+/// fingerprint or the session's fabric moved. `try_lock` only: a busy
+/// terminal is looked at next time, never waited for. Contention, a full
+/// queue or a failed link can leave the keeper's last sample older than one
+/// polling interval; the interval is not a delivery-age bound.
 #[cfg(unix)]
 fn start_meta_pump() {
     {
@@ -1064,23 +1091,26 @@ fn start_meta_pump() {
 }
 
 /// One pass of the pump (and, for tests, one step of it): each registered
-/// terminal whose fingerprint differs from the one its last SENT META had is
-/// sent its META now.
+/// terminal whose fingerprint, or whose session's fabric, differs from what
+/// its last SENT META had is sent its META now.
 #[cfg(unix)]
 pub(crate) fn meta_pass() -> usize {
-    meta_pass_over(&KEEPER_STATE, crate::seamless::keeper_meta_of)
+    meta_pass_over(&KEEPER_STATE, |meta, fabric| {
+        crate::seamless::keeper_meta_of(meta, Some(fabric))
+    })
 }
 
 /// [`meta_pass`] over `state`, building each META with `build` from the
-/// terminal's meta carry. Only the fingerprint and the carry are taken under
-/// the terminal's lock, which the PTY reader waits on; the META is serialized
-/// (and shed to fit, up to 404 µs a call at 4,096 alternate-screen columns in
-/// a debug build) after it is released.
+/// terminal's meta carry and the session's fabric. The fabric is read first,
+/// under its own leaf locks with no other lock held; only the fingerprint and
+/// the carry are taken under the terminal's lock, which the PTY reader waits
+/// on; the META is serialized (and shed to fit, up to 404 µs a call at 4,096
+/// alternate-screen columns in a debug build) after it is released.
 #[cfg(unix)]
-fn meta_pass_over(
-    state: &Mutex<State>,
-    build: impl Fn(aterm_core::terminal::CheckpointMeta) -> Option<Vec<u8>>,
-) -> usize {
+fn meta_pass_over<B>(state: &Mutex<State>, build: B) -> usize
+where
+    B: Fn(aterm_core::terminal::CheckpointMeta, &crate::fabric::KeeperCarry) -> Option<Vec<u8>>,
+{
     let targets: Vec<(u64, Tracked)> = state
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1089,21 +1119,37 @@ fn meta_pass_over(
         .map(|(id, t)| (*id, t.clone()))
         .collect();
     let mut sent = 0;
-    for (id, Tracked { rdev, term, last }) in targets {
+    for (
+        id,
+        Tracked {
+            rdev,
+            term,
+            fabric,
+            last,
+        },
+    ) in targets
+    {
         let Some(term) = term.upgrade() else {
             continue;
         };
+        let carry = fabric
+            .upgrade()
+            .map(|fabric| fabric.keeper_carry())
+            .unwrap_or_default();
         let (fingerprint, meta) = {
             let Ok(engine) = term.try_lock() else {
                 continue;
             };
             let fingerprint = Fingerprint::of(&engine);
-            if last == Some(fingerprint) {
+            if last
+                .as_ref()
+                .is_some_and(|(sent, sent_carry)| *sent == fingerprint && *sent_carry == carry)
+            {
                 continue;
             }
             (fingerprint, engine.carry_meta_abandoning_partial())
         };
-        let meta = build(meta);
+        let meta = build(meta, &carry);
         let mut st = state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1117,7 +1163,7 @@ fn meta_pass_over(
         if let (Some(meta), Phase::Live(link)) = (meta, &*phase)
             && link.enqueue(LinkOp::Meta { rdev, meta })
         {
-            tracked.last = Some(fingerprint);
+            tracked.last = Some((fingerprint, carry));
             sent += 1;
         }
     }
@@ -1419,7 +1465,9 @@ mod tests {
         let spawn = code(include_str!("spawn.rs"));
         assert!(spawn.contains("let recovered = keeper_claim.is_some();"));
         assert!(
-            spawn.contains("if !(adopted && factory.defer_adopted_readers && !recovered) {"),
+            spawn.contains(
+                "if !(adopted && factory.defer_adopted_readers && !recovered) && !factory.reader_after_install {"
+            ),
             "a recovered shell's reader is never deferred to a Commit that will not come"
         );
         assert!(spawn.contains("crate::keeper_link::register(&session, keeper_claim);"));
@@ -1579,6 +1627,62 @@ mod tests {
                 .as_ref()
                 .is_some_and(|cp| cp.modes.bracketed_paste),
             "the META's modes survive"
+        );
+        // A META without a fabric (an older window's): no hold and no topic,
+        // no `dropped=` to go on from, and the counters fenced above any
+        // window's, not restarted.
+        assert_eq!((adopted.holds.len(), adopted.topics.len()), (0, 0));
+        assert_eq!(adopted.fabric.dropped, 0);
+        assert!(
+            adopted.fabric.last_post_id >= 1 << 32,
+            "{:?}",
+            adopted.fabric
+        );
+        drop(adopted);
+
+        // THE SESSION'S FABRIC rides the META (the fabric audit's fourth
+        // round, findings 2-5): the recovered session's hold, opt-ins, id
+        // lease, queued posts and owed receipts are the dead window's.
+        let fabric = crate::fabric::KeeperCarry {
+            hold: Some("fleet human%20stop".to_string()),
+            more_holds: vec!["local mine".to_string()],
+            ids: [8192, 12288, 8192],
+            topics: vec!["builds @91234".to_string()],
+            queued: vec![4],
+            owed: 2,
+            dropped: 9,
+            ..crate::fabric::KeeperCarry::default()
+        };
+        let carried =
+            crate::seamless::keeper_meta_of(t.carry_meta_abandoning_partial(), Some(&fabric))
+                .expect("meta");
+        let adopted = admit_recovered(
+            dup_of(sh.master),
+            header_for(sh.pid, birth),
+            &tag(),
+            &carried,
+            &mut used,
+        )
+        .expect("a live shell is admitted");
+        assert_eq!(adopted.holds, ["fleet human%20stop", "local mine"]);
+        assert_eq!(adopted.topics, ["builds @91234"]);
+        assert_eq!(
+            (
+                adopted.fabric.last_msg_id,
+                adopted.fabric.last_post_id,
+                adopted.fabric.last_receipt_id,
+                adopted.fabric.uncarried.as_slice(),
+                adopted.fabric.receipts_uncarried,
+                adopted.fabric.dropped,
+            ),
+            (8192, 12288, 8192, &[4][..], 2, 9)
+        );
+        assert!(
+            adopted
+                .checkpoint
+                .as_ref()
+                .is_some_and(|cp| cp.modes.bracketed_paste),
+            "the screen beside it still reads"
         );
         drop(adopted);
 
@@ -1864,7 +1968,12 @@ mod tests {
     /// its stops the every-8 defaults. So does that session with every other
     /// scalar at its widest too (`widest_scalars`, after the review's finding
     /// on 2026-10-11 that the worst case left the charsets, the mouse encoding
-    /// and the cursor style narrow).
+    /// and the cursor style narrow). Each with the fullest fabric beside it
+    /// (the fabric audit's fourth round): both its holds, its lease, its
+    /// receipt count and its `dropped=` always cross whole, and every opt-in and queued post is
+    /// named or counted — the fabric never costs a session its META. Past any
+    /// session's reach, with the widest scalars, the holds' reasons may give
+    /// way (`KeeperCarry::rungs`); the holds, origin by origin, never do.
     #[cfg(unix)]
     #[test]
     fn a_meta_is_built_for_every_session() {
@@ -1944,8 +2053,72 @@ mod tests {
             slot.underline_color = Some(u32::MAX);
         }
         let widest = widest_scalars(carry.clone());
-        let meta = crate::seamless::keeper_meta_of(carry).expect("the worst case is built");
+        // The fullest fabric beside it: both holds, a fleet halt over the
+        // owner's stop, each with a 128-byte reason JSON doubles, the lease at
+        // its ceiling, every opt-in at its longest, a full outbox, a full
+        // receipt queue and `dropped=` at its ceiling.
+        let ceiling = i64::MAX.unsigned_abs();
+        let fabric = crate::fabric::KeeperCarry {
+            hold: Some(format!("fleet {}", "\"".repeat(128))),
+            more_holds: vec![format!("local {}", "\"".repeat(128))],
+            ids: [ceiling; 3],
+            topics: (0..crate::fabric::MAX_TOPICS)
+                .map(|n| format!("{n:02}{} @{}", "t".repeat(30), u64::MAX))
+                .collect(),
+            queued: (0..crate::fabric::OUTBOX_CAP)
+                .map(|n| ceiling - u64::try_from(n).expect("n"))
+                .collect(),
+            owed: u64::try_from(crate::fabric::RING_CAP).expect("cap"),
+            dropped: ceiling,
+            ..crate::fabric::KeeperCarry::default()
+        };
+        let carried = |meta: &[u8], what: &str, reasons: bool| {
+            let recovered = crate::seamless::recovered_fabric(meta);
+            let origins: Vec<String> = recovered
+                .holds
+                .iter()
+                .map(|row| crate::fabric::parse_hold(row).origin)
+                .collect();
+            assert_eq!(origins, ["fleet", "local"], "{what}: no hold is ever shed");
+            if reasons {
+                let whole: Vec<String> = fabric
+                    .hold
+                    .iter()
+                    .chain(&fabric.more_holds)
+                    .cloned()
+                    .collect();
+                assert_eq!(recovered.holds, whole, "{what}: nor a reason");
+            }
+            assert_eq!(
+                [
+                    recovered.carry.last_msg_id,
+                    recovered.carry.last_post_id,
+                    recovered.carry.last_receipt_id
+                ],
+                fabric.ids,
+                "{what}: nor the lease"
+            );
+            assert_eq!(recovered.carry.receipts_uncarried, fabric.owed, "{what}");
+            assert_eq!(
+                recovered.carry.dropped, fabric.dropped,
+                "{what}: nor dropped="
+            );
+            let named = |n: usize| u64::try_from(n).expect("n");
+            assert_eq!(
+                named(recovered.topics.len()) + recovered.topics_lost,
+                named(fabric.topics.len()),
+                "{what}: every opt-in is named or counted"
+            );
+            assert_eq!(
+                named(recovered.carry.uncarried.len()) + recovered.queued_lost,
+                named(fabric.queued.len()),
+                "{what}: every queued post is named or counted"
+            );
+        };
+        let meta =
+            crate::seamless::keeper_meta_of(carry, Some(&fabric)).expect("the worst case is built");
         assert!(meta.len() <= aterm_keeper::wire::MAX_META, "{}", meta.len());
+        carried(&meta, "the worst case", true);
         let worst = meta.len();
         let mut used = 0;
         let cp = crate::seamless::recovered_checkpoint(&meta, &mut used).expect("a checkpoint");
@@ -1974,8 +2147,11 @@ mod tests {
                 && widest.cursor.scroll_bottom == u16::MAX,
             "PRECONDITION: the widest scalars: {modes} {charset}"
         );
-        let meta = crate::seamless::keeper_meta_of(widest).expect("the widest is built");
+        let meta =
+            crate::seamless::keeper_meta_of(widest, Some(&fabric)).expect("the widest is built");
         assert!(meta.len() <= aterm_keeper::wire::MAX_META, "{}", meta.len());
+        // Past any session's reach, the reasons may give way; the halts never.
+        carried(&meta, "the widest scalars", false);
         eprintln!(
             "the worst case: {worst} bytes; with the widest scalars: {} (cap {})",
             meta.len(),
@@ -2220,11 +2396,17 @@ mod tests {
     /// fingerprint of every terminal it looked at, sent or not, so a META that
     /// could not be built — or found no link, or a full queue — was never
     /// tried again until the modes moved. It records only what it sent.
+    ///
+    /// AND THE FABRIC MOVES IT TOO (the fabric audit's fourth round, findings
+    /// 2-5): a hold set or lifted, or a topic added, with the modes standing
+    /// still sends the session's META again, its fabric as it stands now.
+    /// NEGATIVE CONTROL: with neither moved, nothing is built.
     #[cfg(unix)]
     #[test]
     fn a_meta_that_was_not_sent_is_retried() {
         let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
         term.lock().expect("term").process(b"\x1b[?2004h");
+        let session = crate::session_store::test_handle(7);
         let state = Mutex::new(State {
             phase: Phase::Off,
             buffered: Vec::new(),
@@ -2233,16 +2415,23 @@ mod tests {
                 Tracked {
                     rdev: 1,
                     term: Arc::downgrade(&term),
+                    fabric: Arc::downgrade(&session.ctx.fabric),
                     last: None,
                 },
             )]),
             pump: false,
         });
-        let last = || state.lock().expect("state").tracked[&7].last;
+        let last = || state.lock().expect("state").tracked[&7].last.clone();
+        let build = |meta, fabric: &crate::fabric::KeeperCarry| {
+            crate::seamless::keeper_meta_of(meta, Some(fabric))
+        };
+        let unchanged = |_, _: &crate::fabric::KeeperCarry| -> Option<Vec<u8>> {
+            panic!("an unchanged fingerprint and fabric build nothing")
+        };
 
-        assert_eq!(meta_pass_over(&state, |_| None), 0);
+        assert_eq!(meta_pass_over(&state, |_, _| None), 0);
         assert_eq!(last(), None, "a META that was not built is tried again");
-        assert_eq!(meta_pass_over(&state, crate::seamless::keeper_meta_of), 0);
+        assert_eq!(meta_pass_over(&state, build), 0);
         assert_eq!(last(), None, "a META no link took is tried again");
 
         // A link whose keeper is not there yet takes the META into its queue.
@@ -2253,19 +2442,61 @@ mod tests {
         )
         .expect("link");
         state.lock().expect("state").phase = Phase::Live(Arc::new(link));
-        assert_eq!(
-            meta_pass_over(&state, crate::seamless::keeper_meta_of),
-            1,
-            "the retry sends it"
-        );
+        assert_eq!(meta_pass_over(&state, build), 1, "the retry sends it");
         let sent = Fingerprint::of(&term.lock().expect("term"));
-        assert_eq!(last(), Some(sent), "what was sent is recorded");
         assert_eq!(
-            meta_pass_over(&state, |_| panic!(
-                "an unchanged fingerprint builds nothing"
-            )),
-            0
+            last().map(|(fingerprint, _)| fingerprint),
+            Some(sent),
+            "what was sent is recorded"
         );
+        assert_eq!(meta_pass_over(&state, unchanged), 0);
+
+        // The modes stand still; the fabric moves.
+        let held = crate::fabric::Hold {
+            reason: "stop".to_string(),
+            origin: "local".to_string(),
+        };
+        assert!(crate::fabric::apply_hold_for_test(&session.ctx, Some(held)));
+        let sent_meta = std::sync::Mutex::new(Vec::new());
+        let capture = |meta, fabric: &crate::fabric::KeeperCarry| {
+            let bytes = crate::seamless::keeper_meta_of(meta, Some(fabric));
+            sent_meta
+                .lock()
+                .expect("capture")
+                .clone_from(bytes.as_ref().expect("a META"));
+            bytes
+        };
+        assert_eq!(meta_pass_over(&state, capture), 1, "a hold sends it");
+        let recovered = crate::seamless::recovered_fabric(&sent_meta.lock().expect("capture"));
+        assert_eq!(recovered.holds, ["local stop"]);
+        assert_eq!(meta_pass_over(&state, unchanged), 0);
+        // A fleet halt over it is a second slot, and sends it too.
+        let halt = crate::fabric::Hold {
+            reason: "halt".to_string(),
+            origin: "fleet".to_string(),
+        };
+        assert!(crate::fabric::apply_hold_for_test(&session.ctx, Some(halt)));
+        assert_eq!(meta_pass_over(&state, capture), 1, "a second hold sends it");
+        let recovered = crate::seamless::recovered_fabric(&sent_meta.lock().expect("capture"));
+        assert_eq!(recovered.holds, ["fleet halt", "local stop"]);
+        assert_eq!(meta_pass_over(&state, unchanged), 0);
+        assert_eq!(
+            session
+                .ctx
+                .fabric
+                .topic_add("builds", "head", &session.ctx.timeline),
+            Ok(true)
+        );
+        assert_eq!(meta_pass_over(&state, capture), 1, "a topic sends it");
+        assert!(crate::fabric::apply_hold_for_test(&session.ctx, None));
+        assert_eq!(meta_pass_over(&state, capture), 1, "a lift sends it");
+        let recovered = crate::seamless::recovered_fabric(&sent_meta.lock().expect("capture"));
+        assert_eq!(
+            (recovered.holds, recovered.topics),
+            (Vec::<String>::new(), vec!["builds head".to_string()]),
+            "the last META sent is the fabric as it stands"
+        );
+        assert_eq!(meta_pass_over(&state, unchanged), 0);
         let phase = std::mem::replace(&mut state.lock().expect("state").phase, Phase::Off);
         if let Phase::Live(link) = phase
             && let Ok(link) = Arc::try_unwrap(link)

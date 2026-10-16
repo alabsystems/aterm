@@ -16,10 +16,9 @@ fn stamp(pid: u32, start: &str, cause: Cause, at: u64) -> Stamp {
     }
 }
 
-/// A STAMP IS ONE FILE PER TAB, written whole: it reads back as written, a
-/// second act's replaces the first, and nothing else is left beside it. Its
-/// text carries no `phase`, so no reader of the upgrade records takes it for
-/// one; a tab key that is not a plain word names no file.
+/// A stamp is one file per tab, written whole: it reads back as written, a second act's replaces
+/// the first, and nothing else is left beside it. Its text carries no `phase`; a tab key that is
+/// not a plain word names no file.
 #[test]
 fn a_stamp_is_one_file_per_tab_written_whole() {
     let tmp = scratch();
@@ -48,11 +47,9 @@ fn a_stamp_is_one_file_per_tab_written_whole() {
     assert_eq!(Cause::parse("exit"), None);
 }
 
-/// TAKING A STAMP TAKES ONLY THE ONE MEANT: one `ours` accepts is removed and
-/// returned; one it refuses is never moved — a reader of the tab's stamp
-/// finds it while it is judged (the review of ruling 21, 2026-10-14) — and a
-/// newer stamp written meanwhile is never replaced or taken: one landing
-/// between the judgement and the move is put back.
+/// Taking a stamp takes only the one meant: one `ours` accepts is removed and returned; one it
+/// refuses is never moved; and a newer stamp landing between the judgement and the move is put
+/// back, never taken.
 #[test]
 fn taking_a_stamp_takes_only_the_one_meant() {
     let tmp = scratch();
@@ -74,9 +71,7 @@ fn taking_a_stamp_takes_only_the_one_meant() {
         Some(newer.clone()),
         "the newer one stands"
     );
-    // Judged where it stands: a reader of the tab's stamp finds it while a
-    // take judges it (the act's watch, which lets its program go when its
-    // tab's stamp names it no more).
+    // Judged in place: the act's watch finds the stamp while a take judges it.
     assert_eq!(
         take_if(state, "s-1", |_| {
             assert_eq!(read(state, "s-1"), Some(newer.clone()), "in place");
@@ -108,12 +103,10 @@ fn taking_a_stamp_takes_only_the_one_meant() {
     );
 }
 
-/// THE READER'S LOOKUP: a stamp naming the process whose exit is read gives
-/// its cause, and stands until the relaunch takes it; one naming ANOTHER
-/// process that still runs is left alone (that act is not over); one naming
-/// a process that is gone, or older than `STALE_S`, is removed as it is
-/// found. The live process here is this test's own, read as the snapshot
-/// reads one.
+/// The reader's lookup: a stamp naming the process whose exit is read gives its cause and stands
+/// until the relaunch takes it; one naming another process that still runs is left alone; one
+/// naming a gone process, or older than `STALE_S`, is removed as it is found. The live process is
+/// this test's own.
 #[test]
 fn the_lookup_names_its_exit_and_sweeps_what_is_over() {
     let tmp = scratch();
@@ -176,10 +169,9 @@ fn the_lookup_names_its_exit_and_sweeps_what_is_over() {
     assert_eq!(lookup(state, "s-9", 4242, "x", now), None);
 }
 
-/// THE STAMP STANDING FOR A PROCESS is the one its exit would be read by: the
-/// tab's stamp naming that very process (pid and kernel start), no older than
-/// `STALE_S`. An act that finds it joins it (review of 3eaa8f83c). Nothing is
-/// written or removed by asking.
+/// The stamp standing for a process is the one its exit would be read by: the tab's stamp naming
+/// that very process (pid and kernel start), no older than `STALE_S`. Asking writes or removes
+/// nothing.
 #[test]
 fn the_stamp_standing_for_a_process_is_the_one_its_exit_is_read_by() {
     let tmp = scratch();
@@ -214,11 +206,9 @@ fn the_stamp_standing_for_a_process_is_the_one_its_exit_is_read_by() {
     assert_eq!(read(state, "s-1"), Some(s), "asking removes nothing");
 }
 
-/// THE ACT READS A START IN THE SNAPSHOT'S OWN SPELLING: on macOS by
-/// syscall, never a `ps` (review of 3eaa8f83c), and equal to what `ps -o
-/// lstart=` in UTC and the C locale says of the same process — the
-/// spelling the snapshot (and Claude Code's `procStart`) names it by. A
-/// stamp stands a second short of going stale.
+/// The act reads a start in the snapshot's own spelling: on macOS by syscall, never a `ps`, and
+/// equal to what `ps -o lstart=` in UTC and the C locale says of the same process. A stamp stands a
+/// second short of going stale.
 #[test]
 fn the_act_reads_a_start_in_the_snapshots_own_spelling() {
     let me = std::process::id();
@@ -235,10 +225,9 @@ fn the_act_reads_a_start_in_the_snapshots_own_spelling() {
     assert!(!s.stale(stale_at) && s.stale(stale_at + 1));
 }
 
-/// THE PRUNE REMOVES ONLY A STALE STAMP: one past `STALE_S` goes whatever
-/// its process; one still standing stays even naming a process that is gone
-/// (its exit may not have been read yet); a file that is no stamp's is not
-/// the prune's.
+/// The prune removes only a stale stamp: one past `STALE_S` goes whatever its process; one still
+/// standing stays even naming a gone process (its exit may not have been read yet); a file that is
+/// no stamp's is not the prune's.
 #[test]
 fn the_prune_removes_only_a_stale_stamp() {
     let tmp = scratch();
@@ -267,13 +256,9 @@ fn the_prune_removes_only_a_stale_stamp() {
     }
 }
 
-/// THE RELAUNCH THAT FILES AN ASKED EXIT TAKES ITS STAMP AND SAYS WHY: an
-/// exit the act made (its stamp naming the process) is consumed once its
-/// relaunch's record is filed, and the record's cause, `asked`, is a
-/// relaunch's (its continuation says someone asked for the restart) — not a
-/// restart that ENDED its agent, whose clock `end_asked_at` dates. NEGATIVE
-/// CONTROLS: an exit no act made (`ExitCause::Exit`) takes nothing, nor does
-/// a stamp naming another process, nor a dry run.
+/// The relaunch that files an asked exit consumes its stamp, and the cause `asked` is a relaunch's,
+/// not a restart that ended its agent. Negative controls: an exit no act made (`ExitCause::Exit`),
+/// a stamp naming another process, and a dry run take nothing.
 #[test]
 fn the_relaunch_that_files_an_asked_exit_takes_its_stamp_and_says_why() {
     use super::super::relaunch::{
@@ -293,9 +278,12 @@ fn the_relaunch_that_files_an_asked_exit_takes_its_stamp_and_says_why() {
         aterm_state: None,
         ask: false,
         several_logins: false,
+        usage_tap: None,
         instances: crate::harness::upgrade_drive::Instances::Listed(Vec::new()),
+        agents_off: Vec::new(),
     };
     let snap = Snapshot {
+        stored_login: false,
         tab: "s-1".to_string(),
         pid: 4242,
         start: "Wed Sep 23 20:13:55 2026".to_string(),

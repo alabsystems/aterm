@@ -171,8 +171,6 @@ mod tests {
             true,
         );
         let lines = notice_lines(&msg);
-        // stderr says what the band says: the loss in words that need no
-        // AT-SPI knowledge, then the only retry, then the reason.
         assert_eq!(
             lines,
             [

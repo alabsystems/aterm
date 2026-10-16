@@ -136,14 +136,11 @@ pub(crate) fn presence_regrids() -> u64 {
     PTY_RESIZES_FOR_PRESENCE.with(|c| c.get())
 }
 
-/// Whether window `ws`'s grid re-grids when its chrome rows move: a real OS
-/// window (a headless window keeps its inserted grid; its chrome caches are
-/// the whole re-grid), or a test's stand-in for one. Only such a window has a
-/// chrome regrow floor (ruling 414): a window whose grid never moves
-/// for its chrome cannot flap, so none of its falls waits. It is also what
-/// "glass" means to the two afford laws — the band's (`App::band_commit`)
-/// and the presence row's ([`Desk::grid_rows`]) — so a stand-in whose rows a
-/// test shrinks takes the window's own fall exactly as a real window does.
+/// Whether window `ws`'s grid re-grids when its chrome rows move: a real OS window, or a
+/// test's stand-in for one (a headless window keeps its inserted grid; its chrome caches are
+/// the whole re-grid). Only such a window has a chrome regrow floor, since a grid that never
+/// moves for its chrome cannot flap. It is also what "glass" means to the band's and the
+/// presence row's afford laws (`App::band_commit`, [`Desk::grid_rows`]).
 pub(crate) fn chrome_regrids_grid(ws: &crate::WindowState) -> bool {
     #[cfg(test)]
     if ws.chrome_regrids_for_test {
@@ -176,7 +173,7 @@ impl App {
 
     /// Gather one session's facts: leaf locks only, each held for a copy; the
     /// agent reading is the status sweep's published one.
-    fn presence_facts(&self, session: u64) -> Option<Facts> {
+    pub(crate) fn presence_facts(&self, session: u64) -> Option<Facts> {
         let s = self.pool.get(session)?;
         let ctx = &s.ctx;
         let now_us = crate::metrics::now_us();
@@ -242,8 +239,8 @@ impl App {
                 upgrade_only && meta.attention.is_some(),
             )
         };
-        // The link as THIS App sees it (`fabric_state_seen`: the process
-        // link, keyed away from a foreign test section in a test binary).
+        // The link as this App sees it (`fabric_state_seen`: the process link, keyed away
+        // from a foreign test section in a test binary).
         let link = match crate::fabric::fabric_state_seen() {
             "connected" => Link::Connected {
                 rtt_ms: crate::fabric::fabric_link_facts().1,
@@ -274,27 +271,35 @@ impl App {
             .session_status
             .status(session)
             .map(|st| (st.phase.as_str(), st.since));
+        // What a `codex` in front reports about itself (OSC 7501): the row's
+        // word where no agent reading names a phase. Display only.
+        let program = self
+            .session_status
+            .program_state(session)
+            .map(|(state, since)| (crate::program_state::row_word(state), since));
         // The sweep's published verdict (only for an identified agent, only
         // when its live zone changed); presence never re-reads the screen, so
         // band, rim, `status agent=` and `EVENT agent` agree.
         let (agent_seq, agent) = self.session_status.agent_reading(session);
         // The loop's next try on an API wall (`with_retry_plan`): the tab says
         // `→ 14:05 · 3m00s` beside the wall's words, which stay the screen's.
+        let now_unix = aterm_time::unix_secs().map_or(0, |s| i64::try_from(s).unwrap_or(0));
         let agent = match self.harness_waits.get(ctx.self_id.as_str()) {
             None => agent,
-            Some(plan) => presence::with_retry_plan(
-                agent,
-                Some(plan),
-                aterm_time::unix_secs().map_or(0, |s| i64::try_from(s).unwrap_or(0)),
-                now,
-            ),
+            Some(plan) => presence::with_retry_plan(agent, Some(plan), now_unix, now),
         };
-        // WHO ANSWERS THE WALL it is at: a wall aterm's own
-        // harness — holding this session's claim — resumes by itself is a
-        // record, not a stop; a wall nobody answers (no claim, another
-        // holder's, the owner's switch off, a login, the memory banner) keeps
-        // the stop. Read on every refresh, so a claim that arrives or lapses
-        // moves it without a new agent reading.
+        // A Codex's reset as its supervisor placed it, in that Codex's own zone
+        // (`with_placed_reset`): the tab counts down to when the loop continues.
+        let agent = presence::with_placed_reset(
+            agent,
+            self.harness_resets.get(ctx.self_id.as_str()),
+            now_unix,
+            now,
+        );
+        // Who answers the wall: one this aterm's harness resumes by itself (it holds the
+        // session's claim) is a record, not a stop; one nobody answers (no claim, another
+        // holder's, the owner's switch off, a login, the memory banner) stays a stop. Read on
+        // every refresh, so a claim arriving or lapsing moves it without a new reading.
         let wall_answer = match (agent.as_ref().map(|a| &a.phase), self.harness.as_ref()) {
             (Some(presence::AgentPhase::Wall { kind, reset, .. }), Some(host))
                 if ctx
@@ -304,21 +309,29 @@ impl App {
                     .live_supervisor(now_us)
                     .is_some_and(|holder| holder == crate::harness_host::holder()) =>
             {
-                host.wall_answer(*kind, reset.is_some())
+                let program = {
+                    let timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+                    crate::harness_host::agent_of(timeline.agent())
+                };
+                if program.is_some_and(|agent| host.admits(agent)) {
+                    host.wall_answer(*kind, reset.is_some())
+                } else {
+                    presence::WallAnswer::Nobody
+                }
             }
             _ => presence::WallAnswer::Nobody,
         };
-        // The published input stall (`input_stall::InputWatches`): the fact
-        // the frozen program's unmoving screen cannot carry — with the
-        // explicit restart (`act`) its publication gave the watch's copy, the
-        // one the attention entry and the menu row name too. No lock.
+        // The published input stall (`input_stall::InputWatches`): the fact a frozen
+        // program's unmoving screen cannot carry, with the restart (`act`) the attention
+        // entry and the menu row name too. No lock.
         let input_stall = self.session_status.input_stall(session).cloned();
         Some(Facts {
             role,
             attention,
             attention_told_elsewhere,
             shell,
-            // The plan's changes count as news to the engine (see
+            program,
+            // The plan's and the placement's changes count as news to the engine (see
             // `App::harness_wait_epoch`).
             agent_seq: agent_seq + self.harness_wait_epoch,
             agent,
@@ -409,6 +422,63 @@ impl App {
         }
     }
 
+    /// What the harness loop of `sid` told the window
+    /// ([`crate::Wake::HarnessFact`], `docs/DESIGN-harness-autopilot-2026-10-15.md`
+    /// §9.2.3, §9.4.4): an ACT goes to the harness's glass
+    /// ([`crate::harness_glass::on_act`]); the TASK'S FACE goes on the
+    /// session's timeline, where `status task=` reads it under the lock it
+    /// already takes, and into the glass the frame reads with none — and,
+    /// where it moved, the session's footer is posted. A fact for a session
+    /// this window does not hold is dropped. A face told again is no move:
+    /// no frame.
+    pub(crate) fn apply_harness_fact(&mut self, sid: &str, fact: crate::HarnessFact) {
+        let Some(session) = self.local_session_of(&SessionId::new(sid)) else {
+            return;
+        };
+        match fact {
+            crate::HarnessFact::Act(act) => crate::harness_glass::on_act(self, session, act),
+            crate::HarnessFact::Task(face) => {
+                let Some(entry) = self.pool.get(session) else {
+                    return;
+                };
+                let at_ms = crate::turn_ledger::now_ms();
+                let at_ms = i64::try_from(at_ms).unwrap_or(i64::MAX);
+                let moved = entry
+                    .ctx
+                    .timeline
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .set_task_face(face, at_ms);
+                if !moved {
+                    return;
+                }
+                if crate::harness_glass::on_task(self, session, face, at_ms) {
+                    crate::claude_footer::post_changed(session);
+                }
+            }
+        }
+    }
+
+    /// A Codex's wall reset as the harness placed it for `sid`
+    /// ([`crate::Wake::HarnessReset`]): stored, and the tab's words re-read
+    /// where it changed.
+    pub(crate) fn apply_harness_reset(&mut self, sid: &str, placed: Option<presence::PlacedReset>) {
+        let changed = match placed {
+            Some(placed) => {
+                let was = self.harness_resets.insert(sid.to_string(), placed.clone());
+                was.as_ref() != Some(&placed)
+            }
+            None => self.harness_resets.remove(sid).is_some(),
+        };
+        if !changed {
+            return;
+        }
+        self.harness_wait_epoch += 1;
+        if let Some(session) = self.local_session_of(&SessionId::new(sid)) {
+            self.refresh_presence_session(session, false);
+        }
+    }
+
     /// The wake arms: resolve the fabric sid to the pool's local id.
     pub(crate) fn on_presence_wake(&mut self, sid: &SessionId, submitted: bool) {
         if let Some(session) = self.local_session_of(sid) {
@@ -416,7 +486,7 @@ impl App {
         }
     }
 
-    /// Project the window's FOCUSED session onto its view and commit the row
+    /// Project the window's focused session onto its view and commit the row
     /// (`drive::refresh_window`).
     pub(crate) fn refresh_presence_window(&mut self, wid: WindowId) {
         drive::refresh_window(self, wid);
@@ -449,9 +519,8 @@ impl App {
         // Press-only, and never on focus alone.
         let seen = front.filter(|_| pressed);
         let echo = self.echo_probe_open(wid, front);
-        // Strain (design §10.14): only a key dispatched from this arm counts
-        // toward the strain engine's input→present slice; control
-        // `send`/`feed`/`key` never do.
+        // Only a key dispatched from this arm counts toward the strain engine's
+        // input→present slice; control `send`/`feed`/`key` never do.
         if pressed {
             self.strain.note_hw_key(Instant::now());
         }
@@ -786,17 +855,15 @@ impl App {
             // this one re-grid, not when the import settles later.
             app.say_carried_history_loss();
             // …and the carried Settings text the restore could not put back,
-            // which the parent held until now (the review of round eight's U61).
+            // which the parent held until now.
             app.say_carried_settings_drafts_loss();
             app.sync_messages();
         });
     }
 
-    /// Note a RISE of the chrome rows every window shares (a band row reached
-    /// the glass, the tab strip grew) on every window's regrow floor
-    /// (`aterm_messages::chrome::RegrowFloor::rose`, ruling 414).
-    /// Noted on every window; read only where the grid re-grids for its
-    /// chrome ([`chrome_regrids_grid`]).
+    /// Note a rise of the chrome rows every window shares (a band row reached the glass, the
+    /// tab strip grew) on every window's regrow floor (`aterm_messages::chrome::RegrowFloor`);
+    /// read only where the grid re-grids for its chrome ([`chrome_regrids_grid`]).
     pub(crate) fn note_chrome_rise_everywhere(&mut self, now: Instant) {
         for ws in self.windows.values_mut() {
             ws.regrow_floor.rose(now);
@@ -909,15 +976,19 @@ impl App {
     /// hear a background session's answer. Headless and test audio is inert,
     /// and zero volume spends no token.
     pub(crate) fn chose_chime(&mut self, now: Instant) {
-        let allowed = chose_chime_allowed(
+        // The chime's law is the voice table's (no focus or motion term: the
+        // point is to hear a background session's answer); a zero volume is
+        // a mute too, so it is read before the token as well.
+        let Some(gain) = chose_chime_gain(
             self.serious_mode_policy()
                 .allows(crate::motion::SeriousEffect::TerminalSound),
             self.config.trail_sounds_or_default(),
             self.config.choice_sound_or_default(),
-        );
-        // A zero volume is a mute too, so it is read before the token as well.
-        let gain = self.config.trail_sound_volume();
-        if !allowed || gain <= 0.0 || !self.chose_chime_gate.try_fire(now) {
+            self.config.trail_sound_volume(),
+        ) else {
+            return;
+        };
+        if !self.chose_chime_gate.try_fire(now) {
             return;
         }
         self.trail_audio
@@ -1079,7 +1150,7 @@ impl Desk for App {
         })
     }
 
-    /// The LIVE mark, reduced as `presence_facts` reduces the read it senses:
+    /// The live mark, reduced as `presence_facts` reduces the read it senses:
     /// the session's own lease, else whether it drives a peer's turn.
     fn lease_mark(&self, session: u64) -> Option<LeaseMark> {
         let s = self.pool.get(session)?;
@@ -1130,8 +1201,7 @@ impl Desk for App {
         self.chrome_commit_grid_rows(w)
     }
 
-    /// Read off the window's stored floor (ruling 414), only where
-    /// its grid re-grids for its chrome.
+    /// Read off the window's stored floor, only where its grid re-grids for its chrome.
     fn chrome_floor(&self, w: WindowId) -> Option<Instant> {
         self.chrome_regrow_floor(w)
     }
@@ -1200,13 +1270,22 @@ impl Desk for App {
         let Some(ctx) = self.pool.get(session).map(|s| s.ctx.clone()) else {
             return;
         };
-        if crate::session_timeline::lapse_supervisor(&ctx, crate::metrics::now_us())
-            && self.subscribers.any()
-        {
-            self.subscribers
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .notify(session);
+        if crate::session_timeline::lapse_supervisor(&ctx, crate::metrics::now_us()) {
+            // The footer's Autopilot chip and the harness card read the live
+            // claim: a lapsed one repaints them, as a released one does
+            // (`Wake::MetaChanged`, `App::on_meta_changed`). So does the
+            // session's A/B arm, and its Settings ▸ Harness row (the review
+            // of a295792e4): an Off session behind a dead holder's ttl claim
+            // was charged to Unsupervised until its word next moved.
+            self.redraw_claude_footer(session);
+            self.note_harness_arm(session);
+            self.harness_screen_moved();
+            if self.subscribers.any() {
+                self.subscribers
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .notify(session);
+            }
         }
     }
 
@@ -1219,15 +1298,29 @@ impl Desk for App {
     }
 }
 
-/// Whether the choice chime may speak, before its rate limiter: serious mode
-/// allows terminal sound, the Music effects master is on, and `choice_sound`
-/// is on. Pure, so testable where the audio host is inert.
-pub(crate) const fn chose_chime_allowed(
+/// The gain the choice chime speaks at, before its rate limiter, or `None`:
+/// serious mode allows terminal sound, the Music effects master is on,
+/// `choice_sound` is on and the volume is up, through the voice table
+/// ([`aterm_effects::sound_policy::Voice::Chime`] follows neither focus nor
+/// motion). Pure, so testable where the audio host is inert.
+pub(crate) fn chose_chime_gain(
     serious_allows_sound: bool,
     music_effects: bool,
     choice_sound: bool,
-) -> bool {
-    serious_allows_sound && music_effects && choice_sound
+    volume: f32,
+) -> Option<f32> {
+    use aterm_effects::sound_policy::{Voice, VoiceTerms, voice_gain};
+    voice_gain(
+        Voice::Chime,
+        &VoiceTerms {
+            master: serious_allows_sound && music_effects,
+            own: choice_sound,
+            volume,
+            // The answer is heard from any window, at any motion.
+            raw_focused: false,
+            reduced_motion: true,
+        },
+    )
 }
 
 fn pack(c: [u8; 3]) -> u32 {
@@ -1264,14 +1357,13 @@ mod tests {
         app.presence_report(wid).expect("a window")
     }
 
-    /// The headless model (§7): a turn submit puts the rim on and the hand in
-    /// the band before any status revision moves; a hold is the stop rim and
-    /// `⊘ hold` within one wake; a delivery prints `✉1 task←✓x` with the trust
-    /// glyph before the sender; a hold lands only on the session it names.
+    /// A turn submit puts the rim on and the hand in the band before any status revision
+    /// moves; a hold is the stop rim and `⊘ hold` within one wake; a delivery prints
+    /// `✉1 task←✓x` (trust glyph before the sender); a hold lands only on the session it names.
     #[test]
     fn a_turn_a_hold_and_a_delivery_reach_the_rim_and_the_band_at_change_rate() {
-        // Reads the process-global link through `presence_level`, so it takes
-        // the reset like every other reader.
+        // The level folds in the process-global link (a sibling test's bridge turns `Quiet`
+        // into `Note`), so every test that reads it takes the reset.
         crate::fabric::with_link_reset(
             a_turn_a_hold_and_a_delivery_reach_the_rim_and_the_band_at_change_rate_body,
         );
@@ -1382,13 +1474,10 @@ mod tests {
         assert_eq!(app.presence.slot(sid).unwrap().level(0), Level::Attention);
     }
 
-    /// The fold law (§7): a keypress while not calm is not a fold; calm without
-    /// a keypress is not a fold; both together fold the row, with one PTY
-    /// re-grid.
+    /// The fold law: a keypress while not calm is no fold, calm without a keypress is no fold;
+    /// both together fold the row with one PTY re-grid.
     #[test]
     fn the_row_folds_only_on_a_keypress_while_calm_and_pays_one_regrid() {
-        // Reads the process-global link through `presence_level`, so it takes
-        // the reset like every other reader.
         crate::fabric::with_link_reset(
             the_row_folds_only_on_a_keypress_while_calm_and_pays_one_regrid_body,
         );
@@ -1412,7 +1501,7 @@ mod tests {
             "the row appearing is one re-grid"
         );
 
-        // A key while HELD: not calm, no fold.
+        // A key while held: not calm, no fold.
         app.note_human_acted(wid);
         assert_eq!(app.presence_view(wid).unwrap().rows, 1);
         assert_eq!(presence_regrids(), regrids + 1);
@@ -1496,8 +1585,7 @@ mod tests {
             // never ages it past `FOLD_QUIET`.
             app.windows.get_mut(&wid).unwrap().presence.born_at = Some(Instant::now());
             assert!(app.pointer_cmd(PointerAction::Click).is_ok());
-            // The press is logged `Acted` (the navigation then folds the
-            // row, design §10.5 H6).
+            // The press is logged `Acted` (the navigation then folds the row).
             assert_eq!(
                 app.messages
                     .log()
@@ -1564,9 +1652,8 @@ mod tests {
             assert_eq!(view.watermark(top), 0, "the pane the press focused is not");
             assert_eq!(app.presence_level(wid), Level::Story, "its row is up");
             assert_eq!(app.presence_view(wid).unwrap().rows, 1);
-            // The next act in the pane now in front reads it. A read folds a
-            // row only once it has stood `FOLD_QUIET`, so the birth is dated
-            // back.
+            // The next act in the pane now in front reads it (the row aged past its
+            // minimum life first).
             let born = &mut app.windows.get_mut(&wid).unwrap().presence.born_at;
             *born = born.and_then(|b| b.checked_sub(FOLD_QUIET));
             app.mouse_input_then_fold(wid, ElementState::Pressed, MouseButton::Left);
@@ -1576,17 +1663,11 @@ mod tests {
         });
     }
 
-    /// THE FOLD QUIET (ruling 394), on the real App: a settling
-    /// turn's lease born and dropped inside a millisecond — the incident's
-    /// schedule (measured 2026-09-28: 121x52 -> 51 -> 52 within ~0.8 ms, an
-    /// alt-screen Claude Code left stale) — pays ONE PTY re-grid, the birth,
-    /// not two; a second lease inside the quiet pays none; the row stands
-    /// blank with an empty `chrome` band meanwhile; and the timer the
-    /// presence deadline arms folds it once, one re-grid, after the quiet.
+    /// A settling turn's lease born and dropped within a millisecond pays one PTY re-grid (the
+    /// birth), not two; a second lease inside `FOLD_QUIET` pays none; the row stands blank
+    /// meanwhile, and the presence timer folds it once after the quiet.
     #[test]
     fn a_quick_show_and_fold_pays_one_regrid_not_two() {
-        // Reads the process-global link through `presence_level`, so it takes
-        // the reset like every other reader.
         crate::fabric::with_link_reset(a_quick_show_and_fold_pays_one_regrid_not_two_body);
     }
 
@@ -1638,12 +1719,9 @@ mod tests {
         assert_eq!(presence_regrids(), regrids + 2, "folded once");
     }
 
-    /// The tab retry plan, through the window: the sweep publishes an API wall
-    /// for the front session; the next try told over `Wake::HarnessWait` lands
-    /// on that tab's words (`→ <clock> · <left>` on the band, `next try` in the
-    /// sentence), and clearing it or a past plan removes it. Controls: the
-    /// wall's band word stays the screen's, and another session's plan changes
-    /// nothing here.
+    /// The next try told over `Wake::HarnessWait` lands on the wall's tab (`→ <clock> · <left>`
+    /// on the band, `next try` in the sentence); clearing it or a past plan removes it.
+    /// Controls: the wall's word stays the screen's, and another session's plan changes nothing.
     #[test]
     fn the_loops_next_try_reaches_the_tab_beside_an_api_wall_and_only_there() {
         crate::fabric::with_link_reset(|| {
@@ -1689,6 +1767,144 @@ mod tests {
         });
     }
 
+    /// A Codex's reset placed by its supervisor (`Wake::HarnessReset`) is what the tab counts
+    /// down to: the window's own reading of the words is in this process's zone, which a
+    /// `TZ` the tab's shell exported never reaches. Controls, each leaving the row as the
+    /// screen alone made it: another notice's words, another session's placement, and the
+    /// placement cleared.
+    #[test]
+    fn a_codex_tab_counts_its_wall_down_to_the_reset_its_supervisor_placed() {
+        crate::fabric::with_link_reset(|| {
+            let (mut app, _wid, sid, ctx) = app_with_stub();
+            let now = Instant::now();
+            let rows = aterm_phase::codex::fixtures::HIT_LIMIT
+                .lines()
+                .map(str::to_string)
+                .collect();
+            app.session_status.agent_observe(
+                sid,
+                crate::control::ScreenGen { epoch: 0, seq: 1 },
+                Some(rows),
+                crate::presence::Cursor::Unknown,
+                Some("codex".into()),
+                42,
+                false,
+                now,
+            );
+            app.refresh_presence_session(sid, false);
+            let mine = ctx.self_id.as_str().to_string();
+            let bare = app.presence_chrome_line();
+            assert!(bare.contains("Oct 17th 1:14 PM"), "{bare}");
+            let counts = |line: &str| line.contains("2h00m") || line.contains("1h59m");
+            assert!(!counts(&bare), "{bare}");
+
+            let unix = aterm_time::unix_secs().map_or(0, |s| i64::try_from(s).unwrap_or(0));
+            let placed = |words: &str| presence::PlacedReset {
+                words: words.to_string(),
+                at_unix: Some(unix + 2 * 3600),
+            };
+            app.apply_harness_reset(&mine, Some(placed("Oct 17th 1:14 PM")));
+            let told = app.presence_chrome_line();
+            assert!(told.contains("Oct 17th 1:14 PM"), "the words stay: {told}");
+            assert!(counts(&told), "the supervisor's placement: {told}");
+
+            // CONTROLS.
+            app.apply_harness_reset(&mine, Some(placed("4:10 PM")));
+            assert_eq!(app.presence_chrome_line(), bare, "another notice's words");
+            app.apply_harness_reset(&mine, None);
+            app.apply_harness_reset("s-not-this-one", Some(placed("Oct 17th 1:14 PM")));
+            assert_eq!(app.presence_chrome_line(), bare, "not this tab's");
+        });
+    }
+
+    /// A worker may still hold its claim while the stop cleans it up. That
+    /// true claim must not hide the disabled agent's wall from the owner.
+    #[test]
+    fn a_disabled_agents_wall_is_unattended_while_its_old_claim_still_lives() {
+        crate::fabric::with_link_reset(|| {
+            let (mut app, _wid, sid, ctx) = app_with_stub();
+            {
+                let mut timeline = ctx.timeline.lock().unwrap();
+                timeline.note_foreground_group(42);
+                timeline.set_program(42, Some("claude".into()));
+            }
+            let rows = aterm_phase::prompt::fixtures::screen(
+                aterm_phase::prompt::fixtures::API_ERROR_TALL_PANE_MEASURED,
+            );
+            let step = app.session_status.agent_observe(
+                sid,
+                crate::control::ScreenGen { epoch: 0, seq: 1 },
+                Some(rows),
+                crate::presence::Cursor::Unknown,
+                Some("claude".into()),
+                42,
+                false,
+                Instant::now(),
+            );
+            // The shipping sweep publishes the reader's returned verdict
+            // before gathering presence facts; the private cache alone is
+            // not the timeline's authoritative agent identity.
+            let (word, detail, subject, reader) = step.publish.expect("the API wall was read");
+            ctx.timeline.lock().unwrap().publish_agent(
+                word,
+                detail,
+                subject,
+                reader,
+                crate::session_timeline::AgentStamp {
+                    generation: crate::control::ScreenGen { epoch: 0, seq: 1 },
+                    fp: 1,
+                },
+            );
+            let host = crate::harness_host::HostHandle::for_supervised_test(
+                Vec::new(),
+                Arc::new(|_| crate::harness_host::BodyEnd::Stopped),
+            );
+            app.harness = Some(host.clone());
+            let holder = crate::harness_host::holder();
+            crate::session_timeline::claim_supervisor(
+                &ctx,
+                &holder,
+                None,
+                None,
+                crate::metrics::now_us(),
+            )
+            .unwrap();
+            let mut answers = Vec::new();
+            for off in [
+                None,
+                Some(aterm_phase::Program::Claude),
+                Some(aterm_phase::Program::Codex),
+            ] {
+                let cfg = aterm_agent::supervise::SupervisorConfig {
+                    off: off.into_iter().collect(),
+                    ..Default::default()
+                };
+                host.set_config(cfg);
+                answers.push(app.presence_facts(sid).unwrap().wall_answer);
+            }
+            let still_claimed = ctx
+                .meta
+                .lock()
+                .unwrap()
+                .live_supervisor(crate::metrics::now_us())
+                .map(str::to_string);
+            host.shutdown_and_join();
+            assert_eq!(
+                still_claimed.as_deref(),
+                Some(holder.as_str()),
+                "the claim fact stays true"
+            );
+            assert_eq!(
+                answers,
+                [
+                    presence::WallAnswer::Harness,
+                    presence::WallAnswer::Nobody,
+                    presence::WallAnswer::Harness
+                ]
+            );
+        });
+    }
+
     /// A retry plan for a try at unix second `at`, its clock read in UTC.
     fn plan(at: i64) -> presence::RetryPlan {
         presence::RetryPlan::with_offset(at, Some(0))
@@ -1706,13 +1922,10 @@ mod tests {
                 .expect("seconds")
     }
 
-    /// The tab's retry countdown ticks: with a plan beside an API wall, the
-    /// presence timer is armed at the words' 1 s clock, each tick recomposes
-    /// and dirties the window, and `<left>` falls by the elapsed second, in both
-    /// the `chrome` verb's bytes and the painted row. A plan whose time comes
-    /// lapses on the same clock. Controls: a cleared or past plan drops to the
-    /// minute cadence (no repaint); a headless window arms no text tick, and
-    /// only a change of plan moves its words.
+    /// With a retry plan beside an API wall, the presence timer ticks at the words' 1 s clock:
+    /// each tick recomposes and dirties the window and `<left>` falls by a second, in the
+    /// `chrome` bytes and the painted row; the plan lapses on the same clock. Controls: a
+    /// cleared or past plan drops to the minute cadence; a headless window arms no text tick.
     #[test]
     fn the_tabs_retry_countdown_ticks_on_the_presence_timer_while_a_plan_stands() {
         /// Puts the test's presence clock back to the wall's, panic or not.
@@ -1888,7 +2101,7 @@ mod tests {
             }
             t += Duration::from_secs(30);
 
-            // CONTROL: a plan already past is a try made, not a countdown.
+            // Control: a plan already past is a try made, not a countdown.
             app.apply_harness_wait(&mine, Some(plan(unix - 60)));
             assert!(words(&app).since.is_empty(), "{:?}", words(&app).since);
             assert_eq!(
@@ -1913,23 +2126,16 @@ mod tests {
         });
     }
 
-    /// The repaint invariant (§7): on a quiet window `presence_fp` is 0 across
-    /// a thousand frames, the overlay is `None`, and the frame path allocates
-    /// nothing (no cache capacity, plain fields, `Copy` reads).
-    /// `aterm ctl story` reaches the band within one revision (phase slot
-    /// `✓ approved`, `status` `level=story story=<n>`, `chrome` the same
-    /// words), and the slot returns to the phase after three seconds. A
-    /// session the pool does not hold is an error.
+    /// `aterm ctl story` reaches the band within one revision (phase slot `✓ approved`,
+    /// `status` `level=story story=<n>`, `chrome` the same words), and the slot returns to the
+    /// phase after `TOLD_FLASH`. A session the pool does not hold is an error.
     #[test]
     fn a_told_story_reaches_the_band_and_the_verbs_within_one_revision() {
-        // Reads the process-global link, so it takes the reset like every
-        // other reader.
         crate::fabric::with_link_reset(|| {
             use crate::presence::{StoryVerb, TOLD_FLASH};
             let (mut app, wid, sid, _ctx) = app_with_stub();
             let revision = app.session_status.revision(sid);
             let record = app.session_status_record(sid).expect("live");
-            // The round-19 tail, with round 22's screen stamp appended after it.
             assert!(
                 record.contains(" hand=- level=quiet story=0 why=- path=live program="),
                 "{record}"
@@ -2040,10 +2246,9 @@ mod tests {
         assert!(v.ripple_at.is_none());
     }
 
-    /// The classifier gate (§7), presence's half: a refresh folds the sweep's
-    /// published reading and never classifies; a thousand refreshes and a
-    /// status revision move cost zero `aterm_phase` calls. The sweep's half is
-    /// pinned in `session_status`.
+    /// Presence's half of the classifier gate: a refresh folds the sweep's published reading
+    /// and never classifies, so refreshes and a status revision cost zero `aterm_phase` calls.
+    /// The sweep's half is pinned in `session_status`.
     #[test]
     fn a_presence_refresh_never_classifies() {
         use crate::session_status::{ActivitySample, Evidence};
@@ -2061,7 +2266,6 @@ mod tests {
             activity: ActivitySample {
                 alt_screen: false,
                 content_seq: 1,
-                last_input: None,
                 last_output: Some(t0),
             },
         };
@@ -2129,9 +2333,8 @@ mod tests {
         }
     }
 
-    /// Every band row of design §1 that this slice paints, as `(name, slot, the
-    /// whole line)`. The lines are the mocks' rows through the composer; the
-    /// story row is 126 cells, so the whole line is read at 160 columns.
+    /// Every band row the design's mocks show, as `(name, slot, the whole line)`. The story
+    /// row is 126 cells, so the whole line is read at 160 columns.
     fn rows(now: Instant) -> Vec<(&'static str, Slot, &'static str)> {
         let role = || Some("worker:claude-satcomp".to_string());
         let mut out = vec![
@@ -2339,12 +2542,11 @@ mod tests {
         out
     }
 
-    /// The golden cells (§7): every band row at 120, 60 and 24 columns, in
-    /// light, dark and each stock Windows High-Contrast palette. The 120-col
-    /// line is literal; at every width the painted text is the fitted words
-    /// (one margin cell each side), every cell sits on the band, every ink
-    /// clears it, emoji-capable glyphs use text presentation, and hand + phase
-    /// + mail survive to 24 columns.
+    /// Every band row at 120, 60 and 24 columns, in light, dark and each stock Windows
+    /// High-Contrast palette: the 120-col line is literal; at every width the painted text is
+    /// the fitted words (one margin cell each side), every cell sits on the band, every ink
+    /// clears it, emoji-capable glyphs use text presentation, and hand, phase and mail survive
+    /// to 24 columns.
     #[test]
     fn golden_cells_for_every_band_row_at_120_60_and_24_in_light_dark_and_hc() {
         let now = Instant::now();
@@ -2379,7 +2581,7 @@ mod tests {
                 let phase_word: String = w.phase.chars().take(4).collect();
                 assert!(fitted.contains(&phase_word), "{name} at {cols}: {fitted}");
                 // Mail survives where there is any; with none there is no
-                // slot to survive (ruling 366).
+                // slot to survive.
                 assert_eq!(
                     fitted.contains('\u{2709}'),
                     !w.mail.is_empty(),
@@ -2405,7 +2607,7 @@ mod tests {
                             cell.bg, colors.bar_bg,
                             "{name} {palette} {cols}: on the band"
                         );
-                        // Every glyph on the row is TEXT: AA 4.5, the hand
+                        // Every glyph on the row is text: AA 4.5, the hand
                         // and phase hues included (`presence_inks`).
                         if cell.ch != ' ' {
                             assert!(
@@ -2438,8 +2640,6 @@ mod tests {
     /// dot, quiet: the bit alone).
     #[test]
     fn the_chip_level_folds_the_session_level_over_the_indicator_bit() {
-        // Reads the process-global link, so it takes the reset like every
-        // other reader.
         crate::fabric::with_link_reset(|| {
             let (mut app, wid, sid, ctx) = app_with_stub();
             let metadata = |app: &App| -> Vec<crate::tab_bar::TabStripMetadata> {
@@ -2482,9 +2682,8 @@ mod tests {
         });
     }
 
-    /// The a11y round trip (§7), App side: the band's message is the sixth
-    /// chrome message, carries the spoken sentence, and sits on bar row 0 only
-    /// while the row is committed.
+    /// The band's a11y message is a chrome message carrying the spoken sentence, on bar row 0
+    /// only while the row is committed.
     #[cfg(a11y_tree)]
     #[test]
     fn the_band_sentence_is_the_sixth_chrome_message_on_bar_row_zero() {
@@ -2508,8 +2707,6 @@ mod tests {
         assert!(!m.activates);
         assert!(ChromeMessage::ORDER.contains(&ChromeMessage::PresenceStatus));
     }
-
-    // ---- honesty-cost review cases ----------------------------------------
 
     fn driven_words(now: Instant) -> presence::Words {
         let then = now - Duration::from_secs(192);
@@ -2541,12 +2738,10 @@ mod tests {
         presence::words(&s, now, 0)
     }
 
-    /// R1: the story watermark is per (window, SESSION), never per window —
-    /// reading tab A's story must not fold tab B's on focus alone.
+    /// The story watermark is per (window, session), never per window: reading tab A's story
+    /// must not fold tab B's on focus alone.
     #[test]
     fn review_r1_focus_alone_never_reads_another_sessions_story() {
-        // The link is process-global, and a sibling's bridge turns `Quiet`
-        // into `Note`, so every test that reads it takes the reset.
         crate::fabric::with_link_reset(
             review_r1_focus_alone_never_reads_another_sessions_story_body,
         );
@@ -2628,8 +2823,7 @@ mod tests {
         app.on_presence_wake(&ctx_a.self_id, false);
         assert_eq!(app.presence_view(wid).unwrap().rows, 1, "A's row is born");
         assert_eq!(presence_regrids(), regrids + 1, "the birth");
-        // The row has long stood its minimum life (ruling 394); the App's
-        // clock is the wall's, so the birth is dated back to match.
+        // Age the row past its minimum life.
         let born = &mut app.windows.get_mut(&wid).unwrap().presence.born_at;
         *born = born.and_then(|b| b.checked_sub(FOLD_QUIET + FOLD_QUIET));
         app.windows.get_mut(&wid).unwrap().mods = ModifiersState::CONTROL;
@@ -2646,7 +2840,7 @@ mod tests {
             regrids + 1,
             "a bound switch away and back is no geometry change at all"
         );
-        // CONTROL: away again, and a key B's PTY takes folds the row.
+        // Control: away again, and a key B's PTY takes folds the row.
         app.dispatch_hw_key(wid, key("y", KeyCode::KeyY));
         assert_eq!(app.focused_session_id(wid), Some(sid_b));
         app.windows.get_mut(&wid).unwrap().mods = ModifiersState::empty();
@@ -2698,8 +2892,7 @@ mod tests {
         app.on_presence_wake(&ctx_top.self_id, false);
         assert_eq!(app.presence_view(wid).unwrap().rows, 1, "A's row is born");
         assert_eq!(presence_regrids(), regrids + 1, "the birth");
-        // The row has long stood its minimum life (ruling 394); the App's
-        // clock is the wall's, so the birth is dated back to match.
+        // Age the row past its minimum life.
         let born = &mut app.windows.get_mut(&wid).unwrap().presence.born_at;
         *born = born.and_then(|b| b.checked_sub(FOLD_QUIET + FOLD_QUIET));
         let row_b = last_row(&mut app);
@@ -2720,7 +2913,7 @@ mod tests {
             regrids + 1,
             "a click away and back is no geometry change at all"
         );
-        // CONTROL: away again, and a click in B (B front) folds the row.
+        // Control: away again, and a click in B (B front) folds the row.
         let row_b = last_row(&mut app);
         click(&mut app, row_b);
         assert_eq!(app.focused_session_id(wid), Some(bottom));
@@ -2735,12 +2928,9 @@ mod tests {
         assert_eq!(presence_regrids(), regrids + 2, "the birth and the fold");
     }
 
-    /// R1b: the same root — a story the human READ does not come back after
-    /// they read a second tab.
+    /// A story already read does not come back after a second tab's story is read.
     #[test]
     fn review_r1b_a_story_already_read_does_not_return_on_a_tab_switch() {
-        // Reads the process-global link through `presence_level`, so it takes
-        // the reset like every other reader.
         crate::fabric::with_link_reset(
             review_r1b_a_story_already_read_does_not_return_on_a_tab_switch_body,
         );
@@ -2790,8 +2980,6 @@ mod tests {
     /// the rim and `◂ holder` lift when `lease status` says `none`.
     #[test]
     fn review_r2_a_lapsed_drive_lease_lifts_the_rim() {
-        // Reads the process-global link, so it takes the reset like every
-        // other reader.
         crate::fabric::with_link_reset(|| {
             let (mut app, wid, sid, ctx) = app_with_stub();
             let now_us = crate::metrics::now_us();
@@ -2901,7 +3089,7 @@ mod tests {
             w.sentence,
             "busy, 1 turn, 1 timed out, context 40 percent left"
         );
-        // The same story on an IDLE worker is the quiet row.
+        // The same story on an idle worker is the quiet row.
         s.absorb(
             Facts {
                 role: Some("worker:claude-satcomp".into()),
@@ -2926,12 +3114,10 @@ mod tests {
         );
     }
 
-    /// R4: an unread TASK still waits after a later note lands — the wait
-    /// rim stays, and the mail slot names the task, not the note.
+    /// An unread task still waits after a later note lands: the wait rim stays, and the mail
+    /// slot names the task, not the note.
     #[test]
     fn review_r4_an_unread_task_still_waits_after_a_later_note() {
-        // Reads the process-global link, so it takes the reset like every
-        // other reader.
         crate::fabric::with_link_reset(|| {
             let (mut app, wid, sid, ctx) = app_with_stub();
             let fabric_sid = ctx.self_id.as_str();
@@ -3083,9 +3269,8 @@ mod tests {
         assert!(d <= Instant::now() + Duration::from_secs(1));
     }
 
-    /// The limited figure counts down to the reset (design §1) with the
-    /// design's separator, and prints nothing when the reset cannot be placed
-    /// on the clock.
+    /// The limited figure counts down to the reset with the design's separator, and prints
+    /// nothing when the reset cannot be placed on the clock.
     #[test]
     fn review_r6_the_limited_figure_counts_down_to_the_reset() {
         let now = Instant::now();
@@ -3181,12 +3366,10 @@ mod tests {
         );
     }
 
-    /// R7: `chrome band=` is the row the human sees — fitted at the painter's
-    /// width (one margin cell each side), never a slot past the margin.
+    /// `chrome band=` is the row the human sees: fitted at the painter's width (one margin
+    /// cell each side), never a slot past the margin.
     #[test]
     fn review_r7_chrome_band_is_the_row_the_human_sees() {
-        // Reads the process-global link, so it takes the reset like every
-        // other reader.
         crate::fabric::with_link_reset(|| {
             let (mut app, wid, _sid, _ctx) = app_with_stub();
             let now = Instant::now();
@@ -3222,8 +3405,6 @@ mod tests {
     /// standing write edge.
     #[test]
     fn review_r8_a_turn_is_not_attributed_to_a_read_only_observer() {
-        // Reads the process-global link, so it takes the reset like every
-        // other reader.
         crate::fabric::with_link_reset(|| {
             let (mut app, wid, sid_a, ctx_a) = app_with_stub();
             let ia = app.windows[&wid].tab_set.tabs().len() - 1;
@@ -3261,7 +3442,7 @@ mod tests {
                 "{}",
                 app.presence_status_tail(sid_a)
             );
-            // A WRITE edge from the same session changes nothing by itself: the
+            // A write edge from the same session changes nothing by itself: the
             // lease still names nobody.
             {
                 let mut edges = ctx_a.edges.lock().unwrap();
@@ -3294,8 +3475,7 @@ mod tests {
         });
     }
 
-    /// R9: a cache hit on the frame path returns the cached row itself — no
-    /// clone per composed frame while a row is up.
+    /// A cache hit on the frame path returns the cached row itself: no clone per frame.
     #[test]
     fn review_r9_a_cache_hit_on_the_frame_path_does_not_allocate() {
         let (mut app, wid, _sid, ctx) = app_with_stub();
@@ -3320,8 +3500,8 @@ mod tests {
         );
     }
 
-    /// R10: U+1F512 (the fleet lock) is pinned to text presentation like the
-    /// other emoji-capable glyphs, so it stays one cell.
+    /// U+1F512 (the fleet lock) is pinned to text presentation like the other emoji-capable
+    /// glyphs, so it stays one cell.
     #[test]
     fn review_r10_the_fleet_lock_is_pinned_to_one_cell() {
         let now = Instant::now();
@@ -3359,11 +3539,9 @@ mod tests {
         assert!(row.get(at + 1).is_none_or(|c| !c.wide));
     }
 
-    /// Round fifteen content-6: a role in CJK reaches the glass in the cells
-    /// the terminal grid gives it — each glyph its lead cell and a `wide`
-    /// continuation, so the renderer draws it across both
-    /// (`materialized_cell_span` 2) rather than squeezing it into one — and a
-    /// combining mark takes no cell; the `chrome` line keeps the words.
+    /// A CJK role is painted in the cells the grid gives it (a lead cell plus a `wide`
+    /// continuation, so `materialized_cell_span` is 2), a combining mark takes no cell, and the
+    /// `chrome` line keeps the words.
     #[test]
     fn a_cjk_role_is_painted_two_cells_a_glyph() {
         let now = Instant::now();
@@ -3514,16 +3692,13 @@ mod tests {
         assert_eq!(presence::sanitize_token("  a   b  ", 32), "a b");
     }
 
-    /// Observed live: a told word under a hold read `✓ approved 0s ⊘ hold
-    /// review` — the stop's duration behind the told word, as an age.
+    /// The band reads `✓ approved  ⊘ hold review`, never `✓ approved 0s`.
     #[test]
     fn a_told_word_under_a_hold_carries_no_stop_duration() {
-        // Reads the process-global link, so it takes the reset like every
-        // other reader.
         crate::fabric::with_link_reset(|| {
             let (mut app, wid, sid, ctx) = app_with_stub();
-            // The slot's baseline first, so the hold that follows is news (a hold
-            // already standing at the mint is state — `adv7`).
+            // The slot's baseline first, so the hold that follows is news (a hold already
+            // standing at first sight is state).
             app.refresh_presence_session(sid, false);
             assert!(crate::fabric::apply_hold_for_test(
                 &ctx,
@@ -3543,14 +3718,10 @@ mod tests {
         });
     }
 
-    /// A turn ledger carried across a self-update handoff (`handoff_carry.rs`,
-    /// `carried=1`) describes a turn settled in the previous process: the slot's
-    /// first sight of it is the baseline (`TurnFact::carried`), not news. A
-    /// turn settled in this process is still news.
+    /// A turn ledger carried across a self-update handoff (`TurnFact::carried`) is the slot's
+    /// baseline, not news; a turn settled in this process still is.
     #[test]
     fn adv1_a_carried_turn_ledger_is_not_a_fresh_story() {
-        // The level read below folds the process-global link state in
-        // (`Note` under a sibling test's attached bridge): take the section.
         crate::fabric::with_link_reset(adv1_a_carried_turn_ledger_is_not_a_fresh_story_body);
     }
 
@@ -3591,7 +3762,7 @@ mod tests {
             app.presence.slot(sid).unwrap().settled_at.is_none(),
             "no Success glow for a turn that settled in another process"
         );
-        // A turn settled in THIS process, on top of the carried baseline, is
+        // A turn settled in this process, on top of the carried baseline, is
         // news: the story counts it and the tone glows.
         {
             let mut turns = ctx.turns.lock().unwrap();
@@ -3747,8 +3918,6 @@ mod tests {
     /// edge never makes a session the named driver.
     #[test]
     fn adv3_an_owner_turn_is_not_credited_to_a_standing_write_edge() {
-        // Reads the process-global link, so it takes the reset like every
-        // other reader.
         crate::fabric::with_link_reset(|| {
             let (mut app, wid, sid_a, ctx_a) = app_with_stub();
             let ia = app.windows[&wid].tab_set.tabs().len() - 1;
@@ -3950,7 +4119,6 @@ mod tests {
                 activity: ActivitySample {
                     alt_screen: false,
                     content_seq: 1,
-                    last_input: None,
                     last_output: Some(t0),
                 },
             };
@@ -4022,17 +4190,20 @@ mod tests {
         let _ = ia;
     }
 
-    /// The chime's gate is a conjunction: serious mode allowing sound, the Music
-    /// effects master, and `choice_sound` — any one off is silence.
     #[test]
     fn the_choice_chime_speaks_only_when_every_gate_is_open() {
         for serious in [false, true] {
             for music in [false, true] {
                 for choice in [false, true] {
                     assert_eq!(
-                        super::chose_chime_allowed(serious, music, choice),
-                        serious && music && choice,
+                        super::chose_chime_gain(serious, music, choice, 0.4),
+                        (serious && music && choice).then_some(0.4),
                         "serious={serious} music={music} choice={choice}"
+                    );
+                    assert_eq!(
+                        super::chose_chime_gain(serious, music, choice, 0.0),
+                        None,
+                        "a zero volume is a mute"
                     );
                 }
             }
@@ -4137,7 +4308,7 @@ mod tests {
             v.ripple_at.is_some(),
             "a pulse started by a choice is marked as one (and none starts under reduced motion)"
         );
-        // An approval told the same way is still the WATCHER's.
+        // An approval told the same way is still the watcher's.
         assert_eq!(app.tell_story(sid, StoryVerb::Approval, ""), Ok(2));
         assert!(
             app.presence_chrome_line()
@@ -4262,12 +4433,9 @@ mod tests {
         );
     }
 
-    /// A carried lease lapses on time after Commit: the handoff seeds another
-    /// supervisor's `ttl=` lease on an adopted session before it is registered,
-    /// so `arm_supervisor_expiries` arms the presence timer at its expiry. A
-    /// dead holder's lease is lapsed and said (`meta-change field=supervisor
-    /// value=-`), telling this instance's parked supervisor host to take the
-    /// session.
+    /// A carried `ttl=` lease, seeded before its session registered, lapses on time after
+    /// Commit: `arm_supervisor_expiries` arms the presence timer at its expiry, and the lapse
+    /// is said (`meta-change field=supervisor value=-`).
     #[cfg(unix)]
     #[test]
     fn a_carried_lease_is_lapsed_on_time_after_the_commit() {
@@ -4307,10 +4475,8 @@ mod tests {
     }
 
     /// The row's commit holds while the sensed mark differs from the live one
-    /// (`drive::commit_rows`), so both must be one reduction of the lease. Every
-    /// lease state (none, typing turn, settling turn, live drive lease, lapsed
-    /// lease, driving a peer's turn) reads the same through `presence_facts`
-    /// and `Desk::lease_mark`.
+    /// (`drive::commit_rows`), so `presence_facts` and `Desk::lease_mark` must reduce every
+    /// lease state the same way.
     #[test]
     fn the_sensed_lease_mark_is_the_live_one_in_every_lease_state() {
         let (mut app, wid, sid_a, ctx_a) = app_with_stub();
@@ -4449,11 +4615,8 @@ mod tests {
         let _ = take_chrome_regrids_applied();
     }
 
-    // ---- round 44: the second adversarial hunt's host repros -------------
-
-    /// Under High Contrast the band is keyed on the resolved inks and the
-    /// latch, so after a palette toggle the presence row's cached row is the
-    /// one painted under the forced palette.
+    /// Under High Contrast the presence row's cache keys on the resolved inks and the latch,
+    /// so a palette toggle repaints it.
     #[test]
     fn r44_hb2_the_presence_row_repaints_under_a_high_contrast_toggle() {
         let (mut app, wid, _sid, ctx) = app_with_stub();

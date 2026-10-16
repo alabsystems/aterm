@@ -151,8 +151,7 @@ fn grid_top_anchored_partial_batch_scroll_archives_each_displaced_row() {
 #[test]
 fn grid_repeated_top_anchored_scrolls_coalesce_footer_row_splices() {
     let mut grid = Grid::with_scrollback(5, 10, 10);
-    // Written displaced rows — never-written rows take the history-free
-    // path (no archival, no splice; pinned separately below).
+    // Written rows: never-written ones archive nothing and splice nothing (pinned below).
     for row in 0..2 {
         grid.set_cursor(row, 0);
         grid.write_char((b'A' + row as u8) as char);
@@ -195,7 +194,7 @@ fn grid_top_anchored_scroll_of_never_written_rows_mints_no_history() {
     assert_eq!(grid.take_selection_row_update(), None);
     grid.assert_invariants();
 
-    // The moment a displaced row HAS been written, archival resumes.
+    // Once a displaced row has been written, archival resumes.
     grid.set_cursor(0, 0);
     grid.write_char('A');
     grid.scroll_region_up(1);
@@ -224,7 +223,7 @@ fn grid_top_anchored_scroll_archives_interior_blank_between_written_lines() {
     grid.write_char('B');
 
     grid.scroll_region_up(1); // displaces A — archives, history begins
-    grid.scroll_region_up(1); // displaces the blank separator ALONE
+    grid.scroll_region_up(1); // displaces the blank separator alone
     grid.scroll_region_up(1); // displaces B
 
     assert_eq!(

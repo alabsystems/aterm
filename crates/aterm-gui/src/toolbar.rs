@@ -889,7 +889,6 @@ mod macos {
     // receiver of a declared `NSView` subclass is its own `as_id()`.
     use aterm_objc::{CGPoint, CGRect, CGSize, Id, MainThread, Obj, Retained, class, sel};
     use winit::event_loop::EventLoopProxy;
-    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
     use super::{
         format_tab_chrome, native_tab_cells, tab_close_accessibility_label, tab_display_label,
@@ -3345,12 +3344,11 @@ mod macos {
     ) -> Option<ToolbarHandle> {
         let mtm = MainThread::new()?;
 
-        let handle = window.window_handle().ok()?;
-        let RawWindowHandle::AppKit(h) = handle.as_raw() else {
+        // winit's live content NSView for this window, borrowed on the main thread.
+        let view = crate::platform::ns_view_of(window);
+        if view.is_null() {
             return None;
-        };
-        // `ns_view` is winit's live NSView for this window, borrowed on the main thread.
-        let view = Id::from_ptr(h.ns_view.as_ptr().cast());
+        }
         // SAFETY: `-window` is `-(id)` and `-frame` is `-(NSRect)`, both
         // side-effect-free main-thread getters on that live view / its window.
         let (ns_window, win_w) = unsafe {

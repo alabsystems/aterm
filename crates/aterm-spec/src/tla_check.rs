@@ -2,10 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! TLA+ file parsing for action cross-referencing.
-//!
-//! Parses `.tla` files to extract module names and definition names,
-//! enabling cross-referencing between Rust refinements and TLA+ properties.
+//! Parses `.tla` files for their module and definition names, to cross-reference Rust refinements
+//! against TLA+.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -55,15 +53,12 @@ pub struct TlaSpec {
     pub module_name: String,
     /// File path (for reporting).
     pub file_path: String,
-    /// ALL named top-level definitions (actions, invariants, `Next`, `Spec`, named
-    /// constants like `BeforeFork`, …). This is the resolution set for obligation 1
-    /// ("an anchor names a real definition") — a `#[refines]`/`#[spec_invariant]`
-    /// must name SOMETHING defined in the module.
+    /// Every named top-level definition (actions, invariants, `Next`, `Spec`, named constants):
+    /// the set an anchor must name a member of (obligation 1).
     pub actions: BTreeSet<String>,
-    /// The real ACTION names: the disjuncts of `Next == A \/ B \/ …`. This is the
-    /// COVERAGE set (obligation 3) — the set every actively-bound external machine
-    /// must have bound-or-waived. Excludes `Init`/`Spec`/`TypeOK`/invariants/named
-    /// constants, which are NOT actions and must not demand a `#[refines]`.
+    /// The action names, the disjuncts of `Next == A \/ B \/ …`: the coverage set (obligation 3)
+    /// that every actively bound external machine must bind or waive. Excludes `Init`, `Spec`,
+    /// `TypeOK`, invariants and constants.
     pub next_actions: BTreeSet<String>,
 }
 
@@ -74,12 +69,8 @@ impl TlaSpec {
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn parse_file(path: &Path) -> Result<Self, TlaParseError> {
         let bytes = std::fs::read(path)?;
-        // Explicit strict UTF-8 decode (`String::from_utf8`, not `read_to_string`'s
-        // implicit validation) so the hardened gate sees the reject path.
-        // Behavior-identical: valid UTF-8 decodes to the same string, and on
-        // invalid UTF-8 `read_to_string` fails with exactly this
-        // `ErrorKind::InvalidData` / message pair (and a `None` source), which
-        // every caller observes only through `TlaParseError`'s `Display`.
+        // An explicit `String::from_utf8` so the hardened gate sees the reject path; the error is
+        // the one `read_to_string` returns on invalid UTF-8.
         let content = match String::from_utf8(bytes) {
             Ok(s) => s,
             Err(_) => {
@@ -119,10 +110,8 @@ fn extract_module_name(content: &str) -> Option<String> {
         if !trimmed.contains("MODULE") {
             continue;
         }
-        // Walk the whitespace-separated tokens directly (no intermediate `Vec`
-        // collect, whose bulk allocation the Trust L0 gate cannot bound) — the
-        // token AFTER the first `MODULE` is the candidate name, exactly as the
-        // old `position(MODULE)` / `parts[idx + 1]` indexing computed it.
+        // No intermediate `Vec`: Trust L0 cannot bound its allocation. The token after the first
+        // `MODULE` is the name.
         let mut tokens = trimmed.split_whitespace();
         for tok in tokens.by_ref() {
             if tok == "MODULE" {
@@ -132,8 +121,7 @@ fn extract_module_name(content: &str) -> Option<String> {
                         return Some(name.to_string());
                     }
                 }
-                // Only the FIRST `MODULE` token on a line is considered (as
-                // before); fall through to the next line.
+                // Only the first `MODULE` on a line counts.
                 break;
             }
         }
@@ -141,16 +129,11 @@ fn extract_module_name(content: &str) -> Option<String> {
     None
 }
 
-/// Scan a line for `(*` and `*)` delimiters and return the updated nesting depth.
-///
-/// TLA+ block comments nest: `(* (* inner *) outer *)` is a single comment.
-/// This function increments depth on each `(*` and decrements on each `*)`,
-/// returning the final depth after processing the entire line.
+/// The block-comment nesting depth after `line`, from `depth`: `(*` opens, `*)` closes, and
+/// comments nest.
 fn update_comment_depth(line: &str, mut depth: u32) -> u32 {
-    // Byte-at-a-time state machine (no index arithmetic, no slice indexing) —
-    // behavior-identical to the pair-scan `while i + 1 < len` loop: `pending`
-    // holds the previous *unconsumed* byte, and a matched `(*`/`*)` consumes
-    // BOTH bytes (pending resets to None), exactly like the old `i += 2` skip.
+    // `pending` is the previous unconsumed byte; a matched `(*` or `*)` consumes both. No index
+    // arithmetic, so no bounds obligation.
     let mut pending: Option<u8> = None;
     for &b in line.as_bytes() {
         match pending {
@@ -168,10 +151,8 @@ fn update_comment_depth(line: &str, mut depth: u32) -> u32 {
     depth
 }
 
-/// Extract all top-level definitions from TLA+ content.
-///
-/// Matches definitions of the form `Name ==` or `Name(params) ==` at column 0,
-/// plus `THEOREM Name ==` patterns. Skips TLA+ keywords and comment lines.
+/// Every top-level definition: `Name ==` or `Name(params) ==` indented at most four columns, with
+/// an optional `THEOREM` or `LOCAL` prefix. Skips TLA+ keywords and comments.
 // Skip: line-scan iterator `next` + BTreeSet keyed build (absent std
 // bodies). Spec tooling; malformed input yields an empty set.
 #[cfg_attr(trust_verify, trust::skip)]
@@ -182,11 +163,9 @@ fn extract_definitions(content: &str) -> BTreeSet<String> {
     for line in content.lines() {
         let trimmed = line.trim();
 
-        // Update block comment nesting depth by scanning for `(*` and `*)`.
-        // TLA+ block comments nest: `(* (* inner *) outer *)` is one comment.
+        // Skip every line that opens, closes or sits inside a block comment (they nest).
         if comment_depth > 0 || trimmed.contains("(*") {
             comment_depth = update_comment_depth(trimmed, comment_depth);
-            // Skip any line that participates in block comment state.
             continue;
         }
 
@@ -195,12 +174,10 @@ fn extract_definitions(content: &str) -> BTreeSet<String> {
             continue;
         }
 
-        // Skip indented lines (inside LET blocks, etc.)
+        // Skip lines indented past four columns (LET bodies and the like).
         if !line.is_empty() && line.starts_with(|c: char| c.is_whitespace()) {
-            // Saturating: `trim_start` returns a suffix of `line`, so its length
-            // can never exceed `line.len()` — saturation is a no-op on every real
-            // input; it only discharges the unconstrained-input underflow
-            // obligation (Trust L0).
+            // Saturating only to discharge the underflow obligation (Trust L0): `trim_start`
+            // returns a suffix.
             let indent = line.len().saturating_sub(line.trim_start().len());
             if indent > 4 {
                 continue;
@@ -216,22 +193,16 @@ fn extract_definitions(content: &str) -> BTreeSet<String> {
     defs
 }
 
-/// Extract the ACTION names from the `Next == …` definition — the disjuncts of the
-/// next-state relation. These are the real actions a machine offers, as opposed to
-/// every top-level `==` def (which also includes `Init`/`Spec`/`TypeOK`/invariants/
-/// named constants). Used for the COVERAGE obligation (every action bound-or-waived).
+/// The action names: the disjuncts of `Next == …`, not every top-level definition (which includes
+/// `Init`, `Spec`, `TypeOK`, invariants and constants). The coverage obligation's set.
 ///
-/// Handles the two shapes the ISOLATION specs use:
-///   * a plain disjunction `Next == Fork \/ Setrlimit \/ … \/ Exec`, and
-///   * quantified disjuncts `Next == \/ \E c \in … : WriteMain(c, v) \/ Enter \/ …`
-///     — the called action identifier (`WriteMain`, before its `(`) is extracted.
-///
-/// The body may span multiple (indented) lines; we gather until the next top-level
-/// definition (a non-indented `Name ==`) or the module end.
+/// Handles the ISOLATION specs' two shapes: a plain disjunction (`Next == Fork \/ … \/ Exec`) and
+/// quantified disjuncts (`\/ \E c \in … : WriteMain(c, v)`), of which the called action is taken.
+/// The body runs to the next unindented definition, blank line or module end.
 // Skip: line-scan iterator + BTreeSet keyed build (absent std bodies).
 #[cfg_attr(trust_verify, trust::skip)]
 fn extract_next_disjuncts(content: &str) -> BTreeSet<String> {
-    // Gather the full `Next == …` body (possibly multi-line).
+    // The `Next == …` body, possibly over several lines.
     let mut body = String::new();
     let mut in_next = false;
     let mut comment_depth: u32 = 0;
@@ -246,7 +217,7 @@ fn extract_next_disjuncts(content: &str) -> BTreeSet<String> {
             None => trimmed,
         };
         if in_next {
-            // A new top-level definition (non-indented `Name ==`) or module end stops it.
+            // An unindented definition, end marker or blank line ends the body.
             let is_new_def = !line.starts_with(char::is_whitespace)
                 && (code.contains("==") || code.starts_with("===") || code.is_empty());
             if is_new_def {
@@ -263,14 +234,11 @@ fn extract_next_disjuncts(content: &str) -> BTreeSet<String> {
         }
     }
 
-    // Tokenize the body: split on `\/`, then for each disjunct take the FIRST
-    // identifier that is a callable action — i.e. skip the quantifier prelude
-    // (`\E c \in 1..Cells, v \in 1..MaxVal :`) and grab the name after the `:` (or
-    // the bare identifier when there is no quantifier).
+    // Per `\/` disjunct, the first identifier after any quantifier prelude's `:`
+    // (`\E c \in 1..Cells, v \in 1..MaxVal :`).
     let mut actions = BTreeSet::new();
     for disj in body.split("\\/") {
         let segment = match disj.rsplit_once(':') {
-            // After a quantifier colon, the action call follows.
             Some((_, after)) => after,
             None => disj,
         };
@@ -315,15 +283,10 @@ fn extract_definition_name(line: &str) -> Option<String> {
         line
     };
 
-    // Find `==` that isn't part of `====` (end-of-module marker).
-    // `split_once` (instead of `find` + index slicing) keeps the parse
-    // behavior-identical while discharging the slice-bounds obligations
-    // (Trust L0): `before`/`after` are exactly `effective[..eq_pos]` /
-    // `effective[eq_pos + 2..]`.
+    // `split_once`, not `find` + slicing: no slice-bounds obligation (Trust L0).
     let (before, after) = effective.split_once("==")?;
 
-    // Skip if this is the `====` end-of-module marker (i.e. the first `==` is
-    // immediately followed by another `==`).
+    // `====` is the end-of-module marker, not a definition.
     if after.starts_with("==") {
         return None;
     }
@@ -482,8 +445,7 @@ Init == x = 0
 
     #[test]
     fn test_nested_block_comments_parse_correctly() {
-        // Nested TLA+ block comments: the first `*)` closes the inner comment,
-        // not the outer one. The parser must track nesting depth.
+        // The first `*)` closes only the inner comment.
         let spec = TlaSpec::parse_str(
             r#"
 ---- MODULE Nested ----
@@ -553,8 +515,7 @@ Visible == x = 0
             .map(|s| s.to_string())
             .collect()
         );
-        // Quantified, multi-line (the AltScreen shape): the called action after the
-        // `\E … :` quantifier colon is what we extract.
+        // Quantified and multi-line (the AltScreen shape): the action after the quantifier's `:`.
         let quant = extract_next_disjuncts(
             "Next ==\n    \\/ \\E c \\in 1..Cells, v \\in 1..MaxVal : WriteMain(c, v)\n    \\/ Enter\n    \\/ \\E c \\in 1..Cells, v \\in 1..MaxVal : Scribble(c, v)\n    \\/ Leave\n\nSpec == Init\n",
         );
@@ -569,7 +530,7 @@ Visible == x = 0
 
     #[test]
     fn next_disjuncts_single_action() {
-        // A `Next == Apply` (single action) — Sandbox / PathConfine shape.
+        // A single action: the Sandbox / PathConfine shape.
         assert_eq!(
             extract_next_disjuncts("Next == Apply\n"),
             ["Apply"].iter().map(|s| s.to_string()).collect()

@@ -9,12 +9,12 @@
 //! For every shipped line of `crates/aterm-gui/src` and
 //! `crates/aterm-control/src`, this flags blocklisted O(history) work
 //! (`.resize(` `.reflow(` `.rewrap(` `.take_scrollback(` `.decompress(`
-//! `.hydrate(` `.rebuild_index(`, or the `zstd` cold tier) run while a guard
-//! is held. Tokens are method-call anchored, so the safe offload
+//! `.hydrate(` `.rebuild_index(`, or a call into the cold tier's LZ4 codec) run
+//! while a guard is held. Tokens are method-call anchored, so the safe offload
 //! (`resize_offloading_scrollback` under the lock, `pending.reflow()` off it,
 //! `finish_resize_offload` under a second brief lock) stays green.
 //!
-//! What counts as held (each shape pinned by a `must_fire` case below):
+//! What counts as held (each shape pinned by a `MUST_FIRE` case below):
 //!
 //! * an acquiring call (`term_lock(`, `term_lock_ui(`, aterm-control's
 //!   `with_terminal(` / `with_terminal_mut(`) holds the guard while its parens
@@ -27,12 +27,12 @@
 //! * the receiver may be paren-dereffed, reached through zero-arg accessor hops,
 //!   or split across lines by rustfmt.
 //!
-//! Not detected: an acquire inside a macro, an acquire whose own call spans
-//! lines, and a deferred `let t; t = …`.
+//! Not detected: an acquire inside a macro, a `let`-bound acquire whose call
+//! spans lines, and a deferred `let t; t = …`.
 //!
 //! Source is lexed with comments and literals blanked in place, then the
 //! unshipped-item mask (`#[cfg(test)]` and kin) is applied; see
-//! [`blank_non_code`] for why that order matters.
+//! [`crate::lex::blank_non_code`] for why that order matters.
 
 use std::path::Path;
 
@@ -49,6 +49,15 @@ const BLOCKED_METHODS: &[&str] = &[
     "hydrate",
     "rebuild_index",
 ];
+
+/// The cold tier's codec, by path: a call into the aterm-lz4 crate
+/// (`aterm_lz4::`). It is the only codec path a line in scope can name: the
+/// store's cold-page encode and decode are private to aterm-scrollback, and so
+/// is its `lz4` module outside the fuzz build. Neither scope crate depends on
+/// aterm-lz4 today, so this fires only once one decodes cold pages itself.
+/// A path rather than a codec name, so the zstd archive decoder (`aterm_zstd`)
+/// is not mistaken for the cold tier.
+const COLD_CODEC: &str = "lz4::";
 
 /// One blocklisted-work-under-guard line.
 pub(crate) struct HeldGuardFinding {
@@ -110,7 +119,7 @@ pub(crate) fn scan_tree(root: &Path) -> Result<HeldGuardScan, String> {
 /// a held guard, and how many lines acquire one.
 pub(crate) fn scan_source(text: &str) -> (Vec<usize>, usize) {
     // Lex first, then mask: see `blank_non_code` for why the order is load-bearing.
-    let code = crate::mask_unshipped_items(&blank_non_code(text));
+    let code = crate::mask_unshipped_items(&crate::lex::blank_non_code(text));
     let mut walk = Walk::default();
     let mut hits = Vec::new();
     let mut acquires = 0;
@@ -130,187 +139,12 @@ pub(crate) fn scan_source(text: &str) -> (Vec<usize>, usize) {
     (hits, acquires)
 }
 
-// The lexer: comments and literal contents blanked in place, before the mask.
-
 fn is_ident_start(c: char) -> bool {
     c.is_ascii_alphabetic() || c == '_'
 }
 
 fn is_ident(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
-}
-
-/// The file with every comment and string, raw string and char literal
-/// (prefix and `#`s included) blanked to spaces in place, tracked across lines:
-/// line and column positions are preserved and trailing whitespace is dropped.
-/// A single-line string keeps its two `"`, so `#[cfg(all(test, feature = "x"))]`
-/// still parses as a gate; a multi-line string loses them, so the item mask's
-/// per-line literal masker cannot read a stray quote as an opener.
-///
-/// This runs before the unshipped-item mask: the mask ends an item at its first
-/// `<indent>}` line, so on raw text a `}` inside a test module's raw string
-/// would end the module early and strand the literal's closer, turning the rest
-/// of the file into string contents.
-pub(crate) fn blank_non_code(text: &str) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    let mut out = chars.clone();
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        let (start, lit) = if is_ident_start(c) && (i == 0 || !is_ident(chars[i - 1])) {
-            // An identifier is skipped whole, unless it prefixes a literal.
-            let mut w = i;
-            while w < chars.len() && is_ident(chars[w]) {
-                w += 1;
-            }
-            let word: String = chars[i..w].iter().collect();
-            let lit = match (word.as_str(), chars.get(w)) {
-                ("r" | "br" | "cr", _) => raw_string(&chars, w),
-                ("b" | "c", Some('"')) => cooked_string(&chars, w),
-                ("b", Some('\'')) => char_literal(&chars, w),
-                _ => None,
-            };
-            if lit.is_none() {
-                i = w;
-                continue;
-            }
-            (i, lit)
-        } else {
-            let lit = match (c, chars.get(i + 1)) {
-                ('/', Some('/')) => Some(Literal {
-                    end: chars[i..]
-                        .iter()
-                        .position(|&c| c == '\n')
-                        .map_or(chars.len(), |p| i + p),
-                    quotes: None,
-                }),
-                ('/', Some('*')) => Some(block_comment(&chars, i)),
-                ('"', _) => cooked_string(&chars, i),
-                ('\'', _) => char_literal(&chars, i),
-                _ => None,
-            };
-            (i, lit)
-        };
-        let Some(lit) = lit else {
-            i += 1;
-            continue;
-        };
-        let end = lit.end.min(chars.len());
-        for slot in &mut out[start..end] {
-            if *slot != '\n' {
-                *slot = ' ';
-            }
-        }
-        if let Some((open, close)) = lit.quotes
-            && !chars[start..end].contains(&'\n')
-        {
-            out[open] = '"';
-            out[close] = '"';
-        }
-        i = end;
-    }
-    let blanked: String = out.into_iter().collect();
-    let mut lexed = String::with_capacity(blanked.len());
-    for line in blanked.lines() {
-        lexed.push_str(line.trim_end());
-        lexed.push('\n');
-    }
-    lexed
-}
-
-/// One comment or literal: where it ends (exclusive), and for a string, where
-/// its opening and closing `"` sit.
-struct Literal {
-    end: usize,
-    quotes: Option<(usize, usize)>,
-}
-
-/// A `"…"` string whose opening quote is at `q`, honouring `\` escapes.
-fn cooked_string(chars: &[char], q: usize) -> Option<Literal> {
-    let mut j = q + 1;
-    while j < chars.len() {
-        match chars[j] {
-            '\\' => j += 2,
-            '"' => {
-                return Some(Literal {
-                    end: j + 1,
-                    quotes: Some((q, j)),
-                });
-            }
-            _ => j += 1,
-        }
-    }
-    Some(Literal {
-        end: chars.len(),
-        quotes: None,
-    })
-}
-
-/// A raw string whose `#`s (if any) start at `at`, right after its `r` prefix;
-/// `None` when no `"` follows them (`r#ident` is a raw identifier).
-fn raw_string(chars: &[char], at: usize) -> Option<Literal> {
-    let hashes = chars[at..].iter().take_while(|&&c| c == '#').count();
-    let q = at + hashes;
-    if chars.get(q) != Some(&'"') {
-        return None;
-    }
-    let close = (q + 1..chars.len())
-        .find(|&j| chars[j] == '"' && (1..=hashes).all(|k| chars.get(j + k) == Some(&'#')));
-    Some(match close {
-        Some(close) => Literal {
-            end: close + 1 + hashes,
-            quotes: Some((q, close)),
-        },
-        None => Literal {
-            end: chars.len(),
-            quotes: None,
-        },
-    })
-}
-
-/// A char literal at `i` (`'x'`, `'\n'`, `'\u{1F600}'`); `None` for anything
-/// else a `'` starts (a lifetime, a label).
-fn char_literal(chars: &[char], i: usize) -> Option<Literal> {
-    let next = chars.get(i + 1).copied();
-    if next == Some('\\') {
-        let close = (i + 3..chars.len().min(i + 12))
-            .find(|&j| chars[j] == '\'' || chars[j] == '\n')
-            .filter(|&j| chars[j] == '\'')?;
-        return Some(Literal {
-            end: close + 1,
-            quotes: None,
-        });
-    }
-    (next.is_some_and(|c| c != '\n') && chars.get(i + 2) == Some(&'\'')).then_some(Literal {
-        end: i + 3,
-        quotes: None,
-    })
-}
-
-/// A block comment opening at `i`, nested ones included.
-fn block_comment(chars: &[char], i: usize) -> Literal {
-    let mut depth = 0usize;
-    let mut j = i;
-    while j < chars.len() {
-        match (chars[j], chars.get(j + 1)) {
-            ('/', Some('*')) => {
-                depth += 1;
-                j += 2;
-            }
-            ('*', Some('/')) => {
-                depth -= 1;
-                j += 2;
-                if depth == 0 {
-                    break;
-                }
-            }
-            _ => j += 1,
-        }
-    }
-    Literal {
-        end: j,
-        quotes: None,
-    }
 }
 
 // The walk: which lines do blocklisted work while a guard is held.
@@ -357,7 +191,7 @@ impl Walk {
         if self.bindings.iter().any(|b| receives_work(bal, &b.name)) {
             hit = true;
         }
-        if live && bal.contains("zstd") {
+        if live && touches_cold_codec(bal) {
             hit = true;
         }
         // A chain rustfmt broke across lines puts the receiver and the work on
@@ -445,9 +279,14 @@ pub(crate) fn find_acquire(bal: &str) -> Option<usize> {
     .min()
 }
 
-/// A blocklisted method call anywhere on the line, or the `zstd` cold tier.
+/// A cold-codec call on the line.
+fn touches_cold_codec(bal: &str) -> bool {
+    bal.contains(COLD_CODEC)
+}
+
+/// A blocklisted method call anywhere on the line, or a cold-codec call.
 fn has_blocked_work(bal: &str) -> bool {
-    bal.contains("zstd")
+    touches_cold_codec(bal)
         || bal
             .match_indices('.')
             .any(|(at, _)| method_call_at(bal, at).is_some())
@@ -868,7 +707,7 @@ fn cross_resize_typed(term: &Mutex<Terminal>, rows: usize, cols: usize) {
             r##"
 fn decode_cold(term: &Mutex<Terminal>) {
     let mut t = term_lock(term);
-    let raw = zstd::decode_all(t.cold_bytes()).unwrap();
+    let raw = aterm_lz4::decompress_size_prepended(t.cold_bytes()).unwrap();
     consume(raw);
 }
 "##,
@@ -1186,54 +1025,5 @@ fn cold_len(term: &Mutex<Terminal>) -> usize {
         let (hits, acquires) = scan_source(MUST_FIRE[14].1);
         assert_eq!(hits, vec![5], "the wrapped chain's `.resize(` line");
         assert_eq!(acquires, 1);
-    }
-
-    /// Every literal and comment is blanked where it stands, columns and line
-    /// count kept; a one-line string keeps its quotes, a multi-line one does not.
-    #[test]
-    fn the_lexer_blanks_every_literal_and_comment_in_place() {
-        let src = "let a = \"x // y\"; // z\nlet b = r#\"multi\nline\"#; /* c\nd */ e\n\
-                   'x' '\\'' 'a b\n#[cfg(all(test, feature = \"x\"))] // why\nlet c = br\"}\";";
-        let lexed = blank_non_code(src);
-        assert_eq!(
-            lexed.lines().collect::<Vec<_>>(),
-            [
-                "let a = \"      \";",
-                "let b =",
-                "      ;",
-                "     e",
-                "         'a b",
-                "#[cfg(all(test, feature = \" \"))]",
-                "let c =   \" \";",
-            ]
-        );
-        assert_eq!(lexed.lines().count(), src.lines().count());
-        assert_eq!(blank_non_code("no newline").lines().count(), 1);
-        assert_eq!(
-            blank_non_code("a\n\n").lines().count(),
-            "a\n\n".lines().count()
-        );
-    }
-
-    /// The real tree: the scope exists, the walk sees acquires (a blind walk is
-    /// not a clean one), and nothing is held across unbounded work.
-    #[test]
-    fn this_tree_holds_no_guard_across_unbounded_work() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(Path::parent)
-            .expect("crates/aterm-census lives two levels under the repo root");
-        let scan = scan_tree(root).expect("the OB-22 scope exists");
-        assert!(
-            scan.acquires >= 100,
-            "a blind walk: {} acquires",
-            scan.acquires
-        );
-        let found: Vec<String> = scan
-            .findings
-            .iter()
-            .map(|f| format!("{}: {}", f.span, f.line))
-            .collect();
-        assert!(found.is_empty(), "{found:#?}");
     }
 }

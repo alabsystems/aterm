@@ -27,23 +27,21 @@ fn composing_a_strip_hands_the_renderer_its_band_and_seam_for_the_padding() {
                 "a band that equals the terminal background is not a band"
             );
         }
-        // macOS: the strip has no surface of its own, so there is nothing to bleed
-        // and the padding keeps the tone it always had.
+        // macOS: the strip has no surface of its own, so nothing bleeds.
         (got, None) => assert_eq!(got, None, "no band ⇒ no bleed"),
         (None, Some(_)) => panic!("a chrome band was never handed to the renderer"),
     }
 
-    // Turning the strip off must put the padding straight back on the theme
-    // background — the reason the setter runs before the `strip == 0` early-out.
+    // Turning the strip off returns the padding to the theme background: the setter runs
+    // before the `strip == 0` early-out.
     app.tab_strip_rows = 0;
     app.splice_tab_strip_with(wid, 1);
     assert_eq!(app.backend.chrome_bleed(), None, "no strip ⇒ no bleed");
 }
 
-/// THE OPT-IN BUILD BADGE CLEARS THE STRIP where the strip carries the
-/// version label (Windows): its anchor is the grid's top-right — the strip's
-/// trailing end, the label's columns — so it moves down past the strip's
-/// rows instead of sitting on the label, and moves with their count.
+/// Where the strip carries the version label (Windows), the opt-in build badge's
+/// top-right anchor sits below the strip's rows instead of on the label, and moves with
+/// their count.
 #[cfg(windows)]
 #[test]
 fn the_build_badge_sits_below_the_strip() {
@@ -72,12 +70,9 @@ fn the_build_badge_sits_below_the_strip() {
     assert_eq!(two - one, ch as u32, "…and it follows the strip's rows");
 }
 
-/// THE METER REACHES THE WINDOW EDGE (ruling 55, 2026-09-23). Composing a
-/// frame with a METERED band row hands the renderer that row's own gutter
-/// tones — at its chrome row, and equal to its first and last painted
-/// cells' backgrounds (the renderer's no-epoch contract) — so a full meter
-/// runs through both gutters in the accent; an unmetered row names no
-/// entry and keeps the band tone.
+/// A metered band row hands the renderer its own gutter tones at its chrome row, equal to
+/// its first and last cells' backgrounds (the renderer's no-epoch contract), so a full
+/// meter runs through both gutters in the accent; an unmetered row keeps the band tone.
 #[test]
 fn composing_a_metered_band_row_hands_the_renderer_its_edge_tones() {
     use aterm_messages::{Hold, Message, Meter, Severity, tags};

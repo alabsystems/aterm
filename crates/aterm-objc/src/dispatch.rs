@@ -199,9 +199,8 @@ where
     F: Send + FnOnce(MainThread) -> R,
     R: Send,
 {
-    // `MainThread::new` costs about 18 ns (mostly the uncached `objc_getClass`,
-    // see [`crate::class`]), paid on every ordinary character key event via
-    // winit's `get_modifierless_char`.
+    // Hot: winit's `get_modifierless_char` reaches this on every ordinary
+    // character key event, so `MainThread::new` caches its class lookup.
     if let Some(mt) = MainThread::new() {
         // Already on the main thread: call directly, since `dispatch_sync_f`
         // here would trap. The pool wraps the closure on this path too, so the

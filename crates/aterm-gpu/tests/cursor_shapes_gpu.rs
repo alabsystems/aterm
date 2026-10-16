@@ -1,14 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// Cursor-shape gate for the GPU renderer: for every DECSCUSR shape (block /
-// underline / bar), the frontend HollowBlock override, the off blink phase,
-// and a DECTCEM-hidden cursor, the GPU frame must (a) show the same exact
-// pixel pattern the CPU asserts (strip-only / outline-only / nothing) and
-// (b) match the CPU frame within the usual small per-channel tolerance.
-// Styles are driven end-to-end by feeding DECSCUSR bytes through a Terminal.
+// Cursor-shape gate for the GPU renderer: for every DECSCUSR shape (block / underline / bar,
+// fed as bytes through a Terminal), the frontend HollowBlock and Bolt overrides, the off blink
+// phase and a DECTCEM-hidden cursor, the GPU frame must paint the exact pixel pattern and
+// match the CPU frame within a small per-channel tolerance.
 //
-// Gated: if there is no GPU or no system font, the tests no-op (return).
+// No GPU or no system font: the tests no-op.
 
 use aterm_core::terminal::{CursorStyle, Terminal};
 use aterm_render::{Frame, RenderInput, Renderer, Theme};
@@ -18,11 +16,9 @@ use crate::common::{backends, bb, gg, max_channel_delta_frame as max_channel_del
 const CURSOR: u32 = 0x0050_FA7B; // Theme::default().cursor
 const PX: f32 = 18.0;
 
-/// Per-channel closeness to a packed `0x00RRGGBB` colour, within 2 LSB: at a
-/// glyph-edge pixel the GPU's fixed-function blend can round 1 LSB below the
-/// CPU's f64 sRGB blend, which on some GPUs moves one edge pixel across a ±1
-/// band. bg (0x111318) and fg (0xD0D0D0) are ~200 LSB from the cursor green,
-/// so the shape-count assertions still count exactly the same pixels.
+/// Within 2 LSB per channel of the cursor colour: at a glyph-edge pixel the GPU's
+/// fixed-function blend can round 1 LSB below the CPU's f64 sRGB blend. bg and fg are ~200 LSB
+/// from the cursor green, so the shape counts still count exactly the same pixels.
 fn near_cursor(p: u32) -> bool {
     near_color(p, CURSOR)
 }
@@ -33,7 +29,7 @@ fn near_color(p: u32, color: u32) -> bool {
         && (bb(p) - bb(color)).abs() <= 2
 }
 
-/// All (x, y) positions whose pixel is the cursor colour (within 1 LSB).
+/// All (x, y) positions whose pixel is the cursor colour ([`near_cursor`]).
 fn cursor_positions(f: &Frame) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     for y in 0..f.height {
@@ -46,13 +42,13 @@ fn cursor_positions(f: &Frame) -> Vec<(usize, usize)> {
     out
 }
 
-/// Both renderers at the same px/theme, or `None` to skip (no GPU / no font).
-fn renderers() -> Option<(Renderer, aterm_gpu::GpuRenderer)> {
+/// Both renderers at the same px/theme ([`common::backends`]).
+fn renderers() -> (Renderer, aterm_gpu::GpuRenderer) {
     backends(PX, Theme::default())
 }
 
-/// A 2x4 terminal (text "a", cursor back over it) with `bytes` processed —
-/// the glyph-under-cursor case, the harshest for shape parity.
+/// A 2x4 terminal (text "a", cursor back over it) with `bytes` processed: the
+/// glyph-under-cursor case, the harshest for shape parity.
 fn term_with(bytes: &[u8]) -> Terminal {
     let mut t = Terminal::new(2, 4);
     t.process(b"a\x1b[1;1H");
@@ -60,9 +56,8 @@ fn term_with(bytes: &[u8]) -> Terminal {
     t
 }
 
-/// Render `term` on both paths and assert pixel parity (1-LSB fills, the
-/// glyph blend within the usual gpu_matches_cpu tolerance). Returns the GPU
-/// frame for the pattern assertions.
+/// Render `term` on both paths and assert parity (whole frame within 8 per channel, identical
+/// cursor-pixel positions). Returns the GPU frame for the pattern assertions.
 fn parity(
     cpu: &mut Renderer,
     gpu: &mut aterm_gpu::GpuRenderer,
@@ -70,7 +65,6 @@ fn parity(
     term: &mut Terminal,
     label: &str,
 ) -> Frame {
-    // A-3: the engine builds the snapshot; both renderers consume the same value.
     let input = term.cell_frame(2, 4);
     parity_input(cpu, gpu, win, &input, label)
 }
@@ -97,8 +91,8 @@ fn parity_input(
         delta <= 8,
         "{label}: GPU/CPU pixels diverge (delta {delta} > 8)"
     );
-    // The cursor-coloured pattern itself must agree EXACTLY (fills are flat
-    // colour on both paths; 1 LSB covers Rgba8 round-tripping).
+    // The cursor-coloured pattern itself must agree exactly (fills are flat colour on both
+    // paths).
     assert_eq!(
         cursor_positions(&cpu_frame),
         cursor_positions(&gpu_frame),
@@ -113,12 +107,10 @@ struct Shape {
     label: &'static str,
     /// DECSCUSR bytes fed through the terminal (the terminal-owned styles).
     decscusr: &'static [u8],
-    /// The frontend style override (HollowBlock, Bolt): these arrive through
-    /// the override on both paths, never through DECSCUSR.
+    /// The frontend style override (HollowBlock, Bolt), never set through DECSCUSR.
     style_override: Option<CursorStyle>,
-    /// The exact number of cursor-coloured pixels for a `(cw, ch)` cell, or
-    /// `None` for the block, whose fill has a glyph cut-out and only has to
-    /// cover well over half the cell.
+    /// The exact cursor-coloured pixel count for a `(cw, ch)` cell, or `None` for the block,
+    /// whose fill has a glyph cut-out and only has to cover well over half the cell.
     count: fn(usize, usize) -> Option<usize>,
     /// Every cursor-coloured pixel `(x, y)` lies where this says, for `(cw, ch)`.
     inside: fn(usize, usize, usize, usize) -> bool,
@@ -137,8 +129,7 @@ fn bolt_rects(cw: usize, ch: usize) -> Vec<[usize; 4]> {
 }
 
 const SHAPES: &[Shape] = &[
-    // Steady block: the fill covers the cell except the glyph cut-out, and
-    // nothing outside the cell is cursor-coloured.
+    // Steady block: the fill covers the cell except the glyph cut-out, and nothing outside it.
     Shape {
         label: "block",
         decscusr: b"\x1b[2 q",
@@ -154,9 +145,8 @@ const SHAPES: &[Shape] = &[
         count: |cw, ch| Some(cw * (ch / 8).max(2)),
         inside: |x, y, cw, ch| x < cw && y >= ch - (ch / 8).max(2) && y < ch,
     },
-    // Steady bar: exactly the left strip, `max(cw / 8, 2)` wide. The strip may
-    // cross the glyph's left edge: every strip pixel is cursor-coloured and no
-    // cursor colour leaks outside it.
+    // Steady bar: exactly the left strip, `max(cw / 8, 2)` wide, even where it crosses the
+    // glyph's left edge.
     Shape {
         label: "bar",
         decscusr: b"\x1b[6 q",
@@ -164,8 +154,7 @@ const SHAPES: &[Shape] = &[
         count: |cw, ch| Some((cw / 8).max(2) * ch),
         inside: |x, y, cw, ch| x < (cw / 8).max(2) && y < ch,
     },
-    // The unfocused HollowBlock: exactly the `max(ch / 16, 1)`-thick outline,
-    // so the centre stays unfilled.
+    // The unfocused HollowBlock: exactly the `max(ch / 16, 1)`-thick outline, centre unfilled.
     Shape {
         label: "hollow",
         decscusr: b"",
@@ -179,8 +168,7 @@ const SHAPES: &[Shape] = &[
             x < cw && y < ch && (x < t || x >= cw - t || y < t || y >= ch - t)
         },
     },
-    // Bolt: exactly the shared per-row strip union, painted over the glyph
-    // ('a' under the cursor: strips paint over it, no cut-out).
+    // Bolt: exactly the shared per-row strip union, painted over the glyph (no cut-out).
     Shape {
         label: "bolt",
         decscusr: b"",
@@ -195,9 +183,7 @@ const SHAPES: &[Shape] = &[
 
 #[test]
 fn every_cursor_shape_paints_its_exact_pattern_and_matches_cpu() {
-    let Some((mut cpu, mut gpu)) = renderers() else {
-        return;
-    };
+    let (mut cpu, mut gpu) = renderers();
     let (cw, ch) = cpu.cell_size();
     for shape in SHAPES {
         let label = shape.label;
@@ -227,9 +213,7 @@ fn every_cursor_shape_paints_its_exact_pattern_and_matches_cpu() {
 
 #[test]
 fn gpu_steady_bar_fill_override_matches_cpu_without_theme_flash() {
-    let Some((mut cpu, mut gpu)) = renderers() else {
-        return;
-    };
+    let (mut cpu, mut gpu) = renderers();
     const OVERRIDE: u32 = 0x00FE_017F;
     let (cw, ch) = cpu.cell_size();
     let mut term = term_with(b"\x1b[6 q"); // steady bar over a real glyph
@@ -276,9 +260,7 @@ fn gpu_steady_bar_fill_override_matches_cpu_without_theme_flash() {
 
 #[test]
 fn gpu_effect_shape_precedence_and_clear_overlays_match_cpu() {
-    let Some((mut cpu, mut gpu)) = renderers() else {
-        return;
-    };
+    let (mut cpu, mut gpu) = renderers();
     let mut win = aterm_gpu::WindowGpu::new();
     let (cw, ch) = cpu.cell_size();
     let mut term = Terminal::new(2, 4);
@@ -321,9 +303,7 @@ fn gpu_effect_shape_precedence_and_clear_overlays_match_cpu() {
 
 #[test]
 fn gpu_blink_phase_and_hidden_suppress_cursor() {
-    let Some((mut cpu, mut gpu)) = renderers() else {
-        return;
-    };
+    let (mut cpu, mut gpu) = renderers();
     let mut win = aterm_gpu::WindowGpu::new();
 
     // Blinking block, phase off: no cursor pixels on either path.

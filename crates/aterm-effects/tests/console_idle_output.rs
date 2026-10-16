@@ -18,18 +18,11 @@ use aterm_lexicon::Lexicon;
 const ROWS: u16 = 58;
 const COLS: u16 = 116;
 
-/// A tick's snapshot of the terminal, keyed by everything it is read from.
-///
-/// The particles test ticks 5,746 frames and the program writes on one in
-/// 32, so a full `cell_frame` per tick was 30% of the file's CPU. The
-/// snapshot is a pure function of the terminal: output (`screen_mutations`,
-/// the product's "nothing reached the screen" witness), the selection and the
-/// facts. A tick whose key is unchanged hands the brain and the scanner the
-/// last one; both still run every frame. Checked at every tick of the file's
-/// three scene tests: equal to a fresh `cell_frame` (content and every
-/// metadata field but `row_rev`, the per-read revision lane neither reads),
-/// and the facts, read first because the key needs them, equal to the facts
-/// read after a `cell_frame`.
+/// A tick's snapshot of the terminal, keyed by everything it is read from: output
+/// (`screen_mutations`), the selection and the facts. A tick whose key is unchanged hands the
+/// brain and the scanner the last snapshot (a fresh `cell_frame` per tick dominated this file's
+/// CPU); both still run every frame. A reused snapshot differs from a fresh `cell_frame` only in
+/// `row_rev`, the per-read revision lane neither reads.
 struct Seen {
     mutations: u64,
     selection: TextSelection,
@@ -156,17 +149,14 @@ impl Scene {
     }
 }
 
-/// One mode's 35 s idle ladder: its summary line and the two counts the law
-/// asserts, `(line, movement, sleeps, frames)`.
+/// One mode's 35 s idle ladder: its summary line and the counts the law asserts,
+/// `(line, movement, sleeps, frames)`.
 type Ladder = (String, usize, usize, usize);
 
 #[test]
 fn nearby_output_particles_allow_uninterrupted_sleep_after_the_idle_ladder() {
-    // Each mode builds its own scene on its own clock, so the two run on the
-    // binary's threads (`par_map`). Each is caught in its pool
-    // thread and judged here in the original order: the far-output line
-    // prints and its law is asserted before the near-particles take's own
-    // panic, if any, is raised.
+    // Each mode runs on its own scene and clock, in parallel; a panic is caught and re-raised
+    // in mode order, after the far-output line prints and its law is asserted.
     let modes = ["far-output", "near-particles"];
     let ladders = crate::common::par_map(&modes, |&mode| {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ladder(mode)))

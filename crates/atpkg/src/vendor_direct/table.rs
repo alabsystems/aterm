@@ -8,6 +8,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::version::Version;
+use crate::manifest::DigestAlg;
 
 /// What authenticates a program's digest document.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -19,6 +20,23 @@ pub enum Anchor {
     /// `SHA256SUMS` — two independent hosts, no signature.
     #[serde(rename = "openai-two-host")]
     OpenAiTwoHost,
+    /// agy's per-platform manifest on Google's Cloud Run updater (the one agy's own
+    /// updater obeys, for this client's platform) agreeing on `{version, url, sha512}`
+    /// with the per-version `manifest.json` beside the payload in Google Cloud Storage,
+    /// the payload exactly at its compiled bucket path — two services, no signature.
+    /// Residual: both hosts are Google's, so the agreement is one vendor's word from two
+    /// of its services, never a second party's; on darwin the Developer ID team pin binds
+    /// the bytes to Google independently of TLS.
+    #[serde(rename = "google-two-host")]
+    GoogleTwoHost,
+    /// muse's `muse-stable` channel on `api.meta.ai` naming the version, and the release
+    /// manifest at the client-built lookaside URL carrying the payload's sha256 and size —
+    /// TLS to Meta's hosts, no signature, and no second host: the manifest comes from the
+    /// host that serves the bytes. Residual: TLS alone vouches for the digest, so the
+    /// anchor is the Developer ID team pin every darwin Mach-O must pass, and no other
+    /// platform is served.
+    #[serde(rename = "meta-developer-id")]
+    MetaDeveloperId,
 }
 
 impl Anchor {
@@ -29,6 +47,27 @@ impl Anchor {
         match self {
             Self::AnthropicOpenPgp => "anthropic-openpgp",
             Self::OpenAiTwoHost => "openai-two-host",
+            Self::GoogleTwoHost => "google-two-host",
+            Self::MetaDeveloperId => "meta-developer-id",
+        }
+    }
+
+    /// Whether the documents vouch for the payload digest before a byte is fetched. muse's
+    /// come from the host that serves the bytes, so its digest is vouched for only once the
+    /// Developer ID team pin passed the bytes it names.
+    #[must_use]
+    pub(crate) const fn vouches_before_download(self) -> bool {
+        !matches!(self, Self::MetaDeveloperId)
+    }
+
+    /// The payload digest this anchor vouches for: Google publishes only a sha512.
+    #[must_use]
+    pub(crate) const fn digest_alg(self) -> DigestAlg {
+        match self {
+            Self::GoogleTwoHost => DigestAlg::Sha512,
+            Self::AnthropicOpenPgp | Self::OpenAiTwoHost | Self::MetaDeveloperId => {
+                DigestAlg::Sha256
+            }
         }
     }
 }
@@ -44,15 +83,54 @@ pub struct DocPin {
     pub redirect_hosts: &'static [&'static str],
 }
 
+/// How a build this machine just landed is WARMED ([`crate::warm`]): one headless run that
+/// refreshes the vendor CLI's account-bound caches (the served model catalog, feature flags)
+/// before the user's first launch, and never starts a model turn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Warm {
+    /// The arguments after the program's name.
+    pub argv: &'static [&'static str],
+    /// The AI variables ([`aterm_types::domain::is_ai_env_var`]) the program is handed
+    /// although they are stripped from every other child: not a session's state but the
+    /// user's own setup of THIS program — where it keeps its config and caches (the very
+    /// files the warm refreshes) and which endpoint it talks to. Every other AI variable,
+    /// another vendor's setup among them, is kept from it.
+    pub keep: &'static [&'static str],
+    /// `(NAME, VALUE)` pairs set on the program, over anything the user's setup holds.
+    pub env: &'static [(&'static str, &'static str)],
+    /// The variable whose non-empty value is the user's opt-out of exactly the traffic the
+    /// warm exists to make: set, the program is not warmed. A variable the program honours
+    /// itself (`DISABLE_TELEMETRY`) is no opt-out here: it reaches the program.
+    pub opt_out: Option<&'static str>,
+    /// Where the program keeps its state on this account: none of it present, the program
+    /// has never run here, there is nothing to refresh, and it is not warmed. `None`: it is
+    /// always warmed.
+    pub state: Option<AccountState>,
+}
+
+/// Where a warmed program keeps its state on this account ([`Warm::state`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AccountState {
+    /// The variable naming its state directory; set and non-empty, that directory alone is
+    /// its state.
+    pub dir_var: &'static str,
+    /// Its state under HOME when [`Self::dir_var`] is unset: any one present is enough.
+    pub under_home: &'static [&'static str],
+}
+
 /// One vendor-direct program.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VendorSpec {
-    /// The program, as [`crate::stub::AGENT_PROGRAMS`] spells it.
+    /// The program's name ([`crate::stub::AGENT_PROGRAMS`] is these names, in table order).
     pub program: &'static str,
     /// Who publishes it, for user-visible lines (`Anthropic latest`).
     pub vendor: &'static str,
     /// The product's own name.
     pub product: &'static str,
+    /// The authored what-it-is line the pending stub prints while the install is on its way
+    /// ([`crate::stub::describe`]): the vendor, the license, the rough size and the host the
+    /// bytes come from — descriptively ("Anthropic Claude Code"), never as an ALab mark.
+    pub description: &'static str,
     /// The vendor's `latest` pointer — a hint only; everything it names is re-verified.
     pub head_url: &'static str,
     /// What authenticates the digest.
@@ -63,25 +141,45 @@ pub struct VendorSpec {
     pub exposes: &'static [&'static str],
     /// Every first-hop fetch URL must start with one of these (https, trailing `/`).
     pub url_prefixes: &'static [&'static str],
+    /// The one query a fetch URL may carry: these keys, in this order, each with a value,
+    /// right after a prefix (`<prefix>?channel=…&version=…&file=…`;
+    /// [`crate::vendor::vendor_direct_url_allowed`]). Empty: no URL carries a query.
+    pub url_query: &'static [&'static str],
     /// Per digest document, where it is fetched and where its answer may come from.
     pub digest_docs: &'static [DocPin],
     /// `NAME=VALUE` entries the shims export; never taken from the index.
     pub shim_env: &'static [&'static str],
-    /// The arguments after the program's name that WARM a build this machine just landed
-    /// ([`crate::warm`]): one headless run that refreshes the vendor CLI's account-bound
-    /// caches (the served model catalog, feature flags) before the user's first launch,
-    /// and never starts a model turn. Empty: the program is never warmed. Compiled only,
-    /// never taken from the index — the rule [`Self::shim_env`] follows.
-    pub warm: &'static [&'static str],
+    /// How a build this machine just landed is warmed: its argv and every per-program fact
+    /// the warm reads. `None`: the program is never warmed. Compiled only, never taken from
+    /// the index — the rule [`Self::shim_env`] follows.
+    pub warm: Option<Warm>,
+    /// The vendor's self-update verbs the program's twin hands to aterm's package manager
+    /// ([`crate::selfupdate`]), exactly as typed as `$1`; each must pass
+    /// [`crate::selfupdate::is_shell_safe_verb`] (it lands in a `case` pattern). EMPTY means
+    /// the program has no self-updater and its twin carries no block — an explicit decision
+    /// per row. Where each was measured is the table in
+    /// `docs/DESIGN-vendor-self-update-2026-09-19.md`.
+    pub self_update_verbs: &'static [&'static str],
+    /// Whether aterm's live upgrade moves a running session of this program onto a build a
+    /// pass lands, so a pass that moves the program's `agents/` twin wakes the window's host
+    /// ([`crate::activation_notice`]). `false` for a program no harness supervises: no
+    /// session waits on its landing.
+    pub live_upgrade: bool,
+    /// Whether the program's versions are spelled in the revision form `x.y.z-R<n>[.<s>]`
+    /// (the same `x.y.z` rebuilt under another `R`) rather than plain `x.y.z`. A head
+    /// spelled in the other form is refused, never ordered against this one.
+    pub revision_versions: bool,
     /// The oldest version installed: a frozen or replayed CDN cannot hand a new machine an
     /// old build. It is the version the final legacy pin names, so it is at or above every
-    /// legacy pin up to [`Self::legacy_ceiling`].
+    /// legacy pin up to [`Self::legacy_ceiling`] (with no pin, the head when the row was
+    /// written).
     pub floor: Version,
     /// The final legacy ALab index build of the program — the last one any index pinned
-    /// before the vendor lane was retired. A legacy build at or below it whose version
-    /// cannot be read is replaced by any admissible head with no index and no downgrade. A
-    /// build above it (a pin this code never saw) may carry a version above the floor, so
-    /// the lane keeps it until its version is read (`legacy_facts`) or a person asks.
+    /// before the vendor lane was retired, or [`NEVER_INDEX_PINNED`]. A legacy build from
+    /// 1 up to it whose version cannot be read is replaced by any admissible head with no
+    /// index and no downgrade. Any other (a pin this code never saw) may carry a version
+    /// above the floor, so the lane keeps it until its version is read (`legacy_facts`) or
+    /// a person asks.
     pub legacy_ceiling: u64,
 }
 
@@ -105,6 +203,15 @@ impl VendorSpec {
                     .is_some_and(|h| pin.redirect_hosts.contains(&h)))
     }
 
+    /// Whether the vendor publishes a build of this program that the lane can verify for
+    /// `triple`, the client's own. A program that is not served is the canonical
+    /// `unavailable on <target>` state: no head is asked for it, no stub promises it and
+    /// no pass installs it.
+    #[must_use]
+    pub(crate) fn serves(&self, triple: &str) -> bool {
+        super::resolve::serves(self.anchor, triple)
+    }
+
     /// [`Self::shim_env`] admitted under [`crate::shim_env::ShimEnv::admit`]'s rule
     /// (pinned by a test, so the fallback never fires).
     #[must_use]
@@ -122,28 +229,85 @@ const fn floor(major: u32, minor: u32, patch: u32) -> Version {
     }
 }
 
-/// The final legacy pins ([`VendorSpec::legacy_ceiling`]), read from the live index 46 on
-/// 2026-09-24 after the vendor lane was retired: claude 2026092401 (2.1.281) and codex
-/// 2026092301 (0.156.1), whose versions are the floors. No lane pins either program again
-/// (an index pin for one is a floor), and `spec_coherence` refuses a committed legacy pin
-/// above the ceiling. A legacy build above it all the same — a pin this code never saw — has
-/// its version read once from its signed manifest and kept in the stamp
-/// (`lane::legacy_facts`), then is decided like any read build; only while that read fails
-/// is it kept (`LegacyUnread`), and the next pass reads again. Raising the ceiling means
-/// raising the floors with it — never one without the other.
+/// A compile-time revision-form version (`x.y.z-R<n>[.<s>]`); an out-of-range literal fails
+/// the build.
+const fn revision_floor(
+    major: u32,
+    minor: u32,
+    patch: u32,
+    revision: u32,
+    sub: Option<u32>,
+) -> Version {
+    match Version::with_revision(major, minor, patch, revision, sub) {
+        Some(v) => v,
+        None => panic!("vendor floor out of range"),
+    }
+}
+
+/// agy's per-platform manifests on its Cloud Run updater service, as agy's own updater
+/// spells them: `<this>/<os>_<arch>[_musl].json`.
+macro_rules! agy_manifests {
+    () => {
+        "https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/"
+    };
+}
+
+/// agy's head: the manifest for THIS client's own platform — the one agy's own updater
+/// obeys while a rollout is staged — chosen by the arms `cli::current_triple` reports
+/// under. A platform with none of them gets the bare prefix, which no fetch admits.
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+const AGY_HEAD: &str = concat!(agy_manifests!(), "darwin_arm64.json");
+#[cfg(all(target_arch = "x86_64", target_os = "macos"))]
+const AGY_HEAD: &str = concat!(agy_manifests!(), "darwin_amd64.json");
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+const AGY_HEAD: &str = concat!(agy_manifests!(), "linux_amd64.json");
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+const AGY_HEAD: &str = concat!(agy_manifests!(), "linux_arm64.json");
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+const AGY_HEAD: &str = concat!(agy_manifests!(), "windows_amd64.json");
+#[cfg(all(target_arch = "aarch64", target_os = "windows"))]
+const AGY_HEAD: &str = concat!(agy_manifests!(), "windows_arm64.json");
+#[cfg(not(any(
+    all(target_arch = "aarch64", target_os = "macos"),
+    all(target_arch = "x86_64", target_os = "macos"),
+    all(target_arch = "x86_64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "linux"),
+    all(target_arch = "x86_64", target_os = "windows"),
+    all(target_arch = "aarch64", target_os = "windows"),
+)))]
+const AGY_HEAD: &str = agy_manifests!();
+
+/// The final legacy pins this code vouches for ([`VendorSpec::legacy_ceiling`]), read from
+/// the live index 46 on 2026-09-24: claude 2026092401 (2.1.281) and codex 2026092301
+/// (0.156.1), whose versions are the floors. An index may pin either program above it (the
+/// live one did, hourly, through index 71 on 2026-10-16). A legacy build above it has its
+/// version read once from its signed manifest, under any verified index whether or not that
+/// index still names the program, and kept in the stamp (`lane::legacy_facts`); then it is
+/// decided like any read build. Only while that read fails is it kept (`LegacyUnread`), and
+/// the next pass reads again. Raising the ceiling means raising the floors with it — never
+/// one without the other.
 const LEGACY_CEILING: u64 = 2_026_092_401;
 
-/// The vendor-direct programs, in [`crate::stub::AGENT_PROGRAMS`] order.
+/// The [`VendorSpec::legacy_ceiling`] of a program no ALab index ever pinned: no legacy
+/// build of it is vouched for by its floor, so a non-vendor build in its store is kept,
+/// unread, until a person asks.
+pub const NEVER_INDEX_PINNED: u64 = 0;
+
+/// The agent programs, each fetched from its own vendor: the one roster of them
+/// ([`crate::stub::AGENT_PROGRAMS`] is its names, in this order).
 pub const VENDORS: &[VendorSpec] = &[
     VendorSpec {
         program: "claude",
         vendor: "Anthropic",
         product: "Claude Code",
+        description: "Anthropic Claude Code — proprietary, ~200 MB, downloaded from \
+                      downloads.claude.ai",
         head_url: "https://downloads.claude.ai/claude-code-releases/latest",
         anchor: Anchor::AnthropicOpenPgp,
         apple_team: "Q6L2SF6YDW",
         exposes: &["claude"],
         url_prefixes: &["https://downloads.claude.ai/claude-code-releases/"],
+        url_query: &[],
         // `<v>/manifest.json` and its `.sig`, answered in place.
         digest_docs: &[DocPin {
             prefix: "https://downloads.claude.ai/claude-code-releases/",
@@ -154,23 +318,44 @@ pub const VENDORS: &[VendorSpec] = &[
             "DISABLE_AUTOUPDATER=1",
             "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1",
         ],
-        // Print mode reading stream-json from a stdin the warm never writes (measured on
-        // 2.1.280): the bootstrap, feature and model-catalog fetches run and
-        // no `/v1/messages` call, no transcript and no hook or MCP server does; the warm
-        // closes stdin and the CLI exits 0. Never `--bare` (it skips those very fetches)
-        // and never `--init-only` (it exits racing them).
-        warm: &[
-            "-p",
-            "--input-format",
-            "stream-json",
-            "--output-format",
-            "stream-json",
-            "--verbose",
-            "--no-session-persistence",
-            "--strict-mcp-config",
-            "--settings",
-            r#"{"disableAllHooks":true}"#,
-        ],
+        warm: Some(Warm {
+            // Print mode reading stream-json from a stdin the warm never writes (measured on
+            // 2.1.280): the bootstrap, feature and model-catalog fetches run and
+            // no `/v1/messages` call, no transcript and no hook or MCP server does; the warm
+            // closes stdin and the CLI exits 0. Never `--bare` (it skips those very fetches)
+            // and never `--init-only` (it exits racing them).
+            argv: &[
+                "-p",
+                "--input-format",
+                "stream-json",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                "--no-session-persistence",
+                "--strict-mcp-config",
+                "--settings",
+                r#"{"disableAllHooks":true}"#,
+            ],
+            // The config home (an aterm identity session sets it after its own strip) and
+            // the endpoint choice.
+            keep: &[
+                "CLAUDE_CONFIG_DIR",
+                "ANTHROPIC_BASE_URL",
+                "CLAUDE_CODE_USE_BEDROCK",
+                "CLAUDE_CODE_USE_VERTEX",
+            ],
+            // The claude.ai MCP connectors stay unstarted: the warm wants the account's
+            // caches, not its tools.
+            env: &[("ENABLE_CLAUDEAI_MCP_SERVERS", "false")],
+            opt_out: Some("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"),
+            state: Some(AccountState {
+                dir_var: "CLAUDE_CONFIG_DIR",
+                under_home: &[".claude", ".claude.json"],
+            }),
+        }),
+        self_update_verbs: &["update", "upgrade", "install"],
+        live_upgrade: true,
+        revision_versions: false,
         floor: floor(2, 1, 281),
         legacy_ceiling: LEGACY_CEILING,
     },
@@ -178,6 +363,8 @@ pub const VENDORS: &[VendorSpec] = &[
         program: "codex",
         vendor: "OpenAI",
         product: "Codex CLI",
+        description: "OpenAI Codex CLI — Apache-2.0, ~110 MB (~290 MB on disk), downloaded \
+                      from github.com/openai/codex",
         head_url: "https://releases.openai.com/codex/channels/latest",
         anchor: Anchor::OpenAiTwoHost,
         apple_team: "2DC432GLL2",
@@ -186,6 +373,7 @@ pub const VENDORS: &[VendorSpec] = &[
             "https://releases.openai.com/codex/",
             "https://github.com/openai/codex/releases/download/",
         ],
+        url_query: &[],
         digest_docs: &[
             // The release JSON: releases.openai.com itself, never redirected — else both
             // halves of the two-host agreement could come from GitHub.
@@ -204,12 +392,101 @@ pub const VENDORS: &[VendorSpec] = &[
             },
         ],
         shim_env: &[],
-        // Lists the served models headless and rewrites `~/.codex/models_cache.json`, with
-        // no model turn (measured on 0.156.1). A debug subcommand: a release
-        // that drops it fails the warm, silently.
-        warm: &["debug", "models"],
+        warm: Some(Warm {
+            // Lists the served models headless and rewrites `~/.codex/models_cache.json`,
+            // with no model turn (measured on 0.156.1). A debug subcommand: a release
+            // that drops it fails the warm, silently.
+            argv: &["debug", "models"],
+            // The config home (an aterm identity session sets it after its own strip).
+            keep: &["CODEX_HOME"],
+            env: &[],
+            opt_out: None,
+            state: Some(AccountState {
+                dir_var: "CODEX_HOME",
+                under_home: &[".codex"],
+            }),
+        }),
+        self_update_verbs: &["update"],
+        live_upgrade: true,
+        revision_versions: false,
         floor: floor(0, 156, 1),
         legacy_ceiling: LEGACY_CEILING,
+    },
+    VendorSpec {
+        program: "agy",
+        vendor: "Google",
+        product: "Antigravity CLI",
+        description: "Google Antigravity CLI — proprietary, ~55 MB (~185 MB on disk), \
+                      downloaded from storage.googleapis.com",
+        head_url: AGY_HEAD,
+        anchor: Anchor::GoogleTwoHost,
+        apple_team: "EQHXZ8M8AV",
+        exposes: &["agy"],
+        url_prefixes: &[
+            agy_manifests!(),
+            "https://storage.googleapis.com/antigravity-public/antigravity-cli/",
+        ],
+        url_query: &[],
+        // The Run manifest and the `manifest.json` beside the payload, each answered in
+        // place — else both halves of the agreement could come from one host.
+        digest_docs: &[
+            DocPin {
+                prefix: agy_manifests!(),
+                redirect_hosts: &[],
+            },
+            DocPin {
+                prefix: "https://storage.googleapis.com/antigravity-public/antigravity-cli/",
+                redirect_hosts: &[],
+            },
+        ],
+        // agy's background updater replaces its own executable unless this is exactly
+        // `true` (`1` leaves it on; measured on 1.3.6, 2026-10-15).
+        shim_env: &["AGY_CLI_DISABLE_AUTO_UPDATE=true"],
+        // Nothing measured warms it signed out (`agy models` exits 1).
+        warm: None,
+        self_update_verbs: &["update", "install"],
+        live_upgrade: false,
+        revision_versions: false,
+        floor: floor(1, 3, 6),
+        legacy_ceiling: NEVER_INDEX_PINNED,
+    },
+    VendorSpec {
+        program: "muse",
+        vendor: "Meta",
+        product: "Muse Code",
+        description: "Meta Muse Code — proprietary, ~370 MB, downloaded from \
+                      lookaside.facebook.com",
+        head_url: "https://api.meta.ai/muse-code/channels/muse-stable",
+        anchor: Anchor::MetaDeveloperId,
+        apple_team: "V9WTTPBFK9",
+        exposes: &["muse"],
+        url_prefixes: &[
+            "https://api.meta.ai/muse-code/channels/",
+            "https://lookaside.facebook.com/lookaside/muse/download/",
+        ],
+        url_query: &["channel", "version", "file"],
+        // The channel and the release manifest, each answered in place.
+        digest_docs: &[
+            DocPin {
+                prefix: "https://api.meta.ai/muse-code/channels/",
+                redirect_hosts: &[],
+            },
+            DocPin {
+                prefix: "https://lookaside.facebook.com/lookaside/muse/download/",
+                redirect_hosts: &[],
+            },
+        ],
+        // The binary has no updater of its own (Meta's launcher script updates it, and is
+        // never used here).
+        shim_env: &[],
+        // No login-free run refreshes anything.
+        warm: None,
+        // No updater, so no verb to hand over (`muse update` is read as a prompt).
+        self_update_verbs: &[],
+        live_upgrade: false,
+        revision_versions: true,
+        floor: revision_floor(1, 4, 9, 6297, Some(1)),
+        legacy_ceiling: NEVER_INDEX_PINNED,
     },
 ];
 
@@ -225,6 +502,13 @@ pub fn is_vendor(program: &str) -> bool {
     spec(program).is_some()
 }
 
+/// Whether this platform has a build of `program` (muse is macOS only), by the rule the
+/// install and the doctor read; for readers outside atpkg, such as the AI connections.
+#[must_use]
+pub fn served_here(program: &str) -> bool {
+    spec(program).is_some_and(|s| s.serves(crate::cli::current_triple()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,47 +519,19 @@ mod tests {
         rest.split('/').next().unwrap()
     }
 
+    /// Every row's legacy ceiling is the newest of the final legacy pins (index 46: claude
+    /// 2026092401, codex 2026092301) or, for a program no index pinned, none: an index
+    /// build, never a vendor one. Each floor is in its program's grammar.
     #[test]
-    fn the_table_is_exactly_the_agent_programs() {
-        let programs: Vec<&str> = VENDORS.iter().map(|s| s.program).collect();
-        assert_eq!(programs, crate::stub::AGENT_PROGRAMS);
-        for name in crate::stub::AGENT_PROGRAMS {
-            assert!(is_vendor(name));
-            assert_eq!(spec(name).map(|s| s.program), Some(*name));
-        }
-        for other in ["trust", "ay", "gh", "", "Claude", "claude "] {
-            assert!(!is_vendor(other), "{other:?}");
-        }
-    }
-
-    #[test]
-    fn the_rows_are_the_measured_facts() {
-        let claude = spec("claude").unwrap();
-        assert_eq!(
-            (claude.vendor, claude.anchor, claude.apple_team),
-            ("Anthropic", Anchor::AnthropicOpenPgp, "Q6L2SF6YDW")
-        );
-        assert_eq!(claude.exposes, &["claude"]);
-        assert_eq!(
-            claude.shim_env,
-            &[
-                "DISABLE_AUTOUPDATER=1",
-                "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1"
-            ]
-        );
-        assert_eq!(claude.floor.to_string(), "2.1.281");
-        let codex = spec("codex").unwrap();
-        assert_eq!(
-            (codex.vendor, codex.anchor, codex.apple_team),
-            ("OpenAI", Anchor::OpenAiTwoHost, "2DC432GLL2")
-        );
-        assert_eq!(codex.exposes, &["codex"]);
-        assert!(codex.shim_env.is_empty());
-        assert_eq!(codex.floor.to_string(), "0.156.1");
-        // The final legacy pins (index 46): claude 2026092401, codex 2026092301.
+    fn the_legacy_ceiling_is_an_index_build() {
         for s in VENDORS {
-            assert_eq!(s.legacy_ceiling, 2_026_092_401, "{}", s.program);
+            assert!(
+                [LEGACY_CEILING, NEVER_INDEX_PINNED].contains(&s.legacy_ceiling),
+                "{}",
+                s.program
+            );
             assert!(!super::super::is_vendor_build(s.legacy_ceiling));
+            assert_eq!(s.floor.has_revision(), s.revision_versions, "{}", s.program);
         }
     }
 
@@ -285,7 +541,7 @@ mod tests {
     /// free operand, which print mode would send as a prompt.
     #[test]
     fn the_warm_argv_refreshes_caches_and_never_prompts() {
-        let claude = spec("claude").unwrap().warm;
+        let claude = spec("claude").unwrap().warm.unwrap().argv;
         for present in ["-p", "--no-session-persistence", "--strict-mcp-config"] {
             assert!(claude.contains(&present), "{present}");
         }
@@ -293,7 +549,6 @@ mod tests {
         for absent in ["--bare", "--init-only"] {
             assert!(!claude.contains(&absent), "{absent}");
         }
-        assert_eq!(spec("codex").unwrap().warm, &["debug", "models"]);
         // Every operand is a flag or the value of the flag before it (codex's two words
         // are its subcommand, not a prompt).
         let takes_value = ["--input-format", "--output-format", "--settings"];
@@ -304,8 +559,13 @@ mod tests {
             );
         }
     }
+
+    /// Every pin is an admissible https URL or host. The vendor-direct lane's host pins are
+    /// these compiled prefixes, never `vendor::VENDOR_HOSTS` (the index rows' list): a
+    /// multi-tenant host is pinned here by its path, which that list cannot say.
     #[test]
-    fn every_pin_is_https_and_an_allowed_vendor_host() {
+    fn every_pin_is_an_admissible_https_url() {
+        let admissible = |h: &str| crate::vendor::https_host(&format!("https://{h}/")) == Some(h);
         for s in VENDORS {
             assert!(
                 s.url_prefixes.iter().any(|p| s.head_url.starts_with(p)),
@@ -314,7 +574,7 @@ mod tests {
             );
             for p in s.url_prefixes {
                 assert!(p.starts_with("https://") && p.ends_with('/'), "{p}");
-                assert!(crate::vendor::VENDOR_HOSTS.contains(&host(p)), "{p}");
+                assert!(admissible(host(p)), "{p}");
             }
             for (i, pin) in s.digest_docs.iter().enumerate() {
                 assert!(
@@ -332,7 +592,7 @@ mod tests {
                     );
                 }
                 for h in pin.redirect_hosts {
-                    assert!(crate::vendor::VENDOR_HOSTS.contains(h), "{h}");
+                    assert!(admissible(h), "{h}");
                 }
             }
             let team = s.apple_team;
@@ -350,10 +610,19 @@ mod tests {
                 "{}",
                 s.program
             );
-            assert_ne!(
-                s.program, "digests",
-                "collides with the digest log's file name"
-            );
+            // A compiled updater switch is one that turns the updater off.
+            for (name, value) in s.shim_env().entries() {
+                if crate::shim_env::SELF_UPDATE_SWITCHES
+                    .iter()
+                    .any(|(n, _)| n == name)
+                {
+                    assert!(
+                        crate::shim_env::turns_updater_off(name, value),
+                        "{}: {name}={value}",
+                        s.program
+                    );
+                }
+            }
         }
     }
 
@@ -403,6 +672,22 @@ mod tests {
         assert!(claude.digest_doc_admitted(manifest, manifest));
         assert!(!claude.digest_doc_admitted(manifest, "https://downloads.claude.ai/other"));
         assert!(!claude.digest_doc_admitted(manifest, storage));
+        // agy's two documents and muse's two are each answered in place, or not read —
+        // never from the other document's host, which would make one host vouch twice.
+        let agy = spec("agy").unwrap();
+        let beside = "https://storage.googleapis.com/antigravity-public/antigravity-cli/1.3.6-1/darwin-arm/manifest.json";
+        let muse = spec("muse").unwrap();
+        let channel = muse.head_url;
+        let release = "https://lookaside.facebook.com/lookaside/muse/download/?channel=muse&version=1.4.9-R6297.1&file=manifest.json";
+        for (row, doc, other) in [
+            (agy, agy.head_url, beside),
+            (agy, beside, agy.head_url),
+            (muse, channel, release),
+            (muse, release, channel),
+        ] {
+            assert!(row.digest_doc_admitted(doc, doc), "{doc}");
+            assert!(!row.digest_doc_admitted(doc, other), "{doc} from {other}");
+        }
     }
 
     #[test]
@@ -411,7 +696,12 @@ mod tests {
         struct Row {
             a: Anchor,
         }
-        for a in [Anchor::AnthropicOpenPgp, Anchor::OpenAiTwoHost] {
+        for a in [
+            Anchor::AnthropicOpenPgp,
+            Anchor::OpenAiTwoHost,
+            Anchor::GoogleTwoHost,
+            Anchor::MetaDeveloperId,
+        ] {
             let text = aterm_toml::to_string(&Row { a }).unwrap();
             assert_eq!(text.trim(), format!("a = \"{}\"", a.as_str()));
             assert_eq!(aterm_toml::from_str::<Row>(&text).unwrap().a, a);

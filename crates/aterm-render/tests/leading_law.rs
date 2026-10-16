@@ -2,33 +2,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! The LEADING LAW (W5a), machine-checked over a dense metrics lattice: for
-//! every (ascent, descent, lineGap, line_height) the shipping
-//! [`aterm_render::cell_h_baseline`] satisfies
+//! The leading law, over a dense metrics lattice: for every (ascent, descent, lineGap,
+//! line_height) [`aterm_render::cell_h_baseline`] satisfies
 //!
-//! 1. `cell_h == round((ascent − descent + lineGap) · line_height)` (min 1) —
-//!    the cell box is the font's full line times the host multiplier; and
-//! 2. HALF-LEADING SPLIT: the total leading `cell_h − (ascent − descent)`
-//!    lands half above / half below the glyph within 1px —
-//!    `|space_above − space_below| <= 1` where
-//!    `space_above = baseline − ascent` and
-//!    `space_below = cell_h − (ascent − descent) − space_above`.
+//! 1. `cell_h == round((ascent − descent + lineGap) · line_height)` (min 1); and
+//! 2. half-leading split: the total leading `cell_h − (ascent − descent)` lands half above
+//!    and half below the glyph within 1px, i.e. `|space_above − space_below| <= 1` with
+//!    `space_above = baseline − ascent`.
 //!
-//! The pre-fix law (`baseline = round(ascent)`, dropping the WHOLE lineGap
-//! below the descent) top-biased every nonzero-lineGap face and violated the
-//! split.
-//!
-//! This is an arithmetic (rounding) law over f32, which the ty model language
-//! cannot express (no multiplication/division) — per the repo's verification
-//! map the always-on lattice test IS the machine check for rounding laws
-//! (the box-drawing `procedural.rs` precedent). An integration test then pins
-//! the REAL renderer geometry to the same function through the public API.
+//! A rounding law over f32 is outside ty's `Expr` language, so this lattice is its machine
+//! check; the last test pins the real renderer's geometry to the same function.
 
 use aterm_render::{Renderer, Theme, cell_h_baseline};
 
-/// Deliberate odd/even + fractional lattice: typical monospace verticals at
-/// UI px sizes, descents (NEGATIVE, the fontdue convention), hhea/OS/2 line
-/// gaps from zero through generous, and the config `line_height` domain
+/// Odd/even and fractional lattice: monospace verticals at UI px sizes, descents (negative,
+/// the fontdue convention), line gaps from zero up, and the config `line_height` domain
 /// (0.8..=2.0) plus the renderer's wider clamp bound.
 const ASCENTS: [f32; 7] = [4.0, 7.3, 9.6, 12.0, 15.5, 20.0, 24.8];
 const DESCENTS: [f32; 5] = [-1.0, -2.4, -3.0, -5.7, -8.0];
@@ -76,17 +64,13 @@ fn half_leading_splits_within_one_px() {
             }
         }
     }
-    // Non-vacuity: for nonzero gaps / non-1 scales the split genuinely moves
-    // the baseline off the old `round(ascent)` — the law is not trivially the
-    // old behavior.
+    // Non-vacuity: nonzero gaps and non-1 scales move the baseline off `round(ascent)`.
     assert!(split_moved_baseline > 100, "got {split_moved_baseline}");
 }
 
-/// Integration (requires the bundled test font): the REAL renderer's public
-/// `cell_size`/`baseline` are exactly `cell_h_baseline` of its live metrics —
-/// at the default line-height, after `set_line_height`, and after the
-/// `set_adjust_baseline` escape hatch (which shifts baseline only, never the
-/// cell box).
+/// The real renderer's `cell_size`/`baseline` follow `cell_h_baseline` at the default
+/// line height, after `set_line_height`, and after `set_adjust_baseline` (which shifts the
+/// baseline only, never the cell box).
 #[test]
 fn renderer_geometry_follows_the_law_live() {
     let bytes = std::fs::read(concat!(
@@ -99,16 +83,12 @@ fn renderer_geometry_follows_the_law_live() {
     let (_, h0) = r.cell_size();
     let b0 = r.baseline();
 
-    // set_line_height re-derives through the same law: scaling to 1.5 grows
-    // the box per the law and keeps the split (checked via the public API by
-    // comparing against cell_h_baseline of the recovered natural metrics).
+    // set_line_height re-derives through the same law.
     r.set_line_height(1.5);
     let (_, h1) = r.cell_size();
     let b1 = r.baseline();
     assert!(h1 > h0, "1.5 line-height grows the cell box");
-    // Recover the natural (scale-1) metrics from the law itself: with
-    // content+gap = natural, cell_h(1.0) = round(natural). Cross-check the
-    // 1.5 box against the same natural.
+    // At scale 1.0 cell_h = round(natural), so h0 stands in for the natural line.
     let natural = h0 as f32; // round(natural*1.0)
     assert_eq!(h1, (natural * 1.5).round() as usize, "law at scale 1.5");
     // The added leading splits: baseline moved down by ~half the delta.
@@ -120,8 +100,7 @@ fn renderer_geometry_follows_the_law_live() {
         "baseline moved by ~half the added leading (moved {moved}, delta {delta})"
     );
 
-    // adjust_baseline: pure baseline shift, cell box untouched, clamped, and
-    // 0 restores the derivation.
+    // adjust_baseline: a pure baseline shift, clamped; 0 restores the derivation.
     r.set_adjust_baseline(3);
     assert_eq!(r.baseline(), b1 + 3, "escape hatch shifts the baseline");
     assert_eq!(r.cell_size().1, h1, "cell box is untouched");

@@ -112,9 +112,8 @@ fn every_production_done_subset_matches_exact_prefix_model() {
         "only empty plus each canonical prefix is admissible"
     );
 
-    // Bind the four model boundaries to concrete pipeline prefixes: empty,
-    // lock, prepared (build, self-check and the origin tag), published (the one
-    // publication — visible-channel convergence), and unlock-complete.
+    // Bind the model's boundaries to concrete prefixes: empty, lock, prepared (through `tag`),
+    // published (through `publish`) and complete.
     assert_eq!(
         publish::STEPS,
         ["lock", "sign", "selfcheck", "tag", "publish", "unlock"]
@@ -141,8 +140,7 @@ fn every_production_done_subset_matches_exact_prefix_model() {
         assert_eq!(after["resume_cursor"], abstract_count as i64);
     }
 
-    // Unknown/duplicate names and malformed immutable identity fail before any
-    // resume authority is admitted.
+    // Unknown or duplicate names and malformed identity fail before any resume authority.
     for done in [
         vec!["lock".into(), "unknown".into()],
         vec!["lock".into(), "lock".into()],
@@ -150,9 +148,7 @@ fn every_production_done_subset_matches_exact_prefix_model() {
     ] {
         assert!(journal(done).save(&path).is_err());
     }
-    // The journal carries the canonical MAJOR.MINOR.PATCH release version, so
-    // the retired two-component spelling, an over-long one, and a non-canonical
-    // leading-zero component are all refused before any resume authority.
+    // The version must be canonical MAJOR.MINOR.PATCH.
     for bad in ["0.55", "0.55.1.2", "0.55.01", "0.55.x", ""] {
         let mut bad_version = journal(Vec::new());
         bad_version.version = bad.into();
@@ -165,8 +161,8 @@ fn every_production_done_subset_matches_exact_prefix_model() {
     bad_owner.commit = "abcd".into();
     assert!(bad_owner.save(&path).is_err());
 
-    // NEGATIVE CONTROL: the historical gap (later remote mutation pre-marked)
-    // is rejected by production and by Buggy=0, but admitted by Buggy=1.
+    // Negative control: a gapped journal (a later remote mutation marked done) is refused by
+    // production and by Buggy=0, admitted by Buggy=1.
     let dangerous_gap = vec!["lock".into(), "publish".into()];
     assert!(journal(dangerous_gap).save(&path).is_err());
     let mut before = model.init_state();
@@ -194,9 +190,8 @@ fn every_production_done_subset_matches_exact_prefix_model() {
     assert!(buggy_admitted, "Buggy=1 did not admit gap: {why}");
     assert!(!buggy.check_invariant("AdmittedDoneIsCanonicalPrefix", &bypassed));
 
-    // NEGATIVE CONTROL: a journal through `mirror` is not complete — production
-    // resumes it at `unlock`. Completing it anyway (the cut reported DONE over a
-    // final step that never journaled) is the mutant only the completion law sees.
+    // Negative control: a journal through `publish` resumes at `unlock`; completing it anyway
+    // is the mutant only the completion law sees.
     let through_mirror = journal(
         publish::STEPS[..publish::STEPS.len() - 1]
             .iter()

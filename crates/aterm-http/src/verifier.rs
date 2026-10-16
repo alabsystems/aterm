@@ -77,8 +77,8 @@ use windows as imp;
 // where `unix::tests` drives its store discovery, its tolerant PEM path and its
 // chain math natively against `/etc/ssl/cert.pem`, the same shape of bundle a
 // Linux box has. A shipped Apple build does not carry it (it is not the arm
-// that runs there); the Linux cells of `xtask gate cells` type-check it for
-// the triples that do. What that still leaves unproven is named in `unix`'s
+// that runs there); the Linux box's own build and the linux-arm cell of
+// `verify cells` type-check it for the triples that do. What that still leaves unproven is named in `unix`'s
 // own header.
 #[cfg(any(
     all(unix, not(target_vendor = "apple"), not(target_os = "android")),

@@ -1,41 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A KEEPER OUTLIVES THE BUILD IT STARTED FROM.
+//! A keeper outlives the build it started from. An update moves the old bundle to
+//! `aterm.app.rollback` and the successor's boot-health confirmation deletes it, while macOS
+//! checks a running process's code through the file it started from: with that file deleted
+//! the lookup fails `ENOENT` (OSStatus 100002), and with another build at the path it fails
+//! too. So the keeper runs from its own copy of its code, and a window's designated-requirement
+//! check (§5.7) still admits it.
 //!
-//! The keeper is the one long-lived process an update leaves on the old
-//! build: the update moves that bundle to `aterm.app.rollback`, and the
-//! successor's boot-health confirmation deletes it. A window admits a keeper
-//! only when the keeper's code meets the window's designated requirement
-//! (§5.7), and macOS checks a running process's code through the file it was
-//! started from. Measured 2026-10-01 (macOS 26.6.2, the installed Developer ID
-//! build and an ad-hoc copy): with that file deleted the lookup fails `ENOENT`
-//! (OSStatus 100002), and with another build at the path it fails too — so
-//! every window after the update refused the keeper, and the shells it held
-//! could never be taken back.
+//! `aterm keeper serve --identity designated` runs from a copy of this test binary (bare, and in
+//! an ad-hoc signed bundle); that build is deleted, then replaced at its path, and a dial as the
+//! original build must still admit the keeper. Negative controls: other code (`nc`, a bundle
+//! sealing another Info.plist) is refused. The last test checks that `aterm keeper stop` leaves
+//! no copy behind.
 //!
-//! Here `aterm keeper serve` (the real verb, `--identity designated`) runs from
-//! a copy of this test binary: a build tree's bare executable, and an ad-hoc
-//! signed app bundle around it (the shape of `/Applications/aterm.app`, whose
-//! whole bundle the keeper copies). That build is then deleted, and a
-//! different one is put at its path (the next update reusing
-//! `aterm.app.rollback`). After each, a dial as the build the keeper started
-//! from must still admit it: the keeper runs that very code. NEGATIVE
-//! CONTROLS: other code (`nc`, a bundle whose signature seals another
-//! Info.plist) is still refused.
-//!
-//! The copy a keeper runs from is removed once it has ended: the last test
-//! submits the keeper as `aterm keeper start` does (a launchd job, under a
-//! test label) and checks `aterm keeper stop` leaves no copy behind.
-//!
-//! No WindowServer: every process is this test binary (bare or in its bundle,
-//! run by `exec`, never by LaunchServices), `nc`, `codesign`, `ditto` or
-//! `launchctl`; stand-ins end by SIGKILL (AGENTS.md).
-//!
-//! Every test skips, with one line, where macOS's `trustd` does not answer
-//! (`aterm_uds::deadline::trust_service_silent`): the negative controls check
-//! Apple-signed code, and once the probe has found the service silent every
-//! code check in this process is refused at once — the shipped behavior.
+//! No WindowServer: every process is this binary (run by `exec`, never LaunchServices), `nc`,
+//! `codesign`, `ditto` or `launchctl`; stand-ins end by SIGKILL. Every test skips with one line
+//! where `trustd` does not answer (`aterm_uds::deadline::trust_service_silent`): the negative
+//! controls check Apple-signed code.
 
 #![cfg(target_vendor = "apple")]
 
@@ -44,9 +26,8 @@ use std::io::Write as _;
 use std::os::unix::fs::DirBuilderExt as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-// `spawnfd`'s: every child here (the keepers, `nc`, the verbs) holds its stdio
-// and nothing else of this process — not a pipe another test thread had open
-// unflagged at the spawn, held for as long as a keeper lives.
+// `spawnfd`'s: each child (the keepers, `nc`, the verbs) inherits only its stdio, never a pipe
+// another test thread had open unflagged at the spawn.
 use aterm_uds::spawnfd::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -246,11 +227,9 @@ fn trustd_silent(why: &str) -> bool {
 }
 
 impl Scratch {
-    /// Dial the keeper as this build's window does (its own designated
-    /// identity). A check `trustd` did not answer — this process's of the
-    /// keeper, or the keeper's of this dial (its log says so) — is COULD NOT
-    /// RUN, so a probe retries only a keeper not yet listening, and the gate's
-    /// own deadline names a hold.
+    /// Dial the keeper as this build's window does (its own designated identity). A check
+    /// `trustd` did not answer, ours of the keeper or the keeper's of this dial (its log says
+    /// so), panics as COULD NOT RUN, so a probe retries only a keeper not yet listening.
     fn dial_as_this_build(&self) -> std::io::Result<String> {
         let own = Identity::for_self(IdentityPolicy::Designated).expect("own requirement");
         let got =
@@ -299,8 +278,7 @@ fn signed_bundle(app: &Path, id: &str) -> PathBuf {
         ),
     )
     .expect("Info.plist");
-    // Under a hang detector: a codesign that macOS stops answering mid-run
-    // fails this test in a minute instead of hanging the suite.
+    // A hang detector: a codesign macOS stops answering fails this test, never hangs the suite.
     let sign = output_until(
         aterm_uds::spawnfd::command("/usr/bin/codesign")
             .args(["--force", "--sign", "-"])
@@ -339,9 +317,8 @@ fn a_keeper_whose_build_is_deleted_is_still_this_builds() {
     })
     .unwrap_or_else(|| panic!("the keeper never answered this build: {}", s.log()));
     assert!(before.starts_with("keeper=running"), "{before}");
-    // It answers from its own copy of its code: the same process (`exec`
-    // keeps the pid launchd watches), now running a file under the keeper
-    // code directory of the HOME it was given.
+    // It answers from its own copy of its code: the same pid (`exec` keeps the one launchd
+    // watches), running a file under the given HOME's keeper code directory.
     let keeper = s.kids[0].id();
     let inner = s.runs_from_its_copy(keeper);
     assert_eq!(inner, Path::new("aterm"), "a bare build is copied alone");
@@ -387,8 +364,7 @@ fn a_keeper_whose_build_is_deleted_is_still_this_builds() {
         "with another build at its path, the keeper is refused: {reused:?}"
     );
 
-    // NEGATIVE CONTROL: a "keeper" that runs other code is still not this
-    // build's — the check is as strict as ever.
+    // Negative control: a "keeper" that runs other code is refused.
     let fake = s.dir.join("run").join("f.sock");
     s.kids.push(
         Command::new("/usr/bin/nc")
@@ -415,12 +391,10 @@ fn a_keeper_whose_build_is_deleted_is_still_this_builds() {
     );
 }
 
-/// THE INSTALLED SHAPE: the keeper runs from an app bundle (`A`, the
-/// `/Applications/aterm.app` an update moves to `aterm.app.rollback`), so it
-/// copies the WHOLE bundle — the signature seals its Info.plist and resources
-/// — and checks that copy as a directory before running from it. The window
-/// that dials is the same app at another path (`B`: the same bytes, so the same
-/// code), as `aterm keeper status --identity designated` runs.
+/// The installed shape: the keeper runs from an app bundle (`A`, as `/Applications/aterm.app`),
+/// so it copies the whole bundle (the signature seals its Info.plist and resources) and checks
+/// the copy before running from it. The dialing window is the same app at another path (`B`,
+/// the same bytes), as `aterm keeper status --identity designated` runs.
 #[test]
 fn a_keeper_whose_app_is_deleted_is_still_that_apps() {
     play_role_if_asked();
@@ -482,8 +456,8 @@ fn a_keeper_whose_app_is_deleted_is_still_that_apps() {
         "with another app at its path, the keeper is refused: {reused}"
     );
 
-    // NEGATIVE CONTROL: that other app is not the keeper's code, and the
-    // keeper is refused when it dials.
+    // Negative control: dialed from the other app, which is not the keeper's code, the keeper
+    // is refused.
     let refused = s.verb(&other_exe, BUNDLED, &status);
     assert!(
         refused.starts_with("keeper=refused"),
@@ -491,10 +465,9 @@ fn a_keeper_whose_app_is_deleted_is_still_that_apps() {
     );
 }
 
-/// `aterm keeper stop` (launchd's SIGTERM, which the keeper does not catch)
-/// leaves no copy of the keeper's code behind: it waits for the keeper to end,
-/// then removes the copies of every keeper that has ended. The keeper is
-/// submitted as `aterm keeper start` submits it, under a TEST label.
+/// `aterm keeper stop` (launchd's SIGTERM, which the keeper does not catch) waits for the keeper
+/// to end, then removes the copies of every keeper that has ended. The keeper is submitted as
+/// `aterm keeper start` submits it, under a test label.
 #[test]
 fn a_stopped_keeper_leaves_no_copy_of_its_code() {
     play_role_if_asked();

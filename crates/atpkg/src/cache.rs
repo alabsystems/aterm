@@ -1,38 +1,24 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Same-source index cache (§14) — persist the last successfully-fetched index CANDIDATE
-//! bytes so a transient fetch failure falls back to the last-good SIGNED index.
+//! Same-source index cache (§14): the last successfully fetched index candidate bytes, so a
+//! transient fetch failure falls back to the last-good signed index.
 //!
-//! The cache holds **bytes, not trust**: cached candidates are fed back UNCHANGED through
-//! [`crate::select::select_index`]'s verify-then-select plus the caller's floor + freshness
-//! gates, so a tampered/stale cache installs nothing the live path wouldn't. It is honored
-//! ONLY when its recorded source == the current fetcher's `source_id`, so a `dir:`
-//! publisher-test cache never satisfies a failed `github:` fetch (the same-source guard).
+//! The cache holds bytes, not trust: cached candidates go back unchanged through
+//! [`crate::select::select_index`]'s verify-then-select (the cached roster admitted under
+//! the pinned paper master, the index verified under the machines it authorizes) and the
+//! caller's floor and freshness gates, so a tampered or stale cache installs nothing the
+//! live path would not. Parsing the cache's own TOML is not the verify-before-parse
+//! boundary: `parse_index` sees the index bytes only after that chain. The cache is honored
+//! only when its recorded source equals the current fetcher's `source_id`, so a `dir:`
+//! publisher-test cache never satisfies a failed `github:` fetch.
 //!
-//! Parsing the cache TOML is NOT the verify-before-parse boundary: the extracted bytes are
-//! only ever handed to [`crate::select_index`], which admits the cached ROSTER under the
-//! pinned paper master and then verifies the cached index under the machines that roster
-//! still authorizes, before `parse_index` sees a byte. A forged cache fails that chain.
-//!
-//! # The roster is cached WITH its index, and that is what keeps the cache honest
-//!
-//! A cache entry stores the whole candidate — index, index signature, roster, roster
-//! signature — because the index is meaningless without the generation that authorized it.
-//! Storing only the index would have made the cache a downgrade oracle: whoever serves the
-//! index could suppress the roster assets, and a client that fell back to a cached index
-//! plus a freshly-fetched roster would be pairing documents that were never published
-//! together.
-//!
-//! The cached roster is not trusted for being cached. It faces the same `roster_seq`
-//! ratchet (a generation older than the durable floor is refused forever) and the same
-//! `valid_until` check. That check no longer bounds how long a suppressed roster can keep
-//! an old authorization alive: every roster is minted with 9999-12-31 by owner decision
-//! (`crates/atpkg-keys/src/roster_ops.rs`), so the floor and revocation are the defences.
-//! An entry written before this field existed decodes to EMPTY
-//! roster bytes, which fail admission — fail-closed, and the next successful fetch
-//! replaces it.
-//!
+//! An entry stores the whole candidate (index, signature, roster, roster signature): an
+//! index without the roster generation that authorized it would make the cache a downgrade
+//! oracle, pairing a cached index with a roster never published beside it. The cached
+//! roster faces the same `roster_seq` floor and `valid_until` check as a fetched one; every
+//! roster is minted with 9999-12-31 (`crates/atpkg-keys/src/roster_ops.rs`), so the floor
+//! and revocation are the real defences.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -42,28 +28,23 @@ use serde::{Deserialize, Serialize};
 use crate::select::Candidate;
 use crate::store::Layout;
 
-/// The one schema version this build writes and the ONLY one it reads. See the
-/// fail-closed check in `read_doc`.
+/// The one schema version this build writes and the only one it reads (`read_doc`). A new
+/// field goes in as `#[serde(default)]`, as the roster fields did, so this need not move.
 const CACHE_SCHEMA: u32 = 1;
 const MAX_CACHE_CANDIDATES: usize = 24;
 const MAX_CACHED_INDEX_BYTES: usize = 5_000_000;
 const MAX_CACHED_SIGNATURE_BYTES: usize = 4_096;
-/// A roster is a few hundred bytes per machine and is capped at 16 machines; 64 KiB is a
-/// ceiling, not a fit. Matches the download cap `net` and `aterm-update` both use.
+/// A roster is a few hundred bytes per machine, capped at 16 machines; 64 KiB is a ceiling,
+/// matching the download cap `net` and `aterm-update` use.
 const MAX_CACHED_ROSTER_BYTES: usize = 65_536;
-/// A label is a release tag (`v1.4.2`, `index-2026-08-20`). Git's own ref format and
-/// every filesystem that has to hold one keep these far under 255 bytes; 512 is a
-/// ceiling, not a fit. Enforced on BOTH sides — see `store` and `read_doc`.
+/// A label is a release tag (`v1.4.2`, `index-2026-08-20`); 512 is a ceiling, not a fit.
+/// Enforced on both `store` and `read_doc`.
 const MAX_CACHED_LABEL_BYTES: usize = 512;
 const MAX_INDEX_CACHE_BYTES: usize = 144 * 1024 * 1024;
 
-/// One cached index candidate: its label + base64 index/sig bytes + the master-signed
-/// roster published beside it.
-///
-/// The two roster fields are `#[serde(default)]` so a cache written by an older build
-/// still DECODES — and then yields empty roster bytes, which no chain admits. That is the
-/// correct direction: an entry that predates the single root cannot authorize anything,
-/// and it is replaced by the next successful fetch rather than failing the read.
+/// One cached index candidate: its label, base64 index/sig bytes and the master-signed
+/// roster published beside it. The roster fields default so an entry without them still
+/// decodes, to empty roster bytes no chain admits; the next successful fetch replaces it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CachedCandidate {
     label: String,
@@ -90,39 +71,26 @@ struct CacheDoc {
 /// A file-backed index cache under the hardened prefix.
 pub struct IndexCache {
     path: PathBuf,
-    /// The layout whose PREFIX this cache lives in, when it has one — the source of the
-    /// mode [`IndexCache::store`] creates and hardens the cache's parent with.
-    ///
-    /// The parent IS `layout.prefix` (`<prefix>/index-cache.toml`), so the mode is not a
-    /// detail of the cache: `store` used to harden it `0700` unconditionally, which under
-    /// a root-owned SYSTEM prefix is the failure [`Layout::ensure_dir`] exists to prevent
-    /// — root writes such a prefix and EVERY user must traverse and execute out of it, so
-    /// it is published `0755`. A `0700` system prefix installs a toolchain only root can
-    /// run and fails at the first non-root invocation with a bare `Permission denied`.
-    /// `store` runs on every resolve that reaches the source, and
-    /// nothing later in a pass widens the prefix back, so the unconditional hardening
-    /// re-entered that regression (7d968b2fe) through the cache writer.
-    ///
-    /// `None` is a cache that is NOT under an install prefix (the path-only
-    /// [`IndexCache::new`]): private state, hardened `0700` as before.
+    /// The layout whose prefix this cache lives in, which sets the mode `store` creates
+    /// the parent with. The parent is `layout.prefix` itself: a root-owned system prefix
+    /// must be `0755` for every user to run from it, and `store` runs on every resolve with
+    /// nothing later widening the prefix back, so a hardcoded `0700` here would leave a
+    /// toolchain only root can run. `None` ([`IndexCache::new`]): private state, `0700`.
     layout: Option<Layout>,
 }
 
 impl IndexCache {
-    /// A cache backed by `path`, with NO prefix shape to follow: `store` hardens the
-    /// parent directory `0700`. The cache of an install prefix must be built with
-    /// [`IndexCache::for_layout`] instead — that is the only constructor whose parent
-    /// gets the mode the prefix shape calls for.
+    /// A cache backed by `path` with no prefix shape to follow: `store` makes the parent
+    /// `0700`. An install prefix's cache uses [`IndexCache::for_layout`].
     #[cfg(test)]
     #[must_use]
     pub(crate) fn new(path: PathBuf) -> Self {
         Self { path, layout: None }
     }
 
-    /// The `<prefix>/index-cache.toml` cache of `layout` — the constructor every install
-    /// path uses. Carries the layout so `store` creates and hardens the prefix through
-    /// [`Layout::ensure_dir`] (system ⇒ `0755`, `$HOME` ⇒ `0700`) rather than a hardcoded
-    /// `0700`; see the `layout` field.
+    /// The `<prefix>/index-cache.toml` cache of `layout`, the constructor every install
+    /// path uses: `store` creates the prefix through [`Layout::ensure_dir`] (system ⇒
+    /// `0755`, `$HOME` ⇒ `0700`).
     #[must_use]
     pub fn for_layout(layout: &Layout) -> Self {
         Self {
@@ -131,11 +99,9 @@ impl IndexCache {
         }
     }
 
-    /// Persist `candidates` tagged with `source_id`. Never clobbers a good cache with an
-    /// empty "success" (an empty candidate set is not stored). Best-effort — any error is
-    /// swallowed so a cache-write failure never fails an install. Written `0600` via temp +
-    /// rename so a reader never sees a half-written cache; a failure of either step unlinks
-    /// the temp rather than stranding it at the prefix root.
+    /// Persist `candidates` tagged with `source_id`. An empty or over-bound candidate set is
+    /// not stored, so it never clobbers a good cache. Best-effort: errors are swallowed.
+    /// Written `0600` via temp + rename; a failure of either step unlinks the temp.
     pub fn store(&self, source_id: &str, candidates: &[Candidate]) {
         if candidates.is_empty()
             || candidates.len() > MAX_CACHE_CANDIDATES
@@ -154,12 +120,9 @@ impl IndexCache {
             source: source_id.to_string(),
             fetched_at: String::new(),
             candidate: {
-                // Every blob is already bounded by the `store` guard above (index
-                // 5 MB, roster 64 KiB, signatures 4 KiB), all far below
-                // `aterm_codec::MAX_INPUT_LEN`, so no encode here can actually
-                // refuse. A cache write is best-effort regardless, so a refusal
-                // drops the write exactly like the `to_string` failure below —
-                // never a panic, and never a half-encoded document.
+                // The guard above bounds every blob far below `aterm_codec::MAX_INPUT_LEN`,
+                // so no encode can refuse; if one did, the write is dropped like a
+                // `to_string` failure, never half-encoded.
                 let mut rows = Vec::with_capacity(candidates.len());
                 for c in candidates {
                     let (Ok(index_b64), Ok(sig_b64), Ok(roster_b64), Ok(roster_sig_b64)) = (
@@ -190,23 +153,15 @@ impl IndexCache {
         let Some(parent) = self.path.parent() else {
             return;
         };
-        // The cache can be the first thing written under the prefix — create/harden the
-        // (vetted) parent so the first fetch is cached too, with the mode the PREFIX SHAPE
-        // calls for. The parent here IS `layout.prefix`, so hardening it `0700`
-        // unconditionally published a root-owned SYSTEM prefix owner-only on every resolve
-        // — and nothing later in the pass widens it back.
+        // The cache can be the first thing written under the prefix, so create the parent
+        // here, with the mode the prefix shape calls for (see the `layout` field).
         if self.ensure_parent(parent).is_err() {
             return;
         }
-        // Already exactly what is on disk ⇒ nothing left to write. The install flow
-        // resolves the candidates once per program AND once per transitive dependency,
-        // and every successful resolve lands here with a byte-identical document, so this
-        // collapses N temp-file writes + renames to one. Placed AFTER the parent
-        // hardening (which must run either way) and guarded on the SAME bounded no-follow
-        // reader `load` uses, so a symlinked/oversize/non-regular cache path never matches
-        // and still takes the replacing temp+rename path below. The file mode is
-        // re-asserted — a plain chmod on a path just read as a regular file — so the 0600
-        // invariant a write establishes is not skipped along with the write.
+        // Already what is on disk: nothing to write (an install resolves once per program
+        // and per dependency, each with an identical document). After the parent hardening,
+        // and through `load`'s bounded no-follow reader, so a symlinked, oversize or
+        // non-regular path never matches. The 0600 mode is re-asserted anyway.
         if crate::metadata_io::read_bounded_regular_utf8(&self.path, MAX_INDEX_CACHE_BYTES)
             .is_ok_and(|on_disk| on_disk == text)
         {
@@ -214,15 +169,9 @@ impl IndexCache {
             return;
         }
         let tmp = parent.join(format!(".index-cache.tmp-{}", std::process::id()));
-        // EITHER failure takes the temp with it, exactly as `progress::write_now` does.
-        // `fs::write` creates the inode before it fills it, so an ENOSPC/EDQUOT mid-write
-        // leaves a file behind even though the write "failed", and a rename that cannot
-        // land (a cache path that is a directory) strands the whole temp. The name carries
-        // the PID, so each failing process would strand a DISTINCT file at the PREFIX ROOT
-        // - which nothing sweeps: `gc` walks `store/` and `staging/`, never the root. They
-        // would accumulate for the life of the prefix, unreported by `doctor`, and the
-        // condition that creates them is a full disk. Best-effort stays best-effort: the
-        // cache write is still skipped silently and never fails the install.
+        // Either failure removes the temp: `fs::write` creates the inode before filling it
+        // (ENOSPC/EDQUOT leaves a file), and nothing sweeps the prefix root (`gc` walks
+        // `store/` and `staging/`), so a PID-named stray would stay.
         if fs::write(&tmp, text.as_bytes()).is_err() {
             let _ = fs::remove_file(&tmp);
             return;
@@ -233,10 +182,8 @@ impl IndexCache {
         }
     }
 
-    /// Create and harden the directory the cache file lives in, with the mode its PREFIX
-    /// SHAPE calls for — [`Layout::ensure_dir`] when this cache belongs to a layout (the
-    /// install paths), private `0700` when it does not. See the `layout` field for why a
-    /// cache writer gets to decide nothing here on its own.
+    /// Create and harden the cache file's directory: [`Layout::ensure_dir`] (the prefix
+    /// shape's mode) when this cache belongs to a layout, private `0700` when it does not.
     fn ensure_parent(&self, parent: &Path) -> std::io::Result<()> {
         match &self.layout {
             Some(layout) => layout.ensure_dir(parent),
@@ -244,19 +191,17 @@ impl IndexCache {
         }
     }
 
-    /// Load the cached candidates IFF the cache's recorded source == `source_id` (the
-    /// same-source guard). Fail-closed to `None` on any missing/parse/decode error, so a
-    /// garbage cache is inert rather than trusted.
+    /// Load the cached candidates iff the cache's recorded source is `source_id` (the
+    /// same-source guard). `None` on any missing/parse/decode error.
     #[must_use]
     pub fn load(&self, source_id: &str) -> Option<Vec<Candidate>> {
         decode(self.read_doc(source_id)?)
     }
 
-    /// The release LABELS of the candidates cached for `source_id`, newest first, under the
-    /// same guards as [`Self::load`] and without decoding a byte of them. A label is
-    /// diagnostics, never trust: `doctor` reads it to say which index the last pass that
-    /// reached the channel downloaded, never to decide anything. Read-only — no lock, no
-    /// write, no repair; `None` on anything [`Self::load`] would refuse.
+    /// The release labels of the candidates cached for `source_id`, newest first, under the
+    /// same guards as [`Self::load`] and without decoding them. Diagnostics only (`doctor`
+    /// says which index the last pass downloaded); read-only; `None` on anything `load`
+    /// refuses.
     #[must_use]
     pub fn labels(&self, source_id: &str) -> Option<Vec<String>> {
         Some(
@@ -268,34 +213,22 @@ impl IndexCache {
         )
     }
 
-    /// Read + parse the cache document, applying the same-source guard, the candidate
+    /// Read and parse the cache document, applying the same-source guard, the candidate
     /// count bound and the per-entry label ceiling.
     fn read_doc(&self, source_id: &str) -> Option<CacheDoc> {
         let text = crate::metadata_io::read_bounded_regular_utf8(&self.path, MAX_INDEX_CACHE_BYTES)
             .ok()?;
         let doc: CacheDoc = aterm_toml::from_str(&text).ok()?;
         if doc.schema != CACHE_SCHEMA {
-            // FAIL CLOSED on an unrecognized version. A version field that fails OPEN is
-            // the wrong direction for this document in particular: it has already needed
-            // one compatibility migration (the roster fields), and that migration was
-            // carried by `#[serde(default)]` at the FIELD level precisely so the schema
-            // number would not have to move. So a schema this build does not recognize is
-            // not an older cache to be read leniently — it is a document written by rules
-            // this build does not have, and the only safe reading of it is none. The cost
-            // of refusing is one re-fetch; the cost of accepting is honoring bytes under
-            // the wrong rules.
+            // Fail closed: an unknown schema was written by rules this build lacks, and
+            // refusing costs one re-fetch.
             return None;
         }
         if doc.source != source_id || doc.candidate.len() > MAX_CACHE_CANDIDATES {
-            return None; // SAME-SOURCE GUARD: a dir: cache never satisfies a github: fetch
+            return None; // the same-source guard
         }
-        // A READ-path bound, not merely the write-path one in `store`: the hostile
-        // document is by definition one we did NOT write, so a ceiling checked only on the
-        // way out is checked in the one place it cannot matter. Every other per-entry field
-        // is bounded in `decode`, which would leave `label` — the one string that survives
-        // decoding into the returned candidate — unbounded. Checked HERE rather than in
-        // `decode` so the refusal costs no base64 work. Fail-closed on the WHOLE document,
-        // as an oversize blob already does.
+        // Checked on read too, before any base64 work: a hostile document is one we did not
+        // write, and `label` is the one string decoding leaves unbounded.
         if doc
             .candidate
             .iter()
@@ -308,8 +241,7 @@ impl IndexCache {
 }
 
 /// Decode a vetted cache document into raw candidates, enforcing the per-blob byte
-/// ceilings. Any decode failure or oversize blob fails the WHOLE document (`None`) — a
-/// half-decoded candidate set is not a cache, it is a selection input nobody chose.
+/// ceilings. Any decode failure or oversize blob fails the whole document (`None`).
 fn decode(doc: CacheDoc) -> Option<Vec<Candidate>> {
     let mut out = Vec::with_capacity(doc.candidate.len());
     for c in doc.candidate {
@@ -369,11 +301,10 @@ mod tests {
         assert_eq!(back[0].label, "v1");
         assert_eq!(back[0].index_bytes, vec![1, 2, 3, 0xFF]);
         assert_eq!(back[0].sig, vec![9, 8, 7]);
-        // The roster rides WITH its index — an entry that lost it could only be paired
-        // with some other generation, which is exactly the substitution to prevent.
+        // The roster rides with its index.
         assert_eq!(back[0].roster_bytes, vec![0xDE, 0xAD, 0xBE, 0xEF]);
         assert_eq!(back[0].roster_sig, vec![4, 5, 6]);
-        // 0600 on disk — Unix-only mode check.
+        // 0600 on disk.
         #[cfg(unix)]
         {
             let mode = fs::metadata(&p).unwrap().permissions().mode();
@@ -395,9 +326,8 @@ mod tests {
         let _ = fs::remove_dir_all(p.parent().unwrap());
     }
 
-    /// A cache written BEFORE the single-root move (no roster fields) still decodes —
-    /// and decodes to EMPTY roster bytes, which no chain admits. Fail-closed, and
-    /// replaced by the next successful fetch rather than failing the whole read.
+    /// A cache entry with no roster fields still decodes, to empty roster bytes no chain
+    /// admits: fail-closed, and replaced by the next successful fetch.
     #[test]
     fn a_pre_roster_cache_entry_decodes_but_authorizes_nothing() {
         let (_scratch, p) = tmp("legacy");
@@ -415,8 +345,8 @@ mod tests {
             back[0].roster_bytes.is_empty() && back[0].roster_sig.is_empty(),
             "a pre-roster entry carries no authority at all"
         );
-        // And empty roster bytes cannot admit: `select_index` skips such a candidate
-        // (proved directly in `select::tests::a_candidate_with_no_roster_is_skipped`).
+        // `select_index` skips such a candidate
+        // (`select::tests::a_candidate_with_no_roster_is_skipped`).
         let _ = fs::remove_dir_all(p.parent().unwrap());
     }
 
@@ -435,7 +365,7 @@ mod tests {
         let (_scratch, p) = tmp("empty");
         let c = IndexCache::new(p.clone());
         c.store("github:o/r", &[cand("v1")]); // good cache
-        c.store("github:o/r", &[]); // an empty "success" must NOT clobber it
+        c.store("github:o/r", &[]); // an empty "success" must not clobber it
         assert_eq!(
             c.load("github:o/r").unwrap().len(),
             1,
@@ -477,14 +407,9 @@ mod tests {
         let _ = fs::remove_dir_all(p.parent().unwrap());
     }
 
-    /// THE LEAK: `store` writes `<prefix>/.index-cache.tmp-<pid>` and renames it over the
-    /// cache, and a rename that cannot land left that temp on disk — the failure was
-    /// ignored with a bare `let _`. Here the cache path is a DIRECTORY, so `rename` is
-    /// `EISDIR`; the same stranding is what an `ENOSPC`/`EDQUOT` mid-write reaches, since
-    /// `fs::write` creates the inode before it fills it. The name carries the PID, so
-    /// every failing process stranded a DISTINCT file at the PREFIX ROOT — which no sweep
-    /// walks (`gc` lists `store/` and `staging/`), so they accumulated for the life of the
-    /// prefix with `aterm pkg doctor` reporting nothing to reclaim.
+    /// A rename that cannot land (the cache path is a directory, `EISDIR`; an
+    /// `ENOSPC`/`EDQUOT` mid-write reaches the same) leaves no `.index-cache.tmp-<pid>` at
+    /// the prefix root, which no sweep walks.
     #[test]
     fn a_store_that_cannot_land_leaves_no_temp_behind() {
         let (_scratch, p) = tmp("tmp-leak");
@@ -509,12 +434,8 @@ mod tests {
         let _ = fs::remove_dir_all(&parent);
     }
 
-    /// Two-sided, BOTH paths: exactly at the ceiling is a working cache, one byte over is
-    /// refused by the writer and by `load` alike.
-    ///
-    /// The read side is the half that matters. `store` only ever sees labels this build
-    /// produced; the reader parses a document we did NOT write, and `label` is the one
-    /// field that survives decoding into the returned candidate.
+    /// Exactly at the label ceiling is a working cache; one byte over is refused by the
+    /// writer and by `load` alike.
     #[test]
     fn label_ceiling_is_enforced_on_both_paths() {
         let write_doc = |p: &PathBuf, label: &str| {
@@ -530,7 +451,7 @@ mod tests {
             .unwrap();
         };
 
-        // AT the ceiling: admissible through both readers, and the label survives intact.
+        // At the ceiling: admissible through both readers, and the label survives intact.
         let (_scratch, p) = tmp("label-at-ceiling");
         let at = "L".repeat(MAX_CACHED_LABEL_BYTES);
         write_doc(&p, &at);
@@ -541,7 +462,7 @@ mod tests {
         assert_eq!(got[0].label, at, "and reaches the caller unmodified");
         let _ = fs::remove_dir_all(p.parent().unwrap());
 
-        // ONE BYTE OVER: refused by both readers, whole document.
+        // One byte over: both readers refuse the whole document.
         let (_scratch, p2) = tmp("label-over-ceiling");
         write_doc(&p2, &"L".repeat(MAX_CACHED_LABEL_BYTES + 1));
         let c2 = IndexCache::new(p2.clone());
@@ -551,7 +472,7 @@ mod tests {
         );
         let _ = fs::remove_dir_all(p2.parent().unwrap());
 
-        // WRITE path: an oversize label is never written, and never clobbers a good cache.
+        // The writer: an oversize label is never written, and never clobbers a good cache.
         let (_scratch, p3) = tmp("label-write");
         fs::write(&p3, "sentinel").unwrap();
         IndexCache::new(p3.clone()).store("src", &[cand(&"L".repeat(MAX_CACHED_LABEL_BYTES + 1))]);
@@ -563,8 +484,7 @@ mod tests {
         let _ = fs::remove_dir_all(p3.parent().unwrap());
     }
 
-    /// An unrecognized schema is refused rather than read leniently — and the version this
-    /// build writes is, of course, still read.
+    /// An unrecognized schema is refused; the version this build writes still loads.
     #[test]
     fn unknown_schema_fails_closed() {
         let (_scratch, p) = tmp("schema");
@@ -604,11 +524,9 @@ mod tests {
         fs::metadata(p).unwrap().permissions().mode() & 0o777
     }
 
-    /// A layout whose prefix chain is root-owned — the SYSTEM shape — WITHOUT creating
-    /// anything: [`Layout::is_system_prefix`] reads the on-disk chain and skips a
-    /// component that does not exist yet, so a never-created path under a root-owned
-    /// `/opt` reads as the system shape for an unprivileged process too. `None` when this
-    /// machine offers no root-owned candidate, and then the caller skips.
+    /// A system-shaped layout, created nowhere: [`Layout::is_system_prefix`] skips a
+    /// component that does not exist yet, so a never-created path under root-owned `/opt`
+    /// reads as the system shape unprivileged too. `None` when no candidate is root-owned.
     #[cfg(unix)]
     fn system_shaped_layout(label: &str) -> Option<Layout> {
         ["/opt", "/usr/lib", "/var/lib", "/usr/local"]
@@ -620,26 +538,14 @@ mod tests {
             .find(|layout| !layout.prefix.exists() && layout.is_system_prefix())
     }
 
-    /// THE REGRESSION (7d968b2fe, re-entered through the cache writer): `store` hardened
-    /// its parent — which IS `layout.prefix` — to `0700` on every resolve, i.e. at the
-    /// start of every install and update pass. Under a root-owned SYSTEM prefix that is
-    /// the documented catastrophe: root writes such a prefix and EVERY user must traverse
-    /// and execute out of it, so [`Layout::ensure_dir`] publishes it `0755`; a `0700` one
-    /// installs a toolchain nobody but root can run, and no later step widens it back
-    /// (the `ensure_dir(&prefix)` calls run at lock time, on the pin verbs and as the flow
-    /// resolves, all BEFORE this write).
-    ///
-    /// Proving it unprivileged takes the two halves apart, because no non-root process
-    /// can create a directory under a root-owned chain: the LAYOUT is system-shaped (a
-    /// never-created path under root-owned `/opt`), while the file the cache writes lives
-    /// in a temp dir we can actually write. `ensure_dir` takes the mode from the PREFIX
-    /// shape, so the mode the parent comes out at is exactly the decision under test —
-    /// `0700` before this routing, `0755` after.
+    /// Under a root-owned system prefix the cache parent (`layout.prefix` itself) comes out
+    /// `0755`, not `0700`. The layout is system-shaped without being created and the cache
+    /// file lives in a writable temp dir, so the parent's mode is exactly what is tested.
     #[cfg(unix)]
     #[test]
     fn a_system_shaped_prefix_leaves_the_cache_parent_traversable() {
         let Some(layout) = system_shaped_layout("sys") else {
-            return; // no root-owned chain here; the $HOME half below still runs
+            return; // no root-owned chain here
         };
         let system_path = layout.prefix.clone();
         let (_scratch, p) = tmp("sys-parent");
@@ -667,10 +573,8 @@ mod tests {
         let _ = fs::remove_dir_all(&parent);
     }
 
-    /// The other half, and the guard against over-correcting: a `$HOME`-shaped prefix's
-    /// cache parent stays PRIVATE `0700`. The store is that user's own state there, and
-    /// `is_system_prefix` asks the FILESYSTEM — a user-owned temp prefix is never the
-    /// system shape, so nothing here may widen it.
+    /// A `$HOME`-shaped prefix's cache parent stays private `0700`: `is_system_prefix` asks
+    /// the filesystem, and a user-owned temp prefix is never the system shape.
     #[cfg(unix)]
     #[test]
     fn a_home_shaped_prefix_keeps_the_cache_parent_private() {

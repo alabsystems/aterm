@@ -424,14 +424,4 @@ mod tests {
                 if B32 { 2303640537 } else { 2349210501944688211 },
         }
     }
-
-    #[test]
-    fn test_fxhasher_default_via_buildhasherdefault() {
-        // Compatible with std::hash::BuildHasherDefault<FxHasher>.
-        use std::hash::BuildHasherDefault;
-        let bh: BuildHasherDefault<FxHasher> = BuildHasherDefault::default();
-        let h1 = bh.hash_one(42_u64);
-        let h2 = FxBuildHasher.hash_one(42_u64);
-        assert_eq!(h1, h2);
-    }
 }

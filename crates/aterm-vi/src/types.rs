@@ -115,43 +115,6 @@ pub enum ViMotion {
     GotoMarkLine(char),
 }
 
-impl ViMotion {
-    /// Returns the primary direction of this motion.
-    #[must_use]
-    #[cfg(test)]
-    pub fn direction(self) -> ViDirection {
-        match self {
-            Self::Up
-            | Self::Left
-            | Self::First
-            | Self::High
-            | Self::SemanticLeft
-            | Self::SemanticLeftEnd
-            | Self::WordLeft
-            | Self::WordLeftEnd
-            | Self::ParagraphUp
-            | Self::SearchPrevious => ViDirection::Left,
-
-            Self::Down
-            | Self::Right
-            | Self::Last
-            | Self::FirstOccupied
-            | Self::Middle
-            | Self::Low
-            | Self::SemanticRight
-            | Self::SemanticRightEnd
-            | Self::WordRight
-            | Self::WordRightEnd
-            | Self::Bracket
-            | Self::ParagraphDown
-            | Self::SearchNext => ViDirection::Right,
-
-            // Mark motions don't have a fixed direction; default Right.
-            Self::GotoMark(_) | Self::GotoMarkLine(_) => ViDirection::Right,
-        }
-    }
-}
-
 impl From<ViMotion> for BufferCommand {
     fn from(motion: ViMotion) -> Self {
         match motion {
@@ -310,12 +273,6 @@ impl ViMarks {
     #[cfg(test)]
     pub fn remove(&mut self, mark: char) -> Option<ViPoint> {
         self.marks.remove(&mark)
-    }
-
-    /// Clear all marks.
-    #[cfg(test)]
-    pub fn clear(&mut self) {
-        self.marks.clear();
     }
 
     /// Check if a mark is set.

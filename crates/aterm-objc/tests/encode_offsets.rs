@@ -1,30 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `strip_method_offsets` AGAINST THE WHOLE LIVE RUNTIME.
+//! `strip_method_offsets` against every instance-method row in the live runtime.
 //!
-//! # Why the subject is the runtime and not a table
-//!
-//! [`aterm_objc::strip_method_offsets`] is the normaliser every
-//! encoding-shaped instrument in this repository runs its inputs through: the
-//! winit seam census, `objc_live_class_audit`'s A and B parts, `toolbar_drive`,
-//! and `SwizzleSite::install`'s refusal. If it LAUNDERS a difference, every one
-//! of those instruments agrees about two encodings that are not the same type.
-//!
-//! A rule written as a list of exceptions ("strip every digit except array
-//! counts") misses spellings nobody thought of. Two real AppKit rows:
-//!
-//! ```text
-//! -[NSPrinter _getNodeForKey:inTable:]   ^{?=b4b1b24(?=*^{?}^{__CFDictionary})}32@0:8@16@24
-//!                              stripped  ^{?=bbb(?=*^{?}^{__CFDictionary})}@:@@
-//! -[NSCollectionViewLayoutAttributes setTransform3D:]  v144@0:8{CATransform3D=dddddddddddddddd}16
-//!                                           stripped  v@:{CATransformD=dddddddddddddddd}
-//! ```
-//!
-//! Bitfield widths and digits inside type names are not offsets. So this file
-//! tests **every instance-method row in the process** against a property
-//! computed from the input: *stripping may delete offsets and nothing else.*
-//! The corpus is the runtime's, so it grows when Apple's does.
+//! [`aterm_objc::strip_method_offsets`] is the normaliser every encoding check here runs its
+//! inputs through (the winit seam census, `objc_live_class_audit`, `toolbar_drive`,
+//! `SwizzleSite::install`'s refusal); if it erased a difference, each would accept two encodings
+//! that are different types. Bitfield widths, digits in type names, array counts and quoted class
+//! names are not offsets, and a rule written as a list of exceptions misses spellings, so the
+//! property is computed from the input: stripping may delete offsets and nothing else. The corpus
+//! is the runtime's, so it grows when Apple's does.
 
 #![cfg(target_os = "macos")]
 
@@ -32,9 +17,8 @@ use std::ffi::{CStr, c_char, c_void};
 
 use aterm_objc::{ClassPtr, strip_method_offsets};
 
-// AppKit, so the corpus is the one the auditors actually run against. A system
-// framework is not a dependency in the sense this crate's zero-dependency rule
-// is about, and nothing is added to `Cargo.toml`.
+// AppKit, so the corpus is the one the auditors run against (a system framework, not a crate
+// dependency).
 //
 // SAFETY: the block declares no symbol; its only job is the link line.
 #[link(name = "AppKit", kind = "framework")]
@@ -47,14 +31,9 @@ unsafe extern "C" {
     fn free(ptr: *mut c_void);
 }
 
-/// Everything in an encoding that is NOT an offset, in the order it appears.
-///
-/// A DIFFERENT reading of the string from the one the function under test
-/// performs: it collects the tokens whose identity matters — struct, union and
-/// template TAGS, BITFIELD widths, ARRAY counts, and quoted CLASS names — and
-/// says nothing about digits in offset position. Two strings with the same
-/// token list may still differ in their offsets, which is the whole point;
-/// two strings with DIFFERENT token lists are different types.
+/// Everything in an encoding that is not an offset, in order: struct, union and template tags,
+/// bitfield widths, array counts and quoted class names. A reading independent of the function
+/// under test: equal token lists may still differ in offsets; different lists are different types.
 fn significant_tokens(enc: &str) -> Vec<String> {
     let b: Vec<char> = enc.chars().collect();
     let mut out = Vec::new();
@@ -84,7 +63,7 @@ fn significant_tokens(enc: &str) -> Vec<String> {
         }
         match c {
             '{' | '(' => {
-                // The TAG runs to the `=` (or to the close, for `{CGRect}`).
+                // The tag runs to the `=` (or to the close, for `{CGRect}`).
                 depth += 1;
                 let start = i + 1;
                 let mut j = start;
@@ -174,14 +153,8 @@ fn every_registered_encoding() -> Vec<(String, String)> {
     out
 }
 
-/// STRIPPING MAY DELETE OFFSETS AND NOTHING ELSE — over every row in the
-/// process.
-///
-/// The corpus assertions below are not decoration. A survey that reads nothing
-/// passes vacuously, and this campaign has already been caught by one: the
-/// floor names the two kinds of non-offset digit that were being destroyed, so
-/// a future runtime that stopped having them would fail LOUDLY rather than
-/// quietly stop testing the thing.
+/// Stripping deletes offsets and nothing else, over every row in the process. The corpus floors
+/// keep the survey from passing vacuously: a runtime with no row of a kind fails loudly.
 #[test]
 fn stripping_deletes_offsets_and_nothing_else_over_every_row_in_the_process() {
     let rows = every_registered_encoding();
@@ -254,10 +227,7 @@ fn stripping_deletes_offsets_and_nothing_else_over_every_row_in_the_process() {
     );
 }
 
-/// The three kinds, written out, so a reader can see what the property above
-/// is asserting without running a 20,000-row survey.
-///
-/// These are REAL rows, copied from the survey's own output, not invented.
+/// The kinds of non-offset digit, on real rows copied from the survey.
 #[test]
 fn the_three_kinds_of_non_offset_digit_survive_by_name() {
     // A bitfield triple — `-[NSPrinter _getNodeForKey:inTable:]`.
@@ -270,20 +240,19 @@ fn the_three_kinds_of_non_offset_digit_survive_by_name() {
         strip_method_offsets("v144@0:8{CATransform3D=dddddddddddddddd}16"),
         "v@:{CATransform3D=dddddddddddddddd}"
     );
-    // A digit in a TEMPLATE tag, which is the same kind one spelling out —
+    // A digit in a template tag:
     // `-[MTLCompiler getFunctionId:airScript:vendorPluginFunctionId:]`.
     assert_eq!(
         strip_method_offsets("{MTLHashMask<4>=QQC}24@0:8@16"),
         "{MTLHashMask<4>=QQC}@:@"
     );
-    // And the one the original rule already kept — `-[NSView getRectsExposedDuringLiveResize:count:]`.
+    // An array count — `-[NSView getRectsExposedDuringLiveResize:count:]`.
     assert_eq!(
         strip_method_offsets("v32@0:8[4{CGRect={CGPoint=dd}{CGSize=dd}}]16^q24"),
         "v@:[4{CGRect={CGPoint=dd}{CGSize=dd}}]^q"
     );
 
-    // THE POINT, stated as a comparison rather than as a string: two bitfield
-    // layouts that are not the same type must not normalise to the same string.
+    // Two layouts that are different types never normalise to the same string.
     assert_ne!(
         strip_method_offsets("v24@0:8{?=b4b1b24}16"),
         strip_method_offsets("v24@0:8{?=b1b1b1}16"),

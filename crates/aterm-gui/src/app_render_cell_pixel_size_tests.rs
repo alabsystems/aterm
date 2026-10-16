@@ -34,8 +34,7 @@ fn a_never_resized_window_reports_its_real_cell_box_to_every_session() {
     let wid = WindowId(0);
     let cell = window_with_a_big_cell(&mut app, wid);
 
-    // A second tab, also never resized (a stub engine, born at the placeholder
-    // exactly like a real newborn would be without `spawn_session`'s seed).
+    // A second tab, also never resized: a stub engine born at the placeholder.
     let second = app.next_session_id;
     app.push_stub_tab(wid, crate::stub_session(second));
 
@@ -99,8 +98,8 @@ fn osc_1337_pixel_sizing_on_a_fresh_tab_uses_the_real_cell_box() {
 
     let (want_cols, want_rows) = (4u16, 3u16);
     let (px_w, px_h) = (u32::from(cw) * 4, u32::from(ch) * 3);
-    // The payload is never decoded for a PIXEL-sized request (only Auto sizing
-    // reads the PNG header), so any non-empty body exercises the same math.
+    // A pixel-sized request never decodes the payload (only Auto sizing reads the PNG
+    // header), so any non-empty body exercises the same math.
     let b64 = aterm_codec::base64::encode(b"cell-px-1").expect("base64");
     let mut seq = format!("\x1b]1337;File=inline=1;width={px_w}px;height={px_h}px:").into_bytes();
     seq.extend_from_slice(b64.as_bytes());
@@ -145,9 +144,8 @@ fn a_newborn_live_engine_carries_the_owning_windows_cell_box() {
     assert_eq!(build(Some((0, 0))).cell_pixel_size(), (1, 1));
 }
 
-/// The boot session is spawned before the backend build is joined, so it
-/// cannot be seeded at construction; the join corrects it with no frame or
-/// resize in between.
+/// The boot session is spawned before the backend build is joined, so it cannot be seeded at
+/// construction; the join corrects it with no frame or resize in between.
 #[test]
 fn the_backend_join_corrects_the_boot_sessions_placeholder() {
     let mut app = App::headless_for_test();
@@ -171,8 +169,7 @@ fn the_backend_join_corrects_the_boot_sessions_placeholder() {
     });
     app.backend = crate::BackendSlot::Pending(Some(handle));
 
-    // A `Pending` slot has no metrics to give, so nothing may be pushed yet —
-    // and asking it for any would be a deliberate panic.
+    // A `Pending` slot has no metrics to give (asking it for any panics), so nothing is pushed.
     assert_eq!(app.spawn_cell_px(wid), None);
 
     app.finalize_backend();
@@ -191,9 +188,8 @@ fn the_backend_join_corrects_the_boot_sessions_placeholder() {
     );
 }
 
-/// The backend join also writes the cell box into the boot PTY's winsize
-/// pixel fields, so `TIOCGWINSZ` reports non-zero `ws_xpixel`/`ws_ypixel`.
-/// Driven on a real pty; the seed assertion proves the 0x0 state exists first.
+/// The backend join also writes the cell box into the boot PTY's winsize, so `TIOCGWINSZ`
+/// reports non-zero `ws_xpixel`/`ws_ypixel`. Driven on a real pty, first asserting the 0x0 seed.
 #[cfg(unix)]
 #[test]
 fn the_backend_join_teaches_the_boot_ptys_winsize_its_cell_box() {
@@ -259,11 +255,10 @@ fn the_backend_join_teaches_the_boot_ptys_winsize_its_cell_box() {
     }
 }
 
-/// The backend join does not end an adoption pulse hold early. A booted
-/// successor pulses each repaint-adopted PTY to `rows-1` and holds it so a
-/// size-comparing program (Node) sees the change; while `adopt_pulse_hold`
-/// stands the join leaves the PTY alone, and the pulse's second half writes
-/// the grid with the join's cell box. Driven on a real pty.
+/// The backend join does not end an adoption pulse hold early: a successor holds each
+/// repaint-adopted PTY at `rows-1` so a size-comparing program (Node) sees the change, the
+/// join leaves the PTY alone while `adopt_pulse_hold` stands, and the pulse's second half
+/// writes the grid with the join's cell box. On a real pty.
 #[cfg(unix)]
 #[test]
 fn the_backend_join_does_not_end_an_adoption_pulse_hold_early() {
@@ -369,13 +364,10 @@ fn the_backend_join_does_not_end_an_adoption_pulse_hold_early() {
     }
 }
 
-/// WIRING FENCE. `spawn_session`'s `cell_px` is positional, so the compiler
-/// already forces every call site to pass SOMETHING — but `None` type-checks
-/// too, and `None` is precisely the value that keeps the 8x16 placeholder.
-/// EXACTLY ONE call site may pass it: the BOOT session, spawned before the
-/// backend build is joined. Every other spawn must hand over the owning
-/// window's real cell box. Checked by reading the sources, because a headless
-/// harness cannot fork the real PTY these sites need.
+/// `spawn_session`'s `cell_px` accepts `None`, which keeps the 8x16 placeholder. Only the boot
+/// session (spawned before the backend build is joined) may pass it; every other spawn hands
+/// over its window's real cell box. Read from the sources: a headless harness cannot fork the
+/// PTYs these sites need.
 #[test]
 fn every_non_boot_spawn_site_hands_over_a_real_cell_box() {
     let sources = [
@@ -383,8 +375,10 @@ fn every_non_boot_spawn_site_hands_over_a_real_cell_box() {
         ("app_window.rs", include_str!("app_window.rs")),
         ("app_restore.rs", include_str!("app_restore.rs")),
         ("lib.rs", include_str!("lib.rs")),
+        // Every tab and split spawns here, on the spawner thread.
+        ("tab_spawn.rs", include_str!("tab_spawn.rs")),
     ];
-    // The ONE justification a bare `None` may carry, written AT the call.
+    // The one justification a bare `None` may carry, written at the call.
     const BOOT_MARKER: &str = "CELL-PX-1: the BOOT session has no metrics to be seeded from";
     let mut wired = Vec::new();
     let mut exempt = Vec::new();
@@ -398,8 +392,7 @@ fn every_non_boot_spawn_site_hands_over_a_real_cell_box() {
             // The argument list: `id, window, rows, cols, <cell_px>, ...`.
             let args = lines[n..(n + 14).min(lines.len())].join("\n");
             let site = format!("{file}:{}", n + 1);
-            // `cell_px` covers both wired spellings — a hoisted `let cell_px`
-            // and an inline `self.spawn_cell_px(wid)`.
+            // Both wired spellings: a hoisted `let cell_px` and `self.spawn_cell_px(wid)`.
             if args.contains("cell_px") {
                 wired.push(site);
             } else if args.contains(BOOT_MARKER) {
@@ -419,7 +412,7 @@ fn every_non_boot_spawn_site_hands_over_a_real_cell_box() {
         "every tab / split / window / restore spawn must pass the owning \
          window's cell box; only these do: {wired:?}"
     );
-    // EXACTLY ONE bare `None`, and it is the boot spawn in `main_entry`.
+    // Exactly one bare `None`: the boot spawn in `main_entry`.
     assert_eq!(
         exempt.len(),
         1,
@@ -433,10 +426,9 @@ fn every_non_boot_spawn_site_hands_over_a_real_cell_box() {
     );
 }
 
-/// The per-window memo is a LOCK-AVOIDANCE device, never a correctness gate: a
-/// changed cell box must always reach the engines. Pins the memo's key as the
-/// RESOLVED cell size (so a face swap at an unchanged `font_px` still pushes)
-/// and proves the second, unchanged call is the no-op the raster seam needs.
+/// The per-window memo avoids locks and never gates correctness: it keys on the resolved
+/// cell size (so a face swap at an unchanged `font_px` still pushes), and an unchanged second
+/// call is a no-op.
 #[test]
 fn the_cell_box_memo_re_pushes_whenever_the_resolved_size_moves() {
     let mut app = App::headless_for_test();
@@ -495,8 +487,8 @@ fn a_font_change_reaches_an_unpainted_windows_engines_at_the_change() {
         "the seed must have reached the engine, or this test proves nothing"
     );
 
-    // The font change itself — the pinned-px shape a zoom / config reload
-    // takes — applied through the metrics seam only.
+    // The font change (the pinned-px shape a zoom or config reload takes), through the
+    // metrics seam only.
     app.font_px = 24.0;
     app.font_px_explicit = true;
     app.refresh_all_window_metrics();

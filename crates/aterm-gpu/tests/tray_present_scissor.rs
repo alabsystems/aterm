@@ -2,21 +2,11 @@
 // Copyright 2026 Andrew Yates
 //
 // A resident tray card (settings panel, transient card, build badge) must not
-// disable the scissored present, and must still look identical.
-//
-// The card composites over the throwaway `present_offscreen` copy (as the
-// comet halo does), so the persistent offscreen stays a clean scissor base.
-// This drives the real present seam: `present_virtual` runs the same
-// `present_to_view` body as the swapchain arm, and the video tap harvests the
-// presented bytes.
-//
-// Properties:
-//   1. a scissored present under a resident card equals the same frame as a
-//      fresh full repaint, and the scissor actually fires;
-//   2. dropping the card leaves no stale card pixels, though the drop frame
-//      repaints nothing;
-//   3. the card sits above the comet halo, with a negative control proving
-//      the halo reaches those pixels.
+// disable the scissored present, and must still look identical. The card
+// composites over the throwaway `present_offscreen` copy (as the comet halo
+// does), so the persistent offscreen stays a clean scissor base. The tests drive
+// `present_virtual` (the same `present_to_view` body as the swapchain arm) and
+// harvest the presented bytes through the video tap.
 //
 // No GPU / no system font: no-op.
 
@@ -27,8 +17,8 @@ use aterm_render::{GlowQuad, RenderInput, Theme, premul_rgb};
 
 use crate::common;
 
-fn gpu_or_skip() -> Option<GpuRenderer> {
-    common::gpu_or_skip(18.0, Theme::default())
+fn gpu() -> GpuRenderer {
+    common::gpu(18.0, Theme::default())
 }
 
 fn opts() -> CaptureOpts {
@@ -72,14 +62,14 @@ fn harvest(
 }
 
 /// A small grid with the cursor hidden (so no blink phase can perturb an A/B),
-/// plus a second frame differing from it in ONE row.
+/// plus a second frame differing from it in one row.
 fn two_frames(rows: usize, cols: usize) -> (RenderInput, RenderInput) {
     let mut term = Terminal::new(rows as u16, cols as u16);
     term.process(b"\x1b[?25l");
     term.process(b"alpha\r\nbravo\r\ncharlie\r\ndelta");
     let a = term.cell_frame(rows, cols);
-    // One row changes; everything else is byte-identical, so the second present
-    // of `a` then `b` has a small dirty set and MUST take the scissored path.
+    // One row changes and everything else is byte-identical, so presenting `a`
+    // then `b` gives a small dirty set that must take the scissored path.
     term.process(b"\x1b[3;1Hbravissimo");
     let b = term.cell_frame(rows, cols);
     (a, b)
@@ -92,7 +82,7 @@ fn card(pw: u32, ph: u32, rgba: [u8; 4]) -> Vec<u8> {
 
 #[test]
 fn tray_present_scissors_and_stays_byte_identical_to_a_full_repaint() {
-    let Some(mut gpu) = gpu_or_skip() else { return };
+    let mut gpu = gpu();
     let (rows, cols) = (6usize, 20usize);
     let (a, b) = two_frames(rows, cols);
     let (cw, ch) = gpu.cell_size();
@@ -108,8 +98,8 @@ fn tray_present_scissors_and_stays_byte_identical_to_a_full_repaint() {
     let (fw, fh) = gpu.frame_size(rows, cols);
     let (fw, fh) = (fw as u32, fh as u32);
 
-    // ARM A: two presents on ONE window with the card resident throughout. The
-    // second one has a prior frame to diff against, so it is the frame under test.
+    // Arm A: two presents on one window with the card resident throughout; the
+    // second has a prior frame to diff against, so it is the frame under test.
     let scissors_before = gpu.scissor_taken();
     let fulls_before = gpu.full_repaints();
     let seq = [(&a, Some(quad)), (&b, Some(quad))];
@@ -125,8 +115,8 @@ fn tray_present_scissors_and_stays_byte_identical_to_a_full_repaint() {
         "a resident tray card must not disable the scissored repaint"
     );
 
-    // ARM B: the SAME frame presented into a fresh window — a full repaint by
-    // construction (no prior frame). The scissored frame must be byte-identical.
+    // Arm B: the same frame presented into a fresh window, a full repaint by
+    // construction. The scissored frame must be byte-identical.
     let full = harvest(&mut gpu, fw, fh, &[(&b, Some(quad))]);
     assert!(
         incremental.frames[1].rgba == full.frames[0].rgba,
@@ -142,7 +132,7 @@ fn tray_present_scissors_and_stays_byte_identical_to_a_full_repaint() {
 
 #[test]
 fn dropping_the_tray_leaves_no_stale_card_pixels() {
-    let Some(mut gpu) = gpu_or_skip() else { return };
+    let mut gpu = gpu();
     let (rows, cols) = (6usize, 20usize);
     let (a, _b) = two_frames(rows, cols);
     let (cw, ch) = gpu.cell_size();
@@ -158,8 +148,8 @@ fn dropping_the_tray_leaves_no_stale_card_pixels() {
     let (fw, fh) = gpu.frame_size(rows, cols);
     let (fw, fh) = (fw as u32, fh as u32);
 
-    // Card up, then card gone — with the SAME input, so any difference between
-    // the drop frame and a never-carded present is a stranded card pixel.
+    // Card up, then card gone, with the same input: any difference between the
+    // drop frame and a never-carded present is a stranded card pixel.
     let dropped = harvest(&mut gpu, fw, fh, &[(&a, Some(quad)), (&a, None)]);
     let never = harvest(&mut gpu, fw, fh, &[(&a, None)]);
     assert!(
@@ -180,7 +170,7 @@ fn dropping_the_tray_leaves_no_stale_card_pixels() {
 
 #[test]
 fn an_opaque_tray_still_covers_the_comet_halo() {
-    let Some(mut gpu) = gpu_or_skip() else { return };
+    let mut gpu = gpu();
     let (rows, cols) = (6usize, 20usize);
     let (plain, _) = two_frames(rows, cols);
     let (cw, ch) = gpu.cell_size();
@@ -195,7 +185,7 @@ fn an_opaque_tray_still_covers_the_comet_halo() {
             w: cw as u16,
             h: ch as u16,
             color: premul_rgb(0x00FF_6A00, 220),
-            // ADDITIVE light (see `GlowQuad::alpha`).
+            // Additive light (see `GlowQuad::alpha`).
             alpha: 0,
             color2: premul_rgb(0x00FF_6A00, 220),
             alpha2: 0,

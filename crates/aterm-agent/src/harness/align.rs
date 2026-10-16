@@ -11,14 +11,13 @@
 //! in `aterm-spec` (`align_tests.rs`).
 
 use aterm_uds::spawnfd::{Child, Command, Stdio};
-use std::io::{Read, Write};
-use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::io::Read;
 #[cfg(unix)]
-use std::{
-    os::fd::AsRawFd,
-    sync::{Arc, atomic::AtomicBool, atomic::Ordering},
-};
+use std::os::fd::AsRawFd;
+use std::sync::mpsc;
+#[cfg(all(test, unix))]
+use std::sync::{Arc, atomic::AtomicBool, atomic::Ordering};
+use std::time::{Duration, Instant};
 
 /// On non-Unix hosts the reader still uses a blocking pipe. Do not join it
 /// indefinitely if a descendant kept the write end open after the child died.
@@ -27,20 +26,15 @@ const READER_CLOSE_GRACE: Duration = Duration::from_millis(500);
 /// The process may close stdout before it exits. Check its exit without
 /// spinning, and never wait beyond the caller's absolute deadline.
 const REAP_CHECK: Duration = Duration::from_millis(20);
-/// An outgoing pipe with no reader parks in `poll`, but should notice that the
-/// child has already exited without charging the next footer a full deadline.
-#[cfg(unix)]
-const WRITER_CANCEL_CHECK: Duration = Duration::from_millis(50);
 
 /// Per-invocation witness for the Tier-1 lifecycle bind. It records the real
-/// worker exits and child reap, rather than inferring them from a successful
+/// worker exit and child reap, rather than inferring them from a successful
 /// return. Compiled only into Unix tests; production carries a zero-sized marker.
 #[cfg(all(test, unix))]
 #[derive(Default)]
 struct CaptureLifecycleObservation {
     child_reaped: AtomicBool,
     reader_done: AtomicBool,
-    writer_done: AtomicBool,
     /// Run once the child is spawned and before the deadline is taken: what a
     /// test's child must have done by then (an escape test's holder, gone to
     /// a session of its own) happens before the deadline whatever the load.
@@ -86,12 +80,12 @@ impl Captured {
 /// mount or a looping command.
 ///
 /// The environment is cleared and rebuilt from `PATH`, `HOME`, `TMPDIR` plus
-/// what the caller set on `cmd`. One thread reads stdout while this one blocks
-/// in `recv_timeout`, then checks `try_wait` until the same absolute deadline;
-/// `stdin` is written on its own thread. On Unix both pipe workers poll
-/// nonblocking descriptors against the deadline, so a descendant that escapes
-/// the process group with an inherited pipe leaves no thread behind. The child
-/// gets a private process group, killed together at timeout.
+/// what the caller set on `cmd`, and stdin is null. One thread reads stdout
+/// while this one blocks in `recv_timeout`, then checks `try_wait` until the
+/// same absolute deadline. On Unix the reader polls a nonblocking descriptor
+/// against the deadline, so a descendant that escapes the process group with
+/// the inherited pipe leaves no thread behind. The child gets a private
+/// process group, killed together at timeout.
 ///
 /// # Errors
 ///
@@ -100,16 +94,14 @@ impl Captured {
 pub fn capture_bounded(
     cmd: Command,
     budget: Duration,
-    stdin: Option<Vec<u8>>,
     max_stdout: usize,
 ) -> Result<Captured, String> {
-    capture_bounded_impl(cmd, budget, stdin, max_stdout, CaptureObserver::default())
+    capture_bounded_impl(cmd, budget, max_stdout, CaptureObserver::default())
 }
 
 fn capture_bounded_impl(
     mut cmd: Command,
     budget: Duration,
-    stdin: Option<Vec<u8>>,
     max_stdout: usize,
     observer: CaptureObserver,
 ) -> Result<Captured, String> {
@@ -120,11 +112,7 @@ fn capture_bounded_impl(
         }
     }
     cmd.env_clear()
-        .stdin(if stdin.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     for pass in ["PATH", "HOME", "TMPDIR"] {
@@ -150,10 +138,8 @@ fn capture_bounded_impl(
         }
     }
     let deadline = Instant::now() + budget;
-    let mut writer = CaptureWriter::new(stdin.zip(child.stdin.take()), deadline, observer.clone());
     let Some(stdout) = child.stdout.take() else {
         kill_capture_child(&mut child, &observer);
-        writer.finish();
         return Err(String::from("its stdout could not be captured"));
     };
     let (tx, rx) = mpsc::channel();
@@ -183,7 +169,6 @@ fn capture_bounded_impl(
         Ok(Err(error)) => {
             let _ = reader.join();
             kill_capture_child(&mut child, &observer);
-            writer.finish();
             if error.kind() == std::io::ErrorKind::TimedOut {
                 return Err(format!(
                     "it ran past its {} ms deadline",
@@ -205,7 +190,6 @@ fn capture_bounded_impl(
                     let _ = reader.join();
                 }
             }
-            writer.finish();
             return Err(format!(
                 "it ran past its {} ms deadline",
                 budget.as_millis()
@@ -221,94 +205,22 @@ fn capture_bounded_impl(
             Ok(None) => {}
             Err(error) => {
                 kill_capture_child(&mut child, &observer);
-                writer.finish();
                 return Err(format!("it could not be reaped: {error}"));
             }
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             kill_capture_child(&mut child, &observer);
-            writer.finish();
             return Err(String::from(
                 "it closed its output and did not exit before its deadline",
             ));
         }
         std::thread::sleep(REAP_CHECK.min(remaining));
     };
-    writer.finish();
     Ok(Captured {
         stdout: bytes,
         code: status.code(),
     })
-}
-
-/// Own the child's stdin until it has seen EOF, or until the common deadline
-/// or completion of the child cancels the write. The caller joins the Unix
-/// worker before returning, including when a detached descendant retained
-/// the read end. Other platforms retain the previous fail-soft detached path.
-struct CaptureWriter {
-    thread: Option<std::thread::JoinHandle<()>>,
-    #[cfg(unix)]
-    stop: Arc<AtomicBool>,
-}
-
-impl CaptureWriter {
-    fn new(
-        stdin: Option<(Vec<u8>, std::process::ChildStdin)>,
-        deadline: Instant,
-        observer: CaptureObserver,
-    ) -> Self {
-        #[cfg(unix)]
-        let stop = Arc::new(AtomicBool::new(false));
-        #[cfg(not(unix))]
-        let _ = deadline;
-        #[cfg(all(test, unix))]
-        if stdin.is_none()
-            && let Some(observer) = &observer
-        {
-            observer.writer_done.store(true, Ordering::Release);
-        }
-        #[cfg(not(all(test, unix)))]
-        let _ = observer;
-        let thread = stdin.map(|(bytes, mut pipe)| {
-            #[cfg(unix)]
-            let worker_stop = Arc::clone(&stop);
-            #[cfg(all(test, unix))]
-            let writer_observer = observer.clone();
-            std::thread::spawn(move || {
-                // The moved handle closes here, so a reader that consumes all
-                // input observes EOF without a second pipe or relay thread.
-                #[cfg(unix)]
-                let _ = write_capture_pipe(&mut pipe, &bytes, deadline, &worker_stop);
-                #[cfg(not(unix))]
-                let _ = pipe.write_all(&bytes);
-                #[cfg(all(test, unix))]
-                if let Some(observer) = writer_observer {
-                    observer.writer_done.store(true, Ordering::Release);
-                }
-            })
-        });
-        Self {
-            thread,
-            #[cfg(unix)]
-            stop,
-        }
-    }
-
-    fn finish(&mut self) {
-        #[cfg(unix)]
-        {
-            self.stop.store(true, Ordering::Relaxed);
-            if let Some(thread) = self.thread.take() {
-                let _ = thread.join();
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            // The non-Unix writer may still be in a blocking `write_all`.
-            let _ = self.thread.take();
-        }
-    }
 }
 
 #[cfg(unix)]
@@ -331,31 +243,17 @@ fn capture_pipe_deadline() -> std::io::Error {
 }
 
 #[cfg(unix)]
-fn capture_pipe_ready(
-    fd: std::os::fd::RawFd,
-    event: libc::c_short,
-    deadline: Instant,
-    stop: Option<&AtomicBool>,
-) -> std::io::Result<()> {
+fn capture_pipe_ready(fd: std::os::fd::RawFd, deadline: Instant) -> std::io::Result<()> {
     loop {
-        if stop.is_some_and(|stop| stop.load(Ordering::Relaxed)) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
-                "capture pipe cancelled",
-            ));
-        }
-        let mut remaining = deadline.saturating_duration_since(Instant::now());
+        let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(capture_pipe_deadline());
-        }
-        if stop.is_some() {
-            remaining = remaining.min(WRITER_CANCEL_CHECK);
         }
         // A positive sub-millisecond wait still needs one kernel sleep.
         let millis = remaining.as_millis().max(1).min(i32::MAX as u128) as i32;
         let mut ready = libc::pollfd {
             fd,
-            events: event,
+            events: libc::POLLIN,
             revents: 0,
         };
         // SAFETY: `ready` is a live stack pollfd; its fd belongs to this
@@ -394,50 +292,13 @@ fn read_capture_pipe(
             Ok(0) => return Ok(bytes),
             Ok(n) => bytes.extend_from_slice(&chunk[..n]),
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                capture_pipe_ready(pipe.as_raw_fd(), libc::POLLIN, deadline, None)?;
+                capture_pipe_ready(pipe.as_raw_fd(), deadline)?;
             }
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
             Err(error) => return Err(error),
         }
     }
     Ok(bytes)
-}
-
-#[cfg(unix)]
-fn write_capture_pipe(
-    pipe: &mut std::process::ChildStdin,
-    bytes: &[u8],
-    deadline: Instant,
-    stop: &AtomicBool,
-) -> std::io::Result<()> {
-    if bytes.is_empty() {
-        return Ok(());
-    }
-    capture_pipe_nonblocking(pipe.as_raw_fd())?;
-    let mut written = 0;
-    while written < bytes.len() {
-        if stop.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err(capture_pipe_deadline());
-        }
-        match pipe.write(&bytes[written..]) {
-            Ok(0) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::WriteZero,
-                    "capture stdin accepted no bytes",
-                ));
-            }
-            Ok(n) => written += n,
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                capture_pipe_ready(pipe.as_raw_fd(), libc::POLLOUT, deadline, Some(stop))?;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(())
 }
 
 /// Stop the child and descendants that inherited its stdout, then reap the

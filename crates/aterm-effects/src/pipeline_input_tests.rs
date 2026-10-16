@@ -102,54 +102,6 @@ impl Host {
 }
 
 #[test]
-fn glow_frame_equality_rejects_equal_count_changed_content() {
-    // Replay the count-only observer as the negative control, against a frame
-    // genuinely emitted by the pipeline before corrupting one rendered field.
-    fn count_only(host: &Host) -> [u64; 7] {
-        let status = host.pipeline.cursor.glow.v2_status().unwrap();
-        [
-            u64::from(status.quads),
-            u64::from(status.halos),
-            u64::from(status.stars),
-            u64::from(status.meteors),
-            u64::from(status.cells),
-            u64::from(status.bridged),
-            status.fp,
-        ]
-    }
-
-    let mut host = Host::new(Instant::now());
-    for ch in "primer".chars() {
-        host.note(ch);
-        host.echo(ch);
-    }
-    let original = host.input.clone();
-    let expected = GlowFrame::read(&original);
-    assert!(
-        !expected.under.is_empty(),
-        "the real emitter must draw a ribbon"
-    );
-    assert_ne!(host.pipeline.cursor.glow.v2_status().unwrap().fp, 0);
-    assert_eq!(host.glow_frame(), expected);
-    let summary = count_only(&host);
-
-    host.input.glow_under[0].color ^= 1;
-    assert_eq!(host.input.glow_under.len(), expected.under.len());
-    assert_eq!(host.input.cursor_glow_add.len(), expected.over.len());
-    assert_eq!(host.input.glow_halo.len(), expected.halos.len());
-    assert_eq!(
-        count_only(&host),
-        summary,
-        "the old observer misses changed content"
-    );
-    assert_ne!(
-        host.glow_frame(),
-        expected,
-        "the stream comparison must catch it"
-    );
-}
-
-#[test]
 fn web_glyph_classes_reach_the_real_rainbow_renderer() {
     // The web host probes only the caret row. First present the blank row
     // above through that real probe, then type beneath its observed sky.

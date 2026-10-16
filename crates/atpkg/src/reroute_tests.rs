@@ -1515,9 +1515,9 @@ fn a_child_of_a_command_the_reroute_ran_is_quiet_and_judged() {
 }
 
 /// A branded tool that cannot run names the fix that works: a shim that forwards to no
-/// build (a tombstone, a pending stub) is exec'd with nothing said first, so its own
-/// line speaks; a lost shim names `repair`; only a tool nothing here holds names
-/// `install`. The probe is asked about the program the table names.
+/// build (a tombstone) is exec'd with nothing said first, so its own line speaks; a lost
+/// shim names `repair`; only a tool nothing here holds names `install`. The probe is
+/// asked about the program the table names.
 #[test]
 fn a_branded_tool_that_cannot_run_names_the_fix_that_works() {
     let shim = PathBuf::from("/prefix/bin/clean");
@@ -1588,8 +1588,71 @@ fn a_branded_tool_that_cannot_run_names_the_fix_that_works() {
     );
 }
 
+/// A PENDING STUB HOLDS NO CALL HOSTAGE (2026-10-15): while `trust` is still to come, a
+/// session's `rustfmt` runs the upstream copy at once, after one line saying trustfmt is
+/// not installed yet — not trustfmt's stub, which waits for the install. The stub runs
+/// only where nothing else can: no upstream copy, `[reroute] strict`, or `cargo trust …`
+/// (upstream cargo has no such verb).
+#[test]
+fn a_pending_branded_tool_runs_upstream_rather_than_wait_for_it() {
+    let stub = PathBuf::from("/prefix/bin/trustfmt");
+    let targo_stub = PathBuf::from("/prefix/bin/targo");
+    let pending = |strict: bool, upstream: Option<PathBuf>| {
+        let stub = stub.clone();
+        let targo_stub = targo_stub.clone();
+        move |row: &str, call: &[&str]| {
+            let machine = Machine {
+                passthrough: false,
+                announced: false,
+                announce: &|| true,
+                strict: &|| strict,
+                upstream: &|| upstream.clone(),
+                branded: &|tool, program| {
+                    assert_eq!(program, "trust", "{tool}");
+                    Install::Pending(if tool == "targo" {
+                        targo_stub.clone()
+                    } else {
+                        stub.clone()
+                    })
+                },
+                pin: &|| None,
+                resolve: &|_, _| panic!("nothing is resolved"),
+                trust_checkout: &|| None,
+            };
+            plan(row_for(row).unwrap(), &args(call), &machine)
+        }
+    };
+    assert_eq!(
+        pending(false, Some(PathBuf::from(UP)))("rustfmt", &["x.rs"]),
+        Plan::Upstream {
+            say: Some(fallback_pending_message("rustfmt", "trustfmt", "trust")),
+            target: PathBuf::from(UP),
+            args: args(&["x.rs"]),
+        }
+    );
+    for (strict, upstream) in [(true, Some(PathBuf::from(UP))), (false, None)] {
+        assert_eq!(
+            pending(strict, upstream)("rustfmt", &["x.rs"]),
+            Plan::Shim {
+                shim: stub.clone(),
+                args: args(&["x.rs"]),
+            },
+            "strict={strict}: the stub is what is left to run"
+        );
+    }
+    assert_eq!(
+        pending(false, Some(PathBuf::from(UP)))("cargo", &["trust", "build"]),
+        Plan::Shim {
+            shim: targo_stub.clone(),
+            args: args(&["trust", "build"]),
+        },
+        "an explicit lane has no upstream to fall back to"
+    );
+}
+
 /// [`installed`] on a real store: a laid shim runs; with it lost, the live build says
-/// so; a tombstone and a pending stub are the shim to exec; nothing else is absent.
+/// so; a tombstone is the shim to exec, a pending stub the program still to come; nothing
+/// else is absent.
 #[cfg(unix)]
 #[test]
 fn a_branded_tool_is_read_off_the_store_the_way_atpkg_run_reads_it() {
@@ -1630,7 +1693,7 @@ fn a_branded_tool_is_read_off_the_store_the_way_atpkg_run_reads_it() {
     crate::stub::write_pending_stub(&l, &targo).unwrap();
     assert_eq!(
         installed(&l, "targo", "trust"),
-        Install::Shim(l.shim(&targo))
+        Install::Pending(l.shim(&targo))
     );
     let _ = std::fs::remove_dir_all(&l.prefix);
 }

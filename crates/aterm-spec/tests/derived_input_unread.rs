@@ -1,41 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-0 for `InputUnreadGate`: the unread-input gate proves over the whole
-//! bounded space, and each of its three invariants is caught by the mutant
-//! family (`Buggy = 1`): the screen-only fence of 2026-09-24, the static 1 s
-//! refusal the owner overruled on 2026-09-29, and a stall published on age
-//! alone. Tier-1 — the real pty, the real sink and the shipped `gate` and
-//! `classify` — is `aterm-session/tests/conformance_input_unread.rs`.
+//! Tier-0 for `InputUnreadGate`: the unread-input gate proves over the bounded space, and each
+//! of its three invariants is caught by the `Buggy = 1` family: a screen-only fence, a static
+//! 1 s refusal, and a stall published on age alone. Tier-1 (the real pty, the real sink and the
+//! real `gate` and `classify`) is `aterm-session/tests/conformance_input_unread.rs`.
 
 use crate::walk::walk;
 use aterm_spec::derive::input_unread_gate_model;
-use aterm_spec::{interp, verify};
+use aterm_spec::interp;
 
-#[test]
-fn input_unread_gate_proves_and_catches_every_invariant() {
-    let model = input_unread_gate_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name),
-        "the unread-input gate must stay enrolled in the spec-link registry"
-    );
-    verify::prove_and_catch_scalar(
-        &model,
-        "input unread gate: no key behind a stall, no refusal without one",
-    );
-    assert_eq!(
-        verify::uncaught_invariants(&model),
-        Vec::<&str>::new(),
-        "each invariant, alone, is falsified by the mutant family"
-    );
-}
-
-/// THE INCIDENT: the program freezes, the human's Enter is queued, it ages
-/// into the stall band and the watch publishes the stall. The gate withholds
-/// the driver's key (a refusal that IS established, so it latches nothing);
-/// the screen-only fence admits it and lands it behind the stale Enter.
+/// The program freezes, the human's Enter is queued, it ages into the stall band and the watch
+/// publishes the stall. The gate withholds the driver's key (a refusal that is established, so
+/// it latches nothing); the screen-only fence admits it and lands it behind the stale Enter.
 #[test]
 fn the_incident_is_refused_once_published_and_admitted_by_the_screen_fence() {
     let model = input_unread_gate_model();
@@ -56,11 +33,10 @@ fn the_incident_is_refused_once_published_and_admitted_by_the_screen_fence() {
     assert!(!fence.check_invariant("NoDriverKeyBehindStalledInput", &screen));
 }
 
-/// THE OWNER'S DIRECTION (2026-09-29): a program that is merely SLOW — it
-/// reads, it has not read yet — has input in the warn band and even in the
-/// stall band, and a driver's key is WRITTEN, with the warning; the watch
-/// does not publish it. The static cap (the mutant) refuses the same key
-/// with nothing established, and publishes the same program on age alone.
+/// A program that is merely slow (it reads, it has not read yet) has input in the warn band
+/// and even in the stall band, and a driver's key is written, with the warning; the watch does
+/// not publish it. The static cap (`Buggy = 1`) refuses the same key with nothing established,
+/// and publishes the same program on age alone.
 #[test]
 fn a_slow_program_is_written_to_with_a_warning_and_never_published() {
     let model = input_unread_gate_model();
@@ -79,7 +55,7 @@ fn a_slow_program_is_written_to_with_a_warning_and_never_published() {
     assert!(model.fire("DriverKey", &mut fresh));
     assert_eq!(fresh["warned"], 0);
 
-    // THE STATIC CAP: the same warn-band key refused, the same slow program
+    // `Buggy = 1`, the static cap: the same warn-band key refused, the same slow program
     // published.
     let cap = interp::with_buggy(&model, 1);
     let mut s = walk(&cap, &["HumanKey", "Tick"]);

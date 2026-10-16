@@ -6,11 +6,11 @@
 //! the `apps/aterm-mac/Info.plist` template via in-process string substitution
 //! (CFBundleShortVersionString, sealed `CFBundleVersion = n`, ATermGitCommit — the
 //! release commit's short id, never dirty: the build reads git objects), copy the static
-//! resources (ShellIntegration/, Help.html, Credits.html, aterm.icns) and the
+//! resources (Help.html, Credits.html, aterm.icns) and the
 //! successor's handoff policy (`publish/handoff-policy.toml`), nest
 //! atpkg + aterm-ctl + aterm-cli in Contents/MacOS; prepare this claim's staging
 //! directory, `dist/cut-<build>.noindex/` ([`prepare_staging`]), which the cut
-//! copies the measured bundle into to sign; and write the
+//! copies the verified bundle into to sign; and write the
 //! `dist/aterm-<ver>-build.txt` provenance record. No `.metadata_never_index` marker
 //! (see [`prepare_staging`]: inert for Spotlight, and its one reader is deleted).
 //!
@@ -30,6 +30,23 @@ use std::path::{Path, PathBuf};
 /// The release bundle's `CFBundleIdentifier` — the identifier a Developer-ID
 /// signing/notarization profile binds to.
 pub const BUNDLE_ID: &str = "com.aterm.aterm";
+
+/// The argv0 aliases every bundle carries in `Contents/MacOS`, each a symlink onto the
+/// one `aterm` binary, which dispatches on the name it is run as. `aterm-link` is spawned
+/// BY NAME out of `[fabric] command`, so a shipped install must carry it too.
+pub const ARGV0_ALIASES: [&str; 8] = [
+    "aterm-cli",
+    "aterm-ctl",
+    "atpkg",
+    "aterm-fleet",
+    "aterm-drive",
+    // The `SUDO_ASKPASS` helper `sudo` runs with no tty
+    // (`docs/DESIGN-sudo-askpass-2026-10-15.md`): an argv0 alias because `sudo`
+    // execs it as `[path, prompt]` with no room for a verb.
+    "aterm-askpass",
+    "aterm-link",
+    "aterm-gui",
+];
 
 /// Everything [`assemble_at`] + [`write_provenance`] need, resolved by the caller.
 pub struct BundleSpec {
@@ -90,7 +107,7 @@ pub fn stamp_info_plist(
 /// purpose: the committed template is trusted, tab-indented XML; a full plist
 /// parser would be a new dependency for zero gain (spec: in-process string
 /// substitution). Values are XML-escaped so a stamp can never break the plist.
-fn set_plist_string(plist: &str, key: &str, value: &str) -> Result<String, String> {
+pub(crate) fn set_plist_string(plist: &str, key: &str, value: &str) -> Result<String, String> {
     let value = xml_escape(value);
     let key_tag = format!("<key>{key}</key>");
     if let Some(kpos) = plist.find(&key_tag) {
@@ -174,13 +191,13 @@ pub fn is_staging_dir_name(name: &str) -> bool {
 ///    for free, before a build number is burned — while any process runs out of
 ///    ANY staging directory, or when the process list cannot be read;
 /// 4. [`prepare_staging`] re-asks at the moment it would `rm -rf` its own
-///    directory (a resume that copies the measured bundle in again), and
+///    directory (a resume that copies the verified bundle in again), and
 ///    [`prune_staging_dirs`] removes an older directory only when the process list
 ///    PROVES nothing runs from it.
 ///
 /// Every step after `sign` reads the bundle from here too; nothing copies it
-/// anywhere else (a release installs from the DMG; the dev app is
-/// tools/dev-app.sh's). Once a real or rehearsed cut is done,
+/// anywhere else (a release installs from the DMG; the dev app is `ship
+/// dev-app`'s). Once a real or rehearsed cut is done,
 /// [`discard_staged_app`] removes this claim's staging directory too (under the
 /// same liveness rule), so no finished cut leaves a launchable copy of the app
 /// behind; a dry run keeps it to inspect.
@@ -350,7 +367,7 @@ fn discard_staged_dir(
 }
 
 /// Prepare THIS claim's staging directory and return where its bundle goes,
-/// [`staged_app_path`] — absent on return: the cut copies the measured bundle
+/// [`staged_app_path`] — absent on return: the cut copies the verified bundle
 /// there to sign it. Older staging directories go only when provably unused
 /// ([`prune_staging_dirs`]), before this claim's own is made, so a failed cut
 /// leaves exactly one.
@@ -408,7 +425,7 @@ pub fn prepare_staging(dist: &Path, build: u64) -> Result<PathBuf, String> {
 
 /// Lay out the release's bundle at `app` (build-app.sh steps 2–6c), which must not
 /// exist yet. Signing is NOT done here: the build lays out an unsigned bundle once,
-/// MEASURE judges it, and the cut signs a byte copy of it (inside-out), then
+/// `verify release` judges it, and the cut signs a byte copy of it (inside-out), then
 /// packages it and runs [`write_provenance`] (whose binary_sha256 must cover the
 /// SIGNED bytes, so it must run after signing — same order as the script).
 pub fn assemble_at(spec: &BundleSpec, app: &Path) -> Result<(), String> {
@@ -438,20 +455,7 @@ pub fn assemble_at(spec: &BundleSpec, app: &Path) -> Result<(), String> {
     // them as resources.
     copy_exe(&spec.aterm_bin, &macos.join("aterm"))?;
     #[cfg(unix)]
-    for alias in [
-        "aterm-cli",
-        "aterm-ctl",
-        "atpkg",
-        "aterm-fleet",
-        "aterm-drive",
-        // The fabric bridge. It is spawned BY NAME out of `[fabric] command`,
-        // which aterm whitespace-splits and exec's, so the name has to exist as
-        // an executable in a SHIPPED install — not only in `install.sh`. It was
-        // added to the three script lists and missed here, which made the alias
-        // work from a source checkout and silently not from a release.
-        "aterm-link",
-        "aterm-gui",
-    ] {
+    for alias in ARGV0_ALIASES {
         let link = macos.join(alias);
         std::os::unix::fs::symlink("aterm", &link)
             .map_err(|e| format!("symlink {} -> aterm: {e}", link.display()))?;
@@ -479,20 +483,6 @@ pub fn assemble_at(spec: &BundleSpec, app: &Path) -> Result<(), String> {
         "    version={} build={} commit={} bundle-id={}",
         spec.short_version, spec.build_number, spec.git_commit, spec.bundle_id
     );
-
-    // --- 5. shell-integration resources ------------------------------------
-    let shell_src = mac_dir.join("Sources/ATermMac/Resources/ShellIntegration");
-    if shell_src.is_dir() {
-        let dst = resources.join("ShellIntegration");
-        std::fs::create_dir_all(&dst).map_err(|e| format!("create {}: {e}", dst.display()))?;
-        for entry in std::fs::read_dir(&shell_src)
-            .map_err(|e| format!("read {}: {e}", shell_src.display()))?
-        {
-            let entry = entry.map_err(|e| format!("read {}: {e}", shell_src.display()))?;
-            std::fs::copy(entry.path(), dst.join(entry.file_name()))
-                .map_err(|e| format!("copy {}: {e}", entry.path().display()))?;
-        }
-    }
 
     // --- 6. icon (optional — its plist stamp already handled above) --------
     if icns.is_file() {
@@ -612,8 +602,8 @@ fn copy_exe(src: &Path, dst: &Path) -> Result<(), String> {
 /// (build-app.sh step 8, same KEY=value fields in the same order). MUST run
 /// AFTER signing: binary_sha256 covers the shipped Contents/MacOS/aterm
 /// bytes, and codesign rewrites them. `pre_sign_sha256` is the digest of those
-/// bytes BEFORE signing — the executable MEASURE judged (build once): the record
-/// binds what shipped to what was measured.
+/// bytes BEFORE signing — the executable `verify release` judged (build once): the record
+/// binds what shipped to what was verified.
 pub fn write_provenance(
     spec: &BundleSpec,
     app: &Path,
@@ -685,29 +675,16 @@ pub fn epoch_to_rfc3339(epoch: u64) -> String {
 
 #[cfg(test)]
 mod alias_tests {
-    /// THE ARGV0 ALIAS SET IS HAND-TYPED IN SEVERAL PLACES. This pins the bundle's copy
-    /// against the OTHER lists in the repository, so the next verb to grow an
-    /// alias cannot ship working from a source checkout and dead from a release.
-    ///
-    /// It reads the sibling files rather than importing a roster: `aterm-release`
-    /// deliberately does not depend on `aterm-cli`, and a test that asserted a
-    /// hard-coded list against a hard-coded list would prove only that one author
-    /// typed the same thing twice.
+    /// The installer is shell, so it spells the argv0 alias set again; every alias it
+    /// installs must be one the bundle ships, or the name works from a source checkout
+    /// and is dead in a release.
     #[test]
     fn the_bundle_ships_every_alias_the_installers_create() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(std::path::Path::parent)
             .expect("crates/aterm-release sits two levels under the root");
-        let bundle = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bundle.rs"),
-        )
-        .expect("this file");
-        for script in [
-            "tools/install.sh",
-            "tools/atpkg-pack.sh",
-            "tools/dev-app.sh",
-        ] {
+        for script in ["tools/install.sh"] {
             let text = std::fs::read_to_string(root.join(script))
                 .unwrap_or_else(|e| panic!("{script}: {e}"));
             // A loop over the names, or (install.sh, whose uninstall sweep reads
@@ -725,7 +702,7 @@ mod alias_tests {
                 .filter(|w| w.starts_with("aterm-") || *w == "atpkg")
             {
                 assert!(
-                    bundle.contains(&format!("\"{alias}\"")),
+                    super::ARGV0_ALIASES.contains(&alias),
                     "{script} installs the `{alias}` argv0 alias and the app bundle does not \
                      ship it: the name works from a source checkout and is dead in a release"
                 );

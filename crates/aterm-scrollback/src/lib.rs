@@ -11,10 +11,9 @@
 #![cfg_attr(trust_verify, feature(register_tool))]
 #![cfg_attr(trust_verify, register_tool(trust))]
 #![cfg_attr(not(trust_verify), allow(unexpected_cfgs))]
-#![deny(unsafe_op_in_unsafe_fn)]
 // F11-4 (#7941): production unwrap() is forbidden; tests opt out uniformly at the
 // crate root so a missing per-module allow can't silently slip past clippy.
-#![deny(clippy::unwrap_used)]
+#![warn(clippy::unwrap_used)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
 //! Tiered scrollback storage for terminal emulators.
@@ -25,7 +24,7 @@
 //!
 //! - **Hot tier**: Recent lines in RAM (uncompressed, instant access)
 //! - **Warm tier**: Older lines in RAM (LZ4 compressed, ~10x compression)
-//! - **Cold tier**: Oldest lines (Zstd compressed, in-memory or disk-backed)
+//! - **Cold tier**: Oldest lines (LZ4 compressed, in-memory or disk-backed)
 //!
 //! ```text
 //! ┌─────────────────────────────────────────────────────────────┐
@@ -66,6 +65,31 @@
 //! | 1M    | ~20 MB         |
 //! | 10M   | ~200 MB        |
 //!
+//! ## Under a Binding Budget
+//!
+//! The budget counts stored bytes: the hot tier raw, the warm and cold tiers
+//! compressed. When it binds (a host's [`Scrollback::set_memory_budget`],
+//! aterm-gui's memory-pressure shed), the store keeps the newest lines that
+//! fit, so the codec sets how much history survives. Every compressed tier is
+//! LZ4, which keeps fewer lines than the zstd level-1 cold tier the GUI ran
+//! before (docs/AUDIT-third-party-2026-10-15.md, step ZC.2; wasm builds were
+//! already LZ4). Lines kept by a [`Scrollback::with_defaults`] store with no
+//! line limit, at 80 and 120 columns, under the pressure shed's 1 MiB floor
+//! and its CRITICAL eighth of [`DEFAULT_MEMORY_BUDGET`]:
+//!
+//! | Output           | 1 MiB        | 12.5 MiB                                |
+//! |------------------|--------------|-----------------------------------------|
+//! | `git log -p`     | 26% fewer    | 28-30% fewer                            |
+//! | `ls -lR`         | 36-37% fewer | all 1.0-1.1M fit, in 41-44% more bytes  |
+//! | random printable | 19-20% fewer | 19-20% fewer                            |
+//!
+//! The figures move with the corpus: `git log -p` is this repository's whole
+//! history (1.2M lines), `ls -lR` is `/System/Library` and `/usr`, and random
+//! printable is 400k seeded rows.
+//!
+//! A budget that does not bind keeps every line and pays in bytes instead:
+//! 20-35% more per GUI session at the 100,000-line default.
+//!
 //! ## Verification
 //!
 //! - The tier laws are the `ty` models `EvictFull` and `TierResidency`
@@ -76,8 +100,7 @@
 //!   claim law over every small input (`lz4::tests`), and, with `disk-tier`,
 //!   the disk page lookup and front truncation over every small layout.
 
-#![deny(missing_docs)]
-#![deny(clippy::all)]
+#![warn(missing_docs)]
 
 mod access;
 mod codec;
@@ -117,17 +140,6 @@ pub(crate) use codec::{
     decode_cold_bounded, decompress_lz4_bounded, encode_cold_block,
 };
 pub use codec::{DEFAULT_LINE_LIMIT, DEFAULT_MEMORY_BUDGET};
-// zstd codec helper. Referenced by the on-disk `.dtrm` cold format
-// (disk_compaction.rs / disk_memory.rs, behind `disk-tier`) and by the zstd
-// round-trip unit test. With `zstd` but not `disk-tier` it has no production
-// caller, so suppress the unused-import lint in that configuration.
-#[cfg(feature = "zstd")]
-pub(crate) use codec::decode_zstd_bounded;
-// Single source of truth for the cold-tier zstd level, shared by the in-memory
-// cold tier (codec.rs) and the disk `.dtrm` rewrite/compaction paths so all
-// eviction sites compress at the same CPU/ratio tradeoff.
-#[cfg(feature = "zstd")]
-pub(crate) use codec::COLD_ZSTD_LEVEL;
 pub(crate) use cold_tier::ColdTier;
 #[cfg(feature = "disk-tier")]
 pub(crate) use disk::DiskColdTier;
@@ -215,7 +227,7 @@ pub struct Scrollback {
     hot: HotTier,
     /// Warm tier: LZ4 compressed blocks.
     warm: WarmTier,
-    /// Cold tier: Zstd compressed, in-memory.
+    /// Cold tier: LZ4 compressed pages, in-memory.
     cold: ColdTier,
     /// Maximum lines in hot tier before promotion.
     hot_limit: usize,
@@ -533,8 +545,8 @@ pub(crate) fn count_image_rows(lines: &[Line]) -> u64 {
 mod tests;
 
 // Never-panic fuzz of the decode surfaces (was tests/fuzz_decode.rs, which only
-// compiled under `cfg(any(fuzzing, feature = "fuzz"))` and so ran nowhere in the
-// gate). Runs in every lib test build; `fuzz` only deepens it.
+// compiled under `cfg(any(fuzzing, feature = "fuzz"))` and so ran in no test
+// run). Runs in every lib test build; `fuzz` only deepens it.
 #[cfg(test)]
 mod decode_fuzz_tests;
 

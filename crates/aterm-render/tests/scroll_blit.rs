@@ -1,18 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! E7 WHOLE-ROW SCROLL-BLIT differential oracle.
+//! Whole-row scroll-blit differential oracle.
 //!
-//! A rigid history scroll (offset AND anchor both shifted) used to `FullRepaint`
-//! every visible row every notch, even though the grid merely slid by a known
-//! integer row delta and those rows were already rasterized last frame. The
-//! blit now shifts the retained rows inside the cached framebuffer and
-//! re-rasterizes ONLY the newly-exposed strip (+ the cursor's old/new rows).
-//!
-//! GUARD: the presented frame must be BYTE-IDENTICAL to a fresh full repaint of
-//! the same input — the blit is faster, never different. Exercised across scroll
-//! directions and deltas, with a visible cursor and wide (CJK) glyphs in the
-//! retained rows, each notch checked against a from-scratch `render_input`.
+//! A rigid history scroll shifts the retained rows inside the cached
+//! framebuffer and re-rasterizes only the exposed strip (and the cursor's old
+//! and new rows). Every presented frame must be byte-identical to a fresh full
+//! repaint of the same input, across directions, deltas, geometries and glyph
+//! classes.
 
 use aterm_core::terminal::Terminal;
 use aterm_render::{DamageOutcome, Renderer, Theme, WindowCpu};
@@ -21,9 +16,8 @@ fn renderer() -> Renderer {
     renderer_px(16.0)
 }
 
-/// A warm/fresh renderer at an EXPLICIT font px — the E7 overshoot bugs only
-/// manifest at specific cell_h/baseline geometries (the seam byte-diverges at
-/// px 13/14 but not at 16), so the differential gate MUST sweep px, not pin one.
+/// A renderer at an explicit font px: the overshoot seam diverges only at some
+/// cell_h/baseline geometries, so the gate sweeps px.
 fn renderer_px(px: f32) -> Renderer {
     Renderer::from_system(px, Theme::default())
         .map(|mut r| {
@@ -33,9 +27,8 @@ fn renderer_px(px: f32) -> Renderer {
         .expect("no font: build with aterm-render's default embedded-font feature")
 }
 
-/// Render through the warm damage cache and assert byte-identity against a fresh
-/// full repaint of the same input (the differential oracle); return the warm
-/// path's damage outcome.
+/// Render through the warm damage cache, assert byte-identity with a fresh full
+/// repaint, and return the warm path's damage outcome.
 fn render_both(
     warm: &mut Renderer,
     wc: &mut WindowCpu,
@@ -57,18 +50,16 @@ fn render_both(
     outcome
 }
 
-/// Scrolling DEEP into history, notch by notch: every retained row is blitted,
-/// only the newly-exposed top strip is re-rasterized, and each frame is
-/// byte-identical to a full repaint. Wide glyphs ride the retained rows; the
-/// cursor is live-visible on the bottom row throughout.
+/// Scrolling deep into history notch by notch blits every retained row and
+/// re-rasters only the exposed top strip; wide glyphs ride the retained rows.
 #[test]
 fn deep_history_scroll_blits_and_matches_full_repaint() {
     let mut warm = renderer();
     let mut wc = WindowCpu::new();
     let (rows, cols) = (8usize, 24usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
-    // Deep history with wide (CJK) glyphs interleaved so retained rows carry
-    // double-width cells across the shift.
+    // Wide (CJK) glyphs in every line, so retained rows carry double-width
+    // cells across the shift.
     for i in 0..120 {
         term.process(format!("line {i} 日本語 tail\r\n").as_bytes());
     }
@@ -96,8 +87,8 @@ fn deep_history_scroll_blits_and_matches_full_repaint() {
     );
 }
 
-/// Scrolling BACK toward the bottom (the opposite sign) blits with a positive
-/// delta and exposes the BOTTOM strip; still byte-identical to a full repaint.
+/// Scrolling toward the bottom blits with a positive delta and exposes the
+/// bottom strip.
 #[test]
 fn scroll_toward_bottom_blits_the_other_direction() {
     let mut warm = renderer();
@@ -132,10 +123,9 @@ fn scroll_toward_bottom_blits_the_other_direction() {
     );
 }
 
-/// A single-row history scroll blits with |delta| == 1 (the tightest exposed
-/// strip) and stays byte-exact in both directions. Entering/leaving history flips
-/// the raw cursor's visibility, so those two boundary frames deliberately repaint
-/// in full rather than shifting stale cursor pixels into/out of the viewport.
+/// A one-row history scroll blits with |delta| == 1 in both directions.
+/// Entering and leaving history flips the cursor's visibility, so those two
+/// frames repaint in full.
 #[test]
 fn single_row_scroll_is_byte_exact() {
     let mut warm = renderer();
@@ -210,20 +200,15 @@ fn single_row_scroll_is_byte_exact() {
     );
 }
 
-// ---- FRAME-EQUALITY DIFFERENTIAL over the E7 review's REFUTING cases ----
+// ---- Shade parity and upward overshoot ----
 //
-// The blit REFUTED byte-identity in two ways the plain-ASCII oracles above never
-// exercised: (1) SHADE DITHER PARITY — U+2591–2593 key on absolute framebuffer
-// Y-parity, so a memmove by an ODD pixel count (`da·cell_h`, e.g. a single notch
-// with cell_h == 19) lands them at the wrong phase; (2) UPWARD GLYPH OVERSHOOT —
-// tall symbols / accented capitals overshoot into the row above, which the blit
-// dropped at the exposed-strip seam. Each test below drives adversarial content
-// and asserts the warm (blit) frame is byte-identical to a fresh full repaint,
-// notch by notch, over both directions and multi-row/multi-notch deltas.
+// Shade dithers U+2591–2593 key on absolute framebuffer Y-parity, so a shift
+// by an odd pixel count (`da·cell_h`) lands them at the wrong phase unless
+// re-rastered; tall glyphs overshoot into the row above, which the exposed-strip
+// seam must keep.
 
-/// Progress-bar / htop-style shade rows (░▒▓) plus accented capitals and tall
-/// box symbols, scrolled a single notch at a time (the ODD `da·cell_h` that trips
-/// BOTH the shade-phase seam and the overshoot apron) — every frame byte-exact.
+/// Shade rows (░▒▓) with accented capitals and box symbols, one notch at a time
+/// (an odd `da·cell_h` when cell_h is odd).
 #[test]
 fn shade_and_overshoot_single_notch_is_byte_exact() {
     let mut warm = renderer();
@@ -253,18 +238,16 @@ fn shade_and_overshoot_single_notch_is_byte_exact() {
             blits += 1;
         }
     }
-    // The shade-parity re-raster must ride the BLIT fast path, not silently fall to
-    // a full repaint (which would make byte-identity vacuous and kill the win).
+    // Shade rows ride the blit path rather than fall to a full repaint, which
+    // would make byte-identity vacuous.
     assert!(
         blits >= 25,
         "shade rows must scroll via the blit ({blits}/30 notches took it)"
     );
 }
 
-/// The same adversarial content scrolled the OTHER direction and by MULTI-ROW
-/// deltas (both parities of `da·cell_h`): the even shift keeps every shade row on
-/// the pure blit fast path, the odd shift re-rasters the shade rows — both must be
-/// byte-identical to a full repaint.
+/// The same content scrolled both directions by 1 and 2 rows (both parities of
+/// `da·cell_h`): an even shift blits shade rows, an odd one re-rasters them.
 #[test]
 fn shade_and_overshoot_multi_row_both_directions_byte_exact() {
     let mut warm = renderer();
@@ -278,7 +261,7 @@ fn shade_and_overshoot_multi_row_both_directions_byte_exact() {
     // Park deep, warm there.
     term.scroll_display(80);
     render_both(&mut warm, &mut wc, &mut term, rows, cols, "deep-warmup");
-    // Back further (top exposed strip), alternating odd/even multi-row deltas.
+    // Further back (top strip exposed), alternating odd/even deltas.
     for step in 0..20 {
         let delta = if step % 2 == 0 { 1 } else { 2 };
         term.scroll_display(delta);
@@ -291,7 +274,7 @@ fn shade_and_overshoot_multi_row_both_directions_byte_exact() {
             &format!("back-multi[{step}]"),
         );
     }
-    // Forward toward the bottom (bottom exposed strip), same alternation.
+    // Toward the bottom (bottom strip exposed), same alternation.
     for step in 0..20 {
         let delta = if step % 2 == 0 { -2 } else { -1 };
         term.scroll_display(delta);
@@ -306,9 +289,8 @@ fn shade_and_overshoot_multi_row_both_directions_byte_exact() {
     }
 }
 
-/// A LIVE, static cursor riding a shade+overshoot scroll: the cursor's re-stamp /
-/// blitted-ghost rows land amid the shade-parity and apron re-rasters, and the
-/// composed frame must still equal a full repaint every notch.
+/// A live, static cursor during a shade + overshoot scroll: the cursor's rows
+/// re-stamp amid the shade and apron re-rasters, still byte-exact.
 #[test]
 fn shade_scroll_with_live_cursor_is_byte_exact() {
     let mut warm = renderer();
@@ -335,10 +317,9 @@ fn shade_scroll_with_live_cursor_is_byte_exact() {
     }
 }
 
-/// A full row of shade with a tall/accented glyph in the row DIRECTLY BELOW each
-/// shade row — the case a shade re-raster must NOT lose (the row-below's upward
-/// overshoot into the shade band) nor double (its own overshoot over the blitted
-/// row above). Byte-exact confirms the upper+lower apron pair.
+/// A shade row above a tall-glyph row: a shade re-raster must neither lose the
+/// row below's upward overshoot into the shade band nor double its own over the
+/// blitted row above.
 #[test]
 fn shade_row_over_tall_glyph_row_is_byte_exact() {
     let mut warm = renderer();
@@ -346,8 +327,8 @@ fn shade_row_over_tall_glyph_row_is_byte_exact() {
     let (rows, cols) = (8usize, 24usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
     for i in 0..100 {
-        // Alternate a pure-shade row and a tall-accent row so every shade band has
-        // an overshooting neighbour above AND below across the shift.
+        // Alternate shade and tall-accent rows: every shade band has an
+        // overshooting neighbour above and below.
         if i % 2 == 0 {
             term.process(
                 b"\xe2\x96\x93\xe2\x96\x93\xe2\x96\x93\xe2\x96\x93\xe2\x96\x93\xe2\x96\x93\r\n",
@@ -370,28 +351,22 @@ fn shade_row_over_tall_glyph_row_is_byte_exact() {
     }
 }
 
-// ---- THE GATE: full geometry × direction × glyph-class differential sweep ----
+// ---- Geometry × direction × glyph-class sweep ----
 //
-// The single-geometry oracles above are HOLLOW: they pin `from_system(16.0)`, and
-// the E7 upward-overshoot seam (a row's band carries its BELOW-neighbour's
-// overshoot, since `Scale::NORMAL.clip_y0 = i32::MIN`) byte-diverges from a full
-// repaint only at particular cell_h/baseline geometries — px 13/14 refuted it
-// where 16 passed. This sweep is the real gate: for EVERY (px × scroll direction
-// × glyph class) it drives the warm blit path notch-by-notch and asserts the
-// presented frame is byte-identical to a from-scratch full repaint, so the
-// GENERAL overshoot invariant is proven geometry-independent, not patched per
-// geometry.
+// A row's band carries its below-neighbour's upward overshoot
+// (`Scale::NORMAL.clip_y0 = i32::MIN`), and the blit seam diverges from a full
+// repaint only at some cell_h/baseline geometries (px 13/14, not 16), so the
+// gate sweeps px.
 
-/// The adversarial glyph classes. Each generator returns line `i`'s text (no
-/// newline). MIXED alternates class per row so adjacent retained/exposed rows
-/// carry DIFFERENT overshoot profiles across the shift — the case a per-row
-/// re-raster must reconcile on both edges.
+/// Line `i`'s text (no newline) for each adversarial glyph class. `mixed`
+/// alternates classes per row, so adjacent rows carry different overshoot
+/// profiles across the shift.
 fn class_line(class: &str, i: usize) -> String {
     match class {
         // Plain ASCII — the overshoot-free control.
         "plain" => format!("line {i} content"),
-        // Accented capitals ÉÁÑÅÊÍ — tall diacritics overshoot UPWARD into the
-        // row above (the exact bug-3 repro content).
+        // Accented capitals ÉÁÑÅÊÍ: tall diacritics overshoot up into the row
+        // above.
         "accent" => format!("\u{c9}\u{c1}\u{d1}\u{c5}\u{ca}\u{cd} r{i}"),
         // Procedural shade dithers ░▒▓ (+ full block) — absolute-Y-parity keyed.
         "shade" => format!("\u{2591}\u{2592}\u{2593}\u{2588} b{i}"),
@@ -411,11 +386,9 @@ fn class_line(class: &str, i: usize) -> String {
     }
 }
 
-/// Present `input` through the warm blit path and, pixel-for-pixel, against a
-/// fresh full repaint. On ANY divergence, panic with the first few (x,y) seams
-/// and the total count (the E7 review's diagnostic form) rather than an
-/// unreadable whole-Vec `assert_eq`. Returns the warm damage outcome so the
-/// caller can prove the blit fast path was actually taken (non-vacuous identity).
+/// Present `input` through the warm blit path and compare it with a fresh full
+/// repaint, panicking with the first few diverging (x,y) and the total count.
+/// Returns the warm damage outcome.
 fn assert_blit_equals_full(
     warm: &mut Renderer,
     wc: &mut WindowCpu,
@@ -456,18 +429,13 @@ fn assert_blit_equals_full(
     outcome
 }
 
-/// THE E7 GATE. Sweep cell geometry (px) × scroll direction (into history AND
-/// toward bottom) × delta (1/2/3-row, single- and multi-row exposed strips) ×
-/// glyph class (plain, accented capitals, shade dither, box drawing, wide/emoji,
-/// and MIXED adjacent rows), and for EVERY combination assert the warm blit frame
-/// is byte-identical to a fresh full repaint at every notch. Non-hollow: the blit
-/// fast path must actually carry a large majority of the notches (else identity is
-/// vacuous — a silent full-repaint would also pass).
+/// The gate: px × direction × delta (1/2/3 rows) × glyph class, each notch's
+/// blit frame byte-identical to a fresh full repaint, with the blit carrying
+/// most of the notches.
 #[test]
 fn e7_scroll_blit_geometry_direction_glyph_sweep_is_byte_exact() {
-    // 8 geometries — including the 13/14 that refuted the seam and even/odd cell_h
-    // (odd → odd `da·cell_h` shade-phase re-raster) — so the invariant is proven
-    // geometry-independent, not tuned for one px.
+    // Odd and even cell_h (an odd `da·cell_h` re-rasters shade rows), including
+    // px 13/14, where the overshoot seam diverges.
     let px_sweep = [11.0f32, 12.0, 13.0, 14.0, 15.0, 16.0, 18.0, 20.0];
     let classes = ["plain", "accent", "shade", "box", "wide", "mixed"];
     let deltas = [1i32, 2, 3];
@@ -483,7 +451,7 @@ fn e7_scroll_blit_geometry_direction_glyph_sweep_is_byte_exact() {
 
         for class in classes {
             for &delta in &deltas {
-                // --- INTO HISTORY: top strip exposed, delta_rows == -delta. ---
+                // --- Into history: top strip exposed, delta_rows == -delta. ---
                 {
                     let mut wc = WindowCpu::new();
                     let mut term = Terminal::new(rows as u16, cols as u16);
@@ -514,9 +482,8 @@ fn e7_scroll_blit_geometry_direction_glyph_sweep_is_byte_exact() {
                         }
                     }
                 }
-                // --- TOWARD BOTTOM: bottom strip exposed, delta_rows == +delta
-                //     (the bug-3 direction: the retained row directly ABOVE the
-                //     exposed bottom strip is stale unless re-rastered). ---
+                // --- Toward bottom: bottom strip exposed, delta_rows == +delta;
+                //     the retained row directly above the strip must re-raster. ---
                 {
                     let mut wc = WindowCpu::new();
                     let mut term = Terminal::new(rows as u16, cols as u16);
@@ -558,9 +525,8 @@ fn e7_scroll_blit_geometry_direction_glyph_sweep_is_byte_exact() {
         }
     }
 
-    // Non-hollow: the blit fast path must carry the clear majority of notches —
-    // a silent fall-through to full repaint would satisfy byte-identity vacuously
-    // and forfeit the entire E7 win.
+    // Non-vacuity: the blit carries most notches; a silent full repaint would
+    // pass byte-identity trivially.
     assert!(
         blits * 2 >= notch_renders,
         "blit fast path took only {blits}/{notch_renders} notches — identity is \

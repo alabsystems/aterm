@@ -8,8 +8,6 @@ use crate::{CellFlags, Grid, LineSize, StyleId};
 
 #[test]
 fn decdwl_row_preserved_on_shrink() {
-    // An 80-col DECDWL row with content in cols 0-9 should not be split
-    // when the terminal shrinks to 40 columns.
     let mut grid = Grid::new(5, 80);
     for i in 0..10u16 {
         grid.write_char((b'A' + i as u8) as char);
@@ -27,14 +25,13 @@ fn decdwl_row_preserved_on_shrink() {
         LineSize::DoubleWidth,
         "DECDWL attribute must survive shrink reflow"
     );
-    // Content should be truncated to fit, not wrapped to a new row.
+    // Resized in place, not wrapped onto a new row.
     assert_eq!(row0.get(0).unwrap().char_data(), 'A' as u16);
     assert_eq!(row0.get(9).unwrap().char_data(), 'J' as u16);
 }
 
 #[test]
 fn decdwl_row_preserved_on_grow() {
-    // A 40-col DECDWL row should not merge with the next row when growing to 80.
     let mut grid = Grid::new(5, 40);
     for i in 0..10u16 {
         grid.write_char((b'A' + i as u8) as char);
@@ -43,7 +40,6 @@ fn decdwl_row_preserved_on_grow() {
         .unwrap()
         .set_line_size(LineSize::DoubleWidth);
 
-    // Put content on row 1 to verify it doesn't merge.
     grid.set_cursor(1, 0);
     grid.write_char('Z');
 
@@ -97,8 +93,7 @@ fn decdhl_top_bottom_preserved_on_shrink() {
 
 #[test]
 fn decdwl_row_not_split_even_when_full() {
-    // A fully-filled DECDWL row shrunk to half its width should truncate,
-    // not wrap. The second half of the content is lost (no new row created).
+    // Shrunk to half its width, a full DECDWL row truncates: no new row.
     let mut grid = Grid::new(3, 80);
     for _i in 0..80u16 {
         grid.write_char('X');
@@ -116,7 +111,6 @@ fn decdwl_row_not_split_even_when_full() {
         LineSize::DoubleWidth,
         "DECDWL must be preserved"
     );
-    // Row count should not increase — DECDWL rows don't split.
     assert_eq!(grid.rows(), rows_before);
 }
 
@@ -135,7 +129,6 @@ fn decdwl_cursor_clamped_on_shrink() {
     grid.assert_invariants();
 
     assert_eq!(grid.cursor_row(), 0, "cursor should stay on row 0");
-    // Cursor clamped to new_cols - 1 = 39 (the resize clamps it).
     assert!(
         grid.cursor_col() <= 39,
         "cursor col {} should be <= 39",
@@ -146,8 +139,7 @@ fn decdwl_cursor_clamped_on_shrink() {
 
 #[test]
 fn decdwl_round_trip_shrink_then_grow() {
-    // Shrink then grow should preserve DECDWL attribute and content
-    // (content beyond the shrunk width is lost, as expected).
+    // Content within the shrunk width survives the round trip.
     let mut grid = Grid::new(5, 80);
     for i in 0..20u16 {
         grid.write_char((b'A' + (i % 26) as u8) as char);
@@ -156,12 +148,10 @@ fn decdwl_round_trip_shrink_then_grow() {
         .unwrap()
         .set_line_size(LineSize::DoubleWidth);
 
-    // Shrink to 40 — content still fits (20 chars < 40 cols).
     grid.resize(5, 40);
     assert_eq!(grid.row(0).unwrap().line_size(), LineSize::DoubleWidth);
     assert_eq!(grid.row(0).unwrap().get(0).unwrap().char_data(), 'A' as u16);
 
-    // Grow back to 80 — row should stay as a single DECDWL row, not merge.
     grid.resize(5, 80);
     grid.assert_invariants();
     assert_eq!(grid.row(0).unwrap().line_size(), LineSize::DoubleWidth);
@@ -170,7 +160,6 @@ fn decdwl_round_trip_shrink_then_grow() {
 
 #[test]
 fn decdhl_pair_preserved_on_grow() {
-    // DECDHL top+bottom pair should not merge with adjacent rows on grow.
     let mut grid = Grid::new(5, 40);
     grid.write_char('T');
     grid.row_mut(0)
@@ -207,7 +196,6 @@ fn decdwl_mixed_with_normal_rows_on_shrink() {
     // A grid with interleaved DECDWL and normal rows: only normal rows reflow.
     let mut grid = Grid::new(5, 20);
 
-    // Row 0: DECDWL with "ABCDEFGHIJ" (10 chars)
     for c in "ABCDEFGHIJ".chars() {
         grid.write_char(c);
     }
@@ -215,35 +203,29 @@ fn decdwl_mixed_with_normal_rows_on_shrink() {
         .unwrap()
         .set_line_size(LineSize::DoubleWidth);
 
-    // Row 1: "1234567890".
     grid.set_cursor(1, 0);
     for c in "1234567890".chars() {
         grid.write_char(c);
     }
 
-    // Shrink to 5 columns.
     grid.resize(5, 5);
     grid.assert_invariants();
 
-    // Row 0 should still be DECDWL, content truncated to 5 cols.
     assert_eq!(grid.row(0).unwrap().line_size(), LineSize::DoubleWidth);
     assert_eq!(grid.row(0).unwrap().get(0).unwrap().char_data(), 'A' as u16);
     assert_eq!(grid.row(0).unwrap().get(4).unwrap().char_data(), 'E' as u16);
 
-    // Row 1 should be the normal row's first chunk "12345".
     assert_eq!(grid.row(1).unwrap().line_size(), LineSize::SingleWidth);
     assert_eq!(grid.row(1).unwrap().get(0).unwrap().char_data(), '1' as u16);
 
-    // Row 2 should be the normal row's second chunk "67890" (wrapped).
     assert!(grid.row(2).unwrap().is_wrapped());
     assert_eq!(grid.row(2).unwrap().get(0).unwrap().char_data(), '6' as u16);
 }
 
 #[test]
 fn decdwl_continuation_row_survives_shrink_merge() {
-    // A DECDWL row that is itself a wrap continuation (autowrap onto it, then
-    // ESC # 6) is not consumed by the shrink merge: it resizes in place,
-    // keeping its wrapped flag and DoubleWidth attribute.
+    // A DECDWL row that is itself a wrap continuation (autowrap onto it, then ESC # 6) resizes in
+    // place, keeping its wrapped flag and DoubleWidth attribute.
     let mut grid = Grid::new(5, 10);
     for c in "ABCDEFGHIJKL".chars() {
         grid.write_char_wrap(c);
@@ -273,8 +255,7 @@ fn decdwl_continuation_row_survives_shrink_merge() {
 
 #[test]
 fn decdwl_continuation_row_not_merged_on_grow() {
-    // Grow direction of the same defect: the head row must not absorb its
-    // wrapped DECDWL successor.
+    // The grow direction: the head row does not absorb its wrapped DECDWL successor.
     let mut grid = Grid::new(5, 10);
     for c in "ABCDEFGHIJKL".chars() {
         grid.write_char_wrap(c);
@@ -306,10 +287,9 @@ fn decdwl_continuation_row_not_merged_on_grow() {
 
 #[test]
 fn decdwl_shrink_blanks_a_wide_char_cut_at_the_new_edge() {
-    // The in-place DECDWL resize truncates, so a wide char whose head lands in
-    // the new last column is blanked (as `Row::resize` does), never left
-    // dangling. The row is 100 wide, so DECDWL clears only `cells[50..]` and
-    // the pair at 39/40 is intact until the resize to 40 cuts it.
+    // The in-place resize truncates, so a wide char whose head lands in the new last column is
+    // blanked (as `Row::resize` does). At 100 wide, DECDWL clears only `cells[50..]`, so the pair
+    // at 39/40 is intact until the resize to 40 cuts it.
     let mut grid = Grid::new(3, 100);
     grid.row_mut(0)
         .unwrap()

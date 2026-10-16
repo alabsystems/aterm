@@ -1,0 +1,14 @@
+# agy 1.4.0 · MEASURED 2026-10-16, `aterm ctl text --json` of a private headless aterm 120x40 (aterm 0.105.0 098c216c7), the atpkg-managed agy (Google latest) launched through its shim under the owner's signed-in account (Gemini 4 Argon, medium), scratch ATERM_STATE_HOME/XDG dirs, harness off · the workspace-trust box agy draws in a folder it has not seen: `> Yes, I trust this folder` selected (5c5cff), `No, exit`, the `↑/↓ Navigate · enter Confirm` key row; no composer; drawn from row 0 with the shell rows gone · cursor=12,119 (hidden) · account and scratch path redacted at equal length
+Accessing workspace:
+
+/tmp/at.XXXXXX/work
+
+Do you trust the contents of this project?
+
+Antigravity CLI requires permission to read, edit, and execute files here.
+
+> Yes, I trust this folder
+  No, exit
+
+  ↑/↓ Navigate · enter Confirm
+                                                                                                 Gemini 4 Argon · medium

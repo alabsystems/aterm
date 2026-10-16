@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! TEST SUPPORT (the `test-support` feature, dev-dependencies only): how a
+//! TEST SUPPORT (test and debug builds, never a release one): how a
 //! test that needs macOS's `trustd` to ANSWER finds out whether it will.
 //!
 //! * [`trust_service_silent`] asks ONCE per process, through the shipped
@@ -89,10 +89,10 @@ pub fn disk_image_service_silent(out: &std::process::Output) -> bool {
 
 /// [`disk_image_service_silent`]'s judgment WITHOUT its notice: a failed run
 /// whose stderr says `Operation timed out`. A test of the judgment asks here,
-/// never the function above: the notice is the line the merge gate counts as a
+/// never the function above: the notice is the line `verify test` counts as a
 /// host skip (aterm-verify `libtest::host_skips`), and printed for a made-up
-/// run it makes a whole-tree run read "1 skipped", and withhold the merge
-/// contract, on a host whose service answers.
+/// run it makes a whole-tree run read "1 skipped", and stops a `verify release`
+/// as COULD NOT RUN, on a host whose service answers.
 fn timed_out(out: &std::process::Output) -> bool {
     !out.status.success() && String::from_utf8_lossy(&out.stderr).contains("Operation timed out")
 }
@@ -110,8 +110,6 @@ pub fn sign_ad_hoc(path: &std::path::Path) {
         crate::spawnfd::command("/usr/bin/codesign")
             .args(["--force", "--sign", "-"])
             .arg(path),
-        // wasm-clock-guard: allow — test support only (the `test-support` feature,
-        // dev-dependencies), never compiled into a wasm bundle.
         std::time::Instant::now() + CODESIGN_HANG,
     )
     .unwrap_or_else(|e| panic!("codesign {}: {e}", path.display()));
@@ -194,7 +192,7 @@ mod tests {
     #[test]
     fn only_a_timed_out_failure_is_a_silent_disk_image_service() {
         // The judgment alone: `disk_image_service_silent` would print the skip
-        // line the gate reads, and no `hdiutil` ran here.
+        // line `verify test` reads, and no `hdiutil` ran here.
         use super::timed_out as silent;
         let asked = super::ASKED.with(std::cell::Cell::get);
         assert!(silent(&run(

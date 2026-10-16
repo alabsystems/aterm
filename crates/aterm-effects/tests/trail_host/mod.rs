@@ -31,7 +31,7 @@
 //!
 //! **Grid and spine.** A family's grid is the product of what it sweeps
 //! (widths, key rates, pauses, tear lengths, pacings). A release build, or
-//! `TRAIL_LAWS_FULL=1` (set by the merge gate via
+//! `TRAIL_LAWS_FULL=1` (which `verify test` sets:
 //! `aterm_verify::stages::TRAIL_LAWS_FULL`), runs every case; a debug run runs
 //! the spine ([`sweep`]): values crossing each stated threshold on both sides,
 //! so every law holds a case that must hold and every limit rule names one
@@ -676,10 +676,10 @@ pub fn sweep<T: Clone + PartialEq + std::fmt::Debug>(all: &[T], spine: &[T]) -> 
 ///
 /// Each case builds its own host on its own clock (`Send + Sync`, nothing
 /// shared), so the cases run on the binary's threads
-/// ([`crate::common::par_map`]) and are judged in order after. MEASURED
-/// 2026-09-30, the gate's full grid at `RUST_TEST_THREADS=7`: one after
-/// another, `moves_are_followed`'s 96 unsynced-composer tears took 41 s and
-/// the binary 47.5 s; on the pool the law takes 8.2 s and the binary 12.4 s.
+/// ([`crate::common::par_map`]) and are judged in order after. Over the full
+/// grid at `RUST_TEST_THREADS=7`, one after another, `moves_are_followed`'s 96
+/// unsynced-composer tears take 41 s and the binary 47.5 s; on the pool the
+/// law takes 8.2 s and the binary 12.4 s.
 fn run_law(cases: Vec<Case>, pick: impl Fn(&str) -> bool, limit: impl Fn(&str) -> bool) {
     let picked: Vec<Case> = cases.into_iter().filter(|c| pick(&c.id)).collect();
     assert!(!picked.is_empty(), "the law picks no case");

@@ -10,8 +10,8 @@ use super::{
 /// nothing answers. A DATAGRAM socket, never a dropped stream listener: macOS marks a
 /// socket close-on-exec only after `socket()` returns, so another test's
 /// `posix_spawn` in that window inherits the listener and keeps it listening after
-/// this test drops its copy, and a connect then succeeds into its backlog — the
-/// merge gate saw "a stale compositor" answer (2026-10-05). A stream connect to a
+/// this test drops its copy, and a connect then succeeds into its backlog — a
+/// parallel test run then reads a stale-compositor answer. A stream connect to a
 /// datagram socket's path is refused (`EPROTOTYPE`) whoever still holds it.
 fn server_gone_socket(path: &std::path::Path) {
     drop(std::os::unix::net::UnixDatagram::bind(path).unwrap());

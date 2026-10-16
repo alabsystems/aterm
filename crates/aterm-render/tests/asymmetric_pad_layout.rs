@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance for `AsymmetricPadLayout`: drive the derived model's
-//! executable actions against the shipping `Renderer` layout and CPU cache.
+//! Conformance for `AsymmetricPadLayout`: the derived model's executable actions,
+//! driven against the shipping `Renderer` layout and CPU cache.
 
 use aterm_core::terminal::Terminal;
 use aterm_render::{DamageOutcome, Renderer, Theme, WindowCpu, project_asymmetric_pad_layout};
@@ -56,10 +56,9 @@ fn asymmetric_pad_layout_model_conforms_to_shipping_cpu_geometry_and_cache() {
             );
         }
 
-        // Stutter conformance: re-applying the SAME base padding is an
-        // idempotent environment update, so it must preserve every modeled
-        // ApplyInitialTop variable. The former unconditional override clear is
-        // the negative mutant here; every point with pad_top != pad catches it.
+        // Stutter: re-applying the same base padding is idempotent and must keep every
+        // modeled ApplyInitialTop variable; an unconditional override clear fails at
+        // every point with pad_top != pad.
         renderer.set_pad(pad);
         let after_same_pad = project_asymmetric_pad_layout(&renderer, &window, rows);
         assert_eq!(after_same_pad.pad_top, layout.pad_top);
@@ -131,9 +130,8 @@ fn asymmetric_pad_layout_model_conforms_to_shipping_cpu_geometry_and_cache() {
             assert_eq!(window.last_damage(), DamageOutcome::Full);
             assert_ne!(second, first, "visible row zero must move with grid_top");
 
-            // NEGATIVE CONTROL: the pre-fix/mutant key used only dimensions and
-            // content. Both are unchanged here, so it would falsely hit exactly
-            // where the model and shipping cache require a full repaint.
+            // Negative control: a cache key of dimensions and content alone would
+            // falsely hit here, where the model requires a full repaint.
             let dimension_only_mutant_hit = renderer.frame_size(rows, cols) == frame_size;
             assert!(dimension_only_mutant_hit);
             assert_eq!(decided["cache_hit"], 0);

@@ -1,25 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The real witness writes the arrival evidence its model states: Tier-1 for
-//! `aterm-spec`'s `ribbon_arrival_evidence_model` (`RibbonArrivalEvidence`),
-//! the writer half of the follow pass. The reader
-//! (`tests/ribbon_follow_conformance.rs`) decides a follow from whether each
-//! record's glyph arrived at the target; this binds what the witness has
-//! written by then, through the arm and every walk of the record's life (the
-//! target row seen holding the glyph, something else, or not sampled, at
-//! frames one or two time units apart).
+//! Tier-1 conformance for `aterm-spec`'s `ribbon_arrival_evidence_model`: the real witness
+//! writes the arrival evidence the model states (the writer half of the follow pass;
+//! `tests/ribbon_follow_conformance.rs` binds the reader).
 //!
-//! Every model trace up to its bound (`T = 5` units of 20 ms, `TWIN_MIN`
-//! being 40 ms) is replayed on the real witness: a three-glyph run armed on
-//! row 5 with row 4 sampled per the trace's arm, walked at each frame's wall
-//! time with row 4 per the frame, then the run's own row blanked and its text
-//! standing on row 4 (the move, or the erase under a copy). The follow pass
-//! must name the run exactly where the model says the glyphs arrived
-//! (`clear == 1 && twin == 0`), and every invariant must hold. The negative
-//! control (`Buggy = 1`, a twin recorded only at arm) says arrived where the
-//! real witness refuses, for a copy that landed beside the standing line and
-//! stood 40 ms (fzf's list under its query).
+//! Every model trace up to its bound (`T = 5` units of 20 ms) is replayed: a three-glyph run
+//! armed on row 5 with row 4 sampled per the trace's arm, walked at each frame's time with row 4
+//! per the frame, then the run's row blanked and its text standing on row 4. The follow pass must
+//! name the run exactly where the model says the glyphs arrived (`clear == 1 && twin == 0`), and
+//! every invariant must hold. The negative control is `Buggy = 1`, a twin recorded only at arm.
 
 use std::time::{Duration, Instant};
 
@@ -128,7 +118,7 @@ fn modelled(model: &Model, trace: &Trace) -> std::collections::BTreeMap<&'static
     st
 }
 
-/// The REAL witness over the trace: `true` when the follow pass names the
+/// The real witness over the trace: `true` when the follow pass names the
 /// run onto the copy a row up once the run's own row is blank.
 fn real_follows(trace: &Trace) -> bool {
     let t0 = Instant::now();

@@ -1,18 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-// The question-policy texts (`long-term`, `short-term`) in the loop: the real
-// `Session` over the scripted server answering Claude Code 2.1.283's question
-// dialog by writing a policy text into its free-text row and pressing Enter on
-// it. Every key and the one `send` are fenced on the screen generation, the
-// row as drawn and the person count of the read they were decided on
-// (`if-human=`); the text is read back before any Enter; never an Enter in a
-// multi-select's field; never a text written twice; a person's text never
-// taken for the loop's own. The screens are the committed 2.1.283 captures,
-// their free-text row redrawn with this build's texts
-// (`fixtures::rewrap_free_text`). Included into `run.rs`'s test module beside
-// `run_engine_tests.rs` (`mod engine`), whose helpers and Tier-1 bind these
-// use.
+// The question-policy texts (`long-term`, `short-term`) in the loop: the real `Session` over a
+// scripted server answers Claude Code 2.1.283's question dialog by writing the policy text into
+// its free-text row, reading it back, and pressing Enter on it, every key and the `send` fenced.
+// The screens are the 2.1.283 captures with this build's texts (`fixtures::rewrap_free_text`).
+// Included into `run_tests.rs`'s `mod engine::text`, whose helpers and Tier-1 bind these use.
 
 use crate::supervise::policy::question::{LONG_TERM_TEXT, SHORT_TERM_TEXT};
 use crate::supervise::policy::{QuestionPriority, RULE_ANSWER_LONG_TERM, RULE_ANSWER_SHORT_TERM};
@@ -92,15 +85,10 @@ fn single_screens(text: &str) -> (Vec<String>, Vec<String>, Vec<String>, Vec<Str
     )
 }
 
-/// Scenario 1, a lone single-select under `long-term`: from option 1 the focus
-/// moves down twice (each seen landing), the long-term text is written into the
-/// pristine free-text row by one fenced `send` (`if-human=0 if-gen= if=<the
-/// row as drawn> -- <text>`), read back exactly, and only on the next read,
-/// the field holding it, is Enter pressed: `[down, down, text, enter]`. The
-/// ledger names `answer-long-term@v1` for the text and the Enter; the dialog
-/// is told once as `CHOSE … rule=answer-long-term@v1 policy=long-term
-/// <question → decided by the worker (long-term)>`, and the window hears
-/// `story chose long-term`.
+/// A lone single-select under `long-term`: two seen moves down, the text written into the
+/// pristine free-text row by one fenced `send`, read back exactly, and Enter pressed only on
+/// the next read. The ledger names `answer-long-term@v1` for the text and the Enter, the
+/// dialog is told once as `CHOSE …`, and the window hears `story chose long-term`.
 #[test]
 fn a_lone_single_select_is_answered_by_the_long_term_text() {
     let (opt1, opt2, free, typed) = single_screens(LONG_TERM_TEXT);
@@ -198,13 +186,10 @@ fn a_lone_single_select_is_answered_by_the_long_term_text() {
     let _ = std::fs::remove_dir_all(&ldir);
 }
 
-/// A still screen over [`Mock`] (which moves its screen on every read): the
-/// screen moves only when a `key` or `send` was written since the last read
-/// (otherwise the last reply is served again), an `await seq` runs out its
-/// whole timeout, and `await idle <ms>` sleeps `ms` first, as the real server
-/// does on a quiescent surface. From the first Enter on it is the mock's own
-/// again: what is measured is the window between the policy text and its
-/// Enter.
+/// A still screen over [`Mock`] (which moves its screen on every read): the screen moves only
+/// when a `key` or `send` was written since the last read, an `await seq` runs out its whole
+/// timeout, and `await idle <ms>` sleeps `ms` first, as the real server does on a quiescent
+/// surface. From the first Enter on it is the mock's own again.
 struct Still<'m> {
     mock: &'m mut Mock,
     /// A `key` or `send` was written since the last read.
@@ -277,14 +262,11 @@ impl Ctl for Still<'_> {
     }
 }
 
-/// The read-back decides the Enter: the policy text read back exactly, the
-/// screen having held still for the read's settle (`await idle 500`), is the
-/// read the Enter is decided on, with no second read or box settle (the typed
-/// text opens no dialog, and 500 ms still is past the vendor's 300 ms key
-/// guard). The Enter costs `status`, `meta` and the key itself, which still
-/// carries every fence (`if-human=`, `if-gen=`, `if=`), on a still screen under
-/// the real box settle. Negative control: a read-back whose settle ran out
-/// (the screen kept moving) is decided on a fresh look.
+/// The read-back decides the Enter: the text read back exactly after the screen held still for
+/// the read's settle (`await idle 500`) is the read the Enter is decided on, with no second read
+/// or box settle (the typed text opens no dialog, and 500 ms still is longer than
+/// [`BOX_SETTLE`]). The Enter costs `status`, `meta` and the fenced key. Negative control: a
+/// read-back whose settle ran out is decided on a fresh look.
 #[test]
 fn the_enter_on_a_read_back_text_costs_status_meta_and_the_key() {
     let (opt1, opt2, free, typed) = single_screens(LONG_TERM_TEXT);
@@ -416,23 +398,17 @@ fn text_model(tabs: i64, review: i64, multi: i64) -> aterm_spec::derive::Model {
     )
 }
 
-/// Tier-1 for the policy text (`SupervisorQuestionText`, `Text = 1`): the real
-/// loop over the scripted server, every read projected onto the model after
-/// the fewest environment actions explaining it, every `key` its
-/// `HarnessMove`/`HarnessEnter` and every `send` its `HarnessType`, each
-/// enabled where the loop sends it, the send carrying the generation fence,
-/// the row guard, the person fence and exactly the priority's text, and all
-/// six laws checked after every request. Three shapes:
+/// Tier-1 for the policy text (`SupervisorQuestionText`, `Text = 1`): the real loop over the
+/// scripted server, every read projected onto the model, every `key` its
+/// `HarnessMove`/`HarnessEnter` and every `send` its `HarnessType`, each enabled where sent,
+/// the send carrying the generation fence, row guard, person fence and the priority's text,
+/// and all six laws checked after every request. Shapes:
 ///
-/// 1. A lone single-select (c1, `Multi = 0`, no review) under each text
-///    priority: `↓ ↓`, the text, Enter on it, and the dialog closes.
-/// 2. A lone multi-select (c3, `Multi = 1`, its review): `↓ ↓ ↓`, the text,
-///    `↓` onto `Submit` (never an Enter in the field), Enter there, the
-///    review's Enter.
-/// 3. Negative control: a loop whose memory is seeded with the long-term text
-///    as its own, over a screen where a person typed that text and no `send`
-///    was made, presses Enter on it, and the bind catches it (a person's text
-///    is `typed`, never own).
+/// 1. A lone single-select under each text priority: `↓ ↓`, the text, Enter on it.
+/// 2. A lone multi-select with its review: `↓ ↓ ↓`, the text, `↓` onto `Submit`, Enter there,
+///    the review's Enter.
+/// 3. Negative control: a loop seeded with the long-term text as its own, over a field a
+///    person typed it into, presses Enter, and the bind catches it.
 #[test]
 fn tier1_the_policy_text_goes_only_where_the_model_allows() {
     // 1. Single-select, both priorities.
@@ -545,10 +521,8 @@ fn badge(m: &Mock) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Scenario 2, a lone multi-select: `↓ ↓ ↓`, the text (the row ticks itself),
-/// then `↓` off the field onto `Submit` and Enter there, then the review's
-/// Enter: `[down×3, text, down, enter, enter]`. Never an Enter with the focus
-/// in the field (it unticks the row), and never a Tab.
+/// A lone multi-select: the text, then `↓` off the field onto `Submit` and Enter there, then
+/// the review's Enter; never an Enter in the field (it unticks the row), never a Tab.
 #[test]
 fn a_lone_multi_select_is_typed_moved_off_and_submitted_by_its_button() {
     let mut m = texting(multi_screens(LONG_TERM_TEXT));
@@ -597,10 +571,8 @@ fn a_lone_multi_select_is_typed_moved_off_and_submitted_by_its_button() {
     );
 }
 
-/// Scenario 3, two questions and the review (c4): the single-select tab's text
-/// and its Enter, which moves on to the multi-select tab; that tab's text,
-/// `↓` onto `Next`… `Submit`, Enter; the review's Enter. Eleven writes, each
-/// text written once, the dialog told once under `long-term`.
+/// Two questions and the review: each tab's text written once, the multi-select tab moved onto
+/// its button, the review's Enter; the dialog told once under `long-term`.
 #[test]
 fn two_questions_and_their_review_are_answered_by_text_then_submitted() {
     use aterm_phase::prompt::fixtures as f;
@@ -643,11 +615,8 @@ fn two_questions_and_their_review_are_answered_by_text_then_submitted() {
     );
 }
 
-/// Scenario 4, the session's word over the global one: the window's policy
-/// answers `recommended`, this session's word is `short-term`, so the
-/// short-term text is written (`answer-short-term@v1`, `CHOSE …
-/// policy=short-term`). Negative control: unset, the global `recommended`
-/// presses the recommended option and writes nothing.
+/// The session's word `short-term` answers over the window's `recommended`. Negative control:
+/// with the word unset, the recommended option is pressed and nothing written.
 #[test]
 fn the_sessions_short_term_word_answers_over_a_global_recommended() {
     for word in [Some("short-term"), None] {
@@ -690,8 +659,8 @@ fn the_sessions_short_term_word_answers_over_a_global_recommended() {
     }
 }
 
-/// Scenario 5, a person's text in the field (c2-04, `go with blue`): nothing
-/// written or keyed; the badge says a person has begun answering.
+/// A person's text in the field (`go with blue`): nothing written or keyed; the badge says a
+/// person has begun answering.
 #[test]
 fn a_persons_text_in_the_field_is_theirs_under_a_text_priority() {
     use aterm_phase::prompt::fixtures as f;
@@ -703,8 +672,7 @@ fn a_persons_text_in_the_field_is_theirs_under_a_text_priority() {
     assert!(badge.contains("a person has begun answering"), "{badge}");
 }
 
-/// Scenario 6, the text reads back short twice (after the worker's reaction
-/// and after the screen held still): one `send`, no Enter, handed over.
+/// A text that reads back short twice: one `send`, no Enter, handed over.
 #[test]
 fn a_text_that_reads_back_short_twice_is_handed_over_never_written_again() {
     use aterm_phase::prompt::fixtures as f;
@@ -737,10 +705,9 @@ fn a_text_that_reads_back_short_twice_is_handed_over_never_written_again() {
     );
 }
 
-/// Scenario 7, the text disappears after reading back exactly: the Enter,
-/// fenced on the read-back's generation, meets the moved screen and is skipped
-/// (`reason=changed`); the next read shows the text gone. Handed over; no
-/// second `send`, no Enter written.
+/// A text that disappears after reading back exactly: the Enter, fenced on the read-back's
+/// generation, is skipped `reason=changed`, and the dialog is handed over with no second
+/// `send`.
 #[test]
 fn a_text_that_disappears_after_it_read_back_is_handed_over_never_rewritten() {
     let (_, _, free, typed) = single_screens(LONG_TERM_TEXT);
@@ -795,9 +762,30 @@ fn a_text_that_disappears_after_it_read_back_is_handed_over_never_rewritten() {
     );
 }
 
-/// Scenario 8, the text never shows: the field stays empty after the worker's
-/// reaction and after the screen held still. One `send`, no Enter, handed
-/// over: a text is never written twice.
+/// A question whose dialog went with no answer of the loop's (a person's Esc after its text)
+/// and is asked again is a new dialog: its pristine field is written afresh, never handed over
+/// as the text gone.
+#[test]
+fn a_question_asked_again_after_its_dialog_went_is_written_afresh() {
+    let (_, _, free, typed) = single_screens(LONG_TERM_TEXT);
+    let mut m = texting(vec![
+        free.clone(),
+        typed.clone(),
+        free,
+        typed,
+        busy_screen(),
+        idle_screen(),
+    ]);
+    // A person's Esc between the read-back and the loop's Enter.
+    m.swap_at_key = Some(idle_screen());
+    m.vanish_after = Some(1);
+    let _ = hosted_run(&mut m, &hosted_by(LONG), None);
+    assert_eq!(badge(&m), None, "never handed over: {:#?}", m.requests);
+    assert_eq!(sends(&m).len(), 2, "{:#?}", m.requests);
+}
+
+/// A text the field never shows (after the worker's reaction and after the screen held still):
+/// one `send`, no Enter, handed over.
 #[test]
 fn a_text_the_dialog_never_took_is_handed_over_never_written_twice() {
     let (_, _, free, _) = single_screens(LONG_TERM_TEXT);
@@ -834,12 +822,10 @@ fn a_text_the_dialog_never_took_is_handed_over_never_written_twice() {
     );
 }
 
-/// Scenario 9, a window that cannot fence a typed answer: `help send` naming
-/// no `if-gen=`, reads without a person count (`"human_seq"`), or no person
-/// stamp. The whole dialog is answered with its recommended option (Enter on
-/// `Red (Recommended)`, nothing sent), ledgered under the word's rule with the
-/// fallback said: `(recommended: this window cannot fence a typed answer: no
-/// …)`. Negative control: a window naming every fence writes the text.
+/// A window that cannot fence a typed answer (no `send if-gen=`, no person count, or no person
+/// stamp) gets the recommended option, ledgered under the word's rule with the fallback said
+/// (`(recommended: this window cannot fence a typed answer: no …)`). Negative control: a
+/// window naming every fence writes the text.
 #[test]
 fn a_window_that_cannot_fence_a_typed_answer_gets_the_recommended_option_said() {
     use aterm_phase::prompt::fixtures as f;
@@ -923,11 +909,9 @@ fn a_window_that_cannot_fence_a_typed_answer_gets_the_recommended_option_said() 
     assert_eq!(sends(&m).len(), 1, "{:#?}", m.requests);
 }
 
-/// Scenario 10, a person at the send: every read said nobody keyed, but the
-/// server's person count moved past the read's, so `send if-human=0 …` answers
-/// `OK skipped reason=person`, nothing written or remembered. The loop yields
-/// (never hands over), waits out the person's quiet, and writes the text once,
-/// fenced on the new count (`if-human=1`), then presses Enter on it.
+/// A person the server sees at the send (its person count moved past the read's): `send
+/// if-human=0` is skipped `reason=person`, and the loop yields, waits out their quiet, and
+/// writes the text once on the new count (`if-human=1`), then presses Enter.
 #[test]
 fn a_person_the_server_sees_at_the_send_gets_the_question_first_then_one_text() {
     let (opt1, opt2, free, typed) = single_screens(LONG_TERM_TEXT);
@@ -971,14 +955,11 @@ fn a_person_the_server_sees_at_the_send_gets_the_question_first_then_one_text() 
     let _ = std::fs::remove_dir_all(&ldir);
 }
 
-/// Tier-1 for the person fence on the text: a person keys between the loop's
-/// read and its policy text (no read shows it, but the count moved), and
-/// `send if-human=0 …` is skipped `reason=person`. Bound to
-/// `SupervisorQuestionText` (`Text = 1`): the skipped send is the model's
-/// `PersonKey`, after which no `HarnessType` or key is enabled; the loop reads
-/// again and writes the text once on the new count, then presses Enter.
-/// Negative control: without the fence (`PersonFence = 0`) the model enables
-/// the text the server refused.
+/// Tier-1 for the person fence on the text: a person keys between the loop's read and its
+/// `send`, which is skipped `reason=person` (the model's `PersonKey`, after which no
+/// `HarnessType` or key is enabled); the loop reads again and writes the text once on the new
+/// count. Negative control: without the fence (`PersonFence = 0`) the model enables the text
+/// the server refused.
 #[test]
 fn a_persons_key_between_the_read_and_the_send_skips_the_policy_text() {
     let (opt1, opt2, free, typed) = single_screens(LONG_TERM_TEXT);
@@ -1017,10 +998,8 @@ fn a_persons_key_between_the_read_and_the_send_skips_the_policy_text() {
     );
 }
 
-/// Scenario 11, the word changes after the first key: keyed under `long-term`,
-/// the word reads `recommended` when the Enter is decided, and the latch hands
-/// it over, no Enter. Negative control: a change before the loop's first key
-/// simply applies (the recommended option is pressed, nothing written).
+/// A word changed after the loop's first key on a dialog hands it over, no Enter. Negative
+/// control: a change before the first key simply applies.
 #[test]
 fn a_word_changed_after_the_first_key_hands_the_dialog_over() {
     let (opt1, opt2, free, typed) = single_screens(LONG_TERM_TEXT);
@@ -1057,8 +1036,7 @@ fn a_word_changed_after_the_first_key_hands_the_dialog_over() {
     assert_eq!(m.writes(), ["enter"], "{:#?}", m.requests);
 }
 
-/// Scenario 12, an unknown stored word (a later build's): the dialog is the
-/// person's and the badge names the word; nothing written or keyed.
+/// An unknown stored word (a later build's) hands the dialog over, the badge naming the word.
 #[test]
 fn an_unknown_session_word_hands_the_dialog_over_under_a_text_global() {
     let (opt1, ..) = single_screens(LONG_TERM_TEXT);
@@ -1076,9 +1054,8 @@ fn an_unknown_session_word_hands_the_dialog_over_under_a_text_global() {
     );
 }
 
-/// Scenario 13, a preview under `long-term` (c11-01): no free-text row, so the
-/// recommended option is pressed, told under the word's rule with the
-/// fallback in its subject and `policy=recommended`.
+/// A preview under `long-term` has no free-text row: its recommended option is pressed, told
+/// under the word's rule with the fallback in its subject and `policy=recommended`.
 #[test]
 fn a_preview_under_long_term_is_answered_with_its_recommended_option_and_told_so() {
     use aterm_phase::prompt::fixtures as f;
@@ -1107,10 +1084,8 @@ fn a_preview_under_long_term_is_answered_with_its_recommended_option_and_told_so
     );
 }
 
-/// Scenario 14, a fresh supervisor over a typed field (restart or claim
-/// handover, memory lost): the field holds the policy text exactly and no
-/// `send` of this loop wrote it, so it is a person's as far as it knows.
-/// Handed over; no key.
+/// A fresh supervisor (memory lost) over a field holding the policy text no `send` of its own
+/// wrote takes it for a person's: handed over, no key.
 #[test]
 fn a_fresh_supervisor_over_a_typed_field_hands_it_over_without_a_key() {
     let (_, _, _, typed) = single_screens(LONG_TERM_TEXT);
@@ -1125,24 +1100,11 @@ fn a_fresh_supervisor_over_a_typed_field_hands_it_over_without_a_key() {
     );
 }
 
-/// Scenario 15, a person's input after the text, then their quiet, the field
-/// intact: the loop waits their quiet out and, the text still exactly its own,
-/// presses Enter on it, but the dialog's end is the person's: no `CHOSE`, no
-/// `story chose`, no `chose (` note. Three ways their input reaches the loop,
-/// each after the text was written:
-///
-/// * the read-back's own stamp, with a `status` naming no person (a host
-///   publishing no `human_ms=`): held by the question's wait;
-/// * the read-back and the `status` made for its decision, answered from one
-///   stamp as the real server does: held for the person (`HELD`) before the
-///   question's wait is reached;
-/// * the `status` alone (their gesture landed between read-back and
-///   `status`): held for the person too.
-///
-/// Held for the person, the loop looks again once the hold is over, and that
-/// look finds their grace over (the person typed just now, [`TYPED_NOW`]);
-/// the loop is stopped at the worker's first busy read, where a choice is
-/// told. Negative control (scenario 1): no person, one `CHOSE`.
+/// A person's input after the text, then their quiet, the field intact: the loop presses
+/// Enter on its own text, but the dialog's end is the person's: no `CHOSE`, no `story chose`,
+/// no `chose (` note. Their input reaches the loop through the read-back's stamp, the read-back
+/// and its `status` together, or the `status` alone. Negative control:
+/// `a_lone_single_select_is_answered_by_the_long_term_text`.
 #[test]
 fn a_persons_input_after_the_text_leaves_the_enter_but_not_the_told_choice() {
     let (opt1, opt2, free, typed) = single_screens(LONG_TERM_TEXT);
@@ -1254,10 +1216,8 @@ fn a_persons_input_after_the_text_leaves_the_enter_but_not_the_told_choice() {
     }
 }
 
-/// Scenario 16, the loop's own text reads unticked (as a person's Enter in the
-/// field would leave it) between the exact read-back and the move off the
-/// field: that move, fenced on the read-back, is skipped, and the next read
-/// shows the text unticked. Handed over, no Enter.
+/// The loop's own text read unticked between the exact read-back and the move off the field:
+/// that move, fenced on the read-back, is skipped, and the dialog is handed over, no Enter.
 #[test]
 fn the_loops_own_text_unticked_on_a_multi_select_is_handed_over() {
     let mut screens = multi_screens(LONG_TERM_TEXT);
@@ -1292,8 +1252,8 @@ fn the_loops_own_text_unticked_on_a_multi_select_is_handed_over() {
     );
 }
 
-/// Scenario 17, a checked option on a multi-select under a text priority: a
-/// text answer toggles none, so the check is a person's. Handed over.
+/// A checked option on a multi-select under a text priority is a person's (a text answer
+/// toggles none): handed over.
 #[test]
 fn a_checked_option_hands_a_multi_select_over_under_a_text_priority() {
     let screens = multi_screens(LONG_TERM_TEXT);
@@ -1312,9 +1272,8 @@ fn a_checked_option_hands_a_multi_select_over_under_a_text_priority() {
     );
 }
 
-/// Scenario 18, a pane too short for the text: the text's growth would cut the
-/// dialog's head off, so that tab is answered with its recommended option
-/// (`↑ ↑` from the free-text row, Enter on `Red (Recommended)`), and told so.
+/// A pane too short for the text (its growth would cut the dialog's head off): that tab is
+/// answered with its recommended option (`↑ ↑`, Enter on `Red (Recommended)`), and told so.
 #[test]
 fn a_tab_too_short_for_the_text_falls_back_to_its_recommended_option() {
     let (opt1, opt2, free, _) = single_screens(LONG_TERM_TEXT);
@@ -1348,21 +1307,12 @@ fn a_tab_too_short_for_the_text_falls_back_to_its_recommended_option() {
     );
 }
 
-/// THE MEMORY IS RECORDED WHEN THE TEXT MAY HAVE BEEN WRITTEN (§7): a
-/// `send` answered with a partial write (`ERR write failed partial …`), or
-/// with no answer at all (the connection lost), is handed over or ridden
-/// out — and the question is remembered as holding the loop's text, so the
-/// next decision on it, the field reading empty, hands it over as the text
-/// GONE instead of writing it again; after a lost answer, the box read back
-/// exactly as it was written into (the text never taken) is handed over as
-/// such. A text the server did NOT write (`ERR busy sink`: zero bytes) is
-/// not remembered: written once the sink clears. Each run's `send` count is
-/// the proof: one, one, one, two.
-///
-/// The next decision after the partial write comes after an outage, as the
-/// lost answer's does: the dialog handed over is the same point however its
-/// focus moves (the review key holds across a moved focus), and an
-/// outage is what makes the point still showing a new one.
+/// The memory is recorded when the text may have been written: after a partial write or a lost
+/// answer the question is remembered as holding the loop's text, so the next decision hands it
+/// over (the text gone, or never taken) instead of writing it again. A text the server did not
+/// write (`ERR busy sink`) is not remembered and is written once the sink clears. Sends: one,
+/// one, one, two. The decision after the partial write comes after an outage, which is what
+/// makes the dialog still showing a new point.
 #[test]
 fn a_text_in_doubt_is_remembered_and_never_written_again_one_not_written_is_not() {
     let (opt1, _, free, typed) = single_screens(LONG_TERM_TEXT);
@@ -1431,14 +1381,10 @@ fn a_text_in_doubt_is_remembered_and_never_written_again_one_not_written_is_not(
     }
 }
 
-/// The Enter goes on the field as decided: the free-text row's text and tick
-/// must read as the decision read them on the read the Enter is fenced on. On
-/// a host that stamps no person (and so cannot fence a typed answer, so the
-/// long-term word answers with the recommended option), a person's text
-/// appearing in the field while the focus moves to the recommended option
-/// means no Enter: handed over. Negative control: with the field left as it
-/// was, the same moves end in the Enter
-/// (`the_free_text_row_is_left_by_arrows_then_enter_never_a_digit`'s shape).
+/// The Enter goes on the field as decided: on a host that stamps no person (so long-term
+/// answers with the recommended option), a person's text appearing in the field while the
+/// focus moves means no Enter, handed over. Negative control: the field left as it was, the
+/// same moves end in the Enter.
 #[test]
 fn an_enter_never_goes_after_the_field_changed_under_the_moves() {
     use aterm_phase::prompt::fixtures as f;
@@ -1514,14 +1460,10 @@ fn a_multi_select_text_that_reads_back_unticked_is_handed_over_at_once() {
     );
 }
 
-/// Before the text (the re-ask pause): the model asks the same question
-/// again after each answer with no review between. Its first two returns are
-/// answered (the text, then the Enter), and at the third the loop waits the
-/// re-ask pause (`WAITING … the same question came back after 2 answers …
-/// re-asking it`) before any key of the answer, so no move or text is written
-/// through the pause. Here the session ends during the pause, so nothing of a
-/// third answer is written. Never handed over. Single- and multi-select. The
-/// text and its Enter on one dialog are one answer: the pause counts answers.
+/// The re-ask pause comes before the text: the same question asked a third time after two
+/// answers (the text and its Enter are one answer) waits the pause before any key, so nothing
+/// of a third answer is written while the session ends in the pause. Never handed over.
+/// Single- and multi-select.
 #[test]
 fn a_question_asked_a_third_time_under_a_text_word_waits_its_pause_before_its_text() {
     let (opt1, opt2, free, typed) = single_screens(LONG_TERM_TEXT);
@@ -1580,13 +1522,11 @@ fn a_question_asked_a_third_time_under_a_text_word_waits_its_pause_before_its_te
     }
 }
 
-/// A recommended fallback begun is finished: a multi-select whose text is
-/// estimated not to fit is answered with its recommended option (Cheese
-/// toggled), and the pane then has room on the next read. The fit is not
-/// estimated again under the loop's own toggle: the tab stays on its
-/// recommended path (four moves onto `Submit`, Enter, the review's Enter) and
-/// is never handed over for the check the loop made itself. (A check the loop
-/// did not make is a person's: scenario 17.)
+/// A recommended fallback begun is finished: a multi-select whose text is estimated not to fit
+/// is answered with its recommended option (Cheese toggled), and when the pane then has room
+/// the fit is not estimated again under the loop's own toggle: the tab stays on its
+/// recommended path and is never handed over for the check the loop made itself (a check it
+/// did not make is a person's: `a_checked_option_hands_a_multi_select_over_under_a_text_priority`).
 #[test]
 fn a_fallback_begun_on_a_tight_pane_is_finished_when_the_pane_grows() {
     use aterm_phase::prompt::fixtures as f;
@@ -1683,7 +1623,7 @@ fn the_fit_is_measured_against_the_pane_not_the_tail_read() {
             38,
             "PRECONDITION: a dialog 38 rows tall: {tail:#?}"
         );
-        // The text typed, the dialog grown UPWARD in the same pane (c3-04 to
+        // The text typed, the dialog grown upward in the same pane (c3-04 to
         // c3-05): its rows above scroll off the top.
         let top = free
             .iter()
@@ -1729,15 +1669,10 @@ fn the_fit_is_measured_against_the_pane_not_the_tail_read() {
     }
 }
 
-/// A controller's option over text in the field (`aterm drive answer`): the
-/// ownership rule is for an Enter that submits a policy text (on the field,
-/// or a multi-select's button after it), never an Enter on a single-select's
-/// option, which submits none. `answer @w 3` over a person's `2` in the field
-/// moves the focus up and presses Enter on `3. High contrast`; `1` over
-/// c2-04's `go with blue` moves up twice and presses Enter on
-/// `1. Red (Recommended)`. A multi-select's button would send the field's
-/// text with the options (a free-text answer, never a controller's), so that
-/// answer is refused before any key: nothing moved, toggled or sent.
+/// A controller's option over text in the field (`aterm drive answer`): an Enter on a
+/// single-select's option submits no text, so it is pressed over a person's text; a
+/// multi-select's button would send the field's text with the options, so that answer is
+/// refused before any key.
 #[test]
 fn a_controllers_option_over_text_in_the_field_is_pressed_and_a_multi_selects_is_refused_first() {
     use aterm_phase::prompt::fixtures as f;
@@ -1799,19 +1734,12 @@ fn dialog_only(rows: &[String]) -> Vec<String> {
     rows[top..=last].to_vec()
 }
 
-/// Tier-1 for a tab that falls back (`SupervisorQuestionText`, `Text = 1`,
-/// each tab its own route): the real loop under `long-term`, bound request by
-/// request as `tier1_the_policy_text_goes_only_where_the_model_allows`, where a
-/// tab is answered with its recommended option because the text would not fit
-/// (the model's `FitLostOnIt` / `FitLostOffIt`). Two shapes:
-///
-/// 1. A lone single-select too short for the text (scenario 18): `↑ ↑` from
-///    the free-text row, Enter on `Red (Recommended)`, the dialog closed,
-///    nothing written.
-/// 2. A dialog of a typed tab and a fallback tab (c4, `Multi = 0`,
-///    `Tabs = 3`): the single-select tab's text and its Enter; the
-///    multi-select tab, too short for the text, its recommended Cheese
-///    toggled, `↓` four times onto `Submit`, Enter; the review's Enter.
+/// Tier-1 for a tab that falls back (`SupervisorQuestionText`, `Text = 1`, the model's
+/// `FitLostOnIt` / `FitLostOffIt`): the real loop under `long-term`, bound as
+/// `tier1_the_policy_text_goes_only_where_the_model_allows`, over a lone single-select too
+/// short for the text (`↑ ↑`, Enter on `Red (Recommended)`, nothing written) and a dialog of a
+/// typed tab then a multi-select tab too short for it (its recommended Cheese toggled, `↓`
+/// four times onto `Submit`, Enter, the review's Enter).
 #[test]
 fn tier1_a_tab_that_falls_back_goes_only_where_the_model_allows() {
     use aterm_phase::prompt::fixtures as f;
@@ -1880,4 +1808,219 @@ fn tier1_a_tab_that_falls_back_goes_only_where_the_model_allows() {
         "one text, on the typed tab: {:#?}",
         m.requests
     );
+}
+
+// ---- Codex's question: the text as a note under `None of the above` --------
+
+/// A Codex 0.163.0 question capture's rows as a `tail=40` read serves them:
+/// its last 40. Whole, the 50-row capture's blank gap sends each read to a
+/// second, whole read, which a script answers with its NEXT screen.
+fn cx(text: &str) -> Vec<String> {
+    let rows = aterm_phase::prompt::fixtures::screen(text);
+    rows[rows.len().saturating_sub(40)..].to_vec()
+}
+
+/// The measured question with its `›` cursor on answer `n` (`  › N.`), the
+/// rest at the answers' column.
+fn codex_focus(rows: &[String], n: u8) -> Vec<String> {
+    let want = format!("{n}. ");
+    rows.iter()
+        .map(|r| match r.strip_prefix("  › ") {
+            Some(rest) if rest.starts_with(|c: char| c.is_ascii_digit()) => format!("    {rest}"),
+            _ => match r.strip_prefix("    ") {
+                Some(rest) if rest.starts_with(&want) => format!("  › {rest}"),
+                _ => r.clone(),
+            },
+        })
+        .collect()
+}
+
+/// `rows` (the notes field open) with the field holding `text` on one row.
+fn codex_noted(rows: &[String], text: &str) -> Vec<String> {
+    let mut out = rows.to_vec();
+    let at = out
+        .iter()
+        .rposition(|r| r.as_str() == "  › Add notes")
+        .expect("the empty notes field");
+    out[at] = format!("  › {text}");
+    out
+}
+
+/// A scripted Codex host for the note: every fence a typed answer rests on.
+fn codex_texting(screens: Vec<Vec<String>>) -> Mock {
+    let mut m = texting(screens);
+    m.program = "codex";
+    m
+}
+
+/// The hosted loop over `m` under `opts`, its ledger at `ledger`.
+fn codex_hosted(m: &mut Mock, opts: &SuperviseOpts, ledger: &Path) {
+    let mut out: Vec<u8> = Vec::new();
+    let mut s = session(m, None);
+    s.set_approval_env(owner_env());
+    s.set_approval_ledger(Some(ledger.to_path_buf()));
+    s.set_clock(TEST_NOW, PDT);
+    s.set_zone_lookup(test_zones);
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _ = s.run_hosted(opts, stop, &mut out);
+}
+
+/// CODEX'S QUESTION UNDER `long-term` (gap #11, measured on 0.163.0): the
+/// loop moves the focus from the recommended answer onto `None of the
+/// above` with two ARROWS (never its digit, which would answer at once),
+/// presses Tab there, writes the long-term text into the empty notes field
+/// with one fenced `send` guarded on `  › Add notes`, and presses Enter only
+/// on the next read, the field holding exactly that text: `[down, down, tab,
+/// text, enter]`, every key `key if-human=0 if-gen=…`, ledgered under
+/// `answer-long-term@v1`. NEGATIVE CONTROLS: under `recommended` the same
+/// question is answered by its recommended digit alone; and where the read
+/// after the text shows the field holding other words, no Enter is pressed
+/// and the question is handed over.
+#[test]
+fn a_codex_question_is_answered_by_a_note_under_none_of_the_above() {
+    use aterm_phase::codex::fixtures as f;
+    let dialog = cx(f::QUESTION_0_163);
+    let open = cx(f::QUESTION_NOTES_OPEN_0_163);
+    let screens = |last: Vec<String>| {
+        vec![
+            dialog.clone(),
+            codex_focus(&dialog, 2),
+            cx(f::QUESTION_NONE_FOCUSED_0_163),
+            open.clone(),
+            last,
+            cx(f::QUESTION_NOTES_SUBMITTED_0_163),
+        ]
+    };
+    let (ldir, ledger) = ledger_file("codex-note");
+    let mut m = codex_texting(screens(codex_noted(&open, LONG_TERM_TEXT)));
+    m.vanish_after = Some(1);
+    codex_hosted(&mut m, &hosted_by(LONG), &ledger);
+    assert_eq!(
+        m.writes(),
+        [
+            "down".to_string(),
+            "down".to_string(),
+            "tab".to_string(),
+            format!("text:{LONG_TERM_TEXT}"),
+            "enter".to_string()
+        ],
+        "{:#?}",
+        m.requests
+    );
+    for p in m.presses() {
+        assert!(p.starts_with("key if-human=0 if-gen=1."), "{p}");
+    }
+    let send = sends(&m)[0].clone();
+    assert!(
+        send.starts_with("send if-human=0 if-gen=1.")
+            && send.contains(&format!(" if={} -- ", guarded("  › Add notes"))),
+        "{send}"
+    );
+    let rows = ledger_rows(&ledger);
+    assert!(
+        rows.iter().any(|r| {
+            r.contains(&format!("\"rule_id\":\"{RULE_ANSWER_LONG_TERM}\""))
+                && r.contains("\"decision\":\"approved\"")
+        }),
+        "{rows:#?}"
+    );
+    let _ = std::fs::remove_dir_all(&ldir);
+
+    // The control: `recommended` presses the recommended answer's digit.
+    let (ldir, ledger) = ledger_file("codex-note-recommended");
+    let mut m = codex_texting(vec![dialog.clone(), cx(f::QUESTION_NOTES_SUBMITTED_0_163)]);
+    m.vanish_after = Some(1);
+    codex_hosted(&mut m, &hosted_by(QuestionPriority::Recommended), &ledger);
+    assert_eq!(m.writes(), ["1".to_string()], "{:#?}", m.requests);
+    let _ = std::fs::remove_dir_all(&ldir);
+
+    // The control: the field reads other words after the text: no Enter.
+    let (ldir, ledger) = ledger_file("codex-note-other");
+    let mut m = codex_texting(screens(codex_noted(&open, "a person's own words")));
+    m.vanish_after = Some(1);
+    codex_hosted(&mut m, &hosted_by(LONG), &ledger);
+    let writes = m.writes();
+    assert_eq!(
+        writes,
+        [
+            "down".to_string(),
+            "down".to_string(),
+            "tab".to_string(),
+            format!("text:{LONG_TERM_TEXT}"),
+        ],
+        "{:#?}",
+        m.requests
+    );
+    let _ = std::fs::remove_dir_all(&ldir);
+}
+
+/// CODEX'S QUESTION WHOSE NOTES FIELD NEVER READS OPEN FALLS BACK TO ITS
+/// RECOMMENDED ANSWER (gap #11): the loop's Tab on `None of the above` is
+/// waited on, and when no read shows the field open, the question's fallback
+/// is latched (`QuestionMemory::fell_back`, `NOTES_UNREAD`) and it is
+/// decided again — its recommended answer's digit, ledgered under the word's
+/// rule with the fallback said (`(recommended: its notes field did not read
+/// open after Tab)`). Never a second Tab, never the text. NEGATIVE CONTROL:
+/// the same script whose Tab does open the field writes the text and no
+/// digit.
+#[test]
+fn a_codex_question_whose_notes_never_open_falls_back_to_its_recommended_answer() {
+    use crate::supervise::policy::question::NOTES_UNREAD;
+    use aterm_phase::codex::fixtures as f;
+    let dialog = cx(f::QUESTION_0_163);
+    let focused = cx(f::QUESTION_NONE_FOCUSED_0_163);
+    let submitted = cx(f::QUESTION_DIGIT_SUBMITS_0_163);
+    let (ldir, ledger) = ledger_file("codex-note-unread");
+    // `None of the above` stands, its field closed, until a fourth key (the
+    // two arrows and the Tab are three) reaches the dialog.
+    let mut m = codex_texting(vec![
+        dialog.clone(),
+        codex_focus(&dialog, 2),
+        focused.clone(),
+        submitted.clone(),
+    ]);
+    m.key_gates = vec![(2, 3)];
+    m.vanish_after = Some(1);
+    codex_hosted(&mut m, &hosted_by(LONG), &ledger);
+    assert_eq!(
+        m.writes(),
+        [
+            "down".to_string(),
+            "down".to_string(),
+            "tab".to_string(),
+            "1".to_string()
+        ],
+        "{:#?}",
+        m.requests
+    );
+    let rows = ledger_rows(&ledger);
+    assert!(
+        rows.iter().any(|r| {
+            r.contains(&format!("\"rule_id\":\"{RULE_ANSWER_LONG_TERM}\""))
+                && r.contains("\"decision\":\"approved\"")
+                && r.contains(&format!("(recommended: {NOTES_UNREAD})"))
+        }),
+        "{rows:#?}"
+    );
+    let _ = std::fs::remove_dir_all(&ldir);
+
+    // The control: the Tab opens the field, and the text goes in.
+    let (ldir, ledger) = ledger_file("codex-note-read");
+    let open = cx(f::QUESTION_NOTES_OPEN_0_163);
+    let mut m = codex_texting(vec![
+        dialog.clone(),
+        codex_focus(&dialog, 2),
+        focused,
+        open.clone(),
+        codex_noted(&open, LONG_TERM_TEXT),
+        cx(f::QUESTION_NOTES_SUBMITTED_0_163),
+    ]);
+    m.vanish_after = Some(1);
+    codex_hosted(&mut m, &hosted_by(LONG), &ledger);
+    let writes = m.writes();
+    assert!(
+        writes.contains(&format!("text:{LONG_TERM_TEXT}")) && !writes.contains(&"1".to_string()),
+        "the control: {writes:?}"
+    );
+    let _ = std::fs::remove_dir_all(&ldir);
 }

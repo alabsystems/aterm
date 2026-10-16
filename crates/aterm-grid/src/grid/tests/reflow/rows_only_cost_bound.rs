@@ -2,26 +2,17 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Bounded-cost obligation for the rows-only resize.
-//!
-//! A rows-only resize changes no line's width, so no wrap topology moves; only
-//! the live/history boundary shifts inside the same ring, and
-//! `scrollback_lines()` counts a line the same in any tier. Evacuating the ring
-//! into the tiered store would cost O(history) under the terminal lock and
-//! strand bump-allocated `PageStore` pages.
-//!
-//! `count_rows_only_resize_migrated_rows` counts the rows a rows-only resize
-//! evacuates out of the ring. The obligation: bounded by the height delta and
-//! independent of history depth. ([`cost_bound`](super::cost_bound) covers the
-//! width rewrap.)
+//! Bounded cost of the rows-only resize. It changes no line's width, so only the live/history
+//! boundary moves inside the ring; evacuating the ring into the tiered store would cost
+//! O(history) under the terminal lock and strand bump-allocated `PageStore` pages.
+//! `count_rows_only_resize_migrated_rows` counts the rows it evacuates: bounded by the height
+//! delta, independent of history depth. `cost_bound` covers the width rewrap.
 
 use super::super::super::*;
 use crate::test_counters::take_rows_only_resize_migrated_rows;
 use aterm_scrollback::{Scrollback, ScrollbackStorage};
 
-/// A tiered grid (the GUI's `Terminal::with_scrollback(rows, cols,
-/// LIVE_SCROLLBACK_RING_LINES, Scrollback::with_defaults())` shape) whose ring
-/// holds `ring` history lines and whose store is empty.
+/// A tiered grid (the GUI's shape) whose ring holds `ring` history lines and whose store is empty.
 fn tiered_grid_with_full_ring(rows: u16, cols: u16, ring: usize) -> Grid {
     let sb: ScrollbackStorage = Scrollback::new(1000, 10_000, 100_000_000).into();
     let mut grid = Grid::with_tiered_scrollback(rows, cols, ring, sb);
@@ -41,8 +32,7 @@ fn tiered_grid_with_full_ring(rows: u16, cols: u16, ring: usize) -> Grid {
     grid
 }
 
-/// A rows-only resize evacuates at most the height delta out of the ring (the
-/// rows the shrunken retention cap can no longer hold).
+/// A rows-only resize evacuates at most the height delta out of the ring.
 #[test]
 fn rows_only_resize_migration_is_bounded_by_the_height_delta() {
     let (rows, cols) = (50u16, 200u16);
@@ -53,8 +43,7 @@ fn rows_only_resize_migration_is_bounded_by_the_height_delta() {
     grid.resize(rows - 1, cols); // one step of a window-height drag
     let migrated = take_rows_only_resize_migrated_rows();
 
-    // Budget: one viewport. The height delta is 1; a viewport of slack keeps
-    // this a bound on the SHAPE, not a brittle exact-count pin.
+    // Budget: one viewport of slack over the height delta of 1, a bound on the shape.
     let budget = usize::from(rows);
     assert!(
         migrated <= budget,
@@ -102,8 +91,7 @@ fn rows_only_grow_migrates_nothing() {
     grid.assert_invariants();
 }
 
-/// After the resize, history is still in the ring, so its rows never strand
-/// their `PageStore` pages.
+/// History stays in the ring, so its rows never strand their `PageStore` pages.
 #[test]
 fn rows_only_resize_leaves_history_in_the_ring() {
     let (rows, cols) = (50u16, 200u16);
@@ -131,10 +119,8 @@ fn rows_only_resize_leaves_history_in_the_ring() {
     grid.assert_invariants();
 }
 
-/// On a tiered grid, ring-history extras (a hyperlink on a scrolled-off line)
-/// survive a rows-only resize: the side table rides its rows.
-/// `rows_only_ring_retention::rows_only_resize_keeps_ring_history_extras`
-/// pins the ring-only shape.
+/// On a tiered grid, ring-history extras (a hyperlink on a scrolled-off line) survive a rows-only
+/// resize. `rows_only_ring_retention` pins the ring-only shape.
 #[test]
 fn rows_only_resize_keeps_tiered_ring_history_extras() {
     use std::sync::Arc;
@@ -183,9 +169,8 @@ fn rows_only_resize_keeps_tiered_ring_history_extras() {
     grid.assert_invariants();
 }
 
-/// A width resize still goes through the generic `adjust_row_count` (governed by
-/// `count_scrollback_reflow_sync_lines`); the rows-only early return does not
-/// swallow it.
+/// A width resize still takes the generic `adjust_row_count` path; the rows-only early return
+/// does not swallow it.
 #[test]
 fn width_resize_still_reflows_and_preserves_history() {
     let (rows, cols) = (10u16, 80u16);

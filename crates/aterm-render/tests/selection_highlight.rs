@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// Selection-highlight regression for the CPU renderer: cells inside the active
-// text selection are filled with `Theme::selection` INSTEAD of their own
-// background, the glyph keeps its foreground, everything outside the selection
-// is untouched, and the viewport->selection row mapping honours the grid's
-// display offset (scrollback). CPU fills are exact, so these checks use exact
-// pixel equality — this locks the highlight rule even where no GPU exists.
+// Selection highlight on the CPU renderer: selected cells take
+// `Theme::selection` instead of their own background, the glyph keeps its
+// foreground, nothing outside the selection changes, and the viewport row
+// mapping honours the display offset. CPU fills are exact, so the checks use
+// exact pixel equality.
 
 use aterm_core::selection::{SelectionSide, SelectionType};
 use aterm_core::terminal::{Terminal, TerminalBuilder};
@@ -263,8 +262,8 @@ fn wide_char_block_selection_highlights_both_halves() {
     let mut term = Terminal::new(2, 6);
     term.process("日x".as_bytes()); // 日 occupies cols 0-1, 'x' col 2
     let sel = term.text_selection_mut();
-    // Block-select ONLY column 0 — the wide lead. contains_cell must snap the
-    // highlight to whole-character boundaries: both halves light up.
+    // Block-select only column 0, the wide lead: `contains_cell` snaps the
+    // highlight to whole characters, so both halves light up.
     sel.start_selection(0, 0, SelectionSide::Left, SelectionType::Block);
     sel.update_selection(0, 0, SelectionSide::Right);
     sel.complete_selection();
@@ -333,17 +332,10 @@ fn scrolled_viewport_maps_selection_rows() {
     );
 }
 
-/// SELECTION CUSTODY Phase 2 — the PER-PANE selection colour resolution, on the CPU
-/// face, which needs no GPU adapter.
-///
-/// `per_pane_selection_colours_gpu_match_cpu` (aterm-gpu) is the differential that
-/// pins the two faces together, and it opens with `let Some(..) = backends(..) else
-/// { return; }`: on a machine with no usable wgpu adapter it reports PASS having
-/// asserted nothing, and the design's own named "highest-risk spot" — a per-entry
-/// resolution duplicated across `aterm-render` and `aterm-gpu` — is then verified
-/// nowhere in that run. This is the half that always runs. It is deliberately the
-/// SAME fixture, so a reader can see that the CPU expectations here are exactly the
-/// ones the differential holds the GPU to.
+/// Per-pane selection colour resolution on the CPU face, which needs no GPU
+/// adapter. `per_pane_selection_colours_gpu_match_cpu` (aterm-gpu) holds the
+/// GPU to the same fixture but passes vacuously with no wgpu adapter; this half
+/// always runs.
 #[test]
 fn per_pane_selection_colours_resolve_per_entry_on_the_cpu() {
     use aterm_core::render::{COLOR_UNSET, PaneSelection};
@@ -381,8 +373,7 @@ fn per_pane_selection_colours_resolve_per_entry_on_the_cpu() {
             0x00fe_dcba,
             false,
         ),
-        // Unfocused pane: no live colour at all, so it takes the theme policy —
-        // and, being unfocused, its INACTIVE derivation.
+        // Unfocused pane: no live colour, so the theme's inactive derivation.
         pane(
             9,
             16,
@@ -398,8 +389,8 @@ fn per_pane_selection_colours_resolve_per_entry_on_the_cpu() {
     let dim = aterm_render::derive_inactive_selection_bg(theme.selection, theme.bg);
     assert_ne!(live, dim, "the fixture's two bands must differ");
 
-    // THE PROPERTY: each entry resolves its OWN colour. A regression that hoists one
-    // scalar back out of the loop makes these two equal.
+    // Each entry resolves its own colour; one scalar hoisted out of the loop
+    // makes these two equal.
     assert!(
         count_eq(&cell_pixels(&frame, cw, ch, 0, 7), live) > 0,
         "the focused pane's band is its own live OSC 17 colour"
@@ -415,8 +406,8 @@ fn per_pane_selection_colours_resolve_per_entry_on_the_cpu() {
         "the divider between them takes neither band"
     );
 
-    // …and dropping the list hands the frame back to the scalar authority, which
-    // here paints nothing — proof the list is what produced those bands.
+    // …and without the list the scalar authority paints nothing here, so the
+    // list produced those bands.
     let plain = term.cell_frame(rows, cols);
     assert_ne!(frame.pixels, rend.render_input(&plain).pixels);
 }

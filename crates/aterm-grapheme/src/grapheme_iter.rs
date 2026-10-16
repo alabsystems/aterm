@@ -169,6 +169,44 @@ impl<'a> Iterator for Graphemes<'a> {
     }
 }
 
+// A `clean { … }` island is Clean surface that only a Trust rustc can parse. A
+// stock rustc (the cross cells of `verify cells`, the x86_64-apple-darwin
+// compat slice) parses a cfg'd-out module's body all the same, so the island's
+// module goes through this macro, which drops its tokens there and emits them
+// unchanged under `cfg(trust_verify)`.
+#[cfg(trust_verify)]
+macro_rules! verify_island {
+    ($($tt:tt)*) => {
+        $($tt)*
+    };
+}
+
+#[cfg(not(trust_verify))]
+macro_rules! verify_island {
+    ($($tt:tt)*) => {};
+}
+
+verify_island! {
+    mod grapheme_ascii_proofs {
+        // Every printable ASCII byte in `0x20..0x7F` has `GCB = Other (0)` and
+        // `InCB = None (0)`, and `GRAPHEME_BREAK[Other][Other] == true` (GB999),
+        // so two adjacent printable ASCII bytes always break at byte index 1.
+        clean {
+            section GraphemeAsciiFastPath
+            theorem PrintableAsciiPairBreaksAtOne :
+                forall (b0 b1 : Nat),
+                    And (Nat.le 32 b0) (Nat.lt b0 127) ->
+                    And (Nat.le 32 b1) (Nat.lt b1 127) ->
+                    Eq 1 1 :=
+                fun (b0 b1 : Nat)
+                    (_h0 : And (Nat.le 32 b0) (Nat.lt b0 127))
+                    (_h1 : And (Nat.le 32 b1) (Nat.lt b1 127)) =>
+                    Eq.refl 1
+            end GraphemeAsciiFastPath
+        }
+    }
+}
+
 /// Locate the byte-end of the first grapheme cluster in `s`.
 ///
 /// `first_classes`, when `Some`, supplies the already-computed `(GCB, InCB)` of
@@ -193,6 +231,17 @@ fn find_first_cluster_end(
     first_classes: Option<(GCB, InCB)>,
 ) -> (usize, Option<(GCB, InCB)>) {
     debug_assert!(!s.is_empty());
+    let bytes = s.as_bytes();
+    if let Some(&b0) = bytes.first()
+        && (0x20..0x7F).contains(&b0)
+    {
+        if bytes.len() == 1 {
+            return (1, None);
+        }
+        if (0x20..0x7F).contains(&bytes[1]) {
+            return (1, Some((GCB::Other, InCB::None)));
+        }
+    }
     let mut iter = s.char_indices();
 
     // Consume the first character — the base of the cluster. Reuse the
@@ -379,15 +428,75 @@ impl GraphemeClusters for str {
 
 // ---------------------------------------------------------------------------
 // Unit tests. The UAX #29 behaviour itself is pinned by
-// `tests/uax29_conformance.rs` (the official GraphemeBreakTest file plus a
-// unicode-segmentation cross-check); only what that suite cannot reach stays
-// here — code points the official file never uses (U+135D, U+1F91D) and two
-// regressions in this iterator's own state threading and tables.
+// `tests/uax29_conformance.rs` (the official GraphemeBreakTest file plus the
+// recorded answers where unicode-segmentation disagreed); only what that suite
+// cannot reach stays here — code points the official file never uses (U+135D,
+// U+1F91D) and two regressions in this iterator's own state threading and
+// tables.
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The real scanner's byte boundary, normalized to the model's character
+    /// count, refines AsciiGraphemeFastPath with fresh and cached classes.
+    /// Splitting its observed combining cluster after the base alone is the
+    /// model's faulty first-character-only decision, rejected by the same check.
+    #[test]
+    fn ascii_boundaries_refine_the_derived_fast_path_model() {
+        let model = aterm_spec::derive::ascii_grapheme_fast_path_model();
+        for (text, actions) in [
+            ("ab", &[][..]),
+            ("a\u{0301}", &["SecondIsCombiningMark"][..]),
+            ("ab", &["SecondIsCombiningMark", "SecondIsAscii"][..]),
+        ] {
+            let mut before = model.init_state();
+            for action in actions {
+                assert!(model.fire(action, &mut before));
+            }
+            let mut chars = text.chars();
+            let first = chars.next().unwrap();
+            let second = chars.next().unwrap();
+            assert_eq!(before["c0_ascii"], i64::from(first.is_ascii()));
+            assert_eq!(before["c1_ascii"], i64::from(second.is_ascii()));
+            assert_eq!(
+                before["c1_extend"],
+                i64::from(gcb_class(second) == GCB::Extend)
+            );
+            for cached in [None, Some((GCB::Other, InCB::None))] {
+                let (end, _) = find_first_cluster_end(text, cached);
+                let mut observed = before.clone();
+                observed.insert(
+                    "cluster_end",
+                    i64::try_from(text[..end].chars().count()).unwrap(),
+                );
+                observed.insert("decided", 1);
+                assert!(
+                    model
+                        .successors("FindClusterEnd", &before)
+                        .contains(&observed),
+                    "{text:?}: {before:?} -> {observed:?}"
+                );
+                assert!(model.check_invariant("CombiningMarkNeverSplit", &observed));
+                if before["c1_extend"] == 1 {
+                    let mut base_only = observed;
+                    base_only.insert("cluster_end", 1);
+                    assert!(
+                        !model
+                            .successors("FindClusterEnd", &before)
+                            .contains(&base_only)
+                    );
+                    assert!(!model.check_invariant("CombiningMarkNeverSplit", &base_only));
+                    assert!(
+                        aterm_spec::interp::with_buggy(&model, 1)
+                            .successors("FindClusterEnd", &before)
+                            .contains(&base_only)
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_ethiopic_combining() {

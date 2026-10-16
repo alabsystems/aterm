@@ -5,32 +5,31 @@
 //! wall-clock [`SystemTime`] over `Date.now()`.
 //!
 //! The wasm cells only type-check this module, so it is also compiled into the
-//! native test build: everything except the two JS bindings and the `now()`
-//! calls that use them is target-independent, and the `tests` below drive the
-//! same arithmetic the browser runs.
+//! native test build: everything except the two clock symbols and the `now()`
+//! calls that read them is target-independent, and the `tests` below drive the
+//! same arithmetic the browser runs. `verify wasm-smoke` reads both clocks
+//! through a real wasm module under node.
 
 use core::ops::{Add, AddAssign, Sub, SubAssign};
 use core::time::Duration;
 
-/// The browser's two clock functions, as bare bindings rather than through
-/// `js-sys`/`web-sys`. `js_namespace` resolves the global at call time, so one
-/// build works in a window, a worker and a worklet.
+/// The browser's two clock functions. This crate binds no JS: they are
+/// link-time symbols the wasm module defines with [`crate::wasm_clock_host!`]
+/// from its own bindings, so the crate has no dependency. The signatures live
+/// in that macro and here, and nowhere else.
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 mod js {
-    use wasm_bindgen::prelude::wasm_bindgen;
-
-    // `#[wasm_bindgen]` turns this foreign block into safe wrappers.
-    #[wasm_bindgen]
+    // Plain `f64` returns: no pointer, no invariant for the caller to uphold.
     unsafe extern "C" {
         /// `performance.now()`: milliseconds since the document's time origin,
         /// monotonic, sub-millisecond where the embedder allows it.
-        #[wasm_bindgen(js_namespace = performance, js_name = now)]
-        pub fn performance_now() -> f64;
+        #[link_name = "aterm_wasm_performance_now"]
+        pub safe fn performance_now() -> f64;
 
         /// `Date.now()`: integer milliseconds since the Unix epoch, wall clock,
         /// free to jump when the host's clock is corrected.
-        #[wasm_bindgen(js_namespace = Date, js_name = now)]
-        pub fn date_now() -> f64;
+        #[link_name = "aterm_wasm_date_now"]
+        pub safe fn date_now() -> f64;
     }
 }
 

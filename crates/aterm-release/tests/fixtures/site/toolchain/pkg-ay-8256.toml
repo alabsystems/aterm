@@ -1,0 +1,23 @@
+schema = 2
+program = "ay"
+version = "8256"
+build_number = 8256
+exposes = ["ay"]
+
+[[artifact]]
+target = "aarch64-apple-darwin"
+kind = "binary"
+url = "ay-8256-aarch64-apple-darwin.tar.zst"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[[artifact]]
+target = "x86_64-apple-darwin"
+kind = "binary"
+url = "ay-8256-x86_64-apple-darwin.tar.zst"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[[artifact]]
+target = "x86_64-unknown-linux-gnu"
+kind = "binary"
+url = "ay-8256-x86_64-unknown-linux-gnu.tar.zst"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"

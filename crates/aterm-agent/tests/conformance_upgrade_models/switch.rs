@@ -1,92 +1,45 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! HarnessModelSwitch, Tier-1: the live upgrade's model switch, driven from
-//! every reachable state of the derived model, in every configuration of its
-//! constants, and projected back onto it.
+//! HarnessModelSwitch, Tier-1: the live upgrade's model switch, driven from every
+//! reachable state of the derived model in every configuration of its constants and
+//! projected back onto it.
 //!
-//! WHAT IS DRIVEN. The model's `Visit` is the real
-//! `upgrade_models::model_read_step` — the one read `upgrade_drive::model_judge`
-//! wraps in its I/O for the drive's visit, the host's pre-filter and a riding
-//! restart alike: the early return when no model can be run and none is
-//! pending, what a transcript tail says runs (`live_model_at`, over a real
-//! tail with the visit's own launch flag and process start), THE SETTLE STEP
-//! (`ModelRecord::settle`), THE MODEL RULE (`model_due`: the conversation's own
-//! family first, then the priority list, over the build's offer) over the
-//! settled record, THE RIDE'S GUARD (`ride_bar`, over the model the round's
-//! notice carried — the model's `phase > 0 && ann == 1`), the cache's coldness
-//! (`last_answer_at`) and THE DUE CLOCK (`ModelRecord::due_clock`), in the
-//! order that function takes them — followed by `model_to` (with THE MODEL
-//! LADDER, `model_moves_now`, inside it), as `visit_models` and
-//! `riding_model_in` call it. The relaunches are the real record write right
-//! before the line that asks it (`ModelRecord::asked`), its take-back when
-//! that line is not typed (`ModelRecord::take_back`, the model's `Refused`),
-//! the model the line asks for (`upgrade_models::line_model`: the site's
-//! own, else none kept of a `--model` the record marks FAILED — the model's
-//! `flag = 2`, 2026-10-01),
-//! and what the new process then runs (`live_model_at`).
+//! Driven: the model's `Visit` is the real `upgrade_models::model_read_step`, the read
+//! `upgrade_drive::model_judge` wraps for the drive's visit, the host's pre-filter and a
+//! riding restart: its early return, `live_model_at` over a real tail, the settle step
+//! (`ModelRecord::settle`), the model rule (`model_due`), the ride's guard (`ride_bar`;
+//! the model's `phase > 0 && ann == 1`), the cache's coldness (`last_answer_at`) and the
+//! due clock (`ModelRecord::due_clock`), in that order; then `model_to` (with the ladder,
+//! `model_moves_now`) as `visit_models` and `riding_model_in` call it. The relaunches
+//! are the real record write before the line (`ModelRecord::asked`), its take-back when
+//! the line is not typed (`ModelRecord::take_back`, the model's `Refused`), the line's
+//! model (`upgrade_models::line_model`; the model's `flag = 2` is a dropped `--model`
+//! the record marks failed) and what the new process runs (`live_model_at`).
 //!
-//! WHAT IS TRANSCRIBED, NOT DRIVEN (a change there passes this bind):
-//! `model_judge`'s and `model_read_kept`'s I/O (the record's load and save,
-//! the transcript read, the ledger rows); the offer (`upgrade_models::offered`
-//! over the build's catalog, the list and `availableModels` — the model's
-//! `tgt` stands for its two shapes and none); `visit_models`' derivation of
-//! the carried model (`St::carried_model`: the upgrade's `model_list` while
-//! announced or gave up), its drop of a barred ride from the record
-//! (`ride_dropped`: the model's `ann = 0`, and no announced model handed to
-//! `model_to`, which [`visit`] transcribes), the release of an announced round
-//! that leaves with nothing to restart for (`St::release_unridden`), and of
-//! `build_restart`;
-//! the pre-filter `model_wants_a_look`; `St::for_target`, `St::give_up`,
-//! `St::unsent`, the READY handshake; the relaunch's ask of `st.model_list`
-//! (`relaunch::relaunch`, right before its line, since 2026-10-02), the
-//! sites' call of `line_model` (inside `relaunch::plan`, through
-//! `upgrade_drive::line_model_of`) and the line itself (`relaunch::with_model`
-//! is taken as read: a model replaces the launch's `--model`, an empty one
-//! drops it, none keeps it); and which
-//! view (managed or native) `riding_model_in` and `visit_models` judge a
-//! session by, and the pre-filter's keep rule over two views — the model has
-//! one.
+//! Transcribed, not driven (a change there passes this bind): the I/O of `model_judge`
+//! and `model_read_kept`; the offer (`upgrade_models::offered`; the model's `tgt` stands
+//! for its two shapes and none); `visit_models`' carried model (`St::carried_model`),
+//! its drop of a barred ride (`ride_dropped`: the model's `ann = 0`),
+//! `St::release_unridden` and the `build_restart` it hands `model_to`; the pre-filter
+//! `model_wants_a_look`; `St::for_target`, `St::give_up`, `St::unsent` and the READY
+//! handshake; `relaunch::relaunch`'s ask, the sites' call of `line_model`
+//! (`relaunch::plan` through `upgrade_drive::line_model_of`) and `relaunch::with_model`
+//! (a model replaces the launch's `--model`, an empty one drops it, none keeps it); and
+//! which view (managed or native) a session is judged by — the model has one.
 //!
-//! NEGATIVE CONTROLS: a TRANSCRIPTION of `model_read_step` whose parts can be
-//! swapped — shown equal to the real function on every state first, so each
-//! control is one defect away from the shipped code — with each real part in
-//! a pre-fix or defect shape: the rule before `18090b6ae` (no remembered
-//! `/model`, no saved default), the rule without its failed record, an
-//! off-list model read as ranked last, the ladder before `2d4656f32` (a cold
-//! cache only), the decision before `4f4c00777` (re-taken after the
-//! announcement), the clock before `b3beaa542` (an unreadable visit restarts
-//! it), a settle step that never records a failure, never records an
-//! application, or (before 2026-09-27) fails an ask that ran; the ride's
-//! guard before 2026-10-01, one law at a time — the record not read (gap (a):
-//! a model recorded failed rides), a person's choice not read (gap (b): their
-//! `/model` of Fable typed after the notice is moved across), an off-list
-//! model read as ranked last (gap (c)); and the function's own order: the
-//! rule asked before the settle step, and the early return taken on an empty
-//! offer alone (a pending ask never settles). The
-//! relaunch bind has its own: an ask not recorded, an ask recorded without
-//! its time, a refused signal's ask kept (the refusal before 2026-10-01), the
-//! line before 2026-10-01 (a `--model` recorded failed kept), and a
-//! relaunched process read as running nothing or as ignoring its launch
-//! flag. Each is caught by the same enumeration that
-//! passes the shipped code; a decision answering the other way disagrees on
-//! every state.
+//! Negative controls: a transcription of `model_read_step` ([`Parts`]), shown equal to
+//! the real function on every state, then with one part at a time in a defect shape;
+//! the relaunch bind has its own. A decision answering the other way disagrees on every
+//! state.
 //!
-//! WHAT THE MODEL DOES NOT COVER (said here, where the bind is): the offer is
-//! only ever every seed model, `claude-opus-5` alone, or nothing (so the only
-//! move is ever INTO `claude-opus-5-5`: none into Fable, no second family
-//! member above a person's choice, no family the list does not name moving
-//! by the build's own word); a
-//! person never relaunches the conversation by hand; the owner's `--now`
-//! never re-arms a gave-up upgrade; a restart made for another reason is
-//! modelled only outside an announcement, and always lands; a `/model` a
-//! person chose since the launch, which a line asking no model carries in
-//! place of the launch's `--model` (`hand_model_in`), is not modelled (such a
-//! line keeps the launch flag here); a person's own launch with an id the
-//! record marks failed is never made (the line would drop it too); the clock never
-//! steps back (`due_since > now`); `[1m]` spellings, aliases and the time
-//! within each clock band are exercised by the concretizations below, not by
-//! the model.
+//! Not modelled: the offer is only every seed model, `claude-opus-5` alone, or nothing
+//! (so the only move is into `claude-opus-5-5`); a person never relaunches by hand;
+//! `--now` never re-arms a gave-up upgrade; a restart for another reason is modelled
+//! only outside an announcement, and always lands; a `/model` chosen since the launch
+//! (`hand_model_in`) is not modelled; a person's own launch with an id the record marks
+//! failed is never made; the clock never steps back. `[1m]` spellings, aliases and
+//! times within each clock band are exercised by the concretizations, not the model.
 
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex, PoisonError};
@@ -111,8 +64,8 @@ const SONNET: &str = "claude-sonnet-5";
 const NOW: u64 = 1_790_000_000;
 /// When a relaunched process started (after every row of the old transcript).
 const STARTED: u64 = NOW - 30;
-/// When a VISITED process started: before every row of its transcript, so
-/// the transcript says what runs.
+/// When a visited process started: before every row of its transcript, so the
+/// transcript says what runs.
 const VISIT_STARTED: u64 = NOW - 10 * CACHE_COLD_S;
 
 /// Every `(DefaultFable, PersonFlag, Build)` configuration (`PersonFlag`:
@@ -174,18 +127,9 @@ fn constant(m: &Model, name: &str) -> i64 {
         .expect("a model constant")
 }
 
-/// Every state the model reaches at `Buggy = 0`, in the order a breadth-first
-/// walk first sees them (`Init`, then each state's successors action by
-/// action in model order) — a state's place `k` picks its spellings
-/// ([`concretize`]).
-///
-/// The library's walk, not one of this file's own (2026-10-05): the same
-/// states in the same order — a queue that skips a state already seen as it
-/// pops it expands states in the order of their first sighting, exactly as one
-/// that skips it before queueing does — over the model resolved once
-/// (aterm-spec's `compiled_walks_are_the_by_name_walks_*` holds it to the
-/// by-name walk), where this file's BFS rebuilt an environment map per state
-/// and action and was 31% of the bind's CPU (`sample`, 2026-10-05).
+/// Every state the model reaches at `Buggy = 0`, in breadth-first order of first
+/// sighting (`Init`, then each state's successors action by action in model order):
+/// a state's place `k` picks its spellings ([`concretize`]).
 fn reachable(model: &Model) -> Vec<Vars> {
     interp::reachable_states(&interp::with_buggy(model, 0))
 }
@@ -208,9 +152,7 @@ fn baked() -> Baked {
     }
 }
 
-/// The list and the catalog every read is made against: constants, built
-/// once per process. Each visit built both until 2026-10-05, the catalog alone
-/// 7% of the bind's CPU (`sample`).
+/// The list and the catalog every read is made against, built once per process.
 static LIST: LazyLock<Priority> = LazyLock::new(|| Priority::seed(0));
 static CATALOG: LazyLock<Baked> = LazyLock::new(baked);
 
@@ -240,9 +182,7 @@ fn set_model(display: &str, t: u64) -> String {
 /// The real inputs one model state stands for.
 #[derive(Debug, Clone)]
 struct Inputs {
-    /// The visit's transcript tail.
     tail: String,
-    /// When the visited process started.
     started: Option<u64>,
     /// The build's offer (`upgrade_models::offered`).
     offered: Vec<String>,
@@ -250,7 +190,7 @@ struct Inputs {
     default: Option<String>,
     record: ModelRecord,
     build: bool,
-    /// The upgrade's model while it is ANNOUNCED, as `visit_models` reads it
+    /// The upgrade's model while it is announced, as `visit_models` reads it
     /// (`None`: not announced, or with no model).
     announced: Option<&'static str>,
     /// The upgrade's `model_list`, announced or gave up — what `restart`
@@ -435,18 +375,17 @@ type RideBar = dyn Fn(
     &ModelRecord,
 ) -> Option<&'static str>;
 
-/// A TRANSCRIPTION of `model_read_step` whose parts can be swapped: a
-/// negative control's harness, one defect away from the shipped function
-/// (shown equal to it on every state with the shipped parts).
+/// A transcription of `model_read_step` whose parts a negative control swaps; with
+/// the shipped parts it equals the real function on every state.
 struct Parts<'a> {
     rule: &'a Rule,
     ladder: &'a Ladder,
     model_to: &'a ModelTo,
     settle: &'a Settle,
     clock: &'a Clock,
-    /// THE RIDE'S GUARD over the carried model (`ride_bar`).
+    /// The ride's guard over the carried model (`ride_bar`).
     ride: &'a RideBar,
-    /// The rule asked BEFORE the settle step (over the record as loaded).
+    /// The rule asked before the settle step (over the record as loaded).
     rule_first: bool,
     /// The early return taken on an empty offer alone, pending ask or not.
     early_on_offer_alone: bool,
@@ -543,12 +482,10 @@ struct ReadOut {
     ride_barred: Option<&'static str>,
 }
 
-/// A visit's read from its inputs: `model_read_step`, or its transcription,
-/// the round's `model_list` carried. Its parameter binds exactly the fields
-/// its memo key holds ([`ReadKey`]) and leaves `build` and `announced` to
-/// [`decide`], so a read that came to need either names it here, beside the
-/// key (review of 2026-10-05: keying on those two as well costs 1.02 ->
-/// 1.32 s, 25,266 keys for 15,242).
+/// A visit's read from its inputs: `model_read_step`, or its transcription, the
+/// round's `model_list` carried. Its parameter binds exactly the fields its memo key
+/// holds ([`ReadKey`]) and leaves `build` and `announced` to [`decide`], so a read
+/// that comes to need either names it here, beside the key.
 fn read(
     v: &Visitor<'_>,
     Inputs {
@@ -617,11 +554,9 @@ fn visit(v: &Visitor<'_>, i: &Inputs) -> Visited {
     decide(v, i, &read(v, i))
 }
 
-/// Exactly what a read is handed of a visit's inputs ([`read`]): the tail,
-/// the process start, the offer, the launch flag, the saved default, the
-/// record and the carried model (the list, the catalog and the clock are the
-/// same at every visit): the fields [`read`]'s parameter binds. Not `build`
-/// or `announced`, which only [`decide`] reads.
+/// Exactly what [`read`] is handed of a visit's inputs: the fields its parameter
+/// binds. Not `build` or `announced`, which only [`decide`] reads; the list, the
+/// catalog and the clock are the same at every visit.
 #[derive(PartialEq, Eq, Hash)]
 struct ReadKey {
     tail: String,
@@ -706,11 +641,9 @@ const RELAUNCHES: [&str; 5] = [
     "Restart",
 ];
 
-/// One configuration's reachable states and what every bind reads of each,
-/// made once (2026-10-05): the visit bind, the transcription's check, the
-/// relaunch bind and every control read the same concretizations and model
-/// steps, where each pass made its own (each state concretized up to nine
-/// times, its environment map built six).
+/// One configuration's reachable states and what every bind reads of each, made
+/// once and shared by the visit bind, the transcription's check, the relaunch bind
+/// and every control.
 struct Space {
     m: Model,
     states: Vec<Vars>,
@@ -719,9 +652,7 @@ struct Space {
     /// The number of each concretization's read key ([`KEYS`]).
     slots: Vec<[usize; 2]>,
     /// The model's successors of each state under `Visit`, then under each of
-    /// [`RELAUNCHES`]: `Model::successors`' own body (the action found by
-    /// name, the state's environment, `successors_in`), the environment built
-    /// once per state rather than once per action.
+    /// [`RELAUNCHES`], with the state's environment built once for all six.
     steps: Vec<[Vec<Vars>; 6]>,
 }
 
@@ -774,14 +705,12 @@ impl Space {
     }
 }
 
-/// A visitor and every read it has made, by its key's number ([`KEYS`]),
-/// 2026-10-05. A read is a function of its key alone — every part either
-/// visitor is built from is pure, and the clock is [`NOW`] — so the read made
-/// for a key is that key's at every state and in every configuration that
-/// concretizes to it; [`decide`], which also reads `build` and `announced`,
-/// runs at every visit. The ~62,000 concretizations of the twelve
-/// configurations make 15,242 keys (measured 2026-10-05), and the transcript
-/// parses inside each read were the bind's largest CPU cost.
+/// A visitor and every read it has made, by its key's number ([`KEYS`]). A read is a
+/// function of its key alone (every part is pure; the clock is [`NOW`]), so one read
+/// serves every state and configuration that concretizes to that key; [`decide`],
+/// which also reads `build` and `announced`, runs at every visit. The transcript
+/// parses inside the reads dominate the bind's cost: ~62,000 concretizations share
+/// ~15,000 keys.
 struct Visits<'a> {
     by: Visitor<'a>,
     reads: Vec<Option<ReadOut>>,
@@ -890,14 +819,11 @@ type LiveAt = dyn Fn(&str, Option<&Baked>, Option<&str>, Option<u64>) -> Option<
 /// launch's `--model` and the record (`upgrade_models::line_model`).
 type Line = dyn Fn(Option<&str>, Option<&str>, &ModelRecord) -> Option<String>;
 
-/// The relaunch bind: from every reachable state where the model relaunches,
-/// the record write before the one act (`ask`: the shipped
-/// `ModelRecord::asked`; for a signal refused, `refuse`: that ask and the
-/// shipped `ModelRecord::take_back`), the model the line asks for (`line`:
-/// the shipped `line_model`, over the record the visit left), and what the
-/// new process then runs (`live_at`: the shipped `live_model_at` over the old
-/// transcript, with the new launch flag and start time), projected back and
-/// checked against the model's step.
+/// The relaunch bind: from every reachable state where the model relaunches, the
+/// record write before the one act (`ask`; for a refused signal, `refuse`: the ask
+/// then `ModelRecord::take_back`), the model the line asks for (`line`, over the
+/// record the visit left) and what the new process runs (`live_at`, over the old
+/// transcript with the new launch flag and start), checked against the model's step.
 fn relaunch_disagreements(
     space: &Space,
     ask: &Ask,
@@ -949,10 +875,9 @@ fn relaunch_disagreements(
                     0 if constant(m, "PersonFlag") == 2 => Some("fable"),
                     _ => None,
                 };
-                // THE LINE: the model it asks for (over the record as the
-                // visit left it, before the ask), then `relaunch::with_model`
-                // as written — an empty one drops every `--model`, none
-                // keeps the launch's.
+                // The line: the model it asks for (over the record as the visit
+                // left it, before the ask), then `relaunch::with_model` as written —
+                // an empty one drops every `--model`, none keeps the launch's.
                 let launch = match line(asks, on_line, &i.record).as_deref() {
                     Some("") => None,
                     Some(model) => Some(model.to_string()),
@@ -1026,19 +951,15 @@ fn shipped_line(asks: Option<&str>, launch: Option<&str>, r: &ModelRecord) -> Op
 
 #[test]
 fn upgrade_model_switch_is_the_models_on_every_reachable_state() {
-    // Each visitor's reads, shared by every configuration ([`Visits`]): 15,242
-    // reads a visitor, where each of the 61,848 concretizations was read anew
-    // by the visit bind and twice more by the transcription's check
-    // (2026-10-05, this test alone: 5.49 s -> 1.00 s, 5.45 -> 0.98 CPU s).
+    // Each visitor's reads are shared by every configuration ([`Visits`]).
     let mut real = Visits::new(Visitor::Real);
     let mut copy = Visits::new(Visitor::Copy(shipped()));
     for (default_fable, person_flag, build) in CONFIGS {
         let space = Space::new(configured(default_fable, person_flag, build));
         let states = &space.states;
-        // A person's launch alias keeps everything, so its space is the one
-        // with nothing ever asked for. A barred ride ends where it was found,
-        // and a refused signal leaves no ask (both 2026-10-01), so the
-        // smallest other space is ~2700 states.
+        // A person's launch alias keeps everything, so its space is the one with
+        // nothing ever asked for. A barred ride ends where it was found and a refused
+        // signal leaves no ask, so the smallest other space is ~2700 states.
         let floor = if person_flag == 2 { 100 } else { 2500 };
         assert!(
             states.len() > floor,
@@ -1087,11 +1008,9 @@ fn upgrade_model_switch_is_the_models_on_every_reachable_state() {
     }
 }
 
-/// The opposite decision: a `model_to` that answers the other way disagrees
-/// with the model on every state, both concretizations, so the bind above
-/// could not have passed one. A sample goes through every installed tier
-/// (`ty trace validate`): each accepted as the real code produced it, and
-/// refused with the decision flipped.
+/// A `model_to` that answers the other way disagrees with the model on every state
+/// and both concretizations. A sample goes through every installed tier: accepted as
+/// the real code produced it, refused with the decision flipped.
 #[test]
 fn upgrade_model_switch_refuses_the_opposite_decision() {
     let space = Space::new(configured(0, 0, 0));
@@ -1197,9 +1116,9 @@ fn upgrade_model_switch_refuses_the_opposite_decision() {
     );
 }
 
-/// Negative controls: each real part in a pre-fix or defect shape, and the
-/// read's own order broken, is caught by the same enumeration that passes the
-/// shipped code; so is each relaunch control.
+/// Negative controls: each real part in a defect shape, and the read's order broken,
+/// is caught by the enumeration that passes the shipped code; so is each relaunch
+/// control.
 #[test]
 fn upgrade_model_switch_binds_catch_every_pre_fix_shape() {
     fn base(m: &str) -> String {
@@ -1292,9 +1211,8 @@ fn upgrade_model_switch_binds_catch_every_pre_fix_shape() {
         out
     };
 
-    // THE RIDE'S GUARD BEFORE 2026-10-01, one law at a time (the ride carried
-    // whatever the visit decided): (a) the record not read, (b) a person's
-    // choice not read, (c) an off-list model read as ranked last.
+    // The ride's guard with one law missing at a time: (a) the record not read,
+    // (b) a person's choice not read, (c) an off-list model read as ranked last.
     let ride_no_record = |carried: &str,
                           list: &Priority,
                           live: Option<&LiveModel>,
@@ -1461,8 +1379,8 @@ fn upgrade_model_switch_binds_catch_every_pre_fix_shape() {
     let flag_ignored = |t: &str, b: Option<&Baked>, _l: Option<&str>, s: Option<u64>| {
         models::live_model_at(t, b, None, s)
     };
-    // The line before 2026-10-01: a relaunch asking no model kept the
-    // launch's `--model`, this harness's own ask recorded FAILED included.
+    // A line that keeps the launch's `--model` when it asks for none, even this
+    // harness's own ask recorded failed.
     let keeps_every_flag =
         |asks: Option<&str>, _l: Option<&str>, _r: &ModelRecord| asks.map(str::to_owned);
     let relaunch_controls: [(&str, &Ask, &Refuse, &Line, &LiveAt); 6] = [

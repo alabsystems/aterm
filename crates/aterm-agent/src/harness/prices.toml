@@ -1,0 +1,470 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+#
+# LIST PRICES, for the account stats' `≈$ (list)` figures
+# (docs/DESIGN-account-stats-2026-10-15.md §3.6). Dollars per million tokens.
+#
+# Every row was read by a person from the vendor's PUBLIC pricing page on the
+# date in `as_of`, and names that page in `source`; the model id itself is
+# taken from the page named in `id_from`. Never copy a row from a vendor
+# binary: the managed build's own catalog and the vendor's own per-process cost
+# are checks, never sources.
+#
+# A model id that is not here is UNPRICED: its tokens are counted and shown,
+# never priced at a guess. A class a page lists no price for ("-") is left out
+# of its row, and a message with tokens in that class is unpriced too.
+#
+# Classes: `input`, `output`, `cache_read` (Anthropic's "cache hits and
+# refreshes", OpenAI's "cached input"), `cache_write` (Anthropic's 5-minute
+# cache writes, OpenAI's cache writes) and `cache_write_1h` (Anthropic's 1-hour
+# cache writes). A `long` table prices a request whose prompt (input, cache
+# reads and cache writes together) is over `over` tokens, as the page says.
+# Fast mode, US-only inference, web search and the batch tier are not priced:
+# the fold counts those messages as approximate.
+#
+# Change a row only from the page, and move `as_of` with it: the spend files
+# priced by an older table are folded again from their transcripts.
+
+format = 1
+as_of = "2026-10-15"
+
+# ---------------------------------------------------------------------------
+# Anthropic. Prices: https://platform.claude.com/docs/en/about-claude/pricing
+# ("Model pricing", "Long context pricing"). Ids: the model status table of
+# https://platform.claude.com/docs/en/about-claude/model-deprecations.
+# Not here: claude-mythos-preview, claude-3-7-sonnet-20250219 and
+# claude-3-haiku-20240307 (in the status table, with no price on the pricing
+# page).
+# ---------------------------------------------------------------------------
+
+[models."claude-fable-5-1"]
+input = 10.0
+cache_write = 12.5
+cache_write_1h = 20.0
+cache_read = 0.25
+output = 50.0
+source = "https://platform.claude.com/docs/en/about-claude/pricing, 2026-10-15"
+id_from = "https://platform.claude.com/docs/en/about-claude/model-deprecations, 2026-10-15"
+
+[models."claude-mythos-5-1"]
+input = 10.0
+cache_write = 12.5
+cache_write_1h = 20.0
+cache_read = 0.25
+output = 50.0
+source = "https://platform.claude.com/docs/en/about-claude/pricing, 2026-10-15"
+id_from = "https://platform.claude.com/docs/en/about-claude/model-deprecations, 2026-10-15"
+
+[models."claude-fable-5"]
+input = 10.0
+cache_write = 12.5
+cache_write_1h = 20.0
+cache_read = 1.0
+output = 50.0
+source = "https://platform.claude.com/docs/en/about-claude/pricing, 2026-10-15"
+id_from = "https://platform.claude.com/docs/en/about-claude/model-deprecations, 2026-10-15"
+
+[models."claude-mythos-5"]
+input = 10.0
+cache_write = 12.5
+cache_write_1h = 20.0
+cache_read = 1.0
+output = 50.0
+source = "https://platform.claude.com/docs/en/about-claude/pricing, 2026-10-15"
+id_from = "https://platform.claude.com/docs/en/about-claude/model-deprecations, 2026-10-15"
+
+[models."claude-opus-5-5"]
+input = 4.0
+cache_write = 5.0
+cache_write_1h = 8.0
+cache_read = 0.2
+output = 20.0
+source = "https://platform.claude.com/docs/en/about-claude/pricing, 2026-10-15"
+id_from = "https://platform.claude.com/docs/en/about-claude/model-deprecations, 2026-10-15"
+
+[models."claude-opus-5"]
+input = 5.0
+cache_write = 6.25
+cache_write_1h = 10.0
+cache_read = 0.5
+output = 25.0
+source = "https://platform.claude.com/docs/en/about-claude/pricing, 2026-10-15"
+id_from = "https://platform.claude.com/docs/en/about-claude/model-deprecations, 2026-10-15"
+
+[models."claude-opus-4-8"]
+input = 5.0
+cache_write = 6.25
+cache_write_1h = 10.0
+cache_read = 0.5
+output = 25.0
+source = "https://platform.claude.com/docs/en/about-claude/pricing, 2026-10-15"
+id_from = "https://platform.claude.com/docs/en/about-claude/model-deprecations, 2026-10-15"
+
+[models."claude-opus-4-7"]
+input = 5.0
+cache_write = 6.25
+cache_write_1h = 10.0
+cache_read = 0.5
+output = 25.0
+source = "https://platform.claude.com/docs/en/about-claude/pricing, 2026-10-15"
+id_from = "https://platform.claude.com/docs/en/about-claude/model-deprecations, 2026-10-15"
+
+[models."claude-opus-4-6"]
+input = 5.0
+cache_write = 6.25
+cache_write_1h = 10.0
+cache_read = 0.5
+output = 25.0
+source = "https://platform.claude.com/docs/en/about-claude/pricing, 2026-10-15"
+id_from = "https://platform.claude.com/docs/en/about-claude/model-deprecations, 2026-10-15"
+
+[models."claude-opus-4-5-20251101"]
+input = 5.0
+cache_write = 6.25
+cache_write_1h = 10.0
+cache_read = 0.5
+output = 25.0
+source = "https://platform.claude.com/docs/en/about-claude/pricing, 2026-10-15"
+id_from = "https://platform.claude.com/docs/en/about-claude/model-deprecations, 2026-10-15"
+
+[models."claude-opus-4-1-20250805"]
+input = 15.0
+cache_write = 18.75
+cache_write_1h = 30.0
+cache_read = 1.5
+output = 75.0
+source = "https://platform.claude.com/docs/en/about-claude/pricing, 2026-10-15"
+id_from = "https://platform.claude.com/docs/en/about-claude/model-deprecations, 2026-10-15"
+
+[models."claude-opus-4-20250514"]
+input = 15.0
+cache_write = 18.75
+cache_write_1h = 30.0
+cache_read = 1.5
+output = 75.0
+source = "https://platform.claude.com/docs/en/about-claude/pricing, 2026-10-15"
+id_from = "https://platform.claude.com/docs/en/about-claude/model-deprecations, 2026-10-15"
+
+[models."claude-sonnet-5-5"]
+input = 2.0
+cache_write = 2.5
+cache_write_1h = 4.0
+cache_read = 0.1
+output = 10.0
+source = "https://platform.claude.com/docs/en/about-claude/pricing, 2026-10-15"
+id_from = "https://platform.claude.com/docs/en/about-claude/model-deprecations, 2026-10-15"
+
+[models."claude-sonnet-5"]
+input = 2.0
+cache_write = 2.5
+cache_write_1h = 4.0
+cache_read = 0.2
+output = 10.0
+source = "https://platform.claude.com/docs/en/about-claude/pricing, 2026-10-15"
+id_from = "https://platform.claude.com/docs/en/about-claude/model-deprecations, 2026-10-15"
+
+[models."claude-sonnet-4-6"]
+input = 3.0
+cache_write = 3.75
+cache_write_1h = 6.0
+cache_read = 0.3
+output = 15.0
+source = "https://platform.claude.com/docs/en/about-claude/pricing, 2026-10-15"
+id_from = "https://platform.claude.com/docs/en/about-claude/model-deprecations, 2026-10-15"
+
+[models."claude-sonnet-4-5-20250929"]
+input = 3.0
+cache_write = 3.75
+cache_write_1h = 6.0
+cache_read = 0.3
+output = 15.0
+source = "https://platform.claude.com/docs/en/about-claude/pricing, 2026-10-15"
+id_from = "https://platform.claude.com/docs/en/about-claude/model-deprecations, 2026-10-15"
+
+[models."claude-sonnet-4-20250514"]
+input = 3.0
+cache_write = 3.75
+cache_write_1h = 6.0
+cache_read = 0.3
+output = 15.0
+source = "https://platform.claude.com/docs/en/about-claude/pricing, 2026-10-15"
+id_from = "https://platform.claude.com/docs/en/about-claude/model-deprecations, 2026-10-15"
+
+# "Claude Haiku 5.5 is priced by prompt length: a request whose prompt is over
+# 100,000 tokens pays higher prices. A request's prompt length counts all of
+# its input tokens, including cache reads and cache writes." (Long context
+# pricing.)
+[models."claude-haiku-5-5"]
+input = 0.1
+cache_write = 0.125
+cache_write_1h = 0.2
+cache_read = 0.01
+output = 0.5
+source = "https://platform.claude.com/docs/en/about-claude/pricing, 2026-10-15"
+id_from = "https://platform.claude.com/docs/en/about-claude/model-deprecations, 2026-10-15"
+
+[models."claude-haiku-5-5".long]
+over = 100000
+input = 0.5
+cache_write = 0.625
+cache_write_1h = 1.0
+cache_read = 0.05
+output = 2.5
+
+[models."claude-haiku-4-5-20251001"]
+input = 1.0
+cache_write = 1.25
+cache_write_1h = 2.0
+cache_read = 0.1
+output = 5.0
+source = "https://platform.claude.com/docs/en/about-claude/pricing, 2026-10-15"
+id_from = "https://platform.claude.com/docs/en/about-claude/model-deprecations, 2026-10-15"
+
+[models."claude-3-5-haiku-20241022"]
+input = 0.8
+cache_write = 1.0
+cache_write_1h = 1.6
+cache_read = 0.08
+output = 4.0
+source = "https://platform.claude.com/docs/en/about-claude/pricing, 2026-10-15"
+id_from = "https://platform.claude.com/docs/en/about-claude/model-deprecations, 2026-10-15"
+
+# ---------------------------------------------------------------------------
+# OpenAI, Standard tier. Prices and ids: https://developers.openai.com/api/docs/pricing
+# (every gpt-5 and later row of the text-token table; gpt-5.3-codex from its
+# "Specialized models" table). Older rows (gpt-4.x, the o-series, gpt-3.5) are
+# not here: unpriced, never guessed. Not on the page: gpt-6-pro, which Codex
+# 0.163.0 names, and three slugs of that build's model catalog, each hidden
+# from its picker (`visibility: hide`): gpt-daybreak-blue-latest,
+# gpt-daybreak-red-latest and codex-auto-review. No public price exists for
+# them, so the Codex fold shows their tokens unpriced. A Codex build carries no
+# price: `lab prices` checks these rows by id against its catalog (0.163.0: 8
+# of its 11 slugs priced, those 3 not), and every row here was read off the
+# page again on 2026-10-16, unchanged.
+# "Short context: ≤272K input tokens. Long context: >272K input tokens." The
+# page does not say how cached input counts toward it; OpenAI's own
+# `input_tokens` include the cached ones, which is the prompt this table's
+# rule counts. A "-" column (cache writes; cached input of the pro rows) is
+# left out, and a "-" long-context column means no `long` table.
+# ---------------------------------------------------------------------------
+
+[models."gpt-6-astra"]
+input = 10.0
+cache_read = 1.0
+cache_write = 12.5
+output = 50.0
+source = "https://developers.openai.com/api/docs/pricing, 2026-10-15"
+id_from = "https://developers.openai.com/api/docs/pricing, 2026-10-15"
+
+[models."gpt-6-astra".long]
+over = 272000
+input = 20.0
+cache_read = 2.0
+cache_write = 25.0
+output = 75.0
+
+[models."gpt-6.1-sol"]
+input = 2.0
+cache_read = 0.1
+cache_write = 2.5
+output = 10.0
+source = "https://developers.openai.com/api/docs/pricing, 2026-10-15"
+id_from = "https://developers.openai.com/api/docs/pricing, 2026-10-15"
+
+[models."gpt-6.1-sol".long]
+over = 272000
+input = 4.0
+cache_read = 0.2
+cache_write = 5.0
+output = 15.0
+
+[models."gpt-6-sol"]
+input = 2.0
+cache_read = 0.2
+cache_write = 2.5
+output = 10.0
+source = "https://developers.openai.com/api/docs/pricing, 2026-10-15"
+id_from = "https://developers.openai.com/api/docs/pricing, 2026-10-15"
+
+[models."gpt-6-sol".long]
+over = 272000
+input = 4.0
+cache_read = 0.4
+cache_write = 5.0
+output = 15.0
+
+[models."gpt-6-luna"]
+input = 0.1
+cache_read = 0.01
+cache_write = 0.125
+output = 0.5
+source = "https://developers.openai.com/api/docs/pricing, 2026-10-15"
+id_from = "https://developers.openai.com/api/docs/pricing, 2026-10-15"
+
+[models."gpt-6-luna".long]
+over = 272000
+input = 0.2
+cache_read = 0.02
+cache_write = 0.25
+output = 0.75
+
+[models."gpt-5.6-sol"]
+input = 4.0
+cache_read = 0.4
+cache_write = 5.0
+output = 20.0
+source = "https://developers.openai.com/api/docs/pricing, 2026-10-15"
+id_from = "https://developers.openai.com/api/docs/pricing, 2026-10-15"
+
+[models."gpt-5.6-sol".long]
+over = 272000
+input = 8.0
+cache_read = 0.8
+cache_write = 10.0
+output = 30.0
+
+[models."gpt-5.6-terra"]
+input = 2.0
+cache_read = 0.2
+cache_write = 2.5
+output = 12.0
+source = "https://developers.openai.com/api/docs/pricing, 2026-10-15"
+id_from = "https://developers.openai.com/api/docs/pricing, 2026-10-15"
+
+[models."gpt-5.6-terra".long]
+over = 272000
+input = 4.0
+cache_read = 0.4
+cache_write = 5.0
+output = 18.0
+
+[models."gpt-5.6-luna"]
+input = 0.2
+cache_read = 0.02
+cache_write = 0.25
+output = 1.2
+source = "https://developers.openai.com/api/docs/pricing, 2026-10-15"
+id_from = "https://developers.openai.com/api/docs/pricing, 2026-10-15"
+
+[models."gpt-5.6-luna".long]
+over = 272000
+input = 0.4
+cache_read = 0.04
+cache_write = 0.5
+output = 1.8
+
+[models."gpt-5.5"]
+input = 5.0
+cache_read = 0.5
+output = 30.0
+source = "https://developers.openai.com/api/docs/pricing, 2026-10-15"
+id_from = "https://developers.openai.com/api/docs/pricing, 2026-10-15"
+
+[models."gpt-5.5".long]
+over = 272000
+input = 10.0
+cache_read = 1.0
+output = 45.0
+
+[models."gpt-5.5-pro"]
+input = 30.0
+output = 180.0
+source = "https://developers.openai.com/api/docs/pricing, 2026-10-15"
+id_from = "https://developers.openai.com/api/docs/pricing, 2026-10-15"
+
+[models."gpt-5.5-pro".long]
+over = 272000
+input = 60.0
+output = 270.0
+
+[models."gpt-5.4"]
+input = 2.5
+cache_read = 0.25
+output = 15.0
+source = "https://developers.openai.com/api/docs/pricing, 2026-10-15"
+id_from = "https://developers.openai.com/api/docs/pricing, 2026-10-15"
+
+[models."gpt-5.4".long]
+over = 272000
+input = 5.0
+cache_read = 0.5
+output = 22.5
+
+[models."gpt-5.4-mini"]
+input = 0.75
+cache_read = 0.075
+output = 4.5
+source = "https://developers.openai.com/api/docs/pricing, 2026-10-15"
+id_from = "https://developers.openai.com/api/docs/pricing, 2026-10-15"
+
+[models."gpt-5.4-nano"]
+input = 0.2
+cache_read = 0.02
+output = 1.25
+source = "https://developers.openai.com/api/docs/pricing, 2026-10-15"
+id_from = "https://developers.openai.com/api/docs/pricing, 2026-10-15"
+
+[models."gpt-5.4-pro"]
+input = 30.0
+output = 180.0
+source = "https://developers.openai.com/api/docs/pricing, 2026-10-15"
+id_from = "https://developers.openai.com/api/docs/pricing, 2026-10-15"
+
+[models."gpt-5.4-pro".long]
+over = 272000
+input = 60.0
+output = 270.0
+
+[models."gpt-5.3-codex"]
+input = 1.75
+cache_read = 0.175
+output = 14.0
+source = "https://developers.openai.com/api/docs/pricing, 2026-10-15"
+id_from = "https://developers.openai.com/api/docs/pricing, 2026-10-15"
+
+[models."gpt-5.2"]
+input = 1.75
+cache_read = 0.175
+output = 14.0
+source = "https://developers.openai.com/api/docs/pricing, 2026-10-15"
+id_from = "https://developers.openai.com/api/docs/pricing, 2026-10-15"
+
+[models."gpt-5.2-pro"]
+input = 21.0
+output = 168.0
+source = "https://developers.openai.com/api/docs/pricing, 2026-10-15"
+id_from = "https://developers.openai.com/api/docs/pricing, 2026-10-15"
+
+[models."gpt-5.1"]
+input = 1.25
+cache_read = 0.125
+output = 10.0
+source = "https://developers.openai.com/api/docs/pricing, 2026-10-15"
+id_from = "https://developers.openai.com/api/docs/pricing, 2026-10-15"
+
+[models."gpt-5"]
+input = 1.25
+cache_read = 0.125
+output = 10.0
+source = "https://developers.openai.com/api/docs/pricing, 2026-10-15"
+id_from = "https://developers.openai.com/api/docs/pricing, 2026-10-15"
+
+[models."gpt-5-mini"]
+input = 0.25
+cache_read = 0.025
+output = 2.0
+source = "https://developers.openai.com/api/docs/pricing, 2026-10-15"
+id_from = "https://developers.openai.com/api/docs/pricing, 2026-10-15"
+
+[models."gpt-5-nano"]
+input = 0.05
+cache_read = 0.005
+output = 0.4
+source = "https://developers.openai.com/api/docs/pricing, 2026-10-15"
+id_from = "https://developers.openai.com/api/docs/pricing, 2026-10-15"
+
+[models."gpt-5-pro"]
+input = 15.0
+output = 120.0
+source = "https://developers.openai.com/api/docs/pricing, 2026-10-15"
+id_from = "https://developers.openai.com/api/docs/pricing, 2026-10-15"

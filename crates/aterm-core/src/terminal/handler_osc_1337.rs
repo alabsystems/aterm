@@ -2,31 +2,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! iTerm2 OSC 1337 `File=` inline-image handler.
+//! iTerm2 OSC 1337 `File=` inline images
+//! (`ESC ] 1337 ; File = key=value ; … : <base64 payload> BEL`), plus the
+//! cell-stamping shared with sixel and Kitty placements.
 //!
-//! `imgcat` and friends emit
+//! The engine does not decode the picture: it computes the cell footprint and
+//! stamps an [`ImageRef`](aterm_grid::ImageRef) on every covered cell, and the
+//! raw bytes ride behind an `Arc` for the renderer to decode once and tile.
+//! Other OSC 1337 sub-commands are ignored here.
 //!
-//! ```text
-//! ESC ] 1337 ; File = key=value ; key=value ; … : <base64 payload> BEL
-//! ```
-//!
-//! to draw an image inline over the grid. This module parses that one sub-command
-//! (`File=`), base64-decodes the payload, computes the image's CELL footprint, and
-//! stamps an [`ImageRef`](aterm_grid::ImageRef) onto every covered cell. The
-//! engine does not decode the picture: the raw bytes ride along behind an `Arc`
-//! and the renderer decodes once (keyed by `Arc` identity) and blits each cell's
-//! tile. See `aterm-render`'s image pass.
-//!
-//! Every other OSC 1337 sub-command (`SetUserVar`, `SetMark`, …) is handled via
-//! the shell-API / KVP callback layer, not here. A param that is not `File=` is
-//! left for those paths (silently ignored in the default lib build).
-//!
-//! ## Robustness
-//!
-//! Malformed input never panics and never writes a cell: a missing payload, an
-//! undecodable base64 body, a zero footprint, or a footprint that does not fit the
-//! grid all return early. An unknown image format (not PNG) is still stored so the
-//! cursor advances consistently, but the renderer draws nothing for it.
+//! Malformed input never panics and never writes a cell. A payload that is not
+//! PNG is still stored so the cursor advances consistently; the renderer draws
+//! nothing for it.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -64,29 +51,22 @@ const MAX_FOOTPRINT_CELLS: u16 = 4096;
 /// PNG decode limit (`aterm-render`'s `IMAGE_MAX_DIMENSION`) and the sixel
 /// decoder's `SIXEL_MAX_DIMENSION`.
 ///
-/// The renderers decode a placement into ONE RGBA buffer of its footprint's
-/// pixel size (`cols * cell_w` by `rows * cell_h`), so a footprint's height is
-/// what a draw allocates and resamples. Kitty's is held to the screen and
-/// sixel's comes from its raster; an iTerm2 `height=` in cells is bounded only
-/// by [`MAX_FOOTPRINT_CELLS`], so without this `height=4096` on a one-pixel PNG
-/// asks each draw for a 262 MB buffer at an 80-column 10x20-px grid (over 1 GB
-/// on a Retina window). An iTerm2 footprint is no taller than the screen or
-/// this, whichever is more: no source taller than this decodes anyway.
+/// The renderers decode a placement into one RGBA buffer of its footprint's
+/// pixel size, and an iTerm2 `height=` in cells is otherwise bounded only by
+/// [`MAX_FOOTPRINT_CELLS`] (`height=4096` on a one-pixel PNG would ask each draw
+/// for 262 MB on an 80-column grid of 10x20 px cells). So an iTerm2 footprint is
+/// no taller than the screen or this, whichever is more.
 const MAX_DECODED_IMAGE_PX: u32 = 4096;
 
 /// Payload bytes of the inline images the live screen may show at once, past
 /// which whole images are taken off it ([`TerminalHandler::admit_live_image`]).
 ///
-/// Every protocol stamps images into cells, and a cell keeps its image while
-/// any of it shows, so without a bound per screen the pictures a screen holds
-/// are bounded only by its cell count times the per-image cap. A program's
-/// output reaches that cheaply: an 80x24 screen of sixels each declaring a
-/// 4096x20 raster (`"1;1;4096;20`, no pixel data) holds 603 MB after 65 KB of
-/// output, and Kitty `o=z` inflates 4 MiB from about 4 KB. The Kitty store's
-/// images are bounded by its own budget and are counted here only once it lets
-/// one go, as a placement on either screen may still show it; history
-/// charges what scrolls off to the scrollback budget. Generous next to any real
-/// screen: a full 6K window of RGBA is 81 MB.
+/// A cell keeps its image while any of it shows, so without this a screen's
+/// pictures are bounded only by cell count times the per-image cap: an 80x24
+/// screen of sixels each declaring a 4096x20 raster (no pixel data) holds
+/// 603 MB after 65 KB of output. Scrolled-off images are charged to the
+/// scrollback budget. Generous next to any real screen: a full 6K window of
+/// RGBA is 81 MB.
 pub(super) const MAX_LIVE_IMAGE_BYTES: usize = 128 * 1024 * 1024;
 
 /// What an over-budget screen is trimmed to: half the budget, so each count of
@@ -182,19 +162,15 @@ struct FileArgs {
 }
 
 impl TerminalHandler<'_> {
-    /// Handle OSC 1337, the iTerm2 `File=` inline-image sub-command.
+    /// Handle OSC 1337, the iTerm2 `File=` inline-image sub-command; any other
+    /// body is ignored.
     ///
-    /// `params[0] == "1337"`; the rest is the `File=…:base64` body, split by the
-    /// parser on every `;` (the arg list is semicolon-separated). The body is
-    /// divided into `(args, payload)` at the first `:`. Base64 has no `;`, so a
-    /// well-formed payload is entirely in the last param and borrowed in place;
-    /// only the small args prefix is rejoined. A `:` in an earlier param means
-    /// a `;` follows the payload start (malformed), and then the whole body is
-    /// rejoined so acceptance matches the unsplit form. This avoids copying a
-    /// payload of up to `MAX_OSC_DATA` under the terminal lock.
-    ///
-    /// Bodies other than `File=` are left to the shell-API / KVP path. Malformed
-    /// `File=` input is ignored without panicking.
+    /// The parser splits the body on every `;`; it divides into `(args,
+    /// payload)` at the first `:`. Base64 has no `;`, so a well-formed payload is
+    /// entirely in the last param and borrowed in place, and only the small args
+    /// prefix is rejoined: no copy of a payload of up to `MAX_OSC_DATA` under the
+    /// terminal lock. A `:` in an earlier param (malformed) rejoins the whole
+    /// body so acceptance matches the unsplit form.
     pub(super) fn handle_osc_1337(&mut self, params: &[&[u8]]) {
         if params.len() < 2 {
             return;
@@ -211,15 +187,12 @@ impl TerminalHandler<'_> {
             return;
         };
 
-        // Fast path: the ':' lives in the last param, so the payload contains no
-        // ';' and can be borrowed in place. Rejoin only the args prefix.
+        // Fast path: the ':' is in the last param, so the payload is borrowed.
         if colon_param == params.len() - 1 {
             let payload = &params[colon_param][colon_off + 1..];
             // Single-param body: `File=args` sits before the ':' in the same
             // param — borrow it too; nothing is copied at all.
             if colon_param == 1 {
-                // Only the File= sub-command is handled here. Everything else
-                // (SetUserVar, SetMark, …) flows through the shell-API/KVP layer.
                 let Some(args_bytes) = strip_prefix_ascii_ci(&params[1][..colon_off], b"File=")
                 else {
                     return;
@@ -227,8 +200,7 @@ impl TerminalHandler<'_> {
                 self.handle_osc_1337_file(args_bytes, payload);
                 return;
             }
-            // Rejoin everything before the ':' — `File=` + the arg list. This is
-            // the small (non-payload) prefix of the body.
+            // Rejoin `File=` + the arg list (everything before the ':').
             let mut head: Vec<u8> = params[1].to_vec();
             for extra in &params[2..colon_param] {
                 head.push(b';');
@@ -259,9 +231,8 @@ impl TerminalHandler<'_> {
         self.handle_osc_1337_file(&rest[..colon], &rest[colon + 1..]);
     }
 
-    /// Parse + place one `File=` body, pre-split at the first `:` into the
-    /// `args` list and the base64 `payload`. Ignored without effect on any
-    /// malformed input.
+    /// Parse and place one `File=` body, pre-split at the first `:` into `args`
+    /// and the base64 `payload`. Malformed input is ignored.
     fn handle_osc_1337_file(&mut self, args_bytes: &[u8], payload: &[u8]) {
         let args = parse_file_args(args_bytes);
         // inline=0 (or absent) means "download", which has no on-screen effect.
@@ -269,13 +240,11 @@ impl TerminalHandler<'_> {
             return;
         }
 
-        // Base64 → raw image bytes. A decode failure degrades to nothing.
         let Ok(payload_str) = std::str::from_utf8(payload) else {
             return;
         };
-        // Strip ASCII whitespace (line-wrapped payloads) before the strict
-        // decoder, copying only when some is present (a byte probe suffices:
-        // ASCII whitespace is single-byte and non-ASCII UTF-8 bytes are >= 0x80).
+        // Strip ASCII whitespace (line-wrapped payloads) for the strict decoder,
+        // copying only when some is present.
         let cleaned: std::borrow::Cow<'_, str> = if payload.iter().any(u8::is_ascii_whitespace) {
             let mut s = String::with_capacity(payload_str.len());
             s.extend(payload_str.chars().filter(|c| !c.is_ascii_whitespace()));
@@ -431,16 +400,11 @@ impl TerminalHandler<'_> {
         // line_feed so footprint tiles map onto whole columns from the anchor.
         self.grid.set_cursor(self.grid.cursor_row(), start_col);
 
-        // Middle-band footprint rows can never be the final writer of a visible
-        // cell: after at most `grid_rows` line feeds the cursor is pinned
-        // (scrolling at the region bottom, or stationary on the last row), and a
-        // row stamped there is either scrolled away or overwritten by later rows.
-        // Only the first `grid_rows` rows (the cursor may still be descending,
-        // possibly outside the scroll region) and the last `2 * grid_rows` can
-        // remain visible. So a hostile `height=4096` costs about
-        // 3*grid_rows*cols extras inserts instead of rows*cols, with identical
-        // final grid, cursor, scroll count and scrollback; the line feeds still
-        // run per row.
+        // Middle-band footprint rows are never the final writer of a visible
+        // cell: after `grid_rows` line feeds the cursor is pinned, so only the
+        // first `grid_rows` rows and the last `2 * grid_rows` can remain. Skipping
+        // the rest bounds a hostile `height=4096` to ~3*grid_rows*cols inserts
+        // with an identical final state; the line feeds still run per row.
         let grid_rows = self.grid.rows();
         let skip_end = rows.saturating_sub(grid_rows.saturating_mul(2));
 
@@ -469,23 +433,17 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// Make room on the live screen for `image`, about to be stamped there
-    /// (as Kitty placement `kitty`, if one), so the screen's images stay
-    /// within [`MAX_LIVE_IMAGE_BYTES`] — every stamp of every protocol comes
-    /// through here.
+    /// Make room on the live screen for `image` (Kitty placement `kitty`, if
+    /// one) so the screen's images stay within [`MAX_LIVE_IMAGE_BYTES`]; every
+    /// stamp of every protocol comes through here.
     ///
-    /// The active screen's `live_image_charge` is an upper bound on their
-    /// bytes: that screen's last count, plus every image stamped on it since,
-    /// plus every image the Kitty store has let go since (an image overwritten
-    /// or scrolled off stays charged until the next count). Only when the bound
-    /// passes the budget are the images counted, and then trimmed
-    /// ([`trim_live_images`](Self::trim_live_images)), so the count runs once
-    /// per half-budget of bytes charged to that screen. Each screen keeps its
-    /// own bound, as a count sees only the active grid. An image the Kitty
-    /// store holds is bounded by that store's budget and is charged nothing
-    /// until the store lets it go, when it is charged to both screens, as
-    /// either grid may still show it. Its stamp still checks the bound: a
-    /// screen whose stamps are all stored images is counted only then.
+    /// Each screen's `live_image_charge` is an upper bound on its image bytes:
+    /// its last count plus everything stamped on it, or let go by the Kitty
+    /// store, since. Only when the bound passes the budget are the images
+    /// counted and trimmed ([`trim_live_images`](Self::trim_live_images)), so a
+    /// count runs once per half-budget charged. An image the Kitty store holds
+    /// is bounded by the store's budget and charged nothing until the store lets
+    /// it go, then to both screens, as either grid may still show it.
     pub(super) fn admit_live_image(
         &mut self,
         image: &Arc<ImageData>,
@@ -612,16 +570,10 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// Place a decoded sixel raster as an inline image via the OSC 1337
-    /// placement path: the RGBA pixels from `aterm-sixel` are wrapped in an
-    /// [`ImageData`] tagged [`ImageFormat::RawRgba8`] and passed to
-    /// [`place_image`], with the footprint computed from the same cell metric.
-    ///
-    /// Cursor behavior follows DECSDM (DEC private mode 80):
-    /// - scrolling mode (reset, default): `place_image` line-feeds per row and
-    ///   leaves the cursor on the line below the image;
-    /// - display mode (set): the image is painted at the cursor and the cursor
-    ///   is restored.
+    /// Place a decoded sixel raster through [`place_image`](Self::place_image)
+    /// as an [`ImageFormat::RawRgba8`] [`ImageData`]. With DECSDM (mode 80)
+    /// reset the cursor ends on the line below the image; with it set the cursor
+    /// is restored.
     #[cfg(feature = "sixel")]
     pub(super) fn place_sixel_image(&mut self, image: &crate::sixel::SixelImage) {
         let (cell_w, cell_h) = self.iterm2.cell_px;
@@ -644,11 +596,9 @@ impl TerminalHandler<'_> {
         let raw_w = u16::try_from(image.width()).unwrap_or(u16::MAX);
         let raw_h = u16::try_from(image.height()).unwrap_or(u16::MAX);
 
-        // Bound the RGBA allocation by the OSC 1337 per-image cap
-        // (`MAX_IMAGE_BYTES`). A DECGRA-only sixel defers `apply_raster` to
-        // `unhook`, after the DCS budget accounting in `dcs_put_inner`, so the
-        // width*height buffer is checked here, in u64 (4096*4096*4 overflows
-        // u32), and rejected rather than allocated.
+        // Bound the RGBA allocation by `MAX_IMAGE_BYTES`: a DECGRA-only sixel
+        // defers `apply_raster` to `unhook`, past the DCS budget in
+        // `dcs_put_inner`. Computed in u64 (4096*4096*4 overflows u32).
         let image_bytes = (image.width() as u64)
             .saturating_mul(image.height() as u64)
             .saturating_mul(4);
@@ -675,10 +625,9 @@ impl TerminalHandler<'_> {
             z_index: 0,
             band_lift_px: 0,
             cell_offset_px: (0, 0),
-            // Sixel names pixels: the raster is drawn 1:1 from the footprint's
-            // top-left, not scaled to fill it (the footprint is the raster rounded
-            // up to whole cells, and filling would magnify and blur it). The
-            // remainder stays unpainted, as on other sixel terminals.
+            // Sixel names pixels: drawn 1:1 from the footprint's top-left, not
+            // scaled to fill it (filling would magnify and blur it), as on other
+            // sixel terminals.
             scaling: ImageScaling::PixelExact,
             source_rect: None,
         });
@@ -735,7 +684,7 @@ fn strip_prefix_ascii_ci<'a>(haystack: &'a [u8], prefix: &[u8]) -> Option<&'a [u
     }
 }
 
-/// Classify the raw payload by magic bytes. Only PNG is renderable today.
+/// Classify the raw payload by magic bytes. Only PNG is renderable.
 fn detect_format(bytes: &[u8]) -> ImageFormat {
     if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
         ImageFormat::Png

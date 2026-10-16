@@ -113,17 +113,12 @@ pub fn native_update_boot_health_lock_model() -> Model {
     }
 }
 
-/// TWO PROCESSES ARM ONE BUILD, AND IT IS SWAPPED IN ONCE (auto-apply audit #8,
-/// 2026-09-21). Every aterm window and session runs the apply lane, so two processes
-/// on one machine routinely arm the same staged build. Process B may finish its whole
-/// pre-lock preflight on that build (`BPeek`) while process A's successor holds
-/// `apply_lock`, swaps the bundle and retires the marker (`ASwap`). What B then does
-/// under the lock (`BApply`) must follow the marker as it reads NOW: nothing is left,
-/// so nothing is swapped. `Buggy=1` is a lane that acts on its pre-lock peek — the
-/// second swap `OneSwapPerBuild` refutes. Tier-1: aterm-update `install.rs`,
-/// `two_processes_arming_one_build_swap_it_once`, which runs the boot lane's own
-/// `apply_lock_then_ready` for both processes over the real `apply_lock` and marker,
-/// and stages the same race through a peek-trusting lane as its negative control.
+/// Two processes arm one staged build and it is swapped in once. Every window and session
+/// runs the apply lane; B may finish its pre-lock peek (`BPeek`) while A holds `apply_lock`,
+/// swaps and retires the marker (`ASwap`). B's apply under the lock (`BApply`) must follow
+/// the marker as it reads then. `Buggy=1` acts on the pre-lock peek and swaps twice
+/// (`OneSwapPerBuild`). Tier-1: aterm-update `install_tests.rs`,
+/// `two_processes_arming_one_build_swap_it_once`.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_update_two_process_apply_model() -> Model {

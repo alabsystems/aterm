@@ -6,7 +6,7 @@
 //!
 //! ```text
 //! host 1:  aterm fabric on --tcp <bind> --key-file <k> [--allow-remote]
-//!          aterm fabric mint-for <node-id>|new [--out <cap>]
+//!          aterm fabric mint-for <node-id>|new [--out <cap>] [--expires <N>d|<N>h]
 //! host 2:  aterm fabric join --broker <host:port> --tcp --key-file <k> --cap-file <c>
 //!                            [--node <id>] [--accept-from <p>,...] [--dry-run]
 //!                            [--service launchd|systemd|none]
@@ -25,12 +25,16 @@
 //!
 //! The key is ONE secret every host of the fleet holds. It keeps a stranger off
 //! the wire and says nothing about WHICH host is speaking; with it alone, host 2
-//! could publish as host 1's node, or on a human's drive lane — keystrokes into
-//! host 1's sessions. What stops that is the capability: `rw,p=<node>:` grants
-//! bind every publish to the node they were minted for (the broker's producer
-//! binding), and only a guarded broker checks one. So `aterm link broker --tcp`
-//! refuses to run without `--secret-file`, and `aterm fabric on --tcp` hands it
-//! the root's own mint secret.
+//! could publish as host 1's node (its sessions' mail and presence rows), or as
+//! a human: `h-` is a cap-forced `<src>`, so that mail is delivered
+//! `trust=human`, a halt in that human's name holds every session on the
+//! fleet, and a lift in it withdraws theirs. (Not keystrokes: no bus record
+//! reaches a PTY, `bridge.rs`'s "The path to a PTY: there is none".) What stops
+//! that is the capability: `rw,p=<node>:` grants bind every publish to the node
+//! they were minted for (the broker's producer binding), and only a guarded
+//! broker checks one. So `aterm link broker --tcp` refuses to run without
+//! `--secret-file`, and `aterm fabric on --tcp` hands it the root's own mint
+//! secret.
 //!
 //! ## What it does NOT protect
 //!
@@ -38,8 +42,21 @@
 //! REQUIREMENTS R6: identity-bound principals and revocation are designed, not
 //! built). A copied key plus a copied cap IS that node, from any machine that
 //! can reach the port; there is no revoking one host short of re-keying every
-//! host and rotating the mint secret. `docs/FABRIC-SECOND-HOST.md` says so to
-//! the operator.
+//! host and rotating the mint secret. What DOES bound a copied cap is its
+//! expiry: `mint-for --expires 30d` stamps `exp=` into every grant, the broker
+//! refuses the ring from that instant on (at attach, and on every request of a
+//! connection already open). It is renewed by a fresh `mint-for` and a `join`
+//! with the new cap: the running bridge reads its cap file again before every
+//! dial, so it attaches the new ring at its next redial — at the latest when
+//! the broker ends the lapsed ring's streams — with no restart. A ring minted
+//! without `--expires` lasts until the secret is rotated.
+//!
+//! And host 1's uid IS the fleet's root of trust: `<root>/mint.secret` is 0600
+//! to it, so every process running as it there — every agent in every session
+//! — can mint a cap for any node or human, and the same uid supervises the
+//! broker. A joined host's uid holds only its own node's ring. Agents not to
+//! be trusted that far belong on a joined host. `docs/FABRIC-SECOND-HOST.md`
+//! says all of this to the operator.
 //!
 //! ## `mint-for`
 //!
@@ -50,14 +67,24 @@
 //! it is refused, by naming the feature, in a build without `sealed`. It refuses
 //! a malformed id, this host's OWN node id (two bridges answering as one node
 //! read each other's mail and fire each other's wills), a secret that is
-//! missing or short — and a root that JOINED another host's fleet: its own
-//! node cap was not minted under its secret (a stale one from an earlier
-//! `on`, or none), so the broker it dials would refuse every cap it minted.
+//! missing, short or readable by another user (the one reader,
+//! [`crate::transport::read_mint_secret`]) — and a root that JOINED another
+//! host's fleet: its own node cap was not minted under its secret (a stale one
+//! from an earlier `on`, or none), so the broker it dials would refuse every
+//! cap it minted.
 //! It never prints the secret; `--out` writes the cap 0600, atomically, never
 //! over a DIFFERENT file and never through a symlink, and makes an IDENTICAL
 //! file already there 0600 before it says so; without `--out` the eight lines
 //! go to stdout (like `aterm link mint`) and the guidance to stderr. Its last
 //! lines are the exact `join` to run on the other host.
+//!
+//! `mint-for h-<name>` (a human) or `a-<name>` (an agent with a cap of its
+//! own) mints a PERSON's ring instead ([`crate::enable::person_grants`]) —
+//! in EVERY build, because the one-host broker `on` runs is guarded as well:
+//! the cap `aterm fabric halt|inbox|post` ([`crate::person`]) take, and the
+//! one `aterm link notify --on ask:<person>` reads its mail with. The same
+//! secret and joined-root refusals apply; the own-node one does not, and its
+//! last lines name those commands instead of a `join`.
 //!
 //! ## `join`
 //!
@@ -120,6 +147,10 @@ pub struct MintForOpts {
     pub out: Option<String>,
     /// `--fleet <F>`: default this host's configured fleet.
     pub fleet: Option<String>,
+    /// `--expires <N>d|<N>h` ([`parse_lifetime`]), as milliseconds: every
+    /// grant is stamped `exp=<now + this>`, and the broker refuses the ring
+    /// from that instant on. `None` mints a ring that never expires.
+    pub expires: Option<u64>,
 }
 
 /// `aterm fabric join`'s flags.
@@ -157,20 +188,44 @@ pub fn is_node_id(node: &str) -> bool {
     node.starts_with("n-") && crate::subject::is_principal(node)
 }
 
+/// Whether `id` is a PERSON: an `h-` human or an `a-` agent holding its own cap
+/// (§3.2), the principals `mint-for` mints [`crate::enable::person_grants`] for.
+#[must_use]
+pub fn is_person_id(id: &str) -> bool {
+    (id.starts_with("h-") || id.starts_with("a-")) && crate::subject::is_principal(id)
+}
+
 /// The `(fleet, node)` a cap file's grants were minted for — exactly §8.2's
 /// eight for ONE node on ONE fleet ([`node_grants`]), in any order, nothing
 /// missing, nothing extra.
 ///
+/// AUTHORITY IS EXACT, LIFETIME IS FREE. Every grant is read with astream's
+/// own parser ([`astream_cap::Grant::parse`]) — never by hand, so `p=` and
+/// `exp=` may come in either order — and the ring is compared by mode,
+/// principal and filter. A ring `mint-for --expires` stamped with `exp=` is
+/// the same ring; one whose grants have ALREADY lapsed is refused here, where
+/// the remedy can be named, rather than as the bridge's `reason=expired` after
+/// the join.
+///
 /// # Errors
 ///
-/// No `rw,p=<N>:/f/<F>/pub/<N>/>` grant to read the identity off, or a set of
-/// grants that is not that node's ring.
+/// A line that is not a grant, no `rw,p=<N>:/f/<F>/pub/<N>/>` grant to read
+/// the identity off, a set of grants that is not that node's ring, or a ring
+/// that has expired.
 pub fn node_ring_of(grants: &[String]) -> Result<(String, String), String> {
-    let identity = grants.iter().find_map(|g| {
-        let rest = g.strip_prefix("rw,p=")?;
-        let (node, filter) = rest.split_once(':')?;
-        let fleet = filter.strip_prefix("/f/")?.split('/').next()?;
-        (filter == format!("/f/{fleet}/pub/{node}/>"))
+    node_ring_at(grants, crate::now_ms())
+}
+
+/// [`node_ring_of`] at the instant `now_ms` (unix milliseconds).
+fn node_ring_at(grants: &[String], now_ms: u64) -> Result<(String, String), String> {
+    use astream_cap::{Grant, Mode};
+    let parse =
+        |g: &String| Grant::parse(g).map_err(|e| format!("`{}` is not a grant: {e}", safe(g, 128)));
+    let parsed: Vec<Grant> = grants.iter().map(parse).collect::<Result<_, _>>()?;
+    let identity = parsed.iter().find_map(|g| {
+        let node = g.principal.as_deref()?;
+        let fleet = g.filter.strip_prefix("/f/")?.split('/').next()?;
+        (g.mode == Mode::ReadWrite && g.filter == format!("/f/{fleet}/pub/{node}/>"))
             .then(|| (fleet.to_string(), node.to_string()))
     });
     let Some((fleet, node)) = identity else {
@@ -187,8 +242,21 @@ pub fn node_ring_of(grants: &[String]) -> Result<(String, String), String> {
             safe(&fleet, 64)
         ));
     }
-    let mut want = node_grants(&fleet, &node);
-    let mut have: Vec<String> = grants.to_vec();
+    let authority = |g: &Grant| {
+        (
+            g.mode == Mode::ReadWrite,
+            g.principal.clone(),
+            g.filter.clone(),
+        )
+    };
+    let mut want: Vec<_> = node_grants(&fleet, &node)
+        .iter()
+        .map(parse)
+        .collect::<Result<Vec<_>, _>>()?
+        .iter()
+        .map(authority)
+        .collect();
+    let mut have: Vec<_> = parsed.iter().map(authority).collect();
     want.sort();
     have.sort();
     if want != have {
@@ -198,7 +266,60 @@ pub fn node_ring_of(grants: &[String]) -> Result<(String, String), String> {
             grants.len()
         ));
     }
+    if let Some(exp) = parsed
+        .iter()
+        .filter_map(|g| g.expires_at)
+        .filter(|&exp| now_ms >= exp)
+        .min()
+    {
+        return Err(format!(
+            "it expired at {} (exp={exp}): on the first host, `aterm fabric mint-for {node} \
+             --out <cap>` mints it again (`--expires` for a bounded one)",
+            aterm_types::rfc3339::format_rfc3339(exp / 1000)
+        ));
+    }
     Ok((fleet, node))
+}
+
+/// `--expires <N>d|<N>h`: a capability lifetime, as milliseconds.
+///
+/// # Errors
+///
+/// Anything but a positive whole number of days or hours, at most ten years.
+pub fn parse_lifetime(word: &str) -> Result<u64, String> {
+    const HOUR_MS: u64 = 3_600_000;
+    const MAX_HOURS: u64 = 10 * 366 * 24;
+    let refuse = || {
+        format!(
+            "--expires {}: a whole number of days or hours, e.g. 30d or 12h",
+            safe(word, 32)
+        )
+    };
+    let (n, unit_hours) = if let Some(d) = word.strip_suffix('d') {
+        (d, 24)
+    } else if let Some(h) = word.strip_suffix('h') {
+        (h, 1)
+    } else {
+        return Err(refuse());
+    };
+    if n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(refuse());
+    }
+    let hours = n
+        .parse::<u64>()
+        .ok()
+        .and_then(|n| n.checked_mul(unit_hours))
+        .filter(|&h| (1..=MAX_HOURS).contains(&h))
+        .ok_or_else(refuse)?;
+    Ok(hours * HOUR_MS)
+}
+
+/// `grant` with `exp=<exp_ms>` added to its prefix: `rw,p=<N>:` becomes
+/// `rw,p=<N>,exp=<ms>:` and `ro:` becomes `ro,exp=<ms>:` — the grammar
+/// astream-cap reads (`field := "p=" … | "exp=" …`). Every node grant has a
+/// prefix, and the mint re-parses, so a stamp that went wrong fails closed.
+fn with_expiry(grant: &str, exp_ms: u64) -> String {
+    grant.replacen(':', &format!(",exp={exp_ms}:"), 1)
 }
 
 /// The fleet, the SEALED endpoint and its key file of THIS host's fabric,
@@ -240,12 +361,16 @@ fn this_fabric() -> Option<(String, String, Option<String>)> {
 // mint-for
 // ---------------------------------------------------------------------------
 
-/// `aterm fabric mint-for <node-id>|new [--out <cap>] [--fleet <F>]`.
+/// `aterm fabric mint-for <node-id>|new [--out <cap>] [--fleet <F>] [--expires <N>d|<N>h]`.
 #[must_use]
 pub fn mint_for(opts: &MintForOpts) -> ExitCode {
-    // REFUSED BY NAME IN A DEFAULT BUILD, like `on --tcp` and `join`: a cap
-    // is only for a host that joins over the sealed wire.
-    if !crate::transport::SEALED {
+    // A PERSON'S RING IS FOR EVERY BUILD: the one-host broker `on` runs is
+    // guarded too, so a human halts, reads and answers there with a cap of
+    // their own. A NODE's is REFUSED BY NAME IN A DEFAULT BUILD, like `on
+    // --tcp` and `join`: a second node is only for a host that joins over
+    // the sealed wire.
+    let person = is_person_id(&opts.node);
+    if !person && !crate::transport::SEALED {
         eprintln!(
             "aterm fabric mint-for: {}",
             crate::transport::SEALED_UNAVAILABLE
@@ -284,15 +409,16 @@ pub fn mint_for(opts: &MintForOpts) -> ExitCode {
     } else {
         opts.node.clone()
     };
-    if !is_node_id(&node) {
+    if !person && !is_node_id(&node) {
         eprintln!(
             "aterm fabric mint-for: `{}` is not a node id (`n-` and [a-z0-9-], in the \
-             joining host's <root>/link-state/node), or `{NEW_NODE}` for a fresh one",
+             joining host's <root>/link-state/node), `{NEW_NODE}` for a fresh one, or a \
+             person (`h-<name>` for a human, `a-<name>` for an agent with its own cap)",
             safe(&node, 64)
         );
         return ExitCode::from(2);
     }
-    if own.as_deref() == Some(node.as_str()) {
+    if !person && own.as_deref() == Some(node.as_str()) {
         eprintln!(
             "aterm fabric mint-for: {node} is THIS host's own node id ({}/node); a second host \
              needs its own. Use the other host's id, or `{NEW_NODE}`",
@@ -300,12 +426,28 @@ pub fn mint_for(opts: &MintForOpts) -> ExitCode {
         );
         return ExitCode::from(2);
     }
+    // The secret, through the one reader (0600, 32+ bytes, its exact bytes).
+    // A missing one is answered below; any other refusal is answered now,
+    // before the joined-root test reads "no usable secret" as "joined".
+    let secret_path = p.secret();
+    let shown = secret_path.to_string_lossy().into_owned();
+    let secret = match crate::transport::read_mint_secret(&shown) {
+        Ok(s) => Some(s),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => {
+            eprintln!(
+                "aterm fabric mint-for: {}",
+                crate::transport::describe(&shown, &e)
+            );
+            return ExitCode::FAILURE;
+        }
+    };
     // A ROOT THAT JOINED ANOTHER HOST'S FLEET MINTS NOTHING: the broker it
     // dials checks caps against THAT host's secret, so a secret left here by
     // an earlier `on` would mint caps the broker refuses. The test is the
     // root's own cap, minted under this root's secret only on the serving host.
     let cap = p.cap();
-    if cap.exists() && !minted_here(&p.secret(), &cap) {
+    if cap.exists() && !secret.as_deref().is_some_and(|s| minted_under(s, &cap)) {
         eprintln!(
             "aterm fabric mint-for: this root's node cap ({}) was not minted under {}: this \
              host JOINED a fleet whose broker another host serves{}. Run `aterm fabric \
@@ -319,16 +461,24 @@ pub fn mint_for(opts: &MintForOpts) -> ExitCode {
         );
         return ExitCode::from(2);
     }
-    let secret_path = p.secret();
-    let secret = match read_mint_secret(&secret_path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("aterm fabric mint-for: {e}");
-            return ExitCode::FAILURE;
-        }
+    let Some(secret) = secret else {
+        eprintln!(
+            "aterm fabric mint-for: no mint secret at {shown}: `aterm fabric on` on the fleet's \
+             first host mints it"
+        );
+        return ExitCode::FAILURE;
+    };
+    let exp = opts
+        .expires
+        .map(|lifetime| crate::now_ms().saturating_add(lifetime));
+    let ring = if person {
+        enable::person_grants(&fleet, &node)
+    } else {
+        node_grants(&fleet, &node)
     };
     let mut lines = String::new();
-    for grant in node_grants(&fleet, &node) {
+    for grant in &ring {
+        let grant = exp.map_or_else(|| grant.clone(), |exp| with_expiry(grant, exp));
         match astream_cap::mint(&secret, &grant) {
             Ok(c) => {
                 lines.push_str(&astream_cap::capfile::format_line(&c.filter, &c.tag));
@@ -405,21 +555,42 @@ pub fn mint_for(opts: &MintForOpts) -> ExitCode {
         }
     };
     say(format!(
-        "minted {node}'s 8 grants on fleet {fleet} under {} (root from {root_from}){}",
+        "minted {node}'s {} grants on fleet {fleet} under {} (root from {root_from}){}",
+        ring.len(),
         secret_path.display(),
         written.as_ref().map_or_else(
             || " — to stdout".to_string(),
             |w| format!(" into {} (0600)", w.display())
         )
     ));
+    let cap_shown = written
+        .as_ref()
+        .map_or_else(|| "<cap>".to_string(), |w| w.display().to_string());
+    if person {
+        if let Some(exp) = exp {
+            say(format!(
+                "they expire at {} (exp={exp}): the broker refuses them from then on; mint \
+                 again here before then",
+                aterm_types::rfc3339::format_rfc3339(exp / 1000)
+            ));
+        }
+        let broker = here.as_ref().map_or("<broker>", |(_, b, _)| b.as_str());
+        say(person_guidance(&node, &fleet, broker, &cap_shown));
+        return ExitCode::SUCCESS;
+    }
+    if let Some(exp) = exp {
+        say(format!(
+            "they expire at {} (exp={exp}): the broker refuses them from then on. Before then, \
+             mint again here and `join` with the new cap on the other host (its running bridge \
+             attaches the new cap at its next redial)",
+            aterm_types::rfc3339::format_rfc3339(exp / 1000)
+        ));
+    }
     say(
         "the joining host needs the cap above and the fleet's key file; the mint secret stays \
          here"
             .to_string(),
     );
-    let cap_shown = written
-        .as_ref()
-        .map_or_else(|| "<cap>".to_string(), |w| w.display().to_string());
     match here {
         Some((_, broker, Some(key))) => {
             say(format!(
@@ -446,26 +617,39 @@ pub fn mint_for(opts: &MintForOpts) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// A mint secret FILE for `mint-for`: present, 0600, at least
-/// [`enable::SECRET_LEN`] bytes.
-fn read_mint_secret(path: &Path) -> Result<Vec<u8>, String> {
-    let shown = path.display();
-    if !path.exists() {
-        return Err(format!(
-            "no mint secret at {shown}: `aterm fabric on` on the fleet's first host mints it"
-        ));
-    }
-    let lossy = path.to_string_lossy();
-    crate::transport::check_private(&lossy).map_err(|e| crate::transport::describe(&lossy, &e))?;
-    let secret = std::fs::read(path).map_err(|e| format!("{shown}: {e}"))?;
-    if secret.len() < enable::SECRET_LEN {
-        return Err(format!(
-            "{shown} holds {} bytes; a mint secret is at least {}",
-            secret.len(),
-            enable::SECRET_LEN
-        ));
-    }
-    Ok(secret)
+/// What a person does with the cap `mint-for <person>` just made: the
+/// commands, spelled with that cap. Run on any host whose `[fabric] command`
+/// names this fleet's broker. Only a human (`h-`) halts, and every node takes
+/// a human's task as a task; an `a-` service's ring has no halt grant, and its
+/// task is one only where `--accept-from` lists it (the bridge's `accepted`).
+fn person_guidance(person: &str, fleet: &str, broker: &str, cap: &str) -> String {
+    let human = person.starts_with("h-");
+    let halt = if human {
+        format!(
+            "  aterm fabric halt --cap-file {cap} <reason>    hold every session on the fleet\n  \
+             aterm fabric halt --cap-file {cap} off         withdraw that halt\n"
+        )
+    } else {
+        String::new()
+    };
+    let task = if human {
+        format!("a `task` from {person} arrives as a task on every node")
+    } else {
+        format!(
+            "{person} is not a human: it halts nothing, and its `task` arrives as a task only on \
+             a node whose --accept-from lists {person}"
+        )
+    };
+    format!(
+        "with it, {person} uses the fleet from any host whose fabric is on (keep the cap \
+         0600; it IS {person}):\n\
+         {halt}  \
+         aterm fabric inbox --cap-file {cap}            read what agents posted to={person}\n  \
+         aterm fabric post --cap-file {cap} to=@<sid>@<node> kind=answer re=<off> <text>\n  \
+         aterm link notify --fleet {fleet} --broker {broker} --cap-file {cap} --on \
+         ask:{person} --exec <cmd>    be paged when an agent asks {person}\n\
+         {task}"
+    )
 }
 
 /// Make `path` 0600 if it is not: `Ok(None)` when it already was, `Ok(Some(
@@ -563,18 +747,17 @@ fn check_inputs(opts: &JoinOpts) -> Result<Checked, String> {
     })
 }
 
-/// Whether `caps` were minted under the secret at `secret` — i.e. whether
-/// THIS root minted them, which makes it the fleet's first host.
-fn minted_here(secret: &Path, cap_file: &Path) -> bool {
-    let Ok(key) = std::fs::read(secret) else {
-        return false;
-    };
+/// Whether the caps in `cap_file` were minted under `secret` — with this
+/// root's own secret, whether THIS root minted them, which makes it the
+/// fleet's first host (and, for `on`, whether the broker it guards with that
+/// secret will take them).
+pub(crate) fn minted_under(secret: &[u8], cap_file: &Path) -> bool {
     let Ok(caps) = crate::bridge::read_cap_file(&cap_file.to_string_lossy()) else {
         return false;
     };
     !caps.is_empty()
         && caps.iter().all(|c| {
-            astream_cap::mint(&key, &c.grant).is_ok_and(|m| m.filter == c.grant && c.tag == m.tag)
+            astream_cap::mint(secret, &c.grant).is_ok_and(|m| m.filter == c.grant && c.tag == m.tag)
         })
 }
 
@@ -682,14 +865,13 @@ fn local_broker_step(p: &Paths, service: Service, remote: &str, out: &mut Out) -
             if out.dry_run {
                 return true;
             }
+            // By domain, as `off` does: no legacy `unload`, which acts on
+            // the caller's domain and exits 0 whatever it did.
             if loaded {
                 let domain = format!("gui/{}/{label}", uid());
                 if let Err(e) = launchctl(&["bootout", &domain]) {
-                    let plist_s = plist.to_string_lossy().into_owned();
-                    if launchctl(&["unload", &plist_s]).is_err() {
-                        out.fail("broker", &e);
-                        return false;
-                    }
+                    out.fail("broker", &e);
+                    return false;
                 }
             }
             if let Err(e) = std::fs::remove_file(&plist) {
@@ -783,8 +965,29 @@ pub fn join(opts: &JoinOpts) -> ExitCode {
         }
     );
 
-    // The refusals that come before anything is written.
-    if minted_here(&p.secret(), &checked.cap_src) {
+    // The refusals that come before anything is written. A secret here that
+    // the one reader refuses (group-readable, short) is a refusal too: this
+    // may be the fleet's first host, and `join` cannot tell without it.
+    let own_secret = p.secret().to_string_lossy().into_owned();
+    let own = match crate::transport::read_mint_secret(&own_secret) {
+        Ok(s) => Some(s),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => {
+            out.fail(
+                "secret",
+                &format!(
+                    "{}: fix it (or move it aside if this host never served the fleet) and \
+                     join again",
+                    crate::transport::describe(&own_secret, &e)
+                ),
+            );
+            return ExitCode::from(2);
+        }
+    };
+    if own
+        .as_deref()
+        .is_some_and(|s| minted_under(s, &checked.cap_src))
+    {
         out.fail(
             "cap",
             &format!(
@@ -932,15 +1135,24 @@ pub fn join(opts: &JoinOpts) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    if !opts.dry_run {
+    // The copies to delete — never the installed files themselves, which a
+    // `join` re-applied from them (doctor's remedy) names as its sources.
+    let copies: Vec<String> = [
+        (&checked.key_src, p.installed_key()),
+        (&checked.cap_src, p.cap()),
+    ]
+    .into_iter()
+    .filter(|(src, dest)| !same_file(src, dest))
+    .map(|(src, _)| src.display().to_string())
+    .collect();
+    if !opts.dry_run && !copies.is_empty() {
         out.note(
             "copies",
             &format!(
-                "this host reads {} and {} now; delete the copies ({} and {})",
+                "this host reads {} and {} now; delete the copies ({})",
                 p.installed_key().display(),
                 p.cap().display(),
-                checked.key_src.display(),
-                checked.cap_src.display()
+                copies.join(" and ")
             ),
         );
     }
@@ -948,6 +1160,15 @@ pub fn join(opts: &JoinOpts) -> ExitCode {
     // 6. `on`'s tail: config, rendezvous, instances, proof, undo, status.
     let argv = p.bridge_command_accepting(&node, &opts.accept_from);
     enable::finish(&p, &node, &argv, &mut out, opts.dry_run, Verb::Join)
+}
+
+/// Whether `a` and `b` name one file: the same path, or paths that resolve
+/// to it.
+fn same_file(a: &Path, b: &Path) -> bool {
+    a == b
+        || std::fs::canonicalize(a)
+            .ok()
+            .is_some_and(|a| std::fs::canonicalize(b).is_ok_and(|b| a == b))
 }
 
 /// The joining node's own presence row on the bus, as the probe read it.
@@ -1039,6 +1260,12 @@ fn probe_remote(c: &Checked, out: &mut Out) -> Result<Option<NodePresence>, ()> 
         "the broker dropped the connection before the sealed handshake finished: its \
          pre-authentication slots were full (docs/FABRIC-SECOND-HOST.md), or it is not a sealed \
          broker. Retry in a few seconds"
+    } else if view.protocol.is_some() {
+        // THE HANDSHAKE PASSED and a broker answered — in another astream
+        // protocol: the sealed layer versions itself apart from the bus, so
+        // the port is open and the key is right. No retry on this pair works.
+        "the first host's broker speaks another astream protocol: the two hosts run different \
+         aterm builds — build both from the same commit (docs/FABRIC-SECOND-HOST.md)"
     } else if !view.reachable {
         "nothing answered: `aterm fabric` on the first host shows the endpoint, and its TCP port \
          must be open to this host"
@@ -1085,16 +1312,82 @@ mod tests {
         assert!(node_ring_of(&[]).is_err());
     }
 
+    /// A RING'S LIFETIME IS FREE, ITS AUTHORITY IS NOT: the eight grants each
+    /// stamped `exp=` — in either field order — are the same ring, while one
+    /// that has lapsed is refused naming the re-mint, and an `exp=` ring with
+    /// a grant too many, or one that is not a grant at all, is still refused.
+    #[test]
+    fn a_ring_stamped_with_an_expiry_is_the_same_ring_until_it_lapses() {
+        let node = "n-0123456789abcdef";
+        let exp = 1_800_000_000_000u64;
+        let stamped: Vec<String> = node_grants("lab", node)
+            .iter()
+            .map(|g| with_expiry(g, exp))
+            .collect();
+        assert!(
+            stamped[0].starts_with(&format!("rw,p={node},exp={exp}:")),
+            "{stamped:?}"
+        );
+        assert!(
+            stamped[1].starts_with(&format!("ro,exp={exp}:")),
+            "{stamped:?}"
+        );
+        for g in &stamped {
+            assert_eq!(astream_cap::expires_at(g), Some(exp), "{g}");
+        }
+        let ok = Ok(("lab".to_string(), node.to_string()));
+        assert_eq!(node_ring_at(&stamped, exp - 1), ok);
+        let swapped: Vec<String> = stamped
+            .iter()
+            .map(|g| {
+                g.replace(
+                    &format!("p={node},exp={exp}"),
+                    &format!("exp={exp},p={node}"),
+                )
+            })
+            .collect();
+        assert_ne!(swapped, stamped);
+        assert_eq!(node_ring_at(&swapped, exp - 1), ok, "either field order");
+        let lapsed = node_ring_at(&stamped, exp).expect_err("lapsed at exp");
+        assert!(
+            lapsed.contains("expired") && lapsed.contains(&format!("mint-for {node}")),
+            "{lapsed}"
+        );
+        let mut long = stamped.clone();
+        long.push(format!("ro,exp={exp}:/f/lab/>"));
+        assert!(
+            node_ring_at(&long, exp - 1).is_err(),
+            "a ninth, wider grant"
+        );
+        let mut junk = stamped;
+        junk[3] = "rw,p=n-x,ttl=9:/f/lab/>".to_string();
+        assert!(
+            node_ring_at(&junk, exp - 1).is_err_and(|e| e.contains("is not a grant")),
+            "an unknown field is not a grant"
+        );
+    }
+
+    /// `--expires` is a whole number of days or hours, never zero, never
+    /// past ten years.
+    #[test]
+    fn a_lifetime_is_days_or_hours() {
+        assert_eq!(parse_lifetime("30d"), Ok(30 * 24 * 3_600_000));
+        assert_eq!(parse_lifetime("12h"), Ok(12 * 3_600_000));
+        for bad in [
+            "0d", "0h", "d", "30", "30m", "-1d", "+3h", "1.5d", "99999d", "",
+        ] {
+            assert!(parse_lifetime(bad).is_err(), "{bad}");
+        }
+    }
+
     /// JOINING ITSELF IS REFUSED: a cap minted under this root's own secret is
     /// recognised (every tag re-minted and compared), one minted under another
-    /// secret is not, and a root with no secret — a joining host's — never is.
+    /// secret is not.
     #[test]
     fn a_cap_minted_under_this_roots_secret_is_recognised() {
         let dir = std::env::temp_dir().join(format!("atjoin-self-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("scratch");
-        let secret = dir.join("mint.secret");
-        std::fs::write(&secret, [4u8; 32]).expect("secret");
         let cap_under = |key: &[u8], name: &str| {
             let lines: String = node_grants("lab", "n-0123456789abcdef")
                 .iter()
@@ -1107,12 +1400,12 @@ mod tests {
             std::fs::write(&path, lines).expect("cap");
             path
         };
-        assert!(minted_here(&secret, &cap_under(&[4u8; 32], "own.cap")));
-        assert!(!minted_here(&secret, &cap_under(&[5u8; 32], "foreign.cap")));
-        assert!(!minted_here(
-            &dir.join("absent"),
-            &cap_under(&[4u8; 32], "x.cap")
+        assert!(minted_under(&[4u8; 32], &cap_under(&[4u8; 32], "own.cap")));
+        assert!(!minted_under(
+            &[4u8; 32],
+            &cap_under(&[5u8; 32], "foreign.cap")
         ));
+        assert!(!minted_under(&[4u8; 32], &dir.join("absent.cap")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

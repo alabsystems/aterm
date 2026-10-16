@@ -1,46 +1,29 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-//! Font and glyph geometry gate models (fallback, variable-font, strike selection) — spec-model
-//! data constructors moved verbatim out of the one-file catalog in `derive.rs`
-//! (pure code motion; every constructor keeps its `crate::derive` path via the
-//! `pub use` re-exports there).
+//! Font and glyph geometry models (fallback, variable font, strike selection), re-exported
+//! from `crate::derive`.
 
 use super::*;
 
-/// W7 DECO PHASE — the abstract twin of the underline pattern-phase law: the
-/// dot/dash/wave phase at a pixel is a pure function of ABSOLUTE x, so
-/// crossing a CELL SEAM never resets it. The real code seam is
-/// `aterm_render::deco::{dotted_on, dashed_on, squarewave_up,
-/// undercurl_tile_col}` + the rect emission in
-/// `aterm_render::underline_rects_into`; Tier-1 is aterm-render's
-/// `tests/deco_lines.rs::pattern_rects_are_partition_invariant`, which
-/// enumerates every cell partition of a run over a size lattice and proves the
-/// emitted pixel coverage identical to the whole-run emission (with the old
-/// per-cell dash law as a failing negative control).
+/// Decoration phase: the dot/dash/wave phase of an underline at a pixel is a pure function of
+/// absolute x, so crossing a cell seam never resets it. The code is
+/// `aterm_render::deco::{dotted_on, dashed_on, squarewave_up, undercurl_tile_col}` and the rect
+/// emission in `aterm_render::underline_rects_into`; Tier-1 is aterm-render's
+/// `tests/deco_lines.rs::pattern_rects_are_partition_invariant`, which checks every cell
+/// partition of a run over a size lattice emits the whole run's pixel coverage, with a per-cell
+/// dash law as a failing negative control.
 ///
-/// This is the model of the phase-restart defect: the historical emission
-/// derived its pattern phase from the CELL origin (dash/dot stepping restarted
-/// at every `x0`, the curly square wave restarted every cell), so patterns
-/// visibly re-synced at every cell boundary.
-///
-/// Scalar projection `<<x, phase>>`: `x` = the ghost pattern phase a pure
-/// function of absolute x would carry (a counter wrapping at `Period`);
-/// `phase` = the phase counter the EMISSION actually uses. `Step` advances one
-/// pixel inside a cell (both counters tick); `Seam` advances the pixel that
-/// crosses a cell boundary — the committed law ticks `phase` like any other
-/// pixel, the `Buggy=1` variant RESETS it to 0 (the old per-cell phasing).
-///
-/// Invariant `PhasePure`: `phase = x` — the emission phase is exactly the
-/// absolute-x ghost, wherever the seams fall. `ty` proves it at `Buggy=0` and
-/// produces the seam-reset counterexample at `Buggy=1`
-/// (tests/derived_ring_ty.rs::derived_deco_phase_proves_and_catches_seam_reset).
-// Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
-// models above) — the MODEL it returns is what `ty` machine-checks.
+/// Projection `<<x, phase>>`: `x` is the ghost phase a pure function of absolute x carries (a
+/// counter wrapping at 4), `phase` the one the emission uses. `Step` advances a pixel inside a
+/// cell; `Seam` advances across a cell boundary, ticking `phase` like any pixel, or resetting it
+/// at `Buggy=1` (per-cell phasing). `PhasePure`: `phase = x`
+/// (`tests/derived_ring_ty.rs::derived_deco_phase_proves_and_catches_seam_reset`).
+// Skip (T2 vcgen-budget lane): a model data constructor; `ty` checks the model it returns.
 #[cfg_attr(trust_verify, trust::skip)]
+#[crate::model]
 pub fn deco_phase_model() -> Model {
-    // Both counters wrap at Period = 4 (any pattern period >= 2 exhibits the
-    // defect; 4 keeps the state space tiny while distinguishing reset from wrap).
+    // Both counters wrap at 4: any period >= 2 shows the defect, and 4 tells reset from wrap.
     let wrap = |v: &'static str| if_(gt(var(v), int(2)), int(0), add(var(v), int(1)));
     Model {
         name: "DecoPhase",
@@ -70,9 +53,7 @@ pub fn deco_phase_model() -> Model {
                 ],
             },
             Action {
-                // One pixel forward, CROSSING a cell seam: the committed law
-                // treats it like any pixel; the buggy law restarts the phase
-                // at the new cell's origin.
+                // One pixel forward across a cell seam; `Buggy` restarts the phase there.
                 name: "Seam",
                 guard: None,
                 updates: vec![
@@ -88,39 +69,28 @@ pub fn deco_phase_model() -> Model {
             },
         ],
         invariants: vec![Invariant {
-            // The emission phase IS the absolute-x ghost: pattern value at a
-            // pixel cannot depend on how the run was cut into cells.
+            // The emission phase is the absolute-x ghost: the pattern at a pixel cannot
+            // depend on how the run was cut into cells.
             name: "PhasePure",
+            kind: InvariantKind::Claim,
             expr: eq(var("phase"), var("x")),
         }],
     }
 }
 
-/// W8 FALLBACK METRIC NORMALIZATION (fallback harmony) — the abstract twin of
-/// `aterm_render::fallback_cjk_scale` / `fallback_xheight_scale`'s clamp law
-/// (the real code seam: `Renderer::fallback_face_scale`, which sizes every
-/// fallback-face raster). Tier-1 lives in
-/// `aterm-render/tests/fallback_harmony.rs`, which sweeps the real `f32`
-/// functions over a dense lattice + degenerate inputs.
+/// Fallback metric normalization: the abstract twin of `aterm_render::fallback_cjk_scale` /
+/// `fallback_xheight_scale`'s clamp law (its seam, `Renderer::fallback_face_scale`, sizes every
+/// fallback-face raster). Tier-1: `aterm-render/tests/fallback_harmony.rs` sweeps the real `f32`
+/// functions over a dense lattice and degenerate inputs.
 ///
-/// The ratio `target/actual` is abstracted to an integer percentage `r` (the
-/// division itself is outside ty's Expr language — no `*`/`/` — exactly the
-/// contrast-floor precedent); `Fire` computes the shipped clamp `out =
-/// min(115, max(85, r))` from the settled scene. Bounds are the CJK ±15%
-/// clamp ×100; the x-height clamp is the same law with different constants,
-/// carried by the same proof.
-///
-/// Invariants: `ScaleInBounds` — the computed scale NEVER leaves the clamp
-/// interval, so a fallback face is never distorted more than the bound; and
-/// `ScaleExactInRange` — an in-interval ratio passes through UNCHANGED (the
-/// normalization is exact whenever achievable). `Buggy = 1` ships the raw
-/// ratio (the pre-W8 "rasterize at the primary's px, whatever that does"
-/// behaviour, where the effective ratio was unbounded) — `ty` PROVES the
-/// clamp (Buggy=0) and CATCHES the unclamped scale (Buggy=1 → r=0 violates
-/// the lower bound).
-// Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
-// models above) — the MODEL it returns is what `ty` machine-checks.
+/// The ratio `target/actual` is an integer percentage `r` (the Expr language has no `*` or `/`);
+/// `Fire` computes `out = min(115, max(85, r))`, the CJK ±15% clamp ×100. The x-height clamp is
+/// the same law with other constants. `ScaleInBounds`: the scale never leaves the interval.
+/// `ScaleExactInRange`: an in-interval ratio passes through unchanged. `Buggy = 1` ships the raw
+/// ratio (`r = 0` breaks the lower bound).
+// Skip (T2 vcgen-budget lane): a model data constructor; `ty` checks the model it returns.
 #[cfg_attr(trust_verify, trust::skip)]
+#[crate::model]
 pub fn fallback_scale_clamp_model() -> Model {
     let clamp = if_(
         gt(int(85), var("r")),
@@ -182,11 +152,13 @@ pub fn fallback_scale_clamp_model() -> Model {
         invariants: vec![
             Invariant {
                 name: "ScaleInBounds",
+                kind: InvariantKind::Claim,
                 expr: and_(le(int(85), var("out")), le(var("out"), int(115))),
             },
             Invariant {
                 // Settled states only (phase = 0): an in-interval ratio is exact.
                 name: "ScaleExactInRange",
+                kind: InvariantKind::Uncaught,
                 expr: or_(
                     gt(var("phase"), int(0)),
                     or_(
@@ -199,26 +171,19 @@ pub fn fallback_scale_clamp_model() -> Model {
     }
 }
 
-/// W8 WIDE-GLYPH CENTRING — the abstract twin of
-/// `aterm_render::wide_center_offset`'s balance law (the real code seam:
-/// `Renderer::harmonize_fallback_raster`, which centres a wide fallback
-/// glyph's advance box in its 2-cell box). Tier-1 lives in
-/// `aterm-render/tests/fallback_harmony.rs`, which proves EXHAUSTIVELY that
-/// the shipped fn satisfies the floor CHARACTERIZATION `2*off <= gap <=
-/// 2*off + 1` over the whole bounded domain; this model proves the
-/// characterization IMPLIES the balance law — floor division itself is
-/// outside ty's Expr language, so the proof is split at that exact seam.
+/// Wide-glyph centring: the abstract twin of `aterm_render::wide_center_offset`'s balance law
+/// (its seam, `Renderer::harmonize_fallback_raster`, centres a wide fallback glyph's advance in
+/// its 2-cell box). Floor division is outside the Expr language, so the proof splits there:
+/// Tier-1 (`aterm-render/tests/fallback_harmony.rs`) proves exhaustively that the shipped fn
+/// meets `2*off <= gap <= 2*off + 1`, and this model proves that characterization implies the
+/// margins differ by at most 1px (`MarginsBalance`).
 ///
-/// `Pick` chooses an arbitrary gap (2-cell box minus scaled advance) and a
-/// candidate offset; `Fire` accepts the offset — gated on the floor
-/// characterization when correct, UNGATED when `Buggy = 1` (the pre-W8
-/// left-bias shipped `off = 0` regardless of gap) — and publishes the two
-/// margins. `MarginsBalance`: a checked state's margins differ by at most 1px.
-/// `ty` PROVES it (Buggy=0) and CATCHES the left-bias (Buggy=1: `off = 0`,
-/// `gap = 2` → margins 0 vs 2).
-// Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
-// models above) — the MODEL it returns is what `ty` machine-checks.
+/// `Pick` chooses a gap (2-cell box minus scaled advance) and a candidate offset; `Fire`
+/// accepts it, gated on the characterization, or ungated at `Buggy = 1` (`off = 0`, `gap = 2`
+/// gives margins 0 and 2).
+// Skip (T2 vcgen-budget lane): a model data constructor; `ty` checks the model it returns.
 #[cfg_attr(trust_verify, trust::skip)]
+#[crate::model]
 pub fn wide_center_model() -> Model {
     let characterized = and_(
         le(add(var("off"), var("off")), var("gap")),
@@ -289,9 +254,8 @@ pub fn wide_center_model() -> Model {
                 name: "Fire",
                 guard: Some(and_(
                     gt(var("phase"), int(0)),
-                    // Correct: only a floor-characterized offset is the policy's
-                    // output. Buggy: ANY offset ships (the pre-W8 `off = 0`
-                    // left-bias is one witness).
+                    // Only a floor-characterized offset is the policy's output; `Buggy`
+                    // ships any (`off = 0` is one witness).
                     or_(gt(cst("Buggy"), int(0)), characterized),
                 )),
                 updates: vec![
@@ -316,6 +280,7 @@ pub fn wide_center_model() -> Model {
         ],
         invariants: vec![Invariant {
             name: "MarginsBalance",
+            kind: InvariantKind::Claim,
             expr: or_(
                 le(var("checked"), int(0)),
                 and_(
@@ -327,41 +292,31 @@ pub fn wide_center_model() -> Model {
     }
 }
 
-/// W8 FALLBACK BAND CLIP — the abstract twin of BOTH shipped band clamps,
-/// `aterm_render::clamp_to_row_band` (rows, band = the cell height) and
-/// `aterm_render::clamp_to_col_band` (columns, band = the cell box widened by
-/// a half-cell bleed). The two are one-line wrappers over one shared core,
-/// `aterm_render::clamp_to_band`, and this model's arithmetic is AXIS-FREE,
-/// so it twins both without cloning: the axis is the only thing that differs.
+/// Fallback band clip: the abstract twin of both band clamps, `aterm_render::clamp_to_row_band`
+/// (band = the cell height) and `clamp_to_col_band` (band = the cell box plus a half-cell
+/// bleed), one-line wrappers over `clamp_to_band`. The arithmetic is axis-free, so one model
+/// covers both.
 ///
-/// The real code seam is `Renderer::harmonize_fallback_raster` — stage (f)
-/// trims a fallback glyph's coverage ROWS so no fallback blit can paint
-/// outside its cell row band, and stage (h) trims its COLUMNS as the backstop
-/// under the (g) condense, so a symbol-tier glyph designed far wider than a
-/// terminal cell (STIX Two Math's 1.499 em long arrows, U+27F5..U+27FC, which
-/// used to paint ~2.9 cells inside a 1-cell grid box) cannot bury its
-/// neighbours. Both apply on the CPU blit and the GPU atlas quad alike, since
-/// they share the trimmed bytes + placement. Tier-1 lives in
-/// `aterm-render/tests/fallback_harmony.rs` (exhaustive lattice over
-/// pos/len/band including all-negative and overflow-past-band shapes, plus a
-/// pointwise agreement sweep pinning that the two wrappers really are one
-/// core, and the anti-fight law binding (g) to (h)).
+/// The seam is `Renderer::harmonize_fallback_raster`: stage (f) trims a fallback glyph's
+/// coverage rows to its cell row band, and stage (h) trims its columns as the backstop under
+/// the (g) condense, so a symbol glyph far wider than a cell (STIX Two Math's 1.499 em arrows,
+/// U+27F5..U+27FC) cannot bury its neighbours. Both apply to the CPU blit and the GPU atlas
+/// quad, which share the trimmed bytes and placement. Tier-1:
+/// `aterm-render/tests/fallback_harmony.rs` (an exhaustive pos/len/band lattice including
+/// all-negative and past-band shapes, a sweep pinning the two wrappers to one core, and the
+/// law binding (g) to (h)).
 ///
-/// `Pick` chooses an arbitrary ink placement — cell-relative `top` (may be
-/// negative: ascender overshoot), bitmap `h`, band height `band`; `Fire`
-/// computes the shipped trim `skip = min(max(0, -top), h)` and
-/// `keep = min(h - skip, band - (top + skip))` (0 when past the band), or
-/// the pre-W8 identity (`skip = 0`, `keep = h`) when `Buggy = 1`.
-/// `KeptRowsInBand`: a checked state only ever TRIMS (`skip + keep <= h`)
-/// and every kept row lies inside `[0, band)`. `ty` PROVES it (Buggy=0) and
-/// CATCHES the unclipped blit (Buggy=1: `top = -1`, `h = 1` paints above the
-/// band).
-// Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
-// models above) — the MODEL it returns is what `ty` machine-checks.
+/// `Pick` chooses an ink placement: cell-relative `top` (negative for ascender overshoot),
+/// bitmap `h`, band height `band`. `Fire` computes `skip = min(max(0, -top), h)` and
+/// `keep = min(h - skip, band - (top + skip))` (0 past the band), or the identity
+/// (`skip = 0`, `keep = h`) at `Buggy = 1`. `KeptRowsInBand`: a checked state only trims
+/// (`skip + keep <= h`) and every kept row lies in `[0, band)`.
+// Skip (T2 vcgen-budget lane): a model data constructor; `ty` checks the model it returns.
 #[cfg_attr(trust_verify, trust::skip)]
+#[crate::model]
 pub fn fallback_band_clip_model() -> Model {
-    // `skip = min(max(0, -top), h)` — inlined everywhere it is needed (updates
-    // evaluate on the unprimed state, so `keep` cannot read `skip'`).
+    // `skip = min(max(0, -top), h)`, inlined where needed: updates read the unprimed state,
+    // so `keep` cannot read `skip'`.
     let skip = || {
         if_(
             gt(int(0), var("top")),
@@ -475,6 +430,7 @@ pub fn fallback_band_clip_model() -> Model {
         ],
         invariants: vec![Invariant {
             name: "KeptRowsInBand",
+            kind: InvariantKind::Claim,
             expr: or_(
                 le(var("checked"), int(0)),
                 and_(
@@ -494,31 +450,21 @@ pub fn fallback_band_clip_model() -> Model {
     }
 }
 
-/// W9 VARIABLE-FONT AXIS CLAMP — the abstract twin of
-/// `aterm_render::variation::clamp_axis`, the resolution law every W9
-/// coordinate flows through (named-instance coords, the `wght=400` default
-/// pull, `font_variation`/`font_weight` requests, the bold instance, the
-/// dark nudge). The real code seam: `Renderer::compute_variations` →
-/// `CtFont::new` / `rb_variations` / `varied_metrics_px`. Tier-1 lives in
-/// `aterm-render/tests/variation_instantiation.rs`, which sweeps the real
-/// `f32` function over a bounds lattice INCLUDING NaN/±∞ (floats are outside
-/// ty's Expr language — the fallback-scale-clamp precedent).
+/// Variable-font axis clamp: the abstract twin of `aterm_render::variation::clamp_axis`, which
+/// every coordinate flows through (named-instance coords, the `wght=400` default pull,
+/// `font_variation`/`font_weight` requests, the bold instance, the dark nudge). Its seam is
+/// `Renderer::compute_variations`, feeding `CtFont::new`, `compute_shaping_variations` and
+/// `varied_metrics_px`. Tier-1: `aterm-render/tests/variation_instantiation.rs` sweeps the real
+/// `f32` function over a bounds lattice including NaN/±∞.
 ///
-/// `Pick` chooses an arbitrary normalized axis (`min <= def <= max`, the
-/// ttf-parser parse-time guarantee) and an arbitrary request from a WIDER
-/// range; `Fire` publishes the shipped clamp `out = min(max, max(min, req))`
-/// — or the RAW request when `Buggy = 1` (the pre-W9 behaviour: no
-/// instantiation layer at all, so whatever value arrived was the instance).
-///
-/// Invariants: `CoordInBounds` — a resolved coordinate NEVER leaves its axis
-/// bounds (so `CTFontDescriptorCreateCopyWithVariation`, rustybuzz and
-/// ttf-parser always receive a valid design-space value — resolution is
-/// TOTAL); `CoordExactInRange` — an in-bounds request passes through
-/// unchanged. `ty` PROVES both (Buggy=0) and CATCHES the unclamped pass-through
-/// (Buggy=1: e.g. req=-2 under min=0 escapes the axis).
-// Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
-// models above) — the MODEL it returns is what `ty` machine-checks.
+/// `Pick` chooses a normalized axis (`min <= def <= max`) and a request from a wider range;
+/// `Fire` publishes `out = min(max, max(min, req))`, or the raw request at `Buggy = 1`.
+/// `CoordInBounds`: a resolved coordinate never leaves its axis, so CoreText and aterm-font's
+/// reader and shaper always get a valid design-space value. `CoordExactInRange`: an in-bounds request
+/// passes through unchanged.
+// Skip (T2 vcgen-budget lane): a model data constructor; `ty` checks the model it returns.
 #[cfg_attr(trust_verify, trust::skip)]
+#[crate::model]
 pub fn vf_axis_clamp_model() -> Model {
     let clamp = if_(
         gt(var("min"), var("req")),
@@ -557,8 +503,7 @@ pub fn vf_axis_clamp_model() -> Model {
         fn_vars: vec![],
         actions: vec![
             Action {
-                // An arbitrary axis + request scene. Normalization
-                // (min <= def <= max) is enforced by Fire's guard, mirroring
+                // An arbitrary axis and request; Fire's guard enforces min <= def <= max,
                 // ttf-parser's parse-time guarantee.
                 name: "Pick",
                 guard: Some(le(var("phase"), int(0))),
@@ -611,6 +556,7 @@ pub fn vf_axis_clamp_model() -> Model {
             Invariant {
                 // Resolved states only (phase = 2): the coordinate is on-axis.
                 name: "CoordInBounds",
+                kind: InvariantKind::Claim,
                 expr: or_(
                     neq(var("phase"), int(2)),
                     and_(le(var("min"), var("out")), le(var("out"), var("max"))),
@@ -619,6 +565,7 @@ pub fn vf_axis_clamp_model() -> Model {
             Invariant {
                 // An in-bounds request resolves exactly.
                 name: "CoordExactInRange",
+                kind: InvariantKind::Uncaught,
                 expr: or_(
                     neq(var("phase"), int(2)),
                     or_(
@@ -631,33 +578,22 @@ pub fn vf_axis_clamp_model() -> Model {
     }
 }
 
-/// W9 DARK-NUDGE SAFETY GATE — the abstract twin of
-/// `aterm_render::variation::dark_nudge_permitted`, the checked PRECONDITION
-/// for the theme-polarity weight nudge (`font_weight_dark_nudge`). The real
-/// code seam: `Renderer::compute_variations`' nudge branch, which measures
-/// the `'M'` advance at the nudged coords and at the `fvar` default instance
-/// and admits the nudge ONLY when they agree within 0.25px (monospace
-/// variable fonts hold advances constant across `wght` — the property that
-/// makes a weight nudge grid-safe). Tier-1 lives in
-/// `aterm-render/tests/variation_instantiation.rs` (exhaustive advance
-/// lattice incl. the NaN/∞ failed-measurement rows, plus the live-renderer
-/// geometry-stability binding on SF Mono).
+/// Dark-nudge safety gate: the abstract twin of `aterm_render::variation::dark_nudge_permitted`,
+/// the precondition for the theme-polarity weight nudge (`font_weight_dark_nudge`). Its seam is
+/// `Renderer::compute_variations`' nudge branch, which measures the `'M'` advance at the nudged
+/// coords and at the `fvar` default and admits the nudge only within
+/// `DARK_NUDGE_ADVANCE_TOL_PX` (0.25px): monospace variable fonts hold advances constant across
+/// `wght`, which is what makes a weight nudge grid-safe. Tier-1:
+/// `aterm-render/tests/variation_instantiation.rs` (an advance lattice including NaN/∞ failed
+/// measurements, plus a live-renderer geometry check on SF Mono).
 ///
-/// Advances are abstracted to integer QUARTER-px, so the 0.25px tolerance is
-/// exactly `diff <= 1` (|·| via the two-sided `if`, the ty idiom for abs —
-/// no floats in the Expr language). `Pick` chooses the two measured
-/// advances; `Fire` applies the gate — or, when `Buggy = 1`, applies the
-/// nudge UNCONDITIONALLY (the unguarded moonshot a review would rightly
-/// reject: on a non-advance-stable VF it would silently change every cell's
-/// designed advance).
-///
-/// Invariant `NudgeOnlyWhenInvariant`: a state where the nudge was applied
-/// has `|adv_nudged − adv_default| <= 1` quarter-px. `ty` PROVES it
-/// (Buggy=0) and CATCHES the unconditional nudge (Buggy=1: adv 0 vs 6
-/// still nudges).
-// Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
-// models above) — the MODEL it returns is what `ty` machine-checks.
+/// Advances are integer quarter-px, so the tolerance is `diff <= 1` (abs via a two-sided `if`;
+/// the Expr language has no floats). `Buggy = 1` nudges unconditionally, which on a font whose
+/// advance moves with `wght` changes every cell's advance. `NudgeOnlyWhenInvariant`: an applied
+/// nudge has `|adv_nudged − adv_default| <= 1` quarter-px.
+// Skip (T2 vcgen-budget lane): a model data constructor; `ty` checks the model it returns.
 #[cfg_attr(trust_verify, trust::skip)]
+#[crate::model]
 pub fn vf_nudge_gate_model() -> Model {
     let diff = if_(
         gt(var("adv_n"), var("adv_d")),
@@ -731,38 +667,27 @@ pub fn vf_nudge_gate_model() -> Model {
         invariants: vec![Invariant {
             // An applied nudge implies advance invariance held.
             name: "NudgeOnlyWhenInvariant",
+            kind: InvariantKind::Claim,
             expr: or_(le(var("applied"), int(0)), le(diff, int(1))),
         }],
     }
 }
 
-/// W10 EMOJI STRIKE SELECTION — the abstract twin of the pure strike policy
-/// `aterm_render::select_strike_ppem` (the real code seam:
-/// `pick_glyph_raster`, which walks the sbix strikes that actually carry a
-/// glyph — the ZWJ ppem dead-zone defense — and applies this law to the
-/// carrying set; Tier-1 is aterm-render's `tests/emoji_resample.rs`, which
-/// enumerates the policy over an exhaustive strike lattice, plus the
-/// real-face conformance sweep in aterm-render's in-module tests).
+/// Emoji strike selection: the abstract twin of `aterm_render::select_strike_ppem`. Its seam,
+/// `pick_glyph_raster`, walks the sbix strikes that carry the glyph (the ZWJ ppem dead-zone
+/// defense) and applies this law to that set. Tier-1 is aterm-render's `tests/emoji_resample.rs`
+/// (an exhaustive strike lattice) plus a real-face sweep in its in-module tests.
 ///
-/// This is the model of the always-largest-strike fix: emoji used to
-/// rasterize from the 160px master regardless of cell size (a `u16::MAX`
-/// request), then minify 4–8x through a 2x2-tap filter that skips most
-/// source texels — Apple's hand-tuned small strikes were never used.
-///
-/// Scalar projection `<<s1, s2, s3, t, chosen>>`: three nondeterministic
-/// strike ppems (`0` = that strike does not carry the glyph), the target box
-/// size, and the policy's pick (`0` = no strike carries the glyph). `Pick`
-/// draws the whole space; `Fire` computes `chosen` with the shipped fold —
-/// at `Buggy = 0` the min-adequate-else-max law, at `Buggy = 1` the pre-fix
-/// always-largest pick. Invariants (settled states, `phase = 0`):
-/// `ChosenFromAvailable` (the pick is a real strike), `ChosenAdequateMinimal`
-/// (an adequate strike exists ⇒ the pick is adequate and `=<` every adequate
-/// strike — the clause the old code violates: strikes {1,2}, target 1 → old
-/// picks 2, law demands 1 → `ty` CATCHES Buggy=1), and
-/// `ChosenMaxWhenNoneAdequate`.
-// Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
-// models above) — the MODEL it returns is what `ty` machine-checks.
+/// Projection `<<s1, s2, s3, t, chosen>>`: three nondeterministic strike ppems (`0` = does not
+/// carry the glyph), the target box size, and the pick (`0` = none carries it). `Fire` computes
+/// `chosen` with the shipped fold, min-adequate-else-max; `Buggy = 1` always takes the largest
+/// strike (rasterizing from the master and minifying, so the small strikes go unused).
+/// Invariants (settled states): `ChosenFromAvailable`, `ChosenAdequateMinimal` (if an adequate
+/// strike exists the pick is adequate and `=<` every adequate strike; strikes {1,2} at target 1
+/// refute `Buggy = 1`), and `ChosenMaxWhenNoneAdequate`.
+// Skip (T2 vcgen-budget lane): a model data constructor; `ty` checks the model it returns.
 #[cfg_attr(trust_verify, trust::skip)]
+#[crate::model]
 pub fn strike_selection_model() -> Model {
     // The shipped fold: keep candidate `x` (a carrying strike, so != 0) over
     // incumbent `c` iff
@@ -789,7 +714,7 @@ pub fn strike_selection_model() -> Model {
         )
     };
     let law_fold = law_step("s3", law_step("s2", law_step("s1", int(0))));
-    // Pre-fix (`Buggy = 1`): the largest carrying strike, regardless of target.
+    // `Buggy = 1`: the largest carrying strike, regardless of target.
     let max_step = |x: &'static str, c: Expr| if_(gt(var(x), c.clone()), var(x), c);
     let buggy_fold = max_step("s3", max_step("s2", max_step("s1", int(0))));
     // Per-strike minimality clause: strike i inadequate, or the pick is
@@ -800,8 +725,7 @@ pub fn strike_selection_model() -> Model {
             and_(le(var("t"), var("chosen")), le(var("chosen"), var(x))),
         )
     };
-    // Invariants apply to SETTLED states only (`phase = 0`, after `Fire`);
-    // this clause discharges the mid-`Pick` state.
+    // Invariants hold at settled states (`phase = 0`); this discharges the mid-`Pick` state.
     let mid_pick = gt(var("phase"), int(0));
     let any_adequate = or_(
         le(var("t"), var("s1")),
@@ -884,6 +808,7 @@ pub fn strike_selection_model() -> Model {
             Invariant {
                 // The pick is one of the (possibly absent, = 0) strikes.
                 name: "ChosenFromAvailable",
+                kind: InvariantKind::Uncaught,
                 expr: or_(
                     mid_pick.clone(),
                     or_(
@@ -896,6 +821,7 @@ pub fn strike_selection_model() -> Model {
                 // Every adequate strike bounds the pick from above, and the
                 // pick itself is adequate whenever any adequate strike exists.
                 name: "ChosenAdequateMinimal",
+                kind: InvariantKind::Claim,
                 expr: or_(
                     mid_pick.clone(),
                     and_(
@@ -907,6 +833,7 @@ pub fn strike_selection_model() -> Model {
             Invariant {
                 // No adequate strike: the pick dominates every carrying strike.
                 name: "ChosenMaxWhenNoneAdequate",
+                kind: InvariantKind::Uncaught,
                 expr: or_(
                     mid_pick,
                     or_(

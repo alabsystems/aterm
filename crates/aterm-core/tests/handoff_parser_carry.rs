@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A seamless update carries the parser's partial state.
-//!
-//! The outgoing engine stops wherever the last PTY read ended (inside an SGR,
-//! mid-glyph, halfway through an OSC title) and the rest of that sequence
-//! reaches the successor's parser, which must continue from the same state.
-//!
-//! These drive the GUI's seamless path (`checkpoint_carry_abandoning_partial`
-//! on the outgoing engine, `restore_checkpoint` into a fresh successor, then
-//! the queued tail) and compare against one engine fed the whole stream.
+//! A seamless update carries the parser's partial state: the outgoing engine stops wherever
+//! the last PTY read ended (inside an SGR, mid-glyph, halfway through an OSC title), and a
+//! successor restored from `checkpoint_carry_abandoning_partial` continues the rest of the
+//! sequence exactly as one engine fed the whole stream.
 
 use aterm_core::terminal::Terminal;
 
@@ -112,23 +107,16 @@ fn an_unterminated_osc_title_completes_after_the_handoff() {
     }
 }
 
-/// A DCS STRING SPLIT IN ITS HEADER IS READ AFTER THE HANDOFF AS IT WOULD
-/// HAVE BEEN (round fifteen, R15-PARSER-P1). The header was carried as
-/// `DcsIgnore`: the successor swallowed a DECRQSS or XTGETTCAP query whose
-/// header the park split, so the program waiting for the reply got none, and
-/// an 8-bit ST the live engine drops (C1 controls are off) ended the string
-/// there and printed its payload. Now the header rides as itself: split at
-/// every byte up to the final byte, through either restore door, the
-/// successor replies exactly as one engine fed the whole stream does and
-/// draws the same screen, cursor included.
+/// A DCS string split in its header is read after the handoff as it would have been: the
+/// header rides as itself, so split at every byte up to the final byte, through either
+/// restore door, the successor replies exactly as one engine fed the whole stream does
+/// (a DECRQSS or XTGETTCAP query is answered) and draws the same screen, cursor included.
 ///
-/// The third stream is a sixel header. With aterm-core's `sixel` feature (on
-/// in any build that links aterm-gui, so in `targo test --workspace`) the
-/// reference draws the image on row 0 and `after` below it; without it the
-/// string is consumed and `after` is row 0. Either way the payload is never
-/// text, and the successor must draw exactly what the reference drew
-/// (2026-10-11, land of round fifteen: the test pinned the no-sixel row and
-/// failed only under the workspace's feature set).
+/// The third stream is a sixel header holding an 8-bit ST, which the engine drops (C1
+/// controls are off). With aterm-core's `sixel` feature (on in any build that links
+/// aterm-gui, so in `targo test --workspace`) the reference draws the image on row 0 and
+/// `after` below it; without it the string is consumed and `after` is row 0. Either way
+/// the payload is never text.
 #[test]
 fn a_dcs_string_split_in_its_header_is_read_as_it_would_have_been() {
     for (stream, query) in [
@@ -215,16 +203,13 @@ fn a_refused_carry_resumes_at_ground() {
     );
 }
 
-/// Engine state that output still to come relies on (update audit round
-/// eight, finding 502). The parser carry
-/// continues a sequence split at the park, but these states live in the
-/// engine: the character REP (`CSI b`) repeats, an open OSC 8 link, an SGR 58
-/// underline colour, a VT52 `ESC Y` waiting for its address bytes, a ZWJ
-/// waiting for the emoji it joins, the XTPUSHSGR stack, the XTSAVE'd modes,
-/// and a complete flag (else the next regional indicator joins its cell).
-/// Each split, handed over through either restore door, must land on the
-/// screen one engine fed the whole stream draws: same cells (underline colour
-/// included), text, link on every cell and cursor.
+/// Engine state that output still to come relies on. The parser carry continues a sequence
+/// split at the park, but these states live in the engine: the character REP (`CSI b`)
+/// repeats, an open OSC 8 link, an SGR 58 underline colour, a VT52 `ESC Y` waiting for its
+/// address bytes, a ZWJ waiting for the emoji it joins, the XTPUSHSGR stack, the XTSAVE'd
+/// modes, and a complete flag (else the next regional indicator joins its cell). Each
+/// split, through either restore door, must land on the screen one engine fed the whole
+/// stream draws: same cells (underline colour included), text, links and cursor.
 #[test]
 fn split_at_park_matches_unsplit() {
     let mut lost = Vec::new();
@@ -299,7 +284,7 @@ fn split_at_park_matches_unsplit() {
         "the handed-over screen differs from the unsplit one for: {lost:?}"
     );
 
-    // NON-VACUITY: each reference really shows the state the split must keep.
+    // Non-vacuity: each reference really shows the state the split must keep.
     assert_eq!(row(&never_handed_over(b"X", b"\x1b[5b"), 0), "XXXXXX");
     let link = never_handed_over(b"\x1b]8;id=p;http://a\x1b\\ab", b"cd\x1b]8;;\x1b\\");
     assert_eq!(link.hyperlink_at(0, 3), Some("http://a"), "d is linked");

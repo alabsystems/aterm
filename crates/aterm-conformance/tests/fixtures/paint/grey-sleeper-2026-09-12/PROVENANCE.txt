@@ -1,0 +1,24 @@
+grey-sleeper-2026-09-12 — three frames of a kept paint-probe take, verbatim.
+
+Source: the v0.82.0 cut's paint smoke (tools/paint-conformance/paint_probe.sh,
+shape fake-claude, focused, starved=no), scanned on 2026-09-12 against the
+shipped v0.82.0 binary; the retained take was /tmp/atpaint-xgQoLw (25 image-burst
+frames, 584x350, cell_w=7 cell_h=14). The probe read pet_claimed=25
+pet_missing=21 on it while a grey sleeping cat was drawn inside the engine's
+claimed pet_body cell on every frame.
+
+Files:
+  shot_0000.png      frame 0  (isolating), pet_pose=pet_sleep_1, body 215/24x14
+  shot_0011.png      frame 11 (mid-take),  pet_pose=pet_sleep_0, body 209/24x13
+  shot_0022.png      frame 22 (isolating), pet_pose=pet_sleep_1, body 226/24x15
+  trail-status.rows  the paired `trail status` rows of exactly those frames,
+                     in that order
+
+sha256:
+  ed2209b882385700c2a086f12cea2951c699fd2fc7ea2909d827c307aa0b93ca  shot_0000.png
+  a30a8c76ac3bc38ef59e41f8af005313ed1c2b99157fb7d442ea77b806c4f165  shot_0011.png
+  06318a73c272952a04536963d877f20b4870b792d48cd6a7b9c9fa507143482c  shot_0022.png
+
+Pinned by the sleeper tests in crates/aterm-conformance/src/measure/scan_tests.rs;
+the rule is RESTING_POSE_STEMS in scan.rs. Do not re-encode or crop: the pin is about the
+kept take's geometry.

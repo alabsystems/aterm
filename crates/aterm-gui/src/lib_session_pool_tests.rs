@@ -37,6 +37,7 @@ fn test_session(id: u64) -> Session {
         generation_look: Default::default(),
         reset_lane: Default::default(),
         update_parked: Default::default(),
+        fenced_writes: Default::default(),
     });
     Session {
         child_reaped: std::sync::atomic::AtomicBool::new(false),

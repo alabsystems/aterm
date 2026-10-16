@@ -97,8 +97,7 @@ impl Tier {
 /// The chain-narrowing policy: two INDEPENDENT switches plus the code point's
 /// Unicode presentation. Keeping them separate fields (never one merged flag) is
 /// the fix the tofu bug demanded, and P4 of `tests/font_chain_conservation.rs`
-/// (with `the_laws_catch_the_shipped_seal_regression`, its mutant) is what holds
-/// them apart.
+/// is what holds them apart.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ChainPolicy {
     /// The E1 host switch (`Renderer::set_runtime_font_discovery`): `false` means

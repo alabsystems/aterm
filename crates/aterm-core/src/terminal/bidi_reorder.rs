@@ -2,35 +2,26 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! BiDi visual-reordering bridge (feature `bidi`).
+//! BiDi visual-reordering bridge (feature `bidi`, off by default, on in `aterm-gui`):
+//! wires [`BiDiMode`] + [`ParagraphDirection`] to the UAX #9 reordering in
+//! `aterm-bidi`. Without the feature rows render in logical order.
 //!
-//! Wires the engine's BiDi configuration ([`BiDiMode`] + [`ParagraphDirection`])
-//! to the UAX #9 reordering in `aterm-bidi`. Compiled only with the
-//! off-by-default `bidi` feature (on in `aterm-gui`); without it rows render in
-//! logical order.
+//! [`Terminal::apply_bidi_reorder`] permutes each row of the render snapshot (from
+//! `cell_frame_into`) into visual order for the CPU and GPU renderers and the `image`
+//! capture, gated at runtime by [`BiDiMode`] (default `Implicit`).
 //!
-//! [`Terminal::apply_bidi_reorder`] permutes each row of the render snapshot
-//! (from `cell_frame_into`) into visual order, so RTL runs display correctly in
-//! the CPU and GPU renderers and the `image` capture. Gated at runtime by
-//! [`BiDiMode`] (default `Implicit`); pure-LTR rows are skipped.
-//!
-//! Each row is resolved against the SCP paragraph direction (`CSI Ps SP k`;
-//! the default `Auto` is LTR). First-strong autodetection (UAX #9 P2/P3) runs
-//! only while DECSET 2501 (`modes.bidi_autodetection`) is set, default off per
-//! the Terminal WG, so an `ls` row whose first entry is Hebrew stays an LTR
-//! paragraph instead of mirroring its columns.
+//! Each row resolves against the SCP paragraph direction (`CSI Ps SP k`; the default
+//! `Auto` is LTR). First-strong autodetection (UAX #9 P2/P3) runs only while DECSET
+//! 2501 (`modes.bidi_autodetection`) is set, default off per the Terminal WG, so an
+//! `ls` row whose first entry is Hebrew stays an LTR paragraph instead of mirroring
+//! its columns.
 
 use super::Terminal;
 use aterm_types::{BiDiMode, ParagraphDirection};
 
 impl Terminal {
-    /// Visual→logical column permutation for a row whose cells hold the scalar
-    /// values `scalars`, honoring this terminal's current BiDi mode/direction.
-    ///
-    /// `result[v] == l` means the logical cell at index `l` is drawn at visual
-    /// column `v` (left to right). Returns the identity permutation `0,1,2,…` when
-    /// BiDi is disabled or the line is pure left-to-right, so a renderer can apply
-    /// the result unconditionally.
+    /// Visual→logical column permutation for `scalars` under this terminal's BiDi
+    /// settings (`result[v] == l`); the identity when BiDi is off or the line is LTR.
     #[must_use]
     #[cfg(test)]
     pub fn bidi_visual_order(&self, scalars: &[char]) -> Vec<usize> {
@@ -42,16 +33,16 @@ impl Terminal {
         )
     }
 
-    /// Visual→logical cell permutation for a rendered row, honoring this
-    /// terminal's BiDi mode/direction and wide-glyph pairing: a wide glyph's
-    /// lead and continuation cells stay paired and unmirrored. `result[v] == l`
-    /// means logical cell `l` is drawn at visual column `v`. The identity when
-    /// BiDi is disabled or the row is pure LTR. The cell-level companion to
-    /// [`Self::bidi_visual_order`], called per visible row by renderers.
+    /// Visual→logical cell permutation for a rendered row under this terminal's BiDi
+    /// mode/direction; a wide glyph's lead and continuation cells stay paired and
+    /// unmirrored. `result[v] == l` means logical cell `l` is drawn at visual column
+    /// `v`; the identity when BiDi is disabled or the row is pure LTR. Renderers call
+    /// it per visible row.
     #[must_use]
     pub fn bidi_visual_order_cells(&self, cells: &[super::RenderCell]) -> Vec<usize> {
-        // Fast path: with BiDi off, skip the per-cell scalar/flag allocations.
-        if self.modes.bidi_mode == BiDiMode::Disabled {
+        // Fast path: with BiDi off or no codepoint at/past the first RTL block
+        // (U+0590), skip the per-cell scalar/flag allocations.
+        if self.modes.bidi_mode == BiDiMode::Disabled || !cells.iter().any(|c| c.ch >= '\u{0590}') {
             return (0..cells.len()).collect();
         }
         let chars: Vec<char> = cells.iter().map(|c| c.ch).collect();
@@ -68,7 +59,9 @@ impl Terminal {
     /// Visible row `row` in display order, for introspection: the row's text as
     /// the frame paints it, and the visual→logical map the renderer applies
     /// ([`Self::bidi_visual_order_cells`] over the same cells; `map[v] == l`). A
-    /// wide glyph's continuation contributes no text and trailing blanks are
+    /// cell at a right-to-left level reads as its Bidi_Mirroring_Glyph, as the
+    /// frame draws it (UAX #9 L4 in [`Self::apply_bidi_reorder`]). A wide
+    /// glyph's continuation contributes no text and trailing blanks are
     /// dropped; the map covers every column. The identity when BiDi is off or
     /// the row is pure LTR. `None` for a row off the screen.
     #[must_use]
@@ -89,17 +82,28 @@ impl Terminal {
                 one.chars().next().unwrap_or(' ')
             })
             .collect();
-        let map = compute_visual_order_cells(
+        let mut levels = aterm_bidi::Scratch::default();
+        let map = visual_order_cells_into(
             self.modes.bidi_mode,
             self.modes.bidi_direction,
             self.modes.bidi_autodetection,
             &chars,
             &continuation,
+            &mut levels,
         );
         let mut text = String::with_capacity(usize::from(cols));
         for &l in &map {
             if let Ok(col) = u16::try_from(l) {
+                let start = text.len();
                 super::content::push_cell_text(&self.grid, row, col, &mut text);
+                // L4, as `apply_bidi_reorder` paints the cell's first scalar.
+                if levels.cell_is_rtl(l)
+                    && let Some(first) = text.get(start..).and_then(|t| t.chars().next())
+                    && let Some(mirror) = aterm_bidi::mirror_glyph(first)
+                {
+                    let end = start + first.len_utf8();
+                    text.replace_range(start..end, mirror.encode_utf8(&mut [0; 4]));
+                }
             }
         }
         let end = text.trim_end().len();
@@ -107,19 +111,16 @@ impl Terminal {
         Some((text, map))
     }
 
-    /// Where a pointer on viewport cell (`row`, `col`) lands in logical order:
-    /// the logical column of the cell the frame paints at visual column `col`
-    /// of viewport row `row` (the offset-aware row a frame fill renders), and
-    /// whether that cell resolved right-to-left.
+    /// Where a pointer on viewport cell (`row`, `col`) lands in logical order: the
+    /// logical column of the cell the frame paints at visual column `col` of the
+    /// offset-aware viewport row, and whether that cell resolved right-to-left.
     ///
-    /// The selection model is logical (the BiDi recommendation's "selection
-    /// operates on the model", and VTE's pointer path): a pointer anchors at
-    /// the logical cell under it, and on a right-to-left cell the half-cell
-    /// side flips, since its visual left half is its logical end. The
-    /// permutation is the renderer's ([`Self::bidi_visual_order_cells`] over
-    /// the same cells); `(col, false)` when BiDi is off, the row has no
-    /// right-to-left text, or `col` is past the row's written cells, where no
-    /// row is ever permuted.
+    /// Selection is logical (the BiDi recommendation's "selection operates on the
+    /// model", as in VTE): a pointer anchors at the logical cell under it, and on an
+    /// RTL cell the half-cell side flips, since its visual left half is its logical
+    /// end. The permutation is the renderer's ([`Self::bidi_visual_order_cells`] over
+    /// the same cells); `(col, false)` when BiDi is off, the row has no RTL text, or
+    /// `col` is past the row's written cells.
     #[must_use]
     pub fn viewport_cell_logical(&self, row: u16, col: u16) -> (u16, bool) {
         if self.modes.bidi_mode == BiDiMode::Disabled {
@@ -136,59 +137,75 @@ impl Terminal {
         {
             return (col, false);
         }
-        let cells = self.render_row(usize::from(row));
+        // Each cell's scalar, wide-continuation flag and class straight from `view`,
+        // by the `render_row_into_impl` rule, without building `RenderCell`s.
+        let len = usize::from(view.len());
         let visual = usize::from(col);
-        if visual >= cells.len() || !cells.iter().any(|c| c.ch >= '\u{0590}') {
-            return (col, false);
+        let mut chars = Vec::with_capacity(len);
+        let mut wide = Vec::with_capacity(len);
+        let mut classes = Vec::with_capacity(len);
+        let mut has_rtl_candidate = false;
+        let mut prev_wide = false;
+        for c in 0..view.len() {
+            let Some(cell) = view.cell(c) else {
+                prev_wide = false;
+                continue;
+            };
+            let is_wide_cont = cell.is_wide_continuation() && !cell.is_wide() && prev_wide;
+            prev_wide = cell.is_wide();
+            let raw = if cell.is_complex() {
+                view.cell_data(c, cell).complex_base().unwrap_or('\u{FFFD}')
+            } else {
+                cell.char()
+            };
+            let ch = if is_wide_cont || raw == '\0' {
+                ' '
+            } else {
+                raw
+            };
+            has_rtl_candidate |= ch >= '\u{0590}';
+            chars.push(ch);
+            wide.push(is_wide_cont);
+            classes.push(aterm_bidi::bidi_class(ch));
         }
-        let classes: Vec<aterm_bidi::BidiClass> =
-            cells.iter().map(|c| aterm_bidi::bidi_class(c.ch)).collect();
-        if !aterm_bidi::has_bidi_classes(&classes) {
+        if visual >= chars.len() || !has_rtl_candidate || !aterm_bidi::has_bidi_classes(&classes) {
             return (col, false);
         }
         let brackets: Vec<aterm_bidi::Bracket> =
-            cells.iter().map(|c| aterm_bidi::bracket_of(c.ch)).collect();
-        let wide: Vec<bool> = cells.iter().map(|c| c.wide).collect();
+            chars.iter().map(|&ch| aterm_bidi::bracket_of(ch)).collect();
         let base = base_direction_from_classes(
             self.modes.bidi_direction,
             self.modes.bidi_autodetection,
             &classes,
         );
+        let levels = aterm_bidi::cell_levels(&classes, &brackets, &wide, base);
+        if !levels.iter().any(|&lvl| lvl > 0) {
+            return (col, false);
+        }
         let order = aterm_bidi::reorder_cells_with_classes(&classes, &brackets, &wide, base);
         let logical = order.get(visual).copied().unwrap_or(visual);
-        let levels = aterm_bidi::cell_levels(&classes, &brackets, &wide, base);
         let rtl = levels.get(logical).is_some_and(|level| level % 2 == 1);
         (u16::try_from(logical).unwrap_or(col), rtl)
     }
 
-    /// Reorder each row of a render snapshot into BiDi visual order, in place.
-    ///
-    /// Applies [`Self::bidi_visual_order_cells`] to the dense
+    /// Reorder each row of a render snapshot into BiDi visual order, in place:
+    /// [`Self::bidi_visual_order_cells`] applied to the dense
     /// [`RenderCell`](super::RenderCell) row, the column-indexed sparse arrays
-    /// (clusters, combining marks, inline images) and the cursor column, and
-    /// records the permutation in
+    /// (clusters, combining marks, inline images) and the cursor column, with the
+    /// permutation recorded in
     /// [`RenderInput::visual_to_logical`](crate::render::RenderInput::visual_to_logical)
-    /// (whose rows the caller has reset to the identity). Called
-    /// from [`Terminal::cell_frame_into`](super::Terminal::cell_frame_into).
-    /// Pure-LTR rows are skipped by a first-RTL-block guard; a no-op when BiDi is
-    /// disabled.
+    /// (whose rows the caller reset to the identity). Called from
+    /// [`Terminal::cell_frame_into`](super::Terminal::cell_frame_into).
     ///
-    /// Rows resolve against the SCP paragraph direction, with first-strong
-    /// autodetection only under DECSET 2501 (see
-    /// [`base_direction_from_classes`]). By default each row is an LTR
-    /// paragraph, so only RTL runs reverse in place and the cursor stays on its
-    /// cell.
+    /// `refill_mask` is the damage-scoped arm's row mask (`None` on the full arm: every
+    /// row). Unnamed rows are retained, which the carrier allows only when the previous
+    /// fill permuted nothing ([`RenderInput::engine_row_order`] was `Logical`) and no
+    /// mode/direction/autodetection change forced full damage (`invalidate_bidi_all`);
+    /// such a row reorders as the identity, so skipping it is exact and keeps the scoped
+    /// arm `O(damaged rows × cols)`.
     ///
-    /// `refill_mask` is the damage-scoped arm's row mask (`None` on the full arm:
-    /// every row). Unnamed rows are retained, which the carrier allows only when
-    /// the previous fill permuted nothing ([`RenderInput::engine_row_order`] was
-    /// `Logical`) and no mode/direction/autodetection change forced full damage
-    /// (`invalidate_bidi_all`); a retained row then reorders as the identity, so
-    /// skipping it is exact and keeps the scoped arm `O(damaged rows × cols)`.
-    ///
-    /// Returns whether any row was permuted, stamped into `engine_row_order`:
-    /// `true` makes the next frame take the full arm (retained rows would be in
-    /// visual order), never this frame wrong.
+    /// Returns whether any row was permuted, stamped into `engine_row_order`: `true`
+    /// sends the next frame down the full arm (retained rows would be in visual order).
     pub(crate) fn apply_bidi_reorder(
         &mut self,
         frame: &mut crate::render::RenderInput,
@@ -200,20 +217,17 @@ impl Terminal {
         let mut reordered_any = false;
         let dir = self.modes.bidi_direction;
         let autodetect = self.modes.bidi_autodetection;
-        // Reusable scratch buffers held on `bidi_state`, cleared and refilled per
-        // row, so a stable terminal size reorders without reallocation.
+        // Scratch buffers live on `bidi_state`, so a stable size never reallocates.
         let scratch = &mut self.bidi_state.scratch;
         for r in 0..frame.cells.len() {
-            // Retained (unmasked) row on the damage-scoped arm: provably still
-            // the identity under the carrier's preconditions (see the doc).
+            // A retained (unmasked) row is still the identity (see the doc).
             if let Some(mask) = refill_mask
                 && mask.get(r / 64).is_none_or(|w| w & (1u64 << (r % 64)) == 0)
             {
                 continue;
             }
-            // Skip rows with no codepoint at or after the first RTL block
-            // (U+0590); only those can reorder. Then compute per-cell BiDi classes
-            // and wide flags once into the scratch.
+            // Only a row with a codepoint at or past the first RTL block (U+0590)
+            // can reorder.
             {
                 let row = &frame.cells[r];
                 if !row.iter().any(|c| c.ch >= '\u{0590}') {
@@ -236,8 +250,6 @@ impl Terminal {
             scratch
                 .brackets
                 .extend(frame.cells[r].iter().map(|c| aterm_bidi::bracket_of(c.ch)));
-            // Resolve the visual→logical cell permutation into
-            // `scratch.cell_order`, reusing the UAX #9 working memory.
             aterm_bidi::reorder_cells_with_classes_into(
                 &scratch.classes,
                 &scratch.brackets,
@@ -256,12 +268,23 @@ impl Terminal {
             for (v, &l) in scratch.cell_order.iter().enumerate() {
                 scratch.inv[l] = v;
             }
-            // Dense cells: visual[v] = logical[order[v]] (RenderCell is Copy). Build
-            // into the reused row buffer, then swap it into place — no fresh Vec.
+            // Dense cells: visual[v] = logical[order[v]], built in the reused row
+            // buffer and swapped into place. UAX #9 L4 on the way: a cell that
+            // resolved right to left is drawn with its Bidi_Mirroring_Glyph, so
+            // a bracket inside RTL text faces the way the text reads, on every
+            // font and every render path (the shaper no longer mirrors; TF.6 of
+            // docs/AUDIT-third-party-2026-10-15.md).
             scratch.row_tmp.clear();
-            scratch
-                .row_tmp
-                .extend(scratch.cell_order.iter().map(|&l| frame.cells[r][l]));
+            let levels = &scratch.bidi;
+            scratch.row_tmp.extend(scratch.cell_order.iter().map(|&l| {
+                let mut cell = frame.cells[r][l];
+                if levels.cell_is_rtl(l)
+                    && let Some(mirror) = aterm_bidi::mirror_glyph(cell.ch)
+                {
+                    cell.ch = mirror;
+                }
+                cell
+            }));
             std::mem::swap(&mut frame.cells[r], &mut scratch.row_tmp);
             // Sparse, column-indexed arrays: remap each logical col to visual.
             fn remap_cols<T>(entries: &mut [(usize, T)], inv: &[usize]) {
@@ -270,11 +293,9 @@ impl Terminal {
                         *c = inv[*c];
                     }
                 }
-                // Reordering leaves the (col, _) keys unsorted: re-sort by column,
-                // stably so one cell's image layers keep their draw order, so the
-                // per-column lookups (RenderInput::cluster_at/combining_at/images_at,
-                // the CPU cluster_for/combining_for/image_covers) stay binary
-                // searches. Only reordered rows reach here.
+                // Re-sort by column, stably so one cell's image layers keep their
+                // draw order: the per-column lookups (`RenderInput::cluster_at` and
+                // kin, the CPU renderer's `cluster_for` and kin) binary-search.
                 entries.sort_by_key(|(c, _)| *c);
             }
             remap_cols(&mut frame.clusters[r], &scratch.inv);
@@ -285,8 +306,8 @@ impl Terminal {
                 frame.cursor_col = scratch.inv[frame.cursor_col];
             }
             // Record the map, so the selection and find tints test each painted
-            // cell at its logical column (`RenderInput::selection_hit`). A row
-            // is at most `u16::MAX` columns (the grid's own column type).
+            // cell at its logical column (`RenderInput::selection_hit`). A row has
+            // at most `u16::MAX` columns (the grid's column type).
             if let Some(map) = frame.visual_to_logical.get_mut(r) {
                 map.clear();
                 map.extend(
@@ -302,11 +323,8 @@ impl Terminal {
     }
 }
 
-/// Pure mapping from BiDi config and line scalars to the visual→logical
-/// permutation. `autodetect` is DECSET 2501: whether first-strong detection
-/// may override the SCP direction `dir` (see [`base_direction`]).
-/// Free-standing so it is testable without a `Terminal`;
-/// `Terminal::bidi_visual_order` wraps it.
+/// Pure mapping from BiDi config and line scalars to the visual→logical permutation,
+/// testable without a `Terminal`. `autodetect` is DECSET 2501 (see [`base_direction`]).
 #[must_use]
 #[cfg(test)]
 pub fn compute_visual_order(
@@ -323,10 +341,9 @@ pub fn compute_visual_order(
     aterm_bidi::reorder_visual_to_logical(scalars, base)
 }
 
-/// Cell-level companion to [`compute_visual_order`]: per-cell scalars and
-/// wide-continuation flags in, visual→logical cell permutation out, keeping
-/// wide-glyph pairs together (see [`aterm_bidi::reorder_cells_with_classes`]).
-/// `autodetect` is DECSET 2501.
+/// Per-cell scalars and wide-continuation flags in, visual→logical cell permutation
+/// out, keeping wide-glyph pairs together (see
+/// [`aterm_bidi::reorder_cells_with_classes`]). `autodetect` is DECSET 2501.
 #[must_use]
 pub fn compute_visual_order_cells(
     mode: BiDiMode,
@@ -335,11 +352,31 @@ pub fn compute_visual_order_cells(
     cell_chars: &[char],
     is_wide_continuation: &[bool],
 ) -> Vec<usize> {
-    if mode == BiDiMode::Disabled {
+    visual_order_cells_into(
+        mode,
+        dir,
+        autodetect,
+        cell_chars,
+        is_wide_continuation,
+        &mut aterm_bidi::Scratch::default(),
+    )
+}
+
+/// [`compute_visual_order_cells`], resolving into `levels`, which then answers
+/// which logical cells are right to left (`Scratch::cell_is_rtl`; none, for the
+/// identity this returns without resolving).
+fn visual_order_cells_into(
+    mode: BiDiMode,
+    dir: ParagraphDirection,
+    autodetect: bool,
+    cell_chars: &[char],
+    is_wide_continuation: &[bool],
+    levels: &mut aterm_bidi::Scratch,
+) -> Vec<usize> {
+    if mode == BiDiMode::Disabled || !cell_chars.iter().any(|&c| c >= '\u{0590}') {
         return (0..cell_chars.len()).collect();
     }
-    // Compute per-cell BiDi classes once and derive the `has_bidi` check, base
-    // direction and level resolution from them.
+    // Classes once, for the `has_bidi` check, base direction and levels.
     let classes: Vec<aterm_bidi::BidiClass> = cell_chars
         .iter()
         .map(|&c| aterm_bidi::bidi_class(c))
@@ -352,20 +389,25 @@ pub fn compute_visual_order_cells(
         .iter()
         .map(|&c| aterm_bidi::bracket_of(c))
         .collect();
-    aterm_bidi::reorder_cells_with_classes(&classes, &brackets, is_wide_continuation, base)
+    let mut order = Vec::new();
+    aterm_bidi::reorder_cells_with_classes_into(
+        &classes,
+        &brackets,
+        is_wide_continuation,
+        base,
+        levels,
+        &mut order,
+    );
+    order
 }
 
-/// Map the engine's [`ParagraphDirection`] onto an `aterm-bidi`
-/// `BaseDirection`.
+/// Map the engine's [`ParagraphDirection`] onto an `aterm-bidi` `BaseDirection`.
 ///
-/// `autodetect` is DECSET 2501, which the Terminal WG makes the only switch for
-/// first-strong detection (default off; SCP 0 is the terminal's default, LTR).
-/// Without it `Auto` is an LTR paragraph and `AutoRtl` an RTL one; with it
-/// both run UAX #9 P2/P3 over the row.
-///
-/// `AutoRtl` under autodetection resolves to `Auto` when a strong L/R/AL
-/// character is present and `Rtl` otherwise. SCP 1/2 (`Ltr`/`Rtl`) force
-/// their direction.
+/// `autodetect` is DECSET 2501, the Terminal WG's only switch for first-strong
+/// detection (default off; SCP 0 is the terminal's default, LTR). Without it `Auto` is
+/// an LTR paragraph and `AutoRtl` an RTL one; with it `Auto` runs UAX #9 P2/P3 and
+/// `AutoRtl` does too when a strong L/R/AL character is present (else `Rtl`). SCP 1/2
+/// (`Ltr`/`Rtl`) force their direction.
 #[cfg(test)]
 fn base_direction(
     dir: ParagraphDirection,
@@ -373,7 +415,6 @@ fn base_direction(
     scalars: &[char],
 ) -> aterm_bidi::BaseDirection {
     use aterm_bidi::{BaseDirection, BidiClass};
-    // The terminal's default: first-strong detection only while 2501 is set.
     let default_ltr = if autodetect {
         BaseDirection::Auto
     } else {
@@ -399,8 +440,6 @@ fn base_direction(
                 BaseDirection::Rtl
             }
         }
-        // `ParagraphDirection` is #[non_exhaustive]; any future variant behaves
-        // as `Auto`, the terminal's default.
         _ => default_ltr,
     }
 }
@@ -461,7 +500,7 @@ mod tests {
         // Default BiDiMode is Implicit, so a fresh terminal reorders RTL.
         assert_ne!(term.modes.bidi_mode, BiDiMode::Disabled);
 
-        // Write three Hebrew letters: logical order ALEF, bet, GIMEL.
+        // Three Hebrew letters in logical order: alef, bet, gimel.
         term.process("\u{05D0}\u{05D1}\u{05D2}".as_bytes());
         let frame = term.cell_frame(4, 8);
         let row: Vec<char> = frame.cells[0].iter().take(3).map(|c| c.ch).collect();
@@ -498,6 +537,26 @@ mod tests {
         assert_ne!(ltr, rtl, "SCP must reproject the already-stored row");
         assert!(term.has_damage());
         assert!(term.damage_epoch() > before);
+    }
+
+    /// UAX #9 L4 (TF.6 of docs/AUDIT-third-party-2026-10-15.md): a cell that
+    /// resolved right to left is drawn with its Bidi_Mirroring_Glyph, so a
+    /// bracket inside Hebrew text faces the way the text reads, and the same
+    /// bracket around a Hebrew word in a left-to-right line, at the line's
+    /// level, stays as written. Before, only the run shaper mirrored (every
+    /// bracket of a right-to-left run, whatever its level), and only on a
+    /// ligature font.
+    #[test]
+    fn cell_frame_mirrors_right_to_left_brackets() {
+        let mut term = Terminal::new(2, 8);
+        term.process(format!("{ALEF}({BET})\u{05D2}\r\n({ALEF}{BET})").as_bytes());
+        let frame = term.cell_frame(2, 8);
+        let row =
+            |r: usize, n: usize| -> String { frame.cells[r][..n].iter().map(|c| c.ch).collect() };
+        // Reversed, and each bracket (at the RTL level) drawn mirrored.
+        assert_eq!(row(0, 5), format!("\u{05D2}({BET}){ALEF}"));
+        // The brackets take the line's LTR level: as written, the word reversed.
+        assert_eq!(row(1, 4), format!("({BET}{ALEF})"));
     }
 
     #[test]
@@ -537,7 +596,7 @@ mod tests {
 
     #[test]
     fn implicit_reorders_rtl() {
-        // Hebrew run reverses under implicit auto-detection.
+        // A Hebrew run reverses within the default LTR paragraph.
         assert_eq!(
             cv(
                 BiDiMode::Implicit,
@@ -550,8 +609,7 @@ mod tests {
 
     #[test]
     fn explicit_mode_also_reorders_via_the_bridge() {
-        // The bridge reorders for any non-Disabled mode (Explicit included);
-        // the mode distinction is handled upstream.
+        // The bridge treats every non-Disabled mode alike (Explicit included).
         assert_eq!(
             cv(BiDiMode::Explicit, ParagraphDirection::Rtl, "ab"),
             vec![0, 1]
@@ -708,6 +766,15 @@ mod tests {
             text.contains('\u{4E2D}'),
             "the wide glyph is whole: {text:?}"
         );
+        // A bracket inside right-to-left text reads mirrored, as painted; one
+        // around it, at the line's level, as written.
+        let mut brackets = Terminal::new(1, 10);
+        brackets.process("(\u{05D0}(\u{05D1})\u{05D2})".as_bytes());
+        let (text, _) = brackets.row_display_order(0).expect("on screen");
+        let frame = brackets.cell_frame(1, 10);
+        let painted: String = frame.cells[0][..7].iter().map(|c| c.ch).collect();
+        assert_eq!(text, painted, "the read is what the frame paints");
+        assert_eq!(text, "(\u{05D2}(\u{05D1})\u{05D0})");
         let mut ltr = Terminal::new(2, 10);
         ltr.process(b"hello");
         let (text, map) = ltr.row_display_order(0).expect("on screen");
@@ -907,13 +974,10 @@ mod tests {
         );
     }
 
-    /// The map's DIRECTION, on a row whose permutation is not its own
-    /// inverse. A lone RTL run reversed in place maps each cell to its mirror,
-    /// so a map recorded or read backwards (logical→visual, or a level read at
-    /// the visual index) gives the same answers there. Hebrew with a number
-    /// does not: in `abc אב 12 ג def` the number keeps its digits in order
-    /// (UAX #9 I2 lifts it to level 2) inside the reversed run, so the frame
-    /// paints `abc ג 12 בא def`.
+    /// The map's direction, on a row whose permutation is not its own inverse (a lone
+    /// reversed run is, so it cannot tell visual→logical from logical→visual): in
+    /// `abc אב 12 ג def` the number keeps its digit order inside the reversed run
+    /// (UAX #9 I2 lifts it to level 2), so the frame paints `abc ג 12 בא def`.
     #[test]
     fn a_number_inside_an_rtl_run_pins_the_maps_direction() {
         const ROW: &str = "abc \u{05D0}\u{05D1} 12 \u{05D2} def";

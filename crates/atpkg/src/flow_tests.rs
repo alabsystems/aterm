@@ -4,7 +4,6 @@
 use super::*;
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use std::collections::HashMap;
-use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -25,7 +24,8 @@ const RELEASE_SEED: [u8; 32] = testkit::MACHINE_SEED;
 /// Display, the same text the singleton lane shows through `FlowError::Stage`).
 #[test]
 fn stage_failure_note_names_program_build_and_cause() {
-    let cause = StageError::Sha256Mismatch {
+    let cause = StageError::DigestMismatch {
+        alg: crate::manifest::DigestAlg::Sha256,
         expected: "aa".to_string(),
         got: "bb".to_string(),
     }
@@ -131,10 +131,7 @@ fn make_archive_with(dir: &Path, ay_content: &[u8], ay_mode: &[u8; 8]) -> PathBu
     )); // sensitive → refused shim
     tar.resize(tar.len() + 1024, 0);
     let path = dir.join("ay-18.tar.zst");
-    let f = std::fs::File::create(&path).unwrap();
-    let mut enc = zstd::Encoder::new(f, 0).unwrap();
-    enc.write_all(&tar).unwrap();
-    enc.finish().unwrap();
+    std::fs::write(&path, crate::extract::fixtures::zstd_bytes(&tar)).unwrap();
     path
 }
 
@@ -210,6 +207,7 @@ fn signed_root_of(archive: &Path, probe: &Path) -> String {
         10_000_000,
         10_000,
         crate::extract::ExtractOptions::default(),
+        crate::extract::FrameChecksum::IfPresent,
     )
     .unwrap()
     .root()
@@ -491,7 +489,9 @@ fn probe_an_install_under_an_open_umask() {
     // and the memo of a refused stage.
     let env = crate::shim_env::ShimEnv::admit(&["DISABLE_AUTOUPDATER=1".to_string()]).unwrap();
     crate::shim_env::write_sidecar(&layout.build_dir("claude", 2_026_091_301), &env).unwrap();
-    crate::store::record_stage_refusal(&layout.build_dir("nn", 3), "aa", "bb", "probe", 0).unwrap();
+    let digest = (crate::manifest::DigestAlg::Sha256, "aa");
+    crate::store::record_stage_refusal(&layout.build_dir("nn", 3), digest, "bb", "probe", 0)
+        .unwrap();
     let mut loose = Vec::new();
     writable_by_others(&layout.prefix, &layout.prefix, &mut loose);
     assert!(loose.is_empty(), "laid writable by others: {loose:#?}");
@@ -738,7 +738,7 @@ fn a_failed_stage_retains_one_verified_archive_and_a_digest_failure_none() {
     std::fs::write(&archive, b"not the bytes the row signed").unwrap();
     let err = install(&good, &dlayout, &anchor(), &req, fl(0), 0).unwrap_err();
     assert!(
-        matches!(err, FlowError::Stage(StageError::Sha256Mismatch { .. })),
+        matches!(err, FlowError::Stage(StageError::DigestMismatch { .. })),
         "PRECONDITION: the digest gate must fail: {err:?}"
     );
     assert!(
@@ -2116,10 +2116,7 @@ fn prog_archive(dir: &Path, program: &str, build: u64) -> PathBuf {
     ));
     tar.resize(tar.len() + 1024, 0);
     let path = dir.join(format!("{program}-{build}.tar.zst"));
-    let f = std::fs::File::create(&path).unwrap();
-    let mut enc = zstd::Encoder::new(f, 0).unwrap();
-    enc.write_all(&tar).unwrap();
-    enc.finish().unwrap();
+    std::fs::write(&path, crate::extract::fixtures::zstd_bytes(&tar)).unwrap();
     path
 }
 
@@ -2415,8 +2412,8 @@ fn a_staged_archive_that_fails_its_digest_aborts_and_is_remembered() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A LEASE HOLDS THE FLIP TOO, with no process in sight: a merge-contract run between
-/// two stages. And an unreadable process table is priced as in use.
+/// A LEASE HOLDS THE FLIP TOO, with no process in sight: a release cut between
+/// two steps. And an unreadable process table is priced as in use.
 #[test]
 fn a_lease_or_an_unreadable_table_holds_the_flip() {
     let dir = scratch("quiet-lease");
@@ -2426,7 +2423,7 @@ fn a_lease_or_an_unreadable_table_holds_the_flip() {
     let lease = crate::lease::take(
         &layout.prefix,
         &crate::lease::Subject::build("trust", 4800).unwrap(),
-        "aterm-verify (pid 7) \u{2014} the merge contract in /w",
+        "aterm-release (pid 7) \u{2014} a release cut in /w",
         crate::lease::DEFAULT_WAIT,
     )
     .unwrap();
@@ -2439,7 +2436,7 @@ fn a_lease_or_an_unreadable_table_holds_the_flip() {
     };
     assert_eq!(
         why,
-        "trust build 4800 is in use by aterm-verify (pid 7) \u{2014} the merge contract in /w"
+        "trust build 4800 is in use by aterm-release (pid 7) \u{2014} a release cut in /w"
     );
     drop(lease);
     let report = quiet_pass(&fake, &layout, &installed, QUIET_T0 + 60, &|| None);
@@ -5480,7 +5477,9 @@ fn a_resumable_download_strands_at_most_one_partial_per_program() {
     let stale = dir.join("trust-5100.tar.zst.part");
     let bystander = dir.join("notes.txt");
     let finished = dir.join("trust-5100.tar.zst");
-    for p in [&ours, &stale, &bystander, &finished] {
+    // A vendor-direct asset carries no extension: it is known by its program's name.
+    let vendor = dir.join("claude-2.1.280-aarch64-apple-darwin");
+    for p in [&ours, &stale, &bystander, &finished, &vendor] {
         std::fs::write(p, b"x").unwrap();
     }
 
@@ -5502,6 +5501,7 @@ fn a_resumable_download_strands_at_most_one_partial_per_program() {
         !finished.exists(),
         "a superseded build's retained archive is reclaimed"
     );
+    assert!(!vendor.exists(), "a vendor-direct asset is reclaimed");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -5636,7 +5636,7 @@ fn a_digest_refusal_is_not_refetched_on_every_tick() {
     let first = install(&fake, &layout, &anchor(), &req, fl(0), 0)
         .expect_err("a corrupted asset must fail the signed digest gate");
     assert!(
-        matches!(&first, FlowError::Stage(StageError::Sha256Mismatch { .. })),
+        matches!(&first, FlowError::Stage(StageError::DigestMismatch { .. })),
         "reach guard: the first attempt reached the digest gate — {first:?}"
     );
     assert_eq!(fake.count("ay-18.tar.zst"), 1, "it had to download it once");
@@ -5651,7 +5651,7 @@ fn a_digest_refusal_is_not_refetched_on_every_tick() {
     let second = install(&fake, &layout, &anchor(), &req, fl(0), 0)
         .expect_err("a corrupted asset must fail the signed digest gate");
     assert!(
-        matches!(&second, FlowError::Stage(StageError::Sha256Mismatch { .. })),
+        matches!(&second, FlowError::Stage(StageError::DigestMismatch { .. })),
         "the first retry is never refused — {second:?}"
     );
     assert_eq!(fake.count("ay-18.tar.zst"), 2, "it really did retry");
@@ -5680,7 +5680,7 @@ fn a_digest_refusal_is_not_refetched_on_every_tick() {
     let fourth = install(&fake, &layout, &anchor(), &req, fl(0), 0)
         .expect_err("the lapsed cooldown lets the attempt through");
     assert!(
-        matches!(&fourth, FlowError::Stage(StageError::Sha256Mismatch { .. })),
+        matches!(&fourth, FlowError::Stage(StageError::DigestMismatch { .. })),
         "a lapsed memo refuses nothing — {fourth:?}"
     );
     assert_eq!(
@@ -6034,4 +6034,822 @@ fn the_set_peak_is_what_every_unit_gate_checks_in_any_order() {
         units[1].and(units[2]).need(),
         units[1].need() + units[2].need()
     );
+    // Two lanes at once hold the two largest archives together; enough lanes, every one.
+    assert_eq!(peak_need_at_once(units, 1), peak);
+    assert_eq!(peak_need_at_once(units, 2), trees + (1024 + 400) * MIB);
+    assert_eq!(
+        peak_need_at_once(units, 8),
+        units.iter().map(|u| u.need()).sum::<u64>()
+    );
+}
+
+// --- download ahead ([`ahead`]) and the side-by-side resolve checks ----------------------
+
+/// A signed release pinning `programs` — `(name, build, signed size)` each, one real archive
+/// apiece — with the ones `tuple` names in one `rustc` coherence group.
+fn ahead_release(dir: &Path, programs: &[(&str, u64, u64)], tuple: &[&str]) -> Fake {
+    let mut pkg = HashMap::new();
+    let mut archives = HashMap::new();
+    let mut named = String::new();
+    let mut pins = Vec::new();
+    for &(program, build, size) in programs {
+        let archive = prog_archive(dir, program, build);
+        let sha = crate::tree::file_sha256(&archive).unwrap();
+        let root = signed_root_of(&archive, &dir.join(format!("probe-{program}")));
+        let asset = format!("{program}-{build}.tar.zst");
+        let pkg_body = format!(
+            "schema = 2\nprogram = \"{program}\"\nversion = \"0.1\"\nbuild_number = {build}\n\
+             exposes = [\"{program}\"]\n\
+             [[artifact]]\ntarget = \"{TRIPLE}\"\nkind = \"binary\"\nasset = \"{asset}\"\n\
+             sha256 = \"{sha}\"\ntree_root = \"{root}\"\nsize = {size}\n\
+             [artifact.cost]\ndisk_installed = 1048576\n"
+        );
+        pkg.insert(
+            (program.to_string(), build),
+            (
+                pkg_body.clone().into_bytes(),
+                sign(&RELEASE_SEED, pkg_body.as_bytes()),
+            ),
+        );
+        archives.insert(asset, archive);
+        named.push_str(&format!("[programs.{program}]\nrepo = \"{program}\"\n"));
+        if tuple.contains(&program) {
+            named.push_str("coherence_group = \"rustc\"\n");
+        }
+        pins.push(format!("{program} = {build}"));
+    }
+    let index_body = format!(
+        "schema = 2\nindex_build = 41\nvalid_until = \"2026-07-05T12:00:00Z\"\n{attr}{named}\
+         [[channels]]\nname = \"stable\"\nchannel_build = 1\nmin_build = 0\n\
+         pin = {{ {pins} }}\n",
+        attr = attribution(),
+        pins = pins.join(", ")
+    );
+    Fake {
+        index: index_body.clone().into_bytes(),
+        index_sig: sign(&RELEASE_SEED, index_body.as_bytes()),
+        pkg,
+        archives,
+    }
+}
+
+/// The name the set completion gives its download-ahead thread.
+const LANE_THREAD: &str = "atpkg-download-ahead";
+
+/// A [`Fake`] whose downloads go into one ordered log beside the test's own marks
+/// (`start:<asset>`, `end:<asset>`, and whatever the test notes), each with the thread that
+/// asked; a download of the asset `hold` names waits until the test lets it go, and one of
+/// an asset in `refused` fails as a dropped link does.
+struct Recorder {
+    inner: Fake,
+    log: std::sync::Mutex<Vec<(String, String)>>,
+    moved: std::sync::Condvar,
+    hold: std::sync::Mutex<Option<String>>,
+    let_go: std::sync::Condvar,
+    refused: Vec<String>,
+}
+
+impl Recorder {
+    fn new(inner: Fake, refused: &[&str]) -> Self {
+        Self {
+            inner,
+            log: std::sync::Mutex::default(),
+            moved: std::sync::Condvar::new(),
+            hold: std::sync::Mutex::default(),
+            let_go: std::sync::Condvar::new(),
+            refused: refused.iter().map(|a| (*a).to_string()).collect(),
+        }
+    }
+
+    fn note(&self, event: &str) {
+        let thread = std::thread::current().name().unwrap_or("").to_string();
+        self.log.lock().unwrap().push((event.to_string(), thread));
+        self.moved.notify_all();
+    }
+
+    /// Wait for `event` — a one-minute hang detector, not a latency budget.
+    fn wait_for(&self, event: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut log = self.log.lock().unwrap();
+        while !log.iter().any(|(e, _)| e == event) {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(!left.is_zero(), "{event} never happened: {log:?}");
+            log = self.moved.wait_timeout(log, left).unwrap().0;
+        }
+    }
+
+    fn release(&self) {
+        *self.hold.lock().unwrap() = None;
+        self.let_go.notify_all();
+    }
+
+    fn at(&self, event: &str) -> usize {
+        let log = self.log.lock().unwrap();
+        log.iter()
+            .position(|(e, _)| e == event)
+            .unwrap_or_else(|| panic!("{event} never happened: {log:?}"))
+    }
+
+    /// Every download, in the order it started, with the thread that asked.
+    fn starts(&self) -> Vec<(String, String)> {
+        self.log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(e, t)| e.strip_prefix("start:").map(|a| (a.to_string(), t.clone())))
+            .collect()
+    }
+}
+
+impl Fetcher for Recorder {
+    fn index_candidates(&self) -> Result<Vec<Candidate>, String> {
+        self.inner.index_candidates()
+    }
+    fn pkg_manifest(
+        &self,
+        repo: &str,
+        program: &str,
+        build: u64,
+    ) -> Result<(Vec<u8>, Vec<u8>), String> {
+        self.inner.pkg_manifest(repo, program, build)
+    }
+    fn download(&self, repo: &str, asset: &str, dest: &Path) -> Result<(), String> {
+        self.note(&format!("start:{asset}"));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut hold = self.hold.lock().unwrap();
+        while hold.as_deref() == Some(asset) {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(!left.is_zero(), "{asset} was held for a minute");
+            hold = self.let_go.wait_timeout(hold, left).unwrap().0;
+        }
+        drop(hold);
+        let fetched = if self.refused.iter().any(|a| a == asset) {
+            Err(String::from("curl: (7) Failed to connect"))
+        } else {
+            self.inner.download(repo, asset, dest)
+        };
+        self.note(&format!("end:{asset}"));
+        fetched
+    }
+}
+
+/// The lane over `units` of `fetcher`'s release, under `budget`.
+fn lane_over(
+    fetcher: &Recorder,
+    layout: &Layout,
+    units: &[(usize, Vec<String>)],
+    budget: u64,
+) -> std::sync::Arc<ahead::Ahead> {
+    let index = resolve_verified_index(fetcher, layout, &anchor(), fl(0), 0).unwrap();
+    let ch = index.channel_for("stable", TRIPLE).unwrap();
+    ahead::Ahead::plan_within(fetcher, layout, &index, &ch, TRIPLE, units, budget)
+        .expect("every member is fetchable ahead")
+}
+
+/// Start `lane`'s worker inside `scope`, named as the set completion names it.
+fn spawn_lane<'scope, 'env>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+    lane: &'env ahead::Ahead,
+    fetcher: &'env Recorder,
+    layout: &'env Layout,
+) {
+    std::thread::Builder::new()
+        .name(LANE_THREAD.into())
+        .spawn_scoped(scope, move || lane.work(fetcher, layout, &|_| {}))
+        .unwrap();
+}
+
+fn singles(names: &[&str]) -> Vec<(usize, Vec<String>)> {
+    names
+        .iter()
+        .enumerate()
+        .map(|(unit, name)| (unit, vec![(*name).to_string()]))
+        .collect()
+}
+
+fn archive_at(layout: &Layout, program: &str, build: u64) -> PathBuf {
+    staged_download_path(layout, program, &format!("{program}-{build}.tar.zst")).unwrap()
+}
+
+// THE NEXT ARCHIVE MOVES WHILE THE PASS HOLDS THE ONE BEFORE. The test is the pass: it takes
+// sa from the lane and, before it takes anything else — as if still staging sa — the lane
+// is already fetching sb. Every archive is fetched once, on the lane's thread, into the
+// staging path the pass then stages from.
+#[test]
+fn the_lane_fetches_the_next_archive_while_the_pass_holds_the_one_before() {
+    let dir = scratch("ahead-overlap");
+    let rec = Recorder::new(
+        ahead_release(&dir, &[("sa", 1, 100), ("sb", 2, 100), ("sc", 3, 100)], &[]),
+        &[],
+    );
+    let layout = layout(&dir);
+    let lane = lane_over(&rec, &layout, &singles(&["sa", "sb", "sc"]), 1 << 20);
+    std::thread::scope(|scope| {
+        spawn_lane(scope, &lane, &rec, &layout);
+        let _entered = lane.enter();
+        assert_eq!(
+            ahead::claim("sa", &archive_at(&layout, "sa", 1)),
+            Some(Ok(()))
+        );
+        assert!(archive_at(&layout, "sa", 1).is_file());
+        rec.wait_for("start:sb-2.tar.zst");
+        assert_eq!(
+            ahead::claim("sb", &archive_at(&layout, "sb", 2)),
+            Some(Ok(()))
+        );
+        assert_eq!(
+            ahead::claim("sc", &archive_at(&layout, "sc", 3)),
+            Some(Ok(()))
+        );
+    });
+    assert_eq!(
+        rec.starts(),
+        [
+            ("sa-1.tar.zst".to_string(), LANE_THREAD.to_string()),
+            ("sb-2.tar.zst".to_string(), LANE_THREAD.to_string()),
+            ("sc-3.tar.zst".to_string(), LANE_THREAD.to_string()),
+        ]
+    );
+    assert!(lane.untaken().is_empty(), "the pass took every archive");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// THE BUDGET. Under 250 bytes ahead, the lane fetches sa and sb unasked and starts sc only
+// once the pass has taken sa; sd, bigger than the whole budget, moves only when the pass asks
+// for it. What the lane can hold beyond the pass's unit is the budget.
+#[test]
+fn the_lane_stays_within_its_budget_and_a_bigger_archive_waits_for_the_pass() {
+    let dir = scratch("ahead-budget");
+    let rec = Recorder::new(
+        ahead_release(
+            &dir,
+            &[
+                ("sa", 1, 100),
+                ("sb", 2, 100),
+                ("sc", 3, 100),
+                ("sd", 4, 300),
+            ],
+            &[],
+        ),
+        &[],
+    );
+    let layout = layout(&dir);
+    let lane = lane_over(&rec, &layout, &singles(&["sa", "sb", "sc", "sd"]), 250);
+    assert_eq!(lane.reserve(), 250);
+    std::thread::scope(|scope| {
+        spawn_lane(scope, &lane, &rec, &layout);
+        let _entered = lane.enter();
+        rec.wait_for("end:sb-2.tar.zst");
+        rec.note("claim:sa");
+        assert_eq!(
+            ahead::claim("sa", &archive_at(&layout, "sa", 1)),
+            Some(Ok(()))
+        );
+        rec.wait_for("end:sc-3.tar.zst");
+        assert_eq!(
+            ahead::claim("sb", &archive_at(&layout, "sb", 2)),
+            Some(Ok(()))
+        );
+        assert_eq!(
+            ahead::claim("sc", &archive_at(&layout, "sc", 3)),
+            Some(Ok(()))
+        );
+        rec.note("claim:sd");
+        assert_eq!(
+            ahead::claim("sd", &archive_at(&layout, "sd", 4)),
+            Some(Ok(()))
+        );
+    });
+    assert!(
+        rec.at("start:sc-3.tar.zst") > rec.at("claim:sa"),
+        "sc would have put 300 bytes ahead"
+    );
+    assert!(
+        rec.at("start:sd-4.tar.zst") > rec.at("claim:sd"),
+        "sd is bigger than the budget"
+    );
+    assert!(rec.starts().iter().all(|(_, thread)| thread == LANE_THREAD));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A legacy release row may omit its compressed size, but zero is an unknown
+/// download cap, not a zero-byte archive. If one member's size is unknown,
+/// the whole tuple stays off the ahead lane and still installs inline. A
+/// separate sized unit remains eligible for the worker.
+#[test]
+fn a_tuple_with_an_unknown_archive_size_downloads_inline_without_disabling_sized_units() {
+    let dir = scratch("ahead-unknown-size");
+    let rec = Recorder::new(
+        ahead_release(
+            &dir,
+            &[("ta", 1, 100), ("tb", 2, 0), ("sc", 3, 100)],
+            &["ta", "tb"],
+        ),
+        &[],
+    );
+    let layout = layout(&dir);
+    let index = resolve_verified_index(&rec, &layout, &anchor(), fl(0), 0).unwrap();
+    let ch = index.channel_for("stable", TRIPLE).unwrap();
+    let group = plan_groups(&index, &ch)
+        .into_iter()
+        .find(|group| group.group.as_deref() == Some("rustc"))
+        .unwrap();
+    let lane = ahead::Ahead::plan_within(
+        &rec,
+        &layout,
+        &index,
+        &ch,
+        TRIPLE,
+        &[(0, group.members.clone()), (1, vec!["sc".to_string()])],
+        1 << 20,
+    )
+    .expect("the sized singleton is eligible");
+    std::thread::scope(|scope| {
+        spawn_lane(scope, &lane, &rec, &layout);
+        let _entered = lane.enter();
+        rec.wait_for("end:sc-3.tar.zst");
+        assert_eq!(
+            rec.starts(),
+            [("sc-3.tar.zst".to_string(), LANE_THREAD.to_string())],
+            "neither member of the unknown-size tuple is fetched ahead"
+        );
+        let (outcome, _) = bootstrap_group(
+            &rec,
+            &layout,
+            &index,
+            "stable",
+            TRIPLE,
+            &group,
+            &BTreeMap::new(),
+            &mut BTreeMap::new(),
+            &crate::quiet::FlipGate::NOW,
+        )
+        .unwrap();
+        assert_eq!(outcome, TxnOutcome::Applied(vec!["ta".into(), "tb".into()]));
+        assert_eq!(
+            ahead::claim("sc", &archive_at(&layout, "sc", 3)),
+            Some(Ok(()))
+        );
+    });
+    for (program, build) in [("ta", 1), ("tb", 2)] {
+        assert_eq!(
+            crate::ops::which(&layout, program).unwrap(),
+            tool_bin(&layout.build_dir(program, build), program)
+        );
+    }
+    let starts = rec.starts();
+    assert_eq!(starts.len(), 3, "every archive once: {starts:?}");
+    assert!(starts[1..].iter().all(|(_, thread)| thread != LANE_THREAD));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// THE BUMP MOVES ONLY WHAT HAS NOT STARTED. A person bumps sb and sd while sb downloads: sb
+// is not restarted, and sd — not started — comes before sc, the order the pass takes too.
+#[test]
+fn a_bump_reorders_only_the_archives_the_lane_has_not_started() {
+    let dir = scratch("ahead-bump");
+    let rec = Recorder::new(
+        ahead_release(
+            &dir,
+            &[
+                ("sa", 1, 100),
+                ("sb", 2, 100),
+                ("sc", 3, 100),
+                ("sd", 4, 100),
+            ],
+            &[],
+        ),
+        &[],
+    );
+    *rec.hold.lock().unwrap() = Some("sb-2.tar.zst".to_string());
+    let layout = layout(&dir);
+    let lane = lane_over(&rec, &layout, &singles(&["sa", "sb", "sc", "sd"]), 1 << 20);
+    std::thread::scope(|scope| {
+        spawn_lane(scope, &lane, &rec, &layout);
+        let _entered = lane.enter();
+        rec.wait_for("start:sb-2.tar.zst");
+        for name in ["sb", "sd"] {
+            crate::progress::append_bump(
+                &layout,
+                &ToolName::new(name).unwrap(),
+                crate::progress::Asker::Person,
+            )
+            .unwrap();
+        }
+        rec.release();
+        // The lane's own next pick, before the pass asks for anything after sb.
+        rec.wait_for("start:sd-4.tar.zst");
+        for (program, build) in [("sa", 1), ("sb", 2), ("sd", 4), ("sc", 3)] {
+            assert_eq!(
+                ahead::claim(program, &archive_at(&layout, program, build)),
+                Some(Ok(()))
+            );
+        }
+    });
+    let order: Vec<String> = rec.starts().into_iter().map(|(asset, _)| asset).collect();
+    assert_eq!(
+        order,
+        [
+            "sa-1.tar.zst",
+            "sb-2.tar.zst",
+            "sd-4.tar.zst",
+            "sc-3.tar.zst"
+        ]
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// THE PASS'S OWN PIN WINS. A singleton's own resolve found another build of sa than the plan
+// did: the lane's sa is not the pass's archive, so the claim takes nothing — and the lane
+// never starts sa afterwards, beside the pass's own download into sa's staging directory,
+// where each download's partial sweep would take the other's `.part`.
+#[test]
+fn a_claim_for_another_build_takes_nothing_and_that_download_never_starts() {
+    let dir = scratch("ahead-other-pin");
+    let rec = Recorder::new(
+        ahead_release(&dir, &[("sb", 2, 100), ("sa", 1, 100)], &[]),
+        &[],
+    );
+    *rec.hold.lock().unwrap() = Some("sb-2.tar.zst".to_string());
+    let layout = layout(&dir);
+    let lane = lane_over(&rec, &layout, &singles(&["sb", "sa"]), 1 << 20);
+    std::thread::scope(|scope| {
+        let worker = std::thread::Builder::new()
+            .name(LANE_THREAD.into())
+            .spawn_scoped(scope, || lane.work(&rec, &layout, &|_| {}))
+            .unwrap();
+        let entered = lane.enter();
+        rec.wait_for("start:sb-2.tar.zst");
+        assert_eq!(ahead::claim("sa", &archive_at(&layout, "sa", 9)), None);
+        rec.release();
+        assert_eq!(
+            ahead::claim("sb", &archive_at(&layout, "sb", 2)),
+            Some(Ok(()))
+        );
+        // The lane ends on its own, still entered and never halted: nothing is left for it.
+        worker.join().unwrap();
+        drop(entered);
+    });
+    let order: Vec<String> = rec.starts().into_iter().map(|(asset, _)| asset).collect();
+    assert_eq!(order, ["sb-2.tar.zst"], "sa is the pass's own download now");
+    assert!(!archive_at(&layout, "sa", 1).exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// A FETCHED-AHEAD ARCHIVE WAITS AT ITS WHOLE SIZE. The lane's download is complete, the pass
+// has not staged it: its progress row reads every byte in — what a reader takes for "waiting
+// for the pass", never a download stuck short of its end (the `.part` poller's last look).
+#[test]
+fn a_download_the_lane_finished_waits_on_its_row_at_its_whole_size() {
+    let _gate = crate::progress::PASS_TEST_GATE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let dir = scratch("ahead-row");
+    let rec = Recorder::new(ahead_release(&dir, &[("sa", 1, 100)], &[]), &[]);
+    let layout = layout(&dir);
+    std::fs::create_dir_all(&layout.prefix).unwrap();
+    let lane = lane_over(&rec, &layout, &singles(&["sa"]), 1 << 20);
+    assert!(crate::progress::begin_pass(
+        &layout.prefix.join("progress.json"),
+        "net"
+    ));
+    if let Some(sink) = crate::progress::active() {
+        sink.plan(&[("sa".to_string(), 100)]);
+    }
+    std::thread::scope(|scope| {
+        let lent = crate::progress::lend();
+        std::thread::Builder::new()
+            .name(LANE_THREAD.into())
+            .spawn_scoped(scope, || {
+                let _adopted = lent.adopt();
+                lane.work(&rec, &layout, &|_| {});
+            })
+            .unwrap();
+        let _entered = lane.enter();
+        assert_eq!(
+            ahead::claim("sa", &archive_at(&layout, "sa", 1)),
+            Some(Ok(()))
+        );
+        let row = crate::progress::live_snapshot().unwrap().programs["sa"].clone();
+        assert!(row.downloaded(), "{row:?}");
+        assert_eq!((row.bytes_done, row.bytes_total), (100, 100));
+    });
+    crate::progress::end_pass();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The `rustc` tuple of `fetcher`'s release, bootstrapped with the lane over it entered.
+fn bootstrap_through_lane(
+    fetcher: &Recorder,
+    layout: &Layout,
+    resolved: &mut BTreeMap<String, String>,
+) -> (TxnOutcome, std::sync::Arc<ahead::Ahead>) {
+    let index = resolve_verified_index(fetcher, layout, &anchor(), fl(0), 0).unwrap();
+    let ch = index.channel_for("stable", TRIPLE).unwrap();
+    let group = plan_groups(&index, &ch)
+        .into_iter()
+        .find(|g| g.group.as_deref() == Some("rustc"))
+        .unwrap();
+    let lane = ahead::Ahead::plan(
+        fetcher,
+        layout,
+        &index,
+        &ch,
+        TRIPLE,
+        &[(0, group.members.clone())],
+    )
+    .expect("every member is fetchable ahead");
+    let outcome = std::thread::scope(|scope| {
+        spawn_lane(scope, &lane, fetcher, layout);
+        let _entered = lane.enter();
+        let (outcome, _) = bootstrap_group(
+            fetcher,
+            layout,
+            &index,
+            "stable",
+            TRIPLE,
+            &group,
+            &BTreeMap::new(),
+            resolved,
+            &crate::quiet::FlipGate::NOW,
+        )
+        .unwrap();
+        lane.passed(0);
+        outcome
+    });
+    (outcome, lane)
+}
+
+// A TUPLE STAGES WHAT THE LANE FETCHED. Each member's archive comes off the lane, once, and
+// the transaction stages, flips and reclaims exactly as with its own downloads.
+#[test]
+fn a_tuple_lands_whole_from_the_archives_the_lane_fetched() {
+    let dir = scratch("ahead-tuple");
+    let rec = Recorder::new(
+        ahead_release(
+            &dir,
+            &[("ta", 1, 100), ("tb", 2, 100), ("tc", 3, 100)],
+            &["ta", "tb", "tc"],
+        ),
+        &[],
+    );
+    let layout = layout(&dir);
+    let mut resolved = BTreeMap::new();
+    let (outcome, lane) = bootstrap_through_lane(&rec, &layout, &mut resolved);
+    assert_eq!(
+        outcome,
+        TxnOutcome::Applied(vec!["ta".into(), "tb".into(), "tc".into()])
+    );
+    for (program, build) in [("ta", 1u64), ("tb", 2), ("tc", 3)] {
+        assert_eq!(
+            crate::ops::which(&layout, program).unwrap(),
+            tool_bin(&layout.build_dir(program, build), program)
+        );
+        assert!(
+            !archive_at(&layout, program, build).exists(),
+            "{program}'s archive is reclaimed once the tuple lands"
+        );
+    }
+    let starts = rec.starts();
+    assert_eq!(starts.len(), 3, "each archive once: {starts:?}");
+    assert!(starts.iter().all(|(_, thread)| thread == LANE_THREAD));
+    assert!(lane.untaken().is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// A DOWNLOAD THE LANE LOST ABORTS THE TUPLE, AND IS THE PASS'S FETCH FAULT. The third
+// member's archive does not arrive: nothing is flipped, the staged siblings' trees are
+// discarded (their archives kept for the next pass), and the pass's own fault tally — the
+// offline verdict's input — counts the one fetch that failed.
+#[test]
+fn a_tuple_whose_third_archive_the_lane_lost_aborts_with_nothing_flipped() {
+    let dir = scratch("ahead-tuple-lost");
+    let rec = Recorder::new(
+        ahead_release(
+            &dir,
+            &[("ta", 1, 100), ("tb", 2, 100), ("tc", 3, 100)],
+            &["ta", "tb", "tc"],
+        ),
+        &["tc-3.tar.zst"],
+    );
+    let layout = layout(&dir);
+    let mut resolved = BTreeMap::new();
+    let faults = fetch_faults();
+    let (outcome, _) = bootstrap_through_lane(&rec, &layout, &mut resolved);
+    assert!(
+        matches!(
+            &outcome,
+            TxnOutcome::Aborted { failed, during_flip: false, .. } if failed == "tc"
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(fetch_faults().wrapping_sub(faults), 1, "one fetch fault");
+    for (program, build) in [("ta", 1u64), ("tb", 2), ("tc", 3)] {
+        assert!(
+            !layout.build_dir(program, build).exists(),
+            "{program} staged"
+        );
+        assert!(
+            std::fs::symlink_metadata(layout.program_current(program)).is_err(),
+            "{program} flipped"
+        );
+    }
+    for (program, build) in [("ta", 1u64), ("tb", 2)] {
+        assert!(
+            archive_at(&layout, program, build).is_file(),
+            "{program}'s verified archive waits for the next pass"
+        );
+    }
+    assert!(!archive_at(&layout, "tc", 3).exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// THE LANE SAYS WHEN EVERY ARCHIVE IS IN, NOT WHEN THE PASS HAS STAGED THEM. The pass takes
+// nothing here: asked after each download that lands, the lane says the set is in only once
+// sc — its last archive — is, never after ta or tb alone. A unit the lane holds no archive of
+// is never in, nor is a set whose archive the lane could not fetch, or one whose archive the
+// pass fetched itself: only the pass knows when those are.
+#[test]
+fn the_lane_says_every_archive_is_in_the_moment_its_last_download_lands() {
+    let release = |dir: &Path| {
+        ahead_release(
+            dir,
+            &[("ta", 1, 100), ("tb", 2, 100), ("sc", 3, 100)],
+            &["ta", "tb"],
+        )
+    };
+    let units = || {
+        vec![
+            (0, vec!["ta".to_string(), "tb".to_string()]),
+            (1, vec!["sc".to_string()]),
+        ]
+    };
+    let dir = scratch("ahead-all-in");
+    let rec = Recorder::new(release(&dir), &[]);
+    let layout = layout(&dir);
+    let lane = lane_over(&rec, &layout, &units(), 1 << 20);
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .name(LANE_THREAD.into())
+            .spawn_scoped(scope, || {
+                lane.work(&rec, &layout, &|lane| {
+                    rec.note(if lane.all_fetched(&[0]) {
+                        "in"
+                    } else {
+                        "short"
+                    });
+                });
+            })
+            .unwrap();
+        let _entered = lane.enter();
+        rec.wait_for("in");
+    });
+    let said: Vec<String> = rec
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(event, _)| event.clone())
+        .filter(|event| !event.starts_with("start:"))
+        .collect();
+    assert_eq!(
+        said,
+        [
+            "end:ta-1.tar.zst",
+            "short",
+            "end:tb-2.tar.zst",
+            "short",
+            "end:sc-3.tar.zst",
+            "in"
+        ]
+    );
+    assert!(
+        !lane.all_fetched(&[0, 2]),
+        "a unit the lane holds nothing of"
+    );
+
+    // tb's download fails: the lane halts, and the set is never in.
+    let lost = scratch("ahead-all-in-lost");
+    let rec = Recorder::new(release(&lost), &["tb-2.tar.zst"]);
+    let layout = self::layout(&lost);
+    let lane = lane_over(&rec, &layout, &units(), 1 << 20);
+    std::thread::scope(|scope| {
+        let worker = std::thread::Builder::new()
+            .name(LANE_THREAD.into())
+            .spawn_scoped(scope, || lane.work(&rec, &layout, &|_| {}))
+            .unwrap();
+        let entered = lane.enter();
+        worker.join().unwrap();
+        drop(entered);
+    });
+    assert!(rec.at("end:tb-2.tar.zst") > rec.at("end:ta-1.tar.zst"));
+    assert!(!lane.all_fetched(&[0]));
+
+    // The lane is busy with ta when the pass asks for tb: the pass fetches tb itself.
+    let inline = scratch("ahead-all-in-inline");
+    let rec = Recorder::new(release(&inline), &[]);
+    *rec.hold.lock().unwrap() = Some("ta-1.tar.zst".to_string());
+    let layout = self::layout(&inline);
+    let lane = lane_over(&rec, &layout, &units(), 1 << 20);
+    std::thread::scope(|scope| {
+        spawn_lane(scope, &lane, &rec, &layout);
+        let _entered = lane.enter();
+        rec.wait_for("start:ta-1.tar.zst");
+        assert_eq!(ahead::claim("tb", &archive_at(&layout, "tb", 2)), None);
+        rec.release();
+        rec.wait_for("end:sc-3.tar.zst");
+        assert!(!lane.all_fetched(&[0]), "tb is the pass's to fetch");
+    });
+    for dir in [dir, lost, inline] {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// THE RESOLVE CHECKS RUN SIDE BY SIDE, AND ANY SIGNAL DEATH REFUSES. Every native binary the
+// bundle exposes is checked (a script is not); one death among five refuses the bundle, and
+// with two the verdict names the first in `exposes` order, as when they ran in turn.
+#[test]
+fn every_resolve_check_runs_and_a_signal_death_in_any_refuses() {
+    let dir = scratch("resolve-side-by-side");
+    let build = dir.join("b");
+    std::fs::create_dir_all(build.join("bin")).unwrap();
+    let names = ["t1", "t2", "t3", "t4", "t5"];
+    for name in names {
+        // MH_MAGIC_64, little-endian: a native object to the sniff.
+        std::fs::write(
+            build.join("bin").join(name),
+            [0xcf, 0xfa, 0xed, 0xfe, 0, 0, 0, 0],
+        )
+        .unwrap();
+    }
+    std::fs::write(build.join("bin/wrap"), b"#!/bin/sh\nexec t1 \"$@\"\n").unwrap();
+    let mut exposed: Vec<String> = names.iter().map(|n| (*n).to_string()).collect();
+    exposed.push("wrap".into());
+    let exposes = crate::store::split_exposed(&exposed).0;
+    let verdict = |killed: &[&str]| {
+        let checked = std::sync::Mutex::new(Vec::new());
+        let result = bundle_resolve_check_with(&build, &exposes, &|bin: &Path| {
+            let name = bin.file_name().unwrap().to_string_lossy().into_owned();
+            checked.lock().unwrap().push(name.clone());
+            if killed.contains(&name.as_str()) {
+                Err(format!("resolve check: {name} was killed by a signal"))
+            } else {
+                Ok(())
+            }
+        });
+        let mut checked = checked.into_inner().unwrap();
+        checked.sort();
+        assert_eq!(checked, names, "every native binary, and only those");
+        result
+    };
+    assert!(verdict(&[]).is_ok());
+    assert!(
+        matches!(verdict(&["t3"]), Err(FlowError::Activate(why)) if why.contains("t3 was killed"))
+    );
+    assert!(
+        matches!(verdict(&["t4", "t2"]), Err(FlowError::Activate(why)) if why.contains("t2 was killed"))
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// THE LINK GOES IN THE ORDER THE PROGRAMS WERE TAKEN, not in the order their landings reach
+/// the transfer: a later ticket is not next while an earlier one — taken first, its landing
+/// perhaps still short of its transfer — is open, and is next once that one is released or
+/// dropped (its transfer over, or its landing ended or moved no byte), whichever ticket gave
+/// up first; a transfer waiting on it starts then.
+#[test]
+fn a_later_download_ticket_waits_for_every_earlier_one() {
+    let turns = DownloadTurns::default();
+    let claude = turns.ticket();
+    let codex = turns.ticket();
+    let agy = turns.ticket();
+    let next = |ticket: &DownloadTicket<'_>| {
+        is_next(
+            &turns
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            ticket.n,
+        )
+    };
+    assert!(next(&claude) && !next(&codex) && !next(&agy));
+    agy.release();
+    assert!(
+        !next(&codex),
+        "a later ticket giving up moves nobody ahead of claude"
+    );
+    drop(claude);
+    assert!(next(&codex), "claude's landing ended: codex is next");
+    let muse = turns.ticket();
+    assert!(!next(&muse));
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            muse.wait();
+            let _ = tx.send(());
+        });
+        codex.release();
+        rx.recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .expect("hang detector: muse's transfer never started after codex's");
+    });
 }

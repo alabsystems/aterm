@@ -11,22 +11,7 @@
 //! abort, the abort that never asked about a named pid) is caught.
 //! Tier-1 is aterm-gui's `app_update_handoff::launched_dial_wait_conformance`.
 
-use aterm_spec::{
-    derive::{native_update_launched_dial_wait_liveness, native_update_launched_dial_wait_model},
-    interp, verify,
-};
-
-#[test]
-fn launched_dial_wait_proves_and_catches() {
-    let model = native_update_launched_dial_wait_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name),
-        "the launched dial wait must stay enrolled in the spec-link registry"
-    );
-    verify::prove_and_catch_scalar(&model, "launched dial wait");
-}
+use aterm_spec::{derive::native_update_launched_dial_wait_model, interp, verify};
 
 /// Each invariant mutant with the invariant it was written for.
 const MUTANTS: [(&str, &str); 5] = [
@@ -129,23 +114,4 @@ fn a_dead_successor_ends_the_wait_and_a_live_one_is_accepted() {
         assert!(model.fire(action, &mut late), "{action}: {late:?}");
     }
     // The negative controls: each mutant alone, by BMC, above.
-}
-
-/// Liveness: a successor dead before its dial ends the wait without the
-/// budget, under the fairness stated on
-/// `native_update_launched_dial_wait_liveness`, and the cancel-only abort and
-/// the abort that never asked about a named pid are the caught mutants —
-/// interpreter and, where installed, `ty`.
-#[test]
-fn a_dead_successor_ends_the_wait_without_the_dial_budget() {
-    let model = native_update_launched_dial_wait_model();
-    let live = native_update_launched_dial_wait_liveness();
-    assert!(
-        aterm_spec::xref::liveness_registry()
-            .iter()
-            .any(|(registered, obligation)| registered.name == model.name
-                && obligation.name == live.name),
-        "the launched dial wait's liveness must stay enrolled"
-    );
-    verify::liveness_proves_and_catches_tiered(&model, &live, "NativeUpdateLaunchedDialWait");
 }

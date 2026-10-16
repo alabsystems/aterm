@@ -2,23 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Underline-colour span type for scrollback lines.
-//!
-//! Represents a contiguous range of columns that share an SGR 58 underline
-//! colour. Used to preserve underline colours when lines scroll from the
-//! visible grid into scrollback storage — a sidecar parallel to
-//! [`HyperlinkSpan`](super::HyperlinkSpan), keeping the RLE-compressed
-//! [`CellAttrs`](super::CellAttrs) wire format unchanged.
+//! Underline-colour span type for scrollback lines: a sidecar parallel to
+//! [`HyperlinkSpan`](super::HyperlinkSpan) that carries SGR 58 underline
+//! colours into history without changing the [`CellAttrs`](super::CellAttrs)
+//! wire format.
 
 /// Underline-colour span within a line.
 ///
-/// Represents a contiguous range of columns that share one SGR 58 underline
-/// colour, stored in the **packed** `0xTT_XXXXXX` form so the distinction
-/// between an explicit RGB colour (`0x01`) and an indexed palette colour
-/// (`0x02`) survives into scrollback. Preserving the index — rather than a
-/// resolved RGB triple — lets a scrolled-back indexed underline colour
-/// re-resolve against the live palette at render time, exactly as the live
-/// cell does (so an OSC 4 palette change still re-colours history).
+/// A contiguous range of columns sharing one SGR 58 underline colour, in the
+/// packed `0xTT_XXXXXX` form: an indexed colour (`0x02`) stays an index and
+/// re-resolves against the live palette at render time (an OSC 4 change still
+/// re-colours history), unlike an explicit RGB colour (`0x01`).
 ///
 /// ## Memory Layout
 ///

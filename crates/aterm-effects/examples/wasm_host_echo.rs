@@ -22,7 +22,7 @@
 //!   - Enter:     "\r\n" + output + prompt ("visitor@alab:~ ❯ ", 17 cols)
 //!   - ArrowUp:   redrawLine = "\r" + CSI K + prompt + buf (+ CSI n D)
 //!
-//!   targo --unverified run -p aterm-effects --example wasm_host_echo -- <scenario>
+//!   targo --unverified run -p aterm-effects --example wasm_host_echo -- [-v] <scenario>
 //!   scenarios: type bs spaces left enter_up bs_mid bs_type enter_only blur all
 
 use aterm_core::render::RenderInput;
@@ -31,7 +31,8 @@ use aterm_effects::pipeline::EffectsPipeline;
 
 const ROWS: u16 = 24;
 const COLS: u16 = 80;
-/// JetBrains Mono at 14 CSS px × dpr 2 (boot.js FONT_PX * devicePixelRatio).
+/// JetBrains Mono at 14 CSS px × dpr 2 (boot.js FONT_PX * devicePixelRatio);
+/// `RK_CW`/`RK_CH` override it.
 static CELL: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
 fn cell() -> (usize, usize) {
     *CELL.get_or_init(|| {

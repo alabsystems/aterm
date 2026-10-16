@@ -102,6 +102,17 @@ fn incoming_control_preparation_requires_both_real_service_lanes() {
 /// the release and `drop(parent)` had to fit inside it — a test thread stalled
 /// past it made a correct worker stand down, read as "ended over a live
 /// parent". Production's own bound is not this test's subject.
+///
+/// The listener closes at the WORST instant, every run: the worker's third
+/// dial is held between its connect and the ownership question until the
+/// listener is gone. The test accepts only the two probes, so that dial is
+/// still queued, and closing the listener aborts it: XNU answers its
+/// `LOCAL_PEERPID` with the owner before the close and `ENOTCONN` after, as
+/// it does for any dial the predecessor's teardown reaches (its exit closes
+/// the connections it accepted, too). That is the teardown the worker waits
+/// for, which it once read as a foreign owner and stood down (7 runs in 6000
+/// at 128 loaded copies, 2026-10-16). The probe after it is refused and the
+/// worker binds, so the plain close is walked too.
 #[test]
 fn fixed_socket_bind_follows_real_commit_gate_and_parent_exit() {
     if !crate::test_alone::alone() {
@@ -121,12 +132,19 @@ fn fixed_socket_bind_follows_real_commit_gate_and_parent_exit() {
     let gate = crate::spawn::DeferredReaderGate::closed();
     let parent_live = Arc::new(AtomicBool::new(true));
     let parent_asked = Arc::new(AtomicUsize::new(0));
+    // Dials that reached a listener; the third is held until `closed`, and
+    // asked who owns it before the close and after.
+    const HELD_DIAL: usize = 3;
+    let parent_dialed = Arc::new(AtomicUsize::new(0));
+    let (closed_tx, closed_rx) = mpsc::sync_channel::<()>(1);
+    let (held_tx, held_rx) = mpsc::sync_channel(1);
     let (done_tx, done_rx) = mpsc::sync_channel(1);
     let child = {
         let plan = plan.clone();
         let gate = gate.clone();
         let live = parent_live.clone();
         let asked = parent_asked.clone();
+        let dialed = parent_dialed.clone();
         std::thread::spawn(move || {
             let result = bind_control_listener_within(
                 &plan,
@@ -138,11 +156,29 @@ fn fixed_socket_bind_follows_real_commit_gate_and_parent_exit() {
                 |pid| pid == std::process::id(),
                 Some(&identity),
                 MUST_HAPPEN,
+                |path: &str| {
+                    let stream = control_auth::connect_socket_nonblocking(path);
+                    let Ok(held) = &stream else { return stream };
+                    let peer = || aterm_uds::fdpass::peer_pid(held).map_err(|e| e.kind());
+                    // Only this thread counts. The held dial is asked before
+                    // the count says it reached the listener, so the listener
+                    // is surely live when it answers.
+                    let n = dialed.load(Ordering::Acquire) + 1;
+                    let before = (n == HELD_DIAL).then(peer);
+                    dialed.store(n, Ordering::Release);
+                    if let Some(before) = before {
+                        // A hang detector: the test closes the listener now.
+                        let _ = closed_rx.recv_timeout(MUST_HAPPEN);
+                        let _ = held_tx.send((before, peer()));
+                    }
+                    stream
+                },
             );
             done_tx.send(result).unwrap();
         })
     };
     let asked = || parent_asked.load(Ordering::Acquire);
+    let dialed = || parent_dialed.load(Ordering::Acquire);
     let model = native_update_control_socket_handoff_model();
     let mut state = model.init_state();
 
@@ -172,21 +208,25 @@ fn fixed_socket_bind_follows_real_commit_gate_and_parent_exit() {
 
     // Darwin can publish the death witness before closing the listener. The
     // worker then probes the listener it attested, finds it live, and probes
-    // again: its probes are accepted here, two of them, as the fact.
+    // again: its probes are accepted here, two of them, and its third dial
+    // reaches the listener too, as the fact. That one is left in the queue.
     parent_live.store(false, Ordering::Release);
     step(&model, &mut state, "Exit");
     parent.set_nonblocking(true).unwrap();
     let mut probes = Vec::new();
     until_within(
         MUST_HAPPEN,
-        "the worker probes the live listener twice",
+        "the worker probes the live listener twice and dials it again",
         || {
-            match parent.accept() {
-                Ok((probe, _)) => probes.push(probe),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(error) => panic!("accept the worker's probe: {error}"),
+            if probes.len() < HELD_DIAL - 1 {
+                match parent.accept() {
+                    Ok((probe, _)) => probes.push(probe),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(error) => panic!("accept the worker's probe: {error}"),
+                }
             }
-            (probes.len() >= 2 || child.is_finished()).then_some(())
+            ((probes.len() == HELD_DIAL - 1 && dialed() >= HELD_DIAL) || child.is_finished())
+                .then_some(())
         },
     );
     assert!(
@@ -194,7 +234,22 @@ fn fixed_socket_bind_follows_real_commit_gate_and_parent_exit() {
         "the worker ended while its predecessor's listener was live"
     );
     assert_eq!(std::fs::read(&plan.token_path).unwrap(), token_before);
+    // The listener closes inside the held dial, before its ownership question.
     drop((probes, parent));
+    closed_tx.send(()).unwrap();
+    let (before, after) = held_rx.recv_timeout(MUST_HAPPEN).unwrap();
+    assert_eq!(
+        before,
+        Ok(std::process::id()),
+        "the held dial reached the listener"
+    );
+    if cfg!(target_vendor = "apple") {
+        assert_eq!(
+            after,
+            Err(std::io::ErrorKind::NotConnected),
+            "closing the listener aborts the dial still queued on it"
+        );
+    }
     let (successor, successor_token) = done_rx
         .recv_timeout(MUST_HAPPEN)
         .unwrap()

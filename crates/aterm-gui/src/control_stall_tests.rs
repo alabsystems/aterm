@@ -303,12 +303,23 @@ fn a_frame_header_is_acted_on_at_once_and_its_body_keeps_no_lane() {
     (&framing)
         .write_all(b"AUTH ok\nfeed-bin 6\nabc")
         .expect("a header and half a body");
-    rig.answers_a_fresh_client_while(1, "the begun frame parked");
+    // The lane may park the connection before any of it arrives, so the
+    // parked census alone does not say the header was seen: wait for it (a
+    // hang detector) with the body still short, then for the lane to be free.
+    let deadline = Instant::now() + HANG;
+    while rig.stub.headers().is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "the header was never acted on before its body came"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
     assert_eq!(
         rig.stub.headers(),
         ["feed-bin 6"],
         "the header was acted on before its body came"
     );
+    rig.answers_a_fresh_client_while(1, "the begun frame parked");
     (&framing).write_all(b"def").expect("the rest of the body");
     assert_eq!(line_of(&framing), "OK 6 abcdef");
     assert_eq!(

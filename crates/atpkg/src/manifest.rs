@@ -287,27 +287,12 @@ impl Index {
         self.programs.contains_key(name)
     }
 
-    /// The installable program set after applying the **narrowing-only**
-    /// `[packages].include`/`exclude` config (R4/§5). The signed index is the sole gate:
-    ///
-    /// * empty `include` ⇒ start from *every* program the index names;
-    /// * non-empty `include` ⇒ start from only those of its names that the index **also**
-    ///   names (an `include` entry absent from the index adds **nothing** — it can never
-    ///   widen the set or introduce an unlisted repo);
-    /// * `exclude` then subtracts.
-    ///
-    /// So no config can make a private-config / unlisted repo installable.
+    /// The installable program set: every program the index names, less the
+    /// **narrowing-only** `[packages].exclude` (R4/§5). The signed index is the sole gate,
+    /// so no config can make a private-config / unlisted repo installable.
     #[must_use]
-    pub fn installable(&self, include: &[String], exclude: &[String]) -> BTreeSet<String> {
-        let mut set: BTreeSet<String> = if include.is_empty() {
-            self.programs.keys().cloned().collect()
-        } else {
-            include
-                .iter()
-                .filter(|n| self.programs.contains_key(n.as_str()))
-                .cloned()
-                .collect()
-        };
+    pub fn installable(&self, exclude: &[String]) -> BTreeSet<String> {
+        let mut set: BTreeSet<String> = self.programs.keys().cloned().collect();
         for e in exclude {
             set.remove(e);
         }
@@ -373,6 +358,28 @@ pub const TARGETS: &[&str] = &[
     "aarch64-pc-windows-msvc",
 ];
 
+/// The tools the published trust bundle shims (the pkg-trust-6808 set): the producer packs
+/// and refuses a seal without each, and the candidate gate measures the directory that
+/// holds them. `ty` left it 2026-08-18 when the standalone `ty` pack took the name: never
+/// re-add it — one index exposing a name twice shims it twice.
+pub const TRUST_EXPOSES: &[&str] = &[
+    "trustc",
+    "targo",
+    "targo-trust",
+    "targo-fmt",
+    "targo-tippy",
+    "tippy",
+    "tippy-driver",
+    "trustfmt",
+    "trustdoc",
+    "trust-analyzer",
+    "targo-trust-wp",
+    "trust-wp-driver",
+    "trust-wp",
+    "cargo-trust-wp",
+    "trust-wp-rustc",
+];
+
 /// One `[[artifact]]` row: how ONE target triple obtains and applies this build. Two
 /// axes (§17): `kind` is the payload / apply shape, `protocol` is where the bytes come
 /// from; [`crate::dispatch::strategy_for`] maps the pair to an apply strategy and refuses
@@ -405,10 +412,15 @@ pub struct Artifact {
     /// Validated non-empty for both protocols at parse ([`parse_pkg`]).
     #[serde(default)]
     pub asset: String,
-    /// SHA-256 of the DOWNLOADED bytes — the download-integrity gate. Required (validated
-    /// at parse).
+    /// SHA-256 of the DOWNLOADED bytes — the download-integrity gate. Required on every
+    /// index row (validated at parse).
     #[serde(default)]
     pub sha256: String,
+    /// SHA-512 of the DOWNLOADED bytes, for a vendor-direct row whose vendor signs only
+    /// that; empty is absent. A row's gate is the ONE of `sha256`/`sha512` it sets
+    /// ([`Artifact::digest`]), and an index row sets `sha256` alone.
+    #[serde(default)]
+    pub sha512: String,
     /// SHA-256 over the sorted extracted-file list — the apply-time re-verify root (§8
     /// TOCTOU). Empty until producers emit it.
     #[serde(default)]
@@ -436,16 +448,16 @@ pub struct Artifact {
     /// asset. Ignored for every other protocol.
     #[serde(default)]
     pub url: String,
-    /// `https` only: how the download is staged — `raw-binary` | `tar-gz` | `tar-zst` |
-    /// `zip` (each with `kind = "binary"`) | `dmg` (with `kind = "app-bundle"`)
-    /// ([`crate::vendor::PAYLOADS`]).
+    /// `https` only: how the download is staged — `raw-binary` | `tar-gz-binary` |
+    /// `tar-gz` | `tar-zst` | `zip` (each with `kind = "binary"`) | `dmg` (with
+    /// `kind = "app-bundle"`) ([`crate::vendor::PAYLOADS`]).
     #[serde(default)]
     pub payload: String,
-    /// `raw-binary` only: the LOGICAL tool name the download becomes under `bin/` (mode
-    /// `0755`) — laid down under the platform's executable spelling
-    /// ([`crate::store::ToolName::exe_file`]: `bin/claude` on Unix, `bin/claude.exe` on
-    /// Windows, which is what the shim forwards to). Must be one of the manifest's
-    /// `exposes`.
+    /// `raw-binary` / `tar-gz-binary` only: the LOGICAL tool name the download (or the
+    /// tar's one file) becomes under `bin/` (mode `0755`) — laid down under the
+    /// platform's executable spelling ([`crate::store::ToolName::exe_file`]: `bin/claude`
+    /// on Unix, `bin/claude.exe` on Windows, which is what the shim forwards to). Must be
+    /// one of the manifest's `exposes`.
     #[serde(default)]
     pub entry: String,
     /// Archive payloads only (`tar-gz`/`tar-zst`/`zip`): leading path components to drop
@@ -463,15 +475,73 @@ pub struct Artifact {
     #[serde(default)]
     pub vendor: String,
     /// `[artifact.provenance]` — which compiler built THIS row's payload, as the packer's
-    /// lineage scan recorded it ([`crate::lineage`]; tools/atpkg-publish.sh writes it from
-    /// `atpkg lineage scan`'s record and refuses to sign a `github-release` row without
-    /// one). Per ROW, not per manifest: `MERGE_FROM` appends the rows of other triples,
+    /// lineage scan recorded it ([`crate::lineage`]; `atpkg-publish`'s manifest writer
+    /// writes it from the scan's record and refuses to sign a `github-release` row without
+    /// one). Per ROW, not per manifest: a merge appends the rows of other triples,
     /// packed on other builders with other seals, to one manifest. Signed metadata for
     /// people and audits; no install decision reads it. Absent on every row published
     /// before the table existed, and ignored by every client older than it (no struct
     /// here denies unknown fields).
     #[serde(default)]
     pub provenance: Option<Provenance>,
+}
+
+impl Artifact {
+    /// The signed digest that gates this row's download: whichever ONE of `sha256` and
+    /// `sha512` it sets ([`one_digest`]). `None` — no digest, which no file matches — when
+    /// it sets neither or both.
+    #[must_use]
+    pub fn digest(&self) -> Option<(DigestAlg, &str)> {
+        one_digest(&self.sha256, &self.sha512)
+    }
+}
+
+/// A payload digest's algorithm, and the key every file that carries one names it by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DigestAlg {
+    /// SHA-256: every index row, and the vendors that publish it.
+    Sha256,
+    /// SHA-512: a vendor that publishes only that.
+    Sha512,
+}
+
+impl DigestAlg {
+    /// The key a digest of this algorithm is spelled under (`sha256 = …`, `sha512=…`).
+    #[must_use]
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Sha256 => "sha256",
+            Self::Sha512 => "sha512",
+        }
+    }
+
+    /// Whether `hex` is one digest of this algorithm, in lowercase hex.
+    #[must_use]
+    pub fn is_lower_hex(self, hex: &str) -> bool {
+        let len = match self {
+            Self::Sha256 => 64,
+            Self::Sha512 => 128,
+        };
+        aterm_codec::hex::is_lower(hex, len)
+    }
+}
+
+impl std::fmt::Display for DigestAlg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.key())
+    }
+}
+
+/// The ONE digest a `sha256`/`sha512` pair of keys names — a signed row's, a log entry's,
+/// a record's: `(algorithm, value)` when exactly one is non-empty, `None` when neither or
+/// both are. The value is as written; its shape is the caller's check.
+#[must_use]
+pub fn one_digest<'a>(sha256: &'a str, sha512: &'a str) -> Option<(DigestAlg, &'a str)> {
+    match (sha256.is_empty(), sha512.is_empty()) {
+        (false, true) => Some((DigestAlg::Sha256, sha256)),
+        (true, false) => Some((DigestAlg::Sha512, sha512)),
+        _ => None,
+    }
 }
 
 /// `[artifact.provenance]`: the scan record of the packer that signed the row. Every
@@ -631,7 +701,8 @@ fn validate_shim_env(m: &PkgManifest) -> Result<(), Reject> {
 ///   it is running tooling this schema left behind;
 /// * a `github-release` or `https` row still REQUIRES `asset` and `sha256` (they were
 ///   `serde`-required fields before the split, and a release-shaped row without them
-///   used to fail closed as [`Reject::Malformed`] — it still does).
+///   used to fail closed as [`Reject::Malformed`] — it still does), and carries no
+///   `sha512`: an index row's gate is its `sha256`, never a second digest beside it.
 ///
 /// Everything finer — hosts, payload lanes, an unknown protocol — is
 /// [`crate::vendor::check_row`]'s per-program refusal, so one mis-authored row for one
@@ -642,7 +713,7 @@ fn validate_rows(m: &PkgManifest) -> Result<(), Reject> {
             return Err(Reject::RetiredKind(VENDOR_FETCH_RETIRED));
         }
         let release_shaped = matches!(a.protocol.as_str(), "github-release" | "https");
-        if release_shaped && (a.asset.is_empty() || a.sha256.is_empty()) {
+        if release_shaped && (a.asset.is_empty() || a.sha256.is_empty() || !a.sha512.is_empty()) {
             return Err(Reject::Malformed);
         }
     }
@@ -653,19 +724,8 @@ fn validate_rows(m: &PkgManifest) -> Result<(), Reject> {
 /// or any TOML/shape error (missing required field, duplicate key, wrong type) is
 /// [`Reject::Malformed`] — fail closed, never a lossy reinterpretation.
 fn parse_toml<T: serde::de::DeserializeOwned>(verified: &VerifiedBytes) -> Result<T, Reject> {
-    #[cfg(test)]
-    PARSE_CALLS.with(|c| c.set(c.get() + 1));
     let text = std::str::from_utf8(verified.as_slice()).map_err(|_| Reject::Malformed)?;
     aterm_toml::from_str(text).map_err(|_| Reject::Malformed)
-}
-
-#[cfg(test)]
-thread_local! {
-    /// Test-only counter proving a parser never runs on unverified bytes: incremented in
-    /// [`parse_toml`], asserted to stay flat after a failed verify. Thread-local so
-    /// libtest's per-test threads don't race a shared global; `#[cfg(test)]` so it never
-    /// ships.
-    static PARSE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -877,8 +937,7 @@ pin = {{ trust = 7100, nn = 108 }}
 
     /// The set a publisher must carry: over every triple an index names, the builds clients
     /// resolve are `pin` union every `pin_by_target` overlay, never one of the two. This is the
-    /// law behind `atpkg_index_pin_union` (tools/atpkg-publish-lib.sh), which the public
-    /// mirror's work list derives from; reading `pin` alone leaves a toolchain that publishes
+    /// law the public mirror's work list (`atpkg-publish mirror`) derives from; reading `pin` alone leaves a toolchain that publishes
     /// entirely as an overlay pinned but never mirrored. Both halves below make it necessary:
     ///
     ///   * an overlay build is resolvable and appears in no `pin` row (so `pin` alone is
@@ -928,8 +987,7 @@ pin = {{ trust = 7100, nn = 108 }}
         assert_eq!(
             resolvable, declared,
             "the resolvable set IS `pin` ∪ every overlay — if this stops holding, \
-             tools/atpkg-publish-lib.sh's atpkg_index_pin_union no longer describes \
-             what the public mirror has to carry"
+             the public mirror's work list no longer describes what it has to carry"
         );
 
         // …and neither key alone covers it, which is the whole reason for a union.
@@ -987,42 +1045,29 @@ pin = {{ trust = 7100, nn = 108 }}
         );
         assert!(!idx.is_program("dotfiles"));
         assert!(
-            !idx.installable(&[], &[]).contains("dotfiles"),
+            !idx.installable(&[]).contains("dotfiles"),
             "a private-config repo can never be in the installable set"
         );
         // Sanity: the named programs ARE reachable.
         assert!(idx.is_program("trust") && idx.is_program("ay") && idx.is_program("aterm"));
     }
 
-    // §5: include/exclude are NARROWING-ONLY — an include naming an absent repo adds nothing.
+    // §5: exclude is NARROWING-ONLY.
     #[test]
-    fn include_exclude_are_narrowing_only() {
+    fn exclude_is_narrowing_only() {
         let idx = parse_index(&verified(&full_index())).unwrap();
-        // Default (empty include): every named program (`gh` included — `system` is a
-        // satisfaction rule, not a tier).
+        // No exclude: every named program (`gh` included — `system` is a satisfaction
+        // rule, not a tier).
         assert_eq!(
-            idx.installable(&[], &[]),
+            idx.installable(&[]),
             ["aterm", "ay", "codex", "gh", "trust", "vendorx"]
                 .iter()
                 .map(|s| s.to_string())
                 .collect()
         );
-        // include narrows to the intersection with named programs...
-        assert_eq!(
-            idx.installable(&["ay".into(), "trust".into()], &[]),
-            ["ay", "trust"].iter().map(|s| s.to_string()).collect()
-        );
-        // ...and an include naming an ABSENT repo can never add it (no widening).
-        assert_eq!(
-            idx.installable(&["ay".into(), "dotfiles".into()], &[]),
-            ["ay"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect::<BTreeSet<_>>()
-        );
         // exclude subtracts.
         assert_eq!(
-            idx.installable(&[], &["trust".into(), "gh".into()]),
+            idx.installable(&["trust".into(), "gh".into()]),
             ["aterm", "ay", "codex", "vendorx"]
                 .iter()
                 .map(|s| s.to_string())
@@ -1038,8 +1083,8 @@ pin = {{ trust = 7100, nn = 108 }}
         let body = full_index();
         assert!(body.contains("[programs.vendorx]") && body.contains("extra = true"));
         let idx = parse_index(&verified(&body)).expect("an index carrying `extra` verifies");
-        assert!(idx.installable(&[], &[]).contains("vendorx"));
-        assert!(idx.installable(&[], &[]).contains("codex"));
+        assert!(idx.installable(&[]).contains("vendorx"));
+        assert!(idx.installable(&[]).contains("codex"));
         assert_eq!(idx.program("gh").unwrap().system.as_deref(), Some("gh"));
         assert_eq!(idx.program("ay").unwrap().system, None);
     }
@@ -1258,10 +1303,13 @@ provides = ["emacs"]
         );
         // A target with no row is the clean skip, never an error.
         assert!(m.artifact_for("aarch64-pc-windows-msvc").is_none());
-        // Release-shaped rows keep their required digests (the pre-split serde contract).
+        // Release-shaped rows keep their required digests (the pre-split serde contract),
+        // and an index row's digest is its sha256 alone.
         for missing in [
             "target = \"aarch64-apple-darwin\"\nsha256 = \"d\"\n",
             "target = \"aarch64-apple-darwin\"\nasset = \"a\"\n",
+            "target = \"aarch64-apple-darwin\"\nasset = \"a\"\nsha512 = \"d\"\n",
+            "target = \"aarch64-apple-darwin\"\nasset = \"a\"\nsha256 = \"d\"\nsha512 = \"d\"\n",
             "target = \"aarch64-apple-darwin\"\nprotocol = \"https\"\nkind = \"binary\"\n\
              sha256 = \"d\"\nurl = \"https://github.com/x\"\n",
         ] {
@@ -1273,6 +1321,44 @@ provides = ["emacs"]
                 "{missing}"
             );
         }
+    }
+
+    /// A row's gate is the ONE digest it sets, named by its algorithm; neither or both is
+    /// no digest. The shape check takes each algorithm's length, lowercase only — the
+    /// sample is agy 1.3.6's darwin_arm64 tarball sha512 as Google's manifest names it.
+    #[test]
+    fn a_row_is_gated_by_the_one_digest_it_sets() {
+        const AGY_SHA512: &str = "473a34b685d0a09d48790e8b86bc3e545dfab889fe0d8fc81cb7e1fdfc336fe7\
+                                  8ce57022e3b438c754c93c9cffeb13fdbd177e50fdedc087d52732fa5475183f";
+        let sha256 = "7b09f01c".repeat(8);
+        assert_eq!(
+            one_digest(&sha256, ""),
+            Some((DigestAlg::Sha256, sha256.as_str()))
+        );
+        assert_eq!(
+            one_digest("", AGY_SHA512),
+            Some((DigestAlg::Sha512, AGY_SHA512))
+        );
+        assert_eq!(
+            one_digest(&sha256, AGY_SHA512),
+            None,
+            "two digests are no gate"
+        );
+        assert_eq!(one_digest("", ""), None);
+        assert!(DigestAlg::Sha512.is_lower_hex(AGY_SHA512));
+        assert!(DigestAlg::Sha256.is_lower_hex(&sha256));
+        for (alg, bad) in [
+            (DigestAlg::Sha256, AGY_SHA512.to_string()),
+            (DigestAlg::Sha512, sha256.clone()),
+            (DigestAlg::Sha512, AGY_SHA512.to_uppercase()),
+            (DigestAlg::Sha512, AGY_SHA512.replacen('4', "g", 1)),
+        ] {
+            assert!(!alg.is_lower_hex(&bad), "{alg} {bad}");
+        }
+        assert_eq!(
+            (DigestAlg::Sha256.to_string(), DigestAlg::Sha512.key()),
+            (String::from("sha256"), "sha512")
+        );
     }
 
     /// The six targets, in the schema's spelling — every one a `<arch>-<vendor>-<os>[-abi]`
@@ -1294,6 +1380,19 @@ provides = ["emacs"]
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), 6, "no duplicates");
+    }
+
+    /// Every published triple is a forge cell, so some lane's compiler reads it:
+    /// a shipped triple in no cell is compiled by none.
+    #[test]
+    fn every_published_triple_is_a_forge_cell() {
+        let cells = aterm_forge::resolve::default_cells();
+        for t in TARGETS {
+            assert!(
+                cells.iter().any(|c| c.triple == *t),
+                "no forge cell compiles `{t}`, and atpkg publishes artifact rows for it"
+            );
+        }
     }
 
     /// `[programs.<name>].unavailable_hint` parses beside `system`; absent ⇒ None.
@@ -1415,33 +1514,6 @@ build_seconds = 0
         assert!(m.artifact_for("x86_64-unknown-linux-gnu").is_none());
     }
 
-    // The parser NEVER runs on unverified bytes: a tampered pkg fails verify, so there is
-    // no VerifiedBytes to parse, and PARSE_CALLS stays flat. (The compile-time half —
-    // parse_index(raw_bytes) does not type-check — needs no test.)
-    #[test]
-    fn parser_never_runs_on_failed_verify() {
-        PARSE_CALLS.with(|c| c.set(0));
-        let roster = testkit::trusted_roster();
-        let body = full_index().into_bytes();
-        let mut sig = testkit::sign(&testkit::MACHINE_SEED, &body);
-        sig[0] ^= 0x01; // tamper
-        assert!(roster.authorize_bytes(body.clone(), &sig).is_err());
-        assert_eq!(
-            PARSE_CALLS.with(std::cell::Cell::get),
-            0,
-            "no parse may run when verification fails"
-        );
-        // The same holds for a signature by a key NO machine on the roster holds — the
-        // case the delegation tier used to answer and the roster answers now.
-        let outsider = testkit::sign(&testkit::OUTSIDER_SEED, &body);
-        assert!(roster.authorize_bytes(body, &outsider).is_err());
-        assert_eq!(PARSE_CALLS.with(std::cell::Cell::get), 0);
-        // Positive control: a good signature verifies, and only then does the parser run.
-        let vb = verified(&full_index());
-        let _ = parse_index(&vb).unwrap();
-        assert!(PARSE_CALLS.with(std::cell::Cell::get) >= 1);
-    }
-
     // STRICT, never-lossy UTF-8: a signed index containing an invalid-UTF-8 byte is
     // rejected (Malformed), NOT silently U+FFFD-substituted and reinterpreted. The byte
     // is part of the genuinely-verified bytes, so this exercises the parse-layer's
@@ -1471,8 +1543,8 @@ build_seconds = 0
         );
     }
 
-    /// `[artifact.provenance]` rides per row, exactly as tools/atpkg-publish.sh writes it
-    /// (after the row's `[artifact.cost]`, with a `MERGE_FROM` row appended after it), and
+    /// `[artifact.provenance]` rides per row, exactly as `atpkg-publish` writes it
+    /// (after the row's `[artifact.cost]`, with a merged row appended after it), and
     /// a client that predates the table parses the same bytes: no struct on the path
     /// denies unknown fields, which is the whole backward-compatibility story.
     #[test]

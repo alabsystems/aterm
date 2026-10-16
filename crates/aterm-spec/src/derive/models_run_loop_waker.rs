@@ -6,26 +6,19 @@
 
 use super::Model;
 
-/// `aterm_objc::WakeTimer` (the winit event-loop waker) over CoreFoundation's
-/// repeating-timer semantics.
+/// `aterm_objc::WakeTimer` (the winit event-loop waker) over CoreFoundation's repeating-timer
+/// semantics; `aterm-objc`'s `wake_timer` module says why the interval is a year.
 ///
-/// The 2026-09-26 freeze: winit's waker repeated every 0.1 µs, the process was
-/// not scheduled for 26.6 h while it was armed, and CoreFoundation walked the
-/// late fire date forward one interval at a time — ~10¹² steps with the
-/// run-loop lock held. `Suspend` is that lateness (in units of the historical
-/// interval); `Fire` records how many steps the walk took. The shipped timer
-/// repeats once a year, so any survivable lateness is one step — and a fired
-/// timer is then SPENT (parked a year out), which is the half the fix could get
-/// wrong: a plan that trusts "already armed for now" after the fire loses every
-/// later wake. `cache`/`spent` project `WakePlan`; `armed` is what
-/// CoreFoundation will actually do.
+/// `Suspend` is lateness, in units of a tiny interval; `Fire` records how many catch-up steps
+/// CoreFoundation's walk took. With the shipped interval any survivable lateness is one step,
+/// and a fired timer is then spent (parked a year out): a plan that trusts "already armed for
+/// now" after the fire loses every later wake. `cache`/`spent` project `WakePlan`; `armed` is
+/// what CoreFoundation will actually do.
 ///
-/// `Buggy = 1` admits one of the two defects: the historical interval (the
-/// timer stays due after firing and the walk is as long as the lateness), or a
-/// plan that never hears the callout. Tier-1 (`aterm-objc`'s
-/// `conformance_wake_timer`) drives the real `WakeTimer` against the real
-/// CoreFoundation on a test thread's run loop, with both defects replayed as
-/// negative controls.
+/// `Buggy = 1` admits one of two defects: a tiny interval (the timer stays due after firing and
+/// the walk is as long as the lateness), or a plan deaf to the callout. Tier-1 (`aterm-objc`'s
+/// `conformance_wake_timer`) drives the real `WakeTimer` against real CoreFoundation on a test
+/// thread's run loop, with both defects as negative controls.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn run_loop_waker_model() -> Model {

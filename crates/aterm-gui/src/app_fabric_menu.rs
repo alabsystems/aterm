@@ -3,26 +3,25 @@
 
 //! The Fabric menu's App side. The bar rows live in [`crate::menu`]
 //! (`FABRIC_MENU`, the View presence checkables, Window ▸ Set Role…); the
-//! dispatch arm in `app_input.rs` hands each one here. Every row is the menu-bar
-//! face of something the wire already does:
+//! dispatch arm in `app_input.rs` hands each one here. Each row fronts
+//! something the wire already does:
 //!
-//! * **Inbox** is `inbox --peek --meta` on the focused session, rendered as a
-//!   Markdown tab. Metadata only: `--meta` prints no body, and the file is
-//!   written `0600`.
-//! * **Hold This Session / Lift Hold** are the `hold` verb with
-//!   [`crate::fabric::HoldIssuer::Owner`] (the local origin), so a fleet hold is
-//!   as untouchable from the menu as from `aterm ctl hold`: the rows grey with
-//!   the fleet's reason, and a click past the grey is answered `ERR denied`.
-//! * **Fabric Status / Turn Fabric On… / Turn Fabric Off…** run `aterm fabric
-//!   [on|off]` as a child process on a thread and open its output as a tab.
-//!   `on`/`off` ask first (the platform's confirm sheet).
-//! * **Presence Band / Presence Rim** flip the live bit at the click and queue
-//!   the `[presence]` leaf's durable write through the serialized config lane
-//!   (`App::queue_presence_write`), as Serious Mode persists.
+//! * **Inbox**: `inbox --peek --meta` on the focused session as a Markdown tab;
+//!   metadata only, the file written `0600`.
+//! * **Hold This Session / Lift Hold**: the `hold` verb as
+//!   [`crate::fabric::HoldIssuer::Owner`], so a fleet hold is as untouchable
+//!   here as from `aterm ctl hold`: the rows grey with the fleet's reason, a
+//!   Release click past the grey is answered `ERR denied`, and a Hold click
+//!   past it sets the owner's own hold beside the fleet's (each origin is its
+//!   own slot), which outlasts the fleet's lift.
+//! * **Fabric Status / Turn Fabric On… / Turn Fabric Off…**: `aterm fabric
+//!   [on|off]` as a child on a thread, its output opened as a tab; `on`/`off`
+//!   confirm first.
+//! * **Presence Band / Presence Rim**: flip the live bit and queue the
+//!   `[presence]` write through the config lane (`App::queue_presence_write`).
 //!
-//! Headless (no OS window, the test harness) every row composes and writes
-//! nothing outside the process: the fabric plan is kept on the App, no child
-//! runs, no sheet is shown.
+//! Headless (no OS window), the fabric commands keep their plan on the App and
+//! run no child and show no sheet.
 
 use crate::menu::{FrontHold, MenuAction};
 use crate::platform::AppRt as _;
@@ -127,7 +126,7 @@ impl FabricVerb {
 
 /// What a Fabric-menu row asked `aterm` to do: the verb, its argv, and the
 /// file its output goes to (opened as a tab when the child ends). Kept on the
-/// App (`last_fabric_plan`) so the tests and a `chrome`-side read can see it.
+/// App (`last_fabric_plan`) for the tests.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FabricPlan {
     pub(crate) verb: FabricVerb,
@@ -372,20 +371,16 @@ impl App {
     }
 
     /// Hold This Session (`on`) / Lift Hold (`off`) for `wid`'s focused
-    /// session: the `hold` verb as the Owner, local origin. The fabric leaf
-    /// changes under the same guard and records the same timeline event a wire
-    /// `hold` does; the presence band is re-projected here (the fabric wake also
-    /// arrives; the refresh is change-gated). A refusal under a fleet hold is
-    /// shown.
+    /// session: the `hold` verb as the Owner, local origin, with the same guard
+    /// and timeline event a wire `hold` has. The presence band is re-projected
+    /// here (the fabric wake also arrives; the refresh is change-gated). A
+    /// refusal under a fleet hold is shown.
     ///
-    /// NEVER A WAIT ON A COMMITTING UPDATE (the review of round eight's #18).
-    /// The Commit's fence ([`crate::fabric::SessionFabric::fence_hold`]) is
-    /// raised and lifted by this thread alone (`App::finish_proven_handoff`),
-    /// and a Commit that holds its claim through one more input-dispatch fence
-    /// (`HeldCommit`) keeps it raised across turns of this run loop — the
-    /// turns that dispatch this very press. A wait here could only end at its
-    /// bound, the window frozen with nothing said and the update's own drain
-    /// deadline spent meanwhile. So the press is answered at once: `ERR busy`
+    /// Never waits on a committing update: the Commit's fence
+    /// ([`crate::fabric::SessionFabric::fence_hold`]) is raised and lifted only
+    /// on this thread, and a `HeldCommit` keeps it raised across the run-loop
+    /// turns that dispatch this press, so a wait could only end at its bound
+    /// with the window frozen. The press is answered at once: `ERR busy`
     /// ([`crate::fabric::HOLD_BUSY`]), nothing moved, said on the band.
     pub(crate) fn menu_hold(&mut self, wid: WindowId, on: bool) {
         use crate::fabric::{HOLD_BUSY, HOLD_DENIED, HoldIssuer, cmd_hold_within};
@@ -408,16 +403,23 @@ impl App {
             &self.store,
             &rest,
             HoldIssuer::Owner,
-            std::time::Duration::ZERO,
+            Some(std::time::Duration::ZERO),
         );
         self.refresh_presence_session(session, false);
         self.publish_front_hold(wid);
         self.palette_refresh_live();
-        // Under a standing fleet hold a Hold press is a record (the session is
-        // held, as asked) and a Release press is a failure on the band; the
-        // bridge's refusal is a failure either way.
+        // Under a fleet hold, Hold fills the owner's own slot beside it (a
+        // success, unsaid) and Release with nothing of the owner's to lift is
+        // `HOLD_DENIED`, a failure on the band; a bridge refusal is a failure
+        // either way.
         let refused = if reply == HOLD_DENIED {
-            Some(crate::message_reporters::fleet_hold(on))
+            let reason = self
+                .pool
+                .get(session)
+                .and_then(|s| s.ctx.fabric.hold())
+                .map(|h| h.reason)
+                .unwrap_or_default();
+            Some(crate::message_reporters::fleet_hold(on, &reason))
         } else if reply == HOLD_BUSY {
             Some(crate::message_reporters::hold_refused(
                 on,
@@ -566,11 +568,11 @@ impl App {
                 // Waits on a CLI child the human is not blocked on.
                 crate::qos::set_self(crate::qos::Role::Background);
                 let cli = crate::ledger_key::aterm_cli();
-                // `aterm fabric` reads every local instance itself (the
-                // rendezvous walk `aterm ctl instances` makes), so the child is
-                // handed no socket. `aterm.exe` is a CONSOLE image: on Windows
-                // `spawnfd::command` gives it a windowless console, where a bare
-                // child opened a visible one for its whole run (`ledger_key::launch`).
+                // `aterm fabric` walks every local instance itself (as `aterm
+                // ctl instances` does), so the child gets no socket. `aterm.exe`
+                // is a console image: on Windows `spawnfd::command` gives it a
+                // windowless console, not the visible one a bare child would
+                // open (`ledger_key::launch`).
                 let mut cmd = aterm_uds::spawnfd::command(&cli);
                 cmd.args(&plan.argv);
                 let (status, stdout, stderr) = match cmd.output() {
@@ -639,11 +641,7 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    //! Tests for the Fabric menu's App side: Hold/Lift greyed with the fleet
-    //! reason under a fleet hold (and live in the right order otherwise), Inbox
-    //! opening a metadata-only tab, Set Role… writing the role, the presence
-    //! toggles gating the projection and queueing their durable write, and the
-    //! fabric commands composing without running.
+    //! Tests for the Fabric menu's App side.
 
     use super::*;
     use crate::menu::MenuAction;
@@ -671,9 +669,9 @@ mod tests {
     }
 
     /// Under a fleet hold both halt rows are disabled (palette mirror and native
-    /// validate) with the fleet's reason, and a click reaching `menu_hold` is
-    /// refused. Under no hold, Hold is live and holds locally; then Lift is live
-    /// and lifts.
+    /// validate) with the fleet's reason; a Release click reaching `menu_hold` is
+    /// refused, and a Hold click fills the owner's own slot beside the fleet's.
+    /// Under no hold, Hold is live and holds locally; then Lift is live and lifts.
     #[test]
     fn hold_and_lift_are_disabled_with_the_fleet_reason_under_a_fleet_hold() {
         let _statics = crate::menu::MENU_STATICS
@@ -709,29 +707,26 @@ mod tests {
                 r.label
             );
         }
-        // A Hold click that slipped past the grey asked for what already is —
-        // the session is held — so it is a record, never a row.
-        app.menu_hold(wid, true);
-        assert!(ctx.fabric.hold().is_some_and(|h| h.origin == "fleet"));
-        assert!(
-            app.messages
-                .live_by_key(crate::message_reporters::KEY_FABRIC_HOLD)
-                .is_none(),
-            "no row for a hold that already stands"
-        );
-        assert!(
-            app.messages
-                .log()
-                .records()
-                .any(|r| r.title == "Session already held" && !r.is_live()),
-            "…and the log keeps it"
-        );
-        // A Release click: refused, shown, the hold stands.
+        // A Release click that slipped past the grey: refused, shown, the
+        // hold stands — there is nothing of the owner's to lift.
         app.menu_hold(wid, false);
         assert!(ctx.fabric.hold().is_some_and(|h| h.origin == "fleet"));
         assert!(
             app.has_live_message("Couldn't release the hold"),
             "the refusal is said, as its outcome"
+        );
+        // A Hold click past the grey fills the owner's own slot and leaves the
+        // fleet's as it was, so the session stays held when the fleet lifts: a
+        // success, unsaid.
+        app.menu_hold(wid, true);
+        assert_eq!(ctx.fabric.holds().origins(), "fleet,local");
+        assert!(ctx.fabric.hold().is_some_and(|h| h.origin == "fleet"));
+        assert!(
+            !app.messages
+                .log()
+                .records()
+                .any(|r| r.title == "Session already held"),
+            "nothing was refused"
         );
         assert!(crate::fabric::apply_hold_for_test(&ctx, None));
         app.on_presence_wake(&ctx.self_id, false);
@@ -777,16 +772,13 @@ mod tests {
         let _ = sid;
     }
 
-    /// THE MENU'S HOLD NEVER WAITS ON A COMMITTING UPDATE (the review of round
-    /// eight's #18). A seamless update's Commit fences every session's hold
-    /// ([`crate::fabric::SessionFabric::fence_hold`]) from this thread, and lifts
-    /// it from this thread; a Commit that holds its claim through one more
-    /// input-dispatch fence keeps it raised across turns of the run loop — the
-    /// turns that dispatch a Hold This Session or Lift Hold press. The press is
-    /// answered at once, nothing moved, and the refusal said; it used to wait
-    /// the verb's whole bound ([`crate::fabric::HOLD_FENCE_WAIT`], 10 s) on a
-    /// fence only this thread could lift, the window frozen with nothing said.
-    /// CONTROL: the fence lifted, the same press holds the session.
+    /// A Hold or Lift press under a committing update's hold fence (raised and
+    /// lifted only on this thread) is answered at once with the refusal shown
+    /// and nothing moved: it never blocks on the fence
+    /// ([`crate::fabric::fence_blocks_on_this_thread`]), where a wait could end
+    /// only at [`crate::fabric::SessionFabric::fence_wait`]. Controls: the
+    /// verb's own bounded wait under the same fence is counted, and with the
+    /// fence lifted the same press holds the session.
     #[test]
     fn a_menu_hold_under_a_committing_update_answers_at_once() {
         let _statics = crate::menu::MENU_STATICS
@@ -794,11 +786,23 @@ mod tests {
             .unwrap_or_else(|p| p.into_inner());
         let (mut app, wid, _sid, ctx) = app_with_stub();
         let _ = ctx.fabric.fence_hold(true);
-        let pressed = std::time::Instant::now();
+        let blocks = crate::fabric::fence_blocks_on_this_thread();
         app.menu_hold(wid, true);
-        assert!(
-            pressed.elapsed() < crate::fabric::HOLD_FENCE_WAIT,
+        assert_eq!(
+            crate::fabric::fence_blocks_on_this_thread(),
+            blocks,
             "the press waited on a fence only this thread lifts"
+        );
+        // Control: the verb's own bounded wait under the same fence is counted.
+        let _ = crate::fabric::cmd_hold_within(
+            &app.store,
+            &format!("{} on reason=verb", ctx.self_id.as_str()),
+            crate::fabric::HoldIssuer::Owner,
+            Some(std::time::Duration::from_millis(1)),
+        );
+        assert!(
+            crate::fabric::fence_blocks_on_this_thread() > blocks,
+            "a bounded wait under the fence blocks, and the count sees it"
         );
         assert!(ctx.fabric.hold().is_none(), "nothing moved");
         assert!(
@@ -816,10 +820,11 @@ mod tests {
 
         // Lift Hold under the fence: answered at once, titled for a lift.
         let _ = ctx.fabric.fence_hold(true);
-        let pressed = std::time::Instant::now();
+        let blocks = crate::fabric::fence_blocks_on_this_thread();
         app.menu_hold(wid, false);
-        assert!(
-            pressed.elapsed() < crate::fabric::HOLD_FENCE_WAIT,
+        assert_eq!(
+            crate::fabric::fence_blocks_on_this_thread(),
+            blocks,
             "the lift waited on a fence only this thread lifts"
         );
         assert!(ctx.fabric.hold().is_some(), "nothing moved");

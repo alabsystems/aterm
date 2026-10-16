@@ -1,65 +1,30 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-//! Native window / tab / pane GUI models — spec-model
-//! data constructors moved verbatim out of the one-file catalog in `derive.rs`
-//! (pure code motion; every constructor keeps its `crate::derive` path via the
-//! `pub use` re-exports there).
+//! Native window, tab and pane models (re-exported from `crate::derive`).
 
 use super::*;
 
-/// TAB NAVIGATION — the GUI per-window tab-strip index machine (`TabIndex` in
-/// `aterm-gui`: `{ active, count }`). One window always holds at least one tab and
-/// the renderer reads `active` as an index into the live tab list, so the contract
-/// is exactly: `count >= 1` AND `active <= count - 1` (with `usize`, `active >= 0`
-/// is trivial). This is the smallest faithful abstraction of the four shipping
-/// mutators, bounded by `Cap` tabs so `ty` explores a finite space:
+/// Tab navigation: the per-window tab-strip index machine (`TabIndex` in `aterm-gui`,
+/// `{ active, count }`). A window holds at least one tab and the renderer indexes the live tab
+/// list with `active`, so the contract is `count >= 1` and `active <= count - 1`. The actions are
+/// the four mutators `add` (`NewTab`), `switch_to` (`SelectTab`), `cycle(true)` (`Cycle`) and a
+/// non-exit `close` (`Close`), bounded by `Cap` tabs.
 ///
-///   * `NewTab`    ⟵ `TabIndex::add()`: append a tab and switch to it. `count' =
-///     count + 1` and the new tab is the new LAST index, `active' =
-///     count` (== new `count - 1`). Guarded `count <= Cap - 1`.
-///   * `SelectTab` ⟵ `TabIndex::switch_to(i)` for an in-range `i` (Cmd-1..9 /
-///     `switch_tab_in`): jump to ANY valid index. The specific `i` is
-///     user input, not a function of the scalar projection, so the
-///     faithful update is NONDETERMINISTIC: `active' \in 0..count-1`.
-///     `ty` checks the whole fan-out, and the real in-range
-///     `switch_to` lands on one such admissible value.
-///   * `Cycle`     ⟵ `TabIndex::cycle(true)` (Cmd-Shift-]): forward with WRAP.
-///     `(active + 1) % count` has no `%` in the macro algebra, but the
-///     invariant `active <= count - 1` makes it exactly `active' = IF
-///     active + 1 > count - 1 THEN 0 ELSE active + 1`. Guarded
-///     `count > 1` (one tab is a no-op).
-///   * `Close`     ⟵ `TabIndex::close(i)` for a non-exit close (`count > 1`, so a
-///     window keeps >= 1 tab): `count' = count - 1`, then RE-CLAMP the
-///     active index into the shrunk range. The worst case for the
-///     range invariant is closing the LAST (active) tab, where active
-///     must drop to the new last index `count - 2`; the faithful
-///     re-clamp is `active' = IF active > count - 2 THEN count - 2 ELSE
-///     active` (= `min(active, new_count - 1)`, matching `close`'s
-///     `else if active >= count { active = count - 1 }` arm). Guarded
-///     `count > 1`.
+/// `Buggy = 1` makes `Close` forget the re-clamp, so closing the last (active) tab leaves the
+/// renderer indexing a tab that no longer exists; `ty` must refute `ActiveInRange`.
 ///
-/// **`Buggy` non-vacuity control.** At `Buggy = 0` `ty` PROVES `CountPositive` +
-/// `ActiveInRange` over the whole bounded space. The `Buggy` branch in `Close`
-/// FORGETS the re-clamp (`active' = active`), so closing the last/active tab leaves
-/// `active = count - 1` while the range shrank to `count - 2` — `active > count - 1`
-/// after the step — and `ty` at `Buggy = 1` MUST yield a counterexample to
-/// `ActiveInRange`. That is the exact "renderer indexes a tab that no longer
-/// exists" defect the clamp prevents.
-///
-/// Hand-built (not via `ty_model!`) because `SelectTab` needs a NONDETERMINISTIC
-/// in-range update (`in_range`), which the light-annotation macro does not surface
-/// — same reason as [`window_routing_model`].
-// Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
-// models above) — the MODEL it returns is what `ty` machine-checks.
+/// Hand-built rather than `ty_model!` because `SelectTab` needs the nondeterministic `in_range`
+/// update, as [`window_routing_model`] does.
+// Skip (T2 vcgen-budget lane): a model data constructor; `ty` checks the model it returns.
 #[cfg_attr(trust_verify, trust::skip)]
+#[crate::model]
 pub fn tab_nav_model() -> Model {
     Model {
         name: "TabNav",
-        // Bound the tab count so `ty` explores a finite space (a window with up to
-        // Cap tabs). `Buggy` flips the Close re-clamp off.
+        // `Cap` bounds the tab count; `Buggy` turns the Close re-clamp off.
         consts: vec![("Cap", 4), ("Buggy", 0)],
-        // A fresh window: one tab (count=1), it is active (active=0).
+        // A fresh window: one active tab.
         vars: vec![
             StateVar {
                 name: "count",
@@ -72,9 +37,7 @@ pub fn tab_nav_model() -> Model {
         ],
         fn_vars: vec![],
         actions: vec![
-            // add(): append a tab and switch to it — the new tab is the new LAST
-            // index. All RHS evaluate against the pre-state, so `active' = count`
-            // (old count == new `count' - 1`) and `count' = count + 1`.
+            // add(): append a tab and switch to it; RHS read the pre-state, so `active' = count`.
             Action {
                 name: "NewTab",
                 guard: Some(le(var("count"), sub(cst("Cap"), int(1)))),
@@ -89,11 +52,8 @@ pub fn tab_nav_model() -> Model {
                     },
                 ],
             },
-            // switch_to(i) for an in-range i (Cmd-1..9 / switch_tab_in): jump to ANY
-            // valid index. The specific `i` is user input, not a function of the
-            // scalar projection, so the faithful update is NONDETERMINISTIC:
-            // `active' \in 0..(count - 1)`. `ty` checks the whole fan-out; the real
-            // in-range `switch_to` lands on one such admissible value.
+            // switch_to(i) (Cmd-1..9 / switch_tab_in): `i` is user input, not a function of the
+            // projection, so the update is nondeterministic over every valid index.
             Action {
                 name: "SelectTab",
                 guard: Some(gt(var("count"), int(1))),
@@ -102,10 +62,8 @@ pub fn tab_nav_model() -> Model {
                     expr: in_range(int(0), sub(var("count"), int(1))),
                 }],
             },
-            // cycle(true) (Cmd-Shift-]): forward with WRAP. `(active + 1) % count`
-            // has no `%` in this algebra, but the invariant `active <= count - 1`
-            // makes it exactly `active' = IF active + 1 > count - 1 THEN 0 ELSE
-            // active + 1`. Guarded `count > 1` (one tab is a no-op).
+            // cycle(true) (Cmd-Shift-]): `(active + 1) % count` without `%`, exact under
+            // `ActiveInRange`.
             Action {
                 name: "Cycle",
                 guard: Some(gt(var("count"), int(1))),
@@ -118,15 +76,9 @@ pub fn tab_nav_model() -> Model {
                     ),
                 }],
             },
-            // close(i) for a non-exit close (count > 1, so the window keeps >= 1 tab):
-            // `count' = count - 1`, then RE-CLAMP active into the shrunk range. The
-            // worst case for the range invariant is closing the LAST (active) tab,
-            // where active must drop to the new last index `count - 2`; the faithful
-            // re-clamp is `active' = IF active > count - 2 THEN count - 2 ELSE active`
-            // (= min(active, new_count - 1), matching `close`'s `else if active >=
-            // count { active = count - 1 }` arm). The `Buggy` branch FORGETS the
-            // clamp (`active' = active`), so closing the last/active tab leaves
-            // `active = count - 1` while the range shrank to `count - 2`.
+            // close(i) with count > 1: `count' = count - 1`, then re-clamp. Closing the last
+            // (active) tab is the worst case: active drops to `count - 2`, matching `close`'s
+            // `else if active >= count { active = count - 1 }` arm. `Buggy` forgets the clamp.
             Action {
                 name: "Close",
                 guard: Some(gt(var("count"), int(1))),
@@ -154,49 +106,38 @@ pub fn tab_nav_model() -> Model {
             // A window always has at least one tab.
             Invariant {
                 name: "CountPositive",
+                kind: InvariantKind::Uncaught,
                 expr: gt(var("count"), int(0)),
             },
-            // The active index is always in range for the renderer (active <= count-1).
+            // The renderer indexes the live tab list with `active`.
             Invariant {
                 name: "ActiveInRange",
+                kind: InvariantKind::Claim,
                 expr: le(var("active"), sub(var("count"), int(1))),
             },
         ],
     }
 }
 
-/// SPLIT-PANE TREE INTEGRITY — the FOCUSED leaf index of a tab's `PaneTree`
-/// (aterm-gui `pane.rs`) never leaves the renderer's `0..leaf_count-1` range. This
-/// holds the split-pane feature (Cmd-D / Cmd-Shift-D split, Cmd-W / EOF close) to
-/// the same Trust bar as tabs: input + the solid cursor never route to a pane that
-/// no longer exists.
+/// Split-pane tree integrity: the focused leaf index of a tab's `PaneTree` (aterm-gui
+/// `pane.rs`) never leaves `0..leaf_count-1`, so input and the cursor never route to a pane
+/// that no longer exists. `Buggy = 1` forgets the Close re-point, leaving `focused` one past
+/// the shrunk end. Only the `CloseOutcome::Collapsed` arm is modelled; a `LastPane` close is a
+/// tab-machine transition (`tab_nav` / `window_routing`).
 ///
-/// `Buggy` gates the Close re-point: at `Buggy = 0` a Close that removes the focused
-/// last leaf drops `focused` to the new last index; at `Buggy = 1` it FORGETS the
-/// re-point, leaving `focused = leaf_count` one past the shrunk end (the dangling-
-/// focus defect). So `ty` PROVES `FocusInRange` (Buggy=0) and CATCHES it (Buggy=1 →
-/// counterexample). SCOPE: only the `CloseOutcome::Collapsed` arm (the tab survives);
-/// a `LastPane` close is a tab-machine transition (`tab_nav` / `window_routing`).
-///
-/// No invariant says the tree is non-empty: `SplitTree` has no empty value (a sole
-/// leaf's `remove_leaf` reports `OnlyLeaf` and leaves it in place), so the claim
-/// would only restate Close's `leaf_count > 1` guard. The seam's real historical
-/// defect, 3c27540a7 (the removal elided from release builds, so `close_pane`
-/// reported `Collapsed` over a tree that still held the leaf), keeps a valid STATE
-/// and breaks the TRANSITION: no invariant here can see it, only a transition
-/// bind can, and only in a build that keeps the elided line out — which is why
-/// that fix carries its own both-profile regressions and the
-/// `no_tree_mutation_hides_inside_a_debug_assert` source guard.
-// Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
-// models above) — the MODEL it returns is what `ty` machine-checks.
+/// No invariant says the tree is non-empty: `SplitTree` has no empty value (a sole leaf's
+/// `remove_leaf` reports `OnlyLeaf`), so it would only restate Close's guard. A removal elided
+/// from release builds (inside a `debug_assert!`) keeps a valid state and breaks the transition,
+/// which no invariant here sees; `no_tree_mutation_hides_inside_a_debug_assert` guards it.
+// Skip (T2 vcgen-budget lane): a model data constructor; `ty` checks the model it returns.
 #[cfg_attr(trust_verify, trust::skip)]
+#[crate::model]
 pub fn pane_tree_model() -> Model {
     Model {
         name: "PaneTree",
-        // Bound the leaf count so `ty` explores a finite space (a tab with up to
-        // Cap split panes). `Buggy` flips the Close re-point off.
+        // `Cap` bounds the leaf count; `Buggy` turns the Close re-point off.
         consts: vec![("Cap", 4), ("Buggy", 0)],
-        // A fresh tab: one leaf (leaf_count=1), it is focused (focused=0).
+        // A fresh tab: one focused leaf.
         vars: vec![
             StateVar {
                 name: "leaf_count",
@@ -209,10 +150,8 @@ pub fn pane_tree_model() -> Model {
         ],
         fn_vars: vec![],
         actions: vec![
-            // split_focused(dir, new): the focused leaf becomes a Split of (original,
-            // new); the new pane is the SECOND child -> the new LAST leaf in tree
-            // order, and focus moves to it. RHS read the pre-state, so focused' =
-            // leaf_count and leaf_count' = leaf_count + 1. Guarded leaf_count <= Cap-1.
+            // split_focused: the new pane is the second child, so the new last leaf in tree
+            // order, and focus moves to it.
             Action {
                 name: "Split",
                 guard: Some(le(var("leaf_count"), sub(cst("Cap"), int(1)))),
@@ -227,16 +166,10 @@ pub fn pane_tree_model() -> Model {
                     },
                 ],
             },
-            // close_pane on a SPLIT tab (CloseOutcome::Collapsed, leaf_count > 1):
-            // leaf_count' = leaf_count - 1, then RE-POINT focused to a surviving leaf.
-            // The real first_leaf/keep-focus index is not a function of the scalar
-            // projection, so the faithful update is NONDETERMINISTIC: focused' \in
-            // 0..(leaf_count - 2). The in_range MUST be the top-level RHS (the renderer
-            // emits focused' \in lo..hi only there; nesting in an IF renders a SET as
-            // an = RHS, a type error), so the Buggy flag is folded into the UPPER
-            // BOUND: Buggy=0 caps at the new last index leaf_count-2; Buggy=1 stretches
-            // the cap to leaf_count-1, one past the end (the forgot-to-re-point defect,
-            // where closing the focused last leaf leaves focused = leaf_count - 1).
+            // close_pane on a split tab (`CloseOutcome::Collapsed`): the surviving leaf focus
+            // moves to is not a function of the projection, so focused' is nondeterministic.
+            // `in_range` must be the top-level RHS (nested in an IF it renders a set as an `=`
+            // RHS, a type error), so `Buggy` stretches the upper bound one past the new end.
             Action {
                 name: "Close",
                 guard: Some(gt(var("leaf_count"), int(1))),
@@ -260,37 +193,30 @@ pub fn pane_tree_model() -> Model {
             },
         ],
         invariants: vec![
-            // Exactly-one in-range focused leaf: focused <= leaf_count - 1.
+            // The focused leaf is in range.
             Invariant {
                 name: "FocusInRange",
+                kind: InvariantKind::Claim,
                 expr: le(var("focused"), sub(var("leaf_count"), int(1))),
             },
         ],
     }
 }
 
-/// SESSION-POOL REFCOUNT ACCOUNTING — a pooled session's bookkeeping entry exists
-/// exactly while ≥1 window view references it. `refcount` is the live view count
-/// (`SessionPool::views`); `closed` is whether the entry has been retired. The
-/// invariant `ClosedIffEmpty` (`closed = 1  <=>  refcount = 0`) is the pool's
-/// allocation discipline: a session is retired the instant — and only the instant —
-/// its last viewer detaches, so the Cmd-Shift-O two-windows-one-session path
-/// (refcount 2) never retires early and a fully-detached session never leaks an entry.
+/// Session-pool refcount: a pooled session's entry exists exactly while at least one window
+/// view references it. `refcount` is the live view count (`SessionPool::views`), `closed`
+/// whether the entry is retired; `ClosedIffEmpty` says a session is retired when, and only
+/// when, its last viewer detaches, so two windows on one session (Cmd-Shift-O) never retire
+/// early and a detached session never leaks an entry. `Buggy = 1` retires on every Release.
 ///
-/// `Buggy = 1` retires on EVERY Release (closes while a co-viewer remains) → `ty`
-/// catches the premature-retire counterexample; `Buggy = 0` retires only at
-/// refcount 0. The Tier-1 conformance makes the iff NON-VACUOUS by projecting the
-/// two variables from TWO INDEPENDENT real signals: `refcount` from the actual count
-/// of canonical terminal view edges (recomputed across every live tab/split, including
-/// multiple shared views migrated into one window) and `closed` from pool membership
-/// (`views(sid).is_none()`).
-/// So a pool that RETIRES a session — dropping its `Session`, closing the PTY — while
-/// a canonical view still references it projects to `[refcount>0, closed=1]`, which `ty`
-/// rejects (the use-after-free-on-the-pooled-session hazard). (PTY-fd liveness past
-/// the pool entry is a further `SinkWriter`-Arc concern, def2bac — out of scope here.)
-// Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
-// models above) — the MODEL it returns is what `ty` machine-checks.
+/// Tier-1 projects the two variables from independent signals: `refcount` from the count of
+/// canonical terminal view edges across every live tab and split, `closed` from pool
+/// membership (`views(sid).is_none()`). A pool that retires a session (dropping its `Session`,
+/// closing the PTY) while a view still references it projects to `[refcount>0, closed=1]`.
+/// PTY-fd liveness past the pool entry (the `SinkWriter` Arc) is out of scope.
+// Skip (T2 vcgen-budget lane): a model data constructor; `ty` checks the model it returns.
 #[cfg_attr(trust_verify, trust::skip)]
+#[crate::model]
 pub fn session_pool_model() -> Model {
     Model {
         name: "SessionPool",
@@ -307,8 +233,7 @@ pub fn session_pool_model() -> Model {
         ],
         fn_vars: vec![],
         actions: vec![
-            // attach (a 2nd+ window views the same session, Cmd-Shift-O): refcount+1,
-            // guarded not-yet-closed and below the model bound.
+            // attach (another window views the session, Cmd-Shift-O): refcount+1.
             Action {
                 name: "Acquire",
                 guard: Some(and_(
@@ -320,8 +245,8 @@ pub fn session_pool_model() -> Model {
                     expr: add(var("refcount"), int(1)),
                 }],
             },
-            // detach (a window stops viewing): refcount-1; retire (closed=1) IFF that
-            // was the last viewer. Buggy retires on every detach.
+            // detach: refcount-1; retire iff that was the last viewer. `Buggy` retires on
+            // every detach.
             Action {
                 name: "Release",
                 guard: Some(gt(var("refcount"), int(0))),
@@ -347,6 +272,7 @@ pub fn session_pool_model() -> Model {
         ],
         invariants: vec![Invariant {
             name: "ClosedIffEmpty",
+            kind: InvariantKind::Claim,
             expr: and_(
                 or_(eq(var("closed"), int(0)), eq(var("refcount"), int(0))),
                 or_(eq(var("closed"), int(1)), gt(var("refcount"), int(0))),
@@ -355,37 +281,26 @@ pub fn session_pool_model() -> Model {
     }
 }
 
-/// TAB-STRIP PARITY — the NATIVE macOS titlebar tab strip (`toolbar.rs`'s
-/// `NSSegmentedControl`) can never DESYNC from the proven tab model. The strip is a
-/// pure MIRROR of the tab set: its `segmentCount` must always equal the tab `count`
-/// and its `selectedSegment` the `active` tab, and — since AppKit will index it — the
-/// selection must stay in range (`selected <= seg_count - 1`). The sink maintaining
-/// the mirror is `set_window_tabs(handle, titles, active)`, driven from
-/// `App::refresh_window_tabs` after EVERY tab mutation.
+/// Tab-strip parity: the native macOS titlebar tab strip (`toolbar.rs`'s `NSSegmentedControl`)
+/// never desyncs from the tab model. Its `segmentCount` equals the tab `count`, its
+/// `selectedSegment` the `active` tab, and since AppKit indexes it the selection stays in
+/// range. `set_window_tabs(handle, titles, active)` maintains it, driven from
+/// `App::refresh_window_tabs` after every tab mutation.
 ///
-/// Two-lane self-composition (cf. [`recording_model`]'s live and replay lanes): one
-/// event stream drives BOTH a TRUTH lane `(count, active)` (the `TabIndex` machine of
-/// [`tab_nav_model`]) and a STRIP lane `(seg_count, selected)` (the control), re-synced
-/// to mirror the truth after each action. `ty` PROVES `StripMirrorsTruth` @Buggy=0; the Buggy branch in
-/// Close DROPS the strip re-sync (a missed `refresh_window_tabs`), freezing BOTH strip
-/// vars stale — so the strip shows an extra segment with an out-of-range selection,
-/// caught @Buggy=1.
+/// Two lanes on one event stream (as in [`recording_model`]): a truth lane `(count, active)`,
+/// the `TabIndex` machine of [`tab_nav_model`], and a strip lane `(seg_count, selected)`
+/// re-synced after each action. `Buggy=1` drops the re-sync in Close (a missed
+/// `refresh_window_tabs`), so the strip shows an extra segment with an out-of-range selection.
 ///
-/// Tier-1: bound by `tab_strip_conformance` (aterm-gui), which projects the TRUTH lane
-/// `(count, active)` from `ws.tabs` AND the STRIP lane `(seg_count, selected)` from
-/// `WindowState::strip_shadow` — a faithful record of what `refresh_window_tabs` last
-/// pushed to the native `NSSegmentedControl`. The two signals are INDEPENDENT (a tab
-/// mutation that forgets to re-sync a window's strip leaves the shadow stale), so the
-/// load-bearing case — closing a tab in a NON-FRONT window — is a real, ty-rejected
-/// desync unless `close_tab_at` re-syncs THAT window's strip (the fix this drove).
-// Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
-// models above) — the MODEL it returns is what `ty` machine-checks.
+/// Tier-1: aterm-gui's `tab_strip_conformance` projects the truth lane from `ws.tab_set` and the
+/// strip lane from `WindowState::strip_shadow`, the record of what `refresh_window_tabs` last
+/// pushed. The two signals are independent, so closing a tab in a non-front window is a
+/// rejected desync unless `close_tab_at` re-syncs that window's strip.
+// Skip (T2 vcgen-budget lane): a model data constructor; `ty` checks the model it returns.
 #[cfg_attr(trust_verify, trust::skip)]
+#[crate::model]
 pub fn tab_strip_model() -> Model {
-    // Re-clamp of the active/selected index after a Close shrinks the count by one:
-    // min(idx, new_count - 1) = IF idx > count - 2 THEN count - 2 ELSE idx (RHS reads
-    // the PRE-state count, so new_count - 1 = count - 2). Used for the TRUTH lane's
-    // active' and, in the correct path, the STRIP lane's selected'.
+    // After a Close: min(idx, new_count - 1), with RHS reading the pre-state count.
     let reclamp = || {
         if_(
             gt(var("active"), sub(var("count"), int(2))),
@@ -395,11 +310,10 @@ pub fn tab_strip_model() -> Model {
     };
     Model {
         name: "TabStrip",
-        // Bound the tab count so `ty` explores a finite space. `Buggy` flips the Close
-        // strip re-sync off (the forgot-to-refresh defect).
+        // `Cap` bounds the tab count; `Buggy` drops the Close strip re-sync.
         consts: vec![("Cap", 4), ("Buggy", 0)],
         vars: vec![
-            // TRUTH lane (the TabIndex machine).
+            // Truth lane (the TabIndex machine).
             StateVar {
                 name: "count",
                 init: 1,
@@ -408,7 +322,7 @@ pub fn tab_strip_model() -> Model {
                 name: "active",
                 init: 0,
             },
-            // STRIP lane (the NSSegmentedControl mirror).
+            // Strip lane (the NSSegmentedControl mirror).
             StateVar {
                 name: "seg_count",
                 init: 1,
@@ -420,8 +334,7 @@ pub fn tab_strip_model() -> Model {
         ],
         fn_vars: vec![],
         actions: vec![
-            // open_tab_in -> TabIndex::add(): append + switch, then refresh re-syncs the
-            // strip verbatim. active' = count (the new last index); strip mirrors.
+            // open_tab_in -> TabIndex::add(): append and switch; refresh re-syncs the strip.
             Action {
                 name: "NewTab",
                 guard: Some(le(var("count"), sub(cst("Cap"), int(1)))),
@@ -444,10 +357,8 @@ pub fn tab_strip_model() -> Model {
                     },
                 ],
             },
-            // switch_tab_in / cycle_tab: move active, then refresh re-syncs the strip to
-            // the NEW active — both lanes move in LOCKSTEP. Modelled as the deterministic
-            // cycle(true) wrap (a genuine shipping transition); selected' mirrors the
-            // SAME pre-state expression so the lanes never diverge spuriously.
+            // switch_tab_in / cycle_tab: both lanes move in lockstep, modelled as the
+            // deterministic cycle(true) wrap.
             Action {
                 name: "SelectTab",
                 guard: Some(gt(var("count"), int(1))),
@@ -470,12 +381,9 @@ pub fn tab_strip_model() -> Model {
                     },
                 ],
             },
-            // close_tab_at -> TabIndex::close(i), non-exit (count > 1): count' = count-1,
-            // active re-clamped; the strip is then re-synced (seg_count' = count',
-            // selected' = active'). The Buggy branch DROPS that re-sync (the close forgot
-            // refresh_window_tabs on a non-front window), freezing BOTH strip vars at
-            // their stale pre-close values — so seg_count outlives the tab it counted and
-            // selected points past the new end when the last/active tab was closed.
+            // close_tab_at -> TabIndex::close(i), count > 1: count' = count - 1, active
+            // re-clamped, then the strip re-synced. `Buggy` drops the re-sync, freezing both
+            // strip vars at their pre-close values.
             Action {
                 name: "Close",
                 guard: Some(gt(var("count"), int(1))),
@@ -504,11 +412,11 @@ pub fn tab_strip_model() -> Model {
             },
         ],
         invariants: vec![
-            // The native strip can never desync from the proven tab model: its segment
-            // count mirrors the tab count, its selection mirrors the active tab, and the
-            // selection is a valid segment index AppKit can highlight.
+            // The strip mirrors the tab count and active tab, and its selection is a segment
+            // index AppKit can highlight.
             Invariant {
                 name: "StripMirrorsTruth",
+                kind: InvariantKind::Claim,
                 expr: and_(
                     and_(
                         eq(var("seg_count"), var("count")),
@@ -521,57 +429,46 @@ pub fn tab_strip_model() -> Model {
     }
 }
 
-/// The GLOBAL control-socket `ActiveHandle` mirror (the `active_handle` in aterm-gui's
-/// `App`). The control socket has ONE global handle that introspection/drive verbs
-/// (`text`/`feed`/`signal`) resolve through (`resolve_active`); it MUST always name the
-/// session the user is actually looking at — the FRONTMOST window's active tab's
-/// focused pane (the TRUTH lane). The window analog of [`tab_strip_model`]'s
-/// per-window strip mirror: same two-lane (truth/mirror) parity discipline, but for the
-/// PROCESS-WIDE control target rather than the native chrome.
+/// The global control-socket `ActiveHandle` mirror (`active_handle` in aterm-gui's `App`).
+/// Introspection and drive verbs (`text`/`feed`/`signal`) resolve through it
+/// (`resolve_active`), so it must always name the session the user is looking at: the frontmost
+/// window's active tab's focused pane. The process-wide analog of [`tab_strip_model`]'s
+/// per-window strip mirror, with the same truth/mirror lanes.
 ///
-/// `ty` PROVES `HandleMirrorsFront` at `Buggy=0` — every path that moves the front
-/// window's active session ALSO re-points the global handle (the
-/// `resync_active_or_window` -> `sync_active_session` discipline), so the two lanes
-/// never diverge under ANY interleaving of front-active changes — and CATCHES the
-/// "swallow class" at `Buggy=1` (a close-collapse / new-window path that re-mirrors only
-/// the PER-WINDOW state via `sync_window` and forgets the global re-point) ->
-/// counterexample on `HandleMirrorsFront`. That is exactly the defect class fixed by
-/// routing `apply_close_outcome` / `create_window_internal` / the new-tab install through
-/// `resync_active_or_window`: without it the control socket keeps driving a stale, or
-/// just-closed, session — and `Owner`/aterm-ctl verbs bypass the per-request edge gate,
-/// so they hit whatever the stale handle points at. The 2026-09-14 audit found the
-/// split and pane-focus moves in the same family. Every seam that CREATES the new
-/// front re-points in its install half, the part after the PTY spawn that moves the
-/// front — `install_new_tab`, `install_split_pane`, `install_window_state_with_parent`
-/// — rather than in each caller.
+/// At `Buggy=0` every path that moves the front session also re-points the handle
+/// (`resync_active_or_window` -> `sync_active_session`). `Buggy=1` is a close-collapse or
+/// new-window path that re-mirrors only the per-window state (`sync_window`), refuted on
+/// `HandleMirrorsFront`. A stale handle matters because Owner-scope verbs bypass the
+/// per-request edge gate and hit whatever it names. Every seam that creates the new front
+/// re-points in its install half, after the PTY spawn (`install_new_tab`, `install_split_pane`,
+/// `install_window_state_with_parent`), not in each caller.
 ///
-/// Tier-1: aterm-gui's `active_handle_conformance` drives a headless `App` through
-/// every one of those seams (the three install halves with a stub session, since the
-/// spawn needs an event loop), reads `truth` from the canonical tab model and
-/// `handle` from the real `active_handle`, and validates each front move against this
-/// model; the stale-handle step is the one it rejects.
-// Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
-// models above) — the MODEL it returns is what `ty` machine-checks.
+/// Tier-1: aterm-gui's `active_handle_conformance` drives a headless `App` through every seam
+/// (the install halves with a stub session, since the spawn needs an event loop), reads `truth`
+/// from the canonical tab model and `handle` from the real `active_handle`, and validates each
+/// front move against this model; the stale-handle step is the one it rejects.
+// Skip (T2 vcgen-budget lane): a model data constructor; `ty` checks the model it returns.
 #[cfg_attr(trust_verify, trust::skip)]
+#[crate::model]
 pub fn active_handle_model() -> Model {
     Model {
         name: "ActiveHandle",
-        // Bound the fresh-session id space so `ty` explores a finite, terminating space.
-        // `Buggy` flips the global re-sync OFF on the close/new-window lane (the swallow).
+        // `MaxId` bounds the fresh-session ids; `Buggy` drops the global re-sync on the
+        // close/new-window path.
         consts: vec![("MaxId", 4), ("Buggy", 0)],
         vars: vec![
-            // TRUTH lane: the frontmost window's CURRENT active-tab focused-pane session.
+            // Truth lane: the frontmost window's active tab's focused-pane session.
             StateVar {
                 name: "truth",
                 init: 1,
             },
-            // MIRROR lane: the global control `ActiveHandle`'s target session.
+            // Mirror lane: the global control `ActiveHandle`'s target session.
             StateVar {
                 name: "handle",
                 init: 1,
             },
-            // A strictly-increasing fresh-session allocator, so each change moves the
-            // front active session to a DISTINCT id (a stale handle is then observable).
+            // A strictly increasing allocator, so each change moves the front session to a
+            // distinct id and a stale handle is observable.
             StateVar {
                 name: "next",
                 init: 2,
@@ -579,10 +476,8 @@ pub fn active_handle_model() -> Model {
         ],
         fn_vars: vec![],
         actions: vec![
-            // The ALWAYS-CORRECT lockstep path (open_tab_in / switch_tab / move_tab):
-            // the front active session moves to a fresh session and the global handle is
-            // re-pointed in lockstep (`if frontmost { sync_active_session }`). Both lanes
-            // move together — this path was never buggy.
+            // The lockstep path (open_tab_in / switch_tab / move_tab): the front session and the
+            // handle move together (`if frontmost { sync_active_session }`).
             Action {
                 name: "SwitchActive",
                 guard: Some(le(var("next"), sub(cst("MaxId"), int(1)))),
@@ -601,12 +496,9 @@ pub fn active_handle_model() -> Model {
                     },
                 ],
             },
-            // The SWALLOW-PRONE path (apply_close_outcome's pane-collapse / tab-close and
-            // create_window_internal's new front window): the front active session moves
-            // to a fresh session. The FIX re-points the global handle too
-            // (`resync_active_or_window` -> `sync_active_session`); the Buggy branch
-            // re-mirrors only the per-window state (`sync_window`) and LEAVES THE GLOBAL
-            // HANDLE STALE on the just-closed / previous session.
+            // The close and new-window path (apply_close_outcome's pane collapse or tab close,
+            // install_window_state_with_parent): `resync_active_or_window` re-points the handle too;
+            // `Buggy` re-mirrors only the per-window state (`sync_window`) and leaves it stale.
             Action {
                 name: "CloseOrNewFront",
                 guard: Some(le(var("next"), sub(cst("MaxId"), int(1)))),
@@ -627,60 +519,46 @@ pub fn active_handle_model() -> Model {
             },
         ],
         invariants: vec![
-            // The global control handle always names the session the user is actually
-            // looking at in the frontmost window — so a control verb never drives a
-            // stale or just-closed session.
+            // A control verb never drives a stale or just-closed session.
             Invariant {
                 name: "HandleMirrorsFront",
+                kind: InvariantKind::Claim,
                 expr: eq(var("handle"), var("truth")),
             },
         ],
     }
 }
 
-/// The cross-process `@<sid>` proxy FORWARD is acyclic and TERMINATES (control.rs
-/// `proxy_forward_plan` / `try_proxy_forward`). The recursion-topology refactor REMOVED
-/// the explicit hop-counter cap, so what bounds a forward chain is how each of the two
-/// hop kinds ENDS at its target:
+/// The cross-process `@<sid>` proxy forward is acyclic and terminates (`control.rs`
+/// `proxy_forward_plan` / `try_proxy_forward`). There is no hop counter; each hop kind ends at
+/// its target:
 ///
-/// * the CHILD hop (a session this aterm spawned): the parent rewrites the child's own
-///   selector to `@.` (run on self) before relaying, so the child resolves the verb
-///   LOCALLY and never re-enters `try_proxy_forward`;
-/// * the SIBLING hop (a same-uid aterm the user opened separately) keeps `@<sid>` — the
-///   sibling resolves it among its own tabs — and ends because the discovery entry it
-///   followed was published by the instance at that socket: there the sid is hosted
-///   locally, or the entry is stale and names the sibling's OWN socket, which the
-///   self-dial guard refuses.
+/// * a child hop (a session this aterm spawned): the parent rewrites the selector to `@.`, so
+///   the child resolves the verb locally and never re-enters `try_proxy_forward`;
+/// * a sibling hop (a same-uid aterm opened separately) keeps `@<sid>` and ends because the
+///   discovery entry it followed was published by the instance at that socket: the sid is
+///   hosted there, or the entry is stale and names the sibling's own socket, which the self-dial
+///   guard refuses.
 ///
-/// A forward chain is therefore at most ONE cross-process hop, so no A→B→A ping-pong
-/// (or unbounded relay-thread/fd growth) can form.
+/// So a chain is at most one cross-process hop and no A→B→A ping-pong can form. `Buggy=1` is a
+/// target that forwards on, refuted on `OneHopNoCycle`.
 ///
-/// `ty` PROVES `OneHopNoCycle` at Buggy=0 — a hop that ends at its target caps the chain
-/// at depth 1 under any interleaving over the bounded space — and CATCHES the loop class
-/// at Buggy=1 (a hop whose target forwards on: the original cross-selector relayed
-/// instead of `@.`, or a sibling that dials onward) -> counterexample on
-/// `OneHopNoCycle`. This locks in the safety the removed hop-cap used to provide.
-///
-/// Tier-1 binding, one test per hop kind in aterm-gui's `control::tests`, each taking
-/// the real first line the forward presents — `proxy_forward_plan`'s verb, with the
-/// token the forward takes once connected: a child's edge token as planned, a
-/// sibling's read beside its socket — stripping its handshake, and asking
-/// the real router again — with Owner scope, where forwarding is possible at all —
-/// whether the target would forward on; every hop is validated as this model's
-/// `Forward`, which `Buggy = 1` must reject:
-/// `proxy_forward_plan_conforms_to_proxy_forward_one_hop` asks in the forwarding
-/// process itself, where the child's sid IS forwardable, so only the `@.` rewrite can
-/// end the chain; `sibling_forward_plan_conforms_to_proxy_forward_one_hop` asks in the
-/// sibling's context (its store, its recorded self socket), for a sid it hosts and for
-/// a stale entry.
-// Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
-// models above) — the MODEL it returns is what `ty` machine-checks.
+/// Tier-1 is one test per hop kind in aterm-gui's `control_tests.rs`: each takes the real first
+/// line the forward presents (`proxy_forward_plan`'s verb with the token the forward takes once
+/// connected), strips its handshake, asks the real router with Owner scope whether the target
+/// would forward on, and validates the hop as `Forward`, which `Buggy = 1` must reject.
+/// `proxy_forward_plan_conforms_to_proxy_forward_one_hop` asks in the forwarding process, where
+/// the child's sid is forwardable, so only the `@.` rewrite ends the chain;
+/// `sibling_forward_plan_conforms_to_proxy_forward_one_hop` asks in the sibling's context for a
+/// sid it hosts and for a stale entry.
+// Skip (T2 vcgen-budget lane): a model data constructor; `ty` checks the model it returns.
 #[cfg_attr(trust_verify, trust::skip)]
+#[crate::model]
 pub fn proxy_forward_model() -> Model {
     Model {
         name: "ProxyForward",
-        // MaxDepth bounds `ty`'s exploration; the SAFETY bound the invariant asserts is 1.
-        // `Buggy` flips the `@.` rewrite off (relay the original cross-selector → re-forward).
+        // `MaxDepth` bounds the exploration; the invariant asserts depth 1. `Buggy` turns the
+        // `@.` rewrite off.
         consts: vec![("MaxDepth", 2), ("Buggy", 0)],
         vars: vec![
             // Cross-process hops taken by the in-flight forward chain so far.
@@ -688,7 +566,7 @@ pub fn proxy_forward_model() -> Model {
                 name: "depth",
                 init: 0,
             },
-            // Is a request still in flight and eligible to forward onward?
+            // A request still in flight and eligible to forward onward.
             StateVar {
                 name: "active",
                 init: 1,
@@ -696,11 +574,8 @@ pub fn proxy_forward_model() -> Model {
         ],
         fn_vars: vec![],
         actions: vec![
-            // One forward hop, which ENDS at its target (active' = 0): a child runs the
-            // `@.`-rewritten verb on ITSELF; a sibling hosts the sid or refuses to dial
-            // itself. The Buggy branch is a target that forwards on — the original cross
-            // selector relayed to a child that re-forwards — so the chain CONTINUES
-            // (active' = 1).
+            // One hop, which ends at its target (active' = 0). `Buggy` is a target that
+            // forwards on (the original selector relayed to a child), so the chain continues.
             Action {
                 name: "Forward",
                 guard: Some(and_(
@@ -720,25 +595,23 @@ pub fn proxy_forward_model() -> Model {
             },
         ],
         invariants: vec![
-            // A forward chain is at most one cross-process hop — never a cycle or
-            // unbounded recursion (which would exhaust relay threads / fds).
+            // At most one cross-process hop: no cycle exhausting relay threads and fds.
             Invariant {
                 name: "OneHopNoCycle",
+                kind: InvariantKind::Claim,
                 expr: le(var("depth"), int(1)),
             },
         ],
     }
 }
 
-/// OSC 52's blocking platform-writer handoff is a one-slot, latest-value
-/// mailbox (`aterm-gui/src/spawn.rs`). A producer may replace either destination
-/// while the worker is busy, but it must never append another retained payload:
-/// the slot remains bounded at one and, whenever occupied, names the newest
-/// clipboard and PRIMARY generations independently.
+/// OSC 52's blocking platform-writer handoff is a one-slot, latest-value mailbox
+/// (`aterm-gui/src/spawn.rs`). A producer may replace either destination while the worker is
+/// busy but never appends another retained payload: the slot holds at most one and, when
+/// occupied, names the newest clipboard and PRIMARY generations independently.
 ///
-/// `Buggy=1` models the retired unbounded `mpsc::channel`: every publish grows
-/// the retained count and leaves the first payload in place. The invariant
-/// catches that implementation immediately, so the proof cannot pass vacuously.
+/// `Buggy=1` is an unbounded channel: every publish grows the retained count and leaves the
+/// first payload in place.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn clipboard_mailbox_model() -> Model {
     crate::ty_model! {
@@ -820,9 +693,8 @@ pub fn clipboard_mailbox_model() -> Model {
 /// scalar retry variables project membership for one observed document; they do
 /// not count the runtime's whole ID set.
 ///
-/// `Buggy=1` models three retired failures: accepting a fifth waiting image,
-/// dropping the reducer intent on `Full`, and releasing capacity without a retry
-/// wake. The invariants catch each independently.
+/// `Buggy=1` accepts a fifth waiting image, drops the reducer intent on `Full`, and releases
+/// capacity without a retry wake; the invariants catch each independently.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_document_queue_model() -> Model {
     crate::ty_model! {
@@ -888,7 +760,7 @@ pub fn native_document_queue_model() -> Model {
                 deferred_intent <= 1
                 && retry_pending <= 1
                 && deferred_intent <= retry_pending;
-            invariant OpenSlotHasRetryEdge:
+            uncaught OpenSlotHasRetryEdge:
                 drain_edge <= 1
                 && (
                     retry_pending == 0

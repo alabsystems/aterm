@@ -1,16 +1,12 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! A usage-limit stall replayed through the real driver: Claude Code 2.1.280
-//! parks the session at `⚠ Usage limit reached · continuing automatically at
-//! 6am`; an upgrade that typed its notice into the parked session every half
-//! hour (a new marker each time) and then gave up would have all its notices
-//! delivered at once at the reset, and the agent's READY to the last marker
-//! would be heard by nobody. Pinned here: no notice into a limited session
-//! (F1), a late READY honoured (F2), one release line for every notice
-//! abandoned (F3), the stops, release rules, drains and clock holds around
-//! them, and the Tier-1 bind of `harness_upgrade_never_strands_model` to the
-//! real code.
+//! A usage-limit stall replayed through the real driver: Claude Code 2.1.280 parks a limited
+//! session at `⚠ Usage limit reached · continuing automatically at 6am`, so notices typed into
+//! it all arrive at the reset and a READY to the last marker can be heard by nobody. Pinned:
+//! no notice into a limited session (F1), a late READY honoured (F2), one release line for
+//! every abandoned notice (F3), and the Tier-1 bind of `harness_upgrade_never_strands_model`
+//! to the real code.
 
 use super::*;
 use aterm_spec::derive::{Model, harness_upgrade_never_strands_model};
@@ -29,8 +25,7 @@ const LEDGER: [(u64, &str); 4] = [
     (1_790_382_760, "ATERM-UPGRADE-READY-8cd7f7eb"),
 ];
 
-/// `gave-up`, and the READY answer the next morning (the supervisor's `EVENT
-/// idle seq=54190 ATERM-UPGRADE-READY-8cd7f7eb`).
+/// The give-up, and the agent's READY the next morning.
 const GAVE_UP_AT: u64 = 1_790_384_562;
 const READY_AT: u64 = 1_790_427_721;
 
@@ -79,12 +74,10 @@ fn notice(marker: &str) -> String {
     )
 }
 
-/// F2 over the replayed record: the markers the ledger names are the ones
-/// this build mints from the state's salt; a record with four notices and a
-/// give-up hears the late READY (to the last marker, and to any other of the
-/// four) and takes the restart; the release it owes waits behind that READY.
-/// F1 over the same moments: those notices are never typed now, and no
-/// give-up comes.
+/// F2 over the replayed record: the ledger's markers are the ones this build mints from the
+/// salt; after four notices and a give-up the late READY (to any of the four) is heard and
+/// the restart taken, the owed release waiting behind it. F1 over the same moments: no notice
+/// is typed and no give-up comes.
 #[test]
 fn the_incident_replays_to_a_restart_never_a_stall() {
     let to = version("2.1.283");
@@ -166,8 +159,7 @@ fn the_incident_replays_to_a_restart_never_a_stall() {
             "{marker} is heard too"
         );
     }
-    // A READY given before a later notice is no answer to it: the rule that the
-    // latest notice ends any READY before it still holds.
+    // A READY given before a later notice is no answer to it.
     let early = [
         user(&notice(LEDGER[0].1)),
         said_by_agent(LEDGER[0].1),
@@ -175,8 +167,7 @@ fn the_incident_replays_to_a_restart_never_a_stall() {
     ]
     .join("\n");
     assert!(!answered(&st, Some(&early)));
-    // Once the release is typed the round's markers are forgotten: the agent
-    // was told the upgrade is off for now, and none of this round's does.
+    // Once the release is typed the round's markers are forgotten.
     st.released();
     assert!(st.release.is_empty());
     assert!(!answered(&st, Some(&tail)));
@@ -215,9 +206,8 @@ fn the_owners_hold_releases_the_agent_and_forgets_its_answers() {
     // A new notice supersedes a release still owed.
     twice.announced("ATERM-UPGRADE-READY-feedface".to_string(), 20, 1);
     assert!(twice.release.is_empty());
-    // A READY covers any version: a newer build for the same model, the
-    // session still on the build the round began on, is taken in place: the
-    // round, its marker and nothing owed.
+    // A READY covers any version: a newer build for the same model, on the build the round
+    // began on, is taken in place (the round, its marker, nothing owed).
     let target = Candidate {
         exe: PathBuf::from("/x/claude"),
         version: version("9.9.9"),
@@ -437,10 +427,9 @@ fn typed(asked: &std::sync::Mutex<Vec<String>>, words: &str) -> usize {
     })
 }
 
-/// F1 through the real visit: the banner over an empty composer, with a
-/// session file that says `idle`, types nothing: a pending upgrade waits
-/// `limited`, and so does one that has asked to its bound long ago, whose
-/// clock the look restarts instead of giving up. Negative control: the same
+/// F1 through the real visit: a limited tab (the banner over an empty composer, the session
+/// file `idle`) is typed nothing: a pending upgrade waits `limited`, and so does one asked to
+/// its bound long ago, its clock restarted instead of a give-up. Negative control: the same
 /// tab off its limit is announced to.
 #[cfg(unix)]
 #[test]
@@ -530,9 +519,7 @@ fn a_voided_ready_owes_one_release_typed_once() {
         ..drive(&dir)
     };
     let marker = "ATERM-UPGRADE-READY-0badf00d";
-    // A session at work when the notice came: a conversation holding only
-    // the harness's own turns has no task, and is restarted afresh instead
-    // of asked.
+    // A conversation with a task (one holding only the harness's turns is restarted afresh).
     write_transcript(
         &opts,
         &[
@@ -572,7 +559,7 @@ fn a_voided_ready_owes_one_release_typed_once() {
         sock: Some(sock),
         ..opts.clone()
     };
-    let release = upgrade::release_prompt(upgrade::Agent::Claude);
+    let release = upgrade::release_prompt(upgrade::Agent::Claude, false);
     let first = agent.visit(&free, shell);
     assert_eq!(first.step, "released:void");
     assert_eq!(typed(&asked, "Upgrade off:"), 1, "{:?}", asked.lock());
@@ -685,17 +672,12 @@ fn a_gave_up_record_restarts_on_a_late_ready_or_releases_its_agent() {
     let _ = std::fs::remove_dir_all(&limited);
 }
 
-/// A stale status never reaches the signal, and never strands the READY
-/// agent under it: Claude Code's status left at `busy` over an idle screen
-/// with nothing running under the agent. At its second idle look the status
-/// lags a turn that is over, and one line may go there, but the restart
-/// waits for Claude's own `idle` (the Drain step): work inside the agent's
-/// own process is no process under it, and the status is the one word that
-/// says it runs. So the READY's restart waits `status-stale` (no last look,
-/// no signal), and once that READY has stood a whole [`upgrade::REASK_S`]
-/// the agent is asked again (`announced:2`), never left stopped. Negative
-/// control: the same agent with Claude's own `idle` is restarted; its
-/// restart reaches its last look before the signal.
+/// A stale status never reaches the signal nor strands the READY agent: with Claude Code's
+/// status left `busy` over an idle screen and nothing under the agent, the restart waits
+/// `status-stale` (the Drain step needs Claude's own `idle`: work inside the agent's process
+/// is no process under it), and once the READY has stood a whole [`upgrade::REASK_S`] the
+/// agent is asked again (`announced:2`). Negative control: with `idle`, the restart reaches
+/// its last look before the signal.
 #[cfg(unix)]
 #[test]
 fn a_ready_agent_under_a_stale_status_is_never_signalled_and_is_asked_again() {
@@ -771,15 +753,11 @@ fn a_ready_agent_under_a_stale_status_is_never_signalled_and_is_asked_again() {
 
 // ------------------------------------------- stops, releases and directions
 
-/// A restart that stops after READY releases the agent it asked, through the
-/// real visit. The restart's own record transitions (written before the
-/// signal, [`St::signalled`], then the kernel's refusal,
-/// [`St::signal_failed`], `restart`'s `Terminated::Failed`) stop the upgrade,
-/// owe the release and forget the round's markers: no stopped phase acts on
-/// a READY. The next visit types the release once, and the one after is the
-/// upgrade's last word with nothing owed. Negative control: a record stopped
-/// with its markers kept and READY still the agent's last word is released at
-/// once, because a READY no phase acts on holds nothing.
+/// A restart refused after READY releases the agent it asked: [`St::signalled`] then
+/// [`St::signal_failed`] stop the upgrade, owe the release and forget the markers, so no
+/// stopped phase acts on a READY. The next visit types the release once; the one after owes
+/// nothing. A stopped record that kept its markers, READY still the agent's last word, is
+/// released at once too.
 #[cfg(unix)]
 #[test]
 fn a_restart_refused_after_ready_releases_the_agent_it_asked() {
@@ -843,12 +821,9 @@ fn a_restart_refused_after_ready_releases_the_agent_it_asked() {
     }
 }
 
-/// A late READY whose restart's gate waits keeps the gate's word, and the
-/// window's host owns the session's turn ends while it settles. The release
-/// a gave-up upgrade owes waits behind the READY, and it is not the step's
-/// word: the restart's gate is, so the supervisor never types a continuation
-/// over the READY turn while its restart settles, and a person's draft under
-/// it is looked at every [`HOLD_LOOK`]. Nothing is typed either way.
+/// A late READY whose restart's gate waits keeps the gate's word, not the owed release's: the
+/// host owns the turn ends while the restart settles, and a draft under it is looked at every
+/// [`HOLD_LOOK`]. Nothing is typed either way.
 #[cfg(unix)]
 #[test]
 fn a_late_ready_whose_restart_waits_keeps_its_gates_word() {
@@ -914,15 +889,12 @@ fn user_row(extra: &str, content: &str) -> String {
 }
 
 /// Who has directed the conversation since the agent's last answer
-/// ([`upgrade::directed_since_ready`]), over real transcript user rows: a
-/// person's words, a `!` command, an Esc, a peer's message and a
-/// supervisor's continuation are directions; the harness's own lines, tool
-/// results, `isMeta` rows (such as the limit's reset), compaction summaries,
-/// task notifications and slash commands with their output are not. A
-/// direction counts once the agent has answered it with a row of its own,
-/// and only after the latest notice and the agent's latest READY to a marker
-/// of the round. Negative control: a direction the agent answered with READY
-/// (a peer's message, then the READY) counts for nothing.
+/// ([`upgrade::directed_since_ready`]), over real user rows: a person's words, a `!` command,
+/// an Esc, a peer's message and a continuation are directions; the harness's own lines, tool
+/// results, `isMeta` rows, compaction summaries, task notifications and slash commands are
+/// not. A direction counts once the agent has answered it, and only after the latest notice
+/// and the agent's latest READY. Negative control: a direction answered with READY counts for
+/// nothing.
 #[test]
 fn a_direction_since_the_last_answer_is_a_turn_typed_by_someone_else() {
     let notice_row = user(&notice(LEDGER[0].1));
@@ -946,7 +918,7 @@ fn a_direction_since_the_last_answer_is_a_turn_typed_by_someone_else() {
             r#""isCompactSummary":true,"#,
             r#""This session is being continued from a previous conversation""#,
         ),
-        user(&upgrade::release_prompt(upgrade::Agent::Claude)),
+        user(&upgrade::release_prompt(upgrade::Agent::Claude, false)),
         said_by_agent("Nothing of mine is running."),
     ];
     let with = |rows: &[String]| {
@@ -1062,14 +1034,11 @@ fn a_release_follows_only_the_process_the_notice_reached() {
     }
 }
 
-/// Through the real visit, a release owed is dropped (said once in the
-/// ledger, nothing typed) where it is no longer this upgrade's: the process
-/// visited is not the one the notice reached (resumed by hand: on the old
-/// build, the visit's own step; on the new one, `release_visit`), or someone
-/// has directed the conversation since the notice. Negative control: the rows
-/// Claude Code writes on its own after the notice (the limit's reset, a
-/// tool's result, a task notification) direct nothing, and the release is
-/// typed.
+/// Through the real visit, an owed release is dropped (ledgered once, nothing typed) where it
+/// is no longer this upgrade's: the process visited is not the one the notice reached, or
+/// someone has directed the conversation since. Negative control: the rows Claude Code writes
+/// on its own (the limit's reset, a tool result, a task notification) direct nothing, and the
+/// release is typed.
 #[cfg(unix)]
 #[test]
 fn a_release_is_dropped_where_it_is_no_longer_the_upgrades() {
@@ -1167,13 +1136,10 @@ fn a_release_is_dropped_where_it_is_no_longer_the_upgrades() {
     }
 }
 
-/// A dropped release leaves no owed wait behind: a pending round owing the
-/// line (`retargeted`), whose last look recorded the release's own gate
-/// (`wait=release:attended`), is visited with no build to move to while the
-/// notice's process no longer holds the conversation: the release is dropped
-/// (`release-dropped:other-process`), the drop is the visit's step, and it
-/// clears the wait, so `--status` never tells the owner the agent is still
-/// owed its line.
+/// A dropped release takes its gate's wait with it: a pending round owing `retargeted`, its
+/// last look's wait `release:attended`, visited with no build to move to while the notice's
+/// process no longer holds the conversation, drops the release (`release-dropped:other-process`)
+/// and clears the wait, so `--status` never says the line is still owed.
 #[cfg(unix)]
 #[test]
 fn a_dropped_release_leaves_no_owed_wait_behind() {
@@ -1262,16 +1228,11 @@ fn a_dropped_release_leaves_no_owed_wait_behind() {
     );
 }
 
-/// A late READY the restart's gate holds past the drain is voided, through
-/// the real visit, as an announced one is. The gave-up record hears the
-/// agent's READY; a person's draft that has stood [`upgrade::HOLD_S`] voids
-/// it (`drain-expired:draft`): nothing typed over the draft, the release
-/// still owed, the round's markers forgotten, so the stale answer can never
-/// end the agent when the draft goes. Background work of the agent's own,
-/// still running [`upgrade::DRAIN_S`] after the answer, voids it too, and the
-/// release is typed in the same visit (`released:gave-up`, the void
-/// ledgered). Negative control: the same work a minute after the answer is
-/// only waited for.
+/// A late READY the restart's gate holds past the drain is voided as an announced one is: a
+/// draft standing [`upgrade::HOLD_S`] voids it (`drain-expired:draft`), nothing typed, the
+/// release still owed, the markers forgotten. The agent's own background work still running
+/// [`upgrade::DRAIN_S`] after the answer voids it too, and the release is typed in the same
+/// visit. Negative control: the same work a minute after the answer is only waited for.
 #[cfg(unix)]
 #[test]
 fn a_late_ready_held_past_the_drain_is_voided_and_its_agent_released() {
@@ -1386,14 +1347,11 @@ fn a_late_ready_held_past_the_drain_is_voided_and_its_agent_released() {
     }
 }
 
-/// A direction before the READY never drops the release its void owes,
-/// through the real visit: the gave-up record; after the notices a person's
-/// message, the agent's answer to it, then its READY; the agent's own work
-/// under it `DRAIN_S` after the answer voids that READY, and the release is
-/// typed (`released:gave-up`), never dropped as `release-dropped:directed`,
-/// which would leave no restart, no release, and nothing asking again.
-/// Negative control: the same message after the READY, taken up by the
-/// agent, ends the READY (nothing to void or restart) and drops the release.
+/// A direction before the READY never drops the release its void owes: after a person's
+/// message, the agent's answer and its READY, the agent's own work `DRAIN_S` on voids the
+/// READY and the release is typed, never dropped as `release-dropped:directed` (which would
+/// leave nothing asking again). Negative control: the message after the READY, taken up, ends
+/// the READY and drops the release.
 #[cfg(unix)]
 #[test]
 fn a_direction_before_the_ready_never_drops_the_release_its_void_owes() {
@@ -1483,16 +1441,13 @@ fn a_direction_before_the_ready_never_drops_the_release_its_void_owes() {
     }
 }
 
-/// F1 from the window: the loop's limit episode holds the upgrade's clocks
-/// ([`hold_clock`], called by the window's host as its loop's episode opens
-/// and closes). The host takes no step during an episode, so without this a
-/// notice whose wind-down turn hit the limit would meet its first idle point
-/// after the reset hours past its window and be given up on at once.
-/// Negative control: that record, unheld, gives up at that point; held, it
-/// waits its window. The READY clock is held too; another tab's record and a
-/// pending one are not touched, no clock is moved back, and a lock another
-/// sweep holds applies nothing (`false`: the host tries again before its
-/// next step).
+/// F1 from the window: the loop's limit episode holds the upgrade's clocks ([`hold_clock`],
+/// called by the host as an episode opens and closes). The host takes no step during an
+/// episode, so a notice whose turn hit the limit would otherwise meet its first idle point
+/// after the reset hours past its window and be given up. Negative control: unheld, that
+/// record gives up there; held, it waits its window. The READY clock is held too; another
+/// tab's record and a pending one are untouched, no clock moves back, and a lock another sweep
+/// holds applies nothing (`false`).
 #[test]
 fn a_limit_episode_holds_the_upgrades_clocks_for_the_window() {
     let dir = scratch("hold-clock");
@@ -1639,17 +1594,14 @@ enum Holds {
     /// The agent's own background work, under a READY heard
     /// [`upgrade::DRAIN_S`] ago.
     Background,
-    /// The same at a break, the work inside the agent's own process (a
-    /// workflow it waits on: Claude's status `busy`, nothing under it): judged
-    /// as [`Holds::Background`]. Only at a break (`brk`): off one, `busy`
+    /// The same at a break, the work inside the agent's own process (Claude's status `busy`,
+    /// nothing under it), judged as [`Holds::Background`]. Only at a break: off one, `busy`
     /// over nothing is a turn still running.
     InProcess,
-    /// The same work, under the same READY, looked at from a break of it
-    /// (`brk`, [`upgrade::Facts::background_point`]), and the step held to
-    /// what a break may do ([`upgrade::break_step`]): nothing is ended; the
-    /// release goes as the notice's point would. Decided for a gave-up round's
-    /// late READY only ([`at_a_break`]), and judged stricter than
-    /// [`Holds::Background`]: the void exactly where the model voids.
+    /// The same work under the same READY, looked at from a break of it (`brk`,
+    /// [`upgrade::Facts::background_point`]), the step held to [`upgrade::break_step`].
+    /// Decided only for a gave-up round's late READY ([`at_a_break`]), and judged stricter
+    /// than [`Holds::Background`]: the void exactly where the model voids.
     Break,
     /// The restart's signal is refused by the kernel, or a re-ask's plan
     /// by the relaunch — the round abandoned.
@@ -1668,24 +1620,19 @@ fn ready_row() -> String {
     said_by_agent(&format!("Saved.\n{}", marker(1)))
 }
 
-/// Whether the transcript a model state stands for may carry a direction the
-/// agent answered with READY before what the state says ([`real_of`]):
-/// wherever a READY may stand in the tail without being the answer the state
-/// denies (it is the answer, its markers are forgotten, or someone spoke
-/// after it).
+/// Whether the transcript a model state stands for may carry an earlier direction the agent
+/// answered with READY ([`real_of`]): wherever a READY may stand in the tail without being an
+/// answer the state denies.
 fn history_fits(s: &S) -> bool {
     s["ready"] == 1 || s["live"] == 0 || s["told"] == 1 || s["directed"] == 1
 }
 
-/// The record, facts, clock and transcript a model state stands for: the
-/// record of the agent the notice reached, its fence on that agent, the
-/// round's marker typed. At a break (`brk`), the look is the window's at a
-/// break of the agent's own work: Claude's status `shell`, a shell running
-/// under the agent. The transcript: the notice;
-/// with `history` ([`history_fits`]), a peer's message the agent answered
-/// with READY; the READY where the state has one, else the agent's
-/// wind-down; a direction not answered yet (`told`), or one the agent took
-/// up (`directed`).
+/// The record, facts, clock and transcript a model state stands for: the record of the agent
+/// the notice reached, the round's marker typed. At a break (`brk`), Claude's status `shell`
+/// with a shell running under the agent. The transcript: the notice; with `history`
+/// ([`history_fits`]), a peer's message the agent answered with READY; the READY where the
+/// state has one, else a wind-down; a direction not answered yet (`told`), or one the agent
+/// took up (`directed`).
 fn real_of(s: &S, history: bool) -> (St, Facts, u64, Vec<String>) {
     let phase = match s["phase"] {
         0 => Phase::Pending,
@@ -1798,24 +1745,14 @@ struct Decided {
     owed: bool,
 }
 
-/// The real visit's decision at the look `s` stands for, under `holds`, over
-/// the transcript [`real_of`] writes for it (`history`: a direction answered
-/// with READY), in the driver's order and through the driver's own code: the
-/// look's clock ([`upgrade::clock_held`]); the READY the step acts on
-/// ([`heard`]) and its clock ([`upgrade::ready_since`]); the step
-/// ([`upgrade::requested_step`]); its record transition ([`St::announced`],
-/// [`St::give_up`], [`St::void`], [`St::signalled`], refused, [`St::stop`]
-/// or [`St::signal_failed`]), at a break held to what a break may do
-/// ([`upgrade::break_step`]); the release where it is the next act
-/// ([`release_next`], at a break too), dropped where [`release_void`] says
-/// the agent took up direction since its last answer ([`St::dropped`]), else
-/// typed under [`upgrade::gate_release`] ([`St::released`]) or the word that
-/// owes it ([`owed_word`]); and the host's reading of the word: its last
-/// word ([`after`] is Finished) at a point the agent can read is the model's
-/// `Look` (the window's host takes no step at a limit). `None` where `holds`
-/// cannot be met: a refusal needs a restart, or a re-ask, to refuse; work
-/// inside the agent's process, and [`Holds::Break`], are decided only at a
-/// break (the latter only where [`at_a_break`] says).
+/// The real visit's decision at the look `s` stands for, under `holds`, over the transcript
+/// [`real_of`] writes (`history`: a direction answered with READY), in the driver's order and
+/// through its own code: the clock hold, the READY and its clock, the step (held to
+/// [`upgrade::break_step`] at a break) and its record transition, then the release where it
+/// is next ([`release_next`]): dropped where [`release_void`] says, else typed under
+/// [`upgrade::gate_release`] or the word that owes it. A last word at a point the agent can
+/// read is the model's `Look`. `None` where `holds` cannot be met: a refusal needs a restart
+/// or re-ask to refuse, and in-process work and [`Holds::Break`] are decided only at a break.
 fn decide(s: &S, holds: Holds, history: bool) -> Option<Decided> {
     if holds == Holds::Break && !at_a_break(s) {
         return None;
@@ -1996,22 +1933,16 @@ fn decide(s: &S, holds: Holds, history: bool) -> Option<Decided> {
     })
 }
 
-/// The states decided at a break ([`Holds::Break`]): a round that gave up,
-/// holding a late READY to one of its markers, at a break of the agent's own
-/// work (`brk`). The answer the work outlives past the drain is voided there
-/// as at an idle point (`Void`, and the release it owes typed at the same
-/// look, as a notice could be), never waited on for good.
+/// The states decided at a break ([`Holds::Break`]): a gave-up round holding a late READY to
+/// one of its markers, at a break of the agent's own work (`brk`).
 fn at_a_break(s: &S) -> bool {
     s["brk"] == 1 && s["phase"] == 2 && s["ready"] == 1 && s["live"] == 1
 }
 
-/// The upgrade's quiet word, nothing it would do for the agent at this look
-/// (the model's `Look`): its last word ([`After::Finished`]), a stopped
-/// round resting before its next (`wait:failed`), which the window looks at
-/// again ([`after`]) but which asks, releases and restarts nothing until the
-/// rest runs out, or a round held by a build that fails to start
-/// (`wait:build-fails`), which asks and restarts nothing until the build is
-/// proved to start.
+/// The upgrade's quiet word, nothing it would do for the agent at this look (the model's
+/// `Look`): its last word ([`After::Finished`]), a stopped round resting (`wait:failed`,
+/// looked at again but acting on nothing until the rest runs out), or a round held by a build
+/// that fails to start (`wait:build-fails`).
 fn quiet(word: &str) -> bool {
     word == "wait:failed"
         || word == format!("wait:{}", upgrade::BUILD_FAILS)
@@ -2050,14 +1981,11 @@ fn reachable(m: &Model) -> Vec<S> {
     out
 }
 
-/// Whether `m` admits what the real visit decided at `s` under `holds`: at an
-/// idle look, the reducer's own step is the one the model's guards enable (a
-/// wait where none is); held by a person, the void exactly where the model
-/// voids; held by the agent's own work, the re-ask or give-up over the READY
-/// where the model takes one, else its void; at a break of that work, the
-/// void exactly where the model voids; refused, the round abandoned; and the
-/// model, firing the same actions in the same order, lands where the real
-/// record does.
+/// Whether `m` admits what the real visit decided at `s` under `holds`: at an idle look, the
+/// one reducer step the model's guards enable (or a wait where none is); held by a person or
+/// at a break, the void exactly where the model voids; held by the agent's own work, the
+/// re-ask or give-up over the READY where the model takes one, else its void; refused, the
+/// round abandoned. Firing the same actions, the model lands where the real record does.
 fn agrees(m: &Model, s: &S, holds: Holds, d: &Decided) -> bool {
     let lands = || {
         let mut t = s.clone();
@@ -2105,14 +2033,10 @@ fn agrees(m: &Model, s: &S, holds: Holds, d: &Decided) -> bool {
     }
 }
 
-/// The conversation's own moves, read by the real code
-/// ([`upgrade::transcript_has_ready`] through [`answered`], and
-/// [`release_void`] over [`upgrade::directed_since_ready`]): the row the
-/// environment action `action` writes (a direction, `Direct`; the agent's
-/// READY, `AgentReady`; its answer that is none, `AgentGoesOn`) appended to
-/// the transcript `s` stands for (`history`), and read back as the model's
-/// `ready` and as whether the release's point would drop the release (the
-/// model's own `DropRelease` guard at that point). `None` where `m` does not
+/// The conversation's own moves (`Direct`, `AgentReady`, `AgentGoesOn`) read by the real code:
+/// the row `action` writes, appended to the transcript `s` stands for, read back as the
+/// model's `ready` ([`answered`]) and as whether the release would be dropped there
+/// ([`release_void`], against the model's `DropRelease` guard). `None` where `m` does not
 /// enable the action at `s`; else whether the real readings are the model's.
 fn reads_as(m: &Model, s: &S, action: &str, history: bool) -> Option<bool> {
     let mut t = s.clone();
@@ -2170,35 +2094,16 @@ fn defective() -> Vec<(&'static str, Model)> {
         .collect()
 }
 
-/// Tier-1: on every reachable state of `harness_upgrade_never_strands_model`
-/// the real code (its reducer, its gates, its record transitions: the
-/// restart's own [`St::signalled`] and [`St::signal_failed`], the stops'
-/// [`St::stop`], the drop's [`St::dropped`]; the driver's READY, direction
-/// and release rules; and the window's reading of each word, [`after`])
-/// takes the step the model's guards allow and lands where the model's
-/// actions land: at an idle look the one reducer step; under a person's hold
-/// past the drain, the void exactly where the model voids; under the agent's
-/// own work past it (a process under the agent, or at a break work inside
-/// its own process) the re-ask that supersedes the READY (or the give-up over
-/// it) where the model takes one, else the void; at a break of that work, a
-/// gave-up round's late READY voided exactly where the model voids (a
-/// `wait:background` there is a disagreement, so reverting the break's void
-/// in [`upgrade::next_step`] turns this red); under a refused signal or plan,
-/// the round abandoned and its release typed; the release dropped exactly
-/// where the model drops it; and the last word only where the model says
-/// it. Each state is decided over its plain transcript and, where it fits,
-/// over a peer's message the agent answered with READY, whose release a void
-/// owes. At a break (`brk`) the look is the window's at a break of the
-/// agent's own work, held to [`upgrade::break_step`]: no restart, and the
-/// release, its drop and a gave-up upgrade's void there as at an idle point
-/// (`IdleOnlyRelease` is the defect without it). No step says the host's
-/// last word over a release owed. The conversation's own moves (`Direct`,
-/// `AgentReady`, `AgentGoesOn`) are read back by the real transcript readers
-/// as the model says ([`reads_as`]). The clocks: an announced upgrade's
-/// window runs out only off the limit (`Elapse`, the look's hold), and a
-/// limit the window's loop saw starts it again (`LimitResets`,
-/// [`St::hold_clock`]). Negative controls: the model with any one defect
-/// switched on disagrees with the real code somewhere.
+/// Tier-1: on every reachable state of `harness_upgrade_never_strands_model` the real code
+/// (reducer, gates, record transitions, the driver's READY, direction and release rules, and
+/// the window's reading of each word, [`after`]) takes the step the model's guards allow and
+/// lands where its actions land, under each [`Holds`]. At a break a gave-up round's late READY
+/// is voided exactly where the model voids, so reverting the break's void in
+/// [`upgrade::next_step`] turns this red. Each state is decided over its plain transcript and,
+/// where it fits, over a direction the agent answered with READY. No step says the host's last
+/// word over an owed release; the conversation's moves read back as the model says
+/// ([`reads_as`]); the clocks match `Elapse`, `Rests` and `LimitResets` ([`St::hold_clock`]).
+/// Negative controls: the model with any one defect switched on disagrees somewhere.
 #[test]
 fn the_real_upgrade_conforms_to_the_never_strands_model() {
     let model = harness_upgrade_never_strands_model();
@@ -2231,9 +2136,7 @@ fn the_real_upgrade_conforms_to_the_never_strands_model() {
                     breaks += 1;
                     if model.action_enabled("Void", s) {
                         voided_at_breaks += 1;
-                        // A break that waits `background` over the answer for
-                        // good: the model refuses it, so reverting the break's
-                        // void in `upgrade::next_step` turns this bind red.
+                        // The break's wait over the answer, for good, is refused.
                         let old = Decided {
                             actions: Vec::new(),
                             next: s.clone(),
@@ -2369,13 +2272,10 @@ fn the_real_upgrade_conforms_to_the_never_strands_model() {
     }
 }
 
-/// Tier-1, the replayed schedule: the environment as it ran (the limit hits,
-/// holds past four half-hours, resets; the agent answers READY) and the real
-/// decisions between, each transition admitted by the model and every state
-/// within its invariants: one notice after the reset, then the restart. The
-/// unfixed run (notices at the limit, a give-up, the READY heard by nobody)
-/// is admitted only by `Buggy = 1`, refused by the committed model at its
-/// first notice, and ends stranded.
+/// Tier-1, the replayed schedule: the environment as it ran (the limit hits, holds, resets;
+/// the agent answers READY) and the real decisions between, each admitted by the model within
+/// its invariants: one notice after the reset, then the restart. The unfixed run is admitted
+/// only by `Buggy = 1`, refused by the model at its first notice, and ends stranded.
 #[test]
 fn the_incident_schedule_conforms_and_the_pre_fix_run_is_caught() {
     let model = harness_upgrade_never_strands_model();
@@ -2401,7 +2301,7 @@ fn the_incident_schedule_conforms_and_the_pre_fix_run_is_caught() {
     let last = |trace: &Vec<S>| trace.last().expect("a state").clone();
     let next = env(&last(&trace), "LimitHits");
     push(&mut trace, next);
-    // 16:02 .. 18:02: the four looks and the give-up's — every one a wait.
+    // The four looks and the give-up's: every one a wait.
     for _ in 0..5 {
         assert!(look(&last(&trace)).actions.is_empty());
     }
@@ -2451,14 +2351,11 @@ fn the_incident_schedule_conforms_and_the_pre_fix_run_is_caught() {
 
 // ------------------------------------------ no stop is for good
 
-/// Every stop is stamped, and a re-arm is a new round ([`St::fail`],
-/// [`St::rearm`]). The give-up, a stop, a refused signal and a gave-up
-/// round's void each stamp the rest's start; the new round is pending with a
-/// fresh salt past every marker the old one could mint, its markers, stamp
-/// and saved prompt position gone, the owner's spent `--now` gone (a skip
-/// kept), the release still owed carried for the new notice to supersede,
-/// and why the old one stopped kept until that notice. A state with no stamp
-/// reads as stopped long ago and is due at once.
+/// Every stop is stamped, and a re-arm is a new round ([`St::fail`], [`St::rearm`]): the
+/// give-up, a stop, a refused signal and a gave-up round's void each stamp the rest's start;
+/// the new round is pending with a fresh salt, its markers, stamp, saved prompt and spent
+/// `--now` gone (a skip kept), the owed release carried for its first notice to supersede.
+/// A state with no stamp reads as stopped long ago and is due at once.
 #[test]
 fn a_stop_is_stamped_and_a_rearm_is_a_new_round() {
     let mut st = St {
@@ -2539,11 +2436,9 @@ fn a_stop_is_stamped_and_a_rearm_is_a_new_round() {
     assert!(upgrade::retry_due(&old.phase, old.failed_for(T0), false));
 }
 
-/// A void never shortens the rest a repeated stop earned: three give-ups in a
-/// row stretch the rest to `4 × RETRY_S` ([`upgrade::rest_extension`]); a
-/// late READY the agent's own work outlives is voided half an hour on, and
-/// the rest begins again at the void, as long as the streak makes it, never
-/// a bare `RETRY_S` from there.
+/// A void never shortens the rest a repeated stop earned: three give-ups rest
+/// `4 × RETRY_S` ([`upgrade::unanswered_rest_extension`]), and a late READY voided half an
+/// hour on begins that whole rest again at the void.
 #[test]
 fn a_void_never_shortens_the_rest_a_repeated_stop_earned() {
     const T: u64 = 1_790_000_000;
@@ -2569,8 +2464,7 @@ fn a_void_never_shortens_the_rest_a_repeated_stop_earned() {
         !upgrade::retry_due(&st.phase, st.failed_for(void_at + upgrade::RETRY_S), false),
         "not due a bare RETRY_S after the void"
     );
-    // Negative control: a first stop's void rests a plain RETRY_S from the
-    // void.
+    // Negative control: a first stop's void rests a plain RETRY_S from the void.
     let mut first = St::default();
     first.give_up(T);
     first.void(void_at);
@@ -2582,17 +2476,10 @@ fn a_void_never_shortens_the_rest_a_repeated_stop_earned() {
     ));
 }
 
-/// A VOID BEGINS THE REST AGAIN BY THE LADDER THE STOP IS ON (F27, beside the
-/// cadence's ladder for a declined round): four rounds the agent
-/// declined rest a day ([`upgrade::unanswered_rest_extension`]); a late READY
-/// voided half an hour on begins that rest again at the void — the same
-/// ladder, never the `4 × RETRY_S` cap of a stop that repeats for another
-/// reason, which would have let the void shorten a day's rest to six hours.
-///
-/// FAILS WITHOUT THE FIX (`upgrade::rest_extension` in the void): the rest
-/// after the void was `void + 6 h` while the give-up had earned `T + 22 h`;
-/// a void late in the rest (`T + 18 h`) made the next round due 2 h sooner
-/// than the ladder says.
+/// A void begins the rest again by its stop's ladder: four declined rounds rest a day
+/// ([`upgrade::unanswered_rest_extension`]), and a late READY voided in that rest begins a
+/// day's rest again at the void, never the `4 × RETRY_S` cap of a stop repeated for another
+/// reason.
 #[test]
 fn a_void_begins_the_rest_again_by_the_ladder_of_its_stop() {
     const T: u64 = 1_790_000_000;
@@ -2615,8 +2502,7 @@ fn a_void_begins_the_rest_again_by_the_ladder_of_its_stop() {
     late.void(late_at);
     assert_eq!(late.failed_at, late_at + 11 * upgrade::RETRY_S);
     assert!(late.failed_at >= earned, "a void never shortens the rest");
-    // NEGATIVE CONTROL: a stop that repeats for another reason keeps the
-    // cap of its own ladder.
+    // Negative control: a stop that repeats for another reason keeps its own ladder's cap.
     let mut refused = St::default();
     for _ in 0..4 {
         refused.stop("signal-refused", T);
@@ -2627,16 +2513,11 @@ fn a_void_begins_the_rest_again_by_the_ladder_of_its_stop() {
     assert_eq!(refused.failed_at, T + 1_800 + 3 * upgrade::RETRY_S);
 }
 
-/// THE LONGEST SILENCE, through the real record and the real reducer (not
-/// `REASK_S + RETRY_S`: a void begins the rest again). A round's last notice goes out;
-/// its window runs out and it gives up; a late READY comes a second before
-/// its rest runs out and holds the rest where it is, at an idle point and at
-/// a break alike; the agent's own work outlives the answer, and the void
-/// comes `DRAIN_S` after it, beginning the rest again; the new round starts
-/// a rest after the void, as long as the streak makes it (F27). Five hours
-/// after a first stop, seventeen after one repeated to the cap, as
-/// `upgrade::RETRY_S` says — and without the late READY, two and a half and
-/// eight and a half.
+/// The longest silence, through the real record and reducer: the last notice's window runs
+/// out and the round gives up; a late READY a second before the rest runs out holds it (at an
+/// idle point and a break alike); the agent's own work outlives it and the void comes
+/// `DRAIN_S` later, beginning the rest again. Five hours after a first stop, seventeen after
+/// one repeated to the cap; without the late READY, two and a half and eight and a half.
 #[test]
 fn the_longest_silence_is_the_window_a_rest_a_drain_and_a_rest() {
     const H: u64 = 3_600;
@@ -2712,17 +2593,11 @@ fn the_longest_silence_is_the_window_a_rest_a_drain_and_a_rest() {
     }
 }
 
-/// A gave-up stall through the real visit: the round gave up after four
-/// notices; the agent answered READY late; a shell of its own ran on under
-/// it past the drain. The READY is voided and the agent released, and the
-/// round rests, looked at again (`wait:failed` is no last word), never waited
-/// on for ever. Once it has rested `RETRY_S` a new round starts
-/// (`rearmed:unanswered`, on the ledger, nothing typed), and the next look
-/// types its first notice, with a marker of its own, naming what runs under
-/// the agent. At a break of that work the same record, with no stamp, is
-/// re-armed and asked there. Negative controls: the owner's `--skip` of the
-/// build holds the stopped round for good, typing nothing; a limited session
-/// is re-armed but not asked.
+/// A gave-up round whose late READY its own shell outlives: voided, the agent released, the
+/// round resting (`wait:failed`, looked at again). After `RETRY_S` a new round starts with
+/// nothing typed, and the next look types its first notice with a marker of its own, naming
+/// what runs under the agent. At a break the same record with no stamp is re-armed and asked.
+/// Negative controls: the owner's `--skip` holds the round; a limited session is not asked.
 #[cfg(unix)]
 #[test]
 fn a_stopped_round_rests_then_a_new_one_asks_again_naming_what_runs() {
@@ -2738,8 +2613,7 @@ fn a_stopped_round_rests_then_a_new_one_asks_again_naming_what_runs() {
     }
     let old_salt = st.salt;
     st.give_up(now - 60);
-    // A conversation at work when the notices came (one with no task is
-    // restarted afresh, never asked).
+    // A conversation with a task (one without is restarted afresh, never asked).
     let mut delivered = vec![user("Tidy the parser module.")];
     delivered.extend(LEDGER.iter().map(|(_, m)| user(&notice(m))));
     delivered.push(said_by_agent(&format!("Stopping.\n{}", LEDGER[3].1)));
@@ -2778,7 +2652,7 @@ fn a_stopped_round_rests_then_a_new_one_asks_again_naming_what_runs() {
     // The READY its own work outlived: voided, the agent released.
     assert_eq!(run(&opts, &agent).step, "released:gave-up");
     assert_eq!(typed(&asked, "Upgrade off:"), 1);
-    // Resting, NOT finished: looked at again, nothing typed.
+    // Resting, not finished: looked at again, nothing typed.
     let resting = run(&opts, &agent);
     assert_eq!(resting.step, "wait:failed");
     assert!(matches!(after(&resting.step, 9), After::Later(_)));
@@ -2826,8 +2700,8 @@ fn a_stopped_round_rests_then_a_new_one_asks_again_naming_what_runs() {
     drop(agent);
     let _ = std::fs::remove_dir_all(&dir);
 
-    // At a break, a record with no stamp, the READY
-    // long voided (its markers gone), a stale READY in the transcript.
+    // At a break, a record with no stamp, the READY long voided (its markers gone), a stale
+    // READY in the transcript.
     let mut stale = st.clone();
     stale.forget_markers();
     stale.release.clear();
@@ -2901,14 +2775,10 @@ fn a_stopped_round_rests_then_a_new_one_asks_again_naming_what_runs() {
     }
 }
 
-/// Tier-1, the gave-up stall as a schedule: the environment as it ran (the
-/// agent's late READY, its own work outliving it, the rest running out) and
-/// the real decisions between (the give-up, the void and the release at a
-/// break, the new round, its notice, the restart on its READY), each
-/// transition admitted by the model and every state within `NeverStalls` and
-/// `NeverStranded`. The same schedule under `Terminal = 1` (a reducer whose
-/// stop is final) is refused at the new round the real code takes, and ends
-/// at the quiet word past the rest: `NeverStalls` catches it.
+/// Tier-1, the gave-up stall as a schedule: the environment's moves and the real decisions
+/// between (give-up, void and release at a break, new round, notice, restart), each admitted
+/// by the model within its invariants. Under `Terminal = 1` (a final stop) the new round is
+/// refused and the quiet word past the rest breaks `NeverStalls`.
 #[test]
 fn the_owners_stall_schedule_conforms_and_the_terminal_run_is_caught() {
     let model = harness_upgrade_never_strands_model();
@@ -2951,14 +2821,12 @@ fn the_owners_stall_schedule_conforms_and_the_terminal_run_is_caught() {
     step(&mut trace, Holds::Nothing, &["Announce"]);
     let next = env(&last(&trace), "Elapse");
     push(&mut trace, next);
-    // The give-up, with a box up at the tab that holds its release back —
-    // so the agent's READY can come late, as the owner's did.
+    // The give-up, a box at the tab holding its release back so the READY can come late.
     step(&mut trace, Holds::Person, &["GiveUp"]);
     let next = env(&last(&trace), "AgentReady");
     push(&mut trace, next);
-    // Its own work outlives the READY past the drain: voided at a break of
-    // that work, and the release it owes typed at the same look, as a notice
-    // could be there. The break then ends.
+    // Its own work outlives the READY past the drain: voided at a break of that work, the
+    // release typed at the same look.
     let next = env(&last(&trace), "BreakBegins");
     push(&mut trace, next);
     step(&mut trace, Holds::Break, &["Void", "Release"]);
@@ -2975,7 +2843,7 @@ fn the_owners_stall_schedule_conforms_and_the_terminal_run_is_caught() {
     step(&mut trace, Holds::Nothing, &["Restart"]);
     assert_eq!((last(&trace)["phase"], last(&trace)["holding"]), (3, 0));
 
-    // The terminal run: the real code's new round is no move of its.
+    // Under `Terminal`, the new round the real code takes is refused.
     let mut rearmed = rested.clone();
     assert!(model.fire("Rearm", &mut rearmed));
     assert_eq!(admit(&terminal, &rested, &rearmed), None, "refused");

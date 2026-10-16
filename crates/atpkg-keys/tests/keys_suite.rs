@@ -5,10 +5,9 @@
 //! keeps its path (so every citation of `crates/atpkg-keys/tests/<file>.rs`
 //! still resolves) and its own `#[test]`s.
 //!
-//! Two files drive the binary on a real terminal (`producer_to_client`,
-//! `provision_cli`); both take it from `pty`, the one pty fixture. It hands
-//! the child its slave by descriptor, so no test calls `ptsname(3)` and no lock
-//! guards its static buffer. Nothing below sets the environment, installs a
+//! `provision_cli` drives the binary on a real terminal, from `pty`, the one pty
+//! fixture. It hands the child its slave by descriptor, so no test calls
+//! `ptsname(3)` and no lock guards its static buffer. Nothing below sets the environment, installs a
 //! hook or an allocator, or keeps a process global; every child the tests
 //! start gets its environment on its own command.
 //!
@@ -20,7 +19,6 @@
 
 mod owner_to_client;
 mod paper_master_to_client;
-mod producer_to_client;
 mod provision_cli;
 #[cfg(unix)]
 mod pty;

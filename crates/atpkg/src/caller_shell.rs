@@ -1,23 +1,19 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! THE SHELL THAT TYPED THIS: which shell `aterm pkg doctor` / `which` are
-//! answering, so the one remedy they print — `. ~/.aterm/shell.d/00-atpkg.zsh`, `source
-//! …fish`, the dot-source for pwsh — is in the dialect of the shell it is typed into.
+//! The shell that typed this: which shell `aterm pkg doctor` / `which` are answering, so
+//! the remedy they print (`. ~/.aterm/shell.d/00-atpkg.zsh`, `source …fish`, the pwsh
+//! dot-source) is in that shell's dialect.
 //!
-//! `$SHELL` is the LOGIN shell, not the one in front of the user: aterm spawns the
-//! configured `shell` (`--shell`, the config key) without re-pointing `$SHELL`, so a
-//! fish tab on a zsh-login machine would be handed a zsh line fish cannot source. The
-//! signal a tab actually carries is its
-//! PROCESS TREE: `aterm pkg …` is a child of the shell that typed it (`exec`'d shims keep
-//! the parent), so the parent's executable name is the shell — `zsh`, `bash`, `fish`,
-//! `pwsh` — read once, by pid, with no fork: `sysctl(KERN_PROCARGS2)` on macOS (the exec
-//! path leads the buffer), `/proc/<pid>/exe` on Linux. Only when the parent is not a
-//! shell at all (`sudo`, `make`, a Python driver) does `$SHELL` answer.
+//! `$SHELL` is the login shell, not the one in front of the user: aterm spawns its
+//! configured `shell` without re-pointing `$SHELL`, so a fish tab on a zsh-login machine
+//! would get a zsh line. `aterm pkg …` is a child of the shell that typed it (`exec`'d shims
+//! keep the parent), so the parent's executable name is read by pid, without a fork:
+//! `sysctl(KERN_PROCARGS2)` on macOS, `/proc/<pid>/exe` on Linux. Only when the parent is
+//! not a shell (`sudo`, `make`, a Python driver) does `$SHELL` answer.
 
-/// The shell families this crate can name a remedy for, or hand a PATH line to:
-/// the parent's executable name is admitted only when it is one of these, so a driver
-/// that is not a shell never masquerades as one.
+/// The shell families this crate can name a remedy for, or hand a PATH line to; the
+/// parent's executable name is admitted only when it is one of these.
 const SHELLS: &[&str] = &[
     "zsh",
     "bash",
@@ -47,10 +43,9 @@ pub fn invoking_shell() -> Option<String> {
     invoking_shell_from(parent.as_deref(), login.as_deref())
 }
 
-/// The pure half of [`invoking_shell`]: `parent` (the parent process's executable name,
-/// when readable) wins whenever it is a known shell; otherwise `login` (`$SHELL`'s
-/// basename). A leading `-` (a login shell's argv0 spelling, should a reader hand one
-/// over) and a `.exe` suffix are stripped before the match.
+/// The pure half of [`invoking_shell`]: `parent` (the parent's executable name, when
+/// readable) wins whenever it is a known shell; otherwise `login` (`$SHELL`'s basename). A
+/// leading `-` and a `.exe` suffix are stripped before the match.
 #[must_use]
 pub fn invoking_shell_from(parent: Option<&str>, login: Option<&str>) -> Option<String> {
     parent
@@ -87,18 +82,13 @@ fn parent_exe_name() -> Option<String> {
 
 /// The basename of `pid`'s executable, when this process may read it.
 ///
-/// macOS: `sysctl` `KERN_PROCARGS2` — the buffer leads with `argc` (one `c_int`) and
-/// then the executable's path, NUL-terminated, before the arguments; the kernel answers
-/// for a process of the caller's uid (or any, as root). Linux: `/proc/<pid>/exe`, and
-/// only where that link cannot be read, `/proc/<pid>/comm`. Elsewhere, and on any
-/// refusal, `None`.
-///
-/// Linux prefers the exe link because `comm` is a 15-byte kernel label a process can
-/// rewrite: `prctl(PR_SET_NAME, "bash")` on a non-shell is exactly the masquerade
-/// [`SHELLS`] refuses. The link is annotated " (deleted)" once the file is replaced under
-/// a running process — the routine state of a shell across a package upgrade — so that
-/// suffix comes off the basename. `comm` remains the fallback only because it is
-/// world-readable where the link is not (`/proc/1/exe` is `EACCES` for a non-root reader).
+/// macOS: `sysctl` `KERN_PROCARGS2` (the exec path follows the leading `argc`), answered for
+/// a process of the caller's uid, or any as root. Linux: `/proc/<pid>/exe`, falling back to
+/// `/proc/<pid>/comm` only where the link cannot be read (`/proc/1/exe` is `EACCES` for a
+/// non-root reader). `comm` is a 15-byte label a process can rewrite
+/// (`prctl(PR_SET_NAME, "bash")` is the masquerade [`SHELLS`] refuses), and the exe link
+/// gains " (deleted)" once a shell is upgraded under itself, so that suffix comes off.
+/// Elsewhere, and on any refusal, `None`.
 #[must_use]
 #[cfg(unix)]
 pub(crate) fn process_exe_name(pid: u32) -> Option<String> {
@@ -128,9 +118,9 @@ fn linux_exe_link_name(pid: u32) -> Option<String> {
     (!name.is_empty()).then(|| name.to_string())
 }
 
-/// `/proc/<pid>/comm`: the kernel's label for the thread group — the exec'd file's
-/// basename truncated to 15 bytes, unless the process has renamed itself. World-readable
-/// where the exe link is not, which is the only reason it is still read.
+/// `/proc/<pid>/comm`: the kernel's label for the thread group, the exec'd file's basename
+/// truncated to 15 bytes unless the process renamed itself. Read only because it is
+/// world-readable where the exe link is not.
 #[cfg(target_os = "linux")]
 fn linux_comm_name(pid: u32) -> Option<String> {
     let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
@@ -146,9 +136,8 @@ fn macos_exe_name(pid: u32) -> Option<String> {
 }
 
 /// The basename of the exec path a `KERN_PROCARGS2` buffer leads with, read on its own
-/// ([`procargs2_exec_path`]) — never through the whole-layout [`parse_procargs2`]. The name
-/// needs one string, and an argv the parser refuses must not cost the caller's shell (the
-/// remedy line would fall back to `$SHELL`'s dialect).
+/// ([`procargs2_exec_path`]), never through [`parse_procargs2`]: an argv the parser refuses
+/// must not cost the caller its shell.
 #[cfg(any(target_os = "macos", test))]
 fn exe_name_of_procargs2(buf: &[u8]) -> Option<String> {
     std::path::Path::new(procargs2_exec_path(buf)?)
@@ -170,9 +159,8 @@ fn procargs2_exec_path(buf: &[u8]) -> Option<&str> {
     std::str::from_utf8(&rest[..end]).ok()
 }
 
-/// One process's exec path, argument vector and environment, as the kernel recorded
-/// them at `exec` (the environment is the INITIAL one: an `export` the process made
-/// later is not in it).
+/// One process's exec path, argument vector and environment, as the kernel recorded them at
+/// `exec` (the initial environment: a later `export` is not in it).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ProcArgs {
     /// The path the process was exec'd from, as passed to `exec` (not canonical).
@@ -193,14 +181,13 @@ impl ProcArgs {
     }
 }
 
-/// `pid`'s exec path, argv and initial environment, when this process may read them —
-/// the process's own uid (or root). macOS: one `sysctl(KERN_PROCARGS2)`; Linux:
-/// `/proc/<pid>/{exe,cmdline,environ}`. `None` on any refusal, on another platform, or on
-/// a buffer this parser does not recognise — never a partial read passed off as whole.
+/// `pid`'s exec path, argv and initial environment, when this process may read them (its
+/// own uid, or root). macOS: one `sysctl(KERN_PROCARGS2)`; Linux:
+/// `/proc/<pid>/{exe,cmdline,environ}`. `None` on any refusal, on another platform, or on a
+/// buffer this parser does not recognise, never a partial read passed off as whole.
 ///
-/// Used by the agent live-upgrade driver (aterm-agent `harness::upgrade`), which must
-/// relaunch a Claude Code session with the flags it was started with and find the aterm
-/// tab it runs in; `ps -o command=` joins argv with spaces and loses a quoted word.
+/// aterm-agent's harness relaunches an agent session with the flags it was started with;
+/// `ps -o command=` joins argv with spaces and loses a quoted word.
 #[must_use]
 pub fn process_args(pid: u32) -> Option<ProcArgs> {
     #[cfg(target_os = "macos")]
@@ -230,13 +217,11 @@ pub fn process_args(pid: u32) -> Option<ProcArgs> {
     }
 }
 
-/// `/proc/<pid>/cmdline` (or `environ`) as words. The kernel ends EVERY word with a NUL,
-/// so exactly one trailing NUL is a terminator and every other empty piece is an EMPTY
-/// WORD — kept, as [`parse_procargs2`] keeps one on macOS. Dropping empties handed a flag
-/// whose value was `""` the next word as its value: `--append-system-prompt ""
-/// --dangerously-skip-permissions` would read back as the prompt swallowing the flag. No
-/// trailing NUL (a process
-/// that rewrote its title) splits as it stands; no bytes at all are no words.
+/// `/proc/<pid>/cmdline` (or `environ`) as words. The kernel ends every word with a NUL,
+/// so exactly one trailing NUL is a terminator and every other empty piece is an empty word,
+/// kept (as [`parse_procargs2`] keeps one): dropping it would give a flag whose value was
+/// `""` the next word as its value. No trailing NUL (a process that rewrote its title)
+/// splits as it stands; no bytes are no words.
 #[cfg(any(test, target_os = "linux"))]
 fn split_nul_list(bytes: &[u8]) -> Vec<String> {
     if bytes.is_empty() {
@@ -258,11 +243,9 @@ pub fn parse_procargs2(buf: &[u8]) -> Option<ProcArgs> {
     let argc = i32::from_ne_bytes(buf.get(..PROCARGS2_ARGC_BYTES)?.try_into().ok()?);
     let exec_path = procargs2_exec_path(buf)?.to_string();
     let rest = buf.get(PROCARGS2_ARGC_BYTES..)?;
-    // The bound is the one the layout sets: every argv word takes at least one byte of
-    // `rest` (its NUL, or its last byte at the very end), so a count past that is a buffer
-    // this parser does not recognise. A fixed cap is not such a bound — ARG_MAX admits
-    // more than 65 535 short words (a live `/bin/zsh` carrying 70 004 argv was measured),
-    // and refusing one refused a real process whole.
+    // Every argv word takes at least one byte of `rest`, so a count past that is a buffer
+    // this parser does not recognise. No fixed cap: ARG_MAX admits more than 65 535 short
+    // words (a live `/bin/zsh` with 70 004 argv was measured).
     let argc = usize::try_from(argc).ok().filter(|&n| n <= rest.len())?;
     let mut at = exec_path.len();
     while rest.get(at) == Some(&0) {
@@ -278,8 +261,8 @@ pub fn parse_procargs2(buf: &[u8]) -> Option<ProcArgs> {
         at += end + 1;
         Some(s)
     };
-    // Grown, not reserved up front: `argc` is bounded by the buffer, not by what an ordinary
-    // process carries, and a reservation sized by it would be the largest allocation here.
+    // Grown, not reserved: `argc` is bounded only by the buffer, and a reservation sized by
+    // it would be the largest allocation here.
     let mut argv = Vec::with_capacity(argc.min(1024));
     for _ in 0..argc {
         argv.push(next()?);
@@ -389,10 +372,9 @@ mod tests {
         assert_eq!(invoking_shell_from(None, None), None);
     }
 
-    /// Poll until `pid` answers `want`, bounded. `Command::spawn` does not promise the
-    /// child has exec'd — macOS takes the `posix_spawn` path, which returns as soon as the
-    /// kernel has the process — so measuring straight after a spawn races the exec. A
-    /// timeout here means the child never got there, not that the law under test failed.
+    /// Poll until `pid` answers `want`, bounded: `Command::spawn` does not promise the
+    /// child has exec'd (macOS's `posix_spawn` path returns first). A timeout means the
+    /// child never got there.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn await_exec(pid: u32, want: &str) {
         let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
@@ -409,12 +391,10 @@ mod tests {
         }
     }
 
-    /// The pid reader names THIS test binary and a spawned `sleep` by executable, and
-    /// answers `None` for a pid nobody has.
-    ///
-    /// Our own name is the fixture that catches Linux's `comm`: cargo's `-<16 hex>` suffix
-    /// puts a test binary past the 15-byte `TASK_COMM_LEN` cap. The length is asserted so a
-    /// shorter binary name cannot quietly retire the case.
+    /// The pid reader names this test binary and a spawned `sleep` by executable, and
+    /// answers `None` for a pid nobody has. Our own name (cargo's `-<16 hex>` suffix puts it
+    /// past the 15-byte `TASK_COMM_LEN`) catches Linux's truncated `comm`; the length is
+    /// asserted so a shorter name cannot quietly retire the case.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn the_pid_reader_names_a_process_by_its_executable() {
@@ -426,8 +406,7 @@ mod tests {
             "the truncation this asserts away needs a name past 15 bytes, not {own:?}"
         );
         assert_eq!(me, own, "{me}");
-        // `spawnfd`'s, as every stand-in here: it holds its stdio and nothing
-        // else of this process, not another test thread's pipe while it lives.
+        // Through `spawnfd`, so the child holds its stdio and no other test thread's pipe.
         let mut child = aterm_uds::spawnfd::command("/bin/sleep")
             .arg("30")
             .stdin(aterm_uds::spawnfd::Stdio::null())
@@ -443,9 +422,9 @@ mod tests {
         assert_eq!(process_exe_name(u32::MAX), None);
     }
 
-    /// End to end through a REAL shell: `sh -c` / `zsh -c` / `bash -c` / `fish -c` each
-    /// spawn this test binary in a mode that prints what [`invoking_shell`] answers, with
-    /// `$SHELL` pointed elsewhere — the parent shell is what comes back.
+    /// End to end through a real shell: `sh`/`zsh`/`bash`/`fish -c` each spawn this test
+    /// binary to print what [`invoking_shell`] answers, with `$SHELL` pointed elsewhere; the
+    /// parent shell is what comes back.
     #[cfg(unix)]
     #[test]
     fn a_real_parent_shell_is_named_over_the_login_shell() {
@@ -466,7 +445,7 @@ mod tests {
             if !std::path::Path::new(shell).exists() {
                 continue;
             }
-            // `exec` keeps the shell as the parent only when the shell does NOT exec the
+            // `exec` keeps the shell as the parent only when the shell does not exec the
             // command itself (`sh -c 'cmd'` may); a `;` after the command stops that.
             let script = format!(
                 "'{}' --exact --nocapture --quiet {}; true",
@@ -497,8 +476,7 @@ mod tests {
         );
     }
 
-    /// The probe half of the test above: printed by the SAME test function when run as
-    /// the child, so the harness needs no extra binary.
+    /// The probe half of the test above: the same test binary, run as the child.
     #[cfg(unix)]
     const PROBE_ENV: &str = "ATPKG_CALLER_SHELL_PROBE";
 
@@ -533,10 +511,9 @@ mod tests {
         assert_eq!(parse_procargs2(&[1, 0]), None);
     }
 
-    /// An argc past 65 535 is a real process, not a malformed buffer: ARG_MAX admits more
-    /// short words than that (a live `/bin/zsh` carrying 70 004 argv read back whole). Such a
-    /// buffer parses whole and names its executable; a count no buffer of its size can hold is
-    /// refused without reserving for it.
+    /// An argc past 65 535 is a real process (ARG_MAX admits more short words), so such a
+    /// buffer parses whole and names its executable; a count no buffer of its size can hold
+    /// is refused without reserving for it.
     #[test]
     fn procargs2_admits_an_argc_past_65535_and_bounds_it_by_the_buffer() {
         let n = 70_000_usize;
@@ -560,9 +537,8 @@ mod tests {
         );
     }
 
-    /// The exe name needs the exec path and nothing after it: a buffer the whole-layout
-    /// parser refuses still names its executable, as this reader did before the parser
-    /// existed. Only a buffer with no exec path names nothing.
+    /// The exe name needs only the exec path: a buffer the whole-layout parser refuses
+    /// still names its executable; only a buffer with no exec path names nothing.
     #[test]
     fn the_exe_name_reads_the_exec_path_alone() {
         let mut short = 5i32.to_ne_bytes().to_vec();
@@ -621,10 +597,9 @@ mod tests {
         );
     }
 
-    /// A live process started with an EMPTY argument reads back with it, in place — on
-    /// Linux through the `/proc` arm, on macOS through
-    /// `KERN_PROCARGS2`. `read` is a shell builtin, so the shell itself is what waits, and
-    /// closing its stdin ends it.
+    /// A live process started with an empty argument reads it back in place (`/proc` on
+    /// Linux, `KERN_PROCARGS2` on macOS). `read` is a shell builtin, so the shell itself
+    /// waits, and closing its stdin ends it.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn process_args_keeps_an_empty_argument_of_a_live_process() {

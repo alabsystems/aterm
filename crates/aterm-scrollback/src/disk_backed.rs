@@ -29,22 +29,19 @@ pub struct DiskBackedScrollbackConfig {
     pub memory_budget: usize,
     /// Lines per compressed block.
     pub block_size: usize,
-    /// Maximum total lines allowed across all tiers (None = unlimited).
+    /// Maximum total lines across all tiers (None = unlimited).
     ///
-    /// Defaults to [`DEFAULT_LINE_LIMIT`] (100,000) to prevent runaway
-    /// stdout from growing scrollback (and the on-disk cold tier) without
-    /// bound (#7929). Use [`with_unlimited_lines`](Self::with_unlimited_lines)
-    /// to opt out.
+    /// Defaults to [`DEFAULT_LINE_LIMIT`], so runaway output cannot grow the
+    /// scrollback (and the cold file) without bound;
+    /// [`with_unlimited_lines`](Self::with_unlimited_lines) opts out.
     pub line_limit: Option<usize>,
     /// Disk cold tier configuration.
     pub cold_config: DiskColdConfig,
 }
 
 impl DiskBackedScrollbackConfig {
-    /// Create a new config with the given cold storage path.
-    ///
-    /// The line limit defaults to [`DEFAULT_LINE_LIMIT`] — see the field
-    /// docs and [`with_unlimited_lines`](Self::with_unlimited_lines).
+    /// Create a new config with the given cold storage path; the line limit
+    /// defaults to [`DEFAULT_LINE_LIMIT`].
     #[must_use]
     pub fn new(cold_path: impl Into<std::path::PathBuf>) -> Self {
         Self {
@@ -95,10 +92,10 @@ impl DiskBackedScrollbackConfig {
     }
 }
 
-/// Scrollback buffer with disk-backed cold tier storage.
+/// Scrollback buffer with a disk-backed cold tier.
 ///
-/// Like [`Scrollback`], but the cold tier is stored on disk for unlimited history.
-/// This enables sessions with millions of lines while keeping memory bounded.
+/// Like [`Scrollback`], but the cold tier lives in a memory-mapped file, so
+/// long histories keep memory bounded.
 ///
 /// # Examples
 ///
@@ -128,7 +125,7 @@ pub struct DiskBackedScrollback {
     hot: HotTier,
     /// Warm tier: LZ4 compressed blocks.
     warm: WarmTier,
-    /// Cold tier: Zstd compressed, disk-backed.
+    /// Cold tier: LZ4 compressed pages, disk-backed.
     cold: DiskColdTier,
     /// Maximum lines in hot tier before promotion.
     hot_limit: usize,
@@ -144,12 +141,10 @@ pub struct DiskBackedScrollback {
     bytes_used: usize,
     /// Reclaimable hot + warm storage bytes for budget enforcement.
     budgeted_bytes: usize,
-    /// Maximum total lines allowed (None = no limit).
-    /// When set, older lines are discarded when this limit is exceeded.
+    /// Maximum total lines; older lines are discarded past it (None = no limit).
     line_limit: Option<usize>,
-    /// Monotonic count of history lines that crossed the IMAGE RETENTION
-    /// HORIZON — see
-    /// [`image_rows_dropped_by_compression`](Self::image_rows_dropped_by_compression).
+    /// Monotonic count of history lines that crossed the image retention
+    /// horizon; see [`Self::image_rows_dropped_by_compression`].
     image_rows_dropped_by_compression: u64,
     /// Current memory pressure watermark level.
     watermark_level: WatermarkLevel,
@@ -170,10 +165,9 @@ impl DiskBackedScrollback {
         let hot = HotTier::new();
         let warm = WarmTier::new();
         let hot_limit = config.hot_limit.max(1);
-        // Block size must not exceed hot limit, otherwise promotion never triggers.
-        // Also clamp to MAX_DECODE_PAGE_LINES so a serialized block never exceeds the
-        // disk-decode cap (else a legitimate oversized block decodes short and fails
-        // its line-count validation).
+        // Block size must not exceed the hot limit (else promotion never
+        // triggers) nor MAX_DECODE_PAGE_LINES (else a legitimate block decodes
+        // short and fails its line-count validation).
         let block_size = config
             .block_size
             .max(1)
@@ -198,9 +192,7 @@ impl DiskBackedScrollback {
             yellow_exit_threshold: threshold_bytes(YELLOW_EXIT_PERCENT, config.memory_budget),
             red_threshold: threshold_bytes(DEFAULT_RED_PERCENT, config.memory_budget),
         };
-        // Apply the configured line limit via the public setter so any
-        // pre-existing cold lines (reloaded from disk) are truncated to the
-        // cap immediately (#7929).
+        // The setter truncates cold lines reloaded from disk to the cap.
         sb.set_line_limit(config.line_limit);
         Ok(sb)
     }
@@ -212,7 +204,7 @@ impl DiskBackedScrollback {
         self.line_count
     }
 
-    /// Get the number of lines in hot tier (test-only; production uses Scrollback facade).
+    /// Get the number of lines in the hot tier.
     #[cfg(test)]
     #[must_use]
     #[inline]
@@ -220,7 +212,7 @@ impl DiskBackedScrollback {
         self.hot.len()
     }
 
-    /// Get the number of lines in warm tier (test-only; production uses Scrollback facade).
+    /// Get the number of lines in the warm tier.
     #[cfg(test)]
     #[must_use]
     #[inline]
@@ -244,11 +236,10 @@ impl DiskBackedScrollback {
         self.line_limit
     }
 
-    /// Monotonic count of history lines whose INLINE IMAGE was discarded
-    /// because the line was compressed — the disk-backed twin of
-    /// [`Scrollback::image_rows_dropped_by_compression`], with the identical
-    /// meaning and the identical horizon: a picture ends where compression
-    /// begins, so it never reaches the `.dtrm` cold file at all.
+    /// Monotonic count of history lines whose inline image was discarded by
+    /// compression: the disk-backed twin of
+    /// [`Scrollback::image_rows_dropped_by_compression`]. A picture never
+    /// reaches the `.dtrm` file.
     ///
     /// [`Scrollback::image_rows_dropped_by_compression`]: crate::Scrollback::image_rows_dropped_by_compression
     #[must_use]
@@ -257,18 +248,11 @@ impl DiskBackedScrollback {
         self.image_rows_dropped_by_compression
     }
 
-    /// Set the line limit (maximum total lines allowed).
-    ///
-    /// When set, older lines are discarded when this limit is exceeded.
-    /// Setting to `None` removes the limit.
-    /// Setting to `Some(0)` effectively disables scrollback.
-    ///
-    /// Enforces the new limit immediately by truncating if needed.
-    /// If truncation fails (decompression/I/O error), the limit is set but
-    /// enforcement is deferred to the next push.
+    /// Set the line limit (`None` removes it, `Some(0)` disables scrollback)
+    /// and enforce it now. If truncation fails (decompression or I/O), the
+    /// limit is set and enforcement waits for the next push.
     pub(crate) fn set_line_limit(&mut self, limit: Option<usize>) {
         self.line_limit = limit;
-        // Enforce the limit immediately
         if let Some(max) = limit
             && self.line_count > max
             && let Err(e) = self.truncate(max)
@@ -283,17 +267,14 @@ impl DiskBackedScrollback {
     ///
     /// If a line limit is set and exceeded, the oldest line is discarded.
     pub(crate) fn push_line(&mut self, line: Line) -> std::io::Result<()> {
-        // If hot tier is full, promote oldest lines to warm
         if self.hot.len() >= self.hot_limit {
             self.promote_hot_to_warm()?;
         }
 
-        // Add line to hot tier
         self.hot.push(line);
         self.line_count += 1;
         self.sync_accounting();
 
-        // Enforce line limit by discarding oldest line if over limit
         if let Some(max) = self.line_limit
             && self.line_count > max
             && let Err(e) = self.truncate(max)
@@ -308,7 +289,6 @@ impl DiskBackedScrollback {
             self.promote_hot_to_warm()?;
         }
 
-        // Handle memory pressure
         let _ = self.handle_memory_pressure();
 
         Ok(())
@@ -321,13 +301,9 @@ impl DiskBackedScrollback {
 
     /// Get a line by index (0 = oldest).
     ///
-    /// Returns `Cow::Borrowed` for hot-tier lines (zero-copy) and
-    /// `Cow::Owned` for warm/cold-tier lines (decompressed on access).
-    ///
-    /// Takes `&self` because the disk cold tier uses interior mutability
-    /// for its LRU cache, and the hot/warm tiers are immutably readable.
-    ///
-    /// Returns `Ok(None)` for out-of-bounds, `Err` for I/O or decompression failures.
+    /// Returns `Cow::Borrowed` for hot-tier lines and `Cow::Owned` for warm and
+    /// cold lines (decompressed on access); `Ok(None)` when out of bounds, `Err`
+    /// on an I/O or decompression failure.
     #[must_use = "line data is discarded if not consumed"]
     pub fn get_line(&self, idx: usize) -> Result<Option<Cow<'_, Line>>, super::ScrollbackError> {
         if idx >= self.line_count {
@@ -365,13 +341,12 @@ impl DiskBackedScrollback {
         crate::iter::hot_start_tiers(&self.cold, &self.warm)
     }
 
-    /// Bulk read for the streaming iterators (ST-6): owned lines from `idx`
-    /// through the end of its tier segment (cold page / warm block / one hot
-    /// line). Tier dispatch mirrors `get_line`; the disk-cold path decodes a
-    /// page ONCE without inserting it into the LRU cache, so a full-history
-    /// walk cannot evict the pages the viewport is reading.
-    // Skip: the tier-dispatch driver — routes into the per-tier bulk reads
-    // (each individually classified: guarded-index / decode class).
+    /// Bulk read for the streaming iterators: owned lines from `idx` through
+    /// the end of its tier segment (cold page, warm block or one hot line). The
+    /// disk-cold path decodes a page once without caching it, so a full-history
+    /// walk cannot evict the viewport's pages.
+    // Skip: the tier-dispatch driver; each per-tier bulk read is classified on
+    // its own.
     #[cfg_attr(trust_verify, trust::skip)]
     pub(crate) fn read_segment(&self, idx: usize) -> crate::iter::SegmentResult {
         crate::iter::read_segment_tiers(&self.cold, &self.warm, &self.hot, idx)
@@ -390,11 +365,8 @@ impl DiskBackedScrollback {
         self.get_line(self.line_count - 1 - rev_idx)
     }
 
-    /// Create a snapshot containing only hot + warm tier lines (skip cold).
-    ///
-    /// Fast path for checkpointing: skips disk I/O and Zstd decompression
-    /// for cold tier lines. Only LZ4 (warm) and uncompressed (hot) lines
-    /// are included. See `Scrollback::checkpoint_snapshot_fast`. (#5946)
+    /// Snapshot of the hot and warm lines only, for checkpointing: skips the
+    /// cold tier's disk I/O and decompression.
     #[must_use]
     pub fn checkpoint_snapshot_fast(&self) -> super::Scrollback {
         super::access::checkpoint_snapshot_fast_from(self)

@@ -54,7 +54,14 @@ enum PatchState {
 struct VendorFork {
     path: String,
     version: Option<String>,
+    /// The row is renamed, so it claims one version line of its package
+    /// ([`crate::policy::in_row_scope`]).
+    renamed: bool,
 }
+
+/// Package → the patch rows replacing it: one, or one per version line when
+/// rows are renamed ([`crate::policy::patched_package`]).
+type Forks = BTreeMap<String, Vec<VendorFork>>;
 
 /// Explain one package. `pkg` is `name` or `name@version`.
 pub fn run(root: &Path, pkg: &str, cells: &[String]) -> Result<Outcome, String> {
@@ -138,7 +145,7 @@ fn versions_block(
     root: &Path,
     found: &BTreeMap<PkgId, Vec<usize>>,
     surveys: &[CellSurvey],
-    forks: &BTreeMap<String, VendorFork>,
+    forks: &Forks,
 ) {
     let _ = writeln!(log, "\n  VERSIONS RESOLVED");
     for (id, cells_with) in found {
@@ -194,14 +201,14 @@ fn liveness_block(
     name: &str,
     found: &BTreeMap<PkgId, Vec<usize>>,
     surveys: &[CellSurvey],
-    forks: &BTreeMap<String, VendorFork>,
+    forks: &Forks,
 ) {
-    let stale: Vec<(&PkgId, String, &Vec<usize>)> = found
+    let stale: Vec<(&PkgId, String, String, &Vec<usize>)> = found
         .iter()
         .filter_map(
             |(id, cells_with)| match patch_state(root, None, forks, id) {
-                PatchState::UnpatchedBesideFork { fork_version, .. } => {
-                    Some((id, fork_version, cells_with))
+                PatchState::UnpatchedBesideFork { path, fork_version } => {
+                    Some((id, path, fork_version, cells_with))
                 }
                 _ => None,
             },
@@ -210,7 +217,6 @@ fn liveness_block(
     if stale.is_empty() {
         return;
     }
-    let Some(fork) = forks.get(name) else { return };
 
     let _ = writeln!(log, "\n{}", "!".repeat(W_LINE));
     let _ = writeln!(
@@ -218,7 +224,7 @@ fn liveness_block(
         "PATCH LIVENESS DEFECT — the fork does not cover every resolved version"
     );
     let _ = writeln!(log, "{}", "!".repeat(W_LINE));
-    for (id, fork_version, cells_with) in &stale {
+    for (id, fork_path, fork_version, cells_with) in &stale {
         let where_: Vec<&str> = cells_with
             .iter()
             .map(|i| surveys[*i].cell.name.as_str())
@@ -234,7 +240,7 @@ fn liveness_block(
                 id.name,
                 id.version,
                 where_.join(", "),
-                path = fork.path
+                path = fork_path
             ),
             W_LINE,
         );
@@ -302,7 +308,7 @@ fn package_block(
     id: &PkgId,
     cells_with: &[usize],
     surveys: &[CellSurvey],
-    forks: &BTreeMap<String, VendorFork>,
+    forks: &Forks,
 ) {
     let _ = writeln!(log, "\n{}", "-".repeat(W_LINE));
     let _ = writeln!(log, "{} {}", id.name, id.version);
@@ -752,7 +758,7 @@ fn entry_points(s: &CellSurvey, target: &PkgId) -> Vec<PkgId> {
 // ------------------------------------------------------------------ vendor/fork
 
 /// `[patch.crates-io]` entries with the vendored manifest's own version.
-fn read_forks(root: &Path) -> Result<BTreeMap<String, VendorFork>, String> {
+fn read_forks(root: &Path) -> Result<Forks, String> {
     let manifest = root.join("Cargo.toml");
     let text = std::fs::read_to_string(&manifest).map_err(|e| {
         format!(
@@ -767,7 +773,7 @@ fn read_forks(root: &Path) -> Result<BTreeMap<String, VendorFork>, String> {
             manifest.display()
         )
     })?;
-    let mut out = BTreeMap::new();
+    let mut out = Forks::new();
     let Some(table) = doc
         .get("patch")
         .and_then(|p| p.get("crates-io"))
@@ -775,10 +781,11 @@ fn read_forks(root: &Path) -> Result<BTreeMap<String, VendorFork>, String> {
     else {
         return Ok(out);
     };
-    for (name, item) in table.iter() {
+    for (key, item) in table.iter() {
         let Some(rel) = item.get("path").and_then(|p| p.as_str()) else {
             continue;
         };
+        let name = crate::policy::patched_package(key, item);
         let version = std::fs::read_to_string(root.join(rel).join("Cargo.toml"))
             .ok()
             .and_then(|t| t.parse::<aterm_toml::edit::DocumentMut>().ok())
@@ -788,13 +795,11 @@ fn read_forks(root: &Path) -> Result<BTreeMap<String, VendorFork>, String> {
                     .and_then(|v| v.as_str())
                     .map(str::to_string)
             });
-        out.insert(
-            name.to_string(),
-            VendorFork {
-                path: rel.to_string(),
-                version,
-            },
-        );
+        out.entry(name.to_string()).or_default().push(VendorFork {
+            path: rel.to_string(),
+            version,
+            renamed: name != key,
+        });
     }
     Ok(out)
 }
@@ -802,7 +807,7 @@ fn read_forks(root: &Path) -> Result<BTreeMap<String, VendorFork>, String> {
 fn patch_state(
     root: &Path,
     facts: Option<&crate::model::PkgFacts>,
-    forks: &BTreeMap<String, VendorFork>,
+    forks: &Forks,
     id: &PkgId,
 ) -> PatchState {
     // The roster is asked first, off the measured directory: a first-party
@@ -815,20 +820,33 @@ fn patch_state(
             path: dir_line(root, dir),
         };
     }
-    let Some(f) = forks.get(&id.name) else {
+    let Some(rows) = forks.get(&id.name) else {
         return PatchState::Registry;
     };
-    match &f.version {
-        Some(v) if *v == id.version => PatchState::Fork {
+    if let Some(f) = rows
+        .iter()
+        .find(|f| f.version.as_deref() == Some(id.version.as_str()))
+    {
+        return PatchState::Fork {
             path: f.path.clone(),
-        },
-        Some(v) => PatchState::UnpatchedBesideFork {
-            path: f.path.clone(),
+        };
+    }
+    // Not any row's own copy. Unpatched beside the first row that claims this
+    // version; a version line no renamed row claims is ordinary registry code.
+    let claimed = rows
+        .iter()
+        .find(|f| crate::policy::in_row_scope(f.renamed, f.version.as_deref(), &id.version));
+    match claimed {
+        Some(VendorFork {
+            path,
+            version: Some(v),
+            ..
+        }) => PatchState::UnpatchedBesideFork {
+            path: path.clone(),
             fork_version: v.clone(),
         },
-        None => PatchState::ForkVersionUnreadable {
-            path: f.path.clone(),
-        },
+        Some(VendorFork { path, .. }) => PatchState::ForkVersionUnreadable { path: path.clone() },
+        None => PatchState::Registry,
     }
 }
 
@@ -1028,7 +1046,7 @@ mod tests {
             forks.contains_key("indexmap"),
             "vendor/indexmap is patched in: {forks:?}"
         );
-        let w = &forks["indexmap"];
+        let w = &forks["indexmap"][0];
         assert_eq!(w.path, "vendor/indexmap");
         let v = w
             .version
@@ -1071,11 +1089,16 @@ mod tests {
         );
         // A REAL fork's directory must not be swallowed by the same arm.
         let fork = crate::model::PkgFacts {
-            root_dir: Some(root.join("vendor/winit")),
+            root_dir: Some(root.join("vendor/indexmap")),
             ..crate::model::PkgFacts::default()
         };
         assert!(matches!(
-            patch_state(&root, Some(&fork), &forks, &PkgId::new("winit", "0.30.13")),
+            patch_state(
+                &root,
+                Some(&fork),
+                &forks,
+                &PkgId::new("indexmap", "2.14.0")
+            ),
             PatchState::Fork { .. }
         ));
     }
@@ -1216,7 +1239,7 @@ mod tests {
         );
         // ONE version resolves, in every cell, so there is no liveness defect
         // to report. Asserted as a property of THIS fork rather than of the tree
-        // as a whole — `[OB-12]` (the gate's `xtask gate forge`) owns the tree-wide
+        // as a whole — `[OB-12]` (`verify forge`) owns the tree-wide
         // claim, and `red_fixtures` owns the detector.
         assert!(
             !out.log.contains("PATCH LIVENESS DEFECT"),

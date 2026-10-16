@@ -2,12 +2,12 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Tests for parser UTF-8 error handling paths in advance_fast/advance_batch.
+//! Tests for parser UTF-8 error handling paths in advance_fast.
 //!
 //! The basic `advance()` method processes bytes through the state machine table
-//! and does not perform UTF-8 reassembly. The `advance_fast()` and
-//! `advance_batch()` paths do UTF-8 reassembly via `process_utf8_byte` and
-//! `process_ground_special_byte`. These tests cover those error paths.
+//! and does not perform UTF-8 reassembly. `advance_fast()` does UTF-8
+//! reassembly via `process_utf8_byte` and `process_ground_special_byte`. These
+//! tests cover those error paths.
 
 use super::super::*;
 use super::RecordingSink;
@@ -35,6 +35,31 @@ fn fast_invalid_continuation_emits_replacement_then_reprints_ascii() {
         "ASCII byte after broken lead should be printed, got: {:?}",
         sink.prints
     );
+}
+
+/// ESC interrupts an incomplete UTF-8 prefix: emit one replacement, then
+/// interpret the escape sequence normally, including across input chunks.
+#[test]
+fn fast_invalid_utf8_prefix_replays_escape_across_chunks() {
+    let input = [0xE2, 0x1B, b'7'];
+    for split in 0..=input.len() {
+        let mut parser = Parser::new();
+        let mut sink = RecordingSink::default();
+        parser.advance_fast(&input[..split], &mut sink);
+        parser.advance_fast(&input[split..], &mut sink);
+
+        assert_eq!(
+            sink.prints,
+            vec![char::REPLACEMENT_CHARACTER],
+            "split {split}: one replacement for the incomplete prefix"
+        );
+        assert_eq!(
+            sink.esc_dispatches,
+            vec![(Vec::new(), b'7')],
+            "split {split}: ESC is replayed as a control"
+        );
+        assert_eq!(parser.state(), State::Ground, "split {split}");
+    }
 }
 
 /// A valid 3-byte UTF-8 lead (0xE2) with only one valid continuation byte

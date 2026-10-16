@@ -2,37 +2,19 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Tier-1 for `NativeUpdateRendezvousAdmission` (aterm-spec's
-//! `native_update_rendezvous_admission_model`; round eight of the update audit,
-//! U36 and its review): the outgoing process grants the launched lane's
-//! descriptors only to a dialer whose CODE is the successor's, commits to none
-//! LaunchServices disowns, holds a dialer whose code check macOS's code-signing
-//! service does not answer instead of turning it away, and files a successor it
-//! did turn away by the refusal's cause.
+//! `native_update_rendezvous_admission_model`): the outgoing process grants the launched
+//! lane's descriptors only to a dialer running the successor's code, commits to none
+//! LaunchServices disowns, holds (never turns away) a dialer whose code check `trustd` does not
+//! answer, and files a successor it turned away by the refusal's cause.
 //!
-//! Driven for real: the rendezvous gate (`Rendezvous::accept_claim`, through
-//! `gate_one`) against dialers that are OTHER PROCESSES — this test binary run as
-//! a stand-in, which copied the claim exactly as a same-uid process reading the
-//! successor's launch environment (`KERN_PROCARGS2`) would, and which meets one
-//! code requirement and not another; the requirement the shipping lane states,
-//! read off the job `prelaunch_out_of_band_handoff` builds for each kind of
-//! attempt (a fresh cached pass among them); the production tail from the dial
-//! wait to the grant (`await_launched_dial`, then `ClaimedPeer::transfer`); the
-//! hold, through the process's one `trustd` gate made overdue, in a child of its
-//! own; the filing of a turned-away successor (`code_refused_completion`, booked
-//! by `HandoffFailureLane::classify`); and the corroboration after the dial
-//! (`LaunchCorroboration::poll`) against live, exited-and-unreaped and reaped
-//! processes. LaunchServices is scripted, with the answers it was measured to
-//! give (`LaunchError::ExitedBeforeCheckIn`), because a unit test may not launch
-//! an application (AGENTS.md).
+//! Dialers are other processes: this test binary run as a stand-in that copied the claim, as a
+//! same-uid process reading `KERN_PROCARGS2` could. The gate, dial wait, grant, filing and
+//! corroboration are the shipping code; LaunchServices is scripted with its measured answers,
+//! since a unit test may not launch an application.
 //!
-//! Negative controls: the gate at the same-uid floor — the launched lane before
-//! 2026-10-02, the secret alone — run for real, grants the stranger every
-//! descriptor, and the model's `GrantOnSecretAlone` reaches the state its
-//! invariant refuses; the corroboration's 2026-09-29 reading of an exit answer is
-//! `CommitOverDisowning`; the first code gate's closing of an unanswered check is
-//! `RefuseUnanswered`; and its filing of the turned-away successor as a death
-//! before its dial, booked for real, is the unexplained shape the model's
-//! `FileAsUnexplainedDeath` reaches — each refused by its invariant.
+//! Negative controls, each refused by its invariant: `GrantOnSecretAlone` (run for real at
+//! the same-uid floor), `CommitOverDisowning`, `RefuseUnanswered` and
+//! `FileAsUnexplainedDeath` (booked for real).
 
 use super::{
     HandoffCandidate, LaunchCorroboration, LaunchedDialEnd, PreDialDeath, await_launched_dial,
@@ -130,11 +112,9 @@ fn own_pid() -> i32 {
     i32::try_from(std::process::id()).expect("a pid fits pid_t")
 }
 
-/// The job the launched lane's worker receives for one attempt, built by the
-/// shipping `prelaunch_out_of_band_handoff` from the facts
-/// `start_unix_update_handoff` decides: an apply ticket (none for the same-image
-/// seam), the seam, whether the worker verifies the candidate again (false for a
-/// fresh cached pass), and an installed activation.
+/// The worker's job for one attempt, built by the shipping `prelaunch_out_of_band_handoff`:
+/// an apply ticket (none for the same-image seam), the seam, whether the worker verifies the
+/// candidate again, and an installed activation.
 fn launched_job(
     ticket: bool,
     seam: bool,
@@ -186,9 +166,8 @@ fn launched_job(
     job
 }
 
-/// The code a fresh cached pass's attempt states for its dialer — the usual
-/// update, since the automatic lane pre-verifies at arm time — read off the job
-/// the shipping lane builds for it.
+/// The code a fresh cached pass's attempt (the usual update: the automatic lane pre-verifies
+/// at arm time) states for its dialer, read off the job the shipping lane builds.
 fn cached_pass_dialer_code(bundle: &Path) -> DialerCode {
     let job = launched_job(true, false, false, false);
     assert!(!job.verify_staged_candidate, "PRECONDITION: a cached pass");
@@ -216,24 +195,15 @@ fn this_binary() -> PathBuf {
     std::env::current_exe().expect("the test binary")
 }
 
-/// STAND-IN: a same-uid process that copied a claim out of the successor's
-/// launch environment (`ps eww`, `KERN_PROCARGS2`) dials, presents it, and
-/// waits for a grant; it prints how many descriptors arrived (none, once the
-/// outgoing process closes the connection). A no-op in the ordinary run.
+/// Stand-in: a same-uid process that copied a claim out of the successor's launch
+/// environment (`ps eww`, `KERN_PROCARGS2`) dials, presents it, and prints how many
+/// descriptors arrived. A no-op in the ordinary run.
 ///
-/// The read has no timer of its own: the connection ends only when the gate
-/// grants or closes it, and the gate closes every connection by its own deadline.
-/// So the stand-in exits only on the gate's answer — a connection HELD for a code
-/// check `trustd` did not answer keeps it alive until the deadline names the
-/// hold, and a hold can never pass for a refusal by racing a second timer here.
-/// `test_alone::Running::wait` is the hang detector for the process itself.
-///
-/// A GRANT IS READ WHOLE before the stand-in exits, as the successor reads it
-/// (`dial_and_claim`): the descriptors ride the header's `sendmsg` and the body
-/// is a second write, so a stand-in that left on the header alone could close
-/// its end between the two, and the grant then failed `TransferPartial(EPIPE)`
-/// — the outgoing side's correct answer to a peer that hung up mid-grant, not a
-/// verdict of the gate (2026-10-06).
+/// The read has no timer of its own: the stand-in exits only on the gate's answer, so a hold
+/// for `trustd` can never pass for a refusal by racing a second timer here;
+/// `test_alone::Running::wait` is the hang detector. The grant is read whole, as
+/// `dial_and_claim` reads it: the descriptors ride the header and the body is a second write,
+/// so leaving after the header could fail the grant with `TransferPartial(EPIPE)`.
 #[test]
 fn stranger_dialer_stand_in() {
     let (Some(path), Ok(claim)) = (
@@ -326,9 +296,8 @@ impl Drop for Answered<'_> {
     }
 }
 
-/// Poll the stand-in until it exits (true) or the gate has answered (false).
-/// No timer of its own: the gate's deadline is the one hang detector, and the
-/// main thread raises `answered` once the gate returns.
+/// Poll the stand-in until it exits (true) or the gate has answered (false). No timer of its
+/// own: the gate's deadline is the one hang detector.
 fn exited_before_the_answer(
     running: &mut crate::test_alone::Running,
     answered: &AtomicBool,
@@ -344,13 +313,9 @@ fn exited_before_the_answer(
     }
 }
 
-/// One dialer through the real gate, `claim` presented and `code` required:
-/// whether it was admitted, and how many descriptors it then held (the grant is
-/// sent to an admitted dialer, as the shipping lane sends it). The wait ends when
-/// the stand-in does — a refused dialer reads EOF and exits — or at the gate's
-/// own deadline, the hang detector; a dialer held there for `trustd` is
-/// [`TRUSTD_SILENT`]. A refused dialer that presented the right claim was turned
-/// away by a VERDICT on its code, never by a check that did not happen.
+/// One dialer through the real gate, `claim` presented and `code` required: whether it was
+/// admitted, and how many descriptors it then held (an admitted dialer is granted). A refused
+/// dialer that presented the right claim must have been refused by a verdict on its code.
 fn through_the_gate(claim_is_right: bool, code: &DialerCode) -> (bool, usize) {
     let rendezvous = bind();
     let claim = if claim_is_right {
@@ -382,9 +347,8 @@ fn through_the_gate(claim_is_right: bool, code: &DialerCode) -> (bool, usize) {
         }
         Err(error) if held_for_trustd(error) => panic!("{TRUSTD_SILENT}: {error}"),
         Err(RendezvousError::Cancelled) => {
-            // The stand-in has exited on this path: its own failure (a dial
-            // that failed, a write after the gate dropped the stream) is named
-            // with its output before any refusal is judged the gate's.
+            // The stand-in has exited: its own failure is named with its output before any
+            // refusal is judged the gate's.
             let received = received_by(running);
             if claim_is_right {
                 assert!(
@@ -410,15 +374,10 @@ fn through_the_gate(claim_is_right: bool, code: &DialerCode) -> (bool, usize) {
     }
 }
 
-/// One stand-in holding `rendezvous`'s claim through the SHIPPING dial wait
-/// (`await_launched_dial`), `code` required: the wait's end and the stand-in.
-/// When the stand-in exits before the wait returns, the watcher runs `on_exit`,
-/// handed the wait's cancel: a cancel, or LaunchServices' answer that the
-/// launched process is gone ([`launch_services_reports_the_exit`]). The gate's
-/// deadline is the one hang detector, and a dialer HELD for `trustd` — the
-/// rendezvous's held refusal, or one that left while held — is
-/// [`TRUSTD_SILENT`]. An accepted peer is returned ungranted; the stand-in
-/// waits for its grant with no timer of its own.
+/// One stand-in holding `rendezvous`'s claim through the shipping dial wait, `code` required:
+/// the wait's end and the stand-in. If the stand-in exits first, the watcher runs `on_exit`
+/// with the wait's cancel. A dialer held for `trustd` is [`TRUSTD_SILENT`]; an accepted peer is
+/// returned ungranted.
 fn through_the_dial_wait(
     rendezvous: &Rendezvous,
     in_flight: &LaunchInFlight,
@@ -470,11 +429,9 @@ fn launch_services_reports_the_exit(in_flight: &LaunchInFlight) {
     in_flight.answer_for_test(LaunchInFlight::admitted_for_test(-1, true, own_pid()));
 }
 
-/// THE GATE ADMITS EXACTLY WHAT THE MODEL GRANTS: a dialer that is another
-/// process, over both halves a stranger can get wrong — the claim, and the code
-/// it runs. The code requirement is realized for real: the code at this test
-/// binary's path (which the stand-in runs) and the code at `/usr/bin/true`
-/// (which it does not).
+/// The gate admits exactly what the model grants, for a dialer that is another process, over
+/// both halves a stranger can get wrong: the claim, and the code it runs (this test binary,
+/// which the stand-in runs, or `/usr/bin/true`, which it does not).
 #[test]
 fn the_real_gate_admits_exactly_what_the_model_grants() {
     let model = native_update_rendezvous_admission_model();
@@ -534,11 +491,9 @@ fn the_real_gate_admits_exactly_what_the_model_grants() {
     );
 }
 
-/// NEGATIVE CONTROL, ON THE SHIPPING GATE: at the same-uid floor — the launched
-/// lane from 2026-09-14 to 2026-10-02, which checked the secret and nothing a
-/// stranger could not copy — the gate grants a stranger of another code every
-/// descriptor. That is the model's `GrantOnSecretAlone`, and the state it reaches
-/// is the one `GrantOnlyToTheSuccessorsCode` refuses.
+/// Negative control on the shipping gate: at the same-uid floor (the secret alone) the gate
+/// grants a stranger of another code every descriptor, the model's `GrantOnSecretAlone`,
+/// whose state `GrantOnlyToTheSuccessorsCode` refuses.
 #[test]
 fn the_secret_alone_grants_a_stranger_and_the_model_refuses_it() {
     let (admitted, received) = through_the_gate(true, &DialerCode::same_uid_floor_for_test());
@@ -555,24 +510,11 @@ fn the_secret_alone_grants_a_stranger_and_the_model_refuses_it() {
     assert!(!buggy.check_invariant("GrantOnlyToTheSuccessorsCode", &state));
 }
 
-/// THE STRANGER HOLDING THE SECRET, ON THE SHIPPING LANE (U36): LaunchServices
-/// does not answer while the dialer is connected (a real successor checks in
-/// only after its grant), and a process that is not the launched successor
-/// dials with the claim it read. The
-/// production tail — the requirement the lane states for the usual update, a
-/// fresh cached pass, read off the job the lane builds for it; the dial wait; the
-/// grant on a held claim — sends it nothing. Then the same tail, for a dialer that
-/// runs the required code, grants it: the refusal is the code's, not the
-/// harness's. (Before U36's review a cached pass stated the code at the install
-/// path, which admits whatever a same-uid process put there.)
-///
-/// The gate's deadline is the one hang detector. The refusing arm ends on the
-/// stand-in's exit, reported as LaunchServices reports a launched process that
-/// never checked in, so the wait carries the refusal and the test requires a
-/// VERDICT on the code: a close for any other reason is not the code's refusal.
-/// A dialer HELD because the process's `trustd` gate was overdue runs to the
-/// deadline and is [`TRUSTD_SILENT`] in either arm — the machine's moment,
-/// never a pass and never the code's verdict.
+/// A process that is not the launched successor dials with the claim it read before
+/// LaunchServices answers, and the production tail (a fresh cached pass's requirement, the dial
+/// wait, the grant) sends it nothing; the same tail grants a dialer of the required code, so
+/// the refusal is the code's. A dialer held for an overdue `trustd` is [`TRUSTD_SILENT`],
+/// never a pass.
 #[test]
 fn a_dialer_that_is_not_the_launched_process_gets_no_descriptor() {
     let bundle = PathBuf::from("/Applications/aterm.app");
@@ -583,11 +525,8 @@ fn a_dialer_that_is_not_the_launched_process_gets_no_descriptor() {
         shipped.describe()
     );
     let accepting = DialerCode::code_at(this_binary());
-    // THE SHIPPED REQUIREMENT REFUSES: the stand-in exits on the gate's close
-    // and LaunchServices reports the launched process gone, so the wait ends
-    // carrying the refusal — which must be a VERDICT on the code. A close for
-    // any other reason (a lookup that failed, a claim read past its budget, an
-    // unattested peer) never passes as the code's refusal.
+    // The shipped requirement refuses. A close for any other reason (a failed lookup, a claim
+    // read past its budget, an unattested peer) never passes as the code's refusal.
     {
         let rendezvous = bind();
         let in_flight = LaunchInFlight::scripted(None);
@@ -615,8 +554,7 @@ fn a_dialer_that_is_not_the_launched_process_gets_no_descriptor() {
             ),
         }
     }
-    // THE SAME TAIL GRANTS A DIALER OF THE REQUIRED CODE: the refusal above is
-    // the code's, not the harness's.
+    // The same tail grants a dialer of the required code: the refusal above is the code's.
     {
         let rendezvous = bind();
         let in_flight = LaunchInFlight::scripted(None);
@@ -640,17 +578,10 @@ fn a_dialer_that_is_not_the_launched_process_gets_no_descriptor() {
     }
 }
 
-/// THE REQUIREMENT EACH ATTEMPT STATES, on the job the shipping lane builds for
-/// it (U36's review): every attempt with an update candidate under the pinned
-/// team — a fresh cached pass that lets the worker skip its own verification
-/// (the usual update), a worker that verifies again, an installed activation —
-/// states an aterm release's own requirement, the identifier every cut stamps and
-/// the Developer ID of the team every candidate was verified against. Only the
-/// same-image seam, and an attempt with no team pinned, read the code at the
-/// launched bundle. NEGATIVE CONTROL: the rule was chosen on whether the WORKER
-/// verifies until the review, which is false for a cached pass — that choice,
-/// `launched_dialer_code(job.verify_staged_candidate, ..)` on the cached pass's
-/// own job, is the code at the path.
+/// Every attempt with a candidate under the pinned team states an aterm release's requirement
+/// (identifier plus the team's Developer ID); only the same-image seam, and an attempt with no
+/// team pinned, read the code at the launched bundle. Negative control: choosing the rule on
+/// `job.verify_staged_candidate` gives a cached pass the code at the path.
 #[test]
 fn every_candidate_attempt_states_the_release_requirement() {
     let bundle = Path::new("/Applications/aterm.app");
@@ -706,17 +637,11 @@ fn every_candidate_attempt_states_the_release_requirement() {
     }
 }
 
-/// THE IDENTIFIER HALF IS ASKED OF THE CANDIDATE BEFORE ANYTHING LAUNCHES (U36's
-/// second review; design laws L1 and L4). The release rule requires
-/// `identifier "com.aterm.aterm"` on top of the Developer ID, and the candidate's
-/// own check tests only the Developer ID — so a candidate cut with another
-/// identifier would pass every check, launch, dial, and be refused at the gate on
-/// every attempt, filed transient each time. The rule now reads the candidate's
-/// identifier first: a release's states the rule; another identifier, or one not
-/// read just then, is `Err`, which the worker answers by handing the attempt to
-/// the fork lane (`run_prelaunched_handoff`), where no dialer's code is asked.
-/// NEGATIVE CONTROL: the rule without the read — the release requirement stated
-/// for that same candidate — is what this test refuses to see again.
+/// The release rule requires `identifier "com.aterm.aterm"`, which the candidate's own
+/// Developer ID check does not test; a candidate cut with another identifier would launch and
+/// be refused at the gate on every attempt. So the identifier is read before anything
+/// launches: a release's states the rule; another, or one not read, is `Err`, which the worker
+/// answers with the fork lane (`run_prelaunched_handoff`).
 #[test]
 fn a_candidate_signed_otherwise_is_caught_before_the_launch() {
     let bundle = Path::new("/Applications/aterm.app");
@@ -744,8 +669,8 @@ fn a_candidate_signed_otherwise_is_caught_before_the_launch() {
         panic!("an identifier that was not read stated the rule");
     };
     assert!(why.contains("codesign did not finish"), "{why}");
-    // The shipped call site reads the identifier through the shipped reader and
-    // answers an `Err` with the fork lane, before the rendezvous is bound.
+    // The shipped call site reads the identifier and answers an `Err` with the fork lane,
+    // before the rendezvous is bound.
     let src = include_str!("app_update_handoff.rs");
     let lane = &src[src
         .find("fn run_prelaunched_handoff(")
@@ -766,8 +691,7 @@ fn a_candidate_signed_otherwise_is_caught_before_the_launch() {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Dialer {
     Alive,
-    /// Exited, its exit queued, not yet reaped: what a successor that just died
-    /// is until launchd reaps it.
+    /// Exited, its exit queued, not yet reaped by launchd.
     Unreaped,
     Reaped,
 }
@@ -782,13 +706,9 @@ enum Answer {
     AnError,
 }
 
-/// THE CORROBORATION REFUSES EXACTLY THE DIALERS THE MODEL WILL NOT COMMIT TO,
-/// before the grant (the poll right after the dial, and beside the hold) and
-/// after it (beside the proof wait): one that LaunchServices names another pid
-/// for, and one that LIVES when LaunchServices says the process it launched
-/// exited before it checked in. A dialer that exited too — reaped, or still
-/// unreaped, which libproc does not report a birth for — is no contradiction:
-/// its death ends the attempt by the death checks.
+/// The corroboration refuses, before and after the grant, exactly the dialers the model will
+/// not commit to: one LaunchServices names another pid for, and a live one when LaunchServices
+/// says its process exited before check-in (a dialer that exited too is no contradiction).
 #[test]
 fn the_real_corroboration_refuses_exactly_a_disowned_dialer() {
     let model = native_update_rendezvous_admission_model();
@@ -880,9 +800,8 @@ fn the_real_corroboration_refuses_exactly_a_disowned_dialer() {
         "the corroboration ran on this thread: {entered:?}"
     );
 
-    // NEGATIVE CONTROL: the corroboration of 2026-09-29 read the exit answer, like
-    // any error, as corroborating the dialer — the model's `CommitOverDisowning`,
-    // whose state `NoCommitToADisownedDialer` refuses.
+    // Negative control: reading the exit answer, like any error, as corroborating the dialer
+    // is the model's `CommitOverDisowning`, refused by `NoCommitToADisownedDialer`.
     let buggy = with_buggy(&model, 1);
     let mut state = buggy.init_state();
     for action in ["Grant", "LaunchServicesDisowns", "CommitOverDisowning"] {
@@ -891,20 +810,13 @@ fn the_real_corroboration_refuses_exactly_a_disowned_dialer() {
     assert!(!buggy.check_invariant("NoCommitToADisownedDialer", &state));
 }
 
-/// THE HOLD, ON THE SHIPPING GATE (U36's review): a dialer whose code check
-/// macOS's code-signing service does not answer is neither admitted nor turned
-/// away. The gate keeps its connection and checks again; with no answer by the
-/// deadline the wait ends there, saying so in typed words, and the dialer was
-/// never closed before it; once `trustd` answers, the same connection is admitted
-/// and granted. Run alone in a child: it makes the process's one `trustd` gate
-/// overdue (`aterm_uds::deadline::TRUST`) exactly as a silent `trustd` does —
-/// work that never returns, past its suspect age — which every code and TLS
-/// check in the process shares. The dialer runs this test binary's ad-hoc code,
-/// whose check needs no `trustd` once the gate lets it through.
+/// A dialer whose code check `trustd` does not answer is held, neither admitted nor turned
+/// away: the deadline ends the wait saying so, and once `trustd` answers the same connection is
+/// granted. Runs alone in a child, because it makes the process's one `trustd` gate
+/// (`aterm_uds::deadline::TRUST`) overdue.
 ///
-/// NEGATIVE CONTROL: the first code gate of 2026-10-02 closed an unanswered
-/// check at once, so the successor read end of file and exited — the model's
-/// `RefuseUnanswered`, whose state `AnUnansweredCheckTurnsNoOneAway` refuses.
+/// Negative control: closing an unanswered check at once is the model's `RefuseUnanswered`,
+/// refused by `AnUnansweredCheckTurnsNoOneAway`.
 #[test]
 fn a_code_check_trustd_does_not_answer_holds_the_dialer_until_it_does() {
     if !crate::test_alone::alone() {
@@ -938,8 +850,8 @@ fn a_code_check_trustd_does_not_answer_holds_the_dialer_until_it_does() {
         "TrustdSilent",
     );
 
-    // 1. NO ANSWER BY THE DEADLINE: the wait ends on it, typed and naming the
-    //    service, after holding the dialer the whole time.
+    // 1. No answer by the deadline: the wait ends on it, typed and naming the service, after
+    //    holding the dialer the whole time.
     {
         let rendezvous = bind();
         let dialer = dial_for_test(rendezvous.path(), rendezvous.claim()).expect("dial and claim");
@@ -989,8 +901,7 @@ fn a_code_check_trustd_does_not_answer_holds_the_dialer_until_it_does() {
         drop(dialer);
     }
 
-    // 2. TRUSTD ANSWERS WHILE THE DIALER IS HELD: the same connection is
-    //    admitted and granted.
+    // 2. Trustd answers while the dialer is held: the same connection is admitted and granted.
     {
         let rendezvous = bind();
         let dialer = dial_for_test(rendezvous.path(), rendezvous.claim()).expect("dial and claim");
@@ -1051,7 +962,7 @@ fn a_code_check_trustd_does_not_answer_holds_the_dialer_until_it_does() {
         );
     }
 
-    // NEGATIVE CONTROL, in the model.
+    // Negative control, in the model.
     let buggy = with_buggy(&model, 1);
     let mut state = buggy.init_state();
     for action in ["TrustdSilent", "RefuseUnanswered"] {
@@ -1060,20 +971,14 @@ fn a_code_check_trustd_does_not_answer_holds_the_dialer_until_it_does() {
     assert!(!buggy.check_invariant("AnUnansweredCheckTurnsNoOneAway", &state));
 }
 
-/// A SUCCESSOR TURNED AWAY AT THE CODE GATE IS FILED BY THE REFUSAL (U36's
-/// review). A dialer — another process, holding the claim — is turned away by
-/// its code; it reads end of file and exits, as a successor's failed claim exits
-/// before any window; LaunchServices then reports the launched process
-/// terminated before it checked in. The shipping dial wait ends on that death
-/// and carries the refusal, since the dialer it turned away is gone too
-/// (`code_refused_dialer_was_launched`), and the shipping filing books it by its
-/// cause: a verdict `Rejected`, a check that did not happen `ProducerFailed`,
-/// transient both, in words that say the successor dialled.
+/// A successor turned away at the code gate is filed by the refusal: the dial wait ends on its
+/// reported death carrying the refusal (`code_refused_dialer_was_launched`), booked transient
+/// as `Rejected` (a verdict) or `ProducerFailed` (a check that did not happen), in words that
+/// say the successor dialled.
 ///
-/// NEGATIVE CONTROL, booked for real: the attempt was filed as `ChildDied` with
-/// nothing observed, "the launched successor exited before it dialled" — the
-/// Unexplained shape, which converges on the bytes after six attempts; the model's
-/// `FileAsUnexplainedDeath`, whose state `ARefusalIsFiledByItsCause` refuses.
+/// Negative control, booked for real: filing it as `ChildDied` with nothing observed is the
+/// Unexplained shape, which converges on the bytes after six attempts (the model's
+/// `FileAsUnexplainedDeath`, refused by `ARefusalIsFiledByItsCause`).
 #[test]
 fn a_successor_turned_away_at_the_code_gate_is_filed_by_the_refusal() {
     let model = native_update_rendezvous_admission_model();
@@ -1091,8 +996,8 @@ fn a_successor_turned_away_at_the_code_gate_is_filed_by_the_refusal() {
     ] {
         let rendezvous = bind();
         let in_flight = LaunchInFlight::scripted(None);
-        // The turned-away dialer exits on the gate's close; held for `trustd`
-        // it stays, and the gate's deadline names the hold.
+        // The turned-away dialer exits on the gate's close; one held for `trustd` stays, and
+        // the gate's deadline names the hold.
         let (ended, running) = through_the_dial_wait(&rendezvous, &in_flight, &code, |_cancel| {
             launch_services_reports_the_exit(&in_flight);
         });
@@ -1167,7 +1072,7 @@ fn a_successor_turned_away_at_the_code_gate_is_filed_by_the_refusal() {
             "FileByCause",
         );
 
-        // NEGATIVE CONTROL: the filing before the review, booked for real.
+        // Negative control, booked for real: the filing as an unexplained death.
         let before = crate::UpdateHandoffCompletion::failure(
             7,
             None,
@@ -1207,11 +1112,9 @@ fn a_successor_turned_away_at_the_code_gate_is_filed_by_the_refusal() {
     assert!(!buggy.check_invariant("ARefusalIsFiledByItsCause", &state));
 }
 
-/// WHICH DEATH A REFUSAL ANSWERS FOR: a dialer the gate turned away is the
-/// launched process whose death LaunchServices reports only when it is the very
-/// pid LaunchServices named, or — for a death reported with no pid — when it is
-/// gone too. One that still lives is a stranger, and the death stays the
-/// successor's own; one never witnessed is not concluded to be it.
+/// A dialer the gate turned away answers for the death LaunchServices reports only when it is
+/// the pid LaunchServices named, or, for a death reported with no pid, when it is gone too. One
+/// that still lives is a stranger; one never witnessed is not concluded to be the successor.
 #[test]
 fn a_turned_away_dialer_answers_only_for_its_own_death() {
     let mut child = aterm_uds::spawnfd::command("/bin/sh")
@@ -1249,10 +1152,10 @@ fn a_turned_away_dialer_answers_only_for_its_own_death() {
     );
 }
 
-/// The machine's actions with no shipping code of their own here, each waived
-/// by name. Bound above: `Grant` (`Rendezvous::gate_one`), `DeadlineWhileHeld`
-/// (`handoff_rendezvous::admit_code`), `FileByCause` (`code_refused_completion`)
-/// and `Commit` (`LaunchCorroboration::poll`).
+/// The machine's actions with no shipping code of their own here, each waived by name. Bound
+/// above: `Grant` (`Rendezvous::gate_one`), `DeadlineWhileHeld`
+/// (`handoff_rendezvous::admit_code`), `FileByCause` (`code_refused_completion`) and `Commit`
+/// (`LaunchCorroboration::poll`).
 mod waivers {
     #[aterm_spec::spec_unmodeled(
         machine = "native_update_rendezvous_admission",

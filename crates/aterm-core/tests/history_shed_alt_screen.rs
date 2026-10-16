@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The memory-pressure shed reaches a tab's history while that tab is on the
-//! alternate screen.
-//!
-//! `Terminal::scrollback` is the active grid's store, and `CSI ?1049h` parks
-//! the primary grid, the only tiered store, in the inactive slot.
-//! `Terminal::history_scrollback` / `shed_history_scrollback` read and trim
-//! the grid holding the history whichever slot it is in.
-//!
-//! Each test drives the real parser with 50k lines of history, then `?1049h`.
+//! The memory-pressure shed reaches a tab's history while it is on the alternate screen:
+//! `CSI ?1049h` parks the primary grid, the only tiered store, in the inactive slot, and
+//! `Terminal::history_scrollback` / `shed_history_scrollback` read and trim whichever slot
+//! holds it (`Terminal::scrollback` is the active grid's store).
 
 use aterm_core::scrollback::{Scrollback, ScrollbackStorage};
 use aterm_core::terminal::Terminal;
@@ -63,7 +58,6 @@ fn shed_trims_the_primary_history_while_the_alt_screen_is_up() {
         term.modes().alternate_screen,
         "?1049h entered the alt screen"
     );
-    // The active grid is the store-less alt buffer.
     assert!(
         term.scrollback().is_none(),
         "the active (alt) grid carries no tiered store"

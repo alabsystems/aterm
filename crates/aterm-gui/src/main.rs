@@ -4,7 +4,7 @@
 //! Thin standalone entry for `aterm-gui` — the windowed terminal lives in the
 //! library (`aterm_gui::main_entry`) so the ONE `aterm` binary can serve the
 //! window mode; this bin exists for dev builds and local automation
-//! (perf-arena, validators) and is NOT shipped (the bundle
+//! (validators) and is NOT shipped (the bundle
 //! carries an `aterm-gui` argv0 symlink onto `aterm`).
 
 // Windows GUI subsystem, so Explorer/Start-menu launches open no stray console;

@@ -13,7 +13,7 @@ default = []
 # TRUST_NATIVE_TLA Phase 2: compile the source↔spec `#[refines]`/`#[spec_unmodeled]`
 # anchors binding `write_all` (→ external `WriteAll.tla`) and the fork→exec child
 # seam (→ `ForkExec.tla`) to those specs. OFF by default (byte-identical production
-# seam, no `aterm-spec`/`inventory`); the workspace `spec_xref_closure` gate
+# seam, no `aterm-spec`); the workspace `spec_xref_closure` gate
 # (aterm-gui's test build) enables it to COLLECT the anchors cross-crate.
 spec-anchors = ["dep:aterm-spec"]
 # Development seams in an optimized build (`aterm_types::dev_seam!`: the
@@ -44,8 +44,7 @@ aterm-uds = { workspace = true }
 # Test-only: the pty tests mint a root `Authority` (unix.rs, windows/mod.rs,
 # tests/windows_smoke.rs). `launcher-mint` makes the sealed
 # `aterm_cap::Authority::root_authority()` nameable for this crate's OWN test build
-# only — the production spawn seam never mints, it receives `Cap`s by argument. See
-# aterm-cap's tests/mint_reachability.rs gate.
+# only — the production spawn seam never mints, it receives `Cap`s by argument.
 [dev-dependencies]
 aterm-cap = { workspace = true, features = ["launcher-mint"] }
 

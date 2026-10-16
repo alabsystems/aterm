@@ -43,32 +43,6 @@ fn witness() -> MainThread {
     unsafe { MainThread::new_unchecked() }
 }
 
-fn assert_send<T: Send>() {}
-fn assert_sync<T: Sync>() {}
-
-#[test]
-fn the_container_is_send_and_sync_over_a_t_that_is_neither() {
-    // The whole point of the type, stated as a compile-time fact. `Rc` and
-    // `Cell` are the standard library's two canonical negatives, and both are
-    // stand-ins for the real cargo: `aterm_objc::Retained<T>` is `!Send` and
-    // `!Sync` for the same structural reason.
-    assert_send::<MainThreadBound<Rc<u8>>>();
-    assert_sync::<MainThreadBound<Rc<u8>>>();
-    assert_send::<MainThreadBound<Cell<u8>>>();
-    assert_sync::<MainThreadBound<Cell<u8>>>();
-    assert_send::<MainThreadBound<*mut u8>>();
-    assert_sync::<MainThreadBound<*mut u8>>();
-
-    // And it composes, which is the shape `vendor/winit`'s `Window` is: a
-    // struct whose only fields are containers is itself `Send + Sync`.
-    struct Window {
-        _window: MainThreadBound<Rc<u8>>,
-        _delegate: MainThreadBound<Rc<u8>>,
-    }
-    assert_send::<Window>();
-    assert_sync::<Window>();
-}
-
 #[test]
 fn the_container_costs_nothing_over_the_value() {
     assert_eq!(

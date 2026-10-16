@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Adversarial probes (semantics lens): each test asserts the DESIGNED
-//! behaviour (docs/DESIGN-unified-messages-2026-09-21.md §1, §2.4) so a
-//! failure is the evidence of a defect. Test-only; nothing here ships.
+//! Adversarial probes: each test asserts the designed behaviour
+//! (docs/DESIGN-unified-messages-2026-09-21.md §1, §2.4).
 
 use crate::center::MessageCenter;
 use crate::glass::{
@@ -56,11 +55,10 @@ fn caps(intents: &[Intent]) -> Vec<CapsuleSpec> {
     v
 }
 
-/// §1.8: "a restate or supersede clears the carried flag". A carried HELD
-/// row restated by the successor before the handoff commit must still fold on
-/// its own 45 s hold, never overstay it and leave as `Stale` after 125 s.
-/// (That its hold is armed at all is `center`'s
-/// `a_carried_held_row_restated_before_commit_still_folds`.)
+/// §1.8 "a restate or supersede clears the carried flag": a carried held row
+/// restated before the handoff commit folds on its own hold (45 s), never
+/// lingering to leave as `Stale` (125 s). Arming is `center`'s
+/// `a_carried_held_row_restated_before_commit_still_folds`.
 #[test]
 fn a_carried_held_row_restated_before_commit_leaves_on_time_and_as_folded() {
     let now = t0();
@@ -97,9 +95,8 @@ fn a_carried_held_row_restated_before_commit_leaves_on_time_and_as_folded() {
     );
 }
 
-/// After the handoff commit a carried held row that is QUEUED (never on
-/// the successor's glass) gets `fold_at` armed anyway and folds `Folded`
-/// without ever being painted.
+/// A carried held row still queued at the handoff commit gets no `fold_at`, so
+/// it never folds unpainted.
 #[test]
 fn a_queued_carried_held_row_is_not_folded_as_read_after_commit() {
     let now = t0();
@@ -133,11 +130,8 @@ fn a_queued_carried_held_row_is_not_folded_as_read_after_commit() {
     );
 }
 
-/// §1.4: "Ask and Standing rows are never evicted by a post"; the glass is
-/// STABLE ORDER — "a row on glass keeps its position while it lives". A
-/// flood of queued Warn posts past MAX_LIVE evicts queued held rows, never
-/// the held row at the TOP of the glass, under the pointer. Ruling 412 (a)
-/// extends it to queued `Live` rows
+/// §1.4 and stable order: a flood of queued Warn posts past MAX_LIVE never
+/// evicts the row at the top of the glass
 /// (`center::tests::a_flood_takes_every_queued_row_before_one_on_glass`).
 #[test]
 fn a_flood_past_max_live_does_not_evict_a_row_on_glass() {
@@ -175,9 +169,8 @@ fn a_flood_past_max_live_does_not_evict_a_row_on_glass() {
     );
 }
 
-/// THE METER IS THE ROW (ruling 55): at every width from 200 cols down to 8
-/// a metered row's meter is `(0, cols, fill)`, so it can neither leave nor
-/// come back at a capsule long→short transition.
+/// The meter is the row: at every width from 200 cols down to 8 it is
+/// `(0, cols, fill)`, so a capsule long→short switch cannot move it.
 #[test]
 fn the_meter_spans_the_row_at_every_width() {
     let spec = RowSpec {
@@ -206,9 +199,8 @@ fn the_meter_spans_the_row_at_every_width() {
     assert!(off.is_empty(), "(cols, meter) off the whole row: {off:?}");
 }
 
-/// The same non-monotonicity for the excerpt on an UNMETERED row: two
-/// capsules with a combined long→short delta ≥ 3 + DETAIL_FLOOR bring the
-/// excerpt back after it was dropped.
+/// Narrowing an unmetered row, an excerpt once dropped never comes back, even
+/// where two capsules' long→short switch frees room for it.
 #[test]
 fn the_excerpt_never_comes_back_while_narrowing() {
     let spec = RowSpec {
@@ -250,9 +242,8 @@ fn the_excerpt_never_comes_back_while_narrowing() {
     );
 }
 
-/// §1.6: "the log keeps it". A LIVE row's record can fall out of the ring
-/// while the row is still on glass — LOG_CAP LogOnly posts push it out —
-/// after which `log().get(id)` is `None` for a row `on_glass()` still yields.
+/// §1.6 "the log keeps it": a live row on glass keeps its record through
+/// LOG_CAP LogOnly posts.
 #[test]
 fn a_live_row_keeps_its_log_record() {
     let now = t0();
@@ -280,10 +271,8 @@ fn a_live_row_keeps_its_log_record() {
     );
 }
 
-/// Codec identity: an empty detail line is dropped at ingress (the builder,
-/// `normalized`, `restate`), so a message posted with ONE empty detail line
-/// never encodes to `detail=` and decodes to no lines: the live row, its
-/// Posted line and the decoded record all agree.
+/// Empty detail lines are dropped at ingress (the builder, `normalized`,
+/// `restate`), so the live row, its Posted line and the decoded record agree.
 #[test]
 fn a_single_empty_detail_line_round_trips() {
     let now = t0();
@@ -368,10 +357,9 @@ fn hit_test_agrees_with_layout_in_the_degenerate_clip() {
     }
 }
 
-/// Under a grapheme-aware measure that is NOT `chars().count()` (every
-/// uppercase letter two cells here), no placed element reaches past `cols`
-/// and the capsules stay right-aligned, at every width where the row is not
-/// degenerate.
+/// Under a measure that is not `chars().count()` (uppercase is two cells), no
+/// element reaches past `cols` and the capsules stay right-aligned at every
+/// non-degenerate width.
 #[test]
 fn the_width_law_holds_under_a_two_cell_measure() {
     let wide = |s: &str| -> usize {
@@ -421,7 +409,7 @@ fn the_width_law_holds_under_a_two_cell_measure() {
                 assert!(*c >= end + 2, "{name}@{cols}: stats overlap");
                 end = c + wide(s);
             }
-            // The load slot is the tail of the words (ruling 246).
+            // The load slot is the tail of the words.
             if let Some((c, w)) = row.load_slot {
                 assert!(c >= end + 2, "{name}@{cols}: load slot overlaps");
                 end = c + w;
@@ -446,14 +434,11 @@ fn the_width_law_holds_under_a_two_cell_measure() {
     }
 }
 
-// ---- design-literal behaviour, pinned (review nits, not defects) ----
+// Decisions where the design's wording is loose or literal, pinned.
 
-/// §1.8 says "`after_handoff_commit` folds every carried non-Live/Standing
-/// row after its severity hold" — wording inherited from the status bars,
-/// which had no Ask or For rows. Decision taken here: the row's OWN hold
-/// (`arm`'s span — the severity's for `Default`, the named span for `For` /
-/// `Ask`), so a question that had ten minutes in the parent keeps them in
-/// the successor instead of dropping to 30 s because a handoff happened.
+/// `after_handoff_commit` arms each carried row's own hold (`arm`'s span), not
+/// its severity's (§1.8's wording), so an Ask keeps its ten minutes across a
+/// handoff.
 #[test]
 fn a_carried_ask_row_keeps_its_own_hold_after_the_commit() {
     let now = t0();
@@ -492,10 +477,9 @@ fn a_carried_ask_row_keeps_its_own_hold_after_the_commit() {
     assert!(HOLD_ASK > HOLD_INFO);
 }
 
-/// §1.4 literally: a post with "no key on either side and equal (tag,
-/// title, detail)" is a Duplicate — severity, hold, meter and actions are
-/// not compared, so an Error re-post of a live Info row is swallowed into
-/// `repeats` and the row stays Info.
+/// §1.4: a keyless post with equal (tag, title, detail) is a Duplicate whatever
+/// its severity, so an Error re-post of a live Info row bumps `repeats` and the
+/// row stays Info.
 #[test]
 fn a_duplicate_post_keeps_the_live_severity() {
     let now = t0();
@@ -511,12 +495,9 @@ fn a_duplicate_post_keeps_the_live_severity() {
     assert_eq!(c.live(a.id).unwrap().repeats, 2);
 }
 
-/// A carried row its parent ended after the capture ends in the successor even
-/// when ANOTHER WRITER of the shared `messages.log` posted under the same
-/// number first. Each aterm mints ids from its own counter (ruling 270), so the
-/// file loads that writer's record under the number and the parent's under a
-/// fresh id; read by the number alone, the row's record would be the other
-/// writer's and the ended row would come back live.
+/// A carried row its parent ended still ends when another writer of the shared
+/// `messages.log` took its number first: each aterm mints ids from its own
+/// counter, so the file loads the parent's record under a fresh id.
 #[test]
 fn a_carried_row_the_parent_ended_ends_though_another_writer_took_its_number() {
     let now = t0();
@@ -564,11 +545,10 @@ fn a_carried_row_the_parent_ended_ends_though_another_writer_took_its_number() {
     assert!(child.live(resolved).is_none());
 }
 
-/// Round eight of the update audit, lead U62: a CARRIED row its parent ended
-/// after the park's capture — its reporter's resolve, a person's press — ends in
-/// the successor at Commit, taking the file's ending WITHOUT a second line of its
-/// own; a row whose hold merely ran out on the parent's glass, a row the
-/// successor restated since the seed, and one nobody ended stay live.
+/// A carried row its parent ended after the capture (a resolve, a press) ends
+/// in the successor at Commit with the file's ending and no second line; a
+/// row whose hold ran out on the parent's glass, one the successor restated,
+/// and one nobody ended stay live.
 #[test]
 fn a_carried_row_the_parent_ended_after_the_capture_ends_in_the_successor() {
     let now = t0();

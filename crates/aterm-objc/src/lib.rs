@@ -6,27 +6,28 @@
 //! Typed message sends ([`msg`], one exact prototype per selector), ownership
 //! ([`Obj`], [`Retained`]), scoped autorelease pools, and:
 //!
-//! 1. **[Runtime class creation](declare)** — `objc_allocateClassPair`,
-//!    `class_addMethod`, `class_addIvar`, `class_addProtocol`,
-//!    `objc_registerClassPair`, driven by [`declare_class!`].
+//! 1. **[Runtime class creation](declare)**, driven by [`declare_class!`].
 //! 2. **[The block ABI](block)** — stack and heap blocks ([`RcBlock`]), plus
 //!    [`BlockPtr`] for the `"@?"` encoding of a block in a declared method.
-//! 3. **[Weak references](weak)** — `objc_initWeak` and friends. A weak
-//!    reference's storage location, not its value, is what the runtime tracks,
-//!    so it is a pinned capability rather than a movable wrapper.
+//! 3. **[Weak references](weak)**. The runtime tracks a weak reference's
+//!    storage location, not its value, so it is a pinned capability rather
+//!    than a movable wrapper.
 //! 4. **[Cached selectors](sel_cache)** — one `sel_registerName` per call site.
 //! 5. **[Method swizzling](swizzle)** — `method_setImplementation`, for patching
-//!    an existing framework method (`-[NSApplication sendEvent:]`), which
-//!    `class_addMethod` cannot do. No encoding check can see its effect.
+//!    an existing framework method, which `class_addMethod` cannot do. No
+//!    encoding check can see its effect.
 //! 6. **[A thread-affinity container](main_thread_bound)** —
 //!    [`MainThreadBound<T>`][MainThreadBound], built from the [`MainThread`]
 //!    witness and [`run_on_main`].
-//! 7. **[The run-loop wake timer](wake_timer)** — the event-loop waker. Its
-//!    repeat interval is a year because CoreFoundation walks a late repeating
-//!    timer forward one interval at a time with the run-loop lock held.
+//! 7. **[The run-loop wake timer](wake_timer)** — the event-loop waker.
+//! 8. **[CoreFoundation](cf) and CoreGraphics (`cg`, feature `cg`)** — the
+//!    flat C the windowing backend calls beside its sends. Each declaration is
+//!    held to the SDK headers by clang (`tests/cf_cg_sdk.rs`).
+//! 9. **[A window's content view](view)** — [`HasNsView`], the `NSView` the
+//!    windowing crate hands the Metal presenter and the GUI's chrome.
 //!
-//! The crate has no third-party dependencies: everything is std over `libobjc`
-//! and `Foundation`, both loaded in every aterm process.
+//! No third-party dependencies: std over `libobjc`, `Foundation` and
+//! `CoreFoundation` (and, under `cg`, `CoreGraphics`).
 //!
 //! # Safety conventions
 //!
@@ -44,11 +45,9 @@
 //!   the enclosing [`autoreleasepool`] scope ends, which is the caller's
 //!   obligation — including on drop, since dealloc paths autorelease into the
 //!   current frame.
-//! * Every `unsafe` block names the runtime invariant it relies on. A false
-//!   SAFETY comment is a defect of the same rank as the bug it hides.
-//! * A guard must be armed with the spelling the ported code actually uses
-//!   (e.g. `*mut c_void`, a wrapper around a packed struct), not a convenient
-//!   stand-in.
+//! * Every `unsafe` block names the runtime invariant it relies on.
+//! * A test guard is armed with the spelling the ported code uses (e.g.
+//!   `*mut c_void`, a wrapper around a packed struct), not a stand-in.
 //!
 //! # Design points
 //!
@@ -68,11 +67,11 @@
 //!   `@abort_on_exception` abort instead. Order: `catch_unwind` outside,
 //!   `@try` inside.
 //! * **The indirect-return entry point is chosen by the type system.** On
-//!   `x86_64-apple-darwin` (the compat slice of the universal binary) a struct
-//!   return over 16 bytes must use `objc_msgSend_stret`, whose hidden result
-//!   pointer occupies `RDI`, shifting every argument. [`msg`] reads the return
-//!   type off the prototype through [`MsgFn`] and picks the entry point in a
-//!   `const` block. See [`returns_indirectly`].
+//!   `x86_64-apple-darwin` a struct return over 16 bytes must use
+//!   `objc_msgSend_stret`, whose hidden result pointer occupies `RDI`,
+//!   shifting every argument. [`msg`] reads the return type off the prototype
+//!   through [`MsgFn`] and picks the entry point in a `const` block. See
+//!   [`returns_indirectly`].
 //! * **`BOOL` is a type, not `bool`** — see [`Bool`] and [`encode`].
 //! * **Every pointer-shaped runtime type is its own `#[repr(transparent)]`
 //!   type** (`Id`, `ClassPtr`, `ProtocolPtr`, `Sel`), so each carries the
@@ -84,29 +83,24 @@
 //! # Open soundness questions
 //!
 //! * **Ivar provenance.** Rust has no model in which a zero-sized marker at an
-//!   object's base address legitimately addresses bytes beyond itself. objc2
-//!   has the same shape; Miri cannot run the Objective-C runtime.
+//!   object's base address legitimately addresses bytes beyond itself. Miri
+//!   cannot run the Objective-C runtime.
 //! * **Sends are unwind-capable, and must be.** An Objective-C exception raised
-//!   inside a send unwinds through the Rust frame as a foreign exception. This
-//!   crate's entry points are `extern "C-unwind"` and [`MsgFn`] refuses `"C"`,
-//!   because a `nounwind` frame on the raise path skips its `Drop`s or aborts
-//!   with `failed to initiate panic`. [`exception`] catches the raise at the
-//!   trampoline. `aterm-gpu`'s private `metal/ffi.rs` still declares its sends
-//!   `"C"`, so a Metal raise skips that frame's destructors on its way to the
-//!   containment. `tests/objc2_exit_condition.rs` refuses a re-added
-//!   objc2-family dependency.
+//!   inside a send unwinds through the Rust frame as a foreign exception, so
+//!   this crate's entry points are `extern "C-unwind"` and [`MsgFn`] refuses
+//!   `"C"` (see [`exception`]). `aterm-gpu`'s private `metal/ffi.rs` declares
+//!   its sends `"C"`, so a Metal raise skips that frame's destructors on its
+//!   way to the containment.
 //! * **`S3` — `dealloc` runs on whatever thread performs the last release.**
 //!   The generated `-dealloc` runs the ivars' Rust destructor there with no
 //!   `Send` bound in the path, and every declared class holds main-thread
 //!   state (`Cell`/`RefCell`/[`Retained`]). Nothing can make a framework
 //!   release an object on its creating thread, so this stays open in general.
 //!   A value held in a [`MainThreadBound`] is released on the main thread: its
-//!   `Drop` reschedules through [`run_on_main`]
-//!   (`tests/main_thread_bound_drive.rs` contrasts it with a naive
-//!   `unsafe impl Send` wrapper). The birth end is closed: `alloc_init` and
-//!   `alloc_ivars` take a [`MainThread`] witness, so a declared class cannot
-//!   be instantiated off the main thread without `unsafe`. Class registration
-//!   is deliberately ungated — see [`MainThread`].
+//!   `Drop` reschedules through [`run_on_main`]. The birth end is closed:
+//!   `alloc_init` and `alloc_ivars` take a [`MainThread`] witness, so a
+//!   declared class cannot be instantiated off the main thread without
+//!   `unsafe`. Class registration is deliberately ungated — see [`MainThread`].
 //! * **`S4` — `malloc` cannot out-align 16 bytes. Closed by refusal.**
 //!   `_Block_copy` and `class_createInstance` both allocate with `malloc`, and
 //!   `class_addIvar` aligns an ivar's offset but not the instance base. Each
@@ -122,8 +116,18 @@
 //!   execution-tested here.
 
 #![cfg(target_os = "macos")]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_types,
+        reason = "test code: a stand-in child may inherit descriptors"
+    )
+)]
 
 pub(crate) mod block;
+pub mod cf;
+#[cfg(feature = "cg")]
+pub mod cg;
 pub(crate) mod class_macro;
 pub(crate) mod declare;
 pub(crate) mod dispatch;
@@ -135,6 +139,7 @@ pub(crate) mod runtime;
 pub(crate) mod sel_cache;
 pub mod send;
 pub mod swizzle;
+pub mod view;
 pub mod wake_timer;
 pub(crate) mod weak;
 
@@ -157,6 +162,7 @@ pub use runtime::{
 };
 pub use sel_cache::SelCache;
 pub use swizzle::{Imp, MethodFn, Swizzle, SwizzleError, SwizzleSite, owning_class};
+pub use view::HasNsView;
 pub use wake_timer::{WakeArm, WakePlan, WakeTarget, WakeTimer};
 pub use weak::{WeakObj, WeakSlot};
 

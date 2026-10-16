@@ -1,134 +1,71 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Per-build EXEC ROOTS for the Trust bundles whose own tippy refuses them.
+//! Per-build exec roots for the Trust bundles whose own tippy refuses them.
 //!
-//! # The defect
-//!
-//! Trust bundles 8571, 8589, 8590 and 8595 — every build an index pinned from before the
-//! Trust-names-only distribution (trust `dist.rs`, 2026-09-14) — ship `bin/rustc` as a
-//! separately signed COPY of `bin/trustc`. Their tippy (before trust `e79c1142a5`)
-//! accepts a sibling `rustc` only when it is the same file as the selected `trustc` or
-//! byte-identical to it, and macOS makes the copy neither: an ad-hoc code signature
-//! bakes the file's own name into itself, so the two differ in 2,428 bytes on 8595 (2,430
-//! on 8590), every one inside `LC_CODE_SIGNATURE`. So `tippy`, `targo tippy` and
-//! `targo-tippy` all stop at "tippy: setup error: rustc-compatible sibling `…/bin/rustc`
-//! is not the selected Trust compiler `…/bin/trustc`", on every machine running those
-//! builds, while `aterm pkg doctor` said healthy (measured 2026-09-15; `tippy --version`
-//! exits 0 on the broken store, so no version probe can see it). The store is
-//! content-addressed (`aterm pkg verify` hashes it against the signed `tree_root`), so
-//! nothing may be relinked inside a build.
+//! Some Trust bundles ship `bin/rustc` as a separately signed copy of `bin/trustc`. Their
+//! tippy accepts a sibling `rustc` only when it is the same file as `trustc` or
+//! byte-identical to it, and on macOS the copy is neither: an ad-hoc signature bakes the
+//! file's own name into `LC_CODE_SIGNATURE`. `tippy`, `targo tippy` and `targo-tippy` then
+//! stop with "rustc-compatible sibling … is not the selected Trust compiler", while
+//! `tippy --version` exits 0, so no version probe sees it. The store is content-addressed
+//! (`aterm pkg verify` hashes it against the signed `tree_root`), so nothing may be
+//! relinked inside a build.
 //!
 //! # The exec root
 //!
-//! For such a build atpkg lays `<prefix>/compat/trust/<build>/` by the construction the
-//! rustup view uses ([`crate::seam::lay_view`]): `bin/` holds a copy-on-write clone
-//! ([`crate::clone`]) of each regular file of the build's `bin/`, each stock name (`rustc`,
-//! `cargo`, `rustdoc`) a clone of its Trust tool — so `rustc` holds `trustc`'s bytes, which
-//! is the one thing that build's tippy asks — and `lib/`, `libexec/`, `share/` and `etc/`
-//! cloned the same way, every regular file a clone and every symlink recreated. Nothing in
-//! the store is written: not a byte, not a link count, not a ctime. A [`ROOT_MARKER`] is
-//! written last, before the root is committed by `rename(2)`, so a root without one is
-//! never routed.
-//!
-//! A root laid by an older client as a hard-link mirror of the store's inodes (which moved
-//! the link count and ctime tippy pins) has no marker and is not a clone, so it is never
-//! routed and the next `repair` rebuilds it.
-//!
-//! `lib/` is mirrored, not symlinked, for the reason the view's is: a frontend finds its
-//! sysroot through the real path of the driver dylib it loaded, so a symlinked `lib/`
-//! answered the STORE to `trustc --print sysroot`, and the sysroot spelling of tippy ran
-//! beside the store's copy again (exit 1, measured).
-//!
-//! EVERY tool of an affected build runs from its root, not only the tippy family:
-//! `targo tippy` looks for `targo-tippy` only beside `targo` itself (targo's
-//! `search_directories`), so `targo` must run from the root, and `trustc` must too for
-//! the sysroot spelling. One sysroot for the whole toolchain also costs no rebuilds:
-//! alternating the store's and the root's `targo` over one target dir stayed `Fresh`
-//! both ways (measured 2026-09-15, with a path dependency and a build script).
+//! For such a build atpkg lays `<prefix>/compat/trust/<build>/` by the rustup view's
+//! construction ([`crate::seam::lay_view`]): copy-on-write clones ([`crate::clone`]) of the
+//! build's `bin/` (each stock name `rustc`, `cargo`, `rustdoc` a clone of its Trust tool),
+//! `lib/`, `libexec/`, `share/` and `etc/`, symlinks recreated. `lib/` is mirrored, not
+//! symlinked: a frontend finds its sysroot through the real path of the driver dylib it
+//! loaded, so a symlinked `lib/` would answer the store's. Nothing in the store is written,
+//! not even a link count or ctime. Every tool of an affected build runs from its root:
+//! `targo tippy` looks for `targo-tippy` only beside `targo`, and `trustc` must share the
+//! root's sysroot. One sysroot for the whole toolchain costs no rebuilds.
 //!
 //! # How a shim reaches it
 //!
-//! Through [`route_for_shim`], which the one shim renderer
-//! (`platform::shim_executable_to_env`) consults for every shim it writes: when a
-//! complete root stands for the build a shim's target lies in, the shim gains the guard
-//! line of `platform::sh_shim_content_routed` ahead of its unchanged store `exec`. The
-//! guard re-checks at every exec, with `test` builtins only, that the root's file is a
-//! regular executable file and not a symlink, that the store file it stands for still
-//! exists, and that the root's [`ROOT_MARKER`] stands — so a root half-way through a
-//! rebuild, retired, or never finished runs the store path. The bytes are proved where they
-//! can be afforded: when the root is laid, and at [`Depth::Deep`] by `repair` and doctor.
-//! Every reader of a shim keeps reading the store target.
+//! The shim renderer (`platform::shim_executable_to_env`) asks [`route_for_shim`]: when a
+//! complete root stands for the build, the shim gains the guard of
+//! `platform::sh_shim_content_routed` ahead of its unchanged store `exec`. The guard
+//! re-checks at every exec, with `test` builtins only, that the root's file is a regular
+//! executable non-symlink, that the store file exists and that [`ROOT_MARKER`] stands, so a
+//! half-built or retired root runs the store path. Every reader of a shim keeps reading the
+//! store target. `atpkg run` and the `clippy` reroute ask `ops::exec_path`, which answers
+//! the root's file exactly when [`route_for_shim`] does.
 //!
 //! # Rules
 //!
-//! * A root is offered only where [`needs_root`] holds — exactly tippy's own refusal
-//!   condition, so a Trust-names-only bundle, a pack whose `rustc` is a hard link of
-//!   `trustc`, a Linux bundle with byte-identical copies and a bundle without tippy get
-//!   NO root and shims byte-identical to today's. The mechanism retires itself with the
-//!   builds: once no index pins an affected build, this module, the guard renderer and
-//!   doctor's clause for it can be deleted.
-//! * Built in a dot-temp beside its name and committed by `rename(2)`; clones only (a
-//!   clone that cannot be made — the store on another volume — refuses, and the shims
-//!   stay plain; a toolchain is never byte-copied in its place).
-//! * A root that already matches its build is NEVER touched ([`ensure_root`] returns
-//!   [`Ensured::Present`] after `lstat`s and [`needs_root`]'s byte compare, writing
-//!   nothing). tippy pins its executable's and siblings' link count and ctime, and a tippy
-//!   running from the root pins the root's own files, so rebuilding a root under it aborts
-//!   it — the rule [`crate::seam::refresh_view`] follows. What still replaces a root's files
-//!   is rare and one-time: rebuilding one that no longer matches, and removing one with its
-//!   build. The store's own files are never touched.
-//! * `lstat` everywhere: a symlink at a root's name is UNLINKED, never followed; nothing
-//!   is removed or laid under a `compat` or `compat/trust` that is not a real directory;
-//!   and a committed root is renamed aside before it is removed, so no shim can route into
-//!   a half-deleted tree.
-//! * Only a PROVEN answer removes anything: a build whose `bin/rustc` or `bin/trustc`
-//!   cannot be read keeps whatever root stands for it ([`needs_root`]'s errors).
-//! * A root lives exactly as long as its build: `store::discard_build` — the one function
-//!   every discard path goes through — takes it with the tree ([`discard_root_of`]),
-//!   `ops::uninstall` takes `compat/<program>` ([`remove_program`]) and `uninstall --all`
-//!   takes `compat/` ([`remove_all`]); gc ends with [`sweep`], which removes a root whose
-//!   build is gone or no longer needs one, and dot debris a crashed run left.
+//! * A root is offered only where [`needs_root`] holds (exactly tippy's refusal). Once no
+//!   index pins an affected build, this module, the guard renderer and doctor's clause for
+//!   it can be deleted.
+//! * Built in a dot-temp beside its name, [`ROOT_MARKER`] last, committed by `rename(2)`;
+//!   clones only (a clone that cannot be made refuses, and the shims stay plain).
+//! * A matching root is never touched ([`Ensured::Present`]): a tippy running from it pins
+//!   its files' link counts and ctimes, so rewriting them would stop it (the rule
+//!   [`crate::seam::refresh_view`] follows too).
+//! * `lstat` everywhere: a symlink at a root's name is unlinked, never followed; nothing is
+//!   removed or laid under a `compat` or `compat/trust` that is not a real directory
+//!   ([`Blocked`]); a committed root is renamed aside before it is removed.
+//! * Only a proven answer removes anything: a build whose `bin/rustc` or `bin/trustc`
+//!   cannot be read keeps its root.
+//! * A root lives as long as its build: `store::discard_build` ([`discard_root_of`]),
+//!   `ops::uninstall` ([`remove_program`]), `uninstall --all` ([`remove_all`]) and gc's
+//!   [`sweep`] remove it.
 //!
-//! # Who lays it
+//! # Who lays and reports it
 //!
-//! `activate::install_tools_env` ensures the root (at [`Depth::Shallow`]) before it renders
-//! a single shim for a trust build, so every install, flip, repair, seed and restore lays
-//! it ahead of the shims that name the build; `flow::rollback_member` — which re-points the
-//! shims at the prior build for `atpkg rollback`, a flip that fails and a group abort, and
-//! renders them through its own `platform::install_shim_env` — ensures the prior build's
-//! root the same way first. And because an up-to-date
-//! program is never re-laid, the verbs that must heal a machine already on an affected
-//! build run [`reconcile`]: the update pass after its gc, the default-set lane after its
-//! alias reconcile, `seed` beside the rustup seam, a trust `rollback`, and `repair` at
-//! [`Depth::Deep`] (a root it cannot lay is exit 1). The alias and agents reconciles
-//! compare a shim's BYTES with the render, not only its target and environment, so an
-//! `alab-` alias laid plain before a root stood is re-laid. `atpkg run` (`aterm <tool>`)
-//! and the `clippy` reroute exec a tool without its shim, so they ask `ops::exec_path`,
-//! which answers the root's file exactly when [`route_for_shim`] does.
+//! `activate::install_tools_env` ensures the root ([`Depth::Shallow`]) before it renders a
+//! trust shim, and `flow::rollback_member` the prior build's. An up-to-date program is never
+//! re-laid, so [`reconcile`] heals a machine already on an affected build (after the update
+//! pass's gc, in the default-set lane, in `seed`, on a trust `rollback`, and in `repair` at
+//! [`Depth::Deep`]). `aterm pkg doctor` (5f) reads through [`inspect`] and [`strays`].
 //!
-//! # Who reports it
-//!
-//! `aterm pkg doctor` (its check 5f), through [`inspect`] and [`strays`], which read and
-//! never write or execute. On the active trust build, when it [`needs_root`]: a root that
-//! matches the build at [`Depth::Deep`] with every trust shim routed is a note and leaves
-//! the report healthy; no root, a root that differs, or a shim that does not route is a
-//! warn that withholds "healthy", naming the inodes and the one fix, `aterm pkg repair`
-//! — except behind a link or a file at `compat` or `compat/trust` ([`Blocked`]), where
-//! repair refuses too and the warn names that path and says to remove it first.
-//! A root no build needs is a warn naming `aterm pkg gc`. A build that needs no root gets
-//! no line at all; one whose `bin/rustc` or `bin/trustc` cannot be read is a warn that
-//! withholds "healthy" and names the read that failed.
-//!
-//! # Not decided here
-//!
-//! Not covered: `cargo +trust clippy` (the bundle ships no `cargo-clippy`), and every
-//! consumer that runs `store/trust/current/bin` by absolute path (aterm-verify's store
-//! discovery, `tools/bootstrap-publisher.sh`, the release gates).
-//!
-//! Unix only: on Windows a byte-identical copy passes tippy, so every function here answers
-//! "no root" and lays nothing. No Linux bundle needs a root either — its copies are
-//! byte-identical, so [`needs_root`] answers `None` there.
+//! Not covered: `cargo +trust clippy` (the bundle ships no `cargo-clippy`) and consumers
+//! that run `store/trust/current/bin` by absolute path. Only macOS needs a root: Windows and
+//! Linux bundles' copies are byte-identical, which tippy accepts, and off Unix
+//! [`needs_root`] always answers `None`.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -136,8 +73,8 @@ use std::path::{Path, PathBuf};
 use crate::Layout;
 use crate::seam::Depth;
 
-/// `<prefix>/compat` — the top-level directory exec roots live under. Outside `store/`
-/// on purpose: nothing may be laid inside the content-addressed store namespace.
+/// `<prefix>/compat`, where exec roots live: outside `store/`, since nothing may be laid
+/// inside the content-addressed store.
 pub const COMPAT_DIR: &str = "compat";
 
 /// `<prefix>/compat`.
@@ -159,10 +96,10 @@ pub fn root_dir(layout: &Layout, build: u64) -> PathBuf {
     roots_dir(layout).join(build.to_string())
 }
 
-/// The file written last into a root before it is committed by `rename(2)`: a root without
-/// it — half-way through a lay, laid as hard links before clones, or planted — is never
-/// routed ([`route_for_shim`], and the shim's own guard, `platform::sh_shim_content_routed`)
-/// and never reads as matching ([`root_first_mismatch`]).
+/// The file written last into a root before `rename(2)` commits it: a root without it
+/// (half-way through a lay, from an older construction, or planted) is never routed
+/// ([`route_for_shim`], and the shim's own guard) and never reads as matching
+/// ([`root_first_mismatch`]).
 pub const ROOT_MARKER: &str = ".atpkg-root";
 
 /// The marker's contents: a version line, so a future construction can tell its own roots
@@ -204,9 +141,8 @@ pub fn root_matches(build_dir: &Path, root: &Path, depth: Depth) -> bool {
 }
 
 /// The one line every lane prints when it lays or rebuilds the exec root of trust build
-/// `build` ([`Ensured::Built`]): `activate::install_tools_env` (install, the flip,
-/// `repair`'s re-lay) and the pass-level reconcile (`cli::reconcile_exec_roots`). One
-/// sentence in one place, so the two cannot drift.
+/// `build` ([`Ensured::Built`]): `activate::install_tools_env` and the pass-level reconcile
+/// (`cli::reconcile_exec_roots`).
 #[must_use]
 pub fn laid_line(layout: &Layout, build: u64) -> String {
     format!(
@@ -216,13 +152,11 @@ pub fn laid_line(layout: &Layout, build: u64) -> String {
 }
 
 /// `<prefix>/compat` or `<prefix>/compat/trust` standing as something other than a real
-/// directory — a symbolic link, or a file — which is where every trust exec root lives.
-/// atpkg never follows or writes through what stands there (a removal could follow such a
-/// link out of the prefix), and no update, repair or gc removes
-/// it — only `uninstall` takes `compat` — so no exec root is laid and no shim routes until a
-/// person moves it. No retry can fix it, so every message about it names the path and that
-/// one manual step: [`ensure_root`]'s error (what the passes print) and doctor's (5f) warn
-/// both speak through this type.
+/// directory (a symlink or a file). atpkg never follows or writes through it (a removal
+/// could follow a link out of the prefix) and only `uninstall` removes `compat`, so no root
+/// is laid and no shim routes until a person moves it. Every message about it names the
+/// path and that manual step: [`ensure_root`]'s error and doctor's (5f) warn both speak
+/// through this type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Blocked {
     /// The first of `<prefix>/compat`, `<prefix>/compat/trust` that is not a real directory.
@@ -359,32 +293,27 @@ impl Report {
     }
 }
 
-/// Whether the build at `build_dir` needs an exec root: `Ok(Some(differing_bytes))`
-/// exactly when its tippy would refuse it, `Ok(None)` when it provably would not. All of
-/// these must hold, each read with `lstat` (the byte compare opens both files without
-/// following a link):
+/// Whether the build at `build_dir` needs an exec root: `Ok(Some(differing_bytes))` exactly
+/// when its tippy would refuse it, `Ok(None)` when it provably would not. All must hold,
+/// each read with `lstat` (the byte compare opens both files without following a link):
 ///
 /// * `bin/rustc` exists, in any form;
 /// * `bin/trustc` is a regular file;
-/// * `bin/tippy` or `bin/targo-tippy` is a regular file — no tippy, nothing to refuse;
+/// * `bin/tippy` or `bin/targo-tippy` is a regular file (no tippy, nothing to refuse);
 /// * `bin/rustc` is not `trustc`'s `(dev, ino)`;
 /// * `bin/rustc` is not a byte-identical copy of the same length.
 ///
-/// That is tippy's acceptance rule before trust `e79c1142a5` (`checked_compiler_pair`:
-/// the same file, or identical bytes), turned around. It decides only whether a root is
-/// OFFERED — a root holds nothing but the build's own inodes, so it is not a security
-/// boundary. The count is the byte positions that differ plus the length difference, or
-/// `trustc`'s whole length when `rustc` is not a regular file (no byte of it can be shown
-/// to be `trustc`'s).
+/// That is tippy's acceptance rule (`checked_compiler_pair`: the same file, or identical
+/// bytes) turned around. It decides only whether a root is offered; a root holds only
+/// clones of the build's own files, so it is no security boundary. The count is the
+/// differing byte positions plus the length difference, or `trustc`'s whole length when
+/// `rustc` is not a regular file.
 ///
 /// # Errors
-/// A read that FAILS — an `lstat` refused for any reason but the name being absent, a
-/// file that will not open or read — is an error, never `Ok(None)`: an unproven "needs
-/// none" must not retire a root. Every caller that removes something acts on `Ok(None)`
-/// alone — [`ensure_root`] leaves whatever stands and returns the error, and [`sweep`]
-/// keeps the root — because a single failed read (a store `bin/rustc` at mode `0111`) would
-/// sweep a needed root, un-route every shim and move every store inode twice on the pass
-/// that re-laid it.
+/// A read that fails (an `lstat` refused for any reason but absence, a file that will not
+/// open or read) is an error, never `Ok(None)`: callers remove a root only on `Ok(None)`
+/// ([`ensure_root`] leaves it, [`sweep`] keeps it), so one unreadable `bin/rustc` cannot
+/// retire a needed root.
 pub fn needs_root(build_dir: &Path) -> io::Result<Option<u64>> {
     #[cfg(unix)]
     {
@@ -482,7 +411,7 @@ pub(crate) fn trust_build_of(layout: &Layout, build_dir: &Path) -> Option<u64> {
         .then_some(n)
 }
 
-/// The trust build a shim TARGET is a tool of: `Some(n)` exactly when `target` is
+/// The trust build a shim target is a tool of: `Some(n)` exactly when `target` is
 /// `<prefix>/store/trust/<n>/bin/<file>` of this layout.
 fn trust_tool_build(layout: &Layout, target: &Path) -> Option<u64> {
     let (program, n) = crate::ops::store_build_of(&layout.prefix, target)?;
@@ -494,40 +423,27 @@ fn trust_tool_build(layout: &Layout, target: &Path) -> Option<u64> {
 /// Make the exec root of the trust build at `build_dir` what the build needs, at `depth`.
 ///
 /// * The build provably needs no root ([`needs_root`] is `Ok(None)`): any root left for it
-///   is removed — renamed aside first, a symlink unlinked — and the answer is
-///   [`Ensured::Plain`]. Only under a `<prefix>/compat` and `compat/trust` that are both
-///   real directories: behind a symlink at either name nothing is atpkg's, and a root-named
-///   directory there is left whole (a removal could follow such a link out of the
-///   prefix).
+///   is removed (renamed aside first, a symlink unlinked), only when `compat` and
+///   `compat/trust` are both real directories; [`Ensured::Plain`].
 /// * `compat` or `compat/trust` exists and is not a real directory: refused with a
-///   [`Blocked`] ([`blocked_by`] recovers it), which names that path and the manual fix,
-///   before anything is compared — a root reached through a link is not one
-///   [`route_for_shim`] routes to, so answering `Present` over it had left every shim
-///   plain with no error; and the refusal had read "update directory is a symlink;
-///   refusing" beside advice to run `aterm pkg repair`, which refuses the same way.
-/// * A root stands and [`root_matches`] holds at `depth`: nothing is written at all, not
-///   even a directory mode — [`Ensured::Present`].
-/// * Otherwise the root is laid at `.<n>.tmp-<pid>`, any standing root is renamed to
-///   `.<n>.old-<pid>`, the temp renamed into place and the old one removed —
-///   [`Ensured::Built`]. When the standing root's `bin/` still matches the build and only a
-///   directory beside it differs, the temp gets the mirrored directories alone
-///   ([`crate::seam::lay_view_dirs`]) and the live `bin/` is moved into it by `rename(2)`, so
-///   a `.DS_Store` under `share/` never replaces a `bin/` file a running tippy pins. The
-///   [`ROOT_MARKER`] goes into the temp last. Between the renames the root, or its `bin/`,
-///   is briefly absent, and a shim exec'd in that instant runs the store path.
+///   [`Blocked`] ([`blocked_by`] recovers it) before anything is compared, since
+///   [`route_for_shim`] never routes through a link.
+/// * A root stands and [`root_matches`] holds at `depth`: nothing is written, not even a
+///   directory mode; [`Ensured::Present`].
+/// * Otherwise the root is laid at `.<n>.tmp-<pid>`, a standing root renamed to
+///   `.<n>.old-<pid>`, the temp renamed into place and the old one removed;
+///   [`Ensured::Built`]. When the standing root's `bin/` still matches and only a directory
+///   beside it differs, the temp gets the mirrored directories alone
+///   ([`crate::seam::lay_view_dirs`]) and the live `bin/` moves into it by `rename(2)`, so a
+///   `.DS_Store` under `share/` never replaces a `bin/` file a running tippy pins.
+///   [`ROOT_MARKER`] goes in last. A shim exec'd between the renames runs the store path.
 ///
 /// # Errors
-/// `build_dir` is not a trust build of this layout, [`needs_root`] could not read the
-/// build, `compat` or `compat/trust` is not a directory atpkg may write (a [`Blocked`]
-/// when something other than a real directory stands at either name), the root cannot
-/// be removed, or it cannot be laid — a clone refused (the store on another volume), a
-/// directory unreadable, the marker unwritable. On an error, whatever stood at the
-/// root is left where it was (a lay's temp tree is removed). The one exception is the
-/// retire of a build that needs none: its root is renamed to `.<n>.old-<pid>` FIRST, so
-/// when that tree then will not delete the error comes back with the name already empty
-/// and the `.<n>.old-<pid>` debris left for [`sweep`] — never a half-deleted tree at the
-/// name. Nothing is ever byte-copied, and a shim rendered afterwards routes only if
-/// [`route_for_shim`] still finds a complete root.
+/// `build_dir` is not a trust build of this layout, [`needs_root`] could not read it,
+/// `compat` or `compat/trust` is not writable (a [`Blocked`] when not a real directory), or
+/// the root cannot be removed or laid. Whatever stood at the root then stays (a lay's temp
+/// is removed), except a root retired for a build that needs none: renamed aside first, it
+/// leaves `.<n>.old-<pid>` debris for [`sweep`], never a half-deleted tree at the name.
 pub fn ensure_root(layout: &Layout, build_dir: &Path, depth: Depth) -> io::Result<Ensured> {
     let Some(n) = trust_build_of(layout, build_dir) else {
         return Err(io::Error::new(
@@ -650,7 +566,7 @@ fn remove_entry(path: &Path) -> io::Result<()> {
     }
 }
 
-/// Remove a committed root at `root`: a real directory is renamed to `aside` FIRST, so
+/// Remove a committed root at `root`: a real directory is renamed to `aside` first, so
 /// its name vanishes in one step and no shim can route into a tree half-way through
 /// deletion; anything else at the name is unlinked. `Ok(true)` when something was there.
 #[cfg(unix)]
@@ -669,11 +585,10 @@ fn retire(root: &Path, aside: &Path) -> io::Result<bool> {
 }
 
 /// Whether `target`, in a build's `bin/` at `bin`, is a stock name
-/// ([`crate::seam::STOCK_NAMES`]) that is a separate file from its Trust tool — the bundle's
-/// own copy. A root presents the stock name as the Trust tool, so a shim forwarding to the
-/// copy is never routed and never counted unrouted. A stock name that is its Trust tool's
-/// own file in the store (a pack that kept one hard link) is not a copy, so this compares
-/// the store's own inodes.
+/// ([`crate::seam::STOCK_NAMES`]) that is a separate file from its Trust tool: the bundle's
+/// own copy. A root presents the stock name as the Trust tool, so a shim to the copy is
+/// neither routed nor counted unrouted. A stock name hard-linked to its Trust tool in the
+/// store is not a copy.
 #[cfg(unix)]
 fn is_stock_copy(bin: &Path, target: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
@@ -694,26 +609,23 @@ fn is_stock_copy(bin: &Path, target: &Path) -> bool {
     })
 }
 
-/// The root file a shim at `shim` forwarding to `target` should run instead, or `None`
-/// for today's shim. `stat` only. `Some(<root>/bin/<file>)` exactly when:
+/// The root file a shim at `shim` forwarding to `target` should run instead, or `None` for
+/// the plain shim. `stat` only. `Some(<root>/bin/<file>)` exactly when:
 ///
 /// * `target` is `<P>/store/trust/<n>/bin/<file>`, where `<P>` is the shim's own prefix
-///   (`shim.parent().parent()`, which holds for `bin/` and `agents/` alike) — so another
-///   program, a dev link into a checkout, a lookalike prefix, extra path components and
-///   a non-canonical build spelling all answer `None`;
+///   (`shim.parent().parent()`, for `bin/` and `agents/` alike), so another program, a dev
+///   link, a lookalike prefix, extra components and a non-canonical build spelling all
+///   answer `None`;
 /// * `<P>/compat`, `<P>/compat/trust`, the root and its `bin/` are real directories, and
 ///   the root's [`ROOT_MARKER`] is a regular file;
-/// * `<root>/bin/<file>` is a clone of `target` ([`crate::clone::is_clone_of`]: a regular
-///   file with its length, mode and time, not its inode);
-/// * `<root>/bin/rustc` is a clone of the store `trustc` — the property the root exists for;
-/// * `target` is not a stock-name copy the bundle ships beside its Trust tool (`rustdoc` as
-///   a separate file from `trustdoc`): the root presents that name as the Trust tool, which
-///   is not what such a shim forwards to;
+/// * `<root>/bin/<file>` is a clone of `target` ([`crate::clone::is_clone_of`]);
+/// * `<root>/bin/rustc` is a clone of the store `trustc`, the property the root exists for;
+/// * `target` is not a stock-name copy the bundle ships beside its Trust tool
+///   ([`is_stock_copy`]);
 /// * `<root>/lib` is a real directory whenever the build has a `lib/`.
 ///
-/// It does not re-walk the root or read bytes: [`ensure_root`] proves the root when it lays
-/// it, and `repair` and doctor at [`Depth::Deep`]; the shim's guard re-checks the file and
-/// the marker at every exec.
+/// It reads no bytes: [`ensure_root`] proves the root when it lays it, `repair` and doctor
+/// at [`Depth::Deep`], and the shim's guard re-checks the file and marker at every exec.
 #[must_use]
 pub fn route_for_shim(shim: &Path, target: &Path) -> Option<PathBuf> {
     #[cfg(unix)]
@@ -775,7 +687,7 @@ pub enum Stray {
     NeedsNone(u64),
 }
 
-/// What an entry of `<prefix>/compat/trust` named `name` is — the ONE classification
+/// What an entry of `<prefix>/compat/trust` named `name` is: the one classification
 /// [`sweep`] removes by and [`strays`] reports by, so doctor names exactly what gc takes.
 #[cfg(unix)]
 enum RootsEntry {
@@ -797,11 +709,9 @@ fn classify(layout: &Layout, name: &str, path: &Path) -> Option<RootsEntry> {
         return Some(RootsEntry::Debris);
     }
     let n = name.parse::<u64>().ok().filter(|n| n.to_string() == name)?;
-    // Every question below is answered only by a PROVEN answer: an `lstat` that fails for
-    // any reason but an absent name (a `compat/trust` or `store/trust` that cannot be
-    // searched) leaves the entry alone, exactly as a build whose need cannot be read does
-    // ([`needs_root`]'s errors). The reconcile that follows the sweep names the failed read
-    // for every build a shim still points at.
+    // Only a proven answer removes: an `lstat` that fails for any reason but absence leaves
+    // the entry alone, as a build whose need cannot be read does. The reconcile after the
+    // sweep names the failed read for every build a shim still points at.
     let build = layout.build_dir(crate::seam::SEAM_PROGRAM, n);
     Some(match (real_dir(path), real_dir(&build)) {
         (Err(_), _) => RootsEntry::Needed,
@@ -814,11 +724,10 @@ fn classify(layout: &Layout, name: &str, path: &Path) -> Option<RootsEntry> {
     })
 }
 
-/// `lstat` of `path` as an ANSWER: `Ok(true)` for a real directory, `Ok(false)` for
-/// provably none — the name absent, a component above it not a directory (`ENOTDIR`), or
-/// something other than a directory (a symlink included) at the name — and `Err` when the
-/// question went unanswered, a component above it that cannot be searched, say. What
-/// [`crate::seam::is_real_dir`] folds into `false`, for the callers that remove by it.
+/// `lstat` of `path` as an answer: `Ok(true)` for a real directory, `Ok(false)` for
+/// provably none (absent, `ENOTDIR` above it, or a non-directory such as a symlink at the
+/// name), and `Err` when the question went unanswered (a component that cannot be
+/// searched). [`crate::seam::is_real_dir`] folds the `Err` into `false`.
 #[cfg(unix)]
 fn real_dir(path: &Path) -> io::Result<bool> {
     match std::fs::symlink_metadata(path) {
@@ -845,10 +754,9 @@ fn walkable_roots_dir(layout: &Layout) -> Option<PathBuf> {
 }
 
 /// Every entry of `<prefix>/compat/trust` the next [`sweep`] would remove as not a root any
-/// build needs, with why, sorted by path. `lstat`s and [`needs_root`]'s reads only —
-/// doctor's half of the sweep, which writes nothing. Dot-named debris is NOT reported:
-/// doctor holds no store lock, so a `.<n>.tmp-<pid>` may be a root another atpkg is laying
-/// this instant, and a warn about it would be wrong exactly when it is read.
+/// build needs, with why, sorted by path: doctor's half of the sweep, which writes nothing.
+/// Dot-named debris is not reported: doctor holds no store lock, so a `.<n>.tmp-<pid>` may
+/// be a root another atpkg is laying this instant.
 #[must_use]
 pub fn strays(layout: &Layout) -> Vec<(PathBuf, Stray)> {
     #[cfg(unix)]
@@ -954,20 +862,14 @@ fn store_build_parts(build_dir: &Path) -> Option<(&Path, &str, u64)> {
     Some((store.parent()?, program, n))
 }
 
-/// Remove the exec root of the build at `build_dir` — `<prefix>/compat/<program>/<n>` for
-/// a `build_dir` of `<prefix>/store/<program>/<n>`, derived from that parent chain alone
-/// and from nothing else, so any other path names no root. The half of
-/// [`crate::store::discard_build`] that keeps a root from outliving its build: every
-/// discard path (gc's supersede, its partial sweep, flow's abort) goes through that one
-/// function, so each takes the root with the tree.
+/// Remove the exec root of the build at `build_dir`: `<prefix>/compat/<program>/<n>` for a
+/// `build_dir` of `<prefix>/store/<program>/<n>`, derived from that parent chain alone. The
+/// half of [`crate::store::discard_build`] (which every discard path goes through) that
+/// keeps a root from outliving its build.
 ///
-/// Best-effort and silent, like the rest of `discard_build`. `lstat` all the way down:
-/// `<prefix>/compat` and `<prefix>/compat/<program>` must be real directories, or nothing
-/// under them is atpkg's to remove; a real root is renamed aside first (`.<n>.old-<pid>`)
-/// so no shim routes into a half-deleted tree, and a symlink at the name is unlinked,
-/// never followed. What will not go is left for [`sweep`], which removes a root whose
-/// build is gone — the clones a root holds keep a reclaimed build's blocks allocated
-/// until then.
+/// Best-effort and silent. `<prefix>/compat` and `<prefix>/compat/<program>` must be real
+/// directories (`lstat`); a real root is renamed aside first, a symlink unlinked. What will
+/// not go is left for [`sweep`].
 pub(crate) fn discard_root_of(build_dir: &Path) {
     #[cfg(unix)]
     {
@@ -1035,24 +937,19 @@ pub fn remove_all(layout: &Layout) -> io::Result<()> {
 /// write nothing when it already is:
 ///
 /// 1. [`sweep`];
-/// 2. group the `bin/` entries whose target resolves to `<prefix>/store/trust/<n>/bin`
-///    by `n` — primaries, `alab-` aliases and env-carrying shims alike; a tombstone, a
-///    pending stub, a dev link and another program's shim resolve elsewhere and are
-///    never touched;
-/// 3. [`ensure_root`] at `depth` for each `n` whose build is there;
-/// 4. re-render each grouped shim through `platform::shim_executable_to_env` with the
-///    environment it already exports, and keep those whose bytes differ — routed where a
-///    root now stands, back to plain where none does;
+/// 2. group the `bin/` shims that forward to a trust build's tools by build (`trust_shims`);
+/// 3. [`ensure_root`] at `depth` for each build that is there;
+/// 4. re-render each shim through `platform::shim_executable_to_env` with the environment
+///    it already exports, and keep those whose bytes differ (routed where a root now
+///    stands, plain where none does);
 /// 5. lay them ([`crate::lay::write_in_process`]).
 ///
-/// A second run finds nothing to do. This is what reaches the shims no install rewrites:
-/// the pass short-circuits an up-to-date program before it lays a shim, and the alias
-/// reconcile keeps an alias whose target and environment already match — so a plain
-/// `alab-tippy` on an affected build would otherwise stay plain forever.
+/// This reaches the shims no install rewrites: the pass short-circuits an up-to-date
+/// program before it lays a shim.
 #[must_use]
 pub fn reconcile(layout: &Layout, depth: Depth) -> Report {
     if cfg!(not(unix)) {
-        // No root is laid off Unix: every shim is today's, and nothing is re-rendered.
+        // No root is laid off Unix: every shim is plain, and nothing is re-rendered.
         let _ = depth;
         return Report::default();
     }
@@ -1172,30 +1069,22 @@ pub struct Inspection {
     /// Where the root stands.
     pub state: RootState,
     /// File names of the `bin/` shims whose target is a regular file in this build's
-    /// `bin/`, sorted — less those forwarding to a stock-name copy the bundle ships beside a
-    /// Trust tool the root presents under that name, which [`route_for_shim`] never routes.
-    /// A shim whose target is gone is a
-    /// broken shim, named elsewhere.
+    /// `bin/`, sorted, less those forwarding to a stock-name copy ([`route_for_shim`] never
+    /// routes them). A shim whose target is gone is a broken shim, named elsewhere.
     pub shims: Vec<String>,
-    /// Those of [`Inspection::shims`] whose bytes are not the ROUTED render — the guard
-    /// line through `<root>/bin/<file>` ahead of the store `exec`, with the environment the
-    /// shim already exports. Such a shim runs the store path, whatever stands at the root.
+    /// Those of [`Inspection::shims`] whose bytes are not the routed render (the guard line
+    /// through `<root>/bin/<file>` ahead of the store `exec`, with the shim's own exports):
+    /// such a shim runs the store path, whatever stands at the root.
     pub unrouted: Vec<String>,
 }
 
 /// Read the exec root of trust build `build` for doctor: `None` when the build is provably
-/// not in the store as a real directory or provably needs no root (every Trust-names-only
-/// bundle: doctor prints nothing about it), `Some(Err(why))` when the build directory's
-/// `lstat` failed for any reason but an absent name, or [`needs_root`] could not read the
-/// build — doctor cannot vouch for PATH tippy then, and says so rather than print
-/// nothing. `lstat`s, [`needs_root`]'s byte compare of
-/// two ~330 KiB files on 8595, a [`Depth::Deep`] walk of the root ([`root_first_mismatch`],
-/// plus the stock names' bytes) and a bounded read
-/// of each trust shim — it writes
-/// nothing, creates nothing, and runs no tool: a probe that EXECUTED tippy would answer
-/// through tippy's ancestor-directory checks, which refuse intermittently on their own
-/// (`$HOME` changing mid-run), so the verdict here is the inode facts tippy's own rule is
-/// made of.
+/// not a real directory in the store or provably needs no root; `Some(Err(why))` when the
+/// build's `lstat` failed for any reason but absence or [`needs_root`] could not read it
+/// (doctor then cannot vouch for PATH tippy, and says so). `lstat`s, [`needs_root`]'s byte
+/// compare, a [`Depth::Deep`] walk of the root and a bounded read of each trust shim: it
+/// writes nothing and runs no tool, since executing tippy would answer through its
+/// ancestor-directory checks, which refuse intermittently on their own.
 #[must_use]
 pub fn inspect(layout: &Layout, build: u64) -> Option<Result<Inspection, String>> {
     #[cfg(unix)]
@@ -1246,16 +1135,9 @@ pub fn inspect(layout: &Layout, build: u64) -> Option<Result<Inspection, String>
             let (Some(name), Some(file)) = (shim.file_name(), target.file_name()) else {
                 continue;
             };
-            // A shim to the stock-name COPY the bundle ships (`rustdoc`, say — `rustc` and
-            // `cargo` are refused as shim names) has nothing to route to either: the root
-            // presents that name as the Trust tool, not the copy, so the writer's
-            // [`route_for_shim`] answers `None` for it on every render. Counted, it would read
-            // as unrouted forever — a warn `aterm pkg repair` could never clear. It runs the store
-            // copy, which no tippy authenticates, exactly as before roots existed.
-            //
-            // Only a copy ([`is_stock_copy`], the one predicate the writer asks too): a
-            // stock name that is its Trust tool's own file in the store is that tool, so the
-            // writer routes its shim and a plain one is unrouted like any other.
+            // A shim to a stock-name copy the bundle ships (`rustdoc`, say) never routes: the
+            // root presents that name as the Trust tool ([`is_stock_copy`]), so counting it
+            // would be a warn `repair` could never clear.
             if is_stock_copy(&bin, &target) {
                 continue;
             }
@@ -1306,9 +1188,9 @@ mod tests {
     /// The shapes a trust build's `bin/` has come in.
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Shape {
-        /// 8571/8589/8590/8595: `rustc` and `cargo` separate copies that differ.
+        /// The affected bundles: `rustc` and `cargo` separate copies that differ.
         Copy,
-        /// Trust-names-only (trust `dist.rs`, builds from 2026-09-14 on).
+        /// Trust-names-only: no stock-name copies.
         NamesOnly,
         /// A pack whose extractor kept `rustc` a hard link of `trustc`.
         Linked,
@@ -1404,8 +1286,8 @@ mod tests {
             self.layout.shim(&ToolName::new(name).unwrap())
         }
 
-        /// Write today's PLAIN shim at `bin/<name>` forwarding to `target`, as an older
-        /// client laid it — directly, so no route is decided.
+        /// Write the plain shim at `bin/<name>` forwarding to `target`, as an older client
+        /// laid it: directly, so no route is decided.
         fn plain_shim(&self, name: &str, target: &Path, env: &crate::shim_env::ShimEnv) -> PathBuf {
             let shim = self.shim_path(name);
             std::fs::write(&shim, crate::platform::sh_shim_content_env(target, env)).unwrap();
@@ -1455,12 +1337,10 @@ mod tests {
         out
     }
 
-    /// Make `path` unreadable, answering the permissions it had — restore with
-    /// [`restore_mode`], never with a literal. `std::fs::write` lays a file `0o666 & !umask`,
-    /// which is `0o644` or `0o664` depending on the host, and a view entry is identified by
-    /// length, permission bits and mtime ([`crate::clone::is_clone_of`]) — so a literal
-    /// restore changes the store file and correctly re-lays the view, which reads exactly
-    /// like the destructive defect these tests pin.
+    /// Make `path` unreadable, answering the permissions it had. Restore with
+    /// [`restore_mode`], never a literal: `std::fs::write` lays `0o666 & !umask`, and a view
+    /// entry is identified by length, mode and mtime ([`crate::clone::is_clone_of`]), so a
+    /// literal restore would change the store file and re-lay the view.
     #[must_use]
     fn unreadable(path: &Path) -> std::fs::Permissions {
         let had = std::fs::symlink_metadata(path).unwrap().permissions();
@@ -1533,12 +1413,10 @@ mod tests {
         assert_eq!(needs_root(&copy).unwrap(), Some(trustc_len));
     }
 
-    /// The root: every regular file of the build's `bin/` is a clone of the store's, each
-    /// stock name a clone of its Trust tool (so `rustc` holds `trustc`'s bytes, never the
-    /// bundle copy's), `lib/`, `libexec/`, `share/`, `etc/` cloned with the symlink
-    /// recreated, and the marker written. Laying it moves nothing in the store — no
-    /// `st_nlink`, `st_ctime` or `st_mtime`. And the no-churn rule: once it stands, a second
-    /// ensure at either depth is `Present` and moves nothing anywhere.
+    /// The root clones every file (each stock name from its Trust tool, so `rustc` holds
+    /// `trustc`'s bytes), recreates the symlink and writes the marker without moving a store
+    /// inode's `st_nlink`, `st_ctime` or `st_mtime`; once it stands, a second ensure at
+    /// either depth is `Present` and moves nothing.
     #[test]
     fn ensure_root_clones_every_file_and_then_touches_nothing() {
         let fx = Fx::new("ensure");
@@ -1632,10 +1510,9 @@ mod tests {
         assert_eq!(stamps(&build), store_before);
     }
 
-    /// A root that stopped matching is rebuilt: a tool replaced by other bytes, or by the
-    /// store's own inode (the hard link a root held before clones), at either depth; a root
-    /// whose marker is gone; a file planted deep in `lib/` at `Deep` only (a shallow pass
-    /// leaves it, and writes nothing). Dot debris a crashed run left is swept.
+    /// A root that stopped matching is rebuilt (a tool's bytes or inode replaced, or the
+    /// marker gone, at either depth; a file planted deep in `lib/` at `Deep` only), and dot
+    /// debris a crashed run left is swept.
     #[test]
     fn a_mismatched_root_is_rebuilt_and_debris_is_swept() {
         let fx = Fx::new("rebuild");
@@ -1721,12 +1598,9 @@ mod tests {
         assert!(debris(&fx.layout).is_empty());
     }
 
-    /// A lay that fails part-way — an unreadable directory in `lib/`, standing in for the
-    /// EXDEV a single-volume test cannot produce — returns the error, leaves no committed
-    /// root and no temp, and every shim rendered afterwards is today's plain shim. And it
-    /// fails BEFORE `bin/`: across two failing attempts (every launch and every pass retries)
-    /// no store `bin/` inode was linked or unlinked, so a tippy running from the store is
-    /// not aborted by a root that cannot be laid.
+    /// A lay that fails part-way (an unreadable `lib/` directory, standing in for EXDEV)
+    /// commits no root and leaves no temp, the shims stay plain, and no store `bin/` inode
+    /// was linked or unlinked.
     #[test]
     fn a_failed_lay_commits_nothing_and_the_shims_stay_plain() {
         if crate::platform::our_uid() == 0 {
@@ -1804,10 +1678,9 @@ mod tests {
         );
         assert!(std::fs::symlink_metadata(&root).is_err());
         assert!(debris(&fx.layout).is_empty());
-        // A leftover root that will not delete (a `0500` directory holding a file): the name
-        // is renamed aside FIRST, so the error comes back with the root already gone from
-        // its name and `.<n>.old-<pid>` left for the sweep — never a half-deleted tree at
-        // the name a shim routes by.
+        // A leftover root that will not delete (a `0500` directory holding a file) is renamed
+        // aside first: the error comes back with the name already empty and `.<n>.old-<pid>`
+        // left for the sweep.
         if crate::platform::our_uid() != 0 {
             let stuck = root.join("lib");
             std::fs::create_dir_all(&stuck).unwrap();
@@ -1839,8 +1712,8 @@ mod tests {
         assert!(ensure_root(&fx.layout, &build.join("bin"), Depth::Shallow).is_err());
     }
 
-    /// `route_for_shim` answers only for a shim of THIS prefix forwarding to a tool of a
-    /// trust build whose root stands whole and marked, and only with a clone of that tool —
+    /// `route_for_shim` answers only for a shim of this prefix forwarding to a tool of a
+    /// trust build whose root stands whole and marked, and only with a clone of that tool,
     /// never the store's own inode.
     #[test]
     fn route_for_shim_is_anchored_and_exact() {
@@ -1955,12 +1828,10 @@ mod tests {
         assert_eq!(route_for_shim(&shim, &target), None);
     }
 
-    /// THE PASS THAT REACHES EVERY SHIM. Plain shims an older client laid for an affected
-    /// build — a primary, an `alab-` alias, one exporting an environment — are routed in
-    /// one reconcile, the environment kept; a tombstone, a pending stub and another
-    /// program's shim are untouched; a second reconcile writes nothing. When `current`
-    /// moves to a build that needs no root, its shims are today's plain shims byte for
-    /// byte; and when the affected build is gone, its root goes with the next sweep.
+    /// One reconcile routes every plain shim of an affected build (primary, `alab-` alias,
+    /// one exporting an environment) and leaves a tombstone, a pending stub and another
+    /// program's shim alone; a second writes nothing. Moving `current` to a build that needs
+    /// no root makes its shims plain, and the gone build's root goes with the next sweep.
     #[test]
     fn reconcile_routes_every_trust_shim_once_and_retires_with_the_build() {
         let fx = Fx::new("reconcile");
@@ -2077,15 +1948,10 @@ mod tests {
         assert!(debris(&fx.layout).is_empty());
     }
 
-    /// THE INVARIANCE TABLE. Every question the store answers from a shim gets the same
-    /// answer from the plain and the routed form of every shim: `which`, `active_builds`,
-    /// gc's `live_builds` (and so `shim_claims`), `pending_stub_exists`, `resolve_shim` and
-    /// `shim_env_of`, the alias reconcile's "already right" (with the stale-shim prune
-    /// behind it — neither writes a byte over either form), and doctor's report, broken-
-    /// shim scan included — all but its (5f)(c) exec-root line, the one report line meant to
-    /// differ (a warn over plain shims, a note once they route), and its free-space line,
-    /// which reads the live volume: any build on the same disk between the two reports moved
-    /// it by a tenth of a GiB and failed this test on unchanged code.
+    /// Every question the store answers from a shim gets the same answer from its plain and
+    /// routed forms: `which`, `active_builds`, gc's `live_builds`, `pending_stub_exists`,
+    /// `resolve_shim`, `shim_env_of`, the alias reconcile's "already right", and doctor's
+    /// report (except its (5f)(c) exec-root and free-space lines).
     #[test]
     fn every_shim_reader_answers_the_same_for_the_routed_form() {
         let fx = Fx::new("invariance");
@@ -2178,10 +2044,9 @@ mod tests {
                 &mut out,
                 &mut err,
             );
-            // Doctor's (5f)(c) line is the one report line MEANT to differ — a warn over
-            // plain shims, a note once they route — so it is held apart from the rest; the
-            // free-space line reads the live volume, which other writers move, so it is
-            // dropped from both.
+            // Doctor's (5f)(c) line is meant to differ (a warn over plain shims, a note once
+            // they route), so it is held apart; the free-space line reads the live volume,
+            // which other writers move, so it is dropped from both.
             let (exec_root, report): (Vec<&str>, Vec<&str>) = std::str::from_utf8(&out)
                 .unwrap()
                 .lines()
@@ -2249,7 +2114,7 @@ mod tests {
                 &routed.7
             )
         );
-        // The one reader that is MEANT to differ: what `atpkg run` and the reroute exec.
+        // The one reader meant to differ: what `atpkg run` and the reroute exec.
         let root_bin = root_dir(&fx.layout, 8595).join("bin");
         for n in names {
             let expected = match crate::ops::which(&fx.layout, n) {
@@ -2262,12 +2127,10 @@ mod tests {
         }
     }
 
-    /// A ROOT LIVES EXACTLY AS LONG AS ITS BUILD, through the one function every discard
-    /// path goes through. `store::discard_build` takes `<prefix>/compat/<program>/<n>`
-    /// with the tree — renamed aside, no debris — and derives it from the build's own
-    /// `store/<program>/<n>` chain only: a stage scratch sibling, a path outside any
-    /// `store/`, a symlink planted at the root's name (unlinked, its target whole) and a
-    /// `compat/` that is itself a symlink (not walked at all) all leave foreign trees alone.
+    /// `store::discard_build` takes `<prefix>/compat/<program>/<n>` with its build, derived
+    /// from the build's own path only; a stage scratch sibling, a path outside `store/`, a
+    /// symlink at the root's name (unlinked, target whole) and a symlinked `compat/` leave
+    /// foreign trees alone.
     #[test]
     fn discard_build_takes_the_root_with_its_build_and_follows_nothing() {
         let fx = Fx::new("discard");
@@ -2331,10 +2194,8 @@ mod tests {
         );
     }
 
-    /// DOCTOR'S HALF OF THE SWEEP. [`strays`] names exactly what [`sweep`] then removes —
-    /// never dot debris, which may be a temp another atpkg is laying — and neither walks
-    /// through a `compat` that is a symlink: what it names is not atpkg's tree, whatever
-    /// sits beneath it. [`inspect`] answers `None` for a build that needs no root, and
+    /// [`strays`] names exactly what [`sweep`] then removes (never dot debris), neither walks
+    /// a symlinked `compat`, and [`inspect`] answers `None` for a build that needs no root and
     /// counts a shim whose target is gone as broken, not unrouted.
     #[test]
     fn strays_name_what_sweep_takes_and_neither_walks_a_symlinked_compat() {
@@ -2395,12 +2256,9 @@ mod tests {
         );
     }
 
-    /// GC TAKES THE ROOTS IT SHOULD, AND ONLY THOSE. Over a live trust 8595 with rollback
-    /// 8590 and a superseded 8589 — all three affected, all three rooted — `gc::run`
-    /// reclaims 8589 and its root in the same discard; the live and rollback roots stand
-    /// and the shims still route. An orphan root (no build), a symlink planted at a
-    /// numeric name (unlinked, its target whole) and dot debris are swept and REPORTED;
-    /// a second run reports nothing.
+    /// `gc::run` reclaims a superseded build with its root and keeps the live and rollback
+    /// roots routed; an orphan root, a symlink at a numeric name (target whole) and dot
+    /// debris are swept and reported once.
     #[test]
     fn gc_reclaims_a_superseded_root_and_sweeps_orphans_without_following_links() {
         let fx = Fx::new("gc");
@@ -2451,10 +2309,9 @@ mod tests {
         assert!(again.swept_exec_roots.is_empty() && again.reclaimed.is_empty());
     }
 
-    /// UNINSTALL TAKES `compat/`. `ops::uninstall("trust")` removes the shims, the store
-    /// tree and `compat/trust` (another program's `compat/` entry stays); `remove_all` —
-    /// `uninstall --all`'s half — removes `compat/` whole, and unlinks a symlink planted at
-    /// its name without following it.
+    /// Uninstall takes `compat/`: `ops::uninstall("trust")` removes the shims, the store tree
+    /// and `compat/trust` (another program's `compat/` entry stays); `remove_all` removes
+    /// `compat/` whole, unlinking a symlink at its name without following it.
     #[test]
     fn uninstall_removes_the_programs_roots_and_uninstall_all_removes_compat() {
         let fx = Fx::new("uninstall");
@@ -2494,11 +2351,8 @@ mod tests {
         );
     }
 
-    /// `ops::exec_path` — what `atpkg run` and the `clippy` reroute exec — is the root's
-    /// file exactly when [`route_for_shim`] answers for the shim: the store path with no
-    /// root, the root's clone once one stands, the store path again when the root's file
-    /// holds other bytes or its marker is gone, and the store path for a shim of another
-    /// program or a name with no shim at all.
+    /// `ops::exec_path` (what `atpkg run` and the `clippy` reroute exec) is the root's file
+    /// exactly when [`route_for_shim`] answers for the shim, and the store path otherwise.
     #[test]
     fn exec_path_takes_the_root_only_when_the_shim_routes() {
         let fx = Fx::new("exec-path");
@@ -2546,12 +2400,9 @@ mod tests {
         );
     }
 
-    /// THE SHIM WRITERS LAY THE ROOT FIRST. `activate::install_tools` on an affected build
-    /// lays `compat/trust/<n>` before it renders, so the shims it writes route on the first
-    /// lay — no reconcile needed; the alias reconcile re-lays a plain `alab-` alias an older
-    /// client left (target and environment already right, bytes not), then writes nothing
-    /// on a second run. On a build that needs no root, `install_tools` puts NOTHING on disk
-    /// under `compat/` and lays today's shims byte for byte.
+    /// `activate::install_tools` lays an affected build's root before it renders, so its
+    /// shims route on the first lay; the alias reconcile re-lays an old plain `alab-` alias
+    /// once. On a build that needs no root nothing goes under `compat/`.
     #[test]
     fn install_lays_the_root_before_the_shims_and_the_alias_reconcile_routes_old_aliases() {
         let fx = Fx::new("install");
@@ -2609,7 +2460,7 @@ mod tests {
         );
         assert_eq!(stamps(&build), store_before);
 
-        // A Trust-names-only build: nothing under compat/, today's shims exactly.
+        // A Trust-names-only build: nothing under compat/, plain shims exactly.
         let fresh = Fx::new("install-plain");
         let plain = fresh.build(8596, Shape::NamesOnly);
         crate::activate::install_tools(
@@ -2638,8 +2489,8 @@ mod tests {
     }
 
     /// A root that cannot be laid costs the install nothing: `install_tools` still lays
-    /// every shim (plain, running the store path as before), returns `Ok`, and leaves no
-    /// committed root and no temp — the pass's reconcile then reports the refusal.
+    /// every shim (plain, on the store path), returns `Ok`, and leaves no committed root and
+    /// no temp; the pass's reconcile then reports the refusal.
     #[test]
     fn install_over_a_root_that_cannot_be_laid_lays_plain_shims() {
         if crate::platform::our_uid() == 0 {
@@ -2674,14 +2525,9 @@ mod tests {
         assert!(report.routed.is_empty(), "{report:?}");
     }
 
-    /// A READ THAT FAILS PROVES NOTHING. With the store `bin/rustc` unreadable under a
-    /// standing, routed root, [`needs_root`] is an error — not "needs none" — and nothing
-    /// acts on it destructively: the reconcile at either depth keeps the root, re-lays no
-    /// shim, moves no stamp in the store, the root or `bin/`, and names the failed read;
-    /// the sweep and doctor's strays keep the root; [`ensure_root`] refuses and leaves it;
-    /// [`inspect`] answers `Err`; the shim still routes. Readable again, a reconcile finds
-    /// nothing to do. The failure mode this pins sweeps the root, un-routes every shim and
-    /// moves every store inode twice.
+    /// A failed read proves nothing: with the store `bin/rustc` unreadable under a routed
+    /// root, no reconcile, sweep, [`strays`] or [`ensure_root`] removes the root or re-lays a
+    /// shim, [`inspect`] answers `Err`, and the shim still routes. Readable again, nothing to do.
     #[test]
     fn a_build_that_cannot_be_read_keeps_its_root_and_its_routes() {
         if crate::platform::our_uid() == 0 {
@@ -2737,21 +2583,17 @@ mod tests {
         let read = needs_root(&build);
         restore_mode(&trustc, &trustc_mode);
         assert!(read.is_err(), "{read:?}");
-        // The fixture proves its own precondition. Both chmod round-trips above must leave
-        // the store exactly as they found it: the view's `bin/rustc` and `bin/trustc` are
-        // clones of the store's `bin/trustc`, and a clone is identified by length, permission
-        // bits and mtime, so a restore that invented a mode leaves the root correctly stale,
-        // and every `!changed()` below would read as the defect this test pins.
+        // The fixture proves its own precondition: both chmod round-trips leave the store as
+        // they found it (a clone is identified by length, mode and mtime, so an invented mode
+        // would leave the root stale and read as the defect this test pins).
         assert_eq!(
             root_first_mismatch(&build, &root_dir(&fx.layout, 8595), Depth::Deep),
             None,
             "the fixture's chmod round-trip, not a reconcile, moved the store"
         );
-        // A `store/trust` that cannot be searched: the build directory's own `lstat` fails,
-        // which is no more proof that the build is GONE than a failed read is proof that it
-        // needs none. The sweep and strays keep the root, inspect answers `Err`, nothing
-        // under `compat/` moves, and once searchable again nothing is re-laid (never read as
-        // `BuildGone`, removed, and re-laid on the next pass).
+        // A `store/trust` that cannot be searched: a failed `lstat` of the build is no proof
+        // it is gone. The sweep and strays keep the root, inspect answers `Err`, nothing
+        // under `compat/` moves, and once searchable again nothing is re-laid.
         let programs = build.parent().unwrap().to_path_buf();
         let mode = std::fs::symlink_metadata(&programs).unwrap().permissions();
         let before = stamps(&compat_dir(&fx.layout));
@@ -2776,18 +2618,10 @@ mod tests {
         assert!(!healed.changed(), "{healed:?}");
     }
 
-    /// NOTHING UNDER A LINKED `compat` IS ATPKG'S. With `<prefix>/compat`, or
-    /// `<prefix>/compat/trust`, a symlink to a directory that holds a root-named tree:
-    ///
-    /// * a build that needs no root answers `Plain` from [`ensure_root`] and from a
-    ///   [`reconcile`] and removes NOTHING behind the link (a removal must not follow it out
-    ///   of the prefix);
-    /// * an affected build whose root stands whole behind the link is REFUSED — not
-    ///   `Present` — and the reconcile says so, because [`route_for_shim`] (which requires
-    ///   both to be real directories) answers `None` through it and [`inspect`] reads it as
-    ///   [`RootState::Blocked`]; every refusal names the link and the manual fix, and the
-    ///   tree behind it is left whole;
-    /// * a plain FILE at `compat` is blocked the same way, worded as a file.
+    /// Nothing under a linked `compat` or `compat/trust` is atpkg's: a build that needs no
+    /// root answers `Plain` and removes nothing behind the link; an affected build's whole
+    /// root behind it is refused (never `Present`, routed, or inspected as standing), each
+    /// refusal naming the link and the manual fix; a plain file at `compat` blocks the same.
     #[test]
     fn nothing_is_removed_or_trusted_behind_a_linked_compat() {
         let none = crate::shim_env::ShimEnv::NONE;
@@ -2851,8 +2685,8 @@ mod tests {
                 RootState::Blocked(expected.clone()),
                 "{linked}"
             );
-            // The refusal names the link and the manual fix — never "update directory is a
-            // symlink; refusing" beside a promise that `aterm pkg repair` retries.
+            // The refusal names the link and the manual fix, never a promise that `repair`
+            // retries.
             let refused = ensure_root(&fx.layout, &build, Depth::Shallow).unwrap_err();
             assert_eq!(blocked_by(&refused), Some(&expected), "{linked}");
             let what = format!(
@@ -2922,12 +2756,8 @@ mod tests {
         );
     }
 
-    /// A STOCK-NAME COPY IS NOT AN UNROUTED SHIM. A build that ships `bin/rustdoc` as a copy
-    /// beside `trustdoc`, exposed as a shim: the root presents `rustdoc` as `trustdoc`'s
-    /// inode, so the writer never routes that shim, and doctor's [`inspect`] does not count
-    /// it — the reconcile routes `tippy`, a second reconcile writes nothing, and the root
-    /// reads as whole with nothing unrouted (the count had kept a warn `repair` could
-    /// never clear).
+    /// A shim to a stock-name copy (`bin/rustdoc` beside `trustdoc`) is never routed and
+    /// never counted unrouted; `tippy` routes, and a second reconcile writes nothing.
     #[test]
     fn a_stock_name_copy_is_neither_routed_nor_counted_unrouted() {
         let fx = Fx::new("stock-copy");
@@ -2947,10 +2777,8 @@ mod tests {
             (vec!["tippy".to_string()], Vec::<String>::new())
         );
 
-        // A stock name that is a HARD LINK of its Trust tool is that tool's inode, which
-        // the root presents under the stock name — so the writer routes its shim, and a
-        // plain one is unrouted until a pass re-renders it. Skipped by name alone, doctor
-        // would read healthy while the next reconcile still routed it.
+        // A stock name hard-linked to its Trust tool is not a copy: the writer routes its
+        // shim, so a plain one is unrouted until a pass re-renders it.
         let fx = Fx::new("stock-link");
         let build = fx.build(8595, Shape::Copy);
         let bin = build.join("bin");
@@ -2977,14 +2805,9 @@ mod tests {
         assert!(i.unrouted.is_empty(), "{:?}", i.unrouted);
     }
 
-    /// A REBUILD BESIDE `bin/` MOVES NO `bin/` INODE. When the standing root's `bin/` still
-    /// matches the build and only a directory beside it differs — a `.DS_Store` under
-    /// `share/` at `Deep`, a driver dylib at the top of `lib/` replaced by other bytes at
-    /// `Shallow` — the root is rebuilt (`Built`, the stray gone, the dylib a clone of the
-    /// store's again), its live `bin/` directory is moved into the new tree (the same
-    /// directory inode, so a tippy running from the root keeps its files), and no store
-    /// `bin/` file's link count or ctime moved. A mismatch inside `bin/` itself still lays a
-    /// fresh `bin/`.
+    /// When only a directory beside the standing root's matching `bin/` differs (a
+    /// `.DS_Store` under `share/`, a replaced dylib in `lib/`), the rebuild carries the live
+    /// `bin/` over and moves no store `bin/` inode; a mismatch inside `bin/` lays a fresh one.
     #[test]
     fn a_rebuild_beside_bin_moves_no_bin_inode() {
         let fx = Fx::new("carry-bin");

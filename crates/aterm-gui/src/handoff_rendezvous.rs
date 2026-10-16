@@ -38,8 +38,9 @@
 //!
 //! Darwin's `MAX_SUN_PATH` is 103 and that name is 87 bytes before its
 //! directory. Under the per-user control directory (`$HOME/Library/Application
-//! Support/aterm`) that left 16 bytes for `$HOME`: `/Users//example` fit with three
-//! to spare and `/Users//andrewyates` — i.e. macOS's default short name for most
+//! Support/aterm`) that left 16 bytes for `$HOME`: a six-letter short name
+//! (`/Users//abcdef`) fit with three to spare and a first and last name run
+//! together (`/Users//firstlastname`) — i.e. macOS's default short name for most
 //! people — did not, so most Macs silently took the fork lane the whole lane was
 //! built to replace (2026-08-19 review). The socket therefore lives in a SHORT
 //! per-uid private directory, [`rendezvous_dir`]: `$TMPDIR/aterm`, where `$TMPDIR`
@@ -279,11 +280,13 @@ use std::time::{Duration, Instant};
 
 use aterm_uds::{CtlListener, CtlStream, fdpass};
 
+use crate::handoff_env::HandoffName;
+
 /// The rendezvous socket path published to the successor. Its absence is what
 /// makes the fork lane the fork lane, with no version byte anywhere.
-pub(crate) const ENV_RENDEZVOUS: &str = crate::seamless::ENV_RENDEZVOUS;
+pub(crate) const ENV_RENDEZVOUS: HandoffName = crate::seamless::ENV_RENDEZVOUS;
 /// The claim secret published to the successor.
-pub(crate) const ENV_CLAIM: &str = crate::seamless::ENV_CLAIM;
+pub(crate) const ENV_CLAIM: HandoffName = crate::seamless::ENV_CLAIM;
 
 /// Random bytes in the claim secret, and so half its hex length. The same width
 /// `control_auth` mints capability tokens at: the secret only has to survive one
@@ -311,7 +314,7 @@ const GRANT_CONTINUATION_LEN: usize = GRANT_CONTINUATION_MAGIC.len() + 1;
 /// capabilities, a comma-separated list. Published only to a candidate whose
 /// verified bundle declares them (`ATermHandoffGrantChunks`); consumed by
 /// [`claim_incoming`].
-pub(crate) const ENV_GRANT_CAPS: &str = "ATERM_HANDOFF_GRANT_CAPS";
+pub(crate) const ENV_GRANT_CAPS: HandoffName = HandoffName::new("ATERM_HANDOFF_GRANT_CAPS");
 /// The capability token for the chunked grant — also the value of the bundle's
 /// `ATermHandoffGrantChunks` key (`aterm_update::HANDOFF_GRANT_CHUNKS_TOKEN`).
 pub(crate) const GRANT_CAPS_CHUNKS: &str = "chunks1";
@@ -556,13 +559,13 @@ pub(crate) enum RendezvousError {
     /// exactly the moment someone is reading it to find out what happened. This
     /// variant says which half arrived and which did not.
     HalfRendezvous {
-        present: &'static str,
-        missing: &'static str,
+        present: HandoffName,
+        missing: HandoffName,
     },
     /// SUCCESSOR SIDE: a rendezvous variable is present but unusable. Present
     /// and malformed is corruption, not absence, so it must not degrade into
     /// "no handoff" and start a fresh window over a parent's live sessions.
-    Env(&'static str),
+    Env(HandoffName),
     /// SUCCESSOR SIDE: `connect` failed — most often because the parent already
     /// gave up and unlinked the socket, which is exactly how a late dial is
     /// meant to fail.
@@ -2296,7 +2299,7 @@ pub(crate) fn rendezvous_present(env: &crate::handoff_env::HandoffEnv) -> bool {
 /// `fd` (descriptor numbers, the fork lane's). Consumed once at boot. A launched
 /// attempt that falls back to the fork lane keeps its device-term proof, so the
 /// successor must not infer the term from how the descriptors arrived.
-pub(crate) const ENV_PROOF_TERM: &str = "ATERM_HANDOFF_PROOF_TERM";
+pub(crate) const ENV_PROOF_TERM: HandoffName = HandoffName::new("ATERM_HANDOFF_PROOF_TERM");
 
 /// Consume [`ENV_PROOF_TERM`]: `Some(true)` for device terms, `Some(false)` for fd
 /// numbers, `None` when the parent said nothing (an older parent — infer from the
@@ -2574,7 +2577,8 @@ fn forget_park_raise() {
 /// told so, and hands an older successor of its own what it would have held
 /// without it. Read by [`adopt_carried_launcher_limit`]; a successor that
 /// predates it ignores it.
-pub(crate) const ENV_PARK_RAISED_FROM: &str = "ATERM_HANDOFF_PARK_RAISED_FROM";
+pub(crate) const ENV_PARK_RAISED_FROM: HandoffName =
+    HandoffName::new("ATERM_HANDOFF_PARK_RAISED_FROM");
 
 /// The launch variable in which a FORK-LANE parent tells its successor the
 /// soft descriptor limit its shells are owed (round seven, item 107): the
@@ -2582,7 +2586,8 @@ pub(crate) const ENV_PARK_RAISED_FROM: &str = "ATERM_HANDOFF_PARK_RAISED_FROM";
 /// successor inherits the parent's RAISED soft limit and never claims, so
 /// without this every tab it opened got 4096 back — the launcher's 256 held
 /// for one hop only. Read by [`adopt_carried_launcher_limit`].
-pub(crate) const ENV_LAUNCHER_NOFILE: &str = "ATERM_HANDOFF_LAUNCHER_NOFILE";
+pub(crate) const ENV_LAUNCHER_NOFILE: HandoffName =
+    HandoffName::new("ATERM_HANDOFF_LAUNCHER_NOFILE");
 
 /// Name [`ENV_LAUNCHER_NOFILE`] on a successor's `command` whose image keeps
 /// this process's soft descriptor limit — the fork lane's child and the cold
@@ -2599,12 +2604,16 @@ pub(crate) const ENV_LAUNCHER_NOFILE: &str = "ATERM_HANDOFF_LAUNCHER_NOFILE";
 /// A PARK'S RAISE IS NAMED BESIDE IT (round eight's second review of #3,
 /// [`ENV_PARK_RAISED_FROM`]): the successor keeps that raise too, and must
 /// know it is one no successor inherited before round eight.
+#[expect(
+    clippy::disallowed_types,
+    reason = "the update successor's raw Command: it hands over exactly its own descriptors, which a strip at the exec would undo"
+)]
 pub(crate) fn carry_launcher_limit(command: &mut std::process::Command) {
     if let Some(soft) = launcher_soft_descriptor_limit() {
-        command.env(ENV_LAUNCHER_NOFILE, soft.to_string());
+        command.envs([ENV_LAUNCHER_NOFILE.pair(soft.to_string())]);
     }
     if let Some(from) = park_raised_from() {
-        command.env(ENV_PARK_RAISED_FROM, from.to_string());
+        command.envs([ENV_PARK_RAISED_FROM.pair(from.to_string())]);
     }
 }
 
@@ -2881,6 +2890,10 @@ impl OlderImageLimit {
 /// leaves the child the raise it inherits, and says so here; the child looks
 /// at its own table again just before its `exec`, and lowers nothing over a
 /// descriptor that appeared since.
+#[expect(
+    clippy::disallowed_types,
+    reason = "the update successor's raw Command: it hands over exactly its own descriptors, which a strip at the exec would undo"
+)]
 pub(crate) fn start_older_image_at_its_limit(
     command: &mut std::process::Command,
     target_build: u64,
@@ -4609,7 +4622,7 @@ mod tests {
         ] {
             let said = half.to_string();
             assert!(
-                said.contains(ENV_RENDEZVOUS) && said.contains(ENV_CLAIM),
+                said.contains(ENV_RENDEZVOUS.name()) && said.contains(ENV_CLAIM.name()),
                 "the message names both halves so a reader can see which arrived: {said}"
             );
             assert!(
@@ -5409,7 +5422,7 @@ mod tests {
             image
                 .command()
                 .get_envs()
-                .any(|(key, value)| key == ENV_LAUNCHER_NOFILE
+                .any(|(key, value)| key == ENV_LAUNCHER_NOFILE.name()
                     && value == Some(std::ffi::OsStr::new(&from.to_string()))),
             "the command names the launcher's {from}"
         );
@@ -5675,7 +5688,7 @@ mod tests {
             image
                 .command()
                 .get_envs()
-                .any(|(key, value)| key == ENV_PARK_RAISED_FROM
+                .any(|(key, value)| key == ENV_PARK_RAISED_FROM.name()
                     && value == Some(std::ffi::OsStr::new(&launchd.to_string()))),
             "the command names the park's raise from {launchd}"
         );

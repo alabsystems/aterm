@@ -1,29 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-//! Conformance (Tier-1): the real `Terminal::cell_frame` + `damage_epoch` /
-//! `take_damage` path obeys the derived snapshot-seq protocol.
-//!
-//! `aterm_spec::derive::read_image_seq_model()` is the drift-free model of the
-//! read_image snapshot-seq contract: monotone seq, snapshot internal-consistency
-//! (no torn read), staleness-detectable — `ty` PROVES it at `Buggy=0` and CATCHES
-//! a torn read at `Buggy=1` (in `aterm-spec/tests/derived_ring_ty.rs`). This binds
-//! that property to the real engine snapshot:
-//!
-//!   * a `cell_frame` snapshot is stamped with `damage_epoch()` (its `snapshot_seq`)
-//!     captured under the one lock — the "value of seq" at snapshot time;
-//!   * subsequent `process()` advances the engine (the live `damage_epoch()` grows)
-//!     but does not mutate the already-emitted snapshot's `snapshot_seq` or its
-//!     rendered cells (no torn read / snapshot isolation);
-//!   * the consumer can always tell its snapshot is behind (`damage_epoch() >
-//!     snap.snapshot_seq`), i.e. staleness is detectable.
-//!
-//! The observed state is projected onto the model's `<<epoch, snapped, snap_seq,
-//! torn>>` and checked against its actual invariants. A negative control (a forced
-//! retro-mutation of the captured seq) is shown to violate `NoTornRead`, so the
-//! pass is never vacuous. The run-ahead stamp (`SeqIsStaleOrCurrent`'s mutant) is
-//! driven on the real engine: a host bump, then a real epoch advance that
-//! collides with it. Pure Rust + real engine code, so it always runs.
+//! Conformance (Tier-1): the real `Terminal::cell_frame` + `damage_epoch` / `take_damage`
+//! path obeys the derived snapshot-seq protocol (`read_image_seq_model()`, proved and
+//! refuted by `ty` in `aterm-spec/tests/derived_ring_ty.rs`): a snapshot is stamped with
+//! `damage_epoch()` under the one lock, later `process()` grows the live epoch without
+//! touching the held snapshot (no torn read), and a consumer can always tell its snapshot
+//! is behind (`damage_epoch() > snap.snapshot_seq`).
 
 use std::collections::BTreeMap;
 
@@ -37,45 +20,38 @@ fn real_cell_frame_seq_is_monotone_isolated_and_stale_detectable() {
     let (rows, cols) = (6usize, 24usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
 
-    // Some net-new damage, then advance the engine's monotone epoch by observing
-    // it (the latch bumps once per damage session) and consuming the damage so the
-    // next write opens a fresh session — exactly the gui's lock-held discipline.
+    // Net-new damage, observed (the latch bumps once per damage session) and consumed so
+    // the next write opens a fresh session, as the GUI does under the lock.
     term.process(b"hello");
     let _ = term.damage_epoch();
     term.take_damage();
     term.process(b" world");
 
-    // read_image: capture the snapshot. Its `snapshot_seq` is the engine's
-    // `damage_epoch` at snapshot time, filled under the same (here, single-thread)
-    // lock as the cells — the canonical value-of-seq for this frame.
+    // read_image: `snapshot_seq` is the engine's `damage_epoch`, filled under the same
+    // lock as the cells.
     let snap = term.cell_frame(rows, cols);
     let snap_seq = snap.snapshot_seq;
     let snap_cells = snap.cells.clone();
-    // The live epoch equals the captured seq right after the snapshot (the engine
-    // is idempotent within a damage session): the snapshot is current, not stale.
+    // The live epoch equals the captured seq right after the snapshot: it is current.
     assert_eq!(
         term.damage_epoch(),
         snap_seq,
         "snapshot_seq must equal the live damage_epoch at snapshot time"
     );
 
-    // A later write advances the engine. Consume the prior damage first so this is
-    // net-new and the epoch genuinely advances (a new damage session).
+    // A later write, net-new after consuming the prior damage, advances the epoch.
     term.take_damage();
     term.process(b"\r\nmore output on a new line");
     let live_after = term.damage_epoch();
 
-    // 1. monotone seq + STALENESS-DETECTABLE: the live epoch advanced past the held
-    //    snapshot, so a consumer comparing them sees its snapshot is behind.
+    // 1. Monotone seq, staleness detectable: the live epoch passed the held snapshot.
     assert!(
         live_after > snap_seq,
         "later damage must advance the live epoch past the captured snapshot_seq \
          (monotone seq; staleness is observable as live > snap)"
     );
 
-    // 2. snapshot INTERNAL-CONSISTENCY / no torn read: the already-emitted snapshot
-    //    is frozen — neither its seq stamp nor its rendered cells changed despite
-    //    the later writes.
+    // 2. No torn read: the emitted snapshot's seq stamp and cells are frozen.
     assert_eq!(
         snap.snapshot_seq, snap_seq,
         "held snapshot's seq must not change after later writes"
@@ -85,9 +61,7 @@ fn real_cell_frame_seq_is_monotone_isolated_and_stale_detectable() {
         "held snapshot's cells must not change after later writes"
     );
 
-    // Project the observed outcome onto the model vars and check its real
-    // invariants. `snapped = 1` (a snapshot was taken), `torn = 0` (no leak),
-    // `epoch = live_after`, `snap_seq = snap_seq`.
+    // Project onto the model vars and check its invariants.
     let observed: BTreeMap<&'static str, i64> = [
         ("epoch", i64::try_from(live_after).expect("epoch fits i64")),
         ("snapped", 1),
@@ -108,9 +82,8 @@ fn real_cell_frame_seq_is_monotone_isolated_and_stale_detectable() {
         "the real monotone/staleness outcome must satisfy SeqIsStaleOrCurrent"
     );
 
-    // Negative control (non-vacuity): a torn read — the captured seq retro-mutated
-    // to the later epoch — must violate the model's NoTornRead invariant. If this
-    // ever passed, the invariant would be trivially true and the above pass empty.
+    // Negative control: a torn read (the captured seq retro-mutated to the later epoch)
+    // violates NoTornRead.
     let torn_state: BTreeMap<&'static str, i64> = [
         ("epoch", i64::try_from(live_after).expect("epoch fits i64")),
         ("snapped", 1),
@@ -140,12 +113,9 @@ fn seq_state(epoch: u64, snap_seq: u64) -> BTreeMap<&'static str, i64> {
     .collect()
 }
 
-/// The model's `snap_seq` is the engine stamp (`engine_fill_seq`), and its
-/// `Buggy = 1` run-ahead capture is a host-bumped `snapshot_seq` read in its
-/// place. The engine cannot produce a run-ahead stamp itself (the epoch latch only
-/// lags), so this drives the one real way a scratch gets one — the ghost-paint
-/// bump every host mutator performs after writing cells — and then the real
-/// engine advance that turns it into a collision.
+/// The model's `snap_seq` is the engine stamp (`engine_fill_seq`); its `Buggy = 1`
+/// run-ahead capture is a host-bumped `snapshot_seq` (the ghost-paint bump a host mutator
+/// performs after writing cells) read in its place. The engine itself only lags.
 #[test]
 fn host_bumped_seq_is_the_run_ahead_stamp_the_engine_stamp_never_is() {
     let m = read_image_seq_model();
@@ -187,9 +157,8 @@ fn host_bumped_seq_is_the_run_ahead_stamp_the_engine_stamp_never_is() {
     ));
 }
 
-/// A no-op `process()` (input that leaves the grid undamaged) does not advance the
-/// epoch, so a held snapshot stays current — the model's `snap_seq <= epoch` holds
-/// with equality and no false staleness is reported.
+/// A no-op `process()` (input that leaves the grid undamaged) does not advance the epoch,
+/// so a held snapshot stays current: no false staleness.
 #[test]
 fn noop_process_does_not_advance_snapshot_seq() {
     let m = read_image_seq_model();
@@ -201,8 +170,7 @@ fn noop_process_does_not_advance_snapshot_seq() {
     let snap_seq = snap.snapshot_seq;
     term.take_damage();
 
-    // Feed bytes that don't damage the grid (a bare ESC that completes nothing
-    // visible is consumed without a cell change). The epoch must not advance.
+    // A bare ESC completes nothing visible: no cell change, no epoch advance.
     term.process(b"\x1b");
     let live_after = term.damage_epoch();
     assert_eq!(

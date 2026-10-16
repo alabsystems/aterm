@@ -16,40 +16,29 @@ const FINAL_SIGMA: char = '\u{03C2}';
 /// Greek small letter sigma (U+03C3).
 const SIGMA: char = '\u{03C3}';
 
-/// Lowercase a single `char` with the shared context-free routine used by
-/// every case-insensitive search site (query key, indexed trigrams, per-line
-/// scan buffer, and [`LowerByteMap`]).
+/// Lowercase one `char` with the context-free fold every case-insensitive search
+/// site shares (query key, indexed trigrams, per-line scan buffer, [`LowerByteMap`]).
 ///
-/// Unlike `str::to_lowercase`, this is purely per-character (no contextual
-/// Final_Sigma rule), and it additionally folds Greek final sigma U+03C2 → σ
-/// U+03C3 so that capital Σ, medial σ, and word-final ς all collapse to a
-/// single canonical form. Without this, `str::to_lowercase` (contextual) and
-/// `char::to_lowercase` (non-contextual) disagree on a word-final Σ, so the
-/// trigram index, the query key, and the scan buffer end up byte-divergent and
-/// case-insensitive search silently misses every sigma match.
-///
-/// Both ς and σ encode to 2 UTF-8 bytes, so folding never changes a
-/// character's lowered byte length — `LowerByteMap` offsets stay aligned.
+/// Per character, unlike the contextual `str::to_lowercase`, and it also folds final
+/// sigma ς (U+03C2) to σ (U+03C3), so Σ, σ and ς collapse to one form; otherwise the
+/// index, query key and scan buffer disagree on a word-final Σ and miss sigma
+/// matches. Both encode to 2 bytes, so [`LowerByteMap`] offsets stay aligned.
 pub(crate) fn lower_fold_char(c: char) -> impl Iterator<Item = char> {
     c.to_lowercase()
         .map(|lc| if lc == FINAL_SIGMA { SIGMA } else { lc })
 }
 
-/// How much work lowering `text` actually needs, so callers can skip or
-/// specialize the fold instead of always materializing a lowered `String`.
+/// How much work lowering `text` needs, so callers can skip or specialize the fold.
 ///
-/// This is the single home of the predicate the trigram
-/// index/removal/rebuild passes share: they MUST agree on when the lowered
-/// pass ran, or removal double-deletes trigrams the insert never added and the
-/// posting lists corrupt.
+/// The one predicate the trigram index, removal and rebuild passes share: they must
+/// agree on when the lowered pass ran, or removal deletes trigrams the insert never
+/// added and the posting lists corrupt.
 pub(crate) enum LowerNeed {
     /// Lowering is the identity (pure ASCII, no uppercase): the lowered
     /// trigrams equal the original-case ones, so the pass can be skipped.
     None,
-    /// Pure ASCII with at least one uppercase letter: lowering is exactly
-    /// per-byte `to_ascii_lowercase` and never changes byte length, so the
-    /// lowered trigram of a window is that window's bytes lowercased in place
-    /// — no buffer required.
+    /// Pure ASCII with an uppercase letter: lowering is per-byte `to_ascii_lowercase`,
+    /// so a window's lowered trigram is its bytes lowercased in place.
     Ascii,
     /// Non-ASCII: needs the real [`lower_fold`] (byte lengths can change).
     Unicode,
@@ -67,17 +56,12 @@ pub(crate) fn lower_need(text: &str) -> LowerNeed {
     }
 }
 
-/// Lowercase + sigma-fold `s` into `out` (cleared first), so a caller with a
-/// per-line loop can pay for the buffer's capacity ONCE instead of allocating
-/// and freeing a fresh `String` per line.
-///
-/// Shared by the query key and the trigram index/removal/rebuild passes so
-/// that index, query, and per-line scan are byte-identical.
+/// Lowercase and sigma-fold `s` into `out` (cleared first), so a per-line loop reuses
+/// one buffer. Shared by the query key and the trigram passes, so index, query and
+/// scan agree byte for byte.
 pub(crate) fn lower_fold_into(s: &str, out: &mut String) {
-    // Spelled as an explicit push loop (not `.collect()`/`extend`) because the
-    // Trust L0 gate's bulk-allocation recognizer cannot derive an element count
-    // for the flat_map collect and refuses to prove the allocation bounded;
-    // incremental `push` growth carries the bounds instead. Identical output.
+    // A push loop, not `collect`/`extend`: the Trust L0 gate cannot bound the
+    // flat_map collect's allocation, but carries incremental `push` growth.
     out.clear();
     for c in s.chars() {
         for lc in lower_fold_char(c) {
@@ -86,21 +70,16 @@ pub(crate) fn lower_fold_into(s: &str, out: &mut String) {
     }
 }
 
-/// Lowercase + sigma-fold an entire string using [`lower_fold_char`].
-///
-/// Thin wrapper over [`lower_fold_into`] so there is one lowering routine.
+/// Lowercase and sigma-fold a whole string (see [`lower_fold_into`]).
 pub(crate) fn lower_fold(s: &str) -> String {
     let mut out = String::new();
     lower_fold_into(s, &mut out);
     out
 }
 
-/// Convert a byte offset to a display column (O(G) per call): the cursor
-/// column after the clusters that start before `byte_offset`.
-///
-/// Reference implementation retained for equivalence testing against
-/// [`ColumnMap::end_column`]. Production code uses `ColumnMap` for
-/// O(log G) lookups (#5672).
+/// Convert a byte offset to a display column in O(G): the cursor column after the
+/// clusters that start before `byte_offset`. Test reference for
+/// `ColumnMap::end_column`.
 #[cfg(test)]
 #[must_use]
 pub fn byte_to_column(s: &str, byte_offset: usize) -> usize {
@@ -116,16 +95,9 @@ pub fn byte_to_column(s: &str, byte_offset: usize) -> usize {
     column
 }
 
-/// Display columns `text` occupies, in the SAME column frame every
-/// [`SearchMatch`](crate::SearchMatch) column is measured in (a wide glyph
-/// counts 2, a combining mark 0).
-///
-/// Exported because the terminal's search caller JOINS a soft-wrapped run of
-/// grid rows into the one logical line the user sees before indexing it, and
-/// has to pad each continued row back out to the grid's width first. A caller
-/// that counted that padding with its OWN width routine would put every column
-/// past the first wrap boundary on the wrong cell, so the padding is counted by
-/// the engine's counter, not beside it.
+/// Display columns `text` occupies, in the column frame every
+/// [`SearchMatch`](crate::SearchMatch) is measured in (a wide glyph counts 2, a
+/// combining mark 0).
 #[must_use]
 pub fn display_columns(text: &str) -> usize {
     display_columns_with(text, AmbiguousWidth::Single)
@@ -146,13 +118,9 @@ pub fn display_columns_with(text: &str, ambiguous: AmbiguousWidth) -> usize {
     aterm_grapheme::str_grid_columns_with(text, ambiguous)
 }
 
-/// Map a byte offset in lowercased text back to the corresponding byte offset
-/// in the original text.
-///
-/// `to_lowercase()` can change byte lengths (e.g. U+212A Kelvin Sign: 3 bytes
-/// → 1-byte 'k'), so searching in the lowered text and using byte offsets
-/// directly on the original produces wrong columns. This mapping tracks
-/// per-char byte expansion/contraction.
+/// Map a byte offset in lowercased text back to the original text: the test
+/// reference for [`LowerByteMap`]. Lowering can change byte lengths (U+212A Kelvin
+/// Sign: 3 bytes to a 1-byte `k`).
 #[cfg(test)]
 pub(crate) fn map_lower_byte_to_original(original: &str, lower_byte: usize) -> usize {
     let mut orig_offset = 0usize;
@@ -171,34 +139,18 @@ pub(crate) fn map_lower_byte_to_original(original: &str, lower_byte: usize) -> u
     orig_offset
 }
 
-/// Precomputed byte-offset-to-column map for a single line.
+/// Byte-offset-to-column map for one line, cached beside the line's text in
+/// `SearchIndex` so repeated queries reuse it. Built in O(G) and looked up in
+/// O(log R) by binary search over its R runs.
 ///
-/// Built once per line in O(G) where G is the grapheme count, then enables
-/// O(log R) column lookups via binary search over its R runs. This replaces
-/// the O(G)-per-call `byte_to_column` pattern that causes O(M × G) total cost
-/// when there are M matches in a line.
-///
-/// Column maps are cached in `SearchIndex` alongside line text so that
-/// repeated searches reuse the precomputed map instead of rebuilding it
-/// for every query (#7373).
-///
-/// # Run-length encoded (ruling 2026-10-11, r15 content-3)
-///
-/// The map is kept for every indexed line, and one entry of three `usize` per
-/// grapheme, in a `Vec` grown by doubling, made a non-ASCII line's map 10-25
-/// times its text: an index of 100,000 rows of CJK held 370 MiB, of
-/// decomposed accents 663 MiB, and one box-drawing glyph in an otherwise ASCII
-/// agent row cost 3.4 KB where the plain row cost 389 B. The graphemes of a
-/// line repeat one shape (every ideograph 3 bytes and 2 columns, every
-/// `e\u{301}` 3 bytes and 1 column), so the map stores RUNS of graphemes
-/// that advance by the same bytes and columns, in an exactly sized slice: a
-/// row of one script is one run, the agent row two. Decided by measurement
-/// against the lazy alternative (build a map per hit line at query time):
-/// runs keep every query's lookups where they were, while a lazy map re-walks
-/// every hit line on every query. Offsets and columns are `u32`; a line past
-/// 4 GiB of text or 4 Gi columns (only a soft-wrapped run of millions of rows
-/// joined into one line could be) saturates there, so its columns past that
-/// point read as the last one instead of wrapping.
+/// Every indexed line keeps one, so it stores runs of graphemes that advance by the
+/// same bytes and columns (every ideograph 3 bytes and 2 columns, every `e\u{301}` 3
+/// bytes and 1 column) in an exactly sized slice: a row of one script is one run.
+/// One entry per grapheme made a non-ASCII line's map 10-25 times its text, and a
+/// map built per hit line at query time would re-walk every hit line on every query.
+/// Offsets and columns are `u32`; a line past 4 GiB of text or 4 Gi columns (only a
+/// soft-wrapped run of millions of rows joined into one line) saturates there, so
+/// its later columns read as the last one instead of wrapping.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ColumnMap {
     /// The graphemes, in byte order, as runs of a repeating shape. Empty for
@@ -361,28 +313,22 @@ impl RunBuilder {
 }
 
 impl ColumnMap {
-    /// Build a column map from line text, East Asian Ambiguous characters as
-    /// wide as the terminal's `ambiguous_width` policy draws them.
-    ///
-    /// For pure-ASCII text, skips grapheme iteration entirely — O(1)
-    /// construction with O(1) lookups via identity mapping (#7375).
-    /// For non-ASCII text, builds the full grapheme map in O(G).
+    /// Build a column map from line text, East Asian Ambiguous characters as wide as
+    /// the terminal's `ambiguous_width` policy draws them. Printable ASCII gets the
+    /// identity map; anything else walks its graphemes in O(G).
     pub fn new(text: &str, ambiguous: AmbiguousWidth) -> Self {
-        // Fast path: printable ASCII only — byte offset == display column, under
-        // either ambiguous-width policy (ASCII holds no ambiguous character).
-        // Control characters such as tab/newline/carriage return can have
-        // zero display width, so they must use the full grapheme map.
+        // Printable ASCII: byte offset == column under either ambiguous-width policy.
+        // Controls (tab, newline, CR) can be zero-width, so they take the full map.
         if text.bytes().all(|byte| matches!(byte, b' '..=b'~')) {
             return Self::identity(text.len(), MapSource::Walk(ambiguous));
         }
 
         let mut runs = RunBuilder::new();
         let mut before: usize = 0;
-        // THE GRID'S OWN WALK, not a second model, and over the whole line:
-        // charging each grapheme on its own charged a Devanagari conjunct 2
-        // where the grid paints 3, a keycap 1 where it paints 2, and the `ය`
-        // the grid folds into the cell before it a cell of its own, so every
-        // later column on the row named a cell beside the text.
+        // The grid's own walk over the whole line, not per-grapheme widths: those
+        // charge a Devanagari conjunct 2 where the grid paints 3, a keycap 1 where it
+        // paints 2, and give the `ය` the grid folds into the previous cell a cell of
+        // its own, shifting every later column.
         for g in grid_graphemes_with(text, ambiguous) {
             runs.push(ClusterColumns {
                 offset: g.byte_offset,
@@ -394,32 +340,26 @@ impl ColumnMap {
         runs.finish(text.len(), before, MapSource::Walk(ambiguous))
     }
 
-    /// Build a column map from line text and the grid cells it was read
-    /// from: each grapheme is drawn in the cell that holds its first byte,
-    /// at the column the grid put that cell.
+    /// Build a column map from line text and the grid cells it was read from: each
+    /// grapheme is drawn in the cell holding its first byte, at that cell's column.
     ///
-    /// Graphemes, not cells, are what a match starts on (a match starting
-    /// inside one starts at the next, as [`ColumnMap::new`]'s do), and the
-    /// columns come from the cells:
+    /// Graphemes, not cells, are what a match starts on (a match starting inside one
+    /// starts at the next, as with [`ColumnMap::new`]); the columns come from the
+    /// cells:
     ///
-    /// * a grapheme that starts a cell is drawn from that cell's column, and
-    ///   the cursor before it is where the previous cell ends;
-    /// * one that starts inside a cell was folded into it: a printing
-    ///   character (the `ය` of Sinhala `ක්‍ය`) is drawn in that cell, a
-    ///   zero-width one (a ZWSP stored after a letter) in none, at the
-    ///   column after it;
-    /// * bytes no cell holds (a mark the grid had no cell to store in, text
-    ///   past the row's last cell) are drawn in none, after the cell before
-    ///   them.
+    /// * a grapheme that starts a cell is drawn from that cell's column, and the
+    ///   cursor before it is where the previous cell ends;
+    /// * one that starts inside a cell was folded into it: a printing character (the
+    ///   `ය` of Sinhala `ක්‍ය`) is drawn in that cell, a zero-width one (a ZWSP stored
+    ///   after a letter) in none, at the column after it;
+    /// * bytes no cell holds (a mark with no cell to store in, text past the row's
+    ///   last cell) are drawn in none, after the cell before them.
     ///
-    /// Written left to right in one go, a line's cells are what
-    /// [`ColumnMap::new`] walks its text into, and the two maps agree; where
-    /// the grid was written otherwise, only this one names the cells on the
-    /// glass.
+    /// For a line written left to right in one go this agrees with
+    /// [`ColumnMap::new`]; where the grid was written otherwise, only this one names
+    /// the cells on screen.
     pub fn with_cells(text: &str, cells: &LineCells) -> Self {
-        // Fast path: every byte read as a one-column cell of its own from
-        // column 0 (a row of printable ASCII, which is every ordinary row) is
-        // the identity, as the cells say.
+        // A row of printable ASCII read one cell per character is the identity.
         if cells.is_identity(text.len()) {
             return Self::identity(text.len(), MapSource::Cells);
         }
@@ -574,12 +514,10 @@ impl ColumnMap {
     }
 }
 
-/// Precomputed lowered-byte-to-original-byte map for case-insensitive search.
+/// Lowered-byte-to-original-byte map for case-insensitive search on one line.
 ///
-/// Built once per line in O(C) where C is the char count, then enables
-/// O(log C) lookups via binary search. This replaces the O(C)-per-call
-/// `map_lower_byte_to_original` pattern that causes O(M × C) total cost
-/// when there are M case-insensitive matches in a line.
+/// Built in O(C) over its chars and looked up in O(log C), so M matches on a line
+/// cost O(M log C) rather than O(M·C).
 pub(crate) struct LowerByteMap {
     /// (lower_byte_offset, original_byte_offset) pairs at char boundaries,
     /// sorted by lower_byte_offset. Includes a sentinel at end.
@@ -595,10 +533,7 @@ impl LowerByteMap {
         for ch in original.chars() {
             entries.push((low_offset, orig_offset));
             let orig_len = ch.len_utf8();
-            // Use the same lower+sigma-fold routine as the scan buffer so the
-            // lowered byte lengths stay byte-identical (ς/σ are both 2 bytes,
-            // so the fold never changes a length, but this keeps the mapping
-            // tied to the one canonical lowering routine).
+            // The scan buffer's own fold, so the lowered lengths match it.
             let low_len: usize = lower_fold_char(ch).map(|c| c.len_utf8()).sum();
             orig_offset = orig_offset.saturating_add(orig_len);
             low_offset = low_offset.saturating_add(low_len);
@@ -637,10 +572,8 @@ mod tests {
     };
     use crate::cells::LineCells;
 
-    /// The per-grapheme map the runs encode, built and looked up the way the
-    /// map did before it was run-length encoded (one `(offset, start,
-    /// before)` entry per grapheme plus a sentinel, binary-searched): the
-    /// oracle the encoding must answer identically to.
+    /// The per-grapheme map the runs encode (one `(offset, start, before)` entry per
+    /// grapheme plus a sentinel, binary-searched): the oracle the encoding must match.
     struct ReferenceMap(Vec<(usize, usize, usize)>);
 
     impl ReferenceMap {
@@ -692,10 +625,9 @@ mod tests {
         "\u{200b}",
     ];
 
-    /// The run-length encoded map answers every `(start, end)` byte pair
-    /// exactly as the per-grapheme map it replaced, under both
-    /// `ambiguous_width` policies: on every pair and triple of shapes, and on
-    /// long lines where a shape repeats (one run) and then changes.
+    /// The run-length encoded map answers every `(start, end)` byte pair as the
+    /// per-grapheme reference does, under both `ambiguous_width` policies: on every
+    /// pair and triple of shapes, and on long lines where a shape repeats then changes.
     #[test]
     fn the_runs_answer_as_the_per_grapheme_map_did() {
         let mut texts: Vec<String> = Vec::new();
@@ -866,17 +798,16 @@ mod tests {
         assert_eq!(map.span(4, 6), (2, 2));
     }
 
-    /// A map is one hash-map entry per indexed line, ASCII lines included:
-    /// it stays the 32 bytes the per-grapheme map took.
+    /// A map is one hash-map entry per indexed line, ASCII lines included: at most 32
+    /// bytes.
     #[test]
     fn a_map_is_no_larger_than_before() {
         assert!(std::mem::size_of::<ColumnMap>() <= 32);
     }
 
-    /// A line of one shape is one run however long it is, and the runs are
-    /// sized exactly: the map of a 100-ideograph row, of 100 decomposed
-    /// accents, or of an ASCII row with one box-drawing glyph holds a few
-    /// dozen bytes, not one 24-byte entry per grapheme with doubling slack.
+    /// A line of one shape is one run however long it is, and runs are sized exactly:
+    /// a 100-ideograph row, 100 decomposed accents, or an ASCII row with one
+    /// box-drawing glyph holds a few dozen bytes.
     #[test]
     fn a_line_of_one_shape_is_one_run() {
         let one = |text: &str| ColumnMap::new(text, AmbiguousWidth::Single).heap_bytes();
@@ -993,9 +924,7 @@ mod tests {
         }
     }
 
-    /// Stress test: ColumnMap is equivalent to byte_to_column on a long line
-    /// with many match positions. This validates the O(log G) lookup path
-    /// produces identical results to the O(G) scan for all byte offsets.
+    /// `ColumnMap` matches `byte_to_column` at every offset of a long CJK line.
     #[test]
     fn column_map_long_line_all_offsets() {
         // 80 CJK chars = 240 bytes, 160 display columns

@@ -6,17 +6,16 @@
 //!
 //! # The authority guard
 //!
-//! The title-summary worker can have its permission to speak revoked from the
-//! UI thread WHILE a request is in flight (the user closes the tab, disables
-//! the feature, or the session's authority epoch moves). DNS, `connect`, proxy
-//! negotiation and the TLS handshake can all block for seconds before a single
-//! body byte moves, so checking authority once at the top would be almost
-//! meaningless.
+//! A caller's permission to speak can be revoked from another thread WHILE a
+//! request is in flight (whatever asked for the request goes away, or the
+//! caller's authority epoch moves). DNS, `connect`, proxy negotiation and the
+//! TLS handshake can all block for seconds before a single body byte moves, so
+//! checking authority once at the top would be almost meaningless.
 //!
 //! [`Guard`] is therefore re-checked at every read and every write, which are
-//! the points at which terminal context could actually leave this process or a
+//! the points at which request data could actually leave this process or a
 //! response could be admitted. The check is two atomic loads, so revocation on
-//! the UI thread stays wait-free.
+//! the revoking thread stays wait-free.
 //!
 //! # Deadlines
 //!
@@ -98,10 +97,10 @@ impl Deadline {
 
 /// Opens the TCP connection a request will run over.
 ///
-/// This is the seam the managed-Ollama path replaces: it connects to a socket
-/// address pinned in advance and attests the peer process on the ESTABLISHED
-/// four-tuple before any request byte is written, which a hostname-based
-/// connect could not do.
+/// This is the seam a caller replaces when it must connect to a socket address
+/// pinned in advance and attest the peer process on the ESTABLISHED four-tuple
+/// before any request byte is written, which a hostname-based connect could
+/// not do (the retired managed-Ollama path did exactly that).
 pub trait Connect: Send + Sync + std::fmt::Debug {
     /// Connect to `host:port`, respecting `deadline`.
     ///
@@ -342,7 +341,7 @@ impl Read for Stream {
 
 impl Write for Stream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        // THE linearization point: terminal context does not leave this process
+        // THE linearization point: request data does not leave this process
         // unless authority still holds right here (and, under TLS, again before
         // each socket write that carries it).
         self.socket().admit()?;

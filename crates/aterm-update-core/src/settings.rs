@@ -1,31 +1,24 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `[update] enabled` — "Check for updates automatically" — read by the updater itself;
-//! and `[update] auto_apply` for the headless `aterm update` verbs, which say whether a
-//! downloaded build installs by itself.
+//! `[update] enabled` ("Check for updates automatically"), read by the updater itself, and
+//! `[update] auto_apply`, whether a downloaded build installs by itself.
 //!
-//! THE ONE SWITCH is a setting, not an environment variable: a variable reaches only the
-//! processes one shell launched, never the window a Dock click or a login item starts,
-//! and a person's controls are Settings. It is a key in the SAME `aterm.toml` the window
-//! reads — Settings ▸ Software Update writes it — and every process that runs the updater
-//! (the window, a terminal session, the `aterm update` verbs) reads it here, identically.
-//!
-//! Only the `[update]` table is deserialized, on its own (atpkg's one-table wrapper
-//! discipline), so a typo in another table cannot flip it. A file that is missing,
-//! unreadable or malformed reads as the default, ON: an updater a typo switched off is
-//! a machine that silently stops receiving security fixes, and the window names a
-//! config it could not read on its own.
+//! The switch is a key in `aterm.toml` (Settings ▸ Software Update writes it), not an
+//! environment variable, which would never reach a window started from the Dock or a login
+//! item. Every process that runs the updater reads it here. Only the `[update]` table is
+//! deserialized, so a typo in another table cannot flip it, and a missing, unreadable or
+//! malformed file reads as on: an updater a typo switched off silently stops receiving
+//! security fixes.
 
 use std::path::{Path, PathBuf};
 
 /// The same admission budget the native config service and atpkg's reader use.
 const MAX_CONFIG_BYTES: u64 = 512 * 1024;
 
-/// The path of the user config file — the GUI's resolution
-/// (`app_config::config_path`), mirrored as atpkg's `config::config_path` mirrors it:
-/// `$XDG_CONFIG_HOME/aterm/aterm.toml`, else (Windows) `%APPDATA%\aterm\aterm.toml`,
-/// else `$HOME/.config/aterm/aterm.toml`.
+/// The user config file, resolved as the GUI's `app_config::config_path` does:
+/// `$XDG_CONFIG_HOME/aterm/aterm.toml`, else (Windows) `%APPDATA%\aterm\aterm.toml`, else
+/// `$HOME/.config/aterm/aterm.toml`.
 #[must_use]
 pub fn config_path() -> Option<PathBuf> {
     if let Some(x) = std::env::var_os("XDG_CONFIG_HOME").filter(|x| !x.is_empty()) {
@@ -40,10 +33,8 @@ pub fn config_path() -> Option<PathBuf> {
         .map(|h| PathBuf::from(h).join(".config/aterm/aterm.toml"))
 }
 
-/// The `[update]` key the updater reads. Every other key of the table (owner, repo,
-/// auto_apply, require_team_id) is the GUI's — `auto_apply` is also read on its own by
-/// [`parse_update_auto_apply`], never beside this one, so a typo in either key cannot
-/// flip the other.
+/// The `[update]` key the updater reads. The table's other keys are the GUI's; `auto_apply`
+/// is read on its own by [`parse_update_auto_apply`], so a typo in one cannot flip the other.
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(default)]
 struct UpdateTable {
@@ -57,8 +48,8 @@ struct UpdateOnly {
     update: Option<UpdateTable>,
 }
 
-/// `[update] enabled` out of full `aterm.toml` text: `false` only when the table
-/// parses and says so; absent, or a table that does not parse, is ON (module docs).
+/// `[update] enabled` out of full `aterm.toml` text: `false` only when the table parses and
+/// says so.
 #[must_use]
 pub fn parse_update_enabled(text: &str) -> bool {
     match aterm_toml::from_str::<UpdateOnly>(text) {
@@ -70,9 +61,8 @@ pub fn parse_update_enabled(text: &str) -> bool {
     }
 }
 
-/// The log line for text [`parse_update_enabled`] could not read: a file that does not
-/// parse at all is told apart from a mistyped `[update]` value, and either way the
-/// person learns their `enabled = false` is not in force.
+/// The log line for text [`parse_update_enabled`] could not read, telling a file that does not
+/// parse apart from a mistyped `[update]` value.
 fn update_parse_notice(text: &str, e: &aterm_toml::Error) -> String {
     let what = if aterm_toml::from_str::<aterm_toml::Table>(text).is_err() {
         "aterm.toml does not parse"
@@ -82,8 +72,8 @@ fn update_parse_notice(text: &str, e: &aterm_toml::Error) -> String {
     format!("{what} — automatic updates stay on: {e}")
 }
 
-/// [`parse_update_enabled`] over the file at `path`; a file that is absent, not a
-/// regular file, over the budget or not UTF-8 is ON.
+/// [`parse_update_enabled`] over the file at `path`; an absent, non-regular, oversized or
+/// non-UTF-8 file is on.
 #[must_use]
 pub fn update_enabled_at(path: &Path) -> bool {
     let Ok(meta) = std::fs::metadata(path) else {
@@ -109,9 +99,8 @@ struct AutoApplyOnly {
     update: Option<AutoApplyTable>,
 }
 
-/// `[update] auto_apply` out of full `aterm.toml` text — whether a downloaded build
-/// installs by itself (the window's automatic lane, within a minute): `false` only when
-/// the table parses and says so, the default ON otherwise, exactly as the window reads it
+/// `[update] auto_apply` out of full `aterm.toml` text: whether a downloaded build installs
+/// by itself. `false` only when the table parses and says so, as the window reads it
 /// (`app_config::update_auto_apply_setting`).
 #[must_use]
 pub fn parse_update_auto_apply(text: &str) -> bool {
@@ -122,9 +111,8 @@ pub fn parse_update_auto_apply(text: &str) -> bool {
         .unwrap_or(true)
 }
 
-/// [`parse_update_auto_apply`] over the user config, read now: the one-shot `aterm
-/// update status|check` says what the window will do with a downloaded build. A file
-/// that is absent, not a regular file, over the budget or not UTF-8 is ON.
+/// [`parse_update_auto_apply`] over the user config, read now (for `aterm update
+/// status|check`). An absent, non-regular, oversized or non-UTF-8 file is on.
 #[must_use]
 pub fn update_auto_apply() -> bool {
     let Some(path) = config_path() else {
@@ -138,9 +126,8 @@ pub fn update_auto_apply() -> bool {
     }
 }
 
-/// "Check for updates automatically" for THIS process: read once, so a change made in
-/// Settings applies from the next launch (Settings says so), and every lane of one
-/// process agrees for its whole life.
+/// "Check for updates automatically" for this process, read once: a change in Settings
+/// applies from the next launch, and every lane of one process agrees for its whole life.
 #[must_use]
 pub fn update_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -160,15 +147,14 @@ mod tests {
         assert!(!parse_update_enabled("[update]\nenabled = false\n"));
     }
 
-    /// `[update] auto_apply` is ON unless the table says `false`, and each key is read
-    /// alone: a malformed `auto_apply` never flips `enabled`, nor the other way round.
+    /// `auto_apply` is on unless the table says `false`, and a malformed key never flips the
+    /// other.
     #[test]
     fn auto_apply_is_on_unless_the_table_says_false() {
         assert!(parse_update_auto_apply(""));
         assert!(parse_update_auto_apply("[update]\nenabled = false\n"));
         assert!(!parse_update_auto_apply("[update]\nauto_apply = false\n"));
         assert!(parse_update_auto_apply("[update]\nauto_apply = \"no\"\n"));
-        // Each key is read alone: a typo in one never flips the other.
         assert!(!parse_update_enabled(
             "[update]\nenabled = false\nauto_apply = \"no\"\n"
         ));
@@ -178,7 +164,7 @@ mod tests {
     }
 
     /// Only `[update]` is type-checked: a typo in another table leaves an explicit
-    /// `enabled = false` standing, and a malformed `[update]` is ON, never a panic.
+    /// `enabled = false` standing, and a malformed `[update]` is on, never a panic.
     #[test]
     fn only_the_update_table_is_read() {
         assert!(!parse_update_enabled(

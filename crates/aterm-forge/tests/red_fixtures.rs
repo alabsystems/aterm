@@ -34,6 +34,10 @@
 //!     only.
 //!
 //! Every test asserts green first, so a red can only come from the plant.
+#![allow(
+    clippy::disallowed_types,
+    reason = "never linked into the shipped binary: the third-party survey behind targo --unverified forge"
+)]
 
 use aterm_forge::check::check_report;
 use std::path::{Path, PathBuf};
@@ -48,7 +52,11 @@ use std::process::Command;
 /// before the per-cell loop. The `[OB-13]`, `[OB-17]` and `[OB-12]` fixtures
 /// keep the whole matrix.
 fn check_one_cell(root: &Path) -> (bool, String) {
-    match aterm_forge::check::run(root, &["mac-arm".to_string()]) {
+    match aterm_forge::check::run(
+        &aterm_forge::resolve::Cargo::from_env(),
+        root,
+        &["mac-arm".to_string()],
+    ) {
         Ok(outcome) => (outcome.ok, outcome.log),
         Err(why) => (false, why),
     }

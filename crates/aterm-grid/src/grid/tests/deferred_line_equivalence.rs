@@ -36,7 +36,6 @@ fn assert_lines_equivalent(
         lazy.hyperlink_count(),
         "{ctx}: hyperlink_count mismatch"
     );
-    // Compare per-character attributes
     let text = eager.to_string();
     for (i, _) in text.char_indices() {
         let ea = eager.get_attr(i);
@@ -217,7 +216,6 @@ fn deferred_line_combining_marks_equivalence() {
     let lazy = deferred.into_line();
 
     assert_lines_equivalent(&eager, &lazy, "combining marks row");
-    // Verify the combining mark is present in the text
     assert!(
         eager.to_string().contains('\u{0301}'),
         "eager line should contain combining mark"
@@ -429,7 +427,6 @@ fn lazy_buffer_drain_produces_equivalent_lines() {
     let mut rb = RowBuilder::new();
     let mut buf = LazyBuffer::new();
 
-    // Push several rows with different content
     let row1 = rb.build(
         &b"Line one"
             .iter()
@@ -476,7 +473,7 @@ fn recycled_cell_body_carries_no_state_from_the_previous_line() {
     let mut rb = RowBuilder::new();
     let mut buf = LazyBuffer::new();
 
-    // A LONG, plain line first — its body is the one that gets recycled.
+    // A long plain line first: its body is the one that gets recycled.
     let long_cells: Vec<Cell> = (0..60u8)
         .map(|i| Cell::from_ascii_fast(b'a' + i % 26))
         .collect();
@@ -613,7 +610,7 @@ fn front_rows_over_sheds_the_fewest_rows_that_fit_and_keeps_the_floor() {
     let total = buf.staged_bytes();
     assert_eq!(buf.front_rows_over(total, 0), 0, "it fits: nothing to shed");
 
-    // `n` is the FEWEST front rows whose going brings it under the budget.
+    // `n` is the fewest front rows whose going brings it under the budget.
     let budget = total * 2 / 3;
     let n = buf.front_rows_over(budget, 0);
     assert!(n > 0);
@@ -646,7 +643,7 @@ fn front_rows_over_sheds_the_fewest_rows_that_fit_and_keeps_the_floor() {
 fn cell_pool_is_bounded_by_depth_and_by_total_cells() {
     use crate::grid::scroll_convert::LazyBuffer;
 
-    // DEPTH cap: many narrow bodies. Unbounded, a 700-line backlog drain would
+    // Depth cap: many narrow bodies. Unbounded, a 700-line backlog drain would
     // park 700 bodies forever.
     let mut rb = RowBuilder::new();
     let mut buf = LazyBuffer::new();

@@ -241,16 +241,7 @@ impl ConnWire {
             {
                 let count = super::stream_count(tail)
                     .ok_or_else(|| super::malformed_header_error(&status))?;
-                for _ in 0..count {
-                    let mut line = String::new();
-                    if super::read_bounded_line(&mut reader, &mut line)? == 0 {
-                        return Err(io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            "server hung up before the complete response",
-                        ));
-                    }
-                    lines.push(line.trim_end_matches(['\r', '\n']).to_string());
-                }
+                lines = super::read_reply_lines(&mut reader, count)?;
             }
             Ok(Reply { status, lines })
         })

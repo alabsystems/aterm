@@ -29,7 +29,15 @@
 //! * a retired key ([`RETIRED_KEYS`]: 0.93.0's approval switches) written
 //!   `false` is read as the limit it named ([`SupervisorConfig::retired`])
 //!   and said so; written `true` it asked for the default, does nothing, and
-//!   is said to (owner, 2026-09-25).
+//!   is said to (owner, 2026-09-25);
+//! * `[harness.<agent>]`, where `<agent>` is a supervisable program's own
+//!   name (`claude`, `codex`), takes one key: `enabled = false` switches that
+//!   agent's sessions off ([`SupervisorConfig::off`], read through
+//!   [`SupervisorConfig::on_for`]); `true` changes nothing beyond the master
+//!   switch; any other key there is reported and changes nothing. It limits
+//!   wherever it is written, as every key does. The window's host is its one
+//!   reader: the engine, `aterm drive watch|supervise` and the launcher read
+//!   neither it nor the master switch.
 //!
 //! Stops are warnings by default: where the harness would halt, end or wait
 //! on an agent on its own judgment, it says so and goes on. Each stop is one
@@ -50,6 +58,34 @@
 //! rule that takes one has never been run against a real wall, so it is held
 //! as `stall_term` is: `false` unless the root `[harness]` table says `true`,
 //! never taken from a misplaced table, and left `false` by its limit.
+//! `usage_tap` is held the same way: its `true` puts Claude Code's own
+//! status-line setting on the relaunch lines aterm types (the usage tap,
+//! `crate::harness::tap`), which changes what a session's argv carries, so it
+//! ships `false` and only the root table's `true` turns it on.
+//!
+//! `usage_notes` ships `false` as well, held the same way: on a machine that
+//! lists no accounts, its `true` keeps a record of the one account's usage —
+//! usage credits carrying its sessions, the vendor's own warning that a window
+//! is filling — and raises the two digest lines they make (accounts v2 §3.3,
+//! §5.4). A new alert on a machine that did not ask for it is the owner's to
+//! turn on; with accounts listed the record is kept unless `accounts` is
+//! `off` (a wall's is kept under `off` too).
+//!
+//! One key says how far the harness carries a session's work: `autopilot`
+//! ([`Autopilot`]; `docs/DESIGN-harness-autopilot-2026-10-15.md` §2),
+//! `cruise` (the default: keep the work moving until the agent's clear final
+//! statement), `land` (wrap the work up cleanly, then type nothing more but
+//! the land answer to a question asked in prose) or `off` (hands off: plain
+//! Claude Code), any case, and the owner's own words for them
+//! (`forever`/`infinity`, `wrap-up`/`wrapup`/`wrap`). Each step down
+//! takes power away, so `land` and `off` are limits and `off` (any off
+//! spelling) is the key's; a value that is none of them keeps `cruise` and
+//! is said. The key is the DEFAULT: a session's own word (`aterm ctl @<sid>
+//! meta set autopilot off|cruise|land`, owned by aterm-gui, read by key off
+//! the bare `meta` reply, [`SupervisorConfig::autopilot_for`]) decides that
+//! session over it, and `meta unset autopilot` hands it back. The master
+//! switch (`enabled = false`) wins over both: no session is supervised at
+//! all, whatever its word.
 //!
 //! One key says how rather than how much: `question_priority`
 //! ([`QuestionPriority`]), how a question is answered once `answer_questions`
@@ -67,6 +103,8 @@
 
 use std::path::{Path, PathBuf};
 
+use aterm_phase::Program;
+
 use super::policy::approval::QuestionPriority;
 
 use super::memory::MemoryCeiling;
@@ -76,6 +114,7 @@ use crate::harness::accounts::Mode;
 pub const KEYS: &[&str] = &[
     "enabled",
     "headless",
+    "autopilot",
     "approve",
     "trust_roots",
     "rm_breaker_ask",
@@ -93,6 +132,10 @@ pub const KEYS: &[&str] = &[
     "limit_wait",
     "accounts",
     "limit_reset",
+    "usage_tap",
+    "usage_notes",
+    "logins",
+    "hosts",
     "model_fallback",
     "rate_nudge",
     "compact_on_context_wall",
@@ -125,7 +168,8 @@ pub enum Approve {
     All,
     /// Only a box [`super::policy::approval::decide`] proves safe: a read-only
     /// command, a trust dialog under [`SupervisorConfig::trust_roots`], a read
-    /// outside the secrets list, an rm under a scratch root.
+    /// under an allowed root and outside the secrets list
+    /// ([`super::policy::ApprovalCtx::read_roots`]), an rm under a scratch root.
     Safe,
     /// None: every box goes to the owner.
     None,
@@ -157,6 +201,90 @@ impl Approve {
             _ => None,
         }
     }
+
+    /// The level as `[harness] approve` spells it: `all`, `safe` or `none`.
+    #[must_use]
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Safe => "safe",
+            Self::None => "none",
+        }
+    }
+}
+
+/// AUTOPILOT: how far the harness carries a session's work at its turn ends
+/// (`[harness] autopilot`, the default; a session's own `autopilot` word over
+/// it, [`SupervisorConfig::autopilot_for`]). The owner's three-way control
+/// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §2.2): the window's chip
+/// cycles it `cruise` → `land` → `off`. Power runs `off` < `land` < `cruise`,
+/// so a key may only move it down that order.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum Autopilot {
+    /// Keep the work moving: every point answered, the work continued until
+    /// the agent's clear final statement (`ATERM-TASK-DONE`, or a done reply
+    /// to the done check; a final report that still names open work without
+    /// a blocker is challenged once first, `policy::turn_end`'s
+    /// `RULE_OPEN_ITEMS`). The harness as it ran before Autopilot. The
+    /// default.
+    #[default]
+    Cruise,
+    /// Wrap the work up cleanly, then stop: the turn-end policy types the
+    /// land instruction once (finish the step in hand, start nothing new,
+    /// leave it verified and committed, reply `ATERM-TASK-DONE`), at most
+    /// `LAND_NUDGES` nudges after it, and then nothing but the land answer,
+    /// which a question asked in prose at a turn end gets whether or not the
+    /// nudges are spent (`policy::turn_end`'s `RULE_LAND`, `RULE_LAND_NUDGE`,
+    /// `RULE_LAND_ANSWER`). A question DIALOG is answered as under `Cruise`
+    /// (the session's `questions` word, else `question_priority`: the land
+    /// answer for a dialog is deferred, the design's §2.2), and so are boxes
+    /// and walls: the wrap-up still has to finish.
+    Land,
+    /// Hands off: the harness answers nothing and types nothing into the
+    /// session — plain Claude Code, the owner's A/B baseline. The loop parks
+    /// while the session's word says so (`Session::park_while_off`), and the
+    /// window's host stops the session's worker (aterm-gui).
+    Off,
+}
+
+impl Autopilot {
+    /// Every mode, in the order the chip cycles them.
+    pub const ALL: [Autopilot; 3] = [Autopilot::Cruise, Autopilot::Land, Autopilot::Off];
+
+    /// The mode's one word, as the table, the session's `meta` word and the
+    /// chip spell it: `cruise`, `land` or `off`. STABLE: [`Self::parse`]
+    /// reads it back.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Autopilot::Cruise => "cruise",
+            Autopilot::Land => "land",
+            Autopilot::Off => "off",
+        }
+    }
+
+    /// A mode from its word ([`Self::word`]) or the owner's own words for it
+    /// (`forever`, `infinity`: [`Autopilot::Cruise`]; `wrap-up`, `wrapup`,
+    /// `wrap`: [`Autopilot::Land`]), trimmed, in any case. `None` for anything
+    /// else: an on/off switch word other than `off` is no mode.
+    #[must_use]
+    pub fn parse(word: &str) -> Option<Self> {
+        match word.trim().to_ascii_lowercase().as_str() {
+            "cruise" | "forever" | "infinity" => Some(Autopilot::Cruise),
+            "land" | "wrap-up" | "wrapup" | "wrap" => Some(Autopilot::Land),
+            "off" => Some(Autopilot::Off),
+            _ => None,
+        }
+    }
+
+    /// How much this mode carries: `off` < `land` < `cruise`.
+    fn rank(self) -> u8 {
+        match self {
+            Autopilot::Off => 0,
+            Autopilot::Land => 1,
+            Autopilot::Cruise => 2,
+        }
+    }
 }
 
 /// How much `[harness] accounts` rotates: `off` < `wall` < `early` (a move at
@@ -175,16 +303,34 @@ fn accounts_rank(mode: Mode) -> u8 {
 pub struct SupervisorConfig {
     /// The master switch (Settings: search "harness"). Off: no session is supervised.
     pub enabled: bool,
+    /// The agents whose sessions are not supervised: each one a
+    /// `[harness.<agent>]` table switched off (`enabled = false`), named once,
+    /// in name order. Read through [`Self::on_for`], under the master switch.
+    pub off: Vec<Program>,
     /// Supervise the sessions of a headless instance too.
     pub headless: bool,
-    /// What a permission box may be answered with.
+    /// THE DEFAULT AUTOPILOT ([`Autopilot`], `[harness] autopilot`): how far
+    /// the harness carries a session that has no `autopilot` word of its own
+    /// ([`Self::autopilot_for`]). [`Autopilot::Cruise`] by default; `off`
+    /// (any off spelling) is its limit.
+    pub autopilot: Autopilot,
+    /// What a permission box may be answered with, one level for every
+    /// agent. The safe rules judge Claude Code's boxes and Codex's
+    /// folder-trust gate: under [`Approve::Safe`] every Codex box but its
+    /// folder-trust gate goes to a person.
     pub approve: Approve,
-    /// Folders whose trust dialog is answered under [`Approve::Safe`]. A
-    /// leading `~/` is the home directory; a trailing `*` matches any suffix
-    /// of the last component (`~/aterm*` is every aterm worktree).
+    /// Folders whose trust dialog is answered under [`Approve::Safe`] —
+    /// Claude Code's, and Codex's folder-trust gate. A leading `~/` is the
+    /// home directory; a trailing `*` matches any suffix of the last
+    /// component (`~/src/app*` is every folder in `~/src` whose name starts
+    /// `app`, a checkout and its worktrees beside it). None by default: no
+    /// fact about a session or the vendor makes a folder safe to trust, so
+    /// under `safe` every trust dialog goes to a person until the person
+    /// names their own folders here. A trust root is also a Read root for
+    /// Claude Code's Read box.
     pub trust_roots: Vec<String>,
     /// Under `approve = "safe"`, hand an unproven rm circuit breaker to a
-    /// person. Off (the default): the vendor's `rm` on a possibly-empty
+    /// person. Off (the default): Claude Code's `rm` on a possibly-empty
     /// variable box that the safe rules cannot prove is approved with its
     /// reason kept as a warning
     /// ([`super::policy::approval::RULE_RM_BREAKER_WARN`]: the ledger's
@@ -268,6 +414,49 @@ pub struct SupervisorConfig {
     /// composed from the vendor's bundle, so the default stays `false` until
     /// that spec's live check (§6) passes.
     pub limit_reset: bool,
+    /// The usage tap (`crate::harness::tap`; the accounts design v2 §3.1,
+    /// ruling R-7): put Claude Code's own status-line setting — an inline
+    /// `--settings` whose command is `<aterm> harness tap` — on the relaunch
+    /// lines aterm types for a Claude Code on the machine's own login, so its
+    /// usage figures are read after every reply and recorded for that login.
+    /// The readings move no session. Off by default: it changes the argv a
+    /// relaunched session carries, so `true` is more power, as
+    /// [`Self::limit_reset`]'s is — [`Self::limit`] leaves it off and a
+    /// misplaced table never turns it on. Read live, independent of
+    /// [`Self::accounts`]: a line typed after an edit follows it, and a
+    /// session tapped before keeps its tap, and is recorded, until its next
+    /// relaunch.
+    pub usage_tap: bool,
+    /// On a machine that lists no Claude Code accounts, keep a record of the
+    /// one account's usage as its sessions' screens say it — usage credits
+    /// carrying them past a limit, the vendor's own warning that a window is
+    /// filling — and raise the digest's two lines they make: credits in use,
+    /// once a day, and the week nearly used with credits off (accounts v2
+    /// §3.3, §5.4). Off by default: a line of the digest on a machine that did
+    /// not ask for it is the owner's to turn on, so `true` is more power, held
+    /// as [`Self::limit_reset`] is. With accounts listed the record is kept
+    /// unless [`Self::accounts`] is `off` (a wall's is kept under `off` too).
+    /// Nothing is typed for it either way: credits are work going on, never a
+    /// wall.
+    pub usage_notes: bool,
+    /// THE LOGIN LIFECYCLE (`[harness] logins`, `"renew"` or `"off"`;
+    /// `docs/DESIGN-claude-accounts-v2-2026-10-15.md` §5): a session whose
+    /// login is a roster row with an email (`accounts.toml`, `aterm harness
+    /// accounts renew`) is WAITED AT when that login ends — never `/login`
+    /// typed — the owner asked once to renew it, and relaunched on its own
+    /// conversation under the renewed login once it is (the wall's resume
+    /// after it); a session still on a login a renewal superseded follows it
+    /// at its next idle turn end. Inert with no such row. Apart from
+    /// [`Self::accounts`], so `accounts = "off"` keeps renewal working.
+    /// `false` (`"off"`, its limit): a lost login is the person's, `/login`
+    /// typed, as before renewal existed.
+    pub logins: bool,
+    /// The machines `aterm harness accounts renew --due` renews on next, over
+    /// SSH (`host` or `host:/abs/path/to/aterm`), in one sitting. Read by
+    /// that command alone, never by a supervisor, nor by the run a sitting
+    /// makes on another machine (`--here`); empty (the default) runs no
+    /// `ssh`, and so does its limit.
+    pub hosts: Vec<String>,
     /// Claude Code's model fallback: the model the agent is relaunched on at
     /// a model-bucket limit (`--model`, session-only — never Claude's
     /// `/model`, which saves the person's default), and back from at its
@@ -361,11 +550,11 @@ impl Default for SupervisorConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            off: Vec::new(),
             headless: true,
+            autopilot: Autopilot::Cruise,
             approve: Approve::All,
-            trust_roots: ["~/aterm*", "~/ay*", "$HOME/trust*", "/private/tmp/claude-*"]
-                .map(String::from)
-                .to_vec(),
+            trust_roots: Vec::new(),
             rm_breaker_ask: false,
             answer_questions: true,
             question_priority: QuestionPriority::Recommended,
@@ -384,6 +573,10 @@ impl Default for SupervisorConfig {
             limit_wait: true,
             accounts: Mode::Early,
             limit_reset: false,
+            usage_tap: false,
+            usage_notes: false,
+            logins: true,
+            hosts: Vec::new(),
             model_fallback: Some("opus".to_string()),
             rate_nudge: true,
             compact_on_context_wall: true,
@@ -408,6 +601,11 @@ impl SupervisorConfig {
     /// that key's limiting value ([`Self::limit`]); anything else leaves the
     /// key at its default; both are said in the `Err`. An unknown key changes
     /// nothing and says so (owner, 2026-09-25).
+    ///
+    /// `<agent>.<key>` is a key of the `[harness.<agent>]` table, `<agent>` a
+    /// supervisable program's own name: `claude.enabled` and `codex.enabled`
+    /// are switches whose `false` switches that agent off ([`Self::off`]) and
+    /// whose `true` changes nothing; any other key there is refused.
     pub fn set(&mut self, key: &str, value: &str) -> Result<(), String> {
         let v = value.trim();
         // An off limits a key it is not the key's own value for, except a
@@ -427,6 +625,17 @@ impl SupervisorConfig {
             }
         };
         let flag = switch_word(v);
+        if let Some((agent, leaf)) = agent_key(key) {
+            if leaf != "enabled" {
+                return Err(per_agent_only(key));
+            }
+            match flag {
+                Some(false) => self.switch_off(agent),
+                Some(true) => {}
+                None => return bad(self, "true or false"),
+            }
+            return Ok(());
+        }
         let text = (!v.is_empty()).then(|| v.to_string());
         macro_rules! switch {
             ($field:ident) => {
@@ -447,6 +656,8 @@ impl SupervisorConfig {
             "resume_limits" => switch!(resume_limits),
             "limit_wait" => switch!(limit_wait),
             "limit_reset" => switch!(limit_reset),
+            "usage_tap" => switch!(usage_tap),
+            "usage_notes" => switch!(usage_notes),
             "rate_nudge" => switch!(rate_nudge),
             "compact_on_context_wall" => switch!(compact_on_context_wall),
             "relaunch" => switch!(relaunch),
@@ -458,10 +669,28 @@ impl SupervisorConfig {
                 Some(a) => self.approve = a,
                 None => return bad(self, "all, safe or none"),
             },
+            "autopilot" => match Autopilot::parse(value) {
+                Some(a) => self.autopilot = a,
+                None => return bad(self, "cruise, land or off"),
+            },
             "accounts" => match Mode::parse(&v.to_ascii_lowercase()) {
                 Some(mode) => self.accounts = mode,
                 None => return bad(self, "early, wall or off"),
             },
+            "logins" => match v.to_ascii_lowercase().as_str() {
+                "renew" => self.logins = true,
+                "off" => self.logins = false,
+                _ => return bad(self, "renew or off"),
+            },
+            "hosts" => {
+                self.hosts = value
+                    .split(',')
+                    .filter_map(|v| {
+                        let v = v.trim();
+                        (!v.is_empty()).then(|| v.to_string())
+                    })
+                    .collect();
+            }
             "question_priority" => match QuestionPriority::parse(value) {
                 Some(p) => self.question_priority = p,
                 None => {
@@ -602,16 +831,20 @@ impl SupervisorConfig {
     }
 
     /// Set `key` to its limiting value: the least power it can give. A switch
-    /// is off, `approve` is `none`, a cap is one an hour, the grace is an
-    /// hour, a frozen agent is never ended (`stall_term_after_s = 0`), no
-    /// session is moved between accounts (`accounts = "off"`), no limit reset
-    /// is taken (`limit_reset = false`, its default). A text and
-    /// `question_priority` (HOW a question is answered) keep their defaults:
-    /// neither carries power.
+    /// is off, `approve` is `none`, the autopilot is `off`, a cap is one an
+    /// hour, the grace is an hour, a frozen agent is never ended
+    /// (`stall_term_after_s = 0`), no session is moved between accounts
+    /// (`accounts = "off"`), no limit reset is taken (`limit_reset = false`,
+    /// its default), no line carries the usage tap (`usage_tap = false`, its
+    /// default), no record of the one account's usage is kept (`usage_notes =
+    /// false`, its default), an agent's own switch (`codex.enabled`) is that
+    /// agent off. A text and `question_priority` (HOW a question is answered)
+    /// keep their defaults: neither carries power.
     pub fn limit(&mut self, key: &str) {
         match key {
             "enabled" => self.enabled = false,
             "headless" => self.headless = false,
+            "autopilot" => self.autopilot = Autopilot::Off,
             "approve" => self.approve = Approve::None,
             "answer_questions" => self.answer_questions = false,
             "dismiss_surveys" => self.dismiss_surveys = false,
@@ -622,8 +855,14 @@ impl SupervisorConfig {
             "resume_limits" => self.resume_limits = false,
             "limit_wait" => self.limit_wait = false,
             "accounts" => self.accounts = Mode::Off,
+            "logins" => self.logins = false,
+            "hosts" => self.hosts.clear(),
             // An opt-in: its least power is its default, no reset taken.
             "limit_reset" => self.limit_reset = false,
+            // An opt-in too: its least power is its default, no tap added.
+            "usage_tap" => self.usage_tap = false,
+            // An opt-in too: no record and no line.
+            "usage_notes" => self.usage_notes = false,
             "model_fallback" => self.model_fallback = None,
             "rate_nudge" => self.rate_nudge = false,
             "compact_on_context_wall" => self.compact_on_context_wall = false,
@@ -641,8 +880,41 @@ impl SupervisorConfig {
             retired if RETIRED_KEYS.contains(&retired) => {
                 let _ = self.retired(retired, true);
             }
-            _ => {}
+            _ => {
+                if let Some((agent, "enabled")) = agent_key(key) {
+                    self.switch_off(agent);
+                }
+            }
         }
+    }
+
+    /// Whether `agent`'s sessions are supervised: the master switch on and
+    /// that agent not switched off by its own table ([`Self::off`]).
+    #[must_use]
+    pub fn on_for(&self, agent: Program) -> bool {
+        self.enabled && !self.off.contains(&agent)
+    }
+
+    /// Switch `agent` off ([`Self::off`]), keeping the list one entry per
+    /// agent in name order, so two files that switch off the same agents read
+    /// as the same policy whichever table comes first.
+    fn switch_off(&mut self, agent: Program) {
+        if !self.off.contains(&agent) {
+            self.off.push(agent);
+            self.off.sort_by_key(|p| p.name());
+        }
+    }
+
+    /// A session's Autopilot ([`Autopilot`]): its own `autopilot` word
+    /// (`word`, read by key off the bare `meta` reply; `None` when the reply
+    /// has none, it is unset, or it is no word [`Autopilot::parse`] reads),
+    /// else this table's default ([`Self::autopilot`]). The one resolver:
+    /// a session's `cruise` under a default of `off` is the owner opting that
+    /// session in by hand. The master switch is not read here: with
+    /// `enabled = false` no session is supervised at all, so no loop asks.
+    #[must_use]
+    pub fn autopilot_for(&self, word: Option<Autopilot>) -> Autopilot {
+        word.unwrap_or(self.autopilot)
     }
 
     /// The reader of aterm.toml's `[harness]` table (module docs): the policy
@@ -680,8 +952,9 @@ impl SupervisorConfig {
                 // A retired key after every current one: the limit it names
                 // holds whatever `approve` says beside it.
                 let (retired, current): (Vec<_>, Vec<_>) = root
+                    .map(entries)
+                    .unwrap_or_default()
                     .into_iter()
-                    .flatten()
                     .partition(|(key, _)| RETIRED_KEYS.contains(&key.as_str()));
                 // `disk` under [harness] is the disk reader's, not an unknown
                 // harness key: a `[disk]` knob TOML files there turns every
@@ -699,19 +972,19 @@ impl SupervisorConfig {
                         notes.extend(disk_notes.iter().cloned());
                         continue;
                     }
-                    if let Err(e) = cfg.set_value(key, value) {
+                    if let Err(e) = cfg.set_value(&key, value) {
                         notes.push(e);
                     }
                 }
                 for (at, table) in misplaced {
-                    for (key, value) in table {
+                    for (key, value) in entries(table) {
                         let before = cfg.clone();
-                        let refused = cfg.set_value(key, value).err();
+                        let refused = cfg.set_value(&key, value).err();
                         let limits = cfg.limits(&before);
                         if !limits {
                             cfg = before;
                         }
-                        notes.push(misplaced_note(&at, key, limits, refused));
+                        notes.push(misplaced_note(&at, &key, limits, refused));
                     }
                 }
                 // `harness = false` filed under another table: the master
@@ -730,7 +1003,7 @@ impl SupervisorConfig {
                     "aterm.toml is not valid TOML ({}); its [harness] lines were read one by one",
                     e.to_string().lines().next().unwrap_or("").trim()
                 ));
-                let mut seen = Vec::new();
+                let mut seen: Vec<String> = Vec::new();
                 // A retired key after every current one, as above.
                 let (retired, current): (Vec<_>, Vec<_>) =
                     assignments(text).into_iter().partition(|(path, _)| {
@@ -740,31 +1013,36 @@ impl SupervisorConfig {
                     // `harness = false`: the master switch written off; at the
                     // root the key `enabled`, said once (a later `enabled =
                     // true` is then a repeat that may only limit); under
-                    // another header a misplaced one, which limits.
-                    let (head, key, one_value): (&[&str], &str, String) = match path.as_slice() {
+                    // another header a misplaced one, which limits. A key of
+                    // an agent's table is `<agent>.<key>`, as `set` reads it.
+                    let (head, key, one_value): (&[&str], String, String) = match path.as_slice() {
                         [head @ .., "harness"] if !value.trim_start().starts_with(['[', '{']) => {
                             if !spells_off(&unquote(value)) {
                                 continue;
                             }
-                            (head, "enabled", "false".to_string())
+                            (head, "enabled".to_string(), "false".to_string())
                         }
-                        [head @ .., "harness", key] => (head, key, unquote(value)),
+                        [head @ .., "harness", key] => (head, key.to_string(), unquote(value)),
+                        [head @ .., "harness", agent, key] if agent_named(agent).is_some() => {
+                            (head, format!("{agent}.{key}"), unquote(value))
+                        }
                         _ => continue,
                     };
+                    let key = key.as_str();
                     let quoted = value.trim_start().starts_with(['"', '\'']);
                     let before = cfg.clone();
-                    let refused = if value.trim_start().starts_with('[') && key != "trust_roots" {
+                    let list = matches!(key, "trust_roots" | "hosts");
+                    let refused = if value.trim_start().starts_with('[') && !list {
                         Some(no_shape(key, "array"))
                     } else {
-                        cfg.set_scalar(key, &one_value, quoted || key == "trust_roots")
-                            .err()
+                        cfg.set_scalar(key, &one_value, quoted || list).err()
                     };
                     // A key said twice — which may be why the file is not
                     // TOML — or said under another header may only limit.
                     let limits = cfg.limits(&before);
-                    let repeat = head.is_empty() && seen.contains(&key);
+                    let repeat = head.is_empty() && seen.iter().any(|k| k == key);
                     if head.is_empty() {
-                        seen.push(key);
+                        seen.push(key.to_string());
                     }
                     if !(limits || head.is_empty() && !repeat) {
                         cfg = before;
@@ -812,6 +1090,7 @@ impl SupervisorConfig {
     /// [`Self::set`] from a parsed TOML value: a value of a shape no key takes
     /// (a table, a float, a date) is no setting and changes nothing, as any
     /// value that is neither the key's own nor an off (owner, 2026-09-25).
+    /// An agent's table arrives key by key, as `<agent>.<key>` ([`entries`]).
     fn set_value(&mut self, key: &str, value: &aterm_toml::Value) -> Result<(), String> {
         use aterm_toml::Value;
         match value {
@@ -820,13 +1099,17 @@ impl SupervisorConfig {
                 self.set_scalar(key, &scalar_text(value).unwrap_or_default(), false)
             }
             // An array is `trust_roots`' shape alone.
-            Value::Array(_) if key == "trust_roots" => match scalar_text(value) {
+            Value::Array(_) if matches!(key, "trust_roots" | "hosts") => match scalar_text(value) {
                 Some(text) => self.set(key, &text),
                 None => Err(no_shape(key, value.type_str())),
             },
             _ if RETIRED_KEYS.contains(&key) => Err(retired_no_setting(key)),
             _ if KEYS.contains(&key) => Err(no_shape(key, value.type_str())),
-            _ => Err(unknown_key(key)),
+            _ => match agent_key(key) {
+                Some((_, "enabled")) => Err(no_shape(key, value.type_str())),
+                Some(_) => Err(per_agent_only(key)),
+                None => Err(unknown_key(key)),
+            },
         }
     }
 
@@ -845,17 +1128,19 @@ impl SupervisorConfig {
     }
 
     /// Whether `self` is `before` with power taken away and none given: some
-    /// field moved, and no switch is on that was off, no approval looser, no
-    /// cap higher or absent, no grace or stall bound shorter, no account mode
-    /// wider, no trust root or fallback model new, and no text or question
-    /// priority changed (neither limits nor grants, so where a key may only
-    /// limit, neither is taken).
+    /// field moved, and no switch is on that was off, no agent back on, no
+    /// autopilot higher, no approval looser, no cap higher or absent, no grace
+    /// or stall bound shorter, no account mode wider, no trust root or
+    /// fallback model new, and no text or question priority changed (neither
+    /// limits nor grants, so where a key may only limit, neither is taken).
     fn limits(&self, before: &Self) -> bool {
         let cap = |n: u32| if n == 0 { u32::MAX } else { n };
         let no_more = |now: bool, then: bool| !now || then;
         self != before
             && no_more(self.enabled, before.enabled)
+            && before.off.iter().all(|agent| self.off.contains(agent))
             && no_more(self.headless, before.headless)
+            && self.autopilot.rank() <= before.autopilot.rank()
             && self.approve.rank() <= before.approve.rank()
             && no_more(!self.rm_breaker_ask, !before.rm_breaker_ask)
             && self
@@ -877,6 +1162,10 @@ impl SupervisorConfig {
             && no_more(self.limit_wait, before.limit_wait)
             && accounts_rank(self.accounts) <= accounts_rank(before.accounts)
             && no_more(self.limit_reset, before.limit_reset)
+            && no_more(self.usage_tap, before.usage_tap)
+            && no_more(self.usage_notes, before.usage_notes)
+            && no_more(self.logins, before.logins)
+            && self.hosts.iter().all(|h| before.hosts.contains(h))
             && (self.model_fallback.is_none() || self.model_fallback == before.model_fallback)
             && no_more(self.rate_nudge, before.rate_nudge)
             && no_more(self.compact_on_context_wall, before.compact_on_context_wall)
@@ -894,10 +1183,17 @@ impl SupervisorConfig {
     /// Every key's value, in [`KEYS`] order, as the text [`Self::set`] takes
     /// back. The destructure names every field, so a field added without a
     /// key here does not build (and `texts_are_the_keys` holds the order).
-    fn texts(&self) -> [(&'static str, String); 29] {
+    /// Settings ▸ Harness lists it, each value against the full-power
+    /// default's, as the effective `[harness]` table.
+    #[must_use]
+    pub fn texts(&self) -> [(&'static str, String); 34] {
         let Self {
             enabled,
+            // No key in [`KEYS`]: the agents' own tables ([`Self::agent_texts`];
+            // `against_default` names them).
+            off: _,
             headless,
+            autopilot,
             approve,
             trust_roots,
             rm_breaker_ask,
@@ -915,6 +1211,10 @@ impl SupervisorConfig {
             limit_wait,
             accounts,
             limit_reset,
+            usage_tap,
+            usage_notes,
+            logins,
+            hosts,
             model_fallback,
             rate_nudge,
             compact_on_context_wall,
@@ -925,21 +1225,18 @@ impl SupervisorConfig {
             upgrade,
             upgrade_ask,
             human_grace_s,
-            // No key of its own: a retired key's (`against_default` names it).
+            // No key of its own: a retired key's ([`Self::withheld_texts`];
+            // `against_default` names it).
             withheld: _,
             // No key: a session's own word, and a flag's limit on it.
             session_questions: _,
         } = self;
         let path = |p: &Option<PathBuf>| p.as_ref().map(|p| p.display().to_string());
-        let approve = match approve {
-            Approve::All => "all",
-            Approve::Safe => "safe",
-            Approve::None => "none",
-        };
         [
             ("enabled", enabled.to_string()),
             ("headless", headless.to_string()),
-            ("approve", approve.to_string()),
+            ("autopilot", autopilot.word().to_string()),
+            ("approve", approve.word().to_string()),
             ("trust_roots", trust_roots.join(",")),
             ("rm_breaker_ask", rm_breaker_ask.to_string()),
             ("answer_questions", answer_questions.to_string()),
@@ -956,6 +1253,10 @@ impl SupervisorConfig {
             ("limit_wait", limit_wait.to_string()),
             ("accounts", accounts.as_str().to_string()),
             ("limit_reset", limit_reset.to_string()),
+            ("usage_tap", usage_tap.to_string()),
+            ("usage_notes", usage_notes.to_string()),
+            ("logins", if *logins { "renew" } else { "off" }.to_string()),
+            ("hosts", hosts.join(",")),
             ("model_fallback", model_fallback.clone().unwrap_or_default()),
             ("rate_nudge", rate_nudge.to_string()),
             (
@@ -972,16 +1273,62 @@ impl SupervisorConfig {
         ]
     }
 
+    /// EACH AGENT'S OWN SWITCH as its `[harness.<agent>]` table spells it —
+    /// `(<agent>.enabled, true|false)`, for every supervisable program in
+    /// [`Program::ALL`]'s order, so a new agent has its row with no list
+    /// here: the key [`Self::set`] takes back, no key of [`KEYS`]
+    /// ([`Self::texts`] leaves the tables out, and `against_default` names
+    /// one off as `<agent>: off`). Settings ▸ Harness lists them beside
+    /// [`Self::texts`] in the effective table.
+    #[must_use]
+    pub fn agent_texts(&self) -> Vec<(String, String)> {
+        Program::ALL
+            .into_iter()
+            .filter(|program| program.supervisable())
+            .map(|program| {
+                (
+                    format!("{}.enabled", program.name()),
+                    (!self.off.contains(&program)).to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// EACH SAFE RULE A RETIRED KEY TOOK AWAY, under the key that took it
+    /// (`rm_breaker`, `false`) — none where none did ([`Withheld`]): what
+    /// it withholds beyond the `approve` cap it also sets has no key of
+    /// [`KEYS`] to show it by.
+    #[must_use]
+    pub fn withheld_texts(&self) -> Vec<(&'static str, String)> {
+        let Withheld {
+            rm_breaker,
+            read_outside_cwd,
+        } = self.withheld;
+        [
+            ("rm_breaker", rm_breaker),
+            ("read_outside_cwd", read_outside_cwd),
+        ]
+        .into_iter()
+        .filter(|(_, withheld)| *withheld)
+        .map(|(key, _)| (key, false.to_string()))
+        .collect()
+    }
+
     /// `key`'s full-power default as Settings and the help show it (`true`,
-    /// `all`, `[~/aterm*, …]`, `0 (no cap)`), or `None` for a key with no
-    /// default value (`rules_file`) or no such key.
+    /// `all`, `[]`, `0 (no cap)`), or `None` for a key with no default value
+    /// (`rules_file`) or no such key. An agent's switch (`codex.enabled`) shows
+    /// `true`.
     #[must_use]
     pub fn default_shown(key: &str) -> Option<String> {
+        if let Some((_, "enabled")) = agent_key(key) {
+            return Some(true.to_string());
+        }
         let full = Self::default();
         let (_, text) = full.texts().into_iter().find(|(k, _)| *k == key)?;
         match key {
-            _ if text.is_empty() => None,
             "trust_roots" => Some(format!("[{}]", full.trust_roots.join(", "))),
+            "hosts" => Some(format!("[{}]", full.hosts.join(", "))),
+            _ if text.is_empty() => None,
             "continue_per_hour" if full.continue_per_hour == 0 => Some(format!("{text} (no cap)")),
             "stall_term_after_s" => Some(format!("{text} (0: never)")),
             _ => Some(text),
@@ -994,7 +1341,8 @@ impl SupervisorConfig {
     /// change (a text, a question priority, a longer list of trust roots,
     /// another fallback model, a shorter grace) is the owner's own value,
     /// which neither limits nor grants. `trust_roots` is read only under
-    /// `approve = "safe"`, the one level that consults it.
+    /// `approve = "safe"`, the one level that consults it. After the keys,
+    /// each agent switched off by its own table, as `<agent>: off`.
     #[must_use]
     pub fn against_default(&self) -> Written {
         let full = Self::default();
@@ -1013,22 +1361,17 @@ impl SupervisorConfig {
             let shown = match value.as_str() {
                 "false" | "" => "off".to_string(),
                 _ if key == "trust_roots" => self.trust_roots.join(", "),
+                _ if key == "hosts" => self.hosts.join(", "),
                 _ => value,
             };
             written.limits.push(format!("{key}: {shown}"));
         }
         // A rule only a retired key takes away, under the name it was written.
-        let Withheld {
-            rm_breaker,
-            read_outside_cwd,
-        } = self.withheld;
-        for (key, off) in [
-            ("rm_breaker", rm_breaker),
-            ("read_outside_cwd", read_outside_cwd),
-        ] {
-            if off {
-                written.limits.push(format!("{key}: off"));
-            }
+        for (key, _) in self.withheld_texts() {
+            written.limits.push(format!("{key}: off"));
+        }
+        for agent in &self.off {
+            written.limits.push(format!("{}: off", agent.name()));
         }
         written
     }
@@ -1051,6 +1394,30 @@ fn unknown_key(key: &str) -> String {
         "harness.{key}: {UNKNOWN_KEY}, ignored (known: {})",
         KEYS.join(", ")
     )
+}
+
+/// The note for a key of an agent's table other than its switch: refused in
+/// the unknown key's words ([`is_unknown_key_note`]), with where it goes.
+fn per_agent_only(key: &str) -> String {
+    format!(
+        "harness.{key}: {UNKNOWN_KEY}, ignored — only `enabled` is per agent; write it under \
+         `[harness]`"
+    )
+}
+
+/// The supervisable program `id` is the exact name of (`claude`, `codex`:
+/// [`Program::name`]), whose `[harness.<id>]` table is that agent's; `None`
+/// for any other word, another spelling of one (`claude-code`, `Codex`)
+/// included.
+fn agent_named(id: &str) -> Option<Program> {
+    aterm_phase::program_of(id).filter(|p| p.name() == id && p.supervisable())
+}
+
+/// A key of an agent's table, `<agent>.<key>` ([`agent_named`]): the agent
+/// and the key under it.
+fn agent_key(key: &str) -> Option<(Program, &str)> {
+    let (id, leaf) = key.split_once('.')?;
+    Some((agent_named(id)?, leaf))
 }
 
 /// The words every unknown-key note carries ([`is_unknown_key_note`]).
@@ -1221,6 +1588,23 @@ fn misplaced_note(at: &str, key: &str, limits: bool, refused: Option<String>) ->
         "harness.{key}: written below another table's header, which TOML files as \
          `{at}.harness.{key}` — {effect}{why}"
     )
+}
+
+/// A `harness` table's entries as the keys [`SupervisorConfig::set`] reads:
+/// each as written, but an agent's table (`[harness.codex]`, `codex = { … }`)
+/// opened into its keys as `<agent>.<key>` ([`agent_named`]), so each of
+/// those is set, held to the limit rule and said on its own, as a root key is.
+fn entries(table: &aterm_toml::Table) -> Vec<(String, &aterm_toml::Value)> {
+    table
+        .iter()
+        .flat_map(|(key, value)| match value.as_table() {
+            Some(agent) if agent_named(key).is_some() => agent
+                .iter()
+                .map(|(leaf, v)| (format!("{key}.{leaf}"), v))
+                .collect(),
+            _ => vec![(key.clone(), value)],
+        })
+        .collect()
 }
 
 /// Every `harness` table in `v` below its root, with the dotted path of the
@@ -1485,7 +1869,9 @@ mod tests {
             // A text has no limit, and neither has how a question is answered
             // (`question_priority`): no power to take; nor `stall_term`, whose
             // default (the warning) is already its least, nor `limit_reset`,
-            // whose default (no reset taken) is.
+            // whose default (no reset taken) is, nor `usage_tap` (no tap), nor
+            // `usage_notes` (no record), nor `hosts`, whose default (no
+            // machine) is.
             let text_key = matches!(
                 *key,
                 "trust_roots"
@@ -1495,6 +1881,9 @@ mod tests {
                     | "rules_file"
                     | "stall_term"
                     | "limit_reset"
+                    | "usage_tap"
+                    | "usage_notes"
+                    | "hosts"
             );
             assert_eq!(c == full, text_key, "{key}: only a text has no limit");
             assert!(
@@ -1867,6 +2256,152 @@ mod tests {
         );
     }
 
+    /// `[harness] autopilot` (the Autopilot design, §2.1): three words and the
+    /// owner's own for them, any case, `cruise` the full-power default and
+    /// `off` its limit; `land` carries less than `cruise`, so it limits too.
+    /// An off however spelled is `off` and said; a value that is no mode (an
+    /// on-word, a number, a word it does not know) keeps `cruise` and is
+    /// said. Written below another table's header it may only limit.
+    /// NEGATIVE CONTROLS: an on-word names no mode, a misplaced `cruise` does
+    /// not undo the root table's `land`, and the session's word decides over
+    /// the table's in both directions ([`SupervisorConfig::autopilot_for`]).
+    #[test]
+    fn autopilot_reads_its_three_words_and_only_limits() {
+        let full = SupervisorConfig::default();
+        assert_eq!(full.autopilot, Autopilot::Cruise);
+        assert_eq!(Autopilot::default(), Autopilot::Cruise);
+        assert_eq!(
+            SupervisorConfig::default_shown("autopilot").as_deref(),
+            Some("cruise")
+        );
+        let at = KEYS.iter().position(|k| *k == "autopilot").expect("a key");
+        assert_eq!(
+            (KEYS[at - 1], KEYS[at + 1]),
+            ("headless", "approve"),
+            "after which sessions, before what a box gets"
+        );
+        // The words, the owner's words, and what they read back as.
+        for mode in Autopilot::ALL {
+            assert_eq!(Autopilot::parse(mode.word()), Some(mode), "{mode:?}");
+        }
+        for (word, want) in [
+            ("cruise", Some(Autopilot::Cruise)),
+            ("  CRUISE ", Some(Autopilot::Cruise)),
+            ("forever", Some(Autopilot::Cruise)),
+            ("Infinity", Some(Autopilot::Cruise)),
+            ("land", Some(Autopilot::Land)),
+            ("wrap-up", Some(Autopilot::Land)),
+            ("WrapUp", Some(Autopilot::Land)),
+            ("wrap", Some(Autopilot::Land)),
+            ("off", Some(Autopilot::Off)),
+            ("Off", Some(Autopilot::Off)),
+            ("on", None),
+            ("true", None),
+            ("false", None),
+            ("none", None),
+            ("wrap it up", None),
+            ("", None),
+        ] {
+            assert_eq!(Autopilot::parse(word), want, "{word:?}");
+        }
+        // The table: its own words without a note; an off however spelled is
+        // `off`, said; anything else keeps `cruise`, said.
+        for (text, want, said) in [
+            ("\"cruise\"", Autopilot::Cruise, None),
+            ("\"land\"", Autopilot::Land, None),
+            ("\"Land\"", Autopilot::Land, None),
+            ("\"off\"", Autopilot::Off, None),
+            ("\"forever\"", Autopilot::Cruise, None),
+            ("\"wrap-up\"", Autopilot::Land, None),
+            ("false", Autopilot::Off, Some("its limit")),
+            ("\"no\"", Autopilot::Off, Some("its limit")),
+            ("0", Autopilot::Off, Some("its limit")),
+            ("\"none\"", Autopilot::Off, Some("its limit")),
+            ("\"disabled\"", Autopilot::Off, Some("its limit")),
+            ("true", Autopilot::Cruise, Some("keeps its default")),
+            (
+                "\"sometimes\"",
+                Autopilot::Cruise,
+                Some("keeps its default"),
+            ),
+            ("3", Autopilot::Cruise, Some("keeps its default")),
+            ("2.5", Autopilot::Cruise, Some("no setting")),
+            ("[\"off\"]", Autopilot::Cruise, Some("no setting")),
+        ] {
+            let (c, notes) =
+                SupervisorConfig::from_aterm_toml(&format!("[harness]\nautopilot = {text}\n"));
+            assert_eq!(c.autopilot, want, "{text}: {notes:?}");
+            assert_eq!(
+                SupervisorConfig {
+                    autopilot: Autopilot::Cruise,
+                    ..c
+                },
+                full,
+                "{text}: nothing else moved"
+            );
+            match said {
+                None => assert!(notes.is_empty(), "{text}: {notes:?}"),
+                Some(word) => assert!(
+                    notes.len() == 1
+                        && notes[0].starts_with("harness.autopilot:")
+                        && notes[0].contains(word),
+                    "{text}: {notes:?}"
+                ),
+            }
+        }
+        let (_, notes) = SupervisorConfig::from_aterm_toml("[harness]\nautopilot = false\n");
+        assert!(
+            notes[0].contains("expected cruise, land or off"),
+            "{notes:?}"
+        );
+        // Power only goes down the order: each step down is a limit, and
+        // its limit is `off`.
+        let land = read("[harness]\nautopilot = \"land\"\n");
+        let off = read("[harness]\nautopilot = \"off\"\n");
+        assert!(land.limits(&full) && off.limits(&full) && off.limits(&land));
+        assert!(!full.limits(&land) && !land.limits(&off), "never up");
+        let mut c = full.clone();
+        c.limit("autopilot");
+        assert_eq!(c, off);
+        // What it writes against the default: a limit, by its own word.
+        assert_eq!(land.against_default().limits, ["autopilot: land"]);
+        assert_eq!(off.against_default().limits, ["autopilot: off"]);
+        assert!(full.texts().contains(&("autopilot", "cruise".to_string())));
+        // Misplaced: it limits, and never grants.
+        assert_eq!(
+            read("[theme]\nharness.autopilot = \"land\"\n").autopilot,
+            Autopilot::Land
+        );
+        assert_eq!(
+            read("[harness]\nautopilot = \"land\"\n[theme]\nharness.autopilot = \"cruise\"\n")
+                .autopilot,
+            Autopilot::Land,
+            "a misplaced key cannot undo the root table's limit"
+        );
+        assert_eq!(
+            read("[harness]\nautopilot = \"land\"\n[theme]\nharness.autopilot = \"off\"\n")
+                .autopilot,
+            Autopilot::Off
+        );
+        // A file that is not TOML: read line by line, the same words.
+        assert_eq!(
+            read("font_px = \n[harness]\nautopilot = \"wrap-up\"\n").autopilot,
+            Autopilot::Land
+        );
+        // The session's word decides over the table's, up or down; no word is
+        // the table's.
+        for table in Autopilot::ALL {
+            let cfg = SupervisorConfig {
+                autopilot: table,
+                ..full.clone()
+            };
+            assert_eq!(cfg.autopilot_for(None), table, "{table:?}");
+            for word in Autopilot::ALL {
+                assert_eq!(cfg.autopilot_for(Some(word)), word, "{table:?} {word:?}");
+            }
+        }
+    }
+
     /// `[harness] limit_reset`: a limit reset is the owner's scarce purchase,
     /// and the rule that takes one has never been run against a real wall,
     /// so the key SHIPS `false` and only the root table's own `true` turns
@@ -1893,8 +2428,8 @@ mod tests {
             .expect("a key");
         assert_eq!(
             (KEYS[at - 1], KEYS[at + 1]),
-            ("accounts", "model_fallback"),
-            "after the accounts, before the model's answer to a limit"
+            ("accounts", "usage_tap"),
+            "after the accounts, before the usage tap"
         );
         // No other key turns it on, written as an on, as its own default or
         // as its limit.
@@ -2016,6 +2551,168 @@ mod tests {
         }
     }
 
+    /// `[harness] usage_notes` (accounts v2 S5): the record of a machine's one
+    /// account's usage and the two digest lines it makes are a new alert, so
+    /// the key SHIPS `false`; the root table's own `true` turns it on, its
+    /// `true` is the owner's own choice against the default and never a
+    /// limit, an off however spelled leaves it off, and a misplaced `true`
+    /// grants nothing. NEGATIVE CONTROLS: the root table's `true` IS read, a
+    /// misplaced `false` still limits, and no other key turns it on.
+    #[test]
+    fn usage_notes_ships_off_and_only_the_root_table_turns_it_on() {
+        let full = SupervisorConfig::default();
+        assert!(!full.usage_notes, "the default is off");
+        assert_eq!(
+            SupervisorConfig::default_shown("usage_notes").as_deref(),
+            Some("false")
+        );
+        let on = SupervisorConfig {
+            usage_notes: true,
+            ..full.clone()
+        };
+        let (c, notes) = SupervisorConfig::from_aterm_toml("[harness]\nusage_notes = true\n");
+        assert_eq!(c, on);
+        assert!(notes.is_empty(), "{notes:?}");
+        for off in ["false", "\"no\"", "0"] {
+            assert_eq!(
+                read(&format!("[harness]\nusage_notes = {off}\n")),
+                full,
+                "{off}"
+            );
+        }
+        assert!(full.limits(&on) && !on.limits(&full));
+        let mut c = on.clone();
+        c.limit("usage_notes");
+        assert_eq!(c, full, "its limit is off");
+        assert_eq!(
+            on.against_default(),
+            Written {
+                limits: Vec::new(),
+                own: vec!["usage_notes"],
+            }
+        );
+        let (c, _) = SupervisorConfig::from_aterm_toml("[theme]\nharness.usage_notes = true\n");
+        assert_eq!(c, full, "misplaced, it grants nothing");
+        assert!(
+            !read("[harness]\nusage_notes = true\n[theme]\nharness.usage_notes = false\n")
+                .usage_notes,
+            "a misplaced off limits all the same"
+        );
+        for key in KEYS.iter().filter(|k| **k != "usage_notes") {
+            let mut c = full.clone();
+            let _ = c.set(key, "true");
+            assert!(!c.usage_notes, "{key} = true");
+        }
+    }
+
+    /// `[harness] usage_tap`: its `true` changes the argv a relaunched
+    /// Claude Code carries, so the key SHIPS `false`, only the root table's
+    /// own `true` turns it on, and against the default it is the owner's own
+    /// choice (`yours: usage_tap`), never a limit. It sits after
+    /// `limit_reset`, before `usage_notes`. NEGATIVE
+    /// CONTROLS: the root table's `true` IS read, `accounts = "off"` beside
+    /// it leaves it on (the tap is a recorder, independent of the accounts),
+    /// a policy that has it on is limited by its `false`, and a misplaced
+    /// `true` grants nothing.
+    #[test]
+    fn usage_tap_ships_off_and_only_the_root_table_turns_it_on() {
+        let full = SupervisorConfig::default();
+        assert!(!full.usage_tap, "the default is off");
+        assert!(!read("").usage_tap && !read("[harness]\n").usage_tap);
+        assert_eq!(
+            SupervisorConfig::default_shown("usage_tap").as_deref(),
+            Some("false")
+        );
+        let at = KEYS.iter().position(|k| *k == "usage_tap").expect("a key");
+        assert_eq!((KEYS[at - 1], KEYS[at + 1]), ("limit_reset", "usage_notes"));
+        for key in KEYS.iter().filter(|k| **k != "usage_tap") {
+            let mut c = full.clone();
+            let _ = c.set(key, "true");
+            assert!(!c.usage_tap, "{key} = true");
+            c.limit(key);
+            assert!(!c.usage_tap, "{key} at its limit");
+        }
+        let on = SupervisorConfig {
+            usage_tap: true,
+            ..full.clone()
+        };
+        for text in ["true", "\"yes\"", "1"] {
+            let (c, notes) =
+                SupervisorConfig::from_aterm_toml(&format!("[harness]\nusage_tap = {text}\n"));
+            assert_eq!(c, on, "{text}");
+            assert!(notes.is_empty(), "{text}: {notes:?}");
+        }
+        for text in ["false", "\"no\"", "0"] {
+            assert_eq!(read(&format!("[harness]\nusage_tap = {text}\n")), full);
+        }
+        let c = read("[harness]\nusage_tap = true\naccounts = \"off\"\n");
+        assert!(c.usage_tap, "the accounts' switch does not silence the tap");
+        assert!(!on.limits(&full), "on is no limit of off");
+        assert!(full.limits(&on), "off limits on");
+        let mut c = on.clone();
+        c.limit("usage_tap");
+        assert_eq!(c, full, "its limit is off");
+        assert_eq!(
+            on.against_default(),
+            Written {
+                limits: Vec::new(),
+                own: vec!["usage_tap"],
+            }
+        );
+        let (c, notes) = SupervisorConfig::from_aterm_toml("[theme]\nharness.usage_tap = true\n");
+        assert_eq!(c, full, "a misplaced true grants nothing");
+        assert!(
+            notes[0].contains("`theme.harness.usage_tap`") && notes[0].contains("changed nothing"),
+            "{notes:?}"
+        );
+        assert!(
+            !read("[harness]\nusage_tap = true\n[theme]\nharness.usage_tap = false\n").usage_tap,
+            "a misplaced off limits all the same"
+        );
+    }
+
+    /// THE AGENTS' OWN SWITCHES, as the effective table lists them: one per
+    /// supervisable program, in `Program::ALL`'s order, each `true` at the
+    /// default, and each text set back onto a default reproduces the policy.
+    /// NEGATIVE CONTROL: one agent's switch Off changes only its own row.
+    #[test]
+    fn agent_texts_are_each_agents_switch_and_read_back() {
+        let full = SupervisorConfig::default();
+        let supervisable: Vec<String> = Program::ALL
+            .into_iter()
+            .filter(|program| program.supervisable())
+            .map(|program| format!("{}.enabled", program.name()))
+            .collect();
+        let keys: Vec<String> = full.agent_texts().into_iter().map(|(k, _)| k).collect();
+        assert_eq!(keys, supervisable);
+        assert!(full.agent_texts().iter().all(|(_, text)| text == "true"));
+        for key in &supervisable {
+            let mut off = full.clone();
+            off.set(key, "false").expect(key);
+            let texts = off.agent_texts();
+            for (k, text) in &texts {
+                assert_eq!(text == "false", k == key, "{key}: {texts:?}");
+                assert_eq!(
+                    SupervisorConfig::default_shown(k).as_deref(),
+                    Some("true"),
+                    "{k}"
+                );
+            }
+            let mut back = full.clone();
+            for (k, text) in &texts {
+                back.set(k, text).expect(k);
+            }
+            assert_eq!(back, off, "{key}");
+        }
+        // A retired key's withheld rule is shown under the key that took it.
+        assert!(full.withheld_texts().is_empty());
+        let (retired, _) = SupervisorConfig::from_aterm_toml("[harness]\nrm_breaker = false\n");
+        assert_eq!(
+            retired.withheld_texts(),
+            [("rm_breaker", "false".to_string())]
+        );
+    }
+
     #[test]
     fn texts_are_the_keys_and_read_back_as_the_policy() {
         let full = SupervisorConfig::default();
@@ -2097,19 +2794,28 @@ mod tests {
                 .limits,
             ["human_grace_s: 600"]
         );
-        // trust_roots is read only where `safe` consults it: fewer roots
-        // there are a limit, more are the owner's own; under `all` neither.
-        let roots = "trust_roots = [\"~/aterm*\"]\n";
+        // trust_roots is read only where `safe` consults it. None is the
+        // default, so `[]` names nothing there, and a person's own folders
+        // are the owner's own; under `all` neither.
+        let roots = "trust_roots = []\n";
         assert!(read(&format!("[harness]\n{roots}")).against_default() == Written::default());
+        let w = read(&format!("[harness]\napprove = \"safe\"\n{roots}")).against_default();
         assert_eq!(
-            read(&format!("[harness]\napprove = \"safe\"\n{roots}"))
-                .against_default()
-                .limits,
-            ["approve: safe", "trust_roots: ~/aterm*"]
+            (w.limits, w.own),
+            (vec!["approve: safe".to_string()], vec![])
         );
-        let more = "trust_roots = [\"~/aterm*\", \"~/ay*\", \"$HOME/trust*\", \"/private/tmp/claude-*\", \"~/x\"]\n";
-        let w = read(&format!("[harness]\napprove = \"safe\"\n{more}")).against_default();
-        assert_eq!((w.limits.len(), w.own), (1, vec!["trust_roots"]));
+        for more in [
+            "trust_roots = [\"~/src/app*\"]\n",
+            "trust_roots = [\"~/src/app*\", \"/srv/work\"]\n",
+        ] {
+            let w = read(&format!("[harness]\napprove = \"safe\"\n{more}")).against_default();
+            assert_eq!(
+                (w.limits.len(), w.own.clone()),
+                (1, vec!["trust_roots"]),
+                "{more}"
+            );
+            assert!(read(&format!("[harness]\n{more}")).against_default() == Written::default());
+        }
     }
 
     /// Owner decision D9: 0.93.0 shipped `approve_all`, `auto_reads`, `rm_breaker`,
@@ -2160,7 +2866,10 @@ read_outside_cwd = false
             (c.approve, c.withheld.read_outside_cwd),
             (Approve::Safe, true)
         );
+        // A root written beside it, since the default holds none: the limit
+        // takes away the roots the same file names.
         let (c, _) = one("[harness]
+trust_roots = [\"~/src/app*\"]
 trust_dialog = false
 ");
         assert_eq!((c.approve, c.trust_roots.len()), (Approve::Safe, 0));
@@ -2493,5 +3202,313 @@ trust_dialog = false
         let o = SuperviseOpts::hosted_with(&on);
         assert!(o.policy.answer_questions);
         assert_eq!(o.policy.question_priority, QuestionPriority::ShortTerm);
+    }
+
+    /// `[harness.<agent>] enabled = false` switches that agent's sessions off
+    /// and nothing else: the master switch and the other agent stay on, in
+    /// every spelling TOML reads as that table's key, and two agents off read
+    /// as one policy whichever table comes first. `true` is accepted and
+    /// changes nothing; the master switch off wins over it. An off however
+    /// spelled is the agent's limit; a value that is no switch keeps it on
+    /// and is said. NEGATIVE CONTROL: the default supervises both.
+    #[test]
+    fn an_agent_table_switches_that_agent_off_and_nothing_else() {
+        let full = SupervisorConfig::default();
+        assert!(full.off.is_empty());
+        assert!(full.on_for(Program::Claude) && full.on_for(Program::Codex));
+        let (c, notes) = SupervisorConfig::from_aterm_toml("[harness.codex]\nenabled = false\n");
+        assert!(notes.is_empty(), "{notes:?}");
+        assert!(!c.on_for(Program::Codex) && c.on_for(Program::Claude));
+        assert!(c.enabled, "the master switch stays on");
+        assert_eq!(
+            SupervisorConfig {
+                off: Vec::new(),
+                ..c
+            },
+            full,
+            "nothing else moved"
+        );
+        for text in [
+            "[harness]\ncodex.enabled = false\n",
+            "harness.codex.enabled = false\n",
+            "harness = { codex = { enabled = false } }\n",
+            "[harness]\ncodex = { enabled = false }\n",
+            "[harness.codex]\nenabled = \"no\"\n",
+            "[harness.codex]\nenabled = 0\n",
+            "[harness.codex]\nenabled = \"none\"\n",
+        ] {
+            assert_eq!(read(text).off, [Program::Codex], "{text:?}");
+        }
+        let both = read("[harness.codex]\nenabled = false\n[harness.claude]\nenabled = false\n");
+        assert_eq!(both.off, [Program::Claude, Program::Codex]);
+        assert_eq!(
+            both,
+            read("[harness.claude]\nenabled = false\n[harness.codex]\nenabled = false\n"),
+            "the same policy in either order"
+        );
+        assert!(both.enabled && !both.on_for(Program::Claude) && !both.on_for(Program::Codex));
+        let (c, notes) = SupervisorConfig::from_aterm_toml("[harness.codex]\nenabled = true\n");
+        assert_eq!((c, notes), (full.clone(), Vec::new()), "`true` is accepted");
+        let c = read("[harness]\nenabled = false\n[harness.codex]\nenabled = true\n");
+        assert!(!c.on_for(Program::Codex) && !c.on_for(Program::Claude));
+        for (text, off, said) in [
+            ("\"none\"", true, "its limit"),
+            ("\"sometimes\"", false, "keeps its default"),
+            ("2.5", false, "no setting"),
+            ("[false]", false, "no setting"),
+        ] {
+            let (c, notes) =
+                SupervisorConfig::from_aterm_toml(&format!("[harness.codex]\nenabled = {text}\n"));
+            assert_eq!(c.on_for(Program::Codex), !off, "{text}: {notes:?}");
+            assert!(
+                notes.len() == 1
+                    && notes[0].starts_with("harness.codex.enabled:")
+                    && notes[0].contains(said),
+                "{text}: {notes:?}"
+            );
+        }
+    }
+
+    /// Only `enabled` is per agent: any other key in an agent's table — a
+    /// `[harness]` key or not — is refused in the unknown key's words, with
+    /// where to write it, and changes nothing, while the `enabled` beside it
+    /// holds. A table under any word that is not a supervisable program's
+    /// exact name is an unknown key, as it always was, and so is an agent's
+    /// name written as a value. NEGATIVE CONTROL: the same key under
+    /// `[harness]` is read.
+    #[test]
+    fn only_enabled_is_per_agent() {
+        let full = SupervisorConfig::default();
+        let (c, notes) = SupervisorConfig::from_aterm_toml(
+            "[harness.codex]\napprove = \"none\"\nenabled = false\ncontinu = false\n",
+        );
+        assert_eq!(c.approve, Approve::All, "{notes:?}");
+        assert_eq!(c.off, [Program::Codex]);
+        assert_eq!(
+            notes,
+            ["approve", "continu"].map(|key| format!(
+                "harness.codex.{key}: {UNKNOWN_KEY}, ignored — only `enabled` is per agent; \
+                 write it under `[harness]`"
+            )),
+            "one note per key"
+        );
+        assert!(notes.iter().all(|n| is_unknown_key_note(n)));
+        assert_eq!(
+            read("[harness]\napprove = \"none\"\n").approve,
+            Approve::None
+        );
+        let (c, notes) =
+            SupervisorConfig::from_aterm_toml("[harness.claude.sub]\nenabled = false\n");
+        assert_eq!(c, full);
+        assert!(
+            notes[0].contains("only `enabled` is per agent"),
+            "{notes:?}"
+        );
+        for id in ["no-such-agent", "Codex", "claude-code", "generic", "sub"] {
+            let (c, notes) =
+                SupervisorConfig::from_aterm_toml(&format!("[harness.{id}]\nenabled = false\n"));
+            assert_eq!(c, full, "{id}");
+            assert!(
+                notes.len() == 1
+                    && notes[0].starts_with(&format!("harness.{id}:"))
+                    && is_unknown_key_note(&notes[0])
+                    && !notes[0].contains("per agent"),
+                "{id}: {notes:?}"
+            );
+        }
+        let (c, notes) = SupervisorConfig::from_aterm_toml("[harness]\ncodex = false\n");
+        assert_eq!(c, full);
+        assert!(is_unknown_key_note(&notes[0]), "{notes:?}");
+    }
+
+    /// Written below another table's header, an agent's table may only limit,
+    /// like every `[harness]` key: its `false` switches the agent off all the
+    /// same, and its `true` never undoes the root table's `false`, whichever
+    /// comes first in the file. Each such key is named.
+    #[test]
+    fn a_misplaced_agent_table_only_limits() {
+        let (c, notes) =
+            SupervisorConfig::from_aterm_toml("[theme]\nharness.codex.enabled = false\n");
+        assert_eq!(c.off, [Program::Codex]);
+        assert!(
+            notes[0].contains("`theme.harness.codex.enabled`")
+                && notes[0].contains("limits all the same"),
+            "{notes:?}"
+        );
+        let (c, notes) = SupervisorConfig::from_aterm_toml(
+            "[harness.codex]\nenabled = false\n[theme]\nharness.codex.enabled = true\n",
+        );
+        assert_eq!(c.off, [Program::Codex]);
+        assert!(notes[0].contains("changed nothing"), "{notes:?}");
+        assert_eq!(
+            read("[a]\nharness.codex.enabled = true\n[harness.codex]\nenabled = false\n").off,
+            [Program::Codex]
+        );
+        assert_eq!(
+            read("[theme.harness.claude]\nenabled = false\n").off,
+            [Program::Claude]
+        );
+        let (c, notes) =
+            SupervisorConfig::from_aterm_toml("[theme.harness.codex]\napprove = \"none\"\n");
+        assert_eq!(c, SupervisorConfig::default());
+        assert!(
+            notes[0].contains("changed nothing")
+                && notes[0].contains("only `enabled` is per agent"),
+            "{notes:?}"
+        );
+    }
+
+    /// Each key of an agent's table is said on its own, as a root key is: the
+    /// note for a key that was read never rides with a refused one beside it,
+    /// so a reader that leaves unknown-key notes out (the window's) still
+    /// shows it, at the root and below another header; and the TOML reader
+    /// and the line-by-line one say the same of each misplaced key.
+    /// NEGATIVE CONTROL: the refused key's own note is an unknown key's.
+    #[test]
+    fn each_key_of_an_agent_table_is_said_on_its_own() {
+        const MISPLACED: &str =
+            "[theme]\nharness.codex.enabled = false\nharness.codex.approve = \"none\"\n";
+        for (text, read_note) in [
+            (
+                "[harness.codex]\nenabled = \"none\"\nfoo = 1\n",
+                "its limit",
+            ),
+            (MISPLACED, "limits all the same"),
+        ] {
+            let (c, notes) = SupervisorConfig::from_aterm_toml(text);
+            assert_eq!(c.off, [Program::Codex], "{text:?}");
+            let (unknown, shown): (Vec<_>, Vec<_>) =
+                notes.iter().partition(|n| is_unknown_key_note(n));
+            assert!(
+                shown.len() == 1
+                    && shown[0].starts_with("harness.codex.enabled:")
+                    && shown[0].contains(read_note),
+                "{text:?}: {notes:?}"
+            );
+            assert!(
+                unknown.len() == 1 && unknown[0].contains("only `enabled` is per agent"),
+                "{text:?}: {notes:?}"
+            );
+        }
+        let (by_toml, mut toml) = SupervisorConfig::from_aterm_toml(MISPLACED);
+        let (by_lines, mut lines) =
+            SupervisorConfig::from_aterm_toml(&format!("font_px = \n{MISPLACED}"));
+        assert!(
+            lines.remove(0).starts_with("aterm.toml is not valid TOML"),
+            "the fixture must be one the parser refuses"
+        );
+        assert_eq!(by_toml, by_lines);
+        toml.sort();
+        lines.sort();
+        assert_eq!(toml, lines, "both readers say the same of each key");
+    }
+
+    /// A file the TOML parser refuses is read line by line for an agent's
+    /// table too, in every one-line spelling; said twice, its key may only
+    /// limit, and another header's still limits. NEGATIVE CONTROLS: an agent
+    /// switched on, a table for no agent, an array of tables, an off quoted
+    /// in a text or a comment, and another key there change nothing.
+    #[test]
+    fn a_file_that_is_not_toml_reads_an_agent_table_too() {
+        const TYPO: &str = "font_px = \n";
+        for tail in [
+            "[harness.codex]\nenabled = false\n",
+            "[harness]\ncodex.enabled = false\n",
+            "harness.codex.enabled = false\n",
+            "harness = { codex = { enabled = false } }\n",
+            "[harness.codex]\nenabled = false\nenabled = true\n",
+            "[harness.codex]\nenabled = true\nenabled = false\n",
+            "[theme]\nharness.codex.enabled = false\n",
+        ] {
+            let text = format!("{TYPO}{tail}");
+            assert!(
+                aterm_toml::from_str::<aterm_toml::Value>(&text).is_err(),
+                "the fixture must be one the parser refuses: {text:?}"
+            );
+            let c = read(&text);
+            assert_eq!(c.off, [Program::Codex], "{text:?}");
+            assert!(c.on_for(Program::Claude), "{text:?}");
+        }
+        for tail in [
+            "[harness.codex]\nenabled = true\n",
+            "[harness.no-such-agent]\nenabled = false\n",
+            "[[harness.codex]]\nenabled = false\n",
+            "[harness.codex]\nnote = \"enabled = false\"\n",
+            "# harness.codex.enabled = false\n",
+            "[harness.codex]\napprove = \"none\"\n",
+        ] {
+            let text = format!("{TYPO}{tail}");
+            assert_eq!(read(&text), SupervisorConfig::default(), "{text:?}");
+        }
+        let (_, notes) = SupervisorConfig::from_aterm_toml(&format!(
+            "{TYPO}[harness.codex]\napprove = \"none\"\n"
+        ));
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("only `enabled` is per agent")),
+            "{notes:?}"
+        );
+    }
+
+    /// An agent switched off is a limit, by the measure every misplaced key is
+    /// held to, and back on is none; against the default it is named as
+    /// `<agent>: off`, after the keys. Its switch is also a key of
+    /// `SupervisorConfig::set`, `limit` and `default_shown`, as
+    /// `<agent>.enabled`.
+    #[test]
+    fn an_agent_switched_off_is_a_limit_and_named_as_one() {
+        let full = SupervisorConfig::default();
+        let off = read("[harness.codex]\nenabled = false\n");
+        assert!(off.limits(&full), "an agent off limits");
+        assert!(!full.limits(&off), "an agent back on is no limit");
+        assert_eq!(
+            off.against_default(),
+            Written {
+                limits: vec!["codex: off".to_string()],
+                own: Vec::new(),
+            }
+        );
+        let text = "[harness]\napprove = \"safe\"\n[harness.codex]\nenabled = false\n\
+                    [harness.claude]\nenabled = false\n";
+        assert_eq!(
+            read(text).against_default().limits,
+            ["approve: safe", "claude: off", "codex: off"]
+        );
+        let mut c = full.clone();
+        c.limit("codex.enabled");
+        assert_eq!(c, off);
+        let mut c = full.clone();
+        c.set("codex.enabled", "false").expect("a switch");
+        assert_eq!(c, off);
+        c.set("codex.enabled", "true").expect("a switch");
+        assert_eq!(c, off, "`true` changes nothing");
+        assert!(c.set("codex.approve", "none").is_err());
+        assert_eq!(c, off);
+        assert_eq!(
+            SupervisorConfig::default_shown("codex.enabled").as_deref(),
+            Some("true")
+        );
+        for key in ["codex.approve", "no-such-agent.enabled", "codex"] {
+            assert_eq!(SupervisorConfig::default_shown(key), None, "{key}");
+        }
+    }
+
+    /// No `[harness]` key, retired key or sub-table (`disk`) is an agent's
+    /// name, so `[harness.<agent>]` can never be read as one of them nor one
+    /// of them as an agent's table: over the real tables and the real
+    /// resolver. Controls: each supervisable program's own name is one, and
+    /// no other spelling of it is.
+    #[test]
+    fn no_harness_key_is_an_agents_name() {
+        for word in KEYS.iter().chain(RETIRED_KEYS).chain(&["disk"]) {
+            assert_eq!(agent_named(word), None, "{word}");
+        }
+        for agent in Program::ALL.into_iter().filter(|p| p.supervisable()) {
+            assert_eq!(agent_named(agent.name()), Some(agent));
+        }
+        for near in ["claude-code", "Claude", "CODEX", " codex", "generic", ""] {
+            assert_eq!(agent_named(near), None, "{near:?}");
+        }
     }
 }

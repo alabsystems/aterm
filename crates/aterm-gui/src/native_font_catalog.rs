@@ -38,6 +38,14 @@ pub(crate) struct Request {
     pub(crate) primary: PrimarySeed,
 }
 
+/// One font row whose authored name no resolver found: the setting's key
+/// and the name as written. The terminal kept what it had for that slot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FontRefusal {
+    pub(crate) key: &'static str,
+    pub(crate) family: String,
+}
+
 pub(crate) struct PreparedFonts {
     pub(crate) renderer: aterm_render::Renderer,
     pub(crate) family: Option<String>,
@@ -57,6 +65,7 @@ pub(crate) struct Completion {
     pub(crate) sparkle: crate::app_config::PreparedSparkleRuntime,
     pub(crate) fonts: Option<PreparedFonts>,
     pub(crate) warnings: Vec<String>,
+    pub(crate) font_refusals: Vec<FontRefusal>,
 }
 
 /// Complete immutable config generation consumed by the event-loop reducer.
@@ -72,6 +81,8 @@ pub(crate) struct PreparedConfigGeneration {
     pub(crate) sparkle: crate::app_config::PreparedSparkleRuntime,
     pub(crate) fonts: Option<PreparedFonts>,
     pub(crate) warnings: Vec<String>,
+    /// The font rows Settings marks "Not found" for this generation.
+    pub(crate) font_refusals: Vec<FontRefusal>,
 }
 
 impl Completion {
@@ -86,6 +97,7 @@ impl Completion {
             sparkle: self.sparkle,
             fonts: self.fonts,
             warnings: self.warnings,
+            font_refusals: self.font_refusals,
         }
     }
 }
@@ -235,6 +247,32 @@ pub(crate) fn prepare(request: Request) -> Completion {
             .cloned()
     };
     let mut warnings = Vec::new();
+    // The font rows Settings marks "Not found": each authored name no
+    // resolver found. The family row only when the terminal asked for it,
+    // not for a launch font or a display face standing in front of it.
+    let refused =
+        |index: Option<usize>| index.filter(|index| batch.get(*index).is_some_and(Result::is_err));
+    let mut font_refusals = Vec::new();
+    let family_requested = requested_family.as_deref().map(str::trim)
+        == source_config.font_family.as_deref().map(str::trim);
+    for (key, index) in [
+        (
+            crate::prefs::EDIT_FONT_FAMILY,
+            primary_i.filter(|_| family_requested),
+        ),
+        (crate::prefs::EDIT_FONT_FAMILY_BOLD, style_i[0]),
+        (crate::prefs::EDIT_FONT_FAMILY_ITALIC, style_i[1]),
+        (crate::prefs::EDIT_FONT_FAMILY_BOLD_ITALIC, style_i[2]),
+        (crate::prefs::EDIT_SYMBOL_FONT, symbol_i),
+        (crate::prefs::EDIT_EMOJI_FONT, emoji_i),
+    ] {
+        if let Some(index) = refused(index) {
+            font_refusals.push(FontRefusal {
+                key,
+                family: names[index].clone(),
+            });
+        }
+    }
 
     let (primary_path, primary_bytes, family) = match primary_i.and_then(admitted) {
         Some(asset) => (
@@ -308,6 +346,7 @@ pub(crate) fn prepare(request: Request) -> Completion {
                 sparkle,
                 fonts: None,
                 warnings,
+                font_refusals,
             };
         }
     };
@@ -380,6 +419,11 @@ pub(crate) fn prepare(request: Request) -> Completion {
             Ok(()) => config.symbol_font = Some(asset.path),
             Err(error) => warnings.push(format!("config symbol_font rejected ({error})")),
         }
+    } else if let Some(index) = symbol_i {
+        warnings.push(format!(
+            "config symbol_font {:?} was not admitted",
+            names[index]
+        ));
     }
     if symbol_i.is_some()
         && config.symbol_font.is_none()
@@ -392,6 +436,11 @@ pub(crate) fn prepare(request: Request) -> Completion {
             Ok(()) => config.emoji_font = Some(asset.path),
             Err(error) => warnings.push(format!("config emoji_font rejected ({error})")),
         }
+    } else if let Some(index) = emoji_i {
+        warnings.push(format!(
+            "config emoji_font {:?} was not admitted",
+            names[index]
+        ));
     }
     if emoji_i.is_some()
         && config.emoji_font.is_none()
@@ -432,6 +481,7 @@ pub(crate) fn prepare(request: Request) -> Completion {
             chrome,
         }),
         warnings,
+        font_refusals,
     }
 }
 
@@ -519,6 +569,47 @@ mod tests {
         }
     }
 
+    /// A name no resolver finds is refused on its own row: the family row,
+    /// and the emoji row, which used to fail without a word.
+    #[test]
+    fn an_unknown_font_name_is_refused_on_its_own_row() {
+        let completion = prepare(request_with_text(
+            1,
+            "font_family = \"NoSuchFontXYZ\"\nemoji_font = \"NoSuchEmoji\"\n",
+        ));
+        let refused = completion
+            .font_refusals
+            .iter()
+            .map(|refusal| (refusal.key, refusal.family.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            refused,
+            [
+                (crate::prefs::EDIT_FONT_FAMILY, "NoSuchFontXYZ"),
+                (crate::prefs::EDIT_EMOJI_FONT, "NoSuchEmoji"),
+            ]
+        );
+        assert!(
+            completion
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("emoji_font \"NoSuchEmoji\"")),
+            "{:?}",
+            completion.warnings
+        );
+        // A display face in front of an unknown family: the terminal never
+        // asked for the family, so its row is not refused.
+        let display = prepare(request_with_text(
+            2,
+            "font_family = \"NoSuchFontXYZ\"\ndisplay_font = \"pixel\"\n",
+        ));
+        assert!(
+            display.font_refusals.is_empty(),
+            "{:?}",
+            display.font_refusals
+        );
+    }
+
     #[test]
     fn ui_request_lane_is_bounded_and_retains_latest_generation() {
         let (mut lane, receiver) = Lane::test_pair();
@@ -595,8 +686,6 @@ mod tests {
         prepared: Vec<(i64, Arc<crate::app_config::ConfigAssetCatalog>)>,
         /// The theme generation of the last completion the worker produced.
         completed_theme: i64,
-        /// Sticky: a publication was ever seen naming a superseded theme.
-        stale_published: i64,
     }
 
     impl ThemeTrace {
@@ -624,9 +713,6 @@ mod tests {
                     as i64
             };
             let theme = generation(app.theme_catalog_generation);
-            if published != 0 && published_theme != theme {
-                self.stale_published = 1;
-            }
             Ok(std::collections::BTreeMap::from([
                 ("requested", generation(app.requested_font_catalog_sequence)),
                 ("theme", theme),
@@ -634,7 +720,6 @@ mod tests {
                 ("completed_theme", self.completed_theme),
                 ("published", published),
                 ("published_theme", published_theme),
-                ("stale_published", self.stale_published),
             ]))
         }
 
@@ -684,7 +769,6 @@ mod tests {
             ],
             prepared: Vec::new(),
             completed_theme: 0,
-            stale_published: 0,
         };
         let mut state = trace.project(&app, None)?;
         if state != model.init_state() {

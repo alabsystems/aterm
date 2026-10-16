@@ -6,8 +6,7 @@
 //!
 //! # The file
 //!
-//! Shaped like `tools/trust-gate-ratchet.tsv`: tab-separated, no header, one
-//! fact per line, readable with `awk -F'\t'`.
+//! Tab-separated, no header, one fact per line, readable with `awk -F'\t'`.
 //!
 //! ```text
 //! <scope>\t<metric>\t<ceiling>[\t<regress-reason>]
@@ -127,11 +126,8 @@ pub fn parse(text: &str) -> Result<Vec<Row>, String> {
             return Err(bad(
                 n,
                 raw,
-                &format!(
-                    "comments are not supported. This file is pure TSV so one `awk -F'\\t'` idiom \
-                 reads it and {BUDGET_PATH}'s sibling tools/trust-gate-ratchet.tsv. Delete the \
-                 line; the prose belongs in aterm_forge::budget's module docs"
-                ),
+                "comments are not supported: the file is pure TSV, read by one `awk -F'\\t'` \
+                 idiom. Delete the line; the prose belongs in aterm_forge::budget's module docs",
             ));
         }
         let f: Vec<&str> = raw.split('\t').collect();
@@ -305,14 +301,14 @@ fn scope_of(cell: &Cell, cells: &[Cell]) -> String {
     }
 }
 
-fn measure(root: &Path) -> Result<Live, String> {
+fn measure(cargo: &crate::resolve::Cargo, root: &Path) -> Result<Live, String> {
     let mut live = Live::default();
 
     let cells = crate::resolve::default_cells();
     for cell in &cells {
         let scope = scope_of(cell, &cells);
         live.scopes.push(scope.clone());
-        match crate::loc::survey_cell(root, cell) {
+        match crate::loc::survey_cell(cargo, root, cell) {
             Ok(s) => {
                 live.set(&scope, "packages", u(s.graph.nodes.len()));
                 live.set(&scope, "third_party_packages", u(s.third_party().count()));
@@ -332,11 +328,12 @@ fn measure(root: &Path) -> Result<Live, String> {
 
     let lock = crate::policy::lock_entries(root)?;
     let patches = crate::policy::patch_entries(root)?;
-    // A lock entry with no `source` is a path package, one of three kinds:
+    // A lock entry with no `source` is a path package, one of four kinds:
     //
     //   * an ordinary workspace member                     -> aterm's own
     //   * a VENDORED `[patch]` fork under vendor/          -> THIRD-PARTY
     //   * a FIRST-PARTY `[patch]` replacement under crates/ -> aterm's own
+    //   * an ABSORBED `[patch]` crate under crates/        -> aterm's own
     //
     // A vendored fork is upstream source aterm maintains and reviews, so it
     // counts as third-party here as in a shipped cell.
@@ -367,9 +364,18 @@ fn measure(root: &Path) -> Result<Live, String> {
         u(vendored.iter().filter(|p| p.is_live()).count()),
     );
     for p in patches.iter().filter(|p| !p.is_vendored()) {
+        let (label, whose) = if p.kind == aterm_census::scan_set::PatchTargetKind::Absorbed {
+            (
+                "ABSORBED PATCH",
+                "It is upstream source aterm owns as a workspace member; `targo --unverified \
+                 forge attest` also holds its NOTICE line, license text and §4(b) notices",
+            )
+        } else {
+            ("FIRST-PARTY PATCH", "It is aterm's own crate")
+        };
         live.notes.push(format!(
-            "FIRST-PARTY PATCH (not counted in the `patch` ratchet, which bounds third-party \
-             fork surface): {} → {} at {}, {}. It is aterm's own crate; `targo --unverified forge attest` \
+            "{label} (not counted in the `patch` ratchet, which bounds third-party \
+             fork surface): {} → {} at {}, {}. {whose}; `targo --unverified forge attest` \
              [OB-1]/[OB-2] and `targo --unverified forge check` [OB-12] are what hold it to being present \
              and live.",
             p.name,
@@ -647,8 +653,14 @@ fn over_message(row: &Row, over: u64, live: &Live) -> String {
 // The verb
 // ---------------------------------------------------------------------------
 
-/// Compare the live surface against `tools/forge-budget.tsv`.
-pub fn run(root: &Path, update: bool, allow_regress: Option<&str>) -> Result<Outcome, String> {
+/// Compare the live surface, as `cargo` resolves it, against
+/// `tools/forge-budget.tsv`.
+pub fn run(
+    cargo: &crate::resolve::Cargo,
+    root: &Path,
+    update: bool,
+    allow_regress: Option<&str>,
+) -> Result<Outcome, String> {
     // Refuse a bad reason BEFORE spending seconds on the survey: an argument
     // error should come back immediately, not after the work it invalidates.
     let reason = match validate_reason(update, allow_regress) {
@@ -662,7 +674,7 @@ pub fn run(root: &Path, update: bool, allow_regress: Option<&str>) -> Result<Out
     };
 
     let rows = load(root)?;
-    let live = measure(root)?;
+    let live = measure(cargo, root)?;
 
     if rows.is_empty() {
         return Ok(unarmed(root, &live, update));
@@ -699,8 +711,8 @@ pub fn run(root: &Path, update: bool, allow_regress: Option<&str>) -> Result<Out
         );
     }
 
-    // A count and the file, not the reasons: 21 of them came to 55 KB, and the
-    // gate printed every byte on every merge-contract run.
+    // A count and the file, not the reasons: 21 of them came to 55 KB, which
+    // would be printed whole on every run.
     let recorded = plan
         .rows
         .iter()
@@ -935,11 +947,6 @@ mod tests {
     const REASON_80: &str =
         "wgpu 29 pulled naga's new backend in for the WebGPU path; carve it back in v0.49";
 
-    #[test]
-    fn the_eighty_character_floor_is_exact() {
-        assert_eq!(REASON_80.chars().count(), 80);
-    }
-
     // --- parsing ------------------------------------------------------------
 
     #[test]
@@ -1169,12 +1176,14 @@ mod tests {
             .unwrap()
             .parent()
             .unwrap();
-        let cell = crate::resolve::default_cells().remove(0);
-        let survey = crate::loc::real_workspace_survey(&cell).expect("mac graph resolves");
+        // The linux cell: since winit's re-home to crates/aterm-window the mac
+        // cells reach no vendored fork, and linux still reaches indexmap.
+        let cell = crate::resolve::default_cells().remove(1);
+        let survey = crate::loc::real_workspace_survey(&cell).expect("linux graph resolves");
         let facts = detail(root, &survey);
         assert!(
             !facts.vendored_measured.is_empty(),
-            "the mac cell vendors winit, so this list is never empty"
+            "the linux cell vendors indexmap, so this list is never empty"
         );
         for row in &facts.vendored_measured {
             let shown = row

@@ -145,14 +145,12 @@ fn a_capture_at_an_injected_instant_is_deterministic() {
 }
 
 /// Every admitted glyph (and the `!` fallback) paints ink in the glyph cell
-/// through the headless CPU renderer. Skipped on a machine with no system
-/// monospace font, like every capture test.
+/// through the headless CPU renderer; skipped with no system monospace font.
 ///
 /// Two rows are posted so the probed row is not the band's last, whose seam
 /// underline would read as ink; the blank cell left of the glyph is the
-/// control. One renderer, one snapshot per glyph, no retry: a fresh
-/// renderer's provisional `.notdef` for a fallback-face glyph is resolved in
-/// `aterm_render::Renderer::render_input`, and a retry would hide a regression.
+/// control. No retry: `Renderer::render_input` resolves a fresh renderer's
+/// provisional `.notdef`, and a retry would hide a regression there.
 #[test]
 fn every_admitted_glyph_paints_a_non_blank_cell_headless() {
     let theme = aterm_render::Theme::default();
@@ -192,7 +190,7 @@ fn every_admitted_glyph_paints_a_non_blank_cell_headless() {
             frame.width >= x_pad + (GLYPH_COL + 1) * cw && frame.height >= y0 + ch,
             "{ch_:?}"
         );
-        // The row's divider (ruling 260) is a rule, not ink.
+        // The row's divider is a rule, not ink.
         let colors = crate::chrome_band::band_colors(theme);
         let divider = packed(crate::chrome_band::mix3(
             colors.bar_bg,
@@ -208,8 +206,8 @@ fn every_admitted_glyph_paints_a_non_blank_cell_headless() {
                 })
                 .count()
         };
-        // The icon may spill into the blank cells beside it (ruling
-        // 258), never as far as the middle of either.
+        // The icon may spill into the blank cells beside it, never as far as
+        // the middle of either.
         assert_eq!(
             ink(x_pad..x_pad + cw / 2),
             0,

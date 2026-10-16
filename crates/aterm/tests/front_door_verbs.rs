@@ -16,6 +16,10 @@
 //! stdin exercises the branch that was wrong.
 
 #![cfg(unix)]
+#![allow(
+    clippy::disallowed_types,
+    reason = "test code: a stand-in child may inherit descriptors"
+)]
 
 use std::io::Read;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -54,18 +58,7 @@ const DEADLINE: Duration = Duration::from_secs(60);
 fn on_a_terminal(root: &Path, args: &[&str]) -> String {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
     isolated(&mut cmd, root).args(args);
-    capture_on_a_terminal(cmd, Drain::WhileItRuns)
-}
-
-/// When [`capture_on_a_terminal`] reads the terminal.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Drain {
-    /// As bytes arrive, and once more after the exit: the real capture.
-    WhileItRuns,
-    /// Only after the child has exited: a reader the machine scheduled late,
-    /// taken on purpose (a child that writes more than the terminal's buffer
-    /// would stall here, so only a short writer is run this way).
-    OnlyAfterExit,
+    capture_on_a_terminal(cmd)
 }
 
 /// Run `cmd` with a REAL terminal on all three streams and return everything
@@ -81,15 +74,14 @@ enum Drain {
 /// its own until EOF, so whenever that thread was scheduled only after the
 /// short-lived verb had exited — a loaded machine — the verb's whole answer
 /// was lost: `every_verb_answers_the_same_with_or_without_a_terminal` went
-/// red comparing an empty terminal answer with the pipe's (seen again in the
-/// merge gate, 2026-10-09, load 70), and
-/// `every_verb_is_routed_by_the_front_door_at_a_terminal` could pass on an
+/// red comparing an empty terminal answer with the pipe's (at a load of 70),
+/// and `every_verb_is_routed_by_the_front_door_at_a_terminal` could pass on an
 /// empty answer that proved nothing. Holding the slave, the master never sees
 /// EOF, so it is read without blocking while the child runs (the child can
 /// never stall on a full buffer) and once more after its exit, when everything
 /// it wrote is already in the terminal's queue. What a descendant writes after
 /// the direct child has exited is not waited for.
-fn capture_on_a_terminal(mut cmd: Command, drain: Drain) -> String {
+fn capture_on_a_terminal(mut cmd: Command) -> String {
     // Both ends close-on-exec from birth: the child holds its terminal and never
     // a copy of its master, and no sibling test's child inherits either end.
     let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
@@ -113,9 +105,7 @@ fn capture_on_a_terminal(mut cmd: Command, drain: Drain) -> String {
     let mut out = Vec::new();
     let start = Instant::now();
     loop {
-        if drain == Drain::WhileItRuns {
-            read_available(&mut pty, &mut out, start);
-        }
+        read_available(&mut pty, &mut out, start);
         match child.try_wait().expect("wait on the child") {
             Some(_) => break,
             None if start.elapsed() >= DEADLINE => {
@@ -265,18 +255,4 @@ fn an_uninstalled_roster_tool_names_the_install_not_an_unknown_command() {
         assert!(!out.contains("unknown option"), "{out:?}");
         assert!(!out.contains("unknown command"), "{out:?}");
     }
-}
-
-/// THE CAPTURE KEEPS WHAT A CHILD WROTE BEFORE IT EXITED, however late the
-/// terminal is read: the answer of a verb that exits in a moment is read only
-/// after its exit here, on purpose — the reader a loaded machine schedules
-/// late. The capture that dropped its slave at once lost every byte of it on
-/// macOS ([`capture_on_a_terminal`]).
-#[test]
-fn a_terminal_read_after_the_child_exited_still_has_its_answer() {
-    const MARK: &str = "front-door-capture-mark";
-    let mut cmd = Command::new("/bin/echo");
-    cmd.arg(MARK);
-    let out = capture_on_a_terminal(cmd, Drain::OnlyAfterExit);
-    assert_eq!(out, format!("{MARK}\n"));
 }

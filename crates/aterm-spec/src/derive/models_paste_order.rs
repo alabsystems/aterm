@@ -117,7 +117,7 @@ pub fn paste_order_sink_isolation_model() -> Model {
                 };
             }
 
-            invariant PendingIsBounded: pending_a <= 2 && pending_b <= 2;
+            bound PendingIsBounded: pending_a <= 2 && pending_b <= 2;
             invariant DecisionReadsOnlySelectedSink: phase == 0
                 || (selected == 1 && decision == if pending_a > 0 { 1 } else { 0 })
                 || (selected == 2 && decision == if pending_b > 0 { 1 } else { 0 });

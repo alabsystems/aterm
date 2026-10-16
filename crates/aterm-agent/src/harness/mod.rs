@@ -3,16 +3,18 @@
 
 //! The harness core: the pure judgments behind the aterm wrapper
 //! (`docs/DESIGN-aterm-wrapper-2026-09-17.md`) and the read verbs over them.
-//! Nothing here types into a session; the one engine that acts is
-//! [`crate::supervise`].
+//! The session loop lives in [`crate::supervise`]; this module supplies its
+//! read views and policy, plus the relaunch and upgrade adapters that act on
+//! a session through the control protocol.
 //!
 //! * [`source`] — WHERE DID THIS FACT COME FROM, once: the one [`source::Source`]
 //!   vocabulary [`usage`] and `harness limits` print.
 //! * [`usage`] — the transcript's usage rows, read into one view; the HUD
 //!   line and the `harness usage --json` shape (design §5.2; `"windows"`
-//!   stays an empty object there); and the `/usage` panel's painted windows
-//!   `harness limits` prints beside the wall the engine's own reader names
-//!   (`aterm_phase::wall`, the one wall classifier).
+//!   stays an empty object there); and the windows Claude Code's `/usage`
+//!   panel and Codex's `/status` card paint, which `harness limits` prints
+//!   beside the wall the engine's own reader names (`aterm_phase::wall`, the
+//!   one wall classifier).
 //! * [`disk`] — DISK WATCH AND CLEANUP (design §5.5): the free-space figure
 //!   and the stale targets, each row carrying the WITNESS that makes it safe
 //!   to remove. Report-only is the shape of the function, not a flag.
@@ -20,6 +22,12 @@
 //! * [`footer`] — the Claude Code footer aterm paints in place of the vendor's
 //!   permission-mode row: model + effort, working directory, branch, read
 //!   from the files Claude Code already keeps.
+//! * [`spend`] — THE DOLLAR FIGURES of the account stats: every transcript
+//!   of a Claude Code home folded into list-price dollars per time bucket
+//!   (the shipped, dated `prices.toml`, injected), kept with byte cursors in
+//!   a spend file so a second fold reads only appended bytes, and a window's
+//!   capacity (`C ≥ $ ÷ used`) and what is left (`≈ C × (1 − used)`). A leaf
+//!   that nothing deciding anything imports.
 //! * [`session_usage`] — THIS session's usage, one implementation for the
 //!   footer and `harness usage`: its tokens per model, folded incrementally
 //!   from its own transcript and its subagents' (live), and the limit wall
@@ -30,10 +38,10 @@
 //!   Code's mode pill, toggled through its own shift+tab, read back after
 //!   every press. Fast mode has no light of aterm's: Claude draws its own `↯`.
 //! * [`cli`] — THE COMMAND: `aterm harness usage|limits|disk|ledger`, the
-//!   read views, `accounts` (the roster's report and its `add`, `login`,
-//!   `check` and `use`, over [`accounts`]), `upgrade` (one hand-run pass of
-//!   the live upgrade) and `upgrade models` (its model priority list), plus
-//!   the retired hook-bridge verbs answered as tombstones.
+//!   read views, `accounts` (the roster's report and its `add`, `login` and
+//!   `use`, over [`accounts`]), `upgrade` (one hand-run pass of the live
+//!   upgrade) and `upgrade models` (its model priority list), plus the
+//!   retired hook-bridge verbs answered as tombstones.
 //! * [`upgrade`], [`upgrade_drive`], [`upgrade_wake`] — THE LIVE UPGRADE of a
 //!   running Claude Code or Codex onto a newer build: the pure plan, its steps
 //!   over one tab or every session, and atpkg's activation notice as a push.
@@ -56,15 +64,22 @@
 //!   LADDER that moves a session onto the newest model of ITS OWN family the
 //!   build offers — and only with none newer, up the list for a model nobody
 //!   chose; never down — on its relaunch line (`--model`, never `/model`).
+//! * [`lanes`] — WHICH LANES ARE WRITTEN FOR AN AGENT: the relaunch on exit,
+//!   the live upgrade and the restart in place, one [`lanes::Lanes`] per
+//!   program. agy is supervised with none (its exit is not relaunched, its
+//!   build not moved live), and Muse Code is not supervised.
 //! * [`relaunch`] — THE RELAUNCH PRIMITIVE both the upgrade and relaunch on
 //!   exit use: an agent that no longer runs started again in its own tab, on
 //!   its own conversation (Claude Code's `--resume`, Codex's `resume`), and
 //!   the host's per-session back-off.
-//! * [`resume`] — THE RESUME COMMAND a person is told to run for a frozen
-//!   Claude Code: `claude --resume <this process's own
-//!   conversation>` with its launch flags carried, read from Claude Code's
-//!   own `sessions/<pid>.json` — never `claude --continue`, which resumes the
-//!   directory's newest conversation, a sibling tab's where two share it.
+//! * [`resume`] — THE RESUME COMMAND a person is told to run for an agent
+//!   the harness cannot bring back itself: for Claude Code, `claude --resume
+//!   <this process's own conversation>` with its launch flags carried, read
+//!   from Claude Code's own `sessions/<pid>.json` — never `claude
+//!   --continue`, which resumes the directory's newest conversation, a
+//!   sibling tab's where two share it; for Codex, `codex resume <its kept
+//!   flags> <its thread>` ([`resume::codex_command`]), none where the thread
+//!   is not its own beyond doubt.
 //! * [`netwatch`] — THE API'S REACH, pure: which route an agent takes, what
 //!   one probe of the default route may conclude, and the one instance's
 //!   measure and schedule while a supervised session waits at a wall the
@@ -77,87 +92,39 @@
 //!   (`Stay | Probe | Move | Wait`), and the store for its state and ledger.
 //!   It touches no session and reads no credential; it chooses a login and
 //!   leaves the Claude home alone.
+//! * [`profile`] — CLAUDE CODE'S PROFILE, READ BY AN ALLOWLIST
+//!   (`docs/DESIGN-account-stats-2026-10-15.md`): the plan and its tier, the
+//!   usage-credits word, the cached `/usage` body and how the plan bills
+//!   Fable, from the `.claude.json` of a home, and the account's key hashed
+//!   from its id — never a field off the list, so never the credentials
+//!   that file can hold. `accounts stats` prints it.
+//! * [`acts`] — WHAT THE HARNESS JUST DID, AND HOW A LANDING ENDED, in the
+//!   words the window shows (`docs/DESIGN-harness-autopilot-2026-10-15.md`
+//!   §9): an act the Autopilot chip lights for a moment, the page's counter
+//!   a ledger row adds to, and the task's face under Land that `status
+//!   task=` prints.
+//! * [`stats`] — WHAT THE HARNESS DID, for Settings ▸ Harness
+//!   (`docs/DESIGN-harness-autopilot-2026-10-15.md` §4): boxes approved,
+//!   questions answered, continuations, Land's wrap-ups, resumes after walls,
+//!   relaunches, upgrades, escalations and the time they waited on a person,
+//!   folded from the ledgers the supervisor and the live upgrade already
+//!   write — each fact from one file, read bounded, nothing created.
 //!
 //! [`crate::supervise`] is the one supervisor; the second harness stack this
 //! module once held is gone (design §0.4 is the record).
 //!
-//! STATUS (docs/README.md honesty ratchet): unit-tested; these bounded
-//! machines carry a derived model in `aterm-spec` with a Tier-1 bind to the
-//! real code — `harness_capture_worker_lifecycle_model` ([`align`]'s runner,
-//! in its tests), `harness_upgrade_notice_owner_model` (a READY acted on only
-//! from the process and tab its notice reached, and a notice whose process is
-//! gone reopened for the live holder in a new round: [`upgrade_drive`]'s
-//! tests), `harness_upgrade_drain_bound_model` (never an end on running work
-//! or on a status of Claude's own that only lags its idle screen, never a
-//! silent wait: [`upgrade::next_step`], in [`upgrade`]'s tests),
-//! `harness_upgrade_never_strands_model` (no notice into a session at its
-//! usage limit, a late READY honoured, every agent asked restarted or
-//! released, at a break of its own work that never ends too — a release
-//! dropped only once the agent took up direction given after its last READY,
-//! never a restart over direction given after it, and no stopped round a
-//! permanent wait — each re-armed once it has rested `upgrade::RETRY_S`; one
-//! stated exception, an agent no job of a job-control shell, refused and owed
-//! no line: [`upgrade_drive`]'s tests, over the real reducer,
-//! gates, record transitions, READY, direction and release rules and the
-//! window's reading of each step's word), `harness_worker_lifecycle_model` and
-//! `harness_relaunch_on_exit_model` ([`relaunch`]'s and the window host's
-//! tests), `harness_leave_model` (the window host hands a worker its
-//! agent's exit only for an exit — a name its roster could not read while
-//! the agent still holds its tab is none — and the upgrade's own restart in
-//! flight at its exit is carried whatever `[harness] relaunch` says, that
-//! process's alone, [`relaunch::restarted`]: the window host's tests),
-//! `harness_upgrade_look_model` (the window host's looks at a
-//! session over [`upgrade_drive::due`] — never let go for what a look could
-//! not read — and its note behind over [`upgrade_drive::note_behind`], the
-//! state behind from the worker's attach: the host's reaction in the window
-//! host's tests, the classifier's reads in [`upgrade_drive`]'s),
-//! `harness_exit_record_model` (what an exit left of Claude's own
-//! record, read as it is seen: [`upgrade_drive`]'s tests, over the real
-//! [`relaunch::exit_record`] and [`relaunch::after_exit`]),
-//! `harness_codex_exit_witness_model` (a Codex's exit read on its shell's
-//! word alone, the thread lock no witness: the Codex lane's tests, over the
-//! real look, [`relaunch::exit_record`] and the lane's `after_exit`),
-//! `harness_model_priority_model` ([`upgrade_models`], in
-//! `aterm-agent/tests/conformance_upgrade_models/priority.rs`),
-//! `harness_model_ladder_model` (WHEN a due model move is taken —
-//! [`upgrade_models::model_moves_now`] over every reachable state, in
-//! `aterm-agent/tests/conformance_upgrade_models/ladder.rs`),
-//! `harness_model_switch_model` (the model rule, ladder, announcement, the
-//! ride's guard and the settle step: one visit's whole read,
-//! [`upgrade_models::model_read_step`],
-//! then [`upgrade_models::model_to`], and a relaunch's
-//! [`upgrade_models::ModelRecord::asked`] and
-//! [`upgrade_models::live_model_at`], over every reachable state, in
-//! `aterm-agent/tests/conformance_upgrade_models/switch.rs`),
-//! `harness_login_wall_model` (nothing of the upgrade's typed at the login
-//! wall, no give-up spent on a notice it answered, no continuation into a
-//! login the supervisor saw gone, the owner told first: in
-//! `aterm-agent/tests/conformance_login_wall.rs`, over the real readers,
-//! reducer and turn-end decider on every reachable state),
-//! `harness_upgrade_limit_queue_model` (no ask typed behind a notice a usage
-//! limit answered and the model has not taken, such a notice typed again
-//! straight away at most [`upgrade::REQUEUE_MAX`] times and past that once per
-//! rest — a rest that grows with every copy the model has not read, so a limit
-//! that lasts for days adds at most [`upgrade::QUEUE_REST_DOUBLINGS`] copies
-//! after a rest shorter than a day — no give-up before [`upgrade::MAX_ASKS`] asks the model took, and
-//! never quiet while an ask it could read is owed — a full queue included:
-//! [`upgrade_drive`]'s tests, over the real readers, `queue_facts`, clock and
-//! reducer, with and without the owner's `--now`, on every reachable state),
-//! and
-//! `harness_codex_daemon_update_model` ([`upgrade_codex::daemon_step`] over
-//! every reachable state, in [`upgrade_codex`]'s tests). The Codex branch
-//! has run end to end against a REAL Codex (a private headless aterm,
-//! network denied) through the window's OWN HOST, no sweep
-//! (`tools/test-codex-live-upgrade.sh`): a background terminal held a
-//! daemon-mode tab and its daemon until it was stopped; an embedded session
-//! got its notice at that break and no `/exit` until the terminal was
-//! stopped; then the daemon moved, each TUI was exited, relaunched, adopted
-//! and carried on, and so was an inline TUI at a two-row prompt. One of three
-//! full runs left the embedded session's carry-on owed ten minutes after its
-//! adoption (cause not captured; the script dumps the host's log and
-//! journals on a failure). Nothing here has run against a REAL exhausted window: the
-//! `/usage` panel reader is exercised against captured and hand-built
-//! fixtures.
+//! STATUS (docs/README.md honesty ratchet): unit-tested; the bounded machines
+//! modelled by the `harness_*` entries in `aterm_spec::xref::model_registry`
+//! each carry a Tier-1 bind to the real code, which that entry's comment
+//! names (in this module's tests, the window host's, or
+//! `aterm-agent/tests/conformance_*`). The footer reader's machine is
+//! `ClaudeFooterModel` (`tests/conformance_footer_model.rs`); the disk
+//! cleaner ([`disk`]) has no derived model. The Codex branch has run end to end
+//! against a REAL Codex through the window's own host
+//! (`targo --unverified lab codex-upgrade`); one of three full runs left an
+//! embedded session's carry-on owed, cause not captured. Nothing here has run
+//! against a REAL exhausted window: the `/usage` panel reader is exercised
+//! against captured and hand-built fixtures.
 
 /// The harness's mark as a literal ([`upgrade::HARNESS_MARK`] is this), for
 /// the texts `concat!` builds on it: every turn the harness types into an
@@ -167,20 +134,31 @@ macro_rules! harness_mark {
         "[aterm harness]"
     };
 }
+// By path too, for the texts built outside this module on the same mark (the
+// turn-end policy's land instruction, `supervise::policy::turn_end::LAND`).
+pub(crate) use harness_mark;
 
 pub mod accounts;
+pub mod acts;
 pub mod align;
 pub mod cli;
 pub mod disk;
 pub mod footer;
 pub mod goal_hold;
+pub mod lanes;
 pub mod lights;
 pub mod netwatch;
+pub mod open_url;
+pub mod profile;
 pub mod relaunch;
 pub mod restart_stamp;
 pub mod resume;
+pub mod self_claimed;
 pub mod session_usage;
 pub mod source;
+pub mod spend;
+pub mod stats;
+pub mod tap;
 pub(crate) mod transcript;
 pub mod upgrade;
 pub mod upgrade_catalog;
@@ -236,6 +214,240 @@ fn is_one_line_already(text: &str) -> bool {
         spaced = b == b' ';
     }
     !spaced || text.is_empty()
+}
+
+// Each control fixture owns a listener, cancellation pipe and connected
+// sockets, alongside the processes its caller may be observing. Bound those
+// fixtures before opening descriptors; the default test runner can otherwise
+// crowd out the real process/record reads that guard a restart. One caller
+// may keep several instances alive, so its instances share a reentrant lease.
+#[cfg(all(test, unix))]
+struct FakeInstanceLease;
+
+#[cfg(all(test, unix))]
+static FAKE_INSTANCE_ADMISSION: (std::sync::Mutex<usize>, std::sync::Condvar) =
+    (std::sync::Mutex::new(0), std::sync::Condvar::new());
+
+#[cfg(all(test, unix))]
+std::thread_local! {
+    static FAKE_INSTANCE_LEASE: std::cell::RefCell<std::sync::Weak<FakeInstanceLease>> =
+        const { std::cell::RefCell::new(std::sync::Weak::new()) };
+}
+
+#[cfg(all(test, unix))]
+impl FakeInstanceLease {
+    fn take() -> std::sync::Arc<Self> {
+        FAKE_INSTANCE_LEASE.with(|current| {
+            if let Some(lease) = current.borrow().upgrade() {
+                return lease;
+            }
+            let (admission, changed) = &FAKE_INSTANCE_ADMISSION;
+            let mut active = admission.lock().unwrap_or_else(|e| e.into_inner());
+            let until = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+            while *active >= 4 {
+                let remaining = until
+                    .checked_duration_since(std::time::Instant::now())
+                    .expect("a control fixture did not release its resource lease");
+                (active, _) = changed
+                    .wait_timeout(active, remaining)
+                    .unwrap_or_else(|e| e.into_inner());
+            }
+            *active += 1;
+            let lease = std::sync::Arc::new(Self);
+            *current.borrow_mut() = std::sync::Arc::downgrade(&lease);
+            lease
+        })
+    }
+}
+
+#[cfg(all(test, unix))]
+impl Drop for FakeInstanceLease {
+    fn drop(&mut self) {
+        let (admission, changed) = &FAKE_INSTANCE_ADMISSION;
+        let mut active = admission.lock().unwrap_or_else(|e| e.into_inner());
+        *active -= 1;
+        changed.notify_one();
+    }
+}
+
+/// A control socket at `sock` standing in for an aterm instance, for tests:
+/// its token, `token`, written where a client reads it, each connection
+/// opened with `AUTH <token>` (acknowledged with nothing, as the server does;
+/// any other first line drops the connection), and every request after it
+/// answered with `answer`'s reply and logged, in order, into the list
+/// returned beside the socket's path. That log owns the server: retain it
+/// through the fixture's client uses, then dropping its last copy closes the
+/// listener and any active client and joins the server, including on unwind.
+#[cfg(all(test, unix))]
+pub(crate) fn fake_instance(
+    sock: &std::path::Path,
+    token: &str,
+    mut answer: impl FnMut(&str) -> String + Send + 'static,
+) -> (String, FakeInstanceLog) {
+    use std::io::{BufRead as _, Write as _};
+    let lease = FakeInstanceLease::take();
+    let path = sock.to_string_lossy().into_owned();
+    let token_file = aterm_uds::latest::token_path_for_sock(&path).expect("token path");
+    std::fs::write(token_file, format!("{token}\n")).expect("token");
+    let listener = std::os::unix::net::UnixListener::bind(sock).expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking accept");
+    let (cancelled, cancel) = std::io::pipe().expect("server cancellation");
+    let active = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = std::sync::Arc::clone(&asked);
+    let auth = format!("AUTH {token}");
+    let (serving, ended) = (
+        std::sync::Arc::clone(&active),
+        std::sync::Arc::clone(&stopped),
+    );
+    let join = std::thread::spawn(move || {
+        use std::os::fd::AsRawFd as _;
+        loop {
+            let mut ready = [
+                libc::pollfd {
+                    fd: listener.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: cancelled.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            // SAFETY: both initialized pollfds borrow descriptors kept open
+            // by this thread. Cancellation closes the pipe's write half.
+            let polled = unsafe { libc::poll(ready.as_mut_ptr(), 2, -1) };
+            if polled < 0
+                && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+            {
+                continue;
+            }
+            if polled < 0 || ready[1].revents != 0 {
+                break;
+            }
+            let conn = match listener.accept() {
+                Ok((conn, _)) => conn,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    continue;
+                }
+                Err(_) => break,
+            };
+            let _ = conn.set_nonblocking(false);
+            let Ok(cut) = conn.try_clone() else {
+                continue;
+            };
+            {
+                let mut active = serving.lock().unwrap_or_else(|p| p.into_inner());
+                if ended.load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
+                }
+                *active = Some(cut);
+            }
+            let Ok(mut out) = conn.try_clone() else {
+                drop(serving.lock().unwrap_or_else(|p| p.into_inner()).take());
+                continue;
+            };
+            let mut lines = std::io::BufReader::new(conn).lines();
+            if !lines.next().is_some_and(|l| l.is_ok_and(|l| l == auth)) {
+                drop(serving.lock().unwrap_or_else(|p| p.into_inner()).take());
+                continue;
+            }
+            for line in lines {
+                if ended.load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
+                }
+                let Ok(line) = line else { break };
+                let reply = answer(&line);
+                if let Ok(mut log) = log.lock() {
+                    log.push(line);
+                }
+                if writeln!(out, "{reply}").is_err() {
+                    break;
+                }
+            }
+            drop(serving.lock().unwrap_or_else(|p| p.into_inner()).take());
+        }
+    });
+    (
+        path,
+        FakeInstanceLog {
+            log: asked,
+            _server: std::sync::Arc::new(FakeInstanceServer {
+                active,
+                stopped,
+                cancel: Some(cancel),
+                join: Some(join),
+                _lease: lease,
+            }),
+        },
+    )
+}
+
+#[cfg(all(test, unix))]
+#[derive(Clone)]
+pub(crate) struct FakeInstanceLog {
+    log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    _server: std::sync::Arc<FakeInstanceServer>,
+}
+
+#[cfg(all(test, unix))]
+impl std::ops::Deref for FakeInstanceLog {
+    type Target = std::sync::Mutex<Vec<String>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.log
+    }
+}
+
+#[cfg(all(test, unix))]
+impl std::fmt::Debug for FakeInstanceLog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.log, f)
+    }
+}
+
+#[cfg(all(test, unix))]
+struct FakeInstanceServer {
+    active: std::sync::Arc<std::sync::Mutex<Option<std::os::unix::net::UnixStream>>>,
+    stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    cancel: Option<std::io::PipeWriter>,
+    join: Option<std::thread::JoinHandle<()>>,
+    // Released after Drop has canceled and joined the descriptor owner.
+    _lease: std::sync::Arc<FakeInstanceLease>,
+}
+
+#[cfg(all(test, unix))]
+impl Drop for FakeInstanceServer {
+    fn drop(&mut self) {
+        use std::io::Write as _;
+        self.stopped
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(client) = self.active.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            // Each half separately: on Darwin Both may refuse a half-closed
+            // peer and shut neither half, leaving its BufReader parked.
+            let _ = client.shutdown(std::net::Shutdown::Write);
+            let _ = client.shutdown(std::net::Shutdown::Read);
+        }
+        // A byte wakes poll even if a concurrent fork briefly holds another
+        // copy of the pipe writer before exec; closing alone would not.
+        if let Some(cancel) = self.cancel.as_mut() {
+            let _ = cancel.write_all(&[1]);
+        }
+        drop(self.cancel.take());
+        if let Some(join) = self.join.take()
+            && let Err(panic) = join.join()
+            && !std::thread::panicking()
+        {
+            std::panic::resume_unwind(panic);
+        }
+    }
 }
 
 #[cfg(test)]

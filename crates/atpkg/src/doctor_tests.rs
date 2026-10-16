@@ -24,8 +24,8 @@ fn synthetic_home(label: &str) -> crate::testdir::Dir {
 fn install_build_tree(layout: &Layout, program: &str, build: u64) -> PathBuf {
     let dir = layout.build_dir(program, build);
     std::fs::create_dir_all(dir.join("bin")).unwrap();
-    // The concrete executable the shim will forward to (`<program>.exe` on Windows) —
-    // it must EXIST for the broken-shim scan (check 4) to see a healthy layout.
+    // The executable the shim forwards to (`<program>.exe` on Windows) must exist for the
+    // broken-shim scan (check 4) to see a healthy layout.
     std::fs::write(
         dir.join("bin").join(tool(program).exe_file()),
         b"#!/bin/true\n",
@@ -55,8 +55,8 @@ fn builds(list: &[&str]) -> std::collections::BTreeMap<String, u64> {
     list.iter().map(|s| ((*s).to_string(), 1u64)).collect()
 }
 
-/// A DEV-LINKED program is present, not missing, and the link outranks a stale
-/// removed-ledger line.
+/// A dev-linked program is present, not missing, and the link outranks a stale removed-ledger
+/// line.
 #[test]
 fn a_dev_linked_program_is_neither_missing_nor_removed_even_when_the_ledger_names_it() {
     let (unexplained, on_purpose, dev_linked) = split_missing(
@@ -81,9 +81,8 @@ fn a_dev_linked_program_is_neither_missing_nor_removed_even_when_the_ledger_name
     );
 }
 
-/// A removed-ledger `trust` keeps its whole coherence group from activating. The
-/// ledger explains `trust` ONLY; the siblings it took down with it are unexplained
-/// and must be named, or doctor reports a machine that cannot compile as healthy.
+/// A removed-ledger `trust` keeps its whole coherence group from activating: the ledger
+/// explains `trust` only, so the siblings it took down are named as missing.
 #[test]
 fn the_suppressed_compiler_tuple_is_reported() {
     let (unexplained, on_purpose, _dev_linked) = split_missing(
@@ -111,9 +110,7 @@ fn the_suppressed_compiler_tuple_is_reported() {
     );
 }
 
-/// Fail-quiet: with no cached index there is no trustworthy answer about what SHOULD
-/// be installed, and inventing one would turn an unreachable network into a pile of
-/// phantom missing programs.
+/// Fail-quiet: with no cached index nothing is reported missing.
 #[test]
 fn no_cached_index_invents_no_missing_programs() {
     let l = layout("no-index");
@@ -137,10 +134,9 @@ fn index_age_math() {
     assert_eq!(index_age_days("not-a-date", then), None);
 }
 
-// (9) A rustup `trust` entry that RESOLVES but is not the managed seam — e.g.
-// `~/.rustup/toolchains/trust -> $HOME/trust/build/host/stage2` — is a WARN that names
-// the one re-point command and moves nothing; a link at a numbered store build is a
-// note; the seam itself and an absent entry say nothing here.
+// (9) A rustup `trust` entry that resolves but is not the managed seam warns with the one
+// re-point and moves nothing; a link at a numbered store build is a note; the seam itself and
+// an absent entry say nothing here.
 #[cfg(unix)]
 #[test]
 fn a_foreign_rustup_trust_entry_is_named_with_its_repoint_and_never_repointed() {
@@ -179,7 +175,7 @@ fn a_foreign_rustup_trust_entry_is_named_with_its_repoint_and_never_repointed() 
     let line = seam_line(&crate::seam::status(&l, &rustup, "trust"), &l).unwrap();
     assert!(line.starts_with("note — "), "{line}");
     assert!(line.contains("inside the store, not the view"), "{line}");
-    // So is the layout from before the view: a link at `current`.
+    // So is a link at `current`.
     std::fs::remove_file(&entry).unwrap();
     std::os::unix::fs::symlink(crate::seam::store_current(&l), &entry).unwrap();
     let line = seam_line(&crate::seam::status(&l, &rustup, "trust"), &l).unwrap();
@@ -237,12 +233,10 @@ fn a_foreign_rustup_trust_entry_is_named_with_its_repoint_and_never_repointed() 
     let _ = std::fs::remove_dir_all(&home);
 }
 
-// (9) THE HEAL, AS DOCTOR SAYS IT. The real unattended re-assertion
-// (`seam::reassert`, the pass nobody asked for) re-points rustup's `trust` from an older
-// live build tree to the store's view; doctor's line names what it named and the one
-// `ln -sfn` that puts it back — a note, so the verdict stays healthy about a channel that
-// works. Run as printed, that command puts the link back, the line says no pass will
-// move it again, and the next pass does not.
+// (9) The heal, as doctor says it: the unattended re-assertion (`seam::reassert`) re-points
+// rustup's `trust` from an older live build tree to the store's view, and doctor's note names
+// the old target and the `ln -sfn` that puts it back. Run as printed, it puts the link back,
+// the line says no pass will move it again, and the next pass does not.
 #[cfg(unix)]
 #[test]
 fn a_stale_link_the_pass_replaced_is_said_with_the_way_back() {
@@ -250,9 +244,8 @@ fn a_stale_link_the_pass_replaced_is_said_with_the_way_back() {
     let home = synthetic_home("replaced-seam");
     let rustup = home.join(".rustup");
     std::fs::create_dir_all(rustup.join("toolchains")).unwrap();
-    // ONE dated compiler script, hard-linked wherever a compiler goes and run once here:
-    // macOS assesses a new executable on its first exec, which can outlast the probe
-    // bound (the seam tests' `dated_compiler` says the same).
+    // One dated compiler script, hard-linked wherever a compiler goes and run once here:
+    // macOS assesses a new executable on its first exec, which can outlast the probe bound.
     let script = home.join("dated-compiler");
     std::fs::write(
         &script,
@@ -296,11 +289,9 @@ fn a_stale_link_the_pass_replaced_is_said_with_the_way_back() {
             && line.contains(&undo),
         "{line}"
     );
-    // …and the report itself carries it: in the whole report (`--verbose`), and not among
-    // the problems the default one lists — a note.
-    // The report resolves the rustup home from RUSTUP_HOME before `<home>/.rustup`,
-    // so under `rustup run trust …` (which exports it) it reads the machine's own
-    // link, not this fixture's: the half the sibling test above guards the same way.
+    // The whole report (`--verbose`) carries it and the default one does not list it: a
+    // note. The report resolves the rustup home from RUSTUP_HOME first, so under `rustup run
+    // trust …` (which exports it) it would read the machine's link, not this fixture's.
     if std::env::var_os("RUSTUP_HOME").is_none() {
         let path = std::env::join_paths([l.bin_dir()]).unwrap();
         let (_, report, faults) = whole_report(&l, &home, &path);
@@ -329,9 +320,8 @@ fn a_stale_link_the_pass_replaced_is_said_with_the_way_back() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// A HELD TOOLCHAIN UPDATE AND A LEASE ARE SAID, AND ARE NOT FAULTS: the
-/// report names what waits, on whom, until when and the command that ends the wait, and
-/// the leased build with its holder — and a healthy store stays healthy.
+/// A held toolchain update and a lease are said (what waits, on whom, until when, and the
+/// command that ends it; the leased build and its holder), and a healthy store stays healthy.
 #[test]
 fn a_held_toolchain_update_and_a_lease_are_said_and_healthy() {
     let l = layout("held-flip");
@@ -357,7 +347,7 @@ fn a_held_toolchain_update_and_a_lease_are_said_and_healthy() {
     let lease = crate::lease::take(
         &l.prefix,
         &crate::lease::Subject::build("trust", 9192).unwrap(),
-        "aterm-verify (pid 7) \u{2014} the merge contract in /w",
+        "aterm-release (pid 7) \u{2014} a release cut in /w",
         crate::lease::DEFAULT_WAIT,
     )
     .unwrap();
@@ -383,8 +373,8 @@ fn a_held_toolchain_update_and_a_lease_are_said_and_healthy() {
          staged and waiting since",
         "/w/target/debug/build/x/build-script-build is running from it",
         "`aterm pkg update` installs it now",
-        "doctor: note \u{2014} trust build 9192 is in use by aterm-verify (pid 7) \u{2014} \
-         the merge contract in /w; it stays as it is until that run ends",
+        "doctor: note \u{2014} trust build 9192 is in use by aterm-release (pid 7) \u{2014} \
+         a release cut in /w; it stays as it is until that run ends",
     ] {
         assert!(report.contains(part), "{part}\n---\n{report}");
     }
@@ -406,8 +396,8 @@ fn a_held_toolchain_update_and_a_lease_are_said_and_healthy() {
             assets: std::collections::BTreeMap::new(),
         },
     ));
-    let held = "trust build 9192 is in use by aterm-verify (pid 7) \u{2014} the merge \
-                contract in /w";
+    let held = "trust build 9192 is in use by aterm-release (pid 7) \u{2014} a release \
+                cut in /w";
     let lines = hold_lines(&l, t0);
     assert_eq!(
         lines.iter().filter(|line| line.contains(held)).count(),
@@ -415,17 +405,18 @@ fn a_held_toolchain_update_and_a_lease_are_said_and_healthy() {
         "{lines:?}"
     );
     drop(lease);
-    // A lease on the rustup VIEW is kept by the seam, not by gc, and says so.
+    // A lease on the rustup view is kept by the seam, not by gc, and says so.
     let view = crate::lease::take(
         &l.prefix,
         &crate::lease::Subject::view("trust").unwrap(),
-        "aterm-verify (pid 8)",
+        "targo (pid 8) \u{2014} held by `aterm pkg lease` in /w",
         crate::lease::DEFAULT_WAIT,
     )
     .unwrap();
     assert!(
         hold_lines(&l, t0).iter().any(|line| line
-            == "note \u{2014} the rustup trust toolchain is in use by aterm-verify (pid 8); \
+            == "note \u{2014} the rustup trust toolchain is in use by targo (pid 8) \u{2014} \
+                held by `aterm pkg lease` in /w; \
                 it stays as it is until that run ends"),
         "{:?}",
         hold_lines(&l, t0)
@@ -450,11 +441,8 @@ fn a_held_toolchain_update_and_a_lease_are_said_and_healthy() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// A HELD-UPDATE RECORD THAT OUTLIVED ITS BUILDS IS NOT SAID AS A WAIT. With nothing
-/// the record moves off in the store (a store emptied by hand), doctor says the record
-/// waits for nothing and names the door that ends it — and, being doctor, leaves the
-/// record as it was. The NEGATIVE CONTROL is the same record with its build in the
-/// store: said as a wait.
+/// A held-update record that outlived its builds is said as that, not as a wait, and left as
+/// it was; the same record with its build in the store is the negative control.
 #[test]
 fn a_held_update_record_that_outlived_its_builds_is_said_as_that_and_left() {
     let l = layout("held-flip-outlived");
@@ -500,11 +488,9 @@ fn a_held_update_record_that_outlived_its_builds_is_said_as_that_and_left() {
     let _ = std::fs::remove_dir_all(&l.prefix);
 }
 
-/// (11) THE C TOOLCHAIN. On an otherwise healthy install, a verdict that is an
-/// answer — no toolchain, or one that refuses — is a FAIL whose next act is the
-/// platform's installer, outranking `update`; a toolchain that answers is an `ok`
-/// line and the report stays healthy; an unknown warns and stays healthy; and the
-/// rustup-absent line is a note, never a warn (the product has no rustup).
+/// (11) The C toolchain: an answer (none, or one that refuses) is a FAIL whose next act is
+/// the platform's installer, outranking `update`; an answering toolchain is `ok`, an unknown
+/// warns, and no rustup is a note.
 #[test]
 fn doctor_fails_when_the_c_toolchain_cannot_build() {
     let l = layout("cc-prereq");
@@ -680,19 +666,16 @@ fn dev_link_health_rejects_non_executable_and_foreign_destinations() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// (3b) REROUTE: per-row stub state (laid / missing / foreign) and PATH ORDER — the
-/// measured failure is upstream `~/.cargo/bin` AHEAD of the reroute dir, not the
-/// dir's absence — with the reroute dir compared against a fake
-/// upstream `cargo` outside the prefix through the injected `path_var`. Every line
-/// is advisory: the warn leaves a healthy toolset healthy.
+/// (3b) Reroute: each stub's state and PATH order (upstream `~/.cargo/bin` ahead of the
+/// reroute dir), all advisory: the warn leaves a healthy toolset healthy.
 #[cfg(unix)]
 #[test]
 fn reroute_section_reports_stub_state_and_path_order() {
     let l = layout("reroute");
     install(&l, "ay", 18);
     let home = synthetic_home("reroute");
-    // A fake upstream cargo OUTSIDE the prefix (a sibling temp dir), so the walk
-    // counts it — a copy under the prefix would be the stub counting itself.
+    // A fake upstream cargo outside the prefix, so the walk counts it (one under the prefix
+    // would be the stub counting itself).
     let upstream = crate::testdir::dir("atpkg-doctor-reroute-upstream-");
     std::fs::write(upstream.join("cargo"), b"#!/bin/sh\nexit 0\n").unwrap();
     std::fs::set_permissions(
@@ -738,7 +721,7 @@ fn reroute_section_reports_stub_state_and_path_order() {
     );
     crate::reroute::lay(&l).unwrap();
     let reroute = l.reroute_dir();
-    // Upstream AHEAD of the reroute dir: the measured failure, as a warning — exit 0.
+    // Upstream ahead of the reroute dir: a warning, exit 0.
     let (ok, out) = run(&[upstream.clone(), reroute.clone(), l.bin_dir()]);
     assert!(ok, "a mis-ordered PATH is advisory:\n{out}");
     assert!(
@@ -782,8 +765,8 @@ fn reroute_section_reports_stub_state_and_path_order() {
 }
 
 /// A store with nothing installed, a `*toolset*` row reading "no build for this
-/// architecture", per-program `unavailable on <target>` rows, and optionally one
-/// served member HELD after a failed stage.
+/// architecture", per-program `unavailable on <target>` rows, and optionally one served
+/// member held after a failed stage.
 fn unserved_platform_store(label: &str, with_held_claude: bool) -> crate::testdir::ScratchLayout {
     let l = layout(label);
     let mut programs = std::collections::BTreeMap::new();
@@ -844,14 +827,12 @@ fn report_over(l: &Layout, label: &str) -> (bool, String) {
     (healthy, String::from_utf8(out).unwrap())
 }
 
-/// AN UNSERVED PLATFORM IS A STATE, NOT A FAULT — on Windows: a note naming the
-/// unserved members, no problem counted for them, exit 0 — unless a SERVED member's
-/// row records a real failure, which is then the problem and whose own door is the
-/// next act. Elsewhere the old PROBLEM stands; the split lives in
-/// [`toolset_unserved_here`], and this test pins BOTH sides.
+/// On Windows an unserved platform is a note, not a problem, unless a served member's row
+/// records a failure; elsewhere it stays a problem. Pins both sides of
+/// [`toolset_unserved_here`].
 #[test]
 fn an_unserved_platform_is_a_note_not_a_problem_on_windows_and_unchanged_elsewhere() {
-    // Nothing served is missing: healthy on Windows, the old PROBLEM elsewhere.
+    // Nothing served is missing: healthy on Windows, a problem elsewhere.
     let l = unserved_platform_store("unserved-quiet", false);
     let (healthy, out) = report_over(&l, "unserved-quiet");
     if cfg!(windows) {
@@ -891,9 +872,8 @@ fn an_unserved_platform_is_a_note_not_a_problem_on_windows_and_unchanged_elsewhe
     }
     let _ = std::fs::remove_dir_all(&l.prefix);
 
-    // A served member HELD after a failed stage IS the problem, and its own door is
-    // the act — never the whole-set install, on any platform: that pass honours the
-    // hold and repeats it.
+    // A served member held after a failed stage is the problem and its own door the act,
+    // never the whole-set install (which honours the hold and repeats it), on any platform.
     let l = unserved_platform_store("unserved-held", true);
     let (healthy, out) = report_over(&l, "unserved-held");
     assert!(!healthy, "a held member is a problem everywhere: {out}");
@@ -932,10 +912,9 @@ fn an_unserved_platform_is_a_note_not_a_problem_on_windows_and_unchanged_elsewhe
     }
     let _ = std::fs::remove_dir_all(&l.prefix);
 
-    // The box after the served members installed: the `*toolset*` row is gone (a
-    // clean pass clears it), the unserved members' own rows remain, and one program
-    // is active. The note still stands on Windows — it keys on the rows that last —
-    // and the report is healthy; elsewhere nothing is said about the platform.
+    // After the served members install: the `*toolset*` row is gone, the unserved members'
+    // rows remain, and one program is active. On Windows the note stands (it keys on the
+    // rows that last) and the report is healthy; elsewhere nothing is said of the platform.
     let l = unserved_platform_store("unserved-after", false);
     clear_row(&l, "*toolset*");
     install(&l, "claude", 2026092201);
@@ -950,10 +929,8 @@ fn an_unserved_platform_is_a_note_not_a_problem_on_windows_and_unchanged_elsewhe
     );
     let _ = std::fs::remove_dir_all(&l.prefix);
 
-    // …and with codex HELD beside the installed claude: the held row is the problem,
-    // and the one act is the pass that forgets the hold — a plain `aterm pkg update`
-    // would honour the hold and repeat it. The same on every platform: a publish-side
-    // `tree_root` mismatch is held on macOS too.
+    // With codex held beside the installed claude, the held row is the problem and the act
+    // is the pass that forgets the hold (a plain `update` repeats it), on every platform.
     let l = unserved_platform_store("unserved-codex-held", false);
     clear_row(&l, "*toolset*");
     install(&l, "claude", 2026092201);
@@ -985,10 +962,8 @@ fn an_unserved_platform_is_a_note_not_a_problem_on_windows_and_unchanged_elsewhe
     let _ = std::fs::remove_dir_all(&l.prefix);
 }
 
-/// THE NOTE MASKS ONE VERDICT, NOT EVERY `*toolset*` ROW. On an unserved platform the
-/// toolset-wide "no build for this architecture" row becomes the note; an UNREACHABLE
-/// INDEX on the same empty store is a fault about this machine and stays one —
-/// `PROBLEM`, unhealthy, and the ordinary act — exactly as on every other platform.
+/// The note masks one verdict, not every `*toolset*` row: an unreachable index on the same
+/// empty store stays a problem with the ordinary act, as on every platform.
 #[test]
 fn an_unreachable_index_is_a_problem_on_an_unserved_platform_too() {
     let l = unserved_platform_store("unserved-offline", false);
@@ -1028,11 +1003,9 @@ fn an_unreachable_index_is_a_problem_on_an_unserved_platform_too() {
     let _ = std::fs::remove_dir_all(&l.prefix);
 }
 
-/// The empty-store verdict on an unserved platform, decided without a signed index:
-/// quiet ONLY when nothing is recorded against a served member AND the index lists no
-/// served member missing without a row — a network failure writes no row, so an empty
-/// problem list alone proves nothing. Where it is not quiet, the act is the door of
-/// the member the verdict is about, and a toolset-wide fault gets the ordinary act.
+/// The empty-store verdict on an unserved platform is quiet only when nothing is recorded
+/// against a served member and the index lists none missing; otherwise the act is that
+/// member's door, and a toolset-wide fault gets the ordinary act.
 #[test]
 fn an_unserved_store_is_quiet_only_when_no_served_member_is_missing() {
     let v = |items: &[&str]| items.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
@@ -1106,10 +1079,9 @@ fn an_unserved_store_is_quiet_only_when_no_served_member_is_missing() {
     );
 }
 
-/// A HELD member's door, at both places the next act names it — the empty store with a
-/// toolset problem, and the held row as the one recorded problem: the program's own
-/// install, or for a coherence-group member the pass that moves the tuple whole, never
-/// an install that lands that one member outside its tuple.
+/// A held member's door at both places the next act names it (the empty store with a
+/// toolset problem, and the held row as the one recorded problem): its own install, or for a
+/// coherence-group member the pass that moves the tuple whole.
 #[test]
 fn a_held_member_s_next_act_is_its_tuple_s_door_when_grouped() {
     let held = [format!(
@@ -1219,14 +1191,8 @@ fn the_rustup_probe_uses_the_platform_executable_spelling() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// ONE TYPO MUST NOT CONDEMN A HEALTHY TOOLSET.
-///
-/// A key beginning with `-` cannot be a program: no shim exists under one and the
-/// signed index cannot name one, so a stray `[programs.--help]` row is not a missing
-/// member. The exit code is a contract: `tools/install.sh` hands `pkg doctor` to every
-/// failed-seed installer as THE diagnostic to trust.
-///
-/// The second case proves the scan was NARROWED to stray flags, not disabled.
+/// A stray `-`-prefixed row (`[programs.--help]`) is not a missing program; the second case
+/// shows the scan is narrowed to stray flags, not disabled.
 #[test]
 fn a_stray_flag_row_is_not_a_missing_program() {
     let stray_row = |name: &str| {
@@ -1281,8 +1247,7 @@ fn a_stray_flag_row_is_not_a_missing_program() {
     let _ = std::fs::remove_dir_all(&l.prefix);
     let _ = std::fs::remove_dir_all(&home);
 
-    // …and a plausible PROGRAM name in the same error state still fails, so the change
-    // narrowed the scan rather than blunting it.
+    // A plausible program name in the same error state still fails: narrowed, not disabled.
     let l = stray_row("trust-vc");
     let home = synthetic_home("stray-real");
     let path = std::env::join_paths([l.bin_dir()]).unwrap();
@@ -1304,13 +1269,8 @@ fn a_stray_flag_row_is_not_a_missing_program() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// THE SCAN MUST SEE WHAT IT IS FOR. `aborted: <phase>` is written for every member
-/// of a coherence group whose transaction was killed mid-flight — precisely the state
-/// in which a tuple's members may disagree with each other — so it is a fault.
-///
-/// A YANKED PIN is the quietest fault: its shims become stubs that print "was
-/// yanked/revoked", the broken-shim scan skips tombstones by design, and the program
-/// drops out of `active_builds` — so every other check goes quiet at once.
+/// `aborted: <phase>` (a coherence-group transaction killed mid-flight) and a yanked pin's
+/// tombstone (stub shims every other check skips) are faults.
 #[test]
 fn an_aborted_transaction_is_a_problem_doctor_can_see() {
     assert!(
@@ -1325,17 +1285,15 @@ fn an_aborted_transaction_is_a_problem_doctor_can_see() {
     ] {
         assert!(is_problem_state(fault), "{fault} stays a fault");
     }
-    // Allow-by-prefix: a state the scan does not recognize reads as benign. Inventing
-    // faults from unknown states is how a diagnostic teaches people to ignore it.
+    // Allow-by-prefix: a state the scan does not recognize reads as benign.
     for benign in ["active", "dev-linked (skipped)", "staged 4821"] {
         assert!(!is_problem_state(benign), "{benign} is not a fault");
     }
 }
 
-/// THE LISTING MUST HANG OFF THE BRANCH THAT SPOKE, not off `store_empty` alone: a
-/// DECLINED store lists nothing, an empty one resumes after the reason the verdict
-/// named inline, a populated one lists every problem. Exhaustive over (declined) x
-/// (store empty) x (0 / 1 / many problems).
+/// Exhaustive over (declined) x (store empty) x (0 / 1 / many problems): a declined store
+/// lists nothing, an empty one resumes after the reason its verdict named inline, a populated
+/// one lists every problem.
 #[test]
 fn the_problem_listing_follows_the_verdict_that_named_it() {
     for empty in [true, false] {
@@ -1359,7 +1317,6 @@ fn the_problem_listing_follows_the_verdict_that_named_it() {
     assert_eq!(problem_listing_start(false, false, 5), Some(0));
 }
 
-/// …and it must report ALL of them, not the alphabetically first.
 #[test]
 fn every_recorded_problem_is_reported_not_just_the_first() {
     let l = layout("multi-problem");
@@ -1430,8 +1387,7 @@ fn every_recorded_problem_is_reported_not_just_the_first() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// …unless the emptiness was ASKED FOR. A user who removed the toolset is not
-/// broken, and telling them so would train them to ignore the diagnostic.
+/// A toolset the user removed is not broken.
 #[test]
 fn a_declined_store_is_healthy_while_empty() {
     let l = layout("declined-store");
@@ -1499,13 +1455,8 @@ fn broken_bin_symlink_fails() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// A SHIM WE COULD NOT STAT IS NOT A BROKEN SHIM.
-///
-/// `Path::exists()` answers `false` for a target that is THERE and merely unreadable
-/// (EACCES on a parent, EPERM from macOS privacy consent, EIO); calling that a broken
-/// shim implies a reinstall that repairs nothing. The health check must neither invent
-/// a fault out of its own blindness nor silently pass, so the Unknown is a warn naming
-/// the shim, the target and the errno.
+/// A shim whose target is there but unreadable (`Path::exists()` says `false`) is not a
+/// broken shim: a warn naming the shim, the target and the errno.
 #[cfg(unix)]
 #[test]
 fn a_shim_whose_target_cannot_be_stat_ed_is_not_reported_broken() {
@@ -1613,10 +1564,8 @@ fn stray_posix_sh_in_shell_d_fails() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// Doctor says plainly which rc files reach the managed `bin/`, in the pass's own five
-/// states: wired, sourced through a line that is not atpkg's, opted out, consent-fenced,
-/// or not yet wired. When none reaches, it names every file it read rather than calling
-/// the machine aterm-only.
+/// Each rc file in the pass's five states (wired, sourced by another line, opted out,
+/// consent-fenced, not yet wired); when none reaches `bin/`, every file read is named.
 #[cfg(unix)]
 #[test]
 fn rc_wiring_is_reported_in_all_five_states() {
@@ -1642,8 +1591,8 @@ fn rc_wiring_is_reported_in_all_five_states() {
         String::from_utf8(out).unwrap()
     };
 
-    // No rc at all: nothing to wire, and the report must say the consequence — about
-    // the files it read, named, never about the machine as a whole.
+    // No rc at all: the report says the consequence for the files it read, named, never for
+    // the machine as a whole.
     let none = report(&home);
     assert!(
         none.contains(
@@ -1666,8 +1615,7 @@ fn rc_wiring_is_reported_in_all_five_states() {
         "unwired names the pass that wires it: {unwired}"
     );
 
-    // Wired by a real pass, so the ledger entry the opt-out state needs is the one the
-    // pass writes, not a shape this test invented.
+    // Wired by a real pass, so the ledger entry the opt-out state needs is the pass's own.
     let pass = crate::hooks::pass_at(&l, &home, crate::hooks::RcWiring::HonorOptOut);
     assert_eq!(
         pass.rc(),
@@ -1695,9 +1643,8 @@ fn rc_wiring_is_reported_in_all_five_states() {
         "opted-out is honoured and names the one verb that re-wires: {opted}"
     );
 
-    // Sourced by a line that is not atpkg's — tools/install.sh's `wire_shell_path`
-    // marker pair, sourcing the same hook — on top of the opt-out ledger entry above.
-    // The toolchain reaches this shell, so doctor must not call the rc unwired.
+    // Sourced by install.sh's `wire_shell_path` marker pair (the same hook), on top of the
+    // opt-out ledger entry above: the toolchain reaches this shell, so the rc is not unwired.
     std::fs::write(
         &zshrc,
         format!(
@@ -1721,9 +1668,8 @@ fn rc_wiring_is_reported_in_all_five_states() {
         "a shell that reaches the toolchain is neither unreached nor unwired: {foreign}"
     );
 
-    // Consent-fenced: the rc resolves under a folder macOS guards, so no pass opens it,
-    // and neither does this report. Without the state nothing tells the user why their
-    // rc is perpetually untouched.
+    // Consent-fenced: the rc resolves under a folder macOS guards, so no pass opens it and
+    // neither does this report; the state tells the user why the rc stays untouched.
     let docs = home.join("Documents");
     std::fs::create_dir_all(&docs).unwrap();
     std::fs::write(docs.join("zshrc"), "export FOO=1\n").unwrap();
@@ -1750,12 +1696,10 @@ fn rc_wiring_is_reported_in_all_five_states() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// tools/install.sh wires macOS bash through a login profile: `path_block_rc_target`
-/// elects ~/.bash_profile, then ~/.bash_login, then ~/.profile, never ~/.bashrc, because
-/// Terminal.app starts a login bash. atpkg has a row for the first of those three only,
-/// so a Mac that fell through to ~/.bash_login would read as "nothing sources
-/// ~/.aterm/shell.d" while it plainly did. Pinned in both shapes — content is read before
-/// the ledger — and a profile that does not source shell.d is not listed at all.
+/// install.sh's `path_block_rc_target` elects ~/.bash_profile, then ~/.bash_login, then
+/// ~/.profile (Terminal.app starts a login bash); atpkg has a row for the first only, so the
+/// other two are read for a shell.d line too. Content is read before the ledger, and a
+/// profile that does not source shell.d is not listed.
 #[cfg(unix)]
 #[test]
 fn an_install_sh_block_in_a_login_profile_is_reported_as_sourcing_shell_d() {
@@ -1839,14 +1783,13 @@ fn an_install_sh_block_in_a_login_profile_is_reported_as_sourcing_shell_d() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// A shim and the channel naming different builds is STRUCTURAL: something on PATH is
-/// running a build the channel does not select, and `gc` has stopped reclaiming that
-/// program entirely. Doctor is the only place that says so.
+/// A shim and the channel naming different builds is structural: something on PATH runs a
+/// build the channel does not select, and gc stops reclaiming that program.
 #[test]
 fn a_shim_disagreeing_with_the_channel_is_structural() {
     let l = layout("witness-mismatch");
     install(&l, "ay", 19); // channel + shim both at 19
-    // Stage 18 COMPLETE on disk (so check 5 stays quiet) and re-point ONLY the shim.
+    // Stage 18 complete on disk (so check 5 stays quiet) and re-point only the shim.
     let older = install_build_tree(&l, "ay", 18);
     crate::store::mark_build_ready(&older).unwrap();
     let ay = tool("ay");
@@ -1870,9 +1813,7 @@ fn a_shim_disagreeing_with_the_channel_is_structural() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// A program with no channel witness is not breakage — nothing is broken, gc just
-/// abstains — so it warns and stays exit-0. It must still be SAID: the whole cost of
-/// abstaining is that it is otherwise invisible.
+/// A program with no channel witness is not breakage (gc just abstains), so it warns, exit 0.
 #[test]
 fn a_program_with_no_channel_witness_warns_but_exit_zero() {
     let l = layout("witness-absent");
@@ -1924,8 +1865,8 @@ fn bin_not_on_path_warns_but_exit_zero() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// A `satisfied by system` row is an OK line while the system binary is there, a WARN
-/// (never a PROBLEM) once it is gone — and it is never counted as a recorded fault.
+/// A `satisfied by system` row is an `ok` while the system binary is there, a warn (never a
+/// problem) once it is gone, and never a recorded fault.
 #[test]
 fn a_system_satisfied_member_is_reported_and_never_a_fault() {
     let l = layout("system-satisfied");
@@ -1986,7 +1927,7 @@ fn a_system_satisfied_member_is_reported_and_never_a_fault() {
     };
     let (ok, out) = run(&l);
     assert!(ok, "a satisfied member is not a problem:\n{out}");
-    // The SAME words the pass wrote — the canonical state, retirement note included.
+    // The words the pass wrote: the canonical state, retirement note included.
     assert!(
         out.contains(&format!(
             "doctor: ok — gh: system: {} — not managed by aterm (managed copy retired \
@@ -2009,9 +1950,8 @@ fn a_system_satisfied_member_is_reported_and_never_a_fault() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// A member HELD on its current build (its coherence group's new pin is not
-/// published for this target) is reported as `ok`, quoting its row, on the
-/// owner's row and on a sibling's — never a fault, and never silent.
+/// A member held on its current build is an `ok` quoting its row, on the owner's row and on
+/// a sibling's: never a fault, never silent.
 #[test]
 fn a_held_member_is_an_ok_line_quoting_its_row_never_a_fault() {
     let layout = layout("doctor-held");
@@ -2082,9 +2022,9 @@ fn a_held_member_is_an_ok_line_quoting_its_row_never_a_fault() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// A file at a command-link path is a warning that names what replaces it —
-/// on macOS the installed app's `repair`, elsewhere moving it aside — never a
-/// fault, and doctor leaves it byte-identical; a link there says nothing.
+/// A file at a command-link path is a warning naming what replaces it (on macOS the installed
+/// app's `repair`, elsewhere moving it aside), never a fault, and left byte-identical; a link
+/// there says nothing.
 #[cfg(unix)]
 #[test]
 fn a_file_at_a_command_link_path_is_a_warning_with_its_remedy() {
@@ -2135,8 +2075,8 @@ fn a_file_at_a_command_link_path_is_a_warning_with_its_remedy() {
         !out.contains(&format!("{} is a file", bin.join("atpkg").display())),
         "{out}"
     );
-    // The default report keeps each row's step — the fix, never the
-    // `aterm ctl` a retired name's remedy mentions.
+    // The default report keeps each row's step: the fix, never the `aterm ctl` a retired
+    // name's remedy mentions.
     let short = present(&out, "", "doctor", Detail::Problems).joined();
     #[cfg(target_os = "macos")]
     let step = format!(
@@ -2159,9 +2099,8 @@ fn a_file_at_a_command_link_path_is_a_warning_with_its_remedy() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// SHADOWED (design S5): a foreign copy of a managed tool AHEAD of the managed bin/ on
-/// PATH is a WARN line in the canonical words — never a fault, never touched — and a
-/// copy BEHIND the managed bin/ is not mentioned at all.
+/// A foreign copy of a managed tool ahead of the managed bin/ on PATH is a warn in the
+/// canonical words, never a fault and never touched; a copy behind it is not mentioned.
 #[cfg(unix)]
 #[test]
 fn a_shadowed_managed_member_is_a_warning_never_a_fault() {
@@ -2222,15 +2161,10 @@ fn a_shadowed_managed_member_is_a_warning_never_a_fault() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// THE AGENT PROGRAMS' SHADOW WORDING. For `claude`/`codex` aterm's copy is what every
-/// tab runs, through `agents/` first on PATH; a foreign copy ahead of it in THIS shell
-/// is a shell that has not run the hook, and the remedy is the hook sourced in place —
-/// `. ~/.aterm/shell.d/00-atpkg.zsh` — never "open a new tab", never `exec $SHELL` (it
-/// drops the tab's shell integration), never "remove or reorder that copy". A warn,
-/// never a fault; the plain SHADOWED wording returns only when the twin itself is gone.
-/// All of it IN AN ATERM SHELL, where the remedy works (the managed copy leads inside
-/// aterm only; outside aterm the same PATH is a note, pinned by
-/// `outside_aterm_with_the_stub_laid_the_users_own_copy_is_a_note_never_shadowed`).
+/// In an aterm shell, a foreign `claude`/`codex` ahead of `agents/` is a shell that has not
+/// run the hook: a warn whose remedy sources the hook in place, never `exec $SHELL` or
+/// "remove or reorder that copy". The plain shadowed wording returns only when the twin is
+/// gone; outside aterm the same PATH is a note (the `outside_aterm_…` test).
 #[cfg(unix)]
 #[test]
 fn an_agent_program_shadowed_in_this_shell_names_the_hook_source_never_a_new_tab() {
@@ -2274,7 +2208,7 @@ fn an_agent_program_shadowed_in_this_shell_names_the_hook_source_never_a_new_tab
         );
         (ok, String::from_utf8_lossy(&out).into_owned())
     };
-    // A shell from before the install: no agents/ on its PATH.
+    // A shell started before the install: no agents/ on its PATH.
     let no_agents = std::env::join_paths([foreign.clone(), l.bin_dir()]).unwrap();
     let (ok, out) = run(&no_agents);
     assert!(ok, "a warning, never a fault:\n{out}");
@@ -2317,8 +2251,7 @@ fn an_agent_program_shadowed_in_this_shell_names_the_hook_source_never_a_new_tab
     let (ok, out) = run(&first);
     assert!(ok, "{out}");
     assert!(!out.contains("SHADOWED"), "{out}");
-    // The twin gone (a lane that could not lay it): the machine-wide wording is the
-    // truth again, unchanged from every other program's.
+    // The twin gone (a lane that could not lay it): the machine-wide wording again.
     std::fs::remove_file(&twin).unwrap();
     let (ok, out) = run(&no_agents);
     assert!(ok, "{out}");
@@ -2334,12 +2267,9 @@ fn an_agent_program_shadowed_in_this_shell_names_the_hook_source_never_a_new_tab
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// THE REROUTE STUB DECIDES AT EXEC TIME. A session shell whose PATH is `reroute,
-/// ~/.local/bin, …, pkg/bin` with no `agents/` and `reroute/claude` laid runs the
-/// managed copy — so the report says it is ROUTED (an `ok`, naming the stub and the
-/// copy it out-ranks), not SHADOWED. Outside
-/// aterm the stub passes through to the user's own copy by design, a note. It still
-/// warns where the stub is absent.
+/// With `reroute/claude` laid first on a session shell's PATH (no `agents/`), the stub runs
+/// the managed copy: `ok`, naming the stub and the copy it out-ranks, not shadowed. Outside
+/// aterm the stub passes through to the user's copy: a note. It still warns with no stub.
 #[cfg(unix)]
 #[test]
 fn an_agent_program_routed_by_its_reroute_stub_is_ok_and_warns_only_where_it_is_not() {
@@ -2415,9 +2345,8 @@ fn an_agent_program_routed_by_its_reroute_stub_is_ok_and_warns_only_where_it_is_
         out.contains("doctor: ok — reroute stub claude laid"),
         "{out}"
     );
-    // Outside aterm the stub passes through to the user's own copy — the design, said
-    // as a note naming no remedy (sourcing the hook there demotes agents/, and the
-    // stub skips it anyway), never SHADOWED.
+    // Outside aterm the stub passes through to the user's own copy: a note naming no remedy
+    // (sourcing the hook there demotes agents/, and the stub skips it anyway), never shadowed.
     let (ok, out) = run(&stale, crate::reroute::StubEnv::default());
     assert!(ok, "{out}");
     assert!(
@@ -2458,11 +2387,9 @@ fn an_agent_program_routed_by_its_reroute_stub_is_ok_and_warns_only_where_it_is_
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// (10h) Claude Code's rating surveys: the two switches Claude Code itself reads
-/// turn them off, and nothing else does. The env switch is read as Claude Code
-/// reads it (2.1.284, `Le`): trimmed, lower-cased, one of `1 true yes on` — a JSON
-/// `true` or `1` stringifies to one of those — and nothing else, `no`, `off`, `2`
-/// and `disabled` included.
+/// (10h) Claude Code's rating surveys are off only by the two switches it reads; the env
+/// switch is read as Claude Code 2.1.284 reads it (trimmed, lower-cased, one of
+/// `1 true yes on`).
 #[test]
 fn the_claude_session_survey_is_off_only_by_the_switches_claude_reads() {
     assert!(claude_survey_off(r#"{"feedbackSurveyRate": 0}"#));
@@ -2527,10 +2454,9 @@ fn top(json: &str) -> String {
     json.replace("<top>", TOP)
 }
 
-/// (10h) THE SWITCH'S ROW: unset, the warn names the nested line the window adds; a
-/// value Claude Code reads as true (whatever its spelling) is the default; a value it
-/// does not — `"off"` — is kept as the person's own and the row says the surveys stay
-/// on; an `env` that is no object is the one refusal, as the window's.
+/// (10h) The switch's row: unset, the warn names the nested line the window adds; a value
+/// Claude Code reads as true is the default; one it does not (`"off"`) is kept and the row
+/// says the surveys stay on; an `env` that is no object is the one refusal.
 #[test]
 fn the_survey_switch_row_names_what_the_window_adds_and_what_a_hand_set_value_does() {
     use DefaultState::{Default as D, Manual, Unset};
@@ -2566,14 +2492,18 @@ fn the_survey_switch_row_names_what_the_window_adds_and_what_a_hand_set_value_do
         r#""feedbackSurveyRate": 0"#
     );
     // The window adds it to a file that has everything else.
-    assert!(window_adds(&top(
-        r#"{"<top>": true, "effortLevel": "xhigh", "feedbackSurveyRate": 0}"#
-    )));
-    assert!(!window_adds(&top(
-        r#"{"<top>": true, "effortLevel": "xhigh", "feedbackSurveyRate": 0,
-                "feedbackDrafts": "quiet",
+    assert!(window_adds(
+        &top(r#"{"<top>": true, "effortLevel": "xhigh", "feedbackSurveyRate": 0}"#),
+        false
+    ));
+    assert!(!window_adds(
+        &top(
+            r#"{"<top>": true, "effortLevel": "xhigh", "feedbackSurveyRate": 0,
+                "feedbackDrafts": "quiet", "autoCompactWindow": 400000,
                 "env": {"CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "off"}}"#
-    )));
+        ),
+        false
+    ));
 
     let l = layout("agent-switch");
     let v283 = crate::vendor_direct::Version::parse("2.1.283")
@@ -2630,7 +2560,7 @@ fn the_survey_switch_row_names_what_the_window_adds_and_what_a_hand_set_value_do
     // survey it asks for, so the window does not add it — and the row says why, as ok.
     let rated = report(&top(
         r#"{"<top>": true, "effortLevel": "xhigh", "feedbackSurveyRate": 0.3,
-                "feedbackDrafts": "quiet"}"#,
+                "feedbackDrafts": "quiet", "autoCompactWindow": 400000}"#,
     ));
     assert!(
         rated.contains(
@@ -2697,27 +2627,121 @@ fn a_hand_set_survey_probability_holds_the_switch_back() {
     assert_eq!(both[3], (CLAUDE_SURVEY_SWITCH, D));
     // The window's own rule (`window_adds`): with every other default in place a held
     // switch leaves nothing to add; with the rate at zero it is added.
-    let rest = format!(r#""{TOP}": true, "effortLevel": "xhigh", "feedbackDrafts": "quiet""#);
-    assert!(!window_adds(&format!(
-        r#"{{{rest}, "feedbackSurveyRate": 0.3}}"#
-    )));
-    assert!(window_adds(&format!(
-        r#"{{{rest}, "feedbackSurveyRate": 0}}"#
-    )));
+    let rest = format!(
+        r#""{TOP}": true, "effortLevel": "xhigh", "feedbackDrafts": "quiet",
+            "autoCompactWindow": 400000"#
+    );
+    assert!(!window_adds(
+        &format!(r#"{{{rest}, "feedbackSurveyRate": 0.3}}"#),
+        false
+    ));
+    assert!(window_adds(
+        &format!(r#"{{{rest}, "feedbackSurveyRate": 0}}"#),
+        false
+    ));
 }
 
-/// (10h) The rows: the defaults as one `ok`, a hand-set value as an `ok` that
-/// names it and says it is kept, an unset key as a `warn` naming what the next
-/// window start adds — and no row at all when the report did not read the
-/// settings (every fixture). The reader also pins that the survey's `env` switch
-/// sets no key.
+/// (10h) A "Keep" answer to Claude Code's own autocompact offer, which Claude Code records
+/// only in `~/.claude.json`, holds the autocompact window back as the window holds it
+/// (`aterm_primer::claude_compact_offers_kept_in`): the row is an `ok` naming the kept model,
+/// never the warn promising `400000`, and the window has nothing left to add. A
+/// `~/.claude.json` that cannot be read holds it back too, and says so; an accepted offer
+/// (saved in the settings) holds nothing back.
+#[test]
+fn a_kept_autocompact_offer_holds_the_window_back_in_the_report() {
+    use DefaultState::{HeldForOffer, Unset};
+    let home = synthetic_home("claude-offer");
+    let claude = home.join(".claude");
+    std::fs::create_dir_all(&claude).unwrap();
+    // Every other default in place.
+    let settings = top(
+        r#"{"<top>": true, "effortLevel": "xhigh", "feedbackSurveyRate": 0,
+            "feedbackDrafts": "quiet", "env": {"CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1"}}"#,
+    );
+    std::fs::write(claude.join("settings.json"), &settings).unwrap();
+    let state = home.join(".claude.json");
+    let offer = |choice: &str| {
+        format!(
+            r#"{{"autoCompactOffer": {{"acct": {{"claude-opus-5-5": {{"eligibleLoggedAt": 1,
+                "resolved": {{"choice": "{choice}", "tokens": 1000000}}}}}}}}}}"#
+        )
+    };
+    let window = || probe_claude_settings(&home).unwrap().unwrap()[5].clone();
+
+    assert_eq!(
+        window(),
+        (CLAUDE_COMPACT_WINDOW_KEY, Unset),
+        "no ~/.claude.json"
+    );
+    std::fs::write(&state, offer("accept")).unwrap();
+    assert_eq!(window(), (CLAUDE_COMPACT_WINDOW_KEY, Unset), "accepted");
+    std::fs::write(&state, offer("keep")).unwrap();
+    let kept =
+        "Claude Code's autocompact offer was answered Keep (claude-opus-5-5) in ~/.claude.json";
+    assert_eq!(
+        window(),
+        (CLAUDE_COMPACT_WINDOW_KEY, HeldForOffer(kept.into()))
+    );
+    assert!(!window_adds(&settings, true));
+    assert!(window_adds(&settings, false));
+    std::fs::write(&state, "{").unwrap();
+    let unreadable = window();
+    assert!(
+        matches!(&unreadable.1, HeldForOffer(why) if why.starts_with(
+            "~/.claude.json, where Claude Code records the answer to its autocompact offer, \
+             cannot be read ("
+        )),
+        "{unreadable:?}"
+    );
+
+    // As the report says it: an ok naming why, and no warn.
+    std::fs::write(&state, offer("keep")).unwrap();
+    let l = layout("claude-offer");
+    let v283 = crate::vendor_direct::Version::parse("2.1.283")
+        .unwrap()
+        .build_id();
+    install(&l, "claude", v283);
+    let now = crate::flow::rfc3339_to_unix("2026-09-28T00:00:00Z").unwrap();
+    let path = std::env::join_paths([l.bin_dir()]).unwrap();
+    let mut out: Vec<u8> = Vec::new();
+    let _ = run_with(
+        &l,
+        Some(&home),
+        Some(&path),
+        now,
+        None,
+        "doctor",
+        &Probes {
+            claude_defaults: probe_claude_settings(&home),
+            ..Probes::default()
+        },
+        &mut out,
+        &mut std::io::sink(),
+    );
+    let report = String::from_utf8_lossy(&out);
+    assert!(
+        report.contains(&format!(
+            "doctor: ok — claude: autoCompactWindow is unset and stays so — {kept}, and aterm \
+             adds its 400k window only where no Keep answer stands (/autocompact in Claude \
+             Code sets a window for a model)"
+        )),
+        "{report}"
+    );
+    assert!(!report.contains("warn — claude:"), "{report}");
+    let _ = std::fs::remove_dir_all(&l.prefix);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// (10h) The rows: the defaults as one `ok`, a hand-set value as a kept `ok`, an unset key as
+/// a warn naming what the next window start adds, and no row when the report did not read
+/// the settings. The `env` survey switch sets no key.
 #[test]
 fn a_managed_claude_reports_each_default_as_set_by_hand_or_unset() {
     use DefaultState::{Default as D, Manual, Unset};
     assert_eq!(
         claude_defaults_state(&top(
             r#"{"<top>": true, "effortLevel": "xhigh", "feedbackSurveyRate": 0,
-                    "feedbackDrafts": "quiet",
+                    "feedbackDrafts": "quiet", "autoCompactWindow": 400000,
                     "env": {"CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1"}}"#
         )),
         Ok(vec![
@@ -2726,6 +2750,7 @@ fn a_managed_claude_reports_each_default_as_set_by_hand_or_unset() {
             ("feedbackSurveyRate", D),
             (CLAUDE_SURVEY_SWITCH, D),
             (CLAUDE_DRAFTS_KEY, D),
+            (CLAUDE_COMPACT_WINDOW_KEY, D),
         ])
     );
     assert_eq!(
@@ -2736,6 +2761,7 @@ fn a_managed_claude_reports_each_default_as_set_by_hand_or_unset() {
             ("feedbackSurveyRate", Unset),
             (CLAUDE_SURVEY_SWITCH, Unset),
             (CLAUDE_DRAFTS_KEY, Unset),
+            (CLAUDE_COMPACT_WINDOW_KEY, Unset),
         ])
     );
     // The `env` survey switch silences every survey, so it needs no rate beside it;
@@ -2768,6 +2794,14 @@ fn a_managed_claude_reports_each_default_as_set_by_hand_or_unset() {
         claude_defaults_state(r#"{"feedbackSurveyRate": 0}"#).unwrap()[3],
         (CLAUDE_SURVEY_SWITCH, Unset)
     );
+    // The per-model window `/autocompact` saves replaces the top-level one for its model
+    // only: the top-level key stays unset, and the window adds it.
+    let per_model = r#"{"modelSettings": {"claude-opus-5-5": {"autoCompactWindow": 400000}}}"#;
+    assert_eq!(
+        claude_defaults_state(per_model).unwrap()[5],
+        (CLAUDE_COMPACT_WINDOW_KEY, Unset)
+    );
+    assert!(window_adds(per_model, false));
 
     let l = layout("agent-defaults");
     let v283 = crate::vendor_direct::Version::parse("2.1.283")
@@ -2804,15 +2838,16 @@ fn a_managed_claude_reports_each_default_as_set_by_hand_or_unset() {
     };
     let all = rows(Some(claude_defaults_state(&top(
         r#"{"<top>": true, "effortLevel": "xhigh", "feedbackSurveyRate": 0,
-                "feedbackDrafts": "quiet",
+                "feedbackDrafts": "quiet", "autoCompactWindow": 400000,
                 "env": {"CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1"}}"#,
     ))));
     assert_eq!(all.len(), 1, "{all:?}");
     assert!(all[0].contains(&format!(
         "doctor: ok — claude: {TOP}, effortLevel, feedbackSurveyRate, \
-         env.CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY, feedbackDrafts set to aterm's defaults \
-         (the top-effort mode on, xhigh effort, the session-quality survey off, every \
-         rating survey off, the drafted-feedback card quiet) in ~/.claude/settings.json"
+         env.CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY, feedbackDrafts, autoCompactWindow set to \
+         aterm's defaults (the top-effort mode on, xhigh effort, the session-quality survey \
+         off, every rating survey off, the drafted-feedback card quiet, autocompact at 400k \
+         tokens) in ~/.claude/settings.json"
     )));
     // The parenthetical names only the defaults the row lists.
     let survey = rows(Some(claude_defaults_state(
@@ -2856,11 +2891,10 @@ fn a_managed_claude_reports_each_default_as_set_by_hand_or_unset() {
     assert!(rows(None).is_empty(), "no settings read, no row");
 }
 
-/// (10h) THE WINDOW'S EFFORT RULE, as the doctor reports it: while an effort
-/// other than `xhigh` is set by hand — the per-model one `/effort medium` saves,
-/// or a top-level one — the top-effort key and `effortLevel` are reported kept
-/// unset, naming that effort, and never as a `warn` promising the window adds
-/// them; the survey rate is still added. A hand-set `xhigh` holds nothing back.
+/// (10h) The window's effort rule: while an effort other than `xhigh` is set by hand
+/// (per-model, as `/effort medium` saves it, or top-level), the top-effort key and
+/// `effortLevel` are reported kept unset, naming that effort, never as a warn; the survey
+/// rate is still added. A hand-set `xhigh` holds nothing back.
 #[test]
 fn an_effort_set_by_hand_holds_top_effort_and_xhigh_back_in_the_report() {
     use DefaultState::{HeldForEffort, Manual, Unset};
@@ -2874,6 +2908,7 @@ fn an_effort_set_by_hand_holds_top_effort_and_xhigh_back_in_the_report() {
             ("feedbackSurveyRate", Unset),
             (CLAUDE_SURVEY_SWITCH, Unset),
             (CLAUDE_DRAFTS_KEY, Unset),
+            (CLAUDE_COMPACT_WINDOW_KEY, Unset),
         ])
     );
     assert_eq!(
@@ -2884,6 +2919,7 @@ fn an_effort_set_by_hand_holds_top_effort_and_xhigh_back_in_the_report() {
             ("feedbackSurveyRate", Unset),
             (CLAUDE_SURVEY_SWITCH, Unset),
             (CLAUDE_DRAFTS_KEY, Unset),
+            (CLAUDE_COMPACT_WINDOW_KEY, Unset),
         ])
     );
     assert_eq!(
@@ -2896,6 +2932,7 @@ fn an_effort_set_by_hand_holds_top_effort_and_xhigh_back_in_the_report() {
             ("feedbackSurveyRate", Unset),
             (CLAUDE_SURVEY_SWITCH, Unset),
             (CLAUDE_DRAFTS_KEY, Unset),
+            (CLAUDE_COMPACT_WINDOW_KEY, Unset),
         ]),
         "a hand-set xhigh is the default's own effort"
     );
@@ -2946,9 +2983,8 @@ fn an_effort_set_by_hand_holds_top_effort_and_xhigh_back_in_the_report() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// (10h) A settings file the window REFUSES to add to — it does not parse, it
-/// is empty, or its top level is not a JSON object — is one `warn` naming why,
-/// and no per-key row promising a repair that never happens.
+/// (10h) A settings file the window refuses (unparsable, empty, or not a JSON object at the
+/// top) is one warn naming why, with no per-key row promising a repair.
 #[test]
 fn a_settings_file_the_window_refuses_is_one_warn_naming_why() {
     for text in ["not json", "", "  \n"] {
@@ -3005,19 +3041,15 @@ fn a_settings_file_the_window_refuses_is_one_warn_naming_why() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// (10h) THE DAMAGE AN EARLIER BUILD LEFT. A window that added every default wherever
-/// its key was unset turned the per-model `medium` that `/effort medium` saves into
-/// exactly the file below, so Claude Code ran xhigh over the person's `medium`.
-/// That top-effort key is a `warn` naming the
-/// effort it overrides and the fix — never an `ok` — and, because the window
-/// does not take it away (nothing tells who wrote it), the default report's
-/// short row keeps the fix. The controls: the top-effort key beside no effort of
-/// a person's own, or beside a hand-set `xhigh`, is the default, and a hand-set
-/// `false` is kept as it was.
+/// (10h) A top-effort key beside a hand-set effort (what adding every unset default makes of
+/// `/effort medium`'s per-model save) is a warn naming the effort it overrides and the fix,
+/// kept in the default report's short row, since the window never removes it. Controls: the
+/// key beside no hand-set effort, or beside a hand-set `xhigh`, is the default, and a
+/// hand-set `false` is kept.
 #[test]
 fn a_top_effort_key_over_an_effort_set_by_hand_is_a_warn_naming_the_fix() {
     use DefaultState::{Default as D, Manual, OverridesEffort, Unset};
-    // What that build's `add_claude_defaults` wrote over
+    // What adding every unset default makes of
     // `{"modelSettings":{"claude-opus-5-5":{"effortLevel":"medium"}}}`.
     let damaged = &top(
         "{\n  \"modelSettings\": {\n    \"claude-opus-5-5\": {\n      \
@@ -3033,6 +3065,7 @@ fn a_top_effort_key_over_an_effort_set_by_hand_is_a_warn_naming_the_fix() {
             ("feedbackSurveyRate", D),
             (CLAUDE_SURVEY_SWITCH, Unset),
             (CLAUDE_DRAFTS_KEY, Unset),
+            (CLAUDE_COMPACT_WINDOW_KEY, Unset),
         ])
     );
     assert_eq!(
@@ -3123,14 +3156,11 @@ fn a_top_effort_key_over_an_effort_set_by_hand_is_a_warn_naming_the_fix() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// (10h) The two refusals the settings TEXT cannot show, read off real links in a
-/// scratch home (never the real one): a symlink whose target does not exist, which
-/// the window refuses at every start, and a file in a directory this user cannot
-/// write — a link into a read-only store as home-manager lays it out, or the plain
-/// file itself — while a key is left to add, which every window start fails to
-/// write. Each is the one refusal `warn`, and no per-key row promises an addition.
-/// The controls: no file is no row, the same text in a writable directory is judged
-/// by its keys, and a read-only file that needs nothing added keeps its rows.
+/// (10h) The two refusals the settings text cannot show, on real links in a scratch home: a
+/// symlink to a missing file, and a file whose directory this user cannot write (a read-only
+/// store link, or the plain file) while a key is left to add. Each is the one refusal warn.
+/// Controls: no file is no row, the same text in a writable directory is judged by its keys,
+/// and a read-only file that needs nothing added keeps its rows.
 #[cfg(unix)]
 #[test]
 fn a_dangling_or_unwritable_settings_file_is_the_one_refusal_warn() {
@@ -3142,12 +3172,12 @@ fn a_dangling_or_unwritable_settings_file_is_the_one_refusal_warn() {
     let claude = home.join(".claude");
     std::fs::create_dir_all(&claude).unwrap();
     let settings = claude.join("settings.json");
-    assert_eq!(probe_claude_settings(&settings), None, "no file, no row");
+    assert_eq!(probe_claude_settings(&home), None, "no file, no row");
 
     // A dotfiles link to a file not there yet.
     let missing = home.join("dotfiles").join("settings.json");
     std::os::unix::fs::symlink(&missing, &settings).unwrap();
-    let dangling = probe_claude_settings(&settings);
+    let dangling = probe_claude_settings(&home);
     std::fs::remove_file(&settings).unwrap();
 
     // A link into a store this user cannot write: a file with keys left to add,
@@ -3161,7 +3191,7 @@ fn a_dangling_or_unwritable_settings_file_is_the_one_refusal_warn() {
         &complete,
         top(
             r#"{"<top>": true, "effortLevel": "xhigh", "feedbackSurveyRate": 0,
-                "feedbackDrafts": "quiet",
+                "feedbackDrafts": "quiet", "autoCompactWindow": 400000,
                 "env": {"CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1"}}"#,
         ),
     )
@@ -3177,27 +3207,27 @@ fn a_dangling_or_unwritable_settings_file_is_the_one_refusal_warn() {
     )
     .unwrap();
     std::os::unix::fs::symlink(&bare, &settings).unwrap();
-    let writable = probe_claude_settings(&settings);
+    let writable = probe_claude_settings(&home);
     std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o555)).unwrap();
-    let linked_read_only = probe_claude_settings(&settings);
+    let linked_read_only = probe_claude_settings(&home);
     std::fs::remove_file(&settings).unwrap();
     std::os::unix::fs::symlink(&complete, &settings).unwrap();
-    let complete_read_only = probe_claude_settings(&settings);
+    let complete_read_only = probe_claude_settings(&home);
     std::fs::remove_file(&settings).unwrap();
     std::os::unix::fs::symlink(&env_only, &settings).unwrap();
-    let env_only_read_only = probe_claude_settings(&settings);
+    let env_only_read_only = probe_claude_settings(&home);
     std::fs::remove_file(&settings).unwrap();
     // The plain file in a directory this user cannot write.
     std::fs::write(&settings, "{}").unwrap();
     std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o555)).unwrap();
-    let plain_read_only = probe_claude_settings(&settings);
+    let plain_read_only = probe_claude_settings(&home);
     // Put the permissions back before asserting, so the scratch home can go.
     std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o700)).unwrap();
     std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o700)).unwrap();
     // A link to itself: the read fails (a loop), and the window refuses it too.
     std::fs::remove_file(&settings).unwrap();
     std::os::unix::fs::symlink(&settings, &settings).unwrap();
-    let looped = probe_claude_settings(&settings);
+    let looped = probe_claude_settings(&home);
     std::fs::remove_file(&settings).unwrap();
 
     assert_eq!(
@@ -3215,6 +3245,7 @@ fn a_dangling_or_unwritable_settings_file_is_the_one_refusal_warn() {
             ("feedbackSurveyRate", Unset),
             (CLAUDE_SURVEY_SWITCH, Unset),
             (CLAUDE_DRAFTS_KEY, Unset),
+            (CLAUDE_COMPACT_WINDOW_KEY, Unset),
         ])),
         "the same link into a writable directory is judged by its keys"
     );
@@ -3235,6 +3266,7 @@ fn a_dangling_or_unwritable_settings_file_is_the_one_refusal_warn() {
             ("feedbackSurveyRate", D),
             (CLAUDE_SURVEY_SWITCH, D),
             (CLAUDE_DRAFTS_KEY, D),
+            (CLAUDE_COMPACT_WINDOW_KEY, D),
         ])),
         "nothing to add, nothing written: the rows still hold"
     );
@@ -3393,11 +3425,9 @@ fn outside_aterm_with_the_stub_laid_the_users_own_copy_is_a_note_never_shadowed(
         )],
         "{out}"
     );
-    // 3. The stub absent (reroute declined, or no pass has laid it yet). Outside aterm
-    //    it is STILL the note: with no reroute dir on PATH whether a stub is laid
-    //    decides nothing, and the rc hook's false arm demotes `agents/` there, so its
-    //    remedy does nothing — and the no-hook fallback would put the managed copy
-    //    first outside aterm. Inside aterm: SHADOWED with the remedy, which works there.
+    // 3. The stub absent. Outside aterm it is still the note: with no reroute dir on PATH a
+    //    stub decides nothing, and the rc hook's false arm demotes `agents/` there, so its
+    //    remedy would do nothing. Inside aterm: shadowed, with the remedy, which works there.
     std::fs::remove_file(&stub).unwrap();
     let (ok, out) = run(&iterm, outside);
     assert!(ok, "{out}");
@@ -3474,7 +3504,7 @@ fn the_drift_warn_says_what_the_shim_exports_and_what_the_build_declares() {
         "/p/bin/x exports DISABLE_AUTOUPDATER=0, but ay build 17 declares \
          DISABLE_AUTOUPDATER=1 — fix: `aterm pkg repair` re-lays it"
     );
-    // The switch is there; the drift is an EXTRA entry — no updater claim.
+    // The switch is there; the drift is an extra entry: no updater claim.
     assert_eq!(
         env_drift_line(
             "ay",
@@ -3493,14 +3523,10 @@ fn the_drift_warn_says_what_the_shim_exports_and_what_the_build_declares() {
     );
 }
 
-/// DESIGN S7 on the `doctor` surface: a managed member whose shim exports its
-/// policy's `shim_env` gets ONE `ok` line — the canonical row (the recorded one when
-/// it is managed, else derived) and the trailing "own updater is off here" sentence —
-/// never a fault, never inside the state; a plain shim gets no such line, and a
-/// shadowed one keeps (10d)'s row alone — a warn inside aterm, a note outside it (the
-/// env never reaches the system copy). A
-/// vendor program (design §1.7) reads by version and source — never an index pin, never
-/// "updates arrive with the ALab index".
+/// A managed member whose shim exports its policy's `shim_env` gets one `ok` line (the
+/// canonical row plus the trailing "own updater is off here" sentence), never a fault; a
+/// plain shim gets no such line; a shadowed one keeps (10d)'s row alone. A vendor program
+/// reads by version and source, never an index pin.
 #[cfg(unix)]
 #[test]
 fn a_managed_member_with_a_shim_env_says_self_update_off_as_a_trailing_line() {
@@ -3626,9 +3652,6 @@ fn a_managed_member_with_a_shim_env_says_self_update_off_as_a_trailing_line() {
         assert!(ok, "{out}");
         assert!(out.contains(row), "{stub_env:?}: {out}");
         assert!(!member_has_self_update_notice(&out, "claude"), "{out}");
-        for line in out.lines().filter(|l| l.contains("claude")) {
-            assert_eq!(crate::vendor_direct::retired_wording(line), None, "{line}");
-        }
     }
     // A plain shim: no line about it at all.
     crate::activate::install_tools(&l, &dir, &[tool("claude")], crate::activate::Aliases::Off)
@@ -3637,10 +3660,8 @@ fn a_managed_member_with_a_shim_env_says_self_update_off_as_a_trailing_line() {
     assert!(ok, "{out}");
     assert!(!member_has_self_update_notice(&out, "claude"), "{out}");
     assert!(!out.contains("exports nothing"), "{out}");
-    // A plain shim over a build whose sidecar DECLARES the env — what an older
-    // `repair` left: NAMED, with the one remedy, never passed over. A warn, not a
-    // fault; and said with a foreign copy ahead too, since
-    // the `agents/` twin every aterm tab runs copies this shim.
+    // A plain shim over a build whose sidecar declares the env: a warn with the one remedy,
+    // said with a foreign copy ahead too, since the `agents/` twin every tab runs copies it.
     crate::shim_env::write_sidecar(&dir, &env).unwrap();
     let drift = format!(
         "doctor: warn — claude: {} exports nothing, but claude 2.1.280 declares \
@@ -3653,9 +3674,6 @@ fn a_managed_member_with_a_shim_env_says_self_update_off_as_a_trailing_line() {
         assert!(ok, "a warn, not a fault: {out}");
         assert!(out.lines().any(|line| line == drift), "{drift}\n---\n{out}");
         assert!(!member_has_self_update_notice(&out, "claude"), "{out}");
-        for line in out.lines().filter(|l| l.contains("claude")) {
-            assert_eq!(crate::vendor_direct::retired_wording(line), None, "{line}");
-        }
     }
     // Exporting what the build declares: the ok line again, and no warn.
     crate::activate::install_tools_env(
@@ -3676,10 +3694,9 @@ fn a_managed_member_with_a_shim_env_says_self_update_off_as_a_trailing_line() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// THE p11-kit STORY (§17.11): a Homebrew-style `trust` ahead of the managed bin/
-/// shadows ALab's `trust`; the warn line keeps the canonical state and gains ONE
-/// trailing sentence naming the alias that runs the managed copy — because the alias
-/// is laid, and only because of that.
+/// A Homebrew-style `trust` (p11-kit, §17.11) ahead of the managed bin/ shadows ALab's: the
+/// warn keeps the canonical state and gains one trailing sentence naming the alias, only
+/// because the alias is laid.
 #[cfg(unix)]
 #[test]
 fn a_shadowed_alab_tool_names_its_alias_as_the_way_to_the_managed_copy() {
@@ -3746,8 +3763,7 @@ fn a_shadowed_alab_tool_names_its_alias_as_the_way_to_the_managed_copy() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// TWO NAMES, ONE REPORT, AND THE SPEAKER IS THE NAME YOU TYPED: a script keying on
-/// the prefix must key on the verb it ran.
+/// The speaker is the verb typed, so a script keying on the prefix keys on the verb it ran.
 #[test]
 fn status_never_speaks_as_doctor() {
     let l = layout("speaker");
@@ -3785,11 +3801,8 @@ fn status_never_speaks_as_doctor() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// AN UNHEALTHY REPORT ENDS IN ONE ACT. A fresh machine's only story is "nothing
-/// installed yet" — structurally spotless, and still not health, since every
-/// structural check passes vacuously on a store that received nothing; the tail must
-/// name the one command that fixes it — and exactly one, after the byte-stable
-/// "found N problem(s)" line, never instead of it.
+/// An empty store passes every structural check vacuously and is still not health: the tail
+/// names exactly one command, after the byte-stable "found N problem(s)" line.
 #[test]
 fn an_unhealthy_report_names_one_next_act() {
     let l = layout("next-act");
@@ -3830,17 +3843,13 @@ fn an_unhealthy_report_names_one_next_act() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// ATPKG NEVER TELLS THE USER TO RESTART FOR AN APP UPDATE. A staged build is applied
-/// in-session by the app's own overlap handoff (automatic by default, one click
-/// otherwise) and the shells keep running, so the posture note names that lane and the
-/// `aterm ctl update` verbs — never a reopen. Both note arms are pinned (a newer build
-/// staged; a newer bundle already on disk), plus the quiet case. Both say it is the
-/// WINDOW that applies: a terminal session never does.
+/// The posture note never says to restart: a staged build applies in-session by the window's
+/// overlap handoff and the shells keep running. Both note arms (a newer build staged; a newer
+/// bundle on disk) and the quiet case are pinned, and both notes name the window.
 #[test]
 fn aterm_posture_never_prompts_a_restart() {
     let base = layout("posture");
-    // The updater's ledger lives BESIDE the pkg prefix (`<support>/Updates`), so the
-    // layout under test is `<scratch>/pkg` and the ledger goes in `<scratch>/Updates`.
+    // The updater's ledger lives beside the pkg prefix (`<support>/Updates`).
     let lay = Layout {
         prefix: base.prefix.join("pkg"),
     };
@@ -3911,9 +3920,8 @@ fn aterm_posture_never_prompts_a_restart() {
     )
     .unwrap();
     assert!(report(&lay).contains("installs within a minute"));
-    // An EARLIER build's failed installs are not this download's: the escalation
-    // streak and the per-target count both name build 1788035000, and 1788077184 is
-    // still promised.
+    // An earlier build's failed installs are not this download's: the escalation streak and
+    // the per-target count both name build 1788035000, and 1788077184 is still promised.
     std::fs::write(
         updates.join("health.toml"),
         "apply_failures = 3\napply_failures_for_target = 3\n\
@@ -3953,8 +3961,8 @@ fn aterm_posture_never_prompts_a_restart() {
     let text = report(&lay);
     assert_eq!(text, "atpkg: ok — aterm build 1788077184 installed\n");
 
-    // A source build over an installed bundle: the version comes off the app dir's
-    // bundle whose sealed build IS the installed one.
+    // A source build over an installed bundle: the version comes off the app dir's bundle
+    // whose sealed build is the installed one.
     let apps = base.prefix.join("Applications");
     std::fs::create_dir_all(apps.join("aterm.app/Contents")).unwrap();
     std::fs::write(
@@ -3973,11 +3981,9 @@ fn aterm_posture_never_prompts_a_restart() {
     let _ = std::fs::remove_dir_all(&base.prefix);
 }
 
-/// THE HAND-PLACED BUNDLE: the updater's receipt says build 1786405661 while the
-/// bundle on disk — dragged in by hand — and the running process are both 1789000876.
-/// The receipt alone would report a DOWNGRADE that does not exist. "On disk" is the
-/// newer of receipt and sealed bundle, and the note fires only when that is strictly
-/// newer than what runs.
+/// A bundle placed by hand is newer than the updater's receipt: "on disk" is the newer of
+/// receipt and sealed bundle (no phantom downgrade), and the note fires only when that is
+/// strictly newer than what runs.
 #[test]
 fn on_disk_build_is_the_newer_of_receipt_and_bundle_and_the_note_needs_installed_newer_than_running()
  {
@@ -4012,8 +4018,8 @@ fn on_disk_build_is_the_newer_of_receipt_and_bundle_and_the_note_needs_installed
         report_v(Some(1_789_000_876), &[(1_789_000_876, "1.2.3".into())]),
         "atpkg: ok — aterm 1.2.3 (build 1789000876) installed\n"
     );
-    // A version read off a bundle that is NOT the installed build (a newer receipt
-    // than the running bundle) is not claimed for it: build-only.
+    // A version read off a bundle that is not the installed build (a newer receipt than the
+    // running bundle) is not claimed for it: build-only.
     std::fs::write(
         updates.join("installed.toml"),
         "build_number = 1789000900\n",
@@ -4048,8 +4054,8 @@ fn on_disk_build_is_the_newer_of_receipt_and_bundle_and_the_note_needs_installed
         plist_short_version("<key>Other</key><string>0.1.0</string>"),
         None
     );
-    // Receipt older, no bundle readable (a source build): the receipt is OLDER than
-    // what runs, so still no "installed on disk" note — that note is for NEWER.
+    // Receipt older, no bundle readable (a source build): older than what runs, so no
+    // "installed on disk" note, which is for newer.
     assert_eq!(
         report(None),
         "atpkg: ok — aterm build 1786405661 installed\n"
@@ -4147,10 +4153,9 @@ fn doctor_over(l: &Layout, home: &Path, probes: &Probes) -> (bool, String) {
     (ok, String::from_utf8_lossy(&out).into_owned())
 }
 
-/// THE `devtools` ROW: aterm not on macOS's Developer Tools list is a WARNING the default
-/// report counts and shortens to the fact and the fix (never a structural problem: the
-/// exit stays healthy); on the list is `ok`; a report that does not read the machine says
-/// nothing.
+/// The `devtools` row: off the list is a warning the default report counts and shortens to
+/// the fact and the fix (the exit stays healthy); on the list is `ok`; a report that does not
+/// read the machine says nothing.
 #[test]
 fn the_devtools_row_is_a_counted_warning_with_the_owners_fix() {
     use aterm_containment::consent::{
@@ -4190,8 +4195,8 @@ fn the_devtools_row_is_a_counted_warning_with_the_owners_fix() {
     assert!(
         shown.contains(
             "doctor: warn \u{2014} devtools: aterm (com.aterm.aterm) is not on System Settings \
-             \u{25b8} Privacy & Security \u{25b8} Developer Tools \u{2014} fix: switch aterm on \
-             under Developer Tools\n"
+             \u{25b8} Privacy & Security \u{25b8} Developer Tools \u{2014} fix: add aterm to \
+             Developer Tools\n"
         ),
         "the default report keeps the row whole, fact and fix, counted:\n{shown}"
     );
@@ -4356,9 +4361,8 @@ fn an_accepted_workspace_policy_is_ok_and_a_local_seal_only_warns() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// A LOCAL TOOLCHAIN OLDER THAN THE STORE'S — or one that is gone — is not a publisher's
-/// unpublished seal: the line says it is stale and names `repair`, never "features only
-/// it has".
+/// A local toolchain older than the store's, or gone, is not a publisher's unpublished seal:
+/// the line says it is stale and names `repair`.
 #[test]
 fn an_older_local_toolchain_is_named_stale_with_repair_as_its_fix() {
     let l = layout("stale-seal");
@@ -4404,9 +4408,8 @@ fn an_older_local_toolchain_is_named_stale_with_repair_as_its_fix() {
         "{out}"
     );
     assert!(!out.contains("features only it has"), "{out}");
-    // A link to a tree that is gone: every `cargo +trust` fails, and repair relinks —
-    // said ONCE, with that one fix: not again by (9) as a foreign link to re-point by
-    // hand, nor as a channel rustup lacks (a link to nothing does not resolve either).
+    // A link to a tree that is gone: every `cargo +trust` fails and repair relinks, said once
+    // with that one fix, not again by (9) as a foreign link or a channel rustup lacks.
     #[cfg(unix)]
     {
         let toolchains = home.join(".rustup").join("toolchains");
@@ -4586,12 +4589,9 @@ fn the_not_healthy_line_counts_cannot_run_apart_from_unproven() {
     );
 }
 
-/// (5f) THE VIEW. With no seam recorded the check has nothing to say. Once a seam
-/// is attached against a synthetic rustup home, the view's stock names are clones of the
-/// store's tools and the report is healthy. Two wrong views are named with the repair
-/// and withhold "healthy": a `rustc` hard-linked to the store's `trustc` (the
-/// construction before clones), and one with `trustc`'s length, mode and time but other
-/// bytes. `repair`'s re-assertion rebuilds the view and the report is healthy again.
+/// (5f) The view: no seam, nothing to say; an attached seam's stock names are clones and the
+/// report is healthy. A hard-linked `rustc`, or one with `trustc`'s attributes and other
+/// bytes, is named with the repair and withholds "healthy"; re-assertion heals it.
 #[cfg(unix)]
 #[test]
 fn a_rustup_view_whose_stock_names_are_not_the_stores_tools_is_not_healthy() {
@@ -4620,7 +4620,7 @@ fn a_rustup_view_whose_stock_names_are_not_the_stores_tools_is_not_healthy() {
         store_trustc.display()
     );
 
-    // A hard link in place of the view's symlink.
+    // A hard link in place of the view's clone.
     std::fs::remove_file(&view_rustc).unwrap();
     std::fs::hard_link(&store_trustc, &view_rustc).unwrap();
     let (ok, out, err) = whole_report(&l, &home, &path);
@@ -4671,11 +4671,9 @@ fn a_rustup_view_whose_stock_names_are_not_the_stores_tools_is_not_healthy() {
     assert!(ok && healthy(&out), "{out}{err}");
 }
 
-/// (5f) The view follows a dev-link. With trust dev-linked to a sysroot checkout the
-/// view presents the checkout, and this check compares it against the checkout's tools —
-/// healthy, with no "is not the store's" line over a view right by construction. A view
-/// left presenting the store while the link stands is named, against the checkout's
-/// tool, with the repair. Unlinked, the store's view is right again.
+/// (5f) The view follows a dev-link: against a sysroot checkout the view is compared with the
+/// checkout's tools (healthy); a view left presenting the store is named with the repair;
+/// unlinked, the store's view is right again.
 #[cfg(unix)]
 #[test]
 fn a_dev_linked_trusts_view_is_healthy_when_it_presents_the_checkout() {
@@ -4796,9 +4794,8 @@ fn a_store_less_dev_linked_seam_is_checked_against_the_checkout() {
         "{out}"
     );
 
-    // The checkout stops being a sysroot: the seam refuses, and with no store build
-    // behind the view doctor says so with the one fix — silence here left
-    // `rustc +trust` running a compiler with no sysroot.
+    // The checkout stops being a sysroot: the seam refuses, and with no store build behind
+    // the view doctor names the one fix (`rustc +trust` would run a compiler with no sysroot).
     std::fs::remove_dir_all(checkout.join("lib")).unwrap();
     let lines = crate::seam::reassert(&l, &rustup);
     assert!(
@@ -4812,10 +4809,8 @@ fn a_store_less_dev_linked_seam_is_checked_against_the_checkout() {
     );
 }
 
-/// (5f) tippy runs `trustc` under its own name and refuses a symbolic link there —
-/// so a bundle whose `trustc` is a link is a tippy that cannot run, and the report
-/// says so with the one fix. A plain `trustc` says nothing. A bundle with no tippy
-/// has nothing to refuse.
+/// (5f) tippy refuses a symlinked `trustc`: the report names a tippy that cannot run, with
+/// the one fix. A plain `trustc`, or a bundle with no tippy, says nothing.
 #[cfg(unix)]
 #[test]
 fn a_symlinked_trust_compiler_is_a_tippy_that_cannot_run() {
@@ -4858,12 +4853,11 @@ fn a_symlinked_trust_compiler_is_a_tippy_that_cannot_run() {
     );
 }
 
-/// Trust build 8595 the way the installed bundles 8571/8589/8590/8595 ship it: `rustc`
-/// and `cargo` SEPARATE files that differ from `trustc` and `targo`, beside `tippy`,
-/// with a `lib/` (a driver dylib, a nested rlib, a symlink) and a `share/` — active
-/// through PLAIN shims for `trust`, `trustc`, `targo`, `tippy` and `alab-tippy`, written
-/// directly the way a client from before exec roots laid them. Returns the layout, the
-/// synthetic home, `PATH` and the build's `bin/`.
+/// Trust build 8595 as the older bundles ship it: `rustc` and `cargo` separate files that
+/// differ from `trustc` and `targo`, beside `tippy`, with a `lib/` (a driver dylib, a nested
+/// rlib, a symlink) and a `share/`, active through plain shims for `trust`, `trustc`,
+/// `targo`, `tippy` and `alab-tippy`. Returns the layout, the synthetic home, `PATH` and the
+/// build's `bin/`.
 #[cfg(unix)]
 fn affected_trust_store(
     label: &str,
@@ -4911,7 +4905,7 @@ fn affected_trust_store(
     (l, home, path, bin)
 }
 
-/// Today's plain shim at `bin/<name>`, written directly so no route is decided.
+/// A plain shim at `bin/<name>`, written directly so no route is decided.
 #[cfg(unix)]
 fn write_plain_shim(l: &Layout, name: &str, target: &Path) {
     let shim = l.shim(&tool(name));
@@ -4979,25 +4973,9 @@ fn exec_root_lines(out: &str) -> Vec<&str> {
         .collect()
 }
 
-/// (5f)(c)-(f) THE EXEC ROOT, over the whole report, each state read-only:
-///
-/// * plain shims and no root on an affected build: the warn, with both inodes and the
-///   one fix, and "not healthy" at exit 0;
-/// * the pass's reconcile lays the root and routes the shims: the note, and healthy;
-/// * an `alab-` alias laid plain again: a warn naming it, one of five;
-/// * a file planted in the root's `lib/`: a warn naming that path; repair's `Deep`
-///   reconcile rebuilds the root and the report is healthy again;
-/// * `compat/trust` replaced by a symbolic link to the whole root's directory: a warn
-///   naming the link and the manual fix (never `repair` alone); the reconcile refuses
-///   with the same path and fix and lays the shims plain, `ensure_root`'s refusal line
-///   says the same, and once the link is gone and the directory is back the shims
-///   route again;
-/// * the build's `bin/rustc` unreadable: the (f) warn naming the failed read, not
-///   healthy, and the root left standing;
-/// * roots no build needs — a build's gone, a symlink at a numeric name — warn with
-///   `aterm pkg gc` and leave the report healthy, and gc's sweep takes exactly them;
-/// * the build stops needing a root (`rustc` a hard link of `trustc`): no (c) line at
-///   all, and its leftover root is a (d) warn until swept.
+/// (5f)(c)-(f) The exec root over the whole report, every state read-only: no root, the
+/// root laid, an alias unrouted, a planted file, a symlinked `compat/trust`, an unreadable
+/// `rustc`, stray roots, and a build that stops needing one.
 #[cfg(unix)]
 #[test]
 fn an_affected_trust_build_is_healthy_only_while_its_exec_root_routes_every_shim() {
@@ -5017,7 +4995,7 @@ fn an_affected_trust_build_is_healthy_only_while_its_exec_root_routes_every_shim
     let fix = "fix: `aterm pkg repair` lays the exec root (a copy-on-write clone — the store \
                is never modified) and routes the shims";
 
-    // An older client's machine: plain shims, no root.
+    // Plain shims, no root.
     let (ok, out, err) = read_only_report(&l, &home, &path);
     assert_not_healthy_exit_0(ok, &out, &err);
     assert_eq!(
@@ -5392,10 +5370,8 @@ fn the_trust_table_is_found_on_the_nearest_ancestor_manifest() {
     assert_eq!(workspace_with_trust_table(&plain), None);
 }
 
-/// WHAT THIS BUILD IGNORES, WARNED: a `[packages] prefix` naming
-/// another store stops unattended installs until the line goes, and a retired opt-out
-/// still exported switches nothing off — each is a `warn` naming the fix, and neither
-/// line appears when there is nothing to say.
+/// A `[packages] prefix` naming another store, and a retired opt-out still exported, are
+/// each a warn naming the fix; neither line appears when there is nothing to say.
 #[test]
 fn doctor_warns_an_ignored_prefix_and_an_exported_retired_opt_out() {
     let l = layout("ignored-settings");
@@ -5453,10 +5429,9 @@ fn doctor_warns_an_ignored_prefix_and_an_exported_retired_opt_out() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// THE FLOOR ROWS CLAIM ONLY WHAT WAS ACCEPTED: a floor of 0 is a missing file
-/// (`Floor::current`), not an acceptance, so a store no pass has accepted an index into
-/// says so; the generation rides the index row, and the roster row is said only where it
-/// is not the generation that row names.
+/// A floor of 0 is a missing file (`Floor::current`), not an acceptance, so a store that
+/// accepted no index says so; the generation rides the index row, and the roster row is said
+/// only where it differs from that generation.
 #[test]
 fn the_floor_rows_claim_only_what_was_accepted() {
     let l = layout("floor-rows");
@@ -5507,13 +5482,10 @@ fn the_floor_rows_claim_only_what_was_accepted() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// "NEVER CHECKED", SAID TRUTHFULLY: the doctor is the one surface that reports that
-/// no index pass has completed — with no `status.toml`, and over a record a failed pass
-/// wrote — and each line says what is true: the programs the ALab index pins wait for a
-/// pass, and the vendor programs this machine keeps at their vendors' heads update
-/// without one. Nothing on stderr. The vendor clause names ONLY the programs that do:
-/// installed and not held, not in `[packages] exclude`, on a machine whose packages
-/// update on their own — and is absent when none.
+/// "Never checked" (no `status.toml`, or a failed pass's record) says only what is true: the
+/// index-pinned programs wait for a pass, and the vendor clause names only the programs that
+/// update without one (installed, not held, not excluded, on a machine whose packages update
+/// on their own). Nothing on stderr.
 #[test]
 fn doctor_says_never_checked_truthfully_and_only_in_its_report() {
     let l = layout("never-checked");
@@ -5596,8 +5568,8 @@ fn doctor_says_never_checked_truthfully_and_only_in_its_report() {
     let (out4, _) = run(&excluded);
     assert!(line(&out4).ends_with("— run: aterm pkg update"), "{out4}");
     crate::pin::set_pinned(&l, "codex", false).unwrap();
-    // Packages that do not update on their own (`enabled` off — or the retired
-    // `auto_update` off — or the manager disarmed): no vendor program updates by itself either.
+    // Packages that do not update on their own (`enabled` off, or the manager disarmed): no
+    // vendor program updates by itself either.
     let (out5, _) = run(&Probes {
         automatic: false,
         ..Probes::default()
@@ -5617,12 +5589,10 @@ fn doctor_says_never_checked_truthfully_and_only_in_its_report() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// (8c) WHO WATCHES THE VENDOR HEADS (gap #28), said as the store's rendezvous says it:
-/// nothing named where no vendor program follows its vendor or packages do not update
-/// on their own; nobody watching is a note naming the cost (the next update pass, not
-/// minutes); a window, and a terminal session by its pid, are ok lines — and the
-/// report takes neither claim: every host keeps what it holds, and a host gone is
-/// read as gone at once.
+/// (8c) Who watches the vendor heads, as the store's rendezvous says: nothing where no vendor
+/// program follows its vendor or packages do not update on their own; nobody watching is a
+/// note naming the cost; a window, or a terminal session by its pid, is an `ok`. The report
+/// takes neither claim.
 #[test]
 fn doctor_says_who_watches_the_vendor_heads() {
     use crate::vendor_direct::watch::{Host, claimed};
@@ -5694,11 +5664,9 @@ fn doctor_says_who_watches_the_vendor_heads() {
 }
 
 #[cfg(target_os = "macos")]
-/// The freshness warnings, separately: an index unreached for days — the last pass
-/// failed, and the last success is that old — is named as such, and an index build
-/// unchanged for a month WHILE the index was reached reads as a frozen publisher. An
-/// unreachable index is never called a frozen publisher, and a record whose last pass
-/// reached the index names neither (the control).
+/// An index unreached for days (the last pass failed and the last success is that old) and
+/// an index build unchanged for a month while reachable (a frozen publisher) are named
+/// separately; a record whose last pass reached the index names neither.
 #[test]
 fn doctor_names_an_unreached_index_and_a_frozen_index_separately() {
     let l = layout("freshness");
@@ -5761,8 +5729,8 @@ fn doctor_names_an_unreached_index_and_a_frozen_index_separately() {
         !out.contains("publishing looks frozen"),
         "unreachable is not frozen:\n{out}"
     );
-    // The cause the last pass wrote — on the cached index, or failed outright — is
-    // said as the reason, in place of a list of guesses.
+    // The cause the last pass wrote (on the cached index, or failed outright) is said as the
+    // reason.
     for (outcome, why) in [
         (
             "up to date (index build 32) (index from cache \u{2014} dns lookup failed: \
@@ -5789,8 +5757,8 @@ fn doctor_names_an_unreached_index_and_a_frozen_index_separately() {
             "{out}"
         );
     }
-    // A failure OLDER than the success (a success stamped after the failed pass ended)
-    // is no failure.
+    // A failure older than the success (a success stamped after the failed pass ended) is no
+    // failure.
     let out = run(crate::Status {
         last_success_at: "2026-10-10T00:00:00Z".into(),
         last_pass: "failed".into(),
@@ -5821,10 +5789,9 @@ fn doctor_names_an_unreached_index_and_a_frozen_index_separately() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// THE VERDICT FIRST, THEN ONLY WHAT NEEDS ATTENTION: a report with warnings and no
-/// fault is "working", never "healthy"; every row it prints fits [`SHORT_ROW`] with the
-/// row's own next step; ok rows and notes wait for `--verbose`, which prints them all
-/// under the same verdict.
+/// Warnings without a fault read "working", never "healthy"; every printed row fits
+/// [`SHORT_ROW`] with its own next step; ok rows and notes wait for `--verbose`, which prints
+/// them all under the same verdict.
 #[test]
 fn the_report_leads_with_its_verdict_and_says_only_the_problems() {
     // A long row a real report carries: its fact, a reason past the width, and the next
@@ -5904,8 +5871,8 @@ fn the_report_leads_with_its_verdict_and_says_only_the_problems() {
     assert!(!all.contains("doctor: healthy"), "{all}");
 }
 
-/// Nothing flagged is `healthy`, with nothing below it; a fault keeps its own verdict
-/// and the one next act; a FAIL row's indented detail follows it.
+/// Nothing flagged is `healthy`, with nothing below it; a fault keeps its own verdict and the
+/// one next act; a FAIL row's indented detail follows it.
 #[test]
 fn a_clean_report_is_healthy_and_a_faulty_one_keeps_its_verdict_and_next_act() {
     let clean = "status: ok — prefix /p\nstatus: 3 program(s) active\nstatus: healthy\n";
@@ -5948,10 +5915,9 @@ fn a_clean_report_is_healthy_and_a_faulty_one_keeps_its_verdict_and_next_act() {
     );
 }
 
-/// A STRUCTURAL FAULT — the rows [`run_with`] writes to stderr — follows the verdict
-/// and is cut to one short row like every other problem, still on stderr; a row whose
-/// fact ends at a `;` or a sentence keeps the fact whole and its `Fix:`, and a `;` inside
-/// a parenthetical is not the end of the fact.
+/// A structural fault (a stderr row of [`run_with`]) follows the verdict, cut to one short
+/// row and still on stderr; a fact ending at a `;` or a sentence is kept whole with its
+/// `Fix:`, and a `;` inside a parenthetical does not end the fact.
 #[test]
 fn a_structural_fault_follows_the_verdict_in_one_short_row() {
     let long_path = format!("/Users//x/{}/pkg/bin/foo", "d".repeat(150));
@@ -6024,12 +5990,9 @@ fn a_structural_fault_follows_the_verdict_in_one_short_row() {
     );
 }
 
-/// THE CHANNEL HEAD PAST THE LOCAL INDEX. A pass completed minutes ago, the index was
-/// reached, the floor is index 42 — and the release host already answers for index 43;
-/// the report must say so, not just "healthy". The stamps here are written by the
-/// probe's REAL writer
-/// ([`crate::index_probe::successor_with`]) over a fake HEAD, and read back by the real
-/// reader; nothing on this path touches the network.
+/// A channel head past the local index (floor 42, the host answering for 43) is said, not
+/// just "healthy". The stamps come from the probe's real writer
+/// ([`crate::index_probe::successor_with`]) over a fake HEAD; nothing touches the network.
 #[test]
 fn doctor_says_when_the_channel_head_is_past_the_local_index() {
     use crate::index_probe::NEAR_LOCK;
@@ -6118,8 +6081,8 @@ fn doctor_says_when_the_channel_head_is_past_the_local_index() {
             .collect()
     };
 
-    // The §14 cache a pass writes from what the channel served, selected or not — by its
-    // REAL writer, under the source key the real fetcher uses.
+    // The §14 cache a pass writes from what the channel served, selected or not, by its real
+    // writer under the source key the real fetcher uses.
     let cache_holds = |builds: &[u64]| {
         let candidates: Vec<crate::select::Candidate> = builds
             .iter()
@@ -6168,9 +6131,9 @@ fn doctor_says_when_the_channel_head_is_past_the_local_index() {
     );
     age_stamps(120);
 
-    // (a2) The same hint, but the last pass that reached the index held only 42 and
-    // older: the channel had no COMPLETE newer release then. "run: aterm pkg update"
-    // alone would loop ("already current" / "not the newest"); the line says why.
+    // (a2) The same hint, but the last pass that reached the index held only 42 and older:
+    // the channel had no complete newer release then, and "run: aterm pkg update" alone
+    // would loop ("already current" / "not the newest"), so the line says why.
     cache_holds(&[42, 41, 40, 39]);
     let (_, out) = run(true);
     assert_eq!(
@@ -6186,8 +6149,8 @@ fn doctor_says_when_the_channel_head_is_past_the_local_index() {
         "{out}"
     );
 
-    // (a3) The last pass DOWNLOADED 43 and the floor is still 42: it was refused.
-    // Another update is not the remedy; the line says so — whatever the probe says.
+    // (a3) The last pass downloaded 43 and the floor is still 42: it was refused, and another
+    // update is not the remedy, whatever the probe says.
     cache_holds(&[43, 42, 41, 40]);
     let refused = "doctor: warn — index 42 is not the newest: index 43 was downloaded \
                    but not accepted — its signatures did not verify here, or its pass \
@@ -6244,8 +6207,8 @@ fn doctor_says_when_the_channel_head_is_past_the_local_index() {
         "{out}"
     );
 
-    // (c) No false alarm once the index LANDED: a "published" stamp written under 42
-    // says nothing about floor 43, and a cache holding 43 is not "newer than 43".
+    // (c) No false alarm once the index landed: a "published" stamp written under 42 says
+    // nothing about floor 43, and a cache holding 43 is not "newer than 43".
     clear();
     assert_eq!(
         probe(Some(43), false),

@@ -112,7 +112,7 @@ fn typing_press_snaps_and_deselects_inert_and_repeat_and_release_do_not() {
             "release must not deselect"
         );
     }
-    // REPEAT: the same held press continuing. Must do neither.
+    // Repeat (the same held press continuing): neither.
     let _ = app.input(wid, key(KeyEventType::Repeat), Source::Human);
     {
         let t = term_lock(&term);
@@ -149,8 +149,7 @@ fn typing_press_snaps_and_deselects_inert_and_repeat_and_release_do_not() {
             "bare {k:?} must not clear the selection"
         );
     }
-    // PRESS: snaps to the live bottom and clears the selection in one pass.
-    // UNCHANGED — the one handover from user to tail-follower.
+    // Press: snaps to the live bottom and clears the selection in one pass.
     let _ = app.input(wid, key(KeyEventType::Press), Source::Human);
     let t = term_lock(&term);
     assert_eq!(t.grid().display_offset(), 0, "press snaps to bottom");
@@ -262,9 +261,8 @@ fn zero_width_commits_and_stationary_kills_arm_no_cursor_move() {
             arm_glow(&mut ws.fx.cursor_mut().glow, seed);
             ws.fx.cursor_mut().trail.note_user_gesture(seed);
         }
-        // The headless fixture's synthetic PTY peer may already be closed;
-        // classifier supersession is intentionally a pre-egress host side
-        // effect and is the behavior under test.
+        // The headless PTY peer may already be closed; the supersession under
+        // test is a pre-egress side effect.
         let _ = app.input(wid, ctrl_k.clone(), Source::Human);
         let moved = Instant::now();
         let ws = app.windows.get_mut(&wid).unwrap();
@@ -430,8 +428,7 @@ fn failed_inline_key_write_revokes_every_new_movement_licence() {
         );
         assert!(glow_out.is_empty() && trail_out.is_empty());
     }
-    // A failed inline write never reached the PTY, so its key is not an
-    // answer to "did a human touch the keyboard just now": the licence
-    // model's swallow disposition (`SwallowedKeyClearsLicense`, proved in
-    // aterm-spec's `derived_cursor_hint_license_proves_and_catches_cold_light`).
+    // A key that never reached the PTY clears the movement licence
+    // (`SwallowedKeyClearsLicense`, proved in aterm-spec's
+    // `derived_cursor_hint_license_proves_and_catches_cold_light`).
 }

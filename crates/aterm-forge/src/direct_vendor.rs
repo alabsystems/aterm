@@ -1,44 +1,37 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `vendor/astream`, the astream git submodule: a separate, named `[OB-1]`
-//! provenance obligation, not an exemption for directories outside the patch
-//! table.
-//!
-//! # The pin is the gitlink
+//! `vendor/astream`, the astream git submodule: a separate, named `[OB-1]` provenance
+//! obligation, not an exemption for directories outside the patch table.
 //!
 //! `vendor/astream` is a submodule of `github.com/alabsystems/astream`
-//! (`vendor/README-astream.md`). The one pin is the gitlink the index records;
-//! nothing here hardcodes a revision or digest, and a bump is reviewed in
-//! astream. This module proves the tree builds the commit the gitlink names:
+//! (`vendor/README-astream.md`). The one pin is the gitlink the index records; nothing here
+//! hardcodes a revision or digest, and a bump is reviewed in astream. This module proves the tree
+//! builds the commit the gitlink names:
 //!
 //! 1. `.gitmodules` declares path `vendor/astream` with astream's URL;
-//! 2. the index records `vendor/astream` as one gitlink (mode 160000) and
-//!    tracks nothing beneath it;
-//! 3. the submodule is initialised and checked out at exactly the gitlink
-//!    commit, with no tracked modification (untracked or ignored build output
-//!    such as `target/` is not a modification);
-//! 4. cargo resolves `astream-{aead,broker,cap,wire}` exactly once each, from
-//!    `vendor/astream/crates/<name>/Cargo.toml`, as path packages (a null
-//!    `source`) licensed Apache-2.0, and not as aterm workspace members;
+//! 2. the index records `vendor/astream` as one gitlink (mode 160000) and tracks nothing beneath
+//!    it;
+//! 3. the submodule is checked out at exactly the gitlink commit, with no tracked modification
+//!    (untracked or ignored build output such as `target/` is not one);
+//! 4. cargo resolves `astream-{aead,broker,cap,digest,wire}` exactly once each, from
+//!    `vendor/astream/crates/<name>/Cargo.toml`, as path packages (a null `source`) licensed
+//!    Apache-2.0, and not as aterm workspace members;
 //! 5. the root manifest's `[workspace] exclude` covers `vendor/astream`;
 //! 6. `crates/aterm-link` still reaches astream-broker and astream-cap there;
-//! 7. the pin did not move backward relative to the merge-base with
-//!    `origin/main` (see [`PinMotion`]).
+//! 7. the pin did not move backward relative to the merge-base with `origin/main` (see
+//!    [`PinMotion`]).
 //!
-//! The gitlink is read from the index, so a staged bump is judged as the commit
-//! it will become. Obligation 7 compares against `HEAD`'s merge-base with
-//! `origin/main`, so mid-merge it judges the merge commit once it exists.
+//! The gitlink is read from the index, so a staged bump is judged as the commit it will become.
 //!
-//! # What it does not prove
-//!
-//! It runs offline and never fetches, so it cannot say that the pinned commit
-//! is one astream's `main` reached or that astream's own gate passed there.
-//! Nor does it decide provenance: [`crate::provenance::FIRST_PARTY_VENDORED`]
-//! is the reviewed claim that these crates are aterm's own code.
+//! It runs offline and never fetches, so it cannot say the pinned commit is one astream's `main`
+//! reached (`ship release` refuses that at its sync step: aterm-release
+//! `gates::submodules_on_declared_branch`) or that astream's own gate passed there. Provenance is
+//! [`crate::provenance::FIRST_PARTY_VENDORED`]'s claim, not this module's.
 
+use aterm_uds::output::CommandOutput as _;
+use aterm_uds::spawnfd::command;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use aterm_json::Value;
 use aterm_toml::edit::{DocumentMut, Item};
@@ -54,16 +47,17 @@ const GITLINK_MODE: &str = "160000";
 const BASE_REF: &str = "refs/remotes/origin/main";
 /// How messages spell [`BASE_REF`].
 const BASE_NAME: &str = "origin/main";
-/// A tip-commit message line that declares a DELIBERATE backward move, with
-/// its reason: `astream-pin-rollback: astream 5021230 broke the sealed wire`.
+/// A commit-message line on this branch that declares a deliberate backward move, with its
+/// reason: `astream-pin-rollback: <why the older astream is needed>`.
 const ROLLBACK_TRAILER: &str = "astream-pin-rollback:";
 /// The astream crates aterm resolves. `astream-aead` only under aterm-link's
 /// off-by-default `sealed` feature, which is why [`metadata`] asks for every
-/// feature.
-const PACKAGES: [&str; 4] = [
+/// feature; `astream-digest` (the SHA-256 under astream-cap) in every build.
+const PACKAGES: [&str; 5] = [
     "astream-aead",
     "astream-broker",
     "astream-cap",
+    "astream-digest",
     "astream-wire",
 ];
 const CONSUMER: &str = "crates/aterm-link/Cargo.toml";
@@ -115,15 +109,12 @@ enum Checkout {
     },
 }
 
-/// Where this tree's pin stands against `origin/main`'s pin at the merge-base.
-/// A bump moves forward; it goes backward by accident when a checkout whose
-/// submodule was not advanced records the old gitlink (`git commit -a`,
-/// `git add -A`, or a merge resolved there).
+/// Where this tree's pin stands against `origin/main`'s pin at the merge-base. A bump moves
+/// forward; a checkout whose submodule was not advanced moves it backward by recording the old
+/// gitlink (`git commit -a`, `git add -A`, or a merge resolved there).
 ///
-/// A provable regression fails, and so does a pin that cannot be a bump
-/// because the base's pin was never fetched ([`PinMotion::BaseNotFetched`]);
-/// everything else passes. This module never fetches, so a pin commit missing
-/// from the submodule's store is [`PinMotion::Undecided`] and passes.
+/// A provable regression fails, and so does [`PinMotion::BaseNotFetched`]; everything else
+/// passes, including [`PinMotion::Undecided`] (this module never fetches).
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum PinMotion {
     /// The gitlink is the base's own, or there is nothing to compare with: no
@@ -133,8 +124,8 @@ enum PinMotion {
     Forward,
     /// Neither pin is an ancestor of the other.
     Diverged,
-    /// This pin is a strict ancestor of the base's: a regression. `declared`
-    /// is the tip commit's `astream-pin-rollback:` reason when it names one.
+    /// This pin is a strict ancestor of the base's: a regression. `declared` is the
+    /// `astream-pin-rollback:` reason a commit on this branch gives, if any.
     Backward {
         base: String,
         declared: Option<String>,
@@ -148,7 +139,7 @@ enum PinMotion {
 }
 
 /// Everything [`validate`] judges. [`capture`] reads it from the real
-/// repository and the tests mutate it.
+/// repository; the tests build a valid one and mutate it.
 #[derive(Clone, Debug)]
 struct Facts {
     /// `.gitmodules` as `(key, value)` pairs, as `git config --list` reads
@@ -160,26 +151,26 @@ struct Facts {
     motion: PinMotion,
     /// The root manifest's `[workspace] exclude` entries.
     exclude: Vec<String>,
-    /// Held as a result so that the git facts, which explain WHY cargo
-    /// failed (an uninitialised submodule), are judged first.
+    /// Held as a result so that the git facts, which explain why cargo failed (an uninitialised
+    /// submodule), are judged first.
     metadata: Result<Value, String>,
 }
 
 /// Called only for the named submodule or its live consumer. Other vendor
 /// directories still owe the ordinary patch-table obligation. `Ok(None)`
 /// means neither exists at this root (attest's synthetic fixtures).
-pub(crate) fn review(root: &Path) -> Result<Option<Pin>, String> {
+pub(crate) fn review(cargo: &crate::resolve::Cargo, root: &Path) -> Result<Option<Pin>, String> {
     if !root.join(SUBMODULE).exists() && !root.join(CONSUMER).exists() {
         return Ok(None);
     }
     let root = root
         .canonicalize()
         .map_err(|e| format!("workspace root: {e}"))?;
-    let facts = capture(&root)?;
+    let facts = capture(cargo, &root)?;
     validate(&root, &facts).map(Some)
 }
 
-fn capture(root: &Path) -> Result<Facts, String> {
+fn capture(cargo: &crate::resolve::Cargo, root: &Path) -> Result<Facts, String> {
     let index = index(root)?;
     Ok(Facts {
         gitmodules: gitmodules(root)?,
@@ -187,12 +178,12 @@ fn capture(root: &Path) -> Result<Facts, String> {
         checkout: checkout(root),
         motion: pin_motion(root, &index),
         exclude: exclude(root)?,
-        metadata: metadata(root),
+        metadata: metadata(cargo, root),
     })
 }
 
 fn git(dir: &Path, args: &[&str], isolate: bool) -> Result<Vec<u8>, String> {
-    let mut cmd = Command::new("git");
+    let mut cmd = command("git");
     cmd.args(args).current_dir(dir);
     if isolate {
         for var in REPO_ENV {
@@ -200,7 +191,7 @@ fn git(dir: &Path, args: &[&str], isolate: bool) -> Result<Vec<u8>, String> {
         }
     }
     let out = cmd
-        .output()
+        .output_owned()
         .map_err(|e| format!("cannot run `git {}`: {e}", args.join(" ")))?;
     if !out.status.success() {
         return Err(format!(
@@ -264,8 +255,8 @@ fn index(root: &Path) -> Result<Vec<IndexEntry>, String> {
         .collect()
 }
 
-/// Never an error: whatever keeps git from answering INSIDE the submodule is
-/// the finding, and [`validate`] names the fix for it.
+/// Never an error: whatever keeps git from answering inside the submodule is the finding, and
+/// [`validate`] names the fix for it.
 fn checkout(root: &Path) -> Checkout {
     let dir = root.join(SUBMODULE);
     if !dir.is_dir() {
@@ -385,14 +376,14 @@ fn pin_motion(root: &Path, index: &[IndexEntry]) -> PinMotion {
 /// `git merge-base --is-ancestor`: exit 0 yes, 1 no, anything else an error,
 /// which [`git`] cannot tell apart from "no".
 fn is_ancestor(dir: &Path, ancestor: &str, descendant: &str) -> Result<bool, String> {
-    let mut cmd = Command::new("git");
+    let mut cmd = command("git");
     cmd.args(["merge-base", "--is-ancestor", ancestor, descendant])
         .current_dir(dir);
     for var in REPO_ENV {
         cmd.env_remove(var);
     }
     let out = cmd
-        .output()
+        .output_owned()
         .map_err(|e| format!("cannot run `git merge-base --is-ancestor`: {e}"))?;
     match out.status.code() {
         Some(0) => Ok(true),
@@ -440,13 +431,11 @@ fn exclude(root: &Path) -> Result<Vec<String>, String> {
 /// `astream-aead` is reachable only through aterm-link's off-by-default
 /// `sealed` feature. `--locked --offline`: reads the shipped lock, fetches
 /// nothing.
-fn metadata(root: &Path) -> Result<Value, String> {
-    // `$CARGO` (the driver running forge), else Trust's `targo` — never a stock
-    // `cargo`. `metadata` takes no lane flag.
-    let exe = std::env::var_os("CARGO").unwrap_or_else(|| "targo".into());
-    let out = Command::new(exe)
+fn metadata(cargo: &crate::resolve::Cargo, root: &Path) -> Result<Value, String> {
+    // `metadata` takes no lane flag.
+    let out = cargo
+        .command("metadata", root)
         .args([
-            "metadata",
             "--format-version",
             "1",
             "--all-features",
@@ -455,8 +444,7 @@ fn metadata(root: &Path) -> Result<Value, String> {
         ])
         .arg("--manifest-path")
         .arg(root.join("Cargo.toml"))
-        .current_dir(root)
-        .output()
+        .output_owned()
         .map_err(|e| format!("cannot read Cargo metadata: {e}"))?;
     if !out.status.success() {
         return Err(format!(
@@ -549,7 +537,7 @@ fn declared_url(entries: &[(String, String)]) -> Result<String, String> {
         }
     };
     let key = format!("submodule.{name}.url");
-    // git reads the LAST value of a single-valued key.
+    // git reads the last value of a single-valued key.
     let url = entries
         .iter()
         .rev()
@@ -780,13 +768,72 @@ fn consumer_reaches_submodule(root: &Path, metadata: &Value) -> Result<(), Strin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::repo_root;
+    use aterm_json::json;
 
-    /// The real tree's facts, which every mutation below starts from, and
-    /// which must themselves validate or the mutations prove nothing.
-    fn real() -> (PathBuf, Facts) {
-        let root = repo_root().canonicalize().unwrap();
-        let facts = capture(&root).unwrap();
+    /// A tree that holds every obligation, written out: the base every
+    /// mutation below starts from, which must itself validate or the
+    /// mutations prove nothing. `validate` reads nothing but its `Facts` (the
+    /// root only prefixes the paths it compares), so a built base judges the
+    /// same logic a captured one would — and leaves these controls green when
+    /// THIS checkout legitimately fails OB-1: a submodule moved for an astream
+    /// trial, or a public clone with no `.gitmodules`. Whether the live tree
+    /// holds OB-1 is attest's real-tree tests' question and the `forge`
+    /// check's, which run `capture` and `targo metadata` for real. The
+    /// metadata carries the fields `validate` reads, shaped as
+    /// `targo metadata --format-version 1` prints them.
+    fn valid() -> (PathBuf, Facts) {
+        let root = PathBuf::from("/w");
+        let pin = "1".repeat(40);
+        let path = |p: &Path| p.to_str().unwrap().to_owned();
+        let id = |dir: &Path| format!("path+file://{}#0.1.0", path(dir));
+        let crate_dir = |name: &str| root.join(SUBMODULE).join("crates").join(name);
+        let mut packages: Vec<Value> = PACKAGES
+            .iter()
+            .map(|name| {
+                let dir = crate_dir(name);
+                json!({
+                    "id": id(&dir),
+                    "name": name,
+                    "source": null,
+                    "license": "Apache-2.0",
+                    "manifest_path": path(&dir.join("Cargo.toml")),
+                    "dependencies": [],
+                })
+            })
+            .collect();
+        let consumer = root.join(CONSUMER);
+        let link = id(consumer.parent().unwrap());
+        let deps: Vec<Value> = CONSUMER_DEPS
+            .iter()
+            .map(|name| json!({ "name": name, "path": path(&crate_dir(name)) }))
+            .collect();
+        packages.push(json!({
+            "id": link.clone(),
+            "name": "aterm-link",
+            "source": null,
+            "license": "Apache-2.0",
+            "manifest_path": path(&consumer),
+            "dependencies": deps,
+        }));
+        let facts = Facts {
+            gitmodules: vec![
+                (format!("submodule.{SUBMODULE}.path"), SUBMODULE.into()),
+                (format!("submodule.{SUBMODULE}.url"), format!("{URL}.git")),
+            ],
+            index: vec![IndexEntry {
+                mode: GITLINK_MODE.into(),
+                object: pin.clone(),
+                stage: "0".into(),
+                path: SUBMODULE.into(),
+            }],
+            checkout: Checkout::At {
+                head: pin,
+                modified: Vec::new(),
+            },
+            motion: PinMotion::Unchanged,
+            exclude: vec![SUBMODULE.into()],
+            metadata: Ok(json!({ "packages": packages, "workspace_members": [link] })),
+        };
         assert!(
             validate(&root, &facts).is_ok(),
             "{:?}",
@@ -821,19 +868,8 @@ mod tests {
     }
 
     #[test]
-    fn the_real_submodule_is_the_pinned_commit_and_cargo_resolves_it() {
-        let root = repo_root().canonicalize().unwrap();
-        let pin = review(&root)
-            .unwrap_or_else(|why| panic!("{why}"))
-            .expect("this checkout has vendor/astream");
-        let (_, facts) = real();
-        assert_eq!(pin.commit, facts.index[0].object);
-        assert!(pin.url == URL || pin.url == format!("{URL}.git"));
-    }
-
-    #[test]
     fn a_missing_or_wrong_gitmodules_entry_is_refused() {
-        let (root, facts) = real();
+        let (root, facts) = valid();
         let mut missing = facts.clone();
         missing.gitmodules.retain(|(k, _)| !k.ends_with(".path"));
         rejects(&root, &missing, &[".gitmodules", "declares no submodule"]);
@@ -866,7 +902,7 @@ mod tests {
 
     #[test]
     fn a_non_gitlink_or_a_tracked_file_beneath_it_is_refused() {
-        let (root, facts) = real();
+        let (root, facts) = valid();
         let mut tree = facts.clone();
         tree.index[0].mode = "100644".into();
         rejects(&root, &tree, &["mode 100644", "not as a gitlink"]);
@@ -889,7 +925,7 @@ mod tests {
 
     #[test]
     fn a_checkout_off_the_gitlink_or_uninitialised_or_dirty_is_refused() {
-        let (root, facts) = real();
+        let (root, facts) = valid();
         let mut moved = facts.clone();
         moved.checkout = Checkout::At {
             head: "0".repeat(40),
@@ -915,7 +951,7 @@ mod tests {
         );
         let mut dirty = facts.clone();
         let Checkout::At { modified, .. } = &mut dirty.checkout else {
-            panic!("the real checkout is initialised")
+            panic!("the valid base is checked out")
         };
         modified.push(" M crates/astream-cap/src/lib.rs".into());
         rejects(
@@ -927,13 +963,19 @@ mod tests {
 
     #[test]
     fn a_package_redirected_made_a_member_or_given_a_registry_source_is_refused() {
-        let (root, facts) = real();
-        let mut redirected = facts.clone();
-        package(&mut redirected, "astream-cap").insert(
-            "manifest_path".into(),
-            Value::String("/outside/Cargo.toml".into()),
-        );
-        rejects(&root, &redirected, &["redirects `astream-cap`", "/outside"]);
+        let (root, facts) = valid();
+        for name in PACKAGES {
+            let mut redirected = facts.clone();
+            package(&mut redirected, name).insert(
+                "manifest_path".into(),
+                Value::String("/outside/Cargo.toml".into()),
+            );
+            rejects(
+                &root,
+                &redirected,
+                &[&format!("redirects `{name}`"), "/outside"],
+            );
+        }
         let mut member = facts.clone();
         let id = package(&mut member, "astream-wire")["id"].clone();
         member
@@ -987,7 +1029,7 @@ mod tests {
 
     #[test]
     fn a_missing_exclude_is_refused_and_an_ancestor_exclude_covers_it() {
-        let (root, facts) = real();
+        let (root, facts) = valid();
         let mut none = facts.clone();
         none.exclude.clear();
         rejects(&root, &none, &["exclude", "vendor/astream"]);
@@ -1001,7 +1043,7 @@ mod tests {
 
     #[test]
     fn aterm_link_redirected_away_from_the_submodule_is_refused() {
-        let (root, mut facts) = real();
+        let (root, mut facts) = valid();
         let deps = package(&mut facts, "aterm-link")
             .get_mut("dependencies")
             .unwrap()
@@ -1019,7 +1061,7 @@ mod tests {
 
     #[test]
     fn a_backward_pin_is_refused_unless_a_commit_on_the_branch_declares_a_rollback() {
-        let (root, mut facts) = real();
+        let (root, mut facts) = valid();
         let base = "0123456789012345678901234567890123456789".to_owned();
         facts.motion = PinMotion::Backward {
             base: base.clone(),
@@ -1088,7 +1130,7 @@ mod tests {
         }
 
         fn run(&self, dir: &Path, args: &[&str]) -> String {
-            let mut cmd = Command::new("git");
+            let mut cmd = command("git");
             cmd.args([
                 "-c",
                 "user.name=t",
@@ -1106,7 +1148,7 @@ mod tests {
             for var in REPO_ENV {
                 cmd.env_remove(var);
             }
-            let out = cmd.output().unwrap();
+            let out = cmd.output_owned().unwrap();
             assert!(
                 out.status.success(),
                 "git {args:?}: {}",
@@ -1115,7 +1157,7 @@ mod tests {
             String::from_utf8_lossy(&out.stdout).trim().to_owned()
         }
 
-        /// A commit in the SUBMODULE on top of `parent` (or the current HEAD).
+        /// A commit in the submodule on top of `parent` (or the current HEAD).
         fn astream_commit(&self, parent: Option<&str>, msg: &str) -> String {
             let sub = self.root.path().join(SUBMODULE);
             if let Some(p) = parent {
@@ -1125,7 +1167,7 @@ mod tests {
             self.run(&sub, &["rev-parse", "HEAD"])
         }
 
-        /// A commit in the SUPERPROJECT that records `pin` at the gitlink.
+        /// A commit in the superproject that records `pin` at the gitlink.
         fn commit_pin(&self, parent: Option<&str>, pin: &str, msg: &str) -> String {
             if let Some(p) = parent {
                 self.run(self.root.path(), &["checkout", "-q", "--detach", p]);
@@ -1288,7 +1330,7 @@ mod tests {
         let c1 = f.astream_commit(None, "c1");
         let c2 = f.astream_commit(None, "c2");
         let base = f.commit_pin(None, &c2, "the pin is c2");
-        // The remote-tracking ref is absent, and a LOCAL branch spells its name.
+        // The remote-tracking ref is absent, and a local branch spells its name.
         f.run(f.root.path(), &["branch", "origin/main", &base]);
         f.commit_pin(Some(&base), &c1, "goes back to c1");
         assert_eq!(f.motion(), PinMotion::Unchanged);

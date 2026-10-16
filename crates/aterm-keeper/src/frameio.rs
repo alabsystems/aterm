@@ -3,11 +3,9 @@
 
 //! One AKP1 frame on a connected stream, with its descriptor.
 //!
-//! Every read goes through `fdpass::recv_with_fds`, the header's first read
-//! declaring room for ONE descriptor and every later read for none: a
-//! descriptor riding any byte but a frame's first, or riding a kind that
-//! carries none, is closed and the connection refused — never silently
-//! dropped by a plain `read`, never left in the table unnamed.
+//! Every read goes through `fdpass::recv_with_fds`, the header's first read with room for one
+//! descriptor and every later read for none: a descriptor riding any byte but a frame's first,
+//! or a kind that carries none, is closed and the connection refused, never dropped unnamed.
 
 use std::io::{self, Write as _};
 use std::os::fd::{BorrowedFd, OwnedFd};

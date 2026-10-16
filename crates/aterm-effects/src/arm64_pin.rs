@@ -1,26 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Exact-bit pins measured on Apple silicon, and how x86_64 macOS treats them.
+//! Exact-bit pins measured on Apple silicon, waived on x86_64 macOS.
 //!
-//! Several tests pin a `u64` fold of what the engine renders: `cursor_glow`'s
-//! `DELETION_GOLDENS` (RainbowKitty and other styles), the flat spelling's
-//! `FLAT_GOLDENS`, the rainbow kitty voice's `LETTER_PATH_FOLD`, and the music
-//! box's `ORACLE_SCRIPT_FOLD` and `BRRRRING_FOLD`. The values were measured on
-//! Apple silicon, and every script runs through libm transcendentals (`powf`,
-//! `hypot`, `asin`, `atan2`, `exp`, `sin`, `cos`), where two libms need not
-//! agree in the last bit. On an x86_64 Mac (macOS 13.7) these pins miss, with
-//! the tree and a Trust-specific compiler difference ruled out; the likely
-//! cause is different last bits in the transcendental math (libm, or a
-//! target-dependent lowering).
-//!
-//! So everywhere but x86_64 macOS each helper below is the plain assertion
-//! (same comparison, message and failure), written as a pair with the
-//! `not(all(target_arch = "x86_64", target_os = "macos"))` arm first. x86_64
-//! Linux and Windows keep the assertions. On x86_64 macOS a mismatch prints
-//! one stderr line (test, row, got, want, and why it is not asserted) instead
-//! of failing, and determinism is still asserted: [`deterministic_on_x86_64`]
-//! renders the pinned script again and demands the same bits.
+//! Some tests pin a `u64` fold of a render (`cursor_glow`'s `DELETION_GOLDENS` and
+//! `FLAT_GOLDENS`, the rainbow kitty voice's `LETTER_PATH_FOLD`, the music box's
+//! `ORACLE_SCRIPT_FOLD` and `BRRRRING_FOLD`) whose script runs through libm
+//! transcendentals (`powf`, `hypot`, `asin`, `atan2`, `exp`, `sin`, `cos`). Their last
+//! bits need not agree between libms, and on x86_64 macOS they do not: there a
+//! mismatch prints one stderr line instead of failing, and [`deterministic_on_x86_64`]
+//! still demands that a second render reproduce the same bits. Everywhere else each
+//! helper is the plain assertion.
 
 use core::fmt;
 
@@ -91,10 +81,9 @@ pub(crate) fn deterministic_on_x86_64<T: PartialEq + fmt::Debug>(
     );
 }
 
-/// The one line an x86_64 macOS run prints per moved row: where the pin was
-/// measured and why this host does not assert it, claiming no cause. Written
-/// to the stderr handle rather than via `eprintln!` (which libtest captures
-/// for passing tests), so a waived pin shows in every run.
+/// The one stderr line an x86_64 macOS run prints per moved row. Written to the
+/// stderr handle, not `eprintln!` (which libtest captures for passing tests),
+/// so a waived pin shows in every run.
 #[cfg(all(target_arch = "x86_64", target_os = "macos"))]
 fn report(test: &str, row: &str, got: u64, want: u64) {
     use std::io::Write as _;

@@ -112,7 +112,7 @@ impl Terminal {
     /// The indexed (0-255) color palette.
     #[must_use]
     pub fn color_palette(&self) -> &ColorPalette {
-        &self.color.palette
+        self.color.palette()
     }
 
     /// Mutate the host-configured color palette.
@@ -125,10 +125,11 @@ impl Terminal {
         // without touching grid content. Mark before handing the borrow out so
         // every damage-keyed frontend observes the possible visual mutation.
         self.grid.damage_mut().mark_full();
-        let before = self.color.palette.clone();
+        let before = self.color.palette().clone();
+        let (palette, configured_palette) = self.color.palette_and_configured_mut();
         ColorPaletteMut {
-            palette: &mut self.color.palette,
-            configured_palette: &mut self.color.configured_palette,
+            palette,
+            configured_palette,
             before,
         }
     }
@@ -136,7 +137,7 @@ impl Terminal {
     /// The RGB value for an indexed color.
     #[must_use]
     pub fn palette_color(&self, index: u8) -> Rgb {
-        self.color.palette.get(index)
+        self.color.palette().get(index)
     }
 
     /// Indexed color as primitive RGB components.
@@ -155,7 +156,7 @@ impl Terminal {
     /// live palette, so a prior program-issued OSC 4 mutation can never become a
     /// host reset default accidentally.
     pub fn set_palette_color(&mut self, index: u8, color: Rgb) {
-        self.color.palette.set(index, color);
+        self.color.palette_mut().set(index, color);
         self.color
             .configured_palette
             .get_or_insert_with(ColorPalette::new)
@@ -171,7 +172,7 @@ impl Terminal {
     /// Reset the live and host-configured color palette to built-in defaults.
     #[cfg(test)]
     pub fn reset_color_palette(&mut self) {
-        self.color.palette.reset();
+        self.color.palette_mut().reset();
         self.color.configured_palette = None;
         self.grid.damage_mut().mark_full();
     }

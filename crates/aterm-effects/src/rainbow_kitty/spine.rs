@@ -2,42 +2,31 @@
 // Copyright 2026 Andrew Yates
 
 //! The spine: rainbow kitty v2's one answer to "how hard are you typing", and
-//! the display follower every visual reads. Design:
-//! `docs/design/RAINBOW-KITTY-V2.md` §17.1, §2.1 T4 (velocity is inherited,
-//! never smoothed; the spine drives heat, never birth position), §19.1.
+//! the display follower every visual reads (`docs/design/RAINBOW-KITTY-V2.md`
+//! §17.1, §19.1; T4: the spine drives heat, never birth position).
 //!
-//! * One metric: [`TypingMomentum`] verbatim (τ 2.0 s, rate 0.65, credit cap
-//!   0.35 s, delete/kill drains). It builds only from non-delete printable
-//!   typing advances; a jump never raises it (no keystroke, no momentum, no
-//!   light bought with momentum).
-//! * One follower: the eased display value [`Spine::disp`], read by ribbon
-//!   width, star counts, meteor width, caret paint and the kitty's bank. It
-//!   chases `target = clamp01(metric · METRIC_GAIN)` ([`Spine::target`]),
-//!   leaving the metric itself untouched. Attack 0.05 s, slam 0.04 s on a rise
-//!   past [`DISP_SLAM_RISE`], release τ 0.85 s: the ribbon swells over ~100 ms
-//!   and exhales over ~2 s.
-//! * One resume memory: [`Spine::disp_peak`], a 7 s half-life of the
-//!   follower's recent peak that floors birth pricing only
-//!   ([`Spine::birth_disp`]), so a key after a thinking pause opens at 80 % of
-//!   the band it re-joins.
-//! * Erase weight is not a separate integrator: the drains move the one metric.
-//! * The mend is a mark, not a level: a Backspace records an [`EraseMark`]
-//!   (the birth spine at the delete and the run's delete count). The next typed
-//!   key, within [`MEND_WINDOW_S`] after at most [`MEND_MAX_DELETES`] deletes,
-//!   is a typo fix priced at `max(birth_disp, mark.disp)`, so momentum resumes.
-//!   The mark touches no metric, arms no timer, and `Spine::at_rest` ignores it.
-//! * Flow is a counter: one `u32` run (keys at or above [`FLOW_KEY_DISP`] with
-//!   no delete) and its high-water mark. No clock or deadline; [`Flow`] is a
-//!   pure function of the counter, and an idle spine drops the run when it
-//!   snaps to zero. Flow draws nothing itself; it re-prices births.
+//! * One metric: [`TypingMomentum`] verbatim. Only non-delete printable typing
+//!   builds it; a jump never raises it. Deletes and kills drain it (erase
+//!   weight is not a separate integrator).
+//! * One follower: [`Spine::disp`], read by ribbon width, star counts, meteor
+//!   width, caret paint and the kitty's bank. It chases
+//!   `clamp01(metric · METRIC_GAIN)`: attack 0.05 s, slam 0.04 s on a rise past
+//!   [`DISP_SLAM_RISE`], release τ 0.85 s.
+//! * One resume memory: `Spine::disp_peak`, a 7 s half-life of the follower's
+//!   peak that floors birth pricing only ([`Spine::birth_disp`]).
+//! * The mend is a mark, not a level: a Backspace records an [`EraseMark`]; the
+//!   next typed key within [`MEND_WINDOW_S`] after at most [`MEND_MAX_DELETES`]
+//!   deletes is a typo fix priced at `max(birth_disp, mark.disp)`. The mark
+//!   touches no metric and arms no timer.
+//! * Flow is a counter: a `u32` run of keys at or above [`FLOW_KEY_DISP`] with
+//!   no delete, and its high-water mark. [`Flow`] is a pure function of it;
+//!   an idle spine drops the run when it snaps to zero. Flow re-prices births
+//!   and draws nothing itself.
 //!
-//! ## Determinism
-//!
-//! Every entry point takes an injected `now: Instant`. [`Spine::update`] is the
-//! only place the follower advances, so a frame at `now` is a pure function of
-//! the event history and `now` (`v2_frames_are_pure_functions_of_now`). The
-//! follower is `dt`-parameterised (`1 − e^(−dt/τ)`), so any refresh rate
-//! reaches the same value at the same wall time (T7).
+//! Every entry point takes an injected `now`, and [`Spine::update`] is the only
+//! place the follower advances, so a frame is a pure function of the event
+//! history and `now`. The follower is `dt`-parameterised (`1 − e^(−dt/τ)`), so
+//! any refresh rate reaches the same value at the same wall time (T7).
 
 use aterm_time::Instant;
 
@@ -45,25 +34,19 @@ use super::timing::smoothstep01;
 use crate::typing_momentum::TypingMomentum;
 
 /// The gain the follower puts on the canonical metric:
-/// `target = clamp01(metric · METRIC_GAIN)`, applied at one site
-/// ([`Spine::target`]) that the chase, slam detector, peak memory and
-/// first-tick latch all read, while [`Spine::momentum`] (`trail status
-/// momentum=`) reports the raw metric.
+/// `target = clamp01(metric · METRIC_GAIN)`, applied only in [`Spine::target`];
+/// the raw metric (`trail status momentum=`) stays ungained.
 ///
-/// 1.23 = 0.80 / 0.65: v2's display climbs as if `TYPING_MOMENTUM_RATE` were
-/// 0.80, without changing the family metric that the kitty cursor's earn arc
-/// and other consumers are pinned to. A cold hand at 8 cps reaches `disp` 0.5
-/// on key 5 (500 ms after key 1), 0.8 on key 10 (1.13 s) and 0.95 on key 13
-/// (1.52 s). The cost is the ceiling clamp (a metric ≥ 0.813 reads as full),
-/// which also delays the release start by `τ_metric · ln 1.23` = 414 ms after a
-/// full stop.
+/// 1.23 = 0.80 / 0.65: the display climbs as if `TYPING_MOMENTUM_RATE` were
+/// 0.80 without changing the family metric other consumers are pinned to. A
+/// cold 8 cps hand reaches `disp` 0.5 on key 5, 0.8 on key 10 and 0.95 on key
+/// 13. The cost: a metric ≥ 0.813 reads as full, which delays the release by
+/// `τ_metric · ln 1.23` = 414 ms after a full stop.
 pub const METRIC_GAIN: f32 = 1.23;
 
-/// Ribbon-momentum attack ease, seconds to ~63 % of a rise: a single key swells
-/// the ribbon over ~50 ms instead of popping its width in one frame (legal
-/// because the mark itself is already at full brightness; T3 governs marks).
-/// At 0.05 the caret's paint and the next key's birth land within ~50 ms of
-/// the hand.
+/// Ribbon-momentum attack ease, seconds to ~63 % of a rise: a key swells the
+/// ribbon's width over ~50 ms instead of popping it in one frame (T3 governs
+/// marks, which are born at full brightness).
 pub const DISP_ATTACK_S: f32 = 0.05;
 
 /// The slam ease: a big rise (a fling, a celebration drive, a warm resume)
@@ -114,9 +97,9 @@ pub const MEND_MAX_DELETES: u8 = 2;
 
 /// The flow floor: a typed key counts toward the run only when its own birth
 /// price ([`Spine::birth_disp`]) is at least this; below it the key breaks the
-/// run. 0.8 is where a cold hand reaches at ~key 10 / 1.13 s of steady typing,
-/// so flow is reached by typing, never by the first key. Read off the birth
-/// spine so a key re-joining a paused run resumes it.
+/// run. A cold 8 cps hand reaches 0.8 at ~key 10, so flow is reached by typing,
+/// never by the first key. Read off the birth spine so a key re-joining a
+/// paused run resumes it.
 pub const FLOW_KEY_DISP: f32 = 0.8;
 
 /// Hot resume after a green command, seconds: how long a successful
@@ -132,9 +115,8 @@ pub const VERDICT_WINDOW_S: f32 = 5.0;
 pub const VERDICT_BIRTH_DISP: f32 = 1.0;
 
 /// The run length at which [`Flow::heat`] is 1.0 and every consumer is at its
-/// flowing price: 24 qualifying keys. Measured through the engine, the 24th
-/// lands 3.083 s after the first key of a cold 12 cps hand and 4.375 s at
-/// 8 cps (the first 11 / 13 keys are the climb to [`FLOW_KEY_DISP`]).
+/// flowing price: 24 qualifying keys, ~3.1 s from the first key of a cold
+/// 12 cps hand (4.4 s at 8 cps).
 pub const FLOW_ENTRY_KEYS: u32 = 24;
 
 /// Keys over which [`Flow::heat`] eases up to 1.0 at [`FLOW_ENTRY_KEYS`], so
@@ -155,9 +137,8 @@ pub const FLOW_FREEZE_S: f32 = 0.25;
 /// change of gear; the steepest step of the 8 cps ramp is 0.13 per key.
 pub const SURGE_MIN_RISE: f32 = 0.15;
 
-/// The birth-price rise that buys the whole stretch ([`Spine::surge`] 1.0).
-/// The design rule is `edge_cells = 3 + 4·Δ/0.5` capped at 5, reached at
-/// `Δ = 0.25`; the spine publishes 0..1 and `ribbon::edge_cells` owns the cells.
+/// The birth-price rise that buys the whole stretch ([`Spine::surge`] 1.0);
+/// `ribbon::edge_cells` turns the 0..1 into cells.
 pub const SURGE_FULL_RISE: f32 = 0.25;
 
 /// The flow state: the value on the `trail status` row an agent can hold its
@@ -223,14 +204,14 @@ pub struct EraseMark {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Spine {
     /// The canonical metric (`crate::typing_momentum`), the raw 0..1 leaky
-    /// integrator. Read through [`Spine::momentum`]; consumers usually want
+    /// integrator, gained only in [`Spine::target`]; consumers want
     /// [`Spine::disp`].
     momentum: TypingMomentum,
-    /// The eased DISPLAY value the art reads. Advanced only in
+    /// The eased display value the art reads. Advanced only in
     /// [`Spine::update`].
     disp: f32,
     /// The resume memory: the follower's recent peak, forgetting on
-    /// [`DISP_PEAK_HALF_LIFE_S`]. Floors BIRTH pricing only.
+    /// [`DISP_PEAK_HALF_LIFE_S`]. Floors birth pricing only.
     disp_peak: f32,
     /// The lay/flow clock in dimensionless sweeps, modulo [`PHASE_RING`].
     phase: f32,
@@ -247,19 +228,19 @@ pub struct Spine {
     /// The pending [`EraseMark`], if the last edge was a Backspace. Cleared by
     /// the next typed advance, a kill, and [`Spine::reset`].
     mark: Option<EraseMark>,
-    /// **THE FLOW RUN** — keys typed at [`FLOW_KEY_DISP`] or above with no
-    /// delete since it began. One `u32`; [`Flow`] is a pure function of it.
+    /// The flow run: keys typed at [`FLOW_KEY_DISP`] or above with no delete
+    /// since it began. [`Flow`] is a pure function of it.
     run: u32,
     /// The run's high-water mark, kept across exits.
     best: u32,
-    /// The birth price the PREVIOUS typed key was born at — the other half of
+    /// The birth price the previous typed key was born at, the other half of
     /// the surge's `Δ` ([`Spine::surge`]). Zero before the first key.
     prev_birth: f32,
     /// The last key's own rise over `prev_birth`, latched at its edge so the
-    /// tick that BIRTHS the key reads the key's number and not a later one.
+    /// tick that births the key reads that key's number.
     key_rise: f32,
-    /// The last [`Spine::drive`] with a live floor — the combo is frozen for
-    /// [`FLOW_FREEZE_S`] after it ([`FLOW_FREEZE_S`]'s anti-farm law).
+    /// The last [`Spine::drive`] with a live floor; the combo is frozen for
+    /// [`FLOW_FREEZE_S`] after it.
     driven_at: Option<Instant>,
     /// The hot-resume door: a green long command's stamp, living
     /// [`VERDICT_WINDOW_S`], which floors one birth at [`VERDICT_BIRTH_DISP`]
@@ -277,30 +258,23 @@ impl Spine {
     // -- the metric's edges (no follower motion happens here) ---------------
 
     /// One non-delete printable typing advance (a forward glyph echo, a wrap, a
-    /// coalesced echo): the only thing that builds momentum (T1: a jump, scroll,
-    /// program output or nav hop builds nothing).
+    /// coalesced echo): the only thing that builds momentum (T1).
     ///
-    /// A typed key also closes the erase run (the [`EraseMark`] is cleared), so
-    /// read [`Spine::mend`] first on a key that may be a fix. The flow run does
-    /// not climb here: a key's flow price is this frame's follower, see
-    /// [`Spine::note_keys`], called from the tick after [`Spine::update`].
+    /// It also closes the erase run, so read [`Spine::mend`] first on a key that
+    /// may be a fix. The flow run climbs in [`Spine::note_keys`], not here.
     pub fn advance(&mut self, now: Instant) {
         self.momentum.advance(now);
         self.mark = None;
     }
 
     /// The flow run's one edge: `keys` typed advances landed on this frame,
-    /// priced at `price` (`Ctx::birth_disp`, the number their light is bought
-    /// with this tick).
+    /// priced at `price` (`Ctx::birth_disp`).
     ///
-    /// Called from [`super::Engine::tick`], not [`Spine::advance`], because the
-    /// follower moves only in [`Spine::update`]: at the key's edge `disp` is
-    /// still the last frame's (after a silence, a stale hot value). Keys
-    /// coalesced into one frame share its price.
-    ///
-    /// A key at [`FLOW_KEY_DISP`] or above extends the run; a key under it breaks
-    /// the run. A frame within [`FLOW_FREEZE_S`] of a [`Spine::drive`] does
-    /// neither.
+    /// Called from [`super::Engine::tick`] after [`Spine::update`], not from
+    /// [`Spine::advance`]: at the key's edge `disp` is still the last frame's.
+    /// Keys coalesced into one frame share its price. A key at
+    /// [`FLOW_KEY_DISP`] or above extends the run, one under it breaks it; a
+    /// frame within [`FLOW_FREEZE_S`] of a [`Spine::drive`] does neither.
     pub fn note_keys(&mut self, now: Instant, keys: u32, price: f32) {
         if keys == 0 {
             return;
@@ -359,12 +333,10 @@ impl Spine {
         self.run = 0;
     }
 
-    /// The celebration bypass: pin the metric to at least `floor` at `now`. An
-    /// armed held-key sing-along is maximal flow by definition, so it drives
-    /// the metric up through this one seam, and every legibility cap holds as at
-    /// earned full momentum. `floor` is clamped to 0..1; non-finite reads as 0.
-    /// It pins the raw metric, so the follower's target is
-    /// `clamp01(floor · METRIC_GAIN)`.
+    /// The celebration bypass: pin the raw metric to at least `floor` at `now`
+    /// (clamped to 0..1; non-finite reads as 0). A held-key sing-along is maximal
+    /// flow by definition, so it drives the metric through this one seam and
+    /// every legibility cap holds as at earned full momentum.
     pub fn drive(&mut self, now: Instant, floor: f32) {
         let floor = if floor.is_finite() {
             floor.clamp(0.0, 1.0)
@@ -384,9 +356,7 @@ impl Spine {
     // -- the follower ------------------------------------------------------
 
     /// The one site of the gain: what the follower chases at `now`, the raw
-    /// metric times [`METRIC_GAIN`], clamped to 0..1. Only the chase, slam
-    /// detector, peak memory and first-tick latch read it; the raw metric is
-    /// reported raw everywhere ([`Spine::momentum`], `Spine::at_rest`).
+    /// metric times [`METRIC_GAIN`], clamped to 0..1.
     #[inline]
     fn target(&self, now: Instant) -> f32 {
         (self.momentum.value(now) * METRIC_GAIN).clamp(0.0, 1.0)
@@ -396,12 +366,12 @@ impl Spine {
     /// Called exactly once per `Engine::tick`, before any producer reads
     /// [`Spine::disp`], so every mark born on one frame is priced by one number.
     ///
-    /// The follower chases [`Spine::target`] with an exponential of real
-    /// elapsed time: the slam ease from a rise past [`DISP_SLAM_RISE`] until it
-    /// is reached (latched), [`DISP_ATTACK_S`] on other rises,
-    /// [`DISP_RELEASE_TAU`] on a fall, snapping to zero under [`DISP_SNAP_ZERO`].
-    /// Against a held target each step is the exact first-order solution, so
-    /// ticks compose. A backwards or zero `dt` advances nothing.
+    /// The follower chases [`Spine::target`] exponentially in real elapsed time:
+    /// the slam ease from a rise past [`DISP_SLAM_RISE`] until it is reached
+    /// (latched), [`DISP_ATTACK_S`] on other rises, [`DISP_RELEASE_TAU`] on a
+    /// fall, snapping to zero under [`DISP_SNAP_ZERO`]. Against a held target
+    /// each step is the exact first-order solution, so ticks compose. A
+    /// backwards or zero `dt` advances nothing.
     pub fn update(&mut self, now: Instant) {
         // The hot-resume door closes by itself on the follower's tick, so a
         // session that goes dark re-earns its price.
@@ -491,9 +461,7 @@ impl Spine {
     #[inline]
     #[must_use]
     pub fn birth_disp(&self) -> f32 {
-        // Floored again by the hot-resume door: the peak floor says "you were
-        // just here", this says "the machine just finished well". One key
-        // spends it.
+        // Floored again by the hot-resume door, which one key spends.
         let verdict = if self.verdict.is_some() {
             VERDICT_BIRTH_DISP
         } else {
@@ -505,17 +473,13 @@ impl Spine {
     }
 
     /// A command succeeded after a while: open the door for
-    /// [`VERDICT_WINDOW_S`].
-    ///
-    /// Draws nothing: every light has a keystroke behind it. This buys a price,
-    /// paid only by a key the user types. The caller decides what "green" and
-    /// "a while" mean.
+    /// [`VERDICT_WINDOW_S`]. Draws nothing; it buys a price paid only by a key
+    /// the user types. The caller decides what "green" and "a while" mean.
     pub fn note_verdict(&mut self, now: Instant) {
         self.verdict = Some(now);
     }
 
-    /// Whether the door is open at `now` (diagnostic; the mark is a value, still
-    /// present over dark glass with nothing armed on it).
+    /// Whether the door is open at `now` (diagnostic).
     #[inline]
     #[must_use]
     #[cfg(test)]
@@ -590,9 +554,9 @@ impl Spine {
     }
 
     /// The raw canonical metric at `now`: un-eased and un-gained, the number the
-    /// kitty cursor's twin instance reads. Reported beside [`Spine::disp`] in
-    /// `trail status` because they differ during attack and release, and at
-    /// rest under a hand (`disp` settles on `min(1, 1.23 · momentum)`).
+    /// kitty cursor's twin instance reads. It differs from [`Spine::disp`] during
+    /// attack and release, and under a held hand (`disp` settles on
+    /// `min(1, 1.23 · momentum)`).
     #[inline]
     #[must_use]
     #[cfg(test)]
@@ -606,7 +570,7 @@ impl Spine {
     ///
     /// `Engine::needs_frame_cadence` does not consult this: the resume memory's
     /// 7 s half-life takes ~53 s to snap after a full peak, long after every mark
-    /// it priced is gone. The cadence rule is the three pools being non-empty.
+    /// it priced is gone.
     #[must_use]
     #[cfg(test)]
     pub fn at_rest(&self, now: Instant) -> bool {
@@ -630,11 +594,9 @@ mod tests {
         Duration::from_millis(n)
     }
 
-    /// Hot resume: a green command that took a while opens the door for
-    /// [`VERDICT_WINDOW_S`], and the first key typed inside it is born at full
-    /// momentum (every birth rule reads [`Spine::birth_disp`]). Nothing is born
-    /// until a key is typed, exactly one key spends it, and an unused door
-    /// closes by itself.
+    /// Hot resume: after a green command the first key inside
+    /// [`VERDICT_WINDOW_S`] is born at full momentum, one key spends it, and an
+    /// unused door closes by itself.
     #[test]
     fn the_first_key_after_a_long_green_run_is_born_hot() {
         let t = Instant::now();
@@ -659,7 +621,7 @@ mod tests {
             "the first key after a long green run is born hot"
         );
 
-        // …and exactly ONE key walks through it.
+        // …and exactly one key walks through it.
         let price = s.birth_disp();
         s.note_keys(t + ms(200), 1, price);
         assert_eq!(
@@ -682,8 +644,7 @@ mod tests {
 
     /// Hold the follower's target at `target` across ticks: `drive` re-pins the
     /// raw metric at `target / METRIC_GAIN` each tick, so the analytic
-    /// first-order solution is exact. Stated on the target so the ease pins do
-    /// not move with the gain.
+    /// first-order solution is exact.
     fn held(s: &mut Spine, from: Instant, to: Instant, step: Duration, target: f32) {
         let floor = target / METRIC_GAIN;
         let mut t = from;
@@ -698,8 +659,8 @@ mod tests {
         }
     }
 
-    /// Drain the canonical metric to EXACTLY zero at `now` — kills are the
-    /// one edge that can lower it, and each takes a fixed slice.
+    /// Drain the canonical metric to exactly zero at `now` (kills are the one
+    /// edge that lowers it, a fixed slice each).
     fn drained(s: &mut Spine, now: Instant) {
         while s.momentum(now) > 0.0 {
             s.drain_kill(now);
@@ -714,7 +675,7 @@ mod tests {
         let t0 = Instant::now();
         let e1 = 1.0 - (-1.0f32).exp();
 
-        // ATTACK: a 0.4 rise is under the slam threshold. One DISP_ATTACK_S
+        // Attack: a 0.4 rise is under the slam threshold. One DISP_ATTACK_S
         // of wall time covers e⁻¹ of the gap.
         let mut a = Spine::new();
         a.update(t0);
@@ -770,9 +731,8 @@ mod tests {
         );
     }
 
-    /// The follower's shape under REAL typing, not a held drive: a second of
-    /// keys lights it, silence lets it fall, and the fall is slower than the
-    /// rise was — the swell-and-exhale of §17.1.
+    /// Under real typing the follower lights, falls when the keys stop, and
+    /// falls slower than it rose (§17.1).
     #[test]
     fn the_follower_attacks_fast_and_releases_slow() {
         let t0 = Instant::now();
@@ -844,8 +804,8 @@ mod tests {
             "slam {slam} should cover more of its gap than attack {attack}"
         );
 
-        // Latched: past the point where the REMAINING gap is under 0.5, the
-        // next step still moves at the slam rate, not the attack rate.
+        // Latched: once the remaining gap is under 0.5, the next step still
+        // moves at the slam rate, not the attack rate.
         let mut x = Spine::new();
         x.update(t0);
         held(&mut x, t0, t0 + ms(60), ms(10), 1.0);
@@ -865,9 +825,8 @@ mod tests {
         );
     }
 
-    /// T6 at the spine: after typing stops the follower reaches exactly zero,
-    /// the resume memory follows, and `at_rest` latches, letting
-    /// `needs_frame_cadence()` disarm.
+    /// T6: after typing stops the follower and resume memory reach exactly zero
+    /// and `at_rest` latches.
     #[test]
     fn idle_drains_to_exactly_zero() {
         let t0 = Instant::now();
@@ -897,8 +856,7 @@ mod tests {
         assert_eq!(s.disp(), 0.0);
     }
 
-    /// Deletes never build and mildly drain; a kill drains harder. Erase weight
-    /// is this one metric moving.
+    /// Deletes drain and never build; a kill drains harder.
     #[test]
     fn deletes_drain_and_never_build() {
         let t0 = Instant::now();
@@ -928,9 +886,8 @@ mod tests {
         );
     }
 
-    /// The resume memory floors BIRTH pricing only: after a thinking pause the
-    /// birth spine is well above the honest spine, and the honest spine is
-    /// untouched by the floor.
+    /// The resume memory floors birth pricing only: after a pause the birth
+    /// spine is above the honest spine, which the floor does not touch.
     #[test]
     fn resume_floors_births_without_touching_the_honest_spine() {
         let t0 = Instant::now();
@@ -959,10 +916,9 @@ mod tests {
         );
     }
 
-    /// The same event history at the same `now` gives the same number however
-    /// many ticks got there (T7). Against a held target 60 Hz and 120 Hz agree
-    /// to float rounding; against a decaying target the discretisation of the
-    /// moving input leaves a residual well under a percent.
+    /// T7: the same history at the same `now` gives the same number at 60 and
+    /// 120 Hz, to float rounding under a held target and well under a percent
+    /// under a decaying one.
     #[test]
     fn the_follower_is_frame_rate_independent() {
         let t0 = Instant::now();
@@ -999,9 +955,8 @@ mod tests {
         );
     }
 
-    /// The gain: a cold hand at 8 cps, ticked at 120 Hz as the engine does, sees
-    /// the display cross 0.5 on key 5 (500 ms after key 1) while the raw metric
-    /// is still under 0.5. The display moved earlier; what keys earn did not.
+    /// A cold 8 cps hand at 120 Hz sees the display cross 0.5 by key 5 while the
+    /// raw metric is still under 0.5.
     #[test]
     fn a_cold_hand_reaches_half_momentum_display_a_key_earlier_with_the_gain() {
         let t0 = Instant::now();
@@ -1066,11 +1021,9 @@ mod tests {
         }
     }
 
-    /// The erase mark's arithmetic: a Backspace on a warm spine leaves a mark
-    /// with the birth spine as it stood (before the drain); a second delete in
-    /// the window keeps that price and counts two; a third counts three and is
-    /// no longer a mend; a typed key clears the run; a kill drops it; a delete
-    /// after a stale run starts afresh at one. `momentum()` and `disp()` read
+    /// The erase mark's arithmetic: the first delete's birth spine is kept across
+    /// the run, the count climbs, a third delete is no longer a mend, a typed key
+    /// or a kill clears it, a stale run restarts at one, and the follower reads
     /// the same with and without the mark.
     #[test]
     fn a_backspace_leaves_a_mark_that_counts_the_run_and_a_typed_key_closes_it() {
@@ -1110,7 +1063,7 @@ mod tests {
             "…until the window closes"
         );
 
-        // A second delete: the FIRST price is kept, the count is two.
+        // A second delete: the first price is kept, the count is two.
         s.update(t + ms(125));
         t += ms(125);
         s.drain_delete(t);
@@ -1205,8 +1158,8 @@ mod tests {
         let held = earned.last().expect("keys").1;
         assert!(held.open(), "the fixture must reach flow first: {held:?}");
 
-        // …then the key is LEANED ON: the host drives the spine every frame
-        // (the sing-along arm) and the auto-repeat floods keys at 30 cps.
+        // …then the key is held: the host drives the spine every frame (the
+        // sing-along arm) and the auto-repeat floods keys at 30 cps.
         let mut t = t0 + ms(83) * 40;
         let mut repeats = 0u32;
         for _ in 0..90 {
@@ -1227,8 +1180,8 @@ mod tests {
         );
         assert_eq!(s.flow().best, held.best, "…and the high-water mark with it");
 
-        // The freeze LIFTS a quarter second after the last drive: the very
-        // next real key climbs again, on the run the hand had earned.
+        // The freeze lifts a quarter second after the last drive: the next
+        // real key climbs again, on the run the hand had earned.
         let after = t + Duration::from_secs_f32(FLOW_FREEZE_S) + ms(1);
         s.advance(after);
         s.update(after);

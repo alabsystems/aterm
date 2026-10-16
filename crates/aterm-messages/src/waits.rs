@@ -1,32 +1,30 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE WAITS A PERSON SITS THROUGH INSIDE A SESSION (design rulings 231–234):
-//! a large paste on its way to a program, and the scrollback rewrap that
-//! follows a width change. Both are real waits — the person's keys queue
-//! behind the paste (Ctrl-C included: paste isolation keeps submission order),
-//! and the history is gone from scrollback and search until the rewrap
-//! re-attaches it — and neither said why.
+//! The waits a person sits through inside a session: a large paste on its
+//! way to a program, and the scrollback rewrap that follows a width change.
+//! The person's keys queue behind the paste (Ctrl-C included: paste
+//! isolation keeps submission order), and the history is gone from
+//! scrollback and search until the rewrap re-attaches it.
 //!
-//! The policy is here, once, for every platform: which of them takes a row
+//! The policy is here, once, for every platform: which wait takes a row
 //! ([`Waiter`]: who waits), the words, the rows, and one clockless state
 //! machine ([`SessionWait`]) a host drives with a sample a few times a second
 //! ([`WAIT_SAMPLE`]). The host only measures (bytes a writer has handed the
 //! program, lines a worker has rewrapped), says whether the person is looking
-//! or asking, and performs what a step returns. No clock is read here: the
-//! host passes how long the work has run, and the row's grace counts from its
-//! start ([`crate::PROGRESS_GRACE`]), so quick work never reaches the glass.
+//! or asking, and performs what a step returns. It passes how long the work
+//! has run, and the row's grace counts from its start
+//! ([`crate::PROGRESS_GRACE`]), so quick work never reaches the glass.
 
 use crate::center::EchoKind;
 use crate::model::{Amount, Glyph, Hold, Intent, Message, Meter, Severity, Unit, tags};
 use crate::progress::Waiter;
 use crate::{Duration, PROGRESS_GRACE, REVEAL_DEFER_MAX, REVEAL_MIN_LEFT};
 
-/// A paste this large or larger is watched; a smaller one never takes a row
-/// (it is delivered in a few `write(2)`s, and a row for it would only ever
-/// sit behind the grace). 64 KiB is eight of the tty's 8 KiB input buffers,
-/// and at the line editors' measured pace the first size that can outlast the
-/// grace.
+/// A paste this large or larger is watched; a smaller one goes in a few
+/// `write(2)`s and its row would only ever sit behind the grace. 64 KiB is
+/// eight of the tty's 8 KiB input buffers, and at the line editors' measured
+/// pace the first size that can outlast the grace.
 pub const LARGE_PASTE_BYTES: u64 = 64 * 1024;
 
 /// How often a host samples a watched wait while its row is on the glass: a
@@ -46,11 +44,9 @@ pub const STALE_WAIT: Duration = Duration::from_secs(30);
 /// The paste row's words while it runs: `Pasting`, and its finished words.
 pub const PASTING: &str = "Pasting";
 
-/// How long a paste's program may take none of it before the row says so
-/// (D8: `Pasting 12 MB 0%` must not stand with no word that it waits on a
-/// program that stopped reading). A few of the
-/// paste's own samples: a program that reads in bursts is never called
-/// stopped between two of them.
+/// How long a paste's program may take none of it before the row says so. A
+/// few of the paste's own samples, so a program that reads in bursts is never
+/// called stopped between two of them.
 pub(crate) const PASTE_UNREAD_AFTER: Duration = Duration::from_secs(3);
 /// The rewrap row's title before it knows how many lines it rewraps
 /// ([`rewrap_title`] says them once it does).
@@ -68,9 +64,9 @@ pub enum WaitKind {
 }
 
 impl WaitKind {
-    /// Whether the wait takes a row: its WAITER decides (ruling 220). A
-    /// paste's person is waiting while its session is on screen; a rewrap's
-    /// only once they scroll into the missing history or search it.
+    /// Whether the wait takes a row: its waiter decides. A paste's person is
+    /// waiting while its session is on screen; a rewrap's only once they
+    /// scroll into the missing history or search it.
     #[must_use]
     pub const fn waiter(asked: bool) -> Waiter {
         Waiter::of(asked)
@@ -140,8 +136,8 @@ pub fn lines_words(n: u64) -> String {
         let t = (n.saturating_mul(10) + M / 2) / M;
         format!("{}.{}M", t / 10, t % 10)
     } else if n >= 10 * K - K / 20 {
-        // As the M branch: a figure that would round to ten of the tenths
-        // unit is the whole unit (`10K`, never `10.0K`).
+        // A figure that would round to ten of the tenths unit is the whole
+        // unit (`10K`, never `10.0K`).
         format!("{}K", (n + K / 2) / K)
     } else if n >= K {
         let t = (n.saturating_mul(10) + K / 2) / K;
@@ -152,9 +148,8 @@ pub fn lines_words(n: u64) -> String {
 }
 
 /// A rewrap's stats: `1.2M of 3.4M lines`, `done` right-aligned to the
-/// total's width. The glass never paints them (the title states the total,
-/// ruling 246), so they need no short form: the description and Details
-/// keep them whole.
+/// total's width. The glass never paints them (the title states the total),
+/// so they need no short form.
 #[must_use]
 pub fn rewrap_stats(done: u64, total: u64) -> String {
     let (done, total) = (lines_words(done.min(total)), lines_words(total));
@@ -163,11 +158,10 @@ pub fn rewrap_stats(done: u64, total: u64) -> String {
 }
 
 /// The paste row: `Pasting 4.2 MB`, filled by the bytes the program has
-/// taken, `1.1 MB / 4.2 MB`, the engine's ETA from their rate, and ONE
-/// capsule, `Stop paste`. Revealed `grace_left` after it is posted — the
-/// grace counts from the paste's start, not from the post — so a paste that
-/// ends inside [`PROGRESS_GRACE`] never reaches the glass. It ends
-/// `Pasted 4.2 MB`.
+/// taken, `1.1 MB / 4.2 MB`, the engine's ETA from their rate, and one
+/// capsule, `Stop paste`. Revealed `grace_left` after it is posted (the grace
+/// counts from the paste's start, not from the post), so a paste that ends
+/// inside [`PROGRESS_GRACE`] never reaches the glass. It ends `Pasted 4.2 MB`.
 #[must_use]
 pub fn paste_row(
     session: u64,
@@ -200,10 +194,8 @@ pub fn paste_row(
         .reveal_after(grace_left)
 }
 
-/// The rewrap row's title: the size of the whole wait, said once — `Rewrapping
-/// 3.4M lines` (design ruling 246: a percent row's stats carry only the job's
-/// size, and here the title already does) — or [`REWRAPPING`] before the
-/// count is known.
+/// The rewrap row's title: the size of the whole wait, said once (`Rewrapping
+/// 3.4M lines`), or [`REWRAPPING`] before the count is known.
 #[must_use]
 pub fn rewrap_title(total: u64) -> String {
     match total {
@@ -216,8 +208,8 @@ pub fn rewrap_title(total: u64) -> String {
 /// The rewrap row: `Rewrapping 3.4M lines`, filled by the lines rewrapped of
 /// the lines detached, and the ETA. Its stats (`1.2M of 3.4M lines`) ride the
 /// description and Details; the glass paints none, since the title states the
-/// total (ruling 246). No capsule: there is nothing to decide (a stopped
-/// rewrap would lose the history). It ends `Scrollback rewrapped`.
+/// total. No capsule: a stopped rewrap would lose the history. It ends
+/// `Scrollback rewrapped`.
 #[must_use]
 pub fn rewrap_row(session: u64, done: u64, total: u64, grace_left: Duration) -> Message {
     let done = done.min(total);
@@ -303,27 +295,25 @@ pub enum WaitStep {
 /// sample into the one thing to do. A row is posted once the person waits
 /// ([`WaitKind::waiter`]), restated on every later sample (its fill, stats and
 /// ETA; the restate re-arms its staleness cap) and ended with the end's echo.
-/// Once up it stays up until the work ends — a person who switched tabs is
-/// still waiting for what they started, and a row that came and went with
-/// every tab switch would be motion for nothing. A wait that ends with no row
-/// posted ends silently.
+/// Once up it stays up until the work ends: a person who switched tabs is
+/// still waiting for what they started. A wait that ends with no row posted
+/// ends silently.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionWait {
     kind: WaitKind,
     session: u64,
     series: u64,
     posted: bool,
-    /// The person waits on it but its row is held back: the work projects
-    /// to end before it could be read (ruling 265). Sampled at the row's
-    /// pace, so the row comes the moment the projection says it should.
+    /// The person waits on it but its row is held back: the work projects to
+    /// end before it could be read. Sampled at the row's pace, so the row
+    /// comes the moment the projection says it should.
     held: bool,
-    /// The first sample this wait saw — `done` and the elapsed time — the
-    /// base its own pace is measured from (a rewrap is watched from the ask,
-    /// long after its work began).
+    /// The first sample this wait saw (`done` and elapsed time), the base its
+    /// own pace is measured from (a rewrap is watched from the ask, long after
+    /// its work began).
     first: Option<(u64, Duration)>,
-    /// The last sample whose `done` moved: its `done` and elapsed time —
-    /// how long the program has taken none of a paste
-    /// ([`PASTE_UNREAD_AFTER`]).
+    /// The last sample whose `done` moved (its `done` and elapsed time): how
+    /// long the program has taken none of a paste ([`PASTE_UNREAD_AFTER`]).
     moved: Option<(u64, Duration)>,
 }
 
@@ -370,9 +360,8 @@ impl SessionWait {
     }
 
     /// The row's words for `s`. A paste whose program has taken none of it
-    /// for [`PASTE_UNREAD_AFTER`] says so, and for how long, as its excerpt
-    /// — what it waits on, so the person knows the wait is the program's and
-    /// that `Stop paste` ends it.
+    /// for [`PASTE_UNREAD_AFTER`] says so, and for how long, as its excerpt,
+    /// so the person knows the wait is the program's and `Stop paste` ends it.
     #[must_use]
     pub fn row(&self, s: &WaitSample) -> Message {
         let grace_left = PROGRESS_GRACE.saturating_sub(s.elapsed);
@@ -439,13 +428,13 @@ impl SessionWait {
     }
 }
 
-/// NO FLASH (design ruling 265): whether the work in `s`, projected at the
-/// pace it kept since `first` (the first sample this wait saw), ends before
-/// its row could be read — inside the rest of its grace plus
-/// [`REVEAL_MIN_LEFT`]. Held back so, the row is never posted and the wait
-/// ends silently; past [`PROGRESS_GRACE`] plus [`REVEAL_DEFER_MAX`] it is
-/// posted whatever the projection says. No pace yet projects nothing: the
-/// row is posted (and the engine's reveal looks again at the grace's end).
+/// Whether the work in `s`, projected at the pace it kept since `first` (the
+/// first sample this wait saw), ends before its row could be read: inside the
+/// rest of its grace plus [`REVEAL_MIN_LEFT`]. A row held back so is never
+/// posted and the wait ends silently; past [`PROGRESS_GRACE`] plus
+/// [`REVEAL_DEFER_MAX`] it is posted whatever the projection says. No pace
+/// yet projects nothing: the row is posted (and the engine's reveal looks
+/// again at the grace's end).
 fn ends_unread((done0, at0): (u64, Duration), s: &WaitSample) -> bool {
     if s.elapsed >= PROGRESS_GRACE + REVEAL_DEFER_MAX || s.done <= done0 || s.total <= s.done {
         return false;
@@ -457,13 +446,10 @@ fn ends_unread((done0, at0): (u64, Duration), s: &WaitSample) -> bool {
     left < PROGRESS_GRACE.saturating_sub(s.elapsed) + REVEAL_MIN_LEFT
 }
 
-/// A paste's excerpt while its program takes none of it: `not read for 37
-/// s` — short enough that its figure survives at 60 columns beside the
-/// title, the percent and `Stop` (ruling 316, day eight E4: `program not
-/// reading for 37 s` kept its figure at 100 columns only and read `program
-/// not reading…` at 60; live, the longer `the program has read nothing for
-/// 13…` lost it at 100). The title names the paste, so what was not read is
-/// the paste, and `Stop paste` is still what ends the wait.
+/// A paste's excerpt while its program takes none of it: `not read for 37 s`,
+/// short enough that its figure survives at 60 columns beside the title, the
+/// percent and `Stop`. The title names the paste, so what was not read is the
+/// paste.
 fn unread_words(stuck: Duration) -> String {
     format!("not read for {}", crate::strain::span_words(stuck))
 }
@@ -489,11 +475,9 @@ mod tests {
         }
     }
 
-    /// A PASTE THE PROGRAM IS NOT READING SAYS SO (D8). Once the
-    /// program has taken none of it for [`PASTE_UNREAD_AFTER`], the row's
-    /// excerpt names the program and how long; the words go as soon as it
-    /// reads again. NEGATIVE CONTROL: a paste that keeps moving, and one
-    /// stuck for less than the bound, carry no excerpt.
+    /// Once the program has taken none of a paste for [`PASTE_UNREAD_AFTER`],
+    /// the excerpt says for how long; the words go as soon as it reads again.
+    /// A paste that keeps moving, or one stuck for less, carries no excerpt.
     #[test]
     fn a_paste_the_program_does_not_read_says_what_it_waits_on() {
         let mut w = SessionWait::paste(3, 1);
@@ -512,9 +496,8 @@ mod tests {
         assert!(row.excerpt);
         assert_eq!(row.detail, ["not read for 37 s"]);
         assert_eq!(row.title, "Pasting 12 MB", "the title is the job's");
-        // Ruling 316 (day eight E4): the figure survives at 60 columns,
-        // beside the percent and the capsule, on the widest paste title and
-        // the widest span words; `program not reading for 37 s` lost it.
+        // The figure survives at 60 columns beside the percent and the
+        // capsule, on the widest paste title and span words.
         let figure_at = |row: &Message, cols: usize| {
             let now = crate::Instant::now();
             let mut c = crate::center::MessageCenter::new(crate::log::MessageLog::empty(), now);
@@ -685,8 +668,8 @@ mod tests {
         assert_eq!(rewrap_title(1), "Rewrapping 1 line");
         assert_eq!(row.finished_title(), REWRAPPED);
         assert!(row.actions.is_empty());
-        // The glass paints no stats beside a title that states the total
-        // (ruling 246); the description keeps them.
+        // The glass paints no stats beside a title that states the total; the
+        // description keeps them.
         assert_eq!(
             crate::glass::job_stats(&row.title, "1.2M of 3.4M lines"),
             None

@@ -186,9 +186,10 @@ impl Scrollback {
     /// Per the Kitty unscroll spec: "The lines that have been scrolled into
     /// the scrollback buffer are removed from the scrollback buffer."
     ///
-    /// Uses tier-aware back-removal: removes from hot first, then warm, then
-    /// cold — decompressing at most one boundary block/page at a time. This
-    /// bounds peak memory to ~one block regardless of total scrollback size.
+    /// Selects the newest lines across hot, warm and cold tiers, committing
+    /// the oldest affected tier first. Decompresses at most one boundary
+    /// block/page at a time, bounding peak memory to ~one block regardless of
+    /// total scrollback size.
     ///
     /// Returns an error if decompression fails during line extraction.
     /// On error, scrollback state is unchanged (no lines lost). (#4638)
@@ -214,43 +215,20 @@ impl Scrollback {
         let warm_remove = after_hot.min(self.warm.line_count());
         let cold_remove = after_hot.saturating_sub(warm_remove);
 
-        // Pre-validate all fallible decompressions before modifying state (#4638).
-        // Each tier's truncate_back_lines is internally error-safe, but calling
-        // them sequentially is NOT — if the second fails, the first already
-        // committed. Pre-validation ensures all boundary blocks/pages decompress
-        // successfully before any tier is modified.
-        if warm_remove > 0 {
-            self.warm.pre_validate_truncate_back(warm_remove)?;
-        }
+        // Commit the oldest affected tier first: it is the only tier that
+        // can have a partial boundary, hence the only fallible rebuild. Every
+        // newer tier is removed whole. Each truncation prepares its boundary
+        // before mutation, so no separate validation pass is needed.
         if cold_remove > 0 {
-            self.cold.pre_validate_truncate_back(cold_remove)?;
-        }
-
-        // Commit. Pre-validation confirms each boundary block DECOMPRESSES, but
-        // the re-compress step is still fallible and pre-validation cannot
-        // exercise it. Propagate any such error with `?` instead of panicking;
-        // each tier's `truncate_back_lines` is internally error-safe (state
-        // unchanged on its own error, #4638).
-        // Decrement the aggregate `line_count` INCREMENTALLY as each tier's
-        // truncation commits. The warm/cold re-compress steps stay fallible even
-        // after pre-validation, so a later tier's error must leave `line_count`
-        // matching exactly the tiers that already succeeded — committing a bulk
-        // `-= n` only at the end overstates the removal on a partial failure and
-        // desyncs the aggregate from the tiers. Newest-first order (hot→warm→
-        // cold) means a partial failure trims the newest lines and leaves only
-        // the oldest boundary portion in place.
-        if hot_remove > 0 {
-            self.hot.truncate_back(hot_remove);
-            self.line_count = self.line_count.saturating_sub(hot_remove);
+            self.cold.truncate_back_lines(cold_remove)?;
         }
         if warm_remove > 0 {
             self.warm.truncate_back_lines(warm_remove)?;
-            self.line_count = self.line_count.saturating_sub(warm_remove);
         }
-        if cold_remove > 0 {
-            self.cold.truncate_back_lines(cold_remove)?;
-            self.line_count = self.line_count.saturating_sub(cold_remove);
+        if hot_remove > 0 {
+            self.hot.truncate_back(hot_remove);
         }
+        self.line_count = self.line_count.saturating_sub(n);
         self.sync_accounting();
         self.assert_bytes_used_invariant();
         Ok(())
@@ -370,8 +348,8 @@ impl Scrollback {
                 // line `lost` rows newer, a renumbering no fence or mark sees.
                 // With nothing older, dropping them is the oldest history
                 // going, as any eviction goes. The one other drop is cold
-                // refusing the blank block itself (its LZ4 or zstd step
-                // failing on a page of empty lines): then the rows leave the
+                // refusing the blank block itself (its LZ4 step failing on
+                // a page of empty lines): then the rows leave the
                 // middle after all, the renumbering above, with no epoch bump.
                 let kept = self.cold.line_count() > 0 && {
                     let blank = super::tier::WarmBlock::from_lines(&vec![Line::default(); lost]);
@@ -403,7 +381,7 @@ impl Scrollback {
     /// Create a snapshot containing only hot + warm tier lines (skip cold).
     ///
     /// This is the fast path for checkpointing: cold tier decompression
-    /// (Zstd or disk I/O) is skipped, bounding the snapshot to at most
+    /// (LZ4 or disk I/O) is skipped, bounding the snapshot to at most
     /// `hot_limit + warm_limit` lines. Hot lines are already uncompressed;
     /// warm lines require only LZ4 decompression (~5 GB/s throughput).
     ///
@@ -443,15 +421,14 @@ impl Scrollback {
     }
 }
 
-#[cfg(any(test, feature = "testing"))]
+#[cfg(any(test, debug_assertions))]
 impl Scrollback {
     /// Inject a corrupted warm block at the front of the warm tier.
     ///
     /// The block reports `line_count` lines but its compressed data is invalid,
     /// causing decompression and warm→cold eviction to fail. Used by quarantine
-    /// behavioral tests (#5947) and, through the `testing` feature, by the
-    /// grid's dense-history conformance tests. Never compiled into a product
-    /// build: only this crate's tests and a dev-dependency turn it on.
+    /// behavioral tests (#5947) and, in a debug build, by the grid's
+    /// dense-history conformance tests. Never compiled into a release build.
     #[doc(hidden)]
     pub fn inject_corrupted_warm_block(&mut self, line_count: usize) {
         self.warm.push_front_corrupt(line_count);

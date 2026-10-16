@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The presence FACTS a host gathers, the per-session [`Slot`] that folds
+//! The presence facts a host gathers, the per-session [`Slot`] that folds
 //! them (with its story: what happened since the human last looked), and the
 //! severity ([`Level`]) the rim ([`Rim`]) and the tab chip ([`ChipLevel`])
-//! are derived from.
+//! derive from.
 
 use std::borrow::Cow;
 use std::collections::VecDeque;
@@ -35,9 +35,8 @@ pub struct AgentReading<V: Host> {
     pub context_pct: Option<u8>,
 }
 
-/// The worker's phase as the row spells it. `Wall` keeps only the wall's
-/// KIND and the RESET time the notice named — never the notice text (the
-/// never-shown law).
+/// The worker's phase as the row spells it. `Wall` keeps only the wall's kind
+/// and the reset time the notice named, never the notice text.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentPhase<V: Host> {
     /// Working.
@@ -60,17 +59,17 @@ pub enum AgentPhase<V: Host> {
         /// The reset time the notice named, sanitized.
         reset: Option<String>,
         /// When the reset falls, if the notice's time could be placed on the
-        /// host's clock: the row counts DOWN to it. `None` prints the reset
-        /// time alone — never a figure that is not the countdown.
+        /// host's clock: the row counts down to it. `None` prints the reset
+        /// time alone, never a figure that is not the countdown.
         until: Option<Instant>,
     },
     /// Waiting at its composer.
     Idle,
     /// Idle with the session survey parked above the composer.
     Survey,
-    /// An identified agent whose reader has no EVIDENCE for a phase: its
-    /// default `idle` is not published as idle, since whatever acts on an
-    /// idle worker would act on a guess.
+    /// An identified agent whose reader has no evidence for a phase: its
+    /// default `idle` is not published, since whatever acts on an idle worker
+    /// would act on a guess.
     Unknown,
 }
 
@@ -90,10 +89,8 @@ impl<V: Host> AgentPhase<V> {
     }
 
     /// The word the row prints: [`Self::word`], except that a wall is the
-    /// host's own word for it ([`Host::wall_band`]: `limited` for the walls
-    /// the row has always called that, an API error's cause, else the state
-    /// the wall leaves the session in), and a parked survey is `idle`: the
-    /// worker waits at its composer either way.
+    /// host's word for it ([`Host::wall_band`]) and a parked survey is `idle`,
+    /// since the worker waits at its composer either way.
     #[must_use]
     pub fn band_word(&self) -> &'static str {
         match self {
@@ -114,12 +111,11 @@ impl<V: Host> AgentPhase<V> {
     }
 }
 
-/// The lease a refresh read, reduced to what the row's GEOMETRY hangs on:
-/// the host reads it into [`Facts::lease`] from the SAME read that forms the
-/// hand, and again, LIVE, for [`super::drive::Desk::lease_mark`]. Words
-/// formed under one mark are never committed to a window's geometry under
-/// another (the drive module's `commit_rows`): every change of
-/// the lease posts a wake, and that wake re-derives them.
+/// The lease a refresh read, reduced to what the row's geometry hangs on. The
+/// host reads it into [`Facts::lease`] from the same read that forms the
+/// hand, and again, live, for [`super::drive::Desk::lease_mark`]: words formed
+/// under one mark are never committed to geometry under another
+/// (`commit_rows`), and every lease change posts a wake that re-derives them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum LeaseMark {
     /// No live lease on the session, and it drives no peer.
@@ -153,8 +149,8 @@ pub enum Hand {
         /// The lease's holder name.
         holder: String,
     },
-    /// THIS session drives another — its own open `turn` on a peer whose
-    /// lease names it: `sid` is the peer's short form.
+    /// This session drives another: its own open `turn` on a peer whose
+    /// lease names it; `sid` is the peer's short form.
     Driving {
         /// The driven peer's short sid.
         sid: String,
@@ -181,11 +177,11 @@ impl Hand {
     }
 }
 
-/// Whether `hand` is THIS process's own harness (ruling 313): a drive lease
-/// under the holder name its supervisor loops claim sessions by
+/// Whether `hand` is this process's own harness: a drive lease under the
+/// holder name its supervisor loops claim sessions by
 /// ([`Host::is_aterms_holder`]). Another instance's harness, a manager
-/// session or an `aterm drive` is somebody else's hand, and stays a fact the
-/// window shows.
+/// session or an `aterm drive` is somebody else's hand, a fact the window
+/// shows.
 #[must_use]
 pub(crate) fn is_aterms_hand<V: Host>(hand: &Hand) -> bool {
     matches!(hand, Hand::DrivenLease { holder } if V::is_aterms_holder(holder))
@@ -200,7 +196,7 @@ pub struct HoldFact {
     pub fleet: bool,
 }
 
-/// The newest inbox row, trust FIRST (the receiver's verdict is the first
+/// The newest inbox row, trust first (the receiver's verdict is the first
 /// thing a reader sees).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MailLast {
@@ -260,23 +256,18 @@ pub struct TurnFact {
     pub settled: bool,
     /// How long it took.
     pub dur_ms: u64,
-    /// The record came from an EARLIER process, carried across a
-    /// self-update handoff: a turn that settled before this process existed.
-    /// It is the ledger's baseline, never news — the slot adopts it without a
-    /// story point or the Success glow (design §4).
+    /// The record came from an earlier process across a self-update handoff:
+    /// the ledger's baseline, never news, so the slot adopts it without a
+    /// story point or the Success glow.
     pub carried: bool,
 }
 
-/// WHO ANSWERS THE WALL the agent is at ([`Facts::wall_answer`]): a fact of
-/// the HOST — aterm's own harness holds the session and has a plan for the
-/// wall — which the screen cannot show.
-///
-/// The owner's rule: *"Don't continue to persist alerts to the
-/// user that are not actionable."* A wall the harness resumes by itself (a
-/// limit waited out to its reset, a 529 retried, a full context compacted) is
-/// a RECORD — the row says when — not a stop: no red rim, no filled diamond
-/// saying "Agent can't continue" for the three hours the harness is about to
-/// spend resuming it. A wall nobody answers keeps the stop.
+/// Who answers the wall the agent is at ([`Facts::wall_answer`]): a host
+/// fact (aterm's own harness holds the session and has a plan for the wall)
+/// the screen cannot show. A wall the harness resumes by itself (a limit
+/// waited out to its reset, a 529 retried, a full context compacted) is a
+/// record the row dates, not a stop: no red rim and no "can't continue" for
+/// hours nobody needs to act in. A wall nobody answers keeps the stop.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum WallAnswer {
     /// Nobody: no supervisor, the owner's switch off, a lost login, a
@@ -286,10 +277,10 @@ pub enum WallAnswer {
     /// The harness resumes it by itself (or Claude Code does, with the harness
     /// the net under it).
     Harness,
-    /// The harness resumes it, slowly, and a person can lift it faster: a
-    /// reset-less model bucket, a spend limit no reset ends. `action` is the
-    /// ONE thing to do, a static phrase (`/model to switch`, `add credits`);
-    /// the row says it, calm — never an interruption.
+    /// The harness resumes it slowly and a person can lift it faster: a
+    /// reset-less model bucket, a spend limit no reset ends. The payload is
+    /// the one thing to do, a static phrase (`/model to switch`, `add
+    /// credits`), which the row says calmly.
     HarnessAsks(&'static str),
 }
 
@@ -301,15 +292,20 @@ pub struct Facts<V: Host> {
     pub role: Option<String>,
     /// `meta attention` (a typed escalation).
     pub attention: Option<String>,
-    /// `attention` is told ELSEWHERE, in full (ruling 270, "one place tells
-    /// it"): the level, `status why=`, the tab chip and the rim still read
-    /// `attention`; only the row's phase slot does not repeat its words.
+    /// `attention` is told elsewhere, in full: the level, `status why=` and
+    /// the tab chip still read it, but the window's own chrome (the rim and
+    /// the row, [`Slot::shown_level`]) does not repeat it.
     pub attention_told_elsewhere: bool,
     /// The shell status word (`running`, `idle`, `quiet`, …) and when it was
     /// published — the phase the row shows when no agent reading exists.
     pub shell: Option<(&'static str, Instant)>,
+    /// The program's own state report (OSC 7501) the host honours now, as
+    /// the row's word (`codex working`), and since when: shown when no agent
+    /// reading names a phase, ahead of the shell's word. A claim for display
+    /// only; nothing decides on it.
+    pub program: Option<(&'static str, Instant)>,
     /// The sequence number of the host's agent reading: `agent` is folded in
-    /// only when this is NEWER than the one the slot last absorbed; `0` =
+    /// only when this is newer than the one the slot last absorbed; `0` =
     /// never read.
     pub agent_seq: u64,
     /// The agent reading at `agent_seq` — `None` for a session that is not an
@@ -317,18 +313,16 @@ pub struct Facts<V: Host> {
     pub agent: Option<AgentReading<V>>,
     /// Whose hand is on the keyboard.
     pub hand: Hand,
-    /// When a cooperative drive lease LAPSES: nothing posts a wake for a
+    /// When a cooperative drive lease lapses: nothing posts a wake for a
     /// lapse, so the host arms this as a deadline and re-reads the hand when
     /// it passes. `None` without such a lease.
     pub lease_until: Option<Instant>,
-    /// A driver may still type into the session (the host's lease: a `turn`
-    /// before its settle phase, or a live drive lease). Every window showing
-    /// the session holds its row count meanwhile ([`super::drive::Desk::
-    /// driver_may_type`] reads the LIVE lease for that); here it is a fact so
-    /// the wake that lifts it counts as a change and the held row catches up —
-    /// and so the words formed from these facts hold their own birth: a lease
-    /// let go between this read and the row's commit must not raise a row for
-    /// a hand already gone (the drive module's `commit_rows`).
+    /// A driver may still type into the session (a `turn` before its settle
+    /// phase, or a live drive lease). Every window showing the session holds
+    /// its row count meanwhile ([`super::drive::Desk::driver_may_type`] reads
+    /// the live lease); as a fact here, the wake that lifts it counts as a
+    /// change so the held row catches up, and words formed under it are never
+    /// committed after the lease is gone (`commit_rows`).
     pub typing: bool,
     /// The lease as this read saw it — the same read as [`Self::hand`] and
     /// [`Self::typing`], never a second lock of it. The row's commit holds
@@ -359,6 +353,7 @@ impl<V: Host> Default for Facts<V> {
             attention: None,
             attention_told_elsewhere: false,
             shell: None,
+            program: None,
             agent_seq: 0,
             agent: None,
             hand: Hand::None,
@@ -396,8 +391,8 @@ pub enum StoryVerb {
     Approval,
     /// A stop (hold / limited) ended.
     Resumed,
-    // The rest of the CLOSED SET `aterm ctl story <verb>` accepts (design §5):
-    // what the watcher decided or saw, which reaches the window no other way.
+    // The rest of the closed set `aterm ctl story <verb>` accepts: what the
+    // watcher decided or saw, which reaches the window no other way.
     /// `ctl story dismissed` — the session survey was dismissed for the human.
     Dismissed,
     /// `ctl story reconnected` — the watcher rode out an outage and is back.
@@ -410,11 +405,11 @@ pub enum StoryVerb {
     Compacted,
     /// `ctl story warned` — the watcher warned (context running low).
     Warned,
-    /// `ctl story chose <policy>` — the SUPERVISOR answered the agent's
+    /// `ctl story chose <policy>`: the supervisor answered the agent's
     /// question dialog by policy, the text naming the policy word. The one
-    /// told verb whose teller is the harness, not a watcher, and the one the
-    /// window answers with a chime and a pulse, because the point of it is
-    /// that the human notices a question was answered without them.
+    /// told verb whose teller is the harness, and the one the window answers
+    /// with a chime and a pulse, so the human notices a question was answered
+    /// without them.
     Chose,
 }
 
@@ -449,8 +444,7 @@ impl StoryVerb {
         })
     }
 
-    /// The word the row prints for a TOLD verb (the wire word), with the
-    /// glyph the mock pairs it with: `✓ approved`.
+    /// The glyph and wire word the row prints for a told verb (`✓ approved`).
     #[must_use]
     pub(crate) const fn told_words(self) -> Option<(char, &'static str)> {
         Some(match self {
@@ -474,7 +468,7 @@ impl StoryVerb {
         })
     }
 
-    /// WHO acted on a told point, for the spoken sentence (`approved by
+    /// Who acted on a told point, for the spoken sentence (`approved by
     /// watcher`, `chose by harness`, `compacted by worker`): the harness for
     /// [`Self::Chose`], the worker for [`Self::Compacted`] (the watcher only
     /// saw it happen), a watcher for every other told word.
@@ -509,9 +503,9 @@ pub struct StoryPoint {
     pub at: Instant,
     /// What happened.
     pub verb: StoryVerb,
-    /// The point happened under aterm's OWN harness's hand (ruling 313):
-    /// kept in the story and counted by `story=`, never news — the row and
-    /// the log already tell what aterm did there.
+    /// The point happened under aterm's own harness's hand: kept in the story
+    /// and counted by `story=`, never news, since the row and the log already
+    /// tell what aterm did there.
     pub aterm: bool,
 }
 
@@ -534,9 +528,11 @@ pub struct Slot<V: Host> {
     pub attention_told_elsewhere: bool,
     /// [`Facts::shell`].
     pub shell: Option<(&'static str, Instant)>,
+    /// [`Facts::program`].
+    pub program: Option<(&'static str, Instant)>,
     /// [`Facts::agent`].
     pub agent: Option<AgentReading<V>>,
-    /// When the AGENT phase word last changed — the row's `since` for it.
+    /// When the agent phase word last changed: the row's `since` for it.
     pub agent_since: Instant,
     /// [`Facts::hand`].
     pub hand: Hand,
@@ -559,38 +555,36 @@ pub struct Slot<V: Host> {
     pub input_stall: Option<V::Stall>,
     /// [`Facts::wall_answer`].
     pub wall_answer: WallAnswer,
-    /// When the last turn SETTLED (the Success tone's 2 s window).
+    /// When the last turn settled (the start of the Success tone's glow).
     pub settled_at: Option<Instant>,
     /// When a stop (hold or limit) began, for the story's stop duration.
     /// `None` under a hold the slot first saw at its own mint: nothing in a
     /// hold says when it began, so the row prints no figure for it rather
     /// than dating it from the mint.
     stop_began: Option<(StoryVerb, Instant)>,
-    /// Whether a refresh has been absorbed yet. The FIRST absorb is the
-    /// baseline — what already stood when the slot was minted — and a fact
-    /// already standing then (a hold) is adopted as state, not narrated as
-    /// something that happened since the human last looked.
+    /// Whether a refresh has been absorbed yet. The first absorb is the
+    /// baseline: a fact already standing when the slot was minted (a hold) is
+    /// adopted as state, not narrated as news.
     baselined: bool,
     story: VecDeque<StoryPoint>,
     /// The seq of the newest story point; 0 = nothing ever happened.
     pub story_seq: u64,
-    /// The seq of the newest point that is NEWS — one that did not happen
-    /// under aterm's own hand ([`StoryPoint::aterm`]); what the level reads.
+    /// The seq of the newest point that is news (one that did not happen
+    /// under aterm's own hand, [`StoryPoint::aterm`]); what the level reads.
     news_seq: u64,
-    /// aterm's OWN harness has its hand on the session (ruling 313): a drive
-    /// lease this process's harness holds (`is_aterms_hand`), or a `turn`
-    /// typed inside one (an Owner-token turn whose lease hands back to it).
-    /// Not a presence fact: the window's own chrome does not show it, and the
-    /// story points it makes are not news.
+    /// aterm's own harness has its hand on the session: a drive lease this
+    /// process's harness holds (`is_aterms_hand`), or a `turn` typed inside
+    /// one (an Owner-token turn whose lease hands back to it). Not a presence
+    /// fact: the window does not show it, and its story points are not news.
     pub(super) aterm_hand: bool,
     /// Set for the length of one [`Self::absorb`] in which aterm's hand was on
     /// the session at either end: every point it notes is aterm's.
     noting_aterm: bool,
-    /// The story up to this seq is CLOSED: the agent it was about left the
-    /// session, so it is no longer news to hold the row for. Every window's
+    /// The story up to this seq is closed: the agent it was about left the
+    /// session, so it is no news to hold the row for. Every window's
     /// watermark is read as at least this.
     story_closed: u64,
-    /// The last TOLD point (`ctl story`), with its text: the phase slot reads
+    /// The last told point (`ctl story`), with its text: the phase slot reads
     /// it for [`TOLD_FLASH`] after its instant, then returns to the phase.
     told: Option<(StoryVerb, String, Instant)>,
 }
@@ -605,6 +599,7 @@ impl<V: Host> Slot<V> {
             attention: None,
             attention_told_elsewhere: false,
             shell: None,
+            program: None,
             agent: None,
             agent_since: now,
             hand: Hand::None,
@@ -684,8 +679,8 @@ impl<V: Host> Slot<V> {
     pub fn absorb(&mut self, facts: Facts<V>, now: Instant) -> bool {
         let mut changed = false;
         // aterm's own hand at either end of this refresh makes every point it
-        // notes aterm's (ruling 313): a relaunch's turn settles and its lease
-        // is handed back between two refreshes, in either order.
+        // notes aterm's: a relaunch's turn settles and its lease is handed
+        // back between two refreshes, in either order.
         let was_aterm = self.aterm_hand;
         let now_aterm = is_aterms_hand::<V>(&facts.hand)
             || (was_aterm && matches!(facts.hand, Hand::DrivenTurn { holder: None, .. }));
@@ -714,6 +709,10 @@ impl<V: Host> Slot<V> {
             changed = true;
         }
         self.shell = facts.shell;
+        if self.program.map(|p| p.0) != facts.program.map(|p| p.0) {
+            changed = true;
+        }
+        self.program = facts.program;
         if facts.agent_seq > self.agent_seq_seen.unwrap_or(0) {
             self.agent_seq_seen = Some(facts.agent_seq);
             let agent = facts.agent;
@@ -746,7 +745,7 @@ impl<V: Host> Slot<V> {
             if self.agent != agent {
                 changed = true;
             }
-            // The agent LEFT (a verdict, then none): what it did while nobody
+            // The agent left (a verdict, then none): what it did while nobody
             // looked is closed, not left standing on the shell it returned to.
             if self.agent.is_some() && agent.is_none() && self.story_closed < self.story_seq {
                 self.story_closed = self.story_seq;
@@ -798,7 +797,7 @@ impl<V: Host> Slot<V> {
             changed = true;
         }
         if self.turn != facts.turn {
-            // A CARRIED record settled in a previous process: the baseline,
+            // A carried record settled in a previous process: the baseline,
             // not news (see [`TurnFact::carried`]).
             if let Some(t) = facts.turn
                 && !t.carried
@@ -844,21 +843,17 @@ impl<V: Host> Slot<V> {
         self.level_counting(watermark, true, true)
     }
 
-    /// The level the window's OWN chrome shows — the rim and the row's
-    /// existence: [`Self::level`], except that an attention another place
-    /// already tells ([`Facts::attention_told_elsewhere`]) is not counted,
-    /// and neither is aterm's own hand (ruling 313). A colour with no words
-    /// is what [`Level::rim`]'s own rule forbids; the fact stays where it is
-    /// read on purpose: `status level=attention why=escalation` and the tab's
-    /// wait mark.
+    /// The level the window's own chrome (the rim and the row's existence)
+    /// shows: [`Self::level`] without an attention told elsewhere
+    /// ([`Facts::attention_told_elsewhere`]) or aterm's own hand. Those facts
+    /// stay in `status level=` and the tab's wait mark.
     #[must_use]
     pub fn shown_level(&self, watermark: u64) -> Level {
         self.level_counting(watermark, !self.attention_told_elsewhere, !self.aterm_hand)
     }
 
     /// `attention`: an escalation counts; `hand`: a hand counts even when it
-    /// is aterm's own (ruling 313 — `status level=` keeps the fact, the
-    /// window's chrome does not show it).
+    /// is aterm's own.
     fn level_counting(&self, watermark: u64, attention: bool, hand: bool) -> Level {
         if self.hold.is_some() {
             return Level::Hold;
@@ -869,10 +864,8 @@ impl<V: Host> Slot<V> {
             return Level::Limited;
         }
         // A wall the harness answers is a record, not a stop (`WallAnswer`):
-        // it stands at `Note` — the row is there, with its reset and its
-        // countdown, and no rim, no filled diamond and no warn tone say
-        // "Agent can't continue" while the harness resumes it. Whatever else
-        // ranks higher (a prompt, a hand, a story) still does.
+        // it stands at `Note`, with its reset and countdown but no rim, below
+        // whatever else ranks higher.
         let handled_wall = matches!(
             self.agent.as_ref().map(|a| &a.phase),
             Some(AgentPhase::Wall { .. })
@@ -899,8 +892,8 @@ impl<V: Host> Slot<V> {
             _ => {}
         }
         // An unread task or ask is a wait state only while no hand is on the
-        // session: a driven worker with mail waiting stays teal (the mock's
-        // first row), and the mail slot says the rest.
+        // session: a driven worker with mail waiting stays teal, and the mail
+        // slot says the rest.
         if self.unread_wants_a_human() {
             return Level::Attention;
         }
@@ -920,7 +913,7 @@ impl<V: Host> Slot<V> {
         Level::Quiet
     }
 
-    /// WHY the slot stands at [`Level::Attention`] (`status why=`): the causes
+    /// Why the slot stands at [`Level::Attention`] (`status why=`): the causes
     /// the level merges, comma-joined in a fixed order — `prompt` (an approval
     /// box), `question` (the agent asked), `escalation` (a typed `meta
     /// attention`), `mail` (an unread task/ask with no hand on the session).
@@ -961,8 +954,8 @@ impl<V: Host> Slot<V> {
                 .is_some_and(|l| l.kind == "task" || l.kind == "ask")
     }
 
-    /// CALM: nothing is happening that the human's next keystroke should not
-    /// fold away — the fold law's second conjunct.
+    /// Calm: nothing is happening that the human's next keystroke should not
+    /// fold away (the fold law's second conjunct).
     #[must_use]
     pub fn calm(&self) -> bool {
         self.hold.is_none()
@@ -977,8 +970,8 @@ impl<V: Host> Slot<V> {
     }
 
     /// The tone the row paints in: Warn while a human should look, Success for
-    /// `SETTLED_GLOW` (2 s) after a settled turn, else Info. It follows the level
-    /// the row is SHOWN at ([`Self::shown_level`], ruling 280).
+    /// `SETTLED_GLOW` after a settled turn, else Info. It follows the level the
+    /// row is shown at ([`Self::shown_level`]).
     #[must_use]
     pub fn tone(&self, now: Instant, watermark: u64) -> Tone {
         if self.shown_level(watermark) >= Level::Attention {
@@ -1012,9 +1005,9 @@ impl<V: Host> Slot<V> {
     }
 }
 
-/// Severity, ascending. `hold > limited > attention > driven > story > quiet`
-/// (design §1), with the rim-less states between: mail waiting (`Note`)
-/// sits under a story, and driving another session under being driven.
+/// Severity, ascending: `hold > limited > attention > driven > story >
+/// quiet`, with the rim-less states between: mail waiting (`Note`) sits under
+/// a story, and driving another session under being driven.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Level {
     /// Nothing to show.
@@ -1049,8 +1042,8 @@ impl Level {
         }
     }
 
-    /// Whether the row EXISTS for this level (the fold law's first half:
-    /// state ≠ quiet). `Story` counts — it is the row the summary lives in.
+    /// Whether the row exists for this level (the fold law's first half:
+    /// state ≠ quiet). `Story` counts: it is the row the summary lives in.
     #[must_use]
     pub const fn shows_row(self) -> bool {
         !matches!(self, Self::Quiet)
@@ -1105,8 +1098,7 @@ impl Rim {
     }
 }
 
-/// The tab chip's attention mark as a LEVEL (the chip's old `attention: bool`
-/// is `Wait`).
+/// The tab chip's attention mark as a level.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub enum ChipLevel {
     /// No mark.

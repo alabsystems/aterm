@@ -19,14 +19,20 @@
 //! `tiny-skia` at this implementation. Anything you change in
 //! `array_vec.rs` is therefore load-bearing for third-party GPU code as well as
 //! for aterm's parser — read `crates/aterm-arrayvec/src/lib.rs` first.
+//!
+//! ## `SmallVec` is also the storage of the `smallvec` package
+//!
+//! `crates/aterm-smallvec` (package `smallvec`) wraps [`SmallVec<T, N>`] as
+//! upstream's `SmallVec<[T; N]>` for parking_lot_core, the wgpu crates and
+//! wayland-backend. It adds no unsafe code: every `MaybeUninit`
+//! those consumers reach is in `small_vec.rs`, so a change there is checked by
+//! that crate's tests too (`targo --unverified test -p smallvec`).
 
 // `no_std` + `alloc`: `ArrayVec` names only `core`, and `SmallVec`'s heap
 // fallback needs only `alloc::vec::Vec`. That keeps the `arrayvec` shim's
 // `#![no_std]` true of its whole graph, not just of the shim. Tests link `std`
 // for the harness and name what they use from it explicitly.
 #![no_std]
-#![deny(clippy::all)]
-#![deny(unsafe_op_in_unsafe_fn)]
 // Trust tool-attribute plumbing (scrollback/lz4 pattern) for `#[trust::contract_panic]`.
 #![cfg_attr(trust_verify, feature(register_tool))]
 #![cfg_attr(trust_verify, register_tool(trust))]

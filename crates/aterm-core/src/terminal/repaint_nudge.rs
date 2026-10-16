@@ -1,57 +1,34 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE REPAINT NUDGE: the closed-loop repair of a full-screen program that will
-//! not repaint a screen a resize left displaced. A pure, CLOCKLESS state
-//! machine; the host (`aterm-gui`'s `app_nudge`) stamps `now_ms`, samples the
-//! [`Facts`], and does the two PTY writes the machine asks for.
+//! The repaint nudge: repairs a full-screen program that did not repaint a screen a resize
+//! left displaced. A pure, clockless state machine; the host (`aterm-gui`'s `app_nudge`)
+//! stamps `now_ms`, samples the [`Facts`], and does the PTY writes the machine asks for.
 //!
-//! WHY. A program that repaints only when its SIGWINCH handler READS a changed
-//! size can miss a flap of its window: it reads the same size twice and draws
-//! nothing, so every later frame lands one row off the engine's screen. The one
-//! natural, input-free way to make it repaint is the resize protocol itself,
-//! done so that its handler reads EACH size: hold the session's PTY ONE ROW
-//! SHORT, wait for the program to ANSWER (its full clear), release, wait for the
-//! second answer. Back to back (the adoption pulse) it reads one size and draws
-//! nothing (measured 0/25); on a timer it guesses the program's longest
-//! blocking read (9/25 at 50 ms under a 90 ms block); closed loop, with the
-//! release after 40 ms of output quiet, 25/25. It sends no input byte, so a
-//! typed draft, a paste and an open approval box are untouched.
+//! A program that repaints only when its SIGWINCH handler reads a changed size misses a flap
+//! (it reads the same size twice), and every later frame lands one row off. So the machine
+//! holds the PTY one row short, waits for the program's answer (a full clear), releases, and
+//! waits for the second answer, so the handler reads each size. Measured: back to back (the
+//! adoption pulse) 0/25, on a timer 9/25, closed loop (release after [`SETTLE_MS`] of quiet)
+//! 25/25. No input byte is sent, so a draft, a paste and an approval box are untouched.
 //!
-//! WHAT IT NEVER DOES. It never touches the ENGINE (the machine has no way to
-//! ask for it: the only acts are [`Act::Hold`] and [`Act::Release`], both
-//! about the PTY), never runs for a program that is not the agent class
-//! (Claude Code; the one program whose repaint contract was measured: an
-//! editor with point on the last row re-scrolls 38 of 41 rows), never starts
-//! while a halt stands, a driver may type into the session, a person touched it
-//! in the last 1.5 s, text is selected, or a DEC 2026 frame is open, and never
-//! leaves the tab short: a missing answer is a bounded wait, a release, then
-//! [`GiveUp::NoAnswer`] and the epoch is tried (one try per epoch, at most
-//! three attempts per session-hour, one cooldown of a minute).
+//! The acts are about the PTY only; the engine is never resized. It runs only for the agent
+//! class (Claude Code, the one program whose repaint contract was measured; an editor with
+//! point on the last row re-scrolls 38 of 41 rows), and never while a halt stands, a driver
+//! may type, a person touched the session within [`PERSON_GATE_MS`], text is selected, or a
+//! DEC 2026 frame is open. A missing answer is a bounded wait, a release, then
+//! [`GiveUp::NoAnswer`]: one try per epoch, at most [`MAX_PER_HOUR`] attempts per
+//! session-hour, [`COOLDOWN_MS`] apart.
 //!
-//! WHAT IS REPORTED. An attempt whose wait is spent ends on what the engine
-//! still owes ([`Facts::owed`]): rows owed is the give-up the owner hears;
-//! none is a silent [`Dropped::NothingOwed`], whatever answers were counted.
-//! It is the one fact the ledger's epoch and its digest line end on too, and
-//! the counters cannot tell two answers that landed before one step from one.
-//! An ADOPTION is not about a debt (its screen was carried blank and owes
-//! none), so a size it left unanswered is a give-up, which names no epoch and
-//! is a log line only.
+//! A spent wait is judged by what the engine still owes ([`Facts::owed`]), not by answers
+//! counted: rows owed is the give-up the owner hears, none is [`Dropped::NothingOwed`]. An
+//! adoption owes nothing, so a size it left unanswered is a give-up (a log line only). A hold
+//! someone else ends ([`Act::Forget`]) or the host lets go ([`RepaintNudge::let_go`]) waits
+//! for the answer as after a release; only a resize that left the engine elsewhere is
+//! [`Dropped::Superseded`]. Every attempt that held ends in a judged outcome.
 //!
-//! A HOLD SOMEONE ELSE ENDS (the layout passes of a flap or a real resize set
-//! the PTY meanwhile) is [`Act::Forget`]: no write, and the answer is waited
-//! for as after a release. A flap that put the engine back is one a busy
-//! program never saw, so an unanswered wait ends in [`GiveUp::NoAnswer`] like
-//! any other; only a resize that LEFT the engine elsewhere is
-//! [`Dropped::Superseded`], whose end the epoch judge owes if the resize comes
-//! back (the host's `app_nudge`). A HOLD THE HOST LETS GO (its hard deadline,
-//! a handoff freeze about to start) goes on the same way
-//! ([`RepaintNudge::let_go`]), and a freeze holds the wait until it lifts: a
-//! parked reader sees no answer, and a successor judges the debt it is handed.
-//! Every attempt that held ends in a judged outcome, whatever ended the hold.
-//!
-//! The model is `RepaintNudge` in `aterm-spec` (`models_resize_render.rs`); the
-//! Tier-1 bind is `tests/conformance_repaint_nudge.rs`.
+//! The model is `RepaintNudge` in `aterm-spec` (`models_resize_render.rs`); the Tier-1 bind is
+//! `tests/conformance_repaint_nudge.rs`.
 
 use std::collections::VecDeque;
 
@@ -204,9 +181,8 @@ impl Gate {
 /// one action (drag the window edge) is worth an item in the digest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GiveUp {
-    /// The program did not answer one of the two sizes, and the engine still
-    /// owes rows when the wait ends (an adoption, which owes none: either size
-    /// unanswered).
+    /// The program did not answer one of the two sizes and the engine still owes rows when
+    /// the wait ends; for an adoption, which owes none, either size unanswered.
     NoAnswer,
     /// A gate deferred the attempt to its cap.
     Deferred(Gate),
@@ -239,14 +215,10 @@ pub enum Dropped {
     /// before the hold, or by the time a debt attempt's wait was spent
     /// (whatever answers were counted).
     NothingOwed,
-    /// A real resize left the engine somewhere the hold did not find it, and
-    /// the program had not answered when the wait ended: it was GIVEN a size
-    /// it reads as changed, and what it draws for it is the epoch judge's. A
-    /// flap that put the engine back is not one (the program could not see
-    /// it): that attempt is judged as the nudge's own. Nor, in the end, is a
-    /// resize that comes back after the wait: the epoch judge finds the epoch
-    /// at risk again where the hold found it and reports the give-up the same
-    /// attempt is when it comes back inside the wait (the host's half).
+    /// A real resize left the engine away from where the hold found it, and the program had
+    /// not answered when the wait ended: it was given a size it reads as changed, so what it
+    /// draws is the epoch judge's. A flap that put the engine back is not this; nor is a
+    /// resize that comes back after the wait (the epoch judge reports that give-up).
     Superseded,
     /// The second size was answered without the first: repainted anyway.
     Repainted,
@@ -268,10 +240,9 @@ pub enum Act {
     /// Set the PTY to the engine's size now. The phase says whether the
     /// machine is now waiting for the second answer or is finished.
     Release,
-    /// Someone else set the PTY while it was held (the layout passes of a
-    /// flap or of a real resize, a cell-box sync): the hold is over and the
-    /// PTY is theirs, so write NOTHING. The machine waits for the program's
-    /// answer as after its own release.
+    /// Someone else set the PTY while it was held (the layout passes of a flap or of a
+    /// real resize, a cell-box sync): the hold is over and the PTY is theirs, so write
+    /// nothing. The machine waits for the program's answer as after its own release.
     Forget,
     /// Mode `log`: the attempt would have started here. Finished.
     WouldNudge,
@@ -290,8 +261,8 @@ pub enum Act {
     GaveUp(GiveUp),
 }
 
-/// What the host reads from the world at each step. Every field is a function
-/// of the TARGET session (not its window, not the machine).
+/// What the host reads from the world at each step, every field about the target session
+/// (not its window, not the machine).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[allow(
     clippy::struct_excessive_bools,
@@ -314,12 +285,12 @@ pub struct Facts {
     pub dragging: bool,
     /// A halt (`hold=1`) stands on the session.
     pub halted: bool,
-    /// A lease or turn on THIS session may still type.
+    /// A lease or turn on this session may still type.
     pub driver_may_type: bool,
     /// Another session's PTY is held right now (one hold at a time across sessions).
     pub other_hold: bool,
-    /// Milliseconds since a person last touched THIS session; a session never
-    /// touched reports the time since it attached ([`person_quiet_ms`]).
+    /// Milliseconds since a person last touched this session, or since it attached when
+    /// never touched ([`person_quiet_ms`]).
     pub person_quiet_ms: u64,
     /// Text is selected.
     pub selection: bool,
@@ -365,10 +336,9 @@ impl Facts {
     }
 }
 
-/// The person gate's input: milliseconds since a person's last gesture on the
-/// session, or - when none has reached it in this process (the stamp is
-/// process-local, so a session adopted across an update has none) - since it
-/// attached. "Never" is unknown, not quiet.
+/// The person gate's input: milliseconds since a person's last gesture on the session, or,
+/// when none reached it in this process (the stamp is process-local, so a session adopted
+/// across an update has none), since it attached. "Never" is unknown, not quiet.
 #[must_use]
 pub const fn person_quiet_ms(since_gesture_ms: Option<u64>, since_attach_ms: u64) -> u64 {
     match since_gesture_ms {
@@ -487,9 +457,9 @@ impl RepaintNudge {
         self.hold_engine
     }
 
-    /// Arm for `epoch` (`u64::MAX` for an adoption). `false` when the machine
-    /// will not start: mode `off`, an attempt in flight, or this epoch was
-    /// already tried or logged (one try per epoch; NEW debt is a new epoch).
+    /// Arm for `epoch` (`u64::MAX` for an adoption). `false` when the machine will not start:
+    /// mode `off`, an attempt in flight, or this epoch already tried or logged (new debt is a
+    /// new epoch).
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
         aterm_spec::refines(
@@ -520,15 +490,10 @@ impl RepaintNudge {
         true
     }
 
-    /// The host let the hold go (its hard deadline, [`PTY_HOLD_CAP_MS`], when
-    /// no step could end it - the loop did not tick, or the terminal lock
-    /// answered nothing at every look - or a handoff freeze about to start):
-    /// the PTY is the engine's again, and the attempt, its one try spent at
-    /// the hold, goes on as after a release, judged when its wait ends, as the
-    /// model's `ReleaseByDeadline` has it. The world may not be readable now,
-    /// so the counters are read at the next step: an answer that landed before
-    /// it reads as the first, as at a [`Act::Forget`]. `false` when no hold was
-    /// in flight.
+    /// The host let the hold go (at [`PTY_HOLD_CAP_MS`] when no step could end it, or before
+    /// a handoff freeze): the PTY is the engine's again and the attempt goes on as after a
+    /// release (the model's `ReleaseByDeadline`). The world may not be readable now, so the
+    /// counters are read at the next step. `false` when no hold was in flight.
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
         aterm_spec::refines(
@@ -732,8 +697,8 @@ impl RepaintNudge {
     }
 
     fn drop_with(&mut self, why: Dropped) -> Act {
-        // A drop for a reason that is about the world (not the program) leaves
-        // the epoch untried: a later, eligible moment may arm it again.
+        // A drop about the world (not the program) leaves the epoch untried: a later,
+        // eligible moment may arm it again.
         self.phase = Phase::Rest;
         if matches!(why, Dropped::NothingOwed | Dropped::Repainted) {
             self.last_epoch = Some(self.epoch);
@@ -741,8 +706,8 @@ impl RepaintNudge {
         Act::Dropped(why)
     }
 
-    /// Note that gate `gate` defers this attempt at `now_ms`; `Some(act)` when
-    /// its cap is spent, else the wait to schedule.
+    /// Gate `gate` defers this attempt at `now_ms`: the give-up when its cap is spent, else
+    /// the wait to schedule.
     fn defer(&mut self, gate: Gate, cap_ms: u64, now_ms: u64) -> Act {
         let since = *self.deferred_since[gate.slot()].get_or_insert(now_ms);
         self.quiet_since = None;
@@ -878,11 +843,9 @@ impl RepaintNudge {
         Act::Release
     }
 
-    /// Someone else set the PTY while it was held: the hold is theirs to end,
-    /// and the attempt goes on as after a release. Whether that was a real
-    /// resize or a flap the program never saw is not known yet (a step may
-    /// see a flap's middle), so it is judged when the wait ends
-    /// ([`Self::step_restoring`]).
+    /// Someone else set the PTY while it was held: the hold is theirs, and the attempt goes
+    /// on as after a release. A real resize and a flap cannot be told apart yet (a step may
+    /// see a flap's middle), so [`Self::step_restoring`] judges it when the wait ends.
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
         aterm_spec::refines(
@@ -893,11 +856,8 @@ impl RepaintNudge {
     )]
     fn forget(&mut self, f: &Facts, now_ms: u64) -> Act {
         if self.answered(f) {
-            // Whatever the program drew by now is taken for its answer to the
-            // SHORT size, so only a later one answers the size that stands.
-            // Two answers that both landed before this step read as one: the
-            // wait for a second is then spent, and the engine, which owes
-            // nothing after them, ends the attempt in silence.
+            // Whatever was drawn by now answered the short size; only a later answer
+            // counts for the size that stands.
             self.first_answer_ms = Some(now_ms.saturating_sub(self.hold_ms));
         }
         self.phase = Phase::Restoring;
@@ -909,23 +869,18 @@ impl RepaintNudge {
 
     fn step_short(&mut self, f: &Facts, now_ms: u64) -> Act {
         let target = (self.hold_engine.0.saturating_sub(1), self.hold_engine.1);
-        // The PTY is not the one the hold set: the layout passes of a resize
-        // (a real one, or a flap's, which may already have put the engine
-        // back) or a cell-box sync wrote it.
+        // Someone else wrote the PTY: a resize's layout pass (real or a flap's) or a
+        // cell-box sync.
         if f.engine != self.hold_engine || f.pty != target {
             return self.forget(f, now_ms);
         }
-        // The alternate screen left: no debt of it is left to repair, so the
-        // hold is lifted and the attempt stands down.
+        // The alternate screen left: nothing to repair, so lift the hold and stand down.
         if !f.alt_screen {
             return self.release(f, now_ms, Phase::Rest);
         }
         let waited = now_ms.saturating_sub(self.hold_ms);
-        // A halt or a handoff freeze lifts the hold at once too, but the
-        // attempt (its one try spent) is judged by the program's answers as
-        // after any release: a tab it leaves displaced is reported, as it is
-        // without them. (The host lets every hold go before a freeze starts;
-        // this is the machine's own half.)
+        // A halt or a handoff freeze lifts the hold at once; the attempt (its try spent)
+        // is still judged by the program's answers, as after any release.
         if f.halted || f.frozen {
             if self.answered(f) {
                 self.first_answer_ms = Some(waited);
@@ -972,9 +927,8 @@ impl RepaintNudge {
     )]
     fn step_restoring(&mut self, f: &Facts, now_ms: u64) -> Act {
         if f.frozen {
-            // A handoff freeze parks the readers, so no answer can be seen: the
-            // wait is held, and starts again at the first step after the freeze
-            // lifts (a rollback). A successor judges the debt it is handed.
+            // A handoff freeze parks the readers, so no answer can be seen: the wait
+            // restarts at the first step after it lifts.
             self.thaw = true;
             return Act::Nothing;
         }
@@ -982,8 +936,7 @@ impl RepaintNudge {
             self.release_ms = now_ms;
         }
         if std::mem::take(&mut self.rebase) {
-            // The host let the hold go with no step that read the world
-            // (`let_go`): what the program drew by now answered the SHORT size.
+            // After `let_go`: what the program drew by now answered the short size.
             if self.answered(f) {
                 self.first_answer_ms = Some(now_ms.saturating_sub(self.hold_ms));
             }
@@ -992,10 +945,9 @@ impl RepaintNudge {
         }
         let waited = now_ms.saturating_sub(self.release_ms);
         if self.answered(f) {
-            // The size that stands was answered. A program that streams
-            // through its repaint (never 40 ms quiet, or a DEC 2026 frame open
-            // at every look) answered all the same: the timeout ends the wait
-            // for quiet, as it does in `step_short`.
+            // Answered. A program that streams through its repaint (never quiet, or a
+            // frame open at every look) answered all the same: the timeout ends the wait for
+            // quiet, as in `step_short`.
             if Self::settled(f) || waited >= ANSWER_TIMEOUT_MS {
                 self.second_answer_ms = Some(waited);
                 return match self.first_answer_ms {
@@ -1010,16 +962,9 @@ impl RepaintNudge {
             return Act::WaitUntil(now_ms.saturating_add(more));
         }
         if waited >= ANSWER_TIMEOUT_MS {
-            // The size that stands was not answered. With the engine moved, a
-            // real resize gave the program a size of its own. With it where
-            // the hold found it (no resize, or a flap that put it back), the
-            // end is judged by what the engine still OWES - the fact the
-            // ledger's epoch and the digest line end on - never by the answers
-            // counted, which cannot tell two answers that landed before one
-            // step from one (`forget`). An adoption is not about a debt (its
-            // screen was carried blank and owes none), so, as at its arming,
-            // the debt says nothing of it: a size it left unanswered is a
-            // give-up.
+            // Unanswered. An engine moved by a real resize got a size of its own; otherwise
+            // the end is judged by what the engine still owes, never by answers counted
+            // (two before one step read as one). An adoption owes nothing: a give-up.
             if f.engine != self.hold_engine {
                 return self.finish(Act::Dropped(Dropped::Superseded));
             }
@@ -1172,9 +1117,7 @@ mod tests {
 
     #[test]
     fn a_nudge_that_gets_no_answer_never_asks_for_the_engine() {
-        // The machine's acts are Hold and Release only; both are about the PTY.
-        // Over every schedule of a silent program the sequence of acts is
-        // Hold, Release, then a give-up: nothing else can be asked for.
+        // Over a silent program the acts are Hold, Release, give-up: nothing else.
         let mut r = Rig::new(Mode::On);
         let mut acts = Vec::new();
         for _ in 0..40 {
@@ -1208,7 +1151,7 @@ mod tests {
 
     #[test]
     fn a_lease_on_another_tab_does_not_defer_the_nudge() {
-        // The fact is per TARGET session: another tab's lease is not in it.
+        // The fact is per target session: another tab's lease is not in it.
         let mut r = Rig::new(Mode::On);
         r.f.driver_may_type = false;
         assert_eq!(r.step(), Act::Hold);
@@ -1240,8 +1183,7 @@ mod tests {
 
     #[test]
     fn a_click_a_wheel_notch_and_a_drag_each_count_as_a_person() {
-        // The machine sees one number; the host builds it from the stamp that
-        // `is_person_gesture` feeds. Any gesture inside the window defers.
+        // The host builds the one number from the stamp `is_person_gesture` feeds.
         for quiet in [0, 1, 700, PERSON_GATE_MS - 1] {
             let mut r = Rig::new(Mode::On);
             r.f.person_quiet_ms = quiet;
@@ -1447,8 +1389,8 @@ mod tests {
     fn a_real_resize_meanwhile_supersedes_the_hold() {
         let mut r = Rig::new(Mode::On);
         r.hold();
-        // The window changed the ENGINE's size; the layout pass reset the PTY.
-        // The hold is the layout's now: forgotten, nothing written.
+        // A real resize moved the engine and its layout pass reset the PTY: forgotten,
+        // nothing written.
         r.f.engine = (62, 200);
         r.f.pty = (62, 200);
         assert_eq!(r.at(5), Act::Forget);
@@ -1471,8 +1413,7 @@ mod tests {
         r.hold();
         r.f.frozen = true;
         assert_eq!(r.at(1), Act::Release);
-        // The host lets it go (its hard deadline, a handoff freeze about to
-        // start): the attempt waits for its answer as after a release.
+        // The host lets it go: the attempt waits for its answer as after a release.
         let mut r = Rig::new(Mode::On);
         r.hold();
         assert!(r.m.let_go(r.now));
@@ -1495,11 +1436,8 @@ mod tests {
 
     #[test]
     fn a_first_answer_with_no_second_is_judged_by_what_the_engine_owes() {
-        // The program drew for the SHORT size and never redrew at the true one.
-        // Rows still owed are a give-up; a debt its clear paid is not reported
-        // (the ledger books that epoch healed, and its line would end at once).
-        // An adoption owes no debt (its screen was carried blank), so the debt
-        // says nothing of it: the size it left unanswered is a give-up.
+        // The program answered the short size only. Rows still owed are a give-up, a paid
+        // debt is not reported, and an adoption (owes nothing) is a give-up.
         for (reason, owed, end) in [
             (Reason::Debt, true, Act::GaveUp(GiveUp::NoAnswer)),
             (Reason::Debt, false, Act::Dropped(Dropped::NothingOwed)),

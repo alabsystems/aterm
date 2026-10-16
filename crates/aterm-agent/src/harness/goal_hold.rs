@@ -74,7 +74,7 @@ impl How {
     }
 }
 
-/// Where a hold stands. The first three OWE a resume ([`Stage::owes`]).
+/// Where a hold stands. The first three owe a resume ([`Stage::owes`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stage {
     /// The pause is made (written before its key), and has not been seen on
@@ -150,11 +150,9 @@ pub struct Hold {
     pub resumes: u32,
     /// The build the move was for (the upgrade's), or empty.
     pub to: String,
-    /// The Codex the upgrade RELAUNCHED for the move, once it found it
-    /// (`upgrade_codex_drive`'s `resume_on_relaunch`); `0`: no relaunch yet.
-    /// The one Codex whose paused-goal box the loop's approval policy may
-    /// answer for this hold ([`box_is_upgrades`]): a box any other Codex in
-    /// the tab draws — a person's own `codex resume` — is theirs.
+    /// The Codex the upgrade relaunched for the move; `0`: none yet. The one
+    /// Codex whose paused-goal box the approval policy may answer for this
+    /// hold ([`box_is_upgrades`]); any other Codex's box is a person's.
     pub relaunched: u32,
     /// Why it ended, once it has: `moved` (resumed after the move),
     /// `abandoned:<why>` (resumed without it), `by-hand` (a person resumed
@@ -316,8 +314,8 @@ pub fn write(path: &Path, hold: &Hold) -> std::io::Result<()> {
 }
 
 /// Claim the goal for `hold`'s owner, before its key goes: written unless an
-/// open hold of the other owner stands there (`Err(that owner)`), the one rule
-/// that keeps the two lanes from both holding a goal.
+/// open hold of the other owner stands there, so the two lanes never both hold
+/// a goal.
 ///
 /// # Errors
 /// The other owner's hold is open (`Ok(Err(owner))`), or the record could not
@@ -329,10 +327,9 @@ pub fn claim(path: &Path, hold: &Hold) -> std::io::Result<Result<(), Owner>> {
     write(path, hold).map(Ok)
 }
 
-/// Whether the UPGRADE holds the goal of the tab whose record is at `path`:
-/// its hold still owes the goal its resume. What the switch reads before it
-/// claims the goal for itself (the switch never pauses, stops or resumes a
-/// goal the upgrade paused).
+/// Whether the upgrade holds the goal of the tab whose record is at `path`.
+/// The switch reads this before it claims: it never pauses, stops or resumes a
+/// goal the upgrade paused.
 #[must_use]
 pub fn held_by_upgrade(path: &Path) -> bool {
     read(path).is_some_and(|h| h.owner == Owner::Upgrade && h.owes())
@@ -355,11 +352,11 @@ pub fn box_is_upgrades(path: &Path, leads: impl Fn(u32) -> bool) -> bool {
     })
 }
 
-/// The switch's claim kept in step with its own state, at `now`: `paused` (the
+/// The switch's claim kept in step with its state at `now`: `paused` (the
 /// switch owes the goal its resume at the reset, `WindDown::goal_paused`)
-/// writes its hold where none is open (an open upgrade hold is left as it
-/// stands); not `paused` ends an open hold of the switch's
-/// ([`Stage::Released`], `switch`). Returns what it wrote, or `None`.
+/// writes a switch hold where none is open (an open upgrade hold stands); not
+/// `paused` releases an open switch hold (`why` = `switch`). Returns what it
+/// wrote.
 pub fn sync_switch(path: &Path, paused: bool, how: How, now: u64) -> Option<Hold> {
     let open = read(path).filter(Hold::owes);
     let hold = match (paused, open) {
@@ -385,10 +382,8 @@ pub fn sync_switch(path: &Path, paused: bool, how: How, now: u64) -> Option<Hold
 mod tests {
     use super::*;
 
-    /// The record reads back whole, and sits beside the tab's loop ledger —
-    /// the one file the loop's path and the upgrade's root both name.
-    /// Negative control: a file that is no hold (an upgrade state's shape)
-    /// reads as none.
+    /// The record reads back whole at the one path the loop and the upgrade
+    /// both name; a file that is no hold reads as none.
     #[test]
     fn a_hold_reads_back_whole_beside_the_loops_ledger() {
         let root = crate::supervise::ScratchDir::new("goal-hold", "whole");
@@ -411,11 +406,8 @@ mod tests {
         assert_eq!(read(&at), None);
     }
 
-    /// One owner at a time: the upgrade's claim stands while the switch's
-    /// hold is open, and the switch's while the upgrade's is, each refused
-    /// with the other's name; an ended hold is no obstacle. The switch's sync
-    /// leaves the upgrade's open hold as it stands. Negative control: the
-    /// same owner claims over its own open hold (a new way tried).
+    /// Each owner's claim is refused while the other's hold is open, an ended
+    /// hold is no obstacle, and an owner may claim over its own open hold.
     #[test]
     fn one_owner_holds_a_goal_at_a_time() {
         let root = crate::supervise::ScratchDir::new("goal-hold", "owner");
@@ -463,11 +455,8 @@ mod tests {
         assert_eq!(claim(&at, &upgrade).expect("io"), Ok(()));
     }
 
-    /// The box is the upgrade's only while its hold owes the resume, names
-    /// the Codex it relaunched, that Codex still leads its terminal, and the
-    /// box was not left to a person. Negative controls, each alone: no
-    /// relaunch yet, the relaunch no longer leading, the box left to a person
-    /// (`BOX_THEIRS`), the hold no longer owed, the hold the switch's.
+    /// The box is the upgrade's only while every condition of
+    /// [`box_is_upgrades`] holds; each negative control breaks one.
     #[test]
     fn the_box_is_the_upgrades_only_on_its_own_relaunch() {
         let root = crate::supervise::ScratchDir::new("goal-hold", "box");

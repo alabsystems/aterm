@@ -7,7 +7,9 @@
 //!   thread; on wake `nanosleep`'s deadline is long past, so the check fires
 //!   immediately — *before* Wi-Fi has associated. The first post-wake check reliably
 //!   fails on DNS. [`sleep_watching_for_wake`] notices the wall-clock jump and gives
-//!   the network [`WAKE_SETTLE`] to come up instead of burning a guaranteed failure.
+//!   the network a short [`WAKE_SETTLE`] to come up; a check inside [`WAKE_GRACE`]
+//!   that still fails ([`after_wake`]) takes the quick [`OFFLINE_RETRY`] rung at INFO,
+//!   whatever it failed on, instead of doubling the backoff.
 //! * **Backoff.** [`Cadence::delay`] doubles the interval
 //!   per consecutive failure up to a ceiling of [`MAX_BACKOFF_INTERVALS`] base
 //!   intervals (never below [`MAX_BACKOFF`]), and snaps back to the base interval the
@@ -45,6 +47,23 @@ pub(crate) use crate::cadence_bounds::{
 /// was not running: system sleep, hibernation, a suspended VM, or a large clock step.
 /// Well above any scheduling delay or routine NTP slew.
 pub(crate) const SLEEP_GAP: Duration = Duration::from_secs(90);
+
+/// How long after a detected wake a failed check is still taken as the network coming
+/// up, whatever it failed on: Wi-Fi associating, DNS re-resolving, a captive portal
+/// or a VPN reconnecting answer with a TLS failure (curl 35), a reset (56) or an HTTP
+/// error page (22) as often as with the unreachable exits [`is_network_unreachable`]
+/// names. Inside it a failure takes the next [`OFFLINE_RETRY`] rung and is said at
+/// INFO; doubling the backoff on it would wait longer than the settle it replaced.
+/// Two minutes covers the settle and the first two quick rungs (3 s, then 20 s, then
+/// 60 s); a network still failing past it is a fault like any other.
+pub(crate) const WAKE_GRACE: Duration = Duration::from_secs(2 * 60);
+
+/// Whether a check that began at `check_began` falls inside [`WAKE_GRACE`] of the last
+/// detected wake (`woke_at`; `None` when this loop has seen none). Both are
+/// [`Instant`]s taken after the wake, so the machine was running between them.
+pub(crate) fn after_wake(woke_at: Option<Instant>, check_began: Instant) -> bool {
+    woke_at.is_some_and(|woke| check_began.saturating_duration_since(woke) <= WAKE_GRACE)
+}
 
 /// How long an unchanged failure message stays suppressed before being repeated.
 pub(crate) const STILL_FAILING_AFTER: Duration = Duration::from_secs(30 * 60);
@@ -191,9 +210,10 @@ impl Cadence {
     /// scatters it). `None` (no receipt could be read) is a plain [`Self::failed`].
     ///
     /// The ladder's first rung is ONE base interval (±[`JITTER_PCT`]%) and the
-    /// deferred window is 1.4 of them (`DEFERRED_WINDOW_INTERVALS`), so on
-    /// `failed` alone the deferring process would wake inside its own window and skip
-    /// on its own note as a sibling's. Held to the window's end instead (un-jittered past it: the epoch carries the scatter), or to
+    /// deferred window is at least 1.4 of them (`DEFERRED_WINDOW_INTERVALS`) and never
+    /// under 14 minutes (`DEFERRED_WINDOW_FLOOR`), so on `failed` alone the deferring
+    /// process would wake inside its own window and skip on its own note as a
+    /// sibling's. Held to the window's end instead (un-jittered past it: the epoch carries the scatter), or to
     /// the jittered ladder when that is later. A rung that can never wake inside the
     /// window keeps its ordinary jittered wait.
     pub(crate) fn deferred(&mut self, window_end: Option<Instant>, now: Instant, entropy: u8) {
@@ -537,6 +557,26 @@ impl FailureLog {
     }
 }
 
+/// What the loop does with a check that failed, and the line it owes for it. One
+/// that could not have met a working network (`offline`: inside [`WAKE_GRACE`] of a
+/// wake whatever it failed on, or a channel never answered — the loop decides) takes
+/// the next [`OFFLINE_RETRY`] rung and is said at INFO while those rungs run; any
+/// other lengthens the backoff and is warned.
+pub(crate) fn note_failure(
+    schedule: &mut Cadence,
+    log: &mut FailureLog,
+    message: &str,
+    offline: bool,
+) -> LogAction {
+    if offline {
+        schedule.failed_offline();
+        log.failure_expected(message, schedule.retrying_offline())
+    } else {
+        schedule.failed();
+        log.failure(message)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -629,13 +669,13 @@ mod tests {
             }
         }
         // …and it is not vacuous: at the shipped interval it is exactly the
-        // schedule's own LONGEST_WAIT (the 40-minute ceiling, +20 %, + the settle),
+        // schedule's own LONGEST_WAIT (the 15-minute ceiling, +20 %, + the settle),
         // the bound `no_wait_exceeds_the_longest_wait` shows is reached.
         assert_eq!(
             Cadence::new(Duration::from_secs(INTERVAL_SECS)).max_wait(),
             LONGEST_WAIT
         );
-        assert_eq!(LONGEST_WAIT, Duration::from_secs(48 * 60) + WAKE_SETTLE);
+        assert_eq!(LONGEST_WAIT, Duration::from_secs(18 * 60) + WAKE_SETTLE);
     }
 
     #[test]
@@ -658,8 +698,9 @@ mod tests {
     }
 
     /// A network that is not up yet — the boot and wake case — is retried after 20 s,
-    /// 60 s, 2 min and 5 min, and only then does the ordinary ladder take over, from
-    /// the base interval and doubling as before.
+    /// 60 s and then the two-minute base (the 5-minute rung never outwaits the ladder),
+    /// and only then does the ordinary ladder take over, from the base interval and
+    /// doubling as before.
     #[test]
     fn an_unreachable_network_is_retried_on_the_short_ladder_then_the_base() {
         let base = Duration::from_secs(INTERVAL_SECS);
@@ -672,8 +713,8 @@ mod tests {
         }
         assert_eq!(
             waits,
-            [20, 60, 120, 300].map(Duration::from_secs),
-            "20 s, 60 s, 2 min, 5 min"
+            [20, 60, 120, 120].map(Duration::from_secs),
+            "20 s, 60 s, then the 2-minute base"
         );
         assert_eq!(
             c.failures(),
@@ -732,6 +773,58 @@ mod tests {
         assert_eq!(c.nominal(), base, "the ordinary ladder's first rung");
     }
 
+    /// A NETWORK STILL COMING UP AFTER A WAKE IS NO FAULT, WHATEVER IT FAILED ON. The
+    /// settle is three seconds, so the first check after the lid opens can meet Wi-Fi
+    /// half associated, a VPN reconnecting or a captive portal: a TLS failure (35), a
+    /// reset (56), a portal's error page (22) — none of them an exit
+    /// `is_network_unreachable` names. Inside the grace each takes the quick rungs
+    /// (20 s, 60 s, then the base) at INFO and the doubling ladder never moves.
+    /// NEGATIVE CONTROL: the same failure past the grace, or with no wake seen, is a
+    /// fault — warned, and the ladder moves.
+    #[test]
+    fn a_failure_inside_the_wake_grace_takes_the_quick_rungs_at_info_whatever_it_was() {
+        let base = Duration::from_secs(INTERVAL_SECS);
+        let woke = Instant::now();
+        for message in [
+            "curl HEAD https://github.com/alabsystems/aterm/releases/latest/download/\
+             aterm-appcast.toml failed (exit status: 35): curl: (35) LibreSSL SSL_connect: \
+             SSL_ERROR_SYSCALL in connection to github.com:443",
+            "curl HEAD https://github.com/x failed (exit status: 56): curl: (56) Recv \
+             failure: Connection reset by peer",
+            "curl HEAD https://github.com/x failed (exit status: 22): curl: (22) The \
+             requested URL returned error: 511",
+        ] {
+            assert!(!is_network_unreachable(message), "premise: {message}");
+            let mut c = Cadence::new(base);
+            c.woke();
+            let mut log = FailureLog::default();
+            let mut waits = Vec::new();
+            for since in [
+                WAKE_SETTLE,
+                WAKE_SETTLE + OFFLINE_RETRY[0],
+                WAKE_SETTLE + OFFLINE_RETRY[0] + OFFLINE_RETRY[1],
+            ] {
+                let offline = after_wake(Some(woke), woke + since);
+                let said = note_failure(&mut c, &mut log, message, offline);
+                assert!(
+                    !matches!(said, LogAction::Warn(_)),
+                    "{since:?} after the wake: {said:?}"
+                );
+                assert_eq!(c.failures(), 0, "no doubling: {message}");
+                waits.push(c.nominal());
+            }
+            assert_eq!(waits, [20, 60, 120].map(Duration::from_secs), "{message}");
+            for woke_at in [Some(woke), None] {
+                let mut c = Cadence::new(base);
+                let mut log = FailureLog::default();
+                let past = woke + WAKE_GRACE + Duration::from_secs(1);
+                let said = note_failure(&mut c, &mut log, message, after_wake(woke_at, past));
+                assert!(matches!(said, LogAction::Warn(_)), "{woke_at:?}: {said:?}");
+                assert_eq!(c.failures(), 1, "{woke_at:?}");
+            }
+        }
+    }
+
     /// THE SOURCE-FIRST RELEASE. A healthy check that
     /// found the head's app build in flight waits 2, 4, then 8 minutes — keyed on the
     /// machine-wide count the check receipt carries — and the ordinary interval after
@@ -740,7 +833,10 @@ mod tests {
     /// unreachable network, a wake — ends the quick ladder, and a hold wins over it.
     #[test]
     fn a_head_whose_app_build_is_in_flight_is_rechecked_on_the_short_ladder() {
-        let base = Duration::from_secs(INTERVAL_SECS);
+        // A base longer than every rung, where the ladder shows: at the shipped
+        // two-minute base every rung is the base
+        // (`the_in_flight_ladder_never_outwaits_the_ordinary_one`).
+        let base = Duration::from_secs(10 * 60);
         let mut c = Cadence::new(base);
         c.succeeded(0);
         assert_eq!(
@@ -756,7 +852,7 @@ mod tests {
             .collect();
         assert_eq!(
             waits,
-            [120, 240, 480, INTERVAL_SECS].map(Duration::from_secs),
+            [120, 240, 480, 600].map(Duration::from_secs),
             "2, 4, 8 minutes, then the interval"
         );
         c.succeeded(u32::MAX);
@@ -900,8 +996,8 @@ mod tests {
         }
         assert_eq!(
             c.nominal(),
-            anon * MAX_BACKOFF_INTERVALS,
-            "and it climbs to the RELATIVE ceiling, above the absolute 15-minute one"
+            MAX_BACKOFF.max(anon * MAX_BACKOFF_INTERVALS),
+            "and it climbs to the ceiling"
         );
         c.succeeded(0);
         assert_eq!(c.nominal(), anon, "recovery snaps back to the base");
@@ -948,7 +1044,11 @@ mod tests {
         let now = Instant::now();
         let mut c = Cadence::new(anon);
         c.hold_until(now + Duration::from_secs(10 * 3600));
-        assert_eq!(c.nominal_at(now), anon * MAX_BACKOFF_INTERVALS, "capped");
+        assert_eq!(
+            c.nominal_at(now),
+            MAX_BACKOFF.max(anon * MAX_BACKOFF_INTERVALS),
+            "capped"
+        );
         c.succeeded(0);
         assert_eq!(c.nominal_at(now), anon, "a success clears the hold");
         c.hold_until(now + Duration::from_secs(600));

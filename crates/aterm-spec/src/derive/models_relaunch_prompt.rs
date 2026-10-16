@@ -178,6 +178,7 @@ pub fn relaunch_prompt_read_model() -> Model {
 /// stays unfair. Broken by `ElsewhereReadAsTyping` alone — tab #1.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
+#[crate::liveness(crate::derive::relaunch_prompt_read_model)]
 pub fn relaunch_prompt_read_liveness() -> Liveness {
     Liveness {
         name: "APromptNobodyKeyedIsTypedAt",

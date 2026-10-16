@@ -153,7 +153,7 @@ fn scrollback_storage_memory_budget() {
 fn scrollback_storage_memory_line_limit() {
     let mut storage = ScrollbackStorage::default();
 
-    // #7929: the default is a bounded cap, not `None`.
+    // The default is a bounded cap, not `None`.
     assert_eq!(storage.line_limit(), Some(DEFAULT_LINE_LIMIT));
 
     storage.set_line_limit(Some(1000));
@@ -323,7 +323,7 @@ fn scrollback_storage_disk_memory_budget() {
     assert_eq!(storage.memory_budget(), 50_000_000);
 }
 
-// --- checkpoint_snapshot_fast tests (#5946) ---
+// --- checkpoint_snapshot_fast tests ---
 
 #[test]
 fn checkpoint_snapshot_fast_all_hot_preserves_lines() {
@@ -349,11 +349,8 @@ fn checkpoint_snapshot_fast_all_hot_preserves_lines() {
 
 #[test]
 fn checkpoint_snapshot_fast_skips_cold_tier_lines() {
-    // Push enough lines to fill hot → warm → cold, then verify the fast
-    // snapshot contains only hot + warm lines (cold lines excluded).
-    //
-    // Tier config: hot=4, warm=8, block_size=4, budget=10MB
-    // Push 20 lines: cold gets ≥8 lines, warm gets up to 8, hot gets remainder.
+    // hot=4, warm=8, block_size=4: 20 lines fill all three tiers, and the fast
+    // snapshot holds only the hot + warm lines.
     let sb = Scrollback::with_block_size(4, 8, 10_000_000, 4);
     let mut storage: ScrollbackStorage = sb.into();
 
@@ -381,7 +378,7 @@ fn checkpoint_snapshot_fast_skips_cold_tier_lines() {
     let expected_fast_lines = counts.hot + counts.warm;
     assert_eq!(fast_snapshot.line_count(), expected_fast_lines);
 
-    // The fast snapshot should contain the MOST RECENT lines (hot + warm),
+    // The fast snapshot should contain the most recent lines (hot + warm),
     // which are the lines at the end of the original storage.
     let cold_count = counts.cold;
     for i in 0..expected_fast_lines {
@@ -460,15 +457,10 @@ fn checkpoint_snapshot_fast_disk_backed_skips_cold() {
     );
 }
 
-// --- Warm block quarantine tests (#5947) ---
+// --- Warm block quarantine tests ---
 
-/// Corrupted warm block is quarantined (dropped) after QUARANTINE_THRESHOLD
-/// consecutive failed eviction attempts, and its line count is subtracted.
-///
-/// Scenario: inject a corrupt warm block at the front of warm, then push
-/// lines that trigger hot→warm promotion (which evicts the corrupt block).
-/// After 3 promotions, the corrupt block should be quarantined and its lines
-/// dropped from the total count.
+/// A corrupt warm block is quarantined after QUARANTINE_THRESHOLD failed
+/// eviction attempts, and its lines leave the count.
 #[test]
 fn test_corrupt_warm_block_quarantined_after_threshold() {
     // hot=4, warm_limit=4, block_size=4, budget=10MB (generous).
@@ -489,11 +481,8 @@ fn test_corrupt_warm_block_quarantined_after_threshold() {
     let count_after_inject = sb.line_count();
     assert_eq!(count_after_inject, 18);
 
-    // Push 3 batches of 4 lines. Each batch fills hot (4 lines), triggering
-    // promote_hot_to_warm, which evicts the corrupt block from warm.
-    // Eviction 1: decompress() fails (failures=1), push back, return false.
-    // Eviction 2: decompress() fails (failures=2), push back, return false.
-    // Eviction 3: decompress() fails (failures=3), quarantined! Block dropped, line_count -= 10.
+    // Push 3 batches of 4 lines: each fills hot, and its promotion tries to
+    // evict the corrupt block. The third failed decode quarantines it.
     for batch in 0..3 {
         for i in 0..4 {
             sb.push_str(&format!("batch{batch}-{i}"));
@@ -564,11 +553,8 @@ fn test_iteration_complete_after_quarantine() {
     );
 }
 
-/// Line limit enforcement recovers after a corrupt warm block is quarantined.
-///
-/// When a corrupt block sits at the front of warm, truncation may fail because
-/// it needs to decompress the boundary block. After the block is quarantined
-/// (dropped via eviction), the line limit is re-enforced on subsequent pushes.
+/// The line limit is enforced again once a corrupt warm block, which blocked
+/// truncation at the boundary, is quarantined.
 #[test]
 fn test_line_limit_enforced_after_quarantine() {
     // hot=4, warm_limit=4, block_size=4, budget=10MB.
@@ -609,9 +595,7 @@ fn test_line_limit_enforced_after_quarantine() {
     );
 }
 
-/// Regression (#5950): hot-tier lines are returned as Cow::Borrowed (zero-copy),
-/// warm-tier lines as Cow::Owned (decompressed). Verifies the Cow variant
-/// matches the expected tier for each access.
+/// Hot-tier lines come back as `Cow::Borrowed`, warm-tier lines as `Cow::Owned`.
 #[test]
 fn get_line_returns_borrowed_for_hot_tier() {
     use std::borrow::Cow;
@@ -657,7 +641,7 @@ fn get_line_returns_borrowed_for_hot_tier() {
 }
 
 // =========================================================================
-// Streaming-iterator parity oracles (ST-6)
+// Streaming-iterator parity oracles
 // =========================================================================
 
 fn streaming_parity_line(i: u16) -> Line {
@@ -687,11 +671,10 @@ fn streaming_parity_line(i: u16) -> Line {
     line
 }
 
-/// Differential oracle: the block-streaming forward iterator must yield
-/// EXACTLY what a per-line `get_line` walk yields, over a store populated in
-/// all three tiers and additionally front-truncated (non-zero front offsets
-/// are the trickiest segment-slicing case). Serialized comparisons preserve
-/// text, styles, links/IDs, underline colors and wrap flags, not just text.
+/// Differential oracle: the block-streaming forward iterator yields exactly
+/// what a per-line `get_line` walk yields, over all three tiers and after a
+/// front truncation (non-zero front offsets). Serialized comparisons cover
+/// styles, links/IDs, underline colours and wrap flags, not just text.
 #[test]
 fn streaming_iter_matches_get_line_walk_memory() {
     // Small limits force all three tiers + multiple blocks/pages.
@@ -744,8 +727,8 @@ fn streaming_iter_matches_get_line_walk_memory() {
     assert_eq!(via_storage, original[47..]);
 }
 
-/// Corrupt-segment parity: a corrupt warm block is skipped WHOLE, and
-/// `skipped_lines()` reports exactly the block's line count (#5947).
+/// A corrupt warm block is skipped whole, and `skipped_lines()` reports exactly
+/// its line count.
 #[test]
 fn streaming_iter_skips_corrupt_block_with_same_totals() {
     let mut sb = Scrollback::with_block_size(4, 12, 10_000_000, 4);
@@ -770,9 +753,8 @@ fn streaming_iter_skips_corrupt_block_with_same_totals() {
     );
 }
 
-/// Disk-backed twin of the parity oracle: cold pages live in the `.dtrm`
-/// file, and the streaming walk must match the per-line walk across the
-/// disk/warm/hot boundaries, including after front truncation.
+/// Disk-backed twin of the parity oracle: cold pages live in the `.dtrm` file,
+/// across the disk/warm/hot boundaries and after front truncation.
 #[cfg(feature = "disk-tier")]
 #[test]
 fn streaming_iter_matches_get_line_walk_disk() {
@@ -813,10 +795,10 @@ fn streaming_iter_matches_get_line_walk_disk() {
 }
 
 // ---------------------------------------------------------------------------
-// DENSE walk (`ScrollbackStorage::dense_from`) — conformance against the
-// per-line oracle. Product readers key every line by its absolute row, so the
-// dense walk must yield EXACTLY one item per logical line: `Some` wherever
-// `get_line` answers a line, `None` wherever it errors or answers nothing.
+// Dense walk (`ScrollbackStorage::dense_from`) against the per-line oracle.
+// Product readers key every line by its absolute row, so the dense walk yields
+// exactly one item per logical line: `Some` wherever `get_line` answers a line,
+// `None` wherever it errors or answers nothing.
 // ---------------------------------------------------------------------------
 
 /// The per-line oracle: what `get_line(i)` answers for every `i` from `start`,
@@ -838,10 +820,8 @@ fn dense_walk(storage: &ScrollbackStorage, start: usize) -> Vec<Option<Vec<u8>>>
     iter.map(|l| l.map(|l| l.serialize())).collect()
 }
 
-/// Every start position — tier boundaries, block interiors, the hot tail —
-/// over a store populated in all three tiers, before and after a
-/// non-block-aligned front truncation (the non-zero front offsets are where
-/// segment slicing can go wrong).
+/// Every start position (tier boundaries, block interiors, the hot tail) over
+/// all three tiers, before and after a non-block-aligned front truncation.
 #[test]
 fn dense_walk_matches_per_line_oracle_across_tiers_and_front_truncation() {
     let mut sb = Scrollback::with_block_size(4, 12, 10_000_000, 4);
@@ -866,8 +846,8 @@ fn dense_walk_matches_per_line_oracle_across_tiers_and_front_truncation() {
     }
 }
 
-/// The hot tail is BORROWED — the dense walk clones no hot line (the
-/// streaming `iter()` clones each one into a one-line segment).
+/// The hot tail is borrowed: the dense walk clones no hot line (the streaming
+/// `iter()` clones each one into a one-line segment).
 #[test]
 fn dense_walk_borrows_hot_lines() {
     let mut sb = Scrollback::with_block_size(4, 12, 10_000_000, 4);
@@ -889,15 +869,12 @@ fn dense_walk_borrows_hot_lines() {
     }
 }
 
-/// CORRUPTION + GAP: a corrupt warm block sits between the cold tier and the
-/// healthy warm blocks. The dense walk yields one placeholder per line it
-/// spans and keeps every later line on its own coordinate, for every start —
-/// including starts INSIDE the corrupt block.
+/// A corrupt warm block between the cold tier and the healthy warm blocks: the
+/// dense walk yields one placeholder per line it spans and keeps every later
+/// line on its own coordinate, for every start, including starts inside it.
 ///
-/// Negative control: the skipping streaming walk, keyed the way the product
-/// used to key lines (by position), puts later lines on the wrong rows — the
-/// exact defect the dense reader exists to rule out, so this test could not
-/// pass against a reader that skipped.
+/// Negative control: keying the skipping streaming walk by position puts later
+/// lines on the wrong rows.
 #[test]
 fn dense_walk_yields_placeholders_for_a_corrupt_segment_and_keeps_coordinates() {
     let mut sb = Scrollback::with_block_size(4, 12, 10_000_000, 4);
@@ -928,7 +905,7 @@ fn dense_walk_yields_placeholders_for_a_corrupt_segment_and_keeps_coordinates() 
         "the placeholders sit exactly on the corrupt block's rows"
     );
 
-    // Negative control: position-keying the SKIPPING walk misplaces rows.
+    // Negative control: position-keying the skipping walk misplaces rows.
     let skipping: Vec<_> = storage.iter().map(|l| Some(l.serialize())).collect();
     let oracle = dense_oracle(&storage, 0);
     assert_eq!(skipping.len(), total - corrupt_lines);

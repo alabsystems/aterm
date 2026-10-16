@@ -18,7 +18,7 @@
 //! **Placement decides what is the vendor's; the table decides what kind.**
 //! A `⎿` block that opens the last thing said is read as a vendor row by the
 //! OWNER WALK (`phase::block_is_vendors`), measured on Claude Code 2.1.294 in
-//! `tools/real-claude-lab`:
+//! the real-Claude lab:
 //! * Claude Code draws its OWN `⎿` rows at column 2 (`  ⎿  …`); a tool's
 //!   output continues at column 5, so a `⎿` the output prints — after a blank
 //!   row of it or not, behind carriage returns, tabs and cursor moves — is at
@@ -82,18 +82,10 @@
 //! command's output (main read it with no owner, behind the command's blank
 //! row) is the first row under its call: no wall.
 //!
-//! H6-HARNESS-1 (2026-10-08) is why: the rule had been "the vendor's unless
-//! the owner is `⏺ Name(…)`", and Claude Code 2.1.294 draws an MCP call `⏺
-//! github - get_issue (MCP)(…)` (verbose output) and a shell-mode command `!
-//! cat notes.txt`. Measured in `tools/real-claude-lab` with nothing said
-//! after either, the first row of the tool's output was read as the wall
-//! (`agent=wall:overloaded`, `agent=wall:auth`) and the harness typed
-//! `/login` into the session; its API-error act typed the output back as a
-//! user turn. Two screen-only fixes were tried and never landed: an
-//! allowlist of owners missed the real walls under a collapsed group and a
-//! hook summary, and a column rule that failed closed under MCP calls, hook
-//! rows and blank rows missed the real walls under a prompt's second
-//! paragraph, after an MCP call and under a long output (each measured).
+//! H6-HARNESS-1 (2026-10-08) is why: under Claude Code 2.1.294's MCP calls and
+//! `!` commands the old rule ("the vendor's unless the owner is `⏺ Name(…)`")
+//! read a tool's output as a wall, and the harness typed `/login` into the
+//! session (measured in the real-Claude lab).
 //!
 //! **Claude Code 2.1.283 draws an API error as a message of its own** — the
 //! `⏺` in column 0, the text from column 2 (its `lu()`), never under `⎿` —
@@ -218,19 +210,28 @@ pub enum ApiCause {
 }
 
 impl WallKind {
-    /// The lowercase word the CLI prints (`wall:overloaded`).
+    /// The lowercase word the CLI prints after `wall:` (`overloaded`).
     #[must_use]
     pub fn name(&self) -> &'static str {
+        let wire = self.wire();
+        wire.strip_prefix("wall:").unwrap_or(wire)
+    }
+
+    /// The whole word `status agent=` publishes for this wall: `wall:` and
+    /// [`Self::name`] (`wall:overloaded`). Static because a published
+    /// verdict word is.
+    #[must_use]
+    pub fn wire(&self) -> &'static str {
         match self {
-            WallKind::UsageSession => "usage-session",
-            WallKind::UsageWeekly => "usage-weekly",
-            WallKind::ModelBucket { .. } => "model-bucket",
-            WallKind::Spend => "spend",
-            WallKind::Context => "context",
-            WallKind::Auth => "auth",
-            WallKind::ApiError { .. } => "api-error",
-            WallKind::Overloaded => "overloaded",
-            WallKind::Memory => "memory",
+            WallKind::UsageSession => "wall:usage-session",
+            WallKind::UsageWeekly => "wall:usage-weekly",
+            WallKind::ModelBucket { .. } => "wall:model-bucket",
+            WallKind::Spend => "wall:spend",
+            WallKind::Context => "wall:context",
+            WallKind::Auth => "wall:auth",
+            WallKind::ApiError { .. } => "wall:api-error",
+            WallKind::Overloaded => "wall:overloaded",
+            WallKind::Memory => "wall:memory",
         }
     }
 
@@ -300,6 +301,22 @@ pub struct Wall {
     pub under_call: bool,
 }
 
+impl Wall {
+    /// A sign-in menu drawn INSTEAD of the composer, `rows[row]` its message
+    /// ([`WallKind::Auth`]): agy's and Muse Code's, whose options open a
+    /// browser and are never read.
+    pub(crate) fn sign_in(rows: &[String], row: usize) -> Self {
+        Self {
+            kind: WallKind::Auth,
+            message: crate::text::trim(&rows[row]).to_string(),
+            reset: None,
+            row,
+            placement: Placement::Banner,
+            under_call: false,
+        }
+    }
+}
+
 /// What one table row names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tag {
@@ -337,6 +354,18 @@ pub const PHRASES: &[(&str, Tag)] = &[
     ("fast mode", Tag::NotAWall),
     ("request was aborted", Tag::NotAWall),
     ("update installed", Tag::NotAWall),
+    // Usage credits carry the session past its limit: the vendor's own list of
+    // those notices (the 2.1.300 bundle; the first two and the fourth measured
+    // in the lab), and its per-model ones. Work goes on under each, so none is a
+    // wall: `crate::credits` reads them, for the record.
+    ("you're now using usage credits", Tag::NotAWall),
+    ("now using usage credits", Tag::NotAWall),
+    ("you're now using your usage allocation", Tag::NotAWall),
+    ("now using your usage allocation", Tag::NotAWall),
+    ("you're now using extra usage", Tag::NotAWall),
+    ("now using extra usage", Tag::NotAWall),
+    ("is drawing from usage credits", Tag::NotAWall),
+    ("is now using usage credits instead", Tag::NotAWall),
     // The auto-continue lifecycle's notices that are NOT a
     // standing limit (2.1.283/284): the reset came (`Usage limit reset ·
     // continuing automatically`, `Usage limit available again · continuing
@@ -763,6 +792,57 @@ pub fn login_restored(rows: &[String]) -> bool {
             .is_some_and(|r| crate::text::trim_end(r) == "❯ /login")
 }
 
+/// How many rows above the composer's top rule a notification is looked
+/// for in ([`login_expires_in`]): Claude Code parks its notifications on the
+/// row right above it, right-aligned (`✔ Update installed · Restart to
+/// update`, MEASURED in the `idle-after-limit-and-model-switch` capture), and
+/// the slack is a row or two of a banner under it.
+const NOTICE_ROWS: usize = 3;
+
+/// THE DAYS CLAUDE CODE SAYS THE STORED LOGIN HAS LEFT — its own `Your login
+/// expires in N days · run /login to renew` (anchors `login.expires_in`,
+/// `login.renew_hint`; READ in the 2.1.300 bundle, N from 1 to 3) — or
+/// `None`. Read where Claude Code draws a notification and nowhere a
+/// conversation is: the right segment of a row just above the composer's top
+/// rule ([`NOTICE_ROWS`]) or under its bottom rule (the footer, where the
+/// bundle draws the same words at a day or less), starting at the hint
+/// column or against the right edge as a notification does, after at most a
+/// status glyph, and followed by `day`/`days` and the renew hint (or the
+/// row's end, where the width cut it). A reply (`⏺`), a tool's output
+/// (`⎿`), a tool row or a person's words quoting the sentence are none of
+/// those rows' right segments, and read `None`. SYNTHETIC: the notice's
+/// placement on a screen was NOT measured (no lab login can be seeded with an
+/// end); it is read where the measured notification of its kind is drawn.
+#[must_use]
+pub fn login_expires_in(rows: &[String]) -> Option<u32> {
+    use crate::phase::{HINT_COLUMN, composer_frame, is_against_right_edge};
+    let head = const { crate::anchors::anchor_text("login.expires_in") };
+    let hint = const { crate::anchors::anchor_text("login.renew_hint") };
+    let frame = composer_frame(rows)?;
+    let width = crate::text::trim_end(&rows[frame.bottom]).chars().count();
+    let above = frame.top.saturating_sub(NOTICE_ROWS)..frame.top;
+    let footer = frame.bottom + 1..rows.len();
+    above.chain(footer).find_map(|i| {
+        let row = crate::text::trim_end(&rows[i]);
+        let (column, segment) = right_segment(row);
+        if column < HINT_COLUMN && !is_against_right_edge(row, width) {
+            return None;
+        }
+        let at = segment.find(head)?;
+        let glyph = &segment[..at];
+        if glyph.chars().count() > 2 || glyph.chars().any(char::is_alphanumeric) {
+            return None;
+        }
+        let rest = &segment[at + head.len()..];
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        let days: u32 = rest[..digits].parse().ok()?;
+        let rest = rest[digits..].strip_prefix(" day")?;
+        let rest = rest.strip_prefix('s').unwrap_or(rest);
+        let rest = rest.trim_start_matches([' ', '\u{b7}']);
+        (rest.is_empty() || rest.starts_with(hint)).then_some(days)
+    })
+}
+
 /// How Claude Code's OWN AUTO-CONTINUE of a usage limit ended, by the
 /// vendor's word on the screen ([`auto_continue_end`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -777,6 +857,14 @@ pub enum AutoContinue {
     /// reset that passed with nothing sent (`Usage limit has reset · press
     /// enter to continue`).
     Unkept,
+    /// It has not ended: its COUNTDOWN is still drawn (`Continuing
+    /// automatically at 3:15pm · esc to cancel`, `Continuing shortly · esc to
+    /// cancel` — the footer's row under the banner from 2.1.295 on, a
+    /// notification under the wall's row in 2.1.284). Where no limit's notice
+    /// is read, this is what says the vendor still goes on by itself; where
+    /// nothing is drawn, it does not: a `/resume` or a `/clear` drops the
+    /// countdown without a word (W4 of ATERM-KI-1015-1, the lab on 2.1.300).
+    Armed,
 }
 
 /// What the screen last says of Claude Code's own auto-continue, once the
@@ -799,7 +887,10 @@ pub enum AutoContinue {
 /// The walk up ends at the turn's own `❯` row — a person's `/usage` after the
 /// cancel is a new turn, and what came before it is that turn's history — and
 /// at a limit notice: a limit below the vendor's word stands (its
-/// continuation met the limit again). `None` when nothing says.
+/// continuation met the limit again). A countdown still drawn there is
+/// [`AutoContinue::Armed`]: not ended. `None` when nothing says — and once a
+/// countdown was armed, nothing drawn says it was dropped (a `/resume`, a
+/// `/clear`: W4 of ATERM-KI-1015-1).
 #[must_use]
 pub fn auto_continue_end(rows: &[String]) -> Option<AutoContinue> {
     use crate::phase::{footer_end, line_at};
@@ -830,8 +921,8 @@ pub fn auto_continue_end(rows: &[String]) -> Option<AutoContinue> {
     None
 }
 
-/// The screen's NEWEST USAGE LIMIT NOTICE and what was served since it
-/// ([`since_limit`]).
+/// The screen's NEWEST USAGE LIMIT NOTICE and what was served, or chosen,
+/// since it ([`since_limit`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SinceLimit {
     /// The notice's kind ([`classify_wall`]).
@@ -842,9 +933,19 @@ pub struct SinceLimit {
     /// A TURN WAS SERVED since it: a person's prompt below it (a `❯` row in
     /// column zero with text, no local command — `❯ /usage`, `❯ /model`, a
     /// `/resume`: no turn) with the model's reply drawn under that prompt (a
-    /// `⏺` row in column zero that is no notice of the vendor's: the model's
-    /// words or a tool's call).
+    /// `⏺` row in column zero, `●` off macOS, that is no notice of the
+    /// vendor's: the model's words or a tool's call).
     pub served: bool,
+    /// A MODEL WAS CHOSEN since it: a person's `/model` below it (`❯ /model`,
+    /// `❯ /model opus`) with its result drawn under that prompt (`⎿  Set model
+    /// to …`, the anchor `model.set`). This alone says nothing about whether
+    /// the choice left the model family a bucket limits.
+    pub model_set: bool,
+    /// The NEWEST completed `/model` choice's words after `Set model to `.
+    /// Kept without interpreting model names: a caller can compare the chosen
+    /// family with the bucket's, and an unknown choice remains unknown rather
+    /// than falling back to an older choice it recognizes.
+    pub chosen_model: Option<String>,
 }
 
 /// THE NEWEST USAGE LIMIT NOTICE THE SCREEN DRAWS and whether a turn was
@@ -880,6 +981,19 @@ pub fn since_limit(rows: &[String]) -> Option<SinceLimit> {
     newest_limit(rows).map(|newest| newest.since)
 }
 
+/// A LINE OF THE MODEL'S: `line`, opened by `row`, a row the caller found in
+/// column 0 ([`since_limit`]), says `⏺` — `●` where the
+/// platform draws that (Claude Code draws `●` off macOS), never the session
+/// survey ([`crate::phase::is_survey`]) — and a reply or a tool's call, never
+/// a notice of the vendor's ([`classify_wall`], [`auto_continue_end`]'s
+/// words).
+fn models_line(row: &str, line: &str) -> bool {
+    !crate::phase::is_survey(row)
+        && crate::text::trim(line)
+            .strip_prefix(['⏺', '●'])
+            .is_some_and(|said| classify_wall(said).is_none() && auto_continue_said(said).is_none())
+}
+
 /// What [`newest_limit`] read: the notice ([`SinceLimit`]), the row its line
 /// opens on, its words as said (the item, its leading glyph dropped), and the
 /// row its `/goal` echo opens on below it, if one took its reset from it.
@@ -903,31 +1017,48 @@ fn newest_limit(rows: &[String]) -> Option<Newest> {
     // A reply of the model's below the rows walked so far, and a prompt
     // that drew one.
     let (mut replied, mut served) = (false, false);
+    // A model's choice below the rows walked so far (`⎿  Set model to …`),
+    // and a `/model` that drew one.
+    let mut set: Option<String> = None;
+    let (mut model_set, mut chosen_model) = (false, None);
     // The newest limit line met, where it named no reset: an ECHO of the
     // notice above it (`⏺ Goal paused · usage limit reached · send a message
     // after it resets to continue`), whose reset the notice names. The walk
     // goes on up to it, through no prompt.
     let mut echo: Option<(WallKind, usize, String)> = None;
-    let echoed = |(kind, row, message): (WallKind, usize, String), served| Newest {
-        since: SinceLimit {
-            kind,
-            reset: None,
-            served,
-        },
-        row,
-        message,
-        echo: None,
-    };
+    let echoed =
+        |(kind, row, message): (WallKind, usize, String), served, model_set, chosen_model| Newest {
+            since: SinceLimit {
+                kind,
+                reset: None,
+                served,
+                model_set,
+                chosen_model,
+            },
+            row,
+            message,
+            echo: None,
+        };
     for (i, row) in rows[..frame.top].iter().enumerate().rev() {
         let column0 = crate::phase::leading_spaces(row) == 0;
         let text = crate::text::trim(row);
         if column0 && let Some(prompt) = text.strip_prefix('❯') {
             if let Some(echo) = echo {
-                return Some(echoed(echo, served));
+                return Some(echoed(echo, served, model_set, chosen_model));
             }
             let prompt = crate::text::trim(prompt);
             served |= replied && !prompt.is_empty() && !prompt.starts_with('/');
-            replied = false;
+            let chose = set.is_some()
+                && prompt
+                    .strip_prefix("/model")
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '));
+            if chose {
+                model_set = true;
+                if chosen_model.is_none() {
+                    chosen_model = set.take();
+                }
+            }
+            (replied, set) = (false, None);
             continue;
         }
         let (_, line) = line_at(rows, i, frame.top, width);
@@ -943,6 +1074,8 @@ fn newest_limit(rows: &[String]) -> Option<Newest> {
                             kind,
                             reset: Some(reset),
                             served,
+                            model_set,
+                            chosen_model,
                         },
                         row: i,
                         message: words(item),
@@ -956,15 +1089,108 @@ fn newest_limit(rows: &[String]) -> Option<Newest> {
             }
         }
         if echo.is_none()
-            && column0
-            && let Some(said) = crate::text::trim(&line).strip_prefix('⏺')
-            && classify_wall(said).is_none()
-            && auto_continue_said(said).is_none()
+            && let Some(chosen) = crate::text::trim(&line).strip_prefix('⎿').and_then(|out| {
+                crate::text::trim_start(out).strip_prefix(crate::anchors::anchor("model.set"))
+            })
         {
+            set.get_or_insert_with(|| crate::text::trim(chosen).to_string());
+        }
+        if echo.is_none() && column0 && models_line(row, &line) {
             replied = true;
         }
     }
-    echo.map(|echo| echoed(echo, served))
+    echo.map(|echo| echoed(echo, served, model_set, chosen_model))
+}
+
+/// The words a GENERIC usage limit notice opens with: Claude Code 2.1.295 and
+/// later draw every subscription limit's footer banner so (`⚠ Usage limit
+/// reached · limit resets 3:34pm`), and its auto-continue's transcript row
+/// (`⏺ Usage limit reached · continuing automatically at 3:34pm · …`), whatever
+/// the limit is — the five-hour window, the weekly one, a model's bucket.
+/// Only the turn's own `⎿` notice names which (`You've hit your Sonnet limit ·
+/// resets …`).
+const GENERIC_LIMIT: &str = "usage limit reached";
+
+/// Whether `item` is a GENERIC usage limit notice ([`GENERIC_LIMIT`]): it
+/// names no window and no bucket.
+fn generic_limit(item: &str) -> bool {
+    let words = item.trim_start_matches(|c: char| !c.is_alphanumeric());
+    strip_ci(words, GENERIC_LIMIT).is_some()
+}
+
+/// A reset as its notice prints it, its zone left out (the footer's banner
+/// names none: `Oct 17 at 3:34pm`; the turn's notice does: `Oct 17 at 3:34pm
+/// (America/Los_Angeles)`), so that two notices of one limit compare equal.
+fn reset_clock_words(reset: &str) -> String {
+    let cut = reset.find('(').unwrap_or(reset.len());
+    crate::text::trim(&reset[..cut]).to_ascii_lowercase()
+}
+
+/// THE WALL A GENERIC BANNER STANDS FOR (W3 of ATERM-KI-1015-1, the lab on
+/// Claude Code 2.1.300, 2026-10-15): `found` is the notice the reader placed
+/// (`crate::phase::notice`'s placement: the footer, a banner) and, where it
+/// is the generic `Usage limit reached` ([`generic_limit`]), the KIND is the
+/// TURN'S OWN NOTICE's — the newest limit notice above the composer that
+/// names its limit, read as [`since_limit`] reads one (each row as the line
+/// it opens, across the rows Ink wrapped it onto), up through local commands
+/// (`❯ /rate-limit-options`, which Claude Code types itself to open its
+/// dialog) but no person's prompt, and naming the SAME reset as `found` (the
+/// zone aside): the notice of this limit, never an older one a `/resume`d
+/// history redraws. Its words then open the message, the banner's follow
+/// (`You've hit your Sonnet limit · resets … — ⚠ Usage limit reached · …`),
+/// so the bucket's model is read off it and a loop that takes the wall up
+/// from its ledger row classifies it the same. Measured before: a Sonnet
+/// bucket's banner read `usage-session`, the default `model_fallback =
+/// "opus"` never ran, and the session waited days for the bucket's reset; a
+/// weekly limit read `usage-session` too. `found` as it is anywhere else: a
+/// banner that names its limit, a turn's notice of the same kind, one naming
+/// another reset or none, a screen with no composer.
+pub(crate) fn named_by_the_turn(
+    rows: &[String],
+    found: Wall,
+    classify: &dyn Fn(&str) -> Option<WallKind>,
+) -> Wall {
+    use crate::phase::line_at;
+    if !generic_limit(&found.message) {
+        return found;
+    }
+    let Some(said) = found.reset.as_deref().map(reset_clock_words) else {
+        return found;
+    };
+    let Some(frame) = crate::phase::composer_frame(rows) else {
+        return found;
+    };
+    let width = crate::text::trim_end(&rows[frame.bottom]).chars().count();
+    let top = frame.top.min(found.row);
+    for (i, row) in rows[..top].iter().enumerate().rev() {
+        let column0 = crate::phase::leading_spaces(row) == 0;
+        if column0 && let Some(prompt) = crate::text::trim(row).strip_prefix('❯') {
+            let prompt = crate::text::trim(prompt);
+            if prompt.is_empty() || prompt.starts_with('/') {
+                continue;
+            }
+            return found;
+        }
+        let (_, line) = line_at(rows, i, top, width);
+        let Some((kind, item)) = gapped_items(&line).find_map(|item| {
+            classify(item)
+                .filter(|k| k.reads_limited() && !generic_limit(item))
+                .map(|k| (k, item))
+        }) else {
+            continue;
+        };
+        let same = crate::phase::notice_reset(item).is_some_and(|r| reset_clock_words(&r) == said);
+        if !same || kind == found.kind {
+            return found;
+        }
+        let words = item.trim_start_matches(|c: char| !c.is_alphanumeric());
+        return Wall {
+            kind,
+            message: format!("{words} \u{2014} {}", found.message),
+            ..found
+        };
+    }
+    found
 }
 
 /// THE LIMIT A CANCEL LEFT ON THE SCREEN: the vendor's own word that its
@@ -1106,6 +1332,11 @@ fn auto_continue_said(item: &str) -> Option<AutoContinue> {
     .any(|id| opens(id))
     {
         Some(AutoContinue::Unkept)
+    } else if opens("wall.auto_continue") || strip_ci(&text, "continuing shortly").is_some() {
+        // The countdown's own row OPENS with its words; the transcript's
+        // `Usage limit reached · continuing automatically at …` is the
+        // limit's notice, and the walk stops there.
+        Some(AutoContinue::Armed)
     } else {
         None
     }
@@ -1236,7 +1467,7 @@ pub fn memory_wall(rows: &[String]) -> Option<Wall> {
 /// person's words are the one text the live zone holds that can quote the
 /// banner (the 2026-09-24 incident's draft quoted it word for word), so
 /// they are never read as it, however narrow the window.
-fn in_queued_message(rows: &[String], status: usize, i: usize) -> bool {
+pub(crate) fn in_queued_message(rows: &[String], status: usize, i: usize) -> bool {
     (status + 1..=i)
         .rev()
         .map(|j| rows[j].as_str())
@@ -1247,7 +1478,7 @@ fn in_queued_message(rows: &[String], status: usize, i: usize) -> bool {
 /// A row's right segment and the column it starts at: the text after its
 /// last run of two or more spaces, or the whole row (its indent skipped)
 /// when it has none. `row` is trimmed at the end.
-fn right_segment(row: &str) -> (usize, &str) {
+pub(crate) fn right_segment(row: &str) -> (usize, &str) {
     match row.rfind("  ") {
         Some(gap) => (row[..gap + 2].chars().count(), &row[gap + 2..]),
         None => {
@@ -2086,7 +2317,7 @@ mod tests {
     }
 
     /// The owner walk on the screens it was measured on (Claude Code 2.1.294,
-    /// `tools/real-claude-lab`, 2026-10-08). WALLS, each a real context wall
+    /// the real-Claude lab, 2026-10-08). WALLS, each a real context wall
     /// read from the gutter: under a collapsed tool group, under a Stop
     /// hook's summary, under a Bash call's output (plain, holding a blank
     /// row, a PostToolUse hook's row between), under a prompt's second
@@ -2461,14 +2692,15 @@ mod tests {
     }
 
     /// HOW THE VENDOR'S OWN AUTO-CONTINUE ENDED, on the lab's captures of
-    /// Claude Code 2.1.296: armed, the wall stands and nothing ended it; after
+    /// Claude Code 2.1.296: armed, the wall stands and its countdown is drawn
+    /// (`Armed`: nothing ended it); after
     /// Esc on its countdown, unkept — the transcript's row and the footer's
     /// notification each say so alone; past the reset, fired. The lifecycle's
     /// other words in the cancelled row's place read as theirs. NEGATIVE
     /// CONTROLS: a turn's `❯` row under the word makes it history (a person's
     /// `/usage` after the cancel); a limit notice under it stands (the
     /// vendor's continuation met the limit again); the armed countdown is no
-    /// end; a screen with no composer says nothing.
+    /// end (`Armed`); a screen with no composer says nothing.
     #[test]
     fn the_auto_continues_end_is_read_off_the_vendors_word() {
         use crate::prompt::fixtures::{
@@ -2480,7 +2712,7 @@ mod tests {
         let cancelled = screen(WALL_SESSION_AUTO_CONTINUE_CANCELLED_MEASURED);
         let resumed = screen(WALL_SESSION_RESUMED_BY_ITSELF_MEASURED);
         assert!(wall(&armed).is_some());
-        assert_eq!(auto_continue_end(&armed), None);
+        assert_eq!(auto_continue_end(&armed), Some(AutoContinue::Armed));
         for left in [&cancelled, &resumed] {
             assert_eq!(wall(left), None);
         }
@@ -2555,15 +2787,61 @@ mod tests {
             .map(str::to_string),
         );
         assert_eq!(auto_continue_end(&again), None);
-        // The countdown alone is no end, and no composer says nothing.
+        // The countdown alone is no end: it stands. No composer says nothing.
         let mut countdown = only_transcript.clone();
         countdown[cancel_row] = "  Continuing automatically at 3:50pm · esc to cancel".to_string();
-        assert_eq!(auto_continue_end(&countdown), None);
+        assert_eq!(auto_continue_end(&countdown), Some(AutoContinue::Armed));
         let top = cancelled
             .iter()
             .rposition(|r| r.starts_with('─'))
             .expect("rule");
         assert_eq!(auto_continue_end(&cancelled[..top]), None);
+    }
+
+    /// WHAT A `/RESUME` AT AN ARMED LIMIT LEAVES OF ITS COUNTDOWN (W1 and W4
+    /// of ATERM-KI-1015-1, the lab on Claude Code 2.1.300): armed, the
+    /// countdown is drawn (`Armed`); after a `/resume`, the history redrawn
+    /// says what the vendor did with ITS OWN limit — `Fired` under that
+    /// limit's notice (`8:48am`), which names it, not the armed one
+    /// (`9:19am`) — or nothing at all, where the history holds no limit: the
+    /// countdown dropped without a word. A `/clear` the same.
+    #[test]
+    fn a_resume_at_an_armed_limit_draws_no_countdown() {
+        use crate::prompt::fixtures::{
+            CLEARED_AT_ARMED_LIMIT_2_1_300, RESUMED_NO_LIMIT_AT_ARMED_LIMIT_2_1_300,
+            RESUMED_OLDER_LIMIT_CONTINUED_AT_ARMED_LIMIT_2_1_300,
+            WALL_SESSION_ARMED_CONVERSATION_B_2_1_300,
+        };
+        let armed = screen(WALL_SESSION_ARMED_CONVERSATION_B_2_1_300);
+        assert_eq!(
+            wall(&armed).and_then(|w| w.reset).as_deref(),
+            Some("9:19am")
+        );
+        assert_eq!(auto_continue_end(&armed), Some(AutoContinue::Armed));
+        let older = screen(RESUMED_OLDER_LIMIT_CONTINUED_AT_ARMED_LIMIT_2_1_300);
+        assert_eq!(wall(&older), None);
+        assert_eq!(auto_continue_end(&older), Some(AutoContinue::Fired));
+        assert_eq!(
+            since_limit(&older),
+            Some(SinceLimit {
+                kind: WallKind::UsageSession,
+                reset: Some("8:48am".to_string()),
+                served: false,
+                model_set: false,
+                chosen_model: None,
+            })
+        );
+        for dropped in [
+            RESUMED_NO_LIMIT_AT_ARMED_LIMIT_2_1_300,
+            CLEARED_AT_ARMED_LIMIT_2_1_300,
+        ] {
+            let rows = screen(dropped);
+            assert_eq!(
+                (wall(&rows), auto_continue_end(&rows), since_limit(&rows)),
+                (None, None, None),
+                "{rows:#?}"
+            );
+        }
     }
 
     /// THE NEWEST LIMIT AND A TURN SERVED SINCE IT, read off the screen's
@@ -2592,6 +2870,8 @@ mod tests {
                 kind,
                 reset: Some(reset.to_string()),
                 served,
+                model_set: false,
+                chosen_model: None,
             })
         };
         let turned = screen(WALL_SESSION_CANCELLED_THEN_PERSON_TURN_MEASURED);
@@ -2671,6 +2951,101 @@ mod tests {
         assert_eq!(since_limit(&turned[..top]), None);
     }
 
+    /// A MODEL CHOSEN SINCE THE NEWEST LIMIT is read off the screen's order
+    /// ([`SinceLimit::model_set`]): a person's `/model` below the notice, its
+    /// `⎿  Set model to …` under the prompt. Measured on Claude Code 2.1.28x
+    /// (the owner's tab): a Fable bucket's notice that names no reset, then
+    /// `❯ /model` and its result. CONSTRUCTED from the lab's 2.1.300 Sonnet
+    /// bucket (the countdown off the screen, `/model` and its result under
+    /// it): the bucket's notice and its reset. NEGATIVE CONTROLS, none
+    /// chosen: the armed bucket; the same result row under another local
+    /// command; a `/model` ABOVE the notice (chosen before the limit); the
+    /// words in a reply of the model's.
+    #[test]
+    fn a_model_chosen_since_the_newest_limit_is_read_off_the_screens_order() {
+        use crate::prompt::fixtures::{
+            IDLE_AFTER_LIMIT_AND_MODEL_SWITCH, WALL_SONNET_BUCKET_AUTO_CONTINUE_ARMED_2_1_300,
+            screen,
+        };
+        let measured = screen(IDLE_AFTER_LIMIT_AND_MODEL_SWITCH);
+        let read = since_limit(&measured).expect("the Fable bucket's notice");
+        assert_eq!(
+            (read.kind, read.reset, read.served, read.model_set),
+            (WallKind::ModelBucket { consent: false }, None, false, true)
+        );
+        assert_eq!(
+            read.chosen_model.as_deref(),
+            Some("Opus 5 (1M context) (default) and saved as your default for new sessions")
+        );
+        let armed = screen(WALL_SONNET_BUCKET_AUTO_CONTINUE_ARMED_2_1_300);
+        let reset = "Oct 17 at 4:20pm (America/Los_Angeles)";
+        let bucket = |model_set: bool| {
+            Some(SinceLimit {
+                kind: WallKind::ModelBucket { consent: false },
+                reset: Some(reset.to_string()),
+                served: false,
+                model_set,
+                chosen_model: model_set
+                    .then(|| "Opus 5.5 and saved as your default for new sessions".to_string()),
+            })
+        };
+        let set_row = "  ⎿  Set model to Opus 5.5 and saved as your default for new sessions";
+        let under = |prompt: &str, result: &str| {
+            let mut rows: Vec<String> = armed
+                .iter()
+                .filter(|r| {
+                    !r.contains("Usage limit reached") && !r.contains("Continuing automatically")
+                })
+                .cloned()
+                .collect();
+            let top = rows
+                .iter()
+                .position(|r| r.starts_with('─'))
+                .expect("the frame");
+            rows.splice(top..top, [prompt, result, ""].map(str::to_string));
+            rows
+        };
+        assert_eq!(since_limit(&under("❯ /model", set_row)), bucket(true));
+        assert_eq!(since_limit(&under("❯ /model opus", set_row)), bucket(true));
+        let mut twice = under("❯ /model", set_row);
+        let top = twice.iter().position(|r| r.starts_with('─')).unwrap();
+        twice.splice(
+            top..top,
+            ["❯ /model", "  ⎿  Set model to new-default", ""].map(str::to_string),
+        );
+        assert_eq!(
+            since_limit(&twice).and_then(|s| s.chosen_model),
+            Some("new-default".to_string()),
+            "the newest completed choice stands even when its model is unknown"
+        );
+        // NEGATIVE CONTROLS.
+        assert_eq!(since_limit(&armed), bucket(false));
+        assert_eq!(since_limit(&under("❯ /usage", set_row)), bucket(false));
+        assert_eq!(
+            since_limit(&under("❯ /models-list", set_row)),
+            bucket(false)
+        );
+        let notice = armed
+            .iter()
+            .position(|r| r.contains("You've hit your Sonnet limit"))
+            .expect("the notice");
+        let mut before = armed.clone();
+        before.splice(
+            notice - 1..notice - 1,
+            ["❯ /model", set_row, ""].map(str::to_string),
+        );
+        assert_eq!(since_limit(&before), bucket(false));
+        let quoted = under(
+            "❯ what did /model print?",
+            "⏺ It printed: Set model to Opus 5.5 and saved as your default.",
+        );
+        assert_eq!(
+            since_limit(&quoted).map(|s| s.model_set),
+            Some(false),
+            "{quoted:#?}"
+        );
+    }
+
     /// THE LIMIT A CANCEL LEFT is read as the wall its notice was (round 16's
     /// residual (a), measured on 2.1.296 and, at 26 columns, 2.1.299): the
     /// vendor's `Automatic continue cancelled` under the newest notice, nothing
@@ -2721,6 +3096,8 @@ mod tests {
                 kind: WallKind::UsageSession,
                 reset: Some("10:50am".to_string()),
                 served: false,
+                model_set: false,
+                chosen_model: None,
             })
         );
         let left = left_wall(&narrow).expect("the narrow cancel's limit");
@@ -2888,12 +3265,26 @@ mod tests {
             "Continuing automatically at 10:25am · esc to cancel",
             "10:25am",
         );
-        footer(
-            WALL_WEEKLY_AUTO_CONTINUE_ARMED_34_2_1_299,
-            "⚠ Usage limit reached · limit resets Oct 15 at 12:33pm",
-            "Continuing automatically at Oct 15 at 12:33pm · esc to cancel",
-            "Oct 15 at 12:33pm",
+        // The weekly limit's banner is the same generic one: the turn's own
+        // notice names the limit, wrapped over three rows too
+        // ([`a_generic_banner_is_the_limit_the_turns_own_notice_names`]).
+        let r = screen(WALL_WEEKLY_AUTO_CONTINUE_ARMED_34_2_1_299);
+        let w = wall(&r).expect("the weekly wall");
+        assert_eq!(
+            (w.kind, w.placement, w.reset.as_deref()),
+            (
+                WallKind::UsageWeekly,
+                Placement::Footer,
+                Some("Oct 15 at 12:33pm")
+            )
         );
+        assert_eq!(
+            w.message,
+            "You've hit your weekly limit · resets Oct 15 at 12:33pm (America/Los_Angeles) \
+             \u{2014} ⚠ Usage limit reached · limit resets Oct 15 at 12:33pm \u{2014} Continuing \
+             automatically at Oct 15 at 12:33pm · esc to cancel"
+        );
+        assert_eq!(limit_notice(&r), Some((w.message, w.reset)));
         footer(
             WALL_SESSION_AUTO_CONTINUE_ARMED_26_2_1_299,
             "⚠ Usage limit reached · limit resets 10:51am",
@@ -2947,6 +3338,105 @@ mod tests {
             "Usage limit reached · continuing automatically at 10:25am · esc to cancel"
         );
         assert_eq!(w.reset.as_deref(), Some("10:25am"));
+    }
+
+    /// A GENERIC BANNER IS THE LIMIT THE TURN'S OWN NOTICE NAMES (W3 of
+    /// ATERM-KI-1015-1, the lab on Claude Code 2.1.300, 2026-10-15). From
+    /// 2.1.295 on, every subscription limit's footer banner reads `⚠ Usage
+    /// limit reached · limit resets …`, whatever the limit: only the turn's `⎿`
+    /// notice names it. A Sonnet bucket (`You've hit your Sonnet limit`) read
+    /// off the banner first was `usage-session`: the default `model_fallback =
+    /// "opus"` never ran and the session waited two days for the bucket's
+    /// reset; a weekly limit read `usage-session` too. Read as the turn's
+    /// notice names it, with that notice's words opening the message (the
+    /// bucket's model is read off them, and a loop that takes the wall up from
+    /// its ledger row classifies the same words). NEGATIVE CONTROLS, the
+    /// banner as it reads: a five-hour limit (the turn's notice of the same
+    /// kind), a turn's notice naming ANOTHER reset (an older limit, not this
+    /// one's), and one above a person's prompt (history).
+    #[test]
+    fn a_generic_banner_is_the_limit_the_turns_own_notice_names() {
+        use crate::prompt::fixtures::{
+            WALL_SESSION_AUTO_CONTINUE_ARMED_34_2_1_299,
+            WALL_SONNET_BUCKET_AUTO_CONTINUE_ARMED_2_1_300,
+            WALL_WEEKLY_AUTO_CONTINUE_ARMED_34_2_1_299,
+        };
+        let sonnet = screen(WALL_SONNET_BUCKET_AUTO_CONTINUE_ARMED_2_1_300);
+        let w = wall(&sonnet).expect("the Sonnet bucket");
+        assert_eq!(
+            (w.kind, w.placement, w.reset.as_deref()),
+            (
+                WallKind::ModelBucket { consent: false },
+                Placement::Footer,
+                Some("Oct 17 at 4:20pm")
+            ),
+            "{w:#?}"
+        );
+        assert_eq!(
+            w.message,
+            "You've hit your Sonnet limit · resets Oct 17 at 4:20pm (America/Los_Angeles) \u{2014} \
+             ⚠ Usage limit reached · limit resets Oct 17 at 4:20pm \u{2014} Continuing \
+             automatically at Oct 17 at 4:20pm · esc to cancel"
+        );
+        assert_eq!(classify_wall(&w.message), Some(w.kind));
+        assert_eq!(limit_notice(&sonnet), Some((w.message, w.reset)));
+        // A weekly limit at 34 columns: its notice wrapped over three rows.
+        let weekly = screen(WALL_WEEKLY_AUTO_CONTINUE_ARMED_34_2_1_299);
+        let w = wall(&weekly).expect("the weekly limit");
+        assert_eq!(
+            (w.kind, w.placement, w.reset.as_deref()),
+            (
+                WallKind::UsageWeekly,
+                Placement::Footer,
+                Some("Oct 15 at 12:33pm")
+            ),
+            "{w:#?}"
+        );
+        assert!(
+            w.message.starts_with(
+                "You've hit your weekly limit · resets Oct 15 at 12:33pm (America/Los_Angeles) \
+                 \u{2014} ⚠ Usage limit reached"
+            ),
+            "{w:#?}"
+        );
+
+        // NEGATIVE CONTROLS. A five-hour limit: its banner as it reads.
+        let session = screen(WALL_SESSION_AUTO_CONTINUE_ARMED_34_2_1_299);
+        let w = wall(&session).expect("the session limit");
+        assert_eq!(
+            (w.kind, w.message.as_str()),
+            (
+                WallKind::UsageSession,
+                "⚠ Usage limit reached · limit resets 10:25am \u{2014} Continuing automatically at \
+                 10:25am · esc to cancel"
+            )
+        );
+        let banner_only = |rows: &[String]| {
+            let w = wall(rows).expect("the banner");
+            (w.kind, w.message.starts_with("⚠ Usage limit reached"))
+        };
+        // The turn's notice names another reset: an older limit's.
+        let older: Vec<String> = sonnet
+            .iter()
+            .map(|r| {
+                r.replace(
+                    "resets Oct 17 at 4:20pm (America",
+                    "resets Oct 12 at 9:05am (America",
+                )
+            })
+            .collect();
+        assert_eq!(banner_only(&older), (WallKind::UsageSession, true));
+        // The notice above a person's prompt: history.
+        let notice = sonnet
+            .iter()
+            .position(|r| r.contains("You've hit your Sonnet limit"))
+            .expect("the notice");
+        let mut history = sonnet.clone();
+        history.splice(
+            notice + 1..notice + 1,
+            ["", "❯ and the tests?", "", "⏺ Running them."].map(str::to_string),
+        );
+        assert_eq!(banner_only(&history), (WallKind::UsageSession, true));
     }
 
     /// The control: a line Ink wrapped where the reader always joined its
@@ -3189,6 +3679,30 @@ mod tests {
         let peek = framed(&["⏺ mcp__aterm__peek(s-1)", payload, ""], FOOTER);
         assert_eq!(wall(&peek), None, "the control");
         assert_eq!(worker_phase(&peek), Phase::Idle);
+    }
+
+    /// THE FABLE BUCKET ON 2.1.301, MEASURED in the lab (crates/aterm-lab,
+    /// 2026-10-15): both forms of its wall are the model bucket, the one with
+    /// a reset naming it and the one without naming none (the second is
+    /// drawn under the first, and the newest is read). NEGATIVE CONTROL: the
+    /// Fable warning on the footer's last row is no wall, and the session
+    /// reads idle.
+    #[test]
+    fn the_2_1_301_fable_walls_are_the_model_bucket_with_and_without_a_reset() {
+        use crate::prompt::fixtures::{
+            FABLE_WARNING_2_1_301, WALL_FABLE_NO_RESET_2_1_301, WALL_FABLE_RESET_2_1_301, screen,
+        };
+        let bucket = WallKind::ModelBucket { consent: false };
+        let w = wall(&screen(WALL_FABLE_RESET_2_1_301)).expect("the Fable wall");
+        assert_eq!(
+            (w.kind, w.reset.as_deref()),
+            (bucket, Some("1:36am (America/Los_Angeles)"))
+        );
+        let w = wall(&screen(WALL_FABLE_NO_RESET_2_1_301)).expect("the Fable wall, no reset");
+        assert_eq!((w.kind, w.reset), (bucket, None));
+        let warning = screen(FABLE_WARNING_2_1_301);
+        assert_eq!(wall(&warning), None);
+        assert_eq!(worker_phase(&warning), Phase::Idle);
     }
 
     /// The session limit and the Fable limit read the same through both
@@ -3975,5 +4489,142 @@ mod tests {
             missing.is_empty(),
             "wall phrases the store claude no longer carries: {missing:?}"
         );
+    }
+
+    /// Usage credits carrying a session are NO WALL: the vendor's own list of
+    /// its credits notices (the 2.1.300 bundle; the first two and the fourth
+    /// measured), the notice credits start on, the warning that a window is
+    /// filling and the one that credits near their cap read as nothing.
+    /// NEGATIVE CONTROL: a model's bucket that the vendor says now uses usage
+    /// credits is still that bucket, and running out of credits still spend.
+    #[test]
+    fn usage_credits_and_the_vendors_warnings_are_no_wall() {
+        for notice in [
+            "You're now using usage credits",
+            "You're now using usage credits · Your session limit resets 9:43am (America/Los_Angeles)",
+            "Now using usage credits",
+            "Now using usage credits for Opus · Your Opus limit resets 4pm",
+            "You're now using your usage allocation",
+            "Now using your usage allocation",
+            "You're now using extra usage",
+            "Now using extra usage",
+            "Fable 5 is drawing from usage credits",
+            "Opus is now using usage credits instead of your plan limits",
+            "You've used 92% of your session limit · resets 4:12am (America/Los_Angeles)",
+            "You've used 80% of your weekly limit · resets Oct 18 at 8:50pm (America/Los_Angeles)",
+            "You're close to your usage credit limit",
+        ] {
+            assert_eq!(classify_wall(notice), None, "{notice}");
+        }
+        assert_eq!(
+            classify_wall("Opus 4.1 now uses usage credits"),
+            Some(WallKind::ModelBucket { consent: false })
+        );
+        assert_eq!(
+            classify_wall("You're out of usage credits. Switch to another model"),
+            Some(WallKind::Spend)
+        );
+    }
+
+    /// OFF MACOS, CLAUDE CODE DRAWS THE MODEL'S LINES WITH `●` (the 2.1.300
+    /// bundle: `⏺` on macOS, `●` elsewhere), and a reply so drawn is the
+    /// model's as one drawn with `⏺` is: a person's turn served under a
+    /// limit's notice is served since it ([`since_limit`]). NEGATIVE CONTROL:
+    /// the same turn's prompt with no reply under it serves nothing.
+    #[test]
+    fn off_macos_a_line_of_the_models_drawn_with_a_dot_is_its_reply() {
+        use crate::prompt::fixtures::{WALL_SESSION_CANCELLED_THEN_PERSON_TURN_MEASURED, screen};
+        let dotted = |rows: Vec<String>| {
+            rows.into_iter()
+                .map(|r| r.replace('⏺', "●"))
+                .collect::<Vec<_>>()
+        };
+        let turned = dotted(screen(WALL_SESSION_CANCELLED_THEN_PERSON_TURN_MEASURED));
+        let read = since_limit(&turned).expect("the limit");
+        assert_eq!(
+            (read.served, read.reset.as_deref()),
+            (true, Some("10:38am"))
+        );
+        let unanswered: Vec<String> = turned
+            .iter()
+            .filter(|r| !r.starts_with("● Hi!"))
+            .cloned()
+            .collect();
+        let read = since_limit(&unanswered).expect("the limit");
+        assert_eq!(
+            (read.served, read.reset.as_deref()),
+            (false, Some("10:38am"))
+        );
+    }
+
+    /// THE EXPIRY NOTICE (`login_expires_in`), composed on the measured
+    /// capture whose notification row (`✔ Update installed · Restart to
+    /// update`, right-aligned above the composer's top rule) it stands in for:
+    /// read there and in the footer, by its day count. NEGATIVE CONTROLS: the
+    /// same words in a reply (`⏺`), a tool row, a tool's output, the composer
+    /// itself, and a notice that names no day count read nothing.
+    #[test]
+    fn the_login_expiry_notice_is_read_where_a_notification_is_drawn_and_only_there() {
+        const CAPTURE: &str = include_str!("fixtures/idle-after-limit-and-model-switch.txt");
+        let rows: Vec<String> = CAPTURE.lines().map(str::to_string).collect();
+        let at = rows
+            .iter()
+            .position(|r| r.contains("Update installed"))
+            .expect("the measured notification row");
+        let notice = |words: &str| {
+            let mut r = rows.clone();
+            r[at] = format!("{:>136}", words);
+            r
+        };
+        assert_eq!(login_expires_in(&rows), None, "the capture as measured");
+        for (words, days) in [
+            (
+                "\u{26a0} Your login expires in 2 days \u{b7} run /login to renew",
+                2,
+            ),
+            ("Your login expires in 1 day \u{b7} run /login to renew", 1),
+            ("\u{26a0} Your login expires in 3 days", 3),
+        ] {
+            assert_eq!(login_expires_in(&notice(words)), Some(days), "{words}");
+        }
+        // The footer's segment, at the right edge under the bottom rule.
+        let mut footer = rows.clone();
+        let last = footer.len() - 1;
+        footer[last] = format!(
+            "  \u{23f5}\u{23f5} auto mode on (shift+tab to cycle){:>90}",
+            "Your login expires in 1 day \u{b7} run /login to renew"
+        );
+        assert_eq!(login_expires_in(&footer), Some(1));
+        // NEGATIVE CONTROLS: a conversation's rows, and words that are not it.
+        let quoted = |row: String| {
+            let mut r = rows.clone();
+            r.insert(at, row);
+            r
+        };
+        for row in [
+            "\u{23fa} Your login expires in 2 days \u{b7} run /login to renew".to_string(),
+            "  Your login expires in 2 days \u{b7} run /login to renew".to_string(),
+            "  \u{23bf}  Your login expires in 2 days \u{b7} run /login to renew".to_string(),
+            "\u{23fa} Bash(echo 'Your login expires in 2 days \u{b7} run /login to renew')"
+                .to_string(),
+        ] {
+            assert_eq!(login_expires_in(&quoted(row.clone())), None, "{row}");
+        }
+        for words in [
+            "Note: Your login expires in 2 days \u{b7} run /login to renew",
+            "Your login expires in two days \u{b7} run /login to renew",
+            "Your login expires in 2 weeks",
+            "Your login expires in 2 days, they say",
+        ] {
+            assert_eq!(login_expires_in(&notice(words)), None, "{words}");
+        }
+        let mut drafted = rows.clone();
+        let caret = drafted
+            .iter()
+            .rposition(|r| r.starts_with('\u{276f}'))
+            .expect("the caret row");
+        drafted[caret] =
+            "\u{276f} Your login expires in 2 days \u{b7} run /login to renew".to_string();
+        assert_eq!(login_expires_in(&drafted), None, "a draft is the person's");
     }
 }

@@ -1,31 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! PROOF (regression corpus) — the ORTHOGONAL procedural families are
-//! byte-identical to their pre-AA rasterization, and the ANTIALIASED families
-//! are pinned byte-exact to their own corpus.
+//! Regression corpora for the procedural glyphs: an FNV-1a 64 hash of every
+//! glyph's coverage per lattice size, one corpus for the orthogonal families
+//! (box lines, junctions, doubles, blocks, shades at phase 0, quadrants,
+//! braille, sextants; hard 0/255) and one for the anti-aliased families (arcs,
+//! diagonals, Powerline, wedges).
 //!
-//! The AA overhaul (4× supersampled diagonals / arcs / Powerline / wedges) is
-//! scoped to the DIAGONAL/CURVED families only; every axis-aligned family —
-//! solid & dashed box lines, junctions, doubles, half lines, eighth/half
-//! blocks, shades (at phase 0), quadrants, braille, sextants — must not move
-//! by a single byte. This locks that domain: an FNV-1a-64 hash of every
-//! orthogonal glyph's coverage, over an odd/even size lattice, against a
-//! corpus fixture generated from the pre-change rasterizer.
-//!
-//! The AA families (arcs, diagonals, Powerline, wedges) carry interior grey
-//! levels by design, so they cannot be "unchanged since before AA"; what the
-//! second corpus pins is that they do not move by a byte without a reviewed
-//! re-bless, at every AA code point and every lattice size.
-//!
-//! The fixtures are INTENTIONALLY hard to regenerate by accident: bless with
-//! `ATERM_BLESS_GOLDEN=1 targo --unverified test -p aterm-render --test
-//! render_suite -- procedural_orthogonal_regression::` and justify the diff in
-//! review.
+//! Re-bless with `ATERM_BLESS_GOLDEN=1 targo --unverified test -p aterm-render
+//! --test render_suite -- procedural_orthogonal_regression::` and justify the
+//! diff in the commit.
 
 use aterm_render::procedural;
 
-/// Odd/even mixes, squat, tall, degenerate-tiny — the seam-hazard lattice.
+/// Odd/even, squat, tall and degenerate sizes: the seam-hazard lattice.
 const SIZES: &[(usize, usize)] = &[
     (1, 1),
     (2, 2),
@@ -40,10 +28,9 @@ const SIZES: &[(usize, usize)] = &[
     (20, 8),
 ];
 
-/// Every ORTHOGONAL (axis-aligned, hard-0/255) procedural code point: the box
-/// range minus arcs (U+256D–2570) and diagonals (U+2571–2573), blocks,
-/// braille and sextants. Powerline (U+E0B0–E0BF) and the wedge/triangle range
-/// (U+1FB3C–1FB6F) are the AA families — excluded by definition.
+/// Every orthogonal (axis-aligned, hard 0/255) procedural code point: the box
+/// range minus arcs (U+256D–2570) and diagonals (U+2571–2573), blocks, braille
+/// and sextants.
 fn orthogonal_chars() -> impl Iterator<Item = char> + Clone {
     (0x2500u32..=0x256C)
         .chain(0x2574..=0x259F)
@@ -67,7 +54,7 @@ impl Fnv {
     }
 }
 
-/// Every ANTIALIASED procedural code point ([`procedural::antialiased`]): the
+/// Every anti-aliased procedural code point ([`procedural::antialiased`]): the
 /// arcs and diagonals (U+256D–2573), the wedge/triangle range
 /// (U+1FB3C–1FB6F) and Powerline (U+E0B0–E0BF).
 fn aa_chars() -> impl Iterator<Item = char> + Clone {

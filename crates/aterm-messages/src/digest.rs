@@ -1,21 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE DIGEST: the owner is needed, but not now (owner rule, 2026-09-28: *"a
-//! single batched 'exceptions' item that I can dismiss and they go to some
-//! log for me to look at later"*).
+//! The digest: exceptions that need the owner, but not now, batched into one item the
+//! owner can dismiss; the log keeps them for a later look.
 //!
-//! Its entries are [`crate::need::Need::Later`] messages. They live HERE, in a
-//! store beside [`crate::MessageCenter`]'s live set and not in it, so nothing
-//! that lays out the band can seat one: `eligible()`, `wanted_rows()`,
-//! `rebalance`, `settle`, `reserved_progress`, `mark_seen` and the eviction all
-//! read the live set only. A seam somebody forgets to carve out therefore does
-//! nothing (an id-based call answers `false`) — it fails QUIET, where a
-//! `Later` row kept in the live set would seat a band row and re-grid every
-//! tab of the window (the 61 -> 60 -> 61 incident).
+//! Its entries are [`crate::need::Need::Later`] messages, held in a store beside
+//! [`crate::MessageCenter`]'s live set, not in it, so nothing that lays out the band can
+//! seat one: `eligible()`, `wanted_rows()`, `rebalance`, `settle`, `reserved_progress`,
+//! `mark_seen` and eviction read only the live set. A seam somebody forgets to carve out
+//! fails quiet (an id-based call answers `false`), where a `Later` row in the live set
+//! would seat a band row and re-grid every tab of the window.
 //!
-//! This module is the store: order, cap, expiry and the view. The center
-//! (`center.rs`) does the posting, the dismissing and the log lines.
+//! This module is the store: order, cap, end times and the view. `center.rs` posts,
+//! dismisses and writes the log lines.
 
 use crate::model::{Glyph, Intent, Message, MessageId, Severity, WallStamp};
 use crate::need::{DIGEST_CAP, LaterAsk};
@@ -32,18 +29,16 @@ pub(crate) struct Entry {
     pub(crate) ask: LaterAsk,
     /// The wall clock at first ingress: the order and the expiry key on it.
     pub(crate) stamp: WallStamp,
-    /// The instant this process first held the entry, and the wall clock it
-    /// read then ([`Self::anchor_wall`]): the pair the wall clock now is
-    /// computed from. For an entry posted here the wall clock is the ingress
-    /// stamp; for one ADOPTED after a restart it is the wall clock of the
-    /// adoption, NOT the old stamp (the log would otherwise read the end of an
-    /// entry that stood three days as five minutes after it began).
+    /// The instant this process first held the entry; with [`Self::anchor_wall`], the
+    /// pair the current wall clock is computed from. For an entry adopted after a
+    /// restart the anchor is the adoption's wall clock, not the old stamp, which would
+    /// date the end of an entry that stood for days as minutes after it began.
     pub(crate) posted_at: Instant,
     /// The wall clock (unix ms) at [`Self::posted_at`].
     pub(crate) anchor_wall: u64,
     /// Posts folded into it that changed nothing it says.
     pub(crate) repeats: u32,
-    /// When a family pass FIRST failed to name it, until one does
+    /// When a family pass first failed to name it, until one does
     /// ([`crate::need::RESOLVE_AFTER`] later it ends `Resolved`).
     pub(crate) missed_at: Option<Instant>,
     /// When its words last changed (the text-only restate spacing).
@@ -243,12 +238,11 @@ pub enum ReportScope {
 /// How many filed entries [`ReportScope::Latest`] lists.
 pub const RECENT_FILED: usize = 10;
 
-/// `aterm exceptions`: the exceptions in a replayed log as plain lines, readable
-/// with aterm NOT running (the same file and decoder as `aterm ctl messages
-/// need=later`, in a person's words rather than its state= words). `offset_s` is the
-/// local zone's offset from UTC and `now_unix_ms` the reader's clock: times are
-/// said on the reader's own clock, a time of an earlier day with its date
-/// (`Fri, 18 Sep, 9:02 AM`), so a log opened a week later still reads.
+/// `aterm exceptions`: a replayed log's exceptions as plain lines, readable with aterm
+/// not running (the same file and decoder as `aterm ctl messages need=later`, in a
+/// person's words rather than `state=` words). `offset_s` is the local zone's offset
+/// from UTC and `now_unix_ms` the reader's clock; a time on an earlier day carries its
+/// date (`Fri, 18 Sep, 9:02 AM`).
 #[must_use]
 pub fn report(
     log: &crate::log::MessageLog,
@@ -317,8 +311,8 @@ pub fn report(
                             Retired::Resolved(Outcome::Warn) => "ended unfixed".to_string(),
                             Retired::Evicted => "filed (list full)".to_string(),
                             Retired::Superseded { .. } => "shown as a message".to_string(),
-                            // the log's `unseen`: the band queue's meaning of
-                            // that word is not this entry's
+                            // The log's `unseen`; the band queue's sense of the
+                            // word is not this entry's.
                             Retired::Unseen => "aged out".to_string(),
                             Retired::Answered { label } => format!("answered {label}"),
                             other => other.as_word().to_string(),
@@ -329,9 +323,8 @@ pub fn report(
                 if let Some(why) = r.detail.first() {
                     out.push(format!("      why    {why}"));
                 }
-                // The action only while the fact may still stand: open, filed,
-                // or ended unfixed; a fixed or superseded entry has nothing left
-                // to do.
+                // The action only while the fact may still stand: open, filed or
+                // ended unfixed.
                 if let Some(then) = r.detail.get(1).filter(|_| {
                     r.is_live()
                         || r.filed_exception()

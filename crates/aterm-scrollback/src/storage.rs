@@ -19,13 +19,9 @@ pub(crate) fn create_dir_restricted(path: &std::path::Path) -> std::io::Result<(
         use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 
         DirBuilder::new().recursive(true).mode(0o700).create(path)?;
-        // Defense-in-depth: a recursive create is a no-op on the mode of an
-        // ALREADY-EXISTING final directory, so a pre-existing looser dir (e.g.
-        // 0o755) would leave scrollback files traversable by other local users
-        // regardless of the files' own bits. Enforce owner-only (0o700) on the
-        // final component unconditionally — a no-op when we just created it
-        // 0o700, and fail-closed if we cannot chmod a pre-existing dir we do not
-        // own (we then refuse to use a directory we cannot secure).
+        // A recursive create leaves an existing final directory's mode alone, and
+        // a looser one would let other local users reach the files: enforce 0o700
+        // unconditionally. Failing to chmod a directory we do not own fails closed.
         std::fs::set_permissions(path, Permissions::from_mode(0o700))?;
         Ok(())
     }
@@ -37,11 +33,9 @@ pub(crate) fn create_dir_restricted(path: &std::path::Path) -> std::io::Result<(
 
 /// Iterator over scrollback storage lines (oldest to newest).
 ///
-/// Streams whole decoded segments (ST-6): each warm block / cold page is
-/// decoded ONCE and its lines are MOVED out — no per-line binary search,
-/// cache probe, or `Line` clone on an O(N) sequential walk. Corrupt segments
-/// are skipped whole (one warning per segment, per-line skip totals
-/// unchanged), matching [`super::ScrollbackIter`].
+/// Streams whole decoded segments: each warm block or cold page is decoded once
+/// and its lines moved out. A corrupt segment is skipped whole (one warning per
+/// segment), matching [`super::ScrollbackIter`].
 pub struct ScrollbackStorageIter<'a> {
     pub(crate) storage: &'a ScrollbackStorage,
     pub(crate) idx: usize,
@@ -58,10 +52,8 @@ impl Iterator for ScrollbackStorageIter<'_> {
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             if let Some(line) = self.buf.pop_front() {
-                // `saturating_add(1)`: `idx < total <= usize::MAX` on every
-                // real path — the saturation just discharges the strict L0
-                // gate's unconstrained-`idx` overflow counterexample (same
-                // cursor idiom as aterm-buffer's id counters).
+                // saturating_add discharges the strict L0 gate's unconstrained-`idx`
+                // overflow counterexample; `idx < total` on every real path.
                 self.idx = self.idx.saturating_add(1);
                 return Some(line);
             }
@@ -72,22 +64,15 @@ impl Iterator for ScrollbackStorageIter<'_> {
             match self.storage.read_segment(self.idx) {
                 Ok(lines) => {
                     if lines.is_empty() {
-                        // In-range index with no data: stale aggregate count
-                        // or short decode — end-of-data, like the old
-                        // `Ok(None)` arm.
+                        // In-range index with no data (stale count or short
+                        // decode): end of data.
                         return None;
                     }
                     self.buf = std::collections::VecDeque::from(lines);
                 }
                 Err((e, skip)) => {
-                    // Direct `warn!`: the error interpolation cannot be
-                    // pre-rendered without the fmt machinery (the `Io` variant
-                    // wraps `std::io::Error`), and routing it through a shim
-                    // whose local-callee closure includes `ScrollbackError`'s
-                    // Display sends the strict gate's CHC engine into a
-                    // non-terminating solve. The macro-expanded `fmt::Arguments`
-                    // here leaves ONE documented full-verify gap on this
-                    // function (a toolchain limitation, not a refutation).
+                    // Direct `warn!`: an error cannot go through a log shim (see
+                    // log_shim.rs), which leaves one documented full-verify gap.
                     aterm_log::warn!("storage iter: skipping {skip} line(s) at {}: {e}", self.idx);
                     // Clamp so a corrupt tail segment cannot push the cursor
                     // past `total`; `max(1)` guarantees forward progress.
@@ -139,10 +124,6 @@ impl<'a> Iterator for ScrollbackStorageRevIter<'a> {
     }
 }
 
-// ============================================================================
-// ScrollbackStorage - Unified storage abstraction for Grid
-// ============================================================================
-
 /// Unified scrollback storage abstraction.
 ///
 /// This enum provides a common interface for both memory-only [`Scrollback`]
@@ -174,8 +155,8 @@ pub enum ScrollbackStorage {
     Memory(Scrollback),
     /// Disk-backed scrollback with mmap cold tier.
     ///
-    /// Only present with the opt-in `disk-tier` feature (§2.7: the default
-    /// engine build is headless, no mmap/libc/std::fs).
+    /// Only with the opt-in `disk-tier` feature: the default build is headless
+    /// (no mmap, libc or `std::fs`).
     #[cfg(feature = "disk-tier")]
     Disk(DiskBackedScrollback),
 }
@@ -197,19 +178,10 @@ pub(crate) struct ColdMetrics {
     pub(crate) disk_used: Option<usize>,
 }
 
-// Devirtualized dispatch over the two concrete backends. The former
-// `inner()`/`inner_mut()` helpers erased the backend to `&dyn ScrollbackAccess`,
-// so every delegated call was a virtual call whose callee body the strict L0
-// gate could not resolve in the lowered bundle — each of the 20 delegations
-// carried a [trust-absent-callee-assumption] "may panic" obligation. Matching
-// on the enum and invoking the trait method on the CONCRETE backend performs
-// the exact dispatch decision the vtable would have made (the `#[non_exhaustive]`
-// enum has exactly these two variants, and both arms call the same
-// `ScrollbackAccess` impl the vtable slot pointed at — including the memory
-// backend's `Ok(())`-wrapping `push_line`/`clear` shims), so the observable
-// behavior is byte-identical while the callee becomes a statically-known local
-// function the verifier can see. The public `ScrollbackAccess` trait and its
-// impls are unchanged; only this internal dispatch devirtualizes.
+// Static dispatch over the two concrete backends: through `&dyn
+// ScrollbackAccess` the strict L0 gate cannot resolve the callee in the lowered
+// bundle and charges every delegation a "may panic" obligation. Matching on the
+// enum calls the same `ScrollbackAccess` impl the vtable would.
 macro_rules! dispatch {
     ($self:expr, $method:ident($($arg:expr),*)) => {
         match $self {
@@ -221,7 +193,7 @@ macro_rules! dispatch {
 }
 
 impl ScrollbackStorage {
-    // --- Delegated via ScrollbackAccess (20 methods) ---
+    // --- Delegated via ScrollbackAccess ---
 
     /// Get the total number of lines.
     #[must_use]
@@ -307,11 +279,10 @@ impl ScrollbackStorage {
         dispatch!(self, watermark_level())
     }
 
-    /// Lines DROPPED by memory-pressure eviction — real retention loss, the
-    /// out-of-band truncation signal (audit E10a). The disk-backed store
-    /// relieves pressure by SPILLING warm blocks to its disk cold tier
-    /// (retained, not lost), so it reports 0 here. The in-memory store also
-    /// counts the lines of a quarantined warm block, whose rows stay in
+    /// Lines dropped by memory-pressure eviction: real retention loss, reported
+    /// out of band. The disk-backed store spills warm blocks to its disk cold
+    /// tier instead (retained), so it reports 0. The in-memory store also counts
+    /// the lines of a quarantined warm block, whose rows stay in
     /// [`line_count`](Self::line_count) as blank rows when older history sits
     /// before them, so the two can overlap.
     #[must_use]
@@ -323,14 +294,10 @@ impl ScrollbackStorage {
         }
     }
 
-    /// History lines whose INLINE IMAGE was discarded because the line was
-    /// compressed — the image retention horizon, reported out-of-band by BOTH
-    /// backends (unlike [`pressure_evicted_lines`](Self::pressure_evicted_lines),
-    /// which the disk store answers 0 to: spilling a warm block to disk retains
-    /// the line, but compressing it has already ended the picture either way).
-    ///
-    /// See [`Scrollback::image_rows_dropped_by_compression`] for the horizon
-    /// and for what a person scrolling past it sees.
+    /// History lines whose inline image was discarded because the line was
+    /// compressed, reported by both backends (spilling to disk retains a line,
+    /// but compression has already dropped its picture). See
+    /// [`Scrollback::image_rows_dropped_by_compression`].
     #[must_use]
     pub fn image_rows_dropped_by_compression(&self) -> u64 {
         dispatch!(self, image_rows_dropped_by_compression())
@@ -356,23 +323,20 @@ impl ScrollbackStorage {
     /// Per the Kitty unscroll spec: "The lines that have been scrolled into
     /// the scrollback buffer are removed from the scrollback buffer."
     ///
-    /// Returns an error if decompression or I/O fails during line extraction.
-    /// On error, scrollback state is unchanged (no lines lost). (#4638)
+    /// Returns an error if decompression or I/O fails during line extraction;
+    /// the scrollback is then unchanged.
     pub fn remove_newest(&mut self, n: usize) -> Result<(), ScrollbackError> {
         dispatch!(self, remove_newest(n))
     }
 
-    /// Drop the `n` OLDEST lines (front truncation), keeping the newest
-    /// `line_count() - n`. `n >= line_count()` clears the store.
+    /// Drop the `n` oldest lines, keeping the newest `line_count() - n`;
+    /// `n >= line_count()` clears the store.
     ///
-    /// Tier-aware front consumption: both backends advance a `front_offset`
-    /// through cold → warm → hot in age order, dropping whole blocks/pages as
-    /// they empty, with NO decompression — O(1) amortized per line. This is
-    /// the reflow job's streaming-input primitive (RFL-2): the off-thread
-    /// rewrap reads its input from the FRONT of the same store it refills at
-    /// the BACK, and this call is what releases the consumed input's memory as
-    /// the job advances — so the job's peak transient memory stays
-    /// O(step budget) uncompressed instead of O(total history).
+    /// Both backends advance a `front_offset` through cold → warm → hot, dropping
+    /// whole blocks/pages as they empty, with no decompression (O(1) amortized
+    /// per line). The off-thread reflow reads its input from the front of the
+    /// store it refills at the back; this releases consumed input as it goes,
+    /// keeping its transient memory O(step budget) rather than O(history).
     // Skip: dispatches into the tier truncations (blanket-drain class), like
     // `set_line_limit` below.
     #[cfg_attr(trust_verify, trust::skip)]
@@ -405,15 +369,9 @@ impl ScrollbackStorage {
         dispatch!(self, set_memory_budget(budget))
     }
 
-    /// Create a snapshot containing only hot + warm tier lines (skip cold).
-    ///
-    /// Fast path for checkpointing under a lock: cold tier decompression
-    /// (Zstd or disk I/O) is skipped, bounding the snapshot to at most
-    /// `hot_limit + warm_limit` lines (~11K with defaults). This prevents
-    /// multi-second UI freezes during auto-save. (#5946)
-    ///
-    /// Use `checkpoint_snapshot()` when a full-fidelity snapshot is needed
-    /// (e.g., offline migration or explicit user-triggered save).
+    /// Create a snapshot of only the hot and warm tier lines, skipping cold-tier
+    /// decompression: at most `hot_limit + warm_limit` lines (~11K by default).
+    /// [`checkpoint_snapshot`](Self::checkpoint_snapshot) is the full snapshot.
     #[must_use]
     #[cfg(test)]
     pub fn checkpoint_snapshot_fast(&self) -> Scrollback {
@@ -424,9 +382,8 @@ impl ScrollbackStorage {
 
     /// Create an in-memory snapshot of this storage for serialization.
     ///
-    /// Preserves line order and runtime limits across both memory-only and
-    /// disk-backed variants. Skips lines with decompression/I/O errors and
-    /// logs the total count of skipped lines. (#4641)
+    /// Preserves line order and runtime limits for both backends. Skips lines
+    /// with decompression/I/O errors and logs how many.
     #[must_use]
     // Skip: the full snapshot walk — routes into the tier `get_line`s (each
     // individually classified) plus Vec/Line clones (idiomatic-alloc class).
@@ -578,10 +535,8 @@ mod restricted_dir_tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// Defense-in-depth regression: a PRE-EXISTING world-traversable (0o755) dir
-    /// must be TIGHTENED to 0o700, since a recursive create is a no-op on an
-    /// existing dir's mode — without this, scrollback files would be readable by
-    /// other local users despite their own restrictive bits.
+    /// A pre-existing 0o755 dir is tightened to 0o700: a recursive create leaves
+    /// an existing dir's mode alone.
     #[test]
     fn create_dir_restricted_tightens_preexisting_loose_dir() {
         let base = std::env::temp_dir().join(format!("aterm_restr_loose_{}", std::process::id()));

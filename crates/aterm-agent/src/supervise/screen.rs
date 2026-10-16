@@ -1,13 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The `text --json` reply as the supervisor reads it: the rows, the cursor, the
-//! content sequence, the screen generation and the person's stamp. A small
-//! std-only JSON reader — the reply is one object of known shape (`{"rows":[…],
-//! "cursor":{"row":r,"col":c,…},"dims":{…},"seq":n,"gen":"e.s","human_ms":n|null}`)
-//! and this crate's closure stays free of a serde stack for it.
+//! The `text --json` reply as the supervisor reads it, by a small std-only JSON reader: the
+//! reply is one object of known shape (`{"rows":[…],"cursor":{"row":r,"col":c,…},"dims":{…},
+//! "seq":n,"gen":"e.s","human_ms":n|null}`), and this crate needs no serde stack for it.
 
 use aterm_types::control_verbs::ScreenGen;
+use std::time::Duration;
 
 /// One screen read.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -23,10 +22,9 @@ pub struct Screen {
     /// The grid row the first of `rows` is: a shaped read's `first` (`tail=`
     /// sends it when it does not start at row 0), 0 for a full read.
     pub first: usize,
-    /// The screen generation the read was taken at, `<epoch>.<seq>` (the
-    /// server's `"gen"`, read under the same lock as the rows): what a fenced
-    /// press names (`key if-gen=`). Unlike `seq` it never repeats, so a press
-    /// fenced on it cannot land on a box that replaced the one read. `None`
+    /// The screen generation, `<epoch>.<seq>` (the server's `"gen"`, read under the same lock
+    /// as the rows): what a fenced press names (`key if-gen=`). Unlike `seq` it never
+    /// repeats, so a fenced press cannot land on a box that replaced the one read. `None`
     /// from a host that does not send it (the press then carries no fence).
     pub generation: Option<String>,
     /// When a person last gave the session input, as the server stamped it at
@@ -38,13 +36,12 @@ pub struct Screen {
     /// writes it only if no person has keyed since. `None` from a host that
     /// does not send it (the key then carries no person fence).
     pub human_seq: Option<u64>,
-    /// The pane's width in cells (`"dims":{"cols":…}`), `None` from a reply
-    /// that does not carry it: what a question's policy text is estimated
-    /// to wrap in.
+    /// The pane's width in cells (`"dims":{"cols":…}`), `None` when absent: what a
+    /// question's policy text is estimated to wrap in.
     pub cols: Option<u16>,
-    /// The PANE's height in rows (`"dims":{"rows":…}`: the grid's, whatever
-    /// slice `tail=` sent in [`Self::rows`]), `None` from a reply that does
-    /// not carry it: what a question's policy text is estimated to fit in.
+    /// The pane's height in rows (`"dims":{"rows":…}`, the grid's, whatever slice `tail=`
+    /// sent in [`Self::rows`]), `None` when absent: what a question's policy text is
+    /// estimated to fit in.
     pub pane_rows: Option<usize>,
 }
 
@@ -67,7 +64,7 @@ impl HumanInput {
     /// than the stamp, or any reply but an `OK` — [`Self::Unknown`].
     #[must_use]
     pub fn of_status(status: &str) -> Self {
-        let Some(line) = status.lines().find(|l| l.starts_with("OK")) else {
+        let Some(line) = status.lines().find(|l| crate::is_ok_reply(l)) else {
             return Self::Unknown;
         };
         match line
@@ -80,11 +77,19 @@ impl HumanInput {
         }
     }
 
-    /// Whether a person gave the session input within `grace_s` seconds
-    /// (`[harness] human_grace_s`): the one test of a person's hand, for
-    /// every caller. `None` for [`Self::Unknown`] — each caller says what an
-    /// unknown stamp means where it acts (nobody, for a relaunch; someone,
-    /// for the upgrade's notice).
+    /// The stamp's age; `None` for [`Self::Never`] and [`Self::Unknown`].
+    #[must_use]
+    pub fn ago(self) -> Option<Duration> {
+        match self {
+            Self::Ago(ms) => Some(Duration::from_millis(ms)),
+            Self::Never | Self::Unknown => None,
+        }
+    }
+
+    /// Whether a person gave the session input within `grace_s` seconds (`[harness]
+    /// human_grace_s`): the one test of a person's hand. `None` for [`Self::Unknown`]: each
+    /// caller says what that means where it acts (nobody for a relaunch, someone for the
+    /// upgrade's notice).
     #[must_use]
     pub fn within(self, grace_s: u32) -> Option<bool> {
         match self {
@@ -94,17 +99,12 @@ impl HumanInput {
         }
     }
 
-    /// Whether NO person gave the session input at or after `since_ms` (Unix
-    /// milliseconds), for a stamp read at `now_ms`: an age is true where the
-    /// input it dates came before `since_ms`; [`Self::Unknown`] AND
-    /// [`Self::Never`] are `None`, for the caller to read as someone. Never
-    /// says nobody keyed the session since the host BEGAN SERVING it, which
-    /// may be after `since_ms`: the stamp lives in the serving process, and a
-    /// seamless update's successor reads every session it adopts as never
-    /// keyed — a person's keys before the update are gone from it, not
-    /// absent. The instant is `now_ms − age`, so a caller's clock read after
-    /// the server's stamp dates the input LATER than it was — the safe way
-    /// to be wrong.
+    /// Whether no person gave the session input at or after `since_ms` (Unix ms), for a
+    /// stamp read at `now_ms`. [`Self::Never`] is `None` like [`Self::Unknown`], for the
+    /// caller to read as someone: it says only that nobody keyed since the host began serving
+    /// the session, which may be after `since_ms` (a seamless update's successor reads every
+    /// adopted session as never keyed). The input's instant is `now_ms − age`, so a caller's
+    /// clock read after the server's stamp dates it later than it was, the safe way to be wrong.
     #[must_use]
     pub fn quiet_since(self, since_ms: u64, now_ms: u64) -> Option<bool> {
         match self {
@@ -133,8 +133,7 @@ pub fn parse_text_json(body: &str) -> Result<Screen, String> {
         .map(str::trim_start)
         .unwrap_or(body);
     let mut v = Json::parse(body)?;
-    // The rows are MOVED out of the parsed value, never copied: nothing below
-    // reads the top-level `rows` again.
+    // The rows are moved out, not copied: nothing below reads `rows` again.
     let rows = match &mut v {
         Json::Object(kv) => kv
             .iter_mut()
@@ -160,10 +159,8 @@ pub fn parse_text_json(body: &str) -> Result<Screen, String> {
         cursor_col: usize::try_from(num(cursor, "col").unwrap_or(0)).unwrap_or(usize::MAX),
         seq: num(Some(&v), "seq").unwrap_or(0),
         first: usize::try_from(num(Some(&v), "first").unwrap_or(0)).unwrap_or(usize::MAX),
-        // Kept only if the server will take it back as a fence: asked of the
-        // same reader the server parses `if-gen=` with. Anything else is not
-        // sent (the server would answer `ERR usage`); a local "two runs of
-        // digits" check stood here and passed an epoch past `u64::MAX`.
+        // Kept only if the server takes it back as a fence: checked by the parser the
+        // server reads `if-gen=` with (anything else would draw `ERR usage`).
         generation: v
             .get("gen")
             .and_then(Json::as_str)
@@ -234,8 +231,8 @@ impl Json {
     }
 }
 
-// The reader walks the `&str` itself: `i` is a BYTE offset, always on a char
-// boundary, and an error names the CHAR index (`at`).
+// The reader walks the `&str` itself: `i` is a byte offset, always on a char boundary, and an
+// error names the char index (`at`).
 
 /// The char index of byte offset `i`, as an error names it.
 fn at(s: &str, i: usize) -> usize {
@@ -378,12 +375,10 @@ fn hex4(s: &str, i: &mut usize) -> Result<u32, String> {
     u32::from_str_radix(t, 16).map_err(|_| format!("json: bad \\u escape {t:?}"))
 }
 
-/// Whether one `cell` reply (`OK <grapheme%enc> <fg> <bg> <attrs>[ link=…]`,
-/// the attrs a comma list or `none`; aterm-gui `cmd_cell`) names `dim`. The
-/// fields are split on single spaces, never on runs: a blank cell's grapheme
-/// is an empty token. This is the one reading of a composer's column-2 cell,
-/// telling the dim placeholder from a typed draft whose caret was moved home;
-/// the supervisor's loop and the live upgrade's gate both ask it.
+/// Whether one `cell` reply (`OK <grapheme%enc> <fg> <bg> <attrs>[ link=…]`, the attrs a comma
+/// list or `none`; aterm-gui `cmd_cell`) names `dim`. Fields split on single spaces, never
+/// runs: a blank cell's grapheme is an empty token. The one test that tells a composer's dim
+/// placeholder from a typed draft whose caret was moved home.
 #[must_use]
 pub fn cell_is_dim(line: &str) -> bool {
     line.trim_end()
@@ -394,7 +389,7 @@ pub fn cell_is_dim(line: &str) -> bool {
 
 /// The `<field>=` word of a `status` reply (`-` and absent are `None`).
 pub fn status_field<'s>(stdout: &'s str, field: &str) -> Option<&'s str> {
-    let line = stdout.lines().find(|l| l.starts_with("OK"))?;
+    let line = stdout.lines().find(|l| crate::is_ok_reply(l))?;
     line.split_whitespace()
         .find_map(|w| w.strip_prefix(field)?.strip_prefix('='))
         .filter(|v| *v != "-")
@@ -404,10 +399,8 @@ pub fn status_field<'s>(stdout: &'s str, field: &str) -> Option<&'s str> {
 mod tests {
     use super::*;
 
-    /// A `status` reply's stamp reads as a `text --json` one does: a count
-    /// its age, `-` never, and no field (an older server) or no `OK`
-    /// unknown — and [`HumanInput::within`] is the one grace test, strictly
-    /// under it. Negative controls: the grace's own edge is outside it, and
+    /// A `status` reply's stamp reads as a `text --json` one does, and [`HumanInput::within`]
+    /// is strictly under the grace. Negative controls: the grace's own edge is outside it, and
     /// `human_ms=` on an `ERR` is no stamp.
     #[test]
     fn a_status_stamp_reads_as_the_one_person_fact() {
@@ -426,6 +419,11 @@ mod tests {
             HumanInput::of_status("ERR no such session human_ms=1"),
             HumanInput::Unknown
         );
+        assert_eq!(
+            HumanInput::of_status("OKAY human_ms=1"),
+            HumanInput::Unknown
+        );
+        assert_eq!(status_field("OKAY human_ms=1", "human_ms"), None);
         assert_eq!(HumanInput::Ago(4999).within(5), Some(true));
         assert_eq!(HumanInput::Ago(5000).within(5), Some(false), "the edge");
         assert_eq!(HumanInput::Never.within(u32::MAX), Some(false));
@@ -493,9 +491,8 @@ mod tests {
         }
     }
 
-    /// The person's stamp (`"human_ms"`): a number is its age, `null` is
-    /// never, and a host that sends none is unknown, as is a value that is
-    /// neither.
+    /// `"human_ms"`: a number is its age, `null` is never, and absent or any other value is
+    /// unknown.
     #[test]
     fn the_persons_stamp_is_read_and_its_absence_is_unknown() {
         let with = |tail: &str| {
@@ -513,9 +510,8 @@ mod tests {
         assert_eq!(with(r#","human_ms":-3"#), HumanInput::Unknown);
     }
 
-    /// A `tail=` read that does not start at row 0 says where it starts
-    /// (`first`), and the cursor's grid row maps onto the rows read through
-    /// it; a full read starts at 0, and a cursor above a tail is on none.
+    /// A `tail=` read's `first` maps the cursor's grid row onto the rows read; a full read
+    /// starts at 0, and a cursor above a tail is on none.
     #[test]
     fn a_tail_reads_first_row_places_the_cursor() {
         let tail = r#"{"rows":["a","❯ hi","b"],"cursor":{"row":61,"col":4},"dims":{"rows":63,"cols":80},"seq":9,"first":60}"#;

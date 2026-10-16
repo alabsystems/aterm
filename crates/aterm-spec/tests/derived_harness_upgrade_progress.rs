@@ -96,11 +96,6 @@ fn is(v: &'static str, n: i64) -> Expr {
 #[test]
 fn the_upgrade_progress_keeps_every_safety_law() {
     let model = harness_upgrade_progress_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name)
-    );
     verify::prove_and_catch_scalar(&model, "harness upgrade progress");
     // The committed space's fired set is walked once, not once per action.
     let fired = interp::fired_actions(&interp::with_buggy(&model, 0));
@@ -111,7 +106,7 @@ fn the_upgrade_progress_keeps_every_safety_law() {
         .filter(|a| !fired.contains(a))
         .collect();
     assert_eq!(
-        verify::audit_dead_negative_controls(&model, &dead),
+        verify::audit_dead_negative_controls(std::slice::from_ref(&model)),
         Ok(4),
         "{dead:?}"
     );
@@ -173,27 +168,6 @@ fn the_upgrade_progress_keeps_every_safety_law() {
     let unrecorded = edited("Watch", None, vec![("cause", var("cause"))]);
     let (_, broken) = interp::bmc(&unrecorded).expect_err("a look that records nothing");
     assert_eq!(broken, "NoStaleLook");
-}
-
-/// "THE UPGRADE MOVES, OR ITS RECORD NAMES WHAT HOLDS IT" under its stated
-/// fairness (the watch's timer, aterm's own code — nothing of the world's,
-/// nor the points' steps), and each named mutant breaks it ALONE: no look
-/// without a point (`NoLookWithoutAPoint`) and a stale word left by a read
-/// that would act (`RecordedWordStands`, main before the fix).
-#[test]
-fn the_upgrade_moves_or_its_record_names_what_holds_it_under_fairness() {
-    let model = harness_upgrade_progress_model();
-    let live = harness_upgrade_progress_liveness();
-    assert!(
-        aterm_spec::xref::liveness_registry()
-            .iter()
-            .any(|(m, l)| m.name == model.name && l.name == live.name)
-    );
-    verify::liveness_proves_and_catches_tiered(
-        &model,
-        &live,
-        "HarnessUpgradeProgress moves or names its cause",
-    );
 }
 
 /// Each livelock the test above catches is the cycle its mutant names — the

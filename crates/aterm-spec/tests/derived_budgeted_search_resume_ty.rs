@@ -12,27 +12,10 @@
 //! `executable_model_walks_every_public_lifecycle_branch` fires every public
 //! action, and aterm-core's `budgeted_resume_refinement_actions_are_complete`
 //! requires one `#[refines]` anchor per public action in both directions and a
-//! waiver for the one `Buggy`-only action. Registry enrolment is
-//! pinned below, directly, rather than left to whichever ratchet table happens
-//! to name the model.
+//! waiver for the one `Buggy`-only action.
 
 use aterm_spec::derive::budgeted_search_resume_model;
 use aterm_spec::{interp, verify};
-
-#[test]
-fn budgeted_search_resume_proves_and_catches_stale_continuation() {
-    let model = budgeted_search_resume_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name),
-        "BudgetedSearchResume must stay enrolled in the model registry"
-    );
-    verify::prove_and_catch_scalar(
-        &model,
-        "derived BudgetedSearchResume spec (identity/reset/delta-drain lifecycle)",
-    );
-}
 
 fn assert_invariants(
     model: &aterm_spec::derive::Model,
@@ -272,7 +255,7 @@ fn each_lifecycle_law_has_its_own_slip() {
         "the scan-only completion is a stutter at the committed config"
     );
     assert_eq!(
-        verify::audit_dead_negative_controls(&model, &[]),
+        verify::audit_dead_negative_controls(std::slice::from_ref(&model)),
         Ok(0),
         "no action is dead at the committed config (strict vacuity)"
     );

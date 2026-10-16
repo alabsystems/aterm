@@ -25,6 +25,10 @@
 //! false`) as in every launch test.
 
 #![cfg(unix)]
+#![allow(
+    clippy::disallowed_types,
+    reason = "test code: a stand-in child may inherit descriptors"
+)]
 
 use std::io::{Read as _, Write as _};
 use std::os::fd::{FromRawFd as _, OwnedFd};

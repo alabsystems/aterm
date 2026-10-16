@@ -141,8 +141,7 @@ fn a_directory_this_check_cannot_resolve_is_refused() {
 }
 
 /// Every wrapper the classifier's head check sees through, this check sees
-/// through too: each of these is approved as a read by the classifier and
-/// gets its config check here.
+/// through too.
 #[test]
 fn a_git_behind_a_wrapper_is_still_placed() {
     let home = Path::new("/Users//o");
@@ -174,7 +173,7 @@ fn a_git_behind_a_wrapper_is_still_placed() {
     assert_eq!(dirs("env -C /r git -C x log"), [PathBuf::from("/r/x")]);
     // A loop over an absolute `cd` lands in one place.
     assert!(dirs("for i in 1 2; do cd /r && git status; done").contains(&PathBuf::from("/r")));
-    // A word that only NAMES git runs nothing.
+    // A word that only names git runs nothing.
     assert_eq!(
         git_reads("grep -rn git src", &[PathBuf::from("/w")], None),
         Ok(None)
@@ -253,8 +252,7 @@ fn each_key_that_runs_a_program_on_a_read_is_a_hazard() {
     }
 }
 
-/// A partial clone fetches a missing object on demand, from its promisor
-/// remote: credential helpers, ssh and the remote's programs run on what
+/// A partial clone may fetch a missing object from its promisor remote on what
 /// looks like a local read.
 #[test]
 fn a_partial_clone_is_a_hazard() {
@@ -492,11 +490,9 @@ fn origin(tag: &str) -> Scratch {
     r
 }
 
-/// A superproject's `git status` runs git in each populated submodule with
-/// that submodule's config (`.git/modules/<name>/config`), which the
-/// superproject's own `git config --list` does not show. The check views every
-/// populated submodule, recursively. Negative control: a clean submodule
-/// loads nothing that runs.
+/// A superproject's `git status` runs git in each populated submodule with its
+/// own config, which the superproject's `git config --list` does not show; the
+/// check views each, recursively. Negative control: a clean submodule.
 #[test]
 fn a_submodules_own_config_is_seen() {
     let from = origin("sub-origin");
@@ -579,10 +575,8 @@ fn a_submodules_own_config_is_seen() {
     assert!(why.contains("diff.external"), "{why}");
 }
 
-/// A filter driver runs only on a path whose attributes select it: `git lfs
-/// install` writes `filter.lfs.*` into every global config, and a repository
-/// with no `filter=lfs` attribute never runs it. The moment an attribute
-/// selects the driver for a tracked path, it is a hazard.
+/// A filter driver is a hazard only once an attribute selects it for a tracked
+/// path (`git lfs install` writes `filter.lfs.*` into every global config).
 #[test]
 fn a_filter_driver_counts_only_where_the_attributes_select_it() {
     let r = repo("filter");
@@ -728,11 +722,10 @@ fn the_workers_external_diff_is_a_hazard() {
     );
 }
 
-/// `GIT_CONFIG` names the one file `git config` alone reads instead of the
-/// effective set — passed on, the probe's own `git config --list` would list
-/// that file and miss what a read loads — and `GIT_TRACE*` would have the
-/// probe write; neither is passed on. CONTROL: `GIT_CONFIG` really does hide
-/// the repository's config from a plain `git config --list`.
+/// Neither `GIT_CONFIG` (the probe's `git config --list` would list that one
+/// file and miss what a read loads) nor `GIT_TRACE*` (the probe would write)
+/// is passed on. Control: `GIT_CONFIG` really does hide the repository's
+/// config from a plain `git config --list`.
 #[test]
 fn what_only_git_config_reads_does_not_hide_the_effective_config() {
     let r = repo("git-config-var");
@@ -763,10 +756,9 @@ fn what_only_git_config_reads_does_not_hide_the_effective_config() {
     assert!(!trace.exists(), "the probe wrote a trace");
 }
 
-/// The probe runs the git the WORKER's `PATH` finds — a git whose own
-/// (compiled-in) configuration differs from this process's is read as it
-/// is. Here a wrapper that adds a configuration stands in for such a git.
-/// Negative control: the worker without it on its `PATH`.
+/// The probe runs the git the worker's `PATH` finds (a wrapper that adds a
+/// configuration stands in for a git built differently). Negative control:
+/// the worker without it on its `PATH`.
 #[cfg(unix)]
 #[test]
 fn the_git_on_the_workers_path_is_the_one_read() {
@@ -807,9 +799,7 @@ fn the_git_on_the_workers_path_is_the_one_read() {
 }
 
 /// Which git runs is refused when the worker's `PATH` cannot say: a relative
-/// (or empty) entry ahead of git — the shell resolves it against the
-/// directory the command runs in, a repository the worker may write — no
-/// `PATH` at all, and no git on it.
+/// (or empty) entry ahead of git, no `PATH` at all, and no git on it.
 #[test]
 fn a_worker_path_that_cannot_name_the_git_is_refused() {
     let r = repo("bad-path");
@@ -845,13 +835,9 @@ fn the_first_entry_of_a_variable_wins() {
     assert_eq!(home_only.claude_dir(cwd), Ok(PathBuf::from("/h/.claude")));
 }
 
-/// The Claude Code directory as Claude Code 2.1.299 resolves it
-/// (`path.resolve(CLAUDE_CONFIG_DIR ?? join(os.homedir(), ".claude"))`, Bun's
-/// `os.homedir()` taking a non-empty `HOME`, else the passwd entry): a
-/// `CLAUDE_CONFIG_DIR` set at all wins, a relative one (or an empty one) taken
-/// against the process's directory; no `HOME`, or an empty one, is the
-/// account's home. Negative control: where the account names no home either,
-/// it is an error, never a directory skipped.
+/// A set `CLAUDE_CONFIG_DIR` wins, a relative (or empty) one taken against the
+/// cwd; no `HOME`, or an empty one, is the account's home. Negative control:
+/// with no account home either, it is an error, never a directory skipped.
 #[test]
 fn the_claude_code_directory_is_resolved_as_claude_code_resolves_it() {
     let cwd = Path::new("/w/proj");

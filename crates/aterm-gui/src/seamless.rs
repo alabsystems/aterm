@@ -22,18 +22,18 @@
 //! before any thread, by `HandoffEnv::capture` (`crate::handoff_env`), so none leaks into
 //! the user's shell children; the intakes here read that snapshot.
 
-use crate::handoff_env::HandoffEnv;
+use crate::handoff_env::{HandoffEnv, HandoffName};
 use crate::session_store::{ConnectionCarry, HandoffFds, ScreenCarry, SessionHandoff, WindowCarry};
 use crate::spawn::Adopted;
 use aterm_core::terminal::{CheckpointMeta, TerminalCheckpoint};
 use aterm_digest::Sha256;
 use aterm_session::{LaunchNonce, SessionId};
 
-pub(crate) const ENV_MANIFEST: &str = "ATERM_SEAMLESS_MANIFEST";
-pub(crate) const ENV_FDS: &str = "ATERM_SEAMLESS_FDS";
-pub(crate) const ENV_NONCE: &str = "ATERM_SEAMLESS_NONCE";
-pub(crate) const ENV_LAYOUT: &str = "ATERM_SEAMLESS_LAYOUT";
-pub(crate) const ENV_TARGET: &str = "ATERM_SEAMLESS_TARGET";
+pub(crate) const ENV_MANIFEST: HandoffName = HandoffName::new("ATERM_SEAMLESS_MANIFEST");
+pub(crate) const ENV_FDS: HandoffName = HandoffName::new("ATERM_SEAMLESS_FDS");
+pub(crate) const ENV_NONCE: HandoffName = HandoffName::new("ATERM_SEAMLESS_NONCE");
+pub(crate) const ENV_LAYOUT: HandoffName = HandoffName::new("ATERM_SEAMLESS_LAYOUT");
+pub(crate) const ENV_TARGET: HandoffName = HandoffName::new("ATERM_SEAMLESS_TARGET");
 
 #[cfg(any(unix, test))]
 const ADOPTION_PROOF_DOMAIN: &[u8] = b"aterm-seamless-adoption-v1\0";
@@ -356,8 +356,8 @@ impl AdoptionProof {
 /// never a substitution. It is fine as ADDRESSING — which received descriptor
 /// is which `local_id` — and useless as proof.
 ///
-/// The two halves of that paragraph a running kernel can settle are now settled
-/// in the gate rather than by a note about what somebody once observed:
+/// The two halves of that paragraph a running kernel can settle are settled by
+/// a test rather than by a note about what somebody once observed:
 /// `the_replacement_proof_term_distinguishes_masters_and_survives_dup` opens
 /// three real masters at once, asserts three DISTINCT minors, and asserts `dup`
 /// preserves each — the substitution half and the same-open-file-description
@@ -3488,7 +3488,7 @@ fn shed_metas_to_budget(carries: &mut [WireCarry]) -> MetaBudget {
             shell.current_block = None;
             "the command mark and output block it was building"
         } else if meta_stacks_pushed(checkpoint) {
-            checkpoint.color.stack.clear();
+            checkpoint.color.clear_stack();
             if let Some(title) = checkpoint.title.as_mut() {
                 title.stack.clear();
             }
@@ -3545,7 +3545,7 @@ fn meta_has_sheddable(checkpoint: &TerminalCheckpoint) -> bool {
 /// Whether a meta carries a pushed colour or title stack.
 #[cfg(any(unix, test))]
 fn meta_stacks_pushed(checkpoint: &TerminalCheckpoint) -> bool {
-    !checkpoint.color.stack.is_empty()
+    checkpoint.color.has_stack()
         || checkpoint
             .title
             .as_ref()
@@ -4581,7 +4581,7 @@ pub(crate) fn write_outgoing_with_held(
             .max_by_key(|r| r.fabric.rows_cost())
         {
             let posts = rec.fabric.posts.len();
-            let receipts = rec.fabric.receipts.len();
+            let receipts = rec.fabric.receipts.len() + rec.fabric.earlier_receipts.len();
             rec.fabric.shed();
             aterm_log::warn!(
                 "overlap handoff: session {} carries {posts} waiting post(s) and {receipts} owed \
@@ -4968,26 +4968,26 @@ fn handoff_leftover_pid(name: &str) -> Option<u32> {
 /// carried window is painted — exit under me". Its own env var (never the
 /// `ATERM_SEAMLESS_FDS` wire: it is not a session, and it must FAIL the
 /// `fd_is_tty` backstop by design).
-pub(crate) const ENV_READY_FD: &str = "ATERM_HANDOFF_READY_FD";
-pub(crate) const ENV_COMMIT_FD: &str = "ATERM_HANDOFF_COMMIT_FD";
+pub(crate) const ENV_READY_FD: HandoffName = HandoffName::new("ATERM_HANDOFF_READY_FD");
+pub(crate) const ENV_COMMIT_FD: HandoffName = HandoffName::new("ATERM_HANDOFF_COMMIT_FD");
 /// OUT-OF-BAND LANE: the single-use rendezvous socket the outgoing process bound
 /// BEFORE it launched this successor. Its PRESENCE is the lane — there is no
 /// version byte anywhere, because a parent can only publish this name if it has
 /// out-of-band transport code, which is what makes "no parent already in the
 /// field can ever be shown the new shape" structural rather than argued.
 #[cfg(unix)]
-pub(crate) const ENV_RENDEZVOUS: &str = "ATERM_HANDOFF_RENDEZVOUS";
+pub(crate) const ENV_RENDEZVOUS: HandoffName = HandoffName::new("ATERM_HANDOFF_RENDEZVOUS");
 /// The secret that admits exactly one dialer to that rendezvous.
 #[cfg(unix)]
-pub(crate) const ENV_CLAIM: &str = "ATERM_HANDOFF_CLAIM";
+pub(crate) const ENV_CLAIM: HandoffName = HandoffName::new("ATERM_HANDOFF_CLAIM");
 #[cfg(unix)]
-pub(crate) const ENV_PARENT_PID: &str = "ATERM_HANDOFF_PARENT_PID";
+pub(crate) const ENV_PARENT_PID: HandoffName = HandoffName::new("ATERM_HANDOFF_PARENT_PID");
 /// The outgoing process's KERNEL BIRTH RECORD, published beside its pid. A pid
 /// alone is a recyclable number; this is what makes it an identity the
 /// successor can verify without being the outgoing process's fork child. See
 /// [`AttestedParent`] for why that distinction is the whole point.
 #[cfg(unix)]
-pub(crate) const ENV_PARENT_BIRTH: &str = "ATERM_HANDOFF_PARENT_BIRTH";
+pub(crate) const ENV_PARENT_BIRTH: HandoffName = HandoffName::new("ATERM_HANDOFF_PARENT_BIRTH");
 /// WHAT THE OUTGOING PROCESS CAN READ OF ITS SUCCESSOR'S EXIT (round eight of
 /// the update audit, finding 0): a comma-separated list of capabilities,
 /// published beside the parent's identity ([`outgoing_parent_env`], so the fork
@@ -5000,7 +5000,7 @@ pub(crate) const ENV_PARENT_BIRTH: &str = "ATERM_HANDOFF_PARENT_BIRTH";
 /// passing failure is the build that also writes this variable. So the variable
 /// is the only proof a successor has that its 75 will be read as meant.
 #[cfg(unix)]
-pub(crate) const ENV_EXIT_CAPS: &str = "ATERM_HANDOFF_EXIT_CAPS";
+pub(crate) const ENV_EXIT_CAPS: HandoffName = HandoffName::new("ATERM_HANDOFF_EXIT_CAPS");
 /// The one capability [`ENV_EXIT_CAPS`] names today: this parent files a
 /// successor's [`EXIT_SUCCESSOR_PASSING`] TRANSIENT and gives its counted trial
 /// launch back (`app_native::PhysicalFailureShape::of_child_death`).
@@ -5013,11 +5013,9 @@ pub(crate) const EXIT_CAPS_PASSING: &str = "passing75";
 /// exactly the property a bare pid lacks. Compared for EQUALITY only — it is an
 /// identity token, never a clock reading.
 ///
-/// The same idea already guards the managed-Ollama daemon
-/// (`title_summary::managed_ollama::ManagedProcessIdentity`, "a bare PID is not
-/// an identity: it can be reused after exit"); this is the update lane's copy,
-/// kept local because the handoff needs the probe on its own hot path and must
-/// not gain a dependency on the summary subsystem.
+/// The same idea guarded the since-retired managed-Ollama daemon ("a bare PID
+/// is not an identity: it can be reused after exit"); this is the update lane's
+/// copy, kept local because the handoff needs the probe on its own hot path.
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ProcessBirth {
@@ -5228,8 +5226,8 @@ fn attest_handoff_parent_from(
             ParentWitness::Birth(live)
         }
         (None, None) if creator == pid => {
-            // On macOS libproc answers for a live same-uid process (the managed-
-            // Ollama attestation depends on it), so no record is an anomaly, said
+            // On macOS libproc answers for a live same-uid process (the retired
+            // managed-Ollama attestation depended on it), so no record is an anomaly, said
             // below as the one signal that this machine's handoffs run on the
             // weaker witness — or the parent is already EXITING: its birth read
             // fails about a millisecond before this link moves (the order measured
@@ -5347,15 +5345,9 @@ impl AttestedParent {
     /// published none — we only ever hold a `Birth` witness we proved, so
     /// publishing it forward is passing on a proof, not inventing one.
     fn exec_env(self) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
-        let mut pairs = vec![(
-            std::ffi::OsString::from(ENV_PARENT_PID),
-            std::ffi::OsString::from(self.pid.to_string()),
-        )];
+        let mut pairs = vec![ENV_PARENT_PID.pair(self.pid.to_string())];
         if let ParentWitness::Birth(birth) = self.witness {
-            pairs.push((
-                std::ffi::OsString::from(ENV_PARENT_BIRTH),
-                std::ffi::OsString::from(birth.to_wire()),
-            ));
+            pairs.push(ENV_PARENT_BIRTH.pair(birth.to_wire()));
         }
         pairs
     }
@@ -5406,12 +5398,12 @@ impl AttestedParent {
 /// newer build, and this very build captures and consumes the name.
 #[cfg(unix)]
 #[must_use]
-pub(crate) fn outgoing_parent_env() -> Vec<(&'static str, String)> {
-    let mut pairs = vec![(ENV_PARENT_PID, std::process::id().to_string())];
+pub(crate) fn outgoing_parent_env() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    let mut pairs = vec![ENV_PARENT_PID.pair(std::process::id().to_string())];
     if let Some(birth) = own_process_birth() {
-        pairs.push((ENV_PARENT_BIRTH, birth.to_wire()));
+        pairs.push(ENV_PARENT_BIRTH.pair(birth.to_wire()));
     }
-    pairs.push((ENV_EXIT_CAPS, EXIT_CAPS_PASSING.to_string()));
+    pairs.push(ENV_EXIT_CAPS.pair(EXIT_CAPS_PASSING));
     pairs
 }
 
@@ -5540,7 +5532,7 @@ impl PrearmedIncomingFds {
 /// control-socket witness are not among them, exactly as before (a refused
 /// boot never reads them).
 #[cfg(unix)]
-const PREARM_KEYS: &[&str] = &[
+const PREARM_KEYS: &[HandoffName] = &[
     ENV_MANIFEST,
     ENV_FDS,
     ENV_NONCE,
@@ -5559,7 +5551,7 @@ const PREARM_KEYS: &[&str] = &[
 
 #[cfg(unix)]
 fn clear_handoff_env(env: &mut HandoffEnv) {
-    for key in PREARM_KEYS {
+    for &key in PREARM_KEYS {
         env.remove(key);
     }
 }
@@ -6979,7 +6971,34 @@ impl PackedTabStops {
 /// the carry under the terminal's lock and builds the META after releasing it.
 #[cfg(all(unix, test))]
 pub(crate) fn keeper_meta(term: &aterm_core::terminal::Terminal) -> Option<Vec<u8>> {
-    keeper_meta_of(term.carry_meta_abandoning_partial())
+    keeper_meta_of(term.carry_meta_abandoning_partial(), None)
+}
+
+/// The top-level member of a keeper META that carries the session's fabric
+/// ([`crate::fabric::KeeperCarry`]). A window before it ignores the member, as
+/// it ignores [`PACKED_TAB_STOPS_KEY`].
+#[cfg(unix)]
+const KEEPER_FABRIC_KEY: &str = "fabric";
+
+/// `json`, a META object, with `fabric` as its [`KEEPER_FABRIC_KEY`] member,
+/// appended so the screen's own bytes stay as they were.
+#[cfg(unix)]
+fn with_fabric(mut json: Vec<u8>, fabric: Option<&[u8]>) -> Option<Vec<u8>> {
+    let Some(fabric) = fabric else {
+        return Some(json);
+    };
+    if json.pop() != Some(b'}') {
+        return None;
+    }
+    if json != b"{" {
+        json.push(b',');
+    }
+    json.push(b'"');
+    json.extend_from_slice(KEEPER_FABRIC_KEY.as_bytes());
+    json.extend_from_slice(b"\":");
+    json.extend_from_slice(fabric);
+    json.push(b'}');
+    Some(json)
 }
 
 /// THE KEEPER'S META (PTY keeper P3, design §5.3 step 2): the Repaint rung's
@@ -7019,17 +7038,49 @@ pub(crate) fn keeper_meta(term: &aterm_core::terminal::Terminal) -> Option<Vec<u
 /// sets in every slot) it sheds to 3,675, 421 under the cap; that test builds
 /// both and holds each under the cap. So `None` means only that those scalars
 /// outgrew the cap.
+///
+/// THE SESSION'S FABRIC rides beside them, under [`KEEPER_FABRIC_KEY`]
+/// ([`crate::fabric::KeeperCarry`]: the holds, the id lease, the topics, the
+/// queued post ids, the owed receipts' count and `dropped=`), in every rung: what does
+/// not fit is the screen's to shed first, since a lost topic is lost consent
+/// and a lost hold a lifted halt, and none of the screen's rungs is more than
+/// what a repaint or a `cd` restores. Only when even the fewest scalars leave
+/// no room do the fabric's lists give way to their counts, and then the
+/// holds' reasons to a fixed word (its `rungs`) — never a hold. Measured
+/// 2026-10-16 with the fullest fabric, both origins held with the longest
+/// reasons JSON can double and the lease and `dropped=` at their ceiling:
+/// 3,975 bytes for the fullest session, every reason whole; with the widest
+/// scalars as well, 3,892, the reasons given way and both holds standing. `None` for `fabric` is a test's META, the
+/// screen alone.
 #[cfg(unix)]
-pub(crate) fn keeper_meta_of(mut meta: CheckpointMeta) -> Option<Vec<u8>> {
+pub(crate) fn keeper_meta_of(
+    mut meta: CheckpointMeta,
+    fabric: Option<&crate::fabric::KeeperCarry>,
+) -> Option<Vec<u8>> {
+    meta.shell_integration_nonce = None;
+    meta.parser = None;
+    meta.output_state = aterm_core::terminal::OutputStateRepr::default();
+    let Some(fabric) = fabric else {
+        return keeper_meta_shed(meta, None);
+    };
+    fabric.rungs().iter().find_map(|rung| {
+        let section = aterm_json::to_vec(rung).ok()?;
+        keeper_meta_shed(meta.clone(), Some(&section))
+    })
+}
+
+/// [`keeper_meta_of`]'s screen: the whole carry in the old form, else packed
+/// and shed one rung at a time, each with `fabric` beside it.
+#[cfg(unix)]
+fn keeper_meta_shed(mut meta: CheckpointMeta, fabric: Option<&[u8]>) -> Option<Vec<u8>> {
     fn cursors(
         meta: &mut CheckpointMeta,
     ) -> impl Iterator<Item = &mut aterm_core::terminal::GridCursorRepr> {
         std::iter::once(&mut meta.cursor).chain(&mut meta.alt_cursor)
     }
-    let under_cap = |bytes: Vec<u8>| (bytes.len() <= aterm_keeper::wire::MAX_META).then_some(bytes);
-    meta.shell_integration_nonce = None;
-    meta.parser = None;
-    meta.output_state = aterm_core::terminal::OutputStateRepr::default();
+    let under_cap = |bytes: Vec<u8>| {
+        with_fabric(bytes, fabric).filter(|bytes| bytes.len() <= aterm_keeper::wire::MAX_META)
+    };
     if let Some(bytes) = aterm_json::to_string(&meta)
         .ok()
         .map(String::into_bytes)
@@ -7146,6 +7197,107 @@ pub(crate) fn recovered_checkpoint(
     )
 }
 
+/// What a keeper-recovered session's fabric comes back as
+/// ([`recovered_fabric`]): the rows and the carry `spawn::seed_adopted_fabric`
+/// puts back, and what the META counted without naming.
+#[cfg(unix)]
+#[derive(Debug, Default)]
+pub(crate) struct RecoveredFabric {
+    /// The hold rows, the META's `hold` and then its `more_holds`, read
+    /// fail-closed by `fabric::parse_holds`.
+    pub(crate) holds: Vec<String>,
+    /// The topic rows, validated by `fabric::parse_topics`.
+    pub(crate) topics: Vec<String>,
+    /// The id lease (or the fence), the queued post ids to retire dead and
+    /// the owed receipts' count.
+    pub(crate) carry: crate::fabric::FabricCarry,
+    /// Opt-ins the META had no room to name.
+    pub(crate) topics_lost: u64,
+    /// Queued posts the META had no room to name.
+    pub(crate) queued_lost: u64,
+}
+
+/// THE FABRIC A KEEPER META CARRIED ([`crate::fabric::KeeperCarry`], under
+/// [`KEEPER_FABRIC_KEY`]), read LENIENTLY and apart from the screen, so a META
+/// whose screen does not read still gives its hold back. The META is another
+/// window's word, possibly another build's:
+///
+/// * no section (an older window's META, or none at all): no hold and no
+///   topics, as before, and the id counters FENCED
+///   ([`crate::fabric::FabricCarry::fenced`]) rather than restarted;
+/// * a `hold` that is not a string, a `more_holds` member that is not one or
+///   a `more_holds` that is no list, or a section that is not an object: a
+///   row outside the grammar, which `parse_hold` turns into a local
+///   `carried-unreadable` halt — dropping it could lift one;
+/// * a META from before the two slots carries `hold` alone, which is that
+///   one hold;
+/// * a lease that is not three counters: fenced; a list member that is not
+///   its type: skipped (the topic rows are validated where they are seeded,
+///   and a queued id the lease does not cover is never retired); a count that
+///   is not one (`owed`, `dropped`, `topics_lost`, `queued_lost`): 0.
+#[cfg(unix)]
+pub(crate) fn recovered_fabric(meta: &[u8]) -> RecoveredFabric {
+    use aterm_json::Value;
+    let value = std::str::from_utf8(meta)
+        .ok()
+        .and_then(|text| aterm_json::from_str::<Value>(text).ok());
+    let Some(section) = value
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|object| object.get(KEEPER_FABRIC_KEY))
+    else {
+        return RecoveredFabric {
+            carry: crate::fabric::FabricCarry::fenced(),
+            ..RecoveredFabric::default()
+        };
+    };
+    let Some(section) = section.as_object() else {
+        return RecoveredFabric {
+            holds: vec![String::new()],
+            carry: crate::fabric::FabricCarry::fenced(),
+            ..RecoveredFabric::default()
+        };
+    };
+    let count = |key: &str| section.get(key).and_then(Value::as_u64).unwrap_or(0);
+    let list = |key: &str| section.get(key).and_then(Value::as_array);
+    let lease = list("ids")
+        .and_then(|ids| ids.iter().map(Value::as_u64).collect::<Option<Vec<u64>>>())
+        .and_then(|ids| <[u64; 3]>::try_from(ids).ok());
+    let mut carry = lease.map_or_else(
+        crate::fabric::FabricCarry::fenced,
+        crate::fabric::FabricCarry::leased,
+    );
+    carry.uncarried = list("queued")
+        .map(|ids| ids.iter().filter_map(Value::as_u64).collect())
+        .unwrap_or_default();
+    carry.receipts_uncarried = count("owed");
+    // `dropped=` goes on counting from the dead window's; a META from before
+    // the count reads 0, as it always did.
+    carry.dropped = count("dropped");
+    // Fail closed, member by member: what is not a string is an unreadable
+    // row, and a `more_holds` that is no list is one.
+    let row = |hold: &Value| hold.as_str().unwrap_or_default().to_owned();
+    let mut holds: Vec<String> = section.get("hold").map(row).into_iter().collect();
+    match section.get("more_holds") {
+        None => {}
+        Some(Value::Array(rows)) => holds.extend(rows.iter().map(row)),
+        Some(_) => holds.push(String::new()),
+    }
+    RecoveredFabric {
+        holds,
+        topics: list("topics")
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|row| row.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        carry,
+        topics_lost: count("topics_lost"),
+        queued_lost: count("queued_lost"),
+    }
+}
+
 /// [`take_incoming_from`] over the process environment: the env-shaped entry
 /// point the handoff suites drive (`handoff_env::through_process_env`).
 #[cfg(test)]
@@ -7237,7 +7389,7 @@ fn refused_whole(whose: WholeRefusal, why: &str) -> IncomingHandoff {
 /// The names [`take_incoming_from_as`] reads: the four it consumes and the two
 /// channel names whose presence it checks.
 #[cfg(test)]
-const INTAKE_KEYS: &[&str] = &[
+const INTAKE_KEYS: &[HandoffName] = &[
     ENV_MANIFEST,
     ENV_NONCE,
     ENV_FDS,
@@ -7729,12 +7881,12 @@ fn take_incoming_from_as(env: &mut HandoffEnv, shape: ReceiverShape) -> Incoming
                     loader: rec.loader,
                     // THE HISTORY CARRY, imported after Commit.
                     history,
-                    // THE STANDING HALT (round four, item 3): the row as the
-                    // record carried it, read FAIL-CLOSED at the seed
-                    // (`spawn::seed_adopted_fabric`) — whatever rung the screen
-                    // crossed at, and whether or not the proof covers it,
-                    // because a halt is not the screen's to lose.
-                    hold: rec.hold.clone(),
+                    // THE STANDING HALTS (round four, item 3): the rows as the
+                    // record carried them, one per origin, read FAIL-CLOSED at
+                    // the seed (`spawn::seed_adopted_fabric`) — whatever rung
+                    // the screen crossed at, and whether or not the proof
+                    // covers it, because a halt is not the screen's to lose.
+                    holds: rec.hold_rows(),
                     // THE RECORD'S TITLE (round four, item 8a), the fallback for
                     // a checkpoint that carried none (`spawn::seed_adopted_title`)
                     // — unless the layout names the session with a title its
@@ -7761,6 +7913,12 @@ fn take_incoming_from_as(env: &mut HandoffEnv, shape: ReceiverShape) -> Incoming
                     // mailbox re-validated row by row at the seed.
                     fabric: rec.fabric.clone(),
                     timeline_id: rec.timeline_id,
+                    // THE SESSION LOG'S EPOCH AND NODE-ID COUNTERS (slice 1):
+                    // a row that does not read carries none, never the manifest.
+                    log_carry: rec
+                        .log_ids
+                        .as_deref()
+                        .and_then(crate::session_log::LogCarry::parse),
                     // THE PAIR THE CRASH JOURNAL KEYS THE SHELL BY, when the
                     // outgoing process held an image not its own (round
                     // seven's leftover I2b); one that does not read is none.

@@ -52,6 +52,14 @@
 //! the place the key was committed at. A row empty because the echo is late
 //! must not start a search.
 //!
+//! On the row the caret picks the copy ([`Anchor`]): one it anchors exactly,
+//! then one it stands inside (recorded mid-echo), then one it merely reaches,
+//! taken only with the live cursor just past it. So `sit sit␣` typed in one
+//! burst flashes the copy that fired, and under a scroll nobody reported the
+//! shell's `bash: sit: command not found` on the caret's row does not flash.
+//! Output whose `sit` the prompt's width lines up exactly with the caret, under
+//! such a scroll, still can.
+//!
 //! # Scope
 //!
 //! Window-scoped, not parked with the panes: a keyboard has one owner, so the
@@ -239,6 +247,22 @@ impl TrickFlash {
 
     /// Forget panes the window no longer shows: their memo entries, and a slot
     /// naming one (no rescan will collect it).
+    #[cfg_attr(
+        any(test, feature = "spec-anchors"),
+        aterm_spec::refines(
+            machine = "TrickFlashLifecycle",
+            action = "CloseOwn",
+            project = "conformance_trick_flash::project"
+        )
+    )]
+    #[cfg_attr(
+        any(test, feature = "spec-anchors"),
+        aterm_spec::refines(
+            machine = "TrickFlashLifecycle",
+            action = "CloseOther",
+            project = "conformance_trick_flash::project"
+        )
+    )]
     pub(crate) fn retain_panes(&mut self, keep: impl Fn(u64) -> bool) {
         self.base_y.retain(|(pane, _)| pane.is_none_or(&keep));
         if self
@@ -247,6 +271,24 @@ impl TrickFlash {
         {
             self.slot = None;
         }
+    }
+
+    /// The slot names the pane its key went to and was found there: that
+    /// pane's, not the window-wide grid's, so a bind from unbound carries it
+    /// across its reset. An unfound word's caret may be the window-wide grid's
+    /// (the unsplit host names its session too), whose geometry the bind just
+    /// changed, so it goes; a found one ends by itself if its columns moved.
+    #[cfg_attr(
+        any(test, feature = "spec-anchors"),
+        aterm_spec::refines(
+            machine = "TrickFlashLifecycle",
+            action = "Rebind",
+            project = "conformance_trick_flash::project"
+        )
+    )]
+    pub(crate) fn found_in_a_pane(&self) -> bool {
+        self.slot
+            .is_some_and(|slot| slot.pane.is_some() && slot.located.is_some())
     }
 
     /// Drop the flash. Idempotent, so the engine's per-pane reset may call it per
@@ -263,6 +305,22 @@ impl TrickFlash {
     /// Fail-silent: no caret observation, an empty or over-long word, or a flash
     /// that only just started stores nothing. O(len) into a fixed inline buffer;
     /// never allocates.
+    #[cfg_attr(
+        any(test, feature = "spec-anchors"),
+        aterm_spec::refines(
+            machine = "TrickFlashLifecycle",
+            action = "NotePane",
+            project = "conformance_trick_flash::project"
+        )
+    )]
+    #[cfg_attr(
+        any(test, feature = "spec-anchors"),
+        aterm_spec::refines(
+            machine = "TrickFlashLifecycle",
+            action = "NoteWindow",
+            project = "conformance_trick_flash::project"
+        )
+    )]
     pub(crate) fn note(
         &mut self,
         now: Instant,
@@ -327,6 +385,14 @@ impl TrickFlash {
     /// The line was not pet talk. A flash on the glass leaves over
     /// [`REVOKE_FADE_MS`]; one never found is dropped. Idempotent (the first
     /// stamp stands, so the fade cannot restart).
+    #[cfg_attr(
+        any(test, feature = "spec-anchors"),
+        aterm_spec::refines(
+            machine = "TrickFlashLifecycle",
+            action = "Revoke",
+            project = "conformance_trick_flash::project"
+        )
+    )]
     pub(crate) fn revoke(&mut self, now: Instant) {
         let Some(slot) = self.slot.as_mut() else {
             return;
@@ -365,6 +431,14 @@ impl TrickFlash {
     #[allow(
         clippy::too_many_arguments,
         reason = "the rescan hands over its scope, clock, geometry, caret, gate and row source in one call; a carrier struct would rename the list, not shrink it"
+    )]
+    #[cfg_attr(
+        any(test, feature = "spec-anchors"),
+        aterm_spec::refines(
+            machine = "TrickFlashLifecycle",
+            action = "Find",
+            project = "conformance_trick_flash::project"
+        )
     )]
     pub(crate) fn on_rescan(
         &mut self,
@@ -651,19 +725,30 @@ fn is_strong_rtl(c: char) -> bool {
     )
 }
 
+/// How well the recorded caret agrees with a match, weakest first.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum Anchor {
+    /// Within reach and nothing more: taken only with the live cursor just
+    /// past the word.
+    Slack,
+    /// The caret stands inside what was typed: recorded mid-echo.
+    Inside,
+    /// The caret sits exactly where the typed characters put it.
+    Exact,
+}
+
 /// One whole-word match on a row.
 #[derive(Clone, Copy)]
 struct Hit {
     /// LEAD columns of the matched scalars, ascending.
     cols: [u16; MAX_CHARS],
-    /// The caret sits exactly where the typed characters put it.
-    exact: bool,
+    anchor: Anchor,
 }
 
 /// The best whole-word occurrence of `seq` in `cells` within reach of the caret:
-/// exact anchors before tolerant ones, and among equals the rightmost (the word
-/// just typed is the last thing on its line). Continuation halves of wide glyphs
-/// carry no scalar and are skipped; columns come from the cells.
+/// by [`Anchor`], and among equals the rightmost (the word just typed is the
+/// last thing on its line). Continuation halves of wide glyphs carry no scalar
+/// and are skipped; columns come from the cells.
 ///
 /// Reach is the typed-edit witness's span reach (the caret may be at the word's
 /// start, inside it, or past it) widened by `2·back_chars + 2` columns, since a
@@ -673,6 +758,13 @@ struct Hit {
 /// Exact means the distance is what `back_chars` narrow or wide characters make
 /// it: `caret == end + 1 + w·back` (typed, word on the left) or
 /// `caret + w·back == start` (one commit, word on the right), `w ∈ {1, 2}`.
+/// Inside means the caret stands in the span the typed characters cover (the
+/// word widened by `2·back` columns each side): `sit sit␣` in one burst with
+/// the caret noted at `$ s` is the first copy, not the rightmost. Slack is the
+/// rest of the reach, a burst that outran its echo; its echo leaves the live
+/// cursor on this row past the word by at most the typed tail (`back` and the
+/// boundary key, two cells each), so Slack needs `cursor_col` there. Output
+/// meets the reach and nothing else.
 ///
 /// `exact_only` (the upward search) takes the left reading alone: it follows a
 /// line that moved, so it may only look for a word already seen in full (a caret
@@ -689,10 +781,12 @@ fn find_in_row(
     seq: &[char],
     caret_col: u16,
     back_chars: u16,
+    cursor_col: Option<u16>,
     exact_only: bool,
 ) -> Option<Hit> {
     let (first, caret, back) = (*seq.first()?, i64::from(caret_col), i64::from(back_chars));
     let reach = i64::from(TYPED_EDIT_REACH_COLS) + 2 * back + 2;
+    let cursor = cursor_col.map(i64::from);
     let mut best: Option<Hit> = None;
     for start in 0..cells.len() {
         if cells[start].wide || cells[start].ch != first {
@@ -739,10 +833,18 @@ fn find_in_row(
         if exact_only && !typed_left {
             continue;
         }
-        let exact = typed_left || committed_right;
-        // Left-to-right walk: `>=` on the exactness rank keeps the rightmost.
-        if best.is_none_or(|b| exact >= b.exact) {
-            best = Some(Hit { cols, exact });
+        let anchor = if typed_left || committed_right {
+            Anchor::Exact
+        } else if (start - 2 * back..=end + 1 + 2 * back).contains(&caret) {
+            Anchor::Inside
+        } else if cursor.is_some_and(|at| (end + 1..=end + 3 + 2 * back).contains(&at)) {
+            Anchor::Slack
+        } else {
+            continue;
+        };
+        // Left-to-right walk: `>=` on the rank keeps the rightmost of equals.
+        if best.is_none_or(|b| anchor >= b.anchor) {
+            best = Some(Hit { cols, anchor });
         }
     }
     best
@@ -751,13 +853,19 @@ fn find_in_row(
 /// [`find_in_row`] for the typed spelling and, for an RTL word, its mirror (the
 /// GUI delivers an RTL run reversed in place, same columns, reversed scalars).
 /// Returns the hit and whether it was mirrored.
-fn find_word(slot: &Slot, cells: &[RenderCell], exact_only: bool) -> Option<(Hit, bool)> {
+fn find_word(
+    slot: &Slot,
+    cells: &[RenderCell],
+    cursor_col: Option<u16>,
+    exact_only: bool,
+) -> Option<(Hit, bool)> {
     let n = usize::from(slot.len);
     let typed = find_in_row(
         cells,
         &slot.chars[..n],
         slot.caret.1,
         slot.back_chars,
+        cursor_col,
         exact_only,
     );
     if !slot.rtl {
@@ -770,10 +878,11 @@ fn find_word(slot: &Slot, cells: &[RenderCell], exact_only: bool) -> Option<(Hit
         &mirror[..n],
         slot.caret.1,
         slot.back_chars,
+        cursor_col,
         exact_only,
     );
     match (typed, mirrored) {
-        (Some(a), Some(b)) if b.exact && !a.exact => Some((b, true)),
+        (Some(a), Some(b)) if b.anchor > a.anchor => Some((b, true)),
         (Some(a), _) => Some((a, false)),
         (None, Some(b)) => Some((b, true)),
         (None, None) => None,
@@ -801,7 +910,8 @@ fn scrolled(row: u16, then: Option<i64>, now: Option<i64>) -> (i64, i64) {
 /// row, so a cursor still there at or past the recorded caret means the line is
 /// still being typed; off that row, or left of the caret (a fresh prompt), it
 /// was left behind. A new prompt that grew past the old caret reads as still
-/// typing and costs that one flash.
+/// typing and costs that one flash. The same cursor, on the expected row, is
+/// the evidence an [`Anchor::Slack`] copy needs.
 #[allow(
     clippy::too_many_arguments,
     reason = "on_rescan's list minus the gate it already applied; the slot, the clock, both carets, the geometry and the row source are each read once"
@@ -820,12 +930,13 @@ fn locate(
     let mut found = None;
     if let Some(row) = usize::try_from(expected).ok().filter(|row| *row < rows) {
         load_row(row, row_buf);
-        found = find_word(slot, row_buf, false).map(|hit| (row, hit));
+        let cursor_col = (usize::from(cursor.0) == row).then_some(cursor.1);
+        found = find_word(slot, row_buf, cursor_col, false).map(|hit| (row, hit));
         let left_behind = cursor.0 != slot.caret.0 || cursor.1 < slot.caret.1;
         if found.is_none() && delta == 0 && left_behind {
             for above in (row.saturating_sub(SEARCH_UP_ROWS)..row).rev() {
                 load_row(above, row_buf);
-                if let Some(hit) = find_word(slot, row_buf, true) {
+                if let Some(hit) = find_word(slot, row_buf, None, true) {
                     found = Some((above, hit));
                     break;
                 }
@@ -1588,26 +1699,89 @@ mod tests {
         }
     }
 
-    /// Preference on the caret's row: an exact anchor beats a tolerant one, among
-    /// equals the rightmost wins, and out of reach is no hit.
+    /// Preference on the caret's row: Exact, then Inside, then Slack, which
+    /// counts only with the live cursor just past the word; among equals the
+    /// rightmost wins, and out of reach is no hit.
     #[test]
-    fn an_exact_anchor_beats_a_tolerant_one_and_among_equals_the_rightmost_wins() {
+    fn an_exact_anchor_beats_an_inside_one_beats_slack_and_among_equals_the_rightmost_wins() {
+        use Anchor::{Exact, Inside, Slack};
         let mut g = Glass::new(Path::Cold, 2, 40);
         g.feed("$ sit sit");
         let row = g.row(0);
-        let find = |caret_col: u16| {
-            find_in_row(&row, &['s', 'i', 't'], caret_col, 0, false)
-                .map(|hit| (hit.cols[0], hit.exact))
+        let find = |caret_col: u16, cursor_col: Option<u16>| {
+            find_in_row(&row, &['s', 'i', 't'], caret_col, 0, cursor_col, false)
+                .map(|hit| (hit.cols[0], hit.anchor))
         };
         assert_eq!(
-            find(5),
-            Some((2, true)),
+            find(5, None),
+            Some((2, Exact)),
             "exact on the left, though the right one is within reach"
         );
-        assert_eq!(find(8), Some((6, false)), "both tolerant: the rightmost");
-        assert_eq!(find(9), Some((6, true)));
-        assert_eq!(find(6), Some((6, true)), "the caret at the word's START");
-        assert_eq!(find(20), None, "out of reach");
+        assert_eq!(find(9, None), Some((6, Exact)));
+        assert_eq!(
+            find(6, None),
+            Some((6, Exact)),
+            "the caret at the word's START"
+        );
+        // `sit sit␣` in one burst, the caret noted at `$ s`: the copy it stands
+        // inside fired; the rightmost is only reached.
+        assert_eq!(find(3, Some(10)), Some((2, Inside)), "inside beats slack");
+        assert_eq!(find(8, None), Some((6, Inside)), "and the other way round");
+        assert_eq!(find(20, Some(10)), None, "out of reach");
+
+        // Slack alone: `$ ` noted, `x sit` typed in a burst.
+        let mut g = Glass::new(Path::Cold, 2, 40);
+        g.feed("$ x sit");
+        let row = g.row(0);
+        let find = |cursor_col: Option<u16>| {
+            find_in_row(&row, &['s', 'i', 't'], 2, 0, cursor_col, false)
+                .map(|hit| (hit.cols[0], hit.anchor))
+        };
+        assert_eq!(find(Some(7)), Some((4, Slack)), "the burst's own echo");
+        assert_eq!(find(Some(9)), Some((4, Slack)), "and a wide boundary key");
+        assert_eq!(find(Some(10)), None, "the cursor ran on past the tail");
+        assert_eq!(find(Some(6)), None, "the cursor has not passed the word");
+        assert_eq!(find(None), None, "the cursor is on another row");
+    }
+
+    /// `sit sit␣` typed in one burst, the caret noted at `$ s`: the phrase law
+    /// fired on the first copy and absorbed the second, so the first flashes.
+    #[test]
+    fn a_burst_flashes_the_copy_that_fired_not_the_rightmost() {
+        for path in BOTH {
+            let t0 = Instant::now();
+            let mut g = Glass::new(path, 4, 40);
+            g.echo("$ s", t0);
+            g.wd.note_trick_typed(t0, None, "sit", 0);
+            g.echo("it sit ", t0);
+            assert_eq!(
+                cells_at(&g.frame(t0 + ms(300)).0),
+                [(0, 2), (0, 3), (0, 4)],
+                "{path:?}"
+            );
+        }
+    }
+
+    /// Under a scroll nobody reported, bash's `bash: sit: command not found`
+    /// lands on the caret's row with its `sit` within reach of a two-column
+    /// prompt's caret, and the cursor at the end of that line. It never flashes;
+    /// the typed line is found upward once the next prompt leaves it behind.
+    #[test]
+    fn output_the_caret_only_reaches_never_flashes_under_an_unreported_scroll() {
+        for path in BOTH {
+            let t0 = Instant::now();
+            let mut g = Glass::new(path, 6, 40).unwired();
+            g.echo("\x1b[2;5r\x1b[5;1H$ sit", t0);
+            g.fire("sit", 0, "\r\nbash: sit: command not found", t0);
+            assert_eq!(g.caret().0, 4, "the error is on the caret's row");
+            assert!(g.frame(t0 + ms(300)).0.is_empty(), "{path:?}: output");
+            g.echo("\r\n$ ", t0 + ms(320));
+            assert_eq!(
+                cells_at(&g.frame(t0 + ms(600)).0),
+                [(2, 2), (2, 3), (2, 4)],
+                "{path:?}: the typed line"
+            );
+        }
     }
 
     /// A held address word sits a few typed characters left of the caret:
@@ -1722,7 +1896,51 @@ mod tests {
             assert_eq!(wd.trick_flash_phase(t0), TrickFlashPhase::Live);
             wd.retain_panes(|pane| pane != closed);
             assert_eq!(wd.trick_flash_phase(t0), left, "pane {closed} closed");
+            // Closing the BOUND pane 2 left the engine unbound, so the split
+            // host's next bind is a pane-space reset; pane 1's flash survives it.
+            wd.bind_pane(1, (0, 0));
+            assert_eq!(wd.trick_flash_phase(t0), left, "pane {closed}: re-bound");
+            if closed == 2 {
+                wd.rescan(&a, 4, 40, &lex, &cfg, 3, t0);
+                let (mut out, mut ink, mut free, mut nova) = (vec![], vec![], vec![], vec![]);
+                let geom = EffectGeom::default();
+                let t = t0 + ms(300);
+                wd.tick(
+                    t, &cfg, geom, None, None, true, &mut out, &mut ink, &mut free, &mut nova,
+                );
+                assert_eq!(cells_at(&ink), [(0, 2), (0, 3), (0, 4)], "and it paints");
+            }
         }
+    }
+
+    /// A flash that names no pane is the window-wide grid's own, and the bind
+    /// that makes the window a split retires it with that grid. So does a word
+    /// the unsplit host noted for its session and nobody found yet: its caret
+    /// was recorded in the geometry the split just changed.
+    #[test]
+    fn a_flash_that_names_no_pane_dies_with_the_window_wide_grid() {
+        let t0 = Instant::now();
+        let (lex, cfg) = (Lexicon::with_languages(&["en"]), DecoConfig::default());
+        let mut a = Terminal::new(4, 40);
+        a.process(b"$ sit");
+        let mut wd = WordDecorations::default();
+        wd.rescan(&a, 4, 40, &lex, &cfg, 1, t0);
+        wd.note_trick_typed(t0, None, "sit", 0);
+        a.process(b" ");
+        wd.rescan(&a, 4, 40, &lex, &cfg, 2, t0);
+        assert_eq!(wd.trick_flash_phase(t0), TrickFlashPhase::Live);
+        wd.bind_pane(1, (0, 0));
+        assert_eq!(wd.trick_flash_phase(t0), TrickFlashPhase::Idle);
+
+        let mut a = Terminal::new(4, 40);
+        a.process(b"$ sit");
+        let mut wd = WordDecorations::default();
+        wd.set_scan_session(Some(1));
+        wd.rescan(&a, 4, 40, &lex, &cfg, 1, t0);
+        wd.note_trick_typed(t0, Some(1), "sit", 0);
+        assert_eq!(wd.trick_flash_phase(t0), TrickFlashPhase::Pending);
+        wd.bind_pane(1, (0, 0));
+        assert_eq!(wd.trick_flash_phase(t0), TrickFlashPhase::Idle, "unfound");
     }
 
     /// A host naming no pane in the note but declaring its scan session: the row

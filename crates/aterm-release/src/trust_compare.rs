@@ -1,132 +1,70 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE CANDIDATE GATE (D27 in `$HOME/trust` docs/DECISION_QUEUE.md): a Trust
-//! toolchain is published only when, on the same aterm
-//! commit and the same machine, it proves every library at least as well as
-//! the PUBLISHED seal does, and gives every library a result within a bounded
-//! time. `tools/trust-gate-candidate.sh` runs the whole-tree lane
-//! (`tools/trust-gate-all.sh`) twice — the published seal first, then the
-//! candidate, each in a target root of its own under the same per-crate wall
-//! budget — and asks this module, `aterm-release trust compare`, for the
-//! verdict.
+//! The candidate gate's comparison (`ship trust compare`): a Trust toolchain is published
+//! only when, on the same aterm commit and machine, it proves every library at least as well
+//! as the published seal does and gives every library a result within a bounded time.
+//! `ship trust candidate` ([`crate::trust_candidate`]) runs the whole-tree lane
+//! ([`crate::trust_lane`]) twice, the seal first, each in its own target root under the same
+//! per-crate wall budget, and asks this module for the verdict.
 //!
-//! WHY NOT THE LANE'S OWN VERDICT. Each run's judge holds its library to the
-//! floors in `tools/trust-gate-ratchet.tsv`, which name the prover that
-//! recorded them: a candidate inherits every floor (a `DRIVER CHANGED:` note),
-//! and the published seal's own run fails wherever this host cannot reproduce
-//! a floor recorded on a larger one. Neither run's verdict, and neither run's
-//! STATUS column, says what the CANDIDATE proves against the SEAL. And the
-//! judge prints `-` for the proved count of a CAP-BOUND or `NOT-VERIFIED(clock)`
-//! row, so its table hides numbers a comparison needs (the seal's aterm-grid,
-//! 986 proved, was `NOT-VERIFIED(clock,<987,48)` there). So this compares what
-//! each run MEASURED — [`Measured`], read from each check's own log by the
-//! judge's own reader ([`Plan::parse`], [`Plan::measure`]), nothing read twice
-//! and no rule copied — library against library.
+//! The lane's own verdict cannot answer: each run's judge holds a library to floors that
+//! name the prover that recorded them, so a candidate inherits every floor, the seal's own
+//! run fails wherever this host cannot reproduce a floor recorded on a larger one, and the
+//! judge prints `-` for the proved count of a CAP-BOUND or `NOT-VERIFIED(clock)` row. So this
+//! compares what each run measured ([`Measured`], read by the judge's own [`Plan::parse`]
+//! and [`Plan::measure`]), library against library.
 //!
-//! ONE SIDE OF ONE LIBRARY ([`Side`]) is read in the judge's order: the lane's
-//! wall budget ended it (OVER-BUDGET), targo would not start it
-//! (NOT-VERIFIED(trustd)), verification did not run (NOT-VERIFIED(rc)), it did
-//! not finish (NOT-VERIFIED(incomplete): a transport row, a signal, no complete
-//! Coverage line), it left no Summary (GATE-BROKE) or one that does not parse —
-//! and only then a RESULT, its proved and total counts. A library refused up
-//! front for memory, or one the tree's own lists never gate, is that decision.
+//! Where both checks gave a result ([`Side`], read in the judge's order), the candidate must
+//! prove every obligation the seal proved, each at its exact key (function, kind, site,
+//! description), from the per-obligation record each check left beside its log (the lane's
+//! `--obligations`, [`crate::trust_oblig`]). Twins (one key held more than once) are told
+//! apart by what else both runs report of them, else held to their worst case. Gains never
+//! offset a loss. A loss is excused only by an audited row of the retraction ledger
+//! (`crates/aterm-release/trust/retractions.tsv`, whose header states when a row applies),
+//! and only for the obligation it was audited for; anywhere else the row is NOT-APPLIED. A
+//! row that names nothing the seal proved is UNUSED, and said. A seal obligation the
+//! candidate reports nothing at (MISSING) no retraction excuses. A record that is missing,
+//! cut short, of another package or not its Summary's counts gives no result on that side.
 //!
-//! PER OBLIGATION, NOT PER COUNT ([`crate::trust_oblig`]). Where
-//! both checks gave a result, the candidate must prove EVERY OBLIGATION the
-//! seal proved — each at its exact key (function, kind, site, description) —
-//! read from the per-obligation record each check left beside its log (the
-//! lane's `--obligations`). Obligations one key holds more than once (TWINS)
-//! are told apart by what else both runs report of them, or else held to
-//! their worst case: a candidate proving a different twin than the seal did
-//! has lost one. Gains never offset a loss: a count hides one behind the other
-//! (trust main, 2026-10-02: aterm-grid lost 147 seal-proved obligations and
-//! gained 87, -60 by count). A loss is excused only by an audited row of the
-//! RETRACTION LEDGER (`tools/trust-gate-retractions.tsv`, `--retractions`),
-//! and only the very obligation it was audited for: its row applies only where
-//! the aterm tree both runs measured is the tree of the commit it was audited
-//! at, but for the ledger itself (read in the repository the ledger is in), the
-//! base ran the seal it was audited against, and the obligation its key names
-//! is at the site it records — anywhere else it is NOT-APPLIED (a key's place
-//! among look-alikes names another obligation once the tree or the seal
-//! changes). The seal's proof was FALSE, and the
-//! trust commit that retracts it — which the candidate's own trust must hold
-//! (`--candidate-trust-commit`, checked against its run's driver line, in
-//! `--trust-repo`: an ancestor, not reverted since, its reproducer still in
-//! the candidate's tree) — is named with the trust test that reproduces the
-//! false proof. A retraction the candidate still proves is STALE, one already
-//! in the published seal is wrong, and either refuses; so does a ledger with
-//! rows read where that cannot be told (the seal's commit unknown to
-//! `--trust-repo`, a shallow or grafted `--trust-repo`; git there runs with no
-//! inherited `GIT_*`, no global config and replace refs ignored). One that
-//! names nothing the seal proved is UNUSED (said, to be pruned). A seal
-//! obligation the candidate reports nothing at (MISSING) no retraction
-//! excuses. Two runs whose plans do not both say they captured the records are
-//! COULD NOT COMPARE, and a library whose record is missing, cut short, of
-//! another package, or not its Summary's counts gives no result on that side.
+//! The outcome per library ([`Outcome`]), candidate against base:
 //!
-//! THE OUTCOME per library ([`Outcome`]), candidate against base:
+//! * OK: both have a result, and the candidate proves every obligation the seal proved but
+//!   those the ledger excuses;
+//! * LOSS: an obligation the seal proved that the candidate does not, unexcused (each
+//!   listed, `LOST`); without both records, the candidate proving fewer than the seal's
+//!   result or, where the seal's own check gave none, than its [`Record`]. A shortfall the
+//!   candidate's lapsed clocks or trustd refusals could cover is named as possibly the
+//!   machine's and refused all the same;
+//! * NO-RESULT: the candidate gave no result, or no usable per-obligation record;
+//! * OK-FLOOR: said only by runs without per-obligation records (which are COULD NOT
+//!   COMPARE): the seal's own check gave no result for a reason that is the seal's, and the
+//!   candidate proves at least its [`Record`]. Compared obligation by obligation, the same
+//!   row is NO-BASELINE;
+//! * NO-BASELINE: the same, with nothing on record of which obligations the seal proves
+//!   there (no record, or only a count, which a candidate proving none of them can meet);
+//! * BASE-UNDECIDED: the seal's check gave no result for a reason that is the machine's
+//!   (trustd kept it from starting, a signal no budget sent, no exit status), or left no
+//!   usable per-obligation record;
+//! * NOT-ON-HOST: refused up front for memory under either toolchain, naming the need, this
+//!   host's ceiling and the RAM that verifies it;
+//! * SKIPPED: the same policy decision under both (NO-LIB, EXCLUDED, a queued fork);
+//! * INPUTS-DIFFER: one run selected it and the other did not, they decided it differently,
+//!   or its records lose fewer obligations than its counts do.
 //!
-//! * OK — both have a result, and every obligation the seal proved the
-//!   candidate proves too, but those the ledger excuses;
-//! * LOSS — an obligation the seal proved that the candidate does not, and no
-//!   retraction excuses (each one listed, `LOST`); without both records, the
-//!   candidate proving fewer than the seal: than its result here, or, where the
-//!   seal's own check gave none, than what the seal is on record proving
-//!   ([`Record`]). A shortfall the candidate's lapsed clocks or trustd refusals
-//!   could cover is named as possibly the machine's, and refused all the same:
-//!   re-run it;
-//! * NO-RESULT — the candidate gave no result: over its wall budget, not
-//!   started, not run, not finished, no Summary, no usable per-obligation record;
-//! * OK-FLOOR — what runs that captured no per-obligation records (which are
-//!   COULD NOT COMPARE) say where the published seal's own check gave no
-//!   result, for a reason that is the seal's (over the same budget, did not
-//!   finish without a signal, verification did not run, broke with an exit
-//!   status, an unparseable Summary), and the candidate proves at least what
-//!   the seal is on record proving ([`Record`]: the floor the seal's own prover
-//!   recorded in the ratchet, or the count its unfinished check here reached,
-//!   whichever is higher). A count never stands for obligations: compared
-//!   obligation by obligation, the same row is NO-BASELINE;
-//! * NO-BASELINE — the same, with nothing on record of WHICH obligations the
-//!   seal proves there (no record at all, or only a count, which a candidate
-//!   proving none of the seal's obligations can meet): refused (fail closed).
-//!   Run the seal so that it finishes the library;
-//! * BASE-UNDECIDED — the seal's check gave no result for a reason that is the
-//!   machine's, not the seal's (trustd kept it from starting; it, or its
-//!   compiler, was ended by a signal no budget sent; it left no exit status), or
-//!   left no usable per-obligation record: refused, re-run the base;
-//! * NOT-ON-HOST — refused up front for memory under either toolchain: nothing
-//!   was compared, and the gate refuses, naming what the run's own refusal
-//!   names (the need, this host's ceiling, the RAM that verifies it);
-//! * SKIPPED — the same policy decision under both (NO-LIB, EXCLUDED, a queued
-//!   fork): the tree's choice, not the compiler's;
-//! * INPUTS-DIFFER — one run selected it and the other did not, or they decided
-//!   it differently, or its records lose fewer obligations than its counts do
-//!   (impossible for records that are their checks'): the two runs did not
-//!   measure the same thing.
+//! The runs as a whole must be comparable, or nothing is (COULD NOT COMPARE): both
+//! concluded and measured the whole tree a release reads ([`Run::not_whole`]), at the same
+//! commit and tree, on the same machine, under the same per-crate budget and slot count,
+//! with two different provers (the base's the published seal's when the caller names it)
+//! and per-obligation records, and at least one library has a result under both. A ledger
+//! that does not read, a row the trust repository cannot vouch for, one whose commit the
+//! seal already holds, one the candidate still proves (STALE), and a trust commit its run's
+//! driver line disagrees with are COULD NOT COMPARE too.
 //!
-//! THE RUNS AS A WHOLE must be comparable, or nothing is (COULD NOT COMPARE):
-//! both concluded (the plan's PASS 3 `trustd` line), both measured the whole
-//! tree a release reads (a `file` section with no reason it may not file:
-//! no `ATERM_GATE_ONLY`, no `--per-commit`, the tree's own roster and scope
-//! list, a clean checkout that did not change during the run), on the same
-//! commit and tree, on the same machine (RAM, and the cores the lane read),
-//! under the same per-crate wall budget (`crate-budget`, which each plan must
-//! record) and slot count (`jobs`), with two different provers (the same prover
-//! twice compares nothing), each library named once in each plan (one log is
-//! read per name), each run's per-obligation records captured, and at least one
-//! library with a result under both — and, when the caller names it, the base's
-//! prover is the published seal's signed tree_root. A retraction ledger that
-//! does not read, names a commit or reproducer the trust repository lacks, a
-//! commit already in the seal, or one the candidate contradicts (STALE), and a
-//! trust commit its run's driver line disagrees with, are COULD NOT COMPARE too.
-//!
-//! EXIT: 0 `VERDICT: PUBLISH-OK` — only OK and SKIPPED rows (OK-FLOOR is
-//! said only by runs that compare nothing, exit 2);
-//! 1 `VERDICT: PUBLISH-REFUSED` — a LOSS, NO-RESULT, NO-BASELINE,
-//! BASE-UNDECIDED or NOT-ON-HOST row; 2 `VERDICT: PUBLISH-REFUSED — COULD NOT
-//! COMPARE`, which outranks 1 (the findings are not of two comparable runs).
-//! Anything but 0 publishes nothing.
+//! Exit 0, `VERDICT: PUBLISH-OK`: only OK and SKIPPED rows. Exit 1, `VERDICT:
+//! PUBLISH-REFUSED`: a LOSS, NO-RESULT, NO-BASELINE, BASE-UNDECIDED or NOT-ON-HOST row.
+//! Exit 2, `VERDICT: PUBLISH-REFUSED — COULD NOT COMPARE`, outranks 1. Anything but 0
+//! publishes nothing.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -178,7 +116,7 @@ pub enum Side {
     Broke(String),
     /// A Summary whose counts do not parse.
     Unparsed,
-    /// Refused up front for memory (`trust admit`): never run. With the run's
+    /// Refused up front for memory (`Plan::admit`): never run. With the run's
     /// own refusal line (the need, this host's ceiling, the RAM that verifies
     /// it), else what of those is known.
     Memory(String),
@@ -186,10 +124,10 @@ pub enum Side {
     Policy(String),
 }
 
-/// Whether a check that did not finish was ENDED BY A SIGNAL: its own exit
-/// status was 128+N, or cargo saw its compiler end by one — the two phrases
-/// [`Measured::of_log`] writes into [`Measured::ended`] (`the check itself
-/// ended by signal N`, `cargo: <program> ended by signal N`).
+/// Whether a check that did not finish was ended by a signal: its own exit status was
+/// 128+N, or cargo saw its compiler end by one (the phrases [`Measured::of_log`] writes into
+/// [`Measured::ended`]: `the check itself ended by signal N`, `cargo: <program> ended by
+/// signal N`).
 fn ended_by_signal(m: &Measured) -> bool {
     m.rc.trim()
         .parse::<u32>()
@@ -289,12 +227,10 @@ impl Side {
         }
     }
 
-    /// For a base that gave no result: whether that is the SEAL's own, so a
-    /// candidate result is held to what the seal is on record proving
-    /// (OK-FLOOR, LOSS or NO-BASELINE), rather than the machine's, which
-    /// decides nothing (BASE-UNDECIDED). A signal no budget sent, a check
-    /// trustd kept from starting, or one that left no exit status is the
-    /// machine's.
+    /// For a base that gave no result: whether that is the seal's own, so a candidate result
+    /// is held to the seal's [`Record`] (OK-FLOOR, LOSS or NO-BASELINE), or the machine's,
+    /// which decides nothing (BASE-UNDECIDED): a signal no budget sent, a check trustd kept
+    /// from starting, or one that left no exit status.
     fn seals_own(&self) -> bool {
         match self {
             Side::OverBudget(_) | Side::NotRun(_) | Side::Unparsed => true,
@@ -308,11 +244,10 @@ impl Side {
     }
 }
 
-/// What the published seal is ON RECORD proving of a library its own check here
-/// left without a result: the floor its own prover recorded in the ratchet (the
-/// row's fourth column is the seal's `--version` line), or the proved count its
-/// unfinished check's Summary reached on this host, whichever is higher — the
-/// least a candidate must prove there. `None` when neither exists.
+/// What the published seal is on record proving of a library its own check here left
+/// without a result: the floor its own prover recorded in the ratchet (the row's fourth
+/// column is the seal's `--version` line), or the proved count its unfinished check's
+/// Summary reached on this host, whichever is higher. `None` when neither exists.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Record {
     pub proved: u64,
@@ -646,7 +581,7 @@ pub fn decide(
         cs.proved,
         signed(i128::from(cs.proved) - i128::from(against))
     );
-    // PER OBLIGATION: both checks gave a result, and the runs captured records.
+    // Per obligation: both checks gave a result, and the runs captured records.
     if let (Side::Result(bs), Some(Oblig::Compared(cmp))) = (b, oblig) {
         let excused = cmp.excused.len();
         let also = |out: &mut String| {
@@ -682,9 +617,8 @@ pub fn decide(
             machine(&mut why, cmp.lost.len() as u64);
             return row(Outcome::Loss, why, None);
         }
-        // A count shortfall the records do not lose cannot be: the records
-        // were held to their checks' Summaries, so each proof fewer is an
-        // obligation fewer. The old count rule stands as this assertion.
+        // A count shortfall the records do not lose cannot be: the records were held to
+        // their checks' Summaries, so each proof fewer is an obligation fewer.
         let short = bs.proved.saturating_sub(cs.proved);
         if short > excused as u64 {
             return row(
@@ -757,10 +691,8 @@ pub fn decide(
             ),
             None,
         ),
-        // A COUNT is no record of WHICH obligations the seal proves: under the
-        // per-obligation comparison it holds a candidate to nothing: a
-        // candidate proving the seal's count but none of its obligations would
-        // pass.
+        // A count is no record of which obligations the seal proves: a candidate proving
+        // the seal's count but none of its obligations would pass.
         Some(from) if per_obligation => row(
             Outcome::NoBaseline,
             format!(
@@ -810,7 +742,7 @@ impl Run<'_> {
         }
         if !f.only.is_empty() {
             out.push(format!(
-                "the {what} run was narrowed by ATERM_GATE_ONLY ({}), so it is no whole-tree measurement",
+                "the {what} run was narrowed by -p ({}), so it is no whole-tree measurement",
                 f.only
             ));
         }
@@ -1108,9 +1040,9 @@ pub fn compare(
             format!("{bh} / {ch}")
         }
     );
-    // THE RETRACTION LEDGER: read and held to its form; each row's commit and
-    // reproducer checked in the trust repository, and its commit held apart
-    // from the published seal's; the candidate's commit tied to its run.
+    // The retraction ledger: read and held to its form; each row's commit and reproducer
+    // checked in the trust repository, its commit held apart from the published seal's; the
+    // candidate's commit tied to its run.
     let mut notes = Vec::new();
     let libraries: BTreeSet<String> = base
         .facts
@@ -1455,8 +1387,8 @@ fn id_of(p: &Plan) -> String {
 pub struct Rendered {
     pub report: String,
     pub tsv: String,
-    /// Every per-obligation finding, one row each (`--obligations-tsv`): a
-    /// lost row's library-to-seal columns are a retraction's first ten.
+    /// Every per-obligation finding, one row each (`--obligations-tsv`,
+    /// [`OBLIGATIONS_TSV_HEADER`]).
     pub obligations: String,
     pub exit: i32,
 }
@@ -1789,7 +1721,7 @@ pub struct Args {
     /// The ratchet the seal's own floors are read from ([`Record`]); default:
     /// the one the base run's plan names.
     pub ratchet: Option<PathBuf>,
-    /// The retraction ledger (`tools/trust-gate-retractions.tsv`); none, no
+    /// The retraction ledger ([`crate::trust_oblig::LEDGER_PATH`]); none, no
     /// loss is excused. A row audited at another aterm commit than the runs
     /// measured is compared with it in the git repository the ledger is in.
     pub retractions: Option<PathBuf>,
@@ -1835,6 +1767,23 @@ fn ratchet_for(given: Option<&Path>, base: &Plan) -> Ratchet {
 
 /// Run `trust compare`: print the report, write the TSV, answer 0, 1 or 2.
 pub fn run(args: &Args) -> i32 {
+    let (report, exit) = answer(args);
+    print!("{report}");
+    exit
+}
+
+/// [`run`]'s report and exit, the TSVs written.
+#[must_use]
+pub fn answer(args: &Args) -> (String, i32) {
+    let refused = |why: String| {
+        (
+            format!(
+                "COULD NOT COMPARE: {why}\nVERDICT: PUBLISH-REFUSED — COULD NOT COMPARE: {why}; \
+                 nothing is published\n"
+            ),
+            2,
+        )
+    };
     let base = load("published seal's", &args.base, args.base_logdir.as_deref());
     let cand = load(
         "candidate's",
@@ -1849,9 +1798,7 @@ pub fn run(args: &Args) -> i32 {
                 .flatten()
                 .collect::<Vec<_>>()
                 .join("; ");
-            println!("COULD NOT COMPARE: {why}");
-            println!("VERDICT: PUBLISH-REFUSED — COULD NOT COMPARE: {why}; nothing is published");
-            return 2;
+            return refused(why);
         }
     };
     let ratchet = ratchet_for(args.ratchet.as_deref(), &base);
@@ -1860,14 +1807,7 @@ pub fn run(args: &Args) -> i32 {
         None => None,
         Some(p) => match fs::read_to_string(p) {
             Ok(text) => Some((text, p.display().to_string())),
-            Err(e) => {
-                let why = format!("the retraction ledger {}: {e}", p.display());
-                println!("COULD NOT COMPARE: {why}");
-                println!(
-                    "VERDICT: PUBLISH-REFUSED — COULD NOT COMPARE: {why}; nothing is published"
-                );
-                return 2;
-            }
+            Err(e) => return refused(format!("the retraction ledger {}: {e}", p.display())),
         },
     };
     let git = args.trust_repo.as_ref().map(TrustGit::new);
@@ -1904,7 +1844,6 @@ pub fn run(args: &Args) -> i32 {
         &ratchet,
         &retractions,
     ));
-    print!("{}", rendered.report);
     for (path, text) in [
         (&args.tsv, &rendered.tsv),
         (&args.obligations_tsv, &rendered.obligations),
@@ -1912,11 +1851,17 @@ pub fn run(args: &Args) -> i32 {
         if let Some(path) = path
             && let Err(e) = fs::write(path, text)
         {
-            eprintln!("aterm-release trust compare: {}: {e}", path.display());
-            return 2;
+            return (
+                format!(
+                    "{}COULD NOT WRITE {}: {e}\n",
+                    rendered.report,
+                    path.display()
+                ),
+                2,
+            );
         }
     }
-    rendered.exit
+    (rendered.report, rendered.exit)
 }
 
 #[cfg(test)]
@@ -2056,7 +2001,7 @@ mod tests {
         let c = load("candidate's", &cand.plan(), None).unwrap();
         let ratchet = Ratchet {
             text: ratchet.map(str::to_string),
-            path: "tools/trust-gate-ratchet.tsv".into(),
+            path: "crates/aterm-release/trust/floors.tsv".into(),
         };
         render(&compare(&b, &c, None, &ratchet, &Retractions::default()))
     }
@@ -2227,14 +2172,11 @@ mod tests {
 
     #[test]
     fn a_base_without_a_result_is_held_to_what_the_seal_is_on_record_proving() {
-        // The seal's own failures (each with no count of its own): with nothing on
-        // record of what the seal proves there, the candidate is REFUSED whatever it
-        // proved (NO-BASELINE); with the floor the seal's own prover recorded, it is
-        // held to that floor — a LOSS below it, and at or above it still REFUSED
-        // under the per-obligation comparison (a count says nothing of WHICH
-        // obligations the seal proves: the 2026-10-07 refutation); OK-FLOOR is
-        // what runs that captured no records would have said, which compare
-        // nothing.
+        // The seal's own failures (each with no count of its own): with nothing on record,
+        // the candidate is refused whatever it proved (NO-BASELINE); with the seal's own
+        // floor it is a LOSS below it and still refused at or above it, since a count says
+        // nothing of which obligations the seal proves. OK-FLOOR is what runs without
+        // records would say, and those compare nothing.
         let seals_own = [
             (
                 "  [UNKNOWN] [transport:missing-crate-summary] no inventory (targo-trust)\nCoverage: unknown (compiler emitted no coverage_summary transport row)\n".to_string(),
@@ -2269,7 +2211,7 @@ mod tests {
                 "VERDICT: PUBLISH-REFUSED — 1 with nothing on record of the seal (alpha); nothing is published",
                 "{log}"
             );
-            // a floor ANOTHER prover recorded is not the seal's record
+            // a floor another prover recorded is not the seal's record
             let other = "alpha\t4\t10\ttargo 1.99.0-dev (another) (targo 0.1.0)\n";
             let r = answer_r(&b, &c, Some(other));
             assert!(row(&r, "alpha").ends_with("NO-BASELINE"), "{}", r.report);
@@ -2285,7 +2227,7 @@ mod tests {
             );
             assert!(
                 r.report.contains("REFUSED alpha (NO-BASELINE): the published seal's own check")
-                    && r.report.contains("it is on record proving 5 by count (its floor of 5 in tools/trust-gate-ratchet.tsv, recorded by the seal's own prover (targo 1.99.0-dev (stub))), and the candidate proved 5 of 10, but no record says WHICH obligations the seal proves here"),
+                    && r.report.contains("it is on record proving 5 by count (its floor of 5 in crates/aterm-release/trust/floors.tsv, recorded by the seal's own prover (targo 1.99.0-dev (stub))), and the candidate proved 5 of 10, but no record says WHICH obligations the seal proves here"),
                 "{}",
                 r.report
             );
@@ -2341,7 +2283,7 @@ mod tests {
             "{}",
             r.report
         );
-        // A FINISHED seal check (100 of 200, complete Coverage) whose log also says
+        // A finished seal check (100 of 200, complete Coverage) whose log also says
         // `verification did not run` somewhere reads as not run, the judge's order —
         // and its 100 still holds the candidate: 10 is a loss, not a free pass.
         let (b, c) = pair((&summary(10, 200), "0"), (&summary(7, 9), "0"));
@@ -2523,7 +2465,7 @@ mod tests {
                     let cut = t.find("file \n").unwrap();
                     t[..cut].replace("only \n", "only alpha\n")
                 },
-                "narrowed by ATERM_GATE_ONLY (alpha)",
+                "narrowed by -p (alpha)",
             ),
             (
                 "per commit",
@@ -3079,7 +3021,7 @@ mod tests {
             ledger: ledger.map(|t| {
                 (
                     t.to_string(),
-                    "tools/trust-gate-retractions.tsv".to_string(),
+                    "crates/aterm-release/trust/retractions.tsv".to_string(),
                 )
             }),
             trust: git.as_ref().map(|g| TrustRepo {
@@ -3112,7 +3054,7 @@ mod tests {
         assert!(row(&r, "alpha").ends_with("-1  OK"), "{}", r.report);
         assert!(
             r.report.contains(&format!(
-                "\nEXCUSED alpha alpha::f | assertion | src/lib.rs | `row 5` #1/1 | assertion | at src/lib.rs:5:0-5:1 | candidate: failed | retracted by trust {} (tools/trust-gate-retractions.tsv line 2; reproducer crates/trust-vcgen/tests/false_proofs.rs::guard_by_reaching_def; reviewed reviewer 2026-10-07 class A (stale field read))\n",
+                "\nEXCUSED alpha alpha::f | assertion | src/lib.rs | `row 5` #1/1 | assertion | at src/lib.rs:5:0-5:1 | candidate: failed | retracted by trust {} (crates/aterm-release/trust/retractions.tsv line 2; reproducer crates/trust-vcgen/tests/false_proofs.rs::guard_by_reaching_def; reviewed reviewer 2026-10-07 class A (stale field read))\n",
                 &t.f[..12]
             )),
             "{}",
@@ -3130,7 +3072,7 @@ mod tests {
             "{}",
             r.obligations
         );
-        // The same loss in a candidate WITHOUT the fix (O): refused, naming the row.
+        // The same loss in a candidate without the fix (O): refused, naming the row.
         let (b, c) = trust_pair(&t.s, &t.o, 4);
         let r = answer_l(
             &b,
@@ -3179,7 +3121,7 @@ mod tests {
             "{}",
             r.report
         );
-        // A candidate that contains the fix and STILL proves row 5: the ledger is
+        // A candidate that contains the fix and still proves row 5: the ledger is
         // wrong for it — stale, refused.
         let (b, c) = trust_pair(&t.s, &t.c, 5);
         let r = answer_l(
@@ -3191,7 +3133,7 @@ mod tests {
         );
         assert_eq!(r.exit, 2, "{}", r.report);
         assert!(
-            r.report.contains("COULD NOT COMPARE: tools/trust-gate-retractions.tsv line 2 is STALE for this candidate (alpha): the candidate contains trust")
+            r.report.contains("COULD NOT COMPARE: crates/aterm-release/trust/retractions.tsv line 2 is STALE for this candidate (alpha): the candidate contains trust")
                 && r.report.contains("and still proves alpha::f | assertion | src/lib.rs | `row 5` #1/1 | assertion (at src/lib.rs:5:0-5:1: proved)"),
             "{}",
             r.report
@@ -3207,7 +3149,7 @@ mod tests {
         );
         assert_eq!(r.exit, 0, "{}", r.report);
         assert!(
-            r.report.contains("NOTE tools/trust-gate-retractions.tsv line 2 (UNUSED, alpha): the published seal did not prove it (failed)"),
+            r.report.contains("NOTE crates/aterm-release/trust/retractions.tsv line 2 (UNUSED, alpha): the published seal did not prove it (failed)"),
             "{}",
             r.report
         );
@@ -3219,7 +3161,7 @@ mod tests {
         let t = Trust::new();
         let (b, c) = trust_pair(&t.s, &t.c, 4);
         let commits = (Some(t.s.as_str()), Some(t.c.as_str()));
-        // CONTROL: audited where the runs measured, at the seal's site — excused.
+        // Control: audited where the runs measured, at the seal's site — excused.
         let r = answer_l(
             &b,
             &c,
@@ -3304,7 +3246,7 @@ mod tests {
             (vec![retract(5, &t.s, &t.f, "no_such_test")], true, t.s.as_str(), "line 2: its reproducer: crates/trust-vcgen/tests/false_proofs.rs at trust".to_string()),
             (vec![retract(5, &t.s, &t.s, "guard_by_reaching_def")], true, t.s.as_str(), "line 2: its reproducer: crates/trust-vcgen/tests/false_proofs.rs is not a file of trust".to_string()),
             (vec![retract(5, &t.s, &t.f, "guard_by_reaching_def")], true, t.c.as_str(), format!("line 2: trust {} is already in the published seal ({}), so the seal's proof is not one it retracts", &t.f[..12], &t.c[..12])),
-            (vec![retract(5, &t.s, &t.f, "guard_by_reaching_def")], false, t.s.as_str(), "tools/trust-gate-retractions.tsv: 1 retraction(s), and no trust repository (--trust-repo)".to_string()),
+            (vec![retract(5, &t.s, &t.f, "guard_by_reaching_def")], false, t.s.as_str(), "crates/aterm-release/trust/retractions.tsv: 1 retraction(s), and no trust repository (--trust-repo)".to_string()),
             (vec![retract(5, &t.s, &t.f, "guard_by_reaching_def").replace("\tassertion\t", "\tAssert\t")], true, t.s.as_str(), "line 2: the kind `Assert` is of no form this gate knows".to_string()),
             (vec![retract(5, &t.s, &t.f, "guard_by_reaching_def").replace("\t1/1\tassertion\t", "\tfirst\tassertion\t")], true, t.s.as_str(), "line 2: nth `first` is not <place>/<of>".to_string()),
             (vec!["alpha\tonly three\tfields".to_string()], true, t.s.as_str(), "line 2: 3 fields, and a retraction has exactly 13".to_string()),
@@ -3327,21 +3269,13 @@ mod tests {
             "{}",
             r.report
         );
-        // A ledger with its header only (the committed one today) is no error.
+        // A ledger with its header only is no error.
         let r = answer_l(&b, &c, Some(&ledger(&[])), None, (None, None));
         assert_eq!(r.exit, 1, "{}", r.report);
         assert!(!r.report.contains("COULD NOT COMPARE"), "{}", r.report);
         // The committed ledger reads.
-        let committed = fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../tools/trust-gate-retractions.tsv"
-        ))
-        .unwrap();
-        let l = trust_oblig::parse_ledger(
-            &committed,
-            "tools/trust-gate-retractions.tsv",
-            &BTreeSet::new(),
-        );
+        let committed = include_str!("../trust/retractions.tsv");
+        let l = trust_oblig::parse_ledger(committed, trust_oblig::LEDGER_PATH, &BTreeSet::new());
         assert!(l.errors.is_empty(), "{:?}", l.errors);
     }
 

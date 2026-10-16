@@ -4,7 +4,6 @@
 
 use super::*;
 // write_ascii_blast content verification
-// ========================================================================
 
 #[test]
 fn write_ascii_blast_content_matches_write_char() {
@@ -104,8 +103,7 @@ fn write_ascii_blast_scrolls_at_screen_bottom() {
     let written = grid.write_ascii_blast(b"ABCDEF");
     assert_eq!(written, 6);
 
-    // Deferred wrap: cursor at last col of row 1, pending_wrap set.
-    // Scroll hasn't happened yet.
+    // Deferred wrap: cursor at the last col of row 1, no scroll yet.
     assert_eq!(grid.cursor_row(), 1);
     assert_eq!(grid.cursor_col(), 2);
     assert!(grid.pending_wrap());
@@ -208,7 +206,6 @@ fn erase_chars_at_content_boundary() {
         grid.write_char(c);
     }
 
-    // Erase 2 chars starting at col 2 (the last content cell)
     if let Some(row) = grid.row_mut(0) {
         row.erase_chars(2, 2);
     }
@@ -241,11 +238,9 @@ fn erase_chars_clears_extras() {
     for c in "ABCDE".chars() {
         grid.write_char(c);
     }
-    // Add extras at cols 1, 2, 3
     for col in 1..4u16 {
         grid.cell_extra_mut(0, col).add_combining('\u{0301}');
     }
-    // Verify all 3 extras exist before operation
     assert!(grid.extras().get(CellCoord::new(0, 1)).is_some());
     assert!(grid.extras().get(CellCoord::new(0, 2)).is_some());
     assert!(grid.extras().get(CellCoord::new(0, 3)).is_some());
@@ -254,7 +249,6 @@ fn erase_chars_clears_extras() {
     grid.set_cursor(0, 2);
     grid.erase_chars(2);
 
-    // Col 1 extras should survive, cols 2-3 should be cleared
     assert!(
         grid.extras().get(CellCoord::new(0, 1)).is_some(),
         "col 1 extras preserved"
@@ -277,7 +271,6 @@ fn insert_chars_shifts_extras_right() {
     for c in "ABCDE".chars() {
         grid.write_char(c);
     }
-    // Add extras at cols 1 and 4
     grid.cell_extra_mut(0, 1).add_combining('\u{0301}');
     grid.cell_extra_mut(0, 4).add_combining('\u{0302}');
 
@@ -285,12 +278,10 @@ fn insert_chars_shifts_extras_right() {
     grid.set_cursor(0, 2);
     grid.insert_chars(2);
 
-    // Col 1 < insert point: preserved at col 1
     assert!(
         grid.extras().get(CellCoord::new(0, 1)).is_some(),
         "col 1 extras preserved (before insert point)"
     );
-    // Col 4 shifted to col 6
     assert!(
         grid.extras().get(CellCoord::new(0, 4)).is_none(),
         "col 4 extras shifted away"
@@ -299,7 +290,6 @@ fn insert_chars_shifts_extras_right() {
         grid.extras().get(CellCoord::new(0, 6)).is_some(),
         "col 4 extras shifted to col 6"
     );
-    // No extras at the newly inserted blank positions (cols 2, 3)
     assert!(
         grid.extras().get(CellCoord::new(0, 2)).is_none(),
         "inserted blank col 2 has no extras"
@@ -318,7 +308,6 @@ fn delete_chars_shifts_extras_left() {
     for c in "ABCDEFGH".chars() {
         grid.write_char(c);
     }
-    // Add extras at cols 1, 3, 6
     grid.cell_extra_mut(0, 1).add_combining('\u{0301}');
     grid.cell_extra_mut(0, 3).add_combining('\u{0302}');
     grid.cell_extra_mut(0, 6).add_combining('\u{0303}');
@@ -327,17 +316,14 @@ fn delete_chars_shifts_extras_left() {
     grid.set_cursor(0, 2);
     grid.delete_chars(2);
 
-    // Col 1 < delete point: preserved
     assert!(
         grid.extras().get(CellCoord::new(0, 1)).is_some(),
         "col 1 extras preserved (before delete point)"
     );
-    // Col 3 was in deletion range [2, 4): deleted
     assert!(
         grid.extras().get(CellCoord::new(0, 3)).is_none(),
         "col 3 extras deleted by DCH"
     );
-    // Col 6 shifted left by 2 → col 4
     assert!(
         grid.extras().get(CellCoord::new(0, 6)).is_none(),
         "col 6 extras shifted away"

@@ -15,6 +15,10 @@
 //! the working directory, as Claude Code runs a `PreToolUse` hook.
 
 #![cfg(unix)]
+#![allow(
+    clippy::disallowed_types,
+    reason = "test code: a stand-in child may inherit descriptors"
+)]
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};

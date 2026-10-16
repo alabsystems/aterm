@@ -421,7 +421,7 @@ fn busy_lane(
     let sink = Arc::clone(posted);
     PkgLane {
         atpkg: std::path::Path::new("atpkg"),
-        child_path: "",
+        child_path: || "",
         layout: None,
         private_state_root: false,
         post: move |e| sink.lock().unwrap().push(e),
@@ -429,6 +429,7 @@ fn busy_lane(
         backoff: ContentionBackoff::default(),
         ran_at: None,
         switch: super::LiveSwitch::new(None, super::LoopGate::On),
+        ahead: false,
     }
 }
 

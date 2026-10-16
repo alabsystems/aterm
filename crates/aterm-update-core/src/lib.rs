@@ -1,38 +1,24 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `aterm-update-core` — the artifact-agnostic, portable POSIX primitives shared by
-//! every aterm self-update / package flow.
+//! The artifact-agnostic update primitives shared by every aterm self-update and package flow.
 //!
-//! This crate holds the parts of the updater that are NOT tied to the macOS `.app`
-//! shape: resolving the GitHub release source (owner/repo) — the compiled channel, which
-//! only a development build may repoint — with a URL-safety allowlist; the one switch a
-//! person has over the app updater ([`settings`], `[update] enabled`); an advisory
-//! [`FileLock`] and a [`same_volume`] check; `curl` plumbing for GitHub's unmetered web
-//! host, which every public-channel byte moves over ([`cdn`] derives the tag-specific
-//! `github.com/…/releases/download/…` URL, [`pointer`] learns the newest release's tag
-//! from ONE redirect-refusing HEAD of `…/releases/latest/download/…`,
-//! [`download_bytes`]/[`download_to`] fetch with no credential ever attached) and for
-//! the vendor-direct hosts ([`vendor_get`]); private-dir hardening ([`ensure_private_dir`]); a
-//! `shasum`-backed [`sha256_file`]; the release-tag grammar ([`tag`]) the publisher
-//! and the updater client BOTH classify with, so they cannot disagree about which
-//! releases are candidates; the trust anchors
-//! ([`pins`] — committed constants, never build-environment state); the
-//! master-signed machine [`roster`] that turns one paper master key into per-machine
-//! signing authority with attribution and revocation; and the Developer ID requirement
-//! and its bounded `/usr/bin/codesign` check ([`codesign`]), shared by the app updater
-//! and atpkg's staged agent builds.
+//! Here: the GitHub release [`Source`] (the compiled channel, repointable only in a development
+//! build) with a URL-safety allowlist; the `[update] enabled` switch ([`settings`]); an
+//! advisory [`FileLock`] and [`same_volume`]; `curl` plumbing for GitHub's web host ([`cdn`]
+//! derives a tag's download URL, [`pointer`] learns the newest tag from one redirect-refusing
+//! HEAD, [`download_bytes`]/[`download_to`] never attach a credential) and for vendor-direct
+//! hosts ([`vendor_get`]); [`ensure_private_dir`]; [`sha256_file`]; the release-tag grammar
+//! ([`tag`]) the publisher and the updater both classify with; the trust anchors ([`pins`]);
+//! the master-signed machine [`roster`]; and the Developer ID requirement with its bounded
+//! `/usr/bin/codesign` check ([`codesign`]).
 //!
-//! `aterm-update` layers the macOS-only pieces (DMG mount/extract, spctl
-//! assessment, the atomic `RENAME_SWAP` bundle exchange + re-exec, the `.app`
-//! staging layout) on top of these. Linux content hashing uses `ring` directly;
-//! other platforms retain their native command-backed hashing. The same crypto
-//! dependency provides Ed25519 verification, used by [`roster`] and shared with the owner-side
-//! minting tool so producer and client cannot drift on what a valid chain is.
+//! `aterm-update` layers the macOS `.app` pieces (DMG mount, spctl, the `RENAME_SWAP` bundle
+//! exchange and re-exec, the staging layout) on top. Roster verification uses `ring`, shared
+//! with the owner-side minting tool so producer and client cannot drift on a valid chain.
 
-// Under the Trust verifier, register the `trust` tool namespace so the
-// `#[cfg_attr(trust_verify, trust::skip)]` opt-out on `Manifest::parse`
-// resolves; plain rustc never sets `trust_verify`, so this is inert off-Trust.
+// Under the Trust verifier, register the `trust` tool namespace so the crate's
+// `#[cfg_attr(trust_verify, trust::skip)]` opt-outs resolve; inert under plain rustc.
 #![cfg_attr(trust_verify, feature(register_tool))]
 #![cfg_attr(trust_verify, register_tool(trust))]
 
@@ -73,23 +59,19 @@ pub use privatedir::ensure_private_dir;
 pub use roster::{Attribution, Machine, Roster, RosterReject, VerifiedRoster, verify_roster};
 pub use sentinel::{LaunchName, Sentinel};
 pub use source::{
-    ATPKG_INDEX_OWNER, DEFAULT_OWNER, DEFAULT_REPO, PUBLISH_OWNER, PUBLISH_REPO,
-    REPOINT_IS_A_DEV_SEAM, Source, is_valid_slug, pick_slug,
+    ATPKG_INDEX_OWNER, DEFAULT_OWNER, DEFAULT_REPO, REPOINT_IS_A_DEV_SEAM, Source, is_valid_slug,
+    pick_slug,
 };
 pub use sys::{FileLock, same_volume};
 
-/// Emit a non-fatal updater warning to the app log (`aterm_log`, with the updater's
-/// `aterm-update:` prefix). A no-op if no logger is installed (e.g. a dev harness).
+/// Log a non-fatal updater warning (`aterm-update:` prefix); a no-op with no logger installed.
 pub(crate) fn warn(msg: &str) {
     aterm_log::warn!("aterm-update: {msg}");
 }
 
-/// An unasked notice from the package manager (atpkg) as a record in the host's log —
-/// the sink `atpkg::notice` uses once a host (the terminal session, the window) has routed
-/// them there, because nothing prints into a shell the user did not ask to update (Phase 2
-/// of `docs/DESIGN-atpkg-vendor-direct-updates-2026-09-22.md`). atpkg links no logger of
-/// its own; this crate's `aterm_log` edge is one it already has. Both hosts install a file
-/// logger (`aterm.log`); where none is installed the record is discarded.
+/// Log an unasked atpkg notice in the host's log: the sink `atpkg::notice` uses once a host
+/// routes notices there, since nothing prints into a shell the user did not ask to update.
+/// Discarded where no logger is installed.
 pub fn log_pkg_note(msg: &str) {
     aterm_log::warn!("atpkg: {msg}");
 }

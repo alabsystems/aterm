@@ -1,0 +1,28 @@
+# agy 1.4.0 · MEASURED 2026-10-16, `aterm ctl text --json` of a private headless aterm 120x40 (aterm 0.105.0 098c216c7), the atpkg-managed agy (Google latest) launched through its shim under the owner's signed-in account (Gemini 4 Argon, medium), scratch ATERM_STATE_HOME/XDG dirs, harness off · a shell-command approval whose long command makes option 3 wrap: its tail `settings.json)` continues at column 0 of the next row, under `  3. Yes, and always allow …`; option 4 follows · cursor=26,0 (hidden) · account and scratch path redacted at equal length
+
+      ▄▀▀▄        Antigravity CLI 1.4.0
+     ▀▀▀▀▀▀       redacted-user@example.test (Google AI Ultra)
+    ▀▀▀▀▀▀▀▀      Gemini 4 Argon (Medium)
+   ▄▀▀    ▀▀▄     /private/tmp/at.XXXXXX/work
+  ▄▀▀      ▀▀▄
+
+────────────────────────────────────────────────────────────
+> Use your shell tool to run exactly: env | cut -d= -f1 | sort > envnames.txt
+
+● Ran (env | cut -d= -f1 | sort > envnames.txt) (ctrl+o to expand)
+
+Command
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+Requesting permission for:
+   env | cut -d= -f1 | sort > envnames.txt
+
+Run this command?
+> 1. Yes, run command
+  2. Yes, and always allow in this conversation for commands that start with 'env | cut -d= -f1 | sort > envnames.txt'
+  3. Yes, and always allow for commands that start with 'env | cut -d= -f1 | sort > envnames.txt' (Persist to
+settings.json)
+  4. No, cancel
+
+  ↑/↓ Navigate · tab Amend · ctrl+g edit/expand command
+esc to cancel                                                                                    Gemini 4 Argon · medium

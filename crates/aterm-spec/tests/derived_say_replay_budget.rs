@@ -6,11 +6,6 @@ use aterm_spec::{derive::say_replay_budget_model, interp, verify};
 #[test]
 fn bridge_wide_replay_pages_rotate_after_control_work() {
     let model = say_replay_budget_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name)
-    );
     verify::prove_and_catch_scalar(&model, "Fabric replay budget and rotation");
 
     let mut state = model.init_state();

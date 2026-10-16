@@ -11,8 +11,7 @@
 //! left stale in the search index.
 
 use super::Terminal;
-// The from-scratch oracle `search_index.rs` pins its cache against, and the
-// cached path it is compared with.
+// `legacy_results` is `search_index.rs`'s from-scratch oracle, `cached_results` the cache.
 use crate::grid::ResizePolicy;
 use crate::terminal::search_index::tests::{cached_results, legacy_results};
 use aterm_scrollback::Scrollback;
@@ -300,12 +299,10 @@ fn abs_text(t: &Terminal, abs: u64) -> String {
     text.trim_end().to_string()
 }
 
-/// OSC 133 command marks are keyed by absolute row and never consult the
-/// renumber epoch. A ConPTY height drag (grow, repaint, shrink back, repaint)
-/// must leave a completed command's prompt and output rows naming the same
-/// text, both after retention has evicted history and in a young session.
-/// With nothing evicted, `oldest_absolute_row()` saturates at 0 and would
-/// hide a key slide; a 100-line limit reaches the evicting state quickly.
+/// OSC 133 marks are keyed by absolute row, never the renumber epoch: a ConPTY height drag
+/// (grow, repaint, shrink back, repaint) leaves a command's prompt and output rows naming
+/// the same text, evicting or young. Unevicted, `oldest_absolute_row()` saturates at 0 and
+/// would hide a key slide, hence the 100-line limit.
 #[test]
 fn conpty_height_drag_keeps_command_marks_on_their_rows() {
     for (label, lead) in [("evicting", 300usize), ("young", 2)] {
@@ -700,65 +697,12 @@ fn native_script(
     (h, kept)
 }
 
-/// The Native policy is 0.94.0's resize (`fe5d19198`, which digested to
-/// `0xc06f_0e9d_2a8d_b94e` / `0x01a9_2c38_01ae_30cc`) but for the key
-/// bookkeeping of its two bottom arms (`keep_keys_across_bottom_rows`,
-/// `cover_retained_rows`), re-captured 2026-10-01: they move the counter and a
-/// scrolled-back reader's anchor but, measured with the key fields left out of
-/// the digest, leave the retained rows, cursor and scrollback identical. The
-/// digest covers the retained rows, cursor, reading position, counter, oldest
-/// key and renumber epoch at every step, so a ConPTY arm leaking into the
-/// Native path moves it. A deliberate change to the native resize moves it
-/// too: re-capture it then, saying what moved.
-///
-/// Re-captured 2026-10-09 (bug hunt 9, `TIERED` only; was
-/// `0xc4cc_9a06_602e_98ee`): a blank the rewrap copies inside a line's
-/// content now counts in the row's length (`copy_cells_to_row`,
-/// `fill_row_cells`), so tiered history, staged at that length, keeps it.
-/// Dumped step by step against the previous code, the `RING` arm is identical
-/// and the `TIERED` arm differs on one logical line only, from step 110 on: a
-/// line whose rows are runs of blanks (left by the script's ED 3 and reader
-/// scrolls) keeps its 46 blanks, where the old code staged two of its rows at
-/// length 0 and 4 and joined them to `  ij`; the counters move by the rows
-/// those blanks take.
-///
-/// Re-captured 2026-10-11 (R15-CHUNK-RING-SCROLL, `TIERED` only; was
-/// `0xaa63_71b5_0ce0_182b`): a scroll after a rows-only grow of a wrapped ring
-/// appends at the ring's logical end (`GridStorage::linearize_ring`). Dumped
-/// step by step against the previous code, the `RING` arm (a 10,000-line ring
-/// that never wraps here) is identical, and the `TIERED` arm (an 8-line ring,
-/// wrapped from the first steps) first differs at step 10: the previous code
-/// spliced a blank row into history there and wrote the next step's line over
-/// the last one (`step 11 abcdefghij`, then step 10's leftover tail), and 63
-/// of the 120 steps retained a transcript missing a step's line. Now 10 do,
-/// all the one line the offloaded width reflow at step 109 drops under a
-/// scrolled-back reader; the synchronous twin of this script keeps every
-/// step's line at every step.
-///
-/// Re-captured 2026-10-11 (the offloaded reflow's lost line, `TIERED` only;
-/// was `0xd968_b590_2d9a_1dd2`): the offloaded width change opens its detach
-/// window before its own resize, so the rows that resize pushes off the
-/// screen past the ring's cap are staged for re-attach, not dropped. Dumped
-/// step by step against the previous code, the `RING` arm is identical and
-/// the `TIERED` arm differs at steps 40-41 and 109-118 only, each by lines the
-/// previous code lost and this one keeps: steps 28-30's at step 40 (a
-/// narrowing after an ED 3 pushed 12 rows into the 8-row ring) and step 102's
-/// at step 109 (10 rows; the reader's scroll there was incidental). No step
-/// loses a line now (`offloaded_native_script_keeps_every_line_the_synchronous_one_keeps`).
-///
-/// Re-captured 2026-10-11 again (the store/ring seam, `TIERED` only; was
-/// `0x0541_a3ca_4677_d9d7`): a logical line straddling the store/ring seam is
-/// handed to the job's ring phase whole under Native too, as under ConPTY.
-/// Dumped step by step against the previous code, the `RING` arm is
-/// identical and the `TIERED` arm moves at 43 steps (14-16, 21-24, 41, 44-45,
-/// 56-67, 79-85, 99-104, 111-118), each by such a line now rewrapped whole
-/// where it left an orphan row (at step 14, `step 5 abcdefghijabcdefgh` over
-/// `ijabcdefghij…` is now `step 5 abcdefghijabcdefghijab` over `cdefghij…`,
-/// the synchronous rewrap); no line is lost or gained. The offloaded run now
-/// equals its synchronous twin, rows and reading position, at 104 of the 120
-/// steps (68 before); the rest differ only after a rows-only grow, which
-/// reveals the history the offloaded width change keeps in the ring and the
-/// synchronous one parks in the store.
+/// The Native policy is 0.94.0's resize but for the key bookkeeping of its two bottom arms
+/// (`keep_keys_across_bottom_rows`, `cover_retained_rows`) and later fixes to tiered history.
+/// The digest covers the retained rows, cursor, reading position, counter, oldest key and
+/// renumber epoch at every step, so a ConPTY arm leaking into the Native path moves it. A
+/// deliberate change to the native resize moves it too: re-capture it then, and say in
+/// the commit what moved.
 #[test]
 fn native_policy_matches_the_0_94_0_resize() {
     const RING: u64 = 0xb706_f513_99e0_6395;
@@ -772,13 +716,9 @@ fn native_policy_matches_the_0_94_0_resize() {
     assert_eq!(native_script(tiered(10, 40), true, native).0, TIERED);
 }
 
-/// The offloaded width reflow keeps every line the synchronous one keeps: the
-/// script above run on the tiered terminal both ways, compared step by step.
-/// The two may place a line differently (screen or history, row breaks); a
-/// line the synchronous resize retains and the offloaded one does not is
-/// lost history. Before 2026-10-11 the offloaded run lost step 102's line at
-/// step 109: that narrowing pushed 10 rows off a 13-row screen into an
-/// 8-row ring while the history was with the job.
+/// The offloaded width reflow keeps every line the synchronous one keeps: the script above
+/// on the tiered terminal both ways, step by step. Placement may differ (screen or history,
+/// row breaks); a line only the synchronous resize retains is lost history.
 #[test]
 fn offloaded_native_script_keeps_every_line_the_synchronous_one_keeps() {
     let native = |t: &mut Terminal, r: u16, c: u16| {
@@ -938,13 +878,10 @@ fn conpty_rows_shrink_in_the_bottom_push_corner_leaves_the_viewport_conhost_pain
 
 // ---- pwsh under conhost, byte for byte -------------------------------------
 //
-// These fixtures replay byte shapes recorded with `aterm ctl cast` from pwsh
-// under conhost at 23x80. The prompt text is replaced by a stand-in of the
-// same length (116 columns, wrapping at 80), so every row and CUP lands where
-// the capture put it. conhost's `cls` erases row by row with `CSI K`, and EL
-// must break the continuation link into the row below
-// (`Grid::clear_wrap_into_next_row`), or a later widen or narrow shifts
-// history rows.
+// Byte shapes recorded with `aterm ctl cast` from pwsh under conhost at 23x80, the prompt
+// replaced by a same-length stand-in (116 columns, wrapping at 80). conhost's `cls` erases
+// row by row with `CSI K`, so EL must break the continuation link into the row below
+// (`Grid::clear_wrap_into_next_row`), or a later widen or narrow shifts history rows.
 
 /// A stand-in for the 116-column pwsh prompt.
 fn pwsh_prompt() -> String {
@@ -1102,12 +1039,10 @@ fn conpty_resize(t: &mut Terminal, rows: u16, cols: u16, repaint: &[u8], before_
     }
 }
 
-/// Widen and narrow replayed: after conhost's `cls` the fill leaves exact
-/// history (no continuation link survives from the prompt that sat there);
-/// the widen to 120 gives each of `col-test 01..=29` one row with no history
-/// row shifted, the boundary line's head stays the newest history line
-/// (conhost repaints its 22-column tail at row 0, `widen_to_120_repaint`), and
-/// narrowing back restores the 59 rows exactly, three times over.
+/// After conhost's `cls` the fill leaves exact history (no continuation link survives the
+/// prompt that sat there); a widen to 120 gives each of `col-test 01..=29` one row with
+/// none shifted, the boundary line's head stays the newest history line, and narrowing
+/// back restores the 59 rows exactly, three times over.
 #[test]
 fn conpty_widen_after_conhost_cls_rewraps_history_with_no_row_shifted() {
     for before_reattach in [true, false] {
@@ -1243,16 +1178,12 @@ fn conpty_column_shrink_after_conhost_cls_pushes_no_stray_row() {
 
 // ---- a shrink with a non-blank row under the cursor -------------------------
 //
-// Replays a pwsh capture at 24x80: `cls; 1..30 | % { "pad {0:D2}" -f $_ }`
-// entered as two input lines, so PSReadLine drew its `>>` continuation prompt
-// and the fill ended with the prompt drawn twice, `>>` on a fresh bottom row
-// and the cursor back on the prompt above it (`CR LF >> CSI 23;38 H`). Each
-// resize is replayed with conhost's repaint for it, including the widths where
-// the cell after the prompt starts a row of its own (58, 39, 29) and a
-// one-line fill with the prompt alone on the bottom rows. OSC marks and SGR
-// changes are left out; the prompt is the 116-column stand-in.
+// Replays a pwsh capture at 24x80 (`cls; 1..30 | % { "pad {0:D2}" -f $_ }`), each resize
+// with conhost's repaint for it, including the widths where the cell after the prompt
+// starts a row of its own (58, 39, 29). OSC marks and SGR are left out; the prompt is the
+// 116-column stand-in.
 
-/// The two pad fills the reviews captured at 24x80.
+/// The two pad fills captured at 24x80.
 #[derive(Clone, Copy, Debug)]
 enum PadPrompt {
     /// The command went in as two input lines, so PSReadLine drew the prompt
@@ -1425,12 +1356,11 @@ fn pad_history(last: usize) -> Vec<(String, bool)> {
     (1..=last).map(|n| (format!("pad {n:02}"), false)).collect()
 }
 
-/// Replay `fill`, then every `(rows, cols, first)` step with conhost's repaint
-/// for it, on every ConPTY terminal shape and with the repaint on either side
-/// of the off-thread re-attach. After each step the history is exactly what
-/// conhost demoted (`pad 01..first`), the screen and the cursor are the ones
-/// conhost painted, and every pad line is retained exactly once; at the end
-/// the search index equals a fresh build.
+/// Replay `fill`, then every `(rows, cols, first)` step with conhost's repaint, on every
+/// ConPTY shape and with the repaint on either side of the re-attach. After each step the
+/// history is what conhost demoted (`pad 01..first`), screen and cursor are what it
+/// painted, and every pad line is retained once; at the end the search index equals a
+/// fresh build.
 fn replay_pad_resizes(fill: PadPrompt, steps: &[(u16, u16, usize)]) {
     let (fill_first, fill_cursor) = match fill {
         PadPrompt::AboveContinuation => (12, (22, 37)),

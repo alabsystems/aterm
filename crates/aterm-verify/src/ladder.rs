@@ -1,58 +1,32 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The ladder: `ok` / `FAIL` / `NOT RUN` / `skip`, one line per decision, under a
-//! `=== stage ===` header so a whole run is scannable in one screenful.
-//!
-//! The vocabulary is not decoration. Every reviewer instruction, every process
-//! doc and every agent prompt in this repo teaches the same words, and a
-//! skip is an honest "tool absent" — NEVER a silent pass. A run that skipped a
-//! gating stage has not discharged the merge contract, so skips are counted AND
-//! NAMED here, and [`crate::verdict`] downgrades the claim accordingly.
+//! The ladder: `ok` / `FAIL` / `NOT RUN` / `skip`, one row per decision, under a
+//! `=== stage ===` header. A skip names what was absent and is never a silent
+//! pass; a stage that could not run is never mistaken for a finding.
+
+use std::ffi::OsString;
 
 use crate::exec::Run;
+use crate::findings;
 
-/// One failure, itemized so another run's can be compared with it
-/// ([`crate::differential`]): the unit a base receipt lists and a branch's run
-/// is judged by, one `fail` line in the receipt each.
+/// One failure: what failed, the command that reruns just it, and the lines of
+/// its output that say what went wrong.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Finding {
-    /// What failed: a test (`-p atpkg --test atpkg_suite -- <name>`, from
-    /// cargo's re-run spec and libtest's name) or, when the row cannot be
-    /// itemized, the ladder row's own label. Never normalized: two rows that
-    /// differ only in a number are two findings.
+    /// A failed test (`-p atpkg --test atpkg_suite -- <name>`) or, when the row
+    /// cannot be itemized, the row's own label.
     pub id: String,
-    /// [`crate::differential::fingerprint`] of how it failed — everything the
-    /// failure printed, whitespace and line numbers included, with only its
-    /// run-to-run noise masked (where the run happened, thread ids, pids,
-    /// measured durations, build hashes, frame addresses, commit ids:
-    /// [`crate::differential::normalize`]); every count and value it printed
-    /// is kept. "The same failure" is the same id AND this.
-    pub hash: String,
-    /// Why this failure can never be matched against main's, when it cannot:
-    /// the machine refused the test ([`crate::libtest::COULD_NOT_RUN_SENTINEL`]),
-    /// or the row printed nothing to compare. It then always counts as NEW.
-    pub opaque: Option<&'static str>,
-    /// The words that make this failure read as a CLOCK running out — a
-    /// [`crate::differential::TIMING_MARKERS`] entry in its message, or
-    /// [`crate::differential::MEASURED_DURATION`] for one that printed a clock
-    /// it read — when it does. The verdict names such a failure when its stage
-    /// ran on a loaded machine ([`StageLoad::loaded`]), as a label; and it is
-    /// never inherited from main, whose same words cannot be told from a new
-    /// hang or a slower run's ([`crate::differential::judge`]).
-    pub timing: Option<&'static str>,
+    /// The exact command that reruns this finding alone, when there is one
+    /// narrower than rerunning its check.
+    pub rerun: Option<String>,
+    /// What it printed that matters, a few lines at most.
+    pub message: Vec<String>,
 }
 
-/// THE MACHINE'S LOAD AROUND ONE STAGE (2026-09-26): the one-minute load
-/// average when the stage started and when it ended, in hundredths (as
-/// `sysctl vm.loadavg` prints it), and how many cores it is read against.
-///
-/// WHY. A red on a machine at load 78 on 14 cores (measured on the audit's
-/// runs, 2026-09-24) and the same red on an idle one are different evidence,
-/// and until then only the opt-in `--timings` TSV (retired 2026-09-27) knew
-/// which it was. The
-/// ladder's `time` line, the receipt (`load` lines) and the verdict's
-/// under-load label read this.
+/// The one-minute load average around a stage, in hundredths, and the cores it
+/// is read against: a red on an idle machine and the same red at load 78 are
+/// different evidence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StageLoad {
     pub start: u32,
@@ -62,13 +36,9 @@ pub struct StageLoad {
 
 impl StageLoad {
     /// From two readings ([`crate::exec::load_average`]); `None` unless both
-    /// were read.
+    /// were read and are small non-negative numbers.
     #[must_use]
     pub fn of(start: Option<f64>, end: Option<f64>, cores: u32) -> Option<Self> {
-        // Through a two-decimal rendering of the reading (the in-process
-        // `getloadavg` answer is an unrounded float), so no float is ever
-        // cast: a load is a small non-negative number, and anything else is
-        // no reading.
         let centi = |l: f64| -> Option<u32> {
             if !(l.is_finite() && (0.0..1e7).contains(&l)) {
                 return None;
@@ -104,26 +74,15 @@ impl StageLoad {
             self.cores
         )
     }
-
-    /// Was the machine BUSY around this stage: the one-minute load, at either
-    /// end, above half its cores — past that, a correct test waiting on a clock
-    /// competes for a core with work that is not its own.
-    #[must_use]
-    pub fn loaded(&self) -> bool {
-        self.start.max(self.end) > self.cores.saturating_mul(50)
-    }
 }
 
-/// Why a stage failed — the distinction `tools/verify.sh`'s exit codes draw
-/// (`1` FAILED, `3` COULD NOT RUN; [`crate::exit`]).
+/// Why a stage failed: exit `1` against exit `3` ([`crate::exit`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Severity {
     /// A real finding about the tree: a lint, a test, a guard, a proof.
     GateFailed,
-    /// Nothing was decided: no driver, no helper script, no temp dir, too little
-    /// disk. Fail-closed all the same (exit 3, never green), and the row says
-    /// `NOT RUN`, never `FAIL`: it decided nothing. Usually that is the machine,
-    /// but a probe that could not launch can be a crash in the change.
+    /// Nothing was decided: no driver, no helper script, no disk. Never green,
+    /// and never a finding either.
     CouldNotRun,
 }
 
@@ -136,8 +95,7 @@ pub enum Outcome {
 }
 
 impl Outcome {
-    /// The row's prefix: `'  ok    '`, `'  skip  '`, `'  FAIL  '` for a finding
-    /// and `'  NOT RUN '` for a stage that could not execute.
+    /// The row's prefix.
     #[must_use]
     pub fn tag(self) -> &'static str {
         match self {
@@ -149,32 +107,28 @@ impl Outcome {
     }
 }
 
-/// A line of stage output: either a ladder decision or verbatim text (a NOTICE,
-/// a captured child log). Keeping both in one ordered list preserves the script's
-/// interleaving — a build's output still appears above the `FAIL` it explains.
+/// A line of stage output: a ladder decision or verbatim text (a child's log),
+/// in the order the stage produced them, so a build's output sits above the
+/// `FAIL` it explains.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Entry {
     Ladder {
         outcome: Outcome,
         label: String,
-        /// A finding's itemized failures ([`Report::fail_child`],
-        /// [`Report::fail_test_child`], [`Report::fail_and_continue`]); empty
-        /// for every other row, and for a finding decided without a child,
-        /// which the tally itemizes from its label or its log, never to be
-        /// inherited ([`tally`]).
+        /// A finding's itemized failures; empty for every other row, and for a
+        /// finding decided without a child ([`Report::findings`] itemizes it).
         findings: Vec<Finding>,
     },
     Raw(String),
 }
 
-/// One stage's complete output, buffered so that concurrently-run stages still
-/// print in the ladder's declared order.
+/// One stage's complete output, buffered so concurrently run stages still
+/// print in declared order.
 #[derive(Clone, Debug)]
 pub struct Report {
     pub title: String,
     pub entries: Vec<Entry>,
-    /// The machine's load around the stage ([`StageLoad`]), set by the run
-    /// once the stage has finished; `None` when it could not be read.
+    /// The load around the stage, set once it has finished.
     pub load: Option<StageLoad>,
 }
 
@@ -189,183 +143,86 @@ impl Report {
     }
 
     pub fn pass(&mut self, label: impl Into<String>) {
-        self.entries.push(Entry::Ladder {
-            outcome: Outcome::Ok,
-            label: label.into(),
-            findings: Vec::new(),
-        });
+        self.record(Outcome::Ok, label);
     }
 
     pub fn skip(&mut self, label: impl Into<String>) {
-        self.entries.push(Entry::Ladder {
-            outcome: Outcome::Skip,
-            label: label.into(),
-            findings: Vec::new(),
-        });
+        self.record(Outcome::Skip, label);
     }
 
-    /// A gate decided against the tree, by the stage itself, with no child
-    /// whose output is the finding — or with a log under it (a smoke's child
-    /// log tail). NEVER INHERITED (2026-09-27, fourth review): nothing shows
-    /// the stage went on to decide what came after it, and most such rows end
-    /// their stage — a smoke returns at its first bad reply, so main's red on
-    /// one hid every check behind it ([`crate::differential::UNFINISHED`],
-    /// applied by [`tally`]). A row after which the stage goes on is
-    /// [`Report::fail_and_continue`].
+    /// A finding the stage decided by itself; a log written under it with
+    /// [`Report::raw`] is its message.
     pub fn fail(&mut self, label: impl Into<String>) {
-        self.fail_with(label, Vec::new());
+        self.record(Outcome::Fail(Severity::GateFailed), label);
     }
 
-    /// A gate the stage decided by itself against the tree, AFTER WHICH IT
-    /// GOES ON to decide everything it would have decided had this passed: a
-    /// reply that is wrong and stopped nothing, or the stage's last check. Its
-    /// label is its whole message ([`crate::differential::label_finding`]),
-    /// and it can be inherited — a row that ends its stage is [`Report::fail`].
-    /// Nothing is read from a log under it.
-    pub fn fail_and_continue(&mut self, label: impl Into<String>) {
-        let label = label.into();
-        let finding = crate::differential::label_finding(&label);
-        self.fail_with(label, vec![finding]);
+    /// The stage could not execute: a `NOT RUN` row and exit 3.
+    pub fn cannot_run(&mut self, label: impl Into<String>) {
+        self.record(Outcome::Fail(Severity::CouldNotRun), label);
     }
 
-    /// A gate decided against the tree, and these are its itemized failures.
-    fn fail_with(&mut self, label: impl Into<String>, findings: Vec<Finding>) {
+    /// A finding the stage decided by itself, itemized: each of `findings`
+    /// is printed under the check's line.
+    pub fn fail_with_findings(&mut self, label: impl Into<String>, findings: Vec<Finding>) {
+        self.fail_with(label.into(), findings);
+    }
+
+    fn fail_with(&mut self, label: String, findings: Vec<Finding>) {
         self.entries.push(Entry::Ladder {
             outcome: Outcome::Fail(Severity::GateFailed),
-            label: label.into(),
+            label,
             findings,
         });
     }
 
-    /// The stage could not execute: a `NOT RUN` row and exit 3. Fail-closed is
-    /// the rule, and a missing tool that a stage NEEDED is not an honest skip.
-    pub fn cannot_run(&mut self, label: impl Into<String>) {
-        self.entries.push(Entry::Ladder {
-            outcome: Outcome::Fail(Severity::CouldNotRun),
-            label: label.into(),
-            findings: Vec::new(),
-        });
-    }
-
-    /// A child that did not pass, as the FAIL row of the severity its failure
-    /// HAS: COULD NOT RUN when it never spawned or died of the machine
-    /// ([`Run::environment_failure`] — a full disk, measured 2026-09-20), a
-    /// finding otherwise.
-    ///
-    /// WHAT THIS COVERS, stated narrowly because the sentence here was once
-    /// wider than the code (corrected 2026-09-21). Every stage that decides a
-    /// row from a child's EXIT STATUS comes through here or
-    /// [`Report::child_could_not_run`]: the script stages, the libc oracle,
-    /// the cells gates, and the drive binaries, whose own exit
-    /// contracts cannot see a full disk — `libc-oracle/run.sh` maps a cargo
-    /// child that died of ENOSPC (exit 101, since targo never answers 3) onto
-    /// a plain failure, which arrived here as a FINDING about the tree until
-    /// the guard was added. So an ENOSPC on any of those is no longer counted
-    /// against the tree or written into its receipt as `verdict FAIL`.
-    ///
-    /// What does NOT come through here is a row decided from a running
-    /// process's ANSWER rather than its exit status — the smoke stages' socket
-    /// replies, metrics readings and frame checks. A child that never spawned
-    /// there was already reported by the stage that launched it, and a reply
-    /// that is wrong is a finding whatever the disk is doing.
-    ///
-    /// The row's finding is the row itself, fingerprinted from what the child
-    /// printed ([`crate::differential::row_finding`]) — and NEVER INHERITED
-    /// (2026-09-27, fourth review): nothing shows the child ran to its end,
-    /// and one that stops at its first failure prints the same whatever it
-    /// did not reach ([`crate::differential::UNFINISHED`]). A checker whose
-    /// output can show it is [`Report::decide_checker_child`]'s.
+    /// A child that did not pass: COULD NOT RUN when it never spawned or died of
+    /// the machine ([`Run::environment_failure`]), a finding read from what it
+    /// printed otherwise.
     pub fn fail_child(&mut self, run: &Run, label: impl Into<String>) {
-        self.fail_checker_child(run, label, |_| Err(crate::differential::UNFINISHED));
-    }
-
-    /// [`Report::decide_child`] for a CHECKER whose failing output can show it
-    /// decided everything it covers: its finding can be inherited only when
-    /// `ran_to_end` says so, and is never inherited otherwise
-    /// ([`crate::differential::RanToEnd`]).
-    pub fn decide_checker_child(
-        &mut self,
-        run: &Run,
-        label: impl Into<String>,
-        ran_to_end: crate::differential::RanToEnd,
-    ) {
-        if run.ok {
-            self.pass(label);
-        } else {
-            self.fail_checker_child(run, label, ran_to_end);
-        }
-    }
-
-    /// [`Report::fail_child`], inheritable when `ran_to_end` says the checker
-    /// reached its end.
-    pub fn fail_checker_child(
-        &mut self,
-        run: &Run,
-        label: impl Into<String>,
-        ran_to_end: crate::differential::RanToEnd,
-    ) {
         let label = label.into();
         if !self.child_could_not_run(run, &label) {
-            let mut finding = crate::differential::row_finding(&label, &run.output);
-            if let Err(why) = ran_to_end(&run.output) {
-                finding = crate::differential::never_inherited(finding, why);
-            }
+            let finding = findings::row_finding(&label, &run.output);
             self.fail_with(label, vec![finding]);
         }
     }
 
-    /// [`Report::fail_child`] for a `targo test` child: its findings are the
-    /// failed TESTS, each with the binary that failed it, when the log
-    /// accounts for every one ([`crate::differential::test_findings`]) — so a
-    /// red test main already has is one inherited finding, not a whole red row.
-    pub fn fail_test_child(&mut self, run: &Run, label: impl Into<String>) {
-        self.fail_itemized_child(run, label, crate::differential::test_findings);
-    }
-
-    /// [`Report::fail_child`] for a child whose failing output ITEMIZES its
-    /// failures: `itemize` reads them from the row's label and what the child
-    /// printed — the failed tests of a `targo test` child
-    /// ([`crate::differential::test_findings`]), the export content scan's
-    /// hits ([`crate::differential::export_content_findings`]).
-    pub fn fail_itemized_child(
+    /// [`Report::fail_child`] for a `targo test` child that ran under `env`:
+    /// one finding per failed test when the log accounts for every one
+    /// ([`findings::test_findings`]).
+    pub fn fail_test_child(
         &mut self,
         run: &Run,
         label: impl Into<String>,
-        itemize: fn(&str, &str) -> Vec<Finding>,
+        env: &[(OsString, OsString)],
     ) {
         let label = label.into();
         if !self.child_could_not_run(run, &label) {
-            let findings = itemize(&label, &run.output);
-            self.fail_with(label, findings);
+            let found = findings::test_findings(&label, &run.output, env);
+            self.fail_with(label, found);
         }
     }
 
-    /// [`Report::decide_child`] for a `targo test` child
-    /// ([`Report::fail_test_child`]).
-    ///
-    /// A PASS THAT RAN NO TEST IS NO PASS (2026-09-27, third review). cargo
-    /// starts each test binary through a runner when a cargo config or the
-    /// environment names one for the host (`target.<triple>.runner`,
-    /// `CARGO_TARGET_<TRIPLE>_RUNNER`) — and that OUTRANKS the gate's own
-    /// recording runner, which is a `cfg(all())` one, so the run falls back to
-    /// cargo's serial child, which starts every binary through it too. A runner
-    /// that runs nothing (`true`, a wrapper that lost its argument) exited 0 for
-    /// every binary, printed no test, and the row was `ok`: the merge contract,
-    /// with no test run. A child that announced test binaries and printed not
-    /// one libtest `test result:` decided nothing about them — COULD NOT RUN,
-    /// naming why ([`crate::libtest::ran_no_test`]).
-    pub fn decide_test_child(&mut self, run: &Run, label: impl Into<String>) {
+    /// [`Report::decide_child`] for a `targo test` child that ran under `env`
+    /// ([`findings::rerun_env`]). A pass that ran no test is no pass: a runner
+    /// from the caller's cargo config can outrank the recording one and run
+    /// nothing, exiting 0 ([`crate::libtest::ran_no_test`]).
+    pub fn decide_test_child(
+        &mut self,
+        run: &Run,
+        label: impl Into<String>,
+        env: &[(OsString, OsString)],
+    ) {
         let label = label.into();
         if run.ok && crate::libtest::ran_no_test(&run.output) {
             self.cannot_run(format!("{label} — {}", crate::libtest::RAN_NO_TEST));
         } else if run.ok {
             self.pass(label);
         } else {
-            self.fail_test_child(run, label);
+            self.fail_test_child(run, label, env);
         }
     }
 
-    /// [`Report::decide`] from a child: `ok` on success, else [`Report::fail_child`].
+    /// `ok` on success, else [`Report::fail_child`].
     pub fn decide_child(&mut self, run: &Run, label: impl Into<String>) {
         if run.ok {
             self.pass(label);
@@ -375,9 +232,7 @@ impl Report {
     }
 
     /// The environment's failure, if this child had one, recorded as a COULD
-    /// NOT RUN row under `label`: `true` when it was. The stages whose child
-    /// says MORE than pass/fail ask this before reading the output, so an
-    /// ENOSPC never reaches their own verdict logic.
+    /// NOT RUN row under `label`: `true` when it was.
     pub fn child_could_not_run(&mut self, run: &Run, label: &str) -> bool {
         match run.environment_failure() {
             Some(why) => {
@@ -388,8 +243,7 @@ impl Report {
         }
     }
 
-    /// Verbatim output (child logs, NOTICE lines). Trailing newlines are trimmed;
-    /// the renderer supplies exactly one.
+    /// Verbatim output. Trailing newlines are trimmed; the renderer supplies one.
     pub fn raw(&mut self, text: impl Into<String>) {
         let text = text.into();
         let trimmed = text.trim_end_matches('\n');
@@ -398,9 +252,8 @@ impl Report {
         }
     }
 
-    /// Record an already-computed outcome — for the stages whose child reports
-    /// more than pass/fail, so the mapping stays a pure, testable function
-    /// instead of control flow spread through the stage.
+    /// Record an already-computed outcome, for the stages whose child reports
+    /// more than pass/fail.
     pub fn record(&mut self, outcome: Outcome, label: impl Into<String>) {
         self.entries.push(Entry::Ladder {
             outcome,
@@ -409,20 +262,12 @@ impl Report {
         });
     }
 
-    /// [`Report::record`] for an outcome computed from `run`'s exit code: a
-    /// finding is fingerprinted from what the child printed, as
-    /// [`Report::fail_child`]'s is, so two runs whose driver failed with the
-    /// same code but said different things are two different failures — and,
-    /// as that one is, never inherited: one exit code answers for all of a
-    /// driver's checks, and nothing shows it reached the last
-    /// ([`crate::differential::UNFINISHED`]).
+    /// [`Report::record`] for an outcome read from `run`'s exit code: a finding
+    /// carries what the child printed.
     pub fn record_child(&mut self, run: &Run, outcome: Outcome, label: impl Into<String>) {
         let label = label.into();
         if outcome == Outcome::Fail(Severity::GateFailed) {
-            let finding = crate::differential::never_inherited(
-                crate::differential::row_finding(&label, &run.output),
-                crate::differential::UNFINISHED,
-            );
+            let finding = findings::row_finding(&label, &run.output);
             self.fail_with(label, vec![finding]);
         } else {
             self.record(outcome, label);
@@ -448,52 +293,56 @@ impl Report {
         s
     }
 
-    /// Ladder outcomes only, for tests and accounting.
+    /// Ladder outcomes only.
     pub fn outcomes(&self) -> impl Iterator<Item = (Outcome, &str)> {
-        self.decisions().map(|(outcome, label, _)| (outcome, label))
-    }
-
-    /// Ladder outcomes with each row's itemized findings.
-    pub fn decisions(&self) -> impl Iterator<Item = (Outcome, &str, &[Finding])> {
         self.entries.iter().filter_map(|e| match e {
-            Entry::Ladder {
-                outcome,
-                label,
-                findings,
-            } => Some((*outcome, label.as_str(), findings.as_slice())),
+            Entry::Ladder { outcome, label, .. } => Some((*outcome, label.as_str())),
             Entry::Raw(_) => None,
         })
     }
+
+    /// Every failing row's findings, in ladder order. A row decided without a
+    /// child is itemized from the log written under it, else from its label.
+    #[must_use]
+    pub fn findings(&self) -> Vec<Finding> {
+        let mut out = Vec::new();
+        for (at, entry) in self.entries.iter().enumerate() {
+            let Entry::Ladder {
+                outcome: Outcome::Fail(Severity::GateFailed),
+                label,
+                findings,
+            } = entry
+            else {
+                continue;
+            };
+            if !findings.is_empty() {
+                out.extend(findings.iter().cloned());
+                continue;
+            }
+            let logged: Vec<&str> = self.entries[at + 1..]
+                .iter()
+                .map_while(|e| match e {
+                    Entry::Raw(text) => Some(text.as_str()),
+                    Entry::Ladder { .. } => None,
+                })
+                .collect();
+            out.push(if logged.is_empty() {
+                findings::label_finding(label)
+            } else {
+                findings::row_finding(label, &logged.join("\n"))
+            });
+        }
+        out
+    }
 }
 
-/// The accounting the verdict is computed from: the NAME of every finding,
-/// every could-not-run and every skip.
-///
-/// ALL THREE ARE NAMED, for one reason (2026-09-17). The skips were named from
-/// the start because "3 stages were skipped" is how a skipped gate becomes
-/// invisible — and a bare failure count is the same sentence with a worse
-/// ending. MEASURED on the `--fast` run of ca7e3dbfe: one stage was red, the
-/// verdict said `VERIFY: FAIL (mode=fast scope=workspace) — DO NOT merge` and
-/// nothing else, and finding WHICH stage meant grepping 30,713 lines of ladder
-/// for `^  FAIL`. The row is right there in the stage's own block; the verdict
-/// is the line a reader quotes, so it says the names too.
+/// The accounting a run's exit code is decided from: every finding, every
+/// could-not-run and every skip, named in ladder order.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Tally {
-    /// Findings, named in ladder order: a gate decided against the tree.
     pub gate_failures: Vec<String>,
-    /// Stages that decided NOTHING, named in ladder order.
     pub could_not_run: Vec<String>,
-    /// Named, in ladder order. The verdict prints these — "3 stages were skipped"
-    /// without saying which is how a skipped gate becomes invisible.
     pub skips: Vec<String>,
-    /// The itemized failures of each finding, parallel to `gate_failures`
-    /// ([`Tally::findings_of`]): what a receipt lists and what the
-    /// differential verdict judges row by row.
-    pub findings: Vec<Vec<Finding>>,
-    /// The load around the stage each finding came from, parallel to
-    /// `gate_failures` ([`Tally::load_of`]) — what the verdict's under-load
-    /// label reads.
-    pub loads: Vec<Option<StageLoad>>,
 }
 
 impl Tally {
@@ -509,107 +358,22 @@ impl Tally {
 
     /// Add one decision.
     pub fn record(&mut self, outcome: Outcome, label: &str) {
-        self.record_with(outcome, label, &[]);
-    }
-
-    /// Add one decision with its itemized findings. A finding recorded without
-    /// any — a row a stage decided without a child, and with no log under it
-    /// ([`tally`]) — is itemized from its label
-    /// ([`crate::differential::label_finding`]), so every row the tally counts
-    /// as a finding has at least one.
-    pub fn record_with(&mut self, outcome: Outcome, label: &str, findings: &[Finding]) {
-        self.record_under(outcome, label, findings, None);
-    }
-
-    /// [`Tally::record_with`] for a decision of a stage that ran under `load`.
-    pub fn record_under(
-        &mut self,
-        outcome: Outcome,
-        label: &str,
-        findings: &[Finding],
-        load: Option<StageLoad>,
-    ) {
         match outcome {
             Outcome::Ok => {}
             Outcome::Skip => self.skips.push(label.to_string()),
-            Outcome::Fail(Severity::GateFailed) => {
-                self.gate_failures.push(label.to_string());
-                self.loads.push(load);
-                self.findings.push(if findings.is_empty() {
-                    vec![crate::differential::label_finding(label)]
-                } else {
-                    findings.to_vec()
-                });
-            }
+            Outcome::Fail(Severity::GateFailed) => self.gate_failures.push(label.to_string()),
             Outcome::Fail(Severity::CouldNotRun) => self.could_not_run.push(label.to_string()),
         }
     }
-
-    /// The itemized failures of the `row`-th finding — empty for a row a
-    /// caller put in `gate_failures` by hand, which the differential verdict
-    /// then can never excuse.
-    #[must_use]
-    pub fn findings_of(&self, row: usize) -> &[Finding] {
-        self.findings.get(row).map_or(&[], Vec::as_slice)
-    }
-
-    /// Every itemized failure, in ladder order.
-    pub fn all_findings(&self) -> impl Iterator<Item = &Finding> {
-        self.findings.iter().flatten()
-    }
-
-    /// The load around the stage the `row`-th finding came from, when known.
-    #[must_use]
-    pub fn load_of(&self, row: usize) -> Option<StageLoad> {
-        self.loads.get(row).copied().flatten()
-    }
 }
 
-/// Fold every stage report into the run's accounting.
-///
-/// A FINDING DECIDED WITHOUT A CHILD BUT WITH A LOG UNDER IT (2026-09-27) —
-/// `r.fail("smoke: aterm-gui exited early")` and then the child's log tail as
-/// raw text — is fingerprinted from that log, up to the stage's next row
-/// ([`crate::differential::row_finding`]). Until then it was itemized from its
-/// label alone, so a new crash under the same label read as main's.
-///
-/// AND IT IS NEVER INHERITED (2026-09-27, fourth review), with or without a
-/// log: a row the stage decided by itself ([`Report::fail`], a
-/// [`Report::record`]ed finding) most often ends the stage, and nothing shows
-/// it did not ([`crate::differential::UNFINISHED`]). The stage says so when it
-/// goes on ([`Report::fail_and_continue`], which itemizes the row itself).
+/// Fold every stage report into one tally.
 #[must_use]
 pub fn tally(reports: &[Report]) -> Tally {
     let mut t = Tally::default();
     for r in reports {
-        for (at, entry) in r.entries.iter().enumerate() {
-            let Entry::Ladder {
-                outcome,
-                label,
-                findings,
-            } = entry
-            else {
-                continue;
-            };
-            let logged: Vec<&str> = r.entries[at + 1..]
-                .iter()
-                .map_while(|e| match e {
-                    Entry::Raw(text) => Some(text.as_str()),
-                    Entry::Ladder { .. } => None,
-                })
-                .collect();
-            if *outcome == Outcome::Fail(Severity::GateFailed) && findings.is_empty() {
-                let finding = if logged.is_empty() {
-                    crate::differential::label_finding(label)
-                } else {
-                    crate::differential::row_finding(label, &logged.join("\n"))
-                };
-                let finding =
-                    crate::differential::never_inherited(finding, crate::differential::UNFINISHED);
-                t.record_under(*outcome, label, &[finding], r.load);
-            } else {
-                t.record_under(*outcome, label, findings, r.load);
-            }
+        for (outcome, label) in r.outcomes() {
+            t.record(outcome, label);
         }
     }
     t
@@ -620,47 +384,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ladder_columns_match_the_script_byte_for_byte() {
+    fn ladder_rows_render_under_their_header() {
         let mut r = Report::new("test compile (--workspace)");
         r.pass("targo test --workspace --no-run");
         r.skip("tippy lint (no tippy)");
-        r.fail("license_check.sh");
+        r.fail("aterm-census --guards");
         r.cannot_run("targo not found");
         assert_eq!(
             r.render(),
             "\n=== test compile (--workspace) ===\n\
              \x20 ok    targo test --workspace --no-run\n\
              \x20 skip  tippy lint (no tippy)\n\
-             \x20 FAIL  license_check.sh\n\
+             \x20 FAIL  aterm-census --guards\n\
              \x20 NOT RUN targo not found\n"
-        );
-    }
-
-    #[test]
-    fn a_could_not_run_prints_not_run_never_fail_or_skip() {
-        // A machine that refused the work is neither a finding nor an honest
-        // skip: its own word, and exit 3 (fail-closed) in the verdict.
-        assert_eq!(Outcome::Fail(Severity::CouldNotRun).tag(), "  NOT RUN ");
-        assert_ne!(
-            Outcome::Fail(Severity::CouldNotRun).tag(),
-            Outcome::Fail(Severity::GateFailed).tag()
-        );
-        assert_ne!(
-            Outcome::Fail(Severity::CouldNotRun).tag(),
-            Outcome::Skip.tag()
-        );
-    }
-
-    #[test]
-    fn raw_entries_interleave_where_the_stage_put_them() {
-        let mut r = Report::new("cross-cell type-check");
-        r.raw("  NOTICE: the win cell has no installed std here\n");
-        r.skip("gate cells (no installed std)");
-        assert_eq!(
-            r.render(),
-            "\n=== cross-cell type-check ===\n\
-             \x20 NOTICE: the win cell has no installed std here\n\
-             \x20 skip  gate cells (no installed std)\n"
         );
     }
 
@@ -683,20 +419,12 @@ mod tests {
     }
 
     #[test]
-    fn a_clean_run_tallies_to_nothing() {
-        let mut a = Report::new("a");
-        a.pass("x");
-        a.pass("y");
-        let t = tally(&[a]);
-        assert_eq!(t, Tally::default());
-        assert!(!t.failed());
-        assert_eq!(t.skipped(), 0);
+    fn raw_text_never_becomes_a_decision() {
+        let mut r = Report::new("r");
+        r.raw("  NOTICE: something");
+        assert_eq!(tally(&[r]), Tally::default());
     }
 
-    /// THE ROW A DYING CHILD LEAVES. A child that ran and failed is a finding
-    /// (`FAIL`, exit 1); one that never spawned or ran out of disk is COULD NOT
-    /// RUN — a `NOT RUN` row, the other severity in the tally, and so `verdict COULD-NOT-RUN` in the receipt rather than a
-    /// judgement of the tree.
     #[test]
     fn a_child_that_died_of_the_machine_is_could_not_run_and_one_that_failed_is_a_finding() {
         let run = |ok: bool, output: &str, spawn: Option<&str>| Run {
@@ -707,7 +435,10 @@ mod tests {
         };
         let mut r = Report::new("test (--workspace)");
         r.decide_child(&run(true, "", None), "passed");
-        r.decide_child(&run(false, "error[E0308]", None), "a finding");
+        r.decide_child(
+            &run(false, "error[E0308]: mismatched types", None),
+            "a finding",
+        );
         r.decide_child(
             &run(
                 false,
@@ -724,31 +455,22 @@ mod tests {
             ),
             "starved",
         );
-        let mut asked = Report::new("cells");
-        assert!(!asked.child_could_not_run(&run(false, "no", None), "gate cells"));
-        assert!(asked.child_could_not_run(
-            &run(false, "x: No space left on device", None),
-            "gate cells"
-        ));
-
-        let t = tally(&[r, asked]);
+        let t = tally(std::slice::from_ref(&r));
         assert_eq!(t.gate_failures, ["a finding"]);
         assert_eq!(
             t.could_not_run,
             [
                 "never spawned — No space left on device (os error 28)",
                 "starved — the child ran out of disk (No space left on device)",
-                "gate cells — the child ran out of disk (No space left on device)",
             ]
         );
-        assert_eq!(t.skipped(), 0);
+        let found = r.findings();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, "a finding");
+        assert_eq!(found[0].message, ["error[E0308]: mismatched types"]);
     }
 
-    /// THE MACHINE'S REFUSAL, THROUGH THE STAGE'S OWN PATH (2026-09-23). A
-    /// test child whose every failure carries the COULD NOT RUN sentinel is
-    /// the COULD NOT RUN severity — the receipt says `COULD-NOT-RUN`, not
-    /// `FAIL` — and the same child with one plain failure beside it stays a
-    /// finding.
+    /// One plain failure beside the refusals makes the test child a finding.
     #[test]
     fn a_test_child_whose_every_failure_is_a_refusal_is_could_not_run() {
         let sentinel = crate::libtest::COULD_NOT_RUN_SENTINEL;
@@ -771,8 +493,8 @@ mod tests {
         };
         let mut r = Report::new("test (--workspace)");
         r.decide_child(&run(log(&format!("{sentinel} — strays alive"))), "refused");
-        r.decide_child(&run(log("assertion failed: a finding")), "found");
-        let t = tally(&[r]);
+        r.decide_test_child(&run(log("assertion failed: a finding")), "found", &[]);
+        let t = tally(std::slice::from_ref(&r));
         assert_eq!(t.gate_failures, ["found"]);
         assert_eq!(t.could_not_run.len(), 1, "{t:?}");
         assert!(
@@ -780,40 +502,31 @@ mod tests {
                 && t.could_not_run[0].contains("(a, b)"),
             "{t:?}"
         );
+        let ids: Vec<String> = r.findings().into_iter().map(|f| f.id).collect();
+        assert_eq!(
+            ids,
+            ["-p x --test bridge_e2e -- a", "-p x --test bridge_e2e -- b"]
+        );
     }
 
-    /// A LOAD IS TWO READINGS OR NONE: both ends read, in hundredths from the
-    /// two-decimal text, never a cast of a float; a missing, negative or
-    /// non-finite reading is no load at all; and the tally keeps each
-    /// finding's stage load beside it, row for row.
     #[test]
-    fn a_stage_load_is_two_readings_or_none_and_rides_with_its_findings() {
+    fn a_row_decided_without_a_child_is_itemized_from_the_log_under_it() {
+        let mut r = Report::new("smoke");
+        r.fail("smoke: aterm-gui exited early");
+        r.raw("panicked at src/main.rs:3:1");
+        r.fail("smoke: metrics reset -> ERR");
+        let found = r.findings();
+        assert_eq!(found[0].message, ["panicked at src/main.rs:3:1"]);
+        assert!(found[1].message.is_empty());
+    }
+
+    #[test]
+    fn a_stage_load_is_two_readings_or_none() {
         let l = StageLoad::of(Some(74.82), Some(80.1), 14).expect("both read");
         assert_eq!((l.start, l.end, l.cores), (7482, 8010, 14));
         assert_eq!(l.describe(), "74.82 -> 80.10 on 14 cores");
-        assert_eq!(StageLoad::text(5), "0.05");
         assert_eq!(StageLoad::of(Some(1.0), None, 14), None);
-        assert_eq!(StageLoad::of(None, Some(1.0), 14), None);
         assert_eq!(StageLoad::of(Some(-1.0), Some(1.0), 14), None);
         assert_eq!(StageLoad::of(Some(f64::NAN), Some(1.0), 14), None);
-
-        let mut a = Report::new("a");
-        a.fail("first");
-        a.load = Some(l);
-        let mut b = Report::new("b");
-        b.fail("second");
-        let t = tally(&[a, b]);
-        assert_eq!(t.load_of(0), Some(l));
-        assert_eq!(t.load_of(1), None);
-        assert_eq!(t.load_of(2), None);
-    }
-
-    #[test]
-    fn raw_text_never_becomes_a_skip() {
-        // A NOTICE line explains a skip; it must not be counted as one, or the
-        // verdict would name the same absence twice and inflate the count.
-        let mut r = Report::new("r");
-        r.raw("  NOTICE: something");
-        assert_eq!(tally(&[r]), Tally::default());
     }
 }

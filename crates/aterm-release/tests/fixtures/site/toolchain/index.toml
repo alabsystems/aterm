@@ -1,0 +1,30 @@
+# Fixture (crates/aterm-release/src/site/toolchain.rs): the shape `atpkg-publish index`
+# publishes — read for the toolchain facts, never signed or installed from.
+schema = 2
+index_build = 50
+valid_until = "2099-01-01T00:00:00Z"
+machine_id = "m0"
+roster_seq = 1
+
+[programs.ay]
+repo = "ay"
+policy = "prebuilt-only"
+
+[programs.trust]
+repo = "trust"
+policy = "prebuilt-only"
+coherence_group = "rustc"
+
+[programs.claude]
+repo = "aterm"
+policy = "prebuilt-only"
+
+[programs.unpinned]
+repo = "unpinned"
+policy = "prebuilt-only"
+
+[[channels]]
+name = "stable"
+channel_build = 50
+min_build = 0
+pin = { ay = 8256, trust = 9192, claude = 2026092601, unlisted = 7 }

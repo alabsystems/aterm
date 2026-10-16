@@ -1,24 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE HOST-FACING ANATOMY OF A DIGEST ENTRY (owner rule, 2026-09-28: *"a
-//! single batched 'exceptions' [surface] that I can dismiss and they go to some
-//! log for me to look at later"*).
+//! The host-facing anatomy of a digest entry (an exception the owner looks at later).
 //!
-//! A reporter never spells the class ceremony ([`crate::need`]) at every call
-//! site. It states one [`Entry`]: which family speaks, the fact's identity, the
-//! glass-title `what`, WHY the owner is needed ([`Why`]), the ONE action
-//! ([`Then`], optionally with the button that does it), and how long a
-//! dismissal holds. [`Entry::message`] turns it into the checked
-//! [`Message`] (a [`crate::need::Need::Later`]) that
-//! [`crate::MessageCenter::sync_digest`] keeps equal to the reporter's whole
-//! answer for the family. Everything a person reads — the title, the reason,
-//! the action, the capsules — is bounded here once, so a builder that runs past
-//! a cap or leans on "waiting" is a red roster test, not a long line in the
-//! menu bar.
-//!
-//! An entry is NEVER a band row: the digest is a store beside the live set
-//! ([`crate::digest`]), so nothing that lays out the band can seat one.
+//! A reporter states one [`Entry`] instead of spelling the class ceremony
+//! ([`crate::need`]): which family speaks, the fact's identity, the glass-title `what`,
+//! why the owner is needed ([`Why`]), the one action ([`Then`], optionally with the
+//! button that does it), and how long a dismissal holds. [`Entry::message`] turns it
+//! into the checked [`Message`] (a [`crate::need::Need::Later`]) that
+//! [`crate::MessageCenter::sync_digest`] keeps equal to the family's whole answer.
+//! Everything a person reads is bounded here once, so a builder that runs past a cap or
+//! leans on "waiting" fails a roster test, not a long line in the menu bar. An entry is
+//! never a band row: the digest is a store beside the live set ([`crate::digest`]).
 
 use crate::model::{Intent, Message, Severity, Tag, tags};
 use crate::need::{Fingerprint, LaterAsk, Mover, Resurface, Then, Why};
@@ -38,18 +31,18 @@ pub const MORE_LINES: usize = 3;
 pub enum Family {
     /// Full Disk Access and the OS's questions about aterm.
     Privacy,
-    /// The updater (`update.review.<kind>`, a dev build's writes). Its stem is
-    /// NOT the health record's (`update.health.<kind>`): an exception and a
-    /// record never share a key, so a record posted under the fact's own key
-    /// can neither stand in for the entry nor be mistaken for its dismissal.
+    /// The updater (`update.review.<kind>`, a dev build's writes). Its stem is not the
+    /// health record's (`update.health.<kind>`): an exception and a record never share
+    /// a key, so a record posted under the fact's own key can neither stand in for the
+    /// entry nor be mistaken for its dismissal.
     Update,
-    /// The live agent upgrade's ROWS (`harness.upgrade.<kind>[.<tab>]`): a
+    /// The live agent upgrade's rows (`harness.upgrade.<kind>[.<tab>]`): a
     /// level-triggered pass over its records, every look.
     Upgrade,
-    /// The upgrade's HOST (`harness.upgrade-host.<kind>`): a fact the host
-    /// observes by event (the state folder it cannot use). It has a prefix of
-    /// its own because the rows' pass sweeps everything under
-    /// `harness.upgrade.` and would end it two minutes after it was raised.
+    /// The upgrade's host (`harness.upgrade-host.<kind>`): a fact the host observes by
+    /// event (the state folder it cannot use). Its prefix is its own because the rows'
+    /// pass sweeps everything under `harness.upgrade.` and would end it
+    /// [`crate::need::RESOLVE_AFTER`] after it was raised.
     UpgradeHost,
     /// The resume loop's exceptions (`harness.resume.<kind>`).
     Resume,
@@ -59,6 +52,11 @@ pub enum Family {
     /// of the machine's roster, not of a tab (an account signed out, a roster
     /// that is refused). Raised and cleared by the host's look, by event.
     Accounts,
+    /// The AI CLIs aterm manages (`ai.<cli>.<state>`,
+    /// docs/DESIGN-ai-connections-2026-10-16.md §7.3): a wanted CLI that needs
+    /// a person (signed out, not installed, a login due). A level-triggered
+    /// pass: the window's look states its whole answer every time.
+    Ai,
     /// The toolchain lane.
     Toolchain,
     /// The disk reclaim pass.
@@ -67,6 +65,11 @@ pub enum Family {
     /// tab the repaint could not put right, so its screen may be drawn a row
     /// off. Raised at the give-up and cleared when the epoch heals, by event.
     Render,
+    /// What a program in a tab asked the terminal for and the owner's own
+    /// configuration refused (`terminal.<cause>`): a palette set under
+    /// `allow_palette_reconfigure = false`. One line for every tab, since the
+    /// setting is one; raised by event at a session's first refusal.
+    Terminal,
 }
 
 impl Family {
@@ -82,9 +85,11 @@ impl Family {
             Self::Resume => "harness.resume",
             Self::Supervisor => "harness.supervisor",
             Self::Accounts => "harness.accounts",
+            Self::Ai => "ai",
             Self::Toolchain => "toolchain",
             Self::Disk => "disk",
             Self::Render => "render",
+            Self::Terminal => "terminal",
         }
     }
 
@@ -94,16 +99,15 @@ impl Family {
         format!("{}.", self.stem())
     }
 
-    /// HOW the family's producer speaks — the family has exactly one, and one
-    /// mode. A [`Mode::Level`] family states its whole answer every look
-    /// (`sync_digest`: what it stops naming ends), so nothing else may raise an
-    /// entry under its prefix; a [`Mode::Event`] family raises and clears by
-    /// event (`post`, `clear_digest`) and is never swept. The host refuses the
-    /// wrong call (`App::except`, `App::except_replace`).
+    /// How the family's one producer speaks. A [`Mode::Level`] family states its whole
+    /// answer every look (`sync_digest`: what it stops naming ends), so nothing else may
+    /// raise an entry under its prefix; a [`Mode::Event`] family raises and clears by
+    /// event (`post`, `clear_digest`) and is never swept. The host refuses the wrong
+    /// call (`App::except`, `App::except_replace`).
     #[must_use]
     pub const fn mode(self) -> Mode {
         match self {
-            Self::Upgrade | Self::Resume => Mode::Level,
+            Self::Upgrade | Self::Resume | Self::Ai => Mode::Level,
             Self::Privacy
             | Self::Update
             | Self::UpgradeHost
@@ -111,12 +115,13 @@ impl Family {
             | Self::Accounts
             | Self::Toolchain
             | Self::Disk
-            | Self::Render => Mode::Event,
+            | Self::Render
+            | Self::Terminal => Mode::Event,
         }
     }
 
     /// Every family, in digest order.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 12] = [
         Self::Privacy,
         Self::Update,
         Self::Upgrade,
@@ -124,9 +129,11 @@ impl Family {
         Self::Resume,
         Self::Supervisor,
         Self::Accounts,
+        Self::Ai,
         Self::Toolchain,
         Self::Disk,
         Self::Render,
+        Self::Terminal,
     ];
 
     /// The message tag the family's entries carry.
@@ -139,10 +146,12 @@ impl Family {
             | Self::UpgradeHost
             | Self::Resume
             | Self::Supervisor
-            | Self::Accounts => tags::HARNESS,
+            | Self::Accounts
+            | Self::Ai => tags::HARNESS,
             Self::Toolchain => tags::TOOLCHAIN,
             Self::Disk => tags::SYSTEM,
             Self::Render => tags::RENDER,
+            Self::Terminal => tags::CONFIG,
         }
     }
 }
@@ -187,12 +196,11 @@ pub struct Entry {
 
 impl Entry {
     /// An entry of `family`. The fact's identity is `(family, subject, cause)`:
-    /// `subject` names the place when the action is per place (a tab), or is
-    /// empty when one action serves every place (one entry naming them all);
-    /// `cause` is a short lowercase word (`own-work`, `needed`) and is the ONLY
-    /// thing that makes a fact NEW after a dismissal — never a version, a pid,
-    /// an age or a tab set. `what` is the glass-title subject; `why` says why
-    /// the owner and not the machine; `then` is the one action.
+    /// `subject` names the place when the action is per place (a tab), or is empty when
+    /// one action serves every place; `cause` is a short lowercase word (`own-work`,
+    /// `needed`) and is the only thing that makes a fact new after a dismissal, never a
+    /// version, a pid, an age or a tab set. `what` is the glass-title subject; `why` says
+    /// why the owner and not the machine; `then` is the one action.
     #[must_use]
     pub fn new(
         family: Family,
@@ -252,9 +260,9 @@ impl Entry {
         self
     }
 
-    /// The ONE machine line `aterm.log` keeps when the entry is first raised
-    /// (`upgrade need=own-work tab=s-3e79 move=2.1.283->2.1.284 ...`): what a
-    /// developer greps, never shown to the owner.
+    /// The one machine line `aterm.log` keeps when the entry is first raised
+    /// (`upgrade need=own-work tab=s-3e79 move=2.1.283->2.1.284 ...`): what a developer
+    /// greps, never shown to the owner.
     #[must_use]
     pub fn log_line(mut self, line: impl AsRef<str>) -> Self {
         self.log_line = Some(line.as_ref().to_string());

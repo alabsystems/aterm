@@ -1,20 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! M1b INCOMING-ROW APRON (CPU): during a sub-row up-glide the exposed bottom
-//! strip shows the TOP `frac` px of the row sliding in from below the viewport
-//! — raster-exact — instead of the band's own stale pixels (the retired
-//! placeholder). The oracle is the engine itself: THE APRON AT OFFSET `d` IS
-//! THE BOTTOM VIEWPORT ROW AT OFFSET `d - 1`, so the strip of the frac frame at
-//! offset `d` must equal the top `frac` px of the bottom grid row of the
-//! whole-row frame at offset `d - 1`. Against today's placeholder the strip
-//! holds the bottom row's own BOTTOM `frac` px, so the first assertion FAILS.
+//! Incoming-row apron (CPU): during a sub-row up-glide the exposed bottom strip shows the
+//! top `frac` px of the row sliding in from below the viewport, raster-exact. The oracle is
+//! the engine: the apron at offset `d` is the bottom viewport row at offset `d - 1`.
 //!
-//! Machine-independent: the bundled DejaVu face with runtime font discovery
-//! off. It used `Renderer::from_system` and RETURNED — reporting PASS having
-//! rastered nothing — on any box with no system font (a Linux container), so
-//! a regression that brought the placeholder back read green there (audit,
-//! 2026-09-24). The fixture text is ASCII caps and digits, which DejaVu covers.
+//! The bundled DejaVu face with runtime font discovery off keeps this machine-independent;
+//! the fixture text is ASCII caps and digits, which DejaVu covers.
 
 use aterm_core::terminal::Terminal;
 use aterm_render::{Frame, Renderer, Theme, WindowCpu};
@@ -35,7 +27,7 @@ fn renderer() -> Renderer {
     r
 }
 
-/// Distinct, DESCENDER-FREE text per line (caps + digits only), so a row's
+/// Distinct, descender-free text per line (caps + digits only), so a row's
 /// ink never overshoots its own band and the per-row oracle is exact at the
 /// row seam. The cursor is hidden so no oracle row carries a caret.
 fn seeded_term() -> Terminal {
@@ -85,9 +77,9 @@ fn up_glide_strip_shows_the_incoming_rows_top_pixels() {
         "scrolled back: a row lies below the viewport"
     );
     let glide = r.render_input(&glide_in);
-    // The untranslated frame at offset d — the retired placeholder's source.
+    // The untranslated frame at offset d.
     let flat = r.render_input(&partitioned(&mut t, 0));
-    // The whole-row ORACLE at offset d - 1: its bottom grid row IS the apron.
+    // The whole-row oracle at offset d - 1: its bottom grid row is the apron.
     let mut o = seeded_term();
     o.scroll_display(d - 1);
     let oracle = r.render_input(&partitioned(&mut o, 0));
@@ -101,8 +93,7 @@ fn up_glide_strip_shows_the_incoming_rows_top_pixels() {
         strip, expected,
         "the exposed bottom strip must be the incoming row's top {n} px"
     );
-    // Teeth: the oracle strip differs from the placeholder (the bottom row's own
-    // bottom px), so the assertion above cannot pass on the retired code.
+    // Control: the oracle strip differs from the bottom row's own bottom px.
     assert_ne!(
         expected,
         rows_of(&flat, y1 - n, n),
@@ -133,10 +124,9 @@ fn up_glide_strip_shows_the_incoming_rows_top_pixels() {
     }
 }
 
-/// The PRESENTATION hot path: a frac-only frame over unchanged content is a
-/// damage-cache gate hit, and the strip must still be painted from the apron on
-/// that zero-raster re-present (the apron raster is a present-step, not a
-/// damage-step). Same oracle as above.
+/// A frac-only frame over unchanged content is a damage-cache gate hit, and the strip is
+/// still painted from the apron on that re-present (the apron is a present step, not a
+/// damage step). Same oracle as above.
 #[test]
 fn cached_gate_hit_frame_still_paints_the_strip() {
     let mut r = renderer();
@@ -164,10 +154,8 @@ fn cached_gate_hit_frame_still_paints_the_strip() {
         rows_of(&oracle, y1 - ch, n),
         "the gate-hit re-present paints the incoming row's top {n} px"
     );
-    // THE PRESENTER READS WHAT THE RENDER HANDED BACK: the CPU window ends the
-    // exclusive render borrow and re-borrows the pixels; re-borrowing the
-    // untranslated cache would drop the band shift and this strip (whole-row
-    // scroll jumps). The shared re-borrow is the translated frame, and says so.
+    // The presenter reads what the render handed back: re-borrowing the untranslated cache
+    // would drop the band shift and this strip.
     assert!(
         wc.last_translated(),
         "a sub-row frame is a translated frame"
@@ -182,8 +170,7 @@ fn cached_gate_hit_frame_still_paints_the_strip() {
         wc.frame_pixels(),
         "control: the untranslated cache is a different frame"
     );
-    // And landing the row (frac 0) hands back the pristine cache: the strip is
-    // then the ordinary bottom row of the offset-d frame, untouched by the apron.
+    // Landing the row (frac 0) hands back the pristine cache.
     let landed = r.render_input_cached(&mut wc, &partitioned(&mut t, 0));
     let flat = r.render_input(&partitioned(&mut t, 0));
     assert_eq!(
@@ -198,9 +185,8 @@ fn cached_gate_hit_frame_still_paints_the_strip() {
     assert_eq!(wc.presented_pixels(), wc.frame_pixels());
 }
 
-/// A DOWN-bounce (negative residual) owes NO apron: the top strip stays the
-/// placeholder on this backend exactly as before — byte-identical to a plain
-/// band translate of the untranslated frame.
+/// A down-bounce (negative residual) owes no apron: the frame is a plain band translate of
+/// the untranslated frame.
 #[test]
 fn down_bounce_keeps_the_placeholder() {
     let mut r = renderer();
@@ -220,4 +206,93 @@ fn down_bounce_keeps_the_placeholder() {
         i64::from(frac),
     );
     assert_eq!(bounce.pixels, expect, "a bounce is the bare translate");
+}
+
+/// Scrolling past the bottom of the live screen (`display_offset == 0`,
+/// `scroll_frac_px > 0`, `apron_row.present == false`) must paint a blank
+/// frame-background apron into the bottom `frac` scanlines rather than leaving
+/// the untranslated bottom row's glyphs duplicated at the bottom of the band.
+#[test]
+fn live_bottom_up_overscroll_paints_blank_apron_instead_of_duplicating_bottom_row() {
+    let mut r = renderer();
+    let (_cw, ch) = r.cell_size();
+    let grid_top = r.grid_top();
+    let frac = (ch / 2).max(1) as i32;
+    let n = frac as usize;
+    let mut t = seeded_term();
+    t.process(b"BOTTOM ROW GLYPHS");
+    assert_eq!(t.grid().display_offset(), 0);
+    let flat = r.render_input(&partitioned(&mut t, 0));
+    let input = partitioned(&mut t, frac);
+    assert!(
+        !input.apron_row.present,
+        "at display_offset 0 there is no incoming row below the live screen"
+    );
+    let overscrolled = r.render_input(&input);
+    let y1 = grid_top + ROWS * ch;
+    assert!(
+        rows_of(&flat, y1 - n, n)
+            .iter()
+            .any(|&px| (px & 0x00ff_ffff) != BG),
+        "control: the untranslated bottom strip carries glyph ink"
+    );
+    assert!(
+        rows_of(&overscrolled, y1 - n, n)
+            .iter()
+            .all(|&px| (px & 0x00ff_ffff) == BG),
+        "bottom overscroll strip must be blank background, not duplicated bottom-row glyphs"
+    );
+}
+
+#[test]
+fn a_reordered_bidi_incoming_row_keeps_the_scroll_placeholder() {
+    let mut r = renderer();
+    let (_cw, ch) = r.cell_size();
+    let grid_top = r.grid_top();
+    let frac = (ch / 2).max(1) as i32;
+    let n = frac as usize;
+    let d = 3;
+    let mut t = seeded_term();
+    // At d=3, screen row ROWS-d is just below the viewport. Its Hebrew
+    // run has a nonidentity visual order, so the engine withholds its apron
+    // rather than exposing a strip rastered in logical order.
+    let incoming_row = ROWS - d as usize;
+    t.process(format!("\x1b[{};1H\x1b[2K", incoming_row + 1).as_bytes());
+    t.process("\u{05d0}\u{05d1}\u{05d2}".as_bytes());
+    let (_, order) = t.row_display_order(incoming_row as u16).unwrap();
+    assert!(
+        order
+            .iter()
+            .enumerate()
+            .any(|(visual, &logical)| visual != logical),
+        "control: the actual incoming row requires BiDi reordering"
+    );
+    t.scroll_display(d);
+    let flat = r.render_input(&partitioned(&mut t, 0));
+    let input = partitioned(&mut t, frac);
+    assert_eq!(input.display_offset, d);
+    assert!(
+        !input.apron_row.present,
+        "a reordered incoming row withholds its apron despite being above the live bottom"
+    );
+    let y1 = grid_top + ROWS * ch;
+    assert!(
+        rows_of(&flat, y1 - n, n)
+            .iter()
+            .any(|&px| (px & 0x00ff_ffff) != BG),
+        "control: blanking the placeholder would erase visible ink"
+    );
+    let mut expected = flat.pixels.clone();
+    aterm_render::scroll_translate::translate_grid_band_in_place(
+        &mut expected,
+        flat.width,
+        grid_top + ch,
+        y1,
+        i64::from(frac),
+    );
+    let glide = r.render_input(&input);
+    assert_eq!(
+        glide.pixels, expected,
+        "an unavailable reordered apron preserves the scroll fallback instead of painting a blank row"
+    );
 }

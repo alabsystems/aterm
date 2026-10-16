@@ -1,36 +1,29 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Resolving the configurable account and the one bootstrap asset it points at (§5).
+//! Resolving the index account and repository (§5).
 //!
-//! The manager **never enumerates** the account. It resolves the configurable owner
-//! (R3, default `alabsystems`) by reusing `aterm-update-core`'s URL-safety slug
-//! resolution verbatim — [`pick_slug`](aterm_update_core::pick_slug) /
-//! [`is_valid_slug`](aterm_update_core::is_valid_slug), the same gate that keeps a
-//! stray/hostile config value from redirecting fetches off GitHub — and then reads the
-//! signed index from `<account>/aterm`'s release download host
-//! ([`crate::manifest::INDEX_REPO`]). Everything installable flows from that one
-//! root-signed document; an unlisted repo is unreachable by construction (§5,
-//! [`crate::manifest::Index::installable`]).
+//! The manager never enumerates the account. It resolves the owner through
+//! `aterm-update-core`'s slug gate ([`pick_slug`](aterm_update_core::pick_slug)), which keeps a
+//! stray or hostile config value from redirecting fetches off GitHub, then reads the
+//! root-signed index from `<owner>/aterm`'s releases. Everything installable flows from that
+//! index; an unlisted repo is unreachable ([`crate::manifest::Index::installable`]).
 
 use crate::manifest::INDEX_REPO;
 
-/// The repository (under the resolved account) that hosts the signed index: always
-/// [`INDEX_REPO`] (the `aterm` repo). The `ATPKG_INDEX_REPO` override is gone
-/// (2026-09-23, R2: one true path, no env alternatives) — it had no config twin and
-/// contradicted this module's own rule that only the account is configurable.
+/// The repository under the resolved account that hosts the signed index: always
+/// [`INDEX_REPO`]. Only the account is configurable.
 #[must_use]
 pub fn index_repo() -> String {
     INDEX_REPO.to_string()
 }
 
-/// The resolved index location: `github.com/<owner>/aterm`. `repo` is
-/// always [`INDEX_REPO`]; only the `owner` (account) is configurable.
+/// The resolved index location, `github.com/<owner>/aterm`; only `owner` is configurable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexRepo {
-    /// The GitHub account (owner) the toolchain index + program repos live under.
+    /// The GitHub account the index and program repos live under.
     pub owner: String,
-    /// Always [`INDEX_REPO`] — the well-known index repository name.
+    /// Always [`INDEX_REPO`].
     pub repo: String,
 }
 
@@ -42,32 +35,19 @@ impl IndexRepo {
     }
 }
 
-/// Resolve the index account: `cfg_account` — the `[packages].account` value, which
-/// only a DEVELOPMENT build ever hands over (`config::admit_packages` drops it from a
-/// shipped binary's table, like every repoint) — else the compiled
-/// [`aterm_update_core::ATPKG_INDEX_OWNER`] (`alabsystems`). Validated by the shared
-/// URL-safety allowlist so a malformed value can never redirect fetches at a different
-/// host/path (it falls through to the default). The `ATPKG_ACCOUNT` env override is gone
-/// (2026-09-23).
+/// Resolve the index account: `cfg_account` (`[packages].account`, which only a development
+/// build keeps: `config::admit_packages` drops it from a shipped binary's table), else
+/// [`aterm_update_core::ATPKG_INDEX_OWNER`]. A value that fails the shared URL-safety slug
+/// check falls through to the default, so it can never redirect fetches at another host.
 ///
-/// Repointing the account is **not** an authenticity downgrade: the install gate is the
-/// root/release signature (§8), not where the bytes come from — and pointing at a
-/// *different owner* additionally requires pinning that owner's root key (§8
-/// account-bound trust), so a bare repoint is same-owner mirror/relocation only.
+/// Repointing is no authenticity downgrade: installs are gated on the root and release
+/// signatures (§8), and a different owner also needs that owner's root key pinned.
 #[must_use]
 pub fn resolve_account(cfg_account: Option<&str>) -> IndexRepo {
-    // ATPKG_INDEX_OWNER — the package index's OWN tracked key
-    // (`[workspace.metadata.atpkg] account`), neither of the updater's slugs:
-    //   * not DEFAULT_OWNER — that is the APP update channel; following it would
-    //     silently move the index's ACCOUNT-BOUND trust root (§8) whenever the
-    //     channel is repointed, turning a channel change into an authenticity
-    //     change;
-    //   * not PUBLISH_OWNER — that is the PRIVATE staging repo, which a
-    //     default-configured (tokenless) install cannot read at all, so binding
-    //     the index to it orphaned every such install from the published
-    //     registry.
-    // Repointing the compiled default is a HOST decision only: the index still
-    // verifies against the pinned root key wherever it is fetched from.
+    // The index has its own owner constant, not `DEFAULT_OWNER` (the app update channel:
+    // following it would move the index's account-bound trust root whenever the channel is
+    // repointed) and not the workspace `repository` owner (a private repo a tokenless
+    // install cannot read).
     let owner = aterm_update_core::pick_slug(
         "[packages] account",
         cfg_account,
@@ -85,8 +65,7 @@ mod tests {
 
     #[test]
     fn defaults_to_the_public_alabsystems_index_repo() {
-        // With no config, the default account + fixed index repo — on every machine:
-        // no environment is read.
+        // No environment is read.
         let r = resolve_account(None);
         assert_eq!(r.owner, aterm_update_core::ATPKG_INDEX_OWNER);
         assert_eq!(r.owner, "alabsystems");
@@ -97,11 +76,9 @@ mod tests {
 
     #[test]
     fn config_account_overrides_default_but_is_validated() {
-        // A valid config account is used (only a development build hands one over).
         assert_eq!(resolve_account(Some("my-org")).owner, "my-org");
         assert_eq!(resolve_account(Some("my-org")).repo, INDEX_REPO);
-        // An invalid (URL-metacharacter) account is rejected → falls back to default,
-        // so it can never splice another host or path into the index's download URL.
+        // An account with URL metacharacters falls back to the default.
         assert_eq!(
             resolve_account(Some("evil.com/x")).owner,
             aterm_update_core::ATPKG_INDEX_OWNER

@@ -95,8 +95,8 @@ fn completion(attempt_id: u64) -> crate::UpdateHandoffCompletion {
     }
 }
 
-/// A completion for an attempt that only ever PRELAUNCHED clears that
-/// record, so a retry may launch.
+/// A completion for an attempt that only ever prelaunched clears that record, so a retry may
+/// launch.
 #[test]
 fn a_prelaunched_attempt_is_cleared_by_its_completion() {
     let mut app = App::headless_for_test();
@@ -127,7 +127,7 @@ fn a_health_warning_during_an_attempt_leaves_its_installing_row_and_rim() {
         .id;
     let (record, _cancelled, _stood_down, _transferred) = prelaunch_record(9, ApplyMode::Immediate);
     app.update_handoff_prelaunch = Some(record);
-    // The readers parked (the rim's start: round eight, leads U60 and U40).
+    // The readers parked: the rim's start.
     app.charge_upgrade_rim_at_park(41);
     assert!(app.note_update_health(
         aterm_update::health_failing_title("manifest"),
@@ -139,17 +139,15 @@ fn a_health_warning_during_an_attempt_leaves_its_installing_row_and_rim() {
         Some(FlowPhase::Installing)
     ));
     assert!(app.level_up.is_some(), "the rim still explains the freeze");
-    // The attempt ends without taking over: ITS completion retires both.
+    // The attempt ends without taking over: its own completion retires both.
     app.reduce_returned_handoff_completion(completion(9));
     assert!(app.messages.live(id).is_none());
     assert!(app.level_up.is_none());
 }
 
-/// A flood's mid-sequence park never stands the successor down on its own:
-/// through the production miss handler, a mid-sequence capture re-parks at the
-/// 20 ms cadence without spending a rung for the whole mid-sequence bound, then
-/// the ordinary ladder takes over, so a parser that stays mid-sequence ends in
-/// the bounded stand-down, never an endless loop.
+/// A mid-sequence park miss re-parks at the 20 ms cadence without spending a rung, up to the
+/// mid-sequence bound; past it the ordinary ladder takes over, so a parser that stays
+/// mid-sequence ends in the bounded stand-down, never an endless loop.
 #[test]
 fn a_mid_sequence_park_miss_re_parks_on_the_same_rung_without_standing_down() {
     let mut app = App::headless_for_test();
@@ -203,10 +201,8 @@ fn a_mid_sequence_park_miss_re_parks_on_the_same_rung_without_standing_down() {
     assert!(!p.stood_down);
 }
 
-/// A flood's batch boundaries fit the free re-park bound: an SGR-dense stream cut
-/// at arbitrary reader boundaries leaves the parser mid-sequence at some cuts
-/// (`Terminal::partial_sequence_state`) and at ground at others, and the longest
-/// mid-sequence run is well inside the bound. Non-vacuous both ways.
+/// An SGR-dense flood cut at arbitrary reader boundaries is mid-sequence at some cuts and at
+/// ground at others, and its longest mid-sequence run fits the free re-park bound.
 #[test]
 fn a_flood_cut_at_batch_boundaries_parks_well_inside_the_mid_sequence_bound() {
     let mut app = App::headless_for_test();
@@ -257,8 +253,8 @@ fn a_flood_cut_at_batch_boundaries_parks_well_inside_the_mid_sequence_bound() {
     );
 }
 
-/// A completion whose attempt matches NEITHER record is not reduced and
-/// clears nothing: a stale completion can never retire a newer attempt.
+/// A completion whose attempt matches neither record is not reduced and clears nothing: a
+/// stale completion can never retire a newer attempt.
 #[test]
 fn a_stale_completion_clears_no_record() {
     let mut app = App::headless_for_test();
@@ -448,10 +444,8 @@ fn the_park_cue_binds_to_its_attempt_and_an_empty_pool_stands_down() {
     );
 }
 
-/// The headless fixture's session has no real master: the descriptor duplicate
-/// fails, the parked readers roll back, and the held successor is stood down as
-/// this process's failure (`ProducerFailed`, Transient), never as the candidate's
-/// bytes failing.
+/// With no real master the descriptor duplicate fails, the parked readers roll back, and the
+/// held successor is stood down as this process's failure (`ProducerFailed`), never the bytes'.
 #[test]
 fn a_park_half_failure_stands_the_held_successor_down_as_a_producer_failure() {
     let mut app = App::headless_for_test();
@@ -548,11 +542,9 @@ fn a_switch_on_record_that_stands_down_is_recorded_as_stopped() {
     assert_eq!(titles(&app).len(), 2);
 }
 
-/// A halt that moves after the park refuses the Commit: the successor adopts the
-/// park's manifest while the control thread keeps serving `hold`, so a `hold on`
-/// answered in between would reach no one. `exact_activity` requires every
-/// session's hold serial to be where the park read it; a hold set and lifted in
-/// the window moves it too.
+/// A halt that moves after the park refuses the Commit (the successor adopts the park's
+/// manifest, so a `hold on` answered in between would reach no one): `exact_activity` requires
+/// every session's hold serial to be where the park read it, and a set-then-lift moves it too.
 #[test]
 fn a_hold_that_moves_after_the_park_refuses_the_commit() {
     use crate::fabric::{Hold, apply_hold_for_test};
@@ -613,12 +605,58 @@ fn a_hold_that_moves_after_the_park_refuses_the_commit() {
     assert!(exact_activity(&mut app));
 }
 
-/// The turn-id ceiling belongs to the attempt: the Commit stands down only when
-/// this process minted past the count its own manifest carried, not another
-/// attempt's.
-///
-/// Robust to concurrent minting: the count only rises, so a ceiling of 1 under a
-/// count of 2 or more is always passed, and one at `MAX_TURN_ID` never is.
+/// A tab spawn queued before a prelaunched successor parks is in no manifest, and the epoch that
+/// park captures cannot vouch for it: the Commit waits for the job itself, its held input and
+/// wire waiter included.
+#[test]
+fn a_tab_still_spawning_at_the_park_refuses_the_commit() {
+    let mut app = App::headless_for_test();
+    let arm = |app: &mut App| {
+        let mut pending = parked_record(9, ApplyMode::Immediate);
+        pending.live = app
+            .pool
+            .iter()
+            .map(|session| (session.id, session.master, session.pid))
+            .collect();
+        pending.layout = app.capture_handoff_layout();
+        pending.activity_epoch = app.update_handoff_activity_epoch;
+        pending.hold_serials = app.hold_serials();
+        app.pending_update_handoff = Some(pending);
+    };
+    let facts = |app: &mut App| {
+        app.collect_handoff_commit_facts(None, true, true, true, None, None)
+            .expect("an attempt is pending")
+            .0
+    };
+    arm(&mut app);
+    assert!(facts(&mut app).exact_activity, "no tab is missing");
+
+    let id = crate::tab_spawn::test_support::book(
+        &mut app,
+        crate::WindowId(0),
+        crate::tab_spawn::TabSpawnThen::Nothing,
+    );
+    arm(&mut app); // The park reads the epoch after the job was queued.
+    let missing = facts(&mut app);
+    assert!(missing.exact_sessions && missing.exact_layout);
+    assert!(
+        !missing.exact_activity,
+        "the unchanged live set and epoch do not carry the unfinished spawn"
+    );
+
+    assert!(!app.install_spawned_tab(crate::tab_spawn::TabSpawned {
+        id,
+        window: crate::WindowId(0),
+        session: Err(std::io::Error::other("exec refused")),
+        reader_gate: None,
+    }));
+    arm(&mut app);
+    assert!(facts(&mut app).exact_activity, "the spawn settled");
+}
+
+/// The Commit stands down only when this process minted past the turn-id ceiling of its own
+/// attempt's manifest, never another attempt's. Robust to concurrent minting: the count only
+/// rises, so a ceiling of 1 under a count of 2 is always passed and `MAX_TURN_ID` never is.
 #[test]
 fn the_commit_reads_the_turn_id_ceiling_of_its_own_attempt() {
     let mut app = App::headless_for_test();
@@ -659,11 +697,10 @@ fn the_commit_reads_the_turn_id_ceiling_of_its_own_attempt() {
     );
 }
 
-/// A halt issued while the Commit runs is never answered and then lost. The
-/// Commit's hold-serial reading raises a fence: a `hold on` issued after it gets
-/// no answer while the attempt can still land, and lands (`OK hold=1`) the moment
-/// the attempt stands down. A landed Commit `_exit`s with the caller waiting, so
-/// its connection closes with no `OK`. Past the verb's bound it is `ERR busy`.
+/// A halt issued while the Commit runs is never answered and then lost: after the Commit's
+/// hold-serial read raises its fence, a `hold on` gets no answer while the attempt can still
+/// land, lands (`OK hold=1`) once it stands down, and past the verb's bound is `ERR busy`. A
+/// landed Commit `_exit`s with the caller waiting, so its connection closes with no `OK`.
 #[test]
 fn a_hold_issued_during_the_commit_waits_for_the_attempt() {
     use crate::fabric::{HOLD_BUSY, HoldIssuer, cmd_hold, cmd_hold_within};
@@ -702,7 +739,7 @@ fn a_hold_issued_during_the_commit_waits_for_the_attempt() {
             &app.store,
             &format!("{sid} on reason=stop"),
             HoldIssuer::Owner,
-            std::time::Duration::from_millis(50),
+            Some(std::time::Duration::from_millis(50)),
         ),
         HOLD_BUSY
     );
@@ -735,12 +772,9 @@ fn a_hold_issued_during_the_commit_waits_for_the_attempt() {
     assert_ne!(app.hold_serials(), parked_serials);
 }
 
-/// Round eight of the update audit, finding 751: what a record carries that
-/// a control verb can move after the park's draw — a topic opt-in, a keyed
-/// escalation, a supervisor claim — and that no other Commit fact compares,
-/// stands the Commit down when it moved (a lossless retry, whose next draw
-/// carries it). A read moves nothing, nor does a lease its own holder
-/// renews.
+/// A topic opt-in, keyed escalation or supervisor claim moved by a control verb after the
+/// park's draw (compared by no other Commit fact) stands the Commit down as a lossless retry.
+/// A read moves nothing, nor does a lease its own holder renews.
 #[test]
 fn a_topic_escalation_or_claim_moved_after_the_draw_stands_the_commit_down() {
     use crate::session_timeline::{MetaEdit, claim_supervisor, write_attention_owned};

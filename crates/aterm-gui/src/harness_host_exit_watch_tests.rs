@@ -176,6 +176,21 @@ fn watch_armed(host: &HostHandle) -> bool {
     kept_of(host, |k| k.exit_watch.is_some()).unwrap_or(false)
 }
 
+/// Whether the restored queue keeps tab `sid`'s attempt as A LANDING NO READ
+/// HAS REACHED ([`RestoredAttempt::landed`]): its step landed, and a look at
+/// the agent it landed found it holding its tab unread
+/// ([`restored_landing_ends`]). Set only as that look ends, so `true` says it
+/// has: the step being counted, or the tab asked about, says neither.
+fn landed_unread(host: &HostHandle, sid: &str) -> bool {
+    host.shared
+        .restored
+        .lock()
+        .unwrap()
+        .attempts
+        .iter()
+        .any(|attempt| attempt.agent.sid == sid && attempt.landed)
+}
+
 /// Whether every worker the host published is stopped ([`State::stops`]).
 fn all_stopped(host: &HostHandle) -> bool {
     host.shared
@@ -245,8 +260,10 @@ fn the_record_of_a_crash_while_the_host_is_down_is_read_as_it_is_seen() {
     // Another Claude Code starts, and sweeps the dead agent's record.
     p.a.record_gone.store(true, Ordering::SeqCst);
     p.down.open();
+    // Waited on the decision, not on the exit's record: the record is pushed
+    // first in the same step, so a read between the two saw no relaunch.
     until("the crash decided once the host is back", || {
-        !p.a.exit_records.lock().unwrap().is_empty()
+        exit_decided(&p.a)
     });
     assert_eq!(
         (
@@ -296,7 +313,7 @@ fn a_crash_while_a_commit_holds_the_host_is_read_as_it_is_seen() {
     host.resume_restored();
     host.relaunch_stranded(&|_| "in tab 1".to_string());
     until("the crash decided once the host is back", || {
-        !a.exit_records.lock().unwrap().is_empty()
+        exit_decided(&a)
     });
     assert_eq!(
         (
@@ -672,7 +689,7 @@ fn a_pass_in_flight_at_a_commits_stop_ends_no_watch_that_stop_armed() {
     host.resume_restored();
     host.relaunch_stranded(&|_| "in tab 1".to_string());
     until("the crash decided once the host is back", || {
-        !a.exit_records.lock().unwrap().is_empty()
+        exit_decided(&a)
     });
     assert_eq!(
         (
@@ -1103,7 +1120,9 @@ fn carried_across(parent: &HostHandle, sid: &str) -> Vec<RestoredAgent> {
             let asked = agent.asked();
             RestoredAgent {
                 sid: sid.to_string(),
-                snap: agent.snapshot(sid.to_string(), shell),
+                snap: agent
+                    .snapshot(sid.to_string(), shell)
+                    .expect("an agent this build knows"),
                 place: "in tab 1".to_string(),
                 cold: true,
                 asked,
@@ -1412,15 +1431,53 @@ fn a_landed_agent_no_read_reaches_that_crashes_is_relaunched() {
 /// read it again gave up at the crash (the agent no longer held its tab)
 /// with nothing holding the exit — no watch, no mark, no worker, no
 /// attempt: the crash was relaunched by nobody and said to nobody (the
-/// wait for the queue's second step runs out).
+/// first wait runs out: no attempt is left for [`landed_unread`] to find).
+///
+/// THE CRASH COMES AFTER THE LOOK THAT FOUND THE LANDING UNREAD, as stated:
+/// waited for on the attempt that look keeps ([`landed_unread`]). This test
+/// first waited for the step's count and a question to the tab
+/// ([`Hooks::still_wanted`]) — but the queue asks the tab BEFORE an untyped
+/// step too ([`restored_overtaken`]), and the step was counted as it began,
+/// so the wait could end while the step still ran. The queue's thread
+/// (utility QoS) preempted there, the crash was made before the landing:
+/// before the step's agent was, the world kept an agent alive and readable,
+/// read at once (no crash to step again); between the step and its look,
+/// that look found no agent in the tab — the residual
+/// [`restored_landing_ends`] states, left to the roster. Either way no second
+/// step: "not within 60 s: the restored landing's crash stepped again", in 3
+/// of about 13 full `aterm-gui --lib` runs (one process, every test), never
+/// alone. The step now lingers at a gate after its count, every run — the
+/// preemption made certain — and nothing is landed there yet (NEGATIVE
+/// CONTROL: the first cut's wait, in place of this one, failed here 7 of 7
+/// runs).
+///
+/// READ BEFORE IT CRASHED (2026-10-16): a look at the landing asks who holds
+/// the tab, then whether a read reaches that agent. This test made the
+/// crash and the readable world after it in one go, so a look that
+/// straddled them found the crashed agent holding the tab and readable. It
+/// read it (an agent read just before it crashed), the attempt was over
+/// and the exit was the watch's, handed by the host's next pass. That pass
+/// comes only after this test's last wait, so the wait for a second step
+/// ran out: 1 of 16 full `aterm-gui --lib` runs under load 35 to 67, with
+/// the queue empty and its tab asked only twice. The agent is made readable
+/// only once the queue has looked at the crash. NEGATIVE CONTROL, with the
+/// straddle forced at a gate in the snapshot read: the old order stepped
+/// once, and the watch's exit was relaunched once the host was back (no
+/// exit lost: [`a_restored_agent_that_crashes_before_a_pass_names_it_is_relaunched`]
+/// is that path); this order steps again.
 #[test]
 fn a_restored_landing_no_read_reaches_that_crashes_is_relaunched_again() {
     let steps = Arc::new(AtomicUsize::new(0));
     let n = Arc::clone(&steps);
+    // Each step, once counted, waits here while it is shut: the queue's
+    // thread preempted between the count and the agent it lands.
+    let landing = Arc::new(PauseGate::default());
+    let gate = Arc::clone(&landing);
     let p = panicking_host_hooked(None, move |a, h| {
         let a = Arc::clone(a);
         h.acts.relaunch_restored = Arc::new(move |sid, _, _| {
             n.fetch_add(1, Ordering::SeqCst);
+            gate.pass();
             a.adopted_in(sid, false);
             // The agent it landed holds its tab (the store names it so).
             *a.holds.lock().unwrap() = Some(true);
@@ -1430,16 +1487,29 @@ fn a_restored_landing_no_read_reaches_that_crashes_is_relaunched_again() {
     p.a.open.lock().unwrap().insert("s-r".to_string());
     p.panic_and_hold();
     p.a.unreadable.store(true, Ordering::SeqCst);
-    let asked = p.a.still_asked.lock().unwrap().len();
+    landing.shut();
     p.host.relaunch_restored(vec![restored("s-r", "in tab 2")]);
+    until("the step counted, its landing held", || landing.held());
+    // NEGATIVE CONTROL: the step is counted and nothing has landed yet, so
+    // a wait on the count alone would let the crash in before the landing.
+    assert_eq!(
+        (steps.load(Ordering::SeqCst), landed_unread(&p.host, "s-r")),
+        (1, false),
+        "(the steps counted, the landing looked at): the step still runs"
+    );
+    landing.open();
     until(
         "the step landed an agent no read reaches, looked at",
-        || steps.load(Ordering::SeqCst) == 1 && p.a.still_asked.lock().unwrap().len() > asked,
+        || steps.load(Ordering::SeqCst) == 1 && landed_unread(&p.host, "s-r"),
     );
-    // It crashes, unread, still before the host is back; the agent the next
-    // step lands can be read.
+    // It crashes, unread, still before the host is back. The agent the next
+    // step lands can be read, but only once the queue has looked at the
+    // crash (see READ BEFORE IT CRASHED above).
     *p.a.holds.lock().unwrap() = None;
     p.a.set(&[("s-a", Program::Claude)]);
+    until("the queue looked at the crash", || {
+        steps.load(Ordering::SeqCst) >= 2 || !landed_unread(&p.host, "s-r")
+    });
     p.a.unreadable.store(false, Ordering::SeqCst);
     until("the restored landing's crash stepped again", || {
         steps.load(Ordering::SeqCst) >= 2
@@ -1785,17 +1855,8 @@ fn the_landings_of_round_eighteen_conform_to_the_commit_owed_model() {
     host.resume_restored();
     host.relaunch_stranded(&|_| "in tab 1".to_string());
     fire(&mut state, &["Resume", "Rollback"]);
-    let landed_unread = |host: &HostHandle| {
-        host.shared
-            .restored
-            .lock()
-            .unwrap()
-            .attempts
-            .iter()
-            .any(|attempt| attempt.agent.sid == "s-a" && attempt.landed)
-    };
     until("the queue's step landed, unread, its attempt kept", || {
-        steps.load(Ordering::SeqCst) == 1 && landed_unread(&host)
+        steps.load(Ordering::SeqCst) == 1 && landed_unread(&host, "s-a")
     });
     fire(&mut state, &["QueueStepsUnread"]);
     assert_eq!(
@@ -1808,7 +1869,7 @@ fn the_landings_of_round_eighteen_conform_to_the_commit_owed_model() {
     *a.holds.lock().unwrap() = None;
     a.set(&[]);
     until("stepped again, landed unread again", || {
-        steps.load(Ordering::SeqCst) == 2 && landed_unread(&host)
+        steps.load(Ordering::SeqCst) == 2 && landed_unread(&host, "s-a")
     });
     fire(&mut state, &["Crash", "QueueStepsUnread"]);
     assert_eq!(

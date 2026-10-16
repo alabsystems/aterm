@@ -9,8 +9,8 @@
 
 use aterm_core::terminal::{ClockReading, Terminal};
 
-// The corpus records are generated and their layout is their content (xtask's
-// `FMT_SWEEP_EXCLUSIONS`). A trustfmt from Trust `77d28e49f5` on follows a
+// The corpus records are generated and their layout is their content
+// (`aterm_verify::fmt::EXCLUDED`). A trustfmt from Trust `77d28e49f5` on follows a
 // literal `include!` and formats the file it names; the skip keeps it out.
 #[rustfmt::skip]
 include!("support/replay_corpus_data.rs");
@@ -18,9 +18,13 @@ include!("support/replay_corpus_data.rs");
 const ROWS: u16 = 12;
 const COLS: u16 = 40;
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "test code: the one instant a test mints and feeds in"
+)]
 fn clock() -> ClockReading {
     ClockReading {
-        monotonic: std::time::Instant::now(), // CLOCK-EXEMPT: captured once, reused so deltas are zero
+        monotonic: std::time::Instant::now(), // captured once, reused so deltas are zero
         wall_ms: Some(0),
     }
 }

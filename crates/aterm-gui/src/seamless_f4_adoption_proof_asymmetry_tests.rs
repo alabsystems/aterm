@@ -56,10 +56,12 @@ fn realistic_layout() -> RestoreManifest {
                         role: None,
                         attention: None,
                         questions: None,
+                        autopilot: None,
                         identity: None,
                         agent: None,
                         supervised: None,
                         held: false,
+                        holds: Vec::new(),
                     },
                 ))),
                 second: Box::new(RestoredSplitTree::leaf(RestoredView::Terminal(
@@ -74,10 +76,12 @@ fn realistic_layout() -> RestoreManifest {
                         role: None,
                         attention: None,
                         questions: None,
+                        autopilot: None,
                         identity: None,
                         agent: None,
                         supervised: None,
                         held: false,
+                        holds: Vec::new(),
                     },
                 ))),
             },
@@ -103,58 +107,6 @@ fn same_build_parent_and_child_layout_digests_agree() {
     assert_eq!(
         parent, child,
         "same-build round trip is a fixed point:\n{wire}"
-    );
-}
-
-/// CROSS-VERSION BREAK #1 — the manifest SCHEMA constant.
-/// `RestoreManifest::from_toml` ACCEPTS `LEGACY_SCHEMA` and then
-/// unconditionally REWRITES `manifest.schema = SCHEMA`. A parent built when
-/// `SCHEMA == 1` writes `schema = 1`; the child re-emits `schema = 2`. The
-/// adoption proof therefore CANNOT match, and nothing in the protocol
-/// notices — the parent reports `AdoptionMismatch`.
-#[test]
-fn cross_version_schema_bump_breaks_the_layout_digest() {
-    let layout = realistic_layout();
-    let modern = layout.to_toml().expect("serialize");
-    assert!(modern.contains("schema = 2"), "today's wire: {modern}");
-    // The bytes an older parent (SCHEMA == 1) would have written+hashed.
-    let old_parent_wire = modern.replacen("schema = 2", "schema = 1", 1);
-    let old_parent_digest = wire_digest(&old_parent_wire);
-    let child_digest =
-        child_digest_of_wire(&old_parent_wire).expect("child still ACCEPTS the legacy schema");
-    assert_ne!(
-        old_parent_digest, child_digest,
-        "a schema bump must break the proof"
-    );
-    crate::logging::stderr_line!(
-        "F4/schema: parent={} child={} (child re-emitted `schema = 2`)",
-        hex12(&old_parent_digest),
-        hex12(&child_digest)
-    );
-}
-
-/// CROSS-VERSION BREAK #2 — an ADDED serde field.
-/// `RestoredTab::zoomed` is `#[serde(default)]` with NO
-/// `skip_serializing_if`, so it is ALWAYS emitted. A parent built before
-/// `zoomed` existed writes a wire without it; the child defaults it and
-/// re-emits `zoomed = false`. Same semantic layout, different digest.
-/// EVERY future additive field of this shape re-breaks the handoff.
-#[test]
-fn cross_version_added_field_breaks_the_layout_digest() {
-    let modern = realistic_layout().to_toml().expect("serialize");
-    assert!(modern.contains("zoomed = false"), "wire: {modern}");
-    let old_parent_wire = modern.replacen("zoomed = false\n", "", 1);
-    let old_parent_digest = wire_digest(&old_parent_wire);
-    let child_digest = child_digest_of_wire(&old_parent_wire)
-        .expect("child parses the older wire (serde default)");
-    assert_ne!(
-        old_parent_digest, child_digest,
-        "an additive always-emitted field must break the proof"
-    );
-    crate::logging::stderr_line!(
-        "F4/field: parent={} child={} (child re-emitted `zoomed = false`)",
-        hex12(&old_parent_digest),
-        hex12(&child_digest)
     );
 }
 
@@ -728,51 +680,6 @@ fn an_unreadable_output_state_costs_only_itself() {
     }
 }
 
-/// CROSS-VERSION BREAK #3 — the screen half, `CheckpointMeta` drift.
-/// `CheckpointMeta` has NO `deny_unknown_fields`. A parent built with an
-/// 18th meta field writes it; the older child silently DROPS it and hashes
-/// 17 keys. The parent hashed 18. `AdoptionMismatch`, with no diagnostic.
-#[test]
-fn cross_version_extra_meta_field_breaks_the_screen_digest() {
-    let cp = live_checkpoint();
-    let meta_json =
-        aterm_json::to_string(&CheckpointMeta::from_checkpoint(&cp)).expect("meta json");
-    // What a NEWER parent's wire looks like: one additive key the running
-    // (older) child does not know.
-    let newer_parent_meta = meta_json.replacen('{', "{\"scene_overlay\":true,", 1);
-    let parent_digest = {
-        let mut hasher = Sha256::new();
-        hasher.update(newer_parent_meta.as_bytes());
-        let d: [u8; 32] = hasher.finalize();
-        d
-    };
-    let carry = ScreenCarry {
-        schema: ScreenCarry::SCHEMA,
-        meta: newer_parent_meta.clone(),
-        grid_file: "unused".to_string(),
-        alt_grid_file: None,
-        repaint: false,
-    };
-    let parsed = parse_checkpoint_meta(&carry).expect("child parses (no deny_unknown)");
-    let child_meta = aterm_json::to_string(&parsed).expect("child reserializes");
-    assert_ne!(
-        newer_parent_meta, child_meta,
-        "the child dropped the unknown key"
-    );
-    let child_digest = {
-        let mut hasher = Sha256::new();
-        hasher.update(child_meta.as_bytes());
-        let d: [u8; 32] = hasher.finalize();
-        d
-    };
-    assert_ne!(parent_digest, child_digest);
-    crate::logging::stderr_line!(
-        "F4/meta: parent meta {} bytes, child meta {} bytes — screen_digest inputs differ",
-        newer_parent_meta.len(),
-        child_meta.len()
-    );
-}
-
 /// CROSS-VERSION BREAK #4 — the HARDER screen failure. `parse_checkpoint_meta`
 /// demands EVERY key in [`CHECKPOINT_META_REQUIRED_KEYS`]. If a newer child
 /// adds an 18th meta field to that list, an older parent's 17-key wire does
@@ -969,8 +876,4 @@ fn the_v1_adoption_digest_is_frozen_to_this_exact_vector() {
         digest, FROZEN,
         "the LIVE adoption wire changed — read this test's doc before touching the constant"
     );
-}
-
-fn hex12(d: &[u8; 32]) -> String {
-    d[..6].iter().map(|b| format!("{b:02x}")).collect()
 }

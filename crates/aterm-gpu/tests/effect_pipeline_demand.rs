@@ -23,7 +23,7 @@ fn glow_quad(cw: usize, ch: usize) -> GlowQuad {
         h: ch as u16,
         color: 0x0020_2020,
 
-        // ADDITIVE light (see `GlowQuad::alpha`).
+        // Additive light (see `GlowQuad::alpha`).
         alpha: 0,
         color2: 0x0020_2020,
         alpha2: 0,
@@ -36,15 +36,13 @@ fn glow_quad(cw: usize, ch: usize) -> GlowQuad {
 #[test]
 fn an_effect_free_frame_compiles_nothing_and_one_glow_quad_compiles_only_glow_add() {
     let theme = Theme::default();
-    let Some((cpu, mut gpu)) = backends(18.0, theme) else {
-        return;
-    };
+    let (cpu, mut gpu) = backends(18.0, theme);
     let mut win = aterm_gpu::WindowGpu::new();
     let (rows, cols) = (4usize, 16usize);
     let (cw, ch) = cpu.cell_size();
     let mut input = Terminal::new(rows as u16, cols as u16).cell_frame(rows, cols);
 
-    // FRAME 1 — the shipped default: a plain grid with an opaque cursor.
+    // Frame 1: the shipped default, a plain grid with an opaque cursor.
     let _ = gpu.render_input(&mut win, &input, None);
     let resident = gpu.effect_pipelines_resident();
     let (builds, build_ns) = gpu.effect_pipeline_build_cost();
@@ -64,7 +62,7 @@ fn an_effect_free_frame_compiles_nothing_and_one_glow_quad_compiles_only_glow_ad
         "an effect-free frame must spend no time in the pipeline builder"
     );
 
-    // FRAME 2 — one glow quad, exactly what a live cursor effect publishes.
+    // Frame 2: one glow quad, exactly what a live cursor effect publishes.
     input.cursor_glow_add.push(glow_quad(cw, ch));
     let _ = gpu.render_input(&mut win, &input, None);
     let resident = gpu.effect_pipelines_resident();
@@ -85,14 +83,13 @@ fn an_effect_free_frame_compiles_nothing_and_one_glow_quad_compiles_only_glow_ad
         builds, 1,
         "the demand pass must build each slot exactly once"
     );
-    // Report what the first glow-carrying frame pays; an effects-off config
-    // never pays it.
+    // What the first glow-carrying frame pays; an effects-off config never pays it.
     eprintln!(
         "MEASURED glow_add demand build = {:.2} ms",
         build_ns as f64 / 1.0e6
     );
 
-    // FRAME 3 — the same glow stream again: idempotent, no second compile.
+    // Frame 3, the same glow stream again: no second compile.
     let _ = gpu.render_input(&mut win, &input, None);
     assert_eq!(
         gpu.effect_pipeline_build_cost().0,
@@ -101,15 +98,12 @@ fn an_effect_free_frame_compiles_nothing_and_one_glow_quad_compiles_only_glow_ad
     );
 }
 
-/// Prints what the four expensive slots cost. `warm_effect_pipelines` builds
-/// every slot off the frame path; the assertion is that the whole set is
-/// resident afterwards (not on timing), which config-apply relies on.
+/// `warm_effect_pipelines` builds every slot off the frame path (config apply relies on it);
+/// the assertion is on residency, not timing, and the cost is printed.
 #[test]
 fn the_warm_up_seam_builds_every_slot_off_the_frame_path() {
     let theme = Theme::default();
-    let Some((_, mut gpu)) = backends(18.0, theme) else {
-        return;
-    };
+    let (_, mut gpu) = backends(18.0, theme);
     assert_eq!(
         gpu.effect_pipeline_build_cost().0,
         0,

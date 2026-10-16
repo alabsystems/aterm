@@ -1,17 +1,18 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `<prefix>/vendor/digests.toml`: the first AUTHENTICATED sha256 this machine saw for
-//! each `(program, version, triple)`. A later, different digest for the same key is
-//! refused — a vendor re-cutting a published version is a supply-chain signal, never an
-//! update. Only an [`AuthenticatedDigest`] enters the log: a digest recorded before its
-//! anchor vouched for it would let one bad response refuse the genuine one for good.
-//! Bounded to the newest [`KEEP_PER_PROGRAM`] versions per program. A log that exists
-//! but does not read is refused, never overwritten: its first sightings are the point.
+//! `<prefix>/vendor/digests.toml` (claude's and codex's) and `digests-<program>.toml` (each
+//! later program's): the first authenticated payload digest this machine saw for each
+//! `(program, version, triple)`, a `sha256` or (for a vendor that signs only that) a `sha512`,
+//! under its algorithm's key. A later, different digest for the same key is refused: a vendor
+//! re-cutting a published version is a supply-chain signal, never an update. Only a digest its
+//! anchor vouched for is recorded, or one bad response would refuse the genuine one for good.
+//! Bounded to the newest [`KEEP_PER_PROGRAM`] versions per program. A log that exists but does
+//! not read is refused, never overwritten: its first sightings are the point.
 
 use std::collections::BTreeMap;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -19,6 +20,7 @@ use super::durable;
 use super::stamp::vendor_dir;
 use super::table::is_vendor;
 use super::version::Version;
+use crate::manifest::{DigestAlg, one_digest};
 use crate::store::Layout;
 
 /// The log's schema.
@@ -30,38 +32,72 @@ pub(crate) const KEEP_PER_PROGRAM: usize = 64;
 /// Bound on a log read.
 const MAX_LOG_BYTES: usize = 128 * 1024;
 
-/// A payload sha256 the program's anchor has vouched for: claude's from the manifest
-/// whose signature verified, codex's once the release JSON and the release's `SHA256SUMS`
-/// agree. Construct one only at that point; [`record_or_conflict`] takes nothing else.
+/// A payload digest from documents the program's anchor checked: claude's from the manifest
+/// whose signature verified, codex's once the release JSON and `SHA256SUMS` agree, agy's once its
+/// two Google manifests agree, muse's only once the Developer ID team pin passed the bytes its
+/// release manifest names (the manifest alone vouches for nothing,
+/// [`super::table::Anchor::vouches_before_download`]). Construct one only at that point;
+/// [`record_or_conflict`] takes nothing else.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct AuthenticatedDigest(String);
+pub(crate) struct AuthenticatedDigest {
+    alg: DigestAlg,
+    hex: String,
+}
 
 impl AuthenticatedDigest {
-    /// `sha256` (64 hex digits, either case), which the anchor has just authenticated.
+    /// `hex` (one `alg` digest, either case), which the anchor has just authenticated.
     #[must_use]
-    pub(crate) fn authenticated(sha256: &str) -> Option<Self> {
-        let sha256 = sha256.to_ascii_lowercase();
-        super::is_hex64(&sha256).then_some(Self(sha256))
+    pub(crate) fn authenticated(alg: DigestAlg, hex: &str) -> Option<Self> {
+        let hex = hex.to_ascii_lowercase();
+        alg.is_lower_hex(&hex).then_some(Self { alg, hex })
+    }
+
+    /// One read back from a record an earlier pass wrote when its anchor vouched for it:
+    /// the `sha256`/`sha512` pair of keys naming exactly one digest, in the lowercase it
+    /// was written in.
+    #[must_use]
+    pub(crate) fn recorded(sha256: &str, sha512: &str) -> Option<Self> {
+        let (alg, hex) = one_digest(sha256, sha512)?;
+        alg.is_lower_hex(hex).then(|| Self {
+            alg,
+            hex: hex.to_string(),
+        })
+    }
+
+    /// The algorithm.
+    #[must_use]
+    pub(crate) const fn alg(&self) -> DigestAlg {
+        self.alg
     }
 
     /// The digest, lowercase hex.
     #[must_use]
     pub(crate) fn as_str(&self) -> &str {
-        &self.0
+        &self.hex
+    }
+
+    /// The `(sha256, sha512)` pair of keys a record writes it under: the digest under its
+    /// algorithm's key, the other empty.
+    #[must_use]
+    pub(crate) fn keyed(&self) -> (String, String) {
+        match self.alg {
+            DigestAlg::Sha256 => (self.hex.clone(), String::new()),
+            DigestAlg::Sha512 => (String::new(), self.hex.clone()),
+        }
     }
 }
 
 /// What [`record_or_conflict`] found.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum DigestSeen {
-    /// First sighting; recorded.
+    /// First sighting; recorded when asked to.
     New,
     /// The same digest was seen before.
     Same,
     /// A different digest was seen first for this key; the log keeps it.
     Conflict {
-        /// The first-seen sha256.
-        first: String,
+        /// The first-seen digest.
+        first: AuthenticatedDigest,
     },
 }
 
@@ -72,26 +108,41 @@ struct LogFile {
     seen: Vec<Entry>,
 }
 
+/// One sighting: exactly one of `sha256`/`sha512` is set.
 #[derive(Serialize, Deserialize)]
 struct Entry {
     program: String,
     version: String,
     triple: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     sha256: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    sha512: String,
 }
 
 /// `(program, version, triple)`.
 type Key = (String, Version, String);
 
-/// `<prefix>/vendor/digests.toml`.
+/// The programs `digests.toml` has carried since it began, each vouched for by a sha256.
+/// Every client rewrites that file from only the rows it reads, so a later program's rows
+/// there would be erased by the first older client to log a claude or codex release: each
+/// later program keeps a log of its own, which no older client opens.
+const SHARED_LOG: [&str; 2] = ["claude", "codex"];
+
+/// `program`'s log: `<prefix>/vendor/digests.toml` for a [`SHARED_LOG`] program, else
+/// `<prefix>/vendor/digests-<program>.toml`.
 #[must_use]
-pub(crate) fn digests_path(layout: &Layout) -> PathBuf {
-    vendor_dir(layout).join("digests.toml")
+pub(crate) fn digests_path(layout: &Layout, program: &str) -> PathBuf {
+    vendor_dir(layout).join(if SHARED_LOG.contains(&program) {
+        String::from("digests.toml")
+    } else {
+        format!("digests-{program}.toml")
+    })
 }
 
-/// Check `digest` against the first digest seen for `(program, version, triple)`, and
-/// record it if none was. Only [`DigestSeen::New`] writes; the read and the write hold the
-/// log's lock.
+/// Check `digest` against the first digest seen for `(program, version, triple)` and, when
+/// `record`, record it if none was. Only a recorded [`DigestSeen::New`] writes; the read
+/// and the write hold the log's lock.
 ///
 /// # Errors
 /// An argument is malformed (not a vendor program, or a triple that is not `[a-z0-9_.]`
@@ -103,8 +154,8 @@ pub(crate) fn record_or_conflict(
     version: Version,
     triple: &str,
     digest: &AuthenticatedDigest,
+    record: bool,
 ) -> io::Result<DigestSeen> {
-    let sha256 = digest.as_str();
     if !is_vendor(program) || !triple_ok(triple) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -112,30 +163,35 @@ pub(crate) fn record_or_conflict(
         ));
     }
     layout.ensure_dir(&vendor_dir(layout))?;
-    let path = digests_path(layout);
+    let path = digests_path(layout, program);
     let _lock = durable::lock_for_update(&path)?;
-    let mut log = read_log(layout)?;
+    let mut log = read_log(&path)?;
     let key: Key = (program.to_string(), version, triple.to_string());
     match log.get(&key) {
-        Some(first) if first == sha256 => return Ok(DigestSeen::Same),
+        Some(first) if first == digest => return Ok(DigestSeen::Same),
         Some(first) => {
             return Ok(DigestSeen::Conflict {
                 first: first.clone(),
             });
         }
+        None if !record => return Ok(DigestSeen::New),
         None => {}
     }
-    log.insert(key, sha256.to_string());
+    log.insert(key, digest.clone());
     bound(&mut log, program);
     let file = LogFile {
         schema: LOG_SCHEMA,
         seen: log
             .into_iter()
-            .map(|((program, version, triple), sha256)| Entry {
-                program,
-                version: version.to_string(),
-                triple,
-                sha256,
+            .map(|((program, version, triple), digest)| {
+                let (sha256, sha512) = digest.keyed();
+                Entry {
+                    program,
+                    version: version.to_string(),
+                    triple,
+                    sha256,
+                    sha512,
+                }
             })
             .collect(),
     };
@@ -143,14 +199,13 @@ pub(crate) fn record_or_conflict(
     Ok(DigestSeen::New)
 }
 
-/// The log as a map — empty when there is none yet; entries that do not re-validate are
-/// dropped alone.
+/// The log at `path` as a map, empty when there is none yet; entries that do not
+/// re-validate are dropped alone.
 ///
 /// # Errors
 /// A log that exists but does not read (malformed, oversized, not a regular file, another
-/// schema): treated as empty, its first sightings would be overwritten unseen.
-fn read_log(layout: &Layout) -> io::Result<BTreeMap<Key, String>> {
-    let path = digests_path(layout);
+/// schema): read as empty, its first sightings would be overwritten unseen.
+fn read_log(path: &Path) -> io::Result<BTreeMap<Key, AuthenticatedDigest>> {
     let unreadable = || {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -160,8 +215,8 @@ fn read_log(layout: &Layout) -> io::Result<BTreeMap<Key, String>> {
             ),
         )
     };
-    let Some(file) = durable::read_toml::<LogFile>(&path, MAX_LOG_BYTES) else {
-        return match std::fs::symlink_metadata(&path) {
+    let Some(file) = durable::read_toml::<LogFile>(path, MAX_LOG_BYTES) else {
+        return match std::fs::symlink_metadata(path) {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(BTreeMap::new()),
             _ => Err(unreadable()),
         };
@@ -174,9 +229,11 @@ fn read_log(layout: &Layout) -> io::Result<BTreeMap<Key, String>> {
         let Some(version) = Version::parse(&e.version) else {
             continue;
         };
-        if is_vendor(&e.program) && triple_ok(&e.triple) && super::is_hex64(&e.sha256) {
-            log.entry((e.program, version, e.triple))
-                .or_insert(e.sha256);
+        let Some(digest) = AuthenticatedDigest::recorded(&e.sha256, &e.sha512) else {
+            continue;
+        };
+        if is_vendor(&e.program) && triple_ok(&e.triple) {
+            log.entry((e.program, version, e.triple)).or_insert(digest);
         }
     }
     for program in super::table::VENDORS.iter().map(|s| s.program) {
@@ -186,7 +243,7 @@ fn read_log(layout: &Layout) -> io::Result<BTreeMap<Key, String>> {
 }
 
 /// Drop `program`'s lowest versions until [`KEEP_PER_PROGRAM`] remain.
-fn bound(log: &mut BTreeMap<Key, String>, program: &str) {
+fn bound(log: &mut BTreeMap<Key, AuthenticatedDigest>, program: &str) {
     let mine: Vec<Key> = log.keys().filter(|k| k.0 == program).cloned().collect();
     let excess = mine.len().saturating_sub(KEEP_PER_PROGRAM);
     // Keys sort by (program, version, triple), so the first are the lowest versions.
@@ -225,7 +282,17 @@ mod tests {
         c.to_string().repeat(64)
     }
 
-    /// [`record_or_conflict`] of a digest the test vouches for.
+    /// A sha256 the test vouches for.
+    fn d256(hex: &str) -> AuthenticatedDigest {
+        AuthenticatedDigest::authenticated(DigestAlg::Sha256, hex).unwrap()
+    }
+
+    /// A sha512 of `c`s the test vouches for.
+    fn d512(c: char) -> AuthenticatedDigest {
+        AuthenticatedDigest::authenticated(DigestAlg::Sha512, &c.to_string().repeat(128)).unwrap()
+    }
+
+    /// [`record_or_conflict`] of a sha256 the test vouches for.
     fn rec(
         l: &Layout,
         program: &str,
@@ -233,8 +300,12 @@ mod tests {
         triple: &str,
         sha256: &str,
     ) -> io::Result<DigestSeen> {
-        let digest = AuthenticatedDigest::authenticated(sha256).unwrap();
-        record_or_conflict(l, program, version, triple, &digest)
+        record_or_conflict(l, program, version, triple, &d256(sha256), true)
+    }
+
+    /// [`record_or_conflict`] of a sha512 of `c`s the test vouches for.
+    fn rec512(l: &Layout, program: &str, version: &str, c: char) -> DigestSeen {
+        record_or_conflict(l, program, v(version), T, &d512(c), true).unwrap()
     }
 
     #[test]
@@ -250,12 +321,16 @@ mod tests {
         );
         assert_eq!(
             seen("claude", "2.1.280", T, &sha('b')),
-            DigestSeen::Conflict { first: sha('a') }
+            DigestSeen::Conflict {
+                first: d256(&sha('a'))
+            }
         );
         // The conflict did not replace the first sighting.
         assert_eq!(
             seen("claude", "2.1.280", T, &sha('b')),
-            DigestSeen::Conflict { first: sha('a') }
+            DigestSeen::Conflict {
+                first: d256(&sha('a'))
+            }
         );
         // Other triples, versions and programs are other keys.
         assert_eq!(
@@ -264,6 +339,17 @@ mod tests {
         );
         assert_eq!(seen("claude", "2.1.281", T, &sha('b')), DigestSeen::New);
         assert_eq!(seen("codex", "2.1.280", T, &sha('b')), DigestSeen::New);
+        // Checked without recording: a first sighting stays unrecorded, a conflict is one.
+        let check =
+            |ver, s: &str| record_or_conflict(&l, "claude", v(ver), T, &d256(s), false).unwrap();
+        assert_eq!(check("2.1.290", &sha('a')), DigestSeen::New);
+        assert_eq!(seen("claude", "2.1.290", T, &sha('b')), DigestSeen::New);
+        assert_eq!(
+            check("2.1.280", &sha('b')),
+            DigestSeen::Conflict {
+                first: d256(&sha('a'))
+            }
+        );
     }
 
     #[test]
@@ -277,21 +363,190 @@ mod tests {
         ] {
             assert!(rec(&l, p, v("1.0.0"), t, &sha('a')).is_err(), "{p} {t}");
         }
-        assert!(!digests_path(&l).exists());
+        assert!(!vendor_dir(&l).exists());
     }
 
+    /// Each program's log is a file no program's stamp is.
     #[test]
-    fn only_a_sha256_is_an_authenticated_digest() {
-        for bad in [
-            String::from("abc"),
-            sha('g'),
-            String::new(),
-            format!("{}0", sha('a')),
-        ] {
-            assert_eq!(AuthenticatedDigest::authenticated(&bad), None, "{bad}");
+    fn no_log_is_a_stamp() {
+        let l = layout("names");
+        let programs = || super::super::table::VENDORS.iter().map(|s| s.program);
+        for program in programs() {
+            let stamp = super::super::stamp::stamp_path(&l, program).unwrap();
+            assert!(
+                programs().all(|p| digests_path(&l, p) != stamp),
+                "{program}"
+            );
         }
-        let d = AuthenticatedDigest::authenticated(&sha('A')).unwrap();
-        assert_eq!(d.as_str(), sha('a'), "held lowercase");
+    }
+
+    /// Only a digest of the named algorithm authenticates (sample: agy 1.3.6's darwin_arm64
+    /// sha512 from Google's manifest), held lowercase.
+    #[test]
+    fn only_a_digest_of_its_algorithm_is_an_authenticated_digest() {
+        const AGY_SHA512: &str = "473a34b685d0a09d48790e8b86bc3e545dfab889fe0d8fc81cb7e1fdfc336fe7\
+                                  8ce57022e3b438c754c93c9cffeb13fdbd177e50fdedc087d52732fa5475183f";
+        for (alg, bad) in [
+            (DigestAlg::Sha256, String::from("abc")),
+            (DigestAlg::Sha256, sha('g')),
+            (DigestAlg::Sha256, String::new()),
+            (DigestAlg::Sha256, format!("{}0", sha('a'))),
+            (DigestAlg::Sha256, AGY_SHA512.to_string()),
+            (DigestAlg::Sha512, sha('a')),
+            (DigestAlg::Sha512, format!("{AGY_SHA512}0")),
+        ] {
+            assert_eq!(
+                AuthenticatedDigest::authenticated(alg, &bad),
+                None,
+                "{alg} {bad}"
+            );
+        }
+        let d = d256(&sha('A'));
+        assert_eq!(
+            (d.alg(), d.as_str()),
+            (DigestAlg::Sha256, sha('a').as_str()),
+            "held lowercase"
+        );
+        let d = AuthenticatedDigest::authenticated(DigestAlg::Sha512, &AGY_SHA512.to_uppercase())
+            .unwrap();
+        assert_eq!((d.alg(), d.as_str()), (DigestAlg::Sha512, AGY_SHA512));
+        assert_eq!(d.keyed(), (String::new(), AGY_SHA512.to_string()));
+        // Read back from a record: exactly one key, as written.
+        assert_eq!(AuthenticatedDigest::recorded("", AGY_SHA512), Some(d));
+        for (sha256, sha512) in [
+            (sha('a'), AGY_SHA512.to_string()),
+            (String::new(), String::new()),
+            (sha('A'), String::new()),
+            (String::new(), AGY_SHA512.to_uppercase()),
+            (AGY_SHA512.to_string(), String::new()),
+        ] {
+            assert_eq!(
+                AuthenticatedDigest::recorded(&sha256, &sha512),
+                None,
+                "{sha256} {sha512}"
+            );
+        }
+    }
+
+    /// A digest is logged under its algorithm's key, and a later program's in a log of its own,
+    /// so the shared log keeps only rows a pre-sha512 client reads and rewrites. Another
+    /// algorithm for a key is a conflict; an entry naming both digests or neither drops alone.
+    #[test]
+    fn each_digest_is_logged_under_its_algorithm() {
+        let l = layout("alg");
+        let shared = digests_path(&l, "claude");
+        std::fs::create_dir_all(shared.parent().unwrap()).unwrap();
+        let earlier = format!(
+            "[[seen]]\nprogram = \"claude\"\nversion = \"2.1.280\"\ntriple = \"{T}\"\nsha256 = \"{a}\"\n",
+            a = sha('a')
+        );
+        std::fs::write(&shared, format!("schema = 1\n\n{earlier}")).unwrap();
+        assert_eq!(rec512(&l, "agy", "1.3.6", '5'), DigestSeen::New);
+        assert_eq!(
+            rec(&l, "codex", v("0.157.0"), T, &sha('b')).unwrap(),
+            DigestSeen::New
+        );
+        let text = std::fs::read_to_string(&shared).unwrap();
+        assert!(
+            text.contains(&earlier),
+            "the earlier entry is rewritten as it was: {text}"
+        );
+        // A client from before sha512 requires every key of a row, `sha256` among them.
+        #[derive(Deserialize)]
+        struct EarlierEntry {
+            program: String,
+            version: String,
+            triple: String,
+            sha256: String,
+        }
+        #[derive(Deserialize)]
+        struct EarlierLog {
+            seen: Vec<EarlierEntry>,
+        }
+        let earlier_reads: EarlierLog = aterm_toml::from_str(&text).unwrap();
+        let rows: Vec<[String; 4]> = earlier_reads
+            .seen
+            .into_iter()
+            .map(|e| [e.program, e.version, e.triple, e.sha256])
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ["claude", "2.1.280", T, &sha('a')].map(String::from),
+                ["codex", "0.157.0", T, &sha('b')].map(String::from),
+            ],
+            "{text}"
+        );
+        let agy = digests_path(&l, "agy");
+        let text = std::fs::read_to_string(&agy).unwrap();
+        assert!(
+            text.contains(&format!("sha512 = \"{}\"\n", "5".repeat(128)))
+                && !text.contains("sha256"),
+            "{text}"
+        );
+        assert_eq!(rec512(&l, "agy", "1.3.6", '5'), DigestSeen::Same);
+        assert_eq!(
+            rec512(&l, "agy", "1.3.6", '6'),
+            DigestSeen::Conflict { first: d512('5') }
+        );
+        assert_eq!(
+            rec(&l, "agy", v("1.3.6"), T, &sha('5')).unwrap(),
+            DigestSeen::Conflict { first: d512('5') },
+            "a sha256 for a key first seen with a sha512 is not the same digest"
+        );
+        let both = format!(
+            "[[seen]]\nprogram = \"agy\"\nversion = \"1.3.7\"\ntriple = \"{T}\"\n\
+             sha256 = \"{a}\"\nsha512 = \"{b}\"\n\
+             [[seen]]\nprogram = \"agy\"\nversion = \"1.3.8\"\ntriple = \"{T}\"\n",
+            a = sha('a'),
+            b = "b".repeat(128)
+        );
+        std::fs::write(&agy, format!("{text}{both}")).unwrap();
+        assert_eq!(
+            read_log(&agy).unwrap().len(),
+            1,
+            "the two-digest and no-digest entries dropped alone"
+        );
+        assert_eq!(
+            rec(&l, "agy", v("1.3.7"), T, &sha('c')).unwrap(),
+            DigestSeen::New
+        );
+    }
+
+    /// An older client rewrites the shared log from only the rows it reads — claude's and
+    /// codex's — so a later program's first sightings, in logs of their own, outlive it.
+    #[test]
+    fn a_later_programs_sightings_outlive_an_older_clients_rewrite() {
+        let l = layout("older");
+        assert_eq!(rec512(&l, "agy", "1.3.6", '5'), DigestSeen::New);
+        let muse = || v("1.4.9-R6297.1");
+        assert_eq!(
+            rec(&l, "muse", muse(), T, &sha('a')).unwrap(),
+            DigestSeen::New
+        );
+        assert_eq!(
+            rec(&l, "codex", v("0.157.0"), T, &sha('a')).unwrap(),
+            DigestSeen::New
+        );
+        std::fs::write(
+            digests_path(&l, "codex"),
+            format!(
+                "schema = 1\n[[seen]]\nprogram = \"codex\"\nversion = \"0.163.0\"\n\
+                 triple = \"{T}\"\nsha256 = \"{b}\"\n",
+                b = sha('b')
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            rec512(&l, "agy", "1.3.6", '6'),
+            DigestSeen::Conflict { first: d512('5') }
+        );
+        assert_eq!(
+            rec(&l, "muse", muse(), T, &sha('b')).unwrap(),
+            DigestSeen::Conflict {
+                first: d256(&sha('a'))
+            }
+        );
     }
 
     #[test]
@@ -303,7 +558,7 @@ mod tests {
             rec(&l, "codex", ver, T, &sha('a')).unwrap();
         }
         rec(&l, "claude", v("1.0.0"), T, &sha('c')).unwrap();
-        let log = read_log(&l).unwrap();
+        let log = read_log(&digests_path(&l, "codex")).unwrap();
         let codex: Vec<Version> = log.keys().filter(|k| k.0 == "codex").map(|k| k.1).collect();
         assert_eq!(codex.len(), KEEP_PER_PROGRAM);
         assert_eq!(codex[0], v("1.0.6"), "the six lowest were dropped");
@@ -324,9 +579,9 @@ mod tests {
     fn an_unreadable_log_is_refused_and_a_bad_entry_drops_alone() {
         let l = layout("malformed");
         rec(&l, "claude", v("2.1.280"), T, &sha('a')).unwrap();
-        let path = digests_path(&l);
+        let path = digests_path(&l, "claude");
         std::fs::write(&path, "not toml {{{").unwrap();
-        assert!(read_log(&l).is_err());
+        assert!(read_log(&path).is_err());
         let err = rec(&l, "claude", v("2.1.280"), T, &sha('b')).unwrap_err();
         assert!(err.to_string().contains("does not read"), "{err}");
         assert_eq!(
@@ -350,14 +605,16 @@ mod tests {
             ),
         )
         .unwrap();
-        let log = read_log(&l).unwrap();
+        let log = read_log(&path).unwrap();
         assert_eq!(log.len(), 1);
         assert_eq!(
             rec(&l, "claude", v("2.1.281"), T, &sha('b')).unwrap(),
-            DigestSeen::Conflict { first: sha('a') }
+            DigestSeen::Conflict {
+                first: d256(&sha('a'))
+            }
         );
         std::fs::write(&path, "schema = 9\n").unwrap();
-        assert!(read_log(&l).is_err(), "an unknown schema is not read");
+        assert!(read_log(&path).is_err(), "an unknown schema is not read");
         assert!(
             rec(&l, "claude", v("2.1.282"), T, &sha('a')).is_err(),
             "…nor overwritten"

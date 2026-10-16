@@ -355,14 +355,12 @@ fn the_raw_plus_zero_load_answers_inside_the_pool_that_is_open() {
     unsafe { slot.destroy() };
 }
 
-/// A signature taking an `AutoreleasePool` must return something with no
-/// lifetime in it, checked against the source of this crate, `aterm-gui` and
-/// the winit fork.
+/// A signature taking an `AutoreleasePool` returns nothing with a lifetime in it, checked across
+/// this crate, `aterm-gui` and the winit fork.
 ///
-/// A pool reference proves that some pool is open, not that it is the one the
-/// runtime autoreleases into (the innermost on the thread), so it may gate an
-/// operation but never mint a lifetime. Rejected spellings: a reference (`&`),
-/// any lifetime token (`'`), and `impl`/`dyn` returns that can capture one. A
+/// A pool reference proves that some pool is open, not that it is the innermost one the runtime
+/// autoreleases into, so it may gate an operation but never mint a lifetime. Rejected: a reference
+/// (`&`), any lifetime token (`'`), and `impl`/`dyn` returns that can capture one. A
 /// lifetime-carrying wrapper has no `&` in its return type:
 ///
 /// ```text
@@ -371,16 +369,16 @@ fn the_raw_plus_zero_load_answers_inside_the_pool_that_is_open() {
 ///     -> Option<Borrowed<'p>>
 /// ```
 ///
-/// Aliasing the pool type (`type Pool = AutoreleasePool;`) is rejected too,
-/// since the check matches the type name. The non-empty assertion is a canary
-/// that the parser still finds signatures (today only `autoreleasepool`).
+/// Aliasing the pool type (`type Pool = AutoreleasePool;`) is rejected too, since the check
+/// matches the type name. The non-empty assertion shows the parser still finds signatures
+/// (currently only `autoreleasepool`).
 #[test]
 fn a_pool_parameter_never_mints_a_lifetime() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let trees = [
         "crates/aterm-objc/src",
         "crates/aterm-gui/src",
-        "vendor/winit/src/platform_impl/macos",
+        "crates/aterm-window/src/platform_impl/macos",
     ];
 
     let mut scanned = 0usize;
@@ -800,8 +798,7 @@ fn dropping_the_handle_unregisters_before_the_box_is_freed() {
     // allocated, pointer-aligned, and reachable through no other pointer.
     unsafe { *slot = target };
 
-    // The moment of truth: if the registration outlived `Drop`, the runtime
-    // writes nil through this address, which the program has moved on from.
+    // If the registration outlived `Drop`, the runtime writes nil through this address now.
     drop(obj);
 
     // SAFETY: as above — the block is leaked and therefore still live.
@@ -825,8 +822,7 @@ fn dropping_the_handle_unregisters_before_the_box_is_freed() {
 /// which has armed [`quarantine`] leaks its deallocations, so a test can read
 /// the bytes a `Box` released while they are still allocated.
 ///
-/// The flag is thread-local (other tests are unaffected) and `const`-initialised
-/// (reading it inside `dealloc` cannot allocate).
+/// The flag is thread-local, so other tests are unaffected.
 struct Quarantining;
 
 thread_local! {
@@ -835,7 +831,7 @@ thread_local! {
     static QUARANTINE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Arm or disarm the quarantine for THIS thread.
+/// Arm or disarm the quarantine for this thread.
 fn quarantine(on: bool) {
     QUARANTINE.with(|q| q.set(on));
 }

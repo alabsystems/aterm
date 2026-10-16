@@ -334,22 +334,6 @@ impl Class {
             Class::ClaudeStaleVersions | Class::CargoTargets => None,
         }
     }
-
-    /// One line of `--help`-shaped prose.
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) fn describe(self) -> &'static str {
-        match self {
-            Class::AtpkgGc => "package builds superseded by the live build",
-            Class::ClaudeStaleVersions => {
-                "vendor version dirs that are not the live symlink target"
-            }
-            Class::CargoTargets => {
-                "cargo profiles' incremental caches (idle ones; below the floor, least recently used first), under cargo's locks"
-            }
-            Class::ClaudePurge => "the vendor's own project purge (surfaced, never run here)",
-        }
-    }
 }
 
 /// A command that owns a class's removal. Every variant is a tool with its
@@ -1447,9 +1431,8 @@ fn hogs(
 /// a hog again, a gone owner's saying why it stayed. A row the pass did not
 /// reach (it stopped once free space was back) stays counted: the next pass
 /// may take it. A build directory no longer `there` — something else removed
-/// it during the pass (`xtask gate cells` sweeps a removed checkout's cells
-/// by the same rule; a person) — is no hog, whatever this pass's own removal
-/// of it said, and the next one moves up in its place.
+/// it during the pass (another sweep, a person) — is no hog, whatever this
+/// pass's own removal of it said, and the next one moves up in its place.
 #[must_use]
 pub fn hogs_left(
     survey: &Survey,
@@ -1570,10 +1553,10 @@ fn hog_of(t: &TargetDir, config: Config, survey: &Survey, notes: &[String]) -> (
             t.path.clone(),
             match checkout {
                 Some(c) => format!(
-                    "the cells cache of {}; `gate cells` reuses it",
+                    "the retired cells cache of {}: nothing writes it now, remove it",
                     display_home(c, survey.home.as_deref())
                 ),
-                None => "a cells cache; `gate cells` reuses it".to_owned(),
+                None => "a retired cells cache: nothing writes it now, remove it".to_owned(),
             },
         ),
         (Origin::Linked { from }, _) => (
@@ -2948,7 +2931,7 @@ fn walk_bytes(
 pub fn free_bytes(path: &Path) -> Option<u64> {
     let mut cmd = aterm_uds::spawnfd::command("df");
     cmd.arg("-Pk").arg(path);
-    let got = super::align::capture_bounded(cmd, DF_BUDGET, None, MAX_DF_STDOUT).ok()?;
+    let got = super::align::capture_bounded(cmd, DF_BUDGET, MAX_DF_STDOUT).ok()?;
     if !got.success() {
         return None;
     }

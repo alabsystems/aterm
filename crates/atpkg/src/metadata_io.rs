@@ -3,12 +3,10 @@
 
 //! Bounded, same-handle reads for atpkg's private metadata files.
 //!
-//! A pathname under the private package prefix is not itself proof of a finite
-//! regular file. A planted FIFO can park an ordinary `File::open`, a device can
-//! stream forever, and a link can retarget a metadata read outside the prefix.
-//! This seam opens once, non-blocking/no-follow where the OS exposes those
-//! flags, proves the opened handle is regular, and consumes at most the caller's
-//! byte limit plus one sentinel byte.
+//! A path under the package prefix may be a planted FIFO (parks an ordinary open), a device
+//! (streams forever) or a link (retargets outside the prefix). This seam opens once,
+//! non-blocking and no-follow where the OS allows, proves the handle regular, and reads at most
+//! the caller's limit plus one sentinel byte.
 
 use std::io::{self, Read as _};
 use std::path::Path;
@@ -147,14 +145,11 @@ pub(crate) fn read_bounded_regular_utf8(path: &Path, limit: usize) -> io::Result
     })
 }
 
-/// Resolve a bounded chain of final-component symlinks, then use the ordinary
-/// no-follow same-handle reader on the resolved spelling.
+/// Resolve a bounded chain of final-component symlinks, then read the resolved spelling with
+/// the no-follow same-handle reader.
 ///
-/// aterm intentionally supports a symlinked `aterm.toml` (dotfile managers use
-/// this routinely). Resolving the link target to its own path before opening
-/// preserves that contract without allowing a retarget between a path metadata
-/// check and the handle read: once selected, the target spelling is opened
-/// directly and the logical link is no longer consulted.
+/// A symlinked `aterm.toml` is supported (dotfile managers use one); opening the resolved
+/// target directly leaves no window for a retarget between the check and the read.
 pub(crate) fn read_bounded_regular_utf8_follow_final_links(
     path: &Path,
     limit: usize,

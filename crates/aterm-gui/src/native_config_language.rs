@@ -8,7 +8,7 @@
 //! here after a document revision changes. Paint consumes only the bounded spans
 //! projected onto visible editor rows and never parses or touches the filesystem.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 use std::path::Path;
 use std::sync::OnceLock;
@@ -157,6 +157,84 @@ const RETIRED_CONFIG_KEYS: &[RetiredConfigKeyMetadata] = &[
         feature: "Package include filter",
         effect_label: "No effect",
     },
+    // SMART TITLES WAS RETIRED (2026-10-15): the generated "activity" half of the
+    // tab and window label, its built-in summarizer, the optional Ollama /
+    // OpenAI-compatible worker, and the label formats that joined the two halves.
+    // Every chrome surface now shows the identity title alone. Real files carry
+    // these keys (the starter config taught them), and two of them held closed
+    // enums whose values the Config no longer knows — so they are named here:
+    // an `aterm.toml` that still sets `title_summary_provider = "ollama"` loads
+    // with every other setting intact and is told each key does nothing.
+    RetiredConfigKeyMetadata {
+        key: "descriptive_titles",
+        feature: "Smart Titles",
+        effect_label: "No effect",
+    },
+    RetiredConfigKeyMetadata {
+        key: "title_summary_provider",
+        feature: "Smart Titles",
+        effect_label: "No effect",
+    },
+    RetiredConfigKeyMetadata {
+        key: "title_summary_model",
+        feature: "Smart Titles",
+        effect_label: "No effect",
+    },
+    RetiredConfigKeyMetadata {
+        key: "title_summary_endpoint",
+        feature: "Smart Titles",
+        effect_label: "No effect",
+    },
+    RetiredConfigKeyMetadata {
+        key: "title_summary_token_file",
+        feature: "Smart Titles",
+        effect_label: "No effect",
+    },
+    RetiredConfigKeyMetadata {
+        key: "title_summary_timeout_seconds",
+        feature: "Smart Titles",
+        effect_label: "No effect",
+    },
+    RetiredConfigKeyMetadata {
+        key: "title_summary_proxy_mode",
+        feature: "Smart Titles",
+        effect_label: "No effect",
+    },
+    RetiredConfigKeyMetadata {
+        key: "title_summary_ca_file",
+        feature: "Smart Titles",
+        effect_label: "No effect",
+    },
+    RetiredConfigKeyMetadata {
+        key: "title_summary_interval_seconds",
+        feature: "Smart Titles",
+        effect_label: "No effect",
+    },
+    RetiredConfigKeyMetadata {
+        key: "title_summary_context_lines",
+        feature: "Smart Titles",
+        effect_label: "No effect",
+    },
+    RetiredConfigKeyMetadata {
+        key: "title_summary_include_output",
+        feature: "Smart Titles",
+        effect_label: "No effect",
+    },
+    RetiredConfigKeyMetadata {
+        key: "title_summary_allow_remote",
+        feature: "Smart Titles",
+        effect_label: "No effect",
+    },
+    RetiredConfigKeyMetadata {
+        key: "tab_title_format",
+        feature: "Smart Titles",
+        effect_label: "No effect",
+    },
+    RetiredConfigKeyMetadata {
+        key: "window_title_format",
+        feature: "Smart Titles",
+        effect_label: "No effect",
+    },
 ];
 
 pub(crate) fn retired_config_key(key: &str) -> Option<&'static RetiredConfigKeyMetadata> {
@@ -191,19 +269,28 @@ const CUSTOM_GRAPHIC_COLLECTIONS: &[&str] = &["cats"];
 /// `useNew`/`useExisting` also parse (`aterm_cli::WindowingBehavior::parse`) and
 /// are offered as aliases so a ported `settings.json` habit validates.
 const WINDOWING_BEHAVIORS: &[&str] = &["new_window", "attach"];
-/// The five DEFERRED_CONFIG_KEYS scalars an operator writes by hand (two are
+/// The five Manual-only scalars an operator writes by hand (two are
 /// taught by `--help` and the `--write-config` starter). They follow the
 /// `windowing_behavior` precedent: off `prefs::editable_fields`, but Manual
 /// must complete them, hover them, and flag a misspelled VALUE — calling a
 /// live key "unknown to this aterm build" was a false diagnostic (audit-2
 /// item 9). Canonical spellings here; parser aliases below, accepted but
 /// never offered.
-const FONT_HINTINGS: &[&str] = &["full", "light", "native", "off"];
+/// `font_hinting`'s retired `native` is no alias: it renders as `light` and is
+/// told so ([`retired_but_resolving`]).
+const FONT_HINTINGS: &[&str] = &["full", "light", "off"];
 const FONT_SUBPIXELS: &[&str] = &["off", "rgb", "bgr"];
 const RIGHT_CLICK_GESTURES: &[&str] = &["copy_paste", "off"];
 const RIGHT_CLICK_ALIASES: &[&str] = &["copy-paste"];
 const TAB_MENU_CHORDS: &[&str] = &["on", "menu_key", "off"];
 const TAB_MENU_CHORD_ALIASES: &[&str] = &["both", "menu-key", "menu"];
+/// `[harness] autopilot`'s parser aliases (`aterm_agent::supervise::Autopilot::
+/// parse`): the owner's own words for `cruise` and `land`, which the reader
+/// takes without a note. Accepted, never offered — completion suggests
+/// `prefs::HARNESS_AUTOPILOT_WORDS`. The off spellings (`"no"`, `"none"`, …)
+/// are not here: the reader takes them as `off` and SAYS so (its limit), and
+/// Manual says so too.
+const HARNESS_AUTOPILOT_ALIASES: &[&str] = &["forever", "infinity", "wrap-up", "wrapup", "wrap"];
 /// `[privacy] warmup` — `app_config::PrivacyWarmup::ALL`'s spellings (pinned
 /// equal by `every_key_the_config_reader_accepts_is_known_to_manual`).
 const PRIVACY_WARMUPS: &[&str] = &["never", "on-request"];
@@ -286,6 +373,10 @@ struct ConfigAssistIndex {
     /// The values the harness's disk reader names, each path without its
     /// array indices ([`unindexed_disk_faults`]): the caret's path has none.
     disk: Vec<aterm_agent::harness::cli::DiskFault>,
+    /// The theme files that loaded in the catalog this analysis was checked
+    /// against ([`ConfigAnalysis::adopt_theme_names`]); completion offers them
+    /// after the built-ins. Empty until the host lane supplies the catalog.
+    theme_names: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -309,6 +400,18 @@ struct AuthoredOccurrences {
 }
 
 impl ConfigAnalysis {
+    /// Take the names of the theme files that loaded in `themes` (the catalog
+    /// the host lane checks this revision against), so completion offers the
+    /// themes Settings offers. The host lane calls this for every revision,
+    /// valid or not: completion is most useful mid-edit.
+    pub(crate) fn adopt_theme_names(&mut self, themes: &crate::app_config::ThemeCatalog) {
+        self.assist_index.theme_names = themes
+            .ready_names()
+            .filter(|name| aterm_types::scheme::builtin_theme(name).is_none())
+            .map(str::to_string)
+            .collect();
+    }
+
     pub(crate) fn pending_failure(message: impl Into<String>) -> Self {
         Self {
             syntax: Vec::new(),
@@ -608,6 +711,14 @@ fn completion_identity(
 pub(crate) struct ConfigAssist {
     pub(crate) help: Option<String>,
     pub(crate) completions: Vec<ConfigCompletionEdit>,
+    /// The caret ends a partly typed key, table or value, one that is not
+    /// yet a whole name: the moment completion is worth showing unasked.
+    /// Elsewhere (a caret at the start of a line, on a finished key) the
+    /// list waits for Ctrl-Space or Tab.
+    pub(crate) typed: bool,
+    /// The help a caret resting here shows while the list waits: the key or
+    /// table under it, never whichever suggestion sorts first.
+    pub(crate) resting_help: Option<String>,
 }
 
 /// One value shape in the canonical Settings/Manual language registry.
@@ -708,10 +819,10 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
     ),
     // A FRONT-DOOR key: read by `crates/aterm/src/main.rs` before a window
     // exists (and by the Windows jump list), never by a running window. It is
-    // deliberately off `prefs::editable_fields` — see its `DEFERRED_CONFIG_KEYS`
-    // rationale — but it is a first-class scalar an operator writes by hand, so
-    // Manual must complete it, hover it, and flag a misspelled VALUE instead of
-    // shrugging at an unknown key.
+    // deliberately off `prefs::editable_fields` — a launch-routing choice has
+    // no effect on the window it is changed in — but it is a first-class scalar
+    // an operator writes by hand, so Manual must complete it, hover it, and flag
+    // a misspelled VALUE instead of shrugging at an unknown key.
     // A LIVE KEY Manual used to call "unknown to this aterm build" — the exact
     // false diagnostic audit-2 item 9 named, which `[fabric]` missed by landing
     // after that fix; this row (and the table header below) closes it for the
@@ -725,7 +836,7 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
     // lost bridge used to make, now opt-in (`fabric::bridge_lost`).
     manual(
         "fabric.hold_on_bridge_lost",
-        "Halt the sessions a lost fabric bridge governed (else: an advisory, nothing halted)",
+        "Halt sessions when the fabric bridge is lost",
         ConfigSchemaKind::Scalar(EditKind::Bool),
         &["fabric", "bridge", "hold", "halt", "strict"],
         true,
@@ -754,8 +865,8 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         false,
     ),
     // The EXPERIMENTAL embedded operator's launch switch (`[operator] enabled`,
-    // `operator_host::enabled`): deliberately off the Settings pages (see its
-    // `DEFERRED_CONFIG_KEYS` rationale), and the one spelling since its
+    // `operator_host::enabled`): deliberately off the Settings pages (see the
+    // `Config::operator` field's doc), and the one spelling since its
     // environment variables went (2026-09-24), so Manual completes and hovers it.
     manual(
         "operator",
@@ -773,7 +884,7 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
     ),
     // The coding-agent primer's opt-out (`agents_auto_prime`, default on): a live
     // key read off the UI thread by the spawn seam and deliberately off the
-    // Settings pages (its `DEFERRED_CONFIG_KEYS` rationale), yet written by hand —
+    // Settings pages (no Agents section to hold it), yet written by hand —
     // every hermetic launch recipe in `tools/` writes `agents_auto_prime = false`,
     // and each of those launches used to open on a "unknown to this aterm build"
     // warning band that every capture then carried.
@@ -854,6 +965,15 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         "Terminal key sequence map",
         ConfigSchemaKind::DynamicStringMap,
         &["keyboard", "escape", "pty", "bytes"],
+        true,
+    ),
+    // Sparse palette slots by index (`palette_overrides = { 12 = "#88c0d0" }`),
+    // applied over `palette`; Settings ▸ Themes writes one slot at a time.
+    manual(
+        "palette_overrides",
+        "Palette slot overrides",
+        ConfigSchemaKind::DynamicStringMap,
+        &["palette", "ansi", "colors", "colours", "slot", "indexed"],
         true,
     ),
     manual(
@@ -961,13 +1081,14 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         true,
     ),
     // The `[claude_footer]` table (owner, 2026-09-30): what the Claude Code
-    // footer writes into the rule under Claude's input box. `usage` defaults
-    // on; written by hand (no Settings row, `DEFERRED_CONFIG_KEYS`).
+    // footer writes into the rule under Claude's input box, and (`card`,
+    // 2026-10-15) the harness card on Claude's launch card. Both default on;
+    // written by hand (no Settings row).
     manual(
         "claude_footer",
         "Claude Code footer",
         ConfigSchemaKind::Table,
-        &["claude", "footer", "usage", "tokens"],
+        &["claude", "footer", "usage", "tokens", "card", "harness"],
         false,
     ),
     manual(
@@ -975,6 +1096,21 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         "Show Claude's working time and tokens (Σ)",
         ConfigSchemaKind::Scalar(EditKind::Bool),
         &["claude", "footer", "usage", "tokens", "runtime", "sigma"],
+        true,
+    ),
+    manual(
+        "claude_footer.card",
+        "Decorate Claude Code's launch card",
+        ConfigSchemaKind::Scalar(EditKind::Bool),
+        &[
+            "claude",
+            "footer",
+            "card",
+            "harness",
+            "autopilot",
+            "rainbow",
+            "banner",
+        ],
         true,
     ),
     // The `[reroute]` table: `announce` rides the native registry
@@ -997,10 +1133,11 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         true,
     ),
     // The `[harness]` table (design DESIGN-aterm-wrapper-2026-09-17 §4.6.2):
-    // its four Settings rows — the master switch `enabled`, the approval
-    // level `approve` (owner, 2026-09-24), the question answer
-    // `answer_questions` (owner, 2026-09-25) and how it answers,
-    // `question_priority` — ride the native registry
+    // its five Settings rows — the master switch `enabled`, the default
+    // Autopilot `autopilot` (2026-10-15), the approval level `approve`
+    // (owner, 2026-09-24), the question answer `answer_questions` (owner,
+    // 2026-09-25) and how it answers, `question_priority` — ride the native
+    // registry
     // (`prefs::NESTED_LEAVES`), so none is listed here (a row here would be
     // shadowed and dropped, `the_manual_schema_holds_one_row_per_key`); this
     // header is what lets Manual complete `[harness]` and what the dotted
@@ -1012,11 +1149,37 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         &["harness", "wrapper", "claude", "agent"],
         false,
     ),
+    // One table per supervisable agent (`[harness.<agent>]`, read by
+    // `aterm_agent::supervise::config`): its one key, `enabled`, is a
+    // Settings row too, so only the headers are here.
+    manual(
+        "harness.claude",
+        "Claude Code supervision",
+        ConfigSchemaKind::Table,
+        &["harness", "claude", "claude code", "agent"],
+        false,
+    ),
+    manual(
+        "harness.codex",
+        "Codex supervision",
+        ConfigSchemaKind::Table,
+        &["harness", "codex", "agent"],
+        false,
+    ),
+    manual(
+        "harness.agy",
+        "Antigravity CLI supervision",
+        ConfigSchemaKind::Table,
+        &["harness", "agy", "antigravity", "agent"],
+        false,
+    ),
     // The supervisor's policy (`aterm_agent::supervise::config::KEYS`, the
-    // in-GUI host's `harness_host`): every key but `enabled`, `approve`,
-    // `answer_questions` and `question_priority`, the Settings rows above.
+    // in-GUI host's `harness_host`): every key but `enabled`, `autopilot`,
+    // `approve`, `answer_questions` and `question_priority`, the Settings rows
+    // above.
     // Every one is ON (full power) by default and can only take power away,
-    // save the opt-ins whose `true` is more (`stall_term`, `limit_reset`).
+    // save the opt-ins whose `true` is more (`stall_term`, `limit_reset`,
+    // `usage_tap`).
     // Known here so the
     // file's `[harness]` keys are completed and a misspelled one is reported,
     // not silently dropped; `every_supervisor_key_is_known_to_the_config_language`
@@ -1039,7 +1202,7 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
     // was (`aterm_agent::supervise::config`'s module doc): each off by default.
     manual(
         "harness.rm_breaker_ask",
-        "Under approve = \"safe\", hand an unproven rm circuit breaker to a person",
+        "Hand an unproven rm to a person",
         ConfigSchemaKind::Scalar(EditKind::Bool),
         &["supervisor", "rm", "breaker", "approve", "strict"],
         true,
@@ -1112,7 +1275,7 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
     ),
     manual(
         "harness.probe_api",
-        "Check the API is reachable while a session waits on a network error",
+        "Check the API's reach during a network error",
         ConfigSchemaKind::Scalar(EditKind::Bool),
         &["supervisor", "offline", "network", "reachable", "probe"],
         true,
@@ -1126,7 +1289,7 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
     ),
     manual(
         "harness.limit_wait",
-        "Wait out a usage limit and continue automatically",
+        "Wait out a usage limit, then continue",
         ConfigSchemaKind::Scalar(EditKind::Bool),
         &[
             "supervisor",
@@ -1139,8 +1302,7 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
     ),
     manual(
         "harness.accounts",
-        "Claude Code accounts: at a usage limit, relaunch the session under the next listed \
-         account; \"early\" also moves it ahead of the limit and types /usage to sample it",
+        "Rotate Claude Code accounts at a usage limit",
         ConfigSchemaKind::Scalar(EditKind::Enum {
             options: &["early", "wall", "off"],
         }),
@@ -1154,27 +1316,71 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         ],
         true,
     ),
+    manual(
+        "harness.logins",
+        "Wait for a renewed Claude Code login",
+        ConfigSchemaKind::Scalar(EditKind::Enum {
+            options: &["renew", "off"],
+        }),
+        &["supervisor", "account", "login", "renew", "expire"],
+        true,
+    ),
+    manual(
+        "harness.hosts",
+        "Machines to renew logins on, over ssh",
+        ConfigSchemaKind::StringList,
+        &["supervisor", "account", "login", "renew", "ssh"],
+        true,
+    ),
     // Ships off: its `true` spends the owner's limit reset, and the rule
     // has never been run against a real wall.
     manual(
         "harness.limit_reset",
-        "Claude Code: take a limit reset the plan offers, only through the usage-limit dialog's \
-         own reset row and its confirmation (keys only, no command typed; needs resume_limits). \
-         Built, OFF by default, NEVER RUN AGAINST A REAL WALL",
+        "Take a limit reset the plan offers",
         ConfigSchemaKind::Scalar(EditKind::Bool),
         &["supervisor", "usage limit", "limit reset", "reset"],
         true,
     ),
+    // Ships off: its `true` changes what a relaunched Claude Code's argv
+    // carries (an inline `--settings` status line).
+    manual(
+        "harness.usage_tap",
+        "Read Claude Code's usage after each reply",
+        ConfigSchemaKind::Scalar(EditKind::Bool),
+        &[
+            "supervisor",
+            "usage",
+            "usage limit",
+            "status line",
+            "statusline",
+            "tap",
+        ],
+        true,
+    ),
+    // Ships off: a new line of the digest on a machine that did not ask for it.
+    manual(
+        "harness.usage_notes",
+        "Note Claude Code usage credits",
+        ConfigSchemaKind::Scalar(EditKind::Bool),
+        &[
+            "supervisor",
+            "usage credits",
+            "credits",
+            "usage limit",
+            "accounts",
+        ],
+        true,
+    ),
     manual(
         "harness.model_fallback",
-        "Claude Code: model to relaunch on at a model limit",
+        "Model to relaunch on at a model limit",
         ConfigSchemaKind::Scalar(EditKind::Text),
         &["supervisor", "model", "limit", "opus"],
         true,
     ),
     manual(
         "harness.rate_nudge",
-        "Codex near its usage limit: save the work on the cheaper model, then wait on its own",
+        "Answer Codex's near-limit nudge",
         ConfigSchemaKind::Scalar(EditKind::Bool),
         &[
             "supervisor",
@@ -1203,14 +1409,14 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
     ),
     manual(
         "harness.stall_term_after_s",
-        "Seconds a frozen agent stands before aterm warns (or, with stall_term, ends it; 0: never)",
+        "Seconds a frozen agent stands before a warning",
         ConfigSchemaKind::Scalar(EditKind::Integer),
         &["supervisor", "frozen", "stall", "relaunch"],
         true,
     ),
     manual(
         "harness.stall_term",
-        "Restart a frozen agent (aterm ctl restart) for its relaunch, instead of warning",
+        "Restart a frozen agent instead of warning",
         ConfigSchemaKind::Scalar(EditKind::Bool),
         &[
             "supervisor",
@@ -1224,7 +1430,7 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
     ),
     manual(
         "harness.memory_ceiling",
-        "Memory an agent may use before aterm warns; restarted only when the Mac is short (auto, off or GiB)",
+        "Memory an agent may use before aterm warns",
         ConfigSchemaKind::Scalar(EditKind::Text),
         &[
             "supervisor",
@@ -1242,24 +1448,108 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
     // `[harness]` stays the one policy home.
     manual(
         "harness.upgrade",
-        "Restart live Claude Code sessions onto a newer build",
+        "Restart Claude Code sessions onto a newer build",
         ConfigSchemaKind::Scalar(EditKind::Bool),
         &["upgrade", "update", "claude", "restart"],
         true,
     ),
     manual(
         "harness.upgrade_ask",
-        "Ask the agent to stop and answer READY before an upgrade restart",
+        "Ask the agent before an upgrade restart",
         ConfigSchemaKind::Scalar(EditKind::Bool),
         &["upgrade", "update", "claude", "ready", "strict"],
         true,
     ),
     manual(
         "harness.human_grace_s",
-        "Seconds the supervisor keeps off a session a person typed into",
+        "Seconds aterm waits after you type in a session",
         ConfigSchemaKind::Scalar(EditKind::Integer),
         &["supervisor", "human", "keyboard", "grace"],
         true,
+    ),
+    // The `[ai]` table (docs/DESIGN-ai-connections-2026-10-16.md §6.1), read by
+    // the AI layer's own reader (`aterm_agent::ai::config::read`), the one
+    // `aterm ai` and this window share. Its Settings rows — `enabled`,
+    // `preferred` and each CLI's `use` — ride the native registry
+    // (`prefs::NESTED_LEAVES`), so only the header and the per-CLI table
+    // headers are here with the keys that have no row: the egress grant
+    // `reviewers` (a registry row is drivable by `settings set`), the review
+    // knobs, and the fleet document's `machine` and `fleet`.
+    // `every_ai_key_is_known_to_the_config_language` pins the reader and
+    // these rows together.
+    manual(
+        "ai",
+        "AI CLIs",
+        ConfigSchemaKind::Table,
+        &[
+            "ai", "cli", "claude", "codex", "agy", "muse", "review", "login",
+        ],
+        false,
+    ),
+    manual(
+        "ai.reviewers",
+        "AI CLIs that may review this machine's code",
+        ConfigSchemaKind::StringList,
+        &["ai", "review", "reviewers", "grant", "egress"],
+        true,
+    ),
+    manual(
+        "ai.review_count",
+        "Reviewers per AI review",
+        ConfigSchemaKind::Scalar(EditKind::Integer),
+        &["ai", "review", "count"],
+        true,
+    ),
+    manual(
+        "ai.review_timeout_s",
+        "Seconds each AI reviewer may take",
+        ConfigSchemaKind::Scalar(EditKind::Integer),
+        &["ai", "review", "timeout"],
+        true,
+    ),
+    manual(
+        "ai.machine",
+        "This machine's row in the AI fleet document",
+        ConfigSchemaKind::Scalar(EditKind::Text),
+        &["ai", "fleet", "machine", "name"],
+        true,
+    ),
+    manual(
+        "ai.fleet",
+        "AI fleet document (path)",
+        ConfigSchemaKind::Scalar(EditKind::Text),
+        &["ai", "fleet", "document", "path", "dotfiles"],
+        true,
+    ),
+    // One table per AI CLI (`[ai.<id>]`): its one key, `use`, is a Settings
+    // row, so only the headers are here.
+    manual(
+        "ai.claude",
+        "Claude Code on this machine",
+        ConfigSchemaKind::Table,
+        &["ai", "claude", "claude code"],
+        false,
+    ),
+    manual(
+        "ai.codex",
+        "Codex CLI on this machine",
+        ConfigSchemaKind::Table,
+        &["ai", "codex", "openai"],
+        false,
+    ),
+    manual(
+        "ai.agy",
+        "Antigravity CLI on this machine",
+        ConfigSchemaKind::Table,
+        &["ai", "agy", "antigravity", "google"],
+        false,
+    ),
+    manual(
+        "ai.muse",
+        "Muse Code on this machine",
+        ConfigSchemaKind::Table,
+        &["ai", "muse", "meta"],
+        false,
     ),
     // The `[disk]` table (design DESIGN-aterm-wrapper-2026-09-17 §5.5), read by
     // the harness's disk verb and by this window's harness host
@@ -1283,7 +1573,7 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
     ),
     manual(
         "disk.apply",
-        "Let `aterm harness disk --apply <class>` remove what it reports",
+        "Let disk cleanup remove what it finds",
         ConfigSchemaKind::Scalar(EditKind::Bool),
         &["disk", "cleanup", "remove", "consent"],
         true,
@@ -1297,21 +1587,21 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
     ),
     manual(
         "disk.target_stale_days",
-        "Days a cargo profile goes unbuilt before it counts as idle: its incremental cache goes first, whole (below the floor, recent ones follow, least recently used first; none built in the last 10 min, even at 0)",
+        "Days unbuilt before a build cache is idle",
         ConfigSchemaKind::Scalar(EditKind::Integer),
         &["disk", "target", "stale", "cargo"],
         true,
     ),
     manual(
         "disk.auto_free_gib",
-        "Free GiB below which cargo profiles' incremental caches are reclaimed automatically: idle ones, then least recently used first until 1 GiB above it, or until the bytes freed cover the shortfall (0: off)",
+        "Free GiB below which caches are cleared",
         ConfigSchemaKind::Scalar(EditKind::Integer),
         &["disk", "free space", "target", "cleanup", "automatic"],
         true,
     ),
     manual(
         "disk.dead_build_dirs",
-        "Below the floor, remove WHOLE a build directory whose owner is gone: an ended Claude Code session's scratch build (no running Claude Code names the session, nothing of it written for target_stale_days, at least a day) or the cells cache of a removed checkout — after the idle caches, before any live checkout's (false: only its incremental caches)",
+        "Remove build folders whose owner is gone",
         ConfigSchemaKind::Scalar(EditKind::Bool),
         &[
             "disk",
@@ -1341,7 +1631,7 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
     ),
     manual(
         "render.repaint_nudge",
-        "Repair a displaced Claude Code tab by telling it its terminal is one row shorter and then the true size (on), only log what that would do (log), or do nothing (off)",
+        "Repair a Claude Code tab drawn a row off",
         ConfigSchemaKind::Scalar(EditKind::Enum {
             options: REPAINT_NUDGE_MODES,
         }),
@@ -1365,7 +1655,7 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
     ),
     manual(
         "packages.enabled",
-        "Automatic updates",
+        "Keep ALab tools up to date",
         ConfigSchemaKind::Scalar(EditKind::Bool),
         &["atpkg", "tools", "master"],
         true,
@@ -1424,7 +1714,7 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
     ),
     // The `[privacy]` table (`app_config::PrivacyConfig`, the macOS consent
     // lane): kept off the Settings pages on purpose — the Security page's
-    // "macOS access" block is its surface (`DEFERRED_CONFIG_KEYS`) — but
+    // "macOS access" block is its surface — but
     // every key is one an operator writes by hand, and each was called "unknown
     // to this aterm build" until these rows. `auto_accept` is here too: it is
     // parsed so its refusal can be SAID (`config_semantic_warnings`), and a key
@@ -1535,18 +1825,10 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         &["streak", "effect", "output", "prism", "rainbow"],
         false,
     ),
-    // The table's five VISUAL keys: config-file surface, deliberately not
-    // Settings rows yet (`prefs::NESTED_LEAVES` says what they are owed first),
-    // but live — each is read by its `Config::output_streak_*_or_default`
-    // resolver — so Manual must not call them unknown. The sixth, `sound`, is
-    // the Sound menu's native row.
-    manual(
-        "output_streak.enabled",
-        "Show the output streak",
-        ConfigSchemaKind::Scalar(EditKind::Bool),
-        &["streak", "prism", "wake"],
-        true,
-    ),
+    // The table's four tuning keys: Manual's (`prefs::NESTED_LEAVES` says
+    // why), and live — each is read by its `Config::output_streak_*_or_default`
+    // resolver — so Manual must not call them unknown. Its switch, `enabled`,
+    // and its pip, `sound`, are native rows.
     manual(
         "output_streak.intensity",
         "Output streak intensity",
@@ -1818,6 +2100,58 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         &["sprite", "cats"],
         false,
     ),
+    // Keys that still parse but do nothing ([`RETIRED_CONFIG_KEYS`],
+    // [`COMPATIBILITY_ONLY_KEYS`]). Typed here so Manual still flags a
+    // malformed value, never Settings rows, and safe to remove from Modified.
+    manual(
+        "sparkle_words.feline.idle",
+        "Keyword Kitty idle animation",
+        ConfigSchemaKind::Scalar(EditKind::Bool),
+        &[],
+        true,
+    ),
+    manual(
+        "sparkle_words.feline.gaze",
+        "Keyword Kitty gaze tracking",
+        ConfigSchemaKind::Scalar(EditKind::Bool),
+        &[],
+        true,
+    ),
+    manual(
+        "sparkle_words.feline.color",
+        "Keyword Kitty tint",
+        ConfigSchemaKind::Scalar(EditKind::Color),
+        &[],
+        true,
+    ),
+    manual(
+        "sparkle_words.feline.intensity",
+        "Keyword Kitty opacity",
+        ConfigSchemaKind::Scalar(EditKind::Float),
+        &[],
+        true,
+    ),
+    manual(
+        "matrix_rain.materialize",
+        "Matrix rain materialize",
+        ConfigSchemaKind::Scalar(EditKind::Bool),
+        &[],
+        true,
+    ),
+    manual(
+        "matrix_rain.ink_text",
+        "Matrix rain ink text",
+        ConfigSchemaKind::Scalar(EditKind::Bool),
+        &[],
+        true,
+    ),
+    manual(
+        "matrix_rain.phosphor",
+        "Matrix rain phosphor layer",
+        ConfigSchemaKind::Scalar(EditKind::Bool),
+        &[],
+        true,
+    ),
 ];
 
 pub(crate) fn config_schema() -> &'static [ConfigSchemaEntry] {
@@ -1918,6 +2252,7 @@ fn manual_default_shown(key: &str) -> Option<String> {
         "operator.enabled" => config.operator_enabled().to_string(),
         "agents_auto_prime" => config.agents_auto_prime_or_default().to_string(),
         "claude_footer.usage" => config.claude_footer_usage().to_string(),
+        "claude_footer.card" => config.claude_footer_card().to_string(),
         "reroute.strict" => atpkg::config::parse_reroute("").strict().to_string(),
         #[cfg(unix)]
         "fabric.hold_on_bridge_lost" => {
@@ -1955,6 +2290,10 @@ fn manual_default_shown(key: &str) -> Option<String> {
         "output_streak.tail" => config.output_streak_tail_or_default().to_string(),
         "output_streak.max_streaks" => config.output_streak_max_streaks_or_default().to_string(),
         "output_streak.idle_secs" => config.output_streak_idle_secs_or_default().to_string(),
+        // The AI layer's own defaults (`aterm_agent::ai::config`), never a
+        // literal re-typed here.
+        "ai.review_count" => aterm_agent::ai::config::REVIEW_COUNT_DEFAULT.to_string(),
+        "ai.review_timeout_s" => aterm_agent::ai::config::TIMEOUT_DEFAULT_S.to_string(),
         _ => return None,
     })
 }
@@ -1994,9 +2333,9 @@ pub(crate) fn config_schema_match_score(
     entry: &ConfigSchemaEntry,
     query: &str,
     scratch: &mut String,
-) -> Option<u8> {
+) -> Option<SearchRank> {
     if query.is_empty() {
-        return Some(0);
+        return Some(SearchRank::EVERY);
     }
     scratch.clear();
     scratch.extend(
@@ -2005,20 +2344,153 @@ pub(crate) fn config_schema_match_score(
             .chars()
             .map(|character| character.to_ascii_lowercase()),
     );
-    std::iter::once(scratch.as_str())
-        .chain(std::iter::once(entry.key))
-        .chain(entry.keywords.iter().copied())
-        .filter_map(|candidate| candidate_match_score(candidate, query))
-        .min()
+    query_match_rank(
+        [scratch.as_str(), entry.key]
+            .into_iter()
+            .chain(crate::prefs::own_name_of(entry.key)),
+        entry.keywords.iter().copied(),
+        query,
+    )
+}
+
+/// WHERE A SEARCH HIT LANDS, as both Settings search and Manual completion
+/// order it: the ladder's rung first ([`candidate_match_score`]); on the
+/// same rung, a hit on what the row is called — its label, its key, a name
+/// of its own (`prefs::own_name_of`) — before one only a word it lists as a
+/// synonym reached. A row's visible name is what a person reads; a synonym
+/// is a hidden alias, so "codex" finds Supervise Codex sessions before the
+/// packages switch that lists "codex" among its words. Lower is better.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct SearchRank {
+    /// The ladder's rung: 0 exact prefix … 3 acronym.
+    pub(crate) rung: u8,
+    /// Only a synonym (a listed keyword, a value) reached the rung.
+    pub(crate) synonym: bool,
+}
+
+impl SearchRank {
+    /// An empty query: everything at once, in its own order.
+    pub(crate) const EVERY: Self = Self::own(0);
+
+    /// A hit on a name of the row's own, at `rung`.
+    pub(crate) const fn own(rung: u8) -> Self {
+        Self {
+            rung,
+            synonym: false,
+        }
+    }
+
+    /// A hit only a synonym reached, at `rung`.
+    pub(crate) const fn synonym(rung: u8) -> Self {
+        Self {
+            rung,
+            synonym: true,
+        }
+    }
+}
+
+/// Rank a row against `query` ([`SearchRank`]): its `own` names (label, key,
+/// own name) and its `synonyms` together, by [`query_match_score`]; then
+/// whether its own names alone reach that rung. Monotone: the own names are
+/// a subset, so they never rank better than the whole set — and a query of
+/// several words may need a synonym for one of them, which is then a
+/// synonym hit.
+pub(crate) fn query_match_rank<'a>(
+    own: impl Iterator<Item = &'a str> + Clone,
+    synonyms: impl Iterator<Item = &'a str> + Clone,
+    query: &str,
+) -> Option<SearchRank> {
+    let rung = query_match_score(own.clone().chain(synonyms), query)?;
+    Some(SearchRank {
+        rung,
+        synonym: query_match_score(own, query) != Some(rung),
+    })
+}
+
+/// Words a query holds that name nothing: "check for updates" asks for the
+/// update switch, not for a setting with "for" in its name.
+const QUERY_FILLER_WORDS: [&str; 12] = [
+    "a", "an", "and", "for", "in", "my", "of", "on", "or", "the", "to", "with",
+];
+
+/// Rank a candidate set (a setting's label, key and keywords) against a query
+/// of one or more words — the rank both Settings search and the schema
+/// authority use. One word ranks by [`candidate_match_score`]. Several rank as
+/// the phrase typed, or as every word matching somewhere in the set, by the
+/// worst of them: "dark mode" finds the setting whose keywords are "dark" and
+/// "mode". Filler words ("for", "the") need not match. A word that matches
+/// nothing as typed may match in its other number ("kitty" finds "kitties").
+///
+/// Same precondition as the ladder: `query` is lowercase, and so is every
+/// candidate.
+pub(crate) fn query_match_score<'a>(
+    candidates: impl Iterator<Item = &'a str> + Clone,
+    query: &str,
+) -> Option<u8> {
+    let best = |needle: &str| {
+        candidates
+            .clone()
+            .filter_map(|candidate| candidate_match_score(candidate, needle))
+            .min()
+    };
+    let word = |word: &str| {
+        best(word).or_else(|| {
+            // The other number is a whole-word idea, so its stem must start
+            // a word: inside one it is an accident ("series" → "ser" in
+            // "user"), and so is an acronym.
+            let stem = word_stem(word)?;
+            candidates
+                .clone()
+                .filter_map(|candidate| candidate_match_score(candidate, stem))
+                .filter(|score| *score < 2)
+                .min()
+        })
+    };
+    let mut words = query.split_whitespace();
+    let first = words.next()?;
+    if words.next().is_none() {
+        return word(first);
+    }
+    let phrase = best(query.trim());
+    let mut every = None;
+    for part in query
+        .split_whitespace()
+        .filter(|part| !QUERY_FILLER_WORDS.contains(part))
+    {
+        match word(part) {
+            Some(score) => every = Some(every.map_or(score, |worst: u8| worst.max(score))),
+            None => {
+                every = None;
+                break;
+            }
+        }
+    }
+    match (phrase, every) {
+        (Some(phrase), Some(every)) => Some(phrase.min(every)),
+        (phrase, every) => phrase.or(every),
+    }
+}
+
+/// `word` less a plural or "-y" ending, so either number of a word finds the
+/// other: "kitties" and "kitty" share "kitt", "titles" finds "title". `None`
+/// when no ending comes off or too little is left to mean anything.
+fn word_stem(word: &str) -> Option<&str> {
+    let stem = word
+        .strip_suffix("ies")
+        .or_else(|| word.strip_suffix('s').filter(|stem| !stem.ends_with('s')))
+        .or_else(|| word.strip_suffix('y'))?;
+    (stem.len() >= 3).then_some(stem)
 }
 
 /// THE search-rank ladder, shared by the config-schema authority above and by
 /// Settings global search (`native_settings::field_match_score_in`).
 ///
-/// Exact prefix beats word prefix beats substring beats an ordered subsequence,
-/// and the subsequence rung is capped at 3 characters because a long fuzzy
-/// subsequence is mostly an accident (`materialize` matching unrelated labels).
-/// Lower is better; the caller takes the `min` over a candidate set.
+/// Exact prefix beats word prefix beats substring beats an acronym — the
+/// query's letters starting words of the candidate in order ("lh" for "line
+/// height"). The acronym rung is capped at 3 characters, and it takes word
+/// starts only: a loose subsequence is mostly an accident ("cat" matched
+/// dozens of unrelated settings). Lower is better; the caller takes the `min`
+/// over a candidate set ([`query_match_score`]).
 ///
 /// The two surfaces are supposed to rank IDENTICALLY — a key that sorts first in
 /// Settings should sort first in Manual completion — and before this was shared
@@ -2028,9 +2500,8 @@ pub(crate) fn config_schema_match_score(
 /// ASCII-lowercased, and `candidate` is already lowercase — folded by the caller
 /// into its scratch buffer, or lowercase by construction and pinned by
 /// `config_schema_keys_and_keywords_are_lowercase` /
-/// `editable_field_keys_are_unique_and_lowercase`. The subsequence rung folds
-/// ASCII case; on already-lowercase input that is indistinguishable from an
-/// exact comparison, which is why both callers can share one ladder.
+/// `editable_field_keys_are_unique_and_lowercase`. Every rung compares bytes
+/// exactly, which is why both callers can share one ladder.
 pub(crate) fn candidate_match_score(candidate: &str, query: &str) -> Option<u8> {
     if candidate.starts_with(query) {
         Some(0)
@@ -2038,11 +2509,34 @@ pub(crate) fn candidate_match_score(candidate: &str, query: &str) -> Option<u8> 
         Some(1)
     } else if candidate.contains(query) {
         Some(2)
-    } else if query.chars().count() <= 3 && is_subsequence(query, candidate) {
+    } else if query.len() <= 3 && is_acronym(query, candidate) {
         Some(3)
     } else {
         None
     }
+}
+
+/// Whether each character of `query` starts a word of `candidate`, in order —
+/// `cts` in `cursor_trail_style`, `lh` in "line height". Words are as
+/// [`starts_a_word`] reads them; a `query` with any character that is not an
+/// ASCII alphanumeric starts none.
+fn is_acronym(query: &str, candidate: &str) -> bool {
+    let wanted = query.as_bytes();
+    if wanted.is_empty() || !wanted.iter().all(u8::is_ascii_alphanumeric) {
+        return false;
+    }
+    let mut next = 0;
+    let mut word_start = true;
+    for &byte in candidate.as_bytes() {
+        if word_start && byte == wanted[next] {
+            next += 1;
+            if next == wanted.len() {
+                return true;
+            }
+        }
+        word_start = !byte.is_ascii_alphanumeric();
+    }
+    false
 }
 
 /// Whether a word of `candidate` — a run between characters that are not ASCII
@@ -2084,15 +2578,6 @@ fn contains_ascii_folded(haystack: &str, needle: &str, scratch: &mut String) -> 
             .map(|character| character.to_ascii_lowercase()),
     );
     scratch.contains(needle)
-}
-
-pub(crate) fn is_subsequence(needle: &str, haystack: &str) -> bool {
-    let mut haystack = haystack.chars();
-    needle.chars().all(|needle| {
-        haystack
-            .by_ref()
-            .any(|candidate| candidate.eq_ignore_ascii_case(&needle))
-    })
 }
 
 /// How far a spelling may sit from a registered one and still be called a typo.
@@ -2408,15 +2893,38 @@ fn omitted_key_line(analysis: &ConfigAnalysis) -> Option<String> {
         .then(|| format!("… and {} more not shown", analysis.omitted_diagnostics))
 }
 
-/// A spelling the registry domain rejects that the RUNTIME nonetheless resolves.
+/// A spelling the registry domain rejects that the RUNTIME nonetheless resolves,
+/// as `(the retired spelling, the value it renders as)`.
 ///
-/// `cursor_style = "underline"` is retired and renders as a bar, so it needs the
-/// sentence that says so and must never be told it is outside the domain: the
-/// cursor does not fall back to the default, and a reader sent to "fix" a working
-/// config learns the wrong thing. Named once because both the editor's value
-/// validation and the fail-soft value walk have to make the same exception.
-fn is_retired_but_resolving(key: &str, value: &str) -> bool {
-    key == crate::prefs::EDIT_CURSOR_STYLE && value.trim().eq_ignore_ascii_case("underline")
+/// - `cursor_style = "underline"` is retired and renders as a bar.
+/// - `font_hinting = "native"` ran the font's own TrueType bytecode or CFF
+///   hints; since TF.2b (docs/AUDIT-third-party-2026-10-15.md) it renders as
+///   `light`, the vertical-only fit those interpreters gave here anyway.
+///   Matched exactly as the renderer's parser matches it (`hinted::HintMode`).
+///
+/// Each needs the sentence that says so and must never be told it is outside
+/// the domain: it does not fall back to the default, and a reader sent to "fix"
+/// a working config learns the wrong thing. Named once because both the
+/// editor's value validation and the fail-soft value walk have to make the same
+/// exception, and `--validate-config` tells the same sentence
+/// ([`retired_but_resolving_note`]).
+fn retired_but_resolving(key: &str, value: &str) -> Option<(&'static str, &'static str)> {
+    let value = value.trim();
+    match key {
+        crate::prefs::EDIT_CURSOR_STYLE if value.eq_ignore_ascii_case("underline") => {
+            Some(("underline", "bar"))
+        }
+        "font_hinting" if value == "native" => Some(("native", "light")),
+        _ => None,
+    }
+}
+
+/// The warning for a [`retired_but_resolving`] value of `key`, if it is one.
+pub(crate) fn retired_but_resolving_note(key: &str, value: &str) -> Option<String> {
+    let (retired, renders) = retired_but_resolving(key, value)?;
+    Some(format!(
+        "{key} = \"{retired}\" is retired and renders as \"{renders}\"; use \"{renders}\" explicitly"
+    ))
 }
 
 /// One `(key, value, sentence)` per registered key in `source` whose authored
@@ -2461,7 +2969,7 @@ fn unaccepted_enum_values(source: &str) -> Vec<(&'static str, String, String)> {
             continue;
         };
         if registered_enum_value_is_valid(setting.key, value, options)
-            || is_retired_but_resolving(setting.key, value)
+            || retired_but_resolving(setting.key, value).is_some()
         {
             continue;
         }
@@ -2685,7 +3193,7 @@ fn warn_compatibility_only_item(
     }
 }
 
-fn compatibility_only_message(key: &str) -> String {
+pub(crate) fn compatibility_only_message(key: &str) -> String {
     if let Some(retired) = retired_config_key(key) {
         return format!(
             "{key} does nothing: {} was removed; safe to delete",
@@ -3051,14 +3559,13 @@ fn validate_registered_values(
                 let Some(value) = item.as_str() else {
                     continue;
                 };
-                if is_retired_but_resolving(setting.key, value) {
+                if let Some(note) = retired_but_resolving_note(setting.key, value) {
                     push_diagnostic(
                         analysis,
                         source,
                         range,
                         ConfigDiagnosticSeverity::Warning,
-                        "cursor_style = \"underline\" is retired and renders as \"bar\"; use \"bar\" explicitly"
-                            .to_string(),
+                        note,
                     );
                     continue;
                 }
@@ -3081,13 +3588,13 @@ fn validate_registered_values(
                 let Some(value) = item.as_str() else {
                     continue;
                 };
-                if crate::app_config::parse_hex_color(value).is_none() {
+                if aterm_types::scheme::parse_hex(value).is_none() {
                     push_diagnostic(
                         analysis,
                         source,
                         range,
                         ConfigDiagnosticSeverity::Error,
-                        format!("{} must be an RRGGBB or #RRGGBB color", setting.key),
+                        format!("{} must be an RRGGBB, #RRGGBB or #RGB color", setting.key),
                     );
                 }
             }
@@ -3635,6 +4142,7 @@ fn enum_aliases(key: &str) -> &'static [&'static str] {
         "windowing_behavior" => WINDOWING_BEHAVIOR_ALIASES,
         "right_click" => RIGHT_CLICK_ALIASES,
         "tab_menu_chord" => TAB_MENU_CHORD_ALIASES,
+        crate::prefs::EDIT_HARNESS_AUTOPILOT => HARNESS_AUTOPILOT_ALIASES,
         _ => &[],
     }
 }
@@ -3644,43 +4152,21 @@ fn custom_ink_colorway_is_valid(value: &str) -> bool {
 }
 
 /// Parse the same plain or `dark:…,light:…` shape as Config's runtime
-/// resolver, while rejecting segments that the permissive fallback would
-/// silently ignore. Names are intentionally not classified as built-in versus
-/// custom because user theme files are resolved by the capability-owning host.
-pub(crate) fn theme_names(value: &str) -> Result<Vec<&str>, String> {
-    let value = value.trim();
-    if value.is_empty() {
-        return Err("theme must name a built-in or user theme".to_string());
+/// resolver ([`aterm_types::scheme::ThemeSelector`]) and reject every segment
+/// that the permissive resolver would silently ignore, naming each one. Names
+/// are intentionally not classified as built-in versus custom because user
+/// theme files are resolved by the capability-owning host.
+pub(crate) fn theme_names(value: &str) -> Result<aterm_types::scheme::ThemeSelector, String> {
+    let (selector, issues) = aterm_types::scheme::ThemeSelector::parse(value);
+    if issues.is_empty() {
+        Ok(selector)
+    } else {
+        Err(issues
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; "))
     }
-    let is_split = value.split(',').any(|segment| {
-        segment.split_once(':').is_some_and(|(mode, _)| {
-            matches!(mode.trim().to_ascii_lowercase().as_str(), "dark" | "light")
-        })
-    });
-    if !is_split {
-        return Ok(vec![value]);
-    }
-
-    let mut seen = BTreeSet::new();
-    let mut names = Vec::new();
-    for segment in value.split(',') {
-        let (mode, name) = segment
-            .split_once(':')
-            .ok_or_else(|| format!("theme split segment {segment:?} needs dark: or light:"))?;
-        let mode = mode.trim().to_ascii_lowercase();
-        if !matches!(mode.as_str(), "dark" | "light") {
-            return Err(format!("theme split mode {mode:?} must be dark or light"));
-        }
-        let name = name.trim();
-        if name.is_empty() {
-            return Err(format!("theme split mode {mode} needs a theme name"));
-        }
-        if !seen.insert(mode.clone()) {
-            return Err(format!("theme split mode {mode} appears more than once"));
-        }
-        names.push(name);
-    }
-    Ok(names)
 }
 
 /// Every key in `walk`'s document this build does nothing with, with the
@@ -4899,13 +5385,16 @@ fn table_assist(
             }
         })
         .collect::<Vec<_>>();
+    let typed = !prefix.is_empty() && exact.is_none() && !completions.is_empty();
     ConfigAssist {
+        resting_help: exact.clone(),
         help: exact.or_else(|| {
             completions
                 .first()
                 .map(|completion| completion.help.clone())
         }),
         completions,
+        typed,
     }
 }
 
@@ -4995,6 +5484,8 @@ fn key_assist(
             }
         })
         .collect::<Vec<_>>();
+    let typed = !normalized.is_empty() && exact.is_none() && !completions.is_empty();
+    let resting_help = exact.clone().or_else(|| table_context_help(table, index));
     ConfigAssist {
         help: exact
             .or_else(|| {
@@ -5004,6 +5495,8 @@ fn key_assist(
             })
             .or_else(|| table_context_help(table, index)),
         completions,
+        typed,
+        resting_help,
     }
 }
 
@@ -5021,15 +5514,21 @@ fn value_assist(
     };
     let full_key = join_key_expressions(table, &local);
     if is_compatibility_only_key(&full_key) {
+        let help = compatibility_only_help(&full_key, index);
         return ConfigAssist {
-            help: compatibility_only_help(&full_key, index),
+            resting_help: help.clone(),
+            help,
             completions: Vec::new(),
+            typed: false,
         };
     }
     let Some(setting) = config_schema_entry(&full_key) else {
+        let help = table_context_help(table, index);
         return ConfigAssist {
-            help: table_context_help(table, index),
+            resting_help: help.clone(),
+            help,
             completions: Vec::new(),
+            typed: false,
         };
     };
     let value_start = equal
@@ -5047,10 +5546,7 @@ fn value_assist(
             .iter()
             .map(|option| format!("\"{option}\""))
             .collect(),
-        ConfigSchemaKind::Scalar(EditKind::Theme) => aterm_types::scheme::builtin_names()
-            .into_iter()
-            .map(|name| format!("\"{name}\""))
-            .collect(),
+        ConfigSchemaKind::Scalar(EditKind::Theme) => theme_value_literals(index),
         ConfigSchemaKind::StringList | ConfigSchemaKind::TextOrStringList => {
             vec!["[]".to_string()]
         }
@@ -5064,6 +5560,10 @@ fn value_assist(
     };
     let prefix_end = caret_in_line.clamp(value_start, value_end);
     let normalized = code[value_start..prefix_end].trim().to_ascii_lowercase();
+    let whole_value = code[value_start..value_end].trim();
+    let finished = literals
+        .iter()
+        .any(|literal| literal.eq_ignore_ascii_case(whole_value));
     let completions = literals
         .into_iter()
         .filter(|literal| {
@@ -5073,6 +5573,8 @@ fn value_assist(
         .map(|literal| {
             let display = if full_key == "sparkle_words.feline.style" && literal == "\"paw\"" {
                 "\"paw\" — legacy ink-only; no paw graphic".to_string()
+            } else if full_key == "theme" && literal.starts_with("\"dark:") {
+                format!("{literal} — follow the system's dark or light appearance")
             } else {
                 literal.clone()
             };
@@ -5085,11 +5587,35 @@ fn value_assist(
                 help: setting_help(setting),
             }
         })
-        .collect();
+        .collect::<Vec<_>>();
     ConfigAssist {
+        typed: !normalized.is_empty() && !finished && !completions.is_empty(),
         help: Some(setting_help(setting)),
+        resting_help: Some(setting_help(setting)),
         completions,
     }
+}
+
+/// The `theme` values completion offers: every built-in, then the theme files
+/// that loaded (the same names Settings' picker offers), and, right after
+/// Default, the split form that follows the system appearance, pre-filled
+/// with Default's pair.
+fn theme_value_literals(index: &ConfigAssistIndex) -> Vec<String> {
+    let builtins = aterm_types::scheme::builtin_names();
+    let dark = builtins.first().copied().unwrap_or("Default");
+    let light = aterm_types::scheme::builtin_pair(dark).unwrap_or(dark);
+    let mut literals: Vec<String> = builtins
+        .iter()
+        .map(|name| (*name).to_string())
+        .chain(index.theme_names.iter().cloned())
+        .map(|name| format!("\"{}\"", name.replace('\\', "\\\\").replace('"', "\\\"")))
+        .collect();
+    // Second, right after Default, so an empty value's short list shows it.
+    literals.insert(
+        literals.len().min(1),
+        format!("\"dark:{dark},light:{light}\""),
+    );
+    literals
 }
 
 fn table_context_help(table: &str, index: &ConfigAssistIndex) -> Option<String> {
@@ -5138,6 +5664,19 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
     } else if setting.key == "packages.links" {
         "named absolute/~/ checkout paths (dev links), or owner/repo slugs (a development build only)"
             .to_string()
+    } else if setting.key == "harness.usage_notes" {
+        "true / false; with no accounts listed, the one Claude Code account's usage credits and \
+         its own warnings that a window fills each get a digest line"
+            .to_string()
+    } else if setting.key == "harness.trust_roots" {
+        // The default is empty (`SupervisorConfig::default`): the help says
+        // what a list of one's own is, and when it is read.
+        "absolute or ~/ folder paths, a trailing * any suffix of the last name; read only under \
+         approve = \"safe\", which answers the trust dialog in these folders alone (Claude \
+         Code's, and Codex's folder-trust gate; and a Claude Code Read in them too); none by \
+         default, so under approve = \"safe\" every trust dialog goes to a person until you list \
+         your own"
+            .to_string()
     } else {
         match setting.kind {
             ConfigSchemaKind::Scalar(EditKind::Float) => "number".to_string(),
@@ -5145,7 +5684,7 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
             ConfigSchemaKind::Scalar(EditKind::Bool) => "true / false".to_string(),
             ConfigSchemaKind::Scalar(EditKind::Text) => "text".to_string(),
             ConfigSchemaKind::Scalar(EditKind::Theme) => "color theme".to_string(),
-            ConfigSchemaKind::Scalar(EditKind::Color) => "RRGGBB or #RRGGBB".to_string(),
+            ConfigSchemaKind::Scalar(EditKind::Color) => "RRGGBB, #RRGGBB or #RGB".to_string(),
             ConfigSchemaKind::Scalar(EditKind::Enum { options }) => options.join(" / "),
             ConfigSchemaKind::StringList => "list of text values".to_string(),
             ConfigSchemaKind::TextOrStringList => "text or list of text values".to_string(),
@@ -5184,10 +5723,10 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
             " · a quiet chime when aterm answers a Claude Code question for you, at most once per 2 s · scaled by trail_sound_volume, silent with trail_sounds off or in serious mode · macOS only"
         }
         crate::prefs::EDIT_MINIMUM_CONTRAST => {
-            " · translucent backgrounds enforce at least 4.5:1 text contrast"
+            " · text on a see-through background keeps 4.5:1 contrast"
         }
         crate::prefs::EDIT_BACKGROUND_OPACITY => {
-            " · macOS GPU window path only; CPU and non-macOS GPU grids stay solid · translucent backgrounds enforce at least 4.5:1 text contrast"
+            " · macOS GPU rendering only · text keeps 4.5:1 contrast"
         }
         crate::prefs::EDIT_BACKGROUND_MATERIAL => {
             " · GPU renderer only · macOS requires background_opacity < 1; Windows maps to Mica / Mica Alt / Acrylic"
@@ -5261,25 +5800,30 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
         crate::prefs::EDIT_DESKTOP_ALERTS => {
             " · aterm's OWN alerts (the menu bar's escalations, macOS permissions, the operator, update health) as system notifications — macOS through terminal-notifier if installed, else osascript (shown as Script Editor); Windows a notification-area balloon (not update health); none on other platforms · off keeps them in the message band, the menu bar and messages.log, the operator's only counted in aterm fleet status · program notifications (OSC 9/99/777) are allow_notifications'"
         }
+        // The Settings rows are named in plain words; the escape sequences
+        // each one gates are named here.
         crate::prefs::EDIT_ALLOW_OSC52_QUERY => {
             if cfg!(target_os = "linux") {
-                " · an authorized query reads back only the clipboard selections aterm itself owns (a foreign app's X11 selection is not readable today); rate/budget gates still apply"
+                " · the OSC 52 clipboard query · an authorized query reads back only the clipboard selections aterm itself owns (a foreign app's X11 selection is not readable today); rate/budget gates still apply"
             } else {
-                " · an authorized query reads the SYSTEM clipboard — including text copied in other apps — which is what remote vim/tmux clipboard sync needs; rate/budget gates still apply"
+                " · the OSC 52 clipboard query · an authorized query reads the SYSTEM clipboard — including text copied in other apps — which is what remote vim/tmux clipboard sync needs; rate/budget gates still apply"
             }
         }
         crate::prefs::EDIT_ALLOW_WINDOW_OPS => {
             if cfg!(target_os = "linux") {
-                " · manipulations (iconify, maximize, fullscreen, resize — move stays denied) apply to the window; the window-title, text-grid-size, text-area-pixels and cell-size reports are answered, while window/screen position and screen-size reports remain unanswered"
+                " · XTWINOPS (CSI t) · manipulations (iconify, maximize, fullscreen, resize — move stays denied) apply to the window; the window-title, text-grid-size, text-area-pixels and cell-size reports are answered, while window/screen position and screen-size reports remain unanswered"
             } else {
-                " · answers the window-title, text-grid-size, text-area-pixels and cell-size reports only; window changes (iconify, maximize, fullscreen, resize, move) and position and screen-size reports are ignored on this platform"
+                " · XTWINOPS (CSI t) · answers the window-title, text-grid-size, text-area-pixels and cell-size reports only; window changes (iconify, maximize, fullscreen, resize, move) and position and screen-size reports are ignored on this platform"
             }
+        }
+        crate::prefs::EDIT_ALLOW_PALETTE_RECONFIGURE => {
+            " · OSC 4 and OSC 21 · false ignores a program's change to one of the 256 indexed colors; reading them, and the named foreground, background and cursor colors, are unaffected"
         }
         crate::prefs::EDIT_SEARCH_HISTORY_LINES => {
             " · Find searches only this many of the newest lines; 0 searches only the screen"
         }
         crate::prefs::EDIT_PACKAGES_ENABLED => {
-            " · Automatic updates — the one switch for the background package service (the retired auto_update is read as it), read live by the window (off stands it down within seconds, on resumes it); a published public index is picked up within minutes, and a full signed check runs every six hours across every aterm on the machine; explicit package commands and Check & Update Now remain available when the trust-root gate is open"
+            " · the one switch for the background package service (the retired auto_update is read as it), read live by the window (off stands it down within seconds, on resumes it); a published public index is picked up within minutes, and a full signed check runs every six hours across every aterm on the machine; explicit package commands and Check & Update Now remain available when the trust-root gate is open"
         }
         crate::prefs::EDIT_PACKAGES_AUTO_INSTALL => {
             " · the one install consent (the retired seed_install is read as it while this is unset): the first-run fill and new members of the signed set; uninstall, exclude and packages.enabled = false always win, and it cannot bypass the package trust-root gate"
@@ -5299,8 +5843,72 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
         "update.require_team_id" => {
             " · a development build only; a shipped build's compiled Team ID always wins"
         }
+        "fabric.hold_on_bridge_lost" => " · off: a lost bridge posts an advisory and halts nothing",
+        "harness.rm_breaker_ask" => {
+            " · read only under approve = \"safe\", at Claude Code's rm circuit breaker · off: an rm the safe rules cannot prove is approved, and its reason kept as a warning"
+        }
+        "harness.probe_api" => {
+            " · a resolve, a connect and a TLS handshake to api.anthropic.com, no request sent, so a wait at an unreachable API ends within about a minute of it being back · off: the wait follows its time ladder alone"
+        }
+        "harness.limit_wait" => {
+            " · at Claude Code's usage-limit dialog, chooses its Wait here row, never a spending row or Stop · off: the dialog is yours"
+        }
+        "harness.accounts" => {
+            " · at a usage limit, a Claude Code session is relaunched under the next listed account; \"early\" also moves it ahead of the limit and types /usage to sample it; \"off\" moves no session"
+        }
+        "harness.logins" => {
+            " · a Claude Code session on a login listed with an email waits when the login ends (no /login typed), you are asked to renew it, and it is relaunched on the renewed login · off types /login as before"
+        }
+        "harness.hosts" => {
+            " · read by aterm harness accounts renew --due alone · each is host or host:/abs/path/to/aterm"
+        }
+        "harness.limit_reset" => {
+            " · Claude Code only, through the usage-limit dialog's own reset row and its confirmation (keys only, no command typed) · needs resume_limits · built, off by default, and never run against a real wall"
+        }
+        "harness.usage_tap" => {
+            " · through Claude Code's own status line on the relaunch lines aterm types, for this machine's own login only; not where your own statusLine or --settings is set; it moves no session · off by default"
+        }
+        "harness.model_fallback" => {
+            " · Claude Code only, for that session alone · none: wait for the reset"
+        }
+        "harness.rate_nudge" => {
+            " · Codex near its usage limit saves the work on the cheaper model, then waits for the reset · off: the nudge is yours"
+        }
+        "harness.stall_term_after_s" => {
+            " · with stall_term on, the agent is restarted instead · 0: never"
+        }
+        "harness.stall_term" => {
+            " · restarted as aterm ctl restart does, for its relaunch, once it has stood stall_term_after_s"
+        }
+        "harness.memory_ceiling" => {
+            " · auto, off or a number of GiB · the agent is restarted only when the Mac is short of memory and it holds the most"
+        }
+        "harness.upgrade_ask" => {
+            " · asks the agent to reach a stopping point and answer READY first · off: a session moves only when it is idle"
+        }
+        "harness.human_grace_s" => {
+            " · the supervisor types nothing into that session for this long"
+        }
+        "disk.apply" => {
+            " · the consent aterm harness disk --apply <class> needs before it removes anything"
+        }
+        "disk.target_stale_days" => {
+            " · a cargo profile unbuilt this long counts as idle: its incremental cache goes first, whole (below the floor, recent ones follow, least recently used first; none built in the last 10 min, even at 0)"
+        }
+        "disk.auto_free_gib" => {
+            " · below it, cargo profiles' incremental caches are reclaimed automatically: idle ones, then least recently used first until 1 GiB above it, or until the bytes freed cover the shortfall"
+        }
+        "disk.dead_build_dirs" => {
+            " · below the floor, a whole build directory whose owner is gone goes too: an ended Claude Code session's scratch build (no running Claude Code names the session, nothing of it written for target_stale_days, at least a day) or the cells cache of a removed checkout, after the idle caches and before any live checkout's · false: only its incremental caches"
+        }
+        "render.repaint_nudge" => {
+            " · on: tell the tab its terminal is one row shorter, then the true size; log: only log what that would do; off: do nothing"
+        }
         "claude_footer.usage" => {
             " · default true: the Claude Code footer shows `Σ` — Claude's working time and the session's token totals, all models merged (`Σ 7h52m ↑395M ↓2.0M`); false hides it, and a limit wall (`⧗`) shows either way · read live"
+        }
+        "claude_footer.card" => {
+            " · default true: while the harness carries a Claude Code session (Autopilot cruise or land, its claim this window's), its launch card wears a rainbow border, a pixel-art kitty riding a rainbow with stars, and the line `✦ enhanced by aterm harness <version> · autopilot ∞ cruise` — glass only; false leaves the card bare · read live"
         }
         "keeper.enabled" => {
             " · read at launch; on, every terminal is registered with this build's PTY keeper (`aterm keeper start` runs one) and a launch after a crash or kill reattaches the shells it held · macOS only"
@@ -5312,7 +5920,7 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
             " · loaded on the host; unreadable or rejected files are skipped while built-ins remain active"
         }
         "sparkle_words.profanity.palette" => {
-            " · each color must be RRGGBB or #RRGGBB; malformed entries are skipped"
+            " · each color must be RRGGBB, #RRGGBB or #RGB; malformed entries are skipped"
         }
         "matrix_rain.hue" => " · matrix / theme / #RRGGBB; invalid values use stock matrix green",
         "net.connections.name" => " · nonempty [A-Za-z0-9_-] and unique; the first duplicate wins",
@@ -5334,17 +5942,63 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
         crate::prefs::EDIT_SCROLLBACK => " · 0 means unlimited scrollback",
         _ => "",
     };
-    format!(
-        "{} · {} · {}{}{}{}{}{}",
-        setting.label,
-        setting.key,
-        kind,
-        default,
-        range.unwrap_or_default(),
-        timing,
-        environment,
-        constraint,
-    )
+    let facts = format!(
+        "{kind}{default}{}{timing}{environment}{constraint}",
+        range.unwrap_or_default()
+    );
+    // The name leads; how the key works is its facts' detail.
+    format!("{} · {} · {facts}", setting.label, setting.key)
+}
+
+/// A key's DOCUMENTED default as a TOML literal — the value hover shows as
+/// "default …" (`10 (0: off)` is `10`, `keep going` is `"keep going"`) — or
+/// `None` where the schema holds no single literal default (a text or path with
+/// none, a table, a list). A key added at this value changes nothing. For a key
+/// with no Settings row, whose placeholder is its resolver's own default text
+/// (`default_shown`), never a description.
+pub(crate) fn config_key_default_literal(key: &str) -> Option<String> {
+    let setting = config_schema_entry(key)?;
+    let shown = setting.placeholder.trim();
+    let shown = shown.strip_suffix(" (default)").unwrap_or(shown);
+    // A text default is the whole text: `continue_text`'s is "keep going".
+    // Its example, `""`, is no stand-in: the harness refuses an empty text.
+    if setting.kind == ConfigSchemaKind::Scalar(EditKind::Text) {
+        return (!shown.is_empty()).then(|| aterm_toml::edit::Value::from(shown).to_string());
+    }
+    let token = shown.split(" (").next()?.trim();
+    match setting.kind {
+        ConfigSchemaKind::Scalar(EditKind::Bool) => {
+            matches!(token, "true" | "false").then(|| token.to_string())
+        }
+        ConfigSchemaKind::Scalar(EditKind::Integer) => {
+            token.parse::<i64>().ok().map(|value| value.to_string())
+        }
+        ConfigSchemaKind::Scalar(EditKind::Float) => {
+            let value = token
+                .parse::<f64>()
+                .ok()
+                .filter(|value| value.is_finite())?;
+            // A float key reads a float: `12` is written `12.0`.
+            Some(if token.contains(['.', 'e', 'E']) {
+                token.to_string()
+            } else {
+                format!("{value:.1}")
+            })
+        }
+        ConfigSchemaKind::Scalar(EditKind::Enum { options }) => options
+            .iter()
+            .find(|option| option.eq_ignore_ascii_case(token))
+            .map(|option| format!("\"{option}\"")),
+        _ => None,
+    }
+}
+
+/// The value completion would offer for `key` as a TOML literal (`"builtin"`,
+/// `true`, `[]`), for a key that takes one; `None` for a table or a map.
+pub(crate) fn config_key_example_literal(key: &str) -> Option<String> {
+    let setting = config_schema_entry(key)?;
+    (setting.kind.is_assignable() && !matches!(setting.kind, ConfigSchemaKind::Flexible))
+        .then(|| example_value(setting))
 }
 
 fn example_value(setting: &ConfigSchemaEntry) -> String {
@@ -5517,6 +6171,7 @@ fn build_assist_index(source: &str) -> ConfigAssistIndex {
         tables: vec![String::new()],
         authored: HashMap::new(),
         disk: Vec::new(),
+        theme_names: Vec::new(),
     };
     let mut table_ids = BTreeMap::from([(String::new(), 0_u32)]);
     let mut table = 0_u32;
@@ -5884,8 +6539,9 @@ fn one_line(message: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     /// A SHADOWED ROW IS A LOST ROW. `config_schema()` drops a MANUAL_SCHEMA entry whose
     /// key it already holds, silently — so upstream's second `machine` row, the one
@@ -5974,15 +6630,23 @@ mod tests {
     /// rung and only a user would have noticed the ordering change.
     #[test]
     fn candidate_match_score_ranks_each_rung() {
-        // 0 exact prefix, 1 word prefix, 2 substring, 3 short subsequence, None.
+        // 0 exact prefix, 1 word prefix, 2 substring, 3 short acronym, None.
         assert_eq!(candidate_match_score("cursor_trail", "cur"), Some(0));
         assert_eq!(candidate_match_score("enable_cursor_trail", "cur"), Some(1));
         assert_eq!(candidate_match_score("thecursorthing", "cur"), Some(2));
         assert_eq!(candidate_match_score("colour_under_rail", "cur"), Some(3));
+        assert_eq!(candidate_match_score("line height", "lh"), Some(3));
         assert_eq!(candidate_match_score("nothing_here", "cur"), None);
-        // The subsequence rung is capped at 3 chars: a long fuzzy match is mostly
-        // accidental, so it must NOT rank rather than rank last.
-        assert_eq!(candidate_match_score("colour_under_railing", "curl"), None);
+        // The acronym rung takes word starts only: letters scattered through
+        // words are an accident, not a match ("cat" in "clear tab").
+        assert_eq!(candidate_match_score("clear_tab", "cat"), None);
+        assert_eq!(candidate_match_score("color and theme", "cat"), Some(3));
+        // It is capped at 3 chars: a long acronym is mostly accidental, so it
+        // must NOT rank rather than rank last.
+        assert_eq!(
+            candidate_match_score("colour_under_rail_link", "curl"),
+            None
+        );
         // Lower wins, so a caller's `min` over a candidate set picks the best rung.
         assert!(candidate_match_score("cursor", "cur") < candidate_match_score("my_cursor", "cur"));
         // The word rung reads bytes; it is the character split it replaced, on
@@ -6027,39 +6691,63 @@ mod tests {
         }
     }
 
-    /// The precondition that lets Settings global search and the schema authority
-    /// share ONE ladder: on already-lowercase input, the ladder's ASCII-case-folding
-    /// subsequence rung is indistinguishable from an exact comparison. Settings used
-    /// to carry its own case-SENSITIVE `is_subsequence`; sharing was only sound
-    /// because every candidate on both sides is lowercase. Pin that equivalence, so
-    /// if anyone ever feeds mixed case the difference surfaces here.
+    /// THE TIE BETWEEN A ROW'S NAME AND A SYNONYM: on the same rung a hit on
+    /// a row's own names (label, key, own name) ranks before one only a
+    /// listed keyword reached; a better rung still wins whichever reached it.
     #[test]
-    fn subsequence_rung_agrees_with_exact_comparison_on_lowercase_input() {
-        fn case_sensitive_subsequence(needle: &str, haystack: &str) -> bool {
-            let mut needle = needle.chars();
-            let mut wanted = needle.next();
-            for character in haystack.chars() {
-                if Some(character) == wanted {
-                    wanted = needle.next();
-                    if wanted.is_none() {
-                        return true;
-                    }
-                }
-            }
-            wanted.is_none()
-        }
-        for entry in config_schema() {
-            for candidate in std::iter::once(entry.key).chain(entry.keywords.iter().copied()) {
-                for query in ["cur", "ab", "z", "trl"] {
-                    assert_eq!(
-                        is_subsequence(query, candidate),
-                        case_sensitive_subsequence(query, candidate),
-                        "case-folding and exact subsequence disagree on \
-                         lowercase candidate {candidate:?} for {query:?}"
-                    );
-                }
-            }
-        }
+    fn an_own_name_hit_ranks_before_a_synonym_hit_on_the_same_rung() {
+        let rank = |own: &[&str], synonyms: &[&str], query: &str| {
+            query_match_rank(own.iter().copied(), synonyms.iter().copied(), query)
+        };
+        let named = rank(&["supervise codex sessions", "codex"], &["agent"], "codex");
+        let listed = rank(
+            &["keep alab tools up to date"],
+            &["codex", "claude"],
+            "codex",
+        );
+        assert_eq!(named, Some(SearchRank::own(0)));
+        assert_eq!(listed, Some(SearchRank::synonym(0)));
+        assert!(named < listed);
+        // A rung beats the tie: a synonym's exact prefix before a name's
+        // word start.
+        assert!(
+            rank(&["x"], &["codex"], "codex") < rank(&["supervise codex sessions"], &[], "codex")
+        );
+        // A query that needs a synonym for one of its words is a synonym hit.
+        assert_eq!(
+            rank(&["dark sky"], &["mode"], "dark mode"),
+            Some(SearchRank::synonym(0))
+        );
+        assert_eq!(rank(&["dark sky"], &["mode"], "sun"), None);
+    }
+
+    /// A query of several words ranks as its phrase or as every word matching
+    /// somewhere in the set; filler words need not match, and a word finds its
+    /// other number.
+    #[test]
+    fn query_match_score_takes_every_word() {
+        let set = ["window appearance", "window_theme", "dark", "light", "mode"];
+        let score = |query: &str| query_match_score(set.iter().copied(), query);
+        assert_eq!(score("dark mode"), Some(0));
+        assert_eq!(score("mode dark"), Some(0), "word order does not matter");
+        assert_eq!(score("dark sky"), None, "every word must match");
+        assert_eq!(score("the dark mode"), Some(0), "filler words need not");
+        assert_eq!(score("appearance of the window"), Some(1));
+        // The worst word ranks the set.
+        assert_eq!(score("dark ppear"), Some(2));
+        // A phrase that matches whole ranks by itself.
+        assert_eq!(score("window app"), Some(0));
+        let kitties = ["keyword kitties", "sparkle_words.feline.enabled"];
+        assert_eq!(query_match_score(kitties.iter().copied(), "kitty"), Some(1));
+        let titles = ["smart title"];
+        assert_eq!(query_match_score(titles.iter().copied(), "titles"), Some(1));
+        // The other number must start a word: never an acronym, never the
+        // inside of a word.
+        assert_eq!(
+            query_match_score(["copy and trim"].into_iter(), "cats"),
+            None
+        );
+        assert_eq!(query_match_score(["user"].into_iter(), "series"), None);
     }
 
     fn highlighted<'a>(
@@ -6280,30 +6968,31 @@ mod tests {
     }
 
     #[test]
-    fn color_assistance_names_the_exact_runtime_six_digit_domain() {
-        for source in ["foreground = \"#12abEF\"\n", "foreground = \"12abEF\"\n"] {
+    fn color_assistance_names_the_exact_runtime_hex_domain() {
+        // The runtime reader is `aterm_types::scheme::parse_hex`: six digits or
+        // three, the `#` optional.
+        for source in [
+            "foreground = \"#12abEF\"\n",
+            "foreground = \"12abEF\"\n",
+            "foreground = \"#abc\"\n",
+        ] {
             let analysis = analyze(source);
             assert!(
                 !analysis.has_errors(),
-                "runtime-valid six-digit color must be accepted: {:?}",
+                "a runtime-valid color must be accepted: {:?}",
                 analysis.diagnostics
             );
         }
 
-        let short = analyze("foreground = \"#abc\"\n");
+        let four = analyze("foreground = \"#abcd\"\n");
+        assert!(four.has_errors(), "four digits are not a runtime spelling");
         assert!(
-            short.has_errors(),
-            "three-digit colors are not a runtime spelling"
-        );
-        assert!(
-            short
-                .first_error()
-                .is_some_and(|diagnostic| diagnostic.message.contains("RRGGBB or #RRGGBB"))
+            four.first_error()
+                .is_some_and(|diagnostic| diagnostic.message.contains("#RRGGBB or #RGB"))
         );
         let foreground = config_schema_entry(crate::prefs::EDIT_FOREGROUND).unwrap();
         let help = setting_help(foreground);
-        assert!(help.contains("RRGGBB or #RRGGBB"), "{help}");
-        assert!(!help.contains("#RGB or"), "{help}");
+        assert!(help.contains("#RRGGBB or #RGB"), "{help}");
     }
 
     #[test]
@@ -6429,7 +7118,13 @@ intensity = 0.25
         ];
         assert_eq!(analysis.diagnostics.len(), expected.len());
         for (key, message) in expected {
-            assert!(crate::prefs::manual_only_key(key));
+            assert!(
+                crate::prefs::editable_fields(&crate::app_config::Config::default())
+                    .iter()
+                    .all(|field| field.key != key),
+                "{key} is no Settings row"
+            );
+            assert!(config_schema_entry(key).is_some(), "Manual types {key}");
             assert!(is_compatibility_only_key(key));
             assert_eq!(
                 retired_config_key(key).map(|entry| entry.effect_label),
@@ -6506,7 +7201,7 @@ intensity = 0.25
     /// nothing is restated, so a field added to any table reaches
     /// [`reader_paths`] the moment it compiles. `None`: not a derived table (a
     /// scalar, a list, a map, or a table with its own `Deserialize`).
-    fn reader_fields<T: serde::de::DeserializeOwned>(
+    pub(crate) fn reader_fields<T: serde::de::DeserializeOwned>(
         path: &[&'static str],
     ) -> Option<&'static [&'static str]> {
         struct Reader<'p> {
@@ -6690,18 +7385,6 @@ intensity = 0.25
     /// ([`reader_paths`]) — with no table excluded.
     #[test]
     fn every_key_the_config_reader_accepts_is_known_to_manual() {
-        // Every key the Settings pages defer — the two tables included — is one
-        // an operator writes by hand, so each has a schema entry of its own.
-        let deferred: Vec<&str> = crate::prefs::DEFERRED_CONFIG_KEYS
-            .iter()
-            .map(|&(key, _)| key)
-            .filter(|key| config_schema_entry(key).is_none())
-            .collect();
-        assert!(
-            deferred.is_empty(),
-            "deferred keys Manual would call unknown: {deferred:?}"
-        );
-
         let paths = reader_paths::<crate::app_config::Config>();
         let unknown: Vec<&str> = paths
             .iter()
@@ -6870,6 +7553,45 @@ intensity = 0.25
                     "scene_panels = [\"meadow\", \"cosmos\"]\n",
                 ),
                 completion_prefix: "scene_",
+            },
+            // Smart Titles left with `title_summary` (2026-10-15). The starter
+            // config taught every one of these, and two held closed enums: the
+            // authored values below must load, not fail the whole file.
+            Family {
+                feature: "Smart Titles",
+                keys: &[
+                    "descriptive_titles",
+                    "title_summary_provider",
+                    "title_summary_model",
+                    "title_summary_endpoint",
+                    "title_summary_token_file",
+                    "title_summary_timeout_seconds",
+                    "title_summary_proxy_mode",
+                    "title_summary_ca_file",
+                    "title_summary_interval_seconds",
+                    "title_summary_context_lines",
+                    "title_summary_include_output",
+                    "title_summary_allow_remote",
+                    "tab_title_format",
+                    "window_title_format",
+                ],
+                source: concat!(
+                    "descriptive_titles = true\n",
+                    "title_summary_provider = \"ollama\"\n",
+                    "title_summary_model = \"qwen3.5:4b-q4_K_M\"\n",
+                    "title_summary_endpoint = \"http://127.0.0.1:11434/api/chat\"\n",
+                    "title_summary_token_file = \"/tmp/aterm-summary-token\"\n",
+                    "title_summary_timeout_seconds = 20\n",
+                    "title_summary_proxy_mode = \"environment\"\n",
+                    "title_summary_ca_file = \"/tmp/private-model-ca.pem\"\n",
+                    "title_summary_interval_seconds = 15\n",
+                    "title_summary_context_lines = 24\n",
+                    "title_summary_include_output = true\n",
+                    "title_summary_allow_remote = false\n",
+                    "tab_title_format = \"description\"\n",
+                    "window_title_format = \"title-description\"\n",
+                ),
+                completion_prefix: "title_",
             },
         ];
         let active_fields = crate::prefs::editable_fields(&crate::app_config::Config::default());
@@ -7332,19 +8054,14 @@ home = "~/aterm"
             "predictive_echo",
             "sparkle_words.feline.style",
             "sparkle_words.profanity.style",
-            "tab_title_format",
             "text_blending",
-            "title_summary_provider",
-            "title_summary_proxy_mode",
             "trail_sound_style",
             "window_colorspace",
             "window_theme",
-            "window_title_format",
-            // Manual-only (off `prefs::editable_fields` — see the
-            // DEFERRED_CONFIG_KEYS rationale), but real enums an operator types
-            // into aterm.toml, so they get the same domain coverage as the
-            // rest. Calling any of them "unknown to this aterm build" was the
-            // audit-2 item-9 false diagnostic.
+            // Manual-only (off `prefs::editable_fields`), but real enums an
+            // operator types into aterm.toml, so they get the same domain
+            // coverage as the rest. Calling any of them "unknown to this aterm
+            // build" was the audit-2 item-9 false diagnostic.
             "windowing_behavior",
             "font_hinting",
             "font_subpixel",
@@ -7366,6 +8083,15 @@ home = "~/aterm"
             // `[harness] accounts` (`aterm_agent::harness::accounts::Mode`):
             // "early" | "wall" | "off", the account rotation's switch.
             "harness.accounts",
+            // `[harness] autopilot` (2026-10-15): "cruise" | "land" | "off",
+            // the default Autopilot (`aterm_agent::supervise::Autopilot`).
+            "harness.autopilot",
+            // `[harness] logins`: "renew" | "off", the login lifecycle's
+            // switch (accounts v2 S7).
+            "harness.logins",
+            // `[ai] preferred`: every AI CLI connection's id
+            // (`aterm_agent::ai::connector::IDS`), this machine's main AI CLI.
+            "ai.preferred",
         ]);
         assert_eq!(actual, expected, "new enum needs language-domain coverage");
 
@@ -7415,6 +8141,12 @@ home = "~/aterm"
             // parse`, `TabMenuChord::parse`): accepted, never offered.
             ("right_click", RIGHT_CLICK_ALIASES),
             ("tab_menu_chord", TAB_MENU_CHORD_ALIASES),
+            // The owner's words, which the supervisor's reader takes without
+            // a note (`Autopilot::parse`).
+            (
+                crate::prefs::EDIT_HARNESS_AUTOPILOT,
+                HARNESS_AUTOPILOT_ALIASES,
+            ),
         ] {
             for alias in aliases {
                 let source = source_for(key, alias);
@@ -7573,6 +8305,26 @@ home = "~/aterm"
                 "cursor_style = \"underline\" is retired and renders as \"bar\"; use \"bar\" explicitly"
             ]
         );
+    }
+
+    /// TF.2b: `font_hinting = "native"` loads, renders as `light`, is told so
+    /// as a warning (never "not accepted", never an error), and is no longer
+    /// offered; an unretired spelling still errors.
+    #[test]
+    fn retired_native_hinting_renders_as_light_and_is_never_offered() {
+        assert!(!FONT_HINTINGS.contains(&"native"));
+        let analysis = analyze("font_hinting = \"native\"\n");
+        assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
+        let warnings = analysis
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.severity == ConfigDiagnosticSeverity::Warning)
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("\"light\""), "{warnings:?}");
+        assert!(unaccepted_enum_values("font_hinting = \"native\"\n").is_empty());
+        assert!(analyze("font_hinting = \"bytecode\"\n").has_errors());
     }
 
     #[test]
@@ -8179,11 +8931,11 @@ cursor_glow_sdr_boost = 0.4\n";
         let help_for = |key: &str| setting_help(config_schema_entry(key).unwrap());
         let opacity_help = help_for(crate::prefs::EDIT_BACKGROUND_OPACITY);
         assert!(
-            opacity_help.contains("macOS GPU window path only"),
+            opacity_help.contains("macOS GPU rendering only"),
             "{opacity_help}"
         );
         assert!(
-            opacity_help.contains("non-macOS GPU grids stay solid"),
+            opacity_help.contains("text keeps 4.5:1 contrast"),
             "{opacity_help}"
         );
         let material_help = help_for(crate::prefs::EDIT_BACKGROUND_MATERIAL);
@@ -8874,7 +9626,7 @@ fps = 999
             .iter()
             .find(|candidate| candidate.insertion.starts_with("window_theme ="))
             .expect("window-theme completion");
-        assert!(window.help.contains("System appearance"));
+        assert!(window.help.contains("Window appearance"));
         assert!(window.help.contains("auto / light / dark"));
 
         let nested_source = "[sparkle_words]\nena";
@@ -8906,6 +9658,40 @@ fps = 999
                 .iter()
                 .any(|candidate| { candidate.insertion == format!("\"{later_theme}\"") })
         );
+    }
+
+    /// SEL-11: completion offers the theme files the host's catalog loaded
+    /// (as Settings does) and the split form, and only after the host lane
+    /// handed the catalog over (negative control).
+    #[test]
+    fn theme_completion_offers_catalog_themes_and_the_split_form() {
+        let source = "theme = \"";
+        let mut catalog_less = analyze(source);
+        let offered = |analysis: &ConfigAnalysis| {
+            assist_with_analysis(source, source.len(), analysis)
+                .completions
+                .into_iter()
+                .map(|completion| completion.insertion)
+                .collect::<Vec<_>>()
+        };
+        let before = offered(&catalog_less);
+        assert!(!before.iter().any(|insertion| insertion == "\"harbour\""));
+        assert!(
+            before.contains(&"\"dark:Default,light:Default Light\"".to_string()),
+            "{before:?}"
+        );
+        let themes = crate::app_config::ThemeCatalog::from_schemes([(
+            "harbour".to_string(),
+            aterm_types::scheme::builtin("Nord").unwrap(),
+        )]);
+        catalog_less.adopt_theme_names(&themes);
+        let typed = "theme = \"har";
+        let after = assist_with_analysis(typed, typed.len(), &catalog_less)
+            .completions
+            .into_iter()
+            .map(|completion| completion.insertion)
+            .collect::<Vec<_>>();
+        assert_eq!(after, ["\"harbour\""]);
     }
 
     #[test]
@@ -9917,12 +10703,82 @@ sty"#;
         assert_eq!(all.len(), 2, "{all:?}");
     }
 
+    /// EVERY `[ai]` KEY (docs/DESIGN-ai-connections-2026-10-16.md §6.1) is the
+    /// config language's AND the AI layer's reader's: a file that writes each
+    /// one is read with no note by `aterm_agent::ai::config::read` and draws
+    /// no ignored-key notice here. The Settings rows (`enabled`, `preferred`,
+    /// each CLI's `use`) are registered once, in `prefs::NESTED_LEAVES`; the
+    /// grant (`reviewers`) and the fleet keys (`machine`, `fleet`) are Manual
+    /// rows only, never a registry row `settings set` could drive. NEGATIVE
+    /// CONTROLS: a misspelled key and a CLI this build does not know are
+    /// noticed by both.
+    #[test]
+    fn every_ai_key_is_known_to_the_config_language() {
+        let mut text = String::from(
+            "[ai]\nenabled = true\npreferred = \"codex\"\nreviewers = [\"codex\"]\n\
+             review_count = 2\nreview_timeout_s = 120\nmachine = \"m7\"\n\
+             fleet = \"/dotfiles/ai-fleet.toml\"\n",
+        );
+        for id in aterm_agent::ai::connector::ids() {
+            text.push_str(&format!("[ai.{id}]\nuse = false\n"));
+        }
+        let (_, notes) = aterm_agent::ai::config::read(&text);
+        assert!(notes.is_empty(), "the AI reader: {notes:?}");
+        assert!(
+            ignored_key_warnings(&text).is_empty(),
+            "{:?}",
+            ignored_key_warnings(&text)
+        );
+        for key in ["ai.reviewers", "ai.machine", "ai.fleet"] {
+            assert!(
+                crate::prefs::nested_leaf(key).is_none(),
+                "{key} has no Settings row"
+            );
+            assert!(
+                MANUAL_SCHEMA.iter().any(|e| e.key == key),
+                "{key} is a Manual row"
+            );
+        }
+        let mut rows = vec![
+            crate::prefs::EDIT_AI_ENABLED.to_string(),
+            crate::prefs::EDIT_AI_PREFERRED.to_string(),
+        ];
+        rows.extend(
+            aterm_agent::ai::connector::ids()
+                .into_iter()
+                .map(|id| format!("ai.{id}.use")),
+        );
+        for key in &rows {
+            assert!(
+                crate::prefs::nested_leaf(key).is_some()
+                    && !MANUAL_SCHEMA.iter().any(|e| e.key == key.as_str()),
+                "{key} is a Settings row: one registration, in NESTED_LEAVES"
+            );
+            assert!(
+                config_schema().iter().any(|e| e.key == key.as_str()),
+                "{key} is not served by config_schema()"
+            );
+        }
+        for wrong in [
+            "[ai]\nreviewer = [\"codex\"]\n",
+            "[ai.nonesuch]\nuse = true\n",
+        ] {
+            assert!(
+                !aterm_agent::ai::config::read(wrong).1.is_empty(),
+                "{wrong}"
+            );
+            assert!(!ignored_key_warnings(wrong).is_empty(), "{wrong}");
+        }
+    }
+
     /// The supervisor's `[harness]` keys (`aterm_agent::supervise::config::
     /// KEYS`) are the config language's: each is completed, and a misspelled
     /// one is an ignored-key notice — never dropped in silence. `enabled`,
-    /// `approve`, `answer_questions` and `question_priority` are Settings
-    /// rows (`prefs::EDIT_HARNESS_ENABLED`, `prefs::EDIT_HARNESS_APPROVE`,
-    /// `prefs::EDIT_HARNESS_ANSWER_QUESTIONS`,
+    /// `autopilot`, `approve`, `answer_questions` and `question_priority` are
+    /// Settings rows (`prefs::EDIT_HARNESS_ENABLED`,
+    /// `prefs::EDIT_HARNESS_AUTOPILOT` — an Enum of the supervisor's own
+    /// three modes, so Manual completes exactly those —
+    /// `prefs::EDIT_HARNESS_APPROVE`, `prefs::EDIT_HARNESS_ANSWER_QUESTIONS`,
     /// `prefs::EDIT_HARNESS_QUESTION_PRIORITY` — an Enum of the supervisor's
     /// own priority words, so Manual completes exactly those), registered once through
     /// `prefs::NESTED_LEAVES` and never ALSO in `MANUAL_SCHEMA`, where the
@@ -9931,6 +10787,7 @@ sty"#;
     fn every_supervisor_key_is_known_to_the_config_language() {
         let rows = [
             crate::prefs::EDIT_HARNESS_ENABLED,
+            crate::prefs::EDIT_HARNESS_AUTOPILOT,
             crate::prefs::EDIT_HARNESS_APPROVE,
             crate::prefs::EDIT_HARNESS_ANSWER_QUESTIONS,
             crate::prefs::EDIT_HARNESS_QUESTION_PRIORITY,
@@ -9977,11 +10834,63 @@ sty"#;
             "an Enum of the supervisor's own words, so Manual completes exactly those"
         );
         assert!(priority.native_scalar, "a Settings row, not Manual-only");
+        let autopilot = config_schema()
+            .iter()
+            .find(|e| e.key == crate::prefs::EDIT_HARNESS_AUTOPILOT)
+            .expect("the default Autopilot is a schema key");
+        assert_eq!(
+            autopilot.kind,
+            ConfigSchemaKind::Scalar(EditKind::Enum {
+                options: &crate::prefs::HARNESS_AUTOPILOT_WORDS
+            }),
+            "an Enum of the supervisor's own three modes"
+        );
+        assert!(autopilot.native_scalar, "a Settings row, not Manual-only");
+        // Every alias Manual accepts the reader takes as a mode, saying
+        // nothing — and an off spelling it says, Manual says too.
+        for alias in HARNESS_AUTOPILOT_ALIASES {
+            let (cfg, notes) = aterm_agent::supervise::SupervisorConfig::from_aterm_toml(&format!(
+                "[harness]\nautopilot = {alias:?}\n"
+            ));
+            assert!(notes.is_empty(), "{alias}: {notes:?}");
+            assert_eq!(
+                Some(cfg.autopilot),
+                aterm_agent::supervise::Autopilot::parse(alias),
+                "{alias}"
+            );
+        }
+        assert!(
+            analyze("[harness]\nautopilot = \"none\"\n").has_errors(),
+            "the reader notes an off spelling; Manual flags it"
+        );
         let good = "[harness]\nenabled = true\napprove = \"safe\"\ncontinue = false\n\
-                    continue_per_hour = 3\ntrust_roots = [\"~/aterm*\", \"/private/tmp/claude-*\"]\n\
+                    continue_per_hour = 3\ntrust_roots = [\"~/src/app*\", \"/srv/work\"]\n\
                     model_fallback = \"opus\"\naccounts = \"wall\"\n";
         let warned = key_warnings(good);
         assert!(warned.ignored.is_empty(), "{:?}", warned.ignored);
+        // Each agent's own table is the config language's too: its switch is
+        // known and told nothing of; any other key there is an ignored key, as
+        // the reader takes only `enabled` per agent.
+        let agents = "[harness.claude]\nenabled = true\n[harness.codex]\nenabled = false\n";
+        assert!(
+            key_warnings(agents).ignored.is_empty(),
+            "{:?}",
+            key_warnings(agents).ignored
+        );
+        assert!(
+            analyze(agents).diagnostics.is_empty(),
+            "{:?}",
+            analyze(agents).diagnostics
+        );
+        let stray = "[harness.codex]\napprove = \"safe\"\n";
+        assert!(
+            key_warnings(stray)
+                .ignored
+                .iter()
+                .any(|line| line.contains("harness.codex.approve")),
+            "{:?}",
+            key_warnings(stray).ignored
+        );
         // Every key the supervisor reads is applied: no label says otherwise.
         for e in MANUAL_SCHEMA
             .iter()
@@ -10013,7 +10922,20 @@ sty"#;
         }
         let help = |key: &str| setting_help(config_schema().iter().find(|e| e.key == key).unwrap());
         assert!(help("harness.continue").contains("default true"));
+        // `trust_roots` names no folder by default, and its help says how to
+        // name one's own.
+        let roots = help("harness.trust_roots");
+        assert!(roots.ends_with(" \u{b7} default []"), "{roots}");
+        assert!(
+            roots.contains("approve = \"safe\"") && roots.contains("none by default"),
+            "{roots}"
+        );
         assert!(help("harness.approve").contains("default all"));
+        assert!(
+            help("harness.autopilot").contains(" \u{b7} default cruise"),
+            "{}",
+            help("harness.autopilot")
+        );
         assert!(help("harness.continue_per_hour").contains("default 0 (no cap)"));
         // `[harness] accounts`: its three words are the completion's, and
         // its default is the reader's own.
@@ -10076,6 +10998,25 @@ sty"#;
             typo.ignored.iter().any(|l| l.contains("limit_resets")),
             "{:?}",
             typo.ignored
+        );
+        // `[harness] usage_tap`: a switch shown off by default, whose help
+        // says it is off by default and moves no session; a file that writes
+        // it is not told the key is unknown.
+        let tap = config_schema()
+            .iter()
+            .find(|e| e.key == "harness.usage_tap")
+            .expect("the usage tap is a schema key");
+        assert_eq!(tap.kind, ConfigSchemaKind::Scalar(EditKind::Bool));
+        assert!(!aterm_agent::supervise::SupervisorConfig::default().usage_tap);
+        let said = help("harness.usage_tap");
+        assert!(said.contains(" \u{b7} default false"), "{said}");
+        for word in ["off by default", "moves no session", "own statusline"] {
+            assert!(said.to_lowercase().contains(word), "{word:?}: {said}");
+        }
+        assert!(
+            key_warnings("[harness]\nusage_tap = true\n")
+                .ignored
+                .is_empty()
         );
         // NEGATIVE CONTROL: a word outside the three is reported, not saved.
         let bad = analyze("[harness]\naccounts = \"sometimes\"\n");

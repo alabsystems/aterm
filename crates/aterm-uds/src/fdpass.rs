@@ -18,18 +18,14 @@
 //! * `FD_CLOEXEC` is clear on arrival and Darwin has no `MSG_CMSG_CLOEXEC`, so
 //!   [`recv_with_fds`] sets it on each descriptor as soon as it owns it, before
 //!   any other validation.
-//! * `MSG_CTRUNC` leaks: the kernel installs every descriptor sent, then
-//!   truncates the message naming them. Truncation is therefore fatal, every
-//!   parsed descriptor is closed on that path, and the parse clamps to the
-//!   control buffer actually supplied rather than the carried `cmsg_len`.
-//!
-//! For the same reason the receive budgets control space for [`CONTROL_FDS`]
-//! descriptors (twice [`MAX_FDS`]) regardless of the caller's `max_fds`, so an
-//! over-send is a visible over-count to close and refuse; `max_fds` is
-//! enforced in user space afterwards.
-//!
-//! Every parsed descriptor becomes an [`OwnedDescriptor`] before the next
-//! fallible step, so every error return closes what it parsed by dropping it.
+//! * `MSG_CTRUNC` leaks: the kernel installs every descriptor sent, then truncates the
+//!   message naming them. Truncation is fatal, every parsed descriptor is closed on that path,
+//!   and the parse clamps to the control buffer supplied rather than the carried `cmsg_len`.
+//!   So the receive budgets control space for [`CONTROL_FDS`] descriptors (twice
+//!   [`MAX_FDS`]) whatever the caller's `max_fds`: an over-send is a visible over-count to
+//!   close and refuse.
+//! * Every parsed descriptor becomes an [`OwnedDescriptor`] before the next fallible step,
+//!   so every error return closes what it parsed by dropping it.
 //!
 //! Platforms: Darwin, and Linux on x86-64/aarch64 (the two ABIs mirrored
 //! below). Other targets, including Windows (afunix carries no ancillary
@@ -47,10 +43,8 @@ use crate::CtlStream;
 /// them across messages.
 pub const MAX_FDS: usize = 64;
 
-/// Descriptor slots the receive budgets control space for, whatever `max_fds`
-/// the caller declares: twice [`MAX_FDS`], so a peer's over-send is visible and
-/// closable rather than a `MSG_CTRUNC` leak (see the module docs). Gated as
-/// `scm` is, its one reader.
+/// Descriptor slots the receive budgets control space for, whatever the caller's `max_fds`
+/// (see the module docs). Gated like `scm`, its one reader.
 #[cfg(any(
     target_vendor = "apple",
     all(
@@ -116,12 +110,9 @@ pub fn send_with_fds(
     scm::send_with_fds(stream, payload, fds)
 }
 
-/// Receive one message from `stream` into `buf`, accepting at most `max_fds`
-/// descriptors with it.
-///
-/// `max_fds` is the declared maximum, not the receive budget: the budget is
-/// always [`CONTROL_FDS`], so an over-send is a closable over-count rather
-/// than a kernel-side leak. Every returned descriptor is already `FD_CLOEXEC`.
+/// Receive one message from `stream` into `buf`, accepting at most `max_fds` descriptors with
+/// it (checked after the receive, whose budget is always [`CONTROL_FDS`]). Every returned
+/// descriptor is already `FD_CLOEXEC`.
 ///
 /// Size `buf` for the whole message. A short `buf` leaves the remaining bytes
 /// queued, but all of the message's descriptors arrive on this call.
@@ -140,25 +131,22 @@ pub fn recv_with_fds(stream: &CtlStream, buf: &mut [u8], max_fds: usize) -> io::
     scm::recv_with_fds(stream, buf, max_fds)
 }
 
-/// The connected peer's pid as the kernel names it: `LOCAL_PEERPID` on Darwin,
-/// `SO_PEERCRED` on Linux, `SIO_AF_UNIX_GETPEERPID` on Windows.
+/// The connected peer's pid as the kernel names it: `LOCAL_PEERPID` on Darwin, `SO_PEERCRED`
+/// on Linux, `SIO_AF_UNIX_GETPEERPID` on Windows.
 ///
-/// A peer cannot assert this for itself. Paired with a published birth record
-/// (which shows the pid was not recycled), it attests who dialed — on Linux,
-/// where `SO_PEERCRED` is fixed at `connect(2)`/`socketpair(2)`. On Darwin it
-/// is the process that last USED the connection, read live (measured
-/// 2026-10-03: `peer`'s `the_peer_is_the_connections_last_user_read_live`), so
-/// another process holding the same connection moves it by writing on it.
+/// A peer cannot assert this for itself. Paired with a published birth record (which shows
+/// the pid was not recycled) it attests who dialed on Linux, where `SO_PEERCRED` is fixed at
+/// `connect(2)`/`socketpair(2)`. On Darwin it is the process that last used the connection,
+/// read live (`peer`'s `the_peer_is_the_connections_last_user_read_live`), so another holder
+/// of the connection moves it by writing on it.
 ///
 /// # Errors
-/// * Anything `getsockopt(2)` reports, notably `ENOTCONN` on a socket that is
-///   not connected.
+/// * Anything `getsockopt(2)` reports, notably `ENOTCONN`.
 /// * `InvalidData`: the kernel answered a pid of zero or below.
-/// * On Windows, whatever the ioctl reports; the control channel then keeps
-///   its directory-ACL and token posture.
-/// * `Unsupported`: a Unix this file does not vouch for (`SO_PEERCRED` and
-///   `SOL_SOCKET` are renumbered on some architectures, so it refuses to
-///   guess).
+/// * On Windows, whatever the ioctl reports; the control channel then keeps its
+///   directory-ACL and token posture.
+/// * `Unsupported`: a Unix this file does not vouch for (`SO_PEERCRED` and `SOL_SOCKET` are
+///   renumbered on some architectures).
 pub fn peer_pid(stream: &CtlStream) -> io::Result<u32> {
     scm::peer_pid(stream)
 }
@@ -294,9 +282,8 @@ mod scm {
         pub fn peer_pid(fd: RawFd) -> io::Result<u32> {
             let mut pid: i32 = 0;
             let mut len: u32 = 4;
-            // SAFETY: `pid`/`len` are live locals for the duration of the
-            // call; `len` states the exact size of the `pid_t` the kernel is
-            // asked to write, and is re-read below rather than assumed.
+            // SAFETY: `pid`/`len` are live locals for the call; `len` states the exact size
+            // of the `pid_t` the kernel writes, and is re-read below.
             let rc = unsafe {
                 super::getsockopt(
                     fd,
@@ -313,16 +300,15 @@ mod scm {
         }
     }
 
-    /// Linux's `bits/socket.h` on x86-64/aarch64: `msg_iovlen`/
-    /// `msg_controllen` are `size_t`, `msg_namelen` is `socklen_t`. musl
-    /// declares the first two as `int` plus padding, which matches only on a
-    /// 64-bit little-endian target, hence the narrow `cfg` on this module.
+    /// Linux's `bits/socket.h` on x86-64/aarch64, item for item as the Darwin `abi`:
+    /// `msg_iovlen`/`msg_controllen` are `size_t`, `msg_namelen` is `socklen_t`. musl declares
+    /// the first two as `int` plus padding, which matches only on a 64-bit little-endian
+    /// target, hence the narrow `cfg` on this module.
     #[cfg(not(target_vendor = "apple"))]
     mod abi {
         use std::io;
         use std::os::fd::RawFd;
 
-        /// `struct msghdr`.
         #[repr(C)]
         pub struct MsgHdr {
             msg_name: *mut core::ffi::c_void,
@@ -343,9 +329,7 @@ mod scm {
             cmsg_type: i32,
         }
 
-        /// Byte offsets of `cmsg_level` / `cmsg_type` inside [`CmsgHdr`].
         pub const LEVEL_OFFSET: usize = 8;
-        /// See [`LEVEL_OFFSET`].
         pub const TYPE_OFFSET: usize = 12;
 
         /// `CMSG_ALIGN` rounds to `sizeof(size_t)` here (8, against Darwin's
@@ -376,8 +360,6 @@ mod scm {
                 msg_namelen: 0,
                 msg_iov: iov,
                 msg_iovlen: iov_len,
-                // A NULL control pointer is the documented "no ancillary
-                // data" spelling; a non-null pointer with length 0 is not.
                 msg_control: if control_len == 0 {
                     core::ptr::null_mut()
                 } else {
@@ -388,25 +370,19 @@ mod scm {
             }
         }
 
-        /// Control bytes the kernel actually wrote (not what was offered).
         pub fn control_len(msg: &MsgHdr) -> usize {
             msg.msg_controllen
         }
 
-        /// Flags the kernel set on the received message (`MSG_CTRUNC`).
         pub fn msg_flags(msg: &MsgHdr) -> i32 {
             msg.msg_flags
         }
 
-        /// Read a `cmsg_len` out of the front of `bytes`, or `None` when the
-        /// buffer cannot even hold the field.
         pub fn read_cmsg_len(bytes: &[u8]) -> Option<usize> {
             let raw: [u8; 8] = bytes.get(..8)?.try_into().ok()?;
             Some(usize::from_ne_bytes(raw))
         }
 
-        /// Write a `cmsg_len` at the front of `bytes` (a no-op on a buffer too
-        /// short to hold one — callers always pass the whole control buffer).
         pub fn write_cmsg_len(bytes: &mut [u8], value: usize) {
             if let Some(slot) = bytes.get_mut(..8) {
                 slot.copy_from_slice(&value.to_ne_bytes());
@@ -419,10 +395,8 @@ mod scm {
         pub fn peer_pid(fd: RawFd) -> io::Result<u32> {
             let mut cred = [0i32; 3];
             let mut len: u32 = UCRED_LEN as u32;
-            // SAFETY: `cred`/`len` are live locals for the duration of the
-            // call; `len` states the exact size of the `struct ucred` the
-            // kernel is asked to write, and is re-read below rather than
-            // assumed.
+            // SAFETY: `cred`/`len` are live locals for the call; `len` states the exact size
+            // of the `struct ucred` the kernel writes, and is re-read below.
             let rc = unsafe {
                 super::getsockopt(
                     fd,
@@ -560,9 +534,8 @@ mod scm {
     }
 
     /// Receive one message and its descriptors. See [`super::recv_with_fds`].
-    // Skip: bottoms out at the `recvmsg(2)`/`fcntl(2)` FFI calls (unverifiable
-    // C bodies). The cmsg walk it depends on is `scan_control`, which is pure
-    // and stays in scope for the verifier and the unit tests below.
+    // Skip: bottoms out at the `recvmsg(2)`/`fcntl(2)` FFI calls. The cmsg walk,
+    // `scan_control`, is pure and stays in scope for the verifier.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn recv_with_fds(
         stream: &CtlStream,
@@ -696,17 +669,13 @@ mod scm {
         truncated: bool,
     }
 
-    /// Walk `control` (the bytes the kernel actually wrote) and collect every
-    /// `SCM_RIGHTS` descriptor number in it.
+    /// Walk `control` (the bytes the kernel wrote) and collect every `SCM_RIGHTS` descriptor
+    /// number in it.
     ///
-    /// Pure and total (no unsafe, no syscalls), so it is unit-testable and
-    /// visible to the verifier. `cmsg_len` describes the message the kernel
-    /// built, not the bytes it copied out, so every read clamps to
-    /// `control.len()` and an overrun is reported as `truncated`.
-    ///
-    /// Unlike `CMSG_NXTHDR`, which stops quietly at a header shorter than a
-    /// `cmsghdr`, a short header here is refused: `control` is only the region
-    /// the kernel wrote, where none is legitimate.
+    /// Pure and total, so the verifier and the unit tests reach it. `cmsg_len` describes the
+    /// message the kernel built, not the bytes it copied out, so every read clamps to
+    /// `control.len()` and an overrun is `truncated`. A `cmsg_len` shorter than the header is
+    /// refused, where `CMSG_NXTHDR` stops quietly: none is legitimate in what the kernel wrote.
     fn scan_control(control: &[u8]) -> ControlScan {
         let mut scan = ControlScan {
             fds: Vec::new(),
@@ -779,11 +748,9 @@ mod scm {
             scan_control, write_i32,
         };
 
-        /// Build one control buffer holding a single `SCM_RIGHTS` header whose
-        /// `cmsg_len` claims `claimed` descriptors, followed by `present`
-        /// descriptor numbers, cut to `keep` bytes — the shape a truncated
-        /// receive leaves behind. `keep` is what `msg_controllen` would say,
-        /// so it is the exact message size in the untruncated cases.
+        /// One `SCM_RIGHTS` header whose `cmsg_len` claims `claimed` descriptors, then
+        /// `present` descriptor numbers, cut to `keep` bytes (what `msg_controllen` would
+        /// say): the shape a truncated receive leaves.
         fn control(claimed: usize, present: &[i32], keep: usize) -> Vec<u8> {
             let mut buf = vec![0u8; CONTROL_LEN];
             abi::write_cmsg_len(&mut buf, cmsg_len(claimed * FD_LEN));
@@ -796,9 +763,7 @@ mod scm {
             buf
         }
 
-        /// Darwin's cmsg data area starts flush against its 12-byte header
-        /// (4-byte alignment); Linux's starts at 16. A wrong offset on Darwin
-        /// sends the padding as an extra descriptor the receiver leaks.
+        /// 12 on Darwin (4-byte alignment), 16 on Linux.
         #[test]
         fn the_data_offset_matches_the_platform_header() {
             let expected = if cfg!(target_vendor = "apple") {
@@ -810,8 +775,6 @@ mod scm {
             assert_eq!(cmsg_len(4), expected + 4, "CMSG_LEN(4)");
         }
 
-        /// The ordinary case: three descriptors in, three numbers out, in
-        /// order, nothing flagged.
         #[test]
         fn a_complete_message_yields_every_descriptor_in_order() {
             let buf = control(3, &[7, 8, 9], cmsg_space(3 * FD_LEN));
@@ -820,8 +783,7 @@ mod scm {
             assert!(!scan.truncated, "a complete message is not truncated");
         }
 
-        /// `cmsg_len` claims three descriptors but the buffer holds one: the
-        /// clamp reports only the one present and flags the message.
+        /// `cmsg_len` claims three descriptors, the buffer holds one.
         #[test]
         fn a_cmsg_len_past_the_buffer_is_clamped_and_flagged() {
             let buf = control(3, &[7], CMSG_DATA_OFFSET + FD_LEN);
@@ -830,9 +792,8 @@ mod scm {
             assert!(scan.truncated, "an overrunning cmsg_len is truncation");
         }
 
-        /// A descriptor cut in half by the copy-out: the whole ones are
-        /// reported (they are ours to close), and the message is still fatal
-        /// because the half-copied one is installed and unnameable.
+        /// The whole descriptors are reported (ours to close) and the half-copied one makes
+        /// the message fatal.
         #[test]
         fn a_partial_descriptor_at_the_tail_is_truncation() {
             let buf = control(3, &[7, 8], CMSG_DATA_OFFSET + FD_LEN + 2);
@@ -841,9 +802,8 @@ mod scm {
             assert!(scan.truncated);
         }
 
-        /// A control message that is not `SCM_RIGHTS` carries no descriptors,
-        /// and a header shorter than its own data area is junk, not a
-        /// descriptor source. Neither may invent one.
+        /// Neither a non-`SCM_RIGHTS` message nor a header shorter than its own data area
+        /// yields a descriptor; the runt is refused.
         #[test]
         fn foreign_and_malformed_headers_yield_no_descriptors() {
             let mut foreign = control(2, &[7, 8], cmsg_space(2 * FD_LEN));
@@ -859,9 +819,7 @@ mod scm {
             assert!(scan.truncated, "malformed is refused, not ignored");
         }
 
-        /// An empty control area (the common case — a message with no
-        /// descriptors) is empty, not truncated: a buffer too short to hold a
-        /// header at all is no message, not a broken one.
+        /// A buffer too short to hold a header is no message, not a truncated one.
         #[test]
         fn an_empty_control_area_is_empty_not_truncated() {
             for keep in [0, 1, CMSG_HDR_LEN - 1] {
@@ -874,12 +832,9 @@ mod scm {
     }
 }
 
-/// Every other target: the same entry points, returning `Unsupported`.
-///
-/// Windows' afunix has no ancillary data, and on a Unix this file does not
-/// vouch for, a wrong `msghdr` layout or option number would read the wrong
-/// memory instead of failing. The seamless handoff falls back to the fork
-/// lane on refusal.
+/// Every other target: the same entry points, returning `Unsupported`. Windows' afunix has no
+/// ancillary data, and on an unvouched Unix a wrong `msghdr` layout or option number would
+/// read the wrong memory instead of failing.
 #[cfg(not(any(
     target_vendor = "apple",
     all(

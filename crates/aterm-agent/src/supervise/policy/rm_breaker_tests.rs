@@ -50,7 +50,7 @@ fn escalates(cmd: &str) -> String {
     }
 }
 
-/// The synthesis's named cases: the one approval and its four refusals.
+/// The core cases: one approval and the refusals beside it.
 #[test]
 fn the_synthesis_cases() {
     assert_eq!(
@@ -106,12 +106,10 @@ fn a_conditional_or_scoped_assignment_is_unknown() {
     approves("S=/tmp/w/a; rm -rf \"$S/y\"");
 }
 
-/// `$TMPDIR` is the supervisor's, which the worker's Bash tool need not share:
-/// `rm -rf "$TMPDIR/probe"` escalates; `D=$(mktemp -d -t probe); rm -rf
-/// "$D/x"` escalates unguarded (a failed `mktemp` removes `/x`) and is proven
-/// behind `&&` by the fresh-directory rule as `<mktemp -d>/x`; `rm -rf "$D"`
-/// after `D=$(mktemp -d)` stays proven (`"$D"` alone is `""` on failure) as
-/// `<mktemp -d>`. A literal template still resolves where it says.
+/// `$TMPDIR` is the supervisor's, which the worker's Bash tool need not share,
+/// so it proves nothing. A `$(mktemp -d)` is proven by a literal template, or
+/// as a fresh directory (`<mktemp -d>`) behind a guard (unguarded, a failed
+/// `mktemp` makes `"$D/x"` `/x`) or as `"$D"` alone (`""` on failure).
 #[test]
 fn mktemp_is_proven_by_its_template_or_as_a_fresh_directory() {
     for (cmd, why) in [
@@ -201,10 +199,8 @@ fn where_an_operand_may_point() {
     assert!(escalates("rm -rf /Users/_owner/aterm/src/x").contains("not strictly inside"));
 }
 
-/// The Bash tool keeps its own working directory, which the worker moves
-/// between calls; the supervisor knows only the launch directory. So a
-/// relative operand and `$PWD` escalate; an absolute spelling of the same path
-/// is the negative control.
+/// The Bash tool keeps its own working directory, which the worker moves between calls, so a
+/// relative operand and `$PWD` escalate. Negative control: an absolute spelling.
 #[test]
 fn a_relative_operand_and_pwd_escalate() {
     assert!(escalates("rm -rf target/debug/x").contains("relative rm operand"));
@@ -243,8 +239,7 @@ fn what_the_resolver_will_not_follow() {
         ("S=/tmp/w/a; rm -rf \"${S:-/}\"", "does not follow"),
         ("S=$'/tmp/w/a'; rm -rf \"$S/x\"", "$'"),
         ("S=/tmp/w/a; read S; rm -rf \"$S/x\"", "`read`"),
-        // Was `printf -v`, the resolver's own check, which duplicated the
-        // classifier's with a weaker rule: the variable it names is unknown.
+        // `printf -v` assigns the variable it names: it is unknown after.
         (
             "S=/tmp/w/a; printf -v S /; rm -rf \"$S/x\"",
             "$S is not known after `printf`",
@@ -290,17 +285,13 @@ fn all_escalate(cases: &[(&str, &str)]) {
     }
 }
 
-/// Each of these reaches `/etc` (checked with `echo` in zsh 5.9 and bash 3.2):
-/// a failed `$(mktemp -d)` leaves `D` empty, so `"$D/etc"` is `/etc`; zsh
-/// splits `$=S`, so `/tmp/x/$=S` with `S='y /etc'` is `/tmp/x/y` and `/etc`;
-/// `$_` is the previous command's last argument, empty after `_=/tmp/x`, so
-/// `"$_/etc"` is `/etc`. (A symbolic link out of the scratch root is
-/// `an_rm_through_a_symbolic_link_is_judged_where_it_leads`.) Negative
-/// controls: the same removals written provably.
+/// Each of these reaches `/etc` in zsh 5.9 or bash 3.2: a failed `$(mktemp -d)` leaves `D`
+/// empty; zsh splits `$=S`; `$_` is empty after `_=/tmp/x`. Negative controls: the same
+/// removals written provably.
 #[test]
 fn the_audits_measured_approvals_escalate() {
     all_escalate(&[
-        // With a literal template: the failed run.
+        // A failed `mktemp -d`, with or without a template.
         ("D=$(mktemp -d); rm -rf \"$D/etc\"", "removes /etc"),
         (
             "D=$(mktemp -d /private/tmp/claude-502/w.XXXXXX); rm -rf \"$D/etc\"",
@@ -462,12 +453,9 @@ fn a_mktemp_that_fails_leaves_its_variable_empty() {
     approves("D=$(mktemp -d /private/tmp/claude-502/w.XXXXXX); rm -rf $D \"$D\"");
 }
 
-/// zsh computes what the lexer reads as text: `$=V` splits, `$~V` globs, `$^V`
-/// and `$+V` expand, a modifier or subscript on a bare name reshapes it
-/// (`"$S:h:h"` is `/tmp`, `$S[1,0]` is empty), a non-ASCII name is a variable,
-/// and `$[…]` is arithmetic, which assigns. Negative controls: a `$` before a
-/// character that opens no expansion, `${S}:h` (text in zsh too), `${S}` and a
-/// plain `$S`.
+/// zsh computes what the lexer reads as text: `$=V`, `$~V`, `$^V`, `$+V`, a modifier or
+/// subscript on a bare name (`"$S:h:h"`, `$S[1,0]`), a non-ASCII name, and `$[…]`.
+/// Negative controls: a `$` that opens no expansion, `${S}:h`, `${S}` and a plain `$S`.
 #[test]
 fn zsh_expansions_are_not_text() {
     for flag in ["=", "~", "^", "+"] {
@@ -505,11 +493,8 @@ fn zsh_expansions_are_not_text() {
 }
 
 /// A command the resolver does not model may assign a variable it names (zsh's
-/// `print -v S /etc` and `zformat -f S /etc` set `S`; `zparseopts a:=S` and
-/// `zstyle -s c s S` empty it). So a variable a word names is unknown after
-/// the command, and every variable is after a word whose text is unknown.
-/// Negative controls: a command that only uses the variable, and one naming
-/// another.
+/// `print -v S /etc`, `zparseopts a:=S`), so that variable is unknown after it, and every
+/// variable is after a word whose text is unknown.
 #[test]
 fn a_variable_another_command_names_is_unknown_after_it() {
     all_escalate(&[
@@ -555,11 +540,9 @@ fn a_variable_another_command_names_is_unknown_after_it() {
     approves("S=/tmp/w/a; T=/tmp/w/b; print -v T /etc; rm -rf \"$S/y\"");
 }
 
-/// A name the shell itself sets, ties or reads (and `cd`, which may fail or
-/// move `$PWD`) is not a variable the line states: its assignment is not
-/// followed, however written (append, subscript, or a value with a `~` or `=`
-/// the shell expands). Negative controls: look-alike names, and the same
-/// values quoted.
+/// A name the shell itself sets, ties or reads (and `cd`, which may fail or move `$PWD`) is
+/// not a variable the line states, however its assignment is written. Negative controls:
+/// look-alike names, and the same values quoted.
 #[test]
 fn a_name_the_shell_maintains_is_not_the_lines() {
     all_escalate(&[
@@ -657,9 +640,8 @@ fn an_assignment_in_a_backgrounded_list_is_not_the_shells() {
     approves("S=/tmp/w/a && true; rm -rf \"$S/x\"");
 }
 
-/// A directory of the test's own under the temp dir, removed on drop
-/// (`remove_dir_all` never follows a link). The resolver only decides;
-/// nothing runs.
+/// A directory of the test's own under the temp dir, removed on drop (`remove_dir_all` never
+/// follows a link).
 struct TempTree(aterm_tempfile::TempDir);
 
 impl TempTree {
@@ -699,11 +681,8 @@ fn resolve_on_disk(roots: &[ScratchRoot], cwd: &str, cmd: &str) -> Result<Vec<St
     resolve_rm_line(cmd, &scope)
 }
 
-/// rm follows links in an operand's directories: `S=/private/tmp/zzprobe;
-/// rm -rf "$S/out/x"` with `out -> /etc` removes `/etc/x`. Built with real
-/// links: a link out of the root, the last component followed through a
-/// trailing `/` or `/.`, a relative link that climbs out, a dangling link
-/// outside, a glob in a directory (it may match a link). Negative controls:
+/// rm follows links in an operand's directories: `rm -rf "$S/out/x"` with
+/// `out -> /etc` removes `/etc/x`. Built with real links. Negative controls:
 /// the link itself (rm removes the link), a link staying inside (absolute or
 /// relative), a real directory, a glob in the last component.
 #[cfg(unix)]
@@ -793,12 +772,9 @@ fn an_rm_through_a_symbolic_link_is_judged_where_it_leads() {
     assert_eq!(run(&inside).map(|v| v.len()), Ok(5), "{inside}");
 }
 
-/// A root is judged where it leads, only through links root owns: a scratch
-/// root swapped for a worker-made link holds nothing (else a root re-pointed at
-/// `/usr` would approve `/usr/local/x`). `/tmp/*` is `/private/tmp/*` on
-/// macOS, so a path spelled through `/tmp` is inside it, and the session cwd
-/// spelled through `/tmp` is the cwd. Negative control: the same removal under
-/// a real directory root.
+/// A root is judged where it leads, through links root owns only: a scratch root swapped for
+/// a worker-made link holds nothing. `/tmp` is `/private/tmp` on macOS, so a path or the cwd
+/// spelled through `/tmp` is the same. Negative control: a real directory root.
 #[cfg(unix)]
 #[test]
 fn a_root_is_judged_where_it_leads_through_roots_links_only() {
@@ -850,15 +826,10 @@ fn a_root_is_judged_where_it_leads_through_roots_links_only() {
     }
 }
 
-/// The fresh-directory rule: `mktemp -d` makes a new, uniquely named
-/// directory, so `"$D"` and a path lexically under it remove nothing that
-/// predates the line, wherever `$TMPDIR` points (`<mktemp -d>`). Proven for any
-/// template (bare, `-t`, relative, absolute, even outside every root), behind
-/// each recognised guard, with every use of `$D` quoted. Negative controls,
-/// each escalated: `$D` or `${D}` unquoted in the operand, `$D` unquoted
-/// anywhere else on the line, `D` reassigned between `mktemp` and rm, `..`
-/// under it, a glob, text glued to its name, another variable under it, no
-/// guard, a `mktemp` of a file (no `-d`), and the name inside another path.
+/// The fresh-directory rule: `mktemp -d` makes a new, uniquely named directory, so `"$D"` and
+/// a path lexically under it remove nothing that predates the line, wherever `$TMPDIR`
+/// points, given a recognised guard and every use of `$D` quoted. Each negative control
+/// breaks one condition.
 #[test]
 fn a_directory_the_line_just_made_is_proven_wherever_it_is() {
     for (cmd, want) in [
@@ -963,9 +934,7 @@ fn a_directory_the_line_just_made_is_proven_wherever_it_is() {
     ]);
 }
 
-/// A variable the line does not assign is not proven, directly or through an
-/// assignment, whatever this process holds for it. Negative control: the same
-/// lines assigning it.
+/// A variable the line does not assign is not proven, whatever this process holds for it.
 #[test]
 fn a_variable_from_the_environment_is_not_proven() {
     assert!(
@@ -1005,13 +974,10 @@ fn a_variable_from_the_environment_is_not_proven() {
     );
 }
 
-/// An assignment in front of a command: zsh expands `export`'s words with it
-/// in force and bash keeps it after `export` (checked below with `echo` in
-/// both shells, where installed), so the names such a command assigns are
-/// unknown after it and it guards nothing (`D=/x export F="${D:?}"` tests the
-/// prefix in zsh). The same for the other declaring builtins (`typeset`,
-/// `declare`, `readonly`, `local`; zsh's `integer` and `float` are refused
-/// outright). Negative controls: the same commands without the prefix.
+/// An assignment in front of a declaring builtin (`export`, `typeset`, `declare`, `readonly`,
+/// `local`) is in force while zsh expands its words and kept by bash after it, so the names
+/// it assigns are unknown after it and it guards nothing. zsh's `integer` and `float` are
+/// refused outright.
 #[test]
 fn an_assignment_in_front_of_a_declaring_builtin_is_unknown_after_it() {
     let s = "S=/private/tmp/claude-502/s";
@@ -1094,14 +1060,10 @@ fn an_assignment_in_front_of_a_declaring_builtin_is_unknown_after_it() {
     }
 }
 
-/// Which words name a variable (`Eval::forget_named`): a lone option cluster
-/// names only what is glued after its first letter, and a path word with no
-/// arithmetic operator names nothing, so `[ -d "$d" ]`, `ls -f "$f"`,
-/// `ls "$out"`, `du -sh "$build"` leave `d`, `f`, `out`, `build` known.
-/// Negative controls, each still forgotten: arithmetic zsh evaluates
-/// (`[ -t "1/(S=5)" ]`, `test -t "1/S--"`, `[ -t -S-- ]`, `printf %d "S=5"`),
-/// a name after an option (`stat -A S`), a subscript (`print -v 'S[1]'`), and
-/// a name glued to its option (`print -vS`, `print -rvS`, bash's `printf -vS`).
+/// Which words name a variable (`Eval::forget_named`): a lone option cluster names only what
+/// is glued after its first letter, and a path word with no arithmetic operator names nothing
+/// (`[ -d "$d" ]`, `ls "$out"`). Negative controls: arithmetic zsh evaluates, a name after or
+/// glued to an option, and a subscript.
 #[test]
 fn a_variable_named_only_by_an_option_letter_or_a_path_is_kept() {
     for (cmd, want) in [
@@ -1160,14 +1122,10 @@ fn a_variable_named_only_by_an_option_letter_or_a_path_is_kept() {
     }
 }
 
-/// A word the resolver cannot compute forgets every variable only where it
-/// could name one or run code (`Eval::forget_named`): a double-quoted unknown
-/// variable or `$(…)` handed to a command that takes no word as a name or
-/// arithmetic (`ls`, `echo`, …) forgets nothing. Negative controls, each still
-/// forgetting: a zsh glob qualifier in `$~X` runs code
-/// (`X='/tmp/*(e:S=/etc:)'; echo $~X` sets `S`), an unquoted unknown variable
-/// or `$(…)`, an unquoted value holding a glob, and a quoted unknown word
-/// handed to `print`, `printf` or `[`.
+/// An unknown word forgets every variable only where it could name one or run code
+/// (`Eval::forget_named`): double-quoted under a command that takes no word as a name or
+/// arithmetic (`ls`, `echo`), it forgets nothing. Negative controls: a zsh glob qualifier in
+/// `$~X` (it runs code), an unquoted unknown word, a quoted one under `print`, `printf`, `[`.
 #[test]
 fn an_unknown_word_forgets_only_where_it_can_name_a_variable() {
     let s = "S=/tmp/w/a";
@@ -1202,10 +1160,8 @@ fn an_unknown_word_forgets_only_where_it_can_name_a_variable() {
     }
 }
 
-/// An `export` that may not run assigns nothing the line can rely on, and a
-/// command after `|` runs whatever the one before returned, so
-/// `test -n "$D" |` proves nothing. Negative controls: the unconditional
-/// `export`, and `test -n "$D" &&`.
+/// An `export` that may not run assigns nothing the line can rely on, and a pipe's right
+/// side runs whatever its left returned, so `test -n "$D" |` proves nothing.
 #[test]
 fn a_conditional_export_and_a_pipe_prove_nothing() {
     all_escalate(&[
@@ -1302,10 +1258,8 @@ fn in_shell(shell: &str, line: &str) -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// A [`PLAIN_CONSUMERS`] command assigns no variable, so its words name
-/// nothing (`echo "OUT=$OUT"` keeps `OUT` known). Negative controls: the same
-/// words under a command that can assign or evaluate them still forget
-/// (`a_command_that_can_assign_…`).
+/// A [`PLAIN_CONSUMERS`] command assigns no variable, so its words name nothing
+/// (`echo "OUT=$OUT"` keeps `OUT` known).
 #[test]
 fn a_plain_commands_words_name_nothing() {
     for (cmd, want) in [
@@ -1343,12 +1297,9 @@ fn a_plain_commands_words_name_nothing() {
     }
 }
 
-/// [`PLAIN_CONSUMERS`] membership is a soundness law: a command that can
-/// assign a variable it names, or read a word as arithmetic, is not in it.
-/// Each head below assigns `S` from a word in zsh 5.9 or bash 3.2 (the zsh
-/// modules by their manuals: `zsh/stat`, `zsh/datetime`, `zsh/system`,
-/// `zsh/zselect`) and is refused or forgets `S`; no builtin member assigns a
-/// variable its words name.
+/// [`PLAIN_CONSUMERS`] holds no command that can assign a variable it names or read a word
+/// as arithmetic: each head below assigns `S` in zsh 5.9 or bash 3.2 (zsh modules per their
+/// manuals) and is refused or forgets `S`; no builtin member assigns.
 #[test]
 fn a_command_that_can_assign_what_it_names_is_no_plain_consumer() {
     let assigners = [
@@ -1402,12 +1353,9 @@ fn a_command_that_can_assign_what_it_names_is_no_plain_consumer() {
     }
 }
 
-/// zsh's arithmetic reads a variable's value as arithmetic in turn
-/// (`A=S=5; printf %d A` sets `S`), so a word an arithmetic command reads
-/// forgets what its variables' values name, and a name whose value is unknown
-/// forgets every variable. Negative controls: a word starting with `/` (the
-/// parse stops: `printf %d /A` reads nothing), `printf`'s format, a word `[`
-/// does not read as arithmetic, a plain command.
+/// zsh's arithmetic reads a variable's value as arithmetic in turn (`A=S=5; printf %d A`
+/// sets `S`), so a word it reads forgets what its variables' values name. Negative controls
+/// include a word starting with `/`, where the parse stops.
 #[test]
 fn a_value_zsh_arithmetic_reads_is_read_too() {
     all_escalate(&[
@@ -1486,10 +1434,8 @@ fn a_value_zsh_arithmetic_reads_is_read_too() {
     }
 }
 
-/// The builtins that change how every later word reads, and zsh's
-/// `integer`/`float`, whose values are arithmetic (`integer T=A` reads
-/// `A`'s value): a line with one is not followed. Negative control: the
-/// line without it.
+/// A line with a builtin that changes how later words read, or zsh's `integer`/`float`
+/// (whose values are arithmetic), is not followed.
 #[test]
 fn a_builtin_that_changes_how_words_read_is_not_followed() {
     all_escalate(&[
@@ -1510,13 +1456,9 @@ fn a_builtin_that_changes_how_words_read_is_not_followed() {
     approves("S=/tmp/w/a; rm -rf \"$S/x\"");
 }
 
-/// Each test below fails with the rule it names weakened.
-///
-/// zsh's modifiers: after `$NAME:`, every letter of zsh's documented set
-/// reshapes the value (`"$S:s/w/etc/"` is `/tmp/etc/a`, `$S:P` resolves links,
-/// `$S:a`, `$S:r`), so each is an expansion the resolver does not compute. The
-/// letters are spelled here, not read off [`ZSH_MODIFIERS`]; where zsh is
-/// installed, every letter whose reading differs from the text must escalate.
+/// After `$NAME:`, every letter of zsh's modifier set reshapes the value, so each escalates.
+/// The letters are spelled here, not read off [`ZSH_MODIFIERS`]; where zsh is installed, each
+/// letter whose reading differs from the text is checked too.
 #[test]
 fn every_zsh_modifier_letter_is_not_text() {
     let letters = "aAcefFghlpPqQrsStuwWx&";
@@ -1557,10 +1499,8 @@ fn every_zsh_modifier_letter_is_not_text() {
     }
 }
 
-/// A path word names nothing only when no arithmetic can assign in it: a
-/// `=`, `(`, `[` or `++` in it (as `--`) makes it a word a command the
-/// resolver does not model may evaluate (`x/S=5`, `x/(S=5)`, `x/a[S=5]`,
-/// `x/S++` each assign `S` as arithmetic). Negative control: a plain path.
+/// A path word with `=`, `(`, `[`, `++` or `--` may be arithmetic that assigns (`x/S=5`,
+/// `x/S++`), so it names its variables. Negative control: a plain path.
 #[test]
 fn a_path_word_with_an_arithmetic_operator_names_its_variables() {
     for word in ["x/S=5", "x/(S)", "x/a[S]", "x/S++", "x/S--"] {
@@ -1570,10 +1510,8 @@ fn a_path_word_with_an_arithmetic_operator_names_its_variables() {
     approves("S=/tmp/w/a; zcompute 'x/S'; rm -rf \"$S/x\"");
 }
 
-/// A double-quoted `$(…)` names nothing only under a [`PLAIN_CONSUMERS`]
-/// command: under any other its output may be the name a builtin assigns
-/// (`print -v "$(echo S)" /etc` sets `S`). Negative control: the same under
-/// `echo`.
+/// A double-quoted `$(…)` names nothing only under a [`PLAIN_CONSUMERS`] command: under
+/// another its output may be a name a builtin assigns (`print -v "$(echo S)" /etc`).
 #[test]
 fn a_quoted_substitution_under_another_command_forgets() {
     for middle in [
@@ -1588,9 +1526,8 @@ fn a_quoted_substitution_under_another_command_forgets() {
     approves("S=/tmp/w/a; echo \"$(echo S)\"; rm -rf \"$S/x\"");
 }
 
-/// With `rm_breaker = false` the rule has no scratch root, and nothing is
-/// proven, the fresh-directory rule included. Negative control: the same lines
-/// with the roots.
+/// With no scratch root nothing is proven, the fresh-directory rule included.
+/// Negative control: the same lines with roots.
 #[test]
 fn nothing_is_proven_with_no_scratch_root() {
     let none: Vec<ScratchRoot> = Vec::new();
@@ -1607,11 +1544,8 @@ fn nothing_is_proven_with_no_scratch_root() {
     assert!(e.contains("not strictly inside"), "{e}");
 }
 
-/// A session cwd reached through a user's link keeps its `<cwd>/target*` root:
-/// that root is resolved where the cwd leads, as the cwd check is. Negative
-/// controls: a fixed root through the same link is still no root
-/// (`a_root_is_judged_where_it_leads…`), and the cwd itself, spelled either
-/// way, is still refused.
+/// A session cwd reached through a user's link keeps its `<cwd>/target*` root, resolved where
+/// the cwd leads. Negative control: the cwd itself, spelled either way.
 #[cfg(unix)]
 #[test]
 fn a_cwd_through_a_users_link_keeps_its_target_root() {
@@ -1642,15 +1576,9 @@ fn a_cwd_through_a_users_link_keeps_its_target_root() {
     assert!(e.contains("not strictly inside"), "{e}");
 }
 
-/// zsh's `printf` reads its arguments as arithmetic only under a numeric
-/// conversion or a `*` width or precision (`%s`, `%b`, `%q`, `%c`, `%1$s`,
-/// `%%d` and no conversion leave `S` after `printf FMT S=5`; `%d`, `%*s` and
-/// `%.*s` set it), and its format names nothing (only `-v NAME` assigns). So
-/// `printf '%s\n' done` and `printf 'OUT=%s\n' "$OUT"` prove. Negative
-/// controls: a numeric conversion anywhere, a length modifier or unknown
-/// conversion, `-v`, and a format word the shell may split, remove, glob or
-/// brace-expand into an option (`$E` empty, `{-v,S}`, `%s*`), each still
-/// forgetting `S`.
+/// zsh's `printf` reads its arguments as arithmetic only under a numeric conversion or a `*`
+/// width or precision (`%d`, `%*s`, `%.*s`; not `%s`, `%b`, `%q`, `%c`, `%1$s`, `%%d`), and
+/// only `-v NAME` assigns. Negative controls: each way a format is or becomes numeric or `-v`.
 #[test]
 fn a_printf_format_with_no_numeric_conversion_reads_no_arithmetic() {
     for (cmd, want) in [
@@ -1726,13 +1654,10 @@ fn a_printf_format_with_no_numeric_conversion_reads_no_arithmetic() {
     }
 }
 
-/// A program run from disk cannot assign the shell's variables, so its words
-/// name nothing: the read-only external programs the classifier accepts are
-/// [`PLAIN_CONSUMERS`] (`shasum "$HOME/f"`, `jq … "$TMPDIR/p.json"`,
-/// `awk -v S=1` prove). Each is checked to be no builtin in zsh 5.9
-/// (`zsh -f`) or bash 3.2 where installed. Negative controls: `stat` (zsh's
-/// `zsh/stat` assigns with `-A`), `env` and `xargs` (they run a command),
-/// `print`, and an unquoted unknown word, which the shell may glob.
+/// A program run from disk cannot assign the shell's variables: the classifier's read-only
+/// external programs are [`PLAIN_CONSUMERS`], each checked to be no builtin in zsh 5.9 or
+/// bash 3.2 where installed. Negative controls: `stat` (zsh's `-A` assigns), `env` and
+/// `xargs` (they run a command), `print`, and an unquoted unknown word.
 #[test]
 fn an_external_read_only_program_names_nothing() {
     let externals = [
@@ -1813,10 +1738,9 @@ fn an_external_read_only_program_names_nothing() {
     }
 }
 
-/// The operand `"$D"` alone is the fresh directory, or `""` when `mktemp`
-/// failed (removing nothing), whatever another command did with an unquoted
-/// `$D`. Only a path under `$D` needs every use double-quoted. Negative
-/// controls: a path under an unquoted-elsewhere `$D`, and an unquoted operand.
+/// The operand `"$D"` alone is the fresh directory, or `""` (removing nothing) when `mktemp`
+/// failed, whatever else reads an unquoted `$D`; only a path under `$D` needs every use
+/// double-quoted.
 #[test]
 fn a_quoted_fresh_directory_alone_is_proven_whatever_else_reads_it() {
     for cmd in [
@@ -1847,10 +1771,8 @@ fn a_quoted_fresh_directory_alone_is_proven_whatever_else_reads_it() {
     ]);
 }
 
-/// A variable the line assigned a literal, then forgot after a command that
-/// may assign it, is reported as that, not as "not assigned a literal on this
-/// line". Negative controls: a variable never assigned, and one assigned only
-/// where the assignment may not run, keep their own reasons.
+/// A variable forgotten after a command that may assign it is reported as that, not as
+/// "not assigned a literal on this line".
 #[test]
 fn a_forgotten_variable_names_the_command_that_forgot_it() {
     for (middle, head) in [
@@ -1873,12 +1795,9 @@ fn a_forgotten_variable_names_the_command_that_forgot_it() {
     );
 }
 
-/// zsh's `{S}>file` opens a descriptor and stores its number in `S`, in the
-/// shell itself under a builtin (`echo`, `:`, `pwd`, `printf`), even with a
-/// blank before the `>`, so `rm -rf "$S/x"` would remove `<fd>/x` in the
-/// working directory. An unquoted `{NAME}` word forgets `NAME` under every
-/// command. Negative controls: a quoted or escaped brace (zsh leaves `S`), and
-/// another name.
+/// zsh's `{S}>file` stores the new descriptor's number in `S` under a builtin, even with a
+/// blank before the `>`; an unquoted `{NAME}` word forgets `NAME` under every command.
+/// Negative controls: a quoted or escaped brace, and another name.
 #[test]
 fn a_named_descriptor_redirect_assigns_its_name() {
     all_escalate(&[
@@ -1942,14 +1861,10 @@ fn a_named_descriptor_redirect_assigns_its_name() {
     }
 }
 
-/// The positions the rule reads (`printf`'s options, format and arguments,
-/// `-t`'s operand) are words as written, and brace expansion moves them: zsh
-/// expands `A=S=5; printf {%d,A}` to `printf %d A` and sets `S`; bash expands
-/// `printf {-vS,%s} /etc` and `printf -{vS,-} /etc` to `printf -vS …`; zsh runs
-/// `[ {-t,A} ]` as `[ -t A ]`. A word with an unquoted `{` forgets every
-/// variable under a command that reads its words, unless it is a data word
-/// past a non-arithmetic as-written format. Negative controls: a quoted or
-/// escaped brace, brace-expanded data after `%s`, a plain command's brace word.
+/// Brace expansion moves the words the rule reads: zsh expands `A=S=5; printf {%d,A}` to
+/// `printf %d A`, and bash `printf {-vS,%s} /etc` to `printf -vS …`. An unquoted `{` forgets
+/// every variable under a command that reads its words, unless it is data past a
+/// non-arithmetic as-written format.
 #[test]
 fn a_brace_expanded_word_moves_the_words_the_rule_reads() {
     for middle in [
@@ -1995,13 +1910,9 @@ fn a_brace_expanded_word_moves_the_words_the_rule_reads() {
     }
 }
 
-/// A glob makes words from the names in the working directory: with a file
-/// `S=5` there, zsh runs `printf %d *`, `printf %d S=?` and `[ -t * ]` as
-/// arithmetic on `S=5`, and with files `-t` and `S=5`, `[ * ]` is
-/// `[ -t S=5 ]`. A word with an unquoted glob forgets every variable where a
-/// brace word does (`a_brace_expanded_word_moves_the_words_the_rule_reads`).
-/// Negative controls: a quoted glob, globbed data after `%s`, a plain
-/// command's glob.
+/// A glob makes words from the working directory's names: beside a file `S=5`, zsh runs
+/// `printf %d *` as arithmetic on `S=5`. An unquoted glob forgets where a brace word does
+/// (`a_brace_expanded_word_moves_the_words_the_rule_reads`).
 #[test]
 fn a_globbed_word_moves_the_words_the_rule_reads() {
     for middle in [
@@ -2033,10 +1944,8 @@ fn a_globbed_word_moves_the_words_the_rule_reads() {
     }
 }
 
-/// A glob or brace word starting with `/` expands only to absolute paths (no
-/// option, name or arithmetic; zsh runs nothing on no match), so the rule keeps
-/// proving past one: `stat -f %z "$S"/*.bin`. Negative controls: a relative
-/// glob, and a value with a blank, which bash splits.
+/// A glob or brace word starting with `/` expands only to absolute paths, so the rule keeps
+/// proving past one. Negative controls: a relative glob, and a value bash splits.
 #[test]
 fn an_absolute_glob_moves_no_word_the_rule_reads() {
     for middle in [
@@ -2063,10 +1972,8 @@ fn an_absolute_glob_moves_no_word_the_rule_reads() {
     }
 }
 
-/// A `-` word zsh takes as `printf`'s format is read as a format: zsh evaluates
-/// nothing under `--- %s ---` or `-%s`, and bash refuses either as an unknown
-/// option, assigning nothing. Negative controls: a numeric `-` format, and
-/// `-vS`, which bash reads as `-v S`.
+/// A `-` word zsh takes as `printf`'s format is read as a format (bash refuses it as an
+/// unknown option). Negative controls: a numeric `-` format, and `-vS` (bash's `-v S`).
 #[test]
 fn a_dash_format_with_no_numeric_conversion_reads_no_arithmetic() {
     for middle in [
@@ -2101,13 +2008,9 @@ fn a_dash_format_with_no_numeric_conversion_reads_no_arithmetic() {
     }
 }
 
-/// Under `EXTENDED_GLOB` (a user's `setopt` rides into Claude Code's shell
-/// snapshot) `^`, `#` and `~` glob too: beside files `-t`, `-vS` and `S=5`,
-/// `[ ^-vS ]` is `[ -t S=5 ]`, `printf ^%s S=5` is `printf %d S=5` beside a
-/// file `%d`, and `rm -rf <root>/^x` removes every name but `x`. Negative
-/// controls: a leading `~`, extended-glob data after `%s`, a plain command's
-/// word, a quoted `^`, an extended glob below a directory inside the root, and
-/// a quoted `~` in a value (`a~b` matches at most `a`).
+/// Under `EXTENDED_GLOB`, `^`, `#` and `~` glob too: beside files `-t`, `-vS`
+/// and `S=5`, `[ ^-vS ]` is `[ -t S=5 ]`, and `rm -rf <root>/^x` removes every
+/// name but `x`.
 #[test]
 fn an_extended_glob_word_moves_the_words_the_rule_reads() {
     for middle in [
@@ -2181,11 +2084,8 @@ fn an_extended_glob_word_moves_the_words_the_rule_reads() {
     }
 }
 
-/// Past `printf`'s non-arithmetic as-written format, a double-quoted word is
-/// one word of data (no option, name or arithmetic), so `printf '%s\n' "$x"`
-/// before the rm proves. Negative controls: the same word as the format, as
-/// `-v`'s name, before the format, unquoted, under a numeric format, and under
-/// other commands.
+/// Past `printf`'s non-arithmetic as-written format, a double-quoted word is one word of
+/// data. Negative controls: the same word in each other position, and under other commands.
 #[test]
 fn a_quoted_word_printf_reads_as_data_names_nothing() {
     for middle in [
@@ -2219,13 +2119,9 @@ fn a_quoted_word_printf_reads_as_data_names_nothing() {
     }
 }
 
-/// A string or file operand of `[`/`test` names nothing ([`test_operands`]),
-/// so `S=<scratch>; [ -n "$x" ]; rm -rf "$S/x"` and
-/// `[ -d "$HOME" ] && rm -rf "$S/x"` prove; checked in zsh 5.9 and bash 3.2
-/// below where installed. Negative controls: `-t`'s operand (arithmetic),
-/// `-v`'s (a name whose subscript zsh evaluates), a word the shell may glob or
-/// brace-expand, an unquoted one, an operator from a variable, four words or
-/// more, a redirect's target, and `[[`, a compound command.
+/// A string or file operand of `[`/`test` names nothing ([`test_operands`]); checked in
+/// zsh 5.9 and bash 3.2 where installed. Each negative control is an operand the shell or
+/// `test` may read as a name, as arithmetic, or as more words.
 #[test]
 fn a_quoted_test_operand_names_nothing() {
     for middle in [
@@ -2343,10 +2239,8 @@ fn in_shell_both(shell: &str, line: &str) -> Option<(String, String)> {
     ))
 }
 
-/// zsh subscripts a special parameter like a name, and the subscript is
-/// arithmetic: `A=S=0; S=<scratch>; echo "$#[A]"; rm -rf "$S/x"` removes
-/// `0/x` (also `$?[A]`, `$@[A]`, `$![A]`, `$-[A]`, `$*[A]`, `$1[A]`,
-/// `$#A[A]`). Negative controls: the special parameters without a subscript.
+/// zsh subscripts a special parameter like a name, as arithmetic: after `A=S=0`,
+/// `echo "$#[A]"` sets `S` to 0. Negative controls: the parameters without a subscript.
 #[test]
 fn a_subscript_on_a_special_parameter_escalates() {
     for sub in [
@@ -2377,10 +2271,8 @@ fn a_subscript_on_a_special_parameter_escalates() {
     }
 }
 
-/// A Unicode escape in `printf`'s format is decoded before the conversions are
-/// read: one decoding to no numeric conversion reads its arguments as data
-/// (`printf '<check mark> %s\n' "$x"`); one decoding to `%d` does not
-/// (`x=S=0; printf <u0025d> "$x"` sets `S`). `BS` stands for a backslash.
+/// `printf`'s format is read after its Unicode escapes are decoded: one that
+/// decodes to `%d` is a numeric conversion. `BS` stands for a backslash.
 #[test]
 fn a_printf_format_is_read_after_its_unicode_escapes() {
     for middle in ["printf 'BSu2713 %sBSn' \"$x\"", "printf 'BSu0025s' \"$x\""] {

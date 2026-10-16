@@ -17,12 +17,6 @@ use super::TaskbarProgress;
 use super::shell::{ANNOTATIONS_MAX, TERMINAL_MARKS_MAX};
 use super::{Annotation, CommandMark, ShellState, Terminal, TerminalMark};
 
-/// Maximum number of OSC 1337 user variables retained per terminal. When full,
-/// a new key evicts the oldest entry (FIFO); updates to existing keys never
-/// evict.
-#[cfg(test)]
-const USER_VARS_MAX: usize = 256;
-
 impl Terminal {
     // =========================================================================
     // Shell integration (OSC 133)
@@ -57,6 +51,18 @@ impl Terminal {
     #[must_use]
     pub fn completed_command_seq(&self) -> u64 {
         self.shell.completed_seq
+    }
+
+    /// Monotonic count of commands the shell started (each OSC 133/633 C the
+    /// A→B→C→D gate accepted, whether or not a block held it). No clear takes
+    /// one back: ED 3, Cmd-K ([`Self::clear_scrollback`]) and RIS drop blocks
+    /// (and RIS the D a running command would send), never a counted C, so
+    /// the C's since a reading, less the blocks still held that reached C
+    /// since, are the commands whose blocks went unread. Survives `reset` and
+    /// a checkpoint round trip.
+    #[must_use]
+    pub fn started_command_seq(&self) -> u64 {
+        self.shell.started_seq
     }
 
     /// Which integration body the shell signs that it runs: the 16-hex address
@@ -184,64 +190,6 @@ impl Terminal {
         self.iterm2.host_cell_px()
     }
 
-    /// Get all user variables (OSC 1337 SetUserVar).
-    ///
-    /// User variables are key-value pairs set by applications for
-    /// shell integration and customization purposes.
-    #[must_use]
-    #[cfg(test)]
-    pub fn user_vars(&self) -> &super::UserVarsMap {
-        &self.iterm2.user_vars
-    }
-
-    /// A specific user variable by key.
-    #[must_use]
-    #[cfg(test)]
-    pub fn user_var(&self, key: &str) -> Option<&String> {
-        self.iterm2.user_vars.get(key)
-    }
-
-    /// Set a user variable.
-    ///
-    /// Capped at `USER_VARS_MAX` entries. Updating an existing key keeps its
-    /// position and never evicts. Inserting a *new* key when the map is full
-    /// evicts the oldest entry first (deterministic FIFO order, tracked in
-    /// `user_vars_order`) — the backing `HashMap`'s iteration order is
-    /// non-deterministic and must not be used for eviction.
-    #[cfg(test)]
-    pub fn set_user_var(&mut self, key: &str, value: &str) {
-        if self.iterm2.user_vars.contains_key(key) {
-            // Update in place; insertion order is unchanged.
-            self.iterm2
-                .user_vars
-                .insert(key.to_string(), value.to_string());
-            return;
-        }
-        // New key: evict the oldest entry first if at capacity.
-        if self.iterm2.user_vars.len() >= USER_VARS_MAX {
-            while let Some(evict_key) = self.iterm2.user_vars_order.pop_front() {
-                if self.iterm2.user_vars.remove(&evict_key).is_some() {
-                    break;
-                }
-                // Stale order entry (key already removed) — keep popping.
-            }
-        }
-        self.iterm2
-            .user_vars
-            .insert(key.to_string(), value.to_string());
-        self.iterm2.user_vars_order.push_back(key.to_string());
-    }
-
-    /// Remove a user variable.
-    #[cfg(test)]
-    pub fn remove_user_var(&mut self, key: &str) -> Option<String> {
-        let removed = self.iterm2.user_vars.remove(key);
-        if removed.is_some() {
-            self.iterm2.user_vars_order.retain(|k| k != key);
-        }
-        removed
-    }
-
     /// The last taskbar progress state the program set (ConEmu OSC 9;4).
     ///
     /// # Example
@@ -257,78 +205,31 @@ impl Terminal {
     pub fn taskbar_progress(&self) -> Option<TaskbarProgress> {
         self.taskbar_progress
     }
+
+    /// The program's own state report (OSC 7501): the last report it made and
+    /// the sequence that moves with each one, a `clear` and a full reset
+    /// included ([`super::program_state`]). A claim for display, never
+    /// evidence a decision rests on.
+    ///
+    /// # Example
+    /// ```
+    /// use aterm_core::terminal::Terminal;
+    /// use aterm_core::terminal::program_state::ProgramStateWord;
+    ///
+    /// let mut term = Terminal::new(24, 80);
+    /// term.process(b"\x1b]7501;state=working:app=codex\x1b\\");
+    /// let report = term.program_state();
+    /// assert_eq!(report.state.map(|s| s.state), Some(ProgramStateWord::Working));
+    /// ```
+    #[must_use]
+    pub fn program_state(&self) -> super::program_state::ProgramStateReport {
+        self.program_state
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::terminal::Terminal;
-
-    #[test]
-    fn set_user_var_evicts_oldest_first_deterministically() {
-        let mut term = Terminal::new(24, 80);
-        // Fill to capacity in a known insertion order: k0..k.
-        for i in 0..USER_VARS_MAX {
-            term.set_user_var(&format!("k{i}"), &format!("v{i}"));
-        }
-        assert_eq!(term.user_vars().len(), USER_VARS_MAX);
-
-        // Inserting a new key at capacity must evict the oldest key (k0),
-        // deterministically — not an arbitrary HashMap entry.
-        term.set_user_var("new", "value");
-        assert_eq!(term.user_vars().len(), USER_VARS_MAX);
-        assert_eq!(term.user_var("k0"), None, "oldest key must be evicted");
-        assert_eq!(term.user_var("k1").map(String::as_str), Some("v1"));
-        assert_eq!(term.user_var("new").map(String::as_str), Some("value"));
-
-        // Next insert evicts k1 (the new oldest).
-        term.set_user_var("new2", "value2");
-        assert_eq!(term.user_var("k1"), None, "second-oldest evicted next");
-        assert_eq!(term.user_var("k2").map(String::as_str), Some("v2"));
-    }
-
-    #[test]
-    fn set_user_var_update_existing_does_not_evict() {
-        let mut term = Terminal::new(24, 80);
-        for i in 0..USER_VARS_MAX {
-            term.set_user_var(&format!("k{i}"), &format!("v{i}"));
-        }
-        // Updating an existing key at capacity must not evict anything.
-        term.set_user_var("k0", "updated");
-        assert_eq!(term.user_vars().len(), USER_VARS_MAX);
-        assert_eq!(term.user_var("k0").map(String::as_str), Some("updated"));
-        assert_eq!(
-            term.user_var("k1").map(String::as_str),
-            Some("v1"),
-            "updating an existing key must not evict another"
-        );
-    }
-
-    #[test]
-    fn remove_user_var_keeps_order_queue_in_sync() {
-        let mut term = Terminal::new(24, 80);
-        term.set_user_var("a", "1");
-        term.set_user_var("b", "2");
-        term.set_user_var("c", "3");
-        // Remove the oldest explicitly; eviction must then start from "b".
-        assert_eq!(term.remove_user_var("a").as_deref(), Some("1"));
-
-        // Fill exactly up to capacity (we currently hold b, c = 2 entries, so
-        // add USER_VARS_MAX - 2 fillers). No eviction yet.
-        for i in 0..(USER_VARS_MAX - 2) {
-            term.set_user_var(&format!("fill{i}"), "x");
-        }
-        assert_eq!(term.user_vars().len(), USER_VARS_MAX);
-        assert_eq!(term.user_var("b").map(String::as_str), Some("2"));
-
-        // One more new key at capacity must evict "b" (the oldest remaining),
-        // proving the order queue dropped the removed "a" cleanly.
-        term.set_user_var("trigger", "t");
-        assert_eq!(term.user_vars().len(), USER_VARS_MAX);
-        assert_eq!(term.user_var("b"), None, "b evicted as new oldest");
-        assert_eq!(term.user_var("c").map(String::as_str), Some("3"));
-        assert_eq!(term.user_var("trigger").map(String::as_str), Some("t"));
-    }
 
     /// `completed_command_seq` strictly increases once per OSC 133;D — two
     /// commands completing within the same millisecond (indistinguishable by
@@ -356,5 +257,45 @@ mod tests {
             before,
             "the seq survives reset (monotonic for observers)"
         );
+    }
+
+    /// `started_command_seq` counts each C the A→B→C→D gate accepts, block or
+    /// no block, and nothing takes one back: ED 3, Cmd-K and RIS drop the
+    /// blocks (RIS also the running command's D, which `completed_command_seq`
+    /// then never counts), and a checkpoint round trip carries it.
+    /// NEGATIVE CONTROL: a C out of order (no B before it) is not a start.
+    #[test]
+    fn started_command_seq_counts_every_accepted_c_and_no_clear_takes_one() {
+        let prompt = b"\x1b]133;A\x07$ \x1b]133;B\x07";
+        let mut term = Terminal::new(6, 40);
+        term.process(prompt);
+        term.process(b"a\r\n\x1b]133;C\x07\x1b]133;D;0\x07");
+        assert_eq!(term.started_command_seq(), 1);
+        // A C with no B before it is refused by the gate.
+        term.process(b"\x1b]133;A\x07\x1b]133;C\x07");
+        assert_eq!(term.started_command_seq(), 1, "out of order: no start");
+        // `reset` at a prompt: its C counts, the RIS takes its block and the
+        // phase, so the shell's D is refused and no D is counted.
+        term.process(prompt);
+        term.process(b"reset\r\n\x1b]133;C\x07\x1bc\x1b]133;D;0\x07");
+        assert_eq!(term.started_command_seq(), 2);
+        assert_eq!(term.completed_command_seq(), 1, "the RIS swallowed the D");
+        assert!(
+            term.all_blocks().next().is_none(),
+            "the RIS took the blocks"
+        );
+        // `clear` (ED 3 from the running command) and Cmd-K.
+        term.process(prompt);
+        term.process(b"clear\r\n\x1b]133;C\x07\x1b[3J\x1b]133;D;0\x07");
+        assert_eq!(term.started_command_seq(), 3);
+        term.process(prompt);
+        term.process(b"b\r\n\x1b]133;C\x07");
+        term.clear_scrollback();
+        term.process(b"\x1b]133;D;0\x07");
+        assert_eq!(term.started_command_seq(), 4);
+        term.reset();
+        assert_eq!(term.started_command_seq(), 4, "survives reset");
+        let carried = Terminal::from_checkpoint(&term.checkpoint());
+        assert_eq!(carried.started_command_seq(), 4, "a checkpoint carries it");
     }
 }

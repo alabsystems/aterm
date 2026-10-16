@@ -1,0 +1,33 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "windows-sys-052-conformance"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "conformance"
+path = "src/lib.rs"
+crate-type = ["rlib"]
+
+[dependencies]
+# Both sides with exactly the features ring 0.17.14 requests.
+facade = { package = "windows-sys-052-under-test", path = "../under-test", features = ["Win32_Foundation", "Win32_System_Threading"] }
+upstream = { package = "windows-sys", version = "=0.52.0", features = ["Win32_Foundation", "Win32_System_Threading"] }
+
+[features]
+# `probe-*` compile one call through one side, for run.sh's symbol phase.
+probe-facade = []
+probe-upstream = []
+# NEGATIVE CONTROLS: each swaps the facade for a copy with ONE planted
+# mismatch. run.sh requires every one to fail (a const-assert, a coercion, or
+# the symbol or DLL comparison), so no check here can pass vacuously.
+plant-type = []
+plant-size = []
+plant-const = []
+plant-abi = []
+plant-arg = []
+plant-ret = []
+plant-link-name = []
+plant-dll = []

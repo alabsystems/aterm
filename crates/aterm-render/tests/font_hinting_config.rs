@@ -1,23 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! TYPOGRAPHY R2: the `font_hinting` config key's renderer seam
-//! ([`Renderer::set_font_hinting`]) — the one way to change the hint mode.
-//!
-//! Laws under test, on the native hint seam (Linux and Windows):
-//! * the DEFAULT is `full` and the getter round-trips every canonical spelling;
-//! * a same-value set is a free `false` (no atlas invalidation), a real change
-//!   is `true`;
-//! * a mode change actually changes rasterized COVERAGE (non-vacuity: `full`
-//!   vs `off` differ at the desktop 12px) while cell GEOMETRY stays fixed
-//!   (the hinted-seam contract: advances stay linear, so the grid never
-//!   moves);
-//! * an unrecognized spelling resolves to the default (`full`).
-//!
-//! On targets without the seam (macOS CoreText, wasm fontdue) the setter is
-//! inert `false` and the getter reports `"off"`, since no glyph is
-//! grid-fitted. Asserted here too, so the contract is checked on every
-//! platform the suite runs on.
+//! The `font_hinting` renderer seam ([`Renderer::set_font_hinting`]), on the native hint
+//! seam (Linux and Windows): the default is `full` and every spelling reads back as its
+//! canonical mode (unknown ones resolve to `full`, the retired `native` to `light`); a
+//! same-value set returns `false`; a mode change alters coverage at 12px but never cell
+//! geometry. Without the seam (macOS CoreText, wasm) the setter is inert and the getter
+//! reports `"off"`.
 
 #![cfg(feature = "embedded-font")]
 
@@ -48,7 +37,7 @@ fn default_is_full_and_spellings_round_trip() {
     );
     for (spelling, canonical) in [
         ("light", "light"),
-        ("native", "native"),
+        ("native", "light"), // retired; see `native_renders_as_light`
         ("off", "off"),
         ("none", "off"),
         ("0", "off"),
@@ -74,12 +63,8 @@ fn same_value_is_free_change_reports_true() {
     assert!(!r.set_font_hinting("light"), "and is then idempotent");
 }
 
-/// A live-set mode RIDES the font-generation handoffs: the semantic-surface
-/// fork (Settings specimens, Markdown) and the sealed rebuild must render with
-/// the parent's `font_hinting`, not resurrect the construction default — a
-/// `font_hinting = "off"` user must not meet re-hinted text in Settings. On
-/// targets without the seam both getters answer `"off"` and the assertions are
-/// the honesty contract itself.
+/// A live-set mode carries through the semantic-surface fork (Settings specimens,
+/// Markdown) and the sealed rebuild instead of reverting to the construction default.
 #[test]
 fn live_mode_rides_semantic_forks_and_rebuilds() {
     let mut r = renderer();
@@ -123,9 +108,41 @@ fn mode_change_moves_coverage_but_never_geometry() {
             "no hint seam: the setter must be pixel-inert"
         );
     }
-    // And back: the glyph caches re-rasterize on the restored mode, so the
-    // original bytes return exactly (determinism of the hinted raster).
+    // And back: the original bytes return exactly.
     r.set_font_hinting("full");
     let full_again = render_stems(&mut r);
     assert_eq!(full.pixels, full_again.pixels, "mode flips are reversible");
+}
+
+/// The retired `native` spelling renders as `light` (`HintMode::Light`, src/hinted.rs). On
+/// the seam, `native` over `light` is a free no-op that reads back as `light`, and `native`
+/// paints light's pixels whichever mode it replaces. `full` painting the row differently from
+/// `light` is the control that keeps the equality from being vacuous. Off the seam everything
+/// is the inert `off`.
+#[test]
+fn native_renders_as_light() {
+    let mut r = renderer();
+    r.set_font_hinting("light");
+    let light = render_stems(&mut r);
+    assert!(
+        !r.set_font_hinting("native"),
+        "native over light changes nothing, so drops no atlas"
+    );
+    assert_eq!(r.font_hinting(), if HINT_SEAM { "light" } else { "off" });
+    assert_eq!(render_stems(&mut r).pixels, light.pixels);
+
+    r.set_font_hinting("full");
+    let full = render_stems(&mut r);
+    assert_eq!(
+        r.set_font_hinting("native"),
+        HINT_SEAM,
+        "native over full is a real change on the seam"
+    );
+    assert_eq!(render_stems(&mut r).pixels, light.pixels);
+    if HINT_SEAM {
+        assert_ne!(
+            full.pixels, light.pixels,
+            "full and light must paint the row differently (the control)"
+        );
+    }
 }

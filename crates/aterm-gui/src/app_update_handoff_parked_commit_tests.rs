@@ -229,16 +229,10 @@ fn assert_whole(frame: &[u8]) {
 
 const WRITTEN: &str = "attempt-bound Commit pipe closed before its atomic write";
 
-/// A FRAME IN FLIGHT HOLDS THE COMMIT (the lifecycle audit of 2026-10-14,
-/// handoff finding 1). A control verb's 64 KiB paste into a session not in
-/// front is parked mid-frame on a program that is not reading: the spill is
-/// empty and no paste-order job waits, so the drain gate used to read the
-/// egress as settled, and the Commit's `_exit` cut the frame — an open
-/// bracketed paste, every later key read as pasted text, the rest lost. Now
-/// the gate waits for the frame (it re-posts, nothing written), and once the
-/// program has read it whole the same attempt commits.
-///
-/// RED before the fix: the first pass wrote the Commit over the open paste.
+/// A frame in flight holds the Commit: a control verb's 64 KiB paste parked mid-frame on a
+/// program that is not reading is unsettled egress even with the spill empty, since `_exit`
+/// would leave a bracketed paste open and every later key read as pasted text. The gate
+/// re-posts, and once the frame is read whole the same attempt commits.
 #[test]
 fn a_control_paste_in_flight_holds_the_commit_until_its_frame_is_whole() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -273,13 +267,10 @@ fn a_control_paste_in_flight_holds_the_commit_until_its_frame_is_whole() {
     );
 }
 
-/// A FRAME BEGUN AFTER THE GATE'S LAST READING STANDS THE COMMIT DOWN: the
-/// Commit holds every handed session's egress fence through its write, so
-/// the paste waits before its first byte or, already part-way in, refuses
-/// the write as unsettled egress (a lossless retry), and its frame is whole
-/// when the program reads again.
-///
-/// RED without the fence at the write: the Commit was written over it.
+/// A frame begun after the drain gate's last reading stands the Commit down: the Commit holds
+/// every handed session's egress fence through its write, so the paste waits before its first
+/// byte or, already part-way in, refuses the write as unsettled egress (a lossless retry), and
+/// its frame is whole when the program reads again.
 #[test]
 fn a_control_paste_begun_after_the_drain_gate_stands_the_commit_down() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -302,16 +293,10 @@ fn a_control_paste_begun_after_the_drain_gate_stands_the_commit_down() {
     assert_whole(&parked.read_frame(writer));
 }
 
-/// A RESET ON A PARKED SESSION STANDS THE COMMIT DOWN (the lifecycle audit of
-/// 2026-10-14, handoff finding 2). The park closed the reset lane, so `aterm
-/// ctl reset` runs directly on this process's engine and answers `OK
-/// reverted=…`, after the carry the successor restores was taken: committing
-/// would bring the stuck modes back under a reset that reported success. The
-/// reset moves the session's carry serial, the Commit reads it moved
-/// (structural activity, a lossless retry), and this engine runs on, reset.
-/// CONTROL: the same park with no reset commits.
-///
-/// RED before the fix: the Commit was written over the reset.
+/// A reset on a parked session stands the Commit down: with the park's reset lane closed,
+/// `aterm ctl reset` runs on this process's engine after the carry was taken, so committing
+/// would bring the stuck modes back. The reset moves the carry serial, the Commit reads it
+/// moved (structural activity, a lossless retry), and this engine runs on, reset.
 #[test]
 fn a_reset_on_a_parked_session_stands_the_commit_down() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -346,18 +331,11 @@ fn a_reset_on_a_parked_session_stands_the_commit_down() {
     }
 }
 
-/// A RESET AT THE WRITE IS NEVER ANSWERED `OK` (the review of handoff finding
-/// 2). The Commit reads the serials once, under the hold fence it keeps raised
-/// to its `_exit`; a reset that runs after that reading lands on this engine
-/// alone, and the successor restores the carry from before it. Such a reset
-/// waits on the fence: the update lands with it unanswered (its client reads
-/// the connection close, never a false `OK`), or stands down and it is
-/// answered then. Run at the write from the thread that holds the fence, which
-/// cannot lift it meanwhile, it waits out its wait and is refused `ERR busy
-/// update-committing`; the Commit is written.
-///
-/// RED before the fix: answered `OK reset reverted=alt,mouse`, and the Commit
-/// was written over it.
+/// A reset at the write is never answered `OK`: the Commit reads the serials once, under the
+/// hold fence it keeps raised to its `_exit`, and a later reset would land on this engine alone
+/// while the successor restores the carry from before it. So it waits on the fence (the update
+/// lands with it unanswered, or stands down and answers it). Run at the write from the thread
+/// holding the fence, it waits out its bound and is refused `ERR busy update-committing`.
 #[test]
 fn a_reset_at_the_write_is_never_answered_ok() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();

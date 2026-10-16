@@ -6,19 +6,14 @@
 use super::*;
 
 /// Bounded model for the occupied-cell rainbow body budget. `Raise` explores
-/// every integer request through and beyond the 56/255 ceiling. `Buggy=1`
+/// every integer request through and beyond the 236 ceiling. `Buggy=1`
 /// forwards an over-budget request instead of clamping it and must produce a
 /// counterexample, so the proof is not vacuous.
 fn rainbow_occupied_coverage_model() -> aterm_spec::derive::Model {
     use aterm_spec::ty_model;
     ty_model! {
         RainbowOccupiedCoverage {
-            // The position-blind bed ceiling, `RAINBOW_UNDER_COV_CAP`:
-            // `RAINBOW_BAND_COV_CAP_MAX` times `RAINBOW_BED_OVER_GAIN` (the bed
-            // composites source-over, displacing the ground rather than adding
-            // to it). The gain is the largest that lands the product on a whole
-            // level, so the beam's ordered dither cannot carry a capped request
-            // one level past its cap: `236 = floor(212 x 1.1148)`.
+            // The bed's byte ceiling, `ribbon::UNDER_COV_CAP`.
             const Cap = 236;
             const RequestedMax = 270;
             const Buggy = 0;
@@ -67,8 +62,6 @@ fn rainbow_retract_rearm_model() -> aterm_spec::derive::Model {
     }
 }
 
-// ----- rainbow kitty continuous rainbow ribbon -----
-
 /// "rainbow kitty" is the style's user-facing name; "rainbow" maps to it too,
 /// and the laser sweep is "phaser". Rainbow kitty draws no shared comet beam
 /// (its body is the streak). Every name the style has shipped under still
@@ -96,9 +89,9 @@ fn rainbow_kitty_parse_and_beam() {
     assert!(style_has_beam("phaser"), "phaser keeps the shared beam");
 }
 
-/// Tier 0: exhaust the 0..=64 request lattice. The body clamp proves the
-/// occupied-cell budget; the pass-through mutant fails once request 57 is
-/// reachable.
+/// Tier 0: exhaust the 0..=270 request lattice. The body clamp proves the
+/// occupied-cell budget; the pass-through mutant fails once a request past the
+/// 236 cap is reachable.
 #[test]
 fn rainbow_occupied_coverage_derived_model_proves_and_catches_regression() {
     let model = rainbow_occupied_coverage_model();
@@ -259,8 +252,7 @@ fn the_brightest_pixel_in_the_frame_is_under_the_cursor() {
                         // Compose in renderer order, ink-free on purpose: the
                         // clause ranks the effect's own light against the
                         // caret, and the theme foreground (`#C8D3F5`, luminance
-                        // 166) is not the effect's. What the effect does to text
-                        // is `the_effect_never_clips_and_never_lifts_the_text`.
+                        // 166) is not the effect's.
                         let mut f = Glass::new(g, c.theme_bg);
                         f.add_quads(glow.under_quads());
                         f.add_quads(&over);
@@ -451,7 +443,7 @@ fn every_kitty_spelling_draws_the_resident_and_flying_stays_reachable() {
             && !GlowStyle::style_names_underline_ribbon("rainbow kitty"),
         "…and the two really are the geometry fork, or the line above is vacuous"
     );
-    // THE DOG IS UNTOUCHED: widening the kitty list must not reach a dog
+    // The dog is untouched: widening the kitty list must not reach a dog
     // spelling, and the bare kitty word must not become a dog.
     for dog in ["rainbow dog pet", "dog pet", "pet dog", "rainbow puppy pet"] {
         assert!(GlowStyle::style_names_dog_pet(dog), "{dog}");
@@ -475,9 +467,7 @@ fn every_kitty_spelling_draws_the_resident_and_flying_stays_reachable() {
 fn rainbow_hot_ribbon_has_visible_travelling_wave() {
     let g = geom();
     let mut c = cfg(GlowStyle::RainbowKitty, true);
-    // On the default tall body. The underline waves only where it has bloomed
-    // into the typed streak (`rainbow_underline_blooms_into_the_typed_streak`);
-    // at rest it is straight.
+    // On the default tall body.
     c.ribbon_tall = true;
     c.intensity = 1.0;
     c.radius = 0.0;
@@ -514,8 +504,8 @@ fn rainbow_hot_ribbon_has_visible_travelling_wave() {
     assert!(out.len() <= CursorGlow::MAX_QUADS);
 }
 
-/// Momentum: a sustained FAST run makes the ribbon brighter than a lone slow move
-/// (typing heat rides through to the band coverage) — the acceleration tell.
+/// Momentum: a sustained fast run makes the ribbon brighter than a lone slow move
+/// (typing heat rides through to the band coverage).
 #[test]
 fn rainbow_ribbon_brightens_with_typing_momentum() {
     let g = geom();
@@ -532,7 +522,7 @@ fn rainbow_ribbon_brightens_with_typing_momentum() {
             })
             .sum()
     };
-    // COLD: one isolated single-cell move from rest.
+    // Cold: one isolated single-cell move from rest.
     let mut cold = CursorGlow::default();
     let mut out = Vec::new();
     let t0 = Instant::now();
@@ -542,7 +532,7 @@ fn rainbow_ribbon_brightens_with_typing_momentum() {
     cold.tick(Some((3, 3)), t1, &c, g, &mut out);
     out.extend_from_slice(cold.under_quads()); // ribbon rides the under-ink stream
     let cold_ink = band_ink(&mut cold, &out);
-    // HOT: a sustained fast run of single-cell advances builds heat.
+    // Hot: a sustained fast run of single-cell advances builds heat.
     let mut hot = CursorGlow::default();
     let mut t = Instant::now();
     hot.tick(Some((3, 2)), t, &c, g, &mut out);
@@ -584,7 +574,7 @@ fn rainbow_ribbon_spans_four_letters_at_any_rhythm() {
     );
 }
 
-/// The four-letter guarantee holds at a GLACIAL rhythm too (~0.55 cps): the
+/// The four-letter guarantee holds at a glacial rhythm too (~0.55 cps): the
 /// chain window covers any plausible typing cadence, not just brisk ones.
 #[test]
 fn rainbow_ribbon_four_letters_even_glacial() {
@@ -778,7 +768,7 @@ fn one_press_still_cannot_buy_a_word_wide_hop() {
         );
     }
 
-    // ONE press, and the caret jumps five columns: vim's `w`.
+    // One press, and the caret jumps five columns: vim's `w`.
     let at = t0 + Duration::from_millis(260);
     glow.note_typed_cells(at, 1);
     glow.tick(
@@ -819,7 +809,7 @@ fn a_refused_rainbow_sweep_names_the_credit_budget_that_refused_it() {
     let t0 = Instant::now();
     glow.tick(Some((3, 2)), t0, &c, g, &mut out);
 
-    // Five ordinary echoes SPEND their five credits as they land.
+    // Five ordinary echoes spend their five credits as they land.
     for i in 1..=5u16 {
         let at = t0 + Duration::from_millis(u64::from(i) * 40);
         glow.note_typed_cells(at, 1);
@@ -841,7 +831,7 @@ fn a_refused_rainbow_sweep_names_the_credit_budget_that_refused_it() {
         "nothing was refused yet: {admitted:?}"
     );
 
-    // ONE press, caret jumps five columns: vim's `w`. Refused by the credit
+    // One press, caret jumps five columns: vim's `w`. Refused by the credit
     // budget, and the ring must say which budget.
     let at = t0 + Duration::from_millis(260);
     glow.note_typed_cells(at, 1);
@@ -976,18 +966,9 @@ fn a_wide_glyphs_single_press_sweeps_its_continuation_cell() {
 /// the caret advances two, so a raw-column share rule (`credits * 4 >=
 /// dc_abs * 3`) could never pass. The share is denominated in glyphs: the row
 /// probe ([`CursorGlow::observe_row`]) spells a wide glyph's continuation
-/// column `'\0'`, and those columns in the swept run are counted as second
-/// halves of glyphs the presses laid.
-///
-/// Controls:
-///
-/// * the same probe over narrow text is unchanged (the probe neither lights
-///   nor darkens anything);
-/// * one press still cannot buy a wide hop: the `credits >= 2` floor reads the
-///   raw ledger (see `a_wide_glyphs_single_press_sweeps_its_continuation_cell`);
-/// * two presses cannot buy seven wide glyphs: each press claims at most one
-///   extra column, so over an all-wide run the rule reduces to
-///   `presses >= 0.75 * glyphs`, the narrow rule's fraction.
+/// column `'\0'`, and those columns in the swept run count as second halves of
+/// glyphs the presses laid. Each press claims at most one extra column, so over
+/// an all-wide run the rule reduces to `presses >= 0.75 * glyphs`.
 #[test]
 fn a_wide_glyph_echo_pays_for_the_cells_its_own_glyphs_occupy() {
     let g = geom();
@@ -1124,7 +1105,7 @@ fn rainbow_typing_wrap_folds_around_the_line_end() {
     let mut out = Vec::new();
     let t = Instant::now();
     glow.tick(Some((3, 38)), t, &c, g, &mut out);
-    // The wrap SHAPE: from the second-to-last column (a wide-glyph wrap)
+    // The wrap shape: from the second-to-last column (a wide-glyph wrap)
     // down one row to column 1, backed by the committed wide glyph.
     let wrapped = t + Duration::from_millis(30);
     glow.note_synthetic_typed(wrapped, 2);
@@ -1154,7 +1135,7 @@ fn rainbow_typing_wrap_folds_around_the_line_end() {
         "no mid-row cells were invented by the fold"
     );
 
-    // …and a COLD +2 hop after the fold, with no press behind it, sweeps
+    // …and a cold +2 hop after the fold, with no press behind it, sweeps
     // nothing: the license declines it before the classifier runs.
     let program = wrapped + Duration::from_millis(400);
     glow.tick(Some((4, 3)), program, &c, g, &mut out);
@@ -1233,7 +1214,7 @@ fn rainbow_first_key_orphan_does_not_outlive_the_ribbon() {
     glow.tick(Some((3, 1)), t0, &c, g, &mut out);
     glow.note_synthetic_typed(t0, 1);
     glow.tick(Some((3, 2)), t0, &c, g, &mut out); // establish the rhythm clock
-    // A 3s pause, then ONE lone key (its inter-key gap is a full 3s).
+    // A 3 s pause, then one lone key (its inter-key gap is a full 3 s).
     let t_orphan = t0 + Duration::from_millis(3000);
     glow.note_synthetic_typed(t_orphan, 1);
     glow.tick(Some((3, 3)), t_orphan, &c, g, &mut out);
@@ -1253,8 +1234,8 @@ fn rainbow_first_key_orphan_does_not_outlive_the_ribbon() {
     let t_last = t;
     let orphan = (3u16, 3u16);
 
-    // Within ~1.5s the first key's cell is gone while the burst still glows —
-    // it does NOT outlive the ribbon it started.
+    // Within ~1.5 s the first key's cell is gone while the burst still glows:
+    // it does not outlive the ribbon it started.
     glow.tick(
         Some((0, 5)),
         t_last + Duration::from_millis(1500),
@@ -1283,7 +1264,7 @@ fn rainbow_first_key_orphan_does_not_outlive_the_ribbon() {
     );
 }
 
-/// The ribbon decays to EXACTLY empty when the cursor rests — 0% idle, fingerprint 0.
+/// The ribbon decays to exactly empty when the cursor rests: 0% idle, fingerprint 0.
 #[test]
 fn rainbow_decays_to_empty_when_idle() {
     let g = geom();

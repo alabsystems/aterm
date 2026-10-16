@@ -1,14 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-//! The ONE place a property-combinator instance is declared. The umbrella in
-//! `derived_ring_ty.rs` iterates this table and discharges every row on both
-//! tiers — the in-process interpreter BMC always, `ty` wherever installed — so
-//! adding a verified property is a generator instance (≈3 lines in
-//! `derive::props`) + ONE row here — zero new test functions. Each row carries
-//! its proof CLASS: a `Safety` invariant (prove+catch) or a `Liveness`
-//! deadlock-freedom check (`CHECK_DEADLOCK` / the no-successor wedge), the
-//! latter with its work-complete `is_final` predicate.
+//! The one table of property-combinator instances. The umbrella in `derived_ring_ty.rs`
+//! discharges every row on both tiers (the interpreter BMC always, `ty` where installed), so a new
+//! verified property is a generator instance in `derive::props` plus one row here. Each row carries
+//! its proof class: a `Safety` invariant (prove and catch) or a `Liveness` deadlock-freedom check
+//! with its work-complete `is_final` predicate.
 
 use std::collections::BTreeMap;
 
@@ -18,12 +15,11 @@ pub type State = BTreeMap<&'static str, i64>;
 
 /// How an instance is verified.
 pub enum Class {
-    /// A safety invariant: ty proves it (Buggy=0) + counterexample (Buggy=1);
-    /// the BMC twin enumerates the bounded space.
+    /// A safety invariant: `ty` proves it at `Buggy = 0` and finds its counterexample at
+    /// `Buggy = 1`; the BMC twin enumerates the bounded space.
     Safety,
-    /// Liveness / deadlock-freedom: ty with CHECK_DEADLOCK + the BMC no-successor
-    /// wedge check. `is_final` marks the legitimate work-complete terminal so it is
-    /// not mistaken for a wedge.
+    /// Deadlock freedom: `ty` with `CHECK_DEADLOCK` and the BMC no-successor check. `is_final`
+    /// marks the legitimate work-complete terminal, which is not a wedge.
     Liveness { is_final: fn(&State) -> bool },
 }
 
@@ -33,9 +29,8 @@ pub struct Instance {
     pub class: Class,
 }
 
-/// THE TABLE — the introspection control-plane property suite. A new property:
-/// add its `derive::props` generator instance (or, when no generator states it, a
-/// hand-written model, as reply fidelity is) + one row here.
+/// The introspection control-plane property suite. A property no generator states is a
+/// hand-written model, as reply fidelity is.
 pub fn instances() -> Vec<Instance> {
     use aterm_spec::derive::{
         authorize_soundness_model, capability_secrecy_model, dispatch_complete_model,

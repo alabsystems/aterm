@@ -644,6 +644,8 @@ fn dispatch_argv(line: &str) -> (String, Vec<String>) {
 // ── NDJSON records, addressed by astream Subject (`/`-rooted, wildcard-free) ──
 
 fn event_record(pid: &str, sid: &str, body: &str) -> String {
+    let pid = json_escape(pid);
+    let sid = json_escape(sid);
     format!(
         "{{\"subject\":\"/fleet/{}/events/{}\",\"instance\":\"{}\",\"sid\":\"{}\",\"event\":\"{}\"}}",
         pid,
@@ -685,6 +687,7 @@ fn batch_error_record(input_line: usize, dispatched: usize, error: &str) -> Stri
 }
 
 fn err_record(pid: &str, msg: &str) -> String {
+    let pid = json_escape(pid);
     format!(
         "{{\"subject\":\"/fleet/{}/events\",\"instance\":\"{}\",\"error\":\"{}\"}}",
         pid,
@@ -709,19 +712,22 @@ mod tests {
     use aterm_uds::spawnfd::Command;
 
     #[test]
-    fn federation_queue_is_bounded_and_backpressures_at_capacity() {
-        let (tx, rx) = federation_channel();
-        for index in 0..FEDERATED_RECORD_CAPACITY {
-            tx.try_send(index.to_string()).expect("capacity slot");
+    fn federated_addresses_cannot_break_ndjson() {
+        let sid = "s-\"\\\u{202e}";
+        let mut channels = std::collections::HashMap::from([("1".to_string(), sid.to_string())]);
+        let resolved = resolve_federated_sid(&mut channels, "1", "exited code=0");
+        assert!(channels.is_empty());
+        for sid in [resolved.as_str(), "unmapped\"\\"] {
+            let record = event_record("42", sid, "changed\n\u{1b}[2K");
+            let value: aterm_json::Value = aterm_json::from_str(&record).expect("NDJSON object");
+            assert_eq!(value["sid"].as_str(), Some(sid));
+            assert_eq!(
+                value["subject"].as_str(),
+                Some(format!("/fleet/42/events/{sid}").as_str())
+            );
+            assert_eq!(value["event"].as_str(), Some("changed\n\u{1b}[2K"));
+            assert!(!record.contains(['\n', '\u{1b}', '\u{202e}']));
         }
-        assert!(
-            matches!(
-                tx.try_send("overflow".to_string()),
-                Err(mpsc::TrySendError::Full(_))
-            ),
-            "a blocked stdout writer must bound retained event records"
-        );
-        drop(rx);
     }
 
     #[test]

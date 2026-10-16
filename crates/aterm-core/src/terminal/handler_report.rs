@@ -15,38 +15,12 @@ use super::{
 use core::fmt::Write as _;
 
 impl TerminalHandler<'_> {
-    /// Handle DECSTR (Soft Terminal Reset).
-    ///
-    /// CSI ! p
-    ///
-    /// Soft reset performs a partial reset of the terminal, resetting:
-    /// - Cursor visibility (DECTCEM) → visible
-    /// - Cursor style (DECSCUSR) → default (blinking block)
-    /// - Origin mode (DECOM) → disabled
-    /// - Auto-wrap mode (DECAWM) → enabled (xterm behavior)
-    /// - Insert mode (IRM) → disabled (replace mode)
-    /// - Application cursor keys (DECCKM) → disabled
-    /// - Application keypad mode (DECKPAM) → disabled
-    /// - Reverse wraparound mode (DECSET 45) → disabled
-    /// - Left/right margin mode (DECLRMM, DECSET 69) → disabled
-    /// - Reverse video mode (DECSCNM) → disabled (per VT220 §4.5.113)
-    /// - Synchronized output mode (2026) → disabled
-    /// - New line mode (LNM) → disabled (per VT510 spec §4.5.113)
-    /// - Focus reporting (mode 1004) → disabled (per xterm)
-    /// - Bracketed paste mode (2004) → disabled (per xterm)
-    /// - Mouse tracking mode (9/1000/1002/1003) → disabled (per xterm)
-    /// - Mouse encoding (1005/1006/1015/1016) → X10 default (per xterm)
-    /// - Text attributes (SGR) → default
-    /// - Character sets (G0-G3, GL) → defaults
-    /// - Scroll margins (DECSTBM) → full screen
-    /// - Saved cursor states → cleared
-    ///
-    /// Unlike RIS (hard reset), DECSTR does not reset:
-    /// - Alternate screen buffer (stays on current screen)
-    /// - Screen content (not erased)
-    /// - Tab stops
-    /// - Color palette
-    /// - Working directory
+    /// Handle DECSTR (`CSI ! p`), the soft reset. Modes (cursor, wrap, insert,
+    /// keys and keypad, margins, sync output, mouse, focus, paste, BiDi, keyboard
+    /// protocols), SGR, charsets, the scroll region and the current screen's
+    /// DECSC save return to their defaults, following xterm where it and the
+    /// VT510 differ. Screen content, the active screen, tab stops, the palette
+    /// and the cwd are kept: clearing them is RIS's job.
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
         aterm_spec::refines(
@@ -58,56 +32,46 @@ impl TerminalHandler<'_> {
     pub(super) fn handle_decstr(&mut self) {
         self.modes.cursor_visible = true;
 
-        // Reset cursor style to the host-preferred default (not the hardcoded
-        // CursorStyle::default()), so a soft reset honors the configured default.
+        // The host-preferred default, not CursorStyle::default().
         self.modes.cursor_style = *self.default_cursor_style;
 
         self.modes.origin_mode = false;
 
-        // Reset auto-wrap mode (xterm sets to true, VT510 says false - follow xterm)
+        // xterm sets auto-wrap; the VT510 resets it. Follow xterm.
         self.modes.auto_wrap = true;
 
         self.modes.insert_mode = false;
 
         self.modes.application_cursor_keys = false;
 
-        // Reset application keypad mode (DECKPAM/DECKPNM)
         self.modes.application_keypad = false;
 
-        // Reset cursor blink (mode 12). Mode 12 is the blink bit of the cursor
-        // style (see `set_cursor_blink`), so it follows the default style just
-        // restored rather than a hardcoded `false`.
+        // Mode 12 is the cursor style's blink bit (see `set_cursor_blink`), so it
+        // follows the style just restored.
         self.modes.cursor_blink = self.modes.cursor_style.blinks();
 
-        // Reset VT52 mode (DECANM, mode 2)
         self.modes.vt52_mode = false;
 
-        // Reset 132-column mode flag (DECCOLM, mode 3)
         self.modes.column_mode_132 = false;
 
-        // Reset DECCOLM enable (mode 40) — per xterm, soft reset disables mode 40
         self.modes.deccolm_enable = false;
 
-        // Reset DECNCSM (mode 95) — per xterm, soft reset clears DECNCSM
         self.modes.decncsm = false;
 
-        // Reset reverse wraparound mode (DECSET 45)
         self.modes.reverse_wraparound = false;
 
-        // Reset left/right margin mode (DECLRMM, DECSET 69) and clear the
-        // horizontal margins unconditionally, so stored margins cannot come back
-        // when DECLRMM is re-enabled later.
+        // Clear the horizontal margins too, so stored margins cannot return when
+        // DECLRMM is re-enabled.
         self.modes.left_right_margin_mode = false;
         self.grid.reset_horizontal_margins();
 
-        // Reset reverse video mode (DECSCNM) per VT220 spec §4.5.113
         if self.modes.reverse_video {
             self.modes.reverse_video = false;
             self.grid.damage_mut().mark_full();
         }
 
-        // Reset synchronized output mode (per synchronized rendering spec).
-        // A reset mid-window counts as a close for the host's present-hold.
+        // A reset inside a mode-2026 window counts as its close for the host's
+        // present-hold.
         if self.modes.synchronized_output {
             self.transient.sync_end_seq += 1;
         }
@@ -117,34 +81,25 @@ impl TerminalHandler<'_> {
         self.transient.app_sync_open = false;
         self.transient.app_sync_dirty = false;
 
-        // Reset sixel display mode (DECSDM, mode 80) — xterm resets on DECSTR
         self.modes.sixel_display_mode = false;
 
-        // Reset alternate scroll mode (mode 1007) — xterm resets this on DECSTR
         self.modes.alternate_scroll = false;
 
-        // Reset new-line mode (LNM, ANSI mode 20) per VT510 spec §4.5.113
         self.modes.new_line_mode = false;
 
-        // Reset focus reporting (mode 1004) — xterm resets on DECSTR
         self.modes.focus_reporting = false;
 
-        // Reset bracketed paste (mode 2004), as xterm does on DECSTR.
         self.modes.bracketed_paste = false;
 
-        // Reset mouse tracking mode (modes 9/1000/1002/1003) — xterm resets on DECSTR.
-        // Without this, mouse events keep being sent after soft reset.
         self.modes.mouse_mode = MouseMode::None;
 
-        // Reset mouse encoding mode (modes 1005/1006/1015/1016) — xterm resets on DECSTR.
         self.modes.mouse_encoding = MouseEncoding::X10;
 
-        // Reset BiDi modes to defaults (Terminal WG spec)
+        // BiDi modes to the Terminal WG defaults (arrow swap on).
         self.modes.bidi_mode = crate::config::BiDiMode::Implicit;
         self.modes.bidi_direction = aterm_types::ParagraphDirection::Auto;
         self.modes.bidi_box_mirroring = false;
         self.modes.bidi_autodetection = false;
-        // Terminal WG spec: default enabled
         self.modes.bidi_arrow_swap = true;
         self.invalidate_bidi_all();
 
@@ -152,40 +107,32 @@ impl TerminalHandler<'_> {
         // DECSCA protection is reset by DECSTR (VT510); reset_sgr() keeps
         // `protected` (correct for SGR 0), so clear it here.
         self.style.protected = false;
-        // Refresh the writer caches and re-arm the BCE cursor template from the
-        // default rendition, so the old background is not used for the next
-        // erase or scroll.
+        // Refresh the writer caches and re-arm the BCE cursor template, so the
+        // old background is not used for the next erase or scroll.
         self.sgr_style().apply_style_change();
         self.transient.current_underline_color = None;
-        // Clear the active hyperlink so text after the soft reset does not
-        // inherit it.
         self.transient.current_hyperlink = None;
         self.transient.current_hyperlink_id = None;
         self.transient.update_has_transient_extras();
 
-        // Clear last graphic character so REP (CSI b) does not repeat
-        // stale characters after soft reset.
+        // REP (CSI b) must not repeat a character from before the reset.
         self.transient.last_graphic_char = None;
 
-        // Clear VT52 cursor addressing state, in case DECSTR arrived while
-        // collecting ESC Y row/col.
+        // DECSTR may arrive mid ESC Y row/col.
         self.transient.vt52_cursor_state = Vt52CursorState::default();
 
-        // Clear SGR stack — DECSTR resets all SGR state, so stale push entries
-        // from before the reset should not be restorable via XTPOPSGR.
+        // Pushes from before the reset must not be restorable via XTPOPSGR.
         self.transient.sgr_stack.clear();
 
-        // Clear XTSAVE'd mode values, as xterm does: DECSTR resets the modes.
+        // XTSAVE'd mode values go too, as in xterm: DECSTR resets the modes.
         self.transient.xtsave_modes.clear();
 
-        // Reset xterm keyboard modifier/format options (XTMODKEYS/XTFMTKEYS).
-        // xterm resets modifyOtherKeys on DECSTR.
+        // xterm resets modifyOtherKeys (XTMODKEYS/XTFMTKEYS) on DECSTR.
         self.xterm_keyboard.reset();
 
-        // Reset the current screen's Kitty keyboard state (flags and stack), an
-        // xterm-style soft-reset convention also used by foot and ghostty (the
-        // kitty spec is silent on DECSTR). The inactive screen's state survives;
-        // clearing both is RIS's job.
+        // Only the current screen's Kitty keyboard state (flags and stack), as
+        // foot and ghostty do (the kitty spec is silent on DECSTR); clearing both
+        // is RIS's job.
         self.kitty_keyboard
             .reset_current_screen(aterm_types::ScreenBuffer::from(self.modes.alternate_screen));
 
@@ -206,16 +153,12 @@ impl TerminalHandler<'_> {
         self.grid.set_cursor(0, 0);
     }
 
-    /// Handle DSR (Device Status Report).
-    ///
-    /// CSI Ps n
-    /// - Ps = 5: Status report - responds with CSI 0 n (terminal OK)
-    /// - Ps = 6: Cursor Position Report (CPR) - responds with CSI row ; col R
+    /// Handle DSR (`CSI Ps n`): 5 answers `CSI 0 n` (OK), 6 the cursor position
+    /// (CPR) `CSI row ; col R`.
     pub(super) fn handle_dsr(&mut self, cap: &ResponseCapability, params: &[u16]) {
         let param = params.first().copied().unwrap_or(0);
         match param {
             5 => {
-                // Terminal OK.
                 self.send_response(cap, b"\x1b[0n");
             }
             6 => {
@@ -244,22 +187,18 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// Handle DECDSR (DEC Device Status Report).
-    ///
-    /// CSI ? Ps n
-    /// - Ps = 6: DECXCPR (Extended Cursor Position Report) - responds with
-    ///   CSI ? row ; col ; page R (page always 1 for us)
-    /// - Ps = 15: Printer status - responds with CSI ? 13 n (no printer)
-    /// - Ps = 25: UDK status - responds with CSI ? 20 n (UDKs unlocked)
-    /// - Ps = 26: Keyboard status - responds with CSI ? 27 ; 1 ; 0 ; 0 n
-    ///   (North American, ready, no LK201 options)
+    /// Handle DECDSR (`CSI ? Ps n`):
+    /// - 6: DECXCPR, `CSI ? row ; col ; 1 R` (page always 1)
+    /// - 15: printer status, `CSI ? 13 n` (no printer)
+    /// - 25: UDK status, `CSI ? 20 n` (unlocked)
+    /// - 26: keyboard status, `CSI ? 27 ; 1 ; 0 ; 0 n` (North American, ready, no
+    ///   LK201 options)
+    /// - 996: color scheme, `CSI ? 997 ; Ps n`
     pub(super) fn handle_decdsr(&mut self, cap: &ResponseCapability, params: &[u16]) {
         let param = params.first().copied().unwrap_or(0);
         match param {
             6 => {
-                // DECXCPR - Extended Cursor Position Report
-                // Response: CSI ? row ; col ; page R (1-indexed, page always 1)
-                // Per VT510: affected by origin mode (DECOM) and DECLRMM.
+                // Origin-relative like CPR (VT510).
                 let (row, col) = if self.modes.origin_mode {
                     let region = self.grid.scroll_region();
                     let r = self.grid.cursor_row().saturating_sub(region.top) + 1;
@@ -279,15 +218,12 @@ impl TerminalHandler<'_> {
                 self.send_response(cap, response.as_bytes());
             }
             15 => {
-                // Printer status: no printer connected
                 self.send_response(cap, b"\x1b[?13n");
             }
             25 => {
-                // UDK status: UDKs are unlocked
                 self.send_response(cap, b"\x1b[?20n");
             }
             26 => {
-                // Keyboard status: North American, ready, no LK201 options
                 self.send_response(cap, b"\x1b[?27;1;0;0n");
             }
             996 => {
@@ -306,18 +242,10 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// Handle Primary Device Attributes (DA1).
-    ///
-    /// CSI Ps c (where Ps is 0 or omitted)
-    ///
-    /// Reports terminal type and capabilities. The conformance level is
-    /// dynamic based on `modes.vt_level` (changed by DECSCL).
-    ///
-    /// Default response (VT420): CSI ? 64 ; 6 ; 22 ; 28 c
-    /// - 64 = VT420 conformance level
-    /// - 6 = Selective erase (DECSCA/DECSED/DECSEL)
-    /// - 22 = ANSI color
-    /// - 28 = Rectangular editing (DECFRA/DECCARA/DECCRA/DECSERA)
+    /// Handle DA1 (`CSI c`). The conformance level follows `modes.vt_level`
+    /// (DECSCL), and the flags with it: 6 (selective erase) and 22 (ANSI color)
+    /// from VT220, 28 (rectangular editing) from VT420, and 4 (sixel) with the
+    /// `sixel` feature. The default VT420 answers `CSI ? 64 ; 6 ; 22 ; 28 c`.
     pub(super) fn handle_primary_da(&mut self, cap: &ResponseCapability) {
         // VT100 has its own format: CSI ? 1 ; 2 c (with the Advanced Video
         // Option).
@@ -341,10 +269,6 @@ impl TerminalHandler<'_> {
         let mut response = StackResponse::<24>::new();
         response.push_bytes(b"\x1b[?");
         response.push_bytes(level);
-        // Capability flags are level-dependent per VT510 spec:
-        // - VT220+ (62+): 6 = selective erase, 22 = ANSI color
-        // - VT420+ (64+): 28 = rectangular editing (DECFRA/DECCARA/DECCRA/DECSERA)
-        // - Sixel (4): advertised when `sixel` feature is enabled (VT220+)
         match self.modes.vt_level {
             aterm_types::VtLevel::VT100 => unreachable!(),
             aterm_types::VtLevel::VT220
@@ -369,18 +293,10 @@ impl TerminalHandler<'_> {
         self.send_response(cap, response.as_bytes());
     }
 
-    /// Handle Secondary Device Attributes (DA2).
-    ///
-    /// CSI > Ps c (where Ps is 0 or omitted)
-    ///
-    /// Reports terminal type, firmware version, and keyboard type.
-    ///
-    /// Response: CSI > Pp ; Pv ; Pc c
-    /// - Pp = Terminal type (41 = VT420, consistent with DA1 conformance level 64)
-    /// - Pv = Firmware version (we use 100 as a version number)
-    /// - Pc = ROM cartridge registration number (0 = none)
+    /// Handle DA2 (`CSI > c`): `CSI > Pp ; 100 ; 0 c`, Pp the terminal type for
+    /// the DECSCL level (41 for VT420, 64 for VT520), 100 the firmware version, 0
+    /// no ROM cartridge.
     pub(super) fn handle_secondary_da(&mut self, cap: &ResponseCapability) {
-        // Pp follows the DECSCL level (41 for VT420, 64 for VT520).
         let da2 = self.modes.vt_level.da2_param();
         // DA2: ESC [ > + u16 + ";100;0c" ≤ 14 bytes.
         let mut response = StackResponse::<24>::new();
@@ -388,42 +304,27 @@ impl TerminalHandler<'_> {
         self.send_response(cap, response.as_bytes());
     }
 
-    /// Handle Tertiary Device Attributes (DA3).
-    ///
-    /// CSI = Ps c (where Ps is 0 or omitted)
-    ///
-    /// Reports the terminal's unit ID (serial number). Per VT510/VT520 spec,
-    /// the response is a DCS sequence with the unit identifier hex-encoded.
-    ///
-    /// Response: DCS ! | <hex-unit-id> ST
-    /// - hex-unit-id = "30" (ASCII '0' = 0x30, meaning no unit ID assigned)
+    /// Handle DA3 (`CSI = c`): the unit ID, hex-encoded in a DCS, as
+    /// `DCS ! | 30 ST` (ASCII `0`: none assigned).
     pub(super) fn handle_tertiary_da(&mut self, cap: &ResponseCapability) {
         self.send_response(cap, b"\x1bP!|30\x1b\\");
     }
 
-    /// Handle Kitty keyboard protocol query (CSI ? u).
-    ///
-    /// Responds with `CSI ? flags u` where flags is the current keyboard flags value.
+    /// Handle the Kitty keyboard query (`CSI ? u`): answer `CSI ? flags u`.
     pub(super) fn handle_kitty_keyboard_query(&mut self, cap: &ResponseCapability) {
         let flags = self.kitty_keyboard.query_flags();
-        // Format: CSI ? flags u — ESC [ ? + u8 (≤3 digits) + 'u' ≤ 7 bytes.
+        // ESC [ ? + u8 (≤3 digits) + 'u' ≤ 7 bytes.
         let mut response = StackResponse::<16>::new();
         let _ = write!(response, "\x1b[?{flags}u");
         self.send_response(cap, response.as_bytes());
     }
 
-    /// Handle XTPUSHSGR - push SGR attributes onto stack (CSI # {).
-    ///
-    /// Saves the current SGR state (colors, flags, underline color) onto an internal
-    /// stack for later restoration with XTPOPSGR. Stack is bounded to
-    /// `SGR_STACK_MAX_DEPTH` (10) entries - oldest entry is discarded if full.
-    ///
-    /// Per xterm spec, `CSI # { Ps...` can selectively push only specific
-    /// attributes. If no params (or param 0), all attributes are pushed.
-    /// Recognized Ps values:
-    /// - 1/2: bold/dim group
+    /// Handle XTPUSHSGR (`CSI # { Ps...`): push the SGR state for XTPOPSGR, at
+    /// most `SGR_STACK_MAX_DEPTH` (10) entries, the oldest dropped when full. No
+    /// Ps (or 0) pushes everything; otherwise only the named groups:
+    /// - 1/2: bold/dim
     /// - 3: italic
-    /// - 4/21: underline group (all underline styles + underline color)
+    /// - 4/21: underline (every style, and the underline color)
     /// - 5: blink
     /// - 7: inverse
     /// - 8: invisible
@@ -432,7 +333,6 @@ impl TerminalHandler<'_> {
     /// - 40/41/48/49: background color
     /// - 53: overline
     pub(super) fn handle_xtpushsgr(&mut self, params: &[u16]) {
-        // Enforce stack depth limit (O(1) eviction via VecDeque)
         if self.transient.sgr_stack.len() >= SGR_STACK_MAX_DEPTH {
             self.transient.sgr_stack.pop_front();
         }
@@ -451,28 +351,22 @@ impl TerminalHandler<'_> {
         self.transient.sgr_stack.push_back(entry);
     }
 
-    /// Handle XTPOPSGR - pop and restore SGR attributes from stack (CSI # }).
-    ///
-    /// Restores the most recently pushed SGR state. If the stack is empty,
-    /// this is a no-op (per xterm behavior). When selective push was used,
-    /// only the masked attributes are restored.
+    /// Handle XTPOPSGR (`CSI # }`): restore the most recent push (only its
+    /// masked attributes after a selective push); an empty stack is a no-op, as
+    /// in xterm.
     pub(super) fn handle_xtpopsgr(&mut self) {
         if let Some(entry) = self.transient.sgr_stack.pop_back() {
             if entry.mask.is_all() {
-                // Full restore — fast path.
-                // Preserve the current DECSCA protection attribute: XTPUSHSGR
-                // is an SGR-only stack, and DECSCA is not an SGR attribute
-                // (it is controlled by CSI Ps " q, not CSI m).
+                // DECSCA protection (CSI Ps " q) is not an SGR attribute, so it
+                // stays.
                 let saved_protected = self.style.protected;
                 *self.style = entry.style;
                 self.style.protected = saved_protected;
                 self.transient.current_underline_color = entry.underline_color;
             } else {
-                // Selective restore — only restore masked attributes
                 use crate::grid::CellFlags;
 
                 if entry.mask.has_bold() {
-                    // Bold/dim group: restore BOLD and DIM flags
                     let bold_dim = CellFlags::BOLD.union(CellFlags::DIM);
                     self.style.flags.remove(bold_dim);
                     self.style
@@ -486,9 +380,7 @@ impl TerminalHandler<'_> {
                         .insert(CellFlags(entry.style.flags.0 & CellFlags::ITALIC.0));
                 }
                 if entry.mask.has_underline() {
-                    // Underline group: all underline style flags + underline color.
-                    // ALL_UNDERLINES covers UNDERLINE, DOUBLE_UNDERLINE,
-                    // CURLY_UNDERLINE, DOTTED_UNDERLINE, and DASHED_UNDERLINE.
+                    // Every underline style plus the underline color.
                     let ul_flags = CellFlags::ALL_UNDERLINES;
                     self.style.flags.remove(ul_flags);
                     self.style
@@ -532,7 +424,6 @@ impl TerminalHandler<'_> {
                         .flags
                         .insert(CellFlags(entry.style.flags.0 & CellFlags::OVERLINE.0));
                 }
-                // Recompute cached state after selective modification
                 self.style.update_cached_colors();
             }
             self.transient.update_has_transient_extras();
@@ -540,7 +431,6 @@ impl TerminalHandler<'_> {
             // (`update_cached_colors` above already refreshed the writer caches).
             self.sgr_style().apply_style_change();
         }
-        // Empty stack = no-op (xterm behavior)
     }
 }
 
@@ -571,8 +461,7 @@ mod color_scheme_tests {
     fn response_append_alloc_fault_drops_response_fail_closed() {
         use crate::fault;
         let mut term = Terminal::new(24, 80);
-        // With the response-append alloc fault armed, a query that would normally
-        // reply produces no bytes — the response is dropped (fail closed), not a panic.
+        // An armed response-append alloc fault drops the reply instead of panicking.
         fault::with_armed("response.append_alloc", || {
             term.process(b"\x1b[?996n");
         });

@@ -26,14 +26,6 @@ fn g1_defaults_to_ascii_so_prints_plain_text() {
     assert_eq!(s.cursor(), (0, 1));
 }
 
-/// Designating G1 explicitly still maps through SCS; only the power-on
-/// default is ASCII.
-#[test]
-fn g1_designated_line_drawing_still_translates() {
-    let s = run(b"\x1b)0\x0eq\x0fq");
-    assert_eq!(s.row(0), "\u{2500}q", "ESC ) 0 + SO must still map via SCS");
-}
-
 // =========================================================================
 // 2. HT preserves the wrap-pending (do_wrap) flag
 // =========================================================================

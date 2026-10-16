@@ -2,14 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Line limit enforcement (#1865, #7929) and binary search validation.
+//! Line limit enforcement and binary search validation.
 
 use super::*;
 
 #[test]
 fn scrollback_line_limit_default_is_safe_cap() {
-    // #7929: default line limit must be set to prevent runaway-stdout DoS.
-    // Callers that want unlimited history must explicitly opt in.
+    // The default line limit bounds a runaway stdout; unlimited history is an
+    // explicit opt-in.
     let sb = Scrollback::with_defaults();
     assert_eq!(sb.line_limit(), Some(DEFAULT_LINE_LIMIT));
     assert_eq!(
@@ -21,8 +21,8 @@ fn scrollback_line_limit_default_is_safe_cap() {
 #[test]
 fn scrollback_set_line_limit() {
     let mut sb = Scrollback::with_defaults();
-    // The default is a bounded limit (#7929). Clear first to exercise the
-    // full Some→None→Some matrix.
+    // The default is bounded. Clear first to exercise the full Some→None→Some
+    // matrix.
     sb.set_line_limit(None);
     assert_eq!(sb.line_limit(), None);
 
@@ -107,14 +107,12 @@ fn scrollback_line_limit_zero_disables() {
 
 #[test]
 fn scrollback_default_caps_runaway_push_from_oldest() {
-    // #7929 regression: with the default line_limit in place, pushing
-    // far more than the cap must not grow `line_count` past it, and must
-    // evict the oldest lines (tier-ordered: cold → warm → hot).
+    // Pushing far more than the cap keeps `line_count` at it and evicts the
+    // oldest lines first (cold → warm → hot).
     let mut sb = Scrollback::with_defaults();
     assert_eq!(sb.line_limit(), Some(DEFAULT_LINE_LIMIT));
 
-    // 10x the default cap. Using a small limit + small tiers keeps this
-    // fast enough for the unit suite while exercising cross-tier drops.
+    // 10x a small cap with small tiers: fast, and still drops across tiers.
     let cap = 500usize;
     sb.set_line_limit(Some(cap));
 
@@ -195,10 +193,8 @@ fn scrollback_line_limit_evicts_from_oldest_tier_first() {
 
 #[test]
 fn scrollback_line_limit_bounds_massive_push() {
-    // Regression for #7929 HN F09-1: a runaway stdout must not blow out
-    // scrollback. Push >> cap and assert the final footprint is bounded by
-    // the cap plus one hot-tier block of amortization (push_line only
-    // truncates *after* the line is appended).
+    // A runaway stdout stays bounded: pushed far past the cap, the line count
+    // is the cap and the budgeted memory stays small.
     let cap = 200usize;
     let mut sb = Scrollback::new(20, 200, 10_000_000);
     sb.set_line_limit(Some(cap));

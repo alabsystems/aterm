@@ -8,35 +8,28 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Tiered scrollback storage with LZ4/Zstd compression and disk offload"
+description = "Tiered scrollback storage with LZ4 compression and disk offload"
 
 [features]
-# Default = headless hot(RAM)+warm(LZ4) scrollback. NO libc / zstd / std::fs in
-# the dependency closure (the §2.7 "no-platform" engine invariant). The disk and
-# zstd tiers are opt-in below; the warm tier's LZ4 path is the default fallback
-# for what would otherwise be the zstd-compressed cold tier.
+# Default = headless hot(RAM)+warm(LZ4)+cold(LZ4) scrollback. NO libc / std::fs
+# in the dependency closure (the §2.7 "no-platform" engine invariant). The disk
+# tier is opt-in below. Every compressed tier uses the one first-party LZ4 codec
+# (aterm-lz4).
 default = []
 # Exposes the fuzz-only decode API (`lz4` becomes `pub`) to the cargo-fuzz crate
 # in fuzz/, and runs src/decode_fuzz_tests.rs at its deep counts
 # (90k/90k/90k/40k inputs instead of 10k per loop).
 fuzz = []
-# Test-only corruption seam (`Scrollback::inject_corrupted_warm_block`) for
-# DOWNSTREAM crates' conformance tests; enabled only from a dev-dependency.
-testing = []
-# Opt-in zstd-compressed cold tier (default = LZ4-only). Gates the `zstd` dep and
-# all of its encode/decode sites. Off by default to keep the engine pure-Rust.
-zstd = ["dep:zstd"]
 # Opt-in disk-backed cold tier: pulls in `libc` (mmap/munmap/msync), `std::fs`,
-# and the memory-mapped `.dtrm` cold store. Implies `zstd` because the on-disk
-# page format is zstd-compressed. Off by default per §2.7.
-disk-tier = ["dep:libc", "zstd"]
+# and the memory-mapped `.dtrm` cold store, whose pages use the same LZ4 cold
+# codec as the in-memory cold tier. Off by default per §2.7.
+disk-tier = ["dep:libc"]
 
 [dependencies]
 aterm-rle = { workspace = true }
 aterm-types = { workspace = true }
 aterm-alloc = { workspace = true }
 aterm-lz4 = { workspace = true }
-zstd = { workspace = true, optional = true }
 libc = { workspace = true, optional = true }
 aterm-log = { workspace = true }
 

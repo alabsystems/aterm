@@ -250,11 +250,17 @@ pub fn installed_exposes(layout: &Layout, program: &str) -> Option<Vec<String>> 
         if owner != program {
             continue;
         }
+        // The TOOL's name, never the shim file's: every reader treats an expose as a tool
+        // (`bin/<name>` + the exe suffix in a sysroot link, `ToolName::new` for the
+        // tombstone test, `which`'s "exposes" list). On unix the two are one spelling; on
+        // Windows the file is `ay.cmd`, and a sysroot link then looked for
+        // `bin/ay.cmd.exe` in the checkout and refused every one (found 2026-09-29).
         let name = shim.file_name().to_string_lossy().into_owned();
-        if ToolName::from_shim_file(&name).is_some_and(|t| t.is_alias()) {
+        let tool = ToolName::from_shim_file(&name);
+        if tool.as_ref().is_some_and(ToolName::is_alias) {
             continue;
         }
-        out.push(name);
+        out.push(tool.map_or(name, |tool| tool.as_str().to_string()));
     }
     if out.is_empty() { None } else { Some(out) }
 }
@@ -502,6 +508,12 @@ pub fn uninstall(layout: &Layout, program: &str) -> io::Result<()> {
     //    to `decide` and to `rollback`. Fail-closed in the direction that repairs itself.
     if prog_store.starts_with(&layout.prefix) && prog_store.exists() {
         crate::store::unmark_program_builds(&prog_store);
+        // A single-binary build's `bin/` is sealed (`store::seal_bin`): unseal each.
+        if let Ok(entries) = std::fs::read_dir(&prog_store) {
+            for entry in entries.flatten() {
+                crate::store::unseal_bin(&entry.path());
+            }
+        }
         std::fs::remove_dir_all(&prog_store)?;
     }
 

@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The focused pane's damage carrier on the composed (split) present.
-//!
-//! `composed_focus_scratch` is the per-window resident buffer only the
-//! focused pane is filled into, so it carries the identity/`extract_gen`
-//! continuity `cell_frame_damage_scoped_into` needs. Pass 2 lends it to two
-//! host mutators (the IME preedit overlay and prediction ghosts), which would
-//! otherwise be retained as engine truth; `return_focused_pane_scratch` takes
-//! whether the host wrote as a required argument. These tests pin both the
-//! retention and the disown.
+//! The focused pane's damage carrier on the composed (split) present. `composed_focus_scratch`,
+//! the resident buffer only the focused pane fills, carries the identity/`extract_gen`
+//! continuity `cell_frame_damage_scoped_into` needs. The IME preedit overlay and prediction
+//! ghosts write into it, and those cells must not be retained as engine truth, so
+//! `return_focused_pane_scratch` takes whether the host wrote and then disowns the carrier.
+//! These tests pin both the retention and the disown.
 
 use crate::{App, WindowId, term_lock};
 use std::time::{Duration, Instant};
@@ -19,7 +16,7 @@ const COLS: usize = 80;
 const DT: Duration = Duration::from_millis(16);
 /// The fixture writes rows 0..=5 and parks the caret on row 6.
 const CARET_ROW: usize = 6;
-/// A row the caret never touches — the retention witness's home.
+/// A row the caret never touches: the retention witness.
 const QUIET_ROW: usize = 2;
 
 /// A focused window holding a 2-pane split, both leaves with several rows and
@@ -30,8 +27,7 @@ fn split_app() -> (App, WindowId) {
     let wid = WindowId(0);
     let sid = app.split_active_stub_tab(wid);
     app.windows.get_mut(&wid).expect("window").focused = true;
-    // Both cases need a second presented frame, so enable the animating
-    // resident pet explicitly.
+    // Both cases need a second presented frame, so enable the animating resident.
     app.config.cursor_trail = Some(true);
     let bg = aterm_render::Theme::default().bg;
     for s in [0u64, sid] {
@@ -123,8 +119,8 @@ fn focus_rect(app: &App, wid: WindowId) -> crate::pane::PaneRect {
         .expect("the focused leaf is laid out")
 }
 
-/// The background leaf's session id — damage that presents a frame without
-/// touching a single focused-pane row.
+/// The background leaf's session id: damage there presents a frame without touching a
+/// focused-pane row.
 fn other_session(app: &App, wid: WindowId) -> u64 {
     let ws = app.windows.get(&wid).expect("window");
     let tree = &ws.layouts[ws.tabs.active];
@@ -141,8 +137,7 @@ fn feed(app: &App, sid: u64, bytes: &[u8]) {
     term_lock(&term).process(bytes);
 }
 
-/// The character the PRESENTED composite carries at a focused-pane-local
-/// cell.
+/// The character the presented composite carries at a focused-pane-local cell.
 fn composed_char(app: &App, wid: WindowId, pane_row: usize, pane_col: usize) -> char {
     let r = focus_rect(app, wid);
     let ws = app.windows.get(&wid).expect("window");
@@ -164,9 +159,8 @@ fn disown(app: &mut App, wid: WindowId) {
 /// carrier. On an undamaged row it survives the scoped arm and is overwritten
 /// by the full arm, so it witnesses which arm ran without a global counter.
 fn plant_marker(app: &mut App, wid: WindowId, pane_row: usize) {
-    // The composed retention lane would skip this undeclared write (its D-2
-    // stamp has not moved), hiding the marker for reasons unrelated to the
-    // extraction arm; force retention off so the witness tests the arm.
+    // Composed retention would skip this undeclared write (its stamp has not moved) and hide
+    // the marker for another reason; retention off makes the witness test the arm.
     super::COMPOSE_RETAIN_OFF.with(|off| off.set(true));
     let ws = app.windows.get_mut(&wid).expect("window");
     ws.composed_focus_scratch

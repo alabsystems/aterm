@@ -15,26 +15,15 @@ pub enum Key {
 }
 
 impl Key {
-    /// The main-block key a KEYPAD key stands in for — `None` when `self` is
-    /// not a keypad key, or is `NumpadBegin`, the one keypad key the main
-    /// block has no twin for (xterm's `CSI E`).
+    /// The main-block key a keypad key stands in for: digits and operators fold to the glyph
+    /// they type (`'5'`, `'.'`, `','` for KP_Separator, `'='` for KP_Equal), editing and
+    /// navigation keys to their named twins (`NumpadEnter` -> `Enter`). `None` for a non-keypad
+    /// key and for `NumpadBegin`, which has no main-block twin.
     ///
-    /// ONE fold, so its consumers cannot drift, now that a physical keypad
-    /// reaches the engine as `Numpad*` (the winit seam resolves KP_5 to
-    /// `Numpad5`, KP_Enter to `NumpadEnter`, a NumLock-off KP_1 to
-    /// `NumpadEnd`): the kitty encoder's legacy rule — "all keypad keys are
-    /// reported as their equivalent non-keypad keys" until the application
-    /// asks to tell them apart — and, in the GUI, the native pages (a Settings
-    /// field types `5` for KP_5 and an editor moves to the line end for a
-    /// NumLock-off KP_1; no page needs the keypad identity) and the press
-    /// classifier (KP_Enter submits a turn, a keypad digit is a typed glyph).
-    /// The PTY encoders never fold outside kitty legacy semantics: DECKPAM's
-    /// SS3 forms and kitty disambiguate exist to tell the keypad apart.
-    ///
-    /// Digits and operators fold to the glyph the key types — `'5'`, `'.'`,
-    /// `','` for KP_Separator, `'='` for KP_Equal — and the editing and
-    /// navigation keys to their named twins (`NumpadEnter` -> `Enter`,
-    /// `NumpadEnd` -> `End`, …).
+    /// The one fold, shared by the kitty encoder's legacy rule ("all keypad keys are reported
+    /// as their equivalent non-keypad keys" until the app asks to tell them apart) and the
+    /// GUI's native pages and press classifier. The PTY encoders never fold outside kitty
+    /// legacy semantics.
     #[must_use]
     pub fn main_block_twin(&self) -> Option<Key> {
         let Key::Named(named) = self else {
@@ -253,7 +242,7 @@ pub enum NamedKey {
     /// Right Meta key
     MetaRight,
 
-    // Numpad keys (when numlock is off or in app keypad mode)
+    // Keypad keys
     /// Numpad 0
     Numpad0,
     /// Numpad 1
@@ -315,14 +304,9 @@ pub enum NamedKey {
 }
 
 impl NamedKey {
-    /// A sided modifier key's modifier bit and its other-side twin
-    /// (`ShiftLeft` → `(SHIFT, ShiftRight)`); `None` for every other key.
-    ///
-    /// Kitty reports a modifier key's release with its own bit still SET while
-    /// the twin is held (both Shifts down, one let go: `shift` is still in
-    /// force). The window answers that from its physical-press record when it
-    /// forwards the release; the encoder takes the bit as the caller states it
-    /// ([`super::encode_key_with_event`]).
+    /// A sided modifier key's modifier bit and its other-side twin (`ShiftLeft` →
+    /// `(SHIFT, ShiftRight)`); `None` for every other key. Kitty keeps a released modifier's bit
+    /// set while the twin is held ([`super::encode_key_with_event`]).
     #[must_use]
     pub fn modifier_twin(self) -> Option<(Modifiers, NamedKey)> {
         Some(match self {
@@ -342,17 +326,9 @@ impl NamedKey {
         })
     }
 
-    /// Get the Kitty keyboard protocol key code for this named key.
-    ///
-    /// Returns the Unicode code point used in CSI u encoding.
-    // Trust L0: one exhaustive match instead of the former five-table
-    // `or_else` combinator chain terminated by an `.expect(...)`. The tables
-    // (control/function/numpad/media/modifier) were disjoint and together
-    // covered every variant, so the expect never fired — but the verifier saw
-    // four opaque closure envs plus a reachable panic edge it could not
-    // discharge. Every variant maps to exactly the same code as before
-    // (values verified against the kitty functional-key table), so this is
-    // behavior-identical with no panic path left to prove.
+    /// The Kitty keyboard protocol key code: the code point CSI u sends for this key.
+    // One exhaustive match (no table chain or panic edge for the verifier), values from kitty's
+    // functional-key table.
     #[must_use]
     pub fn kitty_code(self) -> u32 {
         match self {
@@ -499,14 +475,8 @@ bitflags! {
 }
 
 impl Modifiers {
-    /// Get the Kitty keyboard protocol modifier value.
-    ///
-    /// Kitty uses `modifiers + 1` format (1 = no modifiers).
-    ///
-    /// `saturating_add` guards the latent overflow: all eight modifier bits set
-    /// (`bits() == 255`, reachable only if a future path ever sets CAPS_LOCK +
-    /// NUM_LOCK together with the six chord bits) would otherwise wrap to 0 in
-    /// release / panic in debug. Saturating to 255 is a clamped value, never a wrap.
+    /// The Kitty keyboard protocol modifier value: `modifiers + 1` (1 = none), saturating at
+    /// 255 when all eight bits are set.
     #[must_use]
     pub fn kitty_encoded(self) -> u8 {
         self.bits().saturating_add(1)
@@ -517,9 +487,8 @@ impl Modifiers {
     /// Xterm encoding: `1 + shift(1) + alt(2) + ctrl(4) + meta(8)`.
     #[must_use]
     pub fn xterm_encoded(self) -> u8 {
-        // Trust L0: saturating adds — exact here (the sum is at most
-        // 1+1+2+4+8 = 16), but the native model checker falsely refutes the
-        // plain `+=` overflow asserts; saturating has no panic path.
+        // Saturating adds are exact (the sum is at most 16); the model checker refutes plain
+        // `+=` overflow spuriously.
         let mut val = 1u8;
         if self.contains(Modifiers::SHIFT) {
             val = val.saturating_add(1);

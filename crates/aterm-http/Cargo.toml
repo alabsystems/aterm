@@ -43,10 +43,6 @@ windows-sys = { version = "0.61", default-features = false, features = [
   "Win32_Security_Cryptography",
 ] }
 
-[dev-dependencies]
-# The one trustd probe and skip line (`src/verifier/test_platform.rs`).
-aterm-uds = { workspace = true, features = ["test-support"] }
-
 [lints]
 workspace = true
 

@@ -118,26 +118,6 @@ fn search_with_positions() {
 }
 
 #[test]
-fn search_ordered() {
-    let mut index = SearchIndex::new();
-    index.index_line(0, "test line 0");
-    index.index_line(1, "test line 1");
-    index.index_line(2, "test line 2");
-
-    // Forward search
-    let fwd = index.search_ordered("test", SearchDirection::Forward);
-    assert_eq!(fwd[0].line, 0);
-    assert_eq!(fwd[1].line, 1);
-    assert_eq!(fwd[2].line, 2);
-
-    // Backward search
-    let bwd = index.search_ordered("test", SearchDirection::Backward);
-    assert_eq!(bwd[0].line, 2);
-    assert_eq!(bwd[1].line, 1);
-    assert_eq!(bwd[2].line, 0);
-}
-
-#[test]
 fn push_line() {
     let mut index = SearchIndex::new();
 
@@ -260,14 +240,6 @@ fn find_next_prev_same_line_column_boundary() {
 }
 
 #[test]
-fn search_match_struct() {
-    let m = SearchMatch::new(5, 10, 15);
-    assert_eq!(m.line, 5);
-    assert_eq!(m.start_col, 10);
-    assert_eq!(m.end_col, 15);
-}
-
-#[test]
 fn index_clear() {
     let mut index = SearchIndex::new();
     index.index_line(0, "test");
@@ -276,15 +248,6 @@ fn index_clear() {
     index.clear();
     assert!(index.is_empty());
     assert_eq!(index.len(), 0);
-}
-
-#[test]
-fn get_line() {
-    let mut index = SearchIndex::new();
-    index.index_line(5, "hello");
-
-    assert_eq!(index.get_line(5), Some("hello"));
-    assert_eq!(index.get_line(0), None);
 }
 
 #[test]

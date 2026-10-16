@@ -129,7 +129,7 @@ fn plant_canaries() -> Vec<(&'static str, String)> {
         .map(|key| {
             let canary = format!("canary-{key}");
             aterm_log::env::set(key, &canary);
-            (*key, canary)
+            (key.name(), canary)
         })
         .collect()
 }
@@ -145,9 +145,9 @@ fn canaries_moved(planted: &[(&'static str, String)]) -> bool {
 /// Save every name the walk touches, restored on drop (declare after the lock).
 fn restore_all() -> Vec<RestoreVar> {
     ["XDG_RUNTIME_DIR", "HOME"]
-        .iter()
-        .chain(HANDOFF_ENV_KEYS)
-        .map(|key| RestoreVar::new(key))
+        .into_iter()
+        .chain(HANDOFF_ENV_KEYS.iter().map(|key| key.name()))
+        .map(RestoreVar::new)
         .collect()
 }
 
@@ -328,7 +328,7 @@ fn the_launched_lane_claims_into_the_snapshot_and_adopts_without_touching_the_en
         phase: CLAIMED,
         claim_ok: [ENV_FDS, ENV_READY_FD, ENV_COMMIT_FD]
             .iter()
-            .all(|key| env.present(key)),
+            .all(|key| env.present(*key)),
         env_mut_after_spawn: canaries_moved(&planted),
         ..dialled
     };
@@ -525,8 +525,8 @@ fn the_fork_lane_intake_from_the_snapshot_proves_what_the_parent_expects() {
     // The boot apply's re-exec would carry exactly what is still held, then
     // the attestation.
     let exec = prearmed.final_exec_env_with(&env);
-    assert!(exec.iter().any(|(key, _)| key == ENV_FDS));
-    assert!(exec.iter().any(|(key, _)| key == ENV_PARENT_PID));
+    assert!(exec.iter().any(|(key, _)| key == ENV_FDS.name()));
+    assert!(exec.iter().any(|(key, _)| key == ENV_PARENT_PID.name()));
 
     let (stop, warm) = spawn_warm_thread();
     let planted = plant_canaries();

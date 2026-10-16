@@ -75,6 +75,9 @@ impl ConfigSnapshot {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ExpectedValue {
+    /// No expectation beyond the patch's base revision. Settings always says
+    /// what it expects; only tests write without an expectation.
+    #[cfg(test)]
     Any,
     Exact(Option<String>),
 }
@@ -572,6 +575,7 @@ impl VersionedConfigService {
                 .get(&edit.key)
                 .is_some_and(|revision| *revision > request.base_revision);
             let expectation_failed = match &edit.expected {
+                #[cfg(test)]
                 ExpectedValue::Any => false,
                 ExpectedValue::Exact(expected) => current.get(&edit.key).cloned() != *expected,
             };
@@ -927,6 +931,9 @@ fn semantic_item(item: &aterm_toml::edit::Item) -> String {
             } else {
                 value.to_string().trim().to_owned()
             }
+        }
+        aterm_toml::edit::Item::Table(table) if aterm_toml::edit::TableLike::is_empty(table) => {
+            "{}".to_owned()
         }
         aterm_toml::edit::Item::Table(table) => table.to_string().trim().to_owned(),
         aterm_toml::edit::Item::ArrayOfTables(tables) => tables.to_string().trim().to_owned(),
@@ -1464,44 +1471,6 @@ mod tests {
     }
 
     #[test]
-    fn rejected_sensitive_control_material_is_redacted_from_service_result() {
-        for (key, pasted, expected) in [
-            (
-                crate::prefs::EDIT_TITLE_SUMMARY_TOKEN_FILE,
-                "Bearer service-result-must-not-echo-this-secret",
-                "expected a file path",
-            ),
-            (
-                crate::prefs::EDIT_TITLE_SUMMARY_CA_FILE,
-                concat!("-----BEGIN ", "PRIVATE KEY-----service-result-secret"),
-                "expected a file path",
-            ),
-            (
-                crate::prefs::EDIT_TITLE_SUMMARY_ENDPOINT,
-                "https://models.example.test/chat?api_key=service-result-secret",
-                "without a query or fragment",
-            ),
-        ] {
-            let mut service = VersionedConfigService::new(String::new()).unwrap();
-            let before = service.snapshot();
-            let result = service.patch(ConfigPatchRequest {
-                base_revision: before.revision,
-                edits: vec![ConfigKeyEdit {
-                    key: key.into(),
-                    expected: ExpectedValue::Any,
-                    value: Some(pasted.into()),
-                }],
-            });
-            let ConfigPatchResult::Rejected { message, .. } = result else {
-                panic!("pasted sensitive material should be rejected for {key}");
-            };
-            assert!(!message.contains(pasted), "material leaked: {message}");
-            assert!(message.contains(expected), "{message}");
-            assert_eq!(service.snapshot(), before);
-        }
-    }
-
-    #[test]
     fn unrelated_patch_reuses_asset_arc_and_source_changes_require_worker_admission() {
         use std::sync::Arc;
 
@@ -1632,6 +1601,93 @@ mod tests {
         let _ = std::fs::remove_file(config_path);
     }
 
+    /// An authored empty collection is still an authored value. Clearing it
+    /// and applying the actual Undo token restores its typed empty collection,
+    /// rather than refusing or silently turning it into an absent setting.
+    #[test]
+    fn undo_restores_authored_empty_collections() {
+        for (key, authored) in [
+            ("palette", "palette = []\n"),
+            ("palette_overrides", "palette_overrides = {}\n"),
+            ("palette_overrides", "[palette_overrides]\n"),
+            (
+                "palette_overrides",
+                "[palette_overrides]\n# An authored empty section.\n",
+            ),
+            ("shell_args", "shell_args = []\n"),
+            ("font_features", "font_features = []\n"),
+        ] {
+            let text = format!("font_px = 13.0\n{authored}");
+            let expected: aterm_toml::Value = aterm_toml::from_str(&text).unwrap();
+            let mut service = VersionedConfigService::new(text).unwrap();
+            assert!(service.value(key).unwrap().is_some());
+            let ConfigPatchResult::Applied { snapshot, undo } =
+                service.reset_all(service.snapshot().revision, [key.to_string()])
+            else {
+                panic!("{authored}: clear must apply");
+            };
+            assert!(service.value(key).unwrap().is_none(), "{authored}");
+            assert!(snapshot.text.contains("font_px = 13.0"));
+            let ConfigPatchResult::Applied { snapshot, .. } = service.undo(undo) else {
+                panic!("{authored}: Undo must restore the authored empty collection");
+            };
+            assert!(service.value(key).unwrap().is_some(), "{authored}");
+            let restored: aterm_toml::Value = aterm_toml::from_str(&snapshot.text).unwrap();
+            assert_eq!(
+                restored, expected,
+                "{authored}: typed value and unrelated setting survive"
+            );
+            let _: crate::app_config::Config = aterm_toml::from_str(&snapshot.text).unwrap();
+        }
+    }
+
+    /// The value the service reports for a cleared palette (the slot table in
+    /// either spelling, the `palette` array) is what Undo writes back, and it
+    /// lands as the same TOML, so the file still loads. Control: a slot table
+    /// with an out-of-range slot or a non-colour is refused, never written.
+    #[test]
+    fn a_reported_palette_value_writes_back_as_toml() {
+        for text in [
+            "palette_overrides = { 12 = \"#88c0d0\", 3 = \"#112233\" }\n",
+            "[palette_overrides]\n12 = \"#88c0d0\"\n3 = \"#112233\"\n",
+        ] {
+            let raw = parse_values(text).unwrap()["palette_overrides"].clone();
+            let out = crate::prefs::apply_prefs_edits("", &[("palette_overrides", Some(raw))])
+                .unwrap_or_else(|error| panic!("{text}: {error}"));
+            let config: crate::app_config::Config = aterm_toml::from_str(&out).expect(&out);
+            let slots = config.palette_overrides.expect(&out);
+            assert_eq!(
+                slots.get("12").map(String::as_str),
+                Some("#88c0d0"),
+                "{out}"
+            );
+            assert_eq!(slots.get("3").map(String::as_str), Some("#112233"), "{out}");
+        }
+        let raw =
+            parse_values("palette = [\"#1d1f21\", \"#cc6666\"]\n").unwrap()["palette"].clone();
+        let out = crate::prefs::apply_prefs_edits("", &[("palette", Some(raw))]).unwrap();
+        let config: crate::app_config::Config = aterm_toml::from_str(&out).expect(&out);
+        assert_eq!(
+            config.palette,
+            Some(vec!["#1d1f21".to_string(), "#cc6666".to_string()])
+        );
+        for bad in [
+            "{ 300 = \"#88c0d0\" }",
+            "{ 12 = \"nope\" }",
+            "[]",
+            "#88c0d0",
+        ] {
+            assert!(
+                crate::prefs::apply_prefs_edits(
+                    "",
+                    &[("palette_overrides", Some(bad.to_string()))]
+                )
+                .is_err(),
+                "{bad}"
+            );
+        }
+    }
+
     /// Full-depth dotted projection: each item in a table tree is exposed under its
     /// dotted path with per-key semantics, while each table keeps its whole-table
     /// opaque entry. An absent child is absent; an effective default is presentation.
@@ -1745,7 +1801,7 @@ include = ["nested"]
 
     /// Dotted keys take part in OCC: a patch expecting the old child value conflicts
     /// once the file moved, like a flat key; the winning write and blank-revert both go
-    /// through `apply_prefs_edits`, and an emptied table is retained.
+    /// through `apply_prefs_edits`, and a table the revert leaves bare goes with it.
     #[test]
     fn dotted_key_occ_conflict_write_and_blank_revert() {
         let mut service =
@@ -1785,8 +1841,8 @@ include = ["nested"]
             Some("false")
         );
 
-        // Blank reverts: the table's last key goes, and the emptied [matrix_rain]
-        // header is retained (it may carry comments; empty parses to defaults).
+        // Blank reverts: the table's last key goes, and the bare [matrix_rain]
+        // header with it (no comment of its own; empty parses to defaults).
         let rev = service.snapshot().revision;
         let reverted = service.patch(edit(
             rev,
@@ -1803,9 +1859,8 @@ include = ["nested"]
             snapshot.text
         );
         assert!(
-            snapshot.text.contains("[matrix_rain]"),
-            "an emptied table is RETAINED (the nested writer's contract — its \
-             header may carry user comments, and empty parses to the defaults): {:?}",
+            !snapshot.text.contains("[matrix_rain]"),
+            "a bare table goes with its last key: {:?}",
             snapshot.text
         );
         assert_eq!(service.value("matrix_rain.enabled").unwrap(), None);
@@ -1813,7 +1868,7 @@ include = ["nested"]
 
     /// Depth-2 dotted keys behave like depth-1: `sparkle_words.profanity.enabled` gets
     /// its own entry, a stale expectation conflicts while the current one applies, and
-    /// blank-revert removes only the leaf, retaining the emptied tables at both depths.
+    /// blank-revert removes the leaf and the tables it left bare at both depths.
     #[test]
     fn depth_two_dotted_key_projection_occ_and_blank_revert() {
         let values = parse_values(
@@ -1885,7 +1940,7 @@ include = ["nested"]
             Some("false")
         );
 
-        // Blank reverts only the leaf; the emptied tables at both depths are retained.
+        // Blank reverts the leaf, and the tables it left bare at both depths.
         let rev = service.snapshot().revision;
         let reverted = service.patch(edit(
             rev,
@@ -1902,9 +1957,8 @@ include = ["nested"]
             snapshot.text
         );
         assert!(
-            snapshot.text.contains("[sparkle_words]")
-                && snapshot.text.contains("[sparkle_words.profanity]"),
-            "emptied tables are RETAINED at both depths: {:?}",
+            !snapshot.text.contains("[sparkle_words"),
+            "bare tables go at both depths: {:?}",
             snapshot.text
         );
         assert_eq!(

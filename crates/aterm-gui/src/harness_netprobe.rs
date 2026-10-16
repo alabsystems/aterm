@@ -919,11 +919,11 @@ mod tests {
         assert_eq!(probe_once(&seam, BUDGET), Outcome::Unknown);
     }
 
-    /// A resolver that blocks: the ask never waits on it and reads Unknown
-    /// once the probe is past its budget; exactly one thread, and one probe
-    /// in flight however often it is asked. What the stuck probe finally
-    /// finds — past its budget — is Unknown too, never Down. NEGATIVE
-    /// CONTROL: a resolver that fails AT ONCE reads Down.
+    /// A resolver that blocks: the ask never waits on it and reads Unknown;
+    /// exactly one thread, and one probe in flight however often it is
+    /// asked. What a probe finds past its budget is Unknown, never Down
+    /// (`NetState`'s own test holds the overrun's verdict). NEGATIVE
+    /// CONTROL: the same no-name answer in time reads Down.
     #[test]
     fn a_resolver_that_blocks_past_the_budget_reads_unknown_and_starts_no_second_probe() {
         struct Stuck {
@@ -958,17 +958,12 @@ mod tests {
         while stuck.calls.load(Ordering::SeqCst) == 0 && Instant::now() < until {
             std::thread::sleep(Duration::from_millis(5));
         }
-        std::thread::sleep(Duration::from_millis(80));
         for _ in 0..5 {
             assert_eq!(np.ask("s-1"), Reach::Unknown);
             assert_eq!(np.ask("s-2"), Reach::Unknown);
         }
-        std::thread::sleep(Duration::from_millis(20));
         assert_eq!(stuck.calls.load(Ordering::SeqCst), 1, "one probe in flight");
         assert_eq!(np.spawned.load(Ordering::SeqCst), 1, "one thread");
-        release.send(()).expect("the stuck resolve");
-        std::thread::sleep(Duration::from_millis(50));
-        assert_eq!(np.ask("s-1"), Reach::Unknown, "an overrun is no Down");
         np.stop();
         drop(release);
 
@@ -985,6 +980,8 @@ mod tests {
                 unreachable!()
             }
         }
+        // Past its budget the same answer is no Down.
+        assert_eq!(probe_once(&Nx, Duration::ZERO), Outcome::Unknown);
         let np = NetProbe::with(Arc::new(Nx), BUDGET);
         let asked = Instant::now();
         let mut seen = np.ask("s-1");

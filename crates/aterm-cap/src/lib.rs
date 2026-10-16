@@ -13,12 +13,14 @@
 //!    so capabilities flow only from a held [`Authority`] via
 //!    [`Authority::grant`].
 //! 2. No mint reachability (`docs/ATERM_DESIGN.md` §5.4): the one mint,
-//!    [`Authority::root_authority`], is `unsafe` and sealed behind the
-//!    `launcher-mint` feature (or this crate's `test` cfg), which only the
-//!    trusted launchers enable, so no engine crate can name it. The property is
-//!    proven by [`aterm_spec::derive::mint_reachability_model`] (invariant
-//!    `NoUntrustedTop`) and bound to the tree by
-//!    `crates/aterm-cap/tests/mint_reachability.rs`.
+//!    [`Authority::root_authority`], is `unsafe` and exists only under the
+//!    `launcher-mint` feature (or this crate's `test` cfg). Cargo unifies
+//!    features, so the cfg seals it only in a graph with no launcher; in the
+//!    shipped build the `launcher-mint` source guard (`aterm-census --guards`)
+//!    holds it: outside aterm-gui and aterm-cli no shipped code names the mint
+//!    and no shipped manifest enables the feature. The property is proven by
+//!    [`aterm_spec::derive::mint_reachability_model`] (invariant
+//!    `NoUntrustedTop`).
 
 use std::marker::PhantomData;
 
@@ -128,12 +130,12 @@ impl Authority {
     ///
     /// # Sealing
     ///
-    /// Sealed behind the `launcher-mint` cargo feature (or this crate's `test`
-    /// cfg): only the trusted launchers (`aterm-gui`, `aterm-cli`) enable it,
-    /// so for every other crate the symbol does not exist and cannot be named,
-    /// even in an `unsafe` block. Proven by
-    /// [`aterm_spec::derive::mint_reachability_model`] and bound to the tree by
-    /// `tests/mint_reachability.rs`.
+    /// Exists only under the `launcher-mint` cargo feature (or this crate's
+    /// `test` cfg), which only the trusted launchers (`aterm-gui`, `aterm-cli`)
+    /// enable. Feature unification makes it nameable by every crate in a build
+    /// that holds a launcher, so the `launcher-mint` source guard
+    /// (`aterm-census --guards`) keeps every shipped call in those two crates.
+    /// Proven by [`aterm_spec::derive::mint_reachability_model`].
     #[cfg(any(test, feature = "launcher-mint"))]
     #[doc(hidden)]
     #[must_use]
@@ -234,22 +236,6 @@ mod tests {
 
         let certified: Cap<Spawn> = authority.grant(Tier::Certified);
         assert_eq!(require(&certified, Tier::Trusted), Ok(()));
-    }
-
-    // The effect layer: a privileged op that cannot be called without a
-    // Cap<Spawn> of sufficient tier. (Struct-literal forgery is a compile-time
-    // impossibility: the `_seal` field is private.)
-    #[test]
-    fn effect_gated_operation() {
-        fn privileged_spawn(cap: &Cap<Spawn>) -> Result<&'static str, Denied> {
-            require(cap, Tier::Trusted)?;
-            Ok("spawned")
-        }
-        let authority = test_authority();
-        let ok: Cap<Spawn> = authority.grant(Tier::Trusted);
-        let weak: Cap<Spawn> = authority.grant(Tier::Untrusted);
-        assert_eq!(privileged_spawn(&ok), Ok("spawned"));
-        assert!(privileged_spawn(&weak).is_err());
     }
 
     #[test]

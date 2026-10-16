@@ -4,9 +4,9 @@
 //! UAX #29 Grapheme Cluster Break conformance tests.
 //!
 //! This test suite runs our grapheme segmenter against the official
-//! `GraphemeBreakTest.txt` file from the Unicode Character Database, plus
-//! a cross-validation pass against the `unicode-segmentation` crate on a
-//! large corpus of realistic terminal text.
+//! `GraphemeBreakTest.txt` file from the Unicode Character Database, plus the
+//! answers `unicode-segmentation` gave where it disagreed (recorded once, while
+//! winit's Windows backend still used it).
 //!
 //! The UAX #29 test file uses the following format:
 //! ```text
@@ -179,5 +179,47 @@ fn grapheme_indices_agree_with_graphemes() {
         assert_eq!(at, input.len(), "graphemes cover {input:?}");
         let ours: Vec<(usize, &str)> = GraphemeClusters::grapheme_indices(input).collect();
         assert_eq!(ours, expected, "grapheme_indices for {input:?}");
+    }
+}
+
+/// winit's Windows backend asks one question of a key event's text, "is it
+/// more than one grapheme cluster?", and until 2026-10-15 asked it of
+/// unicode-segmentation 1.13.3 (`grapheme_indices(true).count() > 1`, Unicode
+/// 17 tables). It asks this crate now (`graphemes().count() > 1`, Unicode 16).
+///
+/// Recorded once with both crates, before the switch: the answers agree on
+/// 1,092 of the 1,093 cases in GraphemeBreakTest-16.0.0.txt, on every scalar
+/// value alone (1,112,064 strings), and on every scalar followed by each of
+/// sixteen probes (U+0301, ZWJ, U+0903, a regional indicator, Hangul L, V, T and
+/// LV, U+0600, `a`, CR, LF, VS16, a skin tone, virama, KA: 17,793,024 strings)
+/// but eight. All nine disagreements are below; each is a Unicode 16 -> 17
+/// property change, and this crate answers as the 16.0.0 file does. The
+/// agreements are `uax29_official_conformance`.
+#[test]
+fn where_unicode_segmentation_disagreed_this_crate_follows_unicode_16() {
+    // GraphemeBreakTest-16.0.0.txt line 1105: U+2701 is Extended_Pictographic
+    // in Unicode 16 (GB11 joins across the ZWJ); unicode-segmentation's tables
+    // drop it, and it answered two clusters.
+    assert_eq!("\u{2701}\u{200D}\u{2701}".graphemes().count(), 1);
+    // U+11A3A is Prepend in Unicode 16 (GB9b); unicode-segmentation's tables
+    // have it as Other, and it answered two clusters before every probe that
+    // starts a cluster of its own.
+    for next in [
+        'a',
+        '\u{0600}',
+        '\u{0915}',
+        '\u{1100}',
+        '\u{1161}',
+        '\u{11A8}',
+        '\u{AC00}',
+        '\u{1F1E6}',
+    ] {
+        let text: String = ['\u{11A3A}', next].into_iter().collect();
+        assert_eq!(
+            text.graphemes().count(),
+            1,
+            "U+11A3A then U+{:04X}",
+            next as u32
+        );
     }
 }

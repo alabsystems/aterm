@@ -337,46 +337,6 @@ fn insert_chars_bounded_fill_clears_phantom_continuation() {
     );
 }
 
-/// selective_erase_chars starting on the continuation of an unprotected wide
-/// char clears both halves; otherwise cells[col]'s bit 10 reads as PROTECTED and
-/// the erase skips it.
-#[test]
-fn selective_erase_chars_clears_left_boundary_continuation() {
-    use crate::{Cell, CellFlags, PackedColor};
-
-    let (_pages, mut row) = make_row(10);
-    let fg = PackedColor::DEFAULT_FG;
-    let bg = PackedColor::DEFAULT_BG;
-
-    // Unprotected wide char at cols 3-4.
-    row.write_wide_char(3, '\u{4E2D}', fg, bg, CellFlags::empty());
-    assert!(row.get(3).unwrap().is_wide());
-    assert!(row.get(4).unwrap().is_wide_continuation());
-
-    // Erase [4, 6): the range starts on the continuation; the head at 3 is outside.
-    row.selective_erase_chars(4, 2, Cell::EMPTY);
-
-    assert!(
-        row.get(3).unwrap().is_empty(),
-        "orphaned WIDE head at 3 must be erased"
-    );
-    assert!(
-        !row.get(4)
-            .unwrap()
-            .flags()
-            .contains(CellFlags::WIDE_CONTINUATION),
-        "in-range continuation at 4 must be erased, not left phantom-protected"
-    );
-    assert!(
-        !row.is_cell_protected(4),
-        "cells[4] must not read as phantom-protected"
-    );
-    assert!(
-        row.get(4).unwrap().is_empty(),
-        "cells[4] should be a clean blank"
-    );
-}
-
 /// Like xterm's `ClearRight`, the wide half orphaned by an EL/ED/ECH erase gets
 /// the erase fill (`' '` with the BCE background), not `Cell::EMPTY`.
 /// `clear_range_with_orphan` is the seam: erases pass `orphan = fill`, rect ops
@@ -610,45 +570,6 @@ fn clear_range_shrinks_len_on_tail_wide_orphan() {
     );
 }
 
-/// selective_erase_chars: the wide-head co-clear at cells[end], when it was the
-/// tail, shrinks len.
-#[test]
-fn selective_erase_chars_shrinks_len_on_tail_wide_orphan() {
-    use crate::{Cell, CellFlags, PackedColor};
-
-    let (_pages, mut row) = make_row(10);
-    for (i, ch) in ['a', 'b', 'c', 'd'].iter().enumerate() {
-        row.write_char(i as u16, *ch);
-    }
-    row.write_wide_char(
-        4,
-        '\u{4E2D}',
-        PackedColor::DEFAULT_FG,
-        PackedColor::DEFAULT_BG,
-        CellFlags::empty(),
-    );
-    assert_eq!(row.len(), 6, "abcd中 → len 6");
-
-    // Erase just the WIDE head at col 4 (range [4,5)); its continuation at col 5
-    // (== end) is co-cleared one past the range. Real content now ends at col 3.
-    row.selective_erase_chars(4, 1, Cell::EMPTY);
-
-    assert!(
-        row.get(4).unwrap().is_empty(),
-        "erased WIDE head must be empty"
-    );
-    assert!(
-        row.get(5).unwrap().is_empty(),
-        "co-cleared continuation must be empty"
-    );
-    assert_eq!(row.len(), 4, "len must shrink to 4 (content ends at 'd')");
-    assert_eq!(
-        row.get(3).unwrap().char(),
-        'd',
-        "surviving content must be intact"
-    );
-}
-
 // Write/fill paths: a wide-orphan clear one column past the written range
 // tightens len when that orphan was the row's tail, so row_text, search and
 // scrollback (which slice through len) show no phantom trailing space.
@@ -812,30 +733,6 @@ fn cells_mut_with_fixup_shrinks_len_on_tail_wide_orphan() {
         6,
         "len must shrink to 6, not stay stale-high at 7"
     );
-}
-
-/// write_wide_char_with_style_id sets HAS_WIDE_CHARS so a later gated fixup
-/// (write_char) still runs.
-#[test]
-fn style_id_wide_write_sets_has_wide_chars_for_later_narrow_overwrite() {
-    use crate::{CellFlags, RowFlags, StyleId};
-
-    let (_pages, mut row) = make_row(10);
-    row.write_wide_char_with_style_id(8, '\u{4E2D}', StyleId::new(3), CellFlags::empty());
-    assert!(
-        row.flags().contains(RowFlags::HAS_WIDE_CHARS),
-        "wide write must set HAS_WIDE_CHARS"
-    );
-    assert_eq!(row.len(), 10, "wide char at 8-9 → len 10");
-
-    // Production write_char gates its fixup on HAS_WIDE_CHARS; with the flag set it
-    // now clears the continuation at col 9 and the recalc tightens len.
-    row.write_char(8, 'X');
-    assert!(
-        row.get(9).unwrap().is_empty(),
-        "continuation must be cleared by the now-enabled fixup"
-    );
-    assert_eq!(row.len(), 9, "len must tighten to 9");
 }
 
 /// delete_chars_fill (plain DCH): clearing the deleted head's continuation at

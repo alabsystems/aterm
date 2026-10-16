@@ -1,17 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! PURE helpers for the ConPTY spawn: MSVCRT-canonical command-line quoting and
-//! the `CreateProcessW` environment block. No FFI, unit-tested in place.
+//! Pure helpers for the ConPTY spawn: command-line quoting and the `CreateProcessW`
+//! environment block.
 //!
-//! SECURITY NOTE (quoting is an injection surface): Windows flattens argv to ONE
-//! string, and the child's CRT re-parses it. The quoting below is the canonical
-//! MSVCRT algorithm (quote when an arg contains space/tab/quote or is empty;
-//! double every backslash run that precedes a quote; escape embedded quotes as
-//! `\"`), so a round-trip through a conforming CRT reproduces the argv exactly.
-//! `cmd.exe` ADDITIONALLY interprets its own metacharacters (`&`, `|`, `^`, `%`)
-//! inside `/C`/`/K` arguments — a `-e` command routed through cmd.exe is
-//! shell-interpreted, unlike Unix `execve` (documented caller-facing caveat).
+//! Quoting is an injection surface: Windows flattens argv to one string that the
+//! child's CRT re-parses. The canonical MSVCRT algorithm here (quote an arg that is
+//! empty or holds a space, tab or quote; double a backslash run before a quote; escape
+//! embedded quotes as `\"`) round-trips through a conforming CRT. `cmd.exe` also
+//! interprets `&`, `|`, `^`, `%` in `/C`/`/K` arguments, so a `-e` command run through
+//! it is shell-interpreted, unlike Unix `execve`.
 
 use std::ffi::{OsStr, OsString};
 use std::os::windows::ffi::OsStrExt;
@@ -26,9 +24,8 @@ pub(crate) fn wide_nul(s: &OsStr) -> Vec<u16> {
     s.encode_wide().chain(std::iter::once(0)).collect()
 }
 
-/// Flatten `argv` into a single NUL-terminated UTF-16 command line using the
-/// canonical MSVCRT quoting rules (see module docs). The trailing NUL is
-/// included because `CreateProcessW` takes a mutable NUL-terminated buffer.
+/// Flatten `argv` into one NUL-terminated UTF-16 command line with the MSVCRT quoting
+/// rules (see the module docs); `CreateProcessW` takes a mutable NUL-terminated buffer.
 pub(crate) fn build_command_line(argv: &[OsString]) -> Vec<u16> {
     let mut out: Vec<u16> = Vec::new();
     for (i, arg) in argv.iter().enumerate() {
@@ -65,7 +62,7 @@ fn append_quoted(arg: &OsStr, out: &mut Vec<u16>) {
             // Trailing run: double it so the closing quote stays a real quote.
             out.extend(std::iter::repeat_n(BACKSLASH, n_backslashes * 2));
         } else if units[i] == QUOTE {
-            // Escape the run AND the quote itself.
+            // Escape the run and the quote itself.
             out.extend(std::iter::repeat_n(BACKSLASH, n_backslashes * 2 + 1));
             out.push(QUOTE);
             i += 1;
@@ -79,14 +76,12 @@ fn append_quoted(arg: &OsStr, out: &mut Vec<u16>) {
     out.push(QUOTE);
 }
 
-/// Build the `CreateProcessW` UTF-16 environment block from `build_child_env`'s
-/// output: `KEY=VAL\0 … \0\0`, deduped CASE-INSENSITIVELY (last occurrence wins
-/// — Windows env names are case-insensitive, so an inherited `Path` plus an
-/// injected `PATH` must yield ONE entry, the injected one, or child lookups are
-/// undefined) and sorted case-insensitively by key, as the `CreateProcessW`
-/// docs require for a unicode environment block.
+/// The `CreateProcessW` UTF-16 environment block from `build_child_env`'s output:
+/// `KEY=VAL\0 … \0\0`, deduped case-insensitively with the last occurrence winning (an
+/// inherited `Path` and an injected `PATH` must yield one entry, the injected one) and
+/// sorted case-insensitively by key, as `CreateProcessW` requires.
 pub(crate) fn build_env_block(pairs: &[(OsString, OsString)]) -> Vec<u16> {
-    // (folded key, index into `pairs` of the LAST occurrence)
+    // (folded key, index into `pairs` of the last occurrence)
     let mut kept: Vec<(Vec<u16>, usize)> = Vec::new();
     for (idx, (k, _)) in pairs.iter().enumerate() {
         let folded: Vec<u16> = k.encode_wide().map(fold_upper).collect();
@@ -111,9 +106,8 @@ pub(crate) fn build_env_block(pairs: &[(OsString, OsString)]) -> Vec<u16> {
     block
 }
 
-/// ASCII-uppercase fold of one UTF-16 unit — the ordinal, locale-free key fold
-/// used for env-name dedupe/sort (env names are ASCII in practice; non-ASCII
-/// units compare ordinally, which is deterministic and order-stable).
+/// ASCII-uppercase fold of one UTF-16 unit: the ordinal, locale-free fold for env-name
+/// dedupe and sort.
 fn fold_upper(u: u16) -> u16 {
     if (u16::from(b'a')..=u16::from(b'z')).contains(&u) {
         u - 32
@@ -157,12 +151,11 @@ mod tests {
 
     #[test]
     fn backslashes_before_a_quote_double_but_elsewhere_stay_literal() {
-        // C:\dir\ as an arg with a space: the TRAILING run doubles; the interior
-        // backslash is literal. An embedded \" becomes \\\" + the escaped quote.
+        // A trailing backslash run doubles before the closing quote; an interior one is
+        // literal. A `\"` becomes `\\\"`.
         let c = build_command_line(&args(&["p.exe", "C:\\a dir\\"]));
         assert_eq!(decode(&c), "p.exe \"C:\\a dir\\\\\"");
         let c2 = build_command_line(&args(&["p.exe", "x\\\"y z"]));
-        // arg is: x\"y z  -> quoted as "x\\\"y z"
         assert_eq!(decode(&c2), "p.exe \"x\\\\\\\"y z\"");
     }
 
@@ -206,8 +199,7 @@ mod tests {
 
     #[test]
     fn env_block_dedupes_case_insensitively_last_wins() {
-        // The inherited-'Path'-plus-injected-'PATH' hazard: exactly ONE entry
-        // survives, and it is the LAST occurrence (env_add overrides).
+        // An inherited `Path` plus an injected `PATH`: one entry, the last.
         let block = build_env_block(&pairs(&[
             ("Path", "C:\\old"),
             ("TERM", "dumb"),

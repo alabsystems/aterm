@@ -50,6 +50,19 @@ pub enum Outcome {
 }
 
 impl Outcome {
+    /// Every outcome, in the declaration's order.
+    pub const ALL: [Outcome; 7] = [
+        Outcome::Approved,
+        Outcome::Declined,
+        Outcome::Typed,
+        Outcome::Skipped,
+        Outcome::Escalated,
+        Outcome::Deferred,
+        Outcome::Waiting,
+    ];
+
+    /// The row's `decision` word ([`Self::from_word`] reads it back).
+    #[must_use]
     pub fn word(self) -> &'static str {
         match self {
             Outcome::Approved => "approved",
@@ -60,6 +73,14 @@ impl Outcome {
             Outcome::Deferred => "deferred",
             Outcome::Waiting => "waiting",
         }
+    }
+
+    /// The outcome a row's `decision` word names, by [`Self::word`]'s own
+    /// words, so a reader of the ledger (`harness::stats`) cannot drift from
+    /// its writer; `None` for a word this build does not write.
+    #[must_use]
+    pub fn from_word(word: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|o| o.word() == word)
     }
 }
 
@@ -603,16 +624,19 @@ pub fn account_unmade_reason(
 /// (`account-rotate@v1`, `waiting`: a record, no act): the label and the
 /// answer the loop told its host — `served`, or `wall` / `signed-out` — so a
 /// loop that starts after it ([`account_moves`]) neither forgets a move still
-/// to be served nor tells a bad answer a second time.
+/// to be served nor tells a bad answer a second time. A bad answer's row
+/// says `until=served`: this build's loops tell a told move `served` where
+/// the worker works past it, so the move stands until such a row closes it,
+/// whatever its age ([`OpenAccountMove::told_closes`]).
 #[must_use]
 pub fn account_answer_reason(to: &str, answer: super::policy::turn_end::AccountAnswer) -> String {
     use super::policy::turn_end::{AccountAnswer, AccountBad};
-    let by = match answer {
-        AccountAnswer::Served => "served",
-        AccountAnswer::Bad(AccountBad::Wall) => "wall",
-        AccountAnswer::Bad(AccountBad::SignedOut) => "signed-out",
+    let (by, until) = match answer {
+        AccountAnswer::Served => ("served", ""),
+        AccountAnswer::Bad(AccountBad::Wall) => ("wall", " until=served"),
+        AccountAnswer::Bad(AccountBad::SignedOut) => ("signed-out", " until=served"),
     };
-    format!("the turn-end policy (account move answered: to={to} by={by})")
+    format!("the turn-end policy (account move answered: to={to} by={by}{until})")
 }
 
 /// An account move a loop on the session made that its ledger does not show
@@ -631,6 +655,13 @@ pub struct OpenAccountMove {
     /// The host was told of a wall or a lost login that answered it
     /// ([`account_answer_reason`]'s row): told, and not told again.
     pub told: bool,
+    /// That told row says `until=served`: a build whose loops tell the move
+    /// `served` where it ends wrote it, so the move is open until a row says
+    /// so, whatever its age. A told row without it is an older build's,
+    /// which closed told moves silently: open on its ledger for good, and
+    /// history past the window
+    /// ([`super::policy::turn_end::TurnEndState::seed_account`]).
+    pub told_closes: bool,
 }
 
 /// What `sid`'s ledger says of its account moves ([`account_moves`]).
@@ -690,6 +721,7 @@ pub fn account_moves(path: &Path, sid: Option<&str>) -> AccountMoves {
                     out.open = None;
                 } else if let Some(open) = &mut out.open {
                     open.told = true;
+                    open.told_closes |= reason.contains(" until=served");
                 }
             }
             continue;
@@ -729,6 +761,7 @@ pub fn account_moves(path: &Path, sid: Option<&str>) -> AccountMoves {
             at_ms,
             asked: false,
             told: false,
+            told_closes: false,
         });
     }
     out

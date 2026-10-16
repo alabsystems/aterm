@@ -5,32 +5,27 @@
 //! Resize undo: a rows-only shrink on a grid that keeps no history, then a grow
 //! back with nothing drawn in between, is an exact identity.
 //!
-//! Why: an alternate screen keeps no history, so a shrink evicts its demoted
-//! top row and a plain grow appends a blank, leaving every row one higher than
-//! the app painted it. An app that repaints only on a changed size (read after
-//! both halves landed) never heals that shift.
+//! Without it an alternate screen's shrink evicts its demoted top row and a
+//! plain grow appends a blank, leaving every row one higher than the app
+//! painted it, which an app that repaints only on a changed size never heals.
 //!
-//! How: a Native rows-only shrink of a grid with no retention and no tiered
-//! store keeps what it takes off the screen in a stash, one entry per row in
-//! unit-shrink order: trimmed blank rows, then demoted top rows, then pushed
-//! bottom rows, each with its extras. A later shrink stacks onto the stash; a
-//! grow pops it LIFO, re-inserting demoted rows above the viewport (the reveal
-//! then relabels them and moves cursor, saved cursor, extras and selection
-//! down) and appending pushed rows where it would append blanks. When the grow
-//! lands on the first shrink's starting height, that shrink's cursor picture
-//! (cursor, pending wrap, saved cursor, scroll region, horizontal margins) is
-//! restored and the stash dropped.
+//! A Native rows-only shrink of a grid with no retention and no tiered store
+//! stashes what it takes off the screen, one entry per row in unit-shrink order
+//! (trimmed blanks, demoted top rows, pushed bottom rows, each with its extras).
+//! Later shrinks stack onto the stash; a grow pops it LIFO, re-inserting demoted
+//! rows above the viewport for the reveal to relabel and appending pushed rows
+//! where it would append blanks. A grow back to the first shrink's height
+//! restores that shrink's cursor picture and drops the stash.
 //!
-//! Validity: the stash holds only while `content_gen`, width, height and
-//! cursor picture are what the sealing resize left, the grid keeps no history
-//! and the policy is Native; otherwise it is dropped and the resize runs
-//! normally. `Terminal::process_at` drops it on any input (not every mutation
+//! The stash holds only while `content_gen`, width, height and cursor picture
+//! are what the sealing resize left, the grid keeps no history and the policy
+//! is Native. `Terminal::process_at` drops it on any input (not every mutation
 //! bumps `content_gen`), as do an alt-screen switch and a reset.
 //!
 //! Session-only: never checkpointed or journalled beyond the counts in
-//! [`crate::ResizeShape`]. The selection lives on the host: `Terminal` keeps
-//! the one the first shrink found and restores it on
-//! [`crate::ResizeShape::undone`], keyed by [`Grid::resize_undo_serial`].
+//! [`crate::ResizeShape`]. The host keeps the selection the first shrink found
+//! and restores it on [`crate::ResizeShape::undone`], keyed by
+//! [`Grid::resize_undo_serial`].
 
 use super::scroll_convert::ScrolledRowExtras;
 use super::{Cursor, Grid, HorizontalMargins, ScrollRegion};
@@ -399,7 +394,7 @@ mod tests {
             grid.assert_invariants();
         }
 
-        // TRIM then DEMOTE: one blank row below the cursor.
+        // A trim, then demotes: one blank row below the cursor.
         let mut grid = labelled(6, 10, 5, 0);
         grid.erase_line();
         grid.set_cursor(4, 1);

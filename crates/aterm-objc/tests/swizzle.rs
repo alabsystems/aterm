@@ -46,7 +46,7 @@ unsafe extern "C" {
     fn free(ptr: *mut c_void);
 }
 
-/// How many rows a class registered ITSELF — the containment question.
+/// How many rows a class registered itself: the containment question.
 fn own_method_count(cls: ClassPtr) -> u32 {
     let mut n: u32 = 0;
     // SAFETY: `cls` is a live class object; the runtime writes the count and
@@ -101,13 +101,13 @@ unsafe extern "C-unwind" fn site_patched_probe(_this: Id, _cmd: Sel) -> i64 {
     2
 }
 
-/// `-(int64_t)probeValue` — the ORIGINAL.
+/// `-(int64_t)probeValue`: the original.
 unsafe extern "C-unwind" fn original_probe(_this: Id, _cmd: Sel) -> i64 {
     ORIGINAL_RUNS.fetch_add(1, Ordering::Relaxed);
     1
 }
 
-/// `-(int64_t)probeValue` — the PATCH.
+/// `-(int64_t)probeValue`: the patch.
 unsafe extern "C-unwind" fn patched_probe(_this: Id, _cmd: Sel) -> i64 {
     PATCHED_RUNS.fetch_add(1, Ordering::Relaxed);
     2
@@ -118,8 +118,8 @@ unsafe extern "C-unwind" fn other_probe(_this: Id, _cmd: Sel) -> i64 {
     3
 }
 
-/// A patch with the WRONG return width — the shape the encoding check exists to
-/// refuse. Never installed by any passing test.
+/// A patch with the wrong return width, the shape the encoding check refuses. Never installed by
+/// a passing test.
 unsafe extern "C-unwind" fn wrong_shape(_this: Id, _cmd: Sel) -> Bool {
     Bool::from(true)
 }
@@ -137,11 +137,10 @@ fn register_probe_class(name: &'static CStr) -> ClassPtr {
 /// counts calls can own its counter.
 fn register_probe_class_with(name: &'static CStr, imp: ProbeFn) -> ClassPtr {
     let mut b = begin(c"NSObject", name);
-    // `ClassBuilder::register` asserts the ivar exists — every class this crate
-    // mints carries exactly one, and `()` is the empty payload.
+    // `ClassBuilder::register` asserts the ivar exists; `()` is the empty payload.
     b.add_rust_ivar::<()>();
-    // SAFETY: `imp` is `extern "C"` with the `(Id, Sel) -> i64` prototype its
-    // encoding describes, and cannot unwind (one atomic, then a constant).
+    // SAFETY: `imp` has the `(Id, Sel) -> i64` prototype its encoding describes and cannot
+    // unwind (one atomic, then a constant).
     unsafe {
         b.add_method(
             sel!(probeValue),
@@ -152,7 +151,7 @@ fn register_probe_class_with(name: &'static CStr, imp: ProbeFn) -> ClassPtr {
     b.register().class()
 }
 
-/// A fresh instance of `cls`, +1, leaked — these classes have no ivars and the
+/// A fresh instance of `cls`, +1, leaked: these classes hold no ivar with a destructor, and the
 /// tests are about method tables, not lifetimes.
 fn instance_of(cls: ClassPtr) -> Id {
     // SAFETY: `+alloc` then `-init` on an `NSObject` subclass is the canonical
@@ -448,8 +447,8 @@ fn install_refuses_a_prototype_the_registered_encoding_does_not_match() {
     static SITE: SwizzleSite<WrongFn> = SwizzleSite::new();
     let cls = register_probe_class(c"AtermSwizzleMismatch");
 
-    // SAFETY: `wrong_shape` is `extern "C"` and does not unwind; the install
-    // must refuse it (it returns `BOOL` where the row is `q`).
+    // SAFETY: `wrong_shape` cannot unwind; the install must refuse it (it returns `BOOL` where
+    // the row is `q`).
     let outcome = unsafe { SITE.install(cls, sel!(probeValue), wrong_shape) };
 
     match outcome {
@@ -475,8 +474,8 @@ fn install_refuses_a_selector_nothing_implements_and_a_null_class() {
     static SITE: SwizzleSite<ProbeFn> = SwizzleSite::new();
     let cls = register_probe_class(c"AtermSwizzleAbsent");
 
-    // SAFETY: `extern "C"`, non-unwinding; the selector is not implemented,
-    // which is the refusal under test.
+    // SAFETY: the patch cannot unwind; the selector is not implemented, which is the refusal
+    // under test.
     assert_eq!(
         Err(SwizzleError::NoSuchMethod),
         unsafe { SITE.install(cls, sel!(atermNoSuchSelector), patched_probe) },
@@ -541,7 +540,7 @@ fn install_replaces_publishes_the_original_and_reports_the_owner() {
     let live = unsafe { method_imp(parent, sel!(probeValue)) }.expect("registered");
     assert!(std::ptr::eq(live, site_patched_probe as *const c_void));
 
-    // And the encoding did not move, which is the whole reason A2 is needed.
+    // The encoding did not move, which is why part A2 resolves the IMP instead.
     // SAFETY: `parent` is live.
     assert_eq!(
         Some("q@:".to_owned()),
@@ -650,13 +649,9 @@ fn the_swizzle_is_confined_to_the_class_pair_it_was_applied_to() {
 
 #[test]
 fn concurrent_installs_into_one_site_never_build_a_chain_that_calls_itself() {
-    // Concurrent installs on one site: without the compare-exchange, two
-    // threads read the same empty slot, both publish, and the loser displaces
-    // the winner's implementation, producing a self-calling chain.
-    //
-    // Probabilistic: with the CAS replaced by a plain store, 16 threads behind
-    // a barrier over 12 rounds catch it in roughly one run in ten. A weak
-    // detector, but the only one; the argument in `install` carries the weight.
+    // Without the compare-exchange, two threads read the same empty slot, both publish, and the
+    // loser's chain calls itself. A weak detector (it catches a plain store in about one run in
+    // ten); the argument in `install` carries the weight.
     const THREADS: usize = 16;
     const ROUNDS: usize = 12;
     static SITES: [SwizzleSite<ProbeFn>; ROUNDS] = [const { SwizzleSite::new() }; ROUNDS];
@@ -738,11 +733,10 @@ fn concurrent_installs_into_one_site_never_build_a_chain_that_calls_itself() {
         assert_eq!(2, probe_value(instance_of(cls)));
     }
 }
-/// Differs from [`SameShapeFn`] only in `const` versus `mut` `void *`, which
-/// encodes identically (`^v`). Used only for the encoding comparison below.
-/// only for the encoding comparison below.
+/// Differs from [`SameShapeFn`] only in `const` versus `mut` `void *`, which encodes identically
+/// (`^v`). Used only for the encoding comparison below.
 type WrongObjectFn = unsafe extern "C-unwind" fn(Id, Sel, *const c_void) -> i64;
-/// The same arity and the same widths, with `^v` where the row has `^v`.
+/// The baseline: the same arity and widths, `^v` for the `mut void *`.
 type SameShapeFn = unsafe extern "C-unwind" fn(Id, Sel, *mut c_void) -> i64;
 
 #[test]
@@ -756,8 +750,7 @@ fn the_encoding_check_is_blind_to_a_disagreement_that_does_not_move_a_register()
          and correctly so: it moves no register"
     );
 
-    // And the one that matters more, because this crate has no bindings and
-    // every object is an `Id`: `@` erases the CLASS.
+    // `@` erases the class, and every object here is an `Id`.
     type TakesEvent = unsafe extern "C-unwind" fn(Id, Sel, Id);
     type TakesString = unsafe extern "C-unwind" fn(Id, Sel, Id);
     assert_eq!(
@@ -865,8 +858,7 @@ fn a_kvo_isa_swap_leaves_the_swizzle_and_its_owner_where_they_were() {
     let cls = {
         let mut b = begin(c"NSObject", c"W15KvoProbe");
         b.add_rust_ivar::<()>();
-        // SAFETY: both are `extern "C"` at the prototypes their encodings
-        // describe, and neither can unwind.
+        // SAFETY: each has the prototype its encoding describes, and none can unwind.
         unsafe {
             b.add_method(
                 sel!(probeValue),

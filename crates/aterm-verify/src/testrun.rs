@@ -1,19 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE TEST BINARIES, SEVERAL AT A TIME (2026-09-26).
+//! THE TEST BINARIES, SEVERAL AT A TIME.
 //!
 //! WHY. cargo runs test binaries one at a time, even under `--no-fail-fast`, so
-//! the test stage's run was a serial walk over ~400 binaries on a 14-core
-//! machine: the two ladder logs the push-gate audit measured spent 1224.7 s and
-//! 1421 s inside test binaries (the sum of each one's `finished in`), 287 of
-//! them under a second each, and the stage sat on the ladder's critical path.
-//! This module runs several at once. They start longest first by the last
-//! run's times ([`start_order`],
-//! 2026-09-29), up to `--test-jobs` at once ([`DEFAULT_JOBS`]) and more than
-//! [`FLOOR_JOBS`] only while the machine's load is under its cores
-//! ([`Limits::by_load`], 2026-09-30), each with the whole pinned
-//! `RUST_TEST_THREADS`, as cargo's own run hands it.
+//! a workspace's few hundred binaries, most of them under a second each, would
+//! be a serial walk on the run's critical path. This module runs several at
+//! once. They start longest first by the last run's times ([`start_order`]),
+//! up to `--test-jobs` at once ([`DEFAULT_JOBS`]) and more than [`FLOOR_JOBS`]
+//! only while the machine's load is under its cores ([`Limits::by_load`]), each
+//! with the whole pinned `RUST_TEST_THREADS`, as cargo's own run hands it.
 //!
 //! THE PROCESS IS CARGO'S, NOT A GUESS AT IT. A test binary is not just a path:
 //! cargo starts it in its package's root with an environment of its own —
@@ -21,7 +17,7 @@
 //! `CARGO_PKG_*` family, the dynamic-library search path, every
 //! `cargo:rustc-env` its build script printed, targo's own
 //! `TRUST_TARGO_FRONTEND` — and tests in this tree read several of those at
-//! run time (`CARGO` in trust-gate, aterm-gui, aterm-forge and the conformance
+//! run time (`CARGO` in aterm-gui, aterm-forge and the conformance
 //! support). Rebuilding that from the compile's JSON would be a copy of cargo
 //! that drifts. So cargo is asked: the stage runs the very `targo test --tests`
 //! it always ran, with one addition — `--config
@@ -29,7 +25,7 @@
 //! and cargo, instead of executing each test binary, executes this binary with
 //! the test binary's argv, in its directory, with its environment.
 //! [`record_main`] writes those three facts down and exits 0, so cargo walks
-//! every binary in a few seconds and runs nothing; the gate then runs the
+//! every binary in a few seconds and runs nothing; the run then starts the
 //! recorded invocations itself.
 //!
 //! WHAT ELSE IT READS. The compile child (`--no-run`) is asked for
@@ -37,17 +33,17 @@
 //! before, and each `compiler-artifact` line names a test executable and its
 //! target's kind and name — which, with the recorded `CARGO_PKG_NAME`, is
 //! cargo's own re-run spec (`-p atpkg --test atpkg_suite`, `-p aterm-gui
-//! --lib`), the id every failed test is known by in a receipt
-//! ([`crate::differential::test_findings`]). The JSON lines themselves are
+//! --lib`), the id every failed test is known by and rerun with
+//! ([`crate::findings::test_findings`]). The JSON lines themselves are
 //! removed from what the ladder shows.
 //!
 //! THE LOG IS CARGO'S SHAPE. Each binary's output is captured on its own and
 //! printed in cargo's order — its `Running` header, its bytes, and, when it
-//! failed, `error: test failed, to rerun pass \`<spec>\`` — so the ladder reads
-//! exactly as a serial run's would, and every reader of that log
-//! ([`crate::libtest::failed_tests`], [`crate::libtest::environment_refusals`],
-//! the differential's fingerprints) reads it unchanged. The header is written
-//! at the head of each binary's own log before it starts
+//! failed, cargo's `error: test failed, to rerun pass` line naming its spec —
+//! so the ladder reads exactly as a serial run's would, and every reader of
+//! that log ([`crate::libtest::failed_tests`],
+//! [`crate::libtest::environment_refusals`]) reads it unchanged. The header is
+//! written at the head of each binary's own log before it starts
 //! ([`exec::Cmd::preamble`]), so a wall-clock kill names the binary and the
 //! test still running in it, per binary ([`crate::libtest::note`]).
 //!
@@ -78,39 +74,22 @@ pub const RECORD_FLAG: &str = "--record-test-binary";
 /// only while the machine's one-minute load is under its cores
 /// ([`Limits::by_load`]).
 ///
-/// RAISED FROM 2 ON 2026-09-30, FROM MEASUREMENTS
-/// (`docs/measured/test-pool-2026-09-30.md`: the whole tree, the pool against
-/// main's two-at-a-time on the same load, and cargo's serial run for the
-/// counts). Two was where the audit said to START (2026-09-26), each binary
-/// then getting half the pinned `RUST_TEST_THREADS`; with the long poles
-/// already started first, a green gate's test run (2026-09-29 23:40) still
-/// took 1116.3 s of its 2830 s ladder on 18 cores, two binaries at a time.
-///
-/// MEASURED 2026-09-26 (`measure_the_test_run_on_this_tree`, six crates, 147
-/// binaries, one-minute load 37-84 on 14 cores): two at a time, the binaries'
-/// wall was 315.3 s, 323.8 s and 326.1 s over three runs, against 533.5 s,
-/// 559.8 s and 576.9 s for the same binaries' own durations summed — what one
-/// at a time costs at the least — and cargo's serial `--tests` child, run
-/// between them, took 517.5 s. (Those runs' stage totals, 547-579 s, also hold
-/// a 229-253 s compile, which the serial figure does not separate out.)
+/// Eight: two at a time already took the run to about 60 % of cargo's serial
+/// walk, and with the long poles started first the whole tree's test run still
+/// held the run's critical path at two (`docs/measured/test-pool-2026-09-30.md`
+/// has the measurements).
 pub const DEFAULT_JOBS: u32 = 8;
 
 /// How many test binaries the pool always lets run at once when it has them,
-/// whatever the load: two, the pool's level from 2026-09-26 to 2026-09-30 — so
-/// a busy machine never runs the test binaries fewer at a time than that pool
-/// did. `--test-jobs 1` still means one at a time: the floor is never above
-/// the cap.
+/// whatever the load, so a busy machine still runs two at a time.
+/// `--test-jobs 1` still means one at a time: the floor is never above the cap.
 pub const FLOOR_JOBS: usize = 2;
 
-/// THE MEMORY CAP (2026-10-04): the most test binaries `ram` bytes hold at
-/// once beside the workspace builds `plan` can run during the test run —
-/// what [`crate::plan::builds_held`] leaves after
-/// [`crate::plan::builds_beside_tests`], never under [`FLOOR_JOBS`]; an unread
-/// host gets the floor. On the 8 GiB Mac the load-read pool reached the
-/// 8-binary cap before the one-minute load caught up, and 58 and 59 of
-/// `aterm_suite`'s 89 tests failed in two merge-contract runs ("no answer from
-/// … aterm.sock within 10s"); alone, and in the two-at-a-time pool of
-/// 2026-09-26..30, all passed.
+/// THE MEMORY CAP: the most test binaries `ram` bytes hold at once beside the
+/// workspace builds `plan` can run during the test run
+/// ([`crate::plan::builds_held`] less [`crate::plan::builds_beside_tests`]),
+/// never under [`FLOOR_JOBS`]; an unread host gets the floor. Past it, a small
+/// host swaps and the tests that wait on sockets fail on its clock.
 #[must_use]
 pub fn memory_jobs(ram: Option<u64>, plan: &[crate::plan::StageSpec]) -> usize {
     ram.map_or(FLOOR_JOBS, |ram| {
@@ -120,17 +99,9 @@ pub fn memory_jobs(ram: Option<u64>, plan: &[crate::plan::StageSpec]) -> usize {
     })
 }
 
-// NO BINARY RUNS ALONE (2026-10-05). Until then aterm-link's world-harness
-// binaries ran first, one at a time, with nothing beside them: the harness
-// refuses a machine where an `aterm-gui --headless` or `aterm-link serve` of
-// this checkout older than itself is alive (`strays_now` in its
-// tests/harness/mod.rs), and the twenty-one world binaries of 2026-09-27 were
-// exactly that to each other. They are one binary since 2026-09-30
-// (tests/world/main.rs), `two_nodes_sealed` runs no test without its feature
-// (the sealed rung, which the test run waits for, runs it), and no other test
-// target starts either daemon (`aterm`'s live suites run `aterm --headless`).
-// Alone, `world` held the whole machine for ~51 s while the other 197 binaries
-// waited; its own cap on live stacks was measured green at load ~40.
+// NO BINARY RUNS ALONE. Every live suite scratches under its own pid-keyed
+// world (private sockets, state and HOME), so two binaries booting headless
+// instances never meet, and every binary runs in the pool.
 
 // ---------------------------------------------------------------------------
 // The record: what cargo would have started.
@@ -410,19 +381,19 @@ pub fn take_test_executables(log: &mut String) -> Result<Vec<TestExe>, String> {
             kept.push_str(line);
             continue;
         }
-        let Some(v) = json::parse(t) else {
+        let Ok(v) = aterm_json::from_str::<aterm_json::Value>(t) else {
             bad.get_or_insert_with(|| t.chars().take(120).collect::<String>());
             continue;
         };
-        if v.get("reason").and_then(json::Value::as_str) != Some("compiler-artifact") {
+        if v.get("reason").and_then(aterm_json::Value::as_str) != Some("compiler-artifact") {
             continue;
         }
         let test = v
             .get("profile")
             .and_then(|p| p.get("test"))
-            .and_then(json::Value::as_bool)
+            .and_then(aterm_json::Value::as_bool)
             == Some(true);
-        let Some(exe) = v.get("executable").and_then(json::Value::as_str) else {
+        let Some(exe) = v.get("executable").and_then(aterm_json::Value::as_str) else {
             continue;
         };
         if !test {
@@ -431,12 +402,12 @@ pub fn take_test_executables(log: &mut String) -> Result<Vec<TestExe>, String> {
         let target = v.get("target");
         let kinds: Vec<&str> = target
             .and_then(|t| t.get("kind"))
-            .and_then(json::Value::as_array)
-            .map(|a| a.iter().filter_map(json::Value::as_str).collect())
+            .and_then(aterm_json::Value::as_array)
+            .map(|a| a.iter().filter_map(aterm_json::Value::as_str).collect())
             .unwrap_or_default();
         let name = target
             .and_then(|t| t.get("name"))
-            .and_then(json::Value::as_str)
+            .and_then(aterm_json::Value::as_str)
             .unwrap_or_default();
         match target_flag(&kinds, name) {
             Some(flag) => exes.push(TestExe {
@@ -459,7 +430,7 @@ pub fn take_test_executables(log: &mut String) -> Result<Vec<TestExe>, String> {
 // The plan: records, cargo's headers and the compile's list, in agreement.
 // ---------------------------------------------------------------------------
 
-/// One test binary the gate will run.
+/// One test binary the run will run.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Binary {
     /// cargo's `     Running <target> (<path>)` line for it, verbatim.
@@ -534,34 +505,20 @@ pub fn plan(records: Vec<Record>, log: &str, exes: &[TestExe]) -> Result<Vec<Bin
 // Running them.
 // ---------------------------------------------------------------------------
 
-/// Each shared binary's last wall time, beside the receipts
-/// (`<git common dir>/aterm-verify/`), so every checkout of a clone shares
-/// one history.
+/// Each shared binary's last wall time, in the run's state dir
+/// ([`crate::Ctx::state_dir`]), so the next run starts the longest first.
 pub const COSTS_FILE: &str = "test-costs.tsv";
 
 /// The order the shared binaries START in (their logs still print in
 /// declared order): the ones `costs` does not name first, then the rest
-/// longest first. In cargo's order the two longest binaries of 2026-09-29's
-/// run (181 s and 154 s) started 620th and 621st of 683 and ran on alone at
-/// the end: 1,795 s of binaries took 1,185 s two at a time. Longest first,
-/// they overlap the short ones instead. Stable, so no history is declared
-/// order.
+/// longest first. In cargo's order the longest binaries can start last and
+/// run on alone at the end; longest first, they overlap the short ones
+/// instead. Stable, so no history is declared order.
 #[must_use]
 pub fn start_order(shared: &[usize], bins: &[Binary], costs: &BTreeMap<String, f64>) -> Vec<usize> {
-    longest_first(shared, |i| bins[i].spec.as_str(), costs)
-}
-
-/// [`start_order`] over anything `name`d in `costs`: the items it does not
-/// name first, then the rest longest first, stable. The delivery suites start
-/// in it too (`stages::DELIVERY_COSTS_FILE`).
-#[must_use]
-pub fn longest_first<'a>(
-    items: &[usize],
-    name: impl Fn(usize) -> &'a str,
-    costs: &BTreeMap<String, f64>,
-) -> Vec<usize> {
-    let mut order = items.to_vec();
-    order.sort_by(|&a, &b| match (costs.get(name(a)), costs.get(name(b))) {
+    let cost = |i: usize| costs.get(bins[i].spec.as_str());
+    let mut order = shared.to_vec();
+    order.sort_by(|&a, &b| match (cost(a), cost(b)) {
         (None, None) => std::cmp::Ordering::Equal,
         (None, Some(_)) => std::cmp::Ordering::Less,
         (Some(_), None) => std::cmp::Ordering::Greater,
@@ -606,8 +563,7 @@ pub fn write_costs(path: &Path, measured: &[(String, f64)]) {
 
 /// Run every binary through [`pool_within`] under `limits`, in [`start_order`] over
 /// `costs`, `load` reading the machine's busy cores. EVERY binary runs
-/// with the whole `threads`, as cargo's own run hands each one (until
-/// 2026-09-30 the pool split them, `threads / jobs` each).
+/// with the whole `threads`, as cargo's own run hands each one.
 /// `run_one(binary, its threads)` runs one; the answers come back in declared
 /// order whatever order they ran in, beside the most shared binaries that ran
 /// at once.
@@ -663,17 +619,15 @@ pub struct Limits {
 }
 
 /// How long a binary started past the floor gets to show its CPU before the
-/// pool reads the machine for the next one (2026-10-05). One reading used to
-/// serve every slot that asked within [`LOAD_SAMPLE`], so a second that read
-/// idle started every free slot at once: with the busy-cores reading the pool
-/// went from two to eight inside a few seconds of a gate's test run, the
-/// machine reached load 40 on 14 cores, and a press-retry test missed its
-/// back-off. A binary takes about a second to load and fan out its threads.
+/// pool reads the machine for the next one. One reading serving every slot
+/// that asked within [`LOAD_SAMPLE`] would let a second that read idle start
+/// every free slot at once and overload the machine. A binary takes about a
+/// second to load and fan out its threads.
 pub const ADMIT_SETTLE: Duration = Duration::from_secs(2);
 
 impl Limits {
-    /// Exactly `jobs` at a time (at least one), the load never read: the
-    /// delivery suites' pool ([`pool`]).
+    /// Exactly `jobs` at a time (at least one), the load never read.
+    #[cfg(test)]
     #[must_use]
     pub fn fixed(jobs: usize) -> Self {
         let jobs = jobs.max(1);
@@ -685,11 +639,11 @@ impl Limits {
         }
     }
 
-    /// THE TEST RUN'S (2026-09-30): up to `jobs` at once (at least one),
-    /// always [`FLOOR_JOBS`] of them (within `jobs`), and more only while the
-    /// machine reads under its `cores` busy (the cores busy over the last
-    /// second since 2026-10-05, [`crate::exec::busy_cores`]; the one-minute load
-    /// before, and where that cannot be read). The reading is the whole
+    /// THE TEST RUN'S: up to `jobs` at once (at least one), always
+    /// [`FLOOR_JOBS`] of them (within `jobs`), and more only while the machine
+    /// reads under its `cores` busy (the cores busy over the last second,
+    /// [`crate::exec::busy_cores`]; the one-minute load where that cannot be
+    /// read). The reading is the whole
     /// machine's, the pool's own binaries included — what a test that waits on
     /// something feels — so the pool fills an idle machine and stops adding to a
     /// busy one; it never stops a binary it started.
@@ -722,18 +676,7 @@ impl Limits {
     }
 }
 
-/// Run `run(i)` for every index in `order`, `jobs` at a time (at least one),
-/// each started in `order` as a slot frees; the answers come back by index, of
-/// `n`, with `None` for an index `order` does not hold. Nothing is retried.
-pub fn pool<T, F>(n: usize, order: &[usize], jobs: usize, run: F) -> Vec<Option<T>>
-where
-    T: Send,
-    F: Fn(usize) -> T + Sync,
-{
-    pool_within(n, order, Limits::fixed(jobs), || None, run).0
-}
-
-/// [`pool`] under `limits`: each item of `order` starts, in `order`, when
+/// Run `run(i)` for every index in `order` under `limits`: each item starts, in `order`, when
 /// [`Limits::may_start`] says one more may — `load` is read at most once per
 /// [`LOAD_SAMPLE`], and only when its answer decides that — and never stops
 /// once started. The answers come back by index, of `n`, with `None` for an
@@ -961,8 +904,8 @@ pub fn summary(bins: &[Binary], limits: Limits, threads: u32, timed: usize, peak
 }
 
 /// A binary the test run's ceiling left no time to start: a FAIL in cargo's
-/// shape (its header, then why), never a pass and never a skip, and — it says
-/// [`crate::differential::CEILING_KILL`] — never inherited.
+/// shape (its header, then why), never a pass and never a skip; it says
+/// [`crate::findings::CEILING_KILL`].
 #[must_use]
 pub fn not_started(b: &Binary, limit: std::time::Duration) -> Run {
     Run {
@@ -970,10 +913,10 @@ pub fn not_started(b: &Binary, limit: std::time::Duration) -> Run {
         output: format!(
             "{}\n{} — not started: the test run's {:.1}s wall-clock ceiling was spent before \
              this binary's turn\n\x20 test binary: {}\n\x20 Counted as a FAIL: it never ran.\n\
-             \x20 Raise the ceiling with --stage-timeout <seconds>, or remove it with \
-             --stage-timeout off.\n",
+             \x20 Raise the ceiling with --timeout <seconds>, or remove it with \
+             --timeout off.\n",
             b.header,
-            crate::differential::CEILING_KILL,
+            crate::findings::CEILING_KILL,
             limit.as_secs_f64(),
             b.spec
         ),
@@ -1000,10 +943,9 @@ fn first_error(log: &str) -> String {
 /// A binary whose tests of a macOS service (`trustd`, the disk-image
 /// service) returned early because it did not answer passed without checking
 /// them: the row stays what ran decided, and ONE named skip per service says
-/// what did not ([`crate::libtest::host_skips`]), which withholds the merge
-/// contract.
-fn decide(r: &mut Report, run: &Run, label: &str) {
-    r.decide_test_child(run, label);
+/// what did not ([`crate::libtest::host_skips`]).
+fn decide(r: &mut Report, run: &Run, label: &str, env: &[(OsString, OsString)]) {
+    r.decide_test_child(run, label, env);
     for skip in crate::libtest::host_skips(&run.output) {
         r.skip(skip);
     }
@@ -1023,13 +965,14 @@ pub fn run_tests(
     serial: &Cmd,
     exes: Result<Vec<TestExe>, String>,
 ) {
+    let env = crate::findings::rerun_env(serial, ctx.test_threads);
     let serially = |r: &mut Report, why: &str| {
         r.raw(format!(
             "  test binaries: run by cargo, one at a time — {why}"
         ));
         let out = exec::run(serial, ctx.exec_env());
         r.raw(out.output.as_str());
-        decide(r, &out, label);
+        decide(r, &out, label, &env);
     };
     let dir = ctx.scratch.join(format!(
         "test-records.{}.{}",
@@ -1043,24 +986,24 @@ pub fn run_tests(
     };
     let Some(config) = config else {
         std::fs::remove_dir_all(&dir).ok();
-        serially(r, "the gate could not name itself as the recording runner");
+        serially(r, "verify could not name itself as the recording runner");
         return;
     };
     let pass = exec::run(&recording_cmd(serial, &config), ctx.exec_env());
     let records = read_records(&dir);
     std::fs::remove_dir_all(&dir).ok();
 
-    // RECORDS THAT CANNOT BE READ ARE NEVER "NO RECORDS" (2026-09-27): the
-    // pass behind them may have executed nothing — every binary replaced by a
-    // recorder that exited 0 — and judged as the serial run it was not, it
-    // would be an `ok` row with no test run. The serial child decides instead.
+    // RECORDS THAT CANNOT BE READ ARE NEVER "NO RECORDS": the pass behind them
+    // may have executed nothing — every binary replaced by a recorder that
+    // exited 0 — and judged as the serial run it was not, it would be an `ok`
+    // row with no test run. The serial child decides instead.
     if let Err(why) = &records {
         serially(r, &format!("the recording could not be read: {why}"));
         return;
     }
     // The recorder ran if it recorded something, or if cargo reports it
     // failing (`process didn't exit successfully: \`<gate> --record-test-binary
-    // …\``): a recorder that could not write is the gate's failure, never the
+    // …\``): a recorder that could not write is the run's failure, never the
     // tree's, and the serial child below decides instead.
     let recorded = records.as_ref().is_ok_and(|v| !v.is_empty());
     let recorder_failed = pass
@@ -1089,7 +1032,7 @@ pub fn run_tests(
             );
         }
         r.raw(pass.output.as_str());
-        decide(r, &pass, label);
+        decide(r, &pass, label, &env);
         return;
     }
     let bins = if pass.ok {
@@ -1109,25 +1052,22 @@ pub fn run_tests(
             return;
         }
     };
-    // Three quarters of the cores (2026-10-05): the binaries running burst
-    // past their average, so a pool that admits until every core reads busy
-    // has none left for the burst. The same gate run at the full count reached
-    // load 40 on 14 cores.
+    // Three quarters of the cores: the binaries running burst past their
+    // average, so a pool that admits until every core reads busy has none left
+    // for the burst.
     let limits = Limits::by_load(
         ctx.test_jobs()
-            .min(memory_jobs(ctx.build_memory(), &crate::plan::plan(ctx))),
+            .min(memory_jobs(ctx.host_memory, &crate::plan::plan(ctx))),
         (ctx.cores() * 3 / 4).max(1),
     );
     let threads = ctx.test_threads();
-    // ONE CEILING FOR THE WHOLE RUN (2026-09-27), as the serial child had: a
-    // binary is started with what is left of it, and one whose turn comes
-    // after it is spent is not started. Each binary's own full ceiling left the
-    // stage with no bound at all — two hangs, two ceilings.
+    // ONE CEILING FOR THE WHOLE RUN, as the serial child had: a binary is
+    // started with what is left of it, and one whose turn comes after it is
+    // spent is not started. A full ceiling per binary would leave the stage no
+    // bound at all — two hangs, two ceilings.
     let ceiling = ctx.exec_env().child_ceiling;
     let started = std::time::Instant::now();
-    let costs_path = crate::receipt::dir(&ctx.caller_root())
-        .ok()
-        .and_then(|receipts| receipts.parent().map(|d| d.join(COSTS_FILE)));
+    let costs_path = Some(ctx.state_dir().join(COSTS_FILE));
     let costs = costs_path.as_deref().map(read_costs).unwrap_or_default();
     let timed = bins.iter().filter(|b| costs.contains_key(&b.spec)).count();
     let measured: Mutex<Vec<(String, f64)>> = Mutex::new(Vec::new());
@@ -1186,7 +1126,7 @@ pub fn run_tests(
     r.raw(summary(&bins, limits, threads, timed, peak));
     let all = combined(&bins, &runs);
     r.raw(all.output.as_str());
-    decide(r, &all, label);
+    decide(r, &all, label, &env);
     if let Some(table) = busiest(
         cpu.into_inner()
             .unwrap_or_else(std::sync::PoisonError::into_inner),
@@ -1211,9 +1151,8 @@ pub const BUSIEST_LISTED: usize = 12;
 
 /// The binaries that spent the most CPU, most first, beside their wall time,
 /// under the run's total: on a saturated machine the test run's length follows
-/// the CPU every binary spends, which a binary's own wall time does not show
-/// (measured 2026-10-05: cutting the summed walls 7 % moved the run 3 % at load
-/// 12-20 on 14 cores). `planned` is how many binaries the run had: one with no
+/// the CPU every binary spends, which a binary's own wall time does not show.
+/// `planned` is how many binaries the run had: one with no
 /// CPU figure (a FAIL above names why) is left out, and the header says how
 /// many the table and its total leave out. `None` when no binary was measured
 /// (off Unix).
@@ -1245,238 +1184,15 @@ pub fn busiest(mut runs: Vec<Busy>, planned: usize, n: usize) -> Option<String> 
 
 static RECORDING: AtomicUsize = AtomicUsize::new(0);
 
-// ---------------------------------------------------------------------------
-// A JSON reader for cargo's messages. This crate has no dependencies on purpose
-// (Cargo.toml), and cargo's messages are one object per line.
-// ---------------------------------------------------------------------------
-
-pub mod json {
-    /// A JSON value; numbers keep their text.
-    #[derive(Clone, Debug, PartialEq, Eq)]
-    pub enum Value {
-        Null,
-        Bool(bool),
-        Num(String),
-        Str(String),
-        Array(Vec<Value>),
-        Object(Vec<(String, Value)>),
-    }
-
-    impl Value {
-        /// A member of an object.
-        #[must_use]
-        pub fn get(&self, key: &str) -> Option<&Value> {
-            match self {
-                Value::Object(m) => m.iter().find(|(k, _)| k == key).map(|(_, v)| v),
-                _ => None,
-            }
-        }
-
-        #[must_use]
-        pub fn as_str(&self) -> Option<&str> {
-            match self {
-                Value::Str(s) => Some(s),
-                _ => None,
-            }
-        }
-
-        #[must_use]
-        pub fn as_bool(&self) -> Option<bool> {
-            match self {
-                Value::Bool(b) => Some(*b),
-                _ => None,
-            }
-        }
-
-        #[must_use]
-        pub fn as_array(&self) -> Option<&[Value]> {
-            match self {
-                Value::Array(a) => Some(a),
-                _ => None,
-            }
-        }
-    }
-
-    /// One value filling `text` (surrounding whitespace allowed), or `None`.
-    #[must_use]
-    pub fn parse(text: &str) -> Option<Value> {
-        let mut p = Parser {
-            b: text.as_bytes(),
-            i: 0,
-            depth: 0,
-        };
-        let v = p.value()?;
-        p.ws();
-        (p.i == p.b.len()).then_some(v)
-    }
-
-    struct Parser<'a> {
-        b: &'a [u8],
-        i: usize,
-        depth: usize,
-    }
-
-    impl Parser<'_> {
-        fn ws(&mut self) {
-            while self.b.get(self.i).is_some_and(|c| c.is_ascii_whitespace()) {
-                self.i += 1;
-            }
-        }
-
-        fn eat(&mut self, c: u8) -> Option<()> {
-            self.ws();
-            (self.b.get(self.i) == Some(&c)).then(|| self.i += 1)
-        }
-
-        fn lit(&mut self, word: &str, v: Value) -> Option<Value> {
-            self.b[self.i..].starts_with(word.as_bytes()).then(|| {
-                self.i += word.len();
-                v
-            })
-        }
-
-        fn value(&mut self) -> Option<Value> {
-            self.ws();
-            self.depth += 1;
-            if self.depth > 256 {
-                return None;
-            }
-            let v = match *self.b.get(self.i)? {
-                b'{' => self.object(),
-                b'[' => self.array(),
-                b'"' => self.string().map(Value::Str),
-                b't' => self.lit("true", Value::Bool(true)),
-                b'f' => self.lit("false", Value::Bool(false)),
-                b'n' => self.lit("null", Value::Null),
-                b'-' | b'0'..=b'9' => self.number(),
-                _ => None,
-            };
-            self.depth -= 1;
-            v
-        }
-
-        fn object(&mut self) -> Option<Value> {
-            self.i += 1;
-            let mut m = Vec::new();
-            if self.eat(b'}').is_some() {
-                return Some(Value::Object(m));
-            }
-            loop {
-                self.ws();
-                let k = self.string()?;
-                self.eat(b':')?;
-                m.push((k, self.value()?));
-                if self.eat(b',').is_some() {
-                    continue;
-                }
-                self.eat(b'}')?;
-                return Some(Value::Object(m));
-            }
-        }
-
-        fn array(&mut self) -> Option<Value> {
-            self.i += 1;
-            let mut a = Vec::new();
-            if self.eat(b']').is_some() {
-                return Some(Value::Array(a));
-            }
-            loop {
-                a.push(self.value()?);
-                if self.eat(b',').is_some() {
-                    continue;
-                }
-                self.eat(b']')?;
-                return Some(Value::Array(a));
-            }
-        }
-
-        fn number(&mut self) -> Option<Value> {
-            let start = self.i;
-            while self
-                .b
-                .get(self.i)
-                .is_some_and(|c| c.is_ascii_digit() || b"+-.eE".contains(c))
-            {
-                self.i += 1;
-            }
-            let text = std::str::from_utf8(&self.b[start..self.i]).ok()?;
-            text.parse::<f64>().ok()?;
-            Some(Value::Num(text.to_string()))
-        }
-
-        fn hex4(&mut self) -> Option<u32> {
-            let h = self.b.get(self.i..self.i + 4)?;
-            self.i += 4;
-            u32::from_str_radix(std::str::from_utf8(h).ok()?, 16).ok()
-        }
-
-        fn string(&mut self) -> Option<String> {
-            if self.b.get(self.i) != Some(&b'"') {
-                return None;
-            }
-            self.i += 1;
-            let mut out = Vec::new();
-            loop {
-                let c = *self.b.get(self.i)?;
-                self.i += 1;
-                match c {
-                    b'"' => return String::from_utf8(out).ok(),
-                    b'\\' => {
-                        let e = *self.b.get(self.i)?;
-                        self.i += 1;
-                        let ch = match e {
-                            b'"' => '"',
-                            b'\\' => '\\',
-                            b'/' => '/',
-                            b'b' => '\u{8}',
-                            b'f' => '\u{c}',
-                            b'n' => '\n',
-                            b'r' => '\r',
-                            b't' => '\t',
-                            b'u' => {
-                                let hi = self.hex4()?;
-                                let code = if (0xD800..0xDC00).contains(&hi) {
-                                    if self.b.get(self.i..self.i + 2)? != b"\\u" {
-                                        return None;
-                                    }
-                                    self.i += 2;
-                                    let lo = self.hex4()?;
-                                    if !(0xDC00..0xE000).contains(&lo) {
-                                        return None;
-                                    }
-                                    0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00)
-                                } else {
-                                    hi
-                                };
-                                char::from_u32(code)?
-                            }
-                            _ => return None,
-                        };
-                        let mut buf = [0u8; 4];
-                        out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
-                    }
-                    c if c < 0x20 => return None,
-                    c => out.push(c),
-                }
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// A TEST RUN WHOSE BINARIES A SILENT `trustd` SKIPPED IS NO MERGE CONTRACT
-    /// (2026-10-06: nine binaries printed aterm-uds's line and the verdict read
-    /// `0 skipped — merge contract satisfied`). The row stays green for what
-    /// ran, ONE named skip says what did not and what clears it, the run still
-    /// passes, and the verdict withholds the sentence; without the line,
-    /// nothing changes.
+    /// A test run whose binaries a silent macOS service skipped stays green
+    /// for what ran, and ONE named skip per service says what did not and
+    /// what clears it; without the line, nothing changes.
     #[test]
-    fn a_silent_trustd_is_one_named_skip_and_no_merge_contract() {
-        use crate::cli::Mode;
-        use crate::scope::Scope;
+    fn a_silent_service_is_one_named_skip_beside_a_green_row() {
         let judge = |output: String| {
             let run = Run {
                 ok: true,
@@ -1485,10 +1201,8 @@ mod tests {
                 spawn_error: None,
             };
             let mut r = Report::new("tests");
-            decide(&mut r, &run, "targo test --workspace");
-            let t = crate::ladder::tally(&[r]);
-            let v = crate::verdict::verdict(Mode::Fast, &Scope::workspace(), &t);
-            (t, v)
+            decide(&mut r, &run, "targo test --workspace", &[]);
+            crate::ladder::tally(&[r])
         };
         let log = |skipped: bool| {
             let line = if skipped {
@@ -1502,7 +1216,7 @@ mod tests {
                  test result: ok. 1 passed; 0 failed\n"
             )
         };
-        let (t, v) = judge(log(true));
+        let t = judge(log(true));
         assert_eq!(
             t.skips,
             [
@@ -1510,30 +1224,8 @@ mod tests {
                  checks (aterm_uds unittests src/lib.rs); rebooting the Mac clears a wedged trustd"
             ]
         );
-        assert!(t.gate_failures.is_empty() && t.could_not_run.is_empty());
-        assert_eq!(v.exit, crate::exit::PASS, "{}", v.text);
-        assert!(!v.claims_merge_contract, "{}", v.text);
-        assert!(
-            v.text
-                .contains("VERIFY: PASS (mode=fast scope=workspace, 1 skipped) —"),
-            "{}",
-            v.text
-        );
-        assert!(
-            v.text.contains(&format!("      - {}", t.skips[0])),
-            "{}",
-            v.text
-        );
-        assert!(
-            !v.text.contains(crate::verdict::MERGE_CONTRACT_SENTENCE),
-            "{}",
-            v.text
-        );
-        // Its row names the reboot; no re-run here lifts it.
-        assert!(!v.text.contains("Before you land:"), "{}", v.text);
-
-        // A silent disk-image service is its own named skip, withheld alike.
-        let (t, v) = judge(log(true).replace(
+        assert!(!t.failed());
+        let t = judge(log(true).replace(
             crate::libtest::skipped::SKIPPED,
             crate::libtest::skipped::DISK_IMAGE_SKIPPED,
         ));
@@ -1545,18 +1237,7 @@ mod tests {
                  service"
             ]
         );
-        assert_eq!(v.exit, crate::exit::PASS, "{}", v.text);
-        assert!(!v.claims_merge_contract, "{}", v.text);
-        assert!(
-            !v.text.contains(crate::verdict::MERGE_CONTRACT_SENTENCE),
-            "{}",
-            v.text
-        );
-        assert!(!v.text.contains("Before you land:"), "{}", v.text);
-
-        let (t, v) = judge(log(false));
-        assert!(t.skips.is_empty());
-        assert!(v.claims_merge_contract, "{}", v.text);
+        assert!(judge(log(false)).skips.is_empty());
     }
 
     /// The busiest table lists the binaries that spent the most CPU, most first
@@ -1600,7 +1281,11 @@ mod tests {
     fn rec(exe: &str, pkg: &str) -> Record {
         Record {
             cwd: PathBuf::from(format!("/r/crates/{pkg}")),
-            argv: vec![exe.into(), "--skip".into(), "measuring::".into()],
+            argv: vec![
+                exe.into(),
+                "-Zunstable-options".into(),
+                "--report-time".into(),
+            ],
             env: vec![
                 ("CARGO_PKG_NAME".into(), pkg.into()),
                 ("RUST_TEST_THREADS".into(), "14".into()),
@@ -1698,8 +1383,8 @@ mod tests {
             "--no-fail-fast",
             "--tests",
             "--",
-            "--skip",
-            "measuring::",
+            "-Zunstable-options",
+            "--report-time",
         ]);
         assert_eq!(
             recording_cmd(&serial, "CFG").argv(),
@@ -1713,37 +1398,11 @@ mod tests {
                 "--config",
                 "CFG",
                 "--",
-                "--skip",
-                "measuring::"
+                "-Zunstable-options",
+                "--report-time"
             ],
             "cargo's flag before the separator, libtest's arguments untouched after it"
         );
-    }
-
-    #[test]
-    fn the_json_reader_reads_cargos_messages_and_refuses_the_rest() {
-        let v = json::parse(r#" {"a":[1,-2.5e3,true,null,"x\"\\é😀"],"b":{}} "#).expect("json");
-        assert_eq!(
-            v.get("a").and_then(json::Value::as_array).map(<[_]>::len),
-            Some(5)
-        );
-        assert_eq!(
-            v.get("a")
-                .and_then(|a| a.as_array())
-                .and_then(|a| a[4].as_str()),
-            Some("x\"\\é😀")
-        );
-        for bad in [
-            "{",
-            r#"{"a":}"#,
-            r#"{"a":1,}"#,
-            "[1 2]",
-            r#""\ud83d""#,
-            "{} x",
-            "tru",
-        ] {
-            assert_eq!(json::parse(bad), None, "{bad}");
-        }
     }
 
     /// THE COMPILE'S LIST, AND THE LOG WITHOUT IT: only test-mode executables
@@ -2113,11 +1772,11 @@ mod tests {
         assert_eq!(done.load(Ordering::SeqCst), 4, "the other four ran");
     }
 
-    /// A BINARY THE RUN'S CEILING LEFT NO TIME TO START (2026-09-27) is a FAIL
-    /// in cargo's shape — its header, the gate's TIMEOUT words, cargo's re-run
-    /// line — and its row is never inherited.
+    /// A BINARY THE RUN'S CEILING LEFT NO TIME TO START is a FAIL in cargo's
+    /// shape — its header, the run's TIMEOUT words, cargo's re-run
+    /// line — one finding for the row, which says so.
     #[test]
-    fn a_binary_the_ceiling_left_no_time_for_is_a_fail_never_inherited() {
+    fn a_binary_the_ceiling_left_no_time_for_is_a_fail() {
         let b = Binary {
             header: "     Running tests/late.rs (target/debug/deps/late-1)".into(),
             spec: "-p x --test late".into(),
@@ -2127,15 +1786,22 @@ mod tests {
         assert!(!run.ok);
         assert!(run.output.starts_with(&b.header), "{}", run.output);
         assert!(
-            run.output.contains(crate::differential::CEILING_KILL),
+            run.output.contains(crate::findings::CEILING_KILL),
             "{}",
             run.output
         );
         let all = combined(std::slice::from_ref(&b), std::slice::from_ref(&run));
         assert!(!all.ok);
-        let found = crate::differential::test_findings("targo test --tests", &all.output);
+        let found = crate::findings::test_findings("targo test --tests", &all.output, &[]);
         assert_eq!(found.len(), 1);
-        assert!(found[0].opaque.is_some(), "{found:?}");
+        assert_eq!(found[0].rerun, None, "a whole-row finding: {found:?}");
+        assert!(
+            found[0]
+                .message
+                .iter()
+                .any(|l| l.contains(crate::findings::CEILING_KILL)),
+            "{found:?}"
+        );
     }
 
     /// THE COMBINED LOG IS CARGO'S, so every reader of cargo's reads it: the
@@ -2181,7 +1847,7 @@ mod tests {
         assert_eq!(tests.len(), 1);
         assert_eq!(tests[0].spec, "-p x --test b");
         assert_eq!(tests[0].name, "t::broke");
-        let findings = crate::differential::test_findings("targo test --tests", &all.output);
+        let findings = crate::findings::test_findings("targo test --tests", &all.output, &[]);
         assert_eq!(findings[0].id, "-p x --test b -- t::broke");
         assert!(
             all.output
@@ -2201,7 +1867,7 @@ mod tests {
         let all = combined(&bins, &[pass(&bins[0]), crashed, pass(&bins[2])]);
         assert!(all.output.contains(
             "error: test failed, to rerun pass `-p x --test b`\n\nCaused by:\n  process didn't \
-             exit successfully: `/r/target/debug/deps/b-1 --skip measuring::` (killed by a signal)\n"
+             exit successfully: `/r/target/debug/deps/b-1 -Zunstable-options --report-time` (killed by a signal)\n"
         ));
         assert_eq!(
             crate::libtest::failed_tests(&all.output),
@@ -2233,7 +1899,11 @@ mod tests {
         let cmd = binary_cmd(&b, 7);
         assert_eq!(
             cmd.argv(),
-            ["/r/target/debug/deps/a-1", "--skip", "measuring::"]
+            [
+                "/r/target/debug/deps/a-1",
+                "-Zunstable-options",
+                "--report-time"
+            ]
         );
         assert_eq!(cmd.cwd.as_deref(), Some(Path::new("/r/crates/x")));
         assert!(cmd.exact_env);
@@ -2244,7 +1914,7 @@ mod tests {
                 .map(|(_, v)| v.to_str().unwrap())
                 .collect::<Vec<_>>(),
             ["7"],
-            "one value, the gate's — never the recorded 14 beside it"
+            "one value, the run's — never the recorded 14 beside it"
         );
         assert!(
             cmd.envs

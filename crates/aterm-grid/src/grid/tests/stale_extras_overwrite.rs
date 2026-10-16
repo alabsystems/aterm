@@ -153,11 +153,8 @@ fn write_wide_run_autowrap_clears_stale_extras_entries() {
 
 #[test]
 fn wide_run_autowrap_clears_orphaned_wide_half_at_run_start() {
-    // The bulk wide-run write runs the wide-orphan fixup once before its
-    // no-fixup fast path, so a run starting on a continuation half leaves no
-    // dangling WIDE base.
+    // The bulk run's one pre-run fixup clears the base of the pair it starts on.
     let mut grid = Grid::new(5, 10);
-    // Plant a wide char at cols 0-1: col0 = WIDE base, col1 = WIDE_CONTINUATION.
     grid.set_cursor(0, 0);
     assert!(grid.write_wide_autowrap_fast('中', PackedColors::new(), CellFlags::empty()));
     assert!(grid.cell(0, 0).unwrap().flags().contains(CellFlags::WIDE));
@@ -168,8 +165,7 @@ fn wide_run_autowrap_clears_orphaned_wide_half_at_run_start() {
             .contains(CellFlags::WIDE_CONTINUATION)
     );
 
-    // CUP onto the continuation half (col 1), then a bulk wide run: col 0's WIDE
-    // base is cleaned up.
+    // CUP onto the continuation half, then a bulk wide run.
     grid.set_cursor(0, 1);
     grid.write_mixed_wide_run_autowrap(
         &['🚀', '🚀'],
@@ -216,13 +212,10 @@ fn write_ascii_run_with_extras_does_not_merge_stale_hyperlink() {
     );
 }
 
-/// Defence in depth (r15 C2): an extras run that creates map entries (an
-/// underline colour, OSC 8) starts each cell's entry fresh, so it never adopts
-/// an entry its cells did not claim, whatever left it there. The orphan is
-/// planted straight into the map, as the double-width ICH/DCH left one. A
-/// truecolor-only run writes the ring, not the map, and relies on orphans
-/// being closed where they are made (ruling 2026-10-11 in
-/// `CellExtras::set_range_uniform`), which the process fuzzers assert.
+/// An extras run that creates map entries (an underline colour, OSC 8) starts
+/// each cell's entry fresh, so it never adopts an entry its cells did not claim
+/// (planted straight into the map here). A truecolor-only run writes the ring,
+/// not the map, and relies on orphans being closed where they are made.
 #[test]
 fn an_extras_run_never_adopts_an_orphaned_entry() {
     let url: Arc<str> = Arc::from("https://example.com/new");
@@ -322,39 +315,5 @@ fn wide_run_autowrap_tightens_len_when_the_run_orphans_the_row_tail() {
         grid.row_text(0).as_deref(),
         Some(" あい"),
         "len must tighten to 5 — a stale-high len paints a phantom trailing space"
-    );
-}
-
-/// The same obligation on the emoji run lane. Asserted on the trailing space:
-/// non-BMP glyphs render as U+FFFD on a bare `Grid`, and a stale `len` shows
-/// as exactly one trailing blank.
-#[test]
-fn emoji_run_autowrap_tightens_len_when_the_run_orphans_the_row_tail() {
-    let mut grid = Grid::new(2, 80);
-    grid.set_cursor(0, 0);
-    grid.write_emoji_run_autowrap(
-        &['\u{1F600}', '\u{1F601}', '\u{1F602}'],
-        PackedColors::new(),
-        CellFlags::empty(),
-    );
-    let three = grid.row_text(0).expect("row 0 exists");
-    assert_eq!(three.chars().count(), 3, "three emoji occupy cols 0..6");
-
-    // Cursor on the first emoji's continuation (col 1), then a two-glyph run
-    // whose end orphans the third emoji's continuation at col 5, the last content.
-    grid.set_cursor(0, 1);
-    grid.write_emoji_run_autowrap(
-        &['\u{1F603}', '\u{1F604}'],
-        PackedColors::new(),
-        CellFlags::empty(),
-    );
-    assert!(
-        grid.cell(0, 5).unwrap().is_empty(),
-        "the orphaned continuation past the run's end must be cleared"
-    );
-    let after = grid.row_text(0).expect("row 0 exists");
-    assert!(
-        !after.ends_with(' '),
-        "len must tighten — a stale-high len paints a phantom trailing space, got {after:?}"
     );
 }

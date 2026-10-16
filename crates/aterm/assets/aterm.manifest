@@ -12,8 +12,8 @@
 
   DELIBERATELY ABSENT — read before adding: there is no <dpiAware> and no
   <dpiAwareness>. winit calls SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2)
-  itself at event-loop bring-up (vendor/winit/src/platform_impl/windows/dpi.rs:20,
-  from event_loop.rs:199), and a manifest declaration is applied by the LOADER,
+  itself at event-loop bring-up (crates/aterm-window/src/platform_impl/windows/dpi.rs:35,
+  from event_loop.rs:208), and a manifest declaration is applied by the LOADER,
   before any of our code runs — so it wins, and winit's call then fails with
   ERROR_ACCESS_DENIED (silently: winit ignores the result). Declaring anything
   here would therefore SILENTLY take ownership of the DPI mode away from the code

@@ -6,10 +6,10 @@
 //!
 //! The caller decides WHETHER a proxy may be consulted at all
 //! ([`ProxyMode`]); this module only answers "given that it may, which one".
-//! That split matters: the title-summary worker forces
+//! That split matters: a caller forces
 //! [`ProxyMode::Direct`] for a loopback endpoint so that a stray `HTTPS_PROXY`
 //! in the environment can never turn a local-only trust decision into
-//! terminal-data or bearer-token egress to an unrelated host.
+//! request-body or bearer-token egress to an unrelated host.
 //!
 //! The variable for the target's scheme is read first (`HTTPS_PROXY`, else
 //! `https_proxy`; `HTTP_PROXY`, else `http_proxy`), then `ALL_PROXY`, else
@@ -17,10 +17,9 @@
 //! FAILS CLOSED: a value this client cannot use (no `http://` scheme, a SOCKS
 //! or `https://` proxy, a malformed authority, a value that is not valid
 //! Unicode) is an [`Error::Invalid`] naming the variable. It is never guessed
-//! at and never becomes a direct connection, which would carry terminal
-//! context and a bearer token around a proxy the network or its policy
-//! requires. The error never echoes the value: a proxy URL can carry a
-//! password.
+//! at and never becomes a direct connection, which would carry the request
+//! body and a bearer token around a proxy the network or its policy requires.
+//! The error never echoes the value: a proxy URL can carry a password.
 //!
 //! `user:password@` in the proxy URL, percent-encoded as RFC 3986 requires,
 //! becomes `Proxy-Authorization: Basic` on the `CONNECT` (an `https` target)
@@ -360,7 +359,7 @@ mod tests {
     #[test]
     fn direct_mode_ignores_every_proxy_variable() {
         // THE loopback guarantee: a stray HTTPS_PROXY must never redirect
-        // terminal context or a bearer token off this machine. An unusable
+        // a request body or a bearer token off this machine. An unusable
         // value is ignored too: Direct never reads it.
         let env = FakeEnv::with(&[
             ("HTTPS_PROXY", "http://evil.test:8080"),

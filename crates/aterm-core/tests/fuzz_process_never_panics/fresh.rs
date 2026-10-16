@@ -18,8 +18,8 @@
 //!   whatever aterm-core its invocation builds: WITHOUT `sixel` under a plain
 //!   `-p aterm-core` (the library default and the Linux lane's
 //!   `--no-default-features` build: the hooks take the consume-only
-//!   `DcsType::Unknown` path), with it under `--features sixel` or the
-//!   `--workspace` gate, where feature unification turns it on.
+//!   `DcsType::Unknown` path), with it under `--features sixel` or a
+//!   `--workspace` test run, where feature unification turns it on.
 //! - aterm-conformance's `vt` suite (as `mod fresh_terminal`, by `#[path]`)
 //!   always runs against aterm-core[sixel], that crate's dependency: there
 //!   the hooks reach the decoder and image placement on every run,
@@ -119,6 +119,12 @@ fn fresh_run(test: &str, lane: u64) -> (u64, u32) {
                 .unwrap_or_else(|e| panic!("ATERM_FRESH_FUZZ_SEED={v:?}: {e}"))
         }
         Err(_) => {
+            // `allow`, not `expect`: aterm-conformance compiles this file too,
+            // under the workspace config, which does not ban the clock.
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "test code: the wall clock seeds the fuzz, never the engine"
+            )]
             let nanos = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_nanos() as u64);

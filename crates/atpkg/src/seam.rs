@@ -85,12 +85,12 @@
 //!   clone that cannot be made (the store on another volume) refuses the attach: atpkg
 //!   never byte-copies a toolchain in place of a clone.
 //! * A view a live process runs from — or one a run holds a lease on ([`crate::lease`]: a
-//!   merge-contract run between two of its stages), or one whose process table cannot be
-//!   read — is not re-laid at all: a running `targo` spawns the `trustc` beside it by the
-//!   view's name, so a swap switched compilers mid-build. It is left as it stands, the
-//!   re-assertion says so in a line of its own — naming `aterm pkg repair` for once the
-//!   build has finished — and the first pass that finds nothing running from it and no
-//!   lease on it lays it ([`Deferred`]).
+//!   command under `aterm pkg lease` between two of its steps), or one whose process
+//!   table cannot be read — is not re-laid at all: a running `targo` spawns the
+//!   `trustc` beside it by the view's name, so a swap switched compilers mid-build. It
+//!   is left as it stands, the re-assertion says so in a line of its own — naming
+//!   `aterm pkg repair` for once the build has finished — and the first pass that finds
+//!   nothing running from it and no lease on it lays it ([`Deferred`]).
 //! * The same for the ENTRY: an existing link due to be re-pointed (a pre-view link into
 //!   the store, or a stale foreign link) is left while a live process runs from
 //!   what it names, or while the table cannot be read — rustup's proxies spawn the compiler
@@ -341,8 +341,8 @@ pub struct Refreshed {
 /// `current` flip alone switches it — E0514 measured the same way — with no view involved,
 /// so nothing this guard reads can see it (gc keeps the build: the kernel names the
 /// resolved path). The rule is at the callers instead: resolve the candidate before
-/// running it; `tools/grep_guard.sh` B14 fences a
-/// `current` path joined in shipped code outside atpkg without a `canonicalize`.
+/// running it (the census guard `store-current` fences a `current` path joined in
+/// shipped code outside atpkg without a `canonicalize`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Deferred {
     /// A live process runs from the view — the executable the kernel names for it.
@@ -351,9 +351,9 @@ pub enum Deferred {
     /// ruled out; unknown is priced as in use (a stale view is one pass late, a swapped
     /// one fails a build).
     Unknown,
-    /// A run holds a lease on the view ([`crate::lease`]) — a merge-contract run resolved
-    /// its toolchain here and has stages still to run, though no process runs from it
-    /// between two of them — or its leases could not be read, which is priced the same.
+    /// A run holds a lease on the view ([`crate::lease`]) — a command under `aterm pkg
+    /// lease` that has steps still to run, though no process runs from it between two of
+    /// them — or its leases could not be read, which is priced the same.
     Leased(crate::lease::Holders),
 }
 
@@ -662,7 +662,7 @@ fn dir_mismatch(build: &Path, view: &Path, dir: &str, depth: Depth) -> Option<Pa
 /// means the same sentence everywhere (`symlink_metadata` does not follow a Windows
 /// reparse point either, and a junction answers `is_symlink()`, never `is_dir()`), so the
 /// fix then is widening this gate. An ungated caller of a gated item fails to compile in
-/// the foreign cells (`xtask gate cells-foreign`).
+/// the foreign cells (`verify cells`).
 #[cfg(unix)]
 pub(crate) fn is_real_dir(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
@@ -1640,7 +1640,7 @@ enum Heal {
 }
 
 /// THE UNATTENDED HEAL. Owner direction: the toolchain aterm builds itself with works by
-/// default. The gates and the cutter rank a stale rustup entry below the store, but
+/// default. `verify` and the cutter rank a stale rustup entry below the store, but
 /// rust-analyzer, `cargo +trust` and every rustup proxy under a `rust-toolchain.toml` run
 /// whatever the entry names.
 ///
@@ -3465,9 +3465,9 @@ mod tests {
         assert!(live_build_tree(&alias));
     }
 
-    /// THE UNATTENDED HEAL (2026-09-26, owner: self-healing "by default"). Measured that day:
-    /// rustup's `trust` -> `$HOME/trust/build/host/stage2`, a 2026-08-20 stage2, against the
-    /// store's 2026-09-17 build — the gates already skipped it, and rust-analyzer and every
+    /// THE UNATTENDED HEAL (owner: self-healing "by default"). Measured: rustup's
+    /// `trust` -> `$HOME/trust/build/host/stage2`, a stage2 four weeks older than the store's
+    /// build — `verify` and the cutter already skipped it, and rust-analyzer and every
     /// `cargo +trust` still ran it. The pass nobody asked for re-points it at the view, says
     /// so with the way back on the line, records what it replaced, leaves the tree itself
     /// alone, and is quiet from then on. Both spellings of the tree: `host`, and a triple.
@@ -4586,11 +4586,10 @@ mod tests {
         assert!(view_matches(&new, &view, Depth::Deep));
     }
 
-    /// A LEASED VIEW IS LEFT AS IT STANDS (2026-09-26). A merge-contract run that resolved
-    /// `cargo +trust`'s toolchain here holds a lease on the view for the whole run; between
-    /// two of its stages nothing runs from it, and a re-lay there handed its later stages a
-    /// different compiler. The line names the holder; once the run ends the view follows
-    /// `current` as before.
+    /// A LEASED VIEW IS LEFT AS IT STANDS. A command run under `aterm pkg lease` on the
+    /// view holds it for the whole run; between two of its steps nothing runs from it, and
+    /// a re-lay there would hand its later steps a different compiler. The line names the
+    /// holder; once the run ends the view follows `current` as before.
     #[cfg(unix)]
     #[test]
     fn a_leased_view_is_left_as_it_stands_until_the_run_ends() {
@@ -4601,7 +4600,7 @@ mod tests {
         let lease = crate::lease::take(
             &fx.layout.prefix,
             &crate::lease::Subject::view("trust").unwrap(),
-            "aterm-verify (pid 7) — the merge contract in /w",
+            "targo (pid 7) — held by `aterm pkg lease` in /w",
             crate::lease::DEFAULT_WAIT,
         )
         .unwrap();
@@ -4610,10 +4609,7 @@ mod tests {
         let Some(Deferred::Leased(holders)) = &r.deferred else {
             panic!("a leased view is left: {r:?}");
         };
-        assert!(
-            holders.clause().contains("aterm-verify (pid 7)"),
-            "{holders:?}"
-        );
+        assert!(holders.clause().contains("targo (pid 7)"), "{holders:?}");
         assert_eq!(
             std::fs::read_to_string(view.join("bin").join("trustc")).unwrap(),
             "trustc of build 9178",
@@ -4654,7 +4650,7 @@ mod tests {
         let lease = crate::lease::take(
             &fx.layout.prefix,
             &crate::lease::Subject::view("trust").unwrap(),
-            "aterm-verify (pid 7) — the merge contract in /w",
+            "targo (pid 7) — held by `aterm pkg lease` in /w",
             crate::lease::DEFAULT_WAIT,
         )
         .unwrap();
@@ -4717,7 +4713,7 @@ mod tests {
         let lease = crate::lease::take(
             &fx.layout.prefix,
             &crate::lease::Subject::view("trust").unwrap(),
-            "aterm-verify (pid 7) — the merge contract in /w",
+            "targo (pid 7) — held by `aterm pkg lease` in /w",
             crate::lease::DEFAULT_WAIT,
         )
         .unwrap();

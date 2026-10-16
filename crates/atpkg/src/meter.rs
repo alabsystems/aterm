@@ -66,7 +66,9 @@ pub(crate) struct Look {
 }
 
 /// The program the line features: `focus` if the pass has a row for it, else the one in
-/// a working phase — downloading, checking or unpacking before one only being set up.
+/// a working phase — downloading, checking or unpacking before one only being set up, and
+/// any of those before a download that is in and waits for the pass to reach it
+/// ([`ProgramProgress::downloaded`]).
 fn featured<'a>(
     file: &'a ProgressFile,
     focus: Option<&str>,
@@ -77,13 +79,15 @@ fn featured<'a>(
             .get_key_value(name)
             .map(|(k, row)| (k.as_str(), row));
     }
-    let working = |phases: &[Phase]| {
+    let working = |phases: &[Phase], waiting: bool| {
         file.programs
             .iter()
-            .find(|(_, row)| phases.contains(&row.phase))
+            .find(|(_, row)| phases.contains(&row.phase) && row.downloaded() == waiting)
             .map(|(k, row)| (k.as_str(), row))
     };
-    working(&[Phase::Download, Phase::Verify, Phase::Extract]).or_else(|| working(&[Phase::Link]))
+    working(&[Phase::Download, Phase::Verify, Phase::Extract], false)
+        .or_else(|| working(&[Phase::Link], false))
+        .or_else(|| working(&[Phase::Download], true))
 }
 
 /// A program name from a progress snapshot, fit for a terminal: the file is untrusted
@@ -546,6 +550,10 @@ mod sigint {
         unsafe {
             libc::write(2, CLEAR.as_ptr().cast(), CLEAR.len());
             libc::signal(sig, libc::SIG_DFL);
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "re-raises SIGINT with its default action, which dumps no core"
+            )]
             libc::raise(sig);
         }
     }
@@ -601,6 +609,7 @@ mod tests {
             pid: Some(1),
             pass: "net".into(),
             started_unix: 0,
+            generation: None,
             heartbeat_unix: 0,
             overall,
             queue: Vec::new(),
@@ -737,6 +746,37 @@ mod tests {
             "⠹ Waiting…"
         );
         assert_eq!(render_line(&Show::Nothing, None, &WIDE), "");
+    }
+
+    /// An archive fetched ahead and waiting for the pass moves nothing: the program being
+    /// unpacked, or one being set up, is the one featured — the waiting download only
+    /// when nothing else is in flight.
+    #[test]
+    fn a_download_waiting_for_the_pass_yields_to_the_program_in_hand() {
+        let f = file(
+            &[
+                ("ay", row(Phase::Download, 2, 2)),
+                ("trust", row(Phase::Extract, 3, 4)),
+            ],
+            Overall::default(),
+        );
+        assert_eq!(
+            render_line(&pass(f), None, &WIDE),
+            "⠹ Unpacking trust  ▕████████████    ▏ 75%"
+        );
+        let f = file(
+            &[
+                ("ay", row(Phase::Download, 2, 2)),
+                ("trust", row(Phase::Link, 0, 0)),
+            ],
+            Overall::default(),
+        );
+        assert_eq!(render_line(&pass(f), None, &WIDE), "⠹ Setting up trust…");
+        let f = file(&[("ay", row(Phase::Download, 2, 2))], Overall::default());
+        assert!(
+            render_line(&pass(f), None, &WIDE).starts_with("⠹ Downloading ay"),
+            "nothing else in flight"
+        );
     }
 
     /// A FOCUS names the program a pending stub waits for, whatever else is in flight —

@@ -2,14 +2,12 @@
 // Copyright 2026 Andrew Yates
 
 //! Tier-1: the shipping `MessageCenter` follows the derived `ExceptionsDigest`
-//! model in lock step (aterm-spec `derive`, step 3). Every real
-//! transition is one the model enables, and after each the projection
-//! `(open, glass)` of the real center equals the model's — so the digest can
-//! never want a band row (`LaterNeverWantsARow`), a dismissal holds inside its
-//! span (`DismissalHolds`), and the cap files, it does not drop
-//! (`NothingIsLost`). The negative control at the end plants the incident's
-//! shape — an exception seated as a plain warning — and shows the same
-//! projection catches it.
+//! model in lock step. Every real transition is one the model enables, and
+//! after each the real center's `(open, glass)` equals the model's, so the
+//! digest never wants a band row (`LaterNeverWantsARow`), a dismissal holds
+//! inside its span (`DismissalHolds`), and the cap files rather than drops
+//! (`NothingIsLost`). The negative control plants an exception posted as a
+//! plain warning and shows the same projection catches it.
 
 use aterm_messages::need::{Ask, Fingerprint, LaterAsk, Mover, Reason, Resurface, Span, Then, Why};
 use aterm_messages::{
@@ -77,6 +75,10 @@ fn the_real_center_follows_the_model_in_lock_step() {
     let mut fired = std::collections::BTreeMap::<&str, u32>::new();
     for seed in 1..=30u64 {
         let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test code: the one instant a test mints and feeds in"
+        )]
         let now = Instant::now();
         let mut c = MessageCenter::new(MessageLog::empty(), now);
         let mut st = model.init_state();
@@ -189,9 +191,12 @@ fn the_real_center_follows_the_model_in_lock_step() {
         );
     }
 
-    // NEGATIVE CONTROL: the incident's shape — an exception seated as a plain
-    // warning — moves the band's rows without the model moving, and the same
-    // projection sees it.
+    // Negative control: an exception posted as a plain warning moves the
+    // band's rows without the model moving, and the same projection sees it.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test code: the one instant a test mints and feeds in"
+    )]
     let now = Instant::now();
     let mut c = MessageCenter::new(MessageLog::empty(), now);
     let st = model.init_state();

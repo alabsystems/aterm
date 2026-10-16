@@ -1,17 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Where a kitty chunked load (`m=1`) ends, against the real engine. A load
-//! assembles from its chunks whatever unrelated output falls between them,
-//! and a chunk may repeat the first chunk's keys. It ends where the program
-//! that began it is over (the shell's prompt or command start), and, as in
-//! kitty, at a command that cannot belong to it (a delete, a transmit on
-//! another medium). The next program's first command is then read as itself
-//! instead of being lost as a chunk. A put arriving mid-load is shown and the
-//! load goes on, as kitty does. Only a first chunk kitty holds in flight
-//! opens a load: any other ignores its `m=1`. A command kitty refuses before
-//! it routes one (naming both `i=` and `I=`, or a query naming no `i=`) is
-//! neither a chunk nor ends a load.
+//! Where a kitty chunked load (`m=1`) ends, against the real engine. A load assembles
+//! across unrelated output and repeated keys; it ends where the program that began it is
+//! over (the shell's prompt or command start) and, as in kitty, at a command that cannot
+//! belong to it, so the next program's first command is read as itself instead of being
+//! lost as a chunk.
 
 use aterm_core::terminal::Terminal;
 
@@ -25,7 +19,7 @@ fn apc(control: &str, payload: &str) -> Vec<u8> {
     format!("\x1b_G{control};{payload}\x1b\\").into_bytes()
 }
 
-/// Move the cursor to the 0-based `row`, column 0.
+/// Move the cursor to 0-based row `n`, column 0.
 fn row(n: u16) -> Vec<u8> {
     format!("\x1b[{};1H", n + 1).into_bytes()
 }
@@ -173,14 +167,11 @@ fn refusal(reply: Option<Vec<u8>>) -> Option<String> {
     code.starts_with('E').then_some(code)
 }
 
-/// A first chunk (`m=1`) holds a load in flight exactly where kitty's does: a
-/// transmit, query or frame load on the direct medium that kitty accepts.
-/// Any other command ignores its `m=1`, runs at once with its usual answer
-/// and leaves no load open, and one that ends a load in flight opens none in
-/// its place, so the next program's complete command draws. Each chunk kitty
-/// refuses sits beside one it holds that differs only by a key or by what
-/// the store holds, where that next command is the load's final chunk and
-/// draws nothing.
+/// A first chunk (`m=1`) holds a load in flight exactly where kitty's does: a transmit,
+/// query or frame load on the direct medium that kitty accepts. Any other command ignores
+/// its `m=1`, runs at once with its usual answer and opens no load (one that ends a load in
+/// flight opens none in its place). Each refused chunk sits beside a held one that differs
+/// only by a key or by what the store holds.
 #[test]
 fn only_a_first_chunk_kitty_accepts_holds_a_load() {
     let (first, _) = split_load();
@@ -239,12 +230,10 @@ fn only_a_first_chunk_kitty_accepts_holds_a_load() {
     }
 }
 
-/// A command kitty refuses before it routes one, one naming both `i=` and
-/// `I=` or a query naming no `i=`, is answered between a load's chunks and
-/// leaves the load in flight: the final chunk still completes it, and a
-/// delete refused so deletes nothing. Without the refusing key the same
-/// command is a chunk of the load (a query, a transmit) or ends it (a
-/// delete), and the load draws nothing.
+/// A command kitty refuses before routing it (naming both `i=` and `I=`, or a query
+/// naming no `i=`) is answered between a load's chunks and leaves the load in flight.
+/// Without the refusing key the same command joins the load (a query, a transmit) or ends
+/// it (a delete), and the load draws nothing.
 #[test]
 fn a_command_refused_before_routing_leaves_the_load_in_flight() {
     let (first, rest) = split_load();

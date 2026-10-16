@@ -2,11 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Memory management and back-removal operations for [`DiskColdTier`].
-//!
-//! Contains `bytes_used` tracking, page decompression, LRU cache, and
-//! newest-end (back) removal. Extracted to keep `disk.rs` under the
-//! 500-line file limit.
+//! Memory accounting, page decompression, the LRU page cache, and newest-end
+//! (back) removal for [`DiskColdTier`].
 
 use super::{CacheEntry, DiskColdTier, HashMap, Line, PageIndexEntry};
 use crate::disk_format::{HEADER_SIZE, PAGE_HEADER_SIZE, len_to_u32, len_u32_to_usize};
@@ -25,10 +22,9 @@ impl DiskColdTier {
     }
 
     pub(crate) fn calculate_memory_used(&self) -> usize {
-        // Saturating arithmetic throughout: this is a diagnostic byte counter, so
-        // a pathological capacity must clamp to `usize::MAX` (an "enormous"
-        // reading) rather than debug-panic or release-wrap to a bogus small one.
-        // Trust `-Z trust-verify` proves each operation here panic-free.
+        // Saturating throughout: a pathological capacity clamps to `usize::MAX`
+        // rather than panic or wrap to a bogus small reading, and the trust lane
+        // proves each operation panic-free.
         let base = std::mem::size_of::<Self>();
         let path_mem = self.path.capacity();
         let index_mem = self
@@ -67,14 +63,12 @@ impl DiskColdTier {
         cache.capacity()
     }
 
-    /// Decompress a page — from the mapped view when it covers the page, else
-    /// by reading the file positionally ([`Self::read_page_bytes`]).
+    /// Decompress a page from the mapped view when it covers the page, else by
+    /// positional read ([`Self::read_page_bytes`]).
     ///
-    /// Appends no longer re-map the file (disk_write.rs), so the view's
-    /// extent is a snapshot from load/compaction time and the NEWEST pages
-    /// normally live beyond it; they take the positional-read path. The map
-    /// keeps serving the (older, hotter for scroll) pages it covers with zero
-    /// syscalls.
+    /// Appends do not re-map (disk_write.rs), so the view's extent dates from load
+    /// or compaction and the newest pages normally take the positional path; the
+    /// map serves the older pages it covers with zero syscalls.
     pub(super) fn decompress_page(
         &self,
         page_idx: usize,
@@ -109,18 +103,12 @@ impl DiskColdTier {
             ))
         })?;
 
-        // Mapped fast path, behind two guards:
-        //  (1) the page must lie inside the view's recorded extent;
-        //  (2) defense-in-depth against another process truncating the
-        //      backing file: the mmap length is fixed at map time, so a
-        //      shrunk file leaves the view's tail past EOF (SIGBUS on deref).
-        //      Re-read the live length and refuse mapped reads outside it.
-        //      Best-effort as before (a racing truncation during the deref
-        //      can still fault; the map contract already forbids concurrent
-        //      external modification — hardening beyond contract).
-        // A page failing either guard falls to the positional read, which
-        // fails CLOSED (UnexpectedEof) instead of faulting — strictly more
-        // robust than the old hard error, identical on every honest path.
+        // Mapped fast path, only when the page lies inside both the view's extent
+        // and the file's live length: the map length is fixed at map time, so a file
+        // truncated by another process leaves the view's tail past EOF (SIGBUS on
+        // deref). Best-effort: a truncation racing the deref can still fault, which
+        // the map contract already forbids. A page failing either guard takes the
+        // positional read, which fails closed (UnexpectedEof).
         let mapped: Option<&[u8]> = match self.mmap {
             Some(ref mmap) if data_end <= mmap.len() => {
                 let live_ok = match self.file.as_ref().and_then(|f| f.metadata().ok()) {
@@ -153,34 +141,29 @@ impl DiskColdTier {
             }
         };
 
-        let decompressed = crate::decode_zstd_bounded(compressed)?;
+        let decompressed = crate::decode_cold_bounded(compressed)?;
         Ok(deserialize_page_lines(&decompressed))
     }
 
-    /// Read `len` bytes at `offset` from the backing file (positional read;
-    /// never moves a shared cursor).
+    /// Read `len` bytes at `offset` from the backing file, positionally (no shared
+    /// cursor).
     ///
-    /// Serves pages beyond the mapped extent — the normal case for pages
-    /// appended since the last load/compaction now that appends never re-map
-    /// — and doubles as the fail-closed fallback whenever the mapped view
-    /// cannot safely serve a page. A short read (torn tail, concurrent
-    /// truncation) surfaces as `UnexpectedEof`, never a fault.
-    // Skip: positional-read loop over an OS handle — the io class the strict
-    // gate treats as absent-callee; bounds are carried by the buffer length.
+    /// Serves pages beyond the mapped extent (appended since the last load or
+    /// compaction) and is the fail-closed fallback when the map cannot safely serve
+    /// a page. A short read surfaces as `UnexpectedEof`, never a fault.
+    // Skip: a positional-read loop over an OS handle, the io class the strict gate
+    // treats as absent-callee; the buffer length carries the bounds.
     #[cfg_attr(trust_verify, trust::skip)]
     fn read_page_bytes(&self, offset: u64, len: usize) -> Result<Vec<u8>, crate::ScrollbackError> {
         let Some(file) = self.file.as_ref() else {
-            // Keep the historical in-memory-mode error shape: metadata-only
-            // stores have no page bytes to read.
+            // In-memory mode: metadata-only stores have no page bytes to read.
             return Err(crate::ScrollbackError::Io(io::Error::new(
                 io::ErrorKind::NotFound,
                 "no memory map available for disk read",
             )));
         };
-        // Bound the allocation by the LIVE file length BEFORE allocating: a
-        // malformed PageIndexEntry (huge compressed_size) must fail closed
-        // here exactly as it did against the mapped extent — without first
-        // committing a multi-GiB zeroed buffer.
+        // Bound the allocation by the live file length first, so an entry with a huge
+        // compressed_size fails closed without committing a multi-GiB buffer.
         let live_len = file.metadata().map_err(crate::ScrollbackError::Io)?.len();
         let end = offset.checked_add(len as u64).ok_or_else(|| {
             crate::ScrollbackError::Io(io::Error::new(
@@ -215,25 +198,24 @@ impl DiskColdTier {
                         "positional read hit EOF inside a page",
                     )));
                 }
-                // Bounded by `len`; saturating per crate idiom (discharges
-                // the strict gate's overflow counterexample, exact on every
-                // real path).
+                // Bounded by `len`; saturating discharges the strict gate's
+                // overflow obligation.
                 done = done.saturating_add(n);
             }
         }
         Ok(buf)
     }
 
-    /// Drop the whole decompressed-page cache AND zero its byte accounting in one
-    /// step, so `cache_bytes` (== Σ `CacheEntry::bytes`) cannot drift after a bulk
-    /// clear (truncation/compaction). Every cache-clearing site must go through here.
+    /// Drop the whole decompressed-page cache and zero its byte accounting together,
+    /// so `cache_bytes` (== Σ `CacheEntry::bytes`) cannot drift. Every cache clear
+    /// goes through here.
     pub(crate) fn clear_page_cache(&mut self) {
         self.cache.get_mut().clear();
         self.cache_bytes.set(0);
     }
 
     /// Byte cost of a decompressed page: its `Vec<Line>` buffer plus each line's
-    /// owned content, computed like the cache term of [`calculate_memory_used`].
+    /// owned content, computed like the cache term of [`Self::calculate_memory_used`].
     pub(crate) fn page_byte_size(lines: &[Line]) -> usize {
         let line_struct_size = std::mem::size_of::<Line>();
         let lines_mem = lines.len().saturating_mul(line_struct_size);
@@ -244,14 +226,12 @@ impl DiskColdTier {
         lines_mem.saturating_add(contents_mem)
     }
 
-    /// Add a page to the LRU cache, evicting if necessary.
+    /// Add a page to the LRU cache, evicting as needed.
     ///
-    /// Bounds the cache by BOTH the page count (`cache_size`) and the byte budget
-    /// (`cache_byte_limit`). A single page larger than the whole budget is refused
-    /// (a re-read re-decompresses, which is correct);
-    /// `disk_cold_cache_byte_limit_is_enforced` holds it to both. Without
-    /// the byte bound a malicious `.dtrm` with a few pages near the 64 MiB
-    /// decompression cap pins `cache_size × 64 MiB` resident (round-10).
+    /// Bounded by both page count (`cache_size`) and bytes (`cache_byte_limit`); a
+    /// page larger than the whole budget is not cached. Without the byte bound a
+    /// malicious `.dtrm` with a few pages near the 64 MiB decompression cap would pin
+    /// `cache_size × 64 MiB`.
     pub(super) fn cache_page(&self, page_idx: usize, lines: Vec<Line>) {
         if self.cache_size == 0 || self.cache_byte_limit == 0 {
             return;
@@ -262,9 +242,8 @@ impl DiskColdTier {
         }
         {
             let mut cache = self.cache.borrow_mut();
-            // Evict the LRU page until BOTH limits admit the incoming page. The
-            // `else break` guards against an empty cache (the byte term is then
-            // 0 + page_bytes <= limit, already checked, so this cannot loop).
+            // Evict LRU pages until both limits admit the incoming page. `else break`
+            // covers an empty cache (then 0 + page_bytes <= limit, so no loop).
             while cache.len() >= self.cache_size
                 || self.cache_bytes.get().saturating_add(page_bytes) > self.cache_byte_limit
             {
@@ -297,9 +276,7 @@ impl DiskColdTier {
         self.reset_bytes_used();
     }
 
-    // ------------------------------------------------------------------
-    // Back-removal (newest-end) operations
-    // ------------------------------------------------------------------
+    // Back-removal (newest-end) operations.
 
     /// Count whole pages consumable from the back and remaining boundary trim.
     ///
@@ -327,23 +304,6 @@ impl DiskColdTier {
         (whole_pages, remaining)
     }
 
-    /// Pre-validate that `truncate_back_lines(n)` will succeed.
-    ///
-    /// Tries to decompress the boundary page (if any) without modifying state.
-    /// Call this before committing cross-tier removal to ensure error safety.
-    pub fn pre_validate_truncate_back(&self, n: usize) -> Result<(), crate::ScrollbackError> {
-        if n == 0 || n >= self.line_count {
-            return Ok(());
-        }
-        let (whole_pages, boundary_trim) = self.count_back_pages(n);
-        let live_len = self.live_index().len();
-        if boundary_trim > 0 && whole_pages < live_len {
-            let boundary_idx = live_len - 1 - whole_pages;
-            self.decompress_page(boundary_idx)?;
-        }
-        Ok(())
-    }
-
     /// Remove the newest `n` lines from the back of the cold tier.
     ///
     /// Drops whole pages from the back without decompression. For the
@@ -351,12 +311,9 @@ impl DiskColdTier {
     /// trims the consumed lines from the back, re-compresses, and rewrites
     /// the page at its original file offset.
     ///
-    /// Error safety (#4638): this operation is transactional. ALL fallible work
-    /// — boundary-page decompress + re-compress AND every file write/sync/set_len
-    /// — is performed BEFORE any in-memory `index` / `cumulative_lines` /
-    /// `line_count` / `front_offset` mutation is committed. If decompression or
-    /// I/O fails the method returns `Err` with the in-memory tier unchanged, so
-    /// callers can propagate the error and keep operating on a consistent tier.
+    /// Transactional: all fallible work (boundary decompress and re-compress, every
+    /// file write/sync/set_len) runs before any in-memory mutation, so on `Err` the
+    /// in-memory tier is unchanged and callers can keep operating on it.
     ///
     /// # Panics
     ///
@@ -389,18 +346,15 @@ impl DiskColdTier {
                 None
             } else {
                 let serialized = crate::line::serialize_lines(&lines[..keep]);
-                let compressed = zstd::encode_all(serialized.as_slice(), crate::COLD_ZSTD_LEVEL)
-                    .map_err(crate::ScrollbackError::Io)?;
+                let compressed = crate::encode_cold_block(&serialized)?;
                 Some((compressed, keep))
             }
         } else {
             None
         };
 
-        // Compute the planned surviving layout WITHOUT mutating `self`, so an
-        // I/O failure below leaves the in-memory index/cumulative_lines intact.
-        // Built from the LIVE view: the replacement index adopts cursor 0 and
-        // the commit phase below resets the front-drop state accordingly.
+        // Plan the surviving layout from the live view without mutating `self`; the
+        // commit phase resets the front-drop state to match.
         let surviving = self.live_index().len() - whole_pages;
         let rewrite_boundary = boundary_trim > 0 && surviving > 0;
 
@@ -428,9 +382,8 @@ impl DiskColdTier {
             None => HEADER_SIZE as u64,
         };
 
-        // --- Phase 2: all file I/O, still BEFORE any in-memory commit. ---
-        // The boundary page is rewritten in place at its original offset (which
-        // is the offset of the last surviving page in the rewrite case).
+        // --- Phase 2: all file I/O, still before any in-memory commit. ---
+        // The boundary page (the last surviving page) is rewritten at its offset.
         let boundary_write = if rewrite_boundary {
             boundary_data.as_ref().map(|(compressed, line_count)| {
                 let offset = new_index
@@ -445,10 +398,8 @@ impl DiskColdTier {
         self.write_back_truncation(boundary_write, &new_index, new_write_offset)?;
 
         // --- Phase 3: commit in-memory state (infallible). ---
-        // The replacement index holds only live pages, and the cumulative
-        // rebuild below rebases to zero — reset the front-drop cursor and
-        // absolute base with it (back removal is the rare path; O(P) here is
-        // the pre-existing cost, untouched by the front-drop redesign).
+        // The new index holds only live pages and the cumulative rebuild starts at
+        // zero, so the front-drop cursor and absolute base reset too.
         self.index = new_index;
         self.front_dropped = 0;
         self.cumulative_base = 0;
@@ -469,9 +420,8 @@ impl DiskColdTier {
         }
         self.line_count = self.line_count.saturating_sub(n);
 
-        // Reset front_offset when all pages are gone. Without this, a stale
-        // front_offset would incorrectly skip lines from the first page if
-        // new pages are appended later. Matches warm/cold tier cleanup.
+        // Reset front_offset once all pages are gone, or it would skip lines of the
+        // next page appended.
         if self.index.is_empty() {
             self.front_offset = 0;
         }
@@ -481,14 +431,11 @@ impl DiskColdTier {
         Ok(())
     }
 
-    /// Perform all file I/O for a back-truncation against the planned layout.
-    ///
-    /// This is the only fallible side-effecting step of `truncate_back_lines`;
-    /// it runs before any in-memory state is committed so a failure leaves the
-    /// in-memory tier unchanged (#4638). `boundary_write`, when present, is the
-    /// `(offset, compressed_bytes, line_count)` of the trimmed boundary page to
-    /// rewrite in place; `new_index` is the surviving page index and
-    /// `new_write_offset` the post-truncation logical end of file.
+    /// File I/O for a back-truncation against the planned layout. It runs before any
+    /// in-memory commit, so a failure leaves the in-memory tier unchanged.
+    /// `boundary_write` is the `(offset, compressed_bytes, line_count)` of the trimmed
+    /// boundary page to rewrite in place; `new_write_offset` is the new logical end of
+    /// file.
     fn write_back_truncation(
         &mut self,
         boundary_write: Option<(u64, &[u8], usize)>,
@@ -505,28 +452,19 @@ impl DiskColdTier {
         }
         let io_result = self.write_back_truncation_io(boundary_write, new_index, new_write_offset);
         if io_result.is_err() {
-            // A write/sync/set_len failed PARTWAY: the in-memory index and line
-            // counters are untouched (the caller's commit phase is skipped on
-            // this `Err`), but the mmap was dropped above, which would otherwise
-            // fail EVERY subsequent read with "no memory map available". Best-
-            // effort re-map the current (possibly torn) file so reads of pages
-            // UNAFFECTED by the partial write keep working; a read of the torn
-            // boundary page fails closed via `decompress_page`'s live-length and
-            // bounds checks (never UB, panic, or cross-page corruption). The
-            // on-disk layout itself is repaired on the next load by `scan_pages`
-            // (the crate's crash-recovery path). Full ACID truncation of an
-            // in-place file rewrite is out of scope; this keeps the LIVE tier
-            // self-consistent and fail-closed, honoring the documented
-            // "callers can keep operating on a consistent tier" contract.
+            // A step failed partway. In-memory state is untouched (the caller skips
+            // its commit on Err), but the mmap was dropped above: re-map the possibly
+            // torn file so pages the write did not touch stay readable. The torn
+            // boundary page fails closed in `decompress_page`, and the next load
+            // repairs the layout (`scan_pages`).
             self.remap_current_file();
         }
         io_result
     }
 
     /// All file I/O for a back-truncation: rewrite the trimmed boundary page in
-    /// place, update the header, truncate, and re-map. Split out from
-    /// [`Self::write_back_truncation`] so the caller can re-establish the mmap
-    /// if any step fails partway.
+    /// place, update the header, truncate, and re-map. Split from
+    /// [`Self::write_back_truncation`] so that can re-map if a step fails partway.
     fn write_back_truncation_io(
         &mut self,
         boundary_write: Option<(u64, &[u8], usize)>,
@@ -562,8 +500,8 @@ impl DiskColdTier {
             file.set_len(new_write_offset)
                 .map_err(crate::ScrollbackError::Io)?;
             file.sync_data().map_err(crate::ScrollbackError::Io)?;
-            // Refresh mmap after file resize.
-            // SAFETY: File is exclusively owned; we just updated it.
+            // Re-map after the resize.
+            // SAFETY: the File is exclusively owned by this tier.
             if new_write_offset > HEADER_SIZE as u64 {
                 self.mmap =
                     Some(unsafe { MmapMut::map_mut(&*file).map_err(crate::ScrollbackError::Io)? });
@@ -577,11 +515,9 @@ impl DiskColdTier {
         Ok(())
     }
 
-    /// Best-effort re-establish the mmap from the file's CURRENT on-disk length.
-    /// Used on the partial-write error path (and by `compact`'s error path) so the
-    /// read side stays usable after the pre-write mmap drop; leaves `mmap = None`
-    /// if mapping fails (reads then return a clean "no memory map available" error
-    /// rather than faulting).
+    /// Best-effort re-map from the file's current length after an error path dropped
+    /// the mmap (partial write-back, failed compaction). Leaves `mmap = None` if
+    /// mapping fails; reads then return a clean error rather than fault.
     pub(super) fn remap_current_file(&mut self) {
         let Some(file) = self.file.as_ref() else {
             self.mmap = None;
@@ -589,10 +525,9 @@ impl DiskColdTier {
         };
         let len = file.metadata().map(|m| m.len()).unwrap_or(0);
         if len > HEADER_SIZE as u64 {
-            // SAFETY: the File is exclusively owned by this tier; map its current
-            // (possibly partially-written) contents. `decompress_page` re-checks
-            // the live file length and per-page bounds on every read, so a torn
-            // region fails closed instead of dereferencing past EOF.
+            // SAFETY: the File is exclusively owned by this tier. Its contents may be
+            // torn; `decompress_page` re-checks the live length and page bounds on
+            // every read, so a torn region fails closed instead of faulting.
             self.mmap = unsafe { MmapMut::map_mut(file).ok() };
         } else {
             self.mmap = None;

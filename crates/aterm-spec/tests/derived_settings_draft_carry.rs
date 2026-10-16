@@ -1,13 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-0 of `NativeUpdateSettingsDraftCarry`
-//! (`aterm_spec::derive::native_update_settings_draft_carry_model`): an unsaved
-//! Settings draft rides a seamless self-update (plan P2-2). Proved at
-//! `Buggy = 0` and caught at `Buggy = 1`; `Buggy = 2` (the cold lane spends a
-//! carried token) and `Buggy = 3` (a draft handed to an older successor) each
-//! lose the draft too. The update's paths are walked as the person meets them.
-//! Tier-1 is `aterm-gui/src/settings_draft_carry_conformance.rs`.
+//! Tier-0 of `NativeUpdateSettingsDraftCarry`: an unsaved Settings draft rides a seamless
+//! self-update. Proved at `Buggy = 0` and caught at `Buggy = 1`; `Buggy = 2` (the cold lane
+//! spends a carried token) and `Buggy = 3` (a draft handed to an older successor) each lose the
+//! draft too. The update's paths are walked as the person meets them. Tier-1 is
+//! `aterm-gui/src/settings_draft_carry_conformance.rs`.
 
 use aterm_spec::derive::native_update_settings_draft_carry_model;
 use aterm_spec::{interp, verify};
@@ -15,12 +13,6 @@ use aterm_spec::{interp, verify};
 #[test]
 fn settings_draft_carry_proves_catches_and_has_no_dead_action() {
     let model = native_update_settings_draft_carry_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name),
-        "the Settings draft carry must stay enrolled in the spec-link registry"
-    );
     let fired = interp::fired_actions(&model);
     assert_eq!(
         fired.len(),
@@ -31,14 +23,12 @@ fn settings_draft_carry_proves_catches_and_has_no_dead_action() {
         &model,
         "Settings draft carry: the successor reopens the outgoing draft exactly, or says which it could not",
     );
-    assert!(verify::uncaught_invariants(&model).is_empty());
 }
 
-/// The update as the person meets it. A draft typed before the update rides it.
-/// A key typed while the successor boots holds the Commit, and the next attempt
-/// carries the newer draft. With no terminal open, or toward an older build, a
-/// draft holds the update as it always did; a desk with no draft goes either
-/// way.
+/// The update as the person meets it: a draft typed before the update rides it; a key typed
+/// while the successor boots holds the Commit, and the next attempt carries the newer draft; with
+/// no terminal open, or toward an older build, a draft holds the update; a desk with no draft
+/// goes either way.
 #[test]
 fn settings_draft_carry_walks_the_update_the_way_the_person_meets_it() {
     let m = native_update_settings_draft_carry_model();

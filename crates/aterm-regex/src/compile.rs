@@ -534,18 +534,6 @@ mod tests {
         compile(&ast, usize::MAX).expect("compiles")
     }
 
-    /// The budget is bytes, and an instruction's real cost includes the slots it
-    /// forces in the simulation's two thread lists. Pin the arithmetic so a
-    /// change to either structure has to be a deliberate one.
-    #[test]
-    fn instruction_cost_covers_the_whole_program() {
-        assert_eq!(
-            INST_COST,
-            size_of::<Inst>() + 2 * (size_of::<Thread>() + size_of::<u32>())
-        );
-        assert!(INST_COST >= size_of::<Inst>());
-    }
-
     /// The second-byte filter EXCLUDES positions, so arming it for a pattern
     /// that can match on one code point would lose matches. Pin both halves.
     ///

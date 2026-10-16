@@ -4,11 +4,10 @@
 
 //! Inline (stack-allocated) builder for small terminal query replies.
 //!
-//! [`StackResponse`] formats DA/DSR/CPR/DECRQSS-sized replies into a fixed
-//! `[u8; N]` with `core::fmt::Write`, producing the same bytes as `format!`
-//! without a heap allocation. Surplus past `N` is dropped; callers emit bounded
-//! numeric replies that fit with headroom, and a debug assertion catches
-//! truncation in test builds.
+//! [`StackResponse`] formats DA/DSR/CPR/DECRQSS-sized replies into a fixed `[u8; N]` with
+//! `core::fmt::Write`: the bytes `format!` would make, without a heap allocation. Surplus
+//! past `N` is dropped; callers size `N` with headroom, and a debug assertion catches
+//! truncation.
 
 use core::fmt::{self, Write};
 
@@ -58,14 +57,12 @@ impl<const N: usize> Write for StackResponse<N> {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         let bytes = s.as_bytes();
         let end = self.len + bytes.len();
-        // Bounded replies always fit; truncation would be a programming error.
         debug_assert!(
             end <= N,
             "StackResponse<{N}> overflow: response exceeded inline capacity",
         );
         if end > N {
-            // Never write out of bounds: truncate rather than panic in the parser
-            // hot path. Callers size `N` so this is unreachable.
+            // Truncate rather than panic in the parser hot path.
             let avail = N - self.len;
             self.buf[self.len..N].copy_from_slice(&bytes[..avail]);
             self.len = N;

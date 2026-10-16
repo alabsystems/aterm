@@ -26,7 +26,9 @@ fn scratch(tag: &str) -> (crate::supervise::ScratchDir, Opts) {
         // The ask-and-drain flow these tests pin (`upgrade_ask = true`).
         ask: true,
         several_logins: false,
+        usage_tap: None,
         instances: crate::harness::upgrade_drive::Instances::Listed(Vec::new()),
+        agents_off: Vec::new(),
     };
     (dir, opts)
 }
@@ -473,52 +475,20 @@ const READS: [&str; 5] = ["sessions", "text", "cell", "status", "help"];
 /// `cell` a plain blank, `status` holds nothing, and every other request
 /// (`send`, `key`, `turn`, `paste`, `signal`, a lease, …) is refused. Every
 /// request is logged, in order.
-fn no_hands_instance(
-    dir: &Path,
-    tab: &'static str,
-) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
-    use std::io::BufRead as _;
-    use std::io::Write as _;
-    let sock = dir.join("t.sock");
-    std::fs::write(dir.join("t.sock.token"), format!("{TOKEN}\n")).expect("token");
-    let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
-    let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let log = std::sync::Arc::clone(&asked);
-    std::thread::spawn(move || {
-        for conn in listener.incoming() {
-            let Ok(conn) = conn else { break };
-            let Ok(mut out) = conn.try_clone() else {
-                continue;
-            };
-            let mut lines = std::io::BufReader::new(conn).lines();
-            let auth = format!("AUTH {TOKEN}");
-            if !lines.next().is_some_and(|l| l.is_ok_and(|l| l == auth)) {
-                continue;
-            }
-            for line in lines {
-                let Ok(line) = line else { break };
-                let verb = line
-                    .split_whitespace()
-                    .find(|w| !w.starts_with('@'))
-                    .unwrap_or("")
-                    .to_string();
-                let reply = match verb.as_str() {
-                    "sessions" => format!("OK 1\nlocal {tab} 0 idle claude"),
-                    "text" => format!("OK {}", idle_screen()),
-                    "cell" => "OK %20 d0d0d0 111318 none".to_string(),
-                    "status" => "OK schema=1 hold=0 hand=-".to_string(),
-                    other => format!("ERR the no-hands stand-in refuses {other}"),
-                };
-                if let Ok(mut log) = log.lock() {
-                    log.push(line);
-                }
-                if writeln!(out, "{reply}").is_err() {
-                    break;
-                }
-            }
+fn no_hands_instance(dir: &Path, tab: &'static str) -> (String, crate::harness::FakeInstanceLog) {
+    crate::harness::fake_instance(&dir.join("t.sock"), TOKEN, move |line| {
+        let verb = line
+            .split_whitespace()
+            .find(|w| !w.starts_with('@'))
+            .unwrap_or("");
+        match verb {
+            "sessions" => format!("OK 1\nlocal {tab} 0 idle claude"),
+            "text" => format!("OK {}", idle_screen()),
+            "cell" => "OK %20 d0d0d0 111318 none".to_string(),
+            "status" => "OK schema=1 hold=0 hand=-".to_string(),
+            other => format!("ERR the no-hands stand-in refuses {other}"),
         }
-    });
-    (sock.to_string_lossy().into_owned(), asked)
+    })
 }
 
 /// Tab one, stood up for the watch: a stand-in agent in the tab running Claude
@@ -534,7 +504,7 @@ struct TabOne {
     opts: Opts,
     agent: aterm_uds::spawnfd::Child,
     sf: SessionFile,
-    asked: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    asked: crate::harness::FakeInstanceLog,
     targets: Targets,
 }
 

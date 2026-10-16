@@ -4,7 +4,7 @@
 // build.rs — the facts this crate compiles in are COMMITTED CONTENT and the
 // TARGET, nothing else: the `a11y_tree` cfg, the update pin (derived from the
 // committed paper master) and the target triple, plus the Windows icon of the
-// dev `aterm-gui.exe`.
+// dev `aterm-gui.exe` — and `clean_islands`, which the compiler answers.
 //
 // NOT HERE: any build fact that moves with a commit, a version bump, the
 // compiler, the profile or the flags (commit, build number, build time, dev
@@ -18,8 +18,23 @@
 
 use aterm_digest::Sha256;
 
+// The committed trust anchors, compiled into this build script as SOURCE rather
+// than reached through an `aterm-update-core` build-dependency. A build-dependency
+// is a second compilation of that crate and of its whole closure for the host —
+// `ring` again with a different feature set, so a second C/asm build-script run —
+// to read one `&[&str]` constant. `pins.rs` is self-contained (no `use`, no
+// `crate::` path outside its `#[cfg(test)]` module), so the module compiles here
+// exactly as it does in its own crate: the same file, the same bytes, the same
+// value. Only the constant below is read; the rest is dead in this script.
+#[path = "../aterm-update-core/src/pins.rs"]
+#[allow(dead_code)]
+mod pins;
+
+#[path = "../aterm-log/clean_islands.rs"]
+mod clean_islands;
+
 /// Fixed 64-byte lowercase record used only when no paper master is pinned (a fork).
-/// This tree always has one (`aterm_update_core::pins::PAPER_MASTER_PUBKEYS`), so the
+/// This tree always has one (`aterm-update-core`'s `pins::PAPER_MASTER_PUBKEYS`), so the
 /// release cutter compares the Mach-O record against it and rejects this sentinel.
 const UNPINNED_UPDATE_PIN_SENTINEL: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
@@ -37,6 +52,7 @@ fn main() {
     if a11y_feature || linux {
         println!("cargo::rustc-cfg=a11y_tree");
     }
+    clean_islands::emit();
 
     // The update pin: the fingerprint of the paper master, the ONE anchor that
     // authorizes a release — the SAME compile-time input `aterm-update`'s
@@ -48,7 +64,7 @@ fn main() {
     // The anchor is the COMMITTED constant, not build-environment state: read it from
     // the one file that owns it so the embedded record proves the same key the runtime
     // verifies under.
-    let update_pin_sha256 = match aterm_update_core::pins::PAPER_MASTER_PUBKEYS.first() {
+    let update_pin_sha256 = match pins::PAPER_MASTER_PUBKEYS.first() {
         Some(encoded) if !encoded.is_empty() => {
             let raw = aterm_codec::base64::decode_strict(encoded.as_bytes())
                 .expect("PAPER_MASTER_PUBKEYS[0] must be standard base64");
@@ -70,9 +86,11 @@ fn main() {
 
     // No `rerun-if-changed` on git or on the workspace manifest, and no
     // `rerun-if-env-changed`: nothing above reads either (the build facts live
-    // in `crates/aterm/build.rs`). The update pin comes from a build-dependency,
-    // which cargo already tracks.
+    // in `crates/aterm/build.rs`). The update pin comes from `pins.rs`, which is
+    // compiled into this script by `#[path]` rather than tracked as a
+    // build-dependency, so it is named here: an edited anchor re-runs the script.
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=../aterm-update-core/src/pins.rs");
 
     // Windows: compile + link the application icon into the DEV `aterm-gui.exe`
     // so the taskbar button, Alt-Tab, titlebar and Explorer show the aterm icon

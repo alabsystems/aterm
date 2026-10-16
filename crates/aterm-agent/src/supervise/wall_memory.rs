@@ -58,6 +58,15 @@ use super::*;
 /// (`exception.rs`); a memory older than this is history.
 pub(super) const MEMORY_TTL: Duration = Duration::from_secs(24 * 3600);
 
+/// Why a wall's wait ended, as its ledger row ([`RULE_WALL_WAIT_END`]) says
+/// it: the screen left it, the worker worked, another wall replaced it.
+const WALL_LEFT: &str = "the wall left the screen or the worker worked";
+
+/// ... or the conversation holds no task — a `/clear` at the limit, or a
+/// conversation started since — so nothing is owed at its reset.
+const WALL_LEFT_NO_TASK: &str =
+    "the conversation holds no task (a /clear, or a new one): nothing is owed at the reset";
+
 /// How long a screen may read busy on the agent's own background work alone,
 /// with the agent's OWN title saying idle, before the loop says so in its
 /// journal ([`Session::stuck_busy_note`]). The ladder's unit: its second rung
@@ -84,6 +93,16 @@ pub(super) struct WallMemory {
     saved: Option<Option<i64>>,
 }
 
+/// Whether `p`'s screen can read as the agent's own background work alone
+/// ([`aterm_phase::background_only`], Claude Code's grammar): the remembered
+/// wall stands through it, and the canary climbs on it.
+fn reads_background_work(p: Program) -> bool {
+    match p {
+        Program::Claude => true,
+        Program::Codex | Program::Agy | Program::Muse | Program::Generic => false,
+    }
+}
+
 /// A wall the memory is kept for: a limit that resets, whose wait the loop
 /// owns. An API error's ladder rereads the screen at every rung, a login and
 /// a full context are acted on and left, a memory banner is no turn's end.
@@ -104,7 +123,7 @@ impl<C: Ctl> Session<'_, C> {
         rows: &[String],
     ) -> Option<aterm_phase::Wall> {
         let memory = self.wall_memory.as_ref()?;
-        (reader.program() == aterm_phase::Program::Claude
+        (reads_background_work(reader.program())
             && aterm_phase::background_only(rows)
             && !served_under(
                 aterm_phase::since_limit(rows).as_ref(),
@@ -174,12 +193,22 @@ impl<C: Ctl> Session<'_, C> {
     /// notice left the screen with no work since). The policy's track decides,
     /// so the memory ends at the very point the wait does — the worker's work,
     /// the vendor's own continuation, a retry taken.
+    /// A conversation with NO TASK ([`TurnEndReading::taskless`]: a `/clear`
+    /// at the limit, W4 of ATERM-KI-1015-1) ends the wait too, and the
+    /// ledger's end row says that, not that the worker worked.
     pub(super) fn observe_point(&mut self, reading: &TurnEndReading, now: Instant, seq: u64) {
         self.turn_end.observe(reading, now);
         if matches!(reading.phase, Phase::Idle | Phase::Question)
             && !self.turn_end.waits_on_named_reset()
         {
-            self.forget_wall(seq);
+            self.forget_wall_because(
+                seq,
+                if reading.taskless {
+                    WALL_LEFT_NO_TASK
+                } else {
+                    WALL_LEFT
+                },
+            );
         }
     }
 
@@ -202,16 +231,15 @@ impl<C: Ctl> Session<'_, C> {
 
     /// Forget the wall: the ledger says so to a loop that follows this one.
     pub(super) fn forget_wall(&mut self, seq: u64) {
+        self.forget_wall_because(seq, WALL_LEFT);
+    }
+
+    /// [`Self::forget_wall`], the ledger's end row saying `why`.
+    fn forget_wall_because(&mut self, seq: u64, why: &str) {
         if let Some(m) = self.wall_memory.take()
             && m.saved.is_some()
         {
-            self.ledger_row(
-                RULE_WALL_WAIT_END,
-                Outcome::Waiting,
-                "",
-                "the wall left the screen or the worker worked",
-                seq,
-            );
+            self.ledger_row(RULE_WALL_WAIT_END, Outcome::Waiting, "", why, seq);
         }
     }
 
@@ -267,6 +295,7 @@ impl<C: Ctl> Session<'_, C> {
                 .map_or(Duration::ZERO, Duration::from_millis);
             self.turn_end.seed_named_reset(
                 kind,
+                &open.message,
                 self.instant_of(unix),
                 jitter,
                 limit::resumes_by_itself(&open.message),
@@ -361,7 +390,7 @@ impl<C: Ctl> Session<'_, C> {
         }
         let reader = self.reader(&screen.rows);
         let stuck = since.is_some()
-            && reader.program() == aterm_phase::Program::Claude
+            && reads_background_work(reader.program())
             && aterm_phase::background_only(&screen.rows);
         let Some(at) = since.filter(|_| stuck) else {
             self.stuck_over(screen.seq, "the screen moved on", review);
@@ -602,8 +631,12 @@ fn title_rests(stdout: &str) -> bool {
 /// (`program=`), read fresh: the screen of a dialog has no frame to say it,
 /// and a shell left in a swapped tab, Codex or a foreground `vim` are none.
 fn names_claude(stdout: &str) -> bool {
-    crate::supervise::screen::status_field(stdout, "program").and_then(aterm_phase::program_of)
-        == Some(aterm_phase::Program::Claude)
+    match crate::supervise::screen::status_field(stdout, "program")
+        .and_then(aterm_phase::program_of)
+    {
+        Some(Program::Claude) => true,
+        Some(Program::Codex | Program::Agy | Program::Muse | Program::Generic) | None => false,
+    }
 }
 
 /// How many characters of a screen's last rows the dialog flavour's journal

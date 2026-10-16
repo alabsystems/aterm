@@ -23,6 +23,10 @@
 //   - a REAL shell in a PTY drives the engine and the renderer turns it into
 //     pixels (unix; the Windows ConPTY twin lives with the aterm-pty seam)
 // against the theme's dark background.
+#![allow(
+    clippy::disallowed_types,
+    reason = "test code: a stand-in child may inherit descriptors"
+)]
 
 use aterm_core::terminal::{ClockReading, Terminal};
 use aterm_render::{Frame, Renderer, Theme};
@@ -96,6 +100,10 @@ fn real_shell_session() -> Terminal {
     if pid == 0 {
         unsafe {
             if libc::login_tty(slave) == 0 {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "test code: a stand-in shell for the render fixture, not the shipped spawn"
+                )]
                 libc::execvp(sh.as_ptr(), argv.as_ptr());
             }
             libc::_exit(127);
@@ -229,7 +237,7 @@ ab\r\n",
     // Replay purity: a live host and a fresh replay/viewer fed the same output
     // log at the same clock render the same pixels and encode the same PNG.
     let clock = ClockReading {
-        monotonic: std::time::Instant::now(), // CLOCK-EXEMPT: captured once, reused so deltas are zero (determinism)
+        monotonic: std::time::Instant::now(), // captured once, reused so deltas are zero (determinism)
         wall_ms: Some(0),
     };
     let feed = || {

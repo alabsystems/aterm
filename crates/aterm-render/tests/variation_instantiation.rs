@@ -12,7 +12,7 @@
 //! once demoted it below Menlo (with this fix proven, SF Mono now leads the
 //! candidates). W9 instantiates the face at load — `Regular`
 //! named instance, else `wght=400` clamped — and routes the ONE resolved
-//! coordinate list to the CoreText descriptor, the rustybuzz shaper and the
+//! coordinate list to the CoreText descriptor, the run shaper and the
 //! metrics derivation.
 //!
 //! ## Two-tier proof
@@ -31,7 +31,7 @@
 //!   coord single-source consistency binding on a live `Renderer`.
 
 use aterm_render::variation::{
-    self, BOLD_WGHT, DARK_NUDGE_ADVANCE_TOL_PX, REGULAR_WGHT, VfAxis, WGHT_TAG, clamp_axis,
+    self, DARK_NUDGE_ADVANCE_TOL_PX, REGULAR_WGHT, VfAxis, WGHT_TAG, clamp_axis,
 };
 
 /// A deliberate lattice of axis-bound magnitudes (design-space units),
@@ -61,7 +61,7 @@ const REQUESTS: &[f32] = &[
 ];
 
 /// PROVE (1) — named-instance/axis resolution is TOTAL: for every axis on
-/// the bounds lattice (min <= def <= max, ttf-parser's normalization) and
+/// the bounds lattice (min <= def <= max, aterm-font's normalization) and
 /// EVERY request including NaN/±∞, `clamp_axis` yields a finite value inside
 /// `[min, max]`, exactly the request whenever the request is already
 /// in-bounds. Exhaustive over the lattice; the integer half is the ty-checked
@@ -114,7 +114,7 @@ fn clamp_axis_total_and_exact() {
 }
 
 /// PROVE (1), degenerate-axis totality: a hand-built axis with non-finite
-/// bounds (unreachable from ttf-parser, reachable for a caller constructing
+/// bounds (unreachable from aterm-font, reachable for a caller constructing
 /// `VfAxis` directly) still never panics and never returns NaN.
 #[test]
 fn clamp_axis_never_panics_on_degenerate_axes() {
@@ -304,17 +304,26 @@ fn dark_nudge_gate_is_a_checked_precondition() {
     assert!(!variation::dark_nudge_permitted(7.0, f32::NAN));
 }
 
+/// The system SF Mono, a variable face every macOS ships.
+#[cfg(target_os = "macos")]
+fn sf_mono() -> Vec<u8> {
+    std::fs::read("/System/Library/Fonts/SFNSMono.ttf").expect("macOS ships SFNSMono.ttf")
+}
+
+/// The checked-in variable face (`assets/game/Cinzel-var.ttf`, OFL): a `wght`
+/// axis 400..900 whose default is Regular, the same on every host.
+fn variable_face() -> Vec<u8> {
+    include_bytes!("../assets/game/Cinzel-var.ttf").to_vec()
+}
+
 /// PROVE (4) — SF MONO ACCEPTANCE: the system `SFNSMono.ttf` (a) really does
 /// default to the Light instance (asserted so this test
 /// can never go vacuous on a future macOS that fixes the default), and (b)
-/// resolves to `wght` ≈ 400 under W9's default instantiation. Skips cleanly
-/// on hosts without the file (Linux, stripped macOS).
+/// resolves to `wght` ≈ 400 under W9's default instantiation.
+#[cfg(target_os = "macos")]
 #[test]
 fn sf_mono_resolves_to_regular_not_light() {
-    let Ok(bytes) = std::fs::read("/System/Library/Fonts/SFNSMono.ttf") else {
-        eprintln!("SKIP: no system SFNSMono.ttf on this host");
-        return;
-    };
+    let bytes = sf_mono();
     let probe = variation::probe(&bytes, 0).expect("SFNSMono is a variable font");
     let wi = probe
         .axes
@@ -347,16 +356,14 @@ fn sf_mono_resolves_to_regular_not_light() {
 /// PROVE (2) — COORD CONSISTENCY, bound on a live `Renderer` over the real
 /// SF Mono: the renderer's single `variation_coords()` list (the one source
 /// the CT descriptor and the shaper receive) is exactly the pure resolution
-/// of the probe, and the CELL WIDTH equals the ttf-parser advance measured
+/// of the probe, and the CELL WIDTH equals the aterm-font advance measured
 /// at those SAME coords — i.e. metrics derivation consumed the identical
 /// list, not the default instance (which would desync the grid). Also pins
 /// the real-bold instance (wght 700 clamped) for PROVE-adjacent (c).
+#[cfg(target_os = "macos")]
 #[test]
 fn renderer_binds_one_coord_list_everywhere() {
-    let Ok(bytes) = std::fs::read("/System/Library/Fonts/SFNSMono.ttf") else {
-        eprintln!("SKIP: no system SFNSMono.ttf on this host");
-        return;
-    };
+    let bytes = sf_mono();
     let px = 32.0;
     let r = aterm_render::Renderer::from_bytes(&bytes, px, aterm_render::Theme::default())
         .expect("renderer builds from SFNSMono");
@@ -386,7 +393,7 @@ fn renderer_binds_one_coord_list_everywhere() {
         .iter()
         .position(|a| a.tag == WGHT_TAG)
         .expect("wght");
-    let bold_w = clamp_axis(&probe.axes[wi], BOLD_WGHT);
+    let bold_w = clamp_axis(&probe.axes[wi], variation::BOLD_WGHT);
     assert!((bold[wi].1 - bold_w).abs() < 1e-3, "bold wght = clamp(700)");
     for (i, &(tag, v)) in bold.iter().enumerate() {
         if i != wi {
@@ -400,12 +407,10 @@ fn renderer_binds_one_coord_list_everywhere() {
 /// a light theme gets the un-nudged base — and the cell geometry is
 /// IDENTICAL either way (the gate's grid-stability half), so a live theme
 /// flip provably cannot re-grid. Default `nudge = 0` leaves coords untouched.
+#[cfg(target_os = "macos")]
 #[test]
 fn dark_nudge_applies_gated_and_geometry_stable() {
-    let Ok(bytes) = std::fs::read("/System/Library/Fonts/SFNSMono.ttf") else {
-        eprintln!("SKIP: no system SFNSMono.ttf on this host");
-        return;
-    };
+    let bytes = sf_mono();
     let dark = aterm_render::Theme::default(); // bg 0x111318 — dark
     assert!(aterm_render::theme_is_dark(dark.bg));
     let light = aterm_render::Theme {
@@ -462,14 +467,12 @@ fn dark_nudge_applies_gated_and_geometry_stable() {
 #[cfg(target_os = "macos")]
 #[test]
 fn sf_mono_ct_raster_ink_tracks_the_instance() {
+    // A developer who pins the portable rasterizer has no CoreText raster for
+    // this test to read, by their own choice.
     if std::env::var_os("ATERM_RASTERIZER").is_some_and(|v| v == "portable" || v == "fontdue") {
-        eprintln!("SKIP: portable rasterizer forced (no variation instancing there by design)");
         return;
     }
-    let Ok(bytes) = std::fs::read("/System/Library/Fonts/SFNSMono.ttf") else {
-        eprintln!("SKIP: no system SFNSMono.ttf on this host");
-        return;
-    };
+    let bytes = sf_mono();
     let px = 32.0;
     let theme = aterm_render::Theme::default();
     let ink = |r: &mut aterm_render::Renderer, style: aterm_render::StyleBits| -> u64 {
@@ -528,10 +531,7 @@ fn config_requests_apply_and_nonvariable_stays_default() {
     assert!(r.variation_coords().is_none());
 
     // Variable: requests overlay the default resolution, clamped.
-    let Ok(bytes) = std::fs::read("/System/Library/Fonts/SFNSMono.ttf") else {
-        eprintln!("SKIP: no system SFNSMono.ttf on this host");
-        return;
-    };
+    let bytes = variable_face();
     let mut r = aterm_render::Renderer::from_bytes(&bytes, 24.0, aterm_render::Theme::default())
         .expect("renderer");
     let probe = variation::probe(&bytes, 0).expect("variable");
@@ -546,7 +546,7 @@ fn config_requests_apply_and_nonvariable_stays_default() {
     assert!(!r.set_font_variations(&[(WGHT_TAG, 510.0)], 0.0));
 }
 
-/// W9 perf regression: the resident `rustybuzz`-variation cache (borrowed by
+/// W9 perf regression: the resident shaping-variation cache (borrowed by
 /// the per-row-per-frame shaping path, NOT reallocated each row) stays in
 /// lock-step with `variation_coords()` across every coord transition —
 /// including the awkward variable→non-variable primary swap where
@@ -554,50 +554,45 @@ fn config_requests_apply_and_nonvariable_stays_default() {
 /// instance's variations lingering. Guards the caching optimisation against a
 /// stale-cache correctness regression.
 #[test]
-fn rb_variation_cache_tracks_coords() {
+fn shaping_variation_cache_tracks_coords() {
     // Non-variable primary: coords None ⇒ cache empty.
     let dejavu = include_bytes!("../assets/DejaVuSansMono.ttf");
     let r = aterm_render::Renderer::from_bytes(dejavu, 24.0, aterm_render::Theme::default())
         .expect("embedded face builds");
     assert!(r.variation_coords().is_none());
     assert!(
-        r.debug_rb_variation_cache().is_empty(),
-        "non-VF: the rb-variation cache must be empty"
+        r.debug_shaping_variations().is_empty(),
+        "non-VF: the shaping-variation cache must be empty"
     );
 
-    // Variable primary (system SF Mono): coords Some ⇒ cache mirrors them 1:1.
-    let Ok(bytes) = std::fs::read("/System/Library/Fonts/SFNSMono.ttf") else {
-        eprintln!("SKIP: no system SFNSMono.ttf on this host");
-        return;
-    };
+    // Variable primary: coords Some ⇒ cache mirrors them 1:1.
+    let bytes = variable_face();
     let mut r = aterm_render::Renderer::from_bytes(&bytes, 24.0, aterm_render::Theme::default())
         .expect("renderer");
     assert!(r.set_font_variations(&[(WGHT_TAG, 510.0)], 0.0));
     let coords = r.variation_coords().expect("instantiated").to_vec();
     assert!(!coords.is_empty(), "instantiated VF has coords");
     assert_eq!(
-        r.debug_rb_variation_cache(),
+        r.debug_shaping_variations(),
         coords,
         "cache must mirror the resolved coords 1:1 after a coord change"
     );
 
     // The smoking-gun transition: swap the primary to a NON-variable face.
     // `refresh_variations` early-outs on None==None, so unless the cache is
-    // cleared eagerly it would keep SF Mono's variations on DejaVu.
+    // cleared eagerly it would keep the variable face's variations on DejaVu.
     r.set_primary_font(dejavu).expect("swap to embedded face");
     assert!(r.variation_coords().is_none(), "non-VF after swap");
     assert!(
-        r.debug_rb_variation_cache().is_empty(),
+        r.debug_shaping_variations().is_empty(),
         "stale-cache regression: old instance's variations must be cleared"
     );
 }
 
-/// A variable MONO face installed on this host, or `None`. There is no variable
-/// fixture committed to the tree — both committed faces (DejaVu Sans Mono and the
-/// JetBrains Mono fixture) are static, which is exactly what makes them the anchor
-/// for the `None` case in [`nonvariable_bold_still_takes_the_synthetic_path`]. So
-/// the portable bold-instance proof has to borrow a real `wght` axis from the host
-/// and skip when the host has none.
+/// A variable MONO face installed on this host, or `None`. The one variable face
+/// in the tree (Cinzel, [`variable_face`]) is proportional: its bold widens past
+/// the dilation footprint this proof bounds, so the proof borrows a mono `wght`
+/// axis from the host and could not run on one that has none.
 #[cfg(not(target_os = "macos"))]
 fn host_variable_mono() -> Option<Vec<u8>> {
     // Cascadia Mono ships with Windows 11 as a VARIABLE face (`wght` 200..400..700),
@@ -671,8 +666,7 @@ fn dilate(cov: &[u8], w: usize, h: usize, e: usize) -> Vec<u8> {
 #[test]
 fn portable_bold_draws_the_real_instance_not_a_dilation() {
     let Some(bytes) = host_variable_mono() else {
-        eprintln!("SKIP: no variable mono face installed on this host");
-        return;
+        aterm_spec::host::could_not_run("no variable mono face installed on this host");
     };
     let px = 16.0;
     let theme = aterm_render::Theme::default();

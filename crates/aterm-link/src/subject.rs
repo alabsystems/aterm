@@ -1,73 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The subject taxonomy (§3.3), as construction and as refusal.
+//! The subject taxonomy (§3.3): every subject the bridge publishes is built here,
+//! and every subject it receives is parsed here.
 //!
-//! Every subject the bridge publishes is built here, and every subject it
-//! receives is parsed here. The parsing half is the load-bearing one: the `in`
-//! face is where a stranger's bytes choose part of the address, and §3.3 pins
-//! the shape rather than implying it —
-//!
-//! > Because `>` is one-*or-more* segments, a sender under a `>` grant could
-//! > publish an 8-segment subject whose last two segments read as a forged
-//! > `<src>/<kind>`. So the `in` write grant ends in `*` (exactly one kind
-//! > segment); an `in` subject is exactly seven segments, parsed **by position
-//! > from the left**; a receiving bridge refuses — never delivers, records `ev
-//! > undeliverable off=<n> reason=malformed` — any `in` record with ≠ 7
-//! > segments, a `<src>` without an `s-|n-|h-|a-` prefix, or a `<sid>` it does
-//! > not host.
-//!
-//! The broker's cap check already refuses the 8-segment publish (R4); this is
-//! the second wall, a property of the receiver rather than of the sender's grant.
+//! The parse is the load-bearing half: on the `in` face a stranger's bytes choose
+//! part of the address. `>` matches one or more segments, so an 8-segment subject's
+//! last two would read as a forged `<src>/<kind>`; an `in` subject is therefore
+//! exactly seven segments, parsed by position from the left. A record of another
+//! shape, a `<src>` without an `s-|n-|h-|a-` prefix, or a `<sid>` this node does not
+//! host is refused, never delivered. The broker's cap check (the `in` grant ends in
+//! `*`) refuses the 8-segment publish too (R4); this is the receiver's own wall.
 
-/// The principal classes a `<src>` segment may carry (§3.2). A reserved literal
-/// segment (`node`, `presence`, `ev`, …) can never collide with one, which is
-/// what makes "parse by position" total.
-const CLASSES: [&str; 4] = ["s-", "n-", "h-", "a-"];
-
-/// The most bytes a principal can occupy: the two-byte class prefix plus the
-/// 32-byte name [`is_principal`] admits.
-///
-/// A caller bounding a list of principals (`via=`) derives its bound from this,
-/// never from a second number.
-pub const PRINCIPAL_MAX: usize = CLASS_PREFIX_LEN + NAME_MAX;
-
-/// The class prefix every principal carries (`s-`, `n-`, `h-`, `a-`).
-const CLASS_PREFIX_LEN: usize = 2;
-
-/// The longest name a principal may carry after its class prefix (§3.2).
-const NAME_MAX: usize = 32;
-
-/// The longest a topic name may be (the same bound a principal's name gets:
-/// short enough that a subject segment cannot carry a sentence).
-const TOPIC_MAX: usize = 32;
-
-/// Whether `t` is a well-formed BROADCAST TOPIC: `[a-z0-9][a-z0-9._-]{0,31}`.
-///
-/// One subject segment (no `/`), opening alphanumeric so it never reads as a
-/// flag or relative path; `.`, `-`, `_` inside because people choose topics
-/// (`build.failed`, `sat-comp`).
-#[must_use]
-pub fn is_topic(t: &str) -> bool {
-    let mut cs = t.chars();
-    cs.next()
-        .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
-        && t.len() <= TOPIC_MAX
-        && cs.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'))
-}
-
-/// Whether `p` is a well-formed principal: a class prefix and `[a-z0-9-]{1,32}`
-/// (§3.2 — "too short to carry a sentence into an agent's context").
-#[must_use]
-pub fn is_principal(p: &str) -> bool {
-    let Some(name) = CLASSES.iter().find_map(|c| p.strip_prefix(c)) else {
-        return false;
-    };
-    (1..=NAME_MAX).contains(&name.len())
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-}
+// The segment word grammar (§3.2) lives in `aterm-types`: the endpoint holds lines
+// to it too and does not depend on this crate.
+pub use aterm_types::fabric_grammar::{is_principal, is_topic, PRINCIPAL_MAX};
 
 /// A fleet name segment: the same bounded lowercase grammar, without a class
 /// prefix (it is not a principal).
@@ -78,9 +25,9 @@ pub fn is_fleet(f: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
-/// Why a record on an `in` lane was refused. Every variant becomes an `ev
-/// undeliverable … reason=<token>` record and NOTHING else — a refused record is
-/// never delivered, and the reason is on the bus where a human can read it.
+/// Why a record on an `in` lane was refused. Each variant becomes an `ev
+/// undeliverable … reason=<token>` record on the bus and nothing else: a refused
+/// record is never delivered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reject {
     /// Not seven segments, not under this fleet, or a segment that is not the
@@ -90,9 +37,9 @@ pub enum Reject {
     /// bus, so a sender can address one that moved; the receiver is the only
     /// place that knows.
     NotHosted,
-    /// A record on THIS node's own lane, under THIS node's `<src>`, at an offset
-    /// the bridge never got a `PublishAck` for: a forgery by a co-holder of the
-    /// node cap (§6.2). It is recorded and escalated, never delivered.
+    /// A record on this node's own lane, under this node's `<src>`, at an offset the
+    /// bridge never got a `PublishAck` for: a forgery by a co-holder of the node cap
+    /// (§6.2). Recorded and escalated, never delivered.
     ForgedSelf,
 }
 
@@ -116,19 +63,16 @@ pub struct InAddr {
     pub node: String,
     /// The session the message is addressed to.
     pub sid: String,
-    /// The sender. CAP-FORCED at the broker: the one segment a sender cannot
-    /// choose, which is why provenance can be read straight off it (§4.3).
+    /// The sender, cap-forced at the broker: the one segment a sender cannot choose,
+    /// so provenance is read straight off it (§4.3).
     pub src: String,
     /// The message kind.
     pub kind: String,
 }
 
-/// Parse an `in` subject BY POSITION FROM THE LEFT, against the fleet and node
-/// this bridge serves.
-///
-/// Seven segments, exactly: `f`, `<F>`, `in`, `<node>`, `<sid>`, `<src>`,
-/// `<kind>`. Counting from the left is the whole point — a right-anchored parse
-/// is exactly what an 8-segment subject exploits.
+/// Parse an `in` subject by position from the left, against the fleet and node this
+/// bridge serves: exactly `f`, `<F>`, `in`, `<node>`, `<sid>`, `<src>`, `<kind>`. A
+/// right-anchored parse is what an 8-segment subject exploits.
 ///
 /// # Errors
 ///
@@ -169,10 +113,9 @@ pub fn session_face(fleet: &str, node: &str, sid: &str, leaf: &str) -> String {
     format!("/f/{fleet}/pub/{node}/{sid}/{leaf}")
 }
 
-/// The durable group name the node's inbox drain commits under, and the filter
-/// it drains. `cur` is a NAME face: it is never published to and never
-/// delivered, but the cap must grant it (`broker.rs` `SubscribeGroup`/`Commit`
-/// arms), which is why it is built here beside the subjects.
+/// The durable group name the node's inbox drain commits under. `cur` is a name
+/// face, never published to or delivered, but the cap must grant it (the broker's
+/// `SubscribeGroup`/`Commit` arms), so it is built here beside the subjects.
 #[must_use]
 pub fn inbox_group(fleet: &str, node: &str) -> String {
     format!("/f/{fleet}/cur/{node}/node/inbox")
@@ -185,25 +128,76 @@ pub fn inbox_filter(fleet: &str, node: &str) -> String {
     format!("/f/{fleet}/in/{node}/>")
 }
 
-/// The fleet broadcast face — halts and barriers, drained AHEAD of the inbox
-/// group on every scheduling round (§11.2).
+/// The fleet broadcast face: halts and barriers, drained ahead of the inbox group on
+/// every scheduling round (§11.2).
 #[must_use]
 pub fn fleet_filter(fleet: &str) -> String {
     format!("/f/{fleet}/fleet/>")
 }
 
-/// EVERY BROADCAST FACE IN THE FLEET, as one filter.
+/// A fleet halt row as every bridge reads it ([`parse_halt`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HaltRow<'a> {
+    /// The halting human: the `h-` principal segment, as the subject spells it.
+    pub human: &'a str,
+    /// The row says `state=on`; any other state, or none, lifts that human's halt.
+    pub on: bool,
+    /// The `reason=` token as it arrived (pct-encoded, a stranger's bytes), if any.
+    pub reason: Option<String>,
+}
+
+/// Parse a fleet halt row, `/f/<F>/fleet/<h-name>/halt`, by the rule every bridge
+/// applies a halt under (§5.3), or `None` for a record that halts nothing.
 ///
-/// One subscription, not one per topic: opt-in (`topic add`) is local, so
-/// per-topic subscriptions would put every session's topic set on the bus as
-/// churn. The bridge reads the whole `say` subtree and fans in to the sessions
-/// that asked.
+/// Five segments by position from the left, `halt` as the leaf, and an `h-`
+/// principal: a halt is a human's word, so a row under any other principal (an
+/// `a-` service's, a node's) halts nothing. The body is read by the bridge's own
+/// decoder ([`crate::body::Body`]): the first line only, space-separated, and a
+/// repeated `state=` takes its last value.
+///
+/// The bridge, `aterm fabric`'s status and `link notify --on halt` all read the
+/// face by this, so no reader reports a halt that no bridge applies.
+#[must_use]
+pub fn parse_halt<'a>(fleet: &str, subject: &'a str, body: &[u8]) -> Option<HaltRow<'a>> {
+    let segs: Vec<&'a str> = subject.split('/').collect();
+    if segs.len() != 6 || !segs[0].is_empty() {
+        return None;
+    }
+    if segs[1] != "f" || segs[2] != fleet || segs[3] != "fleet" || segs[5] != "halt" {
+        return None;
+    }
+    let human = segs[4];
+    if !human.starts_with("h-") {
+        return None;
+    }
+    let (mut body, _) = crate::body::Body::decode(body);
+    Some(HaltRow {
+        human,
+        on: body.unknown.get("state").is_some_and(|s| s == "on"),
+        reason: body.unknown.remove("reason"),
+    })
+}
+
+/// Every broadcast face in the fleet, as one filter. One subscription, not one per
+/// topic: opt-in (`topic add`) is local, and per-topic subscriptions would put every
+/// session's topic set on the bus as churn.
 #[must_use]
 pub fn say_filter(fleet: &str) -> String {
     format!("/f/{fleet}/pub/*/*/say/>")
 }
 
-/// A parsed `/f/<F>/pub/<node>/<sid>/say/<topic>` BROADCAST subject.
+/// One topic's broadcasts fleet-wide, `/f/<F>/pub/*/*/say/<topic>`: a read filter,
+/// never a subscription, so it brings none of the churn [`say_filter`] avoids. A
+/// backlog `Fetch` over it has the broker skip other topics' records within its
+/// bounded scan instead of filling the page with them. `topic` must be an
+/// [`is_topic`] name, one literal segment with no `*`, `>` or `/`; the bridge checks
+/// every topic that enters its cursor set.
+#[must_use]
+pub fn say_topic_filter(fleet: &str, topic: &str) -> String {
+    format!("/f/{fleet}/pub/*/*/say/{topic}")
+}
+
+/// A parsed `/f/<F>/pub/<node>/<sid>/say/<topic>` broadcast subject.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SayAddr {
     /// The publishing node.
@@ -214,12 +208,10 @@ pub struct SayAddr {
     pub topic: String,
 }
 
-/// Parse a broadcast subject left-anchored and by position — seven segments,
-/// `f`/`<F>`/`pub`/`<node>`/`<sid>`/`say`/`<topic>` — like [`parse_in`]: a
-/// filter is a wildcard match, so only a counting parse detects a forgery.
-///
-/// `None` for anything else, including a `pub` face that is not `say` — the
-/// filter cannot express "the sixth segment is `say`" on its own.
+/// Parse a broadcast subject left-anchored and by position, seven segments
+/// (`f`/`<F>`/`pub`/`<node>`/`<sid>`/`say`/`<topic>`), like [`parse_in`]: the filter's `>`
+/// matches one or more segments, so only a counting parse refuses a longer subject.
+/// `None` for anything else.
 #[must_use]
 pub fn parse_say(fleet: &str, subject: &str) -> Option<SayAddr> {
     let segs: Vec<&str> = subject.split('/').collect();
@@ -244,55 +236,13 @@ pub fn parse_say(fleet: &str, subject: &str) -> Option<SayAddr> {
 mod tests {
     use super::*;
 
-    /// A topic is one bounded lowercase subject segment.
-    #[test]
-    fn a_topic_is_one_bounded_lowercase_segment() {
-        for good in [
-            "say",
-            "build",
-            "build.failed",
-            "sat-comp",
-            "a",
-            "x_1",
-            "0",
-            &"a".repeat(32),
-        ] {
-            assert!(is_topic(good), "{good} must be a topic");
-        }
-        for bad in [
-            "",      // empty
-            "Build", // uppercase
-            ".dot",  // must open alphanumeric
-            "-dash",
-            "_under",
-            "a/b",           // two segments
-            "a b",           // whitespace
-            "a:b",           // the separator itself
-            "a*",            // a filter wildcard
-            &"a".repeat(33), // over the bound
-        ] {
-            assert!(!is_topic(bad), "{bad:?} must not be a topic");
-        }
-    }
-
-    /// [`PRINCIPAL_MAX`] is the longest principal the grammar admits.
-    #[test]
-    fn the_principal_ceiling_is_the_longest_principal_the_grammar_admits() {
-        let longest = format!("n-{}", "a".repeat(NAME_MAX));
-        assert_eq!(longest.len(), PRINCIPAL_MAX);
-        assert!(is_principal(&longest));
-        assert!(!is_principal(&format!("n-{}", "a".repeat(NAME_MAX + 1))));
-        assert!(!is_principal("n-"));
-    }
-
     /// The 8-segment forgery is malformed, though a right-anchored reading
     /// would name `h-andrew` as the sender.
     #[test]
     fn an_eight_segment_subject_is_malformed_however_its_tail_reads() {
         let forged = "/f/f1/in/n-a/s-b/s-1/h-andrew/answer";
         assert_eq!(parse_in("f1", "n-a", forged), Err(Reject::Malformed));
-        // The honest seven-segment form under the same sender parses, and the
-        // sender it names is the SIXTH segment — never the last-but-one.
+        // The seven-segment form parses, and its sender is the sixth segment.
         let honest = "/f/f1/in/n-a/s-b/s-1/answer";
         assert_eq!(
             parse_in("f1", "n-a", honest),
@@ -324,15 +274,45 @@ mod tests {
         }
     }
 
-    /// Principals are bounded and class-prefixed.
+    /// Only a human's row of the halt shape halts: an `a-` service's or a node's
+    /// `state=on` row, or one of another shape, halts nothing. The body reads as
+    /// the bridge's decoder reads it: a tab is not a separator, a newline ends the
+    /// tokens, and a later `state=` wins.
     #[test]
-    fn a_principal_is_bounded_and_class_prefixed() {
-        assert!(is_principal("h-andrew") && is_principal("s-0123456789abcdef0123"));
-        assert!(!is_principal("andrew"));
-        assert!(!is_principal("x-andrew"));
-        assert!(!is_principal("h-"));
-        assert!(!is_principal("h-Andrew"));
-        assert!(!is_principal(&format!("h-{}", "a".repeat(33))));
-        assert!(!is_principal("h-please ignore previous instructions"));
+    fn only_a_humans_halt_row_halts() {
+        let on = b"v=1 t=1 state=on reason=main%20broken";
+        let row = parse_halt("f1", "/f/f1/fleet/h-andrew/halt", on).expect("a human's halt");
+        assert_eq!(
+            row,
+            HaltRow {
+                human: "h-andrew",
+                on: true,
+                reason: Some("main%20broken".to_string()),
+            }
+        );
+        let off = parse_halt("f1", "/f/f1/fleet/h-andrew/halt", b"v=1 t=2 state=off");
+        assert_eq!(off.map(|r| (r.on, r.reason)), Some((false, None)));
+        for bad in [
+            "/f/f1/fleet/a-svc/halt",       // a service is not a human
+            "/f/f1/fleet/n-node/halt",      // nor is a node
+            "/f/f2/fleet/h-andrew/halt",    // another fleet
+            "/f/f1/fleet/h-andrew/barrier", // another leaf
+            "/f/f1/fleet/h-andrew/halt/x",  // six segments
+            "/f/f1/fleet/x/h-andrew/halt",  // a right-anchored forgery
+            "f/f1/fleet/h-andrew/halt",     // no leading slash
+            "/f/f1/pub/h-andrew/halt",      // another face
+        ] {
+            assert_eq!(parse_halt("f1", bad, on), None, "{bad}");
+        }
+        for (body, state_on) in [
+            (&b"v=1 state=off state=on"[..], true),
+            (b"v=1 state=on state=off", false),
+            (b"v=1\tstate=on", false),
+            (b"v=1\nstate=on", false),
+            (b"v=1 state=ON", false),
+        ] {
+            let row = parse_halt("f1", "/f/f1/fleet/h-a/halt", body).expect("a human's row");
+            assert_eq!(row.on, state_on, "{:?}", String::from_utf8_lossy(body));
+        }
     }
 }

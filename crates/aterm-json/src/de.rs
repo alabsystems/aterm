@@ -2,8 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! The parser and its `serde::Deserializer`: RFC 8259 under the rules the
-//! crate docs list (one value then end-of-input, bounded nesting, last-wins
-//! duplicate keys).
+//! crate docs list (one value then end-of-input, bounded nesting, duplicate
+//! keys delivered to the visitor).
 
 use std::borrow::Cow;
 
@@ -404,8 +404,9 @@ impl<'de> Deserializer<'de> {
 
     /// Hand a parsed number to `visitor`.
     ///
-    /// `-0` goes to the visitor as the FLOAT negative zero in every context,
-    /// typed or not, as in `serde_json`: `from_str::<u64>("-0")` is an error.
+    /// `-0` goes to this visitor as floating negative zero, as in `serde_json`:
+    /// `from_str::<u64>("-0")` is an error. The separate `deserialize_wide`
+    /// entry point accepts it as integer zero for `i128`.
     fn visit_number<V: Visitor<'de>>(&mut self, visitor: V) -> Result<V::Value> {
         let parsed = self.parse_number()?;
         Self::dispatch(parsed.value, visitor)

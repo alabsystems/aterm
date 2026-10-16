@@ -110,16 +110,16 @@ fn still_uncovered_chars_re_fire_after_injection() {
     );
 }
 
-/// macOS system-font test (skips elsewhere): a colour face injected AFTER an
-/// emoji already rendered `.notdef` must take over — `install_color_font`
-/// drops the `keys` memo (where the TEXT-path dispatch parked the `.notdef`),
-/// or the code point would never re-probe. This is the exact lazy-injection
-/// sequence a web host performs on an EMOJI-class signal.
+/// macOS system-font test: a colour face injected AFTER an emoji already
+/// rendered `.notdef` must take over — `install_color_font` drops the `keys`
+/// memo (where the TEXT-path dispatch parked the `.notdef`), or the code point
+/// would never re-probe. This is the exact lazy-injection sequence a web host
+/// performs on an EMOJI-class signal.
+#[cfg(target_os = "macos")]
 #[test]
 fn late_color_face_takes_over_after_notdef() {
-    let Ok(emoji_bytes) = std::fs::read("/System/Library/Fonts/Apple Color Emoji.ttc") else {
-        return; // covered by the fixture-only class-signal tests above
-    };
+    let emoji_bytes = std::fs::read("/System/Library/Fonts/Apple Color Emoji.ttc")
+        .expect("macOS ships Apple Color Emoji");
     let mut r = renderer();
     r.glyph_key('😀'); // parks a `.notdef` in the TEXT-path `keys` memo
     assert_eq!(r.take_missing_font_classes(), MISSING_FONT_CLASS_EMOJI);

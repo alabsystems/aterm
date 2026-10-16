@@ -30,11 +30,11 @@
 //! so it never arms a wake the settle would decline to act on.
 //!
 //! The LOG is not frozen with the holds. The parent's record is its own to
-//! the end: it keeps appending through the park and
-//! [`App::flush_messages_log`]es right before it execs the successor (`exec`
-//! runs no destructor, so nothing the writer still held would land) — or,
-//! on the lanes that never exec, right before Commit `_exit`s it
-//! ([`App::flush_messages_log_within`], bounded). Only
+//! the end: it keeps appending through the park and flushes it right before
+//! it execs the successor (`exec` runs no destructor, so nothing the writer
+//! still held would land) — or, on the lanes that never exec, right before
+//! Commit `_exit`s it ([`App::flush_messages_log_within`], bounded like every
+//! wait on the writer). Only
 //! the SUCCESSOR's drain waits ([`App::message_persist_frozen`]), until
 //! Commit — a refused successor then wrote nothing about rows that were the
 //! parent's to record. A successor that booted BEFORE its parent's last write
@@ -89,6 +89,20 @@ use crate::native_settings::SettingsRoute;
 use crate::toolchain_words::{self, HookDialect, SnapshotWords};
 use crate::update_words;
 use crate::{App, WindowId};
+
+/// How long a UI-thread caller waits for the messages log to land a record
+/// it wants on disk before it answers — a dismissal, an update's start, a
+/// filing whose cause ended ([`App::flush_messages_log_within`]): a writer
+/// that is merely behind lands well inside it, raised to the waiter's urgency
+/// while it does, and a starved one costs a hitch, never a freeze. A miss is
+/// said in `aterm.log`; the lines land when the writer catches up.
+pub(crate) const MESSAGES_FLUSH_UI_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// The same wait at the process's last write — the graceful quit, the
+/// Windows replacement's exit — which runs no destructor after it: the
+/// update lanes' bound (`app_update_handoff::MESSAGES_FLUSH_COMMIT_WAIT`).
+pub(crate) const MESSAGES_FLUSH_EXIT_WAIT: std::time::Duration =
+    std::time::Duration::from_millis(250);
 
 // THE PAGE'S MODEL IS THE ENGINE'S (design ruling 382): the projection, its
 // words, the tag order, the filter, the day clock and the feedback line live
@@ -186,6 +200,12 @@ impl page::Host for PageDesk<'_> {
         crate::message_reporters::sentence_lines(key, detail)
     }
 }
+
+/// The update-health banner's voice: [`crate::notify::deliver_update_health_banner`]
+/// takes one, and its field is private to this module, so
+/// `App::post_update_health_banner` is that delivery's one caller.
+#[cfg(all(target_os = "macos", not(test)))]
+pub(crate) struct HealthBannerVoice(());
 
 #[cfg(test)]
 thread_local! {
@@ -844,40 +864,41 @@ impl App {
         self.append_message_lines(&lines);
     }
 
-    /// Hand drained log lines to the writer. With no writer (a test App, or a
-    /// log dir that could not be opened) the lines are dropped here, so the
-    /// pending queue never fills and reports a `Dropped` count for a file
-    /// that does not exist.
+    /// Hand drained log lines to the writer — none, too, so lines its full
+    /// channel held back go on at the next drain (one load when nothing
+    /// waits). With no writer (a test App, or a log dir that could not be
+    /// opened) the lines are dropped here, so the pending queue never fills
+    /// and reports a `Dropped` count for a file that does not exist.
     fn append_message_lines(&self, lines: &[(aterm_messages::LogLine, aterm_messages::Shelf)]) {
-        if lines.is_empty() {
-            return;
-        }
         if let Some(writer) = &self.messages_log {
             writer.append(lines);
         }
     }
 
-    /// THE PARENT'S LAST WRITE before it execs the successor of a seamless
-    /// handoff: what the center holds goes to the writer, and the writer
-    /// lands everything it holds before this returns — `exec` runs no
-    /// destructor, so the drop-time join would never happen and the lines
-    /// the thread still held would die with the process. The writer stays
-    /// open: a failed exec leaves a process that carries on recording.
+    /// [`Self::flush_messages_log_within`] with a minute's hang detector: the
+    /// tests' way to read the file back.
+    #[cfg(test)]
     pub(crate) fn flush_messages_log(&mut self) {
-        self.persist_messages();
-        if let Some(writer) = &self.messages_log {
-            writer.flush();
-        }
+        assert!(
+            self.flush_messages_log_within(std::time::Duration::from_secs(60)),
+            "the messages writer landed nothing within a minute"
+        );
     }
 
-    /// THE SEAMLESS PARENT'S LAST WRITE before Commit `_exit`s it (round-seven
-    /// update audit, finding 53): [`Self::flush_messages_log`], bounded by
-    /// `within` — the person sits through it frozen (L5). `_exit` runs no
-    /// destructor, so a line the writer thread still held — a record a script
-    /// was answered `OK recorded` for during the park — died with the process,
-    /// and the successor, which reads the file again after Commit
-    /// ([`Self::reload_messages_log_at_commit`]), never saw it. `false`, said in
-    /// `aterm.log`, when the writer was still behind at the deadline.
+    /// What the center holds goes to the writer, and the writer lands
+    /// everything it holds before this returns — or `within` passes. Every
+    /// wait on the writer is bounded (law L5): the person sits through it, at
+    /// a frozen Commit or exec as at a Dismiss click. The parent of a seamless
+    /// handoff calls it right before it execs the successor, and the seamless
+    /// parent before Commit `_exit`s it (round-seven update audit, finding
+    /// 53): neither runs a destructor, so a line the writer thread still held
+    /// — a record a script was answered `OK recorded` for during the park —
+    /// died with the process, and the successor, which reads the file again
+    /// after Commit ([`Self::reload_messages_log_at_commit`]), never saw it.
+    /// The writer stays open: a failed exec carries on recording. `false`,
+    /// said in `aterm.log`, when the writer was still behind at the deadline;
+    /// its lines stay queued and land when it catches up, if the process
+    /// lives that long.
     pub(crate) fn flush_messages_log_within(&mut self, within: std::time::Duration) -> bool {
         self.persist_messages();
         let Some(writer) = &self.messages_log else {
@@ -886,8 +907,8 @@ impl App {
         let landed = writer.flush_within(within);
         if !landed {
             aterm_log::warn!(
-                "messages log: the writer was still behind {} ms into Commit; its last lines \
-                 may not reach messages.log",
+                "messages log: the writer was still behind after {} ms; its queued lines \
+                 land when it catches up, and not if this process ends first",
                 within.as_millis()
             );
         }
@@ -920,7 +941,7 @@ impl App {
             return 0;
         }
         let closed = self.messages.quit(Instant::now());
-        self.flush_messages_log();
+        self.flush_messages_log_within(MESSAGES_FLUSH_EXIT_WAIT);
         closed
     }
 
@@ -1120,7 +1141,8 @@ impl App {
     }
 
     /// Shells that started in the home folder because their folder was not
-    /// there, or could not be entered (audit #7 finding 48): ONE row per fault
+    /// there, could not be entered, or did not answer (audit #7 finding 48;
+    /// [`crate::spawn_folder::Fault`]): ONE row per fault
     /// naming every such folder while it is up, so a restore that meets three
     /// gone folders is one row naming three, and a New Tab from a gone folder
     /// a minute later joins it. Once the row has gone, the next folder starts
@@ -1249,19 +1271,35 @@ impl App {
             // macOS performs (the Security page's own gesture arm — a headless
             // instance's arm reaches no `NSWorkspace`); every other platform's
             // arm reports `Refused`, and the row says so honestly. The row
-            // stays for the watcher either way (R16); the `opened` marker is
-            // recorded so a later process can acknowledge the flip.
+            // stays for the watcher either way (R16). The rest is the pane's
+            // own: Full Disk Access records the access card's `opened` marker
+            // so a later process can acknowledge the flip. Developer Tools is
+            // the one hand-over every origin goes through
+            // (`App::hand_devtools_to_owner`): the page, the helper panel
+            // beside it, the shared opened marker and the owner's return read
+            // — and never the file-access marker (a press there is no answer
+            // to the file-access question, as on the Security page).
             Intent::OpenSystemPane { pane } => {
                 let Some(pane) = privacy_pane(&pane) else {
                     aterm_log::warn!("message {id}: no system pane {pane:?}");
                     return false;
                 };
-                let opened = crate::native_settings::ConsentGestures::for_instance(self.headless)
-                    .open_settings(pane)
-                    .opened();
+                let opened = match pane {
+                    crate::menu::PrivacyPane::DeveloperTools => self
+                        .hand_devtools_to_owner(crate::devtools_helper::Origin::Digest)
+                        .brings_owner(),
+                    crate::menu::PrivacyPane::FullDiskAccess
+                    | crate::menu::PrivacyPane::FilesAndFolders => {
+                        crate::native_settings::ConsentGestures::for_instance(self.headless)
+                            .open_settings(pane)
+                            .opened()
+                    }
+                };
                 let route = crate::menu::privacy_settings_path_words(pane);
                 self.restate_message(id, route_words(opened, route));
-                self.note_macos_access_settings_opened(now);
+                if pane == crate::menu::PrivacyPane::FullDiskAccess {
+                    self.note_macos_access_settings_opened(now);
+                }
                 opened
             }
             Intent::ApplyUpdate { build } => {
@@ -1544,7 +1582,7 @@ impl App {
         // the engine alone: flush the log before the reply (a dismissal must
         // not die with the process) and move the menu-bar item and Settings.
         if self.messages.digest_revision() != digest_before {
-            self.flush_messages_log();
+            self.flush_messages_log_within(MESSAGES_FLUSH_UI_WAIT);
             self.digest_moved();
         }
         if applied.paint == wire::Paint::Now {
@@ -1631,8 +1669,9 @@ impl App {
     ///
     /// THE TABS ARE COUNTED BY WHAT THEY RUN (gap audit 2026-09-24,
     /// [`Self::tabs_behind`]): a frozen tab whose foreground is an agent is
-    /// never handed the hook to type, the Claude sessions behind the managed
-    /// build turn the title to "installed", and a change in those counts
+    /// never handed the hook to type, the agent sessions behind their own
+    /// program's managed build (a Codex against the managed codex) turn the
+    /// title to "installed", and a change in those counts
     /// re-derives the words from the text remembered here.
     pub(crate) fn post_managed_current(&mut self, text: &str) -> bool {
         self.upgrade_view.note_managed_text(text);
@@ -1736,7 +1775,59 @@ impl App {
         }
         self.toolchain_row_latched = true;
         self.toolchain_first_run = true;
-        self.post_message(toolchain_words::announced(detail));
+        // The row the lane opened ahead of this announcement takes its words IN PLACE:
+        // one row, opened once and folded once, whatever the size it now names.
+        let announced = toolchain_words::announced(detail);
+        match self.toolchain_ahead_row.take() {
+            Some(id) if self.restate_message(id, restatement_of(&announced)) => {}
+            _ => {
+                self.post_message(announced);
+            }
+        }
+    }
+
+    /// TC-5 — a FIRST RUN the lane knows of before any child says so
+    /// (`Wake::PkgFirstRunAhead`, `crate::first_run_ahead`: no ALab program in the
+    /// store, and a machine that consents to the adoption): the row opens NOW, as the
+    /// announcement's with no size yet (`toolchain_words::announced("")`), and LATCHES
+    /// like one; the update's announcement restates it in place
+    /// ([`Self::announce_toolchain_pass`]). The next child exit — the launch seed's — is
+    /// carried over instead of folding it ([`Self::toolchain_pass_ended`]). Posted
+    /// again before a retried seed, or an update that stood aside at the lock: it then
+    /// only carries that exit too. `true` when a row went up.
+    pub(crate) fn open_first_run_ahead(&mut self) -> bool {
+        self.toolchain_ahead_carry = true;
+        if self.toolchain_row_latched {
+            return false;
+        }
+        self.toolchain_row_latched = true;
+        self.toolchain_first_run = true;
+        self.toolchain_ahead_row = Some(self.post_message(toolchain_words::announced("")));
+        true
+    }
+
+    /// The lane runs no update after the seed after all (it parks, or Automatic updates
+    /// went off): the row it opened ahead, if no announcement took it over, is WITHDRAWN —
+    /// no outcome claimed, as a vanished read retires a live row
+    /// ([`Self::retire_live_toolchain`]) — and a person's verb waiting behind it gets its
+    /// own row back.
+    pub(crate) fn withdraw_first_run_ahead(&mut self) {
+        self.toolchain_ahead_carry = false;
+        if self.toolchain_ahead_row.take().is_none() {
+            return;
+        }
+        self.toolchain_row_latched = false;
+        self.toolchain_first_run = false;
+        self.toolchain_first_run_short = None;
+        self.retire_live_toolchain(None);
+        if let Some(verb) = self.toolchain_person {
+            let row = if self.toolchain_person_waiting {
+                crate::message_reporters::packages_waiting_row(verb)
+            } else {
+                crate::message_reporters::packages_verb_row(verb)
+            };
+            self.show_person_row(row, false);
+        }
     }
 
     /// R26 — one classified `progress.json` read from the child-scoped
@@ -1915,6 +2006,23 @@ impl App {
     /// person to wait for did not arrive, and they have something to do
     /// (review 2026-09-24).
     pub(crate) fn toolchain_pass_ended(&mut self, clean: bool) {
+        // The LANE'S row outlives its launch seed (`Self::open_first_run_ahead`): the
+        // update that follows takes it over, and that child's exit is the one fold.
+        if std::mem::take(&mut self.toolchain_ahead_carry) {
+            return;
+        }
+        // A row the lane opened ahead that no announcement took over: the child installed
+        // nothing over the wire (an architecture no build serves, a set it found complete),
+        // so a CLEAN exit claims no Complete and the row is withdrawn; an unclean one is
+        // still the Fault it was.
+        let unannounced = self.toolchain_ahead_row.take().is_some();
+        let echo = if !clean {
+            Some(EchoKind::Fault)
+        } else if unannounced {
+            None
+        } else {
+            Some(EchoKind::Complete)
+        };
         let latched = std::mem::take(&mut self.toolchain_row_latched);
         let first_run = std::mem::take(&mut self.toolchain_first_run);
         let short = self.toolchain_first_run_short.take();
@@ -1924,11 +2032,7 @@ impl App {
             // ends as the lane's work did, and the person's own row comes back
             // after the grace if their verb is still running (ruling 224).
             if latched {
-                self.retire_live_toolchain(Some(if clean {
-                    EchoKind::Complete
-                } else {
-                    EchoKind::Fault
-                }));
+                self.retire_live_toolchain(echo);
                 match short {
                     // A first run that ended short keeps its failure row.
                     Some(msg) if !clean && first_run => {
@@ -1945,11 +2049,7 @@ impl App {
             }
             return;
         }
-        self.retire_live_toolchain(Some(if clean {
-            EchoKind::Complete
-        } else {
-            EchoKind::Fault
-        }));
+        self.retire_live_toolchain(echo);
         if !clean
             && first_run
             && let Some(msg) = short
@@ -2386,8 +2486,9 @@ impl App {
     /// nothing, and the record, Settings ▸ Software Update and `messages.log`
     /// still say it. `true` when a banner was posted. Under `cfg(test)` the
     /// banner is recorded ([`UPDATE_HEALTH_BANNERS`]) instead, so no test ever
-    /// posts to the desktop of whoever runs the suite. Fence B26b keeps this the
-    /// only caller of `notify::deliver` outside `notify.rs`.
+    /// posts to the desktop of whoever runs the suite. It is the one caller of
+    /// `notify::deliver_update_health_banner` (only this module mints its
+    /// `HealthBannerVoice`); `notify::deliver` is private.
     pub(crate) fn post_update_health_banner(
         &self,
         kind: update_words::HealthKind,
@@ -2429,7 +2530,7 @@ impl App {
             let banner = update_words::health_notification_body(body, remedy);
             let title = update_words::health_notification_title(title);
             std::thread::spawn(move || {
-                crate::notify::deliver(Some(&title), &banner, false);
+                crate::notify::deliver_update_health_banner(HealthBannerVoice(()), &title, &banner);
             });
             true
         }
@@ -2677,7 +2778,7 @@ impl App {
         automatic: bool,
     ) {
         if self.note_update_switch_started(build, same_image, automatic) {
-            self.flush_messages_log();
+            self.flush_messages_log_within(MESSAGES_FLUSH_UI_WAIT);
         }
     }
 
@@ -2768,7 +2869,7 @@ impl App {
 /// Whether window `ws`'s band is on screen: a real OS window that is not
 /// occluded (minimized, fully covered). A headless window has no OS window,
 /// so its band never moves. `WindowEvent::Occluded` is not reported on
-/// Windows or Wayland (vendor/winit, the platform notes above `Occluded`),
+/// Windows or Wayland (crates/aterm-window, the platform notes above `Occluded`),
 /// and X11 reports it only from `VisibilityNotify` — a window fully covered,
 /// not one iconified (unmapped) — so outside macOS a MINIMIZED window is
 /// asked directly (review 2026-09-24: it kept its 1 Hz text ticks, and its
@@ -2776,8 +2877,11 @@ impl App {
 /// say); macOS reports minimizing as occlusion.
 pub(crate) fn band_on_screen(ws: &crate::WindowState) -> bool {
     #[cfg(test)]
-    if ws.band_on_screen_for_test {
-        return !ws.occluded;
+    {
+        crate::work_counts::on_screen_asked();
+        if ws.band_on_screen_for_test {
+            return !ws.occluded;
+        }
     }
     // macOS reports minimizing as occlusion, and asking AppKit on every loop
     // turn would buy nothing there.

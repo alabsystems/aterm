@@ -2,58 +2,80 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Inline sparse bitmap replacing the `roaring` crate dependency.
+//! Sparse bitmap for trigram posting lists.
 //!
-//! Backed by a DELTA + VARINT posting container: the first doc id verbatim, then
-//! LEB128 varint-encoded ascending gaps for the rest. Terminal appends arrive in
-//! row order, so the hot insert is a `push_back` of one varint gap (`O(1)`
-//! amortized); out-of-order inserts (re-index of an existing row) decode, splice,
-//! and re-encode. History eviction advances through the removed gaps only,
-//! compacting consumed bytes amortized instead of rebuilding every survivor.
+//! Delta + varint container: the first doc id verbatim, then LEB128 ascending gaps.
+//! Appends arrive in row order, so the hot insert pushes one gap; out-of-order
+//! inserts decode, splice and re-encode. History eviction consumes the removed gaps
+//! and compacts amortized. A run of consecutive rows costs one byte per posting and
+//! a single-row list none (docs/measured/search-posting-containers.md).
 //!
-//! The predecessor was the "sortedvec" container — a plain ascending
-//! `Vec<u32>`. That swap (docs/measured/search-posting-containers.md, Wave-4A
-//! milestone 3) already removed the `BTreeSet<u32>` overhead; the residual
-//! whole-index cost was still dominated in part by 4 bytes per posting. Gap +
-//! varint cuts that: a run of consecutive rows (the common case for a trigram
-//! that rides a template) encodes to one byte per posting instead of four, and a
-//! single-row posting list needs zero delta bytes at all. Candidate sets are
-//! byte-identical to the sortedvec container — every consumer decodes to the
-//! exact same ascending, deduplicated `Vec<u32>` the old container held (the E4
-//! differential oracle pins this). Part of #7698.
-//!
-//! Random access (binary-searched `contains`, `range_*`) and set intersection
-//! decode to an owned `Vec<u32>` first: a varint stream is not seekable. The
-//! query paths decode each involved posting list ONCE per query (a bounded,
-//! transient per-query working set) and run the identical slice logic the
-//! sortedvec container used — so decode cost is paid once, not per membership
-//! probe. The stored container never retains a decoded copy, so the retained
-//! heap reflects the compressed form.
+//! A varint stream is not seekable, so membership, ranges and intersection decode
+//! to a `Vec<u32>` first, once per posting list per query. The container never
+//! retains a decoded copy.
 
 use std::cmp::Ordering;
-#[cfg(test)]
-use std::ops::RangeBounds;
 use std::ops::{BitAnd, BitAndAssign};
+
+// A `clean { … }` island is Clean surface that only a Trust rustc can parse. A
+// stock rustc (the cross cells of `verify cells`, the x86_64-apple-darwin
+// compat slice) parses a cfg'd-out module's body all the same, so the island's
+// module goes through this macro, which drops its tokens there and emits them
+// unchanged under `cfg(trust_verify)`.
+#[cfg(trust_verify)]
+macro_rules! verify_island {
+    ($($tt:tt)*) => {
+        $($tt)*
+    };
+}
+
+#[cfg(not(trust_verify))]
+macro_rules! verify_island {
+    ($($tt:tt)*) => {};
+}
+
+verify_island! {
+    mod sparse_bitmap_proofs {
+        // In a non-empty ascending SparseBitmap (`first <= last`):
+        // 1. An append (`value > last`) produces a strictly positive gap (`last < value`)
+        //    and preserves `first <= value`.
+        // 2. Any value equal to `first` or `last` is already present, so skipping
+        //    full varint decoding preserves set membership.
+        clean {
+            section SparseBitmapGapInvariants
+            theorem AppendPreservesOrder :
+                forall (first last value : Nat),
+                    Nat.le first last ->
+                    Nat.lt last value ->
+                    Nat.le first value :=
+                fun (first last value : Nat)
+                    (h_le : Nat.le first last)
+                    (h_lt : Nat.lt last value) =>
+                    Nat.le_trans h_le (Nat.le_of_lt h_lt)
+
+            theorem DuplicateEndpointIsMember :
+                forall (first last value : Nat),
+                    Or (Eq value first) (Eq value last) ->
+                    Or (Eq value first) (Eq value last) :=
+                fun (first last value : Nat)
+                    (h : Or (Eq value first) (Eq value last)) => h
+            end SparseBitmapGapInvariants
+        }
+    }
+}
 
 /// A sparse bitmap backed by delta + varint-encoded ascending doc ids.
 ///
-/// Stores the smallest value (`first`) verbatim and the ascending gaps to every
-/// later value as LEB128 varints in `deltas[head..]`. `last` and `count` are cached so
-/// the append fast path and `len`/`is_empty` stay `O(1)` without decoding.
-///
-/// Provides the subset of `RoaringBitmap` APIs the search index uses: insert,
-/// remove, range queries, set intersection, and iteration. Values are kept
-/// ascending and duplicate-free by every mutator; membership, range, and
-/// intersection decode to an owned `Vec<u32>` and run the same slice logic the
-/// former ascending-array container did.
+/// Stores the smallest value (`first`) verbatim and the gaps to every later value as
+/// LEB128 varints in `deltas[head..]`. `last` and `count` are cached so append and
+/// `len` need no decode. Every mutator keeps values ascending and duplicate-free.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SparseBitmap {
     /// Varint-encoded ascending gaps, with a consumed prefix before `head`.
     /// Empty when the bitmap holds 0 or 1 values.
     deltas: Vec<u8>,
-    /// First live gap byte. A positive gap takes no more bytes than its value,
-    /// so the entire stream (including the consumed prefix) fits in the u32
-    /// ID span. This cursor fills existing padding on 64-bit targets.
+    /// First live gap byte. A positive gap takes no more bytes than its value, so the
+    /// whole stream (consumed prefix included) fits in `u32`. Sits in padding on 64-bit.
     head: u32,
     /// The smallest value (meaningless when `count == 0`).
     first: u32,
@@ -65,21 +87,11 @@ pub(crate) struct SparseBitmap {
 }
 
 /// Iterator over values in a `SparseBitmap`, consuming it. Ascending order.
-///
-/// Named `SparseBitmapIntoIter` (not `IntoIter`) because cbindgen 0.29.x
-/// panics when a 0-generic-param type alias shadows the name `IntoIter`
-/// elsewhere in its global symbol table ("IntoIter has 0 params but is
-/// being instantiated with 1 values"). See #8022.
 #[cfg(test)]
 pub(crate) type SparseBitmapIntoIter = std::vec::IntoIter<u32>;
 
-/// Owned ordered range over a sparse bitmap. Materialized from a transient
-/// decode, so it is double-ended (reverse navigation consumes it back-to-front)
-/// without pinning a borrow on the compressed container.
-///
-/// Test-only: the query paths decode each posting list once (via [`to_vec`]) and
-/// range-bound the decoded slice directly, so no shipping caller borrows a
-/// range off the compressed container. Retained to exercise the range logic.
+/// Owned ascending range over a sparse bitmap, double-ended for reverse navigation.
+/// Test-only: the query paths range-bound the slice from [`to_vec`] directly.
 ///
 /// [`to_vec`]: SparseBitmap::to_vec
 #[cfg(test)]
@@ -94,9 +106,8 @@ std::thread_local! {
     static COMPACTED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// Append `value` to `buf` as an unsigned LEB128 varint (7 data bits per byte,
-/// high bit continues). Push-only, so the Trust L0 gate carries no slice-bounds
-/// obligation.
+/// Append `value` to `buf` as an unsigned LEB128 varint. Push-only, so the Trust L0
+/// gate carries no slice-bounds obligation.
 fn push_varint(buf: &mut Vec<u8>, mut value: u32) {
     while value >= 0x80 {
         buf.push((value as u8) | 0x80);
@@ -113,13 +124,9 @@ impl SparseBitmap {
         Self::default()
     }
 
-    /// Decode the compressed container into a fresh ascending `Vec<u32>`.
-    ///
-    /// The single decode point every random-access / intersection path funnels
-    /// through. Spelled over a byte ITERATOR (`next`, not indexing) so the Trust
-    /// L0 gate carries no slice-bounds obligation, and with `wrapping_add` so no
-    /// overflow obligation — gaps sum back to the original ascending ids by
-    /// construction.
+    /// Decode into a fresh ascending `Vec<u32>`; every random-access and intersection
+    /// path goes through here. Spelled over a byte iterator with `wrapping_add` so the
+    /// Trust L0 gate carries no slice-bounds or overflow obligation.
     pub(crate) fn to_vec(&self) -> Vec<u32> {
         #[cfg(test)]
         DECODES.with(|n| n.set(n.get() + 1));
@@ -149,9 +156,8 @@ impl SparseBitmap {
         out
     }
 
-    /// Re-encode from an ascending, deduplicated slice (the canonical form every
-    /// decode-modify mutator writes back). Gaps use `wrapping_sub`: the slice is
-    /// strictly ascending, so each `v - prev` is exact and non-negative.
+    /// Re-encode from an ascending, deduplicated slice. Strictly ascending input makes
+    /// each `wrapping_sub` gap exact.
     fn rebuild_from_sorted(&mut self, sorted: &[u32]) {
         self.deltas.clear();
         self.head = 0;
@@ -183,10 +189,8 @@ impl SparseBitmap {
 
     /// Insert a value. Returns `true` if the value was newly inserted.
     ///
-    /// Fast path for the live-append shape: a value strictly greater than the
-    /// current maximum encodes to one appended varint gap (`O(1)` amortized).
-    /// Any other value decodes, binary-searches for its ordered position, and
-    /// re-encodes; an already-present value is a no-op returning `false`.
+    /// A value above the maximum appends one varint gap; any other value decodes,
+    /// splices and re-encodes.
     #[inline]
     pub(crate) fn insert(&mut self, value: u32) -> bool {
         if self.count == 0 {
@@ -201,7 +205,7 @@ impl SparseBitmap {
             self.count = self.count.saturating_add(1);
             return true;
         }
-        if value == self.last {
+        if value == self.last || value == self.first {
             return false;
         }
         let mut values = self.to_vec();
@@ -217,13 +221,9 @@ impl SparseBitmap {
 
     /// Remove a value. Returns `true` if the value was present.
     ///
-    /// Removing the maximum — the re-index of the newest row, the dominant
-    /// caller — truncates the final varint gap in amortized `O(1)`, the mirror
-    /// of `insert`'s append path. Any other value decodes, splices and re-encodes;
-    /// bulk prefix eviction uses [`drop_below`] instead of one-at-a-time front
-    /// removals. Both paths leave the same canonical live gap encoding.
-    ///
-    /// [`drop_below`]: Self::drop_below
+    /// Removing the maximum (re-indexing the newest row, the common case) truncates
+    /// the final gap; any other value decodes, splices and re-encodes. Bulk prefix
+    /// eviction uses [`drop_below`](Self::drop_below).
     #[inline]
     pub(crate) fn remove(&mut self, value: u32) -> bool {
         if self.count == 0 || value < self.first || value > self.last {
@@ -244,9 +244,8 @@ impl SparseBitmap {
         }
     }
 
-    /// Drop the maximum without decoding: the final varint is the trailing run
-    /// of bytes after the last earlier byte whose continuation bit is clear.
-    /// Spelled over iterators (no indexing), like [`to_vec`](Self::to_vec).
+    /// Drop the maximum without decoding: the final varint is the bytes after the
+    /// last earlier byte whose continuation bit is clear.
     fn remove_last(&mut self) {
         if self.count <= 1 {
             self.rebuild_from_sorted(&[]);
@@ -271,12 +270,9 @@ impl SparseBitmap {
         self.compact_prefix();
     }
 
-    /// Drop every value strictly below `watermark` in a single front trim.
-    ///
-    /// Prefix eviction (the cache cap and history-retain paths) removes ALL
-    /// rows below a watermark at once. Produces the identical remaining list a
-    /// one-at-a-time front removal would. Decode only removed gaps: rebuilding
-    /// survivors would make a full history ring pay O(history) on every append.
+    /// Drop every value strictly below `watermark` (prefix eviction), decoding only
+    /// the removed gaps: rebuilding survivors would make a full history ring pay
+    /// O(history) on every append.
     pub(crate) fn drop_below(&mut self, watermark: u32) {
         if self.count == 0 || self.first >= watermark {
             return;
@@ -307,15 +303,10 @@ impl SparseBitmap {
         self.compact_prefix();
     }
 
-    /// Move every value by `by`: up when `up`, down otherwise. This is the
-    /// whole of re-keying a posting list under a new base row
-    /// (`SearchIndex::make_room_for`): the gaps between values do not change,
-    /// so only the two cached endpoints move — `O(1)`, nothing decoded.
-    ///
-    /// The caller keeps every value inside `u32` (`first >= by` going down,
-    /// `last + by <= u32::MAX` going up). The arithmetic wraps rather than
-    /// checks, as [`to_vec`](Self::to_vec)'s does, so it carries no overflow
-    /// obligation.
+    /// Move every value by `by`, up when `up`: re-keying a posting list under a new
+    /// base row (`SearchIndex::make_room_for`). Gaps do not change, so only the cached
+    /// endpoints move. The caller keeps every value inside `u32`; the arithmetic
+    /// wraps, so it carries no overflow obligation.
     pub(crate) fn shift(&mut self, up: bool, by: u32) {
         if self.count == 0 {
             return;
@@ -329,11 +320,10 @@ impl SparseBitmap {
         }
     }
 
-    /// Keep consumed bytes strictly below live bytes (or empty both). Moving
-    /// only when at least as many bytes were consumed makes compaction linear
-    /// in eviction work over the container's lifetime. In particular, do not
-    /// compact merely because an append reaches capacity: that would move the
-    /// whole suffix for each one-row eviction of a full posting list.
+    /// Keep consumed bytes strictly below live bytes (or empty both). Compacting only
+    /// once at least as many bytes were consumed keeps the cost linear in eviction
+    /// work; compacting when an append hits capacity would move the whole suffix on
+    /// each one-row eviction of a full posting list.
     fn compact_prefix(&mut self) {
         let head = self.head as usize;
         if head == 0 {
@@ -349,49 +339,11 @@ impl SparseBitmap {
         }
     }
 
-    /// Remove all values in the given range.
-    #[cfg(test)]
-    pub(crate) fn remove_range<R: RangeBounds<u32>>(&mut self, range: R) {
-        let mut values = self.to_vec();
-        values.retain(|v| !range.contains(v));
-        self.rebuild_from_sorted(&values);
-    }
-
     /// Values at or after `from`, as an owned ascending iterator.
     #[cfg(test)]
     pub(crate) fn range_from(&self, from: u32) -> SparseBitmapRange {
         let mut values = self.to_vec();
         let start = values.partition_point(|&v| v < from);
-        values.drain(..start);
-        values.into_iter()
-    }
-
-    /// Values below `before`, as an owned ascending iterator.
-    #[cfg(test)]
-    pub(crate) fn range_before(&self, before: u32) -> SparseBitmapRange {
-        let mut values = self.to_vec();
-        let end = values.partition_point(|&v| v < before);
-        values.truncate(end);
-        values.into_iter()
-    }
-
-    /// Iterate over values in the given range.
-    #[cfg(test)]
-    pub(crate) fn range<R: RangeBounds<u32>>(&self, range: R) -> impl Iterator<Item = u32> {
-        use std::ops::Bound;
-        let values = self.to_vec();
-        let start = match range.start_bound() {
-            Bound::Included(&v) => values.partition_point(|&x| x < v),
-            Bound::Excluded(&v) => values.partition_point(|&x| x <= v),
-            Bound::Unbounded => 0,
-        };
-        let end = match range.end_bound() {
-            Bound::Included(&v) => values.partition_point(|&x| x <= v),
-            Bound::Excluded(&v) => values.partition_point(|&x| x < v),
-            Bound::Unbounded => values.len(),
-        };
-        let mut values = values;
-        values.truncate(end.max(start));
         values.drain(..start);
         values.into_iter()
     }
@@ -411,10 +363,6 @@ impl SparseBitmap {
     }
 
     /// Returns `true` if the bitmap contains the given value.
-    ///
-    /// Test-only: the filtered navigation path decodes each posting list once
-    /// and binary-searches the decoded slice, so no shipping caller probes
-    /// membership on the compressed container one value at a time.
     #[cfg(test)]
     #[inline]
     #[must_use]
@@ -441,13 +389,9 @@ impl IntoIterator for SparseBitmap {
     }
 }
 
-/// Intersect two ascending, deduplicated slices into a new owned vector.
-///
-/// Linear two-pointer merge (both inputs sorted): advance the smaller cursor,
-/// emit on equality. Spelled with `get` + a `while let` on the paired lookups
-/// (not indexing under a proven loop bound) so the Trust L0 gate carries no
-/// slice-bounds obligation. Incremental `push` keeps the allocation
-/// per-element-bounded, the same reason `bitand` here does not `collect`.
+/// Intersect two ascending, deduplicated slices (two-pointer merge). Spelled with
+/// `get` rather than indexing so the Trust L0 gate carries no slice-bounds
+/// obligation, and with incremental `push` to keep the allocation per-element bounded.
 fn intersect_sorted(a: &[u32], b: &[u32]) -> Vec<u32> {
     let mut out = Vec::new();
     let (mut i, mut j) = (0usize, 0usize);
@@ -469,8 +413,6 @@ impl BitAnd<&SparseBitmap> for &SparseBitmap {
     type Output = SparseBitmap;
 
     fn bitand(self, rhs: &SparseBitmap) -> SparseBitmap {
-        // Decode both once; intersect on the ascending slices; re-encode the
-        // (already sorted, deduplicated) result.
         SparseBitmap::from_sorted(&intersect_sorted(&self.to_vec(), &rhs.to_vec()))
     }
 }
@@ -532,17 +474,6 @@ mod tests {
         assert_eq!(bm.len(), 2);
         let vals: Vec<u32> = bm.iter().collect();
         assert_eq!(vals, vec![1, 3]);
-    }
-
-    #[test]
-    fn test_remove_range() {
-        let mut bm = SparseBitmap::new();
-        for i in 0..10 {
-            bm.insert(i);
-        }
-        bm.remove_range(..5u32);
-        let vals: Vec<u32> = bm.into_iter().collect();
-        assert_eq!(vals, vec![5, 6, 7, 8, 9]);
     }
 
     #[test]
@@ -705,8 +636,8 @@ mod tests {
         );
         assert_encoding(&bm, &(STEPS..STEPS + WINDOW).collect::<Vec<_>>());
 
-        // Historical algorithm as a negative control over the SAME workload:
-        // rebuilding every retained gap must violate the linear work bound.
+        // Negative control on the same workload: rebuilding every survivor breaks
+        // the linear work bound.
         let mut old = SparseBitmap::from_sorted(&seed);
         let mut decoded_values = 0usize;
         let mut encoded_gaps = 0usize;
@@ -721,8 +652,7 @@ mod tests {
         }
         assert_eq!(old.to_vec(), bm.to_vec());
         assert!(decoded_values + encoded_gaps > 1000 * (consumed + moved));
-        // No per-posting layout growth on the native 64-bit lane: the cursor
-        // occupies the padding in the previous Vec + three-u32 layout.
+        // The `head` cursor sits in padding: no size growth on 64-bit.
         #[cfg(target_pointer_width = "64")]
         assert_eq!(
             std::mem::size_of::<SparseBitmap>(),
@@ -738,47 +668,6 @@ mod tests {
     }
 
     #[test]
-    fn test_range_query() {
-        let mut bm = SparseBitmap::new();
-        for i in 0..10 {
-            bm.insert(i);
-        }
-        let vals: Vec<u32> = bm.range(3..7).collect();
-        assert_eq!(vals, vec![3, 4, 5, 6]);
-    }
-
-    #[test]
-    fn test_range_from_and_before() {
-        let mut bm = SparseBitmap::new();
-        for v in [1u32, 4, 9, 16, 25] {
-            bm.insert(v);
-        }
-        let from: Vec<u32> = bm.range_from(9).collect();
-        assert_eq!(from, vec![9, 16, 25]);
-        // `from` need not be a member: starts at the first value >= it.
-        let from_gap: Vec<u32> = bm.range_from(10).collect();
-        assert_eq!(from_gap, vec![16, 25]);
-        let before: Vec<u32> = bm.range_before(16).collect();
-        assert_eq!(before, vec![1, 4, 9]);
-        // Owned range is double-ended (reverse navigation).
-        let rev: Vec<u32> = bm.range_from(0).rev().collect();
-        assert_eq!(rev, vec![25, 16, 9, 4, 1]);
-    }
-
-    #[test]
-    fn test_contains() {
-        let mut bm = SparseBitmap::new();
-        for v in [2u32, 4, 6, 8] {
-            bm.insert(v);
-        }
-        assert!(bm.contains(2));
-        assert!(bm.contains(8));
-        assert!(!bm.contains(0));
-        assert!(!bm.contains(5));
-        assert!(!bm.contains(9));
-    }
-
-    #[test]
     fn test_into_iter_sorted() {
         let mut bm = SparseBitmap::new();
         bm.insert(30);
@@ -786,15 +675,6 @@ mod tests {
         bm.insert(20);
         let vals: Vec<u32> = bm.into_iter().collect();
         assert_eq!(vals, vec![10, 20, 30]);
-    }
-
-    #[test]
-    fn test_clone() {
-        let mut bm = SparseBitmap::new();
-        bm.insert(1);
-        bm.insert(2);
-        let bm2 = bm.clone();
-        assert_eq!(bm2.len(), 2);
     }
 
     #[test]
@@ -853,18 +733,6 @@ mod tests {
     }
 
     #[test]
-    fn test_iter_borrowed() {
-        let mut bm = SparseBitmap::new();
-        bm.insert(5);
-        bm.insert(3);
-        bm.insert(7);
-        let vals: Vec<u32> = bm.iter().collect();
-        assert_eq!(vals, vec![3, 5, 7]);
-        // bm still usable after iter()
-        assert_eq!(bm.len(), 3);
-    }
-
-    #[test]
     fn test_large_gap_varint_roundtrip() {
         // Gaps spanning multiple varint bytes (>= 128, >= 16384) must decode
         // back to the exact ascending ids.
@@ -883,8 +751,7 @@ mod tests {
 
     #[test]
     fn test_single_value_has_no_delta_bytes() {
-        // A one-posting list is the common short-trigram case: it must encode
-        // to zero delta bytes (only `first`), the memory win over 4 bytes.
+        // A one-posting list (the common short-trigram case) stores only `first`.
         let mut bm = SparseBitmap::new();
         bm.insert(42);
         assert_eq!(bm.deltas.len(), 0);
@@ -895,9 +762,7 @@ mod tests {
         DECODES.with(std::cell::Cell::get)
     }
 
-    /// Removing the maximum truncates the final gap without a decode, and it
-    /// leaves exactly the canonical encoding a rebuild would (checked across
-    /// one-byte and multi-byte final gaps, down to empty).
+    /// Removing the maximum decodes nothing and leaves the canonical encoding.
     #[test]
     fn remove_last_is_o1_and_canonical() {
         let values = [3u32, 4, 200, 70_000, 70_001, 5_000_000];

@@ -141,7 +141,6 @@ fn a_bare_shift_reaches_the_audio_host_as_the_lift() {
             .any(|ev| matches!(ev.kind, SoundGesture::Trail(SoundKind::Shift))),
         "the first landing of a bare shift lifts",
     );
-    // Repeat and release stay silent.
     press(&mut app, KeyEventType::Repeat);
     press(&mut app, KeyEventType::Release);
     assert!(
@@ -170,15 +169,11 @@ fn a_bare_shift_reaches_the_audio_host_as_the_lift() {
     );
 }
 
-/// The keyed seam's `Typed` gesture's `shifted` flag agrees with
-/// `typed_class_for`, which asks
-/// the glyph: `A` with no SHIFT bit (Caps Lock) is a shifted `Typed`; `a`
-/// and `7` are not; `a` under SHIFT is. (The visual flag still reads the
-/// modifier, and Caps Lock mints no Shift cue.)
-///
-/// Also pins that a keypress reaches the audio host without a render tick:
-/// nothing here ticks between a key and its capture (the one tick precedes
-/// the first key). Keep it that way.
+/// The keyed seam's `Typed` `shifted` flag agrees with `typed_class_for`, which asks the
+/// glyph: `A` with no SHIFT bit (Caps Lock) is shifted; `a` and `7` are not; `a` under
+/// SHIFT is. (The visual flag still reads the modifier; Caps Lock mints no Shift cue.)
+/// Also pins that a keypress reaches the audio host with no render tick between key and
+/// capture.
 #[test]
 fn a_caps_lock_capital_is_a_shifted_click() {
     use crate::input::{InputEvent, Source};
@@ -237,10 +232,9 @@ fn a_caps_lock_capital_is_a_shifted_click() {
         shifted_of('a', Modifiers::SHIFT),
         "`a` under Shift is the capital it always was"
     );
-    // Every way a shifted glyph can reach the seam: a shifted mark (`?` is
-    // `/` under Shift; `Key::Character` holds the base), a capital under
-    // Shift and Caps Lock, and the literal-text path, which carries no
-    // modifier bits (owner, 2026-09-19).
+    // Every way a shifted glyph can reach the seam: a shifted mark (`?` is `/` under
+    // Shift; `Key::Character` holds the base), a capital under Shift and Caps Lock, and
+    // the literal-text path, which carries no modifier bits.
     assert!(
         shifted_of('/', Modifiers::SHIFT),
         "`?` — `/` under Shift — is a shifted click"

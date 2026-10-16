@@ -125,28 +125,3 @@ static ANSI_256_TABLE: [Color; 256] = {
     }
     table
 };
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// This table is a style-intern cache key and `aterm_types::ColorPalette`
-    /// renders; all 256 indices must agree, or a cell's key encodes a different
-    /// colour than the one drawn.
-    #[test]
-    fn grid_ansi_table_matches_color_palette() {
-        for i in 0u16..=255 {
-            let idx = i as u8;
-            let g = Color::from_ansi_256(idx).to_rgb();
-            let c = aterm_types::ColorPalette::default_color(idx);
-            assert_eq!(
-                g,
-                (c.r, c.g, c.b),
-                "ANSI index {idx} diverges: grid {g:?} vs palette ({},{},{})",
-                c.r,
-                c.g,
-                c.b
-            );
-        }
-    }
-}

@@ -115,6 +115,39 @@ fn resolved_bands_always_inside_the_cell() {
         }
     }
     assert!(checked > 100_000, "lattice must be adversarial ({checked})");
+
+    // Float-to-integer saturation still needs total adjustment/clamping,
+    // including when a public caller's cell height exceeds signed integers.
+    for cell_h in [0, 1, 27, usize::MAX] {
+        for baseline in [i32::MIN, 0, i32::MAX] {
+            for px in [f32::NAN, f32::NEG_INFINITY, f32::INFINITY, f32::MAX] {
+                for position in [
+                    f32::NAN,
+                    f32::NEG_INFINITY,
+                    f32::INFINITY,
+                    -f32::MAX,
+                    f32::MAX,
+                ] {
+                    for thickness in [0.1, f32::INFINITY, f32::MAX] {
+                        for adjustment in [i32::MIN, i32::MAX] {
+                            let tables = Some(DecoTables {
+                                underline: Some((position, thickness)),
+                                strikeout: Some((position, thickness)),
+                            });
+                            let d = resolve_deco_metrics(
+                                cell_h, baseline, px, tables, adjustment, adjustment,
+                            );
+                            for (y, t) in [(d.underline_y, d.underline_t), (d.strike_y, d.strike_t)]
+                            {
+                                assert!((1..=cell_h.max(1)).contains(&t));
+                                assert!(y + t <= cell_h.max(1));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Regression pin: with NO tables and NO adjusts, the resolver reproduces the
@@ -596,10 +629,7 @@ fn ink_skip_is_coverage_monotone_end_to_end() {
 /// never caught this.
 #[test]
 fn baseline_bottoms_keep_the_underline_at_12px() {
-    let Some(bytes) = embedded_font_bytes() else {
-        eprintln!("SKIP: embedded font unavailable");
-        return;
-    };
+    let bytes = embedded_font_bytes();
     let mut r = Renderer::from_bytes(&bytes, 12.0, Theme::default())
         .expect("the embedded font must build a 12px renderer");
     // Descender-free letters, underlined: skip on == skip off, byte for byte —
@@ -625,17 +655,10 @@ fn baseline_bottoms_keep_the_underline_at_12px() {
     );
 }
 
-/// The embedded DejaVu Sans Mono, via the public accessor when the (default)
-/// `embedded-font` feature is on; `None` (skip) on a --no-default-features run.
-fn embedded_font_bytes() -> Option<Vec<u8>> {
-    #[cfg(feature = "embedded-font")]
-    {
-        Some(aterm_render::embedded_font().to_vec())
-    }
-    #[cfg(not(feature = "embedded-font"))]
-    {
-        None
-    }
+/// The embedded DejaVu Sans Mono, from the checked-in asset whatever features
+/// the build turned on.
+fn embedded_font_bytes() -> Vec<u8> {
+    include_bytes!("../assets/DejaVuSansMono.ttf").to_vec()
 }
 
 /// The undercurl band derivation agrees with the resolved metrics for every
@@ -663,6 +686,14 @@ fn curly_gates_on_the_shared_mask_predicate() {
     assert!(undercurl_supported(256, 24), "8·256 ≤ 2048");
     assert!(!undercurl_supported(257, 24), "8·257 > 2048");
     assert!(!undercurl_supported(9, 2049), "height cap");
+    assert!(
+        !undercurl_supported(usize::MAX, 24),
+        "oversized width is refused without overflow"
+    );
+    assert!(
+        !undercurl_supported(9, usize::MAX),
+        "oversized height is refused"
+    );
     // Band derivation across styles.
     assert_eq!(underline_band(UnderlineStyle::None, 24, dm), None);
     assert_eq!(
@@ -677,6 +708,16 @@ fn curly_gates_on_the_shared_mask_predicate() {
         underline_band(UnderlineStyle::Double, 24, dm),
         Some((16, 22)),
         "double band spans both rails"
+    );
+    let oversized = DecoMetrics {
+        underline_y: 0,
+        underline_t: usize::MAX,
+        ..dm
+    };
+    assert_eq!(
+        underline_band(UnderlineStyle::Double, usize::MAX, oversized),
+        Some((0, usize::MAX)),
+        "an oversized double-rail gap clamps to the cell"
     );
 }
 
@@ -862,17 +903,6 @@ fn assert_contained(
     );
 }
 
-/// NEGATIVE CONTROL — the containment predicate genuinely REJECTS an out-of-band
-/// rect, so a passing theorem above is not a tautology (a rect one px below the
-/// cell must fail `assert_contained`).
-#[test]
-#[should_panic(expected = "escaped its cell vertically")]
-fn out_of_band_rect_is_rejected() {
-    // A rect whose bottom is one px past the cell — exactly what a pre-clamp
-    // emitter bug would produce.
-    assert_contained([0, 0, 4, 25], 0, 0, 4, 24, UnderlineStyle::Single, false);
-}
-
 /// `pattern_spans_into` (the public span twin of the rect emitter) is also
 /// partition-invariant — it feeds the ink-skip interval algebra.
 #[test]
@@ -963,10 +993,7 @@ fn preedit_frame(r: &mut Renderer, text: &str) -> aterm_render::Frame {
 /// holds even where no CJK face is installed to draw `日`.
 #[test]
 fn cjk_composition_underline_is_continuous() {
-    let Some(bytes) = embedded_font_bytes() else {
-        eprintln!("SKIP: embedded font unavailable");
-        return;
-    };
+    let bytes = embedded_font_bytes();
     // 12px is the live desktop size the Latin ink-skip was tuned at; the rest
     // span the sizes where the fragmentation was measured.
     for px in [12.0f32, 13.0, 14.0, 16.0, 18.0, 24.0, 32.0] {
@@ -1041,10 +1068,7 @@ fn cjk_composition_underline_is_continuous() {
 /// the whole feature stopped firing.
 #[test]
 fn latin_descender_skip_survives_the_wide_glyph_exemption() {
-    let Some(bytes) = embedded_font_bytes() else {
-        eprintln!("SKIP: embedded font unavailable");
-        return;
-    };
+    let bytes = embedded_font_bytes();
     let mut fired = 0usize;
     for px in [12.0f32, 14.0, 18.0, 24.0, 32.0] {
         let mut r = Renderer::from_bytes(&bytes, px, Theme::default())

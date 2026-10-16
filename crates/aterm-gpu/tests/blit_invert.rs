@@ -1,19 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// Present-path blit coverage: the fullscreen-triangle blit (`vs_blit` +
-// `fs_blit`, NEAREST) that copies the offscreen `Rgba8Unorm` frame into the
-// swapchain.
-//   * `BlitUniform.flag == 0`: destination bytes equal the offscreen frame.
-//   * `BlitUniform.flag != 0` (visual-bell flash): RGB inverted (`1.0 - rgb`),
-//     the GPU counterpart of the CPU `px ^ 0x00ffffff`.
-//
-// The swapchain is not readable headless, so the same pipeline, shader,
-// sampler and uniform are driven against a readable target via
-// `blit_to_offscreen_for_test`. `present()`, WSI and scanout are not
-// exercised.
-//
-// No GPU or no system font: no-op.
+// Present-path blit: the fullscreen-triangle blit (`vs_blit` + `fs_blit`, NEAREST) that copies
+// the offscreen `Rgba8Unorm` frame into the swapchain. `BlitUniform.flag == 0` copies bytes
+// exactly; non-zero (visual-bell flash) inverts RGB, the GPU counterpart of the CPU
+// `px ^ 0x00ffffff`. The swapchain is not readable headless, so the same pipeline, shader,
+// sampler and uniform run against a readable target (`blit_to_offscreen_for_test`); `present()`,
+// WSI and scanout are not exercised. No GPU or no system font: no-op.
 
 use std::sync::Arc;
 
@@ -27,23 +20,21 @@ use crate::common::{self, bb, gg, rr};
 const ROWS: usize = 6;
 const COLS: usize = 24;
 
-/// This suite drives the wgpu oracle arm's blit seams (they read the wgpu
-/// offscreen).
-fn fresh_gpu() -> Option<GpuRenderer> {
-    common::wgpu_oracle_or_skip(18.0, Theme::default())
+/// The blit seams read the wgpu offscreen, so this suite drives the wgpu oracle arm.
+fn fresh_gpu() -> GpuRenderer {
+    common::wgpu_oracle(18.0, Theme::default())
 }
 
-/// Render `input` to the offscreen, read it back, then run the real blit
-/// (`invert`) into a readable target and read that back. Returns
-/// `(offscreen_source, blit_output)`.
+/// Render `input` to the offscreen, then run the real blit (`invert`) into a readable target.
+/// Returns `(offscreen_source, blit_output)`.
 fn source_and_blit(
     gpu: &mut GpuRenderer,
     win: &mut aterm_gpu::WindowGpu,
     input: &RenderInput,
     invert: bool,
 ) -> (Frame, Frame) {
-    // `render_input` does a FULL repaint into the resident offscreen and reads it
-    // back: that returned Frame IS the offscreen the present path blits.
+    // `render_input` fully repaints the resident offscreen and returns its readback: the frame
+    // the present path blits.
     let source = gpu.render_input(win, input, None);
     let blit = gpu.blit_to_offscreen_for_test(win, invert);
     assert_eq!(
@@ -54,29 +45,25 @@ fn source_and_blit(
     (source, blit)
 }
 
-/// A representative changed frame: a prompt, coloured text (red/green/blue via
-/// SGR), and a glyph, so the blit is exercised over real glyph + colour pixels.
+/// A prompt, SGR red/green/blue text and glyphs, so the blit runs over real pixels.
 fn representative_input() -> RenderInput {
     let mut term = Terminal::new(ROWS as u16, COLS as u16);
-    // Prompt + a glyph on row 0; saturated red/green/blue runs on rows below.
     term.process(b"$ blit check >_\r\n");
     term.process(b"\x1b[31mRED\x1b[0m \x1b[32mGREEN\x1b[0m \x1b[34mBLUE\x1b[0m\r\n");
     term.process(b"\x1b[1mbold\x1b[0m plain 0123456789");
     term.cell_frame(ROWS, COLS)
 }
 
-/// Passthrough (invert = false): every blit output pixel equals the offscreen
-/// source (NEAREST at 1:1, no smear, no colour-space drift).
+/// Passthrough: every blit output pixel equals the offscreen source (NEAREST at 1:1, no
+/// colour-space drift).
 #[test]
 fn blit_passthrough_is_byte_identical() {
-    let Some(mut gpu) = fresh_gpu() else { return };
+    let mut gpu = fresh_gpu();
     let mut win = aterm_gpu::WindowGpu::new();
     let input = representative_input();
     let (source, blit) = source_and_blit(&mut gpu, &mut win, &input, false);
 
-    // Byte-exact whole-frame equality (the strongest possible assertion).
     if source.pixels != blit.pixels {
-        // Locate the first divergence for a useful failure message.
         let mut first = None;
         for (i, (&s, &b)) in source.pixels.iter().zip(blit.pixels.iter()).enumerate() {
             if s != b {
@@ -102,9 +89,8 @@ fn blit_passthrough_is_byte_identical() {
     );
 }
 
-/// A ramp over `w * h` pixels that visits every 8-bit value in every channel:
-/// `i` for red and odd strides (coprime with 256) for green and blue. The
-/// caller checks coverage on the readback.
+/// A ramp that visits every 8-bit value in every channel: `i` for red and odd strides (coprime
+/// with 256) for green and blue.
 fn full_domain_ramp(w: usize, h: usize) -> Vec<u32> {
     (0..w * h)
         .map(|i| {
@@ -116,12 +102,10 @@ fn full_domain_ramp(w: usize, h: usize) -> Vec<u32> {
         .collect()
 }
 
-/// Put exact `0x00RRGGBB` bytes into the renderer's offscreen and return the
-/// readback, asserting the injection was exact.
-///
-/// Uses one opaque, untinted NEAREST 1:1 free sprite covering the frame,
-/// drawn `OverText` over a blank cursor-hidden grid, which replaces every
-/// pixel. The caller must disable bloom and shimmer.
+/// Put exact `0x00RRGGBB` bytes into the renderer's offscreen and return the readback,
+/// asserting the injection was exact: one opaque, untinted NEAREST 1:1 free sprite covering the
+/// frame, drawn `OverText` over a blank cursor-hidden grid. The caller disables bloom and
+/// shimmer.
 fn inject_offscreen(
     gpu: &mut GpuRenderer,
     win: &mut aterm_gpu::WindowGpu,
@@ -174,17 +158,13 @@ fn inject_offscreen(
     got
 }
 
-/// Literal double invert over the whole 8-bit domain: the second leg blits
-/// the first leg's output bytes (re-injected via `inject_offscreen`), so
-/// `invert(invert(x)) == x` is performed, not composed.
-///   * `255 - x` is checked at all 256 values in all three channels
-///     (coverage measured on the readback).
-///   * Re-inverting returns the original frame byte-for-byte.
+/// Literal double invert over the whole 8-bit domain: the second leg blits the first leg's
+/// output bytes (re-injected), so `invert(invert(x)) == x` is performed, not composed, and
+/// `255 - x` is checked at all 256 values in all three channels.
 #[test]
 fn blit_double_invert_round_trips_the_real_output() {
-    let Some(mut gpu) = fresh_gpu() else { return };
-    // The injected bytes must survive to the blit untouched: bloom and shimmer
-    // both write extra light into the offscreen.
+    let mut gpu = fresh_gpu();
+    // Bloom and shimmer both write extra light into the offscreen.
     gpu.set_bloom(false);
     gpu.set_shimmer(false);
     let mut win = aterm_gpu::WindowGpu::new();
@@ -193,13 +173,12 @@ fn blit_double_invert_round_trips_the_real_output() {
     let probe = gpu.render_input(&mut win, &representative_input(), None);
     let (w, h) = (probe.width, probe.height);
 
-    // LEG 1: ramp -> offscreen, blit invert.
+    // Leg 1: ramp -> offscreen, blit invert.
     let ramp = full_domain_ramp(w, h);
     let src = inject_offscreen(&mut gpu, &mut win, &ramp, w, h);
     let inv1 = gpu.blit_to_offscreen_for_test(&mut win, true);
 
-    // Non-vacuity: every 8-bit value is present in every channel of the
-    // source readback.
+    // Non-vacuity: every 8-bit value is present in every channel of the source readback.
     let mut seen = [[false; 256]; 3];
     for &p in &src.pixels {
         seen[0][rr(p) as usize] = true;
@@ -230,8 +209,7 @@ fn blit_double_invert_round_trips_the_real_output() {
     let _ = inject_offscreen(&mut gpu, &mut win, &inv1_px, w, h);
     let inv2 = gpu.blit_to_offscreen_for_test(&mut win, true);
 
-    // Compact failure: name the first pixel that failed to come home rather
-    // than dumping two 33k-element frames into the log.
+    // Name the first pixel that failed to come home rather than dumping both frames.
     if let Some((i, (&want, &have))) = src
         .pixels
         .iter()
@@ -246,8 +224,7 @@ fn blit_double_invert_round_trips_the_real_output() {
              mismatch at pixel {i} (x={x}, y={y}): wanted {want:#08x}, got {have:#08x}"
         );
     }
-    // And the intermediate really was a different image — otherwise the
-    // identity above would hold for a blit that did nothing at all.
+    // Non-vacuity: a blit that did nothing would pass the identity above.
     assert_ne!(
         inv1.pixels, src.pixels,
         "NON-VACUITY: the first invert must actually change the frame"

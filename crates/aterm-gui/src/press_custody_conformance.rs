@@ -1247,8 +1247,6 @@ fn output_batches(validated: &mut usize, ev: &mut StepEvidence) {
 /// The `PressCustody` Tier-1 body, RUN by `spec_xref_gate`'s `spec_xref_closure` and
 /// by nothing else: the gate's "PressCustody is actively bound" claim then means the
 /// real engine and GUI seams were driven and checked, not merely that anchors exist.
-/// (A standalone test wrapper ran this same body a second time per gate run; it is
-/// gone.)
 pub(crate) fn run_conformance() -> StepEvidence {
     let mut validated = 0usize;
     // EXECUTION EVIDENCE. `step` drives each seam inside a one-step-wide window, so

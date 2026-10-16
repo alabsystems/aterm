@@ -1,12 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Test-only: a row's slots and words (design rulings 241–248) — the time slot's one style per
-//! width, the distance-scaled glide
-//! read on the display's cadence, the echoes' words, the strain row's rail
-//! and plain words, and the words pass (the job's size said once, the
-//! primary load, the load slot at the tail, a count never without its
-//! unit).
+//! Test-only: a row's slots and words: the time slot's one style per width,
+//! the distance-scaled glide, the echoes' words, the strain row's rail, the
+//! job's size said once, the primary load, and a count never without its
+//! unit.
 
 use crate::animate::{Look, Pace, ROW};
 use crate::center::{EchoKind, MessageCenter, Outcome};
@@ -121,15 +119,11 @@ fn style(w: &str) -> Style {
     Style::Word
 }
 
-/// THE TIME SLOT HAS ONE STYLE PER WIDTH (design ruling 241): over every
-/// row that has a time slot — a download with its ETA latched, the same
-/// download before it latches, a stalled one, a busy row past ten seconds, a
-/// measured level, and their Fault and Vanish echoes — at 60, 80, 120 and
-/// 160 columns and in both looks, the slot's words never read as a bare
-/// `m:ss` clock; a slot laid out LONG says `30 s left` / `for 41 s`, one laid
-/// out SHORT says `30s left` / `for 41s` — the declared sacrifice form, and
-/// nothing else; a determinate row whose estimate is hidden leaves its slot
-/// blank; and an ETA never carries a `~`.
+/// Over every row with a time slot (download latched and not, stalled, busy
+/// past ten seconds, a level, and their Fault and Vanish echoes), at four
+/// widths and both looks: never a bare `m:ss` clock; a slot laid out long
+/// says `30 s left` / `for 41 s`, one laid out short `30s left` / `for 41s`;
+/// a hidden estimate leaves the slot blank; an ETA never carries a `~`.
 #[test]
 fn the_time_slot_never_shows_a_bare_clock_and_keeps_one_style_per_width() {
     let mut seen = std::collections::BTreeSet::new();
@@ -283,9 +277,8 @@ fn the_time_slot_never_shows_a_bare_clock_and_keeps_one_style_per_width() {
         ),
     ];
     for (name, scene) in &scenes {
-        // The four widths the captures are shot at, and — so every declared
-        // short form is met — every width from 40 to 200 for the rows long
-        // enough to need one.
+        // The four capture widths, and every width from 40 to 200 for the
+        // rows long enough to meet every declared short form.
         let widths: Vec<usize> = if name.contains("long title") {
             (40..=200).collect()
         } else {
@@ -347,18 +340,16 @@ fn the_time_slot_never_shows_a_bare_clock_and_keeps_one_style_per_width() {
     }
 }
 
-/// THE GLIDE SCALES WITH ITS DISTANCE AND IS READ ON THE DISPLAY'S CADENCE
-/// (design ruling 245): at 80 columns and 60 Hz, a jump of up to fifty
-/// points moves the edge at most 2.5 cells from one display frame to the
-/// next, monotonically toward the data, and lands within the 600 ms cap; the
-/// deadline asks the display's frames while it flies and — once it lands on
-/// a row that asks nothing else — no wake at all.
+/// At 80 columns and 60 Hz, a jump of up to fifty points moves the edge at
+/// most 2.5 cells a display frame, monotonically, and lands within
+/// `FILL_GLIDE_MAX`; the deadline asks the display's frames while it flies
+/// and, once landed on a row that asks nothing else, no wake at all.
 #[test]
 fn a_glide_moves_at_most_two_and_a_half_cells_a_frame_and_then_sleeps() {
     let cols = 80usize;
     let cell = f64::from(ROW) / cols as f64;
-    // FLAT: no glint, so a landed bar with no amount has nothing else to
-    // draw and must arm nothing.
+    // No glint, so a landed bar with no amount has nothing else to draw and
+    // must arm nothing.
     let flat = Look {
         pace: Pace::Moving,
         graded: false,
@@ -448,9 +439,8 @@ fn a_glide_moves_at_most_two_and_a_half_cells_a_frame_and_then_sleeps() {
     }
 }
 
-/// ✓ AND THE FINISHED WORDS ONLY (ruling 244): no echo, of any kind, in any
-/// look and at any width, paints `100%` beside `done` — the words it draws
-/// are its title, `failed`, or the frozen elapsed words.
+/// No echo of a row with finished words, in any look and at any width, paints
+/// `100%` or `done`: it draws its title, `failed`, or the frozen elapsed words.
 #[test]
 fn no_echo_says_100_percent_done() {
     for kind in [EchoKind::Complete, EchoKind::Fault, EchoKind::Vanish] {
@@ -496,10 +486,9 @@ fn no_echo_says_100_percent_done() {
     }
 }
 
-/// THE STRAIN ROW IS A RAIL WITH PLAIN WORDS (ruling 243): its surface is a
-/// rail at every level, glides both ways at the display's cadence, and its
-/// layout has no load slot; and the rail's geometry is the level mapped onto
-/// the whole row (0 % its left edge, 100 % its right).
+/// The strain row's surface is a rail at every level and glides both ways, its
+/// layout has no load slot, and the rail's edge is the level mapped onto the
+/// whole row.
 #[test]
 fn the_strain_row_is_a_rail_across_the_whole_window() {
     let now = Instant::now();
@@ -558,11 +547,10 @@ fn the_strain_row_is_a_rail_across_the_whole_window() {
     assert_eq!(rm.readout.as_deref(), Some("for 10 s"));
 }
 
-/// THE JOB'S SIZE IS SAID ONCE (ruling 246): beside a percent the stats slot
-/// paints only the size of the whole job — a pair `A / B` its total, a count
-/// its one grammar — hidden until the first unit arrives, and gone where the
-/// title already states it; and across the band's own rows no row states
-/// the same total twice.
+/// Beside a percent the stats slot paints only the size of the whole job (a
+/// pair `A / B` its total, a count its one grammar), hidden until the first
+/// unit arrives and gone where the title already states it; no row of the
+/// band states the same total twice.
 #[test]
 fn the_jobs_size_is_said_once_and_only_when_it_is_news() {
     assert_eq!(
@@ -576,8 +564,7 @@ fn the_jobs_size_is_said_once_and_only_when_it_is_news() {
         None
     );
     assert_eq!(job_stats("Pasting 4.2 MB", "1.1 MB / 4.2 MB"), None);
-    // The title says it only as WHOLE words: `12 GB` is not `2 GB`, and a
-    // wire script's title is free text.
+    // The title says it only as whole words: `12 GB` is not `2 GB`.
     assert_eq!(
         job_stats("Uploading 12 GB backup", "1 GB / 2 GB").as_deref(),
         Some("1 of 2 GB")
@@ -654,11 +641,9 @@ fn pass(load: Option<Load>) -> Message {
         .primary_load(Load::Network)
 }
 
-/// THE WORK'S OWN LOAD SAYS NOTHING THE TITLE DOES NOT (ruling 246): a
-/// download row's `network busy` shows only while other work is measurably
-/// slowed; a load outside the work's own (its extraction making the disk
-/// busy) shows as before; the slot is reserved either way, at the TAIL of
-/// the words — never a mid-row hole, never led by a `·`.
+/// A download row's `network busy` shows only while other work is measurably
+/// slowed; a load outside the work's own shows at once; the slot is reserved
+/// either way, at the tail of the words, never led by a `·`.
 #[test]
 fn a_downloads_network_words_show_only_while_other_work_is_slowed() {
     for cols in [80usize, 120, 160] {
@@ -713,8 +698,8 @@ fn a_downloads_network_words_show_only_while_other_work_is_slowed() {
     }
 }
 
-/// THE PERCENT KEEPS THE STANDARD TWO-SPACE GAP (ruling 246): `100%` and
-/// `42%` alike stand two cells clear of the title, right-aligned in four.
+/// `100%` and `42%` alike stand two cells clear of the title, right-aligned in
+/// four.
 #[test]
 fn the_percent_keeps_a_two_space_gap() {
     for p in [0u16, 50, 420, 1000] {
@@ -737,16 +722,13 @@ fn the_percent_keeps_a_two_space_gap() {
     }
 }
 
-/// A TITLE WITH NO PAST TENSE STILL SAYS IT FINISHED (ruling 247): a wire
-/// script's free text (`notice done backup ok` on `Uploading the backup`)
-/// has no declared finished words and no participle the table reads, so its
-/// Complete echo keeps its title and says `done` in the time slot — never a
-/// bare `✓ Uploading the backup` that reads as still going. A row with no
-/// time slot keeps its `100%`. A past-tense title still says nothing there
-/// (ruling 244).
+/// A free-text title the table has no past tense for (`Uploading the backup`)
+/// keeps its title on a Complete echo and says `done` in the time slot, never
+/// a bare `✓ Uploading the backup`. A row with no time slot keeps its `100%`;
+/// a past-tense title says nothing there.
 #[test]
 fn a_complete_echo_without_a_past_tense_says_done() {
-    // The 72/73 captures' row: `done=<n>/<total> unit=bytes`, so an ETA slot.
+    // `done=<n>/<total> unit=bytes`, so an ETA slot.
     let bar = |title: &str| {
         Message::new(tags::PACKAGES, Severity::Info, title)
             .meter(bytes_meter(30_000_000))
@@ -817,13 +799,9 @@ fn a_complete_echo_without_a_past_tense_says_done() {
     assert_eq!(p.rows[0].pct.as_ref().map(|p| p.1.trim()), Some("100%"));
 }
 
-/// A COUNT NEVER STANDS WITHOUT ITS UNIT (ruling 248): at 80 columns the
-/// strain row's stats read `6/8`, a fraction that did not say what it
-/// counts. Where the width law shortens a count it keeps its unit word
-/// (`6/8 cores`, `3/10 programs`, `23/24 GB`); where even that does not fit
-/// the stats go whole. Pinned at 60/80/120 for every row that carries a
-/// count, and swept over every width 40–200: no painted stats is a bare
-/// fraction.
+/// Where the width law shortens a count it keeps its unit word (`6/8 cores`,
+/// `3/10 programs`); where even that does not fit the stats go whole. Pinned
+/// at 60/80/120 and swept over 40–200: no painted stats is a bare fraction.
 #[test]
 fn a_count_keeps_its_unit_at_every_width() {
     let strain = |title: &str, severity: Severity, load: Load, named: bool, stats: &str| {
@@ -854,9 +832,8 @@ fn a_count_keeps_its_unit_at_every_width() {
                 true,
                 "6 of 8 cores",
             ),
-            // At 60 the capsules and the elapsed slot leave no room for
-            // `6/8 cores`: the stats go, never as `6/8`. At 80 the title
-            // without its `(tab 2)` (ruling 259) leaves room for them whole.
+            // At 60 there is no room for `6/8 cores`: the stats go, never as
+            // `6/8`. At 80 they fit whole.
             [None, Some("6 of 8 cores"), Some("6 of 8 cores")],
         ),
         (

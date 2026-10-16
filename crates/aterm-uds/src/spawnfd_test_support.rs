@@ -312,32 +312,3 @@ unsafe fn fail(report: RawFd) -> ! {
         _exit(127)
     }
 }
-
-/// A program that cannot run is an ERROR from every spawn here, never an
-/// exit status: a `fork` child that died before its `execve` exits 127, which
-/// a race control's `code & 3` would count as a leak. (That the leaky spawns
-/// leak and the strip does not is what the inheritance tests' controls show.)
-#[test]
-fn a_program_that_cannot_run_is_an_error_never_an_exit_status() {
-    let none: &[&str] = &[];
-    for (path, err) in [
-        (
-            "leaky_status",
-            leaky_status("/nonexistent/aterm-leaky", none).err(),
-        ),
-        (
-            "leaky_output",
-            leaky_output("/nonexistent/aterm-leaky", none).err(),
-        ),
-        (
-            "stripped_status",
-            stripped_status("/nonexistent/aterm-leaky", none).err(),
-        ),
-    ] {
-        assert_eq!(
-            err.and_then(|e| e.raw_os_error()),
-            Some(2),
-            "{path}: ENOENT"
-        );
-    }
-}

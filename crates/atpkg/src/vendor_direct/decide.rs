@@ -97,9 +97,9 @@ pub(crate) enum InstallReason {
     /// The head is newer than the installed build.
     Newer,
     /// The installed build is a legacy index build whose version could not be read. No
-    /// downgrade when the build is at or below the ceiling: the head is at or above the
-    /// compiled floor, which is at or above the version of every legacy pin up to it
-    /// ([`super::VendorSpec::legacy_ceiling`]); above it, a person asked.
+    /// downgrade when the build is a legacy pin (1 up to the ceiling): the head is at or
+    /// above the compiled floor, which is at or above the version of every legacy pin
+    /// ([`super::VendorSpec::legacy_ceiling`]); any other, a person asked.
     ReplacesLegacy,
     /// The installed build is yanked and the head is admissible — possibly older.
     ReplacesYanked,
@@ -126,9 +126,9 @@ pub(crate) enum KeepReason {
     BuildDateRegressed,
     /// A local hold suppresses the upgrade.
     Held,
-    /// The installed build is a legacy index build above the ceiling — pinned after this
-    /// code, so its version may be above the floor — whose version could not be read, and
-    /// no person asked: kept until its version is read or a person asks.
+    /// The installed build is a legacy index build that is no legacy pin (above the ceiling,
+    /// or any build of a program no index pinned), so its version may be above the floor; its
+    /// version could not be read and no person asked. Kept until either changes.
     LegacyUnread,
 }
 
@@ -151,7 +151,7 @@ pub(crate) enum Decision {
     Tombstone,
 }
 
-/// Decide one program (design §1.3).
+/// Decide one program.
 ///
 /// * A yanked installed build (by version, or a legacy build by its index build number)
 ///   is the one sanctioned downgrade: the head if it is admissible (not yanked, at or
@@ -159,10 +159,10 @@ pub(crate) enum Decision {
 ///   yanked, at or above the floor), else tombstone. A hold never keeps a yanked build.
 /// * Otherwise a hold keeps any active build, legacy included.
 /// * Otherwise install iff nothing is installed or the head is newer than the installed
-///   version (a legacy build of unknown version is replaced when its build is at or below
-///   the ceiling, or a person asked), and the head is not yanked, at or above the floor,
-///   at most one major above, and — when both carry one — not older by `buildDate`; and,
-///   while a build is installed, at or above the high-water.
+///   version (a legacy build of unknown version is replaced when its build is a legacy
+///   pin, 1 up to the ceiling, or a person asked), and the head is not yanked, at or above
+///   the floor, at most one major above, and — when both carry one — not older by
+///   `buildDate`; and, while a build is installed, at or above the high-water.
 ///   A yanked high-water is no mark: the signed move off it went below it on purpose.
 ///   With nothing installed the mark does not bind: the floor alone refuses a replayed
 ///   head, and a vendor pulling back a release it shipped never leaves the program
@@ -228,12 +228,13 @@ pub(crate) fn decide(i: &Inputs<'_>) -> Decision {
     }
     let reason = match i.installed {
         Installed::Nothing => InstallReason::Fresh,
-        // Above the ceiling the floor vouches for nothing: the build may carry a version
-        // above it, so an unread one moves only when a person asks.
+        // The floor vouches only for the legacy pins, builds 1 up to the ceiling (none for
+        // a program no index pinned): any other may carry a version above it, so an unread
+        // one moves only when a person asks.
         Installed::Legacy {
             build,
             version: None,
-        } if build > i.legacy_ceiling && !i.asked => {
+        } if !(1..=i.legacy_ceiling).contains(&build) && !i.asked => {
             return Decision::Keep(KeepReason::LegacyUnread);
         }
         Installed::Legacy { version: None, .. } => InstallReason::ReplacesLegacy,
@@ -312,7 +313,7 @@ mod tests {
         }
     }
 
-    /// The newest legacy pin (build 2026092201 of claude and codex).
+    /// The legacy ceiling these tests decide under (the newest legacy pin they assume).
     const CEILING: u64 = 2_026_092_201;
 
     fn install(text: &str, reason: InstallReason) -> Decision {
@@ -646,11 +647,9 @@ mod tests {
         );
     }
 
-    /// THE LEGACY CEILING: an unread legacy build at or below the newest legacy pin this
-    /// code knows is replaced on every lane (its version is at or below the floor); one
-    /// above it — pinned after this code, its version possibly above the floor — is kept
-    /// until its version is read or a person asks, and a person's door is still bounded by
-    /// the floor, the high-water and the yanks.
+    /// An unread legacy build at or below the ceiling (the newest legacy pin this code knows)
+    /// is replaced on every lane; one above it is kept until its version is read or a person
+    /// asks, and a person's door is still bounded by the floor, the high-water and the yanks.
     #[test]
     fn an_unread_legacy_build_above_the_ceiling_moves_only_when_a_person_asks() {
         let none = Policy::default();
@@ -713,6 +712,51 @@ mod tests {
             decide(&revoked),
             install("2.1.281", InstallReason::ReplacesYanked)
         );
+    }
+
+    /// A program no index ever pinned ([`super::super::NEVER_INDEX_PINNED`]) has no vouched
+    /// legacy build: every unread non-vendor build, build 0 too, is kept until a person asks
+    /// or its version is read.
+    #[test]
+    fn a_never_pinned_program_keeps_every_unread_legacy_build() {
+        let none = Policy::default();
+        for build in [0, 1, 2_026_092_401] {
+            let unread = Inputs {
+                installed: legacy(build, None),
+                legacy_ceiling: super::super::NEVER_INDEX_PINNED,
+                ..base(&none)
+            };
+            assert_eq!(decide(&unread), keep(KeepReason::LegacyUnread), "{build}");
+            let asked = Inputs {
+                asked: true,
+                ..unread
+            };
+            assert_eq!(
+                decide(&asked),
+                install("2.1.281", InstallReason::ReplacesLegacy),
+                "{build}"
+            );
+            let read = Inputs {
+                installed: legacy(build, Some("2.1.280")),
+                ..unread
+            };
+            assert_eq!(decide(&read), install("2.1.281", InstallReason::Newer));
+        }
+        // The negative control: under a real ceiling, a pin up to it is replaced unattended
+        // (and build 0, never a pin, is not).
+        let pinned = Inputs {
+            installed: legacy(1, None),
+            ..base(&none)
+        };
+        assert_eq!(
+            decide(&pinned),
+            install("2.1.281", InstallReason::ReplacesLegacy)
+        );
+        let zero = Inputs {
+            installed: legacy(0, None),
+            ..pinned
+        };
+        assert_eq!(decide(&zero), keep(KeepReason::LegacyUnread));
     }
 
     #[test]

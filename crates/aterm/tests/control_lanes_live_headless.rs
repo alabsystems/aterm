@@ -59,6 +59,10 @@
 //! instance cannot boot.
 
 #![cfg(unix)]
+#![allow(
+    clippy::disallowed_types,
+    reason = "test code: a stand-in child may inherit descriptors"
+)]
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -771,7 +775,7 @@ fn waits_past_their_lanes_are_told_busy_and_hung_up_waits_give_their_places_back
     const PAST: usize = 4;
     /// Far longer than the test: only a hangup can end these waits in time. A
     /// wait that ended on its own would give its place back with no hangup and
-    /// pass the drain below vacuously, so this outlives a loaded gate's
+    /// pass the drain below vacuously, so this outlives a loaded machine's
     /// filling, its [`REFUSAL_STAYS`] and the drain's [`HANG`] by far, and the
     /// test checks that it did, below.
     const WAIT_MS: u64 = 180_000;

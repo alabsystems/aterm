@@ -1,22 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The vendored winit fork's macOS backend, read as SOURCE by the guards in
-//! `winit_seam.rs` and `winit_sent_prototypes.rs`.
+//! The absorbed winit's macOS backend (`crates/aterm-window`), read as SOURCE
+//! by `winit_seam.rs`.
 
 use std::path::{Path, PathBuf};
 
 /// The fork's macOS backend, as a path this crate can read.
 ///
-/// Factored out because several guards in two files read the fork rather than
-/// one, and a census whose file path is written at each of them is a census
-/// with that many places to go stale.
 pub fn fork_backend() -> PathBuf {
     let base =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vendor/winit/src/platform_impl/macos");
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../aterm-window/src/platform_impl/macos");
     assert!(
         base.is_dir(),
-        "the vendored winit macOS backend is not at {}",
+        "the absorbed winit's macOS backend is not at {}",
         base.display()
     );
     base
@@ -25,10 +22,8 @@ pub fn fork_backend() -> PathBuf {
 /// Every `.rs` file under [`fork_backend`], as `(path relative to it, source)`,
 /// sorted by path.
 ///
-/// RECURSIVE. The directory is flat today, and a `read_dir` that assumed so
-/// would be a scope that goes stale the day someone adds a subdirectory — the
-/// failure mode `objc2_exit_condition.rs` exists to name, where a blind spot
-/// widens silently and every test stays green.
+/// RECURSIVE: a `read_dir` that assumed the flat directory of today would go
+/// blind the day someone adds a subdirectory.
 pub fn fork_rs_files() -> Vec<(String, String)> {
     let dir = fork_backend();
     let mut stack = vec![dir.clone()];

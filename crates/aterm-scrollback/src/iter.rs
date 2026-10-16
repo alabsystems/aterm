@@ -4,22 +4,18 @@
 
 //! Forward iterators over scrollback lines.
 //!
-//! They stream whole storage segments (a warm block / cold page decodes once
-//! and its lines are MOVED out), instead of routing every line through the
-//! random-access `get_line` — which paid a binary search, a cache probe, and a
-//! full `Line` clone per line on an O(N) sequential walk (ST-6). Newest-first
-//! reads use `get_line_rev` directly.
+//! They stream whole storage segments (a warm block or cold page decodes once and
+//! its lines are moved out) instead of calling `get_line` per line. Newest-first
+//! reads use `get_line_rev`.
 
 use std::borrow::Cow;
 use std::collections::VecDeque;
 
 use super::{Line, Scrollback, ScrollbackError, ScrollbackStorage};
 
-/// One bulk read for the streaming walk: the owned lines from a requested
-/// index through the end of its storage segment, or the error plus how many
-/// logical lines to skip past the undecodable segment. The skip count equals
-/// what the old per-line walk skipped one `get_line` error at a time, so
-/// `skipped_lines` totals are unchanged.
+/// One bulk read for the streaming walk: the owned lines from a requested index
+/// through the end of its storage segment, or the error plus how many logical
+/// lines to skip past the undecodable segment.
 pub(crate) type SegmentResult = Result<Vec<Line>, (ScrollbackError, usize)>;
 
 impl Scrollback {
@@ -35,13 +31,8 @@ impl Scrollback {
     }
 
     /// Bulk read for the streaming iterators: owned lines from `idx` through
-    /// the end of its tier segment (cold page / warm block / one hot line).
-    ///
-    /// Tier dispatch mirrors `get_line`; the hot tier yields single cloned
-    /// lines (it is uncompressed and bounded by `hot_limit`, and cloning per
-    /// line is exactly what the old walk did there).
-    // Skip: the tier-dispatch driver — routes into the per-tier bulk reads
-    // (each individually classified: guarded-index / decode class).
+    /// the end of its tier segment (cold page / warm block / one cloned hot line).
+    // Skip: a thin forwarder to `read_segment_tiers` (same class).
     #[cfg_attr(trust_verify, trust::skip)]
     pub(crate) fn read_segment(&self, idx: usize) -> SegmentResult {
         read_segment_tiers(&self.cold, &self.warm, &self.hot, idx)
@@ -96,8 +87,8 @@ pub(crate) fn hot_start_tiers(cold: &impl ColdSegments, warm: &crate::WarmTier) 
 /// Bulk read for the streaming iterators over one cold/warm/hot tier stack:
 /// owned lines from `idx` through the end of its tier segment (cold page /
 /// warm block / one hot line), or the error plus the lines to skip.
-// Skip: the tier-dispatch driver — routes into the per-tier bulk reads
-// (each individually classified: guarded-index / decode class).
+// Skip: the tier-dispatch driver; each per-tier bulk read is classified on its
+// own.
 #[cfg_attr(trust_verify, trust::skip)]
 pub(crate) fn read_segment_tiers(
     cold: &impl ColdSegments,
@@ -132,33 +123,24 @@ pub(crate) fn read_segment_tiers(
         let hot_idx = idx.saturating_sub(cold_count).saturating_sub(warm_count);
         match hot.get(hot_idx) {
             Some(line) => Ok(vec![line.clone()]),
-            // In-range index with no hot line: stale aggregate count —
-            // surface as end-of-data exactly like the old `Ok(None)`.
+            // In-range index with no hot line (stale count): end of data.
             None => Ok(Vec::new()),
         }
     }
 }
 
 impl ScrollbackStorage {
-    /// DENSE forward walk from logical line `start` (0 = oldest) to the end:
-    /// exactly one item per logical line, `None` standing in for a line that
-    /// cannot be read.
+    /// Dense forward walk from logical line `start` (0 = oldest) to the end:
+    /// exactly one item per logical line, `None` for a line that cannot be read.
     ///
-    /// The product readers — the search index, its incremental refresh — key
-    /// every line by its ABSOLUTE row, so a walk that silently skips a corrupt
-    /// segment (as [`iter`](Self::iter) does) would shift every later line
-    /// onto its neighbour's coordinate. This one never skips: an undecodable
-    /// warm block or cold page yields one `None` per line it spans, and a short
-    /// or missing decode yields `None` for each line it failed to supply.
-    /// Item `k` is therefore line `start + k`, always, and it equals what the
-    /// per-line oracle `get_line(start + k).ok().flatten()` returns — pinned by
-    /// the conformance tests in `storage_tests.rs`.
+    /// The search index and its refresh key lines by absolute row, so a walk that
+    /// skips a corrupt segment (as [`iter`](Self::iter) does) would shift every
+    /// later line onto its neighbour's row. Item `k` is always line `start + k` and
+    /// equals `get_line(start + k).ok().flatten()` (conformance tests in
+    /// `storage_tests.rs`).
     ///
-    /// Cost: one decode per warm block / cold page (lines are MOVED out, never
-    /// cloned) and a zero-copy `Cow::Borrowed` per hot line — instead of the
-    /// per-line binary search, block-cache probe and `Line` clone `get_line`
-    /// pays on every warm/cold line. A corrupt segment is logged once, not
-    /// once per line.
+    /// One decode per warm block / cold page (lines moved out) and a
+    /// `Cow::Borrowed` per hot line; a corrupt segment is logged once.
     #[must_use]
     pub fn dense_from(&self, start: usize) -> DenseScrollbackIter<'_> {
         let end = self.line_count();
@@ -185,7 +167,7 @@ impl ScrollbackStorage {
 /// count always equals `line_count() - start`.
 pub struct DenseScrollbackIter<'a> {
     storage: &'a ScrollbackStorage,
-    /// Logical index of the NEXT item.
+    /// Logical index of the next item.
     idx: usize,
     /// `line_count()` when the walk began (the storage is borrowed, so it
     /// cannot change underneath).
@@ -218,9 +200,8 @@ impl DenseScrollbackIter<'_> {
 impl<'a> Iterator for DenseScrollbackIter<'a> {
     type Item = Option<Cow<'a, Line>>;
 
-    // Skip: the segment-walk driver — like `ScrollbackIter::next`, its bulk
-    // reads route into the per-tier decode paths (each individually
-    // classified). Conformance-tested against the per-line oracle.
+    // Skip: the segment-walk driver, like `ScrollbackIter::next`. Conformance-
+    // tested against the per-line oracle.
     #[cfg_attr(trust_verify, trust::skip)]
     fn next(&mut self) -> Option<Self::Item> {
         loop {
@@ -252,10 +233,8 @@ impl<'a> Iterator for DenseScrollbackIter<'a> {
                     }
                 };
             }
-            // Warm/cold: one decode for the whole rest of the segment. The
-            // segment never extends past its tier, but clamp to the hot
-            // boundary anyway so a malformed decode can never push a line
-            // onto another line's coordinate.
+            // Warm/cold: one decode for the rest of the segment, clamped to the hot
+            // boundary so a malformed decode cannot push a line onto another's row.
             let tier_left = self.hot_start.saturating_sub(self.idx);
             match self.storage.read_segment(self.idx) {
                 Ok(mut lines) if !lines.is_empty() => {
@@ -286,13 +265,9 @@ impl ExactSizeIterator for DenseScrollbackIter<'_> {}
 
 /// Iterator over scrollback lines (oldest to newest).
 ///
-/// Streams whole decoded segments: each warm block / cold page is decoded
-/// ONCE and its lines are moved out — no per-line binary search or clone.
-///
-/// When corrupt warm blocks cause decompression errors, affected lines are
-/// skipped (one warning per corrupt segment, not per line; the per-line
-/// SKIP COUNT is unchanged). Call [`skipped_lines`](Self::skipped_lines)
-/// after iteration to detect incomplete results (#5947).
+/// Each warm block / cold page is decoded once and its lines moved out. Lines of
+/// a corrupt segment are skipped with one warning per segment; the test-only
+/// `skipped_lines` counts them.
 pub struct ScrollbackIter<'a> {
     scrollback: &'a Scrollback,
     idx: usize,
@@ -303,10 +278,8 @@ pub struct ScrollbackIter<'a> {
 }
 
 impl ScrollbackIter<'_> {
-    /// Number of lines skipped due to decompression errors during iteration.
-    ///
-    /// Non-zero after iteration indicates corrupt warm blocks caused incomplete
-    /// results — the iterator yielded fewer items than `line_count()`.
+    /// Lines skipped due to decompression errors. Non-zero means the iterator
+    /// yielded fewer items than `line_count()`.
     #[must_use]
     #[cfg(test)]
     pub fn skipped_lines(&self) -> usize {
@@ -317,14 +290,12 @@ impl ScrollbackIter<'_> {
 impl Iterator for ScrollbackIter<'_> {
     type Item = Line;
 
-    // Skip: the segment-walk driver — its bulk reads route into the per-tier
-    // decode paths (each individually classified: guarded-index / decode
-    // class). Round-trip, parity-oracle, and ARENA-SCROLL tested.
+    // Skip: the segment-walk driver; its bulk reads route into the per-tier
+    // decode paths, each classified on its own. Round-trip and oracle tested.
     #[cfg_attr(trust_verify, trust::skip)]
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             if let Some(line) = self.buf.pop_front() {
-                // Saturating cursor idiom (see ScrollbackStorageIter).
                 self.idx = self.idx.saturating_add(1);
                 return Some(line);
             }
@@ -335,9 +306,8 @@ impl Iterator for ScrollbackIter<'_> {
             match self.scrollback.read_segment(self.idx) {
                 Ok(lines) => {
                     if lines.is_empty() {
-                        // In-range index with no data: stale aggregate count
-                        // or short decode — end-of-data, like the old
-                        // `Ok(None)` arm.
+                        // In-range index with no data (stale count or short
+                        // decode): end of data.
                         return None;
                     }
                     self.buf = VecDeque::from(lines);
@@ -359,8 +329,8 @@ impl Iterator for ScrollbackIter<'_> {
 
     fn size_hint(&self) -> (usize, Option<usize>) {
         let remaining = self.scrollback.line_count.saturating_sub(self.idx);
-        // `idx` counts CONSUMED lines including the current segment's yielded
-        // prefix, so `remaining` already accounts for the buffered tail.
+        // `idx` counts consumed lines, so `remaining` already includes the
+        // buffered tail.
         (0, Some(remaining))
     }
 }

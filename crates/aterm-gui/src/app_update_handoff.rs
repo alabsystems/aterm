@@ -1,18 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Seamless update handoff, an inherent-impl split of `App`:
-//! `apply_staged_update_now`, the unix overlap worker (`run_handoff_worker`, the
-//! bounded readiness wait, the unique reaper and rejection plumbing), the reap
-//! authority that licenses a rollback (`HandoffRollbackWarrant`), the Commit-time
-//! admission facts, and `finish_update_handoff`'s drain gate, Commit and rollback.
+//! Seamless update handoff, an inherent-impl split of `App`: `apply_staged_update_now`, the
+//! unix overlap worker (`run_handoff_worker`), the reap authority that licenses a rollback
+//! (`HandoffRollbackWarrant`), the Commit-time admission facts, and `finish_update_handoff`'s
+//! drain gate, Commit and rollback.
 //!
-//! The successor races the parent's in-flight `atpkg` pass like a second window:
-//! the orphaned child keeps the store lock for its pass, so the successor's launch
-//! lanes `--wait-lock` behind it (no row is painted for the wait). A new-build
-//! successor runs one full update pass after its seed
-//! (`crate::launch_update_park`). A rejected candidate's sweep SIGKILLs its process
-//! group, atpkg child included (the store is crash-consistent).
+//! The successor races the parent's in-flight `atpkg` pass like a second window: the orphaned
+//! child keeps the store lock, so the successor's launch lanes `--wait-lock` behind it. A
+//! new-build successor runs one full update pass after its seed (`crate::launch_update_park`).
+//! A rejected candidate's sweep SIGKILLs its process group, atpkg child included (the store is
+//! crash-consistent).
 
 #[cfg(unix)]
 use winit::event_loop::ActiveEventLoop;
@@ -23,12 +21,10 @@ use crate::Wake;
 #[cfg(unix)]
 use crate::app_input::paste_order;
 
-// The seamlessness invariant is proved by the compiler in the sibling
-// `app_update_handoff_island.rs` (`clean { … }` island). It is a separate file
-// because a compiler without the Clean surface cannot lex an island body, and only
-// a `mod` declaration decides whether a file is read. The `clean_islands` cfg is
-// set for the Trust lanes in .cargo/config.toml, so the stable cross lanes still
-// compile aterm-gui.
+// The seamlessness invariant is proved in `app_update_handoff_island.rs` (a `clean { … }`
+// island), a separate file because a compiler without the Clean surface cannot lex an island
+// body and only a `mod` declaration decides whether a file is read. build.rs sets
+// `clean_islands` when the compiler is Trust, so the stable cross lanes still compile aterm-gui.
 #[cfg(clean_islands)]
 #[path = "app_update_handoff_island.rs"]
 mod island;
@@ -45,18 +41,13 @@ pub(crate) mod launched_dial_wait_conformance;
 #[path = "app_update_handoff_dialer_admission_tests.rs"]
 pub(crate) mod launched_dialer_admission_conformance;
 
-/// Everything one attempt captured under the park: the facts that depend on
-/// every reader being stopped.
-///
-/// Separate from [`HandoffWorkerJob`] because on the launched lane the worker is
-/// already running when the main thread parks, so the park's product reaches it as
-/// its own message ([`HandoffTransferJob`]). The fork lane fills it at the job's
-/// construction.
+/// Everything one attempt captured under the park. Separate from [`HandoffWorkerJob`]
+/// because on the launched lane the worker is already running when the main thread parks,
+/// so the capture reaches it as its own message ([`HandoffTransferJob`]).
 #[cfg(unix)]
 struct HandoffCapture {
-    /// When the parent started parking its readers: the zero point of the user's
-    /// freeze and of the 20 ms capture deadline. Data only (the worker reports the
-    /// park->transfer half on the launched lane).
+    /// When the parent started parking its readers: the zero point of the user's freeze and
+    /// of the capture deadline. Data only.
     #[cfg(target_os = "macos")]
     park_at: std::time::Instant,
     /// When the main thread finished this capture and handed it over: the end of
@@ -143,13 +134,9 @@ struct HandoffPrelaunchLane {
     /// (`handoff_diet`). A guess, never handed over as one: the park's own
     /// capture is sealed against it byte for byte, and wins.
     speculative_layout: Option<crate::restore::RestoreManifest>,
-    /// The successor runs an update CANDIDATE — a staged build its boot swap
-    /// puts in place, or the installed bundle an activation names — rather than
-    /// this image (the same-image QA seam). Settled on the main thread from the
-    /// attempt's ticket and seam, never from whether the worker re-verifies: a
-    /// candidate a fresh cached pass lets the worker skip is still a candidate
-    /// (round eight of the update audit, U36's review). Decides the code its
-    /// dialer must run ([`Self::dialer_code`]).
+    /// The successor runs an update candidate rather than this image (the same-image QA
+    /// seam), settled from the attempt's ticket and seam, never from whether the worker
+    /// re-verifies. Decides the code its dialer must run ([`Self::dialer_code`]).
     successor_runs_candidate: bool,
 }
 
@@ -175,6 +162,10 @@ impl HandoffPrelaunchLane {
 }
 
 #[cfg(unix)]
+#[expect(
+    clippy::disallowed_types,
+    reason = "the update successor's raw Command: it hands over exactly its own descriptors, which a strip at the exec would undo"
+)]
 struct HandoffWorkerJob {
     attempt_id: u64,
     current_build: u64,
@@ -200,17 +191,12 @@ struct HandoffWorkerJob {
     /// after this worker's verification.
     parked_under: Option<aterm_update_core::handoff_policy::CarryCeiling>,
     /// The verified candidate declares the chunked rendezvous grant in its sealed
-    /// `Info.plist` (read by a passed pre-verification: this worker's own, or the
-    /// cached pass the lane was chosen on). Only then does the launch environment
-    /// carry `ATERM_HANDOFF_GRANT_CAPS`, so a successor that never declared it is
-    /// never offered one.
+    /// `Info.plist`; only then is it offered one (`ATERM_HANDOFF_GRANT_CAPS`).
     successor_grant_chunks: bool,
     command: std::process::Command,
-    /// What the park produced. `Some` from construction on the fork lane; `None`
-    /// on the launched lane until the main thread's [`HandoffTransferJob`] arrives,
-    /// after the successor has launched and dialled. Every step from the artifact
-    /// write onward reads it through [`Self::capture`]; the pre-grant stand-down
-    /// never reads it.
+    /// What the park produced: `Some` from construction on the fork lane, and on the
+    /// launched lane once the main thread's [`HandoffTransferJob`] arrives. Read through
+    /// [`Self::capture`].
     capture: Option<HandoffCapture>,
     /// The late park's channels, present exactly on the launched lane.
     #[cfg(target_os = "macos")]
@@ -240,11 +226,9 @@ pub(crate) struct ParkPolicy {
     /// Whether a passed pre-verification of the attempt's artifact is on record;
     /// `false` means the candidate's policy is unread, so `policy` says nothing.
     pub(crate) known: bool,
-    /// The candidate's sealed `Info.plist` declares the chunked rendezvous grant
-    /// (read by the same passed pre-verification), so the launched lane may hand
-    /// it up to [`crate::handoff_rendezvous::MAX_CHUNKED_SESSIONS`] sessions
-    /// rather than [`crate::handoff_rendezvous::MAX_RENDEZVOUS_SESSIONS`]. `false`
-    /// when nothing passed.
+    /// The candidate's sealed `Info.plist` declares the chunked rendezvous grant, so the
+    /// launched lane may hand it up to [`crate::handoff_rendezvous::MAX_CHUNKED_SESSIONS`]
+    /// sessions. `false` when nothing passed.
     pub(crate) grant_chunks: bool,
 }
 
@@ -269,14 +253,10 @@ impl ParkPolicy {
     }
 }
 
-/// THE HELD PANES' OWN WINDOW (round five, item 19; round six of the update
-/// audit, finding 21), as a pure function of the clock so it is pinned
-/// without one: the held capture runs only when at least `comfort` (half the
-/// freeze budget) is still left before the park's `deadline`, and then stops
-/// a QUARTER of the budget (`comfort / 2`) short of it — the layout capture
-/// and the callers' deadline check still come after it, and a held capture
-/// that ran to the deadline itself turned every landed park into a miss.
-/// `None` means there is no time for held panes at all.
+/// The held panes' window, a pure function of the clock: the held capture runs only when at
+/// least `comfort` (half the freeze budget) is left before the park's `deadline`, and stops a
+/// quarter of the budget (`comfort / 2`) short of it, because the layout capture and the
+/// callers' deadline check still follow. `None`: no time for held panes.
 #[cfg(unix)]
 fn held_capture_deadline(
     deadline: std::time::Instant,
@@ -289,14 +269,10 @@ fn held_capture_deadline(
     Some(deadline.checked_sub(comfort / 2).unwrap_or(deadline))
 }
 
-/// A FORK-LANE PARK TAKEN ABOVE ITS SUCCESSOR'S POLICY is refused before the child
-/// starts (the review of plan P0-5): the reason, or `None` when the capture may be
-/// handed over.
-///
-/// With no cached pass the fork lane parks under `parked_under` (Full) before the
-/// worker reads the policy; a lower policy fails the attempt as a retrying
-/// producer failure with the pass published, so the next park follows it. `None`
-/// on the launched lane.
+/// Refuses a fork-lane park taken above its successor's policy, before the child starts:
+/// with no cached pass the fork lane parks under `parked_under` (Full) before the worker
+/// reads the policy, and a lower policy fails the attempt with the pass published, so the
+/// next park follows it. `None` on the launched lane.
 #[cfg(unix)]
 pub(crate) fn capture_exceeds_policy(
     parked_under: Option<aterm_update_core::handoff_policy::CarryCeiling>,
@@ -314,32 +290,12 @@ pub(crate) fn capture_exceeds_policy(
     })
 }
 
-/// The worker's handle on the App's pre-verification cache
-/// (`crate::HandoffPreverification`) for the artifact its attempt targets.
-///
-/// WHY THE WORKER PUBLISHES (the 2026-09-22/23 update audit, plan P0-5): the
-/// cache used to be filled only when the stage was ARMED, and its verdict stands
-/// in for re-running `codesign` for ten minutes. An attempt later than that —
-/// a busy terminal, an explicit apply of a stage nothing armed — re-verified on
-/// this worker and kept the answer to itself, so the successor's handoff policy
-/// it read never reached the launched lane's park, which happens on the main
-/// thread after this check. Published, the park reads it by the same key.
-///
-/// A REFUSAL IS PUBLISHED TOO, when it is a verdict (round eight, finding 14):
-/// [`Self::publish_refusal`] keeps every refusal that is not a passing moment
-/// exactly as the arm-time read caches one, and it fails the attempt here as
-/// well. From then on it is the cache's word on that artifact: for
-/// [`crate::HANDOFF_PREVERIFY_FRESHNESS`] the automatic lane's short-circuits
-/// (`start_unix_update_handoff`, `App::cold_lane_verdict_gate`) answer its
-/// attempts with it before anything parks or relaunches,
-/// `App::settle_rearmed_apply_failure` books a returned automatic attempt by it (a
-/// refusal only a person can clear takes the environment block, not the
-/// structural budget), until a later verdict replaces it. A person's press is
-/// never answered by it: their worker verifies afresh and publishes what it
-/// finds — and a pass published after the folder's block was taken is what the
-/// next reconcile releases that block on (`App::install_location_answered_since`).
-/// A passing refusal is still never published: the next attempt measures the
-/// moment again.
+/// The worker's handle on the App's pre-verification cache (`crate::HandoffPreverification`)
+/// for its attempt's artifact. A worker that re-verifies publishes what it read, so the
+/// launched lane's park finds the policy by the same key; a refusal that is a verdict is
+/// published too ([`Self::publish_refusal`]), answering the automatic lane's later attempts
+/// until a newer verdict replaces it. A person's press always verifies afresh, and a
+/// passing refusal is never published.
 #[cfg(unix)]
 struct PreverifyPublisher {
     slot: std::sync::Arc<std::sync::Mutex<Option<crate::HandoffPreverification>>>,
@@ -392,14 +348,9 @@ impl PreverifyPublisher {
         policy
     }
 
-    /// Publish the worker's own REFUSAL `reason` — when it is a verdict, never a
-    /// passing moment, exactly as the arm-time read caches one
-    /// (`App::spawn_staged_handoff_preverification`) — so the returned attempt
-    /// is booked by the verifier's word as the synchronous arm books it (round
-    /// eight of the update audit, finding 14): an attempt that outran the
-    /// arm-time read met a refusal only a person can clear here, filed
-    /// `PreparationFailed` (structural), and two of them stranded the build
-    /// as one that "couldn't take over".
+    /// Publish the worker's own refusal `reason` when it is a verdict, never a passing moment,
+    /// exactly as the arm-time read caches one (`App::spawn_staged_handoff_preverification`),
+    /// so the returned attempt is booked by the verifier's word as the synchronous arm books it.
     fn publish_refusal(&self, reason: &str) {
         if aterm_update::is_passing_refusal(reason) {
             return;
@@ -457,17 +408,13 @@ impl HandoffWorkerJob {
 /// path, so no authority can point at another image. The QA seam is the only case.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SameImageHandoff {
-    /// `ATERM_DEBUG_SEAMLESS_REEXEC=1` — the QA seam that exercises the full handoff and
-    /// adopt path without a release. Byte-identical in behaviour to before this type.
+    /// `ATERM_DEBUG_SEAMLESS_REEXEC=1`: the QA seam that exercises the full handoff and adopt
+    /// path without a release.
     DebugSeam,
 }
 
-/// How this attempt hands its descriptors to the successor.
-///
-/// The fork lane is the only one without a bundle; the out-of-band lane is the
-/// only one whose successor gets its own launchd application job. Chosen once on
-/// the main thread before any reader parks, because it decides the term the
-/// adoption proof hashes.
+/// How this attempt hands its descriptors to the successor, chosen once on the main thread
+/// before any reader parks because it decides the term the adoption proof hashes.
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HandoffLane {
@@ -494,10 +441,8 @@ struct HandoffLaneFacts {
     /// The composed rendezvous path fits `sun_path` on this machine (narrowly: see
     /// `handoff_rendezvous`'s module docs for `$HOME`'s 16 bytes of headroom).
     socket_path_fits: bool,
-    /// The authorized `target_build` is at least this build. The transport's
-    /// presence settles old-parent/new-child (a parent without out-of-band code
-    /// sends `ATERM_SEAMLESS_FDS`), but not new-parent/old-child, so an older
-    /// successor is never offered descriptors it cannot receive.
+    /// The authorized `target_build` is at least this build, so an older successor is
+    /// never offered descriptors it cannot receive.
     target_not_older: bool,
     /// Sessions to hand over.
     sessions: usize,
@@ -575,11 +520,9 @@ fn successor_reads_fabric_carry(target_build: u64, running_build: u64) -> bool {
     target_build >= running_build
 }
 
-/// The hold fence the Commit raises ([`App::fence_hold_serials`]): no `hold` lands
-/// between the Commit's hold-serial read and `_exit`, where a halt answered `OK`
-/// would be lost, and no direct manual reset is answered there
-/// (`fabric::SessionFabric::note_direct_reset`). Dropping it lifts every fence; a
-/// Commit that lands never drops it.
+/// The hold fence the Commit raises ([`App::fence_hold_serials`]): no `hold` or direct
+/// reset is answered between the Commit's hold-serial read and `_exit`, where it would be
+/// lost. Dropping it lifts every fence; a Commit that lands never drops it.
 #[cfg(unix)]
 pub(crate) struct HoldFence(Vec<std::sync::Arc<crate::fabric::SessionFabric>>);
 
@@ -606,23 +549,12 @@ impl HoldFence {
     }
 }
 
-/// A COMMIT THAT HOLDS ITS CLAIM THROUGH ONE MORE INPUT-DISPATCH FENCE (round
-/// eight of the update audit, #18): what it answered once it had claimed the
-/// attempt (`App::answer_at_commit_claim`: a live `video` request above all,
-/// whose answer may not come before the claim) took real time, and a key the OS
-/// queued to this process meanwhile would die with the `_exit`. The claim is
-/// kept across the run loop's dispatch — the worker cannot reject a claimed
-/// attempt — with what the claim's admission took, so nothing it fenced off
-/// lands before the write: the resident operator's quiesce and the hold fence.
-/// The next pass of `App::finish_proven_handoff` reads the admission again
-/// under them and commits, or rolls the claim back. The supervisor host is not
-/// among them: it runs through the fence, as before any claim, and stops at the
-/// write — its stop clears the badges its workers raised, which the held pass
-/// would read as an escalation moved since the park (the review of #18). Nor
-/// is the successor activated before the write (`App::activate_successor_at_write`,
-/// the second review of #18): through the fence the keyboard and the focus
-/// stay this window's, so its run loop delivers the keys to the masters and a
-/// refusal kills a successor that never had them.
+/// A Commit that holds its claim through one more input-dispatch fence: what it answered
+/// at the claim (`App::answer_at_commit_claim`) took real time, and a key queued meanwhile
+/// would die with the `_exit`. It keeps what its admission took (the operator's quiesce,
+/// the hold fence), so nothing fenced off lands before the write, and the next pass reads
+/// the admission again and commits or rolls back. The supervisor host runs through the
+/// fence, and the successor is not activated until the write.
 #[cfg(unix)]
 pub(crate) struct HeldCommit {
     /// The resident operator's quiesce (`None`: there is no operator).
@@ -631,13 +563,10 @@ pub(crate) struct HeldCommit {
     hold_fence: HoldFence,
 }
 
-/// Fresh mutable facts required immediately before the attempt-wide Commit CAS. A
-/// pure conjunction; `ProofReady` alone never grants replacement authority.
-///
-/// Queued PTY output and queued hardware input are not facts here: the carry
-/// digest is taken at parser ground and kernel-queued bytes replay through the
-/// child's parser, and the drain gate in `finish_update_handoff` flushes input
-/// into the still-open masters. `sessions_alive` rejects a dead shell.
+/// Fresh mutable facts required immediately before the attempt-wide Commit CAS; a pure
+/// conjunction. Queued PTY output and hardware input are not facts here: kernel-queued
+/// bytes replay through the child's parser, and the drain gate flushes input into the
+/// still-open masters.
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct HandoffCommitFacts {
@@ -647,13 +576,9 @@ struct HandoffCommitFacts {
     /// ([`commit_agent_carry`]) match the pending layout's: otherwise a relaunch
     /// owed in between would be lost or run twice. Activity.
     exact_agent_carry: bool,
-    /// The activity epoch is unchanged since the attempt was armed, in every lane.
-    ///
-    /// It also requires every session's hold serial to be where the park found it
-    /// (`App::hold_serials`): a `hold` answered after the manifest was drawn would
-    /// never reach the successor, and neither would a `reset` run directly on a
-    /// parked session after the carry was taken, which moves the same serial
-    /// (`fabric::SessionFabric::note_direct_reset`).
+    /// The activity epoch is unchanged since the attempt was armed, and every session's
+    /// hold serial is where the park found it (`App::hold_serials`): a `hold`, or a direct
+    /// `reset`, after the carry was drawn would never reach the successor.
     exact_activity: bool,
     teardown_allows_commit: bool,
     parent_still_parked: bool,
@@ -663,33 +588,20 @@ struct HandoffCommitFacts {
     /// event the OS had accepted flowed through the tolerated input path to the
     /// still-open PTY masters (see the drain gate in `finish_update_handoff`).
     input_dispatch_fenced: bool,
-    /// Process-local egress is drained to the kernel: no tolerated keystroke is
-    /// left in the paste-order FIFO or a wedged-tty sink spill, which would die
-    /// with `_exit`, and no frame is part-way into a master, which `_exit` would
-    /// cut. Read last under the Commit's egress fence, at the write
-    /// (`fence_handoff_egress`). Asserted directly; below the spec model's
-    /// abstraction.
+    /// Process-local egress is drained to the kernel: no tolerated keystroke left in a
+    /// process-local queue and no frame part-way into a master, either of which `_exit`
+    /// would lose. Read last, under the Commit's egress fence (`fence_handoff_egress`).
     egress_settled: bool,
     native_safe: bool,
     proof_exact: bool,
     commit_channel: bool,
-    /// THE RESIDENT OPERATOR, INSIDE THE ADMISSION (round eight of the update
-    /// audit, #70). It used to be a thirteenth conjunct beside this struct —
-    /// `handoff_commit_admitted(facts) && operator_quiesce_error.is_none()` —
-    /// so neither the ownership model's Tier-1 nor the retry taxonomy below
-    /// saw it, and a momentarily busy operator refused an all-true fact set
-    /// that was then filed as a physical failure against the build. Two facts,
-    /// because its refusal asks two different things
-    /// ([`crate::operator_host::UpdateQuiesceRefusal`]):
-    ///
-    /// `operator_idle` — no operator transaction was in flight and its gate
-    /// was free when the Commit asked (or there is no operator). False is
-    /// ACTIVITY: the operator doing work, as a person typing is, and the next
-    /// attempt finds it idle.
+    /// The resident operator, as two facts because its refusal asks two different things
+    /// ([`crate::operator_host::UpdateQuiesceRefusal`]). `operator_idle`: no transaction
+    /// was in flight and its gate was free (or there is no operator); false is activity.
     operator_idle: bool,
-    /// `operator_quiesced` — the operator is fenced for the replacement (or
-    /// there is none). False with `operator_idle` true is a FAULT: it is
-    /// shutting down, or a quiesce is already active or went stale.
+    /// `operator_quiesced`: the operator is fenced for the replacement (or there is none).
+    /// False with `operator_idle` true is a fault: it is shutting down, or a quiesce is already
+    /// active or went stale.
     operator_quiesced: bool,
 }
 
@@ -706,17 +618,11 @@ fn operator_commit_facts(
     )
 }
 
-/// The Commit-time layout comparison, reduced to window/tab/pane topology.
-/// Normalized away:
-///
-/// * Window position, show state and raw inner size: a drag or maximize during
-///   the boot is tolerated and the successor restores the pending capture's.
-/// * Per-session cwd/title: `restore_session_meta` degrades to empty on a
-///   `WouldBlock` try_lock; the child inherits the live shells anyway.
-///
-/// A terminal leaf's carried agent is compared apart ([`commit_agent_carry`]).
-/// Settings drafts are compared: a key typed into Settings during the boot refuses
-/// the Commit as activity, and the next attempt carries the newer text.
+/// The Commit-time layout comparison, reduced to window/tab/pane topology: window
+/// position, show state and raw inner size are normalized away (the successor restores the
+/// pending capture's), and so are cwd/title (`restore_session_meta` degrades on
+/// `WouldBlock`). Agents are compared apart ([`commit_agent_carry`]); Settings drafts are
+/// compared, so a key typed into Settings during the boot refuses as activity.
 #[cfg(unix)]
 #[cfg_attr(
     test,
@@ -749,9 +655,8 @@ pub(crate) fn commit_layout_topology(
             } => {
                 terminal.cwd = None;
                 terminal.title.clear();
-                // The agent the successor relaunches is not topology, nor the
-                // one it watches (round eighteen); each is compared on its
-                // own (`commit_agent_carry`).
+                // The agent the successor relaunches is not topology, nor the one it
+                // watches; each is compared on its own (`commit_agent_carry`).
                 terminal.agent = None;
                 terminal.supervised = None;
             }
@@ -771,19 +676,13 @@ pub(crate) fn commit_layout_topology(
     for window in &mut topology.windows {
         window.outer_x = None;
         window.outer_y = None;
-        // Live show state, not topology (macOS does not record it:
-        // `app_restore::TRACKS_NORMAL_FRAME`). The grid stays compared.
+        // Show state, raw inner size and the presence row are live, not topology: a drag
+        // inside one cell changes the size and no grid. The successor restores the pending
+        // capture's (macOS records no maximized state: `app_restore::TRACKS_NORMAL_FRAME`),
+        // and sizes from it only when it holds that capture's grid, which stays compared.
         window.maximized = None;
-        // The rest of the macOS show state (full screen, minimized, stack place,
-        // key) is live too and not topology. The successor restores the pending
-        // capture's show state, as it does its position.
         window.show = crate::restore::WindowShow::UNKNOWN;
-        // The raw inner size is live like the position: a drag inside one cell
-        // changes it and no grid. The successor sizes from the pending capture's,
-        // and only when it holds that capture's grid, which stays compared.
         window.inner_px = None;
-        // …and the presence row that size holds, a sizing fact of the same
-        // capture: the grid it took stays compared.
         window.presence_row = false;
         // Both projections: the capture writes each session's cwd/title into the
         // legacy `tabs` mirror and the canonical `restored_tabs` tree.
@@ -797,26 +696,12 @@ pub(crate) fn commit_layout_topology(
     topology
 }
 
-/// WHAT THE HANDOFF LAYOUT'S LEAVES CARRY OF THE SUPERVISOR HOST'S AGENTS
-/// (round seven, finding 111): each terminal leaf's session and the agent the
-/// successor is to relaunch there (`TerminalLeafRestore::agent`,
-/// `HostHandle::pending_restored_for`), in layout order — the half of a
-/// handoff leaf [`commit_layout_topology`] leaves out, compared at Commit as
-/// a fact of its own (`HandoffCommitFacts::exact_agent_carry`).
-///
-/// It is not topology, and it can move between the two captures with nothing
-/// on screen moving: the cold-restore queue and a relaunch a worker's
-/// back-off owes ([`crate::harness_host`]'s `Kept::owed`) are read live — an
-/// agent that crashes while the successor boots becomes owed once its exit is
-/// read and settled, a restored relaunch in flight lands, and a tab where a
-/// person starts an agent again is owed no more.
-///
-/// AND THE PROCESS THE SUCCESSOR WATCHES THERE (round eighteen;
-/// `TerminalLeafRestore::supervised`), by its pid and kernel start: one
-/// that changed between the two captures had its exit decided here — a
-/// person's `/exit` left, a crash owed — and the successor, watching the
-/// pending layout's, would decide it again. A re-read of the same process
-/// (its conversation followed) is no change.
+/// What the handoff layout's leaves carry of the supervisor host's agents, in layout
+/// order: each terminal leaf's session, the agent the successor relaunches there, and the
+/// process it watches (pid and kernel start). Compared at Commit apart from topology
+/// (`HandoffCommitFacts::exact_agent_carry`): it moves with nothing on screen moving (an
+/// agent crashing or a relaunch landing during the boot), and a change missed here would
+/// be lost or decided twice.
 #[cfg(unix)]
 pub(crate) fn commit_agent_carry(layout: &crate::restore::RestoreManifest) -> Vec<AgentCarry> {
     layout
@@ -858,12 +743,9 @@ fn handoff_commit_admitted(facts: HandoffCommitFacts) -> bool {
         && facts.operator_quiesced
 }
 
-/// The human-readable reason a ProofReady completion did not Commit, derived
-/// from the SAME [`HandoffCommitFacts`] the admission read so the string
-/// cascade and the admission can never drift. The two Commit-race flags arrive
-/// separately because they are decided after admission; `native_safety` and
-/// `operator` ride along for their own words (`facts.native_safe` and the two
-/// operator facts are their projections).
+/// The human-readable reason a ProofReady completion did not Commit, derived from the same
+/// [`HandoffCommitFacts`] the admission read so the two cannot drift; the Commit-race
+/// flags arrive separately, decided after admission.
 #[cfg(unix)]
 fn handoff_rejection_reason(
     facts: HandoffCommitFacts,
@@ -914,32 +796,13 @@ fn handoff_rejection_reason(
     }
 }
 
-/// Whether a rejection was activity (sessions, layout, epoch, deferred teardown,
-/// undrainable typing) or genuine (safety, proof, channel, arbiter faults).
-/// Activity rollback is lossless, so automatic mode may spend bounded retries on
-/// it. Derived from the admission's facts, never from strings.
-///
-/// SESSION DEATH IS ACTIVITY, WHEREVER IT IS SEEN (round six, finding 37). A
-/// handed-off shell ending mid-overlap — `exit` typed during the freeze, a task
-/// pane's command finishing, an ssh link dropping — is the desk changing, not
-/// evidence against the build: the adoption proof's live set is stale, the
-/// attempt is refused (`sessions_alive` stays in the admission), and the next
-/// attempt proves the post-exit set. The park files the very same fact as
-/// `ActivityRevoked` ("a PTY session closed during automatic reader park"), so
-/// this set, the worker's pre-Commit loop and `wait_handoff_ready` file it the
-/// same way. It used to be left out here and filed `Rejected` there, which the
-/// automatic lane booked as a TRANSIENT physical failure — 600 s, then 1800 s,
-/// against the build's nine-attempt lifetime — so a machine whose agents run
-/// short-lived panes pushed a healthy build back by half-hours and could spend
-/// its whole budget. A person's apply is `Manual` whatever this says.
-///
-/// A BUSY RESIDENT OPERATOR IS ACTIVITY TOO (round eight, #70): a proposal or
-/// observer transaction in flight at the Commit is the operator doing work,
-/// and the next attempt finds it idle. It used to sit outside these facts, so
-/// an all-true fact set refused by it read as no activity at all and was
-/// filed `Physical(Transient)`. An operator that refused for any other reason
-/// (`operator_quiesced` alone false) is a fault, and stays on the physical
-/// schedule.
+/// Whether a rejection was activity (lossless, so automatic mode may spend bounded retries
+/// on it) or genuine, derived from the admission's facts, never from strings. Session
+/// death is activity wherever it is seen (the park, the worker's pre-Commit loop and
+/// `wait_handoff_ready` file it the same way): a shell ending mid-overlap is the desk
+/// changing, not evidence against the build, and filing it physical would push a healthy
+/// build back by half-hours. A busy operator is activity; one that refused otherwise is a
+/// fault.
 #[cfg(unix)]
 fn handoff_rejection_activity_shaped(facts: HandoffCommitFacts) -> bool {
     !facts.exact_sessions
@@ -981,8 +844,8 @@ fn emergency_reap_and_report(
             reconcile: None,
             detail,
             input_drain_spins: 0,
-            // WE ended this candidate, off a bare pid from the completion wire.
-            // Nothing here witnessed a death of its own.
+            // We ended this candidate, off a bare pid from the completion wire. Nothing here
+            // witnessed a death of its own.
             child_death: crate::ChildDeathEvidence::Unobserved,
         },
     ));
@@ -990,9 +853,8 @@ fn emergency_reap_and_report(
 
 #[cfg(unix)]
 impl HandoffWorkerCleanup {
-    /// Complete all filesystem repair before the UI is told rollback is safe.
-    /// Thus the event-loop completion performs no directory scan, unlink,
-    /// symlink publication, status read, or child-process probe.
+    /// All filesystem repair, done before the UI is told rollback is safe so the event-loop
+    /// completion touches no file and probes no process.
     fn complete(&self, nonce: Option<&str>) {
         if let Some(nonce) = nonce {
             crate::seamless::discard_outgoing(nonce);
@@ -1011,9 +873,9 @@ fn make_cloexec_pipe() -> Option<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
     let created = unsafe { libc::pipe2(raw.as_mut_ptr(), libc::O_CLOEXEC) };
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     let created = unsafe { libc::pipe(raw.as_mut_ptr()) };
-    // A real one-way pipe gives every fixed <=PIPE_BUF proof/Commit wire the
-    // atomic all-or-nothing write property used by `commit_and_exit`. A byte
-    // stream socketpair does not provide that theorem and may short-write.
+    // A pipe, not a socketpair: a write of at most PIPE_BUF to a pipe is atomic, which
+    // `commit_and_exit`'s fixed-size proof/Commit wires rely on; a stream socket may
+    // short-write.
     if created != 0 {
         return None;
     }
@@ -1029,13 +891,9 @@ fn make_cloexec_pipe() -> Option<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
     Some((rd, wr))
 }
 
-/// Why a parked PTY reader may be resumed. Rollback restarts a reader on every
-/// handed-off master, so it is sound only while no other process can read them:
-/// two readers on one master interleave the stream unrecoverably. Each variant
-/// rules the candidate out as such a reader.
-///
-/// There is no "waited long enough" variant: a candidate that might be alive is
-/// exactly when rollback must not run, so there is no give-up path.
+/// Why a parked PTY reader may be resumed: only while no other process can read the
+/// handed-off masters, since two readers interleave the stream unrecoverably. There is no
+/// "waited long enough" variant.
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[must_use]
@@ -1043,9 +901,9 @@ enum HandoffRollbackWarrant {
     /// The attempt failed before any candidate was spawned, so nothing outside
     /// this process has ever held a handed-off master.
     NoCandidate,
-    /// A successor was launched but the out-of-band transfer never completed, so
-    /// no descriptor left this process. Sound because this lane moves descriptors
-    /// in one `sendmsg`; the successor finds the rendezvous gone and exits.
+    /// A successor was launched but the out-of-band transfer never started, so no
+    /// descriptor left this process: none leaves before the grant's first `sendmsg`.
+    /// The successor finds the rendezvous gone and exits.
     #[cfg(target_os = "macos")]
     NeverTransferred,
     /// `wait` consumed the candidate: this process reaped it, so the pid cannot be
@@ -1073,13 +931,9 @@ impl HandoffRollbackWarrant {
     }
 }
 
-/// The kernel's birth record for the process currently at a pid: its creation
-/// instant in microseconds. Kernel-assigned and unique across pid reuse; compared
-/// for equality only, never as a clock.
-///
-/// `seamless::ProcessBirth` reads the same fact to ask whether the handoff parent
-/// is alive, with the opposite fail-safe direction (unreadable means dead there,
-/// not proven here), so each lane keeps its own probe.
+/// The kernel's birth record for the process at a pid, unique across pid reuse and
+/// compared for equality only. `seamless::ProcessBirth` reads the same fact with the
+/// opposite fail-safe direction, so each keeps its own probe.
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct HandoffCandidateBirth {
@@ -1096,8 +950,8 @@ fn read_candidate_birth(pid: u32) -> Option<HandoffCandidateBirth> {
     if pid <= 1 {
         return None;
     }
-    // Only a record that names `pid` answers: one about some OTHER pid could
-    // only mislead the comparison this feeds.
+    // Only a record that names `pid` answers: one about another pid would mislead the
+    // comparison this feeds.
     let info = crate::quit_safety::pid_bsdinfo(pid)?;
     Some(HandoffCandidateBirth {
         seconds: info.pbi_start_tvsec,
@@ -1114,8 +968,8 @@ fn read_candidate_birth(_pid: u32) -> Option<HandoffCandidateBirth> {
     None
 }
 
-/// The process that must be proven terminated before any parked reader resumes,
-/// plus whatever identity keeps a RECYCLED pid from impersonating it.
+/// The process that must be proven terminated before any parked reader resumes, plus whatever
+/// identity keeps a recycled pid from impersonating it.
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct HandoffCandidate {
@@ -1134,8 +988,8 @@ enum HandoffCandidateIdentity {
     /// The pid still names the candidate: the kernel's stamp for it equals the
     /// captured one.
     Corroborated,
-    /// The pid names a DIFFERENT process. The kernel does not reallocate a pid
-    /// before its previous owner is reaped, so the candidate has terminated.
+    /// The pid names a different process. The kernel does not reallocate a pid before its
+    /// previous owner is reaped, so the candidate has terminated.
     Recycled,
     /// No stamp was captured, or the kernel will not produce one now. Nothing is
     /// concluded in either direction.
@@ -1165,12 +1019,9 @@ impl HandoffCandidate {
         }
     }
 
-    /// The identity of a candidate this process did not fork, from the pid the
-    /// kernel attested at the rendezvous accept (`LOCAL_PEERPID`).
-    ///
-    /// launchd may reap the successor and free the pid at any moment, so the stamp
-    /// is what makes the pid an identity, and what allows `signal_handoff_candidate`
-    /// to signal a launched candidate directly.
+    /// The identity of a candidate this process did not fork, from the pid the kernel
+    /// attested at the rendezvous accept (`LOCAL_PEERPID`); launchd may free the pid at
+    /// any moment, so the stamp is what makes it an identity.
     #[cfg(target_os = "macos")]
     fn of_attested_peer(pid: u32) -> Self {
         Self {
@@ -1208,17 +1059,11 @@ impl HandoffCandidate {
     }
 }
 
-/// Whether the candidate has terminated, so it cannot hold or read the handed-off
-/// PTY masters. Two independent proofs:
-///
-/// * Pid vacancy: `kill(pid, 0)` answering ESRCH. A running process keeps its pid,
-///   so only termination produces it; pid reuse can hide this answer, never
-///   fabricate it.
-/// * Identity: something answers at the pid but its birth stamp differs. A pid is
-///   not reallocated until its previous owner is reaped.
-///
-/// Both establish what `Child::wait` does. Anything else (zombie, unreadable
-/// record, unconvertible pid) is unproven, and unproven never resumes a reader.
+/// Whether the candidate has terminated, so it cannot hold or read the handed-off masters.
+/// Two proofs, each what `Child::wait` establishes: pid vacancy (`kill(pid, 0)` answering
+/// ESRCH, which pid reuse can hide but never fabricate), or a different birth stamp at the
+/// pid (a pid is not reallocated until its owner is reaped). Anything else is unproven,
+/// and unproven never resumes a reader.
 #[cfg(unix)]
 #[must_use]
 fn handoff_candidate_terminated(candidate: HandoffCandidate) -> bool {
@@ -1253,20 +1098,14 @@ pub(crate) enum ProcessGroupContainment {
     },
 }
 
-/// Puts the calling process in its own process group and proves it, so helpers
-/// it forks later are inside the group a rejecting parent sweeps.
-///
-/// The successor-side twin of [`run_handoff_worker`]'s `pre_exec`
-/// `setpgid(0, 0)`, for a LaunchServices-launched successor (launchd's child, so
-/// no parent hook runs in it). Called from [`crate::main_entry`] before anything
-/// can run another program, not from `seamless::prearm_incoming_fds`, which unit
-/// tests run in-process.
-///
-/// The answer is `getpgrp()`, not `setpgid`'s return value: the only failure this
-/// call shape admits is EPERM for a session leader, which already leads its group,
-/// and reading the postcondition back catches any errno not anticipated.
-///
-/// Idempotent; the boot-apply re-exec keeps the process group across `execve`.
+/// Puts the calling process in its own process group and proves it, so helpers it forks
+/// are inside the group a rejecting parent sweeps: the successor-side twin of the fork
+/// lane's `pre_exec` `setpgid(0, 0)`, for a launched successor no parent hook runs in.
+/// Called from [`crate::main_entry`] before anything can run another program, not from
+/// `seamless::prearm_incoming_fds`, which unit tests run in-process. The answer is
+/// `getpgrp()` read back, not `setpgid`'s return: the one expected failure, a session
+/// leader's EPERM, already leads its group. Idempotent; the boot-apply re-exec keeps the
+/// group.
 #[cfg(unix)]
 #[must_use]
 pub(crate) fn contain_own_process_group() -> ProcessGroupContainment {
@@ -1295,38 +1134,27 @@ fn candidate_is_our_child(pid: libc::pid_t) -> bool {
     )
 }
 
-/// What this process can learn about a candidate without changing anything.
-///
-/// One `waitid(WNOHANG | WNOWAIT)` answers two questions:
-///   * Is it ours: `ECHILD` (a launchd-owned or already-reaped process) is the
-///     discriminator [`candidate_is_our_child`] needs before a group sweep.
-///   * Has it died: [`worker_reject_and_reap_handoff_child`] needs to know whether
-///     the status it reaps is the candidate's own or its SIGKILL's.
+/// What this process can learn about a candidate without changing anything: one
+/// `waitid(WNOHANG | WNOWAIT)` says whether it is ours (`ECHILD` otherwise) and whether it
+/// has died.
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HandoffCandidateProbe {
     /// `waitid` refused: not a child of ours (the launched lane), or already
     /// reaped. Nothing may be concluded, and nothing is pinned.
     NotOurChild,
-    /// Our child, and it has not exited (stopped counts as not exited).
-    ///
-    /// Not "it refused": a candidate being torn down looks the same between the
-    /// kernel closing its descriptors and its zombie state becoming visible, and
-    /// under heavy load a dying candidate is likelier to be caught there.
+    /// Our child, and it has not exited (stopped counts as not exited); a dying candidate
+    /// looks like this until its zombie state is visible.
     Running,
     /// Our child, already exited, and still waitable — so its status is intact for
     /// the reap that follows.
     Exited,
 }
 
-/// Non-destructive: `WNOWAIT` leaves an exited child waitable, so the reaper's
-/// `wait` still collects it and its status.
-///
-/// Reads `si_code`, a public `siginfo_t` field on every target (`si_pid` and
-/// `si_status` are union accessors on Linux). An unchanged child leaves the zeroed
-/// struct at `si_code == 0`; an exit writes `CLD_EXITED`, `CLD_KILLED` or
-/// `CLD_DUMPED`. `si_signo` is not used because Darwin reports a stopped child
-/// (`CLD_STOPPED`) even when only `WEXITED` is asked for.
+/// Non-destructive: `WNOWAIT` leaves an exited child waitable for the reaper. Reads
+/// `si_code` (a plain field everywhere; `si_pid`/`si_status` are union accessors on
+/// Linux), which stays 0 in the zeroed struct for an unchanged child; `si_signo` is
+/// unusable because Darwin reports a stopped child even when only `WEXITED` is asked for.
 #[cfg(unix)]
 fn probe_handoff_candidate(pid: libc::pid_t) -> HandoffCandidateProbe {
     let Ok(id) = libc::id_t::try_from(pid) else {
@@ -1353,23 +1181,11 @@ fn probe_handoff_candidate(pid: libc::pid_t) -> HandoffCandidateProbe {
     }
 }
 
-/// A non-parent's witness to how a candidate died.
-///
-/// The launched lane has no `wait`: `waitid` answers `ECHILD` about launchd's
-/// child, so a `ChildDied` there could only be inferred (see
-/// [`crate::ChildDeathEvidence`]). Darwin's `kqueue` `EVFILT_PROC` with
-/// `NOTE_EXIT | NOTE_EXITSTATUS` delivers the full `wait(2)` status to a watcher
-/// permitted to `SIGKILL` the target, which this lane is.
-///
-/// Registration `ESRCH` (the candidate is already gone) answers `None`. Compared
-/// with [`probe_handoff_candidate`]:
-///   * The event is durable: it stays queued in this process until read, so
-///     launchd reaping the candidate cannot take it away.
-///   * Asking late costs nothing: [`observe_candidate_death`] reads it before its
-///     own SIGKILL and again once the candidate is gone.
-///
-/// The knote is one-shot (dequeued on read), so the watch keeps what it read and
-/// answers the same on every call.
+/// A non-parent's witness to how a candidate died: launchd's child answers `waitid` with
+/// `ECHILD`, but `kqueue` `EVFILT_PROC` with `NOTE_EXIT | NOTE_EXITSTATUS` delivers its
+/// full `wait(2)` status to a watcher permitted to `SIGKILL` it. The event stays queued
+/// until read, so launchd reaping the candidate cannot take it away. The knote is
+/// one-shot, so the watch keeps what it read.
 #[cfg(target_os = "macos")]
 struct CandidateExitWatch(aterm_uds::exitwatch::ExitWatch);
 
@@ -1400,15 +1216,9 @@ fn candidate_leads_its_own_group(pid: libc::pid_t) -> bool {
     pid > 1 && unsafe { libc::getpgid(pid) } == pid
 }
 
-/// SIGKILLs a candidate whose identity was just corroborated: its group when
-/// `-pid` provably names the candidate's own group, then the candidate itself.
-///
-/// Either proof licenses the group signal:
-/// * [`candidate_leads_its_own_group`]: the kernel reports it leads group `pid`
-///   (the launched lane).
-/// * [`candidate_is_our_child`]: the fork lane's pin (`pre_exec` set the group;
-///   an unreaped child owns its number). Needed because Darwin answers `getpgid`
-///   on a zombie leader with ESRCH, which would leave its helpers alive.
+/// SIGKILLs a candidate whose identity was just corroborated: its group when `-pid`
+/// provably names it ([`candidate_leads_its_own_group`], or [`candidate_is_our_child`],
+/// since Darwin answers `getpgid` on a zombie leader with ESRCH), then the candidate.
 #[cfg(unix)]
 fn kill_corroborated_candidate(pid: libc::pid_t) {
     if pid <= 1 {
@@ -1428,32 +1238,19 @@ fn kill_corroborated_candidate(pid: libc::pid_t) {
     unsafe { libc::kill(pid, libc::SIGKILL) };
 }
 
-/// SIGKILLs the candidate before anything waits on it.
-///
-/// The group sweep (`-pid`) stops the candidate's ditto/codesign/spctl
-/// descendants from mutating fixed updater paths after the leader is gone. Its
-/// containment differs by lane:
-///
-/// * A forked candidate: `pre_exec` `setpgid(0, 0)` makes it lead its own group
-///   before its image runs, so `-pid` is valid from the moment `spawn` returns.
-/// * A launched candidate contains itself with [`contain_own_process_group`]
-///   before forking any helper, and refuses to run when it cannot. The parent
-///   reads `getpgid(pid) == pid` at the moment of use
-///   ([`candidate_leads_its_own_group`]) and sends the group SIGKILL only then or
-///   when the candidate is our unreaped child ([`kill_corroborated_candidate`]).
-///
-/// The direct signal is sent only when the identity is corroborated, since a
-/// recycled bare pid names a stranger. Unwitnessed, only the group sweep is sent,
-/// which is safe only while the pid is pinned by our unreaped fork child; a
-/// launched candidate must therefore arrive with an identity. Rollback is licensed
-/// by [`handoff_candidate_terminated`], never by the signal.
+/// SIGKILLs the candidate before anything waits on it. The group sweep (`-pid`) stops its
+/// ditto/codesign/spctl descendants from mutating updater paths after the leader is gone;
+/// it is sent only when the kernel says the candidate leads its group or is our unreaped
+/// child (forked: `pre_exec`'s `setpgid`; launched: [`contain_own_process_group`]). The
+/// direct signal needs a corroborated identity, since a recycled bare pid names a
+/// stranger. Rollback is licensed by [`handoff_candidate_terminated`], never by the signal.
 #[cfg(unix)]
 fn signal_handoff_candidate(candidate: HandoffCandidate) {
     let Ok(pid) = libc::pid_t::try_from(candidate.pid) else {
         return;
     };
-    // `-pid` is kill(2)'s process-GROUP target and -1 is its BROADCAST target,
-    // so a pid below 2 must never reach it.
+    // `-pid` is kill(2)'s process-group target and -1 its broadcast target, so a pid
+    // below 2 must never reach it.
     if pid <= 1 {
         return;
     }
@@ -1463,21 +1260,14 @@ fn signal_handoff_candidate(candidate: HandoffCandidate) {
         HandoffCandidateIdentity::Recycled => (),
         HandoffCandidateIdentity::Corroborated => kill_corroborated_candidate(pid),
         HandoffCandidateIdentity::Unwitnessed => {
-            // A group kill is sound only while the pid is pinned. The fork lane
-            // pins it (an unreaped child owns its number); a launched candidate can
-            // be reaped by launchd and `-pid` could then name a stranger's group.
-            // The wire carries a bare integer, so ask the kernel at the moment of
-            // use: `WNOWAIT` leaves an exited child waitable, and ECHILD means not
-            // pinned.
+            // A group kill is sound only while the pid is pinned: a launched candidate can
+            // be reaped by launchd, and `-pid` would then name a stranger's group. So ask
+            // the kernel now (`WNOWAIT`; ECHILD means not pinned).
             if candidate_is_our_child(pid) {
-                // SAFETY: SIGKILL to the candidate's process group, whose number
-                // the kernel just confirmed is held by a child of ours, then to the
-                // candidate itself.
-                //
-                // The group sweep alone misses a child that inherited this
-                // process's group, and the reject path's wait is unbounded, so the
-                // candidate is also signalled directly; the pinned pid makes that
-                // land on it rather than on a stranger.
+                // SAFETY: SIGKILL to the candidate's process group, whose number the
+                // kernel just confirmed is held by a child of ours, then to the candidate
+                // itself (the pinned pid makes that land on it; the group sweep alone
+                // misses a child that inherited this process's group).
                 unsafe {
                     libc::kill(-pid, libc::SIGKILL);
                     libc::kill(pid, libc::SIGKILL);
@@ -1492,12 +1282,10 @@ fn signal_handoff_candidate(candidate: HandoffCandidate) {
     }
 }
 
-/// Blocks until the candidate is provably terminated, then licenses rollback.
-///
-/// Unbounded on purpose: the proof is a precondition for resuming the parked
-/// readers, since resuming while the candidate might still read the masters
-/// silently corrupts the stream. `Child::wait` has no deadline either. The
-/// interval below only decides when a candidate that will not die gets logged.
+/// Blocks until the candidate is provably terminated, then licenses rollback. Unbounded on
+/// purpose, like `Child::wait`: resuming while the candidate might still read the masters
+/// corrupts the stream. The interval only decides when a candidate that will not die is
+/// logged.
 #[cfg(unix)]
 fn wait_for_handoff_candidate_to_terminate(candidate: HandoffCandidate) -> HandoffRollbackWarrant {
     /// Probe cadence — the same ~2 ms yield the worker's decision loop uses.
@@ -1523,25 +1311,18 @@ fn wait_for_handoff_candidate_to_terminate(candidate: HandoffCandidate) -> Hando
     }
 }
 
-/// The reap's two products: the rollback warrant and, when this process's own
-/// `wait` answered for the candidate, the status it collected. `None` on the
-/// launched lane and for a launcher-shaped child. Read only once
-/// [`HandoffCandidateProbe::Exited`] proved the candidate died before this lane
-/// signalled it (see [`worker_reject_and_reap_handoff_child`]).
+/// The reap's two products: the rollback warrant and, when our own `wait` answered for the
+/// candidate, the status it collected (`None` on the launched lane and for a
+/// launcher-shaped child).
 #[cfg(unix)]
 struct ReapedHandoffCandidate {
     warrant: HandoffRollbackWarrant,
     status: Option<std::process::ExitStatus>,
 }
 
-/// Kills the rejected candidate and proves it gone, on the handoff worker; the
-/// returned warrant licenses [`App::rollback_overlap`] to resume the readers.
-///
-/// Relies on the fork lane's containment (`pre_exec` `setpgid(0, 0)`), so the
-/// group sweep in [`signal_handoff_candidate`] reaches the candidate's helpers.
-/// The warrant never rests on the sweep: it comes from `wait` on our own child or
-/// from [`wait_for_handoff_candidate_to_terminate`]'s outside proof. Also returns
-/// the candidate's exit status when our `wait` answered for it.
+/// Kills the rejected candidate and proves it gone, on the handoff worker; the warrant
+/// licenses [`App::rollback_overlap`]. It never rests on the group sweep: it comes from
+/// `wait` on our own child or from [`wait_for_handoff_candidate_to_terminate`].
 #[cfg(unix)]
 fn kill_and_reap_handoff_child(
     candidate: HandoffCandidate,
@@ -1586,12 +1367,8 @@ fn kill_and_reap_handoff_child(
     }
 }
 
-/// What this process may do to the candidate, which depends on how it was started.
-///
-/// `Child::wait` proves termination and consumes the pid in one step, but exists
-/// only for a process we forked. A type rather than an `Option<&mut Child>` makes
-/// the caller say which lane it is on, so the launched lane cannot inherit a
-/// `wait` that would only answer `ECHILD`.
+/// What this process may do to the candidate, which depends on how it was started: only a
+/// forked one has a `wait`, and the type makes the caller say which lane it is on.
 #[cfg(unix)]
 enum HandoffCandidateHandle {
     /// Our own `spawn`. `wait` is available and is the preferred warrant.
@@ -1617,19 +1394,11 @@ impl HandoffCandidateHandle {
         }
     }
 
-    /// Whether the candidate has provably ended, asked without changing anything
-    /// so the reject path still finds every fact it reads.
-    ///
-    /// The waits ask because EOF on the readiness channel needs every copy of the
-    /// write end closed, and a sibling fork caught in its fork-to-exec window can
-    /// hide the death. (`seamless::CommitReceiver` probes its parent for the same
-    /// reason.)
-    ///
-    ///   * Fork lane: [`probe_handoff_candidate`]'s `waitid(WNOWAIT)`; the child
-    ///     stays waitable and its pid stays pinned.
-    ///   * Launched lane: [`handoff_candidate_terminated`]. It never reads the
-    ///     one-shot [`CandidateExitWatch`], which the hold loop and stand-down own;
-    ///     an unreaped zombie answers `false` until launchd reaps it.
+    /// Whether the candidate has provably ended, asked without changing anything: EOF on
+    /// the readiness channel needs every copy of the write end closed, and a sibling fork
+    /// in its fork-to-exec window can hide the death. The fork lane asks `waitid(WNOWAIT)`;
+    /// the launched lane [`handoff_candidate_terminated`], never the one-shot
+    /// [`CandidateExitWatch`] the hold loop owns.
     fn candidate_gone(&self, candidate: HandoffCandidate) -> bool {
         match self {
             // Only while the child is the candidate: a launcher-shaped child exits
@@ -1665,20 +1434,13 @@ fn worker_claim_handoff_reaper(arbiter: &crate::HandoffAttemptArbiter) -> bool {
     }
 }
 
-/// The emergency reaper's kill from a bare `child_pid` (on its own thread, or
-/// inline when that thread cannot be created).
-///
-/// A bare pid carries no evidence of the candidate's group containment: on the
-/// fork lane it is `pre_exec`'s; for a launched candidate the group sweep is
-/// best-effort. The warrant comes from `waitpid` or the outside proof either way
-/// (see [`signal_handoff_candidate`]).
+/// The emergency reaper's kill from a bare `child_pid` (on its own thread, or inline when
+/// that thread cannot be created); the warrant comes from `waitpid` or the outside proof.
 #[cfg(unix)]
 fn emergency_kill_and_reap_handoff_child(pid: u32) -> HandoffRollbackWarrant {
-    // Precondition: the caller won the Emergency reaper CAS, so no worker consumes
-    // the candidate's identity concurrently. A fork child is also pinned to `pid`;
-    // a launchd-owned one is not, so the fallback re-derives termination. The
-    // group is signalled before any wait: `waitpid` reaps a dead leader, and its
-    // helpers would otherwise keep mutating updater paths.
+    // The caller won the Emergency reaper CAS, so nothing else consumes the identity. The
+    // group is signalled before any wait: `waitpid` reaps a dead leader, and its helpers
+    // would otherwise keep mutating updater paths.
     let candidate = HandoffCandidate::from_bare_pid(pid);
     signal_handoff_candidate(candidate);
     let Ok(raw) = libc::pid_t::try_from(pid) else {
@@ -1705,14 +1467,10 @@ fn emergency_kill_and_reap_handoff_child(pid: u32) -> HandoffRollbackWarrant {
     wait_for_handoff_candidate_to_terminate(candidate)
 }
 
-/// Pre-park admission peek only: a readable byte on a live master, output its
-/// reader has not taken yet. Automatic mode does not begin an overlap while output
-/// flows. Mid-flight, queued output is tolerated; use [`handoff_masters_closed`]
-/// there.
-///
-/// POLLIN only, never from a hung-up master: a dead master (macOS reports a dead
-/// slave as `POLLIN|POLLHUP`) would make a `--hold` pane block every automatic
-/// attempt. Death belongs to [`handoff_masters_closed`] and the post-park re-check.
+/// Pre-park admission peek: a readable byte its reader has not taken on a live master, so
+/// automatic mode does not begin an overlap while output flows (mid-flight, queued output
+/// is tolerated: use [`handoff_masters_closed`]). A hung-up master (macOS reports
+/// `POLLIN|POLLHUP`) does not count, or a `--hold` pane would block every attempt.
 #[cfg(unix)]
 pub(crate) fn handoff_masters_have_activity(live: &[(u64, i32, i32)]) -> bool {
     peek_handoff_masters(live, |revents| {
@@ -1721,11 +1479,8 @@ pub(crate) fn handoff_masters_have_activity(live: &[(u64, i32, i32)]) -> bool {
 }
 
 /// Mid-flight death peek: true only when a handed-off master reports
-/// POLLHUP/POLLERR/POLLNVAL, meaning the session is gone or the descriptor is
-/// invalid. Readable output does not count; it waits in the kernel queue for the
-/// child's parser. `events: POLLIN` is still required: macOS evaluates a PTY
-/// master's state only for requested events, and with `events: 0` reports nothing
-/// (pinned by the paired unit test).
+/// POLLHUP/POLLERR/POLLNVAL; queued output waits in the kernel for the child. Requests
+/// `events: POLLIN` anyway: macOS evaluates a PTY master only for requested events.
 #[cfg(unix)]
 pub(crate) fn handoff_masters_closed(live: &[(u64, i32, i32)]) -> bool {
     peek_handoff_masters(live, |revents| revents & HANDOFF_MASTER_DEAD != 0)
@@ -1758,12 +1513,9 @@ fn peek_handoff_masters(live: &[(u64, i32, i32)], hit: impl Fn(libc::c_short) ->
     polled > 0 && fds.iter().any(|fd| hit(fd.revents))
 }
 
-/// Whether every handed-off session's process-local egress has reached the
-/// kernel: no tolerated keystroke is still in the paste-order FIFO or a wedged-tty
-/// sink spill, where `_exit` would destroy it, and no frame is still being
-/// written ([`fence_session_egress`]). A master no longer in the pool is settled
-/// (`sessions_alive`/`exact_sessions` reject its death). Live entries use the
-/// sink-local state; only an orphaned master consults the writer registry.
+/// Whether every handed-off session's process-local egress has reached the kernel
+/// ([`fence_session_egress`]), where `_exit` cannot destroy it. A master no longer in the
+/// pool is settled (`sessions_alive` rejects its death).
 #[cfg(unix)]
 fn handoff_egress_settled(pool: &crate::SessionPool, live: &[(u64, i32, i32)]) -> bool {
     live.iter().all(|(_, master, _)| {
@@ -1776,16 +1528,11 @@ fn handoff_egress_settled(pool: &crate::SessionPool, live: &[(u64, i32, i32)]) -
 }
 
 /// One handed-off session's egress, stopped at a frame boundary
-/// ([`aterm_session::sink::SinkWriter::try_fence_egress`]): `None` while a job
-/// waits in its paste-order FIFO, bytes wait in its spill, or a frame is being
-/// written. That last is the blocking write a control verb makes into a session
-/// not in front (`paste-bin`, `feed-bin`, `send`, `paste --stdin`) or a long
-/// query reply, parked on a program that is not reading — during the freeze it
-/// often cannot, its output undrained. `_exit` would cut that frame mid-write: a
-/// bracketed paste left open, so every key after it reads as pasted text.
-///
-/// The drain gate reads it and lets it go; the Commit holds every session's
-/// through its write and `_exit` ([`fence_handoff_egress`]).
+/// ([`aterm_session::sink::SinkWriter::try_fence_egress`]): `None` while a job waits in its
+/// paste-order FIFO, bytes wait in its spill, or a frame is being written (a control verb's
+/// blocking write into a program not reading), which `_exit` would cut mid-write, leaving a
+/// bracketed paste open. The Commit holds every session's through its write
+/// ([`fence_handoff_egress`]).
 #[cfg(unix)]
 fn fence_session_egress(
     sink: &aterm_session::sink::SinkWriter,
@@ -1808,11 +1555,10 @@ fn handoff_sinks(
         .collect()
 }
 
-/// THE COMMIT'S EGRESS FENCE: every handed-off session's egress stopped at a
-/// frame boundary ([`fence_session_egress`]), or `None` when one still has
-/// input on its way. Held through the Commit's write, so no frame that begins
-/// after the drain gate's last reading is cut by the `_exit` either: it waits
-/// before its first byte, and goes on if the Commit stands down.
+/// The Commit's egress fence: every handed-off session's egress stopped at a frame boundary
+/// ([`fence_session_egress`]), or `None` when one still has input on its way. Held through the
+/// Commit's write, so no frame that begins after the drain gate's last reading is cut by the
+/// `_exit` either: it waits before its first byte, and goes on if the Commit stands down.
 #[cfg(unix)]
 fn fence_handoff_egress(
     sinks: &[std::sync::Arc<aterm_session::sink::SinkWriter>],
@@ -1829,6 +1575,10 @@ const EXPECTED_BUILD_ENV: &str = "ATERM_UPDATE_EXPECTED_BUILD";
 const EXPECTED_COMMIT_ENV: &str = "ATERM_UPDATE_EXPECTED_COMMIT";
 const EXPECTED_DIGEST_ENV: &str = "ATERM_UPDATE_EXPECTED_DMG_SHA256";
 
+#[expect(
+    clippy::disallowed_types,
+    reason = "the update successor's raw Command: it hands over exactly its own descriptors, which a strip at the exec would undo"
+)]
 fn bind_expected_update_artifact(
     command: &mut std::process::Command,
     attempt: Option<&crate::native_updater_service::ApplyAttemptTicket>,
@@ -1845,33 +1595,18 @@ fn bind_expected_update_artifact(
     }
 }
 
-/// The name the cold lane's budget travels under across its `exec` (round eight,
-/// #1's review): written by the cold arm beside the expected-artifact binding, and
-/// read and CLEARED by the relaunched image before its boot apply
-/// ([`ColdRelaunch::of_this_launch`]), so neither a swapped-in build's re-exec nor
-/// any shell is born with it.
+/// The name the cold lane's budget travels under across its `exec`: written by the cold arm
+/// beside the expected-artifact binding, and read and cleared by the relaunched image before
+/// its boot apply ([`ColdRelaunch::of_this_launch`]), so neither a swapped-in build's re-exec
+/// nor any shell is born with it.
 #[cfg(unix)]
 const COLD_LANE_BUDGET_ENV: &str = "ATERM_UPDATE_COLD_LANE_BUDGET";
 
-/// THE AUTOMATIC LANE'S MEMORY OF ONE ARTIFACT, carried across the cold lane's
-/// `exec` (round eight, #1's review).
-///
-/// The cold lane's successor is this build in a NEW process, and every budget that
-/// makes the automatic lane converge — the physical-failure count
-/// (`auto_apply_physical_retry`) and the structural verdict
-/// (`auto_apply_structural_verdict`) — lived in the process the `exec` replaced. In
-/// the relaunched one they started empty, so a boot swap that kept refusing for a
-/// reason the pre-park read cannot see (a stopped sibling holding the apply lock,
-/// whose timeout is a passing refusal and is never cached; a candidate that cannot
-/// start, which only the swap's own probe tries) was booked as the FIRST failure on
-/// every relaunch: retry in 600 s — the moment the seeded verdict lapsed — and a
-/// relaunch into the same refusal, about every ten minutes, for ever. Carried, the
-/// relaunched process books its refusal where the schedule stands: 600 s, 1800 s,
-/// the stand-down, convergence and its notice, as failures inside one process are.
-///
-/// Carried exactly: the count, how long ago its last failure was (so the
-/// replenish window keeps its clock), which side of the swap each record keys, and
-/// when the verdict's one re-sample is due (or that it is spent).
+/// The automatic lane's memory of one artifact, carried across the cold lane's `exec`: the
+/// successor is this build in a new process, and without the physical-failure count and
+/// the structural verdict a boot swap that keeps refusing would be booked as a first
+/// failure on every relaunch, for ever. Carried exactly: the count, how long ago the last
+/// failure was, which side of the swap each record keys, and the verdict's re-sample.
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ColdLaneBudget {
@@ -1925,10 +1660,9 @@ impl ColdLaneBudget {
         fields.join(";")
     }
 
-    /// [`Self::encode`]'s inverse — `None` unless the value is about exactly
-    /// `build`'s `artifact`, so a budget can never answer for other bytes. A half
-    /// that does not parse is dropped on its own: the lane then books from an empty
-    /// record, as it did before anything was carried.
+    /// [`Self::encode`]'s inverse: `None` unless the value is about exactly `build`'s
+    /// `artifact`, so a budget never answers for other bytes. A half that does not parse is
+    /// dropped on its own, and the lane books that half from an empty record.
     pub(crate) fn decode(value: &str, build: u64, artifact: &str) -> Option<Self> {
         let field = |name: &str| {
             value
@@ -1966,6 +1700,10 @@ impl ColdLaneBudget {
 /// The cold arm's half of [`ColdLaneBudget`]: `budget`, encoded for `attempt`'s
 /// artifact, on the successor's environment — and never an inherited one.
 #[cfg(unix)]
+#[expect(
+    clippy::disallowed_types,
+    reason = "the update successor's raw Command: it hands over exactly its own descriptors, which a strip at the exec would undo"
+)]
 fn bind_cold_lane_budget(
     command: &mut std::process::Command,
     attempt: Option<&crate::native_updater_service::ApplyAttemptTicket>,
@@ -1980,27 +1718,19 @@ fn bind_cold_lane_budget(
     }
 }
 
-/// The name the update-health warnings a cold-lane parent had said, and no
-/// proof had answered, travel under across its `exec` (round eight of the
-/// update audit, finding 79): written by the cold arm
-/// ([`bind_cold_lane_health_said`]) and TAKEN by the window's entry after the
-/// boot apply ([`take_cold_lane_health_said`]), whose re-exec into the swapped-in
-/// build inherits it, as it inherits `ATERM_UPDATED_FROM` — so no shell and no
-/// window opened from one is born with it. The consumer is always this build or
-/// a newer one, as `aterm_update::RELAUNCH_OF_RUNNING_ENV`'s is.
+/// The name the cold-lane parent's unanswered update-health warnings travel under across
+/// its `exec`: written by the cold arm, taken by the window's entry after the boot apply
+/// (whose re-exec inherits it), so no shell or window is born with it.
 pub(crate) const COLD_LANE_HEALTH_SAID_ENV: &str = "ATERM_UPDATE_HEALTH_SAID";
 
-/// WHAT THE PARENT HAD SAID CROSSES THE COLD LANE TOO (round eight of the update
-/// audit, finding 79). The seamless lanes carry it in the window carry
-/// ([`crate::session_store::WindowCarry::update_health_said`], round six's
-/// finding 54); the cold lane's `exec` carried nothing, so its successor started
-/// with no memory of "Couldn't install updates", its landing recorded no
-/// healing, and Settings ▸ Messages kept that warning as the last word on the
-/// install lane — and a check or download warning the landing does not answer
-/// was never taken up by the successor's own producer either. The parent's
-/// `update_health_said` rides as JSON, the window carry's own shape; none rides
-/// when nothing is unanswered.
+/// Carries the parent's unanswered update-health warnings across the cold lane, as the
+/// seamless lanes do in the window carry, so the landing can record their healing. JSON,
+/// the window carry's shape; none when nothing is unanswered.
 #[cfg(unix)]
+#[expect(
+    clippy::disallowed_types,
+    reason = "the update successor's raw Command: it hands over exactly its own descriptors, which a strip at the exec would undo"
+)]
 pub(crate) fn bind_cold_lane_health_said(
     command: &mut std::process::Command,
     said: &[crate::session_store::CarriedHealthSaid],
@@ -2014,13 +1744,10 @@ pub(crate) fn bind_cold_lane_health_said(
     }
 }
 
-/// The cold-lane parent's unanswered update-health warnings
-/// ([`bind_cold_lane_health_said`]), TAKEN from this process's environment
-/// whatever this launch is — nothing after it may be born with them — and
-/// returned only when this run is an update's landing (`just_updated`: a refused
-/// relaunch comes back as the same build, which lands nothing). Read by the
-/// window's entry while it is still single-threaded, after the boot apply; a
-/// value that does not parse is no warning, never a guess.
+/// The cold-lane parent's unanswered update-health warnings, taken from this process's
+/// environment whatever this launch is, and returned only when this run is an update's
+/// landing (`just_updated`). Read by the window's entry, single-threaded, after the boot
+/// apply.
 pub(crate) fn take_cold_lane_health_said(
     just_updated: bool,
 ) -> Vec<crate::session_store::CarriedHealthSaid> {
@@ -2040,22 +1767,12 @@ pub(crate) fn parse_cold_lane_health_said(
         .unwrap_or_default()
 }
 
-/// THIS LAUNCH IS THE COLD LANE'S RELAUNCH OF ITS OWN BUILD (round eight, #1):
-/// the artifact the outgoing image bound for it to swap in, when the launch is
-/// that and nothing else — no handoff descriptors, `ATERM_UPDATED_FROM` naming
-/// the very build now running (the cold lane execs itself; its boot swap is what
-/// makes it the new build), and the whole binding present — with the lane's
-/// budget for that artifact ([`ColdLaneBudget`]).
-///
-/// Why it matters: the process that decided to relaunch is gone, and with it
-/// every memory of the attempt. When this launch's boot swap REFUSES, the image
-/// that comes up is the old build again, on a desk with no terminal again — the
-/// exact state that took the cold lane — and nothing told its automatic lane that
-/// the relaunch had just been refused, nor how many times before. It re-armed the
-/// same artifact and exec'd again, every few seconds, for as long as the cause
-/// stood. [`ColdRelaunch::seed`] turns the refusal into the verdict this lane reads
-/// before it relaunches ([`crate::App::cold_lane_verdict_gate`]), and hands back
-/// the budget it is booked against.
+/// This launch is the cold lane's relaunch of its own build: the artifact the outgoing
+/// image bound for it to swap in (no handoff descriptors, `ATERM_UPDATED_FROM` naming this
+/// build, the whole binding present), with the lane's budget for it. The process that
+/// decided to relaunch is gone, so when this boot swap refuses, [`ColdRelaunch::seed`]
+/// turns the refusal into the verdict the lane reads before it relaunches again
+/// ([`crate::App::cold_lane_verdict_gate`]).
 #[cfg(unix)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ColdRelaunch {
@@ -2072,10 +1789,9 @@ pub(crate) struct ColdRelaunch {
 pub(crate) struct ColdRelaunchSeed {
     /// The boot swap's refusal, as the pre-park verdict on its artifact.
     pub(crate) verdict: crate::HandoffPreverification,
-    /// The boot swap's refusal when it was only the wait for an update check to
-    /// confirm the stage's signer ([`aterm_update::is_roster_confirmation_wait`];
-    /// round eight, #503's second review): then it is no verdict at all, and the
-    /// lane holds for the check instead of reading [`Self::verdict`].
+    /// The boot swap's refusal when it was only the wait for an update check to confirm the
+    /// stage's signer ([`aterm_update::is_roster_confirmation_wait`]): no verdict at all, so
+    /// the lane holds for the check instead of reading [`Self::verdict`].
     pub(crate) roster_wait: Option<String>,
     /// The artifact's digest as the automatic lane keys it; `None` when the
     /// binding's digest does not decode (no automatic attempt could have armed for
@@ -2087,12 +1803,9 @@ pub(crate) struct ColdRelaunchSeed {
 
 #[cfg(unix)]
 impl ColdRelaunch {
-    /// Read from this process's environment, BEFORE the boot apply consumes the
-    /// binding, and never cleared here — except the budget, which is TAKEN here
-    /// whatever this launch is: it is this function's alone, and nothing after it
-    /// (a swapped-in build's re-exec, a shell) may be born with it.
-    /// `handoff_successor`: the launch carries a handoff's descriptors (a seamless
-    /// candidate, whose parent owns the verdict).
+    /// Read from this process's environment before the boot apply consumes the binding;
+    /// the budget alone is taken here, whatever this launch is. `handoff_successor`: the
+    /// launch carries a handoff's descriptors, whose parent owns the verdict.
     pub(crate) fn of_this_launch(handoff_successor: bool) -> Option<Self> {
         let budget = aterm_log::env::take(COLD_LANE_BUDGET_ENV);
         if handoff_successor {
@@ -2135,27 +1848,13 @@ impl ColdRelaunch {
         })
     }
 
-    /// What this relaunch's boot apply leaves its automatic lane — `Some` when the
-    /// swap REFUSED (`Deferred`) or was rolled back (`ReExecFailed`): the refusal as
-    /// the pre-park verification entry the automatic lane reads — the complete
-    /// gate's own answer about these bytes on this machine, minutes fresher than any
-    /// cached read — and the budget the outgoing process had booked against them.
-    /// So the first automatic attempt of this process books the refusal by its typed
-    /// fact, where the schedule stands, instead of relaunching into it: a person's to
-    /// clear latches the environment block, a passing moment rides the transient
-    /// schedule, anything else the structural one. A passing refusal is held too —
-    /// unlike a read that did not finish, this one already cost a relaunch. Stamped
-    /// `now`, keyed like every verdict, so it answers for nothing else.
-    ///
-    /// EXCEPT THE WAIT FOR A ROSTER CONFIRMATION (round eight, #503's second review):
-    /// gate 4d's refusal says only that no check has confirmed the stage's signer for
-    /// a day, which the check that runs right after this launch ends. Seeded as a
-    /// refusal it was booked by the first automatic attempt as a transient PHYSICAL
-    /// failure (the budget, the 600 s / 1800 s / 6 h latch, the `apply` streak) even
-    /// when that check had already confirmed the stage, and its fresh verdict kept
-    /// the arm-time read, and with it the lane's hold, from ever forming. It is
-    /// carried as [`ColdRelaunchSeed::roster_wait`] instead: the lane holds for the
-    /// check, charged nothing.
+    /// What this relaunch's boot apply leaves its automatic lane, `Some` when the swap
+    /// refused (`Deferred`) or was rolled back (`ReExecFailed`): the refusal as the
+    /// pre-park verdict on these bytes, with the outgoing process's budget, so the first
+    /// automatic attempt books it where the schedule stands instead of relaunching into
+    /// it. A passing refusal is held too, since this one already cost a relaunch. The wait
+    /// for a roster confirmation is no verdict and is carried as
+    /// [`ColdRelaunchSeed::roster_wait`]: the lane holds for the check, charged nothing.
     pub(crate) fn seed(&self, outcome: &aterm_update::ApplyOutcome) -> Option<ColdRelaunchSeed> {
         let reason = match outcome {
             aterm_update::ApplyOutcome::Deferred(reason)
@@ -2260,13 +1959,9 @@ fn send_warranted_handoff_failure(
     }
 }
 
-/// The first half of [`send_warranted_handoff_failure`]: the completion itself.
-/// `false` when the event loop is gone, and then no disk facts follow.
-///
-/// Split out for the reject paths that may give back the candidate's counted
-/// trial launch between the two halves, so the disk facts read the count the
-/// sentinel keeps; the automatic lane uses that count to decide whether its next
-/// launch is the one the trial reverts on.
+/// The first half of [`send_warranted_handoff_failure`]: the completion itself, `false`
+/// when the event loop is gone. Split out so a reject path can give back the counted trial
+/// launch before the disk facts read the sentinel's count.
 #[cfg(unix)]
 fn publish_warranted_handoff_failure(
     warrant: HandoffRollbackWarrant,
@@ -2327,9 +2022,7 @@ fn worker_reject_and_reap_handoff_child(
         "the worker must retain its unique reaper ownership"
     );
     if outcome == crate::UpdateHandoffOutcome::ChildDied {
-        // Log the evidence: the completion detail is short, so the log records
-        // which `ChildDied` case this was, and when it is `Unobserved`, that the
-        // cause is unknown.
+        // The completion's detail is short; the log says which death this was.
         aterm_log::warn!(
             "update apply: candidate {} died before proving adoption; observed {child_death:?} \
              (this decides whether the automatic lane retries these bytes or converges on them)",
@@ -2374,22 +2067,10 @@ fn forgive_candidate_trial_launch(job: &HandoffWorkerJob, candidate: HandoffCand
     let _ = aterm_update::forgive_trial_launch_of(job.target_build, candidate.pid, started);
 }
 
-/// Kills the candidate, proves it terminated, and says what killed it: the reject
-/// path's evidence gathering, in one place so a test can drive it against a real
-/// process.
-///
-/// The order is the protocol:
-///
-///  1. Before any signal, ask what is known: [`probe_handoff_candidate`]'s
-///     `waitid(WNOWAIT)` on the fork lane, the [`CandidateExitWatch`] on the
-///     launched lane. Anything here is the candidate's own death.
-///  2. The kill and the termination proof, which license the readers to resume.
-///  3. Once it is provably gone, ask again: the status `wait` collected, or the
-///     kqueue knote (guaranteed queued once termination is proven).
-///     [`handoff_child_death`] decides which parts of that answer are attributable.
-///
-/// Only [`crate::UpdateHandoffOutcome::ChildDied`] has the candidate's own death
-/// to describe; for every other outcome the status is our SIGKILL.
+/// Kills the candidate, proves it terminated, and says what killed it, in protocol order:
+/// ask what is known before any signal (anything then is its own death), kill and prove
+/// termination, then ask again; [`handoff_child_death`] decides what is attributable. Only
+/// [`crate::UpdateHandoffOutcome::ChildDied`] has the candidate's own death to describe.
 #[cfg(unix)]
 fn observe_candidate_death(
     outcome: crate::UpdateHandoffOutcome,
@@ -2405,10 +2086,9 @@ fn observe_candidate_death(
         || libc::pid_t::try_from(candidate.pid)
             .is_ok_and(|pid| probe_handoff_candidate(pid) == HandoffCandidateProbe::Exited);
     let reaped = kill_and_reap_handoff_child(candidate, handle);
-    // FIRST ANSWER WINS, in the order they were asked: the pre-kill witness is the
-    // only one that needs no attribution argument at all, `wait` is this process's
-    // own authority over its own child, and the post-termination knote is the
-    // launched lane's last resort.
+    // First answer wins, in the order they were asked: the pre-kill witness needs no
+    // attribution argument at all, `wait` is this process's own authority over its own
+    // child, and the post-termination knote is the launched lane's last resort.
     let status = witnessed_before_the_kill
         .or(reaped.status)
         .or_else(|| handle.witnessed_exit_status());
@@ -2418,22 +2098,13 @@ fn observe_candidate_death(
     )
 }
 
-/// Whether the reject path gives back the boot-trial launch this candidate
-/// counted. The launch stays counted only when the new bytes answer for the death;
-/// every other answer, including "unknown", gives it back.
-///
-/// One predicate keeps the retry budget and the boot sentinel from drifting apart:
-/// otherwise retries of a healthy candidate would stay counted until
-/// `check_boot_health` reverts the bundle and marks the build failed. It decides on
-/// the evidence's shape, not the outcome: a starved candidate produces proof EOF
-/// as readily as a faulting one. A candidate this process ended carries
-/// [`crate::ChildDeathEvidence::Unobserved`], so `TimedOut` and `ActivityRevoked`
-/// retries are forgiven.
-///
-/// Forgiving is cheap (`aterm_update::forgive_trial_launch_of` returns only the
-/// candidate's own launch, once), and a successor that truly cannot boot still
-/// counts its launches on ordinary relaunches. The real-apply guard lives here
-/// too, so the whole decision is testable.
+/// Whether the reject path gives back the boot-trial launch this candidate counted: kept
+/// only when the new bytes answer for the death, by the evidence's shape, not the outcome
+/// (a starved candidate produces proof EOF as readily as a faulting one). One predicate
+/// keeps the retry budget and the boot sentinel from drifting apart, or retries of a
+/// healthy candidate would stay counted until `check_boot_health` reverts it. Forgiving is
+/// cheap: it returns only this candidate's launch, once, and a successor that truly cannot
+/// boot still counts its ordinary relaunches.
 #[cfg(unix)]
 #[must_use]
 fn forgives_the_counted_trial_launch(
@@ -2447,17 +2118,10 @@ fn forgives_the_counted_trial_launch(
             != crate::app_native::PhysicalFailureShape::Structural
 }
 
-/// Turns one `wait(2)` status into evidence, or refuses to.
-///
-/// This process only ever sends `SIGKILL` (`signal_handoff_candidate`), so:
-///
-///   * An exit code cannot be ours: the candidate reached `exit`, which a starved
-///     process never does. The commonest refusal (`main_entry` returning without a
-///     window, exit code `0`) is read unconditionally.
-///   * A signal other than `SIGKILL` (`SIGSEGV`, `SIGBUS`, `SIGABRT`, ...) cannot
-///     be ours either.
-///   * A bare `SIGKILL` is ambiguous. With `died_before_we_signalled` it is the
-///     machine's (macOS jetsam); without it nothing is claimed.
+/// Turns one `wait(2)` status into evidence, or refuses to. This process only ever sends
+/// `SIGKILL`, so an exit code or any other signal is the candidate's own; a bare `SIGKILL`
+/// is the machine's (macOS jetsam) only with `died_before_we_signalled`, else nothing is
+/// claimed.
 #[cfg(unix)]
 #[must_use]
 fn handoff_child_death(
@@ -2515,8 +2179,8 @@ fn handoff_preparation_cancelled(
     true
 }
 
-/// A cancel during PREPARATION: it precedes the spawn, so there is no
-/// candidate to prove anything about (warrant `NoCandidate`).
+/// A cancel during preparation: it precedes the spawn, so there is no candidate to prove
+/// anything about (warrant `NoCandidate`).
 #[cfg(unix)]
 fn send_preparation_cancelled(
     job: &HandoffWorkerJob,
@@ -2532,20 +2196,16 @@ fn send_preparation_cancelled(
             job.attempt_id,
             nonce,
             None,
-            // Typed activity classification: a cancel poke during preparation
-            // is user/structural activity, never evidence against the staged
-            // artifact — automatic mode may re-attempt at a later quiet window.
+            // A cancel is activity, never evidence against the artifact.
             crate::UpdateHandoffOutcome::ActivityRevoked,
             "activity revoked handoff during physical preparation",
         ),
     );
 }
 
-/// This process could not prepare the handoff (a write, a descriptor, a `spawn`,
-/// the event loop or attempt record gone, no private directory). Raised before any
-/// candidate held a master (warrant `NoCandidate`) and filed `ProducerFailed`
-/// (Transient), since none of it is about the candidate's bytes.
-/// [`send_handoff_preparation_failure`] is for the pre-park verification failure.
+/// This process could not prepare the handoff: raised before any candidate held a master
+/// (warrant `NoCandidate`) and filed `ProducerFailed`, since none of it is about the
+/// candidate's bytes.
 #[cfg(unix)]
 fn send_handoff_producer_failure(
     job: &HandoffWorkerJob,
@@ -2588,17 +2248,11 @@ fn send_handoff_preparation_failure(
     );
 }
 
-/// The outcome a refused pre-park verification is filed under, read off the
-/// verifier's own words.
-///
-/// `PreparationFailed` (Structural) is a verdict on the candidate: codesign
-/// refused, the sealed identity does not rebind, the installed bundle cannot be
-/// the rollback source. A refusal without a verdict (apply budget exhausted, apply
-/// lock held past its wait, a helper that would not start;
-/// [`aterm_update::is_passing_refusal`]) is `ProducerFailed` (Transient) — except
-/// the stage's wait for an update check to confirm its signer
-/// ([`aterm_update::is_roster_confirmation_wait`]), which no attempt can end and
-/// is `StageUnconfirmed`, no failure at all (round eight, #503's review).
+/// The outcome a refused pre-park verification is filed under, read off the verifier's own
+/// words: `PreparationFailed` (Structural) for a verdict on the candidate, `ProducerFailed`
+/// (Transient) for a refusal without one ([`aterm_update::is_passing_refusal`]), and
+/// `StageUnconfirmed`, no failure at all, for the stage's wait for an update check to
+/// confirm its signer ([`aterm_update::is_roster_confirmation_wait`]).
 #[cfg(unix)]
 #[must_use]
 pub(crate) fn pre_park_refusal_outcome(error: &str) -> crate::UpdateHandoffOutcome {
@@ -2611,19 +2265,12 @@ pub(crate) fn pre_park_refusal_outcome(error: &str) -> crate::UpdateHandoffOutco
     }
 }
 
-/// The operator-apply-floor refusal a worker owes when a fresh cached pass let
-/// it skip the full pre-verification (round six of the update audit, item 26,
-/// review round two). The full check reads the floor itself; the cached pass
-/// was taken at arm time and nothing drops it when a later check raises the
-/// floor, so without this a yank inside the freshness window parked every
-/// reader for a successor whose gate 4b then retired the stage. The same for the
-/// stage itself (round eight, #36): a check that observes a revocation retires
-/// it inside the freshness window, so a staged candidate is asked under the
-/// commit the pass was cached for whether it is still the published stage; an
-/// activation has no stage and is asked the floor alone. `None` when the
-/// worker verifies anyway, and for the same-image QA seam (no artifact, so no
-/// publisher and nothing to yank). `floor` is
-/// [`aterm_update::handoff_cached_pass_refusal`], injected for the tests.
+/// The refusal a worker owes when a fresh cached pass let it skip the full
+/// pre-verification: the cache cannot vouch for an operator apply floor raised, or a stage
+/// revoked, since it was taken, so a staged candidate is asked both under the commit the
+/// pass was cached for, and an activation the floor alone. `None` when the worker verifies
+/// anyway, and for the same-image QA seam. `floor` is
+/// [`aterm_update::handoff_cached_pass_refusal`].
 #[cfg(unix)]
 fn skipped_verification_floor_refusal(
     job: &HandoffWorkerJob,
@@ -2676,17 +2323,11 @@ fn verify_candidate_for_handoff(
     }
 }
 
-/// THE WORKER'S FIRST REAL ACTION (seamless seam 1), with its two readers
-/// injected so a test drives the decision the worker ships (round seven, item
-/// 106): `verify` is [`verify_candidate_for_handoff`], `floor`
-/// [`aterm_update::handoff_cached_pass_refusal`].
-///
-/// The `codesign --deep` + bundle-flock check runs here, off the UI thread, so a
-/// doomed candidate is refused before any manifest is written or child spawned.
-/// Additive: the child re-runs the complete gate under the apply lock at swap
-/// time. Refusals are filed by [`pre_park_refusal_outcome`]; a worker that skips
-/// the check on a fresh cached pass still asks the floor
-/// ([`skipped_verification_floor_refusal`]).
+/// The worker's first real action, with its readers injected so a test drives the shipped
+/// decision: the full verification (`verify`: codesign and sealed rebinding, under the apply
+/// lock) off the UI thread, so a doomed candidate is refused before anything is written or
+/// spawned; or, after a fresh cached pass, the floor alone (`floor`,
+/// [`skipped_verification_floor_refusal`]).
 #[cfg(unix)]
 fn worker_pre_park_check(
     job: &mut HandoffWorkerJob,
@@ -2715,9 +2356,9 @@ fn worker_pre_park_check(
                 return Err(refused(error));
             }
         };
-        // The candidate passed, so the policy it carries was read (plan P0-5).
-        // Published before the launch: the launched lane's park reads it on the
-        // main thread once the successor has dialled.
+        // The candidate passed, so the policy it carries was read. Published before the
+        // launch: the launched lane's park reads it on the main thread once the successor
+        // has dialled.
         job.successor_grant_chunks = facts.grant_chunks;
         let adopted = job.preverified.as_ref().and_then(|publisher| {
             publisher.publish_pass(
@@ -2730,53 +2371,30 @@ fn worker_pre_park_check(
             return Err(PreParkRefusal::Policy(refusal));
         }
     } else if let Some(error) = skipped_verification_floor_refusal(job, floor) {
-        // A FRESH CACHED PASS LET THIS WORKER SKIP THE FULL CHECK, and the floor
-        // and the stage are the facts the cache cannot vouch for: the floor
-        // ratchets on observation and may have risen since the pass was cached
-        // (round six, item 26, review round two), and a check that observes a
-        // revocation retires the stage (round eight, #36). The same refusal, and
-        // the same outcome, the full check gives.
+        // A fresh cached pass skipped the full check; the floor and the stage are what the
+        // cache cannot vouch for, refused as the full check would refuse them.
         return Err(refused(error));
     }
     Ok(())
 }
 
-/// THE COLD LANE'S TABLE AT ITS `exec`, which replaces this process: every
-/// descriptor above stdio marked close-on-exec, then the harness's lifeline made
-/// inheritable — the guard, dropped when the `exec` returns, flags it again.
-///
-/// The successor is this app, living on as the window, and an `exec` keeps
-/// every descriptor without close-on-exec: Metal's shader-cache files, a fabric
-/// bridge lane caught between its `socketpair` and its `F_SETFD` (2026-09-30
-/// review). Marking the LIVE table is safe here: every descriptor this process
-/// means to hand a child is close-on-exec until the child's own hook (or this
-/// function) clears it, so a failed `exec` carries on with nothing lost.
+/// The cold lane's table at its `exec`: every descriptor above stdio marked close-on-exec,
+/// so nothing stray rides into the successor, then the harness's lifeline made inheritable
+/// (the guard flags it again if the `exec` returns). Safe on the live table: a descriptor
+/// meant for a child is close-on-exec until its hook clears it.
 #[cfg(unix)]
 fn cold_exec_hand_over() -> Option<crate::lifeline::InheritedAcrossExec> {
     aterm_uds::spawnfd::InheritStrip::prepare().apply();
     crate::lifeline::inherit_across_exec()
 }
 
-/// THE FORK LANE'S CHILD, between its fork and its `exec`: its own process
-/// group, then a table holding what it is `handed` and NOTHING ELSE above stdio.
-///
-/// * The group: the candidate and every helper it later launches inherit a
-///   dedicated process group; adopted shell PTYs/process groups are unrelated.
-///   STRICTLY STRONGER than the successor-side `contain_own_process_group`
-///   that covers the launch shape with no pre-exec hook, and the reason this
-///   stays here rather than being replaced by it: this runs between fork and
-///   exec, so the group exists before the candidate's image does — no ordering
-///   argument about "the first thing that can fork a helper" is needed, and the
-///   failure aborts the spawn instead of having to be handled by a process that
-///   is already running. Keep both.
-/// * The strip (2026-09-30 review): the fork copied every descriptor this
-///   process holds, and the ones without close-on-exec — Metal's shader-cache
-///   files, a fabric bridge lane caught between its `socketpair` and its
-///   `F_SETFD` — rode the `exec` into the successor, which lives on as the
-///   window. So the whole table is marked close-on-exec first
-///   ([`aterm_uds::spawnfd::InheritStrip`]), and only then is the flag cleared
-///   on exactly the `handed` descriptors (parent descriptors remain CLOEXEC for
-///   the whole asynchronous interval; only the child's copies change).
+/// The fork lane's child, between its fork and its `exec`: its own process group (before
+/// the candidate's image exists, which the successor-side `contain_own_process_group`
+/// cannot promise; keep both), then the whole table marked close-on-exec
+/// ([`aterm_uds::spawnfd::InheritStrip`]) with the flag cleared on exactly the `handed`
+/// descriptors, so nothing the fork copied without close-on-exec (a shader-cache file, a
+/// bridge socket before its `F_SETFD`) rides into the successor. Only the child's copies
+/// change.
 ///
 /// # Safety
 /// Only in a forked child, before its `exec`: it makes only async-signal-safe
@@ -2803,8 +2421,6 @@ unsafe fn fork_lane_child_holds(
 }
 
 #[cfg(unix)]
-// The worker's muts serve the macOS handoff arms; on other platforms those arms
-// are configured out and the bindings are read-only.
 fn run_handoff_worker(mut job: HandoffWorkerJob, proxy: winit::event_loop::EventLoopProxy<Wake>) {
     use std::os::fd::AsRawFd as _;
     use std::os::unix::process::CommandExt as _;
@@ -2834,13 +2450,11 @@ fn run_handoff_worker(mut job: HandoffWorkerJob, proxy: winit::event_loop::Event
         return;
     }
 
-    // The lanes split here, before anything is written. The launched lane has no
-    // capture yet: this worker launches the successor, holds its rendezvous claim
-    // and asks the main thread to park only once the successor has dialled, so
-    // the swap, re-exec and boot check happen while the terminal still echoes. It
-    // finishes the attempt itself; only a refusal before anything was launched
-    // (no bundle, no rendezvous, LaunchServices) hands it back to be forked, and
-    // it rejoins here with the main thread's capture, where the fork lane starts.
+    // The lanes split here, before anything is written. The launched lane launches and
+    // holds the successor before asking the main thread to park, so the swap, re-exec and
+    // boot check run while the terminal still echoes. It finishes the attempt itself unless
+    // refused before anything launched; then it rejoins here with the main thread's
+    // capture, where the fork lane starts.
     let nonce;
     #[cfg(target_os = "macos")]
     {
@@ -2876,8 +2490,7 @@ fn run_handoff_worker(mut job: HandoffWorkerJob, proxy: winit::event_loop::Event
         nonce = crate::seamless::mint_outgoing_nonce();
     }
 
-    // The fork lane parks before it spawns, so nothing was prepared before the
-    // park: every artifact is written here, as it always was.
+    // The fork lane parks before it spawns, so every artifact is written here.
     let PreparedArtifacts {
         manifest_path: path,
         layout_path,
@@ -2906,35 +2519,35 @@ fn run_handoff_worker(mut job: HandoffWorkerJob, proxy: winit::event_loop::Event
             HandoffLane::Fork => "fd",
         };
         job.command
-            .env(crate::handoff_rendezvous::ENV_PROOF_TERM, proof_term);
-        // THE LAUNCHER'S SOFT DESCRIPTOR LIMIT, when a claim or a park raised
-        // this process's own (round seven, item 107): the forked child inherits
-        // the raised limit and never claims, so without this its shells would
-        // get the raise back instead of the launcher's.
+            .envs([crate::handoff_rendezvous::ENV_PROOF_TERM.pair(proof_term)]);
+        // The launcher's soft descriptor limit, when a claim or a park raised this
+        // process's own: the forked child inherits the raised limit and never claims, so
+        // without this its shells would get the raise instead of the launcher's.
         crate::handoff_rendezvous::carry_launcher_limit(&mut job.command);
     }
-    job.command
-        .env("ATERM_SEAMLESS_MANIFEST", path)
-        .env("ATERM_SEAMLESS_NONCE", &nonce)
-        .env("ATERM_SEAMLESS_FDS", wire)
-        .env("ATERM_SEAMLESS_LAYOUT", layout_path)
+    job.command.envs([
+        crate::seamless::ENV_MANIFEST.pair(path),
+        crate::seamless::ENV_NONCE.pair(&nonce),
+        crate::seamless::ENV_FDS.pair(wire),
+        crate::seamless::ENV_LAYOUT.pair(layout_path),
         // The candidate proves it is the authorized build by comparison and logs
         // which half disagreed. Forging this can only lose a handoff; the parent
         // compares against its own ticket.
-        .env(
-            "ATERM_SEAMLESS_TARGET",
-            crate::seamless::encode_target_identity(job.target_build, &job.target_commit),
-        )
-        .env("ATERM_HANDOFF_READY_FD", proof_wr.as_raw_fd().to_string())
-        .env("ATERM_HANDOFF_COMMIT_FD", commit_rd.as_raw_fd().to_string());
+        crate::seamless::ENV_TARGET.pair(crate::seamless::encode_target_identity(
+            job.target_build,
+            &job.target_commit,
+        )),
+        crate::seamless::ENV_READY_FD.pair(proof_wr.as_raw_fd().to_string()),
+        crate::seamless::ENV_COMMIT_FD.pair(commit_rd.as_raw_fd().to_string()),
+    ]);
     // Parental authority: our pid and its kernel birth record, which lets the
     // successor watch us without being our fork child (`seamless::AttestedParent`,
     // encoded beside its decoder).
     for (key, value) in crate::seamless::outgoing_parent_env() {
         job.command.env(key, value);
     }
-    // Parent descriptors remain CLOEXEC for the WHOLE asynchronous interval.
-    // Clear only the fork child's copies immediately before its exec image.
+    // Parent descriptors remain CLOEXEC for the whole asynchronous interval. Clear only
+    // the fork child's copies immediately before its exec image.
     let mut child_inherit = job
         .capture()
         .live
@@ -2945,9 +2558,8 @@ fn run_handoff_worker(mut job: HandoffWorkerJob, proxy: winit::event_loop::Event
     child_inherit.push(commit_rd.as_raw_fd());
     #[cfg(target_os = "macos")]
     let handed = child_inherit.clone();
-    // AND NOTHING ELSE (2026-09-30 review): `fork_lane_child_holds` strips the
-    // child's table before it hands it these. The strip's bound is read here,
-    // before the fork.
+    // `fork_lane_child_holds` strips the child's table before it hands it these; the
+    // strip's bound is read here, before the fork.
     let strip = aterm_uds::spawnfd::InheritStrip::prepare();
     // SAFETY: the closure runs between fork and exec, and
     // `fork_lane_child_holds` makes only async-signal-safe calls (`setpgid`,
@@ -2956,11 +2568,10 @@ fn run_handoff_worker(mut job: HandoffWorkerJob, proxy: winit::event_loop::Event
         job.command
             .pre_exec(move || fork_lane_child_holds(strip, &child_inherit));
     }
-    // AN OLDER TARGET STARTS AT THE LIMIT THIS PROCESS HELD BEFORE A PARK'S
-    // RAISE (round eight's second review of #3): the raise an earlier attempt
-    // made is never lowered here, and a successor built before 06b06e74e
-    // would hand its shells whatever it inherits. Registered after the hook
-    // above, so the child's last look at its table sees what it is handed.
+    // An older target starts at the limit this process held before a park's raise: an
+    // earlier attempt's raise is never lowered here, and an older successor hands its
+    // shells whatever it inherits. Registered after the hook above, so the child's last
+    // look at its table sees what it is handed.
     #[cfg(target_os = "macos")]
     crate::handoff_rendezvous::start_older_image_at_its_limit(
         &mut job.command,
@@ -2971,22 +2582,12 @@ fn run_handoff_worker(mut job: HandoffWorkerJob, proxy: winit::event_loop::Event
     if handoff_preparation_cancelled(&job, &proxy, Some(nonce.clone())) {
         return;
     }
-    // The fork lane. `spawn` makes the successor our fork child; on macOS, once
-    // `seamless::commit_and_exit` exits, launchd tears down this app instance's
-    // application job and the successor keeps a bootstrap (XPC) context of a dead
-    // job, so `hdiutil` (ENXIO), notifications and LaunchServices opens fail in it
-    // (`tests/handoff_launchd_job.rs`). The `HandoffLane::OutOfBand` lane avoids
-    // that: launchd gives the successor its own job, with parent attestation
-    // (`seamless::AttestedParent`), reap authority (`HandoffRollbackWarrant`),
-    // self-containment (`contain_own_process_group`) and transport
-    // (`handoff_rendezvous`).
-    //
-    // Forking remains the only lane when `out_of_band_lane_refusal` names a
-    // reason: no `.app` bundle, a `$HOME` pushing the rendezvous past `sun_path`,
-    // more panes than the grant carries, or an older target build. Both lanes
-    // rejoin at `run_handoff_decision`. Here `pre_exec` sets the process group
-    // before `spawn` returns, so `kill(-pid)` is valid immediately;
-    // `signal_handoff_candidate` covers the launched lane's case.
+    // The fork lane. On macOS a forked successor keeps the bootstrap context of this app's
+    // launchd job, which dies with this process, so `hdiutil`, notifications and
+    // LaunchServices opens fail in it (`tests/handoff_launchd_job.rs`); the out-of-band
+    // lane avoids that, and forking remains for the cases `out_of_band_lane_refusal`
+    // names. `pre_exec` sets the process group before `spawn` returns, so `kill(-pid)` is
+    // valid at once.
     let child = match job.command.spawn() {
         Ok(child) => child,
         Err(error) => {
@@ -3042,8 +2643,7 @@ struct PreparedArtifacts {
     layout_path: std::path::PathBuf,
     fds_wire: String,
     expected: crate::seamless::AdoptionProof,
-    /// The two private pipes before either end is given away. The successor writes
-    /// the proof and reads the Commit; a swapped pair deadlocks like a slow
+    /// The attempt's two pipes, as [`AttemptPipes`]: a swapped pair deadlocks like a slow
     /// successor.
     proof_rd: std::os::fd::OwnedFd,
     proof_wr: std::os::fd::OwnedFd,
@@ -3111,11 +2711,10 @@ enum PreparationFailure {
     /// `std::io::ErrorKind` when there is one. Filed `ProducerFailed` (Transient),
     /// never `PreparationFailed`, since it is not about the candidate.
     Producer(String),
-    /// The desk's own content refused the write deterministically: the manifest is
-    /// over its cap with every optional part shed
-    /// ([`crate::seamless::WriteOutgoingFailure::ManifestOverCap`]). Filed
-    /// `CaptureRefused`, retried once the desk changes, not `ProducerFailed`, whose
-    /// retries would freeze every reader again for the same answer.
+    /// The desk's own content refused the write deterministically
+    /// ([`crate::seamless::WriteOutgoingFailure::ManifestOverCap`]): filed `CaptureRefused`,
+    /// retried once the desk changes, never `ProducerFailed`, whose retries would freeze
+    /// every reader again for the same answer.
     Refused(String),
 }
 
@@ -3139,17 +2738,11 @@ fn preparation_failure_of_write(
     }
 }
 
-/// Every artifact one attempt publishes, in the order the successor consumes
-/// them: the layout round-trip, the control carry's export, the authenticated
-/// manifest and its grid sidecars under `nonce`, the layout sidecar, the adoption
-/// proof and the two private pipes. Shared by both lanes so the successor's bytes
-/// cannot depend on how it was started.
-///
-/// Runs after the park on both lanes; nothing here touches a master. `early` is
-/// what the launched lane prepared before the park: its pipes are used as they
-/// are, and its layout sidecar is kept only when it reads back byte-equal to the
-/// park's layout (`handoff_diet`). The manifest, screen sidecars and adoption
-/// proof are written here on both lanes.
+/// Every artifact one attempt publishes, in the order the successor consumes them, shared
+/// by both lanes so the successor's bytes cannot depend on how it was started. Runs after
+/// the park and touches no master. `early` is what the launched lane prepared before the
+/// park: its pipes are used as they are, and its layout sidecar kept only when byte-equal
+/// to the park's layout.
 #[cfg(unix)]
 fn prepare_outgoing_artifacts(
     job: &mut HandoffWorkerJob,
@@ -3184,21 +2777,11 @@ fn prepare_outgoing_artifacts(
     if job.cancel.try_recv().is_ok() {
         return Err(PreparationFailure::Cancelled);
     }
-    // THE CONTROL CARRY'S EXPORT (round 10), HERE on the worker and not in the
-    // freeze: every reader is still parked (until Commit or rollback), so no
-    // engine moves, and cloning up to 1 MiB of archive rows per session costs
-    // the frozen terminal nothing. What the freeze took is the fence; a
-    // session whose archive moved since, or whose lock another thread keeps,
-    // carries its counters alone. The turn-id count rides the manifest itself,
-    // so a ledger that could not be carried cannot lower it — with a reserve
-    // for the turns this process still serves until its `_exit`, so the
-    // successor never mints an id this one already replied with (round
-    // seven, finding 22; the Commit checks the reserve held). The export
-    // takes the same ceiling: a turn open here can record under any id up
-    // to it, which no carried ledger may vouch for (round eight, finding 40).
-    // Each record is spelled in the words the target reads: a build from
-    // before `hangup` leaves out a record whose status it does not know
-    // (round eight, finding 714).
+    // The control carry's export runs on the worker, not in the freeze: every reader is
+    // still parked, so no engine moves. The turn-id count rides the manifest with a
+    // reserve for the turns this process still serves until its `_exit` (the Commit checks
+    // it held), so the successor never mints an id this one already replied with; the
+    // export takes the same ceiling. Records are spelled in the words the target reads.
     let turn_id_ceiling = crate::control::turn_ids_for_handoff();
     let controls = crate::handoff_carry::export_for(
         &capture.carries,
@@ -3208,17 +2791,12 @@ fn prepare_outgoing_artifacts(
     capture.manifest.next_turn_id = crate::handoff_carry::manifest_turn_id(turn_id_ceiling);
     // The ceiling rides this attempt, which the Commit reads it from.
     job.arbiter.set_turn_id_ceiling(turn_id_ceiling);
-    // The history carry's join (`crate::handoff_history`): a session whose export
-    // still describes its history and meets its checkpoint's lines names its
-    // sidecar on its record; the others keep the checkpoint's bounded history and
-    // count the lines that do not cross. Cannot fail the attempt. Runs after the
-    // control carry's export so the fork lane's history export does not contend
-    // for the same locks.
-    // The held panes' exports go to their own carry (round eight, finding 39),
-    // joined where their screens are written, with why a pane with none has
-    // none: a successor older than this build takes a held pane's screen alone,
-    // a policy that carries no scrollback withheld it, and anything else is a
-    // carry that failed — each said as what it was.
+    // The history carry's join (`crate::handoff_history`): a session whose export meets
+    // its checkpoint names its sidecar; the others keep the checkpoint's bounded history
+    // and count the lines that do not cross. Never fails the attempt. Runs after the
+    // control carry's export so the fork lane's history export does not contend for the
+    // same locks. The held panes' exports go to their own carry, with the reason a pane has
+    // none.
     let mut held_history = crate::handoff_history::HeldExports::default();
     if let Some(dir) = crate::control_auth::socket_dir() {
         let mut results = std::mem::replace(
@@ -3270,9 +2848,8 @@ fn prepare_outgoing_artifacts(
         screen_digest: carried_screen_digest,
         connections_left_out,
     } = outgoing;
-    // What the manifest left out rides this attempt to its Commit, which audits
-    // it (round eight of the update audit, U23's review): an attempt that stands
-    // down dissolves none of it.
+    // What the manifest left out rides this attempt to its Commit, which audits it; an
+    // attempt that stands down dissolves none of it.
     job.arbiter.set_connections_left_out(connections_left_out);
     // The launch environment named this path from the same nonce before the
     // writer ran, so they must agree.
@@ -3435,14 +3012,8 @@ struct HeldSuccessor {
     dialled_at: std::time::Instant,
 }
 
-/// One step of a pre-grant stand-down, recorded as taken so the order can be
-/// projected onto the derived overlap model.
-///
-/// The model's ungranted lane is `UnparkForRepark?` -> `RevokeUngrantedSuccessor`
-/// -> (`SuccessorExitsOnRevoke` | `KillUngrantedSuccessor`) ->
-/// `ReapUngrantedSuccessor` -> `RetireUngrantedAttempt`;
-/// `UngrantedRetireRequiresReap` forbids clearing an attempt whose successor is
-/// alive. Tests replay what the code emitted.
+/// One step of a pre-grant stand-down, recorded so tests can replay the order against the
+/// derived overlap model (`UngrantedRetireRequiresReap`).
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StandDownStep {
@@ -3485,17 +3056,11 @@ struct StoodDownSuccessor {
 
 #[cfg(target_os = "macos")]
 impl StoodDownSuccessor {
-    /// Whether this process gives back the boot-trial launch the stood-down
-    /// successor counted, decided by the death's evidence through
-    /// [`forgives_the_counted_trial_launch`], as after the grant and before the
-    /// dial ([`send_pre_dial_death`]).
-    ///
-    /// Not whether we signalled it: a held successor the machine SIGKILLed never
-    /// ran its own EOF-rule exit, so nobody else gives its launch back. Exactly one
-    /// party gives it back: the EOF-rule exit is witnessed as `Exited { code: 0 }`
-    /// (`Structural`), so this answers `false`; where the witness cannot tell (lost,
-    /// or our kill racing that exit) it answers `true`, and a second give-back is a
-    /// no-op ([`aterm_update::forgive_trial_launch_of`]).
+    /// Whether this process gives back the stood-down successor's counted trial launch,
+    /// decided by the death's evidence ([`forgives_the_counted_trial_launch`]), not by
+    /// whether we signalled it. Exactly one party gives it back: its own EOF-rule exit is
+    /// witnessed as `Exited { code: 0 }` and answers `false`; where the witness cannot
+    /// tell, a second give-back is a no-op.
     #[must_use]
     fn forgives_the_counted_trial_launch(&self, current_build: u64, target_build: u64) -> bool {
         forgives_the_counted_trial_launch(self.death, current_build, target_build)
@@ -3522,12 +3087,8 @@ const STAND_DOWN_ACK_BUDGET: std::time::Duration = std::time::Duration::from_mil
 #[cfg(target_os = "macos")]
 const PRELAUNCH_HOLD_BOUND: std::time::Duration = std::time::Duration::from_secs(4 * 60);
 
-/// Stands a held successor down and proves it gone: close the rendezvous (EOF),
-/// wait the grace for its own exit, then kill and prove termination.
-///
-/// The order is the model's: `RevokeUngrantedSuccessor` precedes
-/// `KillUngrantedSuccessor` precedes `ReapUngrantedSuccessor`, and only a reaped
-/// attempt may retire (`UngrantedRetireRequiresReap`).
+/// Stands a held successor down and proves it gone: close the rendezvous (EOF), wait the
+/// grace for its own exit, then kill and prove termination, in the model's order.
 #[cfg(target_os = "macos")]
 fn stand_down_held_successor(
     held: HeldSuccessor,
@@ -3587,12 +3148,9 @@ fn stand_down_held_successor_between(
         steps.push(StandDownStep::SuccessorExited);
         let warrant = wait_for_handoff_candidate_to_terminate(candidate);
         steps.push(StandDownStep::Reap);
-        // After the proof, ask again: a candidate that exits and is reaped between
-        // the witness read and the pid probe leaves the loop with the witness
-        // unread. XNU queues the knote in `proc_exit` before the pid can fall
-        // vacant, and `kill(pid, 0)` answers a zombie as alive, so this read finds
-        // it. `the_exit_between_the_witness_read_and_the_pid_probe_is_still_witnessed`
-        // forces the window.
+        // Ask again after the proof: an exit between the witness read and the pid probe left
+        // the witness unread, and XNU queues the knote in `proc_exit` before the pid falls
+        // vacant, so this read finds it.
         let witnessed = witnessed.or_else(|| {
             exit_watch
                 .as_ref()
@@ -3622,20 +3180,12 @@ fn stand_down_held_successor_between(
     }
 }
 
-/// Retires a held, ungranted successor: stand it down, prove it gone, then publish
-/// the completion that clears the attempt. The sibling of
-/// [`worker_reject_and_reap_handoff_child`] for a live candidate holding nothing.
-///
-/// The main thread goes first. This thread cannot know whether the readers are
-/// parked (the park gate re-runs every 20 ms while the successor holds), so
-/// `Wake::UpdateHandoffStandingDown` is sent unconditionally and awaited. Its
-/// handler runs on the main thread beside the park gate: it closes the gate
-/// (`stood_down`) and resumes any parked readers (`UnparkForRepark`). Only then
-/// does this thread revoke, making Unpark -> Revoke -> Kill -> Reap -> Retire real.
-///
-/// The wait is bounded by [`STAND_DOWN_ACK_BUDGET`] and fails open: a candidate
-/// never killed is worse than a late unpark. The attempt record outlives it all,
-/// so no retry launches beside the candidate.
+/// Retires a held, ungranted successor: stand it down, prove it gone, publish the
+/// completion. The main thread goes first: it is told (`Wake::UpdateHandoffStandingDown`)
+/// unconditionally, since this thread cannot know whether the readers are parked, closes
+/// the park gate and resumes any parked readers, and only then does this thread revoke.
+/// The wait is bounded by [`STAND_DOWN_ACK_BUDGET`] and fails open, since a candidate never
+/// killed is worse than a late unpark.
 #[cfg(target_os = "macos")]
 fn retire_ungranted_successor(
     job: &HandoffWorkerJob,
@@ -3674,8 +3224,7 @@ fn retire_ungranted_successor(
         completed,
         "the worker must retain its unique reaper ownership"
     );
-    // Log the steps taken; each is a derived-model action
-    // (`StandDownStep::model_action`) that the tests replay against the model.
+    // Each step is a derived-model action (`StandDownStep::model_action`).
     aterm_log::info!(
         "update apply: stood the held successor (pid {}) down after holding its claim {} ms — \
          {detail}; steps {:?} ({})",
@@ -3712,8 +3261,8 @@ fn retire_ungranted_successor(
     }
 }
 
-/// The boundaries of the parent's park->transfer interval on the launched lane
-/// (warm successor P0), in the order the attempt crosses them.
+/// The boundaries of the parent's park->transfer interval on the launched lane, in the order
+/// the attempt crosses them.
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug)]
 struct ParkTransferSplit {
@@ -3762,11 +3311,9 @@ enum HoldOutcome {
     },
 }
 
-/// The hold: wait, with every reader live, for the main thread's capture or for
-/// whatever ends the attempt first. Each slice is a bounded `recv_timeout` on the
-/// transfer channel followed by the cheap checks: a stand-down, the cancel poke,
-/// the dialer hanging up or exiting, LaunchServices contradicting the dialer's
-/// identity, and the hold bound.
+/// The hold: wait, with every reader live, for the main thread's capture or whatever ends
+/// the attempt first (a stand-down, the cancel, the dialer leaving, a LaunchServices
+/// contradiction, the hold bound).
 #[cfg(target_os = "macos")]
 fn hold_for_park(
     job: &HandoffWorkerJob,
@@ -3957,11 +3504,9 @@ fn fork_after_park(
     }
 }
 
-/// The launched lane's early artifacts: the attempt's two pipes and its layout
-/// sidecar, made before the park while the successor boots. `layout_path` is the
-/// sidecar's name (the launch environment's `ATERM_SEAMLESS_LAYOUT`) and `layout`
-/// the layout at launch. A step that refuses is left to the park; nothing here
-/// can fail the attempt.
+/// The launched lane's early artifacts, made before the park while the successor boots:
+/// the two pipes and the layout sidecar (`layout_path`) from the layout at launch. A step
+/// that refuses is left to the park.
 #[cfg(target_os = "macos")]
 fn prepare_early_artifacts(
     layout_path: &std::path::Path,
@@ -4006,22 +3551,14 @@ fn prepare_early_artifacts(
     EarlyArtifacts { pipes, layout }
 }
 
-/// The launched lane in late-park order: bind, launch, accept and hold the dial
-/// with every reader live; ask the main thread to park; then write the artifacts
-/// under the pre-minted nonce, grant on the held stream, and hand over to the
-/// fork lane's decision tail.
-///
-/// The listener is bound before the launch because the successor is told an
-/// existing name; the launch environment names the manifest and layout by path
-/// before they exist because the nonce is minted first; the dial is awaited with
-/// the terminal still echoing because it follows the successor's whole staged-swap
-/// boot apply; and the park happens at the dial, so only the capture, the write,
-/// one `sendmsg` and the successor's GUI boot remain under the freeze.
-///
-/// Before the transfer no descriptor has left the process, so every failure closes
-/// the rendezvous (EOF), lets the successor exit by its own rule, and kills and
-/// proves it gone otherwise before the attempt retires
-/// ([`retire_ungranted_successor`]).
+/// The launched lane in late-park order: bind, launch, accept and hold the dial with every
+/// reader live, so the successor's swap, re-exec and boot check cost no freeze; ask the
+/// main thread to park; then write the artifacts under the pre-minted nonce, grant on the
+/// held stream, and hand over to the shared decision tail. The listener is bound before
+/// the launch because the successor is told an existing name, and the nonce is minted
+/// first so the launch environment can name the manifest and layout before they exist.
+/// Before the grant no descriptor has left the process, so every failure stands the
+/// successor down ([`retire_ungranted_successor`]).
 #[cfg(target_os = "macos")]
 fn run_prelaunched_handoff(
     job: &mut HandoffWorkerJob,
@@ -4079,8 +3616,8 @@ fn run_prelaunched_handoff(
     // differs: no descriptor numbers (a launched process inherits none), and a
     // rendezvous plus its claim secret instead.
     let Some(mut environment) = launch_environment(&job.command) else {
-        // A merged launch cannot express a REMOVAL, and the fork lane can — this is
-        // the one refusal where forking is not merely acceptable but correct.
+        // A merged launch cannot express a removal and the fork lane can: the one
+        // refusal where forking is not merely acceptable but correct.
         drop(rendezvous);
         return fork_after_park(
             job,
@@ -4103,44 +3640,31 @@ fn run_prelaunched_handoff(
         return Prelaunched::Finished;
     };
     let layout_path = manifest_path.with_extension("layout.toml");
-    environment.push((
-        "ATERM_SEAMLESS_MANIFEST".into(),
-        manifest_path.into_os_string(),
-    ));
-    environment.push(("ATERM_SEAMLESS_NONCE".into(), lane.nonce.clone().into()));
-    environment.push((
-        "ATERM_SEAMLESS_LAYOUT".into(),
-        layout_path.clone().into_os_string(),
-    ));
-    environment.push((
-        "ATERM_SEAMLESS_TARGET".into(),
-        crate::seamless::encode_target_identity(job.target_build, &job.target_commit).into(),
-    ));
-    environment.push((
-        crate::handoff_rendezvous::ENV_RENDEZVOUS.into(),
-        rendezvous_path.into(),
-    ));
-    environment.push((
-        crate::handoff_rendezvous::ENV_CLAIM.into(),
-        rendezvous.claim().into(),
-    ));
+    environment.push(crate::seamless::ENV_MANIFEST.pair(manifest_path));
+    environment.push(crate::seamless::ENV_NONCE.pair(&lane.nonce));
+    environment.push(crate::seamless::ENV_LAYOUT.pair(&layout_path));
+    environment.push(
+        crate::seamless::ENV_TARGET.pair(crate::seamless::encode_target_identity(
+            job.target_build,
+            &job.target_commit,
+        )),
+    );
+    environment.push(crate::handoff_rendezvous::ENV_RENDEZVOUS.pair(rendezvous_path));
+    environment.push(crate::handoff_rendezvous::ENV_CLAIM.pair(rendezvous.claim()));
     // The chunked grant is offered only to a candidate that declared it in its
     // verified `Info.plist`; it claims `ATRZ2C`. Any other successor never sees the
     // variable and claims `ATRZ1C`.
     if job.successor_grant_chunks {
-        environment.push((
-            crate::handoff_rendezvous::ENV_GRANT_CAPS.into(),
-            crate::handoff_rendezvous::GRANT_CAPS_CHUNKS.into(),
-        ));
+        environment.push(
+            crate::handoff_rendezvous::ENV_GRANT_CAPS
+                .pair(crate::handoff_rendezvous::GRANT_CAPS_CHUNKS),
+        );
     }
     // The warm hint, read by the successor's warm prologue before it dials.
     // Advisory: an older successor ignores it, and none authenticates by it.
-    environment.push((
-        crate::handoff_warm_hint::ENV_WARM_HINT.into(),
-        lane.warm_hint.clone().into(),
-    ));
+    environment.push(crate::handoff_warm_hint::ENV_WARM_HINT.pair(&lane.warm_hint));
     for (key, value) in crate::seamless::outgoing_parent_env() {
-        environment.push((key.into(), value.into()));
+        environment.push((key, value));
     }
     let arguments = job
         .command
@@ -4153,13 +3677,8 @@ fn run_prelaunched_handoff(
     }
     let dial_deadline = handoff_ready_deadline();
     let launch_at = std::time::Instant::now();
-    // The launch is issued, not awaited: the successor dials after its boot apply,
-    // before LaunchServices answers (which needs the app to check in). The dial is
-    // the liveness signal and the claim secret the lock; the launch answer
-    // corroborates after the dial.
-    //
-    // A refusal means nothing was launched, so the fork lane can still carry this
-    // attempt. Dropping the rendezvous unlinks the node.
+    // The launch is issued, not awaited: the successor dials before LaunchServices
+    // answers. A refusal means nothing was launched, so the fork lane can still carry it.
     let in_flight = match crate::app_launch_successor::begin_launch(
         &bundle,
         &arguments,
@@ -4186,11 +3705,9 @@ fn run_prelaunched_handoff(
          awaiting its rendezvous dial from code that meets {}",
         dialer_code.describe()
     );
-    // Artifacts that do not depend on the park (`handoff_diet`) are made now, while
-    // the successor boots: the two pipes and the layout sidecar from the layout at
-    // launch, which the park keeps only when byte-equal to its own. Done before the
-    // accept on this thread, so a dial waits in the backlog and no failure path
-    // sweeps the attempt's files (by prefix) while a write is in flight.
+    // The pipes and the speculative layout sidecar are made while the successor boots
+    // (`handoff_diet`), before the accept, so no failure path sweeps the attempt's files
+    // while a write is in flight.
     let early = prepare_early_artifacts(&layout_path, lane.speculative_layout.take());
     // No expected pid at the gate: LaunchServices names the successor only when
     // it checks in, after its grant. The claim secret binds a dialer to this
@@ -4296,11 +3813,9 @@ fn run_prelaunched_handoff(
          its claim until the outgoing process parks",
         dialled_at.saturating_duration_since(launch_at).as_millis(),
     );
-    // Identity and witness first, before any arm that can end the attempt: an
-    // accepted dialer is a live process every exit from here must prove dead, or
-    // the automatic lane could launch a second successor beside it. The pid is the
-    // kernel's attestation plus its birth stamp, which survive pid reuse, and
-    // `EVFILT_PROC` attaches only to a process that exists, as it does now.
+    // Identity and witness first: every exit from here must prove the accepted dialer
+    // dead, or the automatic lane could launch a second successor beside it. The exit
+    // watch is registered now, since `EVFILT_PROC` attaches only to a process that exists.
     let candidate = HandoffCandidate::of_attested_peer(pid_for_completion(peer.pid()));
     // Registered at the dial, before any descriptor is granted, and held to the end:
     // until the Commit this process answers to the carried ids (`identity_claim`).
@@ -4321,14 +3836,11 @@ fn run_prelaunched_handoff(
         exit_watch,
         dialled_at,
     };
-    // Corroboration, not the lock: if LaunchServices has answered, its pid must be
-    // the dialer's (a mismatch is a stranger that knew the secret), and its word
-    // that the process it launched exited must not meet a live dialer. No answer
-    // yet is expected, so nothing waits here: the answer is polled beside the hold
-    // and the proof wait (`LaunchCorroboration`), and a late contradiction refuses
-    // before Commit. A refusal here proves the dialer gone; the pid LaunchServices
-    // names goes in the message only, so nothing acts on a process this parent
-    // never touched.
+    // Corroboration, not the lock: LaunchServices' answer, polled beside the hold and the
+    // proof wait (`LaunchCorroboration`), must name the dialer and must not say the process
+    // it launched exited while the dialer lives. A refusal here proves the dialer gone; the
+    // pid LaunchServices names goes in the message only, so nothing acts on a process this
+    // parent never touched.
     let mut corroboration = LaunchCorroboration::of_dialer(&in_flight, candidate);
     if let Err(detail) = corroboration.poll() {
         retire_ungranted_successor(
@@ -4447,8 +3959,8 @@ fn run_prelaunched_handoff(
         }
     };
     let artifacts_at = std::time::Instant::now();
-    // A dialer that hung up DURING the hold or the write holds nothing and is
-    // owed nothing but a proof of its death.
+    // A dialer that hung up during the hold or the write holds nothing and is owed
+    // nothing but a proof of its death.
     if held.peer.poll_hangup() {
         retire_ungranted_successor(
             job,
@@ -4491,11 +4003,9 @@ fn run_prelaunched_handoff(
         )
         .err();
     if let Some(error) = transfer_failed {
-        // Which side of the `sendmsg`: only a failure before the descriptors left is
-        // an ungranted stand-down. After it the successor holds duplicates of every
-        // master, and rollback owes the fork lane's candidate proof (kill, reap or
-        // witness) before resuming the readers. The partial case is usually EPIPE
-        // from a successor that already closed its socket.
+        // Only a failure before the descriptors left is an ungranted stand-down; after a
+        // partial send the successor holds duplicates, and rollback owes the candidate
+        // proof.
         if matches!(
             error,
             crate::handoff_rendezvous::RendezvousError::TransferPartial(_)
@@ -4595,26 +4105,23 @@ fn run_prelaunched_handoff(
     Prelaunched::Finished
 }
 
-/// A launched pid in the `u32` shape the completion wire and [`HandoffCandidate`]
-/// use. The conversion cannot fail in practice (`app_launch_successor` refuses
-/// non-positive pids); zero is the fallback because every consumer refuses it:
-/// `signal_handoff_candidate` returns for `pid <= 1`, and
-/// `handoff_candidate_terminated` never proves its vacancy.
+/// A launched pid in the `u32` shape the completion wire uses; zero, which every consumer
+/// refuses, if it cannot convert.
 #[cfg(target_os = "macos")]
 #[must_use]
 fn pid_for_completion(pid: i32) -> u32 {
     u32::try_from(pid).unwrap_or_default()
 }
 
-/// The launch environment a `Command` describes, or `None` when it cannot be
-/// expressed as a merge.
-///
-/// `NSWorkspaceOpenConfiguration.environment` merges over the launcher's
-/// environment and cannot remove a variable, but `bind_expected_update_artifact`
-/// uses `env_remove` so a successor never authenticates against a stale
-/// `ATERM_UPDATE_EXPECTED_*`. A removal of a variable set in this process makes
-/// the lane unavailable (the attempt forks); removing an unset one is ignored.
+/// The launch environment a `Command` describes, or `None` when it cannot be expressed as
+/// a merge: LaunchServices merges over the launcher's environment and cannot remove a
+/// variable, so removing one set here (`bind_expected_update_artifact`'s `env_remove`)
+/// makes the lane unavailable.
 #[cfg(target_os = "macos")]
+#[expect(
+    clippy::disallowed_types,
+    reason = "the update successor's raw Command: it hands over exactly its own descriptors, which a strip at the exec would undo"
+)]
 fn launch_environment(
     command: &std::process::Command,
 ) -> Option<Vec<(std::ffi::OsString, std::ffi::OsString)>> {
@@ -4659,12 +4166,9 @@ fn run_handoff_decision(
         corroboration,
     );
     if proof_outcome != crate::UpdateHandoffOutcome::ProofReady {
-        // `ChildDied` is the candidate ending before its proof: a refusing, crashed
-        // or starved successor all close the readiness channel identically. The
-        // successor states refusals itself (`seamless::take_target_identity`,
-        // `main_entry`'s degraded-authority exit) and the reject path adds what the
-        // parent saw (`handoff_child_death`). Log-only; the completion detail stays
-        // short.
+        // A refusing, crashed or starved successor all close the readiness channel alike;
+        // the successor logs its own refusal and the reject path adds what this process
+        // saw.
         if proof_outcome == crate::UpdateHandoffOutcome::ChildDied {
             aterm_log::warn!(
                 "update apply: the successor ended or closed the readiness channel without proving \
@@ -4703,13 +4207,12 @@ fn run_handoff_decision(
         reconcile: None,
         detail: "child painted and proved exact readerless adoption".to_string(),
         input_drain_spins: 0,
-        // A candidate that PROVED adoption is alive and holding the masters; it
-        // has no death to describe.
+        // A candidate that proved adoption is alive and holding the masters; it has no
+        // death to describe.
         child_death: crate::ChildDeathEvidence::Unobserved,
     });
     if proxy.send_event(ready).is_err() {
-        // No main-thread final validation occurred, therefore Commit is impossible.
-        // Kill/reap readerless child; never exit as though authority was granted.
+        // The main thread never validated, so no Commit can happen: reap the child.
         let rejected = worker_reject_and_reap_handoff_child(
             job,
             proxy,
@@ -4772,12 +4275,10 @@ fn run_handoff_decision(
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
         }
-        // A successor that proved and then ended must not be committed to: Commit
-        // would `_exit` on a write only a stray pipe copy accepts, and nobody would
-        // own the terminals. This narrows the window (the atomic Commit write's
-        // EPIPE is the backstop). Asked after the reject channel and filed
-        // `Rejected`, never `ChildDied`: from here the candidate exits when this
-        // process closes the Commit pipe, so a death may be ours.
+        // A successor that proved and then ended must not be committed to (nobody would
+        // own the terminals). This narrows the window; the atomic Commit write's EPIPE is
+        // the backstop. Filed `Rejected`, never `ChildDied`: from here closing the Commit
+        // pipe makes it exit, so a death may be ours.
         if handle.candidate_gone(candidate)
             && worker_reject_and_reap_handoff_child(
                 job,
@@ -4808,23 +4309,18 @@ fn run_handoff_decision(
     }
 }
 
-/// Ceiling on the decode authority one capture may hand its successor: the sum,
-/// over every carried session, of twice `dimension_grid_cap`.
-///
-/// Authority, not memory: `dimension_grid_cap` prices a line at 512 bytes per
-/// cell plus 16 KiB of framing so a hostile `meta` cannot authorize a huge decode,
-/// which overstates a real screen by one or two orders of magnitude. At 4 GiB it
-/// is a cheap early refusal for an absurd pool; the exact bound is
-/// `MAX_HANDOFF_AGGREGATE_GRID_BYTES` (256 MiB), charged by `screen_digest_refs`
-/// and `write_outgoing` against the real serialized bytes.
+/// Ceiling on the decode authority one capture may hand its successor, priced per session at
+/// twice `dimension_grid_cap` (`seamless::checkpoint_capture_budget_bytes`), which overstates a
+/// real screen by orders of magnitude so a hostile `meta` cannot authorize a huge decode. A
+/// screen past it is carried blank; the exact bound is `MAX_HANDOFF_AGGREGATE_GRID_BYTES`,
+/// charged against the real bytes.
 #[cfg(unix)]
 pub(crate) const MAX_HANDOFF_CAPTURE_BUDGET_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
-/// Acquires a parked session's engine within the freeze budget instead of failing
-/// on the first contention: after `park_all_readers` the scrollback-compression
-/// worker and render/status paths can still take the mutex, and under a flood do
-/// so on every attempt. The wait spends the capture's budget (250 ms explicit,
-/// 20 ms first automatic); a poisoned lock is taken.
+/// Acquires a parked session's engine within the freeze budget instead of failing on the
+/// first contention: after `park_all_readers` the scrollback-compression worker and
+/// render/status paths can still take the mutex, and under a flood do so on every attempt.
+/// The wait spends the capture's budget ([`handoff_freeze_budget`]); a poisoned lock is taken.
 #[cfg(unix)]
 fn try_lock_by<T>(
     lock: &std::sync::Mutex<T>,
@@ -4844,19 +4340,12 @@ fn try_lock_by<T>(
     }
 }
 
-/// The wall-clock window the park and capture of a seamless handoff must fit in,
-/// measured from the readers' park: the freeze the user feels.
-///
-/// Not a correctness bound: a busy machine must still update ("the failure mode is
-/// less scrollback, never the update did not apply"). A miss widens the window
-/// within one attempt (a missed park re-parks on the next rung 500 ms later while
-/// the successor holds, `PRELAUNCH_MAX_PARK_MISSES`) and across attempts, up to a
-/// quarter second. An explicit apply gets the widest window at once.
-///
-/// Rung 0 is seeded: `seed` is the attempt's [`FreezeSeed`] (the larger of a dry
-/// run of this capture and the last landed park, else the ledger, else 20 ms), and
-/// the first automatic rung is `clamp(1.5 × seed, 20 ms, 80 ms)`. The next rung is
-/// twice the seed and at least 80 ms, so the ladder widens rung over rung.
+/// The wall-clock window the park and capture must fit in, from the readers' park: the
+/// freeze the user feels. Not a correctness bound: a miss costs scrollback, never the
+/// update, and widens the window within one attempt (a re-park on the next rung) and
+/// across attempts, up to a quarter second; an explicit apply gets the widest at once.
+/// Rung 0 is `clamp(1.5 × seed, 20 ms, 80 ms)` from the attempt's [`FreezeSeed`]; the next
+/// is twice rung 0 and at least 80 ms.
 #[cfg(any(unix, test))]
 pub(crate) fn handoff_freeze_budget(
     mode: crate::native_updater_service::ApplyMode,
@@ -4904,14 +4393,10 @@ pub(crate) fn freeze_rung0_from_capture(capture: std::time::Duration) -> std::ti
 pub(crate) enum FreezeSeed {
     /// Nothing measured: the 20 ms default ([`FREEZE_RUNG0_FLOOR`]).
     Default,
-    /// This attempt's own dry run, timed while its successor booted — and
-    /// never budgeted below the last park that really LANDED (`last_park`, from
-    /// the ledger), because the dry run cannot time the part of the park that
-    /// is the freeze itself: stopping the readers. Measured 2026-09-26 at
-    /// opt-level 3, the capture of a two-session 50x200 desk with 10 000
-    /// scrollback lines each is 1.1 ms; 0.91's and 0.92's parks of a
-    /// two-session desk took 22 and 20 ms. Only the launched lane times a dry
-    /// run ([`crate::App::seed_first_freeze_rung`]), and that lane is macOS's.
+    /// This attempt's own dry run, timed while its successor booted, never budgeted below
+    /// the last landed park (`last_park`): the dry run cannot time stopping the readers,
+    /// the bulk of a real park (a two-session desk's capture measured 1.1 ms against a 20 ms
+    /// park). Only the launched lane (macOS) times one.
     #[cfg(any(target_os = "macos", test))]
     DryRun {
         capture: std::time::Duration,
@@ -5010,18 +4495,15 @@ impl std::fmt::Display for FreezeSeed {
     }
 }
 
-/// Records what a landed park cost (`parked_in`, from the readers' stop to a
-/// capture ready to hand over) for the next update's first rung, on its own
-/// thread: the ledger lock is a file lock another process may hold, and this runs
-/// inside the freeze. Returns the writer so a test can join it. The outgoing
-/// process exits well after this millisecond write; a lost write costs one
-/// measurement.
+/// Records what a landed park cost, for the next update's first rung, on its own thread:
+/// the ledger lock is a file lock another process may hold, and this runs inside the
+/// freeze. A lost write costs one measurement.
 #[cfg(unix)]
 pub(crate) fn keep_landed_park(
     parked_in: std::time::Duration,
 ) -> Option<std::thread::JoinHandle<()>> {
     let build = crate::running_build_number();
-    // A small ledger write nobody waits on — but it must land before Commit, so
+    // Nobody waits on it, but a Commit's `_exit` cuts it short, so it runs at Background,
     // never the starvable Housekeeping class.
     spawn_ledger_writer("aterm-park-cost", move || {
         aterm_update::record_handoff_park(build, parked_in);
@@ -5055,13 +4537,10 @@ fn spawn_ledger_writer(
 #[cfg(unix)]
 type ChildOnlyMasters = (Vec<std::os::fd::OwnedFd>, Vec<(u64, i32, i32)>);
 
-/// The child-only duplicate of every live master, for either lane's park:
-/// each an independent close-on-exec descriptor at 3 or above, owned by the
-/// caller, beside the `(local_id, duplicate, pid)` adoption table that names
-/// them. The original can later close or reuse its number without changing
-/// the open file description the successor is handed. The first duplicate
-/// this process has no room for is the error (`EMFILE` at a launcher's
-/// descriptor limit), and every duplicate made before it is closed again.
+/// The child-only duplicate of every live master (close-on-exec, at 3 or above, owned by
+/// the caller) beside the `(local_id, duplicate, pid)` table that names them, so the
+/// original can close or reuse its number freely. The first duplicate with no room
+/// (`EMFILE`) is the error, and the ones made before it are closed again.
 #[cfg(unix)]
 fn reserve_child_only_masters(live: &[(u64, i32, i32)]) -> std::io::Result<ChildOnlyMasters> {
     use std::os::fd::{AsRawFd as _, FromRawFd as _};
@@ -5082,15 +4561,9 @@ fn reserve_child_only_masters(live: &[(u64, i32, i32)]) -> std::io::Result<Child
     Ok((owned_masters, adoption))
 }
 
-/// The detached ledger writers a test build has in flight. The park lets its
-/// writer run (`let _ledger_write = …`), and the update ledger is one file per
-/// test process, so a writer started by a test that has already let go of the
-/// ledger lock could land inside the next holder's write-then-read;
-/// [`crate::app_update_screen::hold_update_ledger_for_test`] waits them out
-/// before it hands the lock over. A hazard seen only with an injected writer
-/// delay; it is not what failed
-/// `the_first_rung_is_seeded_from_the_dry_run_and_kept_for_the_next_update`
-/// (that was the seed's sub-microsecond capture, see `seed_first_freeze_rung`).
+/// The detached ledger writers a test build has in flight, so
+/// [`crate::app_update_screen::hold_update_ledger_for_test`] can wait them out before it
+/// hands the per-process ledger lock to the next test.
 #[cfg(all(test, unix))]
 pub(crate) mod ledger_writers {
     use std::sync::{Condvar, Mutex, PoisonError};
@@ -5118,11 +4591,8 @@ pub(crate) mod ledger_writers {
         }
     }
 
-    /// Block until no detached ledger writer is in flight — the causal wait
-    /// for a write a park started on this thread (its writer is counted
-    /// before the park returns), bounded only as a hang detector (a minute):
-    /// a writer is one small file write, but at Background QoS a loaded
-    /// machine can starve it for seconds.
+    /// Block until no detached ledger writer is in flight; a one-minute hang detector,
+    /// since at Background QoS a loaded machine can starve a writer for seconds.
     pub(crate) fn wait_until_landed() {
         let in_flight = IN_FLIGHT.lock().unwrap_or_else(PoisonError::into_inner);
         let (_in_flight, waited) = LANDED
@@ -5166,14 +4636,10 @@ pub(crate) enum DryRunCapture {
     Unmeasured(&'static str),
 }
 
-/// Whether one session may spend `optional` on a budget, on top of the
-/// `own_mandatory` it must spend regardless.
-///
-/// `used` is what the pool has been charged, and `later_mandatory` the summed
-/// non-degradable cost of every session not yet admitted. Overflow is a refusal,
-/// never a wrap. Reserving later sessions' visible screens up front means a
-/// session is refused only when the pool's visible-only total exceeds the ceiling,
-/// so early sessions' scrollback cannot starve a later visible screen.
+/// Whether one session may spend `optional` on a budget on top of its `own_mandatory`,
+/// with `used` charged so far and `later_mandatory` reserved for the sessions not yet
+/// admitted, so early scrollback cannot starve a later visible screen. Overflow is a
+/// refusal, never a wrap.
 #[cfg(unix)]
 pub(crate) fn optional_carry_fits(
     used: u64,
@@ -5188,11 +4654,9 @@ pub(crate) fn optional_carry_fits(
         .is_some_and(|total| total <= ceiling)
 }
 
-/// Why the park's capture (`App::capture_parked_screens`) could not produce a
-/// committed screen set. The first three kinds are timing or this process's own
-/// memory, and retrying is right; `Refused` is deterministic and retrying the same
-/// desk cannot change it. [`classify_capture_failure`] sorts a failure into a miss
-/// or a refusal; [`std::fmt::Display`] gives the ledger and log sentences.
+/// Why the park's capture could not produce a committed screen set: timing or this
+/// process's storage, retried; or `Refused`, deterministic for this desk
+/// ([`classify_capture_failure`]).
 #[cfg(unix)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CaptureFailure {
@@ -5202,23 +4666,13 @@ pub(crate) enum CaptureFailure {
     EngineBusy,
     /// This process could not reserve the capture's bounded storage.
     Storage,
-    /// A session's parser was parked mid-escape-sequence with the rest still
-    /// queued on its PTY (a flood: coloured log, redrawing UI, image transfer).
-    ///
-    /// Timing, never a refusal, and never carried: the successor's fresh parser
-    /// would print the queued tail as text. The launched lane re-parks at the
-    /// gate's next 20 ms re-run on the same rung ([`mid_sequence_miss_disposition`]);
-    /// the fork lane files a miss at once. A mid-sequence parser over a quiet PTY is
-    /// carried.
-    ///
-    /// Names only a partial sequence no carry holds: a hooked DCS query
-    /// (`Terminal::partial_sequence_uncarried`), one the carry would swallow
-    /// (`Terminal::partial_sequence_swallowed`), or, on a hop to a successor
-    /// older than the output-state carry, engine state it would resume without:
-    /// an open OSC 8 link or a pending VT52 address
-    /// (`Terminal::output_state_in_flight`). Other partial sequences ride
-    /// `TerminalCheckpoint::parser`, and the engine's in-flight output state
-    /// `TerminalCheckpoint::output_state`.
+    /// A session's parser was parked mid-sequence with the rest still queued on its PTY
+    /// (over a quiet PTY the sequence is abandoned and the screen carried). Timing, never a
+    /// refusal, and never carried: the successor's fresh parser would print the queued tail
+    /// as text. The launched lane re-parks on the same rung ([`mid_sequence_miss_disposition`]);
+    /// the fork lane files a miss. Names only a partial sequence no carry holds
+    /// (`Terminal::partial_sequence_uncarried`, `Terminal::partial_sequence_swallowed`,
+    /// `Terminal::output_state_in_flight`); the rest ride the checkpoint.
     MidSequence { local_id: u64, state: &'static str },
     /// The build's own predicate refused the committed set: too many sessions,
     /// a duplicate id, or (pinned unreachable) its own blank screen.
@@ -5279,18 +4733,12 @@ struct ParkedScreens {
     held: Vec<crate::seamless::HeldScreen>,
 }
 
-/// Why the in-session overlap handoff cannot run in this process. One predicate
-/// ([`App::seamless_handoff_unavailable`]) serves both the apply gate in
-/// `start_unix_update_handoff` and the status bar's posture
-/// (`App::apply_posture_for`), so the bar never promises what the gate refuses.
-/// With any of these the admission classifier (`native_update_admission::classify`)
-/// admits only the cold lane, at zero live PTYs: the apply is refused while any
-/// terminal is open and the build lands at the next launch.
-///
-/// Fixed control sockets support overlap: the candidate's control worker binds
-/// only after Commit and the parent's exit. There is no opt-out (owner,
-/// 2026-09-23: every update seamless, and no env vars); every reason is a fact
-/// about the launch or the process.
+/// Why the overlap handoff cannot run in this process. One predicate
+/// ([`App::seamless_handoff_unavailable`]) serves the apply gate and the status bar's
+/// posture, so the bar never promises what the gate refuses. With any of these only the
+/// cold lane is admitted, at zero live PTYs. Every reason is a fact about the launch or the
+/// process; there is no opt-out. A fixed control socket the process owns is no reason: the
+/// candidate's control worker binds only after Commit and the parent's exit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HandoffUnavailable {
     /// A fixed path is configured, but this process never proved it bound it.
@@ -5361,16 +4809,10 @@ impl HandoffUnavailable {
     }
 }
 
-/// A TEST'S PARK MUST LAND: the freeze budget is a product constant (a
-/// quarter second for an explicit apply), not a hang detector, and a debug
-/// build on a loaded machine misses it now and then. So under `cfg(test)` the
-/// prelaunched park turns its budget into a one-minute deadline
-/// ([`park_budget_for_test::deadline_budget`], read where the park stamps its
-/// deadline): it lands on any machine and only a hang fails it. The budget
-/// itself (`App::prelaunched_park_budget`) stays the real rung. A test whose
-/// subject is a MISS holds [`park_budget_for_test::real`] around that park,
-/// and the park then runs on the real rung. Per thread, as the park runs on
-/// the test's own thread, so no parallel test sees it.
+/// Under `cfg(test)` the prelaunched park stamps its deadline from a one-minute hang
+/// detector ([`park_budget_for_test::deadline_budget`]), since the freeze budget is a
+/// product constant a loaded debug build misses; a test whose subject is a miss holds
+/// [`park_budget_for_test::real`]. Per thread, so no parallel test sees it.
 #[cfg(test)]
 pub(crate) mod park_budget_for_test {
     use std::cell::Cell;
@@ -5411,14 +4853,10 @@ pub(crate) mod park_budget_for_test {
 
 impl App {
     /// Whether the overlap handoff can run here: the first true reason in
-    /// [`HandoffUnavailable::ALL`]'s order, or `None`. Read only by the apply gate
-    /// (`start_unix_update_handoff`) and the status bar's posture
-    /// ([`App::apply_posture_for`]). Plain reads only (environment, two fields, the
-    /// bound-socket witness): no filesystem probes and no memo that could call back
-    /// into its owner.
-    ///
-    /// Not folded into `arm_native_auto_apply`'s `enabled`: the cold lane is a real
-    /// automatic path once the last terminal of such a process has closed.
+    /// [`HandoffUnavailable::ALL`]'s order, or `None`. Read by the apply gate and the status
+    /// bar's posture; plain reads only, no filesystem probes. Not folded into
+    /// `arm_native_auto_apply`'s `enabled`: the cold lane is a real automatic path once the
+    /// last terminal of such a process has closed.
     #[must_use]
     pub(crate) fn seamless_handoff_unavailable(&self) -> Option<HandoffUnavailable> {
         HandoffUnavailable::ALL
@@ -5428,22 +4866,12 @@ impl App {
 }
 
 impl App {
-    /// Applies a staged update now by re-executing; the staged build swaps in at the
-    /// top of the new `main` (`apply_staged_if_ready`). Reached from
-    /// `Wake::ApplyStagedUpdate` (`aterm-ctl update apply` or the update-ready
-    /// nudge). A no-op unless a strictly newer build is staged.
-    ///
-    /// Hands every live PTY master, its visible-screen checkpoint and a
-    /// `SessionHandoff` manifest to the new process so shells survive (proven by
-    /// `handoff_roundtrip_model` and `seamless_nonce_model`). Modes, cursors, output
-    /// queued after the park and the whole scrollback cross: the checkpoint carries
-    /// up to `seamless::MAX_HANDOFF_HISTORY_LINES`, and older history rides a fenced
-    /// sidecar (`crate::handoff_history`). History that moved under its export or
-    /// fails its sha crosses with the checkpoint's lines alone, and the lost lines
-    /// are counted (`history_lost=` on `status`, and on the band). A cold relaunch is
-    /// permitted only when no foreground job would be destroyed. Every path that
-    /// leaves this process alive returns an actionable failure so the updater
-    /// reducer can re-arm the verified stage.
+    /// Applies a staged update now by re-executing; the staged build swaps in at the top of
+    /// the new `main` (`apply_staged_if_ready`). Hands every live PTY master, its screen
+    /// checkpoint, scrollback (`crate::handoff_history`) and a `SessionHandoff` manifest to
+    /// the new process so shells survive; a cold relaunch only when no foreground job would
+    /// be destroyed. Every path that leaves this process alive returns an actionable failure
+    /// so the updater can re-arm the stage.
     pub(crate) fn apply_staged_update_now(
         &mut self,
         safety_token: crate::app_native::NativeUpdateSafetyToken,
@@ -5454,6 +4882,24 @@ impl App {
         if self.update_handoff_in_flight() {
             return Err(crate::UpdateHandoffStartError::failed(
                 "an update handoff is already in flight",
+            ));
+        }
+        #[cfg(target_os = "macos")]
+        if self.askpass_sheet.is_some() {
+            return Err(crate::UpdateHandoffStartError::activity(
+                "a sudo password prompt is still open",
+            ));
+        }
+        // Its session is not registered yet, so neither the handoff manifest
+        // nor a cold replacement can carry the tab, its input or its waiter.
+        if !self.tab_spawns.is_empty() {
+            #[cfg(unix)]
+            return Err(crate::UpdateHandoffStartError::activity(
+                "a new tab is still starting",
+            ));
+            #[cfg(not(unix))]
+            return Err(crate::UpdateHandoffStartError::refused(
+                "a new tab is still starting",
             ));
         }
         let build = crate::build_info::build_number()
@@ -5489,10 +4935,8 @@ impl App {
         // never reaches shell children).
         #[cfg(unix)]
         {
-            // The caller clears the row: `start_unix_update_handoff` shows
-            // "installing…" before building the carry, and several `Err` exits return
-            // without a completion, so binding the result here covers every such
-            // exit.
+            // The row is cleared here: `start_unix_update_handoff` shows "installing…"
+            // before building the carry, and several of its `Err` exits send no completion.
             let started = self.start_unix_update_handoff(
                 exe,
                 build,
@@ -5501,10 +4945,9 @@ impl App {
                 apply_attempt,
                 same_image,
             );
-            // A PERSON'S PRESS HELD FOR THE CANDIDATE'S READ is no stop (round
-            // eight, U35's review): its row keeps saying it installs and its
-            // switch stays on record, for the press that runs when the read ends
-            // (`App::run_held_person_apply`).
+            // A person's press held for the candidate's read is no stop: its row keeps
+            // saying it installs and its switch stays on record, for the press that runs
+            // when the read ends (`App::run_held_person_apply`).
             if let Err(error) = &started
                 && error.held_for_read_of().is_none()
             {
@@ -5520,8 +4963,7 @@ impl App {
             }
             return started;
         }
-        // Windows has no exec(2); spawn the new process, then exit. Unreached while
-        // the updater is macOS-only (`staged` is None).
+        // Windows has no exec(2): spawn the new process, then exit.
         #[cfg(windows)]
         {
             // One cold replacement lane: an automatic and a manual apply replace alike.
@@ -5533,8 +4975,7 @@ impl App {
                 native_state_certified: safety_token.is_certified(),
                 live_ptys,
                 foreground_jobs: 0,
-                // ConPTY currently has no exact foreground-pgrp proof. Any live
-                // session is therefore both non-cold and foreground-unknown.
+                // ConPTY has no foreground-pgrp proof: every live session is unknown.
                 unknown_foregrounds: live_ptys,
             };
             match crate::native_update_admission::classify(facts) {
@@ -5562,23 +5003,17 @@ impl App {
                 })?),
                 None => None,
             };
-            self.shutdown_title_summaries();
-            // The message log's last write from this process: the
-            // `process::exit` after a successful spawn runs no destructor,
-            // so the writer thread's queue would die with it (design §3.7).
-            self.flush_messages_log();
+            // The message log's last write from this process: the `process::exit` after a
+            // successful spawn runs no destructor, so the writer thread's queue would die
+            // with it.
+            self.flush_messages_log_within(crate::messages_host::MESSAGES_FLUSH_EXIT_WAIT);
             let spawn = || {
-                // On Windows the successor is this image again, and when that is
-                // the CONSOLE image (`aterm.exe --headless`, the in-process
-                // fallback window) started bare by a process with no console, it
-                // opened a visible console window for its whole life:
-                // `spawnfd::command` gives it this process's console or a
-                // windowless one.
+                // `spawnfd::command` gives a console successor this process's console or a
+                // windowless one, never a visible console window of its own.
                 let mut cmd = aterm_uds::spawnfd::command(exe);
-                // Forward argv minus the leading `--window` pins earlier boot
-                // swaps prepended — every successor lane strips them so no
-                // relaunch path can re-grow the argv (aterm-update's
-                // reexec_forwarded_args doc has the accumulation story).
+                // Forward argv minus the leading `--window` pins earlier boot swaps
+                // prepended, so no relaunch path can re-grow the argv
+                // (`aterm_update::reexec_forwarded_args`).
                 cmd.args(aterm_update::reexec_forwarded_args(
                     std::env::args_os().skip(1),
                 ))
@@ -5601,16 +5036,13 @@ impl App {
                     ));
                 }
                 Ok(Err(err)) => {
-                    // A failed spawn leaves this process live. Restore a fresh exact
-                    // authority/worker after the pre-replacement shutdown.
-                    self.reconfigure_title_summaries();
+                    // A failed spawn leaves this process live.
                     aterm_log::warn!("update apply: re-spawn failed: {err}");
                     return Err(crate::UpdateHandoffStartError::failed(format!(
                         "replacement process could not start: {err}"
                     )));
                 }
                 Err(refusal) => {
-                    self.reconfigure_title_summaries();
                     return Err(crate::UpdateHandoffStartError::operator_refused(
                         refusal,
                         "revoked replacement",
@@ -5625,35 +5057,26 @@ impl App {
         ))
     }
 
-    /// The cold lane's steps before the commit permit: the switch on record, the
-    /// title-summary worker stopped, and the message log's last write. Each is
-    /// undone or harmless if the `exec` does not happen
-    /// ([`Self::resume_after_cold_exec`]). The control socket is retired inside the
-    /// permit ([`Self::run_cold_exec`]).
+    /// The cold lane's steps before the commit permit: the switch on record and the
+    /// message log's last write. Each is undone or harmless if the `exec` does not
+    /// happen ([`Self::resume_after_cold_exec`]).
     #[cfg(unix)]
     pub(crate) fn prepare_cold_exec(&mut self, build: u64, same_image: bool, automatic: bool) {
         self.note_update_switch_started(build, same_image, automatic);
-        self.shutdown_title_summaries();
         // The message log's last write from this process: `exec` runs no
         // destructor. The writer stays open for a failed `exec`. Bounded, since a
         // saturated machine can starve the utility writer thread while the window
         // is frozen.
         self.flush_messages_log_within(MESSAGES_FLUSH_COMMIT_WAIT);
-        // The consent sentinel's `log stream` child is signalled by pid (a
-        // non-blocking kill; its worker reaps it): `exec` runs no destructor,
-        // and a quiet stream would otherwise outlive this process until the
-        // next dialog. The 15-minute `--timeout` on every generation bounds it
-        // even if this never ran. A failed `exec` re-arms the observer's start
-        // ([`Self::resume_after_cold_exec`]).
+        // `exec` runs no destructor, so the consent sentinel's `log stream` child is
+        // signalled now (its `--timeout` bounds it anyway).
         self.consent_observer.stop();
     }
 
-    /// The cold `exec`, under the resident operator's commit permit when there is
-    /// one. The control socket is retired inside the permit as the last step, so a
-    /// refused permit leaves every connection served. `Ok` carries the error of an
-    /// `exec` that returned, `Err` the permit's refusal; either way
-    /// [`Self::resume_after_cold_exec`] follows and reopens the socket if it was
-    /// retired.
+    /// The cold `exec`, under the resident operator's commit permit when there is one,
+    /// retiring the control socket last inside it, so a refused permit leaves every
+    /// connection served. `Ok` carries the error of an `exec` that returned, `Err` the
+    /// permit's refusal; [`Self::resume_after_cold_exec`] follows either.
     #[cfg(unix)]
     pub(crate) fn run_cold_exec(
         &self,
@@ -5682,8 +5105,7 @@ impl App {
 
     /// A cold `exec` that did not happen (the permit refused, or it returned an
     /// error) leaves this process running: the control socket serves again at its
-    /// path with its token if it was retired, and the title-summary worker is
-    /// recreated.
+    /// path with its token if it was retired.
     #[cfg(unix)]
     pub(crate) fn resume_after_cold_exec(&mut self) {
         if !self.control_endpoint.reopen() {
@@ -5692,7 +5114,6 @@ impl App {
                  returned; its watchdog rebinds it"
             );
         }
-        self.reconfigure_title_summaries();
         // The window carries on: its consent observer starts again at the next
         // park.
         self.consent_observer_started = false;
@@ -5714,6 +5135,10 @@ impl App {
     }
 
     #[cfg(unix)]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "the update successor's raw Command: it hands over exactly its own descriptors, which a strip at the exec would undo"
+    )]
     fn start_unix_update_handoff(
         &mut self,
         exe: std::path::PathBuf,
@@ -5726,12 +5151,9 @@ impl App {
         // Every session with a live process behind it; a pane kept open after
         // its command exited is not handed (`handoff_live_sessions`).
         let live: Vec<(u64, i32, i32)> = self.handoff_live_sessions();
-        // This epoch gates the entry, not the flight: `automatic_activity_epoch` is
-        // read only before the park (the quiet-epoch admission below and the
-        // pre-park re-check). Mid-flight revocation is `pending.activity_epoch`,
-        // armed unconditionally and read at Commit as `exact_activity`. So
-        // `AutomaticPastGrace` skips waiting for a quiet moment but can still be
-        // revoked by activity.
+        // This epoch gates entry only; mid-flight revocation is `pending.activity_epoch`,
+        // read at Commit. So `AutomaticPastGrace` skips the quiet wait but can still be
+        // revoked.
         let automatic_activity_epoch = (mode
             == crate::native_updater_service::ApplyMode::Automatic)
             .then_some(self.update_handoff_activity_epoch);
@@ -5755,11 +5177,8 @@ impl App {
                 }
             },
         );
-        // One predicate for the apply gate and the status bar's posture
-        // (`seamless_handoff_unavailable`), and every reason is logged by name:
-        // without the overlap only the cold lane remains, which the classifier
-        // admits at exactly zero PTYs, so with any terminal open the apply is
-        // refused (`LivePtysNeedSeamless`) and the build waits for the next launch.
+        // Without the overlap only the cold lane remains, admitted at zero PTYs, so with
+        // any terminal open the apply is refused; the reason is logged by name.
         let handoff_unavailable = self.seamless_handoff_unavailable();
         if let Some(why) = handoff_unavailable {
             aterm_log::warn!(
@@ -5793,18 +5212,10 @@ impl App {
             unknown_foregrounds,
         };
         let decision = crate::native_update_admission::classify(facts);
-        // WHAT THE TOKEN SAYS RIDES MUST BE CARRIED BY THE LANE THAT RUNS. The
-        // preflight let unsaved editor drafts, Settings drafts and failed
-        // checkpoints ride because a successor reopens them from the handed-over
-        // layout; the lane is only decided here. A cold exec hands no layout
-        // over, and an OLDER successor ignores the layout field that carries
-        // Settings drafts — so either refuses them, in the preflight's
-        // person-facing shapes, and the row says what to do (plan P2-2).
-        //
-        // The ONE target build of this attempt, settled here: the carry check,
-        // the cold lane's `exec`, the park's raise and the seamless lane's
-        // decision all read this binding, so none of them can call a target
-        // older that another calls newer (round eight's reviews of #3).
+        // What the token lets ride must be carried by the lane that runs: a cold exec hands
+        // no layout over, and an older successor drops Settings drafts
+        // (`lane_carry_refusal`). The one target build of the attempt is settled here, so
+        // no two steps can disagree on whether it is older.
         let target_build = apply_attempt
             .as_ref()
             .map_or(build, |attempt| attempt.target_build());
@@ -5825,59 +5236,46 @@ impl App {
             ) => {
                 // Direct exec is authorized only for an exact zero-PTY state.
                 debug_assert!(live.is_empty());
-                // THE VERDICT FIRST, BEFORE ANYTHING IS WRITTEN OR REPLACED (round
-                // eight, #1): the cold lane's successor is THIS build, whose boot
-                // swap then runs the complete gate — and a refusal there came back
-                // as a fresh desk that re-armed and exec'd again, every few seconds.
+                // The verdict first, before anything is written or replaced: the cold
+                // lane's successor is this build, whose boot swap runs the complete gate,
+                // and a refusal there comes back as a fresh desk that would re-arm and
+                // exec again every few seconds.
                 self.cold_lane_verdict_gate(mode, apply_attempt.as_ref())?;
-                // A harness's lifeline crosses the exec on a descriptor kept open
-                // for it (round eight, #28); the number it was launched with is
-                // `/dev/null` or closed by now.
+                // A harness's lifeline crosses the exec on a descriptor kept open for it;
+                // the number it was launched with is `/dev/null` or closed by now.
                 let lifeline_fd = crate::lifeline::relaunch_descriptor();
                 let mut command = std::process::Command::new(exe);
                 command
-                    // Exactly one `--window` pin, then the window's flags: the
-                    // router chooses window or session before any boot swap runs,
-                    // and a window started from a shell keeps that terminal on
-                    // stdin, so an unpinned exec came back as a nested SESSION
-                    // (round-seven #11). Neither a windowing verb nor a stale
-                    // lifeline number rides along (round eight, #6/#28;
-                    // `running_window_successor_args`); the `-e` command does, for
-                    // the tabs the window opens, and the mark says it already ran
-                    // in the first one (#7's review; `RELAUNCH_OF_RUNNING_ENV`).
+                    // Exactly one `--window` pin, so the router cannot make the successor a
+                    // nested session; no windowing verb or stale lifeline number
+                    // (`running_window_successor_args`); the `-e` command rides for new
+                    // tabs, marked as already run (`RELAUNCH_OF_RUNNING_ENV`).
                     .args(aterm_update::running_window_successor_args(
                         std::env::args_os().skip(1),
                         lifeline_fd,
                     ))
                     .env("ATERM_UPDATED_FROM", build.to_string())
                     .env(aterm_update::RELAUNCH_OF_RUNNING_ENV, "1");
-                // Same rule as the seamless lane below: an ACTIVATION binds no
-                // expected artifact. The successor swaps nothing; binding the
-                // activation digest would make its `apply_staged_if_ready` refuse a
-                // newer `ready.toml` as "no longer matches" and write a spurious
-                // apply refusal into the ledger.
+                // Same rule as the seamless lane below: an activation binds no expected
+                // artifact. The successor swaps nothing; binding the activation digest
+                // would make its `apply_staged_if_ready` refuse a newer `ready.toml` as
+                // "no longer matches" and write a spurious apply refusal into the ledger.
                 let bound = apply_attempt
                     .as_ref()
                     .filter(|attempt| !attempt.is_installed_activation());
                 bind_expected_update_artifact(&mut command, bound);
-                // …and what this lane has booked against those bytes, so a relaunch
-                // whose boot swap refuses again books that refusal where the
-                // schedule stands instead of as a first failure (round eight, #1's
-                // review; `ColdLaneBudget`).
+                // …and what this lane has booked against those bytes, so a relaunch whose
+                // boot swap refuses again books that refusal where the schedule stands
+                // instead of as a first failure (`ColdLaneBudget`).
                 bind_cold_lane_budget(
                     &mut command,
                     bound,
                     bound.map(|attempt| self.cold_lane_budget(attempt, std::time::Instant::now())),
                 );
-                // …and what its warnings had said, so the landing records their
-                // healing (round eight, finding 79).
+                // …and what its warnings had said, so the landing records their healing.
                 bind_cold_lane_health_said(&mut command, &self.carried_health_said());
-                // Headless survives the re-exec with no help: `--headless` is a
-                // launch flag, and the successor's argv carries every one.
-                //
-                // A window of document and Settings tabs is left to the successor as
-                // the quit layout it reads at boot, or, where it could not be
-                // reopened, the lane refuses as the `--hold` case above does.
+                // `--headless` rides the argv. Document and Settings tabs are left as the
+                // quit layout the successor reads at boot, or the lane refuses.
                 let layout = self
                     .cold_lane_layout()
                     .map_err(crate::UpdateHandoffStartError::refused)?;
@@ -5888,10 +5286,9 @@ impl App {
                     .crash_journal
                     .run()
                     .map(crate::crash_journal::JournalId::stem);
-                // The write waits a bounded time for the restore lock: this is
-                // the GUI main thread (round eight, U49). A layout written for an
-                // exec that then does not happen is taken back, this run's desk
-                // alone (`App::take_back_cold_lane_layout`).
+                // The write waits a bounded time for the restore lock: this is the GUI
+                // main thread. A layout written for an exec that then does not happen is
+                // taken back, this run's desk alone (`App::take_back_cold_lane_layout`).
                 let left = leave_cold_lane_layout(layout.as_ref(), |layout| {
                     crate::restore::write_quit_within(
                         layout,
@@ -5899,11 +5296,10 @@ impl App {
                         COLD_LANE_LAYOUT_LOCK_WAIT,
                     )
                 })?;
-                // This run's desk, written again: it replaced the one a take-back
-                // still owed from an earlier attempt (round eight, U49's review).
-                // With no newer desk of this run written (nothing to leave, or a
-                // layout not kept), the successor would reopen that stale one at
-                // its boot: the owed take-back is tried first, as a park tries it.
+                // This run's desk, written again, replaces the one a take-back still owed
+                // from an earlier attempt. With no newer desk of this run written (nothing
+                // to leave, or a layout not kept), the successor would reopen that stale
+                // one at its boot: the owed take-back is tried first, as a park tries it.
                 if left == LayoutLeft::Written {
                     self.cold_lane_layout_rewritten();
                 } else if let Err(refusal) =
@@ -5911,9 +5307,8 @@ impl App {
                 {
                     return Err(crate::UpdateHandoffStartError::refused(refusal));
                 }
-                // THE LAUNCHER'S SOFT DESCRIPTOR LIMIT crosses this exec as it
-                // crosses the fork lane's (round eight of the update audit, #81):
-                // `execve` keeps a limit a claim or a park raised, and the new
+                // The launcher's soft descriptor limit crosses this exec as it crosses the
+                // fork lane's: `execve` keeps a limit a claim or a park raised, and the new
                 // image's shells would get the raise without it.
                 #[cfg(target_os = "macos")]
                 crate::handoff_rendezvous::carry_launcher_limit(&mut command);
@@ -5934,28 +5329,24 @@ impl App {
                         ));
                     }
                 };
-                // TABS NOT KEPT, ON RECORD ONCE THE SWITCH IS GRANTED (round eight,
-                // U48's review): just before the steps whose message-log flush
-                // carries it. Recorded before the quiesce, every attempt a busy
-                // operator turned back said the new version "starts without them"
-                // while the old one ran on, one record per retry.
+                // Tabs not kept go on record once the switch is granted, just before the
+                // steps whose message-log flush carries it. Recorded before the quiesce,
+                // every attempt a busy operator turned back would say the new version
+                // "starts without them" while the old one ran on, one record per retry.
                 if let LayoutLeft::NotKept(cause) = &left {
                     self.say_cold_lane_tabs_not_kept(target_build, cause);
                 }
                 self.prepare_cold_exec(build, same_image.is_some(), mode.is_automatic());
                 // `exec` returns only on failure.
                 let why = match self.run_cold_exec(operator_quiesce.as_ref(), || {
-                    // The table the successor gets: the lifeline, inheritable for
-                    // the `exec` alone (close-on-exec again if it returns, so
-                    // nothing this process spawns next holds it), and NOTHING
-                    // ELSE this process holds (`cold_exec_hand_over`).
+                    // The table the successor gets: the lifeline, inheritable for the
+                    // `exec` alone (close-on-exec again if it returns, so nothing this
+                    // process spawns next holds it), and nothing else this process holds
+                    // (`cold_exec_hand_over`).
                     let _lifeline = cold_exec_hand_over();
-                    // AN OLDER TARGET'S IMAGE STARTS AT THE LIMIT THIS PROCESS
-                    // HELD BEFORE A PARK'S RAISE (round eight's second review of
-                    // #3): `execve` keeps the raise, and a build before 06b06e74e
-                    // ignores the launcher's limit named above. Lowered for the
-                    // `exec` alone, after the lifeline is made inheritable (so it
-                    // counts), and raised back if the `exec` returns.
+                    // An older target starts at the limit this process held before a park's
+                    // raise: lowered for the `exec` alone, after the lifeline counts, and
+                    // raised back if the `exec` returns.
                     #[cfg(target_os = "macos")]
                     let _older_image =
                         crate::handoff_rendezvous::lower_for_older_image(target_build, build);
@@ -5995,12 +5386,8 @@ impl App {
                 "{refusal}; the terminal was left untouched"
             )));
         }
-        // THIS RUN'S DESK FROM A COLD ATTEMPT THAT DID NOT `exec`, STILL OWED ITS
-        // TAKE-BACK (round eight, U49's review): the switch ends this run, and a
-        // desk left in `session.toml` would read as another instance's, kept by
-        // every later quit and reopened by the next cold launch beside the
-        // windows it stands for. Taken back now; a refusal that passes refuses
-        // the attempt, retried with nothing touched.
+        // A take-back still owed from a cold attempt that did not `exec` is settled now: a
+        // stale desk left in `session.toml` would be reopened by the next cold launch.
         if let Err(refusal) =
             self.settle_owed_layout_take_back_before_switch(std::time::Instant::now())
         {
@@ -6009,24 +5396,11 @@ impl App {
             )));
         }
 
-        // Pre-verification of the staged candidate: codesign policy and sealed
-        // build/commit rebinding, bound to the authorized artifact. Additive: the
-        // child re-runs the complete gate at swap time under the apply lock, so
-        // `Ok` here is a latency and warm-cache optimization, never a grant.
-        //
-        // The check (`codesign --deep` plus a bundle flock) is unbounded disk work,
-        // so it runs as the worker's first action (`run_handoff_worker`), not on
-        // the main thread. A failing candidate is rolled back via
-        // `PreparationFailed` (Structural). The same-binary debug re-exec has no
-        // staged bundle (`verify_staged_candidate: false`).
-        //
-        // …AND BETTER STILL, OUT OF THE PARKED WINDOW ENTIRELY: when this exact
-        // artifact already passed `spawn_staged_handoff_preverification` while
-        // every reader was still live, the worker skips the repeat and the
-        // parked interval shrinks by the whole `codesign --deep` cost. A cached
-        // REFUSAL short-circuits the attempt right here, before anything parks.
-        // Never an authorization either way — the child re-runs the complete
-        // gate under the apply lock at swap time.
+        // The staged candidate's pre-verification (codesign, sealed rebinding) is an
+        // optimization, never a grant: the child re-runs the complete gate at swap time. It
+        // is unbounded disk work, so it runs on the worker; a cached pass from
+        // `spawn_staged_handoff_preverification` skips it, and a cached refusal
+        // short-circuits the automatic attempt here.
         if mode.is_automatic()
             && let Some(attempt) = apply_attempt.as_ref()
         {
@@ -6046,9 +5420,8 @@ impl App {
                 .as_ref()
                 .and_then(|attempt| self.cached_handoff_preverification_reason(attempt))
                 .unwrap_or_else(|| "the staged update failed verification".to_string());
-            // The wait for a roster confirmation is no verdict (round eight, #503's
-            // second review): held for the check, never booked on the transient
-            // budget, as the cold lane's gate holds it.
+            // The wait for a roster confirmation is no verdict: held for the check, never
+            // booked on the transient budget, as the cold lane's gate holds it.
             if aterm_update::is_roster_confirmation_wait(&reason)
                 && let Some(attempt) = apply_attempt.as_ref()
             {
@@ -6089,18 +5462,10 @@ impl App {
                 "updater reconciliation worker is unavailable",
             ));
         };
-        // ROOM FOR THE PARK, BEFORE EITHER LANE RESERVES ANYTHING (round eight of
-        // the update audit, #3): a window the Dock started runs at launchd's
-        // soft 256, and both lanes duplicate every master on top of the three
-        // descriptors each session already holds — past 256 from about 60
-        // sessions, so the desks the chunked grant exists for could never
-        // park. A forked successor inherits the room and is told the
-        // launcher's limit; new tabs keep getting the launcher's. Only toward
-        // a target no older than this build, which reads that told limit. An
-        // older one (the fork lane's, or the cold lane's) is not raised for
-        // here, and a raise an earlier attempt left is not handed to it: its
-        // image starts at the limit this process held before that raise
-        // (`start_older_image_at_its_limit`, `lower_for_older_image`).
+        // Room for the park before either lane reserves anything: a Dock-started window
+        // runs at launchd's soft 256, and duplicating every master passes it at about 60
+        // sessions. Only toward a target no older than this build, which reads the
+        // launcher's limit it is told (`start_older_image_at_its_limit`).
         #[cfg(target_os = "macos")]
         crate::handoff_rendezvous::raise_descriptor_limit_for_park(target_build, build);
         // Parent master flags are an invariant, not mutable handoff state. Child
@@ -6113,17 +5478,10 @@ impl App {
             }
         }
 
-        // Apply begins on the status bar, before the carry is built, so the
-        // successor inherits the row count and words on screen. A visible update
-        // row changes its words ("Updating to aterm vX · installing…"), a repaint.
-        // With no row up, an explicit apply adds one here, before the carry reads
-        // `ws.rows` and `exact_layout` freezes, so the successor is sized for it.
-        // The automatic lane never adds a row (its SIGWINCH would read as activity
-        // and revoke); the upgrade rim, started where each lane's readers park
-        // (`charge_upgrade_rim_at_park`), alone explains the frozen frame. Every
-        // refusal from here restores the words and ends the rim, synchronously
-        // via `retire_update_installing` or after the park via
-        // `reduce_returned_handoff_completion`.
+        // Apply begins on the status bar before the carry is built, so the successor
+        // inherits the row count and words. An explicit apply adds a row if none is up;
+        // the automatic lane never does (its SIGWINCH would read as activity) and the
+        // upgrade rim explains the frozen frame. Every refusal from here restores both.
         self.begin_update_installing(matches!(
             mode,
             crate::native_updater_service::ApplyMode::Immediate
@@ -6131,17 +5489,17 @@ impl App {
         // On record before the park: the park's budget has no room for a file write.
         self.record_update_switch_started(build, same_image.is_some(), mode.is_automatic());
 
-        // Probed before the park: resolving the control directory can create and
-        // `chmod` it, which must stay out of the 20 ms frozen interval. The answer
-        // depends only on `$HOME` and this pid, so it cannot change meanwhile.
+        // Probed before the park: resolving the control directory can create and `chmod`
+        // it, which must stay out of the frozen interval. The answer depends only on
+        // `$HOME` and this pid, so it cannot change meanwhile.
         #[cfg(target_os = "macos")]
         let rendezvous_path_fits = crate::handoff_rendezvous::rendezvous_path_fits();
         // Same reasoning, same window: `app_bundle_root` ends in an `is_dir`.
         #[cfg(target_os = "macos")]
         let bundle = app_bundle_root(&exe);
 
-        // Provision the worker before readers park. A resource-exhausted thread
-        // creation therefore returns with the terminal completely untouched.
+        // Spawned before any reader parks, so a failed thread creation leaves the terminal
+        // untouched.
         let (cancel, cancelled) = std::sync::mpsc::sync_channel(1);
         let (job_tx, job_rx) = std::sync::mpsc::sync_channel::<HandoffWorkerJob>(1);
         let worker_proxy = proxy.clone();
@@ -6158,19 +5516,10 @@ impl App {
             )));
         }
 
-        // Hoisted out of the parked window: the attempt's identity, its successor
-        // `Command`, and the lane decision with its proof identities depend only on
-        // facts settled before the park (pool snapshot, dup'd masters, apply
-        // ticket). Only the two digests over the captured screens and layout stay
-        // under the park. This shortens the freeze and keeps the digests' deadline
-        // check from being pushed past 20 ms; it does not change the capture
-        // ladder's budget.
-        //
-        // The attempt id is minted before the park; an attempt dying after this
-        // burns one id, and nothing keys on contiguity.
-        //
-        // These early returns do not roll back the overlap, since no reader is
-        // parked. A return drops `job_tx`, which tells the spawned worker to exit.
+        // Everything up to the park depends only on facts settled before it (only the two
+        // digests are taken under it). No reader is parked yet, so an early return drops
+        // `job_tx` and the worker exits. An attempt dying after its id is minted burns one;
+        // nothing keys on contiguity.
 
         let attempt_id = self.next_update_handoff_id;
         let Some(next_attempt_id) = attempt_id.checked_add(1) else {
@@ -6182,24 +5531,18 @@ impl App {
         let mut command = std::process::Command::new(exe);
         crate::control_socket_identity::bind_command(&mut command);
         command
-            // One `--window` pin, as on the cold lane (round-seven #11): an
-            // unpinned candidate of a shell-started window routed itself to a
-            // terminal SESSION and never dialed, so every attempt timed out. No
-            // windowing verb (round eight, #6): behind the pin it was the window
-            // parser's exit 2. The `-e` command rides along for the tabs the
-            // window opens, and the mark keeps a fresh bootstrap from running it
-            // again (#7 and its review; `RELAUNCH_OF_RUNNING_ENV`). No lifeline
-            // rides this lane — it is `--headless`'s, which never hands off
-            // seamlessly.
+            // One `--window` pin and no windowing verb, as on the cold lane: an unpinned
+            // candidate of a shell-started window would route itself to a terminal session
+            // and never dial. No lifeline rides this lane (it is `--headless`'s).
             .args(aterm_update::running_window_successor_args(
                 std::env::args_os().skip(1),
                 None,
             ))
             .env("ATERM_UPDATED_FROM", build.to_string())
             .env(aterm_update::RELAUNCH_OF_RUNNING_ENV, "1");
-        // An ACTIVATION binds no expected artifact: the successor has nothing to swap
-        // (its `apply_staged_if_ready` finds no newer stage and returns NoUpdate) and
-        // it simply IS the authorized build — the identity check below still names it.
+        // An activation binds no expected artifact: the successor has nothing to swap (its
+        // `apply_staged_if_ready` finds no newer stage and returns NoUpdate) and it is the
+        // authorized build; the identity check below still names it.
         let installed_activation = apply_attempt
             .as_ref()
             .is_some_and(|attempt| attempt.is_installed_activation());
@@ -6207,22 +5550,12 @@ impl App {
             &mut command,
             apply_attempt.as_ref().filter(|_| !installed_activation),
         );
-        // THE LANE IS DECIDED HERE AND NOWHERE ELSE, and it has to be settled
-        // before the pending attempt is recorded: it selects which term the
-        // adoption proof hashes, and the main thread re-derives that proof from
-        // the pending attempt at Commit time. A lane chosen later would leave
-        // the two halves of one proof speaking different terms — the exact
-        // failure that shows up as an unexplained `AdoptionMismatch`.
-        //
-        // Decided on the live snapshot: the launched lane duplicates its masters
-        // and computes device-term identities at the park; the fork lane
-        // duplicates them just below. The `fstat` probe answers the same for a
-        // master and its duplicate, so lane and proof term agree.
-        //
-        // The chunked-grant fact is read once: only a passed verification on record
-        // declares it, otherwise the one-message limit stands. The lane is chosen
-        // on it and the launched successor is offered the grant on it
-        // (`HandoffWorkerJob::successor_grant_chunks`).
+        // The lane is decided here and nowhere else, before the pending attempt is
+        // recorded: it selects the term the adoption proof hashes, which the main thread
+        // re-derives at Commit, so a lane chosen later would split one proof across two
+        // terms. Decided on the live snapshot: `fstat` answers the same for a master and
+        // its duplicate. The chunked-grant fact is read once, from a passed verification
+        // on record.
         #[cfg(target_os = "macos")]
         let lane_grant_chunks = self.park_policy(apply_attempt.as_ref()).grant_chunks;
         #[cfg(target_os = "macos")]
@@ -6297,17 +5630,10 @@ impl App {
         // boot to time a dry run in, so it seeds from the ledger.
         let freeze_seed = FreezeSeed::from_prior(aterm_update::handoff_capture_prior().as_ref());
 
-        // Capture the session registry before parking: this projection can fail
-        // (`WouldBlock`), and must then return with the terminal untouched. No disk
-        // I/O. The restore manifest is captured after the park (see below).
-        //
-        // The hold serials are read first: a hold moving before or after the
-        // manifest's own read refuses the Commit (a lossless retry), and none can
-        // land after the Commit's comparison, which reads the serials under a fence
-        // (`fence_hold_serials`). So does a manual reset run directly once the park
-        // has closed its lane, which moves them after it lands on the engine
-        // (`fabric::SessionFabric::note_direct_reset`): read before the carry, a
-        // moved serial means the carry has it.
+        // The registry projection can fail (`WouldBlock`), so it is taken before parking.
+        // Hold serials first: a hold or a direct reset moving them after this read refuses
+        // the Commit (a lossless retry), and none lands after the Commit's fenced read
+        // (`fence_hold_serials`).
         let hold_serials = self.hold_serials();
         let manifest = match self.store.try_read() {
             Ok(store) => crate::session_store::SessionHandoff::from_store(&store),
@@ -6323,7 +5649,7 @@ impl App {
         };
         let manifest = handed_sessions_only(manifest, &live);
         // What the Commit compares again of each record, as drawn here
-        // (`session_store::CarriedClaims`, round eight, finding 751).
+        // (`session_store::CarriedClaims`).
         let carried_claims = carried_claims_of(&manifest);
         let Ok((owned_masters, adoption)) = reserve_child_only_masters(&live) else {
             return Err(crate::UpdateHandoffStartError::failed(
@@ -6371,14 +5697,9 @@ impl App {
         ) {
             return Err(crate::UpdateHandoffStartError::activity(reason));
         }
-        // Once half the capture window is gone, remaining sessions carry only
-        // their visible screen: history is optional and priced per line, so the
-        // failure mode is less scrollback, never a missed update.
-        //
-        // The budget (`handoff_freeze_budget`) is keyed by the attempt's target
-        // build, which is what the physical-retry record stores, plus this lane's
-        // own park misses (`App::fork_park_misses`), which are not charged as
-        // physical failures.
+        // The freeze budget is keyed by the target build, plus this lane's own park misses
+        // (`App::fork_park_misses`), which are not physical failures. Past half of it the
+        // remaining sessions carry only their visible screen.
         let fork_park_misses = self.fork_park_misses_of(target_build);
         // The successor's policy, read before the park (a cache lookup). The fork
         // lane's only knob is the carry ceiling; its entry gate has no `Land` wait.
@@ -6393,10 +5714,10 @@ impl App {
         // after the park and refuses a capture it forbids (`capture_exceeds_policy`);
         // a failed capture starts the verification now.
         let policy_unread = apply_attempt.is_some() && same_image.is_none() && !park_policy.known;
-        // An attempt — a person's included (round eight, U35: held, then run again
-        // once the read ends) — first waits for the policy while it is read,
-        // bounded by the read's ceiling: the capture runs on this thread, and a
-        // projection that panics or hangs could otherwise never be routed around.
+        // An attempt (a person's included: held, then run again once the read ends) first
+        // waits for the policy while it is read, bounded by the read's ceiling: the capture
+        // runs on this thread, and a projection that panics or hangs could otherwise never
+        // be routed around.
         if let Some(wait) = self.fork_lane_policy_wait(mode, target_build, policy_unread) {
             return Err(wait);
         }
@@ -6418,9 +5739,8 @@ impl App {
              physical failure(s) of the target artifact incl. {fork_park_misses} fork-lane park \
              miss(es); {freeze_seed}; running build {build})"
         );
-        // The instant the terminal stops echoing: the start of the user's freeze,
-        // the zero point of the numbers reported at Commit and of the capture
-        // deadline — and of the rim that explains it.
+        // The instant the terminal stops echoing: the start of the user's freeze, and of
+        // the rim that explains it.
         self.charge_upgrade_rim_at_park(build);
         let park_at = std::time::Instant::now();
         let deadline = park_at + freeze_budget;
@@ -6431,13 +5751,9 @@ impl App {
                 format!("a PTY reader missed the {freeze_ms} ms handoff park deadline"),
             ));
         }
-        // The post-park re-check tolerates activity: a burst consumed during the
-        // park is in the engine and carried; later bytes wait in the kernel for
-        // the child; hardware input queued meanwhile reaches the still-open masters
-        // after this returns. The activity epoch cannot move here (every bump is on
-        // this thread). Session death still rejects: a HUP/ERR master makes the
-        // proof's live set stale. Classified as activity so the next attempt sees
-        // the new set. Gated on the lane, not the epoch: death is a safety fact.
+        // The post-park re-check tolerates output but not session death, which makes the
+        // proof's live set stale: activity. The activity epoch cannot move here (every bump
+        // is on this thread).
         if mode.is_automatic() && handoff_masters_closed(&live) {
             self.rollback_overlap(None, &live);
             return Err(crate::UpdateHandoffStartError::activity(
@@ -6493,15 +5809,8 @@ impl App {
         let manifest = stamp_render_debts(manifest, &render_debts);
         let manifest = stamp_journal_keys(manifest, &self.journal_keys());
 
-        // Captured post-park: every reader is joined and the capture loop proved
-        // every `term` lockable, so `restore_session_meta`'s try_lock cannot degrade
-        // cwd/title here. Captured before the park, a reader holding its term mutex
-        // (or OSC 7 during the park) degraded the layout, `exact_layout` went false,
-        // and the attempt was misreported as a topology change.
-        //
-        // After the capture loop rather than right after `park_all_readers`: if the
-        // scrollback-compression worker still held a `term`, the loop already aborted
-        // the attempt cleanly.
+        // Captured post-park, once every `term` proved lockable, so cwd/title cannot
+        // degrade into a false topology change.
         let layout = self.capture_handoff_layout();
 
         let layout_digest = match commit_handoff_layout(&layout) {
@@ -6517,7 +5826,6 @@ impl App {
         // (`seamless::settle_wire_carries`) over exactly `screens`.
         if std::time::Instant::now() >= deadline {
             self.rollback_overlap(None, &live);
-            // It said "20 ms" whatever the rung was.
             return Err(self.fork_park_missed(
                 target_build,
                 format!("handoff proof capture exceeded the {freeze_ms} ms deadline"),
@@ -6536,8 +5844,8 @@ impl App {
             proof_ready_at: None,
             nonce: None,
             live: live.clone(),
-            // The PROOF identities, in whichever term this attempt's lane can
-            // prove — see `HandoffWorkerJob::proof_identities`. Never `live`.
+            // The proof identities, in whichever term this attempt's lane can prove
+            // (`HandoffCapture::proof_identities`). Never `live`.
             adoption: proof_identities.clone(),
             child_pid: None,
             mode,
@@ -6596,9 +5904,8 @@ impl App {
                 proof_identities,
                 _owned_masters: owned_masters,
                 history_heads,
-                // Exported by the worker after this capture, never beside the park
-                // (`HistoryPlan::Deferred`). Withheld under a ceiling that carries
-                // no scrollback, which the worker checks (`capture_exceeds_policy`).
+                // Exported by the worker after this capture, never beside the park;
+                // withheld under a ceiling with no scrollback.
                 history: crate::handoff_history::HistoryPlan::deferred_under(ceiling, || {
                     self.history_sessions(target_build)
                 }),
@@ -6626,24 +5933,15 @@ impl App {
                 "overlap handoff worker stopped before preparation",
             ));
         }
-        // A live `video` take is not answered here: the worker may still fail and
-        // keep this process running. Commit answers it
-        // (`App::video_answer_before_commit`).
+        // A live `video` take is not answered here: the worker may still fail. Commit
+        // answers it.
         Ok(())
     }
 
-    /// The sessions an overlap handoff hands over, as `(local_id, master, pid)`:
-    /// every pooled session except a pane kept open after its command exited
-    /// (`aterm --hold`), which the session registry marks `Exited`.
-    ///
-    /// An exited pane's master stays hung up until closed, and would read as a
-    /// session dying under every attempt, so the update could never land. There is
-    /// no live process to keep. The layout still names the pane, and the successor
-    /// keeps its place as a placeholder (`RestoreManifest::placed_for_handed`).
-    ///
-    /// Read once per decision and passed down, so the gate, capture, descriptors
-    /// and manifest describe the same set; the Commit compares against
-    /// [`Self::handoff_exited_session_ids`].
+    /// The sessions an overlap handoff hands over, as `(local_id, master, pid)`: every
+    /// pooled session except a pane kept open after its command exited (`aterm --hold`),
+    /// whose hung-up master would read as a session dying under every attempt. Read once per
+    /// decision and passed down, so the gate, capture, descriptors and manifest name one set.
     #[cfg(unix)]
     pub(crate) fn handoff_live_sessions(&self) -> Vec<(u64, i32, i32)> {
         let exited = self.handoff_exited_session_ids();
@@ -6654,15 +5952,9 @@ impl App {
             .collect()
     }
 
-    /// The window facts the successor sizes its first window from, handed over at
-    /// the park by both lanes: the front window's grid, frame origin and raw inner
-    /// size (unchanged by font zoom); the message band's committed rows and their
-    /// messages, so the successor reserves and paints them until Commit; the log
-    /// lines the freeze kept; and when this process finished downloading the
-    /// build, so the successor can record how long the update took.
-    ///
-    /// One projection for both lanes and for `seamless::app_capture_tests`, which
-    /// asserts the successor reads back exactly this after the band changed rows.
+    /// The window facts the successor sizes its first window from: the front window's
+    /// grid, origin, inner size and presence row, the message band's rows and messages, the
+    /// font zoom, and when the build was verified.
     #[cfg(unix)]
     fn handoff_window_carry(&self, target_build: u64) -> Option<crate::session_store::WindowCarry> {
         let carried = self.carried_messages();
@@ -6699,9 +5991,8 @@ impl App {
         })
     }
 
-    /// [`Self::handoff_window_carry`] at a park, noting which messages crossed:
-    /// at that attempt's Commit every live row the carry did not take ends with
-    /// this process ([`Self::close_uncarried_messages`], ruling 441 (d)).
+    /// [`Self::handoff_window_carry`] at a park, noting which messages crossed for
+    /// [`Self::close_uncarried_messages`] at the Commit.
     #[cfg(unix)]
     fn park_window_carry(
         &mut self,
@@ -6715,12 +6006,9 @@ impl App {
         window
     }
 
-    /// The advisory warm hint a launched successor starts with
-    /// (`handoff_warm_hint`): what [`Self::handoff_window_carry`] will write at the
-    /// park, read at launch. The successor's warm prologue builds its backend at
-    /// the font zoom, and only compares and logs window 0's grid and the counts.
-    /// Stale by design: a zoom during the hold costs one warm miss, corrected at
-    /// the backend join.
+    /// The advisory warm hint a launched successor starts with: what
+    /// [`Self::handoff_window_carry`] will write, read at launch. Stale by design: a zoom
+    /// during the hold costs one warm miss, corrected at the backend join.
     #[cfg(target_os = "macos")]
     pub(crate) fn handoff_warm_hint(&self) -> crate::handoff_warm_hint::WarmHint {
         let (px, reset) = self.handoff_font_zoom();
@@ -6738,13 +6026,9 @@ impl App {
         }
     }
 
-    /// The live font zoom as the window carry writes it: `(px, reset px)` in
-    /// thousandths of a physical px while the font is zoomed (pinned by
-    /// `font_px_explicit` and away from the Cmd-0 size), else `(None, None)`.
-    ///
-    /// An unzoomed size is what the successor derives from the same config and
-    /// display, so only a zoom is written, and always as a pair: the size to draw
-    /// at and the one Cmd-0 returns to.
+    /// The live font zoom as the window carry writes it, `(px, reset px)` in thousandths of
+    /// a px, only while zoomed: an unzoomed size is what the successor derives from the same
+    /// config and display. Always a pair: the size to draw at and the one Cmd-0 returns to.
     #[cfg(unix)]
     pub(crate) fn handoff_font_zoom(&self) -> (Option<u32>, Option<u32>) {
         let zoomed = self.font_px_explicit && (self.font_px - self.default_font_px).abs() >= 0.5;
@@ -6757,9 +6041,8 @@ impl App {
         }
     }
 
-    /// The pooled sessions whose command has exited (registry state
-    /// `Exited`) — the panes [`Self::handoff_live_sessions`] leaves out. A
-    /// leaf read of the session registry, never a `Terminal` lock.
+    /// The pooled sessions whose command has exited, which
+    /// [`Self::handoff_live_sessions`] leaves out; a registry read, never a `Terminal` lock.
     #[cfg(unix)]
     pub(crate) fn handoff_exited_session_ids(&self) -> Vec<u64> {
         let store = self
@@ -6777,20 +6060,10 @@ impl App {
             .collect()
     }
 
-    /// Starts the launched lane's history carry export (`crate::handoff_history`)
-    /// for every handed session, with readers live, following each history until
-    /// the park stops it. `None` for [`Self::history_sessions`]'s reasons or when
-    /// the worker cannot start (logged; sessions then carry the screen carry's
-    /// bounded history). The fork lane exports on its worker
-    /// (`HistoryPlan::Deferred`).
-    ///
-    /// `None` too, and nothing written to disk, when `ceiling` — the carry
-    /// ceiling of the successor's handoff policy as far as it is known at the
-    /// launch — carries no scrollback. A policy not yet read then reads
-    /// `Full`, so the export starts; the park, which reads the policy after
-    /// the worker has published it, stops it then
-    /// ([`Self::withhold_history_export`]). Its one caller, the launched
-    /// lane's prelaunch, is macOS's.
+    /// Starts the launched lane's history export for every handed session, with readers
+    /// live; `None` for [`Self::history_sessions`]'s reasons, a worker that cannot start,
+    /// or a `ceiling` with no scrollback (the park stops one started under an unread
+    /// policy, [`Self::withhold_history_export`]).
     #[cfg(target_os = "macos")]
     fn start_history_export(
         &self,
@@ -6819,11 +6092,8 @@ impl App {
         }
     }
 
-    /// Stops the launched lane's history export under a policy whose `ceiling`
-    /// carries no scrollback: takes it off the prelaunched attempt, gives its worker
-    /// [`crate::handoff_history::HALT_WAIT`] to stop, and drops it, removing its
-    /// sidecars. The park then hands the worker
-    /// [`crate::handoff_history::HistoryPlan::Withheld`].
+    /// Stops and removes the launched lane's history export under a `ceiling` with no
+    /// scrollback ([`crate::handoff_history::HistoryPlan::Withheld`]).
     #[cfg(any(target_os = "macos", all(test, unix)))]
     fn withhold_history_export(
         &mut self,
@@ -6852,10 +6122,8 @@ impl App {
         );
     }
 
-    /// Every pooled session's engine for the history export — the handed
-    /// sessions' and the held panes' — or `None` when the successor is older
-    /// than this build (no importer) or there is no private control dir
-    /// (logged; sessions carry the screen carry's bounded history).
+    /// Every pooled session's engine for the history export, or `None` for a successor
+    /// older than this build or no private control dir.
     #[cfg(unix)]
     fn history_sessions(
         &self,
@@ -6877,15 +6145,8 @@ impl App {
             );
             return None;
         }
-        // EVERY POOLED SESSION: the handed ones, and the panes kept open after
-        // their command ended, whose scrollback crosses beside their held
-        // screen (round eight of the update audit, finding 39), each in id
-        // order. Kept apart, because a held pane's export only ever takes
-        // room the handed sessions do not need: its first pass comes after
-        // theirs, as the successor's read of the aggregate does (sessions,
-        // then held panes), and a handed session that keeps printing evicts
-        // held panes' exports when its follow would not fit otherwise (the
-        // review of finding 39). Which is which is the park's to say.
+        // Every pooled session in id order, handed and held apart: a held pane's export
+        // only takes room the handed sessions do not need.
         let live = self.handoff_live_sessions();
         let mut sessions = crate::handoff_history::ExportSessions::default();
         for session in self.pool.iter() {
@@ -6901,12 +6162,8 @@ impl App {
         Some(sessions)
     }
 
-    /// The successor's half of the history carry, at Commit: takes every adopted
-    /// session's carry (`Session::handoff_history`) and imports it on a worker,
-    /// never on the event loop (an import is O(the history)). The worker counts
-    /// failures onto each session's `history_lost` itself and reports
-    /// `Wake::HandoffHistorySettled`. A worker that cannot start costs every carry
-    /// its lines, counted and said here.
+    /// The successor's half of the history carry, at Commit: imports every adopted
+    /// session's carry on a worker, never the event loop.
     #[cfg(unix)]
     pub(crate) fn start_handoff_history_imports(&mut self) {
         let jobs = self.pool.take_handoff_histories();
@@ -6943,16 +6200,8 @@ impl App {
         }
     }
 
-    /// Says what the history carry's imports left behind once they settle: when
-    /// any line of any tab's history was left behind (outgoing fallbacks, policy
-    /// withholding, sidecars that failed here), one band row says how many lines in
-    /// how many tabs, and whether it was the policy's choice or a failure. Per-tab
-    /// counts are on the registry (`handoff_history::record_reports`).
-    ///
-    /// The outgoing side's count is already on the band from the Commit's re-grid
-    /// ([`Self::say_carried_history_loss`]); this settle posts only a change. A
-    /// different summary re-words that row in place (same key, so no re-grid), or
-    /// posts the new count if the row is gone.
+    /// Says what the history imports left behind once they settle, in one band row, posting
+    /// only a change from [`Self::say_carried_history_loss`].
     #[cfg(unix)]
     pub(crate) fn settle_handoff_history(
         &mut self,
@@ -6971,11 +6220,8 @@ impl App {
         }
     }
 
-    /// Posts the loss the parent counted inside the Commit's one re-grid batch
-    /// (`release_successor_commit_freeze`). Each adopted session arrives with the
-    /// lines its outgoing process left behind (`AdoptedHistory::dropped`), which an
-    /// import only adds to; noted for [`Self::settle_handoff_history`], which then
-    /// re-grids nothing for it.
+    /// Posts the history loss the parent counted, inside the Commit's re-grid batch, for
+    /// [`Self::settle_handoff_history`] to compare against.
     #[cfg(unix)]
     pub(crate) fn say_carried_history_loss(&mut self) {
         let loss = crate::handoff_history::carried_loss(
@@ -6995,30 +6241,8 @@ impl App {
         self.handoff_history_loss_said = loss;
     }
 
-    /// The capture ladder, under the park: every session's screen (plus as much
-    /// scrollback as the budget allows) and the control carry's head, priced
-    /// against the freeze budget and the aggregate cell and decode-authority
-    /// ceilings, then committed by the build's full predicate. Shared by both lanes
-    /// (the fork lane before its spawn, the launched lane at its park); the caller
-    /// rolls the readers back on `Err`.
-    ///
-    /// Total over screen content: each session is carried by
-    /// [`crate::seamless::carry_for_wire`] at the most faithful rung the successor's
-    /// `caps` admit, at worst a blank tab that redraws, and
-    /// [`crate::seamless::settle_wire_carries`] lowers whatever session
-    /// `screen_digest` still blames. So `Err` is only timing (the deadline, an
-    /// engine lock), storage this process could not reserve, or a refusal about
-    /// no single screen (too many sessions, a duplicate id).
-    ///
-    /// `ceiling` is the highest rung the successor's signed handoff policy allows
-    /// ([`crate::seamless::carry_for_wire_within`]): `Full`; `Visible` (no
-    /// scrollback); `Repaint` (every session blank). It only lowers. A cosmetic
-    /// partial state over queued output (an OSC 8 link left open, or a picture the
-    /// carry would only swallow: a kitty-graphics APC or an OSC 1337 image) may miss
-    /// the park only while the launched lane has free mid-sequence re-parks
-    /// ([`PRELAUNCH_MAX_MID_SEQUENCE_REPARKS`]); otherwise the screen is carried, the
-    /// link closed and the in-flight frame dropped (the stream's next frame replaces
-    /// it).
+    /// Whether a cosmetic partial state (an open OSC 8 link, a swallowed picture) may still
+    /// miss the park: only within [`PRELAUNCH_MAX_MID_SEQUENCE_REPARKS`] on the launched lane.
     #[cfg(unix)]
     fn soft_miss_may_repark(&self) -> bool {
         #[cfg(any(target_os = "macos", all(test, unix)))]
@@ -7035,6 +6259,11 @@ impl App {
         }
     }
 
+    /// The capture ladder, under the park: every session's screen and as much scrollback as
+    /// the budgets allow, plus the control carry's head. Each session is carried at the most
+    /// faithful rung `caps` and `ceiling` admit, at worst blank, so `Err` is only timing,
+    /// storage, or a refusal about no single screen; the caller rolls the readers back on
+    /// `Err`.
     #[cfg(unix)]
     fn capture_parked_screens(
         &mut self,
@@ -7061,9 +6290,8 @@ impl App {
         // successor cannot repair, never a failed capture.
         let mut render_debts = Vec::new();
         let debt_room = render_debts.try_reserve_exact(live.len()).is_ok();
-        // The history heads are not best-effort: a session without one would
-        // lose its history with nothing counting it, so storage for them is
-        // reserved like the screens' own.
+        // The history heads are not best-effort: a session without one would lose its
+        // history uncounted.
         let mut history_heads = Vec::new();
         if wire.try_reserve_exact(live.len()).is_err()
             || history_heads.try_reserve_exact(live.len()).is_err()
@@ -7076,23 +6304,16 @@ impl App {
         // Latched once a session's carried history was refused (by budget or blob
         // shape), so later sessions go straight to visible-only.
         let mut history_latched_off = false;
-        // Mandatory first, optional second: price the visible and alt grids of the
-        // whole pool in both budgets before charging any of it, so a later session
-        // always has room for its non-degradable screen (`optional_carry_fits`).
-        // Readers are parked, so geometry cannot move between the two passes.
-        //
-        // An unreadable engine reserves everything, so nobody carries scrollback;
-        // the capture loop reports the busy engine a moment later.
+        // Mandatory first: the whole pool's visible and alt grids are reserved before any
+        // scrollback is charged (`optional_carry_fits`). Readers are parked, so geometry
+        // cannot move between the two passes.
         let mut cells_reserve = 0_u64;
         let mut bytes_reserve = 0_u64;
-        // Only the handed sessions: `live` omits exited `--hold` panes
-        // (`App::handoff_live_sessions`), and a screen carried for a session with no
-        // descriptor on the wire is refused by `write_outgoing`.
+        // Only the handed sessions: a screen with no descriptor on the wire is refused by
+        // `write_outgoing`.
         let handed = |id: u64| live.iter().any(|(local_id, _, _)| *local_id == id);
-        // In session-id order, not the pool's: the pool is a randomly seeded
-        // `HashMap`, and this walk spends pool-wide state (history latch, byte and
-        // cell budgets, decode authority), so the same desk must be priced the same
-        // way every time. Ids follow creation order. Reserved like the rest.
+        // In session-id order, not the pool's hash order, so the same desk is priced the
+        // same way every time.
         let mut sessions = Vec::new();
         if sessions.try_reserve_exact(live.len()).is_err() {
             return Err(CaptureFailure::Storage);
@@ -7124,36 +6345,13 @@ impl App {
                 capture_failed = Some(CaptureFailure::EngineBusy);
                 break;
             };
-            // A parser parked inside a sequence no carry holds, over queued output,
-            // is a miss, not a carry: the successor's parser would print the queued
-            // tail as text. That covers:
-            // - a hooked DCS query, whose reply lives in its handler (every other
-            //   partial sequence rides the checkpoint, continued or swallowed; a
-            //   hooked string the engine only consumes, such as a tmux passthrough
-            //   wrapper, is swallowed exactly — round eight, finding 57);
-            // - any partial sequence when the successor predates the parser carry
-            //   (`WireCaps::carries_parser`);
-            // - a carry that only swallows (an over-cap OSC such as OSC 52 or 1337,
-            //   a started APC such as kitty graphics, a hooked sixel string;
-            //   `Terminal::partial_sequence_swallowed`; a DCS header is carried
-            //   as itself since 2026-10-10 and continues exactly);
-            // - when the successor predates the output-state carry
-            //   (`WireCaps::carries_output_state`), engine state it would resume
-            //   without: an open OSC 8 link or a VT52 `ESC Y` awaiting its address
-            //   (`Terminal::output_state_in_flight`). A successor that carries it
-            //   continues both (round eight of the update audit, finding 502).
-            // Over a quiet PTY (a stalled sequence) abandoning is the answer. One
-            // `poll` per such session.
-            //
-            // An open link is cosmetic and may never close, so on such a hop its
-            // miss spends only the launched lane's free mid-sequence re-parks
-            // (`soft_miss_may_repark`); after that, and on the fork lane, the
-            // screen is carried and that successor writes the rest of the text
-            // unlinked. A swallowed picture (kitty APC chunks, OSC 1337
-            // frames, sixel strings) takes the same rule: a graphics stream never
-            // pauses at a batch edge, and its next frame replaces the one dropped.
-            // Every other swallowed sequence (an OSC 52 clipboard write), a DCS
-            // query and a VT52 address keep the hard miss on every lane.
+            // A parser parked inside a sequence no carry holds, over queued output, is a
+            // miss: the successor's parser would print the queued tail as text. Over a quiet
+            // PTY the sequence is abandoned. An open link or a swallowed picture is cosmetic,
+            // so its miss spends only the launched lane's free mid-sequence re-parks
+            // (`soft_miss_may_repark`); past them, and on the fork lane, the screen is carried
+            // with the link closed or the picture's frame dropped (the stream's next replaces
+            // it). Every other partial sequence keeps the hard miss on every lane.
             let partial = if caps.carries_parser() {
                 terminal.partial_sequence_uncarried().or_else(|| {
                     terminal.partial_sequence_swallowed().filter(|_| {
@@ -7181,10 +6379,8 @@ impl App {
                 });
                 break;
             }
-            // Scrollback is best-effort and must never cost the handoff: only the
-            // visible screen is required for adoption. Depth is chosen per session
-            // against the remaining time (zero once over half the window is spent)
-            // and the remaining budget after the pool's mandatory reservation.
+            // Scrollback is best-effort: depth is chosen per session against the remaining
+            // time and the budget left after the pool's mandatory reservation.
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             let (rows, cols) = (terminal.rows(), terminal.cols());
             let own_cells = crate::seamless::mandatory_checkpoint_cells(rows, cols);
@@ -7194,9 +6390,7 @@ impl App {
             // session's scrollback is priced against what the rest still need.
             cells_reserve = cells_reserve.saturating_sub(own_cells);
             bytes_reserve = bytes_reserve.saturating_sub(own_bytes);
-            // A policy ceiling below Full carries no scrollback, so none is
-            // priced either: the budgets stay for the sessions that follow. The
-            // history carry reads the same answer (`HistoryPlan::Withheld`).
+            // A ceiling below Full carries no scrollback, so none is priced either.
             let carry = if ceiling.carries_scrollback() {
                 crate::seamless::max_handoff_history_lines()
             } else {
@@ -7228,9 +6422,8 @@ impl App {
             } else {
                 0
             };
-            // The decode-authority budget is the producer's own ceiling (no consumer
-            // checks it), so it chooses a rung but never refuses the update: a
-            // session whose visible screen alone would exceed it is carried blank.
+            // The decode-authority budget is the producer's own ceiling, so it chooses a
+            // rung but never refuses: a screen past it is carried blank.
             let visible_authority = crate::seamless::checkpoint_capture_budget_bytes(rows, cols, 0)
                 .and_then(|bytes| capture_budget.checked_add(bytes))
                 .filter(|total| *total <= MAX_HANDOFF_CAPTURE_BUDGET_BYTES);
@@ -7255,9 +6448,8 @@ impl App {
                     ),
                 )
             };
-            // A refused history lowers every later session's too, since the budget
-            // or shape that refused it is the pool's. Only the VisibleOnly rung means
-            // that; Sanitized, StrippedLinks and Repaint are about this one screen.
+            // A refused history (`VisibleOnly`) lowers every later session's too: the budget
+            // or shape that refused it is the pool's.
             if history != 0 && rung == CarryRung::VisibleOnly {
                 history_latched_off = true;
             }
@@ -7267,40 +6459,28 @@ impl App {
                 checkpoint.history_lines,
             )
             .map_or(u64::MAX, |bytes| capture_budget.saturating_add(bytes));
-            // The control carry's share of the freeze: the archive's fence and
-            // counters, plus the differ's screen-sized state, under the same lock as
-            // the checkpoint. Rows and ledger are exported on the worker behind the
-            // fence. Past half the budget even the differ's state is left for the
-            // worker (the fence's fingerprint keeps it exact). A clamped or blank
-            // screen drops only the differ's state; ledger and archive rows still
-            // travel. A screen that lost only links keeps it
-            // (`CarryRung::keeps_differ_state`).
+            // The control carry's share of the freeze, under the checkpoint's lock; the
+            // differ's state only within half the budget and on a rung that keeps it.
             let differ = deadline.saturating_duration_since(std::time::Instant::now())
                 >= handoff_history_comfort;
-            // The foreground holder, for every session and apart from the control
-            // carry: the last group the parked reader saw. It lets the adopting
-            // reader hand back a job that died during the handoff even when the
-            // control carry was dropped. Reserved above: no allocation.
+            // The foreground holder, for every session and apart from the control carry,
+            // so a job that died during the handoff is handed back even without it.
             if holder_room {
                 fg_holders.push((
                     session.id,
                     session.fg_holder.load(std::sync::atomic::Ordering::Acquire),
                 ));
             }
-            // THE RENDER DEBT (R08): what the engine owes this session's alternate
-            // screen, under the lock the checkpoint was taken under. A session
-            // carried blank on purpose (the Repaint rung) has no screen the debt
-            // could be about, and one on the main screen owes nothing (the
-            // primary screen is history-backed).
+            // The render debt the engine owes this session's alternate screen, under the
+            // checkpoint's lock; none for a blank carry or the history-backed main screen.
             if debt_room && rung != CarryRung::Repaint && terminal.modes().alternate_screen {
                 let debt = terminal.render_debt();
                 if debt != (0, 0) {
                     render_debts.push((session.id, debt));
                 }
             }
-            // THE HISTORY HEAD, under the same lock as the checkpoint: the
-            // fence the worker joins this session's export to. A pure read.
-            // Reserved for every live session above, so this never allocates.
+            // The history head, under the checkpoint's lock: the fence the worker joins this
+            // session's export to.
             history_heads.push(crate::handoff_history::capture_head(session.id, &terminal));
             // Reserved for every live session above, so this never allocates.
             if carry_room {
@@ -7343,9 +6523,8 @@ impl App {
                     ),
                 }
             })?;
-        // A session the self-check lowered to a clamped or blank screen loses
-        // its differ's state too (`CarryRung::keeps_differ_state`); its ledger
-        // and archive rows still travel.
+        // A session the self-check lowered to a clamped or blank screen loses its differ's
+        // state too.
         carries.retain_mut(|source: &mut crate::handoff_carry::CarrySource| {
             let Some(carry) = wire
                 .iter()
@@ -7371,14 +6550,8 @@ impl App {
             }
             screens.push((carry.local_id, carry.checkpoint));
         }
-        // THE HELD PANES, last and optional (round five, item 19): only with
-        // half the budget still to spare, from what the handed screens left
-        // of the aggregate cells, and never a reason to miss the park — so
-        // they stop a QUARTER of the budget short of the deadline (round six
-        // of the update audit, finding 21): the layout capture and the
-        // callers' deadline check still come after them, and a held capture
-        // that ran to the deadline itself turned every landed park into a
-        // miss.
+        // The held panes, last and optional, never a reason to miss the park
+        // (`held_capture_deadline`).
         let held = match held_capture_deadline(
             deadline,
             std::time::Instant::now(),
@@ -7406,25 +6579,13 @@ impl App {
         })
     }
 
-    /// The visible screen of every pooled session not in `live` (exited panes,
-    /// never handed), at the most faithful rung `caps` and `ceiling` admit, without
-    /// scrollback in it — its scrollback's fence is taken here, and its export is
-    /// joined against it when the manifest is written (round eight, finding 39).
-    /// Best-effort: a busy engine, a screen that would go blank, or one
-    /// reached after the deadline is left out and shown as a placeholder. One
-    /// `try_lock` per engine; nothing waits.
-    ///
-    /// Bounded by what can cross: stops at [`crate::seamless::MAX_HELD_PANES`] and
-    /// skips a screen past what remains of
-    /// [`crate::seamless::MAX_HELD_AGGREGATE_GRID_BYTES`]. Each carries how its
-    /// command ended (`App::exit_status`, collected without waiting).
-    ///
-    /// AND ITS CONTROL CARRY (round eight of the update audit, finding 730): a
-    /// pane carried here adds its turn ledger and archive fence to `carries`,
-    /// under the lock its screen was taken under, so the export carries them as a
-    /// handed session's ([`crate::handoff_carry::export_for`]) and `history`,
-    /// `aterm drive report` and a resumed `since-turn=` still read the turns a
-    /// manager drove into it. Without the differ's state: nothing draws there.
+    /// The visible screen of every pooled session not in `live` (exited panes), without
+    /// scrollback, which crosses in its own sidecar joined against the fence taken here.
+    /// Best-effort, one `try_lock` per engine: a busy engine, a screen that would go blank,
+    /// or one reached after the deadline is left a placeholder; bounded by
+    /// [`crate::seamless::MAX_HELD_PANES`] and
+    /// [`crate::seamless::MAX_HELD_AGGREGATE_GRID_BYTES`]. Each pane adds its control carry
+    /// (no differ state) to `carries`, so its turns still read in the successor.
     #[cfg(unix)]
     fn capture_held_screens(
         &self,
@@ -7456,15 +6617,12 @@ impl App {
             let (checkpoint, rung, _cause) = crate::seamless::carry_for_wire_within(
                 &terminal, session.id, 0, &mut cells, caps, ceiling,
             );
-            // The held screen is the visible rows only: its scrollback rides
-            // its own sidecar, and what does not cross is counted on the
-            // successor's band, never dropped in silence (round eight,
-            // finding 39).
+            // The held screen is the visible rows only; what of its scrollback does not
+            // cross is counted on the successor's band.
             let history_dropped =
                 u64::try_from(terminal.main_grid().scrollback_lines()).unwrap_or(u64::MAX);
-            // …and its fence, which its export is joined against when the
-            // manifest is written, so its scrollback crosses as a handed
-            // session's does (round eight, finding 39).
+            // …and its fence, which its export is joined against when the manifest is
+            // written, so its scrollback crosses as a handed session's does.
             let history_head = Some(terminal.history_fence());
             // …and its control carry's head, under the same lock (no differ).
             let mut control = crate::handoff_carry::capture_head(
@@ -7511,21 +6669,10 @@ impl App {
         screens
     }
 
-    /// The dry run: the park's own capture ([`Self::capture_parked_screens`]) over
-    /// the same handed set, timed with every reader live, so the first freeze rung
-    /// is budgeted from this desk's cost. The readers' stop, which it cannot time,
-    /// comes from the last landed park (`keep_landed_park`).
-    ///
-    /// Nothing is parked and nothing leaves: each engine is read under its own lock
-    /// and the product dropped, so this is no protocol step, and a reader waits at
-    /// most one session's capture.
-    ///
-    /// It prices the widest capture a rung would attempt (history for every
-    /// session the budgets admit), within [`DRY_RUN_CAPTURE_WINDOW`], under the
-    /// successor's handoff policy ([`Self::dry_run_ceiling`]): the policy exists to
-    /// route around a slow or panicking capture path, and this runs on the main
-    /// thread. With the policy not yet read, no dry run is taken (`Unmeasured`) and
-    /// the seed falls back to the ledger.
+    /// The dry run: the park's own capture over the same handed set, timed with every
+    /// reader live, so the first freeze rung is budgeted from this desk's cost. Nothing is
+    /// parked or kept, it is bounded by [`DRY_RUN_CAPTURE_WINDOW`], and it runs under the
+    /// successor's policy ([`Self::dry_run_ceiling`]) or not at all.
     #[cfg(any(target_os = "macos", all(test, unix)))]
     pub(crate) fn dry_run_handoff_capture(
         &mut self,
@@ -7563,9 +6710,8 @@ impl App {
                     sessions: live.len(),
                 }
             }
-            // A reader mid-sequence over live output is ordinary while readers
-            // run; storage and a refusal are the park's to report. None of them
-            // says how long a capture takes.
+            // A mid-sequence parser is ordinary while readers run; none of these says how
+            // long a capture takes.
             Err(CaptureFailure::MidSequence { .. }) => {
                 DryRunCapture::Unmeasured("a parser was mid-sequence over live output")
             }
@@ -7578,10 +6724,8 @@ impl App {
         }
     }
 
-    /// The carry ceiling the dry run captures under: the successor's handoff policy
-    /// for the prelaunched attempt's artifact via [`Self::park_policy`], as every
-    /// park reads it, so the dry run never captures above the park. `Full` with no
-    /// artifact (the same-image seam), `None` while the policy is unread.
+    /// The carry ceiling the dry run captures under, the same policy every park reads:
+    /// `Full` with no artifact, `None` while the policy is unread.
     #[cfg(any(target_os = "macos", all(test, unix)))]
     fn dry_run_ceiling(&self) -> Option<aterm_update_core::handoff_policy::CarryCeiling> {
         let attempt = self
@@ -7592,13 +6736,9 @@ impl App {
         (attempt.is_none() || policy.known).then(|| policy.carry_ceiling())
     }
 
-    /// Seeds this attempt's first automatic freeze rung: times the dry run while the
-    /// successor boots, never below the last landed park, persists the measurement
-    /// in the health ledger off this thread (its lock is a file lock), and falls
-    /// back to the ledger, then 20 ms, when nothing was measured. An explicit apply
-    /// uses the widest rung and spends no dry run. The seed is stored on the
-    /// prelaunched attempt ([`Self::prelaunched_park_budget`]) and returned, with
-    /// the ledger writer's handle for tests to join.
+    /// Seeds this attempt's first automatic freeze rung from the dry run (never below the
+    /// last landed park), kept in the health ledger off this thread, else from the ledger,
+    /// else 20 ms. Returns the seed with the ledger writer's handle for tests to join.
     #[cfg(any(target_os = "macos", all(test, unix)))]
     pub(crate) fn seed_first_freeze_rung(
         &mut self,
@@ -7616,11 +6756,8 @@ impl App {
         let seed = match dry {
             DryRunCapture::Measured { took, sessions }
             | DryRunCapture::AtLeast { took, sessions } => {
-                // In the ledger's unit, whole microseconds (at least one), so
-                // the rung seeded now is the rung the kept record seeds next
-                // time: 1.5 × a capture between 13.3 and 53.3 ms is unclamped,
-                // and its nanoseconds would otherwise buy a rung the ledger's
-                // copy cannot.
+                // In the ledger's unit, whole microseconds, so the rung seeded now is the
+                // one the kept record seeds next time.
                 let took = std::time::Duration::from_micros(
                     u64::try_from(took.as_micros()).unwrap_or(u64::MAX).max(1),
                 );
@@ -7668,10 +6805,8 @@ impl App {
         (seed, kept)
     }
 
-    /// The prelaunched attempt's budget for its next park: the ladder at the
-    /// target's prior physical failures plus this attempt's misses, with rung 0 the
-    /// dry-run seed, as `(prior failures incl. misses, budget, seed)`; `None` with
-    /// no attempt prelaunched. The park reads its budget only from here.
+    /// The prelaunched attempt's budget for its next park, as `(prior failures incl.
+    /// misses, budget, seed)`; the park reads its budget only from here.
     #[cfg(any(target_os = "macos", all(test, unix)))]
     pub(crate) fn prelaunched_park_budget(&self) -> Option<(u8, std::time::Duration, FreezeSeed)> {
         let prelaunch = self.update_handoff_prelaunch.as_ref()?;
@@ -7682,10 +6817,9 @@ impl App {
         Some((prior, budget, prelaunch.freeze_seed))
     }
 
-    /// The launched lane's first half: records the attempt, hands the worker what
-    /// it needs to launch and hold the successor, and returns with every reader
-    /// live. The park is taken later on this thread, when the worker reports the
-    /// dial (`Wake::UpdateHandoffAwaitingPark`) and the park gate admits.
+    /// The launched lane's first half: records the attempt and hands the worker what it
+    /// needs to launch and hold the successor, returning with every reader live; the park
+    /// comes when the worker reports the dial and the gate admits.
     #[cfg(target_os = "macos")]
     fn prelaunch_out_of_band_handoff(
         &mut self,
@@ -7716,10 +6850,8 @@ impl App {
         // Read here, on the main thread, where the windows are: the worker
         // that launches the successor never touches `App`.
         let warm_hint = self.handoff_warm_hint();
-        // The worker writes this as the layout sidecar while the successor boots;
-        // the park only checks it (`handoff_diet`). With readers live a busy tab's
-        // folder or title may read degraded, which costs a rewrite at the park,
-        // never a wrong sidecar.
+        // Written as the layout sidecar while the successor boots, then checked by the
+        // park (`handoff_diet`): a degraded read costs a rewrite, never a wrong sidecar.
         let speculative_layout = Some(self.capture_handoff_layout());
         let (stand_down_tx, stand_down_rx) = std::sync::mpsc::sync_channel(1);
         let (stand_down_ack_tx, stand_down_ack_rx) = std::sync::mpsc::sync_channel(1);
@@ -7809,18 +6941,15 @@ impl App {
             "update apply: launching the successor with every reader live (the late park); \
              the outgoing process parks once it has dialled"
         );
-        // The successor is booting and nothing waits on this thread until it dials,
-        // so time the park's capture now with readers live and seed the first
-        // freeze rung. The attempt stays `launched`; the ledger writer runs
-        // detached.
+        // While the successor boots, time the park's capture with readers live and seed
+        // the first freeze rung.
         let _seeded =
             self.seed_first_freeze_rung(mode, crate::seamless::WireCaps::for_target(target_build));
         Ok(())
     }
 
-    /// `Wake::UpdateHandoffAwaitingPark`: the worker holds the successor's dial (or
-    /// must fork), so the park may be taken, at once for an explicit apply and at
-    /// the next quiet moment for the automatic lane.
+    /// `Wake::UpdateHandoffAwaitingPark`: the worker holds the successor's dial (or must
+    /// fork), so the park may be taken when the gate admits.
     #[cfg(any(target_os = "macos", all(test, unix)))]
     pub(crate) fn on_update_handoff_awaiting_park(
         &mut self,
@@ -7864,10 +6993,8 @@ impl App {
         self.try_park_for_prelaunched_successor(now);
     }
 
-    /// The park gate for a prelaunched attempt, re-run from the event loop every
-    /// [`PRELAUNCH_PARK_RETRY`] while the automatic lane waits for a quiet moment,
-    /// bounded by [`PRELAUNCH_HOLD_MAX`]: an attempt held past it stands down as
-    /// activity-revoked (no physical budget spent) and retries later.
+    /// The park gate for a prelaunched attempt, re-run every [`PRELAUNCH_PARK_RETRY`] while
+    /// the automatic lane waits for a quiet moment, bounded by [`PRELAUNCH_HOLD_MAX`].
     #[cfg(any(target_os = "macos", all(test, unix)))]
     pub(crate) fn try_park_for_prelaunched_successor(&mut self, now: std::time::Instant) {
         let Some(prelaunch) = self.update_handoff_prelaunch.as_ref() else {
@@ -7882,10 +7009,8 @@ impl App {
             return;
         }
         let attempt = self.park_and_transfer_to_prelaunched_successor(now);
-        // A park that did not hand its capture over resumes the history export it
-        // paused: readers are live again, and a paused export would meet the
-        // re-park's heads with a stale fence (`Outrun`). A landed park took the
-        // export with its capture.
+        // A park that did not hand its capture over resumes the export it paused, or the
+        // re-park would meet a stale fence (`Outrun`).
         if !matches!(attempt, ParkAttempt::Parked)
             && let Some(export) = self
                 .update_handoff_prelaunch
@@ -7906,10 +7031,8 @@ impl App {
                     aterm_log::debug!("update apply: not parking yet — {reason}");
                 }
             }
-            // A refused capture is not a missed park: a wider rung cannot change
-            // it, and `ActivityRevoked` would claim the machine was busy. The
-            // successor stands down as `CaptureRefused`; the refusal lane retries
-            // once the desk changes.
+            // A refused capture is not a missed park: no rung changes it, so the successor
+            // stands down as `CaptureRefused`, retried once the desk changes.
             ParkAttempt::Refused(refusal) => {
                 aterm_log::warn!(
                     "update apply: {refusal}; a wider freeze rung cannot change that, so the \
@@ -7917,16 +7040,11 @@ impl App {
                 );
                 self.stand_down_prelaunched_successor(capture_refusal_stand_down(&refusal));
             }
-            // A park that missed its budget is not a failed update: readers are back
-            // (nothing granted), the successor still holds. Re-park on the next rung,
-            // and once every rung is tried stand down as a busy machine, retried on
-            // the activity spacing, never a latch (`park_miss_disposition`).
+            // A missed park is not a failed update: re-park on the next rung, and once
+            // every rung is tried stand down as a busy machine (`park_miss_disposition`).
             ParkAttempt::Missed(reason) => {
-                // Every miss is pre-record: the parked attempt is stored at the end
-                // of the park half, after the last point that can miss, so a miss
-                // leaves only the prelaunch record and resumed readers. That makes
-                // re-parking under the same nonce sound; the layout sidecar is sealed
-                // against whichever park lands (`handoff_diet::seal_layout`).
+                // Every miss is pre-record (the parked attempt is stored after the last
+                // point that can miss), so re-parking under the same nonce is sound.
                 debug_assert!(
                     self.pending_update_handoff.is_none(),
                     "a park that missed its budget must leave no parked attempt behind"
@@ -7954,12 +7072,9 @@ impl App {
         }
     }
 
-    /// THE LAUNCHED LANE'S GATE HOLDS THE PARK BACK with every reader live (the
-    /// review of round eight's leads U60 and U40): a rim a missed park started
-    /// leaves, since the terminal it would explain echoes again and the gate may
-    /// wait until [`PRELAUNCH_HOLD_MAX`] — the U60 symptom, a rim pulsing around a
-    /// working terminal. The park the gate admits next starts it again
-    /// (`charge_upgrade_rim_at_park`). Before the first park there is none.
+    /// While the gate holds the park back with readers live, a rim a missed park started
+    /// leaves (it would pulse around a working terminal); the next admitted park starts it
+    /// again.
     #[cfg(any(target_os = "macos", all(test, unix)))]
     fn retire_rim_while_the_gate_waits(&mut self) {
         if self.pending_update_handoff.is_none() {
@@ -8022,20 +7137,11 @@ impl App {
         }
     }
 
-    /// `Wake::UpdateHandoffStandingDown`: the worker is about to revoke a held,
-    /// ungranted successor and waits for this answer.
-    ///
-    /// Runs on the main thread beside the park gate, so no park can be in progress
-    /// or start afterwards:
-    ///
-    ///  1. The gate closes for good: nothing parks onto a successor being killed.
-    ///  2. If a park landed, its readers resume now (`UnparkForRepark`); exact,
-    ///     since no descriptor was granted, and the user does not wait out the
-    ///     grace, SIGKILL and reap frozen.
-    ///
-    /// The attempt record outlives both until the completion, so no retry launches
-    /// beside the candidate; the parked record's deferred teardown and activity
-    /// flag move onto it for the completion to replay.
+    /// `Wake::UpdateHandoffStandingDown`: the worker is about to revoke a held, ungranted
+    /// successor and waits for this answer. On the main thread beside the park gate, so no
+    /// park is in progress: closes the gate for good and resumes the readers of a landed
+    /// park, so the user does not wait out the grace and reap frozen. The attempt record
+    /// outlives both until the completion, so no retry launches beside the candidate.
     #[cfg(any(target_os = "macos", all(test, unix)))]
     pub(crate) fn answer_prelaunched_stand_down(&mut self, attempt_id: u64) {
         let mut ack = None;
@@ -8063,23 +7169,17 @@ impl App {
                 pending.park_at.elapsed().as_millis()
             );
         }
-        // Answered last, after the gate is shut and readers are back, since the
-        // worker revokes on this. A full or disconnected channel means the worker
-        // stopped waiting, which it reports itself.
+        // Answered last, after the gate is shut and readers are back, since the worker
+        // revokes on this.
         if let Some(ack) = ack {
             let _ = ack.try_send(());
         }
     }
 
-    /// The launched lane's second half: the park itself, at the dial or the quiet
-    /// moment after. Everything that needs stopped readers happens here (registry
-    /// projection, descriptor duplicates, window carry, device-term proof
-    /// identities, capture ladder, layout, both digests) and crosses to the worker
-    /// as one [`HandoffTransferJob`].
-    ///
-    /// `NotYet` means try again shortly; `Failed` stands the successor down with
-    /// the completion's outcome. Every `Failed` after `park_all_readers` has already
-    /// rolled the readers back, since the successor holds nothing.
+    /// The launched lane's second half: the park itself. Everything that needs stopped
+    /// readers happens here and crosses to the worker as one [`HandoffTransferJob`].
+    /// `NotYet` means try again shortly; every `Failed` after `park_all_readers` has rolled
+    /// the readers back.
     #[cfg(any(target_os = "macos", all(test, unix)))]
     fn park_and_transfer_to_prelaunched_successor(
         &mut self,
@@ -8106,10 +7206,8 @@ impl App {
         let build = crate::build_info::build_number()
             .parse::<u64>()
             .unwrap_or(0);
-        // The successor's signed handoff policy, keyed by the launched artifact. It
-        // only lowers what this park carries and relaxes gates only this producer
-        // applies. Re-read at every gate run, since the worker's verdict may have
-        // landed since.
+        // The successor's signed handoff policy, re-read at every gate run since the
+        // worker's verdict may have landed; it only lowers what this park carries.
         let policy = self.park_policy(apply_attempt.as_ref());
         let ceiling = policy.carry_ceiling();
         // A ceiling carrying no scrollback stops the history export now, before
@@ -8118,9 +7216,8 @@ impl App {
             self.withhold_history_export(target_build, ceiling);
         }
 
-        // Sessions with a live process only: exited panes are left out before the
-        // gate reads the masters, so a hung-up master cannot hold or fail the park
-        // (`handoff_live_sessions`).
+        // Sessions with a live process only, so a hung-up master cannot hold or fail the
+        // park.
         let live: Vec<(u64, i32, i32)> = self.handoff_live_sessions();
         if live.is_empty() {
             return ParkAttempt::Failed(HandoffStandDown {
@@ -8128,15 +7225,9 @@ impl App {
                 detail: "every terminal session closed while the successor booted".to_string(),
             });
         }
-        // The scrollback export's first pass comes first (`crate::handoff_history`):
-        // it runs with readers live, and sessions it has not reached get only the
-        // screen carry's bounded history (counted). Bounded by
-        // `handoff_history::EXPORT_PATIENCE` after the dial; waiting freezes nothing.
-        // Afterwards the export follows each history until the park stops it. The
-        // held panes' passes are waited for too (`HistoryExporter::passed`): they
-        // run between the handed sessions' follows (round eight of the update
-        // audit, #801), so the wait costs a handed session nothing, and a held pass
-        // the patience runs out on stays behind, counted.
+        // The scrollback export's first pass (the held panes' included) comes first, with
+        // readers live, bounded by `handoff_history::EXPORT_PATIENCE` after the dial;
+        // sessions it has not reached carry the screen carry's bounded history, counted.
         let exporting = self
             .update_handoff_prelaunch
             .as_mut()
@@ -8148,9 +7239,8 @@ impl App {
             self.retire_rim_while_the_gate_waits();
             return ParkAttempt::NotYet(reason);
         }
-        // The gate: the only decision that costs the user anything
-        // (`prelaunch_park_admitted`). This is about idleness; session death is
-        // re-checked under the park below.
+        // The gate, the only decision that costs the user anything, is about idleness;
+        // session death is re-checked under the park.
         let gate_facts = ParkGateFacts {
             mode,
             phase: self.automatic_phase_for(mode, now),
@@ -8163,8 +7253,8 @@ impl App {
             recording: self.video_request_live(),
         };
         let gate = prelaunch_park_admitted(gate_facts, prelaunch_hold_cap(mode));
-        // CONSECUTIVE `Land` waits, counted here where the gate is read (plan
-        // P1-3): any other answer, or any other phase, starts the count over.
+        // Consecutive `Land` waits, counted here where the gate is read: any other answer,
+        // or any other phase, starts the count over.
         let last_wait = self
             .update_handoff_prelaunch
             .as_ref()
@@ -8216,13 +7306,9 @@ impl App {
                 });
             }
         }
-        // Pause the export before anything freezes: a chunk read beside the park
-        // would contend with the capture's locks and the layout's `try_lock`. The
-        // pause takes one bounded last look; later output rides the screen carry.
-        // Paused, not stopped: any return below that does not hand the capture
-        // over leaves the export on the attempt, and the gate resumes it
-        // (`try_park_for_prelaunched_successor`), so a re-park joins an export that
-        // kept following.
+        // Pause the export before anything freezes, so it does not contend with the
+        // capture's locks; later output rides the screen carry. Paused, not stopped: a
+        // park that does not hand the capture over leaves it to resume.
         if let Some(export) = self
             .update_handoff_prelaunch
             .as_mut()
@@ -8250,14 +7336,8 @@ impl App {
                 );
             }
         }
-        // This process's own limits are not a verdict about the candidate: each
-        // stand-down here other than the park or capture is `ProducerFailed`
-        // (Transient), e.g. a tab opened during the hold or `EMFILE`.
-        //
-        // The limit is the dialled claim's: `transfer` holds the pool to what the
-        // successor claimed, not to the cached `Info.plist` declaration. A fork
-        // (`grant_limit: None`) passes masters by inheritance, bounded only by the
-        // capture's `MAX_HANDOFF_SESSIONS`.
+        // This process's own limits are not a verdict about the candidate
+        // (`ProducerFailed`): here, more sessions than the dialled claim's grant carries.
         if let Some(limit) = grant_limit
             && live.len() > limit
         {
@@ -8270,9 +7350,8 @@ impl App {
                 ),
             });
         }
-        // Capture the session registry before parking: this projection can fail
-        // (`WouldBlock`) and must then leave the terminal untouched. No disk I/O.
-        // Hold serials first, as on the fork lane (`hold_serials`).
+        // The registry projection can fail (`WouldBlock`), so it is taken before parking;
+        // hold serials first, as on the fork lane.
         let hold_serials = self.hold_serials();
         let manifest = match self.store.try_read() {
             Ok(store) => crate::session_store::SessionHandoff::from_store(&store),
@@ -8286,7 +7365,7 @@ impl App {
         };
         let manifest = handed_sessions_only(manifest, &live);
         // What the Commit compares again of each record, as drawn here
-        // (`session_store::CarriedClaims`, round eight, finding 751).
+        // (`session_store::CarriedClaims`).
         let carried_claims = carried_claims_of(&manifest);
         let (owned_masters, adoption) = match reserve_child_only_masters(&live) {
             Ok(reserved) => reserved,
@@ -8303,8 +7382,7 @@ impl App {
         };
         let window = self.park_window_carry(target_build);
         // The proof term is the PTY device on this lane (`SCM_RIGHTS` installs the
-        // receiver's own numbers); a launched attempt that must fork keeps that
-        // term, and the worker names it in the successor's environment.
+        // receiver's own numbers), kept if the attempt must fork.
         #[cfg(target_os = "macos")]
         let Some(proof_identities) =
             crate::handoff_rendezvous::proof_identities_in_device_terms(&adoption)
@@ -8324,9 +7402,8 @@ impl App {
                 detail: "handoff activity identity space is exhausted".to_string(),
             });
         }
-        // The ladder plus this attempt's own misses: a missed park re-parks on the
-        // next rung (seed -> 2 × seed, at least 80 -> 250 ms) without giving the
-        // booted successor back. Rung 0 is the seed from beside the launch.
+        // The ladder plus this attempt's own misses: a missed park re-parks on the next
+        // rung without giving the booted successor back.
         let Some((prior_physical_failures, freeze_budget, freeze_seed)) =
             self.prelaunched_park_budget()
         else {
@@ -8343,14 +7420,9 @@ impl App {
              dial",
             now.saturating_duration_since(dialled_at).as_millis()
         );
-        // The instant the terminal stops echoing: the start of the user's freeze
-        // and the zero point of the numbers reported at Commit. The rim starts
-        // HERE, not at apply begin (round eight of the update audit, leads U60 and
-        // U40): the boot, the dial and the gate's hold before this ran with every
-        // reader live, and a rim charged through them pulsed around a working
-        // terminal and could reach its cap before this freeze. A re-park after a
-        // miss keeps the rim the first park started, its cap counted again from
-        // this park.
+        // The instant the terminal stops echoing: the start of the user's freeze. The rim
+        // starts here, not at apply begin, since everything before ran with readers live;
+        // a re-park keeps the rim the first park started, its cap counted from this park.
         self.charge_upgrade_rim_at_park(build);
         let park_at = std::time::Instant::now();
         let deadline = park_at + freeze_budget;
@@ -8401,9 +7473,8 @@ impl App {
                     "update apply: the park stopped the readers in {readers_ms} ms and its \
                      capture ran {capture_ms} ms before it stopped ({freeze_ms} ms budget)"
                 );
-                // A parser mid-sequence over a flood is cured by the next batch
-                // boundary, not a wider rung: it re-parks at the gate's cadence,
-                // bounded ([`mid_sequence_miss_disposition`]).
+                // A parser mid-sequence is cured by the next batch boundary, not a wider
+                // rung ([`mid_sequence_miss_disposition`]).
                 if matches!(failure, CaptureFailure::MidSequence { .. }) {
                     return ParkAttempt::MissedMidSequence(failure.to_string());
                 }
@@ -8416,8 +7487,8 @@ impl App {
         let manifest = stamp_fg_holders(manifest, &fg_holders);
         let manifest = stamp_render_debts(manifest, &render_debts);
         let manifest = stamp_journal_keys(manifest, &self.journal_keys());
-        // POST-PARK, AND DELIBERATELY SO — see the fork lane for why a pre-park
-        // layout capture revoked healthy attempts.
+        // Post-park, as on the fork lane: before the park a reader's term lock can degrade
+        // the layout into a false topology change.
         let layout = self.capture_handoff_layout();
         let layout_digest = match commit_handoff_layout(&layout) {
             Ok(digest) => digest,
@@ -8444,8 +7515,8 @@ impl App {
             proof_ready_at: None,
             nonce: Some(nonce),
             live: live.clone(),
-            // The PROOF identities, in the device term — see
-            // `HandoffCapture::proof_identities`. Never `live`.
+            // The proof identities, in the device term (`HandoffCapture::proof_identities`).
+            // Never `live`.
             adoption: proof_identities.clone(),
             child_pid: dialer_pid,
             mode,
@@ -8486,11 +7557,8 @@ impl App {
                 proof_identities,
                 _owned_masters: owned_masters,
                 history_heads,
-                // Taken here, after every point a park can miss: a re-park keeps
-                // the export it waited for, resumed after the miss
-                // (`HistoryExporter::resume`). Handed over paused; the worker's
-                // `finish` stops it. Withheld, and stopped, under a ceiling that
-                // carries no scrollback.
+                // Taken after every point a park can miss; handed over paused, withheld
+                // under a ceiling with no scrollback.
                 history: crate::handoff_history::HistoryPlan::exported_under(
                     ceiling,
                     self.update_handoff_prelaunch
@@ -8518,9 +7586,8 @@ impl App {
                 detail: "overlap handoff worker stopped before the transfer".to_string(),
             });
         }
-        // A live `video` take is not answered here: the proof may never come and
-        // the attempt roll back. Commit answers it and waits for the reply to
-        // reach its client (`App::video_answer_before_commit`).
+        // A live `video` take is not answered here, since the proof may never come; Commit
+        // answers it (`App::video_answer_before_commit`).
         aterm_log::info!(
             "update apply: parked and captured {carried} screen(s) in {} ms (the readers stopped \
              in {} ms, the capture and its hand-over took {} ms); the capture is on its way to \
@@ -8534,41 +7601,23 @@ impl App {
         ParkAttempt::Parked
     }
 
-    /// The pre-Commit input-drain gate. Returns `None` when the completion was
-    /// re-posted for another drain spin (the caller must return), otherwise the
-    /// completion plus the `input_dispatch_fenced` / `egress_settled` admission
-    /// facts.
-    ///
-    /// Hardware events accepted just before this callback may not have been
-    /// dispatched through winit yet and would die with `_exit`. Commit waits across
-    /// a dispatch fence counted in loop iterations that really dispatched events:
-    /// re-posting this completion lets the run loop deliver them to the still-open
-    /// masters, and the re-post re-runs this admission. Bounded by the 3 s drain
-    /// deadline (the spin cap is a backstop) and by the worker's 15 s decision
-    /// deadline. A failed re-post means the loop is closing; the dropped reject
-    /// sender makes the worker reject and reap.
-    ///
-    /// Dispatched keystrokes can also sit in process-local queues (the paste-order
-    /// FIFO, a wedged tty's sink spill) that die with `_exit`, and a control verb's
-    /// blocking write can be part-way into a master, which `_exit` would cut; so
-    /// Commit also waits for every handed session's egress to reach the kernel
-    /// (`handoff_egress_settled`), and an unflushable spill or a write that never
-    /// finishes fails closed (rollback).
-    ///
-    /// No quiet window is waited for: `user_input_recent` reads the machine-wide
-    /// HID idle clock, and after the reveal the successor's own keystrokes would
-    /// hold the parent's gate open. The gate settles at its ~30-45 ms floor.
+    /// The pre-Commit input-drain gate: `None` when the completion was re-posted for
+    /// another spin, otherwise the completion with the `input_dispatch_fenced` and
+    /// `egress_settled` facts. Hardware events not yet dispatched would die with `_exit`, so
+    /// Commit waits across a fence counted in loop iterations, and for every handed
+    /// session's egress to reach the kernel; bounded by the 3 s drain deadline, failing
+    /// closed. No quiet window is waited for: the successor's own keys would hold it open.
     #[cfg(unix)]
     fn handoff_drain_gate(
         &mut self,
         completion: crate::UpdateHandoffCompletion,
     ) -> Option<(crate::UpdateHandoffCompletion, bool, bool)> {
         const HANDOFF_INPUT_DRAIN_SPIN_CAP: u32 = 4_000;
-        /// MANDATORY minimum event-loop time between ProofReady and Commit.
+        /// Mandatory minimum event-loop time between ProofReady and Commit.
         const HANDOFF_INPUT_DISPATCH_FENCE: std::time::Duration =
             std::time::Duration::from_millis(30);
-        /// Absolute wall-clock backstop. An egress queue that never settles
-        /// must fail CLOSED (rollback), never `_exit` over undelivered bytes.
+        /// Absolute wall-clock backstop. An egress queue that never settles must fail
+        /// closed (rollback), never `_exit` over undelivered bytes.
         const HANDOFF_INPUT_DRAIN_DEADLINE: std::time::Duration =
             std::time::Duration::from_millis(3_000);
         // A vanished pending attempt cannot be drained toward Commit; fall through
@@ -8583,8 +7632,8 @@ impl App {
             })
         };
         let drained_for = drained_for.unwrap_or(HANDOFF_INPUT_DRAIN_DEADLINE);
-        // The fence needs BOTH a completed re-post (so the loop really
-        // iterated) and the elapsed floor.
+        // The fence needs both a completed re-post (so the loop really iterated) and the
+        // elapsed floor.
         let input_dispatch_fenced =
             completion.input_drain_spins >= 1 && drained_for >= HANDOFF_INPUT_DISPATCH_FENCE;
         let egress_settled = self
@@ -8610,11 +7659,9 @@ impl App {
             };
             return match self.repost_handoff_completion(respin) {
                 Ok(()) => None,
-                // The loop is closing. An attempt that holds its Commit's claim
-                // ([`HeldCommit`]) has nobody else to finish it — the worker
-                // cannot reject a claimed attempt — so its admission is read
-                // now, unfenced, and refuses it: the claim goes to the
-                // rejection, as any refusal's does.
+                // The loop is closing. A held claim has nobody else to finish it (the
+                // worker cannot reject a claimed attempt), so its admission is read now,
+                // unfenced, and refuses it.
                 Err(respin) if held => Some((*respin, false, egress_settled)),
                 // Otherwise the dropped completion's reject sender makes the
                 // worker reject and reap.
@@ -8625,8 +7672,7 @@ impl App {
     }
 
     /// Whether a handoff completion can go back through this thread's event loop
-    /// ([`Self::repost_handoff_completion`]): there is one (`headless_for_test`
-    /// has none, unless the test takes the re-posts itself).
+    /// ([`Self::repost_handoff_completion`]).
     #[cfg(unix)]
     fn handoff_loop_present(&self) -> bool {
         #[cfg(test)]
@@ -8636,10 +7682,8 @@ impl App {
         self.proxy.is_some()
     }
 
-    /// Post `completion` back to this thread's event loop, which dispatches the
-    /// input queued to this process before it comes back ([`Self::handoff_drain_gate`]);
-    /// `Err` hands it back when the loop is closing. A test that set
-    /// `handoff_reposts` takes it there and feeds it back itself.
+    /// Post `completion` back through this thread's event loop, which dispatches queued
+    /// input first; `Err` hands it back when the loop is closing.
     #[cfg(unix)]
     fn repost_handoff_completion(
         &mut self,
@@ -8663,14 +7707,10 @@ impl App {
             })
     }
 
-    /// The Commit's messages flush, run once per attempt BEFORE the claim
-    /// ([`Self::finish_proven_handoff`], round eight of the update audit,
-    /// finding 18): `true` when it took long enough that input may have
-    /// queued behind it ([`HANDOFF_INPUT_DRAIN_YIELD`], the grain the dispatch
-    /// fence is measured in), so the attempt goes through the drain gate again,
-    /// its clock restarted. What the flush lands is lost to no rollback, which
-    /// is why it may run before the claim; whether the writer answered decides
-    /// the flush after it.
+    /// The Commit's messages flush, once per attempt before the claim (what it lands is
+    /// lost to no rollback): `true` when it held the main thread a fence grain
+    /// ([`HANDOFF_INPUT_DRAIN_YIELD`]) or more, so input may have queued behind it and the
+    /// attempt goes through the drain gate again.
     #[cfg(unix)]
     fn commit_flush_refences(&mut self) -> bool {
         if self
@@ -8680,9 +7720,8 @@ impl App {
         {
             return false;
         }
-        // With no writer behind it the flush waits on nothing: its hold is
-        // none, whatever the scheduler did meanwhile (a descheduled main
-        // thread here is no different from one anywhere else in the loop).
+        // With no writer the flush waits on nothing, so its hold is none whatever the
+        // scheduler did.
         let writer = self.messages_log.is_some();
         let started = std::time::Instant::now();
         let landed = self.flush_messages_log_within(MESSAGES_FLUSH_COMMIT_WAIT);
@@ -8694,10 +7733,8 @@ impl App {
         self.settle_commit_flush(landed, held)
     }
 
-    /// What the Commit's flush leaves on the attempt, given whether the writer
-    /// answered (`landed`) and how long waiting on it `held` the main thread:
-    /// the writer's answer is kept, and a hold of a fence grain or more
-    /// ([`HANDOFF_INPUT_DRAIN_YIELD`]) restarts the fence's clock.
+    /// Keeps the writer's answer (`landed`) on the attempt, and restarts the fence's clock
+    /// when the flush `held` the main thread a fence grain or more.
     #[cfg(unix)]
     fn settle_commit_flush(&mut self, landed: bool, held: std::time::Duration) -> bool {
         let refence = held >= HANDOFF_INPUT_DRAIN_YIELD;
@@ -8710,15 +7747,9 @@ impl App {
         refence
     }
 
-    /// THE PAIRS THIS PROCESS'S CRASH JOURNAL KEYS ITS HANDED SHELLS BY, when
-    /// that journal still holds the image this process took over at its own
-    /// Commit (`crash_journal::Lane::inherited_image_parent`; round seven of the
-    /// update audit, leftover I2b): for each session the update's parent
-    /// handed it, the pair the parent's record said that image keys it by
-    /// (`Session::journal_key`, when the parent had not replaced ITS parent's
-    /// image either), else the parent's own pair for it. Empty once this
-    /// process has an image of its own on disk — its successor's registrations
-    /// then name this process's pairs, which that image's leaves carry.
+    /// The pairs this process's crash journal keys its handed shells by, while that journal
+    /// still holds the image this process took over at its own Commit: each session's
+    /// `journal_key` from the parent, else the parent's own pair. Empty otherwise.
     #[cfg(unix)]
     pub(crate) fn journal_keys(&self) -> Vec<(u64, (u32, u64))> {
         let Some(parent) = self.crash_journal.inherited_image_parent() else {
@@ -8737,14 +7768,9 @@ impl App {
             .collect()
     }
 
-    /// Every pooled session's hold serial, summed
-    /// ([`crate::fabric::SessionFabric::hold_serial`]): the park's reading of where
-    /// every halt stands, compared again at Commit.
-    ///
-    /// The counters only grow, so any hold moving changes the sum (a session
-    /// joining or leaving is refused by `exact_sessions`). Per session, so the
-    /// reading is this `App`'s. One short fabric lock each, never under a
-    /// `Terminal` or the registry.
+    /// Every pooled session's hold serial, summed: the counters only grow, so any hold
+    /// moving changes the sum. One short fabric lock each, never under a `Terminal` or the
+    /// registry.
     #[cfg(unix)]
     pub(crate) fn hold_serials(&self) -> u64 {
         self.pool
@@ -8753,11 +7779,10 @@ impl App {
             .fold(0, u64::wrapping_add)
     }
 
-    /// Whether every handed session's [`crate::session_store::CarriedClaims`] —
-    /// its topics, keyed escalations and supervisor claim — still reads as the
-    /// park drew it (`drawn`, the pending attempt's). A session no longer pooled
-    /// reads as moved; `exact_sessions` names that too. One short meta lock and
-    /// one topics lock each, never under a `Terminal` or the registry.
+    /// Whether every handed session's [`crate::session_store::CarriedClaims`] (topics,
+    /// keyed escalations, supervisor claim) still reads as the park drew it (`drawn`); a
+    /// session no longer pooled reads as moved. One short meta lock and one topics lock
+    /// each, never under a `Terminal` or the registry.
     #[cfg(unix)]
     pub(crate) fn carried_claims_held(
         &self,
@@ -8777,12 +7802,9 @@ impl App {
         })
     }
 
-    /// Whether any pooled session's timeline or inbox has handed out an id past the
-    /// manifest's last id plus its overlap reserve
-    /// ([`crate::session_timeline::SessionTimeline::past_handoff_ceiling`],
-    /// [`crate::fabric::SessionFabric::past_handoff_ceiling`]): the successor would
-    /// reuse it, so the Commit stands down. Ordinary overlap traffic never does.
-    /// Read after the fence; one short lock each, in turn.
+    /// Whether any session's timeline or inbox has handed out an id past the manifest's
+    /// last id plus its overlap reserve (`past_handoff_ceiling`): the successor would reuse
+    /// it, so the Commit stands down. Read after the fence.
     #[cfg(unix)]
     fn ids_past_handoff_ceiling(&self) -> bool {
         self.pool.iter().any(|session| {
@@ -8796,15 +7818,11 @@ impl App {
         })
     }
 
-    /// [`Self::hold_serials`] as the Commit reads it: each serial read under the
-    /// guard that fences it ([`crate::fabric::SessionFabric::fence_hold`]), so no
-    /// `hold` lands unseen until the process exits. The fence lifts when the guard
-    /// drops, on every stand-down path; a landed Commit `_exit`s with it raised.
-    ///
-    /// `successor_reads_carry`: a same-or-newer successor carries the outbox on, so
-    /// the fence also holds the bridge's retirements back; for an older successor
-    /// (downgrade, channel switch) they are answered here, since an unanswered one
-    /// would leave a sequence pin that swallows its own post.
+    /// [`Self::hold_serials`] as the Commit reads it, each under the guard that fences it
+    /// ([`crate::fabric::SessionFabric::fence_hold`]), so no `hold` lands unseen before the
+    /// exit; the fence lifts when the guard drops. For a same-or-newer successor
+    /// (`successor_reads_carry`) the fence also holds the bridge's retirements back; for an
+    /// older one they are answered here, or a sequence pin would swallow its own post.
     #[cfg(unix)]
     fn fence_hold_serials(&self, successor_reads_carry: bool) -> (u64, HoldFence) {
         let fabrics: Vec<std::sync::Arc<crate::fabric::SessionFabric>> = self
@@ -8819,10 +7837,8 @@ impl App {
         (serials, HoldFence(fabrics))
     }
 
-    /// Snapshots the pending attempt and collects every Commit admission fact
-    /// ([`HandoffCommitFacts`]). `None` when the pending attempt vanished mid-drain
-    /// (the caller rejects). Also returns the fresh native-safety evidence (`Err`
-    /// carries the reasons), the exact adoption proof and the attempt arbiter.
+    /// Collects every Commit admission fact ([`HandoffCommitFacts`]) with the native-safety
+    /// evidence, the adoption proof and the arbiter; `None` when the attempt vanished.
     #[cfg(unix)]
     #[allow(clippy::type_complexity)]
     fn collect_handoff_commit_facts(
@@ -8856,11 +7872,9 @@ impl App {
             pending.teardown,
             crate::DeferredHandoffTeardown::None | crate::DeferredHandoffTeardown::CleanQuitReady
         );
-        // A hold that moved since the park is structural activity: the successor's
-        // manifest has the holds as the park drew them. Read under the fence
-        // (`fence_hold_serials`), which holds later holds back until the attempt
-        // exits or stands down; this is the last comparison. A held claim
-        // ([`HeldCommit`]) reads them under the fence it raised at the claim.
+        // A hold that moved since the park is structural activity. Read under the fence
+        // (`fence_hold_serials`), which holds later holds back; a held claim reads them
+        // under the fence it raised at the claim.
         let (commit_hold_serials, hold_fence) = match held_fence {
             Some(fence) => (fence.serials(), fence),
             None => self.fence_hold_serials(successor_reads_fabric_carry(
@@ -8868,9 +7882,8 @@ impl App {
                 crate::running_build_number(),
             )),
         };
-        // Minting more turn ids in the overlap than the manifest's reserve
-        // (`control::TURN_ID_RESERVE`) would share one with the successor: a
-        // lossless retry. Other overlap turns are tolerated.
+        // More turn ids minted in the overlap than the manifest's reserve would share one
+        // with the successor: a lossless retry.
         let turn_ids_held =
             !crate::control::turn_ids_past_handoff_ceiling(arbiter.turn_id_ceiling());
         if !turn_ids_held {
@@ -8879,9 +7892,9 @@ impl App {
                  than its reserve holds; standing the Commit down so no id is minted twice"
             );
         }
-        // A topic, escalation or claim that moved since the park's draw is in no
-        // manifest: a lossless retry. Read after the fence, under which no
-        // `topic` change lands (`fabric::cmd_topic`).
+        // A topic, escalation or claim that moved since the park's draw is in no manifest:
+        // a lossless retry. Read after the fence, under which no `topic` change lands
+        // (`fabric::cmd_topic`).
         let claims_held = self.carried_claims_held(&pending_carried_claims);
         if !claims_held {
             aterm_log::warn!(
@@ -8891,13 +7904,21 @@ impl App {
             );
         }
         let exact_activity = self.update_handoff_activity_epoch == pending_activity_epoch
+            // A prelaunch can capture its epoch after a tab was queued. The
+            // epoch alone cannot attest that unfinished tab's ownership.
+            && self.tab_spawns.is_empty()
+            && {
+                #[cfg(target_os = "macos")]
+                { self.askpass_sheet.is_none() }
+                #[cfg(not(target_os = "macos"))]
+                { true }
+            }
             && commit_hold_serials == pending_hold_serials
             && !self.ids_past_handoff_ceiling()
             && turn_ids_held
             && claims_held;
-        // The live set as the park drew it: an exited pane left out stays out, but a
-        // handed session that exited during the overlap stays in, so
-        // `sessions_alive` names its death. Both are activity.
+        // The live set as the park drew it: an exited pane left out stays out, a handed
+        // session that exited during the overlap stays in for `sessions_alive` to name.
         let exited = self.handoff_exited_session_ids();
         let mut current_live: Vec<(u64, i32, i32)> = self
             .pool
@@ -8911,9 +7932,8 @@ impl App {
         let mut expected_live = pending_live.clone();
         expected_live.sort_unstable();
         let exact_sessions = current_live == expected_live;
-        // Compare topology, not the raw capture (`commit_layout_topology`). The raw
-        // inequality is still logged: it is where a window drag or contended session
-        // lock shows up, neither of which may be reported as a topology change.
+        // Compare topology, not the raw capture (`commit_layout_topology`); a raw
+        // difference is only logged.
         let live_layout = self.capture_handoff_layout();
         let exact_layout =
             commit_layout_topology(&live_layout) == commit_layout_topology(&pending_layout);
@@ -8941,15 +7961,10 @@ impl App {
             .iter()
             .all(|session| session.reader_join.is_none());
         let native_safety = self.revalidate_native_update_safety();
-        // Death-only peek: queued output on a master is tolerated (it
-        // waits in the kernel for the child); HUP/ERR means the adopted
-        // live-set identity is already stale and must reject. A program that
-        // exits with output still queued is not seen here: its leader waits in
-        // the tty drain (`?Es`, measured in 706eb1ea0) until the successor's
-        // reader takes the output, so its master shows no hangup and the
-        // Commit lands. The successor then closes that pane only after the keys
-        // typed into it during the freeze replayed into it (round eight of the
-        // update audit, finding 752: `App::defers_wake_until_activation`).
+        // Death-only peek: queued output is tolerated (it waits in the kernel for the
+        // child); HUP/ERR means the adopted live set is stale. A program that exits with
+        // output still queued waits in the tty drain, so its master shows no hangup and the
+        // Commit lands; the successor closes that pane after the keys typed into it replay.
         let sessions_alive = !handoff_masters_closed(&pending_live);
         let (operator_idle, operator_quiesced) = operator_commit_facts(operator);
         let proof = nonce.and_then(|nonce| {
@@ -8982,10 +7997,8 @@ impl App {
         Some((facts, native_safety, proof, arbiter, hold_fence))
     }
 
-    /// Main-thread completion of the asynchronous overlap proof. `ProofReady` alone
-    /// is not enough: native state and the live PTY set may have changed while the
-    /// child booted. Only a fresh proof plus unchanged sessions authorizes the
-    /// destructor-free parent exit.
+    /// Main-thread completion of the overlap proof: only a fresh admission over unchanged
+    /// sessions and native state authorizes the destructor-free parent exit.
     #[cfg(unix)]
     pub(crate) fn finish_update_handoff(
         &mut self,
@@ -9003,8 +8016,7 @@ impl App {
                 .as_ref()
                 .is_some_and(|prelaunch| prelaunch.attempt_id == completion.attempt_id);
         if !matches_pending {
-            // A stale proof can never authorize Commit. Ask its still-owning worker
-            // to kill/reap readerless child; never wait on the event loop.
+            // A stale proof never authorizes a Commit: its worker rejects and reaps.
             let attempt_id = completion.attempt_id;
             let _ = deliver_handoff_rejection(completion.reject);
             aterm_log::warn!("update apply: ignored stale handoff completion {attempt_id}");
@@ -9015,18 +8027,16 @@ impl App {
             return;
         }
 
-        // Every non-ready completion is emitted only after the worker killed and
-        // reaped the child. It is now safe to restore parent readers and reduce the
-        // exact ticket using disk facts that were also collected off the UI thread.
+        // Every non-ready completion comes after the worker killed and reaped the child, so
+        // the readers may resume.
         let Some(teardown) = self.reduce_returned_handoff_completion(completion) else {
             return;
         };
         // A returned attempt is still this build: undo the successor's title the
         // ProofReady edge may have published (`publish_handoff_target_to_menu_bar`).
         self.refresh_version_menu();
-        // The child process group is reaped and overlap rollback has run. Only now
-        // may the event-loop lane replay destructive intent. A whole-app request
-        // dominates individual closes; AppKit generation ownership is preserved.
+        // Only now, with the child reaped and the rollback run, may destructive intent be
+        // replayed; a whole-app request dominates individual closes.
         match teardown {
             crate::DeferredHandoffTeardown::None => {
                 let _ = crate::menu::cancel_current_native_termination();
@@ -9089,10 +8099,8 @@ impl App {
                 self.on_native_terminate_requested(el, generation);
             }
             crate::DeferredHandoffTeardown::CleanQuitReady => {
-                // The rollback worker may have taken long enough for a native
-                // view or a document to acquire new unsaved work after the
-                // barriers' completion: both are asked again at the actual exit
-                // edge instead of replaying a stale Ready.
+                // A native view or document may have gained unsaved work during the
+                // rollback, so both are asked again at the exit edge.
                 if self.replay_clean_quit_ready() {
                     el.exit();
                 }
@@ -9100,9 +8108,8 @@ impl App {
         }
     }
 
-    /// The `ProofReady` arm of [`Self::finish_update_handoff`]: the drain gate,
-    /// the final admission, the messages flush under its own fence, then the
-    /// claim and the Commit — or the rejection.
+    /// The `ProofReady` arm of [`Self::finish_update_handoff`]: the drain gate, the final
+    /// admission, the messages flush, then the claim and the Commit, or the rejection.
     #[cfg(unix)]
     fn finish_proven_handoff(&mut self, completion: crate::UpdateHandoffCompletion) {
         let first_proof = {
@@ -9116,11 +8123,9 @@ impl App {
             pending.child_pid = completion.child_pid;
             pending.proof_ready_at.is_none()
         };
-        // THE BAR NAMES THE SUCCESSOR BEFORE THIS PROCESS DIES (2026-09-24):
-        // once, at the proof's first observation, so the dispatch fence below
-        // gives AppKit loop time to publish it before Commit. The bar may keep
-        // this process's last menu long after `_exit` — nothing need claim it —
-        // so that menu must already read the build that is about to run.
+        // The bar names the successor before this process dies, at the proof's first
+        // observation, so the dispatch fence gives AppKit time to publish it: the bar may
+        // keep this process's last menu long after `_exit`.
         if first_proof && let Some(title) = self.publish_handoff_target_to_menu_bar() {
             aterm_log::info!("update apply: Version menu now reads the successor's {title}");
         }
@@ -9131,22 +8136,16 @@ impl App {
             // closing and the drop rejects the attempt).
             return;
         };
-        // A COMMIT THAT HOLDS ITS CLAIM comes back here once more ([`HeldCommit`];
-        // round eight of the update audit, #18): what it answered at the claim
-        // took real time, so it went through the dispatch fence again. It keeps
-        // the operator's quiesce and the hold fence it took at the claim, reads
-        // the admission again, and commits; refused, its claim goes to the
-        // rejection below.
+        // A held claim ([`HeldCommit`]) comes back here once more, keeping the operator's
+        // quiesce and hold fence it took at the claim, and reads the admission again.
         let held = self
             .pending_update_handoff
             .as_mut()
             .and_then(|pending| pending.held_commit.take());
         let claimed = held.is_some();
-        // Quiesce the resident operator only for the final admission seam.
-        // A rejection drops this reversible token; a successful Commit
-        // `_exit`s while its gate is still held by `with_commit_permit`.
-        // Its answer is two of the admission's facts (round eight, #70):
-        // a busy operator refuses the Commit as activity, never as a fault.
+        // Quiesce the resident operator only for the final admission seam; a successful
+        // Commit `_exit`s while its gate is still held by `with_commit_permit`. A busy
+        // operator refuses the Commit as activity.
         let (operator_quiesce, mut operator_refusal, held_fence) = match held {
             Some(held) => (held.operator_quiesce, None, Some(held.hold_fence)),
             None => match self.operator_control.as_ref() {
@@ -9157,9 +8156,8 @@ impl App {
                 None => (None, None, None),
             },
         };
-        // `hold_fence` stays raised to the end of this arm: through the
-        // Commit's `_exit`, or until the rejection below is under way (a held
-        // claim keeps the one it raised at the claim).
+        // `hold_fence` stays raised to the end of this arm: through the `_exit`, or until
+        // the rejection below is under way.
         let Some((mut facts, native_safety, proof, arbiter, hold_fence)) = self
             .collect_handoff_commit_facts(
                 completion.nonce.as_deref(),
@@ -9178,14 +8176,10 @@ impl App {
             return;
         };
         let commit_admitted = handoff_commit_admitted(facts);
-        // THE MESSAGES FLUSH RUNS BEFORE THE CLAIM, UNDER THE FENCE (round
-        // eight, finding 18): it blocks the main thread for up to
-        // `MESSAGES_FLUSH_COMMIT_WAIT`, and a key the OS queued meanwhile
-        // would die with the `_exit`. A flush that took real time sends the
-        // attempt through the drain gate again, which dispatches that input
-        // into the masters, and the admission is read again. Nothing it does
-        // is lost to a rollback, so it may run before the claim; the video
-        // answer may not, and stays after it.
+        // The messages flush runs before the claim, under the fence: a flush that took real
+        // time sends the attempt through the drain gate again so input queued meanwhile
+        // reaches the masters. Nothing it does is lost to a rollback; the video answer is,
+        // so it stays after the claim.
         let completion =
             if !claimed && commit_admitted && proof.is_some() && self.commit_flush_refences() {
                 match self.handoff_drain_gate(crate::UpdateHandoffCompletion {
@@ -9198,9 +8192,8 @@ impl App {
             } else {
                 completion
             };
-        // Unused fields keep their underscore-prefixed bindings so their
-        // drops still run at the end of this call, exactly as when the
-        // whole completion was destructured on entry.
+        // Unused fields keep their underscore-prefixed bindings so their drops still run
+        // at the end of this call.
         let crate::UpdateHandoffCompletion {
             attempt_id,
             nonce,
@@ -9214,28 +8207,16 @@ impl App {
             child_death: _child_death,
         } = completion;
         let admitted = commit_admitted && commit_fd.is_some() && proof.is_some();
-        // THE CLAIM: a held claim has it already; otherwise it is taken here, and
-        // what must be answered before the `_exit` is answered under it.
+        // The claim: a held claim has it already; otherwise it is taken here, and what
+        // must be answered before the `_exit` is answered under it.
         let claim = claimed || (admitted && arbiter.try_begin_commit());
         let commit_lost_arbiter = admitted && !claim;
         let mut commit_write_failed = false;
         if claim && !claimed {
             let answered_in = self.answer_at_commit_claim(child_pid);
-            // WHAT THE CLAIM ANSWERED TOOK REAL TIME, SO THE COMMIT GOES THROUGH
-            // THE DISPATCH FENCE AGAIN, HOLDING ITS CLAIM (round eight of the
-            // update audit, #18). The video answer runs only under the claim
-            // (round six, #22: a take aborted before it was lost to every
-            // rollback after it), and it can block this thread for up to
-            // `VIDEO_EXPORT_COMMIT_WAIT` on a wedged encode worker or client, the
-            // messages flush for up to `MESSAGES_FLUSH_COMMIT_WAIT`. A key the OS
-            // queued to this process meanwhile died with the `_exit` whenever the
-            // successor had not taken the keyboard. So the claim is kept
-            // ([`HeldCommit`]: the operator's quiesce and the hold fence with
-            // it; the worker cannot reject a claimed attempt), the run loop
-            // dispatches that input into the masters, and the next pass reads
-            // the admission again and commits — or, refused, rolls back like an
-            // EPIPE after the claim, the answered take gone with it. The same
-            // grain as the flush's own fence (`commit_flush_refences`).
+            // What the claim answered took real time, and a key queued meanwhile would die
+            // with the `_exit`. So the claim is held ([`HeldCommit`]) through one more
+            // dispatch fence, and the next pass reads the admission again.
             if answered_in >= HANDOFF_INPUT_DRAIN_YIELD {
                 aterm_log::info!(
                     "update apply: the Commit's answers took {} ms; its claim is held through \
@@ -9270,25 +8251,13 @@ impl App {
             && admitted
             && let (Some(commit_fd), Some(proof)) = (commit_fd.as_ref(), proof)
         {
-            // THE ROWS THE CARRY DID NOT TAKE END WITH THIS PROCESS (ruling
-            // 441 (d)): an unrevealed row, the strain level, a row posted or
-            // revealed since the park (a held claim's fence among it), recorded
-            // as ended here and flushed below, never replayed open in the
-            // successor as cut off by a crash. Here, after the admission's LAST
-            // reading, never at the claim: a held claim reads it again after its
-            // fence, and a refusal there keeps this process running with its
-            // rows, which their reporters still restate and end by id. Only the
-            // egress fence, the operator's permit and the write itself can
-            // still return (an EPIPE); the rejection's caller syncs the band
-            // after any of them.
+            // The rows the carry did not take end with this process, recorded and flushed
+            // below, after the admission's last reading: a refused held claim keeps this
+            // process running with its rows.
             let closed = self.close_uncarried_messages();
-            // A HELD CLAIM'S RECORD LANDS TOO (round-seven update audit, finding
-            // 53), and so do the endings just closed: what the fence's turns of
-            // the loop recorded is flushed, waited for one grain of the fence at
-            // most (`HANDOFF_INPUT_DRAIN_YIELD`), which an idle writer answers
-            // well within: a longer wait would be one more interval for keys to
-            // queue in and die (#18). A writer that did not answer before is
-            // not waited for again.
+            // A held claim's records and the endings just closed are flushed, waiting one
+            // fence grain at most (`HANDOFF_INPUT_DRAIN_YIELD`) so keys have no new interval
+            // to queue in and die; a writer that did not answer before is not waited for.
             if (claimed || closed > 0)
                 && !matches!(
                     self.pending_update_handoff
@@ -9299,11 +8268,9 @@ impl App {
             {
                 self.flush_messages_log_within(HANDOFF_INPUT_DRAIN_YIELD);
             }
-            // THE HANDOFF WINDOW: between this process's `_exit` and the
-            // successor publishing its own entries, name the successor as
-            // the holder of every carried id, so a launch landing there is
-            // refused (`identity_claim` module header, the third gate).
-            // Withdrawn below if the Commit fails and we keep the ids.
+            // Until the successor publishes its own entries, name it the holder of every
+            // carried id, so a launch landing in between is refused (`identity_claim`);
+            // withdrawn below if the Commit fails.
             let carried: Vec<aterm_session::SessionId> = self
                 .store
                 .read()
@@ -9315,51 +8282,28 @@ impl App {
             if let Some(pid) = child_pid {
                 crate::identity_claim::mark_successor(&carried, pid);
             }
-            // THE SUPERVISOR HOST STOPS AT THE WRITE, after the admission's
-            // last reading (the review of round eight's #18). `suspend` sets
-            // every worker's stop flag and cuts its connection before it
-            // returns, and a cut worker's transport refuses every press or
-            // typed request (one already on the wire is the only exception);
-            // the threads are reaped later, off this thread. The successor
-            // resumes its own at the same Commit, and a Commit that returns
-            // resumes this one, below. It used to stop at the claim, before the
-            // answers: a stopped worker's last act clears the badges it raised
-            // (`meta unset attention owner=supervisor`, on a fresh connection
-            // the cut allows), and a claim held through the dispatch fence
-            // ([`HeldCommit`]) read its own stop's clearing as a supervisor
-            // escalation moved since the park (`carried_claims_held`): the
-            // Commit was refused as activity, its successor killed, at every
-            // retry while a supervised tab waited at a question box. Through
-            // the fence the workers run as they do before any claim, and
-            // whatever they move there is the held pass's admission to read.
+            // The supervisor host stops at the write, after the admission's last reading;
+            // a Commit that returns resumes it below. Not at the claim: a stopped worker
+            // clears the badges it raised, which a held claim's next admission would read
+            // as an escalation moved since the park.
             if let Some(host) = self.harness.as_ref() {
                 host.suspend();
             }
-            // THE CONNECTIONS THE MANIFEST LEFT OUT ARE AUDITED AS DROPPED
-            // HERE (round eight of the update audit, U23's review), with the
-            // Commit's permit in hand, right before its one write: not at the
-            // write of the manifest, where an attempt that then stood down
-            // put a dissolution that never happened on record, again at
-            // every retry.
+            // The connections the manifest left out are audited as dropped here, right
+            // before the one write, so an attempt that stands down records none.
             let left_out = arbiter.connections_left_out();
             #[cfg(test)]
             if let Some(begin) = self.handoff_before_egress_fence.take() {
                 begin();
             }
-            // Success cannot return: `commit_and_exit` performs the one
-            // atomic <=PIPE_BUF write and `_exit(0)` in the same typed
-            // operation. EPIPE explicitly transfers Committing back to
-            // Rejecting so one reaper can restore the parent. The successor
-            // is activated inside the operator's permit, right before the
-            // write: a permit refused activated nothing.
-            //
-            // THE EGRESS FENCE IS TAKEN RIGHT BEFORE THE PERMIT AND HELD
-            // THROUGH THE WRITE (`fence_handoff_egress`): a frame a control
-            // verb began writing into a handed-off PTY after the drain gate's
-            // last reading stands the Commit down as unsettled egress
-            // (`Ok(None)`), nothing activated or audited, and no frame can
-            // begin before the `_exit`. With no pending attempt to name the
-            // handed sessions it fences nothing, so it stands down too.
+            // Success cannot return: `commit_and_exit` performs the one atomic <=PIPE_BUF
+            // write and `_exit(0)`. EPIPE transfers Committing back to Rejecting so one
+            // reaper can restore the parent. The successor is activated inside the operator's
+            // permit, right before the write, so a refused permit activates nothing. The
+            // egress fence is taken before the permit and held through the write
+            // (`fence_handoff_egress`): a frame begun after the drain gate's last reading
+            // stands the Commit down as unsettled egress (`Ok(None)`), with nothing activated
+            // or audited.
             let sinks = self
                 .pending_update_handoff
                 .as_ref()
@@ -9403,9 +8347,8 @@ impl App {
                 Ok(Some(Err(_))) => commit_write_failed = true,
                 // The egress fence is the last reading of the egress fact.
                 Ok(None) => facts.egress_settled = false,
-                // The permit is the operator's last answer before the
-                // `_exit`, so it re-reads the operator's two facts: a
-                // gate held for a moment is activity here as well.
+                // The permit is the operator's last answer before the `_exit`, so it
+                // re-reads the operator's two facts.
                 Err(refusal) => {
                     operator_refusal = Some(refusal);
                     (facts.operator_idle, facts.operator_quiesced) =
@@ -9415,13 +8358,8 @@ impl App {
             }
             let _ = arbiter.commit_failed_to_rejecting();
         } else if claim {
-            // A HELD CLAIM THE ADMISSION REFUSED after its fence (#18): the desk
-            // changed while the run loop dispatched, or the input did not reach
-            // the masters in time. The claim goes to the rejection, as a Commit
-            // write's EPIPE does; what the claim answered stays answered. The
-            // supervisor host was never stopped, and the successor never
-            // activated: both happen only at the write, so the successor this
-            // rejection kills never had the keyboard.
+            // A held claim the admission refused after its fence goes to the rejection;
+            // the successor was never activated.
             aterm_log::warn!(
                 "update apply: the Commit's admission, read again after the fence its claim \
                  was held through, refused it; a live video request it answered stays \
@@ -9470,10 +8408,8 @@ impl App {
                 let spawned = std::thread::Builder::new()
                     .name("aterm-handoff-emergency-reaper".to_string())
                     .spawn(move || {
-                        // QoS (port of 61a6c8b62): a REAPER is `Background`,
-                        // never `Housekeeping` — it enforces a kill-and-reap
-                        // deadline, and a starved reaper leaks the process
-                        // whose CPU use is the problem (see `qos::Role`).
+                        // A reaper is `Background`, never `Housekeeping`: it enforces a
+                        // kill-and-reap deadline (`qos::Role`).
                         crate::qos::set_self(crate::qos::Role::Background);
                         emergency_reap_and_report(
                             child_pid,
@@ -9486,9 +8422,8 @@ impl App {
                         );
                     });
                 if spawned.is_err() {
-                    // Resource exhaustion cannot strand a readerless child.
-                    // This fail-safe blocks only after both the normal worker
-                    // and emergency thread creation have failed.
+                    // Resource exhaustion cannot strand a readerless child: reap inline
+                    // when the emergency thread cannot be created.
                     emergency_reap_and_report(
                         child_pid,
                         attempt_id,
@@ -9509,25 +8444,15 @@ impl App {
         }
     }
 
-    /// What a Commit answers once it has claimed the attempt, before its write
-    /// ([`Self::finish_proven_handoff`]): the freeze's two numbers and the
-    /// landing in the log, every live `video` request answered, and what the
-    /// message log still holds flushed. Returns how long it took: real time
-    /// means input may have queued to this process meanwhile, and the Commit
-    /// goes through the dispatch fence again before it writes (round eight of
-    /// the update audit, #18). The supervisor host is stopped, and the
-    /// successor activated, at the write, not here (the reviews of #18).
+    /// What a Commit answers once it has claimed the attempt, before its write: the
+    /// freeze's numbers and the landing in the log, every live `video` request, and a
+    /// messages flush. Returns how long it took; real time sends the Commit through the
+    /// dispatch fence again.
     #[cfg(unix)]
     fn answer_at_commit_claim(&mut self, child_pid: Option<u32>) -> std::time::Duration {
         let started = std::time::Instant::now();
-        // THE FREEZE, IN TWO NUMBERS. Everything from the park to here
-        // is a terminal that echoed nothing; the split says which half
-        // to attack. park→proof is the successor's bundle swap, second
-        // `execve` and cold GUI boot; proof→commit is this process's
-        // dispatch fence plus egress settle. Emitted once per claim,
-        // which ends in `_exit` but on a write that fails or an admission
-        // refused after the claim's fence, so it is the last thing this
-        // process says about a freeze the user just sat through.
+        // The freeze, in two numbers: park→proof is the successor's swap, re-exec and GUI
+        // boot; proof→commit is this process's dispatch fence and egress settle.
         let (park_to_proof_ms, proof_to_commit_ms) = self
             .pending_update_handoff
             .as_ref()
@@ -9546,9 +8471,8 @@ impl App {
              {proof_to_commit_ms}ms proof->commit)",
             child_pid
         );
-        // THE LANDING, on the arming's clock: the log carries arm →
-        // start → land for the automatic lane, so how long an update
-        // waited is one subtraction, not an archaeology of phases.
+        // The landing, on the arming's clock: the log carries arm → start → land for the
+        // automatic lane, so how long an update waited is one subtraction.
         if let Some(pending) = self
             .pending_update_handoff
             .as_ref()
@@ -9564,30 +8488,9 @@ impl App {
                 ladder.armed_at.elapsed().as_secs_f64()
             );
         }
-        // The successor is NOT activated here, and the supervisor host is
-        // NOT stopped here: both happen at the write itself, after the last
-        // reading of the admission (`finish_proven_handoff`). A claim these
-        // answers hold through one more dispatch fence ([`HeldCommit`]) is
-        // still a candidate: activated now, it would take the person's keys
-        // through the fence (lost with it if the held pass refuses), and the
-        // fence's turns would tell this process's focus-tracking tabs they
-        // lost focus after the successor told them they have it
-        // ([`Self::activate_successor_at_write`]). The host's workers' last
-        // act as they stop clears the badges they raised, which that reading
-        // compares.
-        // EVERY LIVE `video` REQUEST IS ANSWERED HERE, AND ITS
-        // ANSWER WRITTEN, BEFORE THE `_exit` (round six of the
-        // update audit, findings 22 and 31). Not at the park, nor
-        // before the claim: every step until it could still
-        // roll the attempt back with this process running, and a
-        // take aborted then was lost to an update that did not
-        // happen. Here the take is aborted and its dir removed, an
-        // export is cancelled and its encode worker waited for, and
-        // then every reply's write on its control connection —
-        // `_exit` before that write was a dropped connection. Bounded
-        // ([`VIDEO_EXPORT_COMMIT_WAIT`]) and said: the adoption
-        // proof is in hand, and what does not answer in time is
-        // left to the process's end, as before.
+        // Every live `video` request is answered here, before the `_exit`: until the claim
+        // the attempt could still roll back, and a take aborted then would be lost to an
+        // update that did not happen. Bounded ([`VIDEO_EXPORT_COMMIT_WAIT`]).
         let video = self.video_answer_before_commit(VIDEO_EXPORT_COMMIT_WAIT);
         if video.answered {
             aterm_log::info!("update apply: answered a live video recording or export at Commit");
@@ -9601,18 +8504,10 @@ impl App {
                 video.unwritten
             );
         }
-        // The rows the park's carry did not take are NOT closed here (ruling
-        // 441 (d)): these answers can hold the claim through one more fence,
-        // and the admission read after it may still refuse, with this process
-        // running on. They close at the write, after its last reading.
-        // THE PARENT'S RECORD LANDS BEFORE ITS `_exit` (round-seven
-        // update audit, finding 53): the writer thread's queue dies
-        // with the process, and the successor reads the file again
-        // after Commit for what this process recorded since its
-        // boot. Flushed before the claim; what was recorded since,
-        // the video answer's lines among it, lands here — at once
-        // from a writer that answered then, and a writer that did
-        // not is not waited for twice.
+        // The rows the carry did not take close at the write, not here: a held claim's
+        // admission may still refuse. The parent's record lands before its `_exit` (the
+        // writer's queue dies with the process, and the successor re-reads the file after
+        // Commit); a writer that did not answer before the claim is not waited for twice.
         if !matches!(
             self.pending_update_handoff
                 .as_ref()
@@ -9624,44 +8519,14 @@ impl App {
         started.elapsed()
     }
 
-    /// THE SUCCESSOR TAKES THE FRONT AT THE COMMIT'S WRITE, and only when an
-    /// aterm window has focus there (2026-09-19; read at the write since
-    /// 2026-10-14, at the park before). Nothing before this
-    /// asked for it, on either half: LaunchServices' `activates` is false
-    /// (`begin_launch(.., false)`), and the successor's own launch posture
-    /// asks for nothing (`launch_posture(_, true)`, 2026-09-24) — the fork
-    /// lane has only that second half. So this is the one instant the user's
-    /// focus moves — onto the window that is about to be theirs, never onto a
-    /// candidate. With no aterm window focused the user is in another app and
-    /// keeps it, and the log says that too, so an update's record shows which.
-    ///
-    /// FOCUS IS READ HERE, NOT AT THE PARK (the lifecycle audit of 2026-10-14,
-    /// handoff finding 3). Park to proof is the successor's adopt and paint,
-    /// seconds at worst, and the person may switch apps meanwhile — the frozen
-    /// terminal echoes nothing — or come back to aterm. `WindowEvent::Focused`
-    /// is exempt through the overlap, so the windows' focus is current here.
-    /// A park-time sample took the front back from the app the person had
-    /// moved to, and left one who had come back with no aterm window in front
-    /// once this process exits.
-    ///
-    /// CALLED INSIDE THE WRITE, after the admission's last reading and the
-    /// operator's permit (the review of round eight's #18), never at the
-    /// claim. A claim whose answers took real time is held through one more
-    /// input-dispatch fence ([`HeldCommit`]) and is still a candidate there:
-    /// its held pass may refuse it, and the rejection kills the successor.
-    /// Activated at the claim, the successor took the person's keys through
-    /// the fence into its pre-Commit queue, all of them lost with it on such a
-    /// refusal, with focus left on no aterm window; and the fence's run-loop
-    /// turns dispatched this process's own `Focused(false)`, which wrote a
-    /// focus-out report (DEC 1004 `ESC [ O`) to the masters after the
-    /// successor's focus-in, so a focus-tracking program in the front tab
-    /// (vim's `FocusLost`, tmux, Claude Code) was left believing the terminal
-    /// unfocused, the successor having taken that report as already sent.
-    /// Here no run-loop turn follows: the write `_exit`s, and a write that
-    /// fails found the successor gone (EPIPE). A key the OS still queues to
-    /// this process while the activation is under way dies with it, as it
-    /// always did; the long waits the dispatch fence exists for (the video
-    /// answer, the messages flush) are behind it.
+    /// Activates the successor at the Commit's write, and only when an aterm window has
+    /// focus there: nothing before asks for it (LaunchServices' `activates` is false, the
+    /// successor's launch posture asks nothing), so this is the one instant the user's
+    /// focus moves. Focus is read here, not at the park, since the person may switch apps
+    /// while the terminal is frozen; `WindowEvent::Focused` is exempt through the overlap,
+    /// so the windows' focus is current. Never at the claim: a claim held through one more
+    /// dispatch fence ([`HeldCommit`]) may still be refused, and an active successor would
+    /// take the person's keys and leave a focus-out report (DEC 1004) after its focus-in.
     #[cfg(target_os = "macos")]
     fn activate_successor_at_write(&mut self, child_pid: Option<u32>) {
         let Some(pid) = child_pid.and_then(|pid| i32::try_from(pid).ok()) else {
@@ -9695,9 +8560,8 @@ impl App {
         );
     }
 
-    /// The cached verdict's own reason for a refusal, when the entry is the
-    /// fresh one for this artifact (the same key [`Self::cached_handoff_preverification`]
-    /// reads by).
+    /// The cached verdict's own reason for a refusal of this artifact, read by the same key
+    /// as [`Self::cached_handoff_preverification`].
     #[cfg(unix)]
     #[must_use]
     pub(crate) fn cached_handoff_preverification_reason(
@@ -9707,9 +8571,8 @@ impl App {
         self.read_fresh_preverification(attempt, |entry| entry.reason.clone())
     }
 
-    /// How many physical handoff failures this process has already booked
-    /// against the artifact `attempt` targets — the number the freeze budget
-    /// widens on. `0` with no attempt (the QA seam) or no record.
+    /// How many physical handoff failures this process has booked against `attempt`'s
+    /// artifact, which the freeze budget widens on.
     #[must_use]
     #[cfg(unix)]
     pub(crate) fn prior_physical_failures_of(
@@ -9724,9 +8587,8 @@ impl App {
             .map_or(0, |retry| retry.cycles)
     }
 
-    /// How many times the FORK lane's park has missed its freeze budget for
-    /// `target_build` — the rungs it climbs across attempts, since it cannot
-    /// climb them inside one (see `App::fork_park_misses`).
+    /// How many times the fork lane's park has missed its freeze budget for
+    /// `target_build`: the rungs it climbs across attempts.
     #[must_use]
     #[cfg(unix)]
     pub(crate) fn fork_park_misses_of(&self, target_build: u64) -> u8 {
@@ -9735,28 +8597,12 @@ impl App {
             .map_or(0, |(_, misses)| misses)
     }
 
-    /// The fork lane waits for an unread policy while it is being read.
-    /// `Some(wait)` for a fork-lane attempt at `target_build` with no verified
-    /// pass on record while a policy read is in flight: the first such attempt
-    /// starts the read off this thread
-    /// ([`Self::spawn_staged_handoff_preverification`], which joins a running arm-time
-    /// read), and attempts wait until it ends — an automatic one deferred as
-    /// activity, a person's held. `None` for a known policy, no read running, or
-    /// once [`crate::HANDOFF_PREVERIFY_READ_CEILING`] has passed since the first
-    /// wait; the attempt then parks as usual. Each wait is logged.
-    ///
-    /// A PERSON'S APPLY WAITS TOO (round eight of the update audit, U35). The fork
-    /// lane parks before its worker verifies, so a person's Install with no pass on
-    /// record ran the Full capture — on this thread, every reader parked — and only
-    /// then learned the policy the candidate sealed to route around it, and refused
-    /// itself (`capture_exceeds_policy`): a frozen desk and a failed install. Now
-    /// its press is HELD while the read runs (seconds), its installing row up —
-    /// [`crate::UpdateHandoffStartError::HeldForRead`], never a deferral, which
-    /// nothing came back for with `[update] auto_apply = false` (U35's review) —
-    /// and runs again, parking under the policy, once the read ends
-    /// ([`Self::run_held_person_apply`]). With the read started when a stage is
-    /// armed whatever `[update] auto_apply` says ([`Self::arm_native_auto_apply`]),
-    /// a press seldom finds one still running.
+    /// The fork lane waits for an unread policy while it is being read: `Some(wait)` for an
+    /// attempt with no verified pass on record while a read is in flight, the first such
+    /// attempt starting it. `None` for a known policy, no read, or once
+    /// [`crate::HANDOFF_PREVERIFY_READ_CEILING`] has passed. A person's apply is held
+    /// ([`crate::UpdateHandoffStartError::HeldForRead`]) rather than deferred: a Full capture
+    /// before the policy is read would be refused by it with every reader already frozen.
     #[cfg(unix)]
     fn fork_lane_policy_wait(
         &mut self,
@@ -9767,52 +8613,21 @@ impl App {
         self.preverify_read_wait(mode, target_build, policy_unread, PreverifyWaiter::ForkPark)
     }
 
-    /// THE COLD LANE ANSWERS TO THE PRE-PARK VERDICT (round eight, #1): what it
-    /// owes the verification of the artifact `attempt` targets before it writes
-    /// the quit layout and replaces this process. The seamless lane has read that
-    /// verdict since 2026-09-14; the cold lane went straight to `exec`, and its
-    /// successor is THIS build, whose boot swap then runs the complete gate — so a
-    /// refusal the verdict already knew (an install location a standard user
-    /// cannot write, a hand-installed bundle that cannot be the rollback source)
-    /// came back as a desk with no terminal again, which re-armed and exec'd
-    /// again: the window closed and reopened every few seconds, for ever.
+    /// The cold lane answers to the pre-park verdict before it writes the quit layout and
+    /// replaces this process: its successor is this build, whose boot swap would refuse
+    /// what the verdict already knew and come back to re-arm and exec again.
     ///
-    /// In the AUTOMATIC modes, exactly as the seamless lane reads it:
-    /// * a fresh REFUSAL of this artifact is the lane's answer — the verifier's
-    ///   own words, minted `Failed` like the seamless lane's, so the synchronous
-    ///   arm books it by the same typed fact (a person's refusal latches the
-    ///   environment block; any other is the cached-refusal shape's budget);
-    /// * no verdict yet, with a read of this target in flight (or startable): the
-    ///   attempt defers as activity while it runs, bounded by
-    ///   [`crate::HANDOFF_PREVERIFY_READ_CEILING`] — the read's own deadline, and
-    ///   the fork lane's wait, one window per target — and the attempt after it
-    ///   relaunches under what it answered — or, nothing on record, as the lane
-    ///   always did;
-    /// * that read ENDED WITHOUT A VERDICT (a passing refusal: another aterm held
-    ///   the apply lock past its wait, a helper ran out of its budget — round eight,
-    ///   S1's second review): the moment it measured is the attempt's answer, a
-    ///   `Failed` the synchronous arm books TRANSIENT (no cached refusal stands
-    ///   behind it), and nothing is relaunched. The successor would be this build,
-    ///   whose boot swap waits on the same lock: the window closed and reopened
-    ///   into that refusal at every retry — every six hours for good once the lane
-    ///   converged — for as long as the lock stayed held.
+    /// In the automatic modes: a fresh refusal of this artifact is the answer (`Failed`,
+    /// booked by its typed fact); with no verdict yet and a read in flight or startable,
+    /// the attempt defers while it runs, up to [`crate::HANDOFF_PREVERIFY_READ_CEILING`]; a
+    /// read that ended without a verdict (a passing refusal) is a transient `Failed`, since
+    /// the boot swap would wait on the same lock. A person's apply is not answered by a
+    /// cached verdict.
     ///
-    /// A person's apply is not answered by a cached verdict (the seamless lane's
-    /// rule: the bundle may have been put right since), nor is the QA seam's
-    /// same-image relaunch, which has no artifact.
-    ///
-    /// IN EVERY MODE, A STAGE THIS PROCESS KNOWS IS WAITING FOR AN UPDATE CHECK TO
-    /// CONFIRM ITS SIGNER IS NOT RELAUNCHED INTO (round eight, #503's review and
-    /// its second review; [`Self::known_roster_wait`]). The successor is this
-    /// build, whose boot swap (gate 4d) would wait the same way: a person's press
-    /// closed and reopened the window and installed nothing, where before #503 that
-    /// relaunch installed the stage. It is a deferral (activity's error: charged
-    /// nothing) that names the wait; the automatic lane holds for the check with its
-    /// intent kept, and a person's press re-arms nothing. That knowledge is not a
-    /// verdict on the bytes but how long ago a check ran, so it binds a person's
-    /// press too, and every check that has reported the stage since retires it. A
-    /// read that ended with the wait but BEGAN before such a report is stale: the
-    /// automatic lane reads the stage again before it decides, and books nothing.
+    /// In every mode, a stage known to wait for an update check to confirm its signer
+    /// ([`Self::known_roster_wait`]) is not relaunched into: a deferral, charged nothing. A
+    /// read that ended with that wait but began before a check reported the stage is stale,
+    /// and the stage is read again.
     #[cfg(unix)]
     pub(crate) fn cold_lane_verdict_gate(
         &mut self,
@@ -9852,9 +8667,8 @@ impl App {
                 let reason = self
                     .cached_handoff_preverification_reason(attempt)
                     .unwrap_or_else(|| "the staged update failed verification".to_string());
-                // Never the wait for a roster confirmation, which no verdict is (a
-                // refused cold relaunch seeds it as a hold); the backstop holds for
-                // the check rather than book it on the transient budget.
+                // A roster confirmation wait is no verdict: hold for the check rather than
+                // book it on the transient budget.
                 if aterm_update::is_roster_confirmation_wait(&reason) {
                     if let Some(dmg_sha256) =
                         crate::app_native::decode_dmg_sha256(attempt.target_dmg_sha256())
@@ -9881,10 +8695,9 @@ impl App {
                     .handoff_preverify_in_flight
                     .as_ref()
                     .filter(|read| read.reads(attempt));
-                // A wait [`Self::known_roster_wait`] did not take is a stale one: the
-                // read began before a check reported the stage, which may have
-                // confirmed it. It is no answer, and above all no `Failed` to book:
-                // the stage is read again, and the attempt defers while that runs.
+                // A roster wait [`Self::known_roster_wait`] did not take is stale (the read
+                // began before a check reported the stage): no `Failed` to book; the stage
+                // is read again and the attempt defers.
                 if read.is_some_and(|read| {
                     read.ended_passing(now)
                         .is_some_and(aterm_update::is_roster_confirmation_wait)
@@ -9907,10 +8720,8 @@ impl App {
                          later"
                     )));
                 }
-                // This target's read still running is waited for whether or not
-                // the per-target window has been spent: a later attempt's arm-time
-                // read is the only measure of the moment the last one refused for,
-                // and its own deadline bounds the wait.
+                // This target's read still running is waited for even past the per-target
+                // window; its own deadline bounds the wait.
                 if read.is_some_and(|read| read.running_for(attempt.target_build(), now)) {
                     return Err(preverify_read_activity(
                         attempt.target_build(),
@@ -9928,14 +8739,9 @@ impl App {
         }
     }
 
-    /// ONE BOUNDED WAIT FOR A PRE-PARK VERIFICATION READ, for whichever lane is
-    /// about to act without its answer (`waiter`): the fork lane's park
-    /// ([`Self::fork_lane_policy_wait`], a person's apply included) and the cold
-    /// lane's relaunch ([`Self::cold_lane_verdict_gate`], which asks only in the
-    /// automatic modes). One window per target (`preverify_read_waited`), shared by
-    /// both — the desk decides the lane, and a target's read is the same read
-    /// whichever lane waits on it. `mode` says whose attempt it is: an automatic
-    /// one defers as activity, a person's is held
+    /// One bounded wait for a pre-park verification read, for the lane about to act
+    /// without its answer (`waiter`): one window per target (`preverify_read_waited`),
+    /// shared by both lanes. An automatic attempt defers as activity; a person's is held
     /// ([`crate::UpdateHandoffStartError::HeldForRead`]).
     #[cfg(unix)]
     fn preverify_read_wait(
@@ -9949,9 +8755,8 @@ impl App {
             return None;
         }
         let now = std::time::Instant::now();
-        // One wait per target — renewed only once a cached verdict would have
-        // gone stale since it ended, when the policy is unread again for the
-        // same reason a first attempt's was.
+        // One wait per target, renewed only once a cached verdict would have gone stale
+        // since it ended.
         let until = match self.preverify_read_waited {
             Some((target, until))
                 if target == target_build && now < until + crate::HANDOFF_PREVERIFY_FRESHNESS =>
@@ -9982,9 +8787,8 @@ impl App {
             }
             return None;
         }
-        // A PERSON'S PRESS IS HELD, NOT DEFERRED (round eight, U35's review):
-        // the automatic lane comes back for its own deferral, and nothing does
-        // for a person's when `[update] auto_apply` is off.
+        // A person's press is held, not deferred: the automatic lane comes back for its
+        // own deferral, and nothing does for a person's when `[update] auto_apply` is off.
         Some(if mode.is_automatic() {
             preverify_read_activity(target_build, waiter)
         } else {
@@ -9992,13 +8796,9 @@ impl App {
         })
     }
 
-    /// THE DISSOLUTION OF EVERY CONNECTION THE MANIFEST LEFT OUT, ON RECORD AT
-    /// THE COMMIT (round eight of the update audit, U23's review): one
-    /// `session_edge` drop per row (`action=drop origin=handoff`), as the
-    /// successor audits a carried row it cannot re-mint. Called by the Commit
-    /// alone, right before its write: the manifest's writer left these rows out
-    /// to fit its cap, but this process holds them until the Commit, and an
-    /// attempt that stands down dissolves none.
+    /// Audits every connection the manifest left out as dropped
+    /// (`action=drop origin=handoff`). Called by the Commit alone, right before its write:
+    /// this process holds them until then, and an attempt that stands down dissolves none.
     #[cfg(unix)]
     pub(crate) fn audit_connections_left_out(rows: &[crate::session_store::ConnectionCarry]) {
         for row in rows {
@@ -10012,8 +8812,7 @@ impl App {
         }
     }
 
-    /// Hold a person's press for the candidate's pre-park read
-    /// ([`crate::UpdateHandoffStartError::HeldForRead`]): `about_to_wait` runs it
+    /// Hold a person's press for the candidate's pre-park read; `about_to_wait` runs it
     /// again once that read ends ([`Self::run_held_person_apply`]).
     #[cfg(unix)]
     pub(crate) fn hold_person_apply(&mut self, held: crate::HeldPersonApply) {
@@ -10028,10 +8827,8 @@ impl App {
         self.person_apply_held = Some(held);
     }
 
-    /// The event loop's next look at a held press ([`Self::run_held_person_apply`]):
-    /// the read raises only a flag, so the loop looks every
-    /// [`HELD_PERSON_APPLY_POLL`], and never later than the hold's window ends.
-    /// `None` with no press held.
+    /// The event loop's next look at a held press: every [`HELD_PERSON_APPLY_POLL`], never
+    /// later than the hold's window ends.
     #[cfg(unix)]
     #[must_use]
     pub(crate) fn held_person_apply_deadline(
@@ -10042,24 +8839,10 @@ impl App {
             .map(|held| held.until.min(now + HELD_PERSON_APPLY_POLL))
     }
 
-    /// THE PERSON'S HELD INSTALL RUNS ONCE THE CANDIDATE'S READ ENDS (round eight
-    /// of the update audit, U35's review). A press that reached the fork lane while
-    /// the read of its target ran was deferred, and nothing came back for it with
-    /// `[update] auto_apply = false`, while its one record said it would; from the
-    /// Version menu or the status bar it opened Software Update, which showed
-    /// nothing of why. Now the press is held ([`Self::hold_person_apply`]), its
-    /// installing row up and its switch on record, and run here, as the person's
-    /// own `Immediate` apply, once the read has ended — or its window `until`
-    /// (at most [`crate::HANDOFF_PREVERIFY_READ_CEILING`]) has passed, when the
-    /// fork lane parks as it always did.
-    ///
-    /// What it comes to is surfaced as a row, the way a person's press that
-    /// cannot open a page is told ([`Self::surface_update_apply_outcome`], no
-    /// details page seconds after the press). An outcome that returned before the
-    /// handoff began had not put the row back nor closed the record the first
-    /// run opened, so this does, as a stop the person is told of (both
-    /// idempotent). A stage that is no longer the held target drops the press:
-    /// the new stage's own row offers it.
+    /// Runs a person's held Install ([`Self::hold_person_apply`]) as their own `Immediate`
+    /// apply once the candidate's read has ended or its window `until` has passed, its
+    /// outcome surfaced as a row. A stage that is no longer the held target drops the
+    /// press.
     #[cfg(unix)]
     pub(crate) fn run_held_person_apply(&mut self, now: std::time::Instant) {
         use crate::native_app::UpdateOutcome;
@@ -10119,9 +8902,8 @@ impl App {
         self.surface_update_apply_outcome(HELD_PRESS_SOURCE, outcome, false);
     }
 
-    /// A fork-lane park miss: counts the rung it buys the next attempt and returns
-    /// the typed start error that routes it to the activity-revoked spacing rather
-    /// than the physical budget.
+    /// A fork-lane park miss: counts the rung it buys the next attempt, routed to the
+    /// activity spacing rather than the physical budget.
     #[cfg(unix)]
     fn fork_park_missed(
         &mut self,
@@ -10137,9 +8919,8 @@ impl App {
         crate::UpdateHandoffStartError::park_missed(reason)
     }
 
-    /// The cached verdict's reason keyed by the artifact alone, for the
-    /// submission-time failure arm, which has no ticket but knows the intent's build
-    /// and digest. `Some(reason)` only for a fresh refusal of that artifact.
+    /// The cached verdict's reason keyed by the artifact alone, for the submission-time
+    /// failure arm: `Some` only for a fresh refusal of the staged artifact of `build`.
     #[cfg(unix)]
     #[must_use]
     pub(crate) fn cached_handoff_refusal_reason(&self, build: u64) -> Option<String> {
@@ -10166,17 +8947,9 @@ impl App {
             .and_then(|entry| entry.reason.clone())
     }
 
-    /// A REFUSED COLD RELAUNCH ANSWERS THIS PROCESS'S FIRST AUTOMATIC READ OF ITS
-    /// ARTIFACT, WHENEVER THAT COMES (round eight, #1's review). The boot's refusal
-    /// is put in the verdict cache at launch
-    /// ([`Self::seed_refused_cold_relaunch`]), where it lapses with every verdict's
-    /// freshness — and a first attempt that came later (a person typing in a
-    /// document tab holds the automatic lane back for up to its ladder) found no
-    /// verdict, relaunched, and carried a budget that never counted the refusal, so
-    /// the lane went round again unconverged. Until an automatic read of the
-    /// artifact has taken it, the refusal is kept apart, and that read — the cold
-    /// lane's gate or the seamless lane's pre-park check — finds it fresh. Taken
-    /// once: the booking it answers is the refusal's one entry in the budget.
+    /// Hands a refused cold relaunch's refusal to this process's first automatic read of
+    /// its artifact, whenever that comes, so the verdict cannot lapse before it is booked.
+    /// Taken once.
     #[cfg(unix)]
     fn answer_with_refused_cold_relaunch(
         &mut self,
@@ -10199,13 +8972,9 @@ impl App {
             });
     }
 
-    /// The cached pre-park verification verdict for THIS exact artifact, or `None`
-    /// when there is no fresh entry bound to its build and commit.
-    ///
-    /// `Some(false)` is the only answer with authority: it short-circuits
-    /// [`Self::start_unix_update_handoff`] before any reader parks. Separate so a
-    /// test can read a seeded verdict the way production does; headless tests park
-    /// nothing and could not otherwise tell a healthy candidate from a refused one.
+    /// The cached pre-park verification verdict for this exact artifact, or `None` with no
+    /// fresh entry. `Some(false)` short-circuits [`Self::start_unix_update_handoff`] before
+    /// any reader parks.
     #[cfg(unix)]
     #[must_use]
     pub(crate) fn cached_handoff_preverification(
@@ -10215,9 +8984,8 @@ impl App {
         self.read_fresh_preverification(attempt, |entry| Some(entry.passed))
     }
 
-    /// Reads the cached pre-park verification entry under the cache's lock when it
-    /// is the fresh one bound to exactly the artifact `attempt` targets (build,
-    /// commit and digest, within [`crate::HANDOFF_PREVERIFY_FRESHNESS`]).
+    /// Reads the cached pre-park verification entry under its lock when it is the fresh one
+    /// for exactly `attempt`'s artifact (build, commit, digest).
     #[cfg(unix)]
     fn read_fresh_preverification<T>(
         &self,
@@ -10239,17 +9007,9 @@ impl App {
             .and_then(read)
     }
 
-    /// The successor's handoff policy as this park must follow it: what the passed
-    /// pre-verification of exactly the targeted artifact read from its bundle. Every
-    /// park takes this one reading (the fork lane, the launched lane's gate and
-    /// capture, and [`Self::park_desk_for_test`]). [`ParkPolicy::policy`] is `None`
-    /// for the same-image QA seam, no verdict, a refusal, or a policy that asks
-    /// nothing of this build; [`ParkPolicy::known`] says whether a pass is on record.
-    ///
-    /// Not bound by [`crate::HANDOFF_PREVERIFY_FRESHNESS`]: that window limits how
-    /// long a verdict stands in for re-running `codesign`, while the policy is a
-    /// sealed resource of one release, named by build, commit and digest. The
-    /// attempt is still authorized by the complete gate at swap time.
+    /// The successor's handoff policy as every park follows it, from the passed
+    /// pre-verification of exactly the targeted artifact. Not bound by
+    /// [`crate::HANDOFF_PREVERIFY_FRESHNESS`]: the policy is a sealed resource of one release.
     #[cfg(unix)]
     #[must_use]
     pub(crate) fn park_policy(
@@ -10294,22 +9054,17 @@ impl App {
         .policy
     }
 
-    /// Reduces one returned (non-ready) handoff completion: resumes the parked
-    /// readers, reduces the exact apply ticket against the lane its mode authorized,
-    /// surfaces the verdict, and returns the structural teardown the caller must
-    /// replay. `None` when no pending attempt matches; nothing may be replayed.
-    ///
-    /// Split out of [`Self::finish_update_handoff`] so it can be tested without an
-    /// event loop. It is the only place the attempt's `ApplyMode` still exists, so
-    /// the automatic/person-initiated split is decided here
-    /// ([`crate::app_native::HandoffFailureLane`]).
+    /// Reduces one returned (non-ready) completion: resumes the parked readers, reduces the
+    /// apply ticket against the lane its mode authorized, surfaces the verdict, and returns
+    /// the teardown the caller must replay (`None`: no attempt matches). The only place the
+    /// attempt's `ApplyMode` still exists, so the automatic/person split is decided here.
     #[cfg(unix)]
     pub(crate) fn reduce_returned_handoff_completion(
         &mut self,
         completion: crate::UpdateHandoffCompletion,
     ) -> Option<crate::DeferredHandoffTeardown> {
-        // (Unused fields keep underscore-prefixed bindings so their drops still
-        // run at the end of this call, as with the old entry destructure.)
+        // Unused fields keep underscore-prefixed bindings so their drops still run at the
+        // end of this call.
         let crate::UpdateHandoffCompletion {
             attempt_id: _attempt_id,
             nonce,
@@ -10322,12 +9077,10 @@ impl App {
             input_drain_spins: _input_drain_spins,
             child_death,
         } = completion;
-        // State-keyed: two records can describe one attempt, the parked one
-        // (`pending_update_handoff`, readers stopped) and the prelaunched one
-        // (`update_handoff_prelaunch`, a successor held). Readers roll back iff the
-        // parked record exists, never by a worker-reported phase, and both records
-        // are cleared only here, after the worker's death proof, so no retry
-        // launches beside a live candidate. The parked record's facts win.
+        // Two records can describe one attempt: the parked one (readers stopped) and the
+        // prelaunched one (a successor held). Readers roll back iff the parked record
+        // exists, and both are cleared only here, after the worker's death proof, so no
+        // retry launches beside a live candidate. The parked record's facts win.
         let parked = self
             .pending_update_handoff
             .take_if(|pending| pending.attempt_id == _attempt_id);
@@ -10370,15 +9123,9 @@ impl App {
             #[cfg(not(any(target_os = "macos", all(test, unix))))]
             None => return None,
         };
-        // Lane classification for the bounded automatic retry budgets, from three
-        // typed facts:
-        // - the mode the apply was authorized under, so a person's failure is not
-        //   charged to the automatic budget;
-        // - the worker's outcome (plus the main thread's activity-rejection flag),
-        //   so `TimedOut` and `AdoptionMismatch` cost what `PhysicalFailureShape`
-        //   says;
-        // - `child_death`, what the worker saw when a candidate ended before its
-        //   proof ([`crate::ChildDeathEvidence`]).
+        // The lane for the bounded automatic retry budgets, from the authorized mode (a
+        // person's failure is never charged to the automatic budget), the outcome, and the
+        // child-death evidence.
         let lane = crate::app_native::HandoffFailureLane::classify(
             pending.mode,
             outcome,
@@ -10391,18 +9138,14 @@ impl App {
         if let Some(live) = pending.parked_live.as_deref() {
             self.rollback_overlap(nonce.as_deref(), live);
         }
-        // The attempt record is gone, and with it the fence holding draft journals:
-        // owed re-seats and the appends behind them run now, not at the next
-        // keystroke.
+        // The attempt record is gone, and with it the fence holding draft journals: owed
+        // re-seats run now.
         self.drive_owed_document_journals();
-        // The attempt is over: restore the row's words (or its absence) and end the
-        // surge before the outcome decides whether to say anything, so a silent
-        // outcome does not leave "Installing" on the bar.
+        // The attempt is over: restore the row and end the surge before the outcome decides
+        // whether to say anything.
         self.retire_update_installing();
-        // QA seam, read before the match consumes it: a `None` ticket comes only
-        // from `ATERM_DEBUG_SEAMLESS_REEXEC`, a simulated apply of the running
-        // binary. It is logged and shown but never touches the durable ledger.
-        // Which same-image attempt it was is carried, not inferred.
+        // QA seam: a `None` ticket comes only from `ATERM_DEBUG_SEAMLESS_REEXEC`, and never
+        // touches the durable ledger.
         let debug_seam = matches!(pending.same_image, Some(SameImageHandoff::DebugSeam));
         let attempted_build = pending
             .apply_attempt
@@ -10424,22 +9167,17 @@ impl App {
                 lane,
             )),
         };
-        // THE SWITCH THAT DID NOT HAPPEN, on record once the lane has decided what
-        // comes next (round eight of the update audit, lead U39): an automatic
-        // attempt the lane tries again by itself — a stand-down for activity, a
-        // capture refusal retried when the desk changes, a physical failure inside
-        // its budget — asks nothing of the person and is a wait, in Info; one that
-        // stopped the lane, or a person's press, could not install. Before the
-        // outcome is surfaced, so the record reads in the order it happened.
+        // The switch that did not happen goes on record, before the outcome is surfaced: an
+        // attempt the automatic lane retries by itself is a wait; one that stopped the lane,
+        // or a person's press, could not install.
         let routine = matches!(
             lane,
             crate::app_native::HandoffFailureLane::ActivityRevoked
                 | crate::app_native::HandoffFailureLane::AwaitsRosterConfirmation { .. }
         ) || (pending.mode.is_automatic()
             && attempted_build.is_some_and(|build| self.automatic_apply_retry_scheduled(build)));
-        // A capture refusal's stop is said by its outcome's own record, which
-        // knows what the retry waits for (`react_to_update_apply_outcome_for`):
-        // one record per attempt.
+        // A capture refusal's stop is said by its outcome's own record, which knows what
+        // the retry waits for: one record per attempt.
         if !matches!(
             surfaced,
             Some(crate::native_app::UpdateOutcome::CaptureRefused { .. })
@@ -10468,29 +9206,13 @@ impl App {
         Some(teardown)
     }
 
-    /// Overlap-handoff failure rollback: restores this still-running parent to a
-    /// working terminal after a candidate that never became ready.
-    ///
-    /// Precondition: the candidate was signalled and proven terminated, so no other
-    /// reader exists when ours restart. The proof is a [`HandoffRollbackWarrant`]
-    /// minted on the worker (or emergency reaper) before the completion is sent
-    /// ([`send_warranted_handoff_failure`]); it cannot cross the channel, so the
-    /// send-site ordering is the guarantee. The pre-spawn failure paths in
-    /// [`App::start_unix_update_handoff`] call this with no candidate.
-    ///
-    /// Then:
-    /// * the worker has already retired the attempt's artifacts and republished the
-    ///   parent socket link;
-    /// * CLOEXEC is re-armed on every master;
-    /// * each master gets back the size its engine was parked at
-    ///   ([`Self::reassert_parked_winsizes`]);
-    /// * the parked readers resume ([`Self::attach_deferred_readers`]);
-    /// * every draft journal is owed a re-seat, since a candidate that restored may
-    ///   have republished it under its own sequence numbers
-    ///   ([`Self::reseat_document_journals_after_rollback`]).
-    ///
-    /// The event-loop half does no filesystem I/O, status read or child probe; the
-    /// re-seats are queued to the document worker.
+    /// Overlap-handoff failure rollback: restores this still-running parent to a working
+    /// terminal once the candidate was proven terminated, or there never was one. The
+    /// [`HandoffRollbackWarrant`] is minted before the completion is sent
+    /// ([`send_warranted_handoff_failure`]) and cannot cross the channel, so the send-site
+    /// ordering is the guarantee. Re-arms CLOEXEC, puts back each parked size, resumes the
+    /// readers, and owes every draft journal a re-seat (queued to the document worker: this
+    /// half does no filesystem I/O), since a candidate that restored may have republished it.
     #[cfg(unix)]
     pub(crate) fn rollback_overlap(&mut self, _nonce: Option<&str>, live: &[(u64, i32, i32)]) {
         for (_, master, _) in live {
@@ -10509,11 +9231,8 @@ impl App {
 }
 
 impl App {
-    /// Puts each handed PTY back at the size its engine was parked at. Before
-    /// Commit the successor resizes every handed PTY to its own grids; after a
-    /// rejected Commit, `resize_panes` skips panes whose engine already matches, so
-    /// without this a split pane's program would keep the successor's size. The
-    /// kernel sends `SIGWINCH` only on a change.
+    /// Puts each handed PTY back at the size its engine was parked at, undoing the
+    /// successor's resize (`resize_panes` skips panes whose engine already matches).
     #[cfg(unix)]
     fn reassert_parked_winsizes(&self, live: &[(u64, i32, i32)]) {
         for (id, master, _) in live {
@@ -10533,10 +9252,8 @@ impl App {
     }
 }
 
-/// How often the event loop looks at a person's held Install
-/// ([`App::run_held_person_apply`]): the read it waits on raises only a flag. A
-/// read takes a fraction of a second, so a press runs at most this long after it
-/// ends.
+/// How often the event loop looks at a person's held Install: the read it waits on raises
+/// only a flag.
 #[cfg(unix)]
 const HELD_PERSON_APPLY_POLL: std::time::Duration = std::time::Duration::from_millis(100);
 
@@ -10569,11 +9286,9 @@ fn preverify_read_activity(
     crate::UpdateHandoffStartError::activity(reason)
 }
 
-/// What a PERSON'S press answers with while `target_build`'s pre-park
-/// verification is being read (round eight of the update audit, U35's review):
-/// held, never deferred — with `[update] auto_apply = false` nothing would come
-/// back for a deferral, and its only record said it would. The caller holds the
-/// press until the read ends or `until` passes ([`App::run_held_person_apply`]).
+/// What a person's press answers with while `target_build`'s pre-park verification is
+/// read: held until the read ends or `until` passes, never deferred, since nothing would
+/// come back for a deferral with `[update] auto_apply = false`.
 #[cfg(unix)]
 fn preverify_read_hold(
     target_build: u64,
@@ -10633,9 +9348,8 @@ impl PreverifyWaiter {
     }
 }
 
-/// The cold lane's refusal of a safety token that carries `carried` unsaved
-/// editor drafts: the preflight's person-facing shape
-/// ([`crate::app_native::DIRTY_DOCUMENTS_BLOCK`]), so the row says what to do.
+/// The cold lane's refusal of a token carrying unsaved editor drafts, in the preflight's
+/// person-facing shape ([`crate::app_native::DIRTY_DOCUMENTS_BLOCK`]).
 #[cfg(unix)]
 pub(crate) fn cold_lane_carried_drafts_refusal(carried: usize) -> String {
     format!(
@@ -10648,12 +9362,9 @@ pub(crate) fn cold_lane_carried_drafts_refusal(carried: usize) -> String {
 
 #[cfg(unix)]
 impl crate::App {
-    /// What the cold lane leaves its successor to reopen.
-    ///
-    /// A windowed desk with windows open writes the same quit layout a quit writes
-    /// (`Some`), which the successor's boot reopens, so document and Settings tabs
-    /// and window geometry survive. With session restore off the lane refuses, as it
-    /// does for `--hold` panes. `None`: nothing to leave (headless, or no window).
+    /// What the cold lane leaves its successor to reopen: the quit layout (`Some`), so
+    /// document and Settings tabs and window geometry survive; `None` with nothing to
+    /// leave. With session restore off the lane refuses, as it does for `--hold` panes.
     pub(crate) fn cold_lane_layout(
         &self,
     ) -> Result<Option<crate::restore::RestoreManifest>, String> {
@@ -10675,17 +9386,9 @@ impl crate::App {
         Ok(Some(layout))
     }
 
-    /// The cold lane goes on without its quit layout, which the data folder
-    /// refused for good (`cause`; [`LayoutLeft::NotKept`]): said in `aterm.log`
-    /// and on record in Messages, written before the `exec` (whose flush
-    /// carries it), so the person who finds the new version without their
-    /// document and Settings tabs can read why (round eight, U48).
-    ///
-    /// Called once the switch is granted (the operator's quiesce), and on
-    /// record ONCE per target build and cause (U48's review): an `exec` that
-    /// then fails is retried, and a record is never folded — each post is a
-    /// new one — so every retry of a settled fault added another. The log
-    /// line is written for every attempt.
+    /// Says in `aterm.log`, and once per target build and cause in Messages, that the cold
+    /// lane goes on without its quit layout (`cause`), so a person missing their tabs can
+    /// read why.
     fn say_cold_lane_tabs_not_kept(&mut self, target_build: u64, cause: &str) {
         aterm_log::warn!(
             "update apply: the open windows could not be saved for the new build ({cause}); \
@@ -10698,23 +9401,9 @@ impl crate::App {
         }
     }
 
-    /// TAKE BACK THIS RUN'S COLD-LANE LAYOUT AN `exec` DID NOT USE, waiting
-    /// for the restore lock at most the main thread's bound
-    /// ([`COLD_LANE_LAYOUT_LOCK_WAIT`]; round eight, U49): this run's desk
-    /// alone ([`crate::restore::unwrite_quit_within`]), another instance's
-    /// quit the write kept stays.
-    ///
-    /// A refused take-back is OWED, never dropped (U49's review): the event
-    /// loop tries it again ([`Self::retry_owed_layout_take_back`]), and so do
-    /// a seamless park and a cold `exec` that writes no newer desk
-    /// ([`Self::settle_owed_layout_take_back_before_switch`]) and the quit
-    /// ([`Self::settle_owed_layout_take_back_at_quit`]), until it
-    /// lands or a newer write of this run's desk replaces it
-    /// ([`Self::cold_lane_layout_rewritten`]). Dropped, the desk stayed in
-    /// `session.toml` while this process ran on: a later crash's claim set the
-    /// journal's newer desk aside by this run's name and reopened the stale
-    /// one, and after a seamless update it read as another instance's desk,
-    /// which every later quit kept and the next cold launch reopened again.
+    /// Takes back this run's cold-lane layout an `exec` did not use (this run's desk alone),
+    /// waiting at most [`COLD_LANE_LAYOUT_LOCK_WAIT`]. A refusal is owed until it lands or a
+    /// newer write of this run's desk replaces it, or the stale desk would be reopened.
     fn take_back_cold_lane_layout(&mut self, run: Option<String>, now: std::time::Instant) {
         let _ = self.take_back_cold_lane_layout_with(run, now, |run| {
             crate::restore::unwrite_quit_within(run, COLD_LANE_LAYOUT_LOCK_WAIT)
@@ -10780,9 +9469,8 @@ impl crate::App {
             .map(|owed| owed.retry_at)
     }
 
-    /// The event loop's try of an owed take-back, once due
-    /// ([`Self::owed_layout_take_back_at`]), bounded as the first was; a
-    /// refusal spaces the next try further ([`OwedTakeBack::spacing`]).
+    /// The event loop's try of an owed take-back once due; a refusal spaces the next try
+    /// further ([`OwedTakeBack::spacing`]).
     pub(crate) fn retry_owed_layout_take_back(&mut self, now: std::time::Instant) {
         self.retry_owed_layout_take_back_with(now, |run| {
             crate::restore::unwrite_quit_within(run, COLD_LANE_LAYOUT_LOCK_WAIT)
@@ -10807,13 +9495,9 @@ impl crate::App {
         let _ = self.take_back_cold_lane_layout_with(run, now, unwrite);
     }
 
-    /// Before a switch that ends this run with no newer desk of it written — a
-    /// seamless park, or a cold `exec` that leaves no layout (nothing to leave,
-    /// or one not kept), whose successor would reopen the stale desk at its
-    /// boot: an owed take-back is tried now, whatever its schedule. A refusal
-    /// whose cause passes is returned, and the attempt refuses (retried,
-    /// nothing touched); a settled one goes on, logged — no retry changes it,
-    /// and an update held on a settled cause had no end (U48).
+    /// Before a switch that writes no newer desk of this run, whose successor would reopen
+    /// the stale one: an owed take-back is tried now. A passing refusal refuses the attempt;
+    /// a settled one goes on, logged, since no retry changes it.
     fn settle_owed_layout_take_back_before_switch(
         &mut self,
         now: std::time::Instant,
@@ -10853,12 +9537,9 @@ impl crate::App {
         }
     }
 
-    /// At quit: an owed take-back is replaced by the quit's own write of this
-    /// run's desk (`quit_wrote_its_desk`: the quit wrote, or tried to write,
-    /// its layout, stamped with this run), or else tried once more, waiting
-    /// for the lock at most [`QUIT_TAKE_BACK_LOCK_WAIT`]: a quit that writes no
-    /// layout (nothing to reopen, or restore off) left this run's stale desk
-    /// for the next launch to reopen.
+    /// At quit: an owed take-back is replaced by the quit's own write of this run's desk
+    /// (`quit_wrote_its_desk`), or else tried once more, waiting at most
+    /// [`QUIT_TAKE_BACK_LOCK_WAIT`].
     pub(crate) fn settle_owed_layout_take_back_at_quit(&mut self, quit_wrote_its_desk: bool) {
         self.settle_owed_layout_take_back_at_quit_with(quit_wrote_its_desk, |run| {
             crate::restore::unwrite_quit_within(run, QUIT_TAKE_BACK_LOCK_WAIT)
@@ -10887,22 +9568,14 @@ impl crate::App {
     }
 }
 
-/// How long the cold lane's quit-layout write, and its take-back, wait for the
-/// restore lock on the GUI main thread (round eight of the update audit, U49).
-/// Another instance holds it across its boot's take or its quit's write — one
-/// or two `F_FULLFSYNC`s, whose worst peer hold measured is 280 ms
-/// (`native_document_journal::JournalLockPatience`) — so this covers a holder
-/// at work; one stopped while it holds the lock is a passing refusal the lane
-/// retries on its schedule, never a frozen window. The figure the document
-/// save's outer retry allows for the same hazard.
+/// How long the cold lane's quit-layout write and take-back wait for the restore lock on
+/// the main thread: a peer holds it for one or two `F_FULLFSYNC`s (worst measured 280 ms),
+/// and one stopped while holding it is a passing refusal, never a frozen window.
 #[cfg(unix)]
 const COLD_LANE_LAYOUT_LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// The wait before an owed take-back of the cold lane's layout is tried again
-/// after its first refusal ([`App::take_back_cold_lane_layout`]), doubled per
-/// refusal up to [`OWED_TAKE_BACK_RETRY_CAP`]; each try waits for the lock at
-/// most [`COLD_LANE_LAYOUT_LOCK_WAIT`], so a holder that never lets go costs
-/// the window that much once a minute, as the lane's own retries do.
+/// The wait before an owed take-back is tried again after its first refusal, doubled per
+/// refusal up to [`OWED_TAKE_BACK_RETRY_CAP`].
 #[cfg(unix)]
 const OWED_TAKE_BACK_RETRY_FIRST: std::time::Duration = std::time::Duration::from_secs(2);
 
@@ -10911,25 +9584,20 @@ const OWED_TAKE_BACK_RETRY_FIRST: std::time::Duration = std::time::Duration::fro
 #[cfg(unix)]
 const OWED_TAKE_BACK_RETRY_CAP: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// How long the quit's try of an owed take-back waits for the restore lock
-/// ([`App::settle_owed_layout_take_back_at_quit`]): the event loop is gone, and
-/// the quit's crash-journal retire waits as long.
+/// How long the quit's try of an owed take-back waits for the restore lock, as long as the
+/// quit's crash-journal retire.
 #[cfg(unix)]
 const QUIT_TAKE_BACK_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// What the cold lane's quit layout still owes after an attempt that did not
-/// `exec` (round eight of the update audit, the reviews of U48 and U49).
+/// What the cold lane's quit layout still owes after an attempt that did not `exec`.
 #[cfg(unix)]
 #[derive(Debug, Default)]
 pub(crate) struct ColdLaneLayoutDebt {
-    /// The target build and cause whose tabs-not-kept record is in Messages
-    /// ([`App::say_cold_lane_tabs_not_kept`]): an attempt that then did not
-    /// `exec` is retried, and its record is not written again.
+    /// The target build and cause whose tabs-not-kept record is in Messages, so a retry
+    /// does not write it again.
     not_kept_said: Option<(u64, String)>,
-    /// This run's desk, written for an `exec` that did not happen, whose
-    /// take-back the restore lock refused past its bound: still in
-    /// `session.toml` while this process runs
-    /// ([`App::take_back_cold_lane_layout`]).
+    /// This run's desk, written for an `exec` that did not happen, whose take-back the
+    /// restore lock refused ([`App::take_back_cold_lane_layout`]).
     owed_take_back: Option<OwedTakeBack>,
 }
 
@@ -10949,9 +9617,8 @@ struct OwedTakeBack {
 
 #[cfg(unix)]
 impl OwedTakeBack {
-    /// The wait after the `refusals`-th refusal: [`OWED_TAKE_BACK_RETRY_FIRST`]
-    /// doubled per refusal after the first, at most
-    /// [`OWED_TAKE_BACK_RETRY_CAP`].
+    /// The wait after the `refusals`-th refusal: [`OWED_TAKE_BACK_RETRY_FIRST`] doubled per
+    /// refusal after the first, at most [`OWED_TAKE_BACK_RETRY_CAP`].
     fn spacing(refusals: u32) -> std::time::Duration {
         let doublings = refusals.saturating_sub(1).min(16);
         OWED_TAKE_BACK_RETRY_FIRST
@@ -10973,30 +9640,12 @@ enum LayoutLeft {
     NotKept(String),
 }
 
-/// Writes the cold lane's quit layout (`App::cold_lane_layout`) through `write`.
-///
-/// A failed write is a fact about this machine's data directory, never the
-/// candidate, so nothing is charged to the artifact. What it does next turns on
-/// whether its cause passes ([`crate::restore::RestoreFault`]):
-///
-/// * PASSING (another aterm holding the restore lock past the main thread's
-///   bound, a full disk, an I/O error): it refuses — no retry budget spent,
-///   auto intent kept, retried on the block cooldown, as the `--hold` and
-///   restore-off refusals are.
-/// * SETTLED (no data dir, a data folder this user cannot write, a read-only
-///   volume, a volume without the locks or syncs the write needs): no retry
-///   changes it. Refusing held the update with no end, re-probed every
-///   minute, while the posture still said it installs by itself (round eight
-///   of the update audit, U48). The lane goes on without the layout, as a quit
-///   on this machine goes on without its own, and says so (`NotKept`): what
-///   the successor does not get back is which document and Settings tabs were
-///   open, never unsaved text, which [`lane_carry_refusal`] already refused.
-///
-/// A write that failed AFTER it published (its directory's sync) left the
-/// layout a reader sees: `Written`, which the successor that starts next reads
-/// and an `exec` that does not happen takes back. Returned as a refusal, it
-/// stayed on disk while this process stayed up, for a later launch to open
-/// beside it.
+/// Writes the cold lane's quit layout (`App::cold_lane_layout`) through `write`; a failure
+/// is about this machine's data directory, never the candidate. A passing cause refuses,
+/// retried on the block cooldown; a settled one, which no retry changes, goes on without
+/// the layout and says so (`NotKept`), losing which tabs were open but never unsaved text.
+/// A write that failed after it published is `Written`, taken back if the `exec` does not
+/// happen.
 #[cfg(unix)]
 fn leave_cold_lane_layout(
     layout: Option<&crate::restore::RestoreManifest>,
@@ -11019,16 +9668,11 @@ fn leave_cold_lane_layout(
     }
 }
 
-/// What `lane` cannot carry of what the preflight's `token` let ride, as the
-/// refusal the update row reads, or `None` when the lane carries all of it.
-///
-/// * The cold lane reopens no draft: its quit layout (`App::cold_lane_layout`)
-///   reopens tabs but carries no unsaved text, so every carried editor draft,
-///   Settings draft and failed checkpoint is refused.
-/// * The seamless lane carries everything to a successor at least this build. An
-///   older successor ignores the Settings-drafts field, so a hop to an older build
-///   is refused (the build number is all that is known of it). Editor drafts ride
-///   the draft journal, not this field.
+/// What `lane` cannot carry of what the preflight's `token` let ride, as the refusal the
+/// update row reads: the cold lane's quit layout carries no unsaved text, so it refuses
+/// every editor draft, Settings draft and failed checkpoint; the seamless lane refuses
+/// Settings drafts on a hop to an older build, which ignores that field (editor drafts ride
+/// the draft journal).
 #[cfg(unix)]
 #[cfg_attr(
     test,
@@ -11082,9 +9726,8 @@ pub(crate) fn lane_carry_refusal(
     }
 }
 
-/// Each handed record's [`crate::session_store::CarriedClaims`], as the park
-/// drew it, in record order: what the Commit reads again
-/// ([`App::carried_claims_held`]).
+/// Each handed record's [`crate::session_store::CarriedClaims`] as the park drew it, for
+/// the Commit to read again ([`App::carried_claims_held`]).
 #[cfg(unix)]
 fn carried_claims_of(
     manifest: &crate::session_store::SessionHandoff,
@@ -11096,13 +9739,9 @@ fn carried_claims_of(
         .collect()
 }
 
-/// The session registry's projection narrowed to the sessions this attempt hands
-/// over, those in `live` ([`App::handoff_live_sessions`]).
-///
-/// The manifest, descriptors and screens must name the same sessions
-/// (`seamless::write_outgoing` refuses otherwise), and the registry still holds
-/// exited panes. Connection rows are kept whole: the successor re-mints only rows
-/// whose two endpoints it adopted.
+/// The registry's projection narrowed to the sessions in `live`: the manifest, descriptors
+/// and screens must name the same sessions (`seamless::write_outgoing` refuses otherwise).
+/// Connection rows stay whole; the successor re-mints only rows whose endpoints it adopted.
 #[cfg(unix)]
 fn handed_sessions_only(
     mut manifest: crate::session_store::SessionHandoff,
@@ -11115,15 +9754,9 @@ fn handed_sessions_only(
     manifest
 }
 
-/// Stamps each record with its session's foreground holder
-/// (`SessionRecord::fg_holder`) as the park capture read it
-/// ([`ParkedScreens::fg_holders`]).
-///
-/// A record scalar because the control-carry sidecar is dropped for many sessions
-/// (Sanitized or Repaint rung, receiver repaint, past the aggregate budget) that
-/// still restore their modes; without a holder, a job that died during the park
-/// would leave its alt screen and mouse modes armed under the prompt. A holder
-/// that is no pgid (`<= 0`) is not written.
+/// Stamps each record with its session's foreground holder as the park read it: the
+/// control-carry sidecar is dropped for many sessions, and without a holder a job that died
+/// during the park would leave its alt screen and mouse modes armed under the prompt.
 #[cfg(unix)]
 fn stamp_fg_holders(
     mut manifest: crate::session_store::SessionHandoff,
@@ -11139,11 +9772,9 @@ fn stamp_fg_holders(
     manifest
 }
 
-/// Stamp every handed session's crash journal key on its manifest record
-/// (`SessionRecord::journal_key`, round seven of the update audit, leftover
-/// I2b): `keys` is [`crate::App::journal_keys`], empty unless this process's
-/// journal still holds the image it took over at its own Commit. A record with
-/// none carries no key, so an older reader sees the wire it always saw.
+/// Stamp every handed session's crash journal key on its manifest record (`keys`:
+/// [`crate::App::journal_keys`]); a record with none carries no key, so an older reader
+/// sees the wire it always saw.
 #[cfg(unix)]
 fn stamp_journal_keys(
     mut manifest: crate::session_store::SessionHandoff,
@@ -11159,10 +9790,8 @@ fn stamp_journal_keys(
 }
 
 /// Stamp every handed session's render debt on its manifest record
-/// ([`ParkedScreens::render_debts`]): `"<shift>,<pushed>"`, only when the
-/// engine owed rows on the alternate screen. A record with none carries no key,
-/// so an older reader sees the wire it always saw, and a successor reads a
-/// missing key as "owes nothing" - the debt is carried, never a verdict.
+/// ([`ParkedScreens::render_debts`]) as `"<shift>,<pushed>"`, only when the engine owed
+/// rows on the alternate screen; a record with none carries no key, read as owing nothing.
 #[cfg(unix)]
 fn stamp_render_debts(
     mut manifest: crate::session_store::SessionHandoff,
@@ -11178,9 +9807,8 @@ fn stamp_render_debts(
     manifest
 }
 
-/// Keep the actionable handoff cause in the returned refusal, which the updater
-/// records in its durable status. A separate warning cannot answer a later
-/// `update status`, and an unrelated admission failure must keep its own reason.
+/// Keep the actionable handoff cause in the returned refusal, which `update status` reads
+/// from the updater's durable status; an unrelated admission failure keeps its own reason.
 #[cfg(unix)]
 fn update_admission_refusal(
     reason: crate::native_update_admission::AdmissionBlock,
@@ -11254,22 +9882,14 @@ mod admission_refusal_detail_tests {
                 message.chars().count() <= 400,
                 "durable health truncates at 400 characters"
             );
-            // Historical construction kept the counts but lost both actionable facts.
+            // The admission's own message keeps the counts but neither actionable fact.
             assert!(!reason.message(facts).contains(cause));
             assert!(!reason.message(facts).contains(remedy));
         }
     }
 
-    /// ROUND EIGHT, U26: A FOREGROUND THE PROBE COULD NOT READ DOES NOT HIDE
-    /// WHY THE HANDOFF IS UNAVAILABLE. With the seamless lane gone, every live
-    /// terminal blocks the update whatever its foreground is, so the probe
-    /// changes no decision; it only chose the words. Its refusal said the
-    /// foreground "could not be proven safe", which nothing the person does
-    /// changes, and dropped the cause and the remedy (`--headless`, a windowed
-    /// launch) the live-session refusal carries — and the recorded reason
-    /// flipped between the two across retries as the probe answered.
-    ///
-    /// RED before the fix: the message was the probe's, without either.
+    /// An unreadable foreground does not hide why the handoff is unavailable: the refusal
+    /// still carries the cause and remedy.
     #[test]
     fn an_unreadable_foreground_keeps_the_handoffs_cause_and_remedy() {
         for (unavailable, cause, remedy) in [
@@ -11361,23 +9981,9 @@ fn readiness_proof_matches(
     crate::seamless::AdoptionProof::from_wire(wire) == Some(expected)
 }
 
-/// Blocks (bounded) until the overlap-handoff child signals readiness, closes
-/// its proof pipe, or times out. Never calls `Child::try_wait`, which would reap
-/// an exited group leader and lose the pid before the unique reaper signals its
-/// descendants. Pre-ready death is proof EOF, or the candidate's end asked
-/// without reaping (`candidate_gone`), since a stray write-end copy can hold EOF
-/// back; an exit after the proof is rejected by the atomic Commit write (EPIPE).
-/// The deadline defaults to 30 s and is tunable via
-/// `ATERM_HANDOFF_READY_TIMEOUT_MS`, a development seam (`aterm_types::dev_seam!`).
-///
-/// `masters` are watched for session death (HUP/ERR/NVAL → `Rejected`) but not
-/// for readable output, which waits in the kernel for the child's parser. A
-/// cancel poke returns `ActivityRevoked`.
-///
-/// The three mutually exclusive verdicts on one `poll` answer during the ready
-/// wait, split out so the anti-spin contract is testable: queued master output
-/// must land on [`ReadyPollAction::NoProgress`] (the yielding branch), never on
-/// an immediate re-poll.
+/// The verdicts on one `poll` answer during the ready wait ([`wait_handoff_ready`]), split
+/// out so the anti-spin contract is testable: queued master output lands on
+/// [`ReadyPollAction::NoProgress`], the yielding branch.
 #[cfg(unix)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ReadyPollAction {
@@ -11386,15 +9992,13 @@ enum ReadyPollAction {
     SessionDied,
     /// The proof fd is readable (POLLIN or its own HUP/ERR/NVAL) — read the wire.
     ReadProof,
-    /// Neither: `poll` returned for queued readable output (plain POLLIN, not an
-    /// abort) or a bare slice. The caller must yield before re-polling, or a master
-    /// that stays readable would make `poll` return instantly forever.
+    /// Neither: queued output or a bare slice. The caller must yield, or a master that
+    /// stays readable makes `poll` return instantly forever.
     NoProgress,
 }
 
-/// Classifies one `poll` answer. Death on any master dominates; otherwise a
-/// readable proof fd is progress; otherwise yield. `pollfds[0]` is the proof fd,
-/// `pollfds[1..]` the watched masters (see [`wait_handoff_ready`]).
+/// Classifies one `poll` answer: death on any master (`pollfds[1..]`) dominates, then a
+/// readable proof fd (`pollfds[0]`), else yield.
 #[cfg(unix)]
 #[must_use]
 fn classify_ready_poll(pollfds: &[libc::pollfd]) -> ReadyPollAction {
@@ -11412,10 +10016,13 @@ fn classify_ready_poll(pollfds: &[libc::pollfd]) -> ReadyPollAction {
     ReadyPollAction::NoProgress
 }
 
-/// What the main thread hands `prelaunch_out_of_band_handoff`: every pre-park
-/// fact the launched lane needs, taken from `start_unix_update_handoff` at the
-/// point the lane was decided.
+/// What the main thread hands `prelaunch_out_of_band_handoff`: the pre-park facts the
+/// launched lane needs.
 #[cfg(target_os = "macos")]
+#[expect(
+    clippy::disallowed_types,
+    reason = "the update successor's raw Command: it hands over exactly its own descriptors, which a strip at the exec would undo"
+)]
 struct PrelaunchArgs {
     attempt_id: u64,
     build: u64,
@@ -11437,14 +10044,13 @@ struct PrelaunchArgs {
     reconcile_ticket: crate::app_native::NativeUpdateReconcileTicket,
 }
 
-/// The facts the park gate reads, in a shape a test can enumerate. Each is
-/// measured on the main thread right before the gate runs, never remembered from
-/// the attempt's entry, which may be minutes earlier.
+/// The facts the park gate reads, measured on the main thread right before it runs, in a
+/// shape a test can enumerate.
 #[cfg(any(target_os = "macos", all(test, unix)))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ParkGateFacts {
     pub(crate) mode: crate::native_updater_service::ApplyMode,
-    /// `App::automatic_apply_phase`: where the automatic lane stands on its
+    /// `App::automatic_phase_for`: where the automatic lane stands on its
     /// ladder at this instant. Ignored by the explicit modes.
     pub(crate) phase: crate::native_update_auto_intent::ApplyPhase,
     /// `App::automatic_activity_facts`: the terminal's quiet / keys / output /
@@ -11453,28 +10059,18 @@ pub(crate) struct ParkGateFacts {
     /// `!handoff_masters_have_activity`: no live master has bytes waiting that
     /// a reader has not consumed.
     pub(crate) masters_quiet: bool,
-    /// `!handoff_masters_closed`: no handed master has hung up. A dead one would be
-    /// refused by the post-park re-check anyway, so the gate waits rather than
-    /// freezing the terminal to find out. Exited panes are not handed
-    /// (`App::handoff_live_sessions`, re-read every gate run), so this is false only
-    /// between a command's exit and the registry marking it.
+    /// `!handoff_masters_closed`: no handed master has hung up. A dead one would fail the
+    /// post-park re-check, so the gate waits rather than freezing the terminal to find out.
     pub(crate) masters_alive: bool,
-    /// How many times in a row the gate has answered `Wait` in the `Land` phase,
-    /// which can only be the masters holding it. Past [`PRELAUNCH_LAND_MAX_WAITS`]
-    /// the park proceeds over queued output, never over a dead master.
+    /// How many times in a row the gate has answered `Wait` in `Land`, which only the
+    /// masters can cause; past [`PRELAUNCH_LAND_MAX_WAITS`] the park proceeds.
     pub(crate) land_waits: u8,
-    /// The successor's signed handoff policy says `park_quiet_gate_at_land =
-    /// "relaxed"`: at `Land` the park proceeds over queued output at once rather
-    /// than after [`PRELAUNCH_LAND_MAX_WAITS`] waits. Never over a dead master or in
-    /// an earlier phase; the capture's mid-sequence check still applies.
+    /// The successor's policy says `park_quiet_gate_at_land = "relaxed"`: at `Land` the
+    /// park proceeds over queued output at once, never over a dead master.
     pub(crate) land_gate_relaxed: bool,
     /// How long the successor has been holding its claim.
     pub(crate) held_for: std::time::Duration,
-    /// A `video` take (or its export) is live and owed a reply
-    /// ([`crate::App::video_request_live`]). Before `Land` the automatic lanes
-    /// wait for it, for at most [`VIDEO_PARK_WAIT_MAX`] of the hold
-    /// ([`recording_park_refusal`]); after that the park proceeds and Commit
-    /// aborts the take with a reply.
+    /// A `video` take (or its export) is live and owed a reply ([`recording_park_refusal`]).
     pub(crate) recording: bool,
 }
 
@@ -11486,42 +10082,20 @@ pub(crate) enum ParkGate {
     Park,
     /// Not now; the successor keeps holding and the gate re-runs.
     Wait(&'static str),
-    /// The hold cap expired without a moment to park in: stand the successor
-    /// down. Activity-revoked, so the intent is retained and the automatic lane
-    /// tries again at a later quiet window.
+    /// The hold cap expired without a moment to park in: stand down as activity-revoked,
+    /// so the automatic lane tries again later.
     StandDown(&'static str),
 }
 
-/// When the terminal may be frozen, decided separately from starting the update.
+/// When the terminal may be frozen, decided separately from starting the update (the
+/// launch costs nothing: readers stay live through the successor's boot). `Immediate`
+/// parks at once; the automatic modes follow the ladder
+/// (`native_update_auto_intent::automatic_park_refusal`) at its live phase.
 ///
-/// The entry gate still decides whether an attempt starts
-/// (`AutomaticAttemptRequiresQuietOrClosedGraceWindow` binds the launch), but the
-/// launch costs the user nothing: readers stay live through the successor's
-/// swap, re-exec and boot check. This gate decides what the user feels:
-///
-/// * `Immediate`: the person asked; park at once.
-/// * The automatic modes: the ladder
-///   (`native_update_auto_intent::automatic_park_refusal`) at its live phase: a
-///   quiet moment while idle is preferred, then a gap in output while an aterm
-///   window is focused, then a gap in typing, then nothing. A successor held into a
-///   later phase parks by that phase's rule.
-///
-/// Bytes waiting unread on a live master are a preference, not a correctness
-/// gate: at `Land` the gate gives way after [`PRELAUNCH_LAND_MAX_WAITS`] waits,
-/// since a producer faster than the parser keeps `POLLIN` set indefinitely.
-/// Parking over them loses nothing at a sequence boundary: the carry is taken
-/// from the engine and the successor replays the kernel queue after Commit
-/// (`HandoffCommitFacts`). A reader parked inside a sequence is caught by the
-/// capture as `CaptureFailure::MidSequence` and re-parked
-/// ([`mid_sequence_miss_disposition`]); a partial sequence is abandoned only over
-/// a quiet PTY.
-///
-/// The successor's signed policy can bring the `Land` bound forward to the first
-/// wait (`park_quiet_gate_at_land = "relaxed"`,
-/// [`ParkGateFacts::land_gate_relaxed`]); nothing else here is the policy's.
-///
-/// Monotone in `held_for`: past the cap every automatic mode stands down and
-/// never admits again, which bounds the hold.
+/// Unread master bytes are a preference, not a correctness gate: at `Land` the gate gives
+/// way after [`PRELAUNCH_LAND_MAX_WAITS`] waits (at once under a `relaxed` policy), since a
+/// fast producer keeps `POLLIN` set; the successor replays the kernel queue. Monotone in
+/// `held_for`: past the cap every automatic mode stands down.
 #[cfg(any(target_os = "macos", all(test, unix)))]
 #[must_use]
 pub(crate) fn prelaunch_park_admitted(
@@ -11559,9 +10133,8 @@ pub(crate) fn prelaunch_park_admitted(
     ParkGate::Park
 }
 
-/// How long a live `video` take may hold an automatic park before `Land`: the
-/// verb's maximum duration ([`crate::control::control_media::VIDEO_MAX_DURATION`]),
-/// so a running take can finish and answer its client.
+/// How long a live `video` take may hold an automatic park before `Land`: the verb's
+/// maximum duration ([`crate::control::control_media::VIDEO_MAX_DURATION`]).
 #[cfg(unix)]
 pub(crate) const VIDEO_PARK_WAIT_MAX: std::time::Duration =
     crate::control::control_media::VIDEO_MAX_DURATION;
@@ -11573,14 +10146,9 @@ const _: () = assert!(
      down instead of being answered"
 );
 
-/// Whether a live `video` take holds this park.
-///
-/// Commit aborts a running take with a reply it waits to see written
-/// ([`crate::App::video_answer_before_commit`]). Before that the automatic lanes
-/// let the take finish, in every phase but `Land` and on the launched lane for at
-/// most [`VIDEO_PARK_WAIT_MAX`] of the hold. Both bounds come due (the ladder
-/// reaches `Land` within [`crate::native_update_auto_intent::LANDS_WITHIN`]); an
-/// explicit apply never waits.
+/// Whether a live `video` take holds this park: the automatic lanes let it finish before
+/// `Land`, for at most [`VIDEO_PARK_WAIT_MAX`] of the hold; after that Commit aborts it
+/// with a reply ([`crate::App::video_answer_before_commit`]). An explicit apply never waits.
 #[cfg(unix)]
 #[must_use]
 pub(crate) fn recording_park_refusal(
@@ -11596,9 +10164,9 @@ pub(crate) fn recording_park_refusal(
         .then_some("a video recording is running")
 }
 
-/// The detail a hold-cap stand-down carries into the completion and ledger: the
-/// cap's reason, how long the successor was held, and the last thing the gate was
-/// waiting for, so a flooded master is not reported as the user being busy.
+/// The detail a hold-cap stand-down carries: the cap's reason, how long the successor was
+/// held, and what the gate last waited for, so a flooded master is not reported as the
+/// user being busy.
 #[cfg(any(target_os = "macos", all(test, unix)))]
 #[must_use]
 pub(crate) fn hold_cap_stand_down_detail(
@@ -11616,10 +10184,8 @@ pub(crate) fn hold_cap_stand_down_detail(
     }
 }
 
-/// How many consecutive `Wait` answers the gate gives in `Land` before parking
-/// over output still queued on a master: one second at the 20 ms re-run, enough
-/// for a lagging reader, so a permanently readable master costs one second rather
-/// than the whole hold.
+/// How many consecutive `Wait` answers the gate gives in `Land` before parking over queued
+/// output: one second at the 20 ms re-run, so a permanently readable master costs no more.
 #[cfg(unix)]
 pub(crate) const PRELAUNCH_LAND_MAX_WAITS: u8 = 50;
 
@@ -11651,26 +10217,17 @@ pub(crate) enum ParkAttempt {
     /// Not now — re-run the gate after [`PRELAUNCH_PARK_RETRY`].
     #[cfg(any(target_os = "macos", all(test, unix)))]
     NotYet(&'static str),
-    /// The park missed: the readers were parked and rolled back, nothing granted,
-    /// and the successor still holds. Re-park once, after [`PRELAUNCH_REPARK_DELAY`]
-    /// and on the next freeze-budget rung.
-    ///
-    /// Timing only: a reader that missed the deadline, a capture that outran it, an
-    /// engine lock not taken, storage not reserved, or a reader parked mid-sequence
-    /// (`CaptureFailure::MidSequence`). Each can come out differently 500 ms later;
-    /// a deterministic refusal never belongs here.
+    /// The park missed (timing or storage): the readers were rolled back, nothing was
+    /// granted, and the successor still holds. Re-park after [`PRELAUNCH_REPARK_DELAY`] on
+    /// the next freeze-budget rung; a deterministic refusal never belongs here.
     Missed(String),
-    /// The park missed only because a parser was mid-sequence with the rest still
-    /// queued (`CaptureFailure::MidSequence`): it re-parks at the gate's 20 ms
-    /// cadence without climbing the rung, up to [`PRELAUNCH_MAX_MID_SEQUENCE_REPARKS`]
-    /// ([`mid_sequence_miss_disposition`]), then becomes [`Self::Missed`]. The fork
-    /// lane files it as a miss directly.
+    /// A miss only because a parser was mid-sequence over queued output: re-parks at the
+    /// gate's cadence on the same rung, up to [`PRELAUNCH_MAX_MID_SEQUENCE_REPARKS`], then
+    /// becomes [`Self::Missed`]. The fork lane files it as a miss directly.
     #[cfg(any(target_os = "macos", all(test, unix)))]
     MissedMidSequence(String),
-    /// The capture refused the desk: a fact about the screens, session set or
-    /// layout that no rung changes. Not re-parked and never filed as a busy machine:
-    /// the successor stands down as [`crate::UpdateHandoffOutcome::CaptureRefused`],
-    /// retried when the desk changes.
+    /// The capture refused the desk, which no rung changes: the successor stands down as
+    /// [`crate::UpdateHandoffOutcome::CaptureRefused`], retried when the desk changes.
     Refused(CaptureRefusal),
     /// Stand the held successor down with this outcome; readers (if they were
     /// parked) have already been rolled back.
@@ -11678,9 +10235,8 @@ pub(crate) enum ParkAttempt {
     Failed(HandoffStandDown),
 }
 
-/// A deterministic refusal of the park's capture, with the session it names if
-/// any, so the stand-down, ledger and `update status` say which session held the
-/// update back.
+/// A deterministic refusal of the park's capture, naming the session that held the update
+/// back if any.
 #[cfg(unix)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CaptureRefusal {
@@ -11705,13 +10261,9 @@ impl std::fmt::Display for CaptureRefusal {
     }
 }
 
-/// Which lane a capture failure belongs to.
-///
-/// Timing (`Deadline`, `EngineBusy`, `MidSequence`) and this process's storage
-/// (`Storage`) are a miss: the same desk can capture 500 ms later on a wider
-/// rung. `Refused` is a fact about the desk that no rung changes, so it never
-/// climbs the freeze ladder or stands down as `ActivityRevoked`. Typed on the
-/// variant, never the message.
+/// Which lane a capture failure belongs to, typed on the variant: timing and this
+/// process's storage are a miss (the same desk can capture on a wider rung); `Refused` is a
+/// fact about the desk that no rung changes.
 #[cfg(unix)]
 #[must_use]
 pub(crate) fn classify_capture_failure(failure: &CaptureFailure) -> ParkAttempt {
@@ -11727,22 +10279,10 @@ pub(crate) fn classify_capture_failure(failure: &CaptureFailure) -> ParkAttempt 
     }
 }
 
-/// The park's commitment to its post-park handoff layout, both lanes': the
-/// digest the adoption proof is taken over, or the deterministic refusal the
-/// lane stands down with (`CaptureRefused`, retried once the desk changes).
-///
-/// A LAYOUT NO BUILD READS WHOLE IS REFUSED HERE (round eight of the update
-/// audit, D5, and the lead U33). The handoff capture folds a desk past the
-/// window and tab caps into what one layout holds
-/// (`restore::RestoreManifest::fold_into_caps`); what is still past them —
-/// more than 64 windows of 256 tabs, or a tab past 256 panes or 31 nested
-/// splits — fails the worker's round trip on every attempt
-/// (`from_toml(to_toml(layout)) == layout`), which files it as this process's
-/// own transient trouble (`ProducerFailed`) and froze every tab again on each
-/// retry. It is a fact about the desk, so it is said as one, before the worker
-/// starts, in words that name the cap and where it is passed
-/// (`restore::RestoreManifest::why_not_whole`). A layout this passes is
-/// exactly one the park committed to before.
+/// The park's commitment to its post-park handoff layout: the digest the adoption proof is
+/// taken over, or `CaptureRefused` for a layout still past the caps after
+/// `restore::RestoreManifest::fold_into_caps`, which would otherwise fail the worker's
+/// round trip on every attempt (`restore::RestoreManifest::why_not_whole`).
 #[cfg(unix)]
 pub(crate) fn commit_handoff_layout(
     layout: &crate::restore::RestoreManifest,
@@ -11759,11 +10299,9 @@ pub(crate) fn commit_handoff_layout(
     })
 }
 
-/// Test seam for the capture's lane decision: runs the shipping park capture over
-/// the whole pool with a deadline wide enough that a loaded machine cannot make
-/// the answer timing, and returns what the park would do: the repainted session
-/// ids of a parked capture, or the [`ParkAttempt`] a failure classifies into.
-/// `native_updater_conformance` drives refused desks through it.
+/// Test seam for the capture's lane decision: the shipping park capture over the whole
+/// pool, with a deadline no loaded machine can miss, answering the repainted ids or the
+/// [`ParkAttempt`] a failure classifies into.
 #[cfg(all(test, unix))]
 impl App {
     pub(crate) fn capture_park_outcome_for_conformance(
@@ -11786,10 +10324,8 @@ impl App {
     }
 }
 
-/// What one park hands the worker, projected from a whole [`App`] as the fork
-/// lane does: the handed set, the registry manifest, the window carry, the
-/// capture, the history heads and plan, and the post-park layout with its digest.
-/// The PTY descriptors are left to the caller.
+/// What one park hands the worker, projected from a whole [`App`] as the fork lane does;
+/// the PTY descriptors are left to the caller.
 #[cfg(all(test, unix))]
 pub(crate) struct ParkedDeskForTest {
     pub(crate) live: Vec<(u64, i32, i32)>,
@@ -11802,9 +10338,8 @@ pub(crate) struct ParkedDeskForTest {
     /// Each handed session's history fence under the park, as the worker's
     /// join takes it.
     pub(crate) history_heads: Vec<crate::handoff_history::HistoryHead>,
-    /// The fork lane's history plan for this park, built by the call the lane
-    /// makes (`HistoryPlan::deferred_under`), for the caller to run as the
-    /// worker does (`HistoryPlan::results`, then `stamp_manifest`).
+    /// The fork lane's history plan for this park, for the caller to run as the worker
+    /// does (`HistoryPlan::results`, then `stamp_manifest`).
     pub(crate) history: crate::handoff_history::HistoryPlan,
     pub(crate) layout: crate::restore::RestoreManifest,
     pub(crate) layout_digest: Option<[u8; 32]>,
@@ -11812,16 +10347,12 @@ pub(crate) struct ParkedDeskForTest {
     pub(crate) held: Vec<crate::seamless::HeldScreen>,
 }
 
-/// Whole-app test seam: the fork lane's park, from registry projection to the
-/// post-park layout, over this App's real pool, with the successor's caps for
-/// `target_build` and a deadline wide enough that a loaded machine cannot make the
-/// answer timing. `seamless::app_capture_tests` drives it through the manifest
-/// writer and the successor's reader.
+/// Whole-app test seam: the fork lane's park over this App's real pool, with the
+/// successor's caps for `target_build` and a deadline no loaded machine can miss.
 #[cfg(all(test, unix))]
 impl App {
-    /// The park described above. The successor's handoff policy for `attempt` is
-    /// read by [`Self::park_policy`], as both lanes do, and its carry ceiling bounds
-    /// the capture. `None` is the same-image seam: no policy.
+    /// The park described above, under the successor's policy for `attempt`
+    /// ([`Self::park_policy`]); `None` is the same-image seam.
     pub(crate) fn park_desk_for_test(
         &mut self,
         attempt: Option<&crate::native_updater_service::ApplyAttemptTicket>,
@@ -11888,9 +10419,8 @@ impl App {
     }
 }
 
-/// The stand-down a [`ParkAttempt::Refused`] park sends: typed `CaptureRefused`,
-/// naming the session, so the refusal lane and the ledger say what held the
-/// update back.
+/// The stand-down a [`ParkAttempt::Refused`] park sends: `CaptureRefused`, naming the
+/// session.
 #[cfg(any(target_os = "macos", all(test, unix)))]
 #[must_use]
 pub(crate) fn capture_refusal_stand_down(refusal: &CaptureRefusal) -> HandoffStandDown {
@@ -11900,25 +10430,20 @@ pub(crate) fn capture_refusal_stand_down(refusal: &CaptureRefusal) -> HandoffSta
     }
 }
 
-/// How often the event loop re-runs the park gate while a prelaunched attempt
-/// waits for a quiet moment. Short enough that the park lands inside the quiet
-/// epoch it is waiting for (500 ms), long enough to be no load.
+/// How often the event loop re-runs the park gate while a prelaunched attempt waits for a
+/// quiet moment: well inside the 500 ms quiet epoch it waits for.
 #[cfg(unix)]
 const PRELAUNCH_PARK_RETRY: std::time::Duration = std::time::Duration::from_millis(20);
 
-/// How long the gate waits before re-parking after a park that missed its
-/// budget. Long enough for whatever took the engine lock (the scrollback
-/// compressor, a render) to finish, short enough that the successor's hold is
-/// not visibly spent on it.
+/// How long the gate waits before re-parking after a missed budget: long enough for
+/// whatever held the engine lock to finish.
 #[cfg(any(target_os = "macos", all(test, unix)))]
 const PRELAUNCH_REPARK_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// How many times one prelaunched attempt re-parks before standing its successor
-/// down. Two: the whole freeze ladder ([`handoff_freeze_budget`]) is climbed within
-/// one attempt, 500 ms apart, with the successor still holding, rather than a
-/// relaunch per rung. A miss is the parent's scheduling failure and says nothing
-/// about the candidate, so it never reaches the ledger; past the last rung the
-/// attempt stands down as a busy-machine fact ([`park_miss_disposition`]).
+/// How many times one prelaunched attempt re-parks before standing its successor down: the
+/// whole freeze ladder ([`handoff_freeze_budget`]) is climbed within one attempt, with the
+/// successor still holding. A miss is the parent's scheduling failure and says nothing
+/// about the candidate, so it never reaches the ledger ([`park_miss_disposition`]).
 #[cfg(any(target_os = "macos", all(test, unix)))]
 pub(crate) const PRELAUNCH_MAX_PARK_MISSES: u8 = 2;
 
@@ -11926,37 +10451,29 @@ pub(crate) const PRELAUNCH_MAX_PARK_MISSES: u8 = 2;
 #[cfg(any(target_os = "macos", all(test, unix)))]
 #[derive(Debug)]
 pub(crate) enum ParkMissDisposition {
-    /// Re-park after [`PRELAUNCH_REPARK_DELAY`] on the ladder's next rung;
-    /// `misses` is the attempt's new miss count, which is also the rung the
-    /// re-park widens to.
+    /// Re-park after [`PRELAUNCH_REPARK_DELAY`] on the next rung; `misses` is the new miss
+    /// count, which is also that rung.
     Repark { misses: u8, reason: String },
-    /// A mid-sequence miss inside its own bound: re-park after
-    /// [`PRELAUNCH_PARK_RETRY`] on the SAME rung; `reparks` is the attempt's new
-    /// mid-sequence count.
+    /// A mid-sequence miss inside its own bound: re-park after [`PRELAUNCH_PARK_RETRY`] on
+    /// the same rung; `reparks` is the attempt's new mid-sequence count.
     RetryMidSequence { reparks: u8, reason: String },
     /// Every rung was tried. Stand the successor down.
     StandDown(HandoffStandDown),
 }
 
-/// How many mid-sequence misses one prelaunched attempt re-parks on for free. Past
-/// [`PRELAUNCH_LAND_MAX_WAITS`], `Land` parks inside a flood, where a reader can
-/// stop inside an escape sequence; the flood's next boundary is elsewhere, so these
-/// re-park at the 20 ms cadence without climbing the rung. Bounded (within a second
-/// of the hold), after which the ordinary ladder applies.
+/// How many mid-sequence misses one prelaunched attempt re-parks on for free, at the gate's
+/// cadence without climbing the rung: past [`PRELAUNCH_LAND_MAX_WAITS`], `Land` parks
+/// inside a flood, where a reader can stop inside an escape sequence.
 #[cfg(any(target_os = "macos", all(test, unix)))]
 pub(crate) const PRELAUNCH_MAX_MID_SEQUENCE_REPARKS: u8 = 32;
 
-/// [`aterm_core::terminal::Terminal::output_state_in_flight`]'s name for an
-/// OSC 8 link still open — on a hop to a successor older than the output-state
-/// carry, the one state it drops whose miss is soft
-/// ([`App::soft_miss_may_repark`]).
+/// [`aterm_core::terminal::Terminal::output_state_in_flight`]'s name for an open OSC 8
+/// link, the one dropped state whose miss is soft ([`App::soft_miss_may_repark`]).
 #[cfg(unix)]
 const OPEN_LINK_STATE: &str = "Osc8HyperlinkOpen";
 
-/// The drain gate's per-respin yield ([`App::handoff_drain_gate`]), so its
-/// fence is measured in loop iterations that really dispatched events instead
-/// of a busy spin — and the grain under which a blocking wait at Commit opened
-/// no window the fence did not already have ([`App::commit_flush_refences`]).
+/// The drain gate's per-respin yield ([`App::handoff_drain_gate`]), and the grain under
+/// which a blocking wait at Commit opens no new window ([`App::commit_flush_refences`]).
 #[cfg(unix)]
 const HANDOFF_INPUT_DRAIN_YIELD: std::time::Duration = std::time::Duration::from_millis(2);
 
@@ -11966,9 +10483,8 @@ const _: () = assert!(
         && PRELAUNCH_PARK_RETRY.as_millis() == 20
 );
 
-/// A miss that was only a parser mid-sequence: a free re-park while `reparks`
-/// is inside [`PRELAUNCH_MAX_MID_SEQUENCE_REPARKS`], otherwise the ordinary
-/// ladder ([`park_miss_disposition`]).
+/// A mid-sequence miss: a free re-park while `reparks` is inside
+/// [`PRELAUNCH_MAX_MID_SEQUENCE_REPARKS`], else the ordinary ladder.
 #[cfg(any(target_os = "macos", all(test, unix)))]
 #[must_use]
 pub(crate) fn mid_sequence_miss_disposition(
@@ -11986,15 +10502,9 @@ pub(crate) fn mid_sequence_miss_disposition(
     }
 }
 
-/// A park miss is a fact about the machine's moment, never about the bytes.
-///
-/// The readers came back and nothing was granted or written; a busy machine only
-/// failed to park or capture inside a comfort budget. Like a keystroke or the hold
-/// cap, that is a scheduling fact, so past the last rung the successor stands down
-/// as `ActivityRevoked`: retried on the activity spacing, no physical budget spent,
-/// never a manual-only latch (docs/DESIGN-auto-apply-ladder-2026-09-21.md, law 2).
-///
-/// Only a miss comes here; a refusal is [`ParkAttempt::Refused`].
+/// A park miss is a fact about the machine's moment, never about the bytes: past the last
+/// rung the successor stands down as `ActivityRevoked`, with no physical budget spent
+/// (docs/DESIGN-auto-apply-ladder-2026-09-21.md, law 2).
 #[cfg(any(target_os = "macos", all(test, unix)))]
 #[must_use]
 pub(crate) fn park_miss_disposition(misses: u8, reason: String) -> ParkMissDisposition {
@@ -12014,27 +10524,20 @@ pub(crate) fn park_miss_disposition(misses: u8, reason: String) -> ParkMissDispo
     }
 }
 
-/// How long Commit waits at most for every live `video` request it answers to
-/// reach its client before `_exit`: an export's encode worker seeing its
-/// cancellation and removing its directory, and each reply written
-/// ([`crate::App::video_answer_before_commit`]). Spent only on a wedged worker or
-/// client.
+/// How long Commit waits at most for every live `video` request it answers to reach its
+/// client before `_exit` ([`crate::App::video_answer_before_commit`]).
 #[cfg(unix)]
 pub(crate) const VIDEO_EXPORT_COMMIT_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// How long the seamless parent waits at Commit, and the cold lane before `exec`
-/// (`prepare_cold_exec`), for the message-log writer to land what it holds
-/// ([`crate::App::flush_messages_log_within`]). Spent only on a throttled or
-/// starved writer; what does not land is noted in `aterm.log`.
+/// How long the seamless parent at Commit, and the cold lane before `exec`, wait for the
+/// message-log writer ([`crate::App::flush_messages_log_within`]).
 #[cfg(unix)]
 pub(crate) const MESSAGES_FLUSH_COMMIT_WAIT: std::time::Duration =
     std::time::Duration::from_millis(250);
 
-/// How long a dialled successor is held for a quiet moment before the attempt
-/// stands down (activity-revoked, retried later). Longer than the whole ladder
-/// ([`crate::native_update_auto_intent::LANDS_WITHIN`]), so a successor held
-/// through a busy stretch reaches `Land` and parks. Only a hold the ladder never
-/// relaxes (the user's consent warm-up) can outlast it.
+/// How long a dialled successor is held for a quiet moment before the attempt stands down
+/// (activity-revoked, retried later): longer than the whole ladder
+/// ([`crate::native_update_auto_intent::LANDS_WITHIN`]), so a held successor reaches `Land`.
 #[cfg(unix)]
 pub(crate) const PRELAUNCH_HOLD_MAX: std::time::Duration = std::time::Duration::from_secs(120);
 
@@ -12043,17 +10546,10 @@ const _: () = assert!(
     crate::native_update_auto_intent::LANDS_WITHIN.as_secs() + 10 < PRELAUNCH_HOLD_MAX.as_secs()
 );
 
-/// When the post-park proof wait gives up on the launched lane.
-///
-/// Everything slow has happened before the park, so this bounds the rest of the
-/// freeze: the artifacts still to write (`prepare_outgoing_artifacts`), the one
-/// `sendmsg`, and the successor's GUI boot to its first present (the dominant
-/// term). Anchored at the park because the frozen interval is what must be bounded.
-/// A missed deadline is a kill, proof of death and resumed terminal, charged to the
-/// physical retry ladder: 3 s on a first automatic attempt, 6 s after a physical
-/// failure of the same bytes, 30 s for an explicit apply.
-/// `ATERM_HANDOFF_PROOF_TIMEOUT_MS` overrides all three; it is a development seam
-/// (`aterm_types::dev_seam!`).
+/// When the post-park proof wait gives up on the launched lane, anchored at the park: 3 s
+/// on a first automatic attempt, 6 s after a physical failure of the same bytes, 30 s for
+/// an explicit apply; `ATERM_HANDOFF_PROOF_TIMEOUT_MS` (a development seam) overrides all
+/// three.
 #[cfg(any(target_os = "macos", all(test, unix)))]
 #[must_use]
 fn handoff_proof_deadline(
@@ -12075,20 +10571,14 @@ fn handoff_proof_deadline(
     park_at + std::time::Duration::from_millis(ms)
 }
 
-/// When this attempt stops waiting for its successor to prove readiness.
-///
-/// A deadline rather than a timeout: on the out-of-band lane the successor must
-/// dial (after its staged-swap boot apply) and then paint and prove, and one
-/// deadline keeps both stages within the fork lane's budget. The fork lane
-/// computes it right before its single wait.
+/// When this attempt stops waiting for its successor to prove readiness: a deadline, not a
+/// timeout, which on the launched lane bounds both the dial and the proof.
 #[cfg(unix)]
 #[must_use]
 fn handoff_ready_deadline() -> std::time::Instant {
-    // 30 s default: the deadline covers LaunchServices latency, a first-launch
-    // Gatekeeper assessment, the successor's whole staged-swap boot apply,
-    // adoption and painting every window, which can exceed 15 s under compile
-    // load. Expiry un-parks the parent safely, while a short deadline would make
-    // the update lane never succeed on a busy machine.
+    // 30 s: LaunchServices latency, a first-launch Gatekeeper assessment, the successor's
+    // whole boot apply, adoption and painting can exceed 15 s under load, and expiry only
+    // un-parks the parent, while a short deadline would never succeed on a busy machine.
     let timeout_ms = aterm_types::dev_seam!("ATERM_HANDOFF_READY_TIMEOUT_MS")
         .and_then(|v| v.to_str()?.parse::<u64>().ok())
         .unwrap_or(30_000)
@@ -12105,37 +10595,27 @@ enum LaunchedDialEnd {
     Cancelled,
     /// The successor is gone and no dial can come: see [`PreDialDeath`].
     SuccessorExited(PreDialDeath),
-    /// The launched successor DIALLED and presented the claim, the code gate
-    /// turned it away ([`crate::handoff_rendezvous::CodeRefusal`]), and it
-    /// exited by its own rule — a failed claim exits before any window — which
-    /// `death` reports. Filed by the refusal's cause
-    /// ([`code_refused_completion`]), never as a death nobody explained (round
-    /// eight of the update audit, U36's review). `dialer` is the process as the
-    /// kernel attested it at the refusal.
+    /// The launched successor dialled, the code gate turned it away
+    /// ([`crate::handoff_rendezvous::CodeRefusal`]), and it exited by its own rule; filed
+    /// by the refusal's cause ([`code_refused_completion`]).
     CodeRefused {
         dialer: HandoffCandidate,
         refusal: crate::handoff_rendezvous::CodeRefusal,
         death: PreDialDeath,
     },
-    /// The launched successor dialled, was held while macOS's code-signing
-    /// service did not answer its code check, and left while held: no refusal
-    /// of ours ended it, so its death is filed by its own evidence, in words
-    /// that say it dialled.
+    /// The launched successor dialled, was held while `trustd` did not answer its code
+    /// check, and left: filed by its own evidence, in words that say it dialled.
     ExitedWhileHeld {
         dialer: HandoffCandidate,
         death: PreDialDeath,
     },
-    /// The rendezvous ended it: the dial budget ran out (with the last refusal,
-    /// a dialer still held for its code check among them), or it refused one
-    /// dialer too many.
+    /// The rendezvous ended it: the dial budget ran out, or it refused one dialer too many.
     Rendezvous(crate::handoff_rendezvous::RendezvousError),
 }
 
-/// Whether `dialer` — a dialer the code gate turned away, witnessed alive at that
-/// moment — is the launched process whose death `death` reports: the very process
-/// LaunchServices named, or, for a death reported with no pid, a dialer that is
-/// gone too. A dialer that still lives is not the process LaunchServices says
-/// terminated, and one that could not be witnessed is not concluded to be it.
+/// Whether `dialer`, turned away by the code gate and witnessed alive then, is the launched
+/// process whose death `death` reports: the pid LaunchServices named, or, for a death with
+/// no pid, a dialer that is gone too.
 #[cfg(target_os = "macos")]
 fn code_refused_dialer_was_launched(dialer: HandoffCandidate, death: PreDialDeath) -> bool {
     match death {
@@ -12155,14 +10635,11 @@ fn code_refused_dialer_was_launched(dialer: HandoffCandidate, death: PreDialDeat
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PreDialDeath {
-    /// LaunchServices answered that the application it launched TERMINATED
-    /// before it checked in (`app_launch_successor::launch_answer_proves_exit`).
-    /// No pid and no status: nothing was observed about how it ended.
+    /// LaunchServices answered that the application it launched terminated before it
+    /// checked in; nothing was observed about how it ended.
     TerminatedBeforeCheckIn,
-    /// The process LaunchServices named for the launch is gone: the kernel recorded
-    /// its exit on the watch, or its pid fell vacant or was recycled
-    /// ([`NamedSuccessorWatch`]). `candidate` is its pid and first-sight birth
-    /// stamp; `death` is the kernel's record, read via [`handoff_child_death`].
+    /// The process LaunchServices named is gone ([`NamedSuccessorWatch`]): `candidate` is
+    /// its pid and first-sight birth stamp, `death` the kernel's record.
     NamedProcessGone {
         candidate: HandoffCandidate,
         death: crate::ChildDeathEvidence,
@@ -12189,25 +10666,12 @@ enum DialWaitAbort {
     SuccessorExited(PreDialDeath),
 }
 
-/// The pid LaunchServices named, watched until the dial.
-///
-/// LaunchServices answers with the pid of a process that checks in (during its
-/// `+sharedApplication`) or at its ~30 s check-in timeout, and says nothing if that
-/// process later dies. A successor dials before checking in, so a named process
-/// dying before its dial would otherwise be found only when the dial budget ran out.
-///
-/// At first sight this reads the named pid's birth stamp and registers a
-/// [`CandidateExitWatch`]; each later look asks, without blocking or signalling:
-///
-/// * the watch: XNU queues the exit in `proc_exit`, with the full status;
-/// * then [`handoff_candidate_terminated`]: the pid vacant or recycled. This covers
-///   a death before registration; the kernel refuses to register on a zombie while
-///   `kill(pid, 0)` still calls it alive, so a failed registration is not death.
-///
-/// A live process is never called gone: a same-pid `execve` raises only
-/// `NOTE_EXEC`, an unwatchable process is merely unwatched, and pid reuse can only
-/// hide a death. The pid is watched, never signalled or admitted: only the dial and
-/// the kernel's attestation at the accept grant identity.
+/// The pid LaunchServices named, watched until the dial: LaunchServices says nothing if a
+/// named process later dies, which would otherwise be found only at the dial deadline. Asks
+/// the [`CandidateExitWatch`] registered at first sight, then
+/// [`handoff_candidate_terminated`]. A live process is never called gone: a same-pid
+/// `execve` raises only `NOTE_EXEC`, a failed registration (the kernel refuses a zombie) is
+/// not death, and pid reuse can only hide one. The pid is never signalled or admitted.
 #[cfg(target_os = "macos")]
 #[derive(Default)]
 struct NamedSuccessorWatch {
@@ -12218,10 +10682,8 @@ struct NamedSuccessorWatch {
 
 #[cfg(target_os = "macos")]
 impl NamedSuccessorWatch {
-    /// One look between two accept slices: is the process LaunchServices named
-    /// (`named`, peeked from its answer) gone? `None` while it lives, while nothing
-    /// is named, and while the kernel has not said. LaunchServices answers once, so
-    /// the first pid seen is the only one.
+    /// One look between accept slices: is the named process (`named`, peeked from the
+    /// answer) gone? LaunchServices answers once, so the first pid seen is the only one.
     #[cfg_attr(
         test,
         aterm_spec::refines(
@@ -12246,9 +10708,8 @@ impl NamedSuccessorWatch {
             return Some((*candidate, handoff_child_death(true, Some(status))));
         }
         if handoff_candidate_terminated(*candidate) {
-            // After the proof, ask the watch again: the knote is queued in
-            // `proc_exit` before the pid can fall vacant, so a death between the
-            // read above and the probe still carries its status.
+            // Ask the watch again after the proof: the knote is queued before the pid can
+            // fall vacant, so a death between the two reads still carries its status.
             let status = watch.as_ref().and_then(CandidateExitWatch::exit_status);
             return Some((*candidate, handoff_child_death(true, status)));
         }
@@ -12256,47 +10717,18 @@ impl NamedSuccessorWatch {
     }
 }
 
-/// THE CODE THE LAUNCHED SUCCESSOR RUNS, as the gate on its dial checks it (round
-/// eight of the update audit, U36): the one gate before the grant that keeps out
-/// a same-uid process that copied the claim secret and dials with its own code
-/// (`handoff_rendezvous`'s module docs state what it leaves).
+/// The code the launched successor must run to pass the gate on its dial, which keeps out a
+/// same-uid process that copied the claim secret.
 ///
-/// * The successor runs an update candidate (`successor_runs_candidate`: a staged
-///   build, or the installed bundle an activation names — the worker verifying it
-///   again or honouring a fresh cached pass alike) and a release team is pinned:
-///   an aterm release's own requirement, the identifier every cut stamps and a
-///   Developer ID of `team` ([`crate::handoff_rendezvous::DialerCode::release`]).
-///   The candidate passed that Developer ID requirement (`codesign --verify -R`)
-///   before this lane was chosen for it, and its identifier is read here, so
-///   every successor gated by this rule meets it whatever its build — and so does
-///   one whose boot swap was deferred and which still runs this image, when this
-///   image is itself a release, as every installed build is. Every shipped build
-///   pins its team, so this is the rule of every real update from a build that
-///   has it. A dialer that does not meet it (a dev image whose swap was deferred,
-///   a process that is not the candidate) is turned away and filed by that
-///   refusal ([`LaunchedDialEnd::CodeRefused`], `Rejected`, transient), never
-///   granted. The candidate's own identifier is read BEFORE the launch
-///   (`candidate_identifier`; U36's second review): the Developer ID check every
-///   candidate passed does not test it, so a candidate cut with another
-///   identifier would pass every check, launch, dial and be refused on every
-///   attempt, a deterministic failure booked as a passing one, and a veto the
-///   old build holds over the new one's content that no new build can lift
-///   (design laws L4 and L1). Such a candidate, or one whose identifier could
-///   not be read just then, is `Err` here, and the caller hands the attempt to
-///   the fork lane, whose gate does not ask: the update still happens, as it
-///   did before the gate existed. A refusal at the dial is then never a verdict
-///   about the candidate's bytes (a deferred swap running a dev image, or a
-///   dialer that is not the candidate), which is why it stays transient.
-/// * Otherwise — the same-image QA seam (the successor re-runs this image, which
-///   a dev build signs ad hoc) or no team pinned: the designated requirement of
-///   the code at `bundle`, read when a dialer presents the secret, which is after
-///   the successor's boot swap put its build there.
-///
-/// Until U36's review this was chosen on whether the WORKER re-verifies the
-/// candidate (`HandoffWorkerJob::verify_staged_candidate`), which is false for a
-/// fresh cached pass too — the usual case, since the automatic lane pre-verifies
-/// at arm time — so most real updates got the code-at-path rule, which admits
-/// whatever code a same-uid process put at the install path before it dialled.
+/// * When the successor runs an update candidate (`successor_runs_candidate`) and a release
+///   team is pinned: the release requirement
+///   ([`crate::handoff_rendezvous::DialerCode::release`]), which the candidate passed
+///   (`codesign --verify -R`) before this lane was chosen. That check does not test the
+///   signing identifier, so it is read here, before the launch: another identifier would be
+///   refused at every dial, so it is `Err` and the caller forks instead.
+/// * Otherwise (the same-image QA seam, or no team pinned): the designated requirement of
+///   the code at `bundle`, read when a dialer presents the secret, after the successor's
+///   boot swap has put its build there.
 #[cfg(target_os = "macos")]
 fn launched_dialer_code(
     successor_runs_candidate: bool,
@@ -12322,40 +10754,17 @@ fn launched_dialer_code(
     }
 }
 
-/// The outgoing process's wait for its launched successor's dial, with every
-/// reader live.
+/// The outgoing process's wait for its launched successor's dial, with every reader live.
 ///
-/// A successor that dies before its dial (a containment-deny fatal in the warm
-/// prologue, a boot crash, a refused re-exec) would otherwise be seen only at the
-/// dial deadline. The accept's abort peeks LaunchServices' answer between its 10 ms
-/// poll slices ([`crate::app_launch_successor::LaunchInFlight::exited_before_check_in`]):
-/// a process that dies before checking in (every successor dials before its
-/// `NSApplication` exists) is answered as terminated with no pid, and nothing
-/// alive is answered that way.
+/// The accept's abort peeks LaunchServices' answer between poll slices (after the cancel),
+/// so a successor that dies before its dial is seen at once: "terminated before check-in",
+/// or a named pid the kernel says is gone ([`NamedSuccessorWatch`]). Any other answer
+/// leaves the wait alone, so a live successor is never refused here. The peeks consume
+/// nothing, so the corroboration after the dial still reads the answer.
 ///
-/// An answer naming a pid is a process seen alive; the abort then asks the kernel
-/// about it ([`NamedSuccessorWatch`]), with the same rollback on its end. Every
-/// other answer (an error, an unknown pid, this process's own, none yet) leaves the
-/// wait unchanged, so a live successor is never refused here
-/// (`NativeUpdateLaunchedDialWait`'s `NeverRefusesALiveSuccessor`). An error names
-/// no process and its codes are generic, so it is not evidence. The peeks consume
-/// nothing, so the corroboration after the dial still reads the answer
-/// (`AnswerKeptForTheCorroboration`).
-///
-/// The cancel is checked first, so a revocation keeps its own name.
-///
-/// A dialer is accepted only if its code is `code` ([`launched_dialer_code`]): a
-/// same-uid process that copied the claim out of the successor's launch
-/// environment is refused at the gate, and the wait goes on for the successor
-/// (round eight of the update audit, U36). The gate tells this wait about every
-/// dialer it turns away while that dialer is still connected, and the wait
-/// witnesses it then (pid and birth stamp): when a death ends the wait and the
-/// last dialer turned away is that launched process — the pid LaunchServices
-/// named, or gone too when the death names none — the wait ends on the refusal
-/// ([`LaunchedDialEnd::CodeRefused`], or [`LaunchedDialEnd::ExitedWhileHeld`]
-/// for one that left while held for a check `trustd` did not answer), so a
-/// successor the gate turned away is filed by that cause, never as a death
-/// before its dial (U36's review).
+/// A dialer is accepted only if its code is `code` ([`launched_dialer_code`]). A death of
+/// the launched process after the code gate turned it away ends the wait on the refusal
+/// ([`LaunchedDialEnd::CodeRefused`] or [`LaunchedDialEnd::ExitedWhileHeld`]).
 #[cfg(target_os = "macos")]
 #[cfg_attr(
     test,
@@ -12401,9 +10810,8 @@ fn await_launched_dial(
         }
         false
     };
-    // The last dialer the code gate turned away, witnessed while its connection
-    // was still open (pid and birth stamp), so a death reported after it is laid
-    // at the refusal's door only when that dialer is the launched process.
+    // The last dialer the code gate turned away, witnessed while still connected, so a
+    // later death is laid at the refusal's door only when that dialer is the launched one.
     let turned_away = std::cell::RefCell::new(None);
     let refused = |dialer: &crate::handoff_rendezvous::CodeRefusedDialer| {
         *turned_away.borrow_mut() = u32::try_from(dialer.pid)
@@ -12442,28 +10850,14 @@ fn await_launched_dial(
     }
 }
 
-/// The rollback of a successor that died before its dial, and the settling of
-/// the boot-trial launch it counted.
-///
-/// Rolled back like the dial deadline: nothing accepted, no descriptor left, so
-/// the readers never stopped (`NeverTransferred`). Filed `ChildDied` with the
-/// wait's evidence: `Unobserved` when LaunchServices reported the termination, the
-/// kernel's record when the named process's exit watch saw it.
-///
-/// The counted trial launch is settled by that evidence through
-/// [`forgives_the_counted_trial_launch`]: kept only when the bytes answer for the
-/// death, given back otherwise. The unexplained lane's budget
-/// (`app_native::UNEXPLAINED_FAILURE_LIFETIME_ATTEMPTS`) is safe only because such
-/// failures forgive their launch; `MAX_BOOT_ATTEMPTS` is 3.
-///
-/// Settled before the disk facts, which carry the sentinel's count
-/// ([`publish_warranted_handoff_failure`]). A death reported with no pid is settled
-/// by the name the successor stamped (`handoff_rendezvous::stamp_this_launch`).
-///
-/// `held` names a successor that DID dial (its kernel-attested pid) and left while
-/// the code gate held it for a check `trustd` did not answer
-/// ([`LaunchedDialEnd::ExitedWhileHeld`]): filed the same way, by its own
-/// evidence, since no refusal of ours ended it, but in words that say it dialled.
+/// The rollback of a successor that died before its dial (`NeverTransferred`: nothing was
+/// accepted, so no descriptor left), filed `ChildDied` with the wait's evidence, and the
+/// counted trial launch settled by it ([`forgives_the_counted_trial_launch`]) before the
+/// disk facts that carry the sentinel's count. The unexplained lane's budget
+/// (`app_native::UNEXPLAINED_FAILURE_LIFETIME_ATTEMPTS`) is safe only because such failures
+/// forgive their launch. A death with no pid is settled by the name the successor stamped
+/// (`handoff_rendezvous::stamp_this_launch`). `held` names a successor that dialled and
+/// left while the code gate held it for a `trustd` check, filed the same way.
 #[cfg(target_os = "macos")]
 fn send_pre_dial_death(
     job: &HandoffWorkerJob,
@@ -12538,22 +10932,10 @@ fn pre_dial_death_seen(death: PreDialDeath) -> String {
     }
 }
 
-/// The outcome a code-gate refusal of the launched successor is filed under
-/// ([`code_refused_completion`]).
-///
-/// * A check that did not happen ([`crate::handoff_rendezvous::CodeRefusal::TrustdSilent`],
-///   [`crate::handoff_rendezvous::CodeRefusal::Unchecked`]) is this process's
-///   moment: `ProducerFailed`, transient. A `trustd` that did not answer used to end
-///   as the successor's own passing refusal (its boot swap's verification ran out of
-///   time, it exited 75), and a lookup that failed because a sibling launch swapped
-///   the same build in under the successor (round eight, #75) is the moment that
-///   successor would have reported as its 75.
-/// * A verdict ([`crate::handoff_rendezvous::CodeRefusal::Refused`]): the launched
-///   process ran code the candidate's requirement does not admit, so it was not
-///   running the candidate, whose bytes met that requirement — the Developer ID
-///   by the candidate's check, the identifier by [`launched_dialer_code`]'s read —
-///   before the launch. `Rejected`, as the corroboration files a dialer that is
-///   not the launched successor: transient, and no verdict on the candidate.
+/// The outcome a code-gate refusal is filed under ([`code_refused_completion`]): a check
+/// that did not happen (`TrustdSilent`, `Unchecked`) is this process's moment,
+/// `ProducerFailed`; a verdict (`Refused`) means the launched process was not running the
+/// candidate, so `Rejected`. Both transient, neither a verdict on the candidate.
 #[cfg(target_os = "macos")]
 fn code_refusal_outcome(
     refusal: &crate::handoff_rendezvous::CodeRefusal,
@@ -12565,11 +10947,9 @@ fn code_refusal_outcome(
     }
 }
 
-/// The completion of an attempt whose launched successor the code gate turned
-/// away and which then exited by its own rule ([`LaunchedDialEnd::CodeRefused`]):
-/// the refusal's own outcome ([`code_refusal_outcome`]) and its own words, with
-/// what the dial wait saw of the exit after them. Never `ChildDied`: the exit is
-/// the refusal's consequence, not a death to explain.
+/// The completion of an attempt whose launched successor the code gate turned away and
+/// which then exited by its own rule: the refusal's own outcome ([`code_refusal_outcome`])
+/// and words. Never `ChildDied`: the exit is the refusal's consequence.
 #[cfg(target_os = "macos")]
 #[cfg_attr(
     test,
@@ -12601,14 +10981,10 @@ fn code_refused_completion(
     )
 }
 
-/// The rollback of a launched successor the code gate turned away
-/// ([`LaunchedDialEnd::CodeRefused`]), filed by [`code_refused_completion`].
-///
-/// Rolled back like the dial deadline (`NeverTransferred`: nothing was accepted,
-/// no descriptor left). The successor gave its counted trial launch back as it
-/// left (`forgive_own_trial_launch`, the failed-claim exit); the refusal is no
-/// evidence against the candidate's bytes, so the same launch is given back here
-/// by the dialer's name too, for a successor that could not.
+/// The rollback of a launched successor the code gate turned away, filed by
+/// [`code_refused_completion`]. The successor gives its counted trial launch back as it
+/// leaves; it is given back here too, by the dialer's name, for one that could not, since
+/// the refusal is no evidence against the candidate's bytes.
 #[cfg(target_os = "macos")]
 fn send_code_refused_dial(
     job: &HandoffWorkerJob,
@@ -12643,28 +11019,18 @@ fn send_code_refused_dial(
     }
 }
 
-/// LaunchServices' pending answer to the launch of the dialer already accepted on
-/// the kernel-attested rendezvous. Polled once right after the accept, then with a
-/// zero budget on every slice of the hold and of [`wait_handoff_ready`], so it never
-/// holds the parked terminal; a contradiction still refuses before Commit. After the
-/// grant the descriptors are the peer's, so a refusal there is a kill-and-reap,
+/// LaunchServices' pending answer to the launch of the dialer already accepted, polled with
+/// a zero budget beside the hold and [`wait_handoff_ready`] so a contradiction refuses
+/// before Commit: a pid other than the dialer's, or "terminated before it checked in"
+/// ([`crate::app_launch_successor::launch_answer_proves_exit`]) while the dialer lives.
+/// After the grant the descriptors are the peer's, so a refusal there is a kill-and-reap,
 /// never `NeverTransferred`.
-///
-/// Two answers contradict the dialer: a pid other than the dialer's (a stranger
-/// that knew the claim secret), and "the application terminated before it checked
-/// in" while the dialer lives (round eight of the update audit, U36). That answer
-/// is LaunchServices' positive word that the process it launched is DEAD
-/// ([`crate::app_launch_successor::launch_answer_proves_exit`]), so a live dialer
-/// cannot be it; until 2026-10-02 it was read, like any error, as corroborating the
-/// attested dialer, and a stranger that killed the real successor was granted
-/// every master on the strength of the successor's death.
 #[cfg(target_os = "macos")]
 struct LaunchCorroboration<'a> {
     in_flight: &'a crate::app_launch_successor::LaunchInFlight,
     dialer_pid: i32,
-    /// The dialer as the kernel attested it at the accept (pid and birth stamp):
-    /// asked whether it still lives when LaunchServices says the process it
-    /// launched has exited.
+    /// The dialer as the kernel attested it at the accept (pid and birth stamp), asked
+    /// whether it still lives when LaunchServices says its process exited.
     dialer: HandoffCandidate,
     /// Set once LaunchServices has answered (a match, or an error about a job that
     /// evidently ran), so the answer is never polled for twice.
@@ -12689,19 +11055,11 @@ impl<'a> LaunchCorroboration<'a> {
 
 #[cfg(target_os = "macos")]
 impl LaunchCorroboration<'_> {
-    /// One zero-budget poll. `Err` means the handoff must be refused, and says why:
-    /// the launch answer names a pid other than the dialer's, or says the launched
-    /// process exited while the dialer lives. The only reader that takes
-    /// LaunchServices' answer
-    /// ([`crate::app_launch_successor::LaunchInFlight::wait`]);
-    /// [`await_launched_dial`] only peeks.
-    ///
-    /// A dialer that is gone when LaunchServices reports the exit WAS the launched
-    /// process (or is gone either way): that is no contradiction, and the death
-    /// checks beside this poll name it (`ChildDied`). "Lives" is the kernel's
-    /// birth stamp for the pid still matching the one taken at the accept, which a
-    /// zombie does not answer (libproc does not report one), so a successor that
-    /// died and is not yet reaped reads as gone.
+    /// One zero-budget poll, the only reader that takes LaunchServices' answer
+    /// ([`await_launched_dial`] only peeks). `Err` refuses the handoff: the answer names
+    /// another pid, or says the launched process exited while the dialer lives. A dialer
+    /// gone by then is no contradiction (the death checks name it); a zombie has no birth
+    /// stamp, so a dead, unreaped successor reads as gone.
     #[cfg_attr(
         test,
         aterm_spec::refines(
@@ -12776,6 +11134,11 @@ impl LaunchCorroboration<'_> {
     }
 }
 
+/// Blocks until the overlap-handoff child proves readiness, closes its proof pipe, or
+/// `deadline` passes. Never calls `Child::try_wait`, which would reap an exited group
+/// leader and lose the pid before the reaper signals its descendants. Pre-ready death is
+/// proof EOF or `candidate_gone` (a stray write-end copy can hold EOF back). A master's
+/// HUP/ERR/NVAL or a cancel poke is `ActivityRevoked`; queued output on a master is ignored.
 #[cfg(unix)]
 fn wait_handoff_ready(
     rd: &std::os::fd::OwnedFd,
@@ -12795,10 +11158,8 @@ fn wait_handoff_ready(
         events: libc::POLLIN,
         revents: 0,
     });
-    // Masters are watched for death only. POLLIN must be requested (macOS evaluates
-    // a PTY's state only for requested events and reports a dead slave as
-    // POLLIN|POLLHUP), but plain POLLIN in the answer is ignored: queued output
-    // waits in the kernel for the child.
+    // Masters are watched for death only: POLLIN must be requested (macOS evaluates a PTY
+    // only for requested events), but plain POLLIN in the answer is ignored.
     pollfds.extend(masters.iter().copied().map(|fd| libc::pollfd {
         fd,
         events: libc::POLLIN,
@@ -12817,10 +11178,8 @@ fn wait_handoff_ready(
         {
             return crate::UpdateHandoffOutcome::Rejected;
         }
-        // The candidate's own end, asked every slice rather than inferred from EOF:
-        // a stray write-end copy can hold EOF back
-        // ([`HandoffCandidateHandle::candidate_gone`]). Asked after the
-        // corroboration, so a dialer LaunchServices disowns is still `Rejected`.
+        // The candidate's own end, asked every slice since a stray write-end copy can hold
+        // EOF back; after the corroboration, so a disowned dialer is still `Rejected`.
         if candidate_gone() {
             return crate::UpdateHandoffOutcome::ChildDied;
         }
@@ -12837,10 +11196,8 @@ fn wait_handoff_ready(
             // (`handoff_rejection_activity_shaped`).
             ReadyPollAction::SessionDied => return crate::UpdateHandoffOutcome::ActivityRevoked,
             ReadyPollAction::NoProgress => {
-                // A booting child's shell can queue output on a handed master, which
-                // answers plain POLLIN and makes `poll` return immediately without
-                // matching the dead mask or the proof fd. Without this 2 ms yield the
-                // loop would busy-spin and starve the child it waits on.
+                // A handed master with queued output answers plain POLLIN at once; without
+                // this yield the loop would busy-spin and starve the child it waits on.
                 std::thread::sleep(std::time::Duration::from_millis(2));
                 continue;
             }
@@ -12878,10 +11235,8 @@ fn wait_handoff_ready(
     }
 }
 
-/// The late park's stand-down against real processes and the real rendezvous: close
-/// the rendezvous (EOF), give the grace, kill if needed, prove it gone either way,
-/// and report how it died, which decides whether the counted trial launch is given
-/// back.
+/// The late park's stand-down against real processes and the real rendezvous, and how the
+/// death it reports settles the counted trial launch.
 #[cfg(all(test, target_os = "macos"))]
 #[path = "app_update_handoff_held_successor_stand_down_tests.rs"]
 mod held_successor_stand_down_tests;
@@ -12891,9 +11246,8 @@ mod held_successor_stand_down_tests;
 #[path = "app_update_handoff_late_park_record_tests.rs"]
 mod late_park_record_tests;
 
-/// The worker's own publication of a pass for `attempt`
-/// ([`PreverifyPublisher::for_attempt`]), so a test seeds the cache as the shipping
-/// lane does. Returns the policy published, narrowed to this build.
+/// The worker's own publication of a pass for `attempt` ([`PreverifyPublisher::for_attempt`]),
+/// so a test seeds the cache as the shipping lane does.
 #[cfg(all(test, unix))]
 impl App {
     pub(crate) fn publish_preverified_pass_for_test(
@@ -12907,25 +11261,21 @@ impl App {
     }
 }
 
-/// The worker's own pre-verification reaches the park: an attempt past the
-/// arm-time verdict's freshness re-verifies on the worker, and its pass and
-/// handoff policy are published under the attempt's artifact key, where the
-/// launched lane's park reads them.
+/// The worker's own pre-verification reaches the park: its pass and handoff policy are
+/// published under the attempt's artifact key, where the launched lane's park reads them.
 #[cfg(all(test, unix))]
 #[path = "app_update_handoff_preverify_publisher_tests.rs"]
 mod preverify_publisher_tests;
 
-/// The park gate, enumerated: freezing the terminal is decided separately from
-/// starting the update, by the ladder's rule for the live phase plus the one fact
-/// (unconsumed master bytes) it relaxes only at its bound.
+/// The park gate, enumerated: the ladder's rule for the live phase, plus unconsumed master
+/// bytes, relaxed only at its bound.
 #[cfg(all(test, unix))]
 #[path = "app_update_handoff_park_gate_tests.rs"]
 mod park_gate_tests;
 
-/// Driven through the shipping capture and gate with real PTY masters: a parser
-/// caught mid-sequence over queued output is a timing miss, never a carry whose
-/// successor prints the tail as text; and an exited `--hold` pane is not handed,
-/// so its hung-up master can neither hold the park nor fail it.
+/// With real PTY masters: a parser caught mid-sequence over queued output is a timing miss,
+/// never a carry, and an exited `--hold` pane is not handed, so its hung-up master can
+/// neither hold the park nor fail it.
 #[cfg(all(test, unix))]
 #[path = "app_update_handoff_handed_set_and_mid_sequence_tests.rs"]
 mod handed_set_and_mid_sequence_tests;
@@ -12969,9 +11319,8 @@ mod park_transfer_split_tests {
 #[path = "app_update_handoff_freeze_budget_tests.rs"]
 mod freeze_budget_tests;
 
-/// The dry run of the park's capture, over the shipping capture and handed set:
-/// what it measures, what it saturates on, what it cannot measure, and that it
-/// parks nothing.
+/// The dry run of the park's capture: what it measures, what it saturates on, what it
+/// cannot measure, and that it parks nothing.
 #[cfg(all(test, unix))]
 #[path = "app_update_handoff_dry_run_capture_tests.rs"]
 mod dry_run_capture_tests;
@@ -12984,11 +11333,9 @@ mod capture_budget_reservation_tests {
         max_handoff_aggregate_grid_cells, max_handoff_history_lines,
     };
 
-    /// Walks a pool of `sessions` identical panes through the producer's
-    /// reserve-then-history rule, charging the real admission seam and budgets
-    /// `start_unix_update_handoff` charges. The per-session degrade rung is not
-    /// replicated, so `Ok` is the stronger claim. `Err(index)` is the session the
-    /// capture would refuse.
+    /// Walks a pool of identical panes through the producer's reserve-then-history rule
+    /// with the real admission seam and budgets. `Err(index)` is the session the capture
+    /// would refuse.
     fn walk_pool(rows: u16, cols: u16, sessions: u64) -> Result<u64, u64> {
         let carry = max_handoff_history_lines();
         let mandatory_cells = mandatory_checkpoint_cells(rows, cols);
@@ -13036,14 +11383,12 @@ mod capture_budget_reservation_tests {
         Ok(carried)
     }
 
-    /// Twelve, twenty-four and sixty-four panes, at a typical and at a maximized
-    /// geometry, must all be admitted in full: reserving every visible screen first
-    /// means early scrollback cannot starve a later mandatory screen. Carrying less
-    /// scrollback is allowed; refusing the update is not.
+    /// 12, 24 and 64 panes, at a typical and a maximized geometry, are all admitted: less
+    /// scrollback is allowed, refusing the update is not.
     #[test]
     fn a_heavy_pool_is_admitted_even_when_it_must_drop_history() {
-        // 49x110 is the window from the field report. 60x200 is a maximized window
-        // on a large display, where one session costs more than twice as much.
+        // 49x110 is a typical window; 60x200 a maximized window on a large display,
+        // where one session costs more than twice as much.
         for (rows, cols) in [(49_u16, 110_u16), (60, 200)] {
             for sessions in [12_u64, 24, 64] {
                 let carried = walk_pool(rows, cols, sessions).unwrap_or_else(|index| {
@@ -13061,11 +11406,8 @@ mod capture_budget_reservation_tests {
         }
     }
 
-    /// The exact boundary the reservation establishes: a session is refused if and
-    /// only if the pool's mandatory visible+alt total does not fit. The count is
-    /// derived from the constant. `Err(fits)` pins that the refusal lands on the
-    /// first session that genuinely does not fit, not an early one whose budget was
-    /// spent on scrollback.
+    /// A session is refused only when the pool's mandatory total does not fit, and then the
+    /// first session past it, never an earlier one whose budget went to scrollback.
     #[test]
     fn a_pool_is_refused_only_when_its_mandatory_total_does_not_fit() {
         let (rows, cols) = (60_u16, 200_u16);
@@ -13084,15 +11426,9 @@ mod capture_budget_reservation_tests {
         );
     }
 
-    /// The per-grid cell cap admits every window the GUI can produce (a 5K display
-    /// in full screen at the default font is 33,462 cells).
-    ///
-    /// Geometry comes from the GUI's own law ([`crate::App::grid_dims_for`]) on a
-    /// headless App with real chrome (pad 24, pad_top 4, head 80 at scale 2), for
-    /// four real Mac displays, full screen and maximized (37 pt notched menu bar,
-    /// 70 pt Dock at 2x), at every font size from `FONT_PX_MIN` to 48 px. A pool is
-    /// that window split into 1..=8 side-by-side panes, admitted as the capture
-    /// admits a visible carry (`history = 0`, alt grid reserved).
+    /// The per-grid cell cap admits every window the GUI can produce: four Mac displays,
+    /// full screen and maximized, at every font size from `FONT_PX_MIN` to 48 px
+    /// ([`crate::App::grid_dims_for`]), split into 1..=8 panes.
     #[test]
     fn every_full_screen_display_geometry_is_admitted_for_a_pool_of_panes() {
         use winit::dpi::PhysicalSize;
@@ -13160,11 +11496,8 @@ mod commit_layout_topology_tests;
 mod pinnedness_tests {
     use super::candidate_is_our_child;
 
-    /// The precondition for a group kill: `kill(-pid)` is sound only while the pid is
-    /// pinned to our candidate. A fork child pins it; a launchd-owned successor does
-    /// not, so the reaper asks the kernel. Pins both answers: a live child of ours is
-    /// pinned, and a process that is not our child (this process, standing in for a
-    /// launchd-owned successor) is not.
+    /// `kill(-pid)` is sound only while the pid is pinned: a live child of ours is, a
+    /// process that is not our child is not.
     #[test]
     fn only_a_child_of_ours_pins_its_pid() {
         let mut child = aterm_uds::spawnfd::command("/bin/sleep")
@@ -13211,10 +11544,8 @@ mod trial_launch_forgiveness_tests {
         forgives_the_counted_trial_launch(death, CURRENT, TARGET)
     }
 
-    /// A `ChildDied` whose launch stays counted spends the counter the boot sentinel
-    /// reverts on; retried more than `MAX_BOOT_ATTEMPTS` times it would revert a
-    /// healthy bundle and mark the build failed. So forgiveness follows the shape,
-    /// and only the shape that converges under `MAX_BOOT_ATTEMPTS` keeps its count.
+    /// A death whose launch stays counted spends the boot sentinel's counter, so only the
+    /// shape that converges under `MAX_BOOT_ATTEMPTS` keeps its count.
     #[test]
     fn only_a_death_the_bytes_answer_for_keeps_its_counted_trial_launch() {
         for (death, keeps_its_count, why) in [
@@ -13279,9 +11610,8 @@ mod trial_launch_forgiveness_tests {
         }
     }
 
-    /// The invariant that makes the table above safe, checked against the real
-    /// constant; mirrors the compile-time assert beside
-    /// `STRUCTURAL_FAILURE_LIFETIME_ATTEMPTS`.
+    /// The invariant that makes the table above safe, against the real constants (mirrors
+    /// the compile-time assert beside `STRUCTURAL_FAILURE_LIFETIME_ATTEMPTS`).
     #[cfg(target_os = "macos")]
     #[test]
     fn the_one_shape_that_keeps_its_count_converges_before_the_sentinel_reverts() {
@@ -13322,26 +11652,16 @@ mod handoff_process_group_tests;
 #[path = "app_update_handoff_returned_handoff_completion_lane_tests.rs"]
 mod returned_handoff_completion_lane_tests;
 
-/// The lane choice and every reason it falls back: whether the next update's
-/// successor gets its own launchd application job or is another pid-1 orphan.
-/// Each row flips one field of [`HandoffLaneFacts`] against an otherwise eligible
-/// attempt, so a predicate ignoring a field fails.
+/// The lane choice and every reason it falls back, each row flipping one field of
+/// [`HandoffLaneFacts`] against an otherwise eligible attempt.
 #[cfg(all(test, target_os = "macos"))]
 #[path = "app_update_handoff_handoff_lane_tests.rs"]
 mod handoff_lane_tests;
 
-/// Tier-1 conformance for the seamless handoff's per-session ownership model
-/// ([`aterm_spec::derive::native_update_seamless_handoff_ownership_model`]): the
-/// real decision functions of this module are driven over their whole bounded
-/// input space and must decide exactly what the model admits.
-///
-/// A child module so it sees the parent's private items without widening them.
-///
-/// Bound: the final Commit admission, which decides whether an attempt may transfer
-/// ownership. Modelled but not bound: the physical surface it gates (the transfer
-/// and `_exit` in `seamless::commit_and_exit`, reader park/resume, the
-/// `F_DUPFD_CLOEXEC` duplication), which replaces this process or needs a live event
-/// loop; the QA-seam tests cover it.
+/// Tier-1 conformance for the seamless handoff's ownership model
+/// ([`aterm_spec::derive::native_update_seamless_handoff_ownership_model`]): the final
+/// Commit admission, over its whole bounded input space, decides exactly what the model
+/// admits.
 #[cfg(all(test, unix))]
 #[path = "app_update_handoff_ownership_conformance_tests.rs"]
 mod ownership_conformance;
@@ -13364,12 +11684,9 @@ mod presence_row_carry_tests {
     use crate::{App, WindowId};
     use winit::dpi::PhysicalSize;
 
-    /// Windows 0 and 1 each show a presence row (an agent's status line under the
-    /// chrome) that takes a grid row inside the window. The update carries window 0's
-    /// frame in the window carry and window 1's in its layout row. The successor's
-    /// rows are frozen until Commit and it takes each carried frame before the first
-    /// attach, so every window comes up at its parent's size and grid, and the
-    /// Commit's lift re-grids no window. The durable layout carries no row.
+    /// Each window's presence row crosses the handoff: window 0's frame in the window carry,
+    /// window 1's in its layout row, so each comes up at its parent's size and grid and the
+    /// Commit's lift re-grids nothing. The durable layout carries no row.
     #[test]
     fn every_window_with_a_presence_row_crosses_at_its_parents_size_and_grid() {
         let (w0, w1) = (WindowId(0), WindowId(1));
@@ -13432,9 +11749,8 @@ mod presence_row_carry_tests {
         )
         .expect("the successor parses it");
 
-        // The successor: window 0 at the carry's grid (`main_entry`), window 1 from
-        // its row (`create_window_internal_connected`); each takes its frame, then its
-        // first attach sizes it (`attach_os_window`).
+        // The successor: window 0 from the carry, window 1 from its layout row; each takes
+        // its frame before its first attach sizes it.
         let mut successor = App::headless_for_test();
         // Its rows frozen until Commit, as `main_entry` starts an adopter.
         successor.incoming_handoff_pending = true;
@@ -13479,8 +11795,8 @@ mod presence_row_carry_tests {
             );
         }
 
-        // COMMIT: each window's story still wants its row (a settling turn's
-        // lease, sensed under the freeze), and the real lift commits it.
+        // Commit: each window's story still wants its row (a settling turn's lease,
+        // sensed under the freeze), and the real lift commits it.
         for session in [0, 1] {
             *successor
                 .pool
@@ -13512,9 +11828,8 @@ mod presence_row_carry_tests {
     }
 }
 
-/// Round eight, finding 52: the held capture applies the manifest writer's own
-/// bounds, so screens the writer would drop (past the link-strip bound) spend
-/// none of the held budget, and a later pane that fits is carried.
+/// The held capture applies the manifest writer's own bounds, so a screen the writer would
+/// drop spends none of the held budget and a later pane that fits is carried.
 #[cfg(all(test, unix))]
 mod held_capture_bound_tests {
     use std::sync::Arc;
@@ -13540,8 +11855,8 @@ mod held_capture_bound_tests {
 
     #[test]
     fn a_held_screen_the_writer_refuses_spends_none_of_the_held_budget() {
-        // PRECONDITION: on the old capture the three dense screens fit the held
-        // budget and crowded the fourth out of it.
+        // PRECONDITION: the three dense screens fit the held budget at their checkpoint
+        // size, and with the fourth they would not.
         let grid = |rows| {
             u64::try_from(
                 linked(rows)
@@ -13593,15 +11908,15 @@ mod held_capture_bound_tests {
     }
 }
 
-/// What a control verb does to a parked session before the Commit: a paste in
-/// flight is never cut by the `_exit`, and a reset is never undone by the
-/// successor's restore.
+/// A paste in flight on a parked session is never cut by the `_exit`, and a reset is
+/// never undone by the successor's restore.
 #[cfg(all(test, unix))]
 #[path = "app_update_handoff_parked_commit_tests.rs"]
 mod parked_commit_tests;
 
-/// Round five, item 16: a `video` take running when an update parks is
-/// answered at the park, never dropped with the connection at Commit.
+/// A park and Commit around a live `video` take, the upgrade rim and a held claim: the take
+/// is waited for before `Land`, kept by a park, and answered by the Commit before its
+/// `_exit`, never dropped with its connection.
 #[cfg(all(test, unix))]
 #[path = "app_update_handoff_video_park_tests.rs"]
 mod video_park_tests;
@@ -13611,10 +11926,8 @@ mod video_park_tests;
 #[path = "app_update_handoff_launched_lane_grant_tests.rs"]
 mod launched_lane_grant_tests;
 
-/// A successor may resize a carried PTY before Commit, and a rejected Commit hands
-/// the program back to this process, whose engine is still at the park's size.
-/// `resize_panes` skips panes whose engine already matches, so the size must be
-/// re-asserted.
+/// A rejected Commit puts each parked PTY back at its engine's size, which the successor
+/// may have changed before Commit.
 #[cfg(all(test, unix))]
 mod rollback_winsize_tests {
     use crate::{App, term_lock};
@@ -13657,23 +11970,16 @@ mod rollback_winsize_tests {
     }
 }
 
-/// The fork lane never captures above a policy it has not waited for: with no
-/// verified pass on record, an attempt — automatic or a person's (round eight,
-/// U35) — defers as activity while the policy read is in flight (including an
-/// arm-time `codesign` past its budget), up to the read's ceiling, and the next
-/// attempt parks under what the read answered, or as before if nothing is on
-/// record. Negative controls: a known policy, a read that ended with nothing, no
-/// read, and a spent ceiling do not defer.
+/// The fork lane never captures above a policy it has not waited for, up to the read's
+/// ceiling. Negative controls: a known policy, a read that ended with nothing, no read, and
+/// a spent ceiling do not wait.
 #[cfg(all(test, unix))]
 #[path = "app_update_handoff_fork_lane_policy_wait_tests.rs"]
 mod fork_lane_policy_wait_tests;
 
-/// A manifest the desk's content puts over its cap is a refusal, not this
-/// process's moment: `write_outgoing_with_held` refuses typed (`ManifestOverCap`)
-/// once every optional part is shed, and the next attempt would capture the same
-/// desk. It goes to the refusal lane, as a capture refusal does. Negative control:
-/// a filesystem refusal, a missing private directory and this build's own
-/// inconsistency stay this process's trouble.
+/// A manifest the desk's content puts over its cap (`ManifestOverCap`) goes to the refusal
+/// lane, as a capture refusal does; a filesystem refusal, a missing private directory and
+/// this build's own inconsistency stay this process's trouble.
 #[cfg(all(test, unix))]
 mod manifest_over_cap_tests {
     use super::{PreparationFailure, preparation_failure_of_write};
@@ -13731,26 +12037,15 @@ mod fabric_carry_successor_tests {
     }
 }
 
-/// The cold lane over a windowed desk with open native tabs leaves the quit layout
-/// its successor's boot reopens, native leaf included, or refuses when session
-/// restore is off and nothing would reopen them.
+/// The cold lane leaves the quit layout its successor's boot reopens, native tabs
+/// included, or refuses when session restore is off.
 #[cfg(all(test, unix))]
 #[path = "app_update_handoff_cold_lane_layout_tests.rs"]
 mod cold_lane_layout_tests;
 
-/// Round eight, #1: a refused cold update was an endless relaunch loop. The cold
-/// lane exec'd before reading any pre-park verdict, its successor is this very
-/// build, and when that successor's boot swap refused (an install location a
-/// standard user cannot write, a bundle that cannot be the rollback source) it came
-/// up on the same terminal-less desk, re-armed and exec'd again — every few seconds.
-///
-/// Two halves, one per side of the `exec`: the lane reads the verdict first
-/// ([`crate::App::cold_lane_verdict_gate`]), and a relaunch whose swap was refused
-/// hands its automatic lane that refusal as the verdict ([`super::ColdRelaunch`]).
-///
-/// RED before the fix: the gate did not exist and the cold arm reached `exec`
-/// with a cached refusal on record; a refused relaunch left an empty cache, so the
-/// first attempt of the new process relaunched again.
+/// A refused cold update does not loop: the cold lane reads the verdict before its `exec`
+/// ([`crate::App::cold_lane_verdict_gate`]), and a relaunch whose boot swap refused hands
+/// its automatic lane that refusal as the verdict ([`super::ColdRelaunch`]).
 #[cfg(all(test, unix))]
 #[path = "app_update_handoff_cold_lane_verdict_tests.rs"]
 mod cold_lane_verdict_tests;
@@ -13785,10 +12080,9 @@ mod fork_lane_child_tests {
             .map(|fd| format!("[ -e /dev/fd/{fd} ] && printf 'held:{fd} '; "))
             .collect::<String>();
         let Some(handed) = hook else {
-            // The control is `transparent`, not a std `Command`: under Trust's
-            // SP-1 std hands a `Command` child fds 0-2 alone, so a plain std
-            // spawn no longer carries the stray. Its child writes on this
-            // process's stdout, so the probe reports into the file `$1` names.
+            // The control is `transparent`: under Trust's SP-1 std a `Command` child gets
+            // fds 0-2 alone. Its child writes on this process's stdout, so the probe reports
+            // into the file `$1` names.
             let dir = aterm_tempfile::tempdir().expect("a temp dir");
             let report = dir.path().join("holds");
             let status = aterm_uds::spawnfd::transparent("/bin/sh")
@@ -13819,11 +12113,9 @@ mod fork_lane_child_tests {
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
-    /// **THE FORK-LANE SUCCESSOR HOLDS WHAT IT IS HANDED AND NOTHING ELSE**
-    /// (2026-09-30 review, F1). A descriptor this process holds without
-    /// close-on-exec rides a spawn that hands on the whole table (the control)
-    /// and not the lane's hook, while a handed one — close-on-exec here, as the
-    /// masters and the proof pipe are — reaches the successor.
+    /// The fork-lane successor holds what it is handed and nothing else: a stray descriptor
+    /// rides a spawn that hands on the whole table (the control) but not the lane's hook,
+    /// while a handed one, close-on-exec here, reaches the successor.
     #[test]
     fn the_fork_lane_successor_holds_what_it_is_handed_and_nothing_else() {
         let stray = stand_in(false);
@@ -13842,14 +12134,11 @@ mod fork_lane_child_tests {
         drop((stray, handed));
     }
 
-    /// **THE COLD LANE'S `exec` HANDS OVER NOTHING THIS PROCESS HOLDS** (2026-09-30
-    /// review, F1). In a helper re-exec of this binary, a descriptor without
-    /// close-on-exec is held when the helper replaces itself with a probe:
-    /// through a plain `exec` (the control) the probe holds it, through
-    /// [`super::cold_exec_hand_over`] it does not. The helper's exit IS the
-    /// probe's, so it is judged by that status — once libtest is seen to have
-    /// selected exactly this test ([`crate::test_alone::Running::selected`]),
-    /// never by a status a name that selects nothing also exits with.
+    /// The cold lane's `exec` hands over nothing this process holds: a helper re-exec of
+    /// this binary holding a stray descriptor replaces itself with a probe, which holds it
+    /// through a plain `exec` (the control) and not through [`super::cold_exec_hand_over`].
+    /// The helper's exit is the probe's, read only once libtest is seen to have selected
+    /// exactly this test ([`crate::test_alone::Running::selected`]).
     #[test]
     fn the_cold_lane_exec_hands_over_nothing_this_process_holds() {
         const STAGE: &str = "ATERM_TEST_COLD_EXEC_HAND_OVER";
@@ -13885,15 +12174,8 @@ mod fork_lane_child_tests {
     }
 }
 
-/// THE CONNECTIONS A MANIFEST LEFT OUT ARE AUDITED AS DROPPED AT THE COMMIT, AND
-/// ONLY THERE (round eight of the update audit, U23's review). The writer left
-/// them out to fit its cap and audited each as a `session_edge` drop as it
-/// wrote, before the attempt's outcome was known: an attempt that stood down
-/// (a proof mismatch, activity, a successor that died, a rollback) left this
-/// process holding every one of them, with their dissolution on record, and
-/// each retry wrote the same burst again. Now the writer returns them, the
-/// worker hands them to the attempt's arbiter, and the Commit audits each once,
-/// right before its write.
+/// The connections a manifest left out are audited as dropped by the Commit alone, right
+/// before its write, so an attempt that stands down puts no dissolution on record.
 #[cfg(all(test, unix))]
 mod connection_drop_audit_tests {
     use crate::session_store::ConnectionCarry;
@@ -13935,9 +12217,8 @@ mod connection_drop_audit_tests {
         assert!(audited[1].message.ends_with("op=signal"), "{audited:?}");
     }
 
-    /// Wired where it holds: the worker records what the writer returned, and
-    /// the Commit audits it on both of its arms — inside the operator's permit,
-    /// right before the one write — past the claim that makes it the Commit.
+    /// Wired where it holds: the worker records what the writer returned, and both of the
+    /// Commit's arms audit it right before the one write, past the claim.
     #[test]
     fn the_drops_are_audited_by_the_commit_alone() {
         let src = include_str!("app_update_handoff.rs");

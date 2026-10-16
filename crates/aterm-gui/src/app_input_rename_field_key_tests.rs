@@ -30,7 +30,7 @@ fn pin(app: &App, session: u64) -> Option<String> {
         .clone()
 }
 
-/// TYPING lands in the field, not the shell; ⏎ commits it as the pin.
+/// Typing lands in the field, not the shell; ⏎ commits it as the pin.
 #[test]
 fn typing_edits_the_field_and_return_commits_the_pin() {
     let (mut app, wid) = app_editing();
@@ -42,8 +42,7 @@ fn typing_edits_the_field_and_return_commits_the_pin() {
     assert_eq!(app.rename_edit_session(wid), None, "the editor closed");
 }
 
-/// ⎋ CANCELS and its `"\u{1b}"` text payload never becomes content — the same
-/// trap the find bar's classifier has to dodge.
+/// ⎋ cancels, and its `"\u{1b}"` text payload never becomes content.
 #[test]
 fn escape_cancels_and_types_nothing() {
     let (mut app, wid) = app_editing();
@@ -57,7 +56,7 @@ fn escape_cancels_and_types_nothing() {
     assert_eq!(field(&app, wid), Some((String::new(), 0)));
 }
 
-/// ⇥ COMMITS, like every other way of leaving a field, and leaves no tab
+/// ⇥ commits, like every other way of leaving a field, and leaves no tab
 /// character behind.
 #[test]
 fn tab_commits_rather_than_typing_a_tab() {
@@ -125,12 +124,10 @@ fn an_unowned_key_settles_the_edit_and_does_not_swallow_itself() {
     );
 }
 
-/// The bound paste chord stays in the field: `ctrl+v` (the seeded
-/// Windows/Linux chord) is claimed by this gate rather than settling the
-/// edit, which would let `on_key`'s keybinding block resolve it to
-/// `Action::Paste` and write the clipboard to the PTY. The clipboard's
-/// content is not asserted (this reads the real pasteboard); the key is
-/// claimed and the edit stays open.
+/// The bound paste chord stays in the field: this gate claims `ctrl+v` (the
+/// seeded Windows/Linux chord) rather than settling the edit, which would let
+/// `on_key`'s keybinding block write the clipboard to the PTY. The clipboard's
+/// content is not asserted (this reads the real pasteboard).
 #[test]
 fn a_bound_paste_chord_pastes_into_the_field_instead_of_the_pty() {
     let (mut app, wid) = app_editing();
@@ -161,9 +158,8 @@ fn a_bound_paste_chord_pastes_into_the_field_instead_of_the_pty() {
     assert!(pin(&app, 0).is_some(), "keeping what was typed");
 }
 
-/// A `[key_sequences]` RAW-BYTE CHORD is an unowned key like any other: driven
-/// through the whole `on_key`, it commits the pin first and only then sends its
-/// bytes, so none reach the PTY while the field still has focus.
+/// A `[key_sequences]` raw-byte chord is an unowned key like any other: through
+/// the whole `on_key`, it commits the pin first and only then sends its bytes.
 #[test]
 fn a_key_sequence_chord_settles_the_edit_before_its_bytes_are_sent() {
     let (mut app, wid) = app_editing();
@@ -198,9 +194,8 @@ fn a_key_sequence_chord_settles_the_edit_before_its_bytes_are_sent() {
     );
 }
 
-/// A HELD key repeats against the SESSION captured at press time, and a repeat
-/// that outlives its editor is dropped rather than replayed into whatever
-/// field exists later.
+/// A held key repeats against the session captured at press time, and a repeat
+/// that outlives its editor is dropped rather than replayed into a later field.
 #[test]
 fn a_held_key_repeats_against_the_renamed_session_only() {
     let (mut app, wid) = app_editing();
@@ -237,10 +232,9 @@ fn an_ime_commit_lands_in_the_field_not_the_shell() {
     assert_eq!(field(&app, wid), Some(("é".to_string(), 2)));
 }
 
-/// B1 WIRING: the tab CONTEXT-menu wake takes the same divert the menu bar
-/// takes. Scraped from the source because the arm needs an `ActiveEventLoop`
-/// no unit test can build — and the defect was precisely a MISSING call, which
-/// is what a source assertion can prove and a behavioural one cannot.
+/// The tab context-menu wake takes the same divert the menu bar takes. Asserted
+/// on the source: the arm needs an `ActiveEventLoop` no unit test can build,
+/// and what matters is that the call is there, before the dispatch.
 #[test]
 fn the_tab_context_menu_wake_diverts_around_a_live_rename() {
     let source = include_str!("lib.rs");
@@ -260,10 +254,10 @@ fn the_tab_context_menu_wake_diverts_around_a_live_rename() {
     );
 }
 
-/// B2 WIRING: a click on a DIFFERENT tab chip settles the edit. Same reason
-/// for a source assertion — and the settle must be on the human `SelectTab`
-/// gesture, never inside `switch_tab_in`, which every programmatic path
-/// (including the control socket's `tab <N>`) runs through.
+/// A click on a different tab chip settles the edit (a source assertion, as
+/// above). The settle sits on the human `SelectTab` gesture, never inside
+/// `switch_tab_in`, which every programmatic path (the control socket's
+/// `tab <N>` too) runs through.
 #[test]
 fn selecting_another_tab_settles_the_edit_without_touching_switch_tab_in() {
     let source = include_str!("lib.rs");

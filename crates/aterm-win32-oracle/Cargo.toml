@@ -1,0 +1,20 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "aterm-win32-oracle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Generate and check the Windows declaration closure against pinned registry windows-sys"
+
+[dependencies]
+aterm-json = { workspace = true }
+aterm-toml = { workspace = true }
+aterm-tempfile = { workspace = true }
+aterm-uds = { workspace = true }
+aterm-census = { workspace = true }
+
+[lints]
+workspace = true

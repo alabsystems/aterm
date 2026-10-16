@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+#
+# The wasm32-unknown-unknown lint: std's clock PANICS there ("time not
+# implemented on this platform"), and a panic out of a `&mut self` wasm-bindgen
+# method leaves the object's RefCell borrowed, so every later call throws far
+# from the clock. `aterm_time::Instant` / `SystemTime` are the browser clocks on
+# that target and std's natively, so these rows can only be judged on a wasm32
+# build: the browser cells lint their modules with this file
+# (`CLIPPY_CONF_DIR=crates/aterm-time/wasm32`, `--target wasm32-unknown-unknown`,
+# `-D clippy::disallowed_methods`). Code a browser never compiles (a
+# `cfg(not(...wasm32...))` arm, a test) is not seen, so it needs no exemption.
+# The host lint covers the workspace clippy.toml's rows; this file holds only
+# what is wrong on wasm32.
+disallowed-methods = [
+  { path = "std::time::Instant::now", reason = "panics on wasm32-unknown-unknown: use aterm_time::Instant::now" },
+  { path = "std::time::SystemTime::now", reason = "panics on wasm32-unknown-unknown: use aterm_time::SystemTime::now or aterm_time::since_epoch" },
+  { path = "std::time::Instant::elapsed", reason = "reads std's clock, which panics on wasm32-unknown-unknown: use aterm_time::Instant" },
+  { path = "std::time::SystemTime::elapsed", reason = "reads std's clock, which panics on wasm32-unknown-unknown (UNIX_EPOCH.elapsed() too): use aterm_time::since_epoch" },
+]

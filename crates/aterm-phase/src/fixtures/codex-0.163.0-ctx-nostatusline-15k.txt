@@ -1,0 +1,51 @@
+# codex-cli 0.163.0 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (144x50, aterm 0.105.0) running the real Codex, launched by path with a scratch `CODEX_HOME`, the lab provider `base_url=http://127.0.0.1:<port>/v1`, `wire_api = "responses"`, a fake `env_key` (a local stub of the Responses API, crates/aterm-lab) · Codex 0.163.0 with tui.status_line=[] idle after one ok turn (last_token_usage total ~15k of model_context_window 258400)
+
+  >_ OpenAI Codex (v0.163.0)
+     /private/tmp/at.lI6N/proj
+
+
+› hi
+
+
+• Hi! I am the local lab stub, not a model. (reply 115)
+
+  Worked for <1s • 11:33 AM
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+› Ask Codex to do anything
+
+  ? for shortcuts                                                                                                             99% context left

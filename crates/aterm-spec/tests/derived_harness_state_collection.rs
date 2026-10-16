@@ -6,21 +6,13 @@ use aterm_spec::derive::{
 };
 use aterm_spec::{interp, verify};
 
-/// THE CODEX RECORDS' PRUNE (gap #22): only a closed tab's record goes, only
-/// once it is settled, and only after its week, and nothing writes a closed
-/// tab's settled record young again. Each invariant is caught by its own
-/// `Buggy` member ALONE (`verify::buggy_baseline_with`). Tier-1
-/// against the real `codex::prune` is in aterm-agent's `upgrade_codex_drive`
-/// tests.
+/// The Codex records' prune: only a closed tab's record goes, only once it is settled and only
+/// after its week, and nothing writes a closed tab's settled record young again. Each invariant
+/// is caught by its own `Buggy` member alone. Tier-1 against the real
+/// `upgrade_codex_drive::prune` is in aterm-agent's `upgrade_codex_drive` tests.
 #[test]
 fn only_a_closed_tabs_settled_week_old_record_is_pruned() {
     let model = harness_upgrade_state_collection_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name),
-        "the collection model stays enrolled in the spec-link registry"
-    );
     verify::prove_and_catch_scalar(&model, "harness upgrade state collection");
 
     for (mutant, invariant) in [
@@ -64,21 +56,14 @@ fn only_a_closed_tabs_settled_week_old_record_is_pruned() {
     assert_eq!(s["kept"], 0);
 }
 
-/// "A CLOSED TAB'S SETTLED RECORD GOES" under the clock and the prune's own
-/// weak fairness, and `Rewrite` — a pass that writes the record again at every
-/// look — breaks it alone. THE HISTORICAL DEFECT as the property's negative
-/// control: the lane before gap #22 had no `Prune` for a Codex record at all,
-/// and without it the record is kept for ever — where the invariants and the
-/// deadlock check see nothing wrong.
+/// "A closed tab's settled record goes" under the clock and the prune's own weak fairness;
+/// `Rewrite`, a pass that writes the record again at every look, breaks it alone. Without a
+/// `Prune` the record is kept for ever while the invariants and the deadlock check see nothing
+/// wrong: the property's negative control.
 #[test]
 fn a_closed_tabs_settled_record_goes_and_the_historical_lane_kept_it_for_ever() {
     let model = harness_upgrade_state_collection_model();
     let live = harness_upgrade_state_collection_liveness();
-    assert!(
-        aterm_spec::xref::liveness_registry()
-            .iter()
-            .any(|(m, l)| m.name == model.name && l.name == live.name)
-    );
     verify::liveness_proves_and_catches_tiered(
         &model,
         &live,

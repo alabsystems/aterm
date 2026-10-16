@@ -16,13 +16,15 @@ proc-macro = true
 test = false
 
 [dependencies]
-syn = { version = "2", features = ["full", "extra-traits"] }
-quote = "1"
-proc-macro2 = "1"
+# docs/AUDIT-third-party-2026-10-15.md, SP.8: the token cursor, string and integer
+# literals and `compile_error!` the macros read and write with, on std `proc_macro`.
+# No syn, proc-macro2 or quote: `ty_model!` takes five expression shapes, and the
+# anchors pass their item through, rebuilding only a probed fn's body.
+aterm-macro-support = { workspace = true }
 
 [dev-dependencies]
 # Test-only: the `#[refines]`/`#[spec_unmodeled]`/`#[spec_invariant]` anchor
-# emitters now generate `::aterm_spec::{inventory,xref}::…` paths (TRUST_NATIVE_TLA
+# emitters now generate `::aterm_spec::{registry,xref}::…` paths (TRUST_NATIVE_TLA
 # Phase 0), so the attribute-macro integration tests need `aterm-spec` linked to
 # resolve them. This is a DEV-dependency cycle (aterm-spec depends on this crate as
 # a normal dep; this crate depends on aterm-spec only for tests), which Cargo

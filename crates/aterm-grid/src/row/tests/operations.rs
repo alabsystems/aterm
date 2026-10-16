@@ -3,8 +3,7 @@
 // Author: Andrew Yates
 //
 // Row operation tests: selective_clear, line_size, copy_from,
-// clear_range boundaries, update_len, resize edge cases,
-// and cross-page memory safety.
+// clear_range boundaries, update_len and resize edge cases.
 
 use super::super::*;
 use super::make_row;
@@ -19,21 +18,17 @@ fn selective_clear_range_skips_protected_cells() {
     let fg = PackedColor::DEFAULT_FG;
     let bg = PackedColor::DEFAULT_BG;
 
-    // Write normal cells
     row.write_char_styled(0, 'A', fg, bg, CellFlags::empty());
     row.write_char_styled(1, 'B', fg, bg, CellFlags::empty());
-    // Write a protected cell
     row.write_char_styled(2, 'P', fg, bg, CellFlags::PROTECTED);
     row.write_char_styled(3, 'D', fg, bg, CellFlags::empty());
 
     row.selective_clear_range(0, 4);
 
-    // Unprotected cells should be cleared
     assert_eq!(row.get(0).unwrap().char(), ' ');
     assert_eq!(row.get(1).unwrap().char(), ' ');
     assert_eq!(row.get(3).unwrap().char(), ' ');
 
-    // Protected cell should remain
     assert_eq!(row.get(2).unwrap().char(), 'P');
 }
 
@@ -61,7 +56,6 @@ fn selective_clear_range_empty_range() {
     let (_pages, mut row) = make_row(10);
     row.write_char(0, 'A');
 
-    // Empty range — should be a no-op
     row.selective_clear_range(5, 5);
     assert_eq!(row.get(0).unwrap().char(), 'A');
 }
@@ -85,7 +79,6 @@ fn set_line_size_double_width() {
     assert_eq!(row.line_size(), LineSize::DoubleWidth);
     assert!(row.flags().contains(RowFlags::DOUBLE_WIDTH));
 
-    // Cells in the second half should be cleared
     assert_eq!(row.get(39).unwrap().char(), 'X');
     assert_eq!(row.get(40).unwrap().char(), ' ');
 }
@@ -150,7 +143,6 @@ fn copy_from_wider_source_clamps() {
 
     row_narrow.copy_from(&row_wide);
 
-    // Only first 10 chars should be copied
     assert_eq!(row_narrow.to_string(), "ABCDEFGHIJ");
     assert_eq!(row_narrow.len(), 10);
 }
@@ -164,7 +156,6 @@ fn clear_range_clamps_end_to_cols() {
         row.write_char(u16_from_usize(i), c);
     }
 
-    // End past row width — should clamp
     row.clear_range_with(8, 100, Cell::EMPTY);
     assert_eq!(row.get(7).unwrap().char(), 'H');
     assert_eq!(row.get(8).unwrap().char(), ' ');
@@ -203,11 +194,9 @@ fn update_len_clamps_to_cols() {
     let (_pages, mut row) = make_row(10);
     assert_eq!(row.len(), 0);
 
-    // Attempting to set len beyond column count should clamp to cols()
     row.update_len(15);
     assert_eq!(row.len(), 10, "update_len must clamp to cols()");
 
-    // u16::MAX should also clamp
     row.update_len(u16::MAX);
     assert_eq!(row.len(), 10, "update_len must clamp u16::MAX to cols()");
 }
@@ -222,14 +211,12 @@ fn resize_wide_char_at_boundary_is_cleared() {
     let fg = PackedColor::DEFAULT_FG;
     let bg = PackedColor::DEFAULT_BG;
 
-    // Wide char at cols 8-9
     row.write_wide_char(8, '\u{4E2D}', fg, bg, CellFlags::empty());
 
-    // Shrink to 9 cols — the wide char at col 8 can't display its second cell
+    // At 9 cols the wide char at col 8 loses its second cell.
     // SAFETY: Test-local `pages` outlives `row` for the full scope.
     unsafe { row.resize(9, &mut pages) };
 
-    // Col 8 is cleared: its continuation at col 9 is gone.
     assert_eq!(row.get(8).unwrap().char(), ' ');
     assert!(!row.get(8).unwrap().is_wide());
 }

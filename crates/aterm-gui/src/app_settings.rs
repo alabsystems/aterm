@@ -17,6 +17,21 @@ fn tccutil_presence_once() -> aterm_containment::TccutilPresence {
     *PRESENCE.get_or_init(aterm_containment::consent::tccutil_presence)
 }
 
+/// The font rows the terminal's latest font generation could not find, for
+/// a Settings view opened after that generation.
+static SETTINGS_FONT_REFUSALS: std::sync::Mutex<Vec<crate::native_font_catalog::FontRefusal>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// The installed fonts the Settings font pickers offer: the Settings
+/// controller they were last listed for, and the last list the listing
+/// thread sent. A new controller (Settings opened again) lists again, so a
+/// font installed in the meantime appears; the list is remembered by
+/// aterm-render, so an unchanged font tree costs a few `stat`s.
+static SETTINGS_FONT_FAMILIES: std::sync::Mutex<(
+    Option<crate::native_app::AppInstanceId>,
+    Option<std::sync::Arc<aterm_render::font_catalog::MonospaceFamilies>>,
+)> = std::sync::Mutex::new((None, None));
+
 impl App {
     /// Enumerate every live Settings presentation in `wid`, including leaves
     /// that are not currently focused. Generic split/restore operations may
@@ -41,7 +56,7 @@ impl App {
     /// Visit in stable tab/leaf order without materializing each tab's leaves.
     /// The event-loop park uses this across every window, including windows
     /// containing only terminal tabs, so temporary leaf lists buy no work.
-    fn visit_settings_tabs_in_window(
+    pub(crate) fn visit_settings_tabs_in_window(
         &self,
         wid: crate::WindowId,
         mut visit: impl FnMut(
@@ -207,53 +222,72 @@ impl App {
             .any(|wid| self.settings_tab_in_window(wid).is_some())
     }
 
-    /// The per-park Settings observation hop, called once per event-loop park by
-    /// `retry_title_observations`. It publishes the Smart Titles runtime observation
-    /// ([`Self::publish_settings_title_summary_health`]), equality-gated so an unchanged
-    /// observation is a no-op. The macOS file-access posture is published separately by
-    /// `about_to_wait` through [`Self::sync_settings_consent_posture`].
-    pub(crate) fn sync_settings_title_summary_health(&mut self) {
-        self.publish_settings_title_summary_health();
-        self.sync_settings_consent_posture();
-    }
-
-    /// Publish the process-global Smart Titles runtime observation into every
-    /// open Settings view. Configuration remains the durable source of intent;
-    /// this is the live provider/locality/readiness/error projection. The update
-    /// is equality-gated and only redraws windows whose view actually changed.
-    fn publish_settings_title_summary_health(&mut self) {
-        // This runs on every park, and usually no Settings view exists. Settings is a
-        // process-singleton controller, so no live instance proves no window presents
-        // it, and the per-tab walk and health projection below can be skipped.
-        // `instance_by_kind` allocates nothing and errs safe (an instance with no view
-        // just falls through to the walk). Not `settings_tab_open()`, which re-runs the
-        // walk.
-        if self
+    /// Hand the installed-font list to every Settings view, listing it off the
+    /// event loop first for a Settings controller that has none yet.
+    pub(crate) fn sync_settings_font_families(&mut self) {
+        let Some(instance) = self
             .native_runtime
             .instance_by_kind(crate::native_app::AppKind::Settings)
-            .is_none()
-        {
+        else {
             return;
+        };
+        let (listed_for, families) = SETTINGS_FONT_FAMILIES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if listed_for != Some(instance) {
+            SETTINGS_FONT_FAMILIES
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0 = Some(instance);
+            if let Some(proxy) = self.proxy.clone() {
+                let _ = std::thread::Builder::new()
+                    .name("aterm-font-families".into())
+                    .spawn(move || {
+                        // Cosmetic: the picker offers Automatic and Other…
+                        // until the list lands.
+                        crate::qos::set_self(crate::qos::Role::Background);
+                        let families = aterm_render::font_catalog::monospace_families();
+                        let _ = proxy.send_event(crate::Wake::FontFamiliesListed(families));
+                    });
+            }
         }
-        let targets = self
-            .windows
-            .keys()
-            .copied()
-            .filter_map(|wid| {
-                self.settings_tab_in_window(wid)
-                    .map(|(_, _, _, view)| (wid, view))
-            })
-            .collect::<Vec<_>>();
-        if targets.is_empty() {
-            return;
+        if let Some(families) = families {
+            self.hand_settings_font_families(&families);
         }
-        // Built after the target search: with no target the projection is wasted.
-        // `title_summary_health()` is `&self` and side-effect-free.
-        let health = self.title_summary_health();
-        for (wid, view) in targets {
+        let refusals = SETTINGS_FONT_REFUSALS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        self.hand_settings_font_refusals(&refusals, false);
+    }
+
+    /// A font generation's refused rows ([`crate::native_font_catalog::FontRefusal`]):
+    /// every Settings view marks them, and says so where one was just saved.
+    pub(crate) fn publish_settings_font_refusals(
+        &mut self,
+        refusals: Vec<crate::native_font_catalog::FontRefusal>,
+    ) {
+        SETTINGS_FONT_REFUSALS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone_from(&refusals);
+        self.hand_settings_font_refusals(&refusals, true);
+    }
+
+    fn hand_settings_font_refusals(
+        &mut self,
+        refusals: &[crate::native_font_catalog::FontRefusal],
+        announce: bool,
+    ) {
+        let mut views = Vec::new();
+        for &wid in self.windows.keys() {
+            self.visit_settings_tabs_in_window(wid, |_, _, _, view| views.push((wid, view)));
+        }
+        for (wid, view) in views {
             let changed = match self.native_runtime.view_state_mut(view) {
                 Some(crate::native_app::AppViewState::Settings(state)) => {
-                    state.replace_title_summary_health(health.clone())
+                    state.replace_font_refusals(refusals.to_vec(), announce)
                 }
                 Some(
                     crate::native_app::AppViewState::Markdown(_)
@@ -271,11 +305,71 @@ impl App {
         }
     }
 
+    /// The listing thread's answer ([`crate::Wake::FontFamiliesListed`]).
+    pub(crate) fn publish_settings_font_families(
+        &mut self,
+        families: std::sync::Arc<aterm_render::font_catalog::MonospaceFamilies>,
+    ) {
+        SETTINGS_FONT_FAMILIES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .1 = Some(std::sync::Arc::clone(&families));
+        self.hand_settings_font_families(&families);
+    }
+
+    /// Give `families` to every Settings view that lacks it, repainting those.
+    fn hand_settings_font_families(
+        &mut self,
+        families: &std::sync::Arc<aterm_render::font_catalog::MonospaceFamilies>,
+    ) {
+        let mut views = Vec::new();
+        for &wid in self.windows.keys() {
+            self.visit_settings_tabs_in_window(wid, |_, _, _, view| views.push((wid, view)));
+        }
+        for (wid, view) in views {
+            let changed = match self.native_runtime.view_state_mut(view) {
+                Some(crate::native_app::AppViewState::Settings(state)) => {
+                    state.replace_font_families(std::sync::Arc::clone(families))
+                }
+                Some(
+                    crate::native_app::AppViewState::Markdown(_)
+                    | crate::native_app::AppViewState::Editor(_)
+                    | crate::native_app::AppViewState::Recovery(_),
+                )
+                | None => false,
+            };
+            if changed && let Some(window) = self.windows.get_mut(&wid) {
+                window.last_present = None;
+                if let Some(os_window) = window.os_window.as_ref() {
+                    os_window.request_redraw();
+                }
+            }
+        }
+    }
+
+    /// Repaint every window whose Settings specimen was waiting on the font
+    /// worker ([`crate::Wake::SemanticFontReady`]), focused or not, so its
+    /// status never sticks on "Loading font".
+    pub(crate) fn repaint_settings_specimens(&mut self) {
+        let phase_ms = u64::try_from(self.lat_epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let windows = self.windows.keys().copied().collect::<Vec<_>>();
+        for wid in windows {
+            if self.invalidate_active_native_settings_preview(wid, phase_ms)
+                && let Some(os_window) = self
+                    .windows
+                    .get(&wid)
+                    .and_then(|window| window.os_window.as_ref())
+            {
+                os_window.request_redraw();
+            }
+        }
+    }
+
     /// Publish the macOS file-access posture into every open Settings view and perform
     /// any outstanding *Ask for folder access now* press.
     ///
-    /// Shaped like [`Self::sync_settings_title_summary_health`]: the cheap
-    /// `instance_by_kind` guard comes first, and the projection is equality-gated.
+    /// The cheap `instance_by_kind` guard comes first, and the projection is
+    /// equality-gated.
     ///
     /// * It never reaches the OS on a headless instance: it returns before the probe,
     ///   and `ConsentGestures::for_instance`'s headless arm cannot contact
@@ -318,7 +412,7 @@ impl App {
 
     /// The Security page's half of [`Self::sync_settings_consent_posture`], over
     /// `views` (every Settings view): build the block once and hand it to each view
-    /// on the Security route. The Developer Tools row may start its `log show` only
+    /// on the Security route. The DEVELOPER TOOLS card may start its `log show` only
     /// while one of those views is on screen ([`Self::settings_view_on_screen`]);
     /// otherwise it is served from its slot, so a Security page left in a
     /// background tab or a hidden window starts nothing (debugger design §9.1,
@@ -411,12 +505,17 @@ impl App {
         let mut opened = false;
         let mut retire = None;
         let mut debugger = None;
+        let mut askpass_requests = Vec::new();
+        let mut devtools_by = Vec::new();
         for &(wid, view) in views {
             if let Some(crate::native_app::AppViewState::Settings(state)) =
                 self.native_runtime.view_state_mut(view)
             {
                 if state.take_consent_warmup_request() {
                     requested_by.push((wid, view));
+                }
+                if state.take_devtools_hand_over_request() {
+                    devtools_by.push((wid, view));
                 }
                 opened |= state.take_consent_open_request();
                 retire = retire.or(state.take_claimant_retire_request());
@@ -425,8 +524,15 @@ impl App {
                 // drained too, and `begin_debugger_access_change` would refuse
                 // it as in flight anyway.
                 debugger = debugger.or(state.take_debugger_change_request());
+                if let Some((off, owner)) = state.take_askpass_off_request() {
+                    askpass_requests.push((wid, view, off, owner));
+                }
             }
         }
+        #[cfg(target_os = "macos")]
+        self.apply_askpass_off_requests(askpass_requests, crate::askpass::set_relay_off);
+        #[cfg(not(target_os = "macos"))]
+        let _ = askpass_requests;
         // Every yes still waiting is taken up here — started, or refused and
         // said so — so no view reads it as under way after this park.
         self.owner_quiet
@@ -476,12 +582,94 @@ impl App {
         if opened {
             self.note_macos_access_settings_opened(std::time::Instant::now());
         }
+        // The DEVELOPER TOOLS card's Open Developer Tools…: the one hand-over,
+        // once however many views pressed it before this park, and what it did
+        // on the bar of each of them. A headless instance answers that nothing
+        // opened. On a list read empty the page waits for `spctl`: those bars say
+        // so now, and hear how it came out when the run ends
+        // (`App::settle_devtools_waiting`).
+        if !devtools_by.is_empty() {
+            let outcome = self.hand_devtools_to_owner(crate::devtools_helper::Origin::Settings);
+            if outcome == crate::devtools_helper::HandOver::Listing {
+                self.devtools_helper
+                    .wait_in_settings(devtools_by.iter().copied());
+            }
+            self.note_devtools_outcome_on(&devtools_by, outcome, None);
+        }
+    }
+
+    /// What the Developer Tools hand-over came to, on the bar of each Settings view
+    /// in `views` that pressed for it (`SettingsViewState::note_devtools_hand_over`),
+    /// each told to draw it: written outside the reducer. `unlisted`: why `spctl
+    /// developer-mode enable-terminal` failed, when the hand-over ran it first.
+    pub(crate) fn note_devtools_outcome_on(
+        &mut self,
+        views: &[(crate::WindowId, crate::tab_model::ViewId)],
+        outcome: crate::devtools_helper::HandOver,
+        unlisted: Option<&str>,
+    ) {
+        for &(wid, view) in views {
+            let noted = match self.native_runtime.view_state_mut(view) {
+                Some(crate::native_app::AppViewState::Settings(state)) => {
+                    state.note_devtools_hand_over(outcome, unlisted)
+                }
+                _ => false,
+            };
+            if noted && let Some(window) = self.windows.get_mut(&wid) {
+                window.last_present = None;
+                if let Some(os_window) = window.os_window.as_ref() {
+                    os_window.request_redraw();
+                }
+            }
+        }
+    }
+
+    /// Consume the first confirmed request in the stable view traversal order. Other
+    /// queued requests are drained as superseded, never reported as writes that ran.
+    #[cfg(any(target_os = "macos", test))]
+    fn apply_askpass_off_requests(
+        &mut self,
+        requests: Vec<(
+            crate::WindowId,
+            crate::tab_model::ViewId,
+            bool,
+            crate::native_settings::OwnerYes,
+        )>,
+        persist: impl FnOnce(bool, crate::native_settings::OwnerYes) -> std::io::Result<()>,
+    ) {
+        let mut requests = requests.into_iter();
+        let Some((wid, view, off, owner)) = requests.next() else {
+            return;
+        };
+        let written = persist(off, owner).map_err(|error| error.to_string());
+        let first = std::iter::once((
+            wid,
+            view,
+            written.as_ref().map(|()| off).map_err(String::as_str),
+        ));
+        let rest = requests.map(|(wid, view, _off, _owner)| {
+            (wid, view, Err("another confirmed preference change was already queued; this request did not run"))
+        });
+        for (wid, view, result) in first.chain(rest) {
+            let noted = match self.native_runtime.view_state_mut(view) {
+                Some(crate::native_app::AppViewState::Settings(state)) => {
+                    state.note_askpass_off_outcome(result)
+                }
+                _ => false,
+            };
+            if noted && let Some(window) = self.windows.get_mut(&wid) {
+                window.last_present = None;
+                if let Some(os_window) = window.os_window.as_ref() {
+                    os_window.request_redraw();
+                }
+            }
+        }
     }
 
     /// Assemble what the Security page renders: `App` state, the cached probe, and one
     /// `proc_pidpath` for the image anchor. It publishes `SpikeEvidence::UNMEASURED`, so
     /// the panel's coverage claim stays gated on a named field. `on_screen` says whether
-    /// a Security view is visible, which alone lets the Developer Tools row dispatch.
+    /// a Security view is visible, which alone lets the DEVELOPER TOOLS card dispatch.
     fn macos_access_projection(&mut self, on_screen: bool) -> crate::native_settings::MacosAccess {
         let facts = self.consent_panel_facts();
         let warmup_offered = self.config.privacy_enabled()
@@ -526,18 +714,34 @@ impl App {
             retire_status: self.claimant_retire_status(),
             debugger: self.debugger_access_facts(),
             devtools: self.devtools_access_facts(on_screen),
+            // The owner's sudo off switch, read once per projection from the
+            // state-dir marker (`crate::askpass::relay_off`): the row renders
+            // the right toggle. The control verb reads the marker itself.
+            #[cfg(target_os = "macos")]
+            askpass_relay_off: crate::askpass::relay_off(),
+            #[cfg(not(target_os = "macos"))]
+            askpass_relay_off: false,
         }
     }
 
-    /// What the Security page's Developer Tools row renders (debugger design
-    /// §9.1): the CACHED devtools slot answer, with tccd's answer aged in whole
-    /// minutes so the equality-gated republish repaints at most once a minute.
-    /// Only while the page is `on_screen` does a stale answer dispatch its one
-    /// bounded `log show` worker off this thread (the render never waits on
-    /// it); otherwise nothing is started ([`ConsentState::devtools_cached`]).
+    /// What the Security page's DEVELOPER TOOLS card renders (debugger design
+    /// §9.1; owner ask 2026-10-15): the CACHED devtools slot answer — the
+    /// switch's row, tccd's answer and the verdict they join to, the one the
+    /// digest line and the helper panel act on — with tccd's answer aged in
+    /// whole minutes so the equality-gated republish repaints at most once a
+    /// minute. Only while the page is `on_screen` does a stale answer dispatch
+    /// its one bounded worker off this thread (the render never waits on it);
+    /// otherwise nothing is started ([`ConsentState::devtools_cached`]). While
+    /// a re-read is out (a focus gain retires the answer), a switch the
+    /// hand-over lane last READ stands in for it, so the card does not flicker
+    /// to "Checking…" each time the owner comes back. When aterm last opened
+    /// the page, and the owner's Not now while it holds, come from the lane's
+    /// cached markers ([`devtools_helper::Lane::last_opened_at`],
+    /// `Lane::declined_marker`): never a file read per park.
     ///
     /// [`ConsentState::devtools_cached`]: crate::control_privacy::ConsentState::devtools_cached
-    fn devtools_access_facts(&self, on_screen: bool) -> crate::native_settings::DevToolsFacts {
+    /// [`devtools_helper::Lane::last_opened_at`]: crate::devtools_helper::Lane::last_opened_at
+    fn devtools_access_facts(&mut self, on_screen: bool) -> crate::native_settings::DevToolsFacts {
         let gate = self.config.privacy_probe_gate();
         let observer_off = self.config.privacy_observer_off();
         let row = if on_screen {
@@ -545,10 +749,26 @@ impl App {
         } else {
             self.consent.devtools_cached(gate, observer_off)
         };
+        let (list, grant) = match self.devtools_helper.reading() {
+            Some(reading)
+                if row.pending()
+                    && reading.list.label == aterm_containment::consent::DevToolListLabel::Read =>
+            {
+                (reading.list, reading.grant)
+            }
+            _ => (row.list(), row.grant()),
+        };
+        let opened_minutes = self.devtools_helper.last_opened_at().and_then(|at| {
+            crate::devtools_helper::minutes_since(at, aterm_time::unix_secs().unwrap_or(0))
+        });
         crate::native_settings::DevToolsFacts {
             enabled: gate.permits(),
             probe: row.probe(),
             answer_minutes: row.answer_age_ms().map(|ms| ms / 60_000),
+            list,
+            grant,
+            opened_minutes,
+            declined: self.devtools_helper.declined_marker(),
         }
     }
 
@@ -658,6 +878,26 @@ impl App {
         self.open_settings_tab_in_window(wid, route)
     }
 
+    /// Hand a new Settings view where aterm.toml lives, and the arm its Manual
+    /// page shows the file with: inert in a headless instance, which presents
+    /// no OS UI.
+    pub(crate) fn arm_settings_config_file(
+        &self,
+        state: &mut crate::native_settings::SettingsViewState,
+    ) {
+        let path = self
+            .native_config_service
+            .bound_logical_path()
+            .map(std::path::Path::to_path_buf)
+            .or_else(crate::app_config::config_path);
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        state.arm_config_file(
+            path,
+            home.as_deref(),
+            crate::native_settings::ConfigFileArm::for_instance(self.headless),
+        );
+    }
+
     /// [`Self::open_settings_tab`] in a named window: the message band, a screen reader's
     /// activate on it and the Messages page's actions pass the window the press landed
     /// in, so a press in a background window opens the page there and raises it.
@@ -679,7 +919,7 @@ impl App {
             let snapshot = self.native_config_service.snapshot();
             let mut state = crate::native_settings::SettingsViewState::from_snapshot(&snapshot)
                 .expect("versioned config service snapshots are valid Settings input");
-            let _ = state.replace_title_summary_health(self.title_summary_health());
+            self.arm_settings_config_file(&mut state);
             state.navigate(route);
             let view_state = crate::native_app::AppViewState::Settings(Box::new(state));
             let presentation = crate::tab_model::TabPresentation {
@@ -755,16 +995,19 @@ impl App {
         // tab) to an existing Settings tab must publish the canonical front
         // content before the exact-view stale-target guard resolves the action.
         self.resync_active_or_window(wid);
-        self.sync_settings_title_summary_health();
+        self.sync_settings_consent_posture();
         if route == crate::native_settings::SettingsRoute::SoftwareUpdate {
             self.acknowledge_native_update_attention();
-            // The screen paints the reducer's snapshot, which learns ledger changes only
-            // on a reconcile; opening the screen is when the user wants the current
-            // verdict.
-            self.request_native_update_reconcile(
-                crate::app_native::NativeUpdateReconcilePurpose::Refresh,
-            );
         }
+        // Every page paints the reducer's snapshot, which learns ledger changes — and
+        // whether this copy can update itself at all — only on a reconcile. Software
+        // Update, Modified and Search all say what the update switches do here, and a
+        // headless launch posts no startup reconcile, so ask whenever Settings opens,
+        // on any page, as the Packages refresh below does; the rows correct themselves
+        // when it lands (`UpdateChanged`). The work is coalesced, off the event loop.
+        self.request_native_update_reconcile(
+            crate::app_native::NativeUpdateReconcilePurpose::Refresh,
+        );
         // Seed and refresh the shared Packages projection whenever Settings surfaces:
         // publication is memory-only (the controller starts "unobserved"), and status
         // collection runs on a worker, never on the event loop.
@@ -774,6 +1017,9 @@ impl App {
         // Messages route (a band row's `Details ›`, the menu, the control verb) reads
         // the log as it is now, not as the 2 Hz gate last let it through.
         self.publish_native_messages_state();
+        // And Settings ▸ Harness's, built from what the App holds: the route's
+        // arrival (the route action below) reads the ledgers again off the loop.
+        self.publish_native_harness_state();
         // The Security page's "This Mac" card reads `[machine]` from a fresh `atpkg
         // machine` every time Settings surfaces.
         self.start_native_machine_refresh();
@@ -1144,7 +1390,7 @@ impl App {
     /// `strip_titles_scratch` and spans from the cached `tab_segments`, the buffers the
     /// last paint filled and the mouse hit-tests, so announced and clickable tabs agree.
     /// The label is announced whole, not as the chip's cut
-    /// (`title_summary::whole_label`).
+    /// (`chrome_label::capped_label`).
     #[cfg(a11y_tree)]
     fn grid_a11y_tabs(&self, wid: crate::WindowId) -> Vec<crate::accesskit_tree::GridTab> {
         if self.tab_strip_rows == 0 {
@@ -1170,7 +1416,7 @@ impl App {
                     index,
                     title: ws.strip_titles_scratch.get(index).map_or_else(
                         || "aterm".to_string(),
-                        |label| crate::title_summary::whole_label(label).into_owned(),
+                        |label| crate::chrome_label::capped_label(label).into_owned(),
                     ),
                     selected: active == Some(index),
                     start_col: segment.start_col,
@@ -1379,10 +1625,14 @@ impl App {
         // count too, so the tree can never describe a row the frame does not carry.
         // Fixed slots per band ROW (`BandRow0..2`), not per message: AccessKit then
         // emits "text changed" on a name change instead of node churn.
-        let presentation = self.band_presentation(usize::from(ws.cols));
+        let presentation = if self.message_band_rows > 0 {
+            Some(self.band_presentation(usize::from(ws.cols)))
+        } else {
+            None
+        };
         for (row, layout) in presentation
-            .rows
             .iter()
+            .flat_map(|p| p.rows.iter())
             .take(usize::from(self.message_band_rows))
             .enumerate()
         {
@@ -1880,6 +2130,93 @@ mod tests {
     use aterm_effects::cursor_glow::GlowStyle;
     use aterm_effects::trail_sound::{SoundGesture, SoundKind, SoundVoice};
 
+    #[test]
+    fn askpass_settings_host_reports_a_failed_private_marker_operation() {
+        let dir = aterm_tempfile::TempDir::new().unwrap();
+        let marker = dir.path().join("askpass-off");
+        std::fs::create_dir(&marker).unwrap();
+        let mut app = App::headless_for_test();
+        let wid = crate::WindowId(0);
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Security));
+        let (_, view) = app.active_native_view(wid).unwrap();
+        app.apply_askpass_off_requests(
+            vec![(
+                wid,
+                view,
+                false,
+                crate::native_settings::OwnerYes::for_test(),
+            )],
+            |off, _owner| {
+                assert!(!off);
+                std::fs::remove_file(&marker)
+            },
+        );
+        let Some(crate::native_app::AppViewState::Settings(state)) =
+            app.native_runtime.view_state(view)
+        else {
+            unreachable!();
+        };
+        let said = state.feedback.as_deref().unwrap();
+        assert!(said.starts_with("Could not change"), "{said}");
+        assert!(!said.contains("allowed again"), "{said}");
+        assert!(marker.is_dir(), "the relay still has its off entry");
+    }
+
+    #[test]
+    fn askpass_settings_host_supersedes_a_second_direction_without_reporting_it_saved() {
+        let mut app = App::headless_for_test();
+        let wid = crate::WindowId(0);
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Security));
+        let (instance, first) = app.active_native_view(wid).unwrap();
+        let second = app.view_store.insert_native(instance).unwrap();
+        let mut state =
+            crate::native_settings::SettingsViewState::new(&crate::app_config::Config::default());
+        state.navigate(crate::native_settings::SettingsRoute::Security);
+        app.native_runtime
+            .attach_view(
+                second,
+                instance,
+                crate::native_app::AppViewState::Settings(Box::new(state)),
+            )
+            .unwrap();
+        let mut writes = Vec::new();
+        app.apply_askpass_off_requests(
+            vec![
+                (
+                    wid,
+                    first,
+                    true,
+                    crate::native_settings::OwnerYes::for_test(),
+                ),
+                (
+                    wid,
+                    second,
+                    false,
+                    crate::native_settings::OwnerYes::for_test(),
+                ),
+            ],
+            |off, _owner| {
+                writes.push(off);
+                Ok(())
+            },
+        );
+        assert_eq!(writes, vec![true], "only the first confirmed request runs");
+        let Some(crate::native_app::AppViewState::Settings(first)) =
+            app.native_runtime.view_state(first)
+        else {
+            unreachable!();
+        };
+        assert!(first.feedback.as_deref().unwrap().contains("turned off"));
+        let Some(crate::native_app::AppViewState::Settings(second)) =
+            app.native_runtime.view_state(second)
+        else {
+            unreachable!();
+        };
+        let said = second.feedback.as_deref().unwrap();
+        assert!(said.contains("this request did not run"), "{said}");
+        assert!(!said.contains("allowed again"), "{said}");
+    }
+
     #[derive(Clone, Copy, Debug)]
     enum CursorDependent {
         Rainbow,
@@ -2184,8 +2521,7 @@ mod tests {
             app.open_settings_tab(crate::native_settings::SettingsRoute::Security),
             "the Security page opens headless like any other route"
         );
-        // The per-park hop, run explicitly. Both halves must stay silent.
-        app.sync_settings_title_summary_health();
+        // The per-park hop, run explicitly. It must stay silent.
         app.sync_settings_consent_posture();
 
         let (_, _, view, _) = app
@@ -2514,7 +2850,7 @@ mod tests {
         );
     }
 
-    /// The Developer Tools row starts its `log show` only while a Security view
+    /// The DEVELOPER TOOLS card starts its `log show` only while a Security view
     /// is on screen (debugger design §9.1, O12). A Security page in a background
     /// tab, or in a window the OS reports occluded, is served from the slot and
     /// starts nothing, however many parks publish it; the same view in its
@@ -2758,6 +3094,635 @@ mod tests {
             "and re-probed: the inert arm reads nothing, and says so"
         );
         assert_eq!(fold(&app, now).0, None, "ended: nothing left to arm");
+    }
+
+    /// THE DEVELOPER TOOLS HAND-OVER at the park (owner ask 2026-10-15), the
+    /// debugger change's sibling: the window's own hand-over waits for a quiet
+    /// moment and arms nothing while no aterm window is focused; the owner's
+    /// press opens the page and shows the helper panel through the one lane;
+    /// while the panel is up the App folds its turn into the park as
+    /// `DeadlineOwner::DevToolsHandOver`, and the park's own consent-lane tick
+    /// reads the list on a worker and takes the result whatever its wake did. A
+    /// read that finds aterm on ends the digest line; the panel closes after
+    /// its done words and nothing is left to arm. A windowed lane with
+    /// stand-in arms stands in on a headless App; nothing reaches the OS.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_devtools_hand_over_under_way_is_folded_into_the_park_and_read_by_its_tick() {
+        use crate::devtools_helper::{DONE_FOR, HandOver, Origin, PANEL_TICK, Phase, test_arms};
+        use crate::metrics::DeadlineOwner;
+        let fold = |app: &App, now: std::time::Instant| {
+            let (mut deadline, mut owner) = (None, DeadlineOwner::None);
+            app.fold_consent_lane_deadlines(now, &mut deadline, &mut owner);
+            (deadline, owner)
+        };
+        let mut app = App::headless_for_test();
+        let now = std::time::Instant::now();
+        assert_eq!(
+            app.hand_devtools_to_owner(Origin::Digest),
+            HandOver::Headless,
+            "a headless instance does nothing"
+        );
+        test_arms::stand_in(&mut app, test_arms::opening());
+        assert!(app.devtools_watch.wants_read(now), "the launch read");
+        app.except(&crate::message_reporters::devtools_entry(
+            atpkg::devtools::Step::Add,
+        ));
+        assert_eq!(fold(&app, now).0, None, "nothing waits");
+        assert_eq!(
+            app.hand_devtools_to_owner(Origin::Automatic),
+            HandOver::Queued,
+            "the window's own waits for a quiet moment"
+        );
+        assert_eq!(
+            fold(&app, now).0,
+            None,
+            "no aterm window focused: the focus gain wakes the loop"
+        );
+        assert_eq!(app.hand_devtools_to_owner(Origin::Digest), HandOver::Opened);
+        assert_eq!(
+            (test_arms::opens(), test_arms::opened_notes()),
+            (1, 1),
+            "the page, and the shared marker"
+        );
+        assert_eq!(
+            app.devtools_helper.queued(),
+            None,
+            "the press ends the wait"
+        );
+        assert!(
+            app.devtools_watch.wants_read(now),
+            "the owner's return reads"
+        );
+        assert_eq!(
+            app.devtools_helper.panel().map(|p| p.phase()),
+            Some(Phase::Explain)
+        );
+        let (deadline, owner) = fold(&app, now);
+        assert_eq!(owner, DeadlineOwner::DevToolsHandOver);
+        assert!(deadline.is_some_and(|at| at <= now + PANEL_TICK));
+        // The park's turn reads the list on a worker; the result is in the
+        // slot whether or not its wake (no event loop here) came.
+        let t1 = std::time::Instant::now() + PANEL_TICK;
+        let start = std::time::Instant::now();
+        while !app.messages.digest().is_empty() {
+            assert!(start.elapsed() < Duration::from_secs(60), "hang");
+            app.tick_consent_lanes(t1);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            app.devtools_helper.panel().map(|p| p.phase()),
+            Some(Phase::Done),
+            "on: the done words"
+        );
+        app.tick_consent_lanes(t1 + DONE_FOR);
+        assert!(app.devtools_helper.panel().is_none(), "done closes itself");
+        assert_eq!(
+            fold(&app, t1 + DONE_FOR).0,
+            None,
+            "ended: nothing left to arm"
+        );
+        assert_eq!(
+            app.hand_devtools_to_owner(Origin::Automatic),
+            HandOver::Refused(crate::devtools_helper::Refusal::Granted),
+            "the panel's read is the lane's reading now"
+        );
+    }
+
+    /// THE DEVELOPER TOOLS CARD'S BUTTON (owner ask 2026-10-15) is the one
+    /// hand-over: its press is recorded on the view, the park performs it
+    /// through `App::hand_devtools_to_owner(Origin::Settings)` — the page, and
+    /// the helper panel beside it — and what it did lands on the view's bar
+    /// with the route in words. An owner's press: the owner's Not now on record
+    /// does not hold it back. A headless instance and a page that did not open
+    /// (the negative controls) say that nothing opened and show no panel. Stand-in
+    /// arms on a headless App; nothing reaches the OS.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_developer_tools_cards_press_is_the_one_hand_over() {
+        use crate::devtools_helper::{Origin, Phase, test_arms};
+        use crate::native_settings::{MACOS_ACCESS_OPEN_DEVTOOLS, SettingsRoute};
+        let words =
+            crate::menu::privacy_settings_path_words(crate::menu::PrivacyPane::DeveloperTools);
+        let press_and_park = |app: &mut App| {
+            let wid = crate::WindowId(0);
+            assert!(app.open_settings_tab(SettingsRoute::Security));
+            let (_, view) = app.active_native_view(wid).expect("Settings view");
+            // The page as a window publishes it, with arms that may ask the host
+            // (a headless App publishes nothing, and an unpublished view asks
+            // nothing: `native_settings`' own negative controls).
+            let access = app.macos_access_projection(false);
+            app.publish_macos_access(
+                &[(wid, view)],
+                &access,
+                crate::native_settings::ConsentGestures::confirming(),
+            );
+            app.dispatch_native_view_event(
+                wid,
+                view,
+                AppEvent::Action(ActionInvocation {
+                    id: ActionId::new(MACOS_ACCESS_OPEN_DEVTOOLS),
+                    value: None,
+                }),
+            )
+            .unwrap();
+            app.sync_settings_consent_posture();
+            let Some(crate::native_app::AppViewState::Settings(state)) =
+                app.native_runtime.view_state_mut(view)
+            else {
+                panic!("a Settings view");
+            };
+            assert!(!state.take_devtools_hand_over_request(), "drained");
+            state.feedback.clone().expect("the bar says what happened")
+        };
+        let not_opened = format!("System Settings did not open. The setting is at {words}.");
+
+        let mut headless = App::headless_for_test();
+        assert_eq!(press_and_park(&mut headless), not_opened);
+        assert!(headless.devtools_helper.panel().is_none());
+
+        let mut app = App::headless_for_test();
+        test_arms::stand_in(&mut app, test_arms::declining());
+        let opens = test_arms::opens();
+        assert_eq!(
+            press_and_park(&mut app),
+            format!("Opened System Settings \u{2014} look under {words}.")
+        );
+        assert_eq!(
+            test_arms::opens(),
+            opens + 1,
+            "one page, whatever was declined"
+        );
+        let panel = app.devtools_helper.panel().expect("the helper panel");
+        assert_eq!(
+            (panel.origin(), panel.phase()),
+            (Origin::Settings, Phase::Explain)
+        );
+        assert!(
+            app.devtools_watch.wants_read(std::time::Instant::now()),
+            "the owner's return reads the list"
+        );
+
+        let mut refused = App::headless_for_test();
+        test_arms::stand_in(&mut refused, test_arms::refusing());
+        let opens = test_arms::opens();
+        assert_eq!(press_and_park(&mut refused), not_opened);
+        assert_eq!(test_arms::opens(), opens + 1, "it was asked");
+        assert!(refused.devtools_helper.panel().is_none());
+    }
+
+    /// A PRESS ON A LIST READ EMPTY waits for `spctl developer-mode
+    /// enable-terminal` before the page can open: the card's bar says the page is
+    /// on its way, and when the run ends it says how it came out — opened, opened
+    /// with macOS showing no list because the run failed (and the panel says why
+    /// and offers Show it), or (the negative control) not — instead of a promise
+    /// left standing. Stand-in arms on a headless App; nothing reaches the OS.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_cards_press_that_waits_for_spctl_hears_how_the_page_came_out() {
+        use crate::devtools_helper::test_arms;
+        use crate::native_settings::{MACOS_ACCESS_OPEN_DEVTOOLS, SettingsRoute};
+        let words =
+            crate::menu::privacy_settings_path_words(crate::menu::PrivacyPane::DeveloperTools);
+        for (reach, came_out) in [
+            (
+                test_arms::opening(),
+                format!("Opened System Settings \u{2014} look under {words}."),
+            ),
+            (
+                test_arms::spctl_failing(),
+                format!(
+                    "Opened System Settings, but macOS did not show the Developer Tools list \
+                     (spctl exited 1). The setting is at {words}."
+                ),
+            ),
+            (
+                test_arms::refusing(),
+                format!("System Settings did not open. The setting is at {words}."),
+            ),
+        ] {
+            let mut app = App::headless_for_test();
+            test_arms::stand_in(&mut app, reach);
+            app.devtools_helper.note_reading(
+                test_arms::reading(
+                    aterm_containment::DevToolGrant::NotGranted,
+                    test_arms::absent(0),
+                ),
+                std::time::Instant::now(),
+            );
+            let wid = crate::WindowId(0);
+            assert!(app.open_settings_tab(SettingsRoute::Security));
+            let (_, view) = app.active_native_view(wid).expect("Settings view");
+            let access = app.macos_access_projection(false);
+            app.publish_macos_access(
+                &[(wid, view)],
+                &access,
+                crate::native_settings::ConsentGestures::confirming(),
+            );
+            app.dispatch_native_view_event(
+                wid,
+                view,
+                AppEvent::Action(ActionInvocation {
+                    id: ActionId::new(MACOS_ACCESS_OPEN_DEVTOOLS),
+                    value: None,
+                }),
+            )
+            .unwrap();
+            app.sync_settings_consent_posture();
+            let feedback = |app: &mut App| {
+                let Some(crate::native_app::AppViewState::Settings(state)) =
+                    app.native_runtime.view_state_mut(view)
+                else {
+                    panic!("a Settings view");
+                };
+                state.feedback.clone().expect("the bar says what happened")
+            };
+            assert!(
+                feedback(&mut app).starts_with("Asking macOS to show the Developer Tools list"),
+                "{}",
+                feedback(&mut app)
+            );
+            // The run ends; the park's turn opens the page and tells the bar.
+            let start = std::time::Instant::now();
+            while app.devtools_helper.listing().is_some() {
+                assert!(start.elapsed() < std::time::Duration::from_secs(60), "hang");
+                app.tick_devtools_hand_over(std::time::Instant::now());
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert_eq!(feedback(&mut app), came_out);
+            // The panel beside the page says what the run said.
+            if let Some(panel) = app.devtools_helper.panel() {
+                let content = panel.content();
+                let failed = content
+                    .texts()
+                    .any(|(text, _)| text.contains("macOS did not show the list (spctl exited 1)"));
+                assert_eq!(failed, came_out.contains("did not show"), "{content:?}");
+                assert_eq!(
+                    content
+                        .buttons()
+                        .contains(&crate::devtools_helper::Button::ShowList),
+                    failed,
+                    "Show it again only after a failed run: {content:?}"
+                );
+            }
+        }
+    }
+
+    /// A HAND-OVER THE OWNER DID NOT PRESS, JUDGED QUIET BEFORE ITS `spctl` RUN, IS
+    /// JUDGED AGAIN WHEN THE RUN ENDS (the run takes as long as syspolicyd takes): the
+    /// moment has passed — here no aterm window is focused — so System Settings does
+    /// not take focus; the hand-over waits for the next quiet moment with the run's
+    /// answer, and then opens the page without running `spctl` again, the panel
+    /// saying Terminal is aterm's doing. A reading that saw aterm on while the run was
+    /// out drops it. NEGATIVE CONTROL: the owner's own press opens when its run ends,
+    /// however unquiet the moment. Stand-in arms on a headless App; nothing reaches
+    /// the OS.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_hand_over_judged_quiet_before_spctl_is_judged_again_when_it_ends() {
+        use crate::devtools_helper::{HandOver, Moment, Origin, test_arms};
+        use aterm_containment::DevToolGrant;
+        let run_out = |app: &mut App| {
+            let start = std::time::Instant::now();
+            while app.devtools_helper.listing().is_some() {
+                assert!(start.elapsed() < std::time::Duration::from_secs(60), "hang");
+                app.tick_devtools_hand_over(std::time::Instant::now());
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        };
+        let empty = || test_arms::reading(DevToolGrant::NotGranted, test_arms::absent(0));
+        let mut app = App::headless_for_test();
+        test_arms::stand_in(&mut app, test_arms::opening());
+        app.devtools_helper
+            .note_reading(empty(), std::time::Instant::now());
+        let opens = test_arms::opens();
+        assert_eq!(
+            app.devtools_hand_over(Origin::Automatic, Moment::Quiet),
+            HandOver::Listing
+        );
+        run_out(&mut app);
+        assert_eq!(
+            test_arms::opens(),
+            opens,
+            "the moment passed: System Settings does not take focus"
+        );
+        assert!(app.devtools_helper.panel().is_none());
+        assert_eq!(
+            app.devtools_helper.queued(),
+            Some(Origin::Automatic),
+            "held for the next quiet moment"
+        );
+        let (origin, listed) = app
+            .devtools_helper
+            .take_queued(std::time::Instant::now(), true)
+            .expect("held");
+        assert_eq!(listed, Some(Ok(())), "with the run's answer");
+        assert_eq!(
+            app.devtools_hand_over_carrying(origin, Moment::Quiet, listed),
+            HandOver::Opened
+        );
+        assert!(app.devtools_helper.listing().is_none(), "no second run");
+        assert_eq!(test_arms::opens(), opens + 1);
+        let panel = app.devtools_helper.panel().expect("the helper panel");
+        assert!(
+            panel
+                .content()
+                .texts()
+                .any(|(text, _)| text == atpkg::devtools::only_aterm(true))
+        );
+
+        // A reading that sees aterm on while the run is out: dropped at its end.
+        let mut granted = App::headless_for_test();
+        test_arms::stand_in(&mut granted, test_arms::opening());
+        granted
+            .devtools_helper
+            .note_reading(empty(), std::time::Instant::now());
+        assert_eq!(
+            granted.devtools_hand_over(Origin::Ctl { now: false }, Moment::Quiet),
+            HandOver::Listing
+        );
+        granted.devtools_helper.note_reading(
+            test_arms::reading(DevToolGrant::Granted, test_arms::on()),
+            std::time::Instant::now(),
+        );
+        let opens = test_arms::opens();
+        run_out(&mut granted);
+        assert_eq!(test_arms::opens(), opens, "nothing opens");
+        assert_eq!(granted.devtools_helper.queued(), None, "refused: dropped");
+
+        // NEGATIVE CONTROL: the owner's own press opens when its run ends.
+        let mut pressed = App::headless_for_test();
+        test_arms::stand_in(&mut pressed, test_arms::opening());
+        pressed
+            .devtools_helper
+            .note_reading(empty(), std::time::Instant::now());
+        assert_eq!(
+            pressed.hand_devtools_to_owner(Origin::Digest),
+            HandOver::Listing
+        );
+        let opens = test_arms::opens();
+        run_out(&mut pressed);
+        assert_eq!(test_arms::opens(), opens + 1, "the owner asked");
+        assert!(pressed.devtools_helper.panel().is_some());
+    }
+
+    /// THE WINDOW'S OWN HAND-OVER, REFUSED AS UNKNOWN AT ITS QUIET MOMENT (a later
+    /// reading read nothing: no Full Disk Access, no new program in tccd's window), is
+    /// no decision against it: the next `not_granted` reading asks for it again,
+    /// rather than the once-per-process latch keeping it from ever coming back in this
+    /// process. Nothing opens on `unknown`. NEGATIVE CONTROL: a hand-over refused for
+    /// the owner's Not now keeps the latch. Stand-in arms on a headless App.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_automatic_hand_over_refused_as_unknown_asks_again_at_the_next_reading() {
+        use crate::devtools_helper::{HandOver, Moment, Origin, Reading, Refusal, test_arms};
+        use crate::devtools_watch::Step;
+        use aterm_containment::DevToolGrant;
+        for (reach, reading, why, asks_again) in [
+            (
+                test_arms::opening(),
+                Reading::UNREAD,
+                Refusal::Unknown,
+                true,
+            ),
+            (
+                test_arms::declining(),
+                test_arms::reading(DevToolGrant::NotGranted, test_arms::absent(2)),
+                Refusal::Declined,
+                false,
+            ),
+        ] {
+            let mut app = App::headless_for_test();
+            test_arms::stand_in(&mut app, reach);
+            assert_eq!(
+                app.devtools_watch.observe(DevToolGrant::NotGranted, false),
+                Step::Raise { hand_over: true },
+                "the first reading asks"
+            );
+            app.devtools_helper
+                .note_reading(reading, std::time::Instant::now());
+            let opens = test_arms::opens();
+            assert_eq!(
+                app.devtools_hand_over(Origin::Automatic, Moment::Quiet),
+                HandOver::Refused(why)
+            );
+            assert_eq!(test_arms::opens(), opens, "nothing opens");
+            assert_eq!(
+                app.devtools_watch.observe(DevToolGrant::NotGranted, false),
+                Step::Raise {
+                    hand_over: asks_again
+                },
+                "{why:?}"
+            );
+        }
+    }
+
+    /// What the DEVELOPER TOOLS card is told: while the window's own re-read is
+    /// out, the switch the hand-over lane last read stands in (no flicker to
+    /// "Checking…" on every focus gain); and when aterm last opened the page is
+    /// read from the shared marker ONCE — not per park — taken from the lane
+    /// when the lane writes it, and read again only after a focus gain.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_devtools_card_reads_the_lanes_switch_and_the_opened_marker_once() {
+        use crate::devtools_helper::{Origin, test_arms};
+        use std::cell::Cell;
+        thread_local! {
+            static READS: Cell<u32> = const { Cell::new(0) };
+        }
+        let reach = test_arms::marked(|| {
+            READS.with(|reads| reads.set(reads.get() + 1));
+            let now = aterm_time::unix_secs().unwrap_or(0);
+            Some(("0.0.0".to_string(), now.saturating_sub(5 * 60)))
+        });
+        let mut app = App::headless_for_test();
+        test_arms::stand_in(&mut app, reach);
+        let facts = app.macos_access_projection(false).devtools;
+        assert!(facts.probe.label == aterm_containment::DevToolProbeLabel::Pending);
+        assert_eq!(
+            (facts.list, facts.grant),
+            (
+                test_arms::absent(2),
+                aterm_containment::DevToolGrant::NotGranted
+            ),
+            "the lane's last read switch stands in while the row is out"
+        );
+        assert!(
+            facts
+                .opened_minutes
+                .is_some_and(|minutes| (4..=6).contains(&minutes)),
+            "{:?}",
+            facts.opened_minutes
+        );
+        for _ in 0..3 {
+            let _ = app.macos_access_projection(false);
+        }
+        assert_eq!(
+            READS.with(Cell::get),
+            1,
+            "the marker is read once, not per park"
+        );
+
+        assert!(app.hand_devtools_to_owner(Origin::Digest).brings_owner());
+        assert_eq!(
+            app.macos_access_projection(false).devtools.opened_minutes,
+            Some(0),
+            "the lane's own write, without reading the file"
+        );
+        assert_eq!(READS.with(Cell::get), 1);
+
+        app.devtools_helper.forget_opened();
+        let again = app.macos_access_projection(false).devtools.opened_minutes;
+        assert!(again.is_some_and(|minutes| minutes >= 4), "{again:?}");
+        assert_eq!(
+            READS.with(Cell::get),
+            2,
+            "a focus gain reads it again, once"
+        );
+    }
+
+    /// `aterm ctl devtools hand-over [now]` (owner ask 2026-10-15) is the one
+    /// hand-over with `Origin::Ctl`, held to the window's own rules because
+    /// every in-session client may send it: the bare form never opens the page
+    /// as it asks but waits for a quiet moment; `now` (a person at `aterm
+    /// doctor`'s terminal) shows only the panel — the asker opens the page —
+    /// and ends any hand-over still waiting, so the page is not brought up a
+    /// second time later. Both answer the owner's Not now, an unread list and
+    /// a granted one with nothing; an unstable build holds back only the bare
+    /// form; the opened marker holds each to its own window (ten minutes, a
+    /// minute for `now`), and `now` is held besides to the window's own minute
+    /// since it last answered a `now` — the asker opens the page, and only an
+    /// opening moves the marker, so a program that asks and never opens cannot
+    /// raise the panel again and again. A headless instance does nothing (the
+    /// negative control). Stand-in arms on a headless App; nothing reaches the
+    /// OS.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_control_verbs_ask_is_held_to_the_windows_own_rules() {
+        use crate::devtools_helper::{
+            DevToolsHelperArm, HandOver, Lane, Origin, Phase, Reading, Refusal, test_arms,
+        };
+        use aterm_containment::DevToolGrant;
+        const ASK: Origin = Origin::Ctl { now: false };
+        const NOW: Origin = Origin::Ctl { now: true };
+        let ask = |app: &mut App, origin| app.hand_devtools_to_owner(origin);
+
+        let mut headless = App::headless_for_test();
+        assert_eq!(ask(&mut headless, NOW), HandOver::Headless);
+
+        let mut app = App::headless_for_test();
+        test_arms::stand_in(&mut app, test_arms::opening());
+        let opens = test_arms::opens();
+        let t = std::time::Instant::now();
+        assert!(app.devtools_watch.wants_read(t), "the launch read");
+        assert_eq!(
+            ask(&mut app, ASK),
+            HandOver::Queued,
+            "the bare form waits for a quiet moment"
+        );
+        assert_eq!(app.devtools_helper.queued(), Some(ASK));
+        assert!(app.devtools_helper.panel().is_none(), "nothing shown yet");
+        assert!(
+            !app.devtools_watch.wants_read(t),
+            "nothing has brought the owner anywhere yet"
+        );
+        assert_eq!(ask(&mut app, NOW), HandOver::Shown);
+        assert_eq!(
+            test_arms::opens(),
+            opens,
+            "`now` leaves the page to its asker"
+        );
+        let panel = app.devtools_helper.panel().expect("the helper panel");
+        assert_eq!((panel.origin(), panel.phase()), (NOW, Phase::Explain));
+        assert_eq!(
+            app.devtools_helper.queued(),
+            None,
+            "the asker opens the page: nothing waits to bring it up again"
+        );
+        assert!(
+            app.devtools_watch.wants_read(t),
+            "the owner's return reads the list"
+        );
+        // Nobody opened the page, so the shared marker never moved: the window
+        // holds `now` to its minute itself. The bare form is not held by it.
+        assert_eq!(
+            ask(&mut app, NOW),
+            HandOver::Refused(Refusal::Recent),
+            "a second `now` inside the minute raises no second panel"
+        );
+        assert_eq!(ask(&mut app, ASK), HandOver::Queued);
+        let minute = std::time::Duration::from_secs(atpkg::devtools::REOPEN_NOW_AFTER_S);
+        let at = std::time::Instant::now();
+        app.devtools_helper.noted_now_answered(at);
+        assert!(
+            app.devtools_helper
+                .now_answered_within_its_minute(at + minute - std::time::Duration::from_secs(1))
+        );
+        assert!(
+            !app.devtools_helper
+                .now_answered_within_its_minute(at + minute),
+            "the minute ends"
+        );
+
+        // Nothing done, and why: the same answers for both forms.
+        let refusals = [
+            (test_arms::declining(), None, Refusal::Declined),
+            (
+                test_arms::opening(),
+                Some(Reading::UNREAD),
+                Refusal::Unknown,
+            ),
+            (
+                test_arms::opening(),
+                Some(test_arms::reading(DevToolGrant::Granted, test_arms::on())),
+                Refusal::Granted,
+            ),
+        ];
+        for (reach, reading, why) in refusals {
+            let mut app = App::headless_for_test();
+            test_arms::stand_in(&mut app, reach);
+            if let Some(reading) = reading {
+                app.devtools_helper
+                    .note_reading(reading, std::time::Instant::now());
+            }
+            for origin in [ASK, NOW] {
+                assert_eq!(ask(&mut app, origin), HandOver::Refused(why), "{origin:?}");
+            }
+            assert!(app.devtools_helper.panel().is_none(), "{why:?}");
+            assert_eq!(app.devtools_helper.queued(), None, "{why:?}");
+        }
+
+        // An ad hoc or dev build: only the bare form is held back.
+        let mut unstable = App::headless_for_test();
+        test_arms::stand_in(&mut unstable, test_arms::unstable());
+        assert_eq!(
+            ask(&mut unstable, ASK),
+            HandOver::Refused(Refusal::Unstable)
+        );
+        assert_eq!(ask(&mut unstable, NOW), HandOver::Shown);
+
+        // Opened 90 s ago: past `now`'s minute, inside the bare form's ten.
+        let mut recent = App::headless_for_test();
+        test_arms::stand_in(
+            &mut recent,
+            test_arms::opened(|window| (90 < window).then_some(90)),
+        );
+        assert_eq!(ask(&mut recent, ASK), HandOver::Refused(Refusal::Recent));
+        assert_eq!(ask(&mut recent, NOW), HandOver::Shown);
+
+        // No panel could be shown: the asker opens the page without it, so
+        // the waiting hand-over ends the same way.
+        let mut unshown = App::headless_for_test();
+        test_arms::stand_in(&mut unshown, test_arms::opening());
+        unshown.devtools_helper =
+            Lane::windowed_for_test(test_arms::opening(), DevToolsHelperArm::inert());
+        unshown.devtools_helper.note_reading(
+            test_arms::reading(DevToolGrant::NotGranted, test_arms::absent(2)),
+            std::time::Instant::now(),
+        );
+        assert_eq!(ask(&mut unshown, ASK), HandOver::Queued);
+        assert_eq!(ask(&mut unshown, NOW), HandOver::Unshown);
+        assert_eq!(unshown.devtools_helper.queued(), None);
     }
 
     /// What a lane step asks of the host: an unchanged re-probe is the owner's

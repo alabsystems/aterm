@@ -1,0 +1,65 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "atpkg-publish"
+# Every test file is a module of the one `publish_suite` binary (declared below); with
+# autotests off, a `tests/*.rs` file listed nowhere never compiles.
+autotests = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "aterm — the atpkg PRODUCER: packs, signs, indexes, mirrors and publishes toolchain packages, and runs the unattended publish lanes. Owner-side; never shipped to clients (docs/DESIGN-atpkg-producer-rust.md)."
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "atpkg-publish"
+path = "src/main.rs"
+# A shim over `atpkg_publish::cli::main_entry`; the suite drives the library.
+test = false
+
+[dependencies]
+# The client. The producer emits the client's own types and verifies with the client's
+# own chain (sig::admit_roster -> authorize_index -> verify_pkg); tree_root, lineage,
+# relocate and the toolchain lease are its library functions, never a copy.
+atpkg = { workspace = true }
+# The signer as a library: `sign`/`pubkey_b64` over the machine key, `verify_signed` for
+# an ALab release's SHA256SUMS, and (tests) `generate` + `roster_ops`.
+atpkg-keys = { workspace = true }
+# The trust anchor (pins::PAPER_MASTER_PUBKEYS, compiled in), the Roster type, and the
+# download host's HEAD/GET.
+aterm-update-core = { workspace = true }
+# The epoch-clock read, and RFC3339 parsing of `valid_until`.
+aterm-time = { workspace = true }
+aterm-types = { workspace = true }
+# The client's TOML parser, for what the typed client structs cannot answer (the head
+# channel's keys, the machine record, a merge base, a seal's trust-version.toml, the
+# lanes' unsigned staged manifests). Published manifests go through the client's verifier.
+aterm-toml = { workspace = true }
+# `spawnfd::command` builds every child, the `zstd` CLI included (clippy.toml bans std's
+# Command); `deadline::output_until` bounds the ones that can hang.
+aterm-uds = { workspace = true }
+# The client's `.tar.zst` decoder and XXH64: each pack the `zstd` CLI writes
+# (artifact::tarwrite) is decoded and checked against the tar stream before it is signed.
+aterm-zstd = { workspace = true }
+# `targo metadata` and `--message-format=json` (artifact::pack), build-local's record,
+# and the publication engine's ledger (`mappings.json`).
+aterm-json = { workspace = true }
+# Scratch dirs: new, mode 0700, random name, removed on drop (a predictable path in a
+# shared /tmp can be pre-created by another user).
+aterm-tempfile = { workspace = true }
+
+[dev-dependencies]
+# The derived `AtpkgIndexPublishWalk` model, whose writer half drives the index's
+# compare-and-swap (tests/channel/).
+aterm-spec = { workspace = true }
+
+[lints]
+workspace = true
+
+[[test]]
+name = "publish_suite"
+path = "tests/publish_suite.rs"

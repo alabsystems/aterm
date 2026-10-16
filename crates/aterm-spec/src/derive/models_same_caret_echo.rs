@@ -145,7 +145,7 @@ pub fn same_caret_typed_echo_model() -> Model {
                 if batch == 1 { admitted <= exact_run && admitted <= tail_fresh
                     && admitted <= prior_blank } else { admitted <= 1 };
             invariant OneCreditPerAdmission: spent == admitted;
-            invariant Bounded:
+            bound Bounded:
                 phase <= 3 && first <= 1 && second <= 1 && printed <= 1
                     && probed <= 1 && owned <= 1 && batch <= 1
                     && exact_run <= 1 && tail_fresh <= 1 && prior_blank <= 1
@@ -266,7 +266,7 @@ pub fn unknown_insert_orphan_key_model() -> Model {
             invariant SiteRequired:
                 if site == 0 { lit == 0 } else { lit <= 2 };
             invariant OneShot: lit + escrow <= queued;
-            invariant Bounded:
+            bound Bounded:
                 phase <= 5 && queued <= 4 && generic <= 3 && site <= 1
                     && escrow <= 2 && exact <= 2 && lit <= 2;
         }

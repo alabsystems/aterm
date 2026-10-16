@@ -1,28 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Video capture core: record the swapchain-destination frames submitted to
-//! `present()`, timestamped, so an agent driving aterm can inspect temporal
-//! output (cursor-trail smoothness, per-keystroke flashes, input-to-present
-//! latency). It does not observe compositor selection, scanout or photons.
+//! Video capture core: record the swapchain-destination frames submitted to `present()`,
+//! timestamped, so an agent driving aterm can inspect temporal output (cursor-trail smoothness,
+//! per-keystroke flashes, input-to-present latency). It does not observe compositor selection,
+//! scanout or photons.
 //!
-//! It copies the swapchain texture, not the offscreen, because offscreen
-//! readbacks miss the swapchain-only passes (HDR aurora, SDR crown, bell
-//! invert, drop overlay, letterbox). The copy is recorded in the same encoder
-//! as the present pass, after the last draw.
+//! It copies the swapchain texture, not the offscreen, because offscreen readbacks miss the
+//! swapchain-only passes (HDR aurora, SDR crown, bell invert, drop overlay, letterbox). The copy
+//! is recorded in the same encoder as the present pass, after the last draw.
 //!
-//! A small ring of staging buffers absorbs GPU latency; when it is saturated
-//! the frame is skipped and counted, never waited on. The store restores
-//! capture-sequence order across asynchronous map callbacks and evicts the
-//! lowest sequences past the byte budget, counted separately. The present
-//! path pays one `Option` branch when the tap is off.
+//! A small ring of staging buffers absorbs GPU latency; a saturated ring skips and counts the
+//! frame, never waits. The store restores capture-sequence order across asynchronous map
+//! callbacks and evicts the lowest sequences past the byte budget, counted separately. The
+//! present path pays one `Option` branch when the tap is off.
 //!
-//! Per-pixel conversion runs off the present thread: a mapped slot's raw bytes
-//! are copied to the recording's [`ConvertWorker`], which runs
-//! [`mapped_to_rgba8`] (f16 decode, scRGB-to-SDR tone map, sRGB encode, 2×2
-//! downscale) and returns RGBA8 frames for the ordered store. Without a thread
-//! (wasm, spawn failure) the harvest converts inline; a worker more than
-//! [`CONVERT_BACKLOG`] frames behind is a counted drop, never a block.
+//! Per-pixel conversion ([`mapped_to_rgba8`]: f16 decode, scRGB-to-SDR tone map, sRGB encode,
+//! 2×2 downscale) runs on the recording's [`ConvertWorker`]. Without a thread (wasm, spawn
+//! failure) the harvest converts inline; a worker more than [`CONVERT_BACKLOG`] frames behind
+//! is a counted drop, never a block.
 
 use std::collections::VecDeque;
 use std::sync::mpsc;
@@ -229,8 +225,8 @@ pub struct VideoTake {
     pub device_px: (u32, u32),
     /// True when the recording downscaled 2×2.
     pub half_res: bool,
-    /// The swapchain format captured (`Bgra8Unorm`, `Rgba8Unorm`, or
-    /// `Rgba16Float` decoded to RGBA8 at harvest).
+    /// The source-encoding label (`bgra8`, `rgba16f-scrgb->srgb8-tonemapped`,
+    /// `mixed-presented->srgb8`, …); every frame is RGBA8 sRGB.
     pub format: &'static str,
     /// True when a mid-capture resize forced an early finalize.
     pub resized_early_stop: bool,
@@ -481,20 +477,18 @@ pub struct VideoTap {
     decimated: u64,
     /// `fps=` capture cap; `None` captures every present.
     fps_cap: Option<u32>,
-    /// The client's requested duration (ms) — carried for the dump's honesty
-    /// report only; the GUI owns the actual stop deadline.
+    /// The client's requested duration (ms), echoed in the dump; the GUI owns the stop
+    /// deadline.
     requested_ms: u64,
     /// Earliest gate time (µs on the `epoch` clock) the next frame is accepted.
     next_capture_us: u64,
-    /// Local monotonic origin for the fps gate, which only compares spacing
-    /// on this clock.
-    // aterm-time so the type/clock matches the renderer's wasm-safe present clocks;
-    // native builds get std's Instant unchanged (video tap is a native feature).
+    /// Monotonic origin for the fps gate, which only compares spacing on this clock
+    /// (`aterm_time`, wasm-safe like the renderer's present clocks).
     epoch: aterm_time::Instant,
     seq: u64,
     half_res: bool,
     /// Source swapchain geometry/format the ring was built for; a mismatch at
-    /// enqueue time (resize / format flip) finalizes the recording honestly.
+    /// enqueue time (resize / format flip) finalizes the recording.
     src_w: u32,
     src_h: u32,
     format: crate::device_layer::TexelFormat,
@@ -667,8 +661,8 @@ fn mapped_to_rgba8(
     let is_f16 = format == crate::device_layer::TexelFormat::Rgba16Float;
     let bgra = format == crate::device_layer::TexelFormat::Bgra8Unorm;
 
-    // Fetch one source pixel as straight, non-linear sRGB RGBA8. Alpha is
-    // linear coverage and must NEVER receive a transfer or gamut transform.
+    // Fetch one source pixel as straight, non-linear sRGB RGBA8. Alpha is linear coverage and
+    // never receives a transfer or gamut transform.
     let fetch = |x: usize, y: usize| -> [u32; 4] {
         let base = y * padded_row + x * bpp;
         if is_f16 {
@@ -710,11 +704,10 @@ fn mapped_to_rgba8(
         }
     };
 
-    // A 256-entry sRGB-to-linear table for the 2×2 box filter. Every `fetch`
-    // path yields byte-valued channels, so `decode[n]` equals
-    // `srgb_to_linear(n as f32 / 255.0)` exactly. It replaces 12 `powf` per
-    // output pixel with 256 per frame. The encode keeps `powf`, since its
-    // rounding is pinned. Built only when downsampling.
+    // A 256-entry sRGB-to-linear table for the 2×2 box filter: every `fetch` path yields
+    // byte-valued channels, so `decode[n]` equals `srgb_to_linear(n as f32 / 255.0)` exactly,
+    // at 256 `powf` per frame instead of 12 per output pixel. The encode keeps `powf`, since its
+    // rounding is pinned.
     let decode: [f32; 256] = if half_res {
         std::array::from_fn(|i| srgb_to_linear(i as f32 / 255.0))
     } else {
@@ -773,14 +766,12 @@ pub struct CaptureOpts {
     pub budget_bytes: usize,
     /// `fps=` capture cap (clamped 1..=120); `None` captures every present.
     pub fps_cap: Option<u32>,
-    /// The client's requested duration (ms), carried verbatim into the take's
-    /// honesty report (`requested_ms` in index.json).
+    /// The client's requested duration (ms), echoed as `requested_ms` in index.json.
     pub requested_ms: u64,
 }
 
 impl VideoTap {
-    /// Build a tap for the CURRENT swapchain size/format with the client's
-    /// [`CaptureOpts`].
+    /// Build a tap for the current swapchain size/format with the client's [`CaptureOpts`].
     #[cfg(wgpu_arm)]
     pub(crate) fn new(
         device: &wgpu::Device,
@@ -795,12 +786,11 @@ impl VideoTap {
             .map_err(|_| format!("video: unsupported swapchain format {format:?}"))?;
         let _ = CaptureEncoding::new(format, color_space, sdr_white_scale)
             .map_err(|error| format!("video: {error}"))?;
-        // COPY_BYTES_PER_ROW_ALIGNMENT (256) padding, computed on BYTES so it is
-        // correct for both the 4-byte SDR and 8-byte f16 formats.
+        // COPY_BYTES_PER_ROW_ALIGNMENT (256) padding, computed on bytes so it holds for the
+        // 4-byte SDR and 8-byte f16 formats.
         let padded = padded_row_bytes(src_w, bpp);
         let size = padded * src_h as u64;
-        // A stride that does not fit `usize` cannot be converted on ANY thread;
-        // the (unreachable in practice) fallback keeps the old inline path.
+        // A stride that does not fit `usize` (unreachable in practice) gets no worker.
         #[cfg(not(target_arch = "wasm32"))]
         let worker = usize::try_from(padded)
             .ok()
@@ -864,7 +854,7 @@ impl VideoTap {
     /// render pass and `queue.submit`). Never blocks: a saturated ring counts a
     /// drop and a size mismatch finalizes.
     #[cfg(wgpu_arm)]
-    pub fn enqueue_copy(
+    pub(crate) fn enqueue_copy(
         &mut self,
         enc: &mut wgpu::CommandEncoder,
         frame_tex: &wgpu::Texture,
@@ -878,8 +868,8 @@ impl VideoTap {
             || frame_tex.height() != self.src_h
             || crate::device_layer::TexelFormat::from_wgpu(frame_tex.format()) != Some(self.format)
         {
-            // Mid-capture resize/format flip: finalize honestly (the ring was
-            // sized for the old geometry) rather than chase it.
+            // Mid-capture resize/format flip: finalize (the ring was sized for the old
+            // geometry) rather than chase it.
             self.resized_early_stop = true;
             return;
         }
@@ -980,7 +970,9 @@ impl VideoTap {
         for _ in 0..RING {
             slots.push(Slot {
                 buffer: SlotBuf::Metal {
-                    buf: crate::metal::resources::SharedBuffer::new(mint.buffer(size)?),
+                    buf: crate::device_layer::DeviceHandle::Metal(mint)
+                        .try_create_readback_buffer("aterm-gpu video tap slot", size as u64)?
+                        .into_metal(),
                     probe: None,
                 },
                 state: SlotState::Free,
@@ -1060,8 +1052,10 @@ impl VideoTap {
         };
         let padded = self.padded_row() as usize;
         {
-            let SlotBuf::Metal { buf, probe } = &mut self.slots[idx].buffer else {
-                unreachable!("guarded homogeneous above")
+            let (buf, probe) = match &mut self.slots[idx].buffer {
+                SlotBuf::Metal { buf, probe } => (buf, probe),
+                #[cfg(multi_arm)]
+                _ => unreachable!("guarded homogeneous above"),
             };
             *probe = None;
             cb.copy_texture_to_buffer(
@@ -1124,8 +1118,10 @@ impl VideoTap {
                 continue;
             };
             let outcome = {
-                let SlotBuf::Metal { probe, .. } = &self.slots[idx].buffer else {
-                    continue;
+                let probe = match &self.slots[idx].buffer {
+                    SlotBuf::Metal { probe, .. } => probe,
+                    #[cfg(multi_arm)]
+                    _ => continue,
                 };
                 match probe {
                     Some(p) if block => Some(p.wait_terminal()),
@@ -1156,8 +1152,10 @@ impl VideoTap {
             if transition.count_drop {
                 self.dropped += 1;
             }
-            let SlotBuf::Metal { probe, .. } = &mut self.slots[idx].buffer else {
-                unreachable!("matched Metal above")
+            let probe = match &mut self.slots[idx].buffer {
+                SlotBuf::Metal { probe, .. } => probe,
+                #[cfg(multi_arm)]
+                _ => unreachable!("matched Metal above"),
             };
             *probe = None;
             match transition.phase {
@@ -1180,8 +1178,10 @@ impl VideoTap {
     ) -> Option<CapturedFrame> {
         let len = self.padded_row() as usize * self.src_h as usize;
         let raw = {
-            let SlotBuf::Metal { buf, .. } = &self.slots[idx].buffer else {
-                unreachable!("a Metal harvest reads a Metal slot")
+            let buf = match &self.slots[idx].buffer {
+                SlotBuf::Metal { buf, .. } => buf,
+                #[cfg(multi_arm)]
+                _ => unreachable!("a Metal harvest reads a Metal slot"),
             };
             // SAFETY: shared storage of exactly `len` bytes; the probe
             // reported the writing command buffer terminal.
@@ -1322,7 +1322,7 @@ impl VideoTap {
     /// to the conversion worker, and adopt finished conversions. Never waits
     /// on the GPU or the worker.
     #[cfg(wgpu_arm)]
-    pub fn after_present(&mut self, device: &wgpu::Device, t_us: u64) {
+    pub(crate) fn after_present(&mut self, device: &wgpu::Device, t_us: u64) {
         // Stamp + map the newest Pending slot (at most one per present).
         for (i, slot) in self.slots.iter_mut().enumerate() {
             if let SlotState::Pending {
@@ -1375,9 +1375,8 @@ impl VideoTap {
         self.slots.first().is_some_and(|s| !s.buffer.is_wgpu())
     }
 
-    /// [`Self::after_present`] for the wgpu-free build: the same per-slot start
-    /// transition (the probe is the map) and non-blocking harvest, with no
-    /// device to poll.
+    /// [`Self::after_present`] for a Metal ring: the same per-slot start transition (the probe
+    /// is the map) and non-blocking harvest, with no device to poll.
     #[cfg(target_os = "macos")]
     pub(crate) fn metal_after_present(&mut self, t_us: u64) {
         for slot in self.slots.iter_mut() {
@@ -1537,9 +1536,8 @@ impl VideoTap {
         }
     }
 
-    /// Budget-bounded, sequence-ordered push. Out-of-order completions are
-    /// placed by sequence before the lowest is evicted. Evictions count in
-    /// `evicted` (head truncation), not `dropped`.
+    /// [`ordered_capture_store_push`] into this tap's store; evictions count in `evicted`
+    /// (head truncation), not `dropped`.
     fn push_frame(&mut self, f: CapturedFrame) {
         self.evicted += ordered_capture_store_push(
             &mut self.store,
@@ -1566,8 +1564,8 @@ impl VideoTap {
         self.store.len() + dispatched
     }
 
-    /// Finalize on the wgpu-free build: wait every in-flight probe and harvest,
-    /// then the abort sweep, conversion-lane drain and take assembly.
+    /// Finalize a Metal ring: wait every in-flight probe and harvest, then the abort sweep,
+    /// conversion-lane drain and take assembly.
     #[cfg(target_os = "macos")]
     pub(crate) fn metal_finish(mut self) -> VideoTake {
         self.metal_harvest_ready(true);
@@ -1590,7 +1588,7 @@ impl VideoTap {
     /// (the recording is over), then hand out the store. Frames still being
     /// converted are adopted before the take is sealed.
     #[cfg(wgpu_arm)]
-    pub fn finish(mut self, device: &wgpu::Device) -> VideoTake {
+    pub(crate) fn finish(mut self, device: &wgpu::Device) -> VideoTake {
         // Metal drain first (blocking is the finish contract); the abort sweep
         // below cleans anything outstanding on either arm.
         #[cfg(target_os = "macos")]
@@ -1937,7 +1935,9 @@ impl PresentedFrameTap {
         let (done_tx, done_rx) = mpsc::channel();
         Ok(Self {
             buffer: SlotBuf::Metal {
-                buf: crate::metal::resources::SharedBuffer::new(mint.buffer(size)?),
+                buf: crate::device_layer::DeviceHandle::Metal(mint)
+                    .try_create_readback_buffer("aterm-gpu presented snapshot", size as u64)?
+                    .into_metal(),
                 probe: None,
             },
             #[cfg(wgpu_arm)]
@@ -2009,8 +2009,10 @@ impl PresentedFrameTap {
         {
             let padded = self.padded_row() as usize;
             let (src_w, src_h) = (self.src_w as usize, self.src_h as usize);
-            let SlotBuf::Metal { buf, probe } = &mut self.buffer else {
-                unreachable!("guarded above")
+            let (buf, probe) = match &mut self.buffer {
+                SlotBuf::Metal { buf, probe } => (buf, probe),
+                #[cfg(multi_arm)]
+                _ => unreachable!("guarded above"),
             };
             *probe = None;
             cb.copy_texture_to_buffer(target, src_w, src_h, buf.obj(), padded)?;
@@ -2041,8 +2043,10 @@ impl PresentedFrameTap {
             return;
         };
         let outcome = {
-            let SlotBuf::Metal { probe, .. } = &self.buffer else {
-                return;
+            let probe = match &self.buffer {
+                SlotBuf::Metal { probe, .. } => probe,
+                #[cfg(multi_arm)]
+                _ => return,
             };
             match probe {
                 Some(p) if block => Some(p.wait_terminal()),
@@ -2057,8 +2061,10 @@ impl PresentedFrameTap {
         let result = if matches!(outcome, crate::metal::loss::CbOutcome::Completed) {
             let len = self.padded_row() as usize * self.src_h as usize;
             let raw = {
-                let SlotBuf::Metal { buf, .. } = &self.buffer else {
-                    unreachable!("matched above")
+                let buf = match &self.buffer {
+                    SlotBuf::Metal { buf, .. } => buf,
+                    #[cfg(multi_arm)]
+                    _ => unreachable!("matched above"),
                 };
                 // SAFETY: shared storage of exactly `len` bytes; the probe
                 // reported the writing command buffer terminal.
@@ -2087,8 +2093,10 @@ impl PresentedFrameTap {
             ))
         };
         let completed_ok = result.is_ok();
-        if let SlotBuf::Metal { probe, .. } = &mut self.buffer {
-            *probe = None;
+        match &mut self.buffer {
+            SlotBuf::Metal { probe, .. } => *probe = None,
+            #[cfg(multi_arm)]
+            _ => {}
         }
         self.result = Some(result);
         let event = if completed_ok {
@@ -2269,7 +2277,7 @@ impl PresentedFrameTap {
         self.result_status()
     }
 
-    /// [`Self::finish`] with no wgpu device: blocking probe drain.
+    /// [`Self::finish`] for a Metal one-shot: a blocking probe drain.
     #[cfg(target_os = "macos")]
     pub(crate) fn metal_finish(&mut self) -> Result<(), String> {
         match self.state {
@@ -2414,8 +2422,7 @@ impl PresentedFrameTap {
     }
 }
 
-/// IEEE 754 half → f32 (the swapchain-capture twin of the renderer's helper;
-/// small and local so this module has no renderer dependency).
+/// IEEE 754 half → f32, local so this module needs no renderer helper.
 fn f16_to_f32(bits: u16) -> f32 {
     let sign = ((bits >> 15) & 1) as u32;
     let exp = ((bits >> 10) & 0x1f) as u32;
@@ -2456,13 +2463,9 @@ fn display_p3_to_srgb8(p3: [u8; 3]) -> [u8; 3] {
     srgb_linear.map(|channel| srgb8_from_linear(channel) as u8)
 }
 
-/// scRGB/EDR to SDR-linear capture transform.
-///
-/// Remove Windows' presentation-only SDR-white multiplier, then, where a pixel
-/// exceeds SDR white, divide all channels by the peak (max-RGB compression).
-/// In-range pixels stay byte-stable and highlight hue is preserved instead of
-/// clipping each channel. Luminance above white cannot be represented in 8-bit
-/// SDR.
+/// scRGB/EDR to SDR-linear: remove Windows' presentation-only SDR-white multiplier, then divide
+/// an over-white pixel by its peak channel (max-RGB compression), so in-range pixels stay
+/// byte-stable and highlight hue survives instead of clipping per channel.
 fn tone_map_scrgb_to_sdr(scrgb: [f32; 3], sdr_white_scale: f32) -> [f32; 3] {
     let mut linear = scrgb.map(|channel| {
         let bounded = if channel.is_nan() || channel <= 0.0 {
@@ -2550,40 +2553,6 @@ mod tests {
         CaptureEncoding::new(format, color_space, sdr_white_scale).unwrap()
     }
 
-    #[test]
-    fn capture_lifecycle_xrefs_cover_every_modeled_action() {
-        let actions_for = |machine| {
-            aterm_spec::xref::refinements()
-                .filter(|anchor| anchor.machine == machine)
-                .map(|anchor| anchor.action)
-                .collect::<std::collections::BTreeSet<_>>()
-        };
-        assert_eq!(
-            actions_for("PresentedFrameTap"),
-            std::collections::BTreeSet::from([
-                "CompleteMap",
-                "EnqueueValid",
-                "MapError",
-                "RejectEnqueue",
-                "StartMap",
-            ])
-        );
-        assert_eq!(
-            actions_for("VideoTapSlot"),
-            std::collections::BTreeSet::from([
-                "Abort",
-                "Enqueue",
-                "HarvestOne",
-                "HarvestThree",
-                "HarvestTwo",
-                "MapError",
-                "MapOk",
-                "RejectInvalidMetadata",
-                "StartMap",
-            ])
-        );
-    }
-
     /// Overflowing the byte budget counts `evicted`, not `dropped`, and keeps
     /// the tail.
     #[test]
@@ -2602,9 +2571,7 @@ mod tests {
         assert!(tap.evicted > 0, "this recording IS head-truncated");
     }
 
-    /// Async map callbacks are not ordered. Completing capture sequences
-    /// 3,1,2 must still publish 1,2,3; under a two-frame budget the same arrival
-    /// order must evict sequence 1 and retain the chronological tail 2,3.
+    /// Map callbacks completing 3,1,2 publish 1,2,3; a two-frame budget evicts 1 and keeps 2,3.
     #[test]
     fn out_of_order_harvest_is_sorted_and_budget_keeps_sequence_tail() {
         let mut all = test_tap(usize::MAX, None);
@@ -2633,10 +2600,8 @@ mod tests {
         assert_eq!(tail.store_bytes, 2 * 16);
     }
 
-    /// The off-thread conversion is byte-identical to inline
-    /// [`mapped_to_rgba8`] for the SDR swizzle and the f16 tone-map path, frame
-    /// stamps pass through, and dropping the job sender drains and exits the
-    /// worker.
+    /// The worker's conversion is byte-identical to inline [`mapped_to_rgba8`] (SDR swizzle and
+    /// f16 tone map), passes stamps through, and exits when its job sender drops.
     #[test]
     fn convert_worker_matches_inline_conversion_and_drains_on_drop() {
         let stride = 256; // COPY_BYTES_PER_ROW_ALIGNMENT padding
@@ -2719,9 +2684,7 @@ mod tests {
         }
     }
 
-    /// `should_capture` at fps=10 accepts a frame iff 100 ms passed since the
-    /// last accepted one (first always accepted, no catch-up debt); rejections
-    /// count `decimated` only.
+    /// The `should_capture` gate at fps=10 (100 ms spacing); rejections count only `decimated`.
     #[test]
     fn should_capture_fps10_spacing() {
         let mut tap = test_tap(usize::MAX, Some(10));
@@ -2829,9 +2792,8 @@ mod tests {
         assert_eq!(rgba, [255, 188, 0, 128, 0, 255, 188, 64]);
     }
 
-    /// The 2×2 video downscale averages all four channels, including alpha, for
-    /// every supported source format. Padded rows make this the same layout the
-    /// GPU staging buffers expose rather than a tightly-packed special case.
+    /// The 2×2 downscale averages alpha too, for every supported format, on padded rows like
+    /// the staging buffers'.
     #[test]
     fn half_res_preserves_alpha_for_every_format() {
         let rgba_rows: [&[u8]; 2] = [

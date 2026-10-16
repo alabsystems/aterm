@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use super::table::{Anchor, VendorSpec, spec};
 use super::version::{BuildDate, Version};
+use crate::manifest::one_digest;
 
 /// The record's schema.
 pub const RECORD_SCHEMA: u32 = 1;
@@ -36,8 +37,14 @@ pub struct VendorRecord {
     pub vendor: String,
     /// The URL the payload was fetched from.
     pub source_url: String,
-    /// The payload's verified sha256 (lowercase hex).
+    /// The payload's verified sha256 (lowercase hex), or empty beside a [`Self::sha512`]:
+    /// a record names exactly one payload digest, under the key of its algorithm.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub sha256: String,
+    /// The payload's verified sha512 (lowercase hex), for a vendor that signs only that;
+    /// empty beside a [`Self::sha256`].
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sha512: String,
     /// The payload's exact size in bytes.
     pub size: u64,
     /// The staged tree's root, folded at stage (lowercase hex).
@@ -99,7 +106,8 @@ impl VendorRecord {
                     .strip_prefix(p)
                     .is_some_and(|rest| !rest.is_empty())
             })
-            && super::is_hex64(&self.sha256)
+            && one_digest(&self.sha256, &self.sha512)
+                .is_some_and(|(alg, hex)| alg.is_lower_hex(hex))
             && super::is_hex64(&self.tree_root)
             && self.size > 0
             && self.apple_team.as_deref() == expected_team(row)
@@ -164,6 +172,7 @@ mod tests {
                 "https://downloads.claude.ai/claude-code-releases/2.1.280/darwin-arm64/claude"
                     .into(),
             sha256: "387a5c5dcdbb815085edf0baf79591f9d8894efe922bceaf3d75b1b08055229d".into(),
+            sha512: String::new(),
             size: 217_254_576,
             tree_root: "0".repeat(64),
             apple_team: team("claude"),
@@ -213,6 +222,70 @@ mod tests {
         };
         let dir = place(&l, "codex", bare.version.build_id(), &bare);
         assert_eq!(read_record(&dir), Some(bare));
+    }
+
+    /// A record names one payload digest under its algorithm's key: an earlier client's sha256
+    /// record reads back and re-serializes byte for byte, a sha512 record has no sha256 key, and
+    /// a record naming both, neither, or a digest of the wrong length or case is refused on
+    /// write and read.
+    #[test]
+    fn a_record_names_its_payload_digest_by_algorithm() {
+        let l = layout("digest");
+        let rec = record();
+        let team = rec
+            .apple_team
+            .as_ref()
+            .map(|t| format!("apple_team = \"{t}\"\n"))
+            .unwrap_or_default();
+        let earlier = format!(
+            "schema = 1\nprogram = \"claude\"\nversion = \"2.1.280\"\nvendor = \"Anthropic\"\n\
+             source_url = \"{url}\"\nsha256 = \"{sha}\"\nsize = 217254576\ntree_root = \"{root}\"\n\
+             {team}anchor = \"anthropic-openpgp\"\nbuild_date = \"2026-09-21T20:55:27Z\"\n\
+             verified_at = 1790000000\n",
+            url = rec.source_url,
+            sha = rec.sha256,
+            root = rec.tree_root,
+        );
+        assert_eq!(
+            String::from_utf8(rec.record_bytes().unwrap()).unwrap(),
+            earlier
+        );
+        let dir = l.build_dir("claude", rec.version.build_id());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(record_path(&dir).unwrap(), &earlier).unwrap();
+        assert_eq!(read_record(&dir), Some(rec.clone()));
+
+        let by_512 = VendorRecord {
+            sha256: String::new(),
+            sha512: "5".repeat(128),
+            ..rec.clone()
+        };
+        let bytes = String::from_utf8(by_512.record_bytes().unwrap()).unwrap();
+        assert!(
+            bytes.contains(&format!("\nsha512 = \"{}\"\n", by_512.sha512)),
+            "{bytes}"
+        );
+        assert!(!bytes.contains("sha256"), "{bytes}");
+        place(&l, "claude", by_512.version.build_id(), &by_512);
+        assert_eq!(read_record(&dir), Some(by_512.clone()));
+
+        for (sha256, sha512) in [
+            (rec.sha256.clone(), by_512.sha512.clone()),
+            (String::new(), String::new()),
+            (String::new(), "5".repeat(64)),
+            (String::new(), "A".repeat(128)),
+            ("5".repeat(128), String::new()),
+        ] {
+            let bad = VendorRecord {
+                sha256,
+                sha512,
+                ..rec.clone()
+            };
+            assert!(bad.record_bytes().is_err(), "{bad:?}");
+            let bytes = super::super::durable::to_toml(&bad, MAX_RECORD_BYTES).unwrap();
+            std::fs::write(record_path(&dir).unwrap(), bytes).unwrap();
+            assert_eq!(read_record(&dir), None, "{bad:?}");
+        }
     }
 
     #[test]

@@ -61,15 +61,14 @@ fn wrap(coalesced: bool, glyph_width: u16, boundary_class: TypedClass) -> Wrappe
     let mut now = Instant::now();
     const ROW: u16 = 20;
     glow.tick(Some((ROW, 2)), now, &cfg, geom, &mut quads);
-    // Fill to the last word boundary of an 80-column composer's 2-cell
-    // inset, using the same public committed-key/observed-caret API as GUI.
+    // Fill to the last word boundary of an 80-column composer's 2-cell inset.
     let prefix_end = 77 - glyph_width;
     for col in 3..=prefix_end {
         now += Duration::from_millis(70);
         glow.note_typed_glyph(now, 1, false, TypedClass::Glyph);
         glow.tick(Some((ROW, col)), now, &cfg, geom, &mut quads);
     }
-    // The suffix is Space plus a one- or two-cell glyph, ending at caret78.
+    // The suffix is Space plus a one- or two-cell glyph, ending at caret 78.
     // The only scheduling difference is whether the Space has its own tick.
     now += Duration::from_millis(70);
     glow.note_typed_glyph(now, 1, false, boundary_class);
@@ -160,11 +159,10 @@ fn the_space_class_is_required_to_relocate_the_word() {
     assert!(plain.contains(&3), "the new key itself still lights");
 }
 
-/// The old row flows into the last cell the wrap kept: on the tick after the
-/// wrap the old row (carried up by the scroll) freezes its fold edge while the
-/// moved Space and glyph are still leaving in its cohort, and the edge is the
-/// last prefix cell (`76 − width`), not the vacated columns' end at 77
-/// (`Ribbon::flow_target`), so no light slides over columns the text left.
+/// On the tick after the wrap the old row (carried up by the scroll) freezes
+/// its fold edge at the last prefix cell (`76 − width`), not the vacated
+/// columns' end at 77 (`Ribbon::flow_target`), while the moved Space and glyph
+/// are still leaving in its cohort: no light slides over columns the text left.
 #[test]
 fn the_old_row_flows_into_the_last_cell_the_wrap_kept() {
     for (coalesced, width) in [(false, 1u16), (true, 1), (true, 2)] {

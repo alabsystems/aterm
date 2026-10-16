@@ -16,13 +16,19 @@
 //!   logging preference was.
 //! * **The log never drops, and never reorders.** Appends go through a
 //!   bounded channel to the writer thread; when the channel is full the
-//!   caller WAITS for a slot (the thread is alive and draining, so the wait
-//!   is one write long) — the ux-first design's drop-on-full was rejected
-//!   because D4 asks for a complete log, and the first cut's write-it-
-//!   yourself fallback was rejected on review (2026-09-22) because it put
-//!   the caller's line on disk AHEAD of the lines still queued, and the
-//!   engine's replay reads a `Retired` line before its `Posted` as a dead
+//!   line waits in an ordered OVERFLOW shared with the worker, which drains
+//!   it after the channel's older jobs without another UI call, so the
+//!   UI thread never waits for a slot — the ux-first design's drop-on-full
+//!   was rejected because D4 asks for a complete log, and the first cut's
+//!   write-it-yourself fallback was rejected on review (2026-09-22) because
+//!   it put the caller's line on disk AHEAD of the lines still queued, and
+//!   the engine's replay reads a `Retired` line before its `Posted` as a dead
 //!   process's open row. Only a dead thread makes the caller write.
+//! * **Every wait on the thread has a deadline** ([`Writer::flush_within`];
+//!   design law L5). A flush lends the waiter's urgency to the thread
+//!   ([`crate::qos::Boost`]) until the thread answers it, so a short bound is
+//!   enough; a miss leaves the lines queued, to land when the thread catches
+//!   up.
 //! * One `write_all` per line, `O_APPEND`. POSIX guarantees atomicity only for
 //!   writes ≤ `PIPE_BUF` on pipes, not on regular files, so line integrity
 //!   comes from the codec's `end=` terminator — a torn line fails to decode
@@ -30,8 +36,8 @@
 //!   the same user (a `--diagnose` beside the GUI) may interleave whole lines;
 //!   the loader keeps both.
 //! * **The handoff.** The parent's record is its own to the end: it keeps
-//!   appending through a pending handoff and [`Writer::flush`]es — every
-//!   queued line on disk — right before it execs the successor (`exec`
+//!   appending through a pending handoff and [`Writer::flush_within`]es —
+//!   every queued line on disk — right before it execs the successor (`exec`
 //!   runs no destructor, so the drop-time join would never happen). The
 //!   successor's drain stays frozen until Commit (`App::sync_messages`), so
 //!   a refused successor writes nothing; after Commit the two records meet
@@ -58,11 +64,13 @@
 //!   id (every line of one record is in one file, in order). Should the wire
 //!   file not open, its lines go to `messages.log`: the log never drops.
 
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, TrySendError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::qos;
 
@@ -91,7 +99,7 @@ pub(crate) const BUDGET: crate::logging::RotationBudget = crate::logging::Rotati
     check_every: std::time::Duration::from_secs(30),
 };
 /// The writer channel's depth: how many lines may wait for the thread before
-/// the caller waits for a slot.
+/// the next ones wait in the writer's overflow.
 pub(crate) const QUEUE_CAP: usize = 512;
 /// The wire's file, beside [`FILE_NAME`] (design ruling 200).
 pub(crate) const WIRE_FILE_NAME: &str = "messages.wire.log";
@@ -304,10 +312,11 @@ fn write_line(files: &Mutex<Files>, line: &str, shelf: Shelf) {
 }
 
 /// What the caller hands the writer thread: a line to append, or a flush
-/// mark the thread answers once every line queued before it is on disk.
+/// mark the thread answers once every line queued before it is on disk —
+/// raised by the flush's [`qos::Boost`] until then.
 enum Job {
     Line(String, Shelf),
-    Flush(mpsc::SyncSender<()>),
+    Flush(mpsc::SyncSender<()>, qos::Boost),
 }
 
 /// The appender: a bounded channel into the `aterm-messages-log` thread,
@@ -316,6 +325,13 @@ enum Job {
 pub(crate) struct Writer {
     /// `None` only during drop, so the receiver sees the channel close.
     tx: Option<mpsc::SyncSender<Job>>,
+    /// Lines the channel had no room for, oldest first: handed over ahead of
+    /// every later line ([`Self::hand_over`]). `overflowed` mirrors its
+    /// length, so an append with nothing to add or hand over costs one load.
+    /// The worker also takes from it, never holding it across a write or a
+    /// wait; each use takes it in place, where the census sees the hold.
+    overflow: Arc<Mutex<VecDeque<(String, Shelf)>>>,
+    overflowed: Arc<AtomicUsize>,
     files: Arc<Mutex<Files>>,
     thread: Option<std::thread::JoinHandle<()>>,
     /// The folder the file lives in — the log dir, where `aterm.log`,
@@ -346,17 +362,55 @@ impl Writer {
             }
         };
         let files = Arc::clone(&writer.files);
+        let overflow = Arc::clone(&writer.overflow);
+        let overflowed = Arc::clone(&writer.overflowed);
         let spawned = std::thread::Builder::new()
             .name("aterm-messages-log".into())
             .spawn(move || {
-                // Nobody is blocked on the record landing: below the
-                // keystroke path, like every other log writer (`crate::qos`).
-                qos::set_self(qos::Role::Background);
-                for job in rx {
+                // The UI takes the same short queue lock, so this follows the
+                // lock-holder floor. No disk I/O or wait holds that lock.
+                qos::set_self(qos::Role::Responsive);
+                loop {
+                    let job = match rx.try_recv() {
+                        Ok(job) => job,
+                        Err(_) => {
+                            let next = {
+                                let mut queued =
+                                    overflow.lock().unwrap_or_else(PoisonError::into_inner);
+                                // Append/flush hand over under this lock too:
+                                // check the channel again before taking an
+                                // overflow line, or a just-enqueued older job
+                                // (including a flush mark) could be overtaken.
+                                match rx.try_recv() {
+                                    Ok(job) => Some(job),
+                                    Err(_) => {
+                                        let line = queued
+                                            .pop_front()
+                                            .map(|(line, shelf)| Job::Line(line, shelf));
+                                        overflowed.store(queued.len(), Ordering::Relaxed);
+                                        line
+                                    }
+                                }
+                            };
+                            match next {
+                                Some(job) => job,
+                                // With neither queue holding a job, only a
+                                // new send can create work. Never keep a
+                                // sender on the worker: closing Writer's
+                                // sender must end this wait and allow join.
+                                None => match rx.recv() {
+                                    Ok(job) => job,
+                                    Err(_) => break,
+                                },
+                            }
+                        }
+                    };
                     match job {
                         Job::Line(line, shelf) => write_line(&files, &line, shelf),
-                        Job::Flush(done) => {
+                        // Answered, then back to this thread's own class.
+                        Job::Flush(done, boost) => {
                             let _ = done.send(());
+                            drop(boost);
                         }
                     }
                 }
@@ -386,6 +440,8 @@ impl Writer {
         Ok((
             Writer {
                 tx: Some(tx),
+                overflow: Arc::new(Mutex::new(VecDeque::new())),
+                overflowed: Arc::new(AtomicUsize::new(0)),
                 files: Arc::new(Mutex::new(Files { host, wire })),
                 thread: None,
                 folder: path.parent().map(Path::to_path_buf),
@@ -418,77 +474,96 @@ impl Writer {
     }
 
     /// Append `lines`, oldest first, in that order on disk, each to its
-    /// shelf's file. `try_send` to
-    /// the thread; on `Full` (the thread is behind) the caller waits for a
-    /// slot — one write long, and no longer than the write-it-yourself
-    /// fallback took under the same file lock — so the file keeps the
-    /// order the engine emitted; on `Disconnected` (the thread died) the
-    /// line is written here, so nothing is dropped.
+    /// shelf's file. `try_send` to the thread; on `Full` (the thread is
+    /// behind) the line waits in the overflow, which the worker drains after
+    /// the channel's older jobs, so the file keeps the order the engine emitted and
+    /// the caller never waits; on `Disconnected` (the thread died) the line is
+    /// written here, after every line the overflow held, so nothing is dropped.
     pub(crate) fn append(&self, lines: &[(LogLine, Shelf)]) {
-        for (line, shelf) in lines {
-            let encoded = encoded(line);
-            if encoded.is_empty() {
-                continue;
-            }
-            let Some(tx) = &self.tx else {
-                write_line(&self.files, &encoded, *shelf);
-                continue;
-            };
-            let job = match tx.try_send(Job::Line(encoded, *shelf)) {
-                Ok(()) => continue,
-                Err(TrySendError::Full(job)) => match tx.send(job) {
-                    Ok(()) => continue,
-                    Err(mpsc::SendError(job)) => job,
-                },
-                Err(TrySendError::Disconnected(job)) => job,
-            };
-            if let Job::Line(line, shelf) = job {
-                write_line(&self.files, &line, shelf);
-            }
-        }
-    }
-
-    /// Wait until every line appended so far is on disk. The parent of a
-    /// seamless handoff calls this right before it execs the successor:
-    /// `exec` runs no destructor, so what the thread still held would die
-    /// with it. A dead thread has nothing queued; nothing to wait for.
-    pub(crate) fn flush(&self) {
-        let Some(tx) = &self.tx else {
+        if lines.is_empty() && self.overflowed.load(Ordering::Relaxed) == 0 {
             return;
-        };
-        let (done, landed) = mpsc::sync_channel::<()>(1);
-        if tx.send(Job::Flush(done)).is_ok() {
-            let _ = landed.recv();
         }
+        let mut queued = self.overflow.lock().unwrap_or_else(PoisonError::into_inner);
+        queued.extend(lines.iter().filter_map(|(line, shelf)| {
+            let encoded = encoded(line);
+            (!encoded.is_empty()).then_some((encoded, *shelf))
+        }));
+        self.hand_over(&mut queued);
     }
 
-    /// [`Self::flush`], waiting no longer than `within` for the lines to land
-    /// — the seamless parent's last write before Commit, which the person
-    /// sits through frozen (design law L5: no wait without a deadline).
-    /// `true` when everything appended so far is on disk; `false` when the
-    /// thread is still behind at the deadline (the lines it holds may die
-    /// with the process — the caller says so).
+    /// Hand `queued` to the thread, oldest first, until the channel is full;
+    /// what is left waits there, in order. A dead thread's lines are written
+    /// here.
+    fn hand_over(&self, queued: &mut VecDeque<(String, Shelf)>) {
+        while let Some((line, shelf)) = queued.pop_front() {
+            let Some(tx) = &self.tx else {
+                write_line(&self.files, &line, shelf);
+                continue;
+            };
+            match tx.try_send(Job::Line(line, shelf)) {
+                Ok(()) => {}
+                Err(TrySendError::Full(job)) => {
+                    if let Job::Line(line, shelf) = job {
+                        queued.push_front((line, shelf));
+                    }
+                    break;
+                }
+                Err(TrySendError::Disconnected(job)) => {
+                    if let Job::Line(line, shelf) = job {
+                        write_line(&self.files, &line, shelf);
+                    }
+                }
+            }
+        }
+        self.overflowed.store(queued.len(), Ordering::Relaxed);
+    }
+
+    /// Wait until every line appended so far is on disk, a minute at most —
+    /// the tests' way to read the file back.
+    #[cfg(test)]
+    pub(crate) fn flush(&self) {
+        assert!(
+            self.flush_within(std::time::Duration::from_secs(60)),
+            "the messages writer landed nothing within a minute"
+        );
+    }
+
+    /// Wait no longer than `within` for every line appended so far to land —
+    /// the record a person's dismissal, an update's start, or the process's
+    /// last write wants on disk before the caller goes on (design law L5: no
+    /// wait without a deadline). The thread runs raised ([`qos::Boost`]) until
+    /// it answers, so a short bound is enough for a thread that is merely
+    /// behind. `true` when everything is on disk; `false` when the thread is
+    /// still behind at the deadline: the lines stay queued and land when it
+    /// catches up — unless the process ends first (an `exec` or `_exit` runs
+    /// no destructor), which the caller says.
     pub(crate) fn flush_within(&self, within: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + within;
         let Some(tx) = &self.tx else {
+            let mut queued = self.overflow.lock().unwrap_or_else(PoisonError::into_inner);
+            self.hand_over(&mut queued);
             return true;
         };
         let (done, landed) = mpsc::sync_channel::<()>(1);
-        let deadline = std::time::Instant::now() + within;
-        // A full channel is a thread behind by a queue's worth: wait for a
-        // slot only until the deadline.
-        let mut job = Job::Flush(done);
+        let mut job = Job::Flush(done, qos::Boost::start(self.thread.as_ref()));
+        // The overflow goes first, then the mark; a full channel is a thread
+        // behind by a queue's worth: wait for a slot only until the deadline.
         loop {
-            match tx.try_send(job) {
-                Ok(()) => break,
-                Err(TrySendError::Disconnected(_)) => return true,
-                Err(TrySendError::Full(back)) => {
-                    if std::time::Instant::now() >= deadline {
-                        return false;
+            {
+                let mut queued = self.overflow.lock().unwrap_or_else(PoisonError::into_inner);
+                self.hand_over(&mut queued);
+                if queued.is_empty() {
+                    match tx.try_send(job) {
+                        Ok(()) => break,
+                        Err(TrySendError::Disconnected(_)) => return true,
+                        Err(TrySendError::Full(back)) => job = back,
                     }
-                    job = back;
-                    std::thread::sleep(std::time::Duration::from_millis(1));
                 }
             }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
         landed
             .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
@@ -497,9 +572,28 @@ impl Writer {
 }
 
 impl Drop for Writer {
-    /// Close the channel, then wait for the thread to write what it holds:
-    /// the lines a process queued in its last moments are its record.
+    /// Hand over what the overflow holds, close the channel, then wait for
+    /// the thread to write what it holds: the lines a process queued in its
+    /// last moments are its record.
     fn drop(&mut self) {
+        // The thread is alive and draining, so a slot comes; with no thread
+        // (a test's stand-in) nothing would ever take one.
+        let attended = self.thread.is_some();
+        let queued =
+            std::mem::take(&mut *self.overflow.lock().unwrap_or_else(PoisonError::into_inner));
+        for (line, shelf) in queued {
+            let job = Job::Line(line, shelf);
+            let refused = match &self.tx {
+                Some(tx) if attended => tx.send(job).err().map(|mpsc::SendError(job)| job),
+                Some(tx) => tx.try_send(job).err().map(|error| match error {
+                    TrySendError::Full(job) | TrySendError::Disconnected(job) => job,
+                }),
+                None => Some(job),
+            };
+            if let Some(Job::Line(line, shelf)) = refused {
+                write_line(&self.files, &line, shelf);
+            }
+        }
         self.tx = None;
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -704,6 +798,90 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A WRITER THAT FALLS BEHIND NEVER HOLDS THE CALLER: with its thread
+    /// paused mid-write (the files lock held, as a disk that stopped
+    /// answering would), four queues' worth of lines are appended at once and
+    /// a bounded flush answers `false` at its deadline; once the thread runs
+    /// again every line lands, none lost and in the order appended.
+    #[test]
+    fn a_paused_writer_holds_no_caller_and_lands_every_line_in_order_after() {
+        let dir = scratch("paused");
+        let path = dir.join(FILE_NAME);
+        let writer = Writer::spawn(&path).expect("a writer over a temp file");
+        let n = 2000u64;
+        let lines: Vec<LogLine> = (1..=n).map(|i| posted(i, &format!("m{i}"))).collect();
+        let mut paused = Some(writer.files.lock().unwrap());
+        let (writer_ref, lines_ref) = (&writer, &lines);
+        std::thread::scope(|scope| {
+            let (appended_tx, appended) = std::sync::mpsc::channel();
+            scope.spawn(move || {
+                writer_ref.append(&host(lines_ref));
+                let _ = appended_tx.send(());
+            });
+            // A hang detector: an append that waits for a slot never returns
+            // while the thread is paused, so the pause is let go before the
+            // failure, or the scope's join would wait on that append forever.
+            if appended
+                .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                .is_err()
+            {
+                drop(paused.take());
+                panic!("the append held its caller while the thread was paused");
+            }
+        });
+        assert!(
+            !writer.flush_within(std::time::Duration::from_millis(20)),
+            "a thread that cannot write misses the bound"
+        );
+        drop(paused);
+        writer.flush();
+        let ids: Vec<u64> = read_lines(&path)
+            .iter()
+            .map(|l| LogLine::decode(l).unwrap().id().unwrap().raw())
+            .collect();
+        assert_eq!(ids, (1..=n).collect::<Vec<_>>(), "every line, in order");
+        drop(writer);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Once a paused disk resumes, the writer lands every accepted line even
+    /// if the UI has gone idle. No append, flush, settle, drop or other kick
+    /// follows the release: only the actual log file witnesses completion.
+    #[test]
+    fn a_recovered_writer_drains_overflow_without_another_ui_call() {
+        let dir = aterm_tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join(FILE_NAME);
+        let writer = Writer::spawn(&path).expect("a writer over a temp file");
+        let n = (QUEUE_CAP * 4) as u64;
+        let lines: Vec<LogLine> = (1..=n).map(|id| posted(id, &format!("m{id}"))).collect();
+        let bytes: u64 = lines.iter().map(|line| encoded(line).len() as u64).sum();
+        let paused = writer.files.lock().unwrap();
+        writer.append(&host(&lines));
+        assert!(
+            writer.overflowed.load(Ordering::Relaxed) > 0,
+            "the real writer could not consume the overflowing burst"
+        );
+        drop(paused);
+
+        let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+        loop {
+            let landed = std::fs::metadata(&path).expect("the actual log").len();
+            if landed >= bytes {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the writer stranded accepted lines after recovery: {landed}/{bytes} bytes"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let ids: Vec<u64> = read_lines(&path)
+            .iter()
+            .map(|line| LogLine::decode(line).unwrap().id().unwrap().raw())
+            .collect();
+        assert_eq!(ids, (1..=n).collect::<Vec<_>>(), "every line, in order");
+    }
+
     /// A budget small enough to rotate in a test: 4 KiB files, a look after
     /// every write.
     const TINY: crate::logging::RotationBudget = crate::logging::RotationBudget {
@@ -778,17 +956,6 @@ mod tests {
         let only_current = load_tail(&path, current_len);
         assert_eq!(only_current.log.len(), 1, "the orphan Retired is ignored");
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The file is `FILE_NAME`, directly under the log dir.
-    #[test]
-    fn the_log_is_written_under_the_log_dir() {
-        let Some(path) = path() else {
-            // No `$HOME` on this worker: nothing to place, nothing to assert.
-            return;
-        };
-        assert_eq!(path.file_name().unwrap(), FILE_NAME);
-        assert_eq!(path.parent(), crate::logging::log_dir().as_deref());
     }
 
     /// REVIEW PIN (Lens B, 2026-09-22), now green: the first cut's

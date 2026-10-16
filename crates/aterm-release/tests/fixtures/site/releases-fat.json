@@ -1,0 +1,67 @@
+[
+  {
+    "tag_name": "v0.63.0",
+    "name": "aterm 0.63.0",
+    "draft": false,
+    "prerelease": false,
+    "published_at": "2026-08-28T03:36:16Z",
+    "html_url": "https://github.com/alabsystems/aterm/releases/tag/v0.63.0",
+    "body": "**aterm** is the batteries-included terminal for AI. New here? What each file is:\n\n- `aterm-0.63.0.dmg` — the full batteries-included install for Apple silicon (~1.1 GB).\n- `aterm-0.63.0-mac.zip` — the same signed, notarized app alone (~26 MB).\n- `.sha256` files verify a download: `shasum -a 256 -c <asset>.sha256`.\n\n---\n\n### Fixed\n\n- **One kitty at a time.** Sometimes a second cat was drawn on top of the\n  cursor companion — two overlapping kitties.\n- **The rainbow has no cyan in it.** Blending green into blue used to pass\n  through a saturated teal.\n\n### Added\n\n- **Backspace, Space and Shift each have their own voice** in the typing\n  music.\n",
+    "assets": [
+      { "name": "aterm-0.63.0-linux-x86_64.tar.gz.sha256", "size": 99 },
+      { "name": "aterm-appcast.toml.sig", "size": 64 },
+      { "name": "aterm-0.63.0-linux-x86_64.tar.gz", "size": 15994454, "browser_download_url": "https://github.com/alabsystems/aterm/releases/download/v0.63.0/aterm-0.63.0-linux-x86_64.tar.gz" },
+      { "name": "aterm-0.63.0-mac.zip", "size": 28219832, "browser_download_url": "https://github.com/alabsystems/aterm/releases/download/v0.63.0/aterm-0.63.0-mac.zip" },
+      { "name": "aterm-0.63.0-mac.zip.sha256", "size": 87, "browser_download_url": "https://github.com/alabsystems/aterm/releases/download/v0.63.0/aterm-0.63.0-mac.zip.sha256" },
+      { "name": "aterm-0.63.0-x86_64.dmg", "size": 921859919, "browser_download_url": "https://github.com/alabsystems/aterm/releases/download/v0.63.0/aterm-0.63.0-x86_64.dmg" },
+      { "name": "aterm-0.63.0.dmg", "size": 1067044990, "browser_download_url": "https://github.com/alabsystems/aterm/releases/download/v0.63.0/aterm-0.63.0.dmg" },
+      { "name": "aterm-appcast.toml", "size": 17533, "browser_download_url": "https://github.com/alabsystems/aterm/releases/download/v0.63.0/aterm-appcast.toml" },
+      { "name": "aterm.dmg", "size": 1067044990, "browser_download_url": "https://github.com/alabsystems/aterm/releases/download/v0.63.0/aterm.dmg" }
+    ]
+  },
+  {
+    "tag_name": "v0.64.0-rc.1",
+    "name": "aterm 0.64.0 rc1",
+    "draft": false,
+    "prerelease": true,
+    "published_at": "2026-08-28T10:00:00Z",
+    "html_url": "https://github.com/alabsystems/aterm/releases/tag/v0.64.0-rc.1",
+    "body": "A pre-release. Never linked, never listed.",
+    "assets": [
+      { "name": "aterm.dmg", "size": 31457280, "browser_download_url": "https://github.com/alabsystems/aterm/releases/download/v0.64.0-rc.1/aterm.dmg" }
+    ]
+  },
+  {
+    "tag_name": "atpkg-index-7",
+    "name": "atpkg index 7",
+    "draft": false,
+    "prerelease": false,
+    "published_at": "2026-08-27T20:00:00Z",
+    "html_url": "https://github.com/alabsystems/aterm/releases/tag/atpkg-index-7",
+    "body": "Machine-readable package index. Not an app release.",
+    "assets": []
+  },
+  {
+    "tag_name": "v0.61.0",
+    "name": "aterm 0.61.0",
+    "draft": false,
+    "prerelease": false,
+    "published_at": "2026-08-26T21:02:03Z",
+    "html_url": "https://github.com/alabsystems/aterm/releases/tag/v0.61.0",
+    "body": "### Changed\n\n- The rainbow advances with your typing, and the highlighter is back behind the text.\n",
+    "assets": [
+      { "name": "aterm-0.61.0-mac.zip", "size": 27000000, "browser_download_url": "https://github.com/alabsystems/aterm/releases/download/v0.61.0/aterm-0.61.0-mac.zip" },
+      { "name": "aterm.dmg", "size": 31000000, "browser_download_url": "https://github.com/alabsystems/aterm/releases/download/v0.61.0/aterm.dmg" }
+    ]
+  },
+  {
+    "tag_name": "v0.60.0",
+    "name": "aterm 0.60.0",
+    "draft": false,
+    "prerelease": false,
+    "published_at": "2026-08-26T17:40:59Z",
+    "html_url": "https://github.com/alabsystems/aterm/releases/tag/v0.60.0",
+    "body": "",
+    "assets": []
+  }
+]

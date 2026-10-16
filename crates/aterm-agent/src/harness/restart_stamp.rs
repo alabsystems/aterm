@@ -1,40 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE EXPLICIT RESTART'S STAMP: `aterm ctl @<sid> restart` writes it BEFORE
-//! it signals the agent, and every reader of that agent's exit recognises the
-//! exit by LOOKUP — never by inference (design of 2026-10-08; the model is
-//! `aterm-spec`'s `HarnessRestartStamp`).
+//! The explicit restart's stamp: `aterm ctl @<sid> restart` writes it before it signals the agent,
+//! so every reader of that agent's exit recognises the exit by lookup, never by inference (model:
+//! `aterm-spec`'s `HarnessRestartStamp`). Other in-place restarts keep their own record
+//! ([`super::relaunch::restarted`]).
 //!
-//! WHY. Round 14 decided whether an exit was the stall remedy's or a
-//! person's from the `signal` verb's record in the instance's memory
-//! (`RemedySent`), kept in the session timeline and spent by a new stall
-//! episode, and four review rounds each found an interleaving it read wrong
-//! (a remedy whose program lived on and was later ended by a person, a stall
-//! that lifted between the loop's read and its signal, the record lost across
-//! a Commit). Every OTHER in-place restart — the live upgrade's, the memory,
-//! model and account restarts — writes its record before its signal and is
-//! found by lookup ([`super::relaunch::restarted`]); the stall remedy was the
-//! one whose record came after its exit. This is that record for it, and for
-//! a person's own `restart`.
+//! One file per tab, `<harness state>/upgrade/asked-<tab>.json`
+//! (`{"pid":…,"start":"…","cause":"stall"|"asked","at":…}`), written by temp-file rename. It names
+//! the process by pid and [`kernel_start`], so only that process's exit matches. It has no `phase`,
+//! so no reader of the upgrade records takes it for one.
 //!
-//! WHAT IT IS. One small file per tab, `<harness state>/upgrade/asked-<tab>.json`
-//! (`{"pid":…,"start":"…","cause":"stall"|"asked","at":…}`), written
-//! atomically (a unique temp file renamed over it), replacing any earlier
-//! stamp of that tab. It names the PROCESS by pid and kernel start in the
-//! spelling the harness's snapshot names an agent ([`kernel_start`],
-//! `relaunch::Snapshot::start`), so only that process's exit matches it. It
-//! has no `phase`, so no reader of the upgrade records (`St::from_json`)
-//! ever takes it for one, and its temp files end `.tmp`.
-//!
-//! WHO READS IT. The host's reader of an agent's exit — the session's worker,
-//! the exit-only worker, a successor's after a Commit — looks it up
-//! ([`lookup`]): a stamp naming the process that left makes the exit the
-//! act's (relaunched on its conversation, a keystroke before it not read as
-//! the person's `/exit`); the relaunch that files the exit's record consumes
-//! it under the sweep lock ([`take_if`]). A stamp whose process is gone and is
-//! not the exit read, or one older than [`super::relaunch::STALE_S`], is
-//! removed by whoever finds it.
+//! A reader of an exit ([`lookup`]) that finds a stamp naming the process makes the exit the act's:
+//! relaunched on its conversation, a keystroke before it not read as the person's `/exit`. The
+//! relaunch that files the exit's record consumes it under the sweep lock ([`take_if`]). A stamp
+//! whose process is gone (and is not the exit being read), or older than
+//! [`super::relaunch::STALE_S`], is removed by whoever finds it.
 
 use std::path::{Path, PathBuf};
 
@@ -43,7 +24,7 @@ use std::path::{Path, PathBuf};
 /// (or a driver's) own ask.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Cause {
-    /// A published stall stood for the process: the stall's remedy (U1).
+    /// A published stall stood for the process: the stall's remedy.
     Stall,
     /// Asked with no stall standing.
     Asked,
@@ -104,9 +85,8 @@ impl Stamp {
         self.age_s(now) > super::relaunch::STALE_S
     }
 
-    /// How long from `now` it still stands — a second short of going
-    /// [`Self::stale`]: what an act's watch may wait for its program
-    /// (`aterm-gui`'s `restart_act::kill`).
+    /// How long from `now` it still stands, a second short of going [`Self::stale`]: what an act's
+    /// watch may wait for its program (`aterm-gui`'s `restart_act::kill`).
     #[must_use]
     pub fn stands_for(&self, now: u64) -> std::time::Duration {
         let stale_at = self.at.saturating_add(super::relaunch::STALE_S);
@@ -150,9 +130,8 @@ pub fn path(state: &Path, tab: &str) -> Option<PathBuf> {
     })
 }
 
-/// Write `stamp` as tab `tab`'s, atomically — a unique temp file renamed
-/// over the stamp — replacing any earlier one. No lock: the rename is the
-/// one write.
+/// Write `stamp` as tab `tab`'s by temp-file rename, replacing any earlier one. No lock: the rename
+/// is the one write.
 ///
 /// # Errors
 /// The tab names no file, or the directory or the file cannot be written.
@@ -177,35 +156,24 @@ pub fn read(state: &Path, tab: &str) -> Option<Stamp> {
     Stamp::from_json(&std::fs::read_to_string(path(state, tab)?).ok()?)
 }
 
-/// THE STAMP STANDING FOR the process `pid` started at `start` in tab
-/// `tab`, at `now` (unix seconds): the tab's stamp when it names that
-/// process and is no older than [`super::relaunch::STALE_S`] — the one a
-/// reader of that process's exit would find ([`lookup`]). An act finds it
-/// BEFORE it writes: an act on that very process is already in flight, and
-/// the new one joins it — never rewriting it before its own signal, never
-/// taking it back (review of 3eaa8f83c: a second act that replaced the
-/// first's stamp and then sent nothing took back the only stamp the first
-/// act's exit had). Once the joining act's `SIGTERM` is sent it writes the
-/// stamp again with its own time, the cause kept (`aterm-gui`'s
-/// `restart_act::renew`, ruling 18 of 2026-10-08), so its escalation has
-/// the stamp's whole life to send its `SIGKILL` in.
+/// The stamp standing for process `pid` started at `start` in tab `tab` at `now`: the tab's stamp
+/// when it names that process and is not [`Stamp::stale`]. An act looks for it before it writes:
+/// one found means an act on that process is in flight, and the new one joins it, never rewriting
+/// the stamp before its own signal nor taking it back (the first act's exit has only that stamp).
+/// Once the joining act's `SIGTERM` is sent it rewrites the stamp with its own time, cause kept
+/// (`aterm-gui`'s `restart_act::renew`), so its escalation has the stamp's whole life for
+/// `SIGKILL`.
 #[must_use]
 pub fn standing(state: &Path, tab: &str, pid: u32, start: &str, now: u64) -> Option<Stamp> {
     read(state, tab).filter(|s| !s.stale(now) && s.names(pid, start))
 }
 
-/// TAKE tab `tab`'s stamp when `ours` says it is the one meant. It is
-/// JUDGED WHERE IT STANDS (the review of ruling 21, 2026-10-14): a stamp that
-/// is not the taker's is never moved, so a reader of the tab's stamp — the
-/// act's watch reads it on every look (`aterm-gui`'s
-/// `restart_act::Watch::named`) — never finds it missing because another
-/// snapshot's relaunch judged it; moved aside to judge it, it was missing
-/// for that moment, and a watch that looked then let its program go for
-/// good. The one judged ours is moved aside (one rename), read again, and
-/// removed — or, a newer stamp having replaced it between the look and the
-/// rename, that one is put back (a hard link, which never replaces a stamp
-/// written meanwhile). A stamp written while this runs is never removed by
-/// it.
+/// Take tab `tab`'s stamp when `ours` says it is the one meant. It is judged in place, so a stamp
+/// that is not the taker's is never moved and a watch reading the tab's stamp
+/// (`aterm-gui`'s `restart_act::Watch::named`) never finds it missing and lets its program go. The
+/// one judged ours is moved aside (one rename), read again and removed; if a newer stamp replaced
+/// it between the look and the rename, that one is put back by hard link, which never replaces a
+/// stamp written meanwhile.
 pub fn take_if(state: &Path, tab: &str, ours: impl FnOnce(&Stamp) -> bool) -> Option<Stamp> {
     let path = path(state, tab)?;
     let judged = read(state, tab).filter(ours)?;
@@ -222,11 +190,10 @@ pub fn take_if(state: &Path, tab: &str, ours: impl FnOnce(&Stamp) -> bool) -> Op
     stamp.filter(|_| mine)
 }
 
-/// THE READER'S LOOKUP for the exit of the process `pid` started at `start`
-/// in tab `tab`, at `now` (unix seconds): the cause of a stamp naming it —
-/// the exit is the act's — else `None`. A stamp older than
-/// [`super::relaunch::STALE_S`], or one naming a process that is gone (not
-/// this exit's), is removed as it is found ([`take_if`]: never a newer one).
+/// The reader's lookup for the exit of process `pid` started at `start` in tab `tab`, at `now`
+/// (Unix seconds): the cause of a stamp naming it (the exit is the act's), else `None`. A stale
+/// stamp, or one naming a process that is gone (not this exit's), is removed as it is found
+/// ([`take_if`]: never a newer one).
 #[must_use]
 pub fn lookup(state: &Path, tab: &str, pid: u32, start: &str, now: u64) -> Option<Cause> {
     let stamp = read(state, tab)?;
@@ -239,20 +206,13 @@ pub fn lookup(state: &Path, tab: &str, pid: u32, start: &str, now: u64) -> Optio
     None
 }
 
-/// THE PRUNE of the stamp file `name` (a file name in `<state>/upgrade`) at
-/// `now`: removed when it is a stamp gone [`Stamp::stale`] — no reader takes
-/// it for an act's any more — whatever its process ([`take_if`]: never a
-/// newer one). Whether `name` is a stamp's file at all. The upgrade lane's
-/// prune runs it under its sweep lock for every file in the directory
-/// whenever an upgrade step runs (`upgrade_drive::prune_states`, from
-/// `claude_pass`) — not on a timer (review of 1a733ed60, which corrected
-/// "periodic"): the reader's [`lookup`] sweeps only its own tab, so a stamp
-/// whose tab closed, or whose relaunch never filed, was left for good
-/// (review of 3eaa8f83c). How long a stale stamp lives decides only litter:
-/// no reader takes it for an act's, and no act's watch or carrier ends its
-/// program (`aterm-gui`'s `restart_act::kill` and `carry`). A stamp still
-/// standing is kept, even naming a process that is gone: its exit may not
-/// have been read yet.
+/// Prune the stamp file `name` (a file name in `<state>/upgrade`) at `now`: removed when it is a
+/// stamp gone [`Stamp::stale`], whatever its process ([`take_if`]: never a newer one). Returns
+/// whether `name` is a stamp's file at all. The upgrade lane runs it under its sweep lock over the
+/// whole directory whenever an upgrade step runs (`upgrade_drive::prune_states`), since [`lookup`]
+/// sweeps only its own tab and a stamp whose tab closed would otherwise stay for good. A stale
+/// stamp's lifetime decides only litter: no reader or act's watch acts on it. A stamp still
+/// standing is kept even naming a gone process: its exit may not have been read yet.
 pub fn prune(state: &Path, name: &str, now: u64) -> bool {
     let Some(tab) = name
         .strip_prefix(FILE_PREFIX)
@@ -269,18 +229,14 @@ pub fn prune(state: &Path, name: &str, now: u64) -> bool {
 /// A stamp's file name, before its tab key: `asked-<tab>.json`.
 const FILE_PREFIX: &str = "asked-";
 
-/// The kernel's start time of `pid` in the spelling the harness's snapshot
-/// names an agent by (`relaunch::Snapshot::start`: `ps -o lstart=` in UTC
-/// and the C locale, whitespace squashed), so a stamp and a snapshot of the
-/// same process compare equal. `None` when it cannot be read — on macOS a
-/// zombie or another uid's process too.
+/// The kernel's start time of `pid` in the spelling the harness's snapshot names an agent by
+/// (`relaunch::Snapshot::start`: `ps -o lstart=` in UTC and the C locale, whitespace squashed), so
+/// a stamp and a snapshot of the same process compare equal. `None` when it cannot be read (on
+/// macOS also a zombie or another uid's process).
 ///
-/// On macOS it is the kernel's own record, read by syscall
-/// (`proc_pidinfo`, [`aterm_uds::process::read_process_birth`]) and spelled
-/// by [`super::footer::lstart_utc`] — what round fourteen's record read: no
-/// `ps` is spawned for each of the act's reads (review of 3eaa8f83c), and
-/// a `ps` that could not be spawned under memory pressure — exactly when an
-/// agent freezes — is never read as the leader having moved. Elsewhere `ps`.
+/// On macOS it is read by syscall ([`aterm_uds::process::read_process_birth`]) and spelled by
+/// [`super::footer::lstart_utc`]: no `ps` per read, and a `ps` that cannot spawn under memory
+/// pressure (just when an agent freezes) is never read as the leader having moved. Elsewhere `ps`.
 #[must_use]
 pub fn kernel_start(pid: u32) -> Option<String> {
     #[cfg(target_vendor = "apple")]

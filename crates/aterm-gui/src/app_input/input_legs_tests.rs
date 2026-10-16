@@ -1,12 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE INPUT LEGS the typing audit named as unmeasured
-//! (docs/AUDIT-typing-to-pixels-2026-08-26.md, P1 "measure the matching key
-//! and matching frame"): the output → redraw-request span and the IME
-//! preedit → commit clock. (The third, a key deferred behind a paste arming
-//! the echo clock, rides the ordered writer and is pinned with it in
-//! `egress_contract_tests`.)
+//! The input legs the typing audit named as unmeasured
+//! (docs/AUDIT-typing-to-pixels-2026-08-26.md, P1): the output → redraw-request
+//! span and the IME preedit → commit clock. The third, a key deferred behind a
+//! paste arming the echo clock, is pinned in `egress_contract_tests`.
 
 use crate::WindowId;
 use std::sync::atomic::Ordering;
@@ -19,10 +17,10 @@ fn close_pipe(pipe: [i32; 2]) {
     }
 }
 
-/// OUTPUT → REDRAW REQUEST (typing audit P1): the leg from a burst's leading
-/// edge to the turn that admits its redraw is booked once per burst — a
-/// second wake for the same unpresented burst books nothing, a new burst
-/// books again — and a stamp older than the honesty cap is never booked.
+/// The output → redraw-request span (a burst's leading edge to the turn that
+/// admits its redraw) is booked once per burst: a second wake for the same
+/// unpresented burst books nothing, a new burst books again, and a stamp older
+/// than the honesty cap is never booked.
 #[test]
 fn the_output_to_redraw_request_span_is_booked_once_per_burst() {
     let (mut app, _sink, pipe) = super::typed_kitty_summon_tests::app_with_private_pty();
@@ -74,11 +72,10 @@ fn the_output_to_redraw_request_span_is_booked_once_per_burst() {
     close_pipe(pipe);
 }
 
-/// THE IME COMPOSITION CLOCK (typing audit P1): a composition is timed from
-/// its first marked character to its commit, through the cleared preedit
-/// platforms send just before committing; a composition that is cleared and
-/// then replaced by a new one without a commit counts as cancelled; an empty
-/// commit books no duration.
+/// A composition is timed from its first marked character to its commit,
+/// through the cleared preedit platforms send just before committing; one
+/// cleared and replaced by a new one without a commit counts as cancelled; an
+/// empty commit books no duration.
 #[test]
 fn the_ime_clock_times_preedit_to_commit_and_counts_cancels() {
     let (mut app, _sink, pipe) = super::typed_kitty_summon_tests::app_with_private_pty();

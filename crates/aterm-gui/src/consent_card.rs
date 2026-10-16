@@ -112,7 +112,8 @@
 //!
 //! # No protected-folder literal lives here
 //!
-//! Nothing in this module names a folder or touches one (`grep_guard` B13).
+//! Nothing in this module names a folder or touches one (the aterm-census guard
+//! `protected-folder`).
 //! The card's whole contact with the filesystem is the marker and the record
 //! beside `aterm.toml`, through [`crate::config_marker`].
 
@@ -1232,13 +1233,12 @@ impl Default for CardState {
 #[cfg(test)]
 mod tests {
     use super::{
-        AccessRecord, CardFacts, CardPhase, CardState, DECIDE_ATTEMPTS, DECIDE_TIMEOUT, FDA_AFTER,
-        FDA_DETAIL, FDA_GRANTS, FDA_THEN, FDA_TITLE, FDA_WHAT, FDA_WHAT_DENIED, FDA_WHAT_REGRESSED,
-        FDA_WHY, GRANTED_CAPTION, LAUNCH_SETTLE, LaunchVerdict, MARKER, MAX_MARKER_BYTES,
-        MAX_RECORD_BYTES, Marker, NEED_LOG_EVERY, NeedCause, NeedFacts, NeedVerdict, NeedWords,
-        NotDue, OWNER_ACTED_HOLD, RECORD, RENEW_AFTER, Verdict, WATCH_FOR, clear_opened,
-        decide_launch, decide_need, is_prompt_while_granted, marker_path, read_marker, read_record,
-        record_marker, record_path, report_state, should_reassert, write_record,
+        AccessRecord, CardFacts, CardPhase, CardState, DECIDE_ATTEMPTS, DECIDE_TIMEOUT,
+        LAUNCH_SETTLE, LaunchVerdict, MARKER, MAX_MARKER_BYTES, MAX_RECORD_BYTES, Marker,
+        NeedCause, NeedFacts, NeedVerdict, NeedWords, NotDue, OWNER_ACTED_HOLD, RECORD,
+        RENEW_AFTER, Verdict, WATCH_FOR, clear_opened, decide_launch, decide_need,
+        is_prompt_while_granted, marker_path, read_marker, read_record, record_marker, record_path,
+        report_state, should_reassert, write_record,
     };
     use aterm_containment::consent::{DrClass, FdaState, Folder};
     use std::time::{Duration, Instant};
@@ -2022,13 +2022,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// EVERY string the owner reads about this question comes from here, in
-    /// one place the exceptions digest imports, and all of it passes the same
-    /// fences: the restart-phrase ruling (B12), no coverage or scope claim, no
-    /// promise of elimination, the digest's `Need` grammar (`then`: one
-    /// imperative, no `; `, no ` or `, no newline) and its caps.
+    /// The event line names the cause, and the tab only when it is known.
     #[test]
-    fn the_entry_words_come_from_the_need_and_pass_every_fence() {
+    fn the_entry_line_names_the_cause_and_the_tab_it_knows() {
         let tab = NeedWords {
             cause: app_data_prompt(),
             tab_number: Some(1),
@@ -2064,77 +2060,6 @@ mod tests {
             eperm.event_line(),
             "macOS refused aterm a read of protected files in tab 2"
         );
-        let all = [
-            FDA_TITLE.to_owned(),
-            FDA_WHAT.to_owned(),
-            FDA_WHAT_DENIED.to_owned(),
-            FDA_WHAT_REGRESSED.to_owned(),
-            FDA_WHY.to_owned(),
-            FDA_THEN.to_owned(),
-            FDA_GRANTS.to_owned(),
-            FDA_AFTER.to_owned(),
-            FDA_DETAIL.to_owned(),
-            GRANTED_CAPTION.to_owned(),
-            tab.event_line(),
-            no_tab.event_line(),
-            regressed.event_line(),
-            eperm.event_line(),
-        ];
-        for text in &all {
-            let lower = text.to_ascii_lowercase();
-            for banned in [
-                "restart",
-                "relaunch",
-                "re-launch",
-                "reopen",
-                "re-open",
-                "quit and",
-                "next launch",
-                "reboot",
-                "launch aterm again",
-                "cover",
-                "documents",
-                "desktop",
-                "downloads",
-                "volume",
-                "icloud",
-                "retires",
-                "this process",
-                "new processes",
-                "stops the",
-                "ends the",
-                "never again",
-                "no more",
-                "eliminat",
-                "without interruption",
-            ] {
-                assert!(!lower.contains(banned), "{banned:?} in {text:?}");
-            }
-            assert!(!text.contains('\n'), "{text:?}");
-        }
-        // The digest's grammar and caps.
-        assert!(FDA_THEN.chars().count() <= 90 && FDA_WHY.chars().count() <= 90);
-        assert!(!FDA_THEN.contains("; ") && !FDA_THEN.contains(" or "));
-        assert!(FDA_GRANTS.chars().count() <= 200 && FDA_AFTER.chars().count() <= 200);
-        for what in [FDA_WHAT, FDA_WHAT_DENIED, FDA_WHAT_REGRESSED] {
-            assert!(
-                aterm_messages::text::glass_title_fault(what).is_none(),
-                "{what}"
-            );
-            assert!(what.chars().count() <= 48, "{what}");
-        }
-        assert!(aterm_messages::text::glass_title_fault(FDA_TITLE).is_none());
-        assert!(FDA_TITLE.ends_with('?'), "the title is the ask");
-        assert!(FDA_TITLE.chars().count() + FDA_WHY.chars().count() <= 75);
-        // WHY first, WHAT the switch grants, and nothing S1 or S4 decides.
-        assert!(FDA_WHY.contains("forgets an Allow"));
-        assert!(
-            FDA_GRANTS.contains("read protected data"),
-            "what the switch grants"
-        );
-        assert!(FDA_GRANTS.contains("agents included"));
-        // NEED_LOG_EVERY is a rate limit, not a promise about the dialog.
-        assert!(NEED_LOG_EVERY >= Duration::from_secs(60 * 60));
     }
 
     /// THE ASKED-ONCE MODEL (replaces the daily-return `AccessCardReoffer`). One

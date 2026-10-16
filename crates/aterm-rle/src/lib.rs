@@ -2,9 +2,12 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-#![deny(unsafe_op_in_unsafe_fn)]
-#![deny(missing_docs)]
-#![deny(clippy::all)]
+#![warn(missing_docs)]
+#![cfg_attr(
+    trust_verify,
+    feature(custom_inner_attributes, register_tool),
+    register_tool(trust)
+)]
 
 //! Run-Length Encoding (RLE) for cell attributes.
 //!

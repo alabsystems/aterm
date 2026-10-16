@@ -440,7 +440,7 @@ fn output_wake_redraw_admission_is_o_visible_windows_at_any_session_count() {
 /// `ActiveEventLoop` cannot be manufactured in a headless unit test. Pin
 /// the event arm's sequencing directly: a future cleanup must not move
 /// optional work back in front of redraw admission, or move subscriber
-/// notification ahead of the status/title it is meant to publish.
+/// notification ahead of the status it is meant to publish.
 #[test]
 fn output_wake_admits_redraw_before_bookkeeping_and_preserves_publication_order() {
     let source = include_str!("lib.rs");
@@ -466,7 +466,6 @@ fn output_wake_admits_redraw_before_bookkeeping_and_preserves_publication_order(
         "s.output_wake_pending.store(0, Ordering::Relaxed)",
         "self.admit_output_redraws(session, now)",
         "self.observe_session_statuses(now)",
-        "self.note_title_activity(session)",
         "self.subscribers.any()",
         "self.search_refresh_for_output(session)",
         "self.observe_title_drift(session, now)",

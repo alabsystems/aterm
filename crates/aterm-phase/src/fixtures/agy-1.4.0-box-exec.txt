@@ -1,0 +1,23 @@
+# agy 1.4.0 · MEASURED 2026-10-16, `aterm ctl text --json` of a private headless aterm 120x40 (aterm 0.105.0 098c216c7), the atpkg-managed agy (Google latest) launched through its shim under the owner's signed-in account (Gemini 4 Argon, medium), scratch ATERM_STATE_HOME/XDG dirs, harness off · a shell-command approval: a `● Ran (touch x.txt)` row drawn before the decision, the `Command` title (bold f1fa8c) over a full rule, `Requesting permission for:` and the command, `Run this command?`, four numbered options (`> 1. Yes, run command` selected, 5c5cff; 2 = allow in this conversation for `touch` prefixes; 3 = allow and persist to settings.json; 4 = `No, cancel`), the key row `↑/↓ Navigate · tab Amend · ctrl+g edit/expand command`, footer `esc to cancel`; the composer is gone and the cursor hidden; digit 1 approves at once · cursor=21,0 (hidden) · account and scratch path redacted at equal length
+────────────────────────────────────────────────────────────
+> Write 600 words about the history of lighthouses. No tools.
+
+────────────────────────────────────────────────────────────
+> Use your shell tool to run exactly: touch x.txt
+
+● Ran (touch x.txt) (ctrl+o to expand)
+
+Command
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+Requesting permission for:
+   touch x.txt
+
+Run this command?
+> 1. Yes, run command
+  2. Yes, and always allow in this conversation for commands that start with 'touch'
+  3. Yes, and always allow for commands that start with 'touch' (Persist to settings.json)
+  4. No, cancel
+
+  ↑/↓ Navigate · tab Amend · ctrl+g edit/expand command
+esc to cancel                                                                                    Gemini 4 Argon · medium

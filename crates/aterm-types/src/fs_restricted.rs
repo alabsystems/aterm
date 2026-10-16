@@ -2,16 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Filesystem helpers with restricted permissions (mode 0o700).
-//!
-//! Canonical implementation shared across all crates (CWE-276, #5815).
+//! Filesystem helpers with restricted permissions (mode 0o700; CWE-276).
 
 use std::io;
 use std::path::Path;
 
-/// Create a directory (and parents) with mode 0o700 on Unix.
-///
-/// On non-Unix platforms, falls back to `create_dir_all` (no mode bits).
+/// Create a directory (and parents) with mode 0o700 on Unix; elsewhere plain `create_dir_all`.
 pub fn create_dir_restricted(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -25,25 +21,19 @@ pub fn create_dir_restricted(path: &Path) -> io::Result<()> {
     }
 }
 
-/// Create `dir` (and parents) if absent, force its mode to `0700`, and VERIFY
-/// it is owned by us and not group/other-writable before returning success —
-/// the control socket's private-dir rule (`ensure_private_dir` in aterm-gui's
-/// `control_auth_unix`), shared here so the session-identity tree
-/// (`<state>/identities/<name>/`) is provisioned under the same fail-closed
-/// gate: forcing the mode is not enough on its own, because a directory
-/// another user pre-created keeps its owner through `set_permissions`, and
-/// that user could still swap files in. Idempotent: an existing 0700 dir of
-/// ours is simply verified. Non-Unix: create only (no mode bits to verify).
+/// Create `dir` (and parents) if absent, force mode `0700`, and verify it is ours and not
+/// group/other-writable: the control socket's private-dir rule, shared by the session-identity
+/// tree. Forcing the mode alone is not enough, because a directory another user pre-created
+/// keeps its owner. Idempotent. Non-Unix: create only.
 pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
     create_dir_restricted(dir)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        // Only a mode that is not already `0700` is written: a `chmod(2)` to the
-        // mode a directory already has still moves its `st_ctime` (APFS), and
-        // tippy aborts when an ancestor of its executable changes ctime mid-run
-        // (aterm-update-core's privatedir.rs keeps the same rule). The stat
-        // below still proves the final mode.
+        // Write the mode only when it differs: a same-mode `chmod(2)` still moves `st_ctime`
+        // on APFS, and tippy fails when an ancestor of its executable changes ctime mid-run
+        // (`~/Library/Application Support/aterm` holds the atpkg store). aterm-update-core's
+        // privatedir.rs keeps the same rule.
         if !std::fs::metadata(dir).is_ok_and(|m| m.mode() & 0o7777 == 0o700) {
             std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
         }
@@ -74,16 +64,10 @@ unsafe extern "C" {
     fn libc_getuid() -> u32;
 }
 
-/// Pure predicate: may the caller (`uid`) write private files into a
-/// directory owned by `owner_uid` with permission bits `mode` (`st_mode`)?
-///
-/// Safe means owned by the caller AND not writable by group or other: a
-/// directory another local user can write into lets them swap the target for
-/// a symlink between our check and our write, or pre-create the file
-/// (CWE-379). Group/other READ bits are the caller's own business — an
-/// explicit 0755 home subdir is honoured; /tmp (root-owned, world-writable,
-/// sticky) is not. Hosts stat the directory and pass the bits in; the
-/// decision itself stays platform-free and testable.
+/// Whether the caller (`uid`) may write private files into a directory owned by `owner_uid`
+/// with `st_mode` bits `mode`: owned by the caller and not group/other-writable. A directory
+/// another user can write into lets them swap in a symlink or pre-create the file (CWE-379);
+/// read bits are the caller's business (a 0755 home subdir passes, /tmp does not).
 #[must_use]
 pub fn dir_safe_for_private_write(uid: u32, owner_uid: u32, mode: u32) -> bool {
     owner_uid == uid && mode & 0o022 == 0
@@ -96,7 +80,7 @@ mod tests {
     #[test]
     fn private_write_accepts_owned_unwritable_by_others() {
         assert!(dir_safe_for_private_write(501, 501, 0o040700));
-        // Group/other read is the caller's choice; only WRITE is fatal.
+        // Group/other read is the caller's choice; only write is fatal.
         assert!(dir_safe_for_private_write(501, 501, 0o040755));
         assert!(dir_safe_for_private_write(0, 0, 0o040700));
     }
@@ -108,9 +92,8 @@ mod tests {
         assert!(!dir_safe_for_private_write(501, 502, 0o040700));
     }
 
-    /// `ensure_private_dir` creates 0700 (parents included), tightens a looser
-    /// existing dir of ours to 0700, and is idempotent — the provisioning every
-    /// identity dir and agent subdir goes through.
+    /// `ensure_private_dir` creates 0700 (parents included), tightens a looser dir of ours, and
+    /// is idempotent.
     #[cfg(unix)]
     #[test]
     fn ensure_private_dir_creates_0700_tightens_and_is_idempotent() {
@@ -144,12 +127,8 @@ mod tests {
         assert!(!dir_safe_for_private_write(501, 501, 0o040722));
     }
 
-    /// A directory already `0700` and ours is left EXACTLY alone — no `chmod(2)`,
-    /// so its `st_ctime` does not move — while a drifted mode is still forced back
-    /// to `0700`. A same-mode chmod moves the ctime on APFS, and tippy snapshots the
-    /// ctime of every ancestor of the executable it runs and aborts on a change
-    /// ("ancestor … changed identity or contents"), and
-    /// `~/Library/Application Support/aterm` is an ancestor of the atpkg store.
+    /// An already-`0700` directory of ours gets no `chmod(2)`, so its `st_ctime` holds; a
+    /// drifted mode is still forced back to `0700`.
     #[cfg(unix)]
     #[test]
     fn an_already_private_dir_keeps_its_ctime_and_a_drifted_one_is_hardened() {

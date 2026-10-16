@@ -100,6 +100,11 @@ pub(crate) fn trim(s: &str) -> &str {
     trim_end(trim_start(s))
 }
 
+/// `s.trim().is_empty()`: a blank row.
+pub(crate) fn blank(s: &str) -> bool {
+    trim(s).is_empty()
+}
+
 /// `s.find(needle)`: each byte that opens the needle compared, the rest
 /// skipped one at a time. A match starts on the needle's first byte, which
 /// opens a char, so it is the char boundary `str::find` names.
@@ -137,20 +142,36 @@ pub(crate) fn leading_space_chars(s: &str) -> usize {
     chars
 }
 
-/// The screens the byte readings are checked on against the char readings
-/// they replace: every fixture file under `src/fixtures/`, as its rows, and
-/// the rows the reader's anchors make alone.
+/// Every fixture file under `src/fixtures/` as `(its file name, its text)`,
+/// in name order: the tests that hold one program's reader to every other
+/// program's screens read the program off the name (`agy-…`, `codex-…`).
 #[cfg(test)]
-pub(crate) fn fixture_screens() -> Vec<Vec<String>> {
+pub(crate) fn fixture_files() -> Vec<(String, String)> {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/fixtures");
     let mut paths: Vec<_> = std::fs::read_dir(&dir)
         .expect("the fixtures")
         .map(|e| e.expect("a fixture").path())
         .collect();
     paths.sort();
-    let mut screens: Vec<Vec<String>> = paths
+    paths
         .iter()
-        .map(|p| crate::prompt::fixtures::screen(&std::fs::read_to_string(p).expect("a fixture")))
+        .map(|p| {
+            let name = p
+                .file_name()
+                .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+            (name, std::fs::read_to_string(p).expect("a fixture"))
+        })
+        .collect()
+}
+
+/// The screens the byte readings are checked on against the char readings
+/// they replace: every fixture file under `src/fixtures/`, as its rows, and
+/// the rows the reader's anchors make alone.
+#[cfg(test)]
+pub(crate) fn fixture_screens() -> Vec<Vec<String>> {
+    let mut screens: Vec<Vec<String>> = fixture_files()
+        .iter()
+        .map(|(_, text)| crate::prompt::fixtures::screen(text))
         .collect();
     screens.push(
         [

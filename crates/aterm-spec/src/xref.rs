@@ -4,42 +4,31 @@
 
 //! The compiler-collectable source↔spec cross-reference (TRUST_NATIVE_TLA, §2).
 //!
-//! This is the runtime backing for the no-longer-decorative `#[refines]`,
-//! `#[spec_unmodeled]`, and `#[spec_invariant]` attribute macros. Each macro now
-//! emits an `inventory::submit!` of a record into a distributed slice, so the FULL
-//! set of source↔spec bindings is collectable at test/compile time WITHOUT scanning
-//! source text — the standard `inventory` pattern.
+//! `#[refines]`, `#[spec_unmodeled]` and `#[spec_invariant]` each emit a
+//! [`registry::submit!`](crate::registry::submit) of a record, so the full set of source↔spec
+//! bindings is collectable without scanning source text.
 //!
-//! Two halves meet here:
-//!   * **Source → spec**: [`RefinementAnchor`] / [`Waiver`] / [`InvariantAnchor`]
-//!     records, submitted by the attribute macros, collected via [`refinements`],
-//!     [`waivers`], [`invariant_anchors`].
-//!   * **Spec → source**: the embedded [`Model`](crate::derive::Model) registry
-//!     ([`model_registry`]) + [`Model::anchors`](crate::derive::Model::anchors),
-//!     plus external `.tla` parsed by [`TlaSpec::parse`](crate::tla_check::TlaSpec).
+//! * **Source → spec**: [`RefinementAnchor`], [`Waiver`] and [`InvariantAnchor`] records,
+//!   collected by [`refinements`], [`waivers`] and [`invariant_anchors`].
+//! * **Spec → source**: the embedded [`Model`](crate::derive::Model) registry
+//!   ([`model_registry`]) and [`Model::anchors`](crate::derive::Model::anchors), plus external
+//!   `.tla` parsed by [`TlaSpec`](crate::tla_check::TlaSpec).
 //!
-//! [`check_closure`] enforces the four bidirectional obligations of §2.2 over both
-//! kinds of `SpecModule`, with coverage scoped to *actively-bound* machines (see
-//! the doc on that fn). It is the runnable form of `trust-spec-link` (Phase 0),
-//! before the IR pass exists (Phase 3).
+//! [`check_closure`] enforces the four bidirectional obligations of §2.2 over both kinds of
+//! `SpecModule`, with coverage scoped to actively bound machines.
 //!
-//! IMPORTANT — collection scope. `inventory` only sees `submit!`s from object code
-//! LINKED into the running binary. Anchor-bearing dependencies enable their
-//! `spec-anchors` features for the `aterm-gui` unit-test build, whose dependency
-//! closure links every participating crate. The full `spec_xref_closure` gate
-//! therefore lives in `aterm-gui`; a gate in any individual library would see only
-//! that library's own test-expanded anchors.
+//! The registry sees only `submit!`s from object code linked into the running binary.
+//! Anchor-bearing dependencies enable their `spec-anchors` features for the `aterm-gui` unit-test
+//! build, whose closure links every participating crate, so the full `spec_xref_closure` gate lives
+//! in `aterm-gui`; a gate in one library would see only its own anchors.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::derive::Model;
 use crate::tla_check::TlaSpec;
 
-/// A source→spec refinement binding, emitted by `#[refines(machine, action, …)]`.
-///
-/// This is the `inventory`-collectable anchor record. Its fields are `&'static str`
-/// so it can live in a `const` submitted at link time (the macro span-captures
-/// `file!()`/`line!()`).
+/// A source→spec refinement binding, emitted by `#[refines(machine, action, …)]`. Its fields are
+/// `&'static str` so it lives in a `static` submitted at load time.
 #[derive(Debug, Clone, Copy)]
 pub struct RefinementAnchor {
     /// The TLA+ machine name (e.g. `"terminal_modes"`) — matches a `Model::name`
@@ -51,27 +40,23 @@ pub struct RefinementAnchor {
     pub rust_method: &'static str,
     /// Source location `file:line` (proc-macro `file!()`/`line!()`).
     pub location: &'static str,
-    /// Optional projection fn path (the `project=` arg), `""` when absent.
+    /// The projection fn path (the `project=` arg, which `#[refines]`
+    /// requires): what Tier-1 reads the real state through.
     pub project: &'static str,
-    /// The EXECUTION-EVIDENCE key for this anchor: the id the `#[refines]` macro
-    /// also injects as a fn-entry probe into the annotated body, so
-    /// [`entered_anchor_ids`] can answer "did the annotated function actually RUN?".
+    /// The execution-evidence key: the id the `#[refines]` macro also injects as a fn-entry probe
+    /// into the annotated body, so [`entered_anchor_ids`] can say whether the function ran. Shape
+    /// `"<machine>::<action> @ <rust_method>"`, from the same expansion as the probe.
     ///
-    /// Shape `"<machine>::<action> @ <rust_method>"`, emitted from the SAME macro
-    /// expansion as the probe, so the two strings cannot drift.
-    ///
-    /// `""` means NOT INSTRUMENTED — the macro could not inject a probe (a `const fn`
-    /// body, or an item that is not a fn with a block). An empty `entry_id` is not a
-    /// pass: a gate that demands execution evidence must treat it as a failure (see
-    /// [`StepAudit::uninstrumented`]), otherwise moving an anchor onto a `const fn`
-    /// would be a way to opt back out of the check.
+    /// `""` means not instrumented (a `const fn` body, or an item that is not a fn with a block).
+    /// That is not a pass: a gate that demands execution evidence treats it as a failure
+    /// ([`StepAudit::uninstrumented`]), or moving an anchor onto a `const fn` would opt it out.
     pub entry_id: &'static str,
 }
 
-/// An explicit "this fn is intentionally NOT modeled" waiver, emitted by
-/// `#[spec_unmodeled(reason, …)]`. `machine`/`action` are optional (a bare
-/// `reason="…"` waiver — the legacy bypass-setter form — leaves them `""`); when
-/// present, the waiver discharges that model `Action` for the coverage obligation.
+/// An explicit "this fn is intentionally not modeled" waiver, emitted by
+/// `#[spec_unmodeled(reason, …)]`. `machine` and `action` are optional (the bare `reason="…"`
+/// bypass-setter form leaves them `""`); when present, the waiver discharges that action for the
+/// coverage obligation.
 #[derive(Debug, Clone, Copy)]
 pub struct Waiver {
     pub machine: &'static str,
@@ -81,9 +66,9 @@ pub struct Waiver {
     pub location: &'static str,
 }
 
-/// A source→spec invariant binding, emitted by `#[spec_invariant(id, machine, …)]`.
-/// `machine` is optional for back-compat (`""` when absent); when present it must
-/// resolve to a registered `SpecModule` (obligation 4).
+/// A source→spec invariant binding, emitted by `#[spec_invariant(id, machine, …)]`. `machine` is
+/// optional (`""` when absent); when present it must resolve to a registered `SpecModule`
+/// (obligation 4).
 #[derive(Debug, Clone, Copy)]
 pub struct InvariantAnchor {
     pub machine: &'static str,
@@ -92,147 +77,84 @@ pub struct InvariantAnchor {
     pub location: &'static str,
 }
 
-inventory::collect!(RefinementAnchor);
-inventory::collect!(Waiver);
-inventory::collect!(InvariantAnchor);
+crate::registry::collect!(RefinementAnchor);
+crate::registry::collect!(Waiver);
+crate::registry::collect!(InvariantAnchor);
 
 /// All [`RefinementAnchor`]s linked into the current binary.
-// Skip: the linkme/`inventory` registry iterator's body lives in the
-// third-party `inventory` crate (an absent callee — a static-slice walk
-// over link-section entries; no user code, no panic path in practice).
-// These accessors are the SPEC-ANCHOR ledger read by the xref gate, not
-// shipping runtime code.
-#[cfg_attr(trust_verify, trust::skip)]
 pub fn refinements() -> impl Iterator<Item = &'static RefinementAnchor> {
-    inventory::iter::<RefinementAnchor>.into_iter()
+    crate::registry::iter::<RefinementAnchor>()
 }
 
 /// All [`Waiver`]s linked into the current binary.
-// Skip: inventory registry walk — see `refinements()`.
-#[cfg_attr(trust_verify, trust::skip)]
 pub fn waivers() -> impl Iterator<Item = &'static Waiver> {
-    inventory::iter::<Waiver>.into_iter()
+    crate::registry::iter::<Waiver>()
 }
 
 /// All [`InvariantAnchor`]s linked into the current binary.
-// Skip: inventory registry walk — see `refinements()`.
-#[cfg_attr(trust_verify, trust::skip)]
 pub fn invariant_anchors() -> impl Iterator<Item = &'static InvariantAnchor> {
-    inventory::iter::<InvariantAnchor>.into_iter()
+    crate::registry::iter::<InvariantAnchor>()
 }
 
 // ---------------------------------------------------------------------------
-// EXECUTION EVIDENCE — the runnable fragment of obligation 2.
+// Execution evidence: the runnable fragment of obligation 2.
 // ---------------------------------------------------------------------------
 //
-// THE HOLE THIS ADDRESSES. A `RefinementAnchor` is submitted by an attribute that
-// leaves the annotated fn untouched, and `check_closure` only ever compared
-// STRINGS: that the anchor's `action` names a real action of a real machine, and
-// that every action of an active machine is named by some anchor. NOTHING tied the
-// anchor to a fn that does the thing. Demonstrated, not theorised: moving a
-// `SelectionCustody` anchor onto `Terminal::is_tmux_mode_active()` — a fn (since
-// deleted) whose entire body was `false`, with zero callers — left the gate GREEN at
-// `ratio=1.000 bound=11 waived=0 [ACTIVE]`.
+// The string closure checks only that an anchor names a real action and that every action of an
+// active machine is named; nothing ties the anchor to a fn that does the thing. So in
+// `cfg(any(test, feature = "spec-anchors"))` builds (the cfg the attribute is under) the macro also
+// injects, as the first statement of the annotated body, a call to [`note_entered`] with the
+// anchor's [`RefinementAnchor::entry_id`].
 //
-// THE MECHANISM. In `cfg(any(test, feature = "spec-anchors"))` builds — the cfg the
-// anchor ATTRIBUTE is under — the macro ALSO injects, as the first statement of the
-// annotated fn's body, a call to [`note_entered`] with the anchor's
-// [`RefinementAnchor::entry_id`].
+// The cfg gates the probe call sites, not this module: the thread-locals and fns below are in
+// every build of `aterm-spec`, since the cfg that strips a probe is the annotated crate's. With no
+// call site, no shipping path pays even the `bool` load.
 //
-// WHAT THAT CFG GATES, AND WHAT IT DOES NOT, stated exactly because an earlier draft
-// of this note said "a shipping binary carries neither the record nor the probe" and
-// only the second half of that was true. The cfg gates the ATTRIBUTE, hence the probe
-// CALL SITES: a shipping build of `aterm-core` (no `spec-anchors`, not `cfg(test)`)
-// has no `note_entered` call in `write_char`. It does NOT gate this module. The two
-// thread-local statics below and the `pub fn`s over them carry no `#[cfg]` at all
-// and are compiled into every build of `aterm-spec`, shipping included — they must be,
-// because the cfg that strips a probe is the ANNOTATED crate's, and `aterm-spec` cannot
-// know at its own compile time whether some downstream crate will emit a call. Whether
-// the statics then survive linking with zero callers is a linker-GC question, not a cfg
-// one. What the cfg does buy is exactly what the COST paragraph below is about: with no
-// call site, no shipping code path pays even the `bool` load.
+// Per step, not per run: a window around a whole conformance would pass an anchor moved onto any
+// fn the run touches. [`StepEvidence::step`] clears the record, runs the one shipping call that
+// drives an action, and snapshots what was entered. A step that drives a `Terminal::process` batch
+// still enters several anchored fns at once, so [`StepAudit::stray`] also checks the converse (a
+// fn that is the seam for `{B, C}` is not entered by a window driving `D`), and
+// [`StepAudit::interchangeable`] prints what entry alone leaves ambiguous.
 //
-// PER STEP, NOT PER RUN — and that distinction is the whole strength of this. One window around the
-// WHOLE conformance asks only "was this fn entered at some point during a run that drives eleven
-// actions". That is far weaker than it reads: an anchor moved onto ANY fn the conformance happens
-// to touch — `Terminal::process`, or even `Terminal::text_selection`, which only the HARNESS'S
-// projection calls — is entered during the run and passes. So the window is ONE STEP wide:
-// [`StepEvidence::step`] clears the record, runs the single shipping call that drives action A, and
-// snapshots what was entered before the harness reads anything back. `Evict`'s anchor moved onto
-// `Terminal::process` then fails, because the `Evict` step calls only `set_scrollback_line_limit`.
+// Thread-local, so a window sees only its own thread's calls; a process-wide set would be satisfied
+// by any parallel test. Work a window spreads over other threads is credited by hand: each worker
+// opens a window, [`take_entered_anchors`] hands its record back, and [`merge_entered_anchors`]
+// credits the owner's window.
 //
-// AND THE CONTRAPOSITIVE, because per-step entry alone is still weaker than it reads.
-// A window is only as narrow as the seam its step calls, and a step that drives a
-// `Terminal::process` batch runs the whole VT engine: several anchored functions are
-// entered at once and entry cannot tell them apart. `SelectionCustody`'s uniform-scroll
-// window enters `Terminal::note_output_custody` as well as `Terminal::post_process`, so
-// entry alone would let the anchor sit on either. What separates them is asking the
-// other question — a function that is the seam for `{B, C}` must NOT be entered by a
-// window driving `D` — and `note_output_custody` also runs in the damage and
-// invalidation windows. [`StepAudit::stray`] is that check; [`StepAudit::interchangeable`]
-// is what entry alone would have left ambiguous, printed so the difference is visible
-// rather than asserted.
+// Armed only inside a step window: the probe sits in every annotated body, some of them
+// per-character hot paths (`Terminal::write_char`), and outside a window it is one thread-local
+// `bool` load and a branch.
 //
-// THREAD-LOCAL, deliberately. The record is per-thread, so a step's window sees ONLY
-// what that step called on the gate's own thread. A process-wide set would be silently
-// satisfied by any other test running in parallel in the same binary — which is
-// exactly the false green this is here to remove. A window whose work runs on threads
-// of its own (a conformance replaying its paths on a pool) gets their entries only by
-// hand: each worker opens a window, [`take_entered_anchors`] closes it and hands its
-// record back, and [`merge_entered_anchors`] credits the owner's open window with it.
-//
-// ARMED, deliberately. The probe is injected into ~190 bodies tree-wide, several of
-// which are per-character hot paths (`Terminal::write_char`). Outside a step window the
-// probe is a single thread-local `bool` load and a predictable branch:
-// [`StepEvidence::step`] arms on entry and disarms on exit, and nothing else arms.
-//
-// WHAT IT IS NOT, stated plainly because the arithmetic matters more than the
-// adjective. This is FUNCTION-ENTRY evidence, not per-action BRANCH evidence. A fn
-// carrying four anchors marks all four the moment it is entered once, so for those
-// four actions the evidence is "the annotated function ran during this action's own
-// step" and NOT "the branch that implements this action was taken". Both
-// `Terminal::post_process` (4 `SelectionCustody` actions) and
-// `Terminal::note_output_custody` (7 `PressCustody` actions) are entered
-// unconditionally on every VT batch, so nothing here can tell their siblings apart at
-// all — permuting either function's labels among themselves (its four, its seven)
-// changes no observable.
-// [`StepAudit::summary`] DERIVES that count and prints it rather than letting the gate
-// claim more; [`StepAudit::shared_site`] is the anchor-table list and
-// [`StepAudit::indiscriminate`] the run-derived one. The other surviving hole is an
-// anchor moved onto a function whose ENTRY PATTERN is exactly the action set it claims
-// — including any unanchored function inside the window, which runs no probe and so
-// cannot even be counted. Full symbol and branch resolution is still Phase 3's
-// `trust-ir` job.
+// This is function-entry evidence, not branch evidence: a fn carrying several anchors marks them
+// all when entered. `Terminal::post_process` (4 `SelectionCustody` actions) and
+// `Terminal::note_output_custody` (7 `PressCustody` actions) run on every VT batch, so permuting
+// either's labels changes nothing observable. [`StepAudit::summary`] derives and prints that
+// count; [`StepAudit::shared_site`] lists such sites from the anchor table and
+// [`StepAudit::indiscriminate`] from the run. An anchor moved onto a fn whose entry pattern is
+// exactly the claimed action set (or into an unanchored fn, which has no probe) still passes; full
+// symbol and branch resolution is `trust-ir`'s job.
 
 thread_local! {
-    /// Is a [`StepEvidence::step`] window open on this thread? The probe's first act
-    /// is to read this and return, so an un-armed probe costs one TLS `bool` load.
-    /// `const`-initialized, so the slot needs no lazy-init check.
+    /// Whether a [`StepEvidence::step`] window is open on this thread. The probe reads this first,
+    /// so an unarmed probe costs one TLS `bool` load; `const`-initialized, so no lazy-init check.
     static ARMED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
 
-    /// Anchor ids whose annotated fn was entered on THIS thread inside the open
+    /// Anchor ids whose annotated fn was entered on this thread inside the open
     /// window. `BTreeSet` (not `HashSet`) so the initializer is `const` — the TLS
     /// costs nothing until the first probe fires.
     static ENTERED_ANCHORS: core::cell::RefCell<BTreeSet<&'static str>> =
         const { core::cell::RefCell::new(BTreeSet::new()) };
 }
 
-/// Record that the fn carrying `entry_id` was ENTERED on this thread.
+/// Record that the fn carrying `entry_id` was entered on this thread. Called only by the probe
+/// `#[refines]` injects into every annotated body, so it is:
 ///
-/// Called by the probe the `#[refines]` macro injects at fn entry; never called by
-/// hand. Two properties it must have, because it is injected into ~190 bodies:
-///
-/// * NEARLY FREE when no gate is watching. The `ARMED` read short-circuits before any
-///   `RefCell` borrow or `BTreeSet` insert, so the cost outside a step window is a
-///   thread-local `bool` load and a branch the predictor gets right every time.
-/// * PANIC-FREE by construction — it must be safe to inject into ANY annotated fn,
-///   including one that runs during TLS teardown or re-entrantly:
-///   [`std::thread::LocalKey::try_with`] tolerates a destroyed TLS slot and
-///   `try_borrow_mut` tolerates a re-entrant call, and both simply drop the record
-///   rather than unwinding inside somebody else's function.
-// Skip: thread-local bookkeeping (`LocalKey::try_with`, `RefCell::try_borrow_mut`,
-// `BTreeSet::insert` — absent std bodies). Verification tooling, like the rest of
-// this module.
+/// * nearly free when no gate is watching: the `ARMED` read returns before any borrow or insert;
+/// * panic-free in any annotated fn, even during TLS teardown or re-entrantly:
+///   [`std::thread::LocalKey::try_with`] tolerates a destroyed slot and `try_borrow_mut` a
+///   re-entrant call, and both drop the record rather than unwind.
+// Skip: thread-local bookkeeping over std bodies the prover lacks. Verification tooling.
 #[cfg_attr(trust_verify, trust::skip)]
 #[inline]
 pub fn note_entered(entry_id: &'static str) {
@@ -246,17 +168,11 @@ pub fn note_entered(entry_id: &'static str) {
     });
 }
 
-/// Open an evidence window: forget every anchor entry recorded on this thread and ARM
-/// the probe. Returns whether the window is genuinely open — the record is provably
-/// empty AND the probe armed.
-///
-/// THE RETURN VALUE IS THE POINT. Both failure modes (`try_with` on a destroyed TLS
-/// slot, `try_borrow_mut` on a re-entrant borrow) would otherwise leave the PREVIOUS
-/// conformance's entries in place, and every audit after it would pass on stale
-/// evidence. A caller that cannot open the window must fail loudly;
-/// [`StepEvidence::step`] asserts on it.
-// Skip: thread-local bookkeeping (`LocalKey::try_with`, `RefCell::try_borrow_mut`,
-// `BTreeSet::clear/is_empty` — absent std bodies). Verification tooling.
+/// Open an evidence window: forget this thread's recorded entries and arm the probe. Returns
+/// whether the window is open (record empty, probe armed); a failure would leave the previous
+/// conformance's entries in place, so a caller fails loudly on `false` ([`StepEvidence::step`]
+/// asserts it).
+// Skip: thread-local bookkeeping over std bodies the prover lacks. Verification tooling.
 #[cfg_attr(trust_verify, trust::skip)]
 #[must_use]
 pub fn reset_entered_anchors() -> bool {
@@ -288,15 +204,10 @@ pub fn disarm_entered_anchors() {
     let _ = ARMED.try_with(|armed| armed.set(false));
 }
 
-/// The anchor ids entered on this thread since the last [`reset_entered_anchors`].
-///
-/// LOSSY ON FAILURE, deliberately, and [`entered_anchor_count`] exists because of it:
-/// a destroyed TLS slot and an outstanding borrow both come back as an EMPTY set,
-/// indistinguishable from a genuinely empty record. That is the right shape for a
-/// reader that wants "what did this window see" and the wrong shape for an assertion
-/// about emptiness, which would then pass in exactly the two states it claims to
-/// detect.
-// Skip: thread-local read + `BTreeSet::clone` (absent std bodies). Verification tooling.
+/// The anchor ids entered on this thread since the last [`reset_entered_anchors`]. Lossy: a
+/// destroyed TLS slot or an outstanding borrow reads as an empty set, so assert emptiness with
+/// [`entered_anchor_count`] instead.
+// Skip: thread-local read over std bodies the prover lacks. Verification tooling.
 #[cfg_attr(trust_verify, trust::skip)]
 #[must_use]
 pub fn entered_anchor_ids() -> BTreeSet<&'static str> {
@@ -308,16 +219,10 @@ pub fn entered_anchor_ids() -> BTreeSet<&'static str> {
         .unwrap_or_default()
 }
 
-/// How many ids are recorded on this thread — `None` when the record could not be
-/// READ at all (destroyed TLS slot, or an outstanding borrow).
-///
-/// THE DISTINCTION IS THE WHOLE POINT. `entered_anchor_ids().is_empty()` folds
-/// "the record is clean" together with "I could not look", so an assertion written on
-/// it is vacuous: it holds precisely when the state it guards against is unobservable.
-/// `Some(0)` is a POSITIVE observation of an empty record and `None` is a failure to
-/// observe, so [`StepEvidence::step`]'s post-reset check can be genuinely independent
-/// of [`reset_entered_anchors`]'s own return value instead of merely echoing it.
-// Skip: thread-local read + `RefCell::try_borrow` (absent std bodies). Verification tooling.
+/// How many ids are recorded on this thread; `None` when the record cannot be read (a destroyed
+/// TLS slot or an outstanding borrow). `Some(0)` is a positive observation of an empty record, so
+/// [`StepEvidence::step`]'s post-reset check is independent of [`reset_entered_anchors`]'s return.
+// Skip: thread-local read over std bodies the prover lacks. Verification tooling.
 #[cfg_attr(trust_verify, trust::skip)]
 #[must_use]
 pub fn entered_anchor_count() -> Option<usize> {
@@ -327,12 +232,9 @@ pub fn entered_anchor_count() -> Option<usize> {
         .flatten()
 }
 
-/// Is an evidence window open on this thread? `None` when the flag could not be read.
-///
-/// Exists so [`StepEvidence::step`] can check its window SURVIVED the closure it ran.
-/// The exit disarms unconditionally, so a nested `step` — or any hand call to
-/// [`disarm_entered_anchors`] — inside the drive closure closes the outer window early,
-/// and the outer action is then credited with whatever the inner window recorded.
+/// Whether an evidence window is open on this thread; `None` when the flag cannot be read. Lets
+/// [`StepEvidence::step`] check that its window survived the closure: a nested `step`, or a hand
+/// call to [`disarm_entered_anchors`], closes the outer window early.
 // Skip: thread-local read (`LocalKey::try_with`, `Cell::get`). Verification tooling.
 #[cfg_attr(trust_verify, trust::skip)]
 #[must_use]
@@ -340,21 +242,14 @@ pub fn window_is_armed() -> Option<bool> {
     ARMED.try_with(core::cell::Cell::get).ok()
 }
 
-/// Close this thread's window and hand over what it recorded, leaving the record empty:
-/// the half of a window split across threads that a WORKER runs (it opened its own
-/// window with [`reset_entered_anchors`]; the caller it works for takes the result into
-/// its own with [`merge_entered_anchors`]).
+/// Close this thread's window and hand over its record, leaving it empty: the worker's half of a
+/// window split across threads (it opened its own with [`reset_entered_anchors`]; the owner takes
+/// the result with [`merge_entered_anchors`]).
 ///
-/// `None` when the record could not be taken (a destroyed TLS slot or an outstanding
-/// borrow): a failure to observe, kept apart from an empty window for the reason
-/// [`entered_anchor_count`] gives. `None` too, with the record left alone, when no
-/// window is open on this thread: a closed window's record is not this work's — a
-/// [`StepEvidence::step`] disarms on exit and leaves its record readable, so a worker
-/// on a reused thread that never opened a window of its own, or one a nested step
-/// closed, would otherwise hand over a stale or partial record as its own
-/// ([`merge_entered_anchors`] refuses a closed window for the same reason).
-// Skip: thread-local bookkeeping (`LocalKey::try_with`, `RefCell::try_borrow_mut`,
-// `mem::take`). Verification tooling.
+/// `None` when the record cannot be taken, or, with the record left alone, when no window is open
+/// on this thread: a closed window's record (a finished step's, or one a nested step closed) is
+/// not this work's.
+// Skip: thread-local bookkeeping over std bodies the prover lacks. Verification tooling.
 #[cfg_attr(trust_verify, trust::skip)]
 #[must_use]
 pub fn take_entered_anchors() -> Option<BTreeSet<&'static str>> {
@@ -372,17 +267,11 @@ pub fn take_entered_anchors() -> Option<BTreeSet<&'static str>> {
         .flatten()
 }
 
-/// Credit this thread's OPEN window with `ids`: the record a thread doing part of this
-/// window's work took with [`take_entered_anchors`]. The per-thread isolation stands:
-/// nothing crosses threads unless the window's owner merges it, so two windows on two
-/// threads still never share an entry.
-///
-/// Returns whether `ids` were recorded. `false`, with nothing recorded, when no window
-/// is open on this thread (the probe records nothing outside one either, and a window
-/// a nested step closed must not be credited) or its record cannot be written; a
-/// caller asserts on it, as on [`reset_entered_anchors`].
-// Skip: thread-local bookkeeping (`LocalKey::try_with`, `RefCell::try_borrow_mut`,
-// `BTreeSet::extend`). Verification tooling.
+/// Credit this thread's open window with `ids`, a record a worker took with
+/// [`take_entered_anchors`]; nothing crosses threads unless the owner merges it. Returns whether
+/// `ids` were recorded: `false` when no window is open here or its record cannot be written, and
+/// the caller asserts on it.
+// Skip: thread-local bookkeeping over std bodies the prover lacks. Verification tooling.
 #[cfg_attr(trust_verify, trust::skip)]
 #[must_use]
 pub fn merge_entered_anchors(ids: BTreeSet<&'static str>) -> bool {
@@ -392,8 +281,8 @@ pub fn merge_entered_anchors(ids: BTreeSet<&'static str>) -> bool {
             .unwrap_or(false)
 }
 
-/// What one conformance STEP entered: the action the step claims to drive, and the
-/// anchor ids whose annotated fn ran inside that step's window and no wider.
+/// What one conformance step entered: the action it claims to drive, and the anchor ids whose
+/// annotated fn ran inside that step's window.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StepRecord {
     /// The machine action this step drives, spelled as the anchors spell it.
@@ -402,12 +291,8 @@ pub struct StepRecord {
     pub entered: BTreeSet<&'static str>,
 }
 
-/// A machine's per-step execution evidence, accumulated by its Tier-1 conformance and
-/// audited by the gate that ran it.
-///
-/// The conformance owns this because only the conformance knows where one step ends
-/// and the next begins — which is precisely the knowledge that makes the evidence
-/// discriminating rather than cumulative.
+/// A machine's per-step execution evidence, accumulated by its Tier-1 conformance (the only party
+/// that knows where one step ends and the next begins) and audited by the gate that ran it.
 #[derive(Debug, Clone)]
 pub struct StepEvidence {
     machine: &'static str,
@@ -424,26 +309,19 @@ impl StepEvidence {
         }
     }
 
-    /// Drive ONE step of the conformance inside its own evidence window.
+    /// Drive one step of the conformance inside its own evidence window.
     ///
-    /// `drive` must be the shipping call for `action` and NOTHING ELSE — no pre-state
-    /// read, no post-state projection, no record read-back. Everything inside the
-    /// window becomes evidence for `action`, so a window that also contains the
-    /// harness's own `term.text_selection()` would let an anchor parked on that
-    /// accessor discharge a shipping obligation.
-    ///
-    /// Windows MUST NOT NEST: the exit disarms unconditionally, so an inner step would
-    /// close the outer one's window early and silently lose evidence. That rule is now
-    /// ENFORCED rather than documented — the arm bit is re-read after `drive` returns.
+    /// `drive` must be the shipping call for `action` and nothing else (no pre-state read,
+    /// projection or read-back): everything inside the window is evidence for `action`, so a
+    /// harness accessor inside it would let an anchor parked there discharge a shipping
+    /// obligation. Windows must not nest; the arm bit is re-read after `drive` returns.
     ///
     /// # Panics
-    /// If the window cannot be opened (see [`reset_entered_anchors`]), if the record is
-    /// not observably empty once it has (see [`entered_anchor_count`]), or if the
-    /// window was closed while `drive` ran (see [`window_is_armed`]). A silent no-op
-    /// reset would leave the previous step's entries in place and make every subsequent
-    /// audit pass on stale evidence, so all three are deliberately loud.
-    // Skip: thread-local window bookkeeping + `Vec::push` (absent std bodies), around
-    // a caller-supplied closure. Verification tooling, like the rest of this module.
+    ///
+    /// If the window cannot be opened ([`reset_entered_anchors`]), the record is not observably
+    /// empty once it is ([`entered_anchor_count`]), or the window was closed while `drive` ran
+    /// ([`window_is_armed`]): each would let the audit pass on stale evidence.
+    // Skip: thread-local window bookkeeping around a caller-supplied closure. Verification tooling.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn step<T>(&mut self, action: &'static str, drive: impl FnOnce() -> T) -> T {
         assert!(
@@ -487,8 +365,7 @@ impl StepEvidence {
     }
 
     /// Cross the ledger with the machine's linked anchors.
-    // Skip: set algebra over the inventory walk (BTreeSet/Map builds, absent std
-    // bodies). Verification tooling, like the rest of this module.
+    // Skip: set algebra over the registry walk. Verification tooling.
     #[cfg_attr(trust_verify, trust::skip)]
     #[must_use]
     pub fn audit(&self) -> StepAudit {
@@ -497,128 +374,89 @@ impl StepEvidence {
 }
 
 /// The execution-evidence verdict for one machine, crossing its linked anchors with a
-/// [`StepEvidence`] ledger.
-///
-/// Every field is DERIVED from the anchors and the ledger. Nothing here is a number
-/// the gate asserts in prose — including the honest limits, which is the point of
-/// [`Self::shared_site`], [`Self::interchangeable`] and [`Self::entered_under`].
+/// [`StepEvidence`] ledger. Every field is derived from the two, including the limits
+/// ([`Self::shared_site`], [`Self::interchangeable`], [`Self::entered_under`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StepAudit {
     /// The machine, spelled as the caller spelled it.
     pub machine: String,
-    /// How many of the machine's anchors are LINKED into this binary (probed or not).
+    /// How many of the machine's anchors are linked into this binary (probed or not).
     pub anchors: usize,
-    /// The distinct ACTIONS those anchors cover. The gate asserts this SET, not a
-    /// count: the design permits several anchor sites per action, so an anchor count
-    /// would turn a legitimate second site into a bogus "linkage" failure.
+    /// The distinct actions those anchors cover. The gate asserts this set, not a count: an action
+    /// may have several anchor sites.
     pub actions: BTreeSet<&'static str>,
     /// How many step windows the conformance recorded.
     pub steps: usize,
-    /// Anchors the macro could not probe (`entry_id == ""`), named by `rust_method`.
-    /// A failure for a machine claiming execution evidence — otherwise moving an
-    /// anchor onto a `const fn` would be a way to opt back out of the check.
+    /// Anchors the macro could not probe (`entry_id == ""`), by `rust_method`: a failure for a
+    /// machine claiming execution evidence.
     pub uninstrumented: Vec<&'static str>,
     /// `entry_id`s claimed by more than one anchor, which would let one fn's entry
     /// discharge another's obligation.
     pub ambiguous: Vec<&'static str>,
-    /// Anchored actions with NO step in the ledger: the conformance never claimed to
-    /// drive them, so nothing was checked about their anchors.
+    /// Anchored actions with no step in the ledger: the conformance never claimed to drive them,
+    /// so nothing was checked about their anchors.
     pub undriven: Vec<&'static str>,
-    /// Anchored actions that WERE driven and whose annotated function was entered in
-    /// no step of their own. THE FAILURE LIST — an anchor on a stub, on a fn the
-    /// action's own step never reaches, or on an unrelated fn (however busy that fn is
-    /// elsewhere in the run) lands here.
+    /// Anchored actions that were driven and whose annotated function was entered in no step of
+    /// their own: the failure list (an anchor on a stub, on a fn the action's step never reaches,
+    /// or on an unrelated fn).
     pub unwitnessed: Vec<&'static str>,
-    /// One entry per WINDOW that did not enter its own action's function, named by that
-    /// window's action (so an action driven three times can appear twice).
-    ///
-    /// [`Self::unwitnessed`] is an OR across an action's windows, so `Evict` — driven
-    /// by three steps — passes on any one of them and the other two are unchecked. This
-    /// is the AND that closes that: it is the difference between
-    /// [`Self::witnessed_steps`] and the windows that name a real action.
+    /// One entry per window that did not enter its own action's function, named by that action
+    /// (so an action driven three times can appear twice). [`Self::unwitnessed`] is an OR across
+    /// an action's windows; this is the AND.
     pub blind_steps: Vec<&'static str>,
     /// Step tags that match no anchored action of this machine — a typo in the
     /// conformance, checking nothing.
     pub unanchored_steps: Vec<&'static str>,
     /// Annotated fn → the actions of this machine anchored on it.
     pub by_function: BTreeMap<&'static str, BTreeSet<&'static str>>,
-    /// Actions sharing their annotated fn with at least one sibling action. Entry
-    /// alone CANNOT tell these apart: one entry marks every anchor on that fn.
-    ///
-    /// Derived from the ANCHOR TABLE, not from the run — the execution-derived twin is
-    /// [`Self::indiscriminate`], and the two are not the same question.
+    /// Actions sharing their annotated fn with a sibling action, which entry alone cannot tell
+    /// apart. Read off the anchor table; [`Self::indiscriminate`] is the run-derived twin.
     pub shared_site: BTreeSet<&'static str>,
-    /// Action → the already-anchored FUNCTIONS that every window driving that action
-    /// entered. THE HONEST DENOMINATOR of what a window pins: `witnessed` requires the
-    /// action's own function to be in this set, and an anchor moved onto ANY other
-    /// member of it would be witnessed exactly the same. `1` is a window that pins the
-    /// action to its own function; `k` is a window that cannot tell it from `k - 1`
-    /// others.
+    /// Action → the anchored functions every window driving it entered: what a window pins.
+    /// `witnessed` needs the action's own function in this set, and an anchor moved onto any other
+    /// member would be witnessed the same, so `1` pins the action to its function and `k` cannot
+    /// tell it from `k - 1` others.
     ///
-    /// A LOWER BOUND on the real ambiguity, and that has to be said wherever the number
-    /// is printed: only a function that ALREADY carries an anchor runs a probe, so an
-    /// unanchored function the same window calls is invisible here and would also pass.
+    /// A lower bound, to be said wherever it is printed: only an anchored function runs a probe,
+    /// so an unanchored one the same window calls is invisible here and would also pass.
     pub interchangeable: BTreeMap<&'static str, BTreeSet<&'static str>>,
-    /// Anchored function of this machine → the actions whose windows entered it.
-    ///
-    /// THE REPLACEMENT FOR `ubiquitous`, which asked for a function entered by
-    /// LITERALLY EVERY window and was therefore structurally empty on any ledger that
-    /// mixes step families (GUI gesture, VT batch, eviction) — i.e. on both real ones.
-    /// It printed `0` and read like an all-clear for exactly the population
-    /// (`Terminal::post_process`, `Terminal::note_output_custody`) the module prose
-    /// correctly describes as entered on every batch regardless of what fired. A
-    /// function here with more than one action is entered under all of them, which is
-    /// the vacuous-discharge fact stated in a form that can actually be non-empty.
+    /// Anchored function of this machine → the actions whose windows entered it. A function with
+    /// more than one action is entered under all of them, the vacuous-discharge fact (true of
+    /// `Terminal::post_process` and `Terminal::note_output_custody`, entered on every batch).
     pub entered_under: BTreeMap<&'static str, BTreeSet<&'static str>>,
-    /// Actions at least one of whose anchored functions was entered by the window of
-    /// some OTHER action of this machine — so entry says the function ran, not which
-    /// action fired. The execution-derived twin of [`Self::shared_site`].
-    ///
-    /// On a ledger with [`Self::stray`] and [`Self::blind_steps`] both empty this set
-    /// is EQUAL to `shared_site`, which is worth printing: one is read off the anchor
-    /// table and the other off the run, and their agreeing is a check that the table
-    /// describes what actually happened.
+    /// Actions one of whose anchored functions was entered by another action's window, so entry
+    /// says the function ran, not which action fired: the run-derived twin of
+    /// [`Self::shared_site`]. With [`Self::stray`] and [`Self::blind_steps`] empty the two are
+    /// equal.
     pub indiscriminate: BTreeSet<&'static str>,
-    /// Anchored function of this machine → the actions whose windows entered it that
-    /// this function is NOT anchored for.
+    /// Anchored function of this machine → the actions whose windows entered it that it is not
+    /// anchored for.
     ///
-    /// THE WITHIN-WINDOW DETECTOR, and the reason the per-step check discriminates
-    /// INSIDE a `Terminal::process` batch rather than only across batches.
-    /// [`Self::unwitnessed`] asks whether a function ran when its own action fired;
-    /// this asks the contrapositive — did it run when something ELSE fired? A function
-    /// that is the seam for `{B, C}` has no business being entered by a window driving
-    /// `D`. So an anchor moved onto a different function inside the same window is
-    /// caught exactly when that function's ENTRY PATTERN is wider than the action set
-    /// it now claims: park `SelectionCustody::UniformScroll` on
-    /// `Terminal::note_output_custody` — which the uniform-scroll batch really does
-    /// enter — and it lands here, because that function also runs in the two damage
-    /// windows and the two invalidation windows.
+    /// The within-window detector: [`Self::unwitnessed`] asks whether a function ran when its own
+    /// action fired; this asks whether it ran when something else fired. A function that is the
+    /// seam for `{B, C}` has no business being entered by a window driving `D`, so an anchor moved
+    /// onto another function in the same window is caught exactly when that function's entry
+    /// pattern is wider than the actions it claims (`SelectionCustody::UniformScroll` parked on
+    /// `Terminal::note_output_custody` lands here, since that function also runs in the damage and
+    /// invalidation windows).
     ///
-    /// IT CAN FIRE ON A STRUCTURALLY-SHARED FUNCTION rather than a misplaced anchor: a
-    /// function entered on every batch, in a machine that also drives a batch-shaped
-    /// action it is not anchored for. That is not a false alarm about the code — it is
-    /// the statement that such a function's entry is no evidence for its own actions —
-    /// and the resolutions are to anchor it for that action too (if the seam really is
-    /// shared), to narrow the window, or to move the anchor to the seam that is
-    /// specific.
+    /// It can fire on a structurally shared function (entered on every batch, in a machine that
+    /// drives a batch-shaped action it is not anchored for), whose entry is then no evidence for
+    /// its own actions. Anchor it for that action too, narrow the window, or move the anchor to a
+    /// specific seam.
     pub stray: BTreeMap<&'static str, BTreeSet<&'static str>>,
-    /// Per step window, in the order driven: the action it drives and the distinct
-    /// already-anchored FUNCTIONS it entered. A window with one function pins its
-    /// action to that function; a window with `k` — a whole `Terminal::process` batch,
-    /// say — ran `k` anchored functions and this check can tell none of them apart.
-    /// Same LOWER-BOUND caveat as [`Self::interchangeable`]: an unanchored function in
-    /// the same window runs no probe and cannot appear here.
+    /// Per step window, in the order driven: the action it drives and the distinct anchored
+    /// functions it entered. A window with one pins its action to it; a window with `k` (a whole
+    /// `Terminal::process` batch, say) tells none of them apart. The same lower bound as
+    /// [`Self::interchangeable`].
     pub window_reach: Vec<(&'static str, BTreeSet<&'static str>)>,
-    /// Anchor SITES of a MULTI-SITE action that no window of that action ever entered.
-    ///
-    /// `witnessed` is an OR across sites, so the moment an action has two the second is
-    /// never required to run at all. Single-site actions are excluded because for them
-    /// this is just [`Self::unwitnessed`] under another name.
+    /// Anchor sites of a multi-site action that no window of that action ever entered.
+    /// `witnessed` is an OR across sites, so a second site is never required to run; single-site
+    /// actions are excluded, since for them this is [`Self::unwitnessed`].
     pub dark_sites: Vec<&'static str>,
-    /// How many anchor sites belong to an action that has MORE THAN ONE — the
-    /// DENOMINATOR of [`Self::dark_sites`], carried so a printed `0 dark sites` cannot
-    /// read as an all-clear when the real reason is that no action has a second site
-    /// yet. (That confusion is exactly what the old `ubiquitous` field did.)
+    /// How many anchor sites belong to an action with more than one: the denominator of
+    /// [`Self::dark_sites`], so `0` dark sites over `0` reads as "no action has a second site
+    /// yet", not an all-clear.
     pub multi_site_anchors: usize,
     /// Steps whose window entered an anchor of their own action.
     pub witnessed_steps: usize,
@@ -649,7 +487,7 @@ impl StepAudit {
             .unwrap_or(("<no window>", 0))
     }
 
-    /// How many windows entered MORE THAN ONE anchored function — the windows inside
+    /// How many windows entered more than one anchored function — the windows inside
     /// which this check distinguishes nothing — and the widest of them, spelled out:
     /// the action it drives and every anchored function it entered. Derived, so no
     /// caller has to name those functions in prose and be wrong about it later.
@@ -670,19 +508,13 @@ impl StepAudit {
         }
     }
 
-    /// The honest arithmetic, derived — what the evidence pins and what it does not, in
-    /// numbers rather than adjectives.
+    /// The evidence's arithmetic: what it pins and what it does not, in numbers.
     ///
-    /// EVERY NUMBER HERE IS A FACT ABOUT THE RUN, not a quality score, and the output
-    /// says so in its own last clause. Two of them — `shared_site` and the count of
-    /// `indiscriminate` actions — go DOWN when an anchor is moved somewhere wrong,
-    /// because a wrong function carries fewer of the machine's actions than the right
-    /// one did. Take an action off a four-action seam and park it on a function only
-    /// its own window enters: [`Self::stray`] cannot object (that function's entry
-    /// pattern IS the action set it now claims), the ledger stays green, and the
-    /// shared-function figure falls from ten to nine. Reading either number as
-    /// "discrimination improved" is exactly the mistake this whole module exists to
-    /// stop, so both are labelled for what they are.
+    /// Every number is a fact about the run, not a quality score. `shared_site` and the
+    /// `indiscriminate` count go down when an anchor is moved somewhere wrong, since a wrong
+    /// function carries fewer of the machine's actions: an action taken off a four-action seam and
+    /// parked on a function only its own window enters passes [`Self::stray`], and the shared
+    /// figure falls.
     // Skip: string formatting over the derived fields. Verification tooling.
     #[cfg_attr(trust_verify, trust::skip)]
     #[must_use]
@@ -760,21 +592,16 @@ impl StepAudit {
     }
 }
 
-/// The annotated FUNCTION half of an entry id (`"<machine>::<action> @ <fn>"`).
-///
-/// The id names an ANCHOR, but what a window observes is the FUNCTION: two anchors on
-/// one fn produce two ids that always fire together, and an anchor moved elsewhere
-/// produces a different id only because this half changed. So every question of the
-/// form "what else could this anchor have sat on and still been witnessed?" is a
-/// question about this half, which is why [`StepAudit::interchangeable`] and
-/// [`StepAudit::entered_under`] are keyed by it rather than by the whole id.
+/// The function half of an entry id (`"<machine>::<action> @ <fn>"`). A window observes functions,
+/// not anchors (two anchors on one fn always fire together), so [`StepAudit::interchangeable`] and
+/// [`StepAudit::entered_under`] are keyed by this half.
 fn fn_of(entry_id: &'static str) -> &'static str {
     entry_id.rsplit_once(" @ ").map_or(entry_id, |(_, f)| f)
 }
 
 /// Cross `machine`'s linked anchors with a per-step ledger. `machine` is resolved with
 /// [`machine_matches`], so the caller may spell it the way the anchors do.
-// Skip: inventory walk feeding the pure set algebra below. Verification tooling.
+// Skip: registry walk feeding the pure set algebra below. Verification tooling.
 #[cfg_attr(trust_verify, trust::skip)]
 fn audit_steps(machine: &str, steps: &[StepRecord]) -> StepAudit {
     let linked: Vec<&'static RefinementAnchor> = refinements()
@@ -786,8 +613,7 @@ fn audit_steps(machine: &str, steps: &[StepRecord]) -> StepAudit {
 /// The pure half of [`audit_steps`]: set algebra over an explicit anchor list, so the
 /// derivations can be exercised on synthetic ledgers rather than only on whatever the
 /// test binary happened to link.
-// Skip: set algebra (BTreeSet/Map builds, absent std bodies). Verification tooling,
-// like the rest of this module.
+// Skip: set algebra over std bodies the prover lacks. Verification tooling.
 #[cfg_attr(trust_verify, trust::skip)]
 #[allow(clippy::too_many_lines)] // one derivation per `StepAudit` field, in field order
 fn audit_steps_of(
@@ -863,26 +689,22 @@ fn audit_steps_of(
     };
     let witnessed_steps = steps.iter().filter(|s| witnessed_of(s)).count();
 
-    // The AND that `unwitnessed`'s OR leaves open: an action driven by three steps is
-    // `witnessed` on any ONE of them, so the other two check nothing until this names
-    // them. (`unanchored_steps` is reported separately; a mistyped tag is not a blind
-    // window, it is a window about no action at all.)
+    // The AND to `unwitnessed`'s OR. A mistyped tag is in `unanchored_steps`, not a blind
+    // window.
     let blind_steps: Vec<&'static str> = steps
         .iter()
         .filter(|s| actions.contains(&s.action) && !witnessed_of(s))
         .map(|s| s.action)
         .collect();
 
-    // What each window entered, as FUNCTIONS: the set an anchor may be moved anywhere
-    // within and still be witnessed.
+    // What each window entered, as functions.
     let fns_of_step: Vec<BTreeSet<&'static str>> = steps
         .iter()
         .map(|s| s.entered.iter().copied().map(fn_of).collect())
         .collect();
 
-    // Per action, the functions EVERY one of its windows entered. This is the honest
-    // denominator of the per-step check: `witnessed` puts the action's own function in
-    // here, and any other member would have passed identically.
+    // Per action, the functions every one of its windows entered: any member would have passed
+    // as the action's own.
     let mut interchangeable: BTreeMap<&'static str, BTreeSet<&'static str>> = BTreeMap::new();
     for action in &actions {
         let mut windows = steps
@@ -898,8 +720,7 @@ fn audit_steps_of(
         }
     }
 
-    // Per anchored function of THIS machine, the actions whose windows entered it —
-    // the non-vacuous form of the old `ubiquitous` (see `StepAudit::entered_under`).
+    // Per anchored function of this machine, the actions whose windows entered it.
     let mut entered_under: BTreeMap<&'static str, BTreeSet<&'static str>> = BTreeMap::new();
     for (s, fns) in steps.iter().zip(&fns_of_step) {
         if !actions.contains(&s.action) {
@@ -910,9 +731,8 @@ fn audit_steps_of(
         }
     }
 
-    // An action is indiscriminate when SOME function it is anchored on was entered by
-    // SOME other action's window: the OR across sites means that site alone could have
-    // discharged it, so entry says the function ran and not which action fired.
+    // An action is indiscriminate when a function it is anchored on was entered by another
+    // action's window: that site alone could have discharged it.
     let indiscriminate: BTreeSet<&'static str> = actions
         .iter()
         .copied()
@@ -932,8 +752,7 @@ fn audit_steps_of(
         .map(|(s, f)| (s.action, f.clone()))
         .collect();
 
-    // Entered under an action this function is NOT anchored for: the within-window
-    // detector (see `StepAudit::stray`).
+    // Entered under an action this function is not anchored for (see `StepAudit::stray`).
     let stray: BTreeMap<&'static str, BTreeSet<&'static str>> = entered_under
         .iter()
         .filter_map(|(f, under)| {
@@ -943,8 +762,7 @@ fn audit_steps_of(
         })
         .collect();
 
-    // Sites of a MULTI-site action that no window of that action entered, and how many
-    // sites are eligible to land there at all.
+    // Sites of a multi-site action no window of that action entered, and the eligible count.
     let multi_site_anchors: usize = ids_of_action
         .values()
         .map(BTreeSet::len)
@@ -992,1196 +810,159 @@ fn audit_steps_of(
     }
 }
 
-/// Every embedded [`Model`] aterm-spec knows about — the spec→source registry.
-///
-/// This enumerates ALL `ty_model!`/`derive`-authored models so the closure gate can
-/// resolve a `machine` named by an anchor to a registered `SpecModule` (obligation
-/// 4) and enumerate a machine's actions (obligation 1 + coverage). Adding a model
-/// here makes it a first-class anchor target.
-// Skip: builds the model registry by calling the (T2-classified) `*_model()`
-// data constructors — the vec! alloc + their absent bodies. Spec tooling.
-#[cfg_attr(trust_verify, trust::skip)]
-pub fn model_registry() -> Vec<Model> {
-    use crate::derive::*;
-    vec![
-        terminal_modes_model(),
-        ring_model(),
-        cursor_model(),
-        subscribe_model(),
-        notify_follow_checkpoint_model(),
-        fabric_outbox_wake_model(),
-        fabric_reconnect_backoff_model(),
-        fabric_refill_retry_model(),
-        broadcast_cursor_checkpoint_model(),
-        broadcast_head_subscription_model(),
-        output_retention_model(),
-        // Disabling desktop alerts cancels the GUI herald's pending debt
-        // while preserving seen escalations. Tier-1 drives the real herald.
-        desktop_alert_debt_model(),
-        // A late say subscriber's gap consumes one shared replay allowance,
-        // rotates by sid, and follows control work. Tier-1 in aterm-link's
-        // bridge tests drives the real scheduler across many owed sessions.
-        say_replay_budget_model(),
-        // The exceptions digest (aterm-messages `MessageCenter::digest`): a
-        // `Later` never wants a band row, a dismissal holds, the cap and the
-        // expiry lose nothing. Tier-1 in aterm-messages' conformance_digest
-        // drives the real center in lock step.
-        exceptions_digest_model(),
-        // An exception its reporter stopped naming ENDS by its own clock, with
-        // no second look and never early: the upgrade's looks are
-        // sent only when its rows change, so the second edition's entry stood
-        // for ever after one empty look. Liveness in `liveness_registry`;
-        // Tier-1 in aterm-messages' conformance_digest_ends.
-        exceptions_digest_ends_model(),
-        // The exceptions digest raises a cause ONCE: a dismissal
-        // is a line on disk, the same cause is not raised again across the
-        // restarts and the seamless updates that replaced the process (six of
-        // the Full Disk Access question's eight raises came within a second
-        // of one). Tier-1 in aterm-messages' family_tests drives the real
-        // center: a restart replays the encoded log, the successor folds the
-        // parent's tail in at Commit.
-        exceptions_once_model(),
-        // The `@*` announcement order and the fabric bridge's level-triggered
-        // unwatched rule. Tier-1 bound twice — aterm-gui's `drain_membership`
-        // and aterm-link's `Bridge` — with no per-method `#[refines]` anchors.
-        subscribe_announcement_order_model(),
-        // The supervisor's `[harness]` policy has one writer, the config
-        // watcher; the lane admits generations under it. Twin of the Clean
-        // island in aterm-gui's `config_watcher_island.rs`; Tier-1 in
-        // aterm-gui drives the real `post_harness` and admission path.
-        harness_policy_one_writer_model(),
-        // The observation kernel's change test across an equal-seq
-        // alternate-screen re-entry; Tier-1 in aterm-core's conformance_observe.
-        observation_screen_generation_model(),
-        // The `Wake::Output` latch + lost-wake watchdog: one machine held to two
-        // laws — bounded damage→present (Buggy=1: the one-shot latch)
-        // and no false heal of a queued wake (Buggy=1: the age-only
-        // heal). Tier-1 in aterm-gui's `spawn` (reader latch + watchdog verdict).
-        damage_to_present_model(),
-        wake_heal_evidence_model(),
-        // The resize ledger's render verdict (`status render=`): the engine's
-        // resize journal is the writer, the ledger's verdict the reader, and
-        // the size-difference judge the replayed bug. Tier-1 in aterm-gui's
-        // `resize_ledger` drives a real alternate-screen Terminal through it.
-        resize_render_model(),
-        repaint_nudge_model(),
-        // Fixed-width row-count changes transfer cell slices between live
-        // rows and PageStore's reusable pool. Tier-1 drives Grid/PageStore.
-        resize_row_reuse_model(),
-        // The in-GUI supervisor host's per-session worker lifecycle (one
-        // supervisor per session, the restart budget, the held claim); Tier-1
-        // in aterm-gui's harness_host conformance.
-        harness_worker_lifecycle_model(),
-        // One session's supervisor claim across a seamless update: an
-        // external supervisor is never displaced by the incoming host (round
-        // four, item 9). Tier-1 bound TEST-ONLY — aterm-gui's session_store
-        // test drives the real record, wire, seed and grace decision against
-        // `Commit`, harness_host's the real grace gate — with no `#[refines]`
-        // anchors: `Commit` is a composition of four functions across two
-        // processes, not one seam. Registered so the non-vacuity sweep covers
-        // its invariants.
-        harness_handoff_claim_model(),
-        // A process-table miss on an unchanged agent screen owns a bounded
-        // name retry; Tier-1 drives StatusObserver's real deadline and guard.
-        program_resolution_retry_model(),
-        // A foreground-group replacement owns one latest resolver job and
-        // one queue token, even across a worker restart; Tier-1 drives the
-        // GUI's real PendingJobs transitions and worker.
-        program_resolver_queue_model(),
-        // A stopped Claude footer watch must neither reread a dormant session
-        // nor erase a replacement group's watch. Tier-1 in the GUI scheduler.
-        claude_footer_watch_model(),
-        // The Claude footer names the model the process runs — a choice the
-        // moment its result is written, never the predecessor's, and not lost
-        // to a row larger than the tail window. Tier-1 in aterm-agent's
-        // `conformance_footer_model` over the real transcript reader;
-        // `#[refines]` anchors (`Read`) on `facts_for_entry_from`, the tail
-        // cache's `read_since` and `for_process`, `scan` and `fold_result`,
-        // every other action waived as Claude Code's or a person's (the
-        // crate's `spec-anchors` feature, which aterm-gui's closure gate
-        // links).
-        claude_footer_model_model(),
-        // The event loop's run-loop wake timer: a late
-        // timer costs CoreFoundation one catch-up step, and a spent timer is
-        // re-armed, never trusted. Tier-1 in aterm-objc's `conformance_wake_timer`
-        // over the real CoreFoundation; no `#[refines]` anchors (the crate ships
-        // with zero dependencies).
-        run_loop_waker_model(),
-        // A main-thread verb is refused at once while the main thread is
-        // stalled, and only then: the watchdog's beat
-        // writes the heartbeat's time, `main_stall` reads it with the count
-        // of hops the main thread has not yet taken. Tier-1 in aterm-gui's
-        // watchdog tests drives the real writer, census reset, hop count,
-        // `take_hop` and reader in lockstep, all three defects replayed. No
-        // `#[refines]` anchors, so spec-link closure does not see this bind:
-        // like `program_resolution_retry_model` and `claude_footer_watch_model`
-        // above, it is a Tier-1 test in the GUI with none.
-        main_thread_stall_refusal_model(),
-        // The §3.2 two-way supernova burst mutex over the shared `nova_add`
-        // channel. Tier-1 bound TEST-ONLY — aterm-effects' word_decorations test
-        // `real_burst_grants_conform_to_the_supernova_mutex_model` drives the
-        // real `super_prepass`/`nova_prepass` grants against `action_enabled` —
-        // with no `#[refines]` anchors (aterm-effects carries no `spec-anchors`
-        // feature). Registered so the non-vacuity sweep covers its invariants.
-        supernova_burst_mutex_model(),
-        // The server's agent verdict as the handshake an orchestrator types on:
-        // Claude Code is `idle` only at the prompt box that holds the terminal's
-        // cursor, never on the screens of its launch — nor at the box an earlier
-        // run left above a same-tab relaunch; Tier-1 drives StatusObserver's real
-        // publication over the measured 2.1.283 frames and their cursors. No
-        // `#[refines]` anchors (aterm-phase takes no dependencies).
-        claude_idle_at_composer_model(),
-        transact_model(),
-        kernel_model(),
-        snapshot_model(),
-        read_image_seq_model(),
-        // Cross-process package hints, their wake decisions, and bounded harness
-        // capture lifecycles are Tier-1 bound to the real lock/stamp, GUI decision,
-        // or child/worker path; none claims per-method `#[refines]` anchors.
-        atpkg_index_probe_cooldown_model(),
-        atpkg_index_probe_completion_cadence_model(),
-        // A new host uses the remaining shared cooldown after a suppressed
-        // attempt; Tier-1 binds its fake-clock due decisions in both hosts.
-        atpkg_index_shared_handoff_model(),
-        atpkg_index_successor_selection_model(),
-        atpkg_index_wake_highwater_model(),
-        atpkg_index_pending_park_model(),
-        atpkg_contention_release_park_model(),
-        atpkg_vendor_pending_check_model(),
-        // Who watches the vendor heads: a window, or with none
-        // open one terminal session, never both kinds at once. Tier-1 bound in atpkg
-        // (`vendor_direct::watch::host`) to the real claims; no `#[refines]` anchors.
-        atpkg_head_watch_hosts_model(),
-        // The seated session's near/far index worker and window handoff are
-        // Tier-1 bound to Runner::step with injected HEADs and real claims.
-        atpkg_session_index_handoff_model(),
-        // An empty local eligibility look does not consume the network-probe
-        // cooldown. Tier-1 binds this to the runner's fake-clock steps.
-        atpkg_session_index_eligibility_model(),
-        // Same-build full-pass retries widen after failures; a higher build
-        // bypasses the wait. Tier-1 binds the model to IndexAttempt's clock.
-        atpkg_session_index_retry_model(),
-        // The machine-wide full-pass rule: atpkg's pass writing `status.toml`'s
-        // stamps, the window's gate and the session lane reading them. Tier-1 bound
-        // in atpkg (`status`) and aterm-gui (the gate); no `#[refines]` anchors.
-        atpkg_full_pass_rule_model(),
-        atpkg_published_spacing_model(),
-        harness_capture_worker_lifecycle_model(),
-        // Cold restore's one worker gives every tab a first relaunch attempt
-        // before retrying a waiting tab. Tier-1 drives the real restored
-        // worker with a waiting first tab and a healthy second one.
-        harness_restored_first_attempt_model(),
-        // Harness work in flight at a seamless update's Commit: the restored queue a park freezes
-        // and the successor relaunches, and the restart records its Commit sweeps. Tier-1 drives
-        // the real host's queue and sweep (`harness_host`).
-        harness_restored_carry_model(),
-        // A crashed agent's relaunch through a park's Commit that fails: the Commit's mark on the
-        // session, read whenever its worker decides; an exit no worker was handed, handed by the
-        // host once it supervises again; and the next park carrying a relaunch the rollback queued.
-        // Tier-1 drives the real host (`harness_host`).
-        harness_commit_owed_model(),
-        // The explicit restart: its stamp is on disk BEFORE its signal, its exit is read by
-        // lookup whoever reads it (a successor after a Commit included), and it always ends the
-        // program it stamped. Tier-1 drives the real `restart` verb over a real pty and the
-        // real reader chain (`harness_host`).
-        harness_restart_stamp_model(),
-        // The shared API probe's shutdown takes the waiter's mutex so its
-        // notification cannot be lost before parking. Tier-1 drives the real
-        // loop at this boundary, including the historical unlocked publisher.
-        netprobe_shutdown_park_model(),
-        // The package pass record: the atpkg pass as the WRITER of `status.toml`'s stamps
-        // and the schedulers that read them. Tier-1 drives the real pass and the real
-        // `pkg_check` readers over a real record (atpkg `cli` tests).
-        atpkg_pass_stamps_model(),
-        // The index channel's writer/reader pair: tools/atpkg-index.sh's number and
-        // compare-and-swap decisions and the client's tag walk. Tier-1 in atpkg
-        // (src/net/index_publish_conformance.rs); no `#[refines]` anchors.
-        atpkg_index_publish_walk_model(),
-        harness_upgrade_notice_owner_model(),
-        // The host's relaunch of an agent that left its tab: an exit the harness's own restart made
-        // is carried whoever is at the tab, a person's or a holder's exit is theirs, the launch's
-        // own end is left, a limited one is said, any other is relaunched on a growing back-off or
-        // said to a person. Tier-1 in aterm-agent's `harness::relaunch` tests.
-        harness_relaunch_on_exit_model(),
-        // What an exit left of Claude Code's own record, read as the exit is seen
-        // and kept: a crash is never read as a graceful exit because another Claude
-        // Code removed the dead record during the back-off. Tier-1
-        // in aterm-agent's upgrade tests over the real `exit_record`/`after_exit`;
-        // no `#[refines]` anchors.
-        harness_exit_record_model(),
-        // A Codex's exit, read on its shell's word alone: someone's signal is never relaunched, and
-        // a crash is left only when the word of the block it ran in could not be read at the
-        // attempt either — the thread lock is no witness, nor another command's block. Tier-1 in
-        // aterm-agent's `harness::upgrade_codex_drive` tests over the real
-        // `look_at_exit`/`exit_record`/`after_exit`; no `#[refines]` anchors.
-        harness_codex_exit_witness_model(),
-        // The host hands a worker its agent's exit only for an exit: a name
-        // the roster could not read while the agent still holds its tab is no
-        // exit, an exit that follows is still seen (a short look, the
-        // backstop for one nothing rang for), and the upgrade's own restart
-        // in flight at its exit is carried on whatever `[harness] relaunch`
-        // says — and no other exit in the tab is. Tier-1 in
-        // aterm-gui's harness_host tests over the real host; no `#[refines]`
-        // anchors.
-        harness_leave_model(),
-        // The live upgrade's looks at one session: never let go for what a
-        // look could not read — a READY answer included — and, from the
-        // worker's attach, its note behind asked until the launch's record
-        // reads, the state behind from the attach.
-        // Tier-1 in aterm-gui's harness_host tests over the real `attach`,
-        // `WorkerIdle` and `ask_note`, and in aterm-agent's upgrade tests over
-        // the real classifier (`due_among`, `no_record`); no `#[refines]`
-        // anchors.
-        harness_upgrade_look_model(),
-        // An age belongs to one process: a
-        // retarget carries the age only while the process that counted it is
-        // the holder, and a record for a build the session runs is closed.
-        // Tier-1 in aterm-agent's upgrade_drive tests over the real
-        // `St::for_target` and `forget_settled_pending`; no `#[refines]`
-        // anchors.
-        harness_upgrade_age_model(),
-        // The drain's bound against a person, and the agent's own work — a
-        // status of Claude's own that only lags an idle screen among it:
-        // never ended on, never waited on in silence.
-        // Tier-1 bound to `upgrade::next_step` in aterm-agent's upgrade tests.
-        harness_upgrade_drain_bound_model(),
-        // The live upgrade never strands the agent it asked: never a notice
-        // into a session at its usage limit, a late READY honoured after it
-        // gave up asking, and one release line for every notice it abandons,
-        // at a break of the agent's own work too, no stopped round a
-        // permanent wait (each re-armed once rested), and no agent left
-        // holding by a build that fails to start (the round that asked it
-        // abandoned and its release typed, a pending round's owed one too).
-        // Tier-1 in aterm-agent's `harness::upgrade_drive` tests over the real
-        // reducer, gates and record transitions; no `#[refines]` anchors.
-        harness_upgrade_never_strands_model(),
-        // The end of the agent's own work is the upgrade's point: the first
-        // idle point after work seen since the notice asks again (or re-arms
-        // a rest and asks), never goes to the loop, and
-        // no wait there outlives the re-ask's window (a status lagging the
-        // idle screen). Tier-1 in aterm-agent's `harness::upgrade` tests over
-        // the real reducer on every reachable idle point.
-        harness_upgrade_work_end_model(),
-        // The login wall: nothing of the upgrade's typed where
-        // the wall shows or stands, no give-up spent on a notice the wall
-        // answered, no continuation into a login the supervisor saw gone,
-        // and the owner told before anything else. Tier-1 in aterm-agent's
-        // `conformance_login_wall` over the real readers, reducer and
-        // turn-end decider on every reachable state; no `#[refines]` anchors.
-        harness_login_wall_model(),
-        // The notice queued behind a usage limit: no ask typed behind a notice the model has not
-        // taken, a queued notice typed again straight away at most `REQUEUE_MAX` times and past
-        // that once per rest — a rest that grows with every copy unread, so at most `Daily` copies
-        // go after a rest shorter than a day — no give-up before `MAX_ASKS` asks the model took,
-        // and never quiet while an ask it could read is owed — a full queue included. Tier-1 in
-        // aterm-agent's `harness::upgrade_drive` tests (`upgrade_queued_tests.rs`) over the real
-        // readers, `queue_facts`, clock and reducer on every reachable state; no `#[refines]`
-        // anchors.
-        harness_upgrade_limit_queue_model(),
-        // The live upgrade's Codex branch: when the shared daemon may be moved
-        // onto the managed build. Tier-1 bound in aterm-agent's
-        // `harness::upgrade_codex` tests to the real `daemon_step` over every
-        // reachable state; no `#[refines]` anchors.
-        harness_codex_daemon_update_model(),
-        // The live upgrade's LADDER: the
-        // longer an upgrade has been behind, the less it waits, and no rung
-        // relaxes a floor, nor holds an idle client for another session's
-        // turn once its screen has placed it. Tier-1 in aterm-agent's
-        // `harness::upgrade_drive` ladder tests over every reachable state,
-        // each built into real looks and read by the visit's own assembly
-        // (`ladder_look`, `codex_daemon_turn`, `screen_turn`, `quiet_s`)
-        // through the real `gate`, `rung`, `St::still`, `daemon_turn` and
-        // `daemon_step`, and a replayed incident; `#[refines]`
-        // anchors on those five, the environment's steps and the `Buggy`
-        // members waived (the crate's `spec-anchors` feature, which
-        // aterm-gui's closure gate links). Liveness: `TheUpgradeLands`.
-        harness_upgrade_ladder_model(),
-        // The live upgrade's GOAL PAUSE:
-        // at the Land rung a goal whose own turn is all that holds the move is
-        // paused with `/goal pause` (the Esc only at a goal turn's head), the
-        // move made, and the goal resumed once — never left paused, never
-        // resumed over a person's hand, never under an open save-then-wait
-        // switch. Tier-1 in aterm-agent's `harness::upgrade_drive` goal
-        // tests over every reachable state, through the real
-        // `upgrade_codex::goal_step`, `goal_owed` and `daemon_turn`, the clock
-        // aged through its real readers (`St::rung_at`, `goal_hold_past_bound`,
-        // `goal_rest_until`); `#[refines]` anchors on those three, the world's
-        // steps (the clock's among them) and the `Buggy` members waived.
-        // Liveness: `TheUpgradeLandsUnderAGoal`.
-        harness_upgrade_goal_pause_model(),
-        // NO UPGRADE STUCK FOREVER: the upgrade moves, or its record names
-        // what holds it now — the watch off any point and the class of the
-        // recorded wait; how the owner is then told is the classifier's
-        // (`Row::attention`), bound in aterm-agent. `RecordedWordStands` is a
-        // negative control, proved closed in
-        // tests/derived_harness_upgrade_progress.rs: the read says what holds
-        // the point of an act (`upgrade::held_point`) and the watch records
-        // it, else `upgrade::NEXT_POINT` — for a Claude Code record only (a
-        // Codex record's act read records nothing still), and its
-        // settled-break half a re-decision of the law's truth, not a change of
-        // code (pinned by `..._break_is_a_redecision`). Its sibling,
-        // `LimitRecordForEver`, is the classifier's claim, not this machine's:
-        // `St::limit_until`, `Row::limit_passed`, for a record that read its
-        // reset (a Claude transcript's, a Codex wall's); one that never learns
-        // it is told a week after its wait began, when any usage limit has
-        // ended (`Row::limit_ends_at`, `LONGEST_LIMIT_S`). Tier-1 in
-        // aterm-agent's `harness::upgrade_drive` progress tests (the real
-        // `requested_step`, `break_step`, `Row::attention`, `next_change`) and
-        // watch tests (the real `watch_with`, no hands); `#[refines]` anchors
-        // on those, the world's steps and the `Buggy` members waived.
-        // Liveness: `TheUpgradeMovesOrTheRecordNamesWhatHoldsIt`.
-        harness_upgrade_progress_model(),
-        // The live upgrade's Codex records are collected:
-        // a closed tab's settled record goes after a week, never a live tab's,
-        // an in-flight restart's or a fresh one. Tier-1 in aterm-agent's
-        // `upgrade_codex_drive` tests over the real `codex::prune` and its
-        // registry reading, with the Claude-only prune replayed as the caught
-        // historical defect; no `#[refines]` anchors. Liveness:
-        // `AClosedTabsSettledRecordGoes`.
-        harness_upgrade_state_collection_model(),
-        // The supervisor's done check: a done report is typed the
-        // check, never a plain continuation; the check's done yield ends the
-        // task until someone else's turn. Tier-1 in aterm-agent's
-        // `supervise_conformance_done_check` over the real decider on every
-        // reachable state; no `#[refines]` anchors.
-        supervisor_done_check_model(),
-        // The stall's remedy:
-        // one `signal term` an episode, never under a hand, never a kill.
-        // Tier-1 in aterm-agent's `supervise::stall` tests over the real loop
-        // on every reachable configuration; no `#[refines]` anchors.
-        supervisor_stall_remedy_model(),
-        // The same box is one point (FIX 3): a
-        // request is asked of the manager once however the vendor redraws
-        // it, and every request the loop looks at is asked — two Edit boxes
-        // on one path included. Tier-1 in aterm-agent's
-        // `supervise/run_box_key_tests.rs` over the real loop: each read
-        // projected, the real review key's equalities and each posted ask
-        // bound read by read, the key before FIX 3 replayed through the same
-        // walk as the caught negative control; no `#[refines]` anchors.
-        supervisor_box_ask_model(),
-        // The question answer's recommended path: every key the supervisor sends a question dialog
-        // meets the state it was decided on — no Enter in the free-text field or off the chosen
-        // row, none on a later tab or the review's cancel, none into the composer — under a
-        // person's quiet, the progression rule and the person fence. Tier-1 in aterm-agent's
-        // `policy/question_tests.rs` (the decider) and `run_engine_tests.rs` (the loop); no
-        // `#[refines]` anchors. Its policy-text twin, `supervisor_question_text_model`, is not here
-        // yet: its `Buggy = 1` space outgrows the interpreter's budget (its own doc says so).
-        supervisor_question_answer_model(),
-        // The live upgrade's model priority list: its writers (the automatic
-        // insertion of a model Claude Code recommends, and `upgrade models set`)
-        // against its reader (target selection). Tier-1 bound in aterm-agent's
-        // `conformance_harness` (`upgrade_models` module) to the real
-        // `Priority::admit`, `render`/`parse` and `upgrade_models::target`; no
-        // per-method `#[refines]` anchors.
-        harness_model_priority_model(),
-        // WHEN a due model move is taken.
-        // Tier-1 in aterm-agent tests/conformance_upgrade_models/ladder.rs.
-        harness_model_ladder_model(),
-        // The live upgrade's model SWITCH: the rule (`model_due`,
-        // same family first, then the list), the ladder (`model_moves_now`),
-        // the announcement's stickiness (`model_to`), the ride's guard
-        // (`ride_bar`: the rule's move laws inside the ride) and
-        // the settle step (`ModelRecord::settle`, the due clock, the ask) as
-        // one conversation's lifecycle. Tier-1 bound in aterm-agent's
-        // `conformance_upgrade_models` (`switch` module) to the real visit
-        // (`upgrade_models::model_read_step`, which `upgrade_drive::model_judge`
-        // wraps, and `model_to`) and relaunch (`ModelRecord::asked`, its
-        // `take_back` on a signal never sent, the line's `line_model`, which
-        // drops a `--model` recorded failed, `live_model_at`)
-        // over every reachable state; no `#[refines]` anchors.
-        harness_model_switch_model(),
-        // The supervisor at a network wall (an API error that never reached
-        // the API, a reply cut off): when it types, given what the host
-        // measures of the API's reach — a measured outage typed into at most
-        // once a hold, at most two acts at once per episode however the
-        // measure flaps, lies or is lost. Tier-1 in aterm-agent's
-        // `tests/supervise_conformance_network_wall.rs` over the real
-        // `decide_turn_end`; no `#[refines]` anchors.
-        supervisor_network_wall_model(),
-        // Codex's rate-limit nudge and the save-then-wait switch: the
-        // nudge switched only near the limit, the work saved once on the cheaper
-        // model and nothing else run there (the save's own turn bounded),
-        // the session held on its own model, no continuation into a pursued goal
-        // or a fallen sandbox. Tier-1 in
-        // aterm-agent's `tests/supervise_conformance_codex_rate_nudge.rs` over the
-        // real approval decider, `decide_turn_end` and `TurnEndState`;
-        // `#[refines]` anchors on the deciders it drives (`rate_nudge`,
-        // `open_switch`, `observe`, `goal_stop`, `goal_told`, `wind_down_act`,
-        // `continue_policy`), Codex's, the clock's and a person's steps and
-        // the `Buggy` members waived (the crate's `spec-anchors` feature,
-        // which aterm-gui's closure gate links).
-        supervisor_codex_rate_nudge_model(),
-        // The supervisor at a USAGE wall: a session at a usage wall is
-        // continued once its tokens are back, in bounded time, on a ladder
-        // that never gives up; no first act before the reset the notice names.
-        // Tier-1 in aterm-agent's `tests/supervise_conformance_usage_wall.rs`
-        // over the real reader and `decide_turn_end`; no `#[refines]` anchors.
-        supervisor_usage_wall_model(),
-        // The supervisor's model switch: the fallback is
-        // asked for until the host can make it, the return is made only at a
-        // reset the notice named, and a deferred return holds nothing. Tier-1 in
-        // aterm-agent's `tests/supervise_conformance_model_switch.rs` over the
-        // real `decide_turn_end` and `TurnEndState`; no `#[refines]` anchors.
-        supervisor_model_switch_model(),
-        // The supervisor's account rotation (design record
-        // `docs/DESIGN-claude-accounts-2026-10-01.md` §6, §10): a session at a
-        // usage wall, or ahead of one, is moved to the next account of the
-        // owner's roster by a rotation one session makes alone; the others
-        // follow only once that account has served a response, and take that
-        // session's place once it has been silent ten minutes; the owner's pin
-        // holds; the hour's rotations are bounded. Tier-1 in aterm-agent's
-        // `tests/supervise_conformance_account_rotation.rs` over the real
-        // `accounts::advise` and its transactions, and the real
-        // `decide_turn_end` fed that advice; no `#[refines]` anchors.
-        supervisor_account_rotation_model(),
-        // The accounts probe (`docs/SPEC-claude-accounts-probe-2026-10-01.md`
-        // §5): `/usage` typed only at an idle point with no panel owed and
-        // nobody's hand on the session, the Settings panel sampled only once
-        // settled and read whole by the step that opened it, and closed by an
-        // Escape written only with the panel on the grid, never under a hand
-        // or into a running turn; a panel the loop opened is never forgotten,
-        // and a stuck one is told. Tier-0 in tests/derived_supervise.rs;
-        // Tier-1 (the real `Session` over the scripted server, in
-        // aterm-agent's `run_engine_tests.rs`) is the loop's to add with the
-        // probe; no `#[refines]` anchors.
-        supervisor_usage_probe_model(),
-        // The limit reset (`docs/SPEC-claude-accounts-resets-2026-10-02.md`
-        // §5): the grant row taken once a wall, on a claim made for it, and
-        // never the weekly row in its slot; Enter only on the exact
-        // confirmation of a row this loop took, past the vendor's guard, on
-        // Yes, with the claim in flight; nothing typed, nothing keyed under
-        // a hand; only the vendor's line says a reset was spent; nobody
-        // moved off an account being reset; a confirmation the loop opened
-        // never forgotten. Tier-0 in tests/derived_supervise.rs; Tier-1 (the
-        // real `Session` over a scripted server, in aterm-agent's
-        // `run_engine_tests.rs`) is the loop's to add with the step; no
-        // `#[refines]` anchors. Nothing of it has been seen on a real wall.
-        supervisor_limit_reset_model(),
-        // A pending stub waiting for its program against the pass installing it: it reads
-        // whether the pass runs before whether the shim resolves. Tier-1 bound to the real
-        // decision (`pending_wait_step`) in `atpkg::cli`'s tests.
-        atpkg_pending_wait_model(),
-        // Flip when quiet: an unattended pass stages a new Trust toolchain and
-        // holds its flip while the one it replaces is in use or cannot be told, up to a
-        // ceiling; a revoked build never waits. Tier-1 bound to the real `decide` and
-        // `Busy` classification in `atpkg::quiet`'s tests; no `#[refines]` anchors (atpkg
-        // takes aterm-spec as a dev-dependency only).
-        atpkg_flip_quiet_model(),
-        // Resident operator safety: durable event claims, guarded mutation WAL +
-        // attempted-input epoch, GAP/resnapshot cursors, single-leader epoch
-        // fencing, and the durable fleet-fault gate. Tier-1 binds these scalar
-        // projections to shipping reducers.
-        operator_event_delivery_model(),
-        operator_wal_actuator_model(),
-        operator_resync_cursor_model(),
-        operator_leadership_model(),
-        operator_fleet_fault_model(),
-        // A7 (WS-G): the PTY-master fd-lifecycle ownership discipline — drift-free
-        // twin of FdLifecycle.tla, anchored to aterm-session/src/sink.rs.
-        fd_lifecycle_model(),
-        // WS-G: spawn-time locale guarantee — the child always runs under a UTF-8
-        // LC_CTYPE. Abstract twin of aterm_pty::resolve_spawn_locale (real-code
-        // binding in aterm-pty's spawn_locale_conformance test). Proves-and-catches.
-        spawn_locale_model(),
-        evict_full_model(),
-        tier_residency_model(),
-        recording_model(),
-        coalesce_model(),
-        window_routing_model(),
-        // SELECTION CUSTODY: who owns the reading position and the highlight.
-        //
-        // `SelectionCustody` is ACTIVELY-BOUND — 11/11 actions anchored, Tier-1
-        // conformance driving real gestures and real `Terminal::process` batches
-        // (`aterm_gui::selection_custody_conformance`), run by the gate.
-        //
-        // `PressCustody` is ACTIVELY-BOUND too, through the custody RECORD: five of its eleven
-        // actions (`RepeatPress`, `InertPress`, `ReleaseEvent` are identical in every observable
-        // variable; `OutputAtLive` is an identity transition) cannot be told apart by state, so
-        // `Terminal::note_custody` has the site that DECIDES a transition record which one it was,
-        // and the conformance validates each step against the action the engine named. 16/16
-        // anchored on the four recorders, Tier-1 in `aterm_gui::press_custody_conformance`, run by
-        // the gate.
-        //
-        // Registration alone (independent of anchoring) is what puts BOTH under
-        // `ty check --strict-vacuity` in the repo-wide gate.
-        press_custody_model(),
-        selection_custody_model(),
-        // The mouse-selection lifecycle under that custody: TextSelection's five
-        // calls, each a no-op outside its phase. 5/5 actions anchored in
-        // aterm-selection; Tier-1 in its tests/conformance_text_selection.rs.
-        text_selection_lifecycle_model(),
-        // Introspection / recursive-stacking control plane (audit findings M1/M2/S1).
-        // Tier-1 conformance for these three, the forward-handshake liveness twin,
-        // `capability_secrecy_model` and the authority pair below lives beside the
-        // code it drives (aterm-gui's control.rs, proxy.rs, spawn.rs and lib.rs;
-        // aterm-session's tests/conformance_authorize.rs); none carries
-        // `#[refines]` anchors, so they report here rather than gate the closure.
-        dispatch_complete_model(),
-        relay_teardown_model(),
-        proxy_registry_model(),
-        // Liveness twin: forward-handshake deadlock-freedom (the drain_buffered class).
-        forward_handshake_model(),
-        // TLS-specific bind of the same no-fresh-read-before-buffer-drain wedge.
-        tls_buffered_relay_model(),
-        // The network drive's slots: an unauthenticated connection's slot may go
-        // to a newcomer at capacity, an admitted relay's never, and the
-        // displaced one lets go before the newcomer starts. Tier-1 + `#[refines]`
-        // anchors in aterm-net's drive.rs (r13 NET-1).
-        net_slot_displacement_model(),
-        // Generalized error-class models (F1 info-flow, ordering, reply-fidelity).
-        capability_secrecy_model(),
-        publish_ordering_model(),
-        reply_fidelity_model(),
-        // Capability-layer audit: the trust core's authorization-soundness predicate.
-        authorize_soundness_model(),
-        // Deep-nesting safety: forwarding needs Owner scope (no transitive authority).
-        no_transitive_authority_model(),
-        // An adopted `@<sid>` during a seamless update: the candidate names
-        // itself only at the Commit, and the predecessor serves the id its own
-        // candidate published early anyway while refusing a stranger's. Tier-1
-        // + `#[refines]` anchors in aterm-gui (`control`, `identity_claim`).
-        handoff_address_owner_model(),
-        // A person's grace over a READY answer ends in the upgrade's restart,
-        // never in the loop's `keep going`. Tier-1 in
-        // aterm-gui's harness_host (the real worker's ownership) and
-        // aterm-agent's turn-end policy (the loop's guard).
-        upgrade_attended_turn_end_model(),
-        // The loop's own act, once the agent took it, never withholds a break
-        // of its background work from the host. Tier-1 in aterm-agent's
-        // run_engine_tests over the real loop.
-        supervisor_break_offer_model(),
-        // The point the upgrade acts at next (a READY's restart) is owned
-        // through its settle: every act of the upgrade's, at an idle point or
-        // a break, starts the counts over. Tier-1
-        // in aterm-gui's harness_host over the real worker.
-        upgrade_settle_turn_end_model(),
-        // A notice its own fence refused owns its point for a bounded number
-        // of looks at the first rung, counted on their own and started over
-        // by an act or the owner's word, never renewed by a turn. Tier-1 in
-        // aterm-gui's harness_host.
-        upgrade_refused_turn_end_model(),
-        // GUI native-chrome safety: split-pane tree integrity + session-pool refcount
-        // accounting (the Tier-1 conformance + #[refines] anchors live in aterm-gui).
-        pane_tree_model(),
-        session_pool_model(),
-        // Native titlebar tab-strip parity: the NSSegmentedControl mirror discipline
-        // (seg_count==count, selected==active). Tier-1 conformance + #[refines] anchors
-        // live in aterm-gui (projects the strip lane from WindowState::strip_shadow).
-        tab_strip_model(),
-        // Native first-party tab apps: Tier-0 platform contracts from
-        // docs/NATIVE_TAB_APPS_DESIGN.md section 8. Tier-1 is deliberately added only
-        // with each genuine shipping service; registering the models here makes the
-        // drift-free spec source discoverable to the closure/anchor ledger today.
-        control_connection_admission_model(),
-        // Where a control connection is between requests (request lane, wait
-        // lane, parked); Tier-1 + `#[refines]` anchors in aterm-gui's
-        // `control_lanes.rs`.
-        control_lane_tenure_model(),
-        native_control_routing_model(),
-        native_tab_identity_model(),
-        native_reopen_ledger_model(),
-        closed_recovery_ledgers_model(),
-        native_settings_singleton_model(),
-        native_settings_draft_close_model(),
-        manual_config_handoff_model(),
-        native_packages_worker_model(),
-        native_markdown_history_model(),
-        native_markdown_viewport_model(),
-        native_editor_viewport_model(),
-        native_editor_command_palette_model(),
-        native_recovery_interaction_model(),
-        native_editor_modal_model(),
-        native_config_transaction_model(),
-        serious_mode_intent_queue_model(),
-        config_file_commit_cas_model(),
-        config_catalog_snapshot_model(),
-        composite_accessibility_route_model(),
-        native_document_publication_model(),
-        native_draft_journal_model(),
-        restore_manifest_single_use_model(),
-        native_close_plan_model(),
-        native_save_intent_latch_model(),
-        native_async_delivery_model(),
-        // Smart terminal-title summarization: each session's coalesced async slot is
-        // bound to the latest content + settings generations, including
-        // disable/re-enable; companions prove two-session fairness, timing,
-        // cancellation, owned worker/runtime lifecycle, distinct per-process
-        // managed endpoints with revocation-safe health telemetry, and bounded
-        // retry of transient multi-owner socket snapshots without relaxing the
-        // exact-owner decision.
-        title_summary_model(),
-        title_summary_observation_scheduler_model(),
-        title_summary_runtime_model(),
-        title_summary_managed_endpoint_model(),
-        title_summary_socket_owner_retry_model(),
-        native_updater_model(),
-        // Release/updater channel state machines. The release-floor resolver and
-        // journal/guard Tier-1 live in aterm-release.
-        release_durable_post_intent_model(),
-        roster_pair_redo_model(),
-        release_channel_floor_model(),
-        release_journal_prefix_model(),
-        release_publisher_fence_model(),
-        release_historical_recovery_model(),
-        release_published_identity_model(),
-        release_yank_successor_first_model(),
-        // The one publication a cut makes and who holds the channel's `latest`: the
-        // engine's prerelease source release, the cut's proved assets and its one
-        // guarded head PATCH, and an abandon that withdraws without deleting. Tier-1 in
-        // aterm-release (tests/it/channel_latest.rs) over a fake GitHub; no `#[refines]`
-        // anchors.
-        release_publish_once_model(),
-        // The release claim's writer/reader contract (owner ruling R2): the release
-        // commit carries only the published code, main keeps every peer commit and
-        // ledger line, builds strictly increase, and a claimed-unpublished version is
-        // never read as fresh. Tier-1 lives in aterm-release's claim_landing_model.rs.
-        release_claim_landing_model(),
-        // The whole-tree Trust lane's facts and the one judge that reads them (FACTS,
-        // NOT VERDICTS): verified only from this tree's and this prover's
-        // facts, against these floors, and a floors-only change reuses them. Tier-1
-        // lives in aterm-release's trust_facts_model.rs.
-        trust_facts_reuse_model(),
-        native_update_admission_model(),
-        native_update_auto_intent_model(),
-        native_update_apply_ladder_model(),
-        native_update_hidden_output_quiet_model(),
-        native_update_attempt_identity_model(),
-        native_update_menu_activation_model(),
-        native_update_worker_queue_model(),
-        native_update_status_reconciliation_model(),
-        // The FailedMark writer/reader suppression contract (the 5ffcc15d
-        // crash-loop poison class). Tier-1 conformance + #[refines] anchors
-        // live in aterm-update::manifest.
-        native_update_failed_mark_suppression_model(),
-        // A stage's roster authorization goes stale: the check that admits a roster retires a
-        // revoked stage or stamps a trusted one, and no lane swaps a stage stamped a window ago or
-        // more, so a revocation published a window before a swap is never missed. Tier-1 +
-        // #[refines] anchors live in aterm-update (`github.rs`'s `roster_freshness_conformance`,
-        // over the real `stage_admission_gates` and `observe_floor_and_withdraw_at`).
-        native_update_roster_freshness_model(),
-        // A STRUCTURAL convergence's latch: one
-        // re-sample after a day, never the launch the boot trial reverts on, a
-        // newer verified release takes the activation's place without launching
-        // it, and build N stays covered whatever the digest. Tier-1 + #[refines]
-        // anchors live in aterm-gui (`native_updater_conformance.rs` over the real
-        // `structural_latch`, `spend_physical_failure_budget`,
-        // `AutoApplyManualOnly::covers` and the retire's two answers,
-        // `finish_activation_supersede` / `say_activation_supersede_refused`).
-        native_update_structural_latch_model(),
-        // The boot trial's count under overlapping launches of one build: a launch
-        // is given back by the process that made it, never by the shared count's
-        // movement, and one whose give-back met a held apply lock is owed and paid
-        // by the next holder of the lock. Tier-1 + #[refines]
-        // anchors live in aterm-update's `install_boot_tests.rs` over the real
-        // `count_trial_launch`, `forgive_trial_launch_of_at`, `owe_trial_launch` and
-        // `pay_owed_trial_launches`.
-        native_update_trial_give_back_model(),
-        trail_audio_lifecycle_model(),
-        // The D5 reopen ladder between a device fault and exhaustion, and the
-        // typing-sound seam (D1/D2) with its two readers. Tier-1 for both
-        // lives in aterm-gui (`trail_audio_reopen_conformance.rs`,
-        // `sound_seam_conformance.rs`); neither carries `#[refines]` anchors,
-        // so both report here rather than gate the closure.
-        trail_audio_reopen_ladder_model(),
-        trail_sound_seam_model(),
-        trail_audio_start_latency_model(),
-        asymmetric_pad_layout_model(),
-        visible_pad_crop_model(),
-        focus_modifier_cache_model(),
-        input_release_pairing_model(),
-        tab_stop_handoff_model(),
-        scrollback_maintenance_lane_model(),
-        top_anchored_scroll_history_model(),
-        kitty_sing_detector_model(),
-        pet_stroke_detector_model(),
-        console_life_episode_model(),
-        console_resident_handoff_model(),
-        // The resident's held z-order: under the glyphs at once, back over
-        // only after a clear dwell. Tier-1 in aterm-effects'
-        // console_pet_z_order_hold.rs walks the real PetBrain.
-        console_pet_z_order_model(),
-        // The resident across a coordinate seam: a re-grid keeps the body, a
-        // replaced surface crossfades in place, a blind frame holds it for a
-        // bounded grace. Tier-1 in aterm-effects' pet_coordinate_seams.rs
-        // drives the real CompanionOwner and replays the shipped cut.
-        pet_surface_seam_model(),
-        cursor_cat_earn_floor_model(),
-        cursor_cat_curse_wince_model(),
-        reduced_motion_companion_handoff_model(),
-        cursor_cat_motion_pulse_routing_model(),
-        cursor_hint_license_model(),
-        rainbow_typed_continuity_model(),
-        rainbow_composer_newline_gate_model(),
-        rainbow_short_wrap_park_model(),
-        same_caret_typed_echo_model(),
-        unknown_insert_orphan_key_model(),
-        // The rainbow-kitty echo ledger: a licensed typed move pays the hole
-        // the seam refused out of the presses older than its licensing key,
-        // exactly, and a refusal forgets them. Tier-1 drives the real
-        // `Engine` in aterm-effects/src/rainbow_kitty/mod.rs.
-        echo_ledger_bridge_model(),
-        cursor_viewport_lifecycle_model(),
-        // Resident cursor companions retain personality across a pane/tab
-        // owner edge, but never coordinates or hit targets. A truly
-        // unpresentable focus loss has the same retirement law; recording and
-        // typed-wake focus pins are modeled as explicit preservation controls.
-        // Tier-1 drives the real sync_window/on_focus decisions in aterm-gui.
-        cursor_companion_owner_lifecycle_model(),
-        composed_witness_generation_model(),
-        native_leaf_cache_lifetime_model(),
-        composed_sync_hold_model(),
-        sync_reopen_visibility_model(),
-        cursor_effect_scroll_model(),
-        cursor_scroll_signal_model(),
-        rainbow_landing_pool_model(),
-        native_update_overlap_handoff_model(),
-        // The launched successor presents its rendezvous claim only to the
-        // attested outgoing process; Tier-1 in aterm-gui's handoff_rendezvous
-        // drives the real dial gate with real attested processes.
-        native_update_rendezvous_claim_model(),
-        // The outgoing side: no descriptor leaves toward a dialer whose code is
-        // not the successor's, and nothing is committed to one LaunchServices
-        // disowns. Tier-1 in aterm-gui's app_update_handoff drives the real gate
-        // with a dialer process of other code and the real corroboration.
-        native_update_rendezvous_admission_model(),
-        // The successor around its claim (docs/DESIGN-warm-successor-2026-09-29.md):
-        // no environment mutation once a thread exists, nothing owned, shown or
-        // proved before the claim. Tier-1 in aterm-gui's handoff_env drives the
-        // real snapshot and intake (P1); the warm actions are waived until P2-P4.
-        native_update_successor_warm_before_claim_model(),
-        // The outgoing process's wait for its launched successor's dial ends on
-        // LaunchServices' "terminated before it checked in", never on an answer
-        // a live successor gets. Tier-1 in aterm-gui's app_update_handoff drives
-        // the real accept, abort and corroboration over scripted answers.
-        native_update_launched_dial_wait_model(),
-        native_update_disk_transaction_model(),
-        exact_profanity_completion_model(),
-        settings_page_scroll_model(),
-        // Fixed-path snapshot publication is generation fenced: once a newer
-        // request begins, an overtaken encoder cannot publish stale payload or
-        // its completion marker. Tier-1 binds the real path-generation fence in
-        // aterm-gui/src/app_introspect.rs.
-        snapshot_generation_commit_model(),
-        // A video request owns its pre-created private directory from admission
-        // through recording/export. All abort paths clean it, success transfers
-        // it to publication, and the recording/export slots never overlap.
-        // Tier-1 binds the real GUI lifecycle and process-wide export permit.
-        video_recording_lifecycle_model(),
-        // Per-process media retention prefers an exact lease observation over
-        // numeric PID liveness; only a legacy namespace without a lease may use
-        // the PID fallback. Tier-1 binds the GUI's full lease×PID decision.
-        exact_instance_retention_model(),
-        // Confined artifact I/O retains the original inside object across
-        // ancestor swaps and validates its identity again before replying.
-        // Tier-1 binds GUI/media read and write transactions.
-        anchored_artifact_transaction_model(),
-        // Capture publication continues past worker enqueue: publication guards
-        // are retained and revalidated through the control socket's complete reply
-        // and a fresh causal nonce challenge/echo. ACK-error/half-closed clients
-        // and partial write failures retain the guard in a central quarantine
-        // until its abstract 30-second expiry; only a valid echo releases
-        // immediately.
-        artifact_reply_publication_model(),
-        // Failed ACKs can outlive their control workers, so one process-wide
-        // admission cap spans queued, active, and quarantined artifact replies.
-        artifact_handoff_capacity_model(),
-        // Every video frame/index member is file-synced before its write action;
-        // one directory batch barrier must cover the complete current member set
-        // before the reader-visible publication marker can appear. Tier-1 binds
-        // all three transitions to ConfinedVideoDir.
-        video_batch_publication_durability_model(),
-        // The video producer and `video frames` readers share a bounded lease
-        // count. Marker publication or final reader validation requests one
-        // capability-bound last-release sweep; acquisition is fail-closed from
-        // the last-release decision through sweep completion.
-        artifact_reader_lease_model(),
-        capture_after_present_model(),
-        native_capture_source_model(),
-        // Presented destination capture: one-shot serial-bound lifecycle plus
-        // the streaming staging-slot reuse/drop and sequence-ordered harvested
-        // store disciplines. Shipping pure transition gates and Tier-1 negative
-        // controls live in aterm-gpu.
-        presented_frame_tap_model(),
-        video_tap_slot_model(),
-        // HDR reconfigure/live-validation lifecycle: an f16 DX12 swapchain
-        // remains HDR only after its scRGB re-tag/check succeeds; failure
-        // atomically selects SDR and reconciles capture metadata. Tier-1 lives
-        // in aterm-gpu/tests/hdr_gate.rs.
-        hdr_reconfigure_retag_model(),
-        layout_coordinate_reset_model(),
-        semantic_prewarm_generation_model(),
-        native_preview_font_convergence_model(),
-        semantic_prewarm_handshake_model(),
-        semantic_prewarm_request_swap_model(),
-        // Zoom/typing integrity: whole-surface presentation,
-        // bounded/typed recovery, redraw delivery, and no-flash predictive
-        // visibility. These are scalar prove-and-catch models, so registering
-        // them enrolls every action in the global strict-vacuity audit as well
-        // as making them first-class spec-link targets.
-        surface_coverage_model(),
-        startup_phase_publication_model(),
-        present_retry_model(),
-        gpu_loss_route_model(),
-        gpu_loss_recovery_model(),
-        recovery_redraw_model(),
-        predictive_echo_visibility_model(),
-        // Sink-ordered output-echo receipts may complete on GUI writers in the
-        // opposite order. The tracker retains the highest accepted order and
-        // publishes/samples its timestamp tuple coherently; Tier-1 drives the
-        // real sink receipts and tracker in aterm-gui/src/app_input.rs.
-        output_echo_receipt_publication_model(),
-        // Ordered GUI input admission is per sink: a paste in one session
-        // cannot defer another session's keys. Tier-1 drives the real sink
-        // counters and key-path decision in aterm-gui/src/app_input.rs.
-        paste_order_sink_isolation_model(),
-        ordered_input_admission_model(),
-        // The Claude mode light's return to bypass or auto: a click starts its
-        // presses at once, each next press is decided from the engine's read
-        // on its own deadline and only while Claude is idle, none goes from an
-        // expected mode or into a box, and every stop — deadline, lap,
-        // rejected press — names its mode. Tier-1 drives the real click,
-        // drain, expiry, lap and rejection in aterm-gui/src/claude_lights.rs.
-        claude_mode_return_model(),
-        // A queued key's fast-present wake requires a direct kernel receipt;
-        // Tier-1 drives the GUI decision over real direct, spill and failed
-        // sink receipts in aterm-gui/src/app_input.rs.
-        queued_key_kernel_delivery_model(),
-        // A socket driver's key is never queued behind input a program the
-        // watch has published as not reading has left unread, and nothing else
-        // is refused — a slow read is a warning. Tier-1 drives a real pty and
-        // the shipped `input_backlog::gate` and `classify` in
-        // aterm-session/tests/conformance_input_unread.rs.
-        input_unread_gate_model(),
-        // A program that loses the terminal with program-only modes armed is
-        // handed back at the byte where the foreground group changed. Tier-1
-        // drives the real PTY reader with a scripted foreground probe in
-        // aterm-gui/src/foreground_handback_conformance.rs.
-        foreground_handback_model(),
-        // Who owns an input mode across jobs when the reader MISSES one (a
-        // loaded machine): a re-armed mode is the re-armer's,
-        // so a missed job loses only its own handback. Tier-1 drives the real
-        // PTY reader in aterm-gui/src/foreground_handback_conformance.rs.
-        foreground_handback_ownership_model(),
-        // A self-update carries every history line of a tab or COUNTS it: the join names a sidecar
-        // only over the session's own fenced, contiguous history, and every fallback and failed
-        // sidecar is counted. Tier-1 drives the real export, park, join, sidecar and import in
-        // aterm-gui/src/handoff_history_conformance.rs.
-        native_update_history_carry_model(),
-        // A self-update keeps each window's show state:
-        // the successor stacks the carried windows only once they are on glass
-        // and, on the update lane, only in the call that writes its adoption
-        // proof, gives the keyboard back to the carried key window at Commit
-        // unless the user typed elsewhere, and re-enters full screen only after
-        // Commit and only while aterm is in front. Tier-1 drives the real App
-        // carry and proof path in aterm-gui/src/window_show_conformance.rs.
-        native_update_window_show_model(),
-        // Where an update's successor rebuilds its layout (warm successor P3): a
-        // cold launch only after its first present (RESTORE-1),
-        // the handoff lane in window 0's attach pass, and the proof only once
-        // the rebuild drained and every window painted. Tier-1 drives the real
-        // `restore_pass_due` and paint decision in
-        // aterm-gui/src/restore_pass_conformance.rs.
-        native_update_successor_attach_model(),
-        // The outgoing process's artifact diet (warm successor P5): a layout sidecar written before
-        // the park reaches the successor only once the park read it back byte-equal to its own
-        // layout, and every retired attempt sweeps it. Tier-1 drives the real writer, seal, reader
-        // and sweep in aterm-gui/src/handoff_diet.rs.
-        native_update_speculative_sidecar_model(),
-        // A health warning that crosses a self-update is handed to the producer
-        // here whose proof heals it, its digest line claimed again; the
-        // ledger's healing never ends the stall. Tier-1 drives the real seed, door and watchdog in
-        // aterm-gui/src/carried_health_conformance.rs.
-        native_update_carried_health_model(),
-        // A self-update's pre-Commit input queue: a focus
-        // loss marks it incoherent only when input for that window is already
-        // queued ahead of it, so the replay's repair — disarming the ambient
-        // modifiers — happens for a real drop or reorder and never for winit's
-        // startup `Focused(false)`. Tier-1 drives the real queue, `on_focus` and
-        // settle in aterm-gui/src/precommit_input_conformance.rs; no
-        // `#[refines]` anchors.
-        native_update_precommit_input_model(),
-        // An unsaved editor tab rides a self-update: its
-        // draft is carried by the crash journal the successor replays when it
-        // reopens the file, and the outgoing process commits only when the image
-        // read back at Commit replays to exactly its editor's text and no write
-        // of its own landed after the park; a rollback re-seats every journal
-        // the successor republished. Tier-1 drives a real outgoing App and a
-        // real successor App over one journal directory in
-        // aterm-gui/src/editor_carry_conformance.rs.
-        native_update_editor_carry_model(),
-        // A driver's own lease never re-grids the session it may still type
-        // into, so its `if-gen=` fence is never refused by a repaint its own
-        // hand caused. Tier-1 drives the real `turn` and `lease` verbs on a
-        // real pty against the real presence projection in
-        // aterm-gui/src/driver_geometry_conformance.rs.
-        driver_geometry_model(),
-        // The window's chrome regrow floor:
-        // after any rise of a window's chrome rows, no source's quiet fall
-        // re-grids it back inside `CHROME_REGROW_SETTLE` (a presence row born
-        // 4-6 ms before the band's quiet shrink, a band row rising just before
-        // the presence row's fold, shifted a busy alternate screen). Tier-1
-        // drives the real App path in aterm-gui/src/chrome_regrow_conformance.rs;
-        // `#[refines]` anchors on the two re-grid points, the rest waived.
-        chrome_regrow_floor_model(),
-        // The owner's debugger-access change (docs/DESIGN-macos-debugger-access-
-        // 2026-09-29.md §5.1; rulings O7/O8): `DevToolsSecurity
-        // -enable`/`-disable` runs only after the owner's "Allow…" in aterm's
-        // alert, only over a fresh `-status` read of its precondition under the
-        // Mac-wide change lock, one child on the Mac at a time, and a surface
-        // says "allowed" only when a probe read it. The race between the re-read
-        // and the tool's own write is named (`ChildClobbers`), and Tier-0
-        // requires its counterexample. Tier-1 drives the real lane, worker and
-        // order in aterm-gui/src/debugger_access.rs.
-        debugger_access_change_model(),
-        // An unsaved Settings draft rides a seamless self-update: the handoff layout carries each
-        // Settings view's field drafts, the successor reopens the view holding them (or says which
-        // it could not), the Commit re-captures and compares Settings leaves in full so a key typed
-        // during the overlap keeps the outgoing process, and neither the cold lane nor an older
-        // successor may spend a token that carries one. Tier-1 drives a real outgoing App and a
-        // real successor App over the real layout wire in
-        // aterm-gui/src/settings_draft_carry_conformance.rs.
-        native_update_settings_draft_carry_model(),
-        // The rendezvous grant across a version boundary: the chunked `ATRZ2G` grant is offered
-        // only to a candidate whose verified bundle declares it, claimed only when offered, sent
-        // only to an `ATRZ2C` claim of more than 62 sessions, and adopted only whole. Tier-1 drives
-        // the shipping decisions and a real chunked grant in aterm-gui's handoff_rendezvous tests.
-        native_update_rendezvous_grant_model(),
-        // The crash journal's claim (PTY keeper P1): a window's
-        // layout journal is taken once, never while its owner runs, reopened
-        // only after an unclean end the crash marker attests, never when the
-        // launch that wrote it had itself reopened a journal and died within
-        // 90 s, and always left whole by a death mid-rewrite. Tier-1 drives the
-        // real owner and claim over a real directory, lock and crash markers
-        // in aterm-gui/src/crash_journal_conformance.rs.
-        crash_journal_claim_model(),
-        // The PTY keeper (P2): custody of every master outside the
-        // window — never two readers, an offer only with no live holder, a
-        // closed tab never handed on, no relaunch after a quit, and a shell
-        // lost only when the keeper also failed — and the relaunch brake's
-        // writer/reader pair. Tier-1 drives the real KeeperCore and
-        // RelaunchBrake in aterm-keeper/src/conformance_custody.rs.
-        pty_keeper_custody_model(),
-        keeper_relaunch_brake_model(),
-        // The keeper's judgement of one window's end (P3's limits):
-        // a quit whose BYE was lost is told from a crash by the kernel's exit
-        // status AND the window's crash marker agreeing, never by either alone,
-        // and an orphan whose shell dies is pruned on its leader's exit. Tier-1
-        // drives the real classifier and KeeperCore in
-        // aterm-keeper/src/conformance_custody.rs.
-        keeper_death_judgement_model(),
-        // A shell spawned before the re-key channel is healed by a key its
-        // relaunch line reads from a one-use file, and a key whose line never
-        // ran is taken back, file and all. Tier-1 drives the real issue and
-        // settle, engine and file in aterm-gui/src/typed_rekey_conformance.rs.
-        typed_rekey_model(),
-        // The relaunch line's read of a returned prompt:
-        // never typed after a person's keys at a marked prompt, and typed at
-        // a prompt nobody keyed whatever the shell's mark names. Tier-1 drives
-        // the real relaunch line in aterm-agent's upgrade_drive_tests.
-        relaunch_prompt_read_model(),
-        // Streaming-search lifecycle: drift-free twin of aterm-search's
-        // StreamingSearch engine. Registering it enrolls every action in the
-        // global strict-vacuity audit, the verifier ledger, and trust-ir
-        // spec-link; #[refines] anchors + Tier-1 lockstep live in aterm-search.
-        streaming_search_model(),
-        // Budgeted full-buffer search's owner-level resume capability. This is
-        // distinct from StreamingSearch: it proves reset + fresh search identity
-        // across restart classes, cursor retirement, one-turn completion, and
-        // scan-complete result-delta draining without row replay. #[refines]
-        // anchors live on Terminal's public calls; Tier-1 drives real returned
-        // steps in aterm-core/tests/conformance_budgeted_search.rs.
-        budgeted_search_resume_model(),
-        // Host-minted OSC-8 hyperlink scheme capability (orca deep-links §7):
-        // bounded extra-scheme set, never-allow refusal, revoke restores the
-        // default allowlist. #[refines] anchors live on
-        // Terminal::authorize_hyperlink_scheme / revoke_hyperlink_scheme and
-        // the OSC-8 acceptance handler; Tier-1 conformance in aterm-core
-        // (conformance_hyperlink_scheme_cap.rs).
-        hyperlink_scheme_cap_model(),
-    ]
+/// One registered model. `ty_model!` submits every model it writes and `#[model]` a hand-built
+/// one, so the registry is exactly the set of models linked into the binary.
+#[derive(Debug, Clone, Copy)]
+pub struct RegisteredModel {
+    /// Builds the model.
+    pub build: fn() -> Model,
+    /// The configurations it declares beside the committed one (`scenario` in `ty_model!`): each
+    /// a set of constant overrides the real code also runs under, swept like the committed one.
+    pub scenarios: &'static [&'static [(&'static str, i64)]],
+    /// Where it was written (`file:line`).
+    pub location: &'static str,
 }
 
-/// Every LIVENESS obligation, beside the registered model it is stated over.
-///
-/// The invariant ratchet (`tests/non_vacuity_ratchet.rs`) finds every invariant
-/// through [`model_registry`]; a liveness obligation is a companion value, not a
-/// model field (see [`crate::derive::Liveness`]), so this is where the sweep
-/// finds IT. Registering here puts the obligation under the workspace sweep:
-/// proved at the committed config, broken by each of its named mutants alone,
-/// on a model that is itself in [`model_registry`].
-// Skip: builds the registry by calling the (T2-classified) `*_model()` data
-// constructors — the vec! alloc + their absent bodies. Spec tooling, same tier
-// as `model_registry`.
+/// One registered liveness obligation, submitted by `#[liveness(model)]` with the model it is
+/// stated over.
+#[derive(Debug, Clone, Copy)]
+pub struct RegisteredLiveness {
+    /// Builds the model the obligation holds of.
+    pub model: fn() -> Model,
+    /// Builds the obligation.
+    pub liveness: fn() -> crate::derive::Liveness,
+    /// Where it was written (`file:line`).
+    pub location: &'static str,
+}
+
+crate::registry::collect!(RegisteredModel);
+crate::registry::collect!(RegisteredLiveness);
+
+/// Every model linked into this binary, in name order. The non-vacuity sweep holds each design
+/// invariant to a catching mutant, `spec-check` re-checks each model under `ty`, and the closure
+/// resolves an anchor's `machine` against this set.
+// Skip: calls every registered model constructor. Spec tooling.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn model_registry() -> Vec<Model> {
+    registered().into_values().map(|(m, _, _)| m).collect()
+}
+
+/// Every registered model in every configuration it declares (the committed one first, then each
+/// `scenario`), in [`model_registry`]'s order. The sweeps hold all of them: a law, an action or a
+/// mutant may matter only in a configuration the committed one does not reach.
+// Skip: same class as `model_registry`.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn model_configurations() -> Vec<Vec<Model>> {
+    registered()
+        .into_values()
+        .map(|(m, scenarios, _)| {
+            let scenarios = scenarios
+                .iter()
+                .map(|overrides| crate::interp::with_consts(&m, overrides));
+            std::iter::once(m.clone()).chain(scenarios).collect()
+        })
+        .collect()
+}
+
+/// Every liveness obligation linked into this binary, beside the registered model it is stated
+/// over, in (model, obligation) name order.
+// Skip: same class as `model_registry`.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn liveness_registry() -> Vec<(Model, crate::derive::Liveness)> {
-    use crate::derive::*;
-    vec![
-        // An unnamed exception ends by its own clock,
-        // under nothing but time and the loop's wake. Tier-0 in
-        // tests/derived_exceptions_digest.rs, interpreter and `ty` both.
-        (
-            exceptions_digest_ends_model(),
-            exceptions_digest_ends_liveness(),
-        ),
-        // Law 1 of the apply ladder: the staged build lands. Tier-0 in
-        // tests/derived_ring_ty.rs, interpreter and `ty` both.
-        (
-            native_update_apply_ladder_model(),
-            native_update_apply_ladder_liveness(),
-        ),
-        // The explicit restart ends the program it stamped: its escalation, or the
-        // successor's carrier after a Commit. Tier-0 in tests/derived_harness_restart.rs.
-        (
-            harness_restart_stamp_model(),
-            harness_restart_stamp_liveness(),
-        ),
-        // The driver's geometry: a row a moved lease holds
-        // catches up with the live want once the wake is handled. Tier-0 in
-        // tests/derived_driver_geometry.rs.
-        (driver_geometry_model(), driver_geometry_liveness()),
-        // The relaunch line types at a prompt nobody keyed (a misplaced mark read as typing never
-        // keeps it out for good). Tier-0 in tests/derived_relaunch_prompt_read.rs.
-        (
-            relaunch_prompt_read_model(),
-            relaunch_prompt_read_liveness(),
-        ),
-        // The chrome regrow floor: a fall it waits is applied
-        // once its own quiet and the floor have run — the floor delays a
-        // re-grid, never loses one. Tier-0 in tests/derived_chrome_regrow.rs.
-        (chrome_regrow_floor_model(), chrome_regrow_floor_liveness()),
-        // The owner's debugger-access change: an exited change
-        // child's result is always taken and re-probed — the park's
-        // `RESULT_RECHECK` re-read (`WF(Notice)`), not the result's wake.
-        // Tier-0 in tests/derived_debugger_access.rs.
-        (
-            debugger_access_change_model(),
-            debugger_access_change_liveness(),
-        ),
-        // The supervisor's `[harness]` policy: the window catches
-        // up with the file once edits stop, whatever the lane admitted and
-        // wherever the Commit fell. Tier-0 in
-        // tests/derived_harness_policy_one_writer.rs.
-        (
-            harness_policy_one_writer_model(),
-            harness_policy_one_writer_liveness(),
-        ),
-        // An update's successor proves (warm successor P3): the rebuild moved
-        // into window 0's attach pass still ends in the proof. Tier-0 in
-        // tests/derived_update_parallel_attach.rs.
-        (
-            native_update_successor_attach_model(),
-            native_update_successor_attach_liveness(),
-        ),
-        // The artifact diet never holds the grant (P5): every attempt is
-        // granted or retired, a refused speculation included. Tier-0 in
-        // tests/derived_update_parent_diet.rs.
-        (
-            native_update_speculative_sidecar_model(),
-            native_update_speculative_sidecar_liveness(),
-        ),
-        // The warm successor proves or exits (P2): the warm prologue before
-        // the dial delays the dial, never withholds it. Tier-0 in
-        // tests/derived_successor_warm_before_claim.rs.
-        (
-            native_update_successor_warm_before_claim_model(),
-            native_update_successor_warm_before_claim_liveness(),
-        ),
-        // A successor that dies before its dial ends the parent's wait without
-        // the dial budget. Tier-0 in
-        // tests/derived_launched_dial_wait.rs.
-        (
-            native_update_launched_dial_wait_model(),
-            native_update_launched_dial_wait_liveness(),
-        ),
-        // Codex's save-then-wait switch: the session comes back to its own
-        // model. Tier-0 in tests/derived_supervise.rs.
-        (
-            supervisor_codex_rate_nudge_model(),
-            supervisor_codex_rate_nudge_liveness(),
-        ),
-        // The live agent upgrade's ladder: the upgrade lands, or a floor no
-        // rung relaxes stands. Tier-0 in
-        // tests/derived_harness_upgrade_ladder.rs, interpreter and `ty` both.
-        (
-            harness_upgrade_ladder_model(),
-            harness_upgrade_ladder_liveness(),
-        ),
-        // The goal pause: the upgrade lands under a goal that never pauses by
-        // itself, and leaves it pursued. Tier-0 in
-        // tests/derived_harness_upgrade_goal_pause.rs.
-        (
-            harness_upgrade_goal_pause_model(),
-            harness_upgrade_goal_pause_liveness(),
-        ),
-        (repaint_nudge_model(), repaint_nudge_liveness()),
-        // A usage wall ends once the tokens are back. Tier-0 in
-        // tests/derived_supervise.rs, interpreter and `ty` both.
-        (
-            supervisor_usage_wall_model(),
-            supervisor_usage_wall_liveness(),
-        ),
-        // The tab at a model limit is moved to the fallback once the host can
-        // make it. Tier-0 in tests/derived_supervise.rs.
-        (
-            supervisor_model_switch_model(),
-            supervisor_model_switch_liveness(),
-        ),
-        // A session at a usage wall is moved once an account it could run on
-        // is usable, unless its jobs, the canary's ten-minute hold or the
-        // breaker hold it — a claim about a session whose host
-        // makes the relaunch or says `wait:`; one it refused is latched, which
-        // the model leaves out. Tier-0 in tests/derived_supervise.rs.
-        (
-            supervisor_account_rotation_model(),
-            supervisor_account_rotation_liveness(),
-        ),
-        // A `/usage` panel the harness opened does not stand for good while
-        // nothing stands in the Escape's way — a person's hand, a hold and a
-        // running turn are exceptions in the goal, not fairness assumed of
-        // the world. Tier-0 in tests/derived_supervise.rs.
-        (
-            supervisor_usage_probe_model(),
-            supervisor_usage_probe_liveness(),
-        ),
-        // A limit reset's claim, which holds every other session of the
-        // account at its wall, does not stay in flight for good: the loop
-        // reads its line, the clock ends a claim with no outcome, and the
-        // vendor answers its own claim. Tier-0 in
-        // tests/derived_supervise.rs.
-        (
-            supervisor_limit_reset_model(),
-            supervisor_limit_reset_claim_liveness(),
-        ),
-        // A confirmation the harness's row opened does not stand for good
-        // while nothing stands in the Escape's way — a person's hand and a
-        // hold are exceptions in the goal, not fairness assumed of the world.
-        // Tier-0 in tests/derived_supervise.rs.
-        (
-            supervisor_limit_reset_model(),
-            supervisor_limit_reset_confirmation_liveness(),
-        ),
-        // No upgrade stuck forever: the upgrade moves, or its record names what
-        // holds it. Tier-0 in
-        // tests/derived_harness_upgrade_progress.rs, interpreter and `ty`
-        // both.
-        (
-            harness_upgrade_progress_model(),
-            harness_upgrade_progress_liveness(),
-        ),
-        // The Codex records: a closed tab's settled record goes. Tier-0 in
-        // tests/derived_harness_state_collection.rs.
-        (
-            harness_upgrade_state_collection_model(),
-            harness_upgrade_state_collection_liveness(),
-        ),
-    ]
+    let models = registered();
+    let mut entries: Vec<(Model, crate::derive::Liveness)> =
+        crate::registry::iter::<RegisteredLiveness>()
+            .map(|r| {
+                let name = (r.model)().name;
+                (models[name].0.clone(), (r.liveness)())
+            })
+            .collect();
+    entries.sort_by(|a, b| a.0.name.cmp(b.0.name).then(a.1.name.cmp(b.1.name)));
+    entries
+}
+
+/// Every hand-written `.tla` under `aterm-spec-models/specs`, at any depth, sorted: the external
+/// modules beside the registered models. One walker, so `spec-check` and the closure hold the
+/// same set.
+///
+/// # Errors
+///
+/// When the directory cannot be read or holds no spec.
+// Skip: a directory walk. Spec tooling.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn hand_written_specs() -> Result<Vec<std::path::PathBuf>, String> {
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) -> std::io::Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                walk(&path, out)?;
+            } else if path.extension().is_some_and(|e| e == "tla") {
+                out.push(path);
+            }
+        }
+        Ok(())
+    }
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../aterm-spec-models/specs");
+    let mut specs = Vec::new();
+    walk(&dir, &mut specs).map_err(|e| format!("no specs at {}: {e}", dir.display()))?;
+    specs.sort();
+    if specs.is_empty() {
+        return Err(format!("no .tla under {}", dir.display()));
+    }
+    Ok(specs)
+}
+
+/// A registered model, the scenarios it declares, and where it was written.
+type Registered = (
+    Model,
+    &'static [&'static [(&'static str, i64)]],
+    &'static str,
+);
+
+/// Every registered model by name: each one a `ty_model!` or `#[model]` registers, and each one a
+/// `#[liveness]` obligation is stated over, so no obligation's model escapes the sweeps.
+///
+/// A name is a model's identity (the machine an anchor names, the module `trust-ir` links), so one
+/// name is one model: the same model registered twice is one entry.
+///
+/// # Panics
+///
+/// When two different models share a name.
+// Skip: same class as `model_registry`.
+#[cfg_attr(trust_verify, trust::skip)]
+fn registered() -> BTreeMap<&'static str, Registered> {
+    let mut by_name: BTreeMap<&'static str, Registered> = BTreeMap::new();
+    let models =
+        crate::registry::iter::<RegisteredModel>().map(|r| ((r.build)(), r.scenarios, r.location));
+    let stated_over =
+        crate::registry::iter::<RegisteredLiveness>().map(|r| ((r.model)(), &[][..], r.location));
+    for (m, scenarios, location) in models.chain(stated_over) {
+        match by_name.get_mut(m.name) {
+            None => {
+                by_name.insert(m.name, (m, scenarios, location));
+            }
+            Some(known) => {
+                assert!(
+                    known.0.to_tla() == m.to_tla() && known.0.to_cfg() == m.to_cfg(),
+                    "two different models are named `{}` ({} and {}): a name is a model's \
+                     identity, so give one of them its own",
+                    m.name,
+                    known.2,
+                    location
+                );
+                if known.1.is_empty() {
+                    known.1 = scenarios;
+                }
+            }
+        }
+    }
+    by_name
 }
 
 /// The action/anchor name set of an embedded [`Model`] — for embedded models the
 /// invariant-def and coverage-action namespaces coincide, so both
 /// [`SpecModule::invariant_names`] and [`SpecModule::coverage_actions`] use this.
-// Explicit insert loop (not `collect`) so the Trust L0 allocation check sees
-// per-element growth instead of an unbounded bulk allocation.
+// An insert loop, not `collect`, so Trust L0 sees per-element growth.
 // Skip: BTreeSet keyed build + iterator `next` (absent std bodies).
 #[cfg_attr(trust_verify, trust::skip)]
 fn embedded_action_set(m: &Model) -> BTreeSet<String> {
@@ -2193,7 +974,7 @@ fn embedded_action_set(m: &Model) -> BTreeSet<String> {
 }
 
 /// A registered spec module — an embedded [`Model`] or a parsed external `.tla`.
-/// Obligation 4 (machine resolves) is satisfied by EITHER variant.
+/// Obligation 4 (machine resolves) is satisfied by either variant.
 pub enum SpecModule {
     /// An embedded `ty_model!`/`derive` model (the default, drift-free).
     Embedded(Model),
@@ -2210,33 +991,20 @@ impl SpecModule {
         }
     }
 
-    /// The names a REFINEMENT / WAIVER anchor may RESOLVE to for obligation 1
-    /// ("action exists"). This is the ACTION namespace — for an embedded model its
-    /// `Action` names; for an external `.tla` the `Next` disjuncts ONLY (the
-    /// [`coverage_actions`](Self::coverage_actions) set), NOT every top-level def.
-    ///
-    /// TRUST_VACUITY_GATE §2.4 (finding 4): resolving against every top-level def
-    /// would let an external `#[refines]` aimed at `Init`/`TypeOK`
-    /// over-resolve. This matches the lowered Trust artifact, which emits only
-    /// `coverage_actions()` and checks Ob.1 against that (the L3 lock), so such an
-    /// anchor fails Ob.1 in BOTH paths. `#[spec_invariant]` uses the wider
+    /// The names a refinement or waiver anchor may resolve to (obligation 1): an embedded model's
+    /// actions, or an external `.tla`'s `Next` disjuncts only
+    /// ([`coverage_actions`](Self::coverage_actions)), never every top-level definition, so a
+    /// `#[refines]` aimed at `Init` or `TypeOK` fails Ob.1 here as in the lowered Trust artifact
+    /// (TRUST_VACUITY_GATE §2.4). `#[spec_invariant]` uses the wider
     /// [`invariant_names`](Self::invariant_names).
     pub fn action_names(&self) -> BTreeSet<String> {
         self.coverage_actions()
     }
 
-    /// The names a `#[spec_invariant]` `id` may RESOLVE to (obligation 1 for the
-    /// INVARIANT arm ONLY). This is the full top-level definition set — for an
-    /// embedded model its action names; for an external `.tla` EVERY top-level
-    /// definition (`t.actions`), because an invariant legitimately names a non-`Next`
-    /// def like `TypeOK`/`Confined`.
-    ///
-    /// TRUST_VACUITY_GATE §2.4: this is the deliberately-WIDER set used ONLY by the
-    /// `#[spec_invariant]` id arm, kept separate from [`action_names`](Self::action_names)
-    /// (the Next-only set the refinement/proof/waiver arms use) so narrowing the action
-    /// set does not break invariants that name `TypeOK`-style defs.
-    // Skip: `BTreeSet`/`BTreeMap` keyed build + iterator `next` (absent std
-    // bodies). Spec-anchor ledger machinery read by the xref gate.
+    /// The names a `#[spec_invariant]` `id` may resolve to: an embedded model's actions, or every
+    /// top-level definition of an external `.tla`, since an invariant legitimately names a
+    /// non-`Next` def like `TypeOK` (TRUST_VACUITY_GATE §2.4).
+    // Skip: BTreeSet keyed build over std bodies the prover lacks. Spec-anchor ledger machinery.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn invariant_names(&self) -> BTreeSet<String> {
         match self {
@@ -2245,16 +1013,12 @@ impl SpecModule {
         }
     }
 
-    /// The real ACTION set used for the COVERAGE obligation (obligation 3): every
-    /// action must be bound-or-waived for an actively-bound machine. For an embedded
-    /// model this is its `Action` names (same as [`action_names`](Self::action_names)).
-    /// For an external `.tla` it is the disjuncts of `Next == …` ONLY — NOT every
-    /// top-level def, so coverage never demands a `#[refines]` for `Init`/`Spec`/
-    /// `TypeOK`/an invariant/a named constant (which are not actions). When a spec has
-    /// no parseable `Next` disjuncts (defensive), fall back to the full def set so
-    /// coverage cannot be vacuously satisfied.
-    // Skip: BTreeSet keyed build + iterator `next` (absent std bodies) —
-    // same class as `invariant_names`. Spec-coverage machinery.
+    /// The action set of the coverage obligation (obligation 3), all of which an actively bound
+    /// machine must bind or waive: an embedded model's actions, or an external `.tla`'s `Next`
+    /// disjuncts, so coverage never demands a `#[refines]` for `Init`, `Spec`, `TypeOK`, an
+    /// invariant or a constant. A spec with no parseable `Next` disjuncts falls back to the full
+    /// definition set, so coverage cannot pass vacuously.
+    // Skip: BTreeSet keyed build over std bodies the prover lacks. Spec-coverage machinery.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn coverage_actions(&self) -> BTreeSet<String> {
         match self {
@@ -2270,19 +1034,14 @@ impl SpecModule {
     }
 }
 
-/// Whether an anchor's `machine` string resolves to a `SpecModule` named `name`.
-///
-/// Anchors use a lower_snake/lowercase convention (`"terminal_modes"`,
-/// `"window_routing"`, `"ring"`) while a `Model::name`/MODULE is CamelCase
-/// (`"TerminalModes"`, `"WindowRouting"`, `"Ring"`). We match case-insensitively
-/// after stripping `_`, so `"terminal_modes"` ⟺ `"TerminalModes"`.
+/// Whether an anchor's `machine` resolves to a `SpecModule` named `module_name`: anchors are
+/// lower_snake (`"terminal_modes"`), models CamelCase (`"TerminalModes"`), so the match is
+/// case-insensitive with `_` stripped.
 pub fn machine_matches(anchor_machine: &str, module_name: &str) -> bool {
     // Skip: char-filter iterator `next` + String alloc (absent std bodies).
     #[cfg_attr(trust_verify, trust::skip)]
     fn norm(s: &str) -> String {
-        // Explicit push loop (not `collect`) so the Trust L0 allocation check sees
-        // per-element growth instead of an unbounded bulk allocation;
-        // behavior-identical.
+        // A push loop, not `collect`, for Trust L0's allocation check.
         let mut out = String::new();
         for c in s.chars() {
             if c == '_' {
@@ -2300,19 +1059,15 @@ pub fn machine_matches(anchor_machine: &str, module_name: &str) -> bool {
 /// A single obligation failure (for a readable aggregate error).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClosureViolation {
-    /// Which of the four §2.2 obligations was violated (1, 3, or 4 here; 2 —
-    /// "symbol resolves to a live DefId" — needs the Trust IR lowering of Phase 3,
-    /// so it is out of scope for the Phase-0 aterm-local gate and not asserted).
-    /// See [`StepEvidence`] for the executable fragment of obligation 2 that the
-    /// conformance-owning gates DO assert: per-STEP function-entry evidence, which
-    /// is strictly weaker than symbol resolution and says so in its own summary.
+    /// Which §2.2 obligation was violated: 1, 3 or 4. Obligation 2 (the symbol resolves to a live
+    /// `DefId`) needs compiler-owned identities this gate does not have; [`StepEvidence`] is its
+    /// executable, weaker fragment (per-step function-entry evidence).
     pub obligation: u8,
     pub message: String,
 }
 
-/// A per-machine coverage line for the report (printed for every active machine,
-/// and surfaced for the non-active embedded models so ratios are visible — the
-/// "REPORT the rest" half of obligation 3).
+/// One module's coverage line for the report. Obligation 3 holds an active machine to full
+/// coverage; an inactive one's ratio is only reported.
 #[derive(Debug, Clone)]
 pub struct MachineCoverage {
     pub machine: String,
@@ -2328,14 +1083,9 @@ impl MachineCoverage {
         if self.total_actions == 0 {
             return 1.0;
         }
-        // Saturating: `bound` and `waived` are disjoint in-memory sets, so their
-        // combined size can never exceed `usize::MAX` — saturation is a no-op on
-        // every real input; it only discharges the unconstrained-input overflow
-        // obligation (Trust L0).
+        // Saturating and `max(1)` only discharge Trust L0's overflow and divisor obligations;
+        // neither changes a reachable result.
         let covered = self.bound.len().saturating_add(self.waived.len());
-        // `max(1)`: `total_actions == 0` already returned above, so the clamp is
-        // a no-op on every reached input; it only discharges the
-        // unconstrained-divisor obligation (Trust L0).
         covered as f64 / self.total_actions.max(1) as f64
     }
 }
@@ -2369,14 +1119,12 @@ struct AnchorObligationSpec<'a> {
     known: &'a str,
 }
 
-/// Shared Ob.4 ("machine exists") + Ob.1 ("action/id exists") arm for one anchor:
-/// push a [`ClosureViolation`] when `resolved` is `None`, else when `target` does
-/// not resolve in the namespace `select`ed from the module's index. `site` is the
-/// anchor's rendered position (e.g. `"#[refines] at src/x.rs:3 (Foo::bar)"`);
-/// `authoring_hint` appends the refinement arm's "Either author the model…"
-/// tail to the Ob.4 message; `noun`/`known` fix the Ob.1 wording ("action"/
-/// "actions" vs "id"/"definitions"). `target == None` skips Ob.1 (a waiver with
-/// no action). Message text is byte-identical to the former per-arm formats.
+/// The Ob.4 ("machine exists") and Ob.1 ("action/id exists") arm for one anchor: push a
+/// [`ClosureViolation`] when `resolved` is `None`, else when `target` does not resolve in the
+/// namespace `select`ed from the module's index. `site` is the anchor's rendered position (e.g.
+/// `"#[refines] at src/x.rs:3 (Foo::bar)"`), `authoring_hint` appends the refinement arm's
+/// "Either author the model…" tail to the Ob.4 message, `noun`/`known` fix the Ob.1 wording, and
+/// a `None` target (a waiver with no action) skips Ob.1.
 fn check_anchor_obligations(
     violations: &mut Vec<ClosureViolation>,
     resolved: Option<&ModuleActionIndex>,
@@ -2424,63 +1172,32 @@ fn check_anchor_obligations(
     }
 }
 
-/// Enforce the four bidirectional obligations of TRUST_NATIVE_TLA §2.2 over the
-/// given `SpecModule`s, the collected `refinements`, `waivers`, and
-/// `invariant_anchors`. This is the runnable `trust-spec-link` (Phase 0).
+/// Enforce the bidirectional obligations of TRUST_NATIVE_TLA §2.2 over `modules` and the
+/// collected refinements, waivers and invariant anchors:
 ///
-/// Obligations enforced:
-///   1. **Action exists** — every `refines`/`spec_invariant` action (and every
-///      waiver action, when present) names a real definition in its module.
-///   3. **Coverage** — for every machine that has ≥1 refinement (an *active*
-///      machine), every model `Action` is bound-or-waived, i.e. `ratio == 1.0`.
-///   4. **Machine exists** — every `machine` named by any anchor resolves to a
-///      registered `SpecModule` (embedded or external). Catches a dangling machine.
+/// * **Ob.1, action exists**: every `refines`/`spec_invariant` action (and every waiver action,
+///   when present) names a real definition in its module.
+/// * **Ob.3, coverage**: every action of an active machine (one with a refinement) is bound or
+///   waived, `ratio == 1.0`.
+/// * **Ob.4, machine exists**: every `machine` an anchor names resolves to a registered
+///   `SpecModule`.
 ///
-/// **Coverage scoping (deliberate).** Requiring `ratio == 1.0` for ALL registered
-/// models would paint a sea of red the moment any model (e.g. the kernel-family
-/// twins, or the ISOLATION external specs) lacks a `#[refines]` handler — which is
-/// expected today (they are bound via Tier-1 conformance / Phase 2, not via the
-/// terminal_modes-style per-method `#[refines]`). So the `== 1.0` requirement is
-/// scoped to ACTIVELY-BOUND machines (≥1 refinement), and the ratios of the rest
-/// are merely REPORTED (their `MachineCoverage.active == false`). This is exactly
-/// the §2.2 obligation-3 intent: total coverage where binding is claimed.
+/// Coverage is scoped to actively bound machines: many models are bound by Tier-1 conformance
+/// rather than per-method `#[refines]`, so the rest are only reported (`active == false`).
 ///
-/// Obligation 2 ("symbol resolves to a live DefId") is NOT enforced here: it needs
-/// the `trust-ir` symbol resolution of Phase 3. The Phase-0 aterm-local gate proves
-/// 1/3/4 (the linkage/coverage closure); behavioural alignment is the separate
-/// Tier-1 conformance layer (already green for window_routing).
-///
-/// A RUNNABLE FRAGMENT of obligation 2 does now exist, one layer up rather than in
-/// this fn: [`StepEvidence`] answers "was the annotated function entered by the STEP
-/// that drives this action?" from the probes `#[refines]` injects. `check_closure`
-/// stays pure set algebra over the collected records (it is called in contexts with no
-/// conformance to run, and by fixtures with hand-built anchors), so the execution
-/// requirement is asserted by the gate that owns the conformance — today the
-/// `SelectionCustody` and `PressCustody` blocks of `aterm_gui`'s `spec_xref_closure`,
-/// which is 2 of the ~20 machines carrying anchors. Without it, a green `ratio=1.000`
-/// here is a claim about STRINGS: an anchor moved onto a body-is-`false` stub with no
-/// callers kept this fn green. WITH it, for those two machines, an anchor on a fn that
-/// action's own windows do not enter fails by name, and so does one on a fn that IS
-/// entered there but also runs when a different action of the machine fires
-/// ([`StepAudit::stray`]) — but the evidence is function-entry, not branch-entry, and
-/// [`StepAudit::summary`] prints in numbers what that leaves undecided.
-// Skip: the closure gate's set algebra + format (BTreeSet/Map keyed builds,
-// absent std bodies). THE xref gate itself — verification tooling.
+/// Ob.2 (the symbol resolves to a live `DefId`) is not enforced here. Its runnable fragment,
+/// [`StepEvidence`], is asserted by the gate that owns each conformance; this fn stays pure set
+/// algebra over the collected records, since callers with no conformance to run and fixtures with
+/// hand-built anchors use it, so a green ratio here is a claim about strings.
+// Skip: the closure gate's set algebra and formatting. Verification tooling.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn check_closure(modules: &[SpecModule]) -> ClosureReport {
     let mut violations = Vec::new();
 
-    // Index modules by THREE namespaces (TRUST_VACUITY_GATE §2.4):
-    //   * the ACTION set (`action_names`, now Next-only for external) — the
-    //     refinement/proof/waiver Ob.1 resolves against this;
-    //   * the INVARIANT-def set (`invariant_names`, the full top-level def set for
-    //     external) — the `#[spec_invariant]` id arm resolves against this ONLY;
-    //   * the coverage-action set (`coverage_actions`) — the Ob.3 coverage check.
-    // For embedded models all three coincide; for external `.tla` the action and
-    // coverage sets are the `Next` disjuncts while the invariant set is the full def
-    // set (so an invariant naming `TypeOK` resolves but a `#[refines]` naming it does
-    // NOT — the alignment with Trust's already-strict artifact).
-    // (machine name as declared, action set, invariant-def set, coverage-action set)
+    // Three namespaces per module (TRUST_VACUITY_GATE §2.4): the action set (refinement and
+    // waiver Ob.1), the invariant-def set (`#[spec_invariant]` ids only) and the coverage set
+    // (Ob.3). They coincide for embedded models; for an external `.tla` the action and coverage
+    // sets are the `Next` disjuncts and the invariant set is every definition.
     let module_actions: Vec<ModuleActionIndex> = modules
         .iter()
         .map(|m| {
@@ -2521,10 +1238,8 @@ pub fn check_closure(modules: &[SpecModule]) -> ClosureReport {
         if inv.machine.is_empty() {
             continue;
         }
-        // An invariant anchor's `id` should name a top-level DEFINITION in the
-        // module (invariants legitimately name non-`Next` defs like `TypeOK`),
-        // so it resolves against the WIDER `invariant_names()` set — NOT the
-        // Next-only action set the refinement/proof arms use (§2.4).
+        // An invariant id names a definition, so it resolves against the wider
+        // `invariant_names()` (§2.4).
         check_anchor_obligations(
             &mut violations,
             resolve(inv.machine),
@@ -2566,7 +1281,7 @@ pub fn check_closure(modules: &[SpecModule]) -> ClosureReport {
     }
 
     // ---- Obligation 3: coverage over active machines, report over the rest ----
-    // Bind/waive sets keyed by the MODULE's declared name (canonical).
+    // Bind/waive sets keyed by the module's declared name (canonical).
     let mut bound: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut waived: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
 
@@ -2591,9 +1306,7 @@ pub fn check_closure(modules: &[SpecModule]) -> ClosureReport {
     }
 
     let mut coverage = Vec::new();
-    // Coverage is computed over the real coverage-action set (4th tuple element), NOT
-    // the full def set — so an external machine is "fully covered" once every `Next`
-    // disjunct is bound-or-waived, without demanding a `#[refines]` for `Init`/`TypeOK`.
+    // Over the coverage set (an external machine's `Next` disjuncts), not every definition.
     for (name, _actions, _inv_defs, cov_actions) in &module_actions {
         let actions = cov_actions;
         let b = bound.get(name).cloned().unwrap_or_default();
@@ -2639,11 +1352,9 @@ mod tests {
     use super::*;
     use crate::tla_check::TlaSpec;
 
-    /// TRUST_VACUITY_GATE §2.4 LOCK (finding 4): an EXTERNAL module's `action_names()`
-    /// (the refinement/proof/waiver Ob.1 set) is the `Next` disjuncts ONLY, while
-    /// `invariant_names()` (the `#[spec_invariant]` id set) is the full top-level def
-    /// set. So an anchor naming `TypeOK` fails Ob.1 but an invariant naming `TypeOK`
-    /// resolves — aligning the in-Rust gate with Trust's already-strict artifact (L3).
+    /// TRUST_VACUITY_GATE §2.4: an external module's `action_names()` is its `Next` disjuncts
+    /// only and its `invariant_names()` every top-level definition, so an anchor naming `TypeOK`
+    /// fails Ob.1 while an invariant naming it resolves.
     #[test]
     fn external_action_names_is_next_only_invariant_names_is_full_set() {
         let tla = "---- MODULE Fix ----\nVARIABLES x\nInit == x = 0\nApply == x' = 1\n\
@@ -2670,12 +1381,10 @@ mod tests {
         );
     }
 
-    // ── The per-step audit's DERIVATIONS, on synthetic ledgers ──────────────
+    // ── The per-step audit's derivations, on synthetic ledgers ──────────────
     //
-    // These exist because the two real ledgers are produced by a gate in another
-    // crate: the arithmetic the gate PRINTS has to be checkable without running it,
-    // and the field these replace (`ubiquitous`, an intersection across every window)
-    // shipped green for weeks while being structurally incapable of firing.
+    // The real ledgers come from a gate in another crate; the arithmetic it prints must be
+    // checkable without running it.
 
     /// A synthetic anchor. `entry_id` is spelled exactly as the `#[refines]` macro
     /// spells it, because `fn_of` splits on that shape.
@@ -2701,10 +1410,10 @@ mod tests {
         }
     }
 
-    /// THE SHAPE OF THE TWO REAL LEDGERS, in miniature: one function carrying two
-    /// actions and entered on every batch (`batch`, the `post_process` stand-in), one
-    /// function private to a third action (`evict`), and one unrelated anchored
-    /// function the batch also enters (`chatty`, the `write_char` stand-in).
+    /// The real ledgers' shape in miniature: one function carrying two actions and entered on
+    /// every batch (`batch`, the `post_process` stand-in), one private to a third action
+    /// (`evict`), and an unrelated anchored function the batch also enters (`chatty`, the
+    /// `write_char` stand-in).
     fn mixed_ledger() -> (Vec<RefinementAnchor>, Vec<StepRecord>) {
         let anchors = vec![
             synth("Push", "batch", "Ring::Push @ batch"),
@@ -2734,7 +1443,7 @@ mod tests {
     }
 
     fn audit_of(anchors: &[RefinementAnchor], steps: &[StepRecord]) -> StepAudit {
-        // `audit_steps_of` takes `&'static` anchors because the inventory yields them;
+        // `audit_steps_of` takes `&'static` anchors because the registry yields them;
         // the leak is a test fixture and bounded by the test.
         let linked: Vec<&'static RefinementAnchor> =
             anchors.iter().map(|a| &*Box::leak(Box::new(*a))).collect();
@@ -2750,10 +1459,8 @@ mod tests {
             "the fixture ledger must be green: {audit:?}"
         );
 
-        // The old field: entered in EVERY window. `batch` misses the `Evict` window and
-        // `evict` misses the two batch windows, so the intersection across all three is
-        // empty — which is what made "0 functions were entered in EVERY step window"
-        // print on both real machines while `post_process` was entered on every batch.
+        // An intersection across every window is empty by construction on mixed step
+        // families: `batch` misses the `Evict` window and `evict` the two batch windows.
         let all: BTreeSet<&str> = steps
             .iter()
             .skip(1)
@@ -2765,8 +1472,8 @@ mod tests {
             "the intersection across mixed step families is empty by construction: {all:?}"
         );
 
-        // The replacement says the true thing: `batch` is entered under BOTH of its
-        // actions, so its entry cannot say which fired.
+        // `entered_under` says the true thing: `batch` is entered under both of its actions, so
+        // its entry cannot say which fired.
         assert_eq!(
             audit.entered_under.get("batch").map(BTreeSet::len),
             Some(2),
@@ -2801,7 +1508,7 @@ mod tests {
             "{:?}",
             audit.interchangeable
         );
-        // `Evict`'s window entered exactly one: that window PINS its anchor.
+        // `Evict`'s window entered exactly one: that window pins its anchor.
         assert_eq!(
             audit.interchangeable.get("Evict").map(BTreeSet::len),
             Some(1)
@@ -2814,14 +1521,12 @@ mod tests {
         );
     }
 
-    /// THE WITHIN-WINDOW MOVE, both halves: the one `stray` catches and the one it
-    /// cannot, so the printed claim can name the boundary instead of gesturing at it.
+    /// The within-window move, both halves: the one `stray` catches and the one it cannot.
     #[test]
     fn a_move_inside_one_window_is_caught_exactly_when_the_new_site_is_wider() {
-        // CAUGHT. `Push` moves onto `chatty`, which the `Push` window really does
-        // enter — so `witnessed` is satisfied — but `chatty` is entered by the `Pop`
-        // window too, and it is not anchored for `Pop`. Its entry pattern is wider than
-        // the action it now claims.
+        // Caught: `Push` moves onto `chatty`, which the `Push` window does enter (so
+        // `witnessed` holds), but the `Pop` window enters it too and it is not anchored for
+        // `Pop`: its entry pattern is wider than the action it now claims.
         let moved = vec![
             synth("Push", "chatty", "Ring::Push @ chatty"),
             synth("Pop", "batch", "Ring::Pop @ batch"),
@@ -2845,9 +1550,8 @@ mod tests {
         );
         assert!(!caught.is_complete());
 
-        // NOT CAUGHT, and the summary must not pretend otherwise. `Push` moves onto
-        // `private`, a function only the `Push` window enters. Its entry pattern is
-        // exactly the action it claims, so nothing in a per-step entry ledger separates
+        // Not caught: `Push` moves onto `private`, which only the `Push` window enters. Its
+        // entry pattern is exactly the action it claims, so a per-step entry ledger cannot tell
         // it from the right seam.
         let moved = vec![
             synth("Push", "private", "Ring::Push @ private"),
@@ -2866,8 +1570,7 @@ mod tests {
              matches the action set it claims is invisible here — {missed:?}"
         );
 
-        // And the residual the anchor table cannot see either: permuting two actions
-        // that share ONE function changes nothing observable at all.
+        // Nor can anything see two actions that share one function permuted.
         let permuted = vec![
             synth("Pop", "batch", "Ring::Pop @ batch"),
             synth("Push", "batch", "Ring::Push @ batch"),
@@ -2922,10 +1625,9 @@ mod tests {
         );
     }
 
-    /// A window whose work runs on a worker thread: the worker's own window, taken and
-    /// merged, credits the owner with exactly what the worker entered; nothing crosses
-    /// threads unless merged, a taken window is closed and empty, and a closed window
-    /// neither hands its record over nor takes a merge.
+    /// A worker's window reaches its owner only by take and merge: nothing crosses threads
+    /// otherwise, a taken window is closed and empty, and a closed window neither hands its record
+    /// over nor takes a merge.
     #[test]
     fn a_workers_window_reaches_its_owner_only_by_take_and_merge() {
         assert!(reset_entered_anchors(), "the owner's window opens");

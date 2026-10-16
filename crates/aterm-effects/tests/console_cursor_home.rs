@@ -19,22 +19,14 @@ const COLS: u16 = 151;
 const CW: u16 = 10;
 const CH: u16 = 20;
 
-/// What a tick reads off the terminal, keyed by everything it is read from.
-///
-/// WHY (2026-10-05): the 16 ms ticks far outnumber the terminal's changes,
-/// and `sample` put 76% of this file's CPU in the per-tick `cell_frame` (a
-/// full 57×151 snapshot) and the world rebuilt from it. All of it is a pure
-/// function of the terminal: output (`screen_mutations`, the product's own
-/// "nothing reached the screen" witness), the selection (the one state these
-/// tests change without output) and the facts. A tick whose key is unchanged
-/// reuses the last read; the pet's brain still observes and ticks on every
-/// frame. Checked equal to a fresh read at every tick of all eleven tests
-/// before the check was removed: the snapshot's content and every metadata
-/// field but `row_rev` (a revision lane each read restamps, which nothing
-/// the pet reads), the facts, the world (as `Debug`), the spans. Of
-/// `cell_frame`'s side effects, the `damage_epoch` latch closes on the first
-/// read and these tests never take damage. The file, alone on one thread:
-/// 13.9 -> 2.3 CPU-s.
+/// What a tick reads off the terminal, keyed by everything it is read from: output
+/// (`screen_mutations`), the selection (the one state these tests change without output) and
+/// the facts. The 16 ms ticks far outnumber the terminal's changes and a full `cell_frame` plus
+/// the world rebuilt from it dominated this file's CPU, so a tick whose key is unchanged reuses
+/// the last read; the brain still observes and ticks every frame. A reused read differs from a
+/// fresh one only in `row_rev`, a revision lane each read restamps and the pet never reads. Of
+/// `cell_frame`'s side effects, the `damage_epoch` latch closes on the first read and these
+/// tests take no damage.
 struct Seen {
     mutations: u64,
     selection: TextSelection,
@@ -92,8 +84,8 @@ struct Scene {
     brain: PetBrain,
     now: Instant,
     reduced: bool,
-    /// Hand a hidden caret over as the hosts do (the cell, reported
-    /// unpainted) instead of this fixture's older `None`.
+    /// Hand a hidden caret over as the hosts do (the cell, reported unpainted) instead of
+    /// `None`.
     hidden_caret_travels: bool,
     /// The last caret a tick saw painted — the home a repaint leaves alone.
     painted: (u16, u16),
@@ -201,8 +193,8 @@ impl Scene {
     }
 }
 
-/// Near the last PAINTED caret: a hidden cursor a program is walking while
-/// it repaints is not where the pet belongs.
+/// Near the last painted caret: a hidden cursor a program is walking while it repaints is not
+/// where the pet belongs.
 fn near_caret(s: &Scene, frame: PetFrame) -> bool {
     body(frame).is_some_and(|rect| {
         let (row, col) = s.painted;
@@ -220,14 +212,11 @@ type State = BTreeMap<&'static str, i64>;
 fn project(s: &Scene, frame: PetFrame, event: i64) -> State {
     State::from([
         ("visible", i64::from(body(frame).is_some())),
-        // The pet walks there. `home` means "the pet's base is the cursor":
-        // standing there or on its way (the model's `Follow` action;
-        // `ArrivesAtCursor` makes arrival real). Requiring `near_caret` on the
-        // same tick as a hundred-column caret jump would demand a teleport;
-        // the escort needs many frames to arrive. `Arrive` is stepped only
-        // once the pet has stopped (`!needs_frames()`), so `home` there is
-        // `near_caret` alone, and the `stranded` counterexample still proves
-        // it.
+        // `home`: the pet's base is the cursor, standing there or on its way (the model's
+        // `Follow`; `ArrivesAtCursor` makes arrival real). Demanding `near_caret` on the tick of
+        // a hundred-column caret jump would demand a teleport. `Arrive` is stepped only once the
+        // pet has stopped, so `home` there is `near_caret` alone and the `stranded`
+        // counterexample still bites.
         (
             "home",
             i64::from(near_caret(s, frame) || s.brain.needs_frames()),
@@ -318,10 +307,9 @@ fn real_cursor_home_placement_conforms_and_rejects_the_historical_hidden_body() 
     s.term.process(b"\x1b[?25l");
     frame = s.tick(16);
     step(&model, &mut state, &s, frame, "HideCursor", 7);
-    // The program walks its hidden cursor to the top of the screen while it
-    // repaints, inside the repaint hold: the home stays the painted caret.
-    // NEGATIVE CONTROL: the chase the hold used to hand the ordinary ladder
-    // (the body travelling to the write position) is refused.
+    // The program walks its hidden cursor to the top of the screen while it repaints, inside
+    // the repaint hold: the home stays the painted caret. Negative control: a chase to the
+    // write position is refused.
     s.term.process(b"\x1b7\x1b[2;120Hrepaint");
     frame = s.tick(16);
     let mut chased = project(&s, frame, 9);
@@ -335,11 +323,9 @@ fn real_cursor_home_placement_conforms_and_rejects_the_historical_hidden_body() 
     step(&model, &mut state, &s, frame, "ShowCursor", 8);
 }
 
-/// Where the body STANDS: the brain's own seat and the drawn feet. The
-/// no-caret hold pins this. It used to pin the whole drawn rect, which it
-/// could only do by loafing the pet: a sleeper was stood up out of its
-/// sleep. A held sleeper sleeps on now, and its breath moves the drawn
-/// outline by a pixel about its feet (2026-09-29).
+/// Where the body stands: the brain's own seat and the drawn feet, which the no-caret hold pins.
+/// Not the whole drawn rect: a held sleeper sleeps on, and its breath moves the outline by a
+/// pixel about its feet.
 fn stance(frame: PetFrame) -> (f32, f32, Option<f32>) {
     (frame.col, frame.row, body(frame).map(PetRect::foot_row))
 }
@@ -459,8 +445,6 @@ fn a_visible_output_watcher_returns_home_after_a_large_caret_move() {
 
 #[test]
 fn ordinary_typing_keeps_the_full_body_visible_between_keys() {
-    // Each rate builds its own scene on its own clock: the rates run on the
-    // binary's threads (`par_map`); a failing rate's panic propagates in order.
     crate::common::par_map(&[2, 4, 8], |&frames_per_key| {
         let mut s = Scene::dense(false);
         for _ in 0..100 {
@@ -562,8 +546,7 @@ fn coding_console_cursor_hide_show_keeps_the_full_resident_without_fake_input() 
     for _ in 1..100 {
         before = s.tick(16);
     }
-    // The dense console's resident has dozed off by now: the hold must
-    // keep it asleep, not stand it up into a loaf (2026-09-29).
+    // The dense console's resident has dozed off by now: the hold keeps it asleep.
     assert_eq!(before.action, PetAction::Sleep);
     let input_seq = s.brain.console_input_seq();
     for col in [3, 25, 140, 4] {
@@ -595,11 +578,8 @@ fn coding_console_cursor_hide_show_keeps_the_full_resident_without_fake_input() 
             .process(format!("\x1b[55;{col}H\x1b[?25h").as_bytes());
         let shown = s.tick(16);
         assert!(shown.alpha > 0);
-        // And then it walks back. The hidden-cursor hold is the one place the
-        // console layer is the only writer (no caret to follow), so the body
-        // stays at its last home. When the cursor reappears up to 137 columns
-        // away the escort travels back; `at_home` on the next frame would
-        // demand a teleport, so arrival is awaited.
+        // Then it walks back: with no caret to follow the body held its last home, so when the
+        // cursor reappears up to 137 columns away arrival is awaited, not demanded next frame.
         let mut settled = shown;
         for _ in 0..400 {
             settled = s.tick(16);
@@ -628,8 +608,6 @@ fn hidden_cursor_region_scrolls_keep_the_full_body_at_its_last_real_home() {
         b"\x1b[5;45r\x1b[20;1H\x1b[2M", // delete lines
         b"\x1b[5;45r\x1b[5;1H\x1bM",    // reverse index
     ];
-    // Each (reduced, home row) builds its own scene on its own clock: they
-    // run on the binary's threads (`par_map`); a panic propagates in order.
     let scenes = [(false, 20), (false, 55), (true, 20), (true, 55)];
     crate::common::par_map(&scenes, |&(reduced, home_row)| {
         let mut s = Scene::dense(reduced);

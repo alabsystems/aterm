@@ -23,43 +23,25 @@ impl Scrollback {
         self.update_watermark_level();
     }
 
-    /// Monotonic count of lines DROPPED by memory-pressure eviction (the byte
-    /// budget's cold-tier FIFO) or LOST with a quarantined warm block (one that
-    /// never decoded again) — real retention loss, surfaced OUT-OF-BAND
-    /// (audit E10a: no sentinel content is ever injected). User-requested
-    /// `set_line_limit` truncation is intentional and NOT counted.
+    /// Monotonic count of lines dropped by memory-pressure eviction (the byte
+    /// budget's cold-tier FIFO) or lost with a quarantined warm block: real
+    /// retention loss, reported out of band (no sentinel content is injected).
+    /// `set_line_limit` truncation is intentional and not counted.
     #[must_use]
     pub fn pressure_evicted_lines(&self) -> u64 {
         self.pressure_evicted_lines
     }
 
-    /// Monotonic count of history lines whose INLINE IMAGE was discarded
-    /// because the line was compressed — the out-of-band signal for the image
-    /// retention horizon, the sibling of
-    /// [`pressure_evicted_lines`](Self::pressure_evicted_lines) (audit E10a:
-    /// the loss is reported, never papered over with sentinel content).
+    /// Monotonic count of history lines whose inline image was discarded because
+    /// the line was compressed: the out-of-band signal for the image retention
+    /// horizon, the sibling of [`pressure_evicted_lines`](Self::pressure_evicted_lines).
     ///
-    /// # The horizon, as a permanent property of this store
-    ///
-    /// An inline image is retained for exactly as long as its line is held
-    /// UNCOMPRESSED, in the hot tier. The wire format that the warm (LZ4) and
-    /// cold (zstd, in RAM or on disk) tiers store lines in carries no image
-    /// section — see `Line::serialize` for why a shared payload cannot be
-    /// written per line without multiplying it by the footprint's height — so
-    /// crossing out of the hot tier is where the picture ends and this counter
-    /// starts moving.
-    ///
-    /// What a person scrolling into that history sees is therefore DECIDED, not
-    /// accidental: the line keeps its text, attributes, hyperlinks and
-    /// underline colours, and loses only the picture, so a footprint ages out
-    /// of history one row at a time from its top — the same direction, and at
-    /// the same boundary, as the history above it. Nothing is half-restored and
-    /// nothing is invented; the row an image no longer covers renders exactly
-    /// as the empty row it always was underneath.
-    ///
-    /// The count is in footprint ROWS (one per history line), so a ten-row
-    /// picture reports ten as it crosses. It never decreases and is not reset
-    /// by [`clear`](Self::clear).
+    /// An image lives only while its line is uncompressed in the hot tier; the
+    /// warm and cold wire format has no image section (see `Line::serialize`).
+    /// The line keeps its text, attributes, hyperlinks and underline colours, so
+    /// a footprint ages out one row at a time from its top. The count is in
+    /// footprint rows (one per history line); it never decreases and
+    /// [`clear`](Self::clear) does not reset it.
     #[must_use]
     pub fn image_rows_dropped_by_compression(&self) -> u64 {
         self.image_rows_dropped_by_compression
@@ -67,10 +49,9 @@ impl Scrollback {
 
     /// Update both diagnostic and budget aggregates from per-tier counters.
     ///
-    /// Spelled `saturating_add`: each operand is bytes of memory this process
-    /// actually holds, so the true sum always fits in `usize` and the
-    /// saturation can never fire on a real path — it just discharges the
-    /// strict L0 gate's unconstrained-input overflow counterexamples.
+    /// Saturating: each operand is bytes this process holds, so the true sum
+    /// fits; saturation only discharges the strict L0 gate's unconstrained-input
+    /// overflow counterexamples.
     pub(crate) fn sync_accounting(&mut self) {
         self.bytes_used = self
             .hot
@@ -97,12 +78,8 @@ impl Scrollback {
         );
     }
 
-    /// Saturating sums for the same strict-gate reason as
-    /// [`sync_accounting`](Self::sync_accounting) (identical on every real path).
-    ///
-    /// `cfg(test)`: only called by the (test-only) invariant assert below and
-    /// by the memory-tracking tests, so a broader cfg would just leave dead
-    /// code in non-test debug builds.
+    /// Saturating for the strict gate, as in [`sync_accounting`](Self::sync_accounting).
+    /// Test-only: only the invariant assert and the memory-tracking tests call it.
     #[cfg(test)]
     pub(crate) fn recompute_total_memory_used(&self) -> usize {
         self.hot
@@ -111,10 +88,7 @@ impl Scrollback {
             .saturating_add(self.cold.recompute_compressed_size())
     }
 
-    /// Saturating sums for the same strict-gate reason as
-    /// [`sync_accounting`](Self::sync_accounting) (identical on every real path).
-    ///
-    /// `cfg(test)`: see [`recompute_total_memory_used`](Self::recompute_total_memory_used).
+    /// Saturating for the strict gate, as in [`sync_accounting`](Self::sync_accounting).
     #[cfg(test)]
     pub(crate) fn recompute_budgeted_bytes(&self) -> usize {
         self.hot
@@ -123,16 +97,12 @@ impl Scrollback {
             .saturating_add(self.cold.recompute_compressed_size())
     }
 
-    /// Consistency check: the aggregate counters must equal a from-scratch
+    /// Consistency check: the aggregate counters equal a from-scratch
     /// recomputation over the tiers.
     ///
-    /// Test-only (`cfg(test)`): the whole point of these asserts is that they
-    /// CAN fire when a counter drifts, so the strict L0 gate — which must
-    /// refute every reachable panic — would reject the library build that
-    /// carried them. The invariant is exercised by the test suite (which
-    /// calls this after every mutation in the accounting/pressure/memory
-    /// tests); non-test debug builds simply skip the recomputation, which has
-    /// no other side effects.
+    /// The asserts run only under `cfg(test)`: they can fire when a counter
+    /// drifts, and the strict L0 gate, which refutes every reachable panic,
+    /// would reject a library build that carried them.
     pub(crate) fn assert_bytes_used_invariant(&self) {
         #[cfg(test)]
         {

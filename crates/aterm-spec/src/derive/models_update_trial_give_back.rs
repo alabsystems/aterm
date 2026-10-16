@@ -6,81 +6,55 @@
 
 use super::Model;
 
-/// THE BOOT TRIAL'S COUNT UNDER OVERLAPPING LAUNCHES (2026-09-30). The sentinel
-/// counts the unconfirmed launches of a trialed build, and a launch that did not
-/// fail the build — a candidate its parent stood down or killed — is given back,
-/// by the candidate on its way out (`ExitsByRule`) and by its parent settling the
-/// same death (`Settled`). One launch the trial KEPT (a crash) is already on the
-/// count, and a sibling of the same trial boots and ends beside this candidate:
-/// several windows each hand off to the one installed build, and a cold or
-/// headless launch of it counts like any other. A handoff target that boots
-/// beside a live launch of the trial is not counted (`count_trial_launch`'s
-/// overlap exemption — a window's target only beside a live WINDOW launch: round
-/// eight, S1's second review), nor is a headless launch of a trial a window has
-/// launched (round eight, #8: it proves nothing about the window path, and is no
-/// launcher); any other launch is. An uncounted launch is outside this machine: it
-/// names nothing on the count, so it gives nothing back.
+/// The boot trial's count under overlapping launches. The sentinel counts the unconfirmed
+/// launches of a trialed build; a launch that did not fail the build — a candidate its parent
+/// stood down or killed — is given back, by the candidate on its way out (`ExitsByRule`) and by
+/// its parent settling the same death (`Settled`). One launch the trial kept (a crash) is
+/// already on the count, and a sibling of the same trial boots and ends beside this candidate:
+/// several windows each hand off to the one installed build, and a cold or headless launch of
+/// it counts like any other. A handoff target booting beside a live window launch of the trial
+/// is not counted (`count_trial_launch`'s overlap exemption), nor is a headless launch of a
+/// trial a window has launched (it proves nothing about the window path); any other launch is.
+/// An uncounted launch names nothing on the count, so it gives nothing back.
 ///
-/// `mine` and `theirs` say whether this candidate's launch and the sibling's are
-/// on the count. A give-back takes exactly the launch it names, once
-/// (`Sentinel::forgive_launch_of`), so the count is always the kept launch plus
-/// the launches still on it, a settled candidate's launch is off it, and a crash
-/// the trial keeps stays on it.
+/// `mine` and `theirs` say whether this candidate's launch and the sibling's are on the count.
+/// A give-back takes exactly the launch it names, once (`Sentinel::forgive_launch_of`), so the
+/// count is always the kept launch plus the launches still on it, a settled candidate's launch
+/// is off it, and a crash the trial keeps stays on it.
 ///
-/// THE DEATH LAUNCHSERVICES REPORTS WITHOUT A PID (round four, 2026-09-30). A
-/// launched candidate LaunchServices reports terminated before it checked in
-/// carries no pid, and its parent settles it by `SettledUnnamed`: exactly
-/// `Settled`, by the name the candidate STAMPED beside its rendezvous before its
-/// boot apply could count anything (aterm-update `stamp_trial_launch`). A
-/// candidate that counted nothing, or that gave its own launch back on its way
-/// out, stamped a name that is not on the line, and nothing is given back.
+/// A candidate LaunchServices reports terminated before it checked in carries no pid; its
+/// parent settles it by `SettledUnnamed`, exactly `Settled`, by the name the candidate stamped
+/// beside its rendezvous before its boot apply could count anything (aterm-update
+/// `stamp_trial_launch`). A candidate that counted nothing, or gave its own launch back,
+/// stamped a name not on the line, and nothing is given back. The stamp assumes no timing
+/// between the sibling and the candidate's end.
 ///
-/// The rule this replaced took the NEWEST launch named on the line since the
-/// parent's pre-launch snapshot (taken at `Launch`; `sib_at > 0` for the
-/// sibling's) whose process is gone. That is the candidate's only while the
-/// candidate has one on it. Beside an uncounted candidate, or one that gave its
-/// own back, it is a sibling's, and when that sibling crashed a crash the trial
-/// keeps — a cold launch nothing settles, or a successor whose parent keeps its
-/// death — the crash signal was erased (`AKeptCrashStaysCounted`). Beside a
-/// counted candidate, a sibling that counted after the candidate and was gone by
-/// the settle, which waits up to ten seconds for the apply lock, was taken for
-/// it, and the candidate's launch stayed counted (`ASettledLaunchIsOffTheCount`).
-/// The stamp assumes no timing between the sibling and the candidate's end.
+/// A give-back waits a bounded while for the apply lock, and another aterm can hold it longer
+/// (a ditto, a codesign, a supersede's Gatekeeper read). The give-back that times out writes
+/// its launch's name beside the sentinel (`SettledOwed`) and the next lock holder pays it
+/// (`PaysOwed`); a sibling's boot pays what is owed before it counts, so the count a revert
+/// reads never stands on a launch its killer gave back (`AnOwedLaunchIsPaidBeforeTheNextCount`).
+/// Unpaid, two such settles in one trial make the third candidate's boot revert and quarantine
+/// a build that never failed. `SettledOwed` stands for either settle (by pid or stamped name)
+/// and for the candidate's own give-back on its way out: each meets the same lock.
 ///
-/// `Buggy=1` is the rule the named give-backs replaced: give one launch back
-/// whenever the count MOVED since the asker's snapshot — the parent's, taken
-/// before the launch (`before`), or the candidate's own, taken as it booted
-/// (`at_boot`) — and stands above zero. A sibling's give-back after the snapshot
-/// makes an uncounted candidate's ask erase the kept launch
-/// (`TheCountIsTheLaunchesOnIt`), and one before the candidate's boot counted it
-/// makes its parent's settle leave that launch counted
-/// (`ASettledLaunchIsOffTheCount`). `Buggy=2` keeps that rule for the unnamed
-/// settle alone, beside the named ones: it takes a sibling's launch, counted
-/// after the snapshot, for the uncounted candidate's. `Buggy=3` is the newest
-/// gone name since the snapshot, above.
+/// Mutants: `Buggy=1` gives one launch back whenever the count moved since the asker's snapshot
+/// — the parent's, taken before the launch (`before`), or the candidate's own at boot
+/// (`at_boot`) — and stands above zero, and never pays a debt. A sibling's give-back after the
+/// snapshot then makes an uncounted candidate's ask erase the kept launch
+/// (`TheCountIsTheLaunchesOnIt`), and one before the candidate's boot counted it leaves the
+/// settled launch counted (`ASettledLaunchIsOffTheCount`). `Buggy=2` keeps that rule for the
+/// unnamed settle alone, taking a sibling's launch counted after the snapshot for the uncounted
+/// candidate's. `Buggy=3` takes the newest launch named since the parent's snapshot (`sib_at >
+/// 0` for the sibling's) whose process is gone: beside an uncounted candidate, or one that gave
+/// its own back, that is a sibling's, possibly a kept crash (`AKeptCrashStaysCounted`); beside
+/// a counted one, a sibling that counted after it and was gone by the settle, which waits up to
+/// ten seconds for the apply lock, is taken for it (`ASettledLaunchIsOffTheCount`).
 ///
-/// A SETTLE THAT MEETS A HELD APPLY LOCK OWES THE LAUNCH (round eight of the
-/// update audit, lead U7). Every give-back waits for the apply lock a bounded
-/// while (the fix for round seven's #93/#96), and another aterm can hold it past
-/// that wait — a ditto, a codesign, a supersede's Gatekeeper read. The give-back
-/// that times out writes its launch's name beside the sentinel (`SettledOwed`),
-/// and the next holder of the lock pays it (`PaysOwed`) — a counted launch first
-/// of all: a sibling's boot pays what is owed before it counts, so the count a
-/// revert reads never stands on a launch its killer gave back
-/// (`AnOwedLaunchIsPaidBeforeTheNextCount`). The fix it replaced left the launch
-/// counted and nothing gave it back: two such settles in one trial and the third
-/// candidate's boot reverted and quarantined a build that never failed.
-/// `SettledOwed` stands for either settle (by pid or by the stamped name), and for
-/// the candidate's own give-back on its way out: each meets the same lock.
-///
-/// `Buggy=1` also never pays a debt — the dropped give-back the debt replaced.
-///
-/// Tier-1: aterm-update `install_boot_tests.rs`,
-/// `overlapping_launches_of_one_trial_are_given_back_by_name`, drives these
-/// interleavings through the real `count_trial_launch`, the stamp and the
-/// give-backs against a scratch sentinel, step by step beside this machine, and
-/// replays the replaced rules against `Buggy=1`, `Buggy=2` and `Buggy=3` as its
-/// negative controls.
+/// Tier-1: aterm-update `install_boot_tests.rs`'s
+/// `overlapping_launches_of_one_trial_are_given_back_by_name` drives these interleavings through
+/// the real `count_trial_launch`, the stamp and the give-backs against a scratch sentinel, step
+/// by step beside this machine, with `Buggy=1`, `2` and `3` as its negative controls.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_update_trial_give_back_model() -> Model {

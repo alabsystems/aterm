@@ -1,21 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// THE OVERLINE'S OWN COLOUR CHANNEL (`RenderCell::overline_color`), on the CPU
-// renderer.
+// The overline's own colour channel (`RenderCell::overline_color`) on the CPU
+// renderer. A cell's three line decorations colour independently: the overline
+// takes the channel, the underline keeps SGR 58's colour, and the strike keeps
+// the glyph's ink, so a chrome seam (`aterm_gui::link_target`) holds one tone
+// across cells with different foregrounds.
 //
-// A cell's three line decorations are three separately-coloured bands, and the
-// property that makes the channel worth having is INDEPENDENCE: the overline
-// takes its channel, the underline keeps SGR 58's, and the strike — which has
-// no colour anywhere, in any terminal — keeps the glyph's own ink. A seam
-// painted for chrome must therefore hold ONE tone across a row whose cells
-// carry different foregrounds, which is the whole reason the channel exists
-// (`aterm_gui::link_target`).
-//
-// The channel is deliberately unreachable from the byte stream: no ECMA-48 code
-// and no vendor extension assigns an overline colour (53/55 set the line, 58/59
-// are the UNDERLINE's), so these tests set it on the `RenderInput` the way
-// aterm's own row builders do.
+// No escape sequence assigns an overline colour (53/55 set the line, 58/59 are
+// the underline's), so these tests set it on the `RenderInput` as aterm's row
+// builders do.
 
 use aterm_core::terminal::{RenderCell, Terminal};
 use aterm_render::{Frame, Renderer, Theme, rgb_to_u32};
@@ -23,15 +17,15 @@ use aterm_render::{Frame, Renderer, Theme, rgb_to_u32};
 fn renderer() -> Renderer {
     Renderer::from_system(18.0, Theme::default())
         .map(|mut r| {
-            // Deterministic pixels: block on the lazy fallback parses so a parse
-            // landing between two renders can't recolour a "must not change" frame.
+            // Deterministic pixels: a lazy fallback parse landing between two
+            // renders would recolour a "must not change" frame.
             r.debug_block_on_lazy_fallbacks();
             r
         })
         .expect("no font: build with aterm-render's default embedded-font feature")
 }
 
-/// The pixels of one cell's TOP row — where `overline_rect` anchors its band.
+/// The pixels of one cell's top row, where `overline_rect` anchors its band.
 fn top_row_pixels(f: &Frame, cw: usize, row: usize, ch: usize, col: usize) -> Vec<u32> {
     let y = row * ch;
     (col * cw..(col * cw + cw).min(f.width))
@@ -39,10 +33,8 @@ fn top_row_pixels(f: &Frame, cw: usize, row: usize, ch: usize, col: usize) -> Ve
         .collect()
 }
 
-/// How deep `ink` runs down from a cell's top edge. Measured off the frame
-/// rather than assumed to be one pixel: an overline is drawn at the font's
-/// resolved underline thickness, which differs per face, per size and per
-/// platform, and these tests only ever run on one face at a time.
+/// How deep `ink` runs down from a cell's top edge: an overline is drawn at the
+/// face's resolved underline thickness, so it is measured, not assumed.
 fn band_depth(f: &Frame, cw: usize, ch: usize, col: usize, ink: u32) -> usize {
     let x0 = col * cw;
     let x1 = (x0 + cw).min(f.width);
@@ -64,8 +56,8 @@ fn paint_seam(cells: &mut [Vec<RenderCell>], color: [u8; 3]) {
     }
 }
 
-/// An overline wears its own channel instead of its cell's foreground — the
-/// band the channel exists to colour, and no other pixel on the row.
+/// An overline wears its own channel instead of the cell's foreground, and no
+/// other pixel on the row changes.
 #[test]
 fn an_overline_takes_its_channel_and_leaves_the_rest_of_the_cell_alone() {
     let mut rend = renderer();
@@ -93,8 +85,7 @@ fn an_overline_takes_its_channel_and_leaves_the_rest_of_the_cell_alone() {
         band.iter().all(|px| *px == rgb_to_u32(seam)),
         "the overline band must be the channel's exact bytes: {band:?}"
     );
-    // Everything BELOW the band is untouched: the channel colours one rule, not
-    // the text under it.
+    // Everything below the band is untouched.
     let t = band_depth(&painted, cw, ch, 0, rgb_to_u32(seam));
     assert!(
         (1..ch).contains(&t),
@@ -107,9 +98,8 @@ fn an_overline_takes_its_channel_and_leaves_the_rest_of_the_cell_alone() {
     );
 }
 
-/// A cell with all three decorations paints three INDEPENDENTLY coloured bands.
-/// The strike is the control: nothing anywhere gives a strikethrough a colour,
-/// so it must keep the glyph's ink while the two channels around it move.
+/// A cell with all three decorations paints three independently coloured
+/// bands; the strike, which nothing gives a colour, keeps the glyph's ink.
 #[test]
 fn the_three_decoration_bands_take_three_independent_inks() {
     let mut rend = renderer();
@@ -130,8 +120,7 @@ fn the_three_decoration_bands_take_three_independent_inks() {
         band.iter().all(|px| *px == rgb_to_u32(over)),
         "the overline takes its own channel: {band:?}"
     );
-    // The underline keeps SGR 58's colour: it is present somewhere below the
-    // top band and the overline's colour is nowhere in the rest of the cell.
+    // Below the top band: SGR 58's underline colour, and no overline colour.
     let t = band_depth(&f, cw, ch, 0, rgb_to_u32(over));
     let rest: Vec<u32> = (t..ch)
         .flat_map(|y| (0..cw).map(move |x| (y, x)))
@@ -145,8 +134,8 @@ fn the_three_decoration_bands_take_three_independent_inks() {
         !rest.contains(&rgb_to_u32(over)),
         "the overline channel must not leak into the underline or the strike"
     );
-    // The strike has no channel: its ink is the cell's foreground, which the
-    // blank cells carry nowhere else, so its presence proves it took the fg.
+    // The strike's ink is the cell's fg, which the blank cells carry nowhere
+    // else, so its presence proves the strike took the fg.
     let fg = rgb_to_u32(input.cells[0][0].fg);
     assert!(
         rest.contains(&fg),
@@ -154,9 +143,7 @@ fn the_three_decoration_bands_take_three_independent_inks() {
     );
 }
 
-/// The seam property the chrome bands depend on: ONE rule tone across a row
-/// whose cells deliberately carry two inks. Without the channel the bright run
-/// drags a brighter dash of the rule along with it.
+/// One rule tone across a row whose cells carry two inks.
 #[test]
 fn a_seam_holds_one_tone_across_a_row_of_two_different_inks() {
     let mut rend = renderer();
@@ -167,7 +154,7 @@ fn a_seam_holds_one_tone_across_a_row_of_two_different_inks() {
     term.process(b"\x1b[?25l\x1b[53m\x1b[38;2;80;80;80mdim\x1b[38;2;255;255;255mLIT");
 
     let mut input = term.cell_frame(rows, cols);
-    // The un-channelled row is the control: its rule follows each cell's ink.
+    // Control: without the channel the rule follows each cell's ink.
     let follows = rend.render_input(&input);
     let dim_band = top_row_pixels(&follows, cw, 0, ch, 0);
     let lit_band = top_row_pixels(&follows, cw, 0, ch, 3);
@@ -188,8 +175,8 @@ fn a_seam_holds_one_tone_across_a_row_of_two_different_inks() {
     }
 }
 
-/// The empty channel is the pre-channel path, byte for byte: `None` everywhere
-/// must render exactly what a frame that never heard of the channel renders.
+/// An unset channel leaves the overline in the cell's own foreground, and no
+/// escape sequence sets it.
 #[test]
 fn an_unset_overline_colour_renders_the_cells_own_foreground() {
     let mut rend = renderer();

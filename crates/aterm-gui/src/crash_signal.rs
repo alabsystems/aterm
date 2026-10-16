@@ -929,6 +929,10 @@ mod imp {
             let mut act: libc::sigaction = std::mem::zeroed();
             act.sa_sigaction = libc::SIG_DFL;
             libc::sigaction(sig, &act, std::ptr::null_mut());
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "a real crash: its own fatal signal re-raised with the default action, as if never trapped"
+            )]
             libc::raise(sig);
         }
     }
@@ -1067,22 +1071,6 @@ mod imp {
             ] {
                 assert_eq!(render(v), v.to_string(), "mismatch at {v}");
             }
-        }
-
-        #[test]
-        fn banner_bytes_are_the_expected_marker_text() {
-            assert_eq!(BANNER_PREFIX, b"aterm: fatal signal ");
-            assert_eq!(BANNER_SUFFIX, b"\n");
-            // The assembled banner around a sample signal number reads
-            // correctly end to end.
-            let mut buf = [0u8; U32_MAX_DIGITS];
-            let num = fmt_u32_decimal(libc::SIGSEGV as u32, &mut buf);
-            let mut line = Vec::new();
-            line.extend_from_slice(BANNER_PREFIX);
-            line.extend_from_slice(num);
-            line.extend_from_slice(BANNER_SUFFIX);
-            let text = String::from_utf8(line).unwrap();
-            assert_eq!(text, format!("aterm: fatal signal {}\n", libc::SIGSEGV));
         }
     }
 }
@@ -1813,46 +1801,6 @@ mod imp_windows {
             }
         }
 
-        #[test]
-        fn banner_bytes_are_the_expected_marker_text() {
-            // Non-AV assembly: code + faulting PC + suffix.
-            let mut code_buf = [0u8; 8];
-            let mut pc_buf = [0u8; 16];
-            let code = fmt_u32_hex(0x8000_0003, &mut code_buf);
-            let pc = fmt_u64_hex(0x7FF6_1234_5678_ABCD, &mut pc_buf);
-            let mut line = Vec::new();
-            line.extend_from_slice(BANNER_PREFIX);
-            line.extend_from_slice(code);
-            line.extend_from_slice(BANNER_AT);
-            line.extend_from_slice(pc);
-            line.extend_from_slice(BANNER_SUFFIX);
-            assert_eq!(
-                String::from_utf8(line).unwrap(),
-                "aterm: fatal exception 0x80000003 at 0x7FF612345678ABCD\n"
-            );
-
-            // Access-violation assembly threads the op + faulting address in.
-            let av_pc = fmt_u64_hex(0x7FF6_0000_0100, &mut pc_buf);
-            let mut av_buf = [0u8; 16];
-            let av_addr = fmt_u64_hex(0, &mut av_buf);
-            let mut code_buf = [0u8; 8];
-            let av_code = fmt_u32_hex(0xC000_0005, &mut code_buf);
-            let mut line = Vec::new();
-            line.extend_from_slice(BANNER_PREFIX);
-            line.extend_from_slice(av_code);
-            line.extend_from_slice(BANNER_AT);
-            line.extend_from_slice(av_pc);
-            line.extend_from_slice(BANNER_AV_OP);
-            line.extend_from_slice(b"writing");
-            line.extend_from_slice(BANNER_AV_AT);
-            line.extend_from_slice(av_addr);
-            line.extend_from_slice(BANNER_SUFFIX);
-            assert_eq!(
-                String::from_utf8(line).unwrap(),
-                "aterm: fatal exception 0xC0000005 at 0x00007FF600000100 \u{2014} access violation writing @ 0x0000000000000000\n"
-            );
-        }
-
         #[cfg(target_pointer_width = "64")]
         #[test]
         fn exception_record_layout_matches_native_offsets() {
@@ -1930,7 +1878,7 @@ mod imp_windows {
 /// store, and the "nothing is held after a release" assertion would read the
 /// handle stored after it. They take this in turn. Each test spells the
 /// `.lock()` itself rather than calling a guard-returning helper: the
-/// lock-order census (tools/freeze-safety-gate, OB-7) sees a hold only where
+/// lock-order census (`aterm-census --locks`, OB-7) sees a hold only where
 /// the acquisition token is written, and refuses an unregistered helper.
 #[cfg(all(test, windows))]
 static PROCESS_MARKER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

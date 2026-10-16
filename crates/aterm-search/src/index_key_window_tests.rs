@@ -2,14 +2,12 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Line numbers past `u32::MAX` (R15 content-1).
+//! Line numbers past `u32::MAX`.
 //!
-//! Every terminal caller keys the index by ABSOLUTE row, a counter that only
-//! grows and outlives live upgrades. When the postings held the line number
-//! itself as `u32`, every row past `u32::MAX` saturated onto one key and
-//! every literal and regex find answered "0 matches", complete. These pin the
-//! base-relative keys: whatever the rows are numbered, every path a line
-//! number enters or leaves the index by gives back the line it was fed.
+//! Terminal callers key the index by absolute row, a counter that only grows and
+//! outlives live upgrades. These pin the base-relative posting keys: whatever the
+//! rows are numbered, every path a line number enters or leaves the index by gives
+//! back the line it was fed.
 
 use super::*;
 use crate::TerminalSearch;

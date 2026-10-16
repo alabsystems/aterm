@@ -4,10 +4,12 @@
 //! SHA-256, transcribed from FIPS 180-4 section 6.2: the reference algorithm,
 //! checkable line by line against the standard.
 //!
-//! THE ONE SHA-256 IN THE TREE: `aterm-verify`, which takes no dependencies,
-//! compiles this file by path (as it does atpkg's toolchain resolution), so the key
-//! a MEASURE receipt is filed under and the digest the release cutter signs the
-//! same bytes under are one function. It names nothing outside itself.
+//! Scalar, and so for small inputs: manifests, tokens, keys, tree-root entry
+//! lines. Bulk content (every byte atpkg installs, hashed once as the signed
+//! archive and once in the extract fold) goes through ring's hardware SHA-256,
+//! `atpkg::tree::BulkSha256`, about six times as fast (measured there), and a
+//! differential test there holds it to this file's digests. It names nothing
+//! outside itself.
 
 /// The SHA-256 block size, in bytes (FIPS 180-4 sec. 1: 512 bits).
 pub(crate) const BLOCK_LEN: usize = 64;
@@ -243,9 +245,8 @@ fn compress(state: &mut [u32; 8], block: &[u8; BLOCK_LEN]) {
 mod tests {
     use super::*;
 
-    /// Lowercase hex, here rather than the crate's: this file is the one SHA-256 in
-    /// the tree, and `aterm-verify` (which takes no dependencies) compiles it by path,
-    /// so its tests name nothing outside it.
+    /// Lowercase hex, here rather than the crate's, so this file's tests name nothing
+    /// outside it.
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
     }

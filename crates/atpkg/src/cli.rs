@@ -494,8 +494,11 @@ pub fn main_entry(mut argv: Vec<std::ffi::OsString>) -> ExitCode {
     // run from their own verb, `aterm pkg machine apply`, which the window and the
     // session call on their own schedule — and here, at
     // a pass's edge, only when the `[machine]` table CHANGED since it was last applied, so
-    // an edit takes effect at the next pass on every lane. Before the lock: this work
-    // takes none, and a contended or refused pass must not hold it hostage.
+    // an edit takes effect at the next pass on every lane. BESIDE the pass, not in front of
+    // it ([`MachineEdit`]): its thread starts before the lock is asked for — this work
+    // takes no store lock, and a contended or refused pass must not hold it hostage — and
+    // is joined before this function returns, so the pass never waits on `defaults` (or
+    // on another apply's queue) to take the lock or do its work.
     // NOT UNDER A PRIVATE STATE ROOT (ruling 409): a pass from a development build given
     // its own `ATERM_STATE_HOME` — a window's launch seed, its loop, a session's detached
     // pass — shares the owner's prefix, and `machine.applied` there records the OWNER's
@@ -511,14 +514,8 @@ pub fn main_entry(mut argv: Vec<std::ffi::OsString>) -> ExitCode {
                     .is_some_and(|p| crate::vendor_direct::is_vendor(p)))
     }) && !under_private_state_root()
         && machine_table_changed();
-    if machine_settings {
-        // Behind any apply already running (the window's or a session's launch apply), and
-        // then only if that one did not just apply this very table.
-        let _queue = machine_apply_queue();
-        if machine_table_changed() {
-            let _ = apply_machine_settings();
-        }
-    }
+    // Declared ahead of the store lock, so the lock is let go before the join.
+    let mut machine_edit = machine_settings.then(MachineEdit::start);
     let _store_lock = if verb.is_some_and(verb_mutates_store) {
         match mutator_store_lock() {
             Ok(guard) => guard,
@@ -528,10 +525,14 @@ pub fn main_entry(mut argv: Vec<std::ffi::OsString>) -> ExitCode {
                 if let Some(layout) = crate::store::resolve_configured() {
                     PassRecord::refused(&layout, &args, exit_code_u8(code));
                 }
-                // A pass that carried a `[machine]` edit applied it above, before this
-                // refusal — the settings need no lock. Say so, on stderr (stdout stays the
-                // marker channel the waiter tests pin), only when the record shows the
-                // table applied, and only while someone is there to read it.
+                // A pass that carried a `[machine]` edit applied it beside this refusal —
+                // the settings need no lock. Say so, on stderr (stdout stays the marker
+                // channel the waiter tests pin), only when the record shows the table
+                // applied, so only once the apply has ENDED, and only while someone is
+                // there to read it.
+                if let Some(edit) = machine_edit.as_mut() {
+                    edit.join();
+                }
                 if machine_settings && !machine_table_changed() && !parent_is_gone() {
                     use std::io::Write as _;
                     let _ = writeln!(
@@ -690,6 +691,7 @@ impl PassRecord {
     fn begin(layout: crate::store::Layout, args: &[String]) -> Self {
         let lane = this_pass_lane(args);
         let verb = pass_verb_words(args);
+        crate::packages_log::start_pass_clock(&layout);
         crate::packages_log::append(
             &layout,
             &crate::packages_log::Event::PassStart { lane, verb: &verb },
@@ -735,6 +737,7 @@ impl PassRecord {
                 outcome: &outcome,
             },
         );
+        crate::packages_log::stop_pass_clock();
     }
 
     /// A pass the store lock refused: one `pass-end`, no start (it never held the store).
@@ -1724,6 +1727,14 @@ fn take_wait_lock_flag(args: &mut Vec<String>) -> Option<std::time::Duration> {
     wait
 }
 
+/// The process a seed's promise of the next pass rides on ([`cmd_seed`]): the window that
+/// spawned it, which runs its update next. Only a window's seed carries both `--wait-lock`
+/// (naming that window, [`SPAWNER_PID_ENV`]) and `--progress-file`; a typed `aterm pkg seed`
+/// carries neither and promises nothing, and nor does a seed detached on purpose.
+fn seed_promise_owner() -> Option<u32> {
+    progress_path().and(wait_lock())?.spawner
+}
+
 /// The wait the edge recorded, if the caller opted in.
 fn wait_lock() -> Option<WaitLock> {
     WAIT_LOCK.get().copied()
@@ -1827,7 +1838,11 @@ fn cmd_landing(rest: &[String]) -> ExitCode {
 /// usage line, exit 2 — non-mutating by design, not by the accident of a refused name.
 ///
 /// In order, each ending pinned in-process by `cmd_selfupdate_refuses_forwards_and_never_takes_the_lock`
-/// and at the process edge by `tests/selfupdate_intercept.rs`:
+/// and at the process edge by `tests/selfupdate_intercept.rs` — but three: a declined
+/// shape (5) is driven on the binary through `atpkg run`, which settles the same plan
+/// (`tests/run_is_the_managed_name.rs`); the disabled line (6) is a build with no root
+/// key's alone; and the child's 75 (7) needs its whole bound to elapse, so only the
+/// in-process test, at a one-second bound, reaches it:
 /// 1. usage exit 2; not a tool name exit 2; the layout from the prefix operand (so no
 ///    `HOME` is needed — `env -i`, launchd) else [`layout`] (exit 1 with its line);
 /// 2. no roster row ⇒ `exec` the `bin/<program>` shim verbatim, nothing printed — a twin
@@ -1947,6 +1962,10 @@ fn settle_selfupdate(layout: &crate::store::Layout, plan: SelfUpdatePlan) -> Exi
 /// the verb, so every ending that is not the child is pinned in-process (an `exec`
 /// would replace the test process; the tests run the planned command as a child instead
 /// and read its argv off a log).
+#[expect(
+    clippy::disallowed_types,
+    reason = "Forward carries the shim's raw Command, a pass-through by exec"
+)]
 #[derive(Debug)]
 enum SelfUpdatePlan {
     /// One stderr line, exit 2, nothing run: the prefix cross-check, or a declined shape.
@@ -1965,7 +1984,7 @@ enum SelfUpdatePlan {
     },
     /// Announce, then the standard update as a child ([`selfupdate_check`]).
     Check {
-        row: &'static crate::selfupdate::Row,
+        row: &'static crate::vendor_direct::VendorSpec,
     },
 }
 
@@ -2033,7 +2052,7 @@ fn selfupdate_plan(
 /// ([`crate::ops::active_builds`]): it is the build that STAYS.
 fn selfupdate_check(
     layout: &crate::store::Layout,
-    row: &crate::selfupdate::Row,
+    row: &crate::vendor_direct::VendorSpec,
     atpkg: &std::path::Path,
     bound: u64,
 ) -> ExitCode {
@@ -2338,39 +2357,74 @@ pub(crate) fn vendor_state_of(
 
 /// The pending verb's body, shared by `__pending` and `atpkg run`'s pending arm so
 /// the three dead ends (the shell stub, `aterm <tool>`, `atpkg run <tool>`) converge
-/// on ONE state machine. Interactive iff stdin AND stdout are terminals; a pipe, a
-/// script or an agent harness never waits.
+/// on ONE state machine. Interactive iff stdin AND stdout are terminals.
 ///
 /// Exits 127 — whatever was printed, the command the user typed did not run — with TWO
 /// exceptions. An AGENT program with a foreign copy to run meanwhile
 /// ([`pending_passthrough`]) has that copy `exec`ed in this process's place,
 /// so the user's command really does run and this never returns; 126 if that `exec`
-/// itself fails, and off Unix, where there is no `exec`, the 127 stands. And a person at
-/// a terminal whose program a running pass is installing waits for it under the meter
-/// and has it run the moment it lands ([`wait_then_run`]).
+/// itself fails, and off Unix, where there is no `exec`, the 127 stands. And a caller whose
+/// program a running pass is installing waits for it and has it run the moment it lands
+/// ([`wait_then_run`]): a person at a terminal under the meter, a script or an agent's
+/// tool call with a line on stderr every few seconds and a bound (2026-10-15 — the agent
+/// primer sends every agent to `targo` as soon as the shell hook sets `$ATPKG_BIN`, and
+/// "try again in a minute" was a dead end for a tool call that cannot).
 fn run_pending(layout: &crate::store::Layout, tool: &str, passthrough: &[String]) -> ExitCode {
     use std::io::IsTerminal as _;
     let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     // An agent program with a foreign copy to run meanwhile says its lines on STDERR:
     // the copy's stdout is the user's (a pipe, a script), and the state is a note.
     let onward = pending_passthrough(layout, tool, std::env::var_os("PATH").as_deref());
-    let to_stderr = onward.is_some();
-    let mut say = |line: String| {
+    let show = if interactive && crate::meter::wanted() {
+        WaitShow::Meter
+    } else {
+        WaitShow::Lines
+    };
+    // A PERSON asked when the stub reads from a terminal and speaks to one; a script, a pipe
+    // or an agent's tool call has neither, and its bump does not jump the toolchain.
+    let asker = if std::io::stdin().is_terminal() && std::io::stderr().is_terminal() {
+        crate::progress::Asker::Person
+    } else {
+        crate::progress::Asker::Script
+    };
+    let mut lines = Vec::new();
+    let mut say = |line: String| lines.push(line);
+    let mut io = PendingIo {
+        say: &mut say,
+        // A copy to run meanwhile runs instead of any wait.
+        wait: onward.is_none().then_some(show),
+        asker,
+    };
+    // Anchor freshness before deciding to wait: a terminal snapshot already here
+    // is not the successor a live promise says is coming.
+    let observed_at = crate::flow::now_unix().max(0).unsigned_abs();
+    let initial = crate::progress::read_progress(layout);
+    let initial_running = initial
+        .as_ref()
+        .is_some_and(|file| crate::progress::snapshot_running(file, observed_at));
+    let next = pending_state(layout, tool, &mut io);
+    // The lines go out once the decision is made: on STDERR for a copy that runs
+    // meanwhile and for an unattended wait — the program's own stdout is the caller's (a
+    // pipe, a script, an agent reading `targo metadata`), and the state is a note.
+    let waits = next == PendingNext::WaitThenRun;
+    let to_stderr = onward.is_some() || (waits && show == WaitShow::Lines);
+    for line in lines {
         if to_stderr {
             eprintln!("{line}");
         } else {
             println!("{line}");
         }
-    };
-    let mut io = PendingIo {
-        say: &mut say,
-        // A person at a terminal waits for a program on its way, under the meter; a copy
-        // to run meanwhile runs instead.
-        wait: interactive && onward.is_none() && crate::meter::wanted(),
-    };
-    let next = pending_state(layout, tool, &mut io);
-    if next == PendingNext::WaitThenRun {
-        return wait_then_run(layout, tool, passthrough);
+    }
+    if waits {
+        return wait_then_run(
+            layout,
+            tool,
+            passthrough,
+            show,
+            asker,
+            initial.as_ref(),
+            initial_running,
+        );
     }
     if let Some(exe) = onward {
         eprintln!(
@@ -2380,6 +2434,10 @@ fn run_pending(layout: &crate::store::Layout, tool: &str, passthrough: &[String]
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt as _;
+            #[expect(
+                clippy::disallowed_types,
+                reason = "a pending stub becomes the copy it names by exec: its caller's descriptors are the copy's"
+            )]
             let err = std::process::Command::new(&exe).args(passthrough).exec();
             eprintln!("atpkg: could not run {}: {err}", exe.display());
             return ExitCode::from(126);
@@ -2423,24 +2481,113 @@ fn pending_wait_step(running: bool, installed: bool, failed: bool) -> WaitStep {
     }
 }
 
+/// Select the snapshot whose rows belong to a pending command's wait. The witness
+/// starts before admission and can advance to a pass actually observed live.
+fn pending_wait_file<'a>(
+    snapshot: Option<&'a crate::progress::ProgressFile>,
+    initial: Option<&crate::progress::ProgressFile>,
+    running: bool,
+    initial_running: bool,
+) -> Option<&'a crate::progress::ProgressFile> {
+    fn generation(file: &crate::progress::ProgressFile) -> Option<&str> {
+        file.generation.as_deref().filter(|id| {
+            id.len() == 32
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+    }
+    snapshot.filter(|file| {
+        if running {
+            return true;
+        }
+        if file.ended_unix.is_none() {
+            return false;
+        }
+        match generation(file) {
+            Some(current) => {
+                initial.is_none_or(|first| generation(first) != Some(current) || initial_running)
+            }
+            // An untagged ended file has no proof of succession. Only a pass
+            // actually observed live before admission can own its terminal row.
+            None => initial.is_some_and(|first| {
+                generation(first).is_none()
+                    && initial_running
+                    && first.pass == file.pass
+                    && first.started_unix == file.started_unix
+            }),
+        }
+    })
+}
+
 /// How often a waiting stub looks for its program ([`wait_then_run`]).
 const PENDING_WAIT_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// The wait a person at a terminal gets when the program they typed is on its way
-/// ([`PendingNext::WaitThenRun`]): the meter follows the running pass's `progress.json`
-/// for this one program, and the moment its shim resolves the program runs — `exec`ed in
-/// this process's place with the arguments they typed, so their command really does run.
-/// Ctrl-C stops the wait (the meter's line is cleared and the process dies of the
-/// signal, 130 to the shell). A failure the pass records, or a pass that ends without
-/// installing it, is said in one line and exits 1.
-fn wait_then_run(layout: &crate::store::Layout, tool: &str, passthrough: &[String]) -> ExitCode {
+/// How long an UNATTENDED caller waits for its program ([`WaitShow::Lines`]): a whole
+/// first install of the toolset fits, and a tool call is never held past it. The bound
+/// is a hang detector for a pass that stalls, never a latency budget.
+const PENDING_UNATTENDED_WAIT_CAP: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// How often an unattended wait says where its program is ([`WaitShow::Lines`]).
+const PENDING_UNATTENDED_SAY_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The line an unattended wait says every [`PENDING_UNATTENDED_SAY_EVERY`]: what was typed,
+/// the program it waits for, and how far that program is — the downloaded share while its
+/// size is known, else its phase.
+fn unattended_wait_line(
+    typed: &str,
+    program: &str,
+    row: Option<&crate::progress::ProgramProgress>,
+) -> String {
+    use crate::progress::Phase;
+    let how = match row {
+        Some(r) if r.phase == Phase::Download && r.bytes_total > 0 => format!(
+            " {}%",
+            r.bytes_done.saturating_mul(100) / r.bytes_total.max(1)
+        ),
+        Some(r) if r.phase == Phase::Queued => ", queued".to_string(),
+        Some(r) if matches!(r.phase, Phase::Verify | Phase::Extract | Phase::Link) => {
+            ", setting up".to_string()
+        }
+        _ => String::new(),
+    };
+    format!("atpkg: {typed} is being installed ({program}{how})")
+}
+
+/// The wait a caller gets when the program they typed is on its way
+/// ([`PendingNext::WaitThenRun`]), and the moment its shim resolves the program runs —
+/// `exec`ed in this process's place with the arguments they typed, so their command really
+/// does run. A person at a terminal ([`WaitShow::Meter`]) watches the meter follow the
+/// running pass's `progress.json` for this one program; Ctrl-C stops the wait (the meter's
+/// line is cleared and the process dies of the signal, 130 to the shell). An unattended
+/// caller ([`WaitShow::Lines`]) gets one stderr line every few seconds and gives up after
+/// [`PENDING_UNATTENDED_WAIT_CAP`], exit 127, saying so. A failure the pass records, or a
+/// pass that ends without installing it, is said in one line and exits 1. A pass only
+/// promised so far ([`crate::progress::pass_owed`]) is waited for as one in flight; when no
+/// pass of the wait planned the program — the promise broke first, or its pass stopped
+/// before planning — it is answered as nothing installing ([`pending_not_running`]), and
+/// when the promised pass planned without it, as no longer in the default set; both exit
+/// 127, the second without waiting the pass out.
+///
+/// `tool` is what was typed; a command a program exposes (`targo`) waits on its program's
+/// progress row (`trust`, [`crate::stub::program_of`]) and runs once its own shim lands.
+fn wait_then_run(
+    layout: &crate::store::Layout,
+    tool: &str,
+    passthrough: &[String],
+    show: WaitShow,
+    asker: crate::progress::Asker,
+    initial: Option<&crate::progress::ProgressFile>,
+    initial_running: bool,
+) -> ExitCode {
+    let program = crate::stub::program_of(tool);
     // Register before the first progress -> shim read. A rename between that
     // read and the wait is then queued by kqueue, not lost until the fallback.
     let mut shim_wake = crate::pending_wake::PendingShimWake::new(layout);
     let waiting = format!("Waiting for {tool}\u{2026}");
-    let meter = {
+    let meter = (show == WaitShow::Meter).then(|| {
         let layout = layout.clone();
-        let focus = tool.to_string();
+        let focus = program.to_string();
         crate::meter::TtyMeter::start(move || {
             let now = crate::flow::now_unix().max(0).unsigned_abs();
             match crate::progress::read_progress(&layout)
@@ -2454,42 +2601,110 @@ fn wait_then_run(layout: &crate::store::Layout, tool: &str, passthrough: &[Strin
                 None => crate::meter::Show::Busy(waiting.clone()),
             }
         })
-    };
+    });
+    let started = std::time::Instant::now();
+    let mut said = started;
+    // Whether a pass of this wait ever planned the program: one that never did — a promise
+    // broken before any pass began, a pass that stopped before it planned (offline) — is
+    // answered as nothing installing ([`pending_not_running`]), not as an install that
+    // stopped.
+    let mut planned = false;
+    // Whether this wait has seen the promise: its retirement then says the promised pass
+    // planned (or ended), so a live default-set pass with no row for the program is a plan
+    // that left it out.
+    let mut promised = false;
+    let mut witness = initial.cloned();
+    let mut witness_running = initial_running;
     let outcome = loop {
-        // THE PASS FIRST, THEN THE SHIM ([`pending_wait_step`]): a pass lays a program's
-        // shim before it ends, so a pass read as ended has laid every shim it will.
+        // THE PROMISE, THEN THE PASS, THEN THE SHIM ([`pending_wait_step`]): an update retires
+        // the promise only once its pass planned or ended, and a pass lays a program's shim
+        // before it ends — so a promise read as gone was kept or broken for good, a live pass
+        // read after it has planned, and a pass read as ended has laid every shim it will.
         let now = crate::flow::now_unix().max(0).unsigned_abs();
+        let owed = crate::progress::pass_owed(layout, now);
         let snapshot = crate::progress::read_progress(layout);
         let running = snapshot
             .as_ref()
             .is_some_and(|f| crate::progress::snapshot_running(f, now));
-        let failed = snapshot
-            .as_ref()
-            .and_then(|f| f.programs.get(tool))
-            .filter(|r| {
-                matches!(
-                    r.phase,
-                    crate::progress::Phase::Failed | crate::progress::Phase::Skipped
-                )
-            });
+        // A live pass or a successor of the pre-admission observation owns its
+        // rows. Equal-second timestamps cannot turn an old failure into this one's.
+        let row = pending_wait_file(
+            snapshot.as_ref(),
+            witness.as_ref(),
+            running,
+            witness_running,
+        )
+        .and_then(|f| f.programs.get(program));
+        if running {
+            witness = snapshot.clone();
+            witness_running = true;
+        }
+        planned |= row.is_some();
+        promised |= owed;
+        // A PLAN THAT LEFT IT OUT: the promise this wait saw is gone, retired once its pass
+        // planned, and that default-set pass runs with no row for the program (a name the
+        // signed index does not serve here). It is not coming, so the wait ends now with
+        // the answer a stub run now gets ([`pending_state`]'s honesty edge), not at the end
+        // of a pass that may run for minutes.
+        let left_out = promised
+            && !planned
+            && !owed
+            && running
+            && snapshot
+                .as_ref()
+                .is_some_and(|f| matches!(f.pass.as_str(), "net" | "seed"));
+        let failed = row.filter(|r| {
+            matches!(
+                r.phase,
+                crate::progress::Phase::Failed | crate::progress::Phase::Skipped
+            )
+        });
         let installed = crate::which(layout, tool).is_some();
-        match pending_wait_step(running, installed, failed.is_some()) {
+        match pending_wait_step(owed || running, installed, failed.is_some() || left_out) {
             WaitStep::Run => break Ok(()),
+            WaitStep::Fail if left_out => {
+                break Err(Some((
+                    not_in_default_set_line(program),
+                    ExitCode::from(127),
+                )));
+            }
+            WaitStep::Fail if failed.is_none() && !planned => break Err(None),
             WaitStep::Fail => {
-                break Err(match failed {
-                    Some(row) => format!(
-                        "atpkg: {tool} did not install: {} \u{2014} `aterm pkg install \
-                         {tool}` tries again",
-                        crate::progress::sanitize_for_tty(
-                            row.error.as_deref().unwrap_or("no reason was recorded"),
-                            PENDING_ERROR_CAP
-                        )
-                    ),
-                    None => format!(
-                        "atpkg: the install stopped before {tool} was ready \u{2014} `aterm \
-                         pkg install {tool}` tries again"
-                    ),
-                });
+                break Err(Some((
+                    match failed {
+                        Some(row) => format!(
+                            "atpkg: {program} did not install: {} \u{2014} `aterm pkg install \
+                             {program}` tries again",
+                            crate::progress::sanitize_for_tty(
+                                row.error.as_deref().unwrap_or("no reason was recorded"),
+                                PENDING_ERROR_CAP
+                            )
+                        ),
+                        None => format!(
+                            "atpkg: the install stopped before {tool} was ready \u{2014} `aterm \
+                             pkg install {program}` tries again"
+                        ),
+                    },
+                    ExitCode::from(1),
+                )));
+            }
+            WaitStep::Wait if show == WaitShow::Lines => {
+                // The unattended bound: a stalled pass never holds a tool call for good.
+                if started.elapsed() >= PENDING_UNATTENDED_WAIT_CAP {
+                    break Err(Some((
+                        format!(
+                            "atpkg: stopped waiting for {program} after {} minutes \u{2014} it \
+                             is still installing; run {tool} again once it lands",
+                            PENDING_UNATTENDED_WAIT_CAP.as_secs() / 60
+                        ),
+                        ExitCode::from(127),
+                    )));
+                }
+                if said.elapsed() >= PENDING_UNATTENDED_SAY_EVERY {
+                    eprintln!("{}", unattended_wait_line(tool, program, row));
+                    said = std::time::Instant::now();
+                }
+                let _ = shim_wake.wait(PENDING_WAIT_POLL);
             }
             WaitStep::Wait => {
                 let _ = shim_wake.wait(PENDING_WAIT_POLL);
@@ -2497,9 +2712,21 @@ fn wait_then_run(layout: &crate::store::Layout, tool: &str, passthrough: &[Strin
         }
     };
     drop(meter);
-    if let Err(line) = outcome {
-        eprintln!("{line}");
-        return ExitCode::from(1);
+    match outcome {
+        Ok(()) => {}
+        Err(Some((line, exit))) => {
+            eprintln!("{line}");
+            return exit;
+        }
+        // No pass of this wait planned the program — the window went, the update ended
+        // before it planned (offline, nothing to do), the deadline passed: the command did
+        // not run, and nothing is installing it.
+        Err(None) => {
+            if let Some(program) = crate::store::ToolName::new(program) {
+                pending_not_running(layout, &program, asker, &mut |line| eprintln!("{line}"));
+            }
+            return ExitCode::from(127);
+        }
     }
     // It landed: run it through `atpkg run <tool>` itself ([`cmd_run`]), so it gets every
     // rule that door keeps — the exec root, the build's declared environment
@@ -2508,7 +2735,7 @@ fn wait_then_run(layout: &crate::store::Layout, tool: &str, passthrough: &[Strin
     // arguments reach it untouched. A name still laid as a pending stub is answered here:
     // handing it on would land back in this wait.
     if crate::stub::pending_stub_exists(layout, tool) {
-        eprintln!("{}", not_installed_fix(tool));
+        eprintln!("{}", not_installed_fix(program));
         return ExitCode::from(127);
     }
     let mut rest = Vec::with_capacity(passthrough.len() + 2);
@@ -2558,10 +2785,25 @@ fn held_stub_line(name: &str, held: &str) -> String {
 /// (production prints it; tests collect it).
 struct PendingIo<'a> {
     say: &'a mut dyn FnMut(String),
-    /// Whether a person at a terminal can wait for a program a running pass is
-    /// installing — then the answer is to wait and run it ([`PendingNext::WaitThenRun`]),
-    /// never "run it again later".
-    wait: bool,
+    /// Whether the caller can wait for a program a running pass is installing, and how
+    /// the wait shows — then the answer is to wait and run it
+    /// ([`PendingNext::WaitThenRun`]), never "run it again later". `None` when a copy of
+    /// the program runs meanwhile instead ([`pending_passthrough`]).
+    wait: Option<WaitShow>,
+    /// Who the bump is written for: a person at a terminal, whose agent lands at once, or a
+    /// script, whose agent goes first among the agents once the toolchain's bytes are in
+    /// ([`RiderQueue::next`]).
+    asker: crate::progress::Asker,
+}
+
+/// How a stub that waits for its program shows the wait ([`wait_then_run`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitShow {
+    /// A person at a terminal: the progress meter, for as long as the pass runs.
+    Meter,
+    /// A script, a pipe or an agent's tool call: a line on stderr every
+    /// [`PENDING_UNATTENDED_SAY_EVERY`], for at most [`PENDING_UNATTENDED_WAIT_CAP`].
+    Lines,
 }
 
 /// What the caller of [`pending_state`] does after the lines: nothing more, or wait.
@@ -2584,21 +2826,33 @@ fn pending_state(layout: &crate::store::Layout, tool: &str, io: &mut PendingIo<'
         (io.say)("atpkg: that is not an installable program name".to_string());
         return PendingNext::Done;
     };
-    let name = tn.as_str();
-    match crate::stub::describe(name) {
-        Some(what) => (io.say)(format!("atpkg: {name}: {what} — not installed yet.")),
-        None => (io.say)(format!(
-            "atpkg: {name}: part of the ALab toolset — not installed yet."
-        )),
+    let typed = tn.as_str();
+    // A COMMAND A PROGRAM EXPOSES (`targo`) answers with its PROGRAM's state (`trust`,
+    // [`crate::stub::program_of`]): the progress row, the status row and the bump are all
+    // the program's. Every line below names the program; this one says how they relate.
+    let program =
+        crate::store::ToolName::new(crate::stub::program_of(typed)).unwrap_or_else(|| tn.clone());
+    let name = program.as_str();
+    let what = crate::stub::describe(name).unwrap_or("part of the ALab toolset");
+    if typed == name {
+        (io.say)(format!("atpkg: {name}: {what} — not installed yet."));
+    } else {
+        (io.say)(format!(
+            "atpkg: {typed} comes with {name}: {what} — not installed yet."
+        ));
     }
-    let snapshot = crate::progress::read_progress(layout);
     let now = crate::flow::now_unix().max(0).unsigned_abs();
+    // THE PROMISE, THEN THE PASS — the order [`wait_then_run`] reads them in.
+    let owed = crate::progress::pass_owed(layout, now);
+    let snapshot = crate::progress::read_progress(layout);
     // A pass that is installing something ELSE — a person's typed `update`, or a single
     // `install` of another program — says nothing about this one: its snapshot never
-    // plans the default set, so its silence about this name is no delisting.
+    // plans the default set, so its silence about this name is no delisting. Nor is a
+    // promised pass's before its plan lands: the promise answers below.
     let running = snapshot.as_ref().is_some_and(|f| {
         crate::progress::snapshot_running(f, now)
-            && (f.programs.contains_key(name) || matches!(f.pass.as_str(), "net" | "seed"))
+            && (f.programs.contains_key(name)
+                || (!owed && matches!(f.pass.as_str(), "net" | "seed")))
     });
     if let Some(file) = snapshot.as_ref().filter(|_| running) {
         if file.v != crate::progress::PROGRESS_VERSION {
@@ -2606,9 +2860,9 @@ fn pending_state(layout: &crate::store::Layout, tool: &str, io: &mut PendingIo<'
             // fields whose meaning may have changed. The bump file's contract is
             // versionless (names only), so the bump is still honest.
             (io.say)(format!(
-                "atpkg: aterm is installing the toolset now — try {name} again shortly."
+                "atpkg: aterm is installing the toolset now — try {typed} again shortly."
             ));
-            let _ = crate::progress::append_bump(layout, &tn);
+            let _ = crate::progress::append_bump(layout, &program, io.asker);
             return PendingNext::Done;
         }
         let overall = &file.overall;
@@ -2621,16 +2875,13 @@ fn pending_state(layout: &crate::store::Layout, tool: &str, io: &mut PendingIo<'
             // plan this program — a compiled-roster stub the signed index no longer
             // lists. Claiming it is next would be a lie the reorder-only intersection
             // silently swallows; the reconcile removes this stub at pass end.
-            (io.say)(format!(
-                "atpkg: {name} is no longer part of the default set — to install it: \
-                 aterm pkg install {name}"
-            ));
+            (io.say)(not_in_default_set_line(name));
             return PendingNext::Done;
         };
         use crate::progress::Phase;
         // A PERSON AT A TERMINAL WAITS FOR IT under the meter, and the program runs the
         // moment it lands — bumped first when still queued, so the wait is short.
-        if io.wait
+        if let Some(wait) = io.wait
             && matches!(
                 row.phase,
                 Phase::Queued
@@ -2641,13 +2892,12 @@ fn pending_state(layout: &crate::store::Layout, tool: &str, io: &mut PendingIo<'
                     | Phase::Done
             )
         {
-            if row.phase == Phase::Queued {
-                let _ = crate::progress::append_bump(layout, &tn);
+            // Not started yet, as far as the pass goes: still queued, or its archive fetched
+            // ahead and waiting for the pass to reach it ([`ProgramProgress::downloaded`]).
+            if row.phase == Phase::Queued || row.downloaded() {
+                let _ = crate::progress::append_bump(layout, &program, io.asker);
             }
-            (io.say)(format!(
-                "atpkg: {name} is on its way \u{2014} it starts as soon as it is installed \
-                 (Ctrl-C to stop)."
-            ));
+            (io.say)(on_its_way_line(typed, name, wait));
             return PendingNext::WaitThenRun;
         }
         match row.phase {
@@ -2687,7 +2937,7 @@ fn pending_state(layout: &crate::store::Layout, tool: &str, io: &mut PendingIo<'
             Phase::Queued => {
                 let position = file.queue.iter().position(|q| q == name);
                 let current = file.queue.first().filter(|c| c.as_str() != name);
-                let bumped = crate::progress::append_bump(layout, &tn).is_ok();
+                let bumped = crate::progress::append_bump(layout, &program, io.asker).is_ok();
                 match (position, current, bumped) {
                     (Some(p), Some(cur), true) => {
                         // `cur` came off disk: it is echoed only after its own
@@ -2736,6 +2986,62 @@ fn pending_state(layout: &crate::store::Layout, tool: &str, io: &mut PendingIo<'
         }
         return PendingNext::Done;
     }
+    // A PASS IS PROMISED and has not planned yet ([`crate::progress::pass_owed`]): the
+    // window's first-run seed, or an update about to plan the set. A caller who can wait
+    // waits for it as for a pass in flight, bumped first so its program goes first.
+    if owed {
+        let _ = crate::progress::append_bump(layout, &program, io.asker);
+        (io.say)("atpkg: aterm is starting your toolchain install now.".to_string());
+        match io.wait {
+            Some(wait) => {
+                (io.say)(on_its_way_line(typed, name, wait));
+                return PendingNext::WaitThenRun;
+            }
+            None => {
+                (io.say)(format!(
+                    "atpkg: {name} is requested first \u{2014} try {typed} again in a minute."
+                ));
+                return PendingNext::Done;
+            }
+        }
+    }
+    pending_not_running(layout, &program, io.asker, &mut *io.say);
+    PendingNext::Done
+}
+
+/// The honesty edge's line: a default-set pass is running and its plan leaves `name` out
+/// ([`pending_state`], and a wait whose promised pass planned without it,
+/// [`wait_then_run`]).
+fn not_in_default_set_line(name: &str) -> String {
+    format!(
+        "atpkg: {name} is no longer part of the default set — to install it: aterm pkg \
+         install {name}"
+    )
+}
+
+/// The line a caller who waits for its program gets ([`PendingNext::WaitThenRun`]): what
+/// it waits for, and how the wait ends.
+fn on_its_way_line(typed: &str, name: &str, wait: WaitShow) -> String {
+    let it = if typed == name { "it" } else { typed };
+    let stop = match wait {
+        WaitShow::Meter => "Ctrl-C to stop".to_string(),
+        WaitShow::Lines => format!(
+            "waiting at most {} minutes",
+            PENDING_UNATTENDED_WAIT_CAP.as_secs() / 60
+        ),
+    };
+    format!("atpkg: {name} is on its way \u{2014} {it} starts as soon as it is installed ({stop}).")
+}
+
+/// [`pending_state`]'s answer when no pass is installing `program` or promised: the
+/// recorded failure or the reason nothing is coming, else the bump and what it means.
+fn pending_not_running(
+    layout: &crate::store::Layout,
+    program: &crate::store::ToolName,
+    asker: crate::progress::Asker,
+    say: &mut dyn FnMut(String),
+) {
+    let name = program.as_str();
     // NOT RUNNING (no file, stale heartbeat, dead pid, or a terminal snapshot):
     // only not-running states may render, whatever the snapshot claims. A recorded
     // failure outranks the generic line — every failure names its next act.
@@ -2748,19 +3054,19 @@ fn pending_state(layout: &crate::store::Layout, tool: &str, io: &mut PendingIo<'
         if let Some(row) = status.programs.get(name)
             && let Some(held) = row.state.strip_prefix(crate::state::HELD_FAILED_PREFIX)
         {
-            (io.say)(held_stub_line(name, held));
-            return PendingNext::Done;
+            say(held_stub_line(name, held));
+            return;
         }
         if let Some(row) = status.programs.get(name)
             && row.state.starts_with("error")
         {
-            (io.say)(format!(
+            say(format!(
                 "atpkg: the last install attempt FAILED: {} — fix: aterm pkg update \
                  retries it; Settings ▸ Packages shows details.",
                 crate::progress::sanitize_for_tty(&row.state, PENDING_ERROR_CAP)
             ));
-            let _ = crate::progress::append_bump(layout, &tn);
-            return PendingNext::Done;
+            let _ = crate::progress::append_bump(layout, program, asker);
+            return;
         }
         // A member the pinned build does not serve on THIS target — the canonical
         // `unavailable on <target>: <hint>` row the pass records per program — is not
@@ -2769,12 +3075,12 @@ fn pending_state(layout: &crate::store::Layout, tool: &str, io: &mut PendingIo<'
         if let Some(row) = status.programs.get(name)
             && row.state.starts_with(crate::state::UNAVAILABLE_PREFIX)
         {
-            (io.say)(format!(
+            say(format!(
                 "atpkg: {name} is not coming on its own: {} — Settings ▸ Packages \
                  shows details.",
                 crate::progress::sanitize_for_tty(&row.state, PENDING_ERROR_CAP)
             ));
-            return PendingNext::Done;
+            return;
         }
         // A BLOCKED toolset outranks the generic promise: the reconcile pass records
         // the `*toolset*` row so this stub, which may outlive the pass by months, can
@@ -2782,7 +3088,7 @@ fn pending_state(layout: &crate::store::Layout, tool: &str, io: &mut PendingIo<'
         if let Some(row) = status.programs.get("*toolset*")
             && let Some(why) = row.state.strip_prefix("blocked: ")
         {
-            (io.say)(format!(
+            say(format!(
                 "atpkg: {name} is not coming on its own: {} — Settings ▸ Packages \
                  shows details.",
                 crate::progress::sanitize_for_tty(why, PENDING_ERROR_CAP)
@@ -2790,15 +3096,15 @@ fn pending_state(layout: &crate::store::Layout, tool: &str, io: &mut PendingIo<'
             // Still worth a bump: a triple the index has since learned to serve
             // gets an immediate pass from the GUI's bump watch; an unserved-triple
             // pass re-skips quietly.
-            let _ = crate::progress::append_bump(layout, &tn);
-            return PendingNext::Done;
+            let _ = crate::progress::append_bump(layout, program, asker);
+            return;
         }
     }
     // BUMP FIRST, THEN SAY WHAT THAT MEANS: an open aterm window stats the bump file
     // every 5 s and turns a fresh bump into a pass, so the sentence depends on whether
     // the bump was recorded.
-    let bumped = crate::progress::append_bump(layout, &tn).is_ok();
-    (io.say)(if bumped {
+    let bumped = crate::progress::append_bump(layout, program, asker).is_ok();
+    say(if bumped {
         format!(
             "atpkg: nothing is installing right now — {name} is requested; an open aterm \
              window starts a pass within seconds (at most one every 5 minutes). \
@@ -2809,7 +3115,6 @@ fn pending_state(layout: &crate::store::Layout, tool: &str, io: &mut PendingIo<'
          toolset on launch), or run: aterm pkg update"
             .to_string()
     });
-    PendingNext::Done
 }
 
 /// After an [`crate::FlowError::Unreachable`] failure line, name the ONE act that
@@ -3592,9 +3897,12 @@ fn which_line_in(
     // 3. A pending stub in the managed bin/: typing the name waits — and a recorded row
     //    that says WHY it waits (unserved here) outranks the generic promise.
     if stubbed {
+        // A command a program exposes (`targo`) waits on that program (`trust`): its row,
+        // and the install that lays it ([`crate::stub::program_of`]).
+        let program = crate::stub::program_of(tool);
         // …and a HELD row (`held: last attempt failed with …; <retry>`): the stub is
         // waiting on a person, not on the next pass, and the row says which act.
-        let waiting = row_of(tool).map(|r| r.state).filter(|st| {
+        let waiting = row_of(program).map(|r| r.state).filter(|st| {
             st.starts_with(crate::state::UNAVAILABLE_PREFIX)
                 || st.starts_with(crate::state::HELD_FAILED_PREFIX)
         });
@@ -3602,7 +3910,7 @@ fn which_line_in(
             Some(st) => format!("{tool} → {} (pending stub) — {st}", shim.display()),
             None => format!(
                 "{tool} → {} (pending stub) — not installed yet: the next pass installs it \
-                 (now: aterm pkg install {tool})",
+                 (now: aterm pkg install {program})",
                 shim.display()
             ),
         });
@@ -3925,10 +4233,13 @@ fn cmd_run(rest: &[String]) -> ExitCode {
     // success) or spawns+waits+exits on Windows (no `execve`); reaching past it means the
     // launch itself failed, and the returned value is that error.
     // Raw, not `spawnfd::command`: `aterm pkg run` becomes the tool, so its caller's
-    // descriptors are the tool's (`tools/grep_guard.sh` B27's allow-list). Its Windows
-    // console is still decided here (`Console::Quiet`, B28).
+    // descriptors are the tool's. Its Windows console is still decided here.
+    #[expect(
+        clippy::disallowed_types,
+        reason = "aterm pkg run becomes the tool by exec: its caller's descriptors are the tool's"
+    )]
     let mut command = std::process::Command::new(&target);
-    aterm_uds::spawn::set_flags(&mut command, aterm_uds::spawn::Console::Quiet, 0);
+    aterm_uds::spawn::set_flags(&mut command, 0);
     command.args(args).env("PATH", child_path);
     // …and the environment the shim would export before its `exec` (`ops::exec_env`):
     // after `PATH`, which no admitted entry can name.
@@ -4071,7 +4382,7 @@ fn lease_and_run(
     ));
     // TRANSPARENT, not `spawnfd::command`: the caller's own command, with ALL of its
     // caller's descriptors (a make jobserver's pipe, a `3>` redirect), whatever std this
-    // binary links (`spawnfd::transparent`'s docs); its Windows console is `Quiet` (B28).
+    // binary links (`spawnfd::transparent`'s docs); its Windows console is `Quiet`.
     let mut command = aterm_uds::spawnfd::transparent(&args.command[0]);
     let mut child = match command.args(&args.command[1..]).spawn() {
         Ok(child) => child,
@@ -4181,8 +4492,8 @@ fn cmd_lane(rest: &[String]) -> ExitCode {
 /// multi-command run resolved for exactly as long as the command lives, so gc keeps it, the
 /// seam does not re-lay it, and an unattended trust update waits for it. What a script
 /// holds its toolchain with: macOS has no `flock(1)`, and a lock on a descriptor the script
-/// keeps would be inherited by every daemon its build starts. The packers re-run
-/// themselves under it (`tools/atpkg-publish-lib.sh`'s `atpkg_hold_toolchain_lease`).
+/// keeps would be inherited by every daemon its build starts. (`atpkg-publish`'s packers
+/// take the lease in-process, `atpkg::lease`.)
 ///
 /// Exit: the command's own status — its code, or its signal re-raised
 /// ([`crate::platform::exit_code_like`]) — 2 for a usage error, 1 when the directory is
@@ -4368,9 +4679,8 @@ fn cmd_relocate(rest: &[String]) -> ExitCode {
 }
 
 /// `atpkg lineage <check-compiler|scan|seed-mint|stamp> …` ([`crate::lineage`]): the ONE
-/// content-based lineage checker the packers call (tools/atpkg-pack.sh,
-/// tools/atpkg-pack-bundle.sh, tools/linux-auto-atpkg.sh and atpkg-publish-lib.sh's
-/// `atpkg_seed_mint_refusals`). Records go to stdout as `key=value` lines; refusals to
+/// content-based lineage checker, on the command line (`atpkg-publish` calls the same
+/// functions as a library). Records go to stdout as `key=value` lines; refusals to
 /// stderr, one per line, exit 1 — except `seed-mint`, whose refusals ARE its output
 /// (stdout, exit 1 when any). Exit 2 is a usage error.
 fn cmd_lineage(rest: &[String]) -> ExitCode {
@@ -5936,7 +6246,7 @@ fn cmd_tree_root(dir: Option<&String>) -> ExitCode {
 }
 
 /// The target triple of this build, for artifact selection (§4.2).
-fn current_triple() -> &'static str {
+pub(crate) fn current_triple() -> &'static str {
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     {
         "aarch64-apple-darwin"
@@ -6187,6 +6497,8 @@ fn failed_install_state(e: &crate::FlowError) -> Option<String> {
 fn canonical_non_error_state(e: &crate::FlowError) -> Option<String> {
     match e {
         crate::FlowError::NoArtifact(t) => Some(crate::state::unavailable(t, "")),
+        // …and the vendor lane's, with its vendor's own hint.
+        crate::FlowError::VendorUnavailable(state) => Some(state.clone()),
         // A member the digest-refusal memo HELD off a stage that would fail again: the
         // flow already rendered the canonical `held: last attempt failed with …; <retry>`
         // row ([`crate::state::held_failed`]), and an `error:` head on it would say this
@@ -6903,7 +7215,7 @@ pub(crate) fn wanted_programs(
     index: &crate::manifest::Index,
     cfg: &crate::config::PackagesConfig,
 ) -> std::collections::BTreeSet<String> {
-    index.installable(&[], cfg.exclude())
+    index.installable(cfg.exclude())
 }
 
 /// Reconcile SYSTEM SATISFACTION over `wanted` against the given `PATH`. Returns the
@@ -7888,17 +8200,19 @@ impl MachineApply {
 /// `<prefix>/machine.lock`, held (blocking) for one apply of the `[machine]` settings: the
 /// window's launch apply, a session's and a pass edge carrying an edit may start at once,
 /// and two of them reading and writing the same per-host keys together is the one thing
-/// the queue exists to stop. `None` — unqueued — with no prefix to hold it
-/// in, or a lock file that cannot be opened. Released when the returned guard drops — by
+/// the queue exists to stop. THE PREFIX IS MADE FIRST, as the store lock makes it
+/// ([`crate::store::Layout::ensure_dir`], write-free over one that exists): on a first
+/// launch there is none yet, and the window's launch apply and the launch seed's edge both
+/// found "no prefix" and applied unqueued, side by side. `None` — unqueued — only for a
+/// prefix that cannot be made (a link, someone else's directory) or a lock file that
+/// cannot be opened. Released when the returned guard drops — by
 /// `LOCK_UN`, not by the close alone: a child any thread forks while an apply holds the
 /// queue (the window's shells) keeps a copy of its description until it execs, and a
 /// queue let go by the close stayed taken there, holding the next apply in line behind a
 /// shell's exec rather than an apply.
 fn machine_apply_queue() -> Option<crate::lock::Flock> {
     let layout = crate::store::resolve_configured()?;
-    if !layout.prefix.is_dir() {
-        return None;
-    }
+    layout.ensure_dir(&layout.prefix).ok()?;
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -7906,6 +8220,54 @@ fn machine_apply_queue() -> Option<crate::lock::Flock> {
         .open(layout.prefix.join("machine.lock"))
         .ok()?;
     crate::lock::Flock::lock(file).ok()
+}
+
+/// A pass's `[machine]` edit ([`main_entry`]), applied BESIDE the pass: on its own thread,
+/// started before the store lock is asked for and joined when this guard drops (or at
+/// [`Self::join`]). The `defaults` reads and writes — tens of milliseconds, and as long as
+/// another apply holds the queue ([`machine_apply_queue`]) — then delay neither the lock
+/// attempt nor the work after it, and the edit has still landed, and said so on stdout,
+/// before the pass exits.
+struct MachineEdit(Option<std::thread::JoinHandle<()>>);
+
+impl MachineEdit {
+    /// Start the apply ([`apply_machine_edit`]); a thread that cannot be started applies
+    /// here, in line.
+    fn start() -> Self {
+        match std::thread::Builder::new()
+            .name("atpkg-machine-edit".into())
+            .spawn(apply_machine_edit)
+        {
+            Ok(apply) => Self(Some(apply)),
+            Err(_) => {
+                apply_machine_edit();
+                Self(None)
+            }
+        }
+    }
+
+    /// Wait for the apply to end. A panic in it ends the apply only: the pass's own
+    /// output keeps its contract.
+    fn join(&mut self) {
+        if let Some(apply) = self.0.take() {
+            let _ = apply.join();
+        }
+    }
+}
+
+impl Drop for MachineEdit {
+    fn drop(&mut self) {
+        self.join();
+    }
+}
+
+/// The edge's apply: behind any apply already running (the window's or a session's launch
+/// apply), and then only if that one did not just apply this very table.
+fn apply_machine_edit() {
+    let _queue = machine_apply_queue();
+    if machine_table_changed() {
+        let _ = apply_machine_settings();
+    }
 }
 
 /// Why the `[machine]` settings must NOT touch this process's machine, or `None` when
@@ -8110,8 +8472,14 @@ fn cmd_machine(rest: &[String]) -> ExitCode {
             // and written twice — not to be told what some earlier call in this process
             // found. (The edge never applies for this verb anyway: it takes no store
             // lock, so it is not in `verb_applies_machine_settings`.)
-            let _queue = machine_apply_queue();
+            let queue = machine_apply_queue();
             let applied = apply_machine_settings();
+            // THE QUEUE GUARDS THE PER-HOST KEYS, NOT THE CACHE WALK: let it go before the
+            // housekeeping below. A pass's edge queued behind this apply ([`MachineEdit`],
+            // the launch seed's on a first launch) is joined before its pass exits, and the
+            // window starts the install only when that seed has exited, so a walk (and the
+            // removal of gigabytes) under the queue held the toolchain install behind it.
+            drop(queue);
             if applied.entries.is_empty() {
                 // THE CARD SHOWS THIS SENTENCE ALONE (the window renders the verdict
                 // without the narration), so it names the one cause the apply saw.
@@ -8213,7 +8581,7 @@ pub(crate) fn agent_twin_current(layout: &crate::store::Layout, name: &str, buil
 /// runs the vendor's updater on `claude update` until a pass re-lays it (the dev box's
 /// own `agents/claude`, laid by the installed app, carried only the landing block when
 /// this was reviewed), and the `.cmd` twin resolves the same and carries no block at
-/// all ([`crate::platform::cmd_selfupdate_prelude`] renders the empty string, pinned).
+/// all ([`crate::platform::twin_prelude`] renders nothing on Windows, pinned).
 /// One bounded, non-link regular read; anything unreadable answers `false`, never a
 /// sentence.
 pub(crate) fn agent_twin_intercepts(layout: &crate::store::Layout, name: &str, build: u64) -> bool {
@@ -9389,9 +9757,10 @@ fn cmd_install_with(
             println!("{}", dev_linked_line(&p));
             ExitCode::SUCCESS
         }
-        // A target the pinned build does not serve is a STATE, never an error (design §2):
-        // say the canonical words (the record already carries them) and exit clean.
-        Err(e @ crate::FlowError::NoArtifact(_)) => {
+        // A target the pinned build — or the vendor — does not serve is a STATE, never an
+        // error (design §2): say the canonical words (the record already carries them) and
+        // exit clean.
+        Err(e @ (crate::FlowError::NoArtifact(_) | crate::FlowError::VendorUnavailable(_))) => {
             let state = canonical_non_error_state(&e)
                 .unwrap_or_else(|| crate::state::unavailable(current_triple(), ""));
             println!("atpkg: {program}: {state}");
@@ -10228,6 +10597,12 @@ fn cmd_update_all_code() -> u8 {
     let Some(layout) = layout() else {
         return 1;
     };
+    // WHATEVER THIS PASS ENDS, ITS PROMISE ENDS WITH IT ([`crate::progress::pass_owed`]): the
+    // update a seed promised is this one, and once it returns nothing more is coming — a
+    // stub waiting on that promise answers at once. Its promise only: the one it wrote, or the
+    // seed's of the window that spawned it, never another window's seed's for the update that
+    // window spawns next ([`PromiseEnds`]).
+    let _promise = PromiseEnds(&layout);
     // THE HOLDER DID THIS PASS: a child that queued behind another full pass and finds its
     // end recorded since it started waiting does not repeat it back to back, whatever
     // that pass ended.
@@ -10296,6 +10671,21 @@ fn cmd_update_all_code() -> u8 {
         );
         return 0;
     }
+    // A pass that will plan the set PROMISES ITS OWN PLAN: the index resolve, the vendor lane
+    // and the manifest prefetch come first, and a stub run meanwhile waits for the plan. The
+    // owner is this process, so its exit breaks the promise; it is retired once the plan
+    // lands in `progress.json` ([`install_default_set_inner`]) or at the latest on return.
+    if update_promises_its_plan(
+        &layout,
+        complete_the_set && pass_progress_path().is_some(),
+        crate::flow::now_unix().max(0).unsigned_abs(),
+    ) {
+        crate::progress::promise_pass(
+            &layout,
+            std::process::id(),
+            crate::progress::PASS_PROMISE_SECS,
+        );
+    }
     let fetcher = resolve_fetcher(&layout);
     run_recorded_update_pass(
         &layout,
@@ -10305,6 +10695,33 @@ fn cmd_update_all_code() -> u8 {
         complete_the_set,
         &PassSeams::process(),
     )
+}
+
+/// Whether a whole update that `plans` the set with a progress file promises its own plan
+/// ([`cmd_update_all_code`]): only on a FIRST install ([`crate::adoption::first_install_ahead`]),
+/// or over a promise it finds at `now_unix` — the window seed's, which it takes over. A
+/// routine pass's stub is a program held, unserved here or failed last time, and its
+/// recorded reason answers at once ([`pending_not_running`]) rather than after a wait for a
+/// plan that leaves it out.
+fn update_promises_its_plan(layout: &crate::store::Layout, plans: bool, now_unix: u64) -> bool {
+    plans
+        && (crate::adoption::first_install_ahead(layout)
+            || crate::progress::pass_owed(layout, now_unix))
+}
+
+/// Retires the promise of a pass when the whole update holding it returns, by any path
+/// ([`cmd_update_all_code`]): a promise this process wrote, or one its spawner holds — the
+/// seed's of the window that spawned this update ([`seed_promise_owner`]) — and no other
+/// ([`crate::progress::retire_promise_of`]). A typed `aterm pkg update` that runs between a
+/// window's seed and that window's update leaves the seed's promise to it.
+struct PromiseEnds<'a>(&'a crate::store::Layout);
+
+impl Drop for PromiseEnds<'_> {
+    fn drop(&mut self) {
+        let mut holders = vec![std::process::id()];
+        holders.extend(wait_lock().and_then(|w| w.spawner));
+        crate::progress::retire_promise_of(self.0, &holders);
+    }
 }
 
 /// WHO gets set-completion: a machine that has ADOPTED the toolset (the seed bootstrap or an
@@ -10716,8 +11133,9 @@ fn run_update_pass(
     // their vendors even when the index is stale or unreachable. The hinted path above
     // only gives already-published index members priority; vendors still run every pass.
     // The vendor lane's downloads under a person's meter too ([`TypedPass`]).
+    let consent = set_completion_consent(adopted(layout), adopted_by_seed(layout));
     let typed = TypedPass::begin("update");
-    let vendor = vendor_pass(
+    let (mut vendor, fresh) = vendor_plan(
         layout,
         fetcher,
         cfg,
@@ -10726,13 +11144,35 @@ fn run_update_pass(
             update_installed: true,
             complete_the_set,
         },
-        set_completion_consent(adopted(layout), adopted_by_seed(layout)),
         match &resolved {
             Some(Ok(index)) => Some(index),
             _ => None,
         },
         seams,
     );
+    // AN EMPTY STORE'S FRESH VENDORS RIDE ITS SET COMPLETION, not ahead of it. On a first
+    // run every agent and the whole ALab set arrive in one pass, and landing the four agents
+    // first held the toolchain's first byte back by their whole download (about 770 MiB);
+    // now the toolchain's tuple goes first and the agents land beside the rest of the set
+    // ([`VendorRider`]). The index this pass resolved is verified and the yank latch fresh,
+    // so the vendors bind the yanks they would have bound first; with no index the set has
+    // nothing to ride, and a store with programs keeps the vendor-first order.
+    let mut rider = if complete_the_set
+        && installed.is_empty()
+        && matches!(resolved, Some(Ok(_)))
+        && !fresh.pending.is_empty()
+    {
+        Some(VendorRider {
+            fresh,
+            trust: seams.trust,
+            warm: seams.warm_agents,
+            landed: None,
+        })
+    } else {
+        land_fresh_alone(layout, fetcher, consent, &fresh, &mut vendor, seams, false);
+        None
+    };
+    warm_landed(layout, &mut vendor, seams);
     drop(typed);
     failures += vendor.failures;
     resolved_assets.extend(vendor.resolved_assets.clone());
@@ -10833,22 +11273,72 @@ fn run_update_pass(
         // it with stdout discarded, so a user could watch multiple GB arrive with nothing
         // on screen ever mentioning it. The marker contract exists to prevent that.
         let before_net = crate::active_builds(layout);
+        // The Trust toolchain is usable the moment its tuple flips: the rustup view and the
+        // exec roots follow it there, not when the rest of the pass is done (the pass end
+        // re-lays both, idempotently, as it always has).
+        let toolchain_flipped = |layout: &crate::store::Layout| {
+            (seams.rustup_seam)(layout);
+            let _ = reconcile_exec_roots(layout, crate::seam::Depth::Shallow);
+        };
         // The consent the line states is the one that holds on this machine: installing
         // aterm, with `auto_install = false` as the switch that would have stopped it —
         // unless a person adopted the set with the explicit verb ([`set_completion_consent`]).
-        let net = install_default_set_with_path(
+        let net = install_default_set_beside(
             layout,
             fetcher,
             &(seams.anchor)(layout),
             cfg,
-            set_completion_consent(adopted(layout), adopted_by_seed(layout)),
+            consent,
             (seams.now)(),
             pass_index.as_ref(),
             seams.path.as_deref(),
             &flip,
             &held_flip,
+            SetCompanions {
+                vendor: rider.as_mut(),
+                toolchain_flipped: &toolchain_flipped,
+            },
         );
         failures += net.failures;
+        // What arrived under the set completion's announcement — the vendors that rode it
+        // included, the ones landed alone below (with a terminal of their own) not.
+        let mut arrived: Vec<String> = crate::active_builds(layout)
+            .keys()
+            .filter(|k| !before_net.contains_key(k.as_str()))
+            .cloned()
+            .collect();
+        // The rider's outcomes, reported on this thread (every status row is written here),
+        // or its landings alone when the set completion stopped before it could carry them.
+        let mut deferred: Vec<&'static str> = Vec::new();
+        if let Some(rider) = rider.take() {
+            let failed_before = vendor.failures;
+            match rider.landed {
+                Some(landed) => {
+                    for outcome in &landed.outcomes {
+                        if matches!(
+                            outcome.verdict,
+                            crate::vendor_direct::lane::Verdict::Deferred { .. }
+                        ) {
+                            deferred.push(outcome.spec.program);
+                        }
+                        report_vendor(layout, outcome, &mut vendor, false, rider.fresh.now);
+                    }
+                    vendor.landed.retain(|p| !landed.warmed.contains(p));
+                }
+                None => land_fresh_alone(
+                    layout,
+                    fetcher,
+                    consent,
+                    &rider.fresh,
+                    &mut vendor,
+                    seams,
+                    true,
+                ),
+            }
+            warm_landed(layout, &mut vendor, seams);
+            failures += vendor.failures - failed_before;
+            resolved_assets.extend(vendor.resolved_assets.clone());
+        }
         // An empty store may retry after the first resolve failed. Judge the pass by
         // that retry's actual network answer: a pass whose retry reached a host is not an
         // offline pass. (Whether it REACHED the index is the live verifications' count,
@@ -10863,11 +11353,6 @@ fn run_update_pass(
         let announced = net.announced;
         // The net lane's resolutions join the apply lane's for the same sparing closure.
         resolved_assets.extend(net.resolved_assets);
-        let mut arrived: Vec<String> = crate::active_builds(layout)
-            .keys()
-            .filter(|k| !before_net.contains_key(k.as_str()))
-            .cloned()
-            .collect();
         if !arrived.is_empty() {
             arrived.sort();
             emit_marker_line(&format!(
@@ -10878,11 +11363,11 @@ fn run_update_pass(
         } else if announced {
             // ALWAYS ANSWER THE ANNOUNCEMENT (the seed lane's law): a pass that
             // said "installing over the network" and then installed nothing
-            // must say so, or the held notice outlives its own truth.
-            emit_marker_line(&format!(
-                "atpkg: {NET_FAILED_MARKER}network provisioning installed nothing — see the \
-                 lines above for each program's reason"
-            ));
+            // must say so, or the held notice outlives its own truth — a failure, unless
+            // everything it announced was a vendor landing waiting on its signature check.
+            if let Some(line) = fresh_landing_terminal(&[], &deferred, net.announced_count) {
+                emit_marker_line(&line);
+            }
         }
         // A CLEAN pass retires a legacy `*seed*` offer row ([`retire_seed_row`]).
         if net.failures == 0 {
@@ -11009,7 +11494,9 @@ fn run_update_pass(
                     .map(|index| index_serves(layout, fetcher, &index, cfg))
             }
         };
-        let (said, state) = match &serves_us {
+        // `unusable`: the `seed-unusable:` body, for the two verdicts the seed's own line
+        // used to carry ([`report_seedless_posture`]).
+        let (said, state, unusable) = match &serves_us {
             Some(IndexServes::Yes) => {
                 // The index DOES publish for this triple, so something else refused
                 // every member — a revocation, a floor, a filter. Saying "no build
@@ -11022,15 +11509,17 @@ fn run_update_pass(
                         current_triple()
                     ),
                     "unavailable: every published build was refused",
+                    None,
                 )
             }
-            Some(IndexServes::Unserved(served)) => (
-                format!(
-                    "nothing is installed and nothing was installable — {}",
-                    unserved_sentence(current_triple(), served)
-                ),
-                crate::state::TOOLSET_UNSERVED,
-            ),
+            Some(IndexServes::Unserved(served)) => {
+                let why = unserved_sentence(current_triple(), served);
+                (
+                    format!("nothing is installed and nothing was installable — {why}"),
+                    crate::state::TOOLSET_UNSERVED,
+                    Some(why),
+                )
+            }
             // The index serves this triple; the user's exclusion or uninstalls are
             // what left nothing — said as that, never as the architecture.
             Some(IndexServes::Narrowed(narrowing)) => {
@@ -11038,6 +11527,7 @@ fn run_update_pass(
                 (
                     format!("nothing is installed and nothing was installable — {why}"),
                     state,
+                    Some(why),
                 )
             }
             // `None` = the index never RESOLVED — an offline machine, a rate
@@ -11048,9 +11538,19 @@ fn run_update_pass(
                  re-run: aterm pkg install --default-set"
                     .to_string(),
                 crate::state::TOOLSET_INDEX_UNREACHABLE,
+                None,
             ),
         };
         eprintln!("atpkg: {said}");
+        // THE WINDOW'S CARD, from this pass: the window's seed no longer resolves the
+        // index, so this arm prints the very line it printed — an unserved architecture,
+        // a toolset narrowed to nothing — for the reader that parses every pass's stdout.
+        // A person's terminal has the sentence above already.
+        if let Some(why) = unusable
+            && !stdout_is_a_person()
+        {
+            emit_marker_line(&seed_unusable_line(&why));
+        }
         record_unbuilt(layout, "*toolset*", state, said);
         // Reached — this pass verified an index the channel served, the diagnosis's own
         // resolve included — is a verdict no retry changes (exit 2). Not reached, it is a
@@ -11116,6 +11616,8 @@ fn run_update_pass(
 struct DefaultSetOutcome {
     failures: u32,
     announced: bool,
+    /// How many programs the announcement named, the vendors that rode it included.
+    announced_count: usize,
     /// The network verdict of this lane's own index resolve, when it could not
     /// reuse the caller's index. Captured before member installs can replace the
     /// thread-local provenance; `update` uses it after a failed first resolve.
@@ -11272,15 +11774,63 @@ fn install_default_set_with_path(
     flip: &crate::quiet::FlipGate<'_>,
     held_flip: &std::collections::BTreeSet<String>,
 ) -> DefaultSetOutcome {
+    install_default_set_beside(
+        layout,
+        fetcher,
+        anchor,
+        cfg,
+        consent,
+        now,
+        index,
+        path_var,
+        flip,
+        held_flip,
+        SetCompanions {
+            vendor: None,
+            toolchain_flipped: &|_| {},
+        },
+    )
+}
+
+/// What an update pass's set completion carries besides its own members
+/// ([`install_default_set_beside`]).
+struct SetCompanions<'c, 'r> {
+    /// The vendor lane's fresh landings, announced and landed beside the set's
+    /// ([`VendorRider`]).
+    vendor: Option<&'c mut VendorRider<'r>>,
+    /// Run the moment a tuple holding the Trust toolchain flips: the pass's rustup view
+    /// and exec roots, which the pass end re-lays as well.
+    toolchain_flipped: &'c dyn Fn(&crate::store::Layout),
+}
+
+/// [`install_default_set_with_path`] with its [`SetCompanions`].
+#[allow(
+    clippy::too_many_arguments,
+    reason = "[`install_default_set_with_path`]'s inputs and what an update pass hands it \
+              besides"
+)]
+fn install_default_set_beside(
+    layout: &crate::store::Layout,
+    fetcher: &dyn crate::flow::Fetcher,
+    anchor: &crate::Anchor,
+    cfg: &crate::config::PackagesConfig,
+    consent: Consent,
+    now: i64,
+    index: Option<&crate::TrustedIndex>,
+    path_var: Option<&std::ffi::OsStr>,
+    flip: &crate::quiet::FlipGate<'_>,
+    held_flip: &std::collections::BTreeSet<String>,
+    companions: SetCompanions<'_, '_>,
+) -> DefaultSetOutcome {
     // Live-progress pass ownership (R5): when the GUI opted in via `--progress-file`
     // (or a person typed the pass on a terminal) and no pass is live yet, this pass IS
     // the "net" pass — begun here so its start truncates the file, ended here so the
     // terminal snapshot (pid cleared, `ended_unix` stamped) is written on every exit
     // path. When a pass is already live, `begin_pass` declines and this one runs under
-    // it.
+    // it. A vendor lane riding this pass meters on it too ([`crate::progress::lend`]).
     let owned_pass = pass_progress_path().is_some_and(|p| crate::progress::begin_pass(p, NET_PASS));
     let out = install_default_set_inner(
-        layout, fetcher, anchor, cfg, consent, now, index, path_var, flip, held_flip,
+        layout, fetcher, anchor, cfg, consent, now, index, path_var, flip, held_flip, companions,
     );
     if owned_pass {
         crate::progress::end_pass();
@@ -11306,7 +11856,12 @@ fn install_default_set_inner(
     path_var: Option<&std::ffi::OsStr>,
     flip: &crate::quiet::FlipGate<'_>,
     held_flip: &std::collections::BTreeSet<String>,
+    companions: SetCompanions<'_, '_>,
 ) -> DefaultSetOutcome {
+    let SetCompanions {
+        vendor: rider,
+        toolchain_flipped,
+    } = companions;
     let floor = build_floor(layout);
     // THE CALLER'S INDEX WHEN IT HAS ONE (`atpkg update`'s pass resolved one for its
     // apply lane), else one resolved here (`install --default-set`, the seed lane).
@@ -11331,6 +11886,7 @@ fn install_default_set_inner(
                     return DefaultSetOutcome {
                         failures: 1,
                         announced: false,
+                        announced_count: 0,
                         resolve_provenance,
                         index_error: Some(e.to_string()),
                         resolved_index_build: None,
@@ -11364,9 +11920,20 @@ fn install_default_set_inner(
     let Some(ch) = index.channel_for(crate::config::CHANNEL, current_triple()) else {
         let e = crate::FlowError::NoChannel(crate::config::CHANNEL.to_string());
         eprintln!("atpkg: default-set bootstrap failed: {e}");
+        // NOTHING OF THE SET IS COMING (an Intel Mac before x86_64 lands): this pass plans
+        // nothing, and the promise goes with that plan, so a stub waiting on it answers now
+        // rather than when the update exits. Not when vendors this pass would have carried
+        // land alone next: their plan takes the promise over ([`land_fresh_alone`]), and a
+        // stub waiting for one of them must not read the promise gone before it.
+        if rider.as_ref().is_none_or(|r| r.fresh.pending.is_empty())
+            && let Some(sink) = crate::progress::active()
+        {
+            sink.plan_promised_pass(layout, &[]);
+        }
         return DefaultSetOutcome {
             failures: 1,
             announced: false,
+            announced_count: 0,
             resolve_provenance,
             index_error: Some(e.to_string()),
             resolved_index_build: Some(index.index_build),
@@ -11380,9 +11947,13 @@ fn install_default_set_inner(
     let mut installed = crate::active_builds(layout);
     let mut wanted = wanted_programs(index, cfg);
     // The vendor programs are wanted from the compiled table whatever the index names:
-    // their stubs and rows stay here, and their own lane installs them (design §1.5).
+    // their stubs and rows stay here, and their own lane installs them (design §1.5). One
+    // whose vendor serves this machine nothing is not: its lane recorded its `unavailable
+    // on` row, and no stub may promise it.
     for spec in crate::vendor_direct::VENDORS {
-        if vendor_wanted(cfg, &std::collections::BTreeSet::new(), spec.program) {
+        if spec.serves(current_triple())
+            && vendor_wanted(cfg, &std::collections::BTreeSet::new(), spec.program)
+        {
             wanted.insert(spec.program.to_string());
         }
     }
@@ -11429,20 +12000,31 @@ fn install_default_set_inner(
         .map(String::as_str)
         .collect();
     let mut unserved: Vec<String> = Vec::new();
-    for group in &groups {
-        let missing = absent_members(group, &wanted, &installed);
-        if missing.is_empty()
-            || group
+    let prescan: Vec<(&crate::Group, Vec<String>)> = groups
+        .iter()
+        .filter(|group| {
+            !group
                 .members
                 .iter()
                 .any(|m| linked_members.contains(m.as_str()))
-        {
-            continue;
-        }
-        let probe: &[String] = match &group.group {
-            Some(_) => &group.members,
-            None => &missing,
-        };
+        })
+        .map(|group| (group, absent_members(group, &wanted, &installed)))
+        .filter(|(_, missing)| !missing.is_empty())
+        .collect();
+    // Every manifest the prescan reads — and the size sums and the disk check after it —
+    // fetched AT ONCE: one at a time they were twenty GETs, four seconds before the
+    // announcement. Bytes only: each read below still verifies what it is handed.
+    crate::flow::prefetch_pinned(
+        fetcher,
+        index,
+        ch,
+        prescan
+            .iter()
+            .flat_map(|(group, missing)| prescan_probe(group, missing))
+            .map(String::as_str),
+    );
+    for (group, missing) in prescan {
+        let probe = prescan_probe(group, &missing);
         if crate::flow::group_missing_triple(fetcher, index, crate::config::CHANNEL, triple, probe)
             .is_some()
         {
@@ -11628,31 +12210,54 @@ fn install_default_set_inner(
     // the units this pass lands nothing of ([`set_units`]). An unknown size or a failed
     // free-space query lets the pass proceed, as the per-program gate does; those gates
     // stay the backstop for what the sum cannot see.
-    let disk_refusal = if planned_units.is_empty() {
+    //
+    // The vendor lane's fresh landings, when they ride this pass, land at the same time:
+    // the set must fit beside everything they need at once ([`FreshVendors::peak`]). A set
+    // that does not is refused as it would be once they had landed, and they land alone.
+    let rider = rider.filter(|r| !r.fresh.pending.is_empty());
+    // The set's units and the volume's free space, when both are known: the refusal below
+    // reads them, and so does the download-ahead lane's room further down.
+    let set_room = if planned_units.is_empty() {
         None
     } else {
         set_units(&planned_units, |group| {
             crate::flow::planned_landing(fetcher, layout, index, ch, group, &installed, triple)
         })
-        .and_then(|units| {
-            set_disk_refusal(
-                &units,
-                crate::freespace::available_bytes(&layout.prefix)?,
-                &layout.prefix,
-            )
-        })
+        .zip(crate::freespace::available_bytes(&layout.prefix))
     };
+    let disk_refusal = set_room.as_ref().and_then(|(units, have)| {
+        set_disk_refusal(
+            units,
+            rider.as_ref().map_or(0, |r| r.fresh.peak()),
+            *have,
+            &layout.prefix,
+        )
+    });
     if let Some(refusal) = &disk_refusal {
         eprintln!("{}", refusal.line);
         refusal.record(layout);
         failures += 1;
     }
+    // ONE ANNOUNCEMENT FOR BOTH LANES: the vendors first, then the set, with their signed
+    // sizes summed. A second `net-starting:` would supersede the first's card while its
+    // landings were still moving bytes. Vendors a refused set leaves behind land alone after
+    // this pass, and the promise goes with their plan, not this one's ([`land_fresh_alone`]).
+    let left_behind = rider.is_some() && disk_refusal.is_some();
+    let rider = rider.filter(|_| disk_refusal.is_none());
+    let mut announced_names = rider.as_ref().map_or_else(Vec::new, |r| r.fresh.names());
+    announced_names.extend(will_install.iter().cloned());
+    let sizes = match (&rider, will_install.is_empty()) {
+        (Some(r), true) => r.fresh.sizes(),
+        (Some(r), false) => sizes.and(r.fresh.sizes()),
+        (None, _) => sizes,
+    };
     let announcement = if disk_refusal.is_some() {
         None
     } else {
-        net_announcement(consent, &will_install, sizes)
+        net_announcement(consent, &announced_names, sizes)
     };
     let announced = announcement.is_some();
+    let announced_count = if announced { announced_names.len() } else { 0 };
     if let Some(line) = &announcement {
         emit_marker_line(line);
     }
@@ -11675,23 +12280,77 @@ fn install_default_set_inner(
         .iter()
         .flat_map(|(_, missing)| missing.iter().cloned())
         .collect();
+    let vendor_plan = rider.as_ref().map_or_else(Vec::new, |r| r.fresh.planned());
+    let vendor_names: Vec<String> = vendor_plan.iter().map(|(name, _)| name.clone()).collect();
+    let shared = rider.as_ref().and_then(|_| fetcher.shared());
     // The live-progress plan (R5): per-program signed sizes fetched only when a sink
     // is live (the GUI lane) — N tiny verified manifest reads fix the overall bar's
     // denominator honestly before any byte moves. Best-effort: a miss degrades that
     // row to unmetered, never fails the pass.
+    //
+    // IN THE ORDER THE BYTES MOVE: the queue is what a pending stub reads its place in
+    // ("next in line, after …") and what the window names when nothing is mid-flight. A
+    // vendor riding this pass on a thread of its own lands once every archive of the set
+    // is in, the coherence tuples' among them, or once no tuple is left ([`RiderGate`]) —
+    // beside the rest of the set's landing — and after every set member when it has no
+    // thread of its own, so its rows stand after the last tuple, or last, never ahead of
+    // the toolchain they wait for ([`set_progress_queue`]).
     if let Some(sink) = crate::progress::active() {
-        let planned: Vec<(String, u64)> = plan
-            .iter()
-            .flat_map(|(_, missing)| missing.iter())
-            .map(|m| {
-                let size =
-                    crate::flow::planned_artifact_size(fetcher, index, ch, m, current_triple())
-                        .unwrap_or(0);
-                (m.clone(), size)
+        let vendor_sizes: std::collections::BTreeMap<_, _> = vendor_plan.into_iter().collect();
+        let planned: Vec<_> = set_progress_queue(&plan, &groups, &vendor_names, shared.is_some())
+            .into_iter()
+            .map(|name| {
+                let size = vendor_sizes.get(&name).copied().unwrap_or_else(|| {
+                    crate::flow::planned_artifact_size(fetcher, index, ch, &name, current_triple())
+                        .unwrap_or(0)
+                });
+                (name, size)
             })
             .collect();
-        sink.plan(&planned);
+        // THE PROMISED PLAN HAS LANDED: a stub reads this pass's rows from here on, and a
+        // name the plan leaves out is no longer coming ([`pending_state`]). Retired only now,
+        // with the pass live and planned, so a stub never reads the promise gone before the
+        // pass that kept it ([`wait_then_run`]) — and not by a plan whose vendors land alone
+        // after it, which would say "left out" to a stub waiting for one of them.
+        if left_behind {
+            sink.plan(&planned);
+        } else {
+            sink.plan_promised_pass(layout, &planned);
+        }
     }
+    // DOWNLOAD AHEAD ([`crate::flow::ahead`]): the plan's archives fetched on a thread of
+    // their own while this one digests, extracts and flips the unit in hand — the link sat
+    // idle through all of that, about ten seconds of the toolchain's alone. Bytes only, in
+    // the order this loop will want them; every stage, flip and row stays here. Only with a
+    // fetcher a pass may share, and only on a volume known to hold the set's peak plus what
+    // the lane may fetch ahead ([`crate::flow::ahead::Ahead::reserve`]): where it does not,
+    // the set lands as it always did, one download at a time.
+    //
+    // Over the units the disk check sized, and only when it sized them all ([`set_units`]):
+    // their signed manifests are in hand, so planning the lane asks the network nothing — a
+    // manifest the prescan could not fetch would otherwise be asked again here, a connect
+    // timeout apiece on a dead link, before the first unit starts — and a unit this pass
+    // lands nothing of (a held tuple, a refusal memo, a build not published here) moves no
+    // byte ahead.
+    let ahead = fetcher
+        .shared()
+        .zip(set_room.as_ref())
+        .and_then(|(_, (sized, have))| {
+            let units: Vec<(usize, Vec<String>)> = plan
+                .iter()
+                .filter(|(_, missing)| sized.iter().any(|unit| unit.members == *missing))
+                .cloned()
+                .collect();
+            let lane = crate::flow::ahead::Ahead::plan(fetcher, layout, index, ch, triple, &units)?;
+            crate::cost::disk_ok(
+                crate::flow::peak_need(sized.iter().map(|u| u.bytes))
+                    .saturating_add(rider.as_ref().map_or(0, |r| r.fresh.peak()))
+                    .saturating_add(lane.reserve()),
+                *have,
+                crate::cost::FREE_FLOOR,
+            )
+            .then_some(lane)
+        });
     // `program → pinned asset name` for every member either arm below resolves — filled
     // even when the member's download then fails, and carried out on the outcome so the
     // CALLER's pass-end gc can spare that member's `.part` resume state.
@@ -11710,86 +12369,198 @@ fn install_default_set_inner(
     // group (the transactional activation is untouched). The bump file is consumed
     // read-only here and deleted only at a clean pass end.
     let mut remaining: Vec<(usize, Vec<String>)> = plan;
-    while !remaining.is_empty() {
-        let bump: Vec<String> = crate::progress::read_bump(layout)
-            .into_iter()
-            .filter(|n| plannable.contains(n))
-            .collect();
-        if !bump.is_empty() {
-            resort_bumped(&mut remaining, &bump);
-            if let Some(sink) = crate::progress::active() {
-                for name in &bump {
-                    sink.bumped(name);
+    // THE VENDORS LAND BESIDE THE LOOP BELOW, on lane threads of their own when the fetcher
+    // may be shared — [`RIDER_LANES`] at once, inside this pass's store lock, metered on its
+    // progress pass, writing no status row (their outcomes come back to this thread) — else
+    // after it on this one. Either way the set's own bytes go first: the toolchain's archives
+    // take the whole link (measured: trust's 744 MB took 8 s alone, and 11 to 28 s beside
+    // claude, agy and muse, whose hosts outpace GitHub's), and agents landing beside the
+    // tuple's extract, or beside the set's other downloads, delayed trust's flip by up to six
+    // seconds (two first runs of six) and the last ALab program by two to four (median). The
+    // download-ahead lane opens the gate the moment the last archive of the set is in,
+    // every unit's — it holds archives of each, or the gate waits for this thread — the link
+    // is then idle while the pass extracts, flips and stages the rest, and the agents take
+    // it; this thread opens it once no tuple is left to land (the lane did not fetch them
+    // all), and when the loop ends or unwinds. An agent a PERSON asked for by name at a
+    // terminal — its pending stub's bump, "bumped first when still queued, so the wait is
+    // short" — does not wait for the gate; one a script asked for goes first once it opens
+    // ([`RiderQueue::next`]).
+    let gate = RiderGate::default();
+    let queue = rider.as_deref().map(RiderQueue::of);
+    // EVERY UNIT THE SET LANDS, not its tuples alone: one the download-ahead lane holds no
+    // archive of (an app bundle, a row of unknown or zero size, a unit the disk check could
+    // not size) is fetched by this thread, which only it knows the end of, so the lane never
+    // opens the gate beside that download.
+    let set_units: Vec<usize> = remaining.iter().map(|(gi, _)| *gi).collect();
+    std::thread::scope(|scope| {
+        let opens = RiderGateOpens(&gate);
+        let mut beside = Vec::new();
+        if let Some(r) = rider.as_deref()
+            && let Some(queue) = &queue
+            && let Some(shared) = shared
+        {
+            for _ in 0..r.fresh.pending.len().min(RIDER_LANES) {
+                let lent = crate::progress::lend();
+                let gate = &gate;
+                if let Ok(handle) = std::thread::Builder::new()
+                    .name("atpkg-vendor-lane".into())
+                    .spawn_scoped(scope, move || {
+                        let _adopted = lent.adopt();
+                        let faults = crate::flow::fetch_faults();
+                        let lane = r.fresh.lane(layout, shared, r.trust);
+                        rider_land(&lane, r, queue, Some(gate));
+                        crate::flow::fetch_faults().wrapping_sub(faults)
+                    })
+                {
+                    beside.push(handle);
                 }
-                let order: Vec<String> = remaining
-                    .iter()
-                    .flat_map(|(_, missing)| missing.iter().cloned())
-                    .collect();
-                sink.queue(&order);
             }
         }
-        let (gi, missing) = remaining.remove(0);
-        let group = &groups[gi];
-        // Dev-linked HARD-SKIP (§13): a singleton skips itself; a coherence tuple with
-        // ANY linked member skips WHOLE (can't partial-install a locked group over a
-        // dev link) — the same rule as `apply_channel`.
-        let linked: Vec<&str> = group
-            .members
-            .iter()
-            .map(String::as_str)
-            .filter(|m| linked_members.contains(m))
-            .collect();
-        if !linked.is_empty() {
-            match &group.group {
-                Some(_) => println!(
-                    "atpkg: {} not installed \u{2014} they install together, and {} {} \
+        if shared.is_some()
+            && beside.is_empty()
+            && let Some(sink) = crate::progress::active()
+        {
+            // A refused worker narrows execution to this thread; its queue follows the
+            // actual fallback order before the first set member starts.
+            sink.queue(&set_progress_queue(
+                &remaining,
+                &groups,
+                &vendor_names,
+                false,
+            ));
+        }
+        // The download-ahead worker, and this thread entered into its lane: every member
+        // fetch below asks the lane first. Halted when `entered` drops — after the loop, or
+        // unwinding — so the scope's join waits at most for the archive in hand.
+        let entered = ahead.as_ref().and_then(|lane| {
+            let shared = fetcher.shared()?;
+            let lent = crate::progress::lend();
+            let worker = std::sync::Arc::clone(lane);
+            let (gate, set_units) = (&gate, &set_units);
+            std::thread::Builder::new()
+                .name("atpkg-download-ahead".into())
+                .spawn_scoped(scope, move || {
+                    let _adopted = lent.adopt();
+                    worker.work(shared, layout, &|lane| {
+                        if lane.all_fetched(set_units) {
+                            gate.open();
+                        }
+                    });
+                })
+                .ok()?;
+            Some(lane.enter())
+        });
+        while !remaining.is_empty() {
+            if !remaining.iter().any(|(gi, _)| groups[*gi].group.is_some()) {
+                gate.open();
+            }
+            let bump: Vec<String> = crate::progress::read_bump(layout)
+                .into_iter()
+                .filter(|n| plannable.contains(n))
+                .collect();
+            if !bump.is_empty() {
+                resort_bumped(&mut remaining, &bump);
+                if let Some(sink) = crate::progress::active() {
+                    for name in &bump {
+                        sink.bumped(name);
+                    }
+                    let order =
+                        set_progress_queue(&remaining, &groups, &vendor_names, !beside.is_empty());
+                    sink.queue(&order);
+                }
+            }
+            let (gi, missing) = remaining.remove(0);
+            let group = &groups[gi];
+            // Dev-linked HARD-SKIP (§13): a singleton skips itself; a coherence tuple with
+            // ANY linked member skips WHOLE (can't partial-install a locked group over a
+            // dev link) — the same rule as `apply_channel`.
+            let linked: Vec<&str> = group
+                .members
+                .iter()
+                .map(String::as_str)
+                .filter(|m| linked_members.contains(m))
+                .collect();
+            if !linked.is_empty() {
+                match &group.group {
+                    Some(_) => println!(
+                        "atpkg: {} not installed \u{2014} they install together, and {} {} \
                      dev-linked",
-                    missing.join(", "),
-                    linked.join(", "),
-                    if linked.len() == 1 { "is" } else { "are" }
-                ),
-                None => println!("atpkg: {} dev-linked — skipped", group.members[0]),
+                        missing.join(", "),
+                        linked.join(", "),
+                        if linked.len() == 1 { "is" } else { "are" }
+                    ),
+                    None => println!("atpkg: {} dev-linked — skipped", group.members[0]),
+                }
+                for m in &missing {
+                    note_finished(m, crate::progress::Phase::Skipped, None);
+                }
+                continue;
             }
-            for m in &missing {
-                note_finished(m, crate::progress::Phase::Skipped, None);
+            match &group.group {
+                // A coherence tuple fresh-installs ALL-OR-NOTHING against the one index
+                // resolved above (§7) — see [`bootstrap_group`].
+                Some(g) => {
+                    failures += bootstrap_group(
+                        layout,
+                        fetcher,
+                        index,
+                        g,
+                        group,
+                        &wanted,
+                        &installed,
+                        &missing,
+                        &mut resolved_assets,
+                        flip,
+                        toolchain_flipped,
+                    );
+                }
+                // An ungrouped member can move alone (§7) — see [`bootstrap_singleton`].
+                None => {
+                    failures += bootstrap_singleton(
+                        layout,
+                        fetcher,
+                        anchor,
+                        &group.members[0],
+                        now,
+                        &mut resolved_assets,
+                    );
+                }
             }
-            continue;
+            if let Some(lane) = &ahead {
+                lane.passed(gi);
+            }
         }
-        match &group.group {
-            // A coherence tuple fresh-installs ALL-OR-NOTHING against the one index
-            // resolved above (§7) — see [`bootstrap_group`].
-            Some(g) => {
-                failures += bootstrap_group(
-                    layout,
-                    fetcher,
-                    index,
-                    g,
-                    group,
-                    &wanted,
-                    &installed,
-                    &missing,
-                    &mut resolved_assets,
-                    flip,
-                );
-            }
-            // An ungrouped member can move alone (§7) — see [`bootstrap_singleton`].
-            None => {
-                failures += bootstrap_singleton(
-                    layout,
-                    fetcher,
-                    anchor,
-                    &group.members[0],
-                    now,
-                    &mut resolved_assets,
-                );
-            }
+        drop(entered);
+        drop(opens);
+        // Joined before anything below reads the store as the pass leaves it: the second
+        // stub reconcile must see the vendor shims this pass laid, never re-lay a stub
+        // over one.
+        let lanes = beside.len();
+        for handle in beside {
+            let faults = handle
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            crate::flow::note_fetch_faults(faults);
         }
+        if lanes == 0
+            && let Some(r) = rider.as_deref()
+            && let Some(queue) = &queue
+        {
+            rider_land(&r.fresh.lane(layout, fetcher, r.trust), r, queue, None);
+        }
+    });
+    let landed = queue.map(RiderQueue::into_landed);
+    let rider_failed = landed
+        .as_ref()
+        .is_some_and(|landed| landed.outcomes.iter().any(|outcome| outcome.is_failure()));
+    if let Some(r) = rider {
+        r.landed = landed;
     }
-    // Clean pass end consumes the bump file: every admitted line was either acted on
-    // or proven outside the plan. A FAILED pass keeps it — the failed program's
-    // priority survives to the retry pass, exactly like its `.part`.
-    if failures == 0 {
-        crate::progress::clear_bump(layout);
+    // What the lane fetched for a unit that never took it (one this loop aborted before it
+    // reached the member) stays for the next pass: the pass-end gc spares the resolved
+    // assets, and the next attempt stages the archive without a download.
+    for (program, asset) in ahead.iter().flat_map(|lane| lane.untaken()) {
+        resolved_assets.entry(program).or_insert(asset);
     }
     // Second stub reconcile, against what ACTUALLY landed: a program whose real
     // shims do not expose its own name would otherwise keep a stale "installing"
@@ -11838,9 +12609,18 @@ fn install_default_set_inner(
         .filter(|p| !now_active.contains_key(p.as_str()))
         .cloned()
         .collect();
+    // Consume requests only after both lanes and the final missing-pin checks settle.
+    // A failed rider keeps the queue like a failed set member. A deferred signature
+    // check is no failure, but its program is still missing: a request for it may
+    // arrive even now. Keep the bounded queue while any wanted work remains, avoiding
+    // a read-then-unlink race with a pending stub appending its request.
+    if failures == 0 && !rider_failed && remaining_missing.is_empty() {
+        crate::progress::clear_bump(layout);
+    }
     DefaultSetOutcome {
         failures,
         announced,
+        announced_count,
         resolve_provenance,
         index_error: None,
         resolved_index_build: Some(index.index_build),
@@ -11848,6 +12628,38 @@ fn install_default_set_inner(
         skipped_narrowed,
         remaining_missing,
     }
+}
+
+/// The queue of both lanes in execution order. An ALab bump keeps its order even when
+/// it moves a singleton ahead of a tuple; parallel vendor lanes stand after the last
+/// remaining tuple — their gate opens once every archive of the set is in, the tuples'
+/// among them, or once no tuple is left ([`RiderGate`]) — and a serial vendor lane follows
+/// every set member.
+fn set_progress_queue(
+    remaining: &[(usize, Vec<String>)],
+    groups: &[crate::Group],
+    vendors: &[String],
+    beside: bool,
+) -> Vec<String> {
+    let after = if beside {
+        remaining
+            .iter()
+            .rposition(|(gi, _)| groups[*gi].group.is_some())
+            .map_or(0, |i| i + 1)
+    } else {
+        remaining.len()
+    };
+    let mut queue = Vec::new();
+    for (i, (_, missing)) in remaining.iter().enumerate() {
+        if i == after {
+            queue.extend_from_slice(vendors);
+        }
+        queue.extend_from_slice(missing);
+    }
+    if after == remaining.len() {
+        queue.extend_from_slice(vendors);
+    }
+    queue
 }
 
 /// Stably re-sort the remaining plan by the bump file's admitted names: a group
@@ -11882,6 +12694,16 @@ fn absent_members(
         .collect()
 }
 
+/// The members whose manifests the missing-triple prescan reads for `group`
+/// ([`crate::flow::group_missing_triple`]): a coherence tuple's every member, since it
+/// installs whole, else the `missing` ones alone.
+fn prescan_probe<'a>(group: &'a crate::Group, missing: &'a [String]) -> &'a [String] {
+    match &group.group {
+        Some(_) => &group.members,
+        None => missing,
+    }
+}
+
 /// The grouped (coherence-tuple) arm of [`install_default_set_with_path`]: refuse a config-narrowed
 /// partial tuple, clean-skip a tuple with no artifact for this triple, else fresh-install
 /// the WHOLE group all-or-nothing against the caller's ONE resolved index (§7) via
@@ -11894,7 +12716,7 @@ fn absent_members(
               context: layout, fetcher, the ONE verified index, config, the group + its \
               name, the wanted/installed/missing member sets the narrowing check and \
               prescan read, the pass's resolved-asset collector the pass-end gc \
-              sparing reads, and the pass's flip gate"
+              sparing reads, the pass's flip gate, and what follows a Trust flip"
 )]
 fn bootstrap_group(
     layout: &crate::store::Layout,
@@ -11907,6 +12729,7 @@ fn bootstrap_group(
     missing: &[String],
     resolved_assets: &mut std::collections::BTreeMap<String, String>,
     flip: &crate::quiet::FlipGate<'_>,
+    toolchain_flipped: &dyn Fn(&crate::store::Layout),
 ) -> u32 {
     // If the narrowing `exclude` leaves part of the tuple absent,
     // refuse the WHOLE group — a deliberately partial tuple is exactly
@@ -11985,6 +12808,9 @@ fn bootstrap_group(
                 );
                 println!("atpkg: installed {m} {}", a.build);
                 note_finished(m, crate::progress::Phase::Done, None);
+            }
+            if applied.iter().any(|(m, _)| m == crate::seam::SEAM_PROGRAM) {
+                toolchain_flipped(layout);
             }
             0
         }
@@ -12536,61 +13362,78 @@ fn cmd_seed(rest: &[String]) -> ExitCode {
     // wrote it exactly on the machines whose update pass never completes the set, so the
     // sweeps in the set-completing lanes alone would never reach it ([`retire_seed_row`]).
     retire_seed_row(&layout);
-    if declined(&layout) {
-        // The user removed this toolset deliberately (`uninstall --all`). This lane adopts
-        // the toolset, so without this check it would undo that on the very next launch.
-        println!(
-            "atpkg: the ALab toolset was removed on this machine — updates no longer install \
-             it; `aterm pkg install --default-set` puts it back"
-        );
-        return ExitCode::SUCCESS;
-    }
     // INSTALLING ATERM IS WANTING THE TOOLSET, so adoption is recorded here, on every
     // Mac, before anything else is asked — recording who adopted; the one install consent,
     // not adoption, gates set completion (`should_complete_set`).
     //
-    // `declined` is checked above, so a deliberate `uninstall --all` still wins — and so
-    // does `auto_install = false` (or the retired `seed_install = false` it folds in),
-    // which is checked BEFORE adoption for the same reason: adopting first once made that
-    // flag a lie, because the update pass then installed the entire ~3.2 GB set over the
-    // NETWORK seconds later. The one documented way to say "not on my disk" has to be
-    // honoured before anything records a wish for the toolset.
+    // But only once the ONE consent predicate says yes ([`crate::adoption`], which the
+    // window asks too, so the two cannot drift). A deliberate `uninstall --all` wins — and
+    // so does `auto_install = false` (or the retired `seed_install = false` it folds in),
+    // checked BEFORE adoption for the same reason: adopting first once made that flag a
+    // lie, because the update pass then installed the entire ~3.2 GB set over the NETWORK
+    // seconds later. The one documented way to say "not on my disk" has to be honoured
+    // before anything records a wish for the toolset.
     let cfg = crate::config::cached();
-    // A `[packages] prefix` this build ignores counts as the same "not here" until its
-    // line is removed ([`crate::config::PackagesConfig::installs_unattended`]): the
-    // toolset lives where it points, and this lane would lay a second one down. Nothing
-    // is adopted or laid, exactly as for `auto_install = false`. Loading the config has
-    // already said so ([`crate::config::ignored_prefix_note`]), so nothing more is printed.
-    if cfg.ignored_prefix.is_some() {
-        return ExitCode::SUCCESS;
-    }
-    if !cfg.installs_unattended() {
-        // Declining the lay-down is not adoption: leave the store as it was (the
-        // legacy-row sweep above is the one write, and it only removes).
-        println!("atpkg: [packages].auto_install = false — not installing the ALab toolset");
-        return ExitCode::SUCCESS;
-    }
-    // A DISABLED MANAGER ADOPTS NOTHING. A build that pins no root key is inert for
-    // every other mutating lane before it touches the store, and that must be consulted
-    // here BEFORE adoption for the same reason `auto_install = false` is: stubs laid now
-    // would promise a pass that answers "disabled", and a durable adoption would install
-    // the whole set the moment the switch lifts — a consent this lane never obtained.
-    if !manager_enabled() {
-        println!("atpkg: disabled (no root key pinned) — not installing the ALab toolset");
-        return ExitCode::SUCCESS;
+    match crate::adoption::adoption(&layout, cfg) {
+        crate::Adoption::Consented => {}
+        crate::Adoption::Declined => {
+            // The user removed this toolset deliberately (`uninstall --all`). This lane
+            // adopts the toolset, so without this check it would undo that on the very
+            // next launch.
+            println!(
+                "atpkg: the ALab toolset was removed on this machine — updates no longer \
+                 install it; `aterm pkg install --default-set` puts it back"
+            );
+            return ExitCode::SUCCESS;
+        }
+        // A `[packages] prefix` this build ignores counts as the same "not here" until its
+        // line is removed: the toolset lives where it points, and this lane would lay a
+        // second one down. Loading the config has already said so
+        // ([`crate::config::ignored_prefix_note`]), so nothing more is printed.
+        crate::Adoption::IgnoredPrefix => return ExitCode::SUCCESS,
+        crate::Adoption::AutoInstallOff => {
+            // Declining the lay-down is not adoption: leave the store as it was (the
+            // legacy-row sweep above is the one write, and it only removes).
+            println!("atpkg: [packages].auto_install = false — not installing the ALab toolset");
+            return ExitCode::SUCCESS;
+        }
+        // A DISABLED MANAGER ADOPTS NOTHING: stubs laid now would promise a pass that
+        // answers "disabled", and a durable adoption would install the whole set the
+        // moment the switch lifts — a consent this lane never obtained.
+        crate::Adoption::ManagerDisabled => {
+            println!("atpkg: disabled (no root key pinned) — not installing the ALab toolset");
+            return ExitCode::SUCCESS;
+        }
     }
     // Who adopted rides beside the marker, and only when this call creates it: an update
     // pass says "installing aterm is the consent" only on a machine the seed pass adopted.
     record_seed_adoption(&layout);
+    // THE UPDATE THIS LANE OWES, PROMISED BEFORE A STUB CAN RUN: on a first run the window
+    // spawns its update next, and that update writes `progress.json` only seconds later,
+    // once it has resolved the index and planned. A stub run meanwhile waits for it
+    // ([`pending_state`]) instead of finding nothing installing. Only the window's seed
+    // knows an update follows ([`seed_promise_owner`]), and it promises for as long as the
+    // window lives, at most [`crate::progress::SEED_PROMISE_SECS`].
+    if let Some(owner) = seed_promise_owner()
+        && crate::adoption::first_install_ahead(&layout)
+    {
+        crate::progress::promise_pass(&layout, owner, crate::progress::SEED_PROMISE_SECS);
+    }
     // PENDING STUBS AT ADOPTION (R6): the instant this machine wants the toolset,
     // every default-set name resolves on PATH — before a single network byte moves.
     // Running one prints the live install state (`atpkg __pending`) instead of "command
     // not found". Compiled roster only; the first index resolve reconciles it against
     // the signed set.
-    crate::stub::lay_adoption_stubs(&layout);
+    crate::stub::lay_adoption_stubs(&layout, cfg);
     // REROUTE STUBS beside them (philosophy §4): the upstream Rust names answer inside a
     // session from the first seed on, not only once the spawn seam has laid them.
     lay_reroute_stubs(&layout);
+    // THE SHELL HOOKS NOW, not at the end of the first update pass a minute later: they
+    // are what append `bin/` to a shell's PATH (the window's integration re-sources them at
+    // the next prompt), so the stubs just laid answer at once and the real shims replace
+    // them in place as they land. Every gate stays [`crate::hooks::refresh`]'s own: the rc
+    // opt-out, the release-bundle rule, the consent-fenced folders.
+    refresh_shell_hooks(&layout);
     reassert_rustup_seam(&layout);
     // The EXEC ROOTS beside the seam, and for the same reason the seam is re-asserted
     // here: this lane runs at every launch. A machine already on a trust build whose
@@ -12652,6 +13495,7 @@ fn serviceable_among(
     let installed = crate::active_builds(layout);
     let triple = current_triple();
     let mut out: Vec<String> = Vec::new();
+    let mut prescan: Vec<(crate::Group, Vec<String>)> = Vec::new();
     for group in crate::plan_groups(index, ch) {
         let mut missing = absent_members(&group, wanted, &installed);
         missing.retain(|m| !removed.contains(m.as_str()));
@@ -12677,10 +13521,20 @@ fn serviceable_among(
         {
             continue;
         }
-        let probe: &[String] = match &group.group {
-            Some(_) => &group.members,
-            None => &missing,
-        };
+        prescan.push((group, missing));
+    }
+    // Every manifest the prescan reads, fetched at once ([`install_default_set_inner`]'s).
+    crate::flow::prefetch_pinned(
+        fetcher,
+        index,
+        ch,
+        prescan
+            .iter()
+            .flat_map(|(group, missing)| prescan_probe(group, missing))
+            .map(String::as_str),
+    );
+    for (group, missing) in prescan {
+        let probe = prescan_probe(&group, &missing);
         if crate::flow::group_missing_triple(fetcher, index, crate::config::CHANNEL, triple, probe)
             .is_none()
         {
@@ -12766,7 +13620,7 @@ fn index_serves(
     if !seed_serviceable(layout, fetcher, index, cfg).is_empty() {
         return IndexServes::Yes;
     }
-    let unnarrowed = index.installable(&[], &[]);
+    let unnarrowed = index.installable(&[]);
     let everything = serviceable_among(
         layout,
         fetcher,
@@ -12859,6 +13713,15 @@ impl SignedSizes {
         download: None,
         disk: None,
     };
+
+    /// Both sets together: each figure known only where both know it.
+    fn and(self, other: Self) -> Self {
+        let sum = |a: Option<u64>, b: Option<u64>| a.zip(b).map(|(a, b)| a.saturating_add(b));
+        Self {
+            download: sum(self.download, other.download),
+            disk: sum(self.disk, other.disk),
+        }
+    }
 }
 
 /// The signed sizes of `members` for this triple, summed from the pinned manifests' `[cost]`
@@ -12960,24 +13823,32 @@ impl SetDiskRefusal {
 }
 
 /// The default set's up-front disk refusal, pure: `Some` when the peak the per-unit gates
-/// enforce ([`crate::flow::peak_need`] over `units`), plus the reserve every disk gate holds
-/// back ([`crate::cost::FREE_FLOOR`]), exceeds `have`, the free space on the volume holding
-/// `prefix`. The line offers the smallest ungrouped program that fits by itself — never a
-/// tuple member, which `aterm pkg install` would land outside its tuple.
+/// enforce ([`crate::flow::peak_need`] over `units`), plus `beside` — what landings running
+/// at the same time need at once (the vendor lane's, [`FreshVendors::peak`]) — plus the
+/// reserve every disk gate holds back ([`crate::cost::FREE_FLOOR`]), exceeds `have`, the
+/// free space on the volume holding `prefix`. The line offers the smallest ungrouped
+/// program that fits by itself — never a tuple member, which `aterm pkg install` would
+/// land outside its tuple.
 fn set_disk_refusal(
     units: &[SetUnit],
+    beside: u64,
     have: u64,
     prefix: &std::path::Path,
 ) -> Option<SetDiskRefusal> {
     let floor = crate::cost::FREE_FLOOR;
-    let peak = crate::flow::peak_need(units.iter().map(|u| u.bytes));
+    let peak = crate::flow::peak_need(units.iter().map(|u| u.bytes)).saturating_add(beside);
     if crate::cost::disk_ok(peak, have, floor) {
         return None;
     }
     let need = peak.saturating_add(floor);
     let sentence = format!(
-        "the ALab toolset needs {} free on the volume holding {}; {} free \u{2014} free {}",
+        "the ALab toolset needs {}{} free on the volume holding {}; {} free \u{2014} free {}",
         crate::cost::human_bytes(need),
+        if beside > 0 {
+            " with the agents installing beside it"
+        } else {
+            ""
+        },
         prefix.display(),
         crate::cost::human_bytes(have),
         crate::cost::human_bytes(need.saturating_sub(have))
@@ -13091,8 +13962,21 @@ fn report_seedless_posture(layout: &crate::store::Layout) {
     // GUI warning pill, a `*toolset*` row reading "unavailable", and a Settings detail
     // line saying no build exists. Ask the other question
     // first — and BEFORE the network, because its answer decides whether the resolve
-    // can matter at all (see [`seedless_serves_us`]).
-    let serves_us = seedless_serves_us(!crate::active_builds(layout).is_empty(), || {
+    // can matter at all (see [`seedless_serves_us`]). A vendor-direct program still
+    // wanted here answers it as a build does: its lane installs it with no index.
+    //
+    // AND THE WINDOW'S OWN SEED ASKS NO INDEX (a `--wait-lock` caller, [`wait_lock`]): the
+    // update the window runs right behind it resolves and verifies the same index, and its
+    // empty-store arm says the same verdict — the same `seed-unusable:` line, the same
+    // `*toolset*` row ([`run_update_pass`]). Resolving it here too was the whole network
+    // twice per launch: a discovery walk, the index quads and every manifest — 77 requests,
+    // about a second (9-16 s from a sequential fetcher) under the store lock before the
+    // install could start, on a store whose config wants no vendor program. A typed
+    // `aterm pkg seed` still resolves, and still says it.
+    let served_without_index = !crate::active_builds(layout).is_empty()
+        || vendor_set_wanted_on(triple, cfg, &removed_programs(layout))
+        || wait_lock().is_some();
+    let serves_us = seedless_serves_us(served_without_index, || {
         let fetcher = resolve_fetcher(layout);
         crate::resolve_verified_index(
             &*fetcher,
@@ -13107,10 +13991,7 @@ fn report_seedless_posture(layout: &crate::store::Layout) {
     // The durable trace, in the same words the marker carries.
     match serves_us {
         Some(IndexServes::Unserved(served)) => {
-            emit_marker_line(&format!(
-                "atpkg: {SEED_UNUSABLE_MARKER}{}",
-                unserved_sentence(triple, &served)
-            ));
+            emit_marker_line(&seed_unusable_line(&unserved_sentence(triple, &served)));
             record_unbuilt(
                 layout,
                 "*toolset*",
@@ -13121,7 +14002,7 @@ fn report_seedless_posture(layout: &crate::store::Layout) {
         // NOT THE CPU: the user's own exclusion or removals emptied a set the index serves.
         Some(IndexServes::Narrowed(narrowing)) => {
             let (why, state) = narrowing.verdict(triple);
-            emit_marker_line(&format!("atpkg: {SEED_UNUSABLE_MARKER}{why}"));
+            emit_marker_line(&seed_unusable_line(&why));
             record_unbuilt(layout, "*toolset*", state, why);
         }
         // Said only while the store is EMPTY, and only to whoever ran the verb
@@ -13139,6 +14020,12 @@ fn report_seedless_posture(layout: &crate::store::Layout) {
         }
         Some(IndexServes::Yes) | None => {}
     }
+}
+
+/// The `seed-unusable:` marker line over `body` — one spelling for the seed and the
+/// update's empty-store arm, so the window's card reads the same from either.
+fn seed_unusable_line(body: &str) -> String {
+    format!("atpkg: {SEED_UNUSABLE_MARKER}{body}")
 }
 
 /// The unserved-architecture `seed-unusable:` body: the need, this machine's triple, and
@@ -13169,12 +14056,13 @@ fn says_not_installed_yet(store_empty: bool, window_pass: bool) -> bool {
 /// lock `seed` holds — is never run for it: its answer could not change the output, and
 /// offline it costs up to three 30 s network attempts holding `store.lock`. Only an
 /// EMPTY store — where
-/// the unserved-architecture verdict is the whole point — pays for the resolve.
+/// the unserved-architecture verdict is the whole point — pays for the resolve. A store a
+/// vendor-direct program is still to land in is served the same way ([`vendor_set_wanted_on`]).
 fn seedless_serves_us(
-    store_holds_builds: bool,
+    served_without_index: bool,
     resolve: impl FnOnce() -> Option<IndexServes>,
 ) -> Option<IndexServes> {
-    if store_holds_builds {
+    if served_without_index {
         Some(IndexServes::Yes)
     } else {
         resolve()
@@ -13569,6 +14457,7 @@ fn update_vendor(
         legacy_index: legacy.as_ref(),
         asked: person,
         now,
+        download_turn: None,
     };
     let held = crate::pin::is_pinned(layout, program);
     let outcome = crate::vendor_direct::lane::install_one(&lane, spec, held);
@@ -13680,12 +14569,26 @@ struct VendorLanes {
 }
 
 /// Whether `[packages].exclude` and this machine's removals leave `program` wanted.
-fn vendor_wanted(
+pub(crate) fn vendor_wanted(
     cfg: &crate::config::PackagesConfig,
     removed: &std::collections::BTreeSet<String>,
     program: &str,
 ) -> bool {
     !cfg.exclude().iter().any(|p| p == program) && !removed.contains(program)
+}
+
+/// Whether a vendor-direct program is still wanted on `triple`: its vendor serves it there
+/// and neither `[packages].exclude` nor an uninstall took it out ([`vendor_wanted`]). Its
+/// lane needs no index — agy and muse are in none — so the seed's sentence never calls
+/// such a machine unserved, or narrowed to nothing, when the index part is empty.
+fn vendor_set_wanted_on(
+    triple: &str,
+    cfg: &crate::config::PackagesConfig,
+    removed: &std::collections::BTreeSet<String>,
+) -> bool {
+    crate::vendor_direct::VENDORS
+        .iter()
+        .any(|spec| spec.serves(triple) && vendor_wanted(cfg, removed, spec.program))
 }
 
 /// The cached verified index, read only when an active vendor program is still a legacy
@@ -13717,7 +14620,9 @@ fn legacy_index_for(
 /// tombstoned in place included, and with `complete_the_set` every wanted one not
 /// installed arrives — announced first with `net-starting:` and the sizes its verified
 /// documents state, metered on the window's progress file, answered with
-/// `net-installed:` or `net-failed:`. Its bytes are only the vendors'.
+/// `net-installed:` or `net-failed:`. Its bytes are only the vendors'. ([`vendor_plan`],
+/// then [`land_fresh_alone`]; an update pass on an empty store lands the fresh ones beside
+/// the set completion instead, [`VendorRider`].)
 #[allow(
     clippy::too_many_arguments,
     reason = "the pass's own inputs plus the index it verified first, which only narrows"
@@ -13732,89 +14637,185 @@ fn vendor_pass(
     fresh: Option<&crate::TrustedIndex>,
     seams: &PassSeams<'_>,
 ) -> VendorPass {
-    use crate::vendor_direct::lane::{self, Step, Verdict};
+    let (mut pass, fresh) = vendor_plan(layout, fetcher, cfg, installed, lanes, fresh, seams);
+    land_fresh_alone(layout, fetcher, consent, &fresh, &mut pass, seams, false);
+    warm_landed(layout, &mut pass, seams);
+    pass
+}
+
+/// The vendor lane short of its fresh landings: every vendor program it runs is planned —
+/// side by side when the fetcher may be shared, the four heads and their documents on four
+/// different hosts — each installed one is then landed in turn as its vendor moved it, and
+/// the wanted ones not installed come back as verified candidates whose bytes have not
+/// moved, for one announcement before any of them does.
+fn vendor_plan(
+    layout: &crate::store::Layout,
+    fetcher: &dyn crate::flow::Fetcher,
+    cfg: &crate::config::PackagesConfig,
+    installed: &std::collections::BTreeMap<String, u64>,
+    lanes: VendorLanes,
+    fresh: Option<&crate::TrustedIndex>,
+    seams: &PassSeams<'_>,
+) -> (VendorPass, FreshVendors) {
+    use crate::vendor_direct::lane::{self, Step};
     // The yanks of the index this pass verified fresh (the verification also refreshed the
     // latch), else the latch: a yank published since the last pass binds this one.
-    let policy = crate::vendor_direct::policy::Policy::current(layout, fresh);
-    let cached = match fresh {
-        Some(_) => None,
-        None => legacy_index_for(layout, installed),
-    };
-    let now = (seams.now)();
-    let lane = lane::Lane {
-        layout,
-        fetcher,
-        triple: current_triple(),
-        policy: &policy,
-        trust: seams.trust,
-        legacy_index: fresh.or(cached.as_ref()),
-        asked: false,
-        now,
+    let mut vendors = FreshVendors {
+        pending: Vec::new(),
+        policy: crate::vendor_direct::policy::Policy::current(layout, fresh),
+        index: match fresh {
+            Some(index) => Some(index.clone()),
+            None => legacy_index_for(layout, installed),
+        },
+        now: (seams.now)(),
     };
     let removed = removed_programs(layout);
+    // `(program, installed, held)` for each program this lane runs. A tombstone is silent
+    // in the shim view, and it is still this machine's install: the update lane revisits
+    // it, as the index lane revisits one, or it waits on a person forever.
+    let runs: Vec<(&'static crate::vendor_direct::VendorSpec, bool, bool)> =
+        crate::vendor_direct::VENDORS
+            .iter()
+            .filter_map(|spec| {
+                let program = spec.program;
+                if lanes.update_installed
+                    && (installed.contains_key(program)
+                        || crate::flow::tombstoned_in_place(layout, [program]))
+                {
+                    Some((spec, true, crate::pin::is_pinned(layout, program)))
+                } else if !installed.contains_key(program)
+                    && lanes.complete_the_set
+                    && vendor_wanted(cfg, &removed, program)
+                {
+                    Some((spec, false, false))
+                } else {
+                    None
+                }
+            })
+            .collect();
+    let steps: Vec<Step> = match fetcher.shared() {
+        Some(shared) => crate::net::fan_out(&runs, &|(spec, _, held)| {
+            lane::plan_one(&vendors.lane(layout, shared, seams.trust), spec, *held)
+        }),
+        None => {
+            let lane = vendors.lane(layout, fetcher, seams.trust);
+            runs.iter()
+                .map(|(spec, _, held)| lane::plan_one(&lane, spec, *held))
+                .collect()
+        }
+    };
     let mut pass = VendorPass::default();
-    let mut fresh = Vec::new();
-    for spec in crate::vendor_direct::VENDORS {
-        let program = spec.program;
-        // A tombstone is silent in the shim view, and it is still this machine's install:
-        // the update lane revisits it, as the index lane revisits one, or it waits on a
-        // person forever.
-        if lanes.update_installed
-            && (installed.contains_key(program)
-                || crate::flow::tombstoned_in_place(layout, [program]))
-        {
-            let held = crate::pin::is_pinned(layout, program);
-            report_vendor(
-                layout,
-                &lane::install_one(&lane, spec, held),
-                &mut pass,
-                false,
-                now,
-            );
-        } else if !installed.contains_key(program)
-            && lanes.complete_the_set
-            && vendor_wanted(cfg, &removed, program)
-        {
-            match lane::plan_one(&lane, spec, false) {
-                Step::Done(outcome) => report_vendor(layout, &outcome, &mut pass, false, now),
-                Step::Land(pending) => fresh.push(pending),
+    let mut pending = Vec::new();
+    {
+        let lane = vendors.lane(layout, fetcher, seams.trust);
+        for ((_, is_installed, _), step) in runs.iter().zip(steps) {
+            match step {
+                Step::Done(outcome) => {
+                    report_vendor(layout, &outcome, &mut pass, false, vendors.now);
+                }
+                Step::Land(landing) if *is_installed => {
+                    let outcome = lane::land_one(&lane, &landing);
+                    report_vendor(layout, &outcome, &mut pass, false, vendors.now);
+                }
+                Step::Land(landing) => pending.push(*landing),
             }
         }
     }
-    if fresh.is_empty() {
-        warm_landed(layout, &mut pass, seams);
-        return pass;
+    vendors.pending = pending;
+    (pass, vendors)
+}
+
+/// The vendor lane's fresh landings once planned ([`vendor_plan`]): verified candidates
+/// whose bytes have not moved, in table order, with what landing them reads.
+struct FreshVendors {
+    pending: Vec<crate::vendor_direct::lane::Pending>,
+    /// The yanks the lane binds ([`crate::vendor_direct::policy::Policy::current`]).
+    policy: crate::vendor_direct::policy::Policy,
+    /// The verified index a legacy build's version is read from: the one this pass verified
+    /// fresh, else the cached one, read only when a legacy build needs it
+    /// ([`legacy_index_for`]).
+    index: Option<crate::TrustedIndex>,
+    /// The pass's clock.
+    now: i64,
+}
+
+impl FreshVendors {
+    /// The lane over `fetcher`: the same store, yanks, anchors and clock whichever thread
+    /// works it.
+    fn lane<'a>(
+        &'a self,
+        layout: &'a crate::store::Layout,
+        fetcher: &'a dyn crate::flow::Fetcher,
+        trust: &'a crate::vendor_direct::lane::Trust,
+    ) -> crate::vendor_direct::lane::Lane<'a> {
+        crate::vendor_direct::lane::Lane {
+            layout,
+            fetcher,
+            triple: current_triple(),
+            policy: &self.policy,
+            trust,
+            legacy_index: self.index.as_ref(),
+            asked: false,
+            now: self.now,
+            download_turn: None,
+        }
     }
-    // The fresh landings are a "net" progress pass of their own when the window asked for
-    // one (or a person typed the pass) and none is live, so their bytes stream before the
-    // index lane's pass begins.
-    let owned_pass = seams
-        .progress
-        .is_some_and(|p| crate::progress::begin_pass(p, NET_PASS));
-    if let Some(sink) = crate::progress::active() {
-        let planned: Vec<(String, u64)> = fresh
+
+    /// The programs, in table order.
+    fn names(&self) -> Vec<String> {
+        self.pending
+            .iter()
+            .map(|p| p.program().to_string())
+            .collect()
+    }
+
+    /// Each program with its exact download size: its rows of a progress plan.
+    fn planned(&self) -> Vec<(String, u64)> {
+        self.pending
             .iter()
             .map(|p| (p.program().to_string(), p.download_bytes()))
-            .collect();
-        sink.plan(&planned);
+            .collect()
     }
-    let names: Vec<String> = fresh.iter().map(|p| p.program().to_string()).collect();
-    let download = fresh.iter().map(|p| p.download_bytes()).sum::<u64>();
-    let disk = fresh.iter().map(|p| p.disk_bytes()).sum::<Option<u64>>();
-    let sizes = SignedSizes {
-        download: Some(download).filter(|d| *d > 0),
-        disk: disk.filter(|d| *d > 0),
-    };
-    if let Some(line) = net_announcement(consent, &names, sizes) {
-        emit_marker_line(&line);
+
+    /// The signed sizes the announcement states.
+    fn sizes(&self) -> SignedSizes {
+        let download = self.pending.iter().map(|p| p.download_bytes()).sum::<u64>();
+        let disk = self
+            .pending
+            .iter()
+            .map(|p| p.disk_bytes())
+            .sum::<Option<u64>>();
+        SignedSizes {
+            download: Some(download).filter(|d| *d > 0),
+            disk: disk.filter(|d| *d > 0),
+        }
     }
-    let mut arrived: Vec<&str> = Vec::new();
-    let mut deferred: Vec<&str> = Vec::new();
-    for pending in &fresh {
-        let outcome = lane::land_one(&lane, pending);
+
+    /// What the landings need free at once, landed [`RIDER_LANES`] at a time
+    /// ([`crate::flow::peak_need_at_once`]): what a set completion landing beside them
+    /// reserves.
+    fn peak(&self) -> u64 {
+        crate::flow::peak_need_at_once(
+            self.pending
+                .iter()
+                .map(crate::vendor_direct::lane::Pending::landing_bytes),
+            RIDER_LANES,
+        )
+    }
+}
+
+/// Land `pending` in turn on this thread, noting each on the live pass and handing its
+/// outcome to `landed`. It writes no status row, so a lane thread can run it.
+fn land_fresh(
+    lane: &crate::vendor_direct::lane::Lane<'_>,
+    pending: &[crate::vendor_direct::lane::Pending],
+    landed: &mut dyn FnMut(crate::vendor_direct::lane::Outcome),
+) {
+    use crate::vendor_direct::lane::Verdict;
+    for pending in pending {
+        let outcome = crate::vendor_direct::lane::land_one(lane, pending);
         match outcome.verdict {
             Verdict::Installed { .. } => {
-                arrived.push(pending.program());
                 note_finished(pending.program(), crate::progress::Phase::Done, None);
             }
             // A FIRST LANDING WHOSE SIGNATURE CHECK DID NOT FINISH IS A WAIT, NOT A FAILURE
@@ -13827,10 +14828,9 @@ fn vendor_pass(
             // codex's 238 MB binary for the first time, disk busiest, codesign clamped
             // to the Background role (453 s measured at load ~90 against a 2 s
             // unclamped run). The row is Skipped with no error; the deferral's own
-            // line went to stdout through `report_vendor`; the archive is kept and the
+            // line goes to stdout through `report_vendor`; the archive is kept and the
             // next pass lands it without a download.
             Verdict::Deferred { .. } => {
-                deferred.push(pending.program());
                 note_finished(pending.program(), crate::progress::Phase::Skipped, None);
             }
             _ => note_finished(
@@ -13839,24 +14839,266 @@ fn vendor_pass(
                 Some(outcome.line()),
             ),
         }
-        report_vendor(layout, &outcome, &mut pass, false, now);
+        landed(outcome);
     }
+}
+
+/// The fresh landings with nothing beside them: announced with `net-starting:` and their
+/// signed sizes, a "net" progress pass of their own when the window asked for one (or a
+/// person typed the pass) and none is live, each outcome reported as it lands, answered
+/// with their terminal marker ([`fresh_landing_terminal`]). `promised` when they are what
+/// is left of a promised default-set pass whose set completion stopped before it could
+/// carry them: their plan is then the promised plan, and the promise goes with it
+/// ([`crate::progress::ProgressSink::plan_promised_pass`]). Ahead of a set completion still to
+/// come, a plan of the vendors alone keeps it.
+fn land_fresh_alone(
+    layout: &crate::store::Layout,
+    fetcher: &dyn crate::flow::Fetcher,
+    consent: Consent,
+    fresh: &FreshVendors,
+    pass: &mut VendorPass,
+    seams: &PassSeams<'_>,
+    promised: bool,
+) {
+    use crate::vendor_direct::lane::Verdict;
+    if fresh.pending.is_empty() {
+        return;
+    }
+    let owned_pass = seams
+        .progress
+        .is_some_and(|p| crate::progress::begin_pass(p, NET_PASS));
+    if let Some(sink) = crate::progress::active() {
+        if promised {
+            sink.plan_promised_pass(layout, &fresh.planned());
+        } else {
+            sink.plan(&fresh.planned());
+        }
+    }
+    if let Some(line) = net_announcement(consent, &fresh.names(), fresh.sizes()) {
+        emit_marker_line(&line);
+    }
+    let mut arrived: Vec<&str> = Vec::new();
+    let mut deferred: Vec<&str> = Vec::new();
+    land_fresh(
+        &fresh.lane(layout, fetcher, seams.trust),
+        &fresh.pending,
+        &mut |outcome| {
+            match outcome.verdict {
+                Verdict::Installed { .. } => arrived.push(outcome.spec.program),
+                Verdict::Deferred { .. } => deferred.push(outcome.spec.program),
+                _ => {}
+            }
+            report_vendor(layout, &outcome, pass, false, fresh.now);
+        },
+    );
     if owned_pass {
         crate::progress::end_pass();
     }
-    if let Some(line) = fresh_landing_terminal(&arrived, &deferred, fresh.len()) {
+    if let Some(line) = fresh_landing_terminal(&arrived, &deferred, fresh.pending.len()) {
         emit_marker_line(&line);
     }
     if !arrived.is_empty() {
         println!("{SEED_FOLLOW_ON}");
     }
-    warm_landed(layout, &mut pass, seams);
-    pass
 }
 
-/// The terminal marker that answers the vendor lane's `net-starting:` announcement for its
-/// `planned` fresh landings, of which `arrived` installed and `deferred` waited on a
-/// signature check that did not finish ([`crate::vendor_direct::lane::Verdict::Deferred`]).
+/// The vendor lane's fresh landings handed to the set completion of an update pass on an
+/// empty store ([`install_default_set_inner`]): ONE `net-starting:` names both lanes'
+/// programs with their signed sizes, and once the set's archives are in ([`RiderGate`]), the
+/// vendors land while the pass installs them — on lane threads of their own when the fetcher
+/// may be shared — inside the one store lock, the one progress pass and the one terminal
+/// marker. Their outcomes are reported on the pass's thread once landed (`landed`), which
+/// writes every status row. A set completion that
+/// stops before it announces (its index stale, no channel for this machine, or a volume
+/// that cannot hold both lanes at once) leaves `landed` empty, and the caller lands them
+/// alone ([`land_fresh_alone`]).
+struct VendorRider<'r> {
+    fresh: FreshVendors,
+    trust: &'r crate::vendor_direct::lane::Trust,
+    /// The warm of an agent build the moment it lands ([`PassSeams::warm_agents`]).
+    warm: fn(&crate::store::Layout, &std::collections::BTreeSet<String>),
+    landed: Option<RiderLanded>,
+}
+
+/// What a [`VendorRider`]'s landings came to.
+#[derive(Default)]
+struct RiderLanded {
+    /// In landing order.
+    outcomes: Vec<crate::vendor_direct::lane::Outcome>,
+    /// The programs warmed as they landed: no later exit warms them again.
+    warmed: std::collections::BTreeSet<String>,
+}
+
+/// How often a vendor lane waiting on its gate reads the bump file ([`rider_land`]): a
+/// person who typed an agent's name waits at most this long for its bytes to start.
+const RIDER_BUMP_TICK: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// How many of a rider's programs land at once once its gate opens, each on a lane thread of
+/// its own ([`rider_land`]), in table order: claude and codex first, then agy and muse as a
+/// lane frees. Measured on a first run: two lanes land codex seven seconds sooner and end
+/// the pass eight sooner than one, with claude as early; four end it two seconds sooner
+/// still, but claude, splitting the link four ways, a second and a half later. The lanes
+/// take turns at the download itself, in the order their programs were taken
+/// ([`RiderQueue::next`], [`crate::flow::DownloadTurns`]), so the overlap is one lane's
+/// download beside the other's verify, unpack and activate.
+const RIDER_LANES: usize = 2;
+
+/// The gate a riding vendor lane waits on ([`rider_land`]): open for good once every archive
+/// the set completion lands is in, its coherence tuples' among them — the
+/// download-ahead lane says so the moment the last one lands
+/// ([`crate::flow::ahead::Ahead::all_fetched`]) — or once no tuple is left to land, whichever
+/// comes first. The pass thread's [`RiderGateOpens`] opens it when the loop ends or unwinds,
+/// so no lane waits on it forever.
+#[derive(Default)]
+struct RiderGate {
+    open: std::sync::Mutex<bool>,
+    changed: std::sync::Condvar,
+}
+
+impl RiderGate {
+    fn open(&self) {
+        if let Ok(mut open) = self.open.lock() {
+            *open = true;
+        }
+        self.changed.notify_all();
+    }
+
+    /// Open (a poisoned gate is: no lane may wait on it forever).
+    fn is_open(&self) -> bool {
+        self.open.lock().map_or(true, |open| *open)
+    }
+
+    /// Wait at most `tick` for the gate to open.
+    fn wait(&self, tick: std::time::Duration) {
+        if let Ok(open) = self.open.lock() {
+            let _ = self.changed.wait_timeout_while(open, tick, |open| !*open);
+        }
+    }
+}
+
+/// Opens a [`RiderGate`] when dropped: the set completion's loop over, or unwinding.
+struct RiderGateOpens<'g>(&'g RiderGate);
+
+impl Drop for RiderGateOpens<'_> {
+    fn drop(&mut self) {
+        self.0.open();
+    }
+}
+
+/// A rider's landings not yet taken, worked by every lane that lands them ([`rider_land`]),
+/// the order their payloads take the link in, and what the ones taken came to.
+struct RiderQueue<'q> {
+    left: std::sync::Mutex<Vec<&'q crate::vendor_direct::lane::Pending>>,
+    /// ONE AGENT DOWNLOAD AT A TIME, in the order the programs are taken
+    /// ([`crate::flow::DownloadTurns`]): the first agent has the whole link — on a slow one,
+    /// two downloads at once would land claude later than one — while the other lane's
+    /// verify, unpack and activate overlap the next download.
+    turns: crate::flow::DownloadTurns,
+    landed: std::sync::Mutex<RiderLanded>,
+}
+
+impl<'q> RiderQueue<'q> {
+    fn of(rider: &'q VendorRider<'_>) -> Self {
+        Self {
+            left: std::sync::Mutex::new(rider.fresh.pending.iter().collect()),
+            turns: crate::flow::DownloadTurns::default(),
+            landed: std::sync::Mutex::default(),
+        }
+    }
+
+    /// The next landing for a lane: a program a PERSON asked for by name, the bump its
+    /// pending stub wrote at a terminal ([`crate::progress::Asker::Person`]), first and at
+    /// once, gate or no gate — the set completion's own queue honours a bump between its
+    /// items, and an agent queued behind the toolchain is the same promise; else, once
+    /// `gate` opens (`None` is open), a program a script asked for (its bump goes first
+    /// among the agents, never ahead of the toolchain's bytes: `claude --version` in a
+    /// script is not a person waiting), then the first left in table order. `None` once
+    /// every one is taken. Each comes with its place in line for the link, taken with it, so
+    /// the payloads move in the order the programs were taken.
+    fn next(
+        &self,
+        layout: &crate::store::Layout,
+        gate: Option<&RiderGate>,
+    ) -> Option<(
+        &'q crate::vendor_direct::lane::Pending,
+        crate::flow::DownloadTicket<'_>,
+    )> {
+        loop {
+            let bump = crate::progress::read_bumps(layout);
+            let open = gate.is_none_or(RiderGate::is_open);
+            {
+                let mut left = self
+                    .left
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if left.is_empty() {
+                    return None;
+                }
+                if let Some(i) = bump
+                    .iter()
+                    .filter(|b| open || b.person)
+                    .find_map(|b| left.iter().position(|p| p.program() == b.program))
+                {
+                    if let Some(sink) = crate::progress::active() {
+                        sink.bumped(left[i].program());
+                    }
+                    return Some((left.remove(i), self.turns.ticket()));
+                }
+                if open {
+                    return Some((left.remove(0), self.turns.ticket()));
+                }
+            }
+            if let Some(gate) = gate {
+                gate.wait(RIDER_BUMP_TICK);
+            }
+        }
+    }
+
+    fn into_landed(self) -> RiderLanded {
+        self.landed
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// One lane of a rider's landings, on this thread ([`land_fresh`]): take the queue's next
+/// program ([`RiderQueue::next`]) until none is left, warming each agent build the moment it
+/// lands rather than when the pass is over. Every lane hands its outcomes to the queue, in the
+/// order they land.
+fn rider_land(
+    lane: &crate::vendor_direct::lane::Lane<'_>,
+    rider: &VendorRider<'_>,
+    queue: &RiderQueue<'_>,
+    gate: Option<&RiderGate>,
+) {
+    while let Some((pending, ticket)) = queue.next(lane.layout, gate) {
+        let lane = &crate::vendor_direct::lane::Lane {
+            download_turn: Some(&ticket),
+            ..*lane
+        };
+        land_fresh(lane, std::slice::from_ref(pending), &mut |outcome| {
+            let warmed = matches!(
+                outcome.verdict,
+                crate::vendor_direct::lane::Verdict::Installed { .. }
+            )
+            .then(|| std::collections::BTreeSet::from([outcome.spec.program.to_string()]));
+            if let Some(program) = &warmed {
+                (rider.warm)(lane.layout, program);
+            }
+            let mut landed = queue
+                .landed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            landed.warmed.extend(warmed.into_iter().flatten());
+            landed.outcomes.push(outcome);
+        });
+    }
+}
+
+/// The terminal marker that answers a `net-starting:` announcement of `planned` landings —
+/// the vendor lane's alone, or the set completion's with the vendors riding it — of which
+/// `arrived` installed and `deferred` waited on a signature check that did not finish
+/// ([`crate::vendor_direct::lane::Verdict::Deferred`]).
 ///
 /// * something arrived → `net-installed:` naming it (a deferral beside it was said on its
 ///   own stdout line);
@@ -14038,6 +15280,9 @@ fn record_vendor_status(
             true,
         ),
         Verdict::Linked => (None, false),
+        Verdict::Unavailable { state } => {
+            (Some(failure_row(layout, program, state.clone())), false)
+        }
     };
     let Some(row) = row else {
         return;
@@ -14580,11 +15825,8 @@ fn cmd_verify_index(args: &[String]) -> ExitCode {
 /// reached with a valid signature already in hand. Reporting them as "no machine on that
 /// roster signed this index" sent the publisher to the PAPER MASTER to re-join or re-key a
 /// machine when the fix is one line of the index they just authored: a duplicate key or a
-/// wrong-typed field from a script edit reads as `Malformed`, and the `roster_seq` that
-/// `tools/atpkg-index.sh` parses out of the roster with `sed … | head -n1` reads as
-/// `SeqMismatch` when it is misread — which that script tells the operator in as many
-/// words ("comes back as `Reject::SeqMismatch` and the publish stops"), a name this verb
-/// never printed.
+/// wrong-typed field from a hand edit reads as `Malformed`, and a misread `roster_seq`
+/// reads as `SeqMismatch` — a name this verb never printed.
 ///
 /// [`crate::Reject::NotAuthorized`] is deliberately NOT named. It is the one verdict
 /// reachable from BOTH sides — `Roster::authorize_appcast` returns it when the roster has
@@ -14674,9 +15916,8 @@ fn cmd_verify_pkg(args: &[String]) -> ExitCode {
 /// WHY A SIGNATURE CHECK ALONE WAS A FALSE OK. `crate::flow` reaches a manifest's bytes
 /// through `verify_pkg(raw, &sig)` and then IMMEDIATELY through `parse_pkg(&verified)`,
 /// discarding the candidate on any refusal — no message, no diagnosis, the program simply
-/// reads as not installable. This verb is the publish pipeline's and the public mirror's
-/// only client-side check (`tools/atpkg-publish-lib.sh`, `tools/atpkg-mirror-public.sh`
-/// step 1), both of which call it "the client's own rule" — so before this, a manifest
+/// reads as not installable. This verb is the client's own rule on the command line —
+/// so before it parsed as well as verified, a manifest
 /// with a `shim_env` entry no shim can lay, an `https` row missing `asset`/`sha256`, the
 /// retired `kind = "vendor-fetch"`, or a `schema` this build cannot read passed the
 /// self-check, was mirrored, and was then refused fleet-wide — discovered by users, after

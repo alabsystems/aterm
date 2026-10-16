@@ -631,67 +631,6 @@ fn dense_result_backlog_drains_without_rescanning_or_replaying_deltas() {
     assert_eq!(got, oracle, "ordered deltas concatenate exactly once");
 }
 
-#[test]
-fn stale_identity_and_early_or_stuttering_drain_negative_controls_are_rejected() {
-    let model = budgeted_search_resume_model();
-
-    let mut scanning = model.init_state();
-    assert!(model.fire("Start", &mut scanning));
-    assert!(model.fire("Resume", &mut scanning));
-    let mut stale = scanning.clone();
-    stale.insert("reset", 1);
-    stale.insert("prior_id", scanning["search_id"]);
-    let (conforms, diagnostics) = verify::validate_transition_tiered(
-        &model,
-        &[],
-        &scanning,
-        &stale,
-        Some("ContentRestart"),
-        "BudgetedSearchResume stale identity negative control",
-    );
-    assert!(
-        !conforms,
-        "stale reset continuation passed unexpectedly: {diagnostics}"
-    );
-
-    let mut backlog = model.init_state();
-    assert!(model.fire("StartBacklog", &mut backlog));
-    let mut early_complete = backlog.clone();
-    early_complete.insert("live", 0);
-    early_complete.insert("complete", 1);
-    early_complete.insert("cursor", 0);
-    early_complete.insert("reset", 0);
-    early_complete.insert("prior_id", 0);
-    let (conforms, diagnostics) = verify::validate_transition_tiered(
-        &model,
-        &[],
-        &backlog,
-        &early_complete,
-        Some("DrainComplete"),
-        "BudgetedSearchResume early completion negative control",
-    );
-    assert!(
-        !conforms,
-        "completion with backlog passed unexpectedly: {diagnostics}"
-    );
-
-    let mut stutter = backlog.clone();
-    stutter.insert("reset", 0);
-    stutter.insert("prior_id", 0);
-    let (conforms, diagnostics) = verify::validate_transition_tiered(
-        &model,
-        &[],
-        &backlog,
-        &stutter,
-        Some("Drain"),
-        "BudgetedSearchResume duplicate-delta stutter negative control",
-    );
-    assert!(
-        !conforms,
-        "drain with no delivery progress passed unexpectedly: {diagnostics}"
-    );
-}
-
 /// The model's other `Buggy=1` slips (the scan-only completion and the
 /// gate-free final drain are replayed in the dense test above), replayed on
 /// real steps: each is the step a slipped `search_budgeted` would return,

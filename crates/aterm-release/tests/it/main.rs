@@ -1,23 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The release cutter's integration tests, as ONE test binary.
+//! The release cutter's integration tests, as one test binary.
 //!
-//! aterm-release is binary-only on purpose (src/main.rs: the spec's §9 file
-//! plan has no `lib.rs`, and nothing outside the cut tool may link this code),
-//! so the tests compile the pipeline's modules directly, by `#[path]`. Each
-//! such mount compiles the whole cutter and runs every inline `#[cfg(test)]`
-//! test in it, so the mounts live here, once, and every test file below is a
-//! module of this crate that reaches the pipeline through `crate::`. The
-//! binary target has `test = false` (Cargo.toml), so this is where the inline
-//! unit tests run, once each.
-//!
-//! The modules are mounted at the crate root because they cross-reference
-//! each other through `crate::` (publish.rs reaches every pipeline stage).
-//! Every mount is `allow(dead_code)`: a test exercises part of a module, and
-//! the real crate's own build — `mod` declarations private to the binary — is
-//! what holds the dead-code line for src/, so an unexercised item here is not
-//! evidence of anything.
+//! aterm-release is binary-only on purpose (no `lib.rs`: nothing outside the cut tool may link
+//! this code), so the tests mount the pipeline's modules by `#[path]` at the crate root, where
+//! they reach each other through `crate::`. Each mount compiles the cutter and its inline
+//! `#[cfg(test)]` tests, so the mounts live here once and the bin target has `test = false`.
+//! Every mount is `allow(dead_code)`: a test exercises part of a module, and the binary's own
+//! build holds the dead-code line for src/.
+#![allow(
+    clippy::disallowed_types,
+    reason = "never linked into the shipped binary: the release cutter, run from source"
+)]
 
 #[path = "../../src/apple.rs"]
 #[allow(dead_code)]
@@ -37,9 +32,21 @@ mod changelog;
 #[path = "../../src/channel.rs"]
 #[allow(dead_code)]
 mod channel;
+#[path = "../../src/clean.rs"]
+#[allow(dead_code)]
+mod clean;
 #[path = "../../src/cli.rs"]
 #[allow(dead_code)]
 mod cli;
+#[path = "../../src/cutter.rs"]
+#[allow(dead_code)]
+mod cutter;
+#[path = "../../src/dev_app.rs"]
+#[allow(dead_code)]
+mod dev_app;
+#[path = "../../src/dev_identity.rs"]
+#[allow(dead_code)]
+mod dev_identity;
 #[path = "../../src/dmg.rs"]
 #[allow(dead_code)]
 mod dmg;
@@ -52,6 +59,9 @@ mod fixtures;
 #[path = "../../src/gates.rs"]
 #[allow(dead_code)]
 mod gates;
+#[path = "../../src/hook.rs"]
+#[allow(dead_code)]
+mod hook;
 #[path = "../../src/ledger.rs"]
 #[allow(dead_code)]
 mod ledger;
@@ -76,9 +86,18 @@ mod release_steps;
 #[path = "../../src/sign.rs"]
 #[allow(dead_code)]
 mod sign;
+#[path = "../../src/site/mod.rs"]
+#[allow(dead_code)]
+mod site;
 #[path = "../../src/snapshot.rs"]
 #[allow(dead_code)]
 mod snapshot;
+#[path = "../../src/transforms.rs"]
+#[allow(dead_code)]
+mod transforms;
+#[path = "../../src/trust_candidate.rs"]
+#[allow(dead_code)]
+mod trust_candidate;
 #[path = "../../src/trust_closure.rs"]
 #[allow(dead_code)]
 mod trust_closure;
@@ -88,6 +107,9 @@ mod trust_compare;
 #[path = "../../src/trust_facts.rs"]
 #[allow(dead_code)]
 mod trust_facts;
+#[path = "../../src/trust_lane.rs"]
+#[allow(dead_code)]
+mod trust_lane;
 #[path = "../../src/trust_oblig.rs"]
 #[allow(dead_code)]
 mod trust_oblig;
@@ -97,18 +119,19 @@ mod verify;
 
 mod apple_tier;
 mod build_once;
+mod candidate_replay;
 mod channel_floor_model;
 mod channel_latest;
 mod claim_landing_model;
 mod d27_refute;
 mod durable_post_intent_model;
+mod export_policy;
 mod handoff_policy_bundle;
+mod hooks;
 mod journal_prefix_model;
 mod ledger_race;
 mod linux_release_arch;
 mod machine_roster;
-mod pack_arch_gate;
-mod packlane_order;
 mod plist_stamp;
 mod publisher_fence_liveness;
 mod publisher_fence_model;
@@ -117,6 +140,7 @@ mod release_flow;
 mod release_lease;
 mod resume;
 mod signconf;
+mod site_sync;
 mod snapshot_take;
 mod transcript_grid;
 mod trust_facts_model;

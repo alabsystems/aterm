@@ -32,8 +32,8 @@ fn native_leaf_cache_releases_hidden_tab_rasters_without_repainting_visible_leaf
         .clone();
     let mut views = vec![first];
 
-    // Replay the old native route: genuine native paint, but without the
-    // common plan-binding retirement. Every visited live tab kept its raster.
+    // Paint through the plan entry alone, skipping the plan-binding
+    // retirement: every visited live tab keeps its raster.
     for visit in 0..6 {
         if visit != 0 {
             let (_, view) = app
@@ -321,6 +321,7 @@ fn paint(
         rect,
         clip: rect,
         content: crate::native_ui::UiContent::Text(crate::native_ui::TextSpec::text(text)),
+        peek: false,
     }
 }
 
@@ -416,10 +417,8 @@ fn desktop_settings_route_repaint_keeps_full_damage_authoritative() {
         "Top -> Packages at the shipped desktop viewport must repaint the retained page, including its sidebar"
     );
 
-    // Bind the policy check to the real Settings reducer and retained
-    // raster path as well.  The route action asks for a full repaint, and
-    // the next preparation must perform one instead of turning the page
-    // diff into a transparent regional patch.
+    // The same through the real Settings reducer and retained raster: the
+    // route action asks for a full repaint and the next preparation does one.
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
@@ -742,10 +741,10 @@ fn ineligible_native_preview_skips_font_polling_then_recording_converges() {
     assert!(before.pending);
     font_job.complete();
 
-    // A queued completion makes polling observable: the historical
-    // unconditional sampler installs it even though this park cannot use
-    // the result. Both focused and unfocused unrecorded headless views skip
-    // the sampler, as does an overlay-covered recording.
+    // A queued completion makes polling observable: a sampler that ran here
+    // would install it though this park cannot use the result. Focused and
+    // unfocused unrecorded headless views skip the sampler, as does an
+    // overlay-covered recording.
     for focused in [true, false] {
         app.windows.get_mut(&wid).unwrap().focused = focused;
         for phase_ms in [33, 66, 99] {
@@ -768,8 +767,8 @@ fn ineligible_native_preview_skips_font_polling_then_recording_converges() {
     );
     app.windows.get_mut(&wid).unwrap().overlay = None;
 
-    // The existing recording exception must still observe completion on
-    // an unfocused headless window and keep its final ready repaint alive.
+    // The recording exception still observes completion on an unfocused
+    // headless window and keeps its final ready repaint alive.
     assert_eq!(
         app.native_settings_preview_for_tick(wid, 165, true),
         Some((view, crate::settings_preview::PreviewAnimation::Continuous))
@@ -819,9 +818,9 @@ fn project_native_preview_font_convergence(
     observed
 }
 
-/// Witness entry at the shipping site as well as validating its actual
-/// state change below. Calls may also poll or decide internally; this does
-/// not claim those entry probes distinguish a transition from a no-op.
+/// Run `drive` and assert it entered `action`'s shipping refinement anchor.
+/// Entry alone does not tell a transition from a no-op; the caller validates
+/// the state change.
 fn drive_native_preview_action<T>(action: &str, drive: impl FnOnce() -> T) -> T {
     use aterm_spec::xref;
 
@@ -1171,12 +1170,10 @@ fn heterogeneous_modal_changes_fingerprint_and_is_painted_last() {
     );
 }
 
-/// The mixed route's fp/geom reuse gate must never serve a composite the
-/// leaf loop abandoned half-built. A leaf that takes a REGIONAL patch moves
-/// neither `fp` nor `geom` and spends its `native_damage` on the spot, so if
-/// a LATER leaf bails the frame the resident card keeps pre-patch pixels
-/// that no later frame would ever notice — it would be presented until some
-/// unrelated input moved. The bail must therefore drop the card.
+/// A mixed-route bail after a leaf rastered drops the reusable card: a
+/// regional patch moves neither `fp` nor `geom` and spends its `native_damage`
+/// at once, so a card kept after a later leaf bails would serve pre-patch
+/// pixels until unrelated input moved.
 #[test]
 fn heterogeneous_bail_after_a_leaf_rasters_drops_the_reusable_card() {
     let mut app = App::headless_for_test();
@@ -1205,8 +1202,8 @@ fn heterogeneous_bail_after_a_leaf_rasters_drops_the_reusable_card() {
         .as_ref()
         .expect("mixed native tray");
     let (fp, geom) = (resident.fp, resident.geom);
-    // Stand-in for "the leaf's PRE-patch pixels": bytes that the rebuilt
-    // composite provably cannot contain, so a reused card is visible here.
+    // Stand-in for the pre-patch pixels: bytes no rebuilt composite contains,
+    // so a reused card shows.
     app.windows
         .get_mut(&wid)
         .unwrap()

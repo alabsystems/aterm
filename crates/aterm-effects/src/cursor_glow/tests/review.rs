@@ -122,7 +122,7 @@ fn a_park_survives_a_hidden_caret_boundary_in_the_gap_before_its_return() {
         "the press is spent by its own cell"
     );
 
-    // CONTROL: a park past its window does not survive the hide.
+    // Control: a park past its window does not survive the hide.
     let mut stale = CursorGlow::default();
     let pre = pre_roll(&mut stale, 11, t0, &c, g);
     let k = pre + Duration::from_millis(85);
@@ -191,7 +191,7 @@ fn a_stalled_batch_draining_across_the_wrap_wider_than_the_tight_fold_is_paid_ex
     assert_eq!(glow.in_flight_tally().forgotten, 0, "nothing forgotten");
     assert_eq!(glow.v2.caret_mirror(), (12, 2));
 
-    // CONTROL: four presses for three cells — the pool overpays the
+    // Control: four presses for three cells — the pool overpays the
     // shape and does not describe the hop.
     let mut over = CursorGlow::default();
     let pre = roll_to(&mut over, 11, 99, t0, &c, g);
@@ -216,7 +216,7 @@ fn a_stalled_batch_draining_across_the_wrap_wider_than_the_tight_fold_is_paid_ex
     assert!(!v2_cols(&over, 11).contains(&99));
     assert!(v2_cols(&over, 12).is_empty());
 
-    // CONTROL: no press in flight — program output.
+    // Control: no press in flight — program output.
     let mut cold = CursorGlow::default();
     let pre = roll_to(&mut cold, 11, 99, t0, &c, g);
     cold.tick(
@@ -235,14 +235,12 @@ fn a_stalled_batch_draining_across_the_wrap_wider_than_the_tight_fold_is_paid_ex
 }
 
 /// A spinner crossing inside a hidden park gap. Ink parks the caret hidden for
-/// ~40 ms, then rewrites the row and shows it one cell on, so every echo is
-/// judged on the visible lane and `last_anchor_sweep` is never set. Inside a
-/// key's gap the status counter crosses a digit width `(9)` → `(10)`: a
-/// brandless first advance on another row with the stamp fresh. The anchored
-/// lane's hold reads the last licensed row on either lane
-/// (`last_licensed_row`), so while another row's licensed echo is younger than
-/// the stamp window no other row spends a stamp there: the spinner spends
-/// nothing and the key's real echo is licensed.
+/// ~40 ms and shows it one cell on, so every echo is judged on the visible lane
+/// and `last_anchor_sweep` is never set. Inside a key's gap the status counter
+/// crosses `(9)` → `(10)`, a brandless first advance on another row with the
+/// stamp fresh. The anchored lane's hold reads the last licensed row on either
+/// lane (`last_licensed_row`), so the spinner spends nothing and the key's real
+/// echo is licensed.
 #[test]
 fn a_spinner_crossing_inside_a_hidden_park_gap_cannot_steal_the_keys_stamp() {
     let g = wide_geom();
@@ -265,7 +263,7 @@ fn a_spinner_crossing_inside_a_hidden_park_gap_cannot_steal_the_keys_stamp() {
     for i in 0..6u16 {
         t += ms(120);
         // The frame before the key sees the caret where the last
-        // rewrite left it (frames run at 50 Hz under the fake).
+        // rewrite left it.
         glow.tick(Some((11, 2 + i)), t - ms(10), &c, g, &mut out);
         glow.note_typed(t);
         seq += 1;
@@ -509,9 +507,8 @@ fn a_swallowed_batch_cannot_fund_a_program_hop_after_an_unexplained_move() {
     let t0 = Instant::now();
     glow.tick(Some((3, 12)), t0, &c, g, &mut out);
     let last = stalled_keys(&mut glow, 3, t0);
-    // The unexplained edge: back to col 2, keyless. Held as a park candidate
-    // for one stamp window, then refused on the next tick past it; the forget
-    // is deferred past `TYPE_HINT_FRESH` (`past_park_window()`).
+    // The unexplained edge: back to col 2, keyless, held as a park candidate
+    // and refused (with its forget) past the park window.
     let edge = last + Duration::from_millis(1000);
     glow.tick(Some((3, 2)), edge, &c, g, &mut out);
     glow.tick(Some((3, 2)), edge + past_park_window(), &c, g, &mut out);
@@ -729,8 +726,8 @@ fn a_glyph_echo_does_not_spend_the_enter_pressed_behind_it() {
         ring_rows(&glow)
     );
 
-    // CONTROL — a same-row forward hop with NO typed pair is the
-    // Return's (a prompt that answers on the row): taken, consumed once.
+    // Control: a same-row forward hop with no typed pair is the Return's
+    // (a prompt that answers on the row): taken, consumed once.
     let mut bare = CursorGlow::default();
     let b0 = Instant::now();
     bare.tick(Some((3, 2)), b0, &c, g, &mut out);
@@ -755,9 +752,9 @@ fn a_glyph_echo_does_not_spend_the_enter_pressed_behind_it() {
     );
 }
 
-/// A KILL FORGETS THE IN-FLIGHT PRESSES AT THE KEY (the line's content
-/// is gone). The arrow's twin — its own licensed move forgets at the
-/// MOVE — is the CONTROL in `seam_laws.rs`'s
+/// A kill forgets the in-flight presses at the key (the line's content is
+/// gone). The arrow's twin, which forgets at its own licensed move, is the
+/// control in `seam_laws.rs`'s
 /// `a_glyph_echo_landing_after_an_arrow_is_the_glyphs_not_the_arrows`.
 #[test]
 fn a_kill_forgets_the_in_flight_presses_at_the_key() {
@@ -865,7 +862,7 @@ fn a_forget_edge_that_finds_only_dead_presses_counts_nothing() {
         0,
         "an edge that forgot no live press is not a forget"
     );
-    // …and the same edge with a LIVE press behind it still counts.
+    // …and the same edge with a live press behind it still counts.
     let k = t + Duration::from_millis(100);
     glow.note_typed(k);
     glow.note_kill(k + Duration::from_millis(50), true);
@@ -1072,8 +1069,7 @@ fn anchored_hidden_run(
 /// licensed anchored echo under a hidden caret moves the hide-bridge source to
 /// its landing (where the mirror is), so a later show is judged from there: a
 /// same-cell reappearance keeps the pool and fresh stamps, and stalled keys
-/// echo licensed. Four shapes: two presses in flight at the show, one, none (a
-/// new key after the show), and the show landing with the stalled echo in.
+/// echo licensed.
 #[test]
 fn a_reappearance_over_an_anchored_run_keeps_the_in_flight_presses() {
     let g = wide_geom();
@@ -1186,10 +1182,7 @@ fn pending_wrap_paid(
 /// twice. The row whose edge glyph the anchored lane paid is remembered
 /// (`wrap_paid_row`, consumed by the next observed caret move, carried across
 /// a scroll or band move), and the fold `99 -> (r+1, 1)` from it prices only
-/// the landing head. Shapes: one stalled key; two (the fold then a `+1`); the
-/// bottom row (the wrap scrolls before the fold). Controls that still pay two:
-/// the last-column glyph arriving with the fold, and the pending-wrap glyph in
-/// the same tick as a caret move.
+/// the landing head.
 #[test]
 fn a_fold_after_a_paid_pending_wrap_glyph_does_not_charge_the_last_column_twice() {
     let g = wide_geom();
@@ -1257,7 +1250,7 @@ fn a_fold_after_a_paid_pending_wrap_glyph_does_not_charge_the_last_column_twice(
         v2_cols(&glow, r),
         ring_rows(&glow)
     );
-    // CONTROL: the last-column glyph arrives WITH the fold (k3 and k4
+    // Control: the last-column glyph arrives with the fold (k3 and k4
     // stall together): two cells from two presses.
     let mut glow = CursorGlow::default();
     glow.tick(Some((11, 97)), t0, &c, g, &mut out);
@@ -1350,7 +1343,7 @@ fn a_pending_wrap_print_under_a_hidden_caret_is_shown_on_the_pane_edge() {
     glow.observe_print_anchor(Some((11, 99, 3)));
     glow.tick(Some((11, 99)), k2 + ms(3), &c, g, &mut out);
     assert_eq!(glow.admission_tally().licensed, 2);
-    // The glyph at the last column printed under a HIDDEN caret (the
+    // The glyph at the last column printed under a hidden caret (the
     // TUI's bracket): the anchor one past the pane's edge.
     let k3 = k2 + ms(100);
     glow.note_typed(k3);
@@ -1558,7 +1551,7 @@ fn a_backspace_into_an_ime_run_retires_one_glyphs_credit() {
     );
     let dark = dark_in(&glow, 3, 5..9);
     assert!(dark.is_empty(), "dark: {dark:?}");
-    // An UNPRICED erase is still the whole-slot retire.
+    // An unpriced erase is still the whole-slot retire.
     glow.note_typed_cells(echo + ms(85), 6);
     glow.note_backspace_erasing(echo + ms(170), None);
     assert_eq!(glow.typed_credits_within(echo + ms(170)), 0);
@@ -1850,7 +1843,7 @@ fn a_program_row_advancing_while_presses_are_in_flight_is_not_the_echo() {
     assert_eq!(glow.spawns(), 1);
     glow.note_typed(at(330));
     glow.note_typed(at(420));
-    // The status row's FIRST advance, brandless, 555 ms after the input
+    // The status row's first advance, brandless, 555 ms after the input
     // echo, with two presses in flight.
     glow.observe_print_anchor(Some((9, 11, 4)));
     glow.tick(None, at(800), &c, g, &mut out);

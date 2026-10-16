@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// VT/ANSI conformance — the gold standard for "is this a correct terminal."
-// Each case: feed input bytes → read the screen via the engine API → assert.
-// A failure here is either a wrong expectation or a real engine bug; both are
-// worth catching.
+// VT/ANSI conformance: feed bytes, read the screen through the engine API,
+// assert.
 
 use aterm_conformance::run;
 
@@ -52,17 +50,15 @@ fn sgr_color_does_not_corrupt_text() {
 
 #[test]
 fn sgr_interleaved_attrs_and_color_keep_text() {
-    // Exercises the flags-only fast path (\x1b[1m, \x1b[22m), the color fast path
-    // (\x1b[31m), and reset (\x1b[0m) interleaved between printable chars. The
-    // text must remain "ABC" regardless of style transitions.
+    // The flags-only (1m, 22m) and colour (31m) fast paths and a reset (0m),
+    // interleaved with printable chars, leave the text "ABC".
     let s = run(b"\x1b[1m\x1b[31mA\x1b[22mB\x1b[0mC");
     assert_eq!(s.row(0), "ABC");
 }
 
 #[test]
 fn sgr_bold_then_color_equals_color_then_bold() {
-    // Order of an attribute SGR vs a color SGR must not affect the final style:
-    // the flags-only fast path and the color fast path must compose identically.
+    // The flags-only and colour fast paths compose identically in either order.
     let bold_then_color = run(b"\x1b[1m\x1b[31m").style_fingerprint();
     let color_then_bold = run(b"\x1b[31m\x1b[1m").style_fingerprint();
     assert_eq!(
@@ -76,8 +72,8 @@ fn sgr_bold_then_color_equals_color_then_bold() {
 
 #[test]
 fn sgr_attr_reset_returns_to_default_style() {
-    // Setting then clearing each attribute via its reset form must restore the
-    // exact default style fingerprint (flags-only fast path round-trip).
+    // Setting then clearing each attribute by its reset form restores the
+    // default fingerprint (the flags-only fast path's round trip).
     let default = run(b"").style_fingerprint();
     // bold(1)/un-bold(22), reverse(7)/un-reverse(27), underline(4)/un-underline(24).
     let round_trip = run(b"\x1b[1m\x1b[7m\x1b[4mX\x1b[22m\x1b[27m\x1b[24m").style_fingerprint();

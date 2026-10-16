@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>aterm in your browser — ALab</title>
+<meta name="description" content="aterm — the ALab terminal — compiled to WebAssembly, running entirely in this page: the real Rust engine, renderer, and effects, client-side. Nothing you type leaves the page." />
+<link rel="canonical" href="https://alab.systems/terminal" />
+<meta name="theme-color" content="#F5F3EC" media="(prefers-color-scheme: light)" />
+<meta name="theme-color" content="#0C0D0C" media="(prefers-color-scheme: dark)" />
+<link rel="icon" href="/assets/favicon.svg" type="image/svg+xml" />
+<link rel="icon" href="/favicon.ico" sizes="32x32" />
+<link rel="stylesheet" href="/assets/term/term.css" />
+<script type="module" src="/assets/term/boot.js"></script>
+</head>
+<body>
+<header class="bar">
+  <a class="brand" href="/">ALab</a>
+  <span class="title">aterm v0.61.0&nbsp;&middot; WASM &middot; Nothing you type leaves this page.</span>
+  <a class="get register" href="/register">Register</a>
+  <a class="get download" href="https://github.com/alabsystems/aterm/releases/download/v0.63.0/aterm-0.63.0.dmg" data-href-linux-x86_64="https://github.com/alabsystems/aterm/releases/download/v0.61.0/aterm-0.61.0-linux-x86_64.tar.gz">Download Native App</a>
+</header>
+<main>
+  <div id="term-wrap">
+    <div id="boot">fetching the engine — aterm_wasm_bg.wasm …</div>
+    <canvas id="term"></canvas>
+    <textarea id="kbd" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false" aria-label="terminal input"></textarea>
+    <noscript><style>#boot { display: none; }</style><div class="noscript-note">This page is a WebAssembly build of the aterm engine — it needs JavaScript to boot the module.</div></noscript>
+  </div>
+</main>
+<footer class="by">
+  <p><a href="/">alab.systems</a> &middot; By Andrew Yates &middot; <a href="mailto:hello@alab.systems">hello@alab.systems</a> &middot; &copy;&nbsp;2026
+    &middot; <a class="soc" href="https://www.linkedin.com/in/alabsystems/" aria-label="Andrew Yates on LinkedIn"><svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" focusable="false"><path fill="currentColor" d="M20.447 20.452h-3.554v-5.569c0-1.328-.027-3.037-1.852-3.037-1.853 0-2.136 1.445-2.136 2.939v5.667H9.351V9h3.414v1.561h.046c.477-.9 1.637-1.85 3.37-1.85 3.601 0 4.267 2.37 4.267 5.455v6.286zM5.337 7.433c-1.144 0-2.063-.926-2.063-2.065 0-1.138.92-2.063 2.063-2.063 1.14 0 2.064.925 2.064 2.063 0 1.139-.925 2.065-2.064 2.065zm1.782 13.019H3.555V9h3.564v11.452zM22.225 0H1.771C.792 0 0 .774 0 1.729v20.542C0 23.227.792 24 1.771 24h20.451C23.2 24 24 23.227 24 22.271V1.729C24 .774 23.2 0 22.222 0h.003z"/></svg></a>
+    <a class="soc" href="https://x.com/alabsystems" aria-label="Andrew Yates on X"><svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" focusable="false"><path fill="currentColor" d="M18.901 1.153h3.68l-8.04 9.19L24 22.846h-7.406l-5.8-7.584-6.638 7.584H.474l8.6-9.83L0 1.154h7.594l5.243 6.932ZM17.61 20.644h2.039L6.486 3.24H4.298Z"/></svg></a></p>
+</footer>
+</body>
+</html>

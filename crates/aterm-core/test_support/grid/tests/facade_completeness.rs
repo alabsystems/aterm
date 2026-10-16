@@ -2,11 +2,9 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Compile-time checks that `aterm_core::grid` re-exports the `aterm-grid`
-//! types cross-crate consumers rely on.
-//!
-//! Each line coerces `identity::<aterm_grid::T>` to `fn(aterm_grid::T) ->
-//! grid::T`, which type-checks only while the two names are the same type.
+//! Compile-time checks that `aterm_core::grid` re-exports the `aterm-grid` types
+//! cross-crate consumers rely on: each coercion of `identity::<aterm_grid::T>` to
+//! `fn(aterm_grid::T) -> grid::T` type-checks only while the two names are one type.
 
 use crate::grid;
 use core::convert::identity;
@@ -27,7 +25,6 @@ const _: () = {
     let _: fn(aterm_grid::StyleTable) -> grid::StyleTable = identity;
     let _: fn(aterm_grid::Row) -> grid::Row = identity;
     let _: fn(aterm_grid::style::ExtendedStyleInfo) -> grid::style::ExtendedStyleInfo = identity;
-    // Page and PageSlice are not re-exported; only
-    // PageStore and PAGE_SIZE are part of the public facade.
+    // Page and PageSlice are not re-exported; PageStore (above) and PAGE_SIZE are.
     let _: usize = grid::page::PAGE_SIZE;
 };

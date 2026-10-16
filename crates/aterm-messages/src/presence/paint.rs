@@ -1,25 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The row's COLOURS and CELLS: the presence tones (the rim's hues and the
-//! story dot, [`tones`]), the same hues as text inks ([`inks`]), and the
-//! painted row ([`paint_row`]) — which character in which cell, in which ink,
-//! on the chrome band's material ([`BandInks`]). The host maps the cells onto
-//! its own cell type.
+//! The row's colours and cells: the presence tones ([`tones`]), the same hues
+//! as text inks ([`inks`]), and the painted row ([`paint_row`]) on the chrome
+//! band's material ([`BandInks`]). The host maps the cells onto its own type.
 
 use super::words::{cells, gap_before, text_presentation};
 use super::{Host, SlotKind, Tone, Words};
 use crate::MARGIN;
 use crate::ink::{BandInks, ForcedPalette, InkedCell, bg_is_light, ensure_contrast, forced_ink};
 
-/// The PRESENCE tones: the rim's three hues and the story dot. The owner's
-/// picks on the approved mocks: teal for DRIVE (a peer's hand is on the
-/// keyboard), amber for WAIT (a human should look), red for STOP (held, or at
-/// a limit), violet for a STORY (something happened while you were away).
-/// Light and dark are the mocks' own pairs; each is contrast-floored against
-/// the band, at the floor its surface owes: [`tones`] at the 3:1 non-text
-/// floor a rim and a chip's dot share, [`inks`] at WCAG AA 4.5:1 for the
-/// WORDS the row paints in them. One hue family, two floors.
+/// The presence tones: teal for drive (a peer's hand is on the keyboard),
+/// amber for wait (a human should look), red for stop (held, or at a limit),
+/// violet for a story (something happened while you were away). Each has a
+/// light and a dark pair, contrast-floored against the band: [`tones`] at the
+/// 3:1 non-text floor a rim and a chip's dot share, [`inks`] at AA 4.5:1 for
+/// the words the row paints in them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PresenceTones {
     /// A peer's hand.
@@ -33,19 +29,17 @@ pub struct PresenceTones {
 }
 
 /// The presence tones on the band `c` of a theme whose background is
-/// `theme_bg` — or, under an OS-forced chrome palette (`forced`), the High
-/// Contrast vocabulary's own words for them. High Contrast discards hue as a
-/// channel, so DRIVE is `COLOR_HIGHLIGHT` (a peer has this window: the
-/// "selected" meaning is the honest one) and WAIT / STOP / STORY collapse
-/// onto the one text ink — the row says which in words, and a hold's rim is
-/// still twice as thick with its wash, so the states stay distinguishable
-/// without a hue.
+/// `theme_bg`, or under an OS-forced chrome palette (`forced`) the High
+/// Contrast colours: hue is no channel there, so drive is `COLOR_HIGHLIGHT`
+/// (its "selected" meaning fits a peer holding the window) and wait / stop /
+/// story share the text ink. The row says which in words, and a hold's rim
+/// stays doubled with its wash.
 #[must_use]
 pub fn tones(theme_bg: [u8; 3], c: &BandInks, forced: Option<ForcedPalette>) -> PresenceTones {
     if let Some(hc) = forced {
         let ink = forced_ink(hc.window_text, hc.btn_face);
         return PresenceTones {
-            // `COLOR_HIGHLIGHT` is a FILL in the HC vocabulary (the selected
+            // `COLOR_HIGHLIGHT` is a fill in the HC vocabulary (the selected
             // tab's), so as an ink or a rim it is floored like every other.
             drive: forced_ink(hc.highlight, hc.btn_face),
             wait: ink,
@@ -66,12 +60,10 @@ pub fn tones(theme_bg: [u8; 3], c: &BandInks, forced: Option<ForcedPalette>) -> 
     }
 }
 
-/// The presence hues as TEXT inks on a band whose ground is `bar_bg`:
-/// [`tones`]' hues held to the AA 4.5:1 text floor. What [`paint_row`] paints
-/// the hand and phase slots in; the rim keeps the 3:1 tones. Under a forced
-/// HC palette the three text inks are already `WINDOWTEXT` on `BTNFACE`;
-/// `COLOR_HIGHLIGHT` — a FILL the OS never meant as ink — is the one that can
-/// need the lift.
+/// The presence hues as text inks on a band whose ground is `bar_bg`:
+/// [`tones`]' hues held to the AA 4.5:1 text floor, for the words
+/// [`paint_row`] paints; the rim keeps the 3:1 tones. Under a forced palette
+/// only `COLOR_HIGHLIGHT`, a fill the OS never meant as ink, can need the lift.
 #[must_use]
 pub fn inks(tones: PresenceTones, bar_bg: [u8; 3]) -> PresenceTones {
     const AA: f64 = 4.5;
@@ -89,35 +81,29 @@ const fn rgb(c: u32) -> [u8; 3] {
     [r, g, b]
 }
 
-/// The cells of a `cols`-wide row that carry TEXT: the row keeps one margin
+/// The cells of a `cols`-wide row that carry text: the row keeps one margin
 /// cell each side, and the `chrome` line and the a11y detail fit the words
-/// at this width — the same line the human sees, never a slot past the margin.
+/// at this width, so they never report a slot past the margin.
 #[must_use]
 pub const fn text_cols(cols: usize) -> usize {
     cols.saturating_sub(2 * MARGIN)
 }
 
-/// Paint the row ([`Words`]) at `cols`: the six slots laid out by
-/// [`Words::pieces`] (which sheds from the right in the design's order), on
-/// the band's material `c`, each slot in its own ink — the role in `value`,
-/// a `since`/fabric figure in `label`, the hand in the DRIVE hue while a peer
-/// types (the rim's own teal family, so the two surfaces read as one fact —
-/// at the TEXT floor, `p` from [`inks`], since these are words), `⊘ hold` in
-/// STOP, the phase in WARN while the row's tone is `Warn` and in the drive
-/// hue for the two seconds after a settled turn. The trust glyph and `⚠` are
-/// text-presentation on purpose (a colour emoji would be two cells wide in
-/// one). Exactly `cols` cells; the row carries no closing seam of its own.
+/// Paint the row ([`Words`]) at `cols`: the slots laid out by
+/// [`Words::pieces`] on the band's material `c`, each in its own ink: the
+/// role in `value`, a `since`/fabric figure in `label`, the hand in the drive
+/// hue while a peer types (the rim's family at the text floor, `p` from
+/// [`inks`]), `⊘ hold` in stop, the phase in warn under `Tone::Warn` and in
+/// the drive hue under `Tone::Success`. Glyphs with an emoji form are pinned
+/// to text presentation (one cell). Exactly `cols` cells, no closing seam.
 ///
-/// Each word is painted in the cells the host's grid lays it out in
-/// ([`Host::columns`], the measure the width law fits by): a wide glyph is
-/// its lead cell and a CONTINUATION ([`InkedCell::continuation`]), and a
-/// character the grid draws in the cell before it (a combining mark, a
-/// variation selector, the rest of a ZWJ sequence or a flag) takes no cell —
-/// the lead cell holds one character, so it is drawn nowhere on the glass,
-/// while the row's words (`chrome`, the a11y sentence) keep it (ruling
-/// 2026-10-11, round fifteen content-6: a host row carries no combining or
-/// cluster lane). A wide glyph that would straddle the row's end is not
-/// painted at all, never halved.
+/// Each word takes the cells the host's grid gives it ([`Host::columns`]): a
+/// wide glyph is its lead cell plus a continuation
+/// ([`InkedCell::continuation`]); a character the grid folds into the cell
+/// before it (a combining mark, a variation selector, the rest of a ZWJ
+/// sequence or flag) takes no cell and is not drawn, since a host row has no
+/// cluster lane, while the row's text (`chrome`, the a11y sentence) keeps it.
+/// A wide glyph that would straddle the row's end is not painted at all.
 #[must_use]
 pub fn paint_row<V: Host>(
     words: &Words,

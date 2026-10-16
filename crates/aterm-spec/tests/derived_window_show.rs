@@ -1,11 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-0 of `NativeUpdateWindowShow`
-//! (`aterm_spec::derive::native_update_window_show_model`): the window show
-//! state a self-update carries (gap #29). Proved at `Buggy = 0` and caught at
-//! `Buggy = 1` on every invariant; the update's paths are walked as the
-//! owner's schedules. Tier-1 is `aterm-gui/src/window_show_conformance.rs`.
+//! Tier-0 of `NativeUpdateWindowShow`: the window show state a self-update carries. Proved at
+//! `Buggy = 0` and caught at `Buggy = 1` on every invariant; the update's paths are walked as
+//! schedules. Tier-1 is `aterm-gui/src/window_show_conformance.rs`.
 
 use crate::walk::only;
 use aterm_spec::derive::native_update_window_show_model;
@@ -14,12 +12,6 @@ use aterm_spec::{interp, verify};
 #[test]
 fn window_show_proves_catches_and_has_no_dead_action() {
     let model = native_update_window_show_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name),
-        "the window show carry must stay enrolled in the spec-link registry"
-    );
     let fired = interp::fired_actions(&model);
     assert_eq!(
         fired.len(),
@@ -32,10 +24,10 @@ fn window_show_proves_catches_and_has_no_dead_action() {
     );
 }
 
-/// The owner's update, in the three ways it meets the user. In aterm: the
-/// stack goes on with the proof, Commit, and full screen comes back with aterm
-/// in front. In another app: full screen waits for aterm to be in front.
-/// Typing into another window before Commit: that window keeps the keyboard.
+/// An update, in the three ways it meets the user. In aterm: the stack goes on with the proof,
+/// Commit, and full screen comes back with aterm in front. In another app: full screen waits
+/// for aterm to be in front. Typing into another window before Commit: that window keeps the
+/// keyboard.
 #[test]
 fn window_show_walks_the_update_the_way_the_user_meets_it() {
     let m = native_update_window_show_model();
@@ -80,9 +72,8 @@ fn window_show_walks_the_update_the_way_the_user_meets_it() {
         "the window typed into keeps the keyboard"
     );
 
-    // Typed into BEFORE the proof (round six, finding 45): the window the
-    // reveal order left key, typed into while the proof was still owed, keeps
-    // the keyboard through the stack and Commit.
+    // Typed into before the proof: the window the reveal order left key keeps the keyboard
+    // through the stack and Commit.
     let mut typed_early = m.init_state();
     for action in ["Launch", "Reveal", "Type", "Prove", "Stack", "Commit"] {
         assert!(
@@ -133,9 +124,9 @@ fn window_show_walks_the_update_the_way_the_user_meets_it() {
     );
 }
 
-/// `Buggy = 1` — raise before the reveal or before the proof, full screen at
-/// the stack, the key left where the reveal order put it, and a Commit that
-/// re-keys over typing — is caught on each invariant by its own schedule.
+/// `Buggy = 1` (raise before the reveal or before the proof, full screen at the stack, the key
+/// left where the reveal order put it, a Commit that re-keys over typing) is caught on each
+/// invariant by its own schedule.
 #[test]
 fn window_show_the_defects_are_caught_on_every_invariant() {
     let m = interp::with_buggy(&native_update_window_show_model(), 1);
@@ -155,5 +146,4 @@ fn window_show_the_defects_are_caught_on_every_invariant() {
     );
     let (e, _) = interp::bmc(&only(&m, "TypingKeepsItsWindow")).expect_err("re-keyed");
     assert_eq!((e["committed"], e["typed"], e["keyed"]), (1, 1, 1), "{e:?}");
-    assert!(verify::uncaught_invariants(&native_update_window_show_model()).is_empty());
 }

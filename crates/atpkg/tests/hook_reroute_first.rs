@@ -1,26 +1,25 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! INSIDE ATERM, THE SHELL HOOK PUTS THE REROUTE DIRECTORY FIRST (owner ruling
-//! 2026-09-27: *"yes, in aterm hosted shells. do not block cargo, but do wrap it so that a
-//! message is printed to tell the AI and users."*).
-//!
-//! The stubs already announce and then run upstream (`atpkg::reroute`, "announce, do not
-//! prevent"). What failed was their PLACE on PATH: measured 2026-09-24 in a TTY `aterm`
-//! login shell, `/etc/zprofile`'s `path_helper` and a `.zshrc` that prepends
-//! `~/.local/bin` left `<prefix>/reroute` at position 12-14, behind `/usr/local/bin` and
-//! `/opt/homebrew/bin`, so a bare `cargo` ran Homebrew's cargo with no message — and that
-//! lane carries no shell integration to re-assert it. These tests source the REAL
+//! Inside aterm the shell hook puts the reroute directory first on PATH. The stubs announce
+//! and then run upstream (`atpkg::reroute`), which works only from ahead of
+//! `/usr/local/bin` and `/opt/homebrew/bin`: a login shell's `/etc/zprofile` `path_helper`
+//! and a `.zshrc` that prepends `~/.local/bin` otherwise leave `<prefix>/reroute` behind
+//! them, so a bare `cargo` would run Homebrew's with no message. These tests source the real
 //! generated hook (`atpkg::hooks::hook_files`) in the real shells installed here, from a
-//! clean environment whose PATH has that measured shape, and then run the REAL generated
-//! `cargo` stub against the dev `atpkg` binary and a FAKE upstream cargo (never a real
-//! one: the fake prints its arguments and exits 3).
+//! clean environment whose PATH has that shape, then run the real generated `cargo` stub
+//! against the dev `atpkg` binary and a fake upstream cargo (it prints its arguments and
+//! exits 3).
 //!
-//! NEVER THE REAL STORE: `HOME` and `XDG_CONFIG_HOME` are temp directories, so the prefix
+//! Never the real store: `HOME` and `XDG_CONFIG_HOME` are temp directories, so the prefix
 //! the stub's `atpkg __reroute` resolves is the default one under that temp `HOME`, and the
 //! `[reroute] announce` setting it reads is the temp `aterm.toml`.
 
 #![cfg(unix)]
+#![allow(
+    clippy::disallowed_types,
+    reason = "test code: a stand-in child may inherit descriptors"
+)]
 
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
@@ -92,9 +91,8 @@ impl Fixture {
             &homebrew.join("cargo"),
             &format!("#!/bin/sh\necho \"homebrew-style cargo: $*\"\nexit {FAKE_EXIT}\n"),
         );
-        // Its first exec, paid here: a freshly written file waits on `syspolicyd`'s
-        // assessment the first time it runs (seconds under load, `atpkg::reroute`'s tests),
-        // and the reroute's bounded `-vV` probe must not be the run that pays it.
+        // Its first exec, paid here: a fresh file waits on `syspolicyd`'s assessment the
+        // first time it runs, and the reroute's bounded `-vV` probe must not pay it.
         let warmed = Command::new(homebrew.join("cargo")).output().unwrap();
         assert_eq!(warmed.status.code(), Some(FAKE_EXIT), "{warmed:?}");
         Self {
@@ -113,10 +111,10 @@ impl Fixture {
         p.to_str().expect("UTF-8 fixture path")
     }
 
-    /// The measured login-shell shape: `~/.local/bin` (the .zshrc prepend), then
-    /// path_helper's `/usr/local/bin` and `/opt/homebrew/bin`, the system dirs, and the
-    /// spawn seam's `reroute`/`agents` front-insert DEMOTED behind all of them — the
-    /// reroute dir listed twice, as a nested seam leaves it.
+    /// The login-shell shape: `~/.local/bin` (the .zshrc prepend), then path_helper's
+    /// `/usr/local/bin` and `/opt/homebrew/bin`, the system dirs, and the spawn seam's
+    /// `reroute`/`agents` front-insert demoted behind all of them — the reroute dir listed
+    /// twice, as a nested seam leaves it.
     fn inherited_path(&self) -> String {
         let local_bin = self.home.join(".local/bin");
         format!(
@@ -209,7 +207,7 @@ fn fish() -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
-/// Run `script` in `shell` from a CLEAN environment: only `HOME`, `XDG_CONFIG_HOME`,
+/// Run `script` in `shell` from a clean environment: only `HOME`, `XDG_CONFIG_HOME`,
 /// `PATH`, `ATPKG_TEST_HOOK` and the `env` pairs given.
 fn run(
     fx: &Fixture,
@@ -281,11 +279,11 @@ fn count(path: &[String], dir: &Path) -> usize {
     path.iter().filter(|e| Path::new(e) == dir).count()
 }
 
-/// THE ORDER, in every POSIX shell installed here: inside aterm (any one marker of the
-/// agents gate) PATH starts `reroute:agents:`, each exactly once, ahead of the fake
-/// `/usr/local/bin` and `/opt/homebrew/bin`; outside aterm neither is on PATH at all; under
-/// `aterm --no-reroute`'s marker agents still leads and reroute is not added; and a
-/// second source changes nothing.
+/// In every POSIX shell installed here: inside aterm (any one marker of the agents gate)
+/// PATH starts `reroute:agents:`, each exactly once, ahead of the fake `/usr/local/bin` and
+/// `/opt/homebrew/bin`; outside aterm neither is on PATH at all; under `aterm
+/// --no-reroute`'s marker agents still leads and reroute is not added; and a second source
+/// changes nothing.
 #[test]
 fn inside_aterm_the_hook_puts_reroute_then_agents_first_and_outside_neither() {
     let fx = Fixture::new("order");
@@ -333,7 +331,7 @@ fn inside_aterm_the_hook_puts_reroute_then_agents_first_and_outside_neither() {
                 "{who}: a passthrough marker of {value:?} is not engaged — {inside:?}"
             );
         }
-        // OUTSIDE ATERM: neither, and bin/ still appended (an iTerm launched from an aterm
+        // Outside aterm: neither, and bin/ still appended (an iTerm launched from an aterm
         // tab inherits both, and heals).
         let outside = sourced_path(&fx, &shell, &hook, 1, &[]);
         assert_eq!(count(&outside, &fx.reroute), 0, "{who}: {outside:?}");
@@ -365,15 +363,13 @@ fn inside_aterm_the_hook_puts_reroute_then_agents_first_and_outside_neither() {
     }
 }
 
-/// THE DEGRADED TTY LAUNCH (review finding, 2026-09-27). A TTY `aterm` session carries
-/// `ATERM_AGENTS_DIR` and neither `ATERM_CHILD` nor `ATERM_SESSION_ID`; when its front door
-/// could hand no agents dir (a file or a link at `agents/`, a refused `mkdir`: one stderr
-/// line, and the handle is blank or absent) the agents markers are all empty — yet the
-/// session is still an aterm-hosted shell, its seam still front-inserted the reroute dir and
-/// still exports `$ATERM_REROUTE_DIR` for it. The hook used to read that as OUTSIDE aterm and
-/// take the reroute dir out, so a bare `cargo` ran the fake upstream with no message. Now
-/// `$ATERM_REROUTE_DIR` (non-empty) counts for the reroute half — never for agents/, which
-/// stays out with `ATPKG_AGENTS` unset — and the passthrough marker still wins.
+/// A degraded TTY launch: a TTY `aterm` session carries `ATERM_AGENTS_DIR` and neither
+/// `ATERM_CHILD` nor `ATERM_SESSION_ID`; when its front door could hand no agents dir (a
+/// file or a link at `agents/`, a refused `mkdir`) the agents markers are all empty, yet the
+/// session is still aterm-hosted: its seam front-inserted the reroute dir and exports
+/// `$ATERM_REROUTE_DIR`. A non-empty `$ATERM_REROUTE_DIR` counts for the reroute half —
+/// never for agents/, which stays out with `ATPKG_AGENTS` unset — and the passthrough marker
+/// still wins.
 #[test]
 fn a_tty_session_whose_front_door_handed_no_agents_dir_still_leads_with_reroute() {
     let fx = Fixture::new("no-agents-handoff");
@@ -437,7 +433,7 @@ fn a_tty_session_whose_front_door_handed_no_agents_dir_still_leads_with_reroute(
                 "{who}: bin/ still appended"
             );
         }
-        // A BLANK `$ATERM_REROUTE_DIR` is not a marker — what every lane leaves under the
+        // A blank `$ATERM_REROUTE_DIR` is not a marker — what every lane leaves under the
         // escape or with nothing laid — and the passthrough marker wins over a set one.
         for no_reroute in [
             &[("ATERM_REROUTE_DIR", "")][..],
@@ -477,15 +473,13 @@ fn a_tty_session_whose_front_door_handed_no_agents_dir_still_leads_with_reroute(
     }
 }
 
-/// THE MESSAGE, END TO END. Inside aterm, after the hook, a bare `cargo build --x` in
-/// every POSIX shell installed here reaches the reroute stub ahead of the fake Homebrew
-/// cargo: stderr carries the signpost — naming what `cargo` resolved to (the fake answers
-/// `-vV` like no Rust tool, so it is an unidentified cargo, not known to be Trust) and
-/// `targo --unverified build --x` and `targo trust build --x` — the fake then runs with the
-/// same arguments, and its exit code is the command's; the `-vV` the name was resolved by
-/// never reaches stdout. `[reroute] announce = false` drops the line and nothing else. The
-/// negative control: outside aterm the same command runs the fake SILENTLY — the message
-/// comes from the order the hook sets, not from the fake or the fixture.
+/// Inside aterm, after the hook, a bare `cargo build --x` in every POSIX shell installed
+/// here reaches the reroute stub ahead of the fake Homebrew cargo: stderr carries the
+/// signpost — naming what `cargo` resolved to (the fake answers `-vV` like no Rust tool, so
+/// an unidentified cargo) and `targo --unverified build --x` and `targo trust build --x` —
+/// the fake then runs with the same arguments, and its exit code is the command's; the
+/// `-vV` probe never reaches stdout. `[reroute] announce = false` drops the line and
+/// nothing else. Negative control: outside aterm the same command runs the fake silently.
 #[test]
 fn inside_aterm_a_bare_cargo_is_announced_and_then_runs_upstream_with_its_exit_code() {
     let fx = Fixture::new("stub");
@@ -592,7 +586,7 @@ fn fish_and_powershell_lead_reroute_then_agents_inside_aterm() {
         "set __atpkg_front \"$__atpkg_agents\"; set -gx ATPKG_AGENTS $__atpkg_agents; \
          else; set -e ATPKG_AGENTS; end"
             .to_owned(),
-        // The reroute half: any agents marker OR a non-empty `$ATERM_REROUTE_DIR` (the
+        // The reroute half: any agents marker or a non-empty `$ATERM_REROUTE_DIR` (the
         // degraded TTY launch), and never under the passthrough marker.
         format!(
             "if test -z \"${PASSTHROUGH_ENV}\"; or test \"${PASSTHROUGH_ENV}\" = 0; \
@@ -674,12 +668,11 @@ fn fish_and_powershell_lead_reroute_then_agents_inside_aterm() {
     assert_eq!(count(&escaped, &fx.reroute), 0, "fish: {escaped:?}");
 }
 
-/// EVERY STUB RUNS SOMETHING (owner, 2026-09-29: *"make these rules informative and concise
-/// warnings for the AI, not extra blockers"*), through the REAL `atpkg __reroute` and the
-/// REAL stubs: `rustfmt` with no trustfmt installed runs the upstream copy after one line
-/// naming `aterm pkg install trust`, and `z3` runs upstream after one line naming `ay` —
-/// each with the fake's own exit code. `[reroute] strict = true` in the temp `aterm.toml`
-/// puts the refusals back: 127 with the install line, and z3's exit 2 naming its path.
+/// Every stub runs something, through the real `atpkg __reroute` and the real stubs:
+/// `rustfmt` with no trustfmt installed runs the upstream copy after one line naming
+/// `aterm pkg install trust`, and `z3` runs upstream after one line naming `ay` — each with
+/// the fake's own exit code. `[reroute] strict = true` in the temp `aterm.toml` puts the
+/// refusals back: 127 with the install line, and z3's exit 2 naming its path.
 #[test]
 fn a_missing_trust_tool_and_z3_run_upstream_and_strict_restores_the_refusals() {
     let fx = Fixture::new("never-refuse");
@@ -719,7 +712,7 @@ fn a_missing_trust_tool_and_z3_run_upstream_and_strict_restores_the_refusals() {
             out.status.code(),
         )
     };
-    // THE DEFAULT: both run, after one line each.
+    // The default: both run, after one line each.
     assert_eq!(
         call("rustfmt src/x.rs"),
         (
@@ -737,7 +730,7 @@ fn a_missing_trust_tool_and_z3_run_upstream_and_strict_restores_the_refusals() {
             Some(FAKE_EXIT)
         )
     );
-    // STRICT: the refusals of before, byte for byte, and nothing upstream ran.
+    // Strict: the refusals, byte for byte, and nothing upstream ran.
     let dir = fx.config_home.join("aterm");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("aterm.toml"), "[reroute]\nstrict = true\n").unwrap();

@@ -6,7 +6,7 @@
 //!   - while a worker owns the drain, staged lines stay readable;
 //!   - a bounded drain loses no history and preserves order;
 //!   - the backlog stays bounded under sustained overload;
-//!   - with no worker attached, the drain runs inline as before.
+//!   - with no worker attached, the drain runs inline.
 
 use crate::Grid;
 use crate::grid::test_support::feed_numbered_lines;
@@ -37,7 +37,6 @@ fn deferred_backlog_stays_readable_then_drains_without_loss() {
     let total_fed = 1100usize;
     feed_numbered_lines(&mut grid, 0, total_fed);
 
-    // The backlog is genuinely deferred (not drained inline)...
     let backlog = grid.lazy_backlog_len();
     assert!(
         backlog > 1000,
@@ -65,7 +64,6 @@ fn deferred_backlog_stays_readable_then_drains_without_loss() {
         assert!(guard < 100, "bounded drain must make progress every call");
     }
 
-    // No history lost, order preserved, total unchanged.
     assert_eq!(grid.scrollback_lines(), depth_before, "no lines lost");
     assert!(
         grid.tiered_scrollback_lines() > 0,
@@ -163,17 +161,15 @@ fn bounded_drain_is_a_noop_while_detached_for_reflow() {
     let mut grid = Grid::with_tiered_scrollback(3, 80, 2, scrollback);
     grid.set_compress_offload_active(true);
     feed_numbered_lines(&mut grid, 0, 400); // build some tiered history first
-    // Detach the store for a width-change reflow (must_use job dropped — this
-    // test only exercises the detach WINDOW, not the re-attach).
+    // Detach the store for a width-change reflow; the job is never re-attached
+    // (this test covers only the detach window).
     let _pending = grid.resize_offloading_scrollback(3, 100);
-    // Re-accumulate a backlog into the now-detached lazy buffer.
     feed_numbered_lines(&mut grid, 400, 1200);
     let before = grid.lazy_backlog_len();
     assert!(
         before > 256,
         "a backlog accumulated while detached: {before}"
     );
-    // No-op: same backlog out, nothing promoted (store is detached).
     let after = grid.drain_lazy_bounded(256);
     assert_eq!(after, before, "detached drain must not change the backlog");
     assert_eq!(grid.lazy_backlog_len(), before);

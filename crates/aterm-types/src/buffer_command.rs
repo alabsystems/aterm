@@ -3,17 +3,9 @@
 // Author: Andrew Yates
 
 //! Canonical buffer navigation and editing commands.
-//!
-//! `BufferCommand` is the unified action vocabulary for aterm. Every keybinding
-//! maps to a `BufferCommand`; AI agents issue them directly. This enum replaces
-//! both the vi-mode `ViMotion` and the editor `EditorCommand` as the single
-//! lingua franca for buffer interaction.
 
-/// Canonical buffer navigation and editing commands.
-///
-/// Every keybinding maps to one of these. AI agents issue these directly
-/// via the daemon command channel. The terminal grid, editor buffer, and
-/// any future navigable surface all consume `BufferCommand`s.
+/// Canonical buffer navigation and editing command, documented with its emacs/vim binding;
+/// aterm-vi's `ViMotion` converts into it.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BufferCommand {
@@ -188,8 +180,7 @@ pub enum BufferCommand {
     MatchBracket,
 
     // -- Command navigation (shell integration) --
-    /// Jump to the next command output boundary.
-    /// Leverages OSC 133 shell integration marks.
+    /// Jump to the next command output boundary (OSC 133 marks).
     NextCommand,
     /// Jump to the previous command output boundary.
     PreviousCommand,

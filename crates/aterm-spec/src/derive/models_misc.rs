@@ -9,54 +9,36 @@ use super::*;
 
 /// Trail-audio UI→worker handoff and AudioQueue idle lifecycle.
 ///
-/// The event loop may perform only a bounded nonblocking enqueue. The shipping
-/// FIFO has 64 slots; `CommandCap=2` is its finite-state projection, preserving
-/// the only decisions that matter here: an available slot accepts the newest cue,
-/// while a full FIFO leaves all queued cues intact and drops/accounts the newest.
-/// Every device open/start/push belongs to the worker. Once a worker applies a cue,
-/// it resets the exact-silence counter before pause housekeeping can observe it. A
-/// running queue owns exactly one low-rate worker timeout, and a successful idle
-/// pause (or explicit start failure) disarms it. This is a safety model: the audio
-/// device may fail, but failure is explicit and cannot turn every future keystroke
-/// into another synchronous platform call.
+/// The event loop may only do a bounded nonblocking enqueue. The shipping FIFO has 64 slots;
+/// `CommandCap=2` is its finite-state projection: an available slot accepts the newest cue,
+/// and a full FIFO keeps every queued cue and drops (and counts) the newest. Every device
+/// open/start/push belongs to the worker. A worker that applies a cue resets the exact-silence
+/// counter before pause housekeeping can observe it. A running queue owns exactly one low-rate
+/// worker timeout, which a successful idle pause (or explicit start failure) disarms. The
+/// device may fail, but failure is explicit and cannot turn every later keystroke into another
+/// synchronous platform call.
 ///
-/// `Buggy=1` combines the regression family deliberately: the UI touches the
-/// platform while enqueuing, blocks and omits drop accounting on a full queue,
-/// and a cue applied to an already-running device retains the pre-cue silence
-/// threshold. It also carries one slip per remaining law:
-/// * the idle pause keeps its housekeeping timeout armed — the loop choosing
-///   `recv_timeout` on `output.is_some()` instead of `is_running()`, so a
-///   paused worker polls forever (`RunningOwnsOneDeadline`);
-/// * exhaustion latches `STATE_FAILED` but the loop does not `return`, so its
-///   receiver stays alive: ingress stays open and the next cue reopens the
-///   device (`StartFailureIsExplicitAndTerminal`). Both guards read
-///   `failed <= Buggy`, which over the 0..1 flag is `failed == 0` at the
-///   committed config;
-/// * the mailbox is built with `mpsc::channel()` where `4b7e0efc0` wrote
-///   `sync_channel(COMMAND_CAPACITY)` — one token, and an unbounded FIFO that
-///   admits a cue past capacity instead of dropping it
-///   (`WorkerMailboxIsBounded`; `PushCueAvailable`'s guard admits one slot
-///   more). The Tier-1 `shipping_ingress_conforms_to_bounded_drop_newest_model`
-///   fills the real 64 slots and sees the 65th dropped, not queued.
+/// `Buggy=1` combines the defects: the UI touches the platform while enqueuing, blocks and
+/// omits drop accounting on a full queue, and a cue applied to a running device keeps the
+/// pre-cue silence count. One slip per remaining law:
+/// * the idle pause keeps its housekeeping timeout armed (the loop choosing `recv_timeout` on
+///   `output.is_some()` instead of `is_running()`, so a paused worker polls for ever;
+///   `RunningOwnsOneDeadline`);
+/// * exhaustion latches `STATE_FAILED` but the loop does not `return`, so its receiver lives,
+///   ingress stays open and the next cue reopens the device
+///   (`StartFailureIsExplicitAndTerminal`; both guards read `failed <= Buggy`, which over the
+///   0..1 flag is `failed == 0` at the committed config);
+/// * an unbounded `mpsc::channel()` in place of `sync_channel(COMMAND_CAPACITY)`, which admits
+///   a cue past capacity instead of dropping it (`WorkerMailboxIsBounded`; `PushCueAvailable`'s
+///   guard admits one slot more). The Tier-1
+///   `shipping_ingress_conforms_to_bounded_drop_newest_model` fills the real 64 slots and sees
+///   the 65th dropped.
 ///
-/// THE REOPEN LADDER IS A SIBLING MACHINE. The shipping worker does not treat
-/// one device fault as terminal: a failed open, a
-/// failed start/enqueue, a faulted callback, a stalled one or a queue
-/// AudioToolbox stopped under us (the `kAudioQueueProperty_IsRunning`
-/// listener, which feeds the same fault verdict) spends one of
-/// `REOPEN_BUDGET` device reopens, and only EXHAUSTION latches
-/// `STATE_FAILED` and seals ingress. In THIS machine that whole ladder is
-/// abstracted as its end: `WorkerStartFails` is the exhausting fault, and
-/// `StartFailureIsExplicitAndTerminal` stays true of the shipping code
-/// because the state it names is still reached and still terminal. What
-/// happens between the first fault and exhaustion — the budget, the backoff
-/// window, the reset that only a device which PLAYED for a healthy window
-/// earns — is [`trail_audio_reopen_ladder_model`], whose
-/// `RecoveryIsBounded`, `ReopensLeftIsTruthful` and
-/// `SilenceIsPermanentOnlyWhenTheBudgetIsSpent` each carry a replayed
-/// historical defect as their `Buggy=1` counterexample and whose Tier-1
-/// conformance drives the real `RetryState`, `reopen_after_fault` and
-/// `worker_loop`.
+/// One device fault is not terminal: a failed open, start or enqueue, a faulted or stalled
+/// callback, or a queue AudioToolbox stopped (the `kAudioQueueProperty_IsRunning` listener)
+/// each spend one of `REOPEN_BUDGET` reopens, and only exhaustion latches `STATE_FAILED` and
+/// seals ingress. Here that ladder is abstracted as its end (`WorkerStartFails`, the exhausting
+/// fault); [`trail_audio_reopen_ladder_model`] is the ladder itself.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn trail_audio_lifecycle_model() -> Model {
@@ -152,7 +134,7 @@ pub fn trail_audio_lifecycle_model() -> Model {
             }
 
             invariant WorkerMailboxIsBounded: queued <= CommandCap;
-            invariant DropAccountingIsBounded: dropped <= DropCap;
+            bound DropAccountingIsBounded: dropped <= DropCap;
             invariant FullIngressDropsNewest:
                 if last_full == 1 {
                     queued == CommandCap && dropped > 0
@@ -169,10 +151,9 @@ pub fn trail_audio_lifecycle_model() -> Model {
                 };
             invariant RunningOwnsOneDeadline:
                 if running == 1 { service_deadline == 1 } else { service_deadline == 0 };
-            // No "idle pause disarms" law: PauseIdle is the one writer of
-            // `paused = 1` and writes `running = 0` from `silent == SilentCap`,
-            // every writer of `running = 1` clears `paused`, so its deadline
-            // half is RunningOwnsOneDeadline at `running = 0`.
+            // No "idle pause disarms" law: `PauseIdle`, the one writer of `paused = 1`, writes
+            // `running = 0`, and every writer of `running = 1` clears `paused`, so it is
+            // `RunningOwnsOneDeadline` at `running = 0`.
             invariant StartFailureIsExplicitAndTerminal:
                 if failed == 1 {
                     running == 0 && queued == 0 && service_deadline == 0
@@ -183,33 +164,25 @@ pub fn trail_audio_lifecycle_model() -> Model {
     }
 }
 
-/// AudioQueue buffer ownership and first-audible-buffer latency across cold
-/// start and idle resume.
+/// AudioQueue buffer ownership and first-audible-buffer latency across cold start and idle
+/// resume.
 ///
-/// The three queue buffers are allocated but AVAILABLE while stopped. A cue is
-/// applied before the worker renders and enqueues all three, so the first
-/// audible samples occupy buffer 1 (`MaxAudibleBuffer`), not buffer 4 behind
-/// three silent priming buffers. Idle uses synchronous immediate stop/reset:
-/// callback recycling is disabled first, and all scheduled buffers are
-/// reclaimed before a resume prime can write them. That the parked worker
-/// holds no timeout is not this machine's: it is
-/// [`trail_audio_lifecycle_model`]'s `RunningOwnsOneDeadline`, whose Tier-1
-/// bind watches the real `worker_loop` stop ticking; the fake queue here has
-/// no worker to wake.
+/// The three queue buffers are allocated but available while stopped. A cue is applied before
+/// the worker renders and enqueues all three, so the first audible samples occupy buffer 1
+/// (`MaxAudibleBuffer`), not buffer 4 behind three silent priming buffers. Idle uses a
+/// synchronous immediate stop/reset: callback recycling is disabled first, and every scheduled
+/// buffer is reclaimed before a resume prime can write it. That the parked worker holds no
+/// timeout is [`trail_audio_lifecycle_model`]'s `RunningOwnsOneDeadline`; the fake queue here
+/// has no worker to wake.
 ///
-/// `Buggy=1` reproduces both dangerous alternatives around the regression: the
-/// retired pre-enqueued/pause-retained silence puts sound in buffer 4, while a
-/// naive attempt to overwrite those still-scheduled pointers on resume records
-/// an ownership violation. It also removes the enqueue/stop gate, admitting a
-/// stop while the callback is inside its queue-enqueue critical section. The
-/// shipping `stop_and_reclaim` refuses exactly that stop (`false`, every buffer
-/// still queued); the mutant ignores the refusal, and its books mark all three
-/// buffers AVAILABLE while the queue still owns them
-/// (`BufferOwnershipConserved`). Only the refused stop miscounts: with no
-/// enqueue in flight the retired pause keeps its buffers queued and its books
-/// say so. Tier-1 binding:
-/// `audio_queue_post_cue_prime_conforms_with_callback_free_fake` drives the
-/// shipping generic prime/stop helpers with an ownership-checking fake queue.
+/// `Buggy=1` has both dangerous alternatives: pre-enqueued, pause-retained silence puts sound
+/// in buffer 4, and overwriting those still-scheduled pointers on resume is an ownership
+/// violation. It also removes the enqueue/stop gate, admitting a stop while the callback is
+/// inside its enqueue critical section: the shipping `stop_and_reclaim` refuses that stop
+/// (`false`, every buffer still queued), while the mutant ignores the refusal and marks all
+/// three buffers available while the queue owns them (`BufferOwnershipConserved`). Tier-1:
+/// `audio_queue_post_cue_prime_conforms_with_callback_free_fake` drives the shipping
+/// prime/stop helpers with an ownership-checking fake queue.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn trail_audio_start_latency_model() -> Model {
@@ -259,11 +232,9 @@ pub fn trail_audio_start_latency_model() -> Model {
             action CallbackEnqueueEnds when (phase == 3 && enqueue_in_flight == 1) {
                 enqueue_in_flight = 0;
             }
-            // With both values bounded to 0..1, `enqueue_in_flight <= Buggy`
-            // is exactly `Buggy == 1 OR enqueue_in_flight == 0`, expressed in
-            // the intentionally small ty_model expression grammar.
-            // Buggy: the retired pause keeps its buffers queued (and says so),
-            // while the refused mid-enqueue stop's books free them anyway.
+            // Over 0..1, `enqueue_in_flight <= Buggy` is `Buggy == 1 || enqueue_in_flight == 0`.
+            // Buggy: the pause keeps its buffers queued (and says so), while a refused
+            // mid-enqueue stop's books free them anyway.
             action StopIdle when (phase == 3 && enqueue_in_flight <= Buggy) {
                 phase = 4;
                 available = if Buggy == 1 && enqueue_in_flight == 0 { 0 } else { BufferCount };
@@ -307,79 +278,61 @@ pub fn trail_audio_start_latency_model() -> Model {
             // No "idle is callback-free" law: `StopIdle` is phase 4's only
             // entry and writes `running`, `recycling` and `enqueue_in_flight`
             // to zero at every `Buggy`, and `ParkIdle` writes none of them.
-            invariant PhaseBounded: phase <= 8;
+            bound PhaseBounded: phase <= 8;
         }
     }
 }
 
-/// The typing-sound SEAM: which ticks leave a keystroke HEARD, and whether
-/// the `tone` verb's answer agrees with the key path.
+/// The typing-sound seam: which ticks leave a keystroke heard, and whether the `tone` verb's
+/// answer agrees with the key path.
 ///
-/// Two writers and two readers share one bit. The WRITER is
-/// `CursorGlow::tick`, which leaves `sound_live` open or closed on every
-/// frame; the READERS are the key path (`keystroke_click_audible` then
-/// `CursorGlow::cue_keystroke_shifted`, which records nothing unless the
-/// seam is open) and the `aterm ctl tone` verb (`sound_seam`, which names the
-/// gate that closed it). Each tick action is one CLASS of host config, as
-/// `App::cursor_frame` folds it (`sound_seam::fold_window_audibility`):
+/// One writer and two readers share one bit. The writer is `CursorGlow::tick`, which leaves
+/// `sound_live` open or closed on every frame; the readers are the key path
+/// (`keystroke_click_audible` then `CursorGlow::cue_keystroke_shifted`, which records nothing
+/// unless the seam is open) and the `aterm ctl tone` verb (`sound_seam`, which names the gate
+/// that closed it). Each tick action is one class of host config, as `App::cursor_frame` folds
+/// it (`sound_seam::fold_window_audibility`):
 ///
-/// * `TickLit` — master on, the window focused, amplitude nonzero.
-/// * `TickDarkMotion` — dark ONLY because of a motion policy: macOS Reduce
-///   Motion / `motion = "reduced"` (D2) or the load-shed envelope (D1).
+/// * `TickLit`: master on, the window focused, amplitude nonzero.
+/// * `TickDarkMotion`: dark only because of a motion policy (macOS Reduce Motion,
+///   `motion = "reduced"`, or the load-shed envelope).
+/// * `TickDarkUnfocused`: dark because the key belongs to another window.
+/// * `TickDarkUserOff`: dark because the person set the aurora's own brightness knob to zero.
+/// * `TickMasterOff`: `cursor_trail = false` or serious mode.
 ///
-/// A tick class is the HOST's config class, whatever the engine then does
-/// with it: every style (the classic wake included) and every grid (a
-/// degenerate one included, whose tick draws nothing) must answer each
-/// class the same way, and the Tier-1 conformance drives them all.
-/// * `TickDarkUnfocused` — dark because the key belongs to another window.
-/// * `TickDarkUserOff` — dark because the person set the aurora's own
-///   brightness knob to zero (binding decision C: their explicit off).
-/// * `TickMasterOff` — `cursor_trail = false` or serious mode.
+/// A tick class is the host's config class whatever the engine then does: every style (the
+/// classic wake included) and every grid (a degenerate one too) must answer each class the
+/// same way, and the Tier-1 conformance drives them all.
 ///
-/// `key` and `tone` are what the two readers answered SINCE the last tick
-/// (`0` not asked, `1` heard / `open`, `2` refused / `closed:<named gate>`,
-/// `3` `closed:engine-silent`); every tick clears them, so each invariant
-/// relates a reader's answer to the config class of the tick it read.
+/// `key` and `tone` are what the two readers answered since the last tick (`0` not asked, `1`
+/// heard / `open`, `2` refused / `closed:<named gate>`, `3` `closed:engine-silent`); every tick
+/// clears them, so each invariant relates a reader's answer to the tick it read.
 ///
-/// The owner's rulings, as invariants: a key pressed while the ONLY
-/// darkness is a motion or performance policy is heard
-/// (`FocusedKeyIsHeard`); a key in an unfocused window, with the aurora
-/// dimmed to zero, or with the master off is not (`ForeignKeyIsSilent`);
-/// the verb and the key path never disagree (`ToneAgreesWithTheKey`); and
-/// `closed:engine-silent` — the sensor for a FUTURE policy re-subordinating
-/// audio — is unreachable while every closed gate has a name
-/// (`EngineSilentIsUnreachable`). That last one is a claim about a window
-/// that has run a frame: the model's `Tone` is only ever asked after a tick
-/// in the conformance, and before a window's first frame the real verb
-/// does say `engine-silent` (no config gate explains a seam no tick has
-/// resolved), which the conformance pins as a separate reading rather than
-/// substituting one.
+/// Invariants: a key pressed while the only darkness is a motion or performance policy is
+/// heard (`FocusedKeyIsHeard`); a key in an unfocused window, with the aurora dimmed to zero,
+/// or with the master off is not (`ForeignKeyIsSilent`); the verb and the key path never
+/// disagree (`ToneAgreesWithTheKey`); and `closed:engine-silent`, the sensor for a future
+/// policy that re-subordinates audio, is unreachable while every closed gate has a name
+/// (`EngineSilentIsUnreachable`). That last holds for a window that has run a frame: before
+/// its first frame the real verb does say `engine-silent` (no config gate explains a seam no
+/// tick has resolved), which the conformance pins as a separate reading.
 ///
-/// There are NO action guards: every tick class and both readers are
-/// enabled in every state, so no invariant can hold merely because a guard
-/// made its counterexample unreachable (the recorded vacuous-guard-conjunct
-/// gap). Every decision lives in an update, which is what the Tier-1
-/// conformance binds.
+/// There are no action guards: every tick class and both readers are enabled in every state,
+/// so no invariant can hold merely because a guard made its counterexample unreachable. Every
+/// decision lives in an update, which is what the Tier-1 conformance binds.
 ///
-/// `Buggy=1` combines three defects, each on its own action so none masks
-/// another: the original law (`TickDarkMotion` closes the seam, as an
-/// unconditional zero-amplitude return did), the naive
-/// over-correction (`TickDarkUnfocused` opens it — `sound_live = true` on
-/// every dark return), and the verb's pre-fix read of `trail_on` as
-/// `GlowConfig::enabled` alone, which reports a user-dimmed aurora as
-/// `closed:engine-silent`.
+/// `Buggy=1` combines three defects, each on its own action: `TickDarkMotion` closing the seam
+/// (an unconditional zero-amplitude return), `TickDarkUnfocused` opening it
+/// (`sound_live = true` on every dark return), and the verb reading `trail_on` as
+/// `GlowConfig::enabled` alone, which reports a user-dimmed aurora as `closed:engine-silent`.
 ///
-/// Tier-1: `aterm-gui/src/sound_seam_conformance.rs` drives the real
-/// resolver, the real `MotionPolicy::resolve`, the real host fold, the real
-/// `CursorGlow::tick` on all eleven styles and four grids, the real key
-/// seam, and the verb's own input constructor into the real `sound_seam`
-/// table, over the whole host input domain; it rejects replays of the
-/// pre-fix fold, the pre-fix verb, the pre-fix classic wake (it wrote no
-/// seam at all) and the pre-fix empty grid (it closed the seam like the
-/// master switch). `app_input`'s `tone_status_tests` bind the verb's call
-/// site. NOT modelled: the host's own sound knobs (`trail_sounds`, volume,
-/// resize-quiet, the audio host), which `Key` pins open and the
-/// `sound_seam` table tests cover.
+/// Tier-1: `aterm-gui/src/sound_seam_conformance.rs` drives the real resolver,
+/// `MotionPolicy::resolve`, host fold, `CursorGlow::tick` on every style and grid, key seam and
+/// the verb's own input constructor into the real `sound_seam` table over the whole host input
+/// domain, and rejects replays of each defect (and of a classic wake that writes no seam and an
+/// empty grid that closes it like the master switch). `app_input`'s `tone_status_tests` bind
+/// the verb's call site. Not modelled: the host's own sound knobs (`trail_sounds`, volume,
+/// resize-quiet, the audio host), which `Key` pins open and the `sound_seam` table tests cover.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn trail_sound_seam_model() -> Model {
@@ -443,9 +396,8 @@ pub fn trail_sound_seam_model() -> Model {
             action Key {
                 key = if seam == 1 { 1 } else { 2 };
             }
-            // The verb, in `sound_seam`'s precedence: what the user SET
-            // (`trail_on`), then where the user IS (`focused`), then the
-            // engine's bare refusal last.
+            // The verb, in `sound_seam`'s precedence: what the user set (`trail_on`), then
+            // where the user is (`focused`), then the engine's bare refusal.
             action Tone {
                 tone = if master == 0 {
                     2
@@ -489,77 +441,60 @@ pub fn trail_sound_seam_model() -> Model {
     }
 }
 
-/// The audio host's bounded DEVICE-REOPEN ladder (D5): a fault spends one
-/// reopen, a device that genuinely PLAYS through a healthy window hands the
-/// budget back, and only exhaustion is terminal.
+/// The audio host's bounded device-reopen ladder: a fault spends one reopen, a device that
+/// plays through a healthy window hands the budget back, and only exhaustion is terminal.
 ///
-/// The sibling of [`trail_audio_lifecycle_model`], which models ingress, the
-/// idle pause and the terminal failed state; this machine models what
-/// happens BETWEEN a fault and that terminal state — the part the lifecycle
-/// machine abstracts as its single `WorkerStartFails` step. It is the
-/// finite-state projection of `RetryState` + `reopen_after_fault` and the
-/// `worker_loop` call sites that drive them (`aterm-gui/src/trail_audio.rs`):
+/// The sibling of [`trail_audio_lifecycle_model`] (ingress, the idle pause and the terminal
+/// failed state): this machine models what happens between a fault and that terminal state,
+/// which the lifecycle abstracts as `WorkerStartFails`. It projects `RetryState`,
+/// `reopen_after_fault` and the `worker_loop` call sites that drive them
+/// (`aterm-gui/src/trail_audio.rs`):
 ///
-/// * `attempts` is `RetryState::attempts` (the wire's `reopens_left` is
-///   `Budget - attempts`); `Budget` is `REOPEN_BACKOFF.len()`.
-/// * `spent` is the SPEC's own count — reopens scheduled since a device last
-///   delivered after playing through a healthy window — kept independently
-///   of `attempts` so the code's counter can be checked against it. Its
-///   reset law reads `evidence`, never `played`: sharing the code's reset
+/// * `attempts` is `RetryState::attempts` (the wire's `reopens_left` is `Budget - attempts`);
+///   `Budget` is `REOPEN_BACKOFF.len()`.
+/// * `spent` is the spec's own count of reopens scheduled since a device last delivered after
+///   playing through a healthy window, kept apart from `attempts` so the code's counter can be
+///   checked against it. Its reset reads `evidence`, never `played`: sharing the code's reset
 ///   condition would make `attempts == spent` true of any reset law.
-/// * `evidence` is the SPEC's own record of what the device did since the
-///   last scheduled reopen, kept apart from the code's `played` clock: `0`
-///   nothing delivered, `1` delivered, `2` delivered and then the window
-///   elapsed (also the value before any fault, when nothing is owed). The
-///   code's `played` clock and this record agree on the committed machine;
-///   a change to the code's reset law, or to what may start or finish its
-///   clock, makes them disagree, and `ResetOnlyOnPlayedWindow` says so.
-/// * `waiting` is "inside the backoff window" (`!RetryState::ready`). The
-///   schedule's first step is zero and the rest strictly increase, so the
-///   first reopen is immediate, later ones wait, and the LAST wait is the
-///   longest step — which is also the healthy window.
-/// * `played` is the healthy window's clock: WALL time from the first
-///   delivery after the last fault (`RetryState::played_since`), with no
-///   fault detected in between — `0` no delivery since the last fault, `1`
-///   the window is running, `2` it has run out. A delivery is a successful
-///   enqueue and start (`Delivery::Sounded`). A device that stops its queue
-///   without flagging a fault is not seen as a fault here, so the window can
-///   run over time the device was idle; the IsRunning-listener lane is what
+/// * `evidence` is the spec's own record of what the device did since the last scheduled
+///   reopen, kept apart from the code's `played` clock: `0` nothing delivered, `1` delivered,
+///   `2` delivered and then the window elapsed (also the value before any fault). The two agree
+///   on the committed machine; a change to the code's reset law, or to what starts or finishes
+///   its clock, makes them disagree, and `ResetOnlyOnPlayedWindow` says so.
+/// * `waiting` is inside the backoff window (`!RetryState::ready`). The schedule's first step
+///   is zero and the rest strictly increase, so the first reopen is immediate and the last
+///   wait is the longest step, which is also the healthy window.
+/// * `played` is the healthy window's clock: wall time from the first delivery after the last
+///   fault (`RetryState::played_since`) with no fault since; `0` no delivery since the last
+///   fault, `1` running, `2` run out. A delivery is a successful enqueue and start
+///   (`Delivery::Sounded`). A device that stops its queue without flagging a fault is not seen
+///   as one here, so the window can run over idle time; the IsRunning-listener lane is what
 ///   would make it true play time.
-/// * `stale` is the clock the pre-fix reset read instead: time since the
-///   last fault has reached the window's length.
+/// * `stale` is the clock a fault-anchored reset would read: time since the last fault has
+///   reached the window's length.
 ///
-/// Actions: `Cue` (a cue reaches a worker holding no device: it opens one,
-/// or is dropped and counted inside the window or against sealed ingress),
-/// `CueSounds` (a delivery — `RetryState::delivered`), `DeviceFaults` (a
-/// failed open, a failed start or enqueue, a faulted or stalled callback:
-/// the ONE handler, which schedules a reopen or reports exhaustion), and
-/// the three clock actions. Every DECISION the invariants depend on lives
-/// in an UPDATE: the reason is the recorded vacuous-guard-conjunct gap, and
-/// the Tier-0 guard-conjunct audit (`derived_trail_sound_ty.rs`) refused two
-/// guards the first draft of this machine had, each of which carried
-/// `SilenceIsPermanentOnlyWhenTheBudgetIsSpent` by premise. What guards
-/// remain are ENVIRONMENT facts — a clock can only run out once it started,
-/// a worker that exited touches no platform — and the audit lists each one
-/// with what it carries; the Tier-1 conformance binds every guard to the
-/// real predicate (`Model::action_enabled` against the real ladder, in
-/// every visited configuration).
+/// Actions: `Cue` (a cue reaches a worker holding no device: it opens one, or is dropped and
+/// counted inside the window or against sealed ingress), `CueSounds` (a delivery,
+/// `RetryState::delivered`), `DeviceFaults` (a failed open, start or enqueue, a faulted or
+/// stalled callback: the one handler, which schedules a reopen or reports exhaustion), and the
+/// three clock actions. Every decision the invariants depend on lives in an update: the Tier-0
+/// guard-conjunct audit (`derived_trail_sound_ty.rs`) refuses guards that carry an invariant by
+/// premise. The guards that remain are environment facts (a clock can only run out once
+/// started, a worker that exited touches no platform), and the Tier-1 conformance binds each
+/// to the real predicate (`Model::action_enabled` against the real ladder in every visited
+/// configuration).
 ///
-/// `Buggy=1` replays three defects, scoped so none masks another: an OPEN
-/// failure is terminal on the spot (the pre-D5 law, "one fault is
-/// forever"); a successful open inside the window resets the ladder (the
-/// first draft of D5, which a device that constructs and never plays
-/// defeated); and a delivery once the FAULT is stale resets it (the shipped
-/// D5 law until this machine's conformance found it: the window was
-/// measured from the fault, and since the last wait IS the window, the
-/// first delivery after the final reopen handed the whole budget back, so a
-/// device that plays one block and stalls cycled the ladder forever).
+/// `Buggy=1` replays three defects, scoped so none masks another: an open failure terminal on
+/// the spot ("one fault is for ever"); a successful open inside the window resetting the
+/// ladder (defeated by a device that constructs and never plays); and a delivery once the
+/// fault is stale resetting it (with the window measured from the fault, and the last wait
+/// being the window, the first delivery after the final reopen hands the whole budget back, so
+/// a device that plays one block and stalls cycles the ladder for ever).
 ///
-/// Tier-1: `aterm-gui/src/trail_audio_reopen_conformance.rs` drives the
-/// real `RetryState`/`reopen_after_fault` exhaustively on a fabricated
-/// clock with the SHIPPING schedule (two-way: every model state is reached),
-/// and validates traces of the real `worker_loop` against this machine,
-/// with replays of each defect as negative controls.
+/// Tier-1: `aterm-gui/src/trail_audio_reopen_conformance.rs` drives the real
+/// `RetryState`/`reopen_after_fault` exhaustively on a fabricated clock with the shipping
+/// schedule (two-way: every model state is reached), and validates traces of the real
+/// `worker_loop` against this machine, with each defect replayed as a negative control.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn trail_audio_reopen_ladder_model() -> Model {
@@ -578,10 +513,9 @@ pub fn trail_audio_reopen_ladder_model() -> Model {
             // Nothing is owed before the first fault.
             var evidence = 2;
 
-            // A cue after exhaustion meets SEALED ingress and opens nothing.
-            // That law is in the update, not in a `failed == 0` guard: as a
-            // guard it carried `SilenceIsPermanentOnlyWhenTheBudgetIsSpent`
-            // by premise, and a premise is not something the conformance can
+            // A cue after exhaustion meets sealed ingress and opens nothing. The law is in the
+            // update: as a `failed == 0` guard it would carry
+            // `SilenceIsPermanentOnlyWhenTheBudgetIsSpent` by premise, which no conformance can
             // refute.
             action Cue when (device == 0) {
                 device = if failed == 1 || waiting == 1 { 0 } else { 1 };
@@ -591,10 +525,9 @@ pub fn trail_audio_reopen_ladder_model() -> Model {
                     attempts
                 };
             }
-            // THE RESET LAW, stated in the update: the ladder is handed back
-            // only on evidence that a device PLAYED through the window. As a
-            // `device == 1` guard it too carried the terminal law by premise,
-            // so the action is unguarded and a delivery with no device
+            // The reset law, in the update: the ladder is handed back only on evidence the
+            // device played through the window. As a `device == 1` guard it would carry the
+            // terminal law by premise, so the action is unguarded and a delivery with no device
             // changes nothing.
             action CueSounds {
                 attempts = if device == 1 && played == 2 {
@@ -602,7 +535,7 @@ pub fn trail_audio_reopen_ladder_model() -> Model {
                 } else {
                     if Buggy == 1 && device == 1 && stale == 1 { 0 } else { attempts }
                 };
-                // THE SPEC'S reset law: on evidence, not on the code's clock.
+                // The spec's reset law: on evidence, not on the code's clock.
                 spent = if device == 1 && evidence == 2 { 0 } else { spent };
                 evidence = if device == 1 && evidence == 0 { 1 } else { evidence };
                 played = if device == 1 && played == 2 {
@@ -640,8 +573,8 @@ pub fn trail_audio_reopen_ladder_model() -> Model {
                         waiting
                     }
                 };
-                // A SCHEDULED reopen restarts both clocks; exhaustion returns
-                // before touching either (`reopen_after_fault`).
+                // A scheduled reopen restarts both clocks; exhaustion returns before touching
+                // either (`reopen_after_fault`).
                 played = if Buggy == 1 && device == 0 {
                     played
                 } else {
@@ -662,7 +595,7 @@ pub fn trail_audio_reopen_ladder_model() -> Model {
             }
             action BackoffElapses when (waiting == 1) {
                 waiting = 0;
-                // The LAST wait is the schedule's longest step: the window.
+                // The last wait is the schedule's longest step: the window.
                 stale = if attempts == Budget { 1 } else { stale };
             }
             action StaleElapses when (stale == 0) {
@@ -679,8 +612,8 @@ pub fn trail_audio_reopen_ladder_model() -> Model {
             invariant ReopensLeftIsTruthful: attempts == spent;
             invariant SilenceIsPermanentOnlyWhenTheBudgetIsSpent:
                 if failed == 1 { attempts == Budget } else { failed == 0 };
-            // The ladder is only ever handed back on evidence the device
-            // PLAYED through a healthy window since the last reopen.
+            // The ladder is handed back only on evidence the device played through a healthy
+            // window since the last reopen.
             invariant ResetOnlyOnPlayedWindow:
                 if attempts == 0 { evidence == 2 } else { evidence <= 2 };
         }
@@ -689,15 +622,13 @@ pub fn trail_audio_reopen_ladder_model() -> Model {
 
 /// Tab-stop checkpoint preservation across a narrow seamless handoff.
 ///
-/// Grid width and tab-stop backing length are deliberately different: shrinking
-/// a terminal keeps bounded stops beyond the visible width so a later grow has
-/// the same tab semantics. A carried projection is admitted exactly when it
-/// covers the current columns and remains within the protocol maximum. The
-/// mutant truncates backing storage at shrink/restore and loses the off-width
-/// custom stop. It is also the `restore_tab_stops` from before `46fc93f5a`,
-/// which admitted a projection of ANY length and copied whatever prefix
-/// overlapped the destination's own stops: an undersize vector was applied over
-/// the defaults and an oversize one truncated, where the fix rejects both
+/// Grid width and tab-stop backing length differ on purpose: shrinking a terminal keeps
+/// bounded stops beyond the visible width so a later grow has the same tab semantics. A
+/// carried projection is admitted exactly when it covers the current columns and stays within
+/// the protocol maximum. The mutant truncates backing storage at shrink/restore, losing the
+/// off-width custom stop, and admits a projection of any length, copying whatever prefix
+/// overlaps the destination's stops (an undersize vector applied over the defaults, an
+/// oversize one truncated), where `restore_tab_stops` rejects both
 /// (`AdmissionIsCoveringAndBounded`, `InvalidProjectionIsNeverAdmitted`).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
@@ -777,8 +708,8 @@ pub fn tab_stop_handoff_model() -> Model {
                 phase = 9;
                 carried_len = MaxCols + 1;
             }
-            // Buggy: the pre-`46fc93f5a` restore admits the invalid vector and
-            // copies its overlapping prefix into the destination's own stops.
+            // Buggy: the restore admits the invalid vector and copies its overlapping prefix
+            // into the destination's own stops.
             action RejectUndersizeProjection when (
                 phase == 9 && carried_len <= Narrow - 1
             ) {
@@ -841,15 +772,13 @@ pub fn tab_stop_handoff_model() -> Model {
 
 /// Event-loop lane-isolation contract for bulk scrollback maintenance.
 ///
-/// Ordinary PTY output is latency-critical and must never begin a terminal scan,
-/// take a blocking lock, or perform eviction. The explicitly delivered OS-memory-
-/// pressure event is the sole bulk-work capability. The allocator/evictor is
-/// abstracted behind `unbounded_work` and `mutation`; this property is about event
-/// routing, not a claim that emergency reclamation itself has a small bound. The
-/// mutant reintroduces the historical defect by admitting output directly into
-/// the bulk lane: the amortized `enforce_global_scrollback_cap` that `46fc93f5a`
-/// removed from the output-wake arm scanned every session, took their locks and
-/// EVICTED mid-scan, so all four capabilities fire on ordinary output and the
+/// Ordinary PTY output is latency-critical and must never begin a terminal scan, take a
+/// blocking lock, or evict. The explicitly delivered OS memory-pressure event is the sole
+/// bulk-work capability. The allocator/evictor is abstracted behind `unbounded_work` and
+/// `mutation`; this is about event routing, not a bound on emergency reclamation itself. The
+/// mutant admits output directly into the bulk lane (an amortized
+/// `enforce_global_scrollback_cap` on the output-wake arm, which scans every session, takes
+/// their locks and evicts mid-scan), so all four capabilities fire on ordinary output and the
 /// eviction lands with no completed pressure trim behind it
 /// (`MutationRequiresCompletedPressureTrim`).
 #[must_use]
@@ -923,20 +852,16 @@ pub fn scrollback_maintenance_lane_model() -> Model {
 
 /// History-retention contract for a full-width, top-anchored partial scroll.
 ///
-/// Terminal UIs such as Codex keep status/input rows below a DECSTBM region and
-/// scroll committed transcript lines through row zero. Such a scroll archives
-/// exactly the displaced row when primary-screen history is enabled, while an
-/// interior region, a horizontally margined rectangle, or a history-free
-/// alternate-screen grid remains ephemeral. Rows below the vertical margin are
-/// preserved in every regime. The mutant is the historical aterm behavior: it
-/// silently drops the eligible displaced row merely because the region is not
-/// full-height. Its scroll also runs to the SCREEN bottom instead of the DECSTBM
-/// bottom margin, in every regime, displacing the fixed footer
-/// (`FixedFooterIsPreserved`). That slip is hypothetical, not a shipped defect.
-/// `footer` is a flag only the slip writes, so at Tier-0 the law is the flag;
-/// what gives it content is the Tier-1 bind, which reads `footer` off the real
-/// grid's bottom row and replays the slip as a real interior scroll whose bottom
-/// margin is the screen bottom.
+/// Terminal UIs such as Codex keep status/input rows below a DECSTBM region and scroll
+/// committed transcript lines through row zero. Such a scroll archives exactly the displaced
+/// row when primary-screen history is enabled, while an interior region, a horizontally
+/// margined rectangle, or a history-free alternate-screen grid stays ephemeral. Rows below the
+/// vertical margin are preserved in every regime. The mutant drops the eligible displaced row
+/// because the region is not full-height, and its scroll runs to the screen bottom instead of
+/// the DECSTBM bottom margin, displacing the fixed footer (`FixedFooterIsPreserved`; a
+/// hypothetical slip). `footer` is a flag only the slip writes, so at Tier-0 the law is the
+/// flag; the Tier-1 bind gives it content by reading `footer` off the real grid's bottom row
+/// and replaying the slip as a real interior scroll whose bottom margin is the screen bottom.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn top_anchored_scroll_history_model() -> Model {
@@ -953,15 +878,12 @@ pub fn top_anchored_scroll_history_model() -> Model {
             var selection_alive = 1;
             var selection_region_row = 2;
             var selection_footer_row = 4;
-            // SELECTION CUSTODY Phase 4: whether the selection lies OUTSIDE the rows
-            // this scroll damages. Chosen alongside the regime below, because the two
-            // together are what decide the selection's fate — and before Phase 4 the
-            // model could not express the question at all.
+            // Whether the selection lies outside the rows this scroll damages: with the
+            // regime, it decides the selection's fate.
             var selection_disjoint = 0;
 
-            // Split into DISJOINT / OVERLAPPING flavours rather than adding a phase:
-            // renumbering phases would touch every invariant in this model, while a
-            // second dimension on the existing choice keeps `phase == 2` tests intact.
+            // Disjoint/overlapping flavours of each regime rather than a new phase, so the
+            // `phase == 2` tests stay intact.
             action ChooseArchivalOverlapping when (phase == 0) {
                 phase = 1;
                 top = 0;
@@ -1030,11 +952,10 @@ pub fn top_anchored_scroll_history_model() -> Model {
                 } else {
                     footer_anchor
                 };
-                // An interior or margined scroll damages only ITS rows, so a
-                // selection disjoint from them survives (a status-bar repaint must
-                // not destroy a highlight in scrollback). An OVERLAPPING selection
-                // still clears in both variants: over-clearing is safe, a stale
-                // highlight over replaced content is not.
+                // An interior or margined scroll damages only its rows, so a disjoint
+                // selection survives (a status-bar repaint must not destroy a highlight in
+                // scrollback). An overlapping one clears in every regime: over-clearing is
+                // safe, a stale highlight over replaced content is not.
                 selection_alive = if top == 0 && full_width == 1 && history_enabled == 1 {
                     if Buggy == 1 { 0 } else { selection_alive }
                 } else if selection_disjoint == 1 {
@@ -1042,11 +963,8 @@ pub fn top_anchored_scroll_history_model() -> Model {
                 } else {
                     0
                 };
-                // The remap is what a splice does to rows ABOVE its boundary — i.e.
-                // to a selection the scrolled region actually covers. A selection
-                // BELOW the region does not move, archival regime or not, so
-                // `selection_disjoint` governs here too: `adjust_for_row_splice`
-                // does not shift a selection under the boundary.
+                // The remap moves only a selection above the splice's boundary, one the
+                // scrolled region covers; `adjust_for_row_splice` leaves one below it alone.
                 selection_region_row = if top == 0 && full_width == 1 && history_enabled == 1
                     && selection_disjoint == 0 {
                     if Buggy == 1 { selection_region_row } else { selection_region_row - 1 }
@@ -1073,8 +991,8 @@ pub fn top_anchored_scroll_history_model() -> Model {
                 } else {
                     footer_anchor == 0
                 };
-            // A selection survives iff it was piecewise-remapped (the archival
-            // regime) OR it was disjoint from the damage.
+            // A selection survives iff it was piecewise-remapped (the archival regime) or was
+            // disjoint from the damage.
             invariant EligibleSelectionUsesPiecewiseRemap:
                 if phase == 2 && top == 0 && full_width == 1 && history_enabled == 1
                     && selection_disjoint == 0 {
@@ -1090,7 +1008,7 @@ pub fn top_anchored_scroll_history_model() -> Model {
                     selection_alive == 1 && selection_region_row == 2 &&
                     selection_footer_row == 4
                 };
-            invariant StateIsBounded:
+            bound StateIsBounded:
                 phase <= 2 && top <= 1 && full_width <= 1 &&
                 history_enabled <= 1 && history_len <= 1 && footer <= 1 &&
                 footer_anchor <= 1 && selection_alive <= 1 &&
@@ -1201,7 +1119,7 @@ pub fn manual_config_diagnostics_lane_model() -> Model {
             invariant StaleCompletionNeverPublishes: stale_published == 0;
             invariant PublicationIsCurrentOrEmpty:
                 published_revision == 0 || published_revision == current_revision;
-            invariant RevisionsBounded:
+            bound RevisionsBounded:
                 current_revision <= MaxRevision &&
                 channel_revision <= MaxRevision && active_revision <= MaxRevision &&
                 pending_revision <= MaxRevision && completed_revision <= MaxRevision &&
@@ -1245,7 +1163,7 @@ pub fn font_catalog_generation_model() -> Model {
             invariant StaleCompletionNeverPublishes: stale_published == 0;
             invariant PublicationIsCurrentOrEmpty:
                 published == 0 || published == requested;
-            invariant GenerationsBounded:
+            bound GenerationsBounded:
                 requested <= 2 && completed <= 2 && published <= 2;
         }
     }
@@ -1258,10 +1176,9 @@ pub fn font_catalog_generation_model() -> Model {
 /// projections derived from those admitted bytes. Later pathname replacement
 /// or ABA restoration may move `live`, but cannot alter either projection.
 ///
-/// `Buggy=1` reproduces the former TOCTOU shape: `Publish` re-reads `live` for
-/// the fingerprint instead of retaining the value produced by `Read`. A
-/// mutation after admission then publishes a consumer from one generation with
-/// another generation's fingerprint.
+/// `Buggy=1` is the TOCTOU shape: `Publish` re-reads `live` for the fingerprint instead of
+/// keeping the value `Read` produced, so a mutation after admission publishes a consumer from
+/// one generation with another generation's fingerprint.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn path_feed_snapshot_model() -> Model {
@@ -1298,24 +1215,25 @@ pub fn path_feed_snapshot_model() -> Model {
                 } else {
                     1 == 1
                 };
-            invariant Bounds:
+            bound Bounds:
                 live <= 2 && admitted <= 2 && prepared <= 2 &&
                 fingerprint <= 2 && read <= 1 && published <= 1;
         }
     }
 }
 
-/// A theme-catalog generation can overtake an expensive font/config prepare.
-/// The current config observation must be re-prepared against that newer theme
-/// rather than publishing assets derived from the old theme or being dropped.
-/// The mutant publishes the sequence-current but theme-stale completion.
+/// A theme-catalog generation can overtake an expensive font/config prepare. The current config
+/// observation must be re-prepared against that newer theme, neither published with assets
+/// derived from the old theme nor dropped. The mutant publishes the sequence-current but
+/// theme-stale completion.
 ///
-/// Tier-1: aterm-gui's
-/// `overtaking_theme_catalog_conforms_to_font_theme_generation_model`
-/// (`native_font_catalog.rs`) drives this model's whole reachable space on a
-/// real headless App and the worker's real `prepare`, reading back which
-/// completion — and so which theme catalog — the config service ended up
-/// holding, and rejects the pre-theme-generation guard.
+/// The one law is stated over state, not over a flag only the mutant sets: whatever is
+/// published names the current theme generation (`PublishedThemeIsCurrentOrEmpty`).
+///
+/// Tier-1: aterm-gui's `overtaking_theme_catalog_conforms_to_font_theme_generation_model`
+/// (`native_font_catalog.rs`) drives the whole reachable space on a real headless App and the
+/// worker's real `prepare`, reads back which completion (so which theme catalog) the config
+/// service holds, and rejects a guard that ignores the theme generation.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn font_theme_generation_model() -> Model {
@@ -1328,7 +1246,6 @@ pub fn font_theme_generation_model() -> Model {
             var completed_theme = 0;
             var published = 0;
             var published_theme = 0;
-            var stale_published = 0;
 
             action RequestConfig when (requested == 0) { requested = 1; }
             action ThemeChanged when (requested == 1 && theme == 0) { theme = 1; }
@@ -1345,7 +1262,6 @@ pub fn font_theme_generation_model() -> Model {
                 published_theme = if Buggy == 1 {
                     completed_theme
                 } else { published_theme };
-                stale_published = if Buggy == 1 { 1 } else { stale_published };
                 requested = 2;
                 completed = 0;
             }
@@ -1363,10 +1279,9 @@ pub fn font_theme_generation_model() -> Model {
                 completed = 0;
             }
 
-            invariant StaleThemeNeverPublishes: stale_published == 0;
             invariant PublishedThemeIsCurrentOrEmpty:
                 published == 0 || published_theme == theme;
-            invariant GenerationsBounded:
+            bound GenerationsBounded:
                 requested <= 2 && theme <= 1 && completed <= 2 &&
                 completed_theme <= 1 && published <= 2 && published_theme <= 1;
         }
@@ -1381,8 +1296,8 @@ pub fn font_theme_generation_model() -> Model {
 /// tab is frontmost: only genuinely terminal-only actions use that content gate.
 /// This is a menu-model/dispatch contract; the AppKit click relay is bound at its
 /// pure tag/validation seams rather than claiming an automated OS click harness.
-/// The mutant reproduces the v0.53 regression by applying the terminal-tab gate
-/// to `ApplyUpdate`, leaving the visible update row grey and unselectable.
+/// The mutant applies the terminal-tab gate to `ApplyUpdate`, leaving the visible update row
+/// grey and unselectable.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_update_menu_activation_model() -> Model {
@@ -1460,11 +1375,10 @@ pub fn native_update_menu_activation_model() -> Model {
 
 /// Per-window modifier-cache reset at the focus-loss boundary.
 ///
-/// Winit reports modifier snapshots and focus as independent window events. Focus
-/// loss must unconditionally invalidate the previous ambient snapshot, because a
-/// backend may omit the matching key-up. Every SUBSEQUENT snapshot remains
-/// authoritative regardless of the current focus bit: Windows can report the
-/// genuinely held modifiers before `Focused(true)` and need not repeat them.
+/// Winit reports modifier snapshots and focus as independent window events. Focus loss must
+/// unconditionally invalidate the previous ambient snapshot, because a backend may omit the
+/// matching key-up. Every later snapshot stays authoritative whatever the focus bit: Windows
+/// can report the genuinely held modifiers before `Focused(true)` and need not repeat them.
 ///
 /// `Buggy=1` reproduces only the unsafe reset transition: `FocusOut` retains Ctrl.
 #[must_use]
@@ -1514,76 +1428,63 @@ pub fn focus_modifier_cache_model() -> Model {
                 } else {
                     delivered_ctrl == 0
                 };
-            invariant StateBounds:
+            bound StateBounds:
                 focused <= 1 && cached_ctrl <= 1 && fresh_ctrl <= 1 &&
                 delivered_ctrl <= 1;
         }
     }
 }
 
-/// SELECTION CUSTODY: which key events may take the user's reading position.
+/// Selection custody: which key events may take the user's reading position.
 ///
-/// The viewport has two owners. The TAIL-FOLLOWER owns it while
-/// `display_offset == 0`; the USER owns it from the moment a scroll gesture lifts
-/// the view off the bottom. Ownership transfers back on exactly ONE event — a
-/// byte-producing key PRESS, which is what a user means by "start typing and jump
-/// back to the prompt". The selection has one owner, the user, and is dropped only
-/// by that same press or by a deliberate deselect.
+/// The viewport has two owners: the tail-follower while `display_offset == 0`, the user from
+/// the moment a scroll gesture lifts the view off the bottom. Ownership transfers back on
+/// exactly one event, a byte-producing key press ("start typing and jump back to the prompt").
+/// The selection has one owner, the user, and is dropped only by that press or a deliberate
+/// deselect.
 ///
-/// Three event classes must NOT disturb either:
+/// Three event classes must disturb neither:
 ///
-/// * a key RELEASE (a Kitty `REPORT_EVENT_TYPES` key-up is not typing),
-/// * an auto-REPEAT tick (the same held press continuing — re-running the snap at
-///   the ~30 Hz repeat rate destroyed any scroll or selection made mid-hold),
-/// * a bare MODIFIER or lock key (Shift/Control/Alt/Super/Caps…), which is the
-///   first half of ⌘-C and the Shift of a shift-click extend.
+/// * a key release (a Kitty `REPORT_EVENT_TYPES` key-up is not typing),
+/// * an auto-repeat tick (the same held press continuing; snapping at the ~30 Hz repeat rate
+///   destroys any scroll or selection made mid-hold),
+/// * a bare modifier or lock key (Shift/Control/Alt/Super/Caps…), the first half of ⌘-C and
+///   the Shift of a shift-click extend.
 ///
-/// …and neither must OUTPUT: a program writing while the user reads must repin the
-/// offset so the SAME content stays under the eye, never slide the view or hand
-/// the viewport back to the tail-follower. That is the second half of the user's
-/// complaint.
+/// Nor must output: a program writing while the user reads repins the offset so the same
+/// content stays under the eye, never sliding the view or handing it back to the
+/// tail-follower.
 ///
-/// Output and the SELECTION are a different matter, and the distinction is the
-/// whole point of Phase 4: output that REPLACED the selected rows may destroy the
-/// highlight (leaving it painted over new text is what makes a copy return
-/// something the user never selected), and ED 3 / `clear_scrollback` / RIS take
-/// the viewport back outright because the space the offset named is gone. Both are
-/// their own event kinds below rather than exceptions swept under one invariant —
-/// the earlier `OutputNeverTakesCustodyOrSelection` asserted the opposite of what
-/// the engine does and would have licensed deleting the damage test.
+/// Output and the selection differ: output that replaced the selected rows may destroy the
+/// highlight (a highlight over new text makes a copy return something never selected), and
+/// ED 3, `clear_scrollback` and RIS take the viewport back outright because the space the
+/// offset named is gone. Both are their own event kinds below, not exceptions under one
+/// invariant.
 ///
-/// The custody invariants are stated over the OBSERVABLE state — `offset`,
-/// `owner`, `selection` — against a shadow of the pre-action values
-/// (`prev_offset`, `prev_owner`, `prev_selection`) that every action writes from
-/// the pre-state. They deliberately do NOT read a self-reported "this press
-/// disturbed something" flag: such a flag is written by hand at every site, so an
-/// implementation that moved the viewport without setting it would satisfy the
-/// invariant while shipping the bug. Here, moving the viewport IS the violation.
+/// The custody invariants are stated over the observable state (`offset`, `owner`,
+/// `selection`) against a shadow of the pre-action values (`prev_*`) that every action writes
+/// from the pre-state, never over a self-reported "this press disturbed something" flag: a
+/// flag written by hand at every site lets an implementation that moves the viewport without
+/// setting it pass. Here, moving the viewport is the violation.
 ///
-/// `Buggy=1` reproduces the regression FAMILY. Two members are the literal
-/// shipping defect — an inert press and an auto-repeat tick each snap the viewport
-/// and clear the selection, which is what made ⌘-C copy nothing (the ⌘ keydown
-/// destroyed the selection before the `c` arrived). The others are the
-/// neighbouring regressions the same invariants must catch: a release that
-/// disturbs, output that snaps the reader back to live instead of repinning,
-/// output that takes custody while clearing the rows it damaged, and a typing
-/// press that deselects without snapping. Every invariant here except the two
-/// state-consistency guards (`TailOwnerAtBottom`, `StateBounds`) is falsified by
-/// one of them, and `derived_ring_ty.rs` checks that invariant by invariant — an
-/// invariant no mutant can falsify is a ghost, which is how this model's first
-/// draft passed while stating nothing.
+/// `Buggy=1` is the regression family: an inert press and an auto-repeat tick each snap the
+/// viewport and clear the selection (so the ⌘ keydown destroys the selection before the `c`
+/// arrives and ⌘-C copies nothing); a release that disturbs; output that snaps the reader back
+/// to live instead of repinning; output that takes custody while clearing the rows it damaged;
+/// and a typing press that deselects without snapping. Every invariant except the
+/// state-consistency guard `TailOwnerAtBottom` is falsified by one of them, and
+/// `derived_ring_ty.rs` checks that invariant by invariant.
 ///
-/// Output that takes the highlight WITHOUT moving the view — an in-place rewrite
-/// over the selected rows, or a re-pin saturated at the history floor — and output
-/// that takes it for a reason the damage lattice cannot attribute
-/// (`post_process`'s fail-closed arms) are their own actions under the same tag and
-/// the same law as a damaging take, and a user gesture back TOWARD live that is not
-/// typing (End, a downward scroll, the ⌘-V / IME snaps) is `SnapToLive` /
+/// Output that takes the highlight without moving the view (an in-place rewrite over the
+/// selected rows, or a re-pin saturated at the history floor), and output that takes it for a
+/// reason the damage lattice cannot attribute (`post_process`'s fail-closed arms), are their
+/// own actions under the same tag and law as a damaging take. A user gesture back toward live
+/// that is not typing (End, a downward scroll, the ⌘-V and IME snaps) is `SnapToLive` /
 /// `UserScrollTowardLive`: it moves the view down and keeps the highlight.
 ///
-/// Scope: this is the PRESS-PATH half of custody plus the output repin it must
-/// not fight. Eviction and wholesale invalidation are [`selection_custody_model`]'s;
-/// the alt-screen round-trip is [`alt_selection_park_model`]'s.
+/// Scope: the press-path half of custody plus the output repin it must not fight. Eviction
+/// and wholesale invalidation are [`selection_custody_model`]'s; the alt-screen round-trip is
+/// [`alt_selection_park_model`]'s.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn press_custody_model() -> Model {
@@ -1598,20 +1499,18 @@ pub fn press_custody_model() -> Model {
             var offset = 0;
             // A completed text selection exists.
             var selection = 0;
-            // Shadow of the pre-action observable state. Every action writes all
-            // three from the PRE-state, so an invariant can compare what an event
-            // did against what was there before it.
+            // Shadow of the pre-action observable state, written by every action from the
+            // pre-state.
             var prev_owner = 0;
             var prev_offset = 0;
             var prev_selection = 0;
-            // What kind of event just fired: 0 a user gesture, 1 a typing press,
-            // 2 an auto-repeat tick, 3 a bare modifier, 4 a release, 5 output that
-            // missed the selected rows, 6 output that TOOK the highlight (it
-            // replaced the selected rows, or `post_process` failed closed on it),
-            // 7 output that invalidated the coordinate space (ED 3 /
-            // clear_scrollback / RIS), 8 a user gesture back TOWARD live that is
-            // not typing (a downward scroll, End / ScrollToBottom, the paste and
-            // IME snaps).
+            // What kind of event just fired: 0 a user gesture, 1 a typing press, 2 an
+            // auto-repeat tick, 3 a bare modifier, 4 a release, 5 output that missed the
+            // selected rows, 6 output that took the highlight (replaced the selected rows,
+            // or `post_process` failed closed on it), 7 output that invalidated the
+            // coordinate space (ED 3, clear_scrollback, RIS), 8 a user gesture back toward
+            // live that is not typing (a downward scroll, End / ScrollToBottom, the paste
+            // and IME snaps).
             var last_event = 0;
 
             action UserScroll when (offset <= MaxOffset - 1) {
@@ -1637,9 +1536,8 @@ pub fn press_custody_model() -> Model {
                 selection = 0;
                 last_event = 0;
             }
-            // Output while the user is reading: the repin keeps the same content
-            // under the eye, so the offset RISES with the new lines and ownership
-            // stays with the user.
+            // Output while the user is reading: the repin keeps the same content under the
+            // eye, so the offset rises with the new lines and ownership stays with the user.
             action OutputWhileReading when (owner == 1 && offset <= MaxOffset - 1) {
                 prev_owner = owner;
                 prev_offset = offset;
@@ -1657,20 +1555,12 @@ pub fn press_custody_model() -> Model {
                 offset = 0;
                 last_event = 5;
             }
-            // Output that REPLACED the selected rows (an overlapping
-            // `SelectionDamage`). It is a separate event kind because the shipped
-            // engine really does destroy a selection here — a highlight left over
-            // replaced text makes ⌘-C return something the user never selected —
-            // and a model that forbade it would contradict the code it stands for.
-            // What it still may not do is take the reading position: the repin
-            // rides the new lines exactly as for undamaged output.
-            //
-            // BOTH OWNERSHIPS: the commonest real instance is at live (a status
-            // line repainting the rows a highlight sits on), so the guard must not
-            // read `owner == 1`. The OFFSET clause carries the ownership split: the
-            // repin rides the arriving lines only for a reader, and at live the view
-            // stays at live. The `Buggy = 1` member at `owner == 1` snaps the reader
-            // to live, which `OutputNeverTakesCustody` catches.
+            // Output that replaced the selected rows (an overlapping `SelectionDamage`): the
+            // engine destroys the selection here (a highlight over replaced text makes ⌘-C
+            // return something never selected), but may not take the reading position. The
+            // commonest case is at live (a status line repainting the highlighted rows), so
+            // the guard does not read `owner`; the repin rides the new lines only for a
+            // reader. `Buggy = 1` snaps the reader to live (`OutputNeverTakesCustody`).
             action OutputDamagesTheSelectedRows
                 when (selection == 1 && offset <= MaxOffset - 1)
             {
@@ -1682,12 +1572,10 @@ pub fn press_custody_model() -> Model {
                 selection = 0;
                 last_event = 6;
             }
-            // The same take, IN PLACE: a damaging batch that advanced no rows (an
-            // in-place rewrite — `\r` plus EL over the selected row, a DECERA, a
-            // status line repainting itself) or whose re-pin saturated at the
-            // history floor. The view does not move, for a reader or at live; only
-            // the highlight goes. `Buggy = 1` snaps the reader to live, which
-            // `OutputNeverTakesCustody` catches.
+            // The same take in place: a damaging batch that advanced no rows (`\r` plus EL
+            // over the selected row, a DECERA, a status line repainting itself) or whose
+            // re-pin saturated at the history floor. The view does not move; only the
+            // highlight goes. `Buggy = 1` snaps the reader to live (`OutputNeverTakesCustody`).
             action OutputDamagesTheSelectedRowsInPlace when (selection == 1) {
                 prev_owner = owner;
                 prev_offset = offset;
@@ -1697,12 +1585,11 @@ pub fn press_custody_model() -> Model {
                 selection = 0;
                 last_event = 6;
             }
-            // Output took the highlight for a reason that is NOT damage overlap —
-            // `post_process`'s fail-closed arms (a malformed or saturated splice
-            // projection, a splice mixed with another scroll, the `left_alt`
-            // re-check, a whole-interval eviction at the history floor). Same
-            // tag and same law as a damaging take: the highlight may go, the
-            // reading position may not. The re-pin rides the arriving lines…
+            // Output took the highlight for a reason other than damage overlap
+            // (`post_process`'s fail-closed arms: a malformed or saturated splice projection,
+            // a splice mixed with another scroll, the `left_alt` re-check, a whole-interval
+            // eviction at the history floor). Same tag and law as a damaging take: the
+            // highlight may go, the reading position may not. The re-pin rides the lines…
             action OutputTookTheSelectionUnattributed
                 when (selection == 1 && offset <= MaxOffset - 1)
             {
@@ -1724,33 +1611,27 @@ pub fn press_custody_model() -> Model {
                 selection = 0;
                 last_event = 6;
             }
-            // ED 3 / `clear_scrollback` / RIS: `repin_display_offset` clamps to 0
-            // because the coordinate space the offset named is gone. This IS output
-            // handing the viewport back to the tail-follower, so it is spelled as
-            // its own event kind rather than left to contradict the custody
-            // invariant. The model does not police the LABEL — as with
-            // `selection_custody_model`'s `WholesaleInvalidate`, an implementation
-            // that called everything wholesale would satisfy it; what the pair of
-            // kinds buys is that the ordinary path is checked and the exception is
-            // enumerated where a reader can see it.
+            // ED 3, `clear_scrollback` and RIS: `repin_display_offset` clamps to 0 because
+            // the coordinate space the offset named is gone, so output hands the viewport
+            // back, spelled as its own event kind. The model does not police the label (as
+            // with `selection_custody_model`'s `WholesaleInvalidate`, an implementation that
+            // called everything wholesale would satisfy it); the separate kind keeps the
+            // ordinary path checked and the exception visible.
             action OutputInvalidatesTheCoordinateSpace {
                 prev_owner = owner;
                 prev_offset = offset;
                 prev_selection = selection;
                 offset = 0;
                 owner = 0;
-                // `Buggy = 1` keeps the highlight across the invalidation — a
-                // selection naming rows that no longer exist, which is the
-                // fail-OPEN direction this design exists to rule out.
+                // `Buggy = 1` keeps the highlight across the invalidation: a selection
+                // naming rows that no longer exist, the fail-open direction.
                 selection = if Buggy == 1 { selection } else { 0 };
                 last_event = 7;
             }
-            // The user brings the view back to LIVE without typing — End /
-            // `ScrollToBottom`, a page or wheel step that lands at the tail, the
-            // ⌘-V and IME snaps. Ownership goes back to the tail-follower because
-            // the view is at the tail; the highlight is the user's and stays.
-            // `Buggy = 1` deselects on the way, which
-            // `ReturningTowardLiveKeepsTheSelection` catches.
+            // The user brings the view back to live without typing (End / `ScrollToBottom`,
+            // a page or wheel step that lands at the tail, the ⌘-V and IME snaps). Ownership
+            // returns to the tail-follower; the highlight is the user's and stays. `Buggy = 1`
+            // deselects on the way (`ReturningTowardLiveKeepsTheSelection`).
             action SnapToLive when (offset > 0) {
                 prev_owner = owner;
                 prev_offset = offset;
@@ -1771,9 +1652,8 @@ pub fn press_custody_model() -> Model {
                 selection = if Buggy == 1 { 0 } else { selection };
                 last_event = 8;
             }
-            // The ONE handover. Unchanged by this design — but `Buggy = 1` still
-            // gives it a member (typing that deselects without snapping), because
-            // an invariant no mutant can falsify states nothing.
+            // The one handover. `Buggy = 1` gives it a member too (typing that deselects
+            // without snapping): an invariant no mutant can falsify states nothing.
             action TypingPress {
                 prev_owner = owner;
                 prev_offset = offset;
@@ -1834,11 +1714,9 @@ pub fn press_custody_model() -> Model {
                 } else {
                     last_event <= 8
                 };
-            // Output never takes the reading position. It covers BOTH output
-            // kinds: damaging the selected rows is not a licence to snap.
-            // `prev_offset <= offset` rather than equality, because the repin
-            // RAISES the offset by the lines that arrived; what it may never do
-            // is move the view back toward live.
+            // Output never takes the reading position, damaging or not. `prev_offset <=
+            // offset` rather than equality: the repin raises the offset by the lines that
+            // arrived; what it may never do is move the view back toward live.
             invariant OutputNeverTakesCustody:
                 if last_event == 5 {
                     owner == prev_owner && prev_offset <= offset
@@ -1849,12 +1727,9 @@ pub fn press_custody_model() -> Model {
                         last_event <= 8
                     }
                 };
-            // …and the selection half, only where it holds: output that replaced
-            // the selected rows (event 6) clears the selection, and
-            // `post_process`'s fail-closed arm clears one it cannot place. WHICH
-            // damage may clear is `selection_custody_model`'s
-            // `OverlapDamageClears`; here the claim is only that output which did
-            // not touch the selected rows leaves the highlight alone.
+            // …and the selection half, only where it holds: output that did not touch the
+            // selected rows leaves the highlight alone. Which damage may clear is
+            // `selection_custody_model`'s `OverlapDamageClears`.
             invariant OutputSparesAnUndamagedSelection:
                 if last_event == 5 {
                     selection == prev_selection
@@ -1867,28 +1742,25 @@ pub fn press_custody_model() -> Model {
                 } else {
                     last_event <= 8
                 };
-            // The ONE handover, and the discipline it owes. ED 3 / `clear_scrollback`
-            // / RIS destroy the coordinate space the anchors are stated in, so
-            // handing the viewport back is correct — but a selection may not
-            // OUTLIVE the space that gives its rows meaning. Every other invariant
-            // reaches event 7 only through an `else { last_event <= 8 }` arm, which
-            // is trivially true; without this one the model admits the action and
-            // then says nothing whatever about it.
+            // ED 3, `clear_scrollback` and RIS destroy the space the anchors are stated in,
+            // so handing the viewport back is correct, but a selection may not outlive it.
+            // Every other invariant reaches event 7 only through a trivially true `else` arm;
+            // without this one the model would say nothing about the action.
             invariant InvalidationCannotLeaveADanglingSelection:
                 if last_event == 7 {
                     offset == 0 && owner == 0 && selection == 0
                 } else {
                     last_event <= 8
                 };
-            // A gesture back toward live moves the view DOWN and nothing else: it is
-            // not typing, so the highlight survives it.
+            // A gesture back toward live moves the view down and nothing else: it is not
+            // typing, so the highlight survives it.
             invariant ReturningTowardLiveKeepsTheSelection:
                 if last_event == 8 {
                     selection == prev_selection && offset <= prev_offset - 1
                 } else {
                     last_event <= 8
                 };
-            invariant StateBounds:
+            bound StateBounds:
                 owner <= 1 && offset <= MaxOffset && selection <= 1 &&
                 prev_owner <= 1 && prev_offset <= MaxOffset && prev_selection <= 1 &&
                 last_event <= 8;
@@ -1896,73 +1768,52 @@ pub fn press_custody_model() -> Model {
     }
 }
 
-/// SELECTION CUSTODY — when a selection may be destroyed, as a lifecycle.
+/// Selection custody: when a selection may be destroyed, as a lifecycle.
 ///
-/// The whole design in one model: a highlight is the user's, and only an act that
-/// destroys the CONTENT it names may destroy it. The shipped defect was the
-/// opposite — twenty-five grid sites set a `content_scroll_delta = i32::MAX`
-/// sentinel meaning "kill the selection", fired by ops that had not touched the
-/// selected rows at all, so a status bar repainting at the bottom of the screen
-/// destroyed a highlight anchored far up in scrollback.
+/// A highlight is the user's, and only an act that destroys the content it names may destroy
+/// it; a status bar repainting at the bottom of the screen must not destroy a highlight
+/// anchored far up in scrollback.
 ///
-/// The model works in the ABSOLUTE row space that `intersects_absolute_band`
-/// converts into — NOT in the selection's own space. `TextSelection` anchors are
-/// relative `i32` rows and stay that way; the conversion happens at the damage
-/// boundary only. Absolute is the right abstraction here because a uniform scroll
-/// advances `absolute_row_counter` by the same delta `adjust_for_scroll` subtracts,
-/// so the interval is stable under ordinary output.
+/// The model works in the absolute row space that `intersects_absolute_band` converts into, not
+/// in the selection's own space: `TextSelection` anchors are relative `i32` rows, converted at
+/// the damage boundary only. A uniform scroll advances `absolute_row_counter` by the same delta
+/// `adjust_for_scroll` subtracts, so the interval is stable under ordinary output.
 ///
-/// Damage bands are LITERAL per action rather than chosen, because the `ty_model!`
-/// grammar has no nondeterministic range arm. Two bands and three selections give
-/// all four overlap/disjoint pairings plus the single-row shape eviction needs:
-/// `RegionDamageLow` covers rows 0..1, `RegionDamageHigh` covers row 3; `SelectLow`
-/// takes rows 0..1, `SelectHigh` rows 2..3, and `SelectOldest` row 0 alone.
+/// Damage bands are literal per action, because the `ty_model!` grammar has no
+/// nondeterministic range arm. Two bands and three selections give all four overlap/disjoint
+/// pairings plus the single-row shape eviction needs: `RegionDamageLow` covers rows 0..1,
+/// `RegionDamageHigh` row 3; `SelectLow` takes rows 0..1, `SelectHigh` rows 2..3, and
+/// `SelectOldest` row 0 alone.
 ///
-/// Every invariant is stated over the OBSERVABLE change — the post-state against a
-/// shadow of the pre-state (`prev_alive`, `prev_sel_lo`, `prev_sel_hi`) that every
-/// action writes before mutating — never over a value the action itself just wrote.
-/// That is not a style preference: as first written this model guarded `InertPress`
-/// and `UniformScroll` on `alive == 1` and had them write nothing but `last_event`,
-/// so `alive == 1` followed from the GUARD and the two invariants whose comments
-/// claim to state the user's complaints could not fail whatever the engine did.
-/// They are ghosts unless a mutant can falsify them, which is why every action that
-/// may not destroy a selection now carries a `Buggy = 1` branch that destroys one.
+/// Every invariant is stated over the observable change, the post-state against a shadow of
+/// the pre-state (`prev_alive`, `prev_sel_lo`, `prev_sel_hi`), never over a value the action
+/// just wrote; and every action that may not destroy a selection carries a `Buggy = 1` branch
+/// that destroys one, so no invariant follows from a guard alone.
 ///
-/// SCOPE, stated rather than implied: this models the ENGINE's destroyers — the
-/// ones reachable from `Terminal::post_process` and its callers. The GUI has its
-/// own clear sites (`app_search`, `app_mouse`, `subscribe`, `control_host`) and the
-/// wasm bridges have theirs; none of them are in this environment, and a claim that
-/// this enumerates "every legitimate destroyer" would be false.
+/// Scope: the engine's destroyers, reachable from `Terminal::post_process` and its callers. The
+/// GUI's own clear sites (`app_search`, `app_mouse`, `subscribe`, `control_host`) and the wasm
+/// bridges' are not in this environment.
 ///
-/// `WholesaleInvalidate` is ONE action, not an alt-enter/alt-exit pair, because the
-/// three engine sites that record `SelectionDamage::All` outside the screen switch —
-/// ED 3 / `clear_scrollback` (`Grid::discard_history_selection`), reflow pullback, and
-/// a Kitty unscroll that renumbers history (`force_selection_invalidation`) — are one
-/// class: the coordinate space the selection named is gone, so no band can describe
-/// the damage and `All` is the honest answer.
+/// `WholesaleInvalidate` is one action, not an alt-enter/alt-exit pair: the three engine sites
+/// that record `SelectionDamage::All` outside the screen switch (ED 3 / `clear_scrollback` via
+/// `Grid::discard_history_selection`, reflow pullback, and a Kitty unscroll that renumbers
+/// history via `force_selection_invalidation`) are one class: the coordinate space the
+/// selection named is gone, so no band can describe the damage. Whether a site also moves host
+/// coordinates is outside this model: ED 3 evicts history without moving a live coordinate
+/// (`discarding_scrollback_evicts_history_and_moves_no_live_coordinate`), a Kitty unscroll
+/// renumbers retained rows; both destroy the selection identically.
 ///
-/// Which of the two spellings a site uses is a question about HOST COORDINATES, not
-/// about the selection, and this model is deliberately blind to it: ED 3 evicts
-/// history without moving a live coordinate (see
-/// `discarding_scrollback_evicts_history_and_moves_no_live_coordinate`) while a Kitty
-/// unscroll renumbers retained rows and does. Both destroy the selection identically,
-/// which is the only thing `WholesaleInvalidate` claims.
+/// `Buggy = 1` is the regression family, one member per destroyer, each falsifying a named
+/// invariant (`derived_ring_ty.rs` asserts the mapping member by member):
 ///
-/// `Buggy = 1` is the regression FAMILY, one member per destroyer, each falsifying
-/// a NAMED invariant (`derived_ring_ty.rs` asserts that mapping member by member,
-/// so a future ghost fails the suite rather than passing it):
-///
-/// * `RegionDamageLow` clears whatever it hit — the literal shipping sentinel,
-///   caught by `DisjointDamagePreserves`.
-/// * `RegionDamageHigh` never clears — the inverse hole, where a
-///   highlight survives over replaced text and the copy returns something the user
-///   never selected. Caught by `OverlapDamageClears`.
-/// * `InertPress` and `UniformScroll` each destroy the selection — the two user
-///   complaints at the engine layer, caught by their own invariants.
+/// * `RegionDamageLow` clears whatever it hit (`DisjointDamagePreserves`).
+/// * `RegionDamageHigh` never clears, so a highlight survives over replaced text
+///   (`OverlapDamageClears`).
+/// * `InertPress` and `UniformScroll` each destroy the selection (their own invariants).
 /// * `Evict` reports the loss without acting on it: it raises the floor and records
-///   `truncated`, but neither clamps the head nor drops a selection both of whose
-///   endpoints are gone. Caught by `PartialEvictionTruncates`, `NoDanglingAnchors`
-///   and `TruncationImpliesAClampedHead`.
+///   `truncated`, but neither clamps the head nor drops a selection both of whose endpoints
+///   are gone (`PartialEvictionTruncates`, `NoDanglingAnchors`,
+///   `TruncationImpliesAClampedHead`).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn selection_custody_model() -> Model {
@@ -1982,26 +1833,20 @@ pub fn selection_custody_model() -> Model {
             var floor = 0;
             // A head clamped to the floor by partial eviction.
             var truncated = 0;
-            // Shadow of the PRE-action selection, written by every action from the
-            // pre-state. Assignments are TLA+ simultaneous, so these read the state
-            // as it was BEFORE the step even where they are spelled first. This is
-            // what lets an invariant say "this event changed nothing" about an
-            // action that writes nothing.
+            // Shadow of the pre-action selection, written by every action from the pre-state
+            // (assignments are simultaneous), so an invariant can say "this event changed
+            // nothing" about an action that writes nothing.
             var prev_alive = 0;
             var prev_sel_lo = 0;
             var prev_sel_hi = 0;
-            // What just happened. ORDERED, so membership tests are prefixes — the
-            // grammar renders `&&` unparenthesised and `||` parenthesised, so
-            // mixing them is unsafe and every test below is a nested `if`.
-            // 0 none, 1 user gesture, 2 typing press, 3 inert press,
-            // 4 region damage, 5 uniform scroll, 6 eviction, 7 wholesale.
+            // What just happened. Ordered, so membership tests are prefixes: the grammar
+            // renders `&&` unparenthesised and `||` parenthesised, so every test below is a
+            // nested `if`. 0 none, 1 user gesture, 2 typing press, 3 inert press, 4 region
+            // damage, 5 uniform scroll, 6 eviction, 7 wholesale.
             var last_event = 0;
 
-            // Guarded on the floor: you cannot select a row that has been evicted,
-            // because it is not on screen to select. Without this the model reaches
-            // `alive` with `sel_lo` below `floor` by selecting row 0 after an
-            // eviction — a dangling anchor no code path can produce, which would
-            // make `NoDanglingAnchors` false for a reason the terminal never has.
+            // Guarded on the floor: an evicted row is not on screen to select. Without it the
+            // model reaches a dangling anchor no code path can produce.
             action SelectLow when (floor == 0) {
                 prev_alive = alive;
                 prev_sel_lo = sel_lo;
@@ -2012,11 +1857,8 @@ pub fn selection_custody_model() -> Model {
                 truncated = 0;
                 last_event = 1;
             }
-            // A one-row selection on the oldest retained row. It exists so the
-            // BOTH-ENDPOINTS-GONE arm of eviction is reachable at all: with only
-            // `SelectLow` and `SelectHigh` every live selection has `sel_hi > 0`,
-            // so `Evict`'s clear branch would be dead and the law "a selection
-            // whose whole interval fell off the back is gone" unmodelled.
+            // A one-row selection on the oldest retained row, so `Evict`'s both-endpoints-gone
+            // arm is reachable (`SelectLow` and `SelectHigh` both have `sel_hi > 0`).
             action SelectOldest when (floor == 0) {
                 prev_alive = alive;
                 prev_sel_lo = sel_lo;
@@ -2037,7 +1879,7 @@ pub fn selection_custody_model() -> Model {
                 truncated = 0;
                 last_event = 1;
             }
-            // A deliberate deselect — always allowed, it IS the user's intent.
+            // A deliberate deselect, always allowed.
             action UserClear {
                 prev_alive = alive;
                 prev_sel_lo = sel_lo;
@@ -2046,7 +1888,7 @@ pub fn selection_custody_model() -> Model {
                 truncated = 0;
                 last_event = 1;
             }
-            // The ONE handover: typing means take me to the prompt, and deselect.
+            // The one handover: typing means take me to the prompt, and deselect.
             action TypingPress {
                 prev_alive = alive;
                 prev_sel_lo = sel_lo;
@@ -2055,10 +1897,8 @@ pub fn selection_custody_model() -> Model {
                 truncated = 0;
                 last_event = 2;
             }
-            // A bare modifier. The guard keeps the state space to selections that
-            // existed to be destroyed; the INVARIANT does not lean on it — it
-            // compares against `prev_alive`, so removing the guard later cannot
-            // silently turn the property back into a tautology.
+            // A bare modifier. The guard keeps the space to selections that exist to be
+            // destroyed; the invariant compares against `prev_alive`, not the guard.
             action InertPress when (alive == 1) {
                 prev_alive = alive;
                 prev_sel_lo = sel_lo;
@@ -2090,10 +1930,9 @@ pub fn selection_custody_model() -> Model {
                 };
                 last_event = 4;
             }
-            // Row 3 replaced. Overlap reduces to `sel_hi > 2`, because
-            // `sel_lo <= 3 == band_hi` holds for every reachable selection. Its
-            // mutant is the INVERSE of `RegionDamageLow`'s — damage that hit and
-            // did not clear — so the two halves of the lattice each have a member.
+            // Row 3 replaced. Overlap reduces to `sel_hi > 2`, because `sel_lo <= 3 ==
+            // band_hi` holds for every reachable selection. Its mutant is the inverse of
+            // `RegionDamageLow`'s (damage that hit and did not clear).
             action RegionDamageHigh when (alive == 1) {
                 prev_alive = alive;
                 prev_sel_lo = sel_lo;
@@ -2107,12 +1946,11 @@ pub fn selection_custody_model() -> Model {
                 };
                 last_event = 4;
             }
-            // Retention drops the oldest row. A head below the new floor CLAMPS and
-            // records the loss; only both endpoints gone destroys the selection.
-            // Every right-hand side reads the PRE-eviction state — assignments are
-            // simultaneous — which is what lets `truncated` and `sel_lo` agree.
-            // `truncated = 0` on the survivor branch is the pre-value restated, not
-            // a reset: `Evict` is the only writer of `1` and its `floor == 0` guard
+            // Retention drops the oldest row. A head below the new floor clamps and records
+            // the loss; only both endpoints gone destroys the selection. Every right-hand
+            // side reads the pre-eviction state (assignments are simultaneous), so
+            // `truncated` and `sel_lo` agree. `truncated = 0` on the survivor branch restates
+            // the pre-value: `Evict` is the only writer of `1` and its `floor == 0` guard
             // lets it fire at most once per trace.
             action Evict when (alive == 1 && floor == 0) {
                 prev_alive = alive;
@@ -2151,10 +1989,9 @@ pub fn selection_custody_model() -> Model {
                 last_event = 7;
             }
 
-            // A bare modifier expresses no intent and may not destroy anything.
-            // This is complaint (1), as a model property — stated as "the event
-            // CHANGED nothing", which is falsifiable, rather than "a selection
-            // exists", which the guard would have granted for free.
+            // A bare modifier expresses no intent and may not destroy anything: stated as
+            // "the event changed nothing", which is falsifiable, not "a selection exists",
+            // which the guard would grant for free.
             invariant InertPressPreservesTheSelection:
                 if last_event == 3 {
                     alive == prev_alive && sel_lo == prev_sel_lo &&
@@ -2162,7 +1999,7 @@ pub fn selection_custody_model() -> Model {
                 } else {
                     alive <= 1
                 };
-            // Ordinary output cannot take a highlight. This is complaint (2).
+            // Ordinary output cannot take a highlight.
             invariant UniformScrollPreservesTheSelection:
                 if last_event == 5 {
                     alive == prev_alive && sel_lo == prev_sel_lo &&
@@ -2170,10 +2007,8 @@ pub fn selection_custody_model() -> Model {
                 } else {
                     alive <= 1
                 };
-            // Damage that missed the selected rows leaves them alone — the half the
-            // sentinel could not express, and the reason a status bar destroyed a
-            // scrollback highlight. Disjointness is decided on the PRE-state
-            // anchors and the conclusion is read off the POST-state.
+            // Damage that missed the selected rows leaves them alone. Disjointness is decided
+            // on the pre-state anchors and the conclusion read off the post-state.
             invariant DisjointDamagePreserves:
                 if last_event == 4 {
                     if prev_sel_lo > band_hi {
@@ -2190,9 +2025,8 @@ pub fn selection_custody_model() -> Model {
                 } else {
                     alive <= 1
                 };
-            // …and damage that HIT them must clear: a highlight left over replaced
-            // text is worse than a lost one, because a copy then returns something
-            // the user never selected.
+            // …and damage that hit them must clear: a highlight over replaced text makes a
+            // copy return something the user never selected.
             invariant OverlapDamageClears:
                 if last_event == 4 {
                     if prev_sel_lo > band_hi {
@@ -2203,10 +2037,9 @@ pub fn selection_custody_model() -> Model {
                 } else {
                     alive <= 1
                 };
-            // Losing the oldest line of a selection is not losing the selection —
-            // the head clamps to the new floor and the loss is RECORDED. Losing
-            // every line of it is: both endpoints gone means there is nothing left
-            // to name. Which arm applies is decided by the PRE-eviction interval.
+            // Losing the oldest line of a selection is not losing it: the head clamps to the
+            // new floor and the loss is recorded. Losing every line of it is. The arm is
+            // decided by the pre-eviction interval.
             invariant PartialEvictionTruncates:
                 if last_event == 6 {
                     if prev_sel_hi > 0 {
@@ -2227,10 +2060,7 @@ pub fn selection_custody_model() -> Model {
             // A truncation is only ever recorded against a clamped head.
             invariant TruncationImpliesAClampedHead:
                 if truncated == 1 { floor <= sel_lo } else { truncated == 0 };
-            // A model-bounds guard, not a design claim: it states the space is the
-            // one the interpreter was asked to walk. It is the ONE invariant here
-            // with no `Buggy = 1` member, and `derived_ring_ty.rs` names it as such.
-            invariant StateIsBounded:
+            bound StateIsBounded:
                 alive <= 1 && truncated <= 1 && floor <= 1 && sel_lo <= 3 &&
                 sel_hi <= 3 && band_lo <= 3 && band_hi <= 3 &&
                 prev_alive <= 1 && prev_sel_lo <= 3 && prev_sel_hi <= 3 &&
@@ -2239,46 +2069,39 @@ pub fn selection_custody_model() -> Model {
     }
 }
 
-/// SELECTION CUSTODY — the alt-screen selection PARK, as a lifecycle.
+/// Selection custody: the alt-screen selection park, as a lifecycle.
 ///
-/// A text selection belongs to the screen it was made on. Entering the alternate
-/// screen parks the main screen's selection and leaves the alt buffer with none;
-/// leaving restores it and leaves the parked slot EMPTY. The engine spells that as
-/// two `mem::take`s at the top of `Terminal::post_process`.
+/// A text selection belongs to the screen it was made on. Entering the alternate screen parks
+/// the main screen's selection and leaves the alt buffer with none; leaving restores it and
+/// empties the parked slot (two `mem::take`s at the top of `Terminal::post_process`).
 ///
-/// The one property worth stating is the slot's lifetime: `parked_sel` is alive
-/// only between an enter and the next leave. That is what bounds the clear-site
-/// list to the handful of destroyers instead of making every future destroyer
-/// acquire a second obligation for a selection that outlived it. They come in
-/// three shapes, one action each:
+/// The property is the slot's lifetime: `parked_sel` is alive only between an enter and the
+/// next leave, which bounds the clear-site list to a handful of destroyers rather than giving
+/// every future destroyer a second obligation. They come in three shapes, one action each:
 ///
-/// * `Wholesale` — `clear_scrollback` and a width resize destroy what BOTH slots
-///   named and leave the screen where it is;
-/// * `Reset` — `Terminal::reset` and byte-stream RIS destroy both AND drop the
-///   alternate buffer, so they also land on the main screen: for a direct reset an
-///   alt->main switch the restore in `post_process` never sees, and for RIS followed
-///   by a re-entry in the SAME batch a switch it never runs at all;
-/// * `RestoreMain` / `RestoreAlt` — `restore_checkpoint` adopts another session's
-///   grids and whichever screen that session was on. It retires the parked slot,
-///   whose anchors name a lineage this terminal never saw, and deliberately leaves
-///   the LIVE selection standing: that half is the seamless-update adopt path, where
-///   clearing it would make a highlight vanish across an in-place update.
+/// * `Wholesale`: `clear_scrollback` and a width resize destroy what both slots named and leave
+///   the screen where it is;
+/// * `Reset`: `Terminal::reset` and byte-stream RIS destroy both and drop the alternate buffer,
+///   so they also land on the main screen (for a direct reset an alt->main switch the restore
+///   in `post_process` never sees, and for RIS followed by a re-entry in the same batch a
+///   switch it never runs);
+/// * `RestoreMain` / `RestoreAlt`: `restore_checkpoint` adopts another session's grids and
+///   whichever screen it was on. It retires the parked slot, whose anchors name a lineage this
+///   terminal never saw, and leaves the live selection standing: that is the seamless-update
+///   adopt path, where clearing it would make a highlight vanish across an in-place update.
 ///
-/// `Buggy=1` is the regression family, two members naming different invariants.
-/// The first is the obvious alternative implementation — a symmetric SWAP instead of
-/// an asymmetric take — under which the alt screen's own selection stays parked
-/// after the leave and reappears on the next round trip, over a buffer the user
-/// cannot see. The second is the destroyer that forgets the parked slot, at every
-/// one of the three shapes, which is exactly the failure mode of the coordinated
-/// clear sites: nothing in the compiler notices.
+/// `Buggy=1` has two members naming different invariants: a symmetric swap instead of an
+/// asymmetric take, under which the alt screen's own selection stays parked after the leave
+/// and reappears on the next round trip over a buffer the user cannot see; and a destroyer
+/// that forgets the parked slot, at every one of the three shapes, the failure mode of
+/// coordinated clear sites that no compiler notices.
 ///
-/// Tier-1: `aterm-core/src/terminal/alt_selection_park_conformance.rs` walks
-/// this model's whole reachable space on the real `Terminal` — real `?1049h` /
-/// `?1049l` bytes, `clear_scrollback`, a width resize, `Terminal::reset`,
-/// byte-stream RIS alone and RIS then `?1049h` in one batch, and
-/// `restore_checkpoint` from a main-screen and an alt-screen checkpoint — from
-/// BOTH screens, reading the parked slot itself, and rejects each `Buggy = 1`
-/// member injected into the same real trace at its own action.
+/// Tier-1: `aterm-core/src/terminal/alt_selection_park_conformance.rs` walks the whole
+/// reachable space on the real `Terminal` (real `?1049h` / `?1049l` bytes, `clear_scrollback`,
+/// a width resize, `Terminal::reset`, byte-stream RIS alone and RIS then `?1049h` in one batch,
+/// and `restore_checkpoint` from a main-screen and an alt-screen checkpoint) from both screens,
+/// reading the parked slot itself, and rejects each `Buggy = 1` member injected into the same
+/// real trace at its own action.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn alt_selection_park_model() -> Model {
@@ -2288,9 +2111,9 @@ pub fn alt_selection_park_model() -> Model {
 
             // 1 while the alternate screen is up.
             var on_alt = 0;
-            // A selection on the ACTIVE screen, whichever that is.
+            // A selection on the active screen, whichever that is.
             var live_sel = 0;
-            // The OTHER screen's selection, held across the switch.
+            // The other screen's selection, held across the switch.
             var parked_sel = 0;
             // What just fired: 0 a user gesture, 1 an enter, 2 an in-place
             // destroyer, 3 a leave, 4 a reset, 5 a checkpoint restore.
@@ -2304,9 +2127,8 @@ pub fn alt_selection_park_model() -> Model {
                 live_sel = 0;
                 last_event = 0;
             }
-            // The park. Assignments are TLA+ simultaneous, so every right-hand side
-            // reads the PRE-state: at Buggy=1 this pair is a swap, and at Buggy=0 the
-            // live slot is emptied outright.
+            // The park. Assignments are simultaneous, so every right-hand side reads the
+            // pre-state: at Buggy=1 this pair is a swap, at Buggy=0 the live slot is emptied.
             action Enter when (on_alt == 0) {
                 parked_sel = live_sel;
                 live_sel = if Buggy == 1 { parked_sel } else { 0 };
@@ -2321,8 +2143,8 @@ pub fn alt_selection_park_model() -> Model {
                 on_alt = 0;
                 last_event = 3;
             }
-            // clear_scrollback, a width resize: the content under BOTH selections
-            // is gone, so both slots must go. The screen stays where it is.
+            // clear_scrollback, a width resize: the content under both selections is gone, so
+            // both slots go. The screen stays where it is.
             action Wholesale {
                 live_sel = 0;
                 parked_sel = if Buggy == 1 { parked_sel } else { 0 };
@@ -2356,11 +2178,11 @@ pub fn alt_selection_park_model() -> Model {
                 } else {
                     last_event <= 5
                 };
-            // Caught on its own by a forgetful restore of an ALT checkpoint, which
+            // Caught on its own by a forgetful restore of an alt checkpoint, which
             // `ParkedEmptyOffAlt` cannot see: the stale slot is still "on alt".
             invariant RestoreRetiresTheParkedSlot:
                 if last_event == 5 { parked_sel == 0 } else { last_event <= 5 };
-            invariant StateBounds:
+            bound StateBounds:
                 on_alt <= 1 && live_sel <= 1 && parked_sel <= 1 && last_event <= 5;
         }
     }
@@ -2368,31 +2190,25 @@ pub fn alt_selection_park_model() -> Model {
 
 /// One-key press/repeat/release pairing at the GUI-to-PTY boundary.
 ///
-/// A press consumed by a physical-key GUI gate or by the engine-key overlay gate
-/// records a per-key disposition. Repeats only peek at that disposition, and the
-/// matching release removes it without emitting Kitty CSI-u bytes. Conversely, a
-/// press already forwarded to the PTY remains outstanding through overlay/gate
-/// changes and is owed its repeat/release reports at the exact press-time target.
-/// The two-window lattice makes focus move while the key is held: the physical
-/// release may arrive through window 2, but a consumed owner remains byte-silent
-/// a forwarded encoded/literal owner routes to window/session 1, and an
-/// untracked repeat is byte-silent. The model projects one entry
-/// of the process-wide physical-key owner map; other-key independence and the full
-/// window/session identity are Tier-1 negative controls. Explicit controller
-/// releases with no preceding physical episode are outside this pairing environment.
+/// A press consumed by a physical-key GUI gate or by the engine-key overlay gate records a
+/// per-key disposition. Repeats only peek at it, and the matching release removes it without
+/// emitting Kitty CSI-u bytes. A press already forwarded to the PTY stays outstanding through
+/// overlay/gate changes and is owed its repeat/release reports at the exact press-time target.
+/// The two-window lattice moves focus while the key is held: the physical release may arrive
+/// through window 2, but a consumed owner stays byte-silent, a forwarded encoded/literal owner
+/// routes to window/session 1, and an untracked repeat is byte-silent. The model projects one
+/// entry of the process-wide physical-key owner map; other-key independence and the full
+/// window/session identity are Tier-1 negative controls. Explicit controller releases with no
+/// preceding physical episode are outside this pairing environment.
 ///
-/// `Buggy=1` reproduces the regression family: a consumed press emits an orphan
-/// release/repeat, a repeat re-decides or consumes the press-time disposition,
-/// closing an overlay clears its still-needed tracker entry, an overlay swallows
-/// the untracked release owed to a pre-overlay forwarded press, or repeat/release
-/// routing re-resolves current focus instead of retaining the original target.
-/// The literal (`[key_sequences]`) release is decided again at RELEASE time —
-/// the chord re-lookup `3742a3b44` removed: a modifier let go mid-hold misses
-/// the chord, and the release falls through to the encoder as an orphan Kitty
-/// report for a press the PTY never saw. The local-repeat release gets the same
-/// slip by analogy: its release helper arrived later (`4b7e0efc0`) and never
-/// re-looked-up, but a `[keybindings]` re-lookup at release time would leak
-/// the same way.
+/// `Buggy=1` is the regression family: a consumed press emits an orphan release/repeat, a
+/// repeat re-decides or consumes the press-time disposition, closing an overlay clears its
+/// still-needed tracker entry, an overlay swallows the untracked release owed to a pre-overlay
+/// forwarded press, or repeat/release routing re-resolves current focus instead of keeping the
+/// original target. The literal (`[key_sequences]`) and local-repeat (`[keybindings]`) releases
+/// are decided again at release time (a chord re-lookup): a modifier let go mid-hold misses the
+/// chord, and the release falls through to the encoder as an orphan Kitty report for a press
+/// the PTY never saw.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn input_release_pairing_model() -> Model {
@@ -2654,7 +2470,7 @@ pub fn input_release_pairing_model() -> Model {
                 } else {
                     release_routed_window == 0
                 };
-            invariant StateBounds:
+            bound StateBounds:
                 phase <= 3 && tracker <= 4 && overlay_open <= 1 &&
                 press_literal <= 1 && press_local <= 1 &&
                 repeat_observed <= 1 && repeat_emitted <= 1 && release_emitted <= 1 &&
@@ -2669,35 +2485,29 @@ pub fn input_release_pairing_model() -> Model {
 /// Full two-phase overlap handoff shared by native-update parent and child.
 ///
 /// The parent parks its readers, a readerless child paints and proves the exact
-/// adoption/layout/session set, the parent rechecks every mutable admission fact
-/// (the resident operator's quiesce among them), and one
-/// atomic Commit+exit grants ownership. The child releases its prebuilt
-/// reader gate directly from Commit; the later UI wake is diagnostic only. Every
-/// pre-Commit failure signals the candidate's entire process group and then reaps
-/// the direct child before parent readers resume or deferred teardown replays —
-/// including when the group leader has already exited but a descendant is live.
-/// The guarded v0.52 one-byte branch requires an
-/// exact, strictly-newer, zero-history legacy payload before ACK+release.
-/// This is a process/event-loop interleaving model through the atomic Commit
-/// linearization point. It does not claim power-loss durability, and physical
-/// input arriving after Commit linearizes belongs to the replacement process's
-/// normal input path rather than this parent's pre-Commit admission snapshot.
-/// Input that reaches this parent while its main thread holds the claim
-/// (`arbiter == 1`) is the parent's: what the claim answers before the write
-/// (a live `video` request, the messages flush) can take real time, so the
-/// Commit drains that input through one more dispatch fence before it writes,
-/// or, undrained, gives the claim to the rejection.
+/// adoption/layout/session set, the parent rechecks every mutable admission fact (the resident
+/// operator's quiesce among them), and one atomic Commit+exit grants ownership. The child
+/// releases its prebuilt reader gate directly from Commit; the later UI wake is diagnostic
+/// only. Every pre-Commit failure signals the candidate's entire process group and then reaps
+/// the direct child before parent readers resume or deferred teardown replays, including when
+/// the group leader has exited but a descendant lives. The guarded v0.52 one-byte branch
+/// requires an exact, strictly-newer, zero-history legacy payload before ACK+release.
 ///
-/// `Buggy=1` admits the regression family: partial/stale proof Commit, reader
-/// release on ProofReady, legacy ACK for ambiguous/scrolled state, parent resume
-/// before reap, the old wait-before-group-signal ordering that could strand a
-/// live descendant after its leader exited, a parent that exits after its Commit
-/// write without checking the result (an EPIPE from a child already gone still ends
-/// the parent, and nobody owns the terminal), and a reject sweep whose signal
-/// reaches only the leader — `kill(pid)` where `kill(-pgid)` was meant, the mirror
-/// of 4a660aded's group-only sweep that missed a candidate outside its own group;
-/// and a Commit written over input queued to the parent after its claim, which
-/// dies with the parent's `_exit`.
+/// This is a process/event-loop interleaving model through the atomic Commit linearization
+/// point. It claims no power-loss durability, and physical input arriving after Commit belongs
+/// to the replacement process's input path. Input that reaches this parent while its main
+/// thread holds the claim (`arbiter == 1`) is the parent's: what the claim answers before the
+/// write (a live `video` request, the messages flush) can take real time, so the Commit drains
+/// that input through one more dispatch fence before it writes, or, undrained, gives the claim
+/// to the rejection.
+///
+/// `Buggy=1` admits the regression family: a partial/stale proof Commit, reader release on
+/// ProofReady, legacy ACK for ambiguous/scrolled state, parent resume before reap, a wait
+/// before the group signal (stranding a live descendant after its leader exited), a parent
+/// that exits after its Commit write without checking the result (an EPIPE from a child
+/// already gone still ends the parent, and nobody owns the terminal), a reject sweep whose
+/// signal reaches only the leader (`kill(pid)` for `kill(-pgid)`), and a Commit written over
+/// input queued to the parent after its claim, which dies with the parent's `_exit`.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_update_overlap_handoff_model() -> Model {
@@ -2727,22 +2537,19 @@ pub fn native_update_overlap_handoff_model() -> Model {
             var layout_exact = 1;
             var epoch_exact = 1;
             var teardown_allows = 1;
-            // Session DEATH (HUP/ERR) rejects, while queued readable output
-            // (pty_output_queued below) is tolerated: post-park bytes wait
-            // gap-free in the kernel and replay through the child's fresh parser
-            // after Commit.
+            // Session death (HUP/ERR) rejects, while queued readable output
+            // (`pty_output_queued`) is tolerated: post-park bytes wait gap-free in the kernel
+            // and replay through the child's fresh parser after Commit.
             var sessions_alive = 1;
             var pty_output_queued = 0;
-            // Queued-but-undispatched hardware input DEFERS Commit (it must be
-            // drained through the live input path into the persistent masters
-            // before `_exit` can be allowed to run) but is not a failure.
+            // Queued-but-undispatched hardware input defers Commit (it must drain through the
+            // live input path into the persistent masters before `_exit`) but is no failure.
             var input_queue_quiet = 1;
             var native_safe = 1;
             var commit_channel = 1;
-            // THE RESIDENT OPERATOR IS FENCED FOR THE REPLACEMENT: its quiesce is
-            // one of the admission's facts, not a precondition kept beside them.
-            // A transaction in flight at the Commit refuses it — as activity,
-            // retried — and the rollback is the one every other refusal takes.
+            // The resident operator's quiesce is one of the admission's facts: a transaction
+            // in flight at the Commit refuses it as activity (retried), with the rollback
+            // every other refusal takes.
             var operator_quiesced = 1;
             // Shared atomic linearization point after ProofReady:
             // 0 Waiting, 1 Committing, 2 Rejecting, 3 Committed.
@@ -2763,25 +2570,21 @@ pub fn native_update_overlap_handoff_model() -> Model {
             var legacy_strict_newer = 1;
             var legacy_ack = 0;
             var diagnostic_wake = 1;
-            // THE LATE PARK. On the launched lane the successor
-            // exists BEFORE the parent parks: launched, booted and dialled with
-            // every reader live, holding NOTHING until the post-park grant's
-            // first descriptor message (`granted`; a grant of more than 62
-            // sessions continues in further messages, `NativeUpdateRendezvousGrant`). Until then a revocation kills,
-            // reaps and retires the candidate with the parent's readers never
-            // stopped, and a parked parent whose capture missed may resume its
-            // readers beside the live candidate and park again — legitimately,
-            // because no descriptor has left. `granted` is the one flag both
-            // lanes share: the fork lane grants at the spawn (inheritance).
+            // The late park. On the launched lane the successor exists before the parent
+            // parks: launched, booted and dialled with every reader live, holding nothing
+            // until the post-park grant's first descriptor message (`granted`; a grant of more
+            // than 62 sessions continues in further messages, `NativeUpdateRendezvousGrant`).
+            // Until then a revocation kills, reaps and retires the candidate with the parent's
+            // readers never stopped, and a parked parent whose capture missed may resume its
+            // readers beside the live candidate and park again, since no descriptor has left.
+            // `granted` is the one flag both lanes share: the fork lane grants at the spawn.
             var launched_early = 0;
             var granted = 0;
             var retired = 0;
-            // A revoked successor is proven gone one of two ways: with no
-            // signal of ours (this flag) — it EXITS on the closed rendezvous by
-            // its own rule, or it had died before it — or it ignores the EOF
-            // for the whole grace and we kill it. Both reach `child_reaped`;
-            // only the second is a kill of ours. Who gives its counted trial
-            // launch back is the death's evidence's to decide, not modelled here.
+            // A revoked successor is proven gone one of two ways: with no signal of ours (this
+            // flag: it exits on the closed rendezvous, or had died before), or it ignores the
+            // EOF for the whole grace and we kill it. Both reach `child_reaped`. Who gives its
+            // counted trial launch back is the death evidence's to decide, not modelled here.
             var successor_exited = 0;
 
             action SelectLegacyBridge when (
@@ -2842,13 +2645,11 @@ pub fn native_update_overlap_handoff_model() -> Model {
                 child_killed = 1;
                 group_signaled = 1;
             }
-            // THE OTHER WAY A REVOKED SUCCESSOR ENDS, and the common one: the
-            // closed rendezvous is a zero-byte `recv` it already maps to "the
-            // parent closed the rendezvous", so it forgives its own trial launch
-            // and exits before any window. Nothing of ours signalled it, so
-            // `group_signaled` stays 0. A successor already dead when the
-            // revoke lands (a hang-up, the machine's kill during the hold) takes
-            // this action too, having run no such exit.
+            // The other, commoner way a revoked successor ends: the closed rendezvous is a
+            // zero-byte `recv` it maps to "the parent closed the rendezvous", so it forgives
+            // its own trial launch and exits before any window, unsignalled
+            // (`group_signaled` stays 0). A successor already dead when the revoke lands (a
+            // hang-up, the machine's kill during the hold) takes this action too.
             action SuccessorExitsOnRevoke when (
                 phase == 0 && launched_early == 1 && child_live == 1 &&
                 granted == 0 && failure == 1 && arbiter == 2 &&
@@ -2939,17 +2740,16 @@ pub fn native_update_overlap_handoff_model() -> Model {
                 epoch_exact = 0;
                 failure = 1;
             }
-            // Queued OUTPUT during the overlap is NOT a failure: the parent
-            // provably consumes no post-park bytes, so the carried checkpoint
-            // stays a valid ground-state prefix and the child drains the queue
-            // after Commit. Commit admission never reads this variable.
+            // Queued output during the overlap is no failure: the parent consumes no post-park
+            // bytes, so the carried checkpoint stays a valid ground-state prefix and the child
+            // drains the queue after Commit. Commit admission never reads this variable.
             action PtyOutputQueues when (
                 phase == 3 && pty_output_queued == 0 && arbiter == 0
             ) {
                 pty_output_queued = 1;
             }
-            // Session DEATH keeps the old fail-closed semantics: the adoption
-            // proof's live-set identity is stale, so the attempt must reject.
+            // Session death fails closed: the adoption proof's live-set identity is stale, so
+            // the attempt must reject.
             action PtySessionDies when (
                 phase > 1 && phase <= 3 && sessions_alive == 1 &&
                 arbiter == 0 && failure == 0
@@ -2957,12 +2757,10 @@ pub fn native_update_overlap_handoff_model() -> Model {
                 sessions_alive = 0;
                 failure = 1;
             }
-            // Hardware input queued in the OS is not a failure — it
-            // parks Commit (the admission guard requires the queue drained)
-            // until the run loop delivers it to the persistent masters.
-            // Input queues to the parent until it exits: while the Commit is
-            // admitted too, and while its claim is held (`arbiter == 1`), since
-            // what the claim answers before the write takes real time.
+            // Hardware input queued in the OS is no failure: it parks Commit (admission needs
+            // the queue drained) until the run loop delivers it to the persistent masters.
+            // Input queues to the parent until it exits, including while its claim is held
+            // (`arbiter == 1`), since what the claim answers before the write takes real time.
             action QueueHardwareInput when (
                 phase == 3 && input_queue_quiet == 1 && arbiter <= 1
             ) {
@@ -3091,13 +2889,11 @@ pub fn native_update_overlap_handoff_model() -> Model {
                 failure = 1;
                 commit_admission_exact = 0;
             }
-            // Shipping never reaps (`try_wait`) after ProofReady. A child that
-            // exits before Commit is seen by the worker's NON-REAPING liveness
-            // probe, which rejects through `WorkerWinsRejectArbiter` like any
-            // other worker reject; once the main thread's Commit has won the
-            // arbiter instead, the exit is observed only when the real atomic
-            // Commit-pipe write fails (normally EPIPE), and this transition
-            // transfers the arbiter to rollback without granting authority.
+            // Shipping never reaps (`try_wait`) after ProofReady. A child that exits before
+            // Commit is seen by the worker's non-reaping liveness probe, which rejects through
+            // `WorkerWinsRejectArbiter`; once the main thread's Commit has won the arbiter, the
+            // exit shows only when the atomic Commit-pipe write fails (normally EPIPE), and
+            // this transfers the arbiter to rollback without granting authority.
             action CommitWriteFails when (
                 protocol == 0 && phase == 3 && child_live == 1 &&
                 arbiter == 1 && commit_admission_exact == 1 && commit == 0
@@ -3148,9 +2944,8 @@ pub fn native_update_overlap_handoff_model() -> Model {
                 parent_exited = 1;
                 commit_write_failed = 1;
             }
-            // The historical defect: the Commit written at once after
-            // what its claim answered, over the input queued to the parent
-            // meanwhile, which then dies with the `_exit`.
+            // The Commit written at once after what its claim answered, over the input queued
+            // to the parent meanwhile, which then dies with the `_exit`.
             action BuggyCommitOverQueuedInput when (
                 Buggy == 1 && protocol == 0 && phase == 3 && child_live == 1 &&
                 arbiter == 1 && commit_admission_exact == 1 && input_queue_quiet == 0
@@ -3328,14 +3123,10 @@ pub fn native_update_overlap_handoff_model() -> Model {
                 } else {
                     parent_resumed == 0
                 };
-            // A REAP FOLLOWS THE SIGNAL THAT LICENSED IT — unless there was
-            // nothing to signal. The rule exists so a direct child is never
-            // `wait`ed before its process group has been swept (a `wait` reaps
-            // the group leader and destroys the pid identity the sweep needs).
-            // A successor that EXITED on the closed rendezvous was never
-            // signalled by us at all: its termination is proven by a vacant pid,
-            // there is no leader left to sweep, and requiring a signal first
-            // would mean killing a process that is already gone.
+            // A reap follows the signal that licensed it, unless there was nothing to signal:
+            // a direct child is never `wait`ed before its group is swept (the `wait` reaps the
+            // leader and destroys the pid identity the sweep needs). A successor that exited
+            // on the closed rendezvous was never signalled: a vacant pid proves its end.
             invariant ProcessGroupSignalPrecedesDirectChildReap:
                 if child_reaped == 1 && successor_exited == 0 {
                     group_signaled == 1 && waited_before_group_signal == 0
@@ -3388,12 +3179,9 @@ pub fn native_update_overlap_handoff_model() -> Model {
                 } else {
                     parent_readers <= 1
                 };
-            // AN ATTEMPT RETIRES ONLY OVER A SUCCESSOR PROVEN GONE — which is
-            // what stops a retry launching beside a candidate that is still
-            // running. "Proven" is the reap, and the reap has two licences: the
-            // successor exited on the closed rendezvous by its own rule, or we
-            // killed it. Both leave `child_live == 0` and `child_reaped == 1`;
-            // only the second is a kill of ours.
+            // An attempt retires only over a successor proven gone, so a retry never launches
+            // beside a candidate still running. The proof is the reap, licensed either by the
+            // successor's own exit on the closed rendezvous or by our kill.
             invariant UngrantedRetireRequiresReap:
                 if retired == 1 {
                     (child_killed == 1 || successor_exited == 1) &&
@@ -3414,16 +3202,13 @@ pub fn native_update_overlap_handoff_model() -> Model {
 
 /// Exact live-caret DFA for canonical profanity completion.
 ///
-/// Every proper prefix of `fuck`, including `fuc`, is ordinary text. Only the
-/// complete token activates and creates an episode; harmless continuations,
-/// non-token contexts, ignore rules, and a delimiter-settled `fuc` stay
-/// inactive. The mutant reproduces the predictive-prefix regression by
-/// activating one character early, and carries two consequences of an early
-/// activation: the cue that fired at `fuc` cannot be taken back, so a `fuchsia`
+/// Every proper prefix of `fuck`, including `fuc`, is ordinary text. Only the complete token
+/// activates and creates an episode; harmless continuations, non-token contexts, ignore rules,
+/// and a delimiter-settled `fuc` stay inactive. The mutant activates one character early, with
+/// two consequences: the cue that fired at `fuc` cannot be taken back, so a `fuchsia`
 /// continuation or a delimiter retracts the highlight but keeps the episode
-/// (`HarmlessAndSettledAreInactive`); and the completing `k` mints a fresh
-/// episode instead of continuing the prefix's, so `fuck` cues twice
-/// (`CompletionCreatesExactlyOneEpisode`).
+/// (`HarmlessAndSettledAreInactive`); and the completing `k` mints a fresh episode instead of
+/// continuing the prefix's, so `fuck` cues twice (`CompletionCreatesExactlyOneEpisode`).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn exact_profanity_completion_model() -> Model {
@@ -3532,36 +3317,31 @@ pub fn exact_profanity_completion_model() -> Model {
     }
 }
 
-/// Process-crash/interleaving model for the native updater's fixed-path install
-/// transaction and boot-health confirmation. It models PROCESS crashes, which
-/// preserve every completed filesystem transition represented here, and not
-/// sudden power loss. The implementation does sync for power loss on a best-
-/// effort basis — every ledger record goes through `manifest::write_durable`
-/// (file `sync_all`, rename, parent-directory sync) and the fixed-path swap
-/// syncs its parent directory — but a filesystem that reports a sync
-/// unsupported degrades to non-durable, so power-loss durability is not a
-/// claim this model makes.
+/// Process-crash/interleaving model for the native updater's fixed-path install transaction
+/// and boot-health confirmation. It models process crashes, which preserve every completed
+/// filesystem transition represented here, not sudden power loss: every ledger record goes
+/// through `manifest::write_durable` (file `sync_all`, rename, parent-directory sync) and the
+/// fixed-path swap syncs its parent directory, but a filesystem that reports sync unsupported
+/// degrades to non-durable, so power-loss durability is no claim of this model.
 ///
 /// Identity `1` is exact OLD, `2` exact authorized NEW, and `3` a same-build or
-/// superseding-but-unauthorized artifact. The committed path verifies OLD's
-/// build+sealed commit before preparation, arms the exact trial before one
-/// atomic fixed-path swap, records NEW's exact build+commit+digest receipt,
-/// reconstructs that receipt after the swap-before-receipt crash cut, and only
-/// GCs rollback after a real first-present, health proof, and successful disarm.
-/// Startup consumes inherited re-exec/expected-artifact authority before any
-/// verifier can inherit it, then observes an armed trial before interpreting that
-/// authority. `Buggy=1` enables independent historical-shortcut controls, each
-/// its own action dead at `Buggy=0`: build-only OLD or mismatched prior-receipt
-/// authority, an inherited-authority early return, a superseded swap,
-/// pre-present disarm, proof-failed early GC, and failed receipt restoration
-/// that leaves NEW's receipt authoritative. Seven more are the slips the
-/// remaining recovery laws refuse: a legacy refusal that disarms the trial it
-/// was deferring for; a receipt written ahead of the swap it describes; a two-rename "swap" failing between its
-/// renames with NEW installed and OLD off the fixed path (`RENAME_SWAP` exists to
-/// make that cut impossible); a failed restore that disarms the trial to stop the
-/// crash loop; an exec failure that runs the rollback GC before any restore; a
-/// crash-loop restore of an unverified rollback; and a restored rollback GC'd while
-/// its trial is still armed.
+/// superseding-but-unauthorized artifact. The committed path verifies OLD's build+sealed commit
+/// before preparation, arms the exact trial before one atomic fixed-path swap, records NEW's
+/// exact build+commit+digest receipt, reconstructs that receipt after the swap-before-receipt
+/// crash cut, and GCs rollback only after a real first-present, health proof, and successful
+/// disarm. Startup consumes inherited re-exec/expected-artifact authority before any verifier
+/// can inherit it, then observes an armed trial before interpreting that authority.
+///
+/// `Buggy=1` enables independent shortcut controls, each its own action dead at `Buggy=0`:
+/// build-only OLD or mismatched prior-receipt authority, an inherited-authority early return, a
+/// superseded swap, pre-present disarm, proof-failed early GC, and failed receipt restoration
+/// that leaves NEW's receipt authoritative. Seven more are slips the recovery laws refuse: a
+/// legacy refusal that disarms the trial it was deferring for; a receipt written ahead of the
+/// swap it describes; a two-rename "swap" failing between its renames with NEW installed and
+/// OLD off the fixed path (`RENAME_SWAP` makes that cut impossible); a failed restore that
+/// disarms the trial to stop the crash loop; an exec failure that runs the rollback GC before
+/// any restore; a crash-loop restore of an unverified rollback; and a restored rollback GC'd
+/// while its trial is still armed.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_update_disk_transaction_model() -> Model {
@@ -3582,10 +3362,9 @@ pub fn native_update_disk_transaction_model() -> Model {
             var startup_returned = 0;
             var startup_deferred = 0;
             var disk_lane_ready = 0;
-            // A v0.52 parent can hand off an already-swapped NEW with an armed
-            // trial and exact OLD rollback but no ready/installed receipt. Keep
-            // this as a first-class reachable startup state rather than treating
-            // post-swap child startup as if it began from staged OLD.
+            // A v0.52 parent can hand off an already-swapped NEW with an armed trial and exact
+            // OLD rollback but no ready/installed receipt: a reachable startup state of its own,
+            // not a post-swap start treated as staged OLD.
             var legacy_postswap = 0;
             var legacy_variant = 0;
             var ready_present = 0;
@@ -3802,12 +3581,10 @@ pub fn native_update_disk_transaction_model() -> Model {
                 startup_deferred = 1;
                 boot_health_attempted = 1;
             }
-            // No receipt and no ready record: there is no evidence left to rebuild
-            // from. The retired v0.52 branch synthesized one here from sealed disk
-            // facts; without it the shipping code returns "no exact receipt or
-            // authorized recovery record" and defers, preserving the armed trial
-            // and fixed rollback for a later launch. Modeling that refusal is what
-            // keeps this state reachable-but-not-stuck.
+            // No receipt and no ready record: no evidence is left to rebuild from, so the
+            // shipping code returns "no exact receipt or authorized recovery record" and
+            // defers, keeping the armed trial and fixed rollback for a later launch. Modelling
+            // that refusal keeps this state reachable but not stuck.
             action RefuseLegacyMissingRecoveryEvidence when (
                 legacy_postswap == 1 && startup_phase == 1 &&
                 receipt == 0 && ready_present == 0
@@ -4506,16 +4283,17 @@ pub fn native_update_disk_transaction_model() -> Model {
                 } else {
                     old_receipt_restored <= 1
                 };
-            invariant CrashBudgetBounded: crashes <= MaxCrashes;
+            bound CrashBudgetBounded: crashes <= MaxCrashes;
         }
     }
 }
 
-/// Settings' semantic pager is a bounded virtual cursor shared by visible
-/// Previous/Next controls, absolute accessibility scroll positions, and signed
-/// wheel/controller line deltas. Every transition first clamps an obsolete cursor
-/// to the current limit, then applies its motion and clamps again. `Buggy=1`
-/// recreates the missing upper clamp for Next, Absolute, and forward line scroll.
+/// A Settings page's scroll list is a bounded cursor over its stops, shared by the wheel and
+/// arrow keys (a row), Page Up/Down (the rows shown, a signed multi-row delta) and absolute
+/// accessibility scroll positions. Every transition first clamps an obsolete cursor to the
+/// current limit (a grown window or a changed layout shrinks it), then applies its motion and
+/// clamps again. `Buggy=1` drops the upper clamp for a row forward, Absolute, and a forward
+/// page.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn settings_page_scroll_model() -> Model {
@@ -4537,10 +4315,10 @@ pub fn settings_page_scroll_model() -> Model {
             action ChooseTarget when (target <= Max) {
                 target = target + 1;
             }
-            action PreviousPage {
+            action RowBack {
                 cursor = if cursor > 0 { cursor - 1 } else { 0 };
             }
-            action NextPage {
+            action RowForward {
                 cursor = if Buggy == 1 {
                     cursor + 1
                 } else if cursor <= limit - 1 {
@@ -4571,76 +4349,65 @@ pub fn settings_page_scroll_model() -> Model {
                 };
             }
             invariant CursorBounded: cursor <= limit;
-            invariant LimitBounded: limit <= Max;
-            invariant TargetBounded: target <= Max + 1;
+            bound LimitBounded: limit <= Max;
+            bound TargetBounded: target <= Max + 1;
         }
     }
 }
 
-/// VIDEO recording and publication are one serialized, fail-closed lifecycle.
+/// Video recording and publication are one serialized, fail-closed lifecycle.
 ///
-/// The control thread pre-creates a private, server-named directory before the
-/// event-loop request is armed. `recording_slot` owns that request through the
-/// pending/recording phases; `BeginExport` atomically hands ownership to the
-/// process-wide `export_permit`. Success transfers the directory from private
-/// ownership to a published artifact, while rejection, cancellation, encode
-/// failure, owner loss, and a live opacity transition all remove it.
+/// The control thread pre-creates a private, server-named directory before the event-loop
+/// request is armed. `recording_slot` owns that request through the pending/recording phases;
+/// `BeginExport` atomically hands ownership to the process-wide `export_permit`. Success
+/// transfers the directory from private ownership to a published artifact, while rejection,
+/// cancellation, encode failure, owner loss, and a live opacity transition all remove it.
 ///
-/// Mode is honest about the presentation source: a swapchain tap requires
-/// glass, and an offscreen present-real recording requires no glass and owns a
-/// pacing timer, its sole redraw driver. A glass recording owns one exactly when
-/// the request asked for `pace` (`video <seconds> ... pace`), because the
-/// post-present hook alone starves once an unchanged frame is skipped;
-/// `video_initial_next_frame` arms both (`RecordingOwnsItsPacingTimer`). The
-/// timer lives in the recording itself, so outside the recording phase it does
-/// not exist. A translucent transition aborts a live tap before another frame
-/// can be accepted.
+/// Mode is honest about the presentation source: a swapchain tap requires glass, and an
+/// offscreen present-real recording requires no glass and owns a pacing timer, its sole redraw
+/// driver. A glass recording owns one exactly when the request asked for `pace`
+/// (`video <seconds> ... pace`), because the post-present hook alone starves once an unchanged
+/// frame is skipped; `video_initial_next_frame` arms both (`RecordingOwnsItsPacingTimer`). The
+/// timer lives in the recording itself, so outside the recording phase it does not exist. A
+/// translucent transition aborts a live tap before another frame can be accepted.
 ///
-/// `Buggy=1` exposes independently reachable historical failure classes:
-/// cleanup may strand the private directory, a windowed request may take the
-/// headless arm, and a second recording may acquire ownership while the first is
-/// still exporting (the begin guard testing `video_rec` without
-/// `video_export.is_busy()`). It also exposes publication without winning the
-/// cancellation CAS and retention of a tap after the glass becomes translucent.
-/// Six more dead mutants are each one line of the shipping lifecycle written
-/// wrong:
-/// * `BuggyExportRetainsVirtualTarget` — `video_finalize` hands the take to the
-///   exporter without `ws.present = None`, so a headless window keeps its
-///   recording-only `Virtual` target after recording ended (the idle-zero law
-///   `finalize_drops_virtual_target_and_timer` pins). `ModeMatchesRecordingPhase`.
-/// * `BuggyFinalizeKeepsRecordingSlot` — `video_finalize` reading `video_rec`
-///   through `as_mut()` instead of `take()`: the export runs while the recording
-///   slot still reads occupied, and every later `video` request is refused as
-///   "already in progress". `SlotMatchesPhase`.
-/// * `BuggyDetachGlassDuringTap` — a window close drops its glass without
-///   `video_abort_window_close`, so the swapchain tap outlives the surface it
-///   copies. `TapOnlyOnGlass`.
-/// * `BuggyBeginHeadlessUntimed` — `video_initial_next_frame` written as
-///   `pace.then_some(now)`: an unpaced offscreen loop begins with no deadline
-///   and records nothing. `RecordingOwnsItsPacingTimer`.
-/// * `BuggyPacedTapUntimed` — the same function returning `None` for every
-///   swapchain tap: a paced glass recording starves on its first skipped
-///   unchanged frame. `RecordingOwnsItsPacingTimer`.
-/// * `BuggyLateCancelRevokes` — `VideoCancellation::cancel` as a blind store of
-///   `VIDEO_CANCELLED` instead of the CAS from `VIDEO_CANCEL_LIVE`, so a timeout
-///   after `authorize_commit` revokes an export already past its rename
-///   boundary. Plausible rather than historical (the token was a CAS from its
-///   first commit); `CancelledOwnsNothing` catches it, since a won cancellation
-///   has ended the lifecycle while this one is still exporting.
+/// `Buggy=1` exposes independently reachable failure classes: cleanup that strands the private
+/// directory, a windowed request taking the headless arm, a second recording acquiring
+/// ownership while the first still exports (the begin guard testing `video_rec` without
+/// `video_export.is_busy()`), publication without winning the cancellation CAS, and a tap
+/// retained after the glass becomes translucent. Six more dead mutants are each one line of
+/// the shipping lifecycle written wrong:
+/// * `BuggyExportRetainsVirtualTarget`: `video_finalize` hands the take to the exporter
+///   without `ws.present = None`, so a headless window keeps its recording-only `Virtual`
+///   target (the idle-zero law `finalize_drops_virtual_target_and_timer` pins).
+///   `ModeMatchesRecordingPhase`.
+/// * `BuggyFinalizeKeepsRecordingSlot`: `video_finalize` reading `video_rec` through
+///   `as_mut()` instead of `take()`, so the slot still reads occupied during the export and
+///   every later `video` request is refused as "already in progress". `SlotMatchesPhase`.
+/// * `BuggyDetachGlassDuringTap`: a window close drops its glass without
+///   `video_abort_window_close`, so the swapchain tap outlives the surface it copies.
+///   `TapOnlyOnGlass`.
+/// * `BuggyBeginHeadlessUntimed`: `video_initial_next_frame` written as `pace.then_some(now)`,
+///   so an unpaced offscreen loop begins with no deadline and records nothing.
+///   `RecordingOwnsItsPacingTimer`.
+/// * `BuggyPacedTapUntimed`: the same function returning `None` for every swapchain tap, so a
+///   paced glass recording starves on its first skipped unchanged frame.
+///   `RecordingOwnsItsPacingTimer`.
+/// * `BuggyLateCancelRevokes`: `VideoCancellation::cancel` as a blind store of
+///   `VIDEO_CANCELLED` instead of the CAS from `VIDEO_CANCEL_LIVE`, so a timeout after
+///   `authorize_commit` revokes an export already past its rename boundary.
+///   `CancelledOwnsNothing`: a won cancellation has ended the lifecycle, while this one still
+///   exports.
 ///
-/// No law restates another. "Recording and export never overlap" and "at most
-/// one lifecycle is live" are `SlotMatchesPhase` and
-/// `PrivateDirectoryOwnedByLifecycle`, which the second-recording mutant breaks
-/// on its first step; "a published take owns nothing" is
-/// `CommitAuthorizationScope` (published only at phase 0) read through the
-/// same two laws, and "a cancelled lifecycle owns nothing" is
-/// `CancelledOwnsNothing` (cancelled only at phase 0) read through them too.
-/// An `active` counter of the two slots, and a `late_cancel` witness of a
-/// cancellation that lost the CAS, were bookkeeping no shipping code keeps: a
-/// losing cancel changes nothing, so `CancelAfterAuthorization` is a stutter.
+/// No law restates another. "Recording and export never overlap" and "at most one lifecycle is
+/// live" are `SlotMatchesPhase` and `PrivateDirectoryOwnedByLifecycle`, which the
+/// second-recording mutant breaks on its first step; "a published take owns nothing" is
+/// `CommitAuthorizationScope` (published only at phase 0) read through the same two laws, and
+/// "a cancelled lifecycle owns nothing" is `CancelledOwnsNothing` (cancelled only at phase 0)
+/// read through them too. A losing cancel changes nothing, so `CancelAfterAuthorization` is a
+/// stutter.
 ///
-/// Tier-0 exercises each mutant directly in addition to the exhaustive
-/// prove-and-catch check.
+/// Tier-0 exercises each mutant directly in addition to the exhaustive prove-and-catch check.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn video_recording_lifecycle_model() -> Model {
@@ -4785,10 +4552,10 @@ pub fn video_recording_lifecycle_model() -> Model {
                 published = 0;
                 cancel_state = 1;
             }
-            // Why: the mutant must be its OWN action, not a `Buggy` arm inside a
-            // live one — the strict-vacuity audit removes the dead set and
-            // requires the remaining Buggy=1 baseline to be safe, so an inline
-            // arm would make every dead action uncreditable as a negative control.
+            // Each mutant is its own action, not a `Buggy` arm inside a live one: the
+            // strict-vacuity audit removes the dead set and requires the remaining Buggy=1
+            // baseline to be safe, so an inline arm would make every dead action uncreditable
+            // as a negative control.
             action BuggyStrandPrivateDirOnCleanup when (
                 Buggy == 1 && phase > 0
             ) {
@@ -4866,7 +4633,7 @@ pub fn video_recording_lifecycle_model() -> Model {
                 timer = 0;
             }
 
-            invariant Bounds:
+            bound Bounds:
                 phase <= 3 && glass <= 1 && pace <= 1 && mode <= 2 &&
                 timer <= 1 && translucent <= 1 && recording_slot <= 1 &&
                 export_permit <= 1 && private_dirs <= 2 &&
@@ -4914,22 +4681,20 @@ pub fn video_recording_lifecycle_model() -> Model {
     }
 }
 
-/// Retention of per-process capture namespaces is decided by the exact instance
-/// lease, not merely by PID liveness.
+/// Retention of per-process capture namespaces is decided by the exact instance lease, not
+/// merely by PID liveness.
 ///
-/// Lease state `0` is a legacy namespace with no lease file, `1` is a lock held
-/// by a live exact process instance, `2` is a well-formed but freely lockable
-/// stale instance, and `3` is malformed/untrusted lease metadata. A held lease
-/// and malformed metadata fail closed to KEEP. A free lease is exact proof of
-/// staleness and is removed even if its recorded PID has since been reused.
-/// Only the missing-legacy case falls back to the coarse PID probe.
+/// Lease state `0` is a legacy namespace with no lease file, `1` a lock held by a live exact
+/// process instance, `2` a well-formed but freely lockable stale instance, and `3`
+/// malformed/untrusted lease metadata. A held lease and malformed metadata fail closed to keep.
+/// A free lease is exact proof of staleness and is removed even if its recorded PID has been
+/// reused. Only the missing-legacy case falls back to the coarse PID probe.
 ///
-/// `Buggy=1` independently recreates removal of held/malformed namespaces, the
-/// PID-reuse leak that keeps a free lease when the numeric PID is alive, and a
-/// legacy namespace kept even though its PID is dead — the
-/// `InstanceLeaseState::Missing if !pid_alive => Remove` arm of
-/// `decide_instance_namespace_sweep` lost into the fail-closed `Keep` arm, so
-/// every pre-lease capture namespace leaks forever.
+/// `Buggy=1` independently recreates removal of held/malformed namespaces, the PID-reuse leak
+/// that keeps a free lease when the numeric PID is alive, and a legacy namespace kept though its
+/// PID is dead (the `InstanceLeaseState::Missing if !pid_alive => Remove` arm of
+/// `decide_instance_namespace_sweep` folded into the fail-closed `Keep` arm, so every pre-lease
+/// capture namespace leaks for ever).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn exact_instance_retention_model() -> Model {
@@ -4962,7 +4727,7 @@ pub fn exact_instance_retention_model() -> Model {
                 };
             }
 
-            invariant Bounds:
+            bound Bounds:
                 lease <= 3 && pid_alive <= 1 && decision <= 2;
             invariant HeldNeverRemoved:
                 if lease == 1 { decision <= 1 } else { decision <= 2 };
@@ -4984,38 +4749,26 @@ pub fn exact_instance_retention_model() -> Model {
     }
 }
 
-/// A confined artifact operation is a retained-handle transaction, not a path
-/// string that may be resolved again after an attacker swaps an ancestor.
+/// A confined artifact operation is a retained-handle transaction, not a path string that may
+/// be resolved again after an attacker swaps an ancestor.
 ///
-/// `ConfinePin` retains the original inside object and its identity. Reads and
-/// writes target that pinned object even when the path's ancestor is swapped.
-/// `ValidateReply` then compares the reply-time path identity with the pin:
-/// unchanged identity may be certified; a swap fails closed, whether it happened
-/// before the operation or in the operation-to-reply interval.
+/// `ConfinePin` retains the original inside object and its identity. Reads and writes target
+/// that pinned object even when the path's ancestor is swapped. `ValidateReply` then compares
+/// the reply-time path identity with the pin: unchanged identity may be certified; a swap fails
+/// closed, whether it happened before the operation or in the operation-to-reply interval.
 ///
-/// `Buggy=1` exposes both forbidden TOCTOU classes. Re-resolving a swapped path
-/// reads or writes the outside object (`BuggyReresolveRead`/`Write`): that is
-/// every operation under path-only confinement, as it was before 6aeae4606
-/// anchored publication to retained handles (`AnchoredAccessNeverOutside`). And
-/// reply construction certifies the swapped identity despite having pinned a
-/// different object (`BuggyCertifySwapped`), which is also what a reply built
-/// without `validate_for_reply` says once the ancestor has moved.
+/// `Buggy=1` exposes both forbidden TOCTOU classes: re-resolving a swapped path reads or writes
+/// the outside object (`BuggyReresolveRead`/`Write`), which is every operation under path-only
+/// confinement (`AnchoredAccessNeverOutside`); and reply construction certifies the swapped
+/// identity despite having pinned a different object (`BuggyCertifySwapped`), which is what a
+/// reply built without `validate_for_reply` says once the ancestor has moved.
 ///
-/// No state records THAT the transaction is pinned or THAT the reply was
-/// validated. Each such flag would be written only by the action it names,
-/// together with `phase`, so a law over it restates that assignment and its
-/// only mutant flips the flag — a confinement that pins nothing but can still
-/// only operate through the pin, a validation-free reply that still names the
-/// right object. The harm behind both slips is the outside effect and the
-/// false certificate, and the two laws below judge exactly those. More
-/// restatements are absent for the same reason: "an operation targets the
-/// pinned object" (`ReadPinned`/`WritePinned`'s guard and paired assignment),
-/// "the path identity tracks the ancestor" (`SwapAncestor` sets both), "a
-/// successful reply follows an operation" (`ValidateReply`'s guard), and "a
-/// swapped path is never certified" beside "a successful reply certifies the
-/// original": no slip breaks one without the other, since a reply can only
-/// certify something other than the pinned original once the path has moved,
-/// so `SuccessfulReplyCertifiesOriginal` states both at once.
+/// No state records that the transaction is pinned or that the reply was validated: such a
+/// flag would be written only by the action it names, so a law over it restates that
+/// assignment. The harm is the outside effect and the false certificate, and the two laws
+/// judge exactly those. "A swapped path is never certified" and "a successful reply certifies
+/// the original" break together (a reply can certify something other than the pinned original
+/// only once the path has moved), so `SuccessfulReplyCertifiesOriginal` states both.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn anchored_artifact_transaction_model() -> Model {
@@ -5090,7 +4843,7 @@ pub fn anchored_artifact_transaction_model() -> Model {
                 certified_identity = 2;
             }
 
-            invariant Bounds:
+            bound Bounds:
                 phase <= 3 && swapped <= 1 && path_identity <= 2 &&
                 operation <= 2 && effect_target <= 2 && reply <= 2 &&
                 certified_identity <= 2;
@@ -5310,7 +5063,7 @@ pub fn artifact_reply_publication_model() -> Model {
                 guard = 0;
             }
 
-            invariant Bounds:
+            bound Bounds:
                 phase <= 12 && artifact <= 1 && guard <= 1 &&
                 committed <= 1 && reply <= 1 &&
                 challenge <= 1 && ack <= 1 && ack_failed <= 1 &&
@@ -5350,10 +5103,8 @@ pub fn artifact_reply_publication_model() -> Model {
                 } else {
                     quarantine_age <= QuarantineDelay
                 };
-            // Only the file. Everything else it once listed at phase 12 is
-            // another law's: the commit/reply/challenge/ACK laws each place
-            // their variable in phases that exclude 12, and the guard's drop IS
-            // the release that enters phase 12.
+            // Only the file: the commit/reply/challenge/ACK laws place their variables in
+            // phases that exclude 12, and the guard's drop is the release that enters it.
             invariant AbortReleaseRemovesUncommittedArtifact:
                 if phase == 12 { artifact == 0 } else { artifact <= 1 };
         }
@@ -5563,21 +5314,17 @@ pub fn artifact_handoff_capacity_model() -> Model {
     }
 }
 
-/// Durability ordering for one published video batch. Each `WriteMember`
-/// abstracts a member whose file contents have already been synced. `SyncBatch`
-/// records the directory barrier covering every member written so far, and a
-/// later member invalidates that coverage until another barrier completes. The
-/// reader-visible marker may be published only while the barrier covers the
-/// complete current batch.
+/// Durability ordering for one published video batch. Each `WriteMember` is a member whose file
+/// contents are already synced; `SyncBatch` records the directory barrier covering every member
+/// written so far, and a later member invalidates that coverage until another barrier
+/// completes. The reader-visible marker may be published only while the barrier covers the
+/// whole current batch.
 ///
-/// `Buggy=1` enables two dead-at-`Buggy=0` negative controls. `BuggyPublishBeforeSync`
-/// shows the marker over members no barrier covers (`MarkerCoversEveryMember`).
-/// `BuggySyncAhead` records a barrier that covers members not yet written — the
-/// projection of `ConfinedVideoDir::write_batch_member_authorized` dropping its
-/// `batch_synced.set(false)`: a flag that stays set claims every later member
-/// too. `MarkerCoversEveryMember` cannot see it (once the batch fills, the
-/// counts agree and the marker publishes over a member written after the
-/// barrier), so `BarrierCoversOnlyWrittenMembers` is its counterexample.
+/// `Buggy=1` enables two dead negative controls. `BuggyPublishBeforeSync` shows the marker over
+/// members no barrier covers (`MarkerCoversEveryMember`). `BuggySyncAhead` is
+/// `ConfinedVideoDir::write_batch_member_authorized` without its `batch_synced.set(false)`: a
+/// flag that stays set claims every later member too. `MarkerCoversEveryMember` cannot see it
+/// (once the batch fills the counts agree), so `BarrierCoversOnlyWrittenMembers` catches it.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn video_batch_publication_durability_model() -> Model {
@@ -5615,7 +5362,7 @@ pub fn video_batch_publication_durability_model() -> Model {
                 synced_members = MaxMembers;
             }
 
-            invariant Bounds: members <= MaxMembers && marker <= 1;
+            bound Bounds: members <= MaxMembers && marker <= 1;
             invariant BarrierCoversOnlyWrittenMembers: synced_members <= members;
             invariant MarkerCoversEveryMember:
                 if marker == 1 {
@@ -5627,56 +5374,45 @@ pub fn video_batch_publication_durability_model() -> Model {
     }
 }
 
-/// Refcounted video retention is a separate bounded lifecycle from publication.
-/// The producer and multiple `video frames` readers may share one exact
-/// recording identity. Marker publication or final reader validation requests
-/// one capability-bound convergence sweep. A non-final release cannot start
-/// maintenance; the last release schedules it, new acquisitions fail closed
-/// while that schedule/sweep is live, and only completion reopens acquisition.
-/// A replacement recording at the same lexical name is also refused while any
-/// original-identity lease remains.
+/// Refcounted video retention is a bounded lifecycle separate from publication. The producer
+/// and several `video frames` readers may share one exact recording identity. Marker
+/// publication or final reader validation requests one capability-bound convergence sweep. A
+/// non-final release cannot start maintenance; the last release schedules it, new acquisitions
+/// fail closed while that schedule/sweep is live, and only completion reopens acquisition. A
+/// replacement recording at the same lexical name is refused while any original-identity lease
+/// remains.
 ///
-/// `pending` is the abstract seam between the last count decrement and
-/// `StartSweep`. Shipping code performs both under one registry mutex, so no
-/// acquisition can observe the seam. Keeping it explicit makes the ordering
-/// obligation checkable instead of hiding it inside one large action.
+/// `pending` is the seam between the last count decrement and `StartSweep`. Shipping code does
+/// both under one registry mutex, so no acquisition observes it; it is explicit so the ordering
+/// obligation is checkable.
 ///
-/// Two variables are not registry fields, and each is what makes a law
-/// independent of the entry it judges:
-/// * `requested` is the obligation `arm_video_retention_sweep` created — set by
-///   `Arm`, discharged only by a finished sweep. The registry's own record of it
-///   (`armed`, the entry's `video_sweep_requested`) disappears with the entry, so
-///   a law over `armed` alone could not see a release that REMOVES an armed entry
-///   instead of sweeping it.
-/// * `admission_spent` is an entry whose reserved retention admission
-///   (`video_retention`) the last release has taken. `join_video_artifact_state`
-///   refuses every reader of such an entry, replacement or not.
+/// Two variables are not registry fields; each makes a law independent of the entry it judges:
+/// * `requested` is the obligation `arm_video_retention_sweep` created, set by `Arm` and
+///   discharged only by a finished sweep. The registry's own record (`armed`, the entry's
+///   `video_sweep_requested`) disappears with the entry, so a law over `armed` alone could not
+///   see a release that removes an armed entry instead of sweeping it.
+/// * `admission_spent` is an entry whose reserved retention admission (`video_retention`) the
+///   last release has taken; `join_video_artifact_state` refuses every reader of it.
 ///
-/// `Buggy=1` enables six dead negative controls: a sweep started before the
-/// last release, an acquisition during the sweep, a replaced recording joining
-/// the lease group, and three that are one line of the registry written wrong:
-/// * `BuggyArmedReleaseDropsEntry` — `ArtifactPathLease::drop` removing an armed
-///   entry at count zero instead of sweeping it: the `video_sweep_requested`
-///   case folded into the `else { held.remove(&key) }` branch, or the `_ =>` arm
-///   a release build takes when the capability or admission is missing. The
-///   retention that marker publication or reader validation asked for never runs
+/// `Buggy=1` enables six dead negative controls: a sweep started before the last release, an
+/// acquisition during the sweep, a replaced recording joining the lease group, and three that
+/// are one line of the registry written wrong:
+/// * `BuggyArmedReleaseDropsEntry`: `ArtifactPathLease::drop` removing an armed entry at count
+///   zero instead of sweeping it (the `video_sweep_requested` case folded into
+///   `else { held.remove(&key) }`, or the `_ =>` arm a release build takes when the capability
+///   or admission is missing), so the requested retention never runs
 ///   (`RequestedRetentionRunsAtLastRelease`).
-/// * `BuggyReleaseSweepsUnarmed` — `ArtifactPathLease::drop` without its
-///   `state.video_sweep_requested` test, so the last release of a recording
-///   that no marker publication or reader validation ever armed schedules the
-///   convergence sweep: retention runs around a publication nothing confirmed
-///   (`MaintenanceRequiresArm`).
-/// * `BuggyFinishKeepsEntry` — `finish_video_retention_sweep` resetting the
-///   entry's `sweeping` and `video_sweep_requested` instead of
-///   `held.remove(key)`. The kept entry has spent its admission, so every later
-///   reader is refused with `WouldBlock`, and after a same-name replacement with
-///   the stale identity's `NotFound` too (`IdleNameAdmitsReaders`).
+/// * `BuggyReleaseSweepsUnarmed`: `ArtifactPathLease::drop` without its
+///   `state.video_sweep_requested` test, so the last release of an unarmed recording schedules
+///   the sweep around a publication nothing confirmed (`MaintenanceRequiresArm`).
+/// * `BuggyFinishKeepsEntry`: `finish_video_retention_sweep` resetting `sweeping` and
+///   `video_sweep_requested` instead of `held.remove(key)`; the kept entry has spent its
+///   admission, so every later reader is refused with `WouldBlock`, and after a same-name
+///   replacement with the stale identity's `NotFound` (`IdleNameAdmitsReaders`).
 ///
-/// Neither "one maintenance phase at a time" nor "a finished sweep leaves the
-/// entry unarmed" is a law of its own: both branches of
-/// `RequestedRetentionRunsAtLastRelease` bound `pending + sweeping` by one, and
-/// an armed count-zero entry with neither pending nor sweeping is exactly what
-/// that law refuses.
+/// "One maintenance phase at a time" and "a finished sweep leaves the entry unarmed" are not
+/// laws of their own: both branches of `RequestedRetentionRunsAtLastRelease` bound
+/// `pending + sweeping` by one, and an armed count-zero entry with neither is what it refuses.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn artifact_reader_lease_model() -> Model {
@@ -5789,7 +5525,7 @@ pub fn artifact_reader_lease_model() -> Model {
                 sweeping = 0;
             }
 
-            invariant Bounds:
+            bound Bounds:
                 leases <= Cap && armed <= 1 && requested <= 1 &&
                 pending <= 1 && sweeping <= 1 && admission_spent <= 1 &&
                 identity_mismatch <= 1 && replacement_joined <= 1;
@@ -5846,7 +5582,7 @@ pub fn snapshot_generation_commit_model() -> Model {
                 payload = job;
                 done = 1;
             }
-            invariant Bounds:
+            bound Bounds:
                 latest <= 2 && job <= 2 && payload <= 2 && done <= 1;
             invariant CommittedPayloadIsCurrent:
                 (if done == 1 { payload } else { latest }) == latest;
@@ -5860,17 +5596,15 @@ pub fn snapshot_generation_commit_model() -> Model {
 /// dropped attempts before that bound may retry, but they never fall through to
 /// reading the previous composited frame.
 ///
-/// `Buggy=1` enables two independent slips in `capture_after_present_decision`,
-/// each a dead-at-`Buggy=0` negative-control action beside the healthy `Decide`:
-/// * `BuggyStaleCapture` treats a dropped present as capture authorization —
-///   the stale-capture defect (`NoStaleCapture`, `CaptureRequiresPresent`);
-/// * `BuggyRetryAtLimit` is the retry arm read as `attempts <= attempt_limit`
-///   for the shipping `attempts < attempt_limit`. Below the bound the two
-///   agree, so the slip is exactly this one decision: the last dropped present
-///   asks for a retry instead of failing closed (`DecisionMatchesOutcome`'s
-///   fail-closed arm). The barrier loop's own `while attempts < attempt_limit`
-///   still stops it — `Retry` keeps that guard — which is why only the DECISION
-///   law sees it.
+/// `Buggy=1` enables two independent slips in `capture_after_present_decision`, each a
+/// dead-at-`Buggy=0` action beside the healthy `Decide`:
+/// * `BuggyStaleCapture` treats a dropped present as capture authorization (`NoStaleCapture`,
+///   `CaptureRequiresPresent`);
+/// * `BuggyRetryAtLimit` reads the retry arm as `attempts <= attempt_limit` for the shipping
+///   `<`, so the last dropped present asks for a retry instead of failing closed
+///   (`DecisionMatchesOutcome`'s fail-closed arm). The barrier loop's own
+///   `while attempts < attempt_limit` still stops it (`Retry` keeps that guard), so only the
+///   decision law sees it.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn capture_after_present_model() -> Model {
@@ -5955,12 +5689,11 @@ pub fn capture_after_present_model() -> Model {
                 } else {
                     decision == 3 && captured == 0 && failed == 1
                 };
-            // The attempt bound only restates `Retry`'s guard (the barrier
-            // loop's `while attempts < attempt_limit`), so it is the space, not a
-            // law; Tier-1 binds the real loop's call bound. The fail-closed-at-
-            // the-bound DECISION is `DecisionMatchesOutcome`'s, and
-            // `BuggyRetryAtLimit` is its counterexample.
-            invariant ValuesBounded:
+            // The attempt bound only restates `Retry`'s guard (the barrier loop's
+            // `while attempts < attempt_limit`), so it is the space, not a law; Tier-1 binds the
+            // real loop's call bound. Failing closed at the bound is `DecisionMatchesOutcome`'s,
+            // and `BuggyRetryAtLimit` is its counterexample.
+            bound ValuesBounded:
                 attempts <= AttemptLimit &&
                 staged <= 1 && present_succeeded <= 1 && decision <= 3 &&
                 captured <= 1 && failed <= 1 && stale_capture <= 1;
@@ -5968,26 +5701,21 @@ pub fn capture_after_present_model() -> Model {
     }
 }
 
-/// A platform window photograph may lag a successful native present by one
-/// compositor interval. Full-window introspection therefore uses the OS image
-/// only for platform chrome. Client authority is the exact physical destination
-/// consumed by the serial-bound successful PRESENT — the swapchain image or
-/// softbuffer surface — never a later offscreen rerender of equivalent semantic
-/// state. Before those destination pixels are stitched under the chrome, both
-/// their physical dimensions and their client-origin offset in the photograph
-/// must validate.
+/// A platform window photograph may lag a successful native present by one compositor
+/// interval, so full-window introspection uses the OS image only for platform chrome. Client
+/// authority is the exact physical destination consumed by the serial-bound successful present
+/// (the swapchain image or softbuffer surface), never a later offscreen rerender of equivalent
+/// semantic state. Before those pixels are stitched under the chrome, both their physical
+/// dimensions and their client-origin offset in the photograph must validate.
 ///
-/// The state/action names `frame_presented`, `renderer_bound`,
-/// `MarkFramePresented`, and decision code `1` (`StitchRenderer`) are retained
-/// for generated-trace and Tier-1 compatibility. Here, "renderer bound" means
-/// *present-destination bound*. `geometry_valid` is the conjunction of size and
-/// client-origin validation. `os_client_current` records only that the
-/// untrusted photograph happens to look current; coincidence never grants
-/// authority.
+/// `frame_presented`, `renderer_bound`, `MarkFramePresented` and decision `1`
+/// (`StitchRenderer`) keep their names for generated traces and Tier-1: "renderer bound" means
+/// present-destination bound. `geometry_valid` is size and client-origin validation together;
+/// `os_client_current` records only that the untrusted photograph looks current, which never
+/// grants authority.
 ///
-/// `Buggy=1` recreates the historical shortcut: accept an unbound client source
-/// (a platform client photograph or semantic offscreen rerender) without the
-/// exact destination/geometry provenance.
+/// `Buggy=1` is the shortcut: accept an unbound client source (a platform client photograph
+/// or semantic offscreen rerender) without the exact destination/geometry provenance.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_capture_source_model() -> Model {
@@ -5997,10 +5725,10 @@ pub fn native_capture_source_model() -> Model {
             var frame_presented = 0;
             var geometry_valid = 0;
             var os_client_current = 0;
-            // 0 Pending, 1 StitchRenderer (legacy name: stitch the exact
-            // successful PRESENT destination), 2 FailClosed.
+            // 0 Pending, 1 StitchRenderer (stitch the exact successful present's
+            // destination), 2 FailClosed.
             var decision = 0;
-            // Legacy trace field name; 1 means exact present-destination bound.
+            // 1: the exact present destination is bound (the name is kept for traces).
             var renderer_bound = 0;
             var captured = 0;
             var failed = 0;
@@ -6060,7 +5788,7 @@ pub fn native_capture_source_model() -> Model {
                     decision == 2 && captured == 0 && failed == 1 &&
                     renderer_bound == 0
                 };
-            invariant ValuesBounded:
+            bound ValuesBounded:
                 frame_presented <= 1 && geometry_valid <= 1 &&
                 os_client_current <= 1 && decision <= 2 &&
                 renderer_bound <= 1 && captured <= 1 && failed <= 1 &&
@@ -6151,7 +5879,7 @@ pub fn presented_frame_tap_model() -> Model {
                 if phase > 0 && phase <= 2 { accepted == 1 } else { phase <= 3 };
             invariant TerminalPhaseHasResult:
                 if phase == 3 { result > 0 } else { result == 0 };
-            invariant ValuesBounded:
+            bound ValuesBounded:
                 phase <= 3 && accepted <= 1 && mapped <= 1 && result <= 2;
         }
     }
@@ -6174,8 +5902,7 @@ pub fn presented_frame_tap_model() -> Model {
 ///   were client decimation, `dropped` untouched (`InvalidMetadataIsCounted`,
 ///   which counts losses by cause, so the slip is caught whatever error or
 ///   abort was counted before it);
-/// * `BuggyHarvestCallbackOrder` — the historical append in callback order,
-///   `3,1` (`HarvestedStoreSorted`);
+/// * `BuggyHarvestCallbackOrder`: an append in callback order, `3,1` (`HarvestedStoreSorted`);
 /// * `BuggyEvictNewest` — `ordered_capture_store_push` with `pop_back` for
 ///   `pop_front`: the budget drops the newest capture and keeps `1,2`
 ///   (`BudgetKeepsNewestTail`);
@@ -6290,7 +6017,7 @@ pub fn video_tap_slot_model() -> Model {
             invariant ErrorResolutionFreesSlot:
                 if last_error == 1 { phase == 0 } else { phase <= 2 };
             invariant InvalidMetadataIsCounted: dropped == errors + invalid;
-            invariant DropCountBounded: dropped <= MaxDrops && errors <= MaxDrops;
+            bound DropCountBounded: dropped <= MaxDrops && errors <= MaxDrops;
             invariant HarvestedStoreSorted:
                 if harvest_phase > 1 {
                     store_first <= store_second
@@ -6305,7 +6032,7 @@ pub fn video_tap_slot_model() -> Model {
                 };
             invariant EvictionMatchesOverflow:
                 if harvest_phase == 3 { evicted == 1 } else { evicted == 0 };
-            invariant ValuesBounded:
+            bound ValuesBounded:
                 phase <= 2 && invalid <= 1 && last_error <= 1 &&
                 harvest_phase <= 3 && store_first <= 3 &&
                 store_second <= 3 && evicted <= 1;
@@ -6319,9 +6046,8 @@ pub fn video_tap_slot_model() -> Model {
 /// changes physical surface/DPI metrics, every charged coordinate-bound effect
 /// must be reset and rebound to the new space.
 ///
-/// `Buggy=1` reproduces the former composed/single boolean-only gate: a
-/// same-class geometry change leaves the charged effect bound to the old
-/// coordinate space.
+/// `Buggy=1` is a composed/single boolean-only gate: a same-class geometry change leaves the
+/// charged effect bound to the old coordinate space.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn layout_coordinate_reset_model() -> Model {
@@ -6374,9 +6100,9 @@ pub fn layout_coordinate_reset_model() -> Model {
                 } else {
                     0 == 0
                 };
-            invariant CoordinateBounded:
+            bound CoordinateBounded:
                 coordinate <= MaxCoordinate && bound_coordinate <= MaxCoordinate;
-            invariant ValuesBounded:
+            bound ValuesBounded:
                 charged <= 1 && prepared <= 1 && stale_present <= 1;
         }
     }
@@ -6500,20 +6226,19 @@ pub fn semantic_prewarm_generation_model() -> Model {
                 if ready == 1 { installed == current } else { installed <= MaxGeneration };
             invariant QueueContainsOnlyCurrent:
                 if queued > 0 { queued == current } else { queued == 0 };
-            invariant GenerationsBounded:
+            bound GenerationsBounded:
                 current <= MaxGeneration && queued <= MaxGeneration &&
                 running <= MaxGeneration && result <= MaxGeneration &&
                 installed <= MaxGeneration && observed_current <= MaxGeneration &&
                 observed_result <= MaxGeneration;
-            invariant FlagsBounded: ready <= 1 && decision <= 1 && resolved <= 1;
+            bound FlagsBounded: ready <= 1 && decision <= 1 && resolved <= 1;
         }
     }
 }
 
-/// A static Settings preview must retain its convergence cadence until the
-/// completed font epoch reaches the retained raster. Polling completion can
-/// happen while arming OR firing a deadline; neither may silently abandon the
-/// last repaint. `Buggy=1` restores the former pending-only predicate.
+/// A static Settings preview must retain its convergence cadence until the completed font epoch
+/// reaches the retained raster. Polling completion can happen while arming or firing a deadline;
+/// neither may silently abandon the last repaint. `Buggy=1` decides on `pending` alone.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_preview_font_convergence_model() -> Model {
@@ -6554,55 +6279,50 @@ pub fn native_preview_font_convergence_model() -> Model {
     }
 }
 
-/// The semantic preview font worker has two coupled ownership decisions beyond
-/// its generation guard. Replacing a queued, not-yet-started install job must
-/// carry its unique committed renderer base into the newest candidate job. At
-/// completion, only an exact generation + request + candidate match may become
-/// active; an exact-match construction failure clears the active renderer, while
-/// superseded successes are cache-only and leave the active slot alone.
+/// The semantic preview font worker has two coupled ownership decisions beyond its generation
+/// guard. Replacing a queued, not-yet-started install job must carry its unique committed
+/// renderer base into the newest candidate job. At completion, only an exact generation +
+/// request + candidate match may become active; an exact-match construction failure clears the
+/// active renderer, while superseded successes are cache-only and leave the active slot alone.
 ///
 /// `DecideResult` is the shipping `poll_semantic_renderer` over
-/// `semantic_prewarm_result_decision`, and each law judges one arm of that
-/// match: `DecisionMatchesIdentity` the pure classification,
-/// `InstallOnlyLatestReady` the `InstallCurrent` arm, `CurrentFailureFailsClosed`
-/// the `FailClosedCurrent` arm, `CacheOnlySupersededReady` the `CacheSuperseded`
-/// arm, and `NoncurrentPreservesActive` every arm that is not an exact-current
-/// one. No law restates the classification: each is conditioned on the decision
-/// and says what its arm does to the slot or the cache.
+/// `semantic_prewarm_result_decision`, and each law judges one arm of that match:
+/// `DecisionMatchesIdentity` the pure classification, `InstallOnlyLatestReady` the
+/// `InstallCurrent` arm, `CurrentFailureFailsClosed` the `FailClosedCurrent` arm,
+/// `CacheOnlySupersededReady` the `CacheSuperseded` arm, and `NoncurrentPreservesActive` every
+/// arm that is not exact-current. Each is conditioned on the decision and says what its arm
+/// does to the slot or the cache.
 ///
-/// `Buggy=1` enables seven dead negative controls. Two recreate the historical
-/// bug shapes: `BuggyReplacementKeepsOnlyNewBase` (replacement keeps only the
-/// new job's optional base, dropping the displaced one — `ReplacementCarriesBase`)
-/// and `BuggyMixedCandidateInstalls` (a ready mixed/superseded candidate installs
-/// as current). Five are one line of the main-thread boundary written wrong:
-/// * `BuggyReadinessBeforeGeneration` — `semantic_prewarm_result_decision`
-///   testing readiness before generation, so a ready renderer forked from an
-///   obsolete generation's base is filed as `CacheSuperseded` and later served
-///   for a candidate under the new configuration (`DecisionMatchesIdentity`);
-/// * `BuggyInstallKeepsStaleIdentity` — the `InstallCurrent` arm without
-///   `self.semantic_identity = Some(result.candidate)`: the new renderer paints
-///   under no candidate identity, so the preview never recognises its own
+/// `Buggy=1` enables seven dead negative controls. `BuggyReplacementKeepsOnlyNewBase`
+/// (replacement keeps only the new job's optional base, dropping the displaced one;
+/// `ReplacementCarriesBase`) and `BuggyMixedCandidateInstalls` (a ready mixed/superseded
+/// candidate installs as current), and five that are one line of the main-thread boundary
+/// written wrong:
+/// * `BuggyReadinessBeforeGeneration`: `semantic_prewarm_result_decision` testing readiness
+///   before generation, so a ready renderer forked from an obsolete generation's base is filed
+///   as `CacheSuperseded` and later served under the new configuration
+///   (`DecisionMatchesIdentity`);
+/// * `BuggyInstallKeepsStaleIdentity`: the `InstallCurrent` arm without
+///   `self.semantic_identity = Some(result.candidate)`, so the preview never recognises its own
 ///   install (`InstallOnlyLatestReady`);
-/// * `BuggyFailClosedKeepsPrevious` — the `FailClosedCurrent` arm without
-///   `self.semantic = None`, so an exact-current construction failure leaves the
-///   previous candidate painting (`CurrentFailureFailsClosed`);
-/// * `BuggyDropSuperseded` — the `CacheSuperseded` arm folded into the ignore
-///   arms: a ready superseded renderer is dropped instead of cached, and its
-///   warmup is paid again (`CacheOnlySupersededReady`);
-/// * `BuggyCacheParksActive` — the `CacheSuperseded` arm opening with the
-///   `InstallCurrent` arm's `cache_active_semantic()`: a superseded result parks
-///   the active renderer and leaves nothing painting (`NoncurrentPreservesActive`).
+/// * `BuggyFailClosedKeepsPrevious`: the `FailClosedCurrent` arm without
+///   `self.semantic = None`, so an exact-current construction failure leaves the previous
+///   candidate painting (`CurrentFailureFailsClosed`);
+/// * `BuggyDropSuperseded`: the `CacheSuperseded` arm folded into the ignore arms, so a ready
+///   superseded renderer is dropped and its warmup paid again (`CacheOnlySupersededReady`);
+/// * `BuggyCacheParksActive`: the `CacheSuperseded` arm opening with `InstallCurrent`'s
+///   `cache_active_semantic()`, so a superseded result parks the active renderer and nothing
+///   paints (`NoncurrentPreservesActive`).
 ///
-/// Tier-1 is in aterm-gui, in two halves: `src/semantic_prewarm_conformance.rs`
-/// enumerates the pure `semantic_prewarm_result_decision` over the lattice, and
-/// `tray_raster`'s `semantic_prewarm_poll_conforms_to_the_handshake_slot_effects`
-/// lands every lattice point through the real `poll_semantic_renderer` and reads
-/// the active slot (`active_after`, `active_after_latest`) back off the fonts.
+/// Tier-1 (aterm-gui), in two halves: `src/semantic_prewarm_conformance.rs` enumerates the pure
+/// `semantic_prewarm_result_decision` over the lattice, and `tray_raster`'s
+/// `semantic_prewarm_poll_conforms_to_the_handshake_slot_effects` lands every lattice point
+/// through the real `poll_semantic_renderer` and reads the active slot (`active_after`,
+/// `active_after_latest`) back off the fonts.
 ///
-/// The input and output bounds are per-variable. "The latest active renderer is
-/// an active renderer" is a definition, not a law the others imply: the `Mark*`
-/// inputs are built that way, every decision arm assigns the two fields
-/// together, and the Tier-1 projection defines `latest` as `active` and the
+/// The bounds are per-variable. "The latest active renderer is an active renderer" is a
+/// definition, not a law: the `Mark*` inputs are built that way, every decision arm assigns the
+/// two fields together, and the Tier-1 projection defines `latest` as `active` and the
 /// requested identity.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
@@ -6798,11 +6518,11 @@ pub fn semantic_prewarm_handshake_model() -> Model {
                     active_after == active_before &&
                     active_after_latest == active_before_latest
                 };
-            invariant InputsBounded:
+            bound InputsBounded:
                 new_base <= 1 && replaced_base <= 1 && generation_matches <= 1 &&
                 request_matches <= 1 && candidate_matches <= 1 && renderer_ready <= 1 &&
                 active_before <= 1 && active_before_latest <= 1;
-            invariant OutputsBounded:
+            bound OutputsBounded:
                 replacement_base <= 1 && replacement_resolved <= 1 && decision <= 5 &&
                 cached <= 1 && active_after <= 1 && active_after_latest <= 1 &&
                 result_resolved <= 1;
@@ -6869,7 +6589,7 @@ pub fn semantic_prewarm_request_swap_model() -> Model {
             // Nor "retained paint is exact or the host seed": once resolved, the
             // law above keeps the active renderer exactly when it is not a
             // ready mismatch, which is that sentence.
-            invariant FlagsBounded:
+            bound FlagsBounded:
                 active_present <= 1 && active_ready <= 1 && candidate_matches <= 1 &&
                 should_cache <= 1 && active_after <= 1 && resolved <= 1;
         }
@@ -6942,68 +6662,55 @@ pub fn session_chrome_expiry_model() -> Model {
                 work = 0;
             }
             invariant WorkPerTurnBounded: work <= Budget;
-            invariant DeadlineTracksRetainedCache:
+            uncaught DeadlineTracksRetainedCache:
                 armed == if fresh + due + scanning > 0 { 1 } else { 0 };
-            invariant CapacityConservedOrRetired:
+            uncaught CapacityConservedOrRetired:
                 fresh + due + scanning == 0 || fresh + due + scanning == Capacity;
-            invariant CursorShape:
+            uncaught CursorShape:
                 if scanning == 1 {
                     remaining > 0 && remaining <= Windows
                 } else {
                     remaining == 0
                 };
-            invariant ValuesBounded:
+            bound ValuesBounded:
                 fresh <= Capacity && due <= Capacity && scanning <= 1 && armed <= 1;
         }
     }
 }
 
-/// STREAMING SEARCH — the memory-bounded incremental search lifecycle: the
-/// drift-free twin of `aterm-search::streaming::StreamingSearch`
-/// (`crates/aterm-search/src/streaming/engine/`). This derived model is the spec
-/// of record; a hand `.tla` never joins the checked set beside it.
+/// Streaming search: the memory-bounded incremental search lifecycle, the twin of
+/// `aterm-search::streaming::StreamingSearch` (`crates/aterm-search/src/streaming/engine/`) and
+/// its spec of record.
 ///
-/// Variable encoding (all scalar; projections are the engine's public accessors):
-///   * `state`  — 0 Idle, 1 Searching, 2 HasResults, 3 NoResults
-///   * `scanp`  — `scan_progress + 1` (0 encodes the engine's idle `-1`; the
-///     `ty_model!` grammar has no negative literals)
-///   * `stored` — `results.len()`; `total` — `total_matches`; `cur` —
-///     `current_index` (1-based, 0 = none)
+/// Variables (projections of the engine's public accessors): `state` 0 Idle, 1 Searching, 2
+/// HasResults, 3 NoResults; `scanp` is `scan_progress + 1` (0 encodes the idle `-1`: the grammar
+/// has no negative literals); `stored` is `results.len()`, `total` `total_matches`, `cur`
+/// `current_index` (1-based, 0 none).
 ///
-/// `ScanHit`/`ScanMiss` FOLD the engine's atomic auto-complete on the last row
-/// for the Tier-1 unit-effect alphabet (one match or none). `Add` and
-/// `Invalidate` likewise represent exactly one added or removed stored match.
-/// A general engine call may affect multiple matches atomically; those calls are
-/// intentionally outside this exact scalar transition abstraction and remain
-/// covered by the engine's `verify_all_invariants`. `Rows`/`MaxTotal` are trace-window bounds
-/// (the offload `produced <= W - 1` idiom), NOT engine claims; `MaxResults`
-/// mirrors the engine's memory bound (at capacity a hit COUNTS but does not
-/// STORE). `Buggy = 1` is one slip per law, each in a branch the engine
-/// really has:
-/// * the invalidation clamp is dropped — the index-out-of-range class
-///   (`CurrentIndexValid`);
-/// * the capacity test reads `results.len() > max_results` for `>=`, so the
-///   hit at capacity STORES one past the bound (`MemoryBounded` — the
-///   store-past-capacity variant `at_capacity_hit_counts_but_does_not_store`
-///   rejects at Tier-1);
-/// * `content_added`'s store arm pushes the match but skips its
-///   `total_matches` increment — the four add-a-match sites each carry both
-///   arms (`TotalMatchesConsistent`);
-/// * `complete_search` drops its `scan_progress = -1`, so a finished search
-///   still reports the row count as progress (`ScanProgressConsistent`).
+/// `ScanHit`/`ScanMiss` fold the engine's atomic auto-complete on the last row, and `Add` and
+/// `Invalidate` each move exactly one stored match: the Tier-1 unit-effect alphabet. Engine
+/// calls that affect several matches at once are outside this abstraction and covered by the
+/// engine's `verify_all_invariants`. `Rows`/`MaxTotal` are trace-window bounds, not engine
+/// claims; `MaxResults` mirrors the engine's memory bound. `Buggy = 1` is one slip per law, each
+/// in a branch the engine really has:
+/// * the invalidation clamp dropped (`CurrentIndexValid`);
+/// * the capacity test `results.len() > max_results` for `>=`, so the hit at capacity stores one
+///   past the bound (`MemoryBounded`; Tier-1's `at_capacity_hit_counts_but_does_not_store`);
+/// * `content_added`'s store arm skipping its `total_matches` increment
+///   (`TotalMatchesConsistent`);
+/// * `complete_search` without its `scan_progress = -1`, so a finished search still reports
+///   progress (`ScanProgressConsistent`).
 ///
-/// Invariants carry the module's historical IDs: `CurrentIndexValid`
-/// (INV-SEARCH-1), `MemoryBounded` (INV-SEARCH-3), `ScanProgressConsistent`
-/// (INV-SEARCH-5), `TotalMatchesConsistent` (INV-SEARCH-6), plus the
-/// state/emptiness shape (`TerminalShape` — HasResults ⇒ stored ≥ 1 ∧ cur ≥ 1,
-/// NoResults ⇒ empty). INV-SEARCH-2 (positions valid) and INV-SEARCH-4 (no
-/// duplicates) are not scalar-expressible — the engine's
-/// `verify_all_invariants` checks them over the real results, and the
-/// aterm-search streaming tests assert it after every operation.
+/// The invariants carry the module's IDs: `CurrentIndexValid` (INV-SEARCH-1), `MemoryBounded`
+/// (INV-SEARCH-3), `ScanProgressConsistent` (INV-SEARCH-5), `TotalMatchesConsistent`
+/// (INV-SEARCH-6), plus `TerminalShape` (HasResults ⇒ stored ≥ 1 ∧ cur ≥ 1, NoResults ⇒ empty).
+/// INV-SEARCH-2 (positions valid) and INV-SEARCH-4 (no duplicates) are not scalar-expressible:
+/// `verify_all_invariants` checks them over the real results, and the aterm-search streaming
+/// tests assert it after every operation.
 ///
-/// Tier-1 binding: `aterm-search/tests/conformance_streaming.rs` (bounded
-/// unit-effect lockstep against the real engine, with explicit multi-effect
-/// boundary controls). Compile-time gate: `aterm-search/build.rs`.
+/// Tier-0: `tests/derived_streaming_search_ty.rs`, at `Wrap=1` and `Wrap=0`. Tier-1:
+/// `aterm-search/tests/conformance_streaming.rs` (unit-effect lockstep against the real engine,
+/// with multi-effect boundary controls).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn streaming_search_model() -> Model {
@@ -7020,13 +6727,13 @@ pub fn streaming_search_model() -> Model {
             var total = 0;
             var cur = 0;
 
-            // start_search: valid from ANY state (a new pattern restarts even a
-            // finished or mid-flight search); reset counters, scan from row 0.
+            // start_search: valid from any state (a new pattern restarts even a finished or
+            // mid-flight search); reset counters, scan from row 0.
             action Start {
                 state = 1; scanp = 1; stored = 0; total = 0; cur = 0;
             }
-            // scan_row finding one match; folds the auto-complete on the last row.
-            // At capacity the hit COUNTS but does not STORE (INV-SEARCH-3 discipline).
+            // scan_row finding one match; folds the auto-complete on the last row. At capacity
+            // the hit counts but does not store (INV-SEARCH-3).
             action ScanHit when (state == 1 && scanp <= Rows && total <= MaxTotal - 1) {
                 stored = if stored <= MaxResults - 1 + Buggy { stored + 1 } else { stored };
                 total = total + 1;
@@ -7041,10 +6748,9 @@ pub fn streaming_search_model() -> Model {
                 cur   = if scanp > Rows - 1 { if stored > 0 { 1 } else { 0 } } else { cur };
                 scanp = if scanp > Rows - 1 { if Buggy > 0 { scanp + 1 } else { 0 } } else { scanp + 1 };
             }
-            // next_match / prev_match: 1-based cycle over the STORED results;
-            // Wrap=0 clamps at the boundary instead (the engine's wrap_enabled).
-            // (Named after the engine methods — a bare `Next` action would clash
-            // with the generated TLA+ `Next ==` disjunction, the `Append` class.)
+            // next_match / prev_match: 1-based cycle over the stored results; Wrap=0 clamps at
+            // the boundary (the engine's wrap_enabled). A bare `Next` action would clash with
+            // the generated TLA+ `Next ==` disjunction.
             action NextMatch when (state == 2 && stored > 0) {
                 cur = if cur > stored - 1 { if Wrap > 0 { 1 } else { cur } } else { cur + 1 };
             }
@@ -7060,12 +6766,11 @@ pub fn streaming_search_model() -> Model {
                 state = 2;
                 cur = if cur == 0 { 1 } else { cur };
             }
-            // content_invalidated of ONE stored match's row: the engine subtracts
-            // removed STORED matches only, saturating (`operations.rs`:
-            // `total_matches.saturating_sub(removed_count)`), and clamps cur to the
-            // new length — the clamp Buggy=1 drops. The saturation never binds at
-            // Buggy=0 (`stored <= total`); under the uncounted-store slip it is
-            // the engine's own floor, which also keeps that space finite.
+            // content_invalidated of one stored match's row: the engine subtracts removed
+            // stored matches only, saturating (`total_matches.saturating_sub(removed_count)`),
+            // and clamps cur to the new length (the clamp Buggy=1 drops). The saturation never
+            // binds at Buggy=0 (`stored <= total`); under the uncounted-store slip it is the
+            // engine's own floor, which also keeps that space finite.
             action Invalidate when (state == 2 && stored > 0) {
                 stored = stored - 1;
                 total = if total > 0 { total - 1 } else { 0 };
@@ -7094,85 +6799,61 @@ pub fn streaming_search_model() -> Model {
     }
 }
 
-/// BUDGETED SEARCH RESUME — the public lifecycle contract of
+/// Budgeted search resume: the public lifecycle contract of
 /// `aterm_core::terminal::Terminal::search_budgeted`.
 ///
-/// This is deliberately a separate machine from [`streaming_search_model`].
-/// `StreamingSearch` models match storage/navigation inside the older streaming
-/// engine; `BudgetedSearchResume` models the owner-level capability that binds a
-/// partial full-buffer scan and its result-delta stream to one query/content
-/// snapshot and one non-repeating `search_id`.
-///
-/// The projection is intentionally small but includes every public field that
-/// controls host accumulation:
+/// A separate machine from [`streaming_search_model`], which models match storage and
+/// navigation inside the streaming engine: this one models the capability that binds a partial
+/// full-buffer scan and its result-delta stream to one query/content snapshot and one
+/// non-repeating `search_id`. The projection covers every public field that controls host
+/// accumulation:
 ///
 /// * `progress` / `total` are `rows_fed` / `total_rows`;
 /// * `scan_done` distinguishes indexing completion from API completion;
 /// * `live` / `cursor` encode the optional resume capability;
 /// * `search_id` and `reset` are projected directly from the returned step;
-/// * `delivery` counts a bounded dense-result trace: the scan turn delivers the
-///   first delta, one drain turn leaves a backlog, and the final drain completes;
-/// * `issued`, `prior_id` and `stream_id` are trace ghosts. Real process-global
-///   `u64` IDs are normalized to first-seen rank, proving freshness without
-///   assuming that IDs are contiguous within one `Terminal`; `stream_id` is the
-///   identity the host last saw `reset` announce.
+/// * `delivery` counts a bounded dense-result trace: the scan turn delivers the first delta,
+///   one drain turn leaves a backlog, and the final drain completes;
+/// * `issued`, `prior_id` and `stream_id` are trace ghosts. Real process-global `u64` IDs are
+///   normalized to first-seen rank, proving freshness without assuming IDs are contiguous
+///   within one `Terminal`; `stream_id` is the identity the host last saw `reset` announce.
 ///
 /// The live cursor and `search_id` are one field in the shipping step
-/// (`cursor: (!complete).then_some(state.cursor)`, `search_id: state.cursor`),
-/// and a fresh identity is minted only where the new state is installed, so
-/// "the cursor is the stream's identity" and "the identity is the latest one
-/// minted" are the step's shape, not laws: every action here writes the two
-/// together. What a slip CAN break is that the identity changes only with
-/// `reset` (`IdentityStableWithoutReset`) — the doc's "stable identity of this
-/// logical search".
+/// (`cursor: (!complete).then_some(state.cursor)`, `search_id: state.cursor`), and a fresh
+/// identity is minted only where the new state is installed, so every action writes the two
+/// together. What a slip can break is that the identity changes only with `reset`
+/// (`IdentityStableWithoutReset`).
 ///
-/// `Rows = 3` is the real three-row Tier-1 terminal. `DeliveryTurns = 3` is a
-/// bounded representative of an arbitrary match backlog, not the shipping
-/// 4,096-record payload cap. `StartBacklog`/`Drain`/`DrainComplete` prove the
-/// important seam: scanning may be finished while the cursor remains live,
-/// drain-only resumes preserve row progress and identity, and only the last
-/// delta retires the cursor. `StartComplete` and `RestartComplete` cover calls
-/// that scan and deliver everything in one turn; the latter still returns
-/// `reset = true` and a fresh `search_id` despite returning no cursor.
-/// The restart alphabet groups equivalent guards: `ContentRestart` covers either
-/// content-snapshot key, `QueryRestart` covers query/options, and
-/// `ForgedRestart` covers forged, foreign, dropped, or otherwise stale tokens.
-/// This successful-step machine does not model construction/exhaustion errors,
-/// which return no step and are covered by the owner's fail-closed unit tests.
+/// `Rows = 3` is the three-row Tier-1 terminal; `DeliveryTurns = 3` stands for an arbitrary
+/// match backlog, not the shipping payload cap. `StartBacklog`/`Drain`/`DrainComplete` prove
+/// the seam: scanning may finish while the cursor stays live, drain-only resumes preserve row
+/// progress and identity, and only the last delta retires the cursor. `StartComplete` and
+/// `RestartComplete` scan and deliver everything in one turn; the latter still returns
+/// `reset = true` and a fresh `search_id` with no cursor. `ContentRestart` covers either
+/// content-snapshot key, `QueryRestart` query/options, and `ForgedRestart` forged, foreign,
+/// dropped, or otherwise stale tokens. Construction/exhaustion errors return no step and are
+/// covered by the owner's fail-closed unit tests.
 ///
-/// `Buggy = 1` reproduces stale continuation: restart actions preserve the old
-/// identity/progress instead of minting/resetting. `ResetMintsFresh` and
-/// `ResetStartsAtBeginning` catch it. It carries two more slips, each applied
-/// at every step it touches:
-/// * `cursor: Some(state.cursor)` without its `(!complete).then_some` gate, so
-///   every completing turn (`StartComplete`, `FinishScan`, `DrainComplete`,
-///   `RestartComplete`) hands back a live token for a completed stream
-///   (`LifecycleShape`; `DeliveryShape` also rejects the final drain's, but
-///   only through the live-means-incomplete conjunct the two share);
-/// * a resume that allocates a fresh token each turn (the usual replay
-///   hardening, `state.cursor = allocate_cursor(..)` on the resume path),
-///   rotating cursor and `search_id` together without `reset`, so a host keyed
-///   on `search_id` discards live results as a superseded snapshot
+/// `Buggy = 1` is stale continuation: restart actions preserve the old identity/progress
+/// instead of minting/resetting (`ResetMintsFresh`, `ResetStartsAtBeginning`). Two more slips,
+/// each applied at every step it touches:
+/// * `cursor: Some(state.cursor)` without its `(!complete).then_some` gate, so every completing
+///   turn (`StartComplete`, `FinishScan`, `DrainComplete`, `RestartComplete`) hands back a live
+///   token for a completed stream (`LifecycleShape`);
+/// * a resume that allocates a fresh token each turn (`state.cursor = allocate_cursor(..)` on
+///   the resume path), rotating cursor and `search_id` together without `reset`, so a host
+///   keyed on `search_id` discards live results as a superseded snapshot
 ///   (`IdentityStableWithoutReset`).
 ///
-/// A third slip is an ALTERNATIVE to `StartBacklog`, not a branch of it, so it
-/// is its own action (a stutter at `Buggy=0`) and the healthy backlog (with its
-/// gate-free final drain) stays reachable beside it. `BuggyScanOnlyCompletion`
-/// is the dense scan turn under `complete = engine.is_complete()`, the rule
-/// `f7a2ca812` shipped while every step returned the whole accumulated set,
-/// kept without the `&& emitted_matches >= result_count` term `809076ce2` added
-/// when it bounded each delta. The first bounded delta comes back complete and
-/// cursorless, and the host never sees the rest (`DeliveryShape`'s own clause:
-/// a completed stream that delivered has drained its whole backlog).
+/// A third slip is an alternative to `StartBacklog`, so it is its own action (a stutter at
+/// `Buggy=0`) and the healthy backlog stays reachable beside it: `BuggyScanOnlyCompletion` is
+/// the dense scan turn under `complete = engine.is_complete()` without the
+/// `&& emitted_matches >= result_count` term a bounded delta needs, so the first delta comes
+/// back complete and cursorless and the host never sees the rest (`DeliveryShape`).
 ///
-/// All three are states the Tier-1 projection can produce, and the Tier-1
-/// replays them on real steps (a completing step that keeps its token, a resume
-/// that carries a freshly minted one, a dense scan turn that reports complete
-/// with its backlog still held — `delivery` is read from the host's delivery
-/// ledger against the snapshot's real match count, not from `complete`).
-///
-/// Tier-1 binding and transition negative controls live in
-/// `aterm-core/tests/conformance_budgeted_search.rs`.
+/// Tier-1: `aterm-core/tests/conformance_budgeted_search.rs` replays all three on real steps
+/// (`delivery` is read from the host's delivery ledger against the snapshot's real match
+/// count, not from `complete`), with transition negative controls.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn budgeted_search_resume_model() -> Model {
@@ -7438,7 +7119,7 @@ pub fn budgeted_search_resume_model() -> Model {
                     ((live == 1 && complete == 0 && delivery > 0 &&
                         delivery <= DeliveryTurns - 1) ||
                      (live == 0 && complete == 1 && delivery == DeliveryTurns)));
-            invariant ValuesBounded:
+            bound ValuesBounded:
                 live <= 1 && scan_done <= 1 && complete <= 1 && reset <= 1 &&
                 progress <= Rows && total <= Rows && delivery <= DeliveryTurns &&
                 issued <= MaxTokens && cursor <= MaxTokens &&
@@ -7448,27 +7129,24 @@ pub fn budgeted_search_resume_model() -> Model {
     }
 }
 
-/// HOST-MINTED HYPERLINK SCHEME CAPABILITY — the abstract twin of
-/// `HyperlinkAuth`'s extra-scheme allowlist (orca deep-links §7, #4384): the
-/// host may mint a small set of EXTRA OSC-8 URI schemes (e.g. `orca`) on top
-/// of the hardcoded safe allowlist. The stateful discipline is exactly:
+/// Host-minted hyperlink scheme capability: the abstract twin of `HyperlinkAuth`'s
+/// extra-scheme allowlist (#4384). The host may mint a small set of extra OSC-8 URI schemes
+/// (e.g. `orca`) on top of the hardcoded safe allowlist:
 ///
-///   * the extra set is BOUNDED (`MAX_EXTRA_SCHEMES` in the code, `Cap` here) —
-///     `Authorize`/`AuthorizeOther` grow it only under the bound and
-///     `RefuseAtCap` is the at-capacity refusal (observable: the API returns
-///     `false`, state unchanged);
-///   * a NEVER-ALLOW scheme (`javascript`/`data`/`file`/…) is refused even
-///     when the host asks — `RefuseNeverAllow` is a no-op at `Buggy=0`, and
-///     `Buggy=1` models the admission defect the invariant must catch;
-///   * `Revoke` removes the distinguished scheme, restoring the default
-///     allowlist: `Accept` (the OSC-8 gate saying yes to an extra-scheme URI)
-///     is enabled IFF the scheme is currently minted, which Tier-1 binds to
-///     the real `is_allowed_scheme` decision.
+///   * the extra set is bounded (`MAX_EXTRA_SCHEMES` in the code, `Cap` here):
+///     `Authorize`/`AuthorizeOther` grow it only under the bound, and `RefuseAtCap` is the
+///     at-capacity refusal (the API returns `false`, state unchanged);
+///   * a never-allow scheme (`javascript`/`data`/`file`/…) is refused even when the host
+///     asks: `RefuseNeverAllow` is a no-op at `Buggy=0`, and `Buggy=1` models the admission
+///     defect the invariant must catch;
+///   * `Revoke` removes the distinguished scheme, restoring the default allowlist: `Accept`
+///     (the OSC-8 gate saying yes to an extra-scheme URI) is enabled iff the scheme is
+///     currently minted, which Tier-1 binds to the real `is_allowed_scheme` decision.
 ///
-/// `orca` is the distinguished tracked scheme (0/1); `others` counts the rest
-/// of the extra set so the bound is proven over the WHOLE set, not one entry.
-/// PROVES `Bounded` + `NeverAllowRefused` at `Buggy=0`; at `Buggy=1` the
-/// unbounded grow and the never-allow admission each yield a counterexample.
+/// `orca` is the distinguished tracked scheme (0/1); `others` counts the rest of the extra set
+/// so the bound is proven over the whole set, not one entry. Proves `Bounded` +
+/// `NeverAllowRefused` at `Buggy=0`; at `Buggy=1` the unbounded grow and the never-allow
+/// admission each yield a counterexample.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn hyperlink_scheme_cap_model() -> Model {
     crate::ty_model! {
@@ -7507,20 +7185,17 @@ pub fn hyperlink_scheme_cap_model() -> Model {
     }
 }
 
-/// Module-wide scrollback budget sharing (one global cap):
-/// N panes in one memory space each apply `min(configured, global / live)` at
-/// their own touch points, so the applied budgets sum within the ONE global cap
-/// at every quiescent point — panes cannot multiply the per-pane budget into an
-/// OOM. Two panes bound the membership lattice (join/leave/apply in all
-/// orders); `fresh*` tracks "applied since the last membership change", so the
-/// invariant is exact at quiescence and honestly waived while a share is stale
-/// (bounded staleness: one touch). `Buggy=1` is the global-less bug — each pane
-/// applies its full configured budget — which two fresh panes must expose.
+/// Module-wide scrollback budget sharing: N panes in one memory space each apply
+/// `min(configured, global / live)` at their own touch points, so the applied budgets sum within
+/// the one global cap at every quiescent point and panes cannot multiply the per-pane budget into
+/// an OOM. Two panes bound the membership lattice (join/leave/apply in all orders); `fresh*`
+/// tracks "applied since the last membership change", so the invariant is exact at quiescence
+/// and waived while a share is stale (for one touch). `Buggy=1` drops the global: each pane
+/// applies its full configured budget, which two fresh live panes overrun.
 ///
-/// PROVES `QuiescentSumBounded` + `DepartedHoldsNothing` at `Buggy=0`; at
-/// `Buggy=1` two fresh live panes overrun the global (counterexample required).
-/// Tier-1: `aterm-core/tests/conformance_shared_budget.rs` drives the real
-/// `ScrollbackBudgetShare` registry (and real `Terminal` eviction) in lockstep.
+/// Proves `QuiescentSumBounded` and `DepartedHoldsNothing`. Tier-1:
+/// `aterm-core/tests/conformance_shared_budget.rs` drives the real `ScrollbackBudgetShare`
+/// registry (and real `Terminal` eviction) in lockstep.
 #[cfg_attr(trust_verify, trust::skip)]
 #[must_use]
 pub fn shared_budget_model() -> Model {
@@ -7582,8 +7257,8 @@ pub fn shared_budget_model() -> Model {
                 steps = steps + 1;
             }
 
-            // THE global contract: once every live pane has applied its current
-            // share, applied budgets sum within the ONE global cap.
+            // The global contract: once every live pane has applied its current share, applied
+            // budgets sum within the one global cap.
             invariant QuiescentSumBounded:
                 if fresh1 == 0 {
                     0 <= 1
@@ -7593,7 +7268,7 @@ pub fn shared_budget_model() -> Model {
                     a1 + a2 <= Global
                 };
             // A departed pane holds no share.
-            invariant DepartedHoldsNothing:
+            uncaught DepartedHoldsNothing:
                 if live2 == 0 { a2 == 0 } else { 0 <= 1 };
         }
     }
@@ -7617,19 +7292,17 @@ pub fn shared_budget_model() -> Model {
 /// older copy — the retention limit, not a loss. `ea`/`eb`/`er` are ticks since
 /// each writer's last look and since the last rotation, saturating at `Window`.
 ///
-/// ENVIRONMENT ASSUMPTION: `aterm.log` fills more slowly than one whole file
-/// per check interval (4 MiB in 30 s), stated as the guard on a write into it:
-/// `live <= Cap - 1 || Window <= er`. Under it no writer falls two files behind
-/// before its time check comes due, so no line lands in a deleted file.
+/// Environment assumption: `aterm.log` fills more slowly than one whole file per check interval
+/// (4 MiB in 30 s), stated as the guard on a write into it: `live <= Cap - 1 || Window <= er`.
+/// Under it no writer falls two files behind before its time check comes due, so no line lands
+/// in a deleted file.
 ///
-/// PROVES `EveryLineOnce` (every line written is in `aterm.log`, in
-/// `aterm.log.1`, or was retired with an older copy — none lost, none
-/// duplicated) and `FilesBounded` (each file stays within the cap plus the
-/// writers' slack between looks). `Buggy=1` is the code this replaced: no look
-/// while running, so the file grows without limit, and a start that TRUNCATES
-/// an oversized file, erasing lines other writers put there. Tier-1:
-/// `aterm-gui/src/logging.rs` `rotation_conformance` drives two real writers on
-/// one path through rotation, a follow and a restart.
+/// Proves `EveryLineOnce` (every line written is in `aterm.log`, in `aterm.log.1`, or was
+/// retired with an older copy: none lost, none duplicated) and `FilesBounded` (each file stays
+/// within the cap plus the writers' slack between looks). `Buggy=1`: no look while running, so
+/// the file grows without limit, and a start that truncates an oversized file, erasing lines
+/// other writers put there. Tier-1: `aterm-gui/src/logging.rs` `rotation_conformance` drives
+/// two real writers on one path through rotation, a follow and a restart.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn log_rotation_model() -> Model {

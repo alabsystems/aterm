@@ -118,6 +118,66 @@ impl DocumentMut {
         owner.keep_lines_above(&key);
         Some(item)
     }
+
+    /// [`DocumentMut::remove_path`], then each table on the path that the
+    /// removal left bare, deepest first: no entries, and no comment of its own
+    /// — above or on its header line, or kept under it from a removed line. A
+    /// table that still holds either stops the walk, so a reset leaves no
+    /// empty `[header]` behind and nothing the person wrote goes with one. A
+    /// table left holding only sub-tables, and no comment, stops printing its
+    /// own header, as if a deeper header had implied it.
+    pub fn remove_path_pruning(&mut self, path: &[&str]) -> Option<Item> {
+        let removed = self.remove_path(path)?;
+        for depth in (1..path.len()).rev() {
+            let parent = &path[..depth];
+            if self.item_at(parent).is_some_and(is_bare_table) {
+                self.remove_path(parent);
+                continue;
+            }
+            if let Some(table) = table_at_mut(self.as_table_mut(), parent)
+                && is_bare_header(table)
+            {
+                table.implicit = true;
+            }
+            break;
+        }
+        Some(removed)
+    }
+
+    fn item_at(&self, path: &[&str]) -> Option<&Item> {
+        let mut node = self.as_item();
+        for part in path {
+            node = node.as_table_like()?.get(part)?;
+        }
+        Some(node)
+    }
+}
+
+/// A table with no entries and no comment of its own.
+fn is_bare_table(item: &Item) -> bool {
+    match item {
+        Item::Table(table) => table.items.len() == 0 && !table_has_comment(table),
+        Item::Value(super::Value::InlineTable(table)) => {
+            table.is_empty() && !commented(table.decor.prefix()) && !commented(table.decor.suffix())
+        }
+        _ => false,
+    }
+}
+
+/// A `[header]` with no lines of its own under it, only sub-tables, and no
+/// comment.
+fn is_bare_header(table: &Table) -> bool {
+    !table.implicit && !table.dotted && table.get_values().is_empty() && !table_has_comment(table)
+}
+
+fn table_has_comment(table: &Table) -> bool {
+    commented(table.decor.prefix())
+        || commented(table.decor.suffix())
+        || table.trailing.as_str().contains('#')
+}
+
+fn commented(raw: Option<&RawString>) -> bool {
+    raw.is_some_and(|raw| raw.as_str().contains('#'))
 }
 
 /// How many of `path`'s steps lead to the table that prints the lines of the

@@ -1,65 +1,47 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE OUTGOING PROCESS'S ARTIFACT DIET (warm successor P5, 2026-09-29;
-//! `docs/DESIGN-warm-successor-2026-09-29.md` §5).
+//! The outgoing process's artifact diet (`docs/DESIGN-warm-successor-2026-09-29.md` §5).
 //!
-//! On the launched lane the outgoing process used to write every artifact
-//! AFTER the park, inside the freeze the person feels. The attempt-bound
-//! layout sidecar was most of it: the restore writer syncs the file and then
-//! its directory. The layout is the window/tab/pane arrangement, and it
-//! rarely moves while a successor boots, so the sidecar is now written BEFORE
-//! the park, at the attempt's own name, and the park only checks it.
+//! On the launched lane the attempt-bound layout sidecar (synced, then its directory) is
+//! written before the park, at the attempt's own name, so the freeze the person feels only
+//! checks it; the window/tab/pane layout rarely moves while a successor boots.
 //!
-//! This is a WRITER/READER contract (the shape of
-//! `NativeUpdateFailedMarkSuppression`). The writer is the outgoing process,
-//! twice: before the park (`aterm-gui`'s `handoff_diet::speculate_layout`)
-//! and at the park (`handoff_diet::seal_layout`). The reader is the successor,
-//! which reads the sidecar at that name after its grant and hashes the bytes
-//! into the adoption proof it must match. The contract: whatever the
-//! successor reads there is exactly the park's layout, and a sidecar written
-//! before the park reaches the grant only after it was read back and found
-//! byte-equal.
+//! A writer/reader contract (the shape of `NativeUpdateFailedMarkSuppression`). The writer
+//! is the outgoing process, before the park (`handoff_diet::speculate_layout`) and at it
+//! (`handoff_diet::seal_layout`); the reader is the successor, which reads the sidecar
+//! after its grant and hashes it into the adoption proof. Whatever the successor reads is
+//! exactly the park's layout, and a speculative sidecar reaches the grant only after it
+//! was read back and found byte-equal.
 
 use super::{Liveness, Model, gt, int, var};
 
-/// `NativeUpdateSpeculativeSidecar`: a layout sidecar written before the park
-/// is handed to the successor only when it is byte-equal to what the park
-/// would write.
+/// `NativeUpdateSpeculativeSidecar`: a layout sidecar written before the park is handed
+/// to the successor only when it is byte-equal to what the park would write.
 ///
-/// `phase`: 0 launched, 1 held (the speculation written or refused, every
-/// reader live), 2 parked (the capture exists), 3 sealed (the park decided
-/// what the file holds), 4 granted (the successor has its descriptors and
-/// reads the sidecar), 5 retired (a rollback or failure ended the attempt).
-/// `disk`: what the sidecar's name holds — 0 nothing (never written, swept,
-/// or consumed by the successor), 1 the bytes written before the park, 2
-/// bytes written at the park, 3 bytes nobody here wrote.
-/// `moved`: the park's layout differs from the one the speculation wrote.
-/// `verified`: the park read the file back and found it byte-equal.
+/// `phase`: 0 launched, 1 held (speculation written or refused, readers live), 2 parked,
+/// 3 sealed (the park decided what the file holds), 4 granted (the successor reads the
+/// sidecar), 5 retired (rollback or failure). `disk`: what the sidecar's name holds — 0
+/// nothing (never written, swept, or consumed), 1 the speculative bytes, 2 bytes written
+/// at the park, 3 bytes nobody here wrote. `moved`: the park's layout differs from the
+/// speculated one. `verified`: the park read the file back and found it byte-equal.
 /// `read`: 0 not read, 1 the successor read the park's bytes, 2 other bytes.
 ///
-/// The environment: `RefuseWrite` (the speculative write will fail — no room,
-/// no permission), `LayoutMoves` (the person opened a tab, moved a window or
-/// changed directory while the successor booted), `DiskDisturbed` (something
-/// else replaced or truncated the file). None is fair.
+/// Environment (none fair): `RefuseWrite` (no room, no permission), `LayoutMoves` (a tab
+/// opened, a window moved, a directory changed), `DiskDisturbed` (the file replaced or
+/// truncated by someone else).
 ///
-/// Invariants, each broken ALONE by its own `Buggy = 1` action:
-///
-/// * `SpeculationVerifiedBeforeSeal` — a sealed file that still holds the
-///   speculative bytes was verified. `SealUnverified` keeps them unread.
-/// * `SealHoldsTheParksBytes` — the sealed file holds the park's bytes.
-///   `VerifyTheMemoryCopy` compares the bytes it meant to write instead of
-///   the file, so a disturbed file passes.
-/// * `SuccessorReadsTheParksBytes` — the reader half: the successor never
-///   reads anything but the park's bytes. `GrantBeforeSeal` grants with the
-///   speculation undecided.
-/// * `NothingSpeculativeOutlivesTheAttempt` — a retired attempt leaves no
-///   file at the name. `RetireKeepsSpeculation` retires without the sweep.
-/// * `ParkNeverWaitsOnSpeculation` — the park never waits for a speculation
-///   that was refused. `AwaitSpeculation` does (also the liveness mutant).
-///
-/// Liveness ([`native_update_speculative_sidecar_liveness`]): every attempt
-/// is granted or retired.
+/// Invariants, each broken alone by its own `Buggy = 1` action:
+/// * `SpeculationVerifiedBeforeSeal` — a sealed file still holding the speculative bytes
+///   was verified; broken by `SealUnverified`.
+/// * `SealHoldsTheParksBytes` — broken by `VerifyTheMemoryCopy`, which compares the bytes
+///   it meant to write instead of the file, so a disturbed file passes.
+/// * `SuccessorReadsTheParksBytes` — the reader half; broken by `GrantBeforeSeal`.
+/// * `NothingSpeculativeOutlivesTheAttempt` — a retired attempt leaves no file at the
+///   name; broken by `RetireKeepsSpeculation` (no sweep).
+/// * `ParkNeverWaitsOnSpeculation` — the park never waits on a refused speculation; broken
+///   by `AwaitSpeculation`, also the liveness mutant
+///   ([`native_update_speculative_sidecar_liveness`]).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_update_speculative_sidecar_model() -> Model {
@@ -96,8 +78,8 @@ pub fn native_update_speculative_sidecar_model() -> Model {
             action Park when (phase == 1) {
                 phase = 2;
             }
-            // THE SEAL: the file read back as the successor will read it, and
-            // compared with the park's own bytes.
+            // The seal: the file read back as the successor will read it, and compared
+            // with the park's own bytes.
             action KeepVerified when (phase == 2 && spec == 1 && disk == 1 && moved == 0) {
                 verified = 1;
                 phase = 3;
@@ -162,25 +144,22 @@ pub fn native_update_speculative_sidecar_model() -> Model {
     }
 }
 
-/// [`native_update_speculative_sidecar_model`]'s progress claim: every
-/// attempt is GRANTED or RETIRED — the speculation can save the park a write,
-/// never hold the grant.
+/// [`native_update_speculative_sidecar_model`]'s progress claim: every attempt is granted
+/// or retired; the speculation can save the park a write, never hold the grant.
 ///
 /// Fairness, each an assumption someone owns:
-///
-/// * `Speculate` — the worker's straight-line write after the launch, bounded
-///   by the file system (a refusal is `RefuseWrite`'s branch, not a wait);
-/// * `Park` — the park gate admits at once for an explicit apply and at the
-///   hold cap at the latest for the automatic lane, which otherwise stands the
-///   successor down (`Retire`, not assumed);
-/// * `KeepVerified`, `DiscardAndRewrite`, `WriteAtPark` — the seal is one read
-///   and at most one write on the worker, with no wait on anything;
+/// * `Speculate` — the worker's straight-line write after the launch (a refusal is
+///   `RefuseWrite`'s branch, not a wait);
+/// * `Park` — the park gate admits at once for an explicit apply, and by the hold cap on
+///   the automatic lane, which otherwise stands the successor down (`Retire`);
+/// * `KeepVerified`, `DiscardAndRewrite`, `WriteAtPark` — one read and at most one write on
+///   the worker, waiting on nothing;
 /// * `Grant` — the one `sendmsg` after the artifacts.
 ///
-/// The mutant that breaks it alone: `AwaitSpeculation`, a park that waits on
-/// a speculative sidecar the launch never wrote.
+/// Mutant: `AwaitSpeculation`, a park that waits on a sidecar the launch never wrote.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
+#[crate::liveness(crate::derive::native_update_speculative_sidecar_model)]
 pub fn native_update_speculative_sidecar_liveness() -> Liveness {
     Liveness {
         name: "TheAttemptIsGrantedOrRetired",

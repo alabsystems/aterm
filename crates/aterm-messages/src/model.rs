@@ -506,6 +506,9 @@ impl Intent {
                 "/manual" => "Manual",
                 "/appearance" => "Appearance",
                 "/messages" => "Messages",
+                // Beside an `OpenSystemPane` (`Open Settings`, short `Settings`):
+                // a line never shows two capsules that read alike.
+                "/security" => "Security",
                 _ => "Settings",
             },
             Self::OpenConfigEditor { .. } => "Open aterm.toml",
@@ -532,6 +535,7 @@ impl Intent {
                 "/manual" => "Manual",
                 "/appearance" => "Look",
                 "/messages" => "Messages",
+                "/security" => "Security",
                 _ => "Settings",
             },
             Self::OpenConfigEditor { .. } => "Edit",
@@ -792,6 +796,9 @@ pub(crate) fn every_intent() -> Vec<Intent> {
         },
         Intent::OpenSettings {
             route: "/messages".into(),
+        },
+        Intent::OpenSettings {
+            route: "/security".into(),
         },
         Intent::OpenSettings {
             route: "/other".into(),
@@ -2062,7 +2069,7 @@ mod tests {
     #[test]
     fn labels_are_one_table() {
         let same_short: &[&str] = &[
-            "Packages", "Manual", "Messages", "Settings", "Install", "Not now",
+            "Packages", "Manual", "Messages", "Security", "Settings", "Install", "Not now",
         ];
         for intent in every_intent() {
             let label = intent.label();
@@ -2097,6 +2104,18 @@ mod tests {
             .label(),
             "Software Update"
         );
+        // aterm's own Security page beside System Settings' pane (the Developer
+        // Tools line carries both): the two capsules never read alike, in either
+        // form.
+        let page = Intent::OpenSettings {
+            route: "/security".into(),
+        };
+        let pane = Intent::OpenSystemPane {
+            pane: "developer-tools".into(),
+        };
+        assert_eq!((page.label(), page.short()), ("Security", "Security"));
+        assert_ne!(page.label(), pane.label());
+        assert_ne!(page.short(), pane.short());
         // Only NotNow closes its row; the two decision intents are asks.
         for intent in every_intent() {
             assert_eq!(

@@ -1,0 +1,17 @@
+# claude-code 2.1.301 · MEASURED 2026-10-15, `aterm ctl text` of a private headless aterm (110x32, aterm 0.103.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake claude.ai OAuth token (`claude --subscriber`) and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, tools/real-claude-lab) · the five-hour limit under CLAUDE_CODE_RETRY_WATCHDOG=1 met by a turn's second request: its Bash call drawn above the vendor's retry row (stub: tool, then limit five_hour)
+ ▐▛███▛█   Claude Code v2.1.301
+▝▜██████▀  Sonnet 5.5 · Claude API
+ ▝▝   ▝▝   /private/tmp/at.I400/proj
+
+
+❯ toolstart
+
+⏺ Bash(sleep 12)
+  ⎿  (No output)
+
+✻ Session limit reached · Retrying in 14m (2:07pm) · attempt 1/300
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt · ← for agents

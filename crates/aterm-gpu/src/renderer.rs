@@ -2597,29 +2597,73 @@ fn metal_arm_note(what: &str) {
     }
 }
 
-/// One armed-arm resident atlas: the Metal texture plus the key its texels were
-/// uploaded under. Re-minted and re-uploaded only when the key moves.
+/// One armed-arm resident atlas: the Metal texture plus the structural key
+/// `(width, tex_h, epoch)` and monotonic shelf write state (`write_gen`,
+/// `uploaded_py`) its texels were uploaded under. Re-minted only when the
+/// structural key moves; in-place glyph appends upload only the dirty row band
+/// `[uploaded_py, occupied_rows)`.
 #[cfg(target_os = "macos")]
 struct ArmAtlas {
-    tex: crate::metal::resources::SealedTexture,
-    /// `(width, height, salt)`; salt is the per-class change signal (glyph-map
-    /// length for packed atlases, `Arc::as_ptr` for sprite snapshots, the curl
-    /// band for the deco bake).
+    /// Minted and uploaded through the device layer's Metal arm.
+    tex: crate::device_layer::LayerTexture,
+    /// `(width, height, salt)`; for glyph atlases `salt` is `atlas_epoch`
+    /// (never `map.len()`), so appending glyphs updates in place instead of
+    /// re-minting the `MTLTexture`.
     key: (u32, u32, u64),
+    /// Monotonic write generation of the CPU [`Atlas`] (`0` for immutable
+    /// sprite/deco/image atlases).
+    write_gen: u64,
+    /// Shelf baseline `atlas.py` at the time of the last upload. Since the
+    /// shelf packer never places a glyph above `atlas.py`, any subsequent append
+    /// touches only rows `>= uploaded_py`.
+    uploaded_py: u32,
 }
 
 /// One armed-arm instance stream: a shared-storage `MTLBuffer` grown
-/// geometrically, rewritten from offset 0 each frame. Race-free because staging
-/// first waits the in-flight Submit A (`MetalArmLive::await_frame_slot`).
+/// geometrically, rewritten from offset 0. Race-free because each frame slot in
+/// `MetalArmLive::frame_slots` is awaited before its buffers are rewritten.
 #[cfg(target_os = "macos")]
 struct ArmStream {
-    buf: crate::metal::resources::SharedBuffer,
+    buf: crate::device_layer::LayerBuffer,
     cap: usize,
+}
+
+#[cfg(target_os = "macos")]
+const ARM_FRAME_SLOTS: usize = 3;
+
+#[cfg(target_os = "macos")]
+const ARM_SUBMIT_B_SLOTS: usize = 5;
+
+/// One ring slot for Submit A's CPU-written shared buffers (`uniform` and
+/// `streams`) plus the `Submitted` handle of the last Submit A that bound them.
+#[cfg(target_os = "macos")]
+struct ArmFrameSlot {
+    uniform: crate::device_layer::LayerBuffer,
+    uniform_key: Option<(u32, u32, u32)>,
+    streams: [Option<ArmStream>; STREAM_COUNT],
+    inflight: Option<crate::metal::encoder::Submitted>,
+}
+
+/// One ring slot for Submit B's per-present uniform and glow-instance buffers.
+/// Bounded by `drain_pending` (`<= 3` prior Submit Bs in flight < `ARM_SUBMIT_B_SLOTS`),
+/// so advancing `submit_b_idx` each Submit B reuses settled `MTLBuffer`s with
+/// zero per-frame buffer allocations.
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct ArmSubmitBSlot {
+    glow_stream: Option<ArmStream>,
+    bloom_cell_u: Option<ArmStream>,
+    bloom_u: Option<ArmStream>,
+    shimmer_u: Option<ArmStream>,
+    tray_u: Option<ArmStream>,
+    crown_u: Option<ArmStream>,
+    blit_u: Option<(BlitUniform, crate::device_layer::LayerBuffer)>,
 }
 
 /// The Metal arm's resident state, minted lazily on the render thread at the
 /// first armed frame: thread-pinned device, queue, library, PSOs and sampler,
-/// plus per-frame caches (uniform block, streams, atlases).
+/// plus multi-slot per-frame rings (uniform blocks, streams, Submit-B scratch)
+/// and resident atlases.
 #[cfg(target_os = "macos")]
 struct MetalArmLive {
     mint: crate::metal::resources::MetalResourceDevice,
@@ -2635,14 +2679,15 @@ struct MetalArmLive {
     /// The one LINEAR clamp sampler the present/post passes (bloom, shimmer,
     /// tray, crown) use — sampler states are immutable, so it stays resident.
     linear: crate::metal::ffi::Obj,
-    /// The 16-byte `cell.metal` `Uniforms` block, rewritten on key change
-    /// (same memo shape as the wgpu `uniform_written`).
-    uniform: crate::metal::ffi::Obj,
-    uniform_key: Option<(u32, u32, u32)>,
-    /// The last Submit B blit uniform and its buffer, reused when the next
-    /// present's uniform has the same bytes. Never rewritten after mint.
-    blit_ubuf: Option<(BlitUniform, crate::metal::ffi::Obj)>,
-    streams: [Option<ArmStream>; STREAM_COUNT],
+    /// Multi-slot ring for Submit A's uniform block, instance streams, and
+    /// in-flight command buffer handle. Rotating across `ARM_FRAME_SLOTS` lets
+    /// the CPU stage frame `N` into a fresh slot while frame `N - 1` is still
+    /// executing on the GPU.
+    frame_slots: [ArmFrameSlot; ARM_FRAME_SLOTS],
+    cur_slot: usize,
+    /// Multi-slot ring for Submit B's per-present uniforms and glow stream.
+    submit_b_slots: [ArmSubmitBSlot; ARM_SUBMIT_B_SLOTS],
+    submit_b_idx: usize,
     /// Shared glyph/decorative coverage only. Sprite and image textures live
     /// with their source in `WindowGpu`.
     atlases: [Option<ArmAtlas>; DRAW_ATLAS_COUNT],
@@ -2659,14 +2704,6 @@ struct MetalArmLive {
     /// each present drains settled entries (feeding the loss latch) and waits
     /// the oldest past depth 3.
     pending: Vec<PendingPresent>,
-    /// The most recent armed frame encode, held in flight rather than waited at
-    /// submit. Shared-storage rewrite discipline: every CPU write into
-    /// GPU-visible memory is either (a) a rewrite of a resident shared buffer
-    /// (instance streams, frame uniform block), done only in the staging step
-    /// after waiting this handle ([`Self::await_frame_slot`]); or (b) a write into
-    /// a fresh allocation kept alive by the command buffer. GPU-GPU ordering on
-    /// the one queue is Metal's hazard tracking.
-    inflight_frame: Option<crate::metal::encoder::Submitted>,
     /// Diagnostic: how many times `await_frame_slot` actually consumed a
     /// prior in-flight Submit A (the pipelining differential's probe).
     awaited_frames: u64,
@@ -2694,9 +2731,21 @@ struct PendingPresent {
     ticket: crate::metal::swapchain::PresentTicket,
 }
 
+#[cfg(all(target_os = "macos", test))]
+thread_local! {
+    /// The failure the next [`MetalArmLive::new`] on this thread returns, so a
+    /// test can drive the mint-failure route.
+    static INJECTED_MINT_FAILURE: std::cell::Cell<Option<&'static str>> =
+        const { std::cell::Cell::new(None) };
+}
+
 #[cfg(target_os = "macos")]
 impl MetalArmLive {
     fn new(latch: Arc<crate::metal::loss::LossLatch>) -> Result<Self, String> {
+        #[cfg(test)]
+        if let Some(injected) = INJECTED_MINT_FAILURE.with(std::cell::Cell::take) {
+            return Err(injected.to_owned());
+        }
         // The low-power GPU on a dual-GPU Mac, the same device `GpuContext::new`
         // names (see `Device::preferred`).
         let Some(dev) = crate::metal::ffi::Device::preferred() else {
@@ -2705,9 +2754,32 @@ impl MetalArmLive {
         let session = crate::metal::encoder::EncodeSession::new(&dev, Arc::clone(&latch))?;
         let mint = crate::metal::resources::MetalResourceDevice::new(&dev, latch);
         let lib = crate::metal::pipelines::compile_library(&dev, ShaderLibrary::Cell)?;
-        let nearest = mint.sampler(crate::metal::ffi::SamplerDesc::NEAREST_CLAMP)?;
-        let linear = mint.sampler(crate::metal::ffi::SamplerDesc::LINEAR_CLAMP)?;
-        let uniform = mint.buffer(std::mem::size_of::<Uniforms>())?;
+        let layer = crate::device_layer::DeviceHandle::Metal(&mint);
+        let nearest = layer
+            .try_create_sampler(
+                "aterm-gpu metal nearest sampler",
+                crate::device_layer::SamplerKind::NearestClamp,
+            )?
+            .into_metal();
+        let linear = layer
+            .try_create_sampler(
+                "aterm-gpu metal linear sampler",
+                crate::device_layer::SamplerKind::LinearClamp,
+            )?
+            .into_metal();
+        let mint_uniform = || {
+            layer.try_create_uniform_buffer(
+                "aterm-gpu metal frame uniforms",
+                std::mem::size_of::<Uniforms>() as u64,
+            )
+        };
+        let (u0, u1, u2) = (mint_uniform()?, mint_uniform()?, mint_uniform()?);
+        let frame_slots = [u0, u1, u2].map(|uniform| ArmFrameSlot {
+            uniform,
+            uniform_key: None,
+            streams: std::array::from_fn(|_| None),
+            inflight: None,
+        });
         Ok(Self {
             mint,
             session,
@@ -2715,21 +2787,44 @@ impl MetalArmLive {
             psos: std::array::from_fn(|_| None),
             nearest,
             linear,
-            uniform,
-            uniform_key: None,
-            blit_ubuf: None,
-            streams: std::array::from_fn(|_| None),
+            frame_slots,
+            cur_slot: 0,
+            submit_b_slots: std::array::from_fn(|_| ArmSubmitBSlot::default()),
+            submit_b_idx: 0,
             atlases: std::array::from_fn(|_| None),
             libs: Vec::new(),
             present_psos: Vec::new(),
             pending: Vec::new(),
-            inflight_frame: None,
             awaited_frames: 0,
             frame_slot_wait_ns: 0,
             pending_ring_wait_ns: 0,
             encode_inline_waits: std::cell::Cell::new(0),
             encode_band_shifts: std::cell::Cell::new(0),
         })
+    }
+
+    /// This arm's device-layer handle: every texture, buffer and sampler the
+    /// arm mints, uploads or writes goes through it. Callers holding a
+    /// mutable borrow of another field spell `DeviceHandle::Metal(&live.mint)`.
+    #[inline]
+    fn layer(&self) -> crate::device_layer::DeviceHandle<'_> {
+        crate::device_layer::DeviceHandle::Metal(&self.mint)
+    }
+
+    #[inline]
+    fn current_slot(&self) -> &ArmFrameSlot {
+        &self.frame_slots[self.cur_slot]
+    }
+
+    #[inline]
+    fn current_slot_mut(&mut self) -> &mut ArmFrameSlot {
+        &mut self.frame_slots[self.cur_slot]
+    }
+
+    #[cfg(test)]
+    #[inline]
+    fn has_inflight_frame(&self) -> bool {
+        self.frame_slots.iter().any(|s| s.inflight.is_some())
     }
 
     /// The compiled MSL library for `lib`, compiled once (`cell.metal` has its
@@ -2773,11 +2868,24 @@ impl MetalArmLive {
         Ok(pso)
     }
 
-    /// Consume the previous frame's in-flight Submit A before any resident
-    /// shared buffer is rewritten (see `inflight_frame`). A terminal error is
-    /// routed by the loss latch.
+    /// Rotate to the next Submit-A ring slot, non-blockingly reaping any other
+    /// slot whose command buffer has already reached a terminal state, and
+    /// waiting only if the target `cur_slot` itself (from `ARM_FRAME_SLOTS`
+    /// frames ago) is still in flight.
     fn await_frame_slot(&mut self) {
-        if let Some(prev) = self.inflight_frame.take() {
+        self.cur_slot = (self.cur_slot + 1) % ARM_FRAME_SLOTS;
+        for s in 0..ARM_FRAME_SLOTS {
+            if s != self.cur_slot
+                && self.frame_slots[s]
+                    .inflight
+                    .as_ref()
+                    .is_some_and(|sub| sub.try_outcome().is_some())
+            {
+                let _ = self.frame_slots[s].inflight.take();
+                self.awaited_frames += 1;
+            }
+        }
+        if let Some(prev) = self.frame_slots[self.cur_slot].inflight.take() {
             // Poll before parking: usually already terminal, costing one status
             // read and a zero park. Otherwise wait and measure the park.
             // `try_outcome` feeds the loss latch like `wait_outcome`.
@@ -2790,6 +2898,89 @@ impl MetalArmLive {
             }
             self.awaited_frames += 1;
         }
+    }
+
+    /// A CPU `replaceRegion:` upload is outside the command queue's hazard
+    /// tracking. The resident glyph texture is shared by every frame slot, so
+    /// an in-place append must settle all its possible readers first.
+    /// Returns `(consumed_frames, parked_ns)` for the present's accounting.
+    fn await_atlas_readers(frame_slots: &mut [ArmFrameSlot]) -> (u64, u64) {
+        let mut consumed = 0;
+        let mut parked_ns = 0u64;
+        for slot in frame_slots {
+            if let Some(submitted) = slot.inflight.take() {
+                if submitted.try_outcome().is_none() {
+                    let parked = aterm_time::Instant::now();
+                    let _ = submitted.wait_outcome();
+                    parked_ns = parked_ns.saturating_add(
+                        u64::try_from(parked.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                    );
+                }
+                consumed += 1;
+            }
+        }
+        (consumed, parked_ns)
+    }
+
+    #[inline]
+    fn advance_submit_b_slot(&mut self) {
+        self.submit_b_idx = (self.submit_b_idx + 1) % ARM_SUBMIT_B_SLOTS;
+    }
+
+    /// Upload `bytes` into a reusable Submit-B `ArmStream` slot, growing
+    /// geometrically on demand and returning a retained `MTLBuffer` handle.
+    fn upload_scratch_stream(
+        layer: crate::device_layer::DeviceHandle<'_>,
+        slot: &mut Option<ArmStream>,
+        bytes: &[u8],
+    ) -> Result<crate::metal::ffi::Obj, String> {
+        let need = bytes.len().max(16);
+        if slot.as_ref().is_none_or(|s| s.cap < need) {
+            let cap = need
+                .next_power_of_two()
+                .max(slot.as_ref().map_or(256, |s| s.cap));
+            *slot = Some(ArmStream {
+                buf: layer
+                    .try_create_instance_buffer("aterm-gpu metal submit-b stream", cap as u64)?,
+                cap,
+            });
+        }
+        let stream = slot.as_ref().expect("sized above");
+        if !bytes.is_empty() {
+            // SAFETY: shared storage of at least `bytes.len()`; `drain_pending`
+            // bounds in-flight Submit Bs below `ARM_SUBMIT_B_SLOTS`, so this
+            // ring slot is idle.
+            unsafe { layer.write_buffer_from_zero(&stream.buf, bytes) };
+        }
+        Ok(stream.buf.metal().clone_retained())
+    }
+
+    /// Upload `want` into the current Submit-B slot's reusable blit-uniform
+    /// buffer, skipping the write when the slot already holds `want`.
+    fn ensure_submit_b_blit_u(
+        &mut self,
+        want: BlitUniform,
+    ) -> Result<crate::metal::ffi::Obj, String> {
+        let layer = crate::device_layer::DeviceHandle::Metal(&self.mint);
+        let slot = &mut self.submit_b_slots[self.submit_b_idx].blit_u;
+        if let Some((memo, buf)) = slot.as_mut() {
+            if aterm_bits::bytes_of(memo) != aterm_bits::bytes_of(&want) {
+                // SAFETY: `buf` is a shared-storage buffer of `size_of::<BlitUniform>()`
+                // owned by this idle Submit-B ring slot.
+                unsafe { layer.write_buffer_from_zero(buf, aterm_bits::bytes_of(&want)) };
+                *memo = want;
+            }
+            return Ok(buf.metal().clone_retained());
+        }
+        let buf = layer.try_create_uniform_buffer(
+            "aterm-gpu metal blit uniform",
+            std::mem::size_of::<BlitUniform>() as u64,
+        )?;
+        // SAFETY: freshly minted shared buffer of `size_of::<BlitUniform>()`.
+        unsafe { layer.write_buffer_from_zero(&buf, aterm_bits::bytes_of(&want)) };
+        let handle = buf.metal().clone_retained();
+        *slot = Some((want, buf));
+        Ok(handle)
     }
 
     /// Drain settled in-flight presents (each feeds the loss latch once) and
@@ -2850,18 +3041,19 @@ impl MetalArmLive {
         Ok(slot.as_ref().expect("filled above"))
     }
 
-    /// Rewrite the shared uniform block when the key moves. Safe in place:
-    /// staging already awaited the pipelined Submit A.
+    /// Rewrite the current frame slot's uniform block when the key moves. Safe
+    /// in place: staging already ensured `cur_slot` is idle (`await_frame_slot`).
     fn ensure_uniform(&mut self, w: u32, h: u32, text_blend: u32) {
-        if self.uniform_key == Some((w, h, text_blend)) {
+        let layer = crate::device_layer::DeviceHandle::Metal(&self.mint);
+        let slot = &mut self.frame_slots[self.cur_slot];
+        if slot.uniform_key == Some((w, h, text_blend)) {
             return;
         }
-        // SAFETY: `uniform` is a shared-storage buffer of exactly
-        // `size_of::<Uniforms>()`; no armed submit is in flight (awaited at the
-        // top of staging).
+        // SAFETY: `slot.uniform` is a shared-storage buffer of exactly
+        // `size_of::<Uniforms>()`; `cur_slot` was awaited at the top of staging.
         unsafe {
-            crate::metal::ffi::buffer_write(
-                &self.uniform,
+            layer.write_buffer_from_zero(
+                &slot.uniform,
                 aterm_bits::bytes_of(&Uniforms {
                     screen: [w as f32, h as f32],
                     text_blend: text_blend as f32,
@@ -2869,86 +3061,289 @@ impl MetalArmLive {
                 }),
             );
         }
-        self.uniform_key = Some((w, h, text_blend));
+        slot.uniform_key = Some((w, h, text_blend));
     }
 
-    /// Upload one instance stream (write from 0, geometric grow). `Ok(true)` iff
-    /// the stream holds `bytes` and may be bound; `Ok(false)` skips the draw.
+    /// Upload one instance stream into the current frame slot (write from 0,
+    /// geometric grow). `Ok(true)` iff the stream holds `bytes` and may be
+    /// bound; `Ok(false)` skips the draw.
     fn upload_stream(&mut self, id: StreamId, bytes: &[u8]) -> Result<bool, String> {
         if !should_slice(bytes.len()) {
             return Ok(false);
         }
-        let slot = &mut self.streams[id as usize];
+        let layer = crate::device_layer::DeviceHandle::Metal(&self.mint);
+        let slot = &mut self.frame_slots[self.cur_slot].streams[id as usize];
         let need = bytes.len();
         if slot.as_ref().is_none_or(|s| s.cap < need) {
             let cap = need
                 .next_power_of_two()
                 .max(slot.as_ref().map_or(0, |s| s.cap));
             *slot = Some(ArmStream {
-                buf: crate::metal::resources::SharedBuffer::new(self.mint.buffer(cap)?),
+                buf: layer
+                    .try_create_instance_buffer("aterm-gpu metal frame stream", cap as u64)?,
                 cap,
             });
         }
         let stream = slot.as_ref().expect("sized above");
-        // SAFETY: shared storage of at least `bytes.len()`; no armed submit is
-        // in flight (`await_frame_slot`).
-        unsafe { crate::metal::ffi::buffer_write(stream.buf.obj(), bytes) };
+        // SAFETY: shared storage of at least `bytes.len()`; `cur_slot` was
+        // awaited at the top of staging (`await_frame_slot`).
+        unsafe { layer.write_buffer_from_zero(&stream.buf, bytes) };
         Ok(true)
     }
 
-    /// Ensure the armed texture for `atlas` holds `bytes` under `key`, re-minting
-    /// only when the key moves. `bytes` covers the occupied rows; headroom is
-    /// zeroed here.
+    /// Ensure the armed texture for `atlas` holds `bytes` under structural `key`
+    /// `(width, tex_h, salt)` and shelf write state `(write_gen, cur_py)`.
+    /// Re-mints the `MTLTexture` only when `key` changes (first frame, resize,
+    /// or full repack); when `key` matches and `write_gen` advanced (`grow_atlas`),
+    /// uploads only the dirty row band `[uploaded_py, occupied_rows)` in place.
+    /// Such an upload first settles `frame_slots`, returning the consumed frame
+    /// count and park duration. Fresh immutable atlases have no prior readers.
+    #[allow(clippy::too_many_arguments)]
     fn ensure_atlas(
-        mint: &crate::metal::resources::MetalResourceDevice,
+        layer: crate::device_layer::DeviceHandle<'_>,
         slot: &mut Option<ArmAtlas>,
         atlas: DrawAtlas,
         key: (u32, u32, u64),
+        write_gen: u64,
+        cur_py: u32,
         format: crate::device_layer::TexelFormat,
         bytes: &[u8],
-    ) -> Result<(), String> {
-        if slot.as_ref().is_some_and(|a| a.key == key) {
-            return Ok(());
-        }
+        frame_slots: &mut [ArmFrameSlot],
+    ) -> Result<(u64, u64), String> {
         let (tw, th, _) = key;
         let bpp = format.bytes_per_texel();
+        let row_bytes = (tw * bpp) as usize;
         let full = (tw * th * bpp) as usize;
-        if bytes.len() > full {
+        if bytes.len() > full || (row_bytes > 0 && !bytes.len().is_multiple_of(row_bytes)) {
             return Err(format!(
-                "metal arm: {atlas:?} atlas bytes ({}) exceed {tw}x{th}x{bpp}",
+                "metal arm: {atlas:?} atlas bytes ({}) invalid for {tw}x{th}x{bpp}",
                 bytes.len()
             ));
         }
-        let tex = mint
-            .texture_2d(
-                format.metal(),
-                tw as usize,
-                th as usize,
-                crate::metal::ffi::TEXTURE_USAGE_SHADER_READ,
+        let occupied_rows = bytes.len().checked_div(row_bytes).unwrap_or(0) as u32;
+        if let Some(a) = slot.as_mut()
+            && a.key == key
+        {
+            if a.write_gen == write_gen {
+                return Ok((0, 0));
+            }
+            let y0 = a.uploaded_py.min(occupied_rows);
+            let rows = occupied_rows.saturating_sub(y0);
+            let mut waited = (0, 0);
+            if rows > 0 {
+                waited = Self::await_atlas_readers(frame_slots);
+                debug_assert!(frame_slots.iter().all(|slot| slot.inflight.is_none()));
+                let start = y0 as usize * row_bytes;
+                let end = occupied_rows as usize * row_bytes;
+                // `a.tex` is `tw x th` (`th >= occupied_rows`); `bytes[start..end]`
+                // holds `rows * row_bytes` bytes at stride `row_bytes`. Every prior
+                // Submit A that could sample this texture has completed (above).
+                layer.upload_texture_rows(
+                    &a.tex,
+                    y0,
+                    rows,
+                    &bytes[start..end],
+                    row_bytes as u32,
+                    tw,
+                );
+            }
+            a.write_gen = write_gen;
+            a.uploaded_py = cur_py;
+            return Ok(waited);
+        }
+        let tex = layer
+            .try_create_texture_2d(
+                "aterm-gpu metal atlas",
+                format,
+                tw,
+                th,
+                crate::device_layer::TexUsage::UPLOADED_SAMPLED,
+                None,
             )
             .map_err(|e| format!("metal arm: {atlas:?} atlas: {e}"))?;
-        let padded;
-        let data = if bytes.len() == full {
-            bytes
-        } else {
-            padded = {
-                let mut data = vec![0u8; full];
-                data[..bytes.len()].copy_from_slice(bytes);
-                data
-            };
-            &padded
-        };
-        // SAFETY: fresh managed texture of exactly `tw` x `th`; `data` holds
-        // the full extent at the tight `tw * bpp` stride.
-        unsafe {
-            tex.upload(
-                crate::metal::ffi::MtlRegion::full_2d(tw as usize, th as usize),
-                data,
-                (tw * bpp) as usize,
-            );
-        }
-        *slot = Some(ArmAtlas { tex, key });
-        Ok(())
+        // A fresh texture of `tw x th` (`th >= occupied_rows`); `bytes` holds
+        // `occupied_rows * row_bytes` bytes at stride `row_bytes`. Unoccupied
+        // headroom past `occupied_rows` is never sampled by any placed glyph
+        // slot (`ay + gh <= occupied_rows`).
+        layer.upload_texture_rows(&tex, 0, occupied_rows, bytes, row_bytes as u32, tw);
+        *slot = Some(ArmAtlas {
+            tex,
+            key,
+            write_gen,
+            uploaded_py: cur_py,
+        });
+        Ok((0, 0))
+    }
+}
+
+#[cfg(clean_islands)]
+macro_rules! trust_island {
+    ($($item:item)*) => {
+        $($item)*
+    };
+}
+
+#[cfg(not(clean_islands))]
+macro_rules! trust_island {
+    ($($tt:tt)*) => {};
+}
+
+trust_island! {
+    clean {
+        namespace MetalAtlasAndFrameRing
+
+        -- Formal state machine for the Metal glyph-atlas incremental row-band
+        -- upload and the 3-slot Submit-A frame ring.
+        structure World where
+            cpuEpoch : Nat
+            cpuWriteGen : Nat
+            cpuPy : Nat
+            occupiedRows : Nat
+            gpuEpoch : Nat
+            gpuWriteGen : Nat
+            uploadedPy : Nat
+            gpuRows : Nat
+            remintCount : Nat
+            curSlot : Nat
+            slot0Busy : Bool
+            slot1Busy : Bool
+            slot2Busy : Bool
+            stalls : Nat
+
+        inductive Event where
+            | AppendShelf (newPy : Nat) (newOccupied : Nat)
+            | RepackAtlas (newOccupied : Nat)
+            | BeginFrame (prevCompleted : Bool)
+
+        def initWorld : World :=
+            { cpuEpoch := 1
+            , cpuWriteGen := 0
+            , cpuPy := 0
+            , occupiedRows := 16
+            , gpuEpoch := 1
+            , gpuWriteGen := 0
+            , uploadedPy := 0
+            , gpuRows := 16
+            , remintCount := 1
+            , curSlot := 0
+            , slot0Busy := true
+            , slot1Busy := false
+            , slot2Busy := false
+            , stalls := 0 }
+
+        def Synced (w : World) : Bool :=
+            Nat.beq w.cpuEpoch w.gpuEpoch
+                && Nat.beq w.cpuWriteGen w.gpuWriteGen
+                && Nat.beq w.cpuPy w.uploadedPy
+                && Nat.beq w.occupiedRows w.gpuRows
+
+        -- Fixed ensure_atlas + 3-slot ring transition.
+        def step (w : World) (ev : Event) : World :=
+            match ev with
+            | Event.AppendShelf newPy newOccupied =>
+                let nextGen := Nat.succ w.cpuWriteGen
+                if Nat.beq w.cpuEpoch w.gpuEpoch then
+                    { w with
+                        cpuWriteGen := nextGen
+                        cpuPy := newPy
+                        occupiedRows := newOccupied
+                        gpuWriteGen := nextGen
+                        uploadedPy := newPy
+                        gpuRows := newOccupied }
+                else
+                    { w with
+                        cpuWriteGen := nextGen
+                        cpuPy := newPy
+                        occupiedRows := newOccupied
+                        gpuEpoch := w.cpuEpoch
+                        gpuWriteGen := nextGen
+                        uploadedPy := newPy
+                        gpuRows := newOccupied
+                        remintCount := Nat.succ w.remintCount }
+            | Event.RepackAtlas newOccupied =>
+                let nextEpoch := Nat.succ w.cpuEpoch
+                { w with
+                    cpuEpoch := nextEpoch
+                    cpuWriteGen := 0
+                    cpuPy := 0
+                    occupiedRows := newOccupied
+                    gpuEpoch := nextEpoch
+                    gpuWriteGen := 0
+                    uploadedPy := 0
+                    gpuRows := newOccupied
+                    remintCount := Nat.succ w.remintCount }
+            | Event.BeginFrame prevCompleted =>
+                let nextSlot := (Nat.succ w.curSlot) % 3
+                let s0 := if prevCompleted then false else w.slot0Busy
+                let s1 := if prevCompleted then false else w.slot1Busy
+                let s2 := if prevCompleted then false else w.slot2Busy
+                let targetBusy :=
+                    if Nat.beq nextSlot 0 then s0
+                    else if Nat.beq nextSlot 1 then s1
+                    else s2
+                let nextStalls := if targetBusy then Nat.succ w.stalls else w.stalls
+                { w with
+                    curSlot := nextSlot
+                    slot0Busy := if Nat.beq nextSlot 0 then true else s0
+                    slot1Busy := if Nat.beq nextSlot 1 then true else s1
+                    slot2Busy := if Nat.beq nextSlot 2 then true else s2
+                    stalls := nextStalls }
+
+        -- Buggy pre-fix variant 1: folding map.len() into key forces a texture
+        -- re-mint on every glyph append.
+        def stepBuggyRemintOnAppend (w : World) (newPy newOccupied : Nat) : World :=
+            let nextGen := Nat.succ w.cpuWriteGen
+            { w with
+                cpuWriteGen := nextGen
+                cpuPy := newPy
+                occupiedRows := newOccupied
+                gpuWriteGen := nextGen
+                uploadedPy := newPy
+                gpuRows := newOccupied
+                remintCount := Nat.succ w.remintCount }
+
+        -- Buggy pre-fix variant 2: a single-slot frame buffer stalls whenever
+        -- the immediately preceding frame is still executing on the GPU.
+        def stepBuggySingleSlot (w : World) (prevCompleted : Bool) : World :=
+            let nextStalls := if prevCompleted then w.stalls else Nat.succ w.stalls
+            { w with slot0Busy := true, stalls := nextStalls }
+
+        theorem initWorld_synced : Synced initWorld = true := rfl
+
+        theorem append_shelf_preserves_sync :
+            let w1 := step initWorld (Event.AppendShelf 16 32)
+            let w2 := step w1 (Event.AppendShelf 32 48)
+            Synced w2 = true := rfl
+
+        theorem append_shelf_avoids_remint :
+            let w1 := step initWorld (Event.AppendShelf 16 32)
+            let w2 := step w1 (Event.AppendShelf 32 48)
+            w2.remintCount = 1 := rfl
+
+        theorem repack_atlas_preserves_sync :
+            let w1 := step initWorld (Event.RepackAtlas 24)
+            Synced w1 = true := rfl
+
+        theorem repack_atlas_bumps_remint :
+            let w1 := step initWorld (Event.RepackAtlas 24)
+            w1.remintCount = 2 := rfl
+
+        theorem counterexample_buggy_append_remints_every_time :
+            let w1 := stepBuggyRemintOnAppend initWorld 16 32
+            let w2 := stepBuggyRemintOnAppend w1 32 48
+            w2.remintCount = 3 := rfl
+
+        theorem three_slot_ring_avoids_stall_when_prev_frame_busy :
+            let w1 := step initWorld (Event.BeginFrame false)
+            let w2 := step w1 (Event.BeginFrame false)
+            w2.stalls = 0 := rfl
+
+        theorem counterexample_single_slot_stalls_when_prev_frame_busy :
+            let w1 := stepBuggySingleSlot initWorld false
+            let w2 := stepBuggySingleSlot w1 false
+            w2.stalls = 2 := rfl
+
+        end MetalAtlasAndFrameRing
     }
 }
 
@@ -3184,6 +3579,29 @@ fn visible_source_scissor(
     let x1 = right.clamp(0, i64::from(destination_width));
     let y1 = bottom.clamp(0, i64::from(destination_height));
     (x1 > x0 && y1 > y0).then_some((x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32))
+}
+
+/// Destination scissor for the crown pass when `band_shift` translates the
+/// present copy's grid band: restricts the visible source interval to the
+/// moved destination rows `[shift.dst_y, shift.dst_y + shift.moved)` so a
+/// shifted crown never bleeds onto pinned chrome rows or the incoming apron
+/// strip.
+fn crown_band_scissor(
+    uniform: &BlitUniform,
+    band_shift: Option<BandShift>,
+    destination_width: u32,
+    destination_height: u32,
+) -> Option<(u32, u32, u32, u32)> {
+    let Some(shift) = band_shift else {
+        return visible_source_scissor(uniform, destination_width, destination_height);
+    };
+    let mut shifted = *uniform;
+    let vis_y0 = uniform.visible_y.max(shift.dst_y as f32);
+    let vis_y1 =
+        (uniform.visible_y + uniform.visible_h).min(shift.dst_y.saturating_add(shift.moved) as f32);
+    shifted.visible_y = vis_y0;
+    shifted.visible_h = (vis_y1 - vis_y0).max(0.0);
+    visible_source_scissor(&shifted, destination_width, destination_height)
 }
 
 #[allow(
@@ -3469,6 +3887,9 @@ struct Atlas {
     px: u32,
     py: u32,
     shelf_h: u32,
+    /// Monotonic generation incremented on every real-slot append (`grow_atlas`),
+    /// reset to `0` on full repack (`build_kind`).
+    write_gen: u64,
 }
 
 impl Atlas {
@@ -3601,6 +4022,7 @@ fn build_kind(cpu: &mut Renderer, keys: &[GlyphKey], kind: AtlasKind, cap_h: u32
         px: 0,
         py: 0,
         shelf_h: 0,
+        write_gen: 0,
     };
     // Record placement first and blit after `data` is allocated, re-borrowing
     // the cache per glyph (no clone).
@@ -3654,6 +4076,7 @@ fn grow_atlas(
         px: sx,
         py: sy,
         shelf_h: sh,
+        write_gen: atlas.write_gen,
     };
     let mut dirty_lo = u32::MAX;
     let mut dirty_hi = 0u32;
@@ -3693,6 +4116,7 @@ fn grow_atlas(
             atlas.blit(img, &slot);
         }
     }
+    atlas.write_gen = atlas.write_gen.wrapping_add(1);
     Some((dirty_lo, dirty_hi))
 }
 
@@ -3836,7 +4260,7 @@ impl SpriteTextureLookup {
 impl SpriteTex {
     fn metal_atlas(
         &self,
-        mint: &crate::metal::resources::MetalResourceDevice,
+        layer: crate::device_layer::DeviceHandle<'_>,
         atlas: DrawAtlas,
     ) -> Result<&ArmAtlas, String> {
         if let Some(resident) = self.metal_atlas.get() {
@@ -3846,12 +4270,15 @@ impl SpriteTex {
         // cell empty so a later frame retries.
         let mut slot = None;
         MetalArmLive::ensure_atlas(
-            mint,
+            layer,
             &mut slot,
             atlas,
             (self.w, self.h, Arc::as_ptr(&self.src) as u64),
+            0,
+            0,
             crate::device_layer::TexelFormat::Rgba8Unorm,
             &self.src.rgba[..(self.w as usize * self.h as usize * 4)],
+            &mut [],
         )?;
         let _ = self
             .metal_atlas
@@ -7106,6 +7533,10 @@ impl GpuRenderer {
         if self.metal_arm.is_some() {
             return true;
         }
+        // The launch's first-frame warm may be compiling `cell.metal` on its
+        // worker right now; wait for it (bounded) so the compile below is a
+        // cache hit instead of a duplicate.
+        crate::metal::warm::FIRST_FRAME.await_cell();
         match MetalArmLive::new(self.ctx.metal_loss_latch_or_wire()) {
             Ok(live) => {
                 self.metal_arm = Some(MetalArmCell::new(live));
@@ -7161,7 +7592,7 @@ impl GpuRenderer {
     pub(crate) fn metal_pipeline_probe_for_test(&mut self) -> (bool, u64) {
         self.metal_arm.as_mut().map_or((false, 0), |c| {
             let l = c.live_mut();
-            (l.inflight_frame.is_some(), l.awaited_frames)
+            (l.has_inflight_frame(), l.awaited_frames)
         })
     }
 
@@ -7217,10 +7648,18 @@ impl GpuRenderer {
         }
         #[cfg(not(wgpu_arm))]
         {
-            // The Metal arm's documented device answer (`DeviceHandle::
-            // max_texture_dim`): every Apple-silicon family supports 16384.
-            d.clamp(1, 16384)
+            // The Metal arm's device answer: the production context holds no
+            // device until the arm mints one on the render thread.
+            d.clamp(1, crate::device_layer::METAL_MAX_TEXTURE_DIM)
         }
+    }
+
+    /// Test/diagnostic: the device's 2-D texture dimension ceiling, the bound
+    /// every framebuffer dimension clamps to ([`Self::clamp_fb_dim`]).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn max_texture_dim(&self) -> u32 {
+        self.clamp_fb_dim(u32::MAX)
     }
 
     /// Glyph-atlas textures created so far (full packs only; reuse and appends
@@ -7311,10 +7750,9 @@ impl GpuRenderer {
         // bounds `atlas.height` to it).
         #[cfg(wgpu_arm)]
         let max_tex_dim = handle.max_texture_dim();
-        // The wgpu-free build uses the Metal arm's `max_texture_dim` (16384 on
-        // Apple silicon).
+        // The wgpu-free build uses the Metal arm's `max_texture_dim`.
         #[cfg(not(wgpu_arm))]
-        let max_tex_dim = 16384;
+        let max_tex_dim = crate::device_layer::METAL_MAX_TEXTURE_DIM;
         let tex_h = (atlas.height + ATLAS_GROW_HEADROOM).min(max_tex_dim);
         #[cfg(wgpu_arm)]
         let tex = handle.create_texture_2d(
@@ -7547,7 +7985,7 @@ impl GpuRenderer {
         #[cfg(wgpu_arm)]
         let cap_h = self.ctx.device_layer().max_texture_dim();
         #[cfg(not(wgpu_arm))]
-        let cap_h = 16384; // the Metal arm's documented device answer
+        let cap_h = crate::device_layer::METAL_MAX_TEXTURE_DIM;
         // Every full repack moves the armed atlas keys, even when
         // `(w, tex_h, map.len())` are identical (a font-feature change).
         #[cfg(target_os = "macos")]
@@ -7672,7 +8110,7 @@ impl GpuRenderer {
         #[cfg(wgpu_arm)]
         let max_tex_dim = self.ctx.device.limits().max_texture_dimension_2d;
         #[cfg(not(wgpu_arm))]
-        let max_tex_dim = 16384; // the Metal arm's documented device answer
+        let max_tex_dim = crate::device_layer::METAL_MAX_TEXTURE_DIM;
         let mut total_h: u32 = 0;
         let mut max_w: u32 = 0;
         for (image, fp_w, fp_h, _) in &order {
@@ -8531,7 +8969,7 @@ impl GpuRenderer {
         width: u32,
         height: u32,
     ) -> Result<Frame, String> {
-        use crate::metal::ffi::{self as mtl, TEXTURE_USAGE_RENDER_TARGET};
+        use crate::metal::ffi as mtl;
         let _pool = mtl::AutoreleasePool::new();
         let throwaway = {
             let live = self
@@ -8539,12 +8977,19 @@ impl GpuRenderer {
                 .as_mut()
                 .ok_or("metal arm not minted")?
                 .live_mut();
-            live.mint.texture_2d(
-                mtl::PixelFormat::Bgra8Unorm,
-                width as usize,
-                height as usize,
-                TEXTURE_USAGE_RENDER_TARGET,
-            )?
+            live.layer()
+                .try_create_texture_2d(
+                    "aterm-gpu metal throwaway present target",
+                    crate::device_layer::TexelFormat::Bgra8Unorm,
+                    width,
+                    height,
+                    crate::device_layer::TexUsage {
+                        render: true,
+                        ..crate::device_layer::TexUsage::default()
+                    },
+                    None,
+                )?
+                .into_metal()
         };
         let (submitted, composed_present_off) = self.metal_encode_submit_b(
             win,
@@ -8611,24 +9056,21 @@ impl GpuRenderer {
         if unchanged {
             return Ok(());
         }
-        let tex = live
-            .mint
-            .texture_2d(
-                crate::metal::ffi::PixelFormat::Rgba8Unorm,
-                t.pw as usize,
-                t.ph as usize,
-                crate::metal::ffi::TEXTURE_USAGE_SHADER_READ,
+        let layer = live.layer();
+        let tex = layer
+            .try_create_texture_2d(
+                "aterm-gpu metal tray card",
+                crate::device_layer::TexelFormat::Rgba8Unorm,
+                t.pw,
+                t.ph,
+                crate::device_layer::TexUsage::UPLOADED_SAMPLED,
+                None,
             )
             .map_err(|e| format!("tray card mint: {e}"))?;
-        // SAFETY: fresh managed texture of exactly `pw` x `ph`; the card is
-        // `pw*ph*4` straight-RGBA bytes at the tight stride.
-        unsafe {
-            tex.upload(
-                crate::metal::ffi::MtlRegion::full_2d(t.pw as usize, t.ph as usize),
-                t.rgba,
-                (t.pw * 4) as usize,
-            );
-        }
+        // A fresh texture of exactly `pw` x `ph`; the card is `pw*ph*4`
+        // straight-RGBA bytes at the tight stride.
+        layer.upload_texture_full(&tex, t.rgba, t.pw * 4, t.pw, t.ph);
+        let tex = tex.into_metal();
         *tray_uploads += 1;
         // Refill the outgoing card's mirror in place (`ensure_tray_overlay`'s
         // discipline) instead of a fresh `pw*ph*4` allocation per change.
@@ -8659,8 +9101,7 @@ impl GpuRenderer {
     ) -> Result<(), String> {
         use crate::metal::encoder::{RenderPassDesc, StoreAction};
         use crate::metal::ffi::{
-            self as mtl, ClearColor, LoadAction, MtlScissorRect, PixelFormat as MPix,
-            PrimitiveType, TEXTURE_USAGE_RENDER_TARGET, TEXTURE_USAGE_SHADER_READ,
+            self as mtl, ClearColor, LoadAction, MtlScissorRect, PixelFormat as MPix, PrimitiveType,
         };
         let _pool = mtl::AutoreleasePool::new();
         let (glow_count, bbox, extract_first) = self.build_bloom_glow(input);
@@ -8681,17 +9122,28 @@ impl GpuRenderer {
             .as_mut()
             .ok_or("the Metal arm is not live")?
             .live_mut();
-        let usage = TEXTURE_USAGE_RENDER_TARGET | TEXTURE_USAGE_SHADER_READ;
         let (bw, bh) = (
             (fw / BLOOM_DOWNSCALE).max(1) as usize,
             (fh / BLOOM_DOWNSCALE).max(1) as usize,
         );
-        let half = live.mint.texture_2d(MPix::Rgba8Unorm, bw, bh, usage)?;
+        let half = live
+            .layer()
+            .try_create_texture_2d(
+                "aterm-gpu metal bloom half",
+                crate::device_layer::TexelFormat::Rgba8Unorm,
+                bw as u32,
+                bh as u32,
+                crate::device_layer::TexUsage::OFFSCREEN,
+                None,
+            )?
+            .into_metal();
         let mint_bytes = |live: &mut MetalArmLive, bytes: &[u8]| -> Result<mtl::Obj, String> {
-            let buf = live.mint.buffer(bytes.len())?;
+            let layer = live.layer();
+            let buf = layer
+                .try_create_uniform_buffer("aterm-gpu metal bloom bytes", bytes.len() as u64)?;
             // SAFETY: fresh exactly-sized shared buffer; no GPU work on it.
-            unsafe { mtl::buffer_write(&buf, bytes) };
-            Ok(buf)
+            unsafe { layer.write_buffer_from_zero(&buf, bytes) };
+            Ok(buf.into_metal().into_obj())
         };
         let insts: &[GlowInstance] = &self.bloom_glow_scratch;
         let stream = mint_bytes(live, aterm_bits::cast_slice(insts))?;
@@ -8834,10 +9286,7 @@ impl GpuRenderer {
         input: &RenderInput,
     ) -> Result<(), String> {
         use crate::metal::encoder::{RenderPassDesc, StoreAction};
-        use crate::metal::ffi::{
-            self as mtl, LoadAction, MtlScissorRect, PixelFormat as MPix,
-            TEXTURE_USAGE_RENDER_TARGET, TEXTURE_USAGE_SHADER_READ,
-        };
+        use crate::metal::ffi::{self as mtl, LoadAction, MtlScissorRect, PixelFormat as MPix};
         let _pool = mtl::AutoreleasePool::new();
         let (fw, fh, off_tex) = {
             let off = win
@@ -8856,10 +9305,17 @@ impl GpuRenderer {
             .as_mut()
             .ok_or("the Metal arm is not live")?
             .live_mut();
-        let usage = TEXTURE_USAGE_RENDER_TARGET | TEXTURE_USAGE_SHADER_READ;
         let scratch = live
-            .mint
-            .texture_2d(MPix::Rgba8Unorm, fw as usize, fh as usize, usage)?;
+            .layer()
+            .try_create_texture_2d(
+                "aterm-gpu metal shimmer scratch",
+                crate::device_layer::TexelFormat::Rgba8Unorm,
+                fw,
+                fh,
+                crate::device_layer::TexUsage::OFFSCREEN,
+                None,
+            )?
+            .into_metal();
         let mut heat = [[0f32; 4]; SHIMMER_BANDS / 4];
         for (i, v) in region.heat.iter().enumerate() {
             heat[i / 4][i % 4] = *v;
@@ -8880,10 +9336,14 @@ impl GpuRenderer {
             heat,
         };
         let ub = {
-            let buf = live.mint.buffer(std::mem::size_of::<ShimmerUniform>())?;
+            let layer = live.layer();
+            let buf = layer.try_create_uniform_buffer(
+                "aterm-gpu metal shimmer uniform",
+                std::mem::size_of::<ShimmerUniform>() as u64,
+            )?;
             // SAFETY: fresh exactly-sized shared buffer; no GPU work on it.
-            unsafe { mtl::buffer_write(&buf, aterm_bits::bytes_of(&su)) };
-            buf
+            unsafe { layer.write_buffer_from_zero(&buf, aterm_bits::bytes_of(&su)) };
+            buf.into_metal().into_obj()
         };
         let m = SHIMMER_COPY_MARGIN;
         let [sx0, sy0, sx1, sy1] = [
@@ -8963,10 +9423,14 @@ impl GpuRenderer {
             .live_mut();
         Self::ensure_metal_tray_card(live, win, &t, &mut self.tray_uploads)?;
         let tu = {
-            let buf = live.mint.buffer(std::mem::size_of::<TrayUniform>())?;
+            let layer = live.layer();
+            let buf = layer.try_create_uniform_buffer(
+                "aterm-gpu metal tray uniform",
+                std::mem::size_of::<TrayUniform>() as u64,
+            )?;
             // SAFETY: fresh exactly-sized shared buffer; no GPU work on it.
             unsafe {
-                mtl::buffer_write(
+                layer.write_buffer_from_zero(
                     &buf,
                     aterm_bits::bytes_of(&TrayUniform {
                         rect: [t.dx as f32, t.dy as f32, t.pw as f32, t.ph as f32],
@@ -8975,7 +9439,7 @@ impl GpuRenderer {
                     }),
                 );
             }
-            buf
+            buf.into_metal().into_obj()
         };
         let pso = live.present_pso(Pipeline::Tray, MPix::Rgba8Unorm)?;
         let linear = &live.linear;
@@ -9025,12 +9489,18 @@ impl GpuRenderer {
             let _pool = crate::metal::ffi::AutoreleasePool::new();
             let cell = self.metal_arm.as_mut().ok_or("the Metal arm is not live")?;
             let live = cell.live_mut();
-            win.metal_shift_scratch = Some(live.mint.texture_2d(
-                crate::metal::ffi::PixelFormat::Rgba8Unorm,
-                w as usize,
-                h as usize,
-                0,
-            )?);
+            win.metal_shift_scratch = Some(
+                live.layer()
+                    .try_create_texture_2d(
+                        "aterm-gpu metal scroll shift scratch",
+                        crate::device_layer::TexelFormat::Rgba8Unorm,
+                        w,
+                        h,
+                        crate::device_layer::TexUsage::COPY_STAGING,
+                        None,
+                    )?
+                    .into_metal(),
+            );
         }
         Ok(win
             .metal_shift_scratch
@@ -9481,9 +9951,7 @@ impl GpuRenderer {
         effects_transport_shift_y: i32,
         destination: (u32, u32),
     ) -> Result<(), String> {
-        use crate::metal::ffi::{
-            self as mtl, TEXTURE_USAGE_RENDER_TARGET, TEXTURE_USAGE_SHADER_READ,
-        };
+        use crate::metal::ffi as mtl;
         let _pool = mtl::AutoreleasePool::new();
         let source_crop = self
             .resident_present_crop(input, source_crop)
@@ -9527,12 +9995,18 @@ impl GpuRenderer {
                 .as_mut()
                 .ok_or("the arm is not live")?
                 .live_mut();
-            win.metal_virtual_off = Some(live.mint.texture_2d(
-                mtl::PixelFormat::Bgra8Unorm,
-                w as usize,
-                h as usize,
-                TEXTURE_USAGE_RENDER_TARGET | TEXTURE_USAGE_SHADER_READ,
-            )?);
+            win.metal_virtual_off = Some(
+                live.layer()
+                    .try_create_texture_2d(
+                        "aterm-gpu metal virtual present target",
+                        crate::device_layer::TexelFormat::Bgra8Unorm,
+                        w,
+                        h,
+                        crate::device_layer::TexUsage::OFFSCREEN,
+                        None,
+                    )?
+                    .into_metal(),
+            );
         }
         // An owned +1 handle (same loss-domain stamp) so `win` stays mutably
         // borrowable through Submit B — the rig convention.
@@ -9574,7 +10048,14 @@ impl GpuRenderer {
                 .as_mut()
                 .ok_or("the arm is not live")?
                 .live_mut();
-            let rb = live.mint.buffer(row * h as usize)?;
+            let rb = live
+                .layer()
+                .try_create_readback_buffer(
+                    "aterm-gpu metal virtual present readback",
+                    (row * h as usize) as u64,
+                )?
+                .into_metal()
+                .into_obj();
             let mut cb = live.session.begin()?;
             cb.copy_texture_to_buffer(&target, w as usize, h as usize, &rb, row)?;
             if cb.commit().wait_outcome() != crate::metal::loss::CbOutcome::Completed {
@@ -9672,22 +10153,13 @@ impl GpuRenderer {
         copy_armed: bool,
         target: &crate::metal::resources::SealedTexture,
     ) -> Result<(crate::metal::encoder::Submitted, bool), String> {
-        use crate::metal::ffi::{
-            self as mtl, PixelFormat as MPix, TEXTURE_USAGE_RENDER_TARGET,
-            TEXTURE_USAGE_SHADER_READ,
-        };
+        use crate::metal::ffi::{self as mtl, PixelFormat as MPix};
         use crate::metal::present::{
             ApronStripPass, BandShiftPass, BloomPasses, CrownPass, PostPass, PresentSequence,
             ShimmerPass, TrayPass, encode_present_sequence,
         };
 
         // ---- Phase A: derivations off `self`/`win` (no arm borrow) -------
-        let bloom_state = if self.enable_bloom && !input.cursor_glow_add.is_empty() {
-            let (count, bbox, extract_first) = self.build_bloom_glow(input);
-            (count > 0).then_some((count, bbox, extract_first))
-        } else {
-            None
-        };
         // The blit + crown uniforms — the production derivation, shared with
         // the wgpu arm (`present_uniforms`).
         let PresentUniforms {
@@ -9709,11 +10181,12 @@ impl GpuRenderer {
             translucent,
             premult,
         );
-        let crown_count = if run_hdr_glow || run_sdr_glow {
-            match bloom_state {
-                Some((n, _, _)) => n,
-                None => self.build_bloom_glow(input).0,
-            }
+        let want_bloom = self.enable_bloom && !input.cursor_glow_add.is_empty();
+        let want_crown = run_hdr_glow || run_sdr_glow;
+        let bloom_glow = (want_bloom || want_crown).then(|| self.build_bloom_glow(input));
+        let bloom_state = bloom_glow.filter(|(count, _, _)| want_bloom && *count > 0);
+        let crown_count = if want_crown {
+            bloom_glow.map_or(0, |(n, _, _)| n)
         } else {
             0
         };
@@ -9791,17 +10264,31 @@ impl GpuRenderer {
                 .is_none_or(|t| (t.width(), t.height()) != (fw as usize, fh as usize));
         let cell = self.metal_arm.as_mut().ok_or("the Metal arm is not live")?;
         let live = cell.live_mut();
-        let usage = TEXTURE_USAGE_RENDER_TARGET | TEXTURE_USAGE_SHADER_READ;
+        // Every Submit-B scratch target here is an offscreen-family texture,
+        // as its wgpu twin (`offscreen_texture`) is.
+        let mint_scratch = |live: &MetalArmLive, label, w: usize, h: usize| {
+            live.layer()
+                .try_create_texture_2d(
+                    label,
+                    crate::device_layer::TexelFormat::Rgba8Unorm,
+                    w as u32,
+                    h as u32,
+                    crate::device_layer::TexUsage::OFFSCREEN,
+                    None,
+                )
+                .map(crate::device_layer::LayerTexture::into_metal)
+        };
         if needs_off {
             // A fresh texture holds undefined texels, so force a full-frame
             // compose copy.
             win.offscreen_dirty_since_sync = None;
             win.present_offscreen_fx = None;
-            win.metal_present_off =
-                Some(
-                    live.mint
-                        .texture_2d(MPix::Rgba8Unorm, fw as usize, fh as usize, usage)?,
-                );
+            win.metal_present_off = Some(mint_scratch(
+                live,
+                "aterm-gpu metal present offscreen",
+                fw as usize,
+                fh as usize,
+            )?);
         }
         // Owned +1 for the same reason as `off_tex` above — and `Some` exactly
         // when a pass can write it, which `needs_off` above guarantees.
@@ -9812,14 +10299,10 @@ impl GpuRenderer {
                 .clone_handle()
         });
         let dest_mpix = dest_format.metal();
-        // Fresh uniforms for the extract: Submit B is not waited, and the
-        // resident frame uniform is rewritten by the next encode.
-        let mint_bytes = |live: &mut MetalArmLive, bytes: &[u8]| -> Result<mtl::Obj, String> {
-            let buf = live.mint.buffer(bytes.len())?;
-            // SAFETY: fresh exactly-sized shared buffer; no GPU work on it.
-            unsafe { mtl::buffer_write(&buf, bytes) };
-            Ok(buf)
-        };
+        // Advance the Submit-B ring slot so uniforms and glow streams reuse
+        // pre-allocated shared buffers across up to `ARM_SUBMIT_B_SLOTS` in-flight
+        // presents without per-frame `newBufferWithLength:` allocations.
+        live.advance_submit_b_slot();
 
         // Bloom (rows 4 + 12) — the replay's derivation, verbatim.
         let (bw, bh) = (
@@ -9834,7 +10317,7 @@ impl GpuRenderer {
                 .as_ref()
                 .is_none_or(|t| (t.width(), t.height()) != (bw, bh))
         {
-            win.metal_bloom_half = Some(live.mint.texture_2d(MPix::Rgba8Unorm, bw, bh, usage)?);
+            win.metal_bloom_half = Some(mint_scratch(live, "aterm-gpu metal bloom half", bw, bh)?);
         }
         let bloom_parts = if let Some((count, bbox, extract_first)) = bloom_state {
             let half = win
@@ -9845,18 +10328,25 @@ impl GpuRenderer {
             // One upload of the whole ungated stream; the extract binds it at the
             // `extract_first` byte offset.
             let insts: &[GlowInstance] = &self.bloom_glow_scratch;
-            let stream = mint_bytes(live, aterm_bits::cast_slice(insts))?;
+            let sb_idx = live.submit_b_idx;
+            let stream = MetalArmLive::upload_scratch_stream(
+                crate::device_layer::DeviceHandle::Metal(&live.mint),
+                &mut live.submit_b_slots[sb_idx].glow_stream,
+                aterm_bits::cast_slice(insts),
+            )?;
             let extract_offset = extract_first as usize * std::mem::size_of::<GlowInstance>();
-            let cell_u = mint_bytes(
-                live,
+            let cell_u = MetalArmLive::upload_scratch_stream(
+                crate::device_layer::DeviceHandle::Metal(&live.mint),
+                &mut live.submit_b_slots[sb_idx].bloom_cell_u,
                 aterm_bits::bytes_of(&Uniforms {
                     screen: [fw as f32, fh as f32],
                     text_blend: text_blend as f32,
                     _pad: 0.0,
                 }),
             )?;
-            let bu = mint_bytes(
-                live,
+            let bu = MetalArmLive::upload_scratch_stream(
+                crate::device_layer::DeviceHandle::Metal(&live.mint),
+                &mut live.submit_b_slots[sb_idx].bloom_u,
                 aterm_bits::bytes_of(&BloomUniform {
                     texel: [1.0 / bw as f32, 1.0 / bh as f32],
                     strength: self.bloom_strength,
@@ -9922,11 +10412,12 @@ impl GpuRenderer {
                 .as_ref()
                 .is_none_or(|t| (t.width(), t.height()) != (fw as usize, fh as usize))
         {
-            win.metal_shimmer_scratch =
-                Some(
-                    live.mint
-                        .texture_2d(MPix::Rgba8Unorm, fw as usize, fh as usize, usage)?,
-                );
+            win.metal_shimmer_scratch = Some(mint_scratch(
+                live,
+                "aterm-gpu metal shimmer scratch",
+                fw as usize,
+                fh as usize,
+            )?);
         }
         let shimmer_parts = shimmer_region
             .map(|region| -> Result<_, String> {
@@ -9954,7 +10445,12 @@ impl GpuRenderer {
                     _pad: [0.0; 2],
                     heat,
                 };
-                let ub = mint_bytes(live, aterm_bits::bytes_of(&su))?;
+                let sb_idx = live.submit_b_idx;
+                let ub = MetalArmLive::upload_scratch_stream(
+                    crate::device_layer::DeviceHandle::Metal(&live.mint),
+                    &mut live.submit_b_slots[sb_idx].shimmer_u,
+                    aterm_bits::bytes_of(&su),
+                )?;
                 let m = SHIMMER_COPY_MARGIN;
                 let stage = [
                     region.x0.saturating_sub(m),
@@ -9981,8 +10477,10 @@ impl GpuRenderer {
         }
         let tray_parts = tray
             .map(|t| -> Result<_, String> {
-                let tu = mint_bytes(
-                    live,
+                let sb_idx = live.submit_b_idx;
+                let tu = MetalArmLive::upload_scratch_stream(
+                    crate::device_layer::DeviceHandle::Metal(&live.mint),
+                    &mut live.submit_b_slots[sb_idx].tray_u,
                     aterm_bits::bytes_of(&TrayUniform {
                         rect: [t.dx as f32, t.dy as f32, t.pw as f32, t.ph as f32],
                         fb: [fw as f32, fh as f32],
@@ -9995,17 +10493,9 @@ impl GpuRenderer {
             })
             .transpose()?;
 
-        // The blit + crown. The blit uniform reuses the arm's memoized buffer
-        // when its bytes are this present's (`MetalArmLive::blit_ubuf`).
-        let bu = if let Some((memo, buf)) = live.blit_ubuf.as_ref()
-            && aterm_bits::bytes_of(memo) == aterm_bits::bytes_of(&want)
-        {
-            buf.clone_retained()
-        } else {
-            let buf = mint_bytes(live, aterm_bits::bytes_of(&want))?;
-            live.blit_ubuf = Some((want, buf.clone_retained()));
-            buf
-        };
+        // The blit + crown. The blit uniform reuses the Submit-B slot's memoized
+        // buffer when its bytes match this present's (`ArmSubmitBSlot::blit_u`).
+        let bu = live.ensure_submit_b_blit_u(want)?;
         let blit_pso = live.present_pso(Pipeline::Blit, dest_mpix)?;
         let crown_parts = if let Some(hu) = crown
             && crown_count > 0
@@ -10016,13 +10506,19 @@ impl GpuRenderer {
                 } else {
                     Pipeline::SdrGlow
                 };
-                let ubuf = mint_bytes(live, aterm_bits::bytes_of(&hu))?;
+                let sb_idx = live.submit_b_idx;
+                let ubuf = MetalArmLive::upload_scratch_stream(
+                    crate::device_layer::DeviceHandle::Metal(&live.mint),
+                    &mut live.submit_b_slots[sb_idx].crown_u,
+                    aterm_bits::bytes_of(&hu),
+                )?;
                 // With bloom on, its ungated stream already holds the crown's set
                 // at `0..n`; share it.
                 let stream = match bloom_parts.as_ref() {
                     Some((_, _, _, _, (bloom_stream, _), ..)) => bloom_stream.clone_retained(),
-                    None => mint_bytes(
-                        live,
+                    None => MetalArmLive::upload_scratch_stream(
+                        crate::device_layer::DeviceHandle::Metal(&live.mint),
+                        &mut live.submit_b_slots[sb_idx].glow_stream,
                         aterm_bits::cast_slice(&self.bloom_glow_scratch[..crown_count as usize]),
                     )?,
                 };
@@ -10352,7 +10848,11 @@ impl GpuRenderer {
             .ok_or("the arm is not live")?
             .live_mut();
         let row = (dw * 4) as usize;
-        let rb = live.mint.buffer(row * dh as usize)?;
+        let rb = live
+            .layer()
+            .try_create_readback_buffer("aterm-gpu metal readback", (row * dh as usize) as u64)?
+            .into_metal()
+            .into_obj();
         let mut cb = live.session.begin()?;
         cb.copy_texture_to_buffer(&target, dw as usize, dh as usize, &rb, row)?;
         if cb.commit().wait_outcome() != crate::metal::loss::CbOutcome::Completed {
@@ -10574,12 +11074,7 @@ impl GpuRenderer {
                 format,
                 w,
                 h,
-                crate::device_layer::TexUsage {
-                    sampled: false,
-                    render: false,
-                    copy_src: true,
-                    copy_dst: true,
-                },
+                crate::device_layer::TexUsage::COPY_STAGING,
                 None,
             ));
         }
@@ -10746,6 +11241,10 @@ impl GpuRenderer {
         width: u32,
         height: u32,
     ) -> Result<GpuSurface, String> {
+        // macOS names no handle crate (`WindowTarget`), so the oracle hands wgpu
+        // the content view as an AppKit raw-window-handle.
+        #[cfg(target_os = "macos")]
+        let target = AppKitSurfaceTarget(target);
         let surface = self
             .ctx
             .instance
@@ -10934,18 +11433,19 @@ impl GpuRenderer {
         Ok(())
     }
 
-    /// Configure an already-created `wgpu::Surface` at the given size, with the
-    /// same non-sRGB format selection as
-    /// [`create_window_surface`](Self::create_window_surface). For WebGL, where
-    /// the canvas surface must exist before the adapter. No format cache or eager
-    /// blit pipeline; `present_input` ensures it lazily.
-    #[cfg(wgpu_arm)]
-    pub fn configure_window_surface(
+    /// Configure the canvas surface [`crate::GpuContext::for_canvas`] created,
+    /// at the given size, with the same non-sRGB format selection as
+    /// [`create_window_surface`](Self::create_window_surface). WebGL needs the
+    /// canvas surface before the adapter, hence the two steps. No format cache
+    /// or eager blit pipeline; `present_input` ensures it lazily.
+    #[cfg(target_arch = "wasm32")]
+    pub fn configure_canvas_surface(
         &self,
-        surface: wgpu::Surface<'static>,
+        surface: crate::web::CanvasSurface,
         width: u32,
         height: u32,
     ) -> Result<GpuSurface, String> {
+        let surface = surface.0;
         let caps = surface.get_capabilities(&self.ctx.adapter);
         let format = Self::pick_surface_format(&caps)?;
         let post_mult = Self::caps_support_post_multiplied(&caps);
@@ -11316,11 +11816,26 @@ impl GpuRenderer {
                 want = want.with_premultiplied_output();
             }
         }
-        let crown_scissor = visible_source_scissor(&want, dw, dh);
+        let (band_y0, band_y1) = aterm_render::scroll_translate::grid_band_px(
+            self.cpu.grid_top(),
+            self.cell_size().1,
+            input.grid_top_row,
+            input.grid_bot_row,
+            fh as usize,
+        );
+        let band_shift = band_shift_ops(band_y0, band_y1, i64::from(input.scroll_frac_px));
+        let crown_scissor = crown_band_scissor(&want, band_shift, dw, dh);
+        let crown_content_off = match band_shift {
+            Some(_) => [
+                want.content_off[0],
+                want.content_off[1] - input.scroll_frac_px as f32,
+            ],
+            None => want.content_off,
+        };
         let crown = if run_hdr_glow {
             Some(HdrGlowUniform {
                 screen: [dw as f32, dh as f32],
-                content_off: want.content_off,
+                content_off: crown_content_off,
                 // scRGB: scale the aurora to the same reference-white as the grid so its
                 // peak reaches the panel max (min(lin*boost*s, headroom*s) == s*min(..)).
                 boost: aterm_render::hdr::HDR_GLOW_BOOST * win.sdr_white_scale.max(1.0),
@@ -11332,7 +11847,7 @@ impl GpuRenderer {
             // `fs_sdr_glow` scales the colour by it.
             Some(HdrGlowUniform {
                 screen: [dw as f32, dh as f32],
-                content_off: want.content_off,
+                content_off: crown_content_off,
                 boost: 1.0,
                 headroom: sdr_budget,
                 _pad: [0.0, 0.0],
@@ -11448,7 +11963,7 @@ impl GpuRenderer {
     /// Returns whether the layer moved. `false` without an AppKit read for an
     /// already-f16 surface or when the gate refuses; also `false` on an SDR
     /// screen, a refused flip, off macOS, and on the wgpu-oracle arm.
-    pub fn upgrade_surface_for_screen<W: raw_window_handle::HasWindowHandle>(
+    pub fn upgrade_surface_for_screen<W: WindowTarget>(
         &mut self,
         win: &mut WindowGpu,
         surf: &mut GpuSurface,
@@ -12236,12 +12751,7 @@ impl GpuRenderer {
                 format,
                 w,
                 h,
-                crate::device_layer::TexUsage {
-                    sampled: false,
-                    render: false,
-                    copy_src: true,
-                    copy_dst: true,
-                },
+                crate::device_layer::TexUsage::COPY_STAGING,
                 None,
             ));
         }
@@ -12374,12 +12884,7 @@ impl GpuRenderer {
                 format,
                 w,
                 h,
-                crate::device_layer::TexUsage {
-                    sampled: false,
-                    render: false,
-                    copy_src: true,
-                    copy_dst: true,
-                },
+                crate::device_layer::TexUsage::COPY_STAGING,
                 None,
             ));
             // Empty ⇒ can never equal a real raster ⇒ the fresh texture
@@ -12466,20 +12971,21 @@ impl GpuRenderer {
             let _pool = crate::metal::ffi::AutoreleasePool::new();
             let cell = self.metal_arm.as_mut().ok_or("the Metal arm is not live")?;
             let live = cell.live_mut();
-            let tex = live
-                .mint
-                .texture_2d(crate::metal::ffi::PixelFormat::Rgba8Unorm, w, h, 0)
+            let layer = live.layer();
+            let tex = layer
+                .try_create_texture_2d(
+                    "aterm-gpu metal apron row",
+                    crate::device_layer::TexelFormat::Rgba8Unorm,
+                    w as u32,
+                    h as u32,
+                    crate::device_layer::TexUsage::COPY_STAGING,
+                    None,
+                )
                 .map_err(|e| format!("apron row mint: {e}"))?;
-            // SAFETY: fresh managed texture of exactly `w` x `h`; the packed
-            // apron is `w*h*4` RGBA bytes at the tight stride (`apron_strip_plan`).
-            unsafe {
-                tex.upload(
-                    crate::metal::ffi::MtlRegion::full_2d(w, h),
-                    &win.apron_rgba,
-                    w * 4,
-                );
-            }
-            win.metal_apron_tex = Some(tex);
+            // A fresh texture of exactly `w` x `h`; the packed apron is `w*h*4`
+            // RGBA bytes at the tight stride (`apron_strip_plan`).
+            layer.upload_texture_full(&tex, &win.apron_rgba, (w * 4) as u32, w as u32, h as u32);
+            win.metal_apron_tex = Some(tex.into_metal());
             win.metal_apron_bytes.clear();
             win.metal_apron_bytes.extend_from_slice(&win.apron_rgba);
         }
@@ -13045,13 +13551,14 @@ impl GpuRenderer {
         };
 
         // Remember this frame on the window for the next present's diff,
-        // `clone_from` into the resident `prev_input` (reuses the allocation at
-        // stable dims).
+        // `clone_input_stamped` into the resident `prev_input` (reuses the
+        // allocation at stable dims and skips row copies whose stamped row_rev
+        // matches).
         let mut prev_input = prev_input;
         // `prev_input` is also the semantic source for image/video
         // introspection, so it keeps the full payload; the gate cache below is
         // damage-only.
-        prev_input.clone_from(input);
+        aterm_render::clone_input_stamped(&mut prev_input, input);
         win.prev_input = prev_input;
         win.advance_resident_input_epoch();
         win.present_prev = Some(PresentPrev {
@@ -15530,13 +16037,14 @@ impl GpuRenderer {
         // MISS: full GPU render + readback, then refresh the gate cache to THIS
         // frame's pixels + state so the next unchanged frame can take the gate.
         self.gate_misses += 1;
+        let mut damage_input = win
+            .gate_cache
+            .take()
+            .map_or_else(RenderInput::empty, |c| c.input);
+        aterm_render::clone_damage_cache_from_stamped(&mut damage_input, input);
         let frame = self.render_input(win, input, None);
         win.gate_cache = Some(GpuGateCache {
-            input: {
-                let mut damage_input = RenderInput::empty();
-                damage_input.clone_damage_cache_from(input);
-                damage_input
-            },
+            input: damage_input,
             blink_phase: cur_blink,
             cursor_style_override: cur_override,
             grid_top: self.cpu.grid_top(),
@@ -17891,10 +18399,6 @@ impl GpuRenderer {
         if armed {
             'armed: {
                 let _pool = crate::metal::ffi::AutoreleasePool::new();
-                use crate::metal::ffi::{
-                    PixelFormat as MtlPixelFormat, TEXTURE_USAGE_RENDER_TARGET,
-                    TEXTURE_USAGE_SHADER_READ,
-                };
                 use crate::metal::loss::CbOutcome;
 
                 // 1. Stage the instance streams (write-from-0, geometric grow):
@@ -17906,8 +18410,8 @@ impl GpuRenderer {
                         .as_mut()
                         .expect("armed implies the arm minted")
                         .live_mut();
-                    // The previous frame's Submit A must be terminal before
-                    // these shared-storage rewrites.
+                    // This ring slot's Submit A must be terminal before its
+                    // shared-storage buffers are rewritten.
                     live.await_frame_slot();
                     for id in StreamId::ALL {
                         let (bytes, count) = self.inst.stream_bytes(id);
@@ -17984,16 +18488,20 @@ impl GpuRenderer {
                         .live_mut();
                     let tex = armed_try!(
                         "offscreen mint failed",
-                        live.mint.texture_2d(
-                            MtlPixelFormat::Rgba8Unorm,
-                            w as usize,
-                            h as usize,
-                            TEXTURE_USAGE_RENDER_TARGET | TEXTURE_USAGE_SHADER_READ,
-                        )
+                        live.layer()
+                            .try_create_texture_2d(
+                                "aterm-gpu metal offscreen",
+                                crate::device_layer::TexelFormat::Rgba8Unorm,
+                                w,
+                                h,
+                                crate::device_layer::TexUsage::OFFSCREEN,
+                                Some(crate::device_layer::TexelFormat::Rgba8UnormSrgb),
+                            )
+                            .map(crate::device_layer::LayerTexture::into_metal)
                     );
                     let srgb = armed_try!(
                         "offscreen sRGB alias failed",
-                        tex.alias_view(MtlPixelFormat::Rgba8UnormSrgb)
+                        tex.alias_view(crate::device_layer::TexelFormat::Rgba8UnormSrgb.metal())
                             .ok_or_else(|| "newTextureViewWithPixelFormat returned nil".to_owned())
                     );
                     win.metal_offscreen = Some(MetalOffscreen { tex, srgb, w, h });
@@ -18070,9 +18578,11 @@ impl GpuRenderer {
                     }
 
                     // The atlases the plan samples, keyed so every mutation the
-                    // wgpu upload reacts to re-uploads here too: glyph-map
-                    // length for the packed pair, the published `Arc` identity
-                    // for sprites, the bake key for deco.
+                    // wgpu upload reacts to re-uploads here too: full-repack
+                    // epoch + resident texture dims + `write_gen` for the
+                    // packed pair (reusing the resident `MTLTexture` on append),
+                    // the published `Arc` identity for sprites, the bake key
+                    // for deco.
                     let mut atlases: [Option<(
                         crate::metal::resources::SealedTexture,
                         crate::metal::ffi::Obj,
@@ -18083,36 +18593,26 @@ impl GpuRenderer {
                             if atlases[a as usize].is_some() {
                                 continue;
                             }
-                            let (format, key, bytes, slot): (
-                                crate::device_layer::TexelFormat,
-                                (u32, u32, u64),
-                                &[u8],
-                                &mut Option<ArmAtlas>,
-                            ) = match a {
-                                // The salt folds the repack epoch above the
-                                // glyph-map length: an append moves the length,
-                                // a repack (e.g. a font-feature flip) moves the
-                                // epoch. See `atlas_epoch`.
+                            let (format, key, write_gen, cur_py, bytes, slot) = match a {
+                                // `key` holds `(width, tex_h, atlas_epoch)`:
+                                // an append keeps the same resident texture
+                                // capacity (`tex_h`) and epoch while advancing
+                                // `write_gen`, so `ensure_atlas` uploads only
+                                // the dirty row band in place.
                                 DrawAtlas::Mono => (
                                     crate::device_layer::TexelFormat::R8Unorm,
-                                    (
-                                        mono_res.atlas.width,
-                                        mono_res.tex_h,
-                                        (self.atlas_epoch << 32)
-                                            | (mono_res.atlas.map.len() as u64 & 0xffff_ffff),
-                                    ),
+                                    (mono_res.atlas.width, mono_res.tex_h, self.atlas_epoch),
+                                    mono_res.atlas.write_gen,
+                                    mono_res.atlas.py,
                                     &mono_res.atlas.data
                                         [..(mono_res.atlas.width * mono_res.atlas.height) as usize],
                                     &mut live.atlases[a as usize],
                                 ),
                                 DrawAtlas::Color => (
                                     crate::device_layer::TexelFormat::Rgba8Unorm,
-                                    (
-                                        color_res.atlas.width,
-                                        color_res.tex_h,
-                                        (self.atlas_epoch << 32)
-                                            | (color_res.atlas.map.len() as u64 & 0xffff_ffff),
-                                    ),
+                                    (color_res.atlas.width, color_res.tex_h, self.atlas_epoch),
+                                    color_res.atlas.write_gen,
+                                    color_res.atlas.py,
                                     &color_res.atlas.data[..(color_res.atlas.width
                                         * color_res.atlas.height
                                         * 4)
@@ -18130,7 +18630,9 @@ impl GpuRenderer {
                                             ((d.curl_band.0 as u64) << 32)
                                                 | (d.curl_band.1 as u64 & 0xffff_ffff),
                                         ),
-                                        &d.data,
+                                        0,
+                                        0,
+                                        &d.data[..],
                                         &mut live.atlases[a as usize],
                                     )
                                 }
@@ -18148,10 +18650,13 @@ impl GpuRenderer {
                                     .unwrap_or_else(|| {
                                         panic!("plan samples {a:?} but its SpriteTex is absent")
                                     });
-                                    match sprite.metal_atlas(&live.mint, a) {
+                                    match sprite.metal_atlas(
+                                        crate::device_layer::DeviceHandle::Metal(&live.mint),
+                                        a,
+                                    ) {
                                         Ok(resident) => {
                                             atlases[a as usize] = Some((
-                                                resident.tex.clone_handle(),
+                                                resident.tex.metal().clone_handle(),
                                                 live.nearest.clone_retained(),
                                             ));
                                         }
@@ -18174,6 +18679,8 @@ impl GpuRenderer {
                                     (
                                         crate::device_layer::TexelFormat::Rgba8Unorm,
                                         (p.w, p.h, p.epoch),
+                                        0,
+                                        0,
                                         p.metal_texels
                                             .as_deref()
                                             .expect("armed_image_plane requires resident texels"),
@@ -18181,15 +18688,32 @@ impl GpuRenderer {
                                     )
                                 }
                             };
-                            if let Err(e) =
-                                MetalArmLive::ensure_atlas(&live.mint, slot, a, key, format, bytes)
-                            {
-                                rig_err = Some(e);
-                                break;
+                            match MetalArmLive::ensure_atlas(
+                                crate::device_layer::DeviceHandle::Metal(&live.mint),
+                                slot,
+                                a,
+                                key,
+                                write_gen,
+                                cur_py,
+                                format,
+                                bytes,
+                                &mut live.frame_slots,
+                            ) {
+                                Ok((consumed, parked_ns)) => {
+                                    live.awaited_frames += consumed;
+                                    live.frame_slot_wait_ns =
+                                        live.frame_slot_wait_ns.saturating_add(parked_ns);
+                                }
+                                Err(e) => {
+                                    rig_err = Some(e);
+                                    break;
+                                }
                             }
                             let resident = slot.as_ref().expect("ensure_atlas filled the slot");
-                            atlases[a as usize] =
-                                Some((resident.tex.clone_handle(), live.nearest.clone_retained()));
+                            atlases[a as usize] = Some((
+                                resident.tex.metal().clone_handle(),
+                                live.nearest.clone_retained(),
+                            ));
                         }
                     }
                     if let Some(e) = rig_err {
@@ -18203,8 +18727,8 @@ impl GpuRenderer {
                     for item in &plan {
                         let idx = item.stream as usize;
                         if streams[idx].is_none() {
-                            streams[idx] = Some(
-                                live.streams[idx]
+                            streams[idx] = Some(crate::metal::resources::SharedBuffer::new(
+                                live.current_slot().streams[idx]
                                     .as_ref()
                                     .unwrap_or_else(|| {
                                         panic!(
@@ -18214,8 +18738,9 @@ impl GpuRenderer {
                                         )
                                     })
                                     .buf
-                                    .clone_handle(),
-                            );
+                                    .metal()
+                                    .clone_retained(),
+                            ));
                         }
                     }
 
@@ -18224,7 +18749,7 @@ impl GpuRenderer {
                         offscreen: off.tex.clone_handle(),
                         offscreen_srgb: off.srgb.clone_handle(),
                         psos,
-                        uniform: live.uniform.clone_retained(),
+                        uniform: live.current_slot().uniform.metal().clone_retained(),
                         uniform_vertex_slot: uniform_vertex_slot.unwrap_or(0),
                         uniform_fragment_slot,
                         streams,
@@ -18234,7 +18759,8 @@ impl GpuRenderer {
 
                 // 6. Run the shared ladder on the Metal encoder and submit.
                 //    Submit A stays in flight; the next frame's staging waits
-                //    it (`await_frame_slot`) before rewriting shared storage.
+                //    its ring slot (`await_frame_slot`) before rewriting shared
+                //    storage.
                 let passes = {
                     let live = self
                         .metal_arm
@@ -18275,10 +18801,9 @@ impl GpuRenderer {
                     );
                     match enc.submit() {
                         crate::device_layer::SubmittedFrame::Metal(submitted) => {
-                            // Pipelined: Submit A stays in flight and the next
-                            // armed frame's staging waits it
-                            // (`await_frame_slot`). An already-terminal error
-                            // still degrades this frame by name.
+                            // Pipelined: Submit A stays in flight in this ring
+                            // slot (`await_frame_slot`). An already-terminal
+                            // error still degrades this frame by name.
                             match submitted.try_outcome() {
                                 Some(outcome) if outcome != CbOutcome::Completed => {
                                     metal_arm_note(&format!(
@@ -18288,7 +18813,7 @@ impl GpuRenderer {
                                     self.frame_plan = plan;
                                     break 'armed;
                                 }
-                                _ => live.inflight_frame = Some(submitted),
+                                _ => live.current_slot_mut().inflight = Some(submitted),
                             }
                         }
                         #[cfg(wgpu_arm)]
@@ -19925,6 +20450,19 @@ impl GpuRenderer {
     }
 }
 
+/// A GPU renderer for a test, on `family` (the system default for `None`). A
+/// host with no GPU, or no font at all, could not run the test (typed by
+/// `aterm_spec::host::could_not_run`); past those, a failure is the code's.
+#[cfg(test)]
+pub(crate) fn gpu_renderer_for_test(family: Option<&str>, px: f32, theme: Theme) -> GpuRenderer {
+    let ctx = GpuContext::new()
+        .unwrap_or_else(|e| aterm_spec::host::could_not_run(format!("no GPU: {e}")));
+    let cpu = Renderer::from_system_with_family(family, px, theme)
+        .unwrap_or_else(|| aterm_spec::host::could_not_run("no system monospace font"));
+    GpuRenderer::from_parts(ctx, cpu, family.map(String::from), theme)
+        .expect("the GPU renderer assembles on an acquired device")
+}
+
 #[cfg(test)]
 mod tests {
     use aterm_render::{FaceId, GlowQuad, GlyphClass, StyleBits};
@@ -20145,8 +20683,7 @@ mod tests {
         // device object.
         let _test_pool = crate::metal::ffi::AutoreleasePool::new();
         let Some(mdev) = MtlDevice::preferred() else {
-            crate::stderr_line!("SKIP: no Metal device");
-            return;
+            aterm_spec::host::could_not_run("no Metal device");
         };
         let latch = Arc::new(LossLatch::new());
         let session =
@@ -20292,16 +20829,9 @@ mod tests {
         use std::sync::Arc;
 
         let _test_pool = crate::metal::ffi::AutoreleasePool::new();
-        let gpu = match GpuRenderer::new(18.0, Theme::default()) {
-            Ok(g) => g,
-            Err(e) => {
-                crate::stderr_line!("SKIP: no GPU renderer: {e}");
-                return;
-            }
-        };
+        let gpu = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
         let Some(mdev) = MtlDevice::preferred() else {
-            crate::stderr_line!("SKIP: no Metal device");
-            return;
+            aterm_spec::host::could_not_run("no Metal device");
         };
         let latch = Arc::new(LossLatch::new());
         let session =
@@ -20414,7 +20944,7 @@ mod tests {
     ///   `[[sampler(0)]]`);
     /// * per-stage visibility is not visible at module scope, so the check is
     ///   the per-library union of the rows' BindSpec halves; the per-entry
-    ///   split is checked by the MSL scan in `metal::shaders`.
+    ///   split is checked by the MSL twin scan in `crate::shader_twins`.
     ///
     /// Fails both ways: an untabled WGSL slot, or a tabled slot with no WGSL
     /// declaration.
@@ -21150,6 +21680,150 @@ mod tests {
         }
     }
 
+    #[test]
+    fn crown_scissor_clips_both_scroll_directions_to_independent_destination_bounds() {
+        let mut uniform = present_blit_uniform(false, None, None, 40, 60, 40, 60, 0);
+        let up = BandShift {
+            src_y: 13,
+            dst_y: 10,
+            moved: 17,
+        };
+        let down = BandShift {
+            src_y: 10,
+            dst_y: 13,
+            moved: 17,
+        };
+        assert_eq!(
+            crown_band_scissor(&uniform, None, 40, 60),
+            Some((0, 0, 40, 60))
+        );
+        assert_eq!(
+            crown_band_scissor(&uniform, Some(up), 40, 60),
+            Some((0, 10, 40, 17))
+        );
+        assert_eq!(
+            crown_band_scissor(&uniform, Some(down), 40, 60),
+            Some((0, 13, 40, 17))
+        );
+
+        // A frontend crop intersects destination rows after the staged copy;
+        // neither the pinned rows nor the incoming strip receives a crown.
+        uniform.visible_y = 15.0;
+        uniform.visible_h = 5.0;
+        for shift in [up, down] {
+            assert_eq!(
+                crown_band_scissor(&uniform, Some(shift), 40, 60),
+                Some((0, 15, 40, 5))
+            );
+        }
+        uniform.visible_y = 30.0;
+        uniform.visible_h = 10.0;
+        for shift in [up, down] {
+            assert_eq!(crown_band_scissor(&uniform, Some(shift), 40, 60), None);
+        }
+
+        // Signed placement cuts two rows from the upward move and leaves a
+        // one-row top gap on the downward move. Expectations are rectangles,
+        // independent of band_shift_ops and the scissor implementation.
+        uniform.content_off = [-3.0, -12.0];
+        uniform.visible_y = 0.0;
+        uniform.visible_h = 60.0;
+        assert_eq!(
+            crown_band_scissor(&uniform, Some(up), 30, 30),
+            Some((0, 0, 30, 15))
+        );
+        assert_eq!(
+            crown_band_scissor(&uniform, Some(down), 30, 30),
+            Some((0, 1, 30, 17))
+        );
+        assert_eq!(
+            crown_band_scissor(&uniform, Some(up), 30, 3),
+            Some((0, 0, 30, 3))
+        );
+        assert_eq!(
+            crown_band_scissor(&uniform, Some(down), 30, 3),
+            Some((0, 1, 30, 2))
+        );
+    }
+
+    #[test]
+    fn crown_band_scissor_and_present_uniforms_track_fractional_scroll_band() {
+        let mut gpu = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
+        gpu.set_hdr_glow(true);
+        let (rows, cols) = (6usize, 12usize);
+        let mut term = Terminal::new(rows as u16, cols as u16);
+        term.process(b"hello");
+        let mut input = term.cell_frame(rows, cols);
+        input.grid_top_row = 1;
+        input.grid_bot_row = rows - 1;
+        input.cursor_glow_add.push(GlowQuad {
+            x: 8,
+            y: 24,
+            w: 8,
+            h: 16,
+            color: 0xffffff,
+            alpha: 0,
+            color2: 0xffffff,
+            alpha2: 0,
+            row: 2,
+        });
+        let (fw, fh) = gpu.frame_size(rows, cols);
+        let (fw, fh) = (fw as u32, fh as u32);
+        let (dw, dh) = (fw + 10, fh + 6);
+        let mut win = WindowGpu::new();
+        win.edr_max = 2.0;
+
+        input.scroll_frac_px = 0;
+        let base = gpu.present_uniforms(
+            &mut win,
+            &input,
+            false,
+            None,
+            None,
+            (fw, fh),
+            (dw, dh),
+            true,
+            false,
+            false,
+        );
+        let base_crown = base.crown.expect("HDR present with glow emits a crown");
+        assert_eq!(base_crown.content_off, base.want.content_off);
+
+        input.scroll_frac_px = 3;
+        let shifted = gpu.present_uniforms(
+            &mut win,
+            &input,
+            false,
+            None,
+            None,
+            (fw, fh),
+            (dw, dh),
+            true,
+            false,
+            false,
+        );
+        let shifted_crown = shifted.crown.expect("HDR present with glow emits a crown");
+        assert_eq!(
+            shifted_crown.content_off,
+            [base.want.content_off[0], base.want.content_off[1] - 3.0],
+            "crown placement must translate with the sub-row scroll band"
+        );
+        let (band_y0, band_y1) = aterm_render::scroll_translate::grid_band_px(
+            gpu.cpu.grid_top(),
+            gpu.cell_size().1,
+            input.grid_top_row,
+            input.grid_bot_row,
+            fh as usize,
+        );
+        let expected_shift =
+            band_shift_ops(band_y0, band_y1, 3).expect("nonzero frac inside non-empty band");
+        assert_eq!(
+            shifted.crown_scissor,
+            crown_band_scissor(&shifted.want, Some(expected_shift), dw, dh),
+            "crown scissor must clip to the moved grid band"
+        );
+    }
+
     /// `pack_image_plane`'s `dw == tw` single-memcpy path matches a naive
     /// row-by-row pack byte for byte.
     #[test]
@@ -21209,8 +21883,7 @@ mod tests {
     #[test]
     fn atlas_texel_bytes_match_cpu_glyph_bytes_exactly() {
         let Some(mut cpu) = Renderer::from_system(18.0, Theme::default()) else {
-            crate::stderr_line!("SKIP: no system monospace font");
-            return;
+            aterm_spec::host::could_not_run("no system monospace font");
         };
 
         let (rows, cols) = (6usize, 12usize);
@@ -21355,19 +22028,11 @@ ab\r\n",
         // bring-up autoreleases.
         let _test_pool = crate::metal::ffi::AutoreleasePool::new();
         let Some(mut cpu) = Renderer::from_system(18.0, Theme::default()) else {
-            crate::stderr_line!("SKIP: no system monospace font");
-            return;
+            aterm_spec::host::could_not_run("no system monospace font");
         };
-        let gpu = match GpuRenderer::new(18.0, Theme::default()) {
-            Ok(g) => g,
-            Err(e) => {
-                crate::stderr_line!("SKIP: no GPU renderer: {e}");
-                return;
-            }
-        };
+        let gpu = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
         let Some(mdev) = MtlDevice::preferred() else {
-            crate::stderr_line!("SKIP: no Metal device");
-            return;
+            aterm_spec::host::could_not_run("no Metal device");
         };
         let latch = Arc::new(LossLatch::new());
         let session =
@@ -21597,22 +22262,28 @@ ab\r\n",
 
     /// Explicit VS15 reaches the GPU as the CPU's one-cell mono image while the
     /// bare form of the same scalar stays a two-cell colour image: both cache
-    /// identities coexist and land in the right atlas. Pure CPU.
+    /// identities coexist and land in the right atlas. Pure CPU. Not on
+    /// Windows: its Segoe UI Symbol maps a monochrome 😀, which outranks the
+    /// colour face by design.
+    #[cfg(not(windows))]
     #[test]
     fn vs15_text_and_default_emoji_pack_distinct_one_and_two_cell_atlas_entries() {
+        // A host fact, from the files: every Mac ships a colour face, a Linux
+        // host when Noto Color Emoji is installed.
+        let noto = "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf";
+        if !cfg!(target_os = "macos") && !std::path::Path::new(noto).is_file() {
+            aterm_spec::host::could_not_run(format!("{noto} is not installed here"));
+        }
         let Some(mut cpu) = Renderer::from_system(18.0, Theme::default()) else {
-            crate::stderr_line!("SKIP: no system monospace font");
-            return;
+            aterm_spec::host::could_not_run("no system monospace font");
         };
         let grin = '\u{1F600}';
         cpu.debug_block_on_lazy_fallbacks();
         let default_key = cpu.glyph_key(grin);
-        if default_key.source != FaceId::ColorEmoji || default_key.glyph_class != GlyphClass::Rgba {
-            crate::stderr_line!(
-                "SKIP: a mono face outranks colour for 😀 on this host: {default_key:?}"
-            );
-            return;
-        }
+        assert!(
+            default_key.source == FaceId::ColorEmoji && default_key.glyph_class == GlyphClass::Rgba,
+            "😀 takes the colour path: {default_key:?}"
+        );
 
         let mut term = Terminal::new(1, 4);
         term.process("😀\u{FE0E}\x1b[2GX".as_bytes());
@@ -21741,6 +22412,7 @@ ab\r\n",
             px: 0,
             py: 0,
             shelf_h: 0,
+            write_gen: 0,
         };
         let key = GlyphKey::mono_char(
             aterm_render::FaceId::Primary,
@@ -21806,6 +22478,7 @@ ab\r\n",
             px: 0,
             py: 0,
             shelf_h: 0,
+            write_gen: 0,
         };
         let overwide_rgba = GlyphImage::Rgba {
             width: ow,
@@ -21836,20 +22509,13 @@ ab\r\n",
         // A face rebuild (zoom / reload / Retina) keeps the user's ligature
         // choice: `set_face` carries the prior shaping onto the new face.
         let theme = Theme::default();
-        let mut gpu = match GpuRenderer::new_with_family(Some("Menlo"), 16.0, theme) {
-            Ok(g) => g,
-            Err(e) => {
-                crate::stderr_line!("SKIP: no GPU renderer: {e}");
-                return;
-            }
-        };
+        let mut gpu = crate::renderer::gpu_renderer_for_test(Some("Menlo"), 16.0, theme);
         gpu.set_text_shaping(aterm_render::TextShapingConfig {
             ligature_mode: aterm_types::text_shaping::LigatureMode::Disabled,
             ..Default::default()
         });
         let Some(face) = Renderer::from_system(24.0, theme) else {
-            crate::stderr_line!("SKIP: no system monospace font");
-            return;
+            aterm_spec::host::could_not_run("no system monospace font");
         };
         gpu.set_face(face, theme);
         assert_eq!(
@@ -21865,13 +22531,12 @@ ab\r\n",
     #[test]
     fn the_font_thread_leaves_the_cache_cold_and_the_post_seal_prewarm_survives() {
         let theme = Theme::default();
-        let mut gpu = match GpuRenderer::new(16.0, theme) {
-            Ok(gpu) => gpu,
-            Err(error) => {
-                crate::stderr_line!("SKIP: no GPU renderer: {error}");
-                return;
-            }
-        };
+        // The real constructor is the subject (its font thread); a host with
+        // no GPU could not run it, decided before it runs.
+        if let Err(error) = GpuContext::new() {
+            aterm_spec::host::could_not_run(format!("no GPU: {error}"));
+        }
+        let mut gpu = GpuRenderer::new(16.0, theme).expect("the GPU renderer builds");
         assert_eq!(
             gpu.cpu.glyph_cache_len(),
             0,
@@ -21915,8 +22580,7 @@ ab\r\n",
         let ctx = match GpuContext::new() {
             Ok(ctx) => ctx,
             Err(error) => {
-                crate::stderr_line!("SKIP: no GPU available: {error}");
-                return;
+                aterm_spec::host::could_not_run(format!("no GPU available: {error}"));
             }
         };
         let adapter_name = ctx.adapter_name.clone();
@@ -21936,13 +22600,7 @@ ab\r\n",
     /// of reaching `create_texture`, which would abort. Needs a GPU device.
     #[test]
     fn deco_atlas_drops_on_oversized_cell_height_no_abort() {
-        let mut gpu = match GpuRenderer::new(18.0, Theme::default()) {
-            Ok(g) => g,
-            Err(e) => {
-                crate::stderr_line!("SKIP: no GPU renderer: {e}");
-                return;
-            }
-        };
+        let mut gpu = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
         let (cw, ch) = gpu.cell_size();
         // A realistic cell BUILDS the atlas — the guard must NOT over-trigger (parity).
         gpu.ensure_deco_atlas(cw, ch);
@@ -21966,13 +22624,7 @@ ab\r\n",
     fn atlas_persists_across_unchanged_frames() {
         let theme = Theme::default();
         let px = 18.0;
-        let mut gpu = match GpuRenderer::new(px, theme) {
-            Ok(g) => g,
-            Err(e) => {
-                crate::stderr_line!("SKIP: no GPU renderer: {e}");
-                return;
-            }
-        };
+        let mut gpu = crate::renderer::gpu_renderer_for_test(None, px, theme);
 
         // A small static grid (cursor hidden so a blink phase can't change the
         // glyph set), then the EXACT same input rendered again.
@@ -22024,13 +22676,7 @@ ab\r\n",
     fn new_glyph_grows_atlas_in_place_without_recreating_texture() {
         let theme = Theme::default();
         let px = 18.0;
-        let mut gpu = match GpuRenderer::new(px, theme) {
-            Ok(g) => g,
-            Err(e) => {
-                crate::stderr_line!("SKIP: no GPU renderer: {e}");
-                return;
-            }
-        };
+        let mut gpu = crate::renderer::gpu_renderer_for_test(None, px, theme);
         let (rows, cols) = (2usize, 8usize);
 
         let mut win = WindowGpu::new();
@@ -22070,13 +22716,7 @@ ab\r\n",
     fn present_prev_is_per_window_no_cross_window_leak() {
         let theme = Theme::default();
         let px = 18.0;
-        let mut gpu = match GpuRenderer::new(px, theme) {
-            Ok(g) => g,
-            Err(e) => {
-                crate::stderr_line!("SKIP: no GPU renderer: {e}");
-                return;
-            }
-        };
+        let mut gpu = crate::renderer::gpu_renderer_for_test(None, px, theme);
 
         let (rows, cols) = (4usize, 10usize);
         // Every interleaved frame differs from the other window's frame and from
@@ -22170,13 +22810,7 @@ ab\r\n",
         let decided = model.successors("RenderWithLayoutCache", &changed)[0].clone();
         assert_eq!((decided["cache_hit"], decided["full_repaint"]), (0, 1));
 
-        let mut gpu = match GpuRenderer::new(18.0, Theme::default()) {
-            Ok(g) => g,
-            Err(e) => {
-                crate::stderr_line!("SKIP: no GPU renderer: {e}");
-                return;
-            }
-        };
+        let mut gpu = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
         gpu.set_pad(picked["pad"] as usize);
         gpu.set_head(picked["head"] as usize);
         gpu.set_pad_top(picked["initial_request"] as usize);
@@ -22292,13 +22926,7 @@ ab\r\n",
     /// Skips without GPU/font.
     #[test]
     fn bloom_glow_frames_scissor_and_match_full_render() {
-        let mut gpu = match GpuRenderer::new(18.0, Theme::default()) {
-            Ok(g) => g,
-            Err(e) => {
-                crate::stderr_line!("SKIP: no GPU renderer: {e}");
-                return;
-            }
-        };
+        let mut gpu = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
         assert!(gpu.bloom_enabled(), "precondition: bloom defaults ON");
         // Pin the heat shimmer's wall-clock phase so the scissored present and
         // the fresh reference compose the same refraction.
@@ -22386,13 +23014,7 @@ ab\r\n",
     /// GPU/font.
     #[test]
     fn bloom_radius_change_mid_sequence_scissors_byte_identical() {
-        let mut gpu = match GpuRenderer::new(18.0, Theme::default()) {
-            Ok(g) => g,
-            Err(e) => {
-                crate::stderr_line!("SKIP: no GPU renderer: {e}");
-                return;
-            }
-        };
+        let mut gpu = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
         assert!(gpu.bloom_enabled(), "precondition: bloom defaults ON");
         // Pin the heat shimmer's wall-clock phase so the scissored present and
         // the fresh reference compose the same refraction.
@@ -22460,13 +23082,7 @@ ab\r\n",
     /// frames match a fresh full render. Skips without GPU/font.
     #[test]
     fn bloom_glow_at_grid_edge_scissors_and_matches() {
-        let mut gpu = match GpuRenderer::new(18.0, Theme::default()) {
-            Ok(g) => g,
-            Err(e) => {
-                crate::stderr_line!("SKIP: no GPU renderer: {e}");
-                return;
-            }
-        };
+        let mut gpu = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
         assert!(gpu.bloom_enabled(), "precondition: bloom defaults ON");
         // Pin the heat shimmer's wall-clock phase so the scissored present and
         // the fresh reference compose the same refraction.
@@ -22523,13 +23139,7 @@ ab\r\n",
     /// recreated, contents undefined) always upload. Skips without GPU/font.
     #[test]
     fn tray_upload_skips_unchanged_card_bytes() {
-        let mut gpu = match GpuRenderer::new(18.0, Theme::default()) {
-            Ok(g) => g,
-            Err(e) => {
-                crate::stderr_line!("SKIP: no GPU renderer: {e}");
-                return;
-            }
-        };
+        let mut gpu = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
         let (rows, cols) = (4usize, 10usize);
         let mut term = Terminal::new(rows as u16, cols as u16);
         term.process(b"\x1b[?25lhello");
@@ -22587,13 +23197,7 @@ ab\r\n",
     /// tray stays at its absolute device-pixel rect, as on the CPU path.
     #[test]
     fn fractional_scroll_keeps_tray_pixels_pinned() {
-        let mut gpu = match GpuRenderer::new(18.0, Theme::default()) {
-            Ok(g) => g,
-            Err(e) => {
-                crate::stderr_line!("SKIP: no GPU renderer: {e}");
-                return;
-            }
-        };
+        let mut gpu = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
         let (rows, cols) = (6usize, 12usize);
         let mut term = Terminal::new(rows as u16, cols as u16);
         term.process(b"\x1b[?25lrow zero\r\nrow one\r\nrow two\r\nrow three");
@@ -22643,13 +23247,7 @@ ab\r\n",
     /// (unlike the readback helpers) does not reset `present_prev`.
     #[test]
     fn fractional_scroll_frames_keep_the_scissor_path() {
-        let mut gpu = match GpuRenderer::new(18.0, Theme::default()) {
-            Ok(g) => g,
-            Err(e) => {
-                crate::stderr_line!("SKIP: no GPU renderer: {e}");
-                return;
-            }
-        };
+        let mut gpu = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
         #[cfg(target_os = "macos")]
         gpu.disarm_metal_for_test();
         let (rows, cols) = (6usize, 12usize);
@@ -22716,6 +23314,43 @@ ab\r\n",
         );
     }
 
+    /// A failed first-frame warm (`metal::warm`) changes nothing for the mint
+    /// after it: the arm mints inline, and a mint that fails still disarms with
+    /// its cause named, which the frontend's CPU fallback reports.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_failed_first_frame_warm_leaves_the_inline_mint_and_its_failure_route() {
+        let dev = crate::metal::ffi::Device::preferred()
+            .unwrap_or_else(|| aterm_spec::host::could_not_run("no Metal device"));
+        let renderer = || {
+            let mut g = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
+            g.arm_metal_for_test();
+            g
+        };
+        let mut gpu = renderer();
+        let mut warm = crate::metal::warm::FIRST_FRAME
+            .begin()
+            .expect("no other test claims the process's first-frame warm");
+        let failed = warm.run_on(&dev, true, |_, _| Err("injected warm failure".to_owned()));
+        assert_eq!(failed, Err("injected warm failure".to_owned()));
+        drop(warm);
+        assert!(
+            gpu.metal_arm_ready(),
+            "the mint after a failed warm compiles inline: {}",
+            gpu.metal_start_error()
+        );
+        assert!(gpu.metal_render_armed());
+
+        let mut gpu = renderer();
+        INJECTED_MINT_FAILURE.with(|f| f.set(Some("injected mint failure")));
+        assert!(!gpu.metal_arm_ready(), "a failed mint is not ready");
+        assert!(!gpu.metal_armed, "a failed mint disarms");
+        assert_eq!(
+            gpu.metal_start_error(),
+            "the Metal renderer could not start: injected mint failure"
+        );
+    }
+
     /// Armed-arm twin: after an armed present with a nonzero frac the Metal
     /// offscreen holds the untranslated frame (the translate happens on
     /// `metal_present_off` in Submit B), while the presented bytes move the
@@ -22724,16 +23359,9 @@ ab\r\n",
     #[test]
     fn armed_fractional_scroll_keeps_the_offscreen_untranslated() {
         if crate::metal::ffi::Device::preferred().is_none() {
-            crate::stderr_line!("SKIP: no Metal device");
-            return;
+            aterm_spec::host::could_not_run("no Metal device");
         }
-        let mut gpu = match GpuRenderer::new(18.0, Theme::default()) {
-            Ok(g) => g,
-            Err(e) => {
-                crate::stderr_line!("SKIP: no GPU renderer: {e}");
-                return;
-            }
-        };
+        let mut gpu = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
         gpu.arm_metal_for_test();
         let (rows, cols) = (6usize, 12usize);
         let mut term = Terminal::new(rows as u16, cols as u16);
@@ -22783,16 +23411,9 @@ ab\r\n",
     #[test]
     fn armed_present_composes_the_stale_rect_and_matches_a_full_copy() {
         if crate::metal::ffi::Device::preferred().is_none() {
-            crate::stderr_line!("SKIP: no Metal device");
-            return;
+            aterm_spec::host::could_not_run("no Metal device");
         }
-        let mut gpu = match GpuRenderer::new(18.0, Theme::default()) {
-            Ok(g) => g,
-            Err(e) => {
-                crate::stderr_line!("SKIP: no GPU renderer: {e}");
-                return;
-            }
-        };
+        let mut gpu = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
         gpu.arm_metal_for_test();
         let (rows, cols) = (6usize, 12usize);
         let mut term = Terminal::new(rows as u16, cols as u16);
@@ -23283,22 +23904,40 @@ impl Rasterizer for GpuRenderer {
 
 /// A window a GPU backend can attach a swapchain to.
 ///
+/// On macOS that is the window's content view ([`aterm_objc::HasNsView`]): the
+/// first-party Metal arm attaches under its layer and reads its screen, and the
+/// wgpu-oracle arm hands wgpu the same view (`AppKitSurfaceTarget`). Naming no
+/// handle crate keeps raw-window-handle out of the shipped macOS graph
+/// (docs/AUDIT-third-party-2026-10-15.md, winit-core step 6).
+#[cfg(target_os = "macos")]
+pub trait WindowTarget: aterm_objc::HasNsView + Send + Sync + 'static {}
+
+#[cfg(target_os = "macos")]
+impl<T> WindowTarget for T where T: aterm_objc::HasNsView + Send + Sync + 'static {}
+
+/// A window a GPU backend can attach a swapchain to.
+///
 /// Keeps `wgpu` types out of the public API: the bound is the same set
 /// `wgpu::SurfaceTarget` accepts (`HasWindowHandle + HasDisplayHandle +
-/// WasmNotSendSync`), and a first-party Metal backend needs only the
-/// `window_handle()` (`RawWindowHandle::AppKit(h).ns_view`).
+/// WasmNotSendSync`).
 ///
 /// wgpu's `WasmNotSendSync` is `Send + Sync` on every cell aterm builds: native
 /// targets, and wasm32 because `Cargo.toml` enables
 /// `fragile-send-sync-non-atomic-wasm`. Only a threaded (`atomics`) wasm build
 /// relaxes it; see the other arm.
-#[cfg(not(all(target_arch = "wasm32", target_feature = "atomics")))]
+#[cfg(not(any(
+    target_os = "macos",
+    all(target_arch = "wasm32", target_feature = "atomics")
+)))]
 pub trait WindowTarget:
     raw_window_handle::HasWindowHandle + raw_window_handle::HasDisplayHandle + Send + Sync + 'static
 {
 }
 
-#[cfg(not(all(target_arch = "wasm32", target_feature = "atomics")))]
+#[cfg(not(any(
+    target_os = "macos",
+    all(target_arch = "wasm32", target_feature = "atomics")
+)))]
 impl<T> WindowTarget for T where
     T: raw_window_handle::HasWindowHandle
         + raw_window_handle::HasDisplayHandle
@@ -23321,6 +23960,76 @@ pub trait WindowTarget:
 impl<T> WindowTarget for T where
     T: raw_window_handle::HasWindowHandle + raw_window_handle::HasDisplayHandle + 'static
 {
+}
+
+/// The wgpu-oracle arm's surface target on macOS: a [`WindowTarget`]'s content
+/// view as raw-window-handle's AppKit handle, through wgpu's own re-export. Only
+/// the oracle build has wgpu, so the shipped graph never gets the handle crate.
+/// wgpu keeps this value, and with it the window, alive as long as the surface.
+#[cfg(all(target_os = "macos", wgpu_arm))]
+struct AppKitSurfaceTarget<W>(W);
+
+#[cfg(all(target_os = "macos", wgpu_arm))]
+impl<W: aterm_objc::HasNsView> wgpu::rwh::HasWindowHandle for AppKitSurfaceTarget<W> {
+    fn window_handle(&self) -> Result<wgpu::rwh::WindowHandle<'_>, wgpu::rwh::HandleError> {
+        let view = std::ptr::NonNull::new(self.0.ns_view().as_ptr())
+            .ok_or(wgpu::rwh::HandleError::Unavailable)?;
+        let raw = wgpu::rwh::RawWindowHandle::AppKit(wgpu::rwh::AppKitWindowHandle::new(view));
+        // SAFETY: `HasNsView` keeps the view live as long as `self.0` is, which
+        // outlives this borrow of `self`.
+        Ok(unsafe { wgpu::rwh::WindowHandle::borrow_raw(raw) })
+    }
+}
+
+#[cfg(all(target_os = "macos", wgpu_arm))]
+impl<W> wgpu::rwh::HasDisplayHandle for AppKitSurfaceTarget<W> {
+    fn display_handle(&self) -> Result<wgpu::rwh::DisplayHandle<'_>, wgpu::rwh::HandleError> {
+        Ok(wgpu::rwh::DisplayHandle::appkit())
+    }
+}
+
+#[cfg(all(test, target_os = "macos", wgpu_arm))]
+mod appkit_surface_target_tests {
+    use wgpu::rwh::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
+
+    use super::AppKitSurfaceTarget;
+
+    /// A window stand-in answering a fixed view. Never messaged: the handle
+    /// only carries the pointer.
+    struct View(aterm_objc::Id);
+
+    // SAFETY: the tests below never dereference the answer, and nil is always
+    // a permitted one.
+    unsafe impl aterm_objc::HasNsView for View {
+        fn ns_view(&self) -> aterm_objc::Id {
+            self.0
+        }
+    }
+
+    /// The oracle hands wgpu exactly the view the Metal arm attaches under,
+    /// and a target with no view (read off the main thread) is `Unavailable`
+    /// rather than a null AppKit handle.
+    #[test]
+    fn the_oracle_target_carries_the_content_view_or_nothing() {
+        let mut word = 0_u64;
+        let view = aterm_objc::Id::from_ptr(std::ptr::from_mut(&mut word).cast());
+        let target = AppKitSurfaceTarget(View(view));
+        let handle = target.window_handle().expect("a view is a handle");
+        let RawWindowHandle::AppKit(h) = handle.as_raw() else {
+            panic!("an AppKit handle, got {:?}", handle.as_raw());
+        };
+        assert_eq!(h.ns_view.as_ptr(), view.as_ptr());
+        assert!(matches!(
+            target.display_handle().expect("AppKit display").as_raw(),
+            RawDisplayHandle::AppKit(_)
+        ));
+
+        let none = AppKitSurfaceTarget(View(aterm_objc::Id::NIL));
+        assert!(matches!(
+            none.window_handle(),
+            Err(wgpu::rwh::HandleError::Unavailable)
+        ));
+    }
 }
 
 /// Every entry point a WGSL source defines, in source order.
@@ -23353,7 +24062,7 @@ mod pipeline_table_wgsl_tests {
     use crate::pipeline_table::entry_points;
 
     /// Entry-point roster guard, wgpu half (twin of
-    /// `crate::metal::shaders::tests::the_msl_defines_exactly_the_entry_points_the_table_asks_for`):
+    /// `crate::shader_twins::tests::every_twin_defines_exactly_the_entry_points_the_table_asks_for`):
     /// each library's WGSL defines exactly the entry points the pipeline table
     /// asks for, no more, no fewer, no renames.
     #[test]
@@ -23389,13 +24098,8 @@ mod pipeline_table_wgsl_tests {
     #[test]
     fn a_wired_metal_loss_latch_feeds_device_lost() {
         use crate::metal::loss::{CbOutcome, LossLatch};
-        let gpu = match crate::GpuRenderer::new(18.0, aterm_render::Theme::default()) {
-            Ok(g) => g,
-            Err(e) => {
-                crate::stderr_line!("SKIP: no GPU renderer: {e}");
-                return;
-            }
-        };
+        let gpu =
+            crate::renderer::gpu_renderer_for_test(None, 18.0, aterm_render::Theme::default());
         // Construction wires the process loss domain itself, so the test
         // consumes the latch the constructor wired.
         assert!(!gpu.device_lost(), "a fresh context is healthy");
@@ -23417,6 +24121,152 @@ mod pipeline_table_wgsl_tests {
                 .wire_metal_loss_latch(std::sync::Arc::new(LossLatch::new())),
             "a second wire refuses — one loss domain per context lifetime"
         );
+    }
+}
+
+#[cfg(all(target_os = "macos", test))]
+mod atlas_upload_sync_tests {
+    use super::{ArmAtlas, DrawAtlas, MetalArmLive};
+    use crate::device_layer::TexelFormat;
+    use crate::metal::ffi::{AutoreleasePool, PixelFormat, TEXTURE_USAGE_SHADER_READ};
+    use crate::metal::loss::LossLatch;
+
+    fn reader_count(live: &MetalArmLive) -> i64 {
+        live.frame_slots
+            .iter()
+            .filter(|s| s.inflight.is_some())
+            .count() as i64
+    }
+
+    fn atlas_state(readers: i64, uploaded_h: i64, presented: i64) -> aterm_spec::interp::State {
+        [
+            ("epoch", 1),
+            ("tex_h", 3),
+            ("occupied_h", 3),
+            ("uploaded_h", uploaded_h),
+            ("presented", presented),
+            ("readers", readers),
+            ("upload_conflict", 0),
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    #[test]
+    fn an_in_place_atlas_upload_settles_every_frame_reader() {
+        let _pool = AutoreleasePool::new();
+        let mut live = match MetalArmLive::new(std::sync::Arc::new(LossLatch::new())) {
+            Ok(live) => live,
+            Err(error) => {
+                aterm_spec::host::could_not_run(format!("no Metal arm: {error}"));
+            }
+        };
+        let mut atlas: Option<ArmAtlas> = None;
+        let key = (4, 3, 1);
+        let first = [0x11, 0x22, 0x33, 0xff].repeat(8);
+        MetalArmLive::ensure_atlas(
+            crate::device_layer::DeviceHandle::Metal(&live.mint),
+            &mut atlas,
+            DrawAtlas::Color,
+            key,
+            0,
+            0,
+            TexelFormat::Rgba8Unorm,
+            &first,
+            &mut live.frame_slots,
+        )
+        .expect("initial atlas upload");
+        let texture_id = atlas.as_ref().unwrap().tex.metal().obj().id();
+
+        // Two genuine GPU readers in different ring slots. Their handles stay
+        // registered even if this small blit already completed: the lifecycle
+        // assertion therefore never depends on GPU scheduling or a latency bound.
+        let dest = live
+            .mint
+            .texture_2d(PixelFormat::Rgba8Unorm, 4, 3, TEXTURE_USAGE_SHADER_READ)
+            .expect("reader destination");
+        for index in [0, 2] {
+            let mut cb = live.session.begin().expect("reader command buffer");
+            cb.copy_texture_sub_rect(
+                atlas.as_ref().unwrap().tex.metal(),
+                (0, 0),
+                &dest,
+                (0, 0),
+                4,
+                2,
+            )
+            .expect("atlas reader");
+            live.frame_slots[index].inflight = Some(cb.commit());
+        }
+        assert_eq!(reader_count(&live), 2);
+
+        // An unchanged generation does not upload and must preserve pipelining.
+        assert_eq!(
+            MetalArmLive::ensure_atlas(
+                crate::device_layer::DeviceHandle::Metal(&live.mint),
+                &mut atlas,
+                DrawAtlas::Color,
+                key,
+                0,
+                0,
+                TexelFormat::Rgba8Unorm,
+                &first,
+                &mut live.frame_slots,
+            )
+            .expect("unchanged atlas"),
+            (0, 0)
+        );
+        assert_eq!(reader_count(&live), 2);
+
+        // Append in the current shelf (py stays zero), so the dirty upload
+        // includes existing texels that the preceding frames read.
+        let mut appended = first;
+        appended.extend_from_slice(&[0x44, 0x55, 0x66, 0xff].repeat(4));
+        let before = atlas_state(reader_count(&live), 2, 0);
+        let (consumed, _) = MetalArmLive::ensure_atlas(
+            crate::device_layer::DeviceHandle::Metal(&live.mint),
+            &mut atlas,
+            DrawAtlas::Color,
+            key,
+            1,
+            0,
+            TexelFormat::Rgba8Unorm,
+            &appended,
+            &mut live.frame_slots,
+        )
+        .expect("resident append");
+        assert_eq!(consumed, 2);
+        let resident = atlas.as_ref().unwrap();
+        assert_eq!(
+            resident.tex.metal().obj().id(),
+            texture_id,
+            "append keeps the texture"
+        );
+        assert_eq!(resident.write_gen, 1);
+        let after = atlas_state(reader_count(&live), 3, 1);
+        let model = aterm_spec::derive::metal_atlas_residency_model();
+        assert_eq!(
+            aterm_spec::interp::admits(&model, &before, &after),
+            Some("SyncAndPresent")
+        );
+        let mut overlapping = after;
+        overlapping.insert("readers", 2);
+        assert_eq!(
+            aterm_spec::interp::admits(&model, &before, &overlapping),
+            None,
+            "negative control: uploading while another frame owns the atlas is rejected"
+        );
+
+        let frame = crate::device_layer::metal_try_read_back(
+            &live.session,
+            &live.mint,
+            resident.tex.metal(),
+            4,
+            3,
+        )
+        .expect("uploaded atlas readback");
+        assert_eq!(&frame.pixels[..8], &[0x112233; 8]);
+        assert_eq!(&frame.pixels[8..], &[0x445566; 4]);
     }
 }
 

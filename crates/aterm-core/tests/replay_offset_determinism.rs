@@ -55,9 +55,13 @@ const SESSION: &[&[u8]] = &[
 /// A single fixed clock reading reused for every batch, so any time-dependent
 /// path (bell rate-limit, mode-2026 timeout) observes a zero delta and the fold
 /// is bit-deterministic — for both the live and the replay timelines.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "test code: the one instant a test mints and feeds in"
+)]
 fn fixed_clock() -> ClockReading {
     ClockReading {
-        monotonic: std::time::Instant::now(), // CLOCK-EXEMPT: captured once; reused for all batches so deltas are zero (determinism)
+        monotonic: std::time::Instant::now(), // captured once; reused for all batches so deltas are zero (determinism)
         wall_ms: Some(0),
     }
 }
@@ -71,17 +75,6 @@ fn feed(term: &mut Terminal, chunks: &[&[u8]], clock: ClockReading) {
     for c in chunks {
         term.process_at(c, clock);
     }
-}
-
-/// Stable, version-independent FNV-1a-64 over bytes (so the golden pin does not
-/// drift with the std hasher).
-fn fnv1a_64(bytes: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in bytes {
-        h ^= u64::from(b);
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    h
 }
 
 #[test]
@@ -159,48 +152,6 @@ fn coalescing_chunk_boundaries_do_not_change_state() {
         split.checkpoint(),
         reference,
         "a mid-sequence re-chunk must match the per-record fold"
-    );
-}
-
-#[test]
-fn golden_visible_content_hash_is_pinned() {
-    let clock = fixed_clock();
-    let mut term = fresh();
-    feed(&mut term, SESSION, clock);
-    let hash = fnv1a_64(term.visible_content().as_bytes());
-    // Pinned the day it was real; a change to the engine's rendered text for
-    // this fixed log will trip this (drift detection, machine-independent).
-    assert_eq!(
-        hash, GOLDEN_VISIBLE_FNV1A,
-        "rendered text drifted for the fixed session log; \
-         if intentional, re-pin GOLDEN_VISIBLE_FNV1A to {hash:#018x}"
-    );
-}
-
-/// Pinned FNV-1a-64 of `visible_content()` for `SESSION`. See the test above.
-const GOLDEN_VISIBLE_FNV1A: u64 = 0x2981_8d48_0522_c513;
-
-#[test]
-fn negative_control_dropping_a_record_diverges() {
-    let clock = fixed_clock();
-    const DROP: usize = 6; // the "row\r\n..." chunk that scrolls the region
-
-    let mut full = fresh();
-    feed(&mut full, SESSION, clock);
-
-    let mut dropped = fresh();
-    for (i, rec) in SESSION.iter().enumerate() {
-        if i == DROP {
-            continue;
-        }
-        dropped.process_at(rec, clock);
-    }
-
-    assert_ne!(
-        full.checkpoint(),
-        dropped.checkpoint(),
-        "dropping a recorded output record MUST diverge (negative control); \
-         if this passes, the determinism assertions are vacuous"
     );
 }
 

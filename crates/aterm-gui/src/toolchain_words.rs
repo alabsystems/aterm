@@ -64,7 +64,7 @@ use std::time::Duration;
 use aterm_messages::text::shape_detail;
 use aterm_messages::{
     Amount, DETAIL_LINE_CAP, Glyph, Intent, Load, Message, Meter, STALE_ANNOUNCE, STALE_TAILED,
-    Severity, Tag, Unit, tags,
+    Severity, TITLE_CAP, Tag, Unit, tags,
 };
 use atpkg::progress::{PROGRESS_VERSION, Phase, sanitize_for_tty};
 
@@ -425,7 +425,7 @@ pub(crate) fn seed_pill_text(
     if installed.len() > 5 {
         names.push('…');
     }
-    // No pill sends a hooked tab to a new one. `claude`/`codex` live in
+    // No pill sends a hooked tab to a new one. The agent programs live in
     // `<prefix>/agents/`, which the spawn seam puts in front of every session's
     // PATH (`spawn::managed_agents_dir`), and atpkg re-lays them in place. The
     // rest of the roster lives in `<prefix>/bin/`, reached through the atpkg
@@ -653,24 +653,27 @@ fn installed_words(text: &str) -> Option<String> {
     let version = version
         .strip_prefix(program.trim())
         .map_or(version, str::trim_start);
-    let name = match program.trim() {
-        "claude" => "Claude Code",
-        "codex" => "Codex",
-        other => other,
-    };
+    let name = known_as(program.trim());
     (!name.is_empty() && !version.is_empty() && !version.contains(' '))
         .then(|| format!("{name} {version} installed"))
+}
+
+/// The program as a person knows it: a vendor program's product from atpkg's
+/// table (`claude` is Claude Code), any other name verbatim (`gemini`).
+fn known_as(program: &str) -> &str {
+    atpkg::vendor_direct::spec(program).map_or(program, |spec| spec.product)
 }
 
 // ---------------------------------------------------------------------------
 // The managed-current and machine-settings records.
 // ---------------------------------------------------------------------------
 
-/// `managed-current:`: every agent program (claude, codex) installed and at its
-/// vendor's latest, as atpkg lists it: `claude 2.1.280 (Anthropic latest);
-/// codex 0.156.0 (OpenAI latest)` (an older atpkg's `(build <N>)` still
-/// parses). The title names the programs as a person knows them ("Claude Code
-/// 2.1.280 and Codex 0.156.1 are current"); the detail says where they are used
+/// `managed-current:`: every agent program (`atpkg::stub::AGENT_PROGRAMS`)
+/// installed and at its vendor's latest, as atpkg lists it: `claude 2.1.280
+/// (Anthropic latest); codex 0.156.0 (OpenAI latest)` (an older atpkg's `(build
+/// <N>)` still parses). The title names the programs as a person knows them
+/// ("Claude Code 2.1.280 and Codex CLI 0.156.1 are current", [`known_as`]); the
+/// detail says where they are used
 /// ([`managed_current_words`]). A keyed Success record, never a row: the host
 /// records it only when its words change (`App::post_managed_current`).
 ///
@@ -791,25 +794,64 @@ pub(crate) struct TabsBehind {
     /// Tabs whose shell runs a frozen PATH (measured, or carried and not yet
     /// measured) with no agent in front: the hook remedy is typed there.
     pub(crate) frozen_shells: usize,
-    /// Frozen tabs whose foreground is an agent (`claude`, `codex`) that the
-    /// live upgrade is not moving: never told to type into (it is a prompt
+    /// Frozen tabs whose foreground is an agent that the live upgrade is not
+    /// moving — one the reader identifies (`harness_host::identified_agent`:
+    /// by its name, or a runtime like `node` by its screen, even read-only)
+    /// or an agent program atpkg manages
+    /// (`atpkg::stub::AGENT_PROGRAMS`): never told to type into (it is a prompt
     /// there), told to source the hook once the agent exits.
     pub(crate) frozen_agents: usize,
-    /// Running Claude Code sessions RUNNING A BUILD OLDER than the version this
-    /// record names that the live upgrade moves on, on their own (its relaunch
-    /// line sources the hook too, so a frozen tab among them heals with the
-    /// move), whatever version their row targets. Never a stalled one.
-    pub(crate) agents_behind: usize,
-    /// Running Claude Code sessions running a build older than that version
-    /// that will not move on their own: stalled (the band has a row for each),
-    /// or held by the owner's `--defer`/`--skip`. They keep the title at
+    /// Running agent sessions RUNNING A BUILD OLDER than the version this
+    /// record names for their own program that the live upgrade moves on, on
+    /// their own (its relaunch line sources the hook too, so a frozen tab
+    /// among them heals with the move), whatever version their row targets.
+    /// Never a stalled one.
+    pub(crate) agents_behind: PerAgent,
+    /// Running agent sessions running a build older than that version that
+    /// will not move on their own: stalled (the band has a row for each), or
+    /// held by the owner's `--defer`/`--skip`. They keep the title at
     /// "installed" and are pointed at `--status`.
-    pub(crate) agents_held: usize,
+    pub(crate) agents_held: PerAgent,
     /// Live tabs with no adoption mark whose shell's PATH was measured, two jobs
-    /// in a row, to put a foreign `claude`/`codex` first
+    /// in a row, to put a foreign copy of an agent program first
     /// (`SessionTimeline::path_settled_frozen`). The shell or its rc reorders
     /// PATH, so no hook remedy is named, but "ready in every aterm tab" is not said.
     pub(crate) shadowed: usize,
+}
+
+/// A count of running sessions per agent the live upgrade moves
+/// ([`aterm_agent::harness::upgrade::Agent`]): each is behind its OWN managed
+/// build, and the record names each product with its own count.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PerAgent {
+    pub(crate) claude: usize,
+    pub(crate) codex: usize,
+}
+
+impl PerAgent {
+    /// One more of `agent`'s sessions.
+    pub(crate) fn count(&mut self, agent: aterm_agent::harness::upgrade::Agent) {
+        use aterm_agent::harness::upgrade::Agent;
+        match agent {
+            Agent::Claude => self.claude += 1,
+            Agent::Codex => self.codex += 1,
+        }
+    }
+
+    /// Every agent's sessions together.
+    fn total(self) -> usize {
+        self.claude + self.codex
+    }
+
+    /// Each agent's product name and count, Claude Code first: the order the
+    /// record says them in.
+    fn each(self) -> [(&'static str, usize); 2] {
+        use aterm_agent::harness::upgrade::Agent;
+        [
+            (Agent::Claude.product(), self.claude),
+            (Agent::Codex.product(), self.codex),
+        ]
+    }
 }
 
 /// The version the managed-current wire text gives `name`
@@ -825,7 +867,7 @@ pub(crate) fn managed_version(text: &str, name: &str) -> Option<String> {
 
 /// The managed-current entry's words from the wire text, or `None` for an empty
 /// body. The title names the programs as a person knows them and says what the
-/// marker means: "Claude Code 2.1.280 and Codex 0.156.1 are current" (one name:
+/// marker means: "Claude Code 2.1.280 and Codex CLI 0.156.1 are current" (one name:
 /// "… is current"; unknown names verbatim, so `gemini` reads as gemini). The
 /// detail says where they are used: "ready in every aterm tab". Neither the vendor
 /// source nor an older atpkg's `(build <N>)` store id is shown.
@@ -857,6 +899,69 @@ pub(crate) fn managed_current_words(
     )
 }
 
+/// The managed-current title over `items`, `None` when there are none. EVERY
+/// MANAGED PROGRAM IS NAMED (audit 2026-10-09: a pass that could not reach
+/// Anthropic said `Codex 0.160.0 is current · ready in every aterm tab`, Claude
+/// Code left out): the ones at their vendor's head first, current or, while an
+/// agent session runs an older build (`lagging`), installed ("current" would
+/// claim the sessions are too); then the others grouped by what is said of them
+/// instead (`Claude Code 2.1.287 and Muse Code 1.4.9-R6297.1 not checked`). The
+/// parenthesis is not shown; the versions are, as `current_versions` and
+/// `other_versions` say.
+fn managed_title(
+    items: &[ManagedItem],
+    lagging: bool,
+    current_versions: bool,
+    other_versions: bool,
+) -> Option<String> {
+    // What is said of them (`None`: current) and their names, as first seen.
+    let mut groups: Vec<(Option<&str>, Vec<String>)> = Vec::new();
+    for item in items {
+        let standing = item.standing.as_deref();
+        let display = known_as(&item.name);
+        let versioned = if standing.is_none() {
+            current_versions
+        } else {
+            other_versions
+        };
+        let named = if versioned && !item.version.is_empty() {
+            sanitize_for_tty(&format!("{display} {}", item.version), NAME_CAP + 24)
+        } else {
+            sanitize_for_tty(display, NAME_CAP)
+        };
+        match groups.iter_mut().find(|(said, _)| *said == standing) {
+            Some((_, names)) => names.push(named),
+            None => groups.push((standing, vec![named])),
+        }
+    }
+    let said = |(standing, names): &(Option<&str>, Vec<String>)| {
+        let word = match (*standing, names.len(), lagging) {
+            (Some(word), ..) => word,
+            (None, _, true) => "installed",
+            (None, 1, false) => "is current",
+            (None, _, false) => "are current",
+        };
+        format!("{} {word}", and_list(names))
+    };
+    let (current, others): (Vec<_>, Vec<_>) = groups.iter().partition(|(s, _)| s.is_none());
+    let others: Vec<String> = others.into_iter().map(said).collect();
+    let parts: Vec<String> = current
+        .into_iter()
+        .map(said)
+        .chain((!others.is_empty()).then(|| and_list(&others)))
+        .collect();
+    (!parts.is_empty()).then(|| parts.join("; "))
+}
+
+/// `words` as a person reads a list: `a`, `a and b`, `a, b and c`.
+fn and_list(words: &[String]) -> String {
+    match words {
+        [] => String::new(),
+        [one] => one.clone(),
+        [head @ .., last] => format!("{} and {last}", head.join(", ")),
+    }
+}
+
 /// [`managed_current_words`] over the whole of [`TabsBehind`]: the title says
 /// "installed", not "current", while running sessions lag
 /// (`agents_behind`, named in the detail with when they move); an agent tab
@@ -869,61 +974,25 @@ pub(crate) fn managed_current_words_for(
     hook: HookDialect,
 ) -> Option<(String, String)> {
     let frozen_tabs = tabs.frozen_shells;
-    // EVERY MANAGED PROGRAM IS NAMED (audit 2026-10-09: a pass that could not reach
-    // Anthropic said `Codex 0.160.0 is current · ready in every aterm tab`, Claude Code
-    // left out): the ones at their vendor's head first, then each other one with what
-    // is said of it instead (`Claude Code 2.1.287 not checked`). The parenthesis
-    // itself is not shown.
-    let mut names: Vec<String> = Vec::new();
-    let mut not_current: Vec<String> = Vec::new();
-    // How many of those no check reached lately, and how many atpkg gives
+    let items = managed_items(text);
+    // How many of the programs no check reached lately, and how many atpkg gives
     // another word (`held`, `failed to update`).
-    let (mut unchecked, mut otherwise) = (0_usize, 0_usize);
-    for item in managed_items(text) {
-        let display = match item.name.as_str() {
-            "claude" => "Claude Code",
-            "codex" => "Codex",
-            other => other,
-        };
-        let named = if item.version.is_empty() {
-            sanitize_for_tty(display, NAME_CAP)
-        } else {
-            sanitize_for_tty(&format!("{display} {}", item.version), NAME_CAP + 24)
-        };
-        match item.standing {
-            None => names.push(named),
-            Some(standing) => {
-                if standing == atpkg::cli::NOT_CHECKED {
-                    unchecked += 1;
-                } else {
-                    otherwise += 1;
-                }
-                not_current.push(format!("{named} {standing}"));
-            }
-        }
-    }
-    // The programs as a person knows them, with versions, and that they are
-    // current; or, while an agent session still runs an older build of one,
-    // that they are installed ("current" would claim the sessions are too).
-    let lagging = tabs.agents_behind + tabs.agents_held > 0;
-    let current = match (names.as_slice(), lagging) {
-        ([], _) => None,
-        ([one], false) => Some(format!("{one} is current")),
-        ([head @ .., last], false) => Some(format!("{} and {last} are current", head.join(", "))),
-        ([one], true) => Some(format!("{one} installed")),
-        ([head @ .., last], true) => Some(format!("{} and {last} installed", head.join(", "))),
-    };
-    let others = match not_current.as_slice() {
-        [] => None,
-        [one] => Some(one.clone()),
-        [head @ .., last] => Some(format!("{} and {last}", head.join(", "))),
-    };
-    let title = match (current, others) {
-        (None, None) => return None,
-        (Some(said), None) | (None, Some(said)) => said,
-        (Some(current), Some(others)) => format!("{current}; {others}"),
-    };
-    let title = sanitize_for_tty(&title, 120);
+    let standings: Vec<&str> = items.iter().filter_map(|i| i.standing.as_deref()).collect();
+    let unchecked = standings
+        .iter()
+        .filter(|s| **s == atpkg::cli::NOT_CHECKED)
+        .count();
+    let otherwise = standings.len() - unchecked;
+    let lagging = tabs.agents_behind.total() + tabs.agents_held.total() > 0;
+    // THE TITLE IS SAID WHOLE (four agents, 2026-10-15: four `not checked` ran to 137
+    // chars and the cap cut `Muse Code 1.4.9-R6…`): with every version while that
+    // fits, else without the versions of the programs not current, else without any.
+    let fits = |title: &String| title.chars().count() <= TITLE_CAP;
+    let title = [(true, true), (true, false), (false, false)]
+        .into_iter()
+        .filter_map(|(current, others)| managed_title(&items, lagging, current, others))
+        .reduce(|said, shorter| if fits(&said) { said } else { shorter })?;
+    let title = sanitize_for_tty(&title, TITLE_CAP);
     let mut pieces: Vec<String> = Vec::new();
     // "Every tab" rests on the same evidence as the pill: the user's rc undoes
     // the seam's front position and only the integration's per-prompt re-assert
@@ -960,26 +1029,31 @@ pub(crate) fn managed_current_words_for(
     }
     // "On its own", not "at its next turn end": the live upgrade starts at a
     // quiet moment, and a goal-mode session's turns never end (owner, 2026-09-28).
-    if tabs.agents_behind > 0 {
-        let n = tabs.agents_behind;
-        pieces.push(if n == 1 {
-            "1 running Claude Code session moves onto it on its own".to_string()
-        } else {
-            format!("{n} running Claude Code sessions move onto it on their own")
-        });
+    // Each product is said with its own count: a Codex session is behind the
+    // managed codex, never Claude Code's build.
+    for (product, n) in tabs.agents_behind.each() {
+        match n {
+            0 => {}
+            1 => pieces.push(format!(
+                "1 running {product} session moves onto it on its own"
+            )),
+            n => pieces.push(format!(
+                "{n} running {product} sessions move onto it on their own"
+            )),
+        }
     }
-    if tabs.agents_held > 0 {
-        let n = tabs.agents_held;
-        pieces.push(if n == 1 {
-            "1 running Claude Code session is still on the old build (`aterm harness upgrade \
-             --status` says why)"
-                .to_string()
-        } else {
-            format!(
-                "{n} running Claude Code sessions are still on the old build (`aterm harness \
+    for (product, n) in tabs.agents_held.each() {
+        match n {
+            0 => {}
+            1 => pieces.push(format!(
+                "1 running {product} session is still on the old build (`aterm harness upgrade \
+                 --status` says why)"
+            )),
+            n => pieces.push(format!(
+                "{n} running {product} sessions are still on the old build (`aterm harness \
                  upgrade --status` says why)"
-            )
-        });
+            )),
+        }
     }
     if tabs.frozen_agents > 0 {
         let n = tabs.frozen_agents;
@@ -1001,9 +1075,9 @@ pub(crate) fn managed_current_words_for(
     if tabs.shadowed > 0 {
         let n = tabs.shadowed;
         pieces.push(if n == 1 {
-            "1 tab's PATH puts another claude or codex first".to_string()
+            "1 tab's PATH puts another copy of an agent first".to_string()
         } else {
-            format!("{n} tabs' PATHs put another claude or codex first")
+            format!("{n} tabs' PATHs put another copy of an agent first")
         });
     }
     if frozen_tabs > 0 {
@@ -1387,7 +1461,9 @@ fn overall_fill(f: &atpkg::progress::ProgressFile) -> Option<u16> {
 /// overall rollup is silent (no signed sizes to sum).
 fn current_program_line(f: &atpkg::progress::ProgressFile) -> (String, Option<u16>) {
     // Mid-flight phases first, in pass order; a queued front-of-queue program
-    // only when nothing is mid-flight.
+    // only when nothing is mid-flight. A download that is in and waits for the
+    // pass to reach it (atpkg fetches archives ahead) moves nothing, so it is
+    // named only when nothing else is in flight.
     let active = f
         .programs
         .iter()
@@ -1397,7 +1473,7 @@ fn current_program_line(f: &atpkg::progress::ProgressFile) -> (String, Option<u1
                 Phase::Download | Phase::Verify | Phase::Extract | Phase::Link
             )
         })
-        .min_by_key(|(_, r)| r.phase as u8);
+        .min_by_key(|(_, r)| (r.downloaded(), r.phase as u8));
     let Some((raw, row)) =
         active.or_else(|| f.queue.first().and_then(|n| f.programs.get_key_value(n)))
     else {
@@ -1454,6 +1530,7 @@ mod tests {
             pid: running_pid,
             pass: pass.to_string(),
             started_unix: 1_700_000_000,
+            generation: None,
             heartbeat_unix: 1_700_000_000,
             overall: atpkg::progress::Overall {
                 programs_done: 3,
@@ -2234,6 +2311,29 @@ mod tests {
         assert_eq!(line, format!("{name} \u{00b7} up to date"));
     }
 
+    /// An archive atpkg fetched ahead waits at its whole size for the pass: the
+    /// row names the program the pass is extracting, not the finished download.
+    #[test]
+    fn a_download_waiting_for_the_pass_yields_to_the_program_in_hand() {
+        let program = |phase, bytes_done, bytes_total| atpkg::progress::ProgramProgress {
+            phase,
+            bytes_done,
+            bytes_total,
+            build: None,
+            bumped: false,
+            error: None,
+        };
+        let mut f = file(Some(7), "net");
+        f.programs = BTreeMap::from([
+            ("ay".to_string(), program(Phase::Download, 9, 9)),
+            ("trust".to_string(), program(Phase::Extract, 1, 4)),
+        ]);
+        assert_eq!(current_program_line(&f).0, "trust \u{00b7} extracting");
+        f.programs
+            .insert("ty".to_string(), program(Phase::Download, 3, 9));
+        assert_eq!(current_program_line(&f).0, "ty \u{00b7} downloading");
+    }
+
     #[test]
     fn hostile_strings_are_sanitized_before_they_become_words() {
         // A program name that fails the store gate has no row words at all.
@@ -2298,7 +2398,7 @@ mod tests {
         let m = words("claude 2.1.287 (not checked); codex 0.160.0 (OpenAI latest)");
         assert_eq!(
             m.title,
-            "Codex 0.160.0 is current; Claude Code 2.1.287 not checked"
+            "Codex CLI 0.160.0 is current; Claude Code 2.1.287 not checked"
         );
         assert_eq!(
             m.detail,
@@ -2311,7 +2411,7 @@ mod tests {
         let m = words("claude 2.1.287 (failed); codex 0.160.0 (held)");
         assert_eq!(
             m.title,
-            "Claude Code 2.1.287 failed to update and Codex 0.160.0 held"
+            "Claude Code 2.1.287 failed to update and Codex CLI 0.160.0 held"
         );
         assert!(
             m.detail[0].ends_with("says why they are not current"),
@@ -2334,8 +2434,44 @@ mod tests {
             "its build is still the one the rows are counted against"
         );
         let m = words("claude 2.1.287 (Anthropic latest); codex 0.160.0 (OpenAI latest)");
-        assert_eq!(m.title, "Claude Code 2.1.287 and Codex 0.160.0 are current");
+        assert_eq!(
+            m.title,
+            "Claude Code 2.1.287 and Codex CLI 0.160.0 are current"
+        );
         assert_eq!(m.severity, Severity::Success);
+    }
+
+    /// FOUR AGENTS ARE SAID WHOLE (2026-10-15: four `not checked` ran to 137
+    /// chars and the cap cut `Muse Code 1.4.9-R6…`): programs that share a
+    /// word are grouped, and when the title still runs over, the programs not
+    /// current lose their versions before anything is cut.
+    #[test]
+    fn four_agents_fit_the_title_whole() {
+        let title = |[a, b, c, d]: [&str; 4]| {
+            let wire = format!(
+                "claude 2.1.287 ({a}); codex 0.160.0 ({b}); agy 1.3.6 ({c}); muse 1.4.9-R6297.1 ({d})"
+            );
+            let title = managed_current(&wire, 0, true, HookDialect::Zsh)
+                .unwrap()
+                .title;
+            assert!(
+                title.chars().count() <= TITLE_CAP && !title.contains('\u{2026}'),
+                "{title}"
+            );
+            title
+        };
+        assert_eq!(
+            title(["not checked"; 4]),
+            "Claude Code 2.1.287, Codex CLI 0.160.0, Antigravity CLI 1.3.6 and Muse Code \
+             1.4.9-R6297.1 not checked"
+        );
+        title(["failed"; 4]);
+        assert_eq!(
+            title(["Anthropic latest", "not checked", "held", "failed"]),
+            "Claude Code 2.1.287 is current; Codex CLI not checked, Antigravity CLI held and \
+             Muse Code failed to update"
+        );
+        title(["Vendor latest"; 4]);
     }
 
     #[test]
@@ -2368,7 +2504,10 @@ mod tests {
             HookDialect::Zsh,
         )
         .unwrap();
-        assert_eq!(m.title, "Claude Code 2.1.280 and Codex 0.156.0 are current");
+        assert_eq!(
+            m.title,
+            "Claude Code 2.1.280 and Codex CLI 0.156.0 are current"
+        );
         assert_eq!(
             m.detail,
             vec!["ready in every aterm tab"],
@@ -2383,12 +2522,12 @@ mod tests {
         .unwrap();
         assert_eq!(
             three.title,
-            "Claude Code 2.1.280, Codex 0.156.1 and gemini 1.0 are current"
+            "Claude Code 2.1.280, Codex CLI 0.156.1 and gemini 1.0 are current"
         );
 
         let m = managed_current("gemini; codex 0.154.0", 0, true, HookDialect::Zsh).unwrap();
         assert_eq!(
-            m.title, "gemini and Codex 0.154.0 are current",
+            m.title, "gemini and Codex CLI 0.154.0 are current",
             "the names are the wire's, never a hardcoded pair"
         );
         assert_eq!(m.detail, vec!["ready in every aterm tab"]);
@@ -2416,7 +2555,10 @@ mod tests {
     fn the_managed_row_names_the_frozen_tabs() {
         let wire = "claude 2.1.273 (build 2026091601); codex 0.154.0 (build 2026091001)";
         let (title, detail) = managed_current_words(wire, 1, true, HookDialect::Zsh).unwrap();
-        assert_eq!(title, "Claude Code 2.1.273 and Codex 0.154.0 are current");
+        assert_eq!(
+            title,
+            "Claude Code 2.1.273 and Codex CLI 0.154.0 are current"
+        );
         assert_eq!(
             detail,
             "1 tab from before this update picks them up with `. ~/.aterm/shell.d/00-atpkg.zsh`",
@@ -2452,10 +2594,13 @@ mod tests {
             managed_current_words_for(wire, tabs, None, HookDialect::Zsh).unwrap()
         };
         let (title, detail) = words(TabsBehind {
-            agents_behind: 2,
+            agents_behind: PerAgent {
+                claude: 2,
+                ..PerAgent::default()
+            },
             ..TabsBehind::default()
         });
-        assert_eq!(title, "Claude Code 2.1.282 and Codex 0.157.0 installed");
+        assert_eq!(title, "Claude Code 2.1.282 and Codex CLI 0.157.0 installed");
         assert_eq!(
             detail,
             "ready in every aterm tab · 2 running Claude Code sessions move onto it on their own"
@@ -2473,10 +2618,13 @@ mod tests {
         let (title, detail) = words(TabsBehind {
             frozen_shells: 1,
             frozen_agents: 1,
-            agents_behind: 1,
+            agents_behind: PerAgent {
+                claude: 1,
+                ..PerAgent::default()
+            },
             ..TabsBehind::default()
         });
-        assert_eq!(title, "Claude Code 2.1.282 and Codex 0.157.0 installed");
+        assert_eq!(title, "Claude Code 2.1.282 and Codex CLI 0.157.0 installed");
         assert!(
             detail.ends_with(
                 "1 tab from before this update picks them up with `. ~/.aterm/shell.d/00-atpkg.zsh`"
@@ -2484,8 +2632,62 @@ mod tests {
             "the shell remedy is said last: {detail}"
         );
         let (title, detail) = words(TabsBehind::default());
-        assert_eq!(title, "Claude Code 2.1.282 and Codex 0.157.0 are current");
+        assert_eq!(
+            title,
+            "Claude Code 2.1.282 and Codex CLI 0.157.0 are current"
+        );
         assert_eq!(detail, "ready in every aterm tab");
+    }
+
+    /// EACH PRODUCT IS SAID WITH ITS OWN COUNT: the words named every lagging
+    /// session "Claude Code", so a Codex session behind the managed codex would
+    /// have read as a Claude Code one. Claude Code is said first, each count
+    /// with its own number; a product with none is not named. NEGATIVE
+    /// CONTROL: Claude Code alone says nothing of Codex.
+    #[test]
+    fn each_lagging_product_is_named_with_its_own_count() {
+        let wire = "claude 2.1.282 (Anthropic latest); codex 0.157.0 (OpenAI latest)";
+        let words = |tabs: TabsBehind| {
+            managed_current_words_for(wire, tabs, None, HookDialect::Zsh).unwrap()
+        };
+        let (title, detail) = words(TabsBehind {
+            agents_behind: PerAgent {
+                claude: 1,
+                codex: 2,
+            },
+            agents_held: PerAgent {
+                codex: 1,
+                ..PerAgent::default()
+            },
+            ..TabsBehind::default()
+        });
+        assert_eq!(title, "Claude Code 2.1.282 and Codex CLI 0.157.0 installed");
+        assert_eq!(
+            detail,
+            "ready in every aterm tab · 1 running Claude Code session moves onto it on its own · \
+             2 running Codex sessions move onto it on their own · 1 running Codex session is \
+             still on the old build (`aterm harness upgrade --status` says why)"
+        );
+        let (title, detail) = words(TabsBehind {
+            agents_behind: PerAgent {
+                codex: 1,
+                ..PerAgent::default()
+            },
+            ..TabsBehind::default()
+        });
+        assert_eq!(title, "Claude Code 2.1.282 and Codex CLI 0.157.0 installed");
+        assert_eq!(
+            detail,
+            "ready in every aterm tab · 1 running Codex session moves onto it on its own"
+        );
+        let (_, detail) = words(TabsBehind {
+            agents_behind: PerAgent {
+                claude: 1,
+                ..PerAgent::default()
+            },
+            ..TabsBehind::default()
+        });
+        assert!(!detail.contains("Codex"), "{detail}");
     }
 
     /// A session that will not move on its own is not said to move: it keeps
@@ -2499,7 +2701,10 @@ mod tests {
             managed_current_words_for(wire, tabs, None, HookDialect::Zsh).unwrap()
         };
         let (title, detail) = words(TabsBehind {
-            agents_held: 1,
+            agents_held: PerAgent {
+                claude: 1,
+                ..PerAgent::default()
+            },
             ..TabsBehind::default()
         });
         assert_eq!(title, "Claude Code 2.1.282 installed");
@@ -2514,7 +2719,7 @@ mod tests {
             ..TabsBehind::default()
         });
         assert_eq!(title, "Claude Code 2.1.282 is current");
-        assert_eq!(detail, "2 tabs' PATHs put another claude or codex first");
+        assert_eq!(detail, "2 tabs' PATHs put another copy of an agent first");
         assert!(!detail.contains("before this update"), "{detail}");
         assert!(!detail.contains("00-atpkg"), "no hook to type: {detail}");
         assert_eq!(

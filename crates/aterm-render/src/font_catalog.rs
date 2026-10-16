@@ -289,11 +289,35 @@ impl Catalog {
             .collect();
 
         // Name tables are the expensive fallback. Parse each candidate at most
-        // once and compare it against every still-unresolved family.
+        // once and compare it against every still-unresolved family. A matched
+        // family keeps settling over the files of its first matching directory, so its
+        // most regular face wins (`regular_face_score`); finding the regular
+        // face itself ends that family's search, so the rest of a crowded
+        // directory is not read for it.
+        let mut settling: HashMap<String, (u32, PathBuf)> = HashMap::new();
+        let settle =
+            |want: &str, path: &Path, results: &mut Vec<Option<Result<PathBuf, String>>>| {
+                if let Some(indexes) = wants.get(want) {
+                    for &index in indexes {
+                        results[index] = Some(Ok(path.to_path_buf()));
+                    }
+                }
+            };
         if !unresolved.is_empty() {
             for path in self.files.clone() {
-                if unresolved.is_empty() {
+                if unresolved.is_empty() && settling.is_empty() {
                     break;
+                }
+                // The depth-first walk can leave a directory for a child and
+                // then return to a later sibling file. Keep its candidate until
+                // the regular face or the end, without reading other directories
+                // solely for a family whose winning directory is already known.
+                if unresolved.is_empty()
+                    && !settling
+                        .values()
+                        .any(|(_, best)| best.parent() == path.parent())
+                {
+                    continue;
                 }
                 if self.stats.work >= self.limits.max_work {
                     self.stats.exhausted.insert("work units");
@@ -329,21 +353,37 @@ impl Catalog {
                 let bytes = Arc::new(raw);
                 let matches: Vec<String> = unresolved
                     .iter()
+                    .chain(
+                        settling
+                            .iter()
+                            .filter(|(_, (_, best))| best.parent() == path.parent())
+                            .map(|(want, _)| want),
+                    )
                     .filter(|want| super::font_name_table_matches(&bytes, want))
                     .cloned()
                     .collect();
                 if !matches.is_empty() {
                     self.bytes.insert(path.clone(), Arc::clone(&bytes));
                 }
+                let score = super::regular_face_score(&bytes);
                 for want in matches {
-                    if let Some(indexes) = wants.get(&want) {
-                        for &index in indexes {
-                            results[index] = Some(Ok(path.clone()));
-                        }
-                    }
                     unresolved.remove(&want);
+                    let held = settling.entry(want).or_insert((u32::MAX, path.clone()));
+                    if score < held.0 {
+                        *held = (score, path.clone());
+                    }
                 }
+                settling.retain(|want, (held, best)| {
+                    let regular = *held == 0;
+                    if regular {
+                        settle(want, best, &mut results);
+                    }
+                    !regular
+                });
             }
+        }
+        for (want, (_, best)) in settling {
+            settle(&want, &best, &mut results);
         }
 
         let truncated = self.stats.truncated();
@@ -529,7 +569,8 @@ impl FontFilesMemo {
 /// there is exactly one root list (`font_search_dirs()`), so this is one
 /// entry; tests walk private fixture roots and must not evict each other's
 /// entries or the real one. Bounded so a pathological caller cannot grow it.
-static FONT_FILES_MEMOS: std::sync::Mutex<Vec<FontFilesMemo>> = std::sync::Mutex::new(Vec::new());
+static FONT_FILES_MEMOS: std::sync::Mutex<Vec<Arc<FontFilesMemo>>> =
+    std::sync::Mutex::new(Vec::new());
 const MAX_FONT_FILES_MEMOS: usize = 8;
 
 /// One walk gate per root list ([`memoized_font_files_walked`]'s single-flight).
@@ -580,6 +621,14 @@ fn memoized_font_files(roots: &[PathBuf]) -> Vec<PathBuf> {
 /// take the real tree's first walk inside another test's window, so a global
 /// count is a flake, while this answer is exact for the root list asked about.
 fn memoized_font_files_walked(roots: &[PathBuf]) -> (Vec<PathBuf>, bool) {
+    let (inventory, walked) = memoized_font_inventory_walked(roots);
+    (inventory.files.clone(), walked)
+}
+
+/// The actual walk generation, shared with derived catalogues. A replacement
+/// under an unchanged pathname still produces a new generation when its
+/// directory observation changes.
+fn memoized_font_inventory_walked(roots: &[PathBuf]) -> (Arc<FontFilesMemo>, bool) {
     let remembered = || {
         let memos = FONT_FILES_MEMOS
             .lock()
@@ -588,10 +637,10 @@ fn memoized_font_files_walked(roots: &[PathBuf]) -> (Vec<PathBuf>, bool) {
             .iter()
             .find(|m| m.roots == roots)
             .filter(|m| m.current())
-            .map(|m| m.files.clone())
+            .map(Arc::clone)
     };
-    if let Some(files) = remembered() {
-        return (files, false);
+    if let Some(inventory) = remembered() {
+        return (inventory, false);
     }
     // SINGLE-FLIGHT per root list: the broad and symbol chain builders run on
     // two threads at once at every launch; the second caller waits on the
@@ -603,8 +652,8 @@ fn memoized_font_files_walked(roots: &[PathBuf]) -> (Vec<PathBuf>, bool) {
     let _in_flight = gate
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(files) = remembered() {
-        return (files, false);
+    if let Some(inventory) = remembered() {
+        return (inventory, false);
     }
     let catalog = Catalog::scan(roots, Limits::default());
     let mut memos = FONT_FILES_MEMOS
@@ -614,12 +663,13 @@ fn memoized_font_files_walked(roots: &[PathBuf]) -> (Vec<PathBuf>, bool) {
     if memos.len() >= MAX_FONT_FILES_MEMOS {
         memos.clear();
     }
-    memos.push(FontFilesMemo {
+    let inventory = Arc::new(FontFilesMemo {
         roots: roots.to_vec(),
         visited: catalog.visited,
-        files: catalog.files.clone(),
+        files: catalog.files,
     });
-    (catalog.files, true)
+    memos.push(Arc::clone(&inventory));
+    (inventory, true)
 }
 
 /// Bounded file list used by renderer diagnostics and runtime discovery. This
@@ -629,6 +679,269 @@ fn memoized_font_files_walked(roots: &[PathBuf]) -> (Vec<PathBuf>, bool) {
 /// so the second and every later caller pays a few `stat`s, not a walk.
 pub(crate) fn system_font_files() -> Vec<PathBuf> {
     memoized_font_files(&crate::font_search_dirs())
+}
+
+/// What a font picker offers, every name one the resolvers find again:
+/// the face aterm draws when no family is set, the families compiled into
+/// aterm, and the installed faces sorted by what they are good for.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MonospaceFamilies {
+    /// The family of the face aterm draws when `font_family` is unset.
+    pub automatic: Option<String>,
+    /// Whether that face has programming ligatures (`liga`/`calt`).
+    pub automatic_has_ligatures: bool,
+    /// Families compiled into aterm and chosen by name.
+    pub bundled: Vec<String>,
+    /// Installed fixed-pitch families with Latin letters, sorted.
+    pub installed: Vec<String>,
+    /// Installed fixed-pitch bold, italic and bold italic faces, by full
+    /// name (`JetBrains Mono Bold`), each sorted.
+    pub bold: Vec<String>,
+    pub italic: Vec<String>,
+    pub bold_italic: Vec<String>,
+    /// Installed faces made for symbols and icons (Nerd Font symbols,
+    /// `Apple Symbols`).
+    pub symbol: Vec<String>,
+    /// Installed colour emoji faces, by file name.
+    pub emoji: Vec<String>,
+}
+
+type MonospaceMemo = Option<(Arc<FontFilesMemo>, Vec<String>, Arc<MonospaceFamilies>)>;
+
+/// [`MonospaceFamilies`] for this machine. It reads every font file the
+/// resolvers search (seconds cold), so callers run it off the UI thread;
+/// the answer is remembered until a font directory changes.
+#[must_use]
+pub fn monospace_families() -> Arc<MonospaceFamilies> {
+    static MEMO: std::sync::Mutex<MonospaceMemo> = std::sync::Mutex::new(None);
+    memoized_monospace_families(
+        &crate::font_search_dirs(),
+        &crate::primary_font_candidate_paths(),
+        &MEMO,
+    )
+}
+
+fn memoized_monospace_families(
+    roots: &[PathBuf],
+    automatic_candidates: &[String],
+    cache: &std::sync::Mutex<MonospaceMemo>,
+) -> Arc<MonospaceFamilies> {
+    let (inventory, _) = memoized_font_inventory_walked(roots);
+    let memo = |memo: &MonospaceMemo| {
+        memo.as_ref()
+            .filter(|(seen, automatic, _)| {
+                Arc::ptr_eq(seen, &inventory) && automatic.as_slice() == automatic_candidates
+            })
+            .map(|(_, _, families)| Arc::clone(families))
+    };
+    if let Some(families) = memo(
+        &cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    ) {
+        return families;
+    }
+    let families = Arc::new(monospace_families_in(
+        &inventory.files,
+        automatic_candidates,
+    ));
+    *cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((
+        inventory,
+        automatic_candidates.to_vec(),
+        Arc::clone(&families),
+    ));
+    families
+}
+
+/// [`MonospaceFamilies`] over `files`, with the default face the first of
+/// `automatic_candidates` that loads. Only the first face of a collection
+/// counts, because that is the face the renderer loads from it, and only a
+/// file within the name-table read limit, because the resolvers find no
+/// other by name.
+#[must_use]
+pub fn monospace_families_in(
+    files: &[PathBuf],
+    automatic_candidates: &[String],
+) -> MonospaceFamilies {
+    let bundled = crate::bundled::selectable_families()
+        .iter()
+        .map(|family| (*family).to_string())
+        .collect::<Vec<_>>();
+    monospace_families_with_bundled(files, automatic_candidates, &bundled)
+}
+
+fn monospace_families_with_bundled(
+    files: &[PathBuf],
+    automatic_candidates: &[String],
+    bundled: &[String],
+) -> MonospaceFamilies {
+    use std::collections::BTreeMap;
+
+    let mut installed: BTreeMap<String, String> = BTreeMap::new();
+    let mut styled: [BTreeMap<String, String>; 3] = Default::default();
+    let mut symbol: BTreeMap<String, String> = BTreeMap::new();
+    let mut emoji: BTreeMap<String, String> = BTreeMap::new();
+    let mut bytes = Vec::new();
+    for path in files {
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        // Colour emoji faces are too large to read by name; their file
+        // name is the name the resolvers find them by.
+        if stem.to_ascii_lowercase().contains("emoji") {
+            emoji.insert(normalize_family(stem), stem.to_string());
+            continue;
+        }
+        if font_file::read_bounded_font_file_into(
+            path,
+            super::NAME_SCAN_MAX_BYTES as usize,
+            &mut bytes,
+        )
+        .is_err()
+        {
+            continue;
+        }
+        let Ok(face) = aterm_font::Face::parse(&bytes, 0) else {
+            continue;
+        };
+        let Some(family) = face_family(&face) else {
+            continue;
+        };
+        let key = normalize_family(&family);
+        if face_is_terminal_text(&face) {
+            let italic = face.is_italic() || face.is_oblique();
+            let bold = face.weight().to_number() >= 600;
+            if !bold && !italic {
+                installed.insert(key, family);
+            } else if let Some(full) = face_full_name(&face, stem) {
+                let slot = match (bold, italic) {
+                    (true, false) => 0,
+                    (false, true) => 1,
+                    _ => 2,
+                };
+                styled[slot].insert(normalize_family(&full), full);
+            }
+        } else if face.glyph_index('\u{e0a0}').is_some()
+            || family.to_ascii_lowercase().contains("symbol")
+        {
+            symbol.insert(key, family);
+        }
+    }
+    // A bundled family an installed one already answers is listed once,
+    // where it is installed.
+    let bundled: Vec<String> = bundled
+        .iter()
+        .filter(|family| !installed.contains_key(&normalize_family(family)))
+        .cloned()
+        .collect();
+    let installed = installed.into_values().collect();
+    let (automatic, automatic_has_ligatures) = automatic_candidates
+        .iter()
+        .find_map(|candidate| automatic_face(candidate))
+        .map_or((None, false), |(family, ligatures)| {
+            (Some(family), ligatures)
+        });
+    let [bold, italic, bold_italic] = styled.map(|faces| faces.into_values().collect());
+    MonospaceFamilies {
+        automatic,
+        automatic_has_ligatures,
+        bundled,
+        installed,
+        bold,
+        italic,
+        bold_italic,
+        symbol: symbol.into_values().collect(),
+        emoji: emoji.into_values().collect(),
+    }
+}
+
+/// The family and ligature support of the default face at `candidate`, a
+/// path or a bundled identity, when it loads. A system face that hides its
+/// name (`.SF NS Mono`) is called what people call it (`SF Mono`).
+fn automatic_face(candidate: &str) -> Option<(String, bool)> {
+    use aterm_font::name_id::{FAMILY, TYPOGRAPHIC_FAMILY};
+    let bytes = crate::read_resolved_font(candidate).ok()?;
+    let face = aterm_font::Face::parse(&bytes, 0).ok()?;
+    let family = face_name(&face, TYPOGRAPHIC_FAMILY).or_else(|| face_name(&face, FAMILY))?;
+    let family = match family.strip_prefix('.') {
+        Some(hidden) => hidden
+            .strip_prefix("SF NS ")
+            .map_or_else(|| hidden.to_string(), |rest| format!("SF {rest}")),
+        None => family,
+    };
+    Some((
+        family,
+        crate::ligature_shaping::font_has_ligature_features(&bytes),
+    ))
+}
+
+/// Fixed pitch with the Latin letters and digits terminal text needs, so a
+/// symbols-only monospace face is not offered as a terminal font.
+fn face_is_terminal_text(face: &aterm_font::Face<'_>) -> bool {
+    let advance = |ch: char| {
+        face.glyph_index(ch)
+            .and_then(|glyph| face.glyph_hor_advance(glyph))
+    };
+    let letters = ['a', 'M', 'i', 'W', '0'];
+    if letters.iter().any(|ch| face.glyph_index(*ch).is_none()) {
+        return false;
+    }
+    face.is_monospaced() || {
+        let first = advance('M');
+        first.is_some_and(|width| width > 0) && letters.iter().all(|ch| advance(*ch) == first)
+    }
+}
+
+/// The face's family name: the typographic family where it has one (the
+/// whole family across weights), else the legacy family. A hidden system
+/// family (`.SF NS Mono`) is not one to offer.
+fn face_family(face: &aterm_font::Face<'_>) -> Option<String> {
+    use aterm_font::name_id::{FAMILY, TYPOGRAPHIC_FAMILY};
+    face_name(face, TYPOGRAPHIC_FAMILY)
+        .or_else(|| face_name(face, FAMILY))
+        .filter(|family| !family.starts_with('.'))
+}
+
+/// The face's full name (`JetBrains Mono Bold`) where the resolvers find it
+/// again (it reads as the file's name or its PostScript name once spaces and
+/// hyphens go), else its PostScript name.
+fn face_full_name(face: &aterm_font::Face<'_>, stem: &str) -> Option<String> {
+    use aterm_font::name_id::{FULL_NAME, POST_SCRIPT_NAME};
+    let postscript = face_name(face, POST_SCRIPT_NAME)?;
+    let full = face_name(face, FULL_NAME).filter(|full| {
+        let full = normalize_family(full);
+        full == normalize_family(&postscript) || full == normalize_family(stem)
+    });
+    Some(full.unwrap_or(postscript))
+}
+
+/// One `name` record, English where the face has it.
+fn face_name(face: &aterm_font::Face<'_>, id: u16) -> Option<String> {
+    let mut any = None;
+    for name in face.names() {
+        if name.name_id != id {
+            continue;
+        }
+        let Some(text) = crate::name_record_text(&name) else {
+            continue;
+        };
+        let text = text.trim().to_string();
+        if text.is_empty() {
+            continue;
+        }
+        let english = match name.platform_id {
+            aterm_font::PlatformId::Windows => name.language_id == 0x0409,
+            aterm_font::PlatformId::Macintosh => name.language_id == 0,
+            _ => false,
+        };
+        if english {
+            return Some(text);
+        }
+        any.get_or_insert(text);
+    }
+    any
 }
 
 #[cfg(test)]
@@ -673,6 +986,167 @@ mod tests {
             files.len(),
             duplicates[0].display()
         );
+    }
+
+    const JETBRAINS: &[u8] = include_bytes!("../tests/fixtures/jetbrains-mono.ttf");
+
+    /// The fixture face with its OS/2 weight class set to `weight`: a bold
+    /// sibling that names the same family.
+    fn with_weight(weight: u16) -> Vec<u8> {
+        let mut bytes = JETBRAINS.to_vec();
+        let tables = usize::from(u16::from_be_bytes([bytes[4], bytes[5]]));
+        let record = (0..tables)
+            .map(|index| 12 + 16 * index)
+            .find(|record| &bytes[*record..*record + 4] == b"OS/2")
+            .expect("the fixture has an OS/2 table");
+        let offset =
+            u32::from_be_bytes(bytes[record + 8..record + 12].try_into().unwrap()) as usize;
+        bytes[offset + 4..offset + 6].copy_from_slice(&weight.to_be_bytes());
+        bytes
+    }
+
+    /// The picker's list comes from the same files and names the resolvers
+    /// use: an installed monospace family, its bold sibling by full name, a
+    /// colour emoji face by file name, and the default face's family.
+    #[test]
+    fn monospace_families_list_what_the_resolvers_find() {
+        let root = fixture("families");
+        std::fs::write(root.join("JetBrainsMono-Regular.ttf"), JETBRAINS).unwrap();
+        std::fs::write(root.join("JetBrainsMono-Bold.ttf"), with_weight(700)).unwrap();
+        std::fs::write(root.join("NotoColorEmoji.ttf"), b"not read").unwrap();
+        std::fs::write(root.join("notes.txt"), b"not a font").unwrap();
+        let files = Catalog::scan(std::slice::from_ref(&root), Limits::default()).files;
+        let regular = root.join("JetBrainsMono-Regular.ttf");
+        let families = monospace_families_in(&files, &[regular.to_string_lossy().into_owned()]);
+        assert!(
+            families
+                .installed
+                .iter()
+                .any(|family| family == "JetBrains Mono"),
+            "{families:?}"
+        );
+        assert_eq!(families.automatic.as_deref(), Some("JetBrains Mono"));
+        assert!(families.automatic_has_ligatures);
+        assert_eq!(families.emoji, ["NotoColorEmoji"]);
+        assert_eq!(families.bold.len(), 1, "{families:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Two files name the same family and the bold one sorts first: the
+    /// family resolves to its regular face.
+    #[test]
+    fn a_family_resolves_to_its_regular_face_not_the_first_file() {
+        let root = fixture("regular-face");
+        std::fs::write(root.join("JetBrainsMono-Bold.ttf"), with_weight(700)).unwrap();
+        std::fs::write(root.join("JetBrainsMono-Regular.ttf"), JETBRAINS).unwrap();
+        let batch = resolve_and_admit_in_dirs(
+            &["JetBrains Mono".to_string()],
+            std::slice::from_ref(&root),
+            Limits::default(),
+        );
+        let admitted = batch.get(0).unwrap().as_ref().expect("the family resolves");
+        assert!(
+            admitted.path.ends_with("JetBrainsMono-Regular.ttf"),
+            "resolved {}",
+            admitted.path
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_regular_face_after_a_nested_directory_still_wins_its_directory() {
+        let user = fixture("regular-interleaved-user");
+        let system = fixture("regular-interleaved-system");
+        let bold = user.join("A-Bold.ttf");
+        let regular = user.join("Z-Regular.ttf");
+        let nested = user.join("M-vendor");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(&bold, with_weight(700)).unwrap();
+        std::fs::write(nested.join("Regular.ttf"), JETBRAINS).unwrap();
+        std::fs::write(&regular, JETBRAINS).unwrap();
+        std::fs::write(system.join("Regular.ttf"), JETBRAINS).unwrap();
+        let roots = [user.clone(), system.clone()];
+        let request = ["JetBrains Mono".to_string()];
+        let winner = |batch: &Batch| batch.get(0).unwrap().as_ref().unwrap().path.clone();
+        let batch = resolve_and_admit_in_dirs(&request, &roots, Limits::default());
+        assert_eq!(
+            winner(&batch),
+            regular.to_string_lossy().into_owned(),
+            "descending into another directory must not finalize the first bold face"
+        );
+
+        // With no regular face in the winning user directory, that user's
+        // bold face still precedes both the nested and system regular faces.
+        std::fs::remove_file(&regular).unwrap();
+        let batch = resolve_and_admit_in_dirs(&request, &roots, Limits::default());
+        assert_eq!(winner(&batch), bold.to_string_lossy().into_owned());
+        std::fs::remove_dir_all(user).unwrap();
+        std::fs::remove_dir_all(system).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_family_memo_observes_an_atomic_replacement_at_the_same_path() {
+        let root = fixture("family-replacement");
+        let path = root.join("Regular.ttf");
+        let replacement = root.join(".replacement");
+        std::fs::write(&path, JETBRAINS).unwrap();
+        std::fs::write(&replacement, with_weight(700)).unwrap();
+        // Force a distinct directory observation before the first real walk:
+        // atomic rename moves it from this old epoch to now, even on a
+        // coarse filesystem. This is not a wait for a timestamp tick.
+        std::fs::File::open(&root)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new().set_modified(
+                    std::time::UNIX_EPOCH + std::time::Duration::from_secs(946_684_800),
+                ),
+            )
+            .unwrap();
+        let before_mtime = dir_mtime(&root).unwrap();
+        let roots = [root.clone()];
+        let automatic = [path.to_string_lossy().into_owned()];
+        let memo = std::sync::Mutex::new(None);
+        let first = memoized_monospace_families(&roots, &automatic, &memo);
+        assert_eq!(first.automatic.as_deref(), Some("JetBrains Mono"));
+        assert!(first.bold.is_empty());
+        let again = memoized_monospace_families(&roots, &automatic, &memo);
+        assert_eq!(
+            *again, *first,
+            "an unchanged inventory preserves its answer"
+        );
+        let before_files = memoized_font_files(&roots);
+
+        std::fs::rename(replacement, &path).unwrap();
+        assert_ne!(dir_mtime(&root).unwrap(), before_mtime);
+        let (after_files, walked) = memoized_font_files_walked(&roots);
+        assert!(walked, "the existing directory freshness path re-walks");
+        assert_eq!(before_files, after_files, "no font pathname changed");
+        let refreshed = memoized_monospace_families(&roots, &automatic, &memo);
+        assert_eq!(
+            refreshed.bold.len(),
+            1,
+            "the replacement is now a bold face despite the identical file list"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn an_installed_family_remains_installed_when_it_also_is_bundled() {
+        let root = fixture("installed-and-bundled");
+        std::fs::write(root.join("Regular.ttf"), JETBRAINS).unwrap();
+        let files = Catalog::scan(std::slice::from_ref(&root), Limits::default()).files;
+        let families = monospace_families_with_bundled(
+            &files,
+            &[],
+            &[
+                "JetBrains Mono".to_string(),
+                "Other Bundled Face".to_string(),
+            ],
+        );
+        assert!(families.installed.iter().any(|f| f == "JetBrains Mono"));
+        assert_eq!(families.bundled, ["Other Bundled Face"]);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn fixture(label: &str) -> PathBuf {

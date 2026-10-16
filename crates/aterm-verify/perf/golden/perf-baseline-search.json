@@ -1,0 +1,14 @@
+{
+  "_comment": "aterm SEARCH-BENCH baseline (E0): full-rebuild klines/s, cached-query q/s, and retained-index lines-per-MiB on the trigram-diverse (rotating), repetitive-log (replog), and hyperlink-heavy (linkheavy, Wave-4A P7) corpora, plus the incremental index_scrollback_line primitive. All BIGGER-IS-BETTER. Re-record with targo --unverified verify perf --record search. Recorded 2026-07-22 on the M5 Max (conservative min-of-2 medians); linkheavy keys 2026-07-23. 2026-07-23 (milestone-3 sortedvec adoption): the three *_lines_per_mib memory floors were re-recorded to the sortedvec container's DETERMINISTIC retained heap (rotating 1171->2009, replog 1865->3095, linkheavy 1653->2660 lines/MiB, ~40% less B/line). 2026-07-23 (delta-postings): the three *_lines_per_mib memory floors were re-recorded again to the delta+varint-gap posting container's DETERMINISTIC retained heap (rotating 2009->3342, replog 3095->4757, linkheavy 2660->4340 lines/MiB; whole-index B/line 522->314, 339->220, 394->242 — a further 35-40% off postings). lines-per-MiB is exact net heap and toolchain-invariant (repeated stable runs are byte-identical, and the pre-change run reproduced the prior floors byte-exact), so these are hard re-records, not stable-vs-trust drift. The throughput floors (build_klps/query_qps/index_line_klps) ALSO held or rose with delta-postings but are left at the conservative trust-toolchain values: a trust re-record was unavailable this session (trustc ICE) and stable throughput runs materially hotter than the gating trust build, so ratcheting them off stable numbers would risk a toolchain false-fail. They pass now with extra headroom.",
+  "rotating_build_klps": 202.241,
+  "rotating_query_qps": 473.889,
+  "rotating_lines_per_mib": 3341.817,
+  "replog_build_klps": 316.04,
+  "replog_query_qps": 3103.863,
+  "replog_lines_per_mib": 4756.602,
+  "linkheavy_build_klps": 427.846,
+  "linkheavy_query_qps": 902.751,
+  "linkheavy_lines_per_mib": 4340.138,
+  "index_line_klps": 247.689,
+  "pass_ratio": 0.45
+}

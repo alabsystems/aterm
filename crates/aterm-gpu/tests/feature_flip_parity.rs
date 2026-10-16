@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// A live `GpuRenderer::set_text_shaping()` flip reaches GPU pixels and keeps
-// CPU==GPU parity: the same renderer is driven through a config change
-// (`set_text_shaping` -> `invalidate_atlas`) and re-rendered.
+// A live `GpuRenderer::set_text_shaping()` flip (which invalidates the atlas) reaches GPU pixels
+// and keeps CPU==GPU parity on the same renderer.
 //
 // No GPU: skip.
 
@@ -13,11 +12,10 @@ use aterm_types::text_shaping::{FontFeature, FontFeatureSet};
 
 use crate::common::{backends_with_font, max_channel_delta_frame as max_channel_delta};
 
-// The ligature test font (as in ligature_parity.rs): the committed JetBrains
-// Mono fixture ligates `=>` and has a `zero` (slashed-zero) feature;
-// $ATERM_LIGATURE_TEST_FONT overrides it. The path is handed to both renderers
-// as their family (`backends_with_font`). Returns (path, is_fixture), where
-// is_fixture means the fixture's `zero` feature can be relied on.
+/// The ligature test font (as in ligature_parity.rs), handed to both renderers as their family:
+/// the committed JetBrains Mono fixture, which ligates `=>` and has a `zero` (slashed-zero)
+/// feature, unless $ATERM_LIGATURE_TEST_FONT overrides it. Returns (path, is_fixture), where
+/// is_fixture means the `zero` feature can be relied on.
 fn ligature_test_font() -> (std::path::PathBuf, bool) {
     if let Some(p) = std::env::var("ATERM_LIGATURE_TEST_FONT")
         .ok()
@@ -43,19 +41,16 @@ fn live_ligature_flip_changes_gpu_pixels_and_keeps_parity() {
     let theme = Theme::default();
     let px = 18.0;
 
-    // Builds BOTH renderers on the ligature font (see ligature_test_font).
     let (font, _) = ligature_test_font();
 
-    let Some((mut cpu, mut gpu)) = backends_with_font(&font, px, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends_with_font(&font, px, theme);
 
     let (rows, cols) = (1usize, 28usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
     term.process(b"\x1b[?25la => b != c == d -> e");
     let input = term.cell_frame(rows, cols);
 
-    // First frame: ligatures ON (default). Resident atlas is now warm on the GPU.
+    // First frame: ligatures on (default), leaving the GPU's resident atlas warm.
     let mut win_on = aterm_gpu::WindowGpu::new();
     let gpu_on = gpu.render_input(&mut win_on, &input, None);
     let cpu_on = cpu.render_input(&input);
@@ -69,7 +64,7 @@ fn live_ligature_flip_changes_gpu_pixels_and_keeps_parity() {
         "CPU/GPU diverge with ligatures on"
     );
 
-    // LIVE flip both renderers to ligatures OFF (the new GpuRenderer passthrough).
+    // Live flip both renderers to ligatures off.
     let off = TextShapingConfig {
         ligature_mode: LigatureMode::Disabled,
         ..Default::default()
@@ -81,12 +76,12 @@ fn live_ligature_flip_changes_gpu_pixels_and_keeps_parity() {
     let gpu_off = gpu.render_input(&mut win_off, &input, None);
     let cpu_off = cpu.render_input(&input);
 
-    // The live GPU flip actually reached pixels (the operators no longer ligate).
+    // The live GPU flip reached pixels (the operators no longer ligate).
     assert_ne!(
         gpu_on.pixels, gpu_off.pixels,
         "a live GpuRenderer::set_text_shaping flip did not change GPU pixels"
     );
-    // And CPU==GPU still holds AFTER the live flip (both re-shaped per-cell).
+    // CPU==GPU still holds after the live flip (both re-shaped per cell).
     let delta = max_channel_delta(&cpu_off, &gpu_off);
     eprintln!("post-flip GPU vs CPU max per-channel delta = {delta}");
     assert!(
@@ -103,13 +98,9 @@ fn live_font_feature_flip_reaches_gpu_pixels() {
     let theme = Theme::default();
     let px = 18.0;
 
-    // is_fixture: whether the bundled fixture (with its `zero` feature) is in use
-    // (see ligature_test_font).
     let (font, is_fixture) = ligature_test_font();
 
-    let Some((mut cpu, mut gpu)) = backends_with_font(&font, px, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends_with_font(&font, px, theme);
 
     // A row of zeros: the `zero` feature slashes each one (a 1:1, cadence-preserving
     // substitution that survives the planner's monospace guard).
@@ -121,7 +112,7 @@ fn live_font_feature_flip_reaches_gpu_pixels() {
     let mut win_base = aterm_gpu::WindowGpu::new();
     let gpu_base = gpu.render_input(&mut win_base, &input, None);
 
-    // LIVE flip to font_features = [zero=1] on BOTH renderers.
+    // Live flip to font_features = [zero=1] on both renderers.
     let zero = TextShapingConfig {
         font_features: vec![FontFeatureSet {
             font_id: 0,
@@ -143,7 +134,7 @@ fn live_font_feature_flip_reaches_gpu_pixels() {
         eprintln!("SKIP: the resolved ligature font has no observable `zero` feature; parity-only");
     }
 
-    // Parity holds under the live feature config (the core invariant either way).
+    // Parity holds under the live feature config either way.
     assert_eq!(
         (gpu_feat.width, gpu_feat.height),
         (cpu_feat.width, cpu_feat.height),

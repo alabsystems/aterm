@@ -21,12 +21,11 @@ fn words(list: &[&str]) -> Vec<String> {
     list.iter().map(|s| (*s).to_string()).collect()
 }
 
-/// The program a relaunch runs is what the process RUNS, not the word it was
-/// typed as: a `#!` script (the managed twin, an npm install, a stand-in)
-/// shows its interpreter as the image and itself as `argv[1]`; a binary is
-/// the kernel's image. Negative controls: a wrapper that runs Claude as a
-/// child (`caffeinate claude`), a relative `argv[1]`, and an image that is
-/// neither named claude, native, nor registered are no program to relaunch.
+/// The program a relaunch runs is what the process runs, not the word it was typed as: a `#!`
+/// script (the managed twin, an npm install) shows its interpreter as the image and itself as
+/// `argv[1]`; a binary is the kernel's image. Negative controls: a wrapper running Claude as a
+/// child (`caffeinate claude`), a relative `argv[1]`, and an image neither named claude, native
+/// nor registered.
 #[test]
 fn the_program_is_the_script_or_the_image_that_is_claude() {
     let native = Path::new("/h/.local/share/claude/versions");
@@ -83,17 +82,13 @@ fn the_program_is_the_script_or_the_image_that_is_claude() {
     );
 }
 
-/// The decision, whose exit it was: a person's (a keystroke within the
-/// grace), a holder's (`hold=1`, a lease, a named driver's turn), else the
-/// owner's limit, else nobody's — relaunched. A person or a holder is asked
-/// about first, so their own exit is never said to them as a limit.
-/// Negative controls: a keystroke older than the grace, `-`, a server that
-/// does not say, an unreadable status, an unnamed turn (this host's own
-/// loop types so) and a `driving:` hand are nobody. An exit the explicit
-/// restart made is neither a person's nor a holder's (ruling 20 of
-/// 2026-10-14): carried through a hold, a lease or a named turn, its relaunch
-/// typed once the hand lifts (`WAIT_HAND_LIFTS`); the owner's limit still
-/// holds it.
+/// The decision, whose exit it was: a person's (a keystroke within the grace), a holder's
+/// (`hold=1`, a lease, a named driver's turn), else the owner's limit, else nobody's: relaunched. A
+/// person or a holder is asked about first, so their own exit is never said to them as a limit. An
+/// exit the explicit restart made is carried through a hold, a lease or a named turn
+/// (`WAIT_HAND_LIFTS`); the owner's limit still holds it. Negative controls: a keystroke older than
+/// the grace, `-`, a server that does not say, an unreadable status, an unnamed turn and a
+/// `driving:` hand are nobody.
 #[test]
 fn an_exit_is_relaunched_unless_someone_owns_it_or_it_is_limited() {
     let st = |tail: &str| format!("OK schema=1 {tail}");
@@ -157,19 +152,10 @@ fn an_exit_is_relaunched_unless_someone_owns_it_or_it_is_limited() {
         OnExit::PersonAsked,
         "a person's exit is theirs, never said as a limit"
     );
-    // An agent that had stopped reading its input, exited by the stall's
-    // remedy: a keystroke just before was read by nothing, so it is no
-    // person's exit. Nor is it a holder's (ruling 20 of 2026-10-14, THE
-    // HOLDER RULE AT THE READ): a hold, a lease or a turn that landed after
-    // the act's program ended is waited out — the host types its relaunch
-    // only once it lifts — never handed the exit, which left the agent a
-    // person asked to restart at its shell. What it waits out is every hand
-    // the relaunch line waits on (`hand_on_tab`, the review of ruling 20):
-    // under an owner-class turn or a `driving:` hand too, which no exit is
-    // left to, an attempt would answer the line's `wait:held`, a counted
-    // miss. Not a person's keystroke, unread input or this process's own
-    // lease: the line's counted waits suit those. The owner's limit still
-    // holds.
+    // An exit the explicit restart made (`asked`): a keystroke just before was read by nothing,
+    // and every hand the relaunch line waits on (`hand_on_tab`) is waited out, never handed the
+    // exit. A person's keystroke, unread input or this process's own lease is no such hand. The
+    // owner's limit still holds.
     assert_eq!(
         on_exit(true, Some(&typed(1)), 120, true, false),
         OnExit::Relaunch
@@ -237,12 +223,10 @@ fn an_exit_is_relaunched_unless_someone_owns_it_or_it_is_limited() {
     assert!(!person_present("ERR no such session human_ms=1", 120));
 }
 
-/// One step's word, read for the host: relaunched; left — the launch's own
-/// end (a one-shot run, a launch that never registered a conversation) or
-/// no exit at all — journaled and never said; never (an interactive
-/// conversation that cannot come back) — said. Negative control: every wait
-/// and every failure that a later attempt can get past is not the
-/// irreducible case.
+/// One step's word, read for the host: relaunched; left (the launch's own end, or no exit at all),
+/// journaled and never said; never (an interactive conversation that cannot come back), said.
+/// Negative control: every wait and failure a later attempt can get past is not the irreducible
+/// case.
 #[test]
 fn a_step_is_relaunched_left_not_yet_or_never() {
     assert_eq!(
@@ -282,13 +266,11 @@ fn a_step_is_relaunched_left_not_yet_or_never() {
         Outcome::Cannot("state-unwritable".to_string())
     );
     assert_eq!(outcome("busy:another-sweep"), Outcome::Busy);
-    // An exit a standing stamp names, its process stopped away from its tab:
-    // owed, looked at again uncounted (ruling 13 of 2026-10-08) — never the
-    // bare `not-exited` above, which is left.
+    // An exit a standing stamp names, its process stopped away from its tab: owed, looked at
+    // again uncounted, never the bare `not-exited` above, which is left.
     assert_eq!(outcome(WAIT_ACT_ENDS), Outcome::Busy);
-    // An asked exit carried through a hand on its tab: looked at again
-    // uncounted until it lifts (ruling 20 of 2026-10-14) — never the line's
-    // own `wait:held` below, a counted miss.
+    // An asked exit carried through a hand on its tab: looked at again uncounted until it lifts,
+    // never the line's own `wait:held` below, a counted miss.
     assert_eq!(outcome(WAIT_HAND_LIFTS), Outcome::Busy);
     for step in [
         "wait:held",
@@ -302,18 +284,12 @@ fn a_step_is_relaunched_left_not_yet_or_never() {
     }
 }
 
-/// The relaunched agent reads as ended only once its line's command was
-/// SEEN TO RUN and every look for [`ENDED_AT_ONCE`] since found its shell
-/// holding the tab, looks taken [`SHELL_LOOK`] apart. With no block read
-/// (the kernel's witness), the line ran once a look found the shell NOT
-/// holding its terminal; with the block the line was typed into (the
-/// shell's own word, [`line_over`]), once that block is over, and nothing
-/// else counts. NEGATIVE CONTROLS: a shell that held its terminal
-/// throughout — its own hooks before the agent starts — never reads as
-/// ended, however long; nor does a block not over, though the agent held
-/// the terminal; the agent still starting starts the count over; an
-/// unreadable look is no verdict; a look before [`SHELL_LOOK`] has passed is
-/// not taken.
+/// The relaunched agent reads as ended only once its line's command was seen to run and every look
+/// for [`ENDED_AT_ONCE`] since found its shell holding the tab, looks [`SHELL_LOOK`] apart: by the
+/// kernel's witness (a look found the shell not holding its terminal) or, with the line's block,
+/// by that block being over ([`line_over`]). Negative controls: a shell that held its terminal
+/// throughout (its own hooks), a block not over, the agent still starting (the count starts over),
+/// an unreadable look, and a look taken too soon.
 #[test]
 fn a_shell_that_has_the_tab_back_reads_as_ended_only_once_its_line_ran() {
     let t0 = Instant::now();
@@ -356,7 +332,7 @@ fn a_shell_that_has_the_tab_back_reads_as_ended_only_once_its_line_ran() {
             "never read, never ended"
         );
     }
-    // THE SHELL'S OWN WORD: the line typed into block 7.
+    // The shell's own word: the line typed into block 7.
     let mut marked = ShellBack::after(Some(7));
     assert!(
         !marked.saw(Some(false), Some(false), at(0)),
@@ -392,11 +368,9 @@ fn a_shell_that_has_the_tab_back_reads_as_ended_only_once_its_line_ran() {
     );
 }
 
-/// Another actor on the lock is no miss: an upgrade step in another tab can
-/// hold it for minutes, and a crash here meanwhile must not read as a
-/// relaunch that keeps failing. However many busy looks in a row, the
-/// back-off, the misses and the attention stay where they were.
-/// Negative control: the same number of real misses is said.
+/// Another actor on the lock is no miss: however many busy looks in a row, the back-off, the misses
+/// and the attention stay where they were. Negative control: the same number of real misses is
+/// said.
 #[test]
 fn another_actor_on_the_lock_is_never_a_miss() {
     let t0 = Instant::now();
@@ -452,19 +426,16 @@ fn a_one_shot_run_is_read_wherever_its_flag_stands() {
     }
 }
 
-/// Whether an exit would be relaunched on its conversation, from the snapshot
-/// alone ([`resumes_on_exit`]): the frozen remedy says "aterm relaunches it"
-/// only where the relaunch's plan would be made, and names
-/// `claude --resume <id>` elsewhere. Negative controls, each a launch the
-/// relaunch refuses or waits on: an unknown flag (`--permission-prompt-tool`:
-/// the relaunch says `argv:unknown-flag`, while the person's own command still
-/// resumes the conversation bare), a `--worktree` launch
-/// (`argv:not-resumable`), a shell the line is not written for (nushell), no
-/// conversation registered, and a one-shot `-p` run.
+/// Whether an exit would be relaunched on its conversation, from the snapshot alone
+/// ([`resumes_on_exit`]): only where the relaunch's plan would be made. Negative controls: an
+/// unknown flag (the person's own command still resumes bare), a `--worktree` launch, a shell the
+/// line is not written for, no conversation registered, a one-shot run, and a control character in
+/// the directory.
 #[test]
 fn an_exit_is_relaunched_only_where_the_relaunch_would_plan_it() {
     const ID: &str = "0badf00d-1111-2222-3333-444455556666";
     let snap = |argv: &[&str]| Snapshot {
+        stored_login: false,
         tab: "s-1".to_string(),
         pid: 4242,
         start: "Thu Sep 24 01:02:03 2026".to_string(),
@@ -532,12 +503,11 @@ fn an_exit_is_relaunched_only_where_the_relaunch_would_plan_it() {
     );
 }
 
-/// Following the snapshot's agent: Claude's own record of the same process
-/// (pid and kernel start) moves its conversation, build and directory — an
-/// in-app `/clear` names a new conversation under the same pid. The tab's
-/// published foreground group says whether the snapshot still describes the
-/// tab. Negative controls: a record of another start (a reused pid) and a
-/// conversation that is no session id move nothing.
+/// Following the snapshot's agent: Claude's own record of the same process (pid and kernel start)
+/// moves its conversation, build and directory (`/clear` names a new conversation under the same
+/// pid), and the tab's published foreground group says whether the snapshot still describes the
+/// tab. Negative controls: a record of another start and a conversation that is no session id move
+/// nothing.
 #[test]
 fn a_snapshot_follows_its_own_process_and_nothing_else() {
     let home = std::env::temp_dir().join(format!("aterm-relaunch-follow-{}", std::process::id()));
@@ -545,6 +515,7 @@ fn a_snapshot_follows_its_own_process_and_nothing_else() {
     std::fs::create_dir_all(home.join(".claude/sessions")).expect("home");
     let start = "Thu Sep 24 01:02:03 2026";
     let snap = Snapshot {
+        stored_login: false,
         tab: "s-1".to_string(),
         pid: 4242,
         start: start.to_string(),
@@ -598,11 +569,9 @@ fn a_snapshot_follows_its_own_process_and_nothing_else() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// The relaunch's build obeys `[harness] upgrade`: on, a crashed session
-/// comes back on the newest build it may move to; off, on the program it
-/// ran, whatever is installed — configuration only takes power away.
-/// Negative controls: nothing newer, and a running version that cannot be
-/// read, relaunch the same program with the switch on too.
+/// The relaunch's build obeys `[harness] upgrade`: on, a crashed session comes back on the newest
+/// build it may move to; off, on the program it ran. Negative controls: nothing newer, and an
+/// unreadable running version, relaunch the same program with the switch on too.
 #[test]
 fn a_relaunch_moves_to_a_newer_build_only_while_the_upgrade_is_on() {
     let v = |s: &str| Version::parse(s).expect("version");
@@ -638,12 +607,10 @@ fn a_relaunch_moves_to_a_newer_build_only_while_the_upgrade_is_on() {
     );
 }
 
-/// The back-off grows 1 s, 10 s, 60 s, then ten minutes for as long as the
-/// agent keeps exiting — never a give-up — and starts over once a relaunched
-/// agent ran [`HEALTHY`]ly. Misses in a row are said once after
-/// [`BADGE_AFTER`] and cleared by a relaunch that lands. Negative controls: a
-/// crash soon after a relaunch does not start the back-off over, and a
-/// person's exit schedules nothing.
+/// The back-off grows 1 s, 10 s, 60 s, then ten minutes for as long as the agent keeps exiting, and
+/// starts over once a relaunched agent ran [`HEALTHY`]ly. Misses in a row are said once after
+/// [`BADGE_AFTER`] and cleared by a relaunch that lands. Negative controls: a crash soon after a
+/// relaunch keeps the long pause, and a person's exit schedules nothing.
 #[test]
 fn the_back_off_grows_caps_and_forgives_a_healthy_run() {
     let t0 = Instant::now();
@@ -710,15 +677,10 @@ fn the_back_off_grows_caps_and_forgives_a_healthy_run() {
     assert_eq!(m.running(), Say::Clear, "a person's agent clears the word");
 }
 
-/// Drive the real [`Relaunches`], [`on_exit`] and [`outcome`] through every
-/// action of `HarnessRelaunchOnExit` and check after each that the state is
-/// the model's after the same action, every invariant holds, and every model
-/// action is driven, including the harness's own restart's exit (`Restarted`),
-/// due though a person typed, a halt stands or the owner switched relaunch off.
-/// Negative controls: the model's buggy host relaunches after a person's exit,
-/// silently drops a relaunch it cannot make, keeps a limit quiet, and leaves
-/// its own restart to a person or reads it as the launch's end; each is caught
-/// by an invariant.
+/// Drive the real [`Relaunches`], [`on_exit`] and [`outcome`] through every action of
+/// `HarnessRelaunchOnExit`: after each, the state is the model's and every invariant holds,
+/// including for the harness's own restart (`Restarted`). Negative controls: each of the buggy
+/// host's defects is caught by an invariant.
 #[test]
 fn the_real_relaunch_decisions_conform_to_the_model() {
     let model = aterm_spec::derive::harness_relaunch_on_exit_model();
@@ -907,11 +869,8 @@ fn the_real_relaunch_decisions_conform_to_the_model() {
             );
         }
         assert_eq!(seen, expect, "{action} ({input}): observed vs model");
-        // The restart is nothing else's (the model's guards on the harness's
-        // own restart): no person, limit or launch's own end takes it. A person
-        // or a limit is decided as the restart ([`on_exit`], above), and an end
-        // its carry could never answer (an `ended:*` word, an agent that never
-        // exited) is said as a `Cannot`, never a silent leave.
+        // The restart is nothing else's: no person, limit or launch's own end takes it, and an
+        // end its carry could never answer is said as a `Cannot`, never a silent leave.
         if expect["restarted"] == 1 {
             for off in ["PersonReturns", "Ended", "Limited"] {
                 assert!(!model.action_enabled(off, &expect), "{off} after {action}");
@@ -955,11 +914,8 @@ fn the_real_relaunch_decisions_conform_to_the_model() {
     }
 }
 
-/// The continuation a relaunched agent is typed is one line, whatever the
-/// version text holds, and it never invites the agent to stop and wait for
-/// a person: it decides for itself and keeps going, as the upgrade's does.
-/// It says why it was relaunched: an exit nobody asked for, or the host's
-/// restart for the memory banner.
+/// The continuation typed to a relaunched agent is one line whatever the version text holds, says
+/// why it was relaunched, and never invites the agent to stop and wait for a person.
 #[test]
 fn the_resumed_prompt_is_one_line_and_keeps_going() {
     for (cause, head) in [
@@ -999,13 +955,10 @@ fn the_resumed_prompt_is_one_line_and_keeps_going() {
     }
 }
 
-/// The look at an exit, over scripted looks and no clock: a record that
-/// survives the settle is a crash, kept as read; one the exit removes a moment
-/// after it is seen (a graceful `/exit` removes its own in its last moments) is
-/// removed, though the first look saw it. Negative controls: a record already
-/// gone decides at once; a process still running proves nothing and is left
-/// to the attempt after [`EXIT_GONE`]; a look cut short or reading nothing
-/// decides nothing.
+/// The look at an exit, over scripted looks and no clock: a record that survives the settle is a
+/// crash, kept as read; one removed a moment after the exit is seen is removed. Negative controls:
+/// a record already gone decides at once; a process still running is left to the attempt after
+/// [`EXIT_GONE`]; a look cut short or reading nothing decides nothing.
 #[test]
 fn the_look_at_an_exit_waits_out_its_own_removal_and_no_longer() {
     let sf = SessionFile {
@@ -1025,7 +978,7 @@ fn the_look_at_an_exit_waits_out_its_own_removal_and_no_longer() {
         Some(ExitLook {
             running: false,
             record: record.then(|| sf.clone()),
-            codex: false,
+            agent: upgrade::Agent::Claude,
             crashed: None,
         })
     };
@@ -1085,7 +1038,7 @@ fn the_look_at_an_exit_waits_out_its_own_removal_and_no_longer() {
             Some(ExitLook {
                 running: true,
                 record: Some(sf.clone()),
-                codex: false,
+                agent: upgrade::Agent::Claude,
                 crashed: None,
             })
         },
@@ -1104,7 +1057,7 @@ fn the_look_at_an_exit_waits_out_its_own_removal_and_no_longer() {
             Some(ExitLook {
                 running: looks <= 3,
                 record: Some(sf.clone()),
-                codex: false,
+                agent: upgrade::Agent::Claude,
                 crashed: None,
             })
         },
@@ -1183,7 +1136,7 @@ fn a_relaunch_resumes_the_mode_the_conversation_ran_in() {
             "ID"
         ])
     );
-    // Negative control: the launch's flags as they were (today's relaunch).
+    // Negative control: no mode, or bypass, keeps the launch's flags as they were.
     assert_eq!(with_permission_mode(carried.clone(), None), carried);
     assert_eq!(
         with_permission_mode(carried.clone(), Some("bypassPermissions")),
@@ -1318,7 +1271,7 @@ fn a_codex_exit_is_decided_on_its_shells_word() {
         Some(ExitLook {
             running: false,
             record: None,
-            codex: true,
+            agent: upgrade::Agent::Codex,
             crashed,
         })
     };
@@ -1357,7 +1310,7 @@ fn a_codex_exit_is_decided_on_its_shells_word() {
         Some(ExitLook {
             running: false,
             record: None,
-            codex: false,
+            agent: upgrade::Agent::Claude,
             crashed: None,
         })
     };
@@ -1435,11 +1388,10 @@ fn login_line(
     })
 }
 
-/// THE LOGIN IS ON THE LINE, FIRST, QUOTED AS THE SHELL NEEDS IT — in front
-/// of the survey switch and the program, inside the subshell's `cd`, behind
-/// fish's `env` — and the EMPTY value (the default login, named) is written
-/// `''`, never dropped: unset and empty are two relaunch lines. NEGATIVE
-/// CONTROL: nothing required, the line is byte for byte what it was.
+/// The login is on the line, first, quoted as the shell needs it: in front of the survey switch
+/// and the program, inside the subshell's `cd`, behind fish's `env`. The empty value (the default
+/// login, named) is written `''`, never dropped: unset and empty are two relaunch lines. Negative
+/// control: with nothing required, the line is byte for byte what it was.
 #[test]
 fn the_relaunch_line_carries_the_login_in_every_shells_form() {
     let login = login_env(Some(LOGIN_DIR));
@@ -1466,7 +1418,7 @@ fn the_relaunch_line_carries_the_login_in_every_shells_form() {
         )
         .as_str())
     );
-    // The default login, NAMED: set and empty.
+    // The default login, named: set and empty.
     assert_eq!(login_env(Some("")), [(accounts::LOGIN_ENV, "")]);
     assert_eq!(
         login_line(Dialect::Zsh, None, &argv, &login_env(Some(""))).as_deref(),
@@ -1476,7 +1428,7 @@ fn the_relaunch_line_carries_the_login_in_every_shells_form() {
         login_line(Dialect::Fish, None, &argv, &login_env(Some(""))).as_deref(),
         Ok(format!(" env CLAUDE_SECURESTORAGE_CONFIG_DIR='' {survey} {tail}").as_str())
     );
-    // NEGATIVE CONTROL: the process had no such variable — nothing is added.
+    // Negative control: the process had no such variable, and nothing is added.
     assert!(login_env(None).is_empty());
     assert_eq!(
         login_line(Dialect::Zsh, None, &argv, &login_env(None)).as_deref(),
@@ -1489,15 +1441,10 @@ fn the_relaunch_line_carries_the_login_in_every_shells_form() {
     );
 }
 
-/// THE CLAUDE HOME IS ON THE LINE TOO ([`required_env`]): a process started
-/// with `CLAUDE_CONFIG_DIR` (on its own command line, or by a wrapper: the
-/// tab's shell never had it) is relaunched with exactly that value, ahead of
-/// the login and the survey switch, in every shell's form — dropped, the new
-/// process reads another `.claude.json` (measured 2026-10-09 in the
-/// real-claude lab: the first-run theme picker, the conversation never held)
-/// and, with no login variable, signs in by another keychain item. A home no
-/// line can hold refuses the line, and no relaunch is promised for it.
-/// NEGATIVE CONTROL: no home, the line is byte for byte what it was.
+/// The Claude home is on the line too ([`required_env`]): a process started with
+/// `CLAUDE_CONFIG_DIR` is relaunched with exactly that value, ahead of the login and the survey
+/// switch, in every shell's form. A home no line can hold refuses the line, and no relaunch is
+/// promised for it. Negative control: no home, the line is byte for byte what it was.
 #[test]
 fn the_relaunch_line_carries_the_claude_home_its_agent_ran_under() {
     const HOME: &str = "/tmp/lab home/.claude";
@@ -1533,8 +1480,8 @@ fn the_relaunch_line_carries_the_claude_home_its_agent_ran_under() {
         .as_deref(),
         Ok(format!(" {home} {posix} {survey} {tail}").as_str())
     );
-    // NEGATIVE CONTROL: no home — the login's line, and with neither the
-    // line as it always was.
+    // Negative control: no home gives the login's line, and with neither the line as it always
+    // was.
     assert_eq!(
         required_env(None, Some(LOGIN_DIR)),
         login_env(Some(LOGIN_DIR))
@@ -1546,6 +1493,7 @@ fn the_relaunch_line_carries_the_claude_home_its_agent_ran_under() {
     );
     // Whether an exit is promised a relaunch asks the same line, home and all.
     let snap = |home: Option<String>| Snapshot {
+        stored_login: false,
         tab: "s-1".to_string(),
         pid: 4242,
         start: "Thu Sep 24 01:02:03 2026".to_string(),
@@ -1579,13 +1527,11 @@ fn the_relaunch_line_carries_the_claude_home_its_agent_ran_under() {
     );
 }
 
-/// THE SURVEY SWITCH IS DROPPED BEFORE THE LOGIN IS, AND THE LOGIN NEVER: a
-/// line that fits only without the switch is typed with the login alone, and
-/// one that cannot hold the login is REFUSED (`refused:line`) — never typed
-/// without it, which would resume the conversation under whatever login the
-/// shell has. NEGATIVE CONTROL: the same two launches with nothing required
-/// are the line and its fallback as they always were — the second is typed
-/// with no environment at all.
+/// The survey switch is dropped before the login is, and the login never: a line that fits only
+/// without the switch is typed with the login alone, and one that cannot hold the login is refused
+/// (`refused:line`), never typed without it. Negative control: the same two launches with nothing
+/// required are the line and its fallback as they always were, the second typed with no
+/// environment at all.
 #[test]
 fn a_line_that_cannot_hold_the_login_is_refused_never_typed_without_it() {
     let login = login_env(Some(LOGIN_DIR));
@@ -1598,8 +1544,8 @@ fn a_line_that_cannot_hold_the_login_is_refused_never_typed_without_it() {
     };
     let has = |line: &str, name: &str| line.contains(&format!("{name}="));
     let (login_var, survey_var) = (accounts::LOGIN_ENV, SURVEY_SWITCH_VAR);
-    // The longest launch whose line still holds the login AND the switch,
-    // found against this kernel's own bound.
+    // The longest launch whose line still holds the login and the switch, found against this
+    // kernel's own bound.
     let both = (1..5000)
         .take_while(|&pad| with(pad, &login).is_ok_and(|l| has(&l, survey_var)))
         .last()
@@ -1613,8 +1559,8 @@ fn a_line_that_cannot_hold_the_login_is_refused_never_typed_without_it() {
         .find(|&pad| with(pad, &login).is_err())
         .expect("a line too long for the login");
     assert_eq!(with(lost, &login), Err("line".to_string()));
-    // NEGATIVE CONTROL: with nothing required that very launch is typed, as
-    // it always was — which is exactly what must not happen to a login.
+    // Negative control: with nothing required that very launch is typed, as it always was, which
+    // is exactly what must not happen to a login.
     let plain = with(lost, &[]).expect("the launch itself fits");
     assert!(!has(&plain, login_var), "{plain}");
     // …and the launch whose switch was dropped is typed with no environment.
@@ -1622,13 +1568,13 @@ fn a_line_that_cannot_hold_the_login_is_refused_never_typed_without_it() {
     assert!(!has(&line, survey_var), "{line}");
 }
 
-/// WHETHER AN EXIT WOULD BE RELAUNCHED is asked of the line the relaunch
-/// would really type — with the login the process runs under: a snapshot
-/// whose login no line can carry promises no relaunch. NEGATIVE CONTROL: the
-/// same launch under a login that fits, and under none, is relaunched.
+/// Whether an exit would be relaunched is asked of the line the relaunch would really type, with
+/// the login the process runs under: a snapshot whose login no line can carry promises no
+/// relaunch. Negative control: the same launch under a login that fits, and under none, is.
 #[test]
 fn an_exit_is_promised_a_relaunch_only_where_the_line_can_hold_its_login() {
     let snap = |login: Option<String>| Snapshot {
+        stored_login: false,
         tab: "s-1".to_string(),
         pid: 4242,
         start: "Thu Sep 24 01:02:03 2026".to_string(),
@@ -1653,14 +1599,12 @@ fn an_exit_is_promised_a_relaunch_only_where_the_line_can_hold_its_login() {
     )))));
 }
 
-/// THE ROSTER NAMES THE LOGIN, AND THE PROCESS'S OWN ENVIRONMENT SAYS WHICH
-/// ACCOUNT IT RUNS UNDER: a label's login is its row's directory verbatim —
-/// the empty value for the row with none — and a label the roster does not
-/// list has none. A process is on an account when its own variable names
-/// that row, byte for byte: unset and empty are both the row with no
-/// directory. NEGATIVE CONTROLS: another row's directory, a directory with a
-/// trailing slash (another login to the vendor), and a roster with no such
-/// row.
+/// The roster names the login, and the process's own environment says which account it runs under:
+/// a label's login is its row's directory verbatim (the empty value for the row with none), and a
+/// label the roster does not list has none. A process is on an account when its own variable names
+/// that row, byte for byte; unset and empty are both the row with no directory. Negative controls:
+/// another row's directory, a directory with a trailing slash (another login to the vendor), and a
+/// roster with no such row.
 #[test]
 fn a_label_is_a_login_only_through_the_roster() {
     let roster = accounts::Roster::parse(&format!(
@@ -1673,6 +1617,7 @@ fn a_label_is_a_login_only_through_the_roster() {
     assert_eq!(account_login(&roster, "pool-a"), None);
     assert_eq!(account_login(&accounts::Roster::default(), "main"), None);
     let on = |login: Option<&str>| Snapshot {
+        stored_login: false,
         tab: "s-1".to_string(),
         pid: 4242,
         start: String::new(),
@@ -1691,7 +1636,7 @@ fn a_label_is_a_login_only_through_the_roster() {
     assert!(runs_under(&on(None), &roster, "main"));
     assert!(runs_under(&on(Some("")), &roster, "main"));
     assert!(runs_under(&on(Some(LOGIN_DIR)), &roster, "work-2"));
-    // NEGATIVE CONTROLS.
+    // Negative controls.
     assert!(!runs_under(&on(Some(LOGIN_DIR)), &roster, "main"));
     assert!(!runs_under(&on(None), &roster, "work-2"));
     assert!(!runs_under(
@@ -1702,13 +1647,12 @@ fn a_label_is_a_login_only_through_the_roster() {
     assert!(!runs_under(&on(None), &accounts::Roster::default(), "main"));
 }
 
-/// AN ACCOUNT MOVE'S RECORD: its cause is `account:<label>` — in BOTH
-/// allowlists, so the harness's own SIGTERM is never read as a graceful exit
-/// and the continuation is a relaunch's, never the upgrade's — and its model
-/// rides as the memory banner's does (what rides, else a hand choice), or,
-/// where a bucket's fallback stands, is the way back, the origin spent: the
-/// fallback answered the OLD account's bucket. NEGATIVE CONTROLS: a cause
-/// that only begins like it, and the upgrade's own (empty) cause.
+/// An account move's record: its cause is `account:<label>`, in both allowlists, so the harness's
+/// own SIGTERM is never read as a graceful exit and the record is a relaunch's, carried on with
+/// nothing typed ([`carried_quietly`], quiet or not). Its model rides as the memory banner's does
+/// (what rides, else a hand choice) or, where a bucket's fallback stands, is the way back, the
+/// origin spent: the fallback answered the old account's bucket. Negative controls: a cause that
+/// only begins like it, and the upgrade's own (empty) cause.
 #[test]
 fn an_account_moves_record_is_a_relaunch_that_ended_its_own_agent() {
     let to = |label: &str| Restart::Account {
@@ -1732,6 +1676,7 @@ fn an_account_moves_record_is_a_relaunch_that_ended_its_own_agent() {
         }
     );
     assert!(relaunch_cause(&plain.cause) && ends_its_agent(&plain.cause));
+    assert!(carried_quietly(&plain.cause, false) && carried_quietly(&plain.cause, true));
     assert!(!starts_afresh(&plain.cause));
     // Its line is typed once: a relaunch that ended as it started is said at
     // once ([`ends_at_once`]).
@@ -1784,10 +1729,15 @@ fn an_account_moves_record_is_a_relaunch_that_ended_its_own_agent() {
         (memory.model, memory.fallback_from.as_deref()),
         (None, Some("claude-fable-5-1"))
     );
-    // NEGATIVE CONTROLS.
+    // Negative controls.
     for cause in ["account", "accounts", "", CAUSE_FRESH] {
         assert!(!relaunch_cause(cause), "{cause:?}");
+        assert!(!carried_quietly(cause, false), "{cause:?}");
     }
+    assert!(
+        !carried_quietly(CAUSE_MEMORY, true),
+        "another relaunch says why it came back"
+    );
     assert!(!ends_its_agent("account"));
     assert!(
         !ends_its_agent(CAUSE_EXIT),
@@ -1795,55 +1745,13 @@ fn an_account_moves_record_is_a_relaunch_that_ended_its_own_agent() {
     );
 }
 
-/// WHAT A SESSION MOVED TO ANOTHER ACCOUNT IS TOLD: that it was relaunched
-/// under another Claude account — the LABEL, nothing else of it — and to
-/// carry on. Nothing about limits (it cannot know them, and the move may
-/// have been made ahead of one or on the owner's word), no directory, one
-/// line whatever the label holds.
-#[test]
-fn a_session_moved_to_another_account_is_told_the_label_and_to_carry_on() {
-    let p = resumed_prompt("2.1.286", "account:work-2");
-    assert_eq!(
-        p,
-        format!(
-            "{} Relaunched under another Claude account (work-2): this session was ended and \
-             restarted on Claude Code 2.1.286 and resumed. {}",
-            upgrade::HARNESS_MARK,
-            upgrade::CARRY_ON
-        )
-    );
-    for word in [
-        "limit",
-        "usage",
-        "reset",
-        "/tmp",
-        LOGIN_DIR,
-        accounts::LOGIN_ENV,
-    ] {
-        assert!(
-            !p.to_lowercase().contains(&word.to_lowercase()),
-            "{word}: {p}"
-        );
-    }
-    assert!(!resumed_prompt("2.1.286", "account:work\n2").contains('\n'));
-    // NEGATIVE CONTROL: without the cause in the allowlist's branch it would
-    // read as an exit nobody asked for.
-    assert!(resumed_prompt("2.1.286", CAUSE_EXIT).contains("exited without anyone asking"));
-    assert!(!p.contains("exited without anyone asking"));
-}
-
-/// WHAT A SHELL WOULD EXPAND IN A LOGIN DIRECTORY IS TYPED LITERALLY, AND A
-/// LINE THAT CANNOT BE WRITTEN WITH THE LOGIN IS NEVER WRITTEN WITHOUT IT
-/// (the review of 2026-10-01). The vendor hashes the directory's bytes into
-/// its keychain item's name, so `$HOME` expanded by the shell, a backtick
-/// run, or a `;` that ended the word would each be another login — or a
-/// command. Every such value rides inside single quotes, under each shell.
-/// And fish has no subshell form for an agent whose directory differs from
-/// its shell's: with a login required that line is REFUSED on both of
-/// [`line_for`]'s tries. NEGATIVE CONTROLS: a value of plain path characters
-/// needs no quotes; the same fish launch with no `cd` holds the login; and
-/// no control character is ever on a line, a tab and a carriage return
-/// included.
+/// What a shell would expand in a login directory is typed literally, and a line that cannot be
+/// written with the login is never written without it: the vendor hashes the directory's bytes into
+/// its keychain item's name, so every value rides inside single quotes, under each shell. Fish has
+/// no subshell form for an agent whose directory differs from its shell's, so with a login required
+/// that line is refused on both of [`line_for`]'s tries. Negative controls: plain path characters
+/// need no quotes; the same fish launch with no `cd` holds the login; no control character is ever
+/// on a line.
 #[test]
 fn a_login_directory_is_typed_literally_or_the_line_is_refused() {
     let argv = ["claude"];
@@ -1887,7 +1795,7 @@ fn a_login_directory_is_typed_literally_or_the_line_is_refused() {
         login_line(Dialect::Fish, None, &argv, &login).as_deref(),
         Ok(format!(r" env {name}='/tmp/a\\b' {survey} {tail}").as_str())
     );
-    // NEGATIVE CONTROL: plain path characters need no quotes.
+    // Negative control: plain path characters need no quotes.
     assert_eq!(
         login_line(
             Dialect::Zsh,
@@ -1922,15 +1830,11 @@ fn a_login_directory_is_typed_literally_or_the_line_is_refused() {
     }
 }
 
-/// AN ACCOUNT MOVE ASKED OVER A RESTART OF ANOTHER KIND IN FLIGHT WAS NOT
-/// TRIED ([`carried_word`], [`IN_FLIGHT_OTHER`]): the conversation's record
-/// was carried on its own line, under the login its process had, so every
-/// word of that carry that is no failure — `adopted` included — is answered
-/// `wait:restart-in-flight`: a wait, asked again, with nothing held against
-/// the account. So is a move to ANOTHER label than the one in flight.
-/// NEGATIVE CONTROLS: the move's OWN record carried answers the carry's
-/// word; a restart of another kind answers the carry's word whatever the
-/// record's cause; and a carry that FAILED is said as it failed.
+/// An account move asked over a restart of another kind in flight was not tried ([`carried_word`],
+/// [`IN_FLIGHT_OTHER`]): every word of that carry but a failure (`adopted` included) answers
+/// `wait:restart-in-flight`, as does a move to another label than the one in flight. Negative
+/// controls: the move's own record carried, and a restart of another kind, answer the carry's word;
+/// a failed carry is said as it failed.
 #[test]
 fn an_account_move_over_another_restart_in_flight_is_not_tried() {
     let to = |label: &str| Restart::Account {
@@ -1965,7 +1869,7 @@ fn an_account_move_over_another_restart_in_flight_is_not_tried() {
             "{cause:?}"
         );
     }
-    // NEGATIVE CONTROLS: the move's own record, and every other restart.
+    // Negative controls: the move's own record, and every other restart.
     for step in ["adopted", "wait:resume", "failed:no-resume"] {
         assert_eq!(word(&to("work-2"), "account:work-2", step), step);
         for cause in ["", CAUSE_MEMORY, "account:work-2"] {
@@ -1979,15 +1883,12 @@ fn an_account_move_over_another_restart_in_flight_is_not_tried() {
     );
 }
 
-/// A RELAUNCH WITH NO PROCESS TO READ CARRIES THE MACHINE'S ACTIVE ACCOUNT
-/// ([`cold_login`]): where two or more accounts are enrolled and `active` is
-/// one of them and PROVEN, the login its roster row names — the empty value
-/// for the row with no directory, the default login named. NEGATIVE
-/// CONTROLS, each of which adds NOTHING (the relaunch as it was before
-/// accounts existed): no roster; one account listed; two listed and one
-/// enrolled; no `active`; an `active` not proven; one the roster no longer
-/// lists, or not enrolled here; one known signed out; and a leaf whose
-/// Claude home is not the default.
+/// A relaunch with no process to read carries the machine's active account ([`cold_login`]): where
+/// two or more accounts are enrolled and `active` is one of them and proven, the login its roster
+/// row names (the empty value, the default login named, for the row with no directory). Negative
+/// controls, each adding nothing: no roster; one account listed; two listed and one enrolled; no
+/// `active`; an `active` not proven; one the roster no longer lists, or not enrolled here; one
+/// known signed out; and a leaf whose Claude home is not the default.
 #[test]
 fn a_cold_relaunch_carries_the_proven_active_account_and_nothing_else() {
     use std::collections::BTreeSet;
@@ -2019,7 +1920,7 @@ fn a_cold_relaunch_carries_the_proven_active_account_and_nothing_else() {
         Some("")
     );
 
-    // NEGATIVE CONTROLS.
+    // Negative controls.
     let none = BTreeSet::new();
     let proven = on(Some("work-2"), true);
     assert_eq!(
@@ -2076,4 +1977,176 @@ fn a_cold_relaunch_carries_the_proven_active_account_and_nothing_else() {
         None,
         "a Claude home that is not the default"
     );
+}
+
+// ------------------------------------------------------------------------
+// The usage tap on a relaunch line (`super::super::tap`; the accounts
+// design v2 §3.1).
+// ------------------------------------------------------------------------
+
+/// The tap's value for the installed app's path.
+fn tap_value() -> String {
+    super::super::tap::settings_value(Path::new("/Applications/aterm.app/Contents/MacOS/aterm"))
+        .expect("an admissible path")
+}
+
+/// The tap rides before `--resume`, quoted as each shell needs it, and last on a fresh start; with
+/// none, [`line_tapped`]'s and [`line_for`]'s line is each shell's golden line, byte for byte.
+/// Negative control: [`with_tap`] never adds a second `--resume`.
+#[test]
+fn the_tap_rides_before_the_resume_in_every_shells_form() {
+    let value = tap_value();
+    let tail = format!("'/opt/claude' '--verbose' '--settings' '{value}' '--resume' '{LOGIN_ID}'");
+    let survey = "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1";
+    let line = |dialect: Dialect, session: Option<&str>, tap: Option<&str>| {
+        line_tapped(
+            dialect,
+            None,
+            None,
+            Path::new("/opt/claude"),
+            &args(&["claude", "--verbose"]),
+            session,
+            None,
+            None,
+            &[],
+            tap,
+        )
+        .unwrap_or_else(|_| panic!("a line"))
+    };
+    for dialect in [Dialect::Zsh, Dialect::Bash] {
+        assert_eq!(
+            line(dialect, Some(LOGIN_ID), Some(&value)),
+            format!(" {survey} {tail}")
+        );
+    }
+    assert_eq!(
+        line(Dialect::Fish, Some(LOGIN_ID), Some(&value)),
+        format!(" env {survey} {tail}")
+    );
+    assert_eq!(
+        line(Dialect::Zsh, None, Some(&value)),
+        format!(" {survey} '/opt/claude' '--verbose' '--settings' '{value}'")
+    );
+    let untapped = format!("{survey} '/opt/claude' '--verbose' '--resume' '{LOGIN_ID}'");
+    for (dialect, golden) in [
+        (Dialect::Zsh, format!(" {untapped}")),
+        (Dialect::Bash, format!(" {untapped}")),
+        (Dialect::Fish, format!(" env {untapped}")),
+    ] {
+        assert_eq!(line(dialect, Some(LOGIN_ID), None), golden, "{dialect:?}");
+        let plain = line_for(
+            dialect,
+            None,
+            None,
+            Path::new("/opt/claude"),
+            &args(&["claude", "--verbose"]),
+            Some(LOGIN_ID),
+            None,
+            None,
+            &[],
+        );
+        assert_eq!(plain.ok(), Some(golden), "{dialect:?}");
+    }
+    let flags = with_tap(args(&["--verbose", "--resume", "X"]), "v");
+    assert_eq!(
+        flags,
+        args(&["--verbose", "--settings", "v", "--resume", "X"])
+    );
+    assert_eq!(flags.iter().filter(|f| *f == "--resume").count(), 1);
+}
+
+/// The tap is dropped before anything required: a launch whose line fits its bound only without
+/// the tap is relaunched without it, the login still first on the line; one that fits only without
+/// the tap and the survey switch keeps the login alone. Negative controls: a roomy line carries the
+/// tap and the switch, and one that cannot hold even what is required is still refused.
+#[test]
+fn the_tap_is_dropped_before_the_required_login() {
+    let value = tap_value();
+    let login = login_env(Some("/logins/w"));
+    let line = |pad: usize| {
+        line_tapped(
+            Dialect::Bash,
+            None,
+            None,
+            Path::new("/opt/claude"),
+            &args(&["claude", "--add-dir"])
+                .into_iter()
+                .chain([format!("/{}", "d".repeat(pad))])
+                .collect::<Vec<_>>(),
+            Some(LOGIN_ID),
+            None,
+            None,
+            &login,
+            Some(&value),
+        )
+    };
+    // The length of the line with the login alone: one byte per pad byte.
+    let base = |pad: usize| {
+        let argv = args(&["claude", "--add-dir"])
+            .into_iter()
+            .chain([format!("/{}", "d".repeat(pad))])
+            .collect::<Vec<_>>();
+        let flags = upgrade::rewrite_argv(&argv, LOGIN_ID).expect("flags");
+        upgrade::relaunch_line_env(
+            Dialect::Bash,
+            None,
+            None,
+            &login,
+            Path::new("/opt/claude"),
+            &flags,
+        )
+        .expect("a line")
+        .len()
+    };
+    let roomy = line(1).unwrap_or_else(|_| panic!("a roomy line"));
+    assert!(
+        roomy.contains("harness tap") && roomy.contains("FEEDBACK_SURVEY"),
+        "{roomy}"
+    );
+    // A pad at which the switch fits exactly, and the tap beside it does not.
+    let survey = "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1 ".len();
+    let fits_switch = upgrade::MAX_LINE - survey - base(1) + 1;
+    assert_eq!(base(fits_switch) + survey, upgrade::MAX_LINE);
+    let line_at = line(fits_switch).unwrap_or_else(|_| panic!("relaunched without the tap"));
+    assert!(!line_at.contains("harness tap"), "{}", line_at.len());
+    assert!(line_at.contains("FEEDBACK_SURVEY"), "{line_at}");
+    assert!(
+        line_at.starts_with(" CLAUDE_SECURESTORAGE_CONFIG_DIR=/logins/w "),
+        "{line_at}"
+    );
+    // A pad at which only the login fits.
+    let fits_bare = upgrade::MAX_LINE - base(1) + 1;
+    assert_eq!(base(fits_bare), upgrade::MAX_LINE);
+    let line_at = line(fits_bare).unwrap_or_else(|_| panic!("relaunched on the login alone"));
+    assert!(!line_at.contains("harness tap") && !line_at.contains("FEEDBACK_SURVEY"));
+    assert!(
+        line_at.starts_with(" CLAUDE_SECURESTORAGE_CONFIG_DIR=/logins/w "),
+        "{line_at}"
+    );
+    // Over the bound even so: refused.
+    assert!(line(fits_bare + 1).is_err());
+}
+
+/// A snapshot says whether its process is on its stored login, from the exec environment it was
+/// read with (`ProcessLogin::of_exec_env`): the tap's first question. A credential, a profile or a
+/// route variable, and an environment that was not read, are not.
+#[test]
+fn a_stored_login_is_read_off_the_exec_environment() {
+    let stored = |env: &[&str]| {
+        accounts::ProcessLogin::of_exec_env(&args(env)).is_some_and(|who| who.stored_login)
+    };
+    assert!(stored(&["HOME=/Users//example"]));
+    assert!(stored(&[
+        "HOME=/Users//example",
+        "CLAUDE_SECURESTORAGE_CONFIG_DIR="
+    ]));
+    assert!(!stored(&[]), "an environment not read");
+    for key in [
+        "CLAUDE_CODE_OAUTH_TOKEN=t",
+        "ANTHROPIC_API_KEY=k",
+        "ANTHROPIC_PROFILE=work",
+        "HTTPS_PROXY=http://gw.example",
+    ] {
+        assert!(!stored(&["HOME=/Users//example", key]), "{key}");
+    }
 }

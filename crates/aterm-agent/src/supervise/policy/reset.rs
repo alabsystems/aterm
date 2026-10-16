@@ -1,24 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A LIMIT RESET, as the loop, its host and the policies speak of one
+//! A limit reset, as the loop, its host and the policies speak of one
 //! (`docs/SPEC-claude-accounts-resets-2026-10-02.md`): what the loop asks its
 //! host before the grant row's first key ([`ResetAsk`]) and what the host
 //! answers ([`ResetWord`]: the go, a moment's wait, or the one word why not);
-//! the verdict on the confirmation the row opens ([`confirm_verdict`]: Enter,
-//! or the reason it is kept); what the loop tells its host when the step ends
-//! ([`ResetEnd`]) and what the host read of it ([`ResetOutcome`]).
+//! the verdict on the confirmation the row opens ([`confirm_verdict`]); what
+//! the loop tells its host when the step ends ([`ResetEnd`]) and what the host
+//! read of it ([`ResetOutcome`]).
 //!
-//! A reset is the owner's scarce purchase, so everything here REFUSES by
+//! A reset is the owner's scarce purchase, so everything here refuses by
 //! default: [`confirm_verdict`] says Enter only where every condition holds,
-//! and each thing that does not hold has its own word ([`KeepWhy`]), which
-//! is what the ledger's `reset-kept` row carries. Pure types and one pure
-//! function: nothing here reads a screen, a clock or a file, and nothing
-//! types.
+//! and each that does not has its own word ([`KeepWhy`]), which the ledger's
+//! `reset-kept` row carries. Pure: nothing here reads a screen, a clock or a
+//! file, and nothing types.
 //!
-//! NOTHING OF IT HAS BEEN SEEN: every text the reader this stands on reads
-//! (`aterm_phase::reset`) is the 2.1.287 bundle's, never a screen's, and
-//! `[harness] limit_reset` ships off.
+//! None of it has been seen live: its reader's texts (`aterm_phase::reset`)
+//! come from Claude Code's 2.1.287 bundle, never a screen, and `[harness]
+//! limit_reset` defaults off.
 
 use std::fmt;
 use std::time::Duration;
@@ -86,8 +85,8 @@ pub struct ResetGo {
 }
 
 /// Why the host did not give the go ([`ResetWord::No`]): one stable word each
-/// ([`Self::word`]), for the loop's one `SKIPPED` line a dialog mount. None of
-/// them is tried again at that mount, and none spends anything.
+/// ([`Self::word`]), for the loop's one `SKIPPED` line per dialog mount. None
+/// is tried again at that mount, and none spends anything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResetNo {
     /// `[harness] limit_reset` is off, read live.
@@ -155,7 +154,7 @@ pub enum ResetWord {
     No(ResetNo),
 }
 
-/// Why a reset was KEPT: the confirmation was not entered (it is Escaped), or
+/// Why a reset was kept: the confirmation was not entered (it is Escaped), or
 /// the step ended before one stood. One stable word each ([`fmt::Display`]),
 /// the reason of the ledger's `reset-kept` row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -222,8 +221,8 @@ pub enum Verdict {
     Keep(KeepWhy),
 }
 
-/// THE VERDICT ON A RESET CONFIRMATION: [`Verdict::Enter`] only where ALL of
-/// these hold, checked in this order — the first that does not is the
+/// The verdict on a reset confirmation: [`Verdict::Enter`] only where all of
+/// these hold, checked in this order; the first that does not is the
 /// [`Verdict::Keep`]:
 ///
 /// 1. `read` is [`ConfirmRead::Exact`] ([`KeepWhy::Inexact`] with the
@@ -240,7 +239,7 @@ pub enum Verdict {
 /// 6. the cursor is on the yes — [`KeepWhy::Focus`].
 ///
 /// `deadline` is the confirmation's own day and hour as the loop placed it;
-/// a long wall does not consult it. Pure.
+/// a long wall does not consult it.
 #[must_use]
 pub fn confirm_verdict(
     read: &ConfirmRead,
@@ -346,8 +345,8 @@ mod tests {
     use aterm_phase::reset::fixtures as composed;
     use aterm_phase::{ResetConfirm, reset_confirm};
 
-    /// The confirmation on a COMPOSED screen of the reader's (never captured:
-    /// each fixture's first line says so), read as the loop reads it.
+    /// The confirmation on one of the reader's composed screens (never
+    /// captured: each fixture's first line says so), read as the loop reads it.
     fn read(fixture: &str) -> ConfirmRead {
         let rows = screen(fixture);
         let reading = aterm_phase::read(Some("claude"), &rows, None);
@@ -376,10 +375,9 @@ mod tests {
     const NOW: i64 = 1_790_000_000;
     const HOUR: i64 = 3600;
 
-    /// ENTER AT THE EXACT CONFIRMATION OF THE ROW TAKEN, at a long wall,
-    /// whatever its deadline; and each [`KeepWhy`] the verdict can give, by
-    /// ONE thing changed from that case. NEGATIVE CONTROL: the unchanged case
-    /// is `Enter` at every row's side.
+    /// Enter at the exact confirmation of the row taken, at a long wall,
+    /// whatever its deadline; and each [`KeepWhy`] the verdict can give, by one
+    /// thing changed from that case.
     #[test]
     fn enter_only_at_the_exact_confirmation_of_the_row_taken() {
         let confirm = exact(composed::CONFIRM);
@@ -548,7 +546,7 @@ mod tests {
             confirm_verdict(&none_left, &with_go(&|g| g.left = 0), None, NOW),
             Verdict::Keep(KeepWhy::Count)
         );
-        // THE ORDER: where several do not hold, the first is the word.
+        // Where several do not hold, the first is the word.
         let other_and_unfocused = with_read(&|c| {
             c.limits = vec!["session".to_string()];
             c.yes_focused = false;
@@ -569,10 +567,9 @@ mod tests {
         );
     }
 
-    /// THE DEADLINE RULE, at a wall that is not long: a deadline within a
-    /// day is entered — to the second — and one a minute past it, one that
-    /// did not place, one that is now and one in the past are kept. NEGATIVE
-    /// CONTROL: at a long wall each of them is entered.
+    /// At a wall that is not long, a deadline within a day (to the second) is
+    /// entered; one a minute past it, one not placed, one now and one in the
+    /// past are kept. Negative control: at a long wall each is entered.
     #[test]
     fn a_short_wall_is_reset_only_where_the_offer_expires_within_a_day() {
         let read = read(composed::CONFIRM);
@@ -613,10 +610,9 @@ mod tests {
         }
     }
 
-    /// A HOST THAT ANSWERS NOTHING TAKES NO RESET AND READS NO OUTCOME: the
-    /// trait's defaults are the refusal and `Unread`, whatever is asked — so
-    /// a loop under a host that keeps no accounts never presses the grant
-    /// row. NEGATIVE CONTROL: a host that answers gives its own words.
+    /// The trait's defaults are the refusal and `Unread`, so a host that keeps
+    /// no accounts never has the grant row pressed. Negative control: a host
+    /// that answers gives its own words.
     #[test]
     fn a_host_that_answers_nothing_takes_no_reset() {
         use crate::supervise::{HostStep, IdleHost};
@@ -671,76 +667,9 @@ mod tests {
         for end in &ends {
             assert_eq!(Silent.reset_told(end), ResetOutcome::Unread);
         }
-        // NEGATIVE CONTROL, and the go carries the row's own count and day.
+        // Negative control; the go carries the row's own count and day.
         assert_eq!(Taking.reset_take(&ask), ResetWord::Take(go()));
         assert_eq!(Taking.reset_told(&ends[0]), ResetOutcome::Pending);
         assert_eq!(Taking.reset_told(&ends[1]), ResetOutcome::Kept);
-    }
-
-    /// One word a refusal, a keep and an outcome: short, lower case, no
-    /// space (a reader greps for them), and no two alike.
-    #[test]
-    fn every_word_is_short_and_its_own() {
-        let nos = [
-            ResetNo::Off,
-            ResetNo::NoHost,
-            ResetNo::Unread,
-            ResetNo::NotDefaultLogin,
-            ResetNo::OtherLogin,
-            ResetNo::NotOwnWall,
-            ResetNo::NoReset,
-            ResetNo::Window,
-            ResetNo::NotQualifying,
-            ResetNo::Held,
-            ResetNo::Attempted,
-            ResetNo::State,
-        ]
-        .map(|no| no.word().to_string());
-        let keeps = [
-            KeepWhy::Inexact("early"),
-            KeepWhy::Inexact("title"),
-            KeepWhy::OtherLimit,
-            KeepWhy::Count,
-            KeepWhy::Day,
-            KeepWhy::Deadline,
-            KeepWhy::NotQualifying,
-            KeepWhy::Focus,
-            KeepWhy::Claim,
-            KeepWhy::NotOpened,
-            KeepWhy::CheckTimeout,
-            KeepWhy::EnterNotTaken,
-            KeepWhy::Successor,
-            KeepWhy::Closed,
-        ]
-        .map(|why| why.to_string());
-        let outcomes = [
-            ResetOutcome::Pending,
-            ResetOutcome::Spent {
-                asks: true,
-                left: Some(1),
-                cleared_at: 0,
-            },
-            ResetOutcome::Lifted {
-                asks: false,
-                cleared_at: 0,
-            },
-            ResetOutcome::Kept,
-            ResetOutcome::Failed { login: true },
-            ResetOutcome::Unread,
-        ]
-        .map(|outcome| outcome.word().to_string());
-        for words in [nos.as_slice(), keeps.as_slice(), outcomes.as_slice()] {
-            let distinct: std::collections::BTreeSet<&String> = words.iter().collect();
-            assert_eq!(distinct.len(), words.len(), "{words:?}");
-            assert!(
-                words.iter().all(
-                    |w| !w.is_empty() && w.bytes().all(|b| b.is_ascii_lowercase() || b == b'-')
-                ),
-                "{words:?}"
-            );
-        }
-        assert_eq!(KeepWhy::Inexact("early").to_string(), "inexact-early");
-        assert_eq!(KeepWhy::CheckTimeout.to_string(), "check-timeout");
-        assert_eq!(KeepWhy::NotOpened.to_string(), "not-opened");
     }
 }

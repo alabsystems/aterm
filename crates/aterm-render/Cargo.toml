@@ -25,7 +25,7 @@ dev-seams = []
 spec-anchors = ["dep:aterm-spec"]
 # Disk-backed scrollback cold tier, forwarded through aterm-core. DEFAULT-ON so
 # native builds are byte-identical; a wasm consumer disables it
-# (--no-default-features) to drop libc/zstd-sys.
+# (--no-default-features) to drop libc.
 disk-tier = ["aterm-core/disk-tier"]
 # FONT-EMBED: compile in a bundled last-resort monospace font (DejaVu Sans Mono,
 # ~340KB, Bitstream Vera license — see assets/DejaVuSansMono.LICENSE.txt) so text
@@ -64,6 +64,12 @@ aterm-core = { path = "../aterm-core", default-features = false }
 # The Unicode `Emoji_Presentation` gate: a default-text code point (⏺ U+23FA) is
 # never resolved to the colour-emoji face merely because that face covers it.
 aterm-grapheme = { workspace = true }
+# The bidi class of a cell (R/AL): the run planner shapes a stretch of
+# right-to-left letters a reordered row paints backwards in logical order. The
+# font oracle (tests/font_oracle.rs) reorders its visual-order runs with the
+# same UAX #9 code aterm-core calls. First-party, already linked through
+# aterm-font.
+aterm-bidi = { workspace = true }
 # Ligature config (LigatureMode / TextShapingConfig / FontFeature): the shaping
 # settings that gate liga/calt. Plain data types, no default features.
 aterm-types = { workspace = true }
@@ -83,14 +89,14 @@ aterm-hash = { workspace = true }
 # it — 7 packages / 33,439 lines. Decode is the inline-image and colour-emoji
 # path (`decode_png_rgba8`); encode is the `image` verb's framebuffer dump.
 aterm-png = { workspace = true }
-rustybuzz = "0.20.1"
-# THE font parser, now that `fontdue` is retired: `src/font.rs` reads the cmap,
-# `hmtx`, `hhea` and legacy `kern` through it and outlines every glyph through
-# it, and `src/colr.rs` reads the Apple Color Emoji `sbix` bitmaps. Retiring
-# fontdue also retired the DUPLICATE `ttf-parser 0.21` fontdue pinned under
-# itself — 2 packages / 31,645 lines off every cell, and one version of the
-# font parser in the tree instead of two.
-ttf-parser = "0.25"
+# THE font reader and shaper (first-party since TF.5 and TF.6 of
+# docs/AUDIT-third-party-2026-10-15.md, carved from ttf-parser 0.25.1 and
+# rustybuzz 0.20.1): `src/font.rs` reads the cmap, `hmtx`, `hhea`/OS/2 and
+# legacy `kern` through it and outlines every glyph through it, `src/colr.rs`
+# paints COLR glyphs, the colour-emoji path reads `sbix`/`CBDT` bitmaps, and
+# `src/ligature_shaping.rs` shapes runs with `aterm_font::shape` (the colour
+# face's clusters too, except on macOS, where CoreText shapes them).
+aterm-font = { workspace = true }
 # Optional verifier registry used only when `spec-anchors` is enabled. The same
 # crate remains a dev-dependency below for this crate's Tier-1 tests.
 aterm-spec = { workspace = true, optional = true }
@@ -103,26 +109,33 @@ libc = { workspace = true }
 
 [target.'cfg(any(all(unix, not(target_os = "macos")), windows))'.dependencies]
 # NATIVE CRISPNESS (see src/hinted.rs): grid-fitted glyph outlines for the two
-# native raster paths that are NOT CoreText — Linux (W13) and Windows. Neither
-# the retired fontdue nor the first-party `src/font.rs` that replaced it hints,
-# so at desktop sizes (~12px, scale 1.0) stems and crossbars land at fractional
-# pixel phases and read fuzzy; skrifa runs the font's TrueType
-# bytecode / FreeType-ported autohinter and hands back a grid-fitted outline that
-# the SAME first-party coverage fill (`src/raster.rs`, as the FONT-2 variation path) turns
-# into crisp masks. Target-gated so the macOS (CoreText) build and the wasm
-# consumer — which trims its closure deliberately, see `disk-tier` above —
-# compile not one byte of it.
-skrifa = "0.46.2"
+# native raster paths that are NOT CoreText — Linux (W13) and Windows. The
+# first-party coverage fill (`src/raster.rs`) does not hint, so at desktop
+# sizes (~12px, scale 1.0) stems and crossbars land at fractional pixel phases
+# and read fuzzy; aterm-font's `hint` feature, the automatic hinter carved
+# from skrifa 0.46.2 (TF.4 of docs/AUDIT-third-party-2026-10-15.md; never the
+# font's own bytecode since TF.2b), hands back a grid-fitted outline that the
+# SAME coverage fill (as the FONT-2 variation path) turns into crisp masks.
+# Target-gated so the macOS (CoreText) build and the wasm consumer — which
+# trims its closure deliberately, see `disk-tier` above — compile not one
+# byte of it (a `--workspace` build unifies aterm-font's default `hint` in
+# everywhere; `src/hinted.rs` stays target-gated either way).
+aterm-font = { workspace = true, features = ["hint"] }
 
 [dev-dependencies]
+# Exercise the native portable rasters with embedded fonts on the macOS test
+# host too; normal macOS and wasm builds retain the target-gated hint feature.
+aterm-font = { workspace = true, features = ["hint"] }
 # TEST-ONLY sixel: re-declare the engine with its `sixel` feature so
 # `tests/inline_image.rs` can drive a REAL sixel DCS through `Terminal` and
 # measure the PIXELS the renderer composites for it (the pixel-exact placement
 # gate). The shipped build ignores dev-dependencies, so the production closure
 # stays byte-identical — no `aterm-sixel`, exactly as the [dependencies] entry
 # above declares it. Same bargain aterm-gpu strikes for its sixel parity gate.
+# BiDi also exercises the real reordered-row apron fallback, as the GUI enables it.
 aterm-core = { path = "../aterm-core", default-features = false, features = [
   "sixel",
+  "bidi",
 ] }
 libc = { workspace = true }
 # `tests/visual_regression.rs` opens its shell's pty through the workspace's one
@@ -186,8 +199,8 @@ path = "tests/seal_maps_discovered_faces.rs"
 name = "sealed_never_consults_coverage_index"
 path = "tests/sealed_never_consults_coverage_index.rs"
 
-# Alone: sets ATERM_NO_PROCEDURAL_GLYPHS for the whole process.
-[[test]]
-name = "no_procedural_glyphs_env"
-path = "tests/no_procedural_glyphs_env.rs"
-
+# ---- release perf gates: `targo --unverified bench -p aterm-render` ----------
+[[bench]]
+name = "sparkle_words"
+path = "benches/sparkle_words.rs"
+harness = false

@@ -233,8 +233,8 @@ impl App {
         }
         // The Security panel's buttons open System Settings, raise consent dialogs,
         // clear saved answers and trash app copies; `act` never presses them. `key`
-        // still drives the page like a hand, so the three that change this Mac are
-        // fenced by their alert (default Cancel, unanswerable by any control verb), and
+        // still drives the page like a hand, so persistent Security changes require
+        // their alert (default Cancel, unanswerable by any control verb), and
         // the two Open buttons never replace the owner's answer to the access card.
         if node_action
             .as_str()
@@ -319,7 +319,7 @@ impl App {
         }
     }
 
-    fn locate_native_view(
+    pub(crate) fn locate_native_view(
         &self,
         view: ViewId,
     ) -> Result<(WindowId, crate::tab_model::AppInstanceId), String> {
@@ -449,7 +449,6 @@ impl App {
                     motion: self.native_view_motion_cx(wid, view),
                     terminal_font_px: self.win_font_px(wid),
                     terminal_scale: self.windows[&wid].scale.max(f64::EPSILON) as f32,
-                    terminal_theme: self.theme,
                     semantic_font,
                     document: document.as_ref(),
                 },
@@ -584,8 +583,8 @@ impl App {
             let bounds = self.content_bounds(*wid).unwrap_or_default();
             for (index, tab) in ws.tab_set.tabs().iter().enumerate() {
                 let leaves = tab.root.layout(bounds, 1.0, 1.0);
-                // Presentation titles are stable model metadata; terminal chrome may be
-                // composed from user metadata, OSC/cwd and Smart Titles. The refresh path
+                // Presentation titles are stable model metadata; a terminal tab's label
+                // is its identity title (operator pin, OSC title, cwd). The refresh path
                 // caches the exact toolbar string per tab (headless too), so inspection
                 // reads that cache, and before the first refresh mirrors `tab_titles`'
                 // stable fallback.
@@ -783,14 +782,16 @@ fn editor_viewport_inspection_lines(compiled: &CompiledUi) -> Vec<String> {
             continue;
         };
         let cursor = spec.cursor_label.as_deref().unwrap_or("Unavailable");
-        let painted_status = spec.status.as_deref().unwrap_or("Ready");
         let semantic_status = spec
             .semantic_status
             .as_deref()
             .or(spec.status.as_deref())
             .unwrap_or("Ready");
         let minibuffer = spec.minibuffer.as_deref();
-        let footer = minibuffer.unwrap_or(painted_status);
+        // What the footer really draws: an open minibuffer takes the place
+        // of the status, which is then not painted at all.
+        let painted_status = minibuffer.unwrap_or(spec.status.as_deref().unwrap_or("Ready"));
+        let footer = painted_status;
         let modeline = format!("EDIT · {} · {cursor} | EMACS · {footer}", spec.label);
         lines.push(format!(
             "editor-view key={:?} mode=EDIT keymap=EMACS document={:?} dirty={} saving={} focused={} cursor={cursor:?}",
@@ -1472,7 +1473,7 @@ mod tests {
     }
 
     #[test]
-    fn tabs_inspection_uses_effective_smart_title_with_stable_fallback() {
+    fn tabs_inspection_uses_the_effective_label_with_stable_fallback() {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
 
@@ -1509,27 +1510,25 @@ mod tests {
             .expect("terminal tab inspection");
         assert!(fallback_line.contains("title=\"stable-terminal\""));
 
-        // Drive the real composition and refresh: an authored Title owns the stable
-        // lane, generated Activity fills Description, and the headless cache holds the
-        // label a windowed toolbar would receive.
-        app.config.descriptive_titles = Some(true);
-        app.config.title_summary_provider = Some(crate::app_config::TitleSummaryProvider::Builtin);
-        app.config.tab_title_format = Some(crate::app_config::TitleFormat::TitleDescription);
+        // Drive the real refresh: an authored Title is the label, an authored
+        // Description stays in the tooltip and menu and is never joined into it,
+        // and the headless cache holds the label a windowed toolbar would receive.
         {
             let session = app.pool.get(0).expect("session 0");
+            let mut meta = session
+                .ctx
+                .meta
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             assert_eq!(
-                session
-                    .ctx
-                    .meta
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .set("title", Some("title-smoke".to_string())),
+                meta.set("title", Some("title-smoke".to_string())),
+                Some(true)
+            );
+            assert_eq!(
+                meta.set("description", Some("Reviewing release checks".to_string())),
                 Some(true)
             );
         }
-        app.note_title_activity(0);
-        app.title_summaries
-            .set_test_activity(0, "Reviewing release checks");
         app.refresh_window_tabs(wid);
 
         let inspected = app.inspect_app(InspectRequest::Tabs).unwrap();
@@ -1538,7 +1537,7 @@ mod tests {
             .find(|line| line.starts_with(&format!("  tab id={} ", tab_id.get())))
             .expect("terminal tab inspection");
         assert!(
-            inspected_line.contains("title=\"title-smoke · Reviewing release checks\""),
+            inspected_line.contains("title=\"title-smoke\""),
             "inspection diverged from refreshed title chrome: {inspected_line:?}"
         );
     }
@@ -1728,22 +1727,24 @@ mod tests {
     #[test]
     fn the_security_panels_owner_gestures_are_refused_on_the_control_surface() {
         use crate::native_settings::{
-            MACOS_ACCESS_ASK_AGAIN, MACOS_ACCESS_DEBUGGER_OFF, MACOS_ACCESS_DEBUGGER_ON,
-            MACOS_ACCESS_GESTURE_PREFIX, MACOS_ACCESS_OPEN_DEVTOOLS, MACOS_ACCESS_TRASH,
-            MacosAccess, SettingsRoute,
+            MACOS_ACCESS_ASK_AGAIN, MACOS_ACCESS_ASKPASS_OFF, MACOS_ACCESS_ASKPASS_ON,
+            MACOS_ACCESS_DEBUGGER_OFF, MACOS_ACCESS_DEBUGGER_ON, MACOS_ACCESS_GESTURE_PREFIX,
+            MACOS_ACCESS_OPEN_DEVTOOLS, MACOS_ACCESS_TRASH, MacosAccess, SettingsRoute,
         };
         use aterm_containment::consent::{
             DebuggerChange, DebuggerMember, DebuggerMode, DebuggerProbe, DebuggerProbeLabel,
         };
         // Every owner gesture on the block sits under the prefix `act` refuses,
-        // the debugger-access change's two directions and the Developer Tools
-        // row's Open among them.
+        // the debugger-access change's two directions and the DEVELOPER TOOLS
+        // card's Open among them.
         for action in [
             MACOS_ACCESS_ASK_AGAIN,
             MACOS_ACCESS_TRASH,
             MACOS_ACCESS_DEBUGGER_ON,
             MACOS_ACCESS_DEBUGGER_OFF,
             MACOS_ACCESS_OPEN_DEVTOOLS,
+            MACOS_ACCESS_ASKPASS_OFF,
+            MACOS_ACCESS_ASKPASS_ON,
         ] {
             assert!(action.starts_with(MACOS_ACCESS_GESTURE_PREFIX), "{action}");
         }
@@ -1848,6 +1849,10 @@ mod tests {
             None,
             "the refused Allow recorded no change"
         );
+        assert!(
+            !panel.take_devtools_hand_over_request(),
+            "the refused Open Developer Tools asked the host for nothing"
+        );
 
         // The owner's press, confirmed, reaches the same reducer.
         state(&mut app, view)
@@ -1856,6 +1861,7 @@ mod tests {
             MACOS_ACCESS_ASK_AGAIN,
             MACOS_ACCESS_TRASH,
             MACOS_ACCESS_DEBUGGER_ON,
+            MACOS_ACCESS_OPEN_DEVTOOLS,
         ] {
             app.dispatch_native_view_event(
                 wid,
@@ -1883,6 +1889,80 @@ mod tests {
                 .map(|(change, _)| change),
             Some(DebuggerChange::On)
         );
+        assert!(
+            panel.take_devtools_hand_over_request(),
+            "the pressed Open Developer Tools asks the host for the hand-over"
+        );
+    }
+
+    #[test]
+    fn askpass_settings_controller_keys_need_an_owner_answer() {
+        use crate::native_settings::{
+            MACOS_ACCESS_ASKPASS_OFF, MACOS_ACCESS_ASKPASS_ON, MacosAccess, SettingsRoute,
+        };
+        for (was_off, action) in [
+            (false, MACOS_ACCESS_ASKPASS_OFF),
+            (true, MACOS_ACCESS_ASKPASS_ON),
+        ] {
+            let mut app = App::headless_for_test();
+            let wid = WindowId(0);
+            let window = app.windows.get_mut(&wid).unwrap();
+            window.cols = 180;
+            window.rows = 200;
+            assert!(app.open_settings_tab(SettingsRoute::Security));
+            let (_, view) = app.active_native_view(wid).unwrap();
+            let Some(crate::native_app::AppViewState::Settings(state)) =
+                app.native_runtime.view_state_mut(view)
+            else {
+                panic!("Settings is active");
+            };
+            state.replace_macos_access(MacosAccess {
+                enabled: true,
+                askpass_relay_off: was_off,
+                ..MacosAccess::default()
+            });
+            state.common.last_focus = Some(UiKey::new(action));
+            let compiled = app.compiled_native_ui(wid).unwrap();
+            assert!(
+                compiled.semantic(&UiKey::new(action)).is_some(),
+                "the requested direction is a real drawn control"
+            );
+            let refused = app
+                .act_app(ActRequest {
+                    view,
+                    ui_key: action.to_string(),
+                    action: action.to_string(),
+                    value: None,
+                })
+                .unwrap_err();
+            assert!(refused.contains("does not press"), "{refused}");
+            assert_eq!(
+                app.input(
+                    wid,
+                    crate::input::InputEvent::Key {
+                        key: aterm_types::keyboard::Key::Named(
+                            aterm_types::keyboard::NamedKey::Enter,
+                        ),
+                        mods: aterm_types::keyboard::Modifiers::default(),
+                        base_layout: None,
+                        layout_text: None,
+                        event_type: aterm_types::keyboard::KeyEventType::Press,
+                    },
+                    crate::input::Source::Controller,
+                ),
+                crate::input::InputOutcome::Ok
+            );
+            let Some(crate::native_app::AppViewState::Settings(state)) =
+                app.native_runtime.view_state_mut(view)
+            else {
+                panic!("Settings remains active");
+            };
+            assert_eq!(
+                state.take_askpass_off_request(),
+                None,
+                "a controller keyboard activation cannot supply an owner's answer"
+            );
+        }
     }
 
     #[test]

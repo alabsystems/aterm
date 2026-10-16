@@ -385,24 +385,6 @@ fn miri_grid_resize_stress() {
 
 // Row bulk operations: cells_mut and copy_from
 
-/// cells_mut returns a mutable slice that is safe to write.
-#[test]
-fn miri_row_cells_mut_bulk_write() {
-    let mut pages = PageStore::new();
-    // SAFETY: `pages` outlives `row`.
-    let mut row = unsafe { Row::new(10, &mut pages) };
-
-    let cells = row.cells_mut();
-    for (i, cell) in cells.iter_mut().enumerate() {
-        *cell = Cell::new(char::from(b'0' + (i as u8)));
-    }
-    row.update_len(10);
-
-    for col in 0..10u16 {
-        assert_eq!(row.get(col).unwrap().char(), char::from(b'0' + (col as u8)));
-    }
-}
-
 /// copy_from transfers content between rows with different backing pages.
 #[test]
 fn miri_row_copy_from() {

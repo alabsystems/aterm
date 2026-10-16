@@ -12,6 +12,10 @@
 //! per-host domain and ignores `$HOME` (measured 2026-09-14), so a test that let the
 //! apply through would disable Universal Control on whatever Mac ran it. The refusal is
 //! what these tests assert, and `store_lock_wait.rs` asserts the same edge for a pass.
+#![allow(
+    clippy::disallowed_types,
+    reason = "test code: a stand-in child may inherit descriptors"
+)]
 
 use std::process::{Command, Stdio};
 

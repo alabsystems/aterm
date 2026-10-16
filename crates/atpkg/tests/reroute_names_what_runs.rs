@@ -20,6 +20,10 @@
 //! `atpkg::reroute`'s test notes) is paid here, never inside the resolution's probe bound.
 
 #![cfg(unix)]
+#![allow(
+    clippy::disallowed_types,
+    reason = "test code: a stand-in child may inherit descriptors"
+)]
 
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};

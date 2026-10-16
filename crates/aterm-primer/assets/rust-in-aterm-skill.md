@@ -9,7 +9,8 @@ description: Use before building, checking, testing, linting, formatting or runn
 aterm installs the ALab verified Rust toolchain in `$ATPKG_BIN`, on PATH in every shell.
 It is the default in every repository, including one whose `rust-toolchain.toml` pins a
 stock channel: that pin moves only rustup's proxies (`cargo`, `rustc`, `rustfmt`,
-`cargo-clippy`), never `targo`. Only `RUSTC` or `build.rustc` moves targo off trustc.
+`cargo-clippy`), never `targo`. Only `RUSTC`, `CARGO_BUILD_RUSTC` or `build.rustc` moves
+targo off trustc.
 
 | instead of | type | what it is |
 |---|---|---|

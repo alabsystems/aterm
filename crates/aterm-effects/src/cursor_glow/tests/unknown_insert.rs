@@ -5,11 +5,10 @@
 
 use super::*;
 
-/// A real queued key follows an unknown-width insert on the FIFO wire,
-/// while its dispatch stamp precedes the insert's delivery receipt. The
-/// first frame shows only the insert's placeholder; cleanup runs after
-/// two seconds with the key still unpaid. This is the Tier-1 projection
-/// shared by the positive and refusal paths below.
+/// A real queued key follows an unknown-width insert on the FIFO wire, while its dispatch stamp
+/// precedes the insert's delivery receipt. The first frame shows only the insert's placeholder;
+/// cleanup runs after two seconds with the key still unpaid. Shared by the positive and refusal
+/// paths below.
 fn unknown_insert_orphan_key_setup(
     t0: Instant,
     keys: usize,

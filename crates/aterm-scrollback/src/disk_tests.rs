@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Unit tests for `DiskColdTier` — extracted from `disk.rs` (#2100).
+//! Unit tests for `DiskColdTier`.
 
 use super::super::line::serialize_lines;
 use super::*;
@@ -11,7 +11,7 @@ use std::fs::File;
 use std::io::Read;
 
 impl DiskColdTier {
-    /// Get the number of LIVE pages (front-dropped dead prefix excluded).
+    /// Get the number of live pages (front-dropped dead prefix excluded).
     #[must_use]
     pub fn page_count(&self) -> usize {
         self.live_index().len()
@@ -29,9 +29,8 @@ impl DiskColdTier {
         self.file.is_some()
     }
 
-    /// Test-only: corrupt the last index entry so it points past the mapped
-    /// region, simulating a malformed/attacker-influenced `PageIndexEntry` or
-    /// an out-of-band file truncation.
+    /// Point the last index entry at an arbitrary range, simulating a malformed
+    /// `PageIndexEntry` or an out-of-band file truncation.
     #[cfg(test)]
     fn corrupt_last_entry_range(&mut self, offset: u64, compressed_size: u32) {
         if let Some(entry) = self.index.last_mut() {
@@ -52,16 +51,14 @@ fn create_test_page(line_count: usize, prefix: &str) -> (Vec<u8>, usize) {
         .map(|i| Line::from(&*format!("{prefix}-Line{i}")))
         .collect();
     let serialized = serialize_lines(&lines);
-    let compressed = zstd::encode_all(serialized.as_slice(), 3).unwrap();
+    let compressed = crate::encode_cold_block(&serialized).unwrap();
     (compressed, line_count)
 }
 
 #[test]
 fn disk_cold_cache_byte_limit_is_enforced() {
-    // The cold LRU cache must evict by bytes, not only by page count.
-    // cache_size here is large so ONLY the byte budget can bind; reading more
-    // distinct pages than the budget holds must keep cache_bytes <=
-    // cache_byte_limit at all times.
+    // The cold LRU cache evicts by bytes, not only page count: with a large
+    // cache_size only the byte budget binds, and cache_bytes never exceeds it.
     let dir = tempdir().unwrap();
     let path = dir.path().join("cold.dtrm");
     let config = DiskColdConfig::new(&path)
@@ -83,8 +80,7 @@ fn disk_cold_cache_byte_limit_is_enforced() {
             cold.cache_byte_limit,
         );
     }
-    // With total cached-page bytes far over the budget and a large page-count cap,
-    // the byte budget is the binding constraint, so not every page can be resident.
+    // The byte budget, not the page-count cap, forces eviction.
     assert!(
         cold.cache.borrow().len() < num_pages,
         "the byte budget must force eviction below the page-count cap"
@@ -100,8 +96,8 @@ fn disk_cold_cache_byte_limit_is_enforced() {
 
 #[test]
 fn disk_cold_skips_caching_an_oversized_page() {
-    // A single page whose decompressed footprint exceeds the whole byte budget is
-    // uncacheable — it must not be inserted (a re-read re-decompresses).
+    // A page larger than the whole byte budget is not cached (a re-read
+    // re-decompresses).
     let dir = tempdir().unwrap();
     let path = dir.path().join("cold.dtrm");
     let config = DiskColdConfig::new(&path)
@@ -136,20 +132,17 @@ fn read_header_counts(path: &Path) -> (u64, u64) {
     (page_count, line_count)
 }
 
-/// Regression: #1004 - test failed when get_line() assertions were added.
-/// In-memory mode is metadata-only by design; data is not stored.
+/// In-memory mode is metadata-only by design: counts track, data is not stored.
 #[test]
 fn disk_cold_in_memory() {
     let mut cold = DiskColdTier::new();
     assert!(cold.is_empty());
     assert!(!cold.is_disk_backed());
 
-    // Push first page
     let (compressed, line_count) = create_test_page(10, "Page0");
     cold.push_compressed(&compressed, line_count).unwrap();
 
-    // In-memory mode is metadata-only - data not stored, so get_line() won't work
-    // Only verify metadata tracking
+    // Metadata only: reads fail.
     assert!(!cold.is_empty(), "should not be empty after push");
     assert_eq!(cold.line_count(), 10);
     assert_eq!(cold.page_count(), 1);
@@ -161,7 +154,7 @@ fn disk_cold_in_memory() {
         "expected I/O error, got: {err:?}"
     );
 
-    // Push second page - verify metadata accumulates correctly
+    // Metadata accumulates across pushes.
     let (compressed2, line_count2) = create_test_page(15, "Page1");
     cold.push_compressed(&compressed2, line_count2).unwrap();
     assert_eq!(cold.line_count(), 25, "line count should accumulate");
@@ -208,7 +201,6 @@ fn disk_cold_file_reload() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("cold.dtrm");
 
-    // Create and populate
     {
         let config = DiskColdConfig::new(&path);
         let mut cold = DiskColdTier::with_config(config).unwrap();
@@ -222,7 +214,6 @@ fn disk_cold_file_reload() {
         cold.sync().unwrap();
     }
 
-    // Reload and verify
     {
         let config = DiskColdConfig::new(&path);
         let cold = DiskColdTier::with_config(config).unwrap();
@@ -232,18 +223,16 @@ fn disk_cold_file_reload() {
     }
 }
 
-/// REGRESSION: a corrupt / torn / tampered `page_count` header field must NOT
-/// abort the reload with a `Vec::with_capacity` capacity-overflow panic.
-/// `page_count` is only a preallocation hint — `scan_pages` rebuilds the index
-/// from the page headers — so a bogus count must degrade gracefully to the real
-/// page data rather than crashing scrollback restore.
+/// A corrupt `page_count` header field must not panic the reload with a
+/// `Vec::with_capacity` overflow: it is only a preallocation hint, and
+/// `scan_pages` rebuilds the index from the page headers.
 #[test]
 fn corrupt_page_count_header_does_not_panic_on_reload() {
     use std::io::{Seek, SeekFrom, Write};
     let dir = tempdir().unwrap();
     let path = dir.path().join("cold.dtrm");
 
-    // Write two real pages, then drop the tier so the file is flushed/closed.
+    // Two real pages, then close the file.
     {
         let config = DiskColdConfig::new(&path);
         let mut cold = DiskColdTier::with_config(config).unwrap();
@@ -254,7 +243,7 @@ fn corrupt_page_count_header_does_not_panic_on_reload() {
         cold.sync().unwrap();
     }
 
-    // Corrupt ONLY the 8-byte page_count field (header[8..16]) to u64::MAX.
+    // Corrupt only the page_count field (header[8..16]) to u64::MAX.
     {
         let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
         f.seek(SeekFrom::Start(8)).unwrap();
@@ -262,8 +251,7 @@ fn corrupt_page_count_header_does_not_panic_on_reload() {
         f.flush().unwrap();
     }
 
-    // Reload must NOT panic; the page-header scan recovers both real pages
-    // regardless of the bogus count.
+    // The page-header scan recovers both real pages regardless of the count.
     let config = DiskColdConfig::new(&path);
     let cold = DiskColdTier::with_config(config).unwrap();
     assert_eq!(
@@ -273,21 +261,43 @@ fn corrupt_page_count_header_does_not_panic_on_reload() {
     );
 }
 
-/// REGRESSION (round 15): `scan_pages` preallocated its index / cumulative_lines
-/// Vecs from `page_count.min(max_pages)`, where `max_pages` = (file_len − 32)/8 is
-/// proportional to the file's LOGICAL length — cheaply attacker-controllable via a
-/// sparse file. A crafted .dtrm (valid header, page_count = u64::MAX) truncated to
-/// a large sparse size made both `Vec::with_capacity` calls eagerly reserve ~3× the
-/// logical length (16 B PageIndexEntry + 8 B usize per slot) BEFORE the scan
-/// discovered the first sparse (zero) page and stopped — an OOM-abort of scrollback
-/// restore on memory-constrained systems. The MAX_PREALLOC_PAGES cap bounds the
-/// initial reservation to a fixed size; the scan still recovers the real pages.
+/// A version-1 `.dtrm` (zstd pages, before the cold codec became LZ4) is
+/// refused at load rather than handed to the LZ4 page decoder; the same file at
+/// the current version loads, so the refusal is the version field alone.
+#[test]
+fn version_1_store_is_refused_at_load() {
+    use std::io::{Seek, SeekFrom, Write};
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("cold.dtrm");
+    {
+        let mut cold = DiskColdTier::with_config(DiskColdConfig::new(&path)).unwrap();
+        let (c, n) = create_test_page(3, "A");
+        cold.push_compressed(&c, n).unwrap();
+        cold.sync().unwrap();
+    }
+    let reloaded = DiskColdTier::with_config(DiskColdConfig::new(&path)).unwrap();
+    assert_eq!(reloaded.page_count(), 1);
+    drop(reloaded);
+
+    {
+        let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        f.seek(SeekFrom::Start(4)).unwrap();
+        f.write_all(&1u32.to_le_bytes()).unwrap();
+        f.flush().unwrap();
+    }
+    let err = DiskColdTier::with_config(DiskColdConfig::new(&path))
+        .expect_err("a version-1 store must not load");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+}
+
+/// `scan_pages` caps its index preallocation at `MAX_PREALLOC_PAGES`: the
+/// `(file_len − 32)/8` page bound scales with the logical length, which a sparse
+/// file makes cheap to inflate, so a crafted header (page_count = u64::MAX) on a
+/// large sparse file would reserve ~3× its length before the scan stopped.
 ///
-/// Uses a 1 GiB sparse tail: max_pages ≈ 1.34e8, so the cap (1<<20) clamps the
-/// reservation from ~3.2 GB down to ~25 MB. The sparse region is all zeros, so the
-/// scan hits a compressed_size==0 page right after the two real ones and stops —
-/// only the transient prealloc was dangerous. The file is sparse (ftruncate) and
-/// the whole-file mmap is lazy/file-backed, so nothing here touches real memory.
+/// The 1 GiB sparse tail clamps the reservation from ~3.2 GB to ~25 MB; the
+/// all-zero tail ends the scan right after the two real pages. Sparse file and
+/// lazy mmap, so nothing here touches real memory.
 #[test]
 fn scan_pages_bounds_prealloc_on_large_sparse_file() {
     use std::io::{Seek, SeekFrom, Write};
@@ -305,7 +315,7 @@ fn scan_pages_bounds_prealloc_on_large_sparse_file() {
         cold.sync().unwrap();
     }
 
-    // Corrupt page_count to u64::MAX AND extend the file to a 1 GiB sparse tail.
+    // Corrupt page_count to u64::MAX and extend the file to a 1 GiB sparse tail.
     {
         let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
         f.seek(SeekFrom::Start(8)).unwrap();
@@ -314,7 +324,7 @@ fn scan_pages_bounds_prealloc_on_large_sparse_file() {
         f.flush().unwrap();
     }
 
-    // Reload must NOT OOM-abort; the scan recovers exactly the two real pages.
+    // Reload must not run out of memory; the scan recovers the two real pages.
     let config = DiskColdConfig::new(&path);
     let cold = DiskColdTier::with_config(config).unwrap();
     assert_eq!(
@@ -331,12 +341,11 @@ fn scan_pages_bounds_prealloc_on_large_sparse_file() {
     );
 }
 
-/// Backward-compat (codex round-5): a legacy `.dtrm` page can declare more lines
-/// than the current decoder reconstructs (`MAX_DECODE_PAGE_LINES`) if it was
-/// written by an older, larger-`block_size` build. `scan_pages` must CLAMP such a
-/// page's recorded `line_count` on load so `cumulative_lines`/`get_line` never
-/// address the undecodable suffix (accepted-but-unreadable history). A page this
-/// build writes can never exceed the cap (block_size is clamped to it).
+/// A legacy `.dtrm` page from a larger-`block_size` build can declare more lines
+/// than the decoder reconstructs (`MAX_DECODE_PAGE_LINES`). `scan_pages` clamps
+/// its recorded `line_count` on load so `get_line` never addresses the
+/// undecodable suffix. This build never writes such a page (block_size is
+/// clamped to the cap).
 #[test]
 fn scan_pages_clamps_legacy_oversized_page_line_count() {
     let dir = tempdir().unwrap();
@@ -349,7 +358,7 @@ fn scan_pages_clamps_legacy_oversized_page_line_count() {
         cold.push_compressed(&compressed, oversized).unwrap();
         cold.sync().unwrap();
     }
-    // Reopen → scan_pages clamps the recorded line_count to the decode cap.
+    // Reopen: scan_pages clamps the recorded line_count to the decode cap.
     let cold = DiskColdTier::with_config(DiskColdConfig::new(&path)).unwrap();
     assert_eq!(
         cold.line_count(),
@@ -358,13 +367,10 @@ fn scan_pages_clamps_legacy_oversized_page_line_count() {
     );
 }
 
-/// Regression (round 11): `scan_pages` must stop at a page whose `line_count`
-/// is 0. Such a page advances `cumulative` by 0, so its `cumulative_lines`
-/// entry duplicates the previous total, breaking the strictly-increasing
-/// invariant that `find_page`'s binary search relies on — a later lookup could
-/// resolve a valid line to the empty page and mis-slice it. A zero-line page
-/// (with nonzero compressed_size, so the length-0 terminator does not fire)
-/// only appears via truncation/corruption, so treat it as end-of-data.
+/// `scan_pages` stops at a page whose `line_count` is 0: its `cumulative_lines`
+/// entry would duplicate the previous total and break the strictly increasing
+/// order `find_page`'s binary search relies on. Such a page (with nonzero
+/// compressed_size) only comes from truncation or corruption: end of data.
 #[test]
 fn scan_pages_stops_at_zero_line_page() {
     use std::io::Write;
@@ -382,9 +388,8 @@ fn scan_pages_stops_at_zero_line_page() {
         cold.sync().unwrap();
     }
 
-    // Append a corrupt page: 8-byte header {compressed_size = 4, line_count = 0}
-    // followed by 4 bytes of payload so the page_end bounds check would pass and
-    // scan_pages reaches the line_count guard (checked first).
+    // Append a page {compressed_size = 4, line_count = 0} with 4 payload bytes, so
+    // the page_end bounds check passes and the line_count guard decides.
     {
         let mut f = std::fs::OpenOptions::new()
             .append(true)
@@ -412,8 +417,7 @@ fn scan_pages_stops_at_zero_line_page() {
         "line count must reflect only the two real pages"
     );
 
-    // Every real line remains readable — cumulative_lines stayed strictly
-    // increasing, so the binary search still lands on the right page.
+    // cumulative_lines stayed strictly increasing, so every real line resolves.
     assert_eq!(cold.get_line(0).unwrap().unwrap().to_string(), "A-Line0");
     assert_eq!(cold.get_line(24).unwrap().unwrap().to_string(), "B-Line14");
     assert!(
@@ -430,7 +434,6 @@ fn disk_cold_get_line() {
     let config = DiskColdConfig::new(&path);
     let mut cold = DiskColdTier::with_config(config).unwrap();
 
-    // Add multiple pages
     for page_num in 0..3 {
         let (compressed, line_count) = create_test_page(5, &format!("Page{page_num}"));
         cold.push_compressed(&compressed, line_count).unwrap();
@@ -438,7 +441,6 @@ fn disk_cold_get_line() {
 
     assert_eq!(cold.line_count(), 15);
 
-    // Test line retrieval across pages
     assert_eq!(
         cold.get_line(0)
             .expect("no error")
@@ -485,13 +487,12 @@ fn disk_cold_lru_cache() {
     let config = DiskColdConfig::new(&path).with_cache_size(2);
     let mut cold = DiskColdTier::with_config(config).unwrap();
 
-    // Add 5 pages
     for page_num in 0..5 {
         let (compressed, line_count) = create_test_page(10, &format!("Page{page_num}"));
         cold.push_compressed(&compressed, line_count).unwrap();
     }
 
-    // Access pages 0, 1, 2 - cache should only hold 2
+    // Touch pages 0, 1, 2 with room for 2.
     cold.get_line(0).expect("no error");
     cold.get_line(10).expect("no error");
     cold.get_line(20).expect("no error");
@@ -512,7 +513,6 @@ fn disk_cold_clear() {
     cold.push_compressed(&compressed, line_count).unwrap();
 
     assert_eq!(cold.line_count(), 10);
-    // Verify mmap is usable (not just present) before clear
     assert_eq!(
         cold.get_line(0)
             .expect("no error")
@@ -527,8 +527,8 @@ fn disk_cold_clear() {
         .metadata()
         .unwrap()
         .len();
-    // Appends never map (ST-1): a freshly created store serves reads through
-    // the positional-read path until a load/compaction establishes a view.
+    // Appends never map: a fresh store reads positionally until a load or
+    // compaction maps it.
     assert!(cold.mmap.is_none());
     assert!(file_len_before > HEADER_SIZE as u64);
 
@@ -572,8 +572,7 @@ fn disk_cold_clear_remap() {
         file_len > HEADER_SIZE as u64,
         "push after clear reaches disk"
     );
-    // No view is re-established by the append (ST-1) — the read above went
-    // through the positional path against the post-clear file.
+    // The append maps nothing; the read above was positional.
     assert!(cold.mmap.is_none());
 }
 
@@ -615,7 +614,6 @@ fn disk_cold_drop_releases_mmap() {
 
         let (compressed, line_count) = create_test_page(10, "Page0");
         cold.push_compressed(&compressed, line_count).unwrap();
-        // Verify mmap content is readable before drop
         assert_eq!(
             cold.get_line(0)
                 .expect("no error")
@@ -633,9 +631,8 @@ fn disk_cold_drop_releases_mmap() {
         assert!(file_len > HEADER_SIZE as u64);
     }
 
-    // Reload so a real mapping exists (appends never map; load does), then
-    // drop it — the point of this test is that Drop releases the view so the
-    // file can be deleted (load-bearing on Windows).
+    // Reload so a mapping exists (load maps, appends do not); Drop must release it
+    // so the file can be deleted (load-bearing on Windows).
     {
         let cold = DiskColdTier::with_config(DiskColdConfig::new(&path)).unwrap();
         assert!(
@@ -652,8 +649,7 @@ fn disk_cold_append_leaves_map_extent_reads_still_work() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("cold.dtrm");
 
-    // Populate one page, then reload so the store carries a mapping of the
-    // full file at load time.
+    // One page, then reload so the store maps the whole file.
     {
         let config = DiskColdConfig::new(&path);
         let mut cold = DiskColdTier::with_config(config).unwrap();
@@ -665,10 +661,8 @@ fn disk_cold_append_leaves_map_extent_reads_still_work() {
     let file_len_at_load = cold.file.as_ref().unwrap().metadata().unwrap().len();
     assert_eq!(mapped_at_load, file_len_at_load);
 
-    // REACH GUARD (ST-1): an append must NOT re-map. The file grows past the
-    // view's extent while the view keeps its load-time length — the whole-file
-    // unmap/remap per appended page is the eliminated cost category, and this
-    // assertion fails if it ever comes back.
+    // An append must not re-map: the file grows past the view, which keeps its
+    // load-time length.
     let (compressed2, line_count2) = create_test_page(5, "Page1");
     cold.push_compressed(&compressed2, line_count2).unwrap();
     let file_len2 = cold.file.as_ref().unwrap().metadata().unwrap().len();
@@ -676,8 +670,7 @@ fn disk_cold_append_leaves_map_extent_reads_still_work() {
     let mmap_len2 = cold.mmap.as_ref().expect("view survives appends").len() as u64;
     assert_eq!(mmap_len2, mapped_at_load, "append must not re-map");
 
-    // Both worlds stay readable: the old page through the mapping, the new
-    // page through the positional read beyond the mapped extent.
+    // The old page reads through the mapping, the new one positionally.
     assert_eq!(
         cold.get_line(0)
             .expect("no error")
@@ -699,7 +692,6 @@ fn disk_cold_reload_and_read() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("cold.dtrm");
 
-    // Create and populate
     {
         let config = DiskColdConfig::new(&path);
         let mut cold = DiskColdTier::with_config(config).unwrap();
@@ -747,24 +739,21 @@ fn disk_cold_cache_size_zero_no_infinite_loop() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("cold.dtrm");
 
-    // with_cache_size(0) should be clamped to 1
+    // with_cache_size(0) clamps to 1.
     let config = DiskColdConfig::new(&path).with_cache_size(0);
     let mut cold = DiskColdTier::with_config(config).unwrap();
 
     let (compressed, line_count) = create_test_page(5, "Page0");
     cold.push_compressed(&compressed, line_count).unwrap();
 
-    // Reading triggers cache_page — must not hang
+    // Reading caches the page; this must not hang.
     let line = cold.get_line(0).expect("no error").expect("line present");
     assert_eq!(line.to_string(), "Page0-Line0");
 
-    // Cache holds exactly 1 entry (clamped from 0)
     assert_eq!(cold.cache.borrow().len(), 1);
 }
 
-// =========================================================================
-// DiskColdTier::truncate_front_lines tests (#5911)
-// =========================================================================
+// DiskColdTier::truncate_front_lines.
 
 /// truncate_front_lines within a single page uses front_offset.
 #[test]
@@ -783,7 +772,6 @@ fn disk_cold_truncate_front_lines_partial_page() {
     assert_eq!(cold.line_count(), 3);
     assert_eq!(cold.page_count(), 1, "page not yet fully consumed");
 
-    // First available line should be P0-Line2.
     let line = cold.get_line(0).unwrap().unwrap();
     assert_eq!(line.to_string(), "P0-Line2");
     let line = cold.get_line(2).unwrap().unwrap();
@@ -810,7 +798,6 @@ fn disk_cold_truncate_front_lines_crosses_page() {
     assert_eq!(cold.line_count(), 3);
     assert_eq!(cold.page_count(), 1, "consumed page should be dropped");
 
-    // First available line should be P1-Line2.
     let line = cold.get_line(0).unwrap().unwrap();
     assert_eq!(line.to_string(), "P1-Line2");
     let last = cold.get_line(2).unwrap().unwrap();
@@ -839,7 +826,7 @@ fn disk_cold_truncate_front_lines_exact_boundary() {
     assert_eq!(line.to_string(), "P1-Line0");
 }
 
-/// truncate_front_lines removing ALL lines leaves DiskColdTier empty.
+/// truncate_front_lines removing all lines leaves DiskColdTier empty.
 #[test]
 fn disk_cold_truncate_front_lines_all() {
     let dir = tempdir().unwrap();
@@ -879,13 +866,12 @@ fn disk_cold_truncate_then_push() {
     cold.truncate_front_lines(7);
     assert_eq!(cold.line_count(), 3);
 
-    // Push a new page.
     let (c3, n3) = create_test_page(4, "P2");
     cold.push_compressed(&c3, n3).unwrap();
     assert_eq!(cold.line_count(), 7, "3 surviving + 4 new = 7");
     assert_eq!(cold.page_count(), 2, "1 surviving + 1 new = 2");
 
-    // Verify data: first 3 lines from P1, then 4 from P2.
+    // 3 lines from P1, then 4 from P2.
     let line0 = cold.get_line(0).unwrap().unwrap();
     assert_eq!(line0.to_string(), "P1-Line2");
     let line3 = cold.get_line(3).unwrap().unwrap();
@@ -902,7 +888,7 @@ fn disk_cold_truncate_front_lines_incremental() {
     let config = DiskColdConfig::new(&path);
     let mut cold = DiskColdTier::with_config(config).unwrap();
 
-    // 4 pages of 3 lines each = 12 lines total.
+    // 4 pages of 3 lines.
     for i in 0..4 {
         let (c, n) = create_test_page(3, &format!("P{i}"));
         cold.push_compressed(&c, n).unwrap();
@@ -932,12 +918,10 @@ fn disk_cold_truncate_front_lines_incremental() {
     assert_eq!(line.to_string(), "P2-Line1");
 }
 
-/// ST-3 rotation oracle: interleave front truncation and appends across many
-/// page boundaries and verify EVERY surviving line by content. This drives
-/// the cursor + absolute-base index maintenance through its whole lifecycle
-/// — base advances, pushes over a non-zero base, the amortized dead-prefix
-/// reclamation, and the drop-to-empty reset — against the plain-meaning
-/// oracle of what the store must contain.
+/// Rotation oracle: interleave front truncation and appends across many page
+/// boundaries and check every surviving line, driving the cursor + absolute-base
+/// index through base advances, dead-prefix reclamation, compaction and the
+/// drop-to-empty reset.
 #[test]
 fn disk_cold_rotation_interleave_matches_oracle() {
     fn push_page(
@@ -969,10 +953,9 @@ fn disk_cold_rotation_interleave_matches_oracle() {
         push_page(&mut cold, &mut oracle, &mut next_page, 3 + (k % 5));
     }
 
-    // Phase 2: many small truncations interleaved with appends — page
-    // drops, partial-page front offsets, and pushes over a non-zero base
-    // (compaction fires whenever dead outgrows live, exercising the
-    // cursor-reset-on-rebuild arm too).
+    // Phase 2: small truncations interleaved with appends: page drops,
+    // partial-page offsets, pushes over a non-zero base, and compaction whenever
+    // dead outgrows live.
     for k in 0..40 {
         let cut = (1 + (k % 7)).min(cold.line_count());
         cold.truncate_front_lines(cut);
@@ -981,8 +964,7 @@ fn disk_cold_rotation_interleave_matches_oracle() {
         if k % 3 == 0 {
             push_page(&mut cold, &mut oracle, &mut next_page, 2 + (k % 6));
         }
-        // Full-content sweep every fourth round keeps the test fast while
-        // still hitting lookups at every base state.
+        // A full sweep every fourth round still hits every base state.
         if k % 4 == 0 {
             for (i, want) in oracle.iter().enumerate() {
                 let got = cold.get_line(i).unwrap().unwrap().to_string();
@@ -992,8 +974,7 @@ fn disk_cold_rotation_interleave_matches_oracle() {
         }
     }
 
-    // Phase 3: drop to empty, then refill — the base must reset with the
-    // cleared index and lookups must be exact again.
+    // Phase 3: drop to empty, then refill; the base resets with the index.
     let all = cold.line_count();
     cold.truncate_front_lines(all);
     oracle.clear();
@@ -1004,9 +985,8 @@ fn disk_cold_rotation_interleave_matches_oracle() {
         assert_eq!(&got, want, "line {i} after refill");
     }
 
-    // Phase 4: reload. Front truncation is logical until compaction, so the
-    // reloaded store may resurrect dropped-but-uncompacted pages — but the
-    // oracle lines are always the newest, i.e. the SUFFIX of what reloads.
+    // Phase 4: reload. Front truncation is logical until compaction, so a reload
+    // may resurrect dropped pages, but the oracle lines are always its suffix.
     drop(cold);
     let cold = DiskColdTier::with_config(DiskColdConfig::new(&path)).unwrap();
     let total = cold.line_count();
@@ -1021,19 +1001,15 @@ fn disk_cold_rotation_interleave_matches_oracle() {
     }
 }
 
-// =========================================================================
-// Crash recovery tests (#5917)
-// =========================================================================
+// Crash recovery.
 
-/// Simulate a crash mid-write: file has a complete page followed by a partial
-/// page (header written, compressed data truncated). On reload, the partial
-/// page should be discarded and the complete page should be accessible.
+/// A crash mid-write leaves a complete page then a torn one; reload discards
+/// the torn page and keeps the complete one.
 #[test]
 fn disk_cold_crash_recovery_partial_page_discarded() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("crash-partial.dtrm");
 
-    // Write one complete page normally.
     {
         let config = DiskColdConfig::new(&path);
         let mut cold = DiskColdTier::with_config(config).unwrap();
@@ -1042,8 +1018,7 @@ fn disk_cold_crash_recovery_partial_page_discarded() {
         cold.sync().unwrap();
     }
 
-    // Simulate a crash: append a page header claiming 1000 bytes of compressed
-    // data, but only write 10 bytes. This mimics a process killed mid-write.
+    // A page header claiming 1000 bytes, followed by only 10.
     {
         use std::io::{Seek, Write};
         let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
@@ -1052,12 +1027,10 @@ fn disk_cold_crash_recovery_partial_page_discarded() {
         let fake_line_count: u32 = 10;
         file.write_all(&fake_compressed_size.to_le_bytes()).unwrap();
         file.write_all(&fake_line_count.to_le_bytes()).unwrap();
-        // Only write 10 bytes of "compressed" data instead of 1000.
         file.write_all(&[0xAB; 10]).unwrap();
         file.flush().unwrap();
     }
 
-    // Reload: partial page should be discarded, complete page intact.
     {
         let config = DiskColdConfig::new(&path);
         let cold = DiskColdTier::with_config(config).unwrap();
@@ -1070,21 +1043,18 @@ fn disk_cold_crash_recovery_partial_page_discarded() {
     }
 }
 
-/// A file with only a partial page header (< PAGE_HEADER_SIZE bytes after the
-/// last complete page) should be handled gracefully — zero pages loaded.
+/// A partial page header after the last complete page loads as zero pages.
 #[test]
 fn disk_cold_crash_recovery_truncated_header() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("crash-trunc-hdr.dtrm");
 
-    // Create an empty file with just the file header.
     {
         let config = DiskColdConfig::new(&path);
         let _cold = DiskColdTier::with_config(config).unwrap();
     }
 
-    // Append a few bytes (less than PAGE_HEADER_SIZE) to simulate a crash
-    // during the very start of a page write.
+    // Fewer than PAGE_HEADER_SIZE bytes: a crash at the start of a page write.
     {
         use std::io::Write;
         let mut file = std::fs::OpenOptions::new()
@@ -1095,7 +1065,6 @@ fn disk_cold_crash_recovery_truncated_header() {
         file.flush().unwrap();
     }
 
-    // Reload: no pages should be loaded.
     {
         let config = DiskColdConfig::new(&path);
         let cold = DiskColdTier::with_config(config).unwrap();
@@ -1104,10 +1073,8 @@ fn disk_cold_crash_recovery_truncated_header() {
     }
 }
 
-/// After an explicit sync, the (advisory) header counters match the scanned
-/// page data. Appends themselves defer both the header write and the
-/// durability barrier to a policy boundary (ST-1) — scan_pages never trusts
-/// the counters, so this consistency is a convenience, not a crash contract.
+/// After an explicit sync the advisory header counters match the page data
+/// (appends defer them; scan_pages never trusts them).
 #[test]
 fn disk_cold_push_compressed_header_consistent() {
     let dir = tempdir().unwrap();
@@ -1123,12 +1090,10 @@ fn disk_cold_push_compressed_header_consistent() {
         cold.sync().unwrap();
     }
 
-    // Verify header counts match actual page data.
     let (header_pages, header_lines) = read_header_counts(&path);
     assert_eq!(header_pages, 2, "header page count must match");
     assert_eq!(header_lines, 8, "header line count must match (5+3)");
 
-    // Reload and verify data integrity.
     let config = DiskColdConfig::new(&path);
     let cold = DiskColdTier::with_config(config).unwrap();
     assert_eq!(cold.page_count(), 2);
@@ -1137,15 +1102,10 @@ fn disk_cold_push_compressed_header_consistent() {
     assert_eq!(cold.get_line(5).unwrap().unwrap().to_string(), "P1-Line0");
 }
 
-// Compaction tests extracted to disk_compaction_tests.rs
 #[path = "disk_compaction_tests.rs"]
 mod compaction;
 
-/// Regression: #5923 — `create()` must sync header to disk immediately.
-///
-/// Before the fix, `create()` called `file.flush()` which is a no-op on
-/// `std::fs::File`. After the fix, `sync_data()` ensures the header is
-/// durable on disk without waiting for `Drop`.
+/// `create()` syncs the header to disk at once (`File::flush` is a no-op).
 #[test]
 fn disk_cold_create_header_durable_on_disk() {
     let dir = tempdir().unwrap();
@@ -1154,18 +1114,13 @@ fn disk_cold_create_header_durable_on_disk() {
     let config = DiskColdConfig::new(&path);
     let _cold = DiskColdTier::with_config(config).unwrap();
 
-    // Read the on-disk header directly (bypassing the tier API).
-    // sync_data() in create() ensures this is visible immediately.
+    // Read the on-disk header directly, bypassing the tier API.
     let (page_count, line_count) = read_header_counts(&path);
     assert_eq!(page_count, 0, "freshly created header should have 0 pages");
     assert_eq!(line_count, 0, "freshly created header should have 0 lines");
 }
 
-/// Regression: #5923 — `clear()` must sync zeroed header to disk immediately.
-///
-/// Before the fix, `clear()` called `file.flush()` which is a no-op on
-/// `std::fs::File`. After the fix, `sync_data()` ensures the zeroed header
-/// is durable without waiting for `Drop::sync_all()`.
+/// `clear()` syncs the zeroed header to disk at once (`File::flush` is a no-op).
 #[test]
 fn disk_cold_clear_header_durable_on_disk() {
     let dir = tempdir().unwrap();
@@ -1174,10 +1129,7 @@ fn disk_cold_clear_header_durable_on_disk() {
     let config = DiskColdConfig::new(&path);
     let mut cold = DiskColdTier::with_config(config).unwrap();
 
-    // Push data so header is non-zero. Appends defer the header catch-up to
-    // a barrier (ST-1), so sync() explicitly before sampling the on-disk
-    // state this test uses as its baseline; the subject under test — clear()
-    // must persist the ZEROED header immediately — is unchanged.
+    // Appends defer the header catch-up, so sync() for a non-zero baseline.
     let (compressed, count) = create_test_page(10, "Page0");
     cold.push_compressed(&compressed, count).unwrap();
     cold.sync().unwrap();
@@ -1186,20 +1138,15 @@ fn disk_cold_clear_header_durable_on_disk() {
     assert_eq!(pages_before, 1, "should have 1 page before clear");
     assert_eq!(lines_before, 10, "should have 10 lines before clear");
 
-    // Clear resets header to zero and syncs to disk
     cold.clear().unwrap();
 
-    // Verify on-disk header is zeroed immediately (not deferred to Drop)
+    // The on-disk header is zeroed now, not at Drop.
     let (pages_after, lines_after) = read_header_counts(&path);
     assert_eq!(pages_after, 0, "clear() must zero page count on disk");
     assert_eq!(lines_after, 0, "clear() must zero line count on disk");
 }
 
-/// Verify push_compressed maintains transactional state consistency (#7575).
-///
-/// After each push, line_count, page_count, and cumulative_lines must all
-/// agree. This test exercises the transactional commit pattern that was
-/// introduced to prevent inconsistent state on I/O failure.
+/// After each push, line_count, page_count and the readable range agree.
 #[test]
 fn disk_cold_push_compressed_state_consistency() {
     let dir = tempdir().unwrap();
@@ -1216,19 +1163,17 @@ fn disk_cold_push_compressed_state_consistency() {
         cold.push_compressed(&compressed, count).unwrap();
         expected_total += size;
 
-        // Invariant: line_count must equal the sum of all pushed line counts.
         assert_eq!(
             cold.line_count(),
             expected_total,
             "line_count inconsistency after push {i}"
         );
-        // Invariant: page_count must match the number of pushes.
         assert_eq!(
             cold.page_count(),
             i + 1,
             "page_count inconsistency after push {i}"
         );
-        // Invariant: data from all pages must be readable.
+        // Data from all pages stays readable.
         let first_line = cold.get_line(0).unwrap().unwrap();
         assert_eq!(
             first_line.to_string(),
@@ -1244,7 +1189,7 @@ fn disk_cold_push_compressed_state_consistency() {
     }
 }
 
-/// push_compressed with empty data or zero lines is a no-op (#7575).
+/// push_compressed with empty data or zero lines is a no-op.
 #[test]
 fn disk_cold_push_compressed_empty_is_noop() {
     let dir = tempdir().unwrap();
@@ -1278,9 +1223,7 @@ fn disk_cold_push_compressed_empty_is_noop() {
     assert_eq!(cold.page_count(), 1);
 }
 
-// Performance regression tests — drain + single-line extraction (P10 6001)
-
-/// Exercises drain(..k) path that replaced O(k*n) remove(0) loops.
+/// Front truncation across several pages in one call.
 #[test]
 fn disk_cold_truncate_multi_page_drain() {
     let dir = tempdir().unwrap();
@@ -1293,7 +1236,7 @@ fn disk_cold_truncate_multi_page_drain() {
     }
     assert_eq!((cold.line_count(), cold.page_count()), (40, 8));
 
-    // Remove 27 lines — consumes 5 full pages, offset 2 into P5.
+    // 27 lines: 5 full pages, then offset 2 into P5.
     cold.truncate_front_lines(27);
     assert_eq!((cold.line_count(), cold.page_count()), (13, 3));
     assert_eq!(cold.get_line(0).unwrap().unwrap().to_string(), "P5-Line2");
@@ -1301,7 +1244,7 @@ fn disk_cold_truncate_multi_page_drain() {
     assert!(cold.get_line(13).unwrap().is_none());
 }
 
-/// Exercises load_line() single-line extraction path (cache miss then hits).
+/// `load_line` returns the right single line on a cache miss and on hits.
 #[test]
 fn disk_cold_get_line_cache_hit_single_extraction() {
     let dir = tempdir().unwrap();
@@ -1311,16 +1254,15 @@ fn disk_cold_get_line_cache_hit_single_extraction() {
     let (c, n) = create_test_page(10, "Pg");
     cold.push_compressed(&c, n).unwrap();
 
-    // Cache miss then cache hits — each returns correct single line.
+    // A cache miss, then hits.
     assert_eq!(cold.get_line(0).unwrap().unwrap().to_string(), "Pg-Line0");
     assert_eq!(cold.get_line(5).unwrap().unwrap().to_string(), "Pg-Line5");
     assert_eq!(cold.get_line(9).unwrap().unwrap().to_string(), "Pg-Line9");
     assert!(cold.get_line(10).unwrap().is_none());
 }
 
-/// Regression: a malformed `PageIndexEntry` whose `offset + compressed_size`
-/// exceeds the mapped/file length must return an `Err`, never read out of
-/// bounds (which would be a SIGBUS / OOB read against the raw mmap pointer).
+/// A `PageIndexEntry` whose range exceeds the mapped/file length returns `Err`,
+/// never an out-of-bounds read.
 #[test]
 fn disk_cold_decompress_oob_offset_returns_err() {
     let dir = tempdir().unwrap();
@@ -1329,16 +1271,14 @@ fn disk_cold_decompress_oob_offset_returns_err() {
 
     let (compressed, line_count) = create_test_page(10, "Pg");
     cold.push_compressed(&compressed, line_count).unwrap();
-    // Reload so a mapping exists (appends never map; load does) — this test
-    // must exercise the mapped read path's bounds handling.
+    // Reload so the mapped read path is the one under test.
     drop(cold);
     let mut cold =
         DiskColdTier::with_config(DiskColdConfig::new(dir.path().join("oob-offset.dtrm"))).unwrap();
 
-    // Valid read works before corruption.
     assert!(cold.decompress_page_for_test(0).is_ok());
 
-    // Push the page range far past the end of the mapped file.
+    // Point the page range past the end of the mapped file.
     let map_len = cold.mmap.as_ref().expect("mmap present").len() as u64;
     cold.corrupt_last_entry_range(map_len + 1, 4096);
 
@@ -1351,9 +1291,7 @@ fn disk_cold_decompress_oob_offset_returns_err() {
     );
 }
 
-/// Regression: an entry whose offset stays in-bounds but whose
-/// `compressed_size` runs past the mapped length must error rather than
-/// slicing past the mapping.
+/// An in-bounds offset with a `compressed_size` past the mapping errors.
 #[test]
 fn disk_cold_decompress_oob_length_returns_err() {
     let dir = tempdir().unwrap();
@@ -1376,9 +1314,8 @@ fn disk_cold_decompress_oob_length_returns_err() {
     );
 }
 
-/// Regression: simulate another process truncating the backing file after the
-/// mapping was created. The live-file-length re-check must catch the shrink
-/// and return an `Err` instead of dereferencing past EOF (SIGBUS).
+/// Another process truncating the backing file under the mapping: the
+/// live-length re-check returns `Err` instead of dereferencing past EOF.
 #[test]
 fn disk_cold_decompress_external_truncation_returns_err() {
     let dir = tempdir().unwrap();
@@ -1388,15 +1325,13 @@ fn disk_cold_decompress_external_truncation_returns_err() {
 
     let (compressed, line_count) = create_test_page(10, "Pg");
     cold.push_compressed(&compressed, line_count).unwrap();
-    // Reload so a live mapping exists (appends never map; load does): this
-    // regression is specifically about reads against a stale mapping.
+    // Reload so a mapping exists (load maps, appends do not).
     drop(cold);
     let cold = DiskColdTier::with_config(DiskColdConfig::new(&path)).unwrap();
     assert!(cold.mmap.is_some(), "load must map the populated file");
     assert!(cold.decompress_page_for_test(0).is_ok());
 
-    // Simulate an out-of-band truncation by another process: shrink the file
-    // to just the header while the mapping still records the original length.
+    // Shrink the file to the header while the mapping keeps its original length.
     let truncator = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
 
     #[cfg(unix)]
@@ -1413,10 +1348,8 @@ fn disk_cold_decompress_external_truncation_returns_err() {
         );
     }
 
-    // On Windows the OS itself enforces the invariant this regression guards:
-    // a file with a live user-mapped section cannot be truncated by ANY
-    // process (ERROR_USER_MAPPED_FILE, 1224), so the SIGBUS window does not
-    // exist. Assert that stronger guarantee instead.
+    // Windows refuses to truncate a file with a live user-mapped section
+    // (ERROR_USER_MAPPED_FILE, 1224), so the SIGBUS window does not exist there.
     #[cfg(windows)]
     {
         let err = truncator
@@ -1435,12 +1368,10 @@ fn disk_cold_decompress_external_truncation_returns_err() {
     }
 }
 
-/// Windows regression: compaction closes its own destination handle before the
-/// rename (required off-NTFS, where POSIX-semantics replace is unavailable).
-/// When an external handle without FILE_SHARE_DELETE (antivirus/indexer,
-/// simulated here) still blocks the rename, the failed compaction must leave
-/// the tier fully operational — reads keep working, later appends still reach
-/// the disk file — and the next compaction succeeds once the blocker is gone.
+/// When an external handle without FILE_SHARE_DELETE (antivirus or indexer,
+/// simulated here) blocks compaction's rename, the tier stays operational
+/// (reads work, appends reach the disk file) and the next compaction succeeds
+/// once the blocker is gone.
 #[cfg(windows)]
 #[test]
 fn disk_cold_compaction_survives_blocked_rename() {
@@ -1457,16 +1388,16 @@ fn disk_cold_compaction_survives_blocked_rename() {
         cold.push_compressed(&c, n).unwrap();
     }
 
-    // Hold the destination open WITHOUT FILE_SHARE_DELETE: no rename can
-    // replace the name while this handle lives, even with POSIX semantics.
+    // Without FILE_SHARE_DELETE no rename can replace the name while this handle
+    // lives, even with POSIX semantics.
     let blocker = std::fs::OpenOptions::new()
         .read(true)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
         .open(&path)
         .unwrap();
 
-    // 6 of 10 pages dead (>50%) → compaction fires; its rename fails against
-    // the blocker. truncate_front_lines swallows the error by contract.
+    // 6 of 10 pages dead: compaction fires and its rename fails against the
+    // blocker; truncate_front_lines swallows the error.
     cold.truncate_front_lines(30);
     assert_eq!(cold.line_count(), 20);
     assert!(
@@ -1476,8 +1407,7 @@ fn disk_cold_compaction_survives_blocked_rename() {
     assert_eq!(cold.get_line(0).unwrap().unwrap().to_string(), "P6-Line0");
     assert_eq!(cold.get_line(19).unwrap().unwrap().to_string(), "P9-Line4");
 
-    // Appends after the failed compaction must land in the disk file, not
-    // silently degrade to memory-only mode.
+    // Appends after the failed compaction still reach the disk file.
     let (c, n) = create_test_page(5, "P10");
     cold.push_compressed(&c, n).unwrap();
     assert_eq!(cold.get_line(24).unwrap().unwrap().to_string(), "P10-Line4");
@@ -1499,15 +1429,10 @@ fn disk_cold_compaction_survives_blocked_rename() {
     assert_eq!(cold.get_line(24).unwrap().unwrap().to_string(), "P10-Line4");
 }
 
-// =========================================================================
-// Deferred append durability (ST-1)
-// =========================================================================
+// Deferred append durability.
 
-/// REACH GUARD (two-sided, ST-1): appends must not write the header (or
-/// fsync) per page any more. The on-disk header staying at (0, 0) while pages
-/// are appended is the observable proof the per-page barrier is gone — if a
-/// future change reintroduces an eager header write, the live-read assertion
-/// fails. The durability side is pinned by the two tests below.
+/// Appends neither write the header nor fsync per page: the on-disk header stays
+/// at (0, 0) until a barrier. The two tests below pin the durability side.
 #[test]
 fn disk_cold_append_defers_header_until_barrier() {
     let dir = tempdir().unwrap();
@@ -1520,28 +1445,25 @@ fn disk_cold_append_defers_header_until_barrier() {
         cold.push_compressed(&c1, n1).unwrap();
         cold.push_compressed(&c2, n2).unwrap();
 
-        // Header catch-up is deferred to a barrier; these small appends stay
-        // below the byte policy, so the on-disk counters still read (0, 0).
+        // These small appends stay below the byte policy: counters still (0, 0).
         let (pages_live, lines_live) = read_header_counts(&path);
         assert_eq!(pages_live, 0, "no per-append header write");
         assert_eq!(lines_live, 0, "no per-append header write");
 
-        // Reads of the appended pages work with no view at all (positional
-        // path — a freshly created store never maps).
+        // A freshly created store never maps; reads are positional.
         assert!(cold.mmap.is_none());
         assert_eq!(cold.get_line(0).unwrap().unwrap().to_string(), "P0-Line0");
         assert_eq!(cold.get_line(5).unwrap().unwrap().to_string(), "P1-Line0");
     }
-    // Drop syncs the deferred header; the closed file is fully consistent.
+    // Drop syncs the deferred header.
     let (pages, lines) = read_header_counts(&path);
     assert_eq!(pages, 2);
     assert_eq!(lines, 8);
 }
 
-/// Recovery does not depend on the deferred header at all: simulate a crash
-/// (no Drop, no sync) and reload. scan_pages rebuilds the index from page
-/// headers, so every page whose bytes reached the file is recovered even
-/// though the on-disk header still claims zero pages.
+/// Recovery does not depend on the deferred header: after a crash (no Drop, no
+/// sync) scan_pages recovers every page whose bytes reached the file, though the
+/// header still claims zero pages.
 #[test]
 fn disk_cold_crash_before_barrier_recovers_from_page_scan() {
     let dir = tempdir().unwrap();
@@ -1553,8 +1475,7 @@ fn disk_cold_crash_before_barrier_recovers_from_page_scan() {
         let (c2, n2) = create_test_page(6, "P1");
         cold.push_compressed(&c1, n1).unwrap();
         cold.push_compressed(&c2, n2).unwrap();
-        // Crash: skip Drop entirely (deliberately leaks the file handle for
-        // the remainder of the test process).
+        // Crash: skip Drop (leaks the file handle for the rest of the process).
         std::mem::forget(cold);
     }
     let (pages_stale, _) = read_header_counts(&path);
@@ -1571,14 +1492,11 @@ fn disk_cold_crash_before_barrier_recovers_from_page_scan() {
     assert_eq!(cold.get_line(9).unwrap().unwrap().to_string(), "P1-Line5");
 }
 
-/// The byte-policy barrier fires DURING a burst: after more than
-/// `SYNC_APPEND_BYTES` of compressed pages, the live on-disk header catches
-/// up with no close/sync call. Incompressible payloads make a handful of
-/// pages cross the boundary.
+/// The byte-policy barrier fires during a burst: past `SYNC_APPEND_BYTES` of
+/// compressed pages the on-disk header catches up with no close or sync call.
 #[test]
 fn disk_cold_append_barrier_fires_on_byte_policy() {
-    // LCG noise -> printable but incompressible payload, so each page's
-    // compressed size ~= its raw size and a few pages cross the 1 MiB policy.
+    // LCG noise: printable but incompressible, so compressed size ~= raw size.
     fn noise_page(lines: usize, len_per_line: usize, seed: &mut u64) -> (Vec<u8>, usize) {
         let make = |seed: &mut u64| {
             let mut s = String::with_capacity(len_per_line);
@@ -1593,7 +1511,7 @@ fn disk_cold_append_barrier_fires_on_byte_policy() {
         };
         let lines_vec: Vec<Line> = (0..lines).map(|_| Line::from(&*make(seed))).collect();
         let serialized = serialize_lines(&lines_vec);
-        let compressed = zstd::encode_all(serialized.as_slice(), 3).unwrap();
+        let compressed = crate::encode_cold_block(&serialized).unwrap();
         (compressed, lines)
     }
 
@@ -1642,13 +1560,12 @@ fn tier_of_pages(line_counts: &[u32]) -> DiskColdTier {
     cold
 }
 
-/// THE PAGE LOOKUP AND THE FRONT TRUNCATION, OVER EVERY SMALL LAYOUT: every
-/// tier of 1..=4 pages of 1..=6 lines each (1554 layouts, so every
-/// non-uniform cumulative boundary the `+1` encoding meets). `find_page`
-/// brackets every line in its page; and after `truncate_front_lines(n)` for
-/// every `n` up to the whole tier, the line count drops by `n` and, while a
-/// page survives, `front_offset` is inside the first live page — what
-/// `compact_page_trimmed`'s `&lines[trim..]` relies on.
+/// Page lookup and front truncation over every small layout: 1..=4 pages of
+/// 1..=6 lines (1554 layouts, every non-uniform cumulative boundary the `+1`
+/// encoding meets). `find_page` brackets every line in its page, and after
+/// `truncate_front_lines(n)` for every `n` the count drops by `n` and, while a
+/// page survives, `front_offset` lies inside the first live page (which
+/// `compact_page_trimmed`'s `&lines[trim..]` relies on).
 #[test]
 fn find_page_and_front_truncation_over_every_small_layout() {
     let mut layouts: Vec<Vec<u32>> = Vec::new();

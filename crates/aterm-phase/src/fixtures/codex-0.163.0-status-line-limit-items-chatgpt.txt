@@ -1,0 +1,51 @@
+# codex-cli 0.163.0 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (144x50, aterm 0.105.0) running the real Codex, launched by path with a scratch `CODEX_HOME`, a composed fake ChatGPT `auth.json` (user@example.com) and the lab provider `base_url=http://127.0.0.1:<port>/v1` with `requires_openai_auth` (a local stub of the Responses API, crates/aterm-lab) · launched with -c tui.status_line=[model-with-reasoning, five-hour-limit, weekly-limit, thread-credits]; the stub's answers carry 5h 76% used, weekly 30%, credits has=false (its account usage the same); after one turn
+⚠ Heads up, you have less than 25% of your 5h limit left. Run /status for a breakdown.
+
+
+  >_ OpenAI Codex (v0.163.0)
+     /private/tmp/at.Q7pH/proj
+
+
+› hi
+
+
+• Hi! I am the local lab stub, not a model. (reply 1)
+
+  Worked for <1s • 11:15 AM
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                            ⚠ 5h limit: 24% left · resets at 12:15 PM · /status
+
+› Ask Codex to do anything
+
+  GPT-6.1-Sol default · 5h 24% left · weekly 70% left
+  ? for shortcuts                                                                                                      ⚠ 1 warning · f2 to view

@@ -5,35 +5,23 @@
 //! Memo of materialized history rows for a scrolled-back viewport.
 //!
 //! [`Grid::visible_row_view`](crate::Grid::visible_row_view) rebuilds a whole
-//! [`MaterializedRow`](super::MaterializedRow) from the 3-tier store for any row
-//! past the live/history boundary, and the frame path
-//! ([`Terminal::cell_frame_into`]) walks every row each frame. This direct-mapped
-//! memo, keyed by the row's absolute number and held by the `Grid`, turns frames
-//! where history did not change (fades, cursor blinks, effects, selection drags)
-//! and overlapping scrolls into hits.
+//! [`MaterializedRow`](super::MaterializedRow) from the 3-tier store for every history row,
+//! and the frame path (`Terminal::cell_frame_into`) walks every row each frame. This
+//! direct-mapped memo, keyed by absolute row number, turns frames where history did not
+//! change (cursor blinks, effects, selection drags) and overlapping scrolls into hits.
 //!
-//! ## The key
+//! The whole cache is stamped with a [`HistoryEpoch`]; a mismatch drops every slot:
 //!
-//! Slots are keyed on the absolute row number, and the whole cache is stamped
-//! with a [`HistoryEpoch`]; a mismatch drops every slot.
+//! * `content_gen`: bumped once per content mutation, including paths that assign
+//!   `Damage::Full` directly (width reflow); a pure viewport change (`scroll_display`) leaves
+//!   it, so a wheel scrub keeps its hits.
+//! * `history_renumber_epoch`: bumped when history rows' absolute numbers shift (width
+//!   reflow, Kitty CSI +T unscroll; see `GridStorage::history_renumber_epoch`).
+//! * `cols` / `visible_rows`: materialization depends on width, and the slot count on height.
 //!
-//! * `content_gen`: bumped once per content mutation, including the paths that
-//!   assign `Damage::Full` directly (width reflow). It does not move on a pure
-//!   viewport change (`scroll_display`), so a wheel scrub keeps its hits.
-//! * `history_renumber_epoch`: Kitty CSI +T unscroll removes the newest
-//!   scrollback lines, shifting every older row's absolute key
-//!   (`GridStorage::history_renumber_epoch`).
-//! * `cols` / `visible_rows`: materialization is width-dependent and the slot
-//!   count is sized from the viewport.
-//!
-//! Retention eviction needs no key: it drops the oldest lines and preserves
-//! every survivor's absolute number, so an evicted row's slot is unreachable.
-//!
-//! ## The debug net
-//!
-//! Debug builds re-materialize every hit and compare it against the memo (see
-//! `Grid::materialized_history_row`), so a stale hit fails loudly. It also keeps
-//! `cfg(test)` op counts identical to a build without the cache.
+//! Retention eviction needs no key: survivors keep their absolute numbers, so an evicted
+//! row's slot is unreachable. Debug builds re-materialize every hit and compare
+//! (`Grid::materialized_history_row`), so a stale hit fails loudly.
 
 use std::cell::RefCell;
 use std::sync::Arc;
@@ -89,7 +77,6 @@ impl Inner {
         }
         self.epoch = Some(epoch);
         let capacity = capacity_for(epoch.visible_rows);
-        // `clear` + `resize_with` keeps the allocation and drops every stale `Arc`.
         self.slots.clear();
         self.slots.resize_with(capacity, || None);
     }
@@ -112,9 +99,8 @@ fn capacity_for(visible_rows: u16) -> usize {
         .clamp(MIN_SLOTS, MAX_SLOTS)
 }
 
-/// The per-`Grid` memo. Interior-mutable because the read it serves
-/// (`Grid::visible_row_view`) takes `&self`; `Grid` is already `!Sync` (its
-/// `StyleTable` is), so this adds no auto-trait change.
+/// The per-`Grid` memo. Interior-mutable because `Grid::visible_row_view` takes `&self`;
+/// `Grid` is already `!Sync` (its `StyleTable` is).
 #[derive(Debug, Default)]
 pub(in crate::grid) struct ViewportRowCache {
     inner: RefCell<Inner>,
@@ -137,9 +123,9 @@ impl ViewportRowCache {
         }
     }
 
-    /// Memoize `row` for `abs_row` under `epoch`, replacing the slot's occupant.
-    /// The borrow is never held across the materialize that produced `row`,
-    /// which keeps this `RefCell` panic-free.
+    /// Memoize `row` for `abs_row` under `epoch`, replacing the slot's occupant. The borrow
+    /// lives only inside this call, never across the materialize that produced `row`, so the
+    /// `RefCell` cannot panic.
     pub(in crate::grid) fn store(
         &self,
         epoch: HistoryEpoch,

@@ -2,11 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Tests for the OSC 1337 `File=` inline-image handler.
-//!
-//! Parsing and placement only: the engine stores an iTerm2 image undecoded, so
-//! the payload is arbitrary bytes with a PNG magic prefix, and cell-unit sizes
-//! (`width=N`) make placement deterministic.
+//! Tests for the OSC 1337 `File=` inline-image handler. The engine stores an
+//! iTerm2 image undecoded, so the payload is arbitrary bytes behind a PNG magic
+//! prefix, and cell-unit sizes (`width=N`) make placement deterministic.
 
 use super::super::Terminal;
 
@@ -204,8 +202,7 @@ fn whitespace_in_payload_is_tolerated() {
 
 #[test]
 fn large_inline_image_payload_decodes_intact() {
-    // A ~512 KiB image (~683 KiB of base64) decodes intact: the parser's OSC
-    // cap (MAX_OSC_DATA) is large enough for real inline images.
+    // A ~512 KiB image (~683 KiB of base64) fits the parser's MAX_OSC_DATA.
     let mut term = Terminal::new(10, 20);
 
     // Deterministic, non-trivial body so a truncated decode could not coincide.
@@ -240,8 +237,7 @@ fn large_inline_image_payload_decodes_intact() {
 
 #[test]
 fn single_arg_body_places_via_borrowed_payload() {
-    // No ';' in the body → the parser yields exactly two OSC params and the
-    // handler borrows both args and payload in place (zero-copy fast path).
+    // No ';' in the body: two OSC params, args and payload both borrowed.
     let mut term = Terminal::new(10, 20);
     let payload = [PNG_MAGIC, &[0u8; 16][..]].concat();
     let b64 = aterm_codec::base64::encode(&payload).expect("encode");
@@ -249,8 +245,8 @@ fn single_arg_body_places_via_borrowed_payload() {
     seq.extend_from_slice(b64.as_bytes());
     seq.extend_from_slice(b"\x1b\\");
     term.process(&seq);
-    // width/height default to Auto; the header is unreadable pixel-wise beyond
-    // the magic, so the footprint degrades to 1x1 — but it must be PLACED.
+    // width/height default to Auto and the header has no readable size, so the
+    // footprint degrades to 1x1, but it is still placed.
     assert!(image_cell_count(&term) >= 1);
 }
 
@@ -263,10 +259,10 @@ fn semicolon_after_payload_start_is_rejected() {
     assert_eq!(image_cell_count(&term), 0);
 }
 
-/// An image far taller than the screen ends in the same state text flow
-/// produces (the middle-band stamp skip in `place_image` is an optimization
-/// only). On a 10-row grid a 40-row footprint scrolls 31 times: visible row
-/// `r` (0..=8) holds footprint row `r + 31`, row 9 is blank, cursor at (9, 0).
+/// An image far taller than the screen ends as text flow would (the
+/// middle-band stamp skip is only an optimization): on a 10-row grid a 40-row
+/// footprint scrolls 31 times, so visible row `r` (0..=8) holds footprint row
+/// `r + 31`, row 9 is blank and the cursor is at (9, 0).
 #[test]
 fn tall_image_final_state_matches_text_flow() {
     let mut term = Terminal::new(10, 20);
@@ -358,11 +354,8 @@ fn one_pixel_png() -> Vec<u8> {
     png
 }
 
-/// A footprint is never taller than the screen or the tallest raster that
-/// decodes (4096 px), whichever is more, because the renderers decode a
-/// placement into one buffer of the footprint's pixel size: `height=4096`
-/// (cells) on a one-pixel PNG would ask each draw for 800 x 81,920 px, 262 MB, at
-/// this grid. A request within those bounds keeps its height.
+/// A footprint is never taller than the screen or 4096 px, whichever is more
+/// (`MAX_DECODED_IMAGE_PX`); a request within those bounds keeps its height.
 #[test]
 fn a_footprint_is_no_taller_than_the_screen_or_the_decodable_height() {
     let cell_h = 20;
@@ -404,10 +397,9 @@ fn a_footprint_is_no_taller_than_the_screen_or_the_decodable_height() {
     assert_eq!(image.map(|i| i.image.rows), Some(300));
 }
 
-/// A DECGRA-only sixel defers the raster allocation to `unhook`, bypassing the
-/// DCS stream budget. A declared 2100x2100 raster is ~17.6 MB of RGBA, over the
-/// 16 MiB `MAX_IMAGE_BYTES` cap, so `place_sixel_image` rejects it and stamps
-/// no cells.
+/// A DECGRA-only sixel allocates at `unhook`, past the DCS stream budget: a
+/// declared 2100x2100 raster (~17.6 MB of RGBA) is over `MAX_IMAGE_BYTES` and
+/// places no cells.
 #[cfg(feature = "sixel")]
 #[test]
 fn decgra_only_sixel_over_image_cap_is_rejected() {
@@ -440,11 +432,10 @@ fn live_image_bytes(term: &Terminal) -> usize {
     bytes
 }
 
-/// The images a screen shows are bounded as a whole, whatever each costs to
-/// send. A sixel declaring a 4096x20 raster (`"1;1;4096;20`, no pixel data)
-/// takes the rest of its row, so placing one a column further right each time
-/// leaves every one of them a cell, and its whole 320 KiB raster, on screen:
-/// 1,840 of them, 65 KB of output, would hold 603 MB without a screen budget.
+/// A screen's images are bounded as a whole: each sixel declaring a 4096x20
+/// raster (no pixel data) takes the rest of its row, so placing one a column
+/// further right each time leaves every one a cell, and its 320 KiB raster, on
+/// screen.
 #[cfg(feature = "sixel")]
 #[test]
 fn a_screen_of_sixels_keeps_its_images_within_the_live_budget() {
@@ -471,11 +462,10 @@ fn a_screen_of_sixels_keeps_its_images_within_the_live_budget() {
     );
 }
 
-/// Each screen's images are bounded, however a program moves between them. A
-/// count sees only the active grid, so one charge shared by both screens would
-/// be reset by a sixel on the near-empty alternate screen (mode 47 keeps both
-/// buffers), and the parked main screen never counted again: hopping over after
-/// every placement, it would hold all 1,840 rasters, 603 MB.
+/// Each screen's images are bounded however a program moves between them: a
+/// count sees only the active grid, so a charge shared by both screens would be
+/// reset by a sixel on the near-empty alternate screen (mode 47 keeps both
+/// buffers) and the parked main screen never counted again.
 #[cfg(feature = "sixel")]
 #[test]
 fn each_screen_keeps_its_images_within_the_live_budget() {

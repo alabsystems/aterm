@@ -19,12 +19,14 @@
 
 use crate::brecord::{BrokerRecord, GroupCommit};
 use crate::proto::{
-    append_delivery_frame, append_frame, decode_request, decode_response, encode_replicate,
-    encode_response, read_frame, write_frame, Request, Response,
+    append_delivery_frame, append_frame, decode_request, decode_response, encode_protocol_refusal,
+    encode_replicate, encode_response, read_frame, write_frame, Request, Response,
+    CAP_EXPIRED_PREFIX, ERR_BAD_FILTER, ERR_BAD_SUBJECT, ERR_RECORD_REFUSED, ERR_REFUSED,
+    ERR_SUBJECT_BOUND, ERR_TOO_MANY_CONNS, ERR_UNAUTHORIZED, PROTO_VERSION,
 };
 use crate::store::{
     is_hidden_subject, replicated_reserved_msg, reserved_msg, BrokerLog, Durability,
-    InjectedFaults, StageErr, WillRecord, COMMIT_SUBJECT,
+    InjectedFaults, StageErr, WillRecord, COMMIT_SUBJECT, MAX_SUBJECTS_PER_PRODUCER,
 };
 use astream_wire::{Filter, Offset, Subject};
 use std::collections::HashMap;
@@ -78,9 +80,18 @@ struct WriteOp {
     ack: Sender<AckResult>,
 }
 
-/// `Ok((offset, deduped))` once durable, or `Err(message)` if the op or its batch
+/// `Ok((offset, deduped))` once durable, or `Err(refusal)` if the op or its batch
 /// failed (e.g. the batch fsync errored — the record is then NOT durable).
-type AckResult = Result<(u64, bool), String>;
+type AckResult = Result<(u64, bool), Refusal>;
+
+/// A refusal on its way to the wire: the `Response::Error` code (the
+/// `proto::ERR_*` table: whether resending can ever land) and the message.
+type Refusal = (u8, String);
+
+/// The [`Refusal`] for `code` and `msg`.
+fn refusal(code: u8, msg: impl Into<String>) -> Refusal {
+    (code, msg.into())
+}
 
 enum WriteKind {
     Publish {
@@ -102,9 +113,10 @@ enum WriteKind {
         upto: u64,
     },
     /// A record shipped by a leader, to be appended at exactly its leader offset
-    /// (see [`Request::Replicate`]).
+    /// (see [`Request::Replicate`]), with the leader's log identity when it sent one.
     Replicate {
         rec: BrokerRecord,
+        leader: Option<crate::LogIdentity>,
     },
     /// Bind a producer id to the principal a capability names, durably (a hidden
     /// `/a/bind` record). Checked and appended under the writer's lock, so two
@@ -205,9 +217,10 @@ fn stream_write_timeout(shared: &Shared) -> Duration {
 ///
 /// The bound is applied on every transport, including the sealed one whose handshake
 /// has already proved the peer holds the key: an idle keyed client is reaped too.
-/// Lifted once the first frame is in (guarded: once a capability is accepted): an
-/// established, idle producer is reaped by shutdown's force-close instead, not by a
-/// timer. Tunable per broker via [`Broker::set_first_frame_timeout`].
+/// Lifted once the first frame is in (guarded: once a capability is accepted). From
+/// then on an established, idle connection is read with no deadline — unless its
+/// client KEEPS ALIVE ([`KEEPALIVE_DEADLINE`]); one that never does is reaped only by
+/// shutdown's force-close. Tunable per broker via [`Broker::set_first_frame_timeout`].
 pub const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How many capabilities one connection's KEYRING may hold. A connection presents
@@ -256,8 +269,8 @@ fn end_lapsed<S: Write>(stream: &mut S, out: &mut Vec<u8>, until: u64, now: u64)
     append_frame(
         out,
         &encode_response(&Response::Error {
-            code: 5,
-            msg: format!("unauthorized: capability expired at {until} (now {now}, unix ms)"),
+            code: ERR_UNAUTHORIZED,
+            msg: format!("{CAP_EXPIRED_PREFIX} at {until} (now {now}, unix ms)"),
         }),
     )?;
     flush_egress(stream, out)
@@ -436,6 +449,57 @@ fn connectable_addr(addr: SocketAddr) -> String {
 /// still wakes the tail immediately via the `Condvar`.
 const LIVENESS_POLL: Duration = Duration::from_millis(200);
 
+/// How long a CAUGHT-UP subscription (`Subscribe`, `SubscribeGroup`) that opted in
+/// with [`Request::IdleMarks`] may go with
+/// nothing written to it before the broker writes a `Mark { next, head }` — the
+/// existing "resume from `next`; `head` is the visible head" frame, which
+/// `Subscription::recv` skips — so a live idle subscription is never silent for
+/// longer than this, and a subscriber that hears nothing for several of these is on
+/// a dead link (`Subscription::recv_live` turns that into an error). The tail also
+/// marks once the moment it first catches up. A wire FRAME, never a log record: it
+/// costs the log nothing, and a write that fails reaps a vanished subscriber the
+/// read probe alone could not. Overridable per broker with [`Broker::set_idle_mark`].
+pub const IDLE_MARK: Duration = Duration::from_secs(10);
+
+/// The read deadline a subscriber arms on the broker's idle marks
+/// (`Subscription::recv_live`): three [`IDLE_MARK`]s, so a mark delayed by a loaded
+/// broker is not a dead link, and a link that IS dead is an error inside half a
+/// minute rather than never.
+pub const IDLE_MARK_DEADLINE: Duration = Duration::from_secs(30);
+
+/// How long a REQUEST/REPLY connection over TCP that keeps alive may go with nothing
+/// read from it before the broker ends it — the request-side twin of
+/// [`IDLE_MARK_DEADLINE`], and the only bound on a peer that vanished without a FIN.
+///
+/// The broker writes to a request/reply connection only to answer it, so a peer that
+/// lost power, or whose path died while the link was idle (a NAT or Wi-Fi change, a
+/// cable pull, a laptop asleep past its NAT mapping), leaves the connection thread
+/// parked in a read that nothing ends: no OS timer runs on an idle socket with no
+/// keepalive, and std offers none to set. Until the broker restarted, its will never
+/// fired and its [`MAX_CONNS`] slot, thread and fd were never freed. A client that
+/// sends [`Request::Keepalive`] asks to be held to this deadline instead: from its
+/// first one, every read on the connection is bounded by it, and a connection silent
+/// that long is ended exactly as a closed one is — `handle_conn` fires its will
+/// (fenced as ever: a later incarnation's record still suppresses it) and its slot is
+/// freed.
+///
+/// OPT-IN BY CONSTRUCTION. The deadline is armed by the client's first `Keepalive`,
+/// so a client that never sends one — every client that predates the verb, idling
+/// for hours on a quiet link — is never cut. A Unix-socket connection is never held
+/// to it: its peer cannot vanish without its kernel closing the socket (a dead
+/// process is an EOF, and a dead host took this broker with it), so a deadline there
+/// could only ever cut a live peer that stalled.
+///
+/// Three [`KEEPALIVE_INTERVAL`]s, so a keepalive delayed by a loaded client is not a
+/// dead link. Overridable per broker with [`Broker::set_keepalive_deadline`].
+pub const KEEPALIVE_DEADLINE: Duration = Duration::from_secs(60);
+
+/// How often a client that keeps a TCP connection alive sends a [`Request::Keepalive`]
+/// when it has sent nothing else (`Client::keepalive_if_idle`): a third of
+/// [`KEEPALIVE_DEADLINE`]. A wire frame, never a log record — it costs the log nothing
+/// and reaches no subscriber, so it is not the heartbeat the fabric design rules out.
+pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
+
 /// How long ONE liveness probe may block reading the subscriber's socket. The probe
 /// is a timed `read` (see `peer_gone`), and while the tail sits in it a publish's
 /// `Condvar` wakeup finds nobody waiting — the record waits out the probe instead.
@@ -478,13 +542,52 @@ struct Shared {
     write_timeout_ms: AtomicU64,
     /// [`MAX_CONNS`] ([`Broker::set_max_conns`]).
     max_conns: AtomicUsize,
+    /// [`IDLE_MARK`], in milliseconds ([`Broker::set_idle_mark`]).
+    idle_mark_ms: AtomicU64,
+    /// [`KEEPALIVE_DEADLINE`], in milliseconds ([`Broker::set_keepalive_deadline`]).
+    keepalive_deadline_ms: AtomicU64,
     /// Connections refused at the cap that are still lingering (`linger_refused`).
     refusing: AtomicUsize,
-    /// [`Broker::on_last_scan_round`]: the test seam fired at each `last_page` round
+    /// [`Broker::pause_last_scan_round`]: the test seam taken at one `last_page` round
     /// boundary. `None` — and one uncontended lock per boundary, never per record —
     /// unless a test installs one.
-    #[allow(clippy::type_complexity)]
-    last_round_hook: Mutex<Option<Arc<dyn Fn(usize) + Send + Sync>>>,
+    ///
+    /// A closed rendezvous, not a caller-supplied `dyn Fn`: a `dyn` callback stored here
+    /// is an open principal for Trust's thread-spawn census (an out-of-sight caller
+    /// could install a closure that spawns), which marked every indirect-call pool in
+    /// the crate "may spawn" — `ConnGuard::drop` included.
+    last_round_pause: Mutex<Option<RoundPause>>,
+}
+
+/// The broker side of a [`Broker::pause_last_scan_round`] rendezvous.
+struct RoundPause {
+    /// The round whose trailing boundary pauses.
+    round: usize,
+    /// Signalled when the walk reaches that boundary.
+    reached: Sender<()>,
+    /// The walk resumes when this yields (or its sender is gone).
+    resume: Receiver<()>,
+}
+
+/// The test side of [`Broker::pause_last_scan_round`]: wait for the `Last` walk to reach
+/// the round boundary, act in the window, then [`resume`](Self::resume) it. Dropping the
+/// handle also resumes the walk, so a panicking test never wedges the broker.
+pub struct LastRoundPause {
+    reached: Receiver<()>,
+    resume: Sender<()>,
+}
+
+impl LastRoundPause {
+    /// Block until a `Last` walk is paused at the boundary. `false` if the broker went
+    /// away without ever reaching it.
+    pub fn wait(&self) -> bool {
+        self.reached.recv().is_ok()
+    }
+
+    /// Let the paused walk continue.
+    pub fn resume(self) {
+        let _ = self.resume.send(());
+    }
 }
 
 /// Leader-side replication for the Replicated durability tier. Each follower link
@@ -511,6 +614,10 @@ struct Replicator {
 
 /// One follower's replication link, driven only by the writer thread.
 struct FollowerLink {
+    /// The leader's own [`LogIdentity`](crate::LogIdentity), sent beside every record
+    /// so the follower — a replica of exactly these offsets — reports it too. Fixed
+    /// for the leader's life: a log a broker owns changes identity only at an open.
+    leader: crate::LogIdentity,
     addr: String,
     /// `None` while the link is down (dropped after an I/O error / timeout); it is
     /// re-established on the next batch. A per-record REFUSAL from the follower (a
@@ -595,6 +702,7 @@ impl FollowerLink {
                 &r.subject,
                 &r.body,
                 r.commit.as_ref().map(|c| (c.group.as_str(), c.upto)),
+                Some(&self.leader),
             );
             write_frame(stream, &payload)?;
         }
@@ -979,8 +1087,10 @@ impl Broker {
             first_frame_timeout_ms: AtomicU64::new(FIRST_FRAME_TIMEOUT.as_millis() as u64),
             write_timeout_ms: AtomicU64::new(ACK_WRITE_TIMEOUT.as_millis() as u64),
             max_conns: AtomicUsize::new(MAX_CONNS),
+            idle_mark_ms: AtomicU64::new(IDLE_MARK.as_millis() as u64),
+            keepalive_deadline_ms: AtomicU64::new(KEEPALIVE_DEADLINE.as_millis() as u64),
             refusing: AtomicUsize::new(0),
-            last_round_hook: Mutex::new(None),
+            last_round_pause: Mutex::new(None),
         });
         let w_shared = shared.clone();
         let writer = thread::spawn(move || writer_loop(&w_shared, rx));
@@ -1124,6 +1234,7 @@ impl Broker {
                 }
             };
             links.push(FollowerLink {
+                leader: log.identity(),
                 addr: addr.clone(),
                 stream,
                 upto: base,
@@ -1167,6 +1278,13 @@ impl Broker {
     /// takes).
     pub fn head(&self) -> u64 {
         self.shared.log.lock().unwrap().head().0
+    }
+
+    /// The [`LogIdentity`](crate::LogIdentity) of the log this broker serves — what
+    /// it tells every client in the answer to `Hello` (on a replica, its leader's once
+    /// a replicated batch carrying it has committed and reached its newest record).
+    pub fn log_identity(&self) -> crate::LogIdentity {
+        self.shared.log.lock().unwrap().identity()
     }
 
     /// The SUBSCRIBER-VISIBLE head. Equal to [`head`](Self::head) in the Strict and
@@ -1218,17 +1336,52 @@ impl Broker {
         self.shared.max_conns.store(max, Ordering::Relaxed);
     }
 
-    /// Run `hook` at every `Last` SCAN-ROUND BOUNDARY: after a round has added its
-    /// rows, before the next round re-takes the log lock — the exact window a
-    /// concurrent publisher gets. The argument is the index of the round that just
-    /// finished.
+    /// Override how long an opted-in caught-up subscription goes with nothing written before
+    /// the broker marks it (default [`IDLE_MARK`], 10 s). A parked tail looks at the
+    /// clock once per liveness poll (200 ms), so that is the finest interval served.
+    /// Applies to subscriptions opened after the call.
+    pub fn set_idle_mark(&self, interval: Duration) {
+        self.shared.idle_mark_ms.store(
+            interval.as_millis().clamp(1, u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Override how long a TCP connection that keeps alive may go with nothing read
+    /// from it before the broker ends it, firing its will (default
+    /// [`KEEPALIVE_DEADLINE`], 60 s). Keep it a few times the interval clients keep
+    /// alive at ([`KEEPALIVE_INTERVAL`]): shorter than that cuts live clients. Applies
+    /// to connections whose first [`Request::Keepalive`] arrives after the call.
+    pub fn set_keepalive_deadline(&self, deadline: Duration) {
+        self.shared.keepalive_deadline_ms.store(
+            deadline.as_millis().clamp(1, u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Pause the next `Last` walk at the SCAN-ROUND BOUNDARY after round `round`:
+    /// after that round has added its rows, before the next round re-takes the log
+    /// lock — the exact window a concurrent publisher gets. One-shot: the first walk
+    /// to reach that boundary takes the pause.
     ///
-    /// A test hook; inert unless called. It exists so a test can OCCUPY that window
-    /// instead of racing for it — the hook runs on the connection's own thread with
-    /// the log lock released, so it may publish through a second connection and block
-    /// on the ack, and the walk does not resume until it returns.
-    pub fn on_last_scan_round(&self, hook: impl Fn(usize) + Send + Sync + 'static) {
-        *self.shared.last_round_hook.lock().unwrap() = Some(Arc::new(hook));
+    /// A test seam; inert unless called. It exists so a test can OCCUPY that window
+    /// instead of racing for it — the walk's connection thread stops there with the log
+    /// lock released, so another thread may [`wait`](LastRoundPause::wait) for it,
+    /// publish through a second connection and block on the ack, and the walk does not
+    /// resume until that thread [`resume`](LastRoundPause::resume)s it (or drops the
+    /// handle).
+    pub fn pause_last_scan_round(&self, round: usize) -> LastRoundPause {
+        let (reached_tx, reached_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        *self.shared.last_round_pause.lock().unwrap() = Some(RoundPause {
+            round,
+            reached: reached_tx,
+            resume: resume_rx,
+        });
+        LastRoundPause {
+            reached: reached_rx,
+            resume: resume_tx,
+        }
     }
 
     /// Bind the Unix socket at `socket_path` and start accepting clients. Returns a
@@ -1289,7 +1442,7 @@ impl Broker {
                         // A spawn that fails (thread exhaustion) drops this socket and
                         // keeps accepting — `thread::spawn` would panic the acceptor.
                         let _ = thread::Builder::new().spawn(move || {
-                            let _ = handle_conn(&sh, s);
+                            let _ = handle_conn(&sh, s, Wire::Unix);
                         });
                     }
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -1475,7 +1628,7 @@ impl Broker {
                             // drops with the Err.
                             if let Ok(stream) = wrapped {
                                 let _ = stream.set_read_timeout(None);
-                                let _ = handle_conn(&sh, stream);
+                                let _ = handle_conn(&sh, stream, Wire::Tcp);
                             }
                         });
                     }
@@ -1566,8 +1719,9 @@ impl BrokerHandle {
     }
 
     /// Stop accepting, wake parked subscribers so they observe shutdown and exit,
-    /// force-close every live connection (connection threads have no idle timeout —
-    /// this is what reaps them), join the acceptor and the writer, release the log's
+    /// force-close every live connection (a connection thread has no idle timeout
+    /// unless its client keeps alive, [`KEEPALIVE_DEADLINE`] — this is what reaps the
+    /// rest), join the acceptor and the writer, release the log's
     /// file lock, and clean up the endpoint. Bounded even with a wedged follower or a
     /// silent client: nothing here waits on a peer.
     pub fn shutdown(&mut self) {
@@ -1615,14 +1769,25 @@ impl Drop for BrokerHandle {
     }
 }
 
+/// Which listener accepted a connection: what decides whether a [`Request::Keepalive`]
+/// holds it to [`KEEPALIVE_DEADLINE`] (TCP, sealed or not) or to nothing (a Unix
+/// socket, whose peer cannot vanish without its kernel closing it).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Wire {
+    #[cfg_attr(not(unix), allow(dead_code))]
+    Unix,
+    Tcp,
+}
+
 /// Serve one connection, then FIRE its registered will (if any) on ANY return — a
-/// clean EOF, an I/O error, a shutdown force-close, or a panic-free early exit alike.
+/// clean EOF, an I/O error (a keepalive deadline passing among them), a shutdown
+/// force-close, or a panic-free early exit alike.
 /// The connection thread does not wait for the ack: the will is already durable as a
 /// hidden `/a/will` record, so the worst a lost firing costs is that the broker's next
 /// open fires it instead.
-fn handle_conn<S: Stream>(shared: &Arc<Shared>, stream: S) -> io::Result<()> {
+fn handle_conn<S: Stream>(shared: &Arc<Shared>, stream: S, wire: Wire) -> io::Result<()> {
     let mut will: Option<WillRecord> = None;
-    let res = serve_conn(shared, stream, &mut will);
+    let res = serve_conn(shared, stream, wire, &mut will);
     if let Some(will) = will.take() {
         fire_will(shared, will);
     }
@@ -1643,15 +1808,15 @@ fn handle_conn<S: Stream>(shared: &Arc<Shared>, stream: S) -> io::Result<()> {
 /// signal is the writer DROPPING the op: when `writer_loop` returns it drops the
 /// receiver, every queued `WriteOp` with it, and every ack `Sender` those held —
 /// which is exactly `Disconnected` here.
-fn submit_blocking(shared: &Arc<Shared>, kind: WriteKind) -> Result<(u64, bool), String> {
+fn submit_blocking(shared: &Arc<Shared>, kind: WriteKind) -> AckResult {
     let (tx, rx) = mpsc::channel();
     if shared.writes.send(WriteOp { kind, ack: tx }).is_err() {
-        return Err("broker is stopping".to_string());
+        return Err(refusal(ERR_REFUSED, "broker is stopping"));
     }
     match rx.recv() {
         Ok(res) => res,
         // The writer is gone and took this op with it, unacked and uncommitted.
-        Err(mpsc::RecvError) => Err("broker is stopping".to_string()),
+        Err(mpsc::RecvError) => Err(refusal(ERR_REFUSED, "broker is stopping")),
     }
 }
 
@@ -1667,9 +1832,10 @@ fn fire_will(shared: &Arc<Shared>, will: WillRecord) {
     });
 }
 
-/// Let a client refused at the connection cap READ its refusal. Closing at once loses
-/// it: a client whose first request lands after the close gets a broken pipe (Unix)
-/// and one whose request is still unread when the socket closes gets a reset (TCP).
+/// Let a client refused at the connection cap — or for speaking another protocol —
+/// READ its refusal. Closing at once loses it: a client whose first request lands after
+/// the close gets a broken pipe (Unix) and one whose request is still unread when the
+/// socket closes gets a reset (TCP).
 /// So the refused socket shuts only its write half (the client reads the error, then
 /// EOF) and stays open for up to [`REFUSAL_LINGER`], reading and discarding input
 /// until the client closes; at most [`MAX_LINGERING_REFUSALS`] do so at once, and past
@@ -1725,6 +1891,7 @@ impl<S: Stream> Read for Deadlined<'_, S> {
 fn serve_conn<S: Stream>(
     shared: &Arc<Shared>,
     mut stream: S,
+    wire: Wire,
     will: &mut Option<WillRecord>,
 ) -> io::Result<()> {
     // Register a shutdown handle so BrokerHandle::shutdown can force-close this socket
@@ -1742,7 +1909,7 @@ fn serve_conn<S: Stream>(
             let _ = write_frame(
                 &mut stream,
                 &encode_response(&Response::Error {
-                    code: 6,
+                    code: ERR_TOO_MANY_CONNS,
                     msg: format!("too many connections (limit {max_conns})"),
                 }),
             );
@@ -1808,6 +1975,9 @@ fn serve_conn<S: Stream>(
     // handed one out. Kept on the DEFAULT build too, because `Hello` is answered by an
     // unguarded broker as well — one client works against either.
     let mut nonce: Option<[u8; 32]> = None;
+    // Legacy clients never ask: their recv skips marks, which would reset the
+    // socket timeout an old take/drain uses to stop on idle.
+    let mut idle_marks = false;
     loop {
         // Guarded, the deadline is ABSOLUTE; unguarded, the socket timeout set above
         // bounds each read of the first frame.
@@ -1834,7 +2004,7 @@ fn serve_conn<S: Stream>(
                     let _ = write_frame(
                         &mut stream,
                         &encode_response(&Response::Error {
-                            code: 5,
+                            code: ERR_UNAUTHORIZED,
                             msg: format!(
                                 "unauthorized: no capability attached within {} ms of connecting",
                                 preauth_timeout.as_millis()
@@ -1854,8 +2024,25 @@ fn serve_conn<S: Stream>(
         }
         let req = match decode_request(&payload) {
             Some(r) => r,
+            // ANOTHER PROTOCOL: say so in the one layout every version reads, stamped
+            // with the peer's own version byte (`encode_protocol_refusal`), and close.
+            // A "malformed request" here would be stamped with OURS, which the peer's
+            // decoder refuses at its first byte — a broker that answered and was read
+            // as a garbled stream. Nothing more the peer sends is decodable, so the
+            // connection ends; the linger lets the refusal be read rather than reset
+            // away by frames the peer pipelined behind it.
+            None if payload.first().is_some_and(|&v| v != PROTO_VERSION) => {
+                finish_pipe(&mut pipe)?;
+                let _ = write_frame(&mut stream, &encode_protocol_refusal(payload[0]));
+                linger_refused(shared, &mut stream);
+                return Ok(());
+            }
             None => {
-                if !emit(&mut stream, &mut pipe, Err("malformed request".into()))? {
+                if !emit(
+                    &mut stream,
+                    &mut pipe,
+                    Err(refusal(ERR_REFUSED, "malformed request")),
+                )? {
                     break;
                 }
                 continue;
@@ -1863,7 +2050,11 @@ fn serve_conn<S: Stream>(
         };
         // Bounded names, before anything (the capability gate included) parses one.
         if let Some(err) = oversized_name(&req) {
-            if !emit(&mut stream, &mut pipe, Err(err))? {
+            if !emit(
+                &mut stream,
+                &mut pipe,
+                Err(refusal(ERR_RECORD_REFUSED, err)),
+            )? {
                 break;
             }
             continue;
@@ -1875,9 +2066,16 @@ fn serve_conn<S: Stream>(
         if matches!(req, Request::Hello) {
             finish_pipe(&mut pipe)?;
             let n = *nonce.insert(fresh_nonce());
+            // The log's identity rides the answer every client already asks for, so a
+            // client that kept offsets can check them before it uses one. Read now,
+            // not at open: a replica adopts its leader's.
+            let log = Some(shared.log.lock().unwrap().identity());
             write_frame(
                 &mut stream,
-                &encode_response(&Response::Nonce { nonce: n.to_vec() }),
+                &encode_response(&Response::Nonce {
+                    nonce: n.to_vec(),
+                    log,
+                }),
             )?;
             continue;
         }
@@ -1913,7 +2111,7 @@ fn serve_conn<S: Stream>(
                             resume: String::new(),
                         }
                     }
-                    Err(msg) => Response::Error { code: 5, msg },
+                    Err((code, msg)) => Response::Error { code, msg },
                 };
                 write_frame(&mut stream, &encode_response(&resp))?;
                 continue;
@@ -1924,22 +2122,19 @@ fn serve_conn<S: Stream>(
                 // capability that expires while a connection is open stops
                 // authorizing its next request, and a stream it admitted ends at
                 // the deadline (`until`).
-                Some(secret) => match cap_authorized_until(secret, &keyring, &req, now_unix_ms()) {
-                    Some(until) => until,
-                    None => {
-                        if !emit(
-                            &mut stream,
-                            &mut pipe,
-                            Err(
-                                "unauthorized: capability does not grant this subject/filter"
-                                    .into(),
-                            ),
-                        )? {
-                            break;
+                Some(secret) => {
+                    let now = now_unix_ms();
+                    match cap_authorized_until(secret, &keyring, &req, now) {
+                        Some(until) => until,
+                        None => {
+                            let why = ungranted(secret, &keyring, &req, now);
+                            if !emit(&mut stream, &mut pipe, Err(refusal(ERR_UNAUTHORIZED, why)))? {
+                                break;
+                            }
+                            continue;
                         }
-                        continue;
                     }
-                },
+                }
             }
         };
         #[cfg(not(feature = "cap"))]
@@ -2005,8 +2200,8 @@ fn serve_conn<S: Stream>(
                 group,
                 upto,
             } => {
-                if let Some(err) = publish_subject_error(&out_subject) {
-                    if !emit(&mut stream, &mut pipe, Err(format!("output {err}")))? {
+                if let Some((code, err)) = publish_subject_error(&out_subject) {
+                    if !emit(&mut stream, &mut pipe, Err((code, format!("output {err}"))))? {
                         break;
                     }
                     continue;
@@ -2034,6 +2229,7 @@ fn serve_conn<S: Stream>(
                 subject,
                 body,
                 commit,
+                leader,
             } => {
                 // The follower does not trust the wire. The subject must be valid,
                 // and EVERY hidden subject is guarded:
@@ -2071,11 +2267,19 @@ fn serve_conn<S: Stream>(
                     log.is_replica() || log.head().0 == 0
                 };
                 let err = if Subject::new(subject.as_str()).is_err() {
-                    Some(format!("bad subject {subject:?}"))
+                    Some(refusal(ERR_BAD_SUBJECT, format!("bad subject {subject:?}")))
                 } else if subject == COMMIT_SUBJECT {
-                    (!pure_commit).then(|| format!("reserved subject {COMMIT_SUBJECT}"))
+                    (!pure_commit).then(|| {
+                        refusal(
+                            ERR_RECORD_REFUSED,
+                            format!("reserved subject {COMMIT_SUBJECT}"),
+                        )
+                    })
                 } else if is_hidden_subject(&subject) && !replica_shape() {
-                    Some(replicated_reserved_msg(&subject))
+                    Some(refusal(
+                        ERR_RECORD_REFUSED,
+                        replicated_reserved_msg(&subject),
+                    ))
                 } else {
                     None
                 };
@@ -2093,7 +2297,12 @@ fn serve_conn<S: Stream>(
                     body,
                     commit: commit.map(|(group, upto)| GroupCommit { group, upto }),
                 };
-                if !emit_op(shared, &mut stream, &mut pipe, WriteKind::Replicate { rec })? {
+                if !emit_op(
+                    shared,
+                    &mut stream,
+                    &mut pipe,
+                    WriteKind::Replicate { rec, leader },
+                )? {
                     break;
                 }
             }
@@ -2108,14 +2317,14 @@ fn serve_conn<S: Stream>(
                         write_frame(
                             &mut stream,
                             &encode_response(&Response::Error {
-                                code: 3,
+                                code: ERR_BAD_FILTER,
                                 msg: format!("bad filter {filter:?}"),
                             }),
                         )?;
                         return Ok(());
                     }
                 };
-                return tail_loop(shared, &mut stream, from_offset, filt, until);
+                return tail_loop(shared, &mut stream, from_offset, filt, until, idle_marks);
             }
             Request::ForkSubscribe {
                 fork_at,
@@ -2124,11 +2333,11 @@ fn serve_conn<S: Stream>(
                 filter,
             } => {
                 finish_pipe(&mut pipe)?;
-                if let Some(err) = publish_subject_error(&replacement_subject) {
+                if let Some((code, err)) = publish_subject_error(&replacement_subject) {
                     write_frame(
                         &mut stream,
                         &encode_response(&Response::Error {
-                            code: 2,
+                            code,
                             msg: format!("replacement {err}"),
                         }),
                     )?;
@@ -2140,7 +2349,7 @@ fn serve_conn<S: Stream>(
                         write_frame(
                             &mut stream,
                             &encode_response(&Response::Error {
-                                code: 3,
+                                code: ERR_BAD_FILTER,
                                 msg: format!("bad filter {filter:?}"),
                             }),
                         )?;
@@ -2229,7 +2438,7 @@ fn serve_conn<S: Stream>(
                         write_frame(
                             &mut stream,
                             &encode_response(&Response::Error {
-                                code: 3,
+                                code: ERR_BAD_FILTER,
                                 msg: format!("bad filter {filter:?}"),
                             }),
                         )?;
@@ -2241,7 +2450,7 @@ fn serve_conn<S: Stream>(
                     let log = shared.log.lock().unwrap();
                     log.group_start(&group)
                 };
-                return tail_loop(shared, &mut stream, start.0, filt, until);
+                return tail_loop(shared, &mut stream, start.0, filt, until, idle_marks);
             }
             Request::Last { filter, after, max } => {
                 // Answered IN THE REQUEST LOOP: the connection stays usable, so a
@@ -2255,7 +2464,7 @@ fn serve_conn<S: Stream>(
                         if !emit(
                             &mut stream,
                             &mut pipe,
-                            Err(format!("bad filter {filter:?}")),
+                            Err(refusal(ERR_BAD_FILTER, format!("bad filter {filter:?}"))),
                         )? {
                             break;
                         }
@@ -2283,7 +2492,7 @@ fn serve_conn<S: Stream>(
                 let (page, resume, head) = match last_page(shared, &filt, &after, want) {
                     Ok(v) => v,
                     Err(msg) => {
-                        if !emit(&mut stream, &mut pipe, Err(msg))? {
+                        if !emit(&mut stream, &mut pipe, Err(refusal(ERR_REFUSED, msg)))? {
                             break;
                         }
                         continue;
@@ -2312,10 +2521,10 @@ fn serve_conn<S: Stream>(
                 // Answered in the request loop, like `Last`/`Fetch`: the connection
                 // stays usable and the client learns the head from the `Mark`.
                 finish_pipe(&mut pipe)?;
-                if let Some(err) = publish_subject_error(&subject) {
+                if let Some((code, msg)) = publish_subject_error(&subject) {
                     write_frame(
                         &mut stream,
-                        &encode_response(&Response::Error { code: 5, msg: err }),
+                        &encode_response(&Response::Error { code, msg }),
                     )?;
                     continue;
                 }
@@ -2331,7 +2540,7 @@ fn serve_conn<S: Stream>(
                     write_frame(
                         &mut stream,
                         &encode_response(&Response::Error {
-                            code: 5,
+                            code: ERR_RECORD_REFUSED,
                             msg: format!(
                                 "this connection already holds a will for producer {}: a second \
                                  Will replaces the first, and replacement is durable only under \
@@ -2360,7 +2569,7 @@ fn serve_conn<S: Stream>(
                 // the NEXT OPEN, for a producer that believes it registered nothing.
                 // `process_batch` acks a `WillRegister` on its own local commit for
                 // exactly that reason.
-                if let Err(msg) = submit_blocking(
+                if let Err((code, msg)) = submit_blocking(
                     shared,
                     WriteKind::WillRegister {
                         will: candidate.clone(),
@@ -2369,7 +2578,7 @@ fn serve_conn<S: Stream>(
                     write_frame(
                         &mut stream,
                         &encode_response(&Response::Error {
-                            code: 5,
+                            code,
                             msg: format!("will was not persisted: {msg}"),
                         }),
                     )?;
@@ -2383,6 +2592,58 @@ fn serve_conn<S: Stream>(
                         next: head,
                         head,
                         resume: String::new(),
+                    }),
+                )?;
+            }
+            Request::Keepalive => {
+                // Answered in the request loop, like `Will`, after the pending acks.
+                // From here on every read on a TCP connection is bounded by the
+                // keepalive deadline — SO_RCVTIMEO is per read, so each frame that
+                // arrives re-arms it — and a read that runs it out returns from this
+                // function like any I/O error: the will fires and the slot is freed
+                // (KEEPALIVE_DEADLINE). Nothing is written first: a peer silent past
+                // its own promise is presumed gone, and a write could only park.
+                finish_pipe(&mut pipe)?;
+                if wire == Wire::Tcp {
+                    let deadline =
+                        Duration::from_millis(shared.keepalive_deadline_ms.load(Ordering::Relaxed));
+                    let _ = stream.set_read_timeout(Some(deadline));
+                }
+                let head = shared.head.load(Ordering::Relaxed);
+                write_frame(
+                    &mut stream,
+                    &encode_response(&Response::Mark {
+                        next: head,
+                        head,
+                        resume: String::new(),
+                    }),
+                )?;
+            }
+            Request::IdleMarks => {
+                finish_pipe(&mut pipe)?;
+                idle_marks = true;
+                let head = shared.head.load(Ordering::Relaxed);
+                write_mark(&mut stream, head, head)?;
+            }
+            Request::Budget { producer_id } => {
+                // Answered in the request loop after the pending acks, so a count read
+                // right after this connection's own publishes includes them. Read under
+                // the log lock, where the writer stages and commits a whole batch, so
+                // the count is never one a half-promoted batch is still moving.
+                finish_pipe(&mut pipe)?;
+                let (subjects, reserved) = {
+                    let log = shared.log.lock().unwrap();
+                    (
+                        log.subjects_per_producer(producer_id),
+                        log.will_reserved_subjects(producer_id),
+                    )
+                };
+                write_frame(
+                    &mut stream,
+                    &encode_response(&Response::Budget {
+                        subjects: subjects as u64,
+                        reserved: reserved as u64,
+                        max: MAX_SUBJECTS_PER_PRODUCER as u64,
                     }),
                 )?;
             }
@@ -2401,7 +2662,7 @@ fn serve_conn<S: Stream>(
                         if !emit(
                             &mut stream,
                             &mut pipe,
-                            Err(format!("bad filter {filter:?}")),
+                            Err(refusal(ERR_BAD_FILTER, format!("bad filter {filter:?}"))),
                         )? {
                             break;
                         }
@@ -2440,12 +2701,12 @@ fn serve_conn<S: Stream>(
 /// Why a client-chosen subject cannot be appended to: not a valid `Subject`, or the
 /// broker-internal commit subject (a record there would bypass exactly-once dedup
 /// and never be delivered — consumer-group commits go through `Commit` /
-/// `ProcessAndProduce`).
-fn publish_subject_error(subject: &str) -> Option<String> {
+/// `ProcessAndProduce`). Either is permanent.
+fn publish_subject_error(subject: &str) -> Option<Refusal> {
     if Subject::new(subject).is_err() {
-        Some(format!("bad subject {subject:?}"))
+        Some(refusal(ERR_BAD_SUBJECT, format!("bad subject {subject:?}")))
     } else if is_hidden_subject(subject) {
-        Some(reserved_msg(subject))
+        Some(refusal(ERR_RECORD_REFUSED, reserved_msg(subject)))
     } else {
         None
     }
@@ -2472,16 +2733,20 @@ fn attach_grant(
     nonce: Option<&[u8; 32]>,
     grant: &str,
     proof: &[u8],
-) -> Result<(), String> {
+) -> Result<(), Refusal> {
+    // Every refusal here is the connection's AUTHORITY failing, and says so.
+    let unauthorized = |msg: String| refusal(ERR_UNAUTHORIZED, msg);
     let Some(nonce) = nonce else {
-        return Err(
+        return Err(unauthorized(
             "unauthorized: Attach without a preceding Hello (the proof of possession is \
              computed over this connection's nonce)"
                 .to_string(),
-        );
+        ));
     };
     if !astream_cap::verify_attach(secret, grant, nonce, proof) {
-        return Err("unauthorized: capability proof does not verify".to_string());
+        return Err(unauthorized(
+            "unauthorized: capability proof does not verify".to_string(),
+        ));
     }
     // EXPIRY IS ITS OWN REFUSAL, after possession is proved and before anything
     // is bound. A separate message because the two failures need separate
@@ -2494,23 +2759,25 @@ fn attach_grant(
     let now_ms = now_unix_ms();
     if astream_cap::is_expired(grant, now_ms) {
         let exp = astream_cap::expires_at(grant).unwrap_or(0);
-        return Err(format!(
-            "unauthorized: capability expired at {exp} (now {now_ms}, unix ms)"
-        ));
+        return Err(unauthorized(format!(
+            "{CAP_EXPIRED_PREFIX} at {exp} (now {now_ms}, unix ms)"
+        )));
     }
     // Genuine under this broker's secret, so `parse` cannot fail (verify_attach parses
     // first) — but fail closed rather than unwrap on a library change.
-    let parsed = astream_cap::Grant::parse(grant).map_err(|e| format!("unauthorized: {e}"))?;
+    let parsed =
+        astream_cap::Grant::parse(grant).map_err(|e| unauthorized(format!("unauthorized: {e}")))?;
     // DECIDE THE RING FIRST, MUTATE THE LOG SECOND. Minting and the ring's capacity are
     // pure, local checks; the producer-id binding below is a DURABLE append, so an
     // attach refused for a full ring must be refused before it, leaving the log
     // untouched.
-    let cap = astream_cap::mint(secret, grant).map_err(|e| format!("unauthorized: {e}"))?;
+    let cap =
+        astream_cap::mint(secret, grant).map_err(|e| unauthorized(format!("unauthorized: {e}")))?;
     let slot = keyring.iter().position(|c| c.filter == cap.filter);
     if slot.is_none() && keyring.len() >= MAX_KEYRING {
-        return Err(format!(
+        return Err(unauthorized(format!(
             "unauthorized: capability keyring is full ({MAX_KEYRING} grants)"
-        ));
+        )));
     }
     match (&parsed.mode, &parsed.principal) {
         // A grant that can PUBLISH under a named principal binds that principal's
@@ -2524,7 +2791,15 @@ fn attach_grant(
                     principal: principal.clone(),
                 },
             )
-            .map_err(|msg| format!("unauthorized: {msg}"))?;
+            // The writer's code stands: a collision is the authority failing; an I/O
+            // error appending the binding is not, and is not known to be permanent.
+            .map_err(|(code, msg)| match code {
+                ERR_UNAUTHORIZED => unauthorized(format!("unauthorized: {msg}")),
+                code => refusal(
+                    code,
+                    format!("the producer binding was not persisted: {msg}"),
+                ),
+            })?;
         }
         // An UNBOUND read-write grant may publish under any producer id — the god cap
         // the fleet root keeps. It is legal and it is a footgun, so say so once, on
@@ -2545,6 +2820,33 @@ fn attach_grant(
         None => keyring.push(cap),
     }
     Ok(())
+}
+
+/// The words of the refusal for a request [`cap_authorized_until`] did not authorize
+/// at `now_ms`. When the ring WOULD have authorized it before any deadline, the
+/// grants that covered it have lapsed, and the refusal says so with
+/// [`CAP_EXPIRED_PREFIX`]: the holder needs a fresh mint of the same grant, not a
+/// wider one. Otherwise no grant ever covered it, and the refusal says that.
+///
+/// "Before any deadline" is the instant 0. It is earlier than every `exp=` a ring can
+/// hold, because `attach_grant` refuses an `exp=0` grant whatever the clock says
+/// (`0 >= 0` is expired). This decides only the WORDS. The request was already
+/// refused at `now_ms`, and nothing here can authorize it.
+#[cfg(feature = "cap")]
+fn ungranted(
+    secret: &[u8],
+    keyring: &[astream_cap::Capability],
+    req: &Request,
+    now_ms: u64,
+) -> String {
+    if cap_authorized_until(secret, keyring, req, 0).is_some() {
+        format!(
+            "{CAP_EXPIRED_PREFIX} before this request: every grant that covered it has \
+             lapsed (now {now_ms}, unix ms)"
+        )
+    } else {
+        "unauthorized: capability does not grant this subject/filter".to_string()
+    }
 }
 
 /// Whether `req` is authorized by this connection's capability KEYRING under the
@@ -2671,6 +2973,31 @@ fn cap_authorized_until(
         Request::Commit { group, .. } => commit(group),
         // Both only ever ADD, and both are fully handled before this gate.
         Request::Attach { .. } | Request::Hello => Some(u64::MAX),
+        // These grant nothing, but their `Mark` names the log's head, which an
+        // unattached connection is told nothing about: any capability the ring still
+        // holds — genuine and unexpired — answers for it.
+        Request::Keepalive | Request::IdleMarks => keyring
+            .iter()
+            .any(|c| {
+                astream_cap::verify(secret, c)
+                    && !astream_cap::is_expired(c.filter.as_str(), now_ms)
+            })
+            .then_some(u64::MAX),
+        // A producer's budget is answered to whoever could spend it: a genuine,
+        // unexpired read-write grant that publishes as that producer — bound to it,
+        // or unbound (the god grant publishes as any). It names no subject, so no
+        // filter is matched; a read-only grant, or one bound to another principal,
+        // learns nothing about this producer.
+        Request::Budget { producer_id } => until(&|c| {
+            astream_cap::verify(secret, c)
+                && !astream_cap::is_expired(c.filter.as_str(), now_ms)
+                && astream_cap::Grant::parse(c.filter.as_str()).is_ok_and(|g| {
+                    g.mode == astream_cap::Mode::ReadWrite
+                        && g.principal
+                            .as_deref()
+                            .is_none_or(|p| astream_cap::producer_id_of(p) == *producer_id)
+                })
+        }),
     }
 }
 
@@ -2703,7 +3030,9 @@ fn oversized_name(req: &Request) -> Option<String> {
             commit.as_ref().map_or(NONE, |(g, _)| ("group", g)),
         ],
         Request::Last { filter, after, .. } => [("filter", filter), ("cursor", after)],
-        Request::Hello => [NONE, NONE],
+        Request::Hello | Request::Keepalive | Request::IdleMarks | Request::Budget { .. } => {
+            [NONE, NONE]
+        }
     };
     names
         .iter()
@@ -2874,7 +3203,7 @@ fn ack_writer_loop<S: Stream>(
 fn ack_response(ack: AckResult) -> Response {
     match ack {
         Ok((offset, deduped)) => Response::PublishAck { offset, deduped },
-        Err(msg) => Response::Error { code: 5, msg },
+        Err((code, msg)) => Response::Error { code, msg },
     }
 }
 
@@ -2937,11 +3266,18 @@ fn process_batch(shared: &Arc<Shared>, batch: Vec<WriteOp>) {
     // not for a follower's.
     let mut local_only: Vec<bool> = Vec::with_capacity(batch.len());
     let mut poisoned = false;
+    // The leader's log identity, from the highest-offset replicated record this batch
+    // staged that carried one, with that offset: adopted once the batch commits, if
+    // that record is the log's newest (see below).
+    let mut adopt: Option<(crate::LogIdentity, Offset)> = None;
     for op in batch {
         acks.push(op.ack);
         local_only.push(matches!(op.kind, WriteKind::WillRegister { .. }));
         if poisoned {
-            results.push(Err("batch aborted (prior append I/O error)".into()));
+            results.push(Err(refusal(
+                ERR_REFUSED,
+                "batch aborted (prior append I/O error)",
+            )));
             continue;
         }
         let staged = match op.kind {
@@ -2969,7 +3305,15 @@ fn process_batch(shared: &Arc<Shared>, batch: Vec<WriteOp>) {
                 group,
                 upto,
             ),
-            WriteKind::Replicate { rec } => guard.stage_replica(rec),
+            WriteKind::Replicate { rec, leader } => {
+                let staged = guard.stage_replica(rec);
+                if let (Ok((off, _)), Some(leader)) = (&staged, leader) {
+                    if adopt.is_none_or(|(_, through)| *off >= through) {
+                        adopt = Some((leader, *off));
+                    }
+                }
+                staged
+            }
             WriteKind::Bind {
                 producer_id,
                 principal,
@@ -2979,37 +3323,71 @@ fn process_batch(shared: &Arc<Shared>, batch: Vec<WriteOp>) {
             }
             WriteKind::WillFire { will } => guard.stage_will_fire(will),
         };
-        match staged {
-            Ok((off, deduped)) => results.push(Ok((off.0, deduped))),
-            Err(StageErr::TooLarge) => results.push(Err("message too large".into())),
-            Err(StageErr::Reserved(subject)) => results.push(Err(reserved_msg(&subject))),
-            Err(StageErr::SubjectBound(msg)) => results.push(Err(msg)),
-            Err(StageErr::Collision(msg)) => results.push(Err(msg)),
+        // The code says whether the same op can EVER land (`proto::ERR_*`): the
+        // record's own shape cannot change on a resend, so it is permanent; the
+        // outcomes that are the log's state of the moment (an I/O error, a replica's
+        // spine) are not known to be; and a spent subject budget, which only another
+        // producer's record or a smaller count lifts, has a code of its own so the
+        // producer can decide by what it knows about who writes the subject.
+        let (code, msg) = match staged {
+            Ok((off, deduped)) => {
+                results.push(Ok((off.0, deduped)));
+                continue;
+            }
+            Err(StageErr::TooLarge) => (ERR_RECORD_REFUSED, "message too large".to_string()),
+            Err(StageErr::Reserved(subject)) => (ERR_RECORD_REFUSED, reserved_msg(&subject)),
+            // Not permanent: another producer can introduce this subject, and an
+            // identical request then updates an existing index entry without
+            // spending a new slot. Not ERR_REFUSED either: nothing transient failed,
+            // and a producer that alone writes the subject can retire the record.
+            Err(StageErr::SubjectBound(msg)) => (ERR_SUBJECT_BOUND, msg),
+            // Only a `Bind`, at attach: the producer id is another principal's.
+            Err(StageErr::Collision(msg)) => (ERR_UNAUTHORIZED, msg),
             // Not a failure: the fence did its job and the will appended nothing.
-            Err(StageErr::Fenced(msg)) => results.push(Err(msg)),
+            Err(StageErr::Fenced(msg)) => (ERR_REFUSED, msg),
             // Also not a failure: a replica appends nothing of its own making.
-            Err(StageErr::Replica(msg)) => results.push(Err(msg)),
-            Err(StageErr::Diverged(msg)) => results.push(Err(msg)),
+            Err(StageErr::Replica(msg)) => (ERR_REFUSED, msg),
+            // A gap is repaired by re-shipping; the leader reads the message, not this.
+            Err(StageErr::Diverged(msg)) => (ERR_REFUSED, msg),
             // Decided in here, under the lock that appends: a replicated hidden record
             // offered to a log this broker owns, and a will offered the reserved ack
             // half. Op-level, like every other refusal above — the file is untouched.
-            Err(StageErr::ReservedReplica(msg)) => results.push(Err(msg)),
-            Err(StageErr::SeqReserved(msg)) => results.push(Err(msg)),
+            Err(StageErr::ReservedReplica(msg)) => (ERR_RECORD_REFUSED, msg),
+            Err(StageErr::SeqReserved(msg)) => (ERR_RECORD_REFUSED, msg),
             Err(StageErr::Io(e)) => {
                 poisoned = true;
-                results.push(Err(format!("append failed: {e}")));
+                (ERR_REFUSED, format!("append failed: {e}"))
             }
-        }
+        };
+        results.push(Err(refusal(code, msg)));
     }
     // Commit the batch: one fsync for everyone (unless poisoned — then roll back).
     let commit_res = if poisoned {
         guard.abort_batch();
-        Err("batch aborted before fsync".to_string())
+        Err(refusal(ERR_REFUSED, "batch aborted before fsync"))
     } else {
         guard
             .commit_batch()
-            .map_err(|e| format!("commit failed: {e}"))
+            .map_err(|e| refusal(ERR_REFUSED, format!("commit failed: {e}")))
     };
+    // A REPLICA reports its leader's identity: its offsets are the leader's, so a
+    // client that fails over to it keeps the ones it persisted. Adopted only once the
+    // records that carried it are durable here, only when they reach the log's newest
+    // record (an echo of a shared prefix vouches for nothing above it), and only by a
+    // log that IS a replica and has not been found holding a record its leader does
+    // not (`adopt_identity` asks all three). Failing to record it is not the batch's
+    // failure — the records are committed — and leaves this follower reporting its
+    // own identity, which costs a client that fails over a re-read, never a skipped
+    // record.
+    if let (Ok(()), Some((leader, through))) = (&commit_res, adopt) {
+        if let Err(e) = guard.adopt_identity(leader, through) {
+            eprintln!(
+                "astream-broker: this replica could not record its leader's log identity \
+                 {leader}: {e}; it keeps reporting {}",
+                guard.identity()
+            );
+        }
+    }
     // Replicated tier: gather every committed-but-unconfirmed record — from the lowest
     // follower prefix to the head, cheap Arc clones — under the lock, to ship AFTER
     // releasing it: network I/O never holds the log lock (the delivery discipline).
@@ -3064,10 +3442,17 @@ fn process_batch(shared: &Arc<Shared>, batch: Vec<WriteOp>) {
             // An op that failed on its own terms (too large / reserved / diverged / the
             // append or poisoned-log error that aborted the batch) keeps its own, more
             // specific message; the ops a batch failure took down with it get the batch's.
-            (_, Err(msg)) => Err(msg),
+            (Ok(()), Err(refused)) => Err(refused),
+            // ...but a batch that rolled back decided nothing for good: its refusals
+            // were judged against records that never landed (the subject bound counts
+            // the batch's own new subjects), so a resend may land. Not known to be
+            // permanent, whatever the op was refused for.
+            (Err(_), Err((_, msg))) => Err(refusal(ERR_REFUSED, msg)),
             (Err(msg), Ok(_)) => Err(msg.clone()),
             (Ok(()), Ok((off, deduped))) => match watermark {
-                Some(wm) if off >= wm && !local => Err("not replicated to quorum".into()),
+                Some(wm) if off >= wm && !local => {
+                    Err(refusal(ERR_REFUSED, "not replicated to quorum"))
+                }
                 _ => Ok((off, deduped)),
             },
         };
@@ -3164,11 +3549,20 @@ fn last_page(
         }
         // The round boundary, with the log lock released — the window a concurrent
         // publisher gets, and the one a test needs to occupy to prove the head above
-        // does not move with it. Cloned out of the lock before the call so a hook is
+        // does not move with it. Taken out of the lock before waiting so the test is
         // free to touch the broker.
-        let hook = shared.last_round_hook.lock().unwrap().clone();
-        if let Some(hook) = hook {
-            hook(round);
+        let pause = {
+            let mut slot = shared.last_round_pause.lock().unwrap();
+            if slot.as_ref().is_some_and(|p| p.round == round) {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        if let Some(pause) = pause {
+            if pause.reached.send(()).is_ok() {
+                let _ = pause.resume.recv();
+            }
         }
     }
     Err(format!(
@@ -3204,6 +3598,7 @@ fn tail_loop<S: Stream>(
     mut cursor: u64,
     filter: Filter,
     until: u64,
+    idle_marks: bool,
 ) -> io::Result<()> {
     // A short read timeout lets a parked subscriber probe for a vanished peer; a
     // generous write timeout means a wedged delivery to a stuck consumer errors out
@@ -3213,6 +3608,12 @@ fn tail_loop<S: Stream>(
     let mut out = Vec::new();
     // When the peer was last probed for having gone (see the end of the loop).
     let mut probed = Instant::now();
+    // LIVENESS THE OTHER WAY: when this stream was last written to, and whether the
+    // tail has yet said it caught up. A caught-up tail marks at once, the first time,
+    // and again after every `idle_mark` with nothing written (see IDLE_MARK).
+    let idle_mark = Duration::from_millis(shared.idle_mark_ms.load(Ordering::Relaxed));
+    let mut wrote_at = Instant::now();
+    let mut said_caught_up = false;
     loop {
         // Catch-up: copy the next records >= cursor that are VISIBLE (below `head` — in
         // the Replicated tier the quorum watermark, so nothing un-replicated is ever
@@ -3228,6 +3629,11 @@ fn tail_loop<S: Stream>(
         if batch.is_empty() {
             if let Some(now) = lapsed(until) {
                 return end_lapsed(stream, &mut out, until, now);
+            }
+            if idle_marks && (!said_caught_up || wrote_at.elapsed() >= idle_mark) {
+                write_mark(stream, cursor, shared.head.load(Ordering::Relaxed))?;
+                said_caught_up = true;
+                wrote_at = Instant::now();
             }
             // Park until a new commit (head > cursor) or shutdown — releasing the
             // lock — but wake every LIVENESS_POLL to check whether the peer vanished,
@@ -3284,11 +3690,18 @@ fn tail_loop<S: Stream>(
         }
         flush_egress(stream, &mut out)?;
         // A subscriber whose filter matches nothing still drains the log without ever
-        // writing, so the park branch (which probes for a vanished peer) is never
-        // reached under continuous traffic. Probe here when a batch produced zero
-        // writes, so a dead never-matching consumer's thread + fd are still reaped. A
-        // probe blocks for PEER_PROBE_TIMEOUT, so a chunk with more right behind it
-        // probes at most once per LIVENESS_POLL rather than once per chunk.
+        // writing, so the park branch (which probes for a vanished peer, and marks an
+        // idle stream) is never reached under continuous traffic. Mark and probe here
+        // too when a batch produced zero writes, so such a subscriber still hears from
+        // the broker and a dead one's thread + fd are still reaped. A probe blocks for
+        // PEER_PROBE_TIMEOUT, so a chunk with more right behind it probes at most once
+        // per LIVENESS_POLL rather than once per chunk.
+        if wrote {
+            wrote_at = Instant::now();
+        } else if idle_marks && wrote_at.elapsed() >= idle_mark {
+            write_mark(stream, cursor, shared.head.load(Ordering::Relaxed))?;
+            wrote_at = Instant::now();
+        }
         if !wrote && (!more || probed.elapsed() >= LIVENESS_POLL) {
             probed = Instant::now();
             if peer_gone(stream) {
@@ -3296,6 +3709,19 @@ fn tail_loop<S: Stream>(
             }
         }
     }
+}
+
+/// Tell a subscriber where its tail stands — resume from `next`, `head` is the visible
+/// head — with nothing to deliver: the catch-up and idle marks (see [`IDLE_MARK`]).
+fn write_mark<S: Write>(stream: &mut S, next: u64, head: u64) -> io::Result<()> {
+    write_frame(
+        stream,
+        &encode_response(&Response::Mark {
+            next,
+            head,
+            resume: String::new(),
+        }),
+    )
 }
 
 /// Bytes of framed output a streaming verb gathers before it writes: one socket write
@@ -3356,6 +3782,10 @@ mod tests {
             TcpStream::connect(l.local_addr().unwrap()).unwrap()
         });
         FollowerLink {
+            leader: crate::LogIdentity {
+                id: [0; 16],
+                generation: 0,
+            },
             addr: "127.0.0.1:0".to_string(),
             stream,
             upto,
@@ -3558,5 +3988,71 @@ mod tests {
              (one chunk is {TAIL_CHUNK})"
         );
         h.shutdown();
+    }
+
+    /// A BATCH THAT ROLLED BACK DECIDED NOTHING FOR GOOD. The distinct-subject bound
+    /// counts the batch's own new subjects, so a record refused at the bound behind
+    /// one that took the producer's last slot was judged against a record that, once
+    /// the commit fails, never landed — and resent, it lands. Its refusal is therefore
+    /// not known to be permanent (`ERR_REFUSED`), though it keeps its own message.
+    #[cfg(unix)]
+    #[test]
+    fn a_refusal_inside_a_batch_that_rolled_back_is_not_permanent() {
+        use crate::store::MAX_SUBJECTS_PER_PRODUCER;
+        let log = format!("/tmp/asb_unit_rollback_{}.log", std::process::id());
+        let _ = std::fs::remove_file(&log);
+        let _tmp = Cleanup(vec![log.clone()]);
+        let b = Broker::open(&log).unwrap();
+        // Producer 1 one slot short of its bound, in one batch (one fsync).
+        {
+            let mut l = b.shared.log.lock().unwrap();
+            for seq in 0..MAX_SUBJECTS_PER_PRODUCER as u64 - 1 {
+                l.stage_publish(1, seq, format!("/t/{seq}"), vec![])
+                    .unwrap();
+            }
+            l.commit_batch().unwrap();
+            b.shared.head.store(l.head().0, Ordering::Relaxed);
+        }
+        let publish = |producer_seq: u64, subject: &str| {
+            let (ack, rx) = mpsc::channel();
+            let kind = WriteKind::Publish {
+                producer_id: 1,
+                producer_seq,
+                subject: subject.to_string(),
+                body: vec![],
+            };
+            (WriteOp { kind, ack }, rx)
+        };
+
+        // `/t/last` takes the last slot; `/t/behind` is refused at the bound for it;
+        // then the fsync fails and the batch rolls back.
+        b.inject_faults(InjectedFaults {
+            sync: true,
+            truncate: false,
+        });
+        let (last, last_ack) = publish(1 << 20, "/t/last");
+        let (behind, behind_ack) = publish((1 << 20) + 1, "/t/behind");
+        process_batch(&b.shared, vec![last, behind]);
+        let (code, _) = last_ack.recv().unwrap().unwrap_err();
+        assert_eq!(code, ERR_REFUSED, "the record the fsync took down");
+        let (code, msg) = behind_ack.recv().unwrap().unwrap_err();
+        assert!(msg.contains("distinct subjects"), "its own words: {msg}");
+        assert_eq!(
+            code, ERR_REFUSED,
+            "judged against a rolled-back batch: {msg}"
+        );
+
+        // Why: the slot it was refused for is free again, so the same record lands.
+        b.inject_faults(InjectedFaults::default());
+        let (again, again_ack) = publish((1 << 20) + 1, "/t/behind");
+        process_batch(&b.shared, vec![again]);
+        assert!(again_ack.recv().unwrap().is_ok(), "the resend landed");
+
+        // The control: the same refusal in a batch that COMMITS keeps the code that
+        // names it — the producer is now at its bound for real.
+        let (over, over_ack) = publish((1 << 20) + 2, "/t/over");
+        process_batch(&b.shared, vec![over]);
+        let (code, msg) = over_ack.recv().unwrap().unwrap_err();
+        assert_eq!(code, ERR_SUBJECT_BOUND, "a committed batch's bound: {msg}");
     }
 }

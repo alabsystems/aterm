@@ -1,91 +1,49 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! WHO MAY TALK TO THE KEEPER, both ways (`docs/DESIGN-pty-keeper-2026-09-26.md`
-//! §5.7, owner decision 7).
+//! Who may talk to the keeper, both ways (`docs/DESIGN-pty-keeper-2026-09-26.md` §5.7).
 //!
-//! The floor is the same uid, always: `getpeereid` on every connection, the
-//! socket in a 0700 directory. Above it, by default, CODE IDENTITY: the peer's
-//! audit token (`LOCAL_PEERTOKEN`, never a pid that may have been recycled)
-//! must name code that satisfies THIS build's own designated requirement. The
-//! keeper and the window are the same binary, so the requirement a build
-//! carries is exactly the one its peers must meet:
+//! The floor is the same uid, always: `getpeereid` on every connection, the socket in a 0700
+//! directory. Above it, by default, code identity: the peer's audit token (`LOCAL_PEERTOKEN`,
+//! never a recyclable pid) must name code that satisfies this build's own designated
+//! requirement. The keeper and the window are the same binary, so:
 //!
-//! * the installed app carries its Developer ID requirement (identifier
-//!   `com.aterm.aterm`, Team `A66A9P66Z7`; §11.1), which every future signed
-//!   build also meets;
-//! * a dev or ad-hoc build carries only its cdhash, so only the very same
-//!   build passes — the strongest identity it has;
-//! * [`IdentityPolicy::SameUid`] is the explicit floor, for tests and for a
-//!   by-hand run of a build whose peers differ (a test harness talking to it).
-//!   A keeper states its policy in its WELCOME, and a window that checks code
-//!   registers nothing with one at the floor (`crate::client`): its code
-//!   passes, yet it would offer an orphaned master to any same-uid process.
+//! * the installed app carries its Developer ID requirement (identifier `com.aterm.aterm`, Team
+//!   `A66A9P66Z7`; §11.1), which every future signed build also meets;
+//! * a dev or ad-hoc build carries only its cdhash, so only the very same build passes;
+//! * [`IdentityPolicy::SameUid`] is the explicit floor, for tests and by-hand runs. A keeper
+//!   states its policy in its WELCOME, and a window that checks code registers nothing with one
+//!   at the floor (`crate::client`): it would offer an orphaned master to any same-uid process.
 //!
-//! WHAT THE CODE CHECK DOES NOT BIND. The audit token is the kernel's answer when
-//! it is read, and on Darwin it names the process that last USED the
-//! connection, read live, not the one that `connect(2)`ed (measured
-//! 2026-10-03: `aterm_uds::peer`'s `the_peer_is_the_connections_last_user_read_live`;
-//! an `exec` at that pid moves the token's pid version while the pid stays). The
-//! keeper reads it ONCE, at accept (`crate::server`'s `accept_all`), and then
-//! serves that connection for its life, the orphaned masters it OFFERs
-//! included. So a same-uid process can connect, keep a copy of the connection
-//! in a second process that does not touch it, and `exec` a genuine aterm (any
-//! invocation that stays up) at its own pid before the keeper reads the token —
-//! holding the keeper still across the `exec` with `SIGSTOP` if it must, which
-//! any process of the uid may send. The keeper then judges genuine code at that
-//! pid, and the copy speaks for it: it registers, claims, and reads every
-//! orphaned master offered to it. Derived from the measured semantics, not run
-//! end to end. A window's check of the keeper reads the same kind of token once
-//! too. Above the same-uid floor, then, code identity turns away a peer that
-//! does not try this; it is no binding to the process that connected. The fix
-//! is the one the update's launched-lane rendezvous is waiting on, which checks
-//! with this same machinery and is open the same way: a binding to the
-//! connecting process that no later use of the connection can move (a sender
-//! credential captured at send, as a Mach message's audit trailer is, or a
-//! secret only aterm's signed code can read), a change of transport left to a
-//! design decision (`docs/AUDIT-update-robustness-r8-2026-09-30.md`, #904,
-//! deferred). Until then, against a same-uid process that knows this, the
-//! keeper's gate is the same-uid floor.
+//! What the code check does not bind: on Darwin the audit token names the process that last
+//! used the connection, read live, not the one that connected (`aterm_uds::peer`'s
+//! `the_peer_is_the_connections_last_user_read_live`), and each side reads it once, at accept or
+//! dial. A same-uid process can keep a copy of a connection in a second process and `exec` a
+//! genuine aterm at its own pid before the check, and the copy then speaks for genuine code. So
+//! against a same-uid process that knows this, the gate is the same-uid floor. The fix, a binding
+//! to the connecting process no later use can move, is a transport decision shared with the
+//! update's launched-lane rendezvous (`docs/AUDIT-update-robustness-r8-2026-09-30.md`, #904).
 //!
-//! The seamless update's launched-lane rendezvous checks its dialer with the
-//! same machinery, against a requirement that is not necessarily this build's
-//! own: an aterm release's requirement (its signing identifier and the
-//! Developer ID every update candidate met, [`Identity::for_requirement`]), or,
-//! for a successor that re-runs this image, the designated requirement of the
-//! code the launch named ([`Identity::for_code_at`]). A check `trustd` did not
-//! answer is [`CheckError::Unanswered`] there too, and the rendezvous holds
-//! that dialer and checks again rather than turning it away.
+//! That rendezvous checks its dialer with this machinery against a requirement that need not be
+//! this build's: a release's ([`Identity::for_requirement`]) or the launched code's
+//! ([`Identity::for_code_at`]). There a [`CheckError::Unanswered`] holds the dialer for another
+//! check rather than turning it away.
 //!
-//! `aterm keeper status` says which one is in force. Security.framework is a C
-//! API; the calls are the documented guest lookup
-//! (`SecCodeCopyGuestWithAttributes` with `kSecGuestAttributeAudit`) and
-//! `SecCodeCheckValidity` against `SecCodeCopySelf`'s designated requirement.
+//! The calls are Security.framework's guest lookup (`SecCodeCopyGuestWithAttributes` with
+//! `kSecGuestAttributeAudit`) and `SecCodeCheckValidity` against `SecCodeCopySelf`'s designated
+//! requirement. The guest lookup re-opens the file the process was started from: with that file
+//! deleted it fails `ENOENT` (OSStatus 100002), and with another build at the path
+//! `errSecCSStaticCodeChanged` (-67034) or -67049; `kSecCSMatchGuestRequirementInKernel` does
+//! not help (`errSecCSReqInvalid`). So a process that must stay checkable runs from code that
+//! outlives it, as the keeper does (`crate::code`), and [`Identity::admits_code_at`] checks that
+//! code before the keeper re-runs from it.
 //!
-//! A running peer's code is found THROUGH THE FILE IT WAS STARTED FROM: the
-//! guest lookup re-opens the path the kernel reports for the process (measured
-//! 2026-10-01 on macOS 26.6.2, the installed Developer ID build and an ad-hoc
-//! copy: with that file deleted the lookup fails `ENOENT`, OSStatus 100002;
-//! with another build at the path it fails `errSecCSStaticCodeChanged`, -67034,
-//! or -67049; `kSecCSMatchGuestRequirementInKernel` changes neither, and
-//! answers `errSecCSReqInvalid` for a cdhash and a Developer ID requirement
-//! alike). So a process that must stay checkable runs from code that outlives
-//! it — the keeper does (`crate::code`) — and [`Identity::admits_code_at`]
-//! checks that code before the keeper re-runs from it.
-//!
-//! BOTH CHECKS WAIT ON macOS's `trustd` (for certificate-chained code), and
-//! when that agent stops answering they never return (measured 2026-10-01: an
-//! installed build's check parked in a Mach receive for as long as anyone
-//! waited, while an ad-hoc build's answered in 0.24 s). So each runs through
-//! the process's one `trustd` gate, `aterm_uds::deadline::TRUST`, under a
-//! deadline: an unanswered check is [`CheckError::Unanswered`] — a refusal,
-//! never a pass — naming the service, and while one is overdue every later
-//! check is refused at once instead of leaving one more stuck thread. It is
-//! its own variant because it is about the machine's moment, not the peer: the
-//! same check may pass once `trustd` answers, and a caller that can wait for
-//! that (the update rendezvous holds its dialer) needs to know which it got.
-//! Reading this process's own requirement does not wait on `trustd` (measured
-//! the same day), so it runs inline.
+//! Both checks wait on macOS's `trustd` for certificate-chained code and never return when it
+//! stops answering. So each runs through the process's one `trustd` gate,
+//! `aterm_uds::deadline::TRUST`, under a deadline: an unanswered check is
+//! [`CheckError::Unanswered`], a refusal, never a pass, and while one is overdue every later check
+//! is refused at once. It is its own variant because it is about the machine's moment, not the
+//! peer. Reading this process's own requirement does not wait on `trustd`, so it runs inline.
 
 use std::path::Path;
 #[cfg(target_vendor = "apple")]
@@ -94,23 +52,17 @@ use std::time::Duration;
 
 use aterm_uds::CtlStream;
 
-/// How long the on-disk check of a copy of this build
-/// ([`Identity::admits_code_at`]) may take. It hashes every page of a bundle,
-/// honestly for many seconds on a loaded machine, so this is a hang detector
-/// rather than a budget: no honest check is cut, and a `trustd` that never
-/// answers is named in a minute.
+/// How long the on-disk check of a copy of this build ([`Identity::admits_code_at`]) may take.
+/// It hashes every page of a bundle, for many seconds on a loaded machine, so this is a hang
+/// detector: no honest check is cut, and a `trustd` that never answers is named in a minute.
 pub const CODE_CHECK_HANG: Duration = Duration::from_secs(60);
 
-/// How long a PEER's code check ([`Identity::check`]) may take, at least: one
-/// `SecCodeCheckValidity` answers in a quarter second (measured 2026-10-01),
-/// so this is a hang detector with room for a loaded cold launch, not the
-/// dialer's socket budget — an honest slow check is never cut into a refused
-/// dial. It is also the check's suspect age, and no shorter than a TLS
-/// evaluation's (`aterm-http`'s five seconds), so a slow peer check never
-/// makes the process's certificate checks refuse. It is not a minute because
-/// the callers wait on it in line (the keeper's accept loop, the window's
-/// boot dial): a silent `trustd` stalls each once, for this long, and every
-/// later check is refused at once.
+/// How long a peer's code check ([`Identity::check`]) may take, at least: a hang detector with
+/// room for a loaded cold launch (one `SecCodeCheckValidity` answers in a quarter second), so an
+/// honest slow check is never cut into a refused dial. It is also the check's suspect age, no
+/// shorter than a TLS evaluation's (`aterm-http`'s five seconds), so a slow peer check never
+/// makes the process's certificate checks refuse. Not a minute, because the keeper's accept loop
+/// and the window's boot dial wait on it in line.
 pub const PEER_CHECK_HANG: Duration = Duration::from_secs(10);
 
 /// The words for a check `trustd` did not answer — at its deadline, or at once
@@ -166,7 +118,7 @@ fn through_trust_gate<T: Send + 'static>(
 pub enum IdentityPolicy {
     /// Same uid only.
     SameUid,
-    /// Same uid AND code that satisfies this build's designated requirement.
+    /// Same uid and code that satisfies this build's designated requirement.
     Designated,
 }
 
@@ -180,11 +132,9 @@ pub enum CheckError {
     /// could not be looked up (it may have exited, or the file it was started
     /// from was replaced).
     Unchecked(String),
-    /// The check could not run because macOS's code-signing service (`trustd`)
-    /// did not answer: at the check's deadline, or at once because an earlier
-    /// check through the process's `trustd` gate is overdue. A refusal, never a
-    /// pass — and about the machine's moment rather than the peer, so the same
-    /// check may pass once `trustd` answers again.
+    /// The check could not run because `trustd` did not answer (at the deadline, or at once while
+    /// an earlier check through the gate is overdue). A refusal, never a pass, and about the
+    /// machine's moment rather than the peer: the same check may pass once `trustd` answers.
     Unanswered(String),
 }
 
@@ -217,7 +167,7 @@ impl Identity {
         }
     }
 
-    /// The identity `policy` asks for, derived from THIS process's own code.
+    /// The identity `policy` asks for, derived from this process's own code.
     ///
     /// # Errors
     /// `Designated` on a platform without code signing, or when this process's
@@ -340,15 +290,11 @@ impl Identity {
         self.check_named(stream, aterm_uds::peer::peer_audit_token(stream), within)
     }
 
-    /// [`Self::check`] of the process `token` names, a token the caller read
-    /// from `stream` earlier ([`aterm_uds::peer::peer_audit_token`]) rather
-    /// than one read now: for a caller that holds a peer across several checks
-    /// and must judge the SAME process each time (the update handoff's
-    /// rendezvous). A token whose process has since gone, or been replaced at
-    /// its pid, fails the code lookup ([`CheckError::Unchecked`]) instead of
-    /// being judged as whatever runs there now. `None` is a peer the kernel did
-    /// not name: refused [`CheckError::Unchecked`] where a requirement is in
-    /// force.
+    /// [`Self::check`] of the process `token` names, read from `stream` earlier
+    /// ([`aterm_uds::peer::peer_audit_token`]): for a caller that must judge the same process
+    /// across several checks (the update handoff's rendezvous). A token whose process has gone or
+    /// been replaced at its pid fails the code lookup ([`CheckError::Unchecked`]); so does `None`
+    /// (a peer the kernel did not name) where a requirement is in force.
     ///
     /// # Errors
     /// As [`Self::check`].
@@ -393,8 +339,7 @@ impl Identity {
                 GateRefusal::Failed(why) => CheckError::Unchecked(why),
             })??;
         }
-        // Off Apple nothing judges the code, so neither the deadline nor the
-        // token is read (this keeps `-D warnings` quiet on Linux).
+        // Off Apple nothing judges the code, so neither the deadline nor the token is read.
         #[cfg(not(target_vendor = "apple"))]
         let _ = (within, token);
         #[allow(unreachable_code)]
@@ -747,8 +692,7 @@ mod tests {
     /// ourselves, and the designated check passes. The floor names itself.
     #[test]
     fn a_process_satisfies_its_own_requirement() {
-        // An ad-hoc build's check answers without `trustd`, but every check
-        // shares the gate, which refuses all of them while `trustd` is silent.
+        // An ad-hoc build's check needs no `trustd`, but every check shares the gate.
         if trust_service_silent() {
             return;
         }
@@ -766,12 +710,9 @@ mod tests {
             .expect("same uid passes");
     }
 
-    /// A CHECK OF A TOKEN THE CALLER HOLDS judges the process that token names,
-    /// and only that one: the token read from the connection passes, as a fresh
-    /// read does. NEGATIVE CONTROLS: the same token with its pid version moved
-    /// on — what a later image at the same pid carries — is not looked up as
-    /// the live process, and no token at all is not checked, where a
-    /// requirement is in force. Neither is ever a pass.
+    /// A held token is judged as the process it names: the token read from the connection
+    /// passes. Negative controls: the token with its pid version moved on (a later image at the
+    /// same pid) and no token at all are `Unchecked`, never a pass, under a requirement.
     #[test]
     fn a_held_token_is_checked_as_the_process_it_named() {
         if trust_service_silent() {
@@ -800,11 +741,9 @@ mod tests {
             .expect("the floor reads no token");
     }
 
-    /// THE CODE A KEEPER RE-RUNS FROM is checked as a peer would check it:
-    /// this test binary's own file meets its requirement, a byte-for-byte copy
-    /// of it does too (the copy a keeper runs from). NEGATIVE CONTROLS: another
-    /// program (`/usr/bin/true`), and the copy with one byte changed (its
-    /// signature broken), do not; the same-uid floor admits any.
+    /// The code a keeper re-runs from is checked as a peer would check it: this test binary's
+    /// file and a byte-for-byte copy pass. Negative controls: `/usr/bin/true` and the copy with
+    /// one byte changed do not; the same-uid floor admits any.
     #[test]
     fn code_on_disk_is_checked_against_the_requirement() {
         if trust_service_silent() {
@@ -832,10 +771,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A REQUIREMENT THIS BUILD STATES FOR ANOTHER BUILD'S CODE: the Developer ID
-    /// requirement pinned to a team, as an update candidate meets it. This ad-hoc
-    /// test binary does not, so its own connection is refused, never unchecked;
-    /// text that is no requirement is refused when it is compiled.
+    /// A stated requirement for another build's code (the Developer ID requirement pinned to a
+    /// team, as an update candidate meets it): this ad-hoc test binary is refused, never
+    /// unchecked, and text that is no requirement is refused when compiled.
     #[test]
     fn a_stated_requirement_refuses_code_that_does_not_meet_it() {
         if trust_service_silent() {
@@ -863,10 +801,8 @@ mod tests {
         assert!(Identity::for_requirement("this is not a requirement").is_err());
     }
 
-    /// THE CODE AT A PATH, as its own designated requirement: a process running
-    /// it passes (this test binary, read from its own file), and the same
-    /// process against another program's code (`/usr/bin/true`) is refused.
-    /// Code with no signature has no requirement to read.
+    /// The code at a path, as its own designated requirement: this test binary passes, and the
+    /// same process against `/usr/bin/true`'s code is refused. Unsigned code has no requirement.
     #[test]
     fn the_code_at_a_path_admits_exactly_its_own_processes() {
         if trust_service_silent() {
@@ -898,9 +834,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A different program's connection fails the designated check and passes
-    /// the floor: `nc -U` dials a listener here, and its audit token names
-    /// `nc`, whose code is not this test binary's.
+    /// `nc -U` dials a listener here: its audit token names `nc`, which fails the designated
+    /// check and passes the floor.
     #[test]
     fn another_program_fails_the_designated_check() {
         if trust_service_silent() {

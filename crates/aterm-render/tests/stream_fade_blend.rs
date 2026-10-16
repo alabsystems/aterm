@@ -2,38 +2,29 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! L0 proofs for the M2 "ink that dries" blend seam: the stream fade tints a
-//! drying cell's foreground with `blend_text(bg, fg, bg, alpha, false)` — the
-//! EXACT linear-light alpha-over — at an ease-out coverage that is monotone in
-//! age (proven in aterm-gui's `stream_fade` module). These tests discharge the
-//! blend half of the M2 PROVE bullets on the shipping blend itself:
+//! The stream fade's blend: a drying cell's foreground is
+//! `blend_text(bg, fg, bg, alpha, false)`, the exact linear-light alpha-over,
+//! at an ease-out coverage monotone in age (proven in aterm-gui's
+//! `stream_fade`). These tests pin the blend half:
 //!
-//! * **CONVERGENCE-TO-EXACT** — coverage 255 returns the fg bytes EXACTLY and
-//!   coverage 0 the destination bytes EXACTLY. Both are structural early
-//!   returns in `blend_text`, taken before any per-value arithmetic, and
-//!   `tests/text_blending.rs::endpoint_exactness_both_modes` pins them in BOTH
-//!   modes over a colour lattice with dirty high bytes. With the envelope's
-//!   `age >= fade_ms ⇒ alpha == 255` theorem this closes "no permanent tint":
-//!   the steady frame is byte-identical to the no-feature frame.
-//! * **MONOTONICITY** — the blended channel is monotone in coverage
-//!   (nondecreasing toward the fg when `fg >= bg`, nonincreasing when
-//!   `fg <= bg`) across ALL 256×256 (bg, fg) channel pairs × all 256 coverage
-//!   steps — the full 16.7M-point input space of one channel, which the other
-//!   two channels share by construction (`blend_channel_linear` is applied
-//!   per-channel with identical code; a cross-channel lattice pins that too).
-//!   So a drying glyph only ever approaches its final ink.
+//! - Convergence: coverage 255 returns the fg bytes and coverage 0 the
+//!   destination bytes, exactly (early returns in `blend_text`;
+//!   `text_blending.rs::endpoint_exactness_both_modes` pins both modes). With
+//!   alpha 255 once a cell's age reaches `stream_fade_ms`, the steady frame
+//!   equals the no-fade frame.
+//! - Monotonicity: each channel moves monotonically toward the fg across the
+//!   full 256×256×256 (bg, fg, coverage) domain of one channel, which the other
+//!   two share (`blend_channel_linear` per channel), so a drying glyph only
+//!   approaches its final ink.
 //!
-//! The uncorrected (`corrected = false`) mode is deliberate: the tint picks an
-//! intermediate COLOUR in linear light (fringe-free on any fg/bg pair); the
-//! perceptual coverage remap stays where it lives — the glyph raster seam.
+//! The uncorrected mode is deliberate: the tint picks an intermediate colour in
+//! linear light; the perceptual coverage remap belongs to the glyph raster.
 
 use aterm_render::blend_text;
 
-/// MONOTONICITY, full per-channel domain: for EVERY (bg, fg) byte pair the
-/// blended red channel is monotone in coverage over all 256 steps — the
-/// complete 16.7M-point proof for the channel function all three positions
-/// share. Includes the non-vacuity control: an interior coverage genuinely
-/// lands strictly between bg and fg for a contrasting pair.
+/// For every (bg, fg) byte pair the blended red channel is monotone in
+/// coverage over all 256 steps, and an interior coverage lands strictly
+/// between bg and fg.
 #[test]
 fn blend_monotone_in_coverage_over_full_byte_domain() {
     for b in 0u32..=255 {
@@ -56,12 +47,11 @@ fn blend_monotone_in_coverage_over_full_byte_domain() {
                 }
                 prev = cur;
             }
-            // The sweep must END on the exact fg (convergence, again).
+            // The sweep ends on the exact fg.
             assert_eq!(prev, f, "the t=255 sample must equal fg exactly");
         }
     }
-    // Non-vacuity: linear-light midpoint of white over black is the physically
-    // correct ~sRGB 188 (strictly interior — the guarded ramp is real).
+    // Non-vacuity: the linear-light midpoint of white over black is ~sRGB 188.
     let mid = (blend_text(0, 0x00FF_0000, 0, 128, false) >> 16) & 0xff;
     assert!(
         mid > 0 && mid < 255,
@@ -73,10 +63,9 @@ fn blend_monotone_in_coverage_over_full_byte_domain() {
     );
 }
 
-/// The green and blue channel positions compute the SAME per-channel function
-/// as red (identical `blend_channel_linear` calls): pinned over a dense lattice
-/// so a channel-order regression in `blend_text`'s packing cannot hide behind
-/// the red-only full sweep above.
+/// Green and blue compute the same per-channel function as red, over a dense
+/// lattice, so a channel-order slip in `blend_text`'s packing cannot hide
+/// behind the red-only sweep.
 #[test]
 fn channels_agree_on_lattice() {
     let lattice: Vec<u32> = (0..=255).step_by(15).collect(); // 0,15,…,255 (18 values)

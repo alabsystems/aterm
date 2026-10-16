@@ -33,10 +33,7 @@ fn scrollback_truncate() {
     );
 }
 
-/// Test truncate when lines span multiple tiers.
-///
-/// Regression test for #1693: truncate() was clearing cold/warm tiers
-/// unconditionally, losing data when n exceeded hot tier size.
+/// Truncate across tiers keeps cold/warm data when `n` exceeds the hot tier.
 #[test]
 fn scrollback_truncate_cross_tier() {
     // Small limits to force tier transitions
@@ -61,7 +58,7 @@ fn scrollback_truncate_cross_tier() {
     sb.truncate(keep).expect("truncate should succeed");
     assert_eq!(sb.line_count(), keep, "line count mismatch after truncate");
 
-    // Verify we kept the LAST 15 lines (10-24)
+    // Verify we kept the last 15 lines (10-24)
     assert_eq!(
         sb.get_line(0)
             .expect("no error")
@@ -93,9 +90,8 @@ fn scrollback_truncate_zero() {
     assert_eq!(sb.cold_line_count(), 0);
 }
 
-/// Bug: `remove_newest` slow path dumped all surviving lines into hot tier,
-/// bypassing tier promotion and violating `hot_limit`. After the fix,
-/// the slow path re-promotes excess hot lines to warm/cold.
+/// The `remove_newest` slow path keeps the tier structure: surviving lines are
+/// not all dumped into hot past `hot_limit`.
 #[test]
 fn remove_newest_slow_path_restores_tier_structure() {
     let mut sb = Scrollback::with_block_size(5, 10, 10_000_000, 5);
@@ -119,7 +115,6 @@ fn remove_newest_slow_path_restores_tier_structure() {
     let expected = 30 - remove;
     assert_eq!(sb.line_count(), expected, "total line count after remove");
 
-    // The bug: all surviving lines were dumped into hot tier, exceeding hot_limit.
     assert!(
         sb.hot_line_count() < sb.hot_limit(),
         "hot tier ({}) must stay under hot_limit ({}) after slow-path rebuild",

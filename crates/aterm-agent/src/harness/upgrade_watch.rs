@@ -24,7 +24,7 @@
 //! 3. THE RE-ARM ([`super::rearm`]): a stopped round that has rested, where
 //!    the reducer's own read says so.
 //!
-//! `tools/grep_guard.sh` H1 fences this file: `watch` and everything it reaches
+//! The aterm-census guard `watch-hands` fences this file: `watch` and everything it reaches
 //! here may not call a hand (`turn_fenced`, `turn`, `type_line`, `terminate`,
 //! `restart`, a kill, a signal) nor name an input verb.
 
@@ -260,7 +260,7 @@ fn look_at(
     // (`codex::keep_wall`: placed in the zone of the Codex the read found,
     // `r.pid`, the same words kept as first placed).
     let codex = owed.iter().find(|(name, st)| {
-        session.as_deref() == Some(name.as_str()) && st.agent == upgrade::Agent::Codex
+        session.as_deref() == Some(name.as_str()) && reads_screen_wall(st.agent)
     });
     let codex_wall = codex.and_then(|_| super::codex::screen_wall_text(opts, tab));
     let keep_wall = |st: &mut St, text: Option<&str>| {
@@ -274,9 +274,9 @@ fn look_at(
     });
     // The word the look records on the read's own record: only a Claude Code
     // visit's dry read says where it read, so only its act reads are worded.
-    let claude = owed.iter().any(|(name, st)| {
-        session.as_deref() == Some(name.as_str()) && st.agent == upgrade::Agent::Claude
-    });
+    let claude = owed
+        .iter()
+        .any(|(name, st)| session.as_deref() == Some(name.as_str()) && reads_transcript(st.agent));
     let wait = look_word(&r.step, claude, || status_of(&records, session.as_deref()));
     let mut out = Watched {
         step: r.step.clone(),
@@ -358,13 +358,13 @@ fn look_at(
         // (`St::limit_spend`).
         if let Some(tail) = tail
             .as_deref()
-            .filter(|_| ours && st.agent == upgrade::Agent::Claude)
+            .filter(|_| ours && reads_transcript(st.agent))
         {
             st.limit_until = limit_reset.unwrap_or(0);
             st.limit_spend = upgrade::transcript_limit_spend(tail);
         }
         if ours
-            && st.agent == upgrade::Agent::Codex
+            && reads_screen_wall(st.agent)
             && let Some((text, spend)) = &codex_wall
         {
             keep_wall(&mut st, text.as_deref());
@@ -390,6 +390,27 @@ fn look_at(
         out.skipped = Some(if moved { "moved" } else { "not-due" }.to_string());
     }
     out
+}
+
+/// Whether the watch reads `agent`'s record as Claude Code's: through its
+/// transcript, which names its limit's reset, and through its visit's dry
+/// read, which says where it read and the target it found ([`look_word`],
+/// [`sanctioned`]). A Codex record's limit is its screen's wall
+/// ([`reads_screen_wall`]).
+fn reads_transcript(agent: upgrade::Agent) -> bool {
+    match agent {
+        upgrade::Agent::Claude => true,
+        upgrade::Agent::Codex => false,
+    }
+}
+
+/// Whether `agent`'s limit is the wall on its screen, read and kept as its
+/// lane keeps it (`codex::screen_wall_text`, `codex::keep_wall`): Codex's.
+fn reads_screen_wall(agent: upgrade::Agent) -> bool {
+    match agent {
+        upgrade::Agent::Claude => false,
+        upgrade::Agent::Codex => true,
+    }
 }
 
 /// The word a look records for its read `step` (`St::wait`; the watch, and
@@ -498,7 +519,7 @@ fn sanctioned(
     now: u64,
 ) -> Vec<String> {
     let mut wrote = Vec::new();
-    let claude = st.agent == upgrade::Agent::Claude;
+    let claude = reads_transcript(st.agent);
     let unbegun = matches!(
         st.phase,
         Phase::Pending | Phase::Announced { .. } | Phase::Failed(_)

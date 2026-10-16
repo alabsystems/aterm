@@ -1,73 +1,52 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! TOOLCHAIN LEASES: a run holds the store build it resolved for exactly as long as it runs.
+//! Toolchain leases: a run holds the store build it resolved for exactly as long as it runs.
 //!
-//! [`crate::gc`] keeps a build a running executable sits under, and that is the whole of its
-//! in-use test. A gate is not that shape. `aterm-verify` resolves ONE physical toolchain
-//! directory and hands it to every child as `$TRUST_STAGE2_BIN` (the 2026-09-24 pin), then
-//! runs stages for 33 minutes to 14 hours; between two stages no process runs from the
-//! build at all. So an update that superseded the toolchain twice inside one run let gc
-//! reclaim the directory the run was still going to use, and the run ended COULD NOT RUN
-//! (gap #31). The release cutter pins the same way for a whole cut. And an unattended
-//! trust update flipped `store/trust/current` — and re-laid the rustup view — within about
-//! 30 s at any hour, so a `targo build` followed by `targo test` could run two compilers
-//! and rebuild about 600 packages (gap #12).
-//!
-//! A LEASE says "this run is using that build" for exactly as long as the run lives: gc
-//! never reclaims a leased build ([`crate::gc`]), the seam never re-lays a leased view
-//! ([`crate::seam`]), and the unattended flip waits while the live toolchain is leased
-//! ([`crate::quiet`]).
+//! [`crate::gc`] otherwise keeps only a build a running executable sits under. A run of
+//! several commands that hands one resolved toolchain directory to every child as
+//! `$TRUST_STAGE2_BIN` (a release cut) has gaps in which no process runs from the build, so
+//! gc could reclaim it, or an unattended trust flip could switch compilers between two
+//! commands and force a full rebuild. While a lease lives, gc never reclaims the build
+//! ([`crate::gc`]), the seam never re-lays the view ([`crate::seam`]), and the unattended
+//! flip waits ([`crate::quiet`]).
 //!
 //! # The protocol
 //!
-//! Everything is a flat file under `<prefix>/leases/`, named for its SUBJECT ([`Subject`]):
+//! Every file is a direct child of `<prefix>/leases/`, named for its subject ([`Subject`]):
 //! `store-<program>-<build>` for a store build, `rustup-<name>` for the seam's view.
 //!
-//! * `<subject>@<pid>-<nonce>.lease` — ONE PER HOLDER, locked exclusive by that holder for
-//!   its whole life, and carrying one line saying who it is. It is laid as
+//! * `<subject>@<pid>-<nonce>.lease`: one per holder, locked exclusive by that holder for
+//!   its whole life, carrying one line saying who it is. It is laid as
 //!   `<subject>@<pid>-<nonce>.taking`, locked, written and only then renamed into place, so
-//!   every `.lease` a reader can see is already locked by a live holder — or is a dead
-//!   holder's, whose lock the kernel released with it. A reader that can lock a lease file
-//!   has found a dead holder's; a reader that cannot has found a live one.
-//! * `<subject>.gate` — the rendezvous between a holder and the reclaimer. A holder takes
-//!   it SHARED while it lays its lease (a moment). The reclaimer ([`reclaim`]) takes it
-//!   EXCLUSIVE without waiting and holds it for the whole reclaim — its reading of the
-//!   leases AND the delete. So a holder that arrives mid-delete waits for the delete to
-//!   finish and then finds the build gone (the caller checks), and a reclaim never deletes
-//!   a build a holder was laying a lease on.
+//!   every `.lease` a reader sees is locked by a live holder or is a dead holder's, whose
+//!   lock the kernel released. A reader that can lock a lease file has found a dead one.
+//! * `<subject>.gate`: the rendezvous between holders and the reclaimer. A holder takes it
+//!   shared while it lays its lease. The reclaimer ([`reclaim`]) takes it exclusive without
+//!   waiting and holds it across reading the leases and the delete, so a holder that
+//!   arrives mid-delete waits and then finds the build gone (the caller checks), and a
+//!   reclaim never deletes a build a holder is laying a lease on.
 //!
-//! `flock(2)` on Unix and `LockFileEx` on Windows, through std's `File::lock*` — the same
-//! primitive as the store lock ([`crate::lock`]), released by the kernel with its process,
-//! so a killed gate never leaves a build pinned forever: its lease reads as a dead holder's
-//! at the next reading and is swept ([`sweep`]).
+//! The locks are `flock(2)` on Unix and `LockFileEx` on Windows through std's `File::lock*`,
+//! as for the store lock ([`crate::lock`]), released by the kernel with the process, so a
+//! killed run never pins a build forever: its lease reads as dead and is swept ([`sweep`]).
 //!
 //! # Who takes one
 //!
-//! `aterm-verify` for a whole merge-contract run (`aterm_verify::lease`, a std-only mirror
-//! of this protocol — that crate has no dependencies by design, so it cannot call this one;
-//! the spelling here is the contract and both test suites pin it), `aterm-release` for
-//! a whole cut (`aterm_release::gates`, through [`take_for_dir`]), and anything else
-//! through the HOLDER VERB, `aterm pkg lease <dir> -- <command…>` ([`hold_for`]): it takes
-//! the lease, runs the command as its child, waits for it and lets the lease go. The
-//! packers `tools/atpkg-pack.sh` and `tools/atpkg-pack-bundle.sh` re-run themselves under
-//! it for their whole run (2026-09-26) — a shell script has no `flock(1)` on macOS to hold
-//! one with, and a lock held on an inherited descriptor would ride into every daemon the
-//! build starts (below).
+//! `aterm-release` for a whole cut (`aterm_release::gates`, through [`take_for_dir`]);
+//! `atpkg-publish`'s packers in-process, and anything else through the holder verb
+//! `aterm pkg lease <dir> -- <command…>`, both through [`hold_for`]. The verb takes the
+//! lease, runs the command as its child and lets go when it exits. A script cannot hold one
+//! itself: macOS has no `flock(1)`, and a lock on an inherited descriptor would ride into
+//! every daemon the build starts.
 //!
-//! # Why the `targo` shim takes none (measured 2026-09-26)
-//!
-//! The shim `<prefix>/bin/targo` is aterm's own code, but it is a `/bin/sh` exec stub
-//! ([`crate::platform::install_shim_to_env`]): macOS ships no `flock(1)` (`which flock`
-//! finds nothing), and `/usr/bin/lockf` takes an EXCLUSIVE lock and waits as the parent
-//! instead of exec'ing, which would serialise every build on the machine and change who
-//! receives a signal. Holding a lock across the `exec` is also wrong on its own: the
-//! descriptor would be inherited by every descendant, and one that daemonizes — an
-//! `sccache` server a build starts — would pin the build for as long as the daemon lives.
-//! And it would add nothing: for as long as a shim-launched command runs, its own
-//! executable sits under the build, which is exactly what gc's process-table test sees.
-//! What no process shows is the gap BETWEEN two commands, and the only party that knows a
-//! run spans several commands is the run itself — so the run takes the lease.
+//! The `targo` shim takes none. It is a `/bin/sh` exec stub
+//! ([`crate::platform::install_shim_to_env`]): `/usr/bin/lockf` waits as the parent instead
+//! of exec'ing (serialising every build and changing who receives a signal), and a lock held
+//! across the `exec` would pin the build for the life of any daemon the build starts (an
+//! `sccache` server). While a shim-launched command runs, its executable sits under the
+//! build, which gc's process-table test already sees; only the run knows it spans several
+//! commands.
 
 use std::fs::File;
 use std::io::{self, Read as _, Write as _};
@@ -150,7 +129,7 @@ impl Subject {
         }
     }
 
-    /// [`Self::stem`] read back. The build is the LAST `-` field, so a program named with a
+    /// [`Self::stem`] read back. The build is the last `-` field, so a program named with a
     /// `-` (`trust-mc`) reads back whole.
     #[must_use]
     pub fn parse_stem(stem: &str) -> Option<Self> {
@@ -182,12 +161,11 @@ impl Subject {
         }
     }
 
-    /// The subject a toolchain DIRECTORY belongs to — a store build's (`store/<p>/<n>/…`),
-    /// its exec root's (`compat/<p>/<n>/…`, which is that build's), or a seam view's
-    /// (`rustup/<name>/…`) — or `None` for a directory atpkg does not manage (a checkout, a
-    /// hand-made rustup toolchain): nothing of atpkg's ever reclaims one of those. Both
-    /// spellings are tried: the caller's (a gate hands in the physical path it resolved)
-    /// and the resolved one, against the prefix as written and as resolved.
+    /// The subject a toolchain directory belongs to: a store build's (`store/<p>/<n>/…`),
+    /// its exec root's (`compat/<p>/<n>/…`, which is that build's) or a seam view's
+    /// (`rustup/<name>/…`); `None` for a directory atpkg does not manage, which nothing of
+    /// atpkg's reclaims. The caller's spelling (a run hands in the physical path it resolved)
+    /// and the resolved one are both tried, against the prefix as written and as resolved.
     #[must_use]
     pub fn of_dir(prefix: &Path, dir: &Path) -> Option<Self> {
         let prefixes = [
@@ -225,7 +203,7 @@ impl Subject {
 /// A held lease. Dropping it — or the process ending — releases it.
 #[derive(Debug)]
 pub struct Lease {
-    file: File,
+    file: crate::lock::RecordLock,
     path: PathBuf,
     subject: Subject,
 }
@@ -247,11 +225,10 @@ impl Lease {
 impl Drop for Lease {
     fn drop(&mut self) {
         // The name first, then the lock: a reader never finds a live holder's file
-        // unlocked. `LOCK_UN` rather than the close — a child another thread is
-        // spawning holds a copy of every descriptor until it execs ([`crate::lock`]'s
-        // `Flock`, measured 2026-09-17).
+        // unlocked. `LOCK_UN` rather than the close: a child another thread is spawning
+        // holds a copy of every descriptor until it execs ([`crate::lock`]'s `Flock`).
         let _ = std::fs::remove_file(&self.path);
-        let _ = self.file.unlock();
+        self.file.unlock();
     }
 }
 
@@ -350,9 +327,9 @@ fn holder_tag() -> String {
 /// a pid, what it is doing). Waits up to `wait` for a reclaim of the subject in progress to
 /// finish; it never waits on another holder, since holders share the gate.
 ///
-/// The lease says nothing about whether the subject still EXISTS: a reclaim that finished
+/// The lease says nothing about whether the subject still exists: a reclaim that finished
 /// while this waited has removed it, so the caller checks what it resolved after taking
-/// the lease (it holds the only answer that matters — whether its own tool is still there).
+/// the lease.
 ///
 /// # Errors
 /// [`LeaseError::Busy`] when the gate stayed held past `wait`; [`LeaseError::Io`] when the
@@ -365,7 +342,7 @@ pub fn take(
 ) -> Result<Lease, LeaseError> {
     let d = ensure_dir(prefix)?;
     let stem = subject.stem();
-    // The gate, SHARED, polled rather than blocked on: a wedged reclaimer must end in a
+    // The gate, shared, polled rather than blocked on: a wedged reclaimer must end in a
     // sentence, never in a gate that hangs.
     let gate: std::fs::File = open_rendezvous(&d.join(format!("{stem}{GATE_SUFFIX}")))?;
     let deadline = Instant::now() + wait;
@@ -389,7 +366,7 @@ pub fn take(
     let tag = holder_tag();
     let taking = d.join(format!("{stem}{HOLDER_SEP}{tag}{TAKING_SUFFIX}"));
     let path = d.join(format!("{stem}{HOLDER_SEP}{tag}{LEASE_SUFFIX}"));
-    let laid = (|| -> io::Result<File> {
+    let laid = (|| -> io::Result<crate::lock::RecordLock> {
         let mut options = std::fs::OpenOptions::new();
         options.read(true).write(true).create_new(true);
         #[cfg(unix)]
@@ -397,15 +374,11 @@ pub fn take(
             use std::os::unix::fs::OpenOptionsExt as _;
             options.mode(0o600);
         }
-        let mut file: std::fs::File = options.open(&taking)?;
+        let file: std::fs::File = options.open(&taking)?;
         // A file this process just created cannot be held by anyone else; an error here is
-        // a filesystem without advisory locks, which is no place to promise a lease.
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "the laid lease's lock goes to a Lease, whose Drop releases by LOCK_UN; \
-                      a failed laying lets go by unlock() below"
-        )]
-        file.try_lock().map_err(|e| match e {
+        // a filesystem without usable locks, which is no place to promise a lease.
+        // The record prefix remains readable while whole-file probes are refused.
+        let mut file = crate::lock::RecordLock::try_lock(file, WHO_MAX).map_err(|e| match e {
             std::fs::TryLockError::Error(e) => e,
             std::fs::TryLockError::WouldBlock => io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -420,7 +393,7 @@ pub fn take(
         if let Err(e) = laid {
             // Let go by LOCK_UN before the close, not by the close alone (the
             // flock release rule); the caller unlinks the `.taking` name.
-            let _ = file.unlock();
+            file.unlock();
             return Err(e);
         }
         Ok(file)
@@ -464,8 +437,7 @@ pub enum Hold {
     /// The directory is none of atpkg's ([`Subject::of_dir`]): nothing of atpkg's reclaims
     /// or re-lays it, so there is nothing to hold.
     Unmanaged,
-    /// The lease could not be taken; the command runs exactly as exposed as it would have
-    /// without one — the rule the merge contract and the cutter keep.
+    /// The lease could not be taken; the command runs as exposed as it would without one.
     NotTaken(Subject, LeaseError),
 }
 
@@ -478,11 +450,10 @@ pub struct Missing {
     pub managed: bool,
 }
 
-/// THE HOLDER VERB's lease (`aterm pkg lease <dir> -- <command…>`): the subject `dir`
+/// The holder verb's lease (`aterm pkg lease <dir> -- <command…>`): the subject `dir`
 /// belongs to, leased as `who` under `prefix` for as long as the returned [`Hold`] lives,
-/// and `dir` checked to be there AFTER the lease is laid — the check [`take`] leaves to its
-/// caller, since only the caller knows what it resolved. Waits up to `wait` for a reclaim in
-/// progress, as [`take`] does.
+/// and `dir` checked to be there after the lease is laid (the check [`take`] leaves to its
+/// caller). Waits up to `wait` for a reclaim in progress, as [`take`] does.
 ///
 /// # Errors
 /// [`Missing`] when `dir` is not there once the lease is laid (or could not be): the command
@@ -664,7 +635,7 @@ pub fn live(prefix: &Path) -> io::Result<Vec<(Subject, Holders)>> {
         .collect())
 }
 
-/// A subject's gate held EXCLUSIVE: while it stands no lease on the subject can be laid,
+/// A subject's gate held exclusive: while it stands no lease on the subject can be laid,
 /// so what the reclaimer read of the leases stays true until it drops this.
 #[derive(Debug)]
 pub struct ReclaimGuard {
@@ -686,7 +657,7 @@ pub enum Reclaim {
     Keep(Holders),
 }
 
-/// Ask to reclaim `subject`: the gate taken exclusive WITHOUT waiting (a holder laying its
+/// Ask to reclaim `subject`: the gate taken exclusive without waiting (a holder laying its
 /// lease this moment keeps the subject), then its leases read, dead holders' reaped. The
 /// guard of a [`Reclaim::Clear`] must be held until the subject is gone.
 ///
@@ -783,12 +754,10 @@ pub fn sweep(prefix: &Path, exists: &dyn Fn(&Subject) -> bool) {
 }
 
 /// [`sweep`]'s arm for a `.taking` file (`laying` is its name without the suffix): reaped
-/// only while its subject's gate is held EXCLUSIVE. A holder lays its `.taking` under the
-/// gate held SHARED, and the file is UNLOCKED for the moment between its `create_new` and
-/// its lock — the lock test alone read that live holder as a dead one, removed its file,
-/// and the holder's rename then failed: a run that went on without its lease (measured
-/// 2026-09-26, `the_sweep_never_takes_a_lease_being_laid`). A gate that is not there has
-/// no holder laying under it; one that cannot be opened or is held keeps the file.
+/// only while its subject's gate is held exclusive. A holder lays its `.taking` under the
+/// gate held shared, and the file is unlocked between its `create_new` and its lock, so the
+/// lock test alone would read a live holder as dead and break its rename. A missing gate
+/// has no holder laying under it; one that cannot be opened or is held keeps the file.
 fn reap_taking(prefix: &Path, laying: &str, path: &Path) {
     let stem = laying
         .split_once(HOLDER_SEP)
@@ -824,8 +793,7 @@ mod tests {
         Subject::build("trust", build).unwrap()
     }
 
-    /// The file names are the contract `aterm-verify`'s std-only mirror writes to
-    /// (`aterm_verify::lease`): pinned here, and pinned there.
+    /// The file names every lease reader and writer agree on.
     #[test]
     fn subjects_spell_and_read_back() {
         assert_eq!(trust(9192).stem(), "store-trust-9192");
@@ -890,11 +858,11 @@ mod tests {
     fn a_lease_is_held_until_dropped() {
         let p = prefix("held");
         assert_eq!(holders(&p, &trust(1)), Holders::Free);
-        let lease = take(&p, &trust(1), "aterm-verify (pid 7) in /w", DEFAULT_WAIT).unwrap();
+        let lease = take(&p, &trust(1), "aterm-release (pid 7) in /w", DEFAULT_WAIT).unwrap();
         assert_eq!(lease.subject(), &trust(1));
         assert_eq!(
             holders(&p, &trust(1)),
-            Holders::Held(vec!["aterm-verify (pid 7) in /w".to_string()])
+            Holders::Held(vec!["aterm-release (pid 7) in /w".to_string()])
         );
         assert_eq!(
             holders(&p, &trust(2)),
@@ -922,7 +890,7 @@ mod tests {
         let lease = take(&p, &trust(3), "gone", DEFAULT_WAIT).unwrap();
         let path = lease.path().to_path_buf();
         // What the kernel does for a killed holder: the lock goes, the file stays.
-        let _ = lease.file.unlock();
+        lease.file.unlock();
         std::mem::forget(lease);
         assert!(path.exists());
         assert_eq!(holders(&p, &trust(3)), Holders::Free);
@@ -987,7 +955,7 @@ mod tests {
         let kept = take(&p, &trust(6), "live", DEFAULT_WAIT).unwrap();
         let dead = take(&p, &trust(7), "dead", DEFAULT_WAIT).unwrap();
         let dead_path = dead.path().to_path_buf();
-        let _ = dead.file.unlock();
+        dead.file.unlock();
         std::mem::forget(dead);
         let debris = dir(&p).join("store-trust-8@1-1.taking");
         std::fs::write(&debris, b"x\n").unwrap();
@@ -1011,11 +979,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&p);
     }
 
-    /// A holder MID-LAY — its subject's gate held shared, its `.taking` created and not yet
-    /// locked, the instant between `take`'s `create_new` and its `try_lock` — is not reaped
-    /// by a sweep: the file is a live holder's, and reaping it failed that holder's rename,
-    /// so its run went on without a lease. Once the gate is free (the holder gone: the
-    /// kernel released its shared lock with it) the same file is debris, and goes.
+    /// A holder mid-lay (its gate held shared, its `.taking` created and not yet locked) is
+    /// not reaped by a sweep; once the gate is free the same file is debris, and goes.
     #[test]
     fn the_sweep_never_takes_a_lease_being_laid() {
         let p = prefix("sweep-laying");

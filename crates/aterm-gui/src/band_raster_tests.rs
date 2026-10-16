@@ -49,17 +49,9 @@ pub(super) fn themes() -> Vec<(&'static str, Theme)> {
     aterm_types::scheme::builtin_names()
         .into_iter()
         .map(|name| {
-            let parts = aterm_types::scheme::builtin(name)
-                .expect("a listed scheme")
-                .to_theme_parts();
             (
                 name,
-                Theme {
-                    fg: parts.fg,
-                    bg: parts.bg,
-                    cursor: parts.cursor,
-                    selection: parts.selection,
-                },
+                Theme::from(&aterm_types::scheme::builtin(name).expect("a listed scheme")),
             )
         })
         .collect()
@@ -873,9 +865,9 @@ fn a_meter_rows_primary_is_an_accent_ring_and_a_plain_rows_is_solid() {
 
 /// The outline never reads brown: on every builtin scheme the outlined
 /// Primary's ring and label (rest and lit) keep a hue of the accent family.
-/// Catppuccin Latte's rosewater, floored to AA, is brown, so its outline
-/// borrows the theme's blue while its fill keeps the rosewater with a darker
-/// edge. Every other scheme's outline is its meter's hue.
+/// Linen's rust cursor and Catppuccin Latte's rosewater, floored to AA, are
+/// brown, so their outlines borrow the theme's blue. Every other scheme's
+/// outline is its meter's hue.
 #[test]
 fn the_outlined_primary_keeps_the_accent_family_on_every_scheme() {
     use aterm_messages::palette::reads_brown;
@@ -907,7 +899,7 @@ fn the_outlined_primary_keeps_the_accent_family_on_every_scheme() {
         }
     }
     let borrowers: Vec<&str> = seen.iter().filter(|(_, b)| *b).map(|(n, _)| *n).collect();
-    assert_eq!(borrowers, ["Catppuccin Latte"], "{seen:?}");
+    assert_eq!(borrowers, ["Linen", "Catppuccin Latte"], "{seen:?}");
 }
 
 /// Theme blue/cyan is borrowed when the cursor is near-grey (the eight builtin
@@ -919,6 +911,10 @@ fn a_near_grey_cursor_borrows_blue_or_cyan_and_the_rest_keep_theirs() {
     use aterm_messages::palette::MeterHue;
     let pinned = [
         ("Default", MeterHue::Cursor),
+        ("Aterm Night", MeterHue::Cursor),
+        ("Aterm Day", MeterHue::Cursor),
+        ("Hearth", MeterHue::Cursor),
+        ("Linen", MeterHue::Cursor),
         ("Dracula", MeterHue::Blue),
         ("Nord", MeterHue::Blue),
         ("Tokyo Night", MeterHue::Cursor),
@@ -926,6 +922,7 @@ fn a_near_grey_cursor_borrows_blue_or_cyan_and_the_rest_keep_theirs() {
         ("Gruvbox Dark", MeterHue::Cyan),
         ("Solarized Dark", MeterHue::Cyan),
         ("One Dark", MeterHue::Blue),
+        ("Default Light", MeterHue::Cursor),
         ("Solarized Light", MeterHue::Blue),
         ("Gruvbox Light", MeterHue::Blue),
         ("Catppuccin Latte", MeterHue::Cursor),
@@ -996,17 +993,36 @@ fn a_near_grey_cursor_borrows_blue_or_cyan_and_the_rest_keep_theirs() {
     }
 }
 
-/// The pastel fill: of the builtin schemes, only Catppuccin Latte keeps its
-/// cursor's pastel rosewater for the progress fill (the 3:1 floor made it a
-/// brick bar) and ends it in a darker rose edge line that stands 3:1 from the
-/// track, visibly darker than the fill, with the words on the fill at AA.
-/// Every other scheme is unchanged byte for byte: hue floored to 3:1 on the
-/// band, track tinted from it, no edge, and no line in the raster.
+/// The pastel fill: a scheme whose cursor is a pastel the 3:1 floor would
+/// turn brown keeps the pastel for the progress fill and ends it in a darker
+/// edge line that stands 3:1 from the track, visibly darker than the fill,
+/// with the words on the fill at AA. No builtin needs it since Catppuccin
+/// Latte's cursor was deepened to 3:1 on its background, so the subject is a
+/// user theme that keeps Latte's upstream rosewater cursor `#dc8a78`. Every
+/// builtin is the ordinary bar: hue floored to 3:1 on the band, track tinted
+/// from it, no edge, and no line in the raster.
 #[test]
-fn only_catppuccin_latte_keeps_a_pastel_fill_with_a_darker_edge() {
+fn only_a_pastel_cursor_keeps_a_pastel_fill_with_a_darker_edge() {
     use aterm_messages::palette::{MeterHue, oklch as ok};
+    const UPSTREAM_LATTE: &str = "Catppuccin Latte, upstream rosewater cursor";
+    let mut subjects = palettes();
+    let latte = subjects
+        .iter()
+        .find(|(name, _)| *name == "Catppuccin Latte")
+        .map(|(_, palette)| *palette)
+        .expect("Catppuccin Latte is a builtin");
+    subjects.push((
+        UPSTREAM_LATTE,
+        chrome_band::BandPalette {
+            theme: aterm_render::Theme {
+                cursor: 0x00DC_8A78,
+                ..latte.theme
+            },
+            ..latte
+        },
+    ));
     let mut pastels = Vec::new();
-    for (name, palette) in palettes() {
+    for (name, palette) in subjects {
         let c = palette.colors();
         let ansi = palette.ansi.unwrap();
         let cursor = [
@@ -1102,7 +1118,7 @@ fn only_catppuccin_latte_keeps_a_pastel_fill_with_a_darker_edge() {
             }
         }
     }
-    assert_eq!(pastels, ["Catppuccin Latte"]);
+    assert_eq!(pastels, [UPSTREAM_LATTE]);
 }
 
 /// Drawn icons, no spinner: every glyph a row can carry (plain row, bar,

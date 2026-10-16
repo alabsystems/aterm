@@ -2,20 +2,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Line-level grid checkpoint primitives.
+//! Line-level grid checkpoint: project a [`Grid`]'s cells (scrollback, then
+//! visible rows) into a flat `Vec<Line>`, and restore visible rows from
+//! [`Line`]s, keeping wide chars, combining marks, graphemes, hyperlinks, RGB
+//! colours, SGR flags and the wrapped flag.
 //!
-//! Project a [`Grid`]'s cell content (scrollback + visible rows) into a flat
-//! `Vec<Line>` and restore visible rows from [`Line`]s, with per-cell fidelity
-//! (wide chars, combining marks, complex/ZWJ graphemes, hyperlinks, RGB
-//! colours, SGR flags, the wrapped flag).
-//!
-//! Both directions reuse the scrollback conversion paths, so any fidelity bug
-//! here is also a scrollback bug:
-//! - capture: [`extract_row_extras`](super::scroll_convert) +
-//!   [`row_to_line_with_stored_extras`](super::scroll_convert), the pair a row
-//!   scrolling off into scrollback goes through.
-//! - restore: [`fill_row_from_line`](super::Grid::fill_row_from_line), the path
-//!   Kitty CSI +T "unscroll" uses.
+//! Both directions reuse the scrollback conversions (capture:
+//! `extract_row_extras` + `row_to_line_with_stored_extras_at_len`; restore:
+//! `fill_row_from_line`, Kitty CSI +T unscroll's path), so a fidelity bug here
+//! is also a scrollback bug.
 
 use aterm_scrollback::Line;
 
@@ -37,15 +32,12 @@ impl Grid {
         let scrollback_count = self.scrollback_lines();
         let mut lines = Vec::with_capacity(scrollback_count + self.rows() as usize);
 
-        // Scrollback history, oldest first; a decode failure becomes an empty
-        // placeholder line.
         lines.extend(
             self.history_lines_from(0)
                 .take(scrollback_count)
                 .map(|line| line.map_or_else(Line::new, std::borrow::Cow::into_owned)),
         );
 
-        // 2) Visible rows, top → bottom, via the stored-extras scroll path.
         lines.extend(self.checkpoint_visible_lines());
         lines
     }
@@ -95,11 +87,11 @@ impl Grid {
                 continue;
             };
             let row_extras = Self::extract_row_extras(row, extras, r, styles);
-            // Read as history reads a row: a continued row at its full width
-            // less a recorded early-wrap hole, so the restored row re-derives
-            // the hole exactly and rewraps as the live one does. At its length,
-            // a hole after skipped cells (a tab, CUF, CHA) came back unmarked,
-            // and a row DCH left one short of the margin came back with one.
+            // Measured as history measures a row: a continued row at its full
+            // width less a recorded early-wrap hole, so the restored row
+            // re-derives the hole and rewraps as the live one does. `row.len()`
+            // would drop a hole after skipped cells (a tab, CUF, CHA) and invent
+            // one on a row DCH left one short of the margin.
             let len = super::scrollback_reflow::history_row_len(row, self.row_at_screen(r + 1));
             lines.push(Self::row_to_line_with_stored_extras_at_len(
                 row,
@@ -490,8 +482,7 @@ mod tests {
 
     #[test]
     fn roundtrip_scrollback_fills() {
-        // Write more than `rows` lines so scrollback fills, by pushing lines
-        // directly into a tiered scrollback then checkpointing.
+        // Scrollback filled by pushing lines straight into a tiered store.
         let mut g = Grid::with_tiered_scrollback(3, 12, 1000, Scrollback::with_defaults());
         let mut sb = Scrollback::with_defaults();
         sb.set_line_limit(None);

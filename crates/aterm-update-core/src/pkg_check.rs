@@ -1,89 +1,69 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Has the TOOLCHAIN package manager (atpkg) ever completed an update check on this
-//! machine, did its last one reach the signed index, and how did it end — read off its
-//! `status.toml` alone, so an edge that must not link atpkg's internals (the `aterm` session
-//! lane, the window) can decide on it.
+//! Whether the toolchain package manager (atpkg) has completed an update check on this
+//! machine, whether its last one reached the signed index, and how it ended, read off its
+//! `status.toml` alone so edges that must not link atpkg (the `aterm` session lane, the
+//! window) can decide on it.
 //!
-//! THE RECORD a full `update` pass writes at its end, and nothing else writes (atpkg's
-//! recorded pass is its one writer; the derived models `AtpkgPassStamps` and
-//! `AtpkgFullPassRule` state the contract with the readers here):
+//! A full `update` pass writes the record at its end, and nothing else writes these keys (the
+//! derived models `AtpkgPassStamps` and `AtpkgFullPassRule` state the contract):
 //!
-//! * `last_success_at` — a pass that REACHED the signed index: it verified an index the
-//!   channel served THIS pass, not the §14 cache's, and ran to its end. A pass served from
-//!   the cache after a refusal, offline, or whose resolve failed stamps no success, or a
-//!   sibling's failure ladder would read it as healed with nothing reached. "Never checked"
-//!   is: the file is absent, or it carries no
-//!   `last_success_at`, or that value is empty.
-//! * `last_pass` / `last_pass_at` — how the pass ENDED ([`PassOutcome`]): `ok` when it stamped
-//!   that success (or had nothing to check), `offline` when no host answered, else `failed`.
-//!   The schedulers read that, never `updated_at`: every write moves `updated_at` — a vendor
-//!   door, a typed verb, a row — so "written after the last success" would read as a FAILED
-//!   pass and hold the session's pass up to six hours from the write.
-//! * `last_pass_attempted_index_build` / `last_pass_attempted_at` — the index the pass was
+//! * `last_success_at`: a pass that reached the signed index (verified an index the channel
+//!   served this pass, not the cache's) and ran to its end. A cache-served, offline or
+//!   failed-resolve pass stamps none, or a sibling's failure ladder would read it as healed.
+//!   Absent or empty is "never checked".
+//! * `last_pass` / `last_pass_at`: how the pass ended ([`PassOutcome`]). The schedulers read
+//!   these, never `updated_at`: every write moves `updated_at`, so "written after the last
+//!   success" would read as a failed pass.
+//! * `last_pass_attempted_index_build` / `last_pass_attempted_at`: the index the pass was
 //!   launched for or resolved, bound to its end in the same write, so a newer published index
-//!   is told apart from a sibling's attempt at the SAME one.
+//!   is told apart from a sibling's attempt at the same one.
 //!
-//! DATA, never a line: nothing prints into a shell the user did not ask to update; `aterm
-//! pkg doctor` reports it.
+//! It is data, never printed into a shell the user did not ask to update; `aterm pkg doctor`
+//! reports it.
 //!
-//! THE MACHINE-WIDE PASS RULE lives here too, read by both lanes
-//! that schedule a full pass on their own — the terminal session's one-shot
-//! ([`full_pass_owed`]) and, for its interval, the window's walk ([`full_pass_due_in`]): a
-//! full `update` pass is owed when none has ever succeeded or the last success is
-//! [`FULL_PASS_INTERVAL_SECS`] old — never while a pass is installing, never within
-//! [`PASS_SPACING_SECS`] of the last full pass ATTEMPTED anywhere on the machine, so
-//! several aterm processes never run the same pass back to back, never within the interval
-//! of one that FAILED, so a pass that keeps failing is retried once per interval by this
-//! rule, not once per tab (the window retries its OWN failed pass on its failure ladder,
-//! and stands down once a later pass [`healed`] it). What was published reaches the
-//! machine sooner through the window's hints — atpkg's next-index probe and the vendor
-//! head watch — never through this rule. There is no
-//! rate-limit hold: the pass makes no metered request (owner ruling R3), and the download
-//! host's 429 is an ordinary failure on the ladder.
+//! The machine-wide pass rule lives here too ([`full_pass_owed`], [`full_pass_due_in`]), read
+//! by the session's one-shot and the window's walk, so aterm processes never run the same pass
+//! back to back and a failing pass is retried once per interval, not once per tab (the window
+//! retries its own failure on its ladder until [`healed`]). New publications arrive sooner
+//! through the window's hints. There is no rate-limit hold: the pass makes no metered request,
+//! and a 429 is an ordinary failure.
 
 use std::ffi::OsString;
 use std::path::Path;
 
-/// The exit code of an atpkg update pass that reached NOTHING: no
-/// host answered its index discovery — the link itself failed (DNS, connect, timeout, TLS);
-/// a host that answered with something else (a rate limit, a 5xx, a portal's page) is a
-/// failure, exit 1 — no vendor's release channel answered, and every member it lost was
-/// lost at a fetch. Not a success (it stamps no `last_success_at` and records `offline`),
-/// not a failure the user must act on (nothing is wrong but the network), not contention
-/// (75): a pass to retry quietly and soon. Sysexits
-/// `EX_UNAVAILABLE`. Here, in the crate both atpkg and the window read, so the code the
-/// pass exits with and the code the window classifies are one constant.
+/// The exit code (sysexits `EX_UNAVAILABLE`) of an atpkg update pass that reached nothing:
+/// the link to every host failed (DNS, connect, timeout, TLS). A host that answered with
+/// anything else (a rate limit, a 5xx, a portal page) is a failure, exit 1. Offline stamps no
+/// `last_success_at`, records `offline`, and is retried quietly and soon. Shared by atpkg and
+/// the window so the exit and its classification are one constant.
 pub const PASS_OFFLINE_EXIT: u8 = 69;
 
-/// THE FALLBACK WALK: a full pass is owed once the machine's last success is this old,
-/// whatever the hints say — six hours. Not a day: the next-index probe answers only for the
-/// shipped public index (a repointed or private index, an `ATPKG_REGISTRY` directory, a
-/// network whose proxy answers the probe with anything but GitHub's own redirect all get
-/// `Deferred`), and for those machines this walk is the only way a newly published index
-/// is found. It is machine-wide, so N windows and every tab share one walk per interval.
+/// The fallback walk: a full pass is owed once the machine's last success is this old,
+/// whatever the hints say. Not a day: the next-index probe answers only for the shipped public
+/// index (a repointed or private index, an `ATPKG_REGISTRY` directory or a proxy that rewrites
+/// GitHub's redirect get `Deferred`), and there this walk is the only way a new index is
+/// found. Machine-wide, so every window and tab share one walk per interval.
 pub const FULL_PASS_INTERVAL_SECS: u64 = 6 * 60 * 60;
 
-/// No lane starts a scheduled full pass within this long of the last full pass ATTEMPTED on
-/// the machine by another process ([`Stamps::last_attempt`]), nor while one is installing:
-/// the next look sees what that pass left.
+/// No lane starts a scheduled full pass within this long of the last full pass attempted on
+/// the machine ([`Stamps::last_attempt`]), nor while one is installing.
 pub const PASS_SPACING_SECS: u64 = 5 * 60;
 
-/// How a full `update` pass ended, as the pass records it in `status.toml` (`last_pass`, with
-/// `last_pass_at` the moment it ended). The one reading of a pass's outcome the schedulers
-/// take ([`Stamps::last_failed`]); `updated_at` is every writer's and proves nothing.
+/// How a full `update` pass ended, as it records itself in `status.toml` (`last_pass`, with
+/// `last_pass_at` its end). The schedulers read this ([`Stamps::last_failed`]), never
+/// `updated_at`, which every writer moves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PassOutcome {
-    /// The pass stamped `last_success_at`: it REACHED the signed index — verified one the
-    /// channel served this pass — and ran to its end (a member that failed is recorded in its
-    /// own row). Or it had nothing to check (no program managed, the set not owed): no success
-    /// stamp, and the schedule counts it as one ([`Stamps::last_success`]).
+    /// The pass reached the signed index and ran to its end (a failed member is recorded in
+    /// its own row), stamping `last_success_at`; or it had nothing to check, which stamps no
+    /// success but counts as one ([`Stamps::last_success`]).
     Ok,
     /// No host answered ([`PASS_OFFLINE_EXIT`]): nothing was checked.
     Offline,
-    /// Anything else: the index was not reached (a refusal the §14 cache stood in for, a
-    /// resolve that failed), nothing was installable here.
+    /// Anything else: the index was not reached (a refusal the cache stood in for, a resolve
+    /// that failed) or nothing was installable here.
     Failed,
 }
 
@@ -109,9 +89,8 @@ impl PassOutcome {
         }
     }
 
-    /// The outcome of a pass that exited `code`: [`Self::Ok`] when it stamped a success
-    /// (`stamped_success` — whatever the exit, as `last_success_at` reads), else offline or
-    /// failed by the exit.
+    /// The outcome of a pass that exited `code`: [`Self::Ok`] when it stamped a success,
+    /// whatever the exit; else offline or failed by the exit.
     #[must_use]
     pub const fn of_pass(stamped_success: bool, code: u8) -> Self {
         if stamped_success {
@@ -124,15 +103,13 @@ impl PassOutcome {
     }
 }
 
-/// How long a scheduled pass queues behind another pass at the store lock (`--wait-lock`)
-/// before it stands aside with atpkg's contention exit: bounded by the retry, not by the
-/// download, and the same for every lane that schedules one.
+/// How long a scheduled pass queues at the store lock (`--wait-lock`) before it stands aside
+/// with atpkg's contention exit.
 pub const PASS_WAIT_LOCK_SECS: u64 = 30 * 60;
 
-/// The flags every scheduled pass carries after its verb — ONE argv for the window's
-/// passes and the session's: `--wait-lock` ([`PASS_WAIT_LOCK_SECS`]), so a contended pass
-/// queues instead of refusing, and `--progress-file` under the store when there is one, so
-/// a window can follow any lane's pass and every lane can see a pass in flight.
+/// The flags every scheduled pass carries after its verb: `--wait-lock`
+/// ([`PASS_WAIT_LOCK_SECS`]), so a contended pass queues, and `--progress-file` under the
+/// store when there is one, so every lane can see a pass in flight.
 #[must_use]
 pub fn pass_flags(progress_file: Option<&Path>) -> Vec<OsString> {
     let mut flags: Vec<OsString> =
@@ -147,28 +124,23 @@ pub fn pass_flags(progress_file: Option<&Path>) -> Vec<OsString> {
 /// The machine-wide stamps of `status.toml` a scheduler reads before it runs a pass.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Stamps {
-    /// Unix seconds of the last SUCCESSFUL update pass (`last_success_at`), or of a later
-    /// full pass that recorded itself [`PassOutcome::Ok`] without one (it had nothing to
-    /// check): the schedule's walk counts from either.
+    /// Unix seconds of the last successful pass (`last_success_at`), or of a later full pass
+    /// that recorded [`PassOutcome::Ok`] with nothing to check; the walk counts from either.
     pub last_success: Option<i64>,
-    /// Unix seconds of the last full pass ATTEMPTED, failed or not: the end the pass recorded
-    /// (`last_pass_at`), or the last success when that is later (a success any writer stamped
-    /// is an attempt too). Never `updated_at`, which every writer moves.
+    /// Unix seconds of the last full pass attempted, failed or not: `last_pass_at`, or the last
+    /// success when that is later. Never `updated_at`, which every writer moves.
     pub last_attempt: Option<i64>,
-    /// How the last full pass ended, as it recorded itself (`last_pass`); `None` when no pass
-    /// recorded one — a record from before the field reads by its success alone.
+    /// How the last full pass ended (`last_pass`); `None` when no pass recorded one.
     pub last_outcome: Option<PassOutcome>,
     /// The index build the last pass resolved (`last_index_build`; `0` for none). A caller
     /// that can read the store's verified floor raises it to that.
     pub last_index_build: u64,
-    /// The last full pass's requested or resolved index, bound to its end stamp in
-    /// the same status write. `None` for older records or a pass that knew no
-    /// index. A newer published hint may bypass sibling spacing only when this
-    /// witness belongs to the latest attempt; same-build failures still space.
+    /// The last full pass's requested or resolved index, bound to its end stamp in the same
+    /// write; `None` for older records or a pass that knew no index.
     pub last_pass_target: Option<(i64, u64)>,
-    /// Whether a pass is installing on the store NOW (its progress file names a live
-    /// writer) — never in `status.toml`; the caller that can read the progress file sets
-    /// it, and it counts as an attempt this moment.
+    /// Whether a pass is installing on the store now (its progress file names a live writer).
+    /// Not in `status.toml`: the caller that reads the progress file sets it, and it counts as
+    /// an attempt this moment.
     pub in_flight: bool,
 }
 
@@ -193,10 +165,9 @@ impl Stamps {
             last_pass_at.map(|_| PassOutcome::from_word(word("last_pass").unwrap_or_default()));
         let last_success = stamp("last_success_at")
             .max(last_pass_at.filter(|_| last_outcome == Some(PassOutcome::Ok)));
-        // A prior binary can preserve the new target fields as unknown `extra`
-        // while rewriting the known pass end. Its whole-second stamp cannot
-        // match the target-bearing writer's fractional-zero format, including
-        // when both passes end in the same second.
+        // An older writer can carry the target fields along as unknown keys while rewriting
+        // the pass end in whole seconds, so the target counts only beside the target-bearing
+        // writer's `.000000000Z` end.
         let target_belongs_to_end = last_pass_at_word
             .filter(|end| end.ends_with(".000000000Z"))
             .is_some_and(|end| word("last_pass_attempted_at") == Some(end));
@@ -237,11 +208,10 @@ impl Stamps {
                 .is_some_and(|then| !elapsed(then, now_unix, PASS_SPACING_SECS))
     }
 
-    /// The latest completed full pass ATTEMPTED an older index. Only that
-    /// evidence lets a strictly newer published hint bypass sibling spacing:
-    /// an in-flight pass, an older schema, or a target not bound to the latest
-    /// attempt keeps the conservative wait. A failure at the same build is
-    /// deduplicated; a new build may be tried after an old one failed.
+    /// Whether the latest completed full pass attempted an index older than `published`. Only
+    /// that lets a newer published hint bypass sibling spacing: an in-flight pass, an older
+    /// record, or a target not bound to the latest attempt keeps the wait, and a failure at the
+    /// same build stays deduplicated.
     #[must_use]
     pub fn completed_older_index_pass(&self, published: u64) -> bool {
         !self.in_flight
@@ -251,9 +221,9 @@ impl Stamps {
             })
     }
 
-    /// Whether the machine's last full pass FAILED: it recorded an outcome other than
-    /// [`PassOutcome::Ok`], and no success was stamped since. What the pass recorded, never
-    /// an order of stamps: a write after the last success is no failed pass.
+    /// Whether the machine's last full pass failed: it recorded an outcome other than
+    /// [`PassOutcome::Ok`] and no success was stamped since. A write after the last success is no
+    /// failed pass.
     #[must_use]
     pub fn last_failed(&self) -> bool {
         match (self.last_outcome, self.last_attempt) {
@@ -265,11 +235,9 @@ impl Stamps {
     }
 }
 
-/// Whether a lane's own pass that failed at `failed_at` has been HEALED: a pass that ended
-/// `ok` — it reached the signed index, or had nothing to check — ended after it, anywhere on
-/// the machine. The window's retry reads it before it runs its failure ladder's next pass
-/// (`AtpkgPassStamps`' `HealedOnlyByAReachedPass`): a pass the §14 cache served after a
-/// refusal records `failed` and heals nothing. Pure.
+/// Whether a lane's own pass that failed at `failed_at` has been healed: a pass that ended
+/// `ok` ended after it, anywhere on the machine. A cache-served pass after a refusal records
+/// `failed` and heals nothing (`AtpkgPassStamps`' `HealedOnlyByAReachedPass`).
 #[must_use]
 pub fn healed(stamps: &Stamps, failed_at: i64) -> bool {
     stamps
@@ -277,10 +245,9 @@ pub fn healed(stamps: &Stamps, failed_at: i64) -> bool {
         .is_some_and(|success| success > failed_at)
 }
 
-/// Seconds from `now_unix` until a LAUNCH owes its first `update` pass, `0` when it owes one
-/// now: at once when no pass ever succeeded or the last one failed — the failure ladder's
-/// minutes-scale retry, never a six-hour park — else the rest of [`FULL_PASS_INTERVAL_SECS`]
-/// since the last success. Pure.
+/// Seconds from `now_unix` until a launch owes its first `update` pass (`0`: now): at once
+/// when no pass ever succeeded or the last one failed (the failure ladder's minutes-scale
+/// retry), else the rest of [`FULL_PASS_INTERVAL_SECS`] since the last success.
 #[must_use]
 pub fn launch_due_in(stamps: &Stamps, now_unix: i64) -> u64 {
     match stamps.last_success {
@@ -300,10 +267,8 @@ pub enum Owed {
     Interval,
 }
 
-/// THE MACHINE-WIDE RULE: the full pass owed at `now_unix` — none ever succeeded, or the
-/// last success is [`FULL_PASS_INTERVAL_SECS`] old — or `None`, which is also the answer
-/// while a pass is installing or was attempted within [`PASS_SPACING_SECS`] (the next look
-/// sees what it left), and within the interval of one that failed. Pure.
+/// The full pass owed at `now_unix` (none ever succeeded, or the last success is
+/// [`FULL_PASS_INTERVAL_SECS`] old), or `None` while [`full_pass_due_in`] holds it back.
 #[must_use]
 pub fn full_pass_owed(stamps: &Stamps, now_unix: i64) -> Option<Owed> {
     if full_pass_due_in(stamps, now_unix) > 0 {
@@ -315,11 +280,10 @@ pub fn full_pass_owed(stamps: &Stamps, now_unix: i64) -> Option<Owed> {
     })
 }
 
-/// Seconds from `now_unix` until [`full_pass_owed`] owes a pass, `0` when it owes one now:
-/// the LATEST of what holds it back — a pass installing (look again after the spacing), the
-/// spacing after the last attempt, the interval after a failed attempt, the interval after
-/// the last success. Each is bounded by its own period, so a stamp a clock set back wrote
-/// never holds a lane longer than that. Pure: what a lane parks for when nothing is owed yet.
+/// Seconds from `now_unix` until [`full_pass_owed`] owes a pass (`0`: now): the latest of a
+/// pass installing (the spacing), the spacing after the last attempt, the interval after a
+/// failed attempt, and the interval after the last success. Each is bounded by its own period,
+/// so a stamp from a clock set back holds a lane no longer than that.
 #[must_use]
 pub fn full_pass_due_in(stamps: &Stamps, now_unix: i64) -> u64 {
     let spacing = if stamps.in_flight {
@@ -339,9 +303,9 @@ pub fn full_pass_due_in(stamps: &Stamps, now_unix: i64) -> u64 {
     spacing.max(failed).max(interval)
 }
 
-/// Whether `every_secs` have passed since the stamp `then` at `now_unix`. A stamp more
-/// than a period in the FUTURE counts as passed: a clock since set back wrote it, and one
-/// run rewrites it — trusting it would stall the lane until that clock came round again.
+/// Whether `every_secs` have passed since `then` at `now_unix`. A stamp more than a period in
+/// the future counts as passed: a clock since set back wrote it, and trusting it would stall
+/// the lane until that clock came round again.
 fn elapsed(then: i64, now_unix: i64, every_secs: u64) -> bool {
     let every = i64::try_from(every_secs).unwrap_or(i64::MAX);
     let age = now_unix.saturating_sub(then);
@@ -362,11 +326,10 @@ fn remaining(then: i64, now_unix: i64, every_secs: u64) -> u64 {
 const CLAIM_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Claim a lane's once-per-`every_secs` slot in `stamp` (unix seconds, one line) at
-/// `now_unix`: `true`, with the stamp moved to now, when the last claim is that old, absent
-/// or unreadable; `false` while it is younger, or while another process holds the claim.
-/// Serialized across processes by an advisory lock on the sibling `<stamp>.lock`, held for
-/// the read and the write only. A stamp that cannot be locked (no directory, a read-only
-/// prefix) answers `true`: the lane runs as it would with no stamp at all.
+/// `now_unix`: `true`, with the stamp moved to now, when the last claim is that old, absent or
+/// unreadable; `false` while it is younger or another process holds the claim. Serialized by
+/// an advisory lock on `<stamp>.lock`, held for the read and write only. A stamp that cannot
+/// be locked (no directory, a read-only prefix) answers `true`, as if there were no stamp.
 #[must_use]
 pub fn claim(stamp: &Path, now_unix: i64, every_secs: u64) -> bool {
     let lock = stamp.with_extension("lock");
@@ -385,13 +348,10 @@ pub fn claim(stamp: &Path, now_unix: i64, every_secs: u64) -> bool {
     true
 }
 
-/// A package status stamp → unix seconds. DECIDED 2026-09-25: strict about the zone,
-/// tolerant of a fraction — `aterm_types::rfc3339::parse_utc_fractional`. The pass writer
-/// stamps `last_pass_at` as `….000000000Z` (atpkg `status.rs`), so a fraction is a shape
-/// this record really carries and is truncated; a zone offset is not, and reading one as
-/// UTC would move every freshness verdict the GUI draws from it (the Packages screen, the
-/// Update screen's "checked" line, the scheduler's pass spacing) by up to 14 h. It used to
-/// ignore anything after the seconds, offsets included.
+/// A package status stamp → unix seconds: strict about the zone, tolerant of a fraction
+/// (`aterm_types::rfc3339::parse_utc_fractional`). The pass writer stamps `last_pass_at` as
+/// `….000000000Z`; an offset is refused, since reading it as UTC would move every freshness
+/// verdict drawn from it by up to 14 h.
 #[must_use]
 pub fn rfc3339_to_unix(s: &str) -> Option<i64> {
     aterm_types::rfc3339::parse_utc_fractional(s)
@@ -408,11 +368,8 @@ mod tests {
         d.join("status.toml")
     }
 
-    /// The stamps a scheduler reads: the success, the attempt (the end the last full pass
-    /// recorded, or the success when that is later), the pass's own outcome and the index
-    /// build — absent, empty and unparseable all read as none. `updated_at` is read by nothing
-    /// here: any write after the last success (a vendor head-watch pass, a typed verb) would
-    /// read as a failed pass.
+    /// The success, the attempt, the outcome and the index build are read off the record;
+    /// absent, empty and unparseable read as none, and `updated_at` is read by nothing.
     #[test]
     fn the_stamps_are_read_off_the_record() {
         let p = scratch("stamps");
@@ -435,8 +392,7 @@ mod tests {
                 in_flight: false,
             }
         );
-        // Only a success stamp (a record from before `last_pass`): it is the attempt, and no
-        // outcome is recorded — the write after it is not a failed pass.
+        // Only a success stamp (an older record): it is the attempt, and no outcome is read.
         std::fs::write(
             &p,
             "updated_at = \"2026-09-10T09:00:00Z\"\nlast_success_at = \"2026-09-10T08:34:12Z\"\n",
@@ -447,7 +403,7 @@ mod tests {
         assert_eq!(only.last_outcome, None);
         assert!(!only.last_failed());
         assert_eq!(only.last_index_build, 0);
-        // A success stamped after the recorded pass (another writer's) is the later attempt.
+        // A success stamped after the recorded pass is the later attempt.
         std::fs::write(
             &p,
             "last_success_at = \"2026-09-10T08:34:12Z\"\nlast_pass = \"failed\"\n\
@@ -471,9 +427,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 
-    /// THE PASS'S OWN VERDICT: a pass that stamped a success is `ok` whatever it exited (a
-    /// member that failed, a listing refused while the cache stood in), one that reached no
-    /// host is `offline`, anything else `failed` — and each word reads back as itself.
+    /// A pass that stamped a success is `ok` whatever it exited, one that reached no host is
+    /// `offline`, anything else `failed`; each word reads back as itself.
     #[test]
     fn a_pass_records_its_outcome_by_what_it_stamped() {
         assert_eq!(PassOutcome::of_pass(true, 0), PassOutcome::Ok);
@@ -494,11 +449,9 @@ mod tests {
         }
     }
 
-    /// THE SESSION LANE'S MISREAD, FIXED (§3.3 of the 2026-09-22 design): a success seven
-    /// hours old and a vendor head-watch write a minute ago. Read by the pass's recorded
-    /// outcome the walk is owed now; the order of the stamps said "attempted after the last
-    /// success", a failed pass, and held the session's pass until six hours after the WRITE.
-    /// The negative control: the same record whose last pass did fail holds the interval.
+    /// A seven-hour-old success and a write a minute ago: the walk is owed now, since the
+    /// write is no failed pass. Negative control: the same record whose last pass failed holds
+    /// the interval from that pass.
     #[test]
     fn a_write_after_the_last_success_is_no_failed_pass() {
         let now = 1_790_000_000_i64;
@@ -526,11 +479,9 @@ mod tests {
         );
     }
 
-    /// HEALED only by a pass that ended `ok` strictly after the lane's own failure — a pass the
-    /// §14 cache served after a refusal records `failed` and stamps no success, so it heals
-    /// nothing (audit PK-3, `AtpkgPassStamps`' `HealedOnlyByAReachedPass`). And a LAUNCH owes
-    /// a pass at once when no pass ever succeeded or the last one failed, else the rest of
-    /// the interval since the last success.
+    /// Only a pass that ended `ok` strictly after the lane's own failure heals it (a
+    /// cache-served pass records `failed`). A launch owes a pass at once when none ever
+    /// succeeded or the last failed, else the rest of the interval since the last success.
     #[test]
     fn a_failure_is_healed_only_by_a_later_ok_pass_and_a_launch_retries_it_at_once() {
         let now = 1_790_000_000_i64;
@@ -547,7 +498,7 @@ mod tests {
         };
         let own_failure = now - 600;
         assert!(!healed(&Stamps::default(), own_failure));
-        // A sibling's pass on the cache after a refusal: `failed`, no success — not a heal.
+        // A sibling's cache-served pass after a refusal: `failed`, no success, no heal.
         let cached = record(Some(now - 7200), "failed", now - 60);
         assert!(
             !healed(&cached, own_failure),
@@ -573,11 +524,8 @@ mod tests {
         );
     }
 
-    /// A FULL PASS WITH NOTHING TO CHECK (no program managed, the set not owed) records `ok`
-    /// and stamps no success, and the walk counts from it all the same: the session lane
-    /// used to read the record's last write as a failed attempt and wait the interval, and
-    /// a pass that recorded nothing would be owed at every tab. A success LATER than such a
-    /// pass is the walk's; a failed pass end is no success.
+    /// A full pass with nothing to check records `ok` without a success stamp, and the walk
+    /// counts from it; a later success is the walk's, and a failed pass end is no success.
     #[test]
     fn a_pass_with_nothing_to_check_counts_as_the_last_success() {
         let now = 1_790_000_000_i64;
@@ -610,11 +558,9 @@ mod tests {
         assert!(failed.last_failed());
     }
 
-    /// THE MACHINE-WIDE RULE, which the session lane spawns on and the window's loop runs
-    /// its fallback walk on: never succeeded ⇒ owed; a success six hours old ⇒ owed; a
-    /// younger one ⇒ not, and [`full_pass_due_in`] names the rest of the interval — and
-    /// nothing is owed while a pass is installing or within the spacing of the last attempt
-    /// anywhere on the machine, so two processes never run the same pass back to back.
+    /// Never succeeded or a six-hour-old success ⇒ owed; a younger one ⇒ not, with
+    /// [`full_pass_due_in`] naming the rest; nothing while a pass installs or within the
+    /// spacing of the last attempt anywhere on the machine.
     #[test]
     fn a_full_pass_is_owed_on_the_interval_or_never_checked_and_never_back_to_back() {
         let now = 1_790_000_000_i64;
@@ -658,8 +604,8 @@ mod tests {
             None,
             "owed, but a sibling attempted a minute ago"
         );
-        // A clock set back: a stamp within a period ahead reads as fresh (and holds for at
-        // most a period), one further ahead is a record from a clock no longer trusted.
+        // A clock set back: a stamp within a period ahead reads as fresh (for at most a
+        // period); one further ahead is not trusted.
         assert_eq!(
             full_pass_owed(&at(Some(now + 3600), Some(now - spacing)), now),
             None
@@ -677,12 +623,9 @@ mod tests {
         assert!(at(None, Some(now + spacing - 1)).attempted_recently(now));
     }
 
-    /// A PASS THAT KEEPS FAILING IS NOT RESPAWNED BY EVERY TAB (the 2026-09-10 rule, kept
-    /// through Phase 3): once the last pass recorded a failure after the last success — or no
-    /// pass ever succeeded — nothing is owed for the interval after that pass, as the session
-    /// lane's old attempt-age rule answered: a record whose passes never succeed (an unserved
-    /// triple exits 2 without a success) costs one pass per interval, not one per tab. The
-    /// spacing alone would have respawned it from every tab opened five minutes on.
+    /// Once the last pass failed after the last success (or none ever succeeded), nothing is
+    /// owed for the interval after it: a record whose passes never succeed costs one pass per
+    /// interval, not one per tab.
     #[test]
     fn a_failing_pass_is_owed_again_only_after_the_interval() {
         let now = 1_790_000_000_i64;
@@ -717,8 +660,7 @@ mod tests {
             Some(Owed::NeverChecked),
             "an interval on: owed again"
         );
-        // The walk after a failed one: the success is a day old, the last attempt (it
-        // failed) an hour ago.
+        // A failed walk: the success is a day old, the failed attempt an hour ago.
         let walk_failed = at(Some(now - 4 * interval), Some(now - 3600));
         assert!(walk_failed.last_failed());
         assert_eq!(full_pass_owed(&walk_failed, now), None);
@@ -726,15 +668,14 @@ mod tests {
             full_pass_owed(&walk_failed, now + interval - 3600),
             Some(Owed::Interval)
         );
-        // The negative control: a success six hours old whose attempt IS that success.
+        // Negative control: a six-hour-old success whose attempt is that success.
         let walk_ok = at(Some(now - interval), Some(now - interval));
         assert!(!walk_ok.last_failed());
         assert_eq!(full_pass_owed(&walk_ok, now), Some(Owed::Interval));
         assert!(!Stamps::default().last_failed(), "never attempted");
     }
 
-    /// One argv for every lane that schedules a pass: the lock wait, and the progress
-    /// file where there is a store.
+    /// One argv for every lane: the lock wait, and the progress file where there is a store.
     #[test]
     fn every_scheduled_pass_carries_the_same_flags() {
         let words = |flags: Vec<OsString>| {
@@ -751,10 +692,9 @@ mod tests {
         assert_eq!(PASS_WAIT_LOCK_SECS, 30 * 60);
     }
 
-    /// A lane's slot: the first claim wins and stamps; a second inside the period is
-    /// refused; one a period later wins again; a garbage or far-future stamp is claimable;
-    /// and a stamp with no directory to live in claims nothing and answers `true` — the
-    /// lane runs as it did before it had a stamp.
+    /// The first claim wins and stamps, a second inside the period is refused, one a period
+    /// later wins; a garbage or far-future stamp is claimable, and a stamp with no directory
+    /// answers `true`.
     #[test]
     fn a_lane_slot_is_claimed_once_per_period() {
         let dir = scratch("claim");
@@ -784,8 +724,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir.parent().unwrap());
     }
 
-    /// A sibling holding the claim lock makes the claim answer `false` — it is claiming
-    /// this very slot — and never blocks past the claim's short wait.
+    /// A sibling holding the claim lock makes the claim answer `false` within its short wait.
     #[test]
     fn a_claim_held_elsewhere_is_not_taken_twice() {
         let dir = scratch("claim-held");
@@ -802,7 +741,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir.parent().unwrap());
     }
 
-    /// The strict date shape.
+    /// Strict about the zone, tolerant of a fraction.
     #[test]
     fn the_stamp_parser_is_pinned() {
         assert_eq!(rfc3339_to_unix("1970-01-02T00:00:00Z"), Some(86_400));

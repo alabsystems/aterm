@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-//! The inline-image retention horizon, end to end through the real `Terminal`.
-//!
-//! An inline image is retained only while its line is held uncompressed: the
-//! grid's scrolled-row ring, the deferred-line staging buffer, then the tiered
-//! store's hot tier. The warm/cold/disk wire format has no image section (see
-//! `Line::serialize`). One test each:
-//!   * inside the horizon the picture is whole;
-//!   * past it the row is empty and the surrounding text is untouched;
-//!   * the crossing is reported (`Terminal::scrollback_image_rows_dropped`).
+//! The inline-image retention horizon, end to end: an inline image is kept only while its
+//! line is held uncompressed (the grid's scrolled-row ring, the deferred-line staging
+//! buffer, then the store's hot tier), since the warm/cold/disk wire format has no image
+//! section (`Line::serialize`). Past it the row is empty, the text around it stays, and
+//! the crossing is counted (`Terminal::scrollback_image_rows_dropped`).
 
 use aterm_core::render::RenderInput;
 use aterm_core::scrollback::Scrollback;
@@ -64,8 +60,7 @@ fn feed(term: &mut Terminal, n: usize) {
 
 #[test]
 fn inside_the_horizon_a_scrolled_off_picture_is_whole() {
-    // The premise the limit is a limit ON. Without this the "past the horizon"
-    // test below would pass on a terminal that never kept a picture at all.
+    // Non-vacuity for the past-the-horizon tests: a picture is kept until then.
     let mut term = terminal_with_short_horizon();
     term.process(b"ABOVE\r\n");
     place_card(&mut term);

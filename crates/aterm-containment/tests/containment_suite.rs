@@ -17,6 +17,10 @@
 //!
 //! `autotests = false` in `Cargo.toml`: a `tests/*.rs` file that is neither a
 //! `mod` line here nor a `[[test]]` of its own NEVER COMPILES.
+#![allow(
+    clippy::disallowed_types,
+    reason = "test code: a stand-in child may inherit descriptors"
+)]
 
 /// Names, in a re-executed child, the one test that child exists to run.
 const FRESH_CHILD: &str = "ATERM_CONTAINMENT_FRESH_CHILD";

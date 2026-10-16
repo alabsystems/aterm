@@ -139,10 +139,8 @@ fn write_ascii_run_styled_wraps_across_lines() {
         grid.write_ascii_run_styled(b"ABCDEFGH", fg, bg, CellFlags::empty(), &mut last_byte);
     assert_eq!(written, 8);
 
-    // First line
     assert_eq!(grid.cell(0, 0).unwrap().char(), 'A');
     assert_eq!(grid.cell(0, 3).unwrap().char(), 'D');
-    // Second line
     assert_eq!(grid.cell(1, 0).unwrap().char(), 'E');
     assert_eq!(grid.cell(1, 3).unwrap().char(), 'H');
 
@@ -161,11 +159,9 @@ fn write_ascii_run_styled_at_cursor_offset() {
     let written = grid.write_ascii_run_styled(b"XYZ", fg, bg, CellFlags::empty(), &mut last_byte);
     assert_eq!(written, 3);
 
-    // Content at offset
     assert_eq!(grid.cell(0, 7).unwrap().char(), 'X');
     assert_eq!(grid.cell(0, 8).unwrap().char(), 'Y');
     assert_eq!(grid.cell(0, 9).unwrap().char(), 'Z');
-    // Preceding cells untouched
     assert!(grid.cell(0, 0).unwrap().is_empty());
     assert!(grid.cell(0, 6).unwrap().is_empty());
 
@@ -206,7 +202,6 @@ fn write_ascii_run_styled_scrolls_at_screen_bottom() {
     grid.resolve_pending_wrap();
     assert_eq!(grid.cursor_row(), 1);
     assert_eq!(grid.cursor_col(), 0);
-    // After scroll, row 0 has second batch content
     assert_eq!(grid.cell(0, 0).unwrap().char(), 'D');
     assert_eq!(grid.cell(0, 1).unwrap().char(), 'E');
     assert_eq!(grid.cell(0, 2).unwrap().char(), 'F');

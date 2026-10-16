@@ -43,8 +43,8 @@ pub fn corpus_under(root: &Path) -> Vec<PathBuf> {
 
 /// Whether the corpus walk stays out of the directory `name` inside `parent`:
 /// `target`, `.git` and `node_modules` at any depth, and at the repository root
-/// every `target-*` sibling build dir (the gate's per-lane dirs) and the gate's
-/// `.aterm-verify` state dir, which the checked-in .gitignore names as
+/// every `target-*` sibling build dir (`target-trust`, older lanes' leftovers)
+/// and a leftover `.aterm-verify` state dir, which the checked-in .gitignore names as
 /// `/target-*` and `/.aterm-verify/`.
 fn corpus_skips(root: &Path, parent: &Path, name: &str) -> bool {
     name == "target"

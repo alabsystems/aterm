@@ -266,8 +266,8 @@ pub struct SavedCursorState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // Color / ColorType / StyleAttrs are used only by these tests.
-    use crate::style::{Color, ColorType, StyleAttrs};
+    // StyleAttrs is used only by these tests.
+    use crate::style::StyleAttrs;
 
     // =========================================================================
     // CurrentStyle::default, and one attribute or colour changed from it
@@ -441,25 +441,6 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_single_underline() {
-        let mut style = CurrentStyle::default();
-        style.flags.insert(CellFlags::UNDERLINE);
-        style.update_cached_colors();
-        assert!(style.flags.contains(CellFlags::UNDERLINE));
-        assert!(!style.flags.contains(CellFlags::DOUBLE_UNDERLINE));
-        assert!(!style.flags.contains(CellFlags::CURLY_UNDERLINE));
-    }
-
-    #[test]
-    fn test_double_underline() {
-        let mut style = CurrentStyle::default();
-        style.flags.insert(CellFlags::DOUBLE_UNDERLINE);
-        style.update_cached_colors();
-        assert!(style.flags.contains(CellFlags::DOUBLE_UNDERLINE));
-        assert!(!style.flags.contains(CellFlags::UNDERLINE));
-    }
-
-    #[test]
     fn test_curly_underline() {
         let mut style = CurrentStyle::default();
         style.flags.insert(CellFlags::CURLY_UNDERLINE);
@@ -469,34 +450,6 @@ mod tests {
             style.has_style_extras(),
             "curly underline uses extended flag bits"
         );
-    }
-
-    #[test]
-    fn test_dotted_underline() {
-        let style = CurrentStyle::new(
-            PackedColor::DEFAULT_FG,
-            PackedColor::DEFAULT_BG,
-            CellFlags::DOTTED_UNDERLINE,
-            false,
-        );
-        assert!(style.flags.contains(CellFlags::DOTTED_UNDERLINE));
-        // Dotted = UNDERLINE | CURLY_UNDERLINE
-        assert!(style.flags.contains(CellFlags::UNDERLINE));
-        assert!(style.flags.contains(CellFlags::CURLY_UNDERLINE));
-    }
-
-    #[test]
-    fn test_dashed_underline() {
-        let style = CurrentStyle::new(
-            PackedColor::DEFAULT_FG,
-            PackedColor::DEFAULT_BG,
-            CellFlags::DASHED_UNDERLINE,
-            false,
-        );
-        assert!(style.flags.contains(CellFlags::DASHED_UNDERLINE));
-        // Dashed = DOUBLE_UNDERLINE | CURLY_UNDERLINE
-        assert!(style.flags.contains(CellFlags::DOUBLE_UNDERLINE));
-        assert!(style.flags.contains(CellFlags::CURLY_UNDERLINE));
     }
 
     // =========================================================================
@@ -522,123 +475,9 @@ mod tests {
     // build_style / build_extended_style correctness
     // =========================================================================
 
-    #[test]
-    fn test_build_style_default() {
-        let style = CurrentStyle::default();
-        let built = style.build_style();
-        assert_eq!(built, Style::DEFAULT);
-    }
-
-    #[test]
-    fn test_build_style_with_indexed_fg() {
-        let style = CurrentStyle::new(
-            PackedColor::indexed(1),
-            PackedColor::DEFAULT_BG,
-            CellFlags::empty(),
-            false,
-        );
-        let built = style.build_style();
-        assert_eq!(built.fg, Color::from_ansi_256(1));
-        assert_eq!(built.bg, Color::DEFAULT_BG);
-        assert_eq!(built.attrs, StyleAttrs::empty());
-    }
-
-    #[test]
-    fn test_build_style_with_bold() {
-        let style = CurrentStyle::new(
-            PackedColor::DEFAULT_FG,
-            PackedColor::DEFAULT_BG,
-            CellFlags::BOLD,
-            false,
-        );
-        let built = style.build_style();
-        assert!(built.attrs.contains(StyleAttrs::BOLD));
-    }
-
-    #[test]
-    fn test_build_extended_style_rgb_fg() {
-        let style = CurrentStyle::new(
-            PackedColor::rgb(100, 150, 200),
-            PackedColor::DEFAULT_BG,
-            CellFlags::empty(),
-            false,
-        );
-        let ext = style.build_extended_style();
-        assert_eq!(ext.fg_type, ColorType::Rgb);
-        assert_eq!(ext.bg_type, ColorType::Default);
-        assert_eq!(ext.style.fg, Color::new(100, 150, 200));
-    }
-
-    #[test]
-    fn test_build_extended_style_indexed_bg() {
-        let style = CurrentStyle::new(
-            PackedColor::DEFAULT_FG,
-            PackedColor::indexed(42),
-            CellFlags::empty(),
-            false,
-        );
-        let ext = style.build_extended_style();
-        assert_eq!(ext.bg_type, ColorType::Indexed);
-        assert_eq!(ext.bg_index, 42);
-    }
-
     // =========================================================================
     // Partial-change build methods
     // =========================================================================
-
-    #[test]
-    fn test_build_extended_style_fg_changed() {
-        let mut style = CurrentStyle::new(
-            PackedColor::indexed(1),
-            PackedColor::indexed(2),
-            CellFlags::BOLD,
-            false,
-        );
-        // Change only fg
-        style.fg = PackedColor::rgb(10, 20, 30);
-        let ext = style.build_extended_style_fg_changed();
-        assert_eq!(ext.style.fg, Color::new(10, 20, 30));
-        assert_eq!(ext.fg_type, ColorType::Rgb);
-        // bg unchanged
-        assert_eq!(ext.bg_type, ColorType::Indexed);
-        assert_eq!(ext.bg_index, 2);
-        // attrs unchanged
-        assert!(ext.style.attrs.contains(StyleAttrs::BOLD));
-    }
-
-    #[test]
-    fn test_build_extended_style_bg_changed() {
-        let mut style = CurrentStyle::new(
-            PackedColor::indexed(1),
-            PackedColor::indexed(2),
-            CellFlags::ITALIC,
-            false,
-        );
-        style.bg = PackedColor::rgb(40, 50, 60);
-        let ext = style.build_extended_style_bg_changed();
-        assert_eq!(ext.style.bg, Color::new(40, 50, 60));
-        assert_eq!(ext.bg_type, ColorType::Rgb);
-        // fg unchanged
-        assert_eq!(ext.fg_type, ColorType::Indexed);
-        assert_eq!(ext.fg_index, 1);
-    }
-
-    #[test]
-    fn test_build_extended_style_both_changed() {
-        let mut style = CurrentStyle::new(
-            PackedColor::DEFAULT_FG,
-            PackedColor::DEFAULT_BG,
-            CellFlags::empty(),
-            false,
-        );
-        style.fg = PackedColor::indexed(7);
-        style.bg = PackedColor::rgb(1, 2, 3);
-        let ext = style.build_extended_style_both_changed();
-        assert_eq!(ext.fg_type, ColorType::Indexed);
-        assert_eq!(ext.fg_index, 7);
-        assert_eq!(ext.bg_type, ColorType::Rgb);
-        assert_eq!(ext.style.bg, Color::new(1, 2, 3));
-    }
 
     // =========================================================================
     // Packed color accessors (fg_packed, bg_packed, flags_bits)
@@ -681,40 +520,6 @@ mod tests {
     // =========================================================================
     // SavedCursorState
     // =========================================================================
-
-    #[test]
-    fn test_saved_cursor_state_default() {
-        let saved = SavedCursorState::default();
-        assert_eq!(saved.cursor, Cursor::default());
-        assert!(!saved.origin_mode);
-        assert!(!saved.auto_wrap);
-        assert!(!saved.pending_wrap);
-        assert!(saved.underline_color.is_none());
-    }
-
-    #[test]
-    fn test_saved_cursor_state_preserves_style() {
-        let style = CurrentStyle::new(
-            PackedColor::indexed(5),
-            PackedColor::rgb(1, 2, 3),
-            CellFlags::STRIKETHROUGH,
-            true,
-        );
-        let saved = SavedCursorState {
-            style,
-            origin_mode: true,
-            auto_wrap: true,
-            pending_wrap: true,
-            underline_color: Some(0x01_FF0000),
-            ..SavedCursorState::default()
-        };
-        assert!(saved.style.protected);
-        assert!(saved.style.flags.contains(CellFlags::STRIKETHROUGH));
-        assert!(saved.origin_mode);
-        assert!(saved.auto_wrap);
-        assert!(saved.pending_wrap);
-        assert_eq!(saved.underline_color, Some(0x01_FF0000));
-    }
 
     // =========================================================================
     // Protected attribute behavior

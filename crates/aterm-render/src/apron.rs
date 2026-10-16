@@ -58,6 +58,7 @@ pub struct ApronScratch {
 /// [`ApronScratch::invalidate`], which the hosts' own cache invalidation calls.
 #[derive(Clone, Copy, PartialEq)]
 struct ApronKey {
+    present: bool,
     cols: usize,
     w: usize,
     grid_top: usize,
@@ -115,8 +116,9 @@ impl ApronScratch {
 
 impl Renderer {
     /// Raster `input.apron_row` into `scratch` as row 0 of a one-row frame
-    /// (see the module doc). Returns `false` — and leaves `scratch` empty —
-    /// when the apron is absent, so a caller can gate the strip on the result.
+    /// (see the module doc). When `ap.present` is false (bottom overscroll at
+    /// `display_offset == 0`), fills the strip with `band_bg` so the upward
+    /// translate does not leave a duplicate copy of the bottom row behind.
     ///
     /// Everything the row needs travels on the one-row input: its cells,
     /// clusters, combining marks and line size; the frame's live default bg,
@@ -129,7 +131,7 @@ impl Renderer {
     /// [`ApronRow::cursor_col`]: aterm_core::render::ApronRow::cursor_col
     pub fn rasterize_apron_row(&mut self, input: &RenderInput, scratch: &mut ApronScratch) -> bool {
         let ap = &input.apron_row;
-        if !ap.present || input.cols == 0 {
+        if input.cols == 0 {
             scratch.w = 0;
             scratch.band = 0..0;
             return false;
@@ -141,6 +143,7 @@ impl Renderer {
         let band_bg = self.frame_bg(input) | (self.bg_transmittance() << 24);
         // THE KEY: a hit keeps the band and rasters nothing (see `ApronKey`).
         let key = ApronKey {
+            present: ap.present,
             cols,
             w,
             grid_top,
@@ -155,6 +158,18 @@ impl Renderer {
             cursor_blink_phase: ap.cursor_col.is_some() && self.cursor_blink_phase,
             renderer_cursor_style_override: ap.cursor_col.and(self.cursor_style_override),
         };
+        if !ap.present {
+            if scratch.w != 0 && scratch.key == Some(key) {
+                return true;
+            }
+            scratch.pixels.clear();
+            scratch.pixels.resize(w.saturating_mul(h), band_bg);
+            scratch.w = w;
+            scratch.band = grid_top * w..h * w;
+            scratch.key = Some(key);
+            scratch.generation = scratch.generation.wrapping_add(1);
+            return true;
+        }
         // The row itself: the one-row input still holds exactly what the last
         // raster ran over (only the refill below writes it), so compare in place.
         let mi = &scratch.input;

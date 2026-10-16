@@ -1,11 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-//! The `ty_model!` light-annotation surface (`aterm_spec::derive`'s module docs):
-//! a model written as near-plain Rust must produce the EXACT same derived spec as
-//! the hand-built `ring_model()` (the `Expr`-constructor form that Tier-0 + Tier-1
-//! already verify). This pins the macro as pure sugar over the proven derivation —
-//! it changes ergonomics, not semantics.
+//! `ty_model!` is pure sugar: the ring written through the macro derives the same TLA+, `.cfg`
+//! and transition spec as the hand-built `ring_model()`.
 
 use aterm_spec::derive::{Model, ring_model};
 use aterm_spec::ty_model;
@@ -51,8 +48,6 @@ fn macro_surface_equals_hand_built_model() {
 
 #[test]
 fn macro_built_interpreter_runs() {
-    // The macro-built model is also executable (same `fire` semantics): drive it
-    // and confirm the ring discipline + invariant hold, end to end through sugar.
     let m = ring_via_macro();
     let mut st = m.init_state();
     while m.fire("Push", &mut st) {

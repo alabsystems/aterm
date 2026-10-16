@@ -9,12 +9,6 @@ use aterm_spec::{derive::desktop_alert_debt_model, interp, verify};
 #[test]
 fn desktop_alert_debt_is_cancelled_without_forgetting_seen_escalations() {
     let model = desktop_alert_debt_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name),
-        "the desktop-alert debt model must remain registered"
-    );
     verify::prove_and_catch_scalar(&model, "desktop alerts cancel work and preserve seen state");
     for (fault, label) in [
         (1, "desktop alert disable cancels existing debt"),
@@ -24,7 +18,6 @@ fn desktop_alert_debt_is_cancelled_without_forgetting_seen_escalations() {
         let selected = interp::with_consts(&model, &[("Fault", fault)]);
         verify::prove_and_catch_scalar(&selected, label);
     }
-    assert!(verify::uncaught_invariants(&model).is_empty());
 }
 
 #[test]

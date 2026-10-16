@@ -2,9 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-// Included from `handler_dec.rs` to keep the DEC dispatcher under the 500-line
-// limit while preserving private helper visibility.
+// Included from `handler_dec.rs` (`include!`), sharing its private helpers.
 
+// The mode-2026 sync deadline runs on the injected instant, so no `#[expect]` may excuse a
+// clock read here.
+#[forbid(clippy::disallowed_methods)]
 impl TerminalHandler<'_> {
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
@@ -72,10 +74,9 @@ impl TerminalHandler<'_> {
     )]
     fn enable_auto_wrap(&mut self) {
         self.modes.auto_wrap = true;
-        // pending_wrap is deliberately not touched: xterm srm_DECAWM only flips
-        // the wraparound flag (charproc.c). do_wrap is mode-independent: a
-        // margin-filling print arms it even with autowrap off, and turning
-        // DECAWM back on lets the next printable consume it and wrap.
+        // pending_wrap is untouched: xterm srm_DECAWM only flips the flag (charproc.c). A
+        // margin-filling print arms it even with autowrap off, and turning DECAWM back on
+        // lets the next printable wrap.
     }
 
     #[cfg_attr(
@@ -88,9 +89,8 @@ impl TerminalHandler<'_> {
     )]
     fn disable_auto_wrap(&mut self) {
         self.modes.auto_wrap = false;
-        // pending_wrap is deliberately not touched (xterm srm_DECAWM; see
-        // enable_auto_wrap). A pending wrap armed while DECAWM was on is
-        // consumed flag-only by the next print (no wrap) when off.
+        // pending_wrap is untouched (see enable_auto_wrap): with DECAWM off the next print
+        // consumes it without wrapping.
     }
 
     #[cfg_attr(
@@ -104,11 +104,9 @@ impl TerminalHandler<'_> {
     fn show_cursor(&mut self) {
         if !self.modes.cursor_visible {
             self.modes.cursor_visible = true;
-            // Cursor visibility changes the frame without changing any cell, so
-            // mark the cursor cell damaged: `has_damage()` becomes true and
-            // `damage_epoch` advances, so the frontend's redraw early-out does
-            // not swallow a bare DECTCEM, and only the cursor cell is refilled
-            // (TUIs bracket every repaint in `?25l` … `?25h`).
+            // A visibility change alters the frame but no cell: damage the cursor cell so the
+            // frontend's redraw early-out does not swallow a bare DECTCEM, and only that cell
+            // is refilled (TUIs bracket every repaint in `?25l` … `?25h`).
             self.grid.mark_cursor_damage();
         }
     }
@@ -179,8 +177,7 @@ impl TerminalHandler<'_> {
         }
     }
 
-    // Another encoding replaces SGR 1006, so in the model's terms this ends the
-    // SGR encoding (a no-op on the fact when SGR was not in force).
+    // Ends the model's SGR encoding (see `enable_utf8_mouse_encoding`).
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
         aterm_spec::refines(
@@ -205,8 +202,7 @@ impl TerminalHandler<'_> {
         }
     }
 
-    // Another encoding replaces SGR 1006, so in the model's terms this ends the
-    // SGR encoding (a no-op on the fact when SGR was not in force).
+    // Ends the model's SGR encoding (see `enable_utf8_mouse_encoding`).
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
         aterm_spec::refines(
@@ -242,19 +238,16 @@ impl TerminalHandler<'_> {
     fn enable_synchronized_output(&mut self) {
         let opening = !self.modes.synchronized_output;
         self.modes.synchronized_output = true;
-        // Clock seam: arm the timeout from the batch's logical instant so the
-        // mode-2026 timeout replays deterministically.
+        // Clock seam: the timeout runs from the batch's logical instant, so it replays.
         self.transient.sync_start = Some(self.transient.process_now);
-        // Only a real false->true edge starts a clean episode. A redundant
-        // DECSET 2026 after writes must not erase evidence that the current
-        // mutable grid already contains a partial synchronized frame.
+        // Only a false->true edge starts a clean episode: a redundant DECSET 2026 must not
+        // erase the evidence of a partial frame already on the grid.
         if opening {
             self.transient.sync_open_dirty = false;
         }
-        // The program's own episode opens only when the program has none
-        // open: a `?2026h` after the terminal's timeout force-clear reopens
-        // the mode, but the frame the program began is still unfinished, and
-        // its writes are still on the grid.
+        // The program's own episode opens only when none is open: a `?2026h` after the
+        // terminal's timeout force-clear reopens the mode, but the program's frame is still
+        // unfinished on the grid.
         if !self.transient.app_sync_open {
             self.transient.app_sync_open = true;
             self.transient.app_sync_dirty = false;
@@ -275,8 +268,8 @@ impl TerminalHandler<'_> {
         self.transient.sync_open_dirty = false;
         self.transient.app_sync_open = false;
         self.transient.app_sync_dirty = false;
-        // ESU: one sync window closed — a complete frame is ready. The host's
-        // present-hold releases on this edge (see `Terminal::sync_end_seq`).
+        // ESU: a complete frame is ready; the host's present-hold releases on this edge
+        // (`Terminal::sync_end_seq`).
         self.transient.sync_end_seq += 1;
     }
 
@@ -339,9 +332,8 @@ impl TerminalHandler<'_> {
         )
     )]
     pub(super) fn set_vt52_mode(&mut self, enabled: bool) {
-        // Per VT220 spec: exiting VT52 mode (ESC <) should reset character
-        // sets to defaults. Without this, G0=DecLineDrawing from VT52 graphics
-        // mode (ESC F) persists into ANSI mode, causing garbled output.
+        // Leaving VT52 (ESC <) resets the character sets (VT220), so G0 line drawing from
+        // VT52 graphics mode (ESC F) does not persist into ANSI mode.
         if !enabled && self.modes.vt52_mode {
             self.charset.reset();
         }
@@ -357,25 +349,20 @@ impl TerminalHandler<'_> {
     fn set_column_mode_132(&mut self, enabled: bool) {
         let changed = self.modes.column_mode_132 != enabled;
         self.modes.column_mode_132 = enabled;
-        // Per VT420/xterm spec, toggling DECCOLM must clear screen,
-        // reset scroll margins (both vertical and horizontal), and
-        // move cursor to home.
-        // The actual column resize is left to the host (flag-only).
+        // Toggling DECCOLM clears the screen, resets both margins and homes the cursor
+        // (VT420, xterm); the column resize itself is the host's.
         if changed && !self.modes.decncsm {
             self.grid.reset_scroll_region();
             self.modes.left_right_margin_mode = false;
             self.grid.reset_horizontal_margins();
-            // Update BCE template from current SGR background.
             self.grid.set_cursor_template(
                 crate::grid::Cell::bce_blank(self.style.cached_colors()),
                 self.style.bce_bg_rgb(),
             );
             self.grid.erase_screen();
-            // DECCOLM clears DECDWL/DECDHL line attributes. The erase above
-            // does too; this stays because the guarantee is DECCOLM's own.
+            // DECCOLM's own guarantee, though the erase above clears DECDWL/DECDHL too.
             self.grid.clear_line_attributes();
-            // Per VT420 spec and xterm, DECCOLM toggle resets tab stops
-            // to default every-8-column pattern.
+            // DECCOLM resets tab stops to every 8 columns (VT420, xterm).
             self.grid.reset_tab_stops();
             self.grid.set_cursor(0, 0);
         }
@@ -388,7 +375,7 @@ impl TerminalHandler<'_> {
         )
     )]
     fn set_reverse_video(&mut self, enabled: bool) {
-        // No-op when value is unchanged — avoids unnecessary full-screen redraw.
+        // Unchanged: no full-screen redraw.
         if self.modes.reverse_video == enabled {
             return;
         }
@@ -396,9 +383,8 @@ impl TerminalHandler<'_> {
         self.grid.damage_mut().mark_full();
     }
 
-    // Mode 12 moves the cursor style (its blink bit, below), so it is a site of
-    // the cursor-shape actions beside DECSCUSR, not an unmodelled mode: the
-    // resulting shape is the host's (`RestoreCursorStyle`) or not
+    // Mode 12 moves the cursor style's blink bit, so it refines the cursor-shape actions
+    // beside DECSCUSR: the resulting shape is the host's (`RestoreCursorStyle`) or not
     // (`SetCursorStyle`).
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
@@ -417,26 +403,16 @@ impl TerminalHandler<'_> {
         )
     )]
     fn set_cursor_blink(&mut self, enabled: bool) {
-        // DEC mode 12 is the BLINK bit of the cursor style, not a second flag
-        // beside it. The rendered blink is decided from `cursor_style` alone
-        // (the frontend arms its blink clock on the `Blinking*` variants), so a
-        // mode that only moved `modes.cursor_blink` reached the code and never
-        // the glass — and `CSI ? 12 $ p` then answered a value the terminal did
-        // not hold, in both directions.
-        //
-        // This matters on the most ordinary path there is: aterm's spawn seam
-        // forces `TERM=xterm-256color`, whose terminfo spells `cnorm` as
-        // `\E[?12l\E[?25h` and `cvvis` as `\E[?12;25h` — so every ncurses
-        // `curs_set()` (vim, less, htop, nano, mc, ...) asks this mode to stop
-        // or start the blink.
+        // Mode 12 is the blink bit of `cursor_style`, not a second flag beside it: the
+        // renderer blinks from `cursor_style` alone, so moving only `modes.cursor_blink` would
+        // change nothing on screen and make `CSI ? 12 $ p` lie. Every ncurses `curs_set()`
+        // drives it (`xterm-256color`'s `cnorm` is `\E[?12l\E[?25h`, `cvvis` `\E[?12;25h`).
         self.modes.cursor_blink = enabled;
         let style = self.modes.cursor_style.with_blink(enabled);
         if self.modes.cursor_style != style {
             self.modes.cursor_style = style;
-            // The same two obligations DECSCUSR discharges for a shape change:
-            // advance damage so a frontend keyed by `damage_epoch` cannot
-            // swallow a mode-only change, and tell the host its cursor moved
-            // class. The cursor cell carries both (see `show_cursor`).
+            // As for a DECSCUSR shape change: damage the cursor cell so a frontend keyed by
+            // `damage_epoch` sees the change, and the host sees its cursor change class.
             self.grid.mark_cursor_damage();
         }
     }
@@ -494,8 +470,8 @@ impl TerminalHandler<'_> {
         self.modes.application_keypad = enabled;
     }
 
-    // --- BiDi DEC Private Modes (Terminal WG specification) ---
-    // See: https://terminal-wg.pages.freedesktop.org/bidi/recommendation/escape-sequences.html
+    // --- BiDi DEC private modes (Terminal WG):
+    // https://terminal-wg.pages.freedesktop.org/bidi/recommendation/escape-sequences.html
 
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
@@ -516,8 +492,7 @@ impl TerminalHandler<'_> {
     fn set_bidi_box_mirroring(&mut self, enabled: bool) {
         if self.modes.bidi_box_mirroring != enabled {
             self.modes.bidi_box_mirroring = enabled;
-            // Invalidate BiDi cache — mirroring affects rendered glyph selection
-            // for box-drawing characters in RTL contexts.
+            // Mirroring changes the box-drawing glyphs chosen in RTL runs.
             self.invalidate_bidi_all();
         }
     }
@@ -531,7 +506,6 @@ impl TerminalHandler<'_> {
     fn set_bidi_autodetection(&mut self, enabled: bool) {
         if self.modes.bidi_autodetection != enabled {
             self.modes.bidi_autodetection = enabled;
-            // Invalidate cache since resolution logic changes
             self.invalidate_bidi_all();
         }
     }
@@ -553,22 +527,15 @@ impl TerminalHandler<'_> {
         };
         if self.modes.bidi_mode != new_mode {
             self.modes.bidi_mode = new_mode;
-            // Invalidate cache since BiDi algorithm behavior may differ
             self.invalidate_bidi_all();
         }
     }
 
-    // --- XTSAVE/XTRESTORE (CSI ? Ps s / CSI ? Ps r) ---
-    // Per xterm specification, saves and restores individual DEC private mode values.
+    // --- XTSAVE/XTRESTORE (CSI ? Ps s / CSI ? Ps r): per-mode save and restore (xterm) ---
 
-    /// Query the current boolean state of a DEC private mode.
-    ///
-    /// This table and `handle_decrqm`'s are one fact, two spellings: a mode the
-    /// terminal can report through DECRQM is a mode XTSAVE/XTRESTORE must be
-    /// able to carry, and a mode missing here makes `CSI ? Ps s` / `CSI ? Ps r`
-    /// a silent no-op that answers exactly like a working one. The pair is
-    /// walked by `xtsave_covers_every_mode_decrqm_reports`, so a mode added to
-    /// one side and forgotten here fails that test instead of shipping.
+    /// The current state of a DEC private mode, for XTSAVE/XTRESTORE. It must cover every mode
+    /// `handle_decrqm` reports, or `CSI ? Ps s`/`r` is a silent no-op answering like a working
+    /// one; `xtsave_covers_every_mode_decrqm_reports` walks the pair.
     pub(super) fn query_dec_mode(&self, mode: u16) -> Option<bool> {
         Some(match mode {
             1 => self.modes.application_cursor_keys,
@@ -577,10 +544,8 @@ impl TerminalHandler<'_> {
             5 => self.modes.reverse_video,
             6 => self.modes.origin_mode,
             7 => self.modes.auto_wrap,
-            // Mode 12 reads the style's blink bit, not the shadow flag beside
-            // it: the style is the fact the glass acts on (see
-            // `set_cursor_blink`), so a site that moves the style without the
-            // mirror still cannot make this answer lie.
+            // Mode 12 reads the style's blink bit, the fact the renderer acts on (see
+            // `set_cursor_blink`), not the shadow flag.
             12 => self.modes.cursor_style.blinks(),
             25 => self.modes.cursor_visible,
             40 => self.modes.deccolm_enable,
@@ -600,11 +565,7 @@ impl TerminalHandler<'_> {
             1007 => self.modes.alternate_scroll,
             1015 => self.modes.mouse_encoding == MouseEncoding::Urxvt,
             1016 => self.modes.mouse_encoding == MouseEncoding::SgrPixel,
-            // The xterm keyboard private modes and the tracked-only 1045: DECRQM
-            // reports all four, so XTSAVE/XTRESTORE must be able to carry them
-            // too. They were the drift between this table and `handle_decrqm`'s
-            // — `CSI ? 1036 s` saved nothing and `CSI ? 1036 r` restored nothing,
-            // both answering OK.
+            // The xterm keyboard modes and the tracked-only 1045: DECRQM reports them.
             1035 => self.modes.special_modifiers,
             1036 => self.modes.meta_send_escape,
             1039 => self.modes.alt_send_escape,
@@ -622,10 +583,7 @@ impl TerminalHandler<'_> {
         })
     }
 
-    /// Handle XTSAVE (CSI ? Ps s) - Save DEC Private Mode Values.
-    ///
-    /// Saves the current state of each listed mode into a per-mode save slot.
-    /// If no parameters are provided, no modes are saved.
+    /// XTSAVE (`CSI ? Ps s`): save each listed mode into its slot; no params saves nothing.
     pub(super) fn handle_xtsave(&mut self, params: &[u16]) {
         for &mode in params {
             if let Some(value) = self.query_dec_mode(mode) {
@@ -634,18 +592,14 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// Handle XTRESTORE (CSI ? Ps r) - Restore DEC Private Mode Values.
-    ///
-    /// Restores each listed mode to its previously saved value. If a mode
-    /// was never saved, it is ignored. Restored modes are set/reset through
-    /// `handle_dec_mode` to trigger any required side effects (e.g., origin
-    /// mode homes the cursor, DECLRMM resets margins).
+    /// XTRESTORE (`CSI ? Ps r`): restore each listed mode that was saved, through
+    /// `handle_dec_mode` so side effects run (origin mode homes the cursor, DECLRMM resets
+    /// margins).
     pub(super) fn handle_xtrestore(&mut self, params: &[u16]) {
         for &mode in params {
             if let Some(&saved_value) = self.transient.xtsave_modes.get(&mode) {
-                // Skip if current value already matches saved — avoids collateral
-                // effects on shared-state modes like mouse tracking where resetting
-                // one inactive mode can disable a different active mode.
+                // Skip a mode already at its saved value: modes share state (mouse
+                // tracking), and resetting an inactive one can disable an active other.
                 if self.query_dec_mode(mode) != Some(saved_value) {
                     self.handle_dec_mode(&[mode], saved_value);
                 }

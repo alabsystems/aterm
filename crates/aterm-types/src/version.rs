@@ -107,6 +107,17 @@ pub fn app_version() -> &'static str {
     installed().unwrap_or(&BuildStamp::UNSTAMPED).app_version
 }
 
+/// The running binary's build as one token: `<version>+g<commit>` — the commit
+/// with its `-dirty` mark when the tree had one — off the installed stamp, else
+/// [`BuildStamp::UNSTAMPED`]'s (`0.0.0+gunknown`, which every unstamped dev bin
+/// shares). What a fabric bridge and the instance serving it exchange in
+/// `hello`, so that one which is another build than the other is named.
+#[must_use]
+pub fn build_id() -> String {
+    let stamp = installed().unwrap_or(&BuildStamp::UNSTAMPED);
+    format!("{}+g{}", stamp.app_version, stamp.git_commit)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

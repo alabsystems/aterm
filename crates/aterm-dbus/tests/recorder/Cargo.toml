@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+#
+# THE D-BUS ORACLE'S RECORDER (A11Y.3, docs/AUDIT-third-party-2026-10-15.md,
+# a11y decision 5), in ITS OWN WORKSPACE on purpose (the empty `[workspace]`
+# below): registry zbus and zvariant write the bytes, and aterm-dbus is held
+# to the committed recordings with neither in the workspace graph, not even as
+# a dev-dependency. Its Cargo.lock pins the zbus family at the versions the
+# workspace lock held when tests/recorded/ was written (main @ ecc07c48a):
+# zbus 5.16.0, zbus_macros 5.16.0, zbus_names 4.3.2, zvariant 5.12.0,
+# zvariant_derive 5.12.0, zvariant_utils 3.4.0, serde 1.0.228, winnow 1.0.3.
+#
+# Nothing in the aterm workspace builds this. From this directory:
+#   targo --unverified run --release --locked -- values > ../recorded/zvariant-5.12.0-values.tsv.new
+#   targo --unverified run --release --locked -- messages > ../recorded/zbus-5.16.0-messages.tsv.new
+#   targo --unverified run --release --locked -- session ../recorded/zbus-5.16.0-messages.tsv tcp
+#   targo --unverified run --release --locked -- session ../recorded/zbus-5.16.0-messages.tsv unix
+# Each prints rows only; the committed TSVs add the `#` header that says what
+# the rows are, and the session file holds the `tcp` block (tagged `nofd`)
+# before the `unix` one. Diff the rows against the committed ones: a
+# difference is zbus changing, never a reason to edit the corpus by hand.
+[package]
+name = "aterm-dbus-recorder"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+zbus = { version = "=5.16.0", default-features = false, features = ["async-io", "blocking-api"] }
+zbus_macros = "=5.16.0"
+zbus_names = "=4.3.2"
+zvariant = "=5.12.0"
+zvariant_derive = "=5.12.0"
+zvariant_utils = "=3.4.0"
+serde = { version = "=1.0.228", features = ["derive"] }
+winnow = "=1.0.3"

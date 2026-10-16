@@ -5,7 +5,7 @@
 //!
 //! # PTY provenance (Phase 1 of #7877, issue #8005)
 //!
-//! Every slice-bearing argument on [`ActionSink`] and [`BatchActionSink`] is
+//! Every slice-bearing argument on [`ActionSink`] is
 //! wrapped in [`Provenance<_, Pty>`] (from `aterm-provenance`). This tags the
 //! bytes at the type level as originating from an adversarial PTY, and the
 //! Rust compiler then refuses to let them reach a `Host`-privileged sink
@@ -267,24 +267,6 @@ pub trait ActionSink {
     fn apc_end(&mut self, _canceled: bool) {}
 }
 
-/// Extended trait for batch-optimized action handling.
-///
-/// This trait adds `print_str` for handling runs of printable ASCII
-/// in a single call, which can be more efficient than per-character
-/// `print` calls.
-///
-/// Test-only: production uses `advance_fast`/`ActionSink`. The batch path
-/// (`advance_batch`) — the only consumer of this trait — is `#[cfg(test)]`,
-/// so the trait and its impls are gated out of release builds.
-#[cfg(test)]
-pub trait BatchActionSink: ActionSink {
-    /// Print a string of characters.
-    ///
-    /// The string is guaranteed to contain only printable ASCII (0x20-0x7E).
-    /// This allows efficient batch processing without per-character overhead.
-    fn print_str(&mut self, s: &Provenance<str, Pty>);
-}
-
 /// A sink that discards all actions.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NullSink;
@@ -302,9 +284,4 @@ impl ActionSink for NullSink {
     fn apc_start(&mut self) {}
     fn apc_put(&mut self, _: u8) {}
     fn apc_end(&mut self, _: bool) {}
-}
-
-#[cfg(test)]
-impl BatchActionSink for NullSink {
-    fn print_str(&mut self, _: &Provenance<str, Pty>) {}
 }

@@ -22,6 +22,10 @@
 //! Every wait is for its causal event; the ceiling is for a broken build.
 
 #![cfg(unix)]
+#![allow(
+    clippy::disallowed_types,
+    reason = "test code: a stand-in child may inherit descriptors"
+)]
 
 use crate::{child_output, headless_boot, launch_isolation};
 
@@ -110,9 +114,9 @@ fn kept_with_line(prefix: &str, name: &str, body: &str, line: &str) {
         if text.contains(line) {
             break text;
         }
-        // The exit status says how it ended (a signal, or its own exit code): the
-        // one gate failure of this (2026-10-09, load ~100) left only the log's
-        // first three lines and no cause.
+        // The exit status says how it ended (a signal, or its own exit code): a
+        // failure on a loaded machine once left only the log's first three lines
+        // and no cause.
         let ended = inst.child.try_wait().expect("poll the instance");
         assert!(
             ended.is_none(),

@@ -7,7 +7,6 @@
 use super::*;
 
 mod basic;
-mod batch;
 mod c1;
 mod carry;
 mod csi;
@@ -15,6 +14,7 @@ mod empty_params;
 mod invariants;
 mod performance;
 mod refinement;
+mod string_bulk;
 mod string_cancel;
 mod subparams;
 mod table_validity;
@@ -120,11 +120,5 @@ impl ActionSink for RecordingSink {
         } else {
             self.apc_ends += 1;
         }
-    }
-}
-
-impl BatchActionSink for RecordingSink {
-    fn print_str(&mut self, s: &aterm_provenance::Provenance<str, aterm_provenance::Pty>) {
-        self.prints.extend(s.as_ref().chars());
     }
 }

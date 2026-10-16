@@ -18,6 +18,10 @@
 //! the registry an empty local directory, so the pass finds an empty store and exits 0.
 
 #![cfg(target_os = "macos")]
+#![allow(
+    clippy::disallowed_types,
+    reason = "test code: a stand-in child may inherit descriptors"
+)]
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -227,5 +231,31 @@ fn an_unknown_word_ahead_of_the_verb_is_refused_before_the_machine_edge() {
     assert!(
         !fx.prefix.join("machine.applied").exists(),
         "nothing was applied or recorded"
+    );
+}
+
+/// A PASS THE STORE LOCK TURNS AWAY STILL CARRIES THE EDIT, AND HAS SAID SO WHEN IT EXITS.
+/// The edge's apply needs no store lock, so it runs BESIDE the pass, on a thread started
+/// before the lock is asked for, and the pass joins it before it returns — a refused pass
+/// too. Here the test holds the store lock, so the `update` is refused at once (exit 75),
+/// and the never-applied table's apply was still attempted: its synthetic-home refusal is
+/// on stdout.
+#[test]
+fn a_pass_the_store_lock_refuses_still_carries_the_machine_edit() {
+    let fx = Fixture::new("contended");
+    let layout = atpkg::store::Layout {
+        prefix: fx.prefix.clone(),
+    };
+    let held = atpkg::lock::try_lock_store(&layout).expect("the test holds the store lock");
+    let out = fx.run(&["update"], None);
+    drop(held);
+    assert_eq!(
+        out.status.code(),
+        Some(i32::from(atpkg::lock::CONTENDED_EXIT)),
+        "{out:?}"
+    );
+    assert!(
+        Fixture::attempted(&Fixture::lines(&out.stdout)),
+        "the refused pass still carried the never-applied table: {out:?}"
     );
 }

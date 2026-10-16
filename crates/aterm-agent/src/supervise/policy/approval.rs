@@ -169,7 +169,15 @@
 //! [`ApprovalCtx::question_priority`] ([`QuestionPriority`]): by default its
 //! recommended option; under the priority words `long-term` / `short-term`
 //! by the worker itself, to whom the supervisor writes that word's fixed
-//! policy text in the question's free-text row ([`Answer::Type`]).
+//! policy text in the question's free-text row ([`Answer::Type`]) — on
+//! Codex's question, as the note of `None of the above` ([`Choice::Note`]).
+//!
+//! **The owner's own Codex rules.** An exec box an owner's prompt rule sent
+//! (`prefix_rule(…, decision="prompt")` in `$CODEX_HOME/rules/`; its Reason
+//! row `` `<cmd>` requires approval by policy`` or `` … requires approval:
+//! <justification>``, measured on 0.163.0) is the owner's review, as Claude
+//! Code's ask rules are ([`aterm_phase::PromptV2::owner_review`]): handed to a
+//! person at every level, never pressed.
 //!
 //! **The usage-limit dialog is neither.** Claude Code's usage-limit options
 //! dialog (`What do you want to do?`, 2.1.282; aterm-phase's "THE
@@ -264,19 +272,26 @@
 //!   machine (no `(runs on <m>)`: the checks below look at THIS
 //!   filesystem and `$HOME`) whose one path is
 //!   absolute (or `~/…`), under an ALLOWED root ([`ApprovalCtx::read_roots`]:
-//!   the trust roots, `/usr`, `/etc`, `/opt/homebrew`, the uid's
-//!   `/private/tmp/claude-<uid>`) and outside the [`SecretRule`] list — the
-//!   path as written AND as its symlinks resolve ([`real_components`]), so
-//!   a committed `docs/k -> ~/.ssh/id_rsa` under an allowed root is judged
-//!   where it leads. A link the worker makes after the
-//!   read is not seen: the check is the read's, not the Read's.
-//! * [`RULE_TRUST_DIALOG`] — Claude Code's folder-trust dialog, when the
-//!   folder it asks about is the session's own working directory (`meta
-//!   cwd=`, [`ApprovalCtx::cwd_known`]) AND under a trust root, its options
-//!   exactly the measured `No, exit` and `Yes, I trust this folder`. It is
-//!   unnumbered: the choice is to move the focus ([`Choice::Focus`]) and
-//!   then Enter, the Enter only once a fresh read shows the focus on
-//!   `Yes, I trust this folder` (the loop's part).
+//!   the trust roots, `/usr`, `/etc`, `/opt/homebrew`) and outside the
+//!   [`SecretRule`] list — the path as written AND as its symlinks resolve
+//!   ([`real_components`]), so a committed `docs/k -> ~/.ssh/id_rsa` under
+//!   an allowed root is judged where it leads. A link the worker makes after
+//!   the read is not seen: the check is the read's, not the Read's.
+//! * [`RULE_TRUST_DIALOG`] — Claude Code's folder-trust dialog and Codex's
+//!   folder-trust gate, when the folder it asks about is the session's own
+//!   working directory (`meta cwd=`, [`ApprovalCtx::cwd_known`]) AND under a
+//!   trust root (`[harness] trust_roots`, none by default:
+//!   [`ApprovalCtx::set_trust_roots`]), its options exactly the measured exit
+//!   and trust (`No, exit` and `Yes, I trust this folder`; Codex's `Quit` and
+//!   `Trust and continue`, 0.156.1 — the 0.157.0 gate measured in place of
+//!   `Quit` offers `Back to Agent Command Center`, a label its reader gives
+//!   no role, so it is a person's). Claude Code's is unnumbered, and Codex's
+//!   reader selects its numbered gate with the arrows too: the choice is to
+//!   move the focus ([`Choice::Focus`]) and then Enter, the Enter only once
+//!   a fresh read shows the focus on the trust option (the loop's part).
+//!   Codex's gate in a Git repository's subdirectory trusts the repository
+//!   ROOT it names under its folder (0.163.0, measured): a trust root must
+//!   hold that root too.
 //!
 //! **Which option** (the safe rules). Only the plain one-shot allow
 //! ([`Role::Once`] — `Yes`, `Yes, proceed`, `Yes, run it`, Chrome's `Allow`)
@@ -284,14 +299,17 @@
 //! the trust dialog's [`Role::Trust`]; never a [`Role::Session`], [`Role::Persist`] or [`Role::ModeSwitch`]
 //! grant, which would turn one verdict into a standing wildcard, and never
 //! [`Role::Other`] — what aterm-phase gives every option of a box whose
-//! options are not sound, and every option of every Codex box.
+//! options are not sound, and a label a reader does not know.
 //!
 //! **Which program.** The box is read by the reader for the session's
 //! PROGRAM ([`aterm_phase::read`]), and only on a reading whose phase is the
 //! reader's evidence ([`Reading::phase_authoritative`]): a shell showing a
 //! captured box, a pager — no agent's box, never pressed. The four safe rules
-//! were measured on Claude Code's boxes and judge only those: under `"safe"` another
-//! agent's box is escalated.
+//! were measured on Claude Code's boxes and judge those; the trust rule judges
+//! Codex's folder-trust gate too, on the same facts its reader gives (the
+//! folder row, the options' roles, the cursor). Under `"safe"` every other
+//! Codex box, and any other agent's, is escalated: no safe rule was measured
+//! on them.
 //!
 //! **The press.** An approval carries the guard to press it under
 //! ([`super::guard::row_guard`] of the judged row: a Bash or PowerShell
@@ -301,11 +319,11 @@
 //! between this read and the press is not answered on this verdict; the
 //! loop adds the screen-generation fence where the server has one. Under the
 //! safe rules the box must also offer a refusal — a [`Role::Deny`] option;
-//! the trust dialog's refusal is its own (`No, exit`) — and wherever a box
-//! has a `Do you want …` question no option-shaped row may sit above it. A
-//! digit is never pressed while the focus is on an open `No, and …` input
-//! ([`amend_input_open`]): the Select hands every key but the arrows to that
-//! input, so the digit would be typed into it.
+//! the trust dialog's refusal is its own (`No, exit`, Codex's `Quit`) — and
+//! wherever a box has a `Do you want …` question no option-shaped row may
+//! sit above it. A digit is never pressed while the focus is on an open `No,
+//! and …` input ([`amend_input_open`]): the Select hands every key but the
+//! arrows to that input, so the digit would be typed into it.
 //!
 //! **THE DECLINE** ([`Decision::Decline`], built by [`decline`]): the third
 //! answer beside approving and escalating — the box refused WITH A REASON the
@@ -405,14 +423,15 @@ use aterm_phase::prompt::{
 use aterm_phase::{Phase, Program, Reading, anchor};
 
 use super::super::codex_usage::LimitRead;
-use super::super::config::Approve;
+use super::super::config::{Approve, SupervisorConfig};
 use super::a_or_an;
-use super::claude_settings::AskRule;
+use super::claude_settings::{AskKind, OwnerAsk};
 use super::git_config::{GitView, WorkerEnv, git_reads, hazard};
 use super::guard::row_guard;
 use super::rm_breaker::{RmScope, ScratchRoot, abs_components, clip, resolve_rm_line};
 use super::shell_startup::ShellStartup;
 use super::turn_end::CodexSetting;
+use crate::harness::lights::Mode;
 use crate::supervise::classify::{
     classify_command_with, classify_except_rm, glob_match, plain_zsh_line,
 };
@@ -615,6 +634,12 @@ pub enum Choice {
         label: String,
         key: &'static str,
     },
+    /// A question read by its answers' roles (Codex's) answered under a text
+    /// priority: `text`'s fixed words written as the note of `None of the
+    /// above` — the focus moved there with arrows, Tab, the text, Enter once
+    /// a read shows it — one keystroke at a time, each decided on a fresh read
+    /// ([`super::question::note_step`]). Never a digit, never Esc.
+    Note { text: QuestionPriority },
 }
 
 /// How a question dialog is answered ([`Choice::Answer`]): move the focus, then
@@ -815,7 +840,7 @@ pub fn default_secrets(home: Option<&Path>) -> Vec<SecretRule> {
 }
 
 /// Roots from config text (`[harness] trust_roots`): `~/` is `home`, a trailing
-/// `*` matches any suffix of the last component (`~/aterm*`), resolved
+/// `*` matches any suffix of the last component (`~/src/app*`), resolved
 /// lexically. A spec not absolute after `~`, holding `..`, or globbing
 /// elsewhere is dropped, never widened.
 pub fn roots_from_config(specs: &[String], home: Option<&Path>) -> Vec<ScratchRoot> {
@@ -853,10 +878,6 @@ pub fn roots_from_config(specs: &[String], home: Option<&Path>) -> Vec<ScratchRo
     }
     out
 }
-
-/// The defaults for `trust_roots` when no config names any
-/// (`SupervisorConfig::default`'s).
-const DEFAULT_TRUST_ROOTS: &[&str] = &["~/aterm*", "~/ay*", "$HOME/trust*", "/private/tmp/claude-*"];
 
 /// Everything [`decide`] knows besides the box.
 #[derive(Debug, Clone)]
@@ -924,8 +945,9 @@ pub struct ApprovalCtx {
     /// (default [`QuestionPriority::Recommended`]).
     pub question_priority: QuestionPriority,
     /// The priority whose text the loop wrote into this question's free-text row
-    /// and remembers writing; `None` when none (or forgotten after a restart or
-    /// handover). The same text with `None` here is a person's.
+    /// (a Codex question's notes field) and remembers writing; `None` when none
+    /// (or forgotten after a restart or handover). The same text with `None`
+    /// here is a person's.
     pub question_own: Option<QuestionPriority>,
     /// The pane's width in cells (`text --json` `dims.cols`, else the widest
     /// row); `0` makes [`decide`] use the widest row. Policy text is typed only
@@ -937,7 +959,8 @@ pub struct ApprovalCtx {
     pub screen_rows: usize,
     /// The loop already fell back to this tab's recommended option under a text
     /// priority (`policy/question.rs`, `falls_back`) and latched it, so the fit
-    /// is not re-estimated.
+    /// is not re-estimated; for a Codex question, its notes field did not read
+    /// open after the loop's Tab (`policy/question.rs`, `NOTES_UNREAD`).
     pub question_fell_back: bool,
     /// The worker's environment ([`WorkerEnv`]) for reading git configuration
     /// ([`super::git_config`]), or why it is unreadable (every git read then
@@ -954,26 +977,25 @@ pub struct ApprovalCtx {
     /// why it is unreadable. Read by the loop only for a Bash box
     /// ([`shell_unread`]).
     pub shell: Result<ShellStartup, String>,
-    /// The bare-tool ask rules of the agent's own Claude Code settings
-    /// ([`super::claude_settings::bare_asks`]), or why they could not be
-    /// read: what holds a box Claude Code draws no ask reason on
+    /// The ask rules and PreToolUse hooks of the agent's own Claude Code
+    /// settings ([`super::claude_settings::owner_asks`]), or why they could
+    /// not be read: what holds a box Claude Code draws no ask reason on
     /// ([`unvoiced_tools`], [`settings_ask`]). Read by the loop only for such
     /// a box ([`asks_unread`]).
-    pub owner_asks: Result<Vec<AskRule>, String>,
+    pub owner_asks: Result<Vec<OwnerAsk>, String>,
 }
 
 impl ApprovalCtx {
-    /// Defaults for a session in `cwd` owned by `uid`: full power
-    /// ([`Approve::All`]), questions answered, the usage-limit wait chosen
-    /// and no limit reset taken.
+    /// Defaults for a session in `cwd` owned by `uid`: the switches and trust
+    /// roots of [`SupervisorConfig::default`] (full power, questions answered,
+    /// the usage-limit wait chosen, no limit reset taken and no trust root).
     /// Scratch roots: `/private/tmp/claude-<uid>/`, `tmpdir` (a root for literal
     /// paths, when at least two levels deep and holding neither `cwd` nor
     /// `home`), any `/tmp/<x>/` and `/private/tmp/<x>/`, and `<cwd>/target*`.
-    /// Trust roots `~/aterm*`, `~/ay*`, `$HOME/trust*`, `/private/tmp/claude-*`
-    /// ([`Self::set_trust_roots`] replaces them). Read roots: trust roots plus
-    /// `/usr`, `/etc`, `/private/etc`, `/opt/homebrew`,
-    /// `/private/tmp/claude-<uid>`. [`default_secrets`], cwd known, not bypass,
-    /// recommended answers, pane size unknown.
+    /// [`Self::set_trust_roots`] replaces the trust roots. Read roots: trust
+    /// roots plus `/usr`, `/etc`, `/private/etc`, `/opt/homebrew`.
+    /// [`default_secrets`], cwd known, not bypass, recommended answers, pane
+    /// size unknown.
     pub fn new(cwd: PathBuf, home: Option<PathBuf>, uid: u32, tmpdir: Option<PathBuf>) -> Self {
         let claude_tmp = PathBuf::from(format!("/private/tmp/claude-{uid}"));
         let mut scratch_roots: Vec<ScratchRoot> = Vec::new();
@@ -992,27 +1014,27 @@ impl ApprovalCtx {
         scratch_roots.extend(ScratchRoot::children_of(Path::new("/tmp")));
         scratch_roots.extend(ScratchRoot::children_of(Path::new("/private/tmp")));
         scratch_roots.extend(ScratchRoot::glob_under(&cwd, "target*"));
-        let defaults: Vec<String> = DEFAULT_TRUST_ROOTS.iter().map(|s| s.to_string()).collect();
+        let defaults = SupervisorConfig::default();
         let mut ctx = Self {
             secrets: default_secrets(home.as_deref()),
             cwd,
             cwd_known: true,
             home,
             bypass_mode: false,
-            approve: Approve::All,
-            answer_questions: true,
-            model_fallback: true,
+            approve: defaults.approve,
+            answer_questions: defaults.answer_questions,
+            model_fallback: defaults.model_fallback.is_some(),
             nudge: NudgeCtx::default(),
             model_restore: None,
             goal_resume: false,
-            limit_wait: true,
-            limit_reset: false,
+            limit_wait: defaults.limit_wait,
+            limit_reset: defaults.limit_reset,
             trust_roots: Vec::new(),
             read_roots: Vec::new(),
             scratch_roots,
-            rm_breaker_warn: true,
+            rm_breaker_warn: !defaults.rm_breaker_ask,
             python_allow: Vec::new(),
-            question_priority: QuestionPriority::Recommended,
+            question_priority: defaults.question_priority,
             question_own: None,
             screen_cols: 0,
             screen_rows: 0,
@@ -1022,24 +1044,21 @@ impl ApprovalCtx {
             shell: shell_unread(),
             owner_asks: asks_unread(),
         };
-        ctx.set_trust_roots(&defaults, uid);
+        ctx.set_trust_roots(&defaults.trust_roots, uid);
         ctx
     }
 
     /// The trust roots from `[harness] trust_roots` ([`roots_from_config`]), and
     /// the Read roots rebuilt around them. A `claude-*` spec under
-    /// `/private/tmp` or `/tmp` names only this uid's `claude-<uid>`.
+    /// `/private/tmp` or `/tmp` names only this uid's `claude-<uid>`. With no
+    /// spec there is no trust root and the Read roots are the system's alone:
+    /// no fact about a session or the vendor makes a folder safe to trust, so
+    /// the folders to trust are a person's to name.
     pub fn set_trust_roots(&mut self, specs: &[String], uid: u32) {
         let specs: Vec<String> = specs.iter().map(|s| own_claude_tmp(s, uid)).collect();
         self.trust_roots = roots_from_config(&specs, self.home.as_deref());
         self.read_roots = self.trust_roots.clone();
-        for sys in [
-            "/usr",
-            "/etc",
-            "/private/etc",
-            "/opt/homebrew",
-            &format!("/private/tmp/claude-{uid}"),
-        ] {
+        for sys in ["/usr", "/etc", "/private/etc", "/opt/homebrew"] {
             self.read_roots.extend(ScratchRoot::dir(Path::new(sys)));
         }
     }
@@ -1075,7 +1094,7 @@ fn shell_unread() -> Result<ShellStartup, String> {
 /// [`ApprovalCtx::owner_asks`] before the loop reads the agent's settings:
 /// unknown, so a box an ask rule could have sent unread is held; in this
 /// crate's unit tests no rule.
-fn asks_unread() -> Result<Vec<AskRule>, String> {
+fn asks_unread() -> Result<Vec<OwnerAsk>, String> {
     #[cfg(test)]
     {
         Ok(Vec::new())
@@ -1121,42 +1140,18 @@ fn own_claude_tmp(spec: &str, uid: u32) -> String {
     spec.to_string()
 }
 
-/// The permission mode Claude Code's footer names.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FooterMode {
-    /// `⏸ manual mode on`, or `? for shortcuts` and no pill: the default mode.
-    Default,
-    /// `⏵⏵ bypass permissions on`.
-    Bypass,
-    /// `⏵⏵ auto mode on`.
-    Auto,
-    /// `⏵⏵ accept edits on`.
-    AcceptEdits,
-    /// `⏵⏵ don't ask on`.
-    DontAsk,
-    /// `⏸ plan mode on`.
-    Plan,
-}
-
-/// The mode the footer under the composer names, read from its pill
-/// (`harness::footer::pill_indicator`); `None` when no footer is drawn (as
-/// while a box is up), so a caller keeps its last answer.
-pub fn footer_mode(rows: &[String]) -> Option<FooterMode> {
-    use crate::harness::lights::Mode;
+/// The permission mode the footer under the composer names, read from its
+/// pill (`harness::footer::pill_indicator`), or [`Mode::Manual`] for
+/// `? for shortcuts` and no pill; `None` when no footer is drawn (as while a
+/// box is up), so a caller keeps its last answer.
+pub fn footer_mode(rows: &[String]) -> Option<Mode> {
     let tail = rows.iter().rev().filter(|r| !r.trim().is_empty()).take(3);
     for r in tail {
         if let Some(mode) = crate::harness::footer::pill_indicator(r).and_then(Mode::of_indicator) {
-            return Some(match mode {
-                Mode::Bypass => FooterMode::Bypass,
-                Mode::Auto => FooterMode::Auto,
-                Mode::AcceptEdits => FooterMode::AcceptEdits,
-                Mode::DontAsk => FooterMode::DontAsk,
-                Mode::Plan => FooterMode::Plan,
-                Mode::Manual => FooterMode::Default,
-            });
+            return Some(mode);
         }
         if r.contains(aterm_phase::anchor("footer.shortcuts")) {
-            return Some(FooterMode::Default);
+            return Some(Mode::Manual);
         }
     }
     None
@@ -1202,7 +1197,7 @@ fn kept_or_bought(p: &PromptV2, decision: &Decision) -> Option<String> {
         Choice::Focus { label, .. } | Choice::FocusKey { label, .. } => {
             p.options.iter().find(|o| o.label == *label)
         }
-        Choice::Answer(_) => None,
+        Choice::Answer(_) | Choice::Note { .. } => None,
     }?;
     let what = if o.role == Role::Persist || settles_later(&o.label) {
         "keeps its answer for every later ask"
@@ -1248,7 +1243,7 @@ fn never_spends(reading: &Reading, rows: &[String], decided: Decision) -> Decisi
             .and_then(|all| all.iter().find(|o| o.n == Some(*n)))
             .map(|o| o.label.as_str()),
         Choice::Focus { label, .. } | Choice::FocusKey { label, .. } => Some(label.as_str()),
-        Choice::Answer(_) => None,
+        Choice::Answer(_) | Choice::Note { .. } => None,
     };
     if let Some(label) = chosen.filter(|label| spends(label)) {
         return Decision::escalate(format!(
@@ -1292,15 +1287,45 @@ fn keeps_reset(opt: &Opt) -> bool {
     (opt.role == Role::Deny || waits(opt)) && !buys(opt)
 }
 
+/// Whether `program` draws Claude Code's boxes and dialogs, the ones the safe
+/// rules (all but the trust rule, which judges Codex's gate too:
+/// [`decide_safe`]), the owner's Claude Code settings and the dialog rules
+/// here were measured on. Any other program's box is escalated or handed over.
+fn draws_claude_boxes(program: Program) -> bool {
+    match program {
+        Program::Claude => true,
+        Program::Codex | Program::Agy | Program::Muse | Program::Generic => false,
+    }
+}
+
+/// Whether `program` draws Codex's own dialogs — its rate-limit nudge
+/// ([`rate_nudge`]), its paused-goal box ([`goal_resume_pick`]) and its model
+/// picker ([`restore_pick`]) — read by Codex's anchors.
+fn draws_codex_dialogs(program: Program) -> bool {
+    match program {
+        Program::Codex => true,
+        Program::Claude | Program::Agy | Program::Muse | Program::Generic => false,
+    }
+}
+
 /// [`decide`], before its last checks ([`never_spends`], THE PRESS GATE).
 fn decide_box(reading: &Reading, rows: &[String], ctx: &ApprovalCtx) -> Decision {
+    // A program the supervisor does not host (Muse Code:
+    // `aterm_phase::Program::supervisable`) is read, never answered: every
+    // box of its is a person's, whatever its reader names in it.
+    if !reading.program.supervisable() {
+        return Decision::escalate(format!(
+            "{} is read, not supervised: its boxes are a person's",
+            reading.program.product()
+        ));
+    }
     // The usage-limit dialog is decided first by its own rules, before
     // questions and levels, so full power never sees it: the grant row where
     // the owner turned limit resets on, else the wait row.
     if let Some(prompt) = reading.prompt.as_ref()
         && prompt.kind == PromptKind::UsageLimit
     {
-        return if reading.program != Program::Claude
+        return if !draws_claude_boxes(reading.program)
             || reading.phase != Phase::Prompt
             || !reading.phase_authoritative
         {
@@ -1345,11 +1370,16 @@ fn decide_box(reading: &Reading, rows: &[String], ctx: &ApprovalCtx) -> Decision
     // The user's own Claude Code configuration (an ask rule or hook) sends this
     // box to a person: no level presses it — read off the box's reason where
     // Claude Code draws one, else off the agent's own settings (a bare-tool
-    // ask rule for a file tool), else, for an in-project Read, off the missing
-    // folder grant. Built-in safety checks stay the levels' to answer.
+    // ask rule for a file tool; for a box a Bash `sed -i` is drawn as, any
+    // Bash ask rule or Bash hook), else, for an in-project Read, off the
+    // missing folder grant. Built-in safety checks stay the levels' to answer.
     if let Some(review) = reading.prompt.as_ref().and_then(|p| p.owner_review()) {
+        let whose = match review.kind {
+            aterm_phase::prompt::ReviewKind::CodexRule => "Codex rules",
+            _ => "Claude Code settings",
+        };
         return Decision::escalate(format!(
-            "the owner's Claude Code settings send this box to a person ({}): {}",
+            "the owner's {whose} send this box to a person ({}): {}",
             review.kind.words(),
             review.text
         ));
@@ -1405,7 +1435,10 @@ fn decide_box(reading: &Reading, rows: &[String], ctx: &ApprovalCtx) -> Decision
 /// `Read file` every read-only file tool's (Read, Glob, Grep); and the IDE
 /// diff, which replaces the title of any file-writing box, any of those that
 /// write. Empty for every other kind: Claude Code draws the reason on a Bash,
-/// Fetch or Tool box ([`PromptV2::owner_review`]).
+/// Fetch or Tool box ([`PromptV2::owner_review`]). A box this lists `Bash`
+/// for is one a Bash `sed -i` may be drawn as, which no reason on it can
+/// tell from a rule's or a hook's ask ([`settings_ask`], DECIDED
+/// 2026-10-15).
 #[must_use]
 pub fn unvoiced_tools(p: &PromptV2) -> &'static [&'static str] {
     let title = p.title.trim_start();
@@ -1421,36 +1454,71 @@ pub fn unvoiced_tools(p: &PromptV2) -> &'static [&'static str] {
 
 /// Why the owner's own Claude Code settings hold the box `reading` found, at
 /// every level, where Claude Code draws no reason to read it by
-/// ([`unvoiced_tools`]): a BARE-TOOL ask rule along the agent's settings
-/// chain ([`ApprovalCtx::owner_asks`]) for any tool Claude Code draws the box
-/// for — `Write`, `Edit`, `Bash`, `Read`…, with no specifier, so every call
-/// of the tool is the person's and no matcher needs evaluating — or those
-/// settings unread, where no rule can be ruled out. A rule with a specifier (`Edit(src/**)`) is Claude Code's to
-/// match and holds nothing here (`tools/real-claude-lab/README.md`, DECIDED
-/// 2026-10-09). A Codex box is not Claude Code's.
+/// ([`unvoiced_tools`]), from what the agent's settings chain carries
+/// ([`ApprovalCtx::owner_asks`]), or those settings unread, where no rule can
+/// be ruled out. A Codex box is not Claude Code's.
+///
+/// * A BARE-TOOL ask rule (`Write`, `Edit`, `Bash`, `Read`…, no specifier)
+///   for any tool Claude Code draws the box for: every call of the tool is
+///   the person's, so no matcher needs evaluating (DECIDED 2026-10-09).
+/// * For a box a Bash `sed -i` is drawn as (`Edit file`, the IDE diff: the
+///   box lists `Bash`), ANY Bash ask rule (`Bash(sed:*)`) and any PreToolUse
+///   hook whose matcher can match Bash
+///   ([`super::claude_settings::hook_may_match`]): Claude Code draws that box
+///   with no reason, so neither the rule's specifier nor the hook's answer
+///   can be read off it, and in auto mode the box is there only because one
+///   of them asked (DECIDED 2026-10-15, fail-closed toward the owner's rules;
+///   ATERM-KI-1015-1 F1). Its over-hold: under such a rule or hook EVERY box
+///   of that title is held, the Edit tool's own included, whatever the rule
+///   matches or the hook answers — a status hook with matcher `*` holds every
+///   `Edit file` box of the agent.
+///
+/// Any other rule with a specifier (`Edit(src/**)`, `Read(~/.ssh/**)`) and
+/// a hook on another tool are Claude Code's to match and hold nothing here
+/// (`docs/measured/real-claude-lab-2026-10-15.md`, the 2026-10-06 ruling).
 fn settings_ask(reading: &Reading, ctx: &ApprovalCtx) -> Option<String> {
     let p = reading.prompt.as_ref()?;
     let tools = unvoiced_tools(p);
-    if reading.program != Program::Claude || tools.is_empty() {
+    if !draws_claude_boxes(reading.program) || tools.is_empty() {
         return None;
     }
-    match &ctx.owner_asks {
-        Ok(rules) => rules
-            .iter()
-            .find(|r| tools.contains(&r.tool.as_str()))
-            .map(|r| {
-                format!(
-                    "the owner's Claude Code settings send this box to a person (an ask rule): \
-                     `{}` in {}",
-                    r.rule, r.source
-                )
-            }),
-        Err(why) => Some(format!(
-            "{} box the agent's Claude Code settings may send to a person, and they are \
-             unknown: {why}",
-            a_or_an(p.kind.name())
-        )),
+    let asks = match &ctx.owner_asks {
+        Ok(asks) => asks,
+        Err(why) => {
+            return Some(format!(
+                "{} box the agent's Claude Code settings may send to a person, and they are \
+                 unknown: {why}",
+                a_or_an(p.kind.name())
+            ));
+        }
+    };
+    if let Some(a) = asks
+        .iter()
+        .find(|a| tools.iter().any(|tool| a.asks_every(tool)))
+    {
+        return Some(format!(
+            "the owner's Claude Code settings send this box to a person (an ask rule): `{}` in \
+             {}",
+            a.text, a.source
+        ));
     }
+    if !tools.contains(&"Bash") {
+        return None;
+    }
+    asks.iter().find(|a| a.may_ask("Bash")).map(|a| {
+        let (what, named) = match a.kind {
+            AskKind::Rule { .. } => ("a Bash ask rule", format!("`{}`", a.text)),
+            AskKind::Hook { .. } => (
+                "a PreToolUse hook that can match Bash",
+                format!("matcher `{}`", a.text),
+            ),
+        };
+        format!(
+            "the owner's Claude Code settings may send this box to a person ({what}; Claude \
+             Code draws a Bash `sed -i` as this box with no reason): {named} in {}",
+            a.source
+        )
+    })
 }
 
 /// A Read box Claude Code offers no folder grant for was sent by the owner's
@@ -1487,7 +1555,7 @@ fn forced_read(reading: &Reading) -> Option<String> {
         path.strip_prefix('/')
             .is_some_and(|rest| !rest.contains('/'))
     });
-    if reading.program != Program::Claude
+    if !draws_claude_boxes(reading.program)
         || p.kind != PromptKind::Read
         || p.runs_on().is_some()
         || root_level
@@ -1569,7 +1637,7 @@ fn vendor_distrusts(path: &str) -> bool {
 /// other breaker kind, another machine's box, or other options keep the
 /// escalation (owner, 2026-09-29).
 fn rm_breaker_warn(reading: &Reading, rows: &[String], safe: String) -> Decision {
-    if reading.program != Program::Claude
+    if !draws_claude_boxes(reading.program)
         || reading.phase != Phase::Prompt
         || !reading.phase_authoritative
     {
@@ -1673,7 +1741,7 @@ fn tall_box(reading: &Reading, rows: &[String], ctx: &ApprovalCtx, why: String) 
     let Some(prompt) = reading.prompt.as_ref() else {
         return handed_over(None);
     };
-    if reading.program != Program::Claude
+    if !draws_claude_boxes(reading.program)
         || reading.phase != Phase::Prompt
         || !reading.phase_authoritative
         || !ctx.bypass_mode
@@ -1736,12 +1804,24 @@ fn quoted_invocation(note: &str) -> Option<&str> {
 }
 
 /// The safe rules alone ([`Approve::Safe`]): the rule for the box's kind,
-/// or an escalation.
+/// or an escalation. They judge Claude Code's boxes, and of Codex's only its
+/// folder-trust gate, whose folder row, options' roles and cursor its reader
+/// gives as Claude Code's reader gives its dialog's ([`trust_dialog`]).
 fn decide_safe(reading: &Reading, rows: &[String], ctx: &ApprovalCtx) -> Decision {
-    if reading.program != Program::Claude {
+    let judged = match reading.program {
+        Program::Claude => true,
+        Program::Codex => reading
+            .prompt
+            .as_ref()
+            .is_some_and(|p| p.kind == PromptKind::Trust),
+        // No safe rule was written for their boxes.
+        Program::Agy | Program::Muse | Program::Generic => false,
+    };
+    if !judged {
         return Decision::escalate(format!(
-            "a {} session's box: the safe rules judge Claude Code's boxes",
-            reading.program.name()
+            "{} session's box: the safe rules judge Claude Code's boxes and Codex's \
+             folder-trust gate",
+            a_or_an(reading.program.name())
         ));
     }
     if reading.phase != Phase::Prompt || !reading.phase_authoritative {
@@ -2644,9 +2724,10 @@ fn read_comps_allowed(comps: &[String], shown: &str, ctx: &ApprovalCtx) -> Resul
 }
 
 /// The folder-trust dialog ([`RULE_TRUST_DIALOG`]): its folder is the session's
-/// launch directory under a trust root, its options exactly `No, exit` and
-/// `Yes, I trust this folder`, focus on one of them. The choice moves the focus
-/// to the trust option (or presses its digit if numbered).
+/// launch directory under a trust root, its options exactly an exit and a trust
+/// (Claude Code's `No, exit` and `Yes, I trust this folder`, Codex's `Quit` and
+/// `Trust and continue`), focus on one of them. The choice moves the focus to
+/// the trust option (or presses its digit if numbered).
 fn trust_dialog(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decision {
     let Some(path) = prompt.path.as_deref() else {
         return Decision::escalate("a folder-trust dialog with no folder");
@@ -2674,12 +2755,33 @@ fn trust_dialog(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decisi
             "a folder-trust dialog for {path}, under no trust root"
         ));
     }
+    // What the trust is granted to: Codex's gate in a Git repository's
+    // subdirectory trusts the repository ROOT it names, so that is the folder
+    // a trust root must hold.
+    let root = match codex_repository_root(prompt, rows) {
+        Ok(root) => root,
+        Err(why) => return Decision::escalate(why),
+    };
+    if let Some((root, _)) = &root {
+        let held = resolve_abs(root, ctx.home.as_deref())
+            .is_ok_and(|c| ctx.trust_roots.iter().any(|r| r.holds(&c)));
+        if !held {
+            return Decision::escalate(format!(
+                "a folder-trust dialog for {path} whose trust applies to the repository root \
+                 {root}, under no trust root"
+            ));
+        }
+    }
     let roles: Vec<Role> = prompt.options.iter().map(|o| o.role).collect();
     if roles.len() != 2 || !roles.contains(&Role::Trust) || !roles.contains(&Role::Exit) {
         return Decision::escalate(format!(
-            "a folder-trust dialog whose options are not exactly `{}` and `{}`",
-            anchor("trust.no"),
-            anchor("trust.yes")
+            "a folder-trust dialog whose options are not exactly an exit and a trust ({})",
+            prompt
+                .options
+                .iter()
+                .map(|o| format!("`{}` {}", o.label, o.role.name()))
+                .collect::<Vec<_>>()
+                .join(", ")
         ));
     }
     let Some(target) = prompt.options.iter().position(|o| o.role == Role::Trust) else {
@@ -2717,9 +2819,51 @@ fn trust_dialog(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decisi
         rule_id: RULE_TRUST_DIALOG,
         choice,
         guard: row_guard(&rows[path_row]),
-        subject: path.to_string(),
+        subject: match root {
+            Some((root, _)) => format!("{path} (the trust applies to the repository root {root})"),
+            None => path.to_string(),
+        },
         unproven: None,
     }
+}
+
+/// The REPOSITORY ROOT Codex's folder gate says its trust applies to, as
+/// `(the path, its row)`: the gate of a session launched in a Git
+/// repository's subdirectory draws `Note: You’re in a subdirectory of a Git
+/// project. Trusting will apply to the repository root:` over the root's
+/// path (MEASURED on 0.163.0, a session launched with `-C /tmp/…/repo`: the
+/// note named `/private/tmp/…/repo`, the same folder by its resolved name).
+/// Read as the gate's SECOND path row, whatever the note's words or their
+/// wrap: a path row the gate draws past its folder is what its trust may
+/// reach. `Ok(None)` for a gate with one path row, and for any dialog not
+/// titled as Codex's gate (anchor `codex.trust.title`: Claude Code's lists
+/// the directories its grants name); `Err` for a second path row with a row
+/// under it before the blank one — a path wrapped, read only in part.
+fn codex_repository_root(
+    prompt: &PromptV2,
+    rows: &[String],
+) -> Result<Option<(String, usize)>, String> {
+    if prompt.title != anchor("codex.trust.title") {
+        return Ok(None);
+    }
+    let is_path = |r: &str| {
+        let t = r.trim();
+        t.starts_with('/') || t.starts_with('~')
+    };
+    let Some(at) = (prompt.span.0 + 1..prompt.span.1.min(rows.len()))
+        .filter(|&k| is_path(&rows[k]))
+        .nth(1)
+    else {
+        return Ok(None);
+    };
+    if rows.get(at + 1).is_some_and(|r| !r.trim().is_empty()) {
+        return Err(format!(
+            "a folder-trust dialog whose second path row ({}) runs onto the row under it: the \
+             folder its trust applies to is not read whole",
+            rows[at].trim()
+        ));
+    }
+    Ok(Some((rows[at].trim().to_string(), at)))
 }
 
 /// The most rows of one backstop warning's list [`backstop_warnings`]
@@ -3047,7 +3191,7 @@ fn other_dialog<'p>(
     p: &'p PromptV2,
     ctx: &ApprovalCtx,
 ) -> Result<(&'static str, &'p Opt), String> {
-    if program == Program::Claude
+    if draws_claude_boxes(program)
         && let Some(o) = p.options.iter().find(|o| consents(o) && !buys(o))
     {
         return Ok((RULE_ALLOW_ONCE, o));
@@ -3096,7 +3240,8 @@ fn switches_model(opt: &Opt) -> bool {
 /// `paused.title`), options exactly `Switch to <model>` and `Edit prompt and
 /// retry…` (anchor `paused.edit`).
 fn refusal_pause_switch(program: Program, p: &PromptV2) -> Option<&Opt> {
-    if program != Program::Claude || p.head_off_screen || p.title.trim() != anchor("paused.title") {
+    if !draws_claude_boxes(program) || p.head_off_screen || p.title.trim() != anchor("paused.title")
+    {
         return None;
     }
     match p.options.as_slice() {
@@ -3209,7 +3354,7 @@ fn rate_nudge<'p>(
     program: Program,
     ctx: &ApprovalCtx,
 ) -> Result<(&'static str, &'p Opt, String), String> {
-    if program != Program::Codex {
+    if !draws_codex_dialogs(program) {
         return Err(format!(
             "a rate-limit nudge on a {} session's screen",
             program.name()
@@ -3316,7 +3461,7 @@ fn goal_resume_pick(
     program: Program,
     ctx: &ApprovalCtx,
 ) -> Decision {
-    if program != Program::Codex || !ctx.goal_resume {
+    if !draws_codex_dialogs(program) || !ctx.goal_resume {
         return Decision::escalate(
             "Codex asks whether to resume a paused goal aterm did not pause: the person's",
         );
@@ -3347,7 +3492,7 @@ fn restore_pick(
     program: Program,
     ctx: &ApprovalCtx,
 ) -> Result<(Choice, String, String), String> {
-    if program != Program::Codex {
+    if !draws_codex_dialogs(program) {
         return Err(format!(
             "a model picker on a {} session's screen",
             program.name()
@@ -3623,7 +3768,7 @@ fn limit_reset(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Option<
         return None;
     }
     let at = prompt.options.iter().position(|o| o.focused)?;
-    let title_row = rows.get(prompt.span.0).filter(|r| r.trim() == title)?;
+    let title_row = aterm_phase::prompt::title_row(prompt, rows)?;
     Some(Decision::Approve {
         rule_id: RULE_LIMIT_RESET,
         choice: Choice::Focus {
@@ -3680,7 +3825,9 @@ fn limit_wait(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decision
     let Some(at) = prompt.options.iter().position(|o| o.focused) else {
         return Decision::escalate("a usage-limit dialog with no focused option");
     };
-    let Some(title_row) = rows.get(prompt.span.0).filter(|r| r.trim() == title) else {
+    // The row its title opens on, its line read across the rows a narrow
+    // pane wraps it onto (`What do you want to` over `do?` at 26 columns).
+    let Some(title_row) = aterm_phase::prompt::title_row(prompt, rows) else {
         return Decision::escalate("the usage-limit dialog's title is not on the screen");
     };
     let label = prompt.options[*target].label.clone();

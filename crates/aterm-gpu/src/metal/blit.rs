@@ -14,7 +14,7 @@
 //!
 //! WGSL's `@group @binding` has no Metal equivalent, so this module binds by
 //! reading `Pipeline::Blit.spec().binds` ([`crate::pipeline_table::BindSpec`]).
-//! The MSL scan in `super::shaders` holds that column equal to `blit.metal`,
+//! The twin scan in `crate::shader_twins` holds that column equal to `blit.metal`,
 //! and the differential pins the bytes, so a swapped slot fails both.
 //!
 //! Test-only: the macOS backend runs its blit from the same row inside

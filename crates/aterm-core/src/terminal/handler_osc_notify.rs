@@ -2,64 +2,46 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! OSC desktop-notification handlers: OSC 9 (simple), OSC 99 (kitty protocol:
-//! title/body/urgency, multi-part) and OSC 777 (rxvt-unicode `notify`).
+//! OSC desktop-notification handlers: OSC 9 (simple), OSC 99 (kitty: title,
+//! body, urgency, multi-part) and OSC 777 (rxvt-unicode `notify`).
 //!
-//! All three are gated by `TerminalConfig::allow_notifications` (applied by
-//! [`Terminal::apply_config`](super::Terminal::apply_config) into
-//! `modes.allow_notifications`), off by default. Wiring a callback alone does
-//! not let the parser reach it; the host must also authorize dispatch.
+//! All three are gated by `modes.allow_notifications`, off by default and set
+//! from `TerminalConfig::allow_notifications` by
+//! [`Terminal::apply_config`](super::Terminal::apply_config): a wired callback
+//! alone is never reached.
 
 use super::handler::TerminalHandler;
 use aterm_types::osc::{Notification, NotificationUrgency, TaskbarProgress};
 
-/// Maximum number of in-flight multi-part OSC 99 notifications retained in the
-/// pending map. A flood of distinct `i=<id>` chunks must not grow the map
-/// without bound; once the cap is hit, new ids are dropped.
+/// Maximum in-flight multi-part OSC 99 notifications; while full, a non-final
+/// chunk of a new id is dropped.
 const MAX_PENDING_NOTIFICATIONS: usize = 64;
 
 /// Pending-map key shared by every OSC 99 chunk without an `i=` id.
 const ANON_NOTIFICATION_KEY: &str = "\u{0}anon";
 
-/// Maximum byte length accepted for any single notification field (title or
-/// body). Longer payloads are truncated at a UTF-8 boundary. Desktop
-/// notification surfaces are small; an unbounded title is a memory/DoS vector.
+/// Maximum bytes of a notification title or body; longer text is cut at a UTF-8
+/// boundary.
 const MAX_NOTIFICATION_FIELD_BYTES: usize = 4096;
 
 impl TerminalHandler<'_> {
-    /// Handle OSC 9 — simple desktop notification (Terminal / ConEmu style).
-    ///
-    /// Format: `ESC ] 9 ; message BEL` (or ST terminator).
-    ///
-    /// The `9;4;st;pr` ConEmu *taskbar progress* sub-protocol is a distinct,
-    /// benign UI feature (a 0-100 progress value + state) — not a notification.
-    /// It carries no message text, so it is processed into [`Terminal::taskbar_progress`]
-    /// unconditionally and is not gated behind notification authorization; it
-    /// never reaches the notification callback. Everything else is treated as a
-    /// notification body and forwarded to the simple notification callback
-    /// registered via [`Terminal::set_notification_callback`][cb].
-    ///
-    /// The notification path is gated by host notification authorization (see
-    /// module docs). When unauthorized, or when no callback is wired, that path
-    /// is a silent no-op.
-    ///
-    /// [cb]: super::Terminal::set_notification_callback
+    /// Handle OSC 9 (Terminal / ConEmu): `ESC ] 9 ; message ST` goes to the
+    /// simple notification callback. ConEmu's `9;4;st;pr` taskbar progress
+    /// carries no text: it sets
+    /// [`Terminal::taskbar_progress`](super::Terminal::taskbar_progress) ungated
+    /// and never reaches the callback.
     pub(super) fn handle_osc_9(&mut self, params: &[&[u8]]) {
-        // params[0] = "9" (already parsed). The message is params[1..], which
-        // the OSC parser splits on ';' — rejoin so a message with literal
-        // semicolons round-trips.
+        // The message is params[1..] rejoined, so literal semicolons round-trip.
         let Some(message) = join_params(params, 1) else {
             return;
         };
-        // ConEmu taskbar progress (`9;4;st;pr`) — parse into taskbar_progress
-        // and return before the notification path (no auth, no callback).
+        // ConEmu taskbar progress: ungated, never a notification.
         if message == "4" || message.starts_with("4;") {
             if let Some(progress) = parse_conemu_taskbar_progress(&message) {
                 *self.taskbar_progress = Some(progress);
             }
             return;
         }
-        // Notification path (gated by host notification authorization).
         if !self.modes.allow_notifications {
             return;
         }
@@ -72,24 +54,15 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// Handle OSC 99 — kitty desktop-notification protocol.
+    /// Handle OSC 99, the kitty notification protocol:
+    /// `ESC ] 99 ; <metadata> ; <payload> ST`, metadata a `:`-separated list of
+    /// - `i=<id>`: groups multi-part chunks (id-less chunks share one default id)
+    /// - `p=title|body`: payload kind (default `title`)
+    /// - `u=0|1|2`: urgency low, normal (default), critical
+    /// - `d=0`: more chunks follow (`d=1` or absent: final)
     ///
-    /// Format: `ESC ] 99 ; <metadata> ; <payload> ST` where metadata is a
-    /// colon-separated list of `key=value` pairs:
-    /// - `i=<id>`   notification id (groups multi-part notifications)
-    /// - `p=<what>` payload type: `title` (default) or `body`
-    /// - `u=<n>`    urgency: 0=low, 1=normal (default), 2=critical
-    /// - `d=<0|1>`  done flag: `d=0` = more chunks follow, `d=1`/absent = final
-    ///
-    /// Multi-part notifications sharing an `i=<id>` (chunks without one share a
-    /// single default id) are accumulated — same-kind text concatenated, capped at
-    /// [`MAX_NOTIFICATION_FIELD_BYTES`] — until the final chunk (`d=1` or no `d`),
-    /// then dispatched to the advanced notification callback registered via
-    /// [`Terminal::set_advanced_notification_callback`][cb].
-    ///
-    /// Gated by host notification authorization (see module docs).
-    ///
-    /// [cb]: super::Terminal::set_advanced_notification_callback
+    /// Same-kind text accumulates, capped at [`MAX_NOTIFICATION_FIELD_BYTES`],
+    /// until the final chunk, then goes to the advanced notification callback.
     pub(super) fn handle_osc_99(&mut self, params: &[&[u8]]) {
         if !self.modes.allow_notifications {
             return;
@@ -133,9 +106,9 @@ impl TerminalHandler<'_> {
 
         let text = sanitize_notification(&payload);
 
-        // Build/update the accumulator entry. Every id-less chunk shares one
-        // key, as kitty treats a missing `i` as one default id, so an id-less
-        // `d=0` chunk can be completed and cannot fill the map.
+        // Every id-less chunk shares one key (kitty treats a missing `i` as one
+        // default id), so an id-less `d=0` chunk can be completed and cannot fill
+        // the map.
         let key = id
             .clone()
             .unwrap_or_else(|| ANON_NOTIFICATION_KEY.to_string());
@@ -161,25 +134,16 @@ impl TerminalHandler<'_> {
                 }
             }
         } else if self.notifications.pending.len() < MAX_PENDING_NOTIFICATIONS {
-            // More chunks expected — re-insert for accumulation. The cap is checked
-            // here, after this key's own entry was removed: a continuing id always
-            // has room, and a final chunk is never refused by it.
+            // More chunks follow. The cap is checked after this key's own entry
+            // was removed, so a continuing id always has room.
             self.notifications.pending.insert(key, entry);
         }
-        // Otherwise the map is full of other in-flight ids — drop this non-final
-        // chunk rather than grow unbounded.
+        // Otherwise the map is full of other in-flight ids: drop this chunk.
     }
 
-    /// Handle OSC 777 — rxvt-unicode `notify` notification.
-    ///
-    /// Format: `ESC ] 777 ; notify ; <title> ; <body> ST`. Only the `notify`
-    /// sub-command is a desktop notification; other OSC 777 sub-commands are
-    /// ignored. Dispatched to the advanced notification callback registered via
-    /// [`Terminal::set_advanced_notification_callback`][cb].
-    ///
-    /// Gated by host notification authorization (see module docs).
-    ///
-    /// [cb]: super::Terminal::set_advanced_notification_callback
+    /// Handle OSC 777 (rxvt-unicode): `ESC ] 777 ; notify ; <title> ; <body> ST`
+    /// goes to the advanced notification callback; other sub-commands are
+    /// ignored.
     pub(super) fn handle_osc_777(&mut self, params: &[&[u8]]) {
         if !self.modes.allow_notifications {
             return;
@@ -220,18 +184,10 @@ enum Osc99Payload {
     Body,
 }
 
-/// Parse a ConEmu OSC 9;4 taskbar-progress body into a [`TaskbarProgress`].
-///
-/// The `message` is the part after `9;` — i.e. `"4"`, `"4;st"`, or `"4;st;pr"`,
-/// where `st` is the state and `pr` is a 0-100 progress value (clamped):
-/// - `0` → `Hidden` (remove progress)
-/// - `1` → `Normal(pr)`
-/// - `2` → `Error(pr)`
-/// - `3` → `Indeterminate`
-/// - `4` → `Paused(pr)`
-///
-/// Returns `None` for an unknown state so the caller leaves the current
-/// progress unchanged rather than clobbering it.
+/// Parse a ConEmu OSC 9;4 body (`"4"`, `"4;st"` or `"4;st;pr"`, `pr` a 0-100
+/// progress, clamped). State `0` is Hidden, `1` Normal, `2` Error, `3`
+/// Indeterminate, `4` Paused; `None` for an unknown state, so the caller keeps
+/// the current progress.
 fn parse_conemu_taskbar_progress(message: &str) -> Option<TaskbarProgress> {
     let mut fields = message.split(';');
     let marker = fields.next(); // "4" sub-command marker
@@ -263,9 +219,8 @@ fn append_notification_field(field: &mut Option<String>, text: &str) {
     value.push_str(&text[..text.floor_char_boundary(room)]);
 }
 
-/// Rejoin OSC params from `start..` with `;`, returning `None` if there is no
-/// param at `start`. The OSC parser splits on `;`, so a payload containing
-/// literal semicolons arrives as multiple params; this reconstructs it.
+/// Rejoin OSC params from `start..` with `;` (the parser splits a payload's
+/// literal semicolons); `None` if there is no param at `start`.
 fn join_params(params: &[&[u8]], start: usize) -> Option<String> {
     if params.len() <= start {
         return None;
@@ -273,13 +228,10 @@ fn join_params(params: &[&[u8]], start: usize) -> Option<String> {
     Some(String::from_utf8_lossy(&params[start..].join(&b';')).into_owned())
 }
 
-/// Strip control characters and BiDi-override codepoints from a notification
-/// field, then truncate to [`MAX_NOTIFICATION_FIELD_BYTES`] at a UTF-8
-/// boundary.
-///
-/// The strip is the title sanitizer's ([`super::handler_osc::sanitize_title`]):
-/// notification surfaces, like title bars, render outside the grid's
-/// BiDi-security filter.
+/// Strip control characters and BiDi overrides, as
+/// [`super::handler_osc::sanitize_title`] does (notification surfaces, like title
+/// bars, render outside the grid's BiDi filter), then truncate to
+/// [`MAX_NOTIFICATION_FIELD_BYTES`] at a UTF-8 boundary.
 fn sanitize_notification(text: &str) -> String {
     let filtered = super::handler_osc::sanitize_title(text);
     if filtered.len() <= MAX_NOTIFICATION_FIELD_BYTES {
@@ -508,7 +460,7 @@ mod tests {
         );
     }
 
-    /// Same-kind chunks are concatenated (the doc's "accumulated"), not replaced.
+    /// Same-kind chunks are concatenated, not replaced.
     #[test]
     fn osc_99_same_kind_chunks_concatenate() {
         let mut term = Terminal::new(24, 80);

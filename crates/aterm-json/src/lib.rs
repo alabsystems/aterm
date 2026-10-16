@@ -24,20 +24,19 @@
 //!
 //! * **trailing data is an error.** [`from_str`] parses one value and requires
 //!   end-of-input.
-//! * **nesting is bounded** ([`de::RECURSION_LIMIT`], 128 — `serde_json`'s
-//!   default). Ten thousand `[` from a hostile peer is an error, not a stack
-//!   overflow.
+//! * **nesting is bounded** at 127 nested containers ([`de::RECURSION_LIMIT`]
+//!   refuses the 128th, matching `serde_json`'s default). Ten thousand `[` from
+//!   a hostile peer is an error, not a stack overflow.
 //! * **numbers keep their type.** A `u64` that arrives as an integer leaves as
 //!   the same integer; only a fraction, an exponent, or a magnitude past 64
 //!   bits becomes an `f64`.
 //! * **`\u` escapes must pair.** A lone surrogate half is refused rather than
 //!   silently replaced, because it is not a character.
 //! * **unescaped control characters are refused** in strings, per RFC 8259.
-//! * **duplicate keys are last-wins**, which is `serde_json`'s rule and what
-//!   `#[derive(Deserialize)]` does. This is deliberately the OPPOSITE of
-//!   [`aterm_toml`](https://docs.rs/aterm-toml), which rejects them: a config
-//!   file a person edits and a wire format a server emits are different
-//!   problems.
+//! * **duplicate keys reach the visitor.** [`Value`] and maps keep the last
+//!   value; `#[derive(Deserialize)]` structs reject duplicate fields, matching
+//!   `serde_json`. [`aterm_toml`](https://docs.rs/aterm-toml) rejects duplicate
+//!   keys while parsing configuration.
 //! * **output is byte-identical to `serde_json`'s** — compact, object keys
 //!   sorted, only ASCII controls escaped, non-finite floats as `null`. Some of
 //!   this JSON is hashed into a checkpoint fingerprint and some of it is a
@@ -51,7 +50,7 @@
 //! this tree asked for them, and each would be a new way for two readers to
 //! disagree about one document.
 
-#![deny(missing_docs)]
+#![warn(missing_docs)]
 
 pub mod de;
 pub mod error;

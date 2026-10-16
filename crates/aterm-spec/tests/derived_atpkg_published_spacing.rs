@@ -6,11 +6,6 @@ use aterm_spec::{derive::atpkg_published_spacing_model, interp, verify};
 #[test]
 fn a_newer_index_escapes_spacing_but_same_failed_index_and_unknowns_wait() {
     let model = atpkg_published_spacing_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name)
-    );
     verify::prove_and_catch_scalar(&model, "atpkg published index spacing");
 
     for ending in ["EndOldOk", "EndOldFailed"] {
@@ -44,9 +39,8 @@ fn a_newer_index_escapes_spacing_but_same_failed_index_and_unknowns_wait() {
     }
     assert!(!old.check_invariant("FreshHigherRuns", &lost));
 
-    // The same inverted reader verdict must also expose every unsafe run,
-    // including both GUI and queued-child decisions. These are independent
-    // design claims, not state-space bounds.
+    // The inverted reader also exposes every unsafe run, GUI and queued child alike: each is
+    // its own design claim, not a state-space bound.
     for (actions, invariant) in [
         (
             &["EndSameFailed", "Publish45", "DecideQueued"][..],

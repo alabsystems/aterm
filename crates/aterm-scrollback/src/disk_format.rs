@@ -1,18 +1,21 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Disk cold tier file format constants and helpers.
-//!
-//! Defines the on-disk layout for `.dtrm` cold storage files:
-//! 32-byte file header followed by page headers with Zstd-compressed data.
+//! On-disk layout of `.dtrm` cold storage files: a 32-byte file header, then
+//! pages, each an 8-byte page header and a cold-codec (size-prepended LZ4) block.
 
 use std::io;
 
-/// Magic bytes identifying a aterm cold storage file.
+/// Magic bytes identifying an aterm cold storage file.
 pub(crate) const MAGIC: &[u8; 4] = b"DTRM";
 
 /// Current file format version.
-pub(crate) const VERSION: u32 = 1;
+///
+/// 2: pages are the cold codec's size-prepended LZ4 (`encode_cold_block`).
+/// Version 1 pages were zstd frames; a v1 file is refused at load
+/// (`unsupported version`) rather than misread, since the two page encodings
+/// share every header field.
+pub(crate) const VERSION: u32 = 2;
 
 /// File header size in bytes.
 pub(crate) const HEADER_SIZE: usize = 32;
@@ -25,10 +28,6 @@ pub(crate) const DEFAULT_CACHE_SIZE: usize = 8;
 
 /// Default LRU cache byte budget for decompressed cold pages.
 pub(crate) const DEFAULT_CACHE_BYTE_LIMIT: usize = 8 * 1024 * 1024;
-
-// ============================================================================
-// Safe Cast Helpers for Disk Serialization
-// ============================================================================
 
 /// Convert a u64 to usize, erroring if it exceeds platform capacity.
 #[inline]
@@ -99,12 +98,8 @@ pub(crate) struct PageIndexEntry {
     pub(crate) offset: u64,
     /// Compressed size in bytes (excluding page header).
     pub(crate) compressed_size: u32,
-    /// Number of lines in this page.
+    /// Number of lines in this page, as persisted in its page header.
     ///
-    /// Persisted in page headers for file format compatibility (read during
-    /// load).
-    ///
-    /// After construction, cumulative_lines is used for lookups instead.
-    /// Debug builds assert this matches cumulative line counts.
+    /// Lookups use `cumulative_lines`; debug builds check the two agree on load.
     pub(crate) line_count: u32,
 }

@@ -2,7 +2,7 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Tests for offset-based page storage.
+//! Page storage tests.
 
 mod pointer_correctness;
 mod store_ops;

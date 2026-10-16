@@ -1,46 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! LAST-RESORT fontless SYMBOL glyphs: the geometric shapes, media controls,
-//! check marks and tree connector that TUIs lean on, synthesized from the cell
-//! geometry when NO face in the resolution chain covers them.
+//! Last-resort fontless symbol glyphs: the geometric shapes, media controls and check
+//! marks TUIs lean on, synthesized from the cell geometry when no face in the resolution
+//! chain covers them. A bare Linux host may have no face at all for U+23F5 `⏵`, which
+//! the Claude Code and Codex footers print.
 //!
-//! # Why this exists (the 2026-09-24 `⏵⏵ bypass permissions on` tofu)
+//! Unlike the parent module's box-drawing families, which pre-empt every font so borders
+//! tile seam-free, these are the last tier of [`crate::font_chain::resolve_chain`]
+//! ([`crate::font_chain::Tier::Synthetic`]): any real face that covers the code point
+//! wins, and only `.notdef` tofu is replaced. The `⎿` painter here is the exception,
+//! drawn by the pre-emptive family ([`draw_dentistry_bottom_right`]).
 //!
-//! Claude Code's and Codex's footers print U+23F5 BLACK MEDIUM RIGHT-POINTING
-//! TRIANGLE. macOS always has a face for it (STIX Two Math, Apple Symbols), so
-//! it was never seen there. A bare Linux desktop does not: measured on the
-//! reporting machine, `fc-list ':charset=23f5'` answers NOTHING — not one
-//! installed face covers it — so no fallback chain, fontconfig-driven or not,
-//! can ever find a glyph, and the cell drew the primary face's `.notdef` box.
-//! The same host has no face at all for ⏴⏶⏷ and ⭘, and reaches ⏩⏸⏹⏺ only
-//! through the colour emoji face.
-//!
-//! # Where it sits
-//!
-//! Unlike the box-drawing families in the parent module (which pre-empt every
-//! font so borders tile seam-free), these glyphs are the LAST tier of
-//! [`crate::font_chain::resolve_chain`] ([`crate::font_chain::Tier::Synthetic`]):
-//! any real face that covers the code point — primary, broad fallback, symbol
-//! face, colour face, runtime discovery — always wins, so a user's font keeps
-//! its own design. Only the alternative of `.notdef` tofu is replaced.
-//!
-//! # Geometry
-//!
-//! Each glyph is a small list of primitives in a UNIT box (`u, v` in `0..=1`,
-//! `v` down) that is scaled to a centred square of side
-//! `min(span * cell_w, cell_h) * size` — `span` is the cell count the glyph
-//! occupies (2 for an emoji-presentation code point such as ⏩), so a wide
-//! symbol is centred across both cells rather than hugging the left one.
-//! Filled shapes and strokes are evaluated at the parent module's 4×4
-//! subsamples and box-filtered to 8-bit coverage ([`super::Canvas::paint_aa`]),
-//! the same regime as the Powerline separators. The strokes use the parent
-//! module's `light` rule (`min(w, h) / 8`, floored at one pixel), so an outline
-//! symbol has the weight of a light box-drawing line beside it.
-//!
-//! The bytes are produced ONCE, by `Renderer::rasterize`, and the CPU blit and
-//! the GPU atlas both consume that same [`crate::GlyphImage`], so the two
-//! backends cannot disagree about these cells.
+//! Each glyph is a few primitives in a unit box (`u, v` in `0..=1`, `v` down) scaled to a
+//! centred square of side `min(span * cell_w, cell_h) * size`, where `span` is the
+//! glyph's cell count (2 for an emoji-presentation code point such as ⏩), so a wide
+//! symbol is centred across both cells. Shapes are supersampled like the Powerline
+//! separators ([`super::Canvas::paint_aa`]); strokes are a light box-drawing line thick
+//! (`min(w, h) / 8`, at least one pixel). `Renderer::rasterize` produces the bytes once
+//! and the CPU blit and the GPU atlas share that [`crate::GlyphImage`].
 
 use super::{Canvas, Metrics, eighth, seg_dist};
 
@@ -380,17 +358,13 @@ pub(super) fn coverage(ch: char, cell_w: usize, cell_h: usize, span: usize) -> O
     Some(c.buf)
 }
 
-/// U+23BF DENTISTRY SYMBOL LIGHT VERTICAL AND BOTTOM RIGHT — Claude Code's
-/// `⎿` tool-output connector: a light vertical on the `│` columns from the
-/// cell's top edge down to the three-quarter line, then a light horizontal
-/// from there to the right edge — hard 0/255, the box-drawing regime.
+/// U+23BF `⎿`, Claude Code's tool-output connector: a light vertical on the `│` columns
+/// from the top edge to the three-quarter line, then a light horizontal to the right
+/// edge, hard 0/255.
 ///
-/// It is drawn by the PRE-EMPTIVE family ([`super::covers`]), NOT as a
-/// last-resort symbol, because a font's `⎿` cannot join the procedural `│`
-/// above it: MEASURED on the Linux host this was written on, the only face
-/// covering U+23BF is Noto Sans/Serif CJK, whose `⎿` is a short L sitting at
-/// the bottom of the cell, leaving a visible gap under the `│` on the row
-/// above. As a last-resort tier the join was designed but never reached.
+/// Drawn by the pre-emptive family ([`super::covers`]), not as a last-resort symbol,
+/// because a font's `⎿` cannot join the procedural `│` above it: Noto CJK, the only
+/// Linux face with U+23BF, draws a short L at the cell bottom and leaves a gap.
 pub(super) fn draw_dentistry_bottom_right(c: &mut Canvas) {
     let m = Metrics::new(c.w, c.h);
     let foot = eighth(6, m.h).clamp(m.light, m.h);
@@ -398,8 +372,8 @@ pub(super) fn draw_dentistry_bottom_right(c: &mut Canvas) {
     c.rect(m.vl0, foot - m.light, m.w, foot);
 }
 
-/// A convex polygon in PIXEL space with outward edge normals, for a signed
-/// distance: negative inside, the max over edges of the distance past each.
+/// A convex polygon in pixel space with outward edge normals, for a signed distance:
+/// negative inside, the max over edges of the distance past each.
 struct ConvexPoly {
     /// `(ax, ay, nx, ny)` per edge: a point on the edge and its unit outward
     /// normal.

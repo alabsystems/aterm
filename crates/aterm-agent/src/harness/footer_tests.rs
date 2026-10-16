@@ -438,6 +438,13 @@ fn a_registry_entry_must_name_the_pid_it_is_filed_under() {
 fn the_slug_matches_claude_codes_project_directories() {
     assert_eq!(project_slug(Path::new("/home/dev/proj")), "-home-dev-proj");
     assert_eq!(project_slug(Path::new("/tmp/a.b c")), "-tmp-a-b-c");
+    // A measured one (home prefix anonymized): a dot folds as a slash does.
+    assert_eq!(
+        project_slug(Path::new(
+            "/home/me/repo/.claude/worktrees/kitty-motion-wave"
+        )),
+        "-home-me-repo--claude-worktrees-kitty-motion-wave"
+    );
 }
 
 #[test]
@@ -846,14 +853,11 @@ fn body(rows: &[&str]) -> String {
     rows.iter().map(|r| format!("{r}\n")).collect()
 }
 
-/// THE PIN'S EVIDENCE, DIRECTLY ([`chose_model_since`]). Every `/model`
-/// COMMAND row is a choice, whatever its result says — a model kept, or
-/// one this build cannot read, still sets Claude's main-loop override — so
-/// the row alone pins the process's model; so does a result that moved
-/// it (a `Set model`, a `/fast on` that changed it), with no command row
-/// beside it. NEGATIVE CONTROLS: a `Kept model` with no command row, an
-/// answer, another command, a `/model` from before the floor and the tag
-/// quoted in a person's text pin nothing.
+/// [`chose_model_since`]: every `/model` command row is a choice whatever its
+/// result says (a kept or unreadable model still sets Claude's main-loop
+/// override), and so is a result that moved the model with no command row.
+/// Negative controls: a `Kept model` alone, an answer, another command, a
+/// `/model` before the floor and the tag quoted in a person's text pin nothing.
 #[test]
 fn a_model_command_row_pins_whatever_its_result_says() {
     let dir = aterm_tempfile::Builder::new()
@@ -1011,7 +1015,7 @@ fn a_command_pairs_only_with_the_result_directly_under_it() {
         facts(&[&opus, &model_cmd, &unread, &fast_cmd, &fast]),
         (Said::Is("Opus 5.5".into()), Said::Unread)
     );
-    // 3c: a `/model` command with NO result under it, then the move: the
+    // 3c: a `/model` command with no result under it, then the move: the
     // move's result is its own command's, not the `/model` one's.
     assert_eq!(
         facts(&[&opus, &model_cmd, &fast_cmd, &fast]),
@@ -1263,8 +1267,8 @@ fn a_resume_carries_the_model_only_where_the_process_pinned_it() {
     let odd = answer_at("claude opus", "2026-09-27T10:00:03.000Z", Some("high"));
     let (_, after, _) = run(&[&opus], &LaunchFacts::default(), &[&old, &odd]);
     assert_eq!(shown(&after), (None, None));
-    // A resumed conversation with NO answer at all: Claude restores
-    // nothing, and the process keeps its model.
+    // A resumed conversation with no answer at all: Claude restores nothing,
+    // and the process keeps its model.
     let chose_there = [
         command_at("model", "2026-09-27T10:00:00.000Z"),
         result_at(
@@ -2543,10 +2547,9 @@ fn repo_under(tag: &str, place: &str, branch: &str) -> (PathBuf, PathBuf, PathBu
     (root, home, repo)
 }
 
-/// The footer thread is one thread for every Claude session: a repository
-/// inside a sync provider's folder shows no branch instead of opening a file
-/// whose system dialog has no timeout. The identical layout in an ordinary
-/// (or merely protected) folder is read as before: one Allow is durable there.
+/// A repository inside a sync provider's folder shows no branch rather than
+/// open a file whose system dialog would park the shared footer thread. The
+/// same layout in an ordinary (or merely protected) folder is read.
 #[test]
 fn read_git_head_opens_nothing_under_a_file_provider_domain() {
     for place in [
@@ -2615,12 +2618,10 @@ fn a_worktree_pointing_into_a_provider_domain_is_absent() {
     let _ = std::fs::remove_dir_all(&ordinary_root);
 }
 
-/// A kernel REFUSAL is its own answer, not "no repository": `EPERM` (what a
-/// macOS folder privacy consent returns) classifies as denied, while an
-/// ordinary `EACCES` permission bit and a missing file do not. Measured on
-/// the real primitive: a directory stripped of its search bit gives EACCES,
-/// which must stay `Absent` — only a consent refusal raises the host's
-/// consent attention.
+/// A kernel refusal is its own answer, not "no repository": `EPERM` (what a
+/// macOS folder privacy consent returns) is denied, while `EACCES` (a
+/// directory stripped of its search bit) and a missing file stay `Absent`, so
+/// only a consent refusal raises the host's consent attention.
 #[cfg(unix)]
 #[test]
 fn only_an_eperm_refusal_reads_as_denied() {
@@ -2719,11 +2720,10 @@ fn the_path_shows_home_as_a_tilde() {
     assert_eq!(path("/Users//ana/a\u{1b}[2J"), None);
 }
 
-/// A LIMIT WALL goes FIRST and the tokens LAST: a narrow row drops values
-/// from the back, so it gives up the tokens first and the wall last. The
-/// tokens are ONE total, every model summed and none named. Both
-/// are absent, not empty, when nothing is known; each mark takes one
-/// cell, as the painter lays it out.
+/// A limit wall goes first and the tokens last, so a narrow row (which drops
+/// values from the back) gives up the tokens first. The tokens are one total,
+/// every model summed and none named; both are absent, not empty, when nothing
+/// is known; each mark takes one cell.
 #[test]
 fn the_wall_leads_and_the_usage_comes_last() {
     use crate::harness::session_usage::{ModelTokens, UsageFacts, Wall};
@@ -2786,10 +2786,10 @@ fn the_wall_leads_and_the_usage_comes_last() {
     );
 }
 
-/// THE ACCOUNT STANDS AFTER THE MODEL: the process's two facts, then the
-/// directory's two, a limit wall still first and the tokens still last.
-/// Its mark takes one cell, as the painter lays it out. NEGATIVE CONTROL:
-/// with no account there is no such mark, and the other five stand.
+/// The account stands after the model: the process's two facts, then the
+/// directory's two, a limit wall still first and the tokens still last; its
+/// mark takes one cell. Negative control: with no account there is no such
+/// mark, and the other five stand.
 #[test]
 fn the_account_stands_after_the_model_and_before_the_path() {
     use crate::harness::session_usage::{ModelTokens, UsageFacts, Wall};
@@ -2848,7 +2848,7 @@ fn the_account_stands_after_the_model_and_before_the_path() {
         ..FooterFacts::default()
     };
     assert_eq!(marks(&bare), [MODEL_MARK, ACCOUNT_MARK]);
-    // NEGATIVE CONTROL: no account, no mark; the other five stand.
+    // Negative control: no account, no mark; the other five stand.
     assert_eq!(
         marks(&plain),
         [WALL_MARK, MODEL_MARK, PATH_MARK, BRANCH_MARK, USAGE_MARK]
@@ -3789,7 +3789,7 @@ fn a_reused_pid_is_refused_by_its_start_time() {
 }
 
 /// The one resolver (`upgrade_drive::claude_home_dir`), as Claude Code
-/// resolves `CLAUDE_CONFIG_DIR ?? join(homedir(), ".claude")`: an EMPTY
+/// resolves `CLAUDE_CONFIG_DIR ?? join(homedir(), ".claude")`: an empty
 /// override is set (`??` keeps it) and names the directory the process runs
 /// in; a relative one is under it; neither is read without that directory.
 #[test]
@@ -4025,14 +4025,12 @@ fn a_lights_reason_never_takes_a_limit_walls_room() {
     }
 }
 
-/// THE LIVE UPGRADE'S NOTE LEADS THE RULE AND GIVES WAY AS A REASON DOES:
-/// a restart that waits on the owner at the tab must say so on the screen.
-/// Over the owner's facts with a limit wall and the session's tokens, at every
-/// width: the note, where drawn, is first; whole beside the whole facts,
-/// then short; it takes the tokens', the branch's and the path's room,
-/// never the wall's or the model's; and where even the short note does
-/// not fit beside them it goes and the facts come back. NEGATIVE CONTROL:
-/// with no note nothing is drawn under its mark.
+/// The live upgrade's note leads the rule and gives way as a reason does: at
+/// every width, over facts with a limit wall and tokens, it is first, whole
+/// then short, takes the tokens', branch's and path's room but never the
+/// wall's or the model's, and where even short it does not fit it goes and the
+/// facts come back. Negative control: with no note nothing is drawn under its
+/// mark.
 #[test]
 fn the_upgrade_note_leads_and_gives_way_as_a_reason_does() {
     use crate::harness::session_usage::{ModelTokens, UsageFacts, Wall};
@@ -4107,7 +4105,7 @@ fn the_upgrade_note_leads_and_gives_way_as_a_reason_does() {
     );
     assert_eq!(beside_note, Some(2), "beside the wall and the model");
     assert!(came_back, "a note too wide goes, and the facts come back");
-    // NEGATIVE CONTROL: no note, nothing under its mark.
+    // Negative control: no note, nothing under its mark.
     for room in 0..=240 {
         assert!(
             !fit_rule(&plain, room, None)
@@ -4138,17 +4136,12 @@ fn read_set(set: &SetFacts, pitches: f32) -> String {
     out
 }
 
-/// THE FACTS ARE SET AS A LINE OF TYPE (owner, 2026-10-14, of the facts'
-/// spacing; 2026-10-08: "the kerning is too wide"): letters and words
-/// [`FACT_PITCH`] apart, every two facts [`GAP`] pitches apart whatever
-/// their lengths, the line a whole number of cells a hair looser than that
-/// (or, where its glyphs need more cells than that line has, exactly as
-/// loose as they need), its first and last glyphs half a pitch in from its
-/// ends, and every glyph in a cell of its own, in order, within a nudge's
-/// reach. A word too long
-/// for that reach at [`FACT_PITCH`] (eighty letters and more) is set looser,
-/// every letter alike. CONTROL: one cell a character, the layout before,
-/// took more cells than the line does.
+/// The facts are set as [`set_facts`] says: letters and words [`FACT_PITCH`]
+/// apart, every two facts [`GAP`] pitches apart, the line a whole number of
+/// cells (as loose as its glyphs need), its first and last glyphs half a pitch
+/// in from its ends, every glyph in a cell of its own, in order, within a
+/// nudge's reach. Control: one cell per character would take more cells than
+/// the line does.
 #[test]
 fn the_facts_are_set_as_a_line_of_type() {
     let step = 1.0 / f32::from(NUDGES_PER_CELL);
@@ -4242,13 +4235,10 @@ fn the_facts_are_set_as_a_line_of_type() {
     assert!(set_facts(&[]).glyphs.is_empty());
 }
 
-/// THE ORDER OF GIVING WAY ([`fit_rule`]; the owner fixed only that the
-/// facts go into the rule and fit at any width, not this order): a light's transient
-/// title first (whole, then short, then none), then the path is cut to
-/// `…/<dir>`, the branch goes, the path, the effort, then the chips; the
-/// model last. A light's REASON outranks the branch and the path — after
-/// the whole title and the path's head go — but never the model and
-/// effort.
+/// The order of giving way ([`fit_rule`]): a light's transient title first
+/// (whole, then short, then none), then the path is cut to `…/<dir>`, the
+/// branch goes, the path, the effort, then the chips; the model last. A light's
+/// reason outranks the branch and the path, never the model and effort.
 #[test]
 fn a_narrow_rule_gives_way_title_first_and_the_model_last() {
     let facts = FooterFacts {
@@ -4570,15 +4560,9 @@ fn owned_rungs(rungs: &[&[&str]]) -> Vec<Vec<String>> {
         .collect()
 }
 
-/// THE ACCOUNT COSTS ONLY THE TOKENS. With `Σ`, a limit wall and an
-/// account: `Σ` narrows to its runtime and goes while the account still
-/// stands; where the account does not fit beside the whole path it goes
-/// and the runtime is back; once the path is cut for its own width the
-/// account stands beside the cut path. At EVERY width the wall, the
-/// model, the path and the branch shown are exactly those of the same
-/// facts with no account, the label is whole (a clipped one would name
-/// another account), and it is absent only where it does not fit beside
-/// them. NEGATIVE CONTROL: with no account every rung is the one
+/// The account costs only the tokens: at every width the wall, model, path and
+/// branch shown are those of the same facts with no account, and the label is
+/// whole or absent. Negative control: with no account every rung is the one
 /// `a_narrow_rule_gives_way_title_first_and_the_model_last` pins.
 #[test]
 fn the_account_costs_only_the_tokens() {
@@ -4708,9 +4692,8 @@ fn the_account_costs_only_the_tokens() {
         }
     }
 
-    // NEGATIVE CONTROL: no account, and no rung carries its mark; the
-    // walk is the pinned one, and the named walk is that walk with the
-    // account's rungs among it.
+    // Negative control: with no account no rung carries its mark, and the walk
+    // is the pinned one.
     let unnamed_of = |walk: &[Vec<String>]| -> Vec<Vec<String>> {
         walk.iter()
             .filter(|rung| !rung.iter().any(|s| s.starts_with(ACCOUNT_MARK)))
@@ -4726,10 +4709,9 @@ fn the_account_costs_only_the_tokens() {
             &[wall, model, path, branch],
         ])
     );
-    // Rounded to whole cells, a rung of the account's and the next one
-    // without it can take the same width, and the earlier one shows: the
-    // named walk, its account's rungs left out, is the pinned walk with at
-    // most such rungs missing, in its order.
+    // Rounded to whole cells, an account rung and the next one without it can
+    // take the same width, and the earlier shows: the named walk without its
+    // account rungs is the pinned walk with at most such rungs missing.
     let mut rest = pinned[1..].iter();
     for rung in unnamed_of(&walk) {
         assert!(rest.any(|r| *r == rung), "{rung:?} out of order: {walk:?}");
@@ -4746,13 +4728,10 @@ fn the_account_costs_only_the_tokens() {
     );
 }
 
-/// A REASON TAKES THE ACCOUNT'S ROOM, as it takes the path's: a light's
-/// reason, and a live upgrade's note, short, are each shown at a width
-/// where the account is not, having stood beside it at a wider one —
-/// only where the two do not fit together beside the facts shown, and
-/// never without the limit wall and the model and effort. NEGATIVE
-/// CONTROLS: a hovered title of the same widths takes nothing, and with
-/// no account the reason and the note stand at those same widths.
+/// A light's reason and a live upgrade's note, short, each take the account's
+/// room where the two do not fit together, never the limit wall's or the model
+/// and effort's. Negative controls: a hovered title of the same widths takes
+/// nothing, and with no account the reason and the note stand at those widths.
 #[test]
 fn a_reason_and_the_upgrade_note_take_the_accounts_room() {
     let plain = narrow_rule_walled();
@@ -4812,7 +4791,7 @@ fn a_reason_and_the_upgrade_note_take_the_accounts_room() {
         instead.iter().max() < beside.iter().max(),
         "a wide rule shows both: {instead:?} {beside:?}"
     );
-    // NEGATIVE CONTROL: a hovered title takes nothing from the facts.
+    // Negative control: a hovered title takes nothing from the facts.
     let hover = reason.map(|l| LightsWidth { reason: false, ..l });
     for room in 0..=240 {
         let fit = fit_rule(&facts, room, hover);
@@ -4821,8 +4800,8 @@ fn a_reason_and_the_upgrade_note_take_the_accounts_room() {
             "{room}: {fit:?}"
         );
     }
-    // NEGATIVE CONTROL: with no account, the reason stands at each room
-    // it took the account's at.
+    // Negative control: with no account, the reason stands at each room it
+    // took the account's at.
     for &room in &instead {
         let fit = fit_rule(&plain, room, reason);
         assert_ne!(fit.title, TitleFit::None, "{room}: {fit:?}");
@@ -4865,7 +4844,7 @@ fn a_reason_and_the_upgrade_note_take_the_accounts_room() {
         instead.iter().max() < beside.iter().max(),
         "a wide rule shows both: {instead:?} {beside:?}"
     );
-    // NEGATIVE CONTROL: with no account, the note stands at each of them.
+    // Negative control: with no account, the note stands at each of them.
     let unnamed = FooterFacts {
         upgrade: Some(note),
         ..plain

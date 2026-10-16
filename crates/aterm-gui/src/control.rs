@@ -133,7 +133,7 @@ mod clipboard;
 pub(crate) use clipboard::{pbcopy, pbpaste};
 // The Windows terminal paste's file-list (`CF_HDROP`) arm, routed like the rest.
 #[cfg(windows)]
-pub(crate) use clipboard::pbpaste_paths;
+pub(crate) use clipboard::{pbpaste_paths, write_with_owner};
 // Test clipboard board, reached as `crate::control::PBPASTE_STUB`; test builds
 // never touch the real clipboard.
 #[cfg(test)]
@@ -170,6 +170,8 @@ pub(crate) mod control_denials;
 /// from [`handle`]. The file is `src/control_session.rs`.
 #[path = "control_session.rs"]
 mod control_session;
+#[cfg(test)]
+pub(crate) use control_session::cmd_sessions_store;
 // The turn-id counter a self-update handoff carries (`crate::seamless`).
 pub(crate) use control_session::{TURN_ID_RESERVE, raise_turn_ids, turn_ids_minted};
 #[cfg(any(unix, test))]
@@ -188,6 +190,9 @@ pub(crate) use control_session::cmd_lease;
 /// turn through the lease seam (`app_presence`'s driver-attribution tests).
 #[cfg(test)]
 pub(crate) use control_session::{TurnIo, cmd_turn, end_turn_input};
+/// The `log` and `brief` reads, for the session log's own tests.
+#[cfg(test)]
+pub(crate) use control_session::{cmd_brief, cmd_log, cmd_log_json};
 
 /// The containment subsystem name used in audit denials from this socket.
 const AUDIT_SUBSYSTEM: &str = "control_socket";
@@ -415,6 +420,35 @@ fn sessionless_front_paste_event(
     )
 }
 
+/// Resolve a bare/self `key` when a native view owns the front (no
+/// `ActiveSession`): the same named-key press a person's keyboard makes on
+/// that view, so Settings' arrows, Tab and Return can be driven headless.
+///
+/// `None` keeps the terminal resolver. Only an Owner's bare/self key takes the
+/// app-authority lane, by [`native_control_decision`]'s App case; explicit
+/// selectors and Edges stay session-bound.
+fn sessionless_front_key_event(
+    rest: &str,
+    selector: Option<&Selector>,
+    front_has_terminal: bool,
+    principal: NativeControlPrincipal,
+) -> Option<Result<InputEvent, &'static str>> {
+    if front_has_terminal || !matches!(selector, None | Some(Selector::SelfTok)) {
+        return None;
+    }
+    Some(
+        match native_control_decision(false, true, principal, NativeControlTarget::App) {
+            NativeControlDecision::WithoutSession => {
+                control_input::parse_key(rest).ok_or(control_input::KEY_USAGE)
+            }
+            NativeControlDecision::Denied => Err("ERR denied\n"),
+            NativeControlDecision::ResolveSession
+            | NativeControlDecision::NoActiveTerminal
+            | NativeControlDecision::NoSuchSession => Err("ERR invalid control target\n"),
+        },
+    )
+}
+
 /// Resolve `resize px <w> <h>` when a native tab owns the front (no
 /// `ActiveSession`). A window resize is a window fact, so it must work with
 /// Settings in front, as an edge drag does.
@@ -521,8 +555,8 @@ pub(crate) enum Scope {
     /// pre-resolved for the inherited fd; there is no token to steal.
     ///
     /// Owner's power plus the `Access::BridgeOnly` verbs (`deliver`, `link`,
-    /// `outbox`, `outbox sent`) and the fleet form of `hold`; `hold` handlers refuse an
-    /// Owner act against an `origin=fleet` hold ([`crate::fabric::HoldIssuer`]).
+    /// `outbox`, `outbox sent`) and the fleet form of `hold`; `hold` handlers never
+    /// let an Owner act set or lift an `origin=fleet` hold ([`crate::fabric::HoldIssuer`]).
     /// Every in-session client holds Owner, so a prompt-injected agent must not
     /// forge human orders, lift a fleet halt or read all outbound traffic.
     ///
@@ -603,7 +637,11 @@ fn required_op(verb: &str) -> Option<Op> {
 ///   * `open prefs` / `open settings` and `open app settings /route` need
 ///     `ConfigWrite`.
 ///   * `act app/v1 ...` resolves its view kind on the main thread after
-///     authorization, so the gateway needs `ConfigWrite`.
+///     authorization, so the gateway needs `ConfigWrite`; a Settings ▸ Harness
+///     session press (`harness/session/…`) writes an Autopilot word and is
+///     Owner-only. Both are defence in depth today: `act` is an App-target
+///     verb, which `dispatch_before_session` refuses every Edge before this
+///     is asked (`native_control_decision`).
 ///   * `open menu` / `open palette` and `open update` are Owner-only, like their
 ///     `invoke` twins.
 ///
@@ -636,6 +674,18 @@ fn escalated_op(verb: &str, rest: &str) -> Option<Escalation> {
             // The versioned Settings app is the same capability as `open prefs`;
             // classify it here, before the main-thread hop.
             Some(Escalation::Op(Op::ConfigWrite))
+        }
+        // A Settings ▸ Harness session press writes that session's Autopilot word,
+        // which is Owner-only like `meta set autopilot` (`meta_questions_denied`):
+        // the Settings fine op does not reach it. `act_app` presses only the action
+        // the live node carries, so the action's spelling is the press.
+        "act"
+            if aterm_types::app_inspection::parse_act(rest).is_ok_and(|act| {
+                act.action
+                    .starts_with(crate::harness_screen::SESSION_ACTION_PREFIX)
+            }) =>
+        {
+            Some(Escalation::OwnerOnly)
         }
         // `act app/v1 ...` resolves its view kind only on the main thread, so the
         // gateway requires ConfigWrite rather than trusting the action spelling.
@@ -682,6 +732,16 @@ fn escalated_op(verb: &str, rest: &str) -> Option<Escalation> {
             Some("set" | "unset") => Some(Escalation::Op(Op::WriteInput)),
             _ => None,
         },
+        // `theme` reads; its preview lane changes what every window draws
+        // (runtime-only, like `rain`), so it needs `WriteInput`; `set` and
+        // `commit` rewrite `aterm.toml` like `settings set`, so `ConfigWrite`.
+        // Classified by the sub-form word the parser reads, so no spelling of a
+        // write form passes as a read.
+        "theme" => match rest.split_whitespace().next() {
+            None | Some("status" | "list") => None,
+            Some("preview" | "revert") => Some(Escalation::Op(Op::WriteInput)),
+            Some(_) => Some(Escalation::Op(Op::ConfigWrite)),
+        },
         // `inbox seen` advances the handled watermark, so it needs `WriteInput`;
         // the listing and `inbox get` are reads.
         "inbox" => match rest.split_whitespace().next() {
@@ -690,6 +750,14 @@ fn escalated_op(verb: &str, rest: &str) -> Option<Escalation> {
         },
         // `family <sid>` walks the tree from an arbitrary node: Owner-only.
         "family" if !rest.trim().is_empty() => Some(Escalation::OwnerOnly),
+        // `brief all` reads every session's log, the whole roster: Owner-only
+        // like `sessions`. `brief [<node>]` reads only its target. Classified by
+        // the verb's own parser (which takes `all` anywhere among the
+        // arguments), fail-closed: only a request it reads as a target's brief
+        // stays a read, so no spelling of the instance-wide form passes as one.
+        "brief" if !crate::session_log::BriefQuery::parse(rest).is_ok_and(|q| !q.all) => {
+            Some(Escalation::OwnerOnly)
+        }
         // `pointer click` presses whatever is under the pointer, including every
         // message-band capsule, so it is Owner-only like `notice act` and spends
         // its budget (`App::pointer_cmd`).
@@ -722,6 +790,10 @@ pub(crate) enum FrontControlSurface {
     Overlay(crate::overlay::OverlayKind),
     /// The process-singleton native Settings tab consumes input.
     NativeSettings,
+    /// The native Settings tab consumes input on Settings ▸ Harness, whose
+    /// session buttons write a session's Autopilot word: Owner-only, like
+    /// `meta set autopilot` (`harness_screen::SESSION_ACTION_PREFIX`).
+    HarnessSettings,
     /// A native app other than Settings consumes input.
     OtherNative,
 }
@@ -887,20 +959,15 @@ fn cmd_help_full() -> String {
 #[cfg(test)]
 mod help_tests {
     use aterm_types::control_verbs::{
-        CATALOG_TEXT_COLUMN, ENTRY_WRAP_COLUMNS, SHORT_CATALOG_MAX_BYTES, VERBS, catalog_lines,
-        spec,
+        CATALOG_TEXT_COLUMN, ENTRY_WRAP_COLUMNS, VERBS, catalog_lines, spec,
     };
 
-    /// The short form is bounded in bytes, has three `#` header lines naming the
-    /// other forms, then exactly the table's summary rows.
+    /// The short form has three `#` header lines naming the other forms, then
+    /// exactly the table's summary rows (whose byte budget `aterm-types` checks at
+    /// compile time).
     #[test]
-    fn help_short_form_is_bounded_and_is_the_summary_catalog() {
+    fn help_short_form_is_the_summary_catalog() {
         let h = super::cmd_help("");
-        assert!(
-            h.len() <= SHORT_CATALOG_MAX_BYTES,
-            "short help is {} bytes, over the {SHORT_CATALOG_MAX_BYTES} budget",
-            h.len()
-        );
         let mut lines = h.lines();
         let status = lines.next().unwrap();
         assert_eq!(
@@ -3322,14 +3389,18 @@ fn bind_control_listener(
         parent_owns_peer,
         identity,
         HANDOFF_BIND_WAIT,
+        control_auth::connect_socket_nonblocking,
     )
 }
 
-/// [`bind_control_listener`] with the handoff wait named: production's is
-/// [`HANDOFF_BIND_WAIT`]. A test that walks the successor through the Commit,
-/// the parent's exit and the listener's close one FACT at a time names a
-/// hang detector instead, so a test thread descheduled between two facts
-/// cannot run the production clock out and make a correct worker stand down.
+/// [`bind_control_listener`] with the handoff wait and the teardown probe's
+/// dial named: production's are [`HANDOFF_BIND_WAIT`] and
+/// [`control_auth::connect_socket_nonblocking`]. A test that walks the
+/// successor through the Commit, the parent's exit and the listener's close
+/// one FACT at a time names a hang detector instead, so a test thread
+/// descheduled between two facts cannot run the production clock out and make
+/// a correct worker stand down; and it holds a dial, to close the listener at
+/// the one instant a scheduler otherwise picks only now and then.
 fn bind_control_listener_within(
     plan: &control_auth::SocketPlan,
     handoff_gate: Option<&crate::spawn::DeferredReaderGate>,
@@ -3337,6 +3408,7 @@ fn bind_control_listener_within(
     parent_owns_peer: impl Fn(u32) -> bool,
     identity: Option<&crate::control_socket_identity::SocketIdentity>,
     handoff_wait: std::time::Duration,
+    mut dial: impl FnMut(&str) -> std::io::Result<CtlStream>,
 ) -> Option<BoundControl> {
     let sock_path = plan.sock_path.clone();
     let sock_dir = control_auth::dir_of_socket(&sock_path);
@@ -3372,18 +3444,27 @@ fn bind_control_listener_within(
                 );
                 return None;
             }
-            match control_auth::connect_socket_nonblocking(&sock_path) {
-                Ok(stream) => {
-                    if !aterm_uds::fdpass::peer_pid(&stream)
-                        .ok()
-                        .is_some_and(&parent_owns_peer)
-                    {
+            match dial(&sock_path) {
+                Ok(stream) => match aterm_uds::fdpass::peer_pid(&stream) {
+                    Ok(pid) if parent_owns_peer(pid) => {}
+                    // The predecessor's teardown reached this dial between the
+                    // connect and the question: closing its listener aborts
+                    // every connection still queued on it, and its exit closes
+                    // every connection it accepted. Either way this end is no
+                    // longer connected, and XNU answers `LOCAL_PEERPID` only on
+                    // a connected socket. That is the teardown this loop waits
+                    // for, not an owner, and it left nothing of this dial in
+                    // any backlog. Dial again, after the identity check above:
+                    // it is refused, or reaches a listener that answers for
+                    // itself.
+                    Err(error) if error.kind() == std::io::ErrorKind::NotConnected => {}
+                    _ => {
                         aterm_log::warn!(
                             "control socket {sock_path}: listener ownership does not verify as the predecessor; preserving its socket and token"
                         );
                         return None;
                     }
-                }
+                },
                 Err(error)
                     if matches!(
                         error.kind(),
@@ -4329,6 +4410,9 @@ fn dispatch_app_verb(
             ));
         }
         "chrome" => control_media::cmd_chrome(proxy),
+        // `appearance`: the OS light/dark reading and what it drew; a dev
+        // build can inject a flip.
+        "appearance" => crate::os_appearance::cmd_appearance(proxy, rest),
         // `appstatus`: what aterm is doing on its own (a toolchain install, an
         // update download): live status-bar rows plus finished jobs the ring
         // remembers. Instance state, so it answers with no terminal.
@@ -4346,6 +4430,7 @@ fn dispatch_app_verb(
         }
         "confirm" => control_media::cmd_confirm(proxy, rest),
         "rain" => control_media::cmd_rain(proxy, rest),
+        "theme" => control_media::cmd_theme(proxy, rest),
         "fx" => control_media::cmd_fx(proxy, rest),
         "streak" => control_media::cmd_streak(proxy, rest),
         "tone" => control_media::cmd_tone(proxy, rest),
@@ -4876,11 +4961,8 @@ fn dispatch_topic_verb(
     };
     let (reply, changed) = crate::fabric::cmd_topic(&ctx, rest);
     // The record drains NOW, not on the next 250 ms tick — `meta`'s rule.
-    if changed && subscribers.any() {
-        subscribers
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .notify(local);
+    if changed {
+        wake_watchers(subscribers, local);
     }
     reply
 }
@@ -4899,27 +4981,41 @@ fn cmd_fabric(rest: &str, store: &Store) -> String {
 }
 
 /// `OK state=<absent|connected|stale|stalled|disconnected> supervised=<0|1>
-/// command=<pct|-> reason=<token|-> rtt_ms=<n|-> link_age_ms=<n|->`.
+/// command=<pct|-> reason=<token|-> rtt_ms=<n|-> link_age_ms=<n|->
+/// build=<token> bridge_lane=<n|-> bridge_build=<token|-> lane_faults=<n>`.
 ///
 /// `state=` is the link token `status` carries; `supervised=` is the latch
 /// `post` reads; `command=` is the supervised argv (or the launch one when
-/// unarmed). The last three are the bridge's broker-link report
-/// (`fabric::link_report`).
-#[cfg(unix)]
+/// unarmed). The next three are the bridge's broker-link report
+/// (`fabric::link_report`). `build=` is this instance's own build and the
+/// last three the bridge's `hello` and its lane (`fabric::cmd_hello`,
+/// `fabric::note_lane_fault`): a `bridge_build=` other than `build=` is a
+/// bridge of another build than its instance, `-` one from before `hello`.
 fn fabric_status_line() -> String {
-    let s = crate::fabric_launch::status();
-    let command = s
-        .armed
-        .or(s.configured)
-        .map_or_else(|| "-".to_string(), |argv| pct_encode(&argv.join(" ")));
+    #[cfg(unix)]
+    let (supervised, command) = {
+        let s = crate::fabric_launch::status();
+        let command = s
+            .armed
+            .or(s.configured)
+            .map_or_else(|| "-".to_string(), |argv| pct_encode(&argv.join(" ")));
+        (crate::fabric::bridge_supervised(), command)
+    };
+    #[cfg(not(unix))]
+    let (supervised, command) = (false, "-".to_string());
     let (reason, rtt, age) = crate::fabric::fabric_link_facts();
+    let (lane, bridge_build, faults) = crate::fabric::fabric_bridge_facts();
     let n = |v: Option<u64>| v.map_or_else(|| "-".to_string(), |n| n.to_string());
     format!(
-        "OK state={} supervised={} command={command} reason={reason} rtt_ms={} link_age_ms={}\n",
+        "OK state={} supervised={} command={command} reason={reason} rtt_ms={} link_age_ms={} \
+         build={} bridge_lane={} bridge_build={} lane_faults={faults}\n",
         crate::fabric::fabric_state(),
-        u8::from(crate::fabric::bridge_supervised()),
+        u8::from(supervised),
         n(rtt),
-        n(age)
+        n(age),
+        aterm_types::version::build_id(),
+        n(lane.map(u64::from)),
+        bridge_build.as_deref().unwrap_or("-"),
     )
 }
 
@@ -4928,6 +5024,16 @@ fn fabric_status_line() -> String {
 ///
 /// Once per process: a second attach is an `ERR` naming what runs, checked
 /// before the argv is resolved (`arm` re-checks under its lock).
+///
+/// IT ARMS ONLY WHAT THE INSTANCE'S CONFIG NAMES. The process this arms holds
+/// `Scope::Bridge` — `deliver`'s attested `from=`/`trust=` and the fleet halt
+/// — and this verb's scope is `Owner`, which every in-session client holds; so
+/// the argv is not the caller's to choose. A bare attach arms the `[fabric]
+/// command` aterm.toml names now (`fabric_launch::command_on_disk`, read again,
+/// so the command `aterm fabric on` just wrote counts), else the one the
+/// instance was launched with; an explicit argv is armed only when it IS one
+/// of those two (`fabric on` sends the one it wrote) and is otherwise `ERR
+/// fabric not configured command=<pct>`, nothing armed and the latch open.
 ///
 /// `ERR fabric not executable program=<pct> reason=<token>` is `arm`'s
 /// pre-flight, refused before the latch closes so a corrected command may
@@ -4945,13 +5051,19 @@ fn cmd_fabric_attach(argv: Vec<String>) -> String {
     if let Some(running) = snapshot.armed {
         return already(running);
     }
+    let on_disk = crate::fabric_launch::command_on_disk();
     let argv = if argv.is_empty() {
-        match snapshot.configured {
+        match on_disk.or(snapshot.configured) {
             Some(configured) => configured,
             None => return "ERR fabric no command\n".to_string(),
         }
-    } else {
+    } else if on_disk.as_ref() == Some(&argv) || snapshot.configured.as_ref() == Some(&argv) {
         argv
+    } else {
+        return format!(
+            "ERR fabric not configured command={}\n",
+            pct_encode(&argv.join(" "))
+        );
     };
     match crate::fabric_launch::arm(argv.clone()) {
         Ok(()) => format!("OK attached command={}\n", pct_encode(&argv.join(" "))),
@@ -4971,18 +5083,22 @@ fn cmd_fabric_attach(argv: Vec<String>) -> String {
 fn cmd_fabric(rest: &str, store: &Store) -> String {
     let mut words = rest.split_whitespace();
     match words.next() {
-        Some("status") if words.next().is_none() => format!(
-            "OK state={} supervised=0 command=- reason=- rtt_ms=- link_age_ms=-\n",
-            crate::fabric::fabric_state()
-        ),
+        Some("status") if words.next().is_none() => fabric_status_line(),
         Some("attach") => "ERR fabric unavailable on this platform\n".to_string(),
         Some("retire") => cmd_fabric_retire(&words.collect::<Vec<_>>(), store),
         _ => FABRIC_USAGE.to_string(),
     }
 }
 
-/// The bridge plane: the `Access::BridgeOnly` verbs `deliver`, `link`, `outbox`
-/// and `outbox sent`. `None` means not a bridge verb.
+/// The bridge plane: the `Access::BridgeOnly` verbs `deliver`, `link`, `hello`,
+/// `outbox` and `outbox sent`. `None` means not a bridge verb.
+///
+/// A LINE OF THE PLANE THIS ENDPOINT CANNOT PARSE is counted for the lane
+/// (`fabric::note_lane_fault`, `fabric status lane_faults=`): every one of
+/// these verbs answers such a line `ERR usage`, and a bridge that shares this
+/// endpoint's grammar writes none, so the count is the two not reading the lane
+/// alike — the bridge holds what it could not deliver back, and this is where
+/// the instance says so.
 ///
 /// Answered before session resolution because each names its session as an
 /// argument, and a delivery must land even on a windowless instance.
@@ -5013,18 +5129,29 @@ fn dispatch_bridge_verb(
         );
         return Some("ERR denied\n".to_string());
     }
-    Some(match verb {
+    let generation = crate::fabric::lane_generation();
+    let reply = match verb {
         "deliver" => crate::fabric::cmd_deliver(store, rest),
         // The bridge's own broker link, gated to the lane's incarnation.
-        "link" => crate::fabric::cmd_link(store, rest, crate::fabric::lane_generation()),
+        "link" => crate::fabric::cmd_link(store, rest, generation),
+        // Its lane grammar and build, gated the same way.
+        "hello" => crate::fabric::cmd_hello(rest, generation),
         // `outbox sent` arrives as `verb == "outbox"`; the handler splits the
         // sub-form, like `inbox get`/`inbox seen`.
         "outbox" => crate::fabric::cmd_outbox_verb(store, rest),
-        // The BridgeOnly set is pinned by
-        // `access_exceptions_are_exactly_the_declared_sets`, so every member has
-        // a handler above.
-        _ => unreachable!("bridge-only verb {verb:?} without a dispatch handler"),
-    })
+        _ => no_handler(verb),
+    };
+    if reply.starts_with("ERR usage") {
+        crate::fabric::note_lane_fault(generation);
+    }
+    Some(reply)
+}
+
+/// The reply for a table row its access class's dispatch has no arm for: refused,
+/// never a panic, so a verb added to `VERBS` before its handler fails closed
+/// instead of dropping the connection thread.
+fn no_handler(verb: &str) -> String {
+    format!("ERR {verb} has no handler\n")
 }
 
 /// Handle requests whose authority/target class does not depend on a session.
@@ -5119,6 +5246,9 @@ fn dispatch_before_session(
             // `notice <post|progress|done|ask|dismiss|act> …`: the message band's write
             // face; app state, answered with no terminal.
             "notice" => Some(control_query::cmd_notice(proxy, rest)),
+            // `devtools hand-over [now]`: the window's Developer Tools hand-over; app
+            // state, answered with no terminal (a headless instance says so).
+            "devtools" => Some(control_query::cmd_devtools(proxy, rest)),
             // `fabric status|attach`: this process's bridge supervisor, answered
             // with no terminal (a windowless instance is the one that needs it).
             "fabric" => Some(dispatch_fabric_verb(rest, selector.as_ref(), scope, store)),
@@ -5148,6 +5278,27 @@ fn dispatch_before_session(
         && let Some(route) = sessionless_front_paste_event(
             verb,
             || control_input::paste_text(rest),
+            selector.as_ref(),
+            resolve_active(active).is_some(),
+            principal,
+        )
+    {
+        return Some(
+            match route {
+                Ok(event) => {
+                    control_input::input_reply_to_str(post_input_reply(proxy, vec![event]))
+                }
+                Err(error) => error.to_string(),
+            }
+            .into(),
+        );
+    }
+
+    // A bare `key` with a native view in front reaches that view's keyboard
+    // handling through the same input seam a person's keypress takes.
+    if verb == "key"
+        && let Some(route) = sessionless_front_key_event(
+            rest,
             selector.as_ref(),
             resolve_active(active).is_some(),
             principal,
@@ -5547,9 +5698,9 @@ fn expire_artifact_quarantine_anchor() {}
 
 /// The process-global quarantine: a `&'static` to a leaked value rather than the
 /// value itself, so the reaper thread spawned by the initializer can be HANDED
-/// the quarantine instead of asking this cell for it. The 2026-09-05 lazy-init
-/// reentrancy census (freeze-safety obligation 6, OB-19) went red on the shape
-/// whose reaper called `artifact_reply_quarantine()` first thing: a blocking
+/// the quarantine instead of asking this cell for it. The lazy-init
+/// reentrancy census (`aterm-census --lazy-init`, OB-19) refuses the shape
+/// whose reaper calls `artifact_reply_quarantine()` first thing: a blocking
 /// `get_or_init` on the very cell whose initializer had just spawned it. Nothing
 /// inside the initializer touches the cell.
 static ARTIFACT_REPLY_QUARANTINE: std::sync::OnceLock<&'static ArtifactReplyQuarantine> =
@@ -5985,6 +6136,139 @@ thread_local! {
     /// ([`CommittedInput`]), so its main-thread hops are not refused for a
     /// hangup.
     static INPUT_COMMITTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Whether [`SERVING_FD`] is a DIRECT local connection — one a pooled
+    /// lane accepted on the instance's own listener ([`DirectPeer`]) — whose
+    /// kernel peer pid may prove a self-claim ([`serving_peer_pid`]). Never
+    /// the bridge's inherited `socketpair` ([`serve_preresolved`]).
+    #[cfg(unix)]
+    static SERVING_DIRECT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The `if-supervisor=<holder>` fence of the write this thread is making
+    /// ([`CarriedFence`]): a main-thread input hop posted under it carries it
+    /// ([`post_input_reply_to`]), and the main thread reads the fence again
+    /// as it applies the batch.
+    static CARRIED_FENCE: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The fence a write on this thread is made under, until dropped
+/// ([`CARRIED_FENCE`]). Nests: a drop restores what it found.
+struct CarriedFence {
+    outer: Option<String>,
+}
+
+impl CarriedFence {
+    fn enter(holder: &str) -> Self {
+        Self {
+            outer: CARRIED_FENCE.with(|fence| fence.replace(Some(holder.to_string()))),
+        }
+    }
+}
+
+impl Drop for CarriedFence {
+    fn drop(&mut self) {
+        let outer = self.outer.take();
+        CARRIED_FENCE.with(|fence| *fence.borrow_mut() = outer);
+    }
+}
+
+/// The fence the write on this thread is made under, if any.
+fn carried_fence() -> Option<String> {
+    CARRIED_FENCE.with(|fence| fence.borrow().clone())
+}
+
+/// One write made under the `if-supervisor=<holder>` fence (the self-claim
+/// contract, §2): counted as in flight from the fence's read to the write's
+/// end ([`crate::session_timeline::FencedWrite`]), so a replacement waits
+/// for it, and carried onto any main-thread input hop it posts. With no
+/// fence the write runs as it is. `Err` is the fence's refusal; nothing was
+/// written.
+fn under_fence<T>(
+    ctx: &SessionCtx,
+    holder: Option<&str>,
+    write: impl FnOnce() -> T,
+) -> Result<T, String> {
+    let Some(holder) = holder else {
+        return Ok(write());
+    };
+    let _counted =
+        crate::session_timeline::FencedWrite::enter(ctx, holder, crate::metrics::now_us())?;
+    let _carried = CarriedFence::enter(holder);
+    Ok(write())
+}
+
+/// Marks the connection this lane serves as a DIRECT local one until dropped
+/// ([`SERVING_DIRECT`]): set by the pooled lanes beside [`ServingFd`].
+#[cfg(unix)]
+pub(crate) struct DirectPeer;
+
+#[cfg(unix)]
+impl DirectPeer {
+    pub(crate) fn enter() -> Self {
+        SERVING_DIRECT.with(|direct| direct.set(true));
+        Self
+    }
+}
+
+#[cfg(unix)]
+impl Drop for DirectPeer {
+    fn drop(&mut self) {
+        SERVING_DIRECT.with(|direct| direct.set(false));
+    }
+}
+
+/// A set's PROOF ([`crate::self_claim`]): the kernel's peer pid of the
+/// direct connection this thread serves ([`serving_peer_pid`]), the live
+/// foreground group of the session's PTY `master`, and the named process's
+/// image ([`crate::self_claim::runs_alab_build`]), read only for a holder a
+/// self-claim can name (`codex-alab@<pid>`).
+pub(crate) fn prove_self_claim(holder: &str, master: i32) -> Option<crate::self_claim::Proven> {
+    prove_self_claim_by(holder, master, &crate::self_claim::runs_alab_build)
+}
+
+/// [`prove_self_claim`] with the image fact read by `alab_image`, which is
+/// asked only once the peer and the foreground facts hold.
+pub(crate) fn prove_self_claim_by(
+    holder: &str,
+    master: i32,
+    alab_image: &dyn Fn(u32) -> bool,
+) -> Option<crate::self_claim::Proven> {
+    let pid = crate::self_claim::holder_pid(holder)?;
+    let peer = serving_peer_pid();
+    let foreground = crate::quit_safety::foreground_pgrp(master);
+    let named = peer == Some(pid) && i64::from(foreground) == i64::from(pid);
+    crate::self_claim::prove(
+        holder,
+        crate::self_claim::Facts {
+            peer,
+            foreground,
+            alab_image: named && alab_image(pid),
+        },
+    )
+}
+
+/// THE KERNEL'S PEER PID of the direct local connection this thread serves,
+/// read now — right after its request line was read ([`aterm_uds::fdpass::
+/// peer_pid`]; Darwin's `LOCAL_PEERPID` names the connection's last writer).
+/// `None` off a direct connection (the bridge, no lane) or where it cannot be
+/// read: no proof ([`crate::self_claim`]).
+pub(crate) fn serving_peer_pid() -> Option<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::FromRawFd as _;
+        if !SERVING_DIRECT.with(std::cell::Cell::get) {
+            return None;
+        }
+        let fd = SERVING_FD.with(std::cell::Cell::get)?;
+        // SAFETY: `fd` is the connection this lane serves, open for as long
+        // as its `ServingFd` guard stands (the whole serve); the borrowed
+        // stream is never dropped, so it never closes the descriptor.
+        let stream = std::mem::ManuallyDrop::new(unsafe { CtlStream::from_raw_fd(fd) });
+        aterm_uds::fdpass::peer_pid(&stream).ok()
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
 }
 
 /// Marks the verb on this thread as COMMITTED to input it has begun, until
@@ -6310,6 +6594,9 @@ fn is_wait_request(line: &str, scope: Scope, store: &Store) -> bool {
         }
         // Parks on an event, a settle, a prompt, or the bridge's landing.
         "await" | "ready" | "wait" | "turn" | "post" => true,
+        // Parks for the owner to answer the sudo password sheet (up to 300 s),
+        // so it holds a wait lane, not one of the RPC lanes.
+        "askpass" => true,
         // `inbox get @<off>` parks for the bridge's next drain; the listing and
         // the other forms answer at once.
         "inbox" => {
@@ -6370,6 +6657,28 @@ fn serve_request_line(
             return Some(ServeDisposition::Close);
         }
         return None;
+    }
+    // The `sudo` askpass relay. Intercepted here, the one layer holding the
+    // stream, so it reads the peer once, gates on `Scope::Owner` EXACTLY, and
+    // returns the (secret-bearing) reply. The reply reaches the peer through
+    // `writer` like any other — on a pooled lane that is the `Outbox` buffer
+    // (`serve_line`'s `out`), which `Outbox::scrub` zeroes with `write_volatile`
+    // once delivered and on drop, so the plaintext does not linger. Never
+    // logged. A selector is refused: the request names no session (the server
+    // attributes it by ancestry).
+    {
+        let (selector, verb, _rest) = request_head(&line);
+        if verb == "askpass" {
+            let response = if selector.is_some() {
+                crate::control_askpass::public_reply("ERR askpass refused takes no @<sid>\n")
+            } else {
+                crate::control_askpass::serve(stream, scope, proxy, store)
+            };
+            if writer.write_all(response.as_bytes()).is_err() || writer.flush().is_err() {
+                return Some(ServeDisposition::Close);
+            }
+            return None;
+        }
     }
     // Tokenized once: the generic binary-frame lane below reuses it (`line` is
     // not changed in between).
@@ -7619,6 +7928,20 @@ fn run_feed_bin<W: Write>(
     )
 }
 
+/// WAKE SESSION `local`'s SUBSCRIBERS so a timeline row just recorded drains
+/// NOW, not on the push loop's 250 ms tick — `meta`'s rule. The fabric verbs
+/// whose row the bridge acts on (`post`, `topic`, `inbox seen`, a parked
+/// `inbox get @<off>`) all wake through this, because the bridge's push lane
+/// is one of those subscribers and has no idle poll of its own.
+fn wake_watchers(subscribers: &Subscribers, local: u64) {
+    if subscribers.any() {
+        subscribers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .notify(local);
+    }
+}
+
 /// `post` (both forms) for session `local` via
 /// [`crate::fabric::cmd_post_waking`], waking that session's `events`
 /// subscribers so the `post` record drains now (the bridge drains the outbox on
@@ -7630,14 +7953,7 @@ fn post_waking_watchers(
     body: Option<Vec<u8>>,
     subscribers: &Subscribers,
 ) -> String {
-    crate::fabric::cmd_post_waking(ctx, rest, body, &|| {
-        if subscribers.any() {
-            subscribers
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .notify(local);
-        }
-    })
+    crate::fabric::cmd_post_waking(ctx, rest, body, &|| wake_watchers(subscribers, local))
 }
 
 /// Serve a length-prefixed `post`: read the body, then hand it to
@@ -8827,7 +9143,13 @@ fn front_surface_authority(
 /// Given the caller's `scope`, input `verb` and the front main-thread surface, the
 /// escalation that replaces the verb's base WriteInput requirement: every overlay is
 /// Owner-only (some bind clipboard/external-process actions), native Settings needs the
-/// durable-config fine op. Owner skips the observation and satisfies either.
+/// durable-config fine op, and Settings ▸ Harness is Owner-only (its session buttons
+/// write Autopilot words). Owner skips the observation and satisfies either.
+///
+/// The Harness fence is the whole page, not the keys that would press a session
+/// button: which key presses one depends on the page's focus and a click's hit,
+/// state the observation does not replay — a Tab that only moves focus onto a
+/// button is what makes the next Return a press.
 ///
 /// Pure for unit testing; a failed hop is denied by the caller, never read as `None`.
 fn front_drive_escalation(
@@ -8839,7 +9161,9 @@ fn front_drive_escalation(
         return None;
     }
     match surface {
-        FrontControlSurface::Overlay(_) => Some(Escalation::OwnerOnly),
+        FrontControlSurface::Overlay(_) | FrontControlSurface::HarnessSettings => {
+            Some(Escalation::OwnerOnly)
+        }
         FrontControlSurface::NativeSettings => Some(Escalation::Op(Op::ConfigWrite)),
         FrontControlSurface::None | FrontControlSurface::OtherNative => None,
     }
@@ -8869,6 +9193,9 @@ fn front_drive_denial(surface: FrontControlSurface) -> String {
         ),
         FrontControlSurface::NativeSettings => {
             "ERR native settings open (config-write authority required)\n".to_string()
+        }
+        FrontControlSurface::HarnessSettings => {
+            "ERR native settings harness open (owner-only while open)\n".to_string()
         }
         FrontControlSurface::None | FrontControlSurface::OtherNative => "ERR denied\n".to_string(),
     }
@@ -9598,7 +9925,7 @@ fn handle(
     // Build and meta verbs (`version`/`update`/`help`/`verbs`): non-sensitive global
     // provenance answered for any authenticated scope before target resolution (a
     // selector is ignored). Membership is the table's `Access::AnyScopeMeta`
-    // (`is_any_scope_meta`), pinned by `access_exceptions_are_exactly_the_declared_sets`.
+    // (`is_any_scope_meta`).
     if aterm_types::control_verbs::is_any_scope_meta(verb) {
         return match verb {
             // Global build provenance (version/commit/build-time/binary signature); see
@@ -9622,10 +9949,7 @@ fn handle(
                 }
                 Some(_) => crate::control_privacy::no_selector_error().to_string(),
             },
-            // The AnyScopeMeta set is pinned by
-            // `access_exceptions_are_exactly_the_declared_sets`, so every member has a
-            // handler above.
-            _ => unreachable!("any-scope-meta verb {verb:?} without a dispatch handler"),
+            _ => no_handler(verb),
         };
     }
 
@@ -9718,18 +10042,15 @@ fn handle(
             "dial-token" => cmd_dial_token(rest),
             "appnotice" => control_query::cmd_appnotice(proxy, rest),
             "notice" => control_query::cmd_notice(proxy, rest),
+            "devtools" => control_query::cmd_devtools(proxy, rest),
             "fabric" => dispatch_fabric_verb(rest, selector.as_ref(), scope, store),
             // A BARE `dial` reaches here: the serve-loop interception fires only on the
             // `"dial "` prefix (a name follows), but `read_request_line` strips the
             // newline leaving exactly "dial" with no trailing space — so a name-less
             // `dial` misses the takeover and lands in this owner-only match. Answer with
-            // a clean usage error rather than panicking the connection thread on the
-            // `unreachable!` below (which dropped the connection with a stderr backtrace).
+            // a clean usage error, not the generic `no_handler` refusal.
             "dial" => DIAL_USAGE.to_string(),
-            // The owner-only set is pinned by the table test
-            // `access_exceptions_are_exactly_the_declared_sets`, so every member has
-            // a handler above.
-            _ => unreachable!("owner-only verb {verb:?} without a dispatch handler"),
+            _ => no_handler(verb),
         };
     }
 
@@ -9761,9 +10082,11 @@ fn handle(
     // Observe a scoped caller's front input consumer before the op gate. A native
     // Settings tab has no modal `OverlayKind`, yet its reducer consumes key/mouse/paste
     // events and can persist default-off security knobs, so the main-thread
-    // observation adds an escalation: Settings -> ConfigWrite, any transient overlay ->
-    // Owner-only. Owner and cross-session requests skip this hop. A failed hop is an
-    // authorization failure (fail closed), except a stalled main thread's refusal
+    // observation adds an escalation: Settings -> ConfigWrite, Settings ▸ Harness and
+    // any transient overlay -> Owner-only. Defence in depth: a scoped caller's
+    // flagless input is pinned to its session (`front_routed`), which never reaches a
+    // native reducer. Owner and cross-session requests skip this hop. A failed hop is
+    // an authorization failure (fail closed), except a stalled main thread's refusal
     // (`front_surface_authority`).
     let front_surface = if !is_cross && !scope.is_owner_class() && is_front_driving_verb(verb) {
         match front_surface_authority(
@@ -9854,6 +10177,8 @@ fn handle(
             "metrics" => Some(control_query::cmd_metrics_json(Some(term), &body)),
             "blocks" => Some(control_selection::cmd_blocks_json(&host, session, &body)),
             "edges" | "grants" => Some(control_session::cmd_edges_json(ctx)),
+            // `log --json [<node>] [since= ep=] …`: one object per record.
+            "log" => Some(control_session::cmd_log_json(ctx, &body)),
             _ => None,
         };
         if let Some(out) = json {
@@ -9875,6 +10200,11 @@ fn handle(
     let (leading, rest) = control_input::take_leading_options(verb, rest);
     let idem_key = leading.idem;
     let rest: &str = &rest;
+    // `if-supervisor=<holder>` (the self-claim contract, §2): a verb's whole
+    // write is made under it, and each phase of a `turn` ([`under_fence`]).
+    let if_supervisor = leading.if_supervisor.as_deref();
+    let fenced_phase =
+        |write: &dyn Fn() -> bool| under_fence(ctx, if_supervisor, write).unwrap_or(false);
 
     // Every authorized attempt that can inject bytes, signal the child or mutate its
     // cursor coordinate space is a newer input boundary, even if its arguments are
@@ -10010,6 +10340,29 @@ fn handle(
     {
         return refusal;
     }
+    // THE SUPERVISOR FENCE, last of the refusals before a byte can move and
+    // above the idempotency claim (a refusal consumes no `id=` sequence). A
+    // `send`/`key`/`paste` is admitted here and stays counted until its reply
+    // ([`under_fence`]); a `turn` is checked here and fenced again per phase,
+    // so its waits never hold a replacement back.
+    let _fenced = match if_supervisor {
+        Some(holder) if verb == "turn" => {
+            if let Some(refusal) =
+                crate::session_timeline::supervisor_fence(ctx, holder, crate::metrics::now_us())
+            {
+                return refusal;
+            }
+            None
+        }
+        Some(holder) => {
+            match crate::session_timeline::FencedWrite::enter(ctx, holder, crate::metrics::now_us())
+            {
+                Ok(counted) => Some((counted, CarriedFence::enter(holder))),
+                Err(refusal) => return refusal,
+            }
+        }
+        None => None,
+    };
     let resp = crate::pty_idem::guarded(ctx, scope, verb, idem_key.as_deref(), || match verb {
         // `text [trim] [tail=<n>|rows=<a>-<b>]`: the arm parses its tail, so an unknown
         // modifier is `ERR usage` rather than a silent full grid.
@@ -10031,8 +10384,11 @@ fn handle(
         // `inbox`: the session's fabric mailbox: the bare listing (`Lines`),
         // `inbox get <id>` (a byte body) and `inbox seen <id>` (a status line). `Read`
         // class, with `seen` escalated to `WriteInput` by `escalated_op`, so a read-only
-        // edge can read mail but not mark it handled.
-        "inbox" => crate::fabric::cmd_inbox_verb(ctx, rest),
+        // edge can read mail but not mark it handled. `seen` and a parked `get @<off>`
+        // record a row the bridge acts on, so they wake `session`'s watchers.
+        "inbox" => {
+            crate::fabric::cmd_inbox_verb(ctx, rest, &|| wake_watchers(subscribers, session))
+        }
         // `post`: queue one outbound fabric message. The handler refuses edge-token
         // connections (a write-input edge over S must not speak as S on the bus; a
         // sender is attested by the Owner). Exempt from `hold`, so a halted agent can
@@ -10126,22 +10482,30 @@ fn handle(
                 // both phases go through the targeted event-loop seam like plain
                 // paste/key, keeping movement provenance, ordering and host side effects.
                 let paste = |text: &str| {
-                    front_routed_input(
-                        proxy,
-                        session,
-                        Some(InputEvent::Paste(
-                            control_input::paste_text(text),
-                            PasteFraming::AtDrain,
-                        )),
-                        "ERR\n",
-                    )
-                    .starts_with("OK")
+                    fenced_phase(&|| {
+                        front_routed_input(
+                            proxy,
+                            session,
+                            Some(InputEvent::Paste(
+                                control_input::paste_text(text),
+                                PasteFraming::AtDrain,
+                            )),
+                            "ERR\n",
+                        )
+                        .starts_with("OK")
+                    })
                 };
                 let press = |name: &str| {
-                    front_routed_input(proxy, session, parse_key(name), "ERR\n").starts_with("OK")
+                    fenced_phase(&|| {
+                        front_routed_input(proxy, session, parse_key(name), "ERR\n")
+                            .starts_with("OK")
+                    })
                 };
                 let key = |ev: InputEvent| {
-                    front_routed_input(proxy, session, Some(ev), "ERR\n").starts_with("OK")
+                    let ev = std::cell::Cell::new(Some(ev));
+                    fenced_phase(&|| {
+                        front_routed_input(proxy, session, ev.take(), "ERR\n").starts_with("OK")
+                    })
                 };
                 control_session::cmd_turn(
                     term,
@@ -10160,21 +10524,28 @@ fn handle(
                 )
             } else if turn_input_route(is_cross, targets_front) == TurnInputRoute::Background {
                 let paste = |text: &str| {
-                    cross_input(
-                        term,
-                        ctx,
-                        Some(InputEvent::Paste(
-                            control_input::paste_text(text),
-                            PasteFraming::AtDrain,
-                        )),
-                        "ERR\n",
-                    )
-                    .starts_with("OK")
+                    fenced_phase(&|| {
+                        cross_input(
+                            term,
+                            ctx,
+                            Some(InputEvent::Paste(
+                                control_input::paste_text(text),
+                                PasteFraming::AtDrain,
+                            )),
+                            "ERR\n",
+                        )
+                        .starts_with("OK")
+                    })
                 };
-                let press =
-                    |name: &str| cross_input(term, ctx, parse_key(name), "ERR\n").starts_with("OK");
-                let key =
-                    |ev: InputEvent| cross_input(term, ctx, Some(ev), "ERR\n").starts_with("OK");
+                let press = |name: &str| {
+                    fenced_phase(&|| {
+                        cross_input(term, ctx, parse_key(name), "ERR\n").starts_with("OK")
+                    })
+                };
+                let key = |ev: InputEvent| {
+                    let ev = std::cell::Cell::new(Some(ev));
+                    fenced_phase(&|| cross_input(term, ctx, ev.take(), "ERR\n").starts_with("OK"))
+                };
                 control_session::cmd_turn(
                     term,
                     store,
@@ -10191,11 +10562,20 @@ fn handle(
                     },
                 )
             } else {
-                let paste = |text: &str| control_input::cmd_paste(proxy, text).starts_with("OK");
-                let press = |name: &str| control_input::cmd_key(proxy, name).starts_with("OK");
+                let paste = |text: &str| {
+                    fenced_phase(&|| control_input::cmd_paste(proxy, text).starts_with("OK"))
+                };
+                let press = |name: &str| {
+                    fenced_phase(&|| control_input::cmd_key(proxy, name).starts_with("OK"))
+                };
                 let key = |ev: InputEvent| {
-                    control_input::input_reply_to_str(post_input_reply(proxy, vec![ev]))
-                        .starts_with("OK")
+                    let ev = std::cell::Cell::new(Some(ev));
+                    fenced_phase(&|| {
+                        ev.take().is_some_and(|ev| {
+                            control_input::input_reply_to_str(post_input_reply(proxy, vec![ev]))
+                                .starts_with("OK")
+                        })
+                    })
                 };
                 control_session::cmd_turn(
                     term,
@@ -10446,6 +10826,10 @@ fn handle(
         // `rain [status|on|off|toggle]`: the per-session matrix-rain override on the
         // focused window's front session. App-level.
         "rain" => control_media::cmd_rain(proxy, rest),
+        // `theme [status|list|preview|revert|commit|set]`: the live theme and
+        // its transient preview lane. App-level; the class rises by sub-form
+        // (`escalated_op`).
+        "theme" => control_media::cmd_theme(proxy, rest),
         // `fx [status|celebrate …]`: arm a one-shot rainbow-kitty celebration on the
         // focused window's front session (or read the arm). App-level; write-class
         // because the session's next keyed edge spends it.
@@ -10641,14 +11025,29 @@ fn handle(
         // `events` watcher drains `EVENT <sid> meta …` at once.
         // `meta set|unset supervisor` is answered first: it is Owner-writable and may
         // bind to this connection, which only this seam knows. A non-Owner `questions`
-        // write is refused next (it decides whether the supervisor answers for the
-        // person); an Owner's falls through to `cmd_meta`'s closed set.
+        // or `autopilot` write is refused next (each decides whether the supervisor
+        // answers for the person); an Owner's falls through to `cmd_meta`'s closed set.
+        // An `autopilot` word that moved rings the window's host from the store write
+        // itself (`session_timeline::apply_meta_value`), and the `Wake::MetaChanged`
+        // below repaints the session's footer (its chip) with the rest.
         "meta" => {
-            let (resp, changed) =
-                control_session::cmd_meta_supervisor(ctx, scope, serving_connection(), rest)
-                    .or_else(|| control_session::meta_questions_denied(scope, rest))
-                    .unwrap_or_else(|| control_session::cmd_meta(term, store, session, ctx, rest));
+            let prove = |holder: &str| prove_self_claim(holder, master);
+            let (resp, changed) = control_session::cmd_meta_supervisor(
+                ctx,
+                scope,
+                serving_connection(),
+                &prove,
+                rest,
+            )
+            .or_else(|| {
+                control_session::cmd_meta_harness_act(ctx, serving_connection(), &prove, rest)
+            })
+            .or_else(|| control_session::meta_questions_denied(scope, rest))
+            .unwrap_or_else(|| control_session::cmd_meta(term, store, session, ctx, rest));
             if changed {
+                // A proven claim's record is read again at each meta-change
+                // while its identity is live (`self_claim`, the contract §4).
+                crate::self_claim::meta_changed(ctx);
                 let _ = proxy.send_event(Wake::MetaChanged { session });
                 if subscribers.any() {
                     subscribers
@@ -10662,6 +11061,12 @@ fn handle(
         // `timeline`: the target session's event timeline (the lifecycle twin of
         // `history`), a pure observer of the ctx ring, cross-session correct.
         "timeline" => control_session::cmd_timeline(ctx, rest),
+        // `log`: the target session's SESSION LOG (session > run > turn > step),
+        // a pure reader of the ctx's timeline lock like `timeline`.
+        "log" => control_session::cmd_log(ctx, rest),
+        // `brief`: the target session's token-budgeted rollup; `brief all` (the
+        // instance's) was escalated to Owner-only by `escalated_op`.
+        "brief" => control_session::cmd_brief(ctx, store, rest),
         // `resizes`: the target session's resize ledger (what re-gridded it, the runs,
         // and whether the app drew over displaced content), from its own engine and
         // timeline, cross-session correct.
@@ -10669,6 +11074,14 @@ fn handle(
         // `status`: the target session's Subject + classified Status. A main-thread hop,
         // since the classifier is `App` state owned by the event loop.
         "status" => control_media::cmd_session_status(proxy, session, rest),
+        // `harness policy`: the target session's `[harness]` policy, the facts a
+        // main-thread hop (the policy cell, the host, the session's words), the
+        // rules file read and the line made here. An edge reads only `effective=`.
+        "harness" => crate::harness_policy_verb::cmd(rest, scope.is_owner_class(), || {
+            control_media::call_main(proxy, |tx| Wake::ReadHarnessPolicy { session, reply: tx })
+                .map_err(|e| e.to_string())
+                .and_then(|facts| facts)
+        }),
         // `sessions`/`grant`/`revoke`/`whoami` are handled self-scoped above.
         _ => "ERR unknown verb (try: help)\n".to_string(),
     });
@@ -10779,11 +11192,13 @@ fn post_input_reply_to(
     batch: Vec<InputEvent>,
     session: Option<u64>,
 ) -> Result<InputOutcome, String> {
+    let fence = carried_fence();
     control_media::call_main(proxy, |tx| Wake::Input {
         batch,
         src: Source::Controller,
         reply: Some(tx),
         session,
+        fence,
     })
     .map_err(|error| format!("ERR input dispatch failed: {error}\n"))
 }
@@ -10813,6 +11228,9 @@ mod control_hangup_tests;
 #[path = "control_retire_tests.rs"]
 mod control_retire_tests;
 #[cfg(all(test, unix))]
+#[path = "control_self_claim_tests.rs"]
+mod control_self_claim_tests;
+#[cfg(all(test, unix))]
 #[path = "control_socket_handoff_tests.rs"]
 mod control_socket_handoff_tests;
 #[cfg(all(test, unix))]
@@ -10824,6 +11242,23 @@ mod publish_ordering_conformance;
 #[cfg(all(test, unix))]
 #[path = "publish_when_committed_conformance.rs"]
 mod publish_when_committed_conformance;
+
+/// One `hold` request as a client's line carries it (`hold <sid> off`,
+/// `@<sid> hold off`), split by [`request_head`] and answered by
+/// [`dispatch_hold_verb`] from `scope`, as [`dispatch_before_session`]
+/// answers it: the seam another module's test runs a command it read off a
+/// record through. A line whose verb is not `hold` is answered `ERR`. Test
+/// code, so below the production text the dispatch tests read
+/// (`the_hold_refusals_are_audited_from_both_dispatch_entries` counts the
+/// production callers of [`dispatch_hold_verb`]).
+#[cfg(test)]
+pub(crate) fn hold_line_for_test(store: &Store, line: &str, scope: Scope) -> String {
+    let (selector, verb, rest) = request_head(line);
+    if verb != "hold" {
+        return format!("ERR not a hold line: {line:?}\n");
+    }
+    dispatch_hold_verb(rest, selector.as_ref(), scope, store)
+}
 
 /// `update check` under a dialog or a stalled main thread answers the main thread's
 /// typed refusal, never an `OK` line whose empty status hides a staged build.

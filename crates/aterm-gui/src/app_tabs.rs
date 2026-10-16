@@ -11,7 +11,6 @@
 use winit::event_loop::ActiveEventLoop;
 
 use crate::platform::AppRt;
-use crate::spawn::spawn_session;
 use crate::{
     App, TabAction, TabIndex, WindowId, WindowState, pane, session_store, tab_bar, term_lock,
 };
@@ -38,15 +37,19 @@ pub(crate) const SHELL_START_WINDOW: std::time::Duration = std::time::Duration::
 /// ([`App::unstarted_shell`]): its PTY can close a moment before the kernel
 /// retires the process. It waits whether the exit turns out clean or not, since
 /// nothing knows until the status is in. Every other exit is one non-blocking
-/// look.
+/// look. Not on unix, where the reader's gather waits for the retirement off
+/// the UI thread before it posts the exit (`spawn::SHELL_RETIRE_WAIT`), and
+/// every look is a non-blocking one.
+#[cfg(not(unix))]
 const SHELL_START_STATUS_WAIT: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// Which look at an exited child's status [`App::exit_status`] is making.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ExitLook {
     /// The first on the exit path: the status classifier, or the exit ledger
-    /// when `tab_status` is off. It waits up to [`SHELL_START_STATUS_WAIT`]
-    /// for a shell that may have failed at start.
+    /// when `tab_status` is off. Off unix it waits up to
+    /// `SHELL_START_STATUS_WAIT` for a shell that may have failed at start; on
+    /// unix the reader waited before it posted the exit.
     First,
     /// The ledger's second chance after the classifier found nothing: one more
     /// non-blocking look, except for a shell the first look already waited on,
@@ -93,7 +96,19 @@ fn inject_operator_launch_line(
     term: &std::sync::Arc<std::sync::Mutex<aterm_core::terminal::Terminal>>,
     ctx: &crate::SessionCtx,
 ) {
-    let mut bytes = crate::status_item::OPERATOR_LAUNCH_LINE.as_bytes().to_vec();
+    inject_launch_line(term, ctx, crate::status_item::OPERATOR_LAUNCH_LINE);
+}
+
+/// Type `line` and Enter into a fresh session's shell, through its canonical
+/// input receipt, as ONE frame (`line + CR`): the `send` verb's write path,
+/// whose bytes wait in the kernel while the shell boots. The operator's
+/// launch line and an AI CLI's sign-in (`App::ai_sign_in`) are typed so.
+pub(crate) fn inject_launch_line(
+    term: &std::sync::Arc<std::sync::Mutex<aterm_core::terminal::Terminal>>,
+    ctx: &crate::SessionCtx,
+    line: &str,
+) {
+    let mut bytes = line.as_bytes().to_vec();
     bytes.push(0x0d);
     let event = crate::input::InputEvent::KeySequence(bytes);
     crate::app_input::tracked_egress(
@@ -461,6 +476,24 @@ pub(crate) enum CloseProgress {
 /// panes stand, only the aimed pane's job stood in the way.
 pub(crate) const WIRE_PANE_CLOSE_REFUSED: &str = "close refused (a running job in that pane)";
 
+/// The flagless wire `tab` verb's refusal when no window is front.
+pub(crate) const NO_FOCUSED_WINDOW: &str = "no window is focused";
+
+/// A connected spawn's inputs, checked before anything is created
+/// ([`App::connected_spawn_plan`]).
+struct ConnectedPlan {
+    origin_local: u64,
+    /// The window a TAB lands in (`None` for a window).
+    host: Option<WindowId>,
+    /// The identity the newborn wears, checked.
+    identity: Option<String>,
+    /// The folder the caller named (`cwd=`).
+    cwd: Option<String>,
+    /// Without `cwd=`, the origin's folder, unjudged: a held origin's is
+    /// checked where the spawn may wait.
+    origin_folder: Option<crate::spawn_folder::PaneFolder>,
+}
+
 /// One canonical terminal-view occurrence.  `layouts` is deliberately absent:
 /// heterogeneous tabs have no terminal-only projection, so session lifecycle
 /// must resolve through stable tab/view identity first and consult the legacy
@@ -525,17 +558,37 @@ pub(crate) fn home_abbreviated(path: &str) -> String {
 struct HarnessHosting {
     /// The host supervises agent sessions at all now.
     supervising: bool,
+    /// Agents admitted by their own live policy switches.
+    agents: crate::harness_host::Admission,
     /// The adopted sessions it is holding off for their claim grace.
     held_off: Vec<String>,
     /// The sessions whose frozen agent it would relaunch
     /// (`HostHandle::relaunching`).
     relaunching: std::collections::HashSet<String>,
+    /// The table's default Autopilot (`[harness] autopilot`), for a session
+    /// with no word of its own.
+    autopilot: aterm_agent::supervise::Autopilot,
 }
 
 impl HarnessHosting {
-    /// Whether the host answers for `sid` (when it runs an agent).
-    fn hosts(&self, sid: &str) -> bool {
-        self.supervising && !self.held_off.iter().any(|held| held == sid)
+    /// Whether the host answers for `sid` (when it runs `agent`), whose own
+    /// Autopilot word is `word`: only for an agent its live policy switch
+    /// admits (`agents`), not while it holds the session off for its claim
+    /// grace, and not while the session's Autopilot is OFF — its word, else
+    /// the table's default (the host stops its worker there and starts none:
+    /// `harness_host`'s `OffSessions`) — so the menu bar raises that session's
+    /// boxes again, as for any session no host supervises (`held_off` the
+    /// precedent).
+    fn hosts(
+        &self,
+        sid: &str,
+        word: Option<aterm_agent::supervise::Autopilot>,
+        agent: aterm_phase::Program,
+    ) -> bool {
+        self.supervising
+            && self.agents.admits(agent)
+            && word.unwrap_or(self.autopilot) != aterm_agent::supervise::Autopilot::Off
+            && !self.held_off.iter().any(|held| held == sid)
     }
 }
 
@@ -543,9 +596,10 @@ impl App {
     /// Detach one terminal view and retire all per-session auxiliary state only
     /// when the pool confirms that this was the final attachment.
     ///
-    /// Every production teardown path funnels through this method so summary
-    /// snapshots, retries, and queued provider work cannot outlive the PTY they
-    /// describe. Shared sessions remain live until their last view closes.
+    /// Every production teardown path funnels through this method so per-session
+    /// chrome state (presented labels, status, presence, caches and debounce
+    /// deadlines) cannot outlive the PTY it describes. Shared sessions remain live
+    /// until their last view closes.
     pub(crate) fn detach_session_view(&mut self, session: u64) -> bool {
         let handed = self
             .pool
@@ -556,7 +610,7 @@ impl App {
             if let Some(local_id) = handed {
                 self.note_handed_shell_lost(local_id);
             }
-            self.retire_title_summary(session);
+            self.chrome_labels.retire(session);
             self.retire_session_status(session);
             self.retire_presence(session);
             // The owner's upgrade view hands over only LIVE tabs' rows, and
@@ -565,7 +619,7 @@ impl App {
             // stood until the next timed look, and its record kept offering
             // words for a session that was gone (ruling 315, day eight E3).
             crate::harness_host::look_at_upgrades_soon();
-            // These caches can carry authored descriptions, generated activity,
+            // These caches can carry authored descriptions, status activity,
             // cwd/title text, and debounce deadlines. The final view is the
             // lifecycle boundary: erase them immediately instead of waiting for
             // the lazy >64-entry reaper or a future drift sweep. A non-final
@@ -1362,28 +1416,22 @@ impl App {
                 let Some(crate::tab_model::View::Terminal(view)) =
                     self.view_store.get(tab.focus).copied()
                 else {
-                    return (fallback, None, None, None);
+                    return (fallback, None, None);
                 };
                 let Some(s) = self.pool.get(view.session) else {
-                    return (fallback, None, None, None);
+                    return (fallback, None, None);
                 };
                 // TOP RUNG: the operator's `meta set title` (leaf lock, dropped
                 // before the term lock is ever taken; contended only by an actual
                 // `meta set`). When it hits, the term try-lock is skipped.
-                let (user_title, authored_description) = {
-                    let meta = s.ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
-                    (
-                        meta.presentation_value("title"),
-                        meta.presentation_value("description"),
-                    )
-                };
+                let user_title = s
+                    .ctx
+                    .meta
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .presentation_value("title");
                 if user_title.is_some() {
-                    return (
-                        fallback,
-                        Some(view.session),
-                        user_title,
-                        authored_description,
-                    );
+                    return (fallback, Some(view.session), user_title);
                 }
                 let term_label = |t: &aterm_core::terminal::Terminal| {
                     use crate::cwd_native::ReportedCwd as _;
@@ -1400,22 +1448,20 @@ impl App {
                     Err(std::sync::TryLockError::Poisoned(p)) => Some(term_label(&p.into_inner())),
                     Err(std::sync::TryLockError::WouldBlock) => None,
                 };
-                (fallback, Some(view.session), fresh, authored_description)
+                (fallback, Some(view.session), fresh)
             })
             .collect();
         // Pass 2: fold through the per-window keep-stale cache, pruned to the
         // sessions that still label a tab so it stays bounded.
-        let title_summaries = &self.title_summaries;
-        let title_config = &self.config;
-        let title_format = title_config.tab_title_format_or_default();
+        let chrome_labels = &self.chrome_labels;
         let Some(ws) = self.windows.get_mut(&wid) else {
             return Vec::new();
         };
         let live: std::collections::HashSet<u64> =
-            read.iter().filter_map(|(_, sid, _, _)| *sid).collect();
+            read.iter().filter_map(|(_, sid, _)| *sid).collect();
         ws.tab_title_cache.retain(|sid, _| live.contains(sid));
         read.into_iter()
-            .map(|(fallback, sid, fresh, authored_description)| {
+            .map(|(fallback, sid, fresh)| {
                 let Some(sid) = sid else {
                     return fallback;
                 };
@@ -1436,13 +1482,13 @@ impl App {
                         .cloned()
                         .unwrap_or(fallback),
                 };
-                title_summaries.compose(
+                // The label is the identity title alone, sanitized for the
+                // strip (no cap: the strip fits its own labels) through the
+                // per-session cache `refill_strip_titles` shares.
+                chrome_labels.present(
                     Some(sid),
                     &raw,
-                    authored_description.as_deref(),
-                    title_format,
-                    title_config,
-                    crate::title_summary::ChromeSurface::TabStrip,
+                    crate::chrome_label::ChromeSurface::TabStrip,
                 )
             })
             .collect()
@@ -1694,8 +1740,9 @@ impl App {
     /// (b) the resolved label is byte-identical — a BACKGROUND tab's OSC title
     /// can drift without a timeline record (only the active session's title is
     /// published to the store), so the label is its own epoch; and
-    /// (c) the generated-activity revision is unchanged — summaries update
-    /// independently of the durable session timeline and selected label. Age
+    /// (c) the session-status revision is unchanged — the activity line is
+    /// Status's words, which move independently of the durable session
+    /// timeline and the label. Age
     /// expiry is owned by the event-loop scheduler, which removes a fixed-size
     /// due batch before refreshing its windows; keeping age out of this local
     /// hit gate prevents one all-tab refresh from recomposing an unbounded
@@ -1707,7 +1754,7 @@ impl App {
     /// read, timeline again — each taken and dropped before the next, never
     /// nested, mirroring `control_session::meta_status`. The terminal leaf is a
     /// try-lock: contention serves stale cached chrome and schedules the existing
-    /// title-drift tail retry, so summary completion never parks the event loop.
+    /// title-drift tail retry, so a chrome refresh never parks the event loop.
     fn composed_session_chrome(
         &mut self,
         retry_window: WindowId,
@@ -1730,9 +1777,7 @@ impl App {
         // The same order for the upgrade view's revision (gap #21): read
         // before the row it composes from.
         let upgrade_revision = self.upgrade_view.revision();
-        let activity_revision = self
-            .title_summary_activity_revision(session)
-            .wrapping_add(self.session_status_revision(session));
+        let activity_revision = self.session_status_revision(session);
         let high_id = ctx
             .timeline
             .lock()
@@ -1749,12 +1794,9 @@ impl App {
         {
             return c.ext.clone();
         }
-        // Tab Subject & Status owns the live activity line when it has anything
-        // honest to say; the older generated summary remains the fallback so
-        // nothing regresses while the two subsystems coexist (RFC §11).
-        let activity = self
-            .session_status_text(session)
-            .or_else(|| self.title_summary_activity(session).map(str::to_owned));
+        // Tab Subject & Status owns the live activity line, and says nothing when
+        // it has nothing honest to say (RFC §11).
+        let activity = self.session_status_text(session);
         let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner()).clone();
         // The tab TOOLTIP's `cwd: …` line, so it takes the native form — the
         // reported defect showed `cwd: /C:/Users//m6-an` here.
@@ -2426,8 +2468,8 @@ impl App {
     }
 
     /// Test-only: append a stub `session` as a NEW tab of EXISTING window `wid` and
-    /// switch to it — the shipping [`Self::install_new_tab`] body `open_tab` runs
-    /// after its spawn, fed a stub session instead of a real PTY. `session.id` MUST
+    /// switch to it — the shipping [`Self::install_tab_session`] body a tab lands
+    /// through ([`Self::install_new_tab`]), fed a stub session instead of a real PTY. `session.id` MUST
     /// equal `self.next_session_id` (the test builds it that way), which is then
     /// bumped. Used to stage multi-tab windows; the appended terminal becomes the
     /// window's canonical front capability.
@@ -2438,7 +2480,8 @@ impl App {
 
     /// Test-only: split window `wid`'s ACTIVE tab into a 2-pane vertical split,
     /// spawning a fresh stub session for the new (now-focused) pane — the shipping
-    /// [`Self::install_split_pane`] body a split runs after its spawn, fed a stub
+    /// [`Self::install_split_session`] body a split lands through
+    /// ([`Self::install_split_pane`]), fed a stub
     /// session instead of a real PTY (the pre-spawn refusals are the caller's to
     /// stage). Returns the new pane's session id.
     #[cfg(test)]
@@ -2530,58 +2573,42 @@ impl App {
         }
     }
 
-    /// `spawn` (control socket): open one new tab session in `window` (the AIMED
-    /// window, design S3; `None` = the frontmost window, the historical contract)
-    /// and return its freshly minted sid. The newborn is found by REGISTRY DIFF —
-    /// snapshot the sid set, run the exact `open_tab_in` path Cmd-T takes, and
-    /// return the one sid that appeared — so this can never misattribute a
-    /// concurrently exiting session, and the sid is registered (addressable)
-    /// before the caller's reply is written. Headless-safe: the logical window
-    /// hosts tabs exactly like a real one.
-    ///
-    /// `split` (`spawn split=<v|h>`, the wire half of the front door's
-    /// `aterm split-pane`) divides the FOCUSED PANE instead of opening a tab.
-    /// The registry diff is what makes one function serve both: a split spawns
-    /// exactly one new session too, so the newborn is found the same way and the
-    /// same sid contract holds. It rides the identical `App::split_focused_pane`
-    /// path a Cmd-D chord takes — including its refusals (a SHARED session is
-    /// never split; a pane too small to halve is never split), each of which
-    /// arrives here as its own honest reason rather than as a corrupted
-    /// co-viewing window or an invisible 1x1 pane with a live shell behind it.
-    pub(crate) fn spawn_tab_session(
-        &mut self,
-        window: Option<WindowId>,
-        cwd: Option<String>,
-        split: Option<crate::pane::SplitDir>,
-        // The agent identity the newborn spawns under (session identities;
-        // already resolved and created by the verb), `None` for the human's own.
-        identity: Option<&str>,
-    ) -> Result<String, String> {
-        let Some(host) = window.or(self.frontmost_window) else {
-            return Err("no window to host the session".to_string());
-        };
-        let before: std::collections::HashSet<aterm_session::SessionId> = {
-            let g = self.store.read().unwrap_or_else(|p| p.into_inner());
-            g.snapshot().iter().map(|h| h.sid.clone()).collect()
-        };
-        match split {
-            // A REFUSED split is not "nothing spawned" — it is a reason, and the
-            // operator gets it verbatim (`ERR Split refused: this pane is 19x11
-            // cells; a left/right split needs at least 33x3`) instead of the
-            // registry-diff's generic shrug. Nothing was spawned, so returning
-            // here skips a diff that could only report the same emptiness with
-            // less information.
-            Some(dir) => self.split_focused_pane_in_window(host, dir, cwd, identity)?,
-            None => self.open_tab_in_cwd_observing(host, cwd.as_deref(), None, identity),
+    /// Revalidate the booked authority before attaching a reader or registering
+    /// the worker's newborn. Main-thread booking and landing cannot interleave
+    /// another lifecycle mutation between this check and the install. `host` is
+    /// the window a connected TAB lands in, which must still host its origin; a
+    /// connected WINDOW (`None`) needs only the origin alive.
+    pub(crate) fn validate_spawn_admission(
+        &self,
+        admission: &crate::tab_spawn::SpawnAdmission,
+        host: Option<WindowId>,
+    ) -> Result<(), String> {
+        match admission {
+            crate::tab_spawn::SpawnAdmission::Plain => {}
+            crate::tab_spawn::SpawnAdmission::Connected { origin, local } => {
+                let store = self.store.read().unwrap_or_else(|p| p.into_inner());
+                let Some(handle) = store.by_sid(origin) else {
+                    return Err("no such origin session".to_string());
+                };
+                if handle.local_id != *local {
+                    return Err("the origin session changed while spawning".to_string());
+                }
+                if matches!(handle.state, session_store::SessionState::Exited) {
+                    return Err("the origin exited before the session started".to_string());
+                }
+                if host.is_some_and(|window| self.terminal_view_location(window, *local).is_none())
+                {
+                    return Err("the booked window no longer hosts the origin session".to_string());
+                }
+            }
+            #[cfg(target_os = "macos")]
+            crate::tab_spawn::SpawnAdmission::Operator => {
+                if self.operator_local_id.is_some() {
+                    return Err("an operator started before this session was ready".to_string());
+                }
+            }
         }
-        let after = {
-            let g = self.store.read().unwrap_or_else(|p| p.into_inner());
-            g.snapshot()
-        };
-        match after.iter().find(|h| !before.contains(&h.sid)) {
-            Some(h) => Ok(h.sid.as_str().to_string()),
-            None => Err("session did not spawn (window hosts no tabs?)".to_string()),
-        }
+        Ok(())
     }
 
     /// Resolve + validate a CONNECTED spawn's origin and place BEFORE anything
@@ -2634,16 +2661,21 @@ impl App {
 
     /// The session's shell-reported cwd by registry LOCAL id (raw, the
     /// [`Self::tab_session_cwd`] rung without the tab resolution) — the
-    /// connected spawn's origin-cwd default (design §6: `cwd=` overrides it).
-    /// A folder reported while ssh (or any program) holds the session, and not
-    /// here, is not taken, as for a New Tab ([`Self::inherited_cwd`]).
-    fn session_cwd_by_local(&self, local: u64) -> Option<String> {
+    /// connected spawn's origin-cwd default (design §6: `cwd=` overrides it) —
+    /// with whether a program other than its shell holds it. Such a folder
+    /// (ssh, any program) that is not here is not taken, as for a New Tab: the
+    /// check that judges it ([`crate::spawn_folder::PaneFolder::resolve`])
+    /// runs where the spawn may wait, not here.
+    fn session_folder_by_local(&self, local: u64) -> Option<crate::spawn_folder::PaneFolder> {
         let s = self.pool.get(local)?;
         let reported = term_lock(&s.term)
             .current_working_directory()
             .filter(|c| !c.is_empty())
             .map(str::to_string)?;
-        Self::inherited_cwd(s, reported)
+        Some(crate::spawn_folder::PaneFolder {
+            reported,
+            held: Self::session_held(s),
+        })
     }
 
     /// Mint a CONNECTED spawn's `both` session connection through the ONE mint
@@ -2691,85 +2723,137 @@ impl App {
     /// handler (`Wake::SpawnConnectedSession`, `surface="wire"`): precheck,
     /// spawn the newborn at `place` (lineage parent = origin for CONTROLLED;
     /// `ATERM_OBSERVE_SESSION_ID` env for CONTROLLER), then mint the ONE
-    /// `both` connection and refresh the §4 marks. Returns the newborn's sid
-    /// (the wire `OK <sid>` body). The newborn is found by REGISTRY DIFF (the
-    /// [`Self::spawn_tab_session`] idiom) so a concurrently exiting session
-    /// can never be misattributed.
+    /// `both` connection and refresh the §4 marks ([`Self::connect_newborn`]).
+    /// `done` hears the newborn's sid (the wire `OK <sid>` body) or why not.
+    /// The shell spawns off the event loop (`tab_spawn`), a TAB's and a
+    /// WINDOW's alike, and is connected as it lands, under the sid it was
+    /// spawned with; the window is built around it then.
     #[allow(
         clippy::too_many_arguments,
         reason = "the connected spawn's birth facts — kind, place, origin, cwd, the \
-                  reporting surface and the agent identity — are each a per-spawn datum; \
-                  a wrapper struct would relocate the list, not simplify it"
+                  reporting surface and the agent identity — are each a per-spawn datum, \
+                  and `done` is its answer; a wrapper struct would relocate the list, not \
+                  simplify it"
     )]
     pub(crate) fn spawn_connected_session(
         &mut self,
-        el: &ActiveEventLoop,
         kind: crate::connections::ConnectedSpawnKind,
         place: crate::connections::ConnectedSpawnPlace,
         origin: &aterm_session::SessionId,
         cwd: Option<String>,
-        surface: &str,
+        surface: &'static str,
         identity: Option<crate::control::IdentitySpec>,
-    ) -> Result<String, String> {
+        done: crate::tab_spawn::SpawnDone,
+    ) {
         use crate::connections::{ConnectedSpawnKind as Kind, ConnectedSpawnPlace as Place};
+        let ConnectedPlan {
+            origin_local,
+            host,
+            identity,
+            cwd,
+            origin_folder,
+        } = match self.connected_spawn_plan(place, origin, cwd, identity) {
+            Ok(plan) => plan,
+            Err(why) => return done(self, Err(why)),
+        };
+        let lineage_parent = matches!(kind, Kind::Controlled).then(|| origin.clone());
+        let observe = matches!(kind, Kind::Controller).then(|| origin.clone());
+        // The origin's folder is judged on the spawner, as the focused pane's
+        // is for any tab or window.
+        let ask = crate::tab_spawn::SpawnAsk {
+            admission: crate::tab_spawn::SpawnAdmission::Connected {
+                origin: origin.clone(),
+                local: origin_local,
+            },
+            cwd,
+            folder_of: origin_folder,
+            identity,
+            observe,
+            ..crate::tab_spawn::SpawnAsk::default()
+        };
+        let then = Self::connected_landing(kind, origin.clone(), surface, done);
+        match place {
+            // A controlled window's first session is its origin's child.
+            Place::Window => self.open_window_off_loop(ask, lineage_parent, then),
+            Place::Tab => {
+                // Precheck resolved the hosting window for every Tab place.
+                let host = host.expect("tab precheck resolves a host window");
+                self.open_off_loop(host, crate::tab_spawn::SpawnPlace::Tab, ask, then);
+            }
+        }
+    }
+
+    /// What a connected tab or window does as it lands: connect the newborn to
+    /// `origin` under the sid it was spawned with ([`Self::connect_newborn`]),
+    /// then tell `done`. One that never landed tells `done` why.
+    fn connected_landing(
+        kind: crate::connections::ConnectedSpawnKind,
+        origin: aterm_session::SessionId,
+        surface: &'static str,
+        done: crate::tab_spawn::SpawnDone,
+    ) -> crate::tab_spawn::TabSpawnThen {
+        crate::tab_spawn::TabSpawnThen::Run(Box::new(move |app, landed| {
+            let connected = landed.and_then(|sid| {
+                let newborn = aterm_session::SessionId::new(sid);
+                app.connect_newborn(kind, &origin, &newborn, surface)
+            });
+            done(app, connected);
+        }))
+    }
+
+    /// A connected spawn's checks and inputs, before anything is created:
+    /// [`Self::connected_spawn_precheck`], the identity the newborn wears
+    /// (checked), and its folder.
+    fn connected_spawn_plan(
+        &self,
+        place: crate::connections::ConnectedSpawnPlace,
+        origin: &aterm_session::SessionId,
+        cwd: Option<String>,
+        identity: Option<crate::control::IdentitySpec>,
+    ) -> Result<ConnectedPlan, String> {
         let (origin_local, host) = self.connected_spawn_precheck(place, origin)?;
         // IDENTITY (session identities, 2026-09-17): the ORIGIN is the aimed
         // session of a connected spawn (the selector is discarded), so the
         // newborn inherits its identity unless `identity=` says otherwise —
-        // the same rule as `@<sid> spawn`, the same only-create-here path.
+        // the same rule as `@<sid> spawn`, the same only-create path: the
+        // verb's control-thread half made a named one before this was posted,
+        // so here it is only checked.
+        let inherited = identity.is_none();
         let identity = crate::control::resolve_spawn_identity(
             identity,
             self.identity_of_local(origin_local).as_deref(),
         );
         if let Some(name) = &identity {
-            crate::agent_identity::ensure(name, true)
+            crate::agent_identity::check_for_spawn(name, inherited)
                 .map_err(|e| format!("identity {name}: {e}"))?;
         }
         // Default the newborn's cwd to the ORIGIN's (design §6): the `of=`
         // target need not be the front pane the plain-spawn default would read.
-        let cwd = cwd.or_else(|| self.session_cwd_by_local(origin_local));
-        let lineage_parent = matches!(kind, Kind::Controlled).then(|| origin.clone());
-        let observe = matches!(kind, Kind::Controller).then(|| origin.clone());
-        let before: std::collections::HashSet<aterm_session::SessionId> = {
-            let g = self.store.read().unwrap_or_else(|p| p.into_inner());
-            g.snapshot().iter().map(|h| h.sid.clone()).collect()
+        let origin_folder = if cwd.is_none() {
+            self.session_folder_by_local(origin_local)
+        } else {
+            None
         };
-        match place {
-            Place::Window => {
-                if self
-                    .create_window_internal_connected(
-                        el,
-                        cwd.as_deref(),
-                        None,
-                        lineage_parent,
-                        observe.as_ref(),
-                        identity.as_deref(),
-                        None,
-                    )
-                    .is_none()
-                {
-                    return Err("could not open a new window".to_string());
-                }
-            }
-            Place::Tab => {
-                // Precheck resolved the hosting window for every Tab place.
-                let host = host.expect("tab precheck resolves a host window");
-                self.open_tab_in_cwd_observing(
-                    host,
-                    cwd.as_deref(),
-                    observe.as_ref(),
-                    identity.as_deref(),
-                );
-            }
-        }
-        let newborn = {
-            let g = self.store.read().unwrap_or_else(|p| p.into_inner());
-            g.snapshot().into_iter().find(|h| !before.contains(&h.sid))
-        };
-        let Some(newborn) = newborn else {
-            return Err("session did not spawn".to_string());
-        };
-        self.mint_connected(kind, origin, &newborn.sid, surface)?;
+        Ok(ConnectedPlan {
+            origin_local,
+            host,
+            identity,
+            cwd,
+            origin_folder,
+        })
+    }
+
+    /// Mint the `both` connection between a connected spawn's `origin` and its
+    /// registered `newborn`, say it once to a first UI user, and refresh the §4
+    /// marks. Returns the newborn's sid, the wire `OK <sid>` body.
+    fn connect_newborn(
+        &mut self,
+        kind: crate::connections::ConnectedSpawnKind,
+        origin: &aterm_session::SessionId,
+        newborn: &aterm_session::SessionId,
+        surface: &str,
+    ) -> Result<String, String> {
+        self.mint_connected(kind, origin, newborn, surface)?;
         // First-use notice (design §1.4#8): once per config lifetime, on the
         // first UI-ORIGINATED connect only — wire callers read the reply.
         if surface == "ui"
@@ -2784,7 +2868,7 @@ impl App {
         // The tables changed ON the main thread — no wake round-trip needed:
         // run the `Wake::ConnectionsChanged` body directly.
         self.refresh_connection_surfaces();
-        Ok(newborn.sid.as_str().to_string())
+        Ok(newborn.as_str().to_string())
     }
 
     /// Re-stamp every window's §4 tab marks through the one strip funnel and
@@ -2842,16 +2926,17 @@ impl App {
     /// that never came (resume-hint review, 2026-09-26).
     pub(crate) fn status_session_row(
         h: &crate::session_store::SessionHandle,
-        hosted: bool,
+        hosted: impl FnOnce(aterm_phase::Program) -> bool,
         relaunching: &std::collections::HashSet<String>,
     ) -> crate::status_item::SessionRow {
-        let (user_title, role, attention, supervised) = {
+        let (user_title, role, attention, supervisor) = {
             let m = h.ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
             (
                 m.user_title.clone(),
                 m.role.clone(),
                 m.attention.clone(),
-                m.live_supervisor(crate::metrics::now_us()).is_some(),
+                m.live_supervisor(crate::metrics::now_us())
+                    .map(str::to_string),
             )
         };
         // THE MEMORY ROW'S WORD ([`crate::status_item::SessionRow::restarts`]):
@@ -2878,7 +2963,7 @@ impl App {
             let resume = tl.claude_footer().and_then(|facts| facts.resume.clone());
             (
                 agent,
-                hosted && crate::harness_host::agent_of(a).is_some(),
+                crate::harness_host::agent_of(a).is_some_and(hosted),
                 stall,
                 resume,
             )
@@ -2901,11 +2986,15 @@ impl App {
             role,
             attention,
             agent,
-            supervised: supervised || host_supervises,
+            // An external claim remains that supervisor's. This host's old
+            // claim can still be winding down after its agent was switched
+            // off; it no longer promises an answer in that case.
+            supervised: host_supervises
+                || supervisor.is_some_and(|holder| holder != crate::harness_host::holder()),
             input_stall,
             resume,
             // Never on supervision alone (resume-hint review, 2026-09-26).
-            restarts,
+            restarts: restarts && host_supervises,
         }
     }
 
@@ -2936,8 +3025,10 @@ impl App {
         match self.harness.as_ref() {
             Some(host) if host.supervising() => HarnessHosting {
                 supervising: true,
+                agents: host.admission(),
                 held_off: host.held_off(),
                 relaunching: host.relaunching(),
+                autopilot: self.harness_policy.get().policy.autopilot,
             },
             _ => HarnessHosting::default(),
         }
@@ -2954,7 +3045,13 @@ impl App {
                 .by_local(session)
                 .filter(|h| !matches!(h.state, crate::session_store::SessionState::Exited))
                 .map(|h| {
-                    Self::status_session_row(h, hosting.hosts(h.sid.as_str()), &hosting.relaunching)
+                    // Read before the row takes the timeline's leaf lock.
+                    let word = crate::autopilot::word_of(&h.ctx);
+                    Self::status_session_row(
+                        h,
+                        |agent| hosting.hosts(h.sid.as_str(), word, agent),
+                        &hosting.relaunching,
+                    )
                 })
         };
         let current = row.as_ref().and_then(crate::status_item::escalation);
@@ -3016,15 +3113,17 @@ impl App {
     /// opt-in guards PROGRAM-originated escapes, and this text is aterm's
     /// own — behind `desktop_alerts` instead, which [`Self::herald_session`]
     /// checks before calling here (and the delivery thread again, for every
-    /// [`crate::notify::NotifyMsg::own`]). Under `cfg(test)` the notice is recorded instead (and counts as
+    /// [`crate::notify::NotifyMsg::herald`]). Under `cfg(test)` the notice is recorded instead (and counts as
     /// queued, unless a test armed `HERALD_REFUSAL`), so no test ever runs a
     /// notifier subprocess.
     fn post_herald_notice(
         &self,
         notice: &crate::status_item::HeraldNotice,
     ) -> Result<(), &'static str> {
+        let message = crate::notify::NotifyMsg::herald(notice);
         #[cfg(test)]
         {
+            let _ = message;
             if let Some(why) = HERALD_REFUSAL.take() {
                 return Err(why);
             }
@@ -3033,11 +3132,6 @@ impl App {
         }
         #[cfg(not(test))]
         {
-            let message = crate::notify::NotifyMsg::own(
-                notice.session,
-                Some(notice.title.to_owned()),
-                notice.body.clone(),
-            );
             self.session_factory
                 .notify_tx
                 .try_send(message)
@@ -3065,9 +3159,11 @@ impl App {
                 .into_iter()
                 .filter(|h| !matches!(h.state, crate::session_store::SessionState::Exited))
                 .map(|h| {
+                    // Read before the row takes the timeline's leaf lock.
+                    let word = crate::autopilot::word_of(&h.ctx);
                     Self::status_session_row(
                         &h,
-                        hosting.hosts(h.sid.as_str()),
+                        |agent| hosting.hosts(h.sid.as_str(), word, agent),
                         &hosting.relaunching,
                     )
                 })
@@ -3169,6 +3265,51 @@ impl App {
         )
     }
 
+    /// The operator row's newborn `sid`, registered: stamp its typed role and
+    /// title, then type the agent's launch line into it.
+    #[cfg(target_os = "macos")]
+    fn stamp_started_operator(&mut self, sid: &str) {
+        // Stamp identity via user meta BEFORE the agent renames itself, then
+        // type the launch line through the sink — the `send` verb's write path
+        // (whole-frame atomic; bytes buffer in the kernel while the shell boots).
+        let stamped = {
+            let store = self.store.read().unwrap_or_else(|p| p.into_inner());
+            store.by_sid(&aterm_session::SessionId::new(sid)).map(|h| {
+                // Typed identity FIRST (the classifier keys on it); the title
+                // stays the human status line. Through the validated ladder, so
+                // the meta-change timeline records land exactly like a wire
+                // `meta set` (the raw-set stamp was invisible to `events`
+                // watchers).
+                use crate::session_timeline::{MetaEdit, MetaField, write_session_meta};
+                let _ = write_session_meta(&h.ctx, MetaField::Role, MetaEdit::Set("operator"));
+                let _ = write_session_meta(
+                    &h.ctx,
+                    MetaField::Title,
+                    MetaEdit::Set("operator: starting"),
+                );
+                (h.local_id, h.term.clone(), h.ctx.clone())
+            })
+        };
+        if let Some((local, term, ctx)) = stamped {
+            // The wire meta arm's fan-out, mirrored (the GUI rename discipline):
+            // chrome recompose + a subscriber notify so the fresh records push.
+            self.refresh_meta_dependent_chrome(local);
+            if self.subscribers.any() {
+                self.subscribers
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .notify(local);
+            }
+            inject_operator_launch_line(&term, &ctx);
+        }
+        self.refresh_operator_status_item();
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn operator_start_available(&self) -> bool {
+        self.operator_local_id.is_none() && !self.tab_spawns.operator_pending()
+    }
+
     /// Dispatch one click from the menu-bar status item (the
     /// `dispatch_menu_action` twin for `Wake::OperatorAction`).
     ///
@@ -3186,60 +3327,34 @@ impl App {
                 // missing agent CLI (the row renders disabled, but a stale
                 // menu can still deliver the click): never spawn a session
                 // just to type a command the shell will not find.
-                if self.operator_local_id.is_some() || !operator_cli_on_path() {
+                if !self.operator_start_available() || !operator_cli_on_path() {
                     self.refresh_operator_status_item();
                     return;
                 }
                 // A TAB, never a split: the operator row stands up its own
                 // terminal, not a division of whatever pane happens to be focused.
-                match self.spawn_tab_session(None, None, None, None) {
-                    Ok(sid) => {
-                        // Stamp identity via user meta BEFORE the agent renames
-                        // itself, then type the launch line through the sink —
-                        // the `send` verb's write path (whole-frame atomic;
-                        // bytes buffer in the kernel while the shell boots).
-                        let stamped = {
-                            let store = self.store.read().unwrap_or_else(|p| p.into_inner());
-                            store.by_sid(&aterm_session::SessionId::new(&sid)).map(|h| {
-                                // Typed identity FIRST (the classifier keys on
-                                // it); the title stays the human status line.
-                                // Through the validated ladder, so the
-                                // meta-change timeline records land exactly
-                                // like a wire `meta set` (the raw-set stamp
-                                // was invisible to `events` watchers).
-                                use crate::session_timeline::{
-                                    MetaEdit, MetaField, write_session_meta,
-                                };
-                                let _ = write_session_meta(
-                                    &h.ctx,
-                                    MetaField::Role,
-                                    MetaEdit::Set("operator"),
-                                );
-                                let _ = write_session_meta(
-                                    &h.ctx,
-                                    MetaField::Title,
-                                    MetaEdit::Set("operator: starting"),
-                                );
-                                (h.local_id, h.term.clone(), h.ctx.clone())
-                            })
-                        };
-                        if let Some((local, term, ctx)) = stamped {
-                            // The wire meta arm's fan-out, mirrored (the GUI
-                            // rename discipline): chrome recompose + a
-                            // subscriber notify so the fresh records push.
-                            self.refresh_meta_dependent_chrome(local);
-                            if self.subscribers.any() {
-                                self.subscribers
-                                    .lock()
-                                    .unwrap_or_else(|p| p.into_inner())
-                                    .notify(local);
-                            }
-                            inject_operator_launch_line(&term, &ctx);
+                // Its shell spawns off the event loop; the newborn is stamped
+                // once it is registered.
+                let Some(front) = self.frontmost_window else {
+                    crate::logging::stderr_line!(
+                        "aterm-gui: start operator failed: no window to host the session"
+                    );
+                    return;
+                };
+                self.open_off_loop(
+                    front,
+                    crate::tab_spawn::SpawnPlace::Tab,
+                    crate::tab_spawn::SpawnAsk {
+                        admission: crate::tab_spawn::SpawnAdmission::Operator,
+                        ..crate::tab_spawn::SpawnAsk::default()
+                    },
+                    crate::tab_spawn::TabSpawnThen::Run(Box::new(|app, started| match started {
+                        Ok(sid) => app.stamp_started_operator(&sid),
+                        Err(e) => {
+                            crate::logging::stderr_line!("aterm-gui: start operator failed: {e}");
                         }
-                        self.refresh_operator_status_item();
-                    }
-                    Err(e) => crate::logging::stderr_line!("aterm-gui: start operator failed: {e}"),
-                }
+                    })),
+                );
             }
             crate::status_item::OperatorAction::Show => {
                 let Some(session) = self.operator_local_id else {
@@ -3702,7 +3817,8 @@ impl App {
     /// stamped with `owner` so its output/exit/bell route back to THIS window.
     ///
     /// TRUST anchor: the `NewTab` action of the ty-proven `tab_strip` machine
-    /// (`tab_strip_model()`) — appends a tab and re-syncs the owner's native strip.
+    /// (`tab_strip_model()`) — appends a tab and re-syncs the owner's native strip,
+    /// once the shell spawned off the loop is up ([`Self::install_tab_session`]).
     #[cfg_attr(
         test,
         aterm_spec::refines(
@@ -3715,93 +3831,62 @@ impl App {
         self.open_tab_in_cwd(owner, None);
     }
 
-    /// [`open_tab_in`] with an optional CWD override (the `spawn cwd=<path>` path).
-    /// `None` keeps the default: inherit the focused pane's cwd so a Cmd-T tab opens
-    /// where the user is.
+    /// [`open_tab_in`] with an optional CWD override. `None` keeps the default:
+    /// inherit the focused pane's cwd so a Cmd-T tab opens where the user is.
+    ///
+    /// The shell is spawned off the event loop ([`crate::tab_spawn`]): this turn
+    /// books the tab, and the tab is appended when its session comes back.
     pub(crate) fn open_tab_in_cwd(&mut self, owner: WindowId, cwd_override: Option<&str>) {
-        self.open_tab_in_cwd_observing(owner, cwd_override, None, None);
-    }
-
-    /// [`open_tab_in_cwd`] with the per-spawn CONTROLLER observation hint
-    /// threaded through (session connections §2.3: a controller-as-tab preset
-    /// injects `ATERM_OBSERVE_SESSION_ID=<origin>` into the newborn's shell).
-    /// Every non-connected caller goes through the `None` wrapper above.
-    pub(crate) fn open_tab_in_cwd_observing(
-        &mut self,
-        owner: WindowId,
-        cwd_override: Option<&str>,
-        observe: Option<&aterm_session::SessionId>,
-        // The agent identity the newborn spawns under (session identities;
-        // resolved and created by the verb), `None` for every chord/menu tab.
-        identity: Option<&str>,
-    ) {
-        if !self.windows.contains_key(&owner) {
-            return;
-        }
-        let id = self.next_session_id;
-        let (rows, cols) = self
-            .windows
-            .get(&owner)
-            .map_or((0, 0), |ws| (ws.rows, ws.cols));
-        // A real run always has a proxy; guard rather than panic (test-only None).
-        let Some(proxy) = self.proxy.clone() else {
-            return;
-        };
-        // Inherit the focused tab's cwd so a new tab opens where the user is —
-        // unless the caller (spawn cwd=<path>) overrode it.
-        let cwd = cwd_override
-            .map(str::to_string)
-            .or_else(|| self.focused_pane_cwd(owner));
-        // CELL-PX-1: the owner window's real cell box, installed in the newborn
-        // engine at construction — this is the tab that used to answer DEC 1016 and
-        // size OSC 1337 images from the engine's 8x16 placeholder until the user
-        // happened to drag the window.
-        let cell_px = self.spawn_cell_px(owner);
-        match spawn_session(
-            id,
+        self.open_tab_off_loop(
             owner,
-            rows,
-            cols,
-            cell_px,
-            &self.session_factory,
-            &proxy,
-            cwd.as_deref(),
-            observe,
-            identity,
-            None, // fresh shell (not a seamless-update adoption)
-        ) {
-            Ok(session) => self.install_new_tab(owner, session),
-            Err(e) => {
-                crate::logging::stderr_line!("aterm-gui: could not open a new tab: {e}");
-                self.post_message(crate::message_reporters::new_tab_failed(&e.to_string()));
-            }
-        }
+            cwd_override,
+            None,
+            crate::tab_spawn::TabSpawnThen::Nothing,
+        );
     }
 
     /// Install an already-spawned `session` as a NEW last tab of window `owner` and
-    /// switch to it — the bookkeeping half of [`Self::open_tab_in_cwd_observing`],
-    /// split from the spawn (a real PTY) so the headless tests drive this SAME body
-    /// with a stub session (`push_stub_tab`). `session.id` must be the minted
-    /// `next_session_id`, which this bumps.
+    /// switch to it — what a tab spawned off the loop lands as
+    /// ([`Self::install_tab_session`] under the focused pane's parent), for the
+    /// headless tests that drive that SAME body with a stub session
+    /// (`push_stub_tab`). `session.id` must be the minted `next_session_id`, which
+    /// this bumps.
     ///
     /// The new tab moves the owner's front session, so when `owner` is the front
     /// window the global control/notify handle follows it here, in the seam that
     /// moved it (`active_handle_model`; Tier-1: `active_handle_conformance`).
+    #[cfg(test)]
     pub(crate) fn install_new_tab(&mut self, owner: WindowId, session: crate::Session) {
         debug_assert_eq!(
             session.id, self.next_session_id,
             "a new tab's session id must be the minted session id",
         );
-        let id = session.id;
         self.next_session_id += 1;
-        // P1.1: register in the process-wide registry (additive index) so a
-        // cross-session `@<selector>` verb can reach this tab. The parent is the
-        // FOCUSED pane's session of the OWNER window when the tab was opened (the
-        // family tree; a user-opened tab is a child of the pane it was opened from).
-        let parent = self
-            .front_terminal(owner)
+        let parent = self.new_tab_parent(owner);
+        self.install_tab_session(owner, session, parent);
+    }
+
+    /// The family-tree parent of a tab opened in `owner`: the FOCUSED pane's
+    /// session of that window (a user-opened tab is a child of the pane it was
+    /// opened from).
+    pub(crate) fn new_tab_parent(&self, owner: WindowId) -> Option<aterm_session::SessionId> {
+        self.front_terminal(owner)
             .and_then(|terminal| self.pool.get(terminal.session))
-            .map(|s| s.ctx.self_id.clone());
+            .map(|s| s.ctx.self_id.clone())
+    }
+
+    /// [`Self::install_new_tab`] for a session whose id is already reserved (a tab
+    /// spawned off the event loop, [`crate::tab_spawn`]): register it under
+    /// `parent`, append its single-pane tab to `owner` and switch to it.
+    pub(crate) fn install_tab_session(
+        &mut self,
+        owner: WindowId,
+        session: crate::Session,
+        parent: Option<aterm_session::SessionId>,
+    ) {
+        let id = session.id;
+        // P1.1: register in the process-wide registry (additive index) so a
+        // cross-session `@<selector>` verb can reach this tab.
         Self::register_session(&self.store, &session, parent);
         let layout = pane::PaneTree::new(id);
         let tab = crate::register_terminal_tab(&mut self.tab_ids, &mut self.view_store, &layout)
@@ -3926,7 +4011,7 @@ impl App {
     pub(crate) fn apply_tab_cmd(&mut self, action: TabAction) -> Result<(usize, usize), String> {
         match self.frontmost_window {
             Some(front) => self.apply_tab_cmd_in(front, action),
-            None => Err("no window is focused".to_string()),
+            None => Err(NO_FOCUSED_WINDOW.to_string()),
         }
     }
 
@@ -3968,6 +4053,8 @@ impl App {
         // refusal is never reported against this one.
         self.pending_action_refusal = None;
         match action {
+            // The wire verb counts the new tab once it lands
+            // (`App::tab_new_answered`); here it is booked like Cmd-T's.
             TabAction::New => self.open_tab_in(wid),
             TabAction::Select(n) => {
                 if n >= count {
@@ -4104,6 +4191,38 @@ impl App {
         }
     }
 
+    /// Windows showing this session as some tab's FOCUS — the tabs whose label
+    /// and composed tooltip are built from it.
+    pub(crate) fn windows_with_focused_session(&self, session: u64) -> Vec<WindowId> {
+        self.windows
+            .iter()
+            .filter(|(_, state)| {
+                state.tab_set.tabs().iter().any(|tab| {
+                    self.view_store
+                        .get(tab.focus)
+                        .copied()
+                        .and_then(crate::tab_model::View::terminal_session)
+                        == Some(session)
+                })
+            })
+            .map(|(wid, _)| *wid)
+            .collect()
+    }
+
+    /// Rebuild and push each window's tab chrome once, then repaint it.
+    pub(crate) fn refresh_tab_chrome_windows(&mut self, windows: Vec<WindowId>) {
+        for wid in windows {
+            self.refresh_window_tabs(wid);
+            if let Some(window) = self
+                .windows
+                .get(&wid)
+                .and_then(|state| state.os_window.as_ref())
+            {
+                window.request_redraw();
+            }
+        }
+    }
+
     /// Re-sync window `wid`'s NATIVE toolbar tab strip to the app's current tab
     /// state: rebuild the view-based strip's per-tab views (one per tab, splitting the
     /// band into equal shares with the active one accented — or, at exactly one tab,
@@ -4120,7 +4239,7 @@ impl App {
     /// asks for ("reads the per-tab titles ONCE and feeds the SAME `Vec` to
     /// both"): `tab_titles` takes each tab's session meta lock and a terminal
     /// `try_lock`, clones its presentation fallback, resolves and allocates the
-    /// title rung, and runs the summary composer — none of which should happen
+    /// title rung, and presents the label — none of which should happen
     /// twice per refresh, and doing it once also makes the pushed chrome and the
     /// redraw decision describe ONE snapshot rather than two possibly divergent
     /// reads. Callers that only want the push (`sync_window`, the reorder path,
@@ -4155,19 +4274,19 @@ impl App {
         // its tab is gone.
         self.reap_stale_rename_edit(wid);
         let titles = self.tab_titles(wid);
-        // WHOLE-STRING SURFACES. `titles` are the strip's labels — composed
+        // WHOLE-STRING SURFACES. `titles` are the strip's labels — presented
         // with no title cap, because the strip fits them itself, sibling-aware
         // (`ChromeSurface::TabStrip`). Everything pushed from here paints a
         // label with no fit of its own — the native toolbar's chip and its
         // accessibility string, the tooltip / context-menu header, the `tabs`
         // and `chrome` introspection lines — so those take the cap here, once
-        // (`whole_labels`: borrowed, no allocation, unless a label is actually
+        // (`capped_labels`: borrowed, no allocation, unless a label is actually
         // past it). The strip's own vector is what this function returns for
         // the in-grid fingerprint, and what the drift cache
         // (`tab_chrome_titles`) compares against the resolved rung; both keep
         // the uncapped label, or a long clean title would never compare equal
         // to itself and every epoch tick would rebuild the chrome.
-        let chrome_titles = crate::title_summary::whole_labels(&titles);
+        let chrome_titles = crate::chrome_label::capped_labels(&titles);
         // Composed per-tab chrome (tooltip + context-menu model) rides the same
         // refresh: epoch-cached, so a steady prompt pays one leaf-lock read per
         // terminal tab (see `composed_session_chrome`), and the strip receives
@@ -5217,10 +5336,12 @@ impl App {
     /// How `session`'s child ended, for every reader on the exit path: the
     /// classifier, the exit ledger and the failed-start line all read this one
     /// status. A child an earlier look reaped answers with what that look kept
-    /// (`Session::child_exit`); otherwise this reaps without blocking, and a
-    /// [`ExitLook::First`] look at a shell that may have failed at start
-    /// ([`Self::unstarted_shell`]) tries again for at most
-    /// [`SHELL_START_STATUS_WAIT`]. `None`: no status (an adopted session with no
+    /// (`Session::child_exit`); otherwise this reaps without blocking — on
+    /// unix the reader posted the exit only once the shell was collectable
+    /// (or `spawn::SHELL_RETIRE_WAIT` passed), so the UI thread never waits
+    /// here; elsewhere a [`ExitLook::First`] look at a shell that may have
+    /// failed at start ([`Self::unstarted_shell`]) tries again for at most
+    /// `SHELL_START_STATUS_WAIT`. `None`: no status (an adopted session with no
     /// exit witness, a child not yet reapable, or one this process cannot wait for).
     pub(crate) fn exit_status(&self, session: u64, look: ExitLook) -> Option<aterm_pty::ChildExit> {
         let pooled = self.pool.get(session)?;
@@ -5236,14 +5357,14 @@ impl App {
         if let Some(exit) = pooled.reap_child() {
             return Some(exit);
         }
-        if look == ExitLook::Retry || pooled.pid <= 1 || self.unstarted_shell(pooled).is_none() {
-            return None;
-        }
-        let deadline = std::time::Instant::now() + SHELL_START_STATUS_WAIT;
-        while std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(1));
-            if let Some(exit) = pooled.reap_child() {
-                return Some(exit);
+        #[cfg(not(unix))]
+        if look == ExitLook::First && pooled.pid > 1 && self.unstarted_shell(pooled).is_some() {
+            let deadline = std::time::Instant::now() + SHELL_START_STATUS_WAIT;
+            while std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                if let Some(exit) = pooled.reap_child() {
+                    return Some(exit);
+                }
             }
         }
         None
@@ -5531,7 +5652,7 @@ impl App {
         // The menu header paints the label WHOLE — the same projection
         // `refresh_window_tabs` hands the tooltip composer, so the two callers
         // of one chrome cache agree on the label they key it with.
-        let label = crate::title_summary::whole_label(titles.get(index).map_or("", String::as_str));
+        let label = crate::chrome_label::capped_label(titles.get(index).map_or("", String::as_str));
         self.composed_session_chrome(wid, session, &label).menu
     }
 
@@ -6378,6 +6499,8 @@ impl App {
     /// (not an `if let` scrutinee) so the store write guard is DROPPED before the
     /// sweep re-reads the registry for the survivors' tables.
     pub(crate) fn retire_session_registration(&mut self, id: u64) {
+        #[cfg(target_os = "macos")]
+        self.withdraw_askpass_session(id);
         // The exit ledger's tale: the gesture that started this close said why.
         let (reason, by) = session_store::current_close_attribution();
         let stable = self
@@ -6385,6 +6508,12 @@ impl App {
             .write()
             .unwrap_or_else(|p| p.into_inner())
             .deregister_local_as(id, reason, by);
+        // The harness's glass, Autopilot's timer and a Codex goal's hold go
+        // with the session (design §9.2.3, §9.3.6, §9.5.4): no label outlives
+        // it, and no deadline of its is folded again.
+        self.forget_harness_glass(id);
+        self.autopilot_timers.forget(id);
+        self.note_codex_goal_hold(id, false);
         // Wake every verb parked on the closed session's changes (`await`,
         // `ready`, `wait`, `subscribe`) to read that it ended, now rather than at
         // its next slice or deadline — as a shell's exit wakes them.
@@ -6425,12 +6554,149 @@ mod mixed_tab_tests {
     fn a_session_held_off_for_its_claim_grace_is_not_the_hosts() {
         let hosting = HarnessHosting {
             supervising: true,
+            agents: crate::harness_host::Admission::of(&Default::default()),
             held_off: vec!["s-adopted".to_string()],
             relaunching: Default::default(),
+            autopilot: aterm_agent::supervise::Autopilot::Cruise,
         };
-        assert!(!hosting.hosts("s-adopted"));
-        assert!(hosting.hosts("s-other"));
-        assert!(!HarnessHosting::default().hosts("s-other"));
+        assert!(!hosting.hosts("s-adopted", None, aterm_phase::Program::Claude));
+        assert!(hosting.hosts("s-other", None, aterm_phase::Program::Claude));
+        assert!(!HarnessHosting::default().hosts("s-other", None, aterm_phase::Program::Claude));
+    }
+
+    /// AN OFF SESSION IS NOBODY'S (the Autopilot design, §2.2): the host stops
+    /// its worker and starts none, so the menu-bar rows treat it as
+    /// unsupervised and raise its agent's own box — its word `off`, or no word
+    /// under a default of `off`. NEGATIVE CONTROLS: `cruise` and `land` are the
+    /// host's, a word `cruise` opts one session in under a default of `off`,
+    /// no word ever lifts a host that supervises nothing, and no word
+    /// admits an agent its own switch holds off (`agents`).
+    #[test]
+    fn an_off_session_is_not_the_hosts() {
+        use aterm_agent::supervise::Autopilot;
+        use aterm_phase::Program;
+        let codex_off = aterm_agent::supervise::SupervisorConfig {
+            off: vec![Program::Codex],
+            ..Default::default()
+        };
+        let mut hosting = HarnessHosting {
+            supervising: true,
+            agents: crate::harness_host::Admission::of(&codex_off),
+            ..HarnessHosting::default()
+        };
+        assert!(hosting.hosts("s-a", None, Program::Claude));
+        assert!(hosting.hosts("s-a", Some(Autopilot::Land), Program::Claude));
+        assert!(!hosting.hosts("s-a", Some(Autopilot::Off), Program::Claude));
+        hosting.autopilot = Autopilot::Off;
+        assert!(!hosting.hosts("s-a", None, Program::Claude));
+        assert!(hosting.hosts("s-a", Some(Autopilot::Cruise), Program::Claude));
+        assert!(!HarnessHosting::default().hosts("s-a", Some(Autopilot::Cruise), Program::Claude));
+        assert!(!hosting.hosts("s-a", Some(Autopilot::Cruise), Program::Codex));
+    }
+
+    /// A disabled agent's question belongs to the owner, while the other
+    /// agent's question remains its live harness's. Use the real timeline →
+    /// host projection → herald classifier, without a native window.
+    #[test]
+    fn per_agent_off_questions_reach_the_herald_only_for_disabled_agents() {
+        use aterm_agent::supervise::SupervisorConfig;
+        use aterm_phase::Program;
+
+        let mut app = App::headless_for_test();
+        app.push_stub_tab(WindowId(0), crate::stub_session(app.next_session_id));
+        for (id, program) in [(0, Program::Codex), (1, Program::Claude)] {
+            let ctx = &app.pool.get(id).unwrap().ctx;
+            let mut timeline = ctx.timeline.lock().unwrap();
+            timeline.set_program(4242 + id as i32, Some(program.name().to_string()));
+            timeline.publish_agent(
+                "question",
+                None,
+                None,
+                Some(program),
+                crate::session_timeline::AgentStamp {
+                    generation: crate::control::ScreenGen { epoch: 1, seq: 1 },
+                    fp: 1,
+                },
+            );
+        }
+        let host = crate::harness_host::HostHandle::for_supervised_test(
+            Vec::new(),
+            std::sync::Arc::new(|_| crate::harness_host::BodyEnd::Stopped),
+        );
+        app.harness = Some(host.clone());
+        let mut observed = Vec::new();
+        for off in [
+            Some("codex.enabled"),
+            Some("claude.enabled"),
+            None,
+            Some("enabled"),
+        ] {
+            let mut cfg = SupervisorConfig::default();
+            if let Some(key) = off {
+                cfg.set(key, "false").unwrap();
+            }
+            host.set_config(cfg);
+            observed.push(
+                app.operator_fleet_glance()
+                    .warnings
+                    .into_iter()
+                    .map(|(id, _)| id)
+                    .collect::<Vec<_>>(),
+            );
+        }
+        let mut cfg = SupervisorConfig::default();
+        cfg.set("codex.enabled", "false").unwrap();
+        host.set_config(cfg);
+        let own = crate::harness_host::holder();
+        let mut claimed = Vec::new();
+        let mut claims_unchanged = Vec::new();
+        for holder in [own.as_str(), "external-supervisor"] {
+            for id in 0..2 {
+                let ctx = &app.pool.get(id).unwrap().ctx;
+                ctx.meta.lock().unwrap().supervisor = None;
+                crate::session_timeline::claim_supervisor(
+                    ctx,
+                    holder,
+                    None,
+                    None,
+                    crate::metrics::now_us(),
+                )
+                .unwrap();
+            }
+            claimed.push(
+                app.operator_fleet_glance()
+                    .warnings
+                    .into_iter()
+                    .map(|(id, _)| id)
+                    .collect::<Vec<_>>(),
+            );
+            claims_unchanged.push((0..2).all(|id| {
+                app.pool
+                    .get(id)
+                    .unwrap()
+                    .ctx
+                    .meta
+                    .lock()
+                    .unwrap()
+                    .live_supervisor(crate::metrics::now_us())
+                    == Some(holder)
+            }));
+        }
+        host.shutdown_and_join();
+        assert_eq!(
+            observed,
+            [vec![0], vec![1], vec![], vec![0, 1]],
+            "only an admitted agent's question is assigned to the harness"
+        );
+        assert_eq!(
+            claimed,
+            [vec![0], vec![]],
+            "a disabled own claim is winding down; an external supervisor still answers its questions"
+        );
+        assert!(
+            claims_unchanged.into_iter().all(|unchanged| unchanged),
+            "projection never rewrites the actual claims"
+        );
     }
 
     /// Address a real temp-dir file the way the SHIPPING code does.
@@ -7801,10 +8067,12 @@ mod mixed_tab_tests {
                     role: None,
                     attention: None,
                     questions: None,
+                    autopilot: None,
                     identity: None,
                     agent: None,
                     supervised: None,
                     held: false,
+                    holds: Vec::new(),
                 },
             )),
             focused_path: Vec::new(),
@@ -8205,8 +8473,6 @@ mod session_chrome_app_tests {
     fn chrome_refresh_never_waits_for_terminal_parser_lock() {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
-        app.config.tab_title_format = Some(crate::app_config::TitleFormat::Title);
-        app.note_title_activity(0);
         app.refresh_window_tabs(wid);
         let cached = app
             .session_chrome
@@ -8225,8 +8491,19 @@ mod session_chrome_app_tests {
             .unwrap()
             .tab_title_epochs
             .insert(0, live_epoch);
-        app.title_summaries
-            .set_test_activity(0, "Reviewing proxy boundary");
+        // A fact the chrome carries moves (the real `meta set` records it), so
+        // the next refresh misses the cache and must read the terminal leaf.
+        {
+            let ctx = &app.pool.get(0).expect("session 0").ctx;
+            ctx.meta
+                .lock()
+                .unwrap()
+                .set("description", Some("Reviewing proxy boundary".into()));
+            ctx.timeline.lock().unwrap().record(
+                "meta-change",
+                "field=description value=Reviewing%20proxy%20boundary".into(),
+            );
+        }
         let parser_guard = term.lock().unwrap();
 
         let started = Instant::now();
@@ -8253,7 +8530,7 @@ mod session_chrome_app_tests {
         assert!(app.session_chrome_retry.contains(&0));
         assert!(
             !app.windows[&wid].tab_title_epochs.contains_key(&0),
-            "activity-only contention must force the retry past the title-epoch gate"
+            "fact-only contention must force the retry past the title-epoch gate"
         );
 
         drop(parser_guard);
@@ -8266,7 +8543,7 @@ mod session_chrome_app_tests {
                 .tooltip
                 .as_deref()
                 .is_some_and(|tooltip| tooltip.contains("Reviewing proxy boundary")),
-            "retry recomposes activity-only chrome after parser contention"
+            "retry recomposes the moved chrome after parser contention"
         );
     }
 
@@ -9485,6 +9762,251 @@ mod connected_spawn_tests {
             assert_eq!(row.dst, origin);
         }
     }
+
+    /// The booked origin must still be live and in the booked host when the
+    /// worker returns, before its newborn is installed or gains any authority.
+    #[cfg(unix)]
+    #[test]
+    fn a_connected_tab_rechecks_its_origin_before_installing() {
+        use crate::tab_spawn::{SpawnAdmission, TabSpawned};
+        use std::{cell::RefCell, rc::Rc};
+        for kind in [
+            ConnectedSpawnKind::Controlled,
+            ConnectedSpawnKind::Controller,
+        ] {
+            for change in ["exited", "removed", "unhosted", "unchanged"] {
+                let mut app = App::headless_for_test();
+                let origin = session0_sid(&app);
+                let (local, host) = app
+                    .connected_spawn_precheck(ConnectedSpawnPlace::Tab, &origin)
+                    .unwrap();
+                let host = host.unwrap();
+                let original = app
+                    .store
+                    .read()
+                    .unwrap()
+                    .by_sid(&origin)
+                    .unwrap()
+                    .ctx
+                    .clone();
+                let heard = Rc::new(RefCell::new(None));
+                let answer = Rc::clone(&heard);
+                let then = App::connected_landing(
+                    kind,
+                    origin.clone(),
+                    "test",
+                    Box::new(move |_, result| {
+                        *answer.borrow_mut() = Some(result);
+                    }),
+                );
+                let id = crate::tab_spawn::tests::book_admitted(
+                    &mut app,
+                    host,
+                    SpawnAdmission::Connected {
+                        origin: origin.clone(),
+                        local,
+                    },
+                    then,
+                );
+                match change {
+                    "exited" => {
+                        app.store
+                            .write()
+                            .unwrap()
+                            .set_state(local, session_store::SessionState::Exited);
+                    }
+                    "removed" => app.retire_session_registration(local),
+                    "unhosted" => {
+                        app.windows.get_mut(&host).unwrap().tab_set =
+                            crate::tab_model::TabSet::default();
+                    }
+                    _ => {}
+                }
+                let session = crate::stub_session(id);
+                let newborn = session.ctx.self_id.clone();
+                let newborn_ctx = session.ctx.clone();
+                let landed = app.install_spawned_tab(TabSpawned {
+                    id,
+                    window: host,
+                    session: Ok(session),
+                    reader_gate: None,
+                });
+                if change == "unchanged" {
+                    assert!(landed);
+                    assert_eq!(*heard.borrow(), Some(Ok(newborn.as_str().to_string())));
+                    let edge_ctx = if matches!(kind, ConnectedSpawnKind::Controlled) {
+                        &newborn_ctx
+                    } else {
+                        &original
+                    };
+                    assert_eq!(edge_ctx.edges.lock().unwrap().edges().len(), 3);
+                } else {
+                    assert!(
+                        !landed,
+                        "{kind:?} origin {change}: no newborn may be installed"
+                    );
+                    assert!(heard.borrow().as_ref().unwrap().is_err());
+                    assert!(app.store.read().unwrap().by_sid(&newborn).is_none());
+                    assert!(app.pool.get(id).is_none());
+                    assert!(original.edges.lock().unwrap().edges().is_empty());
+                    assert!(newborn_ctx.edges.lock().unwrap().edges().is_empty());
+                }
+            }
+        }
+    }
+
+    /// A connected WINDOW spawned off the loop is made, and connected, as its
+    /// session lands, while its origin lives: a controlled window's first
+    /// session is registered as the origin's child, and the caller hears its
+    /// sid. The new window need not host the origin (a tab must), so the
+    /// landing asks only that the origin still be the one booked and not
+    /// exited; one that exited or went is refused before any window is made.
+    #[cfg(unix)]
+    #[test]
+    fn a_connected_window_lands_connected_only_while_its_origin_lives() {
+        use crate::tab_spawn::{SpawnAdmission, TabSpawned};
+        use std::{cell::RefCell, rc::Rc};
+        for kind in [
+            ConnectedSpawnKind::Controlled,
+            ConnectedSpawnKind::Controller,
+        ] {
+            for change in ["exited", "removed", "unchanged"] {
+                let mut app = App::headless_for_test();
+                let origin = session0_sid(&app);
+                let (local, _) = app
+                    .connected_spawn_precheck(ConnectedSpawnPlace::Tab, &origin)
+                    .unwrap();
+                let windows = app.windows.len();
+                let heard = Rc::new(RefCell::new(None));
+                let answer = Rc::clone(&heard);
+                let then = App::connected_landing(
+                    kind,
+                    origin.clone(),
+                    "test",
+                    Box::new(move |_, result| {
+                        *answer.borrow_mut() = Some(result);
+                    }),
+                );
+                let lineage =
+                    matches!(kind, ConnectedSpawnKind::Controlled).then(|| origin.clone());
+                let (id, wid) = crate::tab_spawn::test_support::book_window(
+                    &mut app,
+                    lineage,
+                    SpawnAdmission::Connected {
+                        origin: origin.clone(),
+                        local,
+                    },
+                    then,
+                );
+                match change {
+                    "exited" => {
+                        app.store
+                            .write()
+                            .unwrap()
+                            .set_state(local, session_store::SessionState::Exited);
+                    }
+                    "removed" => app.retire_session_registration(local),
+                    _ => {}
+                }
+                let (session, _pty) = crate::tab_spawn::tests::registered_piped_session(id);
+                let newborn = session.ctx.self_id.clone();
+                let landed = app.install_spawned_tab(TabSpawned {
+                    id,
+                    window: wid,
+                    session: Ok(session),
+                    reader_gate: None,
+                });
+                if change == "unchanged" {
+                    assert!(landed, "{kind:?}: the window lands");
+                    assert_eq!(app.frontmost_window, Some(wid));
+                    assert_eq!(app.focused_session_id(wid), Some(id));
+                    assert_eq!(*heard.borrow(), Some(Ok(newborn.as_str().to_string())));
+                    let store = app.store.read().unwrap();
+                    let parent = store.by_sid(&newborn).unwrap().parent.clone();
+                    let expected =
+                        matches!(kind, ConnectedSpawnKind::Controlled).then(|| origin.clone());
+                    assert_eq!(parent, expected, "{kind:?}: the newborn's lineage");
+                    let dst = match kind {
+                        ConnectedSpawnKind::Controlled => &newborn,
+                        ConnectedSpawnKind::Controller => &origin,
+                    };
+                    let edges = store.by_sid(dst).unwrap().ctx.edges.lock().unwrap().edges();
+                    assert_eq!(edges.len(), 3, "{kind:?}: both = pull + push = 3 ops");
+                } else {
+                    assert!(!landed, "{kind:?} origin {change}: no window may be made");
+                    assert!(heard.borrow().as_ref().unwrap().is_err());
+                    assert_eq!(app.windows.len(), windows);
+                    assert!(!app.windows.contains_key(&wid));
+                    assert!(app.store.read().unwrap().by_sid(&newborn).is_none());
+                    assert!(app.pool.get(id).is_none());
+                }
+            }
+        }
+    }
+
+    /// A connected TAB spawned off the loop is connected as it lands, under the
+    /// sid it was spawned with: the controller newborn drives its origin, and
+    /// the caller hears that sid. A tab that never lands mints nothing and the
+    /// caller hears why.
+    #[test]
+    fn a_connected_tab_is_connected_as_it_lands() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let mut app = App::headless_for_test();
+        let origin = session0_sid(&app);
+        let heard: Rc<RefCell<Vec<Result<String, String>>>> = Rc::default();
+        let tell =
+            |heard: &Rc<RefCell<Vec<Result<String, String>>>>| -> crate::tab_spawn::SpawnDone {
+                let heard = Rc::clone(heard);
+                Box::new(move |_, spawned| heard.borrow_mut().push(spawned))
+            };
+        let then = App::connected_landing(
+            ConnectedSpawnKind::Controller,
+            origin.clone(),
+            "test",
+            tell(&heard),
+        );
+        let id = crate::tab_spawn::test_support::book(&mut app, WindowId(0), then);
+        let session = crate::stub_session(id);
+        let newborn = session.ctx.self_id.clone();
+        assert!(app.install_spawned_tab(crate::tab_spawn::TabSpawned {
+            id,
+            window: WindowId(0),
+            session: Ok(session),
+            reader_gate: None,
+        }));
+        let rows = {
+            let ctx = {
+                let g = app.store.read().unwrap();
+                g.by_sid(&origin).unwrap().ctx.clone()
+            };
+            let edges = ctx.edges.lock().unwrap();
+            edges.edges()
+        };
+        assert_eq!(rows.len(), 3, "both = pull + push = 3 ops: {rows:?}");
+        assert!(
+            rows.iter()
+                .all(|row| row.src == newborn && row.dst == origin),
+            "the newborn supervises the origin: {rows:?}"
+        );
+
+        let then =
+            App::connected_landing(ConnectedSpawnKind::Controller, origin, "test", tell(&heard));
+        let id = crate::tab_spawn::test_support::book(&mut app, WindowId(0), then);
+        assert!(!app.install_spawned_tab(crate::tab_spawn::TabSpawned {
+            id,
+            window: WindowId(0),
+            session: Err(std::io::Error::other("exec refused")),
+            reader_gate: None,
+        }));
+        assert_eq!(
+            *heard.borrow(),
+            [
+                Ok(newborn.as_str().to_string()),
+                Err("exec refused".to_string())
+            ]
+        );
+    }
 }
 
 #[cfg(test)]
@@ -10392,12 +10914,10 @@ mod exit_attribution_tests {
 /// enters: resolve the route, then run the layout preparation `redraw_window`
 /// performs with it.
 ///
-/// The freeze itself was a RELEASE-ONLY state — `PaneTree::close_pane` carried
-/// its leaf removal inside a `debug_assert_eq!`, whose argument a shipped build
-/// compiles away — so these run in both profiles on purpose: under
-/// `cargo test --release` they are the direct regression test for that elision,
-/// and under a debug run they hold the surrounding invariant (both trees shrink,
-/// every leaf resolves, the route survives) that let the elision be fatal.
+/// The freeze itself was a release-only state (`PaneTree::close_pane` carried
+/// its leaf removal inside a `debug_assert_eq!`, which a shipped build compiles
+/// away); these hold the invariant that made the elision fatal: both trees
+/// shrink, every leaf resolves, the route survives.
 #[cfg(test)]
 mod pane_close_render_seam_tests {
     use super::*;
@@ -10801,11 +11321,11 @@ mod shell_start_exit_tests {
     /// the spawn recorded at `at`, well inside [`SHELL_START_WINDOW`]. A
     /// scenario, not a reading: stamped from the clock after the stub ran, it
     /// measured how long a loaded machine took to spawn and exit `/bin/sh`,
-    /// and under the merge gate's load (and at background QoS beside 72
-    /// spinners, 3 to 5 of 12 per run) that passed the then-2 s window, so the
-    /// shells these tests say failed at start were judged late and their
-    /// windows closed ("nothing closes: [WindowId(1)]"). The one test about
-    /// a late exit stamps its own ([`a_shell_that_fails_after_the_start_window_closes_as_today`]).
+    /// and there (and at background QoS beside 72 spinners, 3 to 5 of 12 per
+    /// run) that passed the then-2 s window, so the shells these tests say
+    /// failed at start were judged late and their windows closed ("nothing
+    /// closes: [WindowId(1)]"). The one test about a late exit stamps its own
+    /// ([`a_shell_that_fails_after_the_start_window_closes_as_today`]).
     fn eof_at_start(at: Instant) -> Option<Instant> {
         Some(at + Duration::from_millis(100))
     }

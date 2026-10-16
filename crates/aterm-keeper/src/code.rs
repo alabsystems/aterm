@@ -1,41 +1,28 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE KEEPER RUNS FROM ITS OWN COPY OF ITS CODE.
+//! The keeper runs from its own copy of its code. A window admits a keeper only when the keeper's
+//! code meets its designated requirement (§5.7), which macOS checks through the file the process
+//! was started from (`crate::identity`); an update moves the old bundle to `aterm.app.rollback`
+//! and then deletes it, so a keeper running from it would fail every window's check.
 //!
-//! A window admits a keeper only when the keeper's code meets the window's
-//! designated requirement (§5.7), and macOS checks a running process's code
-//! through the file it was started from (`crate::identity` has the
-//! measurement). The keeper is the one long-lived process an update leaves on
-//! the old build: the update moves that bundle to `aterm.app.rollback`, and the
-//! successor's boot-health confirmation deletes it. A keeper running from that
-//! file would then fail every window's check — each launch's boot HELLO, every
-//! link reconnect, the next successor at its Commit — so nothing would register
-//! and no later window could take a handed shell back.
+//! So `aterm keeper serve` copies its code into a directory only keepers use and re-executes
+//! from the copy ([`run_from_own_copy`]): the same pid, so launchd's job, its log and every
+//! descriptor stay. The copy is the whole app bundle (its signature seals the bundle) or a build
+//! tree's bare executable, an APFS clone per file. The keeper checks the copy as a window will
+//! ([`Identity::admits_code_at`]); a copy that cannot be made or does not pass is removed, and
+//! the keeper serves from where it started, saying so in its log.
 //!
-//! So `aterm keeper serve` first copies its own code into a directory only
-//! keepers use and re-executes itself from the copy ([`run_from_own_copy`]):
-//! the same pid, so launchd's job, its log and every descriptor stay. The copy
-//! is the whole app bundle (its signature seals the bundle) or a build tree's
-//! bare executable; on APFS each file is a clone, sharing its blocks with the
-//! original until an update deletes that. Before re-running, the keeper checks
-//! the copy as a window will check it ([`Identity::admits_code_at`]). A copy
-//! that cannot be made or does not pass is removed, and the keeper serves from
-//! where it started, as before, saying so in its log.
+//! Each copy is named by its keeper's pid and kernel start time, which `exec` keeps. A keeper
+//! cannot remove the copy it runs from while it serves (a window would check it against
+//! nothing), and launchd ends it with a SIGTERM it does not catch, so a copy can outlive its
+//! keeper: `serve` removes its own when it returns, and `aterm keeper stop` and each keeper start
+//! remove every copy whose keeper is gone ([`sweep`]). The directory is durable on purpose:
+//! `$TMPDIR` is swept of anything older than three days (`com.apple.bsd.dirhelper`), and a copy
+//! keeps its original's dates.
 //!
-//! Each copy is named by its keeper's pid and kernel start time, which `exec`
-//! keeps. A keeper cannot remove the copy it runs from while it serves (a
-//! window would check it against nothing), and launchd ends it with a SIGTERM
-//! it does not catch, so a copy can outlive its keeper. `serve` removes its own
-//! copy when it returns; `aterm keeper stop` waits for the keeper to end, then
-//! removes every copy whose keeper is gone ([`sweep`]), as each keeper start
-//! does (a crash or a logout leaves one until then). A live keeper's copy is
-//! never touched. The directory is durable on purpose: `$TMPDIR`, where the
-//! socket lives, is swept daily of anything older than three days
-//! (`com.apple.bsd.dirhelper`), and a copy keeps its original's dates.
-//!
-//! Only a keeper whose peers check its code (`--identity designated`, the
-//! default) copies itself: under the same-uid floor nothing reads it.
+//! Only a keeper whose peers check its code (`--identity designated`, the default) copies
+//! itself: under the same-uid floor nothing reads it.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -126,10 +113,8 @@ fn owner_of(name: &str) -> Option<(u32, Birth)> {
     let pid = parts.next()?.parse().ok()?;
     let seconds = parts.next()?.parse().ok()?;
     let micros = parts.next()?.parse().ok()?;
-    parts
-        .next()
-        .is_none()
-        .then_some((pid, Birth { seconds, micros }))
+    let birth = Birth { seconds, micros };
+    (parts.next().is_none() && copy_name(pid, birth) == name).then_some((pid, birth))
 }
 
 fn copy_own_code(exe: &Path, dir: &Path, identity: &Identity) -> Result<Copy, String> {
@@ -204,14 +189,12 @@ fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
     }
 }
 
-/// Become `copy`, with this process's arguments (its `argv[0]` too) and
-/// [`ORIGIN_ENV`] naming `origin`. Returns only the error of a failed `exec`.
+/// Become `copy`, with this process's arguments (its `argv[0]` too) and [`ORIGIN_ENV`] naming
+/// `origin`. Returns only the error of a failed `exec`, which (Darwin's `POSIX_SPAWN_SETEXEC`)
+/// leaves this process as it was.
 ///
-/// The copy keeps the pid and stdio (launchd's log) and nothing else: it
-/// runs before the keeper binds or holds anything, and a keeper is handed no
-/// descriptor beyond its stdio. Built by `spawnfd::command` (`grep_guard`
-/// B27): the copy holds this process's stdio and nothing else, and a failed
-/// `exec` (Darwin's `POSIX_SPAWN_SETEXEC`) leaves this process as it was.
+/// The copy keeps the pid and stdio (launchd's log) and nothing else: it runs before the keeper
+/// binds or holds anything.
 fn reexec(copy: &Path, origin: &Path) -> io::Error {
     let mut args = std::env::args_os();
     let mut cmd = aterm_uds::spawnfd::command(copy);
@@ -255,15 +238,25 @@ mod tests {
         assert_eq!(name, "512-1790000000-42");
         assert_eq!(owner_of(&name), Some((512, birth)));
         assert_eq!(owner_of(&format!("{name}.partial")), Some((512, birth)));
-        for other in ["", "512", "512-1", "512-1-2-3", "x-1-2", ".DS_Store"] {
+        for other in [
+            "",
+            "512",
+            "512-1",
+            "512-1-2-3",
+            "x-1-2",
+            ".DS_Store",
+            "+512-1-2",
+            "0512-1-2",
+            "512-01-2",
+            "512-1-02",
+            "512-1-+2.partial",
+        ] {
             assert_eq!(owner_of(other), None, "{other:?}");
         }
     }
 
-    /// THE SWEEP removes exactly the copies whose keeper is gone — a dead pid,
-    /// or a live pid that is another process than the one named (its start
-    /// time differs: the pid was reused), and a half-made copy of either —
-    /// and keeps a live keeper's copy and anything that is not a copy.
+    /// The sweep removes exactly the copies whose keeper is gone (a dead pid, a reused pid, a
+    /// half-made copy of either) and keeps a live keeper's copy and anything not a copy.
     #[test]
     fn the_sweep_removes_only_copies_whose_keeper_is_gone() {
         let dir = std::env::temp_dir().join(format!("akcopies-{}", std::process::id()));
@@ -292,10 +285,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A BUNDLE IS COPIED WHOLE and stays valid: an ad-hoc-signed bundle (its
-    /// Info.plist and a resource sealed, an argv0 alias as a symbolic link)
-    /// copied by `copy_tree` passes `codesign --verify --strict`. NEGATIVE
-    /// CONTROL: the same copy with its sealed resource changed does not.
+    /// An ad-hoc-signed bundle (Info.plist and a resource sealed, an argv0 alias as a symbolic
+    /// link) copied by `copy_tree` passes `codesign --verify --strict`. Negative control: the copy
+    /// with its sealed resource changed does not.
     #[cfg(target_vendor = "apple")]
     #[test]
     fn a_copied_bundle_keeps_its_signature() {
@@ -320,8 +312,7 @@ mod tests {
         std::fs::write(app.join("Contents").join("Resources").join("r.txt"), "r").expect("r");
         std::fs::copy("/usr/bin/true", macos.join("t")).expect("exe");
         std::os::unix::fs::symlink("t", macos.join("t-alias")).expect("alias");
-        // Each codesign under a hang detector: one that macOS stops answering
-        // mid-run fails this test in a minute instead of hanging the suite.
+        // Each codesign under a one-minute hang detector.
         let codesign = |args: &[&str], path: &Path| {
             aterm_uds::deadline::output_until(
                 aterm_uds::spawnfd::command("/usr/bin/codesign")

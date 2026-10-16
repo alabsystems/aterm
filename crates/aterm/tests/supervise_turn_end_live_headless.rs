@@ -76,9 +76,16 @@ fn boot(tag: &str) -> Option<Instance> {
 
 /// Boot one headless instance, 40 rows, `columns` wide ([`headless_boot::boot`]:
 /// `None` is an environment refusal; a product that cannot start fails the test).
+///
+/// Every boot gets a world of its own: the scratch root
+/// (`headless_boot::scratch_root`, `{prefix}-{pid}`) carries a per-process
+/// boot number after the tag, so two tests that pick the same tag never share
+/// one directory, socket and fake worker when libtest runs them side by side.
 fn boot_with(tag: &str, columns: &str) -> Option<Instance> {
+    static BOOTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = BOOTS.fetch_add(1, Ordering::Relaxed);
     headless_boot::boot(
-        &format!("atte{tag}"),
+        &format!("atte{tag}{n}"),
         &["--lines", "40", "--columns", columns],
     )
 }
@@ -148,7 +155,7 @@ fn awaited(inst: &Instance, sid: &str, re: &str) -> Result<(), String> {
 /// is when the watcher is armed and every change after, never one that came
 /// and went before: armed after the loop had already continued (a test
 /// process stalled for a few seconds between its `key enter` and its
-/// `await`, 2026-09-27 under a gate's load), it waited 20 s for a screen
+/// `await` on a loaded machine), it waited 20 s for a screen
 /// gone for good. The worker's own record is there whenever it is read.
 /// The stamps are the worker's too, so an interval measured from them (a
 /// back-off, a grace) is not shortened by a test that looked late.
@@ -507,12 +514,11 @@ const DONE: &str = "Fixed the parser; the suite is green.";
 /// renders a burst of input in one frame — in two frames, half the new text
 /// and then all of it: `❯ <text>` from the caret row (the terminal wraps it), the rows
 /// under it moved down past it, the cursor after the text. Never once per
-/// BYTE (2026-09-24): a redraw cost three spawns (`dd`, two `cat`s), so the
-/// 150-character continuation cost ~450 — 1.8-3.7 s at a concurrent gate's
-/// load of 20-43 — and outran the supervisor's read-back settle
-/// (`SETTLE_CAP`, 1.5 s): it read part of the text, pressed no Enter, and the
-/// decision screen never came. And no spawn INSIDE a frame (third audit,
-/// 2026-09-24): the caret row and the rows under it are read once per screen,
+/// BYTE: a redraw cost three spawns (`dd`, two `cat`s), so the 150-character
+/// continuation cost ~450 — 1.8-3.7 s at a load of 20-43 — and outran the
+/// supervisor's read-back settle (`SETTLE_CAP`, 1.5 s): it read part of the
+/// text, pressed no Enter, and the decision screen never came. And no spawn
+/// INSIDE a frame: the caret row and the rows under it are read once per screen,
 /// so both frames are written by builtins alone — a spawn stalled past the
 /// 500 ms settle between clearing the composer and drawing its text latched
 /// the supervisor on a half-drawn composer. The two frames are therefore back
@@ -879,7 +885,7 @@ impl Supervisor {
     /// first point seen"). `start` used to return once the thread was
     /// spawned, and the test typed `go` at once; a loop thread that took
     /// longer than the worker's 2 s turn to make its first read (the
-    /// suggestion test under a gate's load of 35-41, 2026-09-28) read the
+    /// suggestion test at a load of 35-41) read the
     /// goal end as its first point and waited 2 min, and the decision never
     /// came (`OK timeout`). Watching from the ready screen, the loop reads
     /// `go`'s busy turn, as a supervisor that was there when it began does.
@@ -971,43 +977,6 @@ fn evidence(inst: &Instance, out: &str) -> String {
         std::fs::read_to_string(inst.tmp.join("keys.log")).unwrap_or_default(),
         record(&inst.tmp.join("events")),
     )
-}
-
-/// Two tests of one file that boot with the same tag share ONE scratch world
-/// (`headless_boot::scratch_root` names it `atte{tag}-{pid}`): one directory,
-/// one socket, one fake worker, clobbered by each other whenever libtest runs
-/// them side by side. The merge gate runs this binary that way, so a repeated
-/// tag is a red run that reads as load (measured 2026-09-29: six of seventeen
-/// failed at RUST_TEST_THREADS=6 with four tags shared, none alone). A test that
-/// needs a world of its own takes a tag no other test in this file takes.
-#[test]
-fn no_two_tests_boot_with_the_same_tag() {
-    let src = include_str!("supervise_turn_end_live_headless.rs");
-    let mut seen: Vec<(String, usize)> = Vec::new();
-    for (n, line) in src.lines().enumerate() {
-        let line = line.trim_start();
-        let boots = line.starts_with("let Some(inst) = boot(")
-            || line.starts_with("let Some(inst) = boot_with(")
-            || line.starts_with("let tag =");
-        if !boots {
-            continue;
-        }
-        // Every one-letter string literal on the line is a tag (`"64"` and the
-        // like are columns, and longer).
-        for lit in line.split('"').skip(1).step_by(2) {
-            if lit.chars().count() == 1 {
-                seen.push((lit.to_string(), n + 1));
-            }
-        }
-    }
-    assert!(seen.len() >= 10, "the scan read no boots: {seen:?}");
-    for (i, (tag, at)) in seen.iter().enumerate() {
-        if let Some((_, first)) = seen[..i].iter().find(|(t, _)| t == tag) {
-            panic!(
-                "tag {tag:?} boots at line {first} and again at line {at}: a world of its own needs its own tag"
-            );
-        }
-    }
 }
 
 /// The screens the worker draws read as the policy needs them to: the goal

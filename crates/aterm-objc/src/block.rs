@@ -3,11 +3,8 @@
 
 //! The Objective-C block ABI, over `_NSConcreteStackBlock`.
 //!
-//! AppKit takes blocks for event monitors and completion handlers
-//! (`addLocalMonitorForEventsMatchingMask:handler:`,
-//! `beginSheetModalForWindow:completionHandler:`,
-//! `openApplicationAtURL:configuration:completionHandler:`), so this provides
-//! escaping `Fn` blocks of arity 0, 1 and 2.
+//! Escaping `Fn` blocks of arity 0, 1 and 2, for AppKit's event monitors and
+//! completion handlers.
 //!
 //! # Layout
 //!
@@ -348,10 +345,8 @@ macro_rules! block_ctor {
                 // borrow-check error.
                 let descriptor: &'static BlockDescriptor = &Desc::<F>::D;
 
-                // `_Block_copy` allocates with `malloc` (16-byte alignment), so
-                // a closure needing more would be misaligned in the heap block
-                // and every access through `&(*block).closure` would be UB.
-                // There is no way to ask for more; refuse at compile time.
+                // `_Block_copy`'s `malloc` aligns to 16 bytes; a closure needing
+                // more would be misaligned in the heap block (`S4`).
                 const {
                     assert!(
                         align_of::<Blk<F>>() <= 16,
@@ -387,12 +382,10 @@ block_ctor! {
     new0, invoke0
 }
 block_ctor! {
-    /// A one-argument block — `alert_keys.rs`'s event monitor and `lib.rs`'s
-    /// sheet completion handler.
+    /// A one-argument block, e.g. an event monitor or a sheet completion handler.
     new1, invoke1, a0: A0
 }
 block_ctor! {
-    /// A two-argument block — `app_launch_successor.rs`'s LaunchServices
-    /// completion handler.
+    /// A two-argument block, e.g. a LaunchServices completion handler.
     new2, invoke2, a0: A0, a1: A1
 }

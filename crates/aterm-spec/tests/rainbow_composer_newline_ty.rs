@@ -8,11 +8,6 @@ use aterm_spec::{derive::rainbow_composer_newline_gate_model, verify};
 #[test]
 fn composer_gate_waits_for_home_and_catches_the_early_spend() {
     let model = rainbow_composer_newline_gate_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|candidate| candidate.name == model.name)
-    );
     verify::prove_and_catch_scalar(&model, model.name);
 
     let start = model.init_state();

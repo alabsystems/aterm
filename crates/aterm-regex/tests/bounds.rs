@@ -31,7 +31,7 @@ const MAX_PATTERN_LEN: usize = 1024;
 /// A bound on work that must finish, where the regression it catches never
 /// does (an exponential search, four billion instructions emitted, a quadratic
 /// rescan of megabytes): a hang detector of a minute, never a latency budget
-/// (AGENTS.md). A merge gate runs these on a loaded machine.
+/// (AGENTS.md): a whole-workspace test run is a loaded machine.
 const HANG_DETECTOR: Duration = Duration::from_secs(60);
 
 fn bounded(pattern: &str) -> Result<Regex, Error> {

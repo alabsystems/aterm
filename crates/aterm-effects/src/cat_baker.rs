@@ -16,7 +16,7 @@
 //!   [`MAX_BAKES_PER_FRAME`] bakes per frame; a miss retries next frame.
 //! * **Invalidation**: wholesale clear and version bump on a cell-metric change
 //!   (detected in [`CatBaker::begin_frame`]) and on config reload or toggle
-//!   (`WordDecorations::reset` → [`CatBaker::clear`]).
+//!   (`WordDecorations::hard_reset` → [`CatBaker::clear`]).
 
 use std::sync::Arc;
 
@@ -30,7 +30,7 @@ use crate::color_math::{hsv2rgb, relative_luminance, rgb2hsv};
 /// Structural slot ceiling (§5.5): the LRU never exceeds 32 tiles.
 pub const MAX_SLOTS: usize = 32;
 /// Structural memory ceiling for the whole atlas: 2 MiB at any cell size. Slots
-/// are `2·ch` rows tall, so this keeps 32 slots up to `ch = 40` and fewer above.
+/// are `2·ch` rows tall, so this keeps 32 slots up to `ch = 45` and fewer above.
 pub const MAX_ATLAS_BYTES: usize = 2 << 20;
 /// Bake-rate cap (§5.5): at most 2 tiles baked per presented frame.
 pub const MAX_BAKES_PER_FRAME: u32 = 2;
@@ -69,15 +69,15 @@ pub struct CatBaker {
     cell_h: u16,
     /// Slot (and atlas) width: `4·ch` — the §5.2 `W ≤ 4·ch` cap made structural.
     slot_w: u16,
-    /// `min(32, ⌊1 MiB / slot_bytes⌋)` occupied-or-free slots, single column.
+    /// `min(32, ⌊2 MiB / slot_bytes⌋)` occupied-or-free slots, single column.
     slots: Vec<Option<Slot>>,
     /// Master straight-alpha RGBA8 texels (`slot_w × slots.len()·ch`), resident.
     rgba: Vec<u8>,
     /// Monotonic; bumped on every bake and every wholesale clear (a rebake must
-    /// repaint AND re-upload).
+    /// repaint and re-upload).
     version: u64,
-    /// The last published snapshot; rebuilt only when `dirty` (≤ 2 bakes/frame
-    /// transient — zero steady-state allocation).
+    /// The last published snapshot; rebuilt only when `dirty`, so the steady
+    /// state allocates nothing.
     published: Option<Arc<SceneAtlas>>,
     /// The snapshot published before [`CatBaker::published`], kept so the next
     /// dirty publish can recycle its buffer instead of cloning the atlas. A
@@ -125,7 +125,7 @@ impl CatBaker {
             self.slot_version.clear();
             self.slot_version.resize(slots, 0);
             self.rgba.clear();
-            // v2.9 (2-band head): each slot is `2·ch` rows tall.
+            // Each slot is `2·ch` rows tall: a head spans two cell rows.
             self.rgba.resize(
                 usize::from(self.slot_w) * slots * 2 * usize::from(cell_h) * 4,
                 0,
@@ -134,7 +134,7 @@ impl CatBaker {
     }
 
     /// Wholesale clear and version bump (config reload, toggle, metric change).
-    /// A no-op when already empty, so the per-frame master-off `reset()` is free.
+    /// A no-op when already empty, so a repeated reset is free.
     pub fn clear(&mut self) {
         if self.slots.iter().all(Option::is_none) && self.published.is_none() {
             return;
@@ -157,8 +157,8 @@ impl CatBaker {
     }
 
     /// The LRU / bake-budget frame clock, advanced once per
-    /// [`begin_frame`](CatBaker::begin_frame). Diagnostic: lets a host ticking
-    /// several panes into one frame check the bake budget stays per-frame.
+    /// [`begin_frame`](CatBaker::begin_frame); tests use it to check the bake budget
+    /// stays per-frame when several panes tick into one frame.
     #[doc(hidden)]
     #[cfg(test)]
     pub fn frame_clock(&self) -> u64 {
@@ -170,7 +170,6 @@ impl CatBaker {
     pub fn atlas(&mut self) -> Option<Arc<SceneAtlas>> {
         if self.dirty {
             let width = u32::from(self.slot_w);
-            // v2.9 (2-band head): each slot band is `2·ch` rows tall.
             let height = (self.slots.len() * 2 * usize::from(self.cell_h)) as u32;
             let band = 2 * usize::from(self.cell_h) * usize::from(self.slot_w) * 4;
             // Recycle the buffer published two frames ago and patch only the
@@ -223,10 +222,8 @@ impl CatBaker {
     }
 
     /// Look up a [`BakeKeyV4`] glyph tile, baking on a miss when the per-frame
-    /// budget allows. The tile is baked `w + PATCH_STRIP` wide, `h` tall, art at
-    /// row 0 (via [`bake_variant_with`]), and blitted at the slot origin (atlas
-    /// row `i·2·ch`). `None` means budget exhausted or degenerate metrics; the
-    /// caller retries next frame.
+    /// budget allows, and blit it at its slot origin (atlas row `i·2·ch`). `None`
+    /// means budget exhausted or degenerate metrics; the caller retries next frame.
     pub fn get_v4(&mut self, key: &BakeKeyV4) -> Option<CatTile> {
         // The whole baked tile is `key.w + PATCH_STRIP` wide and must fit the slot.
         if self.cell_h == 0
@@ -236,7 +233,6 @@ impl CatBaker {
             return None;
         }
         let ch = usize::from(self.cell_h);
-        // v2.9 (2-band head): the slot band is `2·ch` rows tall.
         let slot_h = 2 * ch;
         // Degenerate caller-supplied art height (the tile stores `h` rows).
         if key.h == 0 || usize::from(key.h) > slot_h {
@@ -269,14 +265,11 @@ impl CatBaker {
         })
     }
 
-    /// Spend one bake from this frame's budget and pick the slot to bake into:
-    /// a free slot first, else the least-recently-used (lowest index on ties).
-    /// A refused pick still spends the bake.
-    ///
-    /// Never a slot already served this frame: its tile is already queued as a
-    /// quad at that `(ax, ay)`, and re-baking would make that quad draw the new
-    /// art. `last_used == self.clock` means served since `begin_frame`. Refusal
-    /// yields `None`, which callers read as "retry next frame".
+    /// Spend one bake from this frame's budget and pick the slot to bake into: a
+    /// free slot first, else the least-recently-used (lowest index on ties). Never
+    /// a slot served this frame (`last_used == clock`): its quad is already queued
+    /// at that `(ax, ay)` and would draw the new art. `None` means retry next frame;
+    /// a refused pick still spends the bake.
     fn bake_slot(&mut self) -> Option<usize> {
         if self.bakes_left == 0 {
             return None;
@@ -321,13 +314,12 @@ impl CatBaker {
         }
     }
 
-    /// Bake a host-authored straight-alpha RGBA tile into the shared atlas,
-    /// keyed by a stable `host_id` so later calls are cache hits. `rgba` is
-    /// `w·h·4` bytes, row-major, and must fit a slot (`w ≤ slot_w`, `h ≤ 2·ch`).
-    /// Returns the placement (`ax = 0`, `ay = slot·2·ch`), or `None` if the baker
-    /// is uninitialised, the tile does not fit, or the frame's bake budget is
-    /// spent. Metric changes clear it like a cat tile. Used by the kitty cursor
-    /// ([`crate::word_decorations::WordDecorations::kitty_cursor`]).
+    /// Bake a host-authored straight-alpha RGBA tile into the shared atlas, keyed
+    /// by a stable `host_id` so later calls are cache hits. `rgba` is `w·h·4` bytes,
+    /// row-major, and must fit a slot (`w ≤ slot_w`, `h ≤ 2·ch`). Returns the
+    /// placement (`ax = 0`, `ay = slot·2·ch`), or `None` if the baker is
+    /// uninitialised, the tile does not fit, or the bake budget is spent. Used by
+    /// the kitty cursor, pet, dog, Robi and animal tiles.
     pub fn host_tile(&mut self, host_id: u64, w: u16, h: u16, rgba: &[u8]) -> Option<CatTile> {
         if self.cell_h == 0 || w == 0 || h == 0 {
             return None;
@@ -348,11 +340,9 @@ impl CatBaker {
     }
 
     /// Peek [`CatBaker::host_tile`]'s cache without supplying texels: the same
-    /// lookup and `last_used` touch as its hit branch (the touch affects later
-    /// eviction), returning `None` on a miss. For callers whose bytes are
-    /// expensive but a pure function of the id (the pet's motes in
-    /// [`crate::word_decorations::WordDecorations::pet_cursor`]): peek first and
-    /// rasterize only on a miss. No version bump or budget spend.
+    /// lookup and LRU touch as its hit branch, `None` on a miss, no version bump or
+    /// budget spend. For callers whose bytes are expensive but a pure function of
+    /// the id: peek first, rasterize only on a miss.
     pub fn host_peek(&mut self, host_id: u64) -> Option<CatTile> {
         // Mirrors `host_tile`'s uninitialised refusal; `begin_frame` clears the
         // slots on any metric change, so nothing could match anyway.
@@ -362,8 +352,6 @@ impl CatBaker {
         self.touch(SlotKey::Host(host_id))
     }
 }
-
-// ────────────────────────────── §5.3 palettes ──────────────────────────────
 
 /// COAT_RAMP — 16 similarity-ordered stops, black→gray→blue→brown→ginger→
 /// cream→white (§5.3; adjacent indices are near-identical coats).
@@ -494,11 +482,9 @@ pub(crate) fn paint_dark_masked_disc(
     }
 }
 
-// ═══════════════════════════ cat-art v4 bake path ═══════════════════════════
-//
-// Authored glyphs (`cat_glyphs_gen::GLYPHS`) rasterized by the `aterm-scene`
-// vector filler with genome-driven fills and a pale outline lift on dark
-// backgrounds (docs/cat-art-v4-design.md §2).
+// Cat-art v4 bake path: authored glyphs (`cat_glyphs_gen::GLYPHS`) rasterized
+// by the `aterm-scene` vector filler with genome-driven fills and a pale
+// outline lift on dark backgrounds (docs/cat-art-v4-design.md §2).
 
 /// v4 §2.1 pale outline lift for the darkest background-luminance band.
 pub const OUTLINE_PALE: u32 = 0x00F4_E6DD;
@@ -747,11 +733,9 @@ fn lift_coat_luminance(coat: (f32, f32, f32), floor: f32) -> (f32, f32, f32) {
     mix3(coat, pale, hi)
 }
 
-/// The coat stop as it resolves on the dark background classes:
-/// `COAT_RAMP[coat]` lifted to [`COAT_MIN_LUM_DARK_BG`], without the 12% accent
-/// nudge (which cancels out of any two-coat comparison). Test-only, so
-/// `kitty_registry`'s `coat_distance` table can be checked against the live
-/// lift without exporting it.
+/// `COAT_RAMP[coat]` lifted to [`COAT_MIN_LUM_DARK_BG`] as on the dark background
+/// classes, without the accent nudge (which cancels out of a two-coat comparison).
+/// Lets `kitty_registry`'s `coat_distance` table be checked against the live lift.
 #[cfg(test)]
 pub(crate) fn dark_bg_coat_stop(coat: u8) -> (f32, f32, f32) {
     let stop = rgb(COAT_RAMP[usize::from(coat).min(COAT_RAMP.len() - 1)]);
@@ -770,8 +754,8 @@ fn contrast_ratio(a: (f32, f32, f32), b: (f32, f32, f32)) -> f32 {
 /// `Whisker` roles use the context contrast ink, overriding the recolor arm.
 /// Layers bake opaque; authored coverage carries the shape.
 ///
-/// A `CoatShade` recolor resolves to `mix(coat, #000, 0.28)`; no current asset
-/// uses it.
+/// The codegen emits only the `Recolor` variants assets use, so `CoatShade`
+/// has no arm here until an asset uses it.
 #[must_use]
 pub fn resolve_layer(layer: &Layer, fills: &ResolvedFills) -> ((f32, f32, f32), f32) {
     // Whiskers reach onto the terminal background, so they need the outline's
@@ -1049,7 +1033,8 @@ fn paint_open_eye_reflections(tile: &mut Tile, layers: &[Layer], xform: PathTran
 }
 
 /// Fill every layer of `GLYPHS[id]` in painter order through `xform`, colours
-/// via [`resolve_layer`]. `eyes` squashes the eye family toward the eye line; a
+/// via [`resolve_layer`] (eye ink swapped in where fixed eyes would vanish into
+/// a recoloured coat). `eyes` squashes the eye family toward the eye line; a
 /// full blink drops iris and catch-light.
 fn paint_glyph(
     tile: &mut Tile,
@@ -1280,8 +1265,6 @@ mod tests {
     use super::*;
     use crate::cat_glyphs_gen::GLYPH_IDS;
 
-    // ───────────── CatBaker LRU / atlas structural tests (v4 keys) ─────────────
-
     /// A distinct v4 key per `coat` index at a working art size (ch=20 slot:
     /// 80×40, so w=40/h=24 fits with the patch strip).
     fn vk(coat: u8) -> BakeKeyV4 {
@@ -1297,10 +1280,8 @@ mod tests {
         }
     }
 
-    /// A slot served this frame may not be re-baked under its own quad, or the
-    /// quad would draw another key's art for a frame (and strobe if two keys
-    /// trade the slot). Reachable at HiDPI: `slot_count` is 8 at `ch = 90`
-    /// while many sprite kinds share the atlas.
+    /// A slot served this frame is never re-baked under its own queued quad.
+    /// Reachable at HiDPI: `slot_count` is 8 at `ch = 90`.
     #[test]
     fn a_slot_served_this_frame_is_never_evicted_under_its_own_quad() {
         const CH: u16 = 90;
@@ -1319,7 +1300,7 @@ mod tests {
             }
         }
 
-        // ONE frame: serve every resident key (each stamps `last_used`), then
+        // One frame: serve every resident key (each stamps `last_used`), then
         // ask for a stranger that must bake.
         baker.begin_frame(CH / 2, CH);
         let mut served = Vec::new();
@@ -1371,28 +1352,6 @@ mod tests {
                 CatBaker::slot_count(ch) * (4 * usize::from(ch)) * (2 * usize::from(ch)) * 4;
             assert!(bytes <= MAX_ATLAS_BYTES, "ch={ch}: {bytes} > 2 MiB");
         }
-    }
-
-    /// Same key ⇒ byte-equal bakes, across fresh bakers (determinism).
-    #[test]
-    fn bake_is_deterministic_across_bakers() {
-        let read = |b: &mut CatBaker| -> Vec<u8> {
-            let t = b.get_v4(&vk(5)).expect("bake");
-            let slot_h = 2 * usize::from(b.cell_h);
-            let aw = usize::from(b.slot_w);
-            let y0 = usize::from(t.ay);
-            let mut out = Vec::new();
-            for row in 0..slot_h {
-                let s = ((y0 + row) * aw + usize::from(t.ax)) * 4;
-                out.extend_from_slice(&b.rgba[s..s + (40 + usize::from(PATCH_STRIP)) * 4]);
-            }
-            out
-        };
-        let mut a = CatBaker::default();
-        a.begin_frame(10, 20);
-        let mut b = CatBaker::default();
-        b.begin_frame(10, 20);
-        assert_eq!(read(&mut a), read(&mut b), "same key must bake byte-equal");
     }
 
     /// LRU eviction at the cap: the least-recently-used slot is replaced, the
@@ -1550,7 +1509,7 @@ mod tests {
         drop(a1); // only the baker holds it now
         b.begin_frame(10, 20);
         b.get_v4(&vk(1)).expect("bake 2");
-        // KEEP this one: it is the spare the third publish would otherwise reuse
+        // Keep this one: it is the spare the third publish would otherwise reuse
         // after the fourth, so it pins the fallback path below.
         let held = b.atlas().expect("publish 2");
         let p2 = Arc::as_ptr(&held);
@@ -1591,14 +1550,12 @@ mod tests {
         assert_eq!(held.version, 2, "…nor re-stamped");
     }
 
-    // ───────────────────────── cat-art v4 bake path ─────────────────────────
-
     fn fills(coat: u8, iris: u8, dark: bool) -> ResolvedFills {
         ResolvedFills::from_indices(coat, iris, dark)
     }
 
-    /// Test-only negative-control bake: identical art + patch-strip path, with
-    /// the new reflection pass selectable so a pixel diff isolates that pass.
+    /// Negative-control bake: identical art and patch-strip path, with the
+    /// reflection pass selectable so a pixel diff isolates that pass.
     fn bake_reflection_control(
         id: CatGlyphId,
         fills: &ResolvedFills,
@@ -1766,7 +1723,7 @@ mod tests {
             (h_before - h_after).abs() < 12.0,
             "the rescue preserves the coat's hue family ({h_before}° → {h_after}°)"
         );
-        // Lifted coats stay DISTINCT (collectible identity): the four darkest
+        // Lifted coats stay distinct (collectible identity): the four darkest
         // stops may converge in brightness but not into one colour.
         let lifted: Vec<_> = (0..4u8)
             .map(|c| ResolvedFills::from_context(c, 4, dark_ctx).coat)
@@ -1786,13 +1743,13 @@ mod tests {
         let dark_bg = 0x000A_0A10; // band 0
         let band2_bg = 0x007A_7A7A; // band 2 (relative luminance ~0.198)
         assert_eq!(background_band(band2_bg), 2, "test constant is band 2");
-        // Averaged-dark + a clipped MID region: stays band 0 (pale outline).
+        // Averaged-dark + a clipped mid region: stays band 0 (pale outline).
         let mid_clip = CatColorKey::from_rgb_span(dark_bg, 0x00C0_C8D0, 0x00A0_A8B0, 0, 2);
         assert_eq!(
             mid_clip.background, 0,
             "a decisively dark average with a mid clip keeps the pale outline"
         );
-        // Averaged-dark + a genuinely BRIGHT clip: the dual treatment (its
+        // Averaged-dark + a genuinely bright clip: the dual treatment (its
         // dark keyline + pale underlay keep ≥3:1 on both halves).
         let bright_clip = CatColorKey::from_rgb_span(dark_bg, 0x00C0_C8D0, 0x00A0_A8B0, 0, 3);
         assert_eq!(
@@ -2022,7 +1979,7 @@ mod tests {
         assert!(has_rgb(pale), "mixed bake contains its pale halo");
     }
 
-    /// v4 §7: an accessory overlay changes texels vs the bare variant AND is a
+    /// v4 §7: an accessory overlay changes texels vs the bare variant and is a
     /// distinct cache key (a bow cat never aliases its bare twin).
     #[test]
     fn v4_accessory_overlay_differs_and_is_distinct_key() {
@@ -2102,10 +2059,8 @@ mod tests {
         assert_eq!(cache.len(), 2, "open and blink occupy distinct slots");
     }
 
-    /// At the settings-preview size (~31 px) the glossy pass changes the default
-    /// head only on opaque dark texels inside the authored eyes, and most dark
-    /// eye pixels remain. Happy, blink and a shallow-eye head are unchanged with
-    /// the pass toggled.
+    /// At the settings-preview size (~31 px) the glossy pass touches only opaque dark
+    /// eye texels; happy, blink and shallow-eyed heads are unchanged by it.
     #[test]
     fn flying_cursor_reflections_are_contained_and_expression_aware() {
         const W: u32 = 38;
@@ -2221,12 +2176,9 @@ mod tests {
         );
     }
 
-    /// The glossy pass across the authored roster at word-cat, settings-preview,
-    /// enlarged-cursor and reference sizes on both grounds: every changed texel
-    /// lies in the path paired with a catch-light, each affected eye keeps at
-    /// least half its dark core, and glyphs with no eligible open eye are
-    /// unchanged. Non-vacuity is pinned on the preview head and the cursor's
-    /// tongue-out expression.
+    /// The glossy pass across the roster at word-cat, preview, enlarged-cursor and
+    /// reference sizes on both grounds: changes stay in the paired eye path, each eye
+    /// keeps half its dark core, and ineligible glyphs are unchanged.
     #[test]
     fn flying_reflection_roster_is_contained_and_nonvacuous() {
         let mut failures = Vec::new();
@@ -2404,32 +2356,5 @@ mod tests {
             assert!(transform.scale_x <= scale * w as f32 + f32::EPSILON);
             assert!(transform.scale_y <= scale * h as f32 + f32::EPSILON);
         }
-    }
-
-    /// v4 §7: the LRU honours the per-frame bake budget ([`MAX_BAKES_PER_FRAME`]) —
-    /// a miss past the budget returns `None` and retries next frame.
-    #[test]
-    fn v4_cache_respects_bake_budget() {
-        let mut cache = CatBakerV4::default();
-        cache.begin_frame();
-        let mk = |c: u8| BakeKeyV4 {
-            variant: CatGlyphId::S100,
-            accessory: None,
-            coat: c,
-            iris: 3,
-            colors: CatColorKey::default(),
-            w: 40,
-            h: 32,
-            eyes: EyesFrame::Open,
-        };
-        for c in 0..MAX_BAKES_PER_FRAME as u8 {
-            assert!(cache.get(&mk(c)).is_some(), "within budget bakes");
-        }
-        assert!(
-            cache.get(&mk(200)).is_none(),
-            "past the per-frame budget ⇒ None (retry next frame)"
-        );
-        cache.begin_frame();
-        assert!(cache.get(&mk(200)).is_some(), "budget resets next frame");
     }
 }

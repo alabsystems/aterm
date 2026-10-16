@@ -1,22 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! aterm-render's integration suite: ONE test binary for every file listed
-//! below, instead of one linked and started per file.
+//! aterm-render's integration suite: one test binary for every file listed
+//! below. Each file keeps its path and its `#[test]`s, named `<file>::<test>`;
+//! a file gated on a platform or feature keeps its inner `#![cfg(..)]`, which
+//! gates the module.
 //!
-//! Each file keeps its path (every `tests/<file>.rs` citation still resolves)
-//! and its own `#[test]`s; a test is named `<file>::<test>` here. Files gated
-//! on a platform or a feature keep their inner `#![cfg(..)]`, which now gates
-//! the module.
-//!
-//! Sharing a process was checked, not assumed: no file below sets or removes an
-//! environment variable, installs a hook or an allocator, re-executes itself,
-//! reads the process's resident-set size, or reads a process-global counter a
-//! sibling's renderer would move. The files that do are their own `[[test]]`s
-//! in `Cargo.toml`, each with its reason.
+//! No file below sets or removes an environment variable, installs a hook or
+//! an allocator, re-executes itself, reads the process's resident-set size, or
+//! reads a process-global counter a sibling's renderer would move. Files that
+//! do are their own `[[test]]`s in `Cargo.toml`, each with its reason.
 //!
 //! `autotests = false`: a `tests/*.rs` file that is neither a `mod` line here
-//! nor a `[[test]]` of its own NEVER COMPILES. Run one file's tests with
+//! nor a `[[test]]` of its own never compiles. Run one file's tests with
 //! `targo --unverified test -p aterm-render --test render_suite -- <file>::`;
 //! an ignored perf gate with `-- <file>:: --ignored --nocapture` in `--release`,
 //! never a bare `--ignored`.
@@ -43,6 +39,7 @@ mod fallback_symbol_placement;
 mod fire_halo;
 mod font_chain_conservation;
 mod font_hinting_config;
+mod font_oracle;
 mod font_subpixel_config;
 mod free_composite;
 mod free_overlay;
@@ -68,6 +65,7 @@ mod procedural_seams;
 mod rain_render;
 mod raster_accuracy_survey;
 mod row_revision_oracle;
+mod rtl_runs;
 mod script_support_matrix;
 mod scroll_blit;
 mod scroll_flood;

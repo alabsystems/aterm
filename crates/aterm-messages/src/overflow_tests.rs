@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Test-only: the overflow row and rank (design ruling 259) — the band's
-//! overflow row never hides live progress and is ONE link that names what it
-//! hides; a record about a previous run ranks a class lower than its own; and
-//! the numbers on a progress row agree with each other.
+//! Test-only: the overflow row never hides live progress and is one link naming what it
+//! hides; a record about a previous run ranks a class lower; a progress row's numbers
+//! agree.
 
 use crate::center::MessageCenter;
 use crate::glass::{Hit, Links, Presentation, RowKind, job_stats};
@@ -46,10 +45,9 @@ fn download(title: &str, done: u64) -> Message {
         })
 }
 
-/// The five-kinds composition (band/95-five-kinds): a
-/// misspelled setting, the download at 45 %, the strain gauge, `aterm crashed
-/// last time` (a retrospective Error) and a dead screen-reader bridge (a
-/// standing Error). Returns the center and the download's id.
+/// The five-kinds composition (the GUI's `95-five-kinds-overflow` shot): a misspelled
+/// setting, the download at 45 %, the strain gauge, a retrospective Error and a standing
+/// Error. Returns the center and the download's id.
 fn five_kinds(now: Instant) -> (MessageCenter, MessageId) {
     let mut c = MessageCenter::new(MessageLog::empty(), now - ms(5000));
     let near = now - ms(4000);
@@ -92,10 +90,8 @@ fn five_kinds(now: Instant) -> (MessageCenter, MessageId) {
     (c, dl)
 }
 
-/// THE PROGRESS ROW IS NEVER THE ONE HIDDEN (ruling 259): five kinds at 60, 80
-/// and 120 columns keep the download on the glass with its fill, the dead
-/// screen-reader bridge (happening now) above it, and the overflow row a
-/// single link with no capsule.
+/// At 60, 80 and 120 columns the download stays on the glass with its fill, the standing
+/// Error above it, and the overflow row is a single link with no capsule.
 #[test]
 fn five_kinds_keep_the_download_on_the_glass_at_every_width() {
     let now = Instant::now() + Duration::from_secs(10);
@@ -127,9 +123,7 @@ fn five_kinds_keep_the_download_on_the_glass_at_every_width() {
     }
 }
 
-/// A PAST RUN RANKS A CLASS LOWER (ruling 259): `aterm crashed last time` is
-/// an Error about the previous run; beside a Warn about now it takes the row
-/// below it, where without the flag it would take the row above.
+/// A retrospective Error ranks below a Warn about now; without the flag it ranks above.
 #[test]
 fn a_retrospective_error_ranks_with_the_warnings() {
     let now = Instant::now();
@@ -160,10 +154,8 @@ fn a_retrospective_error_ranks_with_the_warnings() {
     }
 }
 
-/// THE OVERFLOW ROW NAMES THE PROGRESS IT HIDES (ruling 259): at two rows the
-/// glass keeps one download; the other, behind the overflow row, is named
-/// with its percent — `+ Downloading … 20% · 1 more ›` — and the row falls back
-/// to `N more ›` where that does not fit whole (60 columns). Strings pinned.
+/// The overflow row names a hidden download with its percent (`+ Downloading … 20% ·
+/// 1 more ›`) and falls back to `N more ›` where that does not fit whole.
 #[test]
 fn the_overflow_row_names_a_hidden_download_and_degrades_to_a_count() {
     let now = Instant::now();
@@ -211,7 +203,7 @@ fn the_overflow_row_names_a_hidden_download_and_degrades_to_a_count() {
         assert_eq!(p.rows[1].full_title, spoken, "{cols}");
         assert!(p.rows[1].capsules.is_empty(), "{cols}");
     }
-    // A 60-column band: the long form is 43 cells, it fits whole.
+    // At 60 columns the long form fits whole.
     let p = present(&c, 60);
     assert_eq!(
         p.rows[1].title.1,
@@ -220,7 +212,7 @@ fn the_overflow_row_names_a_hidden_download_and_degrades_to_a_count() {
     // With the links withheld there is no arrow.
     let p = c.presentation(120, &char_width, None, Links::Withheld);
     assert_eq!(p.rows[1].title.1, "Downloading Homebrew 20% \u{b7} 1 more");
-    // A longer hidden title at 60 columns does not fit whole: `N more ›`.
+    // A longer hidden title does not fit whole at 60 columns: `N more ›`.
     let mut c = MessageCenter::new(MessageLog::empty(), now);
     c.post(
         download("Downloading aterm v0.91.0", 33_300_000),
@@ -247,9 +239,7 @@ fn the_overflow_row_names_a_hidden_download_and_degrades_to_a_count() {
     assert_eq!(present(&c, 120).rows[1].glyph.1, '+');
 }
 
-/// ASKS STILL RANK FIRST (ruling 259): the reservation never pushes an ask off
-/// the glass — with one slot and an ask, the download waits (and the overflow
-/// row names it).
+/// The progress reservation never pushes an ask off the glass.
 #[test]
 fn an_ask_keeps_its_row_over_the_reserved_progress() {
     let now = Instant::now();
@@ -296,10 +286,8 @@ fn an_ask_keeps_its_row_over_the_reserved_progress() {
     assert_eq!(p.rows[2].title.1, "2 more \u{203a}");
 }
 
-/// THE NUMBERS AGREE (ruling 259): a count the row shows fills its bar — `3 of
-/// 4 tabs` is 75 %, whatever fill the reporter sent — a measured level keeps
-/// its gauge, a busy row stays a comet, and a size beside the percent says
-/// what it is part of (`33 of 74 MB`, never a bare `74 MB`).
+/// A count the row shows sets its fill whatever the reporter sent, a level keeps its
+/// gauge, a busy row stays a comet, and a size beside the percent names its total.
 #[test]
 fn a_rows_count_and_percent_agree_and_a_size_has_its_referent() {
     let counted = |fill: Option<u16>, stats: &str| {
@@ -318,10 +306,8 @@ fn a_rows_count_and_percent_agree_and_a_size_has_its_referent() {
         counted(Some(420), "3 of 10 programs \u{b7} ~3 GB"),
         Some(300)
     );
-    // With an amount the fill is measured finer than the count, and kept
-    // inside the count's span: 36 % beside `3 of 10 programs` stands, 45 %
-    // is held one permille short of the fourth program's 40 % (`39%`, never
-    // the next count's percent), 20 % is raised to 30 %.
+    // With an amount the fill is finer than the count but kept inside its span: 45 % is
+    // held one permille short of the fourth program's 40 %, 20 % is raised to 30 %.
     let measured = |fill: u16, stats: &str| {
         Meter {
             fill_permille: Some(fill),
@@ -391,11 +377,9 @@ fn a_rows_count_and_percent_agree_and_a_size_has_its_referent() {
     );
 }
 
-/// A CORRECTION CUT KEEPS THE FIX (ruling 261): `windw_padding →
-/// window_padding` whole where it fits, else the correction alone behind
-/// its arrow (ruling 306: a bare `window_padding` under `Misspelled
-/// setting` named the right spelling as the wrong one) — never the typo,
-/// and never a clipped key: too narrow for `→ window_padding`, nothing.
+/// A cut correction keeps the fix: whole where it fits, else `→ window_padding` (a bare key
+/// under `Misspelled setting` would read as the typo); never the typo or a clipped key, and
+/// nothing where the arrow and fix do not fit.
 #[test]
 fn a_cut_correction_keeps_the_fix_never_the_typo() {
     use crate::text::shape_detail;
@@ -407,11 +391,8 @@ fn a_cut_correction_keeps_the_fix_never_the_typo() {
     assert!(!shape_detail(excerpt, 10).contains("windw"));
 }
 
-/// A CARRIED ROW KEEPS WHAT IT WAS (ruling 263): across a seamless handoff
-/// `aterm crashed last time` stays retrospective — a class below the Warn
-/// about now, as it ranked in the parent — and a pass's `3 of 10 programs`
-/// measured at 36 % keeps 36 % though the carry ships no amount (never
-/// snapped back to the count's 30 %, a visible backward jump).
+/// Across a seamless handoff a retrospective row keeps its rank, and a measured fill
+/// keeps its value though the carry ships no amount (no backward snap to the count).
 #[test]
 fn a_carried_row_keeps_its_rank_and_its_measured_fill() {
     let now = Instant::now();

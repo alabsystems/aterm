@@ -5,8 +5,8 @@
 use super::*;
 use crate::{CellFlags, PackedColor};
 
-// Row's unsafe write paths stay sound when rows share a PageStore and
-// allocations span pages (exercised under Miri).
+// Row's unsafe write paths stay sound when rows share a PageStore and when a
+// resize reallocates (exercised under Miri).
 
 /// Rows sharing a PageStore are independent: writing one does not alias or
 /// invalidate another.
@@ -16,13 +16,11 @@ fn multiple_rows_independent_writes() {
     let fg = PackedColor::DEFAULT_FG;
     let bg = PackedColor::DEFAULT_BG;
 
-    // Allocate 10 rows from the same PageStore
     // SAFETY: Test-local `pages` outlives all rows in the vector.
     let mut rows: Vec<Row> = (0..10)
         .map(|_| unsafe { Row::new(80, &mut pages) })
         .collect();
 
-    // Write distinct content to each row using the unsafe write_char_styled path
     for (row_idx, row) in rows.iter_mut().enumerate() {
         let c = char::from(b'A' + row_idx as u8);
         for col in 0..80u16 {
@@ -30,7 +28,6 @@ fn multiple_rows_independent_writes() {
         }
     }
 
-    // Verify each row's content is intact (no cross-row corruption)
     for (row_idx, row) in rows.iter().enumerate() {
         let expected = char::from(b'A' + row_idx as u8);
         for col in 0..80u16 {
@@ -51,17 +48,14 @@ fn resize_preserves_content_across_reallocation() {
     let fg = PackedColor::DEFAULT_FG;
     let bg = PackedColor::DEFAULT_BG;
 
-    // Fill with styled content
     for col in 0..40u16 {
         row.write_char_styled(col, 'Z', fg, bg, CellFlags::BOLD);
     }
 
-    // Resize to larger — allocates new PageSlice, copies content
     // SAFETY: Test-local `pages` outlives `row` for the full scope.
     unsafe { row.resize(80, &mut pages) };
     assert_eq!(row.cols(), 80);
 
-    // Verify original content survived the reallocation
     for col in 0..40u16 {
         let cell = row.get(col).unwrap();
         assert_eq!(cell.char(), 'Z', "col {col} char lost after resize");
@@ -71,7 +65,6 @@ fn resize_preserves_content_across_reallocation() {
         );
     }
 
-    // Verify new cells are empty
     for col in 40..80u16 {
         assert!(
             row.get(col).unwrap().is_empty(),
@@ -88,8 +81,6 @@ fn write_wide_char_every_valid_position() {
     let fg = PackedColor::DEFAULT_FG;
     let bg = PackedColor::DEFAULT_BG;
 
-    // Write a wide char at every valid starting position (0..=18)
-    // Each write overwrites the previous, but we verify each one succeeds
     for col in 0..19u16 {
         row.clear();
         let ok = row.write_wide_char(col, '\u{4E2D}', fg, bg, CellFlags::empty());
@@ -102,7 +93,6 @@ fn write_wide_char_every_valid_position() {
         );
     }
 
-    // Col 19 (last col) should be rejected
     row.clear();
     let ok = row.write_wide_char(19, '\u{4E2D}', fg, bg, CellFlags::empty());
     assert!(!ok, "wide char at last col should be rejected");

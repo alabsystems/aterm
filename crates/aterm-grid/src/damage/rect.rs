@@ -23,7 +23,7 @@ impl LineDamageBounds {
     }
 }
 
-#[cfg(any(test, feature = "testing"))]
+#[cfg(any(test, debug_assertions))]
 impl LineDamageBounds {
     /// Check if this bounds is empty (no damage).
     #[inline]
@@ -61,7 +61,7 @@ impl LineDamageBounds {
 
 /// A rectangular damage region spanning several rows, batching adjacent
 /// damaged rows into fewer GPU draw calls.
-#[cfg(any(test, feature = "testing"))]
+#[cfg(any(test, debug_assertions))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DamageRect {
     /// Top row (inclusive).
@@ -74,7 +74,7 @@ pub struct DamageRect {
     pub right: u16,
 }
 
-#[cfg(any(test, feature = "testing"))]
+#[cfg(any(test, debug_assertions))]
 impl DamageRect {
     /// Create a new damage rectangle.
     #[inline]

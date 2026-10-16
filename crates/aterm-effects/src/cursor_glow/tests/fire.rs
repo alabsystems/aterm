@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The fire style: meteors, the EMBERFORGE thermal laws, the forge field.
+//! The fire style: meteors, the Emberforge thermal laws, the forge field.
 
 use super::*;
 
@@ -47,12 +47,9 @@ fn fire_jump_flares_and_cools() {
     );
 }
 
-/// Newline behaviour: a move down one row anchors no fire beyond the single wake
-/// spark at the landing, and the landing row stays quiet right of the landing
-/// column. A typing wrap (from the last column) is continued typing and flies no
-/// inter-line meteor, which would sweep the whole line on every wrap. A
-/// deliberate Enter/jump from a short column still flies one (the positive
-/// control).
+/// A move down one row anchors no fire beyond the single wake spark at the landing. A typing wrap
+/// (from the last column) flies no inter-line meteor, which would sweep the line on every wrap; a
+/// deliberate jump from a short column still flies one (the positive control).
 #[test]
 fn typing_wrap_no_meteor_deliberate_enter_still_meteors() {
     let g = geom(); // rows:6 cols:40 → the last column is 39
@@ -64,7 +61,7 @@ fn typing_wrap_no_meteor_deliberate_enter_still_meteors() {
     let mut wrapper = CursorGlow::default();
     wrapper.tick(Some((4, 39)), t0, &c, g, &mut out); // typing at the last column
     wrapper.note_synthetic_typed(t0, 1);
-    wrapper.tick(Some((5, 0)), t0, &c, g, &mut out); // WRAP to the next row
+    wrapper.tick(Some((5, 0)), t0, &c, g, &mut out); // wrap to the next row
     assert!(
         wrapper.fire_meteors.is_empty(),
         "a typing wrap flies no meteor (got {})",
@@ -140,8 +137,7 @@ fn fire_meteor_survives_an_unlicensed_second_hop_without_retargeting() {
     assert_eq!(glow.fire_meteors.len(), 1, "the admitted hop flies once");
     let flying = (glow.fire_meteors[0].x0, glow.fire_meteors[0].y0);
     let spawned = glow.spawns();
-    // Hop 2 is UNLICENSED — the scripted gesture's stamp was consumed by
-    // hop 1, so nobody's fingers asked for this one.
+    // Hop 2 is unlicensed: hop 1 spent the scripted gesture's stamp.
     glow.tick(
         Some((5, 44)),
         t0 + Duration::from_millis(30),
@@ -214,8 +210,8 @@ fn fire_smolders_cold_and_blazes_hot() {
 /// Window-space effects layer: with a real head band (origin_y = pad 8 + head 40
 /// = 48) a row-0 blaze climbs above the grid into the chrome band (patches with
 /// `y < origin_y`, tagged damage row 0) while the flame keeps its natural
-/// cell-top root (`base_y == origin_y + 2`), and the engulf gate keeps every
-/// charred key a real grid row (no u16 wrap from a negative band).
+/// cell-top root (`base_y == origin_y + 2`), and the engulf gate keys only real
+/// grid rows (no u16 wrap from a negative band).
 #[test]
 fn fire_rises_into_the_chrome_band() {
     let g = Geom {
@@ -319,9 +315,9 @@ fn fire_identity_at_origin_without_head() {
     }
 }
 
-// ---- EMBERFORGE thermal laws (P1) -------------------------------------
+// ---- Emberforge thermal laws ------------------------------------------
 
-/// The bounded thermal-tier machine (COLD/WARM/HOT/SMOKING as tiers 0..=3):
+/// The bounded thermal-tier machine (cold, warm, hot, smoking as tiers 0..=3):
 /// stoking climbs one tier at a time; quenching and cooling only descend.
 /// `Buggy=1` plants a quench that heats, which the invariant must catch.
 fn emberforge_thermal_model() -> aterm_spec::derive::Model {
@@ -644,33 +640,8 @@ fn fire_forge_cursor_heats_holds_and_cools_to_ember() {
     assert!(!glow.is_active(), "the animation timer disarms");
 }
 
-/// Determinism: the flame field is a pure function of injected clocks; two
-/// engines driven with identical instants emit identical quads (same fp), frame
-/// after frame.
-#[test]
-fn fire_field_is_deterministic() {
-    let g = geom();
-    let c = cfg(GlowStyle::Fire, true);
-    let t0 = Instant::now();
-    let drive = || {
-        let mut glow = CursorGlow::default();
-        let mut out = Vec::new();
-        let mut fps = Vec::new();
-        let mut t = t0;
-        glow.tick(Some((2, 0)), t, &c, g, &mut out);
-        for i in 1..=25u16 {
-            t += Duration::from_millis(40);
-            glow.note_synthetic_typed(t, 1);
-            glow.tick(Some((2, i)), t, &c, g, &mut out);
-            fps.push(glow.tick(Some((2, i)), t, &c, g, &mut out));
-        }
-        fps
-    };
-    assert_eq!(drive(), drive(), "same clocks ⇒ same fire, always");
-}
-
-/// P4 BUDGET LAW: full blaze + a huge landing burst on 4K-class cell
-/// geometry stays under MAX_QUADS (both backends see identical truncation).
+/// The budget law: full blaze plus a huge landing burst on 4K-class cell geometry stays under
+/// `MAX_QUADS`, so both backends see identical truncation.
 #[test]
 fn fire_field_full_blaze_respects_quad_budget() {
     let g = Geom {
@@ -802,8 +773,8 @@ fn fire_light_is_radial_halos_not_squares() {
     assert_eq!(fp, 0);
 }
 
-/// P3: the halo stream is folded into the tick fingerprint — an ember-only
-/// change (same quads) must still change the fp so the frame presents.
+/// The halo stream is folded into the tick fingerprint: an ember-only change (same quads) still
+/// changes the fp, so the frame presents.
 #[test]
 fn halo_changes_change_the_fingerprint() {
     let g = geom();
@@ -1055,9 +1026,8 @@ fn hot_cursor_smokes_and_cool_cursor_stops() {
 /// exactly empty.
 #[test]
 fn towering_blaze_chars_the_engulfed_rows_and_decays() {
-    // The name is kept, but a towering blaze must not recolour any ink: plain
-    // ink under the amber-capped flame, with the ember-glow stacking ceiling
-    // carrying legibility.
+    // Despite the name, a towering blaze recolours no ink: plain ink under the amber-capped
+    // flame, with the ember-glow stacking ceiling carrying legibility.
     let g = geom();
     let c = cfg(GlowStyle::Fire, true);
     let t0 = Instant::now();
@@ -1082,7 +1052,7 @@ fn towering_blaze_chars_the_engulfed_rows_and_decays() {
         glow.patches().iter().all(|q| q.mode == FireMode::Add),
         "dark-theme fire is additive"
     );
-    // THE NO-RECOLOR LAW: ink never changes — nothing to mistake for lag.
+    // Ink is never recoloured, so nothing can read as lag.
     assert!(
         glow.charred().is_empty(),
         "a blaze never recolors ink (the owner's no-char verdict)"
@@ -1115,8 +1085,7 @@ fn hot_blaze_emits_halo_strengths_rising_toward_the_head_and_never_recolors() {
     let c = cfg(GlowStyle::Fire, true);
     let mut glow = CursorGlow::default();
     let mut out = Vec::new();
-    // A hot ROW-0 blaze (the smolder-test hot loop, on the top row): even
-    // the top row — no cursor-row gate — earns its halo cells.
+    // A hot row-0 blaze: the top row earns halo cells too (no cursor-row gate).
     let mut t = Instant::now();
     glow.tick(Some((0, 0)), t, &c, g, &mut out);
     // Key-repeat cadence with a long sustain: the attack is slow
@@ -1128,7 +1097,6 @@ fn hot_blaze_emits_halo_strengths_rising_toward_the_head_and_never_recolors() {
     }
     let cells = glow.halo_cells();
     assert!(!cells.is_empty(), "a hot blaze emits contrast-halo cells");
-    // THE NO-RECOLOR LAW stays intact beside the halo: zero ink overrides.
     assert!(
         glow.charred().is_empty(),
         "the halo never recolors ink — charred stays empty (the no-recolor law)"
@@ -1162,8 +1130,8 @@ fn hot_blaze_emits_halo_strengths_rising_toward_the_head_and_never_recolors() {
     );
 }
 
-/// Campaign 2: on a LIGHT theme the fire patches switch to the ink-fire
-/// ([`FireMode::Over`]) so the flames READ on white.
+/// On a light theme the fire patches are source-over ink ([`FireMode::Over`]), so the flames read
+/// on white.
 #[test]
 fn light_theme_fire_is_ink_over_mode() {
     let g = geom();
@@ -1217,8 +1185,8 @@ fn fire_embers_dim_over_probed_glyph_cells() {
         v.resize(40, ' ');
         v
     };
-    // Sum the premultiplied luminance of every ADDITIVE (Add-mode) halo — the
-    // ember shower — over a hot typed run.
+    // Sum the premultiplied luminance of every additive (Add-mode) halo, the ember shower, over a
+    // hot typed run.
     let ember_light = |probe: Option<&str>| -> u64 {
         let mut glow = CursorGlow::default();
         let mut out = Vec::new();

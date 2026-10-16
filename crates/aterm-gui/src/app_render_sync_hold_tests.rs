@@ -44,9 +44,9 @@ fn terminal_observation(term: &Terminal) -> SyncObservation {
     )
 }
 
-/// SYNC-1 frame-hold state machine: arm on the rising edge, hold while unexpired,
-/// release on `2026l` or timeout, no re-hold within an episode, re-arm on a fresh
-/// episode. Covers the full lifecycle the present path drives.
+/// The frame-hold state machine: arm on the rising edge, hold while unexpired,
+/// release on `2026l` or timeout, no re-hold within an episode, re-arm on a
+/// fresh episode.
 #[test]
 fn sync_frame_hold_state_machine() {
     let t0 = Instant::now();
@@ -67,8 +67,8 @@ fn sync_frame_hold_state_machine() {
         "rising edge arms at now+timeout, holds, records end_seq"
     );
 
-    // Sustained hold (active, not rising, unexpired, counter unmoved): keep the
-    // Same deadline, hold.
+    // Sustained hold (active, not rising, unexpired, counter unmoved): the same
+    // deadline, held.
     assert_eq!(
         sync_frame_hold(
             observation(true, 7, false),
@@ -149,9 +149,9 @@ fn closed_bracket_presents_even_while_level_stays_true() {
         sync_frame_hold(observation(true, 0, false), false, None, 0, d(0), timeout);
     assert!(hold && armed == Some(d(150)) && seq == 0);
 
-    // Frame 1 (16 ms later): bracket #1 CLOSED and bracket #2 opened inside one
-    // reader batch — the level still samples true, but the counter advanced.
-    // The completed frame must PRESENT, with a fresh deadline armed for #2.
+    // Frame 1 (16 ms later): bracket #1 closed and bracket #2 opened inside one
+    // reader batch; the level still samples true, but the counter advanced.
+    // The completed frame presents, with a fresh deadline armed for #2.
     let (armed, hold, seq) = sync_frame_hold(
         observation(true, 1, false),
         true,
@@ -195,11 +195,11 @@ fn closed_bracket_presents_even_while_level_stays_true() {
     assert!(!hold && seq == 2);
 }
 
-/// Tier-1 conformance for `sync_reopen_visibility_model`: drive the real
-/// parser-owned episode bit and the shipping GUI hold decision through the
-/// close/reopen race, then project each sampled state onto the derived
-/// model. The final arm runs the historical close-sequence-only mutant
-/// against the same real terminal observation as a non-vacuity control.
+/// `sync_reopen_visibility_model` conformance: the real parser-owned episode
+/// bit and the shipping GUI hold decision driven through the close/reopen
+/// race, each sampled state projected onto the derived model. A level-sampled
+/// hold and a close-sequence-only rule on the same observations are the
+/// negative controls.
 #[test]
 fn sync_reopen_visibility_model_conforms_to_terminal_and_gui_hold() {
     let model = aterm_spec::derive::sync_reopen_visibility_model();
@@ -371,9 +371,9 @@ fn sync_reopen_visibility_model_conforms_to_terminal_and_gui_hold() {
         reopened_closed["presented_generation"] as u64
     );
 
-    // Negative control: race close+reopen+write before the next sample. The
-    // old close-sequence-only rule released because the counter advanced;
-    // the shipping decision also reads the real dirty bit and holds.
+    // Negative control: race close+reopen+write before the next sample. A
+    // close-sequence-only rule releases because the counter advanced; the
+    // shipping decision also reads the dirty bit and holds.
     let mut raced = terminal_without_force_clear();
     raced.process(b"\x1b[?2026hold-frame");
     let (raced_armed, raced_initial_hold, raced_armed_end_seq) =
@@ -388,9 +388,9 @@ fn sync_reopen_visibility_model_conforms_to_terminal_and_gui_hold() {
         d(80),
         timeout,
     );
-    // The dirty hold arms a FRESH deadline — the freeze valve: a held pane
-    // with no deadline never gets its about_to_wait wake — and carries the
-    // episode's completed generation forward.
+    // The dirty hold arms a fresh deadline (a held pane with no deadline
+    // never gets its about_to_wait wake) and carries the episode's completed
+    // generation forward.
     assert_eq!(
         (raced_deadline, raced_seq),
         (Some(d(80) + timeout), raced.sync_end_seq()),
@@ -454,8 +454,8 @@ fn composed_hold_releases_only_after_every_real_pane_releases() {
     let model_a_closed = model.successors("CloseOnlyA", &model_held)[0].clone();
     assert!(model.check_invariant("NoPartialCompositePresent", &model_a_closed));
 
-    // Negative aggregate control: "any close" would release here, exactly
-    // the old scalar-counter bug. The shipping per-pane fold says held.
+    // Negative control: an "any close" aggregate would release here; the
+    // per-pane fold holds.
     let flawed_aggregate_holds = false;
     assert_ne!(held, flawed_aggregate_holds);
 

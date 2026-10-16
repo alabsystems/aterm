@@ -1,0 +1,795 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+//! The foreground handback, live under a real shell's job control.
+//!
+//! A program killed while it held the terminal leaves its modes armed under the shell that
+//! takes the terminal back (Claude Code's: the alternate screen, kitty keyboard flags,
+//! modifyOtherKeys, any-motion SGR mouse, focus reports, bracketed paste, 2026 and a hidden
+//! cursor). aterm cuts the PTY stream where `tcgetpgrp(master)` changes and hands the terminal
+//! back there. These tests type jobs into zsh, bash and fish in a private headless instance
+//! and read `modes`, `who` and `timeline`'s `modes-restored` events:
+//!
+//! * a killed holder's modes are handed back, once, and 1007 (alternate scroll, on by
+//!   default) is never named;
+//! * display modes a one-shot sets on purpose (`tput rmam`, `tput civis`, `tput smcup; cmd`)
+//!   are kept and record nothing; an input mode a one-shot sets is handed back at its exit
+//!   (the documented residual: nothing tells a clean exit from a kill);
+//! * a stopped job keeps its modes (Ctrl-Z, `fg`) until it dies, also as a pipeline whose
+//!   group leader has exited, and one `bg`'d beside a command;
+//! * a live holder that hands the terminal to its own child (gdb's shape) keeps its modes,
+//!   and its death is one handback;
+//! * a one-shot the reader never saw while it held the terminal loses its own handback and
+//!   only its own: the next job's death is handed back.
+//!
+//! Every job is a Rust program ([`Job`], played by this binary through `support/standin.rs`)
+//! answered where its timing matters: it asks the cursor position and goes on only once aterm
+//! answered, so every byte it wrote was read while its own group held the terminal.
+//!
+//! Every key goes to the holder `who`'s `fgpgid=` names, never one guessed from a quiet screen:
+//! zsh's `fg` prints the job line before it `tcsetpgrp`s the job, so a key sent in that gap
+//! reaches zsh. A marker a job prints is never in the line typed to start it, and a command's
+//! end is the output of a builtin typed after it ([`Shell::settle`]).
+//!
+//! macOS only: the bash test expects /bin/bash 3.2, which has no bracketed paste.
+//! `-e <shell>` runs without shell integration.
+
+use std::collections::BTreeMap;
+use std::io::Write as _;
+use std::path::Path;
+use std::time::Duration;
+
+use aterm_spec::wait::MUST_HAPPEN;
+
+use crate::headless_boot::{self, Instance};
+use crate::live_ctl::Ctl;
+use crate::standin;
+
+/// This lane's stand-in entry (see `support/standin.rs`).
+const ENTRY: &str = "foreground_handback_live_headless::standin";
+
+const ZSH: &[&str] = &["/bin/zsh", "-f", "-i"];
+const BASH: &[&str] = &["/bin/bash", "--norc", "--noprofile", "-i"];
+
+/// What a killed holder must leave: the host's values.
+const HANDED_BACK: &[(&str, &str)] = &[
+    ("alt_screen", "false"),
+    ("cursor_visible", "true"),
+    ("mouse_mode", "none"),
+    ("mouse_encoding", "x10"),
+    ("kitty_keyboard", "none"),
+    ("modify_other_keys", "0"),
+    ("focus_reporting", "false"),
+    ("sync_output", "false"),
+];
+
+/// The modes a killed Claude Code left armed.
+const INCIDENT_MODES: &[u8] =
+    b"\x1b[?1049h\x1b[?1003h\x1b[?1006h\x1b[>5u\x1b[>4;2m\x1b[?2004h\x1b[?1004h\x1b[?25l\x1b[?2026h";
+
+/// The modes an [`Job::Armed`] job arms before it prints its marker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Arm {
+    /// Any-motion mouse reporting (`?1003h`).
+    Mouse,
+    /// The alternate screen and any-motion mouse reporting.
+    AltMouse,
+}
+
+impl Arm {
+    fn bytes(self) -> &'static [u8] {
+        match self {
+            Arm::Mouse => b"\x1b[?1003h",
+            Arm::AltMouse => b"\x1b[?1049h\x1b[?1003h",
+        }
+    }
+
+    fn word(self) -> &'static str {
+        match self {
+            Arm::Mouse => "mouse",
+            Arm::AltMouse => "alt-mouse",
+        }
+    }
+}
+
+/// The programs this lane types into its shells.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Job {
+    /// A killed Claude Code: arm [`INCIDENT_MODES`], be answered, die by SIGKILL.
+    Incident,
+    /// Arm the modes, print `armed-<n>`, and live until a signal ends it
+    /// (30 s at most). SIGINT is at its default and unblocked whatever mask
+    /// the shell handed it: /bin/zsh 5.9 can leave SIGINT blocked in its own
+    /// mask after it takes the terminal back from a stopped job, and every
+    /// job it starts inherits the block.
+    Armed(Arm, u32),
+    /// Set mouse tracking (an input mode), be answered, print `answered`,
+    /// exit 0.
+    MouseOneShot,
+    /// Run `vim -u NONE -c q`, be answered, print `answered`, exit 0.
+    Vim,
+    /// gdb's shape: arm the alternate screen, mouse and a hidden cursor, fork
+    /// a child into its own group and hand it the terminal, take the terminal
+    /// back once the child exits (`parent-back`), then die by SIGKILL once
+    /// the lane releases it with a line on its stdin.
+    Holder,
+}
+
+impl Job {
+    fn spec(self) -> String {
+        match self {
+            Job::Incident => "incident".into(),
+            Job::Armed(arm, n) => format!("job:{}:{n}", arm.word()),
+            Job::MouseOneShot => "one-shot".into(),
+            Job::Vim => "vim".into(),
+            Job::Holder => "holder".into(),
+        }
+    }
+
+    fn parse(spec: &str) -> Option<Self> {
+        Some(match spec {
+            "incident" => Job::Incident,
+            "one-shot" => Job::MouseOneShot,
+            "vim" => Job::Vim,
+            "holder" => Job::Holder,
+            _ => {
+                let rest = spec.strip_prefix("job:")?;
+                let (arm, n) = rest.split_once(':')?;
+                let arm = [Arm::Mouse, Arm::AltMouse]
+                    .into_iter()
+                    .find(|a| a.word() == arm)?;
+                Job::Armed(arm, n.parse().ok()?)
+            }
+        })
+    }
+
+    /// The command line a shell runs it from.
+    fn line(self) -> String {
+        standin::shell_line(ENTRY, &self.spec())
+    }
+
+    /// Play the job in this process; never returns.
+    fn play(self) -> ! {
+        match self {
+            Job::Incident => {
+                standin::put(INCIDENT_MODES);
+                standin::answered();
+                kill_self()
+            }
+            Job::Armed(arm, n) => {
+                // SAFETY: the default disposition, then this thread's mask: a
+                // SIGINT sent to the job's group reaches this thread whatever
+                // the inherited mask of the others.
+                unsafe {
+                    libc::signal(libc::SIGINT, libc::SIG_DFL);
+                    let mut set: libc::sigset_t = std::mem::zeroed();
+                    libc::sigemptyset(&mut set);
+                    libc::sigaddset(&mut set, libc::SIGINT);
+                    libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+                }
+                standin::put(arm.bytes());
+                standin::put(format!("armed-{n}\n").as_bytes());
+                std::thread::sleep(Duration::from_secs(30));
+                standin::exit(0)
+            }
+            Job::MouseOneShot => {
+                standin::put(b"\x1b[?1000h");
+                standin::answered();
+                standin::put(b"answered\n");
+                standin::exit(0)
+            }
+            Job::Vim => {
+                #[expect(
+                    clippy::disallowed_types,
+                    reason = "test code: the stand-in job runs vim as a shell's job would"
+                )]
+                let _ = std::process::Command::new("vim")
+                    .args(["-u", "NONE", "-c", "q"])
+                    .status();
+                standin::answered();
+                standin::put(b"answered\n");
+                standin::exit(0)
+            }
+            Job::Holder => holder(),
+        }
+    }
+}
+
+/// End this process by SIGKILL, as a killed holder ends. The signal may land after `kill`
+/// returns (another thread can take it), so this thread waits for it.
+fn kill_self() -> ! {
+    // SAFETY: a signal to this process; SIGKILL cannot be caught.
+    unsafe {
+        libc::kill(libc::getpid(), libc::SIGKILL);
+    }
+    loop {
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+/// [`Job::Holder`]. The child is forked only once aterm has answered the
+/// holder, so the modes were read as the holder's; the child is answered
+/// before it exits, so aterm saw its group hold the terminal.
+fn holder() -> ! {
+    // SAFETY: SIGTTOU ignored, so the holder may take the terminal back from
+    // its child's group.
+    unsafe {
+        libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+    }
+    standin::put(b"\x1b[?1049h\x1b[?1003h\x1b[?1006h\x1b[?25l");
+    standin::answered();
+    // SAFETY: the child calls only async-signal-safe functions and `_exit`s.
+    let pid = unsafe { libc::fork() };
+    if pid == 0 {
+        // SAFETY: async-signal-safe calls on this process's own terminal.
+        unsafe {
+            libc::setpgid(0, 0);
+            libc::tcsetpgrp(0, libc::getpgrp());
+            let line = b"child-output\r\n";
+            libc::write(1, line.as_ptr().cast(), line.len());
+            standin::answered();
+            libc::_exit(0);
+        }
+    }
+    assert!(pid > 0, "fork: {}", std::io::Error::last_os_error());
+    // SAFETY: reap the child forked above, then take the terminal back.
+    unsafe {
+        let mut status = 0;
+        libc::waitpid(pid, &mut status, 0);
+        libc::tcsetpgrp(0, libc::getpgrp());
+    }
+    standin::put(b"parent-back\r\n");
+    // The release: a line on stdin. Two minutes is a backstop for a lane
+    // that never sends it, past which the holder dies all the same.
+    let mut fd = libc::pollfd {
+        fd: 0,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one valid `pollfd`, then a read into a live buffer.
+    unsafe {
+        if libc::poll(&mut fd, 1, 120_000) > 0 {
+            let mut buf = [0u8; 256];
+            libc::read(0, buf.as_mut_ptr().cast(), buf.len());
+        }
+    }
+    kill_self()
+}
+
+/// The stand-in entry: plays the [`Job`] named in [`standin::ENV`].
+#[test]
+#[ignore = "the jobs this lane types into its shells: the lane runs it as a program"]
+fn standin() {
+    let Some(spec) = standin::spec() else { return };
+    match Job::parse(&spec) {
+        Some(job) => job.play(),
+        None => {
+            standin::put(format!("unknown job: {spec}\r\n").as_bytes());
+            standin::exit(2)
+        }
+    }
+}
+
+/// Who should hold the terminal for the next key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Holder {
+    /// The shell's own group.
+    Shell,
+    /// Any other group: a job.
+    Job,
+}
+
+/// One shell in its own headless instance.
+struct Shell {
+    inst: Instance,
+    ctl: Ctl,
+    /// The shell's process group: the terminal's foreground group from its
+    /// spawn until it runs a job.
+    pgrp: i32,
+    settles: u32,
+}
+
+impl Shell {
+    /// Boot an instance whose only session is `argv`; an environment refusal
+    /// is COULD NOT RUN, never a pass ([`headless_boot::boot_or_refuse`]).
+    #[track_caller]
+    fn boot(tag: &str, argv: &[&str]) -> Self {
+        let inst = headless_boot::boot_or_refuse(
+            &format!("atfh{tag}"),
+            |_, cmd| {
+                cmd.arg("-e").args(argv);
+            },
+            |_| true,
+        );
+        let mut ctl = Ctl::connect(&inst.sock);
+        let pgrp = aterm_spec::wait::until_within(
+            MUST_HAPPEN,
+            "the instance to name its terminal's foreground group (`who` fgpgid=)",
+            || ctl.fg_pgrp(),
+        );
+        Self {
+            inst,
+            ctl,
+            pgrp,
+            settles: 0,
+        }
+    }
+
+    /// Wait (a hang detector) until `who` names `want` as the terminal's
+    /// holder; `what` names the step that waits.
+    #[track_caller]
+    fn await_holder(&mut self, want: Holder, what: &str) {
+        let shell = self.pgrp;
+        let mut last = None;
+        let held = aterm_spec::wait::within(MUST_HAPPEN, Duration::from_millis(10), || {
+            last = self.ctl.fg_pgrp();
+            match (want, last) {
+                (Holder::Shell, Some(g)) if g == shell => Some(()),
+                (Holder::Job, Some(g)) if g != shell => Some(()),
+                _ => None,
+            }
+        });
+        assert!(
+            held.is_some(),
+            "{what}: the {want:?} never held the terminal (fgpgid={last:?}, shell={shell}); \
+             processes:\n{}",
+            headless_boot::process_tree(&self.inst)
+        );
+    }
+
+    /// Type `line` into the shell and press Enter, once the shell holds the
+    /// terminal (a job holding it would read the line as its own input).
+    #[track_caller]
+    fn type_line(&mut self, line: &str) {
+        self.await_holder(Holder::Shell, &format!("before typing {line:?}"));
+        self.ctl.type_line(line);
+    }
+
+    /// Start `job` from the shell.
+    #[track_caller]
+    fn start(&mut self, job: Job) {
+        self.type_line(&job.line());
+    }
+
+    /// Ctrl+`letter` to the job, once a job holds the terminal.
+    #[track_caller]
+    fn job_ctrl(&mut self, letter: char, what: &str) {
+        self.await_holder(Holder::Job, what);
+        self.ctl.ok(&format!("ctrl {letter}"));
+    }
+
+    /// Return once the shell has run everything typed so far: a builtin (no
+    /// fork, so no foreground edge) prints a fresh marker, and the shell reads
+    /// that line only after the command before it is over, so every byte that
+    /// command wrote, and the edge at its end, is parsed by then.
+    #[track_caller]
+    fn settle(&mut self) {
+        self.settles += 1;
+        let n = self.settles;
+        self.type_line(&format!("printf '%s\\n' settled\"\"-{n}"));
+        self.ctl.expect_on_screen(&format!("settled-{n}"));
+    }
+
+    /// The `modes-restored` events so far.
+    fn handbacks(&mut self) -> Vec<String> {
+        self.ctl
+            .counted("timeline 500")
+            .1
+            .into_iter()
+            .filter(|l| l.split_whitespace().any(|t| t == "kind=modes-restored"))
+            .collect()
+    }
+
+    fn handback_count(&mut self) -> usize {
+        self.handbacks().len()
+    }
+
+    /// The modes now, as `(name, value)` pairs from `want`'s names, for
+    /// comparison with `want`.
+    fn modes_of(&mut self, want: &[(&str, &str)]) -> (BTreeMap<String, String>, bool) {
+        let modes = self.ctl.modes();
+        let all = want
+            .iter()
+            .all(|(k, v)| modes.get(*k).map(String::as_str) == Some(*v));
+        (modes, all)
+    }
+
+    /// Every `(mode, value)` in `want` holds now.
+    #[track_caller]
+    fn assert_modes(&mut self, what: &str, want: &[(&str, &str)]) {
+        let (modes, all) = self.modes_of(want);
+        assert!(all, "{what}: want {want:?}, got {modes:?}");
+    }
+
+    /// Wait (a hang detector) for every `(mode, value)` in `want`, for a mode
+    /// that lands after the notice a test waited on (zle re-arms bracketed
+    /// paste only when it draws its next prompt), then assert it.
+    #[track_caller]
+    fn await_modes(&mut self, what: &str, want: &[(&str, &str)]) {
+        let _ = aterm_spec::wait::within(MUST_HAPPEN, Duration::from_millis(20), || {
+            let (modes, all) = self.modes_of(want);
+            // A mode the reply does not name never converges: report it now.
+            let unnamed = want.iter().any(|(k, _)| !modes.contains_key(*k));
+            (all || unnamed).then_some(())
+        });
+        self.assert_modes(what, want);
+    }
+
+    /// The session holds `want` handbacks, and none of them reverted 1007:
+    /// alternate scroll is on by default and no job here touches it, so a
+    /// handback that names it reverted a mode nobody armed (`modes` does not
+    /// print 1007; the event's `reverted=` does).
+    #[track_caller]
+    fn assert_handbacks(&mut self, what: &str, want: usize) {
+        let events = self.handbacks();
+        assert_eq!(
+            events.len(),
+            want,
+            "{what}: modes-restored events:\n{}",
+            events.join("\n")
+        );
+        assert!(
+            events.iter().all(|e| !e.contains("alternate-scroll")),
+            "{what}: a handback reverted alternate-scroll:\n{}",
+            events.join("\n")
+        );
+    }
+
+    /// SIGSTOP or SIGCONT the instance itself.
+    fn signal_instance(&self, sig: libc::c_int) {
+        let pid = libc::pid_t::try_from(self.inst.child.id()).expect("a pid");
+        // SAFETY: a signal to the instance this test spawned and has not reaped.
+        assert_eq!(unsafe { libc::kill(pid, sig) }, 0, "signal the instance");
+    }
+}
+
+/// `name` as this process's `PATH` finds it.
+fn on_path(name: &str) -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|file| file.is_file())
+}
+
+/// [`HANDED_BACK`] plus bracketed paste as the shell itself leaves it.
+fn handed_back(bracketed_paste: &'static str) -> Vec<(&'static str, &'static str)> {
+    let mut want = HANDED_BACK.to_vec();
+    want.push(("bracketed_paste", bracketed_paste));
+    want
+}
+
+/// A FIFO at `path` held open read-write by the returned file, so a write
+/// to it waits for the reader the shell opens, never for this test.
+fn held_fifo(path: &Path) -> std::fs::File {
+    let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).expect("a C path");
+    // SAFETY: a valid NUL-terminated path.
+    assert_eq!(
+        unsafe { libc::mkfifo(c.as_ptr(), 0o600) },
+        0,
+        "mkfifo {}: {}",
+        path.display(),
+        std::io::Error::last_os_error()
+    );
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .expect("hold the FIFO read-write")
+}
+
+/// A killed holder under zsh: after `zsh: killed` the modes are back at the host's values,
+/// zle's own bracketed paste is on again, and the timeline holds exactly one handback, which
+/// keeps 1007. The gate re-arms after it: a one-shot's mouse is the next handback.
+#[test]
+fn zsh_hands_a_killed_holders_modes_back_once() {
+    let mut sh = Shell::boot("zi", ZSH);
+    sh.start(Job::Incident);
+    sh.ctl.expect_on_screen("zsh:.killed");
+    sh.await_modes("the incident is handed back", &handed_back("true"));
+    sh.assert_handbacks("exactly one handback", 1);
+
+    sh.start(Job::MouseOneShot);
+    sh.ctl.expect_on_screen("answered");
+    sh.settle();
+    sh.assert_modes(
+        "a one-shot after the incident is handed back",
+        &[("mouse_mode", "none")],
+    );
+    sh.assert_handbacks("the next job's exit is the next handback", 2);
+}
+
+/// One-shots that set a display mode on purpose keep it after they exit, and
+/// `tput smcup; cmd` runs `cmd` on the alternate screen: nothing is recorded.
+#[test]
+fn zsh_keeps_the_display_modes_a_one_shot_sets() {
+    let mut sh = Shell::boot("zd", ZSH);
+    sh.type_line("tput rmam");
+    sh.settle();
+    sh.assert_modes("tput rmam is kept", &[("auto_wrap", "false")]);
+    sh.type_line("tput smam");
+    sh.type_line("tput civis");
+    sh.settle();
+    sh.assert_modes("tput civis is kept", &[("cursor_visible", "false")]);
+    sh.type_line("tput cnorm");
+    sh.assert_handbacks("tput rmam and civis record nothing", 0);
+
+    // The wrapped command lives until the test releases it with a line on a FIFO: the
+    // alternate screen is read while it provably runs.
+    let release = sh.inst.tmp.join("wrapped.release");
+    let mut fifo = held_fifo(&release);
+    sh.type_line(&format!(
+        "tput smcup; sh -c 'echo in\"\"side; read line' <'{}'",
+        release.display()
+    ));
+    sh.ctl.expect_on_screen("inside");
+    sh.assert_modes(
+        "tput smcup; cmd runs cmd on the alt screen",
+        &[("alt_screen", "true")],
+    );
+    fifo.write_all(b"go\n")
+        .expect("release the wrapped command");
+    sh.settle();
+    sh.assert_modes(
+        "the alt screen outlives the wrapped command",
+        &[("alt_screen", "true")],
+    );
+    sh.type_line("tput rmcup");
+    sh.settle();
+    sh.assert_modes("tput rmcup leaves it", &[("alt_screen", "false")]);
+    sh.assert_handbacks("the whole wrapper records nothing", 0);
+}
+
+/// A one-shot that sets an input mode is handed back when it exits (the documented residual:
+/// nothing tells a clean exit from a kill). It is answered, so the mode is the one-shot's.
+#[test]
+fn zsh_hands_back_a_one_shots_mouse_at_its_exit() {
+    let mut sh = Shell::boot("zo", ZSH);
+    sh.start(Job::MouseOneShot);
+    // Nothing is typed while it runs: it reads its answer from the terminal.
+    sh.ctl.expect_on_screen("answered");
+    sh.settle();
+    sh.assert_modes(
+        "the one-shot's mouse is handed back",
+        &[("mouse_mode", "none")],
+    );
+    sh.assert_handbacks("the one-shot's exit is one handback", 1);
+}
+
+/// vim's own exit resets what it armed: run as an answered job, a clean exit
+/// records nothing. Bare, its exit races the reader, and a reader that parses
+/// vim's exit reset as the shell's hands back at the cut: at most one.
+#[test]
+fn zsh_records_nothing_for_a_clean_vim_exit() {
+    if on_path("vim").is_none() {
+        eprintln!("SKIP: vim is not installed (not a pass)");
+        return;
+    }
+    let mut sh = Shell::boot("zv", ZSH);
+    sh.start(Job::Vim);
+    sh.ctl.expect_on_screen("answered");
+    sh.settle();
+    sh.assert_handbacks("a clean vim exit records nothing", 0);
+    // vim reads the terminal while it runs, so nothing is typed until the
+    // shell's own marker after it.
+    sh.type_line("vim -u NONE -c q; echo vim\"\"-done");
+    sh.ctl.expect_on_screen("vim-done");
+    let bare = sh.handback_count();
+    assert!(bare <= 1, "a bare vim exit records at most one: {bare}");
+}
+
+/// Ctrl-Z of a job that armed mouse tracking hands nothing back (the job
+/// lives), `fg` finds its mouse still on, and only its death hands back.
+#[test]
+fn zsh_a_stopped_job_keeps_its_modes_until_it_dies() {
+    let mut sh = Shell::boot("zs", ZSH);
+    sh.start(Job::Armed(Arm::Mouse, 1));
+    sh.ctl.expect_on_screen("armed-1");
+    sh.job_ctrl('z', "the mouse job holds the terminal for its Ctrl-Z");
+    sh.ctl.expect_on_screen("suspended");
+    sh.assert_modes(
+        "Ctrl-Z keeps a stopped job's mouse",
+        &[("mouse_mode", "any")],
+    );
+    sh.assert_handbacks("the stop edge hands nothing back", 0);
+    sh.type_line("fg");
+    sh.await_holder(Holder::Job, "fg gives the stopped job the terminal");
+    sh.assert_modes(
+        "fg resumes the job with its mouse",
+        &[("mouse_mode", "any")],
+    );
+    sh.assert_handbacks("fg hands nothing back", 0);
+    sh.job_ctrl('c', "the resumed job holds the terminal for its Ctrl-C");
+    sh.settle();
+    sh.assert_modes(
+        "the job's death hands its mouse back",
+        &[("mouse_mode", "none")],
+    );
+    sh.assert_handbacks("the death edge is one handback", 1);
+}
+
+/// zsh makes a pipeline's first stage its group leader, and `sleep 0` has exited by the
+/// Ctrl-Z, so `kill(pgid, 0)` answers ESRCH for a job that is alive and stopped: a stopped
+/// member keeps the job alive, and nothing is handed back until it dies.
+#[test]
+fn zsh_a_leaderless_pipeline_keeps_its_modes_while_stopped() {
+    let mut sh = Shell::boot("zp", ZSH);
+    let both = [("alt_screen", "true"), ("mouse_mode", "any")];
+    sh.type_line(&format!(
+        "sleep 0 | {}",
+        Job::Armed(Arm::AltMouse, 2).line()
+    ));
+    sh.ctl.expect_on_screen("armed-2");
+    sh.job_ctrl('z', "the pipeline holds the terminal for its Ctrl-Z");
+    sh.ctl.expect_on_screen("suspended");
+    sh.assert_modes("Ctrl-Z keeps a leaderless pipeline's modes", &both);
+    sh.assert_handbacks("the pipeline's stop edge hands nothing back", 0);
+    sh.type_line("fg");
+    sh.await_holder(Holder::Job, "fg gives the stopped pipeline the terminal");
+    sh.assert_modes("fg resumes the pipeline with its modes", &both);
+    sh.assert_handbacks("the pipeline's fg hands nothing back", 0);
+    sh.job_ctrl(
+        'c',
+        "the resumed pipeline holds the terminal for its Ctrl-C",
+    );
+    sh.settle();
+    sh.assert_modes(
+        "the pipeline's death hands back",
+        &[("alt_screen", "false"), ("mouse_mode", "none")],
+    );
+    sh.assert_handbacks("the pipeline's death is one handback", 1);
+}
+
+/// The same leaderless pipeline stopped and then `bg`'d runs on with no
+/// member stopped: a command the shell runs meanwhile makes two foreground
+/// edges at which the job is a bystander, gone only when its whole group is,
+/// so its modes stay and `fg` finds them.
+#[test]
+fn zsh_a_bgd_leaderless_pipeline_keeps_its_modes_beside_a_command() {
+    let mut sh = Shell::boot("zb", ZSH);
+    let both = [("alt_screen", "true"), ("mouse_mode", "any")];
+    sh.type_line(&format!(
+        "sleep 0 | {}",
+        Job::Armed(Arm::AltMouse, 3).line()
+    ));
+    sh.ctl.expect_on_screen("armed-3");
+    sh.job_ctrl('z', "the pipeline to bg holds the terminal for its Ctrl-Z");
+    sh.ctl.expect_on_screen("suspended");
+    sh.type_line("bg");
+    sh.type_line("/bin/echo bystander-edge");
+    sh.settle();
+    sh.assert_modes(
+        "a command beside a bg'd leaderless pipeline keeps its modes",
+        &both,
+    );
+    sh.assert_handbacks("the bystander edges hand nothing back", 0);
+    sh.type_line("fg");
+    sh.await_holder(Holder::Job, "fg gives the bg'd pipeline the terminal");
+    sh.assert_modes("fg resumes the bg'd pipeline with its modes", &both);
+    sh.job_ctrl('c', "the bg'd pipeline holds the terminal for its Ctrl-C");
+    sh.settle();
+    sh.assert_modes(
+        "the bg'd pipeline's death hands back",
+        &[("alt_screen", "false"), ("mouse_mode", "none")],
+    );
+    sh.assert_handbacks("the bg'd pipeline's death is one handback", 1);
+}
+
+/// A live holder that hands the terminal to its own child and takes it back
+/// keeps its alternate screen, mouse and hidden cursor; its death is one
+/// handback, and no handback names 1007.
+#[test]
+fn zsh_a_live_holder_keeps_its_modes_across_its_child() {
+    let mut sh = Shell::boot("zh", ZSH);
+    sh.start(Job::Holder);
+    sh.ctl.expect_on_screen("parent-back");
+    sh.assert_modes(
+        "a live holder keeps its modes across its child",
+        &[
+            ("alt_screen", "true"),
+            ("mouse_mode", "any"),
+            ("cursor_visible", "false"),
+        ],
+    );
+    sh.assert_handbacks("the child's exit hands nothing back", 0);
+    // The release: Enter on the holder's (cooked) terminal completes the line
+    // it waits for, and it SIGKILLs itself.
+    sh.await_holder(
+        Holder::Job,
+        "the live holder holds the terminal for its release",
+    );
+    sh.ctl.ok("key enter");
+    sh.ctl.expect_on_screen("zsh:.killed");
+    sh.await_modes("the holder's death hands back", HANDED_BACK);
+    sh.assert_handbacks("the holder's death is one handback", 1);
+}
+
+/// A one-shot whose bytes the reader reads only after zsh took the terminal back is parsed as
+/// the shell's, so its handback is lost (the documented residual), and only its own: the next
+/// job, which re-arms mouse reporting and dies, is handed back once.
+///
+/// The miss is forced, never left to load: once zsh runs the line (its first word, a builtin,
+/// makes a file), the instance is SIGSTOPped; the one-shot, held behind a FIFO read until
+/// then, writes `?1000h` and exits, and zsh reclaims the terminal (`: >flag` is its last
+/// word); only then is the instance continued, so its reader wakes to the one-shot's bytes and
+/// zsh's reclaim together.
+#[test]
+fn zsh_a_missed_one_shot_loses_only_its_own_handback() {
+    let mut sh = Shell::boot("zm", ZSH);
+    let started = sh.inst.tmp.join("missed.started");
+    let gate = sh.inst.tmp.join("missed.gate");
+    let flag = sh.inst.tmp.join("missed.flag");
+    let mut fifo = held_fifo(&gate);
+    sh.type_line(&format!(
+        ": >'{}'; read -r go <'{}'; /usr/bin/printf '\\033[?1000h'; echo miss\"\"ed-done; : >'{}'",
+        started.display(),
+        gate.display(),
+        flag.display()
+    ));
+    // The shell has the whole line once it runs its first word.
+    aterm_spec::wait::until_within(
+        MUST_HAPPEN,
+        "the shell to start the missed one-shot's line",
+        || started.exists().then_some(()),
+    );
+    sh.signal_instance(libc::SIGSTOP);
+    fifo.write_all(b"go\n").expect("open the one-shot's gate");
+    let shell_done = aterm_spec::wait::within(MUST_HAPPEN, Duration::from_millis(10), || {
+        flag.exists().then_some(())
+    });
+    sh.signal_instance(libc::SIGCONT);
+    assert!(
+        shell_done.is_some(),
+        "the shell never ran the missed one-shot's line behind the stopped instance"
+    );
+    sh.ctl.expect_on_screen("missed-done");
+    sh.settle();
+    // The miss took: the one-shot's mouse is read as the shell's and stays,
+    // and nothing was handed back. Without it the recovery below checks
+    // nothing.
+    sh.assert_modes(
+        "the missed one-shot's mouse stays (the residual)",
+        &[("mouse_mode", "normal")],
+    );
+    sh.assert_handbacks("the missed one-shot loses its handback", 0);
+
+    // Re-arming is owning: the job's `?1003h` over the stale shell-owned
+    // mode makes the mouse the job's, so its death is the one handback.
+    sh.start(Job::Armed(Arm::Mouse, 4));
+    sh.ctl.expect_on_screen("armed-4");
+    sh.job_ctrl('c', "the re-arming job holds the terminal for its Ctrl-C");
+    sh.settle();
+    sh.assert_modes(
+        "a job re-arming the missed mouse hands it back",
+        &[("mouse_mode", "none")],
+    );
+    sh.assert_handbacks("the re-arming job's death is one handback", 1);
+}
+
+/// A killed holder under macOS's /bin/bash 3.2, which has no bracketed paste.
+#[test]
+fn bash_hands_a_killed_holders_modes_back_once() {
+    let mut sh = Shell::boot("bi", BASH);
+    sh.start(Job::Incident);
+    sh.ctl.expect_on_screen("Killed");
+    sh.await_modes("the incident is handed back", &handed_back("false"));
+    sh.assert_handbacks("exactly one handback", 1);
+}
+
+/// A killed holder under fish, when installed, after a clean `ls` that records nothing (fish
+/// disables its own modes before it execs a command).
+#[test]
+fn fish_hands_a_killed_holders_modes_back_once() {
+    let Some(fish) = on_path("fish") else {
+        eprintln!("SKIP: fish is not installed (not a pass)");
+        return;
+    };
+    let fish = fish.to_str().expect("a UTF-8 fish path");
+    let mut sh = Shell::boot("fi", &[fish, "--no-config", "-i"]);
+    sh.type_line("ls");
+    sh.settle();
+    sh.assert_handbacks("a clean ls records nothing", 0);
+    sh.start(Job::Incident);
+    sh.ctl.expect_on_screen("SIGKILL|Killed|killed");
+    sh.await_modes("the incident is handed back", HANDED_BACK);
+    sh.assert_handbacks("exactly one handback", 1);
+}

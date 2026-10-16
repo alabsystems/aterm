@@ -1,0 +1,228 @@
+// Copyright The winit contributors
+// SPDX-License-Identifier: Apache-2.0
+//
+// Derived from winit 0.30.13 src/platform/macos.rs,
+// modified by the aterm project in 2026 (see the repository NOTICE).
+
+//! Modified by the aterm project in 2026; see the repository NOTICE.
+//!
+//! # macOS / AppKit
+//!
+//! Winit has an OS requirement of macOS 10.11 or higher (same as Rust
+//! itself), and is regularly tested on macOS 10.14.
+//!
+//! ## Window initialization
+//!
+//! A lot of functionality expects the application to be ready before you
+//! start doing anything; this includes creating windows, fetching monitors,
+//! drawing, and so on, see issues [#2238], [#2051] and [#2087].
+//!
+//! If you encounter problems, you should try doing your initialization inside
+//! [`ApplicationHandler::resumed`].
+//!
+//! [#2238]: https://github.com/rust-windowing/winit/issues/2238
+//! [#2051]: https://github.com/rust-windowing/winit/issues/2051
+//! [#2087]: https://github.com/rust-windowing/winit/issues/2087
+//! [`ApplicationHandler::resumed`]: crate::application::ApplicationHandler::resumed
+//!
+//! ## Custom `NSApplicationDelegate`
+//!
+//! Winit usually handles everything related to the lifecycle events of the application. Sometimes,
+//! though, you might want to do more niche stuff, such as [handle when the user re-activates the
+//! application][reopen]. Such functionality is not exposed directly in Winit, since it would
+//! increase the API surface by quite a lot.
+//!
+//! [reopen]: https://developer.apple.com/documentation/appkit/nsapplicationdelegate/1428638-applicationshouldhandlereopen?language=objc
+//!
+//! Instead, Winit guarantees that it will not register an application delegate, so the solution is
+//! to register your own application delegate, as outlined in the following example (see
+//! `objc2-app-kit` for more detailed information).
+//!
+//! **The example below is upstream's, and it does not build in this fork.** It is written
+//! against the `objc2` family, which this fork stopped depending on at the `objc2` exit
+//! condition (2026-09-03; see the retirement note in this fork's `Cargo.toml`). It is kept as
+//! upstream's statement of the delegate contract and fenced `ignore` on every platform — it
+//! used to be a live doctest on macOS. The fork's own delegates are built on `aterm-objc`;
+//! `platform_impl/macos/app_state.rs` is the shape to copy.
+//!
+//! ```ignore
+//! use objc2::rc::Retained;
+//! use objc2::runtime::ProtocolObject;
+//! use objc2::{declare_class, msg_send_id, mutability, ClassType, DeclaredClass};
+//! use objc2_app_kit::{NSApplication, NSApplicationDelegate};
+//! use objc2_foundation::{NSArray, NSURL, MainThreadMarker, NSObject, NSObjectProtocol};
+//! use winit::event_loop::EventLoop;
+//!
+//! declare_class!(
+//!     struct AppDelegate;
+//!
+//!     unsafe impl ClassType for AppDelegate {
+//!         type Super = NSObject;
+//!         type Mutability = mutability::MainThreadOnly;
+//!         const NAME: &'static str = "MyAppDelegate";
+//!     }
+//!
+//!     impl DeclaredClass for AppDelegate {}
+//!
+//!     unsafe impl NSObjectProtocol for AppDelegate {}
+//!
+//!     unsafe impl NSApplicationDelegate for AppDelegate {
+//!         #[method(application:openURLs:)]
+//!         fn application_openURLs(&self, application: &NSApplication, urls: &NSArray<NSURL>) {
+//!             // Note: To specifically get `application:openURLs:` to work, you _might_
+//!             // have to bundle your application. This is not done in this example.
+//!             println!("open urls: {application:?}, {urls:?}");
+//!         }
+//!     }
+//! );
+//!
+//! impl AppDelegate {
+//!     fn new(mtm: MainThreadMarker) -> Retained<Self> {
+//!         unsafe { msg_send_id![super(mtm.alloc().set_ivars(())), init] }
+//!     }
+//! }
+//!
+//! fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     let event_loop = EventLoop::new()?;
+//!
+//!     let mtm = MainThreadMarker::new().unwrap();
+//!     let delegate = AppDelegate::new(mtm);
+//!     // Important: Call `sharedApplication` after `EventLoop::new`,
+//!     // doing it before is not yet supported.
+//!     let app = NSApplication::sharedApplication(mtm);
+//!     app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
+//!
+//!     // event_loop.run_app(&mut my_app);
+//!     Ok(())
+//! }
+//! ```
+
+use crate::event_loop::EventLoopBuilder;
+use crate::keyboard::ModifiersState;
+use crate::monitor::MonitorHandle;
+use crate::window::Window;
+
+/// Register a handler consulted before the application terminates via AppKit's
+/// `terminate:` — the Dock-icon "Quit", AppleScript `quit`, and logout/restart/shutdown,
+/// none of which pass through the application menu's Quit item (so an app that handles
+/// its own ⌘Q cannot otherwise confirm them). Return `true` to allow termination,
+/// `false` to cancel it (e.g. after a "really quit?" dialog). The handler runs on the
+/// main thread inside `applicationShouldTerminate:`, so it may show a modal. Only the
+/// first registration takes effect; without one, termination always proceeds — the
+/// default, so stock winit behavior is unchanged.
+pub fn set_application_should_terminate_handler(handler: fn() -> bool) {
+    crate::platform_impl::set_quit_confirm_hook(handler);
+}
+
+/// Additional methods on [`Window`] that are specific to MacOS.
+///
+/// LOCAL PATCH (aterm), 2026-10-15 (docs/AUDIT-third-party-2026-10-15.md, winit-core step 5): the
+/// one method aterm calls. Upstream's simple fullscreen, shadow, native tabbing, document-edited,
+/// option-as-alt and borderless-game controls are cut, with `WindowAttributesExtMacOS` (whose
+/// titlebar, shadow, HiDPI, first-mouse, tabbing and option-as-alt settings now stand at the
+/// defaults aterm always ran with), `ActiveEventLoopExtMacOS`, `OptionAsAlt`,
+/// `EventLoopBuilderExtMacOS::with_default_menu` (winit's default menu, and with it the Services
+/// menu registration, is still always built) and `MonitorHandleExtMacOS::ns_screen`.
+pub trait WindowExtMacOS {
+    /// LOCAL PATCH (aterm): the modifier state winit last derived from an
+    /// event for this window — its own cache, written before the matching
+    /// `ModifiersChanged` is queued. For re-syncing after a contained
+    /// `NSException`; never a WindowServer-backed probe.
+    fn cached_modifiers(&self) -> ModifiersState;
+}
+
+impl WindowExtMacOS for Window {
+    #[inline]
+    fn cached_modifiers(&self) -> ModifiersState {
+        self.window.maybe_wait_on_main(|w| w.cached_modifiers())
+    }
+}
+
+// LOCAL PATCH (aterm), 2026-10-15 (docs/AUDIT-third-party-2026-10-15.md, winit-core step 6):
+// the window's content view through first-party `aterm_objc::HasNsView`, so the Metal presenter
+// (aterm-gpu) and aterm-gui's chrome reach it without `raw-window-handle`, whose `rwh_06`
+// feature is no longer a default. The opt-in `rwh_06` handle wraps this same view.
+//
+// SAFETY: the view is the `WinitView` installed as the window's content view at creation and
+// never replaced. The `NSWindow` retains it, and this `Window` retains the `NSWindow` until it
+// drops, so the view outlives `self`. Off the main thread the answer is nil.
+unsafe impl aterm_objc::HasNsView for Window {
+    #[inline]
+    fn ns_view(&self) -> aterm_objc::Id {
+        self.window.ns_view()
+    }
+}
+
+/// Corresponds to `NSApplicationActivationPolicy`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ActivationPolicy {
+    /// Corresponds to `NSApplicationActivationPolicyRegular`.
+    #[default]
+    Regular,
+
+    /// Corresponds to `NSApplicationActivationPolicyAccessory`.
+    Accessory,
+
+    /// Corresponds to `NSApplicationActivationPolicyProhibited`.
+    Prohibited,
+}
+
+pub trait EventLoopBuilderExtMacOS {
+    /// Sets the activation policy for the application. If used, this will override
+    /// any relevant settings provided in the package manifest.
+    /// For instance, `with_activation_policy(ActivationPolicy::Regular)` will prevent
+    /// the application from running as an "agent", even if LSUIElement is set to true.
+    ///
+    /// If unused, the Winit will honor the package manifest.
+    ///
+    /// # Example
+    ///
+    /// Set the activation policy to "accessory".
+    ///
+    /// ```
+    /// use winit::event_loop::EventLoop;
+    /// #[cfg(target_os = "macos")]
+    /// use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
+    ///
+    /// let mut builder = EventLoop::builder();
+    /// #[cfg(target_os = "macos")]
+    /// builder.with_activation_policy(ActivationPolicy::Accessory);
+    /// # if false { // We can't test this part
+    /// let event_loop = builder.build();
+    /// # }
+    /// ```
+    fn with_activation_policy(&mut self, activation_policy: ActivationPolicy) -> &mut Self;
+
+    /// Used to prevent the application from automatically activating when launched if
+    /// another application is already active.
+    ///
+    /// The default behavior is to ignore other applications and activate when launched.
+    fn with_activate_ignoring_other_apps(&mut self, ignore: bool) -> &mut Self;
+}
+
+impl<T> EventLoopBuilderExtMacOS for EventLoopBuilder<T> {
+    #[inline]
+    fn with_activation_policy(&mut self, activation_policy: ActivationPolicy) -> &mut Self {
+        self.platform_specific.activation_policy = Some(activation_policy);
+        self
+    }
+
+    #[inline]
+    fn with_activate_ignoring_other_apps(&mut self, ignore: bool) -> &mut Self {
+        self.platform_specific.activate_ignoring_other_apps = ignore;
+        self
+    }
+}
+
+/// Additional methods on [`MonitorHandle`] that are specific to MacOS.
+pub trait MonitorHandleExtMacOS {
+    /// Returns the identifier of the monitor for Cocoa.
+    fn native_id(&self) -> u32;
+}
+
+impl MonitorHandleExtMacOS for MonitorHandle {
+    #[inline]
+    fn native_id(&self) -> u32 {
+        self.inner.native_identifier()
+    }
+}

@@ -81,12 +81,16 @@ impl AdmissionRecord {
     /// another row and the caret came to rest on or left of the lay with no
     /// key behind the move (`CursorGlow`'s torn lay).
     pub const LICENCE_RECALL: &'static str = "recall";
+    /// Ring token: a move the classic wake (Classic, Classic mono) lit. That
+    /// engine spawns on every observed cursor move with no key behind it, so
+    /// its rows are never declined.
+    pub const LICENCE_MOTION: &'static str = "motion";
     /// Ring token: a declined row admitted nothing.
     pub const LICENCE_NONE: &'static str = "none";
 
     /// One diagnostic line, the `trail` verb's row shape:
     /// `admission seq= phase= reason= age_ms= origin=r,c target=r,c alt=0|1
-    /// licence=key|inflight|insert|rewrite|recall|none`. `age_ms` is relative to `now`, so
+    /// licence=key|inflight|insert|rewrite|recall|motion|none`. `age_ms` is relative to `now`, so
     /// the reader sees "how long ago", not an unanchored instant. `licence=`
     /// is the LAST token: every existing reader greps the tokens before it.
     #[must_use]
@@ -957,7 +961,7 @@ impl CursorGlow {
     //
     // The `swap_*` methods hand the host this frame's stream by moving the
     // buffer rather than copying it (a hot ribbon at retina metrics carries
-    // 6k-14k `GlowQuad`s of 16 B; see `tests/cursor_bench.rs`). [`Self::tick`]
+    // 6k-14k `GlowQuad`s of 16 B; see `benches/cursor_bench.rs`). [`Self::tick`]
     // clears every scratch at entry, so the buffer handed back (holding the
     // previous frame's content) is never read. A host reading a stream twice in
     // one frame must use the borrowing accessor; swap exactly once, at the

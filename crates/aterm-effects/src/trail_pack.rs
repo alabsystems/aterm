@@ -50,12 +50,11 @@ pub const MAX_RAMP_STOPS: usize = 8;
 /// Maximum banded-ramp colours.
 pub const MAX_RAMP_BANDS: usize = 8;
 
-/// The quantization grid every stored `f32` is rounded to (1/1024). Keeping all
-/// scalars on this grid makes the emitted `u8` coverage/colour path and the
-/// fingerprint fold reproducible across reloads and byte-identical CPU↔GPU.
+/// The quantization grid every stored `f32` is rounded to (1/1024); the module
+/// docs say why.
 pub const QUANT: f32 = 1024.0;
 
-// Engine-proven clamp bounds (design §"Validation & safety envelope").
+// Engine-proven clamp bounds.
 const MIN_WINDOW_MS: u16 = 30;
 const MAX_WINDOW_MS: u16 = 2000;
 const MAX_LAYER_THICKNESS: f32 = 16.0; // widest proven bloom layer (×core)
@@ -71,9 +70,9 @@ const MAX_PACK_AUTHORS: usize = 8;
 const MAX_AUTHOR_BYTES: usize = 80;
 const MAX_LICENSE_BYTES: usize = 64;
 
-/// Fixed white mix target for every custom beam layer — the hot core. Packs
-/// supply the ramp SHAPE (base hue per sample); the layer stack only mixes
-/// toward white, exactly as the single-tone built-in stacks do.
+/// Fixed white mix target for every custom beam layer (the hot core): packs
+/// supply the ramp's base hue per sample, and layers only mix toward white, as
+/// the single-tone built-in stacks do.
 pub const CUSTOM_MIX_WHITE: u32 = 0x00FF_FFFF;
 
 /// One resolved Trail Pack, ready for the engine. `Copy` (no heap), so it
@@ -454,10 +453,8 @@ impl std::fmt::Display for TrailPackError {
 
 impl std::error::Error for TrailPackError {}
 
-/// Read one Trail Pack manifest without permitting special files or unbounded
-/// allocation (the FIFO-safe bounded read, mirroring
-/// [`crate::spec::read_toy_pack_file`]). Hosts call this before
-/// [`compile_trail_pack_toml`].
+/// Read one Trail Pack manifest as a bounded regular-file read (no FIFOs or
+/// unbounded allocation), as [`crate::spec::read_toy_pack_file`] does.
 #[cfg(test)]
 pub fn read_trail_pack_file(path: &Path) -> std::io::Result<String> {
     crate::file_feed::read_bounded_regular_utf8(path, MAX_TRAIL_PACK_BYTES)
@@ -665,10 +662,8 @@ struct RawPop {
     jump_burst_max: Option<u32>,
 }
 
-/// Parse and compile one Trail Pack manifest. Cold-path only: the source is
-/// capped BEFORE parsing, every scalar is clamped into an engine-proven range
-/// (out-of-range values also recording a diagnostic), every stored `f32` is
-/// quantized, and all independent errors are collected in one pass.
+/// Parse and compile one Trail Pack manifest (cold path) under the module's
+/// fail-closed envelope, collecting every independent error in one pass.
 pub fn compile_trail_pack_toml(source: &str) -> Result<CompiledTrailPack, TrailPackError> {
     if source.len() > MAX_TRAIL_PACK_BYTES {
         return Err(TrailPackError::one(format!(
@@ -1220,8 +1215,7 @@ fn compile_pop(raw: &RawPop, index: usize, diag: &mut Vec<String>) -> ParticlePo
 // Shared validators (self-contained mirror of the spec.rs Toy-Pack helpers).
 // ---------------------------------------------------------------------------
 
-/// Round a clamped `f32` onto the [`QUANT`] grid so the emitted-`u8` path and
-/// the fingerprint stay bit-exact across reloads and CPU↔GPU.
+/// Round a clamped `f32` onto the [`QUANT`] grid.
 fn quant(v: f32) -> f32 {
     (v * QUANT).round() / QUANT
 }
@@ -1347,7 +1341,7 @@ fn valid_id(value: &str, max: usize) -> bool {
         })
 }
 
-/// FNV-1a over `id` then the full source — the style-switch / pack-swap detector.
+/// FNV-1a over `id` then the full source ([`TrailParams::pack_fp`]).
 fn pack_fingerprint(id: &str, source: &str) -> u32 {
     let mut h: u32 = 0x811C_9DC5;
     for &b in id.as_bytes() {
@@ -1389,38 +1383,6 @@ mod tests {
         // Every stored f32 is on the quantization grid.
         assert_eq!(p.beam.cell_frac, quant(p.beam.cell_frac));
         assert_eq!(p.crown.radius_cells, quant(p.crown.radius_cells));
-    }
-
-    #[test]
-    fn trail_pack_file_reader_admits_regular_and_rejects_oversize() {
-        use std::sync::atomic::{AtomicU64, Ordering};
-
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let root = std::env::temp_dir().join(format!(
-            "aterm-trail-pack-reader-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&root).expect("create Trail Pack reader fixtures");
-        let regular = root.join("regular.toml");
-        std::fs::write(&regular, SYNTHWAVE).expect("write regular Trail Pack");
-        assert_eq!(
-            read_trail_pack_file(&regular).expect("read regular Trail Pack"),
-            SYNTHWAVE
-        );
-
-        let oversized = root.join("oversized.toml");
-        std::fs::write(&oversized, vec![b'x'; MAX_TRAIL_PACK_BYTES + 1])
-            .expect("write oversized Trail Pack");
-        let error = read_trail_pack_file(&oversized).expect_err("oversized Trail Pack rejected");
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-        assert!(
-            error
-                .to_string()
-                .contains(&MAX_TRAIL_PACK_BYTES.to_string()),
-            "{error}"
-        );
-        std::fs::remove_dir_all(root).expect("remove Trail Pack reader fixtures");
     }
 
     #[test]

@@ -3,12 +3,13 @@
 
 //! The non-parking egress must bound its spill.
 //!
-//! `SinkWriter::write_frame_nonparking` (the UI-thread keystroke egress) must not
-//! park, so it normally skips the `SPILL_CAP` backpressure the blocking
+//! `SinkWriter::write_frame_nonparking` (the off-thread small-frame egress) normally
+//! skips the `SPILL_CAP` backpressure the blocking
 //! `write_frame` applies. Skipping the cap entirely let a machine-rate small-frame
 //! producer (the cross-session `input`/`mouse` verbs use this egress) grow the
 //! spill without bound while the foreground program stopped reading. An over-cap
-//! non-parking frame therefore takes the blocking, cap-enforcing path.
+//! non-parking frame therefore takes the blocking, cap-enforcing path. The UI
+//! thread uses `write_frame_interactive_with_receipt` instead.
 //!
 //! A blocking pipe whose read end is never drained stands in for the wedged
 //! foreground; a detached producer pumps small frames; a counting global

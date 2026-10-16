@@ -1,27 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Abandoned ribbon bands: a row the caret has left must not keep a frozen,
-//! full-brightness band (a long line wrapped in Claude Code's input box, or a
-//! band stranded when a TUI re-lays its input) (owner, 2026-09-12).
+//! Abandoned ribbon bands: a row the caret has left must not keep a frozen, full-brightness band
+//! (a long line wrapped in Claude Code's input box, or a band stranded when a TUI re-lays its
+//! input). An erase invalidates no host coordinate (a prompt redraw must not wipe the ribbon), so
+//! these laws keep the absolute-cell ribbon honest. Each runs at the host seam: a real `Terminal`
+//! driven byte for byte, rows sampled as `app_render.rs`'s frame hold does and fed to
+//! `CursorGlow::observe_row` / `observe_ribbon_row`, then `CursorGlow::tick`:
 //!
-//! An erase invalidates no host coordinate (D2: a prompt redraw must not wipe
-//! the ribbon), and the ribbon is an absolute-cell record of the keys, so
-//! these laws keep it honest. Each is checked at the host seam: a real
-//! `aterm_core::terminal::Terminal` driven byte for byte, rows sampled as
-//! `app_render.rs`'s frame hold does (`row_cols_into` after the batch),
-//! fed to `CursorGlow::observe_row` / `observe_ribbon_row` and ticked through
-//! `CursorGlow::tick`:
-//!
-//! 1. renewal is row-scoped (`Ribbon::place`): a row the caret left keeps its
-//!    own clock and leaves on its own;
-//! 2. the content witness (`rk::witness`) retires a cell whose glyph changed
-//!    or went, and the follow pass carries a band whose text moved;
-//! 3. the caret mirror follows an observed row change
-//!    (`Engine::observe_caret`), composed with the echo ledger (a same-row hop
-//!    stays the ledger's to pay);
-//! 4. on the box-growth wrap (text moves up a row, caret stays), the witness
-//!    sees the row's glyphs go.
+//! 1. renewal is row-scoped (`Ribbon::place`): a row the caret left keeps its own clock;
+//! 2. the content witness (`rk::witness`) retires a cell whose glyph changed or went, and the
+//!    follow pass carries a band whose text moved;
+//! 3. the caret mirror follows an observed row change (`Engine::observe_caret`), composed with
+//!    the echo ledger (a same-row hop stays the ledger's to pay);
+//! 4. on the box-growth wrap (text moves up a row, caret stays), the witness sees the glyphs go.
 
 use crate::common::{
     caret_sample, note_blink, observe_caret_row, observe_ribbon_rows, rainbow_cfg, sync_scroll,
@@ -64,8 +56,7 @@ impl Host {
         Self::sized(ROWS as u16, COLS as u16, row)
     }
 
-    /// A fresh `rows × cols` host with the caret parked at 0-based `(row,
-    /// 0)` and the anchor seeded by one frame.
+    /// As `Host::at_row`, at `rows × cols`.
     fn sized(rows: u16, cols: u16, row: u16) -> Self {
         let mut term = Terminal::new(rows, cols);
         term.process(format!("\x1b[{};1H", row + 1).as_bytes());
@@ -86,17 +77,13 @@ impl Host {
         h
     }
 
-    /// The frame hold then the tick: the host's scroll sync
-    /// (`sync_cursor_effect_scroll`), then sample the cursor, repaint blink,
-    /// caret row probe and the ribbon's rows from the terminal after the last
-    /// `process`, then advance the engine one frame.
+    /// One frame: the scroll sync, then the cursor, blink, caret row and ribbon rows sampled from
+    /// the terminal after the last `process`, then the engine's tick.
     fn frame(&mut self) {
         sync_scroll(&self.term, &mut self.glow, &mut self.scroll, self.now);
         let (c, cur) = caret_sample(&self.term);
         note_blink(&self.term, &mut self.glow, &mut self.blink_seen, self.now);
         self.glow.note_context(self.term.is_alternate_screen());
-        // The caret row rides the probe the host already holds, and the
-        // ribbon's own rows are read beside it.
         observe_caret_row(&self.term, &mut self.glow, &mut self.row_buf, c, self.now);
         observe_ribbon_rows(&self.term, &mut self.glow, &mut self.row_buf);
         self.glow
@@ -239,13 +226,11 @@ fn hello(row: u16) -> Host {
     h
 }
 
-/// A plain shell wrap: a line typed past the right margin at 90 ms a key, the
-/// hand typing on the next row. The first row's band stops being renewed the
-/// moment the caret leaves it (row scope, model-checked as `aterm-spec`'s
-/// `ribbon_row_hold_model`, invariant `OnlyOwnerRenews`) and flows from its own
-/// last key: `leave_row` marks it flowing (`Cohort::flow`), it drifts toward
-/// the fold point fading as it goes and is gone by `FLOW_TOTAL_S`. The second
-/// row's band stays under the hand (owner, 2026-09-21).
+/// A plain shell wrap: a line typed past the right margin at 90 ms a key. The first row stops
+/// being renewed the moment the caret leaves it (row scope: `aterm-spec`'s
+/// `ribbon_row_hold_model`, `OnlyOwnerRenews`) and flows out from its own last key
+/// (`leave_row`, `Cohort::flow`), gone by `FLOW_TOTAL_S`; the second row's band stays under the
+/// hand.
 #[test]
 fn a_wrapped_line_s_first_row_goes_out_on_its_own_clock_while_the_hand_types_on_the_second() {
     let mut h = Host::at_row(5);
@@ -292,10 +277,8 @@ fn a_wrapped_line_s_first_row_goes_out_on_its_own_clock_while_the_hand_types_on_
          fold flow's own span, {FLOW_TOTAL_S} s from the wrap key, and never past \
          one key's cadence after it"
     );
-    // Absolute ceiling on how long a row the caret has left may hold light:
-    // the derived swoosh (phrase rest + 0.79 s = 1.69 s at the floor rest)
-    // plus margin. It is a literal, not a function of the constant it guards,
-    // so shortening the rest cannot relax it.
+    // Absolute ceiling on a left row's light: the derived swoosh (1.69 s at the floor rest) plus
+    // margin, a literal so shortening the rest cannot relax it.
     assert!(
         (SWOOSH_TOTAL_S * 1000.0) as u64 <= 1750,
         "the pinned bound: a row the caret left is dark inside 1.75 s"
@@ -346,14 +329,9 @@ fn typed_to_the_margin() -> (Host, f32) {
     (h, pace)
 }
 
-/// A plain shell fold keeps the walk's pace. 80 keys fill row 5 and the
-/// terminal wraps the 81st onto column 0 of row 6, where the hand types 30
-/// more. Row 5 ended laying at `WALK_LAY_RATE` a cell
-/// ([`typed_to_the_margin`]); row 6's cohort, minted by `join_cohort` on the
-/// continued `t`, must continue that pace: every adjacent step on row 6 from
-/// column 0 to 29 equals row 5's last step, to 1e-4, rather than restarting
-/// the walk's `1/16` fast leg (`Cohort::t_at` = `t0 + walk_t(col −
-/// anchor_col)`).
+/// A plain shell fold keeps the walk's pace: row 6's cohort (`join_cohort` on the continued `t`)
+/// steps at row 5's last pace, `WALK_LAY_RATE`, from column 0 rather than restarting the walk's
+/// `1/16` fast leg (`Cohort::t_at`).
 #[test]
 fn a_shell_fold_continues_the_walk_at_the_pace_the_row_above_had_reached() {
     let (mut h, pace) = typed_to_the_margin();
@@ -431,16 +409,11 @@ fn dark_after(h: &mut Host, row: u16, since: Instant, flowed: &mut bool) -> Opti
     None
 }
 
-/// A Backspace back up through a shell fold holds the row under the parked
-/// hand. Row 5 typed to the margin, `x` folds onto `(6, 0)` and row 5 starts
-/// to flow; then two Backspaces 90 ms apart: the first erases `x` (`\b ESC[K`),
-/// the second goes up through the fold (`ESC[A ESC[80G ESC[K`, caret at
-/// `(5, 79)`), and the hand parks. Row 5 must stop flowing on the echo's frame
-/// and stay lit at least as long as a never-folded row after the same
-/// Backspace (the control), whether the echo lands with its key (the erase
-/// replays on row 5) or a frame later (the erase replays at `(6, 0)` and the
-/// hand's return takes the row back, `Ribbon::take_row_back`), and whether the
-/// run starts at once or after the phrase rest.
+/// A Backspace back up through a shell fold holds the row under the parked hand. Row 5 typed to
+/// the margin, `x` folds onto `(6, 0)` and row 5 flows; one Backspace erases `x`, a second goes
+/// up through the fold to `(5, 79)`. Row 5 stops flowing on the echo's frame and stays lit at
+/// least as long as a never-folded row after the same Backspace, whether the echo lands with its
+/// key or a frame later (`Ribbon::take_row_back`), after a pause or none.
 #[test]
 fn a_backspace_back_up_through_a_shell_fold_holds_the_row_under_the_parked_hand() {
     for pause_ms in [0u64, 1000] {
@@ -545,15 +518,11 @@ fn typed_to_the_margin_of(rows: u16, cols: u16, row: u16) -> (Host, f32, f32) {
     (h, t_last, (t_last - t_prev) / f32::from(c_last - c_prev))
 }
 
-/// The fold's seam holds when two keys' echoes share a frame (sibling of
-/// [`a_shell_fold_s_first_cell_is_the_row_above_s_last_glyph_continued_one_step`]).
-/// The fold key and the next reach the glass together, pressed 6 ms apart or
-/// with the fold key's echo lagging 40 ms. The frame replays the later key's
-/// `Typed` at `(r + 1, 2)`, laying `(r + 1, 1)` first. The new row's first cell
-/// must still be the row above's last glyph plus one step, and its second one
-/// more: at 80 columns mid-screen, at 80 columns on the last row (the fold
-/// scrolls and the host's scroll sync carries the ribbon), and at 12 columns
-/// (still on the `1/16` fast leg).
+/// The fold's seam holds when two keys' echoes share a frame (pressed 6 ms apart, or the fold
+/// key's echo lagging 40 ms). The frame replays the later key's `Typed` at `(r + 1, 2)`, laying
+/// `(r + 1, 1)` first; the new row must still continue the margin glyph one step a cell. At 80
+/// columns mid-screen, on the last row (the fold scrolls and the scroll sync carries the
+/// ribbon), and at 12 columns (still on the `1/16` fast leg).
 #[test]
 fn a_fold_s_seam_holds_when_two_keys_echoes_land_on_one_frame() {
     for (rows, cols, row) in [(24u16, 80u16, 5u16), (24, 80, 23), (24, 12, 5)] {
@@ -624,17 +593,12 @@ fn a_fold_s_seam_holds_when_two_keys_echoes_land_on_one_frame() {
     }
 }
 
-/// Claude Code's box-growth wrap, then typing on. The growth key re-lays line 1
-/// a row up while the caret stays on its row and jumps left. Every glyph of
-/// `hello world` stands one row up at its own column, so the follow pass
-/// (`rk::witness`, `Engine::follow_rows`) translates the band to row 5 on that
-/// frame with its clocks intact, and since the text left the caret's row it
-/// flows there, gone by `FLOW_TOTAL_S`. The live row holds only keys typed on
-/// it since.
-///
-/// The same-row backward move is held for one stamp window as a possible Ink
-/// park-and-return; the next key flushes it, laying the landing and the growth
-/// key's glyph beside it.
+/// Claude Code's box-growth wrap, then typing on. The growth key re-lays line 1 a row up while
+/// the caret stays on its row and jumps left. Every glyph of `hello world` stands one row up at
+/// its own column, so the follow pass (`Engine::follow_rows`) translates the band to row 5 with
+/// its clocks intact, and off the caret's row it flows out by `FLOW_TOTAL_S`. The same-row
+/// backward move is held one stamp window as a possible Ink park-and-return; the next key
+/// flushes it, laying the landing and the growth key's glyph.
 #[test]
 fn the_box_growth_wrap_carries_the_band_up_with_its_text_and_the_flush_pays_its_landing() {
     let mut h = hello(6);
@@ -711,9 +675,8 @@ fn the_box_growth_wrap_carries_the_band_up_with_its_text_and_the_flush_pays_its_
     assert_eq!(h.retired(), 0, "…and still nothing was retired by content");
 }
 
-/// (i) D2, the control: an ED and the same text back at the same cells in one
-/// PTY batch (a zsh prompt redraw, Ctrl-L) keeps every cell; the host samples
-/// after the batch.
+/// The control: an ED and the same text back at the same cells in one PTY batch (a zsh prompt
+/// redraw, Ctrl-L) keeps every cell; the host samples after the batch.
 #[test]
 fn a_prompt_redraw_that_puts_the_same_text_back_keeps_every_cell() {
     let mut h = hello(5);
@@ -741,14 +704,10 @@ fn a_prompt_redraw_that_puts_the_same_text_back_keeps_every_cell() {
     assert_eq!(h.retired(), 0);
 }
 
-/// (ii) The relocation: an ED, the text redrawn two rows down with the caret,
-/// no key; the move is declined (no fresh hint). The run's glyphs are found two
-/// rows down at their own columns, so the band is translated there with its
-/// clocks intact, nothing retired, and `ribbon_followed=` counts the cells.
-/// The caret went with the text, so the run is not flowing. A relocation whose
-/// text is not found still retires
-/// (`a_band_overwritten_with_different_text_is_retired`, and the re-layout
-/// control in `composer_box_growth_wrap.rs`).
+/// A relocation with no key behind it (an ED, the text redrawn two rows down with the caret):
+/// the run's glyphs are found at their own columns, so the band is translated there with its
+/// clocks intact, nothing retired, and `ribbon_followed=` counts the cells. A relocation whose
+/// text is not found still retires (`a_band_overwritten_with_different_text_is_retired`).
 #[test]
 fn a_relocated_input_box_carries_the_band_with_its_text_and_stamps_nothing() {
     let mut h = hello(5);
@@ -837,9 +796,8 @@ fn a_ctrl_u_under_an_identical_line_drains_on_its_own_row() {
     assert!(lit5 > 0, "the kill's swoosh drains on the killed row");
 }
 
-/// (iii) The next key after the relocation lays on row 7 beside the band that
-/// followed the text there, nothing on row 5: the mirror followed the declined
-/// row change. One run, columns 0..=11.
+/// The next key after a declined relocation lays on row 7 beside the band that followed the
+/// text there, nothing on row 5: the caret mirror followed the declined row change.
 #[test]
 fn the_next_key_after_a_declined_relocation_lays_at_the_caret_s_true_cell() {
     let mut h = hello(5);
@@ -861,8 +819,8 @@ fn the_next_key_after_a_declined_relocation_lays_at_the_caret_s_true_cell() {
     assert!(h.lit(7));
 }
 
-/// (iv) The same cells overwritten with different text retire, and the space,
-/// with no glyph to witness, goes with its run.
+/// The same cells overwritten with different text retire, and the space, with no glyph to
+/// witness, goes with its run.
 #[test]
 fn a_band_overwritten_with_different_text_is_retired() {
     let mut h = hello(5);
@@ -940,11 +898,9 @@ fn a_composer_repaint_does_not_cut_a_live_ribbon_at_each_space() {
     assert!(!h.lit(5));
 }
 
-/// (v) A CJK glyph's two cells are one unit: overwriting its lead at the run's
-/// end retires both on one frame, neighbours untouched. Overwriting it in the
-/// middle retires neither: a change strictly inside a standing run is not
-/// evidence (`Witness::shape_verdicts`), so the band stays whole
-/// (owner, 2026-09-16).
+/// A CJK glyph's two cells are one unit: overwriting it at the run's end retires both on one
+/// frame, neighbours untouched. Inside a standing run the change is not evidence
+/// (`Witness::shape_verdicts`) and the band stays whole.
 #[test]
 fn a_wide_glyph_s_two_cells_are_retired_as_one_unit() {
     let mut h = Host::at_row(5);
@@ -967,7 +923,7 @@ fn a_wide_glyph_s_two_cells_are_retired_as_one_unit() {
     assert_eq!(h.live(5), vec![0, 1], "its neighbours are untouched");
     assert_eq!(h.retired(), 2);
 
-    // And a DIFFERENT wide glyph over it: the same unit, the same verdict.
+    // A different wide glyph over it: the same unit, the same verdict.
     let mut h = Host::at_row(5);
     h.type_str("ab\u{4f60}");
     h.idle(400);
@@ -975,8 +931,7 @@ fn a_wide_glyph_s_two_cells_are_retired_as_one_unit() {
     assert_eq!(h.leaving(5), vec![2, 3]);
     assert_eq!(h.live(5), vec![0, 1]);
 
-    // In the MIDDLE of a standing run the same overwrite is not evidence:
-    // nothing leaves, the band is whole across the new glyphs.
+    // In the middle of a standing run the same overwrite is not evidence: nothing leaves.
     let mut h = Host::at_row(5);
     h.type_str("a\u{4f60}b");
     h.idle(400);
@@ -990,11 +945,10 @@ fn a_wide_glyph_s_two_cells_are_retired_as_one_unit() {
     assert_eq!(h.retired(), 0);
 }
 
-/// (vi) The box-growth wrap with no key after it: the band is carried up under
-/// its text on the growth frame and flows there, nothing retired. The park is
-/// judged on the tick past its window (≤ `TYPE_HINT_FRESH`), and the flush's
-/// re-anchor lays the wrap's landing at the key's clock, so the growth key's
-/// glyph stands alone on the caret row.
+/// The box-growth wrap with no key after it: the band is carried up under its text and flows
+/// there, nothing retired. The park is judged on the tick past its window (≤ `TYPE_HINT_FRESH`)
+/// and the flush lays the wrap's landing at the key's clock, so the growth key's glyph stands
+/// alone on the caret row.
 #[test]
 fn the_box_growth_wrap_carries_the_band_up_and_a_silent_flush_lays_its_landing() {
     let mut h = hello(6);
@@ -1043,10 +997,9 @@ fn the_box_growth_wrap_carries_the_band_up_and_a_silent_flush_lays_its_landing()
     );
 }
 
-/// A re-anchor onto the pane's first column lights nothing in the pane beside
-/// it. The re-anchor sweep lays the landing, one cell back from the caret, and
-/// a fold wraps at the focused pane's edges (`set_pane`), so the sweep's guard
-/// reads the pane's first column, not the grid's.
+/// A re-anchor onto the pane's first column lights nothing in the pane beside it: the landing
+/// sweep lays one cell back from the caret, so its guard reads the focused pane's first column
+/// (`set_pane`), not the grid's.
 #[test]
 fn a_re_anchor_onto_the_pane_s_first_column_lights_nothing_in_the_pane_beside_it() {
     const PANE_COL0: u16 = 40;
@@ -1063,10 +1016,8 @@ fn a_re_anchor_onto_the_pane_s_first_column_lights_nothing_in_the_pane_beside_it
         "the band is laid under the pane's own text"
     );
     let retired_before = h.retired();
-    // The re-anchor: a typed key whose echo drops the caret onto the pane's
-    // first column with the row's text unchanged, so the witness fires on
-    // nothing. The re-anchor drains the old line toward its landing but lays
-    // no cell in the neighbouring pane.
+    // The re-anchor: the echo drops the caret onto the pane's first column with the text unchanged,
+    // so the witness fires on nothing; the drain must lay no cell in the neighbouring pane.
     h.key(b"\x1b[7;41H", 1);
     let c = h.term.cursor();
     assert_eq!(
@@ -1132,13 +1083,10 @@ fn a_re_anchor_onto_the_pane_s_first_column_lights_nothing_in_the_pane_beside_it
     );
 }
 
-/// A key typed back over a cell an abandoned cohort still owns keeps its own
-/// light. `hello world`, Up, Down, Left×3, `X` at `(5,8)`: the Up abandons the
-/// band (its cohort drains, cells still resident), so the key back on the row
-/// mints a second live cell at `(5,8)`. The stale cell is one changed glyph
-/// strictly inside a standing run, so the witness does not name it
-/// (`Witness::shape_verdicts`); it leaves on its drain, and the new cell keeps
-/// its light (`retire_cells` stamps by identity).
+/// A key typed back over a cell an abandoned cohort still owns keeps its own light. `hello
+/// world`, Up, Down, Left×3, `X` at `(5,8)`: the Up abandons the band, so the key mints a second
+/// cell there. One changed glyph inside a standing run names nothing (`Witness::shape_verdicts`);
+/// the stale cell leaves on its drain and the new one keeps its light.
 #[test]
 fn a_key_typed_over_an_abandoned_cohorts_cell_keeps_its_own_light() {
     let mut h = hello(5);
@@ -1150,10 +1098,8 @@ fn a_key_typed_over_an_abandoned_cohorts_cell_keeps_its_own_light() {
     let c = h.term.cursor();
     assert_eq!((c.row, c.col), (5, 8), "Up, Down, Left×3 from (5,11)");
     let before = h.cells_at(5, 8);
-    // The band the Up left below the caret drains from its right end, so by
-    // the third Left (+450 ms) the stale cell at (5,8) is spent and the hop has
-    // laid a fresh wake cell over it. The stale cell is still resident, not
-    // `leaving`, and the oldest at the position.
+    // The Up's band drains from its right end, so by the third Left (+450 ms) the hop has laid a
+    // fresh wake cell over the spent stale cell, which is still resident, not leaving, and oldest.
     assert!(
         !before.is_empty() && !before[0].1,
         "the stale owner at (5,8) is resident and abandoned, not leaving: {before:?}"
@@ -1182,9 +1128,7 @@ fn a_key_typed_over_an_abandoned_cohorts_cell_keeps_its_own_light() {
         0,
         "one glyph changed inside a standing run names nothing — not the stale cell, not the fresh one, not the run's blank"
     );
-    // The blank stays with a run that is still standing: the other ten glyphs
-    // are unchanged, so the space at (5,5) leaves on its run's drain rather
-    // than punching a hole with the replaced glyph.
+    // The other ten glyphs are unchanged, so the run stands and its blank at (5,5) keeps its light.
     assert!(
         h.cells(5).contains(&(5, false)),
         "the run is standing and its blank kept its light: {:?}",
@@ -1212,9 +1156,7 @@ fn trail_status_appends_ribbon_retired_after_the_v2_rows() {
     let status = h.glow.v2_status().expect("v2 owns the frame");
     assert_eq!(status.retired, 11);
     let line = trail_line(&h);
-    // `ribbon_followed=` counts cells carried with their text (none: the text
-    // was overwritten in place); `ribbon_follow_missed=` is the tail's last
-    // field and nothing was missed.
+    // Overwritten in place: nothing followed, nothing missed.
     assert!(
         line.ends_with(" ribbon_retired=11 ribbon_followed=0 ribbon_follow_missed=0"),
         "the three content counts are the last fields: {line}"
@@ -1276,13 +1218,10 @@ fn follow_missed(h: &Host) -> u64 {
     h.glow.v2_status().map_or(0, |s| s.follow_missed)
 }
 
-/// The missed-follow count reaches `trail status`. `hello world` on row 5, then
-/// one batch blanks the row and writes `hel   world` on row 4: eight glyphs
-/// arrived a row up at their columns but around a hole, not one block, so the
-/// follow pass names nothing and counts the ten gone cells missed, once, on
-/// the engine status and in `trail status`'s last field. Controls: the whole
-/// line arriving is followed (eleven cells) and misses nothing; other text a
-/// row up misses nothing.
+/// The missed-follow count reaches `trail status`. One batch blanks row 5's `hello world` and
+/// writes `hel   world` a row up: the glyphs arrive around a hole, not as one block, so nothing
+/// is followed and the gone cells count as missed, once. Controls: the whole line arriving is
+/// followed; other text a row up misses nothing.
 #[test]
 fn a_line_that_arrives_a_row_up_around_a_hole_is_counted_missed_on_trail_status() {
     for (now, missed, followed) in [

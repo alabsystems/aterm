@@ -2,34 +2,25 @@
 // Copyright 2026 Andrew Yates
 
 //! Tier-1 conformance for `AltSelectionPark`
-//! (`aterm_spec::derive::alt_selection_park_model`): the alt-screen selection
-//! park, driven on the real [`Terminal`].
+//! (`aterm_spec::derive::alt_selection_park_model`): the alt-screen selection park,
+//! driven on the real [`Terminal`].
 //!
-//! Selection gestures go through [`Terminal::text_selection_mut`] as a host's
-//! drag does; screen switches are real `?1049h` / `?1049l` bytes; each
-//! destroyer is its own entry point, driven from both screens:
-//! [`Terminal::clear_scrollback`] and a width [`Terminal::resize`]
-//! (`Wholesale`), [`Terminal::reset`], byte-stream RIS alone and RIS then
-//! `?1049h` in one batch (`Reset`, the last as `Reset` then `Enter`), and
-//! [`Terminal::restore_checkpoint`] of a main- and an alt-screen checkpoint
-//! (`RestoreMain` / `RestoreAlt`).
+//! Selections go through [`Terminal::text_selection_mut`] as a host's drag does;
+//! screen switches are real `?1049h` / `?1049l` bytes; each destroyer is driven from
+//! both screens: [`Terminal::clear_scrollback`] and a width [`Terminal::resize`]
+//! (`Wholesale`), [`Terminal::reset`], RIS alone and RIS then `?1049h` in one batch
+//! (`Reset`, the last as `Reset` then `Enter`), and [`Terminal::restore_checkpoint`]
+//! of a main- and an alt-screen checkpoint (`RestoreMain` / `RestoreAlt`).
 //!
-//! The projection reads the terminal: `on_alt` is
-//! [`Terminal::is_alternate_screen`], `live_sel` the live selection, and
-//! `parked_sel` the private parked slot (hence this lives inside the crate).
-//! `last_event` is harness-supplied: which kind of step was just driven.
+//! The projection reads `on_alt` ([`Terminal::is_alternate_screen`]), the live
+//! selection and the private parked slot (hence in-crate); `last_event` is the kind
+//! of step just driven. The walk replays a real trace to every reachable state,
+//! drives every enabled step, and requires the model's successor; the negative
+//! control injects each `Buggy = 1` member and requires rejection at its action.
 //!
-//! The walk covers the model's reachable space: at every state it replays a
-//! real trace that reached it, drives every enabled step, and requires the
-//! projection to be the model's successor. The negative control injects each
-//! `Buggy = 1` member (the symmetric swap, and the destroyer that forgets the
-//! parked slot, at each destroyer shape) and requires the healthy model to
-//! reject it at that member's action.
-//!
-//! RIS is driven twice because RIS alone on the alt screen returns to main
-//! through the ordinary restore, which empties the parked slot anyway; RIS
-//! then a re-entry in one batch is the shape where only the RIS clear
-//! (`processing.rs`) empties it.
+//! RIS is driven twice because RIS alone on the alt screen returns to main through
+//! the ordinary restore, which empties the parked slot anyway; RIS then a re-entry
+//! in one batch is the shape where only the RIS clear (`processing.rs`) empties it.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -147,9 +138,8 @@ impl Checkpoints {
     }
 }
 
-/// Drive one real step. On main a selection is made in history when there is
-/// any (the reported shape: read back, highlight, run a pager); the alt buffer
-/// has none, so there it is a live row.
+/// Drive one real step. On main a selection is made in history when there is any;
+/// the alt buffer has none, so there it is a live row.
 fn drive(term: &mut Terminal, step: Step, checkpoints: &Checkpoints) {
     match step {
         Step::Select => {
@@ -191,10 +181,9 @@ type Patch = fn(&mut Terminal, Step, Before);
 /// The healthy code, untouched.
 fn no_patch(_: &mut Terminal, _: Step, _: Before) {}
 
-/// The model's first `Buggy = 1` member, as the net effect it would have on the
-/// real terminal: the park and the restore become a symmetric swap — whatever
-/// was parked is handed to the live slot on the way in, and the alt screen's
-/// own selection lands in the parked slot on the way out.
+/// The model's first `Buggy = 1` member as its net effect on the real terminal: a
+/// symmetric swap, handing the parked selection to the live slot on entry and the
+/// alt screen's own selection to the parked slot on exit.
 fn swap_patch(term: &mut Terminal, step: Step, before: Before) {
     match step {
         Step::Enter => term.text_selection = before.parked,
@@ -307,8 +296,8 @@ fn walk(model: &Model, patch: Patch) -> Result<Coverage, String> {
             let mut term = replay(&path, patch, &checkpoints);
             apply(&mut term, step, patch, &checkpoints);
             let after = project(&term, step.last_event());
-            // A one-action step must also be admitted as that action — not merely
-            // land on a state some other action would have produced.
+            // A one-action step must be admitted as that action, not merely land
+            // on a state some other action produces.
             let admitted = match actions {
                 [action] => admits(model, &state, &after) == Some(*action),
                 _ => true,
@@ -368,18 +357,15 @@ fn the_real_park_conforms_to_the_model_over_its_whole_reachable_space() {
     );
 }
 
-/// Negative control. The same walk over the same real terminal, with each of
-/// the model's `Buggy = 1` members injected after the real step it corrupts:
-/// the healthy model must reject every one, at that member's own action. And
-/// the shipped park is in turn rejected by the buggy model, so the bind tells
+/// Negative control: the same walk with each `Buggy = 1` member injected after the
+/// real step it corrupts is rejected by the healthy model at that member's own
+/// action, and the shipped park is rejected by the buggy model, so the bind tells
 /// the two apart in both directions.
 ///
-/// The forgetful destroyer is only visible because the projection reads the
-/// parked slot. Observed from outside at the next restore it would pass: the
-/// erase that `clear_scrollback` runs also records `SelectionDamage::All` on the
-/// parked grid, and the exit batch drains it right after the restore, retiring
-/// the stale selection on arrival. That second enforcer is real and welcome,
-/// but it is not the clear this bind is about — so the slot is what is read.
+/// The forgetful destroyer is visible only because the projection reads the parked
+/// slot: from outside it would pass, as `clear_scrollback`'s erase also records
+/// `SelectionDamage::All` on the parked grid and the exit batch retires the stale
+/// selection right after the restore.
 #[test]
 fn the_swap_and_each_forgetful_destroyer_are_rejected() {
     let healthy = alt_selection_park_model();

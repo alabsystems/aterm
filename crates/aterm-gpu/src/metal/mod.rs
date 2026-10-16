@@ -26,6 +26,8 @@
 //!    latched sticky.
 //! 7. [`swapchain`]: `CAMetalLayer` by class name, with a bounded acquire,
 //!    present in scheduled-safe order, and the frame boundary as a type.
+//! 8. [`warm`]: the first window's shaders compiled on a launch worker and
+//!    discarded, so the main thread's compile is a Metal cache hit.
 //!
 //! `build_glow_boost_pipeline` is one `create_render_pipeline` site used for
 //! two rows (HDR crown and SDR twin), so there is one more pipeline than
@@ -73,25 +75,21 @@ pub(crate) mod present;
 pub(crate) mod resources;
 pub(crate) mod shaders;
 pub(crate) mod swapchain;
+pub(crate) mod warm;
 
 /// The helpers every GPU test module under `metal` shares.
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::ffi::{self, Device, Obj};
 
-    /// A device for GPU tests, or `None` (with a loud skip message) on a machine
-    /// without one.
+    /// A device for GPU tests; a machine without one ends the test COULD NOT RUN.
     ///
     /// Uses [`Device::preferred`], the device the Metal arm renders on: on a
     /// dual-GPU Mac the system default is the discrete GPU while the wgpu arm
     /// asks for the low-power one, and two GPUs can round a blended channel
     /// differently.
-    pub(crate) fn device() -> Option<Device> {
-        let d = Device::preferred();
-        if d.is_none() {
-            crate::stderr_line!("SKIP: no Metal device");
-        }
-        d
+    pub(crate) fn device() -> Device {
+        Device::preferred().unwrap_or_else(|| aterm_spec::host::could_not_run("no Metal device"))
     }
 
     /// `cell.metal`'s 16-byte `Uniforms` block: `float2 screen`,
@@ -199,7 +197,7 @@ mod tests {
             FireFieldParams, FireRow, fire_precomp, fire_shade_add, fire_shade_over, fire_top_fade,
         };
 
-        let Some(dev) = device() else { return };
+        let dev = device();
         let lib = dev
             .new_library(&shaders::cell_with_parity_kernels())
             .expect("cell.metal + parity kernels compile");
@@ -347,7 +345,7 @@ mod tests {
     fn rain_halo_matches_the_cpu_bit_for_bit() {
         use aterm_render::{halo_row_ny, halo_weight};
 
-        let Some(dev) = device() else { return };
+        let dev = device();
         let lib = dev
             .new_library(&shaders::cell_with_parity_kernels())
             .expect("cell.metal + parity kernels compile");
@@ -570,7 +568,7 @@ mod tests {
     /// red bit 3) is not the channel order.
     #[test]
     fn color_write_mask_gates_each_channel_on_the_gpu() {
-        let Some(dev) = device() else { return };
+        let dev = device();
         let p = StateProbe::new(dev);
         const W: usize = 8;
         const H: usize = 8;
@@ -666,7 +664,7 @@ mod tests {
     /// so nothing errors without this check.
     #[test]
     fn scissor_rect_clips_the_fullscreen_draw() {
-        let Some(dev) = device() else { return };
+        let dev = device();
         let sc = MtlScissorRect {
             x: 4,
             y: 3,
@@ -682,7 +680,7 @@ mod tests {
     /// Checked separately from the scissor, since they are separate state.
     #[test]
     fn viewport_confines_the_fullscreen_draw() {
-        let Some(dev) = device() else { return };
+        let dev = device();
         let vp = MtlViewport {
             origin_x: 4.0,
             origin_y: 3.0,
@@ -833,7 +831,7 @@ mod tests {
     /// covered by [`sampler_min_filter_changes_the_minified_bytes`].
     #[test]
     fn sampler_mag_filter_changes_the_magnified_bytes() {
-        let Some(dev) = device() else { return };
+        let dev = device();
         let p = StateProbe::new(dev);
         const DW: usize = 4;
 
@@ -889,7 +887,7 @@ mod tests {
     /// apart; two constant quadrants are controls where they must agree.
     #[test]
     fn sampler_min_filter_changes_the_minified_bytes() {
-        let Some(dev) = device() else { return };
+        let dev = device();
         let p = StateProbe::new(dev);
 
         // Red channel of the 4x4 source, one row per line. Quadrant averages:
@@ -937,7 +935,7 @@ mod tests {
     /// values so the setter is proven independent of the OS default.
     #[test]
     fn compile_options_pin_invariance_and_the_language_version() {
-        let Some(dev) = device() else { return };
+        let dev = device();
 
         let on = CompileOptions::new().expect("MTLCompileOptions");
         on.set_preserve_invariance(true);
@@ -1021,7 +1019,7 @@ mod tests {
     /// is 8 bytes per texel.
     #[test]
     fn the_readback_stride_is_checked_against_the_destination_format() {
-        let Some(dev) = device() else { return };
+        let dev = device();
         let p = StateProbe::new(dev);
         const FMT: PixelFormat = PixelFormat::Rgba16Float;
         const W: usize = 8;
@@ -1113,7 +1111,7 @@ mod tests {
     fn the_bg_row_draws_its_instance_stream_at_the_deconflicted_slot() {
         use crate::pipeline_table::Pipeline;
 
-        let Some(dev) = device() else { return };
+        let dev = device();
         let queue = dev.new_command_queue().expect("queue");
         let spec = Pipeline::Bg.spec();
         let lib = super::pipelines::compile(&dev, spec).expect("cell.metal compiles");
@@ -1262,7 +1260,7 @@ mod tests {
     fn the_tray_strip_covers_the_whole_card() {
         use crate::pipeline_table::{Pipeline, Topology};
 
-        let Some(dev) = device() else { return };
+        let dev = device();
         let p = StateProbe::new(dev);
         let spec = Pipeline::Tray.spec();
         assert_eq!(
@@ -1444,16 +1442,8 @@ mod tests {
     /// `edge < border_px` boundary is inert because `edge` is never an integer.
     #[test]
     fn blit_matches_wgpu_byte_for_byte() {
-        if device().is_none() {
-            return;
-        }
-        let mut gpu = match GpuRenderer::new(18.0, Theme::default()) {
-            Ok(g) => g,
-            Err(e) => {
-                crate::stderr_line!("SKIP: no GPU renderer: {e}");
-                return;
-            }
-        };
+        let _ = device();
+        let mut gpu = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
         // Selection defaults to Metal; this test drives the wgpu oracle arm,
         // so it disarms the default.
         gpu.disarm_metal_for_test();
@@ -1784,14 +1774,8 @@ mod tests {
         use crate::pipeline_table::Pipeline;
         use std::sync::Arc;
 
-        let Some(dev) = device() else { return };
-        let mut gpu = match GpuRenderer::new(18.0, Theme::default()) {
-            Ok(g) => g,
-            Err(e) => {
-                crate::stderr_line!("SKIP: no GPU renderer: {e}");
-                return;
-            }
-        };
+        let dev = device();
+        let mut gpu = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
         // Selection defaults to Metal; this test drives the wgpu oracle arm,
         // so it disarms the default.
         gpu.disarm_metal_for_test();
@@ -2000,15 +1984,9 @@ mod tests {
         use crate::pipeline_table::Pipeline;
         use std::sync::Arc;
 
-        let Some(dev) = device() else { return };
+        let dev = device();
         let _test_pool = ffi::AutoreleasePool::new();
-        let mut gpu = match GpuRenderer::new(18.0, Theme::default()) {
-            Ok(g) => g,
-            Err(e) => {
-                crate::stderr_line!("SKIP: no GPU renderer: {e}");
-                return;
-            }
-        };
+        let mut gpu = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
         // Selection defaults to Metal; this test drives the wgpu oracle arm,
         // so it disarms the default.
         gpu.disarm_metal_for_test();
@@ -2205,15 +2183,9 @@ mod tests {
         use crate::pipeline_table::Pipeline;
         use std::sync::Arc;
 
-        let Some(dev) = device() else { return };
+        let dev = device();
         let _test_pool = ffi::AutoreleasePool::new();
-        let mut gpu = match GpuRenderer::new(18.0, Theme::default()) {
-            Ok(g) => g,
-            Err(e) => {
-                crate::stderr_line!("SKIP: no GPU renderer: {e}");
-                return;
-            }
-        };
+        let mut gpu = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
         // Selection defaults to Metal; this test drives the wgpu oracle arm,
         // so it disarms the default.
         gpu.disarm_metal_for_test();
@@ -2447,16 +2419,8 @@ mod tests {
     #[test]
     fn armed_production_render_input_matches_the_wgpu_arm_byte_for_byte() {
         const N: usize = 5;
-        if device().is_none() {
-            return;
-        }
-        let mut wg = match GpuRenderer::new(18.0, Theme::default()) {
-            Ok(g) => g,
-            Err(e) => {
-                crate::stderr_line!("SKIP: no GPU renderer: {e}");
-                return;
-            }
-        };
+        let _ = device();
+        let mut wg = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
         // Selection defaults to Metal; the wgpu oracle twin disarms.
         wg.disarm_metal_for_test();
         let mut armed = GpuRenderer::new(18.0, Theme::default()).expect("second renderer");
@@ -2510,16 +2474,8 @@ mod tests {
     fn armed_inline_image_plane_matches_the_wgpu_arm_byte_for_byte() {
         use crate::renderer::StreamId;
         const N: usize = 5;
-        if device().is_none() {
-            return;
-        }
-        let mut wg = match GpuRenderer::new(18.0, Theme::default()) {
-            Ok(g) => g,
-            Err(e) => {
-                crate::stderr_line!("SKIP: no GPU renderer: {e}");
-                return;
-            }
-        };
+        let _ = device();
+        let mut wg = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
         // Selection defaults to Metal; the wgpu oracle twin disarms.
         wg.disarm_metal_for_test();
         let mut armed = GpuRenderer::new(18.0, Theme::default()).expect("second renderer");
@@ -2645,16 +2601,8 @@ mod tests {
     #[test]
     fn armed_readback_effects_match_the_wgpu_arm_byte_for_byte() {
         const N: usize = 5;
-        if device().is_none() {
-            return;
-        }
-        let mut wg = match GpuRenderer::new(18.0, Theme::default()) {
-            Ok(g) => g,
-            Err(e) => {
-                crate::stderr_line!("SKIP: no GPU renderer: {e}");
-                return;
-            }
-        };
+        let _ = device();
+        let mut wg = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
         // Selection defaults to Metal; the wgpu oracle twin disarms.
         wg.disarm_metal_for_test();
         let mut armed = GpuRenderer::new(18.0, Theme::default()).expect("second renderer");
@@ -2791,16 +2739,8 @@ mod tests {
     #[test]
     fn armed_present_tap_ring_captures_the_submit_b_destination_byte_for_byte() {
         const N: usize = 3;
-        if device().is_none() {
-            return;
-        }
-        let mut armed = match GpuRenderer::new(18.0, Theme::default()) {
-            Ok(g) => g,
-            Err(e) => {
-                crate::stderr_line!("SKIP: no GPU renderer: {e}");
-                return;
-            }
-        };
+        let _ = device();
+        let mut armed = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
         armed.arm_metal_for_test();
         armed.debug_block_on_lazy_fallbacks();
         let mut win = WindowGpu::new();
@@ -2898,16 +2838,8 @@ mod tests {
     /// (`metal_shift_offscreen_band_px`).
     #[test]
     fn armed_scissored_present_cadence_matches_wgpu_byte_for_byte() {
-        if device().is_none() {
-            return;
-        }
-        let mut wg = match GpuRenderer::new(18.0, Theme::default()) {
-            Ok(g) => g,
-            Err(e) => {
-                crate::stderr_line!("SKIP: no GPU renderer: {e}");
-                return;
-            }
-        };
+        let _ = device();
+        let mut wg = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
         // Selection defaults to Metal; the wgpu oracle twin disarms.
         wg.disarm_metal_for_test();
         let mut armed = GpuRenderer::new(18.0, Theme::default()).expect("second renderer");
@@ -3035,16 +2967,8 @@ mod tests {
     #[test]
     fn armed_submit_a_pipelines_and_stays_byte_identical() {
         const N: usize = 6;
-        if device().is_none() {
-            return;
-        }
-        let mut wg = match GpuRenderer::new(18.0, Theme::default()) {
-            Ok(g) => g,
-            Err(e) => {
-                crate::stderr_line!("SKIP: no GPU renderer: {e}");
-                return;
-            }
-        };
+        let _ = device();
+        let mut wg = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
         // Selection defaults to Metal; the wgpu oracle twin disarms.
         wg.disarm_metal_for_test();
         let mut armed = GpuRenderer::new(18.0, Theme::default()).expect("second renderer");
@@ -3091,16 +3015,8 @@ mod tests {
     #[test]
     fn the_staging_wait_polls_first_and_books_no_park_on_a_steady_loop() {
         const N: usize = 4;
-        if device().is_none() {
-            return;
-        }
-        let mut armed = match GpuRenderer::new(18.0, Theme::default()) {
-            Ok(g) => g,
-            Err(e) => {
-                crate::stderr_line!("SKIP: no GPU renderer: {e}");
-                return;
-            }
-        };
+        let _ = device();
+        let mut armed = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
         armed.arm_metal_for_test();
         armed.debug_block_on_lazy_fallbacks();
         let mut win = WindowGpu::new();
@@ -3142,17 +3058,9 @@ mod tests {
     /// a no-op for a never-armed window.
     #[test]
     fn a_disarm_unparents_the_previously_armed_windows_stale_layer() {
-        if device().is_none() {
-            return;
-        }
+        let _ = device();
         let _pool = ffi::AutoreleasePool::new();
-        let mut armed = match GpuRenderer::new(18.0, Theme::default()) {
-            Ok(g) => g,
-            Err(e) => {
-                crate::stderr_line!("SKIP: no GPU renderer: {e}");
-                return;
-            }
-        };
+        let mut armed = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
         armed.arm_metal_for_test();
         armed.debug_block_on_lazy_fallbacks();
         let mut win = WindowGpu::new();
@@ -3230,19 +3138,11 @@ mod tests {
     #[test]
     fn armed_present_translucency_matches_wgpu_end_to_end() {
         const N: usize = 5;
-        if device().is_none() {
-            return;
-        }
+        let _ = device();
         let input = representative_input();
         for (label, opacity) in [("opaque", 1.0f32), ("translucent", 0.55f32)] {
             let translucent = opacity < 1.0;
-            let mut wg = match GpuRenderer::new(18.0, Theme::default()) {
-                Ok(g) => g,
-                Err(e) => {
-                    crate::stderr_line!("SKIP: no GPU renderer: {e}");
-                    return;
-                }
-            };
+            let mut wg = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
             // Selection defaults to Metal; the wgpu oracle twin disarms.
             wg.disarm_metal_for_test();
             wg.set_background_opacity(opacity);
@@ -3312,16 +3212,8 @@ mod tests {
     #[test]
     fn armed_virtual_present_feeds_the_unchanged_tap_ring_byte_for_byte() {
         const N: usize = 5;
-        if device().is_none() {
-            return;
-        }
-        let mut wg = match GpuRenderer::new(18.0, Theme::default()) {
-            Ok(g) => g,
-            Err(e) => {
-                crate::stderr_line!("SKIP: no GPU renderer: {e}");
-                return;
-            }
-        };
+        let _ = device();
+        let mut wg = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
         // Selection defaults to Metal; the wgpu oracle twin disarms.
         wg.disarm_metal_for_test();
         let mut armed = GpuRenderer::new(18.0, Theme::default()).expect("second renderer");
@@ -3413,16 +3305,8 @@ mod tests {
         use std::sync::Arc;
 
         const N: usize = 5;
-        if device().is_none() {
-            return;
-        }
-        let mut gpu = match GpuRenderer::new(18.0, Theme::default()) {
-            Ok(g) => g,
-            Err(e) => {
-                crate::stderr_line!("SKIP: no GPU renderer: {e}");
-                return;
-            }
-        };
+        let _ = device();
+        let mut gpu = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
         // Selection defaults to Metal; this test drives the wgpu oracle arm,
         // so it disarms the default.
         gpu.disarm_metal_for_test();
@@ -3744,14 +3628,10 @@ mod tests {
                                win: &mut WindowGpu,
                                name: &str,
                                input: &RenderInput,
-                               must_drive: &[S]|
-         -> bool {
+                               must_drive: &[S]| {
             for run in 0..N {
                 match gpu.frame_differential_for_test(win, input) {
-                    Ok(None) => {
-                        crate::stderr_line!("SKIP: no Metal device");
-                        return false;
-                    }
+                    Ok(None) => aterm_spec::host::could_not_run("no Metal device"),
                     Err(e) => panic!("{name} run {run}: {e}"),
                     Ok(Some((expected, actual))) => {
                         // The fixture must drive the streams it claims to
@@ -3780,19 +3660,16 @@ mod tests {
                     }
                 }
             }
-            true
         };
 
         for (name, input, must_drive) in &fixtures {
-            if !run_fixture(&mut gpu, &mut win, name, input, must_drive) {
-                return;
-            }
+            run_fixture(&mut gpu, &mut win, name, input, must_drive);
         }
         // 8. cursor_blend: the translucent cursor fill (row 3) — and prove
         // the fill really switched to the CursorBlend pipe.
         gpu.set_cursor_opacity(0.5);
         let input = base_input();
-        let ran = run_fixture(
+        run_fixture(
             &mut gpu,
             &mut win,
             "cursor_blend",
@@ -3810,9 +3687,6 @@ mod tests {
             "cursor_opacity 0.5 must route the cursor fill through CursorBlend (row 3)"
         );
         gpu.set_cursor_opacity(1.0);
-        if !ran {
-            return;
-        }
         for line in &results {
             crate::stderr_line!("{line}");
         }
@@ -3834,16 +3708,8 @@ mod tests {
         use crate::renderer::StreamId as S;
 
         const N: usize = 5;
-        if device().is_none() {
-            return;
-        }
-        let mut gpu = match GpuRenderer::new(18.0, Theme::default()) {
-            Ok(g) => g,
-            Err(e) => {
-                crate::stderr_line!("SKIP: no GPU renderer: {e}");
-                return;
-            }
-        };
+        let _ = device();
+        let mut gpu = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
         // Selection defaults to Metal; this test drives the wgpu oracle arm,
         // so it disarms the default.
         gpu.disarm_metal_for_test();
@@ -3954,8 +3820,7 @@ mod tests {
         for run in 0..N {
             match gpu.frame_differential_for_test(&mut win, &input) {
                 Ok(None) => {
-                    crate::stderr_line!("SKIP: no Metal device");
-                    return;
+                    aterm_spec::host::could_not_run("no Metal device");
                 }
                 Err(e) => panic!("run {run}: {e}"),
                 Ok(Some((expected, actual))) => {
@@ -4014,16 +3879,8 @@ mod tests {
         use aterm_render::{GlowQuad, premul_rgb};
 
         const N: usize = 5;
-        if device().is_none() {
-            return;
-        }
-        let mut gpu = match GpuRenderer::new(18.0, Theme::default()) {
-            Ok(g) => g,
-            Err(e) => {
-                crate::stderr_line!("SKIP: no GPU renderer: {e}");
-                return;
-            }
-        };
+        let _ = device();
+        let mut gpu = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
         // Selection defaults to Metal; this test drives the wgpu oracle arm,
         // so it disarms the default.
         gpu.disarm_metal_for_test();
@@ -4097,8 +3954,7 @@ mod tests {
             let actual =
                 match gpu.metal_replay_recorded_plan_for_test(&win, &b, (w, h), Some(&seed)) {
                     Ok(None) => {
-                        crate::stderr_line!("SKIP: no Metal device");
-                        return;
+                        aterm_spec::host::could_not_run("no Metal device");
                     }
                     Err(e) => panic!("run {run}: {e}"),
                     Ok(Some(f)) => f,
@@ -4151,16 +4007,8 @@ mod tests {
         use crate::TrayQuad;
 
         const N: usize = 5;
-        if device().is_none() {
-            return;
-        }
-        let mut gpu = match GpuRenderer::new(18.0, Theme::default()) {
-            Ok(g) => g,
-            Err(e) => {
-                crate::stderr_line!("SKIP: no GPU renderer: {e}");
-                return;
-            }
-        };
+        let _ = device();
+        let mut gpu = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
         // Selection defaults to Metal; this test drives the wgpu oracle arm,
         // so it disarms the default.
         gpu.disarm_metal_for_test();
@@ -4383,14 +4231,8 @@ mod tests {
         use crate::pipeline_table::Pipeline;
         use std::sync::Arc;
 
-        let Some(dev) = device() else { return };
-        let mut gpu = match GpuRenderer::new(18.0, Theme::default()) {
-            Ok(g) => g,
-            Err(e) => {
-                crate::stderr_line!("SKIP: no GPU renderer: {e}");
-                return;
-            }
-        };
+        let dev = device();
+        let mut gpu = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
         // Selection defaults to Metal; this test drives the wgpu oracle arm,
         // so it disarms the default.
         gpu.disarm_metal_for_test();

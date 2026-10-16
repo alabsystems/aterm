@@ -206,8 +206,8 @@ fn fx_celebration_completion_guard_conforms_to_real_detector() {
                 actual, expected,
                 "the real detector fires only on the licensed success"
             );
-            // A deliberately unlicensed live run is the historical guard
-            // omission, not another healthy state that could pass vacuously.
+            // Negative control: a run forced live with no keyed success (what an unguarded
+            // detector would do) breaks the invariant.
             if !credit && !failed {
                 actual.insert("live", 1);
                 assert!(!model.check_invariant("ARunNeedsItsOwnKeyedSuccess", &actual));
@@ -297,8 +297,6 @@ fn a_command_that_speaks_was_run_by_a_keystroke() {
     let t = Instant::now();
     let mut spent = None;
 
-    // A window that has never seen an Enter: a `D` arriving with the
-    // marks a program printed itself says nothing.
     assert!(
         !verdict_armed(&mut spent, 7, None),
         "a D with no Enter behind it at all is silent"

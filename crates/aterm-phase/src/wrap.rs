@@ -5,7 +5,7 @@
 //!
 //! In a pane narrower than a line of its text, Ink word-wraps the line onto
 //! the rows under it, each at the column the line's text starts at. Measured
-//! on Claude Code 2.1.295 and 2.1.299 in `tools/real-claude-lab` (the
+//! on Claude Code 2.1.295 and 2.1.299 in the real-Claude lab (the
 //! fixtures `claude-2.1.29x-*-NNcol.txt`):
 //! * a box's key-hint footer (`Enter to confirm · Esc to` over `cancel` at
 //!   34 columns; [`crate::prompt`], "A WRAPPED FOOTER");
@@ -17,6 +17,29 @@
 //! * a turn's `⎿` notice, at the gutter's text column five (`⎿  You've hit
 //!   your` over `session limit ·` at 26 columns).
 //!
+//! And on 2.1.300 (the harness sweep of 2026-10-15, ATERM-KI-1015-1; the
+//! fixtures `claude-2.1.300-*-NNcol.txt`):
+//! * a box's TITLE (`What do you want to` over `do?`, the usage-limit
+//!   dialog at 26 columns; [`crate::prompt`], "A WRAPPED TITLE": joined only
+//!   where its row alone is no whole title, and only as far as the line is
+//!   one, for a box's body is drawn under its title at the same column), and
+//!   a plan approval's option label (`1. Yes, and use auto` over `mode`);
+//! * the plan dialog's key-hint row under its options (`ctrl+g to edit in
+//!   Vim ·` over the plan file's path, below about 70 columns;
+//!   `crate::prompt`'s `last_hint`);
+//! * the status row, the spinner's at its own column (`✻ Choreogr` over
+//!   `aphing…` at 10 columns; `·` alone over `Precipitat` over `ing…`; `✻`
+//!   over `Calculatin` over `g` over `…`, broken between its spans: [`run_end`]),
+//!   a done row's at its text column two (`✻ Baked for 0s · done 7:06` over
+//!   `  AM`; `phase`'s `status_line_end`: never under a row already busy
+//!   alone, as a full retry row is, which has the vendor's own notice at
+//!   column two under it);
+//! * the session survey's question at column two (`● How is Claude doing
+//!   this` over `session? (optional)`; [`crate::survey`]) — and its OPTIONS,
+//!   a row of four boxes Ink lays out side by side, each box's text wrapped
+//!   inside the box (`  1: Bad2:    3:    0: Dis` over `        Fine  Good
+//!   miss` at 26): [`rejoined_cells`] reads each box's rows as its line.
+//!
 //! Read a row at a time such a line says less than it does, or nothing: the
 //! banner named no reset, so the harness waited on its 30-minute backstop
 //! and, after Esc on the countdown, typed `keep going` into the standing
@@ -24,11 +47,13 @@
 //! sweep, measured again 2026-10-14). So every reader of such a line reads it
 //! across its rows: [`continues`] is the one rule for "this row is the rest
 //! of the line above it", [`line_end`] finds a line's last row by it, and
-//! [`rejoined`] joins the rows. Where those readers are: the box's footer
+//! [`rejoined`] joins the rows. Where those readers are: the box's footer,
+//! its title, the plan dialog's hint and its options' labels
 //! ([`crate::prompt`]); the wall's footer item, banner, countdown, `⎿`
 //! notice, the vendor's word on its own auto-continue and the `⎿  Login
 //! successful` that lifts a login wall ([`crate::phase`]'s `line_at`,
-//! [`crate::wall`]).
+//! [`crate::wall`]); the status row ([`crate::phase`]'s `status_line_end`);
+//! the rating card's question and options ([`crate::survey`]).
 //!
 //! A `⏺` message's line is its paragraph, the rows under it at column two
 //! (`phase`'s `message_end`, as `error_row_notice` always read it). Claude
@@ -46,9 +71,18 @@
 //! your` is two lines of the notice, read as one. So a reader joins a line
 //! to read what it says — its kind, its reset — and bounds what it takes by
 //! the text's own grammar, never by where the row ended: a reset is the time
-//! a notice names and no more (`phase`'s `time_after`). And a word longer
+//! a notice names and no more (`phase`'s `time_after`); a title is a header
+//! its grammar reads or a dialog title the anchor table names, and a row that
+//! is one alone takes no row under it (`prompt`'s `title_line`: a file box's
+//! long path under `Edit file` reads to this rule as the title's rest); a
+//! status row already busy alone takes no row at column two. And a word longer
 //! than its row is broken where the row ends (`cancelled · /rat` over
 //! `e-limit-options`): joined with a space, the word reads in two halves.
+//! A line drawn in spans of their own (the spinner's shimmering verb) is
+//! broken between spans as well as where a row is full (`g` over `…` at 10
+//! columns): the rule misses that break, and the status row is read by
+//! [`run_end`] instead — its rows at its column, up to the first row that
+//! opens a block of its own.
 
 use crate::phase::leading_spaces;
 use crate::question::cells;
@@ -101,6 +135,30 @@ pub(crate) fn line_end(
     while end + 1 < until && continues(above, col, &rows[end + 1], room) {
         end += 1;
         above = crate::text::trim(&rows[end]);
+    }
+    end
+}
+
+/// The last row of a line Ink broke at the edges of its SPANS rather than
+/// where a row was full (module header, "THE LIMITS"): row `first` and each
+/// row after it, short of row `until`, that is not blank, starts at column
+/// `col` and draws no rule, frame or block glyph. The spinner's verb is drawn
+/// in spans whose colours move across it (its shimmer), and in a pane
+/// narrower than the line Ink breaks it between them as often as where a row
+/// is full (MEASURED on 2.1.300 at 10 columns: `✻` over `Calculatin` over
+/// `g` over `…`, the ellipsis alone on its row; `phase`'s
+/// `status_line_end`). [`continues`] cannot see such a break, so the caller
+/// bounds the run: `until` is the first row that opens a block of its own.
+pub(crate) fn run_end(rows: &[String], first: usize, col: usize, until: usize) -> usize {
+    let until = until.min(rows.len());
+    let drawn = |t: &str| t.chars().any(|c| ('\u{2500}'..='\u{259F}').contains(&c));
+    let mut end = first;
+    while end + 1 < until && {
+        let r = &rows[end + 1];
+        let t = crate::text::trim(r);
+        !t.is_empty() && leading_spaces(r) == col && !drawn(t)
+    } {
+        end += 1;
     }
     end
 }
@@ -159,6 +217,63 @@ pub(crate) fn rejoined(run: &[String]) -> String {
         out.push_str(crate::text::trim(r));
     }
     out
+}
+
+/// Rows `run`, ONE ROW OF BOXES Ink lays out side by side (a flex row: the
+/// session survey's options), each box's text wrapped inside its own box,
+/// read as each box's line: box `k` starts at cell `starts[k]` on every row
+/// and runs to the next box's start, the last one to `width` (never before
+/// its own start, so a degenerate screen cannot underflow the box-local
+/// width). A box's rows
+/// are joined as [`rejoined`] joins a line, with one space — save where the
+/// row above FILLS its box: Ink broke a word longer than the box there, and
+/// the halves join with nothing between them (`0: Dis` over `miss` in a box
+/// six cells wide). `None` when a row under the first is none of the boxes'
+/// rows: text left of the first box, or a box's text that starts anywhere
+/// but at its box's column.
+pub(crate) fn rejoined_cells(
+    run: &[String],
+    starts: &[usize],
+    width: usize,
+) -> Option<Vec<String>> {
+    let (&first, rest) = starts.split_first()?;
+    // Starts are strictly increasing. Clamp the final end to its own start
+    // when the pane is narrower, keeping every box width nonnegative.
+    let last_start = *rest.last().unwrap_or(&first);
+    let ends: Vec<usize> = rest
+        .iter()
+        .copied()
+        .chain([width.max(last_start)])
+        .collect();
+    let mut texts = vec![String::new(); starts.len()];
+    let mut full = vec![false; starts.len()];
+    for (k, row) in run.iter().enumerate() {
+        let (left, mut row) = crate::question::split_at_cell(row, first);
+        if !crate::text::trim(left).is_empty() {
+            return None;
+        }
+        for (b, &end) in ends.iter().enumerate() {
+            let (cell, after) = crate::question::split_at_cell(row, end - starts[b]);
+            row = after;
+            let text = crate::text::trim_end(cell);
+            if text.is_empty() {
+                continue;
+            }
+            // A box's own row starts at its column; the first row may hold a
+            // box's text that ran into the next box (`1: Bad2:`), never one
+            // under it.
+            if k > 0 && leading_spaces(text) > 0 {
+                return None;
+            }
+            let text = crate::text::trim(text);
+            if !texts[b].is_empty() && !full[b] {
+                texts[b].push(' ');
+            }
+            texts[b].push_str(text);
+            full[b] = cells(cell.trim_end()) >= end - starts[b];
+        }
+    }
+    Some(texts)
 }
 
 #[cfg(test)]
@@ -271,5 +386,69 @@ mod tests {
         // One word, and nothing.
         assert_eq!(rows_in("e-limit-options", 16), 1);
         assert_eq!(rows_in("", 16), 1);
+    }
+
+    /// A row of boxes as Claude Code 2.1.300 draws the session survey's
+    /// options in a narrow pane (the fixtures
+    /// `claude-2.1.300-survey-session-NNcol.txt`): each box's rows joined —
+    /// with a space where Ink broke at one, with none where the row filled
+    /// its box (`0: Dis` over `miss` in a box six cells wide). NEGATIVE
+    /// CONTROLS: a row whose text starts inside a box, text left of the first
+    /// box.
+    #[test]
+    fn rejoined_cells_reads_each_box_of_a_wrapped_row() {
+        let at_26 = rows(&["  1: Bad2:    3:    0: Dis", "        Fine  Good  miss"]);
+        assert_eq!(
+            rejoined_cells(&at_26, &[2, 8, 14, 20], 26),
+            Some(
+                ["1: Bad", "2: Fine", "3: Good", "0: Dismiss"]
+                    .map(String::from)
+                    .to_vec()
+            )
+        );
+        let at_34 = rows(&[
+            "  1: Bad  2: Fine 3: Good 0:",
+            "                          Dismiss",
+        ]);
+        assert_eq!(
+            rejoined_cells(&at_34, &[2, 10, 18, 26], 34),
+            Some(
+                ["1: Bad", "2: Fine", "3: Good", "0: Dismiss"]
+                    .map(String::from)
+                    .to_vec()
+            )
+        );
+        // One row is its boxes as drawn.
+        assert_eq!(
+            rejoined_cells(&at_34[..1], &[2, 10, 18, 26], 34),
+            Some(
+                ["1: Bad", "2: Fine", "3: Good", "0:"]
+                    .map(String::from)
+                    .to_vec()
+            )
+        );
+        // A degenerate screen whose last box key sits PAST a short pane rule
+        // (an adversarial child: keys at 2,8,14,20 under a width-10 rule) must
+        // not underflow the box-local width `end - starts[b]`; the last box
+        // reads empty and nothing panics.
+        assert_eq!(
+            rejoined_cells(&at_26, &[2, 8, 14, 20], 10),
+            Some(
+                ["1: Bad", "2: Fine", "3: Good", ""]
+                    .map(String::from)
+                    .to_vec()
+            )
+        );
+        // NEGATIVE CONTROLS.
+        let inside = rows(&[
+            "  1: Bad  2: Fine 3: Good 0:",
+            "                           Dismiss",
+        ]);
+        assert_eq!(rejoined_cells(&inside, &[2, 10, 18, 26], 34), None);
+        let left = rows(&[
+            "  1: Bad  2: Fine 3: Good 0:",
+            " x                        Dismiss",
+        ]);
+        assert_eq!(rejoined_cells(&left, &[2, 10, 18, 26], 34), None);
     }
 }

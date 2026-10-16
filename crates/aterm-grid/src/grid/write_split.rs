@@ -4,14 +4,10 @@
 
 //! Split write/advance primitives for the terminal handler.
 //!
-//! These separate "write at cursor" from "advance cursor", so the handler can
-//! apply cell extras (hyperlinks, non-BMP overflow, underline colors) at the
-//! written position before the cursor advances and possibly scrolls the row
-//! away. All write damage goes through `mark_content_*`, so Unicode and styled
-//! writes invalidate content-only readers just as the ASCII bulk path does.
-//!
-//! Also contains the bulk extras write path (`write_ascii_run_with_extras`)
-//! for ASCII runs with RGB/hyperlink styles, avoiding per-character fallback.
+//! Writing at the cursor is separate from advancing it, so the handler can apply cell extras
+//! (hyperlinks, non-BMP overflow, underline colours) at the written cell before the advance can
+//! scroll the row away. All write damage goes through `mark_content_*`. Also the bulk extras
+//! path for ASCII runs (`write_ascii_run_with_extras`).
 
 use std::sync::Arc;
 
@@ -38,11 +34,9 @@ impl Grid {
             row.write_char_packed(cursor_col, c, colors, flags);
         }
         self.remove_stale_extras_pair(cursor_row, cursor_col, stale);
-        // Drop a stale dense-RGB-ring entry before overwriting. This slow path
-        // puts the new cell's RGB in the HashMap
-        // (`apply_cell_extras_preflagged`), but reads consult the ring first
-        // (it is filled by the bulk and BCE/erase paths), so a leftover ring
-        // color would shadow the new one.
+        // Drop a stale dense-RGB-ring entry too: this path puts the new cell's RGB in the
+        // extras map (`apply_cell_extras_preflagged`), but reads consult the ring first (filled
+        // by the bulk and BCE/erase paths), so a leftover ring colour would shadow the new one.
         self.storage
             .extras
             .clear_rgb_ring_cell(cursor_row, cursor_col, 1);
@@ -64,10 +58,7 @@ impl Grid {
         self.write_wide_char_at_cursor_packed_ecols(c, colors, flags, effective_cols)
     }
 
-    /// Write a wide character at cursor with pre-computed effective column count.
-    ///
-    /// Avoids redundant `effective_cols_for_row` ring-buffer lookup when the
-    /// caller has already computed it (e.g., during the wide char write pipeline).
+    /// Write a wide character at the cursor, given the row's effective column count.
     ///
     /// REQUIRES: self.storage.cursor.row < self.storage.visible_rows
     #[inline]
@@ -89,9 +80,8 @@ impl Grid {
             && row.write_wide_char_packed(cursor_col, c, colors, flags)
         {
             self.remove_stale_extras_pair(cursor_row, cursor_col, stale);
-            // Drop stale dense-RGB-ring entries for both wide halves before the
-            // overwrite shows through. See `write_char_at_cursor_packed` for why
-            // the slow path must clear this second truecolor store.
+            // Drop stale dense-RGB-ring entries for both halves; see
+            // `write_char_at_cursor_packed`.
             self.storage
                 .extras
                 .clear_rgb_ring_cell(cursor_row, cursor_col, 2);
@@ -101,37 +91,27 @@ impl Grid {
         false
     }
 
-    /// Pre-wrap for wide character with pre-computed effective column count.
-    ///
-    /// Skips a redundant `resolve_pending_wrap` (the caller must have already
-    /// resolved it) and reuses `effective_cols` to avoid a second ring-buffer
-    /// lookup.
-    ///
-    /// Returns the effective_cols for the (possibly new) cursor row.
+    /// Pre-wrap for a wide char: wrap first if it won't fit at the cursor. Returns the
+    /// effective columns of the (possibly new) cursor row.
     ///
     /// REQUIRES: pending wrap already resolved
     /// REQUIRES: self.storage.visible_rows > 0
     #[inline]
     pub fn pre_wrap_wide_ecols(&mut self, effective_cols: u16, fill: Cell) -> u16 {
         if self.storage.cursor.col.saturating_add(1) >= effective_cols {
-            // Wide glyph won't fit at the last column: blank the skipped tail
-            // with the current BCE background before wrapping (matches xterm;
-            // see blank_wide_wrap_tail).
+            // The glyph won't fit at the last column: blank the skipped tail with the BCE
+            // background and wrap (xterm; see `blank_wide_wrap_tail`).
             self.blank_wide_wrap_tail(effective_cols, fill);
             self.advance_autowrap_line();
-            // Row changed — recompute effective_cols for new row
             self.storage.effective_cols_for_row(self.storage.cursor.row)
         } else {
             effective_cols
         }
     }
 
-    /// Blank the tail cell(s) skipped when a wide glyph wraps off the last column.
-    ///
-    /// A width-2 glyph that won't fit at the right edge wraps to the next line;
-    /// xterm fills the skipped cell(s) of the current row with BCE blanks (the
-    /// glyph's background) instead of leaving the old content stranded. Call with
-    /// the cursor still on the old row, before `advance_autowrap_line()`.
+    /// Blank, with BCE blanks, the tail cell(s) a wide glyph skips when it wraps off the last
+    /// column, as xterm does, rather than strand the old content. Call with the cursor still
+    /// on the old row, before `advance_autowrap_line()`.
     #[inline]
     pub(super) fn blank_wide_wrap_tail(&mut self, ecols: u16, fill: Cell) {
         let row = self.storage.cursor.row;
@@ -140,14 +120,10 @@ impl Grid {
         // there is no span to give the ring either.
         let mut bce: Option<core::ops::Range<u16>> = None;
         if let Some(r) = self.storage.row_mut(row) {
-            // A wide half bisected by this blanking takes the BCE blank, not a
-            // default-coloured one. In xterm a write bisecting a wide pair goes
-            // `util.c` `WriteText` -> `DamagedCurCells` -> `ClearInLine` ->
-            // `ClearInLine2` -> `screen.c` `ClearCells`, which widens its run
-            // over the adjacent `HIDDEN_CHAR` halves and writes `' '` with
-            // `ld->color[col] = xtermColorPair(xw)`, the current colour pair
-            // (`fill` here). EL/ED share this rule; only the rectangle ops use
-            // `Clear1Cell` instead. See `Row::clear_range_with_orphan`.
+            // A wide half bisected by this blanking takes the BCE blank (`fill`), not a
+            // default-coloured one: xterm's `ClearCells` widens its run over the adjacent
+            // `HIDDEN_CHAR` halves and writes the current colour pair. EL/ED share this rule;
+            // only the rectangle ops use `Clear1Cell`. See `Row::clear_range_with_orphan`.
             bce = Some(r.clear_range_with_orphan(col, ecols, fill, fill));
             // Record the hole the wrap leaves, so a rewrap drops this cell and
             // only it (`RowFlags::EARLY_WRAP_HOLE`). Only a hole that is the
@@ -156,13 +132,10 @@ impl Grid {
             let cols = r.cols();
             r.set_early_wrap_hole(ecols == cols && col.saturating_add(1) == cols);
         }
-        // A truecolor BCE cell carries only an RGB marker; the bytes live in
-        // `RgbColorRing`, so the blanked tail and the orphan column need ring
-        // entries, or they resolve the dead glyph's bytes. `fill_bce_rgb_range`
-        // takes the bytes from the cursor template, set from the same SGR state
-        // as these `colors` (`handler_sgr`); the `bg_is_rgb` guard keeps a
-        // caller that desynchronizes the two from seeding the ring behind an
-        // indexed marker.
+        // A truecolor BCE cell carries only an RGB marker; its bytes live in `RgbColorRing`, so
+        // the blanked tail and orphan need ring entries or they resolve the dead glyph's bytes.
+        // `fill_bce_rgb_range` reads them from the cursor template; the `bg_is_rgb` guard keeps
+        // a caller whose `fill` disagrees with it from seeding the ring behind an indexed marker.
         if let Some(bce) = bce {
             // The blanked tail and orphan drop the extras they carried (a mark on
             // the last column's glyph), or a write there would adopt them.
@@ -174,13 +147,10 @@ impl Grid {
         self.storage.mark_content_row(row);
     }
 
-    /// Advance cursor by 1 column without wrapping.
-    ///
-    /// Stops at the last column of the current row. A write at the last
-    /// column still arms `pending_wrap`: xterm sets `do_wrap = need_wrap`
-    /// whenever a print fills to the margin regardless of WRAPAROUND
-    /// (charproc.c dotext), so re-enabling DECAWM lets the next printable
-    /// wrap. Fast path: uses `cols - 1` directly to avoid a row lookup.
+    /// Advance the cursor 1 column without wrapping, stopping at the row's last column. A write
+    /// there still arms `pending_wrap`: xterm sets `do_wrap = need_wrap` whenever a print fills
+    /// to the margin regardless of DECAWM (charproc.c `dotext`), so re-enabling DECAWM lets the
+    /// next printable wrap.
     #[inline]
     pub fn advance_cursor_no_wrap(&mut self) {
         let fast_max = self.storage.cols.saturating_sub(1);
@@ -196,16 +166,9 @@ impl Grid {
         }
     }
 
-    /// Advance cursor by 1 column with autowrap (deferred).
-    ///
-    /// At the last column, sets the `pending_wrap` flag instead of wrapping
-    /// immediately. The actual wrap happens when the next character is written.
-    /// This matches xterm/VT220 deferred wrap behavior.
-    ///
-    /// Fast path: uses `cols - 1` directly (avoids ring-buffer row lookup for
-    /// double-width check and margin check). Falls back to the slow path when
-    /// cursor is at or beyond `cols - 1`, when DECDWL is active, or when
-    /// DECLRMM horizontal margins are active.
+    /// Advance the cursor 1 column with deferred autowrap (xterm/VT220): at the last column,
+    /// arm `pending_wrap` so the next printable wraps. The slow path handles the last column,
+    /// DECDWL rows and DECLRMM margins.
     ///
     /// REQUIRES: self.storage.visible_rows > 0
     #[inline]
@@ -233,18 +196,10 @@ impl Grid {
         }
     }
 
-    /// The last column a glyph printed at `col` of `row` reaches before its
-    /// deferred wrap: the row's last column (the half-width one on a DECDWL or
-    /// DECDHL row), or the DECSLRM right margin when `col` is inside the margin
-    /// span, whichever comes first. The one answer for the per-glyph writers;
-    /// the run writers derive the same clamp per row
-    /// (`effective_cols.min(right + 1)`).
-    ///
-    /// Ruling 2026-10-10 (r15 C1): capped by the row's own last column. The
-    /// per-glyph writers took the bare right margin inside the span, so on a
-    /// double-width row under DECSLRM a glyph-by-glyph run (one routed there
-    /// from outside the span, or under IRM) ran the cursor past the row's half
-    /// width, where the run writers stopped at it.
+    /// The last column a glyph printed at `col` of `row` reaches before its deferred wrap: the
+    /// row's last column (half-width on a DECDWL/DECDHL row), or the DECSLRM right margin when
+    /// `col` is inside the margin span, whichever comes first. The run writers derive the same
+    /// clamp per row (`effective_cols.min(right + 1)`).
     #[inline]
     pub(super) fn last_print_col(&self, row: u16, col: u16) -> u16 {
         let max_col = self.storage.max_col_for_row(row);
@@ -264,12 +219,8 @@ impl Grid {
             .saturating_add(1)
     }
 
-    /// Advance cursor by 2 columns (for wide char) without wrapping,
-    /// using pre-computed effective column count.
-    ///
-    /// A wide char filling to the margin arms `pending_wrap` even with autowrap
-    /// off (xterm's `do_wrap = need_wrap` is mode-independent); see
-    /// `advance_cursor_no_wrap`.
+    /// Advance the cursor 2 columns (wide char) without wrapping. Filling to the margin arms
+    /// `pending_wrap` even with autowrap off; see `advance_cursor_no_wrap`.
     #[inline]
     pub fn advance_cursor_wide_no_wrap_ecols(&mut self, effective_cols: u16) {
         let max_col = effective_cols.saturating_sub(1);
@@ -305,17 +256,14 @@ impl Grid {
                 self.storage.cursor.col += 2;
             }
             std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => {
-                // Wide char reached or exceeded end of line — defer wrap
                 self.storage.cursor.col = wrap_cols.saturating_sub(1);
                 self.storage.mark_pending_wrap();
             }
         }
     }
 
-    /// Combined pre-wrap + write + damage + advance for BMP wide chars.
-    ///
-    /// One ring-buffer lookup and no redundant bounds checks, replacing four
-    /// Grid calls on the per-char wide write path. Returns `true` if written.
+    /// Pre-wrap + write + damage + advance for a BMP wide char, with one ring-buffer lookup.
+    /// Returns `true` if written.
     ///
     /// REQUIRES: auto_wrap enabled, no insert mode
     /// REQUIRES: `self.storage.visible_rows > 0`
@@ -326,21 +274,15 @@ impl Grid {
         colors: PackedColors,
         flags: CellFlags,
     ) -> bool {
-        // Resolve pending wrap
         if self.storage.take_pending_wrap() {
             self.advance_autowrap_line();
         }
 
-        // Effective cols clamped by DECLRMM margins.
         let ecols = self.margin_clamped_ecols(self.storage.cursor.row);
 
-        // Pre-wrap wide: ensure room for 2 cells
         let ecols = if self.storage.cursor.col + 1 >= ecols {
-            // The glyph won't fit at the last column (and no wrap was pending,
-            // which take_pending_wrap would have consumed). As xterm does, blank
-            // the skipped cell with the current BCE background before wrapping
-            // the glyph, rather than stranding old content (e.g. ABCD<CUP last
-            // col>中).
+            // The glyph won't fit at the last column: blank the skipped cell with the BCE
+            // background and wrap (xterm; see `blank_wide_wrap_tail`).
             self.blank_wide_wrap_tail(ecols, Cell::bce_blank(colors));
             self.advance_autowrap_line();
             self.margin_clamped_ecols(self.storage.cursor.row)
@@ -351,11 +293,9 @@ impl Grid {
         let cursor_row = self.storage.cursor.row;
         let cursor_col = self.storage.cursor.col;
 
-        // Drop stale extras-map entries for both halves, only once the write
-        // succeeds.
+        // As in `write_wide_char_at_cursor_packed_ecols`.
         let stale = self.stale_extras_pair(cursor_row, cursor_col, 2);
 
-        // Single row_mut call — no separate bounds check (pre_wrap guarantees room)
         if let Some(row) = self.storage.row_mut(cursor_row) {
             if !row.write_wide_char_packed(cursor_col, c, colors, flags) {
                 return false;
@@ -365,11 +305,10 @@ impl Grid {
         }
         self.remove_stale_extras_pair(cursor_row, cursor_col, stale);
 
-        // Row-level damage — same strategy as ASCII bulk path. Avoids per-char
-        // min/max merge overhead of mark_wide_cell for sequential wide writes.
+        // Row-level damage, as the ASCII bulk path: cheaper than per-cell min/max merges for
+        // sequential wide writes.
         self.storage.mark_content_row(cursor_row);
 
-        // Advance cursor with pending wrap at end of line
         let new_col = cursor_col + 2;
         if new_col >= ecols {
             self.storage.cursor.col = ecols.saturating_sub(1);
@@ -380,29 +319,20 @@ impl Grid {
         true
     }
 
-    /// Combined pre-wrap + write + ring-buffer-set + damage + advance for
-    /// non-BMP wide chars.
-    ///
-    /// Like `write_wide_autowrap_fast` but also stores the complex char in the
-    /// dense ring buffer, replacing several Grid calls on the per-emoji path.
-    /// The COMPLEX flag must already be set in `flags`.
+    /// `write_wide_autowrap_fast` for a non-BMP wide char, also storing it in the complex-char
+    /// ring.
     ///
     /// REQUIRES: auto_wrap enabled, no insert mode, COMPLEX flag set in flags
     /// REQUIRES: `self.storage.visible_rows > 0`
     #[inline]
     pub fn write_emoji_autowrap_fast(&mut self, c: char, colors: PackedColors, flags: CellFlags) {
-        // Resolve pending wrap
         if self.storage.take_pending_wrap() {
             self.advance_autowrap_line();
         }
 
-        // Effective cols clamped by DECLRMM margins.
         let ecols = self.margin_clamped_ecols(self.storage.cursor.row);
 
-        // Pre-wrap wide: ensure room for 2 cells
         let ecols = if self.storage.cursor.col + 1 >= ecols {
-            // Blank the skipped last cell before wrapping the glyph down (xterm;
-            // see blank_wide_wrap_tail).
             self.blank_wide_wrap_tail(ecols, Cell::bce_blank(colors));
             self.advance_autowrap_line();
             self.margin_clamped_ecols(self.storage.cursor.row)
@@ -413,11 +343,8 @@ impl Grid {
         let cursor_row = self.storage.cursor.row;
         let cursor_col = self.storage.cursor.col;
 
-        // Drop stale extras-map entries for both halves, only once the write
-        // succeeds.
         let stale = self.stale_extras_pair(cursor_row, cursor_col, 2);
 
-        // Write the wide char
         if let Some(row) = self.storage.row_mut(cursor_row) {
             if !row.write_wide_char_packed(cursor_col, c, colors, flags) {
                 return;
@@ -427,10 +354,8 @@ impl Grid {
         }
         self.remove_stale_extras_pair(cursor_row, cursor_col, stale);
 
-        // Row-level damage — same strategy as ASCII bulk path.
         self.storage.mark_content_row(cursor_row);
 
-        // Store complex char codepoint in ring buffer (O(1) flat array, no Arc)
         let visible_rows = self.storage.visible_rows;
         let cols = self.storage.cols;
         self.storage.extras_mut().set_complex_char_ring(
@@ -441,7 +366,6 @@ impl Grid {
             cols,
         );
 
-        // Advance cursor with pending wrap at end of line
         let new_col = cursor_col + 2;
         if new_col >= ecols {
             self.storage.cursor.col = ecols.saturating_sub(1);
@@ -451,21 +375,16 @@ impl Grid {
         }
     }
 
-    /// Combined resolve-wrap + write + damage + advance for width-1 chars.
-    ///
-    /// Replaces `write_char_at_cursor_packed` + `advance_cursor_wrap` and,
-    /// unlike that pair, resolves a pending wrap first (otherwise a char after
-    /// a wide char at the line boundary would overwrite).
-    ///
-    /// Uses row-level damage (like `write_wide_autowrap_fast`) instead of
-    /// cell-level damage, amortizing min/max overhead across bulk runs.
+    /// Resolve-wrap + write + damage + advance for a width-1 char: the pair
+    /// `write_char_at_cursor_packed` and `advance_cursor_wrap`, with row-level damage amortized
+    /// over bulk runs.
     ///
     /// REQUIRES: auto_wrap enabled, no insert mode
     /// REQUIRES: `self.storage.visible_rows > 0`
     #[inline]
     pub fn write_narrow_autowrap_fast(&mut self, c: char, colors: PackedColors, flags: CellFlags) {
-        // Resolve pending wrap (critical: without this, a width-1 char after a
-        // wide char at end-of-line overwrites the spacer half)
+        // Resolve a pending wrap first, or a width-1 char after a wide char at end of line
+        // overwrites its spacer half.
         if self.storage.take_pending_wrap() {
             self.advance_autowrap_line();
         }
@@ -477,17 +396,14 @@ impl Grid {
         // wide half the overwrite orphans).
         let stale = self.stale_extras_pair(cursor_row, cursor_col, 1);
 
-        // Write character — single row_mut call
         if let Some(row) = self.storage.row_mut(cursor_row) {
             row.write_char_packed(cursor_col, c, colors, flags);
         }
         self.remove_stale_extras_pair(cursor_row, cursor_col, stale);
 
-        // Row-level damage — amortized for bulk runs
         self.storage.mark_content_row(cursor_row);
 
-        // Advance cursor with pending wrap at end of line.
-        // Guard: double-width rows, DECLRMM margins.
+        // Fast advance unless DECDWL rows or DECLRMM margins are in play.
         let fast_max = self.storage.cols.saturating_sub(1);
         if cursor_col < fast_max
             && !self.storage.any_double_width
@@ -529,7 +445,6 @@ impl Grid {
         let scan_stale = !self.storage.extras.is_empty();
 
         while pos < chars.len() {
-            // Resolve pending wrap
             if self.storage.take_pending_wrap() {
                 self.advance_autowrap_line();
             }
@@ -542,11 +457,9 @@ impl Grid {
             let cursor_row = self.storage.cursor.row;
             let cursor_col = self.storage.cursor.col;
 
-            // Pre-wrap: ensure room for at least one wide char
             let (ecols, cursor_row, cursor_col) = if cursor_col + 1 >= ecols {
-                // Match the single-char path: blank the skipped last-column tail
-                // with a BCE blank before wrapping, so coalesced (bulk) and
-                // fragmented (per-char) input fold to the identical grid.
+                // Blank the skipped last-column tail as the single-char path does, so bulk
+                // and per-char input fold to the same grid.
                 self.blank_wide_wrap_tail(ecols, Cell::bce_blank(colors));
                 self.advance_autowrap_line();
                 let new_ecols = if simple_mode {
@@ -559,18 +472,15 @@ impl Grid {
                 (ecols, cursor_row, cursor_col)
             };
 
-            // How many wide chars fit on this row?
             let available_cols = ecols.saturating_sub(cursor_col);
             let max_chars = (available_cols / 2) as usize;
             let to_write = (chars.len() - pos).min(max_chars);
             if to_write == 0 {
-                // Terminal too narrow for wide chars (e.g. 1 column).
-                // Skip the unfittable character to avoid infinite loop.
+                // Too narrow for a wide char (1 column): skip it, or the loop never ends.
                 pos += 1;
                 continue;
             }
 
-            // Single row_mut call for all chars on this line
             let mut stale = StaleExtras::NONE;
             if let Some(row) = self.storage.row_mut(cursor_row) {
                 // Capture stale-extras columns (both wide halves) before the
@@ -579,38 +489,26 @@ impl Grid {
                 if scan_stale {
                     stale = StaleExtras::probe(row, cursor_col, end_col_run);
                 }
-                // Bounds-check once for the whole run, then write unchecked (as
-                // `write_emoji_run_autowrap` does): the run already settled the
-                // wrap, row, margin clamp and damage mark, so per-glyph checks
-                // would repeat the same answer.
+                // Bounds-check once for the run, then write unchecked.
                 if (end_col_run as usize) <= row.cells_len() {
-                    // The unchecked writes skip orphaned-wide-half cleanup, and a
-                    // run has two places one can occur: the first cell landing on
-                    // the continuation half of an existing wide char (cursor put
-                    // there by CUP), and the cell just past the run being the
-                    // continuation of a wide base at `end_col_run - 1`. Interior
-                    // glyphs land only on cells this run wrote. Clean both edges.
+                    // The unchecked writes skip orphaned-wide-half cleanup, and only the run's
+                    // edges can orphan a half: the first cell on the continuation of an
+                    // existing wide char (cursor put there by CUP), and the cell past the run
+                    // being the continuation of a wide base at `end_col_run - 1`.
                     let end_half_blanked =
                         row.fixup_wide_chars_in_range(cursor_col, (to_write as u16) * 2);
                     for i in 0..to_write {
                         let col = cursor_col + (i as u16) * 2;
-                        // SAFETY: (a) `col + 1 < cells.len()` because
-                        // `end_col_run = cursor_col + to_write*2 <= cells_len()`
-                        // and `col + 2 <= end_col_run`, so
-                        // `col + 1 < end_col_run <= cells.len()`. (b) `col` is on
-                        // a wide-cell boundary: writes land at `cursor_col + 0,
-                        // 2, 4, ...`. (c) writes are sequential and
-                        // non-overlapping: `i` strictly increases and each
-                        // iteration covers exactly the two cells `(col, col+1)`.
+                        // SAFETY: (a) `col + 1 < end_col_run <= cells_len()`, checked above;
+                        // (b) `col = cursor_col + 2i` is a wide-cell boundary; (c) the writes are
+                        // sequential and disjoint, each covering `(col, col + 1)`.
                         unsafe {
                             row.write_wide_char_packed_no_fixup(col, chars[pos + i], colors, flags);
                         }
                     }
-                    // Not `update_len`, which only grows: the edge fixup above can
-                    // clear the row's last content, and a stale-high `len` would
-                    // add a phantom trailing space to `row_text`, search and
-                    // scrollback
-                    // (`wide_run_autowrap_tightens_len_when_the_run_orphans_the_row_tail`).
+                    // Not `update_len`, which only grows: the edge fixup can clear the row's
+                    // last content, and a stale-high `len` adds a phantom trailing space to
+                    // `row_text`, search and scrollback.
                     row.settle_len_after_wide_run(end_col_run, end_half_blanked);
                     row.mark_has_wide_chars();
                 } else {
@@ -622,12 +520,10 @@ impl Grid {
             }
             self.remove_stale_extras(cursor_row, stale);
 
-            // Row-level damage — once per row, not per char
             self.storage.mark_content_row(cursor_row);
 
             pos += to_write;
 
-            // Advance cursor
             let end_col = cursor_col + (to_write as u16) * 2;
             if end_col >= ecols {
                 self.storage.cursor.col = ecols.saturating_sub(1);
@@ -638,12 +534,9 @@ impl Grid {
         }
     }
 
-    /// Write a run of non-BMP width-2 characters (emoji) with autowrap, batched.
-    ///
-    /// Like `write_wide_run_autowrap` but also stores each char in the complex
-    /// char ring buffer. Codepoints go into the ring via
-    /// `set_complex_char_wide_run`, batched per row. Computes row_mut +
-    /// effective_cols once per row.
+    /// `write_wide_run_autowrap` for non-BMP width-2 characters (emoji), also storing the
+    /// codepoints in the complex-char ring (`set_complex_char_wide_run`). The comments there
+    /// cover both.
     ///
     /// REQUIRES: auto_wrap enabled, no insert mode, COMPLEX flag set in flags
     /// REQUIRES: `self.storage.visible_rows > 0`
@@ -663,11 +556,9 @@ impl Grid {
         let cols = self.storage.cols;
         let simple_mode = !self.storage.has_horizontal_margins && !self.storage.any_double_width;
         let mut pos = 0;
-        // Hoisted per run: no per-cell cost when the extras map is empty.
         let scan_stale = !self.storage.extras.is_empty();
 
         while pos < chars.len() {
-            // Resolve pending wrap
             if self.storage.take_pending_wrap() {
                 self.advance_autowrap_line();
             }
@@ -680,11 +571,7 @@ impl Grid {
             let cursor_row = self.storage.cursor.row;
             let cursor_col = self.storage.cursor.col;
 
-            // Pre-wrap: ensure room for at least one wide char
             let (ecols, cursor_row, cursor_col) = if cursor_col + 1 >= ecols {
-                // Match the single-char path: blank the skipped last-column tail
-                // with a BCE blank before wrapping, so coalesced (bulk) and
-                // fragmented (per-char) input fold to the identical grid.
                 self.blank_wide_wrap_tail(ecols, Cell::bce_blank(colors));
                 self.advance_autowrap_line();
                 let new_ecols = if simple_mode {
@@ -697,56 +584,33 @@ impl Grid {
                 (ecols, cursor_row, cursor_col)
             };
 
-            // How many wide chars fit on this row?
             let available_cols = ecols.saturating_sub(cursor_col);
             let max_chars = (available_cols / 2) as usize;
             let to_write = (chars.len() - pos).min(max_chars);
             if to_write == 0 {
-                // Terminal too narrow for wide chars (e.g. 1 column).
-                // Skip the unfittable character to avoid infinite loop.
                 pos += 1;
                 continue;
             }
 
             let end_col = cursor_col + (to_write as u16) * 2;
 
-            // Single row_mut call for all chars on this line
             let mut stale = StaleExtras::NONE;
             if let Some(row) = self.storage.row_mut(cursor_row) {
-                // Capture stale-extras columns (both wide halves) before the
-                // overwrite clobbers the HAS_EXTRAS flags.
                 if scan_stale {
                     stale = StaleExtras::probe(row, cursor_col, end_col);
                 }
-                // Bounds check once for the entire run, then use no-fixup writes.
-                // Sequential emoji writes at even columns can't conflict.
                 if (end_col as usize) <= row.cells_len() {
-                    // The unchecked writes below skip orphaned-wide-half cleanup,
-                    // but the run's first cell can land on the continuation half
-                    // of an existing wide char (cursor put there via CUP), and the
-                    // cell just past the run can be the continuation of a wide base
-                    // at end_col-1. Clean both edges once (a no-op on rows without
-                    // wide chars).
                     let end_half_blanked =
                         row.fixup_wide_chars_in_range(cursor_col, (to_write as u16) * 2);
                     for j in 0..to_write {
                         let col = cursor_col + (j as u16) * 2;
-                        // SAFETY: (a) `col + 1 < cells.len()` because
-                        // `end_col = cursor_col + to_write*2 <= cells_len()` and
-                        // `col + 2 <= end_col`, so `col + 1 < end_col <= cells.len()`.
-                        // (b) `col` is on a wide-cell boundary: writes land at
-                        // `cursor_col + 0, 2, 4, ...`. (c) writes are sequential and
-                        // non-overlapping: `j` strictly increases and each iteration
-                        // covers exactly `(col, col+1)`; the run starts at
-                        // `cursor_col` on a freshly bounds-checked row.
+                        // SAFETY: (a) `col + 1 < end_col <= cells_len()`, checked above;
+                        // (b) `col = cursor_col + 2j` is a wide-cell boundary; (c) the writes are
+                        // sequential and disjoint, each covering `(col, col + 1)`.
                         unsafe {
                             row.write_wide_char_packed_no_fixup(col, chars[pos + j], colors, flags);
                         }
                     }
-                    // Not `update_len`, which only grows: the edge fixup above can
-                    // clear the row's last content, and a stale-high `len` would
-                    // add a phantom trailing space to `row_text`, search and
-                    // scrollback.
                     row.settle_len_after_wide_run(end_col, end_half_blanked);
                     row.mark_has_wide_chars();
                 } else {
@@ -758,7 +622,6 @@ impl Grid {
             }
             self.remove_stale_extras(cursor_row, stale);
 
-            // Store complex char codepoints in ring buffer — batched, ring_row hoisted
             self.storage.extras_mut().set_complex_char_wide_run(
                 cursor_row,
                 cursor_col,
@@ -767,7 +630,6 @@ impl Grid {
                 cols,
             );
 
-            // Row-level damage — once per row
             self.storage.mark_content_row(cursor_row);
 
             pos += to_write;
@@ -780,11 +642,8 @@ impl Grid {
         }
     }
 
-    /// Write a mixed run of BMP and non-BMP width-2 characters with autowrap.
-    ///
-    /// One batched write for interleaved BMP (CJK, BMP emoji) and non-BMP
-    /// (SMP emoji) wide chars (e.g. ✨🚀⚡🎉); only non-BMP chars get ring
-    /// buffer entries.
+    /// `write_wide_run_autowrap` for a mix of BMP and non-BMP width-2 characters; only the
+    /// non-BMP chars get ring entries.
     ///
     /// REQUIRES: auto_wrap enabled, no insert mode
     /// REQUIRES: `self.storage.visible_rows > 0`
@@ -804,7 +663,6 @@ impl Grid {
         let cols = self.storage.cols;
         let simple_mode = !self.storage.has_horizontal_margins && !self.storage.any_double_width;
         let mut pos = 0;
-        // Hoisted per run: no per-cell cost when the extras map is empty.
         let scan_stale = !self.storage.extras.is_empty();
 
         while pos < chars.len() {
@@ -821,8 +679,6 @@ impl Grid {
             let cursor_col = self.storage.cursor.col;
 
             let (ecols, cursor_row, cursor_col) = if cursor_col + 1 >= ecols {
-                // Match the single-char path: blank the skipped last-column tail
-                // before wrapping, so bulk and per-char folds are identical.
                 self.blank_wide_wrap_tail(ecols, Cell::bce_blank(bmp_colors));
                 self.advance_autowrap_line();
                 let new_ecols = if simple_mode {
@@ -848,16 +704,10 @@ impl Grid {
 
             let mut stale = StaleExtras::NONE;
             if let Some(row) = self.storage.row_mut(cursor_row) {
-                // Capture stale-extras columns (both wide halves) before the
-                // overwrite clobbers the HAS_EXTRAS flags.
                 if scan_stale {
                     stale = StaleExtras::probe(row, cursor_col, end_col);
                 }
                 if (end_col as usize) <= row.cells_len() {
-                    // As in write_emoji_run_autowrap: clean any orphaned wide half
-                    // at the run's leading edge (cursor on a continuation) or just
-                    // past its trailing edge before the unchecked writes (a no-op
-                    // on rows without wide chars).
                     let end_half_blanked =
                         row.fixup_wide_chars_in_range(cursor_col, (to_write as u16) * 2);
                     for (j, &c) in slice.iter().enumerate() {
@@ -867,22 +717,13 @@ impl Grid {
                         } else {
                             bmp_flags
                         };
-                        // SAFETY: (a) `col + 1 < cells.len()` because
-                        // `end_col = cursor_col + to_write*2 <= cells_len()` and
-                        // `col + 2 <= end_col`, so `col + 1 < end_col <= cells.len()`.
-                        // (b) `col` is on a wide-cell boundary: writes land at
-                        // `cursor_col + 0, 2, 4, ...`. (c) writes are sequential and
-                        // non-overlapping: `j` strictly increases and each iteration
-                        // covers exactly `(col, col+1)`; the run starts at
-                        // `cursor_col` on a freshly bounds-checked row.
+                        // SAFETY: (a) `col + 1 < end_col <= cells_len()`, checked above;
+                        // (b) `col = cursor_col + 2j` is a wide-cell boundary; (c) the writes are
+                        // sequential and disjoint, each covering `(col, col + 1)`.
                         unsafe {
                             row.write_wide_char_packed_no_fixup(col, c, bmp_colors, fl);
                         }
                     }
-                    // Not `update_len`, which only grows: the edge fixup above can
-                    // clear the row's last content, and a stale-high `len` would
-                    // add a phantom trailing space to `row_text`, search and
-                    // scrollback.
                     row.settle_len_after_wide_run(end_col, end_half_blanked);
                     row.mark_has_wide_chars();
                 } else {
@@ -899,7 +740,7 @@ impl Grid {
             }
             self.remove_stale_extras(cursor_row, stale);
 
-            // Ring buffer writes — batched with hoisted ring_row for non-BMP chars
+            // Ring entries for the non-BMP chars only, batched per row.
             self.storage.extras_mut().set_mixed_wide_ring(
                 cursor_row,
                 cursor_col,
@@ -920,12 +761,9 @@ impl Grid {
         }
     }
 
-    /// Write a wide character with autowrap using a style ID.
-    ///
-    /// Test-only: delegates to the combined write+advance method in write.rs
-    /// which is behind `#[cfg(test)]`. Production code uses the split primitives
-    /// (`pre_wrap_wide_ecols` + `write_wide_char_at_cursor_packed_ecols` +
-    /// `advance_cursor_wide_wrap_ecols`).
+    /// Write a wide character with autowrap using a style ID. Test-only; production uses
+    /// `pre_wrap_wide_ecols` + `write_wide_char_at_cursor_packed_ecols` +
+    /// `advance_cursor_wide_wrap_ecols`.
     #[cfg(test)]
     pub(crate) fn write_wide_char_wrap_with_style_id(
         &mut self,
@@ -937,11 +775,8 @@ impl Grid {
         self.write_wide_char_wrap_styled(c, fg, bg, flags)
     }
 
-    /// Write a wide character without autowrap using a style ID.
-    ///
-    /// Test-only: delegates to the combined write+advance method in write.rs
-    /// which is behind `#[cfg(test)]`. Production code uses the split primitives
-    /// (`write_wide_char_at_cursor_packed_ecols` + `advance_cursor_wide_no_wrap_ecols`).
+    /// Write a wide character without autowrap using a style ID. Test-only; production uses
+    /// `write_wide_char_at_cursor_packed_ecols` + `advance_cursor_wide_no_wrap_ecols`.
     #[cfg(test)]
     pub fn write_wide_char_with_style_id(
         &mut self,
@@ -953,13 +788,9 @@ impl Grid {
         self.write_wide_char_styled(c, fg, bg, flags)
     }
 
-    /// Fast path: write styled ASCII bytes with extras (RGB, hyperlinks, etc.).
-    ///
-    /// For ASCII runs whose style needs `CellExtras` overflow (true-color RGB,
-    /// hyperlinks, underline colors, extended flags). Writes cells in bulk like
-    /// `write_ascii_run_styled`, then applies extras to the written range via
-    /// `set_range_uniform`, amortizing style resolution, cursor arithmetic and
-    /// damage marking per line instead of per character.
+    /// Write styled ASCII bytes whose style needs `CellExtras` (truecolor RGB, hyperlinks,
+    /// underline colours, extended flags): the cells in bulk as `write_ascii_run_styled` does,
+    /// then the extras over the written range via `set_range_uniform`, once per row.
     ///
     /// REQUIRES: all bytes 0x20..=0x7E, insert mode OFF, auto-wrap ON
     /// REQUIRES: the cursor is not outside a DECSLRM span
@@ -987,10 +818,8 @@ impl Grid {
 
         let mut written = 0;
         let mut remaining = ascii;
-        // Hoisted per run (no per-cell cost when the extras map is empty).
-        // Without the stale sweep, Phase 2's `set_range_uniform`/`get_or_create`
-        // would merge the new extras into a stale entry (e.g. attach an old
-        // hyperlink to new text).
+        // The stale sweep keeps Phase 2's `set_range_uniform` from merging the new extras into
+        // a stale entry (an old hyperlink on new text); skipped when the extras map is empty.
         let scan_stale = !self.storage.extras.is_empty();
 
         while !remaining.is_empty() {
@@ -1014,13 +843,11 @@ impl Grid {
                 None
             };
 
-            // Combined row access + effective cols: single ring-buffer lookup
             let Some((row, effective_cols)) = self.storage.row_mut_with_effective_cols(cursor_row)
             else {
                 break;
             };
 
-            // Clamp effective cols by right margin when DECLRMM is active.
             let effective_cols = if let Some(clamp) = margin_clamp {
                 effective_cols.min(clamp)
             } else {
@@ -1048,7 +875,7 @@ impl Grid {
                 StaleExtras::NONE
             };
 
-            // Phase 1: Write styled cells directly to row (bulk)
+            // Phase 1: the styled cells, in bulk.
             if let Some(target) = row.cells_mut_with_fixup(cursor_col, to_write_u16) {
                 debug_assert_eq!(target.len(), to_write);
                 // Set HAS_EXTRAS on each cell since extras will be applied in Phase 2.
@@ -1059,11 +886,10 @@ impl Grid {
             }
 
             row.update_len(cursor_col + to_write_u16);
-            // row borrow drops here
 
             self.remove_stale_extras(cursor_row, stale);
 
-            // Phase 2: Apply extras to written range (batched)
+            // Phase 2: the extras over the written range, batched.
             {
                 use crate::UniformExtras;
                 let vals = UniformExtras {
@@ -1118,30 +944,15 @@ impl Grid {
 mod tests {
     use super::{Cell, CellFlags, Grid, PackedColors};
 
-    /// The wrap-tail blanking is a BCE erase that can bisect the wide pair to
-    /// its left, and the orphaned head must get the BCE blank, resolving the
-    /// BCE truecolor background.
-    ///
-    /// The shape a real terminal produces (`Terminal::new(3, 10)`):
-    ///
-    /// ```text
-    ///   ESC[48;2;10;20;30m  ESC[1;9H   <wide glyph>   (cols 8-9)
-    ///   ESC[48;2;200;100;50m ESC[1;10H <wide glyph>   (won't fit -> wraps)
-    /// ```
-    ///
-    /// The second glyph cannot fit at the last column, so the tail `[9, 10)` is
-    /// blanked with the new background and the glyph wraps to row 1, bisecting
-    /// the first glyph and orphaning its head at col 8. Both col 8 and col 9
-    /// must resolve the new background from the ring, not a default colour or
-    /// the dead glyph's `[10, 20, 30]`.
-    ///
-    /// Several rows, since a single-row grid would scroll the evidence away.
+    /// A wrap-tail blank that bisects the wide pair to its left gives the orphaned head and the
+    /// tail the BCE blank and its ring background, not a default colour or the dead glyph's
+    /// bytes. Three rows, so the wrap does not scroll.
     #[test]
     fn wide_wrap_tail_paints_the_bisected_orphan_with_the_bce_blank_and_its_ring() {
         let (rows, cols) = (3u16, 10u16);
         let mut grid = Grid::new(rows, cols);
 
-        // --- SGR 48;2;10;20;30 then a wide glyph at cols 8-9.
+        // SGR 48;2;10;20;30, then a wide glyph at cols 8-9.
         let old_bg = [10u8, 20, 30];
         let old_colors = PackedColors::new().with_rgb_bg();
         grid.set_cursor_template(Cell::bce_blank(old_colors), Some(old_bg));
@@ -1161,7 +972,7 @@ mod tests {
             "precondition: the ring holds the first glyph's bytes"
         );
 
-        // --- SGR 48;2;200;100;50, cursor to the LAST column, another wide glyph.
+        // SGR 48;2;200;100;50, cursor to the last column, another wide glyph.
         let new_bg = [200u8, 100, 50];
         let new_colors = PackedColors::new().with_rgb_bg();
         grid.set_cursor_template(Cell::bce_blank(new_colors), Some(new_bg));

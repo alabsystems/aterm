@@ -1,71 +1,59 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The `atpkg doctor` health surface (§15) — a no-network, no-mutation diagnostic over
-//! atpkg's own store/ops/sig/status primitives.
+//! `atpkg doctor` (§15): a no-network, no-mutation diagnostic over atpkg's store, ops,
+//! signature and status primitives.
 //!
 //! Structural breakage (a broken bin shim, an active build whose store tree vanished, a
-//! fish-breaking stray `.sh`, a world-writable login-sourced dir) is a PROBLEM → nonzero
-//! exit. Everything advisory (bin not yet on PATH, a frozen-looking index, a foreign
-//! sysroot wiring) stays a WARNING → exit 0. A managed tool that cannot run (tippy
-//! refused by its own Trust bundle), or one doctor cannot show to run (an exec root that
-//! differs from its build, a build it cannot read), is neither a store fault nor health:
-//! the report ends "not healthy", names the fix, and still exits 0. It reads no
-//! unverified index/manifest (verify-before-parse): its freshness surface reads atpkg's
-//! OWN `status.toml` + the durable [`crate::sig::Floor`].
+//! fish-breaking stray `.sh`, a world-writable login-sourced dir) is a problem: nonzero exit.
+//! Advisory findings (bin not yet on PATH, a frozen-looking index, a foreign sysroot wiring)
+//! are warnings: exit 0. A managed tool that cannot run (tippy refused by its own Trust
+//! bundle), or that doctor cannot show to run, is neither: the report ends "not healthy",
+//! names the fix, and still exits 0. Doctor parses no unverified index or manifest: its
+//! freshness comes from atpkg's own `status.toml` and the durable [`crate::sig::Floor`].
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
-use aterm_primer::CLAUDE_TOP_EFFORT_KEY;
+// (10h) reports by aterm-primer's own table and rules, so it says only what a window start
+// does.
+use aterm_primer::{
+    CLAUDE_COMPACT_WINDOW_KEY, CLAUDE_DEFAULTS, CLAUDE_DRAFTS_KEY, CLAUDE_EFFORT_DEFAULTS,
+    CLAUDE_SURVEY_SWITCH, CLAUDE_TOP_EFFORT_KEY, claude_compact_offers_kept_in,
+    claude_efforts_set_by_hand, claude_survey_rate_set_by_hand,
+};
 
 use crate::store::Layout;
 
 const GIB: u64 = 1 << 30;
 
-/// Whether a recorded program `state` describes a FAULT this machine should act on.
+/// Whether a recorded program `state` is a fault this machine should act on, by the prefixes
+/// the install and update paths write. Two need a word:
 ///
-/// The fault prefixes are the ones the install/update paths actually write.
+/// * `aborted: <phase>` (cli.rs, `TxnOutcome::Aborted`): a coherence-group transaction
+///   killed mid-flight, recorded against the failed member only (on a group disk
+///   shortfall, an arbitrary one), so the row names where it stopped.
+/// * `tombstoned: pin yanked/below floor`: the shims are failing stubs
+///   ([`crate::activate::install_tombstone_shim`]) that the broken-shim scan skips and
+///   `active_builds` drops, so without this row doctor would call a stubbed compiler healthy.
 ///
-/// * `aborted: <phase>` (cli.rs, the `TxnOutcome::Aborted` arm) — a coherence-group
-///   transaction killed mid-flight, precisely the state in which a tuple's members may
-///   disagree with each other. Recorded against the FAILED member only, and on a group
-///   disk-shortfall that member is an arbitrary one of the tuple, so the row names where
-///   the transaction stopped rather than what is individually wrong.
-/// * `tombstoned: pin yanked/below floor` — silent everywhere else. A yanked pin
-///   replaces the program's working shims with failing stubs
-///   ([`crate::activate::install_tombstone_shim`]); the broken-shim scan skips
-///   tombstones BY DESIGN, and a tombstoned program drops out of `active_builds`, so
-///   without this row doctor would call a stubbed compiler "healthy". Both clear
-///   themselves: a later successful update rewrites the row and replaces the tombstone
-///   shim with a real symlink.
-///
-/// Deliberately NOT a fault: `active`, `dev-linked (skipped)` (a §13 hard-skip the user
-/// asked for), `held: …` (a tuple whose new pin is not published for this target), and any
-/// future informational state. Allow-by-prefix, so an unrecognized state reads as benign
-/// rather than as a failure.
+/// Not a fault: `active`, `dev-linked (skipped)`, `held: …` (a tuple whose new pin is not
+/// published here), and any unrecognized state (allow-by-prefix).
 fn is_problem_state(state: &str) -> bool {
     state.starts_with("error:")
         || state.starts_with("unavailable:")
         || state.starts_with("blocked:")
         || state.starts_with("aborted:")
         || state.starts_with("tombstoned:")
-        // A member HELD after a failed stage (`held: last attempt failed with …; <retry>`)
-        // is not installed and will not be by any unattended pass — a problem, and one
-        // whose row already names the act. The group hold (`held: pinned build …`) is
-        // the benign state the allow-list keeps.
+        // A member held after a failed stage (`held: last attempt failed with …`) is not
+        // installed and no unattended pass will install it. The group hold (`held: pinned
+        // build …`) is benign.
         || state.starts_with(crate::state::HELD_FAILED_PREFIX)
 }
 
-/// Where the per-problem listing should START — or `None` when no verdict owns it.
-///
-/// The listing hangs off the branch that actually printed a verdict; `store_empty` alone
-/// is wrong on a DECLINED store (it would drop the only finding, or print orphan lines
-/// under a verdict nobody gave).
-///
-/// A declined store lists nothing: the decline IS the verdict, and a stale fault row
-/// describes a toolset the user deliberately removed. Whether such a row should also flip
-/// the exit code is a separate product question, deliberately not answered here.
+/// Where the per-problem listing starts, or `None` when no verdict owns it. A declined store
+/// lists nothing: the decline is the verdict, and a stale fault row describes a toolset the
+/// user removed.
 fn problem_listing_start(declined: bool, store_empty: bool, problems: usize) -> Option<usize> {
     if declined || problems == 0 {
         None
@@ -77,22 +65,14 @@ fn problem_listing_start(declined: bool, store_empty: bool, problems: usize) -> 
     }
 }
 
-/// The programs this machine WANTS but does not have, split by whether the removed
-/// ledger explains the absence: `(unexplained, on_purpose)`, each alphabetical.
+/// The programs this machine wants but does not have: `(unexplained, on_purpose,
+/// dev_linked)`, each alphabetical. "Wants" is [`crate::cli::wanted_programs`], the question
+/// the install lanes ask. A program on the removed ledger is the user's decision, not a
+/// problem; one missing with no ledger entry has no shim, row or fault for any other check
+/// to see.
 ///
-/// "Wants" is [`crate::cli::wanted_programs`] — the signed set narrowed by
-/// `[packages].exclude` — so this asks the same question the install lanes ask, and
-/// cannot drift from them into a second opinion.
-///
-/// The split is the whole point. A program on the removed ledger is a decision, and
-/// reporting it as a problem would be the manager arguing with the user. A program
-/// missing with NO ledger entry is the state nothing else in this report can see: no
-/// shim, no `status.toml` row, no recorded fault — invisible to every check that reads
-/// the record rather than the index.
-///
-/// Offline and fail-quiet: with no cached index there is no trustworthy answer about
-/// what SHOULD be installed, and inventing one would turn an unreachable network into a
-/// pile of phantom missing programs.
+/// Offline and fail-quiet: with no cached index there is no trustworthy answer, and inventing
+/// one would turn an unreachable network into phantom missing programs.
 fn missing_against_index(
     layout: &Layout,
     installed: &std::collections::BTreeMap<String, u64>,
@@ -116,10 +96,8 @@ fn live_dev_links(layout: &Layout) -> (std::collections::BTreeSet<String>, Vec<S
     crate::linkmode::live_dev_links(layout)
 }
 
-/// The decision [`missing_against_index`] makes, without the I/O: which wanted programs
-/// are absent, and which of those the removed ledger accounts for.
-///
-/// Pure: the I/O path needs a signed index, a registry and a store.
+/// The decision [`missing_against_index`] makes, without the I/O: which wanted programs are
+/// absent, and which of those the removed ledger or a dev link accounts for.
 fn split_missing(
     wanted: &std::collections::BTreeSet<String>,
     installed: &std::collections::BTreeMap<String, u64>,
@@ -133,9 +111,9 @@ fn split_missing(
         if installed.contains_key(program) {
             continue;
         }
-        // A DEV-LINKED program is PRESENT — its shims are in the managed bin/ and they
-        // run — it just has no store build for `installed` to count. It outranks the
-        // removed ledger: a link made after a removal is the newer decision.
+        // A dev-linked program is present (its shims are in the managed bin/ and run) but
+        // has no store build for `installed` to count. It outranks the removed ledger: a
+        // link made after a removal is the newer decision.
         if linked.contains(program) {
             dev_linked.push(program.clone());
         } else if removed.contains(program) {
@@ -147,24 +125,16 @@ fn split_missing(
     (unexplained, on_purpose, dev_linked)
 }
 
-/// Whether one `status.toml` row is a fault [`recorded_problems`] lists: a real program
-/// (a `-`-prefixed key is a stray row, never a program) in a problem state
-/// ([`is_problem_state`]). Public so the window's Settings ▸ Packages badge counts the
-/// doctor's own list; the badge then drops what the doctor also drops on a DECLINED store
-/// (everything), and the one fault nobody can act on
-/// ([`crate::state::is_unserved_toolset`]).
+/// Whether one `status.toml` row is a fault [`recorded_problems`] lists: a real program (a
+/// `-`-prefixed key is a stray row) in a problem state ([`is_problem_state`]). Public so the
+/// window's Settings ▸ Packages badge counts the doctor's own list.
 #[must_use]
 pub fn is_recorded_problem(name: &str, state: &str) -> bool {
     !name.starts_with('-') && is_problem_state(state)
 }
 
-/// EVERY recorded fault, formatted `"<program>: <state>"`, in program order — `BTreeMap`
-/// order, i.e. alphabetical by program name.
-///
-/// Every finding, not the first: one per repair cycle is a guessing game.
-///
-/// Stray rows (keys beginning with `-`) are excluded — see the caller: they cannot be
-/// programs at all, and counting them condemned healthy toolsets.
+/// Every recorded fault, as `"<program>: <state>"`, alphabetical by program. Stray rows
+/// (keys beginning with `-`) are not programs and are excluded.
 pub(crate) fn recorded_problems(status: Option<&crate::Status>) -> Vec<String> {
     status
         .map(|s| {
@@ -177,30 +147,20 @@ pub(crate) fn recorded_problems(status: Option<&crate::Status>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// The toolset-wide "no build for this architecture" verdict, on the ONE platform where
-/// it is a state and not a fault: WINDOWS. `Some(names)` — the programs whose own rows
-/// say `unavailable on <target>: …` — when the `*toolset*` row reads that verdict here;
-/// `None` on every other platform, whatever the row says.
-///
-/// Why the platform split. On an Intel Mac the absence of an x86_64 build is a
-/// publishing gap the report is right to call a PROBLEM and to answer with `aterm pkg
-/// install --default-set`: the seal serves that machine the day it is cut. On Windows
-/// (index build 44) every ALab row is `prebuilt-only` with no Windows artifact and only
-/// the agents are published, so `install --default-set` cannot change the state and a
-/// PROBLEM line recommending it would be false. The row is also STALE by construction:
-/// it is written when a pass installs nothing on an empty store and cleared only by a
-/// clean pass with something installed, so it outlives the day the agents became
-/// servable here.
+/// The toolset-wide "no build for this architecture" verdict on Windows, the one platform
+/// where it is a state and not a fault: `Some(names)` (the programs whose own rows say
+/// `unavailable on <target>: …`) when it holds, `None` on every other platform. On an Intel
+/// Mac a missing build is a publishing gap that `aterm pkg install --default-set` answers;
+/// on Windows only the agents are published, so recommending it would be false.
 fn toolset_unserved_here(status: Option<&crate::Status>) -> Option<Vec<String>> {
     if !cfg!(windows) {
         return None;
     }
     let s = status?;
-    // The members whose OWN rows say the index publishes nothing for this target — the
-    // durable signal. The toolset-wide row is written only by a pass that installed
-    // nothing on an empty store and is cleared by the first clean pass with something
-    // installed, so after `claude`/`codex` land here it is gone while the ten unserved
-    // members are exactly as unserved as before.
+    // The members' own `unavailable` rows are the durable signal: the `*toolset*` row is
+    // written only by a pass that installed nothing on an empty store and cleared by the
+    // first clean pass that installs something, so once `claude`/`codex` land it is gone
+    // while the other members stay unserved.
     let names: Vec<String> = s
         .programs
         .iter()
@@ -219,9 +179,8 @@ fn toolset_unserved_here(status: Option<&crate::Status>) -> Option<Vec<String>> 
     Some(names)
 }
 
-/// [`split_missing`]'s "unexplained" list with the unserved members taken out: on an
-/// unserved platform each of them IS explained — by its own `unavailable on <target>` row,
-/// which the note names. Identity when `unserved` is `None` (every platform but Windows).
+/// [`split_missing`]'s "unexplained" list without the unserved members, each explained by
+/// its own `unavailable on <target>` row. Identity when `unserved` is `None`.
 fn drop_unserved(missing: Vec<String>, unserved: Option<&[String]>) -> Vec<String> {
     match unserved {
         Some(unserved) => missing
@@ -232,27 +191,26 @@ fn drop_unserved(missing: Vec<String>, unserved: Option<&[String]>) -> Vec<Strin
     }
 }
 
-/// Whether a recorded problem (`"<program>: <state>"`) is the toolset-wide
-/// "no build for this architecture" verdict ([`crate::state::is_unserved_toolset`]) — the
-/// ONE `*toolset*` row [`toolset_unserved_here`] turns into a note. Every other
-/// `*toolset*` verdict (`unavailable: index unreachable`, `unavailable: every published
-/// build was refused`, `unavailable: [packages].exclude leaves nothing to install`, …) is
-/// a fault about THIS machine and stays a problem on every platform.
+/// Whether a recorded problem (`"<program>: <state>"`) is the toolset-wide "no build for this
+/// architecture" verdict ([`crate::state::is_unserved_toolset`]), the one `*toolset*` row
+/// [`toolset_unserved_here`] turns into a note. Every other `*toolset*` verdict (`index
+/// unreachable`, `every published build was refused`, …) is about this machine and stays a
+/// problem everywhere.
 fn is_unserved_toolset_problem(why: &str) -> bool {
     why.strip_prefix("*toolset*: ")
         .is_some_and(crate::state::is_unserved_toolset)
 }
 
-/// Whether a recorded problem is a member HELD after a failed stage
-/// ([`crate::state::HELD_FAILED_PREFIX`]) — a problem no unattended pass moves.
+/// Whether a recorded problem is a member held after a failed stage
+/// ([`crate::state::HELD_FAILED_PREFIX`]), which no unattended pass moves.
 fn is_held_problem(why: &str) -> bool {
     why.split_once(": ")
         .is_some_and(|(_, state)| state.starts_with(crate::state::HELD_FAILED_PREFIX))
 }
 
-/// The first member the recorded problems say is HELD ([`is_held_problem`]), by name —
-/// wherever it sorts: a `*toolset*` row precedes every program in `BTreeMap` order, so on
-/// an empty store the held member is never the first problem.
+/// The first member the recorded problems say is held ([`is_held_problem`]), wherever it
+/// sorts: a `*toolset*` row precedes every program in `BTreeMap` order, so on an empty store
+/// the held member is never the first problem.
 fn first_held_member(recorded_problems: &[String]) -> Option<&str> {
     recorded_problems
         .iter()
@@ -260,10 +218,10 @@ fn first_held_member(recorded_problems: &[String]) -> Option<&str> {
         .find_map(|why| why.split_once(": ").map(|(program, _)| program))
 }
 
-/// The explicit door for a member HELD after a failed stage: `aterm pkg install <p>`, which
-/// forgets its memo and lands it — or, for a coherence-group member (`grouped`), `aterm pkg
-/// update --retry`, which forgets every memo and runs the pass that moves or completes the
-/// tuple whole; `install` would land that one member outside its tuple.
+/// The explicit door for a member held after a failed stage: `aterm pkg install <p>`, which
+/// forgets its memo and lands it, or, for a coherence-group member (`grouped`), `aterm pkg
+/// update --retry`, which forgets every memo and moves or completes the tuple whole;
+/// `install` would land that one member outside its tuple.
 fn held_door(program: &str, grouped: bool) -> String {
     if grouped {
         String::from("aterm pkg update --retry")
@@ -280,11 +238,11 @@ fn in_coherence_group(layout: &Layout, program: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Whether an EMPTY store on an unserved platform is the quiet state — the note, "none is
-/// missing", healthy: only when nothing is recorded against a member the index serves
-/// here AND no served member is missing without a row. A network failure writes no
-/// per-program row by design (`failed_install_state`), so an empty problem list alone
-/// does not prove every served member arrived; the index's own list has to agree.
+/// Whether an empty store on an unserved platform is the quiet state (the note, "none is
+/// missing", healthy): only when nothing is recorded against a member the index serves here
+/// and no served member is missing without a row. A network failure writes no per-program
+/// row (`failed_install_state`), so an empty problem list alone does not prove every served
+/// member arrived.
 fn unserved_store_is_quiet(
     unserved: bool,
     recorded_problems: &[String],
@@ -311,20 +269,18 @@ fn unserved_platform_next(
     (!program.starts_with('*')).then(|| format!("aterm pkg install {program}"))
 }
 
-/// What the WORKSPACE the operator is standing in demands of the installed Trust
-/// toolchain, as decided by the installed `targo` itself (`targo locate-project
-/// --workspace` parses the manifest, compiles nothing, and refuses a `[trust]` policy
-/// key it does not know).
-///
-/// A workspace committed against a LOCAL Trust seal newer than anything atpkg has
-/// published fails on every managed machine with an "unknown field" error that reads
-/// like a typo; this check names the toolchain that is behind.
+/// What the workspace the operator is in demands of the installed Trust toolchain, as the
+/// installed `targo` decides it (`targo locate-project --workspace` parses the manifest,
+/// compiles nothing, and refuses a `[trust]` policy key it does not know). A workspace
+/// committed against a local Trust seal newer than any atpkg published fails on every
+/// managed machine with an "unknown field" error that reads like a typo; this check names
+/// the toolchain that is behind.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkspacePolicy {
     /// The installed targo accepts the workspace's `[trust]` policy.
     Accepted,
-    /// The installed targo refuses a policy key it does not know: the workspace
-    /// needs a NEWER Trust build than atpkg has published.
+    /// The installed targo refuses a policy key it does not know: the workspace needs a
+    /// newer Trust build than atpkg has published.
     UnknownField { field: String },
     /// The probe could not run (no targo in the store, spawn failure); reported, never
     /// counted as a problem.
@@ -338,10 +294,10 @@ pub struct WorkspacePolicyProbe {
     pub policy: WorkspacePolicy,
 }
 
-/// rustup's `trust` channel resolving OUTSIDE the atpkg store: a locally built or
-/// sealed toolchain. Newer than the store's, it is a publisher's seal: anything committed
-/// against a feature only it has will not build on an atpkg-managed machine until the seal
-/// is PUBLISHED. Older or gone, it is stale, and `repair` re-points it at the store.
+/// rustup's `trust` channel resolving outside the atpkg store: a locally built or sealed
+/// toolchain. Newer than the store's, it is a publisher's seal: anything committed against a
+/// feature only it has will not build on an atpkg-managed machine until the seal is
+/// published. Older or gone, it is stale, and `repair` re-points it at the store.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalSealProbe {
     /// The rustup entry itself (`<rustup_home>/toolchains/trust`).
@@ -360,24 +316,22 @@ pub struct LocalSealProbe {
 pub struct Probes {
     pub workspace: Option<WorkspacePolicyProbe>,
     pub local_seal: Option<LocalSealProbe>,
-    /// Whether packages update here on their own: the manager armed, and `[packages]
-    /// enabled` on — Automatic updates, default on, with the retired `auto_update` folded
-    /// in ([`crate::config::PackagesConfig::enabled`]). With [`Self::excluded`], what the
-    /// never-checked line may claim of the vendor programs.
+    /// Whether packages update here on their own: the manager armed and `[packages] enabled`
+    /// on ([`crate::config::PackagesConfig::enabled`], default on). With [`Self::excluded`],
+    /// what the never-checked line may claim of the vendor programs.
     pub automatic: bool,
     /// The programs `[packages] exclude` names: never updated here, by any lane.
     pub excluded: Vec<String>,
-    /// What the `[packages]` table's own spelling asks of its owner — a retired key to
-    /// rename or remove ([`crate::config::PackagesConfig::config_notes`]), one `note` line
-    /// each.
+    /// What the `[packages]` table's own spelling asks of its owner (a retired key to rename
+    /// or remove, [`crate::config::PackagesConfig::config_notes`]), one `note` line each.
     pub config_notes: Vec<String>,
     /// A `[packages] prefix` this shipped build does not use, naming another store
     /// ([`crate::config::PackagesConfig::ignored_prefix`]): a `warn`, because nothing is
     /// installed unattended until the line goes.
     pub ignored_prefix: Option<PathBuf>,
-    /// Retired environment opt-outs still EXPORTED to this process — `(name, the setting
-    /// that replaced it)` ([`retired_opt_outs_exported`]): a `warn` each, because the
-    /// person who set one believes something is off that is not.
+    /// Retired environment opt-outs still exported to this process, `(name, the setting that
+    /// replaced it)` ([`retired_opt_outs_exported`]): a `warn` each, because the person who
+    /// set one believes something is off that is not.
     pub retired_env: Vec<(&'static str, &'static str)>,
     /// What an agent program's reroute stub reads besides PATH, as the shell that ran this
     /// report sees it ([`crate::reroute::StubEnv::of_process`]): (10d) says what `claude`
@@ -422,20 +376,13 @@ impl Default for Probes {
     }
 }
 
-/// Whether Claude Code's rating surveys (its optional 1/2/3/0 prompts) are OFF under this
-/// `~/.claude/settings.json` text.
-///
-/// Read from Claude Code itself (2.1.284): every survey kind returns before it rolls when
-/// `CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY` reads true — a value TRIMMED and lower-cased that is
-/// `1`, `true`, `yes` or `on` (`0`, `false`, `no`, `off`, `2` and the rest are NOT off) — and the
-/// settings `env` block's entries are written into the process environment, live, when the
-/// file is saved. Otherwise the SESSION survey (the only kind that reaches this account today)
-/// appears with probability `settings.feedbackSurveyRate ?? <remote default>`; a rate of `0` is
-/// off for it and for it alone. Anything else — no file, unreadable JSON, no key — leaves the
-/// vendor's default, which shows them.
-///
-/// Why aterm cares: a rating card draws under the prompt of a session the harness is
-/// supervising and waits for a keypress no one is there to give.
+/// Whether Claude Code's rating surveys are off under this `~/.claude/settings.json` text.
+/// As Claude Code 2.1.284 reads it: every survey returns before it rolls when
+/// `CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY` reads true (trimmed, lower-cased, one of `1`,
+/// `true`, `yes`, `on`; the `env` block reaches the process live when the file is saved);
+/// otherwise the session survey shows with probability `feedbackSurveyRate ?? <remote
+/// default>`, and a rate of `0` turns off that kind alone. A rating card under a supervised
+/// session's prompt waits for a keypress no one is there to give.
 #[must_use]
 pub fn claude_survey_off(settings_json: &str) -> bool {
     let Ok(v) = aterm_json::from_str::<aterm_json::Value>(settings_json) else {
@@ -455,7 +402,7 @@ fn claude_survey_env_on(v: &aterm_json::Value) -> bool {
         .is_some_and(claude_env_true)
 }
 
-/// Claude Code's `bool` parse of an `env` value (`Le`): stringified, trimmed, lower-cased, one of
+/// Claude Code's `bool` parse of an `env` value: stringified, trimmed, lower-cased, one of
 /// `1 true yes on`. A JSON `true` or `1` stringifies to one of those; nothing else does.
 fn claude_env_true(value: &aterm_json::Value) -> bool {
     let text = match value {
@@ -468,105 +415,23 @@ fn claude_env_true(value: &aterm_json::Value) -> bool {
     )
 }
 
-/// The Claude Code defaults the owner runs with — `(key, value as JSON text)` —
-/// MIRRORED from `aterm_primer::CLAUDE_DEFAULTS`, which the window writes where a
-/// key is unset. The values are JSON text here and typed there, so the table is a
-/// mirror, not a re-export: atpkg takes only the top-effort key's one spelling from
-/// aterm-primer ([`CLAUDE_TOP_EFFORT_KEY`]), and the two tables are pinned equal by
-/// a test in aterm-gui (which depends on both).
-pub const CLAUDE_DEFAULTS: [(&str, &str); 5] = [
-    (CLAUDE_TOP_EFFORT_KEY, "true"),
-    ("effortLevel", "\"xhigh\""),
-    ("feedbackSurveyRate", "0"),
-    (CLAUDE_SURVEY_SWITCH, "\"1\""),
-    (CLAUDE_DRAFTS_KEY, "\"quiet\""),
-];
-
-/// The key of the drafted-feedback card's setting — MIRRORED from
-/// `aterm_primer::CLAUDE_DRAFTS_KEY`, pinned equal by the same aterm-gui test.
-pub const CLAUDE_DRAFTS_KEY: &str = "feedbackDrafts";
-
-/// The key of the default that turns EVERY rating survey off: the `env` block's
-/// `CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY` (a dotted key is a nested one) — MIRRORED from
-/// `aterm_primer::CLAUDE_SURVEY_SWITCH`, pinned equal by the same aterm-gui test.
-pub const CLAUDE_SURVEY_SWITCH: &str = "env.CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY";
-
-/// The defaults that SET AN EFFORT — MIRRORED from
-/// `aterm_primer::CLAUDE_EFFORT_DEFAULTS`, pinned equal by the same aterm-gui test
-/// module. The window adds neither while a person's own effort stands
-/// ([`claude_efforts_set_by_hand`]): Claude Code resolves the effort to `xhigh`
-/// whenever the top-effort key ([`CLAUDE_TOP_EFFORT_KEY`]) is true, before it reads
-/// the level a person chose.
-pub const CLAUDE_EFFORT_DEFAULTS: [&str; 2] = [CLAUDE_TOP_EFFORT_KEY, "effortLevel"];
-
-/// A survey probability a person set BY HAND in the Claude settings text `settings_json`:
-/// the top-level `feedbackSurveyRate` at any value but the number zero, as its JSON text
-/// (`0.3`, `1`, `"0.5"`, `null`); `None` when it is unset or zero, and for text that does
-/// not parse. The window adds [`CLAUDE_SURVEY_SWITCH`] only where none stands (the switch
-/// silences every survey, whatever the probability asks for).
-///
-/// MIRRORED from `aterm_primer::claude_survey_rate_set_by_hand` and pinned equal to it by
-/// a test in aterm-gui, as [`CLAUDE_DEFAULTS`] is.
-#[must_use]
-pub fn claude_survey_rate_set_by_hand(settings_json: &str) -> Option<String> {
-    aterm_json::from_str::<aterm_json::Value>(settings_json)
+/// A value aterm-primer's rules name, as JSON text on one line — the form every (10h) row
+/// quotes a value in ([`DefaultState::Manual`]'s too). The primer keeps a number's literal
+/// and prints an object over several lines; a row is one line.
+fn one_line(text: String) -> String {
+    aterm_json::from_str::<aterm_json::Value>(&text)
         .ok()
-        .and_then(|v| survey_rate_set_by_hand(&v))
+        .and_then(|v| aterm_json::to_string(&v).ok())
+        .unwrap_or(text)
 }
 
-/// [`claude_survey_rate_set_by_hand`] over a parsed document.
-fn survey_rate_set_by_hand(v: &aterm_json::Value) -> Option<String> {
-    let rate = v.get("feedbackSurveyRate")?;
-    // A JSON number that is zero; `null`, a string or any other number is the person's own.
-    let zero = matches!(rate, aterm_json::Value::Number(_)) && rate.as_f64() == Some(0.0);
-    (!zero).then(|| aterm_json::to_string(rate).unwrap_or_default())
-}
-
-/// Every effort a person set BY HAND in the Claude settings text `settings_json`
-/// that is not the default's `xhigh`, as `(path, value as JSON text)`: the
-/// top-level `effortLevel` first, then each `modelSettings.<model>.effortLevel`
-/// (where `/effort <level>` saves it) in model-name order, the last of a duplicate
-/// key winning. Empty when there is none, and for text that does not parse.
-///
-/// MIRRORED from `aterm_primer::claude_efforts_set_by_hand` — the rule by which
-/// the window holds [`CLAUDE_EFFORT_DEFAULTS`] back — and pinned equal to it by a
-/// test in aterm-gui, as [`CLAUDE_DEFAULTS`] is.
-#[must_use]
-pub fn claude_efforts_set_by_hand(settings_json: &str) -> Vec<(String, String)> {
-    aterm_json::from_str::<aterm_json::Value>(settings_json)
-        .map(|v| efforts_set_by_hand(&v))
-        .unwrap_or_default()
-}
-
-/// [`claude_efforts_set_by_hand`] over a parsed document. [`aterm_json::Map`] is
-/// sorted and keeps the last of a duplicate key, which is the order and the rule
-/// the mirror states.
-fn efforts_set_by_hand(v: &aterm_json::Value) -> Vec<(String, String)> {
-    let xhigh = CLAUDE_DEFAULTS
-        .iter()
-        .find(|(k, _)| *k == "effortLevel")
-        .map_or("", |(_, want)| *want);
-    let mut found = Vec::new();
-    let mut note = |path: String, effort: &aterm_json::Value| {
-        let text = aterm_json::to_string(effort).unwrap_or_default();
-        if text != xhigh {
-            found.push((path, text));
-        }
-    };
-    if let Some(effort) = v.get("effortLevel") {
-        note("effortLevel".to_string(), effort);
-    }
-    if let Some(models) = v
-        .get("modelSettings")
-        .and_then(aterm_json::Value::as_object)
-    {
-        for (model, settings) in models {
-            if let Some(effort) = settings.get("effortLevel") {
-                note(format!("modelSettings.{model}.effortLevel"), effort);
-            }
-        }
-    }
-    found
+/// The hand-set efforts that hold the effort defaults back
+/// ([`claude_efforts_set_by_hand`]), each as `<path> = <value>`.
+fn efforts_by_hand(settings_json: &str) -> Vec<String> {
+    claude_efforts_set_by_hand(settings_json)
+        .into_iter()
+        .map(|(path, value)| format!("{path} = {}", one_line(value)))
+        .collect()
 }
 
 /// Where one default stands in a person's Claude settings.
@@ -574,37 +439,36 @@ fn efforts_set_by_hand(v: &aterm_json::Value) -> Vec<(String, String)> {
 pub enum DefaultState {
     /// Set to the default (or, for the survey, turned off another way).
     Default,
-    /// Set by hand to something else — kept, never overwritten.
+    /// Set by hand to something else: kept, never overwritten.
     Manual(String),
-    /// Not set, and not added: one of [`CLAUDE_EFFORT_DEFAULTS`] while a person's
-    /// own effort stands — named here, `<path> = <value>` (several joined by `, `).
+    /// Not set, and not added: one of [`CLAUDE_EFFORT_DEFAULTS`] while a person's own
+    /// effort stands, named here as `<path> = <value>` (several joined by `, `).
     HeldForEffort(String),
     /// Not set, and not added: [`CLAUDE_SURVEY_SWITCH`] while a person's own survey
-    /// probability stands — named here as its JSON text. The switch silences every
-    /// survey, so it would override the probability the person chose.
+    /// probability stands, named here as its JSON text. The switch silences every survey,
+    /// so it would override the probability the person chose.
     HeldForRate(String),
-    /// The top-effort key ([`CLAUDE_TOP_EFFORT_KEY`]) `true` beside an effort a
-    /// person set by hand — named here as [`DefaultState::HeldForEffort`] names it.
-    /// Claude Code resolves the effort to `xhigh` whenever that key is true, so that
-    /// effort is never used. Nothing can tell who wrote the key, so the window never
-    /// removes it — the doctor names it and the person decides.
+    /// Not set, and not added: [`CLAUDE_COMPACT_WINDOW_KEY`] while `~/.claude.json` records a
+    /// "Keep" answer to Claude Code's own autocompact offer, or cannot be read
+    /// (`aterm_primer::claude_compact_offers_kept_in`), named here as the reason.
+    HeldForOffer(String),
+    /// The top-effort key ([`CLAUDE_TOP_EFFORT_KEY`]) `true` beside a hand-set effort, named
+    /// as [`DefaultState::HeldForEffort`] names it: Claude Code then runs `xhigh`, never that
+    /// effort. Nothing tells who wrote the key, so the window never removes it.
     OverridesEffort(String),
     /// Not set: an aterm window adds the default at its next start.
     Unset,
 }
 
-/// Each of [`CLAUDE_DEFAULTS`] as `settings_json` leaves it, by the window's own
-/// rule (`aterm_primer::add_claude_defaults`): an unset key is added, except the
-/// effort defaults while a person's own effort stands — and a set top-effort key
-/// ([`CLAUDE_TOP_EFFORT_KEY`]) that overrides such an effort is
-/// [`DefaultState::OverridesEffort`], never the default.
+/// Each of [`CLAUDE_DEFAULTS`] as `settings_json` leaves it, by the window's own rule
+/// (`aterm_primer::add_claude_defaults`): an unset key is added, except the effort defaults
+/// while a person's own effort stands; a top-effort key that overrides such an effort is
+/// [`DefaultState::OverridesEffort`].
 ///
 /// # Errors
 ///
-/// A file the window refuses to add to, and leaves exactly as it is: the parse
-/// error (an empty file included), or "the top level is not a JSON object". No
-/// key is reported for it — "an aterm window adds …" would promise a repair that
-/// never happens.
+/// A file the window refuses and leaves as it is: the parse error (an empty file included),
+/// or "the top level is not a JSON object". No key is reported for it.
 pub fn claude_defaults_state(
     settings_json: &str,
 ) -> Result<Vec<(&'static str, DefaultState)>, String> {
@@ -617,11 +481,8 @@ pub fn claude_defaults_state(
         return Err("its \"env\" is not a JSON object".to_string());
     }
     let survey_off = claude_survey_off(settings_json);
-    let rate_by_hand = survey_rate_set_by_hand(&v);
-    let by_hand: Vec<String> = efforts_set_by_hand(&v)
-        .into_iter()
-        .map(|(path, value)| format!("{path} = {value}"))
-        .collect();
+    let rate_by_hand = claude_survey_rate_set_by_hand(settings_json).map(one_line);
+    let by_hand = efforts_by_hand(settings_json);
     Ok(CLAUDE_DEFAULTS
         .iter()
         .map(|&(key, want)| {
@@ -636,14 +497,15 @@ pub fn claude_defaults_state(
                 None => DefaultState::Unset,
                 Some(have) => {
                     let text = aterm_json::to_string(have).unwrap_or_default();
-                    // The switch is on for whatever Claude Code reads as true (`yes`, `TRUE`, ` 1 `,
-                    // a JSON `true`), not only for the spelling the window writes.
+                    // The switch is on for whatever Claude Code reads as true (`yes`,
+                    // `TRUE`, ` 1 `, a JSON `true`), not only the spelling the window writes.
                     let is_default = if key == CLAUDE_SURVEY_SWITCH {
                         claude_env_true(have)
                     } else {
                         // The file's own value only: the `env` survey switch sets no
                         // rate, and a rate a person wrote is theirs, whatever the switch.
-                        text == want || (key == "feedbackSurveyRate" && have.as_f64() == Some(0.0))
+                        text == want.json_text()
+                            || (key == "feedbackSurveyRate" && have.as_f64() == Some(0.0))
                     };
                     if key == CLAUDE_TOP_EFFORT_KEY && text == "true" && !by_hand.is_empty() {
                         DefaultState::OverridesEffort(by_hand.join(", "))
@@ -661,19 +523,37 @@ pub fn claude_defaults_state(
 
 /// Whether an aterm window would write to a settings file with this text: the
 /// window's own rule (`aterm_primer::add_claude_defaults`) — a key of
-/// [`CLAUDE_DEFAULTS`] absent from the top level, unless it is an effort default
-/// held back by a person's own effort: the keys the rows call `Unset`.
-fn window_adds(settings_json: &str) -> bool {
+/// [`CLAUDE_DEFAULTS`] absent from the top level, unless it is held back (an effort
+/// default by a person's own effort, the survey switch by their own probability, the
+/// autocompact window while `window_held`).
+fn window_adds(settings_json: &str, window_held: bool) -> bool {
     let Ok(v) = aterm_json::from_str::<aterm_json::Value>(settings_json) else {
         return false;
     };
-    let held = !efforts_set_by_hand(&v).is_empty();
-    let rate_held = survey_rate_set_by_hand(&v).is_some();
+    let held = !claude_efforts_set_by_hand(settings_json).is_empty();
+    let rate_held = claude_survey_rate_set_by_hand(settings_json).is_some();
     CLAUDE_DEFAULTS.iter().any(|(key, _)| {
         default_value(&v, key).is_none()
             && !(held && CLAUDE_EFFORT_DEFAULTS.contains(key))
             && !(rate_held && *key == CLAUDE_SURVEY_SWITCH)
+            && !(window_held && *key == CLAUDE_COMPACT_WINDOW_KEY)
     })
+}
+
+/// Why the window holds the autocompact window back for `home`, by its own rule
+/// (`aterm_primer::claude_compact_offers_kept_in`), or `None` when nothing does.
+fn compact_window_held(home: &Path) -> Option<String> {
+    match claude_compact_offers_kept_in(home) {
+        Ok(models) if models.is_empty() => None,
+        Ok(models) => Some(format!(
+            "Claude Code's autocompact offer was answered Keep ({}) in ~/.claude.json",
+            models.join(", ")
+        )),
+        Err(why) => Some(format!(
+            "~/.claude.json, where Claude Code records the answer to its autocompact offer, \
+             cannot be read ({why})"
+        )),
+    }
 }
 
 /// Where a default's key stands in the settings: a plain key at the top level, a dotted one
@@ -694,32 +574,21 @@ fn default_line(key: &str, want: &str) -> String {
     }
 }
 
-/// What (10h) reads of the Claude settings file at `path` (`~/.claude/settings.json`):
-/// [`claude_defaults_state`] over its text, or `None` when there is no file (and no
-/// link) at all. What the text cannot show makes it, instead, the `Err` the one
-/// refusal row names:
-///
-/// * A file that cannot be read — a link loop, a directory at that path, bytes that
-///   are not UTF-8, a file this user may not read. `aterm_primer::add_claude_defaults`
-///   reads it the same way and refuses it at every start.
-/// * A symlink whose target does not exist — a dotfiles link to a file not there
-///   yet — which `aterm_primer::add_claude_defaults` refuses at every start rather
-///   than replace the link with a plain file. Read through the link it looked like
-///   no file at all, and the doctor said nothing.
-/// * A file whose REAL directory (a link's target's: the window's atomic write puts
-///   its temp file there and renames it over the target) this user cannot write — a
-///   link into a read-only store, as home-manager lays one out — while the text
-///   leaves a key the window would add ([`window_adds`]). Every window start tries
-///   that write and fails, so the row promising the addition was false. A file that
-///   needs nothing added is judged by its text alone: the window writes nothing to
-///   it, and its rows (a hand-set value kept, a top-effort key over a hand-set
-///   effort) still hold.
-fn probe_claude_settings(path: &Path) -> Option<Result<Vec<(&'static str, DefaultState)>, String>> {
+/// What (10h) reads of the Claude settings file in `home` (`~/.claude/settings.json`):
+/// [`claude_defaults_state`] over its text, the autocompact window held back as the window
+/// holds it ([`compact_window_held`]), or `None` with no file (and no link). Each case where
+/// every window start fails to add to the file is the `Err` the one refusal row names: a file
+/// that cannot be read, a symlink to a missing target (which the window will not replace with
+/// a plain file), or, while a key is left to add ([`window_adds`]), a real directory (where
+/// the atomic write renames its temp file) this user cannot write, such as a read-only
+/// home-manager store.
+fn probe_claude_settings(home: &Path) -> Option<Result<Vec<(&'static str, DefaultState)>, String>> {
+    let path = &home.join(".claude").join("settings.json");
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // NotFound through a link means the LINK is there and its target is not:
-            // the window's own reading (`add_claude_defaults`).
+            // NotFound through a link means the link is there and its target is not: the
+            // window's own reading (`add_claude_defaults`).
             let meta = std::fs::symlink_metadata(path).ok()?;
             if !meta.file_type().is_symlink() {
                 return None;
@@ -730,8 +599,19 @@ fn probe_claude_settings(path: &Path) -> Option<Result<Vec<(&'static str, Defaul
         }
         Err(e) => return Some(Err(format!("it cannot be read: {e}"))),
     };
-    let states = claude_defaults_state(&text);
-    if states.is_ok() && window_adds(&text) {
+    let held = compact_window_held(home);
+    let states = claude_defaults_state(&text).map(|states| {
+        states
+            .into_iter()
+            .map(|(key, state)| match (&held, state) {
+                (Some(why), DefaultState::Unset) if key == CLAUDE_COMPACT_WINDOW_KEY => {
+                    (key, DefaultState::HeldForOffer(why.clone()))
+                }
+                (_, state) => (key, state),
+            })
+            .collect()
+    });
+    if states.is_ok() && window_adds(&text, held.is_some()) {
         let real = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         if let Some(dir) = real.parent()
             && !crate::platform::dir_writable_by_caller(dir)
@@ -754,15 +634,11 @@ fn probe_claude_settings(path: &Path) -> Option<Result<Vec<(&'static str, Defaul
     Some(states)
 }
 
-/// Retired environment knobs a person may still export from a shell rc or a script —
-/// each with the setting or launch flag that replaced it. An inert opt-out silently
-/// stops opting out (`ATERM_NO_AUTO_UPDATE=1` no longer holds updates), so the doctor
-/// names it.
+/// Retired environment opt-outs a person may still export, each with the setting or launch
+/// flag that replaced it. An inert opt-out silently stops opting out
+/// (`ATERM_NO_AUTO_UPDATE=1` holds no update), so the doctor names it.
 ///
-/// THE ONE PLACE A RETIRED NAME IS READ, and it reads PRESENCE only — never the value, and
-/// nothing acts on it: this is the doctor telling a person their switch no longer does
-/// anything and naming the one that does. `crates/aterm-update-core/tests/env_reads.rs`
-/// admits this table by name (`RETIRED_DETECTOR`) and no other read of these names.
+/// The one place a retired name is read, and only for presence: nothing acts on it.
 pub const RETIRED_OPT_OUTS: &[(&str, &str)] = &[
     (
         "ATERM_NO_AUTO_UPDATE",
@@ -894,8 +770,8 @@ pub const RETIRED_OPT_OUTS: &[(&str, &str)] = &[
     ("ATERM_DRIVE_READY", "aterm drive --ready <regex>"),
 ];
 
-/// Which [`RETIRED_OPT_OUTS`] are exported to this process (set at all, whatever the
-/// value — an exported `=0` is still a line in an rc a person should delete).
+/// Which [`RETIRED_OPT_OUTS`] are exported to this process, whatever the value: an exported
+/// `=0` is still a line in an rc a person should delete.
 #[must_use]
 pub fn retired_opt_outs_exported() -> Vec<(&'static str, &'static str)> {
     RETIRED_OPT_OUTS
@@ -907,7 +783,7 @@ pub fn retired_opt_outs_exported() -> Vec<(&'static str, &'static str)> {
 
 /// The publisher-side act that cures an `UnknownField` verdict: publish the newer
 /// Trust coherence group from the seal the workspace was committed against.
-pub const PUBLISH_RUSTC_GROUP: &str = "tools/atpkg-publish-rustc-group.sh";
+pub const PUBLISH_RUSTC_GROUP: &str = "atpkg-publish publish-group rustc --seal <dir> --upload";
 
 /// Find the nearest ancestor of `start` (inclusive) whose `Cargo.toml` carries a
 /// `[trust]` table. `None` when no manifest on the way up declares one.
@@ -936,7 +812,7 @@ fn unknown_field_in(stderr: &str) -> Option<String> {
     (!field.is_empty()).then(|| field.to_string())
 }
 
-/// Ask the INSTALLED targo whether it accepts the workspace's `[trust]` policy.
+/// Ask the installed targo whether it accepts the workspace's `[trust]` policy.
 /// `locate-project --workspace` parses the manifest and compiles nothing.
 fn probe_workspace_policy(layout: &Layout, cwd: &Path) -> Option<WorkspacePolicyProbe> {
     let workspace = workspace_with_trust_table(cwd)?;
@@ -977,9 +853,9 @@ fn probe_workspace_policy(layout: &Layout, cwd: &Path) -> Option<WorkspacePolicy
     Some(WorkspacePolicyProbe { workspace, policy })
 }
 
-/// Where rustup's `trust` channel points, when that is NOT inside the atpkg store. The
-/// rustup home is the one rustup itself resolves — `$RUSTUP_HOME`, else `<home>/.rustup`
-/// ([`crate::seam::rustup_home_with`]) — so a relocated home is probed, not skipped.
+/// Where rustup's `trust` channel points, when that is not inside the atpkg store. The rustup
+/// home is the one rustup resolves (`$RUSTUP_HOME`, else `<home>/.rustup`,
+/// [`crate::seam::rustup_home_with`]), so a relocated home is probed, not skipped.
 fn probe_local_seal(layout: &Layout, home: Option<&Path>) -> Option<LocalSealProbe> {
     let link = crate::seam::rustup_home_with(std::env::var_os("RUSTUP_HOME").as_deref(), home)?
         .join("toolchains")
@@ -1018,17 +894,16 @@ fn probe_local_seal(layout: &Layout, home: Option<&Path>) -> Option<LocalSealPro
 /// the doctor checked (`--verbose`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Detail {
-    /// The verdict, then only what needs attention — each in one short line with its next
-    /// step — and the one next act.
+    /// The verdict, then only what needs attention (each in one short line with its next
+    /// step), and the one next act.
     Problems,
     /// The verdict, then every row and its whole explanation.
     Everything,
 }
 
-/// Run the health surface, printing the report ([`present`]). Returns `true` iff there
-/// were NO structural problems (`main` maps `false` → exit 1). Reads the real environment:
-/// home, PATH, the clock, and the `[packages]` config's account, automatic-update switches
-/// and exclusions.
+/// Run the health surface, printing the report ([`present`]). Returns `true` iff there were
+/// no structural problems (`main` maps `false` to exit 1). Reads the real environment: home,
+/// PATH, the clock, and the `[packages]` config.
 #[must_use]
 pub fn run(layout: &Layout, prefix: &str, detail: Detail) -> bool {
     let home = aterm_types::dirs::home_dir();
@@ -1045,9 +920,7 @@ pub fn run(layout: &Layout, prefix: &str, detail: Detail) -> bool {
         config_notes: cfg.config_notes(),
         ignored_prefix: cfg.ignored_prefix.clone(),
         retired_env: retired_opt_outs_exported(),
-        claude_defaults: home
-            .as_deref()
-            .and_then(|h| probe_claude_settings(&h.join(".claude").join("settings.json"))),
+        claude_defaults: home.as_deref().and_then(probe_claude_settings),
         stub_env: crate::reroute::StubEnv::of_process(),
         index_head: crate::index_probe::probes_this_source(),
         cc: Some(crate::prereq::probe(path.as_deref())),
@@ -1114,16 +987,14 @@ impl Presented {
     }
 }
 
-/// THE REPORT AS A PERSON READS IT. [`run_with`]'s full report buries the one actionable
-/// warning under dozens of long lines, so the report leads with its VERDICT, and by
-/// default ([`Detail::Problems`]) says only what needs attention: each
-/// `warn`/`FAIL`/`PROBLEM` row in one line of at most [`SHORT_ROW`]
-/// characters — the fact, and its next step when the row names one — then the one next
-/// act, and where the rest is. `healthy` is said only when nothing at all was flagged;
-/// a report with warnings and no fault is "working", with the count of what to look at.
-/// [`Detail::Everything`] prints the verdict and then every line the checks wrote. Pure
-/// over the full report's text — `report` its stdout, `faults` its stderr — so the exit
-/// code and every check stay [`run_with`]'s.
+/// The report as a person reads it: the verdict first, then by default
+/// ([`Detail::Problems`]) only what needs attention, each `warn`/`FAIL`/`PROBLEM` row in one
+/// line of at most [`SHORT_ROW`] characters (the fact, and its next step when the row names
+/// one), then the one next act and where the rest is. `healthy` is said only when nothing
+/// was flagged; warnings without a fault read "working", with a count. [`Detail::Everything`]
+/// prints the verdict and then every line the checks wrote. Pure over the full report's text
+/// (`report` its stdout, `faults` its stderr), so the exit code and every check stay
+/// [`run_with`]'s.
 #[must_use]
 pub fn present(report: &str, faults: &str, p: &str, detail: Detail) -> Presented {
     let head = format!("{p}: ");
@@ -1174,8 +1045,8 @@ pub fn present(report: &str, faults: &str, p: &str, detail: Detail) -> Presented
         let flagged_row = ["warn", "FAIL", "PROBLEM"]
             .iter()
             .any(|l| rest.starts_with(&format!("{l} \u{2014} ")));
-        // The recorded problems a PROBLEM verdict lists, indented under it — and the
-        // one plain fact that explains an empty store: it was removed on purpose.
+        // The recorded problems a `PROBLEM` verdict lists, indented under it, and the one
+        // plain fact that explains an empty store: it was removed on purpose.
         if flagged_row || rest.starts_with("  ") || rest.starts_with(DECLINED_LINE) {
             let (row, cut) = shorten(line);
             elided |= cut;
@@ -1249,9 +1120,9 @@ pub fn present(report: &str, faults: &str, p: &str, detail: Detail) -> Presented
 }
 
 /// One problem row in at most [`SHORT_ROW`] characters: the row as written when it fits,
-/// else its first clause — the fact, up to the first ` — `, `; ` or sentence end — and
-/// the next step the row names ([`next_step`]), the fact cut short with a visible `…` if
-/// the two still do not fit.
+/// else its first clause (the fact, up to the first ` — `, `; ` or sentence end) and the
+/// next step the row names ([`next_step`]), the fact cut short with a visible `…` if the two
+/// still do not fit.
 fn short_row(p: &str, level: &str, text: &str) -> String {
     let whole = format!("{p}: {level} \u{2014} {text}");
     if whole.chars().count() <= SHORT_ROW {
@@ -1300,7 +1171,7 @@ fn first_clause_end(text: &str) -> usize {
     text.len()
 }
 
-/// The ONE next step a row names: its `fix:`, `now:` or `or add:` clause (a PATH line to
+/// The one next step a row names: its `fix:`, `now:` or `or add:` clause (a PATH line to
 /// paste), else the first `aterm …` command it quotes in backticks. `None` when the row
 /// names none, or only one too long to leave room for the fact beside it.
 fn next_step(text: &str) -> Option<String> {
@@ -1348,14 +1219,14 @@ pub fn run_with(
     out: &mut dyn std::io::Write,
     err: &mut dyn std::io::Write,
 ) -> bool {
-    // THE SPEAKER IS THE VERB THE USER TYPED (`status` is an alias for this report), so a
+    // The speaker is the verb the user typed (`status` is an alias for this report), so a
     // script keying on the prefix keys on the verb it ran.
     let p = prefix;
     let mut fails = 0usize;
 
-    // (0) WHICH atpkg IS SPEAKING. A machine can carry several (the app's, a dev `dist/`,
-    // a `target/release`), and a stale one misreports the store — whose natural next step
-    // is reinstalling something that was never broken.
+    // (0) Which atpkg is speaking. A machine can carry several (the app's, a dev `dist/`, a
+    // `target/release`), and a stale one misreports the store, whose natural next step is
+    // reinstalling something that was never broken.
     let _ = writeln!(
         out,
         "{p}: this atpkg is {} at {}",
@@ -1375,16 +1246,16 @@ pub fn run_with(
         out,
     );
 
-    // (1) TRUST ROOT + INDEX SOURCE.
+    // (1) Trust root and index source.
     let _ = writeln!(
         out,
         "{p}: index source github.com/{}",
         crate::resolve_account(cfg_account).slug()
     );
     if crate::manager_enabled() {
-        // The root is the PAPER MASTER — the same anchor the app updater uses, not a
-        // package-specific key. Naming it here is what lets an operator answer "which
-        // trust root is this build on?" without reading source.
+        // The root is the paper master, the anchor the app updater uses, not a
+        // package-specific key: naming it answers "which trust root is this build on?"
+        // without reading source.
         let _ = writeln!(
             out,
             "{p}: ok — paper master pinned (fingerprint {}, {} key(s))",
@@ -1417,7 +1288,7 @@ pub fn run_with(
         );
     }
 
-    // (2) PREFIX / STORE.
+    // (2) Prefix and store.
     if layout.prefix.is_dir() {
         let _ = writeln!(out, "{p}: ok — prefix {}", layout.prefix.display());
     } else {
@@ -1428,7 +1299,7 @@ pub fn run_with(
         );
     }
 
-    // (3) PATH WIRING.
+    // (3) PATH wiring.
     let bin_dir = layout.bin_dir();
     let on_path = path_var
         .map(|p| std::env::split_paths(p).any(|d| d == bin_dir))
@@ -1445,15 +1316,14 @@ pub fn run_with(
         );
     }
 
-    // (3b) REROUTE (philosophy §4, `crate::reroute`): per row, the stub's state; then
-    // ORDER, not presence: a `~/.cargo/bin` ahead of everything managed makes a bare
-    // `cargo` in a session run upstream Rust silently. Everything here is
-    // advisory (warn, exit 0): outside an aterm session the reroute dir is not on PATH
-    // BY DESIGN (the prepend is session-scoped, never machine-wide), and a missing stub
-    // is re-laid at the next spawn. Doctor names; it never lays.
+    // (3b) Reroute (`crate::reroute`): each stub's state, then PATH order, not presence: a
+    // `~/.cargo/bin` ahead of everything managed makes a bare `cargo` in a session run
+    // upstream Rust silently. All advisory (warn, exit 0): outside an aterm session the
+    // reroute dir is not on PATH by design (the prepend is session-scoped), and a missing
+    // stub is re-laid at the next spawn. Doctor names; it never lays.
     let reroute_dir = layout.reroute_dir();
-    // …and every agent program whose `agents/` twin stands: its stub is what
-    // routes `claude` to the managed copy at exec time in a shell whose PATH predates it.
+    // Every agent program whose `agents/` twin stands gets a row too: its stub routes
+    // `claude` to the managed copy at exec time in a shell whose PATH predates it.
     let agent_rows = crate::reroute::agents_routes(layout)
         .into_iter()
         .map(|name| (name, crate::reroute::stub_state(layout, name)));
@@ -1524,15 +1394,11 @@ pub fn run_with(
         }
     }
 
-    // (4) BROKEN SHIM SCAN of bin/ — a shim whose forward target is GONE (a dangling
-    // symlink on Unix; on Windows a `.cmd` forwarding to a missing exe, which no symlink
-    // scan could ever catch). `resolve_shim` reads the target cross-platform; a tombstone
-    // (deliberately target-less) yields `None` and is never flagged.
-    //
-    // A SHIM WE COULD NOT STAT IS NOT A BROKEN SHIM: an unreadable target (EACCES on a
-    // parent, privacy consent's EPERM, EIO) is not evidence of a fault, and
-    // `tools/install.sh` hands this exit code to failed-seed installers as the diagnostic
-    // to trust. Nor is it swallowed: it is a warn that names the cause.
+    // (4) Broken shim scan of bin/: a shim whose forward target is gone (a dangling symlink,
+    // or on Windows a `.cmd` forwarding to a missing exe); a tombstone has no target and is
+    // never flagged. A target that cannot be checked (EACCES, privacy consent's EPERM, EIO)
+    // is no evidence of a fault, and `tools/install.sh` points failed installs at this
+    // report, so it is a warn naming the cause, not a broken shim.
     if let Ok(entries) = std::fs::read_dir(&bin_dir) {
         for e in entries.flatten() {
             let shim = e.path();
@@ -1558,10 +1424,10 @@ pub fn run_with(
         }
     }
 
-    // (5) ACTIVE-BUILD STORE INTEGRITY.
+    // (5) Active-build store integrity.
     let active = crate::ops::active_builds(layout);
-    // The first program whose store tree is missing/incomplete — remembered so the
-    // verdict tail can name ONE structural repair (`install <program>`) instead of a menu.
+    // The first program whose store tree is missing or incomplete, so the verdict tail can
+    // name one structural repair (`install <program>`) instead of a menu.
     let mut next_install_program: Option<String> = None;
     for (program, build) in &active {
         let bd = layout.build_dir(program, *build);
@@ -1577,24 +1443,15 @@ pub fn run_with(
             }
         }
     }
-    // No count here: (11) says how many programs are active, from the tally that counts a
-    // dev-linked program too (this loop's own count said 0 beside (11)'s 1 for one).
+    // No count here: (11) says how many programs are active, from the tally that also counts
+    // a dev-linked program.
 
-    // (5c) SOLVERS THE `trust` BUNDLE PINS PRIVATELY.
-    //
-    // trustc resolves its SMT solver as a SIBLING of its own executable — see
-    // `sibling_solver_candidate` / `resolve_ay_solver_identity_from_candidates`
-    // in trust's `compiler/rustc_mir_transform/src/trust_verify.rs`: an explicit
-    // `AY_PATH` wins, otherwise the copy inside the bundle's own `bin/`, and
-    // there is NO PATH fallback at all.
-    //
-    // The pin itself is deliberate and should not be "fixed" away: trust
-    // snapshots and fingerprints the solver binary so a proof records which
-    // solver produced it, and a solver that floated with whatever atpkg last
-    // installed would make proof identity float with it.
-    //
-    // But a managed `ay` newer than the bundle's is not the one Trust uses, and nothing
-    // else says so: reported, never failed.
+    // (5c) Solvers the `trust` bundle pins privately. trustc resolves its SMT solver as a
+    // sibling of its own executable (trust's `trust_verify.rs`): an explicit `AY_PATH` wins,
+    // else the copy in the bundle's own `bin/`, with no PATH fallback. The pin is
+    // deliberate: a proof records which solver produced it, and a solver that floated with
+    // atpkg's installs would make proof identity float too. A managed `ay` newer than the
+    // bundle's is not the one Trust uses, and nothing else says so: reported, never failed.
     if let Some(trust_build) = active
         .iter()
         .find(|(p, _)| p.as_str() == "trust")
@@ -1616,10 +1473,8 @@ pub fn run_with(
                     .join("bin")
                     .join(program),
             );
-            // Equal versions are the healthy case. An unanswered probe on
-            // either side is NOT evidence of divergence, so it stays silent
-            // rather than reporting "pinned unknown vs managed 0.13.0" — a
-            // line that reads like a finding and carries none.
+            // Equal versions are healthy; an unanswered probe on either side is not
+            // evidence of divergence, so it stays silent.
             if pinned_version == managed_version
                 || pinned_version == "unknown"
                 || managed_version == "unknown"
@@ -1637,48 +1492,29 @@ pub fn run_with(
     }
 
     // (5f) tippy's compiler is a plain file, and the rustup view is a clone of the build.
-    //
-    // Current bundles ship Trust's names only, and the stock names live in atpkg's rustup
-    // view ([`crate::seam::refresh_view`]) as copy-on-write clones of the Trust tools.
-    // Older bundles (8571, 8589, 8590, 8595) ship `bin/rustc` as a separately signed copy
-    // of `trustc` — an ad-hoc signature embeds the file name, so the bytes differ — and
-    // their tippy (before trust `e79c1142a5`) refuses it. The store is never modified;
-    // atpkg lays a per-build exec root — a clone of the build where `rustc` holds
-    // `trustc`'s bytes — and routes the trust shims through it ([`crate::compat`]). This
+    // Older bundles ship `bin/rustc` as a separately signed copy of `trustc` (an ad-hoc
+    // signature embeds the file name, so the bytes differ), which their tippy refuses; atpkg
+    // leaves the store alone and routes the trust shims through a per-build exec root where
+    // `rustc` holds `trustc`'s bytes ([`crate::compat`]). Current bundles ship Trust's names
+    // only, and the stock names live in the rustup view ([`crate::seam::refresh_view`]). The
     // check reads file facts (`lstat`, byte compares), never a run of tippy, whose
     // ancestor-directory checks refuse intermittently and would make the verdict flap.
     //
-    // (a) `trustc` must be a plain file: tippy (and tippy-driver) refuse a symbolic
-    //     link for the selected compiler, measured. It withholds "healthy" while tippy
-    //     is in the bundle to be refused.
-    // (b) For every recorded seam, each stock name rustup resolves must be a clone of the
-    //     store's Trust tool holding its bytes — or `cargo +trust` / `rustc +trust` run
-    //     something other than the managed toolchain. A view laid as hard links before
-    //     clones is not one. A mismatch is a warn that withholds "healthy", and
-    //     `aterm pkg repair` rebuilds the view.
-    // (c) When the active build [`crate::compat::needs_root`] (`rustc` neither `trustc`'s
-    //     inode nor its bytes, beside a tippy): an exec root that is a clone of the build
-    //     at `Deep` depth, with every trust shim in `bin/` carrying the guard through it,
-    //     is a NOTE and the report stays healthy. No root, a root that differs from the
-    //     build, or a shim that does not route is a warn that withholds "healthy" — both
-    //     inode numbers in the line, so a reader can `stat` the claim — with the one fix,
-    //     `aterm pkg repair`, which lays the root at `Deep` and re-renders every shim.
-    //     Behind a link or a file at `compat` or `compat/trust` repair refuses on every
-    //     run, so that warn names the path and says to remove it first.
-    // (d) A root under `<prefix>/compat/trust` no build needs — its build reclaimed (its
-    //     clones keep the reclaimed blocks allocated), its build needing none, or not a
-    //     directory at all — is an advisory warn naming `aterm pkg gc`, whose closing
-    //     sweep removes exactly these ([`crate::compat::strays`] is that sweep's own
-    //     classification). It leaves a healthy report healthy: no tool fails over it.
-    // (e) A build that needs no root — every Trust-names-only bundle, a pack whose `rustc`
-    //     is a hard link of `trustc`, a byte-identical copy — gets no (c) line at all.
-    // (f) A build whose `bin/rustc` or `bin/trustc` cannot be READ is not proof of either:
-    //     a warn that withholds "healthy", naming the failed read, because nothing here can
-    //     vouch for PATH tippy — and the passes leave any root standing for it alone.
+    // (a) `trustc` must be a plain file while the bundle ships tippy, which refuses a
+    //     symlinked compiler.
+    // (b) Each stock name in a recorded seam's view must be a clone of the store's Trust
+    //     tool holding its bytes, or `cargo +trust` runs something else; `repair` fixes it.
+    // (c) A build that [`crate::compat::needs_root`] is a note with a matching `Deep` root
+    //     and every shim routed, else a warn with both inodes and the fix: `repair`, or for
+    //     a link or file at `compat`/`compat/trust` (which repair refuses) its removal.
+    // (d) A root no build needs is an advisory warn naming `aterm pkg gc`
+    //     ([`crate::compat::strays`]).
+    // (e) A build that needs no root gets no (c) line.
+    // (f) An unreadable `bin/rustc` or `bin/trustc` proves neither: a warn naming the read.
     //
-    // A warn that says "cannot run" counts in `tools_cannot_run`; one that says "may not
-    // run" or "cannot tell" counts in `tools_unproven`, so the closing line never claims a
-    // tool cannot run where the line it summarises only failed to show that it can.
+    // Warns other than (d) withhold "healthy". "Cannot run" counts in `tools_cannot_run`,
+    // "may not run" or "cannot tell" in `tools_unproven`, so the closing line never claims a
+    // tool cannot run where its line only failed to show that it can.
     let mut tools_cannot_run = 0usize;
     let mut tools_unproven = 0usize;
     if let Some(trust_build) = active.get("trust").copied() {
@@ -1744,14 +1580,11 @@ pub fn run_with(
         let _ = writeln!(out, "{}", stray_root_line(p, &path, why));
     }
 
-    // (5d) THE WORKSPACE THE OPERATOR IS STANDING IN vs THE INSTALLED TRUST.
-    //
-    // atpkg keeps the toolchain current with what is PUBLISHED; it cannot keep a
-    // repository from depending on a Trust build that was never published. When that
-    // happens the symptom is targo refusing the workspace with an "unknown field"
-    // error that looks like a manifest typo. The installed targo decides the verdict
-    // here, and the line says what is actually behind: the toolchain, on the
-    // publisher's side, not this machine.
+    // (5d) The workspace the operator is in against the installed Trust. atpkg keeps the
+    // toolchain current with what is published; it cannot stop a repository depending on a
+    // Trust build never published, whose symptom is targo refusing the workspace with an
+    // "unknown field" error that looks like a manifest typo. The installed targo decides,
+    // and the line names what is behind: the publisher's toolchain, not this machine.
     let mut next_publish = false;
     if let Some(ws) = &probes.workspace {
         let trust_build = active
@@ -1793,14 +1626,12 @@ pub fn run_with(
         }
     }
 
-    // (5e) A LOCAL TOOLCHAIN BEHIND rustup's `trust` CHANNEL. Newer than the store's (or
-    // of unknown age), it is the user's choice to keep: the line says which compiler
-    // `cargo +trust` gets and the one re-point that hands it back to the managed one —
-    // the only line about this entry, since (9) stays silent on it. Older,
-    // or gone, it is stale, and `repair` re-points the channel at the store — as the next
-    // unattended pass does by itself for an older LIVE BUILD TREE nobody put back
-    // ([`crate::seam::live_build_tree`]); `repair` stays the fix named, because it is the
-    // one that acts now.
+    // (5e) A local toolchain behind rustup's `trust` channel. Newer than the store's (or of
+    // unknown age), it is the user's to keep: the line says which compiler `cargo +trust`
+    // gets and the one re-point that hands it back (the only line about this entry; (9)
+    // stays silent on it). Older or gone, it is stale and `repair` re-points the channel at
+    // the store, as the next unattended pass does by itself for an older live build tree
+    // ([`crate::seam::live_build_tree`]); `repair` is named because it acts now.
     if let Some(seal) = &probes.local_seal {
         let _ = match &seal.stale {
             Some(crate::seam::Stale::Dangling) => writeln!(
@@ -1853,21 +1684,20 @@ pub fn run_with(
         };
     }
 
-    // THE TOOLCHAIN UPDATE THAT WAITS, AND THE RUNS HOLDING BUILDS: states, never
-    // failures. An unattended pass that found the Trust toolchain in use staged the
-    // new one and holds its flip for quiet ([`crate::quiet`]); a merge-contract run or a
-    // cut holds a lease on the build it resolved ([`crate::lease`]), which gc keeps. Each
-    // line says what, on whom, until when — and the one command that ends the wait.
+    // The toolchain update that waits, and the runs holding builds: states, never failures.
+    // An unattended pass that found the Trust toolchain in use staged the new one and holds
+    // its flip for quiet ([`crate::quiet`]); a release cut or an `aterm pkg lease` command
+    // holds a lease on the build it resolved ([`crate::lease`]), which gc keeps. Each line
+    // says what, on whom, until when, and the one command that ends the wait.
     for line in hold_lines(layout, now) {
         let _ = writeln!(out, "{p}: {line}");
     }
 
-    // (5b) LIVE-BUILD WITNESS. `gc` reclaims a program's superseded builds only when the
-    // authoritative `store/<program>/current` symlink and the derived `bin/` shim view name
-    // the SAME build; where they don't it abstains rather than guess (guessing is what
-    // deleted live trees), and the program accumulates builds silently — so this makes it
-    // visible. A genuine disagreement is STRUCTURAL: some tool on PATH is running a build
-    // activation does not select. A merely-absent witness is not breakage, so it warns.
+    // (5b) Live-build witness. `gc` reclaims a program's superseded builds only when the
+    // `store/<program>/current` symlink and the derived `bin/` shim view name the same build;
+    // otherwise it abstains rather than guess (a guess can delete a live tree) and builds
+    // accumulate silently, so this makes it visible. A genuine disagreement is structural
+    // (some tool on PATH runs a build activation does not select); an absent witness warns.
     let live = crate::gc::live_builds(layout);
     // A shim/link divergence's repair is a re-run of `update` — remembered for the
     // verdict tail's single `next` act.
@@ -1920,13 +1750,13 @@ pub fn run_with(
         live.len()
     );
 
-    // (6) SHELL HOOKS + FISH-SAFETY.
+    // (6) Shell hooks and fish safety.
     if let Some(home) = home {
         let aterm = home.join(".aterm");
         let shell_d = aterm.join("shell.d");
-        // Probe the dialect the interactive shell on THIS platform actually sources: `.ps1`
-        // (PowerShell) on Windows, `.zsh` elsewhere. An install writes the whole set, so a
-        // present platform-native hook means PATH wiring is in place.
+        // Probe the dialect this platform's interactive shell sources: `.ps1` (PowerShell) on
+        // Windows, `.zsh` elsewhere. An install writes the whole set, so a native hook means
+        // PATH wiring is in place.
         let native_hook = format!("{}.{}", crate::hooks::HOOK_BASENAME, native_hook_ext());
         if shell_d.join(&native_hook).is_file() {
             let _ = writeln!(out, "{p}: ok — shell.d hooks present");
@@ -1948,18 +1778,11 @@ pub fn run_with(
                 }
             }
         }
-        // (6b) rc wiring — which shells outside aterm reach the managed `bin/`, and for the
-        // ones that do not, why. One line per rc file that exists (atpkg never creates one).
-        // Without it the three states a user can be in — wired, opted out, and skipped at
-        // the consent fence — are indistinguishable from outside.
-        //
-        // Doctor must not invent a fault from evidence it did not measure. `rc_wiring` reads
-        // each file's content for a `/.aterm/shell.d/` line, and also the two bash login
-        // profiles install.sh can elect that atpkg has no row for
-        // (`hooks::INSTALL_SH_PROFILES`), so a Mac wired by install.sh is not called
-        // unwired. It still reads six named files, not every file a shell can start from, so
-        // when none of them sources shell.d the note names the six (`hooks::rc_files_read`)
-        // instead of calling the machine aterm-only.
+        // (6b) rc wiring: one line per rc file that exists (atpkg never creates one), telling
+        // wired, opted out and consent-fenced apart. `rc_wiring` reads six named files, among
+        // them install.sh's two bash login profiles (`hooks::INSTALL_SH_PROFILES`), so a Mac
+        // wired by install.sh is not called unwired; when none sources shell.d the note names
+        // the six (`hooks::rc_files_read`) instead of calling the machine aterm-only.
         #[cfg(unix)]
         {
             let wiring = crate::hooks::rc_wiring(home);
@@ -2045,7 +1868,7 @@ pub fn run_with(
                 crate::hooks::copied_command_remedy(&path)
             );
         }
-        // Privacy of the login-sourced dirs (READ-ONLY — doctor never chmods).
+        // Privacy of the login-sourced dirs (read-only: doctor never chmods).
         for dir in [&aterm, &shell_d] {
             if let Ok(m) = std::fs::symlink_metadata(dir)
                 && m.file_type().is_dir()
@@ -2061,7 +1884,7 @@ pub fn run_with(
         }
     }
 
-    // (7) DISK HEADROOM.
+    // (7) Disk headroom.
     match crate::freespace::available_bytes(&layout.prefix) {
         Some(free) if free < 5 * GIB => {
             let _ = writeln!(
@@ -2078,10 +1901,8 @@ pub fn run_with(
         }
     }
 
-    // (7b) THE DEVELOPER TOOLS LIST ([`crate::devtools`], macOS): whether macOS holds
-    // every new program aterm starts for its first-run check. A WARNING when aterm is not
-    // on it (builds and tests wait, timing tests flake; only the owner can add it), never
-    // a PROBLEM; `None` is a report that does not read the machine, and says nothing.
+    // (7b) The Developer Tools list ([`crate::devtools`], macOS): a warning when aterm is not
+    // on it, never a problem. A report that does not read the machine says nothing.
     if let Some(row) = probes.devtools.as_ref().and_then(crate::devtools::row) {
         let _ = writeln!(
             out,
@@ -2091,24 +1912,20 @@ pub fn run_with(
         );
     }
 
-    // (7c) UNIVERSAL CONTROL (macOS): the machine setting the pass applies per
-    // this report (R5). Read through `defaults -currentHost`, never written here; the
-    // line carries the revert when it is off and the opt-out when it is about to be.
+    // (7c) Universal Control (macOS): the machine setting the pass applies, read through
+    // `defaults -currentHost` and never written here; the line carries the revert when it is
+    // off and the opt-out when it is about to be.
     if cfg!(target_os = "macos") {
         let state = crate::machine::universal_control_state(&crate::machine::SystemDefaults);
         let policy = crate::config::cached_machine().universal_control();
         let _ = writeln!(out, "{p}: {}", state.doctor_line(policy));
     }
 
-    // (8) INDEX FREEZE / AGE (no unverified parse — atpkg's OWN diagnostics only).
-    // The clock is `last_success_at`, stamped by a pass that resolved the index and RAN
-    // TO ITS END — clean, or with member failures each recorded in its own row. It is
-    // never `updated_at`, which every writer moves (a failing pass included). The line
-    // says "completed pass", not "successful update", because that is what the stamp
-    // measures; the member rows below say what failed.
-    // "NEVER CHECKED" IS SAID HERE AND NOWHERE ELSE, and only what
-    // is true: an index pass moves the index-pinned programs; the vendor programs this
-    // machine keeps at their vendors' heads update without one (design §1).
+    // (8) Index freeze and age, from atpkg's own records. The clock is `last_success_at`,
+    // stamped by a pass that resolved the index and ran to its end (member failures have
+    // their own rows), never `updated_at`, which every writer moves: hence "completed pass".
+    // "Never checked" is said only here; the vendor programs kept at their vendors' heads
+    // update without an index pass.
     let vendors = vendor_update_clause(layout, probes);
     if let Some(status) = crate::status::read(layout) {
         if status.last_success_at.trim().is_empty() {
@@ -2133,11 +1950,10 @@ pub fn run_with(
                     let _ = writeln!(out, "{p}: warn — could not parse the last-success time");
                 }
             }
-            // HAS THE INDEX BEEN REACHED LATELY: the last success is the last pass that reached
-            // the signed index, and a pass that recorded itself failed or offline after it
-            // (`last_pass` / `last_pass_at`) says every pass since ran on the cached index —
-            // read by the schedulers' own reader (`Stamps::last_failed`), so doctor and the
-            // failure ladder can never disagree about which pass failed.
+            // Has the index been reached lately: a pass recorded failed or offline after the
+            // last success (`last_pass` / `last_pass_at`) means every pass since ran on the
+            // cached index. Read by the schedulers' own reader (`Stamps::last_failed`), so
+            // doctor and the failure ladder agree on which pass failed.
             let reached_days = index_age_days(&status.last_success_at, now);
             let unreached =
                 aterm_update_core::pkg_check::Stamps::parse(&status.to_toml().unwrap_or_default())
@@ -2175,10 +1991,9 @@ pub fn run_with(
     } else {
         let _ = writeln!(out, "{p}: {NEVER_CHECKED}{vendors}");
     }
-    // The build floor is printed WITH the generation that recorded it, because that pair
-    // is the actual gate: a floor stamped with an older generation is re-based by the next
-    // master-signed one rather than obeyed (`sig::BuildFloor`), so a reader who saw only
-    // the number could not tell a binding floor from an inherited one.
+    // The build floor is printed with the generation that recorded it, because that pair is
+    // the gate: a floor stamped with an older generation is re-based by the next
+    // master-signed one rather than obeyed (`sig::BuildFloor`).
     let build_floor = crate::sig::BuildFloor {
         index_build: crate::sig::Floor::new(layout.floor()).current(),
         roster_seq: crate::sig::Floor::new(layout.floor_generation()).current(),
@@ -2199,10 +2014,10 @@ pub fn run_with(
             Some(seq)
         }
     };
-    // The SECOND durable ratchet, which moves independently of the first: which generation
-    // of the machine roster this store has accepted. A roster floor that is stuck while
-    // machines have been minted or revoked means this store has not seen a publish since.
-    // Said only when it is not the generation the row above already names.
+    // The second durable ratchet, moving independently of the first: which generation of the
+    // machine roster this store has accepted. A roster floor stuck while machines have been
+    // minted or revoked means this store has not seen a publish since. Said only when it is
+    // not the generation the row above already names.
     match (
         crate::sig::Floor::new(layout.roster_floor()).current(),
         named,
@@ -2216,8 +2031,8 @@ pub fn run_with(
         }
         _ => {}
     }
-    // ...AND WHETHER IT IS STILL THE NEWEST. The channel-head probe writes its last answer
-    // beside the floor; this reads it back, offline, and says it.
+    // Whether the accepted index is still the newest: the channel-head probe writes its last
+    // answer beside the floor, and this reads it back, offline.
     if probes.index_head {
         let last_pass = LastPass {
             reached_index_at: crate::status::read(layout)
@@ -2232,23 +2047,21 @@ pub fn run_with(
             out,
         );
     }
-    // (8c) WHO WATCHES THE VENDOR HEADS: an aterm window, or, with no
-    // window open, one terminal session — or nobody, and then a new Claude Code or Codex
-    // release waits for the next update pass. Said wherever it matters: a vendor program
-    // kept at its vendor's head on a machine whose packages update on their own.
+    // (8c) Who watches the vendor heads: an aterm window, or with no window open one
+    // terminal session, or nobody, and then a new Claude Code or Codex release waits for the
+    // next update pass. Said for a vendor program kept at its vendor's head on a machine
+    // whose packages update on their own.
     head_watch_line(layout, probes, p, out);
 
-    // (9) RUSTUP + RELOCATABILITY. Two questions, kept apart: is there a rustup on
-    // this machine at all (PATH, then `$CARGO_HOME/bin`, then `~/.cargo/bin` — the
-    // binary an app-spawned pass may not have on ITS PATH), and does it answer inside
-    // the probe ceiling: under load a present rustup can miss the `--version` deadline,
-    // and the seam audit needs no rustup binary at all.
+    // (9) Rustup and relocatability, two questions kept apart: is there a rustup at all
+    // (PATH, then `$CARGO_HOME/bin`, then `~/.cargo/bin`, which an app-spawned pass may not
+    // have on its PATH), and does it answer inside the probe ceiling? Under load a present
+    // rustup can miss the `--version` deadline, and the seam audit needs no rustup binary.
     let rustup = rustup_binary(home);
     let rustup_answers = rustup.as_deref().is_some_and(rustup_present);
     if rustup.is_none() {
-        // A NOTE, not a warn: the product's own shape has no rustup — the managed Trust
-        // toolchain runs as `targo`/`trustc` from the store — so its absence is a fact
-        // about this machine, never something to fix.
+        // A note, not a warn: the managed Trust toolchain runs as `targo`/`trustc` from the
+        // store, so a missing rustup is a fact about this machine, never something to fix.
         let _ = writeln!(
             out,
             "{p}: note — no rustup on PATH, in $CARGO_HOME/bin or in ~/.cargo/bin; the \
@@ -2278,26 +2091,21 @@ pub fn run_with(
             layout,
         )
     {
-        // THE ENTRY EXISTS AND IS NOT OURS: the link resolves, so the check below would
-        // call it healthy while the managed build sits unused by every `cargo +trust`.
-        // Doctor SAYS it and names the one command; it re-points nothing — an entry under
-        // `~/.rustup` that aterm did not lay is the user's, by the seam module's own rule.
+        // The entry exists and is not ours: the link resolves, so the check below would call
+        // it healthy while every `cargo +trust` ignores the managed build. Doctor names the
+        // one command and re-points nothing: an entry under `~/.rustup` that aterm did not
+        // lay is the user's (the seam module's rule).
         let _ = writeln!(out, "{p}: {line}");
     } else if !local_said
         && rustup_answers
         && layout.program_current("trust").join("bin").is_dir()
         && !rustup_trust_channel_resolves(rustup.as_deref().unwrap_or(Path::new("rustup")))
     {
-        // The managed Trust toolchain is HERE, but rustup does not know it, so
-        // `cargo +trust` and a `rust-toolchain.toml` pinning `channel = "trust"`
-        // both fail with `'rustc' is not installed for the custom toolchain
-        // 'trust'` — the message that reads as a blocked machine and is not one.
-        // The fix is `repair`: it lays the entry when it is absent and rebuilds the
-        // view when the entry names a view that no longer resolves. A hand `rustup
-        // toolchain link` at the store would not do — the store ships only Trust's
-        // names, and rustup resolves the stock ones (see the seam module's header).
-        // `repair` lays nothing without `<rustup_home>/toolchains` (a fresh rustup with
-        // no toolchain), so the fix creates it first.
+        // The managed Trust toolchain is here but rustup does not know it, so `cargo +trust`
+        // fails with `'rustc' is not installed for the custom toolchain 'trust'`. `repair`
+        // lays the entry or rebuilds the view (a hand `rustup toolchain link` at the store
+        // would not do: it ships only Trust's names); without `<rustup_home>/toolchains` it
+        // lays nothing, so the fix creates that first.
         let fix =
             match crate::seam::rustup_home_with(std::env::var_os("RUSTUP_HOME").as_deref(), home) {
                 Some(rh) if !crate::seam::toolchains_dir(&rh).is_dir() => format!(
@@ -2313,7 +2121,7 @@ pub fn run_with(
              work) — fix: {fix}"
         );
     }
-    // A STALE LINK THE MACHINE REPLACED ON ITS OWN ([`replaced_seam_line`]).
+    // A stale link the machine replaced on its own ([`replaced_seam_line`]).
     if let Some(rustup_home) =
         crate::seam::rustup_home_with(std::env::var_os("RUSTUP_HOME").as_deref(), home)
         && let Some(line) = replaced_seam_line(layout, &rustup_home)
@@ -2321,16 +2129,14 @@ pub fn run_with(
         let _ = writeln!(out, "{p}: {line}");
     }
 
-    // (10) THE QUESTION A USER ACTUALLY CAME HERE WITH: do I have the toolchain?
-    //
-    // Everything above audits the STRUCTURE of the store, and passes vacuously on a
-    // machine that received nothing at all; health is never reported over an empty store.
+    // (10) The question a user came here with: do I have the toolchain? Everything above
+    // audits the store's structure and passes vacuously on a machine that received nothing;
+    // health is never reported over an empty store.
     let installed = crate::ops::active_builds(layout);
     let status = crate::status::read(layout);
-    // A recorded key beginning with `-` cannot ever be a program: no shim can be created
-    // under one and the signed index cannot name one. Such a row is a STRAY (an old
-    // atpkg recorded a mistyped flag as a program), and counting it would fail a healthy
-    // toolset — and the exit code `tools/install.sh` hands to failed-seed installers.
+    // A recorded key beginning with `-` is never a program (no shim can be made under one and
+    // the signed index cannot name one): such a row is a stray, and counting it would fail a
+    // healthy toolset.
     let strays: Vec<&String> = status
         .as_ref()
         .map(|s| s.programs.keys().filter(|k| k.starts_with('-')).collect())
@@ -2344,12 +2150,11 @@ pub fn run_with(
              clears it"
         );
     }
-    // (10a) SYSTEM-SATISFIED MEMBERS. A member the signed index marks `system = "<bin>"`
-    // that the pass found on PATH outside the prefix is deliberately NOT managed here —
-    // its row says so in the canonical words (`system: <path> — not managed by aterm`),
-    // and it is neither missing nor a fault. Re-check the recorded path: a binary that
-    // has since gone away is the one state worth a line, because the next pass will
-    // install the member through its artifact and a user may wonder why.
+    // (10a) System-satisfied members. A member the signed index marks `system = "<bin>"`
+    // that the pass found on PATH outside the prefix is not managed here (its row says
+    // `system: <path> — not managed by aterm`) and is neither missing nor a fault. The
+    // recorded path is re-checked: a binary since gone is worth a line, because the next
+    // pass installs the member through its artifact.
     if let Some(s) = status.as_ref() {
         for (program, row) in &s.programs {
             let Some(path) = crate::state::system_path(&row.state) else {
@@ -2371,18 +2176,14 @@ pub fn run_with(
             }
         }
     }
-    // (10g) MEMBERS HELD ON THEIR CURRENT BUILD (`held: …`, [`crate::state::held_unpublished`]):
-    // the update lane's row for an INSTALLED member whose coherence group's new pin is
-    // not published for this target. A DEFERRED state, never a fault: nothing was
-    // downloaded or staged, the group stays whole on the builds it has, and the pass
-    // that finds the build published moves it. Said here as `ok`, quoting the row, so
-    // the frozen tuple is VISIBLE — without this line the only trace of it was its
-    // siblings' `pinned by index <old>` rows, which read as stale.
+    // (10g) Members held on their current build ([`crate::state::held_unpublished`]): the
+    // group's new pin is not published here. Deferred, never a fault; said as `ok`, quoting
+    // the row, so the frozen tuple is visible beside its siblings' stale-looking rows.
     if let Some(s) = status.as_ref() {
         for (program, row) in &s.programs {
-            // Only the GROUP hold. A member held after a failed stage (`held: last attempt
-            // failed with …`) is the opposite verdict — not installed, and no pass moves
-            // it — and it is listed with the problems, retry and all (`is_problem_state`).
+            // Only the group hold. A member held after a failed stage (`held: last attempt
+            // failed with …`) is not installed and no pass moves it; it is listed with the
+            // problems (`is_problem_state`).
             if row.state.starts_with(crate::state::HELD_PREFIX)
                 && !row.state.starts_with(crate::state::HELD_FAILED_PREFIX)
             {
@@ -2395,20 +2196,19 @@ pub fn run_with(
             }
         }
     }
-    // (10d) SHADOWED MANAGED MEMBERS (design S5). For every managed member and every tool
-    // it exposes, a foreign executable of that name EARLIER on PATH than the managed
-    // bin/ is what actually runs — silently ahead of the build the index pins. Probed
-    // LIVE against this process's PATH, never trusted from the record: a warning, never a
-    // fault, and never "fixed" here — the user owns PATH.
+    // (10d) Shadowed managed members. For every tool a managed member exposes, a foreign
+    // executable of that name earlier on PATH than the managed bin/ is what runs. Probed
+    // live against this process's PATH, never trusted from the record: a warning, never a
+    // fault, and never fixed here (the user owns PATH).
     for (program, build) in &installed {
         if crate::linkmode::is_linked(layout, program) {
             continue;
         }
-        // AN AGENT PROGRAM'S REROUTE STUB DECIDES AT EXEC TIME: with
-        // `reroute/<name>` first on this PATH, what runs is the stub's choice — the managed
-        // twin inside aterm, which is no shadow however stale this shell's PATH is (said
-        // below as an `ok` naming the copy it out-ranks), or a pass-through, whose walk is
-        // the one probed (`cli::shadow_in_shell`).
+        // An agent program's reroute stub decides at exec time: with `reroute/<name>` first
+        // on this PATH, what runs is the stub's choice, either the managed twin inside aterm
+        // (no shadow however stale this shell's PATH is; said below as an `ok` naming the
+        // copy it out-ranks) or a pass-through, whose walk is the one probed
+        // (`cli::shadow_in_shell`).
         let shadow = crate::ops::active_tools(layout, program, *build)
             .into_iter()
             .find_map(|tool| {
@@ -2423,8 +2223,8 @@ pub fn run_with(
             continue;
         }
         if let Some((tool, path)) = shadow {
-            // …and outside aterm, a stub that passes through to the user's own copy is
-            // the design, said as a note, never SHADOWED.
+            // Outside aterm, a stub that passes through to the user's own copy is the
+            // design: a note, never shadowed.
             if let Some(row) = crate::cli::agent_passed_row(
                 layout,
                 program,
@@ -2436,20 +2236,18 @@ pub fn run_with(
                 let _ = writeln!(out, "{p}: note — {program}: {row}");
                 continue;
             }
-            // An AGENT PROGRAM whose `agents/` twin is laid and current: aterm's copy is
-            // what every tab runs, so this is THIS shell's state — a shell that has not
-            // run the hook — and the remedy works in place (`cli::shell_remedy_command`:
-            // source the hook; never `exec $SHELL`, which drops an aterm tab's shell
-            // integration). Never "open a new tab", never "remove or reorder that copy".
+            // An agent program whose `agents/` twin is laid and current: every tab runs
+            // aterm's copy, so this is this shell's state (it has not run the hook), and the
+            // remedy works in place (`cli::shell_remedy_command`: source the hook, never
+            // `exec $SHELL`, which drops an aterm tab's shell integration).
             if let Some(row) =
                 crate::cli::agent_shell_shadow(layout, program, *build, &path, path_var)
             {
                 let _ = writeln!(out, "{p}: warn — {program}: {row}");
                 continue;
             }
-            // The canonical state in the canonical words, then — when `alab-<tool>` is
-            // laid — the one trailing sentence that names the way to the managed copy
-            // without touching PATH (`cli::alias_fix`; never part of the state).
+            // The canonical state, then, when `alab-<tool>` is laid, one trailing sentence
+            // naming the way to the managed copy without touching PATH (`cli::alias_fix`).
             let fix = crate::cli::alias_fix(layout, &tool, program, path_var)
                 .map(|f| format!(" — {f}"))
                 .unwrap_or_default();
@@ -2465,21 +2263,11 @@ pub fn run_with(
             );
         }
     }
-    // (10f) MANAGED MEMBERS WHOSE SHIM EXPORTS AN ENVIRONMENT (design S7): a vendor tool
-    // whose policy declares `shim_env` runs, through the managed shim, with its own
-    // updater off — `Claude Code's own updater is off here (DISABLE_AUTOUPDATER=1)`. Read
-    // off the shim as laid (the thing that runs), printed as ONE trailing sentence after
-    // the canonical row, never inside it; withheld
-    // when a foreign copy shadows the shim (the env never reaches a system copy — that
-    // member's line is (10d)'s warn). An `ok`, never a fault.
-    //
-    // A shim that exports other than its BUILD declares (the sidecar, written from the
-    // signed policy — `activate::shim_env_drift`, the predicate the pass heals by) is
-    // NAMED instead, as a `warn` with the one remedy — otherwise a plain shim reads as
-    // nothing to say while the vendor's updater runs. Said even when a foreign copy
-    // shadows the shim in this shell, because the shim still reaches something: the
-    // `agents/` twin every aterm tab runs, an `alab-` alias, or any other shell whose
-    // PATH finds it — each copies its exports.
+    // (10f) Managed members whose shim exports an environment (`shim_env`, e.g. the vendor's
+    // updater off): one trailing `ok` sentence after the canonical row, withheld when a
+    // foreign copy shadows the shim. A shim exporting other than its build declares
+    // (`activate::shim_env_drift`) is a `warn` even when shadowed here, since the shim still
+    // reaches the `agents/` twin every tab runs and any shell whose PATH finds it.
     for (program, build) in &installed {
         if crate::linkmode::is_linked(layout, program) {
             continue;
@@ -2530,17 +2318,11 @@ pub fn run_with(
         };
         let _ = writeln!(out, "{p}: ok — {program}: {line}");
     }
-    // (10h) CLAUDE CODE'S DEFAULTS: the top-effort mode
-    // (`CLAUDE_TOP_EFFORT_KEY`), `xhigh` effort, and the session-quality survey off.
-    // An aterm window ADDS each where it is unset (`aterm_primer::add_claude_defaults`)
-    // and never touches one set by hand, so this says which is which: the defaults as
-    // one `ok`, a person's own value as an `ok` that names it, an effort default held
-    // back by a person's own effort as an `ok` that names that effort, a top-effort
-    // key that overrides such an effort as a `warn` naming both and the fix, and an
-    // unset key as a `warn` naming what the next window start adds. A file the window
-    // refuses to add to is one `warn` naming why, and no key: nothing will be added
-    // to it. Every row prints the key from the constant, so a person reads the very
-    // key their settings file holds.
+    // (10h) Claude Code's defaults (top-effort mode, `xhigh` effort, surveys off, the drafts
+    // card quiet, autocompaction at 400k tokens). An aterm window adds each where unset
+    // (`aterm_primer::add_claude_defaults`) and never touches one set by hand; this says which
+    // is which, a row per [`DefaultState`], with each key as the settings file holds it. A
+    // file the window refuses is one `warn` naming why.
     if installed.iter().any(|(program, _)| *program == "claude")
         && let Some(states) = &probes.claude_defaults
     {
@@ -2571,6 +2353,7 @@ pub fn run_with(
                     "feedbackSurveyRate" => "the session-quality survey off",
                     CLAUDE_SURVEY_SWITCH => "every rating survey off",
                     CLAUDE_DRAFTS_KEY => "the drafted-feedback card quiet",
+                    CLAUDE_COMPACT_WINDOW_KEY => "autocompact at 400k tokens",
                     key => key,
                 })
                 .collect();
@@ -2591,8 +2374,8 @@ pub fn run_with(
                 DefaultState::Default => {}
                 DefaultState::Manual(value) => {
                     // A hand-set switch that Claude Code does not read as true leaves the
-                    // surveys ON: kept all the same, and said — with what an aterm-supervised
-                    // session then does about them (its harness still dismisses each one).
+                    // surveys on: kept, and said, with what an aterm-supervised session
+                    // then does about them.
                     let on = if *key == CLAUDE_SURVEY_SWITCH {
                         " — Claude Code reads only 1, true, yes or on as off, so it will \
                          still show its rating surveys (an aterm-supervised session dismisses \
@@ -2622,6 +2405,14 @@ pub fn run_with(
                          survey off only where that probability is unset or 0"
                     );
                 }
+                DefaultState::HeldForOffer(why) => {
+                    let _ = writeln!(
+                        out,
+                        "{p}: ok — claude: {key} is unset and stays so — {why}, and aterm adds \
+                         its 400k window only where no Keep answer stands (/autocompact in \
+                         Claude Code sets a window for a model)"
+                    );
+                }
                 DefaultState::OverridesEffort(effort) => {
                     let _ = writeln!(
                         out,
@@ -2636,8 +2427,8 @@ pub fn run_with(
                     let want = CLAUDE_DEFAULTS
                         .iter()
                         .find(|(k, _)| k == key)
-                        .map_or("", |(_, v)| *v);
-                    let line = default_line(key, want);
+                        .map_or(String::new(), |(_, v)| v.json_text());
+                    let line = default_line(key, &want);
                     let _ = writeln!(
                         out,
                         "{p}: warn — claude: {key} is unset in ~/.claude/settings.json — an \
@@ -2647,12 +2438,12 @@ pub fn run_with(
             }
         }
     }
-    // EVERY problem, not the first one.
+    // Every problem, not the first one.
     let recorded_problems = recorded_problems(status.as_ref());
-    // (11a) AN UNSERVED PLATFORM IS A STATE, NOT A FAULT — Windows only, see
-    // `toolset_unserved_here`. The `*toolset*` row's "no build for this architecture"
-    // verdict leaves the problem list (it is said below, as a note) — that one verdict and
-    // no other: an unreachable index or a refused publish is a fault on every platform.
+    // (11a) An unserved platform is a state, not a fault (Windows only,
+    // `toolset_unserved_here`): the `*toolset*` "no build for this architecture" verdict
+    // leaves the problem list and is said below as a note. Only that verdict: an
+    // unreachable index or a refused publish is a fault everywhere.
     let toolset_unserved = toolset_unserved_here(status.as_ref());
     let recorded_problems: Vec<String> = if toolset_unserved.is_some() {
         recorded_problems
@@ -2663,15 +2454,10 @@ pub fn run_with(
         recorded_problems
     };
     let declined = layout.declined().is_file();
-    // (11) COMPLETENESS AGAINST THE SIGNED INDEX.
-    //
-    // Everything above audits what the RECORD mentions: shims for installed programs,
-    // rows in `status.toml`, faults the last pass wrote down. A program the machine
-    // wants and never attempted has none of those — no shim, no row, no fault.
-    //
-    // The index is the only thing that knows what SHOULD be here, so ask it. Offline and
-    // best-effort by construction (`cached_index`): an unreachable index must never
-    // invent a missing program.
+    // (11) Completeness against the signed index. Everything above audits what the record
+    // mentions; a program the machine wants and never attempted has no shim, row or fault.
+    // Only the index knows what should be here. Offline and best-effort (`cached_index`):
+    // an unreachable index never invents a missing program.
     let (dev_linked, link_problems) = live_dev_links(layout);
     for why in &link_problems {
         let _ = writeln!(out, "{p}: PROBLEM — {why}");
@@ -2689,11 +2475,9 @@ pub fn run_with(
     let missing_unexplained = drop_unserved(missing_unexplained, toolset_unserved.as_deref());
     let mut toolset_problem = false;
     if let Some(unserved) = &toolset_unserved {
-        // Said once, as what it is: a fact about the index and this target, which no
-        // command on this machine changes — the state, and no act. The members it names
-        // are the ones whose own rows say so; the served members (the agents) are
-        // reported like any other — their per-program lines print ABOVE this note (the
-        // program loop runs first), so the note does not point "below".
+        // Said once, as what it is: a fact about the index and this target that no command
+        // here changes. The served members (the agents) are reported like any other; their
+        // lines print above this note, so it does not point "below".
         let _ = writeln!(
             out,
             "{p}: note — the ALab toolset is unavailable on this platform: no build is \
@@ -2719,9 +2503,8 @@ pub fn run_with(
         )
     {
         // Nothing active because nothing published for this target is missing: the note
-        // above is the whole story, and it is not a problem to count or to exit 1 for.
-        // (A served member that failed, is held, or is missing without a row takes the
-        // branch below instead.)
+        // above is the whole story, not a problem to count or exit 1 for. A served member
+        // that failed, is held, or is missing without a row takes the branch below.
         let _ = writeln!(
             out,
             "{p}: 0 program(s) active — none is published for this platform, so none is \
@@ -2733,10 +2516,9 @@ pub fn run_with(
             Some(why) => {
                 let _ = writeln!(out, "{p}: PROBLEM — no ALab programs are installed ({why})");
             }
-            // No per-program row survives an ENVIRONMENTAL failure any more — an
-            // unreachable index says nothing about any particular program — so the
-            // aggregate sentence is now the only place the reason lives. Preferring it to
-            // the generic hint is what keeps "why did nothing arrive?" answerable offline.
+            // An environmental failure (an unreachable index) leaves no per-program row, so
+            // the aggregate outcome is the only place the reason lives; preferring it to the
+            // generic hint keeps "why did nothing arrive?" answerable offline.
             None => match status
                 .as_ref()
                 .map(|s| s.outcome.as_str())
@@ -2756,21 +2538,20 @@ pub fn run_with(
             },
         }
     } else if !recorded_problems.is_empty() {
-        // Something IS installed, but the record carries live failures — a partial first
-        // run, a blocked disk, a member with no build for this triple, an aborted
-        // coherence-group transaction.
+        // Something is installed, but the record carries live failures: a partial first run,
+        // a blocked disk, a member with no build for this triple, an aborted coherence-group
+        // transaction.
         toolset_problem = true;
-        // No COUNT here: the tail's "found N problem(s)" counts differently (structural
-        // failures + the toolset condition as one), and two Ns would contradict.
+        // No count here: the tail's "found N problem(s)" counts differently (structural
+        // failures plus the toolset condition as one), and two Ns would contradict.
         let _ = writeln!(
             out,
             "{p}: PROBLEM — the toolset is incomplete; {} program(s) active",
             active_count
         );
     } else if !missing_unexplained.is_empty() {
-        // The machine wants these, does not have them, and NOTHING recorded a reason.
-        // Distinct from the branch above: that one reports failures the record already
-        // names, this one reports absences the record is silent about.
+        // The machine wants these, does not have them, and nothing recorded a reason; the
+        // branch above reports failures the record names.
         toolset_problem = true;
         let _ = writeln!(
             out,
@@ -2784,10 +2565,10 @@ pub fn run_with(
         // Not "ALab program(s)": the count includes the vendor-direct agents.
         let _ = writeln!(out, "{p}: {active_count} program(s) active");
     }
-    // A DELIBERATE removal is not a fault — but it must be VISIBLE. The ledger that
-    // records it is a file no user reads, and its effect (no stub, no unattended
-    // reinstall, and a coherence group that never activates) is indistinguishable from
-    // the program never having existed. Say it plainly, and name the way back.
+    // A dev link and a deliberate removal are not faults, but they must be visible: the
+    // removal ledger is a file no user reads, and its effect (no stub, no unattended
+    // reinstall, a coherence group that never activates) looks like the program never
+    // existed. Say each plainly, and name the way back.
     for program in &dev_linked {
         let from = crate::linkmode::linked_checkout(layout, program)
             .map(|c| c.display().to_string())
@@ -2812,11 +2593,11 @@ pub fn run_with(
         }
     }
 
-    // (11) THE C TOOLCHAIN — a prerequisite, probed and never shipped (`crate::prereq`).
-    // Only where a toolset is installed: that is what it stops from building. A verdict
-    // that is an ANSWER (no toolchain, or one that refuses) is a FAIL — "healthy" over a
-    // machine whose first `targo build` dies in a build script is the vacuous pass (10)
-    // was written against; an unknown is a warn; a target it does not apply to, a note.
+    // (11) The C toolchain, a prerequisite probed and never shipped (`crate::prereq`), only
+    // where a toolset is installed (that is what it stops from building). An answer (no
+    // toolchain, or one that refuses) is a FAIL: "healthy" over a machine whose first
+    // `targo build` dies in a build script is the vacuous pass (10) guards against. An
+    // unknown is a warn; a target it does not apply to, a note.
     let mut next_prereq = false;
     if active_count > 0
         && let Some(verdict) = probes.cc.as_ref()
@@ -2845,10 +2626,8 @@ pub fn run_with(
         let _ = writeln!(out, "{p}: healthy");
         true
     } else if fails == 0 && !toolset_problem {
-        // Nothing structural — but a managed tool that cannot run, or that doctor cannot
-        // show to run, is not health, and this line is the one a reader takes away. The
-        // warn above carries its own remedy, so no `next` line: the tail's rule for
-        // failures with an inline remedy.
+        // Nothing structural, but a managed tool that cannot run, or that doctor cannot show
+        // to run, is not health. The warn above carries its own remedy, so no `next` line.
         let _ = writeln!(
             out,
             "{p}: not healthy — {} (see below)",
@@ -2914,20 +2693,20 @@ struct NextFacts<'a> {
     install_program: Option<&'a str>,
 }
 
-/// THE ONE NEXT ACT — a single command, never a menu: a report that ends in a pile of
-/// problems and three suggestions teaches a first-hour user to close the terminal.
-/// Priority: install the missing SET (an empty store has exactly one fix), then `update` (a
-/// successful pass rewrites every recorded fault row and re-flips diverged shims), then the
-/// structural repair of one named program. Failures with their remedy already inline (a
-/// stray .sh — "remove it") add no line rather than a second, vaguer act. `grouped` says
-/// whether a program is in a coherence group, which decides a HELD member's door
+/// The one next act: a single command, never a menu (a pile of problems and three
+/// suggestions teaches a first-hour user to close the terminal). Priority: an unserved
+/// platform's member door; the missing set (an empty store has exactly one fix); the C
+/// toolchain; a publish; a held member's door; `update` (a successful pass rewrites every
+/// recorded fault row and re-flips diverged shims); then one program's structural repair.
+/// Failures with their remedy inline (a stray .sh: "remove it") add no line. `grouped`
+/// says whether a program is in a coherence group, which decides a held member's door
 /// ([`held_door`]).
 fn next_act(f: &NextFacts<'_>, grouped: impl Fn(&str) -> bool) -> Option<String> {
     let door = |program: &str| held_door(program, grouped(program));
     if f.unserved_door.is_some() {
         f.unserved_door.clone()
     } else if f.toolset_problem && f.empty_store {
-        // …but never over a HELD member: the whole-set pass honours the hold and repeats it
+        // Never over a held member: the whole-set pass honours the hold and repeats it
         // (`skip_held_member`), so the act is that member's explicit door, which forgets its
         // memo before it stages.
         Some(
@@ -2945,10 +2724,9 @@ fn next_act(f: &NextFacts<'_>, grouped: impl Fn(&str) -> bool) -> Option<String>
              machine holding the seal), then aterm pkg update trust"
         ))
     } else if !f.declined && f.recorded_problems.iter().any(|why| is_held_problem(why)) {
-        // A HELD member is the one recorded problem a plain `update` cannot move: the pass
-        // honours the hold and repeats it. When it is the only problem, the act is that
-        // member's own door, so the screen carries one remedy; with others beside it,
-        // `--retry` is the one pass that answers every recorded fault.
+        // A held member is the one recorded problem a plain `update` cannot move: the pass
+        // honours the hold and repeats it. Alone, the act is that member's own door; with
+        // other problems, `--retry` is the one pass that answers every recorded fault.
         Some(
             match (
                 f.recorded_problems.len(),
@@ -2966,17 +2744,11 @@ fn next_act(f: &NextFacts<'_>, grouped: impl Fn(&str) -> bool) -> Option<String>
     }
 }
 
-/// The bare version token from `<bin> --version`, for comparing two copies of
-/// the same program at a glance.
-///
-/// Takes the SECOND whitespace token (`ay 0.13.0+build.8174.…` -> `0.13.0…`)
-/// and drops any `+build…`/commit/date suffix, because the question this
-/// answers is "are these the same release", not "which exact commit".
-///
-/// Best-effort by construction: a binary that will not run, will not answer, or
-/// answers in some other shape reports `unknown` and the caller stays quiet
-/// about it. `doctor` must never fail because a probe failed — the probe is a
-/// convenience, and the store integrity checks above are the real verdict.
+/// The bare version token from `<bin> --version`: the second whitespace token
+/// (`ay 0.13.0+build.8174.…` → `0.13.0`) without its `+…` suffix, since the question is
+/// "same release?", not "same commit?". Best-effort: a binary that will not run or answers
+/// in another shape reports `unknown` and the caller stays quiet; doctor never fails
+/// because a probe failed.
 fn probe_version(bin: &Path) -> String {
     const UNKNOWN: &str = "unknown";
     let Some(out) = output_bounded(aterm_uds::spawnfd::command(bin).arg("--version")) else {
@@ -2995,8 +2767,8 @@ fn probe_version(bin: &Path) -> String {
     token.split('+').next().unwrap_or(token).to_string()
 }
 
-/// What the bundle has to ship for tippy to run, as (5f) words it: tippy refuses a
-/// symbolic link for the compiler, measured.
+/// What the bundle has to ship for tippy to run, as (5f) words it: tippy refuses a symlink
+/// for the compiler.
 const TRUST_COMPILER_FIX: &str = "ship trustc as one signed plain file, never a symbolic link";
 
 /// The fix every (5f)(c) warn names but the blocked one: `repair` reconciles the exec roots
@@ -3031,12 +2803,11 @@ fn withheld_summary(cannot: usize, unproven: usize) -> String {
     }
 }
 
-/// (10f)'s drift warn, after `<program>: `: what `shim` exports (`have`) against what
-/// its build declares; the consequence only when the build declares a self-update switch
-/// ([`crate::shim_env::SELF_UPDATE_SWITCHES`]) and the shim exports NONE — the one shape
-/// where "on here" is certain, and the mirror of [`crate::shim_env::ShimEnv::fix_line`],
-/// whose "off here" sentence this warn replaces; and the one remedy: `repair` re-lays each
-/// shim with its build's sidecar. Pure, so every wording is pinned without a store.
+/// (10f)'s drift warn, after `<program>: `: what `shim` exports (`have`) against what its
+/// build declares; the consequence only when the build declares a self-update switch
+/// ([`crate::shim_env::turns_updater_off`]) and the shim exports none, the one shape where
+/// "on here" is certain (the mirror of [`crate::shim_env::ShimEnv::fix_line`]); and the one
+/// remedy, `repair`, which re-lays each shim with its build's sidecar.
 fn env_drift_line(
     program: &str,
     build: u64,
@@ -3052,7 +2823,7 @@ fn env_drift_line(
     let switches = |env: &crate::shim_env::ShimEnv| {
         env.entries()
             .iter()
-            .any(|(name, _)| crate::shim_env::SELF_UPDATE_SWITCHES.contains(&name.as_str()))
+            .any(|(name, value)| crate::shim_env::turns_updater_off(name, value))
     };
     let switch_lost = switches(declared) && !switches(have);
     let consequence = match (switch_lost, crate::vendor_direct::spec(program)) {
@@ -3107,12 +2878,11 @@ fn hold_lines(layout: &Layout, now: i64) -> Vec<String> {
     lines
 }
 
-/// The note for one leased subject, or `None` for a free one. What the lease protects, by
-/// subject: gc keeps a leased build, and the seam leaves a leased view as it stands.
-/// Either way it stays as it is, which is what the line says, in the shared words
-/// ([`crate::lease::Subject::describe`], [`crate::lease::Holders::clause`]) the
-/// held-flip row uses for the same lease. It stays
-/// until the holder's run ends, or, with no holder known, until its lease can be read.
+/// The note for one leased subject, or `None` for a free one. gc keeps a leased build and
+/// the seam leaves a leased view as it stands, so the line says it stays as it is, in the
+/// words the held-flip row uses ([`crate::lease::Subject::describe`],
+/// [`crate::lease::Holders::clause`]), until the holder's run ends or, with no holder
+/// known, until its lease can be read.
 fn lease_line(subject: &crate::lease::Subject, holders: &crate::lease::Holders) -> Option<String> {
     let until = match holders {
         crate::lease::Holders::Held(_) => "that run ends",
@@ -3126,25 +2896,12 @@ fn lease_line(subject: &crate::lease::Subject, holders: &crate::lease::Holders) 
     ))
 }
 
-/// The (5f)(c) line for an active trust build that [`crate::compat::needs_root`], and
-/// what it claims ([`ToolClaim`]): a tool that cannot run, or one it cannot show to run
-/// (both warns that withhold "healthy"), rather than a note. Pure over the inspection, so
-/// every wording is testable without a store.
-///
-/// * Root absent: every trust shim's guard is false and runs the store path, where the
-///   build's tippy refuses — PATH tippy cannot run.
-/// * Root differs from the build: a shim whose own file differs runs the store path, and
-///   the rest run a tree that is not the build — tippy MAY not run, and nothing vouches
-///   for what does; the root, the store build and the first path that differs are each
-///   named as what they are.
-/// * Root matches, some shims unrouted: those run the store path — tippy cannot run
-///   through them; the count and one name (`tippy` when it is among them) are given.
-/// * Root matches, every shim routed: the note.
-/// * `compat` or `compat/trust` not a real directory ([`crate::compat::Blocked`]): no
-///   root is laid or rendered through it, and `aterm pkg repair` refuses too, so the fix
-///   is to remove what stands there first. tippy cannot run when no shim carries a route;
-///   one routed earlier may still run through the link, which atpkg does not vouch for,
-///   so then it MAY not.
+/// The (5f)(c) line for an active trust build that [`crate::compat::needs_root`], and what it
+/// claims ([`ToolClaim`]). An absent root, or unrouted shims, run the store path, where tippy
+/// cannot run; through a root that differs from the build it may not. Behind a blocked
+/// `compat` ([`crate::compat::Blocked`], which `repair` also refuses) it cannot run with no
+/// shim routed and may not with one routed earlier. A matching root with every shim routed
+/// is the note.
 fn exec_root_line(p: &str, build: u64, i: &crate::compat::Inspection) -> (String, ToolClaim) {
     use crate::compat::RootState;
     let root = i.root.display();
@@ -3253,9 +3010,9 @@ fn stray_root_line(p: &str, path: &Path, why: crate::compat::Stray) -> String {
 }
 
 /// Whether the view file `at` presents the store's Trust tool `store`: a clone of it
-/// ([`crate::clone::is_clone_of`] — length, mode and time, not inode, so the hard link a
-/// view held before clones does not present it) holding its bytes, since the attributes
-/// alone cannot tell it from a bundle's separately signed copy. Writes nothing.
+/// ([`crate::clone::is_clone_of`]: same length, mode and time on a different inode, so a
+/// hard link does not count) holding its bytes, since the attributes alone cannot tell it
+/// from a bundle's separately signed copy. Writes nothing.
 fn presents(store: &Path, at: &Path) -> bool {
     crate::clone::is_clone_of(store, at) && matches!(crate::clone::same_bytes(store, at), Ok(true))
 }
@@ -3270,16 +3027,15 @@ fn build_list(builds: &[u64]) -> String {
         .join(", ")
 }
 
-/// How recent a "nothing newer" answer must be for (8) to say `ok`: the window re-asks
-/// the next two tags every thirty seconds ([`crate::index_probe`]), so an answer older than
-/// this means nothing is asking any more (no window running), and its age is the honest
-/// thing to print.
+/// How recent a "nothing newer" answer must be for (8) to say `ok`: the window re-asks the
+/// next two tags every [`crate::index_probe::INTERVAL`], so an older answer means nothing is
+/// asking (no window running), and its age is the honest thing to print.
 const INDEX_HEAD_FRESH_SECS: i64 = 15 * 60;
 
 /// What the last signed update pass left on disk that bears on the channel head: when a
-/// pass last REACHED the signed index (`status.toml`'s `last_success_at` — stamped only by
-/// a pass that verified an index the channel served, never by one on the §14 cache), and
-/// the index builds of the signed candidates it downloaded
+/// pass last reached the signed index (`status.toml`'s `last_success_at`, stamped only by a
+/// pass that verified an index the channel served, never by one on the §14 cache), and the
+/// index builds of the signed candidates it downloaded
 /// ([`crate::index_probe::held_index_builds`]). `None` in either field when that record is
 /// absent or unreadable.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -3288,22 +3044,15 @@ struct LastPass {
     held: Option<Vec<u64>>,
 }
 
-/// (8)'s channel-head line: the probe's cached answer for the CURRENT floor
-/// ([`crate::index_probe::cached_answer`]) set beside what the last signed update pass left
-/// ([`LastPass`]), said as one line. None withholds "healthy" — like the other freshness
-/// lines, it is a fact about the channel, not a fault in the store. Pure over its inputs
-/// and `now`, so tests drive it through the probe's and the cache's real writers.
+/// (8)'s channel-head line: the probe's cached answer for the current floor
+/// ([`crate::index_probe::cached_answer`]) beside what the last signed update pass left
+/// ([`LastPass`]). A fact about the channel, so it never withholds "healthy".
 ///
-/// # The remedy is only printed where it can work
-///
-/// "run: aterm pkg update" is right when no signed pass has looked since the newer index
-/// appeared. It is wrong — and loops, update saying "already current" and doctor saying
-/// "not the newest" — when a pass already downloaded the newer index and refused it, or
-/// walked the channel's tags and found no complete newer release there. The last pass's
-/// downloaded candidates (the §14 cache, accepted or not) tell those apart offline,
-/// so each gets its own sentence. And the notes never promise that `aterm pkg update`
-/// refreshes the probe's answer — it does not write the probe's stamps; what it does move,
-/// the time a pass last reached the index, is printed beside them.
+/// "run: aterm pkg update" is printed only where it can work: not when a pass already
+/// downloaded the newer index and refused it, or found no complete newer release on the
+/// channel (update would say "already current" and doctor "not the newest" forever). The
+/// last pass's downloaded candidates (the §14 cache) tell those apart offline. `update`
+/// does not write the probe's stamps, so no note promises it refreshes them.
 fn index_head_line(
     cached: &crate::index_probe::CachedProbe,
     last: &LastPass,
@@ -3326,8 +3075,8 @@ fn index_head_line(
         ),
         None => "no update pass has recorded reaching the signed index".to_string(),
     };
-    // A NEWER INDEX ALREADY DOWNLOADED AND NOT LANDED. A pass that reaches the channel
-    // caches what it served whether or not it selected (`flow::resolve_verified_index`),
+    // A newer index already downloaded and not landed. A pass that reaches the channel
+    // caches what it served whether or not it selected it (`flow::resolve_verified_index`),
     // so this is independent of the probe: the pass held it, and the floor did not move.
     if let Some(held) = last
         .held
@@ -3346,8 +3095,8 @@ fn index_head_line(
     match cached.near {
         Some((RangeAnswer::Published, seen)) => {
             if last.reached_index_at.is_some() && last.held.is_some() {
-                // The last pass reached the channel and held nothing above the floor: at
-                // that moment it had no COMPLETE signed release newer than it.
+                // The last pass reached the channel and held nothing above the floor: then
+                // it had no complete signed release newer than it.
                 let _ = writeln!(
                     out,
                     "{p}: warn — index {floor} is not the newest: the index probe found a \
@@ -3368,7 +3117,7 @@ fn index_head_line(
             }
         }
         Some((RangeAnswer::Missing, checked)) => {
-            // Said as what was CHECKED, and when: the probe's own rule is that absence is
+            // Said as what was checked, and when: the probe's own rule is that absence is
             // never authority. Only a running window re-asks, so a stale answer says so.
             let checked = age(checked);
             if checked <= INDEX_HEAD_FRESH_SECS {
@@ -3426,11 +3175,9 @@ const INDEX_UNREACHED_WARN_DAYS: i64 = 3;
 /// on every Claude Code and Codex release, and thirty days without either is neither.
 const INDEX_FROZEN_WARN_DAYS: i64 = 30;
 
-/// The tail of the never-checked lines — `; claude and codex update from their vendors
-/// without it` — naming only the vendor programs that do: kept at their vendor's head
-/// ([`crate::vendor_direct::watch::follows_vendor`]: installed, not removed, held or
-/// dev-linked), not in `[packages] exclude`, on a machine whose packages update on their
-/// own ([`Probes::automatic`]). Empty when none does, and the line claims nothing of them.
+/// The tail of the never-checked lines (`; claude and codex update from their vendors
+/// without it`), naming only [`vendor_followers`]. Empty when there are none, and the line
+/// then claims nothing of them.
 fn vendor_update_clause(layout: &Layout, probes: &Probes) -> String {
     let names = vendor_followers(layout, probes);
     match names.as_slice() {
@@ -3514,14 +3261,11 @@ fn unreached_cause(outcome: &str) -> Option<&str> {
     Some(why.trim()).filter(|why| !why.is_empty())
 }
 
-/// (5f b) For every recorded seam, each stock name the view holds must present the tool it
-/// stands for: the store's while the store's build is what the view presents (a clone of it
-/// holding its bytes, [`presents`]), the dev-linked checkout's while trust is dev-linked to
-/// a sysroot (the view is exec stubs there, so the stub's target is read rather than an
-/// inode compared). `store_bin` is the store build's `bin/` — the active one, or `current`'s
-/// when no shim names a build — or `None` when the store holds none. A mismatch is a tool
-/// that cannot run: `repair` rebuilds the view, except under a dev-link the seam refuses,
-/// where nothing rebuilds it until the link goes.
+/// (5f b) For every recorded seam, each stock name in the view must present its tool: the
+/// store's ([`presents`]), or the checkout's while trust is dev-linked to a sysroot (the view
+/// is exec stubs there, so the stub's target is read). `store_bin` is the active (else
+/// `current`) store build's `bin/`, `None` when there is none. A mismatch is a tool that
+/// cannot run: `repair` rebuilds the view, except under a dev-link the seam refuses.
 fn view_stock_names_check(
     out: &mut dyn std::io::Write,
     p: &str,
@@ -3615,14 +3359,14 @@ fn repoint_fix(layout: &Layout, link: &Path) -> String {
     format!("ln -sfn '{}' '{}'{then}", target.display(), link.display())
 }
 
-/// The doctor line for a rustup `trust` entry that is NOT the managed seam, or `None`
-/// when the entry is absent or already ours (the callers' other checks speak then).
-/// Pure over the probe result, so the words are testable without a rustup.
+/// The doctor line for a rustup `trust` entry that is not the managed seam, or `None` when
+/// the entry is absent or already ours (the callers' other checks speak then). Pure over the
+/// probe result.
 ///
-/// A foreign LINK names the exact re-point ([`repoint_fix`]); a foreign DIRECTORY/FILE cannot be re-pointed over — `ln -sfn` onto a
-/// directory would lay the link INSIDE it — so that shape gets [`crate::seam::DETACH_FIX`].
-/// A link into the store — `current`, or a numbered build, the layouts from before the
-/// view — is a note, not a warn: `repair` re-points it to the view by itself.
+/// A foreign link names the exact re-point ([`repoint_fix`]); a foreign directory or file
+/// cannot be re-pointed over (`ln -sfn` onto a directory lays the link inside it), so that
+/// shape gets [`crate::seam::DETACH_FIX`]. A link into the store (`current`, or a numbered
+/// build) is a note, not a warn: `repair` re-points it to the view by itself.
 fn seam_line(st: &crate::seam::SeamStatus, layout: &Layout) -> Option<String> {
     use crate::seam::Entry;
     let target = crate::seam::seam_target(layout, "trust");
@@ -3659,13 +3403,11 @@ fn seam_line(st: &crate::seam::SeamStatus, layout: &Layout) -> Option<String> {
     }
 }
 
-/// The doctor line for a stale rustup `trust` link a re-assertion REPLACED: the
-/// unattended pass re-points an older live build tree at the store by itself
-/// ([`crate::seam::live_build_tree`]), and a change nobody asked for is said where the person
-/// looks — what it named and the one command that puts it back, or, once it has been put
-/// back, that no pass will move it again ([`crate::seam::replaced_note`]). A note, not a
-/// warn: the channel works either way, and the stale half of a link put back is (5e)'s to
-/// say. `None` when nothing was replaced, or the entry has since become something else.
+/// The note for a stale rustup `trust` link the unattended re-assertion replaced
+/// ([`crate::seam::live_build_tree`]): what it named and the one command that puts it back,
+/// or, once put back, that no pass will move it again ([`crate::seam::replaced_note`]). A
+/// note, since the channel works either way. `None` when nothing was replaced or the entry
+/// has since changed.
 fn replaced_seam_line(layout: &Layout, rustup_home: &Path) -> Option<String> {
     let line = crate::seam::replaced_note(layout, rustup_home, crate::seam::DEFAULT_SEAM)?;
     Some(format!("note — {line}"))
@@ -3676,7 +3418,7 @@ fn replaced_seam_line(layout: &Layout, rustup_home: &Path) -> Option<String> {
 /// rustup-init lays it, which an app-spawned pass (no rc file read) does not
 /// have on its PATH. Existence only; whether it answers is [`rustup_present`].
 fn rustup_binary(home: Option<&Path>) -> Option<std::path::PathBuf> {
-    // The platform's EXECUTABLE spelling: a bare `rustup` is never a file on Windows.
+    // The platform's executable spelling: a bare `rustup` is never a file on Windows.
     let file = rustup_file_name();
     let on_path = std::env::var_os("PATH").and_then(|path| {
         std::env::split_paths(&path)
@@ -3709,10 +3451,9 @@ fn rustup_present(bin: &Path) -> bool {
         .is_some_and(|o| o.status.success())
 }
 
-/// Does rustup resolve a `trust` channel? `rustup which cargo --toolchain trust`
-/// exits non-zero (and prints the famous `'rustc' is not installed for the
-/// custom toolchain 'trust'`) when the channel is absent or dangling; a linked
-/// channel answers with the cargo path. Bounded like every other probe here.
+/// Does rustup resolve a `trust` channel? `rustup which cargo --toolchain trust` exits
+/// non-zero (printing `'rustc' is not installed for the custom toolchain 'trust'`) when the
+/// channel is absent or dangling; a linked channel answers with the cargo path.
 fn rustup_trust_channel_resolves(bin: &Path) -> bool {
     output_bounded(aterm_uds::spawnfd::command(bin).args([
         "which",
@@ -3723,30 +3464,19 @@ fn rustup_trust_channel_resolves(bin: &Path) -> bool {
     .is_some_and(|o| o.status.success() && !o.stdout.is_empty())
 }
 
-/// How long ONE `--version` probe may take before `doctor` gives up on it.
-///
-/// A healthy local binary answers in milliseconds; the ceiling is for a wedged one (a
-/// stale NFS mount, a `rustup` shim waiting on a network fetch), which would otherwise
-/// hang the whole report silently.
+/// How long one `--version` probe may take before doctor gives up on it: a healthy local
+/// binary answers in milliseconds, and a wedged one (a stale NFS mount, a `rustup` shim
+/// waiting on a network fetch) would otherwise hang the whole report.
 const PROBE_TIMEOUT: std::time::Duration = crate::prereq::PROBE_TIMEOUT;
 
 /// Poll interval while waiting for a probe to exit.
 const PROBE_POLL: std::time::Duration = std::time::Duration::from_millis(10);
 
-/// Run a version probe with a bounded wall clock, killing and reaping it on
-/// timeout. `None` when it could not be spawned, did not finish in time, or
-/// could not be waited for.
-///
-/// Fails to `None`, not to an error, and that is the right direction HERE (the
-/// opposite of the updater's fail-closed helpers this mirrors): the probe is a
-/// convenience that renders one column of a report, and `doctor`'s contract is
-/// that it never fails because a probe failed — the store integrity checks are
-/// the verdict. A timed-out probe reads `unknown`, exactly like a binary that
-/// will not run.
-///
-/// Every probe handed here is built through `aterm_uds::spawnfd::command` (B27 of
-/// `tools/grep_guard.sh`): a no-op from a console, and on Windows a windowless
-/// console from a process with none, where a bare console probe opens a visible one.
+/// Run a version probe with a bounded wall clock, killing and reaping it on timeout. `None`
+/// when it could not be spawned, finish in time, or be waited for: unlike the updater's
+/// fail-closed helpers, doctor never fails because a probe failed, and a timed-out probe
+/// reads `unknown`. Callers build the probe with `aterm_uds::spawnfd::command`, which on
+/// Windows keeps a console probe from opening a visible window.
 pub(crate) fn output_bounded(
     cmd: &mut aterm_uds::spawnfd::Command,
 ) -> Option<std::process::Output> {
@@ -3765,11 +3495,9 @@ pub(crate) fn output_bounded_within(
 
 /// [`PROBE_TIMEOUT`], or a test's shorter one (`ShorterProbes`, unix tests only).
 fn probe_timeout() -> std::time::Duration {
-    // A test waits for a probe the way it waits for anything that must happen: a
-    // hang detector, never the production ceiling, which is a latency budget for a
-    // wedged binary (a probe that runs a script, three forks and an `cat` took
-    // longer than 5 s on a machine under a build storm, 2026-10-09, and read as
-    // "unknown"). A leg that wedges a probe on purpose sets its own, shorter bound.
+    // A test waits for a probe as for anything that must happen: a hang detector, never the
+    // production ceiling, which a loaded machine can miss. A leg that wedges a probe on
+    // purpose sets its own, shorter bound.
     #[cfg(all(test, unix))]
     return PROBE_TIMEOUT_IN_TEST
         .with(std::cell::Cell::get)
@@ -3784,12 +3512,9 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-/// A test's shorter [`PROBE_TIMEOUT`] for [`output_bounded`], on THIS thread
-/// until dropped: a leg whose driver is wedged on purpose waits out the probe's
-/// bound, not five seconds of the production one. The bound itself is pinned at
-/// its production length by `prereq`'s wedged-compiler test. Unix only, like its
-/// one user (a script fixture): a Windows `cfg(test)` build carries no unused
-/// helper.
+/// A test's shorter [`PROBE_TIMEOUT`] for [`output_bounded`] on this thread until dropped,
+/// for a leg whose driver is wedged on purpose. The production bound is pinned by
+/// `prereq`'s wedged-compiler test. Unix only, like its one user (a script fixture).
 #[cfg(all(test, unix))]
 pub(crate) struct ShorterProbes;
 
@@ -3818,21 +3543,17 @@ pub(crate) fn output_bounded_capturing(
 }
 
 /// The most of a probe's stdout or stderr that is kept: a version answer is a line or two.
-/// A child that writes more is not answering one; its pipe is no longer read, so it fills
-/// and the child meets the deadline, as every probe did before the pipes were read while it
-/// ran.
+/// Past it the pipe is no longer read, so it fills and the child meets the deadline.
 const PROBE_OUTPUT_CAP: usize = 1 << 20;
 
-/// [`output_bounded`] and [`output_bounded_capturing`]: the child's pipes are read WHILE it
+/// [`output_bounded`] and [`output_bounded_capturing`]: the child's pipes are read while it
 /// runs and once more when it has exited, and never waited on past that.
 ///
-/// WHY NOT `read_to_end` AFTER THE EXIT. The child's exit does not close its pipes: any
-/// process it started holds them for as long as it lives. A `cargo` wrapper that backgrounds
-/// a usage logger or starts a server answered `-vV` in 0.08 s and then held the reroute's
-/// probe for the 20 s its background `sleep` lived (measured 2026-09-30; a process that
-/// never exits held it forever, and the command the probe stood in front of never ran).
+/// Not `read_to_end` after the exit: the child's exit does not close its pipes, and any
+/// process it started holds them as long as it lives (a `cargo` wrapper that backgrounds a
+/// usage logger answers `-vV` at once, then holds the pipe for the logger's whole life).
 /// Everything the child itself wrote is in the pipe by the time it has exited, so the last
-/// read takes what is there and stops — on unix the pipes are non-blocking ([`Capture`]).
+/// read takes what is there and stops; on unix the pipes are non-blocking ([`Capture`]).
 fn bounded(
     cmd: &mut aterm_uds::spawnfd::Command,
     keep_stderr: bool,
@@ -3998,9 +3719,9 @@ impl Capture {
     }
 }
 
-/// Copy-pasteable manual PATH-append for the shell of THIS platform: PowerShell on Windows
-/// (';' separator, `$env:PATH`), POSIX `export` elsewhere. Only a fallback — an aterm shell
-/// auto-sources the `shell.d` hook that does this already.
+/// Copy-pasteable manual PATH-append for this platform's shell: PowerShell on Windows,
+/// POSIX `export` elsewhere. Only a fallback: an aterm shell sources the `shell.d` hook that
+/// does this already.
 #[cfg(windows)]
 fn manual_path_hint(bin: &Path) -> String {
     format!("$env:PATH += \";{}\"", bin.display())
@@ -4020,22 +3741,12 @@ fn native_hook_ext() -> &'static str {
     "zsh"
 }
 
-/// Report the aterm app's own update posture beside the toolchain's.
-///
-/// The app updates itself through a SEPARATE updater (it cannot be an atpkg program:
-/// swapping a running, notarized `.app` needs Gatekeeper assessment, a boot sentinel and
-/// the in-session PTY handoff), so this reads that updater's own records rather than
-/// forming a second opinion. It never says to reopen the app: a staged build applies
-/// in-session. It names WHICH process applies — the window; a terminal session checks and
-/// stages but never applies, so with no window open the note names `aterm --window`.
-/// `installs_by_itself` is `[update] auto_apply`: off, the window installs nothing until a
-/// person presses Install, and the note names Settings ▸ Software Update, as `aterm update`
-/// does. A staged build whose installs keep failing (health.toml's apply streak) promises no
-/// install either: the note says it did not install and how many tries, as `aterm update`
-/// does.
-///
-/// Silent when there is no updater state: a bare CLI install is a legitimate posture, not a
-/// fault.
+/// Report the aterm app's own update posture beside the toolchain's, from its separate
+/// updater's records (a running notarized `.app` is swapped by the in-session PTY handoff,
+/// not by atpkg). It never says to reopen the app: a staged build applies in-session, and
+/// only the window applies, so with no window open the note names `aterm --window`.
+/// `installs_by_itself` is `[update] auto_apply`. Silent when there is no updater state (a
+/// bare CLI install).
 fn report_aterm_posture(
     layout: &crate::store::Layout,
     app_dirs: &[PathBuf],
@@ -4071,16 +3782,11 @@ fn report_aterm_posture(
     );
 }
 
-/// [`report_aterm_posture`] over an explicit updater ledger dir, the SEALED build
-/// number of the bundle this process runs from (`None` outside a bundle), and the
-/// `(build, version)` read off each bundle found, so the arms are testable against a
-/// fixture.
-///
-/// "Installed on disk" is the NEWER of the updater's receipt and the bundle's own
-/// `CFBundleVersion`: a bundle placed by hand (`install.sh`, a DMG drag) is newer than
-/// any receipt the updater wrote, and the receipt alone could name an OLDER build as
-/// "installed on disk". The note fires only when what is on disk is strictly newer than
-/// what runs; an equal or older receipt is the quiet line.
+/// [`report_aterm_posture`] over an explicit updater ledger dir, the sealed build of the
+/// running bundle (`None` outside one), and each bundle's `(build, version)`. "Installed on
+/// disk" is the newer of the receipt and the bundle's `CFBundleVersion` (a hand-placed
+/// bundle is newer than any receipt), and the note fires only when that is newer than what
+/// runs.
 fn report_aterm_posture_at(
     updates: &Path,
     bundle_build: Option<u64>,
@@ -4128,14 +3834,10 @@ fn report_aterm_posture_at(
     let by_hand = "install it from Settings \u{25b8} Software Update; your shells keep running";
     match (current, field("status.toml", "staged_build")) {
         (Some(current), Some(staged)) if current != staged => {
-            // The staged build is applied IN-SESSION by the WINDOW's overlap handoff
-            // (automatic within a minute by default, one click otherwise); the shells keep
-            // running. A terminal session never applies, so the note names the window for a
-            // Mac that has none open, and never asks the user to reopen anything.
-            // The window's installs of THIS build keep failing: no install is on its way,
-            // so none is promised. The count is health.toml's per-target one, keyed to the
-            // build it tried — the escalation streak `apply_failures` carries a superseded
-            // build's tries onto a fresh download nothing has tried yet.
+            // Only the window applies (see the fn doc). When its installs of this build keep
+            // failing, no install is promised; the count is health.toml's per-target one,
+            // keyed to the build it tried, since `apply_failures` carries a superseded
+            // build's tries onto a fresh download.
             let tries = field("health.toml", "apply_failures_for_target")
                 .and_then(|n| n.parse::<u32>().ok())
                 .filter(|n| *n > 0)
@@ -4189,10 +3891,9 @@ fn report_aterm_posture_at(
             }
         }
         _ => {
-            // The version a person recognises, read off whichever bundle's sealed build IS
-            // the installed one — the running bundle or an app dir's. With no such bundle
-            // readable the row stays build-only, so it never names a version it did not
-            // read off that build.
+            // The version a person recognises, read off whichever bundle's sealed build is
+            // the installed one; with none readable the row stays build-only, so it never
+            // names a version it did not read off that build.
             match versions.iter().find(|(b, _)| b.to_string() == installed) {
                 Some((_, v)) => {
                     let _ = writeln!(out, "{p}: ok — aterm {v} (build {installed}) installed");
@@ -4239,10 +3940,10 @@ fn plist_short_version(text: &str) -> Option<String> {
     shaped.then(|| v.to_string())
 }
 
-/// `CFBundleVersion` out of an XML plist: the `<string>` IMMEDIATELY after the key
-/// (modulo whitespace) — never a string further on that another key owns — parsed as
-/// the integer build number the cutter seals. `None` for a missing key, an intervening
-/// element, or a non-integer value.
+/// `CFBundleVersion` out of an XML plist: the `<string>` immediately after the key (modulo
+/// whitespace), never a string further on that another key owns, parsed as the integer
+/// build number the cutter seals. `None` for a missing key, an intervening element, or a
+/// non-integer value.
 fn plist_bundle_version(text: &str) -> Option<u64> {
     let key = "<key>CFBundleVersion</key>";
     let after = text.find(key)? + key.len();
@@ -4251,12 +3952,11 @@ fn plist_bundle_version(text: &str) -> Option<u64> {
     value[..end].trim().parse::<u64>().ok()
 }
 
-/// The index (in `split_paths` order) of the first `PATH` entry holding an executable
-/// `name` OUTSIDE the managed `prefix` — the reroute dir lives under it, so a laid stub
-/// never counts as its own upstream. A local walk on purpose: the vendor probes are
-/// [`crate::store::ToolName`]-gated and `cargo` is deny-listed there. Relative entries
-/// are skipped (they name the cwd, not a toolchain), and only an executable regular file
-/// counts — a directory named `cargo` is not a copy that runs.
+/// The index (in `split_paths` order) of the first `PATH` entry holding an executable `name`
+/// outside the managed `prefix` (the reroute dir lives under it, so a laid stub never counts
+/// as its own upstream). A local walk on purpose: the vendor probes are
+/// [`crate::store::ToolName`]-gated and `cargo` is deny-listed there. Relative entries are
+/// skipped (they name the cwd, not a toolchain), and only an executable regular file counts.
 fn upstream_index_on_path(
     entries: &[std::path::PathBuf],
     prefix: &Path,

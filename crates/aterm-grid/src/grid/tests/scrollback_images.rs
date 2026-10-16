@@ -2,11 +2,9 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Inline images survive the scroll-off → history → materialize round trip.
-//!
-//! An image cell carries a `CellExtra` and no glyph, so an image-only row has
-//! `Row::len() == 0`; text paths are bounded by that length, so extraction has
-//! its own full-width pass. These tests use zero-length rows on purpose.
+//! Inline images survive the scroll-off -> history -> materialize round trip. An image cell
+//! carries a `CellExtra` and no glyph, so an image-only row has `Row::len() == 0` and extraction
+//! needs its own full-width pass; these tests use zero-length rows on purpose.
 
 use std::sync::Arc;
 
@@ -57,7 +55,7 @@ fn an_image_only_row_yields_one_span_per_footprint_row_when_it_scrolls_off() {
     let image = placement(2, 4);
     stamp(&mut grid, 0, &image, 0, 4);
 
-    // The premise: nothing about the row's TEXT says the picture is there.
+    // Nothing in the row's text says the picture is there.
     assert_eq!(
         grid.row(0).unwrap().len(),
         0,

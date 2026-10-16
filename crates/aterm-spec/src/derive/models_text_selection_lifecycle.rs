@@ -7,30 +7,19 @@
 
 use super::*;
 
-/// `TextSelection`'s five lifecycle calls, each total (callable in every
-/// phase) and each a no-op outside the phase it belongs to.
+/// `TextSelection`'s five lifecycle calls, each callable in every phase and a no-op
+/// outside the phase it belongs to.
 ///
-/// `phase` is `TextSelection::state()` (0 None, 1 InProgress, 2 Complete) and
-/// `end` is which of the driver's three points the far anchor holds (0 where
-/// the press lands, 1 the drag point, 2 the shift-click point). The rules are
-/// about single calls, so the state also carries an OBSERVER of the last call:
-/// `last` names it (0 none yet, 1 Start, 2 Update, 3 Complete, 4 Extend,
-/// 5 Clear), `pre` is the phase it ran in, and `moved` whether it moved the far
-/// anchor. Each invariant reads one call's rule off that observer:
-/// * `UpdateOnlyInProgress` — a drag moves the far anchor only while the button
-///   is down;
-/// * `CompleteOnlyFromInProgress` — a release completes only an in-progress
-///   selection, and is a no-op otherwise;
-/// * `ExtendOnlyFromComplete` — a shift-click acts only on a completed
-///   selection, which it reopens; otherwise it changes nothing;
-/// * `ClearIsNone` — clearing always ends the selection.
+/// `phase` is `TextSelection::state()` (0 None, 1 InProgress, 2 Complete); `end` is which
+/// point the far anchor holds (0 the press, 1 the drag, 2 the shift-click). The state also
+/// observes the last call: `last` (0 none, 1 Start, 2 Update, 3 Complete, 4 Extend,
+/// 5 Clear), `pre` the phase it ran in, `moved` whether it moved the far anchor. Each
+/// invariant reads one call's rule off that observer.
 ///
-/// `Buggy = 1` drops each call's phase check the way the code could: the drag
-/// keeps moving the far anchor after the release, a release with nothing
-/// pressed completes an empty selection, a shift-click during a drag jumps the
-/// far anchor, and clearing spares a completed selection. Tier-1:
-/// `aterm-selection/tests/conformance_text_selection.rs` drives the real calls
-/// from every reachable state.
+/// `Buggy = 1` drops each call's phase check: a drag moves the anchor after release, a
+/// release with nothing pressed completes, a shift-click mid-drag jumps the anchor, and
+/// clearing spares a completed selection. Tier-1:
+/// `aterm-selection/tests/conformance_text_selection.rs`.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn text_selection_lifecycle_model() -> Model {

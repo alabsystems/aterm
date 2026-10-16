@@ -1,0 +1,10 @@
+# muse 1.4.9-R6297.1 · MEASURED 2026-10-16, `aterm ctl text --json` of a private headless aterm 120x40 (aterm 0.105.0 098c216c7), the atpkg-managed muse (Meta latest) launched through its shim with a scratch HOME, `--provider echo --echo-delay-ms 8000` (Meta's offline echo provider: no login, no model), harness off · the workspace-trust box drawn from row 0: `Do you trust this workspace?`, the path, two lines of explanation, `⟩ 1  Trust and continue` (bold 5aa0ff) and `2  Quit`, the key row `Use Up/Down or 1/2, then Enter. Esc quits.`; cursor hidden · cursor=0,0 (hidden) · account and scratch path redacted at equal length
+Do you trust this workspace?
+Workspace: /private/tmp/at.XXXXXX/mwork
+
+Trusting allows project-local skills, rules, hooks, and plugin config to load before the model runs.
+Only trust this workspace when you trust its contents.
+⟩ 1  Trust and continue
+  2  Quit
+
+Use Up/Down or 1/2, then Enter. Esc quits.

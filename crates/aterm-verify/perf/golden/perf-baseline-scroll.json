@@ -1,0 +1,7 @@
+{
+  "_comment": "aterm ARENA-SCROLL baseline: scrollback-scrub read-path rates (rows materialized/sec for wheel-scrub + page-sweep, jumps/sec for jump-to-top over DISTINCT cold-tier pages) over a 100k+-line tiered-scrollback fill. All BIGGER-IS-BETTER. Re-record with targo --unverified verify perf --record scroll-scrub. Each phase fails independently iff measured < recorded * pass_ratio. Recorded 2026-07-08 on the M2 Air (dev box, conservative min-of-3 medians) like the pathological baseline.",
+  "scrub_median_rps": 1231000.000,
+  "pageup_median_rps": 1137000.000,
+  "jump_top_median_jps": 40200.000,
+  "pass_ratio": 0.450
+}

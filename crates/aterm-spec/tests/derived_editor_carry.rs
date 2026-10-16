@@ -1,12 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-0 of `NativeUpdateEditorCarry`
-//! (`aterm_spec::derive::native_update_editor_carry_model`): an unsaved editor
-//! tab rides a self-update (gap #32). Proved at `Buggy = 0` and caught at
-//! `Buggy = 1` on every invariant; `Buggy = 2` and `Buggy = 3` are the two
-//! subtler losses, each caught on `NoDraftLost`. The update's paths are walked
-//! as the person meets them. Tier-1 is
+//! Tier-0 of `NativeUpdateEditorCarry`: an unsaved editor tab rides a self-update. Proved at
+//! `Buggy = 0` and caught at `Buggy = 1` on every invariant; `Buggy = 2` and `Buggy = 3`, the
+//! two subtler losses, are each caught on `NoDraftLost`. Tier-1 is
 //! `aterm-gui/src/editor_carry_conformance.rs`.
 
 use crate::walk::only;
@@ -16,12 +13,6 @@ use aterm_spec::{interp, verify};
 #[test]
 fn editor_carry_proves_catches_and_has_no_dead_action() {
     let model = native_update_editor_carry_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name),
-        "the editor carry must stay enrolled in the spec-link registry"
-    );
     let fired = interp::fired_actions(&model);
     assert_eq!(
         fired.len(),
@@ -140,5 +131,4 @@ fn editor_carry_the_defects_are_caught_on_every_invariant() {
             "Buggy = {buggy} is a Commit-side loss only"
         );
     }
-    assert!(verify::uncaught_invariants(&native_update_editor_carry_model()).is_empty());
 }

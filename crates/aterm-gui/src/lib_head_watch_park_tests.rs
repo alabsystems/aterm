@@ -463,15 +463,16 @@ fn slow_index_probe_does_not_hold_a_ready_vendor_hint() {
     assert!(watch.pending_index_probe.is_some());
     assert_eq!(state["phase"], 1);
     assert_eq!(modeled_index_owner(&watch), 1);
-    // The park is exactly one `PARK_SLICE`, the bound: the vendor worker's completion
-    // must unpark the lane (`HeadWatch::park_for_hint`), or it wakes at the slice's
-    // timeout and answers `Elapsed`, as would a lane holding the vendor hint behind the
-    // blocked index probe.
-    let started = Instant::now();
+    // The park is one slice of a minute: the vendor worker's completion must unpark
+    // the lane (`HeadWatch::park_for_hint`), or it wakes at the slice's timeout and
+    // answers `Elapsed`, as would a lane holding the vendor hint behind the blocked
+    // index probe.
+    let park = aterm_spec::wait::MUST_HAPPEN;
+    set_park_slice_for_this_thread(park);
     let end = sleep_interval_watching_bump(
         Some(&layout),
-        &mut (SystemTime::now() + PARK_SLICE),
-        PARK_SLICE,
+        &mut (SystemTime::now() + park),
+        park,
         &mut watch,
         ParkProbes::INDEX,
         Some(&mut heads),
@@ -481,7 +482,6 @@ fn slow_index_probe_does_not_hold_a_ready_vendor_hint() {
     assert!(model.fire("ChooseVendor", &mut state));
     assert_eq!(end, ParkEnd::VendorMoved(vec!["claude"]));
     assert_eq!(modeled_park_choice(&end), state["chosen"]);
-    assert!(started.elapsed() < PARK_SLICE, "woken by the vendor worker");
     assert_eq!(asked.lock().unwrap().as_slice(), [None]);
     assert!(
         watch.pending_index_probe.is_some(),
@@ -768,20 +768,20 @@ fn near_index_unparks_the_vendor_head_wait_without_a_poll_tick() {
         std::thread::sleep(Duration::from_millis(100));
         near_tx.send(()).unwrap();
     });
-    // The near hint must beat the slice's own timeout: one `PARK_SLICE` of park, or a
+    // The near hint must beat the slice's own timeout: one slice of a minute, or a
     // missed unpark answers `Elapsed`.
-    let started = Instant::now();
+    let park = aterm_spec::wait::MUST_HAPPEN;
+    set_park_slice_for_this_thread(park);
     let end = sleep_interval_watching_bump(
         Some(&layout),
-        &mut (SystemTime::now() + PARK_SLICE),
-        PARK_SLICE,
+        &mut (SystemTime::now() + park),
+        park,
         &mut watch,
         ParkProbes::INDEX,
         Some(&mut heads),
         &mut LiveSwitch::new(None, LoopGate::On),
     );
-    assert_eq!(end, ParkEnd::IndexPublished(44));
-    assert!(started.elapsed() < PARK_SLICE, "woken by the hint");
+    assert_eq!(end, ParkEnd::IndexPublished(44), "woken by the hint");
     assert!(
         !watch
             .pending_index_probe
@@ -799,8 +799,8 @@ fn near_index_unparks_the_vendor_head_wait_without_a_poll_tick() {
     );
 }
 
-/// A final answer must also interrupt the five-second ordinary slice when
-/// no vendor watch is admitted. The `done` publication closes the race
+/// A final answer must also interrupt the ordinary slice when no vendor
+/// watch is admitted. The `done` publication closes the race
 /// between unpark delivery and `JoinHandle::is_finished` becoming true.
 #[test]
 fn final_index_answer_unparks_a_package_lane_without_vendor_heads() {
@@ -822,19 +822,19 @@ fn final_index_answer_unparks_a_package_lane_without_vendor_heads() {
         std::thread::sleep(Duration::from_millis(100));
         finish_tx.send(()).unwrap();
     });
-    // One `PARK_SLICE` of park, so a missed unpark answers `Elapsed`.
-    let started = Instant::now();
+    // One slice of a minute, so a missed unpark answers `Elapsed`.
+    let park = aterm_spec::wait::MUST_HAPPEN;
+    set_park_slice_for_this_thread(park);
     let end = sleep_interval_watching_bump(
         Some(&layout),
-        &mut (SystemTime::now() + PARK_SLICE),
-        PARK_SLICE,
+        &mut (SystemTime::now() + park),
+        park,
         &mut watch,
         ParkProbes::INDEX,
         None,
         &mut LiveSwitch::new(None, LoopGate::On),
     );
-    assert_eq!(end, ParkEnd::IndexPublished(45));
-    assert!(started.elapsed() < PARK_SLICE, "woken by the answer");
+    assert_eq!(end, ParkEnd::IndexPublished(45), "woken by the answer");
     assert!(watch.pending_index_probe.is_none());
     release.join().unwrap();
 }
@@ -1588,7 +1588,7 @@ fn ready_codex_starts_its_pass_before_stalled_claude_finishes() {
 
     let mut lane = PkgLane {
         atpkg: atpkg.as_path(),
-        child_path: "",
+        child_path: || "",
         layout: Some(&layout),
         private_state_root: false,
         post: |_| {},
@@ -1596,6 +1596,7 @@ fn ready_codex_starts_its_pass_before_stalled_claude_finishes() {
         backoff: ContentionBackoff::default(),
         ran_at: None,
         switch: LiveSwitch::new(None, LoopGate::On),
+        ahead: false,
     };
     lane.run_vendor_moved(&["codex"], Some(&mut head_watch));
     assert_eq!(
@@ -1664,7 +1665,7 @@ fn a_targeted_pass_that_stood_aside_ends_the_trigger_on_the_tally() {
     let runs = || std::fs::read_to_string(&argv_log).unwrap_or_default();
     let mut lane = PkgLane {
         atpkg: atpkg.as_path(),
-        child_path: "",
+        child_path: || "",
         layout: None,
         private_state_root: false,
         post: |_| {},
@@ -1672,6 +1673,7 @@ fn a_targeted_pass_that_stood_aside_ends_the_trigger_on_the_tally() {
         backoff: ContentionBackoff::default(),
         ran_at: None,
         switch: LiveSwitch::new(None, LoopGate::On),
+        ahead: false,
     };
     fake(75);
     lane.run_vendor_moved(&["claude", "codex"], None);
@@ -1732,7 +1734,7 @@ fn a_private_windows_passes_lead_with_the_flag_and_the_owners_do_not() {
         let _ = std::fs::remove_file(&argv_log);
         let mut lane = PkgLane {
             atpkg: atpkg.as_path(),
-            child_path: "",
+            child_path: || "",
             layout: None,
             private_state_root,
             post: |_| {},
@@ -1740,6 +1742,7 @@ fn a_private_windows_passes_lead_with_the_flag_and_the_owners_do_not() {
             backoff: ContentionBackoff::default(),
             ran_at: None,
             switch: LiveSwitch::new(None, LoopGate::On),
+            ahead: false,
         };
         for verb in [
             PassVerb::Seed,
@@ -1776,6 +1779,255 @@ fn a_private_windows_passes_lead_with_the_flag_and_the_owners_do_not() {
         1,
         "{body}"
     );
+}
+
+/// TC-5 — THE LANE'S FIRST-RUN ROW AND EACH CHILD'S PATH. A lane holding the row
+/// ahead posts it open before its seed and again before a retried one, hands it to
+/// the whole update with no word of its own, and withdraws it before a park instead
+/// (once). An update that stood aside at the lock (exit 75) only waited: its exit is
+/// carried like a seed's and the busy park withdraws the row, as it is for one whose only
+/// answer was a fact about the machine (an unserved architecture). The seeds run with this
+/// process's PATH and never ask the login shell; the update gets the login shell's
+/// answer.
+#[cfg(unix)]
+#[test]
+fn the_lane_holds_the_first_run_row_ahead_and_only_an_update_asks_the_login_path() {
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static ASKED: AtomicUsize = AtomicUsize::new(0);
+    fn login_path() -> &'static str {
+        ASKED.fetch_add(1, Ordering::SeqCst);
+        "/login/bin:/usr/bin:/bin"
+    }
+    let dir = std::env::temp_dir().join(format!("aterm-first-run-ahead-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let said = dir.join("said");
+    let code = dir.join("code");
+    let out = dir.join("out");
+    std::fs::write(&code, "0\n").unwrap();
+    let atpkg = dir.join("atpkg");
+    let script = format!(
+        "#!/bin/sh\nprintf '%s %s\\n' \"$1\" \"$PATH\" >> '{}'\nif [ -f '{}' ]; then cat '{}'; fi\n\
+         read code < '{}'\nexit \"$code\"\n",
+        said.display(),
+        out.display(),
+        out.display(),
+        code.display()
+    );
+    std::fs::write(&atpkg, script).unwrap();
+    std::fs::set_permissions(&atpkg, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let posted = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&posted);
+    let mut lane = PkgLane {
+        atpkg: atpkg.as_path(),
+        child_path: login_path,
+        layout: None,
+        private_state_root: false,
+        post: move |e| sink.lock().unwrap().push(e),
+        wait_row_open: false,
+        backoff: ContentionBackoff::default(),
+        ran_at: None,
+        switch: LiveSwitch::new(None, LoopGate::On),
+        ahead: true,
+    };
+    let rows = |posted: &Arc<Mutex<Vec<Wake>>>| -> Vec<&'static str> {
+        posted
+            .lock()
+            .unwrap()
+            .drain(..)
+            .filter_map(|e| match e {
+                Wake::PkgFirstRunAhead { open: true } => Some("open"),
+                Wake::PkgFirstRunAhead { open: false } => Some("withdraw"),
+                Wake::PkgPassEnded { .. } => Some("ended"),
+                _ => None,
+            })
+            .collect()
+    };
+    lane.run(PassVerb::Seed, None);
+    lane.run(PassVerb::Seed, None);
+    assert_eq!(rows(&posted), ["open", "ended", "open", "ended"]);
+    assert_eq!(
+        ASKED.load(Ordering::SeqCst),
+        0,
+        "no seed asked the login shell"
+    );
+    lane.run(PassVerb::Update, None);
+    assert_eq!(
+        rows(&posted),
+        ["ended"],
+        "the update takes the row over silently"
+    );
+    assert!(!lane.ahead);
+    assert_eq!(ASKED.load(Ordering::SeqCst), 1);
+    let process_path = std::env::var("PATH").unwrap_or_default();
+    assert_eq!(
+        std::fs::read_to_string(&said).unwrap(),
+        format!("seed {process_path}\nseed {process_path}\nupdate /login/bin:/usr/bin:/bin\n")
+    );
+    // No update after the seed: the park withdraws the row, once.
+    lane.ahead = true;
+    lane.run(PassVerb::Seed, None);
+    let _ = lane.park(
+        Duration::ZERO,
+        &mut BumpWatch::default(),
+        false,
+        false,
+        None,
+    );
+    let _ = lane.park(
+        Duration::ZERO,
+        &mut BumpWatch::default(),
+        false,
+        false,
+        None,
+    );
+    assert_eq!(rows(&posted), ["open", "ended", "withdraw"]);
+    // An update that stood aside at the lock, or found no network before it announced
+    // anything, wrote no outcome: its exit is carried, the lane still holds the row,
+    // and the park that follows withdraws it.
+    for exit in [
+        atpkg::lock::CONTENDED_EXIT,
+        aterm_update_core::pkg_check::PASS_OFFLINE_EXIT,
+    ] {
+        lane.ahead = true;
+        std::fs::write(&code, format!("{exit}\n")).unwrap();
+        lane.run(PassVerb::Update, None);
+        assert_eq!(rows(&posted), ["open", "ended"], "exit {exit}");
+        assert!(
+            lane.ahead,
+            "exit {exit}: the row is still the lane's to withdraw"
+        );
+        let _ = lane.park(
+            Duration::ZERO,
+            &mut BumpWatch::default(),
+            false,
+            false,
+            None,
+        );
+        assert_eq!(rows(&posted), ["withdraw"], "exit {exit}");
+    }
+    // A failed update is the Fault it was: it takes the row over and its exit folds it.
+    lane.ahead = true;
+    std::fs::write(&code, "1\n").unwrap();
+    lane.run(PassVerb::Update, None);
+    assert_eq!(rows(&posted), ["ended"]);
+    assert!(!lane.ahead);
+    // An update whose only answer is a fact about this machine — the empty-store arm's
+    // informational `seed-unusable:` line, exit 2 — announced no install: its exit is
+    // carried and the park withdraws the row, never a Fault for an architecture no build
+    // serves. An exclusion that leaves nothing is a failure a person can act on, and
+    // folds the row as before.
+    let unusable = |body: &str| format!("atpkg: {}{body}\n", atpkg::cli::SEED_UNUSABLE_MARKER);
+    let unserved = unusable(&format!(
+        "ALab publishes no build {} (x86_64-apple-darwin) \u{2014} it builds for \
+         aarch64-apple-darwin; nothing installs here until one is published",
+        atpkg::cli::UNSERVED_ARCHITECTURE_CLAUSE
+    ));
+    let excluded = unusable(
+        "[packages].exclude narrows the toolset to nothing installable on this machine \
+         (aarch64-apple-darwin; excluded: ay, clean) \u{2014} shorten it to receive the toolset",
+    );
+    std::fs::write(&code, "2\n").unwrap();
+    lane.ahead = true;
+    std::fs::write(&out, &unserved).unwrap();
+    lane.run(PassVerb::Update, None);
+    assert_eq!(rows(&posted), ["open", "ended"], "an unserved architecture");
+    assert!(lane.ahead, "the row is still the lane's to withdraw");
+    let _ = lane.park(
+        Duration::ZERO,
+        &mut BumpWatch::default(),
+        false,
+        false,
+        None,
+    );
+    assert_eq!(rows(&posted), ["withdraw"]);
+    lane.ahead = true;
+    std::fs::write(&out, &excluded).unwrap();
+    lane.run(PassVerb::Update, None);
+    assert_eq!(rows(&posted), ["ended"], "an exclusion that leaves nothing");
+    assert!(!lane.ahead);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// TC-5 — the lane starts before the event loop exists: what it posts meanwhile is
+/// delivered once the loop goes live, in order and once, and later posts go straight
+/// through behind them.
+#[test]
+fn lane_posts_before_the_loop_exists_are_delivered_when_it_goes_live() {
+    use std::sync::Arc;
+    let sink = LaneSink::new();
+    let early = sink.clone();
+    early.send_event(Wake::PkgFirstRunAhead { open: true });
+    early.send_event(Wake::PkgPassEnded { clean: true });
+    let delivered = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&delivered);
+    sink.go_live(move |event| {
+        seen.lock().unwrap().push(match event {
+            Wake::PkgFirstRunAhead { open } => format!("ahead {open}"),
+            Wake::PkgPassEnded { clean } => format!("ended {clean}"),
+            _ => "other".to_string(),
+        });
+    });
+    assert_eq!(*delivered.lock().unwrap(), ["ahead true", "ended true"]);
+    early.send_event(Wake::PkgFirstRunAhead { open: false });
+    assert_eq!(
+        *delivered.lock().unwrap(),
+        ["ahead true", "ended true", "ahead false"]
+    );
+}
+
+/// TC-5 — the row goes up ahead only for a first run this machine consents to and
+/// no pass has served yet: an empty consenting store; never a declined one, an
+/// `auto_install = false` one, one holding an ALab program, one a pass already
+/// reached the index for, or no store at all.
+#[test]
+fn the_first_run_row_opens_ahead_only_where_the_seed_will_adopt() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let fresh = atpkg::store::Layout {
+        prefix: dir.path().join("fresh"),
+    };
+    let consenting = atpkg::config::PackagesConfig::default();
+    let off = atpkg::config::PackagesConfig {
+        auto_install: Some(false),
+        ..atpkg::config::PackagesConfig::default()
+    };
+    let armed = atpkg::manager_enabled();
+    assert_eq!(first_run_ahead(Some(&fresh), &consenting), armed);
+    assert!(!first_run_ahead(Some(&fresh), &off));
+    assert!(!first_run_ahead(None, &consenting));
+    let declined = atpkg::store::Layout {
+        prefix: dir.path().join("declined"),
+    };
+    std::fs::create_dir_all(&declined.prefix).unwrap();
+    std::fs::write(declined.declined(), "# declined\n").unwrap();
+    assert!(!first_run_ahead(Some(&declined), &consenting));
+    let served = atpkg::store::Layout {
+        prefix: dir.path().join("served"),
+    };
+    std::fs::create_dir_all(&served.prefix).unwrap();
+    atpkg::status::write(
+        &served,
+        &atpkg::status::Status {
+            schema: 1,
+            last_success_at: "2023-11-14T22:13:20Z".to_string(),
+            ..atpkg::status::Status::default()
+        },
+    )
+    .unwrap();
+    assert!(!first_run_ahead(Some(&served), &consenting));
+    let stocked = atpkg::store::Layout {
+        prefix: dir.path().join("stocked"),
+    };
+    let tool = stocked.build_dir("ay", 1971).join("bin").join("ay");
+    std::fs::create_dir_all(tool.parent().unwrap()).unwrap();
+    std::fs::write(&tool, "").unwrap();
+    std::fs::create_dir_all(stocked.bin_dir()).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&tool, stocked.bin_dir().join("ay")).unwrap();
+    #[cfg(unix)]
+    assert!(!first_run_ahead(Some(&stocked), &consenting));
 }
 
 /// The first run is defined by the store at the pass's start: over a store with no
@@ -1843,7 +2095,7 @@ fn a_pass_is_a_first_run_only_on_an_empty_store_and_reports_its_exit() {
         let sink = Arc::clone(&posted);
         let mut lane = PkgLane {
             atpkg: atpkg.as_path(),
-            child_path: "",
+            child_path: || "",
             layout: Some(layout),
             private_state_root: false,
             post: move |e| sink.lock().unwrap().push(e),
@@ -1851,6 +2103,7 @@ fn a_pass_is_a_first_run_only_on_an_empty_store_and_reports_its_exit() {
             backoff: ContentionBackoff::default(),
             ran_at: None,
             switch: LiveSwitch::new(None, LoopGate::On),
+            ahead: false,
         };
         lane.run(verb, None).expect("the child ran");
         std::mem::take(&mut *posted.lock().unwrap())
@@ -1937,7 +2190,7 @@ fn a_whole_pass_that_cannot_launch_is_a_failure() {
         let sink = Arc::clone(&posted);
         let mut lane = PkgLane {
             atpkg: missing.as_path(),
-            child_path: "",
+            child_path: || "",
             layout: None,
             private_state_root: false,
             post: move |e| sink.lock().unwrap().push(e),
@@ -1945,6 +2198,7 @@ fn a_whole_pass_that_cannot_launch_is_a_failure() {
             backoff: ContentionBackoff::default(),
             ran_at: None,
             switch: LiveSwitch::new(None, LoopGate::On),
+            ahead: false,
         };
         assert!(lane.run(verb, None).is_none(), "{verb}: nothing ran");
         let posted = std::mem::take(&mut *posted.lock().unwrap());
@@ -2012,30 +2266,6 @@ fn only_the_announcement_carries_the_first_run_tag() {
         true,
     );
     assert!(matches!(other, Wake::PkgSeedDone { .. }));
-}
-
-/// A targeted pass's markerless failure ran and failed, and is named by its own
-/// command; the toolchain passes keep their words.
-#[test]
-fn a_targeted_pass_is_named_by_its_command_and_its_refusal_is_a_failure() {
-    let why = "atpkg: codex 0.157.0 refused: SHA256SUMS disagrees";
-    assert_eq!(
-        refused_line(PassVerb::UpdateProgram("codex"), why),
-        format!("the atpkg update codex pass failed: {why}")
-    );
-    assert_eq!(
-        refused_line(PassVerb::Update, why),
-        format!("the ALab toolchain update pass did not run: {why}")
-    );
-    let seen = SeedMarkers::default();
-    assert!(
-        stood_aside_line(PassVerb::UpdateProgram("claude"), seen)
-            .starts_with("the atpkg update claude pass waited 30 min")
-    );
-    assert!(
-        stood_aside_line(PassVerb::Seed, seen)
-            .starts_with("the ALab toolchain seed pass waited 30 min")
-    );
 }
 
 /// One slice at a time: due at once, then on the cadence; a wake asks again 20 s

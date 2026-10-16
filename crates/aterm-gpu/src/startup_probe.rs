@@ -1,33 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Cold-build sub-phase timing: the breakdown of the frontend's
-//! `backend_finalize` startup phase.
+//! Cold-build sub-phase timing: the breakdown of the frontend's `backend_finalize` startup
+//! phase, which is one `handle.join()` on the backend-build worker. These legs record the split
+//! where the work happens; `aterm-gui` folds them into its startup ledger.
 //!
-//! The frontend's startup ledger (`aterm-gui::metrics`) splits Rust-main to
-//! first-present into exclusive phases; `backend_finalize` is one
-//! `handle.join()` on the backend-build worker, so the worker's work (wgpu
-//! instance/adapter/device, the parallel font thread, render pipelines) is one
-//! opaque number there. Normally the worker has finished before the join, its
-//! work hidden under window creation. These legs record the split where the
-//! work happens; `aterm-gui` folds them into its ledger. This crate publishes
-//! nothing itself.
+//! * Slots are `u64` nanosecond durations; the wire converts to ms.
+//! * First write wins: a later rebuild (GPU loss recovery, a second renderer in a test) never
+//!   overwrites the cold build; [`record`] admits a leg only while its slot is zero.
+//! * Zero means unset: a sub-ns leg records as 1 ns; a leg that never ran (the CPU fallback)
+//!   reads 0, making the frontend's `startup_gpu_valid` false.
+//! * Durations, not stamps: the legs run on two threads with no shared epoch.
 //!
-//! ## Rules
-//!
-//! * Nanoseconds: every slot is a `u64` duration; the wire converts to ms.
-//! * First write wins: a process has one cold build, so a later rebuild (GPU
-//!   loss recovery, a context recreated on reload, a second renderer in a test)
-//!   never overwrites it; [`record`] admits a leg only while its slot is zero.
-//! * Zero means unset: a sub-ns leg records as 1 ns, and a leg that never ran
-//!   (the CPU fallback) reads 0, making the frontend's `startup_gpu_valid`
-//!   false.
-//! * Durations, not stamps: legs run on two threads with no shared epoch. How
-//!   much of the worker was done when the join was reached is computed on the
-//!   frontend side, where both ends share a clock.
-//!
-//! Cost: one `Instant::now()` pair and one relaxed compare-exchange per leg,
-//! about 30 per process, none on a frame path.
+//! Cost: one `Instant::now()` pair and one relaxed compare-exchange per leg, off the frame path.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -50,8 +35,8 @@ pub enum Leg {
     GpuDevice = 2,
     /// Downlevel-capability read, device-lost callback, context assembly.
     GpuContextTail = 3,
-    /// PARALLEL: system font discovery, face parse, and the ASCII prewarm, on
-    /// the font thread. Overlaps every GPU leg; not in the exclusive sum.
+    /// System font discovery, face parse and the ASCII prewarm, on the font thread. Runs in
+    /// parallel with every GPU leg; not in the exclusive sum.
     FontThread = 4,
     /// The GPU leg's wait at the font-thread join: the part of
     /// [`Leg::FontThread`] that did not fit under the GPU legs.
@@ -60,33 +45,28 @@ pub enum Leg {
     PipeShader = 6,
     /// Uniform buffer/bind-group and glyph-atlas layout + sampler.
     PipeUniformAtlas = 7,
-    /// The cell render pipelines a cold build creates (see
-    /// [`cell_pipeline_ns`]). Effect pipelines are built on first use
-    /// (`renderer::EffectPipelines`).
+    /// The cell render pipelines a cold build creates (see [`cell_pipeline_ns`]).
     PipeCell = 8,
     /// Blit shader, layouts, NEAREST sampler, invert uniform.
     PipeBlit = 9,
     /// Tray shader, layouts, LINEAR sampler, placement uniform.
     PipeTray = 10,
-    /// Bloom layouts, sampler, uniform, and the thirteenth render pipeline.
+    /// Bloom layouts, sampler, uniform and render pipeline.
     PipeBloom = 11,
     /// Static vertex/index buffer upload.
     PipeVertexBuffers = 12,
     /// `from_parts` struct assembly after the last resource is built.
     PipeTail = 13,
-    /// The whole of `from_parts` — the "pipeline construction" number. Parent
-    /// of every `Pipe*` leg above.
+    /// The whole of `from_parts`; parent of every `Pipe*` leg above.
     PipeTotal = 14,
 }
 
-/// How many slots [`LEG_NS`] carries. Kept as a `const` (not `Leg::PipeTotal as
-/// usize + 1`) so the array length is visible at its definition.
+/// How many slots [`LEG_NS`] carries (`Leg::PipeTotal as usize + 1`; a test pins it).
 pub const LEG_COUNT: usize = 15;
 
-/// Cell render pipelines `build_cell_pipelines` builds and times individually:
-/// background fill, mono glyphs and colour emoji, the only ones a default frame
-/// binds. Effect pipelines are built on demand (`renderer::EffectPipelines`);
-/// if this grows, launch is paying for effect pipelines again.
+/// Cell render pipelines `build_cell_pipelines` builds and times individually: background fill,
+/// mono glyphs and colour emoji, the only ones a default frame binds. Effect pipelines are built
+/// on demand (`renderer::EffectPipelines`); if this grows, launch pays for them again.
 pub const CELL_PIPELINE_COUNT: usize = 3;
 
 /// Names of the [`CELL_PIPELINE_COUNT`] slots, in build order. Read by the
@@ -122,9 +102,8 @@ pub(crate) fn timed<T>(leg: Leg, build: impl FnOnce() -> T) -> T {
     built
 }
 
-/// Close the cell pipeline at `index` against `since` and return the stamp the
-/// next pipeline closes against. A running split, since wrapping each
-/// descriptor literal in a closure would restate them all.
+/// Close the cell pipeline at `index` against `since` and return the stamp the next pipeline
+/// closes against (a running split, so the descriptor literals need no closures).
 #[cfg(wgpu_arm)]
 pub(crate) fn split_cell_pipeline(index: usize, since: Instant) -> Instant {
     let now = Instant::now();
@@ -139,8 +118,7 @@ pub(crate) fn split_cell_pipeline(index: usize, since: Instant) -> Instant {
     now
 }
 
-/// Read one leg. 0 means the leg never ran in this process (see the module
-/// docs' UNSET rule).
+/// Read one leg; 0 means it never ran in this process.
 pub fn leg_ns(leg: Leg) -> u64 {
     LEG_NS[leg as usize].load(Ordering::Relaxed)
 }
@@ -150,14 +128,12 @@ pub fn cell_pipeline_ns() -> [u64; CELL_PIPELINE_COUNT] {
     std::array::from_fn(|index| CELL_PIPELINE_NS[index].load(Ordering::Relaxed))
 }
 
-/// Effect pipelines this process has compiled on demand, and the wall time
-/// spent. Process-global, since a fail-soft rebuild can create a second
-/// renderer. Accumulates (unlike the legs), because an effect enabled later is
-/// worth seeing. A default launch that draws no effect reads zero.
+/// Effect pipelines this process has compiled on demand, and the wall time spent.
+/// Process-global (a fail-soft rebuild can create a second renderer), and accumulating, unlike
+/// the legs.
 static EFFECT_BUILDS: AtomicU64 = AtomicU64::new(0);
 static EFFECT_BUILD_NS: AtomicU64 = AtomicU64::new(0);
-/// Which effect slots were built, as a bitmask over
-/// `renderer::EffectPipeline as usize`, so a reading says what was paid for.
+/// Which effect slots were built, as a bitmask over `renderer::EffectPipeline as usize`.
 static EFFECT_BUILT_MASK: AtomicU64 = AtomicU64::new(0);
 
 /// Book one demand-built effect pipeline (slot `index`) into the ledger.

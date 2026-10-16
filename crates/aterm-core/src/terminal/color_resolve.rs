@@ -336,8 +336,17 @@ fn linear_to_srgb_with(tables: &TransferTables, l: f32) -> u8 {
 /// `opacity` is the fraction of the foreground retained (clamped to `0..=1`):
 /// `1.0` returns `fg` unchanged, `0.0` lands on `bg` (invisible). The blend is
 /// per-channel in linear light, so the result's WCAG relative luminance is
-/// exactly the same linear interpolation:
-/// `L(dim) = L(bg) + opacity·(L(fg) − L(bg))` (up to u8 quantization).
+/// the linear interpolation `L(dim) = L(bg) + m·(L(fg) − L(bg))` (up to u8
+/// quantization), where the mix `m` is `opacity` raised, when needed, so the
+/// faint text keeps at least `opacity` of the fg's contrast in log space:
+/// `contrast(dim, bg) >= contrast(fg, bg)^opacity` ([`faint_mix`]).
+///
+/// The floor is what makes one opacity read alike on both polarities. A
+/// luminance lerp halves light ink on a dark ground and keeps most of its
+/// contrast (16.4:1 → 8.7:1 on Aterm Night), but on a light ground it lands
+/// dark ink in the mid-greys, where the ratio collapses (14.4:1 → 1.9:1 on
+/// Aterm Day): the floor holds that to 3.8:1. It only ever raises the mix,
+/// so a dark theme's faint ink (already above its floor) is unchanged.
 ///
 /// # Invariant (proven)
 ///
@@ -357,6 +366,12 @@ pub fn dim_toward_bg(fg: Rgb, bg: Rgb, opacity: f32) -> Rgb {
     };
     // Resolve the OnceLock once per cell, not once per channel/transfer.
     let tables = transfer_tables();
+    let luminance = |c: Rgb| {
+        0.2126 * tables.to_linear[usize::from(c.r)]
+            + 0.7152 * tables.to_linear[usize::from(c.g)]
+            + 0.0722 * tables.to_linear[usize::from(c.b)]
+    };
+    let t = faint_mix(luminance(fg), luminance(bg), t);
     let mix = |f: u8, b: u8| -> u8 {
         let lf = tables.to_linear[usize::from(f)];
         let lb = tables.to_linear[usize::from(b)];
@@ -367,6 +382,35 @@ pub fn dim_toward_bg(fg: Rgb, bg: Rgb, opacity: f32) -> Rgb {
         g: mix(fg.g, bg.g),
         b: mix(fg.b, bg.b),
     }
+}
+
+/// The linear-light mix SGR 2 uses for an fg of relative luminance `lf` on
+/// a bg of `lb` at `opacity` (already in `0..=1`): `opacity`, raised to the
+/// smallest mix whose WCAG contrast reaches `contrast(fg, bg)^opacity`.
+/// Theme-independent and bounded: the result stays in `opacity..=1`, `0`
+/// stays invisible and `1` stays the fg, and since the luminance is a lerp
+/// in the mix the floor is solved exactly rather than searched.
+fn faint_mix(lf: f32, lb: f32, opacity: f32) -> f32 {
+    // Endpoints need no floor. For light ink on a darker ground, the
+    // ordinary mix already has contrast 1 + t * (full - 1) >= full.powf(t)
+    // by weighted AM-GM, so keep that common path free of per-cell powf.
+    if opacity <= 0.0 || opacity >= 1.0 || lf >= lb {
+        return opacity;
+    }
+    let (hi, lo) = (lf.max(lb), lf.min(lb));
+    let full = (hi + 0.05) / (lo + 0.05);
+    if hi - lo <= f32::EPSILON {
+        return opacity;
+    }
+    let target = full.powf(opacity);
+    // The luminance the faint ink needs to reach `target` against `lb`.
+    let needed = if lf < lb {
+        (lb + 0.05) / target - 0.05
+    } else {
+        target * (lb + 0.05) - 0.05
+    };
+    let floor = ((needed - lb) / (lf - lb)).clamp(0.0, 1.0);
+    opacity.max(floor)
 }
 
 /// Resolve raw cell colors from packed representation.
@@ -500,6 +544,148 @@ mod dim_contrast_law {
         assert!(
             dark_on_light_checked && light_on_dark_checked,
             "non-vacuity"
+        );
+    }
+
+    /// Faint ink keeps a readable share of its contrast on both polarities:
+    /// at the default opacity the floor `contrast(fg)^opacity` holds for
+    /// the light signature and Default themes (3:1 or more), where the bare
+    /// linear-light lerp (the negative control) falls to under 2:1; on a
+    /// dark theme the lerp is already above the floor, so faint ink there is
+    /// exactly the lerp.
+    #[test]
+    fn faint_keeps_its_share_of_contrast_on_light_themes() {
+        use super::faint_mix;
+        let lerp = |fg: Rgb, bg: Rgb, t: f32| {
+            let mix = |f: u8, b: u8| {
+                let (lf, lb) = (srgb_to_linear(f), srgb_to_linear(b));
+                super::linear_to_srgb(lb + (lf - lb) * t)
+            };
+            Rgb {
+                r: mix(fg.r, bg.r),
+                g: mix(fg.g, bg.g),
+                b: mix(fg.b, bg.b),
+            }
+        };
+        let t = aterm_types::DIM_FACTOR;
+        for name in ["Aterm Day", "Linen", "Default Light"] {
+            let scheme = aterm_types::scheme::builtin(name).expect("built-in");
+            let (fg, bg) = (scheme.foreground, scheme.background);
+            let faint = contrast(dim_toward_bg(fg, bg, t), bg);
+            assert!(faint >= 3.0, "{name}: faint text at {faint}:1");
+            // Quantization may round a hair under the exact floor.
+            assert!(faint >= contrast(fg, bg).powf(t) - 0.02, "{name}: {faint}");
+            assert!(faint < contrast(fg, bg), "{name}: faint still recedes");
+            assert!(
+                contrast(lerp(fg, bg, t), bg) < 2.0,
+                "{name}: control, the bare lerp is what was weak"
+            );
+        }
+        for name in ["Aterm Night", "Hearth", "Default"] {
+            let scheme = aterm_types::scheme::builtin(name).expect("built-in");
+            let (fg, bg) = (scheme.foreground, scheme.background);
+            assert_eq!(dim_toward_bg(fg, bg, t), lerp(fg, bg, t), "{name}");
+        }
+        // The ends stay put: invisible at 0, the fg at 1.
+        assert!(faint_mix(0.02, 0.9, 0.0).abs() < f32::EPSILON);
+        assert!((faint_mix(0.02, 0.9, 1.0) - 1.0).abs() < f32::EPSILON);
+    }
+
+    /// Light ink keeps the pre-floor linear-light bytes; dark ink retains
+    /// the complete contrast-floor formula. Compare actual public outputs,
+    /// including quantization, rather than merely the real-number law.
+    #[test]
+    fn faint_fast_paths_keep_their_polarity_references() {
+        let linear = |fg: Rgb, bg: Rgb, t: f32| {
+            let channel = |f: u8, b: u8| {
+                let (lf, lb) = (srgb_to_linear(f), srgb_to_linear(b));
+                super::linear_to_srgb(lb + (lf - lb) * t)
+            };
+            Rgb {
+                r: channel(fg.r, bg.r),
+                g: channel(fg.g, bg.g),
+                b: channel(fg.b, bg.b),
+            }
+        };
+        let floored = |fg: Rgb, bg: Rgb, t: f32| {
+            let (lf, lb) = (luminance(fg), luminance(bg));
+            let (hi, lo) = (lf.max(lb), lf.min(lb));
+            let mix = if hi - lo <= f32::EPSILON {
+                t
+            } else {
+                let target = ((hi + 0.05) / (lo + 0.05)).powf(t);
+                let needed = if lf < lb {
+                    (lb + 0.05) / target - 0.05
+                } else {
+                    target * (lb + 0.05) - 0.05
+                };
+                t.max(((needed - lb) / (lf - lb)).clamp(0.0, 1.0))
+            };
+            let channel = |f: u8, b: u8| {
+                let (lf, lb) = (srgb_to_linear(f), srgb_to_linear(b));
+                super::linear_to_srgb(lb + (lf - lb) * mix)
+            };
+            Rgb {
+                r: channel(fg.r, bg.r),
+                g: channel(fg.g, bg.g),
+                b: channel(fg.b, bg.b),
+            }
+        };
+        let mut colors = Vec::with_capacity(512);
+        for r in 0..8u16 {
+            for g in 0..8u16 {
+                for b in 0..8u16 {
+                    colors.push(Rgb {
+                        r: (r * 255 / 7) as u8,
+                        g: (g * 255 / 7) as u8,
+                        b: (b * 255 / 7) as u8,
+                    });
+                }
+            }
+        }
+        // The old floor's f32 cancellation could push this light-ink pair
+        // past a blue-channel quantizer boundary. It must remain the ordinary
+        // linear result, as it was before the light-theme floor was added.
+        let fg = Rgb {
+            r: 109,
+            g: 255,
+            b: 36,
+        };
+        let bg = Rgb {
+            r: 0,
+            g: 255,
+            b: 182,
+        };
+        assert!(luminance(fg) > luminance(bg));
+        assert_eq!(dim_toward_bg(fg, bg, 0.75), linear(fg, bg, 0.75));
+        let (mut light_ink, mut dark_ink) = (0, 0);
+        for &fg in &colors {
+            for &bg in &colors {
+                assert_eq!(dim_toward_bg(fg, bg, 0.0), bg);
+                assert_eq!(dim_toward_bg(fg, bg, 1.0), fg);
+                let lighter = luminance(fg) >= luminance(bg);
+                for t in [0.25, 0.5, 0.75] {
+                    let expected = if lighter {
+                        linear(fg, bg, t)
+                    } else {
+                        floored(fg, bg, t)
+                    };
+                    assert_eq!(
+                        dim_toward_bg(fg, bg, t),
+                        expected,
+                        "fg={fg:?} bg={bg:?} t={t}"
+                    );
+                }
+                if lighter {
+                    light_ink += 1;
+                } else {
+                    dark_ink += 1;
+                }
+            }
+        }
+        assert!(
+            light_ink > 100_000 && dark_ink > 100_000,
+            "non-vacuity: both full RGB lattices"
         );
     }
 

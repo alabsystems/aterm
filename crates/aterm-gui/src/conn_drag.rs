@@ -1,26 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Drag-to-connect (`docs/design/SESSION_CONNECTIONS.md` §3.1–§3.3): the pure core of
-//! the connector gesture, a state machine over `{armed, dragging, over-target}` plus
-//! the screen-space window-frame registry that cross-window resolution reads. No App,
-//! winit or AppKit here, so the press-release = menu vs press-move = drag rule, the
-//! self-drop refusal and platform scoping are unit-testable with synthetic geometry.
+//! Drag-to-connect (`docs/design/SESSION_CONNECTIONS.md` §3.1–§3.3): the pure core of the
+//! connector gesture, a state machine over `{armed, dragging, over-target}` plus the
+//! screen-space window-frame registry cross-window resolution reads. No App, winit or AppKit
+//! here, so the press-release = menu vs press-move = drag rule, the self-drop refusal and
+//! platform scoping are unit-testable with synthetic geometry. `Drop` names the pair the confirm
+//! card opens over; nothing mints here. `app_conn_drag.rs` is the App glue (arming from the
+//! strip funnel, cursor tracking, target resolution, drop-target highlights, the wire card).
 //!
-//! - This module: [`ConnDragState::track`] applies the movement threshold;
-//!   [`ConnDragState::set_over`] is the one authority that refuses an illegal target
-//!   (self-connection, fixed at arm time); [`ConnDragState::release`] yields the
-//!   outcome (menu / drop / cancel). Nothing mints here: `Drop` names the pair the
-//!   §3.3 confirm card opens over.
-//! - `app_conn_drag.rs`: App glue (arming from the strip funnel, cursor tracking,
-//!   target resolution against live windows, drop-target highlights, the wire card).
-//!
-//! Platform scope (§3.2): cross-window drag needs global coordinates. The
-//! [`FrameRegistry`] is built from winit's `inner_position`/`inner_size`; on macOS,
-//! X11 and Windows every mapped window joins, while on Wayland `inner_position` errors
-//! by protocol, so no frame joins and [`FrameRegistry::to_screen`] returns `None`. The
-//! drag is then same-window only with no cfg fork; the Connections menu and the
-//! `connect` verb stay the cross-window path there.
+//! Cross-window drag needs global coordinates. [`FrameRegistry`] is built from winit's
+//! `inner_position`/`inner_size`; on macOS, X11 and Windows every mapped window joins, while on
+//! Wayland `inner_position` errors by protocol, so no frame joins and
+//! [`FrameRegistry::to_screen`] returns `None`. The drag is then same-window only with no cfg
+//! fork; the Connections menu and the `connect` verb stay the cross-window path there.
 
 use aterm_session::SessionId;
 
@@ -36,8 +29,7 @@ pub(crate) const CONN_DRAG_THRESHOLD_PX: f64 = 6.0;
 /// the session of the pane or tab chip under the point.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) struct ConnDropTarget {
-    /// The window hosting the target — the confirm card opens HERE (§3.3:
-    /// "focus T's window first").
+    /// The window hosting the target; the confirm card opens here, focused first (§3.3).
     pub(crate) window: WindowId,
     /// Tab index in the target window carrying the drop highlight (the chip under the
     /// cursor, or the active tab for a pane hit). Presentation only; `session` is what
@@ -73,7 +65,7 @@ pub(crate) struct ConnDragState {
     /// Whether the gesture crossed the §3.1 threshold: `false` = still armed
     /// (release opens the menu), `true` = a connection drag (release drops).
     pub(crate) dragging: bool,
-    /// The legal target currently under the cursor, if any. Written ONLY by
+    /// The legal target currently under the cursor, if any. Written only by
     /// [`Self::set_over`], which refuses self-connection.
     pub(crate) over: Option<ConnDropTarget>,
     /// Screen-space frame registry snapshotted when the drag began (empty while
@@ -406,7 +398,7 @@ mod tests {
     fn missing_source_frame_scopes_the_drag_to_the_source_window() {
         let reg = FrameRegistry::default();
         assert!(reg.to_screen(WindowId(0), (10.0, 10.0)).is_none());
-        // Even with OTHER windows present (a hypothetical partial report),
+        // Even with other windows present (a hypothetical partial report),
         // a source with no frame cannot produce a screen point to locate.
         let mut partial = FrameRegistry::default();
         partial.push(WindowFrame {

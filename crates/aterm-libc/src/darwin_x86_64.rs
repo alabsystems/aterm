@@ -6,11 +6,11 @@
 //! GENERATED, and deliberately: every value below is a fact about this
 //! platform's ABI, measured for THIS TRIPLE and checked against the
 //! conformance oracle in `libc-oracle/` (see `src/lib.rs` for the method;
-//! regenerate with `libc-oracle/gen/regen.sh`). The only hand-written code
-//! in this file is the
-//! bodies of the C macros libc reimplements in Rust and the inherent
-//! siginfo_t accessors. The oracle audits their exact sets and checks
-//! their behavior against the reference libc.
+//! regenerate with `targo --unverified run -q -p aterm-libc-oracle -- regen`).
+//! The only hand-written code in this file is the bodies of the C macros
+//! libc reimplements in Rust and the inherent siginfo_t accessors. The
+//! oracle audits their exact sets and checks their behavior against the
+//! reference libc.
 
 #[allow(unused_imports)]
 use core::ffi::{

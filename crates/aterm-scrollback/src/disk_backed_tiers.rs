@@ -13,23 +13,18 @@ impl DiskBackedScrollback {
             return Ok(());
         }
 
-        // Take block_size lines from front of hot tier.
         let lines = self.hot.take_front(self.block_size);
         if lines.is_empty() {
             return Ok(());
         }
 
-        // THE IMAGE RETENTION HORIZON, counted through the same seam as the
-        // in-memory store's promotion so the two can never come to mean
-        // different things (see `crate::count_image_rows`). The disk store's
-        // horizon is the SAME boundary: compression, not the trip to disk —
-        // a picture is already gone by the time a warm block reaches the cold
-        // `.dtrm` file.
+        // The image retention horizon, counted through the same seam as the
+        // in-memory store (`crate::count_image_rows`): compression, not the
+        // trip to disk, is where a picture ends.
         self.image_rows_dropped_by_compression = self
             .image_rows_dropped_by_compression
             .saturating_add(crate::count_image_rows(&lines));
 
-        // Compress and add to warm tier.
         self.warm.push_block(&lines);
 
         // While the warm tier is over its limit, evict to cold: a batch can
@@ -49,7 +44,7 @@ impl DiskBackedScrollback {
             match block.to_cold_compressed() {
                 Ok((compressed, line_count)) => {
                     if let Err(error) = self.cold.push_compressed(&compressed, line_count) {
-                        // Cold write failed — restore block to warm to prevent data loss.
+                        // Cold write failed: restore the block to warm.
                         self.warm.push_front(block);
                         self.sync_accounting();
                         self.assert_bytes_used_invariant();
@@ -57,7 +52,7 @@ impl DiskBackedScrollback {
                     }
                 }
                 Err(error) => {
-                    // Re-compression failed — restore block to warm to prevent data loss.
+                    // Re-compression failed: restore the block to warm.
                     aterm_log::warn!(
                         "evict_warm_to_cold: re-compression failed ({error}), restoring block to warm tier"
                     );

@@ -14,6 +14,10 @@
 //! gone); the deadlines are ceilings for a broken build, never what a pass waits on.
 
 #![cfg(unix)]
+#![allow(
+    clippy::disallowed_types,
+    reason = "test code: a stand-in child may inherit descriptors"
+)]
 
 use crate::{child_output, launch_isolation};
 
@@ -238,13 +242,12 @@ fn a_held_lifeline_keeps_the_instance_and_a_cut_one_ends_it_cleanly() {
     );
 }
 
-/// THE GAP'S OWN SHAPE: the launcher is a bash script (as
-/// `tools/visual-judge/capture.sh` is) holding the lifeline's FIFO, and it is
-/// SIGKILLed — no trap, no cleanup, no `Drop`. Its instance goes anyway, because
-/// the kernel closes a dead process's descriptors and that is the end-of-file the
-/// instance waits for.
+/// THE GAP'S OWN SHAPE: the launcher is a bash script holding the lifeline's
+/// FIFO, and it is SIGKILLed — no trap, no cleanup, no `Drop`. Its instance goes
+/// anyway, because the kernel closes a dead process's descriptors and that is the
+/// end-of-file the instance waits for.
 ///
-/// The launch is the form capture.sh first had, `( exec prog <fifo 9>&- )`, on
+/// The launch is `( exec prog <fifo 9>&- )` on
 /// purpose: bash 3.2 (macOS's `/bin/bash`) leaks a copy of fd 9 into `prog` at fd
 /// 11 there (measured 2026-09-26), and an instance holding its own launcher's end
 /// never read end-of-file. It passes only because the instance closes inherited

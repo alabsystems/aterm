@@ -1,34 +1,21 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Offset-based page storage with memory pooling.
+//! Page storage: 64 KB pages that [`PageStore`] bump-allocates typed
+//! [`PageSlice`]s from, with a free list of recycled pages
+//! ([`PageStore::preheat`] fills it ahead of use).
 //!
-//! Pages use offsets instead of pointers, enabling:
-//! - Direct serialization to disk
-//! - Memory-mapping without fixup
-//! - Network transmission for sync
-//!
-//! ## Memory Pooling
-//!
-//! [`PageStore`] keeps a free list of recycled pages; new allocations take
-//! from it before allocating fresh memory. [`PageStore::preheat`]
-//! pre-allocates pages during initialization.
-//!
-//! ## API Safety
-//!
-//! [`Page`] is crate-internal: external code cannot construct or hold raw
-//! pages. [`PageSlice`] is reachable for downstream test scaffolding via
-//! `feature = "testing"` but is not re-exported at the crate root or through
-//! the `aterm-core` facade. Production consumers use [`Row`] and
-//! [`PageStore`] as their safe API boundary.
-//!
+//! [`Page`] is crate-internal. [`PageSlice`] is reachable for downstream test
+//! scaffolding under `debug_assertions` but is not re-exported at the crate
+//! root or through the `aterm-core` facade; production consumers use
+//! [`Row`](crate::Row) and [`PageStore`].
 #![allow(
     clippy::large_stack_arrays,
     reason = "64KB page buffers are intentional for memory-mapped scrollback"
 )]
 
 use std::cell::UnsafeCell;
-#[cfg(any(test, feature = "testing"))]
+#[cfg(any(test, debug_assertions))]
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
@@ -36,35 +23,22 @@ use std::ptr::NonNull;
 /// Page size: 64 KB.
 pub const PAGE_SIZE: usize = 64 * 1024;
 
-/// A page of terminal data.
-///
-/// All data is stored contiguously with offset-based references.
-/// Uses `UnsafeCell` for interior mutability to satisfy Stacked Borrows -
-/// arena-allocated data may be accessed through multiple independent borrows.
-///
-/// Crate-internal: external code cannot construct `Page` values.
+/// A 64 KB page of terminal data that [`PageStore`] bump-allocates slices from.
 #[repr(C, align(4096))]
 pub(crate) struct Page {
-    /// Raw page data wrapped in UnsafeCell for interior mutability.
-    /// This allows arena-style allocation where pointers derived from this data
-    /// remain valid even when other parts of the PageStore are accessed.
+    /// `UnsafeCell` so pointers derived from the data stay valid while other
+    /// parts of the `PageStore` are accessed.
     data: UnsafeCell<[u8; PAGE_SIZE]>,
 }
 
-// SAFETY: `Page` is `Send` because its only field (`UnsafeCell<[u8; PAGE_SIZE]>`)
-// contains plain byte data with no thread-affine resources (no `Rc`, no thread-local
-// refs, no raw OS handles). Ownership transfer between threads is safe because the
-// `PageStore` allocator guarantees that at most one `PageSlice` references any byte
-// range at a time — allocation returns disjoint slices and the free-list reclaims
-// entire pages only after all slices are dropped.
+// SAFETY: `Page` is `Send`: its only field is plain bytes with no thread-affine
+// resources, and `PageStore` hands each byte range to at most one `PageSlice`.
 unsafe impl Send for Page {}
 
-// SAFETY: `Page` is `Sync` because shared `&Page` access is mediated exclusively
-// through `PageSlice`, which enforces Rust's borrowing rules: `as_slice()` requires
-// `&self` (shared) and `as_mut_slice()` requires `&mut self` (exclusive). The
-// `UnsafeCell` interior mutability is only exercised during allocation
-// (`PageStore::alloc_page` zeroes data under `&mut` borrow), never through shared
-// references. No concurrent mutation of the same byte range is possible.
+// SAFETY: `Page` is `Sync`: its bytes are reached only through `PageSlice`s over
+// disjoint ranges (`as_slice` under `&self`, `as_mut_slice` under `&mut self`),
+// `alloc_page`'s zeroing under `&mut PageStore`, and test code's raw `data_ptr`
+// accesses, whose callers guarantee exclusivity; no byte range is mutated concurrently.
 unsafe impl Sync for Page {}
 
 fn _assert_send<T: Send>() {}
@@ -106,11 +80,8 @@ impl Default for Page {
     }
 }
 
-/// An offset into a page.
-///
-/// This is NOT a pointer - it's an index that remains valid
-/// after the page is copied, serialized, or memory-mapped.
-#[cfg(any(test, feature = "testing"))]
+/// A byte offset into a page (test scaffolding): an index, not a pointer.
+#[cfg(any(test, debug_assertions))]
 #[derive(Debug, PartialEq, Eq)]
 #[repr(transparent)]
 pub struct Offset<T> {
@@ -120,25 +91,19 @@ pub struct Offset<T> {
     _marker: PhantomData<T>,
 }
 
-// Manual Copy/Clone impl because derive requires T: Copy, but PhantomData<T> is always Copy
-#[cfg(any(test, feature = "testing"))]
+// Manual Copy/Clone: derive would require `T: Copy`.
+#[cfg(any(test, debug_assertions))]
 impl<T> Copy for Offset<T> {}
-#[cfg(any(test, feature = "testing"))]
+#[cfg(any(test, debug_assertions))]
 impl<T> Clone for Offset<T> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-#[cfg(any(test, feature = "testing"))]
+#[cfg(any(test, debug_assertions))]
 impl<T> Offset<T> {
-    /// Create a new offset.
-    ///
-    /// # Safety
-    ///
-    /// The offset must be:
-    /// - Less than PAGE_SIZE
-    /// - Properly aligned for T
+    /// Create an offset.
     #[must_use]
     pub const fn new(byte_offset: u32) -> Self {
         Self {
@@ -153,66 +118,13 @@ impl<T> Offset<T> {
     pub const fn byte_offset(self) -> u32 {
         self.byte_offset
     }
-
-    /// Resolve the offset to a reference.
-    ///
-    /// Returns `None` if the offset is out of bounds or misaligned.
-    ///
-    /// # Safety
-    ///
-    /// - The page must contain valid, initialized data at this offset
-    /// - The type `T` at the offset must have been properly constructed
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) unsafe fn get<'a>(&self, page: &'a Page) -> Option<&'a T> {
-        let offset = self.byte_offset as usize;
-        let align = std::mem::align_of::<T>();
-        let size = std::mem::size_of::<T>();
-
-        // Runtime bounds and alignment check
-        if offset >= PAGE_SIZE || !offset.is_multiple_of(align) || offset + size > PAGE_SIZE {
-            return None;
-        }
-
-        // SAFETY: Caller guarantees valid data at offset; we verified bounds/alignment.
-        // Use data_ptr() to go through UnsafeCell for Stacked Borrows compliance.
-        Some(unsafe { &*page.data_ptr().add(offset).cast::<T>() })
-    }
-
-    /// Resolve the offset to a mutable reference.
-    ///
-    /// Returns `None` if the offset is out of bounds or misaligned.
-    ///
-    /// # Safety
-    ///
-    /// Same as `get`, plus exclusive access to the memory at this offset.
-    #[cfg(test)]
-    #[must_use]
-    #[allow(
-        clippy::mut_from_ref,
-        reason = "unsafe test helper: caller ensures exclusive page access"
-    )]
-    pub(crate) unsafe fn get_mut<'a>(&self, page: &'a Page) -> Option<&'a mut T> {
-        let offset = self.byte_offset as usize;
-        let align = std::mem::align_of::<T>();
-        let size = std::mem::size_of::<T>();
-
-        if offset >= PAGE_SIZE || !offset.is_multiple_of(align) || offset + size > PAGE_SIZE {
-            return None;
-        }
-
-        // SAFETY: Caller guarantees valid data at offset and exclusive access;
-        // we verified bounds/alignment above. Uses data_ptr() for Stacked Borrows compliance.
-        Some(unsafe { &mut *page.data_ptr().add(offset).cast::<T>() })
-    }
 }
 
 /// Logical page identifier.
 pub type PageId = usize;
 
-/// A typed slice allocated within a page.
-///
-/// Crate-internal: production consumers use [`Row`] as their safe boundary.
+/// A typed slice allocated within a page. Production consumers use
+/// [`Row`](crate::Row) as their safe boundary.
 #[derive(Debug)]
 pub struct PageSlice<T> {
     ptr: NonNull<T>,
@@ -276,29 +188,21 @@ impl<T> DerefMut for PageSlice<T> {
     }
 }
 
-// SAFETY: `PageSlice<T>` is `Send` when `T: Send` because:
-// 1. The `NonNull<T>` pointer targets memory owned by a `Page` (which is `Send`).
-// 2. `PageSlice` logically owns the [T] range — `PageStore::alloc_slice` returns
-//    a unique, non-overlapping slice per allocation. No aliasing across slices.
-// 3. The remaining fields (`len: u16`, `page_id: PageId`) are trivially `Send`.
-// Transferring a `PageSlice` to another thread transfers ownership of the [T] range,
-// which is safe because the backing `Page` outlives all its slices (pages are freed
-// only after all `PageSlice` references via `Offset` are dropped or the `PageStore`
-// itself is dropped).
+// SAFETY: `PageSlice<T>` is `Send` when `T: Send`: it uniquely owns its `[T]` range
+// (`PageStore::alloc_slice` hands out disjoint ranges) inside a `Page`, which is `Send`
+// and outlives its slices (`Row::new`'s contract). Moving it moves that ownership; `len`
+// and `page_id` are plain data.
 unsafe impl<T: Send> Send for PageSlice<T> {}
 
-// SAFETY: `PageSlice<T>` is `Sync` when `T: Sync` because shared access (`&PageSlice<T>`)
-// delegates to `as_slice() -> &[T]`, which returns an immutable reference. The
-// `from_raw_parts` call in `as_slice()` produces a `&[T]` valid for the slice lifetime,
-// and `&[T]` is `Sync` when `T: Sync`. Mutable access (`as_mut_slice`) requires
-// `&mut PageSlice<T>`, which Rust's borrow checker guarantees is exclusive.
+// SAFETY: `PageSlice<T>` is `Sync` when `T: Sync`: shared access only yields `&[T]`
+// (`as_slice`), and `as_mut_slice` needs `&mut PageSlice<T>`, which the borrow checker
+// keeps exclusive.
 unsafe impl<T: Sync> Sync for PageSlice<T> {}
 
 #[path = "page_store.rs"]
 mod page_store;
 pub use page_store::PageStore;
 
-// Tests are in a separate file for better organization
 #[cfg(test)]
 #[path = "page_tests/mod.rs"]
 mod tests;

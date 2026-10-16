@@ -28,7 +28,7 @@ impl Grid {
     /// use [`Grid::with_tiered_scrollback`].
     #[must_use]
     pub fn with_scrollback(rows: u16, cols: u16, max_scrollback: usize) -> Self {
-        // Ingress clamp (§5.8): bound the allocation a hostile caller can request.
+        // Ingress clamp: bound the allocation a hostile caller can request.
         let rows = rows.clamp(1, MAX_GRID_ROWS);
         let cols = cols.clamp(1, MAX_GRID_COLS);
 
@@ -77,7 +77,7 @@ impl Grid {
                 resize_undo: None,
                 generations: GenerationTracker::new(),
                 absolute_row_counter: u64::from(rows),
-                // Init NONZERO so `0` is a usable "never observed" sentinel (P1.0).
+                // Nonzero, so `0` is a usable "never observed" sentinel.
                 content_gen: 1,
                 reader_live_bottom_gen: 0,
                 wrap_serial: 0,
@@ -129,14 +129,13 @@ impl Grid {
         ring_buffer_size: usize,
         scrollback: impl Into<ScrollbackStorage>,
     ) -> Self {
-        // Ingress clamp (§5.8): bound the allocation a hostile caller can request.
+        // Ingress clamp: bound the allocation a hostile caller can request.
         let rows = rows.clamp(1, MAX_GRID_ROWS);
         let cols = cols.clamp(1, MAX_GRID_COLS);
         let scrollback: ScrollbackStorage = scrollback.into();
         let carried = u64::try_from(scrollback.line_count()).unwrap_or(u64::MAX);
 
-        // Pre-heat pages based on initial grid size. Only enough pages for the
-        // visible rows are preheated; extra pages allocate lazily on first need.
+        // Preheat only enough pages for the visible rows.
         let bytes_per_row = (cols as usize) * std::mem::size_of::<Cell>();
         let initial_bytes = (rows as usize) * bytes_per_row;
         let pages_needed = (initial_bytes / PAGE_SIZE).max(1);
@@ -179,7 +178,7 @@ impl Grid {
                 resize_undo: None,
                 generations: GenerationTracker::new(),
                 absolute_row_counter: u64::from(rows).saturating_add(carried),
-                // Init NONZERO so `0` is a usable "never observed" sentinel (P1.0).
+                // Nonzero, so `0` is a usable "never observed" sentinel.
                 content_gen: 1,
                 reader_live_bottom_gen: 0,
                 wrap_serial: 0,

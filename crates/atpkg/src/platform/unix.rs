@@ -11,7 +11,6 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use aterm_types::fs_restricted::dir_safe_for_private_write;
 
@@ -67,6 +66,92 @@ pub fn kill_process_group(leader: u32) {
             libc::killpg(pgid, libc::SIGKILL);
         }
     }
+}
+
+/// The kernel's start-time stamp for `pid` ([`crate::platform::Birth`]), used with the pid
+/// to detect reuse within the current boot:
+/// `proc_pidinfo(PROC_PIDTBSDINFO)`'s `pbi_start_tvsec/usec` in microseconds on macOS,
+/// `/proc/<pid>/stat`'s `starttime` (clock ticks since boot) on Linux, the reading
+/// `aterm_pty::process_birth` makes, which this crate's shipped graph does not link.
+/// [`Birth::Gone`](crate::platform::Birth::Gone) for no such process or a zombie (libproc
+/// refuses one with `ESRCH`); [`Birth::Unreadable`](crate::platform::Birth::Unreadable) when
+/// the kernel would not say — a sandbox denying process-info (`EPERM`, while `kill(pid, 0)`
+/// still answers), another account's process, a record about another pid, another Unix.
+#[must_use]
+pub fn process_birth(pid: u32) -> crate::platform::Birth {
+    match libc::pid_t::try_from(pid).ok().filter(|p| *p > 0) {
+        Some(pid) => process_birth_platform(pid),
+        None => crate::platform::Birth::Gone,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn process_birth_platform(pid: libc::pid_t) -> crate::platform::Birth {
+    use crate::platform::Birth;
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+    let Ok(size) = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>()) else {
+        return Birth::Unreadable;
+    };
+    // SAFETY: `info` points at `size` writable bytes of exactly the structure
+    // PROC_PIDTBSDINFO fills; libproc returns the number of bytes it wrote.
+    let read = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if read != size {
+        // Read at once, before anything else can move errno.
+        return if io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+            Birth::Gone
+        } else {
+            Birth::Unreadable
+        };
+    }
+    // SAFETY: the exact-size success above initialized the whole record.
+    let info = unsafe { info.assume_init() };
+    if u32::try_from(pid).ok() != Some(info.pbi_pid) {
+        return Birth::Unreadable;
+    }
+    if info.pbi_status == libc::SZOMB {
+        return Birth::Gone;
+    }
+    info.pbi_start_tvsec
+        .checked_mul(1_000_000)
+        .and_then(|us| us.checked_add(info.pbi_start_tvusec))
+        .map_or(Birth::Unreadable, Birth::At)
+}
+
+#[cfg(target_os = "linux")]
+fn process_birth_platform(pid: libc::pid_t) -> crate::platform::Birth {
+    use crate::platform::Birth;
+    let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Birth::Gone,
+        Err(_) => return Birth::Unreadable,
+    };
+    // `comm` (field 2) is parenthesised and may hold spaces or `)`: the fields proper start
+    // after the LAST `)`, field 3 (`state`) first and field 22 (`starttime`) twentieth.
+    let Some(close) = stat.rfind(')') else {
+        return Birth::Unreadable;
+    };
+    let mut fields = stat[close + 1..].split_ascii_whitespace();
+    match fields.next() {
+        Some("Z") => Birth::Gone,
+        Some(_) => fields
+            .nth(18)
+            .and_then(|t| t.parse().ok())
+            .map_or(Birth::Unreadable, Birth::At),
+        None => Birth::Unreadable,
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn process_birth_platform(_pid: libc::pid_t) -> crate::platform::Birth {
+    crate::platform::Birth::Unreadable
 }
 
 /// This ACCOUNT's home directory, as the OS knows it — `getpwuid(getuid())->pw_dir` —
@@ -239,7 +324,7 @@ pub fn spotlight_query(scope: &Path, filename: &str) -> Option<bool> {
 /// ```text
 /// mdutil -s /System/Volumes/Data        -> Indexing enabled.
 /// mdutil -s /Users                      -> Indexing enabled.
-/// mdutil -s /Users//example/aterm         -> Error: unknown indexing state.
+/// mdutil -s /Users//user/proj            -> Error: unknown indexing state.
 /// ```
 ///
 /// The mount point comes from `statfs(2)`'s `f_mntonname` rather than from walking up by
@@ -856,7 +941,11 @@ pub fn shim_env_of(shim: &Path) -> crate::shim_env::ShimEnv {
 }
 
 /// Replace the current process image with `command` (`execve`); returns only on failure.
-pub fn exec_or_run(command: &mut Command) -> io::Error {
+#[expect(
+    clippy::disallowed_types,
+    reason = "the pass-throughs' exec: the caller's descriptors are the program's"
+)]
+pub fn exec_or_run(command: &mut std::process::Command) -> io::Error {
     use std::os::unix::process::CommandExt as _;
     // `exec` replaces this process and never returns on success; the returned value is
     // the error that PREVENTED the exec.
@@ -937,6 +1026,10 @@ extern "C" fn forward_to_child(sig: libc::c_int) {
             libc::kill(pid, sig);
         } else {
             libc::signal(sig, libc::SIG_DFL);
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "re-raises SIGTERM or SIGHUP (the two it forwards) with the default action: neither dumps core"
+            )]
             libc::raise(sig);
         }
     }
@@ -966,6 +1059,10 @@ pub fn exit_code_like(status: std::process::ExitStatus) -> std::process::ExitCod
         // delivers it to this thread before it returns.
         unsafe {
             libc::signal(sig, libc::SIG_DFL);
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "re-raises SIGINT, SIGTERM, SIGHUP or SIGPIPE: none dumps core"
+            )]
             libc::raise(sig);
         }
     }
@@ -1018,8 +1115,8 @@ mod tests {
     /// Why `mdutil` reports no index state for the volume at `mount` — its own words —
     /// or `None` when it does ("Indexing enabled." / "Indexing disabled."). Read on both
     /// streams under a one-minute hang detector: with the Spotlight server off it answers
-    /// "Spotlight server is disabled." in ~10 s, and the gate's environment can answer
-    /// differently from a login shell.
+    /// "Spotlight server is disabled." in ~10 s, and a test runner's environment can
+    /// answer differently from a login shell.
     fn mount_index_state_unreadable(mount: &Path) -> Option<String> {
         let Ok(mut child) = std::process::Command::new("/usr/bin/mdutil")
             .arg("-s")

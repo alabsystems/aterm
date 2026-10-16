@@ -2,15 +2,15 @@
 // Copyright 2026 Andrew Yates
 
 //! The wire grammars: the `messages` read query and its row, the
-//! byte-identical `appstatus` compatibility face, and the `notice` verb —
-//! `post`, `progress`, `done`, `ask`, `dismiss`, `act` — with its verdicts, caps,
-//! budgets, key namespace and paint pacing (design rulings 163–198). The
-//! percent-encoder is INJECTED (`aterm_control::wire::pct_encode` in the
-//! host) — the grammar lives beside the state, the bytes stay the host's,
-//! and no second encoder can drift. The host parses on its control thread
-//! ([`NoticeRequest::parse`]), wakes its main thread, calls [`apply`] (or,
-//! for `act`, [`press_target`] and its own press) and paints by the returned
-//! [`Paint`]: every word of the reply is decided here.
+//! byte-identical `appstatus` compatibility face, and the `notice` verb
+//! (`post`, `progress`, `done`, `ask`, `dismiss`, `act`) with its verdicts,
+//! caps, budgets, key namespace and paint pacing. The percent-encoder is
+//! injected (`aterm_control::wire::pct_encode` in the host): the grammar lives
+//! beside the state, the bytes stay the host's, and no second encoder can
+//! drift. The host parses on its control thread ([`NoticeRequest::parse`]),
+//! wakes its main thread, calls [`apply`] (or, for `act`, [`press_target`] and
+//! its own press) and paints by the returned [`Paint`]: every word of the
+//! reply is decided here.
 
 use std::collections::VecDeque;
 
@@ -73,14 +73,12 @@ impl ReadQuery {
     }
 
     /// The records the query selects, ascending by id. Without `since=` the
-    /// page is the NEWEST ones (the tail of the log); with it, the OLDEST
-    /// ones above the id, so a reader paging with the last id it saw never
-    /// skips a record, however many arrived between two reads (design
-    /// ruling 198 — the `exits since=` idiom). BY ID, not by the ring's order:
-    /// a record a replay loaded under a fresh id (a collision, ruling 270) or
-    /// one moved off a carried number keeps its place in the ring under a
-    /// higher id, and a page cut in ring order would skip the records between
-    /// (ruling 415 (e)).
+    /// page is the newest ones (the tail of the log); with it, the oldest ones
+    /// above the id, so a reader paging with the last id it saw never skips a
+    /// record (the `exits since=` idiom). By id, not by the ring's order: a
+    /// record a replay loaded under a fresh id, or one moved off a carried
+    /// number, keeps its place in the ring under a higher id, and a page cut in
+    /// ring order would skip the records between.
     #[must_use]
     pub(crate) fn select<'a>(&self, log: &'a MessageLog) -> Vec<&'a LogRecord> {
         let mut picked: Vec<&LogRecord> = log
@@ -115,8 +113,7 @@ pub fn parse_read_args(rest: &str) -> Result<ReadQuery, &'static str> {
         if word == "live" {
             q.live_only = true;
         } else if let Some(n) = digits::<usize>(word) {
-            // Plain digits, as everywhere on the wire (design ruling 182):
-            // `+5` is a usage error, not five (ruling 415 (p)).
+            // Plain digits, as everywhere on the wire: `+5` is a usage error.
             if n == 0 {
                 return Err(READ_USAGE);
             }
@@ -137,7 +134,7 @@ pub fn parse_read_args(rest: &str) -> Result<ReadQuery, &'static str> {
 }
 
 /// The `appstatus` progress field for a fill: `<n>/100` rounded to the
-/// nearest percent (`status_bars.rs:975`), `-` for none.
+/// nearest percent, `-` for none.
 fn progress_word(fill: Option<u16>) -> String {
     fill.map_or_else(
         || "-".to_string(),
@@ -145,11 +142,10 @@ fn progress_word(fill: Option<u16>) -> String {
     )
 }
 
-/// The `state=` word of a record: `held` / `live` while unretired (a held
-/// row folds on its hold; a live one stays until its reporter is done), else
-/// how it retired ([`crate::log::Retired::as_word`]). ONE table — the `messages` row
-/// and Settings ▸ Messages both read it, so the screen and the wire can
-/// never disagree about what a row is doing.
+/// The `state=` word of a record: `held` / `live` while unretired (a held row
+/// folds on its hold; a live one stays until its reporter is done), else how
+/// it retired ([`crate::log::Retired::as_word`]). The `messages` row and
+/// Settings ▸ Messages both read this one table, so they never disagree.
 #[must_use]
 pub fn state_word(rec: &LogRecord, live: Option<&Live>) -> &'static str {
     match (live, rec.retired()) {
@@ -171,20 +167,17 @@ pub fn state_word(rec: &LogRecord, live: Option<&Live>) -> &'static str {
 /// `message <id> at=<unix_ms> ago_ms=<ms> tag=<tag> sev=<sev>
 /// origin=<host|wire|carried> state=<…> glass=<row|-> rep=<n> key=<pct|->
 /// title=<pct> detail=<pct> actions=<pct|-> [progress=<n>/100|level=<n>/100|busy=1]
-/// [load=<network|disk|cpu|memory>] [since_ms=<ms>]`. `at=` is the wall
-/// clock at ingress; `ago_ms=` and `since_ms=` are both read off the ONE
-/// `now_unix_ms` of the reply — the ingress stamp and the retirement's wall
-/// time (the wall at posting — the seed's, for a carried row — plus the
-/// row's monotonic life, [`Live::wall_at`], ruling 204) — so
-/// `since_ms <= ago_ms` always (design ruling 201); `since_ms=` is present
-/// only for rows retired in this process; `detail=` is the lines joined by `\n` before
-/// encoding; `actions=` the FULL capsule labels joined by `,`. A live row
-/// with a fill says `progress=` (a measured level, the strain row, says
-/// `level=` instead), a busy one `busy=1`, and `load=` only while
-/// the row SAYS its load words on the glass — the band's own rule, so the
-/// work's own primary load only while other work is `slowing` (ruling 246;
-/// [`Live::said_load`], ruling 441 (b)); no ETA, elapsed or frame state ever
-/// reaches the line — motion is the glass's (design ruling 175).
+/// [load=<network|disk|cpu|memory>] [since_ms=<ms>] [need=<class>]`. `at=` is
+/// the wall clock at ingress; `ago_ms=` and `since_ms=` are both read off the one
+/// `now_unix_ms` of the reply (the retirement's wall time is the posting wall
+/// plus the row's monotonic life, [`Live::wall_at`]), so `since_ms <= ago_ms`
+/// always; `since_ms=` is present only for rows retired in this process.
+/// `detail=` is the lines joined by `\n` before encoding; `actions=` the full
+/// capsule labels joined by `,`. A live row with a fill says `progress=` (a
+/// measured level, the strain row, says `level=`), a busy one `busy=1`, and
+/// `load=` only while the row says its load words on the glass
+/// ([`Live::said_load`]). No ETA, elapsed or frame state reaches the line:
+/// motion is the glass's.
 #[must_use]
 pub(crate) fn message_row(
     rec: &LogRecord,
@@ -199,9 +192,8 @@ pub(crate) fn message_row(
         Some(l) => (&l.msg.title, &l.msg.detail, &l.msg.actions, l.repeats),
         None => (&rec.title, &rec.detail, &rec.actions, rec.repeats),
     };
-    // A retired record offers no intent whose moment passed (ruling 265, the
-    // page's rule; ruling 267 for the wire): `Stop paste` on a paste that
-    // finished is not an action anyone can take.
+    // A retired record offers no intent whose moment passed: `Stop paste` on
+    // a paste that finished is not an action anyone can take.
     let labels: Vec<&str> = actions
         .iter()
         .filter(|intent| live.is_some() || rec.still_offers(intent))
@@ -233,14 +225,13 @@ pub(crate) fn message_row(
             .filter(|m| m.level)
             .and_then(|m| m.fill_permille)
         {
-            // A measured level is not progress (design ruling 208).
+            // A measured level is not progress.
             row.push_str(" level=");
             row.push_str(&progress_word(Some(fill)));
         } else if let Some(fill) = l.msg.meter.as_ref().and_then(|m| m.fill_permille) {
-            // The percent the band paints, floored (ruling 265): `11/40` is
-            // `27%` on the glass and `progress=27/100` here — never a
-            // rounded 28 beside it. `appstatus` keeps its nearest percent,
-            // the status bars' byte-identical grammar.
+            // The percent the band paints, floored: `11/40` is `27%` on the
+            // glass and `progress=27/100` here, never a rounded 28 beside it.
+            // `appstatus` keeps its nearest percent, the bars' grammar.
             row.push_str(" progress=");
             row.push_str(&(fill.min(1000) / 10).to_string());
             row.push_str("/100");
@@ -261,10 +252,9 @@ pub(crate) fn message_row(
                 .to_string(),
         );
     }
-    // The message's CLASS, when it has one ([`crate::need`]): a live typed
+    // The message's class, when it has one ([`crate::need`]): a live typed
     // row says `now`, `working` or `notice`; an exception, open or filed,
-    // says `later`. An unclassified row says nothing (the word would be on
-    // every row until the reporters are classified).
+    // says `later`. An unclassified row says nothing.
     let class = match live {
         // A row adopted from an older parent (or lent to a fixture) has no
         // class of its own to report.
@@ -298,7 +288,7 @@ pub fn message_rows(
         .into_iter()
         .map(|rec| {
             let live = center.live(rec.id);
-            // An open exception reads its CURRENT words (a restatement is
+            // An open exception reads its current words (a restatement is
             // never logged, so the record holds the words it was posted with).
             if live.is_none()
                 && rec.later
@@ -318,20 +308,17 @@ pub fn message_rows(
         .collect()
 }
 
-/// The `appstatus` body in the bars' byte-identical GRAMMAR
-/// (status_bars.rs:971-999 — field order, keys, percent-encoding, the phase
-/// and outcome words; a `phase=live` line carries the row's CURRENT words,
-/// design ruling 116): one
-/// `activity kind=<toolchain|update|harness> phase=live …` per unretired
-/// message with those tags — **toolchain-tagged rows first, then
-/// update-tagged, then harness-tagged, each `posted_at` ascending, whatever
-/// the glass order** (a harness note is a record, so it is only ever
-/// `phase=done`; design rulings 61 and 147) — then one
-/// `phase=done … outcome=<ok|warn> since_ms=<ms>` per record those tags
-/// retired IN THIS PROCESS (a superseded row is not a finished outcome,
-/// and neither is a withdrawn one — the bars dropped a meter whose file
-/// vanished without a ledger row), oldest first. `outcome=warn` ⇔ severity
-/// Warn/Error.
+/// The `appstatus` body in the retired status bars' byte-identical grammar
+/// (field order, keys, percent-encoding, the phase and outcome words; a
+/// `phase=live` line carries the row's current words): one `activity
+/// kind=<toolchain|update|harness> phase=live …` per unretired message with
+/// those tags, toolchain rows first, then update, then harness, each
+/// `posted_at` ascending whatever the glass order (a harness note is a
+/// record, so it is only ever `phase=done`); then one `phase=done …
+/// outcome=<ok|warn> since_ms=<ms>` per record those tags retired in this
+/// process, oldest first. A superseded or withdrawn row is not a finished
+/// outcome (the bars dropped a meter whose file vanished). `outcome=warn` ⇔
+/// severity Warn/Error.
 #[must_use]
 pub fn activity_rows_compat(
     center: &MessageCenter,
@@ -389,7 +376,7 @@ pub fn activity_rows_compat(
 }
 
 // ---------------------------------------------------------------------------
-// `notice` — the outside world's voice on the band (design rulings 163–198).
+// `notice`: the outside world's voice on the band.
 // ---------------------------------------------------------------------------
 
 /// The `notice` verb's usage line: a missing or unknown sub-form.
@@ -405,20 +392,20 @@ pub(crate) const ASK_USAGE: &str =
 pub(crate) const DISMISS_USAGE: &str = "usage: notice dismiss <id|review>";
 /// The `notice act` usage line.
 pub(crate) const ACT_USAGE: &str = "usage: notice act <id> <label|index|details>";
-/// A key outside the wire's rule (design ruling 167).
+/// A key outside the wire's rule.
 pub(crate) const KEY_REFUSAL: &str =
     "notice: keys are 1-40 of a-z 0-9 . _ - (they live as wire.<key>)";
-/// A tag of aterm's own families (design rulings 171 and 433).
+/// A tag of aterm's own families.
 pub(crate) const OWN_TAG_REFUSAL: &str =
     "notice: that tag is aterm's own; post under script or a tag of your own";
-/// [`apply`] handed an `act`: a press is the HOST's to perform
+/// [`apply`] handed an `act`: a press is the host's to perform
 /// ([`press_target`], then its own press path).
 pub(crate) const ACT_IS_THE_HOSTS: &str = "ERR notice: act is pressed by the host";
 
 /// Whether `notice` refuses `tag`: every family aterm reports under
 /// ([`tags::ALL`]) but `script`, the scripts' own. A script's `crash` or
 /// `session` row would otherwise count, filter and read as aterm's on the
-/// page, which cannot tell the two apart (design rulings 171, 390 and 433).
+/// page, which cannot tell the two apart.
 fn aterms_own(tag: &Tag) -> bool {
     *tag != tags::SCRIPT && tags::ALL.contains(&tag)
 }
@@ -426,7 +413,7 @@ fn aterms_own(tag: &Tag) -> bool {
 /// The refusal for a glass title fault: `notice: <fault>`, one static string
 /// per fault [`glass_title_fault`] names, in the script author's words: what
 /// is wrong with the title and where the rest goes (` -- `), never the band's
-/// internal name (design ruling 213).
+/// internal name.
 fn title_refusal(fault: &'static str, tail: bool) -> &'static str {
     match (fault, tail) {
         ("a glass title over six words", true) => {
@@ -495,9 +482,9 @@ fn wire_id(s: &str) -> Option<MessageId> {
 }
 
 /// `<title>[ -- <tail>]`, both trimmed; a line that opens with `--` has no
-/// title, and one that ENDS with its separator has no tail — `Deploy failed
-/// -- ` (a script's `"$TITLE -- $DETAIL"` with nothing in `$DETAIL`) is the
-/// title `Deploy failed`, never `Deploy failed --` (ruling 415 (o)).
+/// title, and one that ends with its separator has no tail: `Deploy failed -- `
+/// (a script's `"$TITLE -- $DETAIL"` with nothing in `$DETAIL`) is the title
+/// `Deploy failed`.
 fn split_title(rest: &str) -> (&str, &str) {
     let rest = rest.trim_start();
     if rest.trim_end() == "--" {
@@ -513,11 +500,10 @@ fn split_title(rest: &str) -> (&str, &str) {
     (title.trim(), tail.trim())
 }
 
-/// A wire title, detail line, stats or `done`'s words: STRIPPED, then
-/// trimmed, then capped. The strip runs first, so an invisible character
-/// after a space never keeps the space, and a trailing period before it,
-/// out of the title form's sight (rulings 164, 196; ruling 415
-/// (m)): `Build failed. ` + U+2060 is `Build failed.`, refused.
+/// A wire title, detail line, stats or `done`'s words: stripped, then trimmed,
+/// then capped. The strip runs first, so an invisible character after a space
+/// never keeps the space, nor a trailing period before it, out of the title
+/// form's sight: `Build failed. ` + U+2060 is `Build failed.`, refused.
 fn clip_words(s: &str, cap: usize) -> String {
     clip(clip(s, usize::MAX).trim(), cap)
 }
@@ -543,16 +529,16 @@ fn options(
 /// `notice post <tag> [sev=<sev>] [key=<key>] [hold=<1..120>] <title>[ -- <detail>]`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PostRequest {
-    /// `script` or any tag of the script's own (design ruling 433).
+    /// `script` or any tag of the script's own.
     pub tag: Tag,
     /// Defaults to `info`.
     pub severity: Severity,
-    /// The FULL key, `wire.<key>` (design ruling 167).
+    /// The full key, `wire.<key>`.
     pub key: Option<String>,
     /// Seconds, 1..=120 (a script cannot say why the owner is needed, so it
-    /// cannot hold a row longer than a glance: decision D3); the severity's
-    /// hold when absent. A record has no hold, so on `success`/`info` it is
-    /// accepted and ignored.
+    /// cannot hold a row longer than a glance); the severity's hold when
+    /// absent. A record has no hold, so on `success`/`info` it is accepted and
+    /// ignored.
     pub hold_secs: Option<u32>,
     /// ≤ [`TITLE_CAP`] chars; a `warn`/`error` title obeys the glass title
     /// form ([`glass_title_fault`]).
@@ -623,18 +609,17 @@ impl PostRequest {
         })
     }
 
-    /// `true` for a RECORD: `success` and `info` go to the log, never the
-    /// glass — the owner's *"'FYI CYA' bullshit messages need to go to the
-    /// log and not interrupt the user"* (design ruling 163).
+    /// `true` for a record: `success` and `info` go to the log, never the
+    /// glass.
     #[must_use]
     pub(crate) fn is_record(&self) -> bool {
         self.severity <= Severity::Info
     }
 
-    /// The message: `Origin::Wire`, the severity's glyph, NO actions ever
-    /// (a socket client cannot mint an owner gesture, ruling 172). A record
-    /// is [`Hold::LogOnly`] whatever `hold=` said; a row holds
-    /// [`Hold::Default`] or `For(hold=)`.
+    /// The message: `Origin::Wire`, the severity's glyph, no actions ever (a
+    /// socket client cannot mint an owner gesture). A record is
+    /// [`Hold::LogOnly`] whatever `hold=` said; a row holds [`Hold::Default`]
+    /// or `For(hold=)`.
     #[must_use]
     pub(crate) fn into_message(self) -> Message {
         let hold = if self.is_record() {
@@ -698,13 +683,13 @@ fn parse_done(v: &str) -> Option<(u64, u64)> {
 /// [unit=<bytes|items|steps>] [load=<network|disk|cpu>] <title>[ -- <stats>]`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProgressRequest {
-    /// The FULL key, `wire.<key>`.
+    /// The full key, `wire.<key>`.
     pub key: String,
-    /// `script` by default (ruling 265); never aterm's own families.
+    /// `script` by default; never aterm's own families.
     pub tag: Tag,
     /// The fill, the amount, or busy.
     pub indicator: WireIndicator,
-    /// A very heavy phase's resource (design §10.6).
+    /// A very heavy phase's resource.
     pub load: Option<Load>,
     /// The glass title form, always.
     pub title: String,
@@ -787,10 +772,9 @@ impl ProgressRequest {
     #[must_use]
     pub fn meter(&self) -> Meter {
         let m = match self.indicator {
-            // A PERCENT IS AN AMOUNT TOO (design ruling 265): a thousand
-            // steps of the key's own series, so the estimator reads its rate
-            // and the row says how long is left, as `done=` does — `pct=`
-            // gave no time at all through a steady 20 s job.
+            // A percent is an amount too: a thousand steps of the key's own
+            // series, so the estimator reads its rate and the row says how
+            // long is left, as `done=` does.
             WireIndicator::Fill(p) => Meter {
                 fill_permille: Some(p),
                 amount: Some(Amount {
@@ -823,11 +807,10 @@ impl ProgressRequest {
         .normalized()
     }
 
-    /// A NEW row (design ruling 165): Info, `Origin::Wire`, keyed,
-    /// `Hold::Live { STALE_WIRE }`, revealed only after [`PROGRESS_GRACE`]
-    /// (a job done inside it never flashes), with its meter; no actions. It
-    /// wears the working mark `↻` (design ruling 304): Info's `ℹ` made a
-    /// script's meter read as an FYI beside aterm's own moving rows.
+    /// A new row: Info, `Origin::Wire`, keyed, `Hold::Live { STALE_WIRE }`,
+    /// revealed only after [`PROGRESS_GRACE`] (a job done inside it never
+    /// flashes), with its meter; no actions. It wears the working mark `↻`, so
+    /// a script's meter does not read as an FYI beside aterm's own moving rows.
     #[must_use]
     pub(crate) fn into_message(self) -> Message {
         let meter = self.meter();
@@ -839,10 +822,10 @@ impl ProgressRequest {
                 stale_after: STALE_WIRE,
             })
             .reveal_after(PROGRESS_GRACE)
-            // A load on the first line is the row's DECLARATION (ruling
-            // 267): its slot is reserved at that load's words, not at the
-            // widest of all four, so `disk busy` shows wherever it fits.
-            // A different load later widens the slot once (ruling 221).
+            // A load on the first line is the row's declaration: its slot is
+            // reserved at that load's words, not at the widest of all four, so
+            // `disk busy` shows wherever it fits. A different load later
+            // widens the slot once.
             .loads(self.load)
             .meter(meter)
     }
@@ -885,7 +868,7 @@ impl DoneHow {
 /// `notice done <key> [ok|warn|withdraw] [<words>]`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DoneRequest {
-    /// The FULL key, `wire.<key>`.
+    /// The full key, `wire.<key>`.
     pub key: String,
     /// `ok` by default.
     pub how: DoneHow,
@@ -926,20 +909,18 @@ impl DoneRequest {
     }
 }
 
-/// `notice ask <key> [tag=<tag>] <title> -- <reason> -- <step>`: THE OWNER IS
-/// NEEDED NOW, for a reason only he can close — Apple's developer agreement lapsed,
-/// a credential only he types — said once by a tool that is not aterm (`targo
-/// --unverified ship release` on an open owner gap). It is the classified standing
-/// row `Message::now(Ask::standing(StandingWhy::OnlyYou(reason), Then::step(step)))`
-/// a reporter writes, keyed, so it stays until the tool resolves it (`notice done
-/// <key> ok`) or the owner reads it — and, read, is not raised again for a day. It
-/// carries NO button: the socket authors none (ruling 172), so the one action is the
-/// step, in words. The door's own word rules hold (`need::Reason::fault`,
-/// `need::Step::fault`): a reason that only says something is pending, a snooze or
-/// two actions are refused here, before any wake. Owner-only, as every `notice`.
+/// `notice ask <key> [tag=<tag>] <title> -- <reason> -- <step>`: a tool that is
+/// not aterm says the owner is needed now, for a reason only they can close (a
+/// lapsed developer agreement, a credential only they type). It is the keyed
+/// standing row `Message::now(Ask::standing(StandingWhy::OnlyYou(reason),
+/// Then::step(step)))`: it stays until the tool resolves it (`notice done <key>
+/// ok`) or the owner reads it, and once read is not raised again for a day. No
+/// button (the socket authors none): the one action is the step, in words. The
+/// door's word rules (`need::Reason::fault`, `need::Step::fault`) are applied
+/// here, before any wake. Owner-only, as every `notice`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AskRequest {
-    /// The FULL key, `wire.<key>`.
+    /// The full key, `wire.<key>`.
     pub key: String,
     /// `script` by default; never aterm's own families.
     pub tag: Tag,
@@ -1035,13 +1016,13 @@ fn ask_refusal(fault: &'static str) -> &'static str {
 pub enum Press {
     /// An authored capsule by index, `0..MAX_ACTIONS`.
     Index(u8),
-    /// An authored capsule by its FULL label ([`Intent::label`], exact).
+    /// An authored capsule by its full label ([`Intent::label`], exact).
     Label(String),
     /// The implicit `Details ›`.
     Details,
 }
 
-/// `notice <post|progress|done|dismiss|act> …`, parsed on the control thread.
+/// `notice <post|progress|done|ask|dismiss|act> …`, parsed on the control thread.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NoticeRequest {
     /// A record, or a failure row.
@@ -1068,17 +1049,18 @@ pub enum NoticeRequest {
 impl NoticeRequest {
     /// The words after `notice`; `Err` is the refusal text after `ERR `.
     /// Every usage, key, tag and title refusal is answered here, before any
-    /// wake (design ruling 177).
+    /// wake.
     ///
     /// # Errors
     /// [`NOTICE_USAGE`] for a missing or unknown sub-form; each sub-form's
     /// own refusals ([`PostRequest::parse`], [`ProgressRequest::parse`],
-    /// [`DoneRequest::parse`], [`DISMISS_USAGE`], [`ACT_USAGE`]).
+    /// [`DoneRequest::parse`], [`AskRequest::parse`], [`DISMISS_USAGE`],
+    /// [`ACT_USAGE`]).
     pub fn parse(rest: &str) -> Result<Self, &'static str> {
         // A tab (or any whitespace the strip removes: a control, U+2028,
-        // U+2029) on the line is a space: the strip below would otherwise glue
+        // U+2029) on the line is a space: the strip would otherwise glue
         // `Deploy\tfailed` into `Deployfailed`, and a `\t--\t` would never
-        // split the detail off (design ruling 189; ruling 415 (n)).
+        // split the detail off.
         let spaced: String = rest
             .chars()
             .map(|c| {
@@ -1260,10 +1242,9 @@ impl WireGate {
     /// A glass change: paint now if the last wire paint is a frame old, else
     /// arm the one paced paint at the next frame. Both are recorded on the
     /// center's motion grid ([`MessageCenter::frame_instant`]), and a paced
-    /// paint lands ON it: the band's own motion frames fall on the same
-    /// instants, so a flood over a moving row shares their present instead
-    /// of adding one between them (design ruling 190 — measured live: 56
-    /// presents a second before, 31-32 after).
+    /// paint lands on it: the band's own motion frames fall on the same
+    /// instants, so a flood over a moving row shares their present instead of
+    /// adding one between them.
     fn pace(&mut self, center: &MessageCenter, now: Instant) -> Paint {
         match self.last_paint {
             Some(last) if now < later(last, WIRE_PAINT_GAP) => {
@@ -1292,8 +1273,8 @@ fn later(t: Instant, d: Duration) -> Instant {
 }
 
 /// A row the wire owns: minted by it, or keyed in its namespace (a carried
-/// keyed wire row's origin is `Carried`, its key is still the wire's; a
-/// carried keyless one keeps `Wire`, ruling 415 (h)).
+/// keyed wire row's origin is `Carried`, its key still the wire's; a carried
+/// keyless one keeps `Wire`).
 fn is_wire(row: &Live) -> bool {
     row.msg.origin == Origin::Wire
         || row
@@ -1327,7 +1308,7 @@ enum Busy {
 
 impl Busy {
     /// The whole `ERR busy notice: … retry_ms=<ms>` line (the transient
-    /// class drivers back off on; `retry_ms` rounds up, ruling 184).
+    /// class drivers back off on; `retry_ms` rounds up).
     fn reply(self) -> String {
         let (what, retry) = match self {
             Self::Mints(d) => (format!("{WIRE_MINTS_PER_WINDOW} new messages a minute"), d),
@@ -1423,8 +1404,9 @@ fn apply_post(
     post_row(center, gate, msg, stamp, now)
 }
 
-/// Post a ROW from the wire (a `post` at warn or error, an `ask`): the duplicate,
-/// the live-row cap and the mint budget, then the post and its paint.
+/// Post a row from the wire (a `post` at warn or error, an `ask`): the
+/// duplicate, the live-row cap and the mint budget, then the post and its
+/// paint.
 fn post_row(
     center: &mut MessageCenter,
     gate: &mut WireGate,
@@ -1518,15 +1500,12 @@ fn apply_done(
         return Applied::quiet("OK done=- how=gone".to_string());
     };
     if let Some(words) = d.words {
-        // DELIVERED WORDS ARE THE FINISHED WORDS (design ruling 265): `done
-        // build ok Built aterm` declares how `Building aterm` ends, so its
-        // echo reads `✓ Built aterm` as every reporter's does (a re-title
-        // left `Built aterm` with no past tense to say, and its echo kept a
-        // `100%`), and its record is `Built aterm`. A failure's or a
-        // withdrawal's words re-title the row, as before, and are declared
-        // its finished words too: the script SAID how it ended, so its
-        // record keeps them (`Indexing skipped`), never
-        // `Indexing ended` / `Indexing stopped` over them (ruling 266).
+        // Delivered words are the finished words: `done build ok Built aterm`
+        // declares how `Building aterm` ends, so its echo reads `✓ Built
+        // aterm` and its record is `Built aterm`. A failure's or a
+        // withdrawal's words re-title the row and are its finished words too:
+        // the script said how it ended, so its record keeps them (`Indexing
+        // skipped`), never `Indexing ended` / `Indexing stopped`.
         let restatement = match d.how {
             DoneHow::Ok => Restatement {
                 finished: Some(Some(words)),
@@ -1581,7 +1560,7 @@ fn apply_dismiss(
 }
 
 /// The capsule a press names on a live row: `Index(i)` for `i <
-/// actions.len()`, a FULL label equal to [`Intent::label`] (exact,
+/// actions.len()`, a full label equal to [`Intent::label`] (exact,
 /// case-sensitive), or `Details` → [`ActionIndex::DETAILS`].
 #[must_use]
 pub(crate) fn resolve_press(row: &Live, press: &Press) -> Option<ActionIndex> {
@@ -1598,7 +1577,7 @@ pub(crate) fn resolve_press(row: &Live, press: &Press) -> Option<ActionIndex> {
     }
 }
 
-/// The press as the caller spelled it — for `no action <press>`.
+/// The press as the caller spelled it, for `no action <press>`.
 #[must_use]
 pub(crate) fn press_words(press: &Press) -> String {
     match press {
@@ -1609,15 +1588,14 @@ pub(crate) fn press_words(press: &Press) -> String {
 }
 
 /// How long a script is told to wait while aterm hands itself to a new version
-/// ([`switching_reply`]): the park lasts until the new version commits —
-/// seconds — and the retry then reaches that version.
+/// ([`switching_reply`]): the park lasts seconds, until the new version
+/// commits, and the retry then reaches that version.
 pub const SWITCHING_RETRY: Duration = Duration::from_secs(1);
 
-/// `ERR busy notice: aterm is switching to its new version retry_ms=<ms>` —
-/// the host's answer to every `notice` while a seamless update has parked this
-/// process: the rows crossed to the new
-/// version at the park, so a row posted, dismissed, re-worded or pressed now
-/// would be lost at Commit. The transient class drivers already back off on.
+/// `ERR busy notice: aterm is switching to its new version retry_ms=<ms>`: the
+/// host's answer to every `notice` while a seamless update has parked this
+/// process. The rows crossed to the new version at the park, so a row posted,
+/// dismissed, re-worded or pressed now would be lost at Commit.
 #[must_use]
 pub fn switching_reply() -> String {
     format!(
@@ -1626,20 +1604,20 @@ pub fn switching_reply() -> String {
     )
 }
 
-/// `ERR notice: no live message <id>` — `dismiss`, `act` and the host's
-/// press that found the row gone all answer with this one line.
+/// `ERR notice: no live message <id>`: `dismiss`, `act` and the host's press
+/// that found the row gone all answer with this one line.
 #[must_use]
 pub fn no_live_reply(id: MessageId) -> String {
     format!("ERR notice: no live message {id}")
 }
 
-/// What `notice act` presses: the capsule index and its FULL label, or the
-/// whole `ERR …` reply (`no live message <id>`, `no action <press> on
-/// message <id>`, the press percent-encoded, or `ERR busy notice: 10
-/// presses a minute retry_ms=<ms>`). A press that names a capsule spends one
-/// of [`WIRE_PRESSES_PER_WINDOW`] (design ruling 195): each repaints, may
-/// open a window and logs a line, so a loop of them cannot. The host then
-/// performs the page's own press and answers with [`acted_reply`].
+/// What `notice act` presses: the capsule index and its full label, or the
+/// whole `ERR …` reply (`no live message <id>`, `no action <press> on message
+/// <id>`, the press percent-encoded, or `ERR busy notice: 10 presses a minute
+/// retry_ms=<ms>`). A press that names a capsule spends one of
+/// [`WIRE_PRESSES_PER_WINDOW`]: each repaints, may open a window and logs a
+/// line, so a loop of them cannot. The host then performs the page's own
+/// press and answers with [`acted_reply`].
 ///
 /// # Errors
 /// The reply line, when there is no live row, no such capsule, or no press
@@ -1669,9 +1647,9 @@ pub fn press_target(
 }
 
 /// Spend one band press for a press that did not come through `notice act`
-/// — `pointer click` on a capsule (ruling 373): every scripted press of the
-/// band shares [`WIRE_PRESSES_PER_WINDOW`] (ruling 195), whichever verb
-/// carries it, so alternating the two routes buys a loop nothing.
+/// (`pointer click` on a capsule): every scripted press of the band shares
+/// [`WIRE_PRESSES_PER_WINDOW`], whichever verb carries it, so alternating the
+/// two routes buys a loop nothing.
 ///
 /// # Errors
 /// The whole `ERR busy notice: … presses a minute retry_ms=<ms>` line when
@@ -1705,10 +1683,9 @@ mod tests {
         WallStamp { unix_ms: ms }
     }
 
-    /// `appstatus` reads a meter's FILL only: a busy row is `progress=-`,
-    /// like any row with no fraction, and busy changes nothing on the wire.
-    /// A harness note is a record: `kind=harness`, `phase=done`, never live
-    /// (design ruling 61).
+    /// `appstatus` reads a meter's fill only: a busy row is `progress=-`, like
+    /// any row with no fraction. A harness note is a record: `kind=harness`,
+    /// `phase=done`, never live.
     #[test]
     fn activity_rows_compat_ignores_busy_and_lists_the_harness() {
         let now = t0();
@@ -1745,10 +1722,10 @@ mod tests {
         );
     }
 
-    /// Invariant 20: a live toolchain meter at 50 % and a retired Warn
-    /// update row render exactly the status_bars.rs:4443 strings — and
-    /// toolchain-tagged live rows precede update-tagged ones whatever the
-    /// glass order (the update row is posted first and sits above).
+    /// A live toolchain meter at 50 % and a retired Warn update row render the
+    /// exact strings the status bars did, and toolchain live rows precede
+    /// update ones whatever the glass order (the update row is posted first and
+    /// sits above).
     #[test]
     fn activity_rows_compat_is_byte_identical() {
         let now = t0();
@@ -1871,12 +1848,10 @@ mod tests {
         assert!(rows[0].ends_with(" outcome=-"));
     }
 
-    /// `since_ms` NEVER RUNS AHEAD OF `ago_ms` (design ruling 201): both are
-    /// read off the reply's one wall `now` — the ingress stamp and the
-    /// retirement's wall time — so a record retired 300 ms into its life
-    /// reads `since_ms = ago_ms − 300` at every read, and a wall clock that
-    /// moved less than the monotonic one (the live run's 19 ms) clamps to
-    /// `since_ms <= ago_ms`, never past it.
+    /// `since_ms` never runs ahead of `ago_ms`: both are read off the reply's
+    /// one wall `now`, so a record retired 300 ms into its life reads
+    /// `since_ms = ago_ms − 300` at every read, and a wall clock that moved
+    /// less than the monotonic one clamps to `since_ms <= ago_ms`.
     #[test]
     fn since_ms_never_runs_ahead_of_ago_ms() {
         let now = t0();
@@ -1905,11 +1880,10 @@ mod tests {
         }
     }
 
-    /// A CARRIED row's `since_ms` counts from its retirement in THIS process,
-    /// never from the parent's ingress (design ruling 204): a download row
-    /// stamped 60 s before the handoff and superseded 1 s after the seed
-    /// reads `since_ms` = the read delay, and its logged retirement is the
-    /// seed's wall plus 1 s.
+    /// A carried row's `since_ms` counts from its retirement in this process,
+    /// never from the parent's ingress: a download row stamped 60 s before the
+    /// handoff and superseded 1 s after the seed reads `since_ms` = the read
+    /// delay, and its logged retirement is the seed's wall plus 1 s.
     #[test]
     fn a_carried_rows_since_ms_counts_from_its_retirement_here() {
         let now = t0();
@@ -2012,10 +1986,10 @@ mod tests {
         }
     }
 
-    /// Ruling 198: paging with the last id seen
-    /// never skips a record. 100 records: `since=10` under `n=64` is 11..=74,
-    /// then `since=74` is 75..=100; a bare read is still the newest 64, and
-    /// `since=` with no count is everything above the id.
+    /// Paging with the last id seen never skips a record. 100 records:
+    /// `since=10` under `n=64` is 11..=74, then `since=74` is 75..=100; a bare
+    /// read is still the newest 64, and `since=` with no count is everything
+    /// above the id.
     #[test]
     fn paging_since_the_last_id_loses_nothing() {
         let now = t0();
@@ -2099,7 +2073,7 @@ mod tests {
         let _ = char_width;
     }
 
-    // ---- `notice` (design rulings 163–198) -------------------------------
+    // ---- `notice` ----------------------------------------------------------
 
     use crate::center::EchoKind;
     use crate::model::{Decision, Load, Unit};
@@ -2127,9 +2101,8 @@ mod tests {
         apply(c, g, req, stamp(1_000), now)
     }
 
-    /// A wire post under `tag`, which `notice` itself may refuse (ruling
-    /// 433): what an older build's post, carried or logged, puts in front of
-    /// the center.
+    /// A wire post under `tag`, which `notice` itself may refuse: what an
+    /// older build's post, carried or logged, puts in front of the center.
     fn wire_row(
         c: &mut MessageCenter,
         g: &mut WireGate,
@@ -2160,9 +2133,9 @@ mod tests {
         c.commit_rows(now, 3);
     }
 
-    /// Ruling 433: a script posts under `script` or a tag of its own, never
-    /// under a family aterm reports under — the page could not tell its
-    /// `crash` row from aterm's own.
+    /// A script posts under `script` or a tag of its own, never under a family
+    /// aterm reports under: the page could not tell its `crash` row from
+    /// aterm's own.
     #[test]
     fn a_script_may_not_post_under_any_of_aterms_families() {
         for own in tags::ALL.iter().filter(|t| ***t != tags::SCRIPT) {
@@ -2466,7 +2439,7 @@ mod tests {
             "post worker sev=error key=a Worker crashed -- exit 3",
             "progress b Building aterm",
             "progress c pct=10 load=cpu Verifying the payload",
-            // Past the three-row cap (ruling 197): the error row goes first.
+            // Past the three-row cap: the error row goes first.
             "done a",
             "progress d done=1/9 unit=steps Migrating the store",
         ] {
@@ -2580,9 +2553,9 @@ mod tests {
             NoticeRequest::parse("progress k \u{7}\u{7}"),
             Err(PROGRESS_USAGE)
         );
-        // Ruling 196: an invisible character cannot
-        // hide a seam or a trailing period from the title form, and no bidi
-        // mark, tag character or noncharacter survives into a row.
+        // An invisible character cannot hide a seam or a trailing period from
+        // the title form, and no bidi mark, tag character or noncharacter
+        // survives into a row.
         assert_eq!(
             NoticeRequest::parse("post script sev=warn Build:\u{2060} failed"),
             Err("notice: title has a clause (\u{2014}, ;, :); put it after --")
@@ -2757,9 +2730,8 @@ mod tests {
                 .count(),
             1
         );
-        // Ruling 193: the SAME words take each other's
-        // place too — a change of severity or hold kind is news, never a
-        // repeat of the row it replaces.
+        // The same words take each other's place too: a change of severity or
+        // hold kind is news, never a repeat of the row it replaces.
         let work = id_of(&notice(&mut c, &mut g, "progress same Building aterm", t));
         let fail = notice(
             &mut c,
@@ -2847,8 +2819,8 @@ mod tests {
             // Fill changes never multiply deadlines: one paced paint at most,
             // never further than a frame away.
             assert!(g.due().is_none_or(|d| d <= t + WIRE_PAINT_GAP));
-            // …and ON the motion grid, where the band's own frames land, so
-            // a flood over a moving row shares their present (ruling 190).
+            // …and on the motion grid, where the band's own frames land, so
+            // a flood over a moving row shares their present.
             if let Some(d) = g.due() {
                 assert_eq!(c.frame_instant(d), d, "{i}: a paced paint off the grid");
                 assert!(d > t, "{i}: a paced paint in the past");
@@ -3018,7 +2990,7 @@ mod tests {
                 note: false,
             }
         );
-        // `done` ends ANY live wire row under the key, a warn post too.
+        // `done` ends any live wire row under the key, a warn post too.
         let p = id_of(&notice(
             &mut c,
             &mut g,
@@ -3351,10 +3323,9 @@ mod tests {
         assert!(c.live(id).is_some());
     }
 
-    /// Ruling 195: a loop of `act <id> details`
-    /// on a row that stays live gets the budget's presses and then `ERR
-    /// busy`, never a repaint, a window and a log line per line. A refused
-    /// press (no row, no capsule) spends nothing.
+    /// A loop of `act <id> details` on a row that stays live gets the budget's
+    /// presses and then `ERR busy`, never a repaint, a window and a log line
+    /// per line. A refused press (no row, no capsule) spends nothing.
     #[test]
     fn notice_act_presses_are_budgeted() {
         let now = t0();
@@ -3393,9 +3364,8 @@ mod tests {
         assert_eq!(no_live_reply(gone), "ERR notice: no live message 999");
     }
 
-    /// Ruling 192: a wire post never folds into
-    /// a host row, and a host post never into a wire row, whatever their
-    /// words — the wire can never restate a host row (ruling 167).
+    /// A wire post never folds into a host row, and a host post never into a
+    /// wire row, whatever their words: the wire never restates a host row.
     #[test]
     fn wire_and_host_rows_never_merge_as_duplicates() {
         let now = t0();
@@ -3451,9 +3421,8 @@ mod tests {
         assert_eq!(id_of(&again), planted);
     }
 
-    /// Ruling 194: the mints' title and detail
-    /// bytes are budgeted, so full-detail records cannot rotate
-    /// `messages.log` over aterm's own lines in minutes.
+    /// The mints' title and detail bytes are budgeted, so full-detail records
+    /// cannot rotate `messages.log` over aterm's own lines in minutes.
     #[test]
     fn the_wire_budgets_the_bytes_it_writes() {
         let now = t0();
@@ -3528,7 +3497,7 @@ mod tests {
                 ),
             ]
         );
-        // load= only while the row SHOWS its load words: a load a restate
+        // load= only while the row shows its load words: a load a restate
         // declares after none waits LOAD_AFTER.
         notice(
             &mut c,

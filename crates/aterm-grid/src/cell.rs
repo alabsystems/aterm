@@ -342,7 +342,7 @@ impl Cell {
     }
 
     /// Set the foreground color (indexed).
-    #[cfg(any(test, feature = "testing"))]
+    #[cfg(any(test, debug_assertions))]
     #[inline]
     pub fn set_fg(&mut self, fg: PackedColor) {
         // Copy from packed struct for modification
@@ -355,36 +355,6 @@ impl Cell {
             // RGB - mark as needing overflow
             self.colors = colors.with_rgb_fg();
         }
-    }
-
-    /// Set the StyleId for this cell.
-    ///
-    /// This converts the cell to use style interning. The colors field is
-    /// repurposed to store the StyleId, and USES_STYLE_ID flag is set.
-    ///
-    /// Cell-specific flags (WIDE, WIDE_CONTINUATION, COMPLEX, PROTECTED) are preserved.
-    #[cfg(test)]
-    #[inline]
-    pub(crate) fn set_style_id(&mut self, style_id: StyleId) {
-        // Store StyleId in colors field
-        self.colors = PackedColors(u32::from(style_id.raw()));
-        // Set USES_STYLE_ID flag while preserving cell-specific flags
-        let mut flags = self.flags;
-        flags.insert(CellFlags::USES_STYLE_ID);
-        self.flags = flags;
-    }
-
-    /// Clear the StyleId and switch back to inline colors mode.
-    ///
-    /// This clears the USES_STYLE_ID flag and sets colors to default.
-    /// Use this when transitioning a cell from style interning back to inline.
-    #[cfg(test)]
-    #[inline]
-    pub(crate) fn clear_style_id(&mut self) {
-        self.colors = PackedColors::DEFAULT;
-        let mut flags = self.flags;
-        flags.remove(CellFlags::USES_STYLE_ID);
-        self.flags = flags;
     }
 
     /// Check if this is a wide character.
@@ -453,13 +423,6 @@ impl Cell {
         let colors = self.colors;
         let flags = self.flags;
         self.char_data == ' ' as u16 && colors.is_default() && flags.0 == 0
-    }
-
-    /// Clear the cell to empty.
-    #[cfg(test)]
-    #[inline]
-    fn clear(&mut self) {
-        *self = Self::EMPTY;
     }
 }
 

@@ -2,14 +2,14 @@
 // Copyright 2026 Andrew Yates
 //
 // Scrollback scrub harness: the headless half of the scrub dimension, an
-// `xtask perf` floor. Tiered compressed scrollback pays LZ4/zstd decode on the
+// `verify perf` floor. Tiered compressed scrollback pays LZ4 decode on the
 // interactive scrub path, so this fences the read path against regressions.
 //
 //   targo --unverified run --release -q -p aterm-bench --example scroll_scrub_harness
 //   -> {"scrub_median_rps":...,"pageup_median_rps":...,"jump_top_median_jps":...,
 //       "fill_lines":...,"depth":...,"n":7,"warmup":2}
 //
-// Three phases, all bigger-is-better so `xtask::perf::compare` applies (the
+// Three phases, all bigger-is-better so `aterm_verify::perf`'s floors apply (the
 // jump latency is reported as jumps per second):
 //   scrub     small-delta wheel scrub (3 lines/step, overlapping viewports):
 //             the cache-warm scrub cost.
@@ -36,7 +36,7 @@ const COLS: u16 = 80;
 const RING_LINES: usize = 10_000;
 
 /// Fill target. 120k overflows the default 100k tiered limit: truncation runs,
-/// the cold (zstd) tier is deep, and 100k+ lines remain.
+/// the cold tier is deep, and 100k+ lines remain.
 const FILL_LINES: usize = 120_000;
 
 /// Wheel scrub: 3 lines per step (a mouse notch), a bounded number of steps so
@@ -177,7 +177,7 @@ fn main() {
     let depth = term.grid().scrollback_lines();
     eprintln!("scroll_scrub_harness: filled {FILL_LINES} lines -> {depth} scrollback depth");
 
-    // The phase keys are mirrored by `xtask::perf::SCROLL_LANE`
+    // The phase keys are mirrored by `aterm_verify::perf`'s `SCROLL_LANE`
     // (the gate reads each key) — keep the two in sync.
     let mut scrub = Vec::with_capacity(N_ITERS);
     let mut pageup = Vec::with_capacity(N_ITERS);

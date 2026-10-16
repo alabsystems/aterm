@@ -2,10 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Terminal emulator — combines the parser and grid.
-//!
-//! See handler modules (`handler_csi.rs`, `handler_esc.rs`, `handler_osc.rs`)
-//! for per-sequence documentation.
+//! Terminal emulator: the parser driving the grid. Per-sequence behaviour is documented in the
+//! handler modules (`handler_csi.rs`, `handler_esc.rs`, `handler_osc.rs`, …).
 
 /// The alt-screen scroll-off archive: rows a fullscreen app scrolled off its top.
 mod alt_archive;
@@ -74,6 +72,7 @@ mod observe;
 mod policy_bridge;
 mod policy_gates;
 mod processing;
+pub mod program_state;
 mod render_cells;
 pub mod repaint_nudge;
 mod reset;
@@ -85,6 +84,14 @@ mod serialize_ansi;
 mod shell;
 pub(crate) mod shell_integration_auth;
 mod window_auth;
+
+/// The private field of every capability token (`ClipboardWriteCapability`,
+/// `ResponseCapability`, `WindowOpsCapability`): the field is private to the
+/// token's module, so nothing outside it can build one, and `Seal` has no
+/// `Clone` or `Default`, so a token deriving either does not compile — a mint
+/// is spent, never copied or conjured.
+#[derive(Debug)]
+struct Seal;
 
 // Block model, process detection, and the shell-facing API.
 mod shell_api;
@@ -101,9 +108,8 @@ mod terminal_modes_conformance;
 mod transient_state;
 mod types;
 
-// The source-to-spec cross-reference gate lives in aterm-gui's test build: it is
-// the one binary that links every crate's `spec-anchors`, including this crate's
-// `terminal_modes` anchors.
+// The source-to-spec cross-reference gate (this crate's `terminal_modes` anchors included) runs
+// in aterm-gui's test build, the one binary that links every crate's `spec-anchors`.
 
 pub use callbacks::{ColorChangeOp, ColorTarget};
 use callbacks::{
@@ -145,8 +151,8 @@ pub use checkpoint_output::{
 #[cfg(feature = "serde")]
 pub use checkpoint_parser::ParserRepr;
 pub use checkpoint_state::{
-    ColorRepr, ColorSlotRepr, ColorStackEntryRepr, OutputBlockRepr, PaletteOverrideRepr, ShellRepr,
-    ShellSpanRepr, TitleRepr,
+    ColorOverridesRepr, ColorRepr, ColorSlotRepr, ColorStackEntryRepr, OutputBlockRepr,
+    PaletteOverrideRepr, ShellRepr, ShellSpanRepr, TitleRepr,
 };
 pub use clipboard_auth::ClipboardAccess;
 pub use custody::CustodyTransition;
@@ -181,38 +187,29 @@ pub(crate) type UserVarsMap = std::collections::HashMap<String, String>;
 
 pub(crate) type PendingNotificationsMap = std::collections::HashMap<String, types::Notification>;
 
-/// Maximum decoded clipboard bytes for an OSC 52 query response (Pd = "?").
-///
-/// Larger clipboard data from the callback is dropped rather than answered. The
-/// wire response is about a third larger (base64 plus OSC framing). This cap is
-/// deliberately tighter than the parser's 8 MiB `MAX_OSC_DATA` input limit, to
-/// limit accidental exfiltration.
+/// Maximum decoded clipboard bytes answered to an OSC 52 query (`Pd = ?`); larger clipboard data
+/// is dropped, not answered. Far below the parser's 8 MiB `MAX_OSC_DATA`, to limit accidental
+/// exfiltration.
 pub(crate) const MAX_OSC52_QUERY_RESPONSE_BYTES: usize = 64 * 1024;
 
 /// Maximum bytes in the terminal response buffer (DSR/DA/DECRQSS/OSC replies
 /// waiting for `take_response()`).
 pub(crate) const MAX_RESPONSE_BUFFER_SIZE: usize = 1024 * 1024;
 
-/// Maximum title/icon-name length in bytes for OSC 0/1/2 and `set_title`
-/// (same cap as OSC 777).
+/// Maximum title/icon-name length in bytes for OSC 0/1/2 and `set_title`.
 const MAX_TITLE_BYTES: usize = 1024;
 
 /// Maximum OSC 8 hyperlink URL length in bytes; longer URLs are ignored.
 const MAX_HYPERLINK_URL_BYTES: usize = 8192;
 
-/// Maximum working-directory path length in bytes for OSC 7 and OSC 633 `P` Cwd.
-///
-/// Longer paths are rejected: they would otherwise be retained in the
-/// `osc_events` queue and the count-capped but not byte-capped shell
-/// mark/block fields. 4 KiB matches the conventional `PATH_MAX`.
+/// Maximum working-directory path length in bytes for OSC 7 and OSC 633 `P` Cwd (the
+/// conventional `PATH_MAX`). Longer paths are rejected: they would be retained in the
+/// `osc_events` queue and in the shell mark/block fields, which are count-capped, not byte-capped.
 pub(crate) const MAX_CWD_PATH_BYTES: usize = 4096;
 
-/// Maximum command-line text length in bytes for OSC 633 `E` and `F`/`G`/`H`
-/// payloads.
-///
-/// The `E` text is retained in shell mark/block `commandline` fields, which are
-/// count-capped but not byte-capped. Bounding the escaped input also bounds the
-/// unescape work.
+/// Maximum command-line text length in bytes for OSC 633 `E` and `F`/`G`/`H` payloads. The `E`
+/// text is retained in the count-capped, not byte-capped, shell mark/block `commandline` fields;
+/// the cap also bounds the unescape work.
 pub(crate) const MAX_COMMANDLINE_BYTES: usize = 64 * 1024;
 
 /// An SGR color parameter as a palette index; values above 255 saturate.

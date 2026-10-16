@@ -44,7 +44,7 @@ fn truncate_slow_path_scales_with_kept_lines() {
 /// #5893: cold tier front_offset gives O(1) truncate, where a decompress-all
 /// truncate costs O(total_lines) per push to a full scrollback.
 ///
-/// COUNTED, NOT TIMED (wall-clock ratios went red under a loaded gate). The
+/// COUNTED, NOT TIMED (wall-clock ratios failed on a loaded machine). The
 /// work a decompress-all truncate does is DECODING: every block it reads walks
 /// its serialized records. So the proof counts the records walked
 /// ([`crate::line::take_records_walked`], counted at the one walk every block
@@ -287,19 +287,13 @@ fn remove_newest_memory_bounded_cross_tier() {
 
 /// #5918: Prove that `remove_newest` work does not grow with total scrollback size.
 ///
-/// Before the tier-aware fix, `remove_newest` materialized every kept line when
-/// the removal crossed tiers. The tier-aware implementation decodes at most the
-/// one boundary block it trims (read once to pre-validate, once to commit).
-///
-/// COUNTED, NOT TIMED (it timed ONE `remove_newest(1)` call at 1K and 50K lines
-/// and bounded the ratio, a sub-millisecond sample on a shared machine). The
-/// records walked by that one call are counted instead: bounded by two 50-line
-/// blocks, and identical at 1K and 50K lines. The old O(total_lines) path walks
-/// ~every kept line.
+/// Count decoded records: removing one line reads its 50-line boundary block
+/// once, with identical work at 1K and 50K lines. Materializing the whole
+/// history or decoding the boundary twice violates this bound.
 #[test]
-fn remove_newest_time_sublinear_in_total_size() {
+fn remove_newest_work_sublinear_in_total_size() {
     fn records_walked_removing_one(total: usize) -> usize {
-        let mut sb = Scrollback::with_block_size(5, 200, 500_000_000, 50);
+        let mut sb = Scrollback::with_block_size(50, 200, 500_000_000, 50);
         for i in 0..total {
             sb.push_str(&format!("Scale-{i}"));
         }
@@ -320,7 +314,7 @@ fn remove_newest_time_sublinear_in_total_size() {
     let large = records_walked_removing_one(50_000);
     eprintln!("remove_newest(1) records walked: 1K lines -> {small}, 50K lines -> {large}");
     assert!(
-        large <= 2 * 50,
+        large <= 50,
         "remove_newest(1) on 50K lines walked {large} records — it is decoding more \
          than the one 50-line boundary block (O(total_lines) regression, #5918)"
     );

@@ -1,12 +1,11 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The goal pause through the lane's own driver: the Codex lane's stand-in
-//! instance and kernel with a goal on the tab's Codex ([`GoalWorld`]), its
-//! footer moved by the `/goal pause` and `/goal resume` the lane types and the
-//! relaunched Codex opening on its `Resume paused goal?` box, and the tab's
-//! goal record (`goal_hold`) under the aterm state root. Every visit is a
-//! fresh call over the files, as a restarted host would make it.
+//! The goal pause through the lane's own driver: the Codex lane's stand-in instance and kernel
+//! with a goal on the tab's Codex ([`GoalWorld`]), whose footer the lane's `/goal pause` and
+//! `/goal resume` move and whose relaunch opens on its `Resume paused goal?` box, and the tab's
+//! goal record (`goal_hold`) under the aterm state root. Every visit is a fresh call over the
+//! files, as a restarted host would make it.
 
 use super::*;
 use crate::harness::goal_hold::{self, Hold, How, Owner, Stage};
@@ -83,7 +82,7 @@ fn write_hold(rig: &Rig, h: &Hold) {
     goal_hold::write(&goal_hold::path(root, TAB), h).expect("write");
 }
 
-/// What the lane TYPED as a line, each by its text's last word.
+/// What the lane typed as a line, each by its text's last word.
 fn lines(rig: &Rig) -> Vec<String> {
     rig.typed()
         .iter()
@@ -113,13 +112,11 @@ fn keys_pressed(rig: &Rig) -> Vec<String> {
         .collect()
 }
 
-/// The whole move, a goal paused for it: an embedded Codex whose goal's turn
-/// runs, three hours behind (the Land rung). The first look pauses the goal
-/// (record claimed first); while the last turn runs the look holds
-/// (`wait:goal-held`); once it ends the notice goes; at the READY the `/exit`
-/// and relaunch, and the relaunched Codex's paused-goal box is answered with
-/// one guarded Enter on `Resume goal` (`done:goal`, no continuation typed).
-/// A host restarted between any two visits resumes from the record.
+/// The whole move, a goal paused for it: an embedded Codex whose goal's turn runs, three hours
+/// behind (the Land rung). The first look pauses the goal (record claimed first); while the last
+/// turn runs the look holds (`wait:goal-held`); once it ends the notice goes; at the READY the
+/// `/exit` and relaunch, and the relaunched Codex's paused-goal box gets one guarded Enter on
+/// `Resume goal` (`done:goal`, no continuation typed).
 #[test]
 fn an_embedded_goal_is_paused_at_land_moved_and_resumed_once() {
     let (rig, goal) = goal_rig("goal-move", true);
@@ -311,13 +308,10 @@ fn an_open_save_then_wait_switch_keeps_the_pause_off() {
     assert_eq!(lines(&rig), ["/goal pause"]);
 }
 
-/// The Esc at a turn's head, the fallback for a typed pause that never shows:
-/// past the take window, with the goal thread's rollout at a turn's head
-/// (`task_started`, its context, the goal's message and `world_state`, none of
-/// its own work) and the screen showing the turn's status row, one Esc,
-/// fenced and guarded on the footer's goal row, the record naming it first;
-/// the goal shows paused. Negative control: a turn past its head (a tool call
-/// in its rollout) gets no Esc.
+/// The Esc at a turn's head, the fallback for a typed pause that never shows: past the take window,
+/// with the goal thread's rollout at a turn's head (none of its own work yet) and the turn's
+/// status row up, one Esc, fenced and guarded on the footer's goal row, the record naming it
+/// first. Negative control: a turn past its head (a tool call in its rollout) gets no Esc.
 #[test]
 fn the_esc_is_pressed_only_at_a_goal_turns_head() {
     let (rig, goal) = goal_rig("goal-esc", false);

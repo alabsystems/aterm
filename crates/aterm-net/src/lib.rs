@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
+#![cfg_attr(trust_verify, feature(register_tool))]
+#![cfg_attr(trust_verify, register_tool(trust))]
+
 //! **aterm-net** — layer L3 of the RFC "The Reactive Surface": the control
 //! protocol (read + drive + `await`) over a network boundary, so one aterm
 //! drives another on a different host exactly as it would locally.
@@ -129,7 +132,7 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
 }
 
 /// Read one `\n`-terminated line (the `\n` is consumed, not returned), bounded by
-/// `max` bytes. Errors on EOF before any byte, on overflow, or on non-UTF-8.
+/// `max` bytes. Errors on EOF before the newline, on overflow, or on non-UTF-8.
 fn read_line<R: Read>(r: &mut R, max: usize) -> io::Result<String> {
     let mut buf = Vec::new();
     let mut one = [0u8; 1];
@@ -250,12 +253,13 @@ pub fn is_token_refused(e: &io::Error) -> bool {
 /// exporter; `lookup(src, op)` yields the [`EdgeToken`] the listener minted for
 /// that driver+op (`None` ⇒ no such grant). The HMAC is verified in **constant
 /// time** ([`verify_presented`]); a captured tag from another channel fails
-/// because its exporter differs. Writes `OK\n` on success, `DENIED\n` otherwise,
-/// so the dialer gets a definite verdict either way.
+/// because its exporter differs. Writes `OK\n` on success. A complete UTF-8
+/// line with invalid AUTH syntax, no grant or a wrong tag gets a best-effort
+/// `DENIED\n`; read and framing errors return without writing a verdict.
 ///
 /// # Errors
-/// On I/O failure, or if the presentation is malformed / unknown / fails
-/// verification (after a best-effort `DENIED` is written back).
+/// On I/O or framing failure, or if a complete presentation is malformed,
+/// unknown or fails verification (after attempting to write `DENIED`).
 pub fn verify_capability<S, F>(stream: &mut S, exporter: &[u8], lookup: F) -> io::Result<Granted>
 where
     S: Read + Write,
@@ -282,12 +286,11 @@ where
     }
 }
 
-/// A pinned remote identity. A dialer is expected to check this BEFORE presenting
-/// the bound token, so a redirected/MITM'd endpoint is rejected before any secret
-/// crosses the wire (the filesystem `confine_proxy_sock` discipline has no network
-/// analog, so identity pinning replaces it). The `fingerprint` half is enforced by
-/// the TLS layer ([`tls::client_config`] pins the cert); the `nonce` rebind half is
-/// checked via [`RemoteEndpoint::matches`], enforced on the dial path by
+/// A pinned remote identity. The dial path checks the presented TLS certificate
+/// against `fingerprint` BEFORE presenting the bound token, so a redirected
+/// endpoint is rejected before authentication. The TLS configuration also checks
+/// certificate identity and key possession ([`tls::client_config`]). The `nonce`
+/// rebind half is enforced on the dial path by
 /// [`dial_and_relay_pinned`](drive::dial_and_relay_pinned) BEFORE any relay, against
 /// the live nonce the remote's `sessions bridge` roster reports for `sid` (or, with
 /// no `sid`, for any session carrying the pinned nonce). A pinned session the remote
@@ -301,7 +304,8 @@ pub struct RemoteEndpoint {
     pub sid: String,
     /// The remote session's launch nonce (rebind guard).
     pub nonce: String,
-    /// The pinned transport identity (TLS cert fingerprint / ssh host key).
+    /// The pinned transport identity. The TLS dial path accepts SHA-256 hex,
+    /// optionally `sha256:`-prefixed, with surrounding whitespace ignored.
     pub fingerprint: String,
 }
 

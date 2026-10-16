@@ -1,0 +1,28 @@
+# claude-code 2.1.301 · MEASURED 2026-10-15, `aterm ctl text` of a private headless aterm (120x50, aterm 0.105.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake claude.ai OAuth token (`claude --subscriber`) and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · 2.5 s after the Enter on /usage, as the plain --subscriber login (the token's scopes user:inference only, no oauthAccount): the usage tab draws the session block alone; Claude Code read no usage body at all (no profile scope), and the 5h/7d header readings of the stub's answers are not drawn · the lab's random project dir is spelled /private/tmp/at.lab0 here
+ ▐▛███▛█   Claude Code v2.1.301
+▝▜██████▀  Sonnet 5.5 · Claude API
+ ▝▝   ▝▝   /private/tmp/at.lab0/proj
+
+
+❯ hi
+
+⏺ Hi! I am the local lab stub, not a model. (reply 1)
+
+✻ Worked for 0s · done 11:35 PM
+
+❯ /usage
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Settings  Status   Config   Usage   Stats
+
+  Session
+
+  Total cost:            $0.0456
+  Total duration (API):  0s
+  Total duration (wall): 6s
+  Total code changes:    0 lines added, 0 lines removed
+  Usage by model:
+     claude-sonnet-5-5:  22.8k input, 12 output, 0 cache read, 0 cache write ($0.0456)
+  Prompt cache (main):   1 request · 0% of input tokens from cache · no misses · no prompt caching reported by the API
+
+  Esc to cancel

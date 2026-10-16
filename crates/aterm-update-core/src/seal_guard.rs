@@ -1,17 +1,15 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Where the app updater's `…/aterm/Updates` root lives — one derivation shared by
-//! `aterm-update`'s staging layout and the tests and tools that read it. (The module
-//! name is historical.)
+//! Where the app updater's `…/aterm/Updates` root lives: one derivation shared by
+//! `aterm-update`'s staging layout and the tests and tools that read it. The module name is
+//! historical.
 
 use std::path::PathBuf;
 
-/// The `…/aterm/Updates` root shared with `aterm-update`'s staging layout: the
-/// HOME-keyed Application Support base, which a DEVELOPMENT build may relocate with the
-/// `ATERM_UPDATE_ROOT` seam (test/demo isolation; `aterm_types::dev_seam!` — a shipped
-/// binary does not read it, and a scratch `$HOME` isolates it there). `None` when HOME
-/// is unset or the directory cannot be made private.
+/// The `…/aterm/Updates` root: under the HOME-keyed Application Support base, which a
+/// development build may relocate with the `ATERM_UPDATE_ROOT` seam (a shipped binary does not
+/// read it). `None` when HOME is unset or the directory cannot be made private.
 #[must_use]
 pub fn updates_root() -> Option<PathBuf> {
     let base = match aterm_types::dev_seam!("ATERM_UPDATE_ROOT") {

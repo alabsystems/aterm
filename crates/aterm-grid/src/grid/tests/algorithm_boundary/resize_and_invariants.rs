@@ -5,7 +5,6 @@
 use super::super::super::reflow::ReflowMode;
 use super::*;
 // Scroll region and damage tracking
-// ========================================================================
 
 #[test]
 fn reset_scroll_region_restores_full_screen_region() {
@@ -218,18 +217,15 @@ fn row_shrink_after_scrolling_preserves_newest_content() {
     // Verify that shrinking rows after scrolling (ring_head != 0) preserves
     // the most recent visible rows, not the oldest.
     let mut grid = Grid::with_scrollback(5, 10, 0);
-    // Fill all 5 rows: A, B, C, D, E
     for row in 0..5 {
         grid.set_cursor(row, 0);
         grid.write_char((b'A' + row as u8) as char);
     }
-    // Scroll twice from bottom to advance ring_head.
-    // With scrollback=0, each scroll immediately recycles the oldest row.
+    // Two scrolls advance ring_head; with scrollback=0 each recycles the oldest row.
     grid.set_cursor(4, 0);
     grid.line_feed();
     grid.line_feed();
     // After 2 scrolls: visible rows are C, D, E, <blank>, <blank>
-    // Write distinct content to the last two rows
     grid.set_cursor(3, 0);
     grid.write_char('X');
     grid.set_cursor(4, 0);
@@ -257,12 +253,10 @@ fn row_shrink_with_scrollback_retains_history_within_the_ring_cap() {
     // the demoted bottom row joins history and existing scrollback stays,
     // bounded by the ring cap.
     let mut grid = Grid::with_scrollback(4, 10, 4);
-    // Fill 4 rows: A, B, C, D
     for row in 0..4 {
         grid.set_cursor(row, 0);
         grid.write_char((b'A' + row as u8) as char);
     }
-    // Scroll 3 times to push A, B, C into scrollback.
     grid.set_cursor(3, 0);
     grid.line_feed();
     grid.line_feed();
@@ -284,8 +278,7 @@ fn row_shrink_with_scrollback_retains_history_within_the_ring_cap() {
     assert_eq!(grid.cell(0, 0).unwrap().char(), 'X');
     assert_eq!(grid.cell(1, 0).unwrap().char(), 'Y');
     assert_eq!(grid.cell(2, 0).unwrap().char(), 'Z');
-    // History retained (nothing evicted: 4 lines fit the cap of 4), and the
-    // scroll-up reading order is exactly the write order.
+    // Nothing evicted (4 lines fit the cap of 4), in write order.
     assert_eq!(grid.scrollback_lines(), 4);
     let history: Vec<String> = (0..4)
         .map(|i| {
@@ -316,7 +309,6 @@ fn row_shrink_grow_cycle_nonzero_ring_head() {
     assert_eq!(grid.rows(), 6);
     for row in 0..6 {
         grid.row(row).expect("row should be accessible after grow");
-        // Rows beyond the pre-grow count (2) must be blank.
         if row >= 2 {
             assert_eq!(
                 grid.cell(row, 0).unwrap().char(),
@@ -380,12 +372,10 @@ fn reflow_shrink_cursor_past_content_end() {
     for c in "ABC".chars() {
         grid.write_char(c);
     }
-    // Place cursor at col 8 — far past the 3 chars of content
     grid.set_cursor(0, 8);
 
     grid.resize(3, 5);
 
-    // Cursor should be clamped to valid position within the new grid
     assert!(
         grid.cursor_col() < 5,
         "cursor col {} should be < new_cols 5",
@@ -409,7 +399,6 @@ fn reflow_grow_cursor_on_last_content_cell() {
 
     grid.resize(3, 10);
 
-    // Cursor should stay at col 4 (content didn't move)
     assert_eq!(grid.cursor_row(), 0);
     assert_eq!(grid.cursor_col(), 4);
     assert_eq!(grid.cell(0, 0).unwrap().char(), 'A');
@@ -422,19 +411,15 @@ fn reflow_grow_cursor_on_last_content_cell() {
 /// row width, not `row.len()`.
 #[test]
 fn reflow_grow_cursor_in_trailing_blank_of_continuation_row() {
-    // Setup: 5-col terminal, 4 visible rows
     let mut grid = Grid::new(4, 5);
 
-    // Row 0: "ABCDE" — fills the row, autowrap makes row 1 a continuation
     grid.set_cursor(0, 0);
     for c in "ABCDE".chars() {
         grid.write_char_wrap(c);
     }
-    // Row 1 is now a continuation (wrapped). Write "FG" on it.
     for c in "FG".chars() {
         grid.write_char_wrap(c);
     }
-    // Row 2: separate line "XY"
     grid.set_cursor(2, 0);
     for c in "XY".chars() {
         grid.write_char(c);
@@ -443,23 +428,18 @@ fn reflow_grow_cursor_in_trailing_blank_of_continuation_row() {
     assert_eq!(grid.row(0).unwrap().to_string(), "ABCDE");
     assert!(grid.row(1).unwrap().is_wrapped(), "row 1 should be wrapped");
 
-    // Place cursor at col 4 on the continuation row (trailing blank area past "FG")
     grid.set_cursor(1, 4);
     assert_eq!(grid.cursor_row(), 1);
     assert_eq!(grid.cursor_col(), 4);
 
-    // Resize wider: rows 0+1 should merge into a single row "ABCDEFG"
     grid.resize(4, 10);
 
-    // The cursor was on the continuation of "ABCDE"→"FG", so it stays on the
-    // merged row 0, not row 1 ("XY").
     assert_eq!(
         grid.cursor_row(),
         0,
         "cursor should be on merged row 0, not row {} (was on continuation of 'ABCDE'→'FG')",
         grid.cursor_row()
     );
-    // Column should be clamped to content end or preserved within the merged row
     assert!(
         grid.cursor_col() <= 9,
         "cursor col {} should be within new_cols 10",
@@ -491,7 +471,6 @@ fn reflow_shrink_to_single_column() {
 }
 
 // visible_to_absolute coordinate consistency
-// ========================================================================
 
 /// Resize shrink while scrolled back: TotalLinesMinimum and TotalLinesValid
 /// hold with `display_offset > 0`, where `total_lines` and `visible_rows` are
@@ -500,7 +479,6 @@ fn reflow_shrink_to_single_column() {
 fn invariants_resize_shrink_while_scrolled_back() {
     let mut grid = Grid::with_scrollback(10, 20, 50);
 
-    // Fill 30 lines of content to build scrollback.
     for i in 0..30u16 {
         grid.set_cursor(grid.rows() - 1, 0);
         grid.write_char((b'A' + (i % 26) as u8) as char);
@@ -509,17 +487,14 @@ fn invariants_resize_shrink_while_scrolled_back() {
     assert!(grid.scrollback_lines() > 0, "should have scrollback");
     grid.assert_invariants();
 
-    // Scroll display back to middle of scrollback.
     let half_back = (grid.scrollback_lines() / 2) as i32;
     grid.scroll_display(half_back);
     assert!(grid.display_offset() > 0, "should be scrolled back");
     grid.assert_invariants();
 
-    // Shrink rows from 10 to 3 while scrolled back.
     grid.resize(3, 20);
     grid.assert_invariants();
 
-    // Grow back to 10 while still potentially scrolled back.
     grid.resize(10, 20);
     grid.assert_invariants();
 }
@@ -530,7 +505,6 @@ fn invariants_resize_shrink_while_scrolled_back() {
 fn invariants_resize_extreme_shrink_full_scrollback() {
     let mut grid = Grid::with_scrollback(8, 10, 20);
 
-    // Fill scrollback to capacity: write 40 lines of content.
     for i in 0..40u16 {
         grid.set_cursor(grid.rows() - 1, 0);
         grid.write_char((b'0' + (i % 10) as u8) as char);
@@ -538,16 +512,13 @@ fn invariants_resize_extreme_shrink_full_scrollback() {
     }
     grid.assert_invariants();
 
-    // Scroll to top of scrollback.
     grid.scroll_to_top();
     assert!(grid.display_offset() > 0);
     grid.assert_invariants();
 
-    // Extreme shrink: 8 rows → 2 rows while at top of scrollback.
     grid.resize(2, 10);
     grid.assert_invariants();
 
-    // Verify grid is functional after extreme shrink.
     grid.write_char('Z');
     grid.assert_invariants();
 
@@ -561,7 +532,6 @@ fn invariants_resize_extreme_shrink_full_scrollback() {
 fn invariants_resize_reflow_while_scrolled_back() {
     let mut grid = Grid::with_scrollback(6, 20, 30);
 
-    // Fill with wrappable content.
     for _i in 0..20u16 {
         grid.set_cursor(grid.rows() - 1, 0);
         for c in "ABCDEFGHIJKLMNOP".chars() {
@@ -574,11 +544,9 @@ fn invariants_resize_reflow_while_scrolled_back() {
     grid.scroll_display(5);
     assert!(grid.display_offset() > 0);
 
-    // Shrink both rows and columns (triggers reflow + ring buffer adjustment).
     grid.resize(3, 10);
     grid.assert_invariants();
 
-    // Grow columns back (triggers reverse reflow).
     grid.resize(3, 40);
     grid.assert_invariants();
 }
@@ -588,23 +556,19 @@ fn invariants_resize_reflow_while_scrolled_back() {
 /// while the ring grows.
 #[test]
 fn visible_to_absolute_self_consistency_growth_phase() {
-    // Use small scrollback to quickly test the growth phase.
     let mut grid = Grid::with_scrollback(4, 10, 5);
 
-    // Fill all visible rows with content.
     for row in 0..4 {
         grid.set_cursor(row, 0);
         grid.write_char((b'A' + row as u8) as char);
     }
 
-    // Record absolute position of visible row 2 (content 'C') before scrolling.
     let abs_before = grid.visible_to_absolute(2);
 
-    // Scroll up by 1 (growth phase: ring buffer grows from 4 to 5).
+    // Growth phase: the ring grows from 4 to 5 rows.
     grid.set_cursor(3, 0);
     grid.line_feed();
 
-    // Content 'C' was at visible row 2, now at visible row 1 (shifted up by 1).
     let abs_after = grid.visible_to_absolute(1);
 
     assert_eq!(
@@ -625,25 +589,20 @@ fn visible_to_absolute_self_consistency_reuse_phase() {
         grid.set_cursor(row, 0);
         grid.write_char((b'A' + row as u8) as char);
     }
-    // 3 scrolls to fill scrollback.
     for _ in 0..3 {
         grid.set_cursor(3, 0);
         grid.line_feed();
     }
-    // Write identifiable content at the current visible rows.
     for row in 0..4 {
         grid.set_cursor(row, 0);
         grid.write_char((b'W' + row as u8) as char);
     }
 
-    // Now in reuse phase. Record absolute for visible row 2 ('Y').
     let abs_before = grid.visible_to_absolute(2);
 
-    // Scroll 1 more (reuse).
     grid.set_cursor(3, 0);
     grid.line_feed();
 
-    // 'Y' content moved from visible row 2 to visible row 1.
     let abs_after = grid.visible_to_absolute(1);
 
     assert_eq!(
@@ -717,9 +676,7 @@ fn resize_existing_grid_to_zero_both() {
 #[test]
 fn row_index_one_row_grid_visible_row_zero() {
     let grid = Grid::new(1, 10);
-    // row(0) should succeed — the only visible row
     assert!(grid.row(0).is_some(), "row 0 should exist in 1-row grid");
-    // row(1) should be None — out of bounds
     assert!(
         grid.row(1).is_none(),
         "row 1 should not exist in 1-row grid"
@@ -764,7 +721,6 @@ fn row_index_after_resize_from_one_row() {
 }
 
 // ComplexCharRing invalidation on row-only resize
-// ========================================================================
 
 /// A row-only resize invalidates the ComplexCharRing so emoji stored for the
 /// old geometry do not alias into new row indices.
@@ -772,8 +728,7 @@ fn row_index_after_resize_from_one_row() {
 fn row_only_resize_invalidates_complex_char_ring() {
     let mut grid = Grid::new(24, 80);
 
-    // Write a supplementary-plane emoji to row 0 — this goes through the
-    // ComplexCharRing because U+1F389 (party popper) is outside the BMP.
+    // U+1F389 is outside the BMP, so it goes through the ComplexCharRing.
     grid.set_cursor(0, 0);
     grid.write_char('\u{1F389}');
 
@@ -787,19 +742,16 @@ fn row_only_resize_invalidates_complex_char_ring() {
     grid.resize(48, 80);
     assert_eq!(grid.rows(), 48);
 
-    // Write a different emoji to row 30 (beyond the old row count).
     grid.set_cursor(30, 0);
     grid.write_char('\u{1F680}');
 
-    // Row 30 should contain the rocket emoji.
     let text_row30 = grid.row_text(30).unwrap();
     assert!(
         text_row30.contains('\u{1F680}'),
         "row 30 should contain rocket emoji after row-only resize, got: {text_row30:?}"
     );
 
-    // Row 6 (= 30 % 24, the alias under stale ring dimensions) must be
-    // empty — if the ring was not invalidated, the emoji data would leak here.
+    // Row 6 (= 30 % 24) is where a stale ring would alias it.
     let cell_row6 = grid.cell(6, 0).unwrap();
     assert!(
         cell_row6.is_empty(),

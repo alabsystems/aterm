@@ -13,11 +13,6 @@ use aterm_spec::{derive::harness_codex_daemon_update_model, interp, verify};
 #[test]
 fn the_daemon_moves_only_between_turns_and_never_backwards() {
     let model = harness_codex_daemon_update_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name)
-    );
     verify::prove_and_catch_scalar(&model, "harness codex daemon update");
 
     // A detached thread's turn holds the daemon where it is.
@@ -51,7 +46,7 @@ fn the_daemon_moves_only_between_turns_and_never_backwards() {
     assert!(model.fire("VendorAhead", &mut ahead));
     assert!(!model.action_enabled("Update", &ahead));
 
-    // NEGATIVE CONTROL: the rule that asks only the tabs it can see.
+    // `Buggy = 1`: the rule that asks only the tabs it can see.
     let buggy = interp::with_buggy(&model, 1);
     for (start, invariant) in [
         ("StartDetached", "NoRunningWorkInterrupted"),

@@ -76,6 +76,17 @@ fn open_regular(path: &Path) -> io::Result<std::fs::File> {
 /// The attribute is checked on the opened handle before any byte is consumed.
 #[cfg(windows)]
 fn open_regular(path: &Path) -> io::Result<std::fs::File> {
+    open_regular_shared(
+        path,
+        win::FILE_SHARE_READ | win::FILE_SHARE_WRITE | win::FILE_SHARE_DELETE,
+    )
+}
+
+/// [`open_regular`] with an explicit share mode. The copy path shares
+/// everything (std's own default); the mapping path ([`open_for_admission`])
+/// refuses WRITE sharing.
+#[cfg(windows)]
+fn open_regular_shared(path: &Path, share: u32) -> io::Result<std::fs::File> {
     use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
 
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
@@ -83,6 +94,7 @@ fn open_regular(path: &Path) -> io::Result<std::fs::File> {
 
     let file = std::fs::OpenOptions::new()
         .read(true)
+        .share_mode(share)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)?;
     let metadata = file.metadata()?;
@@ -256,31 +268,49 @@ pub fn read_font_file(path: &Path) -> io::Result<Vec<u8>> {
 /// ([`MAX_FONT_FILE_BYTES`]), and the mapping's length IS that observed
 /// size, so no byte past the admission bound is ever addressable.
 ///
-/// `identity` is the file's `(st_dev, st_ino)`: two mappings of the same
-/// inode are the same bytes, and the discovery intern uses that to converge
-/// on one mapping without comparing 192 MB of pages.
-#[cfg(unix)]
+/// `identity` is the file's `(st_dev, st_ino)` — on Windows its volume serial
+/// number and file index: two mappings of the same file are the same bytes,
+/// and the discovery intern uses that to converge on one mapping without
+/// comparing 192 MB of pages.
+///
+/// # Windows
+///
+/// The same handle, over a `PAGE_READONLY` section and a `FILE_MAP_READ`
+/// view. What stands in for the sealed volume is [`MAPPABLE_FONT_ROOTS`]'s
+/// Windows entry plus the handle itself: [`admit_font_file`] opens a file
+/// it will map WITHOUT write sharing and the mapping keeps that handle
+/// (`_file`), so while the view is live no process can open the file for
+/// writing — to rewrite it or to truncate it.
+#[cfg(any(unix, windows))]
 pub struct MappedFontFile {
     ptr: std::ptr::NonNull<u8>,
     len: usize,
     identity: (u64, u64),
+    /// The admission handle, opened without write sharing, held so the share
+    /// mode outlives the admission for as long as the bytes are addressable.
+    #[cfg(windows)]
+    _file: std::fs::File,
 }
 
-/// Off unix there is no mapping constructor, so the type is uninhabited: the
-/// `FaceBytes::Mapped` arm exists on every target and can be built on none of
-/// these, which keeps every `match` over the handle cfg-free.
-#[cfg(not(unix))]
+/// Without a mapping constructor (neither unix nor Windows) the type is
+/// uninhabited: the `FaceBytes::Mapped` arm exists on every target and can be
+/// built on none of these, which keeps every `match` over the handle cfg-free.
+#[cfg(not(any(unix, windows)))]
 pub struct MappedFontFile {
     never: core::convert::Infallible,
 }
 
-// SAFETY: the mapping is PROT_READ and MAP_PRIVATE — nothing writes through
-// it, and the kernel owns the pages — so sharing or moving the handle between
+// SAFETY: the mapping is read-only (unix: PROT_READ and MAP_PRIVATE; Windows:
+// a PAGE_READONLY section viewed FILE_MAP_READ) — nothing writes through it,
+// and the kernel owns the pages — so sharing or moving the handle between
 // threads is sharing an immutable byte slice. `Drop` runs once, on the last
-// `Arc` holder.
-#[cfg(unix)]
+// `Arc` holder. Windows admission also excludes an existing writable mapping:
+// CreateFileW's FILE_SHARE_WRITE rule covers mappings as well as open handles;
+// the retained no-write-share handle prevents later writable opens/mappings.
+// https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew
+#[cfg(any(unix, windows))]
 unsafe impl Send for MappedFontFile {}
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 unsafe impl Sync for MappedFontFile {}
 
 #[cfg(unix)]
@@ -333,8 +363,73 @@ impl MappedFontFile {
             identity,
         })
     }
+}
 
-    /// Whether `self` and `other` map the same inode — the same bytes, without
+#[cfg(windows)]
+impl MappedFontFile {
+    /// Map `len` bytes of an already-admitted handle, read-only. `len` is the
+    /// size [`check_observed_size`] bounded, so the view never addresses a byte
+    /// past the admission limit. An empty file cannot be mapped
+    /// (`CreateFileMappingW` refuses a zero-length file) and is refused here
+    /// the same way as on unix. The view keeps its section alive, so the
+    /// section handle is closed at once; a duplicate of `file` is kept (see
+    /// the `_file` field).
+    fn map(file: &std::fs::File, len: u64) -> io::Result<Self> {
+        use std::os::windows::io::AsRawHandle as _;
+
+        let Ok(len_usize) = usize::try_from(len) else {
+            return Err(too_large(MAX_FONT_FILE_BYTES));
+        };
+        if len_usize == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "font file is empty",
+            ));
+        }
+        let identity = win::file_identity(file)?;
+        let held = file.try_clone()?;
+        // SAFETY: `file` is the caller's open, admitted handle. A NULL name and
+        // zero maximum size ask for an anonymous read-only section over the
+        // whole current file, which the size check above proved non-empty.
+        let section = unsafe {
+            win::CreateFileMappingW(
+                file.as_raw_handle(),
+                std::ptr::null_mut(),
+                win::PAGE_READONLY,
+                0,
+                0,
+                std::ptr::null(),
+            )
+        };
+        if section.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `section` is live; the view covers exactly the `len_usize`
+        // bytes the file was observed to hold, from offset 0.
+        let view = unsafe { win::MapViewOfFile(section, win::FILE_MAP_READ, 0, 0, len_usize) };
+        // Read the failure before CloseHandle, which may reset the last error.
+        let failed = view.is_null().then(io::Error::last_os_error);
+        // SAFETY: `section` is live and no longer needed: a view keeps its
+        // section alive until it is unmapped.
+        unsafe { win::CloseHandle(section) };
+        if let Some(error) = failed {
+            return Err(error);
+        }
+        let Some(ptr) = std::ptr::NonNull::new(view.cast::<u8>()) else {
+            return Err(io::Error::other("MapViewOfFile returned a null view"));
+        };
+        Ok(Self {
+            ptr,
+            len: len_usize,
+            identity,
+            _file: held,
+        })
+    }
+}
+
+#[cfg(any(unix, windows))]
+impl MappedFontFile {
+    /// Whether `self` and `other` map the same file — the same bytes, without
     /// touching a page of either.
     #[must_use]
     pub fn same_file(&self, other: &Self) -> bool {
@@ -342,9 +437,15 @@ impl MappedFontFile {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 impl MappedFontFile {
-    /// Uninhabited: see the type's `cfg(not(unix))` doc.
+    /// No mapping on this target: [`admit_font_file`] never asks for one
+    /// ([`open_for_admission`] answers `false`), and this says why if it did.
+    fn map(_file: &std::fs::File, _len: u64) -> io::Result<Self> {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+
+    /// Uninhabited: see the type's `cfg(not(any(unix, windows)))` doc.
     #[must_use]
     pub fn same_file(&self, _other: &Self) -> bool {
         match self.never {}
@@ -355,14 +456,14 @@ impl core::ops::Deref for MappedFontFile {
     type Target = [u8];
     #[inline]
     fn deref(&self) -> &[u8] {
-        #[cfg(unix)]
-        // SAFETY: `ptr` is a live `len`-byte PROT_READ mapping owned by
+        #[cfg(any(unix, windows))]
+        // SAFETY: `ptr` is a live `len`-byte read-only mapping owned by
         // `self` until `Drop`; nothing writes through it, so handing out
         // shared slices for `&self`'s lifetime is sound.
         unsafe {
             std::slice::from_raw_parts(self.ptr.as_ptr(), self.len)
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         match self.never {}
     }
 }
@@ -393,21 +494,47 @@ impl Drop for MappedFontFile {
     }
 }
 
+#[cfg(windows)]
+impl Drop for MappedFontFile {
+    fn drop(&mut self) {
+        // SAFETY: `ptr` is the base `MapViewOfFile` returned for this handle,
+        // and `Drop` runs once. The result is ignored: there is nothing to do
+        // if unmapping a valid view failed. The held handle (`_file`) closes
+        // after this body, so the write-sharing refusal lasts exactly as long
+        // as the view.
+        unsafe {
+            let _ = win::UnmapViewOfFile(self.ptr.as_ptr().cast_const().cast());
+        }
+    }
+}
+
 /// The directories whose files [`admit_font_file`] holds as file MAPPINGS
 /// rather than copies: the sealed, read-only system font volume and nothing
-/// user-writable (see [`MappedFontFile`]'s truncation caveat). macOS-shaped on
-/// purpose: the Linux package roots are root-owned but are rewritten in place
-/// by package managers, and the finding this serves measured a Mac; widening
-/// the list is an owner ruling, not a patch.
-pub const MAPPABLE_FONT_ROOTS: &[&str] = &["/System/Library/Fonts"];
+/// user-writable (see [`MappedFontFile`]'s truncation caveat). The Linux
+/// package roots stay out: they are root-owned but are rewritten in place by
+/// package managers. Widening the list is an owner ruling, not a patch.
+///
+/// Windows maps only the conventional `C:\Windows\Fonts` system directory.
+/// The admission handle denies write sharing for the view's lifetime; this
+/// does not rely on a font's ACL. Per-user font directories and installations
+/// under another Windows directory retain the bounded copy path.
+pub const MAPPABLE_FONT_ROOTS: &[&str] = &[
+    #[cfg(not(windows))]
+    "/System/Library/Fonts",
+    #[cfg(windows)]
+    "C:\\Windows\\Fonts",
+];
 
-/// Whether [`admit_font_file`] MAPS `path` (unix) rather than copying it:
+/// Whether [`admit_font_file`] MAPS `path` (unix, Windows) rather than copying it:
 /// the path lies lexically under one of [`MAPPABLE_FONT_ROOTS`] and contains
 /// no `..` component. The `..` refusal is load-bearing — `Path::starts_with`
 /// is component-wise, so `/System/Library/Fonts/../../../Users//x/y.ttf`
 /// would otherwise pass — and it keeps the check free of pathname I/O, which
 /// matters because the seal's callers admit paths with the promise that no
 /// pathname is touched afterwards.
+///
+/// On Windows the root comparison ignores ASCII case: font discovery and
+/// configured paths can spell the Windows directory with different case.
 #[must_use]
 pub fn maps_in_place(path: &Path) -> bool {
     !path
@@ -415,7 +542,24 @@ pub fn maps_in_place(path: &Path) -> bool {
         .any(|c| matches!(c, std::path::Component::ParentDir))
         && MAPPABLE_FONT_ROOTS
             .iter()
-            .any(|root| path.starts_with(root))
+            .any(|root| lies_under(path, Path::new(root)))
+}
+
+/// `path.starts_with(root)`, component-wise.
+#[cfg(not(windows))]
+fn lies_under(path: &Path, root: &Path) -> bool {
+    path.starts_with(root)
+}
+
+/// `path.starts_with(root)`, component-wise and ASCII-case-insensitive.
+#[cfg(windows)]
+fn lies_under(path: &Path, root: &Path) -> bool {
+    let mut components = path.components();
+    root.components().all(|want| {
+        components
+            .next()
+            .is_some_and(|have| have.as_os_str().eq_ignore_ascii_case(want.as_os_str()))
+    })
 }
 
 /// Admit one font file under the production budget, MAPPING it when the path
@@ -429,17 +573,116 @@ pub fn maps_in_place(path: &Path) -> bool {
 /// on the same handle rather than failing the admission — the mapping is a
 /// residency choice, never a correctness one.
 pub fn admit_font_file(path: &Path) -> io::Result<crate::font::FaceBytes> {
-    let file = open_regular(path)?;
+    let (file, may_map) = open_for_admission(path, maps_in_place(path))?;
     let length = check_observed_size(&file, MAX_FONT_FILE_BYTES)?;
-    #[cfg(unix)]
-    if maps_in_place(path)
-        && let Ok(mapped) = MappedFontFile::map(&file, length)
-    {
+    if may_map && let Ok(mapped) = MappedFontFile::map(&file, length) {
         return Ok(crate::font::FaceBytes::Mapped(Arc::new(mapped)));
     }
     let mut bytes = Vec::new();
     read_admitted_handle(file, length, MAX_FONT_FILE_BYTES, &mut bytes)?;
     Ok(crate::font::FaceBytes::Vec(Arc::new(bytes)))
+}
+
+/// [`admit_font_file`]'s one open, and whether its handle may be MAPPED
+/// (`mappable` is [`maps_in_place`]'s answer for `path`).
+#[cfg(unix)]
+fn open_for_admission(path: &Path, mappable: bool) -> io::Result<(std::fs::File, bool)> {
+    Ok((open_regular(path)?, mappable))
+}
+
+/// Windows: a file [`maps_in_place`] would map is opened WITHOUT write
+/// sharing, and the mapping keeps that handle ([`MappedFontFile`]), so no
+/// process can open the file for writing while its bytes are a live `&[u8]`.
+/// If a writer already holds it (a sharing violation), it is copied through
+/// the ordinary fully-shared open instead — a residency choice, never a
+/// refused font.
+#[cfg(windows)]
+fn open_for_admission(path: &Path, mappable: bool) -> io::Result<(std::fs::File, bool)> {
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    if mappable {
+        match open_regular_shared(path, win::FILE_SHARE_READ | win::FILE_SHARE_DELETE) {
+            Ok(file) => return Ok((file, true)),
+            Err(error) if error.raw_os_error() != Some(ERROR_SHARING_VIOLATION) => {
+                return Err(error);
+            }
+            Err(_) => {}
+        }
+    }
+    Ok((open_regular(path)?, false))
+}
+
+/// No mapping on this target: every admission is a copy.
+#[cfg(not(any(unix, windows)))]
+fn open_for_admission(path: &Path, _mappable: bool) -> io::Result<(std::fs::File, bool)> {
+    Ok((open_regular(path)?, false))
+}
+
+/// The kernel32 calls the Windows mapping arm makes, declared directly.
+#[cfg(windows)]
+mod win {
+    use std::ffi::c_void;
+    use std::io;
+    use std::os::windows::io::AsRawHandle as _;
+
+    pub(super) const FILE_SHARE_READ: u32 = 0x1;
+    pub(super) const FILE_SHARE_WRITE: u32 = 0x2;
+    pub(super) const FILE_SHARE_DELETE: u32 = 0x4;
+    pub(super) const PAGE_READONLY: u32 = 0x02;
+    pub(super) const FILE_MAP_READ: u32 = 0x0004;
+
+    /// `BY_HANDLE_FILE_INFORMATION` (52 bytes): the attributes and three
+    /// `FILETIME`s, the volume serial number, the size and link count, then
+    /// the file index. Only the identity fields are read.
+    #[repr(C)]
+    #[derive(Default)]
+    struct ByHandleFileInformation {
+        _attributes_and_times: [u32; 7],
+        volume_serial_number: u32,
+        _size_and_links: [u32; 3],
+        index_high: u32,
+        index_low: u32,
+    }
+
+    // SAFETY: standard kernel32 declarations, signatures per the Win32 docs.
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        pub(super) fn CreateFileMappingW(
+            file: *mut c_void,
+            attributes: *mut c_void,
+            protect: u32,
+            max_size_high: u32,
+            max_size_low: u32,
+            name: *const u16,
+        ) -> *mut c_void;
+        pub(super) fn MapViewOfFile(
+            mapping: *mut c_void,
+            access: u32,
+            offset_high: u32,
+            offset_low: u32,
+            bytes: usize,
+        ) -> *mut c_void;
+        pub(super) fn UnmapViewOfFile(base: *const c_void) -> i32;
+        pub(super) fn CloseHandle(handle: *mut c_void) -> i32;
+        fn GetFileInformationByHandle(
+            file: *mut c_void,
+            information: *mut ByHandleFileInformation,
+        ) -> i32;
+    }
+
+    /// The file's `(volume serial number, file index)` — Windows' `(st_dev,
+    /// st_ino)`: the same pair is the same file however it was opened.
+    pub(super) fn file_identity(file: &std::fs::File) -> io::Result<(u64, u64)> {
+        let mut info = ByHandleFileInformation::default();
+        // SAFETY: `file` is an open handle and `info` is a writable
+        // BY_HANDLE_FILE_INFORMATION, which is all the call writes.
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok((
+            u64::from(info.volume_serial_number),
+            (u64::from(info.index_high) << 32) | u64::from(info.index_low),
+        ))
+    }
 }
 
 /// Production-font-budget twin of [`read_bounded_font_file_into`], for the one
@@ -590,10 +833,13 @@ mod tests {
     /// refused rather than mapped.
     #[test]
     fn maps_in_place_admits_the_system_font_volume_and_nothing_user_writable() {
-        assert!(maps_in_place(Path::new("/System/Library/Fonts/Menlo.ttc")));
-        assert!(maps_in_place(Path::new(
-            "/System/Library/Fonts/Supplemental/Arial Unicode.ttf"
-        )));
+        #[cfg(not(windows))]
+        {
+            assert!(maps_in_place(Path::new("/System/Library/Fonts/Menlo.ttc")));
+            assert!(maps_in_place(Path::new(
+                "/System/Library/Fonts/Supplemental/Arial Unicode.ttf"
+            )));
+        }
         assert!(!maps_in_place(Path::new("/Library/Fonts/Custom.ttf")));
         assert!(!maps_in_place(Path::new(
             "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
@@ -602,16 +848,29 @@ mod tests {
             "/System/Library/Fonts/../../../Users//x/y.ttf"
         )));
         assert!(!maps_in_place(Path::new("System/Library/Fonts/Menlo.ttc")));
-        for dir in crate::font_search_dirs() {
-            let candidate = dir.join("Font.ttf");
-            let on_volume = MAPPABLE_FONT_ROOTS.iter().any(|root| dir.starts_with(root));
-            assert_eq!(
-                maps_in_place(&candidate),
-                on_volume,
-                "{}: a search dir maps only when it IS the system font volume",
-                candidate.display()
-            );
+        // Windows: the system font directory maps; the per-user font
+        // directory, anything else on the drive, and a `..` walk out of the
+        // system directory are copied.
+        #[cfg(windows)]
+        {
+            assert!(maps_in_place(Path::new("C:\\Windows\\Fonts\\msyh.ttc")));
+            // `%WINDIR%` spells it `C:\WINDOWS`; the file system ignores case.
+            assert!(maps_in_place(Path::new("C:\\WINDOWS\\Fonts\\SegUIVar.ttf")));
+            assert!(maps_in_place(Path::new("c:/windows/fonts/seguisb.ttf")));
+            assert!(!maps_in_place(Path::new("C:\\Windows\\FontsX\\a.ttf")));
+            assert!(!maps_in_place(Path::new("C:\\Windows")));
+            assert!(!maps_in_place(Path::new("/System/Library/Fonts/Menlo.ttc")));
+            assert!(!maps_in_place(Path::new("C:\\font-fixture\\café.ttf")));
+            assert!(!maps_in_place(Path::new(
+                "C:\\Users\\x\\AppData\\Local\\Microsoft\\Windows\\Fonts\\Font.ttf"
+            )));
+            assert!(!maps_in_place(Path::new("C:\\Windows\\Temp\\Font.ttf")));
+            assert!(!maps_in_place(Path::new(
+                "C:\\Windows\\Fonts\\..\\Temp\\Font.ttf"
+            )));
         }
+        #[cfg(not(windows))]
+        assert!(!maps_in_place(Path::new("C:\\Windows\\Fonts\\msyh.ttc")));
         // The per-user directories in particular: they are what a user
         // rewrites in place, and they are the ones the resolver prefers.
         if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
@@ -627,9 +886,9 @@ mod tests {
     /// The mapping arm answers the SAME bytes the copy arm does, and the
     /// residency policy is [`maps_in_place`]: a file outside the system font
     /// volume — here a fixture directory, standing in for every user-writable
-    /// path — is copied, one on the volume is mapped (unix). The on-volume
-    /// case uses a real system font when the host has one; there is no
-    /// fixture path on a read-only volume.
+    /// path — is copied, one on the volume is mapped (unix, Windows). The
+    /// on-volume case uses a real system font when the host has one; there is
+    /// no fixture path on a read-only volume.
     #[test]
     fn admit_font_file_maps_only_the_system_font_volume_and_matches_the_copy() {
         let root = fixture_dir("admit-policy");
@@ -651,7 +910,7 @@ mod tests {
             "the copy arm carries the empty file as-is"
         );
 
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             let candidate = MAPPABLE_FONT_ROOTS
                 .iter()
@@ -699,6 +958,158 @@ mod tests {
                 _ => unreachable!("both admissions were asserted mapped"),
             }
         }
+        std::fs::remove_dir_all(root).expect("remove font-file fixtures");
+    }
+
+    /// The Windows mapping arm's stand-in for a read-only volume, checked
+    /// against the OS rather than assumed: while a view is live, opening the
+    /// file for WRITING fails with a sharing violation (the admission handle
+    /// refuses write sharing and the mapping keeps it), readers still open it,
+    /// and the refusal lifts with the view. A fixture directory cannot sit
+    /// under the system font directory, so this drives the same open and map
+    /// [`admit_font_file`] makes for a path there.
+    #[cfg(windows)]
+    #[test]
+    fn a_mapped_font_refuses_writers_until_it_is_dropped() {
+        const ERROR_SHARING_VIOLATION: i32 = 32;
+        let root = fixture_dir("win-map-share");
+        let path = root.join("face.ttf");
+        std::fs::write(&path, b"mapped-font-bytes").expect("write fixture");
+
+        let file = open_regular_shared(&path, win::FILE_SHARE_READ | win::FILE_SHARE_DELETE)
+            .expect("the mapping open succeeds with no writer present");
+        let length = check_observed_size(&file, MAX_FONT_FILE_BYTES).expect("size");
+        let mapped = MappedFontFile::map(&file, length).expect("map the fixture");
+        drop(file);
+        assert_eq!(&mapped[..], b"mapped-font-bytes");
+
+        let writer = std::fs::OpenOptions::new().write(true).open(&path);
+        assert_eq!(
+            writer.as_ref().err().and_then(io::Error::raw_os_error),
+            Some(ERROR_SHARING_VIOLATION),
+            "a writer opened the file while its bytes were a live mapping: {writer:?}"
+        );
+        assert_eq!(
+            read_font_file(&path).expect("readers are not refused"),
+            b"mapped-font-bytes"
+        );
+
+        drop(mapped);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("the write refusal must lift with the mapping");
+        std::fs::remove_dir_all(root).expect("remove font-file fixtures");
+    }
+
+    /// The other half: a mappable file a WRITER already holds is not mapped
+    /// (its bytes could change under the view) and is not refused either — it
+    /// is admitted as a copy through the fully-shared open.
+    #[cfg(windows)]
+    #[test]
+    fn a_mappable_font_a_writer_holds_is_copied_not_refused() {
+        let root = fixture_dir("win-map-writer");
+        let path = root.join("face.ttf");
+        std::fs::write(&path, b"held-by-a-writer").expect("write fixture");
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open the writer");
+
+        let (file, may_map) = open_for_admission(&path, true).expect("a held file still admits");
+        assert!(!may_map, "a file a writer holds must not be mapped");
+        let length = check_observed_size(&file, MAX_FONT_FILE_BYTES).expect("size");
+        let mut bytes = Vec::new();
+        read_admitted_handle(file, length, MAX_FONT_FILE_BYTES, &mut bytes).expect("copy");
+        assert_eq!(bytes, b"held-by-a-writer");
+
+        drop(writer);
+        let (_, may_map) = open_for_admission(&path, true).expect("admits once released");
+        assert!(may_map, "with no writer the same file is mappable again");
+        std::fs::remove_dir_all(root).expect("remove font-file fixtures");
+    }
+
+    /// A writable view keeps its section alive even after both handles close.
+    /// Admission must still copy: no immutable Rust slice may alias that view.
+    #[cfg(windows)]
+    #[test]
+    fn a_writable_view_without_its_handles_is_copied_not_mapped() {
+        use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
+
+        struct WritableView(std::ptr::NonNull<std::ffi::c_void>);
+
+        impl Drop for WritableView {
+            fn drop(&mut self) {
+                // SAFETY: this guard owns the live view returned below and
+                // unmaps it once, including when an assertion unwinds.
+                unsafe { win::UnmapViewOfFile(self.0.as_ptr()) };
+            }
+        }
+
+        const PAGE_READWRITE: u32 = 0x04;
+        const FILE_MAP_WRITE: u32 = 0x0002;
+        let root = fixture_dir("win-map-prior-view");
+        let path = root.join("face.ttf");
+        let expected = b"held-by-a-writable-view";
+        std::fs::write(&path, expected).expect("write fixture");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open the writable mapping file");
+        // SAFETY: the file is open for reading/writing and is nonempty; an
+        // unnamed PAGE_READWRITE section covers its existing contents.
+        let raw_section = unsafe {
+            win::CreateFileMappingW(
+                file.as_raw_handle(),
+                std::ptr::null_mut(),
+                PAGE_READWRITE,
+                0,
+                0,
+                std::ptr::null(),
+            )
+        };
+        assert!(!raw_section.is_null(), "{}", io::Error::last_os_error());
+        // SAFETY: CreateFileMappingW returned a live handle, transferred to
+        // this guard so a later failure still closes it exactly once.
+        let section = unsafe { OwnedHandle::from_raw_handle(raw_section) };
+        // SAFETY: the section is live and contains expected.len() bytes.
+        let raw_view = unsafe {
+            win::MapViewOfFile(
+                section.as_raw_handle(),
+                FILE_MAP_WRITE,
+                0,
+                0,
+                expected.len(),
+            )
+        };
+        let view = WritableView(
+            std::ptr::NonNull::new(raw_view)
+                .unwrap_or_else(|| panic!("{}", io::Error::last_os_error())),
+        );
+        drop(section);
+        drop(file);
+
+        let (file, may_map) = open_for_admission(&path, true).expect("a live view still admits");
+        assert!(
+            !may_map,
+            "a writable view without handles must prevent mapping"
+        );
+        let length = check_observed_size(&file, MAX_FONT_FILE_BYTES).expect("size");
+        let mut bytes = Vec::new();
+        read_admitted_handle(file, length, MAX_FONT_FILE_BYTES, &mut bytes).expect("copy");
+        assert_eq!(bytes, expected);
+
+        drop(view);
+        let (file, may_map) = open_for_admission(&path, true).expect("admits after unmapping");
+        assert!(
+            may_map,
+            "the same file is mappable after its writable view closes"
+        );
+        let mapped = MappedFontFile::map(&file, length).expect("map the released fixture");
+        assert_eq!(&mapped[..], expected);
+        drop(mapped);
+        drop(file);
         std::fs::remove_dir_all(root).expect("remove font-file fixtures");
     }
 

@@ -70,8 +70,8 @@ fn switching_the_active_tab_blurs_the_tab_left_and_focuses_the_tab_arrived_at() 
         "the tab arrived at must be told it has the keyboard"
     );
 
-    // ... and the same in the other direction, through the CYCLE lane the
-    // next/prev-tab accelerator and the Window menu both dispatch.
+    // The same the other way through `cycle_tab_in`, which the next/prev-tab accelerator and
+    // the Window menu dispatch.
     app.cycle_tab_in(wid, true);
     assert_eq!(
         drain(pipe_a),
@@ -85,9 +85,8 @@ fn switching_the_active_tab_blurs_the_tab_left_and_focuses_the_tab_arrived_at() 
     );
 }
 
-/// A session that never armed DEC 1004 hears nothing, and a re-sync that
-/// moves no keyboard writes nothing to a session that did. The report is a
-/// DELTA, not a heartbeat.
+/// A session that never armed DEC 1004 hears nothing, and a re-sync that moves no keyboard
+/// writes nothing to a session that did: the report is a delta, not a heartbeat.
 #[test]
 fn an_unarmed_session_and_a_switch_that_moves_nothing_both_write_no_bytes() {
     let (pipe_a, sink_a) = observer();
@@ -195,21 +194,16 @@ fn an_unfocused_windows_tab_switch_is_silent_and_regaining_focus_reports_once() 
         "the tab the user left is not re-blurred"
     );
 
-    // And the account survives the round trip: the very next switch is a
-    // clean out/in pair rather than a doubled arrival.
+    // The next switch is a clean out/in pair, not a doubled arrival.
     app.switch_tab_in(wid, 1);
     assert_eq!(drain(pipe_a), FOCUS_OUT.to_vec());
     assert_eq!(drain(pipe_b), FOCUS_IN.to_vec());
 }
 
-/// At most one session in the process is told it holds the keyboard. Windows are born
-/// `focused: true` and some never get a `Focused` event, so the holder is resolved from
-/// `frontmost_window`. Pinned in order:
-///   1. tearing the active tab into its own window writes nothing (same session keeps
-///      the keyboard);
-///   2. a tab switch in the window left behind writes nothing;
-///   3. bringing that window to the front moves the claim: `ESC[O` to the other
-///      window's session, `ESC[I` to the arriving one.
+/// At most one session in the process holds the keyboard. Windows are born `focused: true` and
+/// some never get a `Focused` event, so the holder is resolved from `frontmost_window`: tearing
+/// out the active tab and a tab switch in the window left behind write nothing; bringing that
+/// window to the front blurs the other window's session, then focuses the arriving one.
 #[test]
 fn only_the_front_window_ever_claims_the_keyboard() {
     let (pipe_a, sink_a) = observer();
@@ -226,9 +220,8 @@ fn only_the_front_window_ever_claims_the_keyboard() {
     let _ = drain(pipe_b);
     let _ = drain(pipe_c);
 
-    // Tab 2 (session 2) is active and holds the keyboard. Tear it out into
-    // its own window: window B is born `focused: true` with no OS surface
-    // and no `WindowEvent::Focused` in its future.
+    // Tear out the active tab (session 2): window B is born `focused: true`, with no OS
+    // surface and no `WindowEvent::Focused` to come.
     let wid_b = app.detach_active_tab_logical().expect("the tab tears out");
     assert_ne!(wid_b, wid_a);
     assert!(
@@ -241,8 +234,7 @@ fn only_the_front_window_ever_claims_the_keyboard() {
         "moving a tab to its own window hands the keyboard to the session that already had it: nothing to report"
     );
 
-    // A tab switch in the window left BEHIND. It is not where keystrokes go,
-    // so it may not blur or focus anything.
+    // A tab switch in the window left behind, which is not where keystrokes go.
     app.switch_tab_in(wid_a, 0);
     assert!(
         drain(pipe_a).is_empty() && drain(pipe_b).is_empty() && drain(pipe_c).is_empty(),
@@ -291,9 +283,7 @@ fn a_controller_focus_in_survives_the_next_resync() {
     app.on_focus(wid, true);
     assert_eq!(drain(pipe_a), FOCUS_IN.to_vec(), "the verb focuses");
 
-    // A bare re-stabilization must now write nothing: the account already
-    // names this session, and a holder gate that could not see a
-    // controller-asserted focus would blur it here.
+    // A bare re-sync writes nothing: the account already names this session.
     app.sync_window(wid);
     app.sync_active_session();
     assert!(
@@ -314,10 +304,8 @@ fn a_tab_switch_reports_focus_without_taking_an_engine_lock() {
     app.push_stub_tab(wid, stub_session_with_sink(1, sink_b));
     let acq = crate::term_lock_acquisitions_on_this_thread;
 
-    // The control, chosen so it provably cannot reach the egress seam at
-    // all: with the window blurred the holder is already `None`, so the
-    // delta returns before any report. What this switch costs the engine
-    // mutex is what a tab switch cost before focus reporting existed.
+    // Control: with the window blurred the holder is already `None`, so the delta returns
+    // before any report; this switch's lock count is the baseline.
     app.on_focus(wid, false);
     let _ = drain(pipe_a);
     let _ = drain(pipe_b);
@@ -335,8 +323,7 @@ fn a_tab_switch_reports_focus_without_taking_an_engine_lock() {
     let _ = drain(pipe_a);
     let _ = drain(pipe_b);
 
-    // The MEASUREMENT: the same gesture, moving the keyboard between two
-    // sessions that have both armed DEC 1004, so both reports are written.
+    // The same gesture between two sessions that both armed DEC 1004: both reports written.
     let before = acq();
     app.switch_tab_in(wid, 1);
     let with_reports = acq() - before;

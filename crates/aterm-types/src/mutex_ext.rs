@@ -6,16 +6,10 @@
 
 use std::sync::{Mutex, MutexGuard};
 
-/// Extension trait for [`Mutex`] that recovers from poisoned locks.
-///
-/// Terminal state must remain accessible even if a thread panicked while
-/// holding a lock. This trait provides a concise, auditable recovery path
-/// replacing the verbose `.lock().unwrap_or_else(|e| e.into_inner())` pattern.
-///
-/// F11-4 (#7941): recovery is visible. Silent poison recovery hides the fact
-/// that some other thread panicked mid-critical-section, which can leave
-/// invariants half-established. `lock_or_recover` logs an `error!` line the
-/// first time a given lock is observed poisoned so operators see a signal.
+/// Extension trait for [`Mutex`] that recovers from poisoned locks, so terminal state stays
+/// reachable after a thread panicked holding one. Recovery is never silent: every poisoned
+/// acquire logs an error with the caller's location, since the panicking thread may have left
+/// invariants half-established.
 pub trait MutexExt<T> {
     /// Acquires the lock, recovering from poison if needed.
     fn lock_or_recover(&self) -> MutexGuard<'_, T>;
@@ -28,17 +22,9 @@ impl<T> MutexExt<T> for Mutex<T> {
         match self.lock() {
             Ok(guard) => guard,
             Err(poisoned) => {
-                // F11-4 (#7941): never silently swallow poison. Include the
-                // caller location so operators can tell which lock it was.
-                //
-                // Trust gate note: this calls `aterm_log::__log` directly with a
-                // constant message and routes the caller location through the
-                // record's `file`/`line` fields, instead of the `error!` macro.
-                // The macro's `format_args!` with runtime arguments produces an
-                // `fmt::Arguments` constructor the Trust native lowering cannot
-                // model; a constant-literal `format_args!` lowers fine. The log
-                // record carries the same signal (level, message, caller
-                // file/line), and recovery semantics are byte-identical.
+                // Never silent: log with the caller's location. `aterm_log::__log` takes a
+                // constant message and the caller in the record's file/line, not `error!`: a
+                // runtime-argument `format_args!` cannot be lowered by Trust, a constant one can.
                 let caller = ::core::panic::Location::caller();
                 aterm_log::__log(
                     aterm_log::Level::Error,

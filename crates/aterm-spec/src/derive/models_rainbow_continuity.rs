@@ -86,7 +86,7 @@ pub fn rainbow_typed_continuity_model() -> Model {
             invariant RejoinNeedsExactContent: revived <= exact;
             invariant RejoinNeedsFreshChain: revived <= fresh;
             invariant DormantCacheDoesNotWake: idle_work == 0;
-            invariant Bounded:
+            bound Bounded:
                 phase <= 3 && authored <= 1 && cached <= 1 && live <= 1
                     && licence <= 1 && cleared <= 1 && same_row <= 1
                     && adjacent <= 1 && exact <= 1 && fresh <= 1

@@ -190,13 +190,14 @@ fn the_synthesis_still_reports_the_miss_to_a_poll_based_host() {
 /// the synthesis, which is the "a real face always wins" contract. This pins
 /// both halves of that behaviour change on the intercept path, which
 /// `the_synthesis_still_reports_the_miss_to_a_poll_based_host` (no colour
-/// face) does not reach.
+/// face) does not reach. Linux's Noto Color Emoji is the face whose
+/// silhouette is the key cap, so the test is Linux's.
+#[cfg(target_os = "linux")]
 #[test]
 fn the_colour_silhouette_intercept_draws_the_disc_and_reports_the_text_class() {
     let emoji = "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf";
     let Ok(bytes) = std::fs::read(emoji) else {
-        eprintln!("SKIP: {emoji} is not installed here");
-        return;
+        aterm_spec::host::could_not_run(format!("{emoji} is not installed here"));
     };
     let mut r = renderer(false, false);
     r.set_color_font_bytes(bytes).expect("colour face parses");
@@ -306,8 +307,8 @@ fn the_tree_connector_meets_a_vertical_line_above_it() {
 /// the previous revision drew it in the last-resort tier, so on any host with
 /// a face covering U+23BF (Noto CJK on the Linux host that reported the bug)
 /// the font's short bottom-of-cell `⎿` won and left a gap under the `│` above.
-/// Checked through `glyph_key` / `glyph_image`, on every policy, and — where a
-/// real CJK face is installed — with that face injected into the chain.
+/// Checked through `glyph_key` / `glyph_image`, on every policy, and with the
+/// checked-in Iosevka Term (which maps U+23BF) injected into the chain.
 #[test]
 fn the_renderer_draws_the_tree_connector_procedurally_even_when_a_font_covers_it() {
     let check = |r: &mut Renderer, label: &str| {
@@ -328,13 +329,9 @@ fn the_renderer_draws_the_tree_connector_procedurally_even_when_a_font_covers_it
         let mut r = renderer(runtime, sealed);
         check(&mut r, &format!("runtime={runtime} sealed={sealed}"));
     }
-    let cjk = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc";
-    match std::fs::read(cjk) {
-        Ok(bytes) => {
-            let mut r = renderer(false, false);
-            r.add_fallback_bytes(&bytes).expect("CJK face admissible");
-            check(&mut r, "with Noto Sans CJK (covers U+23BF) in the chain");
-        }
-        Err(_) => eprintln!("SKIP (font-covers half): {cjk} is not installed here"),
-    }
+    let iosevka = include_bytes!("../assets/bundled/IosevkaTerm-Regular.ttf");
+    let mut r = renderer(false, false);
+    r.add_fallback_bytes(iosevka)
+        .expect("Iosevka Term admissible");
+    check(&mut r, "with Iosevka Term (covers U+23BF) in the chain");
 }

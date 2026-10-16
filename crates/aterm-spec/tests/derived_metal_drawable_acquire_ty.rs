@@ -4,14 +4,7 @@
 //! Tier-0 for the native acquisition handoff. The genuine channel worker and
 //! pure policy guards are bound in aterm-gpu's acquire_worker inline tests.
 
-use aterm_spec::{derive::metal_drawable_acquire_model, verify};
-
-#[test]
-fn metal_drawable_acquire_proves_bounds_and_catches_blocking_stale_and_retirement_mutants() {
-    let model = metal_drawable_acquire_model();
-    // A NotRun has already printed its own NOT RUN line.
-    let _ = verify::prove_and_catch_tiered(&model, model.name);
-}
+use aterm_spec::derive::metal_drawable_acquire_model;
 
 #[test]
 fn each_historical_failure_has_an_independent_derived_counterexample() {

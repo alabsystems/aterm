@@ -12,7 +12,7 @@ pub use aterm_scrollback::{
 // The construction-default total retention cap, for embedders that report
 // budgets and limits (wasm exports, the daemon builder).
 pub use aterm_scrollback::DEFAULT_LINE_LIMIT;
-// Disk cold-tier types are disk-tier-gated in aterm-scrollback (mmap + zstd-sys);
+// Disk cold-tier types are disk-tier-gated in aterm-scrollback (libc mmap);
 // dropped on wasm.
 #[cfg(feature = "disk-tier")]
 pub use aterm_scrollback::{DiskBackedScrollback, DiskBackedScrollbackConfig};

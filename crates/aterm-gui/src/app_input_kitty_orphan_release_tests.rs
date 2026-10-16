@@ -20,12 +20,10 @@ fn pairing_step(
     }
 }
 
-/// A key release whose press a GUI gate consumed (settings/search mode, a
-/// keybinding `Action`, a Cmd/Super shortcut, a scrollback/pane/zoom chord,
-/// an IME-suppressed key) is swallowed exactly once: `take_consumed_release`
-/// removes the tracked physical key and returns `true`, so `on_key` returns
-/// without reaching the seam encoder (no orphan Kitty `REPORT_EVENT_TYPES`
-/// release report). A second release, or any untracked key, still encodes.
+/// A key release whose press a GUI gate consumed is swallowed exactly once:
+/// `take_consumed_release` removes the tracked physical key and returns `true`,
+/// so `on_key` never reaches the encoder (no orphan Kitty release report). A
+/// second release, or any untracked key, still encodes.
 #[test]
 fn consumed_press_release_is_swallowed_exactly_once() {
     let mut app = App::headless_for_test();
@@ -34,24 +32,23 @@ fn consumed_press_release_is_swallowed_exactly_once() {
     let other = PhysicalKey::Code(KeyCode::KeyB);
     let model = aterm_spec::derive::input_release_pairing_model();
     let mut state = model.init_state();
-    // No tracked press yet: a normal key's release is forwarded (encodes as today).
+    // No tracked press yet: a normal key's release is forwarded.
     assert!(
         !app.take_consumed_release(wid, key),
         "an untracked release is not swallowed"
     );
     assert!(model.successors("ReleaseConsumedPress", &state).is_empty());
     assert!(model.successors("ReleaseForwardedPress", &state).is_empty());
-    // A GUI gate consumed this physical key's PRESS.
+    // A GUI gate consumed this physical key's press.
     app.note_consumed_press_key(wid, key, false);
     pairing_step(&model, &mut state, "ConsumePhysicalPress");
 
-    // Tier-1 non-vacuity: the removed branch emits a release after a consumed
-    // press and violates both byte-silence and orphan-report obligations.
+    // Non-vacuity: emitting a release after a consumed press breaks byte silence.
     let buggy = aterm_spec::interp::with_buggy(&model, 1);
     let mut mutant = state.clone();
     assert!(buggy.fire("ReleaseConsumedPress", &mut mutant));
     assert!(!buggy.check_invariant("NoOrphanCsiUBytes", &mutant));
-    // The matching RELEASE is swallowed and its entry removed.
+    // The matching release is swallowed and its entry removed.
     assert!(
         app.take_consumed_release(wid, key),
         "the matching release is swallowed (no orphan release report)"
@@ -65,8 +62,8 @@ fn consumed_press_release_is_swallowed_exactly_once() {
             .is_empty(),
         "the entry is removed on the first release"
     );
-    // A second release for the SAME key is not swallowed (no stale double-swallow),
-    // and an unrelated key is never affected.
+    // A second release of the same key is not swallowed, and an unrelated key
+    // is never affected.
     assert!(
         !app.take_consumed_release(wid, key),
         "no stale double-swallow"
@@ -77,9 +74,8 @@ fn consumed_press_release_is_swallowed_exactly_once() {
     );
 }
 
-/// Defensive field-level rule: even if a future caller presents a REPEAT to
-/// the consumed-note seam, it cannot rewrite an existing forwarded episode.
-/// Shipping `on_key` routes repeats before all live GUI gates.
+/// A repeat presented to the consumed-note seam cannot rewrite a forwarded
+/// episode (shipping `on_key` routes repeats before every GUI gate anyway).
 #[test]
 fn repeat_does_not_note_and_release_is_not_swallowed() {
     let mut app = App::headless_for_test();
@@ -88,8 +84,8 @@ fn repeat_does_not_note_and_release_is_not_swallowed() {
     let model = aterm_spec::derive::input_release_pairing_model();
     let mut state = model.init_state();
     pairing_step(&model, &mut state, "ForwardPress");
-    // Plain press fell through to the encoder. Any later repeat-note attempt
-    // is a no-op, so the app remains owed the matching release.
+    // The press fell through to the encoder; repeat notes are no-ops, so the
+    // app is still owed the matching release.
     app.note_consumed_press_key(wid, key, true);
     app.note_consumed_press_key(wid, key, true);
     assert!(

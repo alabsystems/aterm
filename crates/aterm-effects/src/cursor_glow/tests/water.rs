@@ -42,9 +42,8 @@ fn water_stays_in_ocean_hues() {
     }
 }
 
-/// The water dynamic range: relaxed typing is a TRICKLE, a sustained fast
-/// run is the TORPEDO — far more light and far more droplet quads at the
-/// same config.
+/// Water's dynamic range: relaxed typing is a trickle, a sustained fast run a torpedo with far
+/// more light and far more droplet quads at the same config.
 #[test]
 fn water_scales_from_trickle_to_torpedo() {
     let g = geom();
@@ -86,9 +85,9 @@ fn water_scales_from_trickle_to_torpedo() {
     );
 }
 
-/// Slow typing must DRIP: after the crown and the typing wake have decayed
-/// (350 ms > CROWN_MS and any typing spark's life), the only light left is
-/// droplets — and at least one must have fallen BELOW the typed row.
+/// Slow typing drips: once the crown and the typing wake have decayed (`CROWN_TYPING_MS` after
+/// the last key), the only light left is droplets, and at least one has fallen below the typed
+/// row.
 #[test]
 fn water_drips_fall_below_the_typed_row() {
     let g = geom();
@@ -276,9 +275,9 @@ fn water_repaint_corridor_deduplicates_and_cannot_cover_text() {
         glow.water_samples.len(),
         "each visible coordinate has exactly one Water owner"
     );
-    // Uniqueness alone would also accept an oldest-owner traversal. Pick a
-    // coordinate whose alternating passes carry visibly different path
-    // positions and prove the selected color belongs to its NEWEST resident.
+    // Uniqueness alone would also accept an oldest-owner traversal. Pick a coordinate whose
+    // alternating passes carry visibly different path positions and prove the selected color
+    // belongs to its newest resident.
     let owner_cell = (2, 10);
     let selected = glow
         .water_samples
@@ -451,5 +450,33 @@ fn water_jump_reflection_drips_then_fades_smoothly_to_zero() {
     assert!(
         glow.under_quads().is_empty() && glow.water_samples.is_empty(),
         "the eased residue reaches exact idle zero"
+    );
+}
+
+/// Light-theme law: the wake is additive light, which cannot show on a white
+/// ground, so on `dark_theme: false` a typed run lays source-over veils and no
+/// additive wake; the dark wake above is untouched.
+#[test]
+fn light_theme_wake_is_veils_not_additive() {
+    let g = geom();
+    let mut c = cfg(GlowStyle::Water, true);
+    c.dark_theme = false;
+    let t0 = Instant::now();
+    let mut out = Vec::new();
+    let mut glow = CursorGlow::default();
+    glow.tick(Some((2, 4)), t0, &c, g, &mut out);
+    let mut t = t0;
+    for col in 5..=9u16 {
+        t += Duration::from_millis(60);
+        glow.note_synthetic_typed(t, 1);
+        glow.tick(Some((2, col)), t, &c, g, &mut out);
+    }
+    assert!(
+        glow.under_quads().is_empty(),
+        "no additive wake under the ink on a light theme"
+    );
+    assert!(
+        glow.halos().iter().any(|h| h.mode == HaloMode::Over),
+        "the light-theme wake renders as source-over veils"
     );
 }

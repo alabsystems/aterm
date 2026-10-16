@@ -619,7 +619,7 @@ type Beside<'a> = &'a dyn Fn(&str, &str) -> bool;
 /// and answers `rustc 1.99.0-dev (450403669 2026-09-24)`; `rustdoc` is
 /// byte-identical to `trustdoc`. Neither is stock, so by path beside its twin
 /// neither is a hit — the page `aterm help rust` prints names that directory as
-/// the gates' toolchain, and `build/<host>/stage2/bin/rustc -vV` is how the trust
+/// the check toolchain, and `build/<host>/stage2/bin/rustc -vV` is how the trust
 /// repository reads the compiler under measurement (the INSTALLED `trustc` a
 /// refusal would name instead is a different artifact:
 /// docs/TOOLCHAIN_POSTURE.md in that repository).

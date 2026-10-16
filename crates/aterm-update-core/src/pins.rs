@@ -1,215 +1,103 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! THE trust anchors. Every one of them, in one file.
+//! The trust anchors, all in one file.
 //!
-//! Changing a value here is a reviewed commit. There is no other way to change what
-//! a build trusts — no environment variable, no per-machine file, no build flag.
-//!
-//! # Why these are constants and not `option_env!`
-//!
-//! These were compiled in from the build environment (`ATERM_UPDATE_PUBKEY`,
-//! `ATERM_PKG_ROOTKEY`, `ATERM_EXPECTED_TEAM_ID`), exported into the child cargo
-//! build by the release cutter. That made **what a binary trusts a property of the
-//! shell that compiled it rather than of the source**, with three costs paid in
-//! practice:
-//!
-//! * A locally built `atpkg` had an EMPTY root key and refused every install with
-//!   `atpkg: disabled (no root key pinned or overridden)`. Same commit, same machine,
-//!   different trust, and no diff anywhere to review.
-//! * An unset variable is silent: `option_env!` yields `None`, the pin becomes `""`,
-//!   and the consumer goes inert without saying so.
-//! * "What does this build trust?" could not be answered by reading the repository.
-//!
-//! As constants the answer is a `git diff`, identical on every machine, and carried
-//! in history like any other reviewed change.
-//!
-//! # Empty means unpinned, and unpinned means inert
-//!
-//! An empty anchor is the fail-closed default: with nothing compiled in there is
-//! nothing to trust, so the consumer stays inert rather than accepting anything. A
-//! fork or private channel commits its OWN anchors here — the same deliberate,
-//! reviewable act as changing `update_channel`.
-//!
-//! # The anchors in this file
+//! Changing a value here is a reviewed commit: no environment variable, per-machine file or
+//! build flag changes what a build trusts, so the source and its history say it. An empty
+//! anchor is unpinned and inert: with nothing compiled in there is nothing to trust. A fork or
+//! private channel commits its own anchors here.
 //!
 //! | Anchor | Signs | Where its secret half lives |
 //! |---|---|---|
-//! | [`PAPER_MASTER_PUBKEYS`] | the machine roster — which authorizes BOTH release manifests and atpkg's `index.toml` | **on paper, on no computer** |
+//! | [`PAPER_MASTER_PUBKEYS`] | the machine roster, which authorizes release manifests and atpkg's `index.toml` | on paper, on no computer |
 //! | [`APPLE_TEAM_ID`] | (not a key) the optional Developer-ID tier | Apple |
 //! | [`WINDOWS_SIGNING_PUBLISHER`] | (not a key) the optional Windows code-signing tier | the signing service |
 //!
-//! # ONE ROOT
+//! [`PAPER_MASTER_PUBKEYS`] is the one trust root: it signs the machine roster, and a rostered
+//! machine signs the release appcast, atpkg's `index.toml` and every `pkg-*.toml`. The
+//! delegation buys revocation because the root is elsewhere: a stolen laptop yields a machine
+//! key the master can revoke. See `docs/RELEASE-KEYS.md`.
 //!
-//! There is exactly one trust root in this tree, and it is [`PAPER_MASTER_PUBKEYS`]. It
-//! signs the machine roster; a machine on that roster signs the release appcast AND
-//! atpkg's `index.toml` AND every `pkg-*.toml`. One thing written on paper, one document
-//! to audit, one revocation that stops everything a stolen machine can publish.
-//!
-//! Two retired roots are gone for good: atpkg's second root (`PKG_ROOT_PUBKEY`, with its
-//! own delegation tier) and the channel keyset (`UPDATE_CHANNEL_PUBKEYS`, "K1") that
-//! builds older than v0.21.0 verified releases under before the roster existed. Those
-//! installs are abandoned (owner ruling, 2026-09-23): every client from v0.21.0 on
-//! authorizes a release by the master-signed roster alone and never consulted K1, so
-//! nothing a current client needs was removed with it. K1's private half is simply the
-//! roster machine `incumbent-head` now — revocable like any other.
-//!
-//! # Why a two-level hierarchy
-//!
-//! A delegation tier buys revocation ONLY if the root is genuinely elsewhere. A master
-//! that is ON PAPER is: it is present on no computer, it is touched only to mint or
-//! revoke a machine key, and a thief who takes a laptop gets a machine key that the
-//! master can revoke without them. See `docs/RELEASE-KEYS.md`.
-//!
-//! # Rotation
-//!
-//! [`PAPER_MASTER_PUBKEYS`] is a LIST, and clients accept any member: replacing one
-//! master with another in a single release would strand every client still holding the
-//! old one. Rotating means shipping a build that carries both, waiting out adoption,
-//! then dropping the old one. Machines rotate without any of this — `atpkg-keys join`
-//! and `machine-revoke` re-sign the roster, and no binary changes.
+//! `crates/aterm-gui/build.rs` compiles this file by `#[path]` to derive the Mach-O
+//! `__aterm_upin` record from [`PAPER_MASTER_PUBKEYS`]. Keep it self-contained: no `use` and no
+//! `crate::` path outside `#[cfg(test)]`.
 
-/// Ed25519 public key(s) of the **paper MASTER** — the offline root of the machine
-/// roster, and the ONE anchor that authorizes a release. ARMED in this tree since
-/// 2026-08-15 (`atpkg-keys setup --id m3`).
+/// Ed25519 public key(s) of the paper master: the offline root of the machine roster and the
+/// one anchor that authorizes a release.
 ///
-/// # What this key is, and what it is not
+/// The master signs only `aterm-machines.toml`, the roster naming which machines may sign
+/// releases and which are revoked (`roster`). Its secret half is 52 base32 characters on paper,
+/// on no computer, typed in only to mint or revoke a machine key. A client authorizes a release
+/// by the roster alone: also accepting some compiled-in key would let a revoked machine keep
+/// publishing to every build that carried it.
 ///
-/// The master signs exactly one kind of document: `aterm-machines.toml`, the roster that
-/// names which machines may sign releases and which machines have been revoked
-/// (`aterm_update_core::roster`). It signs no release, no package and no artifact. Its
-/// secret half is written on paper as 52 base32 characters and exists on **no computer**
-/// — it is typed in only to mint a machine key or to revoke one, and scrubbed
-/// immediately after.
+/// An empty slice (a fork with no master of its own) removes the signature tier:
+/// `roster::verify_roster` returns `Disabled` and trust is the channel repository over TLS, the
+/// manifest sha256 and the codesign/Team-ID checks. An empty member is never legal: it reads
+/// as armed and authorizes nobody.
 ///
-/// A client authorizes a release by the roster ALONE: the appcast must be signed by a
-/// machine the master-signed roster names and has not revoked. There is no second key a
-/// client also accepts — an OR of "roster or some compiled-in key" would let a revoked
-/// machine keep publishing to every build that carried its key, forever.
+/// A client accepts any member, so a planned rotation is append, wait out adoption, drop. A
+/// lost paper is remedied only by a new binary carrying a new pin. Test vectors never land
+/// here: any value in this file is the live root of trust.
 ///
-/// # Empty means unpinned — the signature tier is ABSENT
+/// Do not hand-edit the value: `atpkg-keys` writes it and re-reads the file to prove it landed.
 ///
-/// An empty SLICE (a fork that has not committed a master of its own) removes the
-/// signature tier: `roster::verify_roster` returns `Disabled`, the updater verifies no
-/// appcast signature, and trust is the channel repository over TLS plus the manifest
-/// sha256 and the codesign/Team-ID checks — the same shape as an empty [`APPLE_TEAM_ID`]
-/// removing the Developer-ID tier without loosening anything beside it.
+/// 1. `atpkg-keys setup --id <id>`, once ever: generates the master, shows its phrase once on
+///    `/dev/tty` and demands it retyped, writes the public key here, mints this machine's key
+///    and creates the roster. It refuses if a master is already committed.
+/// 2. Review and commit; the tool only edits the working tree.
+/// 3. `atpkg-keys join --id <id>` on each later publishing machine (copy `aterm-machines.toml`
+///    and its `.sig` there first): proves the phrase, mints locally, re-signs the roster.
+/// 4. `atpkg-keys machine-revoke --id <id>` bumps `roster_seq` and re-signs the roster.
 ///
-/// An empty STRING MEMBER is never legal: it would leave a non-empty anchor list that
-/// authorizes nobody, which reads as "armed" and refuses everything. The tests below
-/// refuse it.
-///
-/// # A LIST, so a planned rotation is possible
-///
-/// A client that accepts exactly one master cannot be told about a replacement by a
-/// document it would refuse to verify. If the paper is lost or destroyed, the ONLY
-/// remedy is a new binary carrying a new pin — so the list exists to make a planned
-/// rotation (append → wait out adoption → drop) possible at all. The paper master is a
-/// single point of total failure in both directions: photographed, the scheme is gone;
-/// lost, no machine can ever be added or revoked again.
-///
-/// # ⚠ NEVER commit a real-looking key here
-///
-/// Any value in this file is the live root of trust for every user. Test vectors are
-/// generated inside tests from obviously-synthetic seeds and must never land here.
-///
-/// # Machines — two commands, and the human types only the phrase
-///
-/// **Do not hand-edit the value below.** `atpkg-keys` writes it and re-reads this file to
-/// prove the value it intended is the value now present.
-///
-/// 1. **Once ever, on the first machine:** `atpkg-keys setup --id <id>` generates the
-///    paper master, shows its 52 characters ONCE on `/dev/tty`, demands them retyped from
-///    the paper, writes the master's public key here, mints this machine's key and
-///    creates the master-signed roster. It refuses if a master is already committed.
-/// 2. **Review and commit.** The tool edits the working tree and stops; arming a trust
-///    anchor is a reviewed act.
-/// 3. **Every later publishing machine:** `atpkg-keys join --id <id>` proves the phrase
-///    against the committed anchor and the existing roster, mints locally and re-signs
-///    the roster. It edits no trust anchor. Copy `aterm-machines.toml` and its `.sig` to
-///    the machine first — `join` refuses to start a second roster.
-/// 4. **Revoke with `atpkg-keys machine-revoke --id <id>`**, which bumps `roster_seq`,
-///    re-signs with the paper master, and refreshes the freshness window.
-///
-/// # ⚠ EVERY PUBLISHING MACHINE MUST HOLD A CURRENT ROSTER, not merely a valid one
-///
-/// `roster_seq` is a MONOTONIC channel counter: a client ratchets the highest generation
-/// it has ever OBSERVED and refuses anything below it with `RosterReject::Rollback`.
-/// Because the roster is not distributed with the repository (`dist/` is gitignored), a
-/// machine that did not run the last `join`/`machine-revoke` holds a stale copy.
-/// `aterm_release::publish::roster_floor_covered` refuses a cut that carries an older
-/// generation than the published channel head's. The working rule: **after any `join` or
-/// `machine-revoke`, copy the re-signed roster to every publishing machine before the
-/// next cut from any of them.**
+/// `roster_seq` is monotonic: a client refuses a generation below the highest it has seen
+/// (`RosterReject::Rollback`), and `aterm_release::publish::roster_floor_covered` refuses a cut
+/// carrying an older roster than the channel head's. The roster lives in gitignored `dist/`,
+/// so after any `join` or `machine-revoke` copy it to every publishing machine before the next
+/// cut.
 pub const PAPER_MASTER_PUBKEYS: &[&str] = &[
-    // The PAPER MASTER — the offline root of the machine roster, armed by
-    // `atpkg-keys setup --id m3` on 2026-08-15.
-    // Its secret half is 52 base32 characters ON PAPER and exists on no
-    // computer. It signs aterm-machines.toml and nothing else.
+    // The paper master, armed by `atpkg-keys setup --id m3`.
     "DtiLfpk0iUSrK1/LkyIVf+4C2eGjD2Myf4Sr/FCoMPQ=",
 ];
 
-/// Whether the paper-master roster tier is ARMED for this build.
-///
-/// Fail-closed by construction: an unpinned master means the tier authorizes nothing, so
-/// callers skip it rather than treating an absent roster as permission. This is the same
-/// shape as [`APPLE_TEAM_ID`] — an empty anchor removes a tier, it never weakens the
-/// tiers beside it.
+/// Whether the paper-master roster tier is armed for this build. An unpinned master
+/// authorizes nothing, so callers skip the tier rather than read an absent roster as
+/// permission.
 #[must_use]
 pub const fn roster_tier_armed() -> bool {
     !PAPER_MASTER_PUBKEYS.is_empty()
 }
 
-/// Apple Developer **Team ID** for the optional Tier APPLE anchor.
+/// Apple Developer Team ID for the optional Tier APPLE anchor.
 ///
-/// Empty does NOT disable the updater — it skips the codesign/notarization anchor,
-/// leaving signature + hash verification intact. Non-empty is a promise the release
-/// pipeline must keep: a Developer-ID-signed AND notarized artifact.
+/// Empty skips the codesign/notarization anchor and leaves signature and hash verification
+/// intact. A non-empty value is the whole switch; with no other code change it arms:
 ///
-/// # This one line is the whole switch
+/// * the release pipeline's Developer-ID sign, notarize, staple and verify, or the cut fails
+///   (`aterm-release/src/sign.rs`);
+/// * the cut's self-check of `TeamIdentifier=`, a stapled ticket and a Gatekeeper pass on both
+///   the `.app` and the `.dmg`;
+/// * the in-app updater's refusal of any update not Developer-ID signed by this team
+///   (`aterm-update`'s `PINNED_TEAM_ID` → `verify_bundle_policy`);
+/// * `tools/install.sh`'s `subject.OU = "<TEAM>"` designated requirement.
 ///
-/// The producer and every consumer are already wired to it, so a non-empty value
-/// here simultaneously arms four things and needs no other code change:
+/// The identity string (`Developer ID Application: <name> (<TEAMID>)`) is written nowhere: the
+/// pipeline matches this anchor against `security find-identity -v -p codesigning`, so this
+/// constant is the only place a Team ID appears in the tree.
 ///
-/// * the release pipeline resolves a Developer-ID certificate, signs, notarizes,
-///   staples and verifies — or fails the cut (`aterm-release/src/sign.rs`);
-/// * the cut's self-check demands `TeamIdentifier=`, a stapled ticket and a
-///   Gatekeeper pass on BOTH the `.app` and the `.dmg`;
-/// * the in-app updater refuses any update not Developer-ID signed by this exact
-///   team (`aterm-update`'s `PINNED_TEAM_ID` → `verify_bundle_policy`);
-/// * `tools/install.sh` builds a `subject.OU = "<TEAM>"` designated requirement
-///   and refuses a non-Dev-ID bundle.
+/// Arming is a one-way door: a shipped binary with a non-empty value refuses every future
+/// update not Developer-ID signed by this team, and clearing the value in source does not reach
+/// it. It commits the owner to keeping the Developer Program membership and certificate alive
+/// for as long as pinned clients exist.
 ///
-/// The identity STRING (`Developer ID Application: <name> (<TEAMID>)`) is
-/// deliberately NOT written down anywhere: the pipeline derives it by matching
-/// this anchor against `security find-identity -v -p codesigning`. That keeps
-/// this constant the only place a Team ID appears in the entire tree, which is
-/// the property that makes "what does this build trust?" answerable by a `git
-/// diff` rather than by auditing a keychain.
+/// # Arming Tier APPLE
 ///
-/// # ⚠ This is a one-way door for anyone already running a pinned build
-///
-/// A shipped binary carrying a non-empty value refuses every FUTURE update that
-/// is not Developer-ID signed by this team. Turning the anchor back off in
-/// source does not reach a binary already in the field: those clients are
-/// stranded with no update path if the Developer Program membership lapses or
-/// the certificate expires without replacement. Setting this is a commitment to
-/// keep that membership alive for as long as pinned clients exist, and the first
-/// pinned release must itself be a genuinely notarized cut.
-///
-/// # ACTIVATION CHECKLIST — turning Tier APPLE on
-///
-/// Do these in order. Steps 1–3 are one-time setup on the cutting machine and
-/// change nothing about what ships; step 4 is the reviewed commit that flips it.
-///
-/// 1. **Hold an active Apple Developer Program membership**, and install a
-///    **Developer ID Application** certificate *and its private key* in the
-///    login keychain of the machine that cuts releases. Verify with
-///    `security find-identity -v -p codesigning` — you want EXACTLY ONE line
-///    reading `Developer ID Application: <you> (<TEAMID>)`. If two appear (a
-///    renewal overlapping the incumbent), either delete the superseded one in
-///    Keychain Access or continue to step 3's optional key; the pipeline refuses
-///    to guess between them.
+/// 1. Install a **Developer ID Application** certificate and its private key in the login
+///    keychain of the cutting machine. `security find-identity -v -p codesigning` should show
+///    exactly one `Developer ID Application: <you> (<TEAMID>)` line; with two (a renewal
+///    overlapping the incumbent), delete one or pin one in step 3. The pipeline refuses to
+///    guess.
 ///
 /// 2. **Store the notarytool credential once, outside the repo:**
 ///    ```text
@@ -218,85 +106,50 @@ pub const fn roster_tier_armed() -> bool {
 ///        --team-id <TEAMID> \
 ///        --password <app-specific-password>
 ///    ```
-///    The app-specific password is minted at appleid.apple.com. It is typed into
-///    this command once and never enters the repository, the credentials profile,
-///    or any argv thereafter — `--keychain-profile` is why. `<profile-name>` is a
-///    label you choose; nothing else derives meaning from it.
+///    The app-specific password (minted at appleid.apple.com) is typed only here;
+///    `--keychain-profile` keeps it out of the repository, the credentials profile and every
+///    later argv.
 ///
-/// 3. **Name that profile in the release-credentials file** — the same 0600 file
-///    `targo --unverified ship cut --release-credentials <path>` already reads for the Ed25519
-///    signing key. Add one line:
+/// 3. **Name that profile in the release-credentials file** that
+///    `targo --unverified ship cut --release-credentials <path>` reads:
 ///    ```toml
 ///    notary_profile = "<profile-name>"          # from step 2
 ///    # only if step 1 left two matching certificates:
 ///    # signing_identity_sha1 = "<the 40-hex SHA-1 of the one to use>"
 ///    ```
-///    A machine with no usable login keychain may instead use the headless
-///    fallback `notary_apple_id` + `notary_password`; it puts a live secret in
-///    that file, which is why the loader refuses any profile readable by group or
-///    other. Note there is no `team_id` key: the Team ID notarytool receives
-///    always comes from THIS constant, so the two can never disagree.
+///    A machine with no usable login keychain may use `notary_apple_id` + `notary_password`
+///    instead; that puts a live secret in the file, so the loader refuses a profile readable by
+///    group or other. There is no `team_id` key: notarytool always gets the Team ID from this
+///    constant.
 ///
-/// 4. **Set the value below** to your 10-character Team ID (it is public — it
-///    already appears in the `subject.OU` of every Developer-ID signature you
-///    ship). Taken 2026-08-15;
-///    `the_shipped_anchor_is_armed_and_an_empty_anchor_still_resolves_inert` (in
-///    `crates/aterm-release/tests/it/apple_tier.rs`) asserts the ARMED value, so a fork
-///    re-arming this anchor updates that assertion. One reviewed diff.
+/// 4. **Set the value below** to the 10-character Team ID (public: it is in the `subject.OU` of
+///    every Developer-ID signature), and update the armed value that
+///    `the_shipped_anchor_is_armed_and_an_empty_anchor_still_resolves_inert`
+///    (`crates/aterm-release/tests/it/apple_tier.rs`) asserts.
 ///
-/// 5. **Cut a rehearsal first.** `--rehearse` and `--dry-run` deliberately sign
-///    and notarize for real, so the rehearsal is a true proof that the whole path
-///    works — and the first real pinned release is not the first time it runs.
-// ARMED 2026-08-15 per the checklist above: membership paid, the Developer ID
-// Application certificate + key live in the cutting machine's (m3's) login keychain
-// (two overlapping certs, so the credentials profile pins signing_identity_sha1),
-// and the notarytool credential is stored under keychain profile "notary".
+/// 5. **Cut a rehearsal first.** `--rehearse` and `--dry-run` sign and notarize for real.
+// Armed on m3: two overlapping certificates, so its credentials profile pins
+// signing_identity_sha1; the notarytool credential is keychain profile "notary".
 pub const APPLE_TEAM_ID: &str = "A66A9P66Z7";
 
-/// The Windows code-signing **publisher** for the optional Tier WINDOWS anchor —
-/// the Windows twin of [`APPLE_TEAM_ID`], read by `targo --unverified winsign`
-/// (`crates/aterm-winsign`).
+/// The Windows code-signing publisher for the optional Tier WINDOWS anchor, the twin of
+/// [`APPLE_TEAM_ID`], read by `targo --unverified winsign` (`crates/aterm-winsign`, which says
+/// why only a publicly trusted chain is a lane).
 ///
-/// # This one line is the whole switch
+/// Empty (as committed): Tier WINDOWS is inactive and the tier refuses nothing. Set: every
+/// shipped `aterm.exe` must be signed, timestamped, chain to a root the default Authenticode
+/// policy trusts, and have a leaf issued to exactly this string. The value is the leaf's
+/// subject Common Name as `signtool verify /v` prints it after `Issued to:` (an MSIX manifest's
+/// `Publisher` is the full DN; this is its CN).
 ///
-/// Empty (as committed) → Tier WINDOWS is INACTIVE: `targo --unverified winsign sign` signs
-/// when a lane is configured and reports honestly when none is, and nothing
-/// fails a build over a missing or self-signed signature. Set → ACTIVE: every
-/// shipped `aterm.exe` must be signed, timestamped, chain to a root the default
-/// Authenticode policy trusts, and its leaf certificate must be issued to
-/// EXACTLY this string — or `targo --unverified winsign` refuses. The value is the leaf's
-/// subject Common Name as `signtool verify /v` prints it after `Issued to:`
-/// (the `Publisher` an MSIX manifest carries is the full DN; this is its CN).
-///
-/// # Why a signature at all, and why not a self-signed one
-///
-/// Windows 11 with Smart App Control ON runs an unsigned exe only while the
-/// reputation service happens to allow it, and Code Integrity refuses it
-/// (event 3077, "did not meet the Enterprise signing level requirements")
-/// whenever that changes — measured on 2026-09-15 on an installed
-/// `aterm-gui.exe` that had run the day before. Only a publicly trusted chain
-/// clears that policy: Azure Artifact Signing, formerly Trusted Signing (the
-/// lane Microsoft recommends for exactly this), or a CA-issued code-signing
-/// certificate. A self-signed certificate, however widely trusted locally, does
-/// not, so it is not a lane.
-///
-/// # ACTIVATION CHECKLIST — turning Tier WINDOWS on
-///
-/// 1. Obtain the identity (apps/aterm-win/SIGNING.md walks both lanes).
-/// 2. Sign a build with it while the anchor is still empty and read the
-///    `signed by` value `targo --unverified winsign verify` prints back: the
-///    leaf's `Issued to:`, which is the last and most indented one in signtool's
-///    chain (the first is the root CA, and pinning that would accept every exe
-///    under the root). THAT string, byte for byte, is the value to commit here.
-/// 3. Commit it. From that commit on, an unsigned or wrongly signed Windows
-///    exe is refused by the tool, never shipped by accident.
+/// To arm it: obtain the identity (`apps/aterm-win/SIGNING.md`), sign a build while the anchor
+/// is still empty, and commit the `signed by` value `targo --unverified winsign verify` prints:
+/// the leaf, the last and most indented `Issued to:` in signtool's chain (the first is the root
+/// CA, and pinning that would accept every exe under the root).
 pub const WINDOWS_SIGNING_PUBLISHER: &str = "";
 
-/// Whether an anchor is active. Fail-closed: an empty anchor is never active.
-///
-/// Unlike the `pin_active` it replaces, this takes NO opt-out environment variable.
-/// A build either has an anchor or it does not, and no ambient state can turn one
-/// off — which is the entire point of moving these into source.
+/// Whether an anchor is active, i.e. non-empty. No environment variable or other ambient
+/// state can turn one off.
 #[must_use]
 pub const fn anchor_active(anchor: &str) -> bool {
     !anchor.is_empty()
@@ -309,9 +162,8 @@ const _: () = assert!(!anchor_active("") && anchor_active("any-nonempty-value"))
 mod tests {
     use super::*;
 
-    /// Anchors are base64 Ed25519 public keys: 32 bytes -> 44 chars with one `=`.
-    /// Catches a truncated paste, which would otherwise fail closed at runtime with
-    /// no hint that the VALUE, not the state, is wrong.
+    /// A master is a base64 Ed25519 public key (32 bytes, 44 chars with one `=`); this
+    /// catches a truncated paste.
     #[test]
     fn the_master_is_a_well_formed_base64_ed25519_key() {
         for k in PAPER_MASTER_PUBKEYS {
@@ -325,10 +177,8 @@ mod tests {
         }
     }
 
-    /// The Windows anchor is the leaf certificate's subject CN exactly as
-    /// `signtool verify /v` prints it after `Issued to:` — never a full DN
-    /// (`CN=…, O=…`), never padded. `targo --unverified winsign` compares it byte for byte,
-    /// so a DN or stray whitespace would refuse every correctly signed build.
+    /// The Windows anchor is the leaf's subject CN as `signtool verify /v` prints it, never a
+    /// DN and never padded: `targo --unverified winsign` compares it byte for byte.
     #[test]
     fn the_windows_anchor_is_a_bare_common_name_or_empty() {
         let a = WINDOWS_SIGNING_PUBLISHER;
@@ -340,14 +190,8 @@ mod tests {
         );
     }
 
-    // (The unset-anchor tripwire that stood here was deleted 2026-08-15 as part of the
-    // arming commit, exactly as its own doc prescribed: `atpkg-keys setup --id m3` wrote
-    // the anchor, the tripwire went red, and the reviewed diff removed it.)
-
-    /// The brick rule for the master: only an empty
-    /// SLICE means unpinned. A non-empty list containing an empty member would read as
-    /// ARMED to `roster_tier_armed()` while authorizing nobody, so every release would be
-    /// refused with no diff explaining why.
+    /// Only an empty slice unpins the master: an empty member would read as armed to
+    /// `roster_tier_armed()` while authorizing nobody.
     #[test]
     fn the_master_keyset_has_no_empty_members_and_no_duplicates() {
         for (i, key) in PAPER_MASTER_PUBKEYS.iter().enumerate() {

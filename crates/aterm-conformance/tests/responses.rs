@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// Response correctness — feed a query, drain Terminal::take_response(), assert
-// the exact reply bytes. Expectations are xterm/VT510-correct; where the reply
-// embeds an identity constant (DA1/DA2/DA3 device params, firmware version),
-// the engine's own documented identity is asserted and marked as such.
+// Responses: feed a query, drain `Terminal::take_response()`, assert the exact
+// reply bytes. Expectations are xterm/VT510-correct; where a reply embeds an
+// identity constant (DA1/DA2/DA3 device params, firmware version), the
+// engine's own identity is asserted and marked as such.
 
 use aterm_conformance::{Screen, run};
 
@@ -22,11 +22,9 @@ fn resp_bytes(input: &[u8]) -> Option<Vec<u8>> {
 
 #[test]
 fn responses_accumulate_until_drained_then_buffer_is_empty() {
-    // Engine contract: feed()/process() never auto-drain; replies concatenate
-    // in arrival order until take_response() drains them (buffer_api.rs).
+    // feed() never drains: replies concatenate in arrival order until taken.
     let mut s = run(b"\x1b[5n\x1b[6n");
     assert_eq!(s.response_string(), "\x1b[0n\x1b[1;1R");
-    // Drained: a second take must report nothing pending.
     assert_eq!(s.take_response(), None);
 }
 
@@ -34,11 +32,9 @@ fn responses_accumulate_until_drained_then_buffer_is_empty() {
 
 #[test]
 fn da1_reports_vt420_with_capabilities() {
-    // VT510 DA1 format: CSI ? Pc ; Ps.. c. 64/6/22/28 (VT420 level, selective
-    // erase, ANSI color, rectangular editing) plus 4 (sixel) — the engine's
-    // documented identity constant (handler_report.rs). Code 4 is advertised
-    // because aterm-conformance builds aterm-core with the `sixel` feature on,
-    // so the live decode/render path exists.
+    // VT510 DA1: CSI ? Pc ; Ps.. c. 64/6/22/28 (VT420, selective erase, ANSI
+    // color, rectangular editing) are the engine's identity (handler_report.rs);
+    // 4 (sixel) because this crate builds aterm-core with `sixel`.
     assert_eq!(resp(b"\x1b[c"), "\x1b[?64;6;22;28;4c");
 }
 
@@ -120,12 +116,10 @@ fn decrqm_reports_reset_for_origin_mode_off() {
 
 #[test]
 fn decrqm_2048_in_band_resize_reports_reset_when_off() {
-    // xterm DECRPM: Ps=2 = mode recognized but reset. In-band resize
-    // notifications (mode 2048) are implemented (a size report on enable and
-    // on every resize), so DECRQM reports the real state: reset at power-on,
-    // including after the kitty keyboard protocol is enabled (Neovim 0.10+
-    // pushes kitty flags, then probes 2048). handler_dec.rs
-    // decrqm_reports_mode_2048_state covers the on/off states.
+    // xterm DECRPM: Ps=2 = recognized but reset. Mode 2048 (in-band resize)
+    // is implemented, so it reports reset at power-on, also after kitty flags
+    // are pushed (Neovim 0.10+ pushes them, then probes 2048). On/off states
+    // are aterm-core's `decrqm_reports_mode_2048_state`.
     assert_eq!(resp(b"\x1b[?2048$p"), "\x1b[?2048;2$y");
     assert_eq!(resp(b"\x1b[>1u\x1b[?2048$p"), "\x1b[?2048;2$y");
 }
@@ -139,10 +133,8 @@ fn kitty_keyboard_flags_query_uses_csi_question_u_not_decrqm() {
 }
 
 // --- DECRQSS ---------------------------------------------------------------
-// Validity code: the engine follows xterm's convention — DCS 1 $ r .. ST for a
-// valid request, DCS 0 $ r ST for invalid. Note this is inverted from the DEC
-// VT510/VT520 manuals, where 0 means valid and 1 means invalid; xterm's
-// convention is what modern applications expect.
+// Validity follows xterm: DCS 1 $ r .. ST valid, DCS 0 $ r ST invalid. The DEC
+// VT510/VT520 manuals invert it; applications expect xterm's.
 
 #[test]
 fn decrqss_sgr_reports_current_attributes() {
@@ -194,21 +186,18 @@ fn decrqss_decscl_reports_level_and_fixed_7bit_c1() {
 
 #[test]
 fn decrqss_unknown_setting_reports_invalid() {
-    // xterm: an unrecognized DECRQSS Pt gets the invalid form DCS 0 $ r ST
-    // (validity 0 = invalid in xterm's convention) — and must not panic.
+    // xterm: an unrecognized DECRQSS Pt gets the invalid form DCS 0 $ r ST.
     assert_eq!(resp(b"\x1bP$qzz\x1b\\"), "\x1bP0$r\x1b\\");
 }
 
 #[test]
 fn decrqss_unknown_leaves_terminal_usable() {
-    // After an invalid DECRQSS the terminal must keep parsing normally.
     let mut s = Screen::new(24, 80);
     s.feed(b"\x1bP$qzz\x1b\\ok");
     assert_eq!(s.response_string(), "\x1bP0$r\x1b\\");
     assert_eq!(s.row(0), "ok");
 }
 
-/// No-response queries must leave the buffer empty (take_response -> None).
 #[test]
 fn plain_text_produces_no_response() {
     assert_eq!(resp_bytes(b"hello"), None);

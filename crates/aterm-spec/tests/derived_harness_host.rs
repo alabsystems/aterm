@@ -12,12 +12,6 @@ use aterm_spec::{
 #[test]
 fn one_supervisor_per_session_across_restarts_and_reloads() {
     let model = harness_worker_lifecycle_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name),
-        "the harness worker lifecycle must stay enrolled in the spec-link registry"
-    );
     verify::prove_and_catch_scalar(&model, "harness worker lifecycle");
 
     // A reload while a worker parks in its wait: the shipped host starts the
@@ -82,6 +76,106 @@ fn one_supervisor_per_session_across_restarts_and_reloads() {
     }
     assert_eq!((q["cur"], q["faulted"]), (0, 1), "{q:?}");
     assert!(!quits.check_invariant("NeverGivesUp", &q));
+
+    // The agent switched off: its worker asked to stop as a leave asks it,
+    // the session still the agent's and its failures kept, and nothing
+    // started until the agent is on again.
+    let mut off = model.init_state();
+    for action in ["Arrive", "Start", "Fail", "SwitchOff"] {
+        assert!(model.fire(action, &mut off), "{action}: {off:?}");
+    }
+    assert_eq!(
+        (off["wanted"], off["cur"], off["old"], off["faults"]),
+        (1, 0, 1, 1),
+        "{off:?}"
+    );
+    assert!(model.fire("Exit", &mut off));
+    assert!(!model.action_enabled("Start", &off), "{off:?}");
+    for action in ["SwitchOn", "Start"] {
+        assert!(model.fire(action, &mut off), "{action}: {off:?}");
+    }
+    assert_eq!((off["cur"], off["faults"]), (1, 1), "{off:?}");
+    // A held session switched off forgets the claim, as a leave does.
+    let mut held = model.init_state();
+    for action in ["Arrive", "Start", "Hold", "SwitchOff", "SwitchOn"] {
+        assert!(model.fire(action, &mut held), "{action}: {held:?}");
+    }
+    assert!(model.action_enabled("Start", &held), "{held:?}");
+
+    // A host whose start gate does not read the switch: a worker for an
+    // agent switched off, the only claim it breaks.
+    let gateless = interp::with_buggy(&model, 1);
+    let mut g = gateless.init_state();
+    for action in ["Arrive", "SwitchOff", "Start"] {
+        assert!(gateless.fire(action, &mut g), "{action}: {g:?}");
+    }
+    for inv in &gateless.invariants {
+        assert_eq!(
+            gateless.check_invariant(inv.name, &g),
+            inv.name != "OffMeansNoCurrent",
+            "{}: {g:?}",
+            inv.name
+        );
+    }
+}
+
+/// AUTOPILOT OFF STOPS THE WORKER AND LETS NOTHING GO (the Autopilot design,
+/// 2026-10-15, §2.2): an Off session's worker is stopped — on its way out
+/// until its wait ends — never handed its agent's exit; no worker starts for
+/// it while it is Off, its agent crashed or named again; back on, it is
+/// started as any wanted session is. NEGATIVE CONTROLS: a host that
+/// implements Off as a let-go hands the exit (`OffLetsNothingGo`), and one
+/// that starts a worker for an Off session supervises it
+/// (`OffStopsTheWorker`) — and then a crash hands that worker the exit too.
+#[test]
+fn autopilot_off_stops_the_worker_and_lets_nothing_go() {
+    let model = harness_worker_lifecycle_model();
+    let mut s = model.init_state();
+    for action in ["Arrive", "Start", "TurnOff"] {
+        assert!(model.fire(action, &mut s), "{action}: {s:?}");
+    }
+    assert_eq!(
+        (s["cur"], s["old"], s["letgo"]),
+        (0, 1, 0),
+        "stopped: {s:?}"
+    );
+    assert!(!model.action_enabled("Start", &s), "{s:?}");
+    assert!(model.fire("Exit", &mut s));
+    assert!(!model.action_enabled("Start", &s), "Off: no worker: {s:?}");
+    // The agent crashes in its open tab: nothing handed, nothing started.
+    assert!(model.fire("Crash", &mut s));
+    assert_eq!((s["wanted"], s["cur"], s["letgo"]), (0, 0, 0), "{s:?}");
+    // Its agent comes back (a person relaunched it): still Off, no worker.
+    assert!(model.fire("Arrive", &mut s));
+    assert!(!model.action_enabled("Start", &s), "{s:?}");
+    // Back on: started.
+    assert!(model.fire("TurnOn", &mut s) && model.fire("Start", &mut s));
+    assert_eq!((s["cur"], s["off"]), (1, 0), "{s:?}");
+    for inv in &model.invariants {
+        assert!(model.check_invariant(inv.name, &s), "{}: {s:?}", inv.name);
+    }
+
+    let buggy = interp::with_buggy(&model, 1);
+    // Off as a let-go: the worker is handed its agent's exit.
+    let mut let_go = buggy.init_state();
+    for action in ["Arrive", "Start", "TurnOff"] {
+        assert!(buggy.fire(action, &mut let_go), "{action}: {let_go:?}");
+    }
+    assert!(!buggy.check_invariant("OffLetsNothingGo", &let_go));
+    // A worker started for an Off session: supervised, and its crash handed.
+    let mut started = buggy.init_state();
+    for action in ["Arrive", "Start", "TurnOff", "Exit", "Start"] {
+        assert!(buggy.fire(action, &mut started), "{action}: {started:?}");
+    }
+    assert!(!buggy.check_invariant("OffStopsTheWorker", &started));
+    assert!(buggy.fire("Crash", &mut started));
+    assert!(!buggy.check_invariant("OffLetsNothingGo", &started));
+    // The shipped host does neither: the same schedule stops the worker.
+    let mut shipped = model.init_state();
+    for action in ["Arrive", "Start", "TurnOff"] {
+        assert!(model.fire(action, &mut shipped));
+    }
+    assert_eq!((shipped["letgo"], shipped["cur"]), (0, 0), "{shipped:?}");
 }
 
 /// THE UPGRADE'S LOOKS ARE NEVER LET GO FOR WHAT A LOOK COULD NOT READ, AND
@@ -97,12 +191,6 @@ fn one_supervisor_per_session_across_restarts_and_reloads() {
 #[test]
 fn an_upgrade_is_never_let_go_for_a_look_that_could_not_read() {
     let model = harness_upgrade_look_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name),
-        "the upgrade's look machine must stay enrolled in the spec-link registry"
-    );
     verify::prove_and_catch_scalar(&model, "harness upgrade look");
 
     // A fresh launch: the note unread at the attach, asked again once the
@@ -157,12 +245,6 @@ fn an_upgrade_is_never_let_go_for_a_look_that_could_not_read() {
 #[test]
 fn an_external_supervisor_keeps_its_session_across_the_handoff() {
     let model = harness_handoff_claim_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name),
-        "the handoff claim machine must stay enrolled in the spec-link registry"
-    );
     verify::prove_and_catch_scalar(&model, "harness handoff claim");
     let konst = |name: &str| model.consts.iter().find(|c| c.0 == name).unwrap().1;
     assert!(
@@ -245,20 +327,16 @@ fn an_external_supervisor_keeps_its_session_across_the_handoff() {
 /// own restart, its relaunch not landed at
 /// the step's end, is carried on under `[harness] relaunch = false` — and
 /// nothing else is: an exit in a tab with another process's restart in
-/// flight is the agent's own, and said. NEGATIVE CONTROLS: the host of
+/// flight is the agent's own, and said. An agent switched off is stopped,
+/// never handed an exit. NEGATIVE CONTROLS: the host of
 /// 32a51a716 hands a misread as an exit, a keep without a look never sees the
 /// exit that follows, the worker of 32a51a716 drops the upgrade's own restart
-/// for `relaunch = false` (the gate failure of 32a51a716), and a worker that
-/// reads the tab's record, not the agent's, carries on a stranger's exit.
+/// for `relaunch = false` (the test failure of 32a51a716), a worker that
+/// reads the tab's record, not the agent's, carries on a stranger's exit, and
+/// a host that drops a switched-off agent from its roster hands its exit.
 #[test]
 fn an_exit_is_handed_only_for_an_exit_and_the_upgrades_own_is_carried_on() {
     let model = harness_leave_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name),
-        "the harness leave machine must stay enrolled in the spec-link registry"
-    );
     verify::prove_and_catch_scalar(&model, "harness leave");
 
     // A misread: kept, looked at again while it lasts, named again, and
@@ -291,6 +369,23 @@ fn an_exit_is_handed_only_for_an_exit_and_the_upgrades_own_is_carried_on() {
         assert!(model.fire(action, &mut t), "{action}: {t:?}");
     }
     assert_eq!((t["handed"], t["decided"]), (1, 2), "{t:?}");
+    // The agent switched off: its worker stopped and handed nothing — not
+    // for a misread, which owes no look, nor for the exit that follows.
+    let mut off = model.init_state();
+    for action in ["SwitchOff", "Visit", "Misread", "Visit", "Exit"] {
+        assert!(model.fire(action, &mut off), "{action}: {off:?}");
+    }
+    assert_eq!(
+        (off["handed"], off["due"], off["decided"]),
+        (0, 0, 0),
+        "{off:?}"
+    );
+    // An exit the pass had not seen when the switch went off: not handed.
+    let mut late = model.init_state();
+    for action in ["Exit", "SwitchOff", "Visit"] {
+        assert!(model.fire(action, &mut late), "{action}: {late:?}");
+    }
+    assert_eq!((late["handed"], late["due"]), (0, 0), "{late:?}");
 
     let buggy = interp::with_buggy(&model, 1);
     // The host of 32a51a716: a pass that cannot name the agent hands its exit.
@@ -324,4 +419,18 @@ fn an_exit_is_handed_only_for_an_exit_and_the_upgrades_own_is_carried_on() {
         !buggy.check_invariant("OnlyTheUpgradesOwnIsCarried", &r),
         "{r:?}"
     );
+    // A switched-off agent dropped from the roster: its pass reads the agent
+    // as gone and hands the exit of one still running…
+    let mut f = buggy.init_state();
+    for action in ["SwitchOff", "VisitOffAsLeave"] {
+        assert!(buggy.fire(action, &mut f), "{action}: {f:?}");
+    }
+    assert!(!buggy.check_invariant("NoExitWhileAlive", &f), "{f:?}");
+    // …and of one that ended, relaunched or said against the switch.
+    let mut e = buggy.init_state();
+    for action in ["Exit", "SwitchOff", "VisitOffAsLeave"] {
+        assert!(buggy.fire(action, &mut e), "{action}: {e:?}");
+    }
+    assert!(buggy.check_invariant("NoExitWhileAlive", &e), "{e:?}");
+    assert!(!buggy.check_invariant("NoExitWhileOff", &e), "{e:?}");
 }

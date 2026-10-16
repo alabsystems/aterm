@@ -1,18 +1,18 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Linux release identity shared by the cutter, bootstrap installer contract,
-//! and native updater. Linux updates are raw ELF executables, not archives.
-//! An ELF header is a compatibility check, NEVER an authenticity check: callers
-//! must first verify the signed manifest and then the complete file's digest.
+//! Linux release identity shared by the cutter, the bootstrap installer contract and the
+//! native updater. Linux updates are raw ELF executables, not archives. An ELF header is a
+//! compatibility check, never an authenticity check: callers first verify the signed manifest
+//! and then the complete file's digest.
 
 /// A deliberately bounded native executable download (512 MiB).
 pub const LINUX_BINARY_MAX_BYTES: u64 = 512 * 1024 * 1024;
 
-/// The side-effect-free `aterm update identity` response. A candidate is executed
-/// for this probe ONLY AFTER its signed artifact digest has been authenticated.
-/// This proves the loader and compiled identity agree with the signed metadata;
-/// it does not replace signature verification or the ordinary-launch health trial.
+/// The side-effect-free `aterm update identity` response. A candidate runs this probe only
+/// after its signed artifact digest is authenticated; it proves the loader and compiled
+/// identity agree with the signed metadata and replaces neither signature verification nor
+/// the ordinary-launch health trial.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BinaryIdentity {
     pub schema: u32,

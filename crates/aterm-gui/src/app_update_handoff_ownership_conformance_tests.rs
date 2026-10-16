@@ -15,7 +15,7 @@ const TO_DESCRIPTORS_TRANSFERRED: [&str; 4] = [
     "DuplicateDescriptorsToCandidate",
 ];
 
-/// The same prefix plus the proof, i.e. the model's `ProofMatched`.
+/// `TO_DESCRIPTORS_TRANSFERRED` plus the proof: the model's `ProofMatched`.
 const TO_PROOF_MATCHED: [&str; 5] = [
     "ParkOutgoingReaders",
     "CaptureCheckpoints",
@@ -143,10 +143,8 @@ fn model_revoked(facts: HandoffCommitFacts) -> bool {
         && facts.operator_quiesced)
 }
 
-/// Projects one bounded fact combination onto the model's pre-Commit state. It can
-/// express states the healthy model never reaches (a reader resumed mid-attempt);
-/// the bind checks the shipping admission and the model's guard refuse the same
-/// combinations.
+/// Projects one fact combination onto the model's pre-Commit state, including states the
+/// healthy model never reaches (a reader resumed mid-attempt).
 fn project_commit_facts(transferred: &State, matched: &State, facts: HandoffCommitFacts) -> State {
     let mut state = if facts.proof_exact {
         matched.clone()
@@ -158,10 +156,8 @@ fn project_commit_facts(transferred: &State, matched: &State, facts: HandoffComm
     state
 }
 
-/// Session death at Commit is the same fact as at the park: a handed session that
-/// ended between capture and Commit refuses the Commit as activity, filed
-/// `ActivityRevoked` (activity spacing, no physical budget), never
-/// `Physical(Transient)`. The worker's own detection lands in the same lane.
+/// A handed session that ended between capture and Commit refuses the Commit as activity
+/// (`ActivityRevoked`), the same filing the park gives it, never `Physical(Transient)`.
 #[test]
 fn session_death_before_commit_is_filed_as_the_activity_the_park_files_it_as() {
     use crate::app_native::HandoffFailureLane;
@@ -195,8 +191,7 @@ fn session_death_before_commit_is_filed_as_the_activity_the_park_files_it_as() {
             );
         }
     }
-    // Negative control: a genuine fault (a mismatched proof) stays on the
-    // physical schedule.
+    // Negative control: a genuine fault (a mismatched proof) stays on the physical schedule.
     let proof = HandoffCommitFacts {
         proof_exact: false,
         ..all
@@ -204,21 +199,9 @@ fn session_death_before_commit_is_filed_as_the_activity_the_park_files_it_as() {
     assert!(!handoff_rejection_activity_shaped(proof));
 }
 
-/// A BUSY RESIDENT OPERATOR IS A RETRY, NEVER A STRIKE (round eight of the
-/// update audit, #70). The real operator, one proposal transaction in
-/// flight, answers the Commit's quiesce `Busy`; that answer is two of the
-/// admission's facts, refuses the Commit, and is activity-shaped — so the
-/// automatic lane files the returned `Rejected` as `ActivityRevoked` (the
-/// activity spacing, no physical budget), never `Physical(Transient)`, the
-/// 600 s / 1800 s schedule against the build's lifetime. The same operator
-/// idle is fenced and admits; one shutting down is a fault and stays on the
-/// physical schedule.
-///
-/// RED before the fix: the operator's refusal sat beside these facts, which
-/// all held, so the rejection read as no activity at all and the lane was
-/// `Physical(Transient)` — measured here by taking the `operator_idle`
-/// clause back out of `handoff_rejection_activity_shaped`, which fails the
-/// first activity assertion.
+/// A busy resident operator (a proposal in flight) refuses the Commit as activity, so the
+/// automatic lane files it `ActivityRevoked`, never a strike. Idle admits; shutting down is a
+/// fault on the physical schedule.
 #[test]
 fn a_busy_resident_operator_refuses_the_commit_as_activity_never_a_strike() {
     use crate::app_native::{HandoffFailureLane, PhysicalFailureShape};
@@ -265,8 +248,8 @@ fn a_busy_resident_operator_refuses_the_commit_as_activity_never_a_strike() {
             "{mode:?}"
         );
     }
-    // The Commit permit's moment (another thread holding the gate) is the
-    // same fact, re-read at the `_exit`.
+    // The Commit permit's moment (another thread holding the gate) is the same fact, re-read
+    // at the `_exit`.
     let permit_busy = with_operator(Some(UpdateQuiesceRefusal::Busy(
         "operator authority transition is busy",
     )));
@@ -283,8 +266,8 @@ fn a_busy_resident_operator_refuses_the_commit_as_activity_never_a_strike() {
     assert!(handoff_commit_admitted(with_operator(None)));
     drop(fenced);
 
-    // NEGATIVE CONTROL: an operator that refused for anything but work —
-    // shutting down — is a fault, and stays on the physical schedule.
+    // Negative control: an operator refusing for anything but work (shutting down) is a fault,
+    // and stays on the physical schedule.
     operator.begin_shutdown();
     let shut = operator
         .try_begin_update_quiesce()
@@ -300,11 +283,10 @@ fn a_busy_resident_operator_refuses_the_commit_as_activity_never_a_strike() {
     );
 }
 
-/// A RELAUNCH OWED OR SETTLED BETWEEN THE TWO CAPTURES REFUSES THE COMMIT
-/// BY ITS OWN NAME, AS ACTIVITY (round seven, finding 111): the successor
-/// would restore a layout without it, and the rollback lets this process
-/// relaunch it — lossless and repeatable, never a fault against the build,
-/// and never read as the window/tab/pane topology changing.
+/// An agent relaunch owed or settled between the two captures refuses the Commit by its own
+/// name, as activity: the successor would restore a layout without it, and the rollback lets
+/// this process relaunch it. Lossless and repeatable, never a fault against the build, and
+/// never read as the topology changing.
 #[test]
 fn an_agent_carry_that_moved_refuses_the_commit_by_its_own_name() {
     let all = facts_from_bits(ALL_FACTS);
@@ -330,14 +312,8 @@ fn an_agent_carry_that_moved_refuses_the_commit_by_its_own_name() {
     );
 }
 
-/// THE FINAL ADMISSION, exhaustively. `handoff_commit_admitted` is the compiled
-/// conjunction standing immediately before the attempt-wide Commit CAS, so it —
-/// and nothing in this file — decides whether a session's ownership moves. All
-/// 2^14 of its bounded fact combinations are driven through it and through the
-/// model's `CommitAtomically` guard, and the two must agree combination for
-/// combination. The resident operator's quiesce is two of those facts
-/// (round eight, #70): it used to be a thirteenth conjunct beside this
-/// function, which the sweep never drove.
+/// `handoff_commit_admitted` alone decides whether ownership moves; all 2^14 fact combinations
+/// must get the same verdict from it and from the model's `CommitAtomically` guard.
 #[test]
 fn real_commit_admission_conforms_to_the_ownership_model_over_every_bounded_fact_combination() {
     let model = native_update_seamless_handoff_ownership_model();
@@ -367,9 +343,8 @@ fn real_commit_admission_conforms_to_the_ownership_model_over_every_bounded_fact
         }
 
         if !admitted {
-            // Once a parent reader has resumed, that part of the rollback has
-            // happened; every refusal with readers still parked must have a path
-            // back to Resumed.
+            // Once a parent reader has resumed, that part of the rollback has happened; every
+            // refusal with readers still parked must have a path back to Resumed.
             if facts.parent_still_parked {
                 refused_parked.insert(before);
             }
@@ -390,8 +365,8 @@ fn real_commit_admission_conforms_to_the_ownership_model_over_every_bounded_fact
         );
     }
 
-    // Rollback is available for every refusal. Checked once per distinct
-    // projected state (the projection is many-to-one).
+    // Rollback is available for every refusal, checked once per distinct projected state (the
+    // projection is many-to-one).
     assert!(refused_parked.len() > 1, "vacuous refusal projection");
     for state in &refused_parked {
         assert!(
@@ -406,17 +381,16 @@ fn real_commit_admission_conforms_to_the_ownership_model_over_every_bounded_fact
         );
     }
 
-    // Non-vacuity: the conjunction admits exactly the all-facts-hold
-    // combination.
+    // Non-vacuity: the conjunction admits exactly the all-facts-hold combination.
     assert_eq!(
         admitted_combinations, 1,
         "exactly one bounded combination may authorize a Commit"
     );
 }
 
-/// The readiness wait's verdict: `classify_ready_poll` turns one `poll` answer
-/// into stale set, read the proof, or yield. Exhausted over every `revents`
-/// combination for the proof fd and a two-master pool, the model's cardinality.
+/// Every reachable pre-Commit state of the ownership model has a rollback path to Resumed
+/// with both sessions still the outgoing process's; the Buggy=1 mutant can orphan a session
+/// and put two readers on one master.
 #[test]
 fn every_pre_commit_state_has_a_path_back_to_resumed_with_both_sessions_still_ours() {
     let model = native_update_seamless_handoff_ownership_model();

@@ -14,9 +14,7 @@ use super::Terminal;
 /// never decodes, small enough that the compressed tiers hold deep history.
 pub const TIERED_RING_CAP_DEFAULT: usize = 1_000;
 
-/// Builder for creating [`Terminal`] instances with custom configuration.
-///
-/// Provides a fluent API for configuring terminal options before construction.
+/// Builder for a [`Terminal`] with custom size and scrollback.
 ///
 /// # Example
 ///
@@ -43,9 +41,7 @@ impl Default for TerminalBuilder {
 }
 
 impl TerminalBuilder {
-    /// Create a new terminal builder with default settings.
-    ///
-    /// Defaults: 24 rows, 80 cols, no scrollback, default colors.
+    /// A builder for a 24x80 terminal with a 10,000-line ring and no tiered store.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -64,33 +60,29 @@ impl TerminalBuilder {
         self
     }
 
-    /// Set the ring buffer size for in-memory scrollback.
-    ///
-    /// If not set, the terminal will not have a ring buffer scrollback.
+    /// Set the in-memory ring's line cap (default 10,000).
     #[must_use]
     pub fn ring_buffer_size(mut self, size: usize) -> Self {
         self.ring_buffer_size = Some(size);
         self
     }
 
-    /// Attach the engine-default tiered scrollback: a hot+warm(+cold) store with
-    /// the crate-default tier sizes and memory budget behind a
-    /// [`TIERED_RING_CAP_DEFAULT`]-line hot ring, capped so the total retention
-    /// limit (ring + staged + store; see
+    /// Attach the engine-default tiered scrollback (crate-default tier sizes and memory
+    /// budget) behind a [`TIERED_RING_CAP_DEFAULT`]-line hot ring, capped so the total
+    /// retention limit (ring + staged + store; see
     /// [`Terminal::set_scrollback_line_limit`](super::Terminal::set_scrollback_line_limit))
     /// starts at `DEFAULT_LINE_LIMIT`.
     ///
-    /// Embedders should prefer this to a bare `ring_buffer_size(N)`, which keeps
-    /// raw cells (~640 B/line at 80 cols): the tiered store keeps attributed
-    /// history at roughly 1/3 to 1/10 of that and enables off-thread history
-    /// reflow. The cold-tier codec follows the build (LZ4 by default, zstd plus
-    /// optional disk spill under `disk-tier`/`zstd`); see
-    /// [`TierCapabilities::current`](crate::scrollback::TierCapabilities::current).
+    /// Prefer this to a bare `ring_buffer_size(N)`, which keeps raw cells (~640 B/line at
+    /// 80 cols): the tiered store holds attributed history at roughly 1/3 to 1/10 of that
+    /// and enables off-thread history reflow. Cold pages are LZ4; the disk spill follows
+    /// the `disk-tier` feature
+    /// ([`TierCapabilities::current`](crate::scrollback::TierCapabilities::current)).
     ///
-    /// Without a compression-drain thread, scrolled-off lines are compressed
-    /// inline in ~1000-line batches on the feeding thread; a throughput-critical
-    /// host should call `set_compress_offload_active(true)` and drain
-    /// `drain_lazy_bounded(...)` on a worker, as the GUI session does.
+    /// Without a compression-drain thread, scrolled-off lines compress inline in ~1000-line
+    /// batches on the feeding thread; a throughput-critical host calls
+    /// `set_compress_offload_active(true)` and runs `drain_lazy_bounded` on a worker, as the
+    /// GUI session does.
     #[must_use]
     pub fn tiered_scrollback_defaults(mut self) -> Self {
         let mut scrollback = Scrollback::with_defaults();
@@ -107,25 +99,18 @@ impl TerminalBuilder {
     /// Build the terminal with the configured options.
     #[must_use]
     pub fn build(self) -> Terminal {
-        // Build the grid based on scrollback configuration.
-        // Default ring buffer size matches Grid::new (10,000 lines).
         let grid = match (self.ring_buffer_size, self.scrollback) {
             (Some(ring_size), Some(scrollback)) => {
                 Grid::with_tiered_scrollback(self.rows, self.cols, ring_size, scrollback)
             }
             (None, Some(scrollback)) => {
-                // Caller provided tiered scrollback but no explicit ring buffer size.
-                // Use the default (10,000) rather than silently dropping the scrollback.
+                // A tiered store with no ring size gets Grid::new's 10,000-line ring.
                 Grid::with_tiered_scrollback(self.rows, self.cols, 10_000, scrollback)
             }
-            (Some(ring_size), None) => {
-                // Caller set ring buffer size but no tiered scrollback.
-                Grid::with_scrollback(self.rows, self.cols, ring_size)
-            }
+            (Some(ring_size), None) => Grid::with_scrollback(self.rows, self.cols, ring_size),
             (None, None) => Grid::new(self.rows, self.cols),
         };
 
-        // Use Terminal::with_grid for consistent field initialization
         Terminal::with_grid(grid)
     }
 }

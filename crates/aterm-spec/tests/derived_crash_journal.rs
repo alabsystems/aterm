@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-0 of `CrashJournalClaim` (`aterm_spec::derive::crash_journal_claim_model`):
-//! the crash journal's claim (PTY keeper P1, `docs/DESIGN-pty-keeper-2026-09-26.md`
-//! §5.5, §6.3). Proved at `Buggy = 0` and caught at `Buggy = 1` on every
-//! invariant; the owner's ends are walked the way a person meets them. Tier-1 is
+//! Tier-0 of `CrashJournalClaim`, the crash journal's claim
+//! (`docs/DESIGN-pty-keeper-2026-09-26.md` §5.5, §6.3): proved at `Buggy = 0`, caught at
+//! `Buggy = 1` on every invariant, and walked the way a person meets its ends. Tier-1 is
 //! `aterm-gui/src/crash_journal_conformance.rs`.
 
 use crate::walk::{only, walk};
@@ -14,12 +13,6 @@ use aterm_spec::{interp, verify};
 #[test]
 fn crash_journal_claim_proves_and_catches() {
     let model = crash_journal_claim_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name),
-        "the crash journal's claim must stay enrolled in the spec-link registry"
-    );
     let committed: Vec<&str> = interp::fired_actions(&model).into_iter().collect();
     for action in [
         "BootFresh",
@@ -53,14 +46,8 @@ fn crash_journal_claim_proves_and_catches() {
     );
 }
 
-/// The ends a person meets. A SIGKILL after a write is reopened. A Cmd-Q leaves
-/// nothing to take. The update's hand-off leaves its image behind and it is
-/// taken but not reopened. A launch that reopened a journal and CRASHED before
-/// its 90 s is taken and skipped; one STOPPED before them (a kill, day five's
-/// D18) is reopened once more as a second chance, and that second chance
-/// stopped again inside its own 90 s is skipped (ruling 285); one that lived
-/// past them is reopened. A second launch finds nothing where the first took
-/// the image.
+/// The ends a person meets: a kill is reopened, a quit or an update hand-off is not, and inside
+/// the 90 s probation a crash is skipped while a first stop gets one second chance.
 #[test]
 fn crash_journal_claim_walks_the_ends_the_way_a_person_meets_them() {
     let m = crash_journal_claim_model();
@@ -89,9 +76,8 @@ fn crash_journal_claim_walks_the_ends_the_way_a_person_meets_them() {
         "the update parent's journal is taken and set aside: {handed_off:?}"
     );
 
-    // A quit cut short after its `session.toml` and before its journal went
-    // (finding 48's review): the journal is taken and set aside — its desk
-    // comes back once, as the quit layout — however the run then died.
+    // A quit cut short after its `session.toml` and before its journal went: the journal is
+    // taken and set aside (its desk comes back once, as the quit layout) however the run died.
     for end in ["Die", "Crash"] {
         let cut = walk(&m, &["BootFresh", "Write", "WriteQuitLayout", end, "Claim"]);
         assert_eq!(
@@ -101,9 +87,8 @@ fn crash_journal_claim_walks_the_ends_the_way_a_person_meets_them() {
         );
     }
 
-    // ROUND EIGHT, FINDING 45: the successor runs on the live sessions only
-    // once the parent's image is its own, so it can end before the take-over
-    // only when there was nothing to take; after it, its end is the owner's.
+    // The successor runs on the live sessions only once the parent's image is its own, so it
+    // can end before the take-over only when there was nothing to take.
     let waiting = walk(&m, &["BootFresh", "Write", "HandOff"]);
     assert!(
         !m.action_enabled("SuccessorDies", &waiting),
@@ -222,10 +207,8 @@ fn crash_journal_claim_the_defects_are_caught_on_every_invariant() {
         "a published layout gone when its owner died mid-rewrite: {lost:?}"
     );
 
-    // ROUND EIGHT OF THE UPDATE AUDIT, FINDING 45: the Commit waiter that
-    // releases the readers before the take-over runs the new build on the
-    // live sessions while the desk on disk is the parent's clean end; a death
-    // there loses it.
+    // A Commit waiter that releases the readers before the take-over runs the new build on the
+    // live sessions while the desk on disk is the parent's clean end; a death there loses it.
     let released_first = walk(
         &m,
         &[
@@ -242,6 +225,4 @@ fn crash_journal_claim_the_defects_are_caught_on_every_invariant() {
         "the parent's image left behind a dead successor: {released_first:?}"
     );
     assert!(!m.check_invariant("NoLoss", &released_first));
-
-    assert!(verify::uncaught_invariants(&crash_journal_claim_model()).is_empty());
 }

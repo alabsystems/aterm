@@ -2,11 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Regression tests for #5928: DiskBackedScrollback cold tier reload.
-//!
-//! Each test populates cold tier data in session 1, drops, reloads via
-//! `with_config` in session 2, and exercises one cascading failure mode
-//! of a reload that sets `line_count` to 0.
+//! Cold-tier reload: each test fills the cold tier, drops the scrollback,
+//! reloads it with `with_config` and checks that the reloaded `line_count`
+//! drives one operation correctly.
 
 use super::*;
 
@@ -36,11 +34,7 @@ fn reload_from(cold_path: &std::path::Path) -> DiskBackedScrollback {
     DiskBackedScrollback::with_config(config).unwrap()
 }
 
-/// Cold tier data is accessible after drop + reload from the same path.
-///
-/// Regression test for #5928: a `line_count` of 0 after reload makes all cold
-/// tier data invisible, because `get_line()` returns `Ok(None)` for
-/// `idx >= self.line_count`.
+/// Every cold line is readable after drop and reload from the same path.
 #[test]
 fn disk_backed_cold_data_persists_on_reload() {
     let dir = aterm_tempfile::tempdir().unwrap();
@@ -48,7 +42,7 @@ fn disk_backed_cold_data_persists_on_reload() {
 
     let total_lines = 50;
 
-    // Session 1: Populate all tiers including cold.
+    // Session 1: populate every tier, cold included.
     {
         let config = DiskBackedScrollbackConfig::new(&cold_path)
             .with_hot_limit(5)
@@ -64,7 +58,7 @@ fn disk_backed_cold_data_persists_on_reload() {
         assert!(cold > 0, "session 1 must evict to cold tier: cold={cold}");
     }
 
-    // Session 2: Reload from same path.
+    // Session 2: reload from the same path.
     {
         let config = DiskBackedScrollbackConfig::new(&cold_path)
             .with_hot_limit(5)
@@ -104,9 +98,7 @@ fn disk_backed_cold_data_persists_on_reload() {
     }
 }
 
-/// Regression #5928: `line_count()` equals cold tier size after reload.
-///
-/// With `line_count: 0`, `line_count()` returned 0 despite cold tier having data.
+/// `line_count()` equals the cold tier size after reload.
 #[test]
 fn disk_backed_reload_line_count_matches_cold() {
     let dir = aterm_tempfile::tempdir().unwrap();
@@ -134,10 +126,7 @@ fn disk_backed_reload_line_count_matches_cold() {
     );
 }
 
-/// Regression #5928: `push_line` after reload increments from correct base.
-///
-/// With `line_count: 0`, pushed lines were inaccessible because `line_count`
-/// was too small to route `get_line` past the cold tier to the hot tier.
+/// Lines pushed after reload land after the cold lines.
 #[test]
 fn disk_backed_reload_push_increments_correctly() {
     let dir = aterm_tempfile::tempdir().unwrap();
@@ -155,11 +144,9 @@ fn disk_backed_reload_push_increments_correctly() {
         "line_count should be cold({cold_n}) + 2 new lines"
     );
 
-    // Oldest cold line still accessible at index 0.
     let first = sb.get_line(0).unwrap().unwrap();
     assert_eq!(first.to_string(), "Line-0", "oldest cold line at idx 0");
 
-    // New lines appear after cold data.
     let new_a = sb.get_line(cold_n).unwrap().unwrap();
     assert_eq!(
         new_a.to_string(),
@@ -175,9 +162,7 @@ fn disk_backed_reload_push_increments_correctly() {
     );
 }
 
-/// Regression #5928: `truncate(N/2)` after reload trims oldest cold lines.
-///
-/// With `line_count: 0`, `truncate(N/2)` was a no-op because `N/2 >= 0`.
+/// `truncate(N/2)` after reload trims the oldest cold lines.
 #[test]
 fn disk_backed_reload_truncate_keeps_newest() {
     let dir = aterm_tempfile::tempdir().unwrap();
@@ -195,8 +180,6 @@ fn disk_backed_reload_truncate_keeps_newest() {
         "line_count should be {keep} after truncate"
     );
 
-    // After truncate keeping `keep` newest, the new index 0 is the former
-    // index (cold_n - keep).
     let first = sb.get_line(0).unwrap().unwrap();
     assert!(
         first.to_string().starts_with("Line-"),
@@ -209,17 +192,13 @@ fn disk_backed_reload_truncate_keeps_newest() {
         "last line after truncate should be valid, got: '{last}'"
     );
 
-    // Out-of-bounds after truncate returns None.
     assert!(
         sb.get_line(keep).unwrap().is_none(),
         "index {keep} should be out-of-bounds after truncate to {keep}"
     );
 }
 
-/// Regression #5928: `remove_newest(1)` after reload removes from the correct end.
-///
-/// With `line_count: 0`, `remove_newest(1)` hit the `self.line_count == 0` early
-/// return and silently did nothing, despite cold tier having real data.
+/// `remove_newest(1)` after reload removes the newest cold line.
 #[test]
 fn disk_backed_reload_remove_newest_preserves_oldest() {
     let dir = aterm_tempfile::tempdir().unwrap();
@@ -236,7 +215,6 @@ fn disk_backed_reload_remove_newest_preserves_oldest() {
         "line_count should be {cold_n}-1 after remove_newest(1)"
     );
 
-    // Oldest cold line still accessible.
     let first = sb.get_line(0).unwrap().unwrap();
     assert_eq!(
         first.to_string(),
@@ -244,17 +222,13 @@ fn disk_backed_reload_remove_newest_preserves_oldest() {
         "oldest line preserved after remove_newest"
     );
 
-    // Former last line is gone.
     assert!(
         sb.get_line(cold_n - 1).unwrap().is_none(),
         "former last line should be removed"
     );
 }
 
-/// Regression #5928: `set_line_limit(Some(N/2))` after reload truncates immediately.
-///
-/// With `line_count: 0`, the `self.line_count > max` check always failed, so
-/// `set_line_limit` never enforced the limit on existing cold data.
+/// `set_line_limit(Some(N/2))` after reload truncates the reloaded cold lines.
 #[test]
 fn disk_backed_reload_set_line_limit_truncates_immediately() {
     let dir = aterm_tempfile::tempdir().unwrap();
@@ -272,14 +246,12 @@ fn disk_backed_reload_set_line_limit_truncates_immediately() {
         "line_count should be {limit} after set_line_limit({limit})"
     );
 
-    // Newest lines (kept by truncation) are accessible.
     let last = sb.get_line(limit - 1).unwrap().unwrap();
     assert!(
         last.to_string().starts_with("Line-"),
         "last line after limit enforcement should be valid, got: '{last}'"
     );
 
-    // Out-of-bounds returns None.
     assert!(
         sb.get_line(limit).unwrap().is_none(),
         "index {limit} should be out-of-bounds after limit enforcement"

@@ -59,13 +59,14 @@ if ($HOME) {
 
 # The agents directory, moved to the front ahead of the reroute block below.
 # $env:ATPKG_AGENTS - set by the atpkg shell.d hook dot-sourced just above - names
-# <prefix>/agents, which holds ONLY the claude and codex shims aterm keeps current
-# (owner decision 2026-09-10). An earlier PATH entry for claude or codex wins
-# otherwise (measured 2026-09-10 on macOS zsh: behind /opt/homebrew/bin and
-# ~/.local/bin, so codex ran a brew cask that could run no command) - an ORDER
-# failure, so move-to-front. aterm dot-sources this file AFTER the user's profile
-# (the -Command it passes pwsh), so this runs after a profile's own prepends; a
-# profile that dot-sources this file itself is re-fronted only at that point.
+# <prefix>/agents, which holds ONLY the agent shims aterm keeps current (claude,
+# codex, agy, muse; owner decisions 2026-09-10 and 2026-10-15). An earlier PATH
+# entry for one of those names wins otherwise (measured 2026-09-10 on macOS zsh:
+# behind /opt/homebrew/bin and ~/.local/bin, so codex ran a brew cask that could
+# run no command) - an ORDER failure, so move-to-front. aterm dot-sources this
+# file AFTER the user's profile (the -Command it passes pwsh), so this runs after a
+# profile's own prepends; a profile that dot-sources this file itself is re-fronted
+# only at that point.
 # Asserted before the reroute block, so PATH reads reroute, agents, ... - the spawn
 # seam's own order. Inert when the variable is unset or names no directory.
 #

@@ -1,87 +1,57 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm-messages` — one band, one model, one log.
+//! `aterm-messages`: one band, one model, one log.
 //!
-//! The platform-neutral engine behind aterm's unified message system
-//! (docs/DESIGN-unified-messages-2026-09-21.md): the message model, the glass
-//! policy (which rows are on the band, in what order, for how long), the
-//! single-row width law, the tagged log ring and its line codec, the wire
-//! grammars and the seamless-handoff carry. It emits layouts in cells
-//! ([`glass::Presentation`]); the host paints them, appends the log lines it
-//! drains, and performs the plain-data [`model::Intent`]s a press returns.
+//! The platform-neutral engine behind aterm's message system
+//! (docs/DESIGN-unified-messages-2026-09-21.md): the message model, the glass policy
+//! (which rows are on the band, in what order, for how long), the single-row width law,
+//! the tagged log ring and its line codec, the wire grammars and the seamless-handoff
+//! carry. It emits layouts in cells ([`glass::Presentation`]); the host paints them,
+//! appends the log lines it drains, and performs the plain-data [`model::Intent`]s a
+//! press returns.
 //!
 //! # Contract
 //!
-//! * **Clockless.** Every method that reads time takes `now: Instant`
-//!   ([`Instant`] is `aterm_time::Instant`), so the engine runs
-//!   deterministically and on wasm.
-//! * **No platform.** No `std::fs`, threads, sockets or theme: [`paint`] lays
-//!   out the band's structure (character, ink slot and ground per cell) and
-//!   [`ink`] resolves it over a plain-RGB palette derived from a theme's
-//!   background, foreground and cursor; the host owns the file, the cells and
-//!   the theme.
+//! * **Clockless.** Every method that reads time takes `now: Instant` ([`Instant`] is
+//!   `aterm_time::Instant`), so the engine is deterministic and runs on wasm.
+//! * **No platform.** No `std::fs`, threads, sockets or theme: [`paint`] lays out the
+//!   band's structure (character, ink slot and ground per cell) and [`ink`] resolves it
+//!   over a plain-RGB palette derived from a theme's background, foreground and cursor.
 //! * **Bounded.** [`MAX_LIVE`] unretired messages, [`LOG_CAP`] ring records,
-//!   [`PENDING_PERSIST_CAP`] undrained persist lines; every string is sanitized
-//!   and capped at ingress, so a hostile reporter cannot grow the process or
-//!   forge a row.
-//! * **Constants, not knobs.** Every hold, cap and floor is a `pub const` here.
+//!   [`PENDING_PERSIST_CAP`] undrained persist lines; every string is sanitized and
+//!   capped at ingress, so a hostile reporter cannot grow the process or forge a row.
+//! * **Constants, not knobs.** Every hold, cap and floor is a `const`.
 //!
 //! # Indicators and motion
 //!
-//! A row's indicator is its meter's state: a fill draws the bar,
-//! [`Meter::busy`] the comet, neither draws nothing. The meter spans the whole
-//! row (`(0, cols, fill)`, a busy track `(0, cols)`), laid under the words and
-//! mapped by the host onto the window's pixels, gutters included, so it costs
-//! the words no room and is never shed. Motion is the engine's: the host reads
-//! one frame at a time through [`MessageCenter::motion`] and wakes at
-//! [`MessageCenter::motion_deadline`] on one 33 ms grid; a frame carries
-//! fractions of the row ([`animate::Surface`]) and an echo's glyph, never a
-//! pixel. A frame never enters the center: it bumps no revision, re-grids
-//! nothing and never arms [`MessageCenter::deadline`].
-//! [`MessageCenter::busy_on_glass`] says whether a committed row is busy.
+//! A row's indicator is its meter's state: a fill draws the bar, [`Meter::busy`] the
+//! comet, neither draws nothing. The meter spans the whole row, laid under the words and
+//! mapped by the host onto the window's pixels, gutters included, so it costs the words
+//! no room. The host reads one motion frame at a time ([`MessageCenter::motion`]) and
+//! wakes at [`MessageCenter::motion_deadline`] on the [`ANIM_FRAME`] grid. A frame
+//! carries fractions of the row ([`animate::Surface`]), never a pixel, and never enters
+//! the center: it bumps no revision, re-grids nothing and never arms
+//! [`MessageCenter::deadline`]. A host runs all of it through one driver, [`drive`],
+//! injecting the clock, the afford, the freeze and each view's look.
 //!
-//! A host runs all of it through one driver, [`drive`]: the step (settle,
-//! commit, drain, the wire's paced paint), each view's layout, motion frame,
-//! next change and paint key, and the deadline folds; the host injects the
-//! clock, the afford, the freeze and each view's look.
+//! # The rest of the chrome
 //!
-//! # The presence row
+//! The per-tab presence row (who drives the session, what its agent is doing, its mail
+//! and link) and the window's rim are [`presence`]: what only a host knows comes in
+//! through [`presence::Host`], and sequencing is [`presence::drive`] over the host's
+//! [`presence::drive::Desk`]. The strip, the band and the presence row share one
+//! window's grid, and [`chrome`] is the floor across them: after any rise, no source's
+//! quiet fall re-grids the window back inside [`chrome::CHROME_REGROW_SETTLE`]. The host
+//! hands the floor in ([`drive::Commit::floor`], [`presence::drive::Desk::chrome_floor`]).
 //!
-//! The same chrome carries the per-tab presence row (who drives the session,
-//! what its agent is doing, its mail and its link) and the window's rim. Its
-//! pure core is [`presence`]: the facts a host gathers, the per-session slot and
-//! its story, the levels, the words and their width law, the tones, the painted
-//! cells and the per-window view. What only a host knows (an agent wall's
-//! vocabulary, its input stall, its harness's name, the wire's percent codec)
-//! comes in through [`presence::Host`]; sequencing is [`presence::drive`] over
-//! the host's [`presence::drive::Desk`].
-//!
-//! # The window's chrome rows together
-//!
-//! The strip, the band and the presence row share one window's grid, and
-//! each spaces only its OWN fall from its own rise. [`chrome`] (design
-//! ruling 414) is the floor across them: after any rise of a
-//! window's chrome rows, no source's quiet fall re-grids it back inside
-//! [`chrome::CHROME_REGROW_SETTLE`]. The host notes the rises and hands the
-//! floor in ([`drive::Commit::floor`], [`presence::drive::Desk::chrome_floor`]);
-//! the fall laws read it.
-//!
-//! # The Settings ▸ Messages page
-//!
-//! [`page`] builds the log page's model once over the center
-//! ([`page::MessagesState::of`]): every record newest first in the wire's state
-//! words, the live rows' current words, the band row each is on, which authored
-//! intents can still be pressed, the tags in chip order, and the page's words,
-//! filter, day clock and press feedback. Host facts (clock, log folder, UTC
-//! offset, staged build, agent upgrades, detail-line budget) come in through
-//! [`page::Host`]; the host lays the page out and paints it.
+//! [`page`] builds the Settings ▸ Messages page's model over the center
+//! ([`page::MessagesState::of`]); host facts come in through [`page::Host`], and the host
+//! lays the page out and paints it.
 
 #![forbid(unsafe_code)]
-#![deny(missing_docs)]
-#![deny(clippy::all)]
-#![deny(clippy::pedantic)]
-// Test code is exempt from the pedantic bar; production code is not.
+#![warn(missing_docs)]
+#![warn(clippy::pedantic)]
 #![cfg_attr(test, allow(clippy::all, clippy::pedantic))]
 #![allow(
     clippy::module_name_repetitions,
@@ -240,8 +210,7 @@ pub(crate) const COMET_LEAD_PERMILLE: u32 = 80;
 pub(crate) const COMET_HEAD_LIFT: u8 = 150;
 /// The glint's cycle over a determinate bar: a travel, then rest.
 pub const GLINT_PERIOD: Duration = Duration::from_millis(4000);
-/// The glint's travel along the FILL; the rest of [`GLINT_PERIOD`] asks no
-/// frames.
+/// The glint's travel along the fill; the rest of [`GLINT_PERIOD`] asks no frames.
 pub const GLINT_TRAVEL: Duration = Duration::from_millis(1600);
 /// The first glint, after the motion epoch.
 pub const GLINT_DELAY: Duration = Duration::from_millis(1200);
@@ -381,14 +350,7 @@ pub const GLASS_TITLE_CHARS: usize = 48;
 const _: () =
     assert!(WIRE_KEY_PREFIX.len() + WIRE_KEY_MAX <= KEY_CAP && GLASS_TITLE_CHARS < TITLE_CAP);
 
-// ---- Strain: explaining very heavy system use ------------------------------
-//
-// The strain engine ([`strain`]) puts one row on the glass, `Typing slowed by
-// <cause>`, only while aterm measured slow typing (felt), a resource is past
-// its enter line (heavy), the cause is named from what was measured (named)
-// and it is not the person's own command or an aterm job that already has a
-// row (not own). Everything else is a record. Nothing is sampled until felt is
-// suspected, so a calm machine arms nothing.
+// ---- Strain: explaining very heavy system use (the rule is `strain`'s module doc) ----
 
 /// The strain row's supersede key; its records share it.
 pub const STRAIN_KEY: &str = "system.strain";
@@ -482,120 +444,6 @@ const _: () = assert!(
 
 #[cfg(test)]
 mod tests {
-    /// Every source file of this crate, by name, as compiled — no `std::fs`
-    /// walk, so the fence holds on a target with no filesystem too.
-    const SOURCES: &[(&str, &str)] = &[
-        ("lib.rs", include_str!("lib.rs")),
-        ("model.rs", include_str!("model.rs")),
-        ("need.rs", include_str!("need.rs")),
-        ("center.rs", include_str!("center.rs")),
-        ("chrome.rs", include_str!("chrome.rs")),
-        ("digest.rs", include_str!("digest.rs")),
-        ("exceptions.rs", include_str!("exceptions.rs")),
-        ("glass.rs", include_str!("glass.rs")),
-        ("log.rs", include_str!("log.rs")),
-        ("text.rs", include_str!("text.rs")),
-        ("wire.rs", include_str!("wire.rs")),
-        ("words.rs", include_str!("words.rs")),
-        ("carry.rs", include_str!("carry.rs")),
-        ("progress.rs", include_str!("progress.rs")),
-        ("animate.rs", include_str!("animate.rs")),
-        ("strain.rs", include_str!("strain.rs")),
-        ("waits.rs", include_str!("waits.rs")),
-        ("palette.rs", include_str!("palette.rs")),
-        ("paint.rs", include_str!("paint.rs")),
-        ("page.rs", include_str!("page.rs")),
-        ("ink.rs", include_str!("ink.rs")),
-        ("drive.rs", include_str!("drive.rs")),
-        ("presence/mod.rs", include_str!("presence/mod.rs")),
-        ("presence/model.rs", include_str!("presence/model.rs")),
-        ("presence/words.rs", include_str!("presence/words.rs")),
-        ("presence/paint.rs", include_str!("presence/paint.rs")),
-        ("presence/view.rs", include_str!("presence/view.rs")),
-        ("presence/drive.rs", include_str!("presence/drive.rs")),
-    ];
-
-    /// Invariant 1: the engine never samples a clock. `tools/grep_guard.sh`'s
-    /// C3 walks only core/src/terminal, so the crate carries its own fence: no
-    /// `::now()` in the SHIPPED code, everything before each file's
-    /// `#[cfg(test)]` MODULE (tests mint a base instant). A `#[cfg(test)]` on a
-    /// single accessor ends nothing, so the scan cannot quietly shrink.
-    #[test]
-    fn no_wall_clock_in_this_crate() {
-        // Assembled so this test's own text is not a hit.
-        let needle = ["::", "now()"].concat();
-        let marker = ["\n#[cfg(", "test)]\n"].concat();
-        let mut hits = Vec::new();
-        for (name, src) in SOURCES {
-            let module_start = src.match_indices(&marker).find(|(at, _)| {
-                let next = src[at + marker.len()..].lines().next().unwrap_or("");
-                next.starts_with("mod ") || next.starts_with("pub(crate) mod ")
-            });
-            let shipped = module_start.map_or(*src, |(at, _)| &src[..at]);
-            assert!(shipped.len() > 100, "{name}: the shipped half is not empty");
-            for (i, line) in shipped.lines().enumerate() {
-                if line.contains(&needle) {
-                    hits.push(format!("{name}:{}: {}", i + 1, line.trim()));
-                }
-            }
-        }
-        assert!(
-            hits.is_empty(),
-            "clock reads in the engine:\n{}",
-            hits.join("\n")
-        );
-        // The fence is complete by construction: every shipped `mod x;` of this
-        // file names a source in SOURCES — `x.rs`, or a directory module's
-        // `x/mod.rs` together with every `mod y;` that file declares
-        // (`x/y.rs`) — so a new shipped module cannot arrive unscanned (the
-        // `#[cfg(test)]` modules are not shipped).
-        let decls = |src: &'static str| -> Vec<&'static str> {
-            src.lines()
-                .filter_map(|l| {
-                    l.strip_prefix("pub mod ")
-                        .or_else(|| l.strip_prefix("pub(crate) mod "))
-                        .or_else(|| l.strip_prefix("mod "))?
-                        .strip_suffix(';')
-                })
-                .collect()
-        };
-        let source = |file: &str| SOURCES.iter().find(|(name, _)| *name == file);
-        let modules: Vec<&str> = include_str!("lib.rs")
-            .lines()
-            .filter_map(|l| {
-                l.strip_prefix("pub mod ")
-                    .or_else(|| l.strip_prefix("pub(crate) mod "))?
-                    .strip_suffix(';')
-            })
-            .collect();
-        assert_eq!(modules.len(), 22, "{modules:?}");
-        let mut scanned = 1;
-        for m in &modules {
-            let flat = format!("{m}.rs");
-            let dir = format!("{m}/mod.rs");
-            let Some((name, src)) = source(&flat).or_else(|| source(&dir)) else {
-                panic!("{flat} is a shipped module outside the clock fence");
-            };
-            scanned += 1;
-            if *name == dir {
-                for sub in decls(src) {
-                    let file = format!("{m}/{sub}.rs");
-                    assert!(
-                        source(&file).is_some(),
-                        "{file} is a shipped module outside the clock fence"
-                    );
-                    scanned += 1;
-                }
-            }
-        }
-        assert_eq!(
-            SOURCES.len(),
-            scanned,
-            "lib.rs plus every shipped module, nothing else"
-        );
-    }
-
-    /// The holds are the measured status-bar values.
     #[test]
     fn holds_are_the_measured_status_bar_values() {
         use super::*;

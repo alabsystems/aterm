@@ -36,11 +36,10 @@ impl Drop for FileLock {
     }
 }
 
-/// How often [`FileLock::acquire_within`] re-tests a held lock. Matches the
-/// Windows branch's cadence: short enough that the common "holder finishes in
-/// millis" case costs one tick, long enough that a full wait is ~20 syscalls a
-/// second rather than a spin.
-#[cfg(unix)]
+/// How often [`FileLock::acquire_within`] re-tests a held lock, on both
+/// branches: short enough that the common "holder finishes in millis" case
+/// costs one tick, long enough that a full wait is ~20 syscalls a second rather
+/// than a spin.
 const LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
 impl FileLock {
@@ -147,17 +146,9 @@ impl FileLock {
         }
     }
 
-    /// Windows: the lock is already a bounded retry loop, so the bounded and
-    /// blocking spellings are the same operation. `limit` is accepted for a
-    /// single call shape across platforms.
-    #[cfg(windows)]
-    pub fn acquire_within(path: &Path, _limit: std::time::Duration) -> io::Result<Self> {
-        Self::acquire(path)
-    }
-
     /// Windows approximation of the advisory lock: open the file with
     /// `share_mode(0)` (exclusive — a second open by anyone fails with a sharing
-    /// violation) in a bounded retry loop. The updater is inert on Windows
+    /// violation), retried until `limit`. The updater is inert on Windows
     /// (`enabled()` is already `false`), so an approximate advisory lock is an
     /// honest stand-in; the OS releases it when the handle closes, matching the
     /// flock open-file-description cleanup guarantee.
@@ -167,21 +158,19 @@ impl FileLock {
     // by design (a raced path costs a retry, never corruption). Audited
     // (update-atpkg).
     #[cfg_attr(trust_verify, trust::skip)]
-    pub fn acquire(path: &Path) -> io::Result<Self> {
+    pub fn acquire_within(path: &Path, limit: std::time::Duration) -> io::Result<Self> {
         use std::os::windows::fs::OpenOptionsExt;
         // Only a sharing/lock violation means "someone else holds it" — retry
         // those. ERROR_SHARING_VIOLATION (32) is what a competing `share_mode(0)`
         // open returns; ERROR_LOCK_VIOLATION (33) is the byte-range-lock cousin.
         // Any other error (missing parent dir = 3, access-denied ACL = 5, invalid
-        // path, …) is PERMANENT: retrying just burns the full ~5 s before the real
+        // path, …) is PERMANENT: retrying just burns the budget before the real
         // error surfaces, so return it immediately (matching the unix branch, where
         // flock only blocks after a successful open).
         const ERROR_SHARING_VIOLATION: i32 = 32;
         const ERROR_LOCK_VIOLATION: i32 = 33;
-        let mut last_err = None;
-        // Bounded wait (~5 s) rather than flock's indefinite block: holders
-        // release in millis, and a wedged holder should surface as an error.
-        for _ in 0..100 {
+        let deadline = std::time::Instant::now() + limit;
+        loop {
             match std::fs::OpenOptions::new()
                 .create(true)
                 .read(true)
@@ -199,14 +188,29 @@ impl FileLock {
                     ) {
                         return Err(e);
                     }
-                    last_err = Some(e);
+                    // Held past the deadline: `TimedOut`, as the unix branch
+                    // answers, which is what every caller matches on.
+                    if std::time::Instant::now() >= deadline {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!(
+                                "another process has held the update lock for more than {}s",
+                                limit.as_secs()
+                            ),
+                        ));
+                    }
                 }
             }
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            std::thread::sleep(LOCK_POLL);
         }
-        Err(last_err.unwrap_or_else(|| {
-            io::Error::new(io::ErrorKind::TimedOut, "could not acquire update lock")
-        }))
+    }
+
+    /// [`Self::acquire_within`] a bounded ~5 s rather than flock's indefinite
+    /// block: holders release in millis, and a wedged holder should surface as
+    /// an error.
+    #[cfg(windows)]
+    pub fn acquire(path: &Path) -> io::Result<Self> {
+        Self::acquire_within(path, std::time::Duration::from_secs(5))
     }
 }
 
@@ -361,21 +365,23 @@ mod tests {
     }
 
     // A permanent open failure (here: parent directory does not exist → os error 3)
-    // must surface IMMEDIATELY, not after the full ~5 s retry budget that is reserved
-    // for genuine sharing-violation contention.
+    // must surface IMMEDIATELY, not after the retry budget that is reserved for
+    // genuine sharing-violation contention.
     #[cfg(windows)]
     #[test]
     fn acquire_fails_fast_on_permanent_error() {
         let missing = std::env::temp_dir()
             .join(format!("aterm-no-such-dir-{}", std::process::id()))
             .join("lock");
+        // A two-minute budget, and a minute's hang detector: only an error
+        // returned without retrying ends inside it.
         let start = std::time::Instant::now();
-        let err = match FileLock::acquire(&missing) {
+        let err = match FileLock::acquire_within(&missing, std::time::Duration::from_secs(120)) {
             Ok(_) => panic!("acquire must fail on a missing parent"),
             Err(e) => e,
         };
         assert!(
-            start.elapsed() < std::time::Duration::from_secs(1),
+            start.elapsed() < std::time::Duration::from_secs(60),
             "permanent error must not burn the retry budget (took {:?})",
             start.elapsed()
         );

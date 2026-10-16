@@ -31,9 +31,8 @@ fn selection(
     sel
 }
 
-/// The pane selection fold: no selection contributes nothing (a settled window folds to
-/// 0); any change of a pane's selection, its state, or which pane holds it changes the
-/// fold.
+/// No selection folds to 0; any change of a pane's selection, its state, or which pane holds it
+/// changes the fold.
 #[test]
 fn the_pane_selection_fold_changes_with_any_panes_selection() {
     let none = aterm_core::selection::TextSelection::default();
@@ -70,10 +69,8 @@ fn the_pane_selection_fold_changes_with_any_panes_selection() {
     );
 }
 
-/// Build the `RepaintKey` for the current frame exactly as `redraw()` does:
-/// observe the damage epoch, the selection, and the supplied visual-only
-/// state. Returns the key; the caller decides whether to "present" (which in
-/// `redraw()` consumes the damage via `take_damage`).
+/// The `RepaintKey` `redraw()` builds for the current frame; presenting (`take_damage`) is the
+/// caller's.
 pub(super) fn frame_key(
     term: &mut Terminal,
     blink_phase: bool,
@@ -85,77 +82,44 @@ pub(super) fn frame_key(
         grid_top: 0,
         blink_phase,
         invert,
-        // These unit frames never exercise the drag-hover highlight.
+        // Unit frames are single-pane with no host-driven chrome or animation: every visual
+        // fingerprint is its idle 0/false sentinel.
         drag_hover: false,
         cursor_override,
         cursor_row: term.cursor().row as usize,
         cursor_col: term.cursor().col as usize,
         cursor_visible: term.cursor_visible(),
         cursor_style: term.cursor_style(),
-        // No cursor aurora in these unit frames (the wake is a host-driven
-        // animation); the cursor-position terms above carry the move.
         glow_fp: 0,
-        // No cadence-comet trail in these unit frames (host-driven animation).
         trail_fp: 0,
-        // No sparkle-word decorations in these unit frames (host-driven).
         deco_fp: 0,
-        // No matrix rain in these unit frames (default-off feature) — the
-        // constant-0 sentinel keeps the key byte-identical to the pre-rain path.
         rain_fp: 0,
         streak_fp: 0,
         selection: SelectionFingerprint::of(term.text_selection()),
         pane_selection_fp: super::fold_pane_selection_fp(0, 0, term.text_selection()),
-        // These unit frames are single-pane, which marks no pane — the same
-        // 0 sentinel the shipping single-pane key carries.
         active_pane_mark: 0,
-        // No tab strip in these unit frames (the disabled-strip sentinel), so the
-        // key matches the byte-identical no-strip path.
         tab_strip: 0,
-        // No tab context menu in these unit frames — the closed sentinel keeps
-        // the key byte-identical to the pre-menu path.
         tab_menu_fp: 0,
-        // No Settings overlay in these unit frames — the closed sentinel keeps the
-        // key byte-identical to the no-overlay path.
         settings_fp: 0,
-        // No ⌘F find bar in these unit frames — the not-searching sentinel keeps the
-        // key byte-identical to the pre-find path.
         find_fp: 0,
-        // No scroll pill in these unit frames (host-driven fade) — the invisible
-        // sentinel keeps the key byte-identical to the pre-pill path.
         pill_fp: 0,
-        // No composition in these unit frames — the 0 sentinel keeps the
-        // key byte-identical to the pre-preedit shape.
         preedit_fp: 0,
-        // Whole-row in these unit frames (no sub-row scroll) — the frac-0 sentinel
-        // keeps the key byte-identical to the pre-M1b path.
         scroll_frac_px: 0,
-        // No update-ready nudge in these unit frames (the no-nudge sentinel).
         relaunch_fp: 0,
-        // No build badge in these unit frames (the hidden sentinel).
         badge_fp: 0,
-        // No transient notice in these unit frames (the no-notice sentinel).
         bubble_fp: 0,
-        // No upgrade rim in these unit frames (the no-rim sentinel).
         level_up_fp: 0,
-        // No message band in these unit frames — the hidden sentinel keeps the
-        // key byte-identical to the no-band path.
         band_fp: 0,
-        // No presence in these unit frames (the quiet sentinel).
         presence_fp: 0,
-        // No connection drag in these unit frames (the no-drag sentinel).
         conn_wire_fp: 0,
-        // Fixed OS appearance in these unit frames (a flip is exercised by
-        // `os_appearance_flip_repaints`).
         system_dark: false,
         link_caption: None,
-        // No Claude Code footer in these unit frames (the no-facts sentinel).
         claude_footer_fp: 0,
     }
 }
 
-/// `selection_inactive = true` is host state, so a focus flip must invalidate both GUI
-/// cache layers: prime the real CPU cache, drive `App::on_focus`, and with an explicit
-/// inactive-background override check the unfocused band appears and focus restores it.
+/// `selection_inactive` is host state: a focus flip invalidates both the repaint gate and the
+/// raster cache, an explicit inactive background appears unfocused, and focus restores it.
 #[test]
 fn explicit_inactive_selection_focus_flip_invalidates_and_repaints() {
     const INACTIVE_BG: u32 = 0x0001_7AC4;
@@ -273,10 +237,8 @@ fn explicit_inactive_selection_focus_flip_invalidates_and_repaints() {
     );
 }
 
-/// Drive the ty-checked `AsymmetricPadLayout` cache actions against the real
-/// GUI `RepaintKey` comparison. Run by the cross-crate xref gate (its only
-/// caller), so the gate runs the behavior as well as collecting its
-/// `#[refines]` anchors.
+/// Drives the `AsymmetricPadLayout` cache actions against the real `RepaintKey` comparison.
+/// The spec xref gate is its only caller.
 pub(super) fn run_asymmetric_pad_layout_conformance() {
     let model = aterm_spec::derive::asymmetric_pad_layout_model();
     let picked = model
@@ -299,10 +261,8 @@ pub(super) fn run_asymmetric_pad_layout_conformance() {
     let mut cached = frame_key(&mut term, true, false, None);
     cached.grid_top = initial["grid_top"] as usize;
 
-    // Prime the real shipping cache seam, rather than manufacturing the
-    // `Option<RepaintKey>` consumed below. This binds PrimeLayoutCache to
-    // WindowState::stamp_present_decision and then projects the private
-    // stored key back onto the model's cached_grid_top variable.
+    // `PrimeLayoutCache` primes the real seam, `WindowState::stamp_present_decision`, not a
+    // hand-built key; the stored key projects onto the model's `cached_grid_top`.
     let mut app = App::headless_for_test();
     app.backend.set_pad(picked["pad"] as usize);
     app.backend.set_head(picked["head"] as usize);
@@ -330,8 +290,7 @@ pub(super) fn run_asymmetric_pad_layout_conformance() {
         "identical layout may reuse the GUI present cache"
     );
 
-    // Same terminal content and every same-sized-frame key term; only the
-    // effective grid origin changes.
+    // Only the effective grid origin changes.
     let mut current = cached;
     current.grid_top = changed["grid_top"] as usize;
     assert_ne!(current.grid_top, cached.grid_top);
@@ -339,7 +298,7 @@ pub(super) fn run_asymmetric_pad_layout_conformance() {
     assert_eq!(usize::from(!repaint), decided["cache_hit"] as usize);
     assert_eq!(usize::from(repaint), decided["full_repaint"] as usize);
 
-    // Negative control: without the `grid_top` term the gate falsely hits, the decision
+    // Negative control: without the `grid_top` term the gate falsely hits, which
     // `LayoutChangeForcesFullRepaint` rejects.
     let mut mutant_without_grid_top = current;
     mutant_without_grid_top.grid_top = cached.grid_top;
@@ -350,10 +309,8 @@ pub(super) fn run_asymmetric_pad_layout_conformance() {
     );
 }
 
-/// CPU softbuffer acquisition/commit errors and GPU drawable drops share
-/// one recovery transition. The retained-stamp negative control reproduces
-/// the black-window wedge; the real host helper must make the identical key
-/// repaintable immediately.
+/// A dropped present (CPU softbuffer acquire/commit error, GPU drawable drop) unstamps its key
+/// so the identical frame repaints on the next redraw; a retained stamp wedges a black window.
 #[test]
 fn dropped_surface_attempt_unstamps_same_key_for_retry() {
     let mut term = Terminal::new(2, 8);
@@ -382,9 +339,8 @@ fn dropped_surface_attempt_unstamps_same_key_for_retry() {
     );
 }
 
-/// A surface-recovery redraw is not a content change. Both render paths use
-/// this exact cache seam so identical terminal cells cannot swallow the
-/// frame that fills newly exposed raw-size bands or acknowledges CPU fallback.
+/// A surface-recovery redraw bypasses an identical key, so unchanged cells cannot swallow the
+/// frame that fills newly exposed bands or acknowledges a CPU fallback.
 #[test]
 fn outstanding_recovery_bypasses_identical_repaint_key() {
     let mut term = Terminal::new(4, 10);
@@ -394,14 +350,14 @@ fn outstanding_recovery_bypasses_identical_repaint_key() {
     assert!(should_repaint_or_recover(Some(key), key, true));
 }
 
-/// What buys the frame after a torn caret: the caret move is itself part of the
-/// `RepaintKey`, so the next redraw cannot early-out, and `Wake::Output` clears its latch
-/// before its work so a chunk landing mid-redraw re-arms. This pins the half here.
+/// A bare caret move changes the `RepaintKey`, so the redraw after a torn caret cannot
+/// early-out. (The other half: `Wake::Output` clears its latch before its work, so a chunk
+/// landing mid-redraw re-arms.)
 #[test]
 fn a_bare_caret_move_moves_the_repaint_key() {
     let mut term = Terminal::new(4, 10);
     let settled = frame_key(&mut term, true, false, None);
-    // CUP: relocate the caret, write nothing.
+    // CUP: move the caret, write nothing.
     term.process(b"\x1b[3;7H");
     let moved = frame_key(&mut term, true, false, None);
     assert_eq!(
@@ -414,10 +370,8 @@ fn a_bare_caret_move_moves_the_repaint_key() {
     );
 }
 
-/// Exercise the COMPLETE split compose call site, not only the pure gate:
-/// after one unchanged frame early-outs, the same key must compose when a
-/// recovery redraw is outstanding. Removing the recovery-aware predicate
-/// from `redraw_compose` makes the final assertion fail.
+/// At the split compose call site, an identical key composes again while a recovery redraw is
+/// outstanding.
 #[test]
 fn split_compose_recovery_bypasses_identical_key_at_shipping_callsite() {
     let mut app = App::headless_for_test();
@@ -529,21 +483,19 @@ fn zoomed_split_live_and_capture_use_the_visible_panes_effective_background() {
     );
 }
 
-/// The acceptance behavior: after a present with NO subsequent terminal
-/// mutation and unchanged blink/flash/selection/focus, the next redraw
-/// decision is "skip" — i.e. `redraw()` would not re-rasterize.
+/// With no terminal mutation and unchanged visual state since the last present, the next
+/// redraw skips.
 #[test]
 fn steady_screen_skips_rerasterize_after_present() {
     let mut term = Terminal::new(4, 10);
     term.process(b"steady");
 
-    // Frame 1: present (record the key, consume the damage like redraw does).
+    // Present: record the key and consume the damage, as `redraw()` does.
     let k1 = frame_key(&mut term, true, false, None);
     assert!(should_repaint(None, k1), "first present");
     term.take_damage();
     let last_present = Some(k1);
 
-    // Frame 2: nothing changed (no write, same blink/flash/selection/focus).
     let k2 = frame_key(&mut term, true, false, None);
     assert!(
         !should_repaint(last_present, k2),
@@ -551,11 +503,9 @@ fn steady_screen_skips_rerasterize_after_present() {
     );
 }
 
-/// An OS appearance flip with a plain theme moves only `system_dark`, which must defeat
-/// the early-out so the preview's `window_theme=auto` mock re-renders. The term comes
-/// from `repaint_system_dark` (every key site's source) after the real
-/// `sync_app_theme_to_appearance`. The all-window nudge is pinned by
-/// `app_colorscheme::tests::appearance_flip_nudges_every_window`.
+/// An OS appearance flip under a plain theme moves only `system_dark` (via the real
+/// `sync_app_theme_to_appearance` and `repaint_system_dark`), which must defeat the early-out.
+/// The all-window nudge: `app_colorscheme::tests::appearance_flip_nudges_every_window`.
 #[test]
 fn os_appearance_flip_repaints() {
     let mut term = Terminal::new(4, 10);
@@ -565,9 +515,6 @@ fn os_appearance_flip_repaints() {
     let mut k2 = frame_key(&mut term, true, false, None);
     assert!(!should_repaint(Some(k1), k2), "idle screen skips");
 
-    // The population half: a plain theme (no dark:/light: split) makes the
-    // flip a theme-unchanged no-op everywhere EXCEPT the tracked appearance,
-    // which must still move the key term through `repaint_system_dark`.
     let mut app = crate::App::headless_for_test();
     app.config = aterm_toml::from_str(r#"theme = "Dracula""#).expect("valid toml");
     app.os_appearance = aterm_types::Appearance::Light;
@@ -583,8 +530,7 @@ fn os_appearance_flip_repaints() {
     );
 }
 
-/// A selection change still repaints: it mutates the selection, not the grid
-/// damage tracker, so only the key's selection fingerprint can carry it.
+/// A selection change marks no grid damage, so only the key's selection fingerprint carries it.
 #[test]
 fn a_selection_change_still_repaints() {
     let mut term = Terminal::new(4, 10);

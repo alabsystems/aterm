@@ -1,0 +1,57 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+#
+# Arena pins — the single source of competitor + harness provenance, read by
+# the arena lanes of `verify perf` (crates/aterm-verify/src/perf/arena/).
+# A ledger entry must name the [pin] it ran against. Update pins in their own
+# commit, never silently inside a results commit.
+
+[ghostty.tip]
+# The rolling nightly artifact — the exact channel mitchellh's 2026-07-06
+# benchmark charts describe. This pin includes the July IO-rework PRs
+# (#13209 2026-07-06, #13226, #13227, #13237 through 2026-07-07).
+commit = "2511abe3d (self-identified; full sha unresolved — tip dmg carries short id)"
+commit_date = "2026-07-19 (re-pin)"
+artifact = "https://github.com/ghostty-org/ghostty/releases/download/tip/Ghostty.dmg"
+artifact_sha256 = "63bab66d77d935f4316c355e09a804c6b19fe2213bbeef74c0e9642b5cdf6eb8"
+artifact_built = "2026-07-19 (downloaded)"
+# CFBundleShortVersionString inside the dmg — the tip build self-identifies
+# by commit, so verify this after mounting before any run:
+bundle_version = "2511abe3d"
+note = "Re-pin (new dmg + sha) whenever a D1-class re-measure is triggered; tip rebuilds on every green commit to main."
+
+[ghostty.stable]
+version = "1.3.1"
+released = "2026-03-13"
+source = "Homebrew cask `ghostty` 1.3.1 (the build the first stable-channel run used)"
+binary_sha256 = "3460be6d0c80504ffafe0dbb06f60cb1e8fb680a564a97a1aa5b95b48b8e30ac"
+measured = "docs/measured/arena/2026-07-19-d1-cat-ghostty-stable.md (first stable-channel run)"
+
+# alacritty, kitty and wezterm carry no table: no arena run has used them. The
+# first run that does adds its pin here, in its own commit. The June onglass
+# numbers came from unrecorded source builds and must never be reused (README
+# rule zero 1).
+
+[harness.vtebench]
+repo = "https://github.com/alacritty/vtebench"
+commit = "ead80032e57dee2e75f0b51f2ea67528647d9944"
+pinned = "2026-09-25 (git ls-remote HEAD)"
+note = "No 'nanosecond patch' could be sourced (recon flag). The vte lane builds vtebench at this commit, runs it inside each terminal and reads its own --dat samples — no hyperfine, which would time nothing vtebench does not. The benchmarks' tty lookup is trimmed for macOS ps padding (crates/aterm-verify/src/perf/arena/vte.rs says why); nothing else is changed."
+
+[harness.doom-fire-zig]
+repo = "https://github.com/const-void/DOOM-fire-zig"
+commit = "eb0631b141b5778eefc6f5767bb45f8974c1be71"
+pinned = "2026-09-25 (git ls-remote HEAD)"
+requires = "zig on the bench machine (build with -Doptimize=ReleaseFast)"
+grids = ["community-standard (default window)", "fullscreen 5K-class ~300x90"]
+
+[harness.typometer]
+repo = "https://github.com/pavelfatin/typometer"
+commit = "2084acfec845fdb3042f0155adffd88f14117c00"
+pinned = "2026-09-25 (git ls-remote HEAD)"
+note = "A manual Java GUI tool: the ARENA-LAT tier-(a) run is by hand on the M4 Max, and its ledger entry names this pin."
+
+[corpus.asciinema]
+note = "The ghostty flagship real-world corpus (2.4GB/2yr in their PR #9645; '~4GB' in 1.3.0 notes). Download on the M4 Max only — the M2 Air is at disk capacity."
+url = "none public: ghostty received the dump directly from asciinema (1.3.0 release notes; PR #9645 links none)"
+obtain = "EXTERNAL — ask the asciinema maintainers for the same dump. A self-assembled corpus of public asciinema.org .cast files is the fallback; it gets its own entry (recording IDs + sha256) and is not comparable with ghostty's numbers."

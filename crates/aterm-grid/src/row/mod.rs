@@ -2,20 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Row storage for terminal grid.
+//! Row storage for the terminal grid: a contiguous array of cells, a length
+//! (one past the last cell output wrote, printed blanks included; see
+//! [`Row::len`]) and [`RowFlags`].
 //!
-//! ## Design
-//!
-//! A Row is a contiguous array of cells with a length: one past the last cell
-//! output wrote, printed blanks included (see [`Row::len`]).
-//!
-//! Lines can be soft-wrapped (automatic) or hard-wrapped (explicit newline).
-//!
-//! ## Module organization
-//!
-//! - `write.rs`: Single/wide character write operations with wide-char fixup
-//! - `char_ops.rs`: ICH (insert), DCH (delete), ECH (erase) operations
-//! - `clear.rs`: Full/partial/selective row clearing
+//! `write.rs` holds single/wide writes with wide-char fixup, `char_ops.rs`
+//! ICH/DCH/ECH, `clear.rs` full/partial/selective clears.
 
 use super::cell::Cell;
 use super::page::{PageSlice, PageStore};
@@ -65,35 +57,29 @@ aterm_types::bitflags! {
         const DOUBLE_HEIGHT_TOP = 1 << 3;
         /// Double-height line, bottom half (DECDHL).
         const DOUBLE_HEIGHT_BOTTOM = 1 << 4;
-        /// This row contains at least one WIDE (double-column) character.
-        /// Set by write_wide_char; cleared by clear(). Enables
-        /// fixup_wide_chars_in_range to skip the scan when no wide chars exist.
+        /// At least one cell is a WIDE head. Set by every wide write and by
+        /// `Row::set`/`overwrite_span` of a wide cell; cleared by whole-row
+        /// clears. Gates the wide fixups so narrow-only rows skip the scan.
         const HAS_WIDE_CHARS = 1 << 5;
-        /// This row contains at least one cell written with a StyleId
-        /// (cell flag USES_STYLE_ID). Set by StyleId write paths and
-        /// propagated by Row::set; cleared by clear()/erase(). Lets
-        /// extract_row_extras skip the per-cell style_id scan on plain rows.
+        /// At least one cell uses a StyleId (cell flag USES_STYLE_ID). Set by
+        /// the (test-only) StyleId write paths and `Row::set`/`overwrite_span`;
+        /// cleared by whole-row clears. Lets `extract_row_extras` skip the
+        /// per-cell scan.
         const HAS_STYLE_ID = 1 << 6;
         /// The row's last cell is an early-wrap hole: a width-2 glyph that
         /// could not start there wrapped to the next row and left the cell
-        /// unwritten (xterm blanks it with the current background). Ghostty
-        /// calls the cell a `spacer_head`, Alacritty a
-        /// `LEADING_WIDE_CHAR_SPACER`. It is not content: a rewrap that rejoins
-        /// the row with its continuation drops this one cell and nothing else,
-        /// so a space or glyph a program really wrote in the last column is
-        /// kept ([`Row::has_early_wrap_hole`]).
+        /// unwritten (xterm blanks it with the current background; Ghostty's
+        /// `spacer_head`). It is not content: a rewrap that rejoins the row
+        /// with its continuation drops this one cell, so a space or glyph a
+        /// program really wrote in the last column is kept
+        /// ([`Row::has_early_wrap_hole`]).
         ///
-        /// Set where a hole is made: the write path's early wrap
-        /// (`Grid::blank_wide_wrap_tail`), the visible rewrap's chunker when it
-        /// backs a chunk off a wide glyph, and a row filled from a history
-        /// [`Line`](aterm_scrollback::Line) that ends one cell short (a line
-        /// stores content only, so its hole is the cell it leaves unfilled).
-        /// Cleared by a write into the last cell (a glyph, a wide glyph's
-        /// spacer, a `Row::set`, a fill run, a DECFRA glyph) and by a shift of
-        /// it (ICH/DCH), and by every whole-row clear/erase/reset; a width
-        /// change without rewrap drops it. An erase of the cell (DECERA, or
-        /// ECH and EL, which also end the soft wrap there) keeps it: the hole
-        /// stays a hole, blanked again.
+        /// Set by the write path's early wrap (`Grid::blank_wide_wrap_tail`),
+        /// the visible rewrap's chunker when it backs a chunk off a wide glyph,
+        /// and a row filled from a history [`Line`](aterm_scrollback::Line)
+        /// that ends one cell short. Cleared by any write into or shift of the
+        /// last cell, every whole-row clear/erase/reset, and a width change
+        /// without rewrap. An erase of the cell (DECERA, ECH, EL) keeps it.
         const EARLY_WRAP_HOLE = 1 << 7;
         /// Mask of DEC line attribute flags (DECDWL/DECDHL).
         ///
@@ -392,10 +378,7 @@ impl Row {
         unsafe { self.cells.get_unchecked_mut(col as usize) }
     }
 
-    /// Get mutable access to all cells in this row.
-    ///
-    /// This is the fast path for bulk cell writes (e.g., ASCII blast).
-    /// After modifying cells, call `update_len()` if the content length changed.
+    /// Mutable access to all cells (bulk writes); call `update_len()` after.
     #[cfg(miri)]
     #[must_use]
     #[inline]
@@ -438,10 +421,8 @@ impl Row {
         Some(&mut self.cells[start..end])
     }
 
-    /// Update the row's len to include all written content up to `end_col`.
-    ///
-    /// Call this after using `cells_mut()` to write content at positions up to `end_col - 1`.
-    /// This ensures `visible_content()` and iteration include the new content.
+    /// Grow `len` to cover content written up to `end_col - 1` by a path that
+    /// does not keep it (e.g. [`Self::cells_mut_with_fixup`]). Never shrinks.
     #[inline]
     pub fn update_len(&mut self, end_col: u16) {
         if end_col > self.len {
@@ -450,18 +431,13 @@ impl Row {
     }
 
     /// Overwrite the cells from column `left` with `cells` (clipped to the
-    /// row), as a rectangle copy does, keeping the row's hints as [`Self::set`]
-    /// does: `HAS_WIDE_CHARS` when a copied cell is a wide head, `HAS_STYLE_ID`
-    /// when one uses a style id. `len` is left to the caller, which recomputes
-    /// it after its boundary fixup.
+    /// row), keeping the row's hints as [`Self::set`] does: `HAS_WIDE_CHARS`
+    /// for a copied wide head, `HAS_STYLE_ID` for a style-id cell. `len` is
+    /// left to the caller, which recomputes it after its boundary fixup.
     ///
-    /// Ruling 2026-10-11 (r15 chunking review): the margined scrolls and IL/DL
-    /// copied cells in through [`Self::get_mut`], which keeps no hint, so a
-    /// row that received a wide pair that way read as narrow-only and the bulk
-    /// writers, whose wide fixups the hint gates, overwrote the head without
-    /// blanking its continuation; the per-glyph writer always fixes up, so the
-    /// stale continuation depended on how the PTY read was cut. This is the
-    /// one span copy they share.
+    /// The margined scrolls and IL/DL copy through here: a copy that dropped
+    /// `HAS_WIDE_CHARS` would let the bulk writers (whose wide fixups it gates)
+    /// overwrite a copied head without blanking its continuation.
     #[inline]
     pub(crate) fn overwrite_span(&mut self, left: usize, cells: &[Cell]) {
         let Some(dst) = self.cells.get_mut(left..) else {
@@ -489,7 +465,6 @@ impl Row {
     pub fn set(&mut self, col: u16, cell: Cell) -> bool {
         if let Some(c) = self.cells.get_mut(col as usize) {
             *c = cell;
-            // Update len if we wrote past the current end
             if col >= self.len && !cell.is_empty() {
                 self.len = col.saturating_add(1);
             }
@@ -514,20 +489,12 @@ impl Row {
     }
 
     /// Settle `len` after a bulk wide-char run written through
-    /// [`Row::write_wide_char_packed_no_fixup`].
-    ///
-    /// A wide write can orphan an existing wide char's continuation; the
-    /// fixup clears it, and if it was the row's last content `len` must shrink
-    /// or a phantom trailing space shows in `row_text`, search and scrollback.
-    /// [`Row::update_len`] only grows, so run lanes call this instead.
-    ///
-    /// Once per run equals once per glyph: glyphs advance left to right over
-    /// cells the run owns, and `recalculate_len_up_to` rescans, reaching the
-    /// same answer from the final state.
-    ///
-    /// The wide-run counterpart of the rule [`Row::cells_mut_with_fixup`]
-    /// applies for narrow bulk writes; the wide lanes call
-    /// `fixup_wide_chars_in_range` directly.
+    /// [`Row::write_wide_char_packed_no_fixup`]. The run's edge fixup can blank
+    /// an orphaned wide continuation that was the row's last content, which
+    /// must shrink `len` (or `row_text`, search and scrollback show a phantom
+    /// trailing space), and [`Row::update_len`] only grows. Once per run gives
+    /// the same answer as once per glyph: glyphs advance left to right over
+    /// cells the run owns.
     pub fn settle_len_after_wide_run(&mut self, end_col: u16, end_half_blanked: bool) {
         // The run's unchecked writes skip `note_write_through`; a run that
         // reached the last cell wrote over any early-wrap hole there.
@@ -559,16 +526,11 @@ impl Row {
         self.recalculate_len_up_to(self.cells.len());
     }
 
-    /// Resize the row to a new column count.
-    ///
-    /// If growing, new cells are empty.
-    /// If shrinking, excess cells are discarded.
+    /// Resize the row to `new_cols`: new cells are empty, excess cells dropped.
     ///
     /// # Safety
     ///
-    /// `pages` must outlive `self` after the resize completes. If `self` is
-    /// stored inside another owner, that owner must not outlive the backing
-    /// page store.
+    /// `pages` must outlive `self` after the resize, as for [`Row::new`].
     pub unsafe fn resize(&mut self, new_cols: u16, pages: &mut PageStore) {
         let old_cols = self.cols();
         if new_cols == old_cols {
@@ -583,7 +545,6 @@ impl Row {
         new_cells[..copy_len].copy_from_slice(&self.cells[..copy_len]);
         self.cells = new_cells;
 
-        // Clamp len
         if self.len > new_cols {
             self.len = new_cols;
         }

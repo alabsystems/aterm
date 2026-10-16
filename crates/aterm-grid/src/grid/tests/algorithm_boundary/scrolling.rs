@@ -291,7 +291,6 @@ fn write_wide_char_wrap_at_scroll_region_bottom_scrolls_region_only() {
 }
 
 // Full-screen region scrolls with scrollback
-// ========================================================================
 
 #[test]
 fn line_feed_full_screen_region_scrolls_with_scrollback() {
@@ -759,8 +758,7 @@ fn scroll_up_mixed_phase_scrollback_content() {
         "row 2 blank after mixed scroll"
     );
 
-    // Lines may be in the lazy buffer (deferred) or tiered scrollback.
-    // Check the combined count: tiered_scrollback_lines() includes both.
+    // `tiered_scrollback_lines()` counts the lazy buffer too.
     let line_count = grid.tiered_scrollback_lines();
     assert!(
         line_count >= 2,
@@ -783,7 +781,6 @@ fn scroll_region_up_top_equals_bottom_is_noop() {
 
     grid.scroll_region_up(1);
 
-    // All rows must be preserved — the degenerate region is a no-op.
     for row in 0..6u16 {
         assert_eq!(
             grid.cell(row, 0).unwrap().char(),

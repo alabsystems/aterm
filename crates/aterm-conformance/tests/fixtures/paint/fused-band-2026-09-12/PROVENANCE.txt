@@ -1,0 +1,17 @@
+fused-band-2026-09-12 — four frames of one kept `fake-claude` paint take, VERBATIM.
+
+Binary:   the shipped v0.83.0 bundle (build 1789245159), /Users//example/aterm/dist/cut-app/aterm.app
+Take:     tools/paint-conformance/paint_probe.sh <bin> --shape fake-claude
+          --keys t,h,e,r,a,i,n,b,o,w,k,i,t,t,y,p,a,i,n,t,s,t,h,e,a,r,c,o,k
+          --capture image --focus out --record 3 --expect ink --budget 25 --backend gpu
+          run under `launchctl submit` (QoS utility — the cutter's own tier), ATERM_PAINT_KEEP=1,
+          scratch /tmp/atpaint-ZEgUUK, 2026-09-12 16:1x, cell 7x14, 67 frames.
+Probe:    PAINT ... ribbon_bound=49 ribbon_dark=2 ... sched_late_max_us=75028 starved=yes verdict=FAIL
+Frames:   shot_0000 (the differencing baseline)
+          shot_0006 (key 3's second shot; ribbon_hue_bands=3, unbound; band_ink 166 before and after)
+          shot_0007 (key 4's first shot; bands=4, the claim opens; band_ink 4 → 203)
+          shot_0008 (key 4's second shot; bands=4; band_ink 6 → 223)
+Rows:     trail-status.rows holds the four paired `trail status` rows in the same order.
+Measured: shot_0007's one saturated object is 332 px, 33x22 (rows 150-171), eight columns of
+          cell height; per row with those columns removed: 150-155 sparks, 156-159 ZERO,
+          160-171 ribbon — the caret block was the only join.

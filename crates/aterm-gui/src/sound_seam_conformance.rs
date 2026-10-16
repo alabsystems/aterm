@@ -292,7 +292,7 @@ fn folded(i: HostInputs, style: GlowStyle, fold: Fold) -> GlowConfig {
 /// The states a run of ONE model visited, and what that model already
 /// answered about them.
 ///
-/// WHY THE ANSWERS (2026-10-05, gate speed): every script starts from the
+/// WHY THE ANSWERS (test-run speed): every script starts from the
 /// model's initial state, so the same few states are asked about again by
 /// script after script, and asking was 17% of
 /// [`the_shipping_seam_conforms_to_the_trail_sound_seam_model`]'s samples
@@ -557,9 +557,9 @@ fn the_shipping_seam_conforms_to_the_trail_sound_seam_model() {
     assert_eq!(reps.len(), 5, "every model tick class has a host input");
 
     // Each script runs on a fresh engine, so the scripts are independent: they
-    // are listed first and run side by side (22 s run in turn on the 6-core
-    // gate host, 2026-10-05), each exactly once, and the states each thread
-    // visited are united before the two-way check below.
+    // are listed first and run side by side (22 s run in turn on a 6-core
+    // host), each exactly once, and the states each thread visited are united
+    // before the two-way check below.
     // A script, and whether it runs in both reader orders (`conforms`) or
     // tone-last alone.
     type Script = (Vec<(HostInputs, GlowStyle, Grid)>, bool);

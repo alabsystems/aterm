@@ -7,16 +7,14 @@
 
 use super::Model;
 
-/// `Buggy=1` drops a shrinking row's slice without returning it to the pool,
-/// reproducing the bump allocator's historical resize leak. With
-/// `BypassReuse=1` it instead keeps the slice but allocates on a grow despite
-/// one being available: conservation alone cannot catch that defect, while
-/// the high-water bound does. Each mutant is checked independently at Tier-0.
+/// `Buggy=1` drops a shrinking row's slice without returning it to the pool (the resize leak).
+/// `BypassReuse=1` keeps the slice but allocates on a grow despite one being free: conservation
+/// cannot catch that, the high-water bound does. Each mutant is checked alone at Tier-0.
 ///
-/// `Rebuild` is a new PageStore (for example after a width change), resetting
-/// both the allocation accounting and its pool. `Output` is row-preserving
-/// output or resize-undo invalidation: it changes content, never ownership.
-/// Tier-1 drives the shipping Grid and projects the PageStore's cell slices.
+/// `Rebuild` is a new PageStore (e.g. after a width change), resetting the allocation
+/// accounting and its pool. `Output` is row-preserving output or resize-undo invalidation: it
+/// changes content, never ownership. Tier-1 drives the shipping Grid and projects the
+/// PageStore's cell slices.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn resize_row_reuse_model() -> Model {

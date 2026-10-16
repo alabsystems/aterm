@@ -50,7 +50,7 @@ pub fn atpkg_session_index_retry_model() -> Model {
             }
 
             invariant NoPrematureSameBuildPass: premature == 0;
-            invariant BoundedRetry: passes <= 3;
+            bound BoundedRetry: passes <= 3;
         }
     }
 }

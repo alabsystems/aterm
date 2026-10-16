@@ -54,12 +54,15 @@ pub struct BandInks {
     /// The band's words: the theme's foreground floored to AA on
     /// [`Self::bar_bg`]; `COLOR_WINDOWTEXT` under an OS-forced palette.
     pub value: [u8; 3],
-    /// A warning's words and glyph: an amber floored to AA on the band;
-    /// `COLOR_WINDOWTEXT` under an OS-forced palette.
+    /// A warning's words and glyph: the theme's yellow (or a fixed amber)
+    /// floored to AA on the band, [`STATUS_LIGHTNESS_GAP`] lighter than
+    /// [`Self::error`] where the band's words are light; `COLOR_WINDOWTEXT`
+    /// under an OS-forced palette.
     pub warn: [u8; 3],
     /// The ink of an error row's words and glyph on the message band: a red,
-    /// floored to AA on the band like [`Self::warn`], so `✕ Tests failed`
-    /// and `⚠ Misspelled setting` differ in more than the glyph. Collapses to
+    /// floored to AA on the band like [`Self::warn`] and kept a colour and a
+    /// lightness step apart from it, so `✕ Tests failed` and `⚠ Misspelled
+    /// setting` differ in more than the glyph and in more than hue. Collapses to
     /// the one ink under an OS-forced palette, as `warn` does.
     pub error: [u8; 3],
     /// Background of an editable well inset in the band (the find bar's query
@@ -198,10 +201,15 @@ pub struct ThemeInks {
     pub cursor: [u8; 3],
 }
 
-/// The theme's ANSI blue and cyan (slots 4 and 6), which a band meter
-/// borrows when the cursor is near-grey.
+/// The theme's ANSI hues the band borrows: blue and cyan (slots 4 and 6)
+/// for a meter when the cursor is near-grey, red and yellow (slots 1 and 3)
+/// as the seeds of its error and warn inks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct AnsiHues {
+    /// ANSI slot 1.
+    pub red: [u8; 3],
+    /// ANSI slot 3.
+    pub yellow: [u8; 3],
     /// ANSI slot 4.
     pub blue: [u8; 3],
     /// ANSI slot 6.
@@ -224,7 +232,8 @@ pub enum BarBase {
     },
 }
 
-/// The band's WARN base hue on a light ground.
+/// The band's WARN base hue on a light ground, where the theme has no
+/// chromatic ANSI yellow to seed it ([`status_seed`]).
 const WARN_LIGHT: [u8; 3] = [0x9A, 0x67, 0x00];
 /// …on a dark ground.
 const WARN_DARK: [u8; 3] = [0xF1, 0xFA, 0x8C];
@@ -232,6 +241,118 @@ const WARN_DARK: [u8; 3] = [0xF1, 0xFA, 0x8C];
 const ERROR_LIGHT: [u8; 3] = [0xCF, 0x22, 0x2E];
 /// …on a dark ground.
 const ERROR_DARK: [u8; 3] = [0xFF, 0x55, 0x55];
+
+/// The least `OkLCh` lightness the band's warn and error inks sit apart: warn
+/// the brighter on a band whose words are light, error the darker on one
+/// whose words are dark. Hue alone is the cue a colour-weak reader loses, so
+/// the two never share a lightness.
+pub const STATUS_LIGHTNESS_GAP: f64 = 0.10;
+
+/// The least `OkLab` distance between the band's warn and error inks. A
+/// theme's own pair that the floor leaves closer than this (two warm hues a
+/// short way apart, or a brown yellow beside a red) gives way to the fixed
+/// pair.
+pub const STATUS_DISTANCE: f64 = 0.12;
+
+/// The seed of a status ink (warn or error): the theme's own ANSI slot when
+/// it carries a colour (`OkLCh` chroma at least
+/// [`crate::palette::BORROW_CHROMA`], the line a meter borrows a hue at), so
+/// a Solarized or Nord band warns in its own yellow and red rather than
+/// Dracula's; otherwise the fixed fallback for the ground's polarity.
+fn status_seed(slot: Option<[u8; 3]>, fallback: [u8; 3]) -> [u8; 3] {
+    slot.filter(|c| crate::palette::chroma(*c) >= crate::palette::BORROW_CHROMA)
+        .unwrap_or(fallback)
+}
+
+/// The band's warn and error inks, `(warn, error)`.
+///
+/// Each seed ([`status_seed`]) is floored to AA on `bar_bg` by moving its
+/// `OkLCh` lightness at constant hue and chroma ([`lightness_floor`]): an
+/// sRGB mix toward white washes a red into a grey-pink and leaves warn and
+/// error on the same contrast line, differing in hue alone. The pair is then
+/// pulled [`STATUS_LIGHTNESS_GAP`] apart in lightness, always away from the
+/// band, so neither loses contrast. The RESULT is judged, not the seed: where
+/// the theme's floored error has no colour left (chroma under
+/// [`crate::palette::NEAR_GREY_CHROMA`]) or the pair stands closer than
+/// [`STATUS_DISTANCE`], the fixed pair for the ground's polarity is floored
+/// the same way instead.
+fn status_inks(ansi: Option<AnsiHues>, bar_bg: [u8; 3], light: bool) -> ([u8; 3], [u8; 3]) {
+    let (warn_fallback, error_fallback) = if light {
+        (WARN_LIGHT, ERROR_LIGHT)
+    } else {
+        (WARN_DARK, ERROR_DARK)
+    };
+    let theirs = status_pair(
+        status_seed(ansi.map(|a| a.yellow), warn_fallback),
+        status_seed(ansi.map(|a| a.red), error_fallback),
+        bar_bg,
+    );
+    let (warn, error) = theirs;
+    if crate::palette::chroma(error) >= crate::palette::NEAR_GREY_CHROMA
+        && crate::palette::oklab_distance(warn, error) >= STATUS_DISTANCE
+    {
+        theirs
+    } else {
+        status_pair(warn_fallback, error_fallback, bar_bg)
+    }
+}
+
+/// One warn/error pair floored to AA on `bar_bg` and held
+/// [`STATUS_LIGHTNESS_GAP`] apart (see [`status_inks`]).
+fn status_pair(warn: [u8; 3], error: [u8; 3], bar_bg: [u8; 3]) -> ([u8; 3], [u8; 3]) {
+    const AA: f64 = 4.5;
+    let up = lifts(bar_bg);
+    let warn = lightness_floor(warn, bar_bg, AA, up);
+    let error = lightness_floor(error, bar_bg, AA, up);
+    let (lw, le) = (oklch(warn).0, oklch(error).0);
+    if up && lw < le + STATUS_LIGHTNESS_GAP {
+        (
+            at_lightness(warn, (le + STATUS_LIGHTNESS_GAP).min(1.0)),
+            error,
+        )
+    } else if !up && le > lw - STATUS_LIGHTNESS_GAP {
+        (
+            warn,
+            at_lightness(error, (lw - STATUS_LIGHTNESS_GAP).max(0.0)),
+        )
+    } else {
+        (warn, error)
+    }
+}
+
+/// Whether an ink on `bg` reads by being lighter than it: white reaches at
+/// least the contrast black does.
+fn lifts(bg: [u8; 3]) -> bool {
+    contrast(WHITE, bg) >= contrast(BLACK, bg)
+}
+
+/// `c` at `OkLCh` lightness `l`, its hue and chroma kept (chroma given up
+/// only to stay in gamut, [`from_oklch`]).
+fn at_lightness(c: [u8; 3], l: f64) -> [u8; 3] {
+    let (_, ch, h) = oklch(c);
+    from_oklch(l, ch, h)
+}
+
+/// `c` floored to `target`:1 on `bg` by the least move of its `OkLCh`
+/// lightness, up (`up`) or down, at constant hue and chroma: a red stays a
+/// red rather than washing to pink. Where even the end of that walk falls
+/// short (a mid-grey ground), [`ensure_contrast`] finishes the job.
+fn lightness_floor(c: [u8; 3], bg: [u8; 3], target: f64, up: bool) -> [u8; 3] {
+    if contrast(c, bg) >= target {
+        return c;
+    }
+    let (l, ch, h) = oklch(c);
+    let (mut short, mut far) = (l, if up { 1.0 } else { 0.0 });
+    for _ in 0..24 {
+        let mid = f64::midpoint(short, far);
+        if contrast(from_oklch(mid, ch, h), bg) >= target {
+            far = mid;
+        } else {
+            short = mid;
+        }
+    }
+    ensure_contrast(from_oklch(far, ch, h), bg, target)
+}
 
 impl BandInks {
     /// The palette's ink for one of the painter's word-ink slots: each maps
@@ -273,8 +394,7 @@ impl BandInks {
                 }
                 BarBase::Blend => mix3(theme.bg, theme.fg, if light { 0.10 } else { 0.16 }),
             };
-            let warn_base = if light { WARN_LIGHT } else { WARN_DARK };
-            let error_base = if light { ERROR_LIGHT } else { ERROR_DARK };
+            let (warn, error) = status_inks(ansi, bar_bg, light);
             const AA: f64 = 4.5;
             let field_bg = theme.bg;
             let value = ensure_contrast(theme.fg, bar_bg, AA);
@@ -296,8 +416,8 @@ impl BandInks {
                     AA,
                 ),
                 value,
-                warn: ensure_contrast(warn_base, bar_bg, AA),
-                error: ensure_contrast(error_base, bar_bg, AA),
+                warn,
+                error,
                 field_bg,
                 caret: ensure_contrast(theme.cursor, field_bg, AA),
                 // The theme-derived well is an inset: `field_bg` is the terminal
@@ -491,65 +611,61 @@ fn rgb_luminance(c: [u8; 3]) -> f64 {
     0.2126 * r + 0.7152 * g + 0.0722 * b
 }
 
-/// Nudge ink `c` toward black/white (whichever the background is not) until it
-/// clears `target`:1 against `bg`, in ten steps, returning the best it reached when
-/// the target is unreachable. A no-op when `c` already clears the target, so it is
+/// Nudge ink `c` toward black or white until it clears `target`:1 against
+/// `bg`, in ten steps. A no-op when `c` already clears the target, so it is
 /// safe to wrap an ink that is normally fine and only needs a floor on an
 /// exotic user theme.
+///
+/// The anchor is chosen by the contrast it can REACH, not by the surface's
+/// luma: the ink first moves away from `bg` on its own side (lighter ink
+/// toward white, darker toward black), which keeps a floored ink beside the
+/// unfloored ones it sits with; where that pole cannot clear `target`
+/// against `bg`, it crosses to the other pole. The luma split
+/// ([`bg_is_light`]) is not the contrast crossover: on a mid-grey bar
+/// (`#939393`) white tops out at 3.07:1 while black reaches 6.8:1, so a
+/// luma-chosen anchor left AA unreachable. One of black and white always
+/// clears √21 ≈ 4.58:1, so a target at or under AA is always met. When
+/// neither pole can clear `target`, the best ratio either walk reached is
+/// returned.
 #[must_use]
 pub fn ensure_contrast(c: [u8; 3], bg: [u8; 3], target: f64) -> [u8; 3] {
-    if contrast(c, bg) >= target {
+    const BLACK: [u8; 3] = [0, 0, 0];
+    const WHITE: [u8; 3] = [255, 255, 255];
+    let start = contrast(c, bg);
+    if start >= target {
         return c;
     }
-    let anchor = if bg_is_light(bg) {
-        [0, 0, 0]
+    let (lc, lb) = (rgb_luminance(c), rgb_luminance(bg));
+    let own_side = if lc > lb {
+        WHITE
+    } else if lc < lb {
+        BLACK
+    } else if contrast(WHITE, bg) >= contrast(BLACK, bg) {
+        WHITE
     } else {
-        [255, 255, 255]
+        BLACK
+    };
+    let other = if own_side == WHITE { BLACK } else { WHITE };
+    // The ink's own side first, unless only the other pole can clear the
+    // target; a pole that cannot reach it is walked only for its best.
+    let order = if contrast(own_side, bg) >= target || contrast(other, bg) < target {
+        [own_side, other]
+    } else {
+        [other, own_side]
     };
     let mut best = c;
-    let mut best_ratio = contrast(c, bg);
-    let mut step = 1u8;
-    while step <= 10 {
-        let mixed = mix3(c, anchor, f32::from(step) / 10.0);
-        let ratio = contrast(mixed, bg);
-        if ratio > best_ratio {
-            best = mixed;
-            best_ratio = ratio;
-        }
-        if ratio >= target {
-            return mixed;
-        }
-        step += 1;
-    }
-    best
-}
-
-/// [`ensure_contrast`] that crosses to the other anchor when the near one
-/// cannot clear `target`: the floor for words on the meter's surface. The
-/// edge cell of a fill, the comet and the glint are mixes of track and fill,
-/// so a word can land on a mid tone whose luma [`bg_is_light`] calls dark
-/// but that white cannot lift to AA against (the luma split is not the
-/// contrast crossover). One of black and white always clears √21 ≈ 4.58:1,
-/// so a target at or under AA is always met.
-#[must_use]
-pub fn ensure_contrast_either(c: [u8; 3], bg: [u8; 3], target: f64) -> [u8; 3] {
-    let near = ensure_contrast(c, bg, target);
-    if contrast(near, bg) >= target {
-        return near;
-    }
-    let far = if bg_is_light(bg) {
-        [255, 255, 255]
-    } else {
-        [0, 0, 0]
-    };
-    let mut best = near;
-    for step in 1..=10u8 {
-        let mixed = mix3(c, far, f32::from(step) / 10.0);
-        if contrast(mixed, bg) >= target {
-            return mixed;
-        }
-        if contrast(mixed, bg) > contrast(best, bg) {
-            best = mixed;
+    let mut best_ratio = start;
+    for anchor in order {
+        for step in 1..=10u8 {
+            let mixed = mix3(c, anchor, f32::from(step) / 10.0);
+            let ratio = contrast(mixed, bg);
+            if ratio >= target {
+                return mixed;
+            }
+            if ratio > best_ratio {
+                best = mixed;
+                best_ratio = ratio;
+            }
         }
     }
     best
@@ -1658,7 +1774,7 @@ const OUTLINE_LIT_TINT: f64 = 0.18;
 /// ([`keep_side`]), rather than turning the label black. The lit Primary is
 /// lifted from it and deepened the same way. A Primary on a metered row is
 /// outlined instead ([`outlined_inks`]). Every other label is lifted to AA by
-/// [`ensure_contrast_either`].
+/// [`ensure_contrast`].
 #[must_use]
 pub(crate) fn chip_inks(
     c: &BandInks,
@@ -1684,12 +1800,187 @@ pub(crate) fn chip_inks(
         (CapsuleRole::Secondary, false) => (c.value, c.chip_ground, false),
         (CapsuleRole::Details, false) => (c.label, c.bar_bg, false),
     };
-    (ensure_contrast_either(fg, bg, WORD_AA), bg, bold)
+    (ensure_contrast(fg, bg, WORD_AA), bg, bold)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pre-fix floor: the anchor chosen by the surface's luma alone.
+    fn luma_anchored_floor(c: [u8; 3], bg: [u8; 3], target: f64) -> [u8; 3] {
+        let anchor = if bg_is_light(bg) {
+            [0, 0, 0]
+        } else {
+            [255, 255, 255]
+        };
+        (1..=10u8)
+            .map(|step| mix3(c, anchor, f32::from(step) / 10.0))
+            .find(|m| contrast(*m, bg) >= target)
+            .unwrap_or(anchor)
+    }
+
+    /// THE FLOOR IS MET WHENEVER EITHER POLE CAN MEET IT: over a lattice of
+    /// surfaces (every grey, and a colour cube) and inks, at the 3:1 and AA
+    /// floors, `ensure_contrast` clears `target` wherever black or white
+    /// does, never loses contrast it started with, and leaves an ink that
+    /// already clears it untouched.
+    #[test]
+    fn the_floor_is_met_whenever_either_pole_can_meet_it() {
+        let greys = (0..=255u8).map(|g| [g, g, g]);
+        let cube = (0..=255u8)
+            .step_by(51)
+            .flat_map(|r| (0..=255u8).step_by(51).map(move |g| (r, g)))
+            .flat_map(|(r, g)| (0..=255u8).step_by(51).map(move |b| [r, g, b]));
+        let surfaces: Vec<[u8; 3]> = greys.chain(cube).collect();
+        let inks: Vec<[u8; 3]> = (0..=255u8)
+            .step_by(17)
+            .flat_map(|v| [[v, v, v], [v, 255 - v, v / 2], [255 - v, v / 3, v]])
+            .collect();
+        for &bg in &surfaces {
+            for target in [3.0, 4.5] {
+                let reachable =
+                    contrast([0, 0, 0], bg) >= target || contrast([255, 255, 255], bg) >= target;
+                for &c in &inks {
+                    let got = ensure_contrast(c, bg, target);
+                    let (before, after) = (contrast(c, bg), contrast(got, bg));
+                    if before >= target {
+                        assert_eq!(got, c, "{c:?} on {bg:?} already cleared {target}");
+                    }
+                    if reachable {
+                        assert!(
+                            after >= target,
+                            "{c:?} on {bg:?}: {after:.2} < {target} though a pole clears it"
+                        );
+                    }
+                    assert!(after >= before, "{c:?} on {bg:?} lost contrast");
+                }
+            }
+        }
+    }
+
+    /// Warn and error speak the theme's own ANSI yellow and red (slots 3 and
+    /// 1), floored to AA on the band at their own hue, where those slots
+    /// carry a colour; a monochrome palette's grey slots leave the fixed
+    /// fallbacks in place.
+    #[test]
+    fn warn_and_error_seed_from_the_themes_ansi_yellow_and_red() {
+        let theme = ThemeInks {
+            bg: [0xfd, 0xf6, 0xe3],
+            fg: [0x58, 0x6e, 0x75],
+            cursor: [0x58, 0x6e, 0x75],
+        };
+        let solarized = AnsiHues {
+            red: [0xdc, 0x32, 0x2f],
+            yellow: [0xb5, 0x89, 0x00],
+            blue: [0x26, 0x8b, 0xd2],
+            cyan: [0x2a, 0xa1, 0x98],
+        };
+        let c = BandInks::derive(theme, Some(solarized), BarBase::Blend);
+        let hue = |ink: [u8; 3]| crate::palette::oklch(ink).2;
+        assert!((hue(c.warn) - hue(solarized.yellow)).abs() < 3.0);
+        assert!((hue(c.error) - hue(solarized.red)).abs() < 3.0);
+        assert!(contrast(c.warn, c.bar_bg) >= 4.5 && contrast(c.error, c.bar_bg) >= 4.5);
+        let mono = AnsiHues {
+            red: [0x80; 3],
+            yellow: [0xa0; 3],
+            ..solarized
+        };
+        let m = BandInks::derive(theme, Some(mono), BarBase::Blend);
+        let none = BandInks::derive(theme, None, BarBase::Blend);
+        assert_eq!((m.warn, m.error), (none.warn, none.error));
+        assert_ne!(none.error, c.error, "the fallback is not the theme's red");
+    }
+
+    /// Every built-in theme, on every band ground a host draws: the error ink
+    /// keeps a colour after its floor, warn and error stand apart in lightness
+    /// (warn the lighter on either polarity: lifted above error on a dark
+    /// band, error pushed below it on a light one) and in `OkLab`, and both
+    /// clear AA.
+    #[test]
+    fn warn_and_error_stay_coloured_and_a_lightness_step_apart_on_every_builtin() {
+        use crate::palette::{NEAR_GREY_CHROMA, chroma, oklab_distance};
+        let bytes = |c: aterm_types::Rgb| [c.r, c.g, c.b];
+        let bases = [
+            BarBase::Blend,
+            BarBase::Fixed {
+                light: [0xeb; 3],
+                dark: [0x30; 3],
+            },
+        ];
+        // Byte rounding of the lightness moves: well under the gap itself.
+        let slack = 0.01;
+        let names = aterm_types::scheme::builtin_names();
+        assert!(names.len() > 1);
+        for name in names {
+            let scheme = aterm_types::scheme::builtin(name).expect("a listed built-in");
+            let fg = bytes(scheme.foreground);
+            let theme = ThemeInks {
+                bg: bytes(scheme.background),
+                fg,
+                cursor: scheme.cursor.map_or(fg, bytes),
+            };
+            let ansi = AnsiHues {
+                red: bytes(scheme.ansi[1]),
+                yellow: bytes(scheme.ansi[3]),
+                blue: bytes(scheme.ansi[4]),
+                cyan: bytes(scheme.ansi[6]),
+            };
+            for base in bases {
+                let c = BandInks::derive(theme, Some(ansi), base);
+                let (lw, le) = (oklch(c.warn).0, oklch(c.error).0);
+                let gap = lw - le;
+                assert!(
+                    chroma(c.error) >= NEAR_GREY_CHROMA,
+                    "{name} {base:?}: error {:?} washed out",
+                    c.error
+                );
+                assert!(
+                    gap >= STATUS_LIGHTNESS_GAP - slack,
+                    "{name} {base:?}: warn L {lw:.3} / error L {le:.3}"
+                );
+                assert!(
+                    oklab_distance(c.warn, c.error) >= STATUS_DISTANCE,
+                    "{name} {base:?}: warn {:?} and error {:?} too close",
+                    c.warn,
+                    c.error
+                );
+                assert!(contrast(c.warn, c.bar_bg) >= 4.5, "{name} {base:?}: warn");
+                assert!(contrast(c.error, c.bar_bg) >= 4.5, "{name} {base:?}: error");
+            }
+        }
+    }
+
+    /// Negative control for the property above: Nord's red floored the old
+    /// way, an sRGB mix toward white, comes out a grey-pink under the
+    /// near-grey line and closer to the floored yellow than
+    /// [`STATUS_DISTANCE`]; the lightness floor keeps it a red.
+    #[test]
+    fn an_srgb_mix_floor_washes_a_red_the_lightness_floor_keeps() {
+        use crate::palette::{NEAR_GREY_CHROMA, chroma, oklab_distance};
+        let (bg, fg) = ([0x2e, 0x34, 0x40], [0xd8, 0xde, 0xe9]);
+        let (red, yellow) = ([0xbf, 0x61, 0x6a], [0xeb, 0xcb, 0x8b]);
+        let bar = mix3(bg, fg, 0.16);
+        let mixed_red = ensure_contrast(red, bar, 4.5);
+        let mixed_yellow = ensure_contrast(yellow, bar, 4.5);
+        assert!(chroma(mixed_red) < NEAR_GREY_CHROMA);
+        assert!(oklab_distance(mixed_red, mixed_yellow) < STATUS_DISTANCE);
+        assert!(chroma(lightness_floor(red, bar, 4.5, true)) >= NEAR_GREY_CHROMA);
+    }
+
+    /// Negative control for the lattice law: on a mid-grey bar (`#939393`, the
+    /// message band of a mid-tone theme) the luma-anchored floor pushed the
+    /// secondary label (`#535353`) toward white and stopped at 3.07:1, under
+    /// AA, though black clears it; the measured anchor reaches AA on the
+    /// label's own (dark) side.
+    #[test]
+    fn a_mid_grey_bar_floors_its_label_on_the_side_that_reaches_aa() {
+        let (bar, label) = ([0x93; 3], [0x53; 3]);
+        assert!(contrast(luma_anchored_floor(label, bar, 4.5), bar) < 4.5);
+        let got = ensure_contrast(label, bar, 4.5);
+        assert!(contrast(got, bar) >= 4.5);
+        assert!(got[0] < label[0], "the label stays darker than its bar");
+    }
 
     /// THE CONTRAST IS aterm-types' ARITHMETIC (ruling 324): the pin pair
     /// `(#000000, #f8f8f2)` gives `…a6` in `aterm_types::Rgb::contrast`'s
@@ -1752,6 +2043,8 @@ mod tests {
                 cursor: [0x04, 0x44, 0xd8],
             },
             Some(AnsiHues {
+                red: [0xcf, 0x22, 0x2e],
+                yellow: [0x4d, 0x2d, 0x00],
                 blue: [0x09, 0x69, 0xda],
                 cyan: [0x1b, 0x7c, 0x83],
             }),

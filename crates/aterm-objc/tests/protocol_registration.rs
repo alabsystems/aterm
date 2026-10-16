@@ -67,7 +67,7 @@ declare_class! {
 }
 
 declare_class! {
-    /// The application delegate's exact claim, built the way `vendor/winit`'s
+    /// The application delegate's exact claim, built the way `crates/aterm-window`'s
     /// `app_state.rs` builds it — the class whose construction was the crash.
     struct ClaimsAppDelegate: NSObject {
         const NAME: &str = "ATermObjcClaimsNSApplicationDelegate";

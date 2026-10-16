@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Typing-voice A/B: the bench for the keystroke voice, as `mix_meter` is for
-//! the ladder (which reports only one isolated event's peak and cannot say
-//! whether typing reads as a phrase).
+//! Typing-voice A/B: the bench for the keystroke voice, as `mix_meter` is for the
+//! ladder (which reports one isolated event's peak and cannot say whether typing
+//! reads as a phrase).
 //!
 //! Renders one typing script through the real synth in several states of the
 //! borrowed song key ([`TrailSynth`]'s `song_key`, latched by a riff bar) and
@@ -12,31 +12,26 @@
 //! spectral centroid, energy above 2 kHz, and level. Deterministic: fixed seed,
 //! fixed script, hand-rolled FFT.
 //!
-//!   cargo run -p aterm-effects --example typing_voice_ab [-- <out_dir>] [--voice <name>] [--all]
+//!   targo --unverified run -p aterm-effects --example typing_voice_ab [-- <out_dir>] [--voice <name>] [--all]
 //!   afplay target/typing-voice-ab/a-neutral.wav
 //!
-//! `--voice <name>` renders every scenario in that typing-sound voice
-//! (`SoundVoice::parse`: the picker's canonical spellings or an alias; default
-//! `auto`, the rainbow-kitty palette). `--all` renders the `a-neutral` script
-//! once per voice of the picker roster into `<out_dir>/<voice>.wav` (spaces →
-//! `-`) and prints one comparable metrics row per voice, the figures each
-//! `palette_trim` comment quotes.
+//! `--voice <name>` renders every scenario in that voice (`SoundVoice::parse`;
+//! default `auto`, the rainbow-kitty palette). `--all` renders the `a-neutral`
+//! script once per picker voice into `<out_dir>/<voice>.wav` (spaces → `-`) and
+//! prints one comparable metrics row per voice.
 //!
 //! It also benches the gesture family (`trail_sound`'s `gesture_shape` law):
-//! Typed / Space / Backspace / Glide± / Sweep± each rendered alone from the
-//! same melody state and reported by first-note pitch, travel in semitones,
-//! note count, timbre (centroid, energy over 2 kHz) and crest, so "a word
-//! motion is a character motion at scale" and "the erase sits above the
-//! keystroke" are measured. (Backspace is an unpitched poof, so read its
-//! centroid, not its pitch columns. A word run's note count reads ±1 since its
-//! notes overlap; travel is the exact measure.)
+//! Typed / Space / Backspace / Glide± / Sweep±, each alone from the same melody
+//! state, reported by first-note pitch, travel in semitones, note count, timbre
+//! and crest. Backspace is an unpitched poof, so read its centroid, not its
+//! pitch columns; a word run's note count reads ±1 since its notes overlap, so
+//! travel is the exact measure.
 //!
 //! Scenarios:
 //! - `a-neutral`: no celebration, the untransposed typed melody.
-//! - `f-family`: a word typed, corrected and word-motioned over, the whole edit
-//!   vocabulary in one pass.
-//! - `b-after-song-`: a song, then silence, then typing; the key is handed back
-//!   by `is_quiet()`, so this must equal `a-neutral` note for note.
+//! - `f-family`: a word typed, corrected and word-motioned over.
+//! - `b-after-song-`: a song, silence, then typing; `is_quiet()` hands the key
+//!   back, so this must equal `a-neutral` note for note.
 //! - `d-leak-`: a song, then typing at 6-8 cps; the gaps still reach
 //!   `is_quiet()`, so the key is handed back.
 //! - `e-leak-fast-`: a song, then typing at 15 cps; the synth is never quiet and
@@ -93,12 +88,12 @@ fn typing_script(t0: f32) -> Vec<Cue> {
     cues
 }
 
-/// Seconds per celebration bar — mirrors `kitty_sing::SING_BAR_SECONDS`
-/// (pinned equal to the synth's `CELEBRATION_BAR_SECONDS`).
+/// Seconds per celebration bar (`kitty_sing::SING_BAR_SECONDS`, pinned equal to
+/// the synth's `CELEBRATION_BAR_SECONDS`).
 const BAR_S: f32 = aterm_effects::kitty_sing::SING_BAR_SECONDS;
 
 /// A scenario: a name, the cues, and the window (start, end) the measurement
-/// runs over so only the TYPING is scored.
+/// runs over, so only the typing is scored.
 struct Scenario {
     name: String,
     /// The typing-sound voice every cue rides (`--voice`).
@@ -152,9 +147,9 @@ fn scenario_after_song(ch: char) -> Scenario {
 }
 
 /// Like [`scenario_after_song`] but typing starts while the last bar still
-/// rings, so the synth may never reach `is_quiet()`, the only place `song_key`
-/// is released. The window opens 3 s after the last bar (riff voices dead, sing
-/// duck handed back), scoring typing alone.
+/// rings. At 6-8 cps the gaps still reach `is_quiet()`, the only place `song_key`
+/// is released ([`scenario_leak_fast`] never does). Scored from 3 s in (riff
+/// voices dead, sing duck handed back): typing alone.
 fn scenario_leak(ch: char) -> Scenario {
     let sig = song_signature(ch);
     let mut cues: Vec<Cue> = Vec::new();
@@ -166,12 +161,10 @@ fn scenario_leak(ch: char) -> Scenario {
             1.0,
         ));
     }
-    // Typing overlaps the LAST bar (pushed at 7*BAR_S), so a voice is always
-    // on from here to the end — `is_quiet()` never fires.
+    // Typing overlaps the last bar (pushed at 7*BAR_S).
     let t0 = 7.0 * BAR_S + 0.05;
     cues.extend(typing_script(t0));
     cues.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-    // Score from +3 s (duck released, riff silent) for 9 s of pure typing.
     Scenario {
         voice: SoundVoice::Style,
         name: format!("d-leak-{ch}"),
@@ -184,7 +177,7 @@ fn scenario_leak(ch: char) -> Scenario {
 
 /// The leak at a cadence that never falls silent: 15 cps (~180 wpm) with a
 /// 105 ms note is a continuous voice, so `is_quiet()` never fires and the
-/// borrowed key outlives the song. Scored over the last 2 s.
+/// borrowed key outlives the song. Scored over the last 2.5 s of typing.
 fn scenario_leak_fast(ch: char) -> Scenario {
     let sig = song_signature(ch);
     let mut cues: Vec<Cue> = Vec::new();
@@ -251,7 +244,7 @@ fn scenario_family() -> Scenario {
     };
     typed(&mut cues, &mut t, 7, -0.4);
     t += 0.35;
-    // Back over the word, then forward again — the WORD motions.
+    // Back over the word, then forward again: the word motions.
     cues.push((
         t,
         SoundGesture::Trail(SoundKind::Sweep { dir: -1 }),
@@ -342,7 +335,7 @@ fn render_one(sc: &Scenario) -> Vec<f32> {
                 hue: (ct * 0.18).fract(),
                 gain: 0.4,
                 tone: Tone::Technical,
-                bed: false, // the KEYSTROKE is what is on trial
+                bed: false, // the keystroke is on trial
                 shifted: false,
             });
             cue_i += 1;
@@ -430,8 +423,8 @@ const EARLY_OFF: usize = SR as usize * 2 / 1000;
 /// shared [`FFT_N`] transform so both windows read the same bin grid.
 const EARLY_N: usize = 1024;
 
-/// Magnitude spectrum of the EARLY window — [`EARLY_N`] samples under their
-/// own Hann, zero-padded to [`FFT_N`].
+/// Magnitude spectrum of the early window: [`EARLY_N`] samples under their own
+/// Hann, zero-padded to [`FFT_N`].
 fn mag_early(x: &[f32], start: usize) -> Vec<f32> {
     let mut re = vec![0.0f32; FFT_N];
     let mut im = vec![0.0f32; FFT_N];
@@ -545,8 +538,8 @@ fn roughness(x: &[f32]) -> f64 {
     }
 }
 
-/// Peak normalized autocorrelation of the INTERVAL sequence over lags
-/// 2..=len/2 — "does the line repeat a motif" (phrase) or not (scatter).
+/// Peak normalized autocorrelation of the interval sequence over lags
+/// 2..=len/2: does the line repeat a motif (phrase) or not (scatter).
 fn seq_autocorr_peak(v: &[f64]) -> f64 {
     let n = v.len();
     if n < 8 {
@@ -734,10 +727,10 @@ struct FamilyRow {
     notes: usize,
     first_hz: f64,
     last_hz: f64,
-    /// Travel from first note to last, in semitones (the gesture's SCALE).
+    /// Travel from first note to last, in semitones (the gesture's scale).
     travel_st: f64,
-    /// Offset of the first note from the reference keystroke, in semitones
-    /// (the gesture's DIRECTION).
+    /// Offset of the first note from the reference keystroke, in semitones (the
+    /// gesture's direction).
     offset_st: f64,
     centroid_hz: f64,
     hi_frac: f64,
@@ -745,19 +738,18 @@ struct FamilyRow {
     crest_db: f64,
 }
 
-/// Notes inside a gesture are at least [`CURSOR_SWEEP_STEP_S`] (55 ms) apart, so
-/// a 50 ms refractory turns a pulse beating against its sub-octave into the
-/// single onset it is.
+/// Notes inside a gesture are at least trail_sound's `CURSOR_SWEEP_STEP_S` (55 ms)
+/// apart, so a 50 ms refractory turns a pulse beating against its sub-octave into
+/// the single onset it is.
 const REFRACTORY: usize = SR as usize / 20;
 
 /// The contour bend settles over ~12 ms; anchoring the pitch window 25 ms past
 /// the onset measures the note the gesture lands on.
 const SETTLE: usize = SR as usize / 40;
 
-/// Onsets of the notes inside one gesture. `onsets` uses a 1.3 ms max-envelope
-/// (right for a typing stream, but it reads the ~200 Hz pulse/sub-octave beat as
-/// false attacks); here the envelope is a 5.3 ms RMS with a 40 ms refractory,
-/// under the `CURSOR_SWEEP_STEP_S` spacing of a run's notes.
+/// Onsets of the notes inside one gesture. `onsets`' 1.3 ms max-envelope reads
+/// the ~200 Hz pulse/sub-octave beat as false attacks, so this uses a 5.3 ms RMS
+/// envelope with the 50 ms [`REFRACTORY`], under the 55 ms spacing of a run's notes.
 fn note_onsets(x: &[f32]) -> Vec<usize> {
     const W: usize = 256;
     let env: Vec<f32> = x
@@ -1088,10 +1080,8 @@ fn main() {
     );
     let typed_probe = probe(SoundGesture::Trail(SoundKind::Typed), voice);
     let reference = family_row("Typed", &typed_probe, 0.0).first_hz;
-    // The space is a per-character gesture with its own voice; comparing it with
-    // the keystroke shows whether the downbeat sits under the letters. The
-    // Backspace row is the unpitched erase poof: its first_hz/travel/offset
-    // columns are a noise-band centre; read its centroid and HI>2K.
+    // Space has its own per-character voice: set against Typed it shows whether
+    // the downbeat sits under the letters.
     let family: [(&str, SoundGesture); 7] = [
         ("Typed", SoundGesture::Trail(SoundKind::Typed)),
         ("Space", SoundGesture::Trail(SoundKind::Space)),
@@ -1129,7 +1119,6 @@ fn main() {
         );
     }
 
-    // Machine-readable, for the next agent.
     let mut f = std::fs::File::create(out.join("metrics.json")).expect("metrics");
     writeln!(f, "[").unwrap();
     for (i, r) in reports.iter().enumerate() {

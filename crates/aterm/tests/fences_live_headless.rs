@@ -195,13 +195,12 @@ fn a_fenced_key_skips_a_swapped_box_and_the_worker_receives_nothing() {
     };
     // Armed, or the waiter ended without arming: the two events that decide
     // it. A wall-clock bound alone read a client starved of its spawn under a
-    // loaded lane as "never armed" (red 1 in 4 on a loaded lane on 2026-09-26,
-    // green 3/3 alone); the backstop is only for a
-    // server that neither arms nor answers.
+    // loaded lane as "never armed" (red 1 in 4 on a loaded lane, green 3/3
+    // alone); the backstop is only for a server that neither arms nor answers.
     //
     // Every `who` sample is kept — when it started, how long the call took,
     // what it read — and a failure prints them. This red was seen once in a
-    // full gate (2026-09-27: the await answered its own 150 s `OK timeout`
+    // whole-workspace test run (the await answered its own 150 s `OK timeout`
     // while no sample had seen it armed, and the 120 s backstop never fired)
     // and never alone or under a 24-way CPU stress, so the next one has to
     // explain itself: slow calls say the client was starved, fast zeros say
@@ -382,10 +381,19 @@ fn a_supervisor_claim_shows_in_the_roster_and_clears_when_its_connection_closes(
         "OK\n"
     );
     let row = supervisor_until(&inst, &sid, "sup-live");
-    // `supervisor=` is followed only by the OWNER'S COLUMNS (2026-09-24,
-    // `help sessions`: `path_evidence= copy= upgrade=`, last): it is the column
-    // the agent verdict's block ends with, and nothing else moved in between.
-    let tail = ["path_evidence", "copy", "upgrade"];
+    // `supervisor=` is followed only by `autopilot=` (2026-10-15, the session's
+    // effective Autopilot beside its claim), the OWNER'S COLUMNS (2026-09-24,
+    // `help sessions`: `path_evidence= copy= upgrade=`) and the harness's
+    // `land_at= task=` (2026-10-16, last): it is the column the agent
+    // verdict's block ends with, and nothing else moved in between.
+    let tail = [
+        "autopilot",
+        "path_evidence",
+        "copy",
+        "upgrade",
+        "land_at",
+        "task",
+    ];
     let words: Vec<&str> = row.split_whitespace().collect();
     let at = words
         .iter()
@@ -464,8 +472,8 @@ fn a_supervisor_claim_shows_in_the_roster_and_clears_when_its_connection_closes(
     // witness this claim: it is shown for 400 ms from the instant the server
     // takes it (`live_supervisor` filters on the expiry), and one poll has to
     // fit this client's exit, the next `aterm ctl`'s spawn and `sessions`' own
-    // main-thread hop (allowed 500 ms) inside that window. On a loaded gate it
-    // misses, and every later poll reads `-`. The `sup-ttl` claim above is the
+    // main-thread hop (allowed 500 ms) inside that window. On a loaded machine
+    // it misses, and every later poll reads `-`. The `sup-ttl` claim above is the
     // roster's witness for a `ttl=` claim, and that it outlives its client.
     let changes = || -> Vec<String> {
         ctl_ok(&inst, &[&format!("@{sid}"), "timeline"])

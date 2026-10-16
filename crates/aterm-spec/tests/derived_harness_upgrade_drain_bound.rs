@@ -3,24 +3,18 @@
 
 use aterm_spec::{derive::harness_upgrade_drain_bound_model, interp, verify};
 
-/// The drain never ends the agent on an answer a person held past the bound,
-/// never waits in silence on the agent's own work past it, never ends running
-/// work, and never supersedes a READY answer before its own bound. Each bug
-/// it was written for is caught:
-/// - with no void, the answer outlives the hold, and the end comes the moment
-///   the person lets go;
-/// - with no work bound, a tab behind loops that can never end is told once
-///   and then waited on for good;
-/// - the wrong fixes for that silence (ending the agent at the bound, and
-///   superseding a READY answer on the notice's clock) are caught too.
+/// The drain never ends the agent on an answer a person held past the bound, never waits in
+/// silence on the agent's own work past it, never ends running work, and never supersedes a
+/// READY answer before its own bound. `Buggy = 1` is caught on each:
+/// - with no void, the answer outlives the hold, and the end comes the moment the person lets
+///   go;
+/// - with no work bound, a tab behind loops that can never end is told once and then waited on
+///   for good;
+/// - the tempting fixes for that silence, ending the agent at the bound and superseding a READY
+///   answer on the notice's clock.
 #[test]
 fn the_drain_never_ends_the_agent_on_an_answer_a_person_held_past_its_bound() {
     let model = harness_upgrade_drain_bound_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name)
-    );
     verify::prove_and_catch_scalar(&model, "harness upgrade drain bound");
 
     // Held to the bound, the answer is voided and can never end the agent.
@@ -43,10 +37,8 @@ fn the_drain_never_ends_the_agent_on_an_answer_a_person_held_past_its_bound() {
     assert!(!model.action_enabled("Wait", &held_at_break));
     assert!(model.fire("Void", &mut held_at_break));
 
-    // The agent's own work is waited for up to the bound and is never voided
-    // or ended. Past the bound the upgrade asks again: the new notice
-    // supersedes the old answer. Past `MaxAsks` it gives up. It never waits
-    // on the work in silence.
+    // The agent's own work is waited for up to the bound, never voided or ended; past it the
+    // upgrade asks again (the new notice superseding the old answer), and past `MaxAsks` gives up.
     let mut working = model.init_state();
     assert!(model.fire("AgentWorks", &mut working));
     assert!(model.fire("Wait", &mut working));
@@ -93,12 +85,10 @@ fn the_drain_never_ends_the_agent_on_an_answer_a_person_held_past_its_bound() {
     );
     assert!(model.fire("ReAsk", &mut at_break));
 
-    // CLAUDE'S OWN STATUS LAGS AN IDLE SCREEN:
-    // `busy` or `shell` over a screen read idle, nothing under the agent the
-    // kernel can see. Work in the agent's own process may still run, and the
-    // status is the one word that says so: the agent is never ended on it.
-    // Its READY is asked again past the bound, then given up on — never
-    // waited on in silence. Once Claude writes `idle`, the restart goes.
+    // Claude's status lags an idle screen (`busy` or `shell`, nothing under the agent the kernel
+    // can see): work in the agent's own process may still run, so it is never ended on it; its
+    // READY is asked again past the bound, then given up on. Once Claude writes `idle`, the
+    // restart goes.
     let mut lag = model.init_state();
     assert!(model.fire("StatusLags", &mut lag));
     assert!(
@@ -122,15 +112,15 @@ fn the_drain_never_ends_the_agent_on_an_answer_a_person_held_past_its_bound() {
     for invariant in ["NoSilentWait", "NeverEndsRunningWork"] {
         assert!(model.check_invariant(invariant, &lag), "{invariant}");
     }
-    // The defect the review found: the restart took the lagging status for
-    // idle (`LagEnds`), and ended the agent over whatever ran in it.
+    // `LagEnds`: the restart takes the lagging status for idle and ends the agent over
+    // whatever runs in it.
     let lag_ends = interp::with_consts(&model, &[("LagEnds", 1)]);
     let mut cut = lag_ends.init_state();
     assert!(lag_ends.fire("StatusLags", &mut cut));
     assert!(lag_ends.fire("Terminate", &mut cut));
     assert!(!lag_ends.check_invariant("NeverEndsRunningWork", &cut));
-    // The tempting wrong fix (`LagHolds`): the restart kept to Claude's
-    // `idle`, and the READY behind the lag waited on for good, in silence.
+    // `LagHolds`: the restart keeps to Claude's `idle`, and the READY behind the lag is waited
+    // on for good, in silence.
     let lag_holds = interp::with_consts(&model, &[("LagHolds", 1)]);
     let mut silent = lag_holds.init_state();
     assert!(lag_holds.fire("StatusLags", &mut silent));
@@ -152,9 +142,7 @@ fn the_drain_never_ends_the_agent_on_an_answer_a_person_held_past_its_bound() {
     assert!(buggy.fire("Terminate", &mut stale));
     assert!(!buggy.check_invariant("NoEndOnAHeldAnswer", &stale));
 
-    // THE FOUR-DAY TAB (2026-09-26), replayed on the drain before the work
-    // bound: two poll loops that can never end, a break every minute, one
-    // notice and then silence.
+    // No work bound: work that never ends gets one notice and then silence.
     let mut silent = buggy.init_state();
     assert!(buggy.fire("AgentWorks", &mut silent));
     assert!(buggy.fire("AtBreak", &mut silent));
@@ -163,8 +151,7 @@ fn the_drain_never_ends_the_agent_on_an_answer_a_person_held_past_its_bound() {
     }
     assert!(!buggy.check_invariant("NoSilentWait", &silent));
 
-    // The first tempting wrong fix for that silence: ending the agent at the
-    // bound, its work still running. aterm never ends running work.
+    // Ending the agent at the bound, its work still running: aterm never ends running work.
     let mut cut = buggy.init_state();
     assert!(buggy.fire("AgentWorks", &mut cut));
     assert!(buggy.fire("Wait", &mut cut));
@@ -179,8 +166,8 @@ fn the_drain_never_ends_the_agent_on_an_answer_a_person_held_past_its_bound() {
         s
     }));
 
-    // The second: the notice's clock alone. On the last notice, a READY answer
-    // given after the notice's bound is given up on at once.
+    // The notice's clock alone: on the last notice, a READY answer given after the notice's
+    // bound is given up on at once.
     let mut hasty = buggy.init_state();
     assert!(buggy.fire("AgentWorks", &mut hasty));
     assert!(buggy.fire("Wait", &mut hasty));

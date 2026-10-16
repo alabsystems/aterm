@@ -1,0 +1,51 @@
+# claude-code 2.1.300 · MEASURED 2026-10-15, `aterm ctl text --json` of a private headless aterm (10x50, aterm 0.104.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, tools/real-claude-lab) · a running turn (the stub's 200 slow ticks) whose spinner row Ink broke between the spans of its shimmering verb as well as where the row is full: `✻` over `Calculatin` over `g` over `…`, the ellipsis alone on its row, the `⎿  Tip:` right under it
+  tick 92
+  tick 93
+  tick 94
+  tick 95
+  tick 96
+  tick 97
+  tick 98
+  tick 99
+  tick 100
+  tick
+  101 tick
+  102
+  tick 103
+  tick
+  104 tick
+
+✻
+Calculatin
+g
+…
+  ⎿  Tip:
+     Start
+     with
+
+     small
+     feat
+     ures
+     or
+     bug f
+     ixes,
+     tell
+     Clau
+     de to
+     prop
+     ose a
+
+     plan,
+     and
+     verif
+     y its
+     sugg
+     ested
+
+     edits
+
+──────────
+❯
+──────────
+  ⏵⏵
+

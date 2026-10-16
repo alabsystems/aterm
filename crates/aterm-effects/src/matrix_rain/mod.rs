@@ -25,13 +25,9 @@
 //!   wave limiter live in the math, not in host policy.
 
 pub mod bake;
-/// The 8x8 bitmap glyph table literal material mode draws with — public-domain
-/// data copied in-tree, retiring the `font8x8` crate (see `bitmap_font.rs`).
 mod bitmap_font;
 pub mod field;
 pub mod rom;
-/// The rain driver's frame: the suspended arm, per-frame policy, the weather's
-/// notes (output, Execute, a new completion), the gated scan and the emission.
 pub mod step;
 pub use step::{RainClock, RainFrame, RainLatches, RainScan};
 
@@ -112,7 +108,7 @@ const ECHO_DISCOUNT_MS: u64 = 250;
 /// generation jump inflate state.
 const CONTENT_CREDIT_CAP: u8 = 32;
 /// Mandatory drain length in engine ticks: at the CALM 12 Hz gate this is
-/// ~2.5 s — every column reaches empty within this bound REGARDLESS of
+/// ~2.5 s — every column reaches empty within this bound regardless of
 /// geometry (`C·p` alone is 6–16 s at 50 rows).
 const DRAIN_TICKS: u32 = 30;
 /// Alt-screen scroll-quiet window (design §6): wheel/PgUp input while in the
@@ -137,7 +133,7 @@ const DIFF_GREEN: u32 = 0x0021_3A2B;
 const MATRIX_HUE_DEG: f32 = 122.0;
 /// Bell ALERT ramp hue (amber).
 const ALERT_HUE_DEG: f32 = 42.0;
-/// Command-FAILED ramp hue (ember red-orange — clearly distinct from the amber
+/// Command-failed ramp hue (ember red-orange — clearly distinct from the amber
 /// bell and the green field; constant-luminance swap, never a flash).
 const FAIL_HUE_DEG: f32 = 8.0;
 /// How long the failed-exit ember tint holds (mirrors the bell window).
@@ -148,7 +144,9 @@ const EXIT_FAIL_MS: u64 = 2000;
 pub enum RainHue {
     /// The stock matrix green.
     Matrix,
-    /// Derive the hue from the theme foreground.
+    /// Derive the hue from the theme: its foreground, or, where the
+    /// foreground is achromatic, its accent (`RainConfig::theme_accent`) or
+    /// the stock ANSI blue ([`theme_hue`]).
     Theme,
     /// An explicit `0x00RRGGBB` whose hue seeds the ramp.
     Custom(u32),
@@ -226,8 +224,8 @@ impl RainSignal {
     }
 }
 
-/// Fully-resolved rain configuration (frozen by the PHOSPHOR contract; the
-/// gui resolver owns defaults/clamps, the engine re-clamps defensively).
+/// Fully-resolved rain configuration. The gui resolver owns defaults and
+/// clamps; the engine re-clamps defensively.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RainConfig {
     /// Master gate. Disabled ⇒ empty channels, fp 0, inactive.
@@ -276,6 +274,9 @@ pub struct RainConfig {
     /// Theme foreground `0x00RRGGBB` (the SGR-2 dim reference the luminance
     /// invariant floors against, and the `hue = "theme"` source).
     pub theme_fg: u32,
+    /// Theme accent (its cursor) `0x00RRGGBB`: the `hue = "theme"` source
+    /// where the foreground has no hue of its own ([`theme_hue`]).
+    pub theme_accent: u32,
 }
 
 impl Default for RainConfig {
@@ -298,9 +299,10 @@ impl Default for RainConfig {
             output_material: true,
             seed: 0,
             // Stock dark theme chrome (aterm-types/src/scheme.rs,
-            // `ColorScheme::default`): bg #111318 / fg #D0D0D0.
+            // `ColorScheme::default`): bg #111318 / fg #D0D0D0 / cursor #50FA7B.
             default_bg: 0x0011_1318,
             theme_fg: 0x00D0_D0D0,
+            theme_accent: 0x0050_FA7B,
         }
     }
 }
@@ -441,11 +443,6 @@ fn frame_vertical(ch: char) -> bool {
 }
 
 /// The rain engine. One per window; all buffers resident.
-///
-/// scope-waiver: a resource statement, not a safety budget. Rain has no
-/// ignition limiter or burst mutex; it is a continuous field, so N engines cost
-/// N sets of buffers. If rain gains a flash-rate or quad-budget enforcer, this
-/// waiver must become a ScopeClaim.
 pub struct MatrixRain {
     cfg: RainConfig,
     // -- config-derived caches (rebuilt by `set_config`) --------------------
@@ -469,8 +466,7 @@ pub struct MatrixRain {
     consumed_ms: u64,
     /// The field tick (advances at the weather-gated engine rate).
     tick: u64,
-    // -- pending host notes (stamped at the next clock sync so a note after
-    //    a long idle gap lands at the FRESH clock, not the stale one) --------
+    // -- pending host notes (stamped at the next clock sync) ---------------------
     pending_key: bool,
     /// Coalesced distance in the grid content clock (bounded). Unlike a boolean
     /// edge it survives synchronized-output batching, so one large agent
@@ -538,7 +534,7 @@ pub struct MatrixRain {
     rom: Option<RomMaster>,
     baker: RainBaker,
     last_bake_tick: Option<u64>,
-    // -- output material bank (design v1.1) -------------------------------------
+    // -- output material bank ----------------------------------------------------
     /// Dynamic-ROM tile indices for the program's literal on-screen characters
     /// at the last Tier-A rescan (≤ [`MATERIAL_CAP`], source order retained;
     /// empty ⇒ the classic pure-hash alphabet).
@@ -676,7 +672,7 @@ impl MatrixRain {
         self.last_bake_tick = None;
         self.order_seed = self.seed32;
         self.order_cols = 0; // force a col_order rebuild
-        // The material knob must take effect on a LIVE reload, even when the
+        // The material knob must take effect on a live reload, even when the
         // visible grid has not produced another damage epoch.
         if !cfg.output_material {
             self.clear_material_bank();
@@ -764,7 +760,7 @@ impl MatrixRain {
     /// counts as a burst. Cheap; callable every frame.
     pub fn note_activity(&mut self, content_seq: u64) {
         let Some(previous) = self.last_seq.replace(content_seq) else {
-            // The FIRST observation is a baseline, not activity: enabling
+            // The first observation is a baseline, not activity: enabling
             // rain over a static screen must not read as streaming.
             return;
         };
@@ -825,20 +821,13 @@ impl MatrixRain {
     }
 
     /// The host swapped which grid this engine watches (tab switch, pane focus
-    /// move, session migration). `needs_rescan` compares per-terminal damage
-    /// epochs, and two terminals' counters can collide, so rebaseline
-    /// everything grid-derived:
-    /// - occupancy: force the next Tier-A rescan;
-    /// - material bank: drop the old grid's glyphs and resample from the new
-    ///   one;
-    /// - activity: the next `note_activity` is a baseline, not a burst;
-    /// - composer provenance: the `material_editing` latch belongs to the old
-    ///   grid's draft; carrying it over would keep `sample_material` refusing
-    ///   and leave the new grid dark until its next Enter. The new grid's
-    ///   composer is still protected by the cursor/hidden-band exclusions.
-    ///
-    /// Weather and clock survive: the swap is a viewpoint change, not a
-    /// restart.
+    /// move, session migration). Two terminals' damage epochs can collide, so
+    /// rebaseline everything grid-derived: force the next Tier-A rescan, drop
+    /// and resample the material bank, make the next `note_activity` a
+    /// baseline, and release the `material_editing` latch (the old grid's
+    /// draft; kept, it would leave the new grid dark until its next Enter — the
+    /// cursor/hidden-band exclusions still protect the new composer). Weather
+    /// and clock survive: the swap is a viewpoint change, not a restart.
     pub fn note_grid_replaced(&mut self) {
         self.have_scanned = false;
         self.clear_material_bank();
@@ -869,7 +858,7 @@ impl MatrixRain {
         self.pending_bell = true;
     }
 
-    /// A command COMPLETED (OSC 133/633 exit code, host-fed): success fires
+    /// A command completed (OSC 133/633 exit code, host-fed): success fires
     /// the finishing head-sweep; failure holds the 2 s ember tint. Gated by
     /// the `exit_tint` knob at apply time. Last completion in a frame wins.
     pub fn note_exit_status(&mut self, failed: bool) {
@@ -946,11 +935,9 @@ impl MatrixRain {
     }
 
     /// The damage epoch the Tier-A scan last consumed, `None` before the first
-    /// [`rescan_from_cells`](Self::rescan_from_cells). A host can assert it
-    /// advances: [`needs_rescan`](Self::needs_rescan) is false both after a
-    /// scan and when nothing moved, and [`diag_line`](Self::diag_line)'s
-    /// `scanned=` flag is sticky, so neither shows a host that stopped feeding
-    /// the scan (or fed it the wrong buffer).
+    /// [`rescan_from_cells`](Self::rescan_from_cells), so a host can assert the
+    /// scan advances (neither `needs_rescan` nor `diag_line`'s sticky `scanned=`
+    /// shows a host that stopped feeding it).
     #[must_use]
     pub fn scanned_epoch(&self) -> Option<u64> {
         self.have_scanned.then_some(self.last_epoch)
@@ -1286,7 +1273,7 @@ impl MatrixRain {
         if !gated && material_ready {
             self.baker.begin_frame(geom.cell_w, geom.cell_h);
             if !self.baker.complete() && !self.material.is_empty() {
-                // A literal charset becomes visible as ONE complete generation:
+                // A literal charset becomes visible as one complete generation:
                 // never mix new slot indices with old/blank atlas tiles.
                 self.finish_material_bake();
             } else if !self.baker.complete() && (ticked || self.last_bake_tick != Some(self.tick)) {
@@ -1350,10 +1337,10 @@ impl MatrixRain {
         self.baker.version()
     }
 
-    /// One-line diagnostic for host introspection (`aterm-ctl rain status`):
-    /// the effective weather word, the density staircase byte, the engine
-    /// tick, whether a Tier-A scan is resident, the literal alphabet size, and
-    /// whether the last emit produced light. Pure read.
+    /// One-line diagnostic for host introspection (`aterm ctl rain status`):
+    /// effective weather, density byte, tick, Tier-A scan residency, literal
+    /// alphabet size, whether the last emit produced light, visibility, drain
+    /// ticks, content seq and streak. Pure read.
     #[must_use]
     pub fn diag_line(&self) -> String {
         let weather = match self.eff_weather() {
@@ -1383,7 +1370,7 @@ impl MatrixRain {
         )
     }
 
-    /// What the weather has HEARD from its host, for tests: the semantic
+    /// What the weather has heard from its host, for tests: the semantic
     /// phase the last applied signal set (an Execute edge sets
     /// [`RainSignal::Execute`]) and whether a failed command's ember hold is
     /// live. Both move only when a note reached the engine and a frame
@@ -1406,10 +1393,10 @@ impl MatrixRain {
     // -- internals -------------------------------------------------------------
 
     /// Stamp pending host notes at the freshest clock (a note after a long
-    /// idle gap must land NOW, not at the stale pre-gap clock).
+    /// idle gap lands now, not at the stale pre-gap clock).
     fn apply_pending_notes(&mut self) {
         let now = self.clock_ms;
-        // Keystrokes stamp FIRST so a same-frame echo sees the fresh key time.
+        // Keystrokes stamp first so a same-frame echo sees the fresh key time.
         if self.pending_key {
             self.pending_key = false;
             self.last_key_ms = Some(now);
@@ -1663,8 +1650,8 @@ impl MatrixRain {
         }
     }
 
-    /// Rebuild the hash-ascending column order when the width changes: the
-    /// stride covers the FULL width (never a prefix — no dead right margin),
+    /// Rebuild the hash-ascending column order on a width, row or seed change: the
+    /// stride covers the full width (never a prefix — no dead right margin),
     /// and budget truncation drops whole highest-hash columns from the tail.
     fn ensure_col_order(&mut self, cols: u16, rows: u16) {
         if cols == self.order_cols && self.order_seed == self.seed32 && rows == self.order_rows {
@@ -1758,7 +1745,7 @@ impl MatrixRain {
             let h0 = self.halo_cands.len();
             if !self.emit_column(&ctx, col, quads) {
                 // Over budget: drop this (and every later = higher-hash)
-                // column WHOLE — reads as lower density, never a cut margin.
+                // column whole — reads as lower density, never a cut margin.
                 quads.truncate(q0);
                 self.halo_cands.truncate(h0);
                 break;
@@ -2033,9 +2020,7 @@ impl MatrixRain {
             let mut has_horizontal = false;
             for col in 0..cols {
                 let ch = ch_at(col);
-                // Every character the `frame_*` classifiers match lies in
-                // U+2500..=U+257A, so one range compare rejects ordinary cells
-                // without changing any outcome.
+                // One range compare rejects ordinary cells (see `in_box_drawing_block`).
                 if !in_box_drawing_block(ch) {
                     continue;
                 }
@@ -2103,7 +2088,7 @@ impl MatrixRain {
         self.occ[last_word] &= !last_mask;
     }
 
-    /// Clear rows `row-1 ..= row+1` over one ALREADY DILATED inclusive column
+    /// Clear rows `row-1 ..= row+1` over one already dilated inclusive column
     /// interval (clamped to the grid) — the 3×3 neighborhood of every
     /// semantic cell in a run, as three masked word writes per interval.
     fn clear_occ_neighborhood_span(&mut self, row: usize, start_col: usize, end_col: usize) {
@@ -2144,7 +2129,7 @@ impl MatrixRain {
         if Self::row_banded(row as usize, self.occ_rows, input.cursor, input.hidden_band) {
             return false;
         }
-        // Live selection (search highlight IS the selection): applied per
+        // Live selection (search highlight is the selection): applied per
         // quad, host-side, so CPU==GPU stays byte-identical.
         !input.sel.as_ref().is_some_and(|sv| {
             sv.sel
@@ -2220,7 +2205,7 @@ impl MatrixRain {
                     cy,
                     rx,
                     ry,
-                    // Defaulted `mode: HaloMode::Add` — the historical light.
+                    // `mode` defaults to `HaloMode::Add`: additive light.
                     ..Default::default()
                 });
                 yy = band_end;
@@ -2253,11 +2238,32 @@ fn quantize_density(v: i32) -> u8 {
     (((v.max(0) + 10) / 21) * 21).min(255) as u8
 }
 
+/// Below this HSV chroma (`max − min` of the channels, 0..1) a colour has no
+/// hue to give: `rgb2hsv` reports 0° (red) for an exact grey, so a neutral
+/// foreground would otherwise seed saturated red rain a few degrees from
+/// [`FAIL_HUE_DEG`], the tint that signals a failed command.
+const THEME_HUE_MIN_CHROMA: f32 = 0.03;
+
+/// The stock palette's ANSI blue (slot 4), the `hue = "theme"` seed of last
+/// resort when neither the foreground nor the accent has a hue.
+const THEME_HUE_FALLBACK: u32 = 0x003B_8EEA;
+
+/// The `hue = "theme"` seed: the theme foreground, else its accent (the
+/// cursor), else [`THEME_HUE_FALLBACK`], skipping any whose chroma is under
+/// [`THEME_HUE_MIN_CHROMA`].
+fn theme_hue(cfg: &RainConfig) -> f32 {
+    [cfg.theme_fg, cfg.theme_accent]
+        .into_iter()
+        .map(rgb2hsv)
+        .find(|&(_, s, v)| s * v >= THEME_HUE_MIN_CHROMA)
+        .map_or_else(|| rgb2hsv(THEME_HUE_FALLBACK).0, |(h, _, _)| h)
+}
+
 /// The ramp hue for a config, kept ≥ 18° away from the Codex diff green.
 fn ramp_hue(cfg: &RainConfig) -> f32 {
     let hue = match cfg.hue {
         RainHue::Matrix => MATRIX_HUE_DEG,
-        RainHue::Theme => rgb2hsv(cfg.theme_fg).0,
+        RainHue::Theme => theme_hue(cfg),
         RainHue::Custom(c) => rgb2hsv(c).0,
     };
     let diff = rgb2hsv(DIFF_GREEN).0;
@@ -2295,7 +2301,7 @@ fn build_ramp(hue: f32, cfg: &RainConfig) -> [u32; 16] {
 }
 
 /// Re-value one ramp to match another's per-level luminance (≤ 8 correction
-/// steps per tint) — the bell ALERT swap changes HUE, not brightness.
+/// steps per tint) — the bell ALERT swap changes hue, not brightness.
 fn luminance_match(mut ramp: [u32; 16], reference: [u32; 16]) -> [u32; 16] {
     for (slot, target) in ramp.iter_mut().zip(reference.iter()) {
         let lt = relative_luminance(*target);
@@ -2327,8 +2333,18 @@ fn srgb_over(tint: u32, alpha: u8, bg: u32) -> u32 {
 
 /// Derive `(body_alpha, head_alpha)` from the luminance constraint: the largest
 /// coverages keeping every composited rain level closer to the background than
-/// SGR-2 dim text, using the theme's real fg under the linear-light dim rule
-/// (`L(dim) = L(bg) + 0.5·(L(fg)-L(bg))`, `color_resolve::dim_toward_bg`).
+/// SGR-2 dim text, using the theme's real fg.
+///
+/// Faint text is `color_resolve::dim_toward_bg`: a linear-light mix
+/// `L(dim) = L(bg) + m·(L(fg)-L(bg))` whose mix `m` is `color_resolve::faint_mix`,
+/// the opacity (default 0.5) raised, when needed, until the faint ink keeps
+/// `contrast(fg, bg)^opacity` (dark ink on a light ground would otherwise sink
+/// into the mid-greys). The bound here still takes `m = 0.5`, the plain blend:
+/// `faint_mix` only ever raises the mix, so faint text sits at least that far
+/// from the background, and rain held under the plain blend stays closer to the
+/// background than faint text on every theme. It is conservative (tighter than
+/// the real faint ink on light themes, where the floor lifts `m`), never
+/// optimistic, and needs no contrast solve per theme.
 fn derive_alphas(cfg: &RainConfig, ramp: &[u32; 16]) -> (u8, u8) {
     let bg = cfg.default_bg;
     let lb = relative_luminance(bg);
@@ -2362,7 +2378,7 @@ fn derive_alphas(cfg: &RainConfig, ramp: &[u32; 16]) -> (u8, u8) {
     (body, head)
 }
 
-/// Which of the 64 dynamic-ROM slots change CHARACTER between two sorted slot
+/// Which of the 64 dynamic-ROM slots change character between two sorted slot
 /// tables (bit `i` ⇒ slot `i` must be re-authored and re-baked). A slot past the
 /// end of a table holds the decorative glyph, so "absent from both" is unchanged
 /// and "present in exactly one" is a change.
@@ -2494,7 +2510,7 @@ mod tests {
         RainTickInput::default()
     }
 
-    /// Force a dense field NOW: pin the density staircase at 252 so cycle
+    /// Force a dense field now: pin the density staircase at 252 so cycle
     /// admission passes for ~98% of columns without waiting out the EMA.
     fn pour(e: &mut MatrixRain) {
         e.density_byte = 252;
@@ -2509,7 +2525,7 @@ mod tests {
         let (rows, cols) = (10usize, 40usize);
         // Only row 0 carries content (12 block glyphs); rows 1..10 are
         // entirely absent, and row 0's cols 12..40 are absent too — the
-        // trimmed shape. Block cells are NON-space, so ineligible.
+        // trimmed shape. Block cells are non-space, so ineligible.
         let block = RenderCell {
             ch: '█',
             ..space_cell(bg3())
@@ -2663,7 +2679,7 @@ mod tests {
         }
     }
 
-    /// Truncation drops WHOLE highest-hash columns: the emitted column set is
+    /// Truncation drops whole highest-hash columns: the emitted column set is
     /// a prefix of the hash-ascending column order.
     #[test]
     fn truncation_drops_whole_highest_hash_columns() {
@@ -2718,7 +2734,7 @@ mod tests {
         // Advance to a tick `t` where `t` and `t+1` share every field
         // quantum: same mutation bucket ((t+1) % mq != 0), same dither
         // bucket ((t+1) % dq != 0), same stammer window ((t+1) % sq != 0)
-        // — a NON-mutation tick, so only stepped rows may change.
+        // — a non-mutation tick, so only stepped rows may change.
         let mut seq = 1000u64;
         loop {
             let t = e.tick;
@@ -2778,6 +2794,48 @@ mod tests {
 
     // ---- luminance invariant -------------------------------------------------
 
+    /// Angular distance between two hues, degrees in `0..=180`.
+    fn hue_gap(a: f32, b: f32) -> f32 {
+        let d = (a - b).rem_euclid(360.0);
+        d.min(360.0 - d)
+    }
+
+    /// `hue = "theme"` on the default theme (a neutral grey fg) is not the
+    /// failure tint: an achromatic fg hands the hue to the accent, so the rain
+    /// is not within 30° of [`FAIL_HUE_DEG`]. Negative control: the grey fg's
+    /// own HSV hue, the old seed, is 0°, 8° from it.
+    #[test]
+    fn theme_hue_on_a_neutral_fg_is_not_the_failure_tint() {
+        let cfg = RainConfig {
+            hue: RainHue::Theme,
+            ..cfg_on()
+        };
+        assert!(
+            hue_gap(rgb2hsv(cfg.theme_fg).0, FAIL_HUE_DEG) < 30.0,
+            "negative control: the default fg's own hue already avoids the failure tint"
+        );
+        let hue = ramp_hue(&cfg);
+        assert!(
+            hue_gap(hue, FAIL_HUE_DEG) >= 30.0,
+            "default-theme rain hue {hue:.1}° is within 30° of the failure tint"
+        );
+        // A fg with a hue keeps it; a grey fg and a grey accent fall back to
+        // the stock ANSI blue.
+        let solarized = RainConfig {
+            theme_fg: 0x0065_7B83,
+            ..cfg
+        };
+        assert!(hue_gap(ramp_hue(&solarized), rgb2hsv(0x0065_7B83).0) < 0.5);
+        let monochrome = RainConfig {
+            theme_fg: 0x00C0_C0C0,
+            theme_accent: 0x00FF_FFFF,
+            ..cfg
+        };
+        let blue = ramp_hue(&monochrome);
+        assert!(hue_gap(blue, rgb2hsv(THEME_HUE_FALLBACK).0) < 0.5);
+        assert!(hue_gap(blue, FAIL_HUE_DEG) >= 30.0);
+    }
+
     /// Contrast invariant on both stock gui themes:
     /// `|L(rain over bg) - L(bg)| < |L(dim SGR-2 text) - L(bg)|` for every
     /// level at the derived alphas. Dark = `ColorScheme::default` in
@@ -2821,6 +2879,52 @@ mod tests {
         }
     }
 
+    /// The plain-blend bound is conservative against the faint ink aterm-core
+    /// actually draws (`dim_toward_bg`, whose `faint_mix` floor only raises
+    /// the mix): every rain level stays closer to the background than real
+    /// faint text, dark and light. The control: on a light theme the floor
+    /// lifts faint ink well past the plain blend, so the two are not the same
+    /// rule.
+    #[test]
+    fn plain_blend_bound_is_conservative_against_real_faint_ink() {
+        use aterm_core::terminal::color_resolve::dim_toward_bg;
+        let pack =
+            |c: aterm_types::Rgb| (u32::from(c.r) << 16) | (u32::from(c.g) << 8) | u32::from(c.b);
+        let mut lifted = false;
+        for name in ["Default", "Aterm Day", "Linen", "Default Light"] {
+            let scheme = aterm_types::scheme::builtin(name).expect("built-in");
+            let (fg, bg) = (scheme.foreground, scheme.background);
+            let faint = dim_toward_bg(fg, bg, aterm_types::DIM_FACTOR);
+            let (fg, bg, faint) = (pack(fg), pack(bg), pack(faint));
+            let lb = relative_luminance(bg);
+            let plain = (0.5 * (relative_luminance(fg) - lb)).abs();
+            let real = (relative_luminance(faint) - lb).abs();
+            // u8 quantization may land a hair under the exact blend.
+            assert!(
+                real >= plain - 0.005,
+                "{name}: faint {real} < plain {plain}"
+            );
+            lifted |= real > plain * 1.5;
+            let e = MatrixRain::new(RainConfig {
+                default_bg: bg,
+                theme_fg: fg,
+                ..cfg_on()
+            });
+            for lvl in 0..=15u32 {
+                let dl = (relative_luminance(srgb_over(e.ramp[lvl as usize], e.alpha_of(lvl), bg))
+                    - lb)
+                    .abs();
+                assert!(dl < real, "{name}: level {lvl} at {dl} >= faint {real}");
+            }
+            let dh = (relative_luminance(srgb_over(e.ramp[15], e.head_alpha, bg)) - lb).abs();
+            assert!(dh < real, "{name}: head at {dh} >= faint {real}");
+        }
+        assert!(
+            lifted,
+            "a light theme's faint ink sits past the plain blend"
+        );
+    }
+
     /// The readable ceiling (the cursor-trail precedent) holds against
     /// out-of-range overrides.
     #[test]
@@ -2837,7 +2941,7 @@ mod tests {
 
     // ---- drain ---------------------------------------------------------------
 
-    /// Every path to stillness reaches EMPTY within the fixed bound and
+    /// Every path to stillness reaches empty within the fixed bound and
     /// disarms `is_active` (mandatory sleep — no idle="keep" exists).
     #[test]
     fn drain_reaches_empty_within_bound_from_every_state() {
@@ -2906,7 +3010,7 @@ mod tests {
 
     // ---- fingerprint liveness --------------------------------------------------
 
-    /// Animating ⇒ the fingerprint changes EVERY engine tick; drained ⇒ it is
+    /// Animating ⇒ the fingerprint changes every engine tick; drained ⇒ it is
     /// the stable 0. Even quad counts must not cancel the frame term.
     #[test]
     fn fingerprint_liveness_and_stability() {
@@ -2933,7 +3037,7 @@ mod tests {
         assert!(seen_nonempty >= 10, "liveness test needs a raining field");
     }
 
-    /// Direct anti-cancellation pin: an EVEN number of identical quads still
+    /// Direct anti-cancellation pin: an even number of identical quads still
     /// yields a live, tick-varying fingerprint (the frame term folds once
     /// mid-chain, never per quad).
     #[test]
@@ -2971,7 +3075,7 @@ mod tests {
         let mut e = MatrixRain::new(cfg_on());
         // 12 rows so the Tier-B band can live far from the probed cells (the
         // hidden-cursor fallback banding the bottom K rows is pinned by its
-        // own test; here we probe the OCCUPANCY predicates in isolation).
+        // own test; here we probe the occupancy predicates in isolation).
         let rows = 12usize;
         let cols = 8usize;
         let mut cells = vec![vec![space_cell(bg3()); cols]; rows];
@@ -3188,9 +3292,9 @@ mod tests {
         );
     }
 
-    /// OUTPUT MATERIAL BANK: supported literal codepoints are built from REAL
-    /// screen content in source order, while this fixture's current typing band
-    /// (cursor ± 2 / hidden composer rows) is excluded.
+    /// Output material bank: supported literal codepoints come from real screen
+    /// content in source order, and the typing band (cursor ± 2 / hidden composer
+    /// rows) is excluded.
     #[test]
     fn material_bank_samples_output_not_typing() {
         let rows = 6usize;
@@ -3222,9 +3326,9 @@ mod tests {
         assert_eq!(e.material.len(), 4, "hidden band excludes the secret row");
         assert_eq!(decoded(&e), "0f3a");
 
-        // Hidden cursor with an UNKNOWN band (empty ring — first enable /
+        // Hidden cursor with an unknown band (empty ring — first enable /
         // resize / full damage): the bottom K rows are conservatively treated
-        // as the composer, so a secret typed there is STILL never sampled.
+        // as the composer, so a secret typed there is still never sampled.
         let mut bottom_secret = vec![vec![space_cell(bg3()); cols]; rows];
         for (i, ch) in "hunter2".chars().enumerate() {
             bottom_secret[rows - 1][i].ch = ch;
@@ -3235,7 +3339,7 @@ mod tests {
             "unknown composer band ⇒ the bottom rows are never sampled"
         );
 
-        // A live reload flipping the knob OFF clears the table immediately
+        // A live reload flipping the knob off clears the table immediately
         // (emission only consults emptiness — no waiting for the next damage).
         e.sample_material(&cells, rows, Some((5, 0)), &[]);
         assert!(!e.material.is_empty());
@@ -3256,7 +3360,7 @@ mod tests {
         e.sample_material(&cells, rows, Some((5, 0)), &[]);
         assert!(!e.needs_material_sample());
 
-        // With NOTHING outside the band, the table is empty (classic field).
+        // With nothing outside the band, the table is empty.
         let mut only_secret = vec![vec![space_cell(bg3()); cols]; rows];
         for (i, ch) in "hunter2".chars().enumerate() {
             only_secret[3][i].ch = ch;
@@ -3274,7 +3378,7 @@ mod tests {
             "output_material=false stays classic"
         );
 
-        // Over-long screens stride-cap deterministically.
+        // Over-long screens cap at MATERIAL_CAP.
         let mut big = vec![vec![space_cell(bg3()); 64]; 8];
         for row in big.iter_mut().take(8) {
             for cell in row.iter_mut() {
@@ -3364,8 +3468,7 @@ mod tests {
     /// and a short row mixed in.
     #[test]
     fn literal_material_tail_matches_an_exhaustive_forward_walk() {
-        /// The pre-optimisation semantics, spelled out: every unbanded row
-        /// top-down, keep the tail.
+        /// Reference: every unbanded row top-down, keep the tail.
         fn forward_tail(
             cells: &[Vec<RenderCell>],
             rows: usize,
@@ -3445,7 +3548,7 @@ mod tests {
             );
         }
 
-        // Under the cap the tail is the WHOLE sample — no truncation, same order.
+        // Under the cap the tail is the whole sample — no truncation, same order.
         let mut sparse = vec![vec![space_cell(bg3()); cols]; rows];
         for (c, cell) in sparse[8].iter_mut().take(9).enumerate() {
             cell.ch = pattern[c % pattern.len()];
@@ -3741,7 +3844,7 @@ mod tests {
         assert!(!e2.wave_pending, "knob off ⇒ no sweep either");
     }
 
-    /// The emitted snapshot arrives ROW-SORTED — the renderer's per-row dirty
+    /// The emitted snapshot arrives row-sorted — the renderer's per-row dirty
     /// merge-diff walks contiguous row slices and debug_asserts this order
     /// (emission itself walks hash-ordered columns; `emit` sorts).
     #[test]
@@ -3946,7 +4049,7 @@ mod tests {
         assert_eq!(rain.semantic_ticks_left, 0);
     }
 
-    /// Tier-B: a live selection zeroes emission in its band WITHOUT any
+    /// Tier-B: a live selection zeroes emission in its band without any
     /// rescan (frozen damage epoch — selection never marks damage), and the
     /// cursor band masks ±2 rows (visible) or the host-fed damaged band
     /// (hidden cursor).
@@ -4079,7 +4182,7 @@ mod tests {
             );
         }
         assert_eq!(e.weather, RainWeather::Calm);
-        // Sustained content stream on a FRESH engine (its CALM state is
+        // Sustained content stream on a fresh engine (its CALM state is
         // seconds-zero, so the up-transition itself proves the dwell):
         // WORKING, but never before 1 s in CALM.
         let mut e = MatrixRain::new(cfg_on());
@@ -4273,7 +4376,7 @@ mod tests {
     }
 
     /// The WORKING→CALM edge fires at most 2 turn waves per rolling second;
-    /// excess waves are DELAYED (granted when the window frees), not dropped.
+    /// excess waves are delayed (granted when the window frees), not dropped.
     #[test]
     fn turn_wave_limiter_caps_ignitions() {
         let g = geom(30, 40, 8, 16);
@@ -4516,7 +4619,7 @@ mod tests {
         }
     }
 
-    // ---- Tier-1 conformance binds (project REAL engine onto the ty models) --
+    // ---- conformance binds (the real engine projected onto the ty models) -----
 
     fn composer_material_gate_model() -> aterm_spec::derive::Model {
         use aterm_spec::ty_model;
@@ -4837,11 +4940,10 @@ mod tests {
         assert_eq!(i64::from(rain.semantic_ticks_left), state["ttl"]);
     }
 
-    /// Bounded synchronized-output credit, authored once in Rust and derived
-    /// into both executable semantics and TLA+. `Buggy=1` models the missing
-    /// saturation defect: a coalesced burst stores `Cap+1` and violates
-    /// `CreditBound`. Editor echo clears the whole synchronized frame, while a
-    /// submitted turn admits that same bounded credit; rebase clears all state.
+    /// Bounded synchronized-output credit. `Buggy=1` is the missing-saturation negative
+    /// control (a coalesced burst stores `Cap+1`, violating `CreditBound`). Editor echo
+    /// clears the whole synchronized frame, a submitted turn admits the same bounded
+    /// credit, and rebase clears all state.
     fn rain_activity_credit_model() -> aterm_spec::derive::Model {
         use aterm_spec::ty_model;
         ty_model! {
@@ -4886,10 +4988,9 @@ mod tests {
         aterm_spec::verify::prove_and_catch_scalar(&m, m.name);
     }
 
-    /// Tier-1: drive the shipping classifier through the synchronized
-    /// Codex/Claude burst + echo + new-session rebase trace and project every
-    /// decision onto the derived model. The Buggy negative control is discharged
-    /// by the prove-and-catch test above, so this bind cannot pass vacuously.
+    /// Conformance: the shipping classifier runs the synchronized burst + echo + rebase
+    /// trace, each decision projected onto the model (its negative control is the
+    /// prove-and-catch test above).
     #[test]
     fn rain_activity_credit_real_engine_conforms_to_model() {
         let m = rain_activity_credit_model();
@@ -4944,15 +5045,12 @@ mod tests {
         assert!(m.check_invariant("RealBound", &st));
     }
 
-    /// Tier-1 conformance for the `RainLifecycle` model
-    /// (`aterm_spec::derive::rain_lifecycle_model`): the real `MatrixRain` is
-    /// driven through enable → rain → unfocus-drain → licensed refocus, each
-    /// transition projected onto the model (enable/resume → `Activity`,
-    /// unfocus → `StartDrain`, each drain tick → `DrainTick`), landing Idle at
-    /// exactly `DRAIN_TICKS`. `(state, drained)` tracks `(lifecycle,
-    /// drain_ticks)` tick for tick, and `NoUnlicensedRain`, `CanReachIdle` and
-    /// the structural bounds hold throughout. The phantom-relight negative
-    /// control is below.
+    /// Conformance for the `RainLifecycle` model
+    /// (`aterm_spec::derive::rain_lifecycle_model`): the real engine runs enable → rain →
+    /// unfocus-drain → licensed refocus, each transition projected onto the model
+    /// (enable/resume → `Activity`, unfocus → `StartDrain`, drain tick → `DrainTick`),
+    /// reaching Idle at exactly `DRAIN_TICKS` with the model's invariants holding throughout.
+    /// The phantom-relight negative control is below.
     #[test]
     fn rain_lifecycle_conformance_real_engine_projects_onto_model() {
         let m = aterm_spec::derive::rain_lifecycle_model();
@@ -5059,8 +5157,8 @@ mod tests {
     /// healthy model's `NoUnlicensedRain` rejects the projected state.
     #[test]
     fn rain_lifecycle_negative_control_phantom_relight_is_buggy_trace() {
-        // 1) The REAL engine does the RIGHT thing: a slept, drained pane stays
-        //    drained across an unfocus/refocus (cmd-tab), never relighting.
+        // 1) The real engine keeps a slept, drained pane drained across an
+        //    unfocus/refocus (cmd-tab).
         let g = geom(24, 60, 8, 16);
         let mut e = MatrixRain::new(RainConfig {
             enabled: true,
@@ -5081,7 +5179,7 @@ mod tests {
             assert!(guard < 500, "the pane must sleep and drain");
         }
         assert!(!e.is_active(), "a slept, drained pane is inactive");
-        // cmd-tab: hide then refocus. Refocus of a SLEEPING pane must not relight.
+        // cmd-tab: hide then refocus. Refocus of a sleeping pane must not relight.
         e.set_visibility(RainVisibility::Hidden);
         assert_eq!(e.drain_ticks, DRAIN_TICKS);
         e.set_visibility(RainVisibility::Focused);
@@ -5094,7 +5192,7 @@ mod tests {
             "the refocused slept pane stays inactive until real activity"
         );
 
-        // 2) The MODELS separate healthy from buggy: only Buggy=1 admits the
+        // 2) The models separate healthy from buggy: only Buggy=1 admits the
         //    phantom relight, and the healthy model rejects the projected state.
         let healthy = aterm_spec::derive::rain_lifecycle_model();
         let mut buggy = aterm_spec::derive::rain_lifecycle_model();
@@ -5111,14 +5209,14 @@ mod tests {
             assert!(buggy.fire("DrainTick", &mut st));
         }
         assert_eq!(st["state"], 0, "the buggy episode reaches Idle");
-        // …then the phantom relight: Idle → Raining with NO Activity event.
+        // …then the phantom relight: Idle → Raining with no Activity event.
         assert!(
             buggy.action_enabled("Rearm", &st),
             "Buggy=1 enables the phantom relight"
         );
         assert!(buggy.fire("Rearm", &mut st));
         assert_eq!(st["state"], 1, "the buggy pane relit on cmd-tab alone");
-        // The healthy model REJECTS the projected state, and has no such action.
+        // The healthy model rejects the projected state, and has no such action.
         assert!(
             !healthy.check_invariant("NoUnlicensedRain", &st),
             "a Raining entry with no paying Activity violates NoUnlicensedRain"
@@ -5129,7 +5227,7 @@ mod tests {
         );
     }
 
-    /// Tier-1 conformance for the `RainIgnition` model
+    /// Conformance for the `RainIgnition` model
     /// (`aterm_spec::derive::rain_ignition_model`): the real `field::col_params`
     /// is driven over the model's small-grid lattice (rows 3..=8 at the neutral
     /// speed knob, so `p ∈ 2..=5`, tick_ms = 33), asserting the per-cell

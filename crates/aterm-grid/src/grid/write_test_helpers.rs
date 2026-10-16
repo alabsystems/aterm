@@ -9,7 +9,7 @@ use super::{CellFlags, Grid, PackedColor, StyleId};
 
 impl Grid {
     /// Write a styled character at the cursor and advance it (production:
-    /// `write_split::write_char_at_cursor_packed` + `advance_cursor_*`).
+    /// `write_char_at_cursor_packed` + `advance_cursor_*`).
     ///
     /// REQUIRES: self.storage.cursor.row < self.storage.visible_rows
     /// ENSURES: self.storage.cursor.col <= self.storage.max_col_for_row(self.storage.cursor.row)
@@ -27,7 +27,6 @@ impl Grid {
         }
         self.storage.damage.mark_cell(cursor_row, cursor_col);
 
-        // Advance cursor
         let max_col = self.storage.max_col_for_row(cursor_row);
         if self.storage.cursor.col < max_col {
             self.storage.cursor.col += 1;
@@ -60,7 +59,6 @@ impl Grid {
         bg: PackedColor,
         flags: CellFlags,
     ) {
-        // Resolve any deferred wrap before writing
         self.resolve_pending_wrap();
 
         let cursor_row = self.storage.cursor.row;
@@ -70,7 +68,6 @@ impl Grid {
         }
         self.storage.damage.mark_cell(cursor_row, cursor_col);
 
-        // Advance cursor with deferred wrap
         let max_col = self.storage.max_col_for_row(cursor_row);
         if self.storage.cursor.col < max_col {
             self.storage.cursor.col += 1;
@@ -80,19 +77,7 @@ impl Grid {
         debug_assert!(self.storage.cursor.row < self.storage.visible_rows);
     }
 
-    /// Write a character with autowrap using a style ID.
-    pub(crate) fn write_char_wrap_with_style_id(
-        &mut self,
-        c: char,
-        style_id: StyleId,
-        extra_flags: CellFlags,
-    ) {
-        let (fg, bg, flags) = self.resolve_style_to_colors(style_id, extra_flags);
-        self.write_char_wrap_styled(c, fg, bg, flags);
-    }
-
-    /// Write a wide (2-cell) character with autowrap and deferred wrapping.
-    /// Returns `true` if written, `false` if cannot fit.
+    /// Write a wide (2-cell) character with deferred autowrap. Returns whether it was written.
     pub(crate) fn write_wide_char_wrap_styled(
         &mut self,
         c: char,
@@ -100,12 +85,10 @@ impl Grid {
         bg: PackedColor,
         flags: CellFlags,
     ) -> bool {
-        // Resolve any deferred wrap before writing
         self.resolve_pending_wrap();
 
-        // If we're at the last column, we need to wrap first (wide char can't
-        // start at last column), leaving the skipped cell as the production
-        // early wrap does: blanked and recorded as the row's early-wrap hole.
+        // A wide char cannot start at the last column: wrap first, leaving the skipped cell as
+        // the production early wrap does (blanked, recorded as the row's early-wrap hole).
         let effective_cols = self.storage.effective_cols_for_row(self.storage.cursor.row);
         if self.storage.cursor.col.saturating_add(1) >= effective_cols {
             self.blank_wide_wrap_tail(effective_cols, crate::Cell::EMPTY);
@@ -116,7 +99,6 @@ impl Grid {
         let cursor_col = self.storage.cursor.col;
         let effective_cols = self.storage.effective_cols_for_row(cursor_row);
 
-        // Write the wide character (main cell + continuation)
         let ok = if cursor_col.saturating_add(1) < effective_cols {
             if let Some(row) = self.row_mut(cursor_row) {
                 row.write_wide_char(cursor_col, c, fg, bg, flags)
@@ -133,14 +115,12 @@ impl Grid {
                 .damage
                 .mark_cell(cursor_row, cursor_col.saturating_add(1));
 
-            // Advance cursor by 2 with deferred wrap
             use std::cmp::Ordering;
             match (self.storage.cursor.col.saturating_add(2)).cmp(&effective_cols) {
                 Ordering::Less => {
                     self.storage.cursor.col += 2;
                 }
                 Ordering::Equal | Ordering::Greater => {
-                    // At or past end of line — defer wrap
                     self.storage.cursor.col = effective_cols.saturating_sub(1);
                     self.storage.mark_pending_wrap();
                 }
@@ -151,7 +131,7 @@ impl Grid {
         ok
     }
 
-    /// Write a wide (2-cell) character without autowrap. Returns `true` or `false`.
+    /// Write a wide (2-cell) character without autowrap. Returns whether it was written.
     pub(crate) fn write_wide_char_styled(
         &mut self,
         c: char,
@@ -163,7 +143,6 @@ impl Grid {
         let cursor_col = self.storage.cursor.col;
         let effective_cols = self.storage.effective_cols_for_row(cursor_row);
 
-        // Write the wide character
         let ok = if cursor_col.saturating_add(1) < effective_cols {
             if let Some(row) = self.row_mut(cursor_row) {
                 row.write_wide_char(cursor_col, c, fg, bg, flags)
@@ -180,7 +159,6 @@ impl Grid {
                 .damage
                 .mark_cell(cursor_row, cursor_col.saturating_add(1));
 
-            // Advance cursor by 2, but don't exceed bounds
             self.storage.cursor.col = self
                 .storage
                 .cursor

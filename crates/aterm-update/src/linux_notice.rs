@@ -2,35 +2,27 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! What the Linux background check tells the window about update health
-//! ([`crate::HealthNotify`]): a check lane that keeps failing, its later reasons, and
-//! its recovery — never an ordinary result. The window reads an unknown title as a
-//! failing check, so a healthy pass must send nothing.
+//! ([`crate::HealthNotify`]): a check lane that keeps failing, its later reasons, and its
+//! recovery, never an ordinary result. The window reads an unknown title as a failing
+//! check, so a healthy pass sends nothing.
 //!
 //! The loop speaks the macOS lane's words on the same threshold
 //! ([`crate::PERSISTENT_AFTER`] consecutive failed checks): the failing title
 //! ([`crate::health_failing_title`]) once, a quiet restatement
-//! ([`crate::HEALTH_RESTATED_TITLE`]) when the body changes while it still fails, and
-//! the recovery ([`crate::HEALTH_RECOVERED_TITLE`]) once the checks work again. A
-//! streak whose last failed check came before this process started is history the
-//! status line already shows, not news.
+//! ([`crate::HEALTH_RESTATED_TITLE`]) when the body changes while it still fails, and the
+//! recovery ([`crate::HEALTH_RECOVERED_TITLE`]) once checks work again. A streak whose
+//! last failed check came before this process started is not news.
 //!
 //! A failure the record cannot hold (update folder full or read-only, a record or
-//! settings that will not read) never raises `failing_checks`, so the loop counts its
-//! own unrecorded failures ([`Record::Lost`]) and judges the larger count. Such a body
-//! names no count: neither count is the streak's, and a moving one would restate
-//! every pass. A pass that found another aterm holding the copy's update lock
-//! ([`Record::Busy`]) is no failure: it neither adds to the count nor ends it. A lock
-//! held past [`BUSY_ANNOUNCED_AFTER`] passes is said once, and only a pass that took
-//! the lock ([`Pass::took_lock`]) answers it.
+//! settings that will not read) never raises `failing_checks`, so the loop counts its own
+//! unrecorded failures ([`Record::Lost`]), judges the larger count, and names no count in
+//! the body. A pass that found the update lock held ([`Record::Busy`]) neither adds to the
+//! count nor ends it; a lock held past [`BUSY_ANNOUNCED_AFTER`] passes is said once, and
+//! only a pass that took the lock ([`Pass::took_lock`]) answers it.
 //!
-//! A recovery is owed only once a check has been RECORDED since the failure was said
-//! (the record's `updated_at` moved): an install zeroes the count with no check run.
-//! A pass that only waited on a pending trial is no recorded check
-//! (`linux::Checked::Nothing`). The lock's notice, said over an announced failure,
-//! keeps that failure under it: the lock coming free answers the notice, never the
-//! failure.
-//!
-//! Compiled into every test build, like `linux_trial`, so the macOS gate runs it.
+//! A recovery is owed only once a check has been recorded since the failure was said (the
+//! record's `updated_at` moved): an install zeroes the count with no check run. The lock
+//! coming free answers only the lock's notice; a failure said under it is said again.
 
 /// The class a Linux check failure is announced under: the check half.
 const CLASS: &str = "manifest";
@@ -51,10 +43,9 @@ pub(crate) struct Pass<'a> {
     pub(crate) updated_at: &'a str,
     /// What the record made of this pass.
     pub(crate) record: Record,
-    /// Whether this pass TOOK the copy's update lock, which shows that no other
-    /// aterm held it then. A pass that failed before it reached the lock (its
-    /// settings or the record would not read) or found it held ([`Record::Busy`])
-    /// did not, and says nothing of whether the lock is free.
+    /// Whether this pass took the copy's update lock, which shows no other aterm held it
+    /// then. A pass that failed before reaching it, or found it held ([`Record::Busy`]),
+    /// says nothing of whether the lock is free.
     pub(crate) took_lock: bool,
 }
 
@@ -120,11 +111,6 @@ impl Announcer {
     }
 
     /// The `(title, body)` owed to the window for `pass`, or `None`.
-    ///
-    /// A lock busy for [`BUSY_ANNOUNCED_AFTER`] passes in a row (e.g. `aterm update`
-    /// stopped with Ctrl-Z mid-download) is announced once; the first pass that TAKES
-    /// it answers that notice. A failure kept under the notice is answered only by a
-    /// check recorded since it was said, and otherwise said again.
     pub(crate) fn tick(&mut self, pass: Pass<'_>) -> Option<(String, String)> {
         if pass.record == Record::Busy {
             self.busy = self.busy.saturating_add(1);
@@ -135,8 +121,6 @@ impl Announcer {
             // It happened in this process, whatever time the record last kept.
             return self.show(BUSY_BODY.to_string(), true);
         }
-        // Only a pass that took the lock shows it free: one that failed before
-        // reaching it learned nothing of it.
         let mut lock_freed = false;
         if pass.took_lock {
             self.busy = 0;
@@ -215,10 +199,10 @@ impl OutcomeWatch {
     }
 }
 
-/// What one pass of the Linux check loop tells the window (`crate::linux`'s loop
-/// hands every pass to [`Reporter::report`]): a changed outcome cues a re-read
+/// What one pass of the Linux check loop tells the window (`crate::linux`'s loop hands
+/// every pass to [`Reporter::report`]): a changed outcome cues a re-read
 /// ([`OutcomeWatch`], `on_checked`), and a notice owed by [`Announcer`] goes through
-/// `notify`. One step, so the macOS gate tests the Linux-only loop's cue.
+/// `notify`.
 #[derive(Debug)]
 pub(crate) struct Reporter {
     outcome: OutcomeWatch,
@@ -269,10 +253,8 @@ fn failing_body(failing_checks: Option<u32>, outcome: &str) -> String {
 mod tests {
     use super::*;
 
-    /// A HEALTHY PASS THAT CHANGES THE OUTCOME STILL CUES THE WINDOW. "Up to date"
-    /// then "aterm 0.99.0 is installed" owe no notice, but each is a change the window
-    /// is cued for, through the loop's own step ([`Reporter::report`]). NEGATIVE
-    /// CONTROL: the same outcome again is no change.
+    /// A healthy pass that changes the outcome owes no notice but still cues the window,
+    /// through the loop's own step ([`Reporter::report`]); the same outcome again does not.
     #[test]
     fn a_changed_outcome_cues_the_window_with_no_notice_owed() {
         use std::sync::Arc;
@@ -320,10 +302,8 @@ mod tests {
         assert_eq!(cues.load(Ordering::SeqCst), 3);
     }
 
-    /// The Linux loop hands every pass to [`Reporter::report`] with the window's
-    /// two hooks, and reports nothing by any other road. A scrape, in this
-    /// crate's idiom for the Linux-only lane the macOS gate cannot run: deleting
-    /// the call or passing no cue fails here.
+    /// The Linux loop hands every pass to [`Reporter::report`] with the window's two
+    /// hooks, and reports nothing by any other road (a scrape of `linux.rs`).
     #[test]
     fn the_linux_loop_reports_every_pass_through_the_reporter() {
         let src: String = include_str!("linux.rs").split_whitespace().collect();
@@ -399,17 +379,8 @@ mod tests {
         }
     }
 
-    /// A PASS THAT FAILED BEFORE THE LOCK SAYS NOTHING OF IT. A stopped
-    /// `aterm update check` holds the copy's lock and the notice was said. A pass that
-    /// fails before reaching the lock (settings timed out, record unreadable) must
-    /// neither answer the notice nor restart its count; the first pass that TAKES the
-    /// lock answers it.
-    ///
-    /// FAILS WITHOUT THE FIX: the failed pass answered the notice with the recovery
-    /// title, and 119 busy passes after a failure before the lock said nothing.
-    ///
-    /// NEGATIVE CONTROL: a pass that took the lock and lost its failure (the save the
-    /// full folder refused) does show the lock free.
+    /// A pass that failed before reaching the lock neither answers the lock's notice nor
+    /// restarts its count; the first pass that takes the lock answers it.
     #[test]
     fn a_pass_that_failed_before_the_lock_neither_answers_nor_restarts_its_notice() {
         let held = "Another aterm is updating this copy right now; try again when it finishes";
@@ -445,7 +416,7 @@ mod tests {
             .expect("the bound's last busy pass, a failure before the lock between");
         assert!(body.contains("Ctrl-Z"), "{body}");
 
-        // NEGATIVE CONTROL: a pass that took the lock shows it free, failed or not.
+        // Negative control: a pass that took the lock shows it free, failed or not.
         let mut notice = Announcer::new(START.into());
         for _ in 0..BUSY_ANNOUNCED_AFTER {
             notice.tick(busy(held, 0, before));
@@ -457,16 +428,7 @@ mod tests {
         }
     }
 
-    /// ANOTHER ATERM'S LONG UPDATE IS NO FAILURE IN EVERY OTHER WINDOW. One window
-    /// downloads for minutes under the copy's lock; every other window's pass gives
-    /// up on the lock after half a second, before any save, so the record never
-    /// takes it. Those passes are no failed checks: however many come in a row
-    /// nothing is announced, and so no recovery either. They also neither add to a
-    /// streak of the loop's own nor end one.
-    ///
-    /// FAILS WITHOUT THE FIX: each busy pass counted as an unrecorded failure, so
-    /// the third announced "Another aterm is updating this copy" as a persistent
-    /// failure, and the next pass announced a recovery.
+    /// Busy passes announce nothing and neither add to nor end the loop's own streak.
     #[test]
     fn another_aterms_long_update_announces_nothing() {
         let mut notice = Announcer::new(START.into());
@@ -488,17 +450,8 @@ mod tests {
         );
     }
 
-    /// A LOCK HELD PAST ITS BOUND IS SAID.
-    /// A person presses Ctrl-Z on `aterm update check` during its download: the stopped
-    /// job keeps the copy's update lock for as long as it stays stopped, days in a tmux
-    /// pane. Every pass in every window then found the lock busy, and a busy pass is no
-    /// failed check, so nothing was ever said, while no check ran, no install finished
-    /// and no start of an installed update was counted or confirmed. A lock busy for
-    /// longer than any bounded download holds it ([`BUSY_ANNOUNCED_AFTER`] passes) is now
-    /// announced once, under the check half's failing title, and the lock coming free
-    /// is its recovery.
-    ///
-    /// FAILS WITHOUT THE FIX: a day of busy passes announced nothing.
+    /// A lock held past [`BUSY_ANNOUNCED_AFTER`] passes (e.g. `aterm update check` stopped
+    /// with Ctrl-Z) is announced once, and its release is the recovery.
     #[test]
     fn a_lock_held_past_its_bound_is_said_once_and_its_release_recovers() {
         let mut notice = Announcer::new(START.into());
@@ -520,7 +473,7 @@ mod tests {
             Some((crate::HEALTH_RECOVERED_TITLE.to_string(), CLASS.to_string())),
             "the lock came free: no check need have run"
         );
-        // NEGATIVE CONTROLS: a lock held for less than the bound says nothing, and
+        // Negative controls: a lock held for less than the bound says nothing, and
         // a free pass between busy ones starts the count again.
         let mut notice = Announcer::new(START.into());
         for _ in 0..2 {
@@ -541,14 +494,8 @@ mod tests {
         assert_eq!(body, "3 failed checks in a row: network down.");
     }
 
-    /// ONLY A CHECK SAYS THE CHECKS WORK AGAIN.
-    /// Checks fail persistently with a stage held, and the window announced it. The
-    /// person runs `aterm update apply` (or the installer's reinstall), and the install
-    /// zeroes the record's failure count; the next pass checked nothing (the failure
-    /// backoff), read a count of 0 and announced that updates work again. The recovery
-    /// now waits for a check recorded after the announcement, by any aterm.
-    ///
-    /// FAILS WITHOUT THE FIX: the pass after the install announced the recovery.
+    /// An install zeroes the failure count with no check run: the recovery waits for a
+    /// check recorded after the announcement.
     #[test]
     fn a_zeroed_count_with_no_check_since_is_no_recovery() {
         let mut notice = Announcer::new(START.into());
@@ -582,15 +529,8 @@ mod tests {
         );
     }
 
-    /// THE LOCK COMING FREE DOES NOT ANSWER A FAILURE UNDER ITS NOTICE. Checks fail
-    /// and the window announced it. The person runs `aterm update apply`, presses Ctrl-Z during its
-    /// probe and resumes it more than two hours later: the lock's notice is said over
-    /// the failure, then the apply commits, which zeroes the record's count with no
-    /// check run (its `updated_at` stays), and frees the lock. The failure is said
-    /// again, and only a check recorded since it was said answers it.
-    ///
-    /// FAILS WITHOUT THE FIX: the lock's notice replaced the failure's announcement,
-    /// and the first pass that found the lock free announced the recovery.
+    /// The lock coming free does not answer a failure said under its notice: the failure
+    /// is said again, and only a check recorded since answers it.
     #[test]
     fn the_lock_coming_free_does_not_answer_a_failure_under_its_notice() {
         let mut notice = Announcer::new(START.into());
@@ -623,7 +563,7 @@ mod tests {
             Some((crate::HEALTH_RECOVERED_TITLE.to_string(), CLASS.to_string())),
             "a check recorded since the failure was said"
         );
-        // NEGATIVE CONTROL: a check recorded while the lock was held (its holder was
+        // Negative control: a check recorded while the lock was held (its holder was
         // the check) answers the failure the moment the lock comes free.
         let mut notice = Announcer::new(START.into());
         assert!(notice.tick(pass("network down", 3, failed)).is_some());
@@ -636,13 +576,7 @@ mod tests {
         );
     }
 
-    /// ONE UNRECORDED BLIP IS NOT NEWS OF AN OLD STREAK. The record holds five
-    /// failed checks, all before this launch: history the status line shows. A
-    /// single pass whose failure the record could not take is no streak of this
-    /// process's own, and must not announce the old failure under its reason.
-    ///
-    /// FAILS WITHOUT THE FIX: any unrecorded pass was news, so the blip announced a
-    /// persistent failure at the first pass.
+    /// One unrecorded failure does not announce a streak recorded before this launch.
     #[test]
     fn one_unrecorded_blip_is_not_news_of_an_old_streak() {
         let mut notice = Announcer::new(START.into());
@@ -656,12 +590,8 @@ mod tests {
         assert!(!body.contains("failed checks"), "5 is the record's: {body}");
     }
 
-    /// A STREAK THE RECORD STOPPED TAKING NAMES NO STALE COUNT. Five failed checks
-    /// are recorded this launch, then the update folder turns read-only: every later
-    /// pass reads the record's 5, which is no longer the streak.
-    ///
-    /// FAILS WITHOUT THE FIX: the body kept saying "5 failed checks in a row"
-    /// through the tenth failure and said "6" at the eleventh.
+    /// Once the record stops taking failures (the folder turns read-only), the body names
+    /// no stale count.
     #[test]
     fn a_streak_the_record_stopped_taking_names_no_stale_count() {
         let mut notice = Announcer::new(START.into());
@@ -685,15 +615,8 @@ mod tests {
         }
     }
 
-    /// A FAILURE THE RECORD CANNOT HOLD STILL REACHES THE WINDOW. The update folder's
-    /// filesystem is full, so the save before the check fails at every pass and the
-    /// record's count never rises past what it was (here 0, the status reporting
-    /// its floor of 1), with its time from before this launch. The third such pass
-    /// in a row is announced; a pass whose failure is recorded, or a success, ends
-    /// the loop's own count, and the recovery follows.
-    ///
-    /// FAILS WITHOUT THE FIX: every pass read `failing_checks` 1 from a record last
-    /// written before the launch, and nothing was ever announced.
+    /// The loop counts failures the record cannot hold (a full disk): the third in a row is
+    /// announced, and any pass the record took restarts the count.
     #[test]
     fn a_failure_the_record_cannot_hold_is_counted_by_the_loop() {
         let mut notice = Announcer::new(START.into());
@@ -705,8 +628,7 @@ mod tests {
             .tick(unrecorded(full, 1, before))
             .expect("the third unrecorded failure in a row is announced");
         assert_eq!(crate::health_failing_class(&title), Some(CLASS));
-        // No count: the record's is stale (1 here, through every pass) and the
-        // loop's counts passes, so neither is the streak's.
+        // No count: neither the record's (stale) nor the loop's is the streak's.
         assert_eq!(body, "No space left on device (os error 28).");
         // Said once, not restated every pass.
         assert_eq!(notice.tick(unrecorded(full, 1, before)), None, "said once");
@@ -729,16 +651,8 @@ mod tests {
         );
     }
 
-    /// A HEALTHY COPY'S RESULTS ARE NEVER A WARNING, AND A REAL FAILURE STILL IS.
-    /// The window's first pass of an up-to-date copy sends nothing, nor does an
-    /// install or a single failed check; three failed checks in a row are announced
-    /// under the check half's failing title, which the window reads back to its
-    /// class; a changed reason restates quietly; and the recovery names the class
-    /// it proves, which is what clears the window's row and latch.
-    ///
-    /// FAILS WITHOUT THE FIX: the loop sent every changed outcome — "Up to date"
-    /// first — under a title the window takes for a failing check, latched for the
-    /// launch, so the failure below was never shown.
+    /// Only a persistent failure is announced: three in a row under the failing title, a
+    /// changed reason or count restated quietly, then the recovery naming its class.
     #[test]
     fn only_a_persistent_failure_is_announced_and_its_recovery_follows() {
         let mut notice = Announcer::new(START.into());
@@ -800,9 +714,7 @@ mod tests {
         assert_eq!(crate::health_failing_class(&title), Some(CLASS));
     }
 
-    /// A streak recorded before this window started is on the status line already:
-    /// a window launch does not re-announce it, but the streak's next failed check
-    /// does.
+    /// A streak recorded before this launch is not re-announced; its next failed check is.
     #[test]
     fn a_streak_from_before_this_launch_waits_for_its_next_failed_check() {
         let mut notice = Announcer::new(START.into());

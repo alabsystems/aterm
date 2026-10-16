@@ -2,35 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Tier-1 for `NativeUpdateLaunchedDialWait` (aterm-spec's
-//! `native_update_launched_dial_wait_model`, 2026-09-29): the outgoing
-//! process's wait for its launched successor's dial, driven for real and
-//! projected onto the model step by step (`interp::admits` names the action
-//! the model admits the real step by, and every invariant holds after it).
+//! `native_update_launched_dial_wait_model`): the outgoing process's wait for its launched
+//! successor's dial, driven for real and projected onto the model step by step.
 //!
-//! Driven for real: the completion's reading of an `NSRunningApplication`
-//! (`admit_launch_answer`, through `LaunchInFlight::admitted_for_test`), the
-//! verdicts (`launch_answer_proves_exit`, `launch_answer_names_pid`), the
-//! kernel's word about a named pid (`NamedSuccessorWatch::gone`, against real
-//! processes this test starts and ends), the wait itself
-//! (`await_launched_dial`: a real `Rendezvous` bound in this process, its real
-//! 10 ms accept loop and the real abort), a real dialer presenting the real
-//! claim frame, and the corroboration after the accept
-//! (`LaunchCorroboration::poll`). LaunchServices is SCRIPTED — with the
-//! answers it was measured to give (see `LaunchError::ExitedBeforeCheckIn`
-//! and `launch_answer_names_pid`) — because a unit test may not launch an
-//! application (AGENTS.md). The live half, this build's own successor
-//! dying before its dial through `ATERM_DEBUG_DIE_BEFORE_DIAL`, is measured in
-//! the design doc.
+//! Real: the completion's reading of an `NSRunningApplication` (`admit_launch_answer`), the
+//! verdicts, `NamedSuccessorWatch::gone` against real processes, `await_launched_dial` over a
+//! real `Rendezvous` with a real dialer and claim frame, and `LaunchCorroboration::poll`.
+//! LaunchServices is scripted with its measured answers, because a unit test may not launch
+//! an application.
 //!
-//! Negative controls: a classifier that reads a live application's unknown
-//! pid as death is refused by the model; the retired cancel-only abort, run
-//! for real, waits out its budget beside a death LaunchServices already
-//! reported (the liveness mutant `PollCancelOnly`); the abort before the
-//! named-pid watch, run for real, waits out its budget beside a named process
-//! that is gone (`IgnoreNamedPid`); an abort that takes a pid it cannot watch
-//! for gone, run for real, refuses a live process (`EndOnNamedPid`); and a
-//! consuming pre-dial poll, run for real, leaves the corroboration nothing
-//! (`ConsumingPoll`).
+//! Negative controls run each mutant for real where it can: `PollCancelOnly`,
+//! `IgnoreNamedPid`, `EndOnNamedPid` and `ConsumingPoll`.
 
 use super::{
     HandoffCandidate, LaunchCorroboration, LaunchedDialEnd, NamedSuccessorWatch, PreDialDeath,
@@ -150,8 +132,8 @@ fn bind() -> Rendezvous {
     Rendezvous::bind(&nonce).expect("bind a rendezvous for the Tier-1")
 }
 
-/// A far deadline, bounded at a minute by the caller: a wait that ignored its
-/// abort would run to it. The minute is a hang detector, not a latency budget.
+/// A deadline past the callers' one-minute bound, so a wait that ignored its abort runs to it
+/// and fails that bound. The minute is a hang detector, not a latency budget.
 fn far() -> Instant {
     Instant::now() + Duration::from_secs(120)
 }
@@ -196,16 +178,16 @@ fn launch_services_shapes() -> [(i32, bool, bool); 6] {
         (4243, false, false),
         // An unknown pid on an application not terminated: proves nothing.
         (-1, false, false),
-        // A known pid that has since terminated: admitted as a pid, as before;
-        // whether it is gone is the kernel's to say (`NamedSuccessorWatch`).
+        // A known pid that has since terminated: admitted as a pid; whether it is gone is
+        // the kernel's to say (`NamedSuccessorWatch`).
         (4244, true, true),
-        // LaunchServices substituting THIS process: names nothing to watch.
+        // LaunchServices substituting this process: names nothing to watch.
         (own_pid(), false, false),
     ]
 }
 
-/// THE WAIT, END TO END, PROJECTED: every anchored function of the machine
-/// runs on this thread and is required to have been entered.
+/// The wait end to end, projected: every anchored function of the machine runs on this thread
+/// and must have been entered.
 #[test]
 fn the_real_dial_wait_refines_the_model() {
     let model = native_update_launched_dial_wait_model();
@@ -214,10 +196,9 @@ fn the_real_dial_wait_refines_the_model() {
         "the evidence window must open"
     );
 
-    // 1. THE CLASSIFIER is the model's three answer actions: from a successor
-    //    in the state the harness scripted, the real reading of each measured
-    //    answer is admitted as AnswerExited exactly when it proves the exit,
-    //    and as AnswerNamed exactly when it names a pid.
+    // 1. The classifier: the real reading of each measured answer is admitted as
+    //    AnswerExited exactly when it proves the exit, and as AnswerNamed exactly when it
+    //    names a pid.
     for (pid, terminated, dead) in launch_services_shapes() {
         let answer = LaunchInFlight::admitted_for_test(pid, terminated, own_pid());
         let before = Observed {
@@ -233,9 +214,9 @@ fn the_real_dial_wait_refines_the_model() {
         step(&model, before, after, answer_action(class));
     }
 
-    // 2. DEAD BEFORE ITS DIAL: LaunchServices reports the terminated
-    //    application while the real wait runs; the wait ends on it, not on its
-    //    budget, and leaves the answer in the slot.
+    // 2. Dead before its dial: LaunchServices reports the terminated application while the
+    //    real wait runs; the wait ends on it, not on its budget, and leaves the answer in the
+    //    slot.
     {
         let rendezvous = bind();
         let in_flight = LaunchInFlight::scripted(None);
@@ -292,9 +273,8 @@ fn the_real_dial_wait_refines_the_model() {
             Err(LaunchError::ExitedBeforeCheckIn),
             "and the one consuming reader would still get it"
         );
-        // THE CLASS AND THE ACCOUNTING AGREE: nothing observed is filed
-        // Unexplained, and that lane's budget is safe only because its
-        // counted trial launch is given back.
+        // The class and the accounting agree: filed Unexplained, so the counted trial launch
+        // is given back.
         let evidence = PreDialDeath::TerminatedBeforeCheckIn.evidence();
         assert_eq!(
             PhysicalFailureShape::of_child_death(evidence),
@@ -303,10 +283,8 @@ fn the_real_dial_wait_refines_the_model() {
         assert!(forgives_the_counted_trial_launch(evidence, 1, 2));
     }
 
-    // 3. NAMED, THEN DEAD BEFORE ITS DIAL. LaunchServices named a real
-    //    process and says nothing more; the kernel does. First the watch
-    //    itself: registered while the process lives (nothing to say), then its
-    //    own exit, recorded with its status.
+    // 3. Named, then dead before its dial: LaunchServices says nothing more, the kernel does.
+    //    First the watch alone: registered while the process lives, then its own exit.
     {
         let child = named_stand_in();
         let (pid, named) = pid_of(&child);
@@ -344,8 +322,8 @@ fn the_real_dial_wait_refines_the_model() {
             },
             "EndOnNamedExit",
         );
-        // An exit of its own is the bytes' answer: Structural, and the counted
-        // trial launch is kept — the one decision every reject path uses.
+        // An exit of its own is the bytes' answer: Structural, and the counted trial launch
+        // is kept.
         let evidence = ChildDeathEvidence::Exited { code: 70 };
         assert_eq!(
             PhysicalFailureShape::of_child_death(evidence),
@@ -354,9 +332,8 @@ fn the_real_dial_wait_refines_the_model() {
         assert!(!forgives_the_counted_trial_launch(evidence, 1, 2));
     }
 
-    // …then the real wait, over a named process that is already gone and
-    //    reaped: its pid is vacant, the watch could not even be registered,
-    //    and the wait ends on the kernel's word at once, answer left in place.
+    // …then the real wait over a named process already reaped: the watch cannot register on
+    //    the vacant pid, and the wait ends on the kernel's word at once, answer left in place.
     {
         let rendezvous = bind();
         let child = named_stand_in();
@@ -407,11 +384,8 @@ fn the_real_dial_wait_refines_the_model() {
         assert!(forgives_the_counted_trial_launch(death.evidence(), 1, 2));
     }
 
-    // 4. ALIVE, ANSWERED WITH AN ERROR, or NAMED, before its dial (the error
-    //    that exists for a process still running; the pid of one that checked
-    //    in first): no arm ends the wait, the real dialer is accepted, and the
-    //    corroboration takes the answer the wait left — proceeding on the
-    //    attested dialer, or matching it.
+    // 4. Alive and answered with an error, or named, before its dial: no arm ends the wait,
+    //    the real dialer is accepted, and the corroboration takes the answer the wait left.
     for named in [false, true] {
         let rendezvous = bind();
         let in_flight = LaunchInFlight::scripted(named.then(own_pid));
@@ -491,9 +465,8 @@ fn the_real_dial_wait_refines_the_model() {
         step(&model, accepted, corroborated, "Corroborate");
     }
 
-    // 5. NOBODY DIALS AND NOTHING PROVES A DEATH: LaunchServices named a live
-    //    process this one may not even watch (pid 1), so only the budget ends
-    //    the wait — a pid that cannot be watched is not a pid that is gone.
+    // 5. Nobody dials and nothing proves a death: LaunchServices named a live process this one
+    //    may not watch (pid 1), so only the budget ends the wait.
     {
         let rendezvous = bind();
         let in_flight = LaunchInFlight::scripted(Some(1));
@@ -527,8 +500,8 @@ fn the_real_dial_wait_refines_the_model() {
         step(&model, expired, timed_out, "TimeOut");
     }
 
-    // 6. A REVOCATION KEEPS ITS OWN NAME, even beside a reported death: the
-    //    cancel is asked first.
+    // 6. A revocation keeps its own name, even beside a reported death: the cancel is asked
+    //    first.
     {
         let rendezvous = bind();
         let in_flight = LaunchInFlight::scripted(None);
@@ -548,7 +521,7 @@ fn the_real_dial_wait_refines_the_model() {
         );
     }
 
-    // Every anchored shipping function of the machine RAN, on this thread.
+    // Every anchored shipping function of the machine ran, on this thread.
     let entered = aterm_spec::xref::entered_anchor_ids();
     aterm_spec::xref::disarm_entered_anchors();
     let anchors: Vec<_> = aterm_spec::xref::refinements()
@@ -572,16 +545,15 @@ fn the_real_dial_wait_refines_the_model() {
     }
 }
 
-/// NEGATIVE CONTROLS: each defect the model was written against, run for
-/// real where it can be, and refused by the model.
+/// Negative controls: each defect the model was written against, run for real where it can
+/// be, and refused by the model.
 #[test]
 fn the_models_mutants_are_the_defects_they_name() {
     let model = native_update_launched_dial_wait_model();
 
-    // A classifier that reads a LIVE application's unknown pid as death — the
-    // shape of "any error, or any unknown pid, is death" — produces a step the
-    // committed model does not admit, and the buggy one admits only by
-    // breaking NeverRefusesALiveSuccessor.
+    // A classifier that reads a live application's unknown pid as death ("any error, or any
+    // unknown pid, is death") makes a step the model does not admit; the buggy model admits
+    // it only by breaking NeverRefusesALiveSuccessor.
     let buggy_class = |answer: &Result<LaunchedSuccessor, LaunchError>| {
         if answer.is_err() {
             PROVES_EXIT
@@ -613,9 +585,8 @@ fn the_models_mutants_are_the_defects_they_name() {
     }
     assert!(!buggy.check_invariant("NeverRefusesALiveSuccessor", &refused));
 
-    // THE RETIRED ABORT, run for real: the worker's cancel and nothing else.
-    // LaunchServices has already reported the death, and the wait still runs
-    // to its budget — the liveness mutant `PollCancelOnly`.
+    // The cancel-only abort, run for real: beside a death LaunchServices already reported it
+    // runs to its budget (the liveness mutant `PollCancelOnly`).
     {
         let rendezvous = bind();
         let in_flight = LaunchInFlight::scripted(None);
@@ -657,10 +628,9 @@ fn the_models_mutants_are_the_defects_they_name() {
         );
     }
 
-    // THE ABORT BEFORE THE NAMED-PID WATCH, run for real: the cancel and
-    // LaunchServices' "terminated", nothing about a pid it named. The named
-    // process is gone and reaped, and the wait still runs to its budget — the
-    // liveness mutant `IgnoreNamedPid`.
+    // The abort before the named-pid watch, run for real: it asks the cancel and
+    // LaunchServices' "terminated", never the named pid, so beside a reaped named process it
+    // runs to its budget (the liveness mutant `IgnoreNamedPid`).
     {
         let rendezvous = bind();
         let child = named_stand_in();
@@ -704,11 +674,9 @@ fn the_models_mutants_are_the_defects_they_name() {
         );
     }
 
-    // A PID THAT CANNOT BE WATCHED TAKEN FOR GONE, run for real: LaunchServices
-    // names pid 1, which is alive (`kill` answers EPERM, not ESRCH) and which
-    // this process may not watch. Such an abort ends the wait at once — a live
-    // successor refused (`EndOnNamedPid`) — where the shipping wait runs to
-    // its budget (case 5 above).
+    // A pid that cannot be watched taken for gone, run for real: pid 1 is alive (`kill`
+    // answers EPERM, not ESRCH) and unwatchable, so such an abort refuses a live successor at
+    // once (`EndOnNamedPid`), where the shipping wait runs to its budget (case 5 above).
     {
         // SAFETY: signal 0 checks existence and permission, delivering nothing.
         let alive = unsafe { libc::kill(1, 0) } == 0
@@ -760,9 +728,9 @@ fn the_models_mutants_are_the_defects_they_name() {
         assert!(!model.check_invariant("NeverRefusesALiveSuccessor", &projected));
     }
 
-    // A CONSUMING PRE-DIAL POLL, run for real: an abort that reads the answer
-    // with the consuming `wait` leaves the corroboration after the accept
-    // nothing to read — `ConsumingPoll`, caught by AnswerKeptForTheCorroboration.
+    // A consuming pre-dial poll, run for real: an abort that reads the answer with the
+    // consuming `wait` leaves the corroboration nothing (`ConsumingPoll`, caught by
+    // AnswerKeptForTheCorroboration).
     {
         let rendezvous = bind();
         let in_flight = LaunchInFlight::scripted(Some(9_999_999));
@@ -805,12 +773,8 @@ fn the_models_mutants_are_the_defects_they_name() {
     }
 }
 
-/// The machine's actions with no shipping code of their own on the outgoing
-/// side, each waived by name. Bound above: `AnswerExited`/`AnswerOther`/
-/// `AnswerNamed` (`app_launch_successor::admit_launch_answer`), `EndOnExit`
-/// (`launch_answer_proves_exit`), `EndOnNamedExit`
-/// (`NamedSuccessorWatch::gone`), `Accept`/`TimeOut` (`await_launched_dial`)
-/// and `Corroborate` (`LaunchCorroboration::poll`).
+/// The machine's actions with no shipping code of their own on the outgoing side, each waived
+/// by name; the anchored ones are listed in `the_real_dial_wait_refines_the_model`.
 mod waivers {
     #[aterm_spec::spec_unmodeled(
         machine = "native_update_launched_dial_wait",

@@ -85,14 +85,11 @@ impl Iterator for BitsetRowIterator<'_> {
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            // Find next set bit in current word
             if self.current_word != 0 {
                 let bit_pos = self.current_word.trailing_zeros() as usize;
-                // word_idx ≤ MAX_ROWS/64 = 1023, bit_pos ≤ 63
-                // max value = 1023*64 + 63 = 65535 which fits in u16
+                // A tracker has at most u16::MAX rows (1024 words), so this <= 65535.
                 let row = row_u16(self.word_idx * 64 + bit_pos);
 
-                // Clear this bit for next iteration
                 self.current_word &= !(1u64 << bit_pos);
 
                 if row < self.max_row {
@@ -101,7 +98,6 @@ impl Iterator for BitsetRowIterator<'_> {
                 return None;
             }
 
-            // Move to next word
             self.word_idx += 1;
             if self.word_idx >= self.bits.len() {
                 return None;
@@ -111,8 +107,8 @@ impl Iterator for BitsetRowIterator<'_> {
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        // Count remaining set bits (upper bound)
-        // Use .get() to avoid panic when iterator is exhausted (word_idx >= bits.len())
+        // Upper bound: the set bits left; `.get()` because an exhausted iterator's
+        // word_idx is past the end.
         let remaining: usize = self.current_word.count_ones() as usize
             + self
                 .bits
@@ -165,13 +161,13 @@ impl Iterator for DamageBoundsIterator<'_> {
 
 /// Iterator merging consecutive damaged rows with overlapping column ranges
 /// into rectangles (fewer draw calls).
-#[cfg(any(test, feature = "testing"))]
+#[cfg(any(test, debug_assertions))]
 pub struct MergedDamageIterator<'a> {
     inner: DamageBoundsIterator<'a>,
     pending: Option<super::rect::DamageRect>,
 }
 
-#[cfg(any(test, feature = "testing"))]
+#[cfg(any(test, debug_assertions))]
 impl<'a> MergedDamageIterator<'a> {
     /// Create a new merged damage iterator.
     #[cfg(test)]
@@ -183,7 +179,7 @@ impl<'a> MergedDamageIterator<'a> {
     }
 }
 
-#[cfg(any(test, feature = "testing"))]
+#[cfg(any(test, debug_assertions))]
 impl Iterator for MergedDamageIterator<'_> {
     type Item = super::rect::DamageRect;
 

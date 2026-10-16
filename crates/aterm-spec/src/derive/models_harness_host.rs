@@ -765,26 +765,34 @@ pub fn harness_commit_owed_model() -> Model {
     }
 }
 
-/// `aterm-gui`'s `harness_host` runs one worker per Claude session. For ONE
-/// session: `wanted` is the session's published program being `claude` —
-/// or, for a pass that cannot name it, its agent still holding the tab
-/// ([`harness_leave_model`]) — and the policy active; `cur` a worker running under the current policy;
-/// `old` workers asked to stop (the program left, the policy changed) whose
-/// wait has not ended yet; `faults` the SESSION's failed runs in the restart
-/// window — across its workers, kept at most `Budget + 1`; `faulted` the
-/// session badged while its worker waits to restart a supervisor that keeps
-/// failing past the budget (the worker still the session's: `cur` stays);
-/// `held` another supervisor's claim refused ours.
+/// `aterm-gui`'s `harness_host` runs one worker per agent session. For ONE
+/// session: `wanted` is the session's published program being a supervisable
+/// agent — or, for a pass that cannot name it, its agent still holding the
+/// tab ([`harness_leave_model`]) — and the policy active; `on` that agent's
+/// own switch (`[harness.<id>] enabled`); `cur` a worker running under the
+/// current policy; `old` workers asked to stop (the program left, the policy
+/// changed, the agent switched off) whose wait has not ended yet; `faults`
+/// the SESSION's failed runs in the restart window — across its workers,
+/// kept at most `Budget + 1`; `faulted` the session badged while its worker
+/// waits to restart a supervisor that keeps failing past the budget (the
+/// worker still the session's: `cur` stays); `held` another supervisor's
+/// claim refused ours.
 ///
-/// * `Arrive`/`Leave` — the program becomes / stops being claude. Leaving asks
-///   the worker to stop and forgets `held` (the host keeps it only for a
+/// * `Arrive`/`Leave` — the program becomes / stops being the agent. Leaving
+///   asks the worker to stop and forgets `held` (the host keeps it only for a
 ///   session it still wants) — but NOT `faults`: a program flap gives a
 ///   crash-looping engine no fresh budget. The badge goes with the worker
 ///   that raised it, at its `Exit`.
-/// * `Start` — the host starts a worker for a wanted session with none of its
-///   own, not held, and — the property — NO OLD WORKER STILL RUNNING: the
-///   host reaps a stopped worker before it starts the next one. It inherits
-///   the session's `faults`.
+/// * `SwitchOff`/`SwitchOn` — the agent's switch goes off / on. Off asks the
+///   worker to stop exactly as `Leave` does — `faults` kept, `held`
+///   forgotten, the badge going at its `Exit` — while the session stays the
+///   agent's: the switch-off path is a stop, never the agent leaving
+///   ([`harness_leave_model`] hands its worker no exit). On lets `Start` run
+///   again.
+/// * `Start` — the host starts a worker for a wanted session whose agent is
+///   on, with none of its own, not held, and — the property — NO OLD WORKER
+///   STILL RUNNING: the host reaps a stopped worker before it starts the next
+///   one. It inherits the session's `faults`.
 /// * `Exit` — an old worker's wait ends and it is reaped, its badge cleared
 ///   on its way out (no new worker starts before it has gone).
 /// * `Fail` — the current worker's run failed or panicked: restarted in
@@ -806,6 +814,25 @@ pub fn harness_commit_owed_model() -> Model {
 /// * `Reload` — the `[harness]` policy changed: the worker is asked to stop
 ///   (its successor starts under the new policy), and `faults` is forgiven.
 ///
+/// AUTOPILOT OFF (`docs/DESIGN-harness-autopilot-2026-10-15.md` §2.2; `off`
+/// the session's effective Autopilot is Off — its own word, else the table's
+/// default — an open tab whose session the harness keeps its hands off). It
+/// is not the agent's switch (`on`): the switch is `[harness.<id>]`'s, for
+/// every session of that agent, the word is one session's; both stop the
+/// worker, neither lets it go, and `Start` waits for both:
+///
+/// * `TurnOff` — the word goes Off: the host STOPS the worker (it is `old`
+///   until its wait ends, `Exit`), never lets it go — a let-go hands the
+///   worker its agent's exit and begins the relaunch decision.
+/// * `TurnOn` — the word goes back to Cruise or Land: `Start` is the host's
+///   again, as for any wanted session.
+/// * `Crash` — the agent exits on its own while its tab stays open. Under
+///   Cruise or Land the running worker would be handed the exit; Off has no
+///   running worker, so nothing is handed and nothing relaunched. `letgo`
+///   records an exit handed to a worker WHILE the session is Off.
+/// * `Start` waits for `off == 0` too: no worker starts for an Off session,
+///   whether its agent is named again or was never stopped.
+///
 /// `Buggy=1` is a host without its guards, each one a defect with its own
 /// witness: it starts the new worker without waiting for the old one to end
 /// (two supervisors answering one session's boxes, the double press the claim
@@ -814,12 +841,37 @@ pub fn harness_commit_owed_model() -> Model {
 /// and it GIVES UP on a supervisor failing past the budget — the worker
 /// ended with the badge up, nobody supervising and nothing to restart it
 /// (`NeverGivesUp`: a session whose failure the window was told of is
-/// still supervised, or its worker is on its way out). The shipped
+/// still supervised, or its worker is on its way out). It starts a worker
+/// for a session whose agent is switched off (`Start` not reading the switch
+/// — `OffMeansNoCurrent`). For Autopilot Off it starts a worker for an Off
+/// session (`OffStopsTheWorker`), and its `TurnOff` is a let-go — Off
+/// implemented as `Worker::leave` — handing the running worker its agent's
+/// exit, the relaunch decision begun (`OffLetsNothingGo`); a crash of the Off
+/// session it started a worker for is handed too. Every defect is a `Buggy`
+/// branch of a live action — `Start`'s one branch drops every one of its
+/// guards, the wait, the claim, the switch and the word alike — so no action
+/// is dead at `Buggy=0` (the strict-vacuity audit). The shipped
 /// guard on `Fail` is `cur == 1` alone — `faults` never passes `Budget + 1`
 /// there — and the `faults <= Budget + 1` half only bounds the buggy host's
-/// space. Tier-1 (`aterm-gui`'s `harness_host` conformance)
-/// drives the real host through each action and checks its observed state
-/// against the model's after the same actions.
+/// space. Tier-1 (`aterm-gui`'s `harness_host` conformance) drives the real
+/// host through each action but `Restart` and `Age`, and checks its
+/// observed state against the model's after the same actions. A stopped
+/// worker's body lingers while the step holds the state its stop leaves
+/// (about two host passes after the stop settles), so a host that starts
+/// the next worker before reaping the old one within those passes (at a
+/// reload, at a flap) is seen with two (`OneSupervisor`) — a start delayed
+/// past the hold is not witnessed here; and one failure
+/// is driven past the cap within the window, so a history kept past
+/// `Budget + 1` is seen (`FaultBudget`). The switch
+/// is read from the host's live per-agent gate, with a running worker
+/// switched off and back on after failures: the old worker ends, a new one
+/// starts, and the session's failures survive. The held-session off/on
+/// trace is a model-only check here, not a runtime claim. Autopilot's word
+/// is driven too: `letgo` is OBSERVED there (a worker's body read its
+/// agent's exit handed with its stop), never only set by `Buggy`:
+/// `the_lifecycle_projection_catches_a_real_let_go_of_an_off_session` lets
+/// the real host's worker of an Off session go inside the pass that read it
+/// Off, and the projection breaks `OffLetsNothingGo`.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn harness_worker_lifecycle_model() -> Model {
@@ -833,6 +885,9 @@ pub fn harness_worker_lifecycle_model() -> Model {
             var faults = 0;
             var faulted = 0;
             var held = 0;
+            var on = 1;
+            var off = 0;
+            var letgo = 0;
 
             action Arrive when (wanted == 0) {
                 wanted = 1;
@@ -843,8 +898,17 @@ pub fn harness_worker_lifecycle_model() -> Model {
                 cur = 0;
                 held = 0;
             }
+            action SwitchOff when (on == 1 && old + cur <= 1) {
+                on = 0;
+                old = old + cur;
+                cur = 0;
+                held = 0;
+            }
+            action SwitchOn when (on == 0) {
+                on = 1;
+            }
             action Start when (wanted == 1 && cur == 0
-                && ((held == 0 && old == 0) || Buggy == 1)) {
+                && ((on == 1 && held == 0 && old == 0 && off == 0) || Buggy == 1)) {
                 cur = 1;
             }
             action Exit when (old > 0) {
@@ -875,11 +939,30 @@ pub fn harness_worker_lifecycle_model() -> Model {
                 cur = 0;
                 faults = 0;
             }
+            action TurnOff when (off == 0 && old + cur <= 1) {
+                off = 1;
+                letgo = if (cur == 1 && Buggy == 1) { 1 } else { letgo };
+                old = old + cur;
+                cur = 0;
+            }
+            action TurnOn when (off == 1) {
+                off = 0;
+            }
+            action Crash when (wanted == 1 && old + cur <= 1) {
+                wanted = 0;
+                held = 0;
+                letgo = if (cur == 1 && off == 1) { 1 } else { letgo };
+                old = old + cur;
+                cur = 0;
+            }
 
             invariant OneSupervisor: old + cur <= 1;
             invariant FaultBudget: faults <= Budget + 1;
             invariant NeverGivesUp: faulted == 0 || cur == 1 || old > 0;
             invariant HeldIsOff: held == 0 || cur == 0;
+            invariant OffMeansNoCurrent: on == 1 || cur == 0;
+            invariant OffStopsTheWorker: off == 0 || cur == 0;
+            invariant OffLetsNothingGo: letgo == 0;
         }
     }
 }
@@ -1010,7 +1093,7 @@ pub fn harness_handoff_claim_model() -> Model {
 
 /// THE HOST HANDS A WORKER ITS AGENT'S EXIT ONLY FOR AN EXIT (2026-09-28):
 /// `aterm-gui`'s `harness_host`, for ONE supervised session whose tab lives
-/// on, under `[harness] relaunch = false` (the configuration of the gate
+/// on, under `[harness] relaunch = false` (the configuration of the test
 /// failure below). `alive` the FACT the host reads that the agent holds its
 /// tab (`Acts::holds` answering `Some(true)`): the foreground group it was
 /// named in is still the tab's, that group's leader still exists, and
@@ -1025,7 +1108,8 @@ pub fn harness_handoff_claim_model() -> Model {
 /// owes itself a pass (its bell rang, or a timed look is set); `handed` the
 /// host handed the worker the exit (`Worker::leave`); `decided` what the
 /// worker made of it: 1 carried on (relaunched), 2 left and said (the
-/// owner's limit).
+/// owner's limit); `off` the agent was switched off (`[harness.<id>]
+/// enabled = false`) before the host handed the exit.
 ///
 /// * `Misread` / `Reread` — the roster stops / starts naming a live agent: a
 ///   name the resolver could not read replaces the good one
@@ -1049,11 +1133,17 @@ pub fn harness_handoff_claim_model() -> Model {
 ///   (`acting`), so the step is one action here.
 /// * `Stray` — a restart record in flight for the tab that is not this
 ///   agent's appears (it rings nothing).
+/// * `SwitchOff` — the agent is switched off; the changed policy rings the
+///   host. The model takes it only before an exit is handed (`handed == 0`):
+///   a switch-off between `Visit` and `Decide` is outside it (WHAT THE MODEL
+///   LEAVES OUT, below).
 /// * `Visit` — a host pass, which reads the fact (`Acts::holds`) for a worker
 ///   the roster does not name: an agent that still holds its tab is no exit
 ///   — the worker is kept, and a short look is set, because nothing else
 ///   would ring for an exit that follows; one that holds it no longer is
-///   handed the exit.
+///   handed the exit. A worker whose agent is switched off is stopped
+///   through the switch-off path ([`harness_worker_lifecycle_model`]'s
+///   `SwitchOff`): handed nothing, its agent live or not, and owed no look.
 /// * `Decide` — the worker handles the exit it was handed
 ///   (`on_agent_left`): the upgrade's own restart in flight — asked about
 ///   THE LEAVING AGENT's pid (`Acts::restarted`, `relaunch::restarted`),
@@ -1061,7 +1151,9 @@ pub fn harness_handoff_claim_model() -> Model {
 ///   says; its own exit is left, and said.
 ///
 /// `NoExitWhileAlive`: no worker is handed the exit of an agent that still
-/// holds its tab. `NeverMissed`: an exit is handed, or a pass is still owed.
+/// holds its tab. `NoExitWhileOff`: nor of an agent switched off — a stop
+/// is no exit, so the agent is neither relaunched nor said. `NeverMissed`:
+/// an exit is handed, a pass is still owed, or the agent is switched off.
 /// `TheUpgradesOwnIsCarried`: an agent the upgrade ended is never left for
 /// `[harness] relaunch = false`. `OnlyTheUpgradesOwnIsCarried`: nothing else
 /// is carried on against it. The invariants restate `Visit`'s and
@@ -1093,28 +1185,43 @@ pub fn harness_handoff_claim_model() -> Model {
 /// `a_pass_that_keeps_an_agent_owes_the_host_a_look`, and on a real
 /// terminal `the_real_hold_reads_the_tabs_foreground_and_its_leader` and
 /// `the_hold_reads_the_groups_leader_and_a_zombie_still_reads_held`).
+/// A switch-off after the exit was handed — between `Visit` and `Decide` —
+/// is outside the model too: `SwitchOff` is guarded by `handed == 0` and
+/// `Decide` is one action here, so whether such a worker still relaunches
+/// its agent is the host's to bind, and nothing binds it yet.
 ///
-/// `Buggy=1` adds four hosts, each a dead action at `Buggy=0` caught alone:
+/// `Buggy=1` adds five hosts, each a dead action at `Buggy=0` caught alone:
 /// the host of 32a51a716, whose pass hands the exit whenever the roster does
 /// not name the agent (`VisitUnconfirmed`: `Misread`, `VisitUnconfirmed` —
 /// `NoExitWhileAlive`); a fix of it that keeps the worker but sets no look
 /// (`VisitNoLook`: `Misread`, `VisitNoLook`, `Exit` — `NeverMissed`); the
 /// worker of 32a51a716, whose exit decision reads `[harness] relaunch` alone
 /// (`DecideLimited`: `Terminate`, `Visit`, `DecideLimited` —
-/// `TheUpgradesOwnIsCarried`; the gate failure of 32a51a716, where the
+/// `TheUpgradesOwnIsCarried`; the test failure of 32a51a716, where the
 /// upgrade's own SIGTERM, both of the step's relaunch attempts waiting — the
 /// shape a forced reproduction matched line for line — read as the agent
 /// leaving and was dropped); and that fix's first cut, which read the
 /// record by tab alone (`DecideByTab`: `Stray`, `Exit`, `Visit`,
 /// `DecideByTab` — `OnlyTheUpgradesOwnIsCarried`: a person's crashed agent
-/// relaunched against the owner's limit). Tier-1, in `aterm-gui`'s
-/// `harness_host` tests: `the_real_host_conforms_to_the_leave_model` drives
-/// the real host through every path of the environment's actions and checks
+/// relaunched against the owner's limit); and the host that drops a
+/// switched-off agent from its roster, whose pass reads the agent as gone
+/// and hands its worker the exit (`VisitOffAsLeave`: `SwitchOff`,
+/// `VisitOffAsLeave` — `NoExitWhileAlive`; after an `Exit` —
+/// `NoExitWhileOff`). Tier-1, in `aterm-gui`'s `harness_host` tests:
+/// `the_real_host_conforms_to_the_leave_model` drives the real host through
+/// every path of the environment's actions but `SwitchOff`, and checks
 /// after each that what it did — kept, carried on or said — is what the
 /// model does. Only `handed` and `decided` are OBSERVED there: `alive`,
-/// `ours`, `stray` and `named` are what its driver did to a fake world, `due`
-/// is the model's, the hold is the fake's flag (not the shipping `holds`),
-/// and its negative controls fire the `Buggy` actions on MODEL state alone.
+/// `ours`, `stray` and `named` are what its driver did to a fake world,
+/// `due` is the model's, the hold is the fake's flag (not the shipping
+/// `holds`), and its negative controls fire `VisitUnconfirmed` and
+/// `DecideByTab` on MODEL state alone.
+/// `the_real_host_switch_off_conforms_to_the_leave_model` separately binds
+/// switch-off of a named or misread live agent and its later exit: `off`
+/// reads the host's live per-agent gate, its worker ends without an exit
+/// decision, and another admitted agent starts after its exit as a witness
+/// that a host pass reached the start decisions. `VisitOffAsLeave` itself
+/// remains a MODEL-state negative control, not a runtime mutation test.
 /// `a_pass_that_keeps_an_agent_owes_the_host_a_look` binds the look `Visit`
 /// keeps owed (`due`) to the instant the real host's own pass (`host_pass`)
 /// waits for — the one test that catches `VisitNoLook`, since a threaded
@@ -1132,6 +1239,7 @@ pub fn harness_leave_model() -> Model {
             var due = 0;
             var handed = 0;
             var decided = 0;
+            var off = 0;
 
             action Misread when (alive == 1 && named == 1) {
                 named = 0;
@@ -1155,9 +1263,13 @@ pub fn harness_leave_model() -> Model {
             action Stray when (alive == 1 && stray == 0) {
                 stray = 1;
             }
+            action SwitchOff when (off == 0 && handed == 0) {
+                off = 1;
+                due = 1;
+            }
             action Visit when (due == 1 && handed == 0) {
-                due = if (named == 0 && alive == 1) { 1 } else { 0 };
-                handed = if (named == 0 && alive == 0) { 1 } else { 0 };
+                due = if (named == 0 && alive == 1 && off == 0) { 1 } else { 0 };
+                handed = if (named == 0 && alive == 0 && off == 0) { 1 } else { 0 };
             }
             action VisitUnconfirmed when (Buggy == 1 && due == 1 && handed == 0) {
                 due = 0;
@@ -1166,6 +1278,10 @@ pub fn harness_leave_model() -> Model {
             action VisitNoLook when (Buggy == 1 && due == 1 && handed == 0) {
                 due = 0;
                 handed = if (named == 0 && alive == 0) { 1 } else { 0 };
+            }
+            action VisitOffAsLeave when (Buggy == 1 && due == 1 && handed == 0 && off == 1) {
+                due = 0;
+                handed = 1;
             }
             action Decide when (handed == 1 && decided == 0) {
                 decided = if (ours == 1) { 1 } else { 2 };
@@ -1178,7 +1294,8 @@ pub fn harness_leave_model() -> Model {
             }
 
             invariant NoExitWhileAlive: handed == 0 || alive == 0;
-            invariant NeverMissed: alive == 1 || handed == 1 || due == 1;
+            invariant NoExitWhileOff: handed == 0 || off == 0;
+            invariant NeverMissed: alive == 1 || handed == 1 || due == 1 || off == 1;
             invariant TheUpgradesOwnIsCarried: ours == 0 || decided <= 1;
             invariant OnlyTheUpgradesOwnIsCarried: ours == 1 || decided == 0 || decided == 2;
         }
@@ -1799,11 +1916,39 @@ pub fn harness_upgrade_age_model() -> Model {
 ///   claim landed included, asked at every look of the carry (the review of
 ///   ruling 20): left to it, the stamp unconsumed, `read` 3.
 ///
+/// * `SelfClaimOn` / `SelfClaimOff` — a PROVEN SELF-CLAIM (the codex-alab
+///   self-claim contract, §4; `selfclaim`): `P` itself claims the session,
+///   the kernel proving the claim is its own, while it runs and no other
+///   supervisor's claim stands (a foreign `ClaimOn` over it is refused busy,
+///   as the server refuses it); it is given back, or cleared once `P` left
+///   the front. It is no other hand: the act's `Stamp` and `KILL` go ahead
+///   under it (the stall's remedy, which `P` cannot give itself), and once
+///   `P` has ended it is NOBODY'S — `claimed_by_another` reads a proven
+///   self-claim whose process is gone as no claim, so the end is `Read` by
+///   this host's watch-only worker, never left to the dead holder (ruling
+///   17, amended 2026-10-16). `by` — the hand that took an end left to a
+///   claim (`ReadByClaim`: another supervisor's, 2).
+///
+/// * `Copied` / `CopyRelaunches` / `CopyLeaves` — ATERM'S COPY of the
+///   self-claimed agent's record (`copy`, read while the proven claim stood
+///   and `P` ran). Where it stands, it is the end's ONE DECIDER (the lane's
+///   `Read` does not run): it relaunches the end on the line it validated
+///   (as the act's when the stamp stood, consuming it), or LEAVES it, said
+///   once — its verdict orderly (the record removed, an exit word that is
+///   not aterm's signal) or its line refused against the live process
+///   (`read` 4). A claim given back while `P` runs (`SelfClaimOff`, passive)
+///   drops the copy: `P`'s later end is the lane's to read, never decided
+///   from a copy frozen at the release.
+///
 /// Invariants: `TheActsEndIsRelaunched` — an end an act made is relaunched
 /// whoever reads it, however many acts there were — or, read while another
-/// supervisor claims the session, left to that supervisor, the one end this
-/// host does not relaunch (`read` 3, ruling 17: a supervisor of the session
-/// relaunches what it holds); `OnlyAStampedEndIsTheActs`
+/// LIVE supervisor claims the session, left to that supervisor (`read` 3
+/// with `by` 2, ruling 17: a supervisor of the session relaunches what it
+/// holds; a proven self-claim whose process ended relaunches nothing, so it
+/// takes no end), or left by the agent's own copy, said once (`read` 4: it
+/// recorded an orderly end, or names no line that is the live process's —
+/// no line read from a writable file is typed unless the agent ran it);
+/// `OnlyAStampedEndIsTheActs`
 /// — nothing is relaunched as the act's unless the stamp stood at its end;
 /// `TheActEndsItsProgram` — a `P` an act signalled is never left alive with
 /// nobody to end it (its thread, or after a Commit the carrier);
@@ -1848,7 +1993,7 @@ pub fn harness_upgrade_age_model() -> Model {
 /// on the real code. Nor a STOPPED `P` as a state of its own: `alive` covers it,
 /// and `Read`'s `alive == 0` is what the reader must wait for (ruling 15).
 ///
-/// `Buggy=1` adds ten mutants, each caught alone: `SignalBeforeStamp`
+/// `Buggy=1` adds eleven mutants, each caught alone: `SignalBeforeStamp`
 /// (the signal sent first: a reader of the exit before the stamp lands reads
 /// a graceful exit — `TheActsEndIsRelaunched`), `CommitForgetsStamp` (the
 /// record in the instance's memory, `RemedySent`'s, lost across a Commit —
@@ -1876,7 +2021,11 @@ pub fn harness_upgrade_age_model() -> Model {
 /// 20's first reader, which asked the claim only at an exit's first read: a
 /// claim that landed while the end was carried through a hold was asked at
 /// no later look, and the relaunch was typed into the tab it claims once the
-/// hold lifted — `NothingIsTypedIntoAClaim`). Tier-1 (`aterm-gui`'s `harness_host` tests
+/// hold lifted — `NothingIsTypedIntoAClaim`), and `DeadSelfClaimTakesTheExit`
+/// (a reader that read a proven self-claim whose process is gone as a live
+/// supervisor's, the reader before 2026-10-16: the self-supervised agent
+/// the act ended was left at a bare shell with nobody to relaunch it —
+/// `TheActsEndIsRelaunched`). Tier-1 (`aterm-gui`'s `harness_host` tests
 /// `the_real_restart_act_conforms_to_its_model`,
 /// `a_second_restart_that_sends_nothing_leaves_the_first_acts_stamp`,
 /// `the_restart_acts_kill_waits_out_another_hand`, for `Read`'s
@@ -1887,7 +2036,9 @@ pub fn harness_upgrade_age_model() -> Model {
 /// for `Read` after a hold that landed between the end and the read
 /// `an_acts_end_read_under_a_hold_is_relaunched_once_it_lifts`, for
 /// `ReadByClaim` after a claim that landed during that carry
-/// `a_claim_that_lands_while_an_acts_end_is_carried_takes_it`,
+/// `a_claim_that_lands_while_an_acts_end_is_carried_takes_it`, for `Read`
+/// under a proven self-claim whose process is gone
+/// `an_acts_end_under_a_dead_proven_self_claim_is_relaunched`,
 /// and for `esc`'s one watch `many_restarts_of_one_program_run_one_watch`)
 /// drives the real `restart` verb and its two halves over a real pty and a
 /// real stand-in, the real stamp, a real hold, and the real reader chain.
@@ -1910,6 +2061,9 @@ pub fn harness_restart_stamp_model() -> Model {
             var hand = 0;
             var held_kill = 0;
             var into_claim = 0;
+            var selfclaim = 0;
+            var by = 0;
+            var copy = 0;
 
             action Stamp when (alive == 1 && inflight == 0 && committed == 0 && hand == 0) {
                 inflight = 1;
@@ -1950,8 +2104,18 @@ pub fn harness_restart_stamp_model() -> Model {
             action HandOn when (hand == 0) {
                 hand = 1;
             }
-            action ClaimOn when (hand <= 1) {
+            action ClaimOn when (hand <= 1 && selfclaim == 0) {
                 hand = 2;
+            }
+            action SelfClaimOn when (alive == 1 && hand <= 1 && selfclaim == 0) {
+                selfclaim = 1;
+            }
+            action SelfClaimOff when (selfclaim == 1) {
+                selfclaim = 0;
+                copy = if (alive == 1) { 0 } else { copy };
+            }
+            action Copied when (selfclaim == 1 && alive == 1) {
+                copy = 1;
             }
             action HandOff when (hand > 0) {
                 hand = 0;
@@ -1970,13 +2134,23 @@ pub fn harness_restart_stamp_model() -> Model {
                 at_end = 1;
                 held_kill = hand;
             }
-            action Read when (alive == 0 && read == 0 && hand == 0) {
+            action Read when (alive == 0 && read == 0 && hand == 0 && copy == 0) {
                 read = if (stamped == 1) { 1 } else { 2 };
                 stamped = 0;
                 into_claim = if (hand == 2) { 1 } else { 0 };
             }
             action ReadByClaim when (alive == 0 && read == 0 && hand == 2) {
                 read = 3;
+                by = hand;
+            }
+            action CopyRelaunches when (alive == 0 && read == 0 && hand == 0 && copy == 1) {
+                read = if (stamped == 1) { 1 } else { 2 };
+                stamped = 0;
+                copy = 0;
+            }
+            action CopyLeaves when (alive == 0 && read == 0 && hand == 0 && copy == 1) {
+                read = if (stamped == 1) { 4 } else { 2 };
+                copy = 0;
             }
             action SignalBeforeStamp when (
                 Buggy == 1 && alive == 1 && stamped == 0 && termed == 0 && committed == 0
@@ -2031,8 +2205,16 @@ pub fn harness_restart_stamp_model() -> Model {
                 into_claim = 1;
             }
 
-            invariant TheActsEndIsRelaunched: read <= 1 || read == 3 || ended == 0 || ended == 2;
-            invariant OnlyAStampedEndIsTheActs: read == 0 || read == 2 || read == 3 || at_end == 1;
+            action DeadSelfClaimTakesTheExit when (
+                Buggy == 1 && alive == 0 && read == 0 && hand == 0 && selfclaim == 1
+            ) {
+                read = 3;
+            }
+
+            invariant TheActsEndIsRelaunched: read <= 1 || (read == 3 && by == 2) || read == 4
+                || ended == 0 || ended == 2;
+            invariant OnlyAStampedEndIsTheActs: read == 0 || read == 2 || read == 3 || read == 4
+                || at_end == 1;
             invariant TheActEndsItsProgram: alive == 0 || termed == 0 || esc > 0
                 || committed == 1;
             invariant TheKillWaitsOutAnotherHand: held_kill == 0;
@@ -2059,6 +2241,7 @@ pub fn harness_restart_stamp_model() -> Model {
 /// survives.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
+#[crate::liveness(crate::derive::harness_restart_stamp_model)]
 pub fn harness_restart_stamp_liveness() -> super::Liveness {
     use super::{eq, int, or_, var};
     super::Liveness {

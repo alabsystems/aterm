@@ -1,0 +1,328 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+//! SIGN-IN, through each vendor's own flow, on a terminal a person is at (design §8).
+//!
+//! * Claude Code: ONLY accounts v2's renewal. With no renewable own row it asks for the
+//!   account's email, lists the machine's own login with `aterm harness accounts
+//!   adopt-default`, then runs `aterm harness accounts renew`: a staging home, the email
+//!   hint, the browser profile, the one check in the staging home, then the binding. aterm
+//!   never signs in a live Claude home, and records nothing of Claude's: accounts does.
+//! * A CLI whose login signs the current one out first (Codex revokes it) runs only when it
+//!   is already signed out.
+//! * Each flow runs from an empty run directory, with the tab's environment less the CLI's
+//!   credential variables, then its status read, on the login it just made.
+//!
+//! Nothing here runs under an agent: a sign-in is a person's act.
+
+use std::io::Write;
+use std::path::Path;
+use std::time::Duration;
+
+use super::connector::{Connector, Login, Status};
+use super::facts::{Facts, Job, Ran, RunFailed, Runner};
+use super::run::RunDir;
+use super::state::{Row, State};
+use super::store::{Ended, How, Outcome, Store};
+
+/// The status read's time limit.
+pub const STATUS_BUDGET: Duration = Duration::from_secs(20);
+/// The label accounts v2 gives the machine's own row (`harness::cli::ACCOUNTS_OWN_LABEL`).
+pub const OWN_LABEL: &str = "main";
+
+/// The variables that mean an agent is running this command: its tools carry them.
+pub const AGENT_MARKERS: &[&str] = &[
+    "CLAUDECODE",
+    "CODEX_THREAD_ID",
+    "CODEX_SANDBOX",
+    "ATERM_AI_REVIEW",
+];
+
+/// The first [`AGENT_MARKERS`] variable set, if any.
+#[must_use]
+pub fn agent_marker(var: &dyn Fn(&str) -> Option<String>) -> Option<&'static str> {
+    AGENT_MARKERS
+        .iter()
+        .copied()
+        .find(|k| var(k).is_some_and(|v| !v.is_empty()))
+}
+
+/// What a sign-in came to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Done {
+    /// The status read says it is signed in (`Some(method)`), or accounts v2 renewed it
+    /// (`None`).
+    SignedIn(Option<&'static str>),
+    /// The flow ended and nothing could read whether a login was made.
+    NotChecked,
+    /// The status read says nobody is signed in.
+    SignedOut,
+    /// The flow failed; why.
+    Failed(String),
+    /// It was not started; why.
+    Refused(String),
+}
+
+/// What a sign-in needs of the machine. Injected: tests run no vendor and no `aterm`.
+pub struct Host<'a> {
+    /// The child processes.
+    pub runner: &'a dyn Runner,
+    /// One variable of this process's environment.
+    pub var: &'a dyn Fn(&str) -> Option<String>,
+    /// This process's whole environment.
+    pub vars: &'a [(String, String)],
+    /// This program, for `aterm harness accounts …`.
+    pub aterm: &'a Path,
+    /// The AI store.
+    pub store: &'a Store,
+    /// Unix seconds, read when asked.
+    pub now: &'a dyn Fn() -> i64,
+    /// Asks the person a question on the terminal and answers the line typed.
+    pub ask: &'a dyn Fn(&str) -> Option<String>,
+}
+
+/// The environment a sign-in runs with: the tab's (the AI-variable strip), less the CLI's
+/// credential variables, plus its home variable when one is set.
+#[must_use]
+pub fn sign_in_env(
+    c: &Connector,
+    vars: &[(String, String)],
+    var: &dyn Fn(&str) -> Option<String>,
+) -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> = vars
+        .iter()
+        .filter(|(k, _)| {
+            !aterm_types::domain::is_ai_env_var(k) && !c.credential_env.contains(&k.as_str())
+        })
+        .filter(|(k, _)| !AGENT_MARKERS.contains(&k.as_str()))
+        .cloned()
+        .collect();
+    if let Some(name) = c.home.var
+        && let Some(v) = var(name).filter(|v| !v.is_empty())
+    {
+        env.retain(|(k, _)| k != name);
+        env.push((name.to_string(), v));
+    }
+    env
+}
+
+/// What a status read said.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Said {
+    /// Signed in, this way.
+    In(&'static str),
+    /// Nobody is signed in.
+    Out,
+    /// Nothing it can be read as; why.
+    Unread(String),
+}
+
+/// Reads a status run against its closed grammar, error output first (Codex prints there).
+/// Whatever follows a known prefix (an API key's masked fragment) is dropped here.
+#[must_use]
+pub fn read_status(status: &Status, ran: &Result<Ran, RunFailed>) -> Said {
+    let ran = match ran {
+        Ok(ran) => ran,
+        Err(RunFailed::Timeout) => return Said::Unread("timed out".to_string()),
+        Err(RunFailed::NotRun(why)) => return Said::Unread(crate::harness::one_line(why, 80)),
+    };
+    for line in ran.stderr.lines().chain(ran.stdout.lines()) {
+        let line = line.trim();
+        for (prefix, method) in status.lines {
+            if line.starts_with(prefix) {
+                return match method {
+                    Some(m) => Said::In(m),
+                    None => Said::Out,
+                };
+            }
+        }
+    }
+    Said::Unread(format!(
+        "an answer this build does not read (exit {:?})",
+        ran.exit
+    ))
+}
+
+fn as_args(words: &[&str]) -> Vec<String> {
+    words.iter().map(|w| (*w).to_string()).collect()
+}
+
+/// Claude Code's sign-in: accounts v2's renewal, after listing the machine's own login
+/// with its email where it has none.
+fn claude(h: &Host<'_>, f: &Facts, out: &mut dyn Write) -> Done {
+    // Accounts v2 renews only the default home's login; under a home of its own the
+    // vendor keys the login by that home, which no renewal here touches.
+    if let Some(dir) = (h.var)(
+        super::connector::CLAUDE
+            .home
+            .var
+            .unwrap_or("CLAUDE_CONFIG_DIR"),
+    )
+    .filter(|v| !v.is_empty())
+    {
+        return Done::Refused(format!(
+            "CLAUDE_CONFIG_DIR is set ({}): aterm signs in only the default home's Claude login, \
+             through accounts v2; sign in under that home with `claude` and its /login",
+            crate::harness::one_line(&dir, 80)
+        ));
+    }
+    if let Some(why) = f.accounts.as_ref().and_then(|a| a.refused.as_deref()) {
+        return Done::Refused(format!(
+            "accounts.toml is refused ({why}): fix it (`aterm harness accounts` says how), then run `aterm ai login claude`"
+        ));
+    }
+    if let Some(a) = f.accounts.as_ref().filter(|a| a.listed && !a.renews) {
+        return Done::Refused(format!(
+            "accounts.toml lists this machine's own login as `{}` with no email: add `email = \"…\"` to that row, then `aterm ai login claude` renews it",
+            a.label
+        ));
+    }
+    let renews = f.accounts.as_ref().is_some_and(|a| a.renews);
+    let label = f
+        .accounts
+        .as_ref()
+        .map_or_else(|| OWN_LABEL.to_string(), |a| a.label.clone());
+    let env: Vec<(String, String)> = h.vars.to_vec();
+    if !renews {
+        let _ = writeln!(
+            out,
+            "Claude Code signs in through accounts v2's renewal: a fresh login, checked against \
+             the account's email before any session uses it."
+        );
+        let Some(email) = (h.ask)("The Claude account's email (Enter skips): ")
+            .map(|e| e.trim().to_string())
+            .filter(|e| !e.is_empty())
+        else {
+            return Done::Refused("no email was given".to_string());
+        };
+        if !email.contains('@') || email.chars().any(char::is_whitespace) {
+            return Done::Refused("that is not an email address".to_string());
+        }
+        let args = as_args(&[
+            "harness",
+            "accounts",
+            "adopt-default",
+            &label,
+            "--email",
+            &email,
+        ]);
+        match h.runner.terminal(h.aterm, &args, &env, None) {
+            Ok(0) => {}
+            Ok(code) => {
+                return Done::Failed(format!(
+                    "`aterm harness accounts adopt-default` exited {code}"
+                ));
+            }
+            Err(why) => return Done::Failed(why),
+        }
+    }
+    let args = as_args(&["harness", "accounts", "renew", &label]);
+    match h.runner.terminal(h.aterm, &args, &env, None) {
+        Ok(0) => Done::SignedIn(None),
+        Ok(code) => Done::Failed(format!(
+            "`aterm harness accounts renew {label}` exited {code}"
+        )),
+        Err(why) => Done::Failed(why),
+    }
+}
+
+/// Signs `row`'s CLI in. `out` gets what the person is told.
+#[must_use]
+pub fn sign_in(h: &Host<'_>, f: &Facts, row: &Row, out: &mut dyn Write) -> Done {
+    let c = f.connector;
+    if let Some(marker) = agent_marker(h.var) {
+        return Done::Refused(format!(
+            "{marker} is set: a sign-in is a person's act, not an agent's"
+        ));
+    }
+    if matches!(row.state, State::Off) {
+        return Done::Refused(row.fact.clone());
+    }
+    if matches!(row.state, State::NotInstalled) {
+        return Done::Refused(format!(
+            "not installed: run `aterm pkg install {}` first",
+            c.id
+        ));
+    }
+    let (args, remote, tell, signs_out_first, after) = match &c.login {
+        Login::Accounts => return claude(h, f, out),
+        Login::Run {
+            args,
+            remote,
+            tell,
+            signs_out_first,
+            after,
+        } => (args, remote, tell, *signs_out_first, after),
+    };
+    if signs_out_first && !matches!(row.state, State::SignedOut) {
+        return Done::Refused(format!(
+            "{} is signed in; its own login signs that login out (revokes it) before it starts",
+            c.product
+        ));
+    }
+    let Some(managed) = &f.managed else {
+        return Done::Refused(format!(
+            "not installed: run `aterm pkg install {}` first",
+            c.id
+        ));
+    };
+    let run = match RunDir::make(h.store.dir()) {
+        Ok(run) => run,
+        Err(e) => return Done::Failed(format!("no private run directory: {e}")),
+    };
+    let under_ssh = (h.var)("SSH_CONNECTION").is_some_and(|v| !v.is_empty());
+    let words = match (under_ssh, remote) {
+        (true, Some(r)) => *r,
+        _ => *args,
+    };
+    let env = sign_in_env(c, h.vars, h.var);
+    let _ = writeln!(out, "{}: {tell}", c.product);
+    let _ = out.flush();
+    let exited = h
+        .runner
+        .terminal(&managed.path, &as_args(words), &env, Some(run.path()));
+    if let Err(why) = &exited {
+        return Done::Failed(format!("{} could not be started: {why}", c.id));
+    }
+    // Read whatever the exit: a person quits a TUI with Ctrl-C.
+    let Some(status) = after else {
+        return Done::NotChecked;
+    };
+    let ran = h.runner.run(&Job {
+        program: &managed.path,
+        args: &as_args(status.args),
+        env: &env,
+        stdin: None,
+        cwd: Some(run.path()),
+        budget: STATUS_BUDGET,
+    });
+    let now = (h.now)();
+    let default_home = c
+        .home
+        .var
+        .is_none_or(|v| (h.var)(v).is_none_or(|s| s.is_empty()));
+    let note = |outcome| {
+        if default_home {
+            let _ = h.store.note(c.id, How::Login, outcome, now);
+        }
+    };
+    match read_status(status, &ran) {
+        Said::In(method) => {
+            note(Outcome::Worked);
+            Done::SignedIn(Some(method))
+        }
+        Said::Out => {
+            note(Outcome::Ended(Ended::StatusSignedOut));
+            Done::SignedOut
+        }
+        Said::Unread(_) => match exited {
+            Ok(0) => Done::NotChecked,
+            Ok(code) => Done::Failed(format!("{} exited {code}", c.id)),
+            Err(why) => Done::Failed(why),
+        },
+    }
+}
+
+#[cfg(test)]
+#[path = "login_tests.rs"]
+mod tests;

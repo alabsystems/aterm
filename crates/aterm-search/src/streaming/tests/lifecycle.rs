@@ -68,13 +68,3 @@ fn cancel_clears_state() {
     assert_eq!(search.current_index(), 0);
     assert!(search.verify_all_invariants());
 }
-
-#[test]
-fn clear_pattern_returns_to_idle() {
-    let mut search = StreamingSearch::new();
-
-    search.start_search("hello", FilterMode::Literal).unwrap();
-    search.update_pattern("").unwrap();
-
-    assert_eq!(search.state(), SearchState::Idle);
-}

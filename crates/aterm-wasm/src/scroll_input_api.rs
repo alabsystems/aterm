@@ -1,57 +1,38 @@
 // SPDX-License-Identifier: MIT
 // Copyright 2026 Andrew Yates
 
-//! The host-facing SUB-ROW scroll input API on [`AtermTerminal`]: fractional /
-//! pixel wheel deltas accumulate here, whole rows flip into the engine's
-//! `scroll_display`, and the banked sub-row residual is presented at render
-//! time through the existing M1b grid-band translate
-//! (`aterm_render::scroll_translate`) — pixel-true trackpad scrolling for web
-//! hosts instead of `scroll_lines`' whole-row jumps.
+//! Sub-row scroll input on [`WebTerminal`]: pixel or fractional wheel deltas
+//! accumulate here, whole rows flip into the engine's `scroll_display`, and the banked
+//! residual is presented through `aterm_render::scroll_translate`.
 //!
-//! ## Contract
+//! * The residual banks in row units, so it survives `set_px` unscaled.
+//! * A row flips at ±1.0 accumulated (`display_offset` moves only by whole rows).
+//! * Whole-row navigation (`scroll_lines`, `scroll_to_bottom`, `scroll_to_top`)
+//!   resets the residual.
+//! * At a history end the residual clamps to zero on the empty side.
 //!
-//! * Deltas ACCUMULATE: two `scroll_px(cell_height / 2)` calls reveal exactly
-//!   one older row. The residual banks in ROW units, so it survives a font
-//!   zoom (`set_px`) unscaled.
-//! * A row FLIPS at ±1.0 accumulated rows (truncation toward zero — the
-//!   engine's `display_offset` only ever moves by whole rows).
-//! * The residual RESETS on every whole-row navigation (`scroll_lines`,
-//!   `scroll_to_bottom`, `scroll_to_top`): row-aligned jumps land row-aligned.
-//! * At a history end the residual CLAMPS to zero on the empty side (no
-//!   sub-row position exists past the live bottom or the oldest retained
-//!   line); with no scrollback at all (the alternate screen) nothing banks.
+//! Positive input reveals older lines, as in [`WebTerminal::scroll_lines`]; the
+//! presented shift is the negated residual, so partway toward an older row the band
+//! shifts down. Float accumulation is outside the ty `Expr` language, so the unit
+//! tests below carry the semantics instead of a derived spec.
 //!
-//! Sign convention matches [`AtermTerminal::scroll_lines`]: POSITIVE input
-//! reveals OLDER lines. The presented shift is the NEGATED residual — partway
-//! toward an older row the band shifts DOWN (`scroll_frac_px < 0`, the
-//! incoming older row's strip exposed at the top), partway toward a newer row
-//! it shifts UP — continuous with the whole-row flip on both sides.
-//!
-//! Float accumulation is outside the ty `Expr` language (the same documented
-//! waiver as `aterm-gui`'s scroll kinematics), so the semantics are proven by
-//! the unit lattice below, not a derived spec.
+//! Shared with `aterm-gpu-web`, which mounts this file by `#[path]`;
+//! [`WebTerminal`] is each crate's own terminal type.
 
-#[cfg(target_arch = "wasm32")]
-use wasm_bindgen::prelude::*;
-
-use crate::AtermTerminal;
+use crate::WebTerminal;
 use aterm_render::RenderInput;
 
-/// The banked sub-row scroll state: a signed fractional-row residual in
-/// `(-1.0, 1.0)`, relative to the engine's whole-row `display_offset`
-/// (positive = partway toward OLDER lines). Pure accumulation/rounding logic —
-/// no engine, no clock — so the semantics are unit-tested exhaustively below.
+/// The banked sub-row scroll state: a fractional-row residual in `(-1.0, 1.0)` on top
+/// of the engine's whole-row `display_offset`, positive toward older lines.
 #[derive(Debug, Default)]
 pub(crate) struct ScrollInputState {
     frac_rows: f64,
 }
 
 impl ScrollInputState {
-    /// Accumulate a fractional row delta and return the WHOLE rows that
-    /// flipped (truncation toward zero: a flip happens exactly at ±1.0
-    /// accumulated). The sub-row remainder stays banked. Non-finite deltas (a
-    /// hostile JS `NaN`/`Infinity`) are ignored. The return saturates to
-    /// `i32` — the engine clamps to the real history bound anyway.
+    /// Accumulate a row delta and return the whole rows that flipped (truncation
+    /// toward zero), banking the remainder. Non-finite deltas are ignored; the return
+    /// saturates to `i32` (the engine clamps to the real history bound).
     pub(crate) fn add_rows(&mut self, delta_rows: f64) -> i32 {
         if !delta_rows.is_finite() {
             return 0;
@@ -62,11 +43,9 @@ impl ScrollInputState {
         whole.clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
     }
 
-    /// Zero the residual on a side with no content: nothing sub-row exists
-    /// below the live bottom (`display_offset == 0`, negative residual) or
-    /// above the oldest retained line (`display_offset >= history_lines`,
-    /// positive residual). With no history at all BOTH sides clamp, so the
-    /// alternate screen can never bank a shift.
+    /// Zero the residual on a side with no content: below the live bottom or above the
+    /// oldest retained line. With no history both sides clamp, so the alternate screen
+    /// never banks a shift.
     pub(crate) fn clamp_at_history_edges(&mut self, display_offset: usize, history_lines: usize) {
         if display_offset == 0 && self.frac_rows < 0.0 {
             self.frac_rows = 0.0;
@@ -81,15 +60,13 @@ impl ScrollInputState {
         self.frac_rows = 0.0;
     }
 
-    /// The banked residual in rows — signed, in `(-1.0, 1.0)`.
+    /// The banked residual in rows, in `(-1.0, 1.0)`.
     pub(crate) fn frac_rows(&self) -> f64 {
         self.frac_rows
     }
 
-    /// The SIGNED device-px shift presenting this residual through the M1b
-    /// grid-band translate: the NEGATED residual (partway toward older ⇒ band
-    /// shifts DOWN ⇒ negative), rounded to whole px and clamped inside the
-    /// translate's domain `(-cell_h, cell_h)`.
+    /// The device-px shift presenting this residual: the negated residual, rounded and
+    /// clamped inside the translate's domain `(-cell_h, cell_h)`.
     pub(crate) fn frac_px(&self, cell_h: usize) -> i32 {
         if cell_h == 0 {
             return 0;
@@ -99,13 +76,9 @@ impl ScrollInputState {
         px.clamp(-max, max)
     }
 
-    /// Stamp this residual onto a frame snapshot: the presented
-    /// `scroll_frac_px` plus the grid band, set here to the whole frame
-    /// `[0, grid_rows)`. When message-band rows are committed, `render()`
-    /// runs `compose_band_into_frame` right after this stamp, which prepends
-    /// them and moves the grid band down below them by their count. Called
-    /// EVERY frame — a kept scratch would otherwise carry a stale shift after
-    /// the residual resets.
+    /// Stamp the presented `scroll_frac_px` and a whole-frame grid band `[0, grid_rows)`
+    /// onto the frame (`compose_band_into_frame` then moves the band below any message
+    /// rows). Call every frame: a kept scratch would otherwise carry a stale shift.
     pub(crate) fn stamp(&self, input: &mut RenderInput, grid_rows: usize, cell_h: usize) {
         input.scroll_frac_px = self.frac_px(cell_h);
         input.grid_top_row = 0;
@@ -113,58 +86,58 @@ impl ScrollInputState {
     }
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
-impl AtermTerminal {
-    /// Sub-row scroll input in device PIXELS — the wheel/trackpad `deltaY` at
-    /// `deltaMode == DOM_DELTA_PIXEL`, sign-adjusted by the host so POSITIVE
-    /// reveals older lines (the [`scroll_lines`](Self::scroll_lines)
-    /// convention). Fractions accumulate across calls; each whole
-    /// `cell_height` of accumulation flips one engine row, and the sub-row
-    /// remainder is presented by the next `render()` as a pixel shift of the
-    /// grid band — the host only needs to redraw afterwards.
-    pub fn scroll_px(&mut self, delta_px: f64) {
-        let cell_h = self.cell_height();
-        if cell_h == 0 {
-            return;
+/// The JS-visible surface. Each crate expands it onto its own terminal
+/// type, under its own export attribute, with `web_terminal_impl!`: the
+/// attribute names the JS class after the impl's type, which this shared
+/// file cannot spell.
+macro_rules! bind {
+    ($terminal:ident, $export:ident) => {
+        #[cfg_attr(target_arch = "wasm32", $export)]
+        impl $terminal {
+            /// Sub-row scroll input in device pixels (`DOM_DELTA_PIXEL`), positive revealing
+            /// older lines as in [`scroll_lines`](Self::scroll_lines). Each accumulated
+            /// `cell_height` flips one engine row; the next `render()` presents the remainder
+            /// as a pixel shift of the grid band.
+            pub fn scroll_px(&mut self, delta_px: f64) {
+                let cell_h = self.cell_height();
+                if cell_h == 0 {
+                    return;
+                }
+                self.scroll_rows_input(delta_px / cell_h as f64);
+            }
+
+            /// Sub-row scroll input in fractional lines (`DOM_DELTA_LINE`), with the
+            /// [`scroll_px`](Self::scroll_px) accumulation contract.
+            pub fn scroll_lines_frac(&mut self, delta_rows: f64) {
+                self.scroll_rows_input(delta_rows);
+            }
+
+            /// The banked sub-row residual in rows, in `(-1.0, 1.0)`, positive toward older
+            /// lines; `0` whenever the viewport is row-aligned.
+            #[cfg_attr(target_arch = "wasm32", $export(getter))]
+            pub fn scroll_frac_rows(&self) -> f64 {
+                self.scroll_input.frac_rows()
+            }
+
+            /// The signed device-px band shift the next `render()` presents (negative = band
+            /// shifted down, toward older), so a harness can compare the CPU and GPU bundles.
+            #[cfg_attr(target_arch = "wasm32", $export(getter))]
+            pub fn scroll_frac_px(&self) -> i32 {
+                self.scroll_input.frac_px(self.cell_height())
+            }
         }
-        self.scroll_rows_input(delta_px / cell_h as f64);
-    }
-
-    /// Sub-row scroll input in fractional LINES (`deltaMode ==
-    /// DOM_DELTA_LINE` hosts, or a host that scales pixels itself). Same
-    /// accumulation contract as [`scroll_px`](Self::scroll_px): whole rows
-    /// flip at ±1.0 accumulated, the remainder banks.
-    pub fn scroll_lines_frac(&mut self, delta_rows: f64) {
-        self.scroll_rows_input(delta_rows);
-    }
-
-    /// The banked sub-row residual in ROWS — signed, in `(-1.0, 1.0)`,
-    /// positive = partway toward OLDER lines. `0` whenever the viewport is
-    /// row-aligned (after a flip, a whole-row navigation, or at a clamped
-    /// history end).
-    #[cfg_attr(target_arch = "wasm32", wasm_bindgen(getter))]
-    pub fn scroll_frac_rows(&self) -> f64 {
-        self.scroll_input.frac_rows()
-    }
-
-    /// The SIGNED device-px band shift the next `render()` presents for the
-    /// banked residual (negative = band shifted DOWN, toward older). Exposed
-    /// so hosts/harnesses can assert the CPU and GPU bundles present the same
-    /// sub-row frame.
-    #[cfg_attr(target_arch = "wasm32", wasm_bindgen(getter))]
-    pub fn scroll_frac_px(&self) -> i32 {
-        self.scroll_input.frac_px(self.cell_height())
-    }
+    };
 }
+web_terminal_impl!(bind);
 
-// Not wasm-exported: the shared ingress for both input units.
-impl AtermTerminal {
+// Not wasm-exported: the ingress shared by both input units.
+impl WebTerminal {
     fn scroll_rows_input(&mut self, delta_rows: f64) {
         let whole = self.scroll_input.add_rows(delta_rows);
         if whole != 0 {
             self.term.scroll_display(whole);
         }
-        // Clamp against where the engine ACTUALLY landed: input parked at a
+        // Clamp against where the engine actually landed: input parked at a
         // history end must not bank a phantom sub-row shift.
         let grid = self.term.grid();
         self.scroll_input
@@ -189,7 +162,7 @@ mod tests {
 
     #[test]
     fn row_flips_at_exactly_plus_and_minus_one() {
-        // 0.25 is exactly representable, so ±1.0 is reached EXACTLY.
+        // 0.25 is exactly representable, so ±1.0 is reached exactly.
         let mut s = ScrollInputState::default();
         for _ in 0..3 {
             assert_eq!(s.add_rows(0.25), 0);
@@ -233,7 +206,7 @@ mod tests {
 
     #[test]
     fn history_edges_clamp_the_empty_side_only() {
-        // At the live bottom a NEGATIVE residual has nowhere to go...
+        // At the live bottom a negative residual has nowhere to go...
         let mut s = ScrollInputState::default();
         s.add_rows(-0.4);
         s.clamp_at_history_edges(0, 10);
@@ -267,7 +240,7 @@ mod tests {
         s.reset();
         s.add_rows(0.3);
         assert_eq!(s.frac_px(16), -5, "rounds to the nearest device px (4.8)");
-        // Near ±1.0 the rounded px must stay INSIDE (-cell_h, cell_h).
+        // Near ±1.0 the rounded px must stay inside (-cell_h, cell_h).
         s.reset();
         s.add_rows(0.999_999);
         assert_eq!(s.frac_px(16), -15, "clamped below cell_h");
@@ -302,7 +275,7 @@ mod tests {
         s.stamp(&mut input, 24, 16);
         assert_eq!(input.scroll_frac_px, -8);
         assert_eq!((input.grid_top_row, input.grid_bot_row), (0, 24));
-        // A kept scratch must be re-stamped to ZERO after the residual drops.
+        // A kept scratch must be re-stamped to zero after the residual drops.
         s.reset();
         s.stamp(&mut input, 24, 16);
         assert_eq!(input.scroll_frac_px, 0);
@@ -310,10 +283,9 @@ mod tests {
 
     // ---- wasm-export smoke: the exported surface end to end ----------------
 
-    /// Build a terminal with real scrollback, or skip when the environment has
-    /// no system font (the same posture as the other binding tests).
-    fn terminal_with_history() -> Option<AtermTerminal> {
-        let mut t = AtermTerminal::new_from_system(4, 20, 16.0)?;
+    /// A terminal with scrollback, or `None` without a system font.
+    fn terminal_with_history() -> Option<WebTerminal> {
+        let mut t = WebTerminal::new_from_system(4, 20, 16.0)?;
         for i in 0..12 {
             t.process(format!("line {i}\r\n").as_bytes());
         }
@@ -377,30 +349,19 @@ mod tests {
         t.scroll_lines_frac(0.7);
         assert_eq!((t.display_offset(), t.scroll_frac_rows()), (top, 0.0));
         // A fresh terminal (no history at all) never banks.
-        let Some(mut fresh) = AtermTerminal::new_from_system(4, 20, 16.0) else {
+        let Some(mut fresh) = WebTerminal::new_from_system(4, 20, 16.0) else {
             return;
         };
         fresh.scroll_lines_frac(0.7);
         assert_eq!(fresh.scroll_frac_rows(), 0.0);
     }
 
-    #[test]
-    fn render_presents_the_banked_residual_and_is_identity_at_zero() {
-        let Some(mut t) = terminal_with_history() else {
-            eprintln!("no system font; skipping render smoke");
-            return;
-        };
-        t.render();
-        let base = t.rgba();
-        // Bank half a row: same engine offset, but the presented frame shifts.
-        t.scroll_px(t.cell_height() as f64 / 2.0);
-        assert!(t.scroll_frac_px() != 0, "non-vacuity: a shift is presented");
-        t.render();
-        assert_ne!(t.rgba(), base, "the sub-row residual moves the pixels");
-        // Snap resets: frac 0 must be BYTE-IDENTICAL to the whole-row frame
-        // (the translate's identity-at-zero, through the whole export path).
-        t.scroll_to_bottom();
-        t.render();
-        assert_eq!(t.rgba(), base, "identity at frac 0 after the snap");
+    /// The including crate's own `src/scroll_input_api_tests.rs`: the CPU and GPU hosts
+    /// draw differently.
+    mod host {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/scroll_input_api_tests.rs"
+        ));
     }
 }

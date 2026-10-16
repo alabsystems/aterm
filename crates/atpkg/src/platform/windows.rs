@@ -14,16 +14,13 @@
 //! [`crate::platform`] — but no shim, junction or `GetDiskFreeSpaceExW` call here has ever run.
 //!
 //! A Windows triple absent from `aterm-libc`'s cell list stops the build rather than falling
-//! back to an empty cell. Guards: `crates/aterm-libc/tests/target_gate.rs` (a configured
-//! build lane it refuses) and `crates/atpkg/tests/shipped_triples_have_a_compile_cell.rs`
-//! (a shipped triple no build lane compiles).
+//! back to an empty cell.
 
 use std::ffi::OsStr;
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// Whether the calling user can write into `dir`. Best-effort `true` on Windows,
 /// matching [`dir_meta_is_private`]: writability rests on the per-user ACL, which this
@@ -71,6 +68,13 @@ pub fn our_uid() -> u32 {
 
 /// No process groups on Windows: the caller's `Child::kill` is the whole of it.
 pub fn kill_process_group(_leader: u32) {}
+
+/// No start-time reader is wired on Windows: [`crate::platform::Birth::Unreadable`], and a
+/// promise rides on the pid alone (the Unix twin's docs).
+#[must_use]
+pub fn process_birth(_pid: u32) -> crate::platform::Birth {
+    crate::platform::Birth::Unreadable
+}
 
 /// Best-effort private-dir predicate: `true`. POSIX owner/mode bits do not apply;
 /// confidentiality rests on the per-user `%LOCALAPPDATA%` profile ACL.
@@ -427,24 +431,7 @@ pub fn atomic_symlink(target: &Path, link: &Path) -> io::Result<()> {
 /// ([`super::CMD_FORWARD_TAIL`]), and every file starts with the frame
 /// ([`super::CMD_FRAME_HEAD`]) a legacy file resumes into harmlessly.
 fn atomic_write(dest: &Path, bytes: &[u8]) -> io::Result<()> {
-    let parent = dest.parent().unwrap_or_else(|| Path::new("."));
-    let mut tmp_name = String::from(".");
-    if let Some(n) = dest.file_name().and_then(OsStr::to_str) {
-        tmp_name.push_str(n);
-    } else {
-        tmp_name.push_str("shim");
-    }
-    tmp_name.push_str(".tmp-");
-    tmp_name.push_str(&std::process::id().to_string());
-    let tmp = parent.join(tmp_name);
-    let _ = fs::remove_file(&tmp);
-    fs::write(&tmp, bytes)?;
-    let _ = fs::remove_file(dest);
-    if let Err(e) = fs::rename(&tmp, dest) {
-        let _ = fs::remove_file(&tmp);
-        return Err(e);
-    }
-    Ok(())
+    crate::lay::write_in_process(&crate::lay::Executable::new(dest, bytes))
 }
 
 /// The two injection refusals every `.cmd` shim renderer makes, fail-closed: a target
@@ -610,11 +597,15 @@ unsafe extern "system" fn swallow_ctrl_c(ctrl_type: u32) -> i32 {
 /// a Ctrl-C — once per batch level, so up to TWICE on a legacy twin's landing hand-over
 /// (`agents\<program>.cmd`, then `bin\<program>.cmd`). Unverified on a Windows host.
 ///
-/// Every caller builds `command` through `aterm_uds::spawnfd::command`, or raw (B27's
-/// transparent rows) with `aterm_uds::spawn::set_flags`, both `Console::Quiet`, which
+/// Every caller builds `command` through `aterm_uds::spawnfd::command`, or raw (the
+/// reviewed pass-throughs) with `aterm_uds::spawn::set_flags`, both `Console::Quiet`, which
 /// adds nothing from a console: typed at a prompt the tool shares that console, its
 /// Ctrl-C and its code page, exactly as a bare child did.
-pub fn exec_or_run(command: &mut Command) -> io::Error {
+#[expect(
+    clippy::disallowed_types,
+    reason = "the pass-throughs' spawn-and-wait: the program stands in for this process"
+)]
+pub fn exec_or_run(command: &mut std::process::Command) -> io::Error {
     // Best effort: when the install fails the wrapper keeps the default disposition (it
     // ends on Ctrl-C), and the child still runs — nothing here may stand between the
     // user and the tool.

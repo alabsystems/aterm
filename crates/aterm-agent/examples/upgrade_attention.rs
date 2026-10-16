@@ -122,6 +122,8 @@ fn main() {
         "claimed",
         "left-typed:unsent",
         "left-typed:mixed",
+        // A tab whose Autopilot the owner turned off (2026-10-15).
+        "autopilot-off",
     ];
     for phase_name in ["pending", "announced"] {
         for behind in [1u64, 7, 30] {

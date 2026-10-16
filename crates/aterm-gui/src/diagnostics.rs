@@ -480,7 +480,7 @@ pub(crate) fn collect() -> DiagInfo {
 }
 
 /// Every Objective-C protocol a `declare_class!` site in the shipped window
-/// layer claims — the union of the `protocols:` lists in `vendor/winit`'s
+/// layer claims — the union of the `protocols:` lists in `crates/aterm-window`'s
 /// macOS backend and this crate — pinned so `--diagnose` can ask the host about
 /// each BEFORE any class is declared (declaration is what would supply a
 /// missing one). `claimed_objc_protocols_are_pinned` reads the sites and keeps
@@ -489,6 +489,7 @@ pub(crate) fn collect() -> DiagInfo {
 pub(crate) const CLAIMED_OBJC_PROTOCOLS: &[&std::ffi::CStr] = &[
     c"NSApplicationDelegate",
     c"NSDraggingDestination",
+    c"NSDraggingSource",
     c"NSMenuDelegate",
     c"NSObject",
     c"NSTextFieldDelegate",
@@ -912,16 +913,14 @@ pub(crate) fn config_semantic_warnings(
             ));
         }
     }
-    if let Some(palette) = config.palette.as_ref() {
-        for (i, hex) in palette.iter().enumerate() {
-            if crate::app_config::parse_hex_color(hex).is_none() {
-                warnings.push(ConfigSemanticWarning {
-                    key: "palette",
-                    message: format!(
-                        "palette[{i}]: expected #RRGGBB, got {hex:?} (ignored at load)"
-                    ),
-                });
-            }
+    // The resolver's own issues, so a bad palette entry reads the same here as
+    // everywhere else; the scalar colour keys are `validate_config_text`'s.
+    for issue in config.color_issues() {
+        if issue.key.starts_with("palette[") {
+            warnings.push(ConfigSemanticWarning {
+                key: "palette",
+                message: format!("{issue} (ignored at load)"),
+            });
         }
     }
     if let Some(palette) = config
@@ -931,11 +930,11 @@ pub(crate) fn config_semantic_warnings(
         .and_then(|profanity| profanity.palette.as_ref())
     {
         for (index, color) in palette.iter().enumerate() {
-            if crate::app_config::parse_hex_color(color).is_none() {
+            if aterm_types::scheme::parse_hex(color).is_none() {
                 warnings.push(ConfigSemanticWarning {
                     key: "sparkle_words.profanity.palette",
                     message: format!(
-                        "sparkle_words.profanity.palette[{index}]: expected RRGGBB or #RRGGBB, got {color:?}; this color is ignored"
+                        "sparkle_words.profanity.palette[{index}]: expected RRGGBB, #RRGGBB or #RGB, got {color:?}; this color is ignored"
                     ),
                 });
             }
@@ -949,7 +948,7 @@ pub(crate) fn config_semantic_warnings(
         let hue = hue.trim();
         let valid = hue.eq_ignore_ascii_case("matrix")
             || hue.eq_ignore_ascii_case("theme")
-            || (hue.starts_with('#') && crate::app_config::parse_hex_color(hue).is_some());
+            || (hue.starts_with('#') && aterm_types::scheme::parse_hex(hue).is_some());
         if !valid {
             warnings.push(ConfigSemanticWarning {
                 key: "matrix_rain.hue",
@@ -1279,12 +1278,20 @@ pub(crate) fn config_host_semantic_warnings_with_backend_and_assets(
     }
 
     warnings.extend(
-        crate::app_config::theme_misses(config, &assets.themes)
+        crate::app_config::theme_catalog_misses(config, &assets.themes)
             .into_iter()
             .map(|message| ConfigSemanticWarning {
                 key: "theme",
                 message,
             }),
+    );
+    // Colour keys apply to both sides of a dark/light split; say when one
+    // leaves a side illegible (it needs the catalog for a file theme's colours).
+    warnings.extend(
+        config
+            .split_override_warnings(&assets.themes)
+            .into_iter()
+            .map(|(key, message)| ConfigSemanticWarning { key, message }),
     );
 
     warnings.extend(
@@ -2186,62 +2193,55 @@ pub(crate) fn validate_config_text(text: &str) -> Result<Vec<String>, String> {
     // the retired underline spelling is preserved but resolves to a bar).
     if let Some(style) = config.cursor_style.as_deref() {
         let normalized = style.trim().to_ascii_lowercase();
-        if normalized == "underline" {
-            warnings.push(
-                "cursor_style = \"underline\" is retired and renders as \"bar\"; use \"bar\" explicitly"
-                    .to_string(),
-            );
+        if let Some(note) = crate::native_config_language::retired_but_resolving_note(
+            crate::prefs::EDIT_CURSOR_STYLE,
+            style,
+        ) {
+            warnings.push(note);
         } else if !matches!(normalized.as_str(), "block" | "bar" | "beam") {
             warnings.push(format!(
                 "cursor_style: expected block|bar, got {style:?} (block used at load)"
             ));
         }
     }
+    // The retired `native` hinting spelling still loads and renders as `light`
+    // (TF.2b): the same sentence Manual shows.
+    if let Some(note) = config.font_hinting.as_deref().and_then(|hinting| {
+        crate::native_config_language::retired_but_resolving_note("font_hinting", hinting)
+    }) {
+        warnings.push(note);
+    }
     // Retired face ids load (renamed ones as their successor, a deleted one as
     // nothing), so the enum walk below accepts them; say what each draws.
     warnings.extend(crate::app_config::display_font_notices(&config));
-    // Hex colours: every colour-typed key the loaders parse-or-skip.
+    // Hex colours: the theme colour keys as the resolver read them (its
+    // palette entries are a semantic warning above), then the other
+    // colour-typed keys the loaders parse-or-skip.
+    warnings.extend(
+        config
+            .color_issues()
+            .into_iter()
+            .filter(|issue| !issue.key.starts_with("palette["))
+            .map(|issue| format!("{issue} (ignored at load)")),
+    );
     for (key, value) in [
-        ("foreground", config.foreground.as_deref()),
-        ("background", config.background.as_deref()),
-        ("cursor_color", config.cursor_color.as_deref()),
-        ("selection_color", config.selection_color.as_deref()),
-        (
-            "selection_foreground",
-            config.selection_foreground.as_deref(),
-        ),
         ("cursor_trail_color", config.cursor_trail_color.as_deref()),
         ("cursor_trail_accent", config.cursor_trail_accent.as_deref()),
     ] {
         if let Some(s) = value
-            && crate::app_config::parse_hex_color(s).is_none()
+            && aterm_types::scheme::parse_hex(s).is_none()
         {
             warnings.push(format!(
-                "{key}: expected #RRGGBB, got {s:?} (ignored at load)"
+                "{key}: expected #RRGGBB or #RGB, got {s:?} (ignored at load)"
             ));
         }
     }
-    // A malformed appearance split still applies the side it can read, and the
-    // side it cannot draws Default (`app_config::resolve_theme_name_value`) —
-    // the same selector Manual marks as an error.
-    if let Some(theme) = config.theme.as_deref()
-        && theme.contains(':')
-        && let Err(message) = crate::native_config_language::theme_names(theme)
-    {
-        let defaulted = [
-            (aterm_types::Appearance::Dark, "dark"),
-            (aterm_types::Appearance::Light, "light"),
-        ]
-        .into_iter()
-        .filter(|(appearance, _)| config.resolve_theme_name(*appearance).is_none())
-        .map(|(_, side)| side)
-        .collect::<Vec<_>>();
-        warnings.push(match defaulted.as_slice() {
-            [] => message,
-            [side] => format!("{message}; {side} mode uses Default"),
-            _ => format!("{message}; both modes use Default"),
-        });
-    }
+    // A malformed appearance split still draws what it can read
+    // (`app_config::resolve_theme_name_value`); the notice names each issue and
+    // what the affected mode draws — the same selector Manual marks as an error.
+    warnings.extend(crate::app_config::theme_selector_notice(
+        config.theme.as_deref(),
+    ));
     warnings.extend(
         config_host_semantic_warnings(&config)
             .into_iter()
@@ -2323,38 +2323,412 @@ pub(crate) fn list_fonts() -> String {
     s
 }
 
-/// `--list-themes`: every built-in colour scheme as `name — description`, the
-/// `"Default"` first, from the single registry (`scheme::builtin_themes`), then
-/// the custom themes in the themes folder, which it names (one that did not
-/// load says why). These are the names accepted by `theme = "<name>"`.
-pub(crate) fn list_themes() -> String {
-    let mut s = String::new();
-    let _ = writeln!(s, "built-in themes (set via `theme = \"<name>\"`):");
-    for (name, desc) in aterm_types::scheme::builtin_themes() {
-        let _ = writeln!(s, "  {name} — {desc}");
+/// How [`theme_list_report`] prints: a padded table for a person, or
+/// tab-separated rows for a script (the stable form: a header row naming
+/// [`THEME_LIST_TSV_COLUMNS`], then one row per theme with exactly that many
+/// fields, then `#`-led trailer lines for the folder and any truncation).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThemeListFormat {
+    /// Aligned columns, a reason or warning on an indented line under its row.
+    Text,
+    /// Tab-separated values with a fixed column count.
+    Tsv,
+}
+
+/// The `--format tsv` columns, in order. `notes` is a non-loading row's reason
+/// or a loaded row's admission warnings (`; `-joined); an absent value is an
+/// empty field.
+pub(crate) const THEME_LIST_TSV_COLUMNS: [&str; 9] = [
+    "id",
+    "label",
+    "appearance",
+    "appearance_source",
+    "pair",
+    "source",
+    "status",
+    "notes",
+    "description",
+];
+
+/// One theme the listing names: a built-in, or a row of the themes folder.
+struct ThemeListRow {
+    /// What `theme = "<id>"` takes (a file's stem, a built-in's name).
+    id: String,
+    /// What a person sees: a file's `name =`, else the id.
+    label: String,
+    /// `None` for a file that did not load (nothing was measured).
+    appearance: Option<aterm_types::Appearance>,
+    measured: bool,
+    pair: Option<String>,
+    builtin: bool,
+    /// `ready`, `invalid`, `shadowed` or `unreadable`.
+    status: &'static str,
+    /// The reason a row did not load, or a loaded row's warnings.
+    notes: Vec<String>,
+    description: Option<String>,
+}
+
+impl ThemeListRow {
+    fn of_meta(id: &str, meta: aterm_types::scheme::ThemeMeta, builtin: bool) -> Self {
+        Self {
+            id: id.to_string(),
+            label: meta.display_name,
+            appearance: Some(meta.appearance),
+            measured: meta.appearance_source == aterm_types::scheme::AppearanceSource::Measured,
+            pair: meta.pair,
+            builtin,
+            status: "ready",
+            notes: meta.warnings.iter().map(ToString::to_string).collect(),
+            description: meta.description,
+        }
     }
-    if let Some(dir) = aterm_types::scheme::user_theme_dir() {
-        list_custom_themes(&mut s, &dir);
+}
+
+/// Every theme a config can name or a person should know about: the built-ins
+/// first (`Default` leading, from the one registry), then each row the
+/// catalog kept for the themes folder, loaded or not. `appearance` keeps only
+/// the themes drawn for it (a file that did not load has none, so it drops).
+fn theme_list_rows(
+    catalog: &crate::app_config::ThemeCatalog,
+    appearance: Option<aterm_types::Appearance>,
+) -> Vec<ThemeListRow> {
+    let builtins = aterm_types::scheme::builtin_theme_list()
+        .into_iter()
+        .map(|theme| {
+            ThemeListRow::of_meta(
+                theme.name,
+                aterm_types::scheme::ThemeMeta::of_builtin(theme),
+                true,
+            )
+        });
+    let files = catalog.listing().map(|(name, status)| {
+        use crate::app_config::ThemeEntryStatus;
+        let meta = match status {
+            ThemeEntryStatus::Ready => catalog.meta(name),
+            _ => None,
+        };
+        if let Some(meta) = meta {
+            return ThemeListRow::of_meta(name, meta, false);
+        }
+        let label = match status {
+            ThemeEntryStatus::Ready => "ready",
+            ThemeEntryStatus::Invalid(_) => "invalid",
+            ThemeEntryStatus::Shadowed(_) => "shadowed",
+            ThemeEntryStatus::Unreadable => "unreadable",
+        };
+        ThemeListRow {
+            id: name.to_string(),
+            label: name.to_string(),
+            appearance: None,
+            measured: false,
+            pair: None,
+            builtin: false,
+            status: label,
+            notes: status.reason().into_iter().collect(),
+            description: None,
+        }
+    });
+    builtins
+        .chain(files)
+        .filter(|row| appearance.is_none_or(|want| row.appearance == Some(want)))
+        .collect()
+}
+
+/// The `theme list` control verb's rows over the live `catalog`: the same rows
+/// `aterm theme list` prints, one `theme …` line each with every text field
+/// quoted (`drawn=1` marks `drawn`, the theme on screen), then one `folder …`
+/// line for the themes folder and how much of it discovery read.
+pub(crate) fn theme_list_wire_rows(
+    catalog: &crate::app_config::ThemeCatalog,
+    dir: Option<&std::path::Path>,
+    drawn: &str,
+) -> Vec<String> {
+    let opt = |value: Option<&str>| value.map_or_else(|| "-".to_string(), |v| format!("{v:?}"));
+    let mut rows: Vec<String> = theme_list_rows(catalog, None)
+        .into_iter()
+        .map(|row| {
+            format!(
+                "theme id={:?} label={:?} appearance={} measured={} pair={} source={} \
+                 status={} drawn={} notes={} description={}",
+                row.id,
+                row.label,
+                row.appearance.map_or("-", appearance_word),
+                u8::from(row.measured),
+                opt(row.pair.as_deref()),
+                if row.builtin { "builtin" } else { "file" },
+                row.status,
+                u8::from(row.status == "ready" && row.id.eq_ignore_ascii_case(drawn)),
+                opt((!row.notes.is_empty())
+                    .then(|| row.notes.join("; "))
+                    .as_deref()),
+                opt(row.description.as_deref()),
+            )
+        })
+        .collect();
+    let limits = catalog.limits();
+    rows.push(format!(
+        "folder path={} kept={} seen={} truncated={}",
+        opt(dir.map(|d| d.display().to_string()).as_deref()),
+        limits.kept,
+        limits.seen,
+        u8::from(catalog.truncated()),
+    ));
+    rows
+}
+
+/// A listing field as printable text: a control character (a tab, a newline,
+/// an escape a hostile file name could carry) is shown escaped, so a field
+/// never splits a TSV row or drives the terminal it is printed to.
+fn listing_field(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for c in raw.chars() {
+        if c.is_control() {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// `aterm theme list`, `aterm list-themes` and `aterm --list-themes`: every
+/// built-in and every theme in the themes folder (each with its id, label,
+/// appearance, pair, source and status, a row that did not load saying why),
+/// then the folder itself and, when discovery stopped early, how much it read.
+/// `appearance` keeps only the themes drawn for it.
+#[must_use]
+pub fn theme_list_report(
+    appearance: Option<aterm_types::Appearance>,
+    format: ThemeListFormat,
+) -> String {
+    let dir = aterm_types::scheme::user_theme_dir();
+    let catalog = dir
+        .as_deref()
+        .map(crate::app_config::ThemeCatalog::discover_in)
+        .unwrap_or_default();
+    theme_list(&catalog, dir.as_deref(), appearance, format)
+}
+
+/// The theme `id` names (case-insensitive), by the window's own lookup: a
+/// built-in first, then a themes-folder file that loaded and was admitted as
+/// the catalog admits it. What `aterm theme export` writes and `aterm theme
+/// new --from` starts from. `Err` says why there is none (no such theme, or
+/// the file that has the name did not load).
+///
+/// # Errors
+/// The reason no theme by that id can be had.
+pub fn theme_catalog_entry(id: &str) -> Result<aterm_types::scheme::CatalogTheme, String> {
+    // A built-in needs no look at the themes folder (and always wins there).
+    if let Some(builtin) = aterm_types::scheme::CatalogTheme::builtin(id) {
+        return Ok(builtin);
+    }
+    let catalog = aterm_types::scheme::user_theme_dir()
+        .as_deref()
+        .map(crate::app_config::ThemeCatalog::discover_in)
+        .unwrap_or_default();
+    catalog_theme(&catalog, id)
+}
+
+/// [`theme_catalog_entry`] for a themes-folder file, over a given catalog.
+fn catalog_theme(
+    catalog: &crate::app_config::ThemeCatalog,
+    id: &str,
+) -> Result<aterm_types::scheme::CatalogTheme, String> {
+    let scheme = catalog.resolve(id)?;
+    let (name, meta) = catalog
+        .ready_themes()
+        .find(|(name, _)| name.eq_ignore_ascii_case(id))
+        .ok_or_else(|| "no built-in or loaded custom theme by that name".to_string())?;
+    Ok(aterm_types::scheme::CatalogTheme {
+        id: name.to_string(),
+        theme: aterm_types::scheme::ParsedTheme {
+            scheme,
+            description: meta.description.clone(),
+            author: meta.author.clone(),
+            appearance_declared: meta.appearance_source
+                == aterm_types::scheme::AppearanceSource::Declared,
+        },
+        meta: meta.clone(),
+    })
+}
+
+/// The appearance a background measures as, by the one dark/light rule the
+/// catalog admits a theme file with (so `aterm theme check` measures a file
+/// exactly as the themes folder will).
+#[must_use]
+pub fn theme_measured_appearance(background: aterm_types::Rgb) -> aterm_types::Appearance {
+    crate::app_config::measured_appearance(background)
+}
+
+/// [`theme_list_report`] over a given catalog and folder.
+fn theme_list(
+    catalog: &crate::app_config::ThemeCatalog,
+    dir: Option<&std::path::Path>,
+    appearance: Option<aterm_types::Appearance>,
+    format: ThemeListFormat,
+) -> String {
+    let rows = theme_list_rows(catalog, appearance);
+    let truncated = catalog.truncated().then(|| catalog.limits());
+    match format {
+        ThemeListFormat::Tsv => theme_list_tsv(&rows, dir, truncated),
+        ThemeListFormat::Text => theme_list_text(&rows, dir, truncated),
+    }
+}
+
+fn appearance_word(appearance: aterm_types::Appearance) -> &'static str {
+    match appearance {
+        aterm_types::Appearance::Dark => "dark",
+        aterm_types::Appearance::Light => "light",
+    }
+}
+
+fn theme_list_tsv(
+    rows: &[ThemeListRow],
+    dir: Option<&std::path::Path>,
+    truncated: Option<crate::app_config::ThemeCatalogLimits>,
+) -> String {
+    let mut s = THEME_LIST_TSV_COLUMNS.join("\t");
+    s.push('\n');
+    for row in rows {
+        let fields: [String; THEME_LIST_TSV_COLUMNS.len()] = [
+            listing_field(&row.id),
+            listing_field(&row.label),
+            row.appearance
+                .map(appearance_word)
+                .unwrap_or_default()
+                .to_string(),
+            match (row.appearance, row.measured) {
+                (None, _) => "",
+                (Some(_), true) => "measured",
+                (Some(_), false) => "declared",
+            }
+            .to_string(),
+            listing_field(row.pair.as_deref().unwrap_or_default()),
+            if row.builtin { "builtin" } else { "file" }.to_string(),
+            row.status.to_string(),
+            listing_field(&row.notes.join("; ")),
+            listing_field(row.description.as_deref().unwrap_or_default()),
+        ];
+        s.push_str(&fields.join("\t"));
+        s.push('\n');
+    }
+    let folder = dir.map(|d| listing_field(&d.display().to_string()));
+    let _ = writeln!(s, "#folder\t{}", folder.unwrap_or_default());
+    if let Some(limits) = truncated {
+        let _ = writeln!(
+            s,
+            "#truncated\t{}\t{}\t{}\t{}",
+            limits.kept,
+            limits.seen,
+            crate::app_config::MAX_USER_THEME_FILES,
+            crate::app_config::MAX_USER_THEME_DIRECTORY_ENTRIES,
+        );
     }
     s
 }
 
-/// The custom-theme half of [`list_themes`]: the folder a `<name>.conf` goes in,
-/// every theme in it that loaded, and each one that did not, with the reason.
-fn list_custom_themes(s: &mut String, dir: &std::path::Path) {
-    let catalog = crate::app_config::ThemeCatalog::discover_in(dir);
-    let _ = writeln!(s, "\ncustom themes (<name>.conf in {}):", dir.display());
-    let mut any = false;
-    for (name, not_loaded) in catalog.listing() {
-        any = true;
-        let _ = match not_loaded {
-            None => writeln!(s, "  {name}"),
-            Some(reason) => writeln!(s, "  {name} — not loaded: {reason}"),
+/// A text column is padded to its widest cell, but never past this, so one
+/// long file name pushes only its own row out of line.
+const THEME_LIST_MAX_COLUMN: usize = 28;
+
+fn theme_list_text(
+    rows: &[ThemeListRow],
+    dir: Option<&std::path::Path>,
+    truncated: Option<crate::app_config::ThemeCatalogLimits>,
+) -> String {
+    const HEADER: [&str; 7] = [
+        "ID",
+        "LABEL",
+        "APPEARANCE",
+        "PAIR",
+        "SOURCE",
+        "STATUS",
+        "DESCRIPTION",
+    ];
+    let cells: Vec<[String; 7]> = rows
+        .iter()
+        .map(|row| {
+            let appearance = match row.appearance {
+                None => "-".to_string(),
+                Some(a) if row.measured => format!("{} (measured)", appearance_word(a)),
+                Some(a) => appearance_word(a).to_string(),
+            };
+            [
+                listing_field(&row.id),
+                listing_field(&row.label),
+                appearance,
+                listing_field(row.pair.as_deref().unwrap_or("-")),
+                if row.builtin { "built-in" } else { "file" }.to_string(),
+                row.status.to_string(),
+                listing_field(row.description.as_deref().unwrap_or_default()),
+            ]
+        })
+        .collect();
+    // Every column but the last (free text) is padded to its widest cell.
+    let mut widths = HEADER.map(str::len);
+    for cell in &cells {
+        for (width, text) in widths.iter_mut().zip(cell.iter()) {
+            *width = (*width).max(text.chars().count().min(THEME_LIST_MAX_COLUMN));
+        }
+    }
+    let line = |cells: &[String]| -> String {
+        let mut out = String::new();
+        let last = cells.len() - 1;
+        for (index, (text, width)) in cells.iter().zip(widths).enumerate() {
+            if index == last {
+                out.push_str(text);
+            } else {
+                let pad = width.saturating_sub(text.chars().count());
+                out.push_str(text);
+                out.extend(std::iter::repeat_n(' ', pad + 2));
+            }
+        }
+        out.trim_end().to_string()
+    };
+    let mut s = String::from(
+        "themes (set one with theme = \"<id>\" in aterm.toml; \"dark:<id>,light:<id>\" follows \
+         the system):\n",
+    );
+    let _ = writeln!(s, "{}", line(&HEADER.map(str::to_string)));
+    for (row, cell) in rows.iter().zip(&cells) {
+        let _ = writeln!(s, "{}", line(cell));
+        let lead = if row.status == "ready" {
+            "warning"
+        } else {
+            "not loaded"
         };
+        for note in &row.notes {
+            let _ = writeln!(s, "    {lead}: {}", listing_field(note));
+        }
     }
-    if !any {
-        let _ = writeln!(s, "  (none loaded)");
+    match dir {
+        Some(dir) => {
+            let _ = writeln!(
+                s,
+                "\nthemes folder: {} (a <id>.conf there is a theme; `aterm theme import <file>` \
+                 converts another terminal's)",
+                listing_field(&dir.display().to_string())
+            );
+        }
+        None => {
+            let _ = writeln!(
+                s,
+                "\nthemes folder: none (no config directory could be found)"
+            );
+        }
     }
+    if let Some(limits) = truncated {
+        let _ = writeln!(
+            s,
+            "truncated: read {} of the {} .conf files seen; aterm reads at most {} theme files \
+             and inspects at most {} folder entries",
+            limits.kept,
+            limits.seen,
+            crate::app_config::MAX_USER_THEME_FILES,
+            crate::app_config::MAX_USER_THEME_DIRECTORY_ENTRIES,
+        );
+    }
+    s
 }
 
 /// `--list-keybinds`: the keybinding surface. First the BUILT-IN default chords
@@ -2480,26 +2854,35 @@ fn user_keybinding_note_for(action: &str, shadow: Option<&'static str>) -> Strin
 
 /// `--show-config`'s theme line: the configured value, followed by the theme each
 /// appearance draws whenever that is not the name the value gives it (a name that
-/// does not load, or a side the value leaves out, draws Default).
+/// does not load draws Default; a side the value leaves out draws the named one's
+/// pair; no name at all draws the unset default, which follows the OS).
 fn show_config_theme(
     config: &crate::app_config::Config,
     themes: &crate::app_config::ThemeCatalog,
 ) -> String {
-    let Some(raw) = config.theme.clone() else {
-        return "Default".to_string();
-    };
-    let named = [
+    use crate::app_config::unset_theme_name;
+    let sides = [
         aterm_types::Appearance::Dark,
         aterm_types::Appearance::Light,
-    ]
-    .map(|appearance| config.resolve_theme_name(appearance));
-    let drawn = named.clone().map(|name| {
-        name.filter(|name| name.eq_ignore_ascii_case("default") || themes.resolve(name).is_ok())
+    ];
+    let Some(raw) = config.theme.clone() else {
+        let [dark, light] = sides.map(unset_theme_name);
+        return format!("unset (in use: dark {dark}, light {light})");
+    };
+    let named = sides.map(|appearance| config.resolve_theme_name(appearance));
+    let drawn = sides.map(|appearance| match config.resolve_theme_name(appearance) {
+        None => unset_theme_name(appearance).to_string(),
+        Some(name) if name.eq_ignore_ascii_case("default") || themes.resolve(&name).is_ok() => name,
+        Some(_) => "Default".to_string(),
     });
-    if drawn == named && named.iter().all(Option::is_some) {
+    if named
+        .iter()
+        .zip(&drawn)
+        .all(|(named, drawn)| named.as_deref() == Some(drawn.as_str()))
+    {
         return raw;
     }
-    let [dark, light] = drawn.map(|name| name.unwrap_or_else(|| "Default".to_string()));
+    let [dark, light] = drawn;
     if dark == light {
         format!("{raw} ({dark} in use)")
     } else {
@@ -2551,7 +2934,7 @@ fn show_config_report(launch_failure: Option<&str>) -> String {
         aterm_types::Appearance::Dark,
         aterm_types::Appearance::Light,
     ]
-    .map(|appearance| config.applied_terminal_config_for_with_assets(appearance, &themes));
+    .map(|appearance| config.resolved_colors(appearance, &themes, None));
     // The same effective resolution and admission the renderer uses (`--font` >
     // config > platform default), so `--show-config` reports the face that actually
     // loads — on a pristine config, or a family that does not load, that is
@@ -2621,14 +3004,50 @@ fn show_config_report(launch_failure: Option<&str>) -> String {
     let _ = writeln!(
         s,
         "foreground:     {}",
-        appearance_colours(dark.default_foreground, light.default_foreground)
+        appearance_colours(dark.scheme.foreground, light.scheme.foreground)
     );
     let _ = writeln!(
         s,
         "background:     {}",
-        appearance_colours(dark.default_background, light.default_background)
+        appearance_colours(dark.scheme.background, light.scheme.background)
+    );
+    let _ = writeln!(
+        s,
+        "colour source:  {}",
+        appearance_labels(color_source_label(&dark), color_source_label(&light))
     );
     s
+}
+
+/// Where one appearance's colours come from: the theme drawn and its source,
+/// then the `aterm.toml` keys that override its slots and the values that were
+/// ignored.
+fn color_source_label(resolved: &crate::resolved_colors::ResolvedColors) -> String {
+    use crate::resolved_colors::ThemeSource;
+    let mut label = match &resolved.source {
+        ThemeSource::Builtin => format!("{} (built-in)", resolved.id),
+        ThemeSource::File(id) => format!("{id} (themes folder)"),
+        ThemeSource::DefaultFallback { reason } => format!("Default (fallback: {reason})"),
+    };
+    let keys = resolved.config_keys();
+    if !keys.is_empty() {
+        let _ = write!(label, "; config sets {}", keys.join(", "));
+    }
+    if !resolved.issues.is_empty() {
+        let ignored: Vec<&str> = resolved.issues.iter().map(|i| i.key.as_str()).collect();
+        let _ = write!(label, "; ignored {}", ignored.join(", "));
+    }
+    label
+}
+
+/// One `--show-config` text row: the value once when both appearances agree,
+/// else each, labelled.
+fn appearance_labels(dark: String, light: String) -> String {
+    if dark == light {
+        dark
+    } else {
+        format!("{dark} (dark) / {light} (light)")
+    }
 }
 
 /// One `--show-config` colour row: a single `#RRGGBB` when both OS appearances
@@ -3998,11 +4417,15 @@ ink = "rainbow"
         // that draws Default, as Manual marks the selector.
         assert_eq!(
             validate_config_text("theme = \"dark:Nord,lite:Dracula\"\n").expect("valid"),
-            ["theme split mode \"lite\" must be dark or light; light mode uses Default"]
+            ["theme split mode \"lite\" must be dark or light; light mode uses \"Nord\""]
         );
         assert_eq!(
             validate_config_text("theme = \"dark:,light:\"\n").expect("valid"),
-            ["theme split mode dark needs a theme name; both modes use Default"]
+            [
+                "theme split mode dark needs a theme name; theme split mode light needs a \
+                 theme name; the unset default is used (Default in dark mode, Default Light \
+                 in light mode)"
+            ]
         );
 
         // Retired display-face ids load, so the enum walk accepts them; the
@@ -4036,6 +4459,12 @@ ink = "rainbow"
                 "cursor_style = \"underline\" is retired and renders as \"bar\"; use \"bar\" explicitly"
             ]
         );
+
+        // TF.2b: `native` hinting loads, is told once, and names what renders.
+        let native = validate_config_text("font_hinting = \"native\"\n")
+            .expect("the retired hinting spelling remains loadable");
+        assert_eq!(native.len(), 1, "{native:?}");
+        assert!(native[0].contains("\"light\""), "{native:?}");
     }
 
     /// The mistake that most often sends someone to `--validate-config` is the
@@ -4230,29 +4659,6 @@ ink = "rainbow"
         }
     }
 
-    /// The one line that would have named the v0.72.0 launch crash in the
-    /// cut's own transcript: which claimed protocols the host lacks.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn report_names_the_protocols_the_host_does_not_register() {
-        let r = sample().render();
-        assert!(
-            r.contains(
-                "objc:      protocols this host does not register: NSApplicationDelegate \
-                 (aterm supplies a name-only stand-in at declaration)"
-            ),
-            "the absent protocol is named: {r}"
-        );
-        let mut all_present = sample();
-        all_present.objc_protocols_absent.clear();
-        assert!(
-            all_present
-                .render()
-                .contains("objc:      every claimed protocol is registered by this host"),
-            "and the cutter's shape says so too"
-        );
-    }
-
     /// The pinned list IS the union of every `protocols:` list in the shipped
     /// window layer — read from the sources, every `.rs` file under both roots
     /// including subdirectories and `#[cfg(test)]` probes (a test-only claim
@@ -4278,7 +4684,7 @@ ink = "rainbow"
         let mut files = Vec::new();
         rs_files(&root.join("src"), &mut files);
         rs_files(
-            &root.join("../../vendor/winit/src/platform_impl/macos"),
+            &root.join("../aterm-window/src/platform_impl/macos"),
             &mut files,
         );
         let mut claimed = std::collections::BTreeSet::new();
@@ -4746,13 +5152,6 @@ ink = "rainbow"
     }
 
     #[test]
-    fn empty_env_renders_placeholder() {
-        let mut d = sample();
-        d.env.clear();
-        assert!(d.render().contains("(no ATERM_* variables set)"));
-    }
-
-    #[test]
     fn collect_enumerates_every_capability() {
         let d = collect();
         // All 16 advertised capabilities are surfaced (no silent omission).
@@ -4764,58 +5163,244 @@ ink = "rainbow"
         assert_eq!(d.compiler, crate::build_info::compiler_summary());
     }
 
-    #[test]
-    fn list_themes_lists_every_builtin_default_first() {
-        let out = list_themes();
-        assert!(out.contains("built-in themes"), "header present");
-        // Default is first and every registry name appears with a description.
-        assert!(out.contains("Default — "), "Default themed first");
-        for name in aterm_types::scheme::builtin_names() {
-            assert!(out.contains(name), "{name} must be listed");
-        }
+    /// A scratch themes folder for one listing test.
+    fn theme_list_scratch(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("aterm-theme-list-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
-    /// The custom half names the folder a theme goes in, each theme that
-    /// loaded from it and each one that did not, with the reason; an empty or
-    /// absent folder says nothing loaded.
+    /// The TSV rows (header and `#` trailers dropped), split into fields.
+    fn tsv_rows(out: &str) -> Vec<Vec<&str>> {
+        out.lines()
+            .skip(1)
+            .filter(|line| !line.starts_with('#'))
+            .map(|line| line.split('\t').collect())
+            .collect()
+    }
+
+    fn tsv_field<'a>(row: &[&'a str], column: &str) -> &'a str {
+        let index = THEME_LIST_TSV_COLUMNS
+            .iter()
+            .position(|c| *c == column)
+            .expect("a listing column");
+        row[index]
+    }
+
+    /// `theme export` / `theme new --from` see a theme as the catalog does:
+    /// a built-in with its description and declared appearance, a loaded
+    /// file under its stem with its own text and the measured appearance it
+    /// was admitted with (not declared, so an export leaves `appearance` out
+    /// again), and a file that did not load is refused with its reason.
     #[test]
-    fn list_themes_names_the_custom_folder_and_its_loaded_themes() {
-        let dir = std::env::temp_dir().join(format!("aterm-list-themes-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let mut empty = String::new();
-        list_custom_themes(&mut empty, &dir);
-        assert_eq!(
-            empty,
-            format!(
-                "\ncustom themes (<name>.conf in {}):\n  (none loaded)\n",
-                dir.display()
-            )
-        );
-        std::fs::create_dir_all(&dir).unwrap();
+    fn catalog_theme_is_the_catalogs_view_of_a_theme() {
+        let dir = theme_list_scratch("entry");
         std::fs::write(
-            dir.join("Work.conf"),
+            dir.join("Paper.conf"),
+            "name = Paper Day\nauthor = Me\nforeground = #202020\nbackground = #f4f4f0\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("Broken.conf"), "foreground = #ffffff\n").unwrap();
+        let catalog = crate::app_config::ThemeCatalog::discover_in(&dir);
+
+        let paper = catalog_theme(&catalog, "paper").expect("a loaded file");
+        assert_eq!(paper.id, "Paper");
+        assert_eq!(paper.meta.display_name, "Paper Day");
+        assert_eq!(paper.theme.author.as_deref(), Some("Me"));
+        assert!(!paper.theme.appearance_declared);
+        assert_eq!(paper.meta.appearance, aterm_types::Appearance::Light);
+        assert_eq!(
+            paper.theme.scheme.appearance,
+            aterm_types::Appearance::Light
+        );
+        assert_eq!(
+            theme_measured_appearance(paper.theme.scheme.background),
+            aterm_types::Appearance::Light
+        );
+
+        let broken = catalog_theme(&catalog, "Broken").expect_err("did not load");
+        assert!(broken.contains("Broken"), "{broken}");
+        assert!(catalog_theme(&catalog, "Absent").is_err());
+        // A built-in is answered without the folder.
+        let nord = theme_catalog_entry("nord").expect("a built-in");
+        assert_eq!(nord.id, "Nord");
+        assert!(nord.theme.appearance_declared);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// One row per built-in and per catalog row, `Default` first, in both
+    /// formats; a loaded file carries its label and measured appearance, a
+    /// refused one its reason, and one named like a built-in is listed as
+    /// shadowed rather than dropped.
+    #[test]
+    fn the_theme_list_has_one_row_per_theme_default_first() {
+        let dir = theme_list_scratch("rows");
+        let theme = "foreground = #e0e0e0\nbackground = #101010\n";
+        std::fs::write(dir.join("Work.conf"), format!("name = Work Night\n{theme}")).unwrap();
+        std::fs::write(dir.join("Broken.conf"), "foreground = #ffffff\n").unwrap();
+        std::fs::write(dir.join("Nord.conf"), theme).unwrap();
+        let catalog = crate::app_config::ThemeCatalog::discover_in(&dir);
+        let builtins = aterm_types::scheme::builtin_theme_list();
+        let expected = builtins.len() + catalog.listing().count();
+        assert_eq!(catalog.listing().count(), 3, "every file has a catalog row");
+
+        let tsv = theme_list(&catalog, Some(&dir), None, ThemeListFormat::Tsv);
+        assert_eq!(
+            tsv.lines().next(),
+            Some(THEME_LIST_TSV_COLUMNS.join("\t").as_str()),
+            "the header names the columns"
+        );
+        let rows = tsv_rows(&tsv);
+        assert_eq!(rows.len(), expected, "{tsv}");
+        assert_eq!(tsv_field(&rows[0], "id"), "Default", "{tsv}");
+        for (row, builtin) in rows.iter().zip(&builtins) {
+            assert_eq!(tsv_field(row, "id"), builtin.name);
+            assert_eq!(tsv_field(row, "source"), "builtin");
+            assert_eq!(tsv_field(row, "pair"), builtin.pair.unwrap_or_default());
+        }
+        let file = |id: &str| {
+            rows.iter()
+                .find(|row| tsv_field(row, "id") == id && tsv_field(row, "source") == "file")
+                .unwrap_or_else(|| panic!("no file row {id}: {tsv}"))
+        };
+        let work = file("Work");
+        assert_eq!(tsv_field(work, "label"), "Work Night");
+        assert_eq!(tsv_field(work, "appearance"), "dark");
+        assert_eq!(tsv_field(work, "appearance_source"), "measured");
+        assert_eq!(tsv_field(work, "status"), "ready");
+        let broken = file("Broken");
+        assert_eq!(tsv_field(broken, "status"), "invalid");
+        assert!(!tsv_field(broken, "notes").is_empty(), "a refusal says why");
+        assert_eq!(tsv_field(broken, "appearance"), "");
+        let nord = file("Nord");
+        assert_eq!(tsv_field(nord, "status"), "shadowed");
+        assert!(!tsv_field(nord, "notes").is_empty());
+        assert_eq!(
+            tsv.lines().last(),
+            Some(format!("#folder\t{}", dir.display()).as_str()),
+            "the folder closes the listing"
+        );
+
+        // The text form: title, column header, then the same rows in the same
+        // order, a non-loading row followed by its reason.
+        let text = theme_list(&catalog, Some(&dir), None, ThemeListFormat::Text);
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[1].starts_with("ID "), "{text}");
+        let row_ids: Vec<&str> = lines[2..]
+            .iter()
+            .take_while(|line| !line.is_empty())
+            .filter(|line| !line.starts_with(' '))
+            .map(|line| line.split("  ").next().unwrap_or_default())
+            .collect();
+        let tsv_ids: Vec<&str> = rows.iter().map(|row| tsv_field(row, "id")).collect();
+        assert_eq!(row_ids, tsv_ids, "{text}");
+        let broken_at = lines
+            .iter()
+            .position(|line| line.starts_with("Broken "))
+            .expect("broken row");
+        assert!(
+            lines[broken_at + 1].starts_with("    ") && lines[broken_at + 1].len() > 8,
+            "the reason follows its row: {text}"
+        );
+        assert!(text.contains(&dir.display().to_string()), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every TSV row has exactly the header's field count, a file name
+    /// carrying a tab or an escape included; the negative control shows such
+    /// a name would have split the row unescaped.
+    #[test]
+    fn every_tsv_row_has_the_header_column_count() {
+        let dir = theme_list_scratch("tsv");
+        let hostile = "Tab\there\u{1b}[31m";
+        std::fs::write(
+            dir.join(format!("{hostile}.conf")),
             "foreground = #e0e0e0\nbackground = #101010\n",
         )
         .unwrap();
-        let mut listed = String::new();
-        list_custom_themes(&mut listed, &dir);
-        assert_eq!(
-            listed,
-            format!(
-                "\ncustom themes (<name>.conf in {}):\n  Work\n",
-                dir.display()
-            )
+        std::fs::write(dir.join("Plain.conf"), "nonsense\twith\ttabs\n").unwrap();
+        let catalog = crate::app_config::ThemeCatalog::discover_in(&dir);
+        let tsv = theme_list(&catalog, Some(&dir), None, ThemeListFormat::Tsv);
+        let rows = tsv_rows(&tsv);
+        assert!(rows.len() > aterm_types::scheme::builtin_theme_list().len());
+        for row in &rows {
+            assert_eq!(row.len(), THEME_LIST_TSV_COLUMNS.len(), "{row:?}");
+        }
+        assert!(
+            !tsv.contains('\u{1b}'),
+            "no raw escape reaches the terminal"
         );
-        // A theme that does not parse is listed with its reason, never
-        // dropped into "(none loaded)".
-        std::fs::remove_file(dir.join("Work.conf")).unwrap();
+        assert!(hostile.split('\t').count() > 1, "negative control");
+        assert_eq!(listing_field(hostile).split('\t').count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `--appearance` keeps exactly the themes drawn for it; a file that did
+    /// not load has no appearance and drops out.
+    #[test]
+    fn the_appearance_filter_keeps_only_that_side() {
+        let dir = theme_list_scratch("side");
+        std::fs::write(
+            dir.join("Paper.conf"),
+            "foreground = #202020\nbackground = #fafafa\n",
+        )
+        .unwrap();
         std::fs::write(dir.join("Broken.conf"), "foreground = #ffffff\n").unwrap();
-        let mut broken = String::new();
-        list_custom_themes(&mut broken, &dir);
-        let header = format!("\ncustom themes (<name>.conf in {}):\n", dir.display());
-        let body = broken.strip_prefix(&header).expect("header first");
-        assert!(body.starts_with("  Broken — not loaded: "), "{broken}");
-        assert_eq!(body.lines().count(), 1, "{broken}");
+        let catalog = crate::app_config::ThemeCatalog::discover_in(&dir);
+        let all = tsv_rows(&theme_list(&catalog, None, None, ThemeListFormat::Tsv)).len();
+        let mut kept = 0;
+        for (side, word) in [
+            (aterm_types::Appearance::Light, "light"),
+            (aterm_types::Appearance::Dark, "dark"),
+        ] {
+            let tsv = theme_list(&catalog, None, Some(side), ThemeListFormat::Tsv);
+            let rows = tsv_rows(&tsv);
+            assert!(!rows.is_empty());
+            for row in &rows {
+                assert_eq!(tsv_field(row, "appearance"), word, "{tsv}");
+            }
+            kept += rows.len();
+        }
+        assert_eq!(kept + 1, all, "only the unloaded file drops out");
+        let light = theme_list(
+            &catalog,
+            None,
+            Some(aterm_types::Appearance::Light),
+            ThemeListFormat::Tsv,
+        );
+        assert!(light.lines().any(|l| l.starts_with("Paper\t")), "{light}");
+        assert!(
+            !light.lines().any(|l| l.starts_with("Default\t")),
+            "{light}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A folder holding more than discovery reads ends with a truncation
+    /// trailer naming how much it read; one within the caps has none.
+    #[test]
+    fn a_truncated_folder_says_so_in_both_formats() {
+        let dir = theme_list_scratch("cap");
+        let theme = "foreground = #e0e0e0\nbackground = #101010\n";
+        std::fs::write(dir.join("Only.conf"), theme).unwrap();
+        let small = crate::app_config::ThemeCatalog::discover_in(&dir);
+        let tsv = theme_list(&small, Some(&dir), None, ThemeListFormat::Tsv);
+        assert!(!tsv.lines().any(|l| l.starts_with("#truncated")), "{tsv}");
+        let cap = crate::app_config::MAX_USER_THEME_FILES;
+        for index in 0..=cap {
+            std::fs::write(dir.join(format!("Theme-{index:03}.conf")), theme).unwrap();
+        }
+        let catalog = crate::app_config::ThemeCatalog::discover_in(&dir);
+        let tsv = theme_list(&catalog, Some(&dir), None, ThemeListFormat::Tsv);
+        let trailer: Vec<&str> = tsv.lines().last().unwrap_or_default().split('\t').collect();
+        assert_eq!(trailer[0], "#truncated", "{tsv}");
+        assert_eq!(trailer[1], cap.to_string());
+        assert_eq!(trailer[2], (cap + 2).to_string());
+        let text = theme_list(&catalog, Some(&dir), None, ThemeListFormat::Text);
+        let last = text.lines().last().unwrap_or_default();
+        assert!(last.contains(&cap.to_string()) && last.contains(&(cap + 2).to_string()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5091,6 +5676,48 @@ ink = "rainbow"
         assert_eq!(show_config_font_px(24.0, true), "24 (explicit physical px)");
     }
 
+    /// `--show-config`'s colour source row names the theme each appearance
+    /// draws and where it came from, the config keys that override it, and
+    /// the values ignored; a split shows each side.
+    #[test]
+    fn show_config_colour_source_names_theme_and_overrides() {
+        let themes = crate::app_config::ThemeCatalog::default();
+        let config: crate::app_config::Config = aterm_toml::from_str(
+            "theme = \"dark:Dracula,light:no-such-theme\"\nforeground = \"#102030\"\n\
+             palette = [\"#010203\", \"nope\"]",
+        )
+        .unwrap();
+        let [dark, light] = [
+            aterm_types::Appearance::Dark,
+            aterm_types::Appearance::Light,
+        ]
+        .map(|appearance| {
+            super::color_source_label(&config.resolved_colors(appearance, &themes, None))
+        });
+        assert!(dark.starts_with("Dracula (built-in)"), "{dark}");
+        assert!(light.starts_with("Default (fallback: "), "{light}");
+        for side in [&dark, &light] {
+            assert!(
+                side.contains("config sets foreground, palette[0]"),
+                "{side}"
+            );
+            assert!(side.contains("ignored palette[1]"), "{side}");
+        }
+        let row = super::appearance_labels(dark.clone(), light.clone());
+        assert!(
+            row.contains(" (dark) / ") && row.ends_with(" (light)"),
+            "{row}"
+        );
+        // An unset theme with no colour keys says only the built-in.
+        let plain =
+            super::color_source_label(&crate::app_config::Config::default().resolved_colors(
+                aterm_types::Appearance::Dark,
+                &themes,
+                None,
+            ));
+        assert_eq!(plain, "Default (built-in)");
+    }
+
     /// `--show-config` is the resolved launch config, so a theme the window
     /// draws Default in place of says so beside the configured name.
     #[test]
@@ -5106,7 +5733,14 @@ ink = "rainbow"
             };
             show_config_theme(&config, &themes)
         };
-        assert_eq!(line(None), "Default");
+        assert_eq!(
+            line(None),
+            "unset (in use: dark Default, light Default Light)"
+        );
+        assert_eq!(
+            line(Some("dark:,light:")),
+            "dark:,light: (in use: dark Default, light Default Light)"
+        );
         assert_eq!(line(Some("Work")), "Work");
         assert_eq!(line(Some("Nord")), "Nord");
         assert_eq!(line(Some("dark:Nord,light:Work")), "dark:Nord,light:Work");
@@ -5115,9 +5749,10 @@ ink = "rainbow"
             line(Some("dark:Nord,light:Drakula")),
             "dark:Nord,light:Drakula (in use: dark Nord, light Default)"
         );
+        assert_eq!(line(Some("dark:Nord,lite:Work")), "dark:Nord,lite:Work");
         assert_eq!(
-            line(Some("dark:Nord,lite:Work")),
-            "dark:Nord,lite:Work (in use: dark Nord, light Default)"
+            line(Some("light:Drakula")),
+            "light:Drakula (Default in use)"
         );
     }
 
@@ -5155,23 +5790,6 @@ ink = "rainbow"
             renderer_label(resolve_want_gpu_with(false, false, None)),
             GPU_BACKEND_LABEL
         );
-    }
-
-    /// The label must name the backend this platform actually negotiates. Every
-    /// other assertion above compares against the constant itself and so cannot
-    /// see it being WRONG: Windows restricts wgpu to DX12
-    /// (`aterm_gpu::default_backends`) while the report said "vulkan", which is
-    /// the one line a bug reporter is asked to paste.
-    #[test]
-    fn the_backend_label_names_this_platform_s_backend() {
-        let want = if cfg!(target_os = "macos") {
-            "gpu (metal)"
-        } else if cfg!(windows) {
-            "gpu (dx12)"
-        } else {
-            "gpu (vulkan)"
-        };
-        assert_eq!(renderer_label(true), want);
     }
 
     #[test]

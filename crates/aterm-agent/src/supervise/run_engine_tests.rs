@@ -1,11 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-// The engine over the scripted server (`Mock`): the approval policy in the
-// loop, the press guard and fence, the wake on a ticking screen, the
-// lifecycle (a hold, a refusal, a stale badge, the end) and the escalation
-// (questions, the fabric's state), and the hosted entry. Included into
-// `run.rs`'s test module (`mod engine`), where `Mock` and its helpers live.
+// The engine over the scripted server (`Mock`): the approval policy in the loop, the press
+// guard and fence, the wake, the lifecycle, the escalation and the hosted entry. Included
+// into `run.rs`'s test module (`mod engine`), where `Mock` and its helpers live.
 
 use crate::supervise::policy::WorkerEnv;
 
@@ -60,11 +58,9 @@ fn ledger_rows(path: &Path) -> Vec<String> {
         .collect()
 }
 
-/// The swap: the box judged read-only is replaced by another between the
-/// loop's read and its press. The press is guarded by the judged row, so the
-/// server writes nothing (`OK skipped`); the loop reads again, decides the new
-/// box (a write) and hands it over. A generic guard (`Do.you.want.to.proceed`)
-/// would match the swapped box.
+/// A box swapped between the read and the press is not pressed: the press is guarded by the
+/// judged row, so the server writes nothing (`OK skipped`) and the new box is decided afresh.
+/// A generic guard (`Do.you.want.to.proceed`) would match the swapped box.
 #[test]
 fn a_box_swapped_between_the_read_and_the_press_is_not_pressed() {
     let (dir, notes) = notes_file("swap");
@@ -99,14 +95,12 @@ fn a_box_swapped_between_the_read_and_the_press_is_not_pressed() {
     assert!(bash_one_row().iter().any(|r| m.matches(r)));
 }
 
-/// A server that fences on the screen generation (`help key` names `if-gen=`,
-/// `text --json` carries `"gen"`): the press carries the judged read's
-/// generation; a row that ticked between read and press is `OK skipped
-/// reason=changed`, and the loop decides again and presses on the fresh
-/// read's generation. A screen that ticks under every press is handed over
-/// after five skips, never pressed with the fence dropped (the row guard binds
-/// only the box's first command row, which a swapped box can show). The probe
-/// reads a real `help key` answer (the fence named on a continuation row).
+/// A server that fences on the screen generation (`help key` names `if-gen=`, `text --json`
+/// carries `"gen"`): the press carries the judged read's generation, and a row that ticked
+/// meanwhile (`OK skipped reason=changed`) is decided again from a fresh read; a screen
+/// ticking under every press is handed over after five skips, never pressed unfenced (the row
+/// guard binds only the first command row). The probe reads the real `help key` text, wrapped
+/// as the server prints it.
 #[test]
 fn a_fenced_press_on_a_moved_screen_is_decided_again_from_a_fresh_read() {
     let help = aterm_types::control_verbs::spec("key")
@@ -158,10 +152,9 @@ fn a_fenced_press_on_a_moved_screen_is_decided_again_from_a_fresh_read() {
         "never unfenced: {presses:?}"
     );
 
-    // Negative controls. A server whose `help key` names no fence gets the
-    // row guard alone, as does one naming only `if-seq=`. A read with no
-    // generation sends no fence. A server that does not know the fence form
-    // (a bare `ERR`) is asked again without it, never unguarded.
+    // Negative controls: a `help key` naming no fence, or only `if-seq=`, gets the row guard
+    // alone; a read with no generation sends no fence; a bare `ERR` to the fence form is asked
+    // again without it, never unguarded.
     let mut m = Mock::new(true, vec![bash_one_row(), busy_screen(), idle_screen()]);
     m.sends_gen = true;
     let mut s = session(&mut m, None);
@@ -192,10 +185,9 @@ fn a_fenced_press_on_a_moved_screen_is_decided_again_from_a_fresh_read() {
     assert_eq!(presses[1], G_PRESS);
 }
 
-/// A disabled rule's limit reaches the box: under `approve = "safe"` a Read
-/// box of `/etc/hosts` (a system root) is pressed; with `read_outside_cwd =
-/// false` the same box goes to the manager. Likewise `rm_breaker = false`
-/// leaves the rm breaker no scratch root.
+/// A disabled rule's limit reaches the box: under `approve = "safe"` a Read of `/etc/hosts`
+/// is pressed, and with `read_outside_cwd = false` handed over; `rm_breaker = false` likewise
+/// leaves the breaker no scratch root.
 #[test]
 fn a_retired_key_takes_its_safe_rule_away_in_the_loop() {
     let read_box: Vec<String> = aterm_phase::prompt::fixtures::read_box()
@@ -230,17 +222,14 @@ fn a_retired_key_takes_its_safe_rule_away_in_the_loop() {
         "the safe rule proves it"
     );
     assert_eq!(run("[harness]\nread_outside_cwd = false\n"), 0);
-    // The breaker's roots go the same way (the rule itself is
-    // `approval_tests`'): the policy carries it to the context.
+    // `rm_breaker = false` reaches the context the same way (the rule is `approval_tests`').
     let (p, _) = SupervisorConfig::from_aterm_toml("[harness]\nrm_breaker = false\n");
     assert!(p.withheld.rm_breaker && p.approve == Approve::Safe, "{p:?}");
 }
 
-/// The wake: a box drawn where the busy footer was, under a screen that
-/// animates so `await idle` never latches, is read the moment the footer
-/// leaves: the busy read re-arms `await gone`, and no idle step comes between
-/// the busy read and the press. Negative control: an older host without
-/// `await gone` follows its busy read with `await idle 2000`.
+/// The wake: a box drawn where the busy footer was, under a screen that never holds still, is
+/// read the moment the footer leaves (`await gone`), with no idle step before the press.
+/// Negative control: an older host without `await gone` steps on `await idle 2000`.
 #[test]
 fn a_read_box_under_a_ticking_screen_is_approved_within_one_wake() {
     let mut m = Mock::new(
@@ -283,9 +272,8 @@ fn a_read_box_under_a_ticking_screen_is_approved_within_one_wake() {
             "help key",
         ]
     );
-    // "Within one wake" is the trace above: three `await gone` reads and no
-    // idle step before the press. The mock caps every wait at 50 ms, so the
-    // clock cannot show it; the minute bound is only a hang detector.
+    // "Within one wake" is the trace above; the mock caps every wait at 50 ms, so the clock
+    // cannot show it, and the minute bound is only a hang detector.
     assert!(elapsed < Duration::from_secs(60), "{elapsed:?}");
 
     let mut m = Mock::new(false, vec![busy_screen(), bash_one_row()]);
@@ -302,10 +290,9 @@ fn a_read_box_under_a_ticking_screen_is_approved_within_one_wake() {
     );
 }
 
-/// `ERR halted` (a `hold`) neither ends the watch nor is pressed through: the
-/// loop parks (`status hold=1`, then `await inbox since=0 kinds=hold`), and
-/// once `status` says `hold=0` it decides the box again and presses it.
-/// Journaled `HALTED` and `UNHALTED`; the refused press is a ledger row.
+/// `ERR halted` (a `hold`) parks the loop (`await inbox since=0 kinds=hold`) until `status`
+/// says `hold=0`, then the box is decided again and pressed; journaled `HALTED`/`UNHALTED`,
+/// the refused press ledgered.
 #[test]
 fn err_halted_parks_until_the_hold_lifts_and_the_loop_goes_on() {
     let (jdir, journal) = journal_file("halted");
@@ -384,11 +371,9 @@ fn err_halted_parks_until_the_hold_lifts_and_the_loop_goes_on() {
     );
 }
 
-/// A stale badge: a watch that starts over a `limited:` badge a previous
-/// watcher left, with the screen idle, unsets it before its first wait.
-/// Negative controls: another owner's badge is left alone (the key proves
-/// ownership, never the text); a badge of ours whose box is still up is
-/// adopted (no second badge or ask) and cleared when the box goes.
+/// A watch that starts over a stale `limited:` badge with the screen idle unsets it first.
+/// Negative controls: another owner's badge is left alone (the key proves ownership); ours
+/// over a box still up is adopted and cleared when the box goes.
 #[test]
 fn a_stale_attention_is_reconciled_at_the_start() {
     let (dir, journal) = journal_file("stale");
@@ -471,12 +456,9 @@ fn turn_of_rows(rows: &[String]) -> Turn {
     }
 }
 
-/// The rm breaker in the loop: in a bypass session (footer read before the
-/// box) with the session's cwd known (`meta`), a breaker whose every operand
-/// resolves under a scratch root is pressed under its command row and
-/// ledgered `rm-breaker@v3`; `S=/usr` escalates, badged `claude rm-breaker:
-/// <command> (<reason>)`. Negative controls: the same scratch command
-/// escalates with the cwd unknown, and outside bypass.
+/// The rm breaker in a bypass session with the cwd known: every operand under a scratch root,
+/// pressed and ledgered `rm-breaker@v3`; `S=/usr`, escalated. Negative controls: the cwd
+/// unknown, and outside bypass.
 #[test]
 fn the_rm_breaker_is_approved_under_a_scratch_root_and_escalated_otherwise() {
     let (ldir, ledger) = ledger_file("rm");
@@ -549,10 +531,9 @@ fn the_rm_breaker_is_approved_under_a_scratch_root_and_escalated_otherwise() {
     }
 }
 
-/// A variable from the environment: the safe rules escalate `rm -rf
-/// "$SCRATCH/t5"`, which the line does not assign, naming why, whatever this
-/// process's environment holds; the default presses it at full power,
-/// ledgered as the one-shot allow with that reason as `unproven`.
+/// An rm breaker on a variable from the environment (`rm -rf "$SCRATCH/t5"`, not assigned on
+/// the line) is escalated by the safe rules, naming why, and pressed at full power, ledgered
+/// as the one-shot allow with that reason `unproven`.
 #[test]
 fn a_breaker_on_an_environment_variable_is_escalated_proven_and_pressed_by_default() {
     const ENV_RM: &str = "rm -rf \"$SCRATCH/t5\"";
@@ -603,26 +584,17 @@ fn a_breaker_on_an_environment_variable_is_escalated_proven_and_pressed_by_defau
     let _ = std::fs::remove_dir_all(&ldir);
 }
 
-/// An idle bypass session as Claude Code draws it: a reply, the composer,
-/// and the footer that names the mode.
+/// An idle bypass session: a reply, the composer, and the footer naming the mode.
 fn bypass_idle() -> Vec<String> {
     let mut r = rows(&["⏺ Ready.", ""]);
     r.extend(composer("  ⏵⏵ bypass permissions on (shift+tab to cycle)"));
     r
 }
 
-/// The footer race: the rm breaker's bypass proof is the mode an earlier
-/// read's footer showed (a box is drawn where the footer was). An idle point
-/// read before that footer appeared (an agent still starting, or a frame
-/// between the composer and its footer row) must be waited on by its content
-/// ([`Session::agent_wake`]), since the server's verdict does not move on the
-/// frame that draws the footer (idle to idle); then the footer's frame is
-/// read and the breaker is pressed. The script's verdict passes over every
-/// frame whose phase is not waited for, as the server's does.
-///
-/// Negative control: a session whose footer was read at its first idle point
-/// is waited on by the verdict (one `await agent`), its idle twin passed over
-/// unread, and pressed the same.
+/// The footer race: the rm breaker's bypass proof is a footer an earlier read showed, so an
+/// idle point read before the footer appeared is waited on by its content
+/// ([`Session::agent_wake`]): the verdict does not move on the frame that draws the footer.
+/// Negative control: a footer read at the first idle point is waited on by the verdict.
 #[test]
 fn an_idle_point_read_before_the_footer_waits_for_the_footer_frame() {
     // Still starting: blank on the first read and again once the idle
@@ -655,8 +627,7 @@ fn an_idle_point_read_before_the_footer_waits_for_the_footer_frame() {
             "{why}: {:?}",
             m.requests
         );
-        // The point with no footer was waited on by its content, and the
-        // footer's frame by the verdict.
+        // The footerless point waited on by its content, the footer's frame by the verdict.
         let waits: Vec<&str> = m
             .requests
             .iter()
@@ -700,14 +671,9 @@ fn an_idle_point_read_before_the_footer_waits_for_the_footer_frame() {
     );
 }
 
-/// The content wait is the start's alone: it holds only until the session
-/// shows its mode or a busy frame. A busy footer names every mode but the
-/// default, so a session read busy with no mode named has no footer race
-/// left. A session that never names a mode gets the verdict wait back at its
-/// first busy read: the idle point after it is waited on by one `await
-/// agent`, and a screen change that moves no verdict wakes nothing. Negative
-/// control: the same idle point read before any busy frame is waited on by
-/// its content.
+/// The content wait is the start's alone: once a busy frame shows (a busy footer names every
+/// mode but the default), a session that names no mode gets the verdict wait back. Negative
+/// control: the idle point read before any busy frame is waited on by its content.
 #[test]
 fn a_session_naming_no_mode_gets_the_verdict_wait_back_at_its_first_busy_read() {
     let mut no_mode = idle_screen();
@@ -756,9 +722,8 @@ fn a_session_naming_no_mode_gets_the_verdict_wait_back_at_its_first_busy_read() 
 /// What tells [`park_as_worker`] to park.
 const WORKER_PARK: &str = "SUPERVISE_ENGINE_TEST_PARK";
 
-/// The stand-in worker's body: idle unless asked to park — past the minute
-/// [`StandIn::spawn`] may wait for it to start.
-/// Every [`StandIn`] is killed on drop.
+/// The stand-in worker's body: a no-op unless asked to park; parked, it sleeps 120 s, past
+/// the minute [`StandIn::spawn`] may wait for it to start. Every [`StandIn`] is killed on drop.
 #[test]
 fn park_as_worker() {
     if std::env::var_os(WORKER_PARK).is_some() {
@@ -837,8 +802,7 @@ fn zsh_snapshot(options: &str) -> String {
     )
 }
 
-/// Put one shell snapshot of a zsh started with `options` in the Claude
-/// Code directory `claude`.
+/// One shell snapshot of a zsh started with `options`, in the Claude Code directory `claude`.
 fn write_snapshot(claude: &Path, options: &str) {
     let dir = claude.join("shell-snapshots");
     std::fs::create_dir_all(&dir).expect("shell-snapshots");
@@ -849,18 +813,16 @@ fn write_snapshot(claude: &Path, options: &str) {
     .expect("snapshot");
 }
 
-/// A worker's scratch `$HOME` (never the developer's), whose Claude Code
-/// directory holds a snapshot of a zsh started with the defaults; removed when
-/// it drops, so the test holds it while its workers run.
+/// A worker's scratch `$HOME` (never the developer's), its Claude Code directory holding a
+/// default zsh snapshot; removed on drop, so the test holds it while its workers run.
 fn worker_home() -> crate::supervise::ScratchDir {
     let home = crate::supervise::ScratchDir::new("loop", "worker-home");
     write_snapshot(&home.join(".claude"), "");
     home
 }
 
-/// A worker's hermetic environment in the session `sid`: this process's
-/// `PATH`, no system or global git config, and `home` ([`worker_home`]) as its
-/// `$HOME`.
+/// A worker's hermetic environment in session `sid`: this process's `PATH`, no system or
+/// global git config, and `home` ([`worker_home`]) as `$HOME`.
 fn worker_vars(sid: &str, home: &Path) -> Vec<(String, String)> {
     vec![
         (
@@ -874,10 +836,8 @@ fn worker_vars(sid: &str, home: &Path) -> Vec<(String, String)> {
     ]
 }
 
-/// One `approve = "safe"` loop over a `git log` box in `cwd`, the session
-/// `3`/`sid` on the roster with `worker` as its foreground process, the
-/// worker read from the session ([`WorkerSource::Session`]): the presses and
-/// the approval ledger's rows (an escalation's carries its reason).
+/// One `approve = "safe"` loop over a `git log` box in `cwd`, `worker` the foreground process
+/// of session `3`/`sid` ([`WorkerSource::Session`]): the presses and the ledger's rows.
 fn judge_git_box_with(worker: &StandIn, sid: &str, cwd: &Path) -> (usize, Vec<String>) {
     let (ldir, ledger) = ledger_file(&format!("worker-{}", worker.pid()));
     let mut m = Mock::new(true, vec![bash_one_row()]);
@@ -912,12 +872,9 @@ fn judge_git_box_with(worker: &StandIn, sid: &str, cwd: &Path) -> (usize, Vec<St
     (m.presses().len(), rows)
 }
 
-/// The worker's own environment: a git box is judged in the environment the
-/// command will run with, the worker's, read from the session's foreground
-/// process (`who`'s `fgpgid=`, bound by its `ATERM_PARENT_SESSION_ID`), so the
-/// worker's own `GIT_CONFIG_*` is seen though this process has none. A process
-/// that names another session is not taken for the worker. Negative control:
-/// the same box, the worker without the variables, is pressed.
+/// A git box is judged in the worker's own environment, read from the session's foreground
+/// process (`who`'s `fgpgid=`, bound by `ATERM_PARENT_SESSION_ID`), so its `GIT_CONFIG_*` is
+/// seen; another session's process is no worker. Negative control: without them, pressed.
 #[test]
 fn a_git_box_is_judged_in_the_workers_own_environment() {
     let repo = loop_scratch("worker-env");
@@ -960,11 +917,9 @@ fn a_git_box_is_judged_in_the_workers_own_environment() {
     let _ = std::fs::remove_dir_all(&repo);
 }
 
-/// The worker's own Claude directory: where the Bash tool stands is read from
-/// the transcripts under the worker's `CLAUDE_CONFIG_DIR`, not this process's
-/// `~/.claude`. Negative control: the same worker without the variable (its
-/// `$HOME` holds no Claude directory) is judged by its launch directory
-/// alone, and pressed.
+/// Where the Bash tool stands is read from the transcripts under the worker's
+/// `CLAUDE_CONFIG_DIR`, not this process's `~/.claude`. Negative control: without the
+/// variable the worker is judged by its launch directory alone, and pressed.
 #[test]
 fn a_git_box_reads_the_transcripts_under_the_workers_claude_config_dir() {
     let root = loop_scratch("worker-claude-dir");
@@ -1035,12 +990,9 @@ fn a_git_box_reads_the_transcripts_under_the_workers_claude_config_dir() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// The worker's shell startup: a Bash box is judged under the options the
-/// worker's Bash tool's shell starts with (the shell snapshot in the worker's
-/// Claude Code directory), and an option the read-only classifier does not
-/// model (`setopt globsubst`) escalates the read, naming it. Negative control:
-/// with a default snapshot it is pressed (the first loop above); with no
-/// snapshot the startup is unknown, and escalated.
+/// A Bash box is judged under the worker's shell startup (the shell snapshot in its Claude
+/// Code directory): an option the classifier does not model (`setopt globsubst`), or no
+/// snapshot, escalates naming why; an inert option is pressed.
 #[test]
 fn a_bash_box_is_judged_under_the_workers_shell_startup() {
     let repo = loop_scratch("worker-shell");
@@ -1080,10 +1032,8 @@ fn a_bash_box_is_judged_under_the_workers_shell_startup() {
     let _ = std::fs::remove_dir_all(&repo);
 }
 
-/// Which `who` row is the session's, and the process group it names: by the
-/// `s-…` id the loop addresses where it has one, else by the local id
-/// `status` gave; refused when the group is unknown or another session's too,
-/// and when the roster is not one.
+/// The session's `who` row and its process group: by the addressed `s-…` id, else the local
+/// id `status` gave; refused when the group is unknown or shared, or the roster is not one.
 #[test]
 fn the_sessions_foreground_group_is_read_off_the_roster() {
     let rows = "0 s-aaaaaaaaaaaaaaaaaaaa driving=- watchers=1 turns=0 alive nonce=00 fgpgid=101\n\
@@ -1104,9 +1054,8 @@ fn the_sessions_foreground_group_is_read_off_the_roster() {
         group("OK 1\nnot a roster\n", None, Some("0")).is_err(),
         "no roster"
     );
-    // The stable id wins over a local one: a `status` another instance
-    // answered (local ids are per instance, and reused) cannot pick this
-    // session's row for it.
+    // The stable id wins over a local one: a `status` another instance answered (local ids
+    // are per instance, and reused) cannot pick this session's row.
     assert_eq!(
         group(rows, Some("s-eeeeeeeeeeeeeeeeeeee"), Some("0")),
         Ok(("s-eeeeeeeeeeeeeeeeeeee".to_string(), 505))
@@ -1121,13 +1070,9 @@ fn the_sessions_foreground_group_is_read_off_the_roster() {
     );
 }
 
-/// The addressed session: a loop that addresses its session by its `s-…` id
-/// binds the worker by that id (the row, and the process's
-/// `ATERM_PARENT_SESSION_ID`), not by the local id `status` answered, which
-/// another instance's session may hold. Here `status` names local `3`, a
-/// stranger's row; the addressed session is `2`'s, whose configuration is
-/// seen (escalated). Negative control: the same loop by local id alone takes
-/// the stranger's clean row and presses.
+/// A loop addressing its session by its `s-…` id binds the worker by that id, not by the
+/// local id `status` answered, which another instance's session may hold. Negative control:
+/// by local id alone it takes the stranger's row.
 #[test]
 fn a_loop_addressing_its_session_binds_the_worker_by_that_id() {
     let repo = loop_scratch("worker-stable-id");
@@ -1190,11 +1135,9 @@ fn a_loop_addressing_its_session_binds_the_worker_by_that_id() {
     let _ = std::fs::remove_dir_all(&repo);
 }
 
-/// Under `answer_questions = false` a question is escalated like a box
-/// (badged `claude question: <what was asked> (<why>; answer_questions is
-/// off)`, asked of the manager once while the fabric is connected), and the
-/// badge goes when the question does. With `fabric=absent` nothing is posted,
-/// and the journal says `mail=skipped: no fabric (fabric=absent)`.
+/// Under `answer_questions = false` a question is escalated like a box and asked of the
+/// manager once over a connected fabric; the badge goes with the question. With
+/// `fabric=absent` nothing is posted (`mail=skipped: no fabric`).
 #[test]
 fn a_question_escalates_and_mail_goes_only_over_a_connected_fabric() {
     for fabric in ["connected", "absent"] {
@@ -1292,11 +1235,9 @@ fn every_decision_is_a_ledger_row() {
     let _ = std::fs::remove_dir_all(&ldir);
 }
 
-/// The in-GUI host's entry: `SuperviseOpts::hosted()` is the unbounded watch
-/// with the policy on, and `run_hosted` ends (`Ok`, `EXIT stopped`) within one
-/// wait of its stop flag being set, clearing the badge it raised. The stop is
-/// set from another thread once the loop has reported the point, raised its
-/// badge and is watching past it ([`host_stops`]), not on a timer.
+/// `SuperviseOpts::hosted()` is the unbounded watch with the policy on, and `run_hosted` ends
+/// (`EXIT stopped`) within one wait of its stop flag, clearing the badge it raised; the stop
+/// is set once the loop watches past the point ([`host_stops`]).
 #[test]
 fn run_hosted_runs_until_it_is_stopped_and_clears_its_badge() {
     let hosted = SuperviseOpts::hosted();
@@ -1306,8 +1247,7 @@ fn run_hosted_runs_until_it_is_stopped_and_clears_its_badge() {
 
     let mut m = Mock::new(true, vec![question_screen()]);
     let (ldir, ledger) = ledger_file("hosted");
-    // `answer_questions = false`: a question is escalated, so a badge is raised and
-    // cleared (under full power it would be answered).
+    // A question escalated, so a badge is raised and cleared (full power would answer it).
     let limited = SuperviseOpts::hosted_with(&SupervisorConfig {
         answer_questions: false,
         ..SupervisorConfig::default()
@@ -1340,10 +1280,8 @@ fn run_hosted_runs_until_it_is_stopped_and_clears_its_badge() {
     assert_eq!(m.attention, None);
     let _ = std::fs::remove_dir_all(&ldir);
 
-    // A turn that never ends (the footer never leaves): the stop is seen in
-    // the wait for it, not only at a look — every wait the loop began was
-    // for the turn (`await gone` on the busy footer), the host stopped it
-    // there, and it ended within one wait of that.
+    // A turn that never ends: the stop is seen in the wait for it (`await gone` on the busy
+    // footer), not only at a look.
     let mut m = Mock::new(true, vec![busy_screen()]);
     let (ldir, ledger) = ledger_file("hosted-busy");
     let (r, lines) = host_stops(&mut m, None, ledger, &hosted, false);
@@ -1365,12 +1303,9 @@ fn run_hosted_runs_until_it_is_stopped_and_clears_its_badge() {
     let _ = std::fs::remove_dir_all(&ldir);
 }
 
-/// A stop that lands between the look and the write writes nothing: the stop
-/// flag is set while the loop decides the box it read (its `status` request,
-/// after the look's own stop check), and neither the guarded `1` nor any
-/// `send`/`turn`/`key` reaches the transport (`Session::call` refuses it). The
-/// run ends as a stop, not a failure. Negative control: the same box with no
-/// stop is pressed through the same wrapper.
+/// A stop that lands while the loop decides the box it read writes nothing (`Session::call`
+/// refuses every input) and ends the run as a stop. Negative control: with no stop the box
+/// is pressed through the same wrapper.
 #[test]
 fn a_stop_between_the_look_and_the_press_writes_nothing() {
     struct StopOnRead<'a> {
@@ -1382,8 +1317,8 @@ fn a_stop_between_the_look_and_the_press_writes_nothing() {
     impl Ctl for StopOnRead<'_> {
         fn call(&mut self, args: &[&str]) -> Result<CtlReply, String> {
             let r = self.inner.call(args);
-            // The stop lands while the loop decides the box it read: its
-            // first `status` after a screen read.
+            // The stop lands while the loop decides the box it read: its first `status` after
+            // a read.
             self.read |= args.contains(&"text");
             if self.arm && self.read && args.contains(&"status") {
                 self.stop.store(true, Ordering::SeqCst);
@@ -1428,9 +1363,8 @@ fn a_stop_between_the_look_and_the_press_writes_nothing() {
     }
 }
 
-/// A build's output on a screen without Claude Code's composer frame: a
-/// program still writing, which the turn's wait reads as busy until the
-/// output holds still.
+/// A build's output on a screen without Claude Code's composer frame: a program still
+/// writing, which the turn's wait reads as busy until the output holds still.
 fn writing_screen() -> Vec<String> {
     rows(&[
         "$ targo --unverified build -p aterm-agent",
@@ -1439,12 +1373,9 @@ fn writing_screen() -> Vec<String> {
     ])
 }
 
-/// The frame after the footer left: the read right after `await gone` latches
-/// is often the next frame mid-draw (a question dialog's first rows, no
-/// composer). It gets the short settle first (`await idle 500 timeout 1500`),
-/// and only a screen still writing after it waits out the full `await idle
-/// 2000` window. Negative control: a screen still writing after the settle
-/// waits the full window.
+/// The frame after the footer left (often the next frame mid-draw) gets the short settle
+/// first (`await idle 500 timeout 1500`). Negative control: still writing after it, the full
+/// `await idle 2000` window.
 #[test]
 fn the_frame_after_the_footer_left_gets_the_short_settle_first() {
     // The first wait after each read from the second (the first mid-draw
@@ -1494,15 +1425,10 @@ fn the_frame_after_the_footer_left_gets_the_short_settle_first() {
     );
 }
 
-/// A stop in any wait ends the hosted run before another wait begins
-/// (`run_hosted`: "within one wait"): the stop is set as each wait of a path
-/// goes out in turn, past every check the loop makes before it
-/// ([`stop_in_every_wait`]). After it no wait and no input reaches the
-/// transport, and the run is `EXIT stopped`. The paths: a question escalated
-/// and watched past; a turn that never ends, with and without `await gone`;
-/// a screen without the composer frame whose output never holds still; a
-/// read box approved (the press, its settle). Each path names the waits it
-/// exists for, so a script that stops reaching them fails here.
+/// A stop in any wait ends the hosted run before another wait begins: set as each wait of a
+/// path goes out ([`stop_in_every_wait`]), no wait or input follows and the run is `EXIT
+/// stopped`. Each path names the waits it exists for, so a script that stops reaching them
+/// fails.
 #[test]
 fn a_stop_in_any_wait_ends_the_hosted_run_before_another_begins() {
     let hosted = SuperviseOpts::hosted();
@@ -1552,11 +1478,9 @@ fn a_stop_in_any_wait_ends_the_hosted_run_before_another_begins() {
     named(&armed, "@s-1 await idle 500 ");
 }
 
-/// A stop in one of a turn's waits ends the turn, spent (the look it returns
-/// to reads the stop), before the turn's next wait: `await_turn_from` checks
-/// the stop before every wait it begins, including the one after a read and
-/// the one after a refused `await gone`, the two places a wait followed
-/// another with no check between.
+/// A stop in one of a turn's waits ends the turn, spent, before its next wait:
+/// `await_turn_from` checks the stop before every wait it begins, including the one after a
+/// read and the one after a refused `await gone`.
 #[test]
 fn a_stop_in_a_turns_wait_ends_the_turn_spent_before_its_next_wait() {
     for (tag, modern, screen, arm_at, wait) in [
@@ -1645,15 +1569,9 @@ fn a_halted_survey_dismissal_parks_and_tries_again() {
     );
 }
 
-/// A PERSON'S KEY INSIDE THE ~0.44 s THE HARNESS'S `0` SPENDS PENDING (real
-/// Claude Code 2.1.286, 13 of 13 runs): the `0` is written 1.82-1.87 s after the
-/// card and the card takes it 0.41 s later; any first key of a person in that
-/// window abandons the card, leaves the `0` at the head of what they typed
-/// (`0hello`, `00`) — and the journal said `DISMISSED survey`. The card is gone
-/// over text that BEGINS with the `0`: now said as it is (`ABANDONED`, and in
-/// `--notes`), nothing dismissed, the text left alone. `SURVEY_RACE_0HELLO_MEASURED`
-/// is the measured aftermath. CONTROL: the card gone over text a person typed
-/// AFTER the card took the `0` (no `0` at its head) is a dismissal.
+/// A person's first key inside the ~0.44 s the `0` spends pending abandons the card and
+/// leaves the `0` at the head of their text (`0hello`): said `ABANDONED`, never `DISMISSED`,
+/// the text left alone. Control: text typed after the card took the `0` is a dismissal.
 #[test]
 fn a_survey_that_left_under_typed_text_is_not_said_dismissed() {
     use aterm_phase::prompt::fixtures::{SURVEY_RACE_0HELLO_MEASURED, screen};
@@ -1698,7 +1616,7 @@ fn a_survey_that_left_under_typed_text_is_not_said_dismissed() {
         "{records:#?}"
     );
     assert_eq!(noted.len(), 1, "{noted:?}");
-    // CONTROL.
+    // Control.
     let (lines, records, noted) = run("hello");
     assert!(
         lines.iter().any(|l| l.starts_with("DISMISSED survey seq=")),
@@ -1711,12 +1629,9 @@ fn a_survey_that_left_under_typed_text_is_not_said_dismissed() {
     assert_eq!(noted.len(), 1, "{noted:?}");
 }
 
-/// THE PERSON FENCE ON THE SURVEY'S `0`: the press carries the person count of
-/// the read that judged the card (`key if-human=<n> if=… 0`, as every other press
-/// of the loop does), and a person who keyed in the gap between the status read
-/// and the press makes the server skip it (`OK skipped reason=person`). That
-/// spends no try — no `did not take its 0`, no back-off — the next look reads
-/// again, carries the new count, and the `0` goes.
+/// The survey's `0` carries the judged read's person count (`if-human=<n>`); a person keying
+/// in the gap makes the server skip it, which spends no try: the next look's `0` carries the
+/// new count and goes.
 #[test]
 fn a_person_who_keys_before_the_survey_press_skips_it_and_costs_no_try() {
     let mut m = Mock::new(
@@ -1758,9 +1673,8 @@ fn a_person_who_keys_before_the_survey_press_skips_it_and_costs_no_try() {
     );
 }
 
-/// The measured 2.1.280 folder-trust dialog (`policy/fixtures/cap-trust.txt`,
-/// folder `/private/tmp/claude-502/scratch/work1`), the focus on `No, exit`
-/// — or, `focused_yes`, moved onto `Yes, I trust this folder`.
+/// The measured 2.1.280 folder-trust dialog (`policy/fixtures/cap-trust.txt`, folder
+/// [`TRUST_FOLDER`]), the focus on `No, exit` or, `focused_yes`, on `Yes, I trust this folder`.
 fn trust_dialog(focused_yes: bool) -> Vec<String> {
     include_str!("policy/fixtures/cap-trust.txt")
         .lines()
@@ -1783,11 +1697,9 @@ fn fenced(screens: Vec<Vec<String>>) -> Mock {
     m
 }
 
-/// The trust dialog in the loop: for the session's own folder (`meta cwd=`)
-/// under a trust root, the focus is moved to `Yes, I trust this folder` with a
-/// fenced `down` guarded on the folder's row, a fresh read confirms the focus
-/// landed, and Enter goes fenced on that read's generation, guarded on the
-/// focused row itself; never Esc, which exits Claude Code.
+/// The trust dialog for the session's own folder under a trust root: a fenced, guarded
+/// `down` onto `Yes, I trust this folder`, confirmed by a fresh read, then a fenced, guarded
+/// Enter; never Esc, which exits Claude Code.
 #[test]
 fn the_trust_dialog_is_answered_by_a_confirmed_focus_move_then_enter() {
     let mut m = fenced(vec![trust_dialog(false), trust_dialog(true), idle_screen()]);
@@ -1821,9 +1733,8 @@ fn the_trust_dialog_is_answered_by_a_confirmed_focus_move_then_enter() {
     );
 }
 
-/// A key the dialog did not take (sent before it accepted input, so the focus
-/// still reads `No, exit`) is moved again from a fresh read, and the second
-/// lands: approved.
+/// A focus move the dialog dropped (sent before it accepted input) is made again from a
+/// fresh read, and the second lands: approved.
 #[test]
 fn a_focus_move_the_dialog_dropped_is_made_again_from_a_fresh_read() {
     let mut m = fenced(vec![
@@ -1854,6 +1765,221 @@ fn a_focus_move_the_dialog_dropped_is_made_again_from_a_fresh_read() {
     assert_eq!(m.attention, None);
 }
 
+/// A recently published trust verdict. Its age dates publication, not the
+/// first drawing of this dialog.
+const TRUST_PUBLISHED_1S: &str = "prompt agent_detail=trust agent_rev=1 agent_since_ms=1000";
+
+/// A watch at full power with the default grace, ending when the scripted
+/// session does. Its minute max is a hang detector.
+fn full_power_watch(m: &mut Mock, tag: &str) -> (Vec<String>, Vec<String>) {
+    let (jdir, journal) = journal_file(tag);
+    let opts = SuperviseOpts {
+        policy: SupervisorConfig::default(),
+        journal: Some(journal.clone()),
+        ..auto(60, None)
+    };
+    m.vanish_after = Some(0);
+    let (lines, _) = watch_lines(m, &opts);
+    let (records, _) = journal_records(&journal);
+    let _ = std::fs::remove_dir_all(&jdir);
+    (lines, records.into_iter().map(|r| r.line).collect())
+}
+
+fn held_for_the_person(what: &str, m: &mut Mock) {
+    let (_, noted) = full_power_watch(m, "trust-held");
+    assert!(
+        m.presses().is_empty(),
+        "{what}: {noted:#?}\n{:#?}",
+        m.requests
+    );
+    assert!(
+        noted.iter().any(|l| l.starts_with("HELD ")),
+        "{what}: {noted:#?}"
+    );
+    assert_eq!(
+        m.attention, None,
+        "{what}: a held box is nobody's to be told of"
+    );
+}
+
+/// A recent gesture and an observed agent verdict, without a causal launch
+/// witness. Neither observation states when this dialog was first drawn.
+fn recent_person(screens: Vec<Vec<String>>, agent: &'static str) -> Mock {
+    let mut m = fenced(screens);
+    m.agent = agent;
+    m.human_ms = Some(60_000);
+    m.human_seq = Some(4);
+    m
+}
+
+#[test]
+fn a_recent_persons_trust_dialog_keeps_their_grace() {
+    for agent in [
+        TRUST_PUBLISHED_1S,
+        "prompt agent_detail=trust agent_rev=1 agent_since_ms=120000",
+        "prompt agent_detail=trust agent_rev=1",
+        "unknown agent_detail=- agent_rev=0 agent_since_ms=1500",
+    ] {
+        let mut m = recent_person(vec![trust_dialog(false)], agent);
+        held_for_the_person(agent, &mut m);
+    }
+    let mut m = recent_person(vec![trust_dialog(false)], TRUST_PUBLISHED_1S);
+    m.hand = "lease:mgr";
+    held_for_the_person("another driver's hand", &mut m);
+    let mut m = recent_person(vec![trust_dialog(false)], TRUST_PUBLISHED_1S);
+    m.human_seq = None;
+    held_for_the_person("a host with no person-count fence", &mut m);
+    let mut m = recent_person(
+        vec![bash_box(&["⏺ Cleaning."], "rm -rf build")],
+        "prompt agent_detail=bash:not-read-only agent_rev=1 agent_since_ms=1000",
+    );
+    held_for_the_person("the ordinary Bash hold", &mut m);
+}
+
+/// Unknown and unread input cannot release a person's trust dialog early.
+#[test]
+fn unknown_input_keeps_the_persons_trust_dialog_held() {
+    for input in [
+        "",
+        "input=- input_bytes=-",
+        "input=pending input_bytes=1 input_wait_ms=40 fg_rss_mb=-",
+        "input=typeahead input_bytes=9",
+    ] {
+        let mut m = recent_person(vec![trust_dialog(false)], TRUST_PUBLISHED_1S);
+        m.input = input;
+        held_for_the_person(input, &mut m);
+    }
+}
+
+/// The first observed trust dialog, a clear input queue and a server
+/// publication younger than the person's key do not say when the box was
+/// drawn. The same observations can follow a key on an already drawn box.
+#[test]
+fn publication_after_a_key_does_not_prove_a_launch() {
+    let mut m = fenced(vec![trust_dialog(true)]);
+    m.agent = TRUST_PUBLISHED_1S;
+    m.human_ms = Some(60_000);
+    m.human_seq = Some(4);
+    m.input = INPUT_CLEAR;
+    held_for_the_person("publication after a key proves no launch", &mut m);
+}
+
+/// After the earlier gesture's grace, every trust answer still fences its
+/// keys on that gesture count, including the backstop and Codex's gate.
+#[test]
+fn a_trust_answer_after_the_persons_grace_fences_every_key() {
+    use aterm_phase::prompt::fixtures as f;
+    let backstop = f::screen(f::TRUST_BACKSTOP);
+    let on_yes: Vec<String> = backstop
+        .iter()
+        .map(|r| match r.as_str() {
+            " ❯ No, continue without these permissions" => {
+                "   No, continue without these permissions".to_string()
+            }
+            "   Yes, I trust this folder" => " ❯ Yes, I trust this folder".to_string(),
+            _ => r.clone(),
+        })
+        .collect();
+    for (program, screens, expected_keys) in [
+        (
+            "claude",
+            vec![trust_dialog(false), trust_dialog(true), idle_screen()],
+            2,
+        ),
+        ("claude", vec![backstop, on_yes, idle_screen()], 2),
+        ("codex", vec![f::screen(f::CODEX_TRUST)], 1),
+    ] {
+        let mut m = recent_person(screens, TRUST_PUBLISHED_1S);
+        m.program = program;
+        m.human_ms = Some(180_000);
+        let (lines, noted) = full_power_watch(&mut m, "trust-post-grace");
+        assert_eq!(
+            m.presses().len(),
+            expected_keys,
+            "{lines:#?}\n{noted:#?}\n{:#?}",
+            m.requests
+        );
+        assert!(
+            m.presses()
+                .iter()
+                .all(|p| p.starts_with("key if-human=4 if-gen=")),
+            "{:#?}",
+            m.requests
+        );
+        assert!(
+            lines.iter().any(|l| l.starts_with("APPROVED ")),
+            "{lines:#?}"
+        );
+        assert!(!noted.iter().any(|l| l.starts_with("HELD ")), "{noted:#?}");
+    }
+}
+
+/// The publication wait has been removed. At the reachable decision's
+/// metadata read, a newly selected Off still prevents every trust key;
+/// unchanged Cruise permits the ordinary answer after the person's grace.
+#[test]
+fn a_trust_answer_obeys_the_current_autopilot_word() {
+    for word in ["off", "cruise"] {
+        let mut m = recent_person(
+            vec![trust_dialog(false), trust_dialog(true), idle_screen()],
+            "unknown agent_detail=- agent_rev=0 agent_since_ms=1500",
+        );
+        m.human_ms = Some(180_000);
+        m.autopilot = Some("cruise");
+        m.autopilot_at = vec![(2, Some(word))];
+        let (lines, noted) = full_power_watch(&mut m, "trust-owner-word");
+        assert_eq!(m.autopilot, Some(word), "the owner controls the word");
+        if word == "off" {
+            assert!(m.presses().is_empty(), "{:#?}", m.requests);
+            assert!(!lines.iter().any(|l| l.starts_with("APPROVED ")));
+            assert!(noted.iter().any(|l| l.starts_with("PARKED ")));
+            assert_eq!(m.attention, None);
+        } else {
+            assert_eq!(m.presses().len(), 2, "{:#?}", m.requests);
+            assert!(lines.iter().any(|l| l.starts_with("APPROVED ")));
+            assert!(!noted.iter().any(|l| l.starts_with("PARKED ")));
+        }
+    }
+}
+
+/// A person keying after the read gets the trust dialog, even when the
+/// earlier gesture's grace had expired: both arrow and Enter yield without
+/// a failed-press escalation.
+#[test]
+fn a_person_who_keys_while_a_trust_answer_is_pressed_gets_the_dialog() {
+    for (focused_yes, key) in [(false, " down"), (true, " enter")] {
+        let mut m = recent_person(vec![trust_dialog(focused_yes)], TRUST_PUBLISHED_1S);
+        m.human_ms = Some(180_000);
+        m.status_human_from = BTreeMap::from([(2, 0)]);
+        m.human_seq = Some(0);
+        m.person_at_key = 1;
+        let (lines, noted) = full_power_watch(&mut m, "trust-yield");
+        assert_eq!(m.person_skipped.len(), 1, "{key}: {:#?}", m.requests);
+        let presses = m.presses();
+        assert!(
+            presses.len() == 1 && presses[0].ends_with(key),
+            "{key}: one key tried: {:#?}",
+            m.requests
+        );
+        assert!(
+            noted.iter().any(|l| l.starts_with("HELD ")),
+            "{key}: {noted:#?}\n{:#?}",
+            m.requests
+        );
+        assert!(
+            !noted
+                .iter()
+                .any(|l| l.contains("did not take") || l.contains("did not land")),
+            "{key}: a person's skip is no failed try: {noted:#?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.starts_with("APPROVED ")),
+            "{key}: {lines:#?}"
+        );
+        assert_eq!(m.attention, None, "{key}: {lines:#?}");
+    }
+}
+
 /// The usage-limit dialog (aterm-phase's capture of Claude Code 2.1.295) with
 /// its rows replaced by `labels`, the `❯` on option `focus`.
 fn limit_dialog(labels: &[&str], focus: usize) -> Vec<String> {
@@ -1864,13 +1990,9 @@ const LIMIT_STOP: &str = "Stop and wait for limit to reset";
 const LIMIT_WAIT: &str = "Wait here, then continue automatically at 12:23pm";
 const LIMIT_UPGRADE: &str = "Upgrade your plan";
 
-/// The usage-limit dialog in the loop: under the window's defaults the focus
-/// is moved from `Stop and wait …` onto `Wait here, then continue
-/// automatically …` with a fenced `down` guarded on the dialog's title, a
-/// fresh read confirms it landed, and Enter goes fenced on that read, guarded
-/// on the focused wait row (never a digit, never Esc); one Enter for the one
-/// dialog, which then leaves. The act is an approval line and a ledger row
-/// under `limit-wait@v1`, and no badge is raised.
+/// The usage-limit dialog under the window's defaults: a fenced `down` onto `Wait here, then
+/// continue automatically …`, confirmed by a fresh read, then an Enter fenced on it and
+/// guarded on that row; never a digit or Esc. Ledgered `limit-wait@v1`, no badge.
 #[test]
 fn the_limit_options_dialog_waits_for_the_reset_by_itself() {
     let (dir, ledger) = ledger_file("limit-wait");
@@ -1915,7 +2037,7 @@ fn the_limit_options_dialog_waits_for_the_reset_by_itself() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 
-    // The wait row FIRST, the focus already on it: no move, Enter alone.
+    // The wait row first, the focus already on it: no move, Enter alone.
     let mut m = fenced(vec![
         limit_dialog(&[LIMIT_WAIT, LIMIT_STOP, LIMIT_UPGRADE], 0),
         idle_screen(),
@@ -1931,10 +2053,8 @@ fn the_limit_options_dialog_waits_for_the_reset_by_itself() {
     assert_eq!(presses.len(), 1, "{:?}", m.requests);
     assert!(presses[0].ends_with(" enter"), "{presses:?}");
 
-    // The dialog stays after the Enter: at full power a box that comes back
-    // is answered again — but only ever by the wait row, each Enter fenced on
-    // a fresh read and guarded on the focused wait row itself; never a digit,
-    // never another row.
+    // The dialog stays after the Enter: at full power it is answered again, but only by the
+    // wait row, each Enter fenced on a fresh read and guarded on that row.
     let mut m = fenced(vec![
         limit_dialog(&[LIMIT_STOP, LIMIT_WAIT, LIMIT_UPGRADE], 0),
         limit_dialog(&[LIMIT_STOP, LIMIT_WAIT, LIMIT_UPGRADE], 1),
@@ -1956,11 +2076,9 @@ fn the_limit_options_dialog_waits_for_the_reset_by_itself() {
     }
 }
 
-/// The usage-limit dialog in the fullscreen panel (aterm-phase's
-/// `LIMIT_OPTIONS_PANEL`) gets the dated wait row under the window's
-/// defaults — a fenced `down` guarded on the panel's title, then Enter
-/// guarded on the focused wait row — ledgered under `limit-wait@v1`, never a
-/// digit, never the credits row, and nothing asked of the owner.
+/// The usage-limit dialog in the fullscreen panel (`LIMIT_OPTIONS_PANEL`) gets the dated wait
+/// row the same way (a fenced `down` guarded on the title, then Enter on the wait row),
+/// ledgered `limit-wait@v1`; never a digit or the credits row, nothing asked of the owner.
 #[test]
 fn the_limit_dialog_in_the_fullscreen_panel_waits_for_its_dated_reset() {
     const WAIT: &str = "Wait here, then continue automatically at Oct 2 at 5am";
@@ -2003,10 +2121,8 @@ fn the_limit_dialog_in_the_fullscreen_panel_waits_for_its_dated_reset() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// No `approve` level limits the usage-limit wait (it is `limit_wait`'s
-/// alone): under `approve = "none"`, which hands every other box over unread,
-/// the dialog still gets its wait row (the same fenced `down` and confirmed
-/// Enter, ledgered `limit-wait@v1`, no badge).
+/// No `approve` level limits the usage-limit wait (it is `limit_wait`'s alone): under
+/// `approve = "none"` the dialog still gets its wait row, no badge.
 #[test]
 fn the_limit_wait_is_chosen_under_approve_none_too() {
     let mut cfg = crate::supervise::SupervisorConfig::default();
@@ -2033,10 +2149,8 @@ fn the_limit_wait_is_chosen_under_approve_none_too() {
     assert_eq!(m.attention, None, "nothing asked of the owner");
 }
 
-/// Every usage-limit dialog the rule does not answer is escalated under its
-/// own kind and nothing is pressed: no wait row, the armed wait's `Don’t
-/// continue automatically` in its place, and `limit_wait = false` over the
-/// usual dialog.
+/// Every usage-limit dialog the rule does not answer (no wait row, the armed wait's row in
+/// its place, `limit_wait = false`) is escalated under its own kind, nothing pressed.
 #[test]
 fn a_limit_options_dialog_without_a_wait_row_goes_to_the_owner() {
     let defaults = crate::supervise::SupervisorConfig::default();
@@ -2080,13 +2194,9 @@ fn a_limit_options_dialog_without_a_wait_row_goes_to_the_owner() {
     }
 }
 
-/// The host's `[harness] trust_roots` reach the decision under the safe
-/// rules (`approve = "safe"`): the options the in-GUI host builds
-/// (`SuperviseOpts::hosted_with`) put the configured roots into the approval
-/// context (`ApprovalCtx::set_trust_roots`), so a configured root covers the
-/// folder and a non-covering one leaves the dialog to the person; only the
-/// roots differ. Under full power the roots are not consulted
-/// ([`full_power_trusts_the_folder_whatever_the_roots`]).
+/// The host's `[harness] trust_roots` reach the safe rule's decision through `hosted_with`
+/// (`ApprovalCtx::set_trust_roots`): a covering root approves the folder, another does not.
+/// Full power does not consult them ([`full_power_trusts_the_folder_whatever_the_roots`]).
 #[test]
 fn the_hosts_trust_roots_decide_the_trust_dialog() {
     for (roots, approved) in [
@@ -2125,14 +2235,71 @@ fn the_hosts_trust_roots_decide_the_trust_dialog() {
     }
 }
 
-/// A shell with no OSC 7 reports no folder, but the agent has one: the server
-/// reports the foreground program's own directory (`meta agent_cwd=`), the
-/// folder Claude Code's trust dialog asks about, and the safe rule reads it
-/// where the shell reported none, and BEFORE a shell's: the OSC 7 directory is
-/// where the last prompt was, not where the agent was launched (`cd x &&
-/// claude`, a worktree, the harness's own relaunch). Negative control: with
-/// neither, the dialog is escalated as the cwd unknown; with only the shell's,
-/// it is the shell's.
+/// CODEX'S FOLDER-TRUST GATE (0.156.1, measured) under `approve = "safe"`, in the session's
+/// own folder under the host's trust root: the trust rule's (`trust-dialog@v1`), its cursor
+/// already on `Trust and continue`, so no move — one fenced, guarded Enter, never Esc (which
+/// quits Codex). Negative control: a root naming another folder, escalated and nothing pressed.
+#[test]
+fn codexs_trust_gate_is_answered_under_safe_in_a_trust_root() {
+    const FOLDER: &str = "/private/tmp/claude-502/-Users-user00-aterm/\
+                          00000000-0000-0000-0000-000000000000/scratchpad/lv/work3";
+    for (roots, approved) in [("/private/tmp/claude-*", true), ("/nowhere/at/all*", false)] {
+        let mut cfg = crate::supervise::SupervisorConfig::default();
+        cfg.set("approve", "safe").expect("a level");
+        cfg.set("trust_roots", roots).expect("a root list");
+        let opts = SuperviseOpts {
+            max: Duration::from_secs(30),
+            ..SuperviseOpts::hosted_with(&cfg)
+        };
+        let (ldir, ledger) = ledger_file("codex-trust-safe");
+        let gate =
+            aterm_phase::prompt::fixtures::screen(aterm_phase::prompt::fixtures::CODEX_TRUST);
+        let mut m = fenced(vec![gate]);
+        m.program = "codex";
+        m.cwd = Some(FOLDER.to_string());
+        m.vanish_after = Some(0);
+        let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+            s.set_approval_env(owner_env());
+            s.set_approval_ledger(Some(ledger.clone()));
+        });
+        if approved {
+            assert!(
+                lines[0].starts_with("APPROVED seq=") && lines[0].ends_with(FOLDER),
+                "{lines:?}"
+            );
+            let presses = m.presses();
+            assert!(
+                presses.len() == 1
+                    && presses[0].starts_with("key if-gen=")
+                    && presses[0].contains(" if=")
+                    && presses[0].ends_with(" enter"),
+                "{:?}",
+                m.requests
+            );
+            let rows = ledger_rows(&ledger);
+            assert!(
+                rows.iter()
+                    .any(|r| r.contains("\"rule_id\":\"trust-dialog@v1\"")
+                        && r.contains("\"decision\":\"approved\"")),
+                "{rows:?}"
+            );
+        } else {
+            assert!(m.presses().is_empty(), "{roots}: {:?}", m.requests);
+            let rows = ledger_rows(&ledger);
+            assert!(
+                rows.iter().any(|r| r.contains("\"decision\":\"escalated\"")
+                    && r.contains("under no trust root")),
+                "{roots}: {rows:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&ldir);
+    }
+}
+
+/// With no OSC 7 from the shell, the trust dialog is decided by the agent's own folder
+/// (`meta agent_cwd=`), which comes before the shell's (the OSC 7 directory is where the last
+/// prompt was, not where the agent was launched); the shell's alone still decides. Negative
+/// control: with neither, escalated.
 #[test]
 fn a_trust_dialog_under_a_shell_with_no_osc7_is_decided_by_the_agents_own_folder() {
     let mut cfg = crate::supervise::SupervisorConfig::default();
@@ -2177,11 +2344,9 @@ fn a_trust_dialog_under_a_shell_with_no_osc7_is_decided_by_the_agents_own_folder
     }
 }
 
-/// The default on the same dialog: the folder is trusted with the roots
-/// naming nowhere near it (the confirmed focus move, then Enter), ledgered
-/// `trust-any@v1` with the safe rule's reason as `unproven:`. Negative
-/// control: `approve = "safe"`, nothing typed
-/// ([`the_hosts_trust_roots_decide_the_trust_dialog`]).
+/// The default on the same dialog trusts the folder with the roots naming nowhere near it
+/// (the confirmed focus move, then Enter), ledgered `trust-any@v1` with the safe rule's
+/// reason as `unproven:`.
 #[test]
 fn full_power_trusts_the_folder_whatever_the_roots() {
     let mut cfg = crate::supervise::SupervisorConfig::default();
@@ -2225,13 +2390,10 @@ fn full_power_trusts_the_folder_whatever_the_roots() {
     }
 }
 
-/// THE 2026-10-09 SWEEP'S WRONG ACTION, in the loop (Claude Code 2.1.295):
-/// the owner's bare ask rules `Write` and `Edit`, in the agent's own user
-/// settings (`settings.json` in its `CLAUDE_CONFIG_DIR`), send every Write and
-/// Edit to a person, and Claude Code draws the box an unruled call gets (the
-/// captures: no reason row). Under the host's default (full power) the box
-/// is held: escalated naming the rule, nothing pressed. Negative control: the
-/// same captured box with the rules gone is pressed `1`.
+/// A file box the agent's own ask rule sends (bare `Write`/`Edit` asks in its
+/// `CLAUDE_CONFIG_DIR` settings, Claude Code 2.1.295) is held by the host's default, naming
+/// the rule. The box draws no reason row, so only the settings tell it from an unruled call's.
+/// Negative control: with the rules gone it is pressed `1`.
 #[test]
 fn a_file_box_the_agents_own_ask_rule_sends_is_held_in_the_loop() {
     const WRITE: &str = include_str!("policy/fixtures/claude-2.1.295-box-write-ask-rule.txt");
@@ -2283,12 +2445,9 @@ fn a_file_box_the_agents_own_ask_rule_sends_is_held_in_the_loop() {
     }
 }
 
-/// The default in the host's loop (`SuperviseOpts::hosted_with` of
-/// `SupervisorConfig::default()`): a `touch x` box (a write) is pressed `1`
-/// under its command row's guard; the ledger row is `allow-once@v1` with
-/// `unproven: not read-only …` as its reason, the `--notes` line says the same,
-/// and the journal carries `UNPROVEN` after `APPROVED`. Negative control: the
-/// same box under `approve = "safe"` is escalated, nothing pressed.
+/// The host's default presses a write (`touch x`) `1`, ledgered `allow-once@v1` with
+/// `unproven: not read-only …` (in `--notes` too, `UNPROVEN` journaled). Negative control:
+/// `approve = "safe"` escalates it.
 #[test]
 fn the_hosts_default_presses_a_write_and_ledgers_it_unproven() {
     let touch = {
@@ -2373,12 +2532,9 @@ fn the_hosts_default_presses_a_write_and_ledgers_it_unproven() {
     assert!(m.presses().is_empty(), "{:?}", m.requests);
 }
 
-/// A question box in a shape Claude Code does not draw (a hand-built column-1
-/// `Yes`/`No`) under the default: detected as a box, read as a question
-/// aterm-phase did not read whole, escalated (badged `claude question: …` with
-/// that reason, ledgered `-`), nothing typed; under `answer_questions = false`
-/// handed over as that limit's. A live-geometry question is answered
-/// ([`a_live_question_box_is_answered_under_the_default`]).
+/// A question box in a shape Claude Code does not draw (a hand-built column-1 `Yes`/`No`) is
+/// escalated under the default as not read whole (badged `claude question: …`, ledgered
+/// `-`), nothing typed; under `answer_questions = false` it is handed over as that limit's.
 #[test]
 fn a_column_one_question_box_is_escalated_and_a_limit_hands_it_over() {
     use aterm_phase::prompt::fixtures as f;
@@ -2432,15 +2588,9 @@ fn a_column_one_question_box_is_escalated_and_a_limit_hands_it_over() {
     let _ = std::fs::remove_dir_all(&ldir);
 }
 
-/// A box the pane shows whole is read whole: the loop reads the last 40 rows,
-/// and a 43-row box whose title sits on row 3 of a 49-row grid comes back
-/// with its head cut. A `tail=` read that cuts a box's head is taken again
-/// whole: the box is approved at full power, a live-geometry question at the
-/// top of the grid is answered with one fenced Enter, and the column-1 Yes/No
-/// question at the top of a 49-row grid is escalated as unread. Control: a box
-/// truly taller than the grid (its title on no row of the full read) is read
-/// with its head off the screen and, not read whole, pressed by no level: it
-/// is the person's, the missing title said.
+/// A `tail=40` read that cuts a box's head is taken again whole: a 43-row Bash box is
+/// approved, a question at the top of the grid answered, the column-1 Yes/No escalated as
+/// unread. Control: a box taller than the grid is pressed by no level.
 #[test]
 fn a_box_cut_by_the_tail_is_read_again_whole() {
     use aterm_phase::prompt::fixtures as f;
@@ -2483,9 +2633,8 @@ fn a_box_cut_by_the_tail_is_read_again_whole() {
         m.requests
     );
 
-    // A live-geometry question at the top of a 56-row grid: the last 40
-    // rows start at its first option, so the tail read cuts its head; read
-    // again whole, it is answered.
+    // A question at the top of a 56-row grid: the tail starts at its first option, cutting
+    // its head; read again whole, it is answered.
     let mut live = f::screen(f::QUESTION_ONE);
     live.resize(56, String::new());
     let mut m = questioned(vec![live]);
@@ -2549,12 +2698,9 @@ fn a_box_cut_by_the_tail_is_read_again_whole() {
     assert!(set.contains("title row is not on the screen"), "{set}");
 }
 
-/// Codex's folder-trust gate drawn at the top of a 45-row pane (title on row
-/// 1): the 40-row tail cuts its title, and the tail read is judged by the
-/// session program's reader (not Claude Code's grammar, which sees no Codex
-/// box), taken again whole, and the gate is answered (its cursor already on
-/// `Trust and continue`: Enter, fenced). Negative control: the whole gate in a
-/// 40-row pane is read once, from the tail.
+/// Codex's trust gate at the top of a 45-row pane, its title cut by the tail, is read again
+/// whole by the session program's reader and answered. Negative control: a gate cut by the
+/// pane itself is never re-read, and nothing is pressed.
 #[test]
 fn a_codex_box_cut_by_the_tail_is_read_again_whole() {
     use aterm_phase::codex::fixtures as cx;
@@ -2603,8 +2749,7 @@ fn a_codex_box_cut_by_the_tail_is_read_again_whole() {
     }
 }
 
-/// A fresh 149x62 pane running Claude Code, as the loop reads it: the host's
-/// default options, and the row a 40-row tail of the pane starts at.
+/// The host's default options, for the tests of a fresh 149x62 pane running Claude Code.
 fn fresh_pane_opts() -> SuperviseOpts {
     SuperviseOpts {
         max: Duration::from_secs(30),
@@ -2616,10 +2761,8 @@ const FRESH_PANE_ROWS: usize = 62;
 const FRESH_PANE_FOLDER: &str =
     "/private/var/folders/xx/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx/T/tmp.XXXXXXXXXX/proj";
 
-/// A subagent box's rows (the rule to `Esc to cancel`) drawn at the top of a
-/// fresh 62-row pane under one blank row, hand-built: a box that appears
-/// before any transcript, wholly above a 40-row tail, the hidden cursor on
-/// its focused `❯ 1. Yes` (row 16).
+/// A subagent box's rows drawn under one blank row at the top of a fresh 62-row pane
+/// (hand-built), wholly above a 40-row tail, its focused `❯ 1. Yes` on row 16.
 fn rm_box_above_the_tail() -> Vec<String> {
     use aterm_phase::prompt::fixtures as f;
     let live = f::screen(f::BOX_RM_SUBAGENT_FRESH_PANE);
@@ -2641,16 +2784,9 @@ fn text_reads(m: &Mock, n: usize) -> Vec<&str> {
         .collect()
 }
 
-/// A fresh pane whose shell prompt sat at the top: the folder-trust dialog is
-/// drawn on rows 5-20, wholly above the 40-row tail, which comes back as 40
-/// blank rows from row 22 with the hidden cursor on row 17 above them
-/// (`TRUST_FRESH_PANE_TAIL40`, served byte for byte). A tail that holds none
-/// of the live rows (cursor above it, or every row blank) is taken again
-/// whole, and the dialog is answered under the default: the focus moved onto
-/// `Yes` (fenced, guarded on the folder's row) from the whole read, then Enter
-/// from a fresh read (itself a blank tail, read again whole). Negative
-/// control: the session's rm-breaker box inside the tail, cursor on its
-/// focused row, is read once from the tail and pressed.
+/// A trust dialog wholly above the 40-row tail of a fresh pane (the tail blank, the cursor
+/// above it: `TRUST_FRESH_PANE_TAIL40`) is read again whole and answered. Negative control:
+/// the rm-breaker box inside the tail is read once.
 #[test]
 fn a_dialog_above_the_tail_of_a_fresh_pane_is_read_whole_and_answered() {
     use aterm_phase::prompt::fixtures as f;
@@ -2740,10 +2876,9 @@ fn a_dialog_above_the_tail_of_a_fresh_pane_is_read_whole_and_answered() {
     );
 }
 
-/// A subagent's Bash box carrying the rm circuit breaker's note, drawn wholly
-/// above the 40-row tail of a fresh 62-row pane ([`rm_box_above_the_tail`]),
-/// is read whole (its tail blank, the cursor above it) and pressed `1` once by
-/// the default, no badge.
+/// A subagent's rm-breaker box drawn wholly above the 40-row tail of a fresh pane
+/// ([`rm_box_above_the_tail`]) is read whole (its tail blank, the cursor above it) and
+/// pressed `1` once by the default, no badge.
 #[test]
 fn an_rm_breaker_box_above_the_tail_of_a_fresh_pane_is_pressed() {
     let boxed = rm_box_above_the_tail();
@@ -2775,13 +2910,9 @@ fn an_rm_breaker_box_above_the_tail_of_a_fresh_pane_is_pressed() {
     assert_eq!(count(&m, "meta set attention"), 0, "{:?}", m.requests);
 }
 
-/// What the loop waits on: at an idle point a host that pushes its agent
-/// verdict is waited on with one `await agent <every word but idle>`, no
-/// screen read until the server's verdict moves ([`Session::agent_wake`]). A
-/// fresh pane idle at its top, then a box drawn wholly above the last 40
-/// rows: a verdict reading only the last 40 rows (blank, `idle`) never moves
-/// and the loop sleeps through the box. With the verdict reaching the box,
-/// the wait wakes, the loop reads (tail blank, then whole) and presses.
+/// At an idle point a host that pushes its verdict is waited on by one `await agent`
+/// ([`Session::agent_wake`]): a box drawn above the last 40 rows wakes the loop only if the
+/// verdict reaches it.
 #[test]
 fn a_box_drawn_above_the_tail_after_the_idle_point_wakes_the_loop_only_through_the_verdict() {
     let mut idle = idle_screen();
@@ -2840,14 +2971,9 @@ fn a_box_drawn_above_the_tail_after_the_idle_point_wakes_the_loop_only_through_t
     }
 }
 
-/// The same for a footerless box: a network box taller than the 40-row tail,
-/// whole on a 49-row grid, read from its last 40 rows has its title and rule
-/// off them. The tail read is taken again whole and the box is pressed; a held
-/// message the same height is re-read whole and handled as its own kind (its
-/// delivery a focus move this unfenced host cannot make, so handed over as a
-/// held message, never as a cut box); and a short pane that shows no more than
-/// the network box's title row (rule cut, `first == 0`) escalates it as a box
-/// whose title is off the screen.
+/// The same for a footerless box: a tall network box is read again whole and pressed; a held
+/// message is re-read whole and handed over as one; a pane showing only the network box's
+/// title row escalates it as a box whose title is off the screen.
 #[test]
 fn a_footerless_box_cut_by_the_tail_is_read_again_whole() {
     use aterm_phase::prompt::fixtures as f;
@@ -2907,10 +3033,8 @@ fn a_footerless_box_cut_by_the_tail_is_read_again_whole() {
         "{set}"
     );
 
-    // The control: the pane is no taller than the cut, so there is nothing to
-    // re-read: the box is read with its head off the screen (no rule above its
-    // first row proves that row its title) and, not read whole, pressed by no
-    // level, the missing title said.
+    // The control: a pane no taller than the cut has nothing to re-read; the box's head is
+    // off the screen, so no level presses it.
     let net = f::screen(f::BOX_NETWORK);
     let short = net[net.len() - 8..].to_vec();
     assert!(short[0].starts_with(" Network request"), "{short:?}");
@@ -2928,20 +3052,16 @@ fn a_footerless_box_cut_by_the_tail_is_read_again_whole() {
     );
 }
 
-/// A press that did not land (the box unchanged after it) is not handed over
-/// for good: at full power, unattended, the box is read and pressed again on
-/// a back-off doubling from 250 ms, journaled `WAITING … the press did not
-/// land`, and the session is badged once it has missed for a while, the tries
-/// going on behind the badge. Negative control: under `approve = "safe"` the
-/// same box is handed over after its one press.
+/// At full power, unattended, a press that did not land is pressed again on a back-off
+/// doubling from 250 ms and badged once it has missed a while. Negative control: the safe
+/// rules hand it over after one press.
 #[test]
 fn a_press_that_did_not_land_is_tried_again_at_full_power() {
     let (jdir, journal) = journal_file("press-missed");
     let mut m = Mock::new(true, vec![bash_one_row()]);
     m.stall_sleep = Some(Duration::from_millis(50));
-    // The session ends once the box was pressed three times AND badged, so
-    // the run is decided by what happened, not by how many back-off turns a
-    // 3 s `max` fits under load. `max` is only a hang detector.
+    // The session ends once the box was pressed three times and badged, so the run is
+    // decided by what happened, not by how many back-off turns fit under load.
     m.exit_when = Some(|m| {
         m.presses().len() >= 3
             && m.requests
@@ -2986,10 +3106,8 @@ fn a_press_that_did_not_land_is_tried_again_at_full_power() {
     assert_eq!(m.presses().len(), 1, "{:#?}", m.requests);
 }
 
-/// No repeat cap at full power (`approval_loop`'s module header): the same box
-/// that comes back is pressed every time (a build or test the worker reruns is
-/// its business, and nobody else is there to answer), past the safe rules'
-/// two, a proven read too. Control: the safe rules keep their cap of two
+/// No repeat cap at full power (`approval_loop`'s module header): the same box that comes
+/// back is pressed every time, past the safe rules' two. Control: the safe rules' cap
 /// (`a_read_that_keeps_coming_back_is_approved_twice_then_handed_over`).
 #[test]
 fn full_power_presses_the_same_box_every_time_it_comes_back() {
@@ -3031,15 +3149,13 @@ fn full_power_presses_the_same_box_every_time_it_comes_back() {
     );
 }
 
-/// Every way the trust press stops short is a negative control: a focus
-/// that did not land (no Enter at all), another folder than the session's
-/// (no key), a host with no generation fence (no key), and a Codex session
-/// (its gate is escalated, never pressed).
+/// Every way the trust press stops short: a focus move that did not land (no Enter), another
+/// folder than the session's, a host with no generation fence (no key), and a Codex gate for
+/// another folder than the session's (escalated).
 #[test]
 fn the_trust_dialog_is_never_entered_unconfirmed() {
-    // The `down` is never taken — the focus still reads `No, exit` after
-    // every move: moved again from a fresh read each time, then handed
-    // over; never Enter.
+    // The `down` is never taken (the focus stays on `No, exit`): moved again from each fresh
+    // read, then handed over; never Enter.
     let mut m = fenced(vec![trust_dialog(false); 16]);
     m.cwd = Some(TRUST_FOLDER.to_string());
     m.vanish_after = Some(0);
@@ -3102,7 +3218,7 @@ fn the_trust_dialog_is_never_entered_unconfirmed() {
     watch_lines_with(&mut m, &auto(30, None), |s| s.set_approval_env(owner_env()));
     assert!(m.presses().is_empty(), "{:?}", m.requests);
 
-    // Codex: its reader sees the gate, and every option is `Other`.
+    // Codex: its reader sees the gate, which names another folder than the session's.
     let codex = aterm_phase::prompt::fixtures::screen(aterm_phase::prompt::fixtures::CODEX_TRUST);
     let mut m = fenced(vec![codex]);
     m.program = "codex";
@@ -3116,15 +3232,14 @@ fn the_trust_dialog_is_never_entered_unconfirmed() {
             .expect("decided")
     };
     assert!(
-        matches!(&d, crate::supervise::policy::approval::Decision::Escalate { reason } if reason.contains("codex")),
+        matches!(&d, crate::supervise::policy::approval::Decision::Escalate { reason } if reason.contains("not the session's cwd")),
         "{d:?}"
     );
 }
 
-/// A box is read by the reader for the session's foreground program (`status
-/// program=`): a shell that shows a captured Claude box is never pressed
-/// into. Negative control: the same screen under `claude` is approved (every
-/// other test of the loop).
+/// A box is read by the reader for the session's foreground program (`status program=`): a
+/// shell showing a captured Claude box is never pressed into. Negative control: under
+/// `claude` the same screen is approved.
 #[test]
 fn a_box_on_a_shell_is_never_pressed() {
     for program in ["zsh", "less"] {
@@ -3142,9 +3257,8 @@ fn a_box_on_a_shell_is_never_pressed() {
     m.vanish_after = Some(0);
     let (lines, _) = watch_lines(&mut m, &auto(30, None));
     assert!(lines[0].starts_with("APPROVED"), "{lines:?}");
-    // An agent just started still reads as its shell until the server
-    // resolves its name: the box waits for the server's verdict (`await
-    // agent prompt`, bounded) and is judged under the name it then has.
+    // An agent just started reads as its shell until the server resolves its name: the box
+    // waits for the verdict (`await agent prompt`, bounded) and is judged under the new name.
     let mut m = Mock::new(true, vec![bash_one_row(), bash_one_row()]);
     m.program = "zsh";
     m.program_resolves_to = Some("claude");
@@ -3158,10 +3272,9 @@ fn a_box_on_a_shell_is_never_pressed() {
         "{:?}",
         m.requests
     );
-    // An agent exec'ed in place keeps its launcher's name while the server's
-    // verdict already names the screen an agent's: the verdict decides (`bash
-    // -c 'exec -a claude …'` reads `program=bash` for seconds under
-    // `agent=prompt`).
+    // An agent exec'ed in place keeps its launcher's name (`bash -c 'exec -a claude …'` reads
+    // `program=bash` for seconds) while the server's verdict already says `agent=prompt`:
+    // the verdict decides.
     let mut m = Mock::new(true, vec![bash_one_row(), bash_one_row()]);
     m.program = "bash";
     m.agent = "prompt";
@@ -3170,9 +3283,8 @@ fn a_box_on_a_shell_is_never_pressed() {
     assert!(lines[0].starts_with("APPROVED"), "{lines:?}");
 }
 
-/// The supervisor claim: an unattended loop takes the session's claim at the
-/// start as a lease, renews it with its requests, and releases it at the end;
-/// `supervise` (one look for a manager who is right there) takes none.
+/// An unattended loop takes the session's supervisor claim at the start as a lease, renews it
+/// with its requests and releases it at the end; `supervise` (one look) takes none.
 #[test]
 fn a_watch_claims_the_session_renews_and_releases_it() {
     let mut m = Mock::new(true, vec![bash_one_row(), busy_screen(), idle_screen()]);
@@ -3198,9 +3310,8 @@ fn a_watch_claims_the_session_renews_and_releases_it() {
         "renewed with the requests: {:?}",
         m.claims
     );
-    // Given back only while it is still this loop's (`holder=`): a bare
-    // unset would clear the claim of a supervisor that took the session
-    // after this loop's lease lapsed.
+    // Given back only while still this loop's (`holder=`): a bare unset would clear the claim
+    // of a supervisor that took the session after this loop's lease lapsed.
     assert_eq!(
         m.claims.last().map(String::as_str),
         Some("meta unset supervisor holder=gui:7")
@@ -3213,10 +3324,9 @@ fn a_watch_claims_the_session_renews_and_releases_it() {
     assert!(m.claims.is_empty(), "{:?}", m.claims);
 }
 
-/// Another supervisor's live claim (`ERR busy supervisor=<holder>`): the loop
-/// says so and only watches (the read box is pressed by nobody here, no badge
-/// raised or cleared), and takes over, saying so, the moment the claim is
-/// free. It never releases a claim it does not hold.
+/// Behind another supervisor's live claim (`ERR busy supervisor=<holder>`) the loop says so
+/// and only watches (nothing pressed, no badge raised or cleared), and takes over the moment
+/// the claim is free. It never releases a claim it does not hold.
 #[test]
 fn behind_another_supervisors_claim_the_loop_only_watches() {
     let mut m = Mock::new(
@@ -3284,12 +3394,9 @@ fn behind_another_supervisors_claim_the_loop_only_watches() {
     assert!(!m.presses().is_empty(), "{:?}", m.requests);
 }
 
-/// The hosted loop yields (`SuperviseOpts::yield_when_held`, set by
-/// `hosted()`): behind another holder's claim it ends with `CLAIM_HELD` + the
-/// holder (no box judged, nothing pressed, no badge), so the in-GUI host
-/// parks the session until the claim is released. Its own claim is the only
-/// one taken, under the host's name (`set_supervisor_name`). Negative control:
-/// the same screen with the claim free is approved under that one claim.
+/// The hosted loop yields (`SuperviseOpts::yield_when_held`): behind another holder's claim
+/// it ends with `CLAIM_HELD` + the holder, nothing pressed, so the host parks the session.
+/// Negative control: with the claim free the box is approved under the host's one claim.
 #[test]
 fn a_hosted_loop_behind_another_claim_ends_and_presses_nothing() {
     let hosted = SuperviseOpts::hosted();
@@ -3374,15 +3481,11 @@ enum ClaimAnswer {
     Lost,
 }
 
-/// Tier-1 for `SupervisorClaim` (aterm-spec `supervisor_claim_model`): the
-/// real `Session` over the scripted server, the claim renewed before every
-/// request (a zero renewal step), projected onto the model request by
-/// request. A claim request is the model's `Renewal`, the server's answer
-/// fixing what the environment did before it (`OK`: free or the loop's; `ERR
-/// busy`: it lapsed and another took it, i.e. `Tick`s to the lease's end,
-/// `Lapse`, `OtherClaims`), or `Unserved` when not served; a `key` is a
-/// `Press`, which must be enabled at the projected state, the invariant
-/// checked after each. `script`: the claim answers in order, `OK` after.
+/// Tier-1 for `SupervisorClaim` (aterm-spec `supervisor_claim_model`): the real `Session` with
+/// the claim renewed before every request, projected onto the model. A claim request is
+/// `Renewal` (its answer fixing what the environment did before it: `OK` free or the loop's,
+/// `ERR busy` lapsed and taken) or `Unserved`; a `key` is `Press`, which must be enabled.
+/// `script`: the claim answers in order, `OK` after.
 fn claim_conformance(script: &[ClaimAnswer]) -> (Mock, aterm_spec::derive::Model) {
     let model = aterm_spec::derive::supervisor_claim_model();
     let mut m = Mock::new(true, vec![bash_one_row(), bash_one_row(), bash_one_row()]);
@@ -3402,6 +3505,8 @@ fn claim_conformance(script: &[ClaimAnswer]) -> (Mock, aterm_spec::derive::Model
     let fire = |st: &mut std::collections::BTreeMap<&'static str, i64>, a: &str| {
         assert!(model.fire(a, st), "the model refused {a} at {st:?}");
     };
+    // The scripted server's loop is an external supervisor's: unfenced.
+    fire(&mut st, "External");
     let mut asked = 0;
     for (req, _) in &m.order {
         if req.starts_with("meta set supervisor") {
@@ -3458,14 +3563,11 @@ fn tier1_the_claim_is_renewed_before_every_press_and_none_goes_under_anothers() 
     // Held throughout: every press is at a state the model permits.
     let (m, _) = claim_conformance(&[]);
     assert!(!m.presses().is_empty(), "{:?}", m.requests);
-    // Lost to another supervisor after the start: the renewal before the
-    // next request finds it, and nothing more is pressed.
+    // Lost to another supervisor after the start: nothing more is pressed.
     let (m, model) = claim_conformance(&[Yes, Busy, Busy, Busy, Busy, Busy, Busy, Busy]);
     assert!(m.presses().is_empty(), "{:?}", m.order);
-    // Pending: renewals not served through the moment the loop would press,
-    // then answered. The loop presses nothing while it does not know whose
-    // the session is (the walk fails on a press at a pending view), and
-    // presses once its claim is back.
+    // Pending: renewals unserved through the moment the loop would press, then answered:
+    // nothing pressed while it does not know whose the session is, then pressed.
     let lost = [Yes, Lost, Lost, Lost, Lost, Lost, Lost, Lost, Lost];
     let (m, _) = claim_conformance(&lost);
     let claims: Vec<usize> = m
@@ -3486,37 +3588,58 @@ fn tier1_the_claim_is_renewed_before_every_press_and_none_goes_under_anothers() 
         "pressed once the claim was back: {:?}",
         m.order
     );
-    // Negative control: the stale view (lease lapsed, another holds it, the
-    // loop has not asked since) is refused by the model and admitted with the
-    // renewal skipped (Buggy = 1), so the pass above is not vacuous.
+    // Negative control: the stale view (lease lapsed, another holds it, not asked since) is
+    // refused by the model and admitted with the renewal skipped (`Buggy = 1`).
     let mut stale = model.init_state();
-    for (k, v) in [("held", 2), ("view", 1), ("age", 3)] {
+    for (k, v) in [
+        ("started", 1),
+        ("fenced", 0),
+        ("held", 2),
+        ("view", 1),
+        ("age", 3),
+    ] {
         stale.insert(k, v);
     }
     assert!(!model.action_enabled("Press", &stale));
     assert!(aterm_spec::interp::with_buggy(&model, 1).action_enabled("Press", &stale));
     // And a pending view never presses, Buggy or not.
     let mut pending = model.init_state();
-    for (k, v) in [("held", 2), ("view", 3), ("age", 0)] {
+    for (k, v) in [("started", 1), ("held", 2), ("view", 3), ("age", 0)] {
         pending.insert(k, v);
     }
     assert!(!aterm_spec::interp::with_buggy(&model, 1).action_enabled("Press", &pending));
+    // THE PROVEN REPLACEMENT: the hosted loop's claim replaced while it still
+    // reads it as its own; its fenced press is enabled and lands nothing.
+    // NEGATIVE CONTROL: unfenced (`Buggy`), the same press is under another's.
+    let mut replaced = model.init_state();
+    for a in ["Hosted", "Tick", "Renewal", "ProvenReplaces"] {
+        assert!(model.fire(a, &mut replaced), "{a} at {replaced:?}");
+    }
+    assert!(model.action_enabled("Press", &replaced), "{replaced:?}");
+    assert!(model.fire("Press", &mut replaced));
+    assert!(model.check_invariant("NoPressUnderAnothersClaim", &replaced));
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let mut unfenced = buggy.init_state();
+    for a in ["Hosted", "Tick", "Renewal", "ProvenReplaces", "Press"] {
+        assert!(buggy.fire(a, &mut unfenced), "{a} at {unfenced:?}");
+    }
+    assert!(!buggy.check_invariant("NoPressUnderAnothersClaim", &unfenced));
+    // An external loop's claim is never replaced so.
+    let mut external = model.init_state();
+    for a in ["External", "Tick", "Renewal"] {
+        assert!(model.fire(a, &mut external), "{a} at {external:?}");
+    }
+    assert!(!model.action_enabled("ProvenReplaces", &external));
 }
 
-/// Tier-1 for `SupervisorFocusChoice` (aterm-spec
-/// `supervisor_focus_choice_model`): the real trust-dialog press over the
-/// scripted server, projected request by request: a `key … down` is the move
-/// (landed or lost, as the next read shows), a `text` read after it the
-/// `Reread`, a `key … enter` the `Enter`, which must be enabled there. Both
-/// shapes: the move lands (one Enter), or the move is lost, made again from
-/// each fresh read, then handed over (no Enter, and the model's Enter is
-/// disabled where the real loop stopped).
+/// Tier-1 for `SupervisorFocusChoice` (aterm-spec `supervisor_focus_choice_model`): the real
+/// trust-dialog press projected request by request; Enter goes only where the model enables
+/// it, after a move that landed, never after one lost.
 #[test]
 fn tier1_enter_goes_only_on_a_confirmed_focus() {
     let model = aterm_spec::derive::supervisor_focus_choice_model();
     for lands in [true, false] {
-        // Landed, the dialog then leaves (Claude Code starts); lost, it
-        // stays as it was.
+        // Landed, the dialog leaves (Claude Code starts); lost, it stays.
         let after = if lands {
             idle_screen()
         } else {
@@ -3556,12 +3679,9 @@ fn tier1_enter_goes_only_on_a_confirmed_focus() {
     }
 }
 
-/// The loop on the question dialog's second tab (no answer marked) and its
-/// review: each answered by one fenced Enter on the focused row (`❯ 1.
-/// Small`, then `❯ 1. Submit answers`), never a digit, ledgered
-/// `answer-recommended@v1`, nothing escalated, at every `approve` level (a
-/// question is no permission). Negative control: `answer_questions = false`
-/// (`--no-answer`) hands the dialog over, unpressed.
+/// The question dialog's second tab and its review are each answered by one fenced Enter on
+/// the focused row, ledgered `answer-recommended@v1`, at every `approve` level. Negative
+/// control: `answer_questions = false` hands it over.
 #[test]
 fn the_2_1_281_question_dialog_is_answered_by_enter_at_every_level() {
     use aterm_phase::prompt::fixtures::{ASK_SUBMIT, ASK_TWO_SECOND, screen};
@@ -3612,68 +3732,58 @@ fn the_2_1_281_question_dialog_is_answered_by_enter_at_every_level() {
     );
 }
 
-/// A host at the loop's idle points ([`IdleHost`]), as a test drives it:
-/// `wants` while its flag is set; each `at_idle` counted, the flag cleared
-/// (the step taken), and the requests the loop had made by then kept.
+/// A host at the loop's idle points ([`IdleHost`]) as a test scripts it: it `wants` while its
+/// flag is set, and each `at_idle` is counted and clears the flag (unless `again` is left).
 #[derive(Debug, Default)]
 struct TestHost {
     wants: AtomicBool,
     owns: AtomicBool,
     steps: std::sync::atomic::AtomicUsize,
-    /// What each restart the loop asks for answers, in turn (`None`: this
-    /// host makes none); `None` once spent.
+    /// What each restart asked for answers, in turn (`None`, or spent: no restart made).
     restarts: std::sync::Mutex<VecDeque<Option<&'static str>>>,
     /// The restarts asked for, by their word.
     restarted: std::sync::Mutex<Vec<&'static str>>,
-    /// It restarts while any of [`Self::restarts`] is left (`can_restart`
-    /// holds once its scripted answers are spent), as the window's host does:
-    /// a refusal does not change its word that it restarts.
+    /// `can_restart` holds even once [`Self::restarts`] is spent, as the window's host's
+    /// does: a refusal does not change its word that it restarts.
     restartable: AtomicBool,
-    /// Breaks of the agent's own background work offered
-    /// ([`IdleHost::at_background`]), each answered with the notice.
+    /// Breaks of background work offered ([`IdleHost::at_background`]), each answered.
     backgrounds: std::sync::atomic::AtomicUsize,
-    /// Its word that nobody has asked the session anything
-    /// ([`IdleHost::taskless`]).
+    /// Its word that nobody has asked the session anything ([`IdleHost::taskless`]).
     taskless: AtomicBool,
     /// Its step lets the turn ends go: `owns` cleared by `at_idle`.
     lets_go: AtomicBool,
-    /// Its step is a person's hold at the point (`wait:attended`), owning the
-    /// turn ends.
+    /// Its step is a person's hold at the point (`wait:attended`), owning the turn ends.
     holds: AtomicBool,
     /// Each hold after the first is said as a repeat ([`HostStep::repeat`]).
     marks: AtomicBool,
     /// The turns the loop said ran ([`IdleHost::turn_ran`]).
     turns_ran: std::sync::atomic::AtomicUsize,
-    /// Its step TYPES into the agent and owns nothing after it — a
-    /// relaunch's carry-on ([`HostStep::moved`]).
+    /// The decided idle turn ends the loop offered its usage tap ([`IdleHost::usage_tap`]).
+    taps: std::sync::atomic::AtomicUsize,
+    /// Its step types into the agent and owns nothing after it: a relaunch's carry-on
+    /// ([`HostStep::typed`]).
     types: AtomicBool,
-    /// Its moving step ENDS the agent and types nothing into it — a restart
+    /// Its moving step ends the agent and types nothing into it: a restart
     /// ([`HostStep::typed`] false).
     ends: AtomicBool,
-    /// Steps it asks for again after the one taken (the upgrade parked for
-    /// the next idle point after its notice).
+    /// Steps it asks for again after the one taken (the upgrade parked after its notice).
     again: std::sync::atomic::AtomicUsize,
     /// The limit episodes the loop told of ([`IdleHost::limited`]), in order.
     limits: std::sync::Mutex<Vec<bool>>,
     /// The exceptions the loop told of ([`IdleHost::exception`]), in order:
     /// `Some(kind word)` as one appears, `None` as it ends.
     exceptions: std::sync::Mutex<Vec<Option<&'static str>>>,
-    /// How many times the loop asked whether the host owns a turn end — the
-    /// host-side evidence that the loop reached one ([`Stop::Reached`]).
+    /// The loop's asks whether the host owns a turn end: evidence it reached one.
     turn_ends: std::sync::atomic::AtomicUsize,
-    /// The guards the loop said withheld a point ([`IdleHost::withheld`]),
-    /// in order.
+    /// The guards the loop said withheld a point ([`IdleHost::withheld`]), in order.
     withheld: std::sync::Mutex<Vec<Guard>>,
-    /// How many of the loop's first asks whether the host wants a point it
-    /// answers `false` to, whatever [`Self::wants`] says: a host that asks for
-    /// no point until the loop has acted at the first one.
+    /// How many of the loop's first `wants` asks it answers `false` whatever [`Self::wants`]
+    /// says: a host that asks for no point until the loop has acted at the first one.
     deaf_for: std::sync::atomic::AtomicUsize,
     /// How many times the loop asked ([`IdleHost::wants`]).
     asked: std::sync::atomic::AtomicUsize,
-    /// Its first step relaunches the agent (`upgrade step=adopted`: moved,
-    /// nothing typed) and asks for the next idle point, where its second types
-    /// the relaunched agent's carry-on (`carry-on step=continued`), as the
-    /// window's host takes the live upgrade's restart.
+    /// Its first step relaunches the agent (`upgrade step=adopted`) and asks for the next idle
+    /// point, where its second types the carry-on (`carry-on step=continued`).
     adopts: AtomicBool,
     /// The agent's memory it measures ([`IdleHost::memory`]), in MiB, on a 128
     /// GiB machine ([`Self::trouble`] says in what state); `0`: none.
@@ -3682,8 +3792,7 @@ struct TestHost {
     /// MB/s, 2 GiB available of 128, 120 GiB in use. `false`: memory to spare
     /// (normal pressure, no swap, 60 GiB available and 60 in use).
     trouble: AtomicBool,
-    /// The machine falls into trouble at this memory ask (1-based), as if
-    /// [`Self::trouble`] were set just before it; `0`: [`Self::trouble`]
+    /// The machine falls into trouble at this memory ask (1-based); `0`: [`Self::trouble`]
     /// alone decides.
     trouble_from_ask: std::sync::atomic::AtomicUsize,
     /// The largest of the OTHER agents the host supervises, MiB (`0`: none).
@@ -3693,23 +3802,19 @@ struct TestHost {
     /// The memory it measures from its first restart asked on, in MiB
     /// (`0`: unchanged) — a measure that fell while the restart was tried.
     memory_at_restart: std::sync::atomic::AtomicU64,
-    /// The memory it measures once it has made a restart (answered
-    /// `adopted`), in MiB (`0`: unchanged) — the relaunched agent a fresh,
-    /// small one, as the window's host finds it.
+    /// The memory it measures once it has made a restart (`adopted`), in MiB (`0`:
+    /// unchanged): the relaunched agent a fresh, small one.
     memory_once_made: std::sync::atomic::AtomicU64,
     /// What the loop told it for a person ([`IdleHost::inform`]), in order.
     informed: std::sync::Mutex<Vec<String>>,
     /// What the loop warned a person of ([`IdleHost::warn`]), in order.
     warned: std::sync::Mutex<Vec<String>>,
-    /// The usage limit's reset its agent's transcript names
-    /// ([`IdleHost::limit_until`]; `None`: none), and how many times the loop
-    /// asked for it.
+    /// The usage limit's reset its agent's transcript names ([`IdleHost::limit_until`];
+    /// `None`: none), and how many times the loop asked for it.
     limit_until: std::sync::Mutex<Option<u64>>,
     limit_asks: std::sync::atomic::AtomicUsize,
-    /// The Codex it keeps — its pid and `$CODEX_HOME` — whose wall's words
-    /// it places as the window's host does ([`IdleHost::place_reset`]: the
-    /// real `codex_wall_reset`, in that process's own zone); `None`: a host
-    /// that places nothing, and the loop reads the words itself.
+    /// The Codex it keeps (its pid and `$CODEX_HOME`), whose wall's words it places as the
+    /// window's host does ([`IdleHost::place_reset`]); `None`: the loop reads them itself.
     codex: std::sync::Mutex<Option<(u32, PathBuf)>>,
     /// Its agent's transcript tail ([`IdleHost::transcript_tail`]) before
     /// its first restart and after it; `None`: none to read.
@@ -3813,6 +3918,9 @@ impl IdleHost for TestHost {
     fn turn_ran(&self) {
         self.turns_ran.fetch_add(1, Ordering::SeqCst);
     }
+    fn usage_tap(&self) {
+        self.taps.fetch_add(1, Ordering::SeqCst);
+    }
     fn limited(&self, open: bool) {
         self.limits.lock().unwrap().push(open);
     }
@@ -3875,13 +3983,9 @@ impl IdleHost for TestHost {
     }
 }
 
-/// A limit episode is the host's to hear and the loop's to wait out, even
-/// while the upgrade owns the session's turn ends. A notice is out and the
-/// wind-down turn hits the weekly limit: the loop opens its episode and tells
-/// the host (`limited(true)`: the host holds the upgrade's clocks), closes it
-/// when the worker answers after the continuation (`limited(false)`), and
-/// past the reset the continuation is typed (`CONTINUED … usage-resume`), so
-/// the upgrade's ownership does not hold the point for good.
+/// A limit episode is the host's to hear and the loop's to wait out, even while the upgrade
+/// owns the turn ends: the host is told it opened and closed (`limited`), and past the reset
+/// the continuation is typed.
 #[test]
 fn a_limit_episode_is_told_to_the_host_and_waited_out_over_its_turn_ends() {
     let host = Arc::new(TestHost::default());
@@ -3918,13 +4022,9 @@ fn a_limit_episode_is_told_to_the_host_and_waited_out_over_its_turn_ends() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A POINT ONLY A PERSON CAN ANSWER IS JOURNALED ONCE, AND ENDS WHEN THE
-/// WORKER WORKS. A spend limit that names no reset is read at two points (the
-/// notice, then the same notice on a retry's rows): the journal carries ONE
-/// `EXCEPTION … => <action>` and the host is told once; the worker's next busy
-/// read closes it with `CLEARED … exception=spend after=…` and tells the host
-/// `None`. A wait (the entitlement ladder's) is not an exception, and nothing
-/// is raised: no `ESCALATED` line.
+/// A spend limit naming no reset is an exception journaled once (`EXCEPTION … => <action>`),
+/// the host told once; the next busy read clears it (`CLEARED … exception=spend`, the host
+/// told `None`). A `later` exception raises nothing.
 #[test]
 fn an_exception_is_journaled_once_and_cleared_when_the_worker_works() {
     let host = Arc::new(TestHost::default());
@@ -3993,14 +4093,9 @@ fn an_exception_is_journaled_once_and_cleared_when_the_worker_works() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A POINT A PERSON MUST ANSWER STANDS WHILE ITS WALL IS OUT OF VIEW. A spend
-/// limit that names no reset is an exception (journaled, the host told); the
-/// owner then scrolls back and the wall's rows leave, so the screen reads busy
-/// on the agent's own background work alone. That is no answer to it: the
-/// exception stands (no `CLEARED`, the host told nothing), until the agent
-/// really works (a spinner), which closes it. Without the guard the first
-/// background-only read cleared the exception the person had not answered and a
-/// digest would drop it. NEGATIVE CONTROL: the live turn clears it.
+/// An exception stands while its wall is out of view: once the person scrolls the wall away,
+/// a screen busy on background work alone is no answer to it; a spinner is. Negative control:
+/// the live turn clears it.
 #[test]
 fn an_exception_stands_while_its_wall_is_out_of_view_and_ends_when_the_agent_works() {
     const WALL: &str = include_str!(
@@ -4067,7 +4162,7 @@ fn an_exception_stands_while_its_wall_is_out_of_view_and_ends_when_the_agent_wor
         cleared.iter().all(|l| l.contains("the loop ended")),
         "nothing but the loop's end clears it while the wall is out of view: {cleared:#?}"
     );
-    // NEGATIVE CONTROL: the agent works again under the wall.
+    // Negative control: the agent works again under the wall.
     let (told, cleared, lines) = run(hidden(&live));
     assert_eq!(told, [Some("spend"), None], "{lines:#?}");
     assert!(
@@ -4078,11 +4173,9 @@ fn an_exception_stands_while_its_wall_is_out_of_view_and_ends_when_the_agent_wor
     );
 }
 
-/// THE HOST TAKES NO STEP AT THE LOGIN WALL: the supervisor's `continue`
-/// answered by `⏺ Login expired · Please run /login` is no idle point for
-/// the host, so the live upgrade's notice is never typed into it. Once the
-/// person's `/login` is done (`⎿  Login successful`) the point is the
-/// host's — the NEGATIVE CONTROL: the host does step there.
+/// The host takes no step at the login wall: a `continue` answered by `⏺ Login expired ·
+/// Please run /login` is no idle point, so the upgrade's notice is never typed into it.
+/// Negative control: once `/login` succeeds (`⎿  Login successful`) the host steps there.
 #[test]
 fn the_host_takes_no_step_at_the_login_wall_and_steps_once_it_is_back() {
     use aterm_phase::prompt::fixtures::{LOGIN_EXPIRED, screen};
@@ -4116,8 +4209,8 @@ fn the_host_takes_no_step_at_the_login_wall_and_steps_once_it_is_back() {
         let (dir, journal) = journal_file("login-wall-host");
         let mut m = Mock::new(true, screens);
         m.vanish_after = Some(3);
-        // The cursor in the prompt box, where Claude Code keeps it at an idle
-        // point: main reads `idle` only where the box holds the cursor.
+        // The cursor in the prompt box, where Claude Code keeps it at an idle point (the
+        // server's idle is the box that holds the cursor).
         m.cursor_on_caret = true;
         let opts = SuperviseOpts {
             idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
@@ -4137,16 +4230,9 @@ fn the_host_takes_no_step_at_the_login_wall_and_steps_once_it_is_back() {
     assert_eq!(steps, 1, "the login back is the host's point: {lines:#?}");
 }
 
-/// The agent's own background work is a break the host is offered: busy
-/// sessions are upgraded at their next natural break, and the notice
-/// interrupts the agent's orchestration once. A busy read whose only busy
-/// signal is work the agent left running (`✻ Crunched for … · done … · 1 shell
-/// still running`, the footer's `· 1 shell ·`), stood [`background_settle`],
-/// is offered to the host that asks for a point ([`IdleHost::at_background`]),
-/// journaled `HOST seq=<n> background <word>`, and is no idle point
-/// (`at_idle` is never asked there). Negative controls: a live turn's spinner
-/// is never a break; a break short of its settle is not offered; a host that
-/// asks for no point is offered nothing.
+/// A break of the agent's own background work (`… · 1 shell still running`) that stood
+/// [`background_settle`] is offered to the host ([`IdleHost::at_background`]) and is no idle
+/// point. Negative controls: a live spinner, a break short of its settle, a host asking nothing.
 #[test]
 fn a_break_of_the_agents_background_work_is_offered_to_the_host_once_it_stood() {
     let bg = || {
@@ -4199,14 +4285,9 @@ fn a_break_of_the_agents_background_work_is_offered_to_the_host_once_it_stood() 
     assert_eq!(run(bg(), Duration::ZERO, false).0, 0, "no point asked for");
 }
 
-/// The loop says which guard withheld a point: the real loop, over scripted
-/// screens, tells a host that asked for a point which guard kept it from one
-/// ([`IdleHost::withheld`]), once while the guard stands however many reads
-/// it lasts, and the hooks fire exactly at a settled break and at an idle
-/// point. The weekly limit's notice on screen at a break of the agent's own
-/// work is a wall, and no break is offered there. Negative controls: the same
-/// break without the notice is offered (the wall alone withheld it); a host
-/// that asks for no point is told nothing.
+/// The loop tells a host that asked for a point which guard withheld it
+/// ([`IdleHost::withheld`]), once while the guard stands; the weekly notice at a break is a
+/// wall. Negative controls: the bare break is offered; a host asking nothing is told nothing.
 #[test]
 fn the_loop_says_which_guard_withheld_the_point_the_host_asked_for() {
     let bg = |wall: bool| {
@@ -4241,18 +4322,13 @@ fn the_loop_says_which_guard_withheld_the_point_the_host_asked_for() {
         )
     };
     use Guard::{NoBackgroundWait, NotIdle, Settle};
-    // Tab #1's posture: the weekly limit's notice at a break of its own work.
-    // The reader now sees that wall behind the background work
-    // ([`aterm_phase::worker_phase`]): the screen is a LIMITED turn end, not a
-    // busy break, so the guard is the one every wall at a turn end draws
-    // (`NotIdle`, as the loop below says for `weekly_limited`), said once over
-    // every read, and no break offered. Before the reader saw it the guard was
-    // `Wall`; the invariant this test pins — a wall never draws a break — holds.
+    // The weekly notice at a break of the agent's own work reads as a limited turn end, not
+    // a busy break (`NotIdle`), said once over every read; no break offered.
     assert_eq!(
         run(vec![bg(true)], Duration::ZERO, true),
         (vec![NotIdle], 0, 0)
     );
-    // CONTROL: the same break with no notice is offered, and nothing withheld.
+    // Control: the same break with no notice is offered, and nothing withheld.
     let (withheld, offered, _) = run(vec![bg(false)], Duration::ZERO, true);
     assert!(
         withheld.is_empty() && offered >= 1,
@@ -4284,30 +4360,11 @@ fn the_loop_says_which_guard_withheld_the_point_the_host_asked_for() {
     assert_eq!(run(vec![bg(true)], Duration::ZERO, false), (vec![], 0, 0));
 }
 
-/// T1-b, A USAGE LIMIT'S NOTICE LEFT ON THE SCREEN A GRACE PAST ITS RESET IS
-/// THE IDLE POINT IT IS (the owner's ruling, "treat it as idle after reset +
-/// 1 h"; design record 2026-09-28, "No upgrade stuck forever", C9). Claude
-/// Code leaves its weekly notice standing after the reset until
-/// something is typed, and the loop read it as a wall for good — `NotIdle` at
-/// the point (the phase reads `limited`), `Wall` and `LimitEpisode` behind it
-/// — so the quiet upgrade never moved such a tab. The real loop over scripted
-/// screens: the weekly notice (its reset Sep 19, 11am PDT) at a turn end, the
-/// clock [`crate::harness::upgrade_drive::LIMIT_GRACE_S`] and half a minute
-/// past that reset. The episode opens as ever (`EVENT limited`), and the
-/// point is OFFERED to the host (`HOST seq=<n> upgrade step=…`), no guard
-/// said at it — by the episode's own reset, the transcript not asked. A
-/// notice naming no reset the loop can read is offered by the reset the
-/// agent's transcript names ([`IdleHost::limit_until`], asked then).
-/// NEGATIVE CONTROLS, each withheld as main withholds it (`NotIdle`, no
-/// step): a minute short of the grace; a notice naming no reset and a
-/// transcript naming none (a reset is never guessed); a LIVE limit — the
-/// notice naming next week's reset, the transcript's old one long past (the
-/// episode's own reading wins); and with a shell still running under the
-/// notice, the wall read through it is withheld short of its grace
-/// (`NotIdle`) and offered past it. And the
-/// model answering again after the notice, within the grace, is main's path
-/// unchanged: the episode closes (the host told `limited(false)`) and the
-/// answer is the point offered.
+/// A usage limit's notice left on the screen a grace past its reset is an idle point (Claude
+/// Code leaves it up until something is typed): offered by the episode's own reset, or by the
+/// transcript's ([`IdleHost::limit_until`]) where it names none. Negative controls
+/// (`NotIdle`): a minute short of the grace, no reset anywhere, a live limit naming next
+/// week's. Also a shell running under the notice, and the model answering within the grace.
 #[test]
 fn a_limit_notice_left_past_its_reset_and_its_grace_is_an_idle_point() {
     // The weekly notice's reset (`WEEKLY`), Sep 19 at 11am PDT, and its grace.
@@ -4436,10 +4493,8 @@ fn a_limit_notice_left_past_its_reset_and_its_grace_is_an_idle_point() {
         r.lines
     );
     assert_eq!(r.asks, 0, "the episode's own reset stands");
-    // A shell still running under the notice (tab 1's posture): the reader
-    // sees the wall through it, so the point is the wall's own — withheld
-    // short of the grace as any limit notice is (`NotIdle`, no break of the
-    // agent's own work offered), offered past it by the transcript's reset.
+    // A shell still running under the notice: the reader sees the wall through it, so it is
+    // withheld short of the grace (`NotIdle`, no break offered) and offered past it.
     let r = run(vec![at_break(unnamed)], short, Some(reset));
     assert_eq!(
         (r.withheld, r.steps, r.breaks),
@@ -4454,9 +4509,8 @@ fn a_limit_notice_left_past_its_reset_and_its_grace_is_an_idle_point() {
         r.lines
     );
 
-    // The model answering again after the notice, within the grace: the
-    // episode closes when the worker has worked, and the answer is the point
-    // offered.
+    // The model answering again within the grace: the episode closes when the worker has
+    // worked, and the answer is the point offered.
     let host = Arc::new(TestHost::default());
     host.wants.store(true, Ordering::SeqCst);
     let mut m = Mock::new(
@@ -4493,17 +4547,9 @@ fn a_limit_notice_left_past_its_reset_and_its_grace_is_an_idle_point() {
     assert_eq!(host.limit_asks.load(Ordering::SeqCst), 0);
 }
 
-/// A live limit that names no reset is never spent by an earlier notice's.
-/// The episode opens on the weekly notice (reset Sep 19, 11am PDT); the clock
-/// is [`crate::harness::upgrade_drive::LIMIT_GRACE_S`] and half a minute past
-/// it, so that notice is an idle point and the host steps there. The agent is
-/// continued and its retry meets `API Error: Rate limit reached for
-/// requests`, a live limit naming no reset, which leaves the episode's reset
-/// as it was (`Session::refresh_reset`). The loop withholds that point
-/// (`NotIdle`), asking the transcript for the reset (none). Negative control:
-/// judging by the episode's reset would read the live wall as spent and offer
-/// it. The same retry meeting the weekly notice again is still spent (same
-/// reset text).
+/// A live limit that names no reset (`API Error: Rate limit reached for requests`) is never
+/// spent by the weekly notice's reset its episode opened on: withheld (`NotIdle`). The same
+/// weekly notice again after the retry is still spent.
 #[test]
 fn a_live_limit_naming_no_reset_is_never_spent_by_an_earlier_notices_reset() {
     let reset = AFTER_RESET - 30;
@@ -4567,30 +4613,11 @@ fn a_live_limit_naming_no_reset_is_never_spent_by_an_earlier_notices_reset() {
     assert_eq!(steps, 2, "the same spent notice, offered: {lines:#?}");
 }
 
-/// T1-b, A BARE CLOCK TIME IS PLACED ON THE DAY THE TRANSCRIPT NAMES (C9).
-/// Claude Code printed `You've hit your session limit · resets 3pm
-/// (America/Los_Angeles)` the day before, at 13:02 PDT, and its transcript's
-/// limit row names that day's 15:00 (`quotaLimits.resetsAt`,
-/// [`IdleHost::limit_until`]). The notice stood overnight, and the loop
-/// starts again the next morning at 08:55 — an aterm update, a hot swap, a
-/// reaped worker — on a redrawn conversation that carries no done row. The
-/// words name no day; read as that morning's 3 pm they would withhold every
-/// point (`NotIdle`) and stretch the budget to it. The real loop over
-/// scripted screens reads the transcript's day: the point is OFFERED
-/// (`HOST seq=…`), and no `EXTEND` is said. NEGATIVE CONTROLS, each the loop's
-/// own reading — withheld, the budget stretched to today's 3 pm: a transcript
-/// naming none (a reset is never guessed), one naming another clock time the
-/// day before (another limit's), and one naming the same clock time a day after
-/// (a transcript moves a bare time only to an earlier day). A dated notice
-/// names its own day: the next-week control of
-/// `a_limit_notice_left_past_its_reset_and_its_grace_is_an_idle_point`.
-///
-/// THE SCREEN'S OWN PRINT IS EVIDENCE TOO (the done row, `done 1:02 PM`,
-/// Claude Code's stamp of when the turn ended on the wall): with it on the
-/// screen the session window's 3 pm after a 1:02 PM print is the day before's
-/// whatever the transcript names ([`Session::reset_unix_for`]), and the point
-/// is offered with no transcript at all. The same scenario, the done row
-/// drawn.
+/// A bare clock time (`resets 3pm`) is placed on the day the transcript names
+/// ([`IdleHost::limit_until`]): printed yesterday and read this morning on a redrawn screen,
+/// it is offered, not read as today's 3 pm (withheld, the budget stretched). Negative
+/// controls: a transcript naming none, another time, or a day after. A drawn done row (`done
+/// 1:02 PM`) places it by itself ([`Session::reset_unix_for`]).
 #[test]
 fn a_bare_clock_time_is_placed_on_the_day_the_transcript_names() {
     // Today's 3 pm PDT, six hours and five minutes after the clock.
@@ -4618,8 +4645,7 @@ fn a_bare_clock_time_is_placed_on_the_day_the_transcript_names() {
             "a notice naming a clock time and no day (done row: {printed})"
         );
     }
-    // The journal's lines (the host's step is noted there alone), then the
-    // printed ones.
+    // The journal's lines (where alone the host's step is noted), then the printed ones.
     let run = |named: Option<i64>, printed: bool| {
         let host = Arc::new(TestHost::default());
         host.wants.store(true, Ordering::SeqCst);
@@ -4672,9 +4698,8 @@ fn a_bare_clock_time_is_placed_on_the_day_the_transcript_names() {
             "{why}: today's 3 pm, the loop's own reading: {lines:#?}"
         );
     }
-    // The done row drawn: the print is yesterday's 13:02, and its 3 pm is
-    // yesterday's, whatever the transcript names — none, the day before's, or
-    // a day after (which moves nothing).
+    // The done row drawn: its 1:02 PM print puts 3 pm on yesterday, whatever the transcript
+    // names.
     for (why, named) in [
         ("none named", None),
         ("the day before", Some(yesterday)),
@@ -4689,26 +4714,11 @@ fn a_bare_clock_time_is_placed_on_the_day_the_transcript_names() {
     }
 }
 
-/// A Codex's wall is read by the loop in the zone Codex printed it in, as its
-/// upgrade reads it. codex-rs prints `try again at <time>` in its own process's
-/// zone (its `TZ`, else the machine's) and names none; the loop runs in the
-/// window's process, which a `TZ` exported in the tab's shell never reaches,
-/// while the upgrade reads the words in the Codex's zone
-/// (`upgrade_drive::codex_wall_reset`). A quiet `/exit` needs both the loop's
-/// point and the upgrade's clearance, and the continuation goes by the loop's
-/// reading alone. A real process stands in for the Codex (this test binary,
-/// parked, started with `TZ=UTC`), and the host places its wall's words as the
-/// window's host does ([`IdleHost::place_reset`]); the loop runs over scripted
-/// Codex screens, its clock at 15:55 UTC.
-///
-/// Late, the machine in America/Los_Angeles: `2:30 PM` is 14:30 UTC, a grace
-/// and 25 minutes past, and the point is offered. Negative control, a host
-/// that places nothing: the loop's zone reads 21:30 UTC, ahead, and withholds
-/// it. Early, the machine two hours east: `4:30 PM` is 16:30 UTC, 35 minutes
-/// ahead, so the live wall is withheld and no continuation is typed into it.
-/// Negative control: read as 14:30 UTC, spent, the live wall is offered and
-/// the agent continued into it (`CONTINUED … usage-resume`). Read right, a
-/// wall a minute short of its grace is still withheld.
+/// A Codex's wall is read in the zone Codex printed it in (`upgrade_drive::codex_wall_reset`):
+/// codex-rs prints `try again at <time>` in its own process's zone, which a `TZ` exported in
+/// the tab's shell never gives the window's process. With a stand-in Codex in `TZ=UTC`, a
+/// wall a grace past is offered and one ahead withheld (no continuation); read in the loop's
+/// zone, each verdict flips.
 #[test]
 fn a_codex_wall_is_read_by_the_loop_in_the_zone_the_codex_printed_it_in() {
     use aterm_phase::codex::fixtures as cx;
@@ -4744,11 +4754,12 @@ fn a_codex_wall_is_read_by_the_loop_in_the_zone_the_codex_printed_it_in() {
     let (home, _) = journal_file("codex-wall-zone");
     let walled = |when: &str| {
         let mut r = screen(cx::HIT_LIMIT);
+        let reset = "Oct 17th, 2026 1:14 PM.";
         let at = r
             .iter()
-            .position(|row| row == "Sep 25th, 2026 3:05 PM.")
+            .position(|row| row.ends_with(reset))
             .expect("the fixture's reset row");
-        r[at] = format!("{when}.");
+        r[at] = r[at].replace(reset, &format!("{when}."));
         r
     };
     assert!(
@@ -4806,7 +4817,7 @@ fn a_codex_wall_is_read_by_the_loop_in_the_zone_the_codex_printed_it_in() {
     // 14:30 UTC, 85 minutes before the clock.
     let short = TEST_NOW - 85 * 60 + grace - 60;
 
-    // LATE: the Codex's 14:30 UTC, a grace past — offered.
+    // Late: the Codex's 14:30 UTC, a grace past: offered.
     let r = run("2:30 PM", TEST_NOW, PDT, true, false);
     assert_eq!(r.steps, 1, "offered: {:?} {:#?}", r.withheld, r.lines);
     // Negative control: read in the loop's zone, 21:30 UTC: withheld.
@@ -4818,8 +4829,8 @@ fn a_codex_wall_is_read_by_the_loop_in_the_zone_the_codex_printed_it_in() {
     assert_eq!(r.steps, 0, "{:#?}", r.lines);
     assert_eq!(r.withheld.last(), Some(&Guard::NotIdle), "{:?}", r.withheld);
 
-    // EARLY: the Codex's 16:30 UTC, ahead — the live wall withheld, and no
-    // continuation typed into it.
+    // Early: the Codex's 16:30 UTC, ahead: the live wall withheld, and no continuation typed
+    // into it.
     let r = run("4:30 PM", TEST_NOW, CEST, true, false);
     assert_eq!(r.steps, 0, "{:#?}", r.lines);
     assert_eq!(r.withheld.last(), Some(&Guard::NotIdle), "{:?}", r.withheld);
@@ -4835,23 +4846,10 @@ fn a_codex_wall_is_read_by_the_loop_in_the_zone_the_codex_printed_it_in() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// The loop's own act, once the agent has taken it, never withholds a break.
-/// The loop continues a turn that ended after real work (`CONTINUED … keep
-/// going`), the agent's live turn is read, and its break of background work is
-/// offered to the host (`HOST seq=<n> background …`). Otherwise an agent that
-/// orchestrates all day never reaches an idle point and the upgrade never
-/// gets a look. Negative control: the same act followed straight by a break
-/// (no live turn read, the act perhaps queued behind work the reader missed)
-/// is not offered: no host line is stacked on a continuation the agent has
-/// not read.
-///
-/// **Tier-1 for `SupervisorBreakOffer`** (aterm-spec
-/// `supervisor_break_offer_model`): each script is a model path (`LoopActs`,
-/// `LiveTurn` or not, `BreakSettles`), and the real loop offers the break
-/// exactly where the model's `Offer` is enabled at its end. Each dial is
-/// caught: a guard on the judged point (`Judged`) withholds the taken act's
-/// break the real loop offers; a guard that asks nothing (`Blind`) offers the
-/// untaken act's break the real loop withholds.
+/// A break after the loop's own act is offered to the host once a live turn shows the agent
+/// took the act; otherwise an agent that orchestrates all day never gives the upgrade a look.
+/// Negative control: a break straight after the act is not. Tier-1 for `SupervisorBreakOffer`:
+/// the loop offers exactly where `Offer` is enabled; the `Judged` and `Blind` dials are caught.
 #[test]
 fn a_break_after_the_loops_own_taken_act_is_offered_to_the_host() {
     let ended = || {
@@ -4951,7 +4949,7 @@ fn a_break_after_the_loops_own_taken_act_is_offered_to_the_host() {
                 "{why}: {withheld:?}"
             );
         } else {
-            // The host is told which guard withheld the break (C5).
+            // The host is told which guard withheld the break.
             assert!(withheld.contains(&Guard::ActUntaken), "{why}: {withheld:?}");
             // Negative control: a guard that asks nothing stacks on it.
             assert!(blind.action_enabled("Offer", &walk(&blind)), "{why}");
@@ -4963,8 +4961,8 @@ fn a_break_after_the_loops_own_taken_act_is_offered_to_the_host() {
 /// fixed window: mock round trips with stalls and back-offs stretch on a
 /// loaded machine.
 enum Stop {
-    /// After a fixed window — only for arms that assert something did NOT
-    /// happen, where a longer run can only find more.
+    /// After a fixed window: only for arms that assert something did not happen, where a
+    /// longer run can only find more.
     After(Duration),
     /// Once the host shows `reached`, then `tail` more for the steps it cannot
     /// see (a journal line, a typed turn). Bounded at 60 s, so a loop that
@@ -4978,9 +4976,8 @@ impl Stop {
     }
 }
 
-/// Whether the journal at `path` holds the usage rule's continuation
-/// (`CONTINUED … rule=usage-resume@v1`): the [`Stop::reached`] of an arm that
-/// waits on it.
+/// Whether the journal at `path` holds the usage rule's continuation (`CONTINUED …
+/// rule=usage-resume@v1`), for an arm's [`Stop::reached`].
 fn continued_on_usage(path: &std::path::Path) -> bool {
     std::fs::read_to_string(path).is_ok_and(|j| {
         j.lines()
@@ -5015,9 +5012,9 @@ fn hosted_with_host_ledger(
     hosted_with_host_at(m, opts, host, stop_at, timing, ledger, None)
 }
 
-/// [`hosted_with_host`] with the loop's wall clock set to `clock` (unix
-/// seconds, PDT, [`test_zones`]) and RUNNING from it — a limit's reset read
-/// against it, and waited for in real time.
+/// [`hosted_with_host`] with the loop's wall clock set to `clock` (unix seconds, PDT,
+/// [`test_zones`]) and running from it: a limit's reset is read against it and waited for in
+/// real time.
 fn hosted_with_host_clocked(
     m: &mut Mock,
     opts: &SuperviseOpts,
@@ -5084,14 +5081,9 @@ fn hosted_with_host_at(
     (r, lines)
 }
 
-/// Claude Code's critical-memory banner at an idle point is the host's
-/// restart: the agent ended and relaunched on its conversation
-/// ([`IdleHost::restart`]), journaled `HOST seq=<n> restart:memory
-/// step=<word>`, nothing typed, nothing escalated. A restart that must wait
-/// (`wait:held`: a person's hand) is tried again on the back-off (`WAITING …
-/// restart:memory waits: …`), never escalated for it. Negative controls: a
-/// host that makes no restart, and one whose restart can never be made
-/// (`refused:…`), hand the point to a person with the banner's remedy.
+/// Claude Code's critical-memory banner at an idle point is the host's restart
+/// ([`IdleHost::restart`]; a `wait:held` tried again on the back-off), nothing typed or
+/// escalated. Negative controls: no restart, or a refused one, hands the point to a person.
 #[test]
 fn a_memory_banner_is_the_hosts_restart_and_escalated_only_when_it_cannot_be() {
     use aterm_phase::prompt::fixtures::{MEMORY_BANNER_IDLE, screen};
@@ -5184,27 +5176,18 @@ fn a_memory_banner_is_the_hosts_restart_and_escalated_only_when_it_cannot_be() {
 const TROUBLE_FACT: &str = "Memory past aterm's ceiling (215.1 GB; ceiling 17.0 GB, the Mac \
                             swapping 89 MB/s under memory pressure)";
 
-/// The memory ceiling in the loop warns first: caps and ceilings warn and
-/// block only when they must. The host measures the agent past `[harness]
-/// memory_ceiling` while no banner is on the screen.
+/// The memory ceiling in the loop warns first, the host measuring the agent past `[harness]
+/// memory_ceiling` with no banner on the screen:
 ///
-/// * With memory to spare (normal pressure, 60 GiB available: a 46 GiB
-///   ceiling), the 215 GiB runaway is a warning and nothing else: said once
-///   (`MEMORY seq=<n> …`, [`IdleHost::warn`]) naming the footprint, the machine
-///   and `a warning only: nothing is restarted`, and its idle point continued
-///   as any other.
-/// * In trouble (pressure warn, swapping 89 MB/s, 2 GiB available: a 17 GiB
-///   ceiling) with this agent the largest, the same measure is the banner's
-///   wall at the idle point: the host's restart (`HOST seq=<n> restart:memory
-///   step=adopted`, `RESTARTED … the agent, for its memory: …`), nothing typed
-///   or escalated; the warning names aterm's restart.
-/// * In trouble behind a larger agent: a warning (`another agent holds
-///   more`), the point continued, no restart.
+/// * With memory to spare (a 46 GiB ceiling), the 215 GiB runaway is a warning said once
+///   (`MEMORY seq=<n> …`, [`IdleHost::warn`]), `a warning only: nothing is restarted`, and
+///   the point continued.
+/// * In trouble (a 17 GiB ceiling) with this agent the largest, it is the banner's wall: the
+///   host's restart (`RESTARTED … the agent, for its memory: …`), nothing typed or escalated.
+/// * In trouble behind a larger agent: a warning (`another agent holds more`), continued.
 ///
-/// Negative controls: a healthy agent (450 MiB) in trouble, the runaway in
-/// trouble under `memory_ceiling = "off"`, and a host that measures nothing
-/// are each continued with nothing said; in trouble with a host that makes no
-/// restart, the point is the person's, with the measure and the remedy.
+/// Negative controls: healthy, the ceiling `off`, or nothing measured: continued, nothing
+/// said; in trouble with no host restart, the point is the person's.
 #[test]
 fn a_measure_past_the_ceiling_warns_and_restarts_only_when_the_mac_is_in_trouble() {
     use crate::supervise::memory::MemoryCeiling;
@@ -5225,10 +5208,8 @@ fn a_measure_past_the_ceiling_warns_and_restarts_only_when_the_mac_is_in_trouble
         host.larger_other_mib.store(other, Ordering::SeqCst);
         let restarts = !answers.is_empty() && trouble && other == 0 && mib == RUNAWAY_MIB;
         if restarts {
-            // The restarted agent is a fresh, small one: the episode ends
-            // (a test host whose one scripted answer is spent would
-            // otherwise be read as one that restarts no more, and the
-            // warning said again with the person's restart).
+            // The restarted agent is a fresh, small one, so the episode ends (else the spent
+            // test host reads as one that restarts no more).
             host.memory_at_restart.store(HEALTHY_MIB, Ordering::SeqCst);
         }
         *host.restarts.lock().unwrap() = answers.into();
@@ -5306,7 +5287,7 @@ fn a_measure_past_the_ceiling_warns_and_restarts_only_when_the_mac_is_in_trouble
     assert!(continued(&r), "continued as any point: {:#?}", r.lines);
     assert!(escalated(&r.m).is_empty(), "{:#?}", r.m.requests);
 
-    // IN TROUBLE, the largest: the restart at the idle point.
+    // In trouble, the largest: the restart at the idle point.
     let r = run(RUNAWAY_MIB, MemoryCeiling::Auto, true, 0, adopted());
     assert_eq!(r.restarted, ["memory"], "{:#?}", r.lines);
     assert!(
@@ -5333,7 +5314,7 @@ fn a_measure_past_the_ceiling_warns_and_restarts_only_when_the_mac_is_in_trouble
     assert!(escalated(&r.m).is_empty(), "{:#?}", r.m.requests);
     assert_eq!(typed(&r.m), 0, "nothing typed: {:#?}", r.m.requests);
 
-    // IN TROUBLE behind a larger agent: a warning, the point continued.
+    // In trouble behind a larger agent: a warning, the point continued.
     let r = run(
         RUNAWAY_MIB,
         MemoryCeiling::Auto,
@@ -5392,19 +5373,10 @@ fn a_measure_past_the_ceiling_warns_and_restarts_only_when_the_mac_is_in_trouble
     );
 }
 
-/// The machine's trouble comes to a standing idle point: an agent idle with no
-/// task yet, past the ceiling with memory to spare, is warned about at its
-/// point, which decides nothing; the machine then falls into trouble while
-/// the loop waits there, and the point is decided again at the top of the
-/// next step (the host's restart, not the next turn's end, which an idle agent
-/// never reaches). Or the trouble is first found by the POINT'S OWN reading
-/// (the host's cached measure expired since the turn's last busy read, which
-/// said a warning only), and the restart is made there, with no wait step
-/// between to say the new verdict. Either way the row standing when the host
-/// is asked names aterm's restart — never `a warning only: nothing is
-/// restarted` (and its `claude --resume` line) over it. Negative control:
-/// memory to spare throughout is warned about once, no restart asked,
-/// nothing typed.
+/// The Mac's trouble coming to a standing idle point (an idle agent warned about with memory
+/// to spare) is acted on there, whether found while the loop waits or by the point's own
+/// reading: the host's restart, the row standing at the ask naming aterm's restart. Negative
+/// control: memory to spare throughout, warned once, nothing restarted.
 #[test]
 fn trouble_that_comes_while_idle_decides_the_standing_point_again() {
     #[derive(Clone, Copy, PartialEq, Debug)]
@@ -5475,10 +5447,8 @@ fn trouble_that_comes_while_idle_decides_the_standing_point_again() {
         let (m, lines, journal, restarted, warned, _) = run(trouble);
         assert_eq!(restarted, ["memory"], "{trouble:?}: {lines:#?}");
         assert_eq!(typed(&m), 0, "{trouble:?}: {:#?}", m.requests);
-        // The warning is said again when the machine falls into trouble: its
-        // row (keyed per tab) names aterm's restart, not `a warning only`. A
-        // third may follow: this test host restarts no more once its one
-        // scripted answer is spent, and says so (the person's restart).
+        // Said again when the machine falls into trouble, the row naming aterm's restart. A
+        // third may follow: this host restarts no more once its one answer is spent.
         assert!(
             warned.len() >= 2,
             "{trouble:?}: said again on the new verdict: {warned:#?}"
@@ -5488,7 +5458,7 @@ fn trouble_that_comes_while_idle_decides_the_standing_point_again() {
             "{trouble:?}: {warned:#?}"
         );
         assert!(warned[1].ends_with(aterms), "{trouble:?}: {warned:#?}");
-        // …said BEFORE the host is asked: the row standing at the restart.
+        // …said before the host is asked: the row standing at the restart.
         let asked = journal
             .iter()
             .position(|l| l.starts_with("HOST seq=") && l.contains(" restart:memory step="))
@@ -5524,13 +5494,9 @@ fn login_lost_screen() -> Vec<String> {
     r
 }
 
-/// The ceiling behind a wall: an agent the machine's trouble is acted on for,
-/// whose turn ended on a wall of its own (the session limit hours off, a lost
-/// login, an overloaded API), is restarted there as at a plain idle point, not
-/// left thrashing the machine for as long as the wall stands. Negative
-/// controls: the same walls with the agent healthy restart nothing and say
-/// nothing of memory; the runaway with memory to spare restarts nothing (a
-/// warning only).
+/// The ceiling behind a wall (a session limit hours off, a lost login, a 529): an agent the
+/// Mac's trouble is acted on for is restarted there as at a plain idle point. Negative
+/// controls: healthy, nothing said of memory; memory to spare, a warning only.
 #[test]
 fn a_measure_acted_on_restarts_an_agent_idle_behind_a_wall() {
     let end_529 = aterm_phase::prompt::fixtures::screen(aterm_phase::prompt::fixtures::END_529);
@@ -5599,10 +5565,8 @@ fn a_measure_acted_on_restarts_an_agent_idle_behind_a_wall() {
     }
 }
 
-/// A session limit whose reset is hours off whatever the wall clock reads:
-/// `limited_screen`'s `resets 7:30pm` is read against the real clock, and in
-/// the hour after 7:30pm local it would read as already passed (continued at
-/// once, not waited out).
+/// A session limit whose reset is hours off whatever the wall clock reads (`limited_screen`'s
+/// `resets 7:30pm` would read as passed in the hour after 7:30pm local).
 fn limited_hours_off() -> Vec<String> {
     limited_screen()
         .into_iter()
@@ -5610,11 +5574,9 @@ fn limited_hours_off() -> Vec<String> {
         .collect()
 }
 
-/// The ceiling behind a limit with no restart here: in trouble, the person's
-/// restart is escalated with the measure, and the limit's own badge does not
-/// stand over it (one attention entry: the last set wins). Negative controls:
-/// healthy, and the runaway with memory to spare: the limit is waited out and
-/// nothing about memory is raised (the runaway is warned about once).
+/// The ceiling behind a limit with no restart here: in trouble, the person's restart is
+/// escalated and the limit's own badge does not stand over it. Negative controls: healthy, or
+/// memory to spare: the limit is waited out, nothing about memory raised.
 #[test]
 fn a_measure_acted_on_behind_a_limit_is_escalated_where_no_host_restarts() {
     let run = |mib: u64, trouble: bool| {
@@ -5650,7 +5612,7 @@ fn a_measure_acted_on_behind_a_limit_is_escalated_where_no_host_restarts() {
         last.contains("memory critical: restart it") && last.contains("Memory past aterm"),
         "{sets:#?}\n{lines:#?}"
     );
-    // Negative controls: the limit is waited out as ever.
+    // Negative controls: the limit is waited out.
     for (mib, warnings, why) in [(HEALTHY_MIB, 0, "healthy"), (RUNAWAY_MIB, 1, "spare")] {
         let (lines, sets, warned) = run(mib, why == "healthy");
         assert!(
@@ -5665,11 +5627,9 @@ fn a_measure_acted_on_behind_a_limit_is_escalated_where_no_host_restarts() {
     }
 }
 
-/// The machine's trouble comes while a limit is waited out: the limited point
-/// was decided with the runaway a warning only (memory to spare, reset hours
-/// off); trouble begins while the loop waits, and the point is decided again
-/// at the top of the next step (the restart, not hours later at the reset).
-/// Negative control: memory to spare throughout, nothing restarted.
+/// The Mac's trouble coming while a limit is waited out decides the limited point again at
+/// the next step (the restart, not hours later at the reset). Negative control: memory to
+/// spare, nothing restarted.
 #[test]
 fn trouble_that_comes_behind_a_limit_decides_the_standing_point_again() {
     let run = |troubled: bool| {
@@ -5714,17 +5674,10 @@ fn trouble_that_comes_behind_a_limit_decides_the_standing_point_again() {
 /// The weekly limit's reset (`resets Sep 19 at 11am`, PDT): 2026-09-19T18:00Z.
 const WEEKLY_RESET_AT: i64 = AFTER_RESET - 30;
 
-/// The continuation a memory wall stood in for: the measure acted on took the
-/// weekly limit's place at its notice, and the escalation (no host restart
-/// here) or a restart that could not be made replaced the limit's own wait.
-/// When the measure is no longer acted on (the footprint back under the
-/// ceiling, or the machine out of trouble), the point is decided again on that
-/// down edge: the limit by its own rule, the continuation at its reset
-/// (`CONTINUED … usage-resume@v1`). Ways in: the drop right after the
-/// escalation past the reset, the machine's recovery, a brief crossing while
-/// the reset is seconds off, and a refused restart (the measure falling after
-/// it, or while it was tried). Negative control: the measure staying acted on
-/// continues nothing (the person's restart stands).
+/// The continuation a memory wall stood in for: once the measure that took the weekly
+/// limit's place is no longer acted on (the footprint back under the ceiling, or the Mac out
+/// of trouble), the limit continues at its reset (`CONTINUED … usage-resume@v1`). Negative
+/// control: the measure staying acted on continues nothing.
 #[test]
 fn a_memory_wall_no_longer_acted_on_hands_the_limit_back() {
     use std::sync::atomic::AtomicUsize;
@@ -5738,9 +5691,8 @@ fn a_memory_wall_no_longer_acted_on_hands_the_limit_back() {
         /// The Mac leaves its trouble; the footprint stays.
         Recovers,
     }
-    // The run ends once the journal holds the continuation, or `window`
-    // after the move (a loaded machine takes its time; a control needs no
-    // more).
+    // The run ends once the journal holds the continuation, or `window` after the move (a
+    // control needs no more).
     let run = |tag: &str,
                clock: i64,
                restarts: Vec<Option<&'static str>>,
@@ -5786,9 +5738,8 @@ fn a_memory_wall_no_longer_acted_on_hands_the_limit_back() {
                 }
                 let asks = h.memory_asks.load(Ordering::SeqCst);
                 if crossing {
-                    // Decided healthy, the reset seconds off: the memory
-                    // crosses, is decided on (the edge, the reading, the
-                    // next step's ask), and falls back under.
+                    // Decided healthy with the reset seconds off: the memory crosses, is
+                    // decided on, and falls back under.
                     let at = crossed_at.load(Ordering::SeqCst);
                     if at == 0 {
                         h.memory_mib.store(RUNAWAY_MIB, Ordering::SeqCst);
@@ -5856,8 +5807,8 @@ fn a_memory_wall_no_longer_acted_on_hands_the_limit_back() {
     );
     assert!(continued(&lines), "(1) the drop: {sets:#?}\n{lines:#?}");
 
-    // (1b) The same, and the MAC recovers with the footprint as it was: a
-    // warning now, and the limit handed back.
+    // (1b) The same, and the Mac recovers with the footprint as it was: a warning now, and
+    // the limit handed back.
     let (lines, sets, _) = run(
         "mem-down-1b",
         AFTER_RESET,
@@ -5911,9 +5862,8 @@ fn a_memory_wall_no_longer_acted_on_hands_the_limit_back() {
         "(3) escalated first: {sets:#?}\n{lines:#?}"
     );
     assert!(continued(&lines), "(3) the drop: {sets:#?}\n{lines:#?}");
-    // (3b) The measure fell while the restart was tried: the refused
-    // restart's own read is under the ceiling already, and its escalation
-    // still stood in for the limit's wait — the point is handed back.
+    // (3b) The measure fell while the restart was tried: the refused restart's own read is
+    // already under the ceiling, and the point is handed back.
     let (lines, sets, restarted) = run(
         "mem-down-3b",
         AFTER_RESET,
@@ -5931,9 +5881,8 @@ fn a_memory_wall_no_longer_acted_on_hands_the_limit_back() {
     );
     assert!(continued(&lines), "(3b) the fall: {sets:#?}\n{lines:#?}");
 
-    // Negative control: the measure stays acted on: the person's restart
-    // stands, nothing typed over it (in a window many times what a passing
-    // case needs).
+    // Negative control: the measure stays acted on: the person's restart stands, nothing
+    // typed over it.
     let (lines, sets, _) = run(
         "mem-down-ctl",
         AFTER_RESET,
@@ -5947,18 +5896,10 @@ fn a_memory_wall_no_longer_acted_on_hands_the_limit_back() {
     assert!(!continued(&lines), "control: {sets:#?}\n{lines:#?}");
 }
 
-/// A plain idle point the memory took is handed back. With the machine in
-/// trouble and this agent the largest, its plain idle point is escalated for
-/// the person's restart where no restart is made (the host makes none,
-/// `relaunch` is off, or the host refused). When the trouble passes with the
-/// footprint unchanged, the measure is a warning again, so the point's own act
-/// comes back: the memory's badge taken down (`CLEARED seq=<n> memory
-/// attention=OK`, `meta unset attention`) and the point continued
-/// (`continue@v1`). The warning is said again, its last row `a warning only`.
-///
-/// Negative control: the trouble stays: the escalation stands, nothing is
-/// continued, the badge stays, and the warning still names the person's
-/// restart.
+/// A plain idle point the memory escalated (this agent the largest in trouble, no restart
+/// made: none offered, `relaunch` off, or refused) is handed back when the Mac recovers: the
+/// badge comes down (`CLEARED … memory attention=OK`), the point is continued, the warning
+/// said again as `a warning only`. Negative control: the trouble stays, and so does the badge.
 #[test]
 fn a_plain_idle_point_the_memory_escalated_is_handed_back_when_the_mac_recovers() {
     use std::sync::atomic::AtomicUsize;
@@ -6082,10 +6023,9 @@ fn a_plain_idle_point_the_memory_escalated_is_handed_back_when_the_mac_recovers(
                 .any(|l| l.starts_with("CLEARED seq=") && l.contains("memory attention=OK")),
             "{way:?}: {lines:#?}"
         );
-        // The warning said again with the verdict that holds now: every row
-        // before the recovery named the memory as acted on (the one said at
-        // the escalation the person's restart, as its badge is); the last is
-        // a warning only.
+        // Said again with the verdict that holds now: every row before the recovery names
+        // the memory as acted on (the escalation's, the person's restart); the last is a
+        // warning only.
         let (last, before) = warned.split_last().expect("warned");
         assert!(!before.is_empty(), "{way:?}: {warned:#?}");
         assert!(
@@ -6140,12 +6080,9 @@ fn a_plain_idle_point_the_memory_escalated_is_handed_back_when_the_mac_recovers(
     }
 }
 
-/// A restart the host refused, on a host that still restarts: the window's
-/// host answers `can_restart` the same after refusing one, and nothing asks it
-/// again while the point stands. The point is escalated `the restart could not
-/// be made`, and the warning row is said again with the person's restart,
-/// never left promising aterm's. Negative control: a restart the host made
-/// (`adopted`) keeps the `aterm restarts it` row and raises no badge.
+/// A restart the host refused on a host that still restarts is asked once: the point is
+/// escalated `the restart could not be made` and the row says the person's restart.
+/// Negative control: a restart made keeps `aterm restarts it`, no badge.
 #[test]
 fn a_refused_memory_restart_says_the_persons_restart_on_a_host_that_restarts() {
     let run = |answer: &'static str| {
@@ -6211,19 +6148,9 @@ fn a_refused_memory_restart_says_the_persons_restart_on_a_host_that_restarts() {
 const PERSONS_ROW: &str = "it holds the most memory; restart it yourself";
 const ATERMS_ROW: &str = "it holds the most memory, so aterm restarts it";
 
-/// A REFUSED MEMORY RESTART STANDS UNTIL THE HOST IS ASKED AGAIN. The
-/// refusals are the agent's own launch (`refused:one-shot`, `refused:self`) and
-/// stand for its life, so the person's restart the row names after one is not
-/// taken back at the next busy read: the clear there promised aterm's restart
-/// for the whole next turn, and the next idle point's refusal took it back —
-/// the row flipping every turn. The point is escalated, the agent works again,
-/// and its next idle point asks the host again: REFUSED, the row is the
-/// person's from the first refusal on, said once; ADOPTED, the restart is made,
-/// and only after it does the row name aterm's restart again (a latch never
-/// cleared would leave the person's) — said by the restart itself, on the
-/// measure it was made on: the relaunched agent is a small one, whose measures
-/// say nothing, and the person's `claude --resume` line left standing would
-/// resume the conversation aterm just relaunched a second time.
+/// A refused memory restart stands until the host is asked again (the refusals stand for the
+/// agent's life): the row stays the person's restart across turns, said once, until a restart
+/// adopted at a later point names aterm's again.
 #[test]
 fn a_refused_memory_restart_keeps_the_persons_row_until_the_host_is_asked_again() {
     let run = |tag: &str, second: &'static str| {
@@ -6314,16 +6241,9 @@ fn a_refused_memory_restart_keeps_the_persons_row_until_the_host_is_asked_again(
     );
 }
 
-/// A REFUSED RESTART AT CLAUDE CODE'S OWN MEMORY BANNER. The banner is the
-/// point's wall, not the host's measure: its escalation is not the measure's to
-/// hand back, and nothing asks the host again while it stands (the measure the
-/// point was read with stays the point's). The measure stops being acted on for
-/// a while — the Mac's trouble passes, or the footprint falls an eighth under
-/// the ceiling and the warning's episode ends — and comes back: the row is said
-/// again with the person's restart, as the badge says, never aterm's, and no
-/// restart is asked for. Clearing the refusal on that dip (or at the episode's
-/// end) promised aterm's restart beside `the restart could not be made` until a
-/// person acted.
+/// A refused restart at Claude Code's own memory banner: nothing asks the host again while
+/// the banner stands, and when the measure dips and comes back the row is said again with the
+/// person's restart, as the badge says, never aterm's.
 #[test]
 fn a_refused_restart_at_the_memory_banner_keeps_the_persons_row_when_the_measure_comes_back() {
     use aterm_phase::prompt::fixtures::{MEMORY_BANNER_IDLE, screen};
@@ -6432,15 +6352,9 @@ fn a_refused_restart_at_the_memory_banner_keeps_the_persons_row_when_the_measure
     }
 }
 
-/// A RESTART THAT TYPED ITS CARRY-ON:
-/// a host whose restart types the relaunched agent's carry-on itself says
-/// `continued` ([`IdleHost::restart`]) — a turn it typed, whose answer is
-/// the harness's: answered short, it is no short turn of the worker's. Here
-/// the memory banner's point starts no streak (a wall's point leaves it as
-/// it was); the host restarts and types the carry-on, and after its short
-/// answer the point is continued at once. NEGATIVE CONTROL: a restart that
-/// typed nothing (`adopted`) leaves the next turn the worker's own — a
-/// short turn, backed off.
+/// A restart that typed its carry-on (`continued`) typed a harness turn, so its short answer
+/// is no short turn of the worker's and the next point is continued at once. Negative
+/// control: one that typed nothing (`adopted`) leaves a worker's short turn, backed off.
 #[test]
 fn a_restart_that_typed_its_carry_on_typed_a_harness_turn() {
     use aterm_phase::prompt::fixtures::{MEMORY_BANNER_IDLE, screen};
@@ -6463,9 +6377,8 @@ fn a_restart_that_typed_its_carry_on_typed_a_harness_turn() {
             ],
         );
         m.stall_sleep = Some(Duration::from_millis(5));
-        // The restart at the banner's point, then the carry-on's answer at
-        // the next (the host told a second turn ran), and a tail for what is
-        // decided there.
+        // Stop at the carry-on's answer (the host told a second turn ran), with a tail for
+        // what is decided there.
         let (r, _) = hosted_with_host(
             &mut m,
             &opts,
@@ -6509,18 +6422,9 @@ fn a_restart_that_typed_its_carry_on_typed_a_harness_turn() {
     assert!(!continued(&lines), "{lines:#?}");
 }
 
-/// THE DECISION'S VERDICT KEPT FOR THE LOOP'S BOOKS (H6-HARNESS-1, the
-/// review of pass 3): a Fable limit that names its reset (`resets Oct 30 at
-/// 9pm`), its notice the transcript's newest entry — CONFIRMED — is
-/// relaunched on opus, and the host types the relaunched agent's carry-on
-/// (`continued`), so the transcript ends on that turn by the time the loop
-/// reads the point again to record the restart. Read again with the
-/// transcript asked, that read refused the wall the restart was made for,
-/// and the switch's way back lost its reset: `(from the launch's model, no
-/// return scheduled …)`, the session left on the fallback for good. Kept, the
-/// switch is the same as with no transcript at all: from fable, back at the
-/// reset (`2026-10-31T04:00:00Z`), and its ledger row says so; the
-/// transcript was asked at the decision only.
+/// The decision's verdict is kept for the loop's books: a confirmed Fable limit relaunched on
+/// opus records the same switch (from fable, back at the reset) after the host's carry-on has
+/// moved the transcript on; the transcript is asked at the decision only.
 #[test]
 fn a_model_buckets_relaunch_keeps_its_way_back_when_the_transcript_moves_on() {
     let fable = || {
@@ -6588,18 +6492,8 @@ fn a_model_buckets_relaunch_keeps_its_way_back_when_the_transcript_moves_on() {
     assert!(asks >= 1, "the decision asked: {asks}");
 }
 
-/// …AND EVERY OTHER BOOKS' READ OF A RELAUNCH (the review of pass 4: each
-/// reverted to a decision's read, no test failed). The same confirmed Fable
-/// limit, its relaunch on opus asked of the host, which answers
-/// `wait:changed` (the agent's own work runs: the relaunch is tried again on
-/// the restart back-off) or `refused:off` (not made: the point's own act
-/// instead). The point is read again for the loop's books after the ask —
-/// the wait's due time, the switch left unmade — by when the transcript has
-/// moved on (here, to a turn after the notice). Each keeps the decision's
-/// verdict: the transcript asked at the decision only (neither read takes
-/// anything else from the wall today — the restart's due time is cut at
-/// the reset only within the first back-off step — so the ask is what a
-/// read for the books must not make), and nothing said unconfirmed.
+/// A confirmed Fable limit whose relaunch is not made (`wait:changed`, `refused:off`) keeps the
+/// decision's verdict too: the transcript is asked at the decision only, nothing refused.
 #[test]
 fn a_model_buckets_relaunch_not_made_keeps_the_decisions_verdict() {
     let fable = || {
@@ -6663,15 +6557,9 @@ fn a_model_buckets_relaunch_not_made_keeps_the_decisions_verdict() {
     }
 }
 
-/// A model bucket's fallback and its way back are relaunches the host makes
-/// (`--model` on the relaunch line, session-only), never Claude's own
-/// `/model`. The Fable limit is relaunched on opus (`RESTARTED …
-/// rule=model-fallback@v1 relaunch --model opus (from fable, back at …;
-/// session-only)`), its ledger row read back as the open switch; a loop that
-/// starts after a switch whose reset has passed relaunches back on fable
-/// (`model-restore@v1`). Negative control: a fallback the host could not make
-/// is waited out to the reset (nothing typed, no badge), and nothing anywhere
-/// types `/model`.
+/// A model bucket's fallback and its way back are relaunches the host makes (`--model`,
+/// session-only), never Claude's own `/model`, the switch kept in the ledger. Negative
+/// control: a fallback the host could not make is waited out, nothing typed, no badge.
 #[test]
 fn a_model_bucket_is_relaunched_on_the_fallback_and_back_never_by_model() {
     let fable = || {
@@ -6750,8 +6638,7 @@ fn a_model_bucket_is_relaunched_on_the_fallback_and_back_never_by_model() {
     assert!(no_model(&m), "{:#?}", m.requests);
     let _ = std::fs::remove_dir_all(&dir);
 
-    // Negative control: the fallback could not be made: the reset waited
-    // out, nothing typed, no badge.
+    // Negative control: a fallback not made: the reset waited out, nothing typed, no badge.
     let (dir, ledger) = ledger_file("bucket-refused");
     let (m, lines, restarted) = run(
         vec![busy_screen(), fable()],
@@ -6778,12 +6665,9 @@ fn a_model_bucket_is_relaunched_on_the_fallback_and_back_never_by_model() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The host's step is taken in place: at the first authoritative idle point
-/// the host asked for, before the point's own act (the box is answered first;
-/// nothing is typed at a point the host took), and the loop runs on with its
-/// claim, policy memory (per-hour window, back-off, walls) and full
-/// `WAIT_STEP` waits. Negative control: a host that asks for nothing gets no
-/// step, and the point is continued.
+/// The host's step is taken in place, at the first idle point it asked for and after the box
+/// there is answered; nothing is typed at that point, and the loop runs on. Negative controls:
+/// a host asking for nothing gets the point continued; one owning the turn end, nothing typed.
 #[test]
 fn the_hosts_step_is_taken_at_the_idle_point_and_the_loop_runs_on() {
     let full = SuperviseOpts {
@@ -6798,8 +6682,6 @@ fn the_hosts_step_is_taken_at_the_idle_point_and_the_loop_runs_on() {
         busy_screen(),
         idle_screen(),
     ]);
-    // The cursor in the prompt box, where Claude Code keeps it at an idle
-    // point: the host's step reads the point with it.
     m.cursor_on_caret = true;
     m.stall_sleep = Some(Duration::from_millis(5));
     let (jdir, journal) = journal_file("idle-host");
@@ -6899,13 +6781,9 @@ fn the_hosts_step_is_taken_at_the_idle_point_and_the_loop_runs_on() {
     assert_eq!(count(&m, "@s-1 turn"), 0, "{:?}", m.requests);
 }
 
-/// A resumed Codex daemon client is the host's idle point: a daemon-mode Codex
-/// the upgrade relaunched redraws its conversation over a bare `›` composer
-/// (no placeholder), by whose layout no reader names Codex. A loop that has
-/// read no program yet (it typed nothing) would read the point generically,
-/// with no evidence, and never take the relaunch's carry-on. The host's step
-/// reads the program first, and the point is Codex's idle. Negative control: a
-/// program that is no agent (the shell) gets no step there.
+/// A resumed Codex daemon client (a bare `›` composer by whose layout no reader names Codex)
+/// is the host's idle point: the host's step reads the program first. Negative control: a
+/// program that is no agent (the shell) gets no step.
 #[test]
 fn a_resumed_codex_daemon_client_is_the_hosts_idle_point() {
     use aterm_phase::codex::fixtures as cx;
@@ -6941,14 +6819,9 @@ fn a_resumed_codex_daemon_client_is_the_hosts_idle_point() {
     run("zsh", false);
 }
 
-/// A relaunched Codex is the host's next idle point, where its carry-on is
-/// typed. The host's step at the old Codex's idle point relaunches it
-/// (`adopted`: moved, nothing typed) and asks for the next point; the
-/// relaunched TUI redraws its conversation with each end row's clock after
-/// ` • ` (`aterm_phase::codex::END_ROW_MARKS`), and the loop reads that as the
-/// ended turn it is, so the carry-on step is taken there, journaled after the
-/// adoption. Negative control: the same relaunched screen with its last end
-/// row gone (a turn still running) gets the relaunch and no carry-on.
+/// A relaunched Codex is the host's next idle point, where its carry-on is typed: its redrawn
+/// end rows (`aterm_phase::codex::END_ROW_MARKS`) read as the ended turn they are. Negative
+/// control: with its last end row gone (a turn running), no carry-on.
 #[test]
 fn a_relaunched_codex_0_159_is_the_hosts_next_idle_point_for_its_carry_on() {
     use aterm_phase::codex::fixtures as cx;
@@ -6975,9 +6848,7 @@ fn a_relaunched_codex_0_159_is_the_hosts_next_idle_point_for_its_carry_on() {
             journal: Some(journal.clone()),
             ..full.clone()
         };
-        // Both arms wait for what they assert did happen (the carry-on; the
-        // adoption) on the 60 s hang detector; the negative arm's tail is
-        // the window in which no carry-on may appear.
+        // The negative arm's tail is the window in which no carry-on may appear.
         let stop = if carried {
             Stop::reached(
                 |h| h.steps.load(Ordering::SeqCst) >= 2,
@@ -7030,21 +6901,10 @@ fn a_relaunched_codex_0_159_is_the_hosts_next_idle_point_for_its_carry_on() {
     assert_eq!(lines, ["upgrade step=adopted"], "{requests:?}");
 }
 
-/// The inline REPL is an idle point: Claude Code's inline renderer draws its
-/// REPL at the top of the pane with blank rows below, and a 40-row tail of a
-/// 150x50 pane holds the prompt box's bottom rule, footer and blank rows but
-/// never its caret. That tail (the cursor on the caret row above it,
-/// [`tail_misses_the_live_rows`], its last row blank) is read again whole and
-/// cut to the live zone (the server's own cut): the inline REPL is the idle
-/// point, and the host's step is taken. (The caret on the tail's first row,
-/// its top rule cut: [`drawn_above_tail`], the next test.) The point is read
-/// with each screen's terminal cursor ([`aterm_phase::read_at`]). Negative
-/// controls: the fullscreen REPL, drawn to its last row, is the idle point,
-/// read again whole where its tail holds a blank gap ([`gap_above_tail`]) and
-/// from the tail alone where it does not; the inline REPL half drawn is read
-/// whole and is no idle point; and the inline renderer relaunched in the same
-/// tab (the previous prompt box above the new launch line, the cursor under
-/// it) is no idle point until the new REPL is drawn.
+/// The inline REPL is an idle point: drawn at the top of a 150x50 pane, its caret is above
+/// the 40-row tail ([`tail_misses_the_live_rows`]), so the tail is read again whole and cut to
+/// the live zone. Controls: the fullscreen REPL (read whole only where its tail holds a blank
+/// gap); a half-drawn REPL and an inline relaunch before its new REPL are no idle point.
 #[test]
 fn an_inline_repl_above_the_tail_is_the_hosts_idle_point() {
     use aterm_phase::prompt::fixtures::{
@@ -7055,9 +6915,6 @@ fn an_inline_repl_above_the_tail_is_the_hosts_idle_point() {
         max: Duration::from_secs(30),
         ..SuperviseOpts::hosted()
     };
-    // A step expected: stop once it is taken (a positive arm must not race a fixed
-    // window under load); none expected: a fixed window, which a longer run can only
-    // fail by finding one.
     let run_rows = |repl: Vec<String>, row: usize, step: bool| {
         assert_eq!(repl.len(), 50, "a 50-row pane");
         let host = Arc::new(TestHost::default());
@@ -7099,11 +6956,8 @@ fn an_inline_repl_above_the_tail_is_the_hosts_idle_point() {
         "a blank tail read again whole: {reads:#?}"
     );
     // Negative controls.
-    // The fullscreen launch, drawn to its last row: its banner on the top
-    // rows and its composer at the foot, a blank gap between. The live zone
-    // counts the gap as one row and reaches the banner, so the tail (holding
-    // the gap, [`gap_above_tail`]) is read again whole, and the REPL is the
-    // idle point all the same.
+    // The fullscreen launch, drawn to its last row with a blank gap between banner and
+    // composer: the tail holding the gap ([`gap_above_tail`]) is read again whole.
     let (steps, reads, requests) = run(LAUNCH_REPL_READY, true);
     assert_eq!(steps, 1, "the fullscreen REPL: {requests:#?}");
     assert!(
@@ -7112,8 +6966,7 @@ fn an_inline_repl_above_the_tail_is_the_hosts_idle_point() {
             .any(|w| w[0] == "text --json tail=40" && w[1] == "text --json"),
         "drawn to its last row with a gap in the tail: read again whole: {reads:#?}"
     );
-    // The same screen with the gap filled (a full transcript, drawn to its
-    // last row with no gap): the tail alone, as before.
+    // The same screen with the gap filled (a full transcript): the tail alone.
     let launch = screen(LAUNCH_REPL_READY);
     let (row, _) = cursor(LAUNCH_REPL_READY).expect("a measured cursor");
     let filled: Vec<String> = launch
@@ -7140,17 +6993,10 @@ fn an_inline_repl_above_the_tail_is_the_hosts_idle_point() {
     assert_eq!(steps, 1, "the relaunched REPL: {requests:#?}");
 }
 
-/// THE TAIL THAT CUTS THE PROMPT BOX'S TOP RULE: the measured inline REPL one
-/// row lower in its 50-row pane, so its caret row — the cursor on it — is the
-/// tail's FIRST row and its top rule the row above the tail.
-/// `tail_misses_the_live_rows` does not see it: the cursor is not above the tail,
-/// the tail is not blank, and it holds no box. The tail, read with the
-/// cursor, decides nothing (the prompt box that holds the cursor has no top
-/// rule on it), and it ends on a blank row: it is read again whole and cut to
-/// the live zone ([`drawn_above_tail`]), where the REPL is the idle point
-/// and the host's step is taken. (One row lower again the whole box is in the
-/// tail, the cursor on its caret: an idle composer, read whole too, since what
-/// the loop reads of it lies above — `a_rating_card_above_the_tail_is_dismissed`.)
+/// A tail that cuts the prompt box's top rule (the caret on the tail's first row), which
+/// `tail_misses_the_live_rows` does not see, decides nothing (the box holding the cursor has
+/// no top rule in it) and ends blank, so it is read again whole and cut to the live zone
+/// ([`drawn_above_tail`]): the REPL is the idle point.
 #[test]
 fn a_tail_that_cuts_the_prompt_boxs_top_rule_is_read_in_the_live_zone() {
     use aterm_phase::prompt::fixtures::{INLINE_REPL_READY, cursor, screen};
@@ -7205,18 +7051,10 @@ fn a_tail_that_cuts_the_prompt_boxs_top_rule_is_read_in_the_live_zone() {
     );
 }
 
-/// THE RATING CARD ABOVE THE TAIL (the real Claude Code 2.1.286 of
-/// 2026-10-01, a 144x53 pane): the card on rows 11-12 and the composer's top
-/// rule on row 14, so the loop's 40-row tail starts on row 13 and holds the
-/// whole composer, the cursor on its caret, and neither card row. Its reader
-/// decides that tail — an idle composer — and, read once (`EVENT idle`, no `0`),
-/// the card stays up for good (18 of 18 probes on a live instance, the worker's
-/// last words lost with it). An idle composer under a blank
-/// tail is read whole and cut to the live zone, and the card is dismissed.
-/// `SURVEY_CARD_ABOVE_THE_TAIL_MEASURED` is the measured frame with the
-/// pane's blank rows put back; the screen after is the same with the card's
-/// three rows (head, options, the blank under them) gone, as the measured
-/// dismissal draws it.
+/// A rating card above the tail (Claude Code 2.1.286, a 144x53 pane, the card on rows 11-12)
+/// is dismissed: the 40-row tail holds only the idle composer over blank rows, which read
+/// alone would leave the card up for good, so the screen is read whole and cut to the live
+/// zone.
 #[test]
 fn a_rating_card_above_the_tail_is_dismissed() {
     use aterm_phase::prompt::fixtures::{SURVEY_CARD_ABOVE_THE_TAIL_MEASURED, screen};
@@ -7258,18 +7096,10 @@ fn a_rating_card_above_the_tail_is_dismissed() {
     );
 }
 
-/// A turn end the host let go is decided again. The point was decided once,
-/// as it came: while the upgrade owned turn ends, or passed over for the
-/// host's step; once the host owns nothing (its ownership lapsed after
-/// `OWNED_SETTLE_LOOKS`) the loop decides it again: continued. Both ways in:
-/// decided under the host's ownership that its step then lets go, and passed
-/// over for a step that owns nothing. Negative controls: a host that keeps
-/// owning it gets nothing typed; nor does a point a host step moved (its
-/// carry-on typed, the screen still showing the old point). Tier-1 for
-/// `SupervisorHostTurnEnd` (aterm-spec `supervisor_host_turn_end_model`): each
-/// run is a model path, and the real loop continues exactly where the model's
-/// `Redecide` is enabled at its end; the `Buggy` loop is caught at each
-/// (stranded where it waits on a let-go point, deciding a moved point).
+/// A turn end the host let go is decided again: owned and then let go, or passed over for a
+/// step that owns nothing, it is continued once the host owns nothing; one the host keeps, or
+/// a point a host step moved, gets nothing. Tier-1 for `SupervisorHostTurnEnd`: the loop
+/// continues exactly where `Redecide` is enabled, and the `Buggy` loop is caught.
 #[test]
 fn a_turn_end_the_host_let_go_is_decided_again() {
     let full = SuperviseOpts {
@@ -7283,14 +7113,9 @@ fn a_turn_end_the_host_let_go_is_decided_again() {
         host.lets_go.store(step == "HostLetsGo", Ordering::SeqCst);
         host.types.store(step == "HostMoves", Ordering::SeqCst);
         let mut m = Mock::new(true, vec![busy_screen(), idle_screen()]);
-        // The cursor in the prompt box, where Claude Code keeps it at an idle
-        // point (the server's idle is the box that holds the cursor).
         m.cursor_on_caret = true;
         m.stall_sleep = Some(Duration::from_millis(5));
         m.turn_releases = Some(1);
-        // Every arm takes the host's step: stop once it is taken, then long
-        // enough for the point decided again to be typed — or, where nothing
-        // is typed, for a turn typed in error to show.
         let (r, _) = hosted_with_host(
             &mut m,
             &full,
@@ -7353,10 +7178,8 @@ fn a_turn_end_the_host_let_go_is_decided_again() {
     }
 }
 
-/// The host is told when a turn ran since the last point
-/// ([`IdleHost::turn_ran`]), at the point a busy read came before, so the looks
-/// it counted start over. Negative control: a point read again with no busy
-/// read between (a repaint) tells it nothing.
+/// The host is told when a turn ran since the last point ([`IdleHost::turn_ran`]), so its
+/// looks start over. Negative control: repaints with no busy read between tell it nothing.
 #[test]
 fn the_host_is_told_a_turn_ran_only_when_one_did() {
     let full = SuperviseOpts {
@@ -7374,9 +7197,6 @@ fn the_host_is_told_a_turn_ran_only_when_one_did() {
         let _ = hosted_with_host(&mut m, &full, &host, stop, None);
         host.turns_ran.load(Ordering::SeqCst)
     };
-    // A turn expected: stop once the host is told, then long enough for a
-    // second telling to show; none expected: a fixed window, which a longer
-    // run can only fail by finding one.
     let ran = run(
         vec![idle_screen(), busy_screen(), idle_screen()],
         Stop::reached(
@@ -7400,14 +7220,45 @@ fn the_host_is_told_a_turn_ran_only_when_one_did() {
     );
 }
 
-/// A turn the host typed (a carry-on, a notice, [`HostStep::typed`]) is the
-/// harness's own, and its short answer is no short turn of the worker's: the
-/// streak stands as the worker's turns left it. Here the streak is one (the
-/// first point, work unknown) and the answer is short (`min_work` an hour): it
-/// stays one, and the back-off is the first point's. An answer of real work
-/// (`min_work` zero) ends the streak: continued at once. Negative control:
-/// after a step that ended the agent and typed nothing (`done:fresh`), the
-/// short turn is the worker's own: a streak of two.
+/// The host reads its usage tap at each decided idle turn end of a Claude Code
+/// ([`IdleHost::usage_tap`]), not at the books' reread. Negative control: a session at a
+/// usage limit has no idle point, and the host is never asked.
+#[test]
+fn the_host_reads_its_usage_tap_at_each_decided_idle_turn_end() {
+    let full = SuperviseOpts {
+        max: Duration::from_secs(30),
+        ..SuperviseOpts::hosted()
+    };
+    let run = |screens: Vec<Vec<String>>, stop: Stop| {
+        let host = Arc::new(TestHost::default());
+        host.owns.store(true, Ordering::SeqCst);
+        let mut m = Mock::new(true, screens);
+        m.stall_sleep = Some(Duration::from_millis(5));
+        m.vanish_after = Some(0);
+        let _ = hosted_with_host(&mut m, &full, &host, stop, None);
+        (
+            host.taps.load(Ordering::SeqCst),
+            host.turn_ends.load(Ordering::SeqCst),
+        )
+    };
+    let (taps, _) = run(
+        vec![idle_screen(), busy_screen(), idle_screen()],
+        Stop::reached(
+            |h| h.taps.load(Ordering::SeqCst) >= 2,
+            Duration::from_millis(300),
+        ),
+    );
+    assert!(taps >= 2, "each decided idle point: {taps}");
+    let (taps, _) = run(
+        vec![busy_screen(), weekly_limited()],
+        Stop::After(Duration::from_millis(300)),
+    );
+    assert_eq!(taps, 0, "a limit is no idle point");
+}
+
+/// A turn the host typed ([`HostStep::typed`]) is the harness's own: its short answer leaves
+/// the worker's short-turn streak as it was, and real work ends it. Negative control: after a
+/// step that typed nothing (`done:fresh`), the short turn is the worker's.
 #[test]
 fn a_turn_the_host_typed_is_no_short_turn_of_the_workers() {
     let full = SuperviseOpts {
@@ -7420,8 +7271,6 @@ fn a_turn_the_host_typed_is_no_short_turn_of_the_workers() {
         host.types.store(true, Ordering::SeqCst);
         host.ends.store(ends, Ordering::SeqCst);
         let mut m = Mock::new(true, vec![idle_screen(), busy_screen(), idle_screen()]);
-        // The cursor in the prompt box, where Claude Code keeps it at an idle
-        // point (the server's idle is the box that holds the cursor).
         m.cursor_on_caret = true;
         m.stall_sleep = Some(Duration::from_millis(5));
         let (jdir, journal) = journal_file("host-typed");
@@ -7429,9 +7278,8 @@ fn a_turn_the_host_typed_is_no_short_turn_of_the_workers() {
             journal: Some(journal.clone()),
             ..full.clone()
         };
-        // The host's step at the first point, then its answer's point (a
-        // busy read before it: the host is told a turn ran), and a tail for
-        // what is decided there.
+        // Stop at the answer's point (the host told a turn ran), with a tail for what is
+        // decided there.
         let (r, _) = hosted_with_host(
             &mut m,
             &opts,
@@ -7476,14 +7324,9 @@ fn a_turn_the_host_typed_is_no_short_turn_of_the_workers() {
     );
 }
 
-/// A turn the host typed holds the policy's acts, never the host's own next
-/// step: the upgrade's step after its notice reads its own evidence (the READY
-/// answer in the conversation's record), so an answer no read saw busy (the
-/// screen never moved) must not hold it. Here the host types its notice and
-/// asks for the next idle point on a screen that never changes: its second
-/// step is taken, and the policy types nothing meanwhile (the upgrade owns the
-/// point). Counting the host's turn as a policy act in flight would block the
-/// second step (checked in place).
+/// A turn the host typed holds the policy's acts, never the host's own next step: on a
+/// screen that never moves, the host's notice and then its second step are both taken, and
+/// the policy types nothing meanwhile.
 #[test]
 fn a_turn_the_host_typed_never_holds_the_hosts_next_step() {
     let full = SuperviseOpts {
@@ -7495,12 +7338,8 @@ fn a_turn_the_host_typed_never_holds_the_hosts_next_step() {
     host.owns.store(true, Ordering::SeqCst);
     host.again.store(1, Ordering::SeqCst);
     let mut m = Mock::new(true, vec![idle_screen()]);
-    // The cursor in the prompt box, where Claude Code keeps it at an idle
-    // point (the server's idle is the box that holds the cursor).
     m.cursor_on_caret = true;
     m.stall_sleep = Some(Duration::from_millis(5));
-    // Stop once the second step is taken, then long enough for a turn the
-    // policy must not type to show.
     let (r, _) = hosted_with_host(
         &mut m,
         &full,
@@ -7521,12 +7360,9 @@ fn a_turn_the_host_typed_never_holds_the_hosts_next_step() {
     assert_eq!(count(&m, "@s-1 turn"), 0, "the upgrade owns the point");
 }
 
-/// A host's same wait said again at one point is journaled once: a person's
-/// hold is looked at every twenty seconds, and a `HOST` row per look would push
-/// useful rows out of the kept journal. The host marks every look after the
-/// first a repeat ([`HostStep::repeat`]); the loop takes each step (here three
-/// at one point, owned throughout, nothing typed) and journals the first.
-/// Negative control: the same steps unmarked are journaled each time.
+/// A host's same wait said again at one point is journaled once: a person's hold is looked at
+/// every twenty seconds, so each later look is marked a repeat ([`HostStep::repeat`]).
+/// Negative control: unmarked, each is journaled.
 #[test]
 fn a_hosts_same_wait_said_again_at_one_point_is_journaled_once() {
     let full = SuperviseOpts {
@@ -7581,12 +7417,9 @@ fn a_hosts_same_wait_said_again_at_one_point_is_journaled_once() {
     assert_eq!(typed, 0);
 }
 
-/// A session its host says nobody has asked anything
-/// ([`IdleHost::taskless`]: its conversation holds only the harness's own
-/// turns) gets nothing at its turn ends: the report after a turn of work is
-/// not continued, the question not answered, nothing escalated. Negative
-/// control: the same points on a host that says nothing of it are continued
-/// and answered.
+/// A session its host says nobody has asked anything ([`IdleHost::taskless`]) gets nothing at
+/// its turn ends: no continuation, no answer, no escalation. Negative control: on a host that
+/// does not say so, both points are acted on.
 #[test]
 fn a_session_its_host_says_nobody_asked_anything_gets_nothing_typed() {
     let full = SuperviseOpts {
@@ -7641,13 +7474,9 @@ fn a_session_its_host_says_nobody_asked_anything_gets_nothing_typed() {
     }
 }
 
-/// The wake, counted: one turn (busy, the idle point, then the idle screen
-/// repainting with nothing the point is made of changing) and the next turn,
-/// under a policy that acts on nothing. On a host that pushes its agent
-/// verdict the idle point is waited on with one `await agent` that wakes when
-/// the verdict leaves `idle`, and no repaint costs a request; otherwise each
-/// repaint is an `await seq` that latches, a settle and a screen read.
-/// Negative control: the same script on the older host takes the old path.
+/// The wake, counted: one turn and six idle repaints under a policy that acts on nothing. A
+/// host that pushes its agent verdict waits out the idle point on one `await agent`, no
+/// repaint costing a request; otherwise each repaint is an `await seq`, a settle and a read.
 #[test]
 fn the_idle_wait_wakes_on_the_servers_verdict_not_on_every_repaint() {
     let ticking = |i: u32| {
@@ -7710,17 +7539,9 @@ fn the_idle_wait_wakes_on_the_servers_verdict_not_on_every_repaint() {
     );
 }
 
-/// A point read before the agent drew itself is waited on by its content,
-/// never by the server's verdict: with the agent's launch line still at the
-/// shell prompt, the reader cannot vouch for the point, and the verdict
-/// (already `idle`) never moves as the composer comes up. Here the host asks
-/// for a point from the start; the session is past its start (a busy frame
-/// first, as a relaunch in the same tab is, since the start window would pass
-/// this test without the vouch guard), then the launch line, then the agent's
-/// idle composer, and the host pushes its verdict: the host's step is taken
-/// on the composer, which only the vouch guard makes it wait for. Negative
-/// control: a first screen the reader vouches for (the idle composer) takes
-/// the step as it comes.
+/// A point read before the agent drew itself (its launch line at the shell prompt) is waited
+/// on by its content, never by the verdict, already `idle`, which never moves as the composer
+/// comes up. Negative control: a first screen the reader vouches for takes the step at once.
 #[test]
 fn a_point_read_before_the_agent_drew_itself_is_waited_on_by_its_content() {
     let launch = rows(&["% cd /w && '/Users//a/pkg/agents/claude' --model opus", ""]);
@@ -7729,8 +7550,6 @@ fn a_point_read_before_the_agent_drew_itself_is_waited_on_by_its_content() {
         host.wants.store(true, Ordering::SeqCst);
         host.lets_go.store(true, Ordering::SeqCst);
         let mut m = fenced(screens);
-        // The cursor in the prompt box, where Claude Code keeps it at an idle
-        // point (the server's idle is the box that holds the cursor).
         m.cursor_on_caret = true;
         m.agent_pushes = true;
         m.stall_sleep = Some(Duration::from_millis(5));
@@ -7751,9 +7570,8 @@ fn a_point_read_before_the_agent_drew_itself_is_waited_on_by_its_content() {
         assert_eq!(r, Ok(()));
         (host.steps.load(Ordering::SeqCst), m.requests)
     };
-    // A busy frame (the session past its start), then the launch line through
-    // the loop's settling reads (each read serves the next screen), then the
-    // composer comes up.
+    // A busy frame (past the start), then the launch line through the loop's settling reads,
+    // then the composer.
     let mut drawn = vec![busy_screen()];
     drawn.extend(vec![launch; 8]);
     drawn.push(idle_screen());
@@ -7764,12 +7582,9 @@ fn a_point_read_before_the_agent_drew_itself_is_waited_on_by_its_content() {
     assert_eq!(steps, 1);
 }
 
-/// The vendor's key guard (a box ignores keys pressed the instant it is
-/// drawn): a box is judged only on a read made once it has settled since a
-/// read first showed it. The young box is waited on (`await seq`, bounded by
-/// what is left of the settle) and read again, so the press is fenced on that
-/// fresh read, never on one a sleep made stale. Negative control: with no
-/// settle the press follows the first read at once.
+/// The vendor's key guard (a box ignores keys the instant it is drawn): a box is judged only
+/// on a read made once it has settled, so the press is fenced on that fresh read. Negative
+/// control: with no settle the press follows the first read.
 #[test]
 fn a_box_is_pressed_only_once_it_has_shown_the_settle() {
     for settle in [Duration::from_millis(300), Duration::ZERO] {
@@ -7816,12 +7631,9 @@ fn a_box_is_pressed_only_once_it_has_shown_the_settle() {
     }
 }
 
-/// A workflow subagent's rm-breaker box (`BOX_RM_WORKFLOW`) in the loop: at
-/// default power the engine presses `1` (the one-shot `Yes`, under the row
-/// guard of the box's first command row), raises no badge, and ledgers the
-/// breaker's refusal it answered over. Negative controls: under `approve =
-/// "safe"` (an operand under no scratch root) and `"none"` nothing is pressed
-/// and it is badged.
+/// A workflow subagent's rm-breaker box (`BOX_RM_WORKFLOW`) at full power: `1` pressed under
+/// the first command row's guard, no badge, the overridden refusal ledgered. Negative
+/// controls: under `approve = "safe"` (with `rm_breaker_ask`) and `"none"` it is badged.
 #[test]
 fn the_owners_workflow_rm_box_is_pressed_at_default_power() {
     let owners_box =
@@ -7891,18 +7703,10 @@ fn the_owners_workflow_rm_box_is_pressed_at_default_power() {
     }
 }
 
-/// A subagent's rm-breaker box in the host's loop
-/// (`policy/fixtures/owner-rm-breaker-subagent-2026-09-26.txt`: a
-/// `general-purpose` subagent's Bash box carrying the breaker's
-/// possibly-empty-variable note, in a bypass session launched in
-/// `/Users/_owner/clean` by uid 502). Under the host's default config
-/// (`SuperviseOpts::hosted_with` of `SupervisorConfig::default()`), bypass
-/// read off the footer before the box, the loop presses `1` once under the
-/// row guard of the box's first command row (and the generation fence where
-/// the host has it), raises no badge, and writes one ledger row:
-/// `allow-once@v1`, approved, its `unproven:` reason naming the breaker's kind
-/// and the operand under no scratch root. Negative control: the same box
-/// under `approve = "safe"` is escalated, badged as the rm breaker's.
+/// A subagent's rm-breaker box (`policy/fixtures/owner-rm-breaker-subagent-2026-09-26.txt`)
+/// is pressed `1` once by the host's default (fenced where the host can), no badge, one
+/// `allow-once@v1` row naming the breaker and the operand. Under `approve = "safe"` it is
+/// pressed with a `WARN`; with `rm_breaker_ask = true`, escalated.
 #[test]
 fn the_owners_subagent_rm_box_is_pressed_once_by_the_hosts_default() {
     let owners_box = || -> Vec<String> {
@@ -7928,8 +7732,7 @@ fn the_owners_subagent_rm_box_is_pressed_once_by_the_hosts_default() {
         max: Duration::from_secs(30),
         ..SuperviseOpts::hosted_with(&SupervisorConfig::default())
     };
-    // On a host without the generation fence, and on one with it: the press
-    // is the same guarded `1`, fenced where it can be.
+    // With and without the generation fence: the same guarded `1`, fenced where it can be.
     for gen_fence in [false, true] {
         let (ldir, ledger) = ledger_file(&format!("owners-subagent-box-{gen_fence}"));
         let script = vec![bypass_busy(), owners_box(), busy_screen()];
@@ -7984,9 +7787,8 @@ fn the_owners_subagent_rm_box_is_pressed_once_by_the_hosts_default() {
         let _ = std::fs::remove_dir_all(&ldir);
     }
 
-    // `approve = "safe"` as the default reads it: the box the safe rules
-    // cannot prove is pressed once with a warning (its own rule, the reason
-    // said on a `WARN` line), never handed to a person.
+    // `approve = "safe"` as the default reads it: the box the safe rules cannot prove is
+    // pressed once with a `WARN` line naming its rule, never handed to a person.
     let mut cfg = SupervisorConfig::default();
     cfg.set("approve", "safe").expect("the limit");
     let opts = SuperviseOpts {
@@ -8043,11 +7845,9 @@ fn the_owners_subagent_rm_box_is_pressed_once_by_the_hosts_default() {
     );
 }
 
-/// A box the policy hands over is escalated, a person answers it, and the
-/// worker goes busy on what they allowed, perhaps for hours. The badge goes at
-/// the first busy read after the box left (the box's own row leaving is the
-/// server's push that wakes the loop), never at the next idle point.
-/// Negative control: a box nobody answers keeps its badge while it shows.
+/// An escalated box a person answers is cleared at the first busy read after it left (its
+/// row leaving is the push that wakes the loop), never at the next idle point. Negative
+/// control: a box nobody answers keeps its badge.
 #[test]
 fn an_escalated_box_a_person_answered_is_cleared_while_the_worker_stays_busy() {
     let none = SuperviseOpts {
@@ -8072,9 +7872,8 @@ fn an_escalated_box_a_person_answered_is_cleared_while_the_worker_stays_busy() {
     let set = at("meta set attention owner=supervisor claude rm-breaker:");
     let unset = at("meta unset attention owner=supervisor");
     assert!(set < unset, "{:#?}", m.requests);
-    // After the escalation: the wait on the box's own row (it leaves: the
-    // person answered), the short settle, one read (busy), and the badge
-    // goes before the loop settles into the busy turn's own wait.
+    // After the escalation: the wait on the box's own row (it leaves: answered), the short
+    // settle, one busy read, and the badge goes before the busy turn's own wait.
     let after: Vec<&str> = m.requests[set + 1..=unset]
         .iter()
         .map(String::as_str)
@@ -8114,18 +7913,16 @@ fn an_escalated_box_a_person_answered_is_cleared_while_the_worker_stays_busy() {
     assert!(m.attention.is_some(), "still badged");
 }
 
-/// The options of the default in a `supervise` run: full power
-/// ([`auto`]'s every turn-end act limited, as its tests pin the approvals).
+/// [`auto`] at the default approval level, full power (its turn-end acts still limited).
 fn full_power_opts(notes: Option<PathBuf>) -> SuperviseOpts {
     let mut o = auto(60, notes);
     o.policy.approve = Approve::All;
     o
 }
 
-/// What a full-power press names (the ledger row, the notes line, the
-/// `APPROVED` line) is the decision's subject, not the parser's command: a
-/// workflow launch (whose command is empty) is named by its title, and the
-/// trust dialog's backstop names its warnings.
+/// What a full-power press names (the ledger row, the notes line, `APPROVED`) is the
+/// decision's subject, not the parser's command: a workflow launch by its title, the trust
+/// backstop with its warnings.
 #[test]
 fn full_power_ledgers_the_decisions_subject() {
     use aterm_phase::prompt::fixtures as f;
@@ -8186,11 +7983,9 @@ fn full_power_ledgers_the_decisions_subject() {
     let _ = std::fs::remove_dir_all(&ldir);
 }
 
-/// A box ticks its auto-deny countdown every second, and a tick is no sign the
-/// press was taken. A `1` the box never took (the countdown ticking on under
-/// the same box) is pressed once and handed over as "the box did not change
-/// after the press". Negative control: the same box followed by a busy screen
-/// (the press taken) is pressed once and not handed over.
+/// A box ticks its auto-deny countdown every second, and a tick is no sign the press was
+/// taken: a `1` the box never took is pressed once and handed over ("the box did not change
+/// after the press"). Negative control: a busy screen after it, not handed over.
 #[test]
 fn a_ticking_countdown_is_not_the_box_leaving() {
     use aterm_phase::prompt::fixtures as f;
@@ -8216,10 +8011,8 @@ fn a_ticking_countdown_is_not_the_box_leaving() {
         "{lines:?}"
     );
 
-    // Under a grid narrower than the ~113-cell countdown its tail wraps onto a
-    // row of its own. The countdown is then the two rows joined, and neither
-    // is part of the box's identity: the same box ticking is still pressed
-    // once and handed over.
+    // On a grid narrower than the ~113-cell countdown its tail wraps onto a row of its own;
+    // the two rows are one countdown, neither part of the box's identity.
     let wrapped = |left: &str| -> Vec<String> {
         let mut r = at(left);
         let i = r
@@ -8267,14 +8060,9 @@ fn a_ticking_countdown_is_not_the_box_leaving() {
     );
 }
 
-/// A ticking default-No box (the irreversible tool's unnumbered `Tool use`
-/// box, focus on `No`, with the auto-deny countdown) whose Enter the box never
-/// takes is pressed once: the focus moved to `Yes`, one fenced Enter, one
-/// `approved` ledger row carrying `vendor default was No`, then "the box did
-/// not change after the press". The moved focus is not part of the box's
-/// identity, so a countdown tick is not read as the box leaving. Negative
-/// control: the box followed by a busy screen (the Enter taken) is approved
-/// once and not handed over.
+/// A ticking default-No box whose Enter is not taken is pressed once (the focus moved to
+/// `Yes`, one fenced Enter, `vendor default was No` ledgered) and handed over: the moved focus
+/// is not the box's identity. Negative control: a busy screen after it, not handed over.
 #[test]
 fn a_ticking_default_no_box_whose_enter_is_not_taken_is_pressed_once() {
     use aterm_phase::prompt::fixtures as f;
@@ -8400,10 +8188,8 @@ fn focused_on(rows: &[String], prefix: &str) -> Vec<String> {
         .collect()
 }
 
-/// The safe rules (`approve = "safe"`) with the question answer on — a
-/// question is no permission, so no level limits it — and a person's quiet
-/// window of 10 s (`human_grace_s`): what the loop presses is the question
-/// answer alone.
+/// The safe rules with the question answer on (a question is no permission, so no level
+/// limits it) and a 10 s person's grace: the loop presses only the question answer.
 fn answering(max_s: u64, notes: Option<PathBuf>) -> SuperviseOpts {
     let mut opts = auto(max_s, notes);
     opts.policy.answer_questions = true;
@@ -8416,13 +8202,9 @@ fn guarded(row: &str) -> String {
     crate::supervise::policy::row_guard(row)
 }
 
-/// A four-tab question dialog (S6-01 to S6-05) is answered tab by tab: one
-/// fenced Enter each on the focused recommended option, then one on the
-/// review's `Submit answers`, five keys, every one `key if-gen=… if=<the
-/// focused row as drawn> enter`, no digit, no escalation, five
-/// `answer-recommended@v1` ledger rows, and each answer's `UNPROVEN` and
-/// `DIALOG` (its rows) in the journal. Under the safe rules no tab is capped
-/// by the parser's (empty) command.
+/// A four-tab question dialog (S6-01 to S6-05) is answered tab by tab: a fenced, guarded
+/// Enter on each recommended option and the review's `Submit answers`, five
+/// `answer-recommended@v1` rows, each answer's `UNPROVEN` and `DIALOG` journaled.
 #[test]
 fn a_four_tab_question_is_answered_tab_by_tab_and_submitted() {
     use aterm_phase::prompt::fixtures as f;
@@ -8494,10 +8276,8 @@ fn a_four_tab_question_is_answered_tab_by_tab_and_submitted() {
     let _ = std::fs::remove_dir_all(&jdir);
 }
 
-/// A host without the generation fence never gets a question key: the box is
-/// handed over naming why. The host sends no person stamp either, so the
-/// stand-in quiet (the screen still for 10 s, `await idle 10000`) is waited
-/// out first, once.
+/// A host without the generation fence never gets a question key: the box is handed over
+/// naming why, after the stand-in quiet (`await idle 10000`: no person stamp) once.
 #[test]
 fn a_question_on_a_host_without_the_generation_fence_is_handed_over() {
     use aterm_phase::prompt::fixtures as f;
@@ -8536,10 +8316,9 @@ fn a_question_on_a_host_without_the_generation_fence_is_handed_over() {
     );
 }
 
-/// The free-text row focused (S1-03): the focus moves up one row at a time
-/// (each move fenced, guarded on the row it leaves and seen landing before
-/// the next), then Enter on `❯ 1. Dark (Recommended)`. Never a digit, never
-/// Enter on `Type something.`.
+/// The free-text row focused (S1-03): the focus moves up one row at a time, each move fenced,
+/// guarded on the row it leaves and seen landing, then Enter on `❯ 1. Dark (Recommended)`.
+/// Never a digit.
 #[test]
 fn the_free_text_row_is_left_by_arrows_then_enter_never_a_digit() {
     use aterm_phase::prompt::fixtures as f;
@@ -8610,9 +8389,8 @@ fn a_person_typing_in_the_free_text_row_gets_the_question() {
     );
 }
 
-/// Multi-select (S3-06 → S3-16): Enter toggles option 1, the focus moves
-/// down to option 3 and Enter toggles it, then down to `Next` and Enter —
-/// and the next tab is answered in turn.
+/// Multi-select (S3-06 → S3-16): Enter toggles option 1, `↓ ↓` and Enter toggle option 3,
+/// `↓ ↓` and Enter take `Next`, and the next tab is answered in turn.
 #[test]
 fn multiselect_is_toggled_then_advanced() {
     use aterm_phase::prompt::fixtures as f;
@@ -8662,14 +8440,9 @@ fn multiselect_is_toggled_then_advanced() {
     );
 }
 
-/// On a multi-select, a check the supervisor did not make is a person's, even
-/// on a recommended option, and so is a check it made that reads unchecked
-/// again. Each is handed over, never toggled over. Three shapes: the S3-11
-/// capture read first (its checks a person's); a fresh tab whose recommended
-/// option 1 a person checked; and option 1 the loop checked, then a person
-/// unchecked and moved off, quiet since. Negative control:
-/// `multiselect_is_toggled_then_advanced` (every check the loop's own) is
-/// answered through.
+/// On a multi-select, a check the supervisor did not make is a person's (even on a
+/// recommended option), as is its own check undone: handed over, never toggled over. Shapes:
+/// the S3-11 capture, a fresh tab a person checked, the loop's check undone.
 #[test]
 fn a_check_the_supervisor_did_not_make_hands_the_multiselect_over() {
     use aterm_phase::prompt::fixtures as f;
@@ -8718,13 +8491,9 @@ fn a_check_the_supervisor_did_not_make_hands_the_multiselect_over() {
     }
 }
 
-/// The retry's premise is a screen that held still after the key: on one that
-/// never does (a row ticking outside the box's identity) the unseen Enter is
-/// never sent again; after [`MAX_UNSETTLED_WAITS`] waits that ran out the box
-/// is handed over. The retry is counted when it is written: a retry the fence
-/// skipped (`reason=changed`) is tried again before the box is handed over.
-/// Negative control: `a_dialog_that_did_not_take_the_key_is_keyed_again_
-/// once_then_handed_over`, where the screen holds still: two Enters.
+/// A question key is sent again only after the screen held still: on one that never does,
+/// the box is handed over after [`MAX_UNSETTLED_WAITS`]; a retry is counted when written, so
+/// one the fence skipped is tried again first.
 #[test]
 fn a_question_key_is_sent_again_only_after_the_screen_held_still_and_counted_when_written() {
     use aterm_phase::prompt::fixtures as f;
@@ -8769,10 +8538,8 @@ fn a_question_key_is_sent_again_only_after_the_screen_held_still_and_counted_whe
     );
 }
 
-/// A question key the server refuses `ERR busy input-unread` (a worker that
-/// has left its input unread) is ledgered refused and backed off, never
-/// re-sent at once and never escalated for it: the loop reads `status` and the
-/// box again, and keys it once the worker reads again.
+/// A question key refused `ERR busy input-unread` is backed off, never re-sent at once or
+/// escalated: the loop reads `status` and the box again and keys it once the worker reads.
 #[test]
 fn a_question_key_refused_busy_input_unread_is_backed_off_then_answered() {
     use aterm_phase::prompt::fixtures as f;
@@ -8808,11 +8575,9 @@ fn a_question_key_refused_busy_input_unread_is_backed_off_then_answered() {
     );
 }
 
-/// A WRAPPED FOOTER (aterm-phase's prompt.rs): the question dialog in a
-/// 44-column pane (MEASURED on 2.1.295, `… · Esc to` over `cancel`) read
-/// `idle` and sat unanswered and unescalated for ten minutes; read whole, it
-/// is answered as at any width: one fenced Enter on the focused recommended
-/// option, and nothing asked of the owner.
+/// A question dialog whose footer wraps (a 44-column pane on 2.1.295, `… · Esc to` over
+/// `cancel`) is read whole and answered as at any width: one fenced Enter on the
+/// recommended option, nothing asked of the owner.
 #[test]
 fn a_question_whose_footer_wraps_is_answered() {
     use aterm_phase::prompt::fixtures as f;
@@ -8833,11 +8598,8 @@ fn a_question_whose_footer_wraps_is_answered() {
     assert_eq!(m.attention, None, "nothing asked of the owner");
 }
 
-/// A draft typed into the composer while the turn ran does not withhold the
-/// dialog: the dialog is drawn in place of the composer, the draft hidden
-/// under it, and one fenced Enter on the recommended option answers it; the
-/// draft is back in the composer afterwards, never submitted, backspaced or
-/// typed over.
+/// A dialog drawn over a composer draft is answered with one fenced Enter, and the draft is
+/// never submitted, backspaced or typed over.
 #[test]
 fn a_question_drawn_over_a_draft_is_answered_and_the_draft_left_alone() {
     use aterm_phase::prompt::fixtures as f;
@@ -8864,10 +8626,8 @@ fn a_question_drawn_over_a_draft_is_answered_and_the_draft_left_alone() {
     );
 }
 
-/// A dialog that did not take the Enter (nothing changed after it) is not
-/// keyed again at once: the loop waits for the screen to hold still, reads
-/// again, sends the key once more, and then hands the box over: two keys in
-/// all, never a third.
+/// A dialog that did not take the Enter is keyed once more after the screen held still, then
+/// handed over: two keys, never a third.
 #[test]
 fn a_dialog_that_did_not_take_the_key_is_keyed_again_once_then_handed_over() {
     use aterm_phase::prompt::fixtures as f;
@@ -8899,15 +8659,9 @@ fn a_dialog_that_did_not_take_the_key_is_keyed_again_once_then_handed_over() {
     );
 }
 
-/// With nobody to hand it to (`watch`, the window's host), a dialog that takes
-/// no key is keyed again for as long as it stands, never at once: each try
-/// only after the screen held still since the last (`await idle 2000`
-/// latched) and after the press back-off (`WAITING … (try <n>)`), the session
-/// badged as information once it has missed for a while, nothing handed over.
-/// The same under `approve = "safe"`: a question is no permission. Negative
-/// control:
-/// `a_dialog_that_did_not_take_the_key_is_keyed_again_once_then_handed_over`,
-/// the one look, two keys and its manager.
+/// Unattended (`watch`), a dialog that takes no key is keyed again for as long as it stands,
+/// each try after the screen held still and the press back-off, badged once as information,
+/// never handed over; under `approve = "safe"` too (a question is no permission).
 #[test]
 fn unattended_a_dialog_that_takes_no_key_is_tried_on_the_back_off_and_never_handed_over() {
     use aterm_phase::prompt::fixtures as f;
@@ -8972,12 +8726,8 @@ fn unattended_a_dialog_that_takes_no_key_is_tried_on_the_back_off_and_never_hand
     let _ = std::fs::remove_dir_all(&jdir);
 }
 
-/// With nobody to hand it to, a screen that never holds still after the key
-/// (a row ticking outside the box's identity) is waited on the press back-off
-/// for as long as it lasts, and the unseen Enter is never sent again; nothing
-/// is handed over. Negative control: `a_question_key_is_sent_again_only_
-/// after_the_screen_held_still_and_counted_when_written`, the one look, which
-/// hands it to its manager.
+/// With nobody to hand it to, a screen that never holds still after the key is waited on the
+/// press back-off and the unseen Enter is never sent again; nothing is handed over.
 #[test]
 fn unattended_a_screen_that_never_holds_still_is_waited_on_the_back_off_never_keyed_again() {
     use aterm_phase::prompt::fixtures as f;
@@ -9008,10 +8758,9 @@ fn unattended_a_screen_that_never_holds_still_is_waited_on_the_back_off_never_ke
     let _ = std::fs::remove_dir_all(&jdir);
 }
 
-/// A person keyed the session 3 s before the read: no key until they have
-/// been quiet 10 s. The loop waits (woken early by any change, at most the 7 s
-/// left) and reads again, never escalating for it; the next read says 12 s,
-/// and the question is answered.
+/// A person keyed 3 s before the read: no key until they have been quiet 10 s. The loop
+/// waits (at most the 7 s left, woken by any change) and reads again, never escalating; at
+/// 12 s the question is answered.
 #[test]
 fn a_question_waits_for_a_persons_quiet_and_is_never_escalated_for_it() {
     use aterm_phase::prompt::fixtures as f;
@@ -9044,11 +8793,9 @@ fn a_question_waits_for_a_persons_quiet_and_is_never_escalated_for_it() {
     );
 }
 
-/// The same question answered twice since the last review point is the model
-/// re-asking it, and nobody else is there to answer: its third return is
-/// answered again after a pause (journaled `WAITING … re-asking it`), never
-/// handed over. The pause doubles with each further return (`reask_pause`),
-/// from the press back-off's first to its minute.
+/// The same question answered twice since the last review point is the model re-asking it:
+/// its third return is answered again after a pause (`WAITING … re-asking it`), never handed
+/// over; the pause doubles per return (`reask_pause`), up to a minute.
 #[test]
 fn a_question_asked_a_third_time_is_answered_again_after_a_pause() {
     use aterm_phase::prompt::fixtures as f;
@@ -9109,8 +8856,7 @@ fn a_question_asked_a_third_time_is_answered_again_after_a_pause() {
     let _ = std::fs::remove_dir_all(&jdir);
 }
 
-/// A live-geometry question under the default (the window's host):
-/// answered, `APPROVED seq=…`, one fenced Enter.
+/// A live-geometry question under the window's default is answered: one fenced Enter.
 #[test]
 fn a_live_question_box_is_answered_under_the_default() {
     use aterm_phase::prompt::fixtures as f;
@@ -9131,16 +8877,10 @@ fn a_live_question_box_is_answered_under_the_default() {
     assert!(m.presses()[0].ends_with(&format!(" if={} enter", guarded("❯ 1. Dark (Recommended)"))));
 }
 
-/// The text press is never unfenced, and its Enter never blind. Called
-/// directly (the loop answers such a dialog with its recommended option
-/// first), a policy text on a host whose `send` does not name its generation
-/// fence (`help send`), or whose reads carry no person count (`"human_seq"`,
-/// what `if-human=` names), is `Unconfirmed`, naming them, with nothing keyed
-/// or sent, and is never retried; and an Enter on the field's "own" text the
-/// loop does not remember writing (`AnswerTarget::OwnText`) is `Unconfirmed`,
-/// nothing keyed. Negative controls: the same text on a host that names the
-/// fences and sends the count is written (one `send`, no Enter), and the
-/// recommended option's Enter on the same screen is pressed.
+/// The text press is never unfenced and its Enter never blind: a policy text on a host whose
+/// `send` names no generation fence or whose reads carry no person count is `Unconfirmed`,
+/// never retried; so is an Enter on own text the loop does not remember writing. Negative
+/// controls: with both fences one `send` goes; the recommended option's Enter is pressed.
 #[test]
 fn the_text_press_refuses_a_host_that_cannot_fence_it_and_an_enter_it_did_not_earn() {
     use crate::supervise::policy::{Answer, AnswerTarget, QuestionPriority};
@@ -9250,8 +8990,7 @@ fn the_text_press_refuses_a_host_that_cannot_fence_it_and_an_enter_it_did_not_ea
 
 // ---- the session's own `questions` word, and the told choice -------------
 
-/// The window's policy (`session_questions` on) with the global switch as
-/// given.
+/// The window's policy (`session_questions` on) with the global switch `global`.
 fn hosted_answering(global: bool) -> SuperviseOpts {
     let policy = SupervisorConfig {
         answer_questions: global,
@@ -9263,13 +9002,9 @@ fn hosted_answering(global: bool) -> SuperviseOpts {
     }
 }
 
-/// The session's word over the global switch: a session's `meta set questions
-/// ask` hands its dialog to a person although the switch answers, naming the
-/// session's word; `recommended`, `long-term` and `short-term` answer it
-/// although the switch is off; an unknown word hands it over, naming the
-/// word. Negative controls: unset, the switch decides both ways; and a loop
-/// whose policy gives no session a say (`session_questions` off: `--no-answer`,
-/// an unreadable `answer_questions`) ignores the word (owner, 2026-09-23).
+/// The session's word over the global switch: `ask` hands the dialog over though the switch
+/// answers; `recommended`, `long-term`, `short-term` answer though it is off; an unknown word
+/// hands it over. Negative controls: unset, the switch decides; `session_questions` off.
 #[test]
 fn the_sessions_word_decides_its_question_dialog_over_the_switch() {
     use aterm_phase::prompt::fixtures as f;
@@ -9301,15 +9036,12 @@ fn the_sessions_word_decides_its_question_dialog_over_the_switch() {
         keys, 1,
         "the session's recommended answers under a switch that is off"
     );
-    // The priority words answer too, under a switch that is off (by the
-    // recommended option here: this host's `help send` names no fence, so no
-    // text can be fenced; `run_question_text_tests.rs` types them where it
-    // can).
+    // The priority words answer too under a switch that is off, by the recommended option:
+    // this host's `help send` names no fence (`run_question_text_tests.rs` types them).
     for word in ["long-term", "short-term"] {
         assert_eq!(run(false, Some(word), true).0, 1, "{word}");
     }
-    // A word this supervisor does not know is the person's, and the badge
-    // says which; never read as the global switch, which answers here.
+    // A word this supervisor does not know is the person's, named in the badge.
     let (keys, badge) = run(true, Some("sometimes"), true);
     assert_eq!(keys, 0, "an unknown word types nothing");
     assert!(
@@ -9329,11 +9061,9 @@ fn the_sessions_word_decides_its_question_dialog_over_the_switch() {
     );
 }
 
-/// Handed back: a dialog held for the person by the policy is answered once
-/// the word changes after the badge went up (the mock's
-/// `questions_after_badge`), read again while the loop waits
-/// (`HANDBACK_POLL`), the dialog decided afresh rather than passed over.
-/// Negative control: never handed back, never typed.
+/// Handed back: a dialog held for the person by the policy is answered once the word changes
+/// after the badge went up, read again while the loop waits (`HANDBACK_POLL`). Negative
+/// control: never handed back, never typed.
 #[test]
 fn a_dialog_held_by_the_policy_is_answered_when_handed_back() {
     use aterm_phase::prompt::fixtures as f;
@@ -9370,7 +9100,7 @@ fn a_dialog_held_by_the_policy_is_answered_when_handed_back() {
     // Negative control.
     assert!(run(None).0.is_empty(), "never handed back");
 
-    // Answered after the hand-back, it is the POLICY's answer: told once.
+    // Answered after the hand-back, it is the policy's answer: told once.
     let mut m = questioned(vec![q(f::QUESTION_ONE), busy_screen(), idle_screen()]);
     m.key_releases = Some(0);
     m.vanish_after = Some(2);
@@ -9386,12 +9116,8 @@ fn a_dialog_held_by_the_policy_is_answered_when_handed_back() {
     );
 }
 
-/// The told choice (its sound and animation) is the policy's alone: a person's
-/// input after the loop keyed the dialog makes its end theirs, so no `CHOSE`
-/// and no `story chose`. The choice the loop's own Enter made is told once
-/// ([`a_choice_is_told_at_the_first_busy_read_and_before_a_stop`],
-/// [`a_choice_is_told_when_the_reply_ends_before_any_busy_read`])
-/// (owner, 2026-09-23).
+/// The told choice (its sound and animation) is the policy's alone: a person's input after
+/// the loop keyed the dialog makes its end theirs, so no `CHOSE` and no `story chose`.
 #[test]
 fn a_dialog_a_person_keyed_after_the_loop_is_not_told_as_its_choice() {
     use aterm_phase::prompt::fixtures as f;
@@ -9411,13 +9137,9 @@ fn a_dialog_a_person_keyed_after_the_loop_is_not_told_as_its_choice() {
     });
     assert!(!lines.iter().any(|l| l.starts_with("CHOSE ")), "{lines:#?}");
 
-    // The person as the real server reports them: the `status` made for the
-    // second tab's decision sees them too (one stamp), so the answer is held
-    // for them (`HELD`) before the question's own wait; once the hold is over
-    // the loop answers the tab, but the end is still theirs. The person typed
-    // just now and the look after the hold finds their grace over
-    // ([`TYPED_NOW`]); the second tab sits until the loop keys it, and the
-    // loop is stopped at the worker's first busy read, where a choice is told.
+    // As the real server reports the person: the second tab's `status` sees them too, so the
+    // answer is held (`HELD`); the loop answers after the hold, but the end is theirs. It stops
+    // at the worker's first busy read, where a choice is told.
     let mut m = questioned(vec![
         q(f::QUESTION_TABS_INCIDENT),
         q(f::QUESTION_TABS_SECOND),
@@ -9474,18 +9196,10 @@ fn a_dialog_a_person_keyed_after_the_loop_is_not_told_as_its_choice() {
     );
 }
 
-/// The grace of a test that holds the loop for a person
-/// ([`Session::held_for_person`]; `[harness] human_grace_s`, the default's two
-/// minutes), and the person's stamps (`"human_ms"` on a read, `status
-/// human_ms=`) on either side of it: [`TYPED_NOW`], inside it by the whole
-/// grace, so the hold is decided with two minutes to spare and only a hang,
-/// never a loaded machine, ages them out of it first; and
-/// [`QUIET_PAST_GRACE`], whose grace is over. The hold is looked at again at
-/// once ([`Session::set_person_hold_wait`]), so no grace is waited out in real
-/// time: that look reads the age the next `status` reports. (A person staged
-/// a few milliseconds short of a grace is aged out of it by any preemption
-/// between the `status` that stamped them and the decision, since the hold
-/// is decided on the clock: [`Session::hands_off_until`].)
+/// The person's grace in tests that hold the loop for a person (`[harness] human_grace_s`,
+/// the default's two minutes). [`TYPED_NOW`] is inside it by the whole grace, so only a hang
+/// ages it out; [`QUIET_PAST_GRACE`] is past it. The hold is looked at again at once
+/// ([`Session::set_person_hold_wait`]), so no grace is waited out in real time.
 const PERSON_GRACE_S: u32 = 120;
 /// A person who typed just now ([`PERSON_GRACE_S`]).
 const TYPED_NOW: &str = "0";
@@ -9497,9 +9211,8 @@ fn stamp_ms(stamp: &str) -> u64 {
     stamp.parse().expect("an age in milliseconds")
 }
 
-/// [`Mock`] with the hosted loop's stop set the moment a read serves the
-/// worker busy: a loop stopped mid-turn (a policy edit's hand-over, a live
-/// upgrade's hand-off, the tab parked).
+/// [`Mock`] with the hosted loop's stop set the moment a read serves the worker busy: a
+/// loop stopped mid-turn.
 struct StopAtBusy<'m> {
     mock: &'m mut Mock,
     stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
@@ -9518,12 +9231,9 @@ impl Ctl for StopAtBusy<'_> {
     }
 }
 
-/// The told choice at the answer: `CHOSE`, its journal note and `story chose`
-/// (the chime and the rim pulse) go at the first busy read after the loop's
-/// last key (the worker working on the answer), naming that read's seq, as the
-/// escalation badge is cleared there; not when the worker's next turn ends,
-/// and not never for a loop stopped in that turn. Negative control: told once,
-/// never again at the turn's end.
+/// The told choice: `CHOSE`, its journal note and `story chose` go at the first busy read
+/// after the loop's last key, naming that read's seq, also for a loop stopped there.
+/// Negative control: told once, never again at the turn's end.
 #[test]
 fn a_choice_is_told_at_the_first_busy_read_and_before_a_stop() {
     use aterm_phase::prompt::fixtures as f;
@@ -9601,12 +9311,9 @@ fn a_choice_is_told_at_the_first_busy_read_and_before_a_stop() {
     );
 }
 
-/// The told choice on a short reply: the worker's reply can start and end
-/// inside the settle after the loop's Enter, so no read serves it busy. The
-/// dialog is done all the same once a settled read shows the worker at its
-/// composer with no dialog up: told there, naming that read, once. Negative
-/// control: the turn the continuation starts (busy, then idle again) tells
-/// nothing more.
+/// The told choice on a short reply that starts and ends inside the settle after the Enter
+/// (no busy read): told once, at the settled read showing the composer with no dialog.
+/// Negative control: the continuation's turn tells nothing more.
 #[test]
 fn a_choice_is_told_when_the_reply_ends_before_any_busy_read() {
     use aterm_phase::prompt::fixtures as f;
@@ -9661,15 +9368,9 @@ fn a_choice_is_told_when_the_reply_ends_before_any_busy_read() {
     );
 }
 
-/// A dialog the policy held to its end is not its choice: the loop answers tab
-/// 1 of a two-question dialog under `recommended`, and the session's word is
-/// `ask` by tab 2, so the dialog is held for a person, and whoever finishes it
-/// (a controller's `aterm drive answer`, a person) was not the policy: no
-/// `CHOSE`, no chime. Nor when someone answered a tab while it was held and
-/// the word was then handed back (the dialog drawn otherwise at the
-/// hand-back). Negative control: handed back with the dialog as it was held,
-/// the loop answers tab 2 itself, and the dialog is told once, both answers
-/// named.
+/// A dialog the policy held to its end is not its choice: held at tab 2 (`ask`) and finished
+/// by a controller or a person, or answered while held, it gets no `CHOSE`. Negative
+/// control: handed back as held, the loop finishes it and tells it once.
 #[test]
 fn a_dialog_the_policy_held_to_its_end_is_not_told_as_its_choice() {
     use aterm_phase::prompt::fixtures as f;
@@ -9739,8 +9440,7 @@ fn a_dialog_the_policy_held_to_its_end_is_not_told_as_its_choice() {
     assert_eq!(m.presses().len(), 2, "{:#?}", m.requests);
     assert!(chose(&lines).is_empty(), "{lines:#?}");
 
-    // Negative control: handed back as it was held: the loop answers tab 2
-    // itself, and the dialog is the policy's.
+    // Negative control: handed back as held, the loop answers tab 2: the policy's dialog.
     let mut m = questioned(vec![
         q(f::QUESTION_TABS_INCIDENT),
         q(f::QUESTION_TABS_SECOND),
@@ -9789,12 +9489,9 @@ fn controller_answer(m: &mut Mock, answer: &str, box_token: Option<&str>) -> (St
     (String::from_utf8(out).expect("utf-8"), code)
 }
 
-/// A controller's own choice for a session under its control: `answer @w 2`
-/// moves the focus one row (an arrow guarded on the focused row, fenced), sees
-/// it land, and presses Enter guarded on `❯ 2. Light`; never a digit. `--box`
-/// with the dialog's own token passes; another is refused with nothing typed,
-/// as is a free-text answer; `human` types nothing; no dialog is NO-BOX
-/// (owner, 2026-09-23).
+/// A controller's own choice: `answer @w 2` moves the focus one row (guarded, fenced), sees it
+/// land and presses Enter guarded on `❯ 2. Light`; never a digit. `--box` with another token
+/// is refused, as is a free-text answer; `human` types nothing; no dialog is NO-BOX.
 #[test]
 fn a_controllers_answer_moves_the_focus_and_presses_enter_on_its_choice() {
     use aterm_phase::prompt::fixtures as f;
@@ -9873,11 +9570,190 @@ fn a_controllers_answer_moves_the_focus_and_presses_enter_on_its_choice() {
     );
 }
 
-/// A controller's `recommended` on a multi-select answers the tab: both
-/// recommended options toggled, then `Next` (the seven fenced keys of the
-/// explicit `1, 3`), and `ANSWERED … enters=3 … next=<the next question>`, not
-/// one Enter that leaves the worker on the open tab. Negative control: the
-/// explicit answer's keys are the same.
+/// A controller's answer to CODEX's question (`status program=codex`): read by Codex's reader,
+/// by its answers' roles, and pressed as the window presses it — the answer's digit, which Codex
+/// chooses at once, guarded on the question's title row and fenced on the screen generation;
+/// never Enter, never a focus move. `--box` takes the question's own token, and `recommended`
+/// is the `(Recommended)` answer's digit. Negative controls: read by Claude Code's grammar (the
+/// session named `claude`, the reader `answer` used before), the same screen holds no question
+/// (NO-BOX, nothing typed); a person who keyed within the grace gets it (LEFT, nothing typed);
+/// another question's token is refused.
+#[test]
+fn a_controllers_answer_to_a_codex_question_presses_its_digit_under_the_title_row() {
+    use aterm_phase::codex::fixtures as cx;
+    let question = q(cx::QUESTION);
+    let token = crate::supervise::run::prompt_box_token(
+        &aterm_phase::Program::Codex
+            .reader()
+            .prompt(&question)
+            .expect("Codex's question"),
+    )
+    .expect("its token");
+    let title = guarded("  Question 1/1 (1 unanswered)");
+    for (answer, digit, said) in [
+        ("2", "2", "sub"),
+        (
+            "recommended",
+            "1",
+            "Question 1/1 (1 unanswered) → subtract (Recommended)",
+        ),
+    ] {
+        let mut m = questioned(vec![question.clone(), q(cx::END_OF_TURN)]);
+        m.program = "codex";
+        let (line, code) = controller_answer(&mut m, answer, Some(&token));
+        assert_eq!(
+            (line.as_str(), code),
+            (
+                format!("ANSWERED @s-w enters=1 answer={said} next=none\n").as_str(),
+                0
+            ),
+            "{answer}: {:#?}",
+            m.requests
+        );
+        let keys = m.presses();
+        assert_eq!(keys.len(), 1, "{answer}: {keys:#?}");
+        assert!(
+            keys[0].contains(" if-gen=") && keys[0].ends_with(&format!(" if={title} {digit}")),
+            "{answer}: {}",
+            keys[0]
+        );
+    }
+
+    // Negative controls: nothing typed.
+    for (program, human, box_token, want, code) in [
+        (
+            "claude",
+            "null",
+            None,
+            "NO-BOX @s-w no question dialog on the screen",
+            1,
+        ),
+        (
+            "codex",
+            "1500",
+            None,
+            "LEFT @s-w a person gave the session input",
+            0,
+        ),
+        (
+            "codex",
+            "null",
+            Some("deadbeef"),
+            "REFUSED @s-w the dialog on the screen is box=",
+            2,
+        ),
+    ] {
+        let mut m = questioned(vec![question.clone()]);
+        m.program = program;
+        m.human = vec![human];
+        let (line, c) = controller_answer(&mut m, "2", box_token);
+        assert!(line.starts_with(want), "{program}: {line}");
+        assert_eq!(c, code, "{program}: {line}");
+        assert!(m.presses().is_empty(), "{program}: {:#?}", m.requests);
+    }
+}
+
+/// A controller's answer to CODEX's question is never pressed unfenced: the digit's guard
+/// names only the question's title row, which another one-question dialog draws the same
+/// (`Question 1/1 (1 unanswered)`), so a host whose `help key` names no `if-gen=`, or a read
+/// that carried no generation, is NOT-SERVED with nothing typed. A host advertising the
+/// fence but rejecting it gets one fenced request and no retry — where the window's own
+/// press would fall back to the row guard alone. Negative control: the fenced host of
+/// [`a_controllers_answer_to_a_codex_question_presses_its_digit_under_the_title_row`] presses.
+#[test]
+fn a_controllers_answer_to_a_codex_question_is_never_pressed_unfenced() {
+    use aterm_phase::codex::fixtures as cx;
+    for host in [
+        "no if-gen= in help key",
+        "no gen on the read",
+        "advertised fence returns bare ERR",
+        "advertised fence returns usage",
+    ] {
+        let mut m = questioned(vec![q(cx::QUESTION), q(cx::END_OF_TURN)]);
+        m.program = "codex";
+        match host {
+            "no gen on the read" => m.sends_gen = false,
+            "no if-gen= in help key" => {
+                m.help = "key [id=<key>] [if=<re>] <name>: send a named key\n".to_string();
+            }
+            "advertised fence returns bare ERR" => m.key_replies.push_back(bare_err()),
+            "advertised fence returns usage" => {
+                m.key_replies.push_back(usage("key <name>"));
+            }
+            _ => unreachable!(),
+        }
+        let (line, code) = controller_answer(&mut m, "2", None);
+        let cannot = "NOT-SERVED @s-w this host cannot fence a question's key on the screen \
+                      generation";
+        if host.starts_with("advertised fence") {
+            // The fenced key the host turned away is named, and nothing else
+            // was tried (the shape of
+            // `a_controllers_answer_to_a_codex_question_is_not_pressed_when_the_fence_is_turned_away`).
+            assert!(
+                line.starts_with(&format!("{cannot}: `key if-gen="))
+                    && line.ends_with("and nothing was pressed without the fence (enters=0)\n"),
+                "{host}: {line}"
+            );
+        } else {
+            assert_eq!(
+                line,
+                format!("{cannot} (enters=0)\n"),
+                "{host}: {:#?}",
+                m.requests
+            );
+        }
+        assert_eq!(code, 3, "{host}: {line}");
+        let keys = m.presses();
+        assert_eq!(
+            keys.len(),
+            usize::from(host.starts_with("advertised fence")),
+            "{host}: {:#?}",
+            m.requests
+        );
+        assert!(keys.iter().all(|key| key.contains(" if-gen=")), "{keys:?}");
+    }
+}
+
+/// A controller's answer to CODEX's question whose FENCED key the host turns away (`ERR
+/// usage …`, or a bare `ERR` from a build that reads the option as a key name) is NOT-SERVED,
+/// nothing typed: the one key request is the fenced one. The window's own press drops the
+/// fence there and presses `key if=<title> 2` under the row guard alone, then (that turned away
+/// too) the unguarded fallback's `key 2` — which would land on whatever question is up.
+/// Negative control: the same host answering the fenced key presses it (ANSWERED).
+#[test]
+fn a_controllers_answer_to_a_codex_question_is_not_pressed_when_the_fence_is_turned_away() {
+    use aterm_phase::codex::fixtures as cx;
+    for refusal in [usage("key"), bare_err()] {
+        let said = refusal.stderr.trim().to_string();
+        let mut m = questioned(vec![q(cx::QUESTION), q(cx::END_OF_TURN)]);
+        m.program = "codex";
+        m.key_replies.push_back(refusal);
+        let (line, code) = controller_answer(&mut m, "2", None);
+        assert!(
+            line.starts_with(
+                "NOT-SERVED @s-w this host cannot fence a question's key on the screen generation: \
+                 `key if-gen="
+            ) && line.ends_with("and nothing was pressed without the fence (enters=0)\n"),
+            "{said}: {line}"
+        );
+        assert_eq!(code, 3, "{said}: {line}");
+        let keys = m.presses();
+        assert_eq!(keys.len(), 1, "{said}: one fenced key, no other: {keys:#?}");
+        assert!(keys[0].contains(" if-gen="), "{said}: {}", keys[0]);
+    }
+
+    let mut m = questioned(vec![q(cx::QUESTION), q(cx::END_OF_TURN)]);
+    m.program = "codex";
+    let (line, code) = controller_answer(&mut m, "2", None);
+    assert_eq!(
+        (line.as_str(), code),
+        ("ANSWERED @s-w enters=1 answer=sub next=none\n", 0)
+    );
+}
+
+/// A controller's `recommended` on a multi-select answers the whole tab: both recommended
+/// options toggled, then `Next` (the explicit `1, 3`'s seven fenced keys), and `ANSWERED …
+/// enters=3 … next=<the next question>`.
 #[test]
 fn a_controllers_recommended_on_a_multi_select_answers_the_whole_tab() {
     use aterm_phase::prompt::fixtures as f;
@@ -9931,15 +9807,10 @@ use std::collections::BTreeSet;
 
 type QState = BTreeMap<&'static str, i64>;
 
-/// The environment's actions in the question answer's machine: Claude
-/// Code reading the oldest key (the policy text's consume among them:
-/// whole, or its head dropped; a key read after the dialog closed is
-/// `KeyRefused`'s, into the composer), a person keying — their own copy of
-/// the policy text among it — their quiet returning, and a tab falling back
-/// to its recommended option under a text word (its pane too short for the
-/// text). The text's own are the policy text's model's
-/// (`supervisor_question_text_model`) alone; a model is explained by the
-/// ones it has ([`q_env`]).
+/// The environment's actions in the question answer's machine: Claude Code reading the
+/// oldest key (the policy text whole or its head dropped; a key read after the dialog closed
+/// is `KeyRefused`), a person keying (their own copy of the policy text among it), their
+/// quiet returning, and a tab falling back under a text word.
 const QUESTION_ENV: [&str; 17] = [
     "OpensOffChoice",
     "FitLostOnIt",
@@ -9960,19 +9831,16 @@ const QUESTION_ENV: [&str; 17] = [
     "KeyRefused",
 ];
 
-/// [`QUESTION_ENV`]'s actions that `model` has: the recommended path's
-/// model (`supervisor_question_answer_model`) leaves out the policy text's,
-/// which cannot fire where no text is written.
+/// [`QUESTION_ENV`]'s actions that `model` has: the recommended path's model leaves out the
+/// policy text's.
 fn q_env(model: &aterm_spec::derive::Model) -> impl Iterator<Item = &'static str> + '_ {
     QUESTION_ENV
         .into_iter()
         .filter(|a| model.actions.iter().any(|b| b.name == *a))
 }
 
-/// Every name in [`QUESTION_ENV`] is an action of the question answer's
-/// whole machine (the policy text's model), so [`q_env`]'s filter drops
-/// only the text's actions from the recommended path's — never a misspelt
-/// one — and the recommended path lacks only the text's.
+/// Every name in [`QUESTION_ENV`] is an action of the whole machine (the policy text's
+/// model), and the recommended path's model lacks only the text's.
 #[test]
 fn the_question_environment_names_the_machines_actions() {
     let whole = aterm_spec::derive::supervisor_question_text_model();
@@ -10000,32 +9868,22 @@ fn the_question_environment_names_the_machines_actions() {
     );
 }
 
-/// A read as the model sees it ([`q_projected`]): the tab, the focus, its
-/// parity, `typed`, `own`, `exact`, and — where the read's decision says —
-/// whether the tab falls back to its recommended option (`None`: the
-/// decision did not say, a hand-over).
+/// A read as [`q_projected`] sees it: tab, focus, parity, `typed`, `own`, `exact`, and the
+/// fallback where the read's decision says (`None`: a hand-over).
 type QRead = (i64, i64, i64, i64, i64, i64, Option<i64>);
 
-/// A read as the model sees it: the tab (the chips answered plus — a
-/// multi-select's toggles being tabs of their own in the model — its
-/// checked options, less `offset`; `Tabs` the review, `Tabs + 1` no
-/// dialog), the focus (0 on the row the real decider chooses on this very
-/// read, 1 anywhere else), its focus-order parity, text in the free-text
-/// row that is not the supervisor's own (`typed`), its own (`own`), a
-/// person's exact copy of the policy text (`exact`), and whether the tab
-/// falls back to its recommended option.
+/// A read as the model sees it: the tab (chips answered plus a multi-select's checked
+/// options, each toggle a tab in the model, less `offset`; `Tabs` the review, `Tabs + 1` no
+/// dialog), the focus (0 on the row the real decider chooses on this read, else 1), its
+/// focus-order parity, others' text in the free-text row (`typed`), the supervisor's own
+/// (`own`), a person's exact copy of the policy text (`exact`), and whether the tab falls
+/// back to its recommended option (`question::falls_back`).
 ///
-/// Under a text priority (`text`: the priority and the questions a `send`
-/// was really made on, from the requests — never the loop's memory) the
-/// decider is asked with the memory those sends give; `own` is the field
-/// holding exactly the priority's text, on a question a `send` was made on
-/// (ticked, on a multi-select), and `exact` the same text on one no `send`
-/// was made on; a multi-select the text goes to is ONE tab of the model
-/// (its text toggles nothing), and its chip ticking itself as the text
-/// lands (c4-09) is no tab answered; one that FALLS BACK toggles its
-/// recommended options as the recommended path does, each a tab. The tab
-/// falls back where the real decider's answer is its recommended option's
-/// (`question::falls_back`).
+/// Under a text priority, `text` carries the questions a `send` was really made on (from the
+/// requests, never the loop's memory): `own` is the field holding exactly the priority's text
+/// on such a question, `exact` the same text on any other. A multi-select the text goes to is
+/// one tab (its chip ticking itself is no tab answered); one that falls back toggles its
+/// recommended options, each a tab.
 fn q_projected(
     rows: &[String],
     tabs: i64,
@@ -10108,9 +9966,8 @@ fn q_projected(
                 text.is_some() && crate::supervise::policy::question::falls_back(d, &answer),
             )),
         ),
-        // Escalated: the row the decider would choose were it answered —
-        // the free-text row under a text priority, else option 1 (the
-        // review's submit).
+        // Escalated: the row the decider would choose were it answered: the free-text row
+        // under a text priority, else option 1 (the review's submit).
         _ if text.is_some() && !review => (focus == QuestionFocus::FreeText, None),
         _ => (
             matches!(
@@ -10142,11 +9999,9 @@ fn q_projected(
     )
 }
 
-/// The environment behaviour the model allows that explains a read: the
-/// fewest of [`QUESTION_ENV`] from `st` to a state that draws `want` with
-/// the person's quiet `quiet` — a person keying only where the read's stamp
-/// says one did (`new_input`). None explains it: the real loop saw what the
-/// model cannot reach.
+/// The fewest [`QUESTION_ENV`] actions from `st` to a state that draws `want` with the
+/// person's quiet `quiet`; a person keys only where the read's stamp says one did
+/// (`new_input`). Panics when none does: the loop saw what the model cannot reach.
 fn q_explained(
     model: &aterm_spec::derive::Model,
     st: &QState,
@@ -10188,12 +10043,9 @@ fn q_explained(
     panic!("no behaviour the model allows explains the read {want:?} (quiet {quiet}) from {st:?}");
 }
 
-/// One scenario of the bind: the real loop over `m`, projected request by
-/// request onto `model` (the committed one, or a variant of its constants
-/// for the dialog's shape), the dialog's tabs counted from `offset`.
-/// Returns the model state at its end, the keys the loop sent, and the
-/// state at the first read that showed a person not quiet (the negative
-/// control's).
+/// One scenario of the bind: the real loop over `m` projected onto `model` (the committed one
+/// or a variant of its constants), the dialog's tabs counted from `offset`. Returns the end
+/// state, the keys sent, and the state at the first read that showed a person.
 fn q_bound_on(
     m: &mut Mock,
     model: &aterm_spec::derive::Model,
@@ -10202,12 +10054,9 @@ fn q_bound_on(
     q_bound_with(m, model, offset, None, &answering(30, None), |_| {})
 }
 
-/// [`q_bound_on`] under the options `opts`, the session set up by `setup`
-/// first, and — `text` — a text priority: each `send` the loop makes is the
-/// model's `HarnessType`, which must be ENABLED where it goes, and must carry
-/// the generation fence, the row guard and the person fence, its body
-/// exactly that priority's text; a read's `own` is projected from the sends
-/// really made ([`q_projected`]).
+/// [`q_bound_on`] under `opts`, the session set up by `setup`, and the text priority `text`:
+/// each `send` is `HarnessType`, must be enabled where it goes, and carries the generation,
+/// row and person fences with exactly that priority's text.
 fn q_bound_with(
     m: &mut Mock,
     model: &aterm_spec::derive::Model,
@@ -10235,8 +10084,7 @@ fn q_projected_run(
     q_projected_run_as(m, model, offset, None)
 }
 
-/// [`q_projected_run`] under the text priority `text`, if any
-/// ([`q_bound_with`]).
+/// [`q_projected_run`] under the text priority `text`, if any.
 fn q_projected_run_as(
     m: &mut Mock,
     model: &aterm_spec::derive::Model,
@@ -10258,9 +10106,8 @@ fn q_projected_run_as(
     let mut last_question: Option<String> = None;
     for (at, (req, _)) in m.order.iter().enumerate() {
         if m.person_skipped.contains(&at) {
-            // A person keyed between the loop's read and this write, and the
-            // server's person fence skipped it (`reason=person`): the model's
-            // `PersonKey` then, and its own key or text is not enabled there.
+            // A person keyed between the read and this write and the person fence skipped it
+            // (`reason=person`): `PersonKey`, after which no harness key or text is enabled.
             assert!(model.fire("PersonKey", &mut st), "PersonKey at {st:?}");
             for action in ["HarnessMove", "HarnessEnter", "HarnessType"] {
                 if !model.actions.iter().any(|a| a.name == action) {
@@ -10358,14 +10205,9 @@ fn q_bound(m: &mut Mock) -> (QState, Vec<String>, Option<QState>) {
     )
 }
 
-/// The round trip: a person's key lands between the loop's last read and its
-/// question key (nothing on screen says so), and the key's person fence
-/// (`if-human=<the read's count>`, checked by the server under its lock)
-/// skips it: `OK skipped reason=person`, nothing written, and the loop sends
-/// nothing more on that read. Bound to the model: the skipped key is
-/// `PersonKey`, and neither harness key is enabled after it. Negative control:
-/// without the fence (`PersonFence = 0`) the model enables the key the server
-/// refused, and a host that sends no count gets no `if-human=` at all.
+/// The round trip: a person's key between the loop's last read and its question key is
+/// skipped by the person fence (`if-human=<n>`), the model's `PersonKey`. Negative controls:
+/// the model without the fence (`PersonFence = 0`) keys there; a host sending no count gets none.
 #[test]
 fn a_persons_key_between_the_read_and_the_write_skips_the_question_key() {
     use aterm_phase::prompt::fixtures as f;
@@ -10426,27 +10268,14 @@ fn a_persons_key_between_the_read_and_the_write_skips_the_question_key() {
     );
 }
 
-/// Tier-1 for `SupervisorQuestionAnswer` (aterm-spec
-/// `supervisor_question_answer_model`), the loop: the real `Session` over the
-/// scripted server, projected request by request. Each read is the model's
-/// `Read` after the fewest environment actions that explain it (the loop's
-/// key taken or not, a person's key where the read's stamp says one came,
-/// their quiet where it says it returned); each `key … up|down|enter` is
-/// `HarnessMove`/`HarnessEnter`, which must be enabled there; the `await idle
-/// 2000` after a read showing the box as keyed is `StillScreen`; every
-/// invariant is checked after every request. Three shapes:
+/// Tier-1 for `SupervisorQuestionAnswer` (aterm-spec `supervisor_question_answer_model`): the
+/// real loop projected request by request (each read `Read` after the fewest environment
+/// actions that explain it, each key `HarnessMove`/`HarnessEnter`, enabled where it goes):
 ///
-/// 1. The free-text row a person left focused, then quiet: `↑` twice (each
-///    seen landing), Enter, the next tab's Enter, the review's Enter.
-/// 2. A person keys while the focus is being moved (the read says 400 ms):
-///    nothing more is sent until their stamp says they are quiet. Negative
-///    control: where the real loop sent nothing, the model with the fence
-///    alone (`Buggy = 1`) enables the `↑`, and the committed model does not.
-/// 3. A dialog that takes no key: Enter, the screen still, Enter once more,
-///    and no third key in the one look (`MaxRetry = 1`). Unattended
-///    (`watch`), the loop keeps trying on the press back-off: every key is
-///    enabled at a bound that admits that many tries, each written only after
-///    the screen held still.
+/// 1. The free-text row a person left focused, then quiet: `↑ ↑` Enter, Enter, Enter.
+/// 2. A person keys while the focus is moved: nothing more until they are quiet; the
+///    fence-only model (`Buggy = 1`) would key there.
+/// 3. A dialog that takes no key: two Enters in one look (`MaxRetry = 1`); unattended, more.
 #[test]
 fn tier1_a_question_key_goes_only_where_the_model_allows() {
     use aterm_phase::prompt::fixtures as f;
@@ -10523,12 +10352,8 @@ fn tier1_a_question_key_goes_only_where_the_model_allows() {
     assert_eq!(st["retried"], tries - 1, "{st:?}");
 }
 
-/// The lone multi-select question (it draws the Submit tab, its button reads
-/// `Submit`, and a review follows), keyed through: nothing checked with the
-/// focus on 1 → 1 checked → the focus on 2, on 3 → 1 and 3 checked → the
-/// focus on the free-text row, on `Submit` → its review → no dialog. The
-/// screens are the hand-built fixture with the focus and checks moved as each
-/// key would, and a one-question review.
+/// The lone multi-select question (a Submit tab, a `Submit` button, a review) keyed through:
+/// the hand-built fixture with focus and checks moved as each key would, then its review.
 fn lone_multiselect_screens() -> Vec<Vec<String>> {
     use aterm_phase::prompt::fixtures as f;
     let fresh = q(f::QUESTION_MULTISELECT_ALONE);
@@ -10578,19 +10403,13 @@ fn lone_multiselect_screens() -> Vec<Vec<String>> {
     ]
 }
 
-/// Tier-1 for the downward moves: a `↓` is the model's `HarnessMove` as much
-/// as an `↑` is. Two more shapes, each on the model with the dialog's own
-/// constants:
+/// Tier-1 for the downward moves (a `↓` is `HarnessMove` as an `↑` is), each on the model with
+/// the dialog's own constants:
 ///
-/// 4. S2-01, a lone single-select question whose recommendation is option 2
-///    with the focus on option 1 (the model's `OpensOffChoice`; `Tabs = 1`,
-///    `Review = 0`: no Submit tab): `↓`, seen landing, then Enter, and the
-///    dialog closes.
-/// 5. The lone multi-select (`Tabs = 3`, a toggle being a tab of the model's
-///    own): Enter, `↓ ↓` Enter, `↓ ↓` Enter on `Submit`, the review's Enter,
-///    each Enter guarded on the `[ ]` row it toggles, the `Submit` button and
-///    the review's `1. Submit answers`; never a digit, never the free-text or
-///    chat row.
+/// 4. A lone single-select recommending option 2, the focus on 1 (`OpensOffChoice`;
+///    `Tabs = 1`, `Review = 0`): `↓`, then Enter.
+/// 5. The lone multi-select (`Tabs = 3`, each toggle a tab): Enter, `↓ ↓` Enter, `↓ ↓` Enter
+///    on `Submit`, the review's Enter, each Enter guarded on its row; never a digit.
 #[test]
 fn tier1_a_downward_move_and_a_multiselect_go_only_where_the_model_allows() {
     use aterm_phase::prompt::fixtures as f;
@@ -10639,20 +10458,16 @@ fn tier1_a_downward_move_and_a_multiselect_go_only_where_the_model_allows() {
     }
 }
 
-/// A person across the first-key wait: the decision read said no person, but
-/// the tab's first key waits about a second, and the server's stamp asked
-/// after it (`status`'s `human_ms=`) says a person keyed 300 ms ago, so
-/// nothing is sent; the loop reads again, decides again, and keys once, fenced
-/// on that read. Control: a host whose `status` carries no stamp keys on the
-/// first decision read.
+/// A person who keys during the first key's wait gets the dialog first: the stamp asked after
+/// the wait says 300 ms ago, so the loop decides again and keys once, fenced on that read.
+/// Control: a host whose `status` carries no stamp keys on the first read.
 #[test]
 fn a_person_who_keys_during_the_first_key_wait_gets_the_dialog_first() {
     use aterm_phase::prompt::fixtures as f;
     for stamped in [true, false] {
         let incident = q(f::QUESTION_TABS_INCIDENT);
         let mut m = questioned(vec![incident.clone(), incident, idle_screen()]);
-        // The decision read's `status` says no person; the one asked after
-        // the first-key wait says a person keyed 300 ms ago.
+        // The decision read's `status` says no person; the one after the wait, 300 ms ago.
         if stamped {
             m.human_ms_reads = VecDeque::from([None, Some(300)]);
         }
@@ -10695,11 +10510,10 @@ fn a_person_who_keys_during_the_first_key_wait_gets_the_dialog_first() {
     }
 }
 
-// --- THE DECLINE's keystrokes (`press.rs`) -----------------------------------
+// --- the decline's keystrokes (`press.rs`) -----------------------------------
 
-/// A host with both generation fences (`help` names `if-gen=` for `key` and
-/// `send`, `text --json` carries `"gen"`) and a person stamp (`"human_ms":
-/// null`: no person has keyed the session).
+/// A host with both generation fences (`key` and `send` name `if-gen=`, `text --json` carries
+/// `"gen"`) and a person stamp (`"human_ms": null`: nobody has keyed the session).
 fn fenced_both(screens: Vec<Vec<String>>) -> Mock {
     let mut m = fenced(screens);
     m.help = "key [id=<key>] [if=<re>] [if-gen=<e.s>] <name>: send a named key\n\
@@ -10754,14 +10568,9 @@ fn press_decline_on(m: &mut Mock, text: &str) -> Pressing {
         .expect("no failure")
 }
 
-/// The decline's keystrokes over the four screens Claude Code draws: one
-/// keystroke per fresh read of the box, each fenced on that read's generation
-/// and guarded on the row showing the state it answers (`down` from `❯ 1.
-/// Yes`, `tab` on `❯ 2. No`, the text sent into the open empty input, `enter`
-/// on the typed row); the Enter is the answer (`Press::Pressed`). Never a
-/// digit: on the refusal it is the bare `No`, which stops the worker for a
-/// person. (The mock's guards are the server's matcher over the last served
-/// screen, so a guard that matched no row would come back `OK skipped`.)
+/// The decline's keystrokes over the four screens Claude Code draws: one per fresh read, each
+/// fenced on its generation and guarded on the row it answers. Never a digit: on the refusal
+/// that is the bare `No`, which stops the worker for a person.
 #[test]
 fn a_decline_is_one_fenced_guarded_keystroke_per_fresh_read() {
     let text = press_text();
@@ -10795,11 +10604,8 @@ fn a_decline_is_one_fenced_guarded_keystroke_per_fresh_read() {
     );
 }
 
-/// A stale screen refuses the keystroke: the box ticks between the read and
-/// the `down` (the countdown does, every second), so the server answers the
-/// generation fence `OK skipped reason=changed` and nothing further is sent
-/// on that read (no Tab after a `down` that did not land). The press says so
-/// (`Press::Changed`); the loop reads and decides again.
+/// A stale screen refuses the keystroke: the box ticked between the read and the `down`, the
+/// fence answers `OK skipped reason=changed` (`Press::Changed`), and nothing follows.
 #[test]
 fn a_decline_keystroke_on_a_stale_screen_is_refused_and_nothing_follows_it() {
     let text = press_text();
@@ -10820,13 +10626,8 @@ fn a_decline_keystroke_on_a_stale_screen_is_refused_and_nothing_follows_it() {
     );
 }
 
-/// Negative controls: a decline is carried out only as far as each read
-/// proves, and whatever it cannot finish is `Unconfirmed` (the loop hands the
-/// box over); no `enter` is sent in any of them. A host whose `send` takes no
-/// generation fence writes nothing, nor does a read with no generation. A
-/// text that does not show in the input is not typed again. Text in the input
-/// that is not the decline's is never Entered. A box gone from a read is
-/// `Skipped`, with nothing more sent.
+/// Negative controls: a decline goes only as far as each read proves; what it cannot finish
+/// is `Unconfirmed` (handed over) with no `enter`, and a box gone is `Skipped`.
 #[test]
 fn a_decline_the_screen_does_not_confirm_is_never_entered() {
     use crate::supervise::policy::approval::tests as at;
@@ -10891,13 +10692,10 @@ fn a_decline_the_screen_does_not_confirm_is_never_entered() {
     assert_eq!(no_enter(&m).len(), 1, "{:#?}", m.requests);
 }
 
-/// One keystroke in flight, never written twice: the read after the Tab still
-/// shows `❯ 2. No` shut (Claude Code has not drawn the Tab yet), and the fence
-/// cannot see a keystroke written and not yet read. A second Tab would shut the
-/// input the first opens, and the reason sent after it would meet the closed
-/// Select, whose `1` (the text quotes `rm -rf $S/$1`) chooses `1. Yes`. So
-/// nothing is written on that read: the screen is read again, and the reason
-/// goes once the input shows open. Exactly one Tab.
+/// One keystroke in flight, never written twice: the read after the Tab still shows `❯ 2.
+/// No` shut, and the fence cannot see a key written but not yet drawn. A second Tab would
+/// shut the input, and the reason would meet the Select, whose `1` (the text quotes `rm -rf
+/// $S/$1`) chooses `1. Yes`; so the reason goes once the input shows open.
 #[test]
 fn a_decline_keystroke_not_drawn_yet_is_never_written_again() {
     let text = crate::supervise::policy::decline_text(
@@ -10937,14 +10735,9 @@ fn a_decline_keystroke_not_drawn_yet_is_never_written_again() {
     );
 }
 
-/// A keystroke the box never draws is handed over, never re-sent: the Tab's
-/// effect never shows, so after the bounded reads the box is handed over
-/// naming why (one Tab, no reason, no Enter). The memory outlives the call:
-/// deciding the same decline again on the same unmoved box writes nothing
-/// more. The reason is typed once across calls too: an open, empty input that
-/// never shows the text is never typed into again. Negative control: a fresh
-/// session (no memory) on the same unmoved screen writes the Tab; the refusal
-/// is the memory's, not the screen's.
+/// A keystroke the box never draws is handed over, never re-sent, and the memory outlives the
+/// call (the reason too is typed once). Negative control: a fresh session on the same screen
+/// writes the Tab.
 #[test]
 fn a_decline_keystroke_the_box_never_draws_is_handed_over_and_never_resent() {
     let text = press_text();
@@ -10999,14 +10792,9 @@ fn a_decline_keystroke_the_box_never_draws_is_handed_over_and_never_resent() {
     );
 }
 
-/// A keystroke whose answer never came may have been written: the connection
-/// closes on the reason's `send`, so the server may have typed it, and the
-/// next press on the same open input still showing nothing writes no second
-/// one (the box is handed over after the bounded reads). The Enter stays
-/// remembered after it lands: a read still showing the reason is the Enter not
-/// drawn yet, never one to send again. Negative control: the same open input
-/// with the first `send` answered `OK skipped` (nothing written) is typed into
-/// on the next press.
+/// A keystroke whose answer never came may have been written: after a `send` lost to a closed
+/// connection, or an Enter that landed, the same press writes no second one. Negative
+/// control: a `send` answered `OK skipped` is typed on the next press.
 #[test]
 fn a_decline_keystroke_whose_answer_never_came_is_never_written_again() {
     let text = press_text();
@@ -11080,12 +10868,9 @@ fn a_decline_keystroke_whose_answer_never_came_is_never_written_again() {
     assert_eq!(enters, 1, "{:#?}", m.requests);
 }
 
-/// A person keying the session gets it: a read whose person stamp says a
-/// person keyed 400 ms ago writes nothing more (`Press::Yielded`: the loop
-/// waits for their quiet); after the `↓`, no Tab. The read the press starts on
-/// is checked like every other. A host that stamps no person's input cannot
-/// say, and the box is handed over with nothing written. Negative control: the
-/// same box with no person (`null`) is declined all the way.
+/// A person keying the session gets the decline's box: a read stamped 400 ms ago writes
+/// nothing more (`Press::Yielded`), the first read included; a host that stamps no input
+/// hands the box over unwritten. Negative control: no person, declined all the way.
 #[test]
 fn a_person_keying_the_session_gets_the_decline_s_box() {
     let text = press_text();
@@ -11133,10 +10918,9 @@ const TALL_RM_TEXT: &str = "aterm harness (not the user): this command was not r
      its own as a short command, separate from the rest, its paths written as literal absolute \
      paths (a command run on its own keeps none of this one's shell variables).";
 
-/// The tall Bash box (`policy/fixtures/owner-bash-command-2026-09-24.txt`, 544
-/// rows) with its foot, from the question down, taken from one of the decline
-/// states (`cap-decline-1..4`: as drawn, focus on No, the amend input open,
-/// the reason typed), on a 48-row screen, with its note's `$S` made `var`.
+/// The tall Bash box (`policy/fixtures/owner-bash-command-2026-09-24.txt`) on a 48-row
+/// screen, its foot from the question down taken from a decline state (`cap-decline-1..4`),
+/// its note's `$S` made `var`.
 fn tall_state(foot_from: &[String], var: &str) -> Vec<String> {
     use crate::supervise::policy::approval::tests as at;
     let question = |rows: &[String]| {
@@ -11166,9 +10950,8 @@ fn tall_states(var: &str) -> [Vec<String>; 4] {
     decline_states(&text).map(|s| tall_state(&s, var))
 }
 
-/// Each tall screen served twice: the loop reads the last 40 rows and —
-/// the box's head cut by that tail — the whole screen again
-/// (`tail_misses_the_live_rows`), and the mock serves one screen per read.
+/// Each tall screen served twice: the loop reads the tail, then (the box's head cut) the
+/// whole screen (`tail_misses_the_live_rows`), and the mock serves one screen per read.
 fn each_read_twice(screens: &[Vec<String>]) -> Vec<Vec<String>> {
     screens
         .iter()
@@ -11192,17 +10975,9 @@ fn unfenced(write: &str) -> (String, Option<u64>) {
     (words.join(" "), gen_seq)
 }
 
-/// The tall box in the loop. Under the safe rules (`watch`'s `approve =
-/// "safe"`), in its bypass session, it is declined and nobody is asked: a box
-/// whose header is above the screen cannot be judged, so it is refused with
-/// the removal its note flags (`down` off `❯ 1. Yes`, `tab` on `❯ 2. No`, the
-/// reason sent into the open input, `enter` on the typed row), each on a fresh
-/// read (the tail, then the whole screen), fenced on that read's generation.
-/// The decline is an answer, not a review point: no badge, mail or `EVENT
-/// prompt`, never the digit `1` or a bare `2`; the ledger says `declined` under
-/// `tall-box@v1` with the text, the journal `DECLINED`. Every state is still
-/// taller than the screen. Full power declines it the same way (no option of
-/// a box not read whole is pressed: `policy/approval.rs`'s tests).
+/// The tall box under the safe rules, in its bypass session, cannot be judged (its head is off
+/// the screen), so it is declined with the removal its note flags, each write fenced on a
+/// fresh read; nobody is asked, and the ledger says `declined` under `tall-box@v1`.
 #[test]
 fn a_box_taller_than_the_screen_is_declined_in_the_loop_and_nobody_is_asked() {
     let [s1, s2, s3, s4] = tall_states("$S");
@@ -11297,13 +11072,9 @@ fn a_box_taller_than_the_screen_is_declined_in_the_loop_and_nobody_is_asked() {
     let _ = std::fs::remove_dir_all(&jdir);
 }
 
-/// A person at the tall box is not typed over: the reads the decline's
-/// keystrokes would go on say a person keyed 400 ms ago, so nothing is written
-/// on them (`Press::Yielded`, the loop decides again from a fresh read), and
-/// once the stamp says no person the decline goes as ever. Every write is
-/// fenced on a read after the last one that showed the person, and nobody is
-/// asked for the wait. Negative control: the loop test above, no person,
-/// declines on the first reads.
+/// A person at the tall box is not typed over: reads showing a person keyed 400 ms ago get
+/// no write (`Press::Yielded`), and once the stamp shows none the decline goes, every write
+/// fenced on a read after the last one that showed the person.
 #[test]
 fn a_person_at_the_tall_box_is_waited_for_and_then_it_is_declined() {
     let [s1, s2, s3, s4] = tall_states("$S");
@@ -11352,13 +11123,9 @@ fn a_person_at_the_tall_box_is_waited_for_and_then_it_is_declined() {
     );
 }
 
-/// The same box back after its declines is declined again (`approval_loop`'s
-/// module header): a worker told twice why its box was declined that raises
-/// the same tall box a third time has not acted on the reason yet, and nobody
-/// else is there to answer. It is declined again after a pause (`WAITING …
-/// declined again in <n> ms`), never handed over for the count. Control: a
-/// different tall box (its note flags another removal) after the same two is
-/// declined at once, with its own removal.
+/// The same tall box back after two declines is declined again after a pause (`WAITING …
+/// declined again in <n> ms`; `approval_loop`'s module header), never handed over for the
+/// count. Control: a different tall box after the same two is declined at once.
 #[test]
 fn the_same_box_back_after_its_declines_is_declined_again_after_a_pause() {
     let same = tall_states("$S");
@@ -11413,11 +11180,8 @@ fn the_same_box_back_after_its_declines_is_declined_again_after_a_pause() {
     }
 }
 
-/// A decline stops where the box is not the same: after the `down` on the tall
-/// box, another tall box stands there (its note flags another removal, which
-/// the text decided for the first would misname), so nothing more is sent: no
-/// Tab (`Press::Skipped`; the loop decides the new box afresh). A tall box has
-/// no command to tell it by; the note at its foot does (`PromptV2::foot_note`).
+/// A decline stops where another tall box stands after the `down` (its note flags another
+/// removal, which `PromptV2::foot_note` tells apart): no Tab is sent (`Press::Skipped`).
 #[test]
 fn a_decline_goes_no_further_once_another_tall_box_stands_there() {
     let [s1, _, _, _] = tall_states("$S");
@@ -11434,16 +11198,9 @@ fn a_decline_goes_no_further_once_another_tall_box_stands_there() {
     assert!(w[0].ends_with(" down"), "{w:#?}");
 }
 
-/// A decline stops where the box is not the same, whatever note it shows: a
-/// tall box's identity is also its kind, whether its head is off the screen,
-/// and its command (`press.rs`, `decline_box`). After the `↓` on the tall box,
-/// (i) the same box whole (a Bash box, head on screen, same note) or (ii) a
-/// whole box of another kind with the same note stands there, and nothing more
-/// is sent: the text decided for an unreadable box is no answer to one the
-/// rules can read. And on a whole box's decline: (iii) a box of another kind,
-/// (iv) the same box asking about another command, or (v) the same command in
-/// another shell's box, with the same note. Each shows the same note first, so
-/// only the kind, the command or the head tells them apart.
+/// A decline stops where the box is not the same, whatever note it shows: a box is also its
+/// kind, whether its head is off the screen, and its command (`decline_box`). Each of the five
+/// look-alikes below gets the `↓` and nothing more.
 #[test]
 fn a_decline_goes_no_further_once_a_readable_box_with_the_same_note_stands_there() {
     use crate::supervise::policy::approval::tests as at;
@@ -11477,10 +11234,7 @@ fn a_decline_goes_no_further_once_a_readable_box_with_the_same_note_stands_there
     assert!(tall_head && note.is_some(), "{note:?}");
     assert_eq!(key(&whole), (PromptKind::Bash, false, note.clone()));
     assert_eq!(key(&other), (tall_kind, false, note.clone()));
-    // A whole box's decline: after the `↓` on the Bash box, (iii) a box of
-    // another kind with its note, or (iv) the same Bash box asking about
-    // another command under the same note; the head on the screen in all
-    // three, so only the kind or the command tells them apart.
+    // A whole box's decline: (iii) another kind, (iv) another command, (v) another shell.
     let text = press_text();
     let [box1, box2, _, _] = decline_states(&text);
     let note_at = box2
@@ -11569,13 +11323,9 @@ fn a_decline_goes_no_further_once_a_readable_box_with_the_same_note_stands_there
     }
 }
 
-/// The taken box, redrawn before it leaves (`cap-taken-box-1..2`): within 5 ms
-/// of a taken `1` Claude Code wipes the auto-deny countdown and one of the two
-/// blank rows under it, reflows the transcript above, and keeps the box drawn
-/// some 550 ms more. That is the box taken, not a new one: pressed and
-/// ledgered once. A box with no countdown whose transcript reflows above it
-/// is the same box too. Negative control: a box with another command after
-/// the press is a new box, decided and pressed afresh.
+/// The taken box, redrawn before it leaves (`cap-taken-box-1..2`: the countdown and a blank
+/// row wiped, the transcript reflowed, the box up ~550 ms more), is pressed and ledgered once,
+/// as is a box whose transcript reflows. Negative control: another command is a new box.
 #[test]
 fn a_taken_box_redrawn_before_it_leaves_is_pressed_once() {
     use aterm_phase::prompt::fixtures as f;
@@ -11649,12 +11399,13 @@ fn a_taken_box_redrawn_before_it_leaves_is_pressed_once() {
 
 /// The environment's actions in `SupervisorDeclineKeys`: Claude Code reading
 /// the oldest key, a person keying, their quiet returning.
-const DECLINE_ENV: [&str; 17] = [
+const DECLINE_ENV: [&str; 18] = [
     "PersonKey",
     "QuietReturns",
     "PersonMoves",
     "PersonTabs",
     "PersonTypes",
+    "PersonClears",
     "PersonAnswers",
     "PersonKeyIgnored",
     "DownTaken",
@@ -11669,10 +11420,8 @@ const DECLINE_ENV: [&str; 17] = [
     "KeyIntoTheComposer",
 ];
 
-/// A read as the model sees it: the focus (1 on the refusal), its input
-/// open, what the input holds (0 nothing or the placeholder, 1 exactly
-/// `text`, 2 anything else), and whether the box is gone (these scripts end
-/// on the reason submitted).
+/// A read as the model sees it: the focus (1 on the refusal), its input open, what it holds
+/// (0 nothing or the placeholder, 1 exactly `text`, 2 else), and whether the box is gone.
 fn d_projected(rows: &[String], text: &str) -> (i64, i64, i64, i64) {
     use crate::supervise::policy::REFUSAL_LABEL;
     use crate::supervise::policy::approval::squashed;
@@ -11695,10 +11444,8 @@ fn d_projected(rows: &[String], text: &str) -> (i64, i64, i64, i64) {
     (i64::from(refusal.focused), i64::from(open), held, 0)
 }
 
-/// The environment behaviour the model allows that explains a read: the
-/// fewest of [`DECLINE_ENV`] from `st` to a state that draws `want` with the
-/// person's quiet `quiet` — a person keying only where the read's stamp says
-/// one did (`new_input`).
+/// The fewest [`DECLINE_ENV`] actions from `st` to a state that draws `want` with the person's
+/// quiet `quiet`; a person keys only where the read's stamp says one did (`new_input`).
 fn d_explained(
     model: &aterm_spec::derive::Model,
     st: &QState,
@@ -11731,13 +11478,9 @@ fn d_explained(
     panic!("no behaviour the model allows explains the read {want:?} (quiet {quiet}) from {st:?}");
 }
 
-/// The real press of option 2 with `text` over `m`, projected request by
-/// request onto `model`: each read the model's `Read` after the fewest
-/// environment actions that explain it, each `key … down|tab|enter` and `send
-/// …` the model's `HarnessDown`/`HarnessTab`/`HarnessEnter`/`HarnessText`,
-/// which must be enabled there; every invariant checked after every request.
-/// Returns the press's answer, the state at its end, the keystrokes written,
-/// and the state at the first read that showed a person.
+/// The real press of option 2 with `text` over `m`, projected onto `model`: each read is
+/// `Read` after the fewest environment actions that explain it, each write its `Harness…`
+/// action, which must be enabled. Returns the answer, end state, keys and first person state.
 fn d_bound(
     m: &mut Mock,
     model: &aterm_spec::derive::Model,
@@ -11794,15 +11537,9 @@ fn d_bound(
     (pressing, st, keys, person_seen)
 }
 
-/// Tier-1 for `SupervisorDeclineKeys` (aterm-spec
-/// `supervisor_decline_keys_model`): the real press over the scripted server,
-/// bound request by request, in four shapes: (1) the four states, declined;
-/// (2) the Tab not drawn on the first read after it: one Tab, the reason once
-/// the input shows open; (3) a person keys after the `↓`: nothing more
-/// written; (4) the Tab never drawn: nothing more written, handed over.
-/// Negative controls: where the real press wrote nothing in (3) and (4), the
-/// model with the fence alone (`Buggy = 1`) enables the Tab again and the
-/// committed model does not, so a pass is never vacuous.
+/// Tier-1 for `SupervisorDeclineKeys` (aterm-spec `supervisor_decline_keys_model`): the real
+/// press bound request by request in the four shapes below. Negative controls: where it
+/// wrote nothing in (3) and (4), the fence-only model (`Buggy = 1`) enables the Tab again.
 #[test]
 fn tier1_a_decline_keystroke_goes_only_where_the_model_allows() {
     let model = aterm_spec::derive::supervisor_decline_keys_model();
@@ -11854,13 +11591,9 @@ fn tier1_a_decline_keystroke_goes_only_where_the_model_allows() {
     );
 }
 
-/// Each live-row rule alone (`tail_misses_the_live_rows`): the fresh pane's
-/// trust dialog answered where only one of the two rules sees it, so dropping
-/// either is caught. (1) The dialog two rows lower, its footer on the tail's
-/// first row and the cursor on the focused `No, exit` above the tail: the tail
-/// is not blank and holds no box, so only the cursor rule reads it whole. (2)
-/// The dialog where it was, the hidden cursor on the pane's last row (inside
-/// the tail): only the blank-tail rule reads it whole.
+/// Each live-row rule alone (`tail_misses_the_live_rows`) reads the fresh pane's trust
+/// dialog whole: (1) two rows lower, the cursor on `No, exit` above the tail, only the
+/// cursor rule; (2) the hidden cursor on the pane's last row, only the blank-tail rule.
 #[test]
 fn each_live_row_rule_alone_reads_the_fresh_panes_dialog_whole() {
     use aterm_phase::prompt::fixtures as f;
@@ -11903,10 +11636,8 @@ fn each_live_row_rule_alone_reads_the_fresh_panes_dialog_whole() {
     }
 }
 
-/// The tail's cut swept across the fresh pane's rm box (its top from row 22 up
-/// past the box's height) and across the trust dialog (shifted 0 to 18 rows
-/// down), the cursor on the focused option where Claude Code parks it: every
-/// position is answered, the box wholly in the tail, cut by it, or above it.
+/// The tail's cut swept across the fresh pane's rm box and trust dialog, the cursor on the
+/// focused option: every position is answered.
 #[test]
 fn every_cut_of_the_tail_across_a_fresh_panes_box_is_answered() {
     use aterm_phase::prompt::fixtures as f;
@@ -11971,11 +11702,8 @@ fn every_cut_of_the_tail_across_a_fresh_panes_box_is_answered() {
     assert!(misses.is_empty(), "{}", misses.join("\n"));
 }
 
-/// The hosted loop keeps its ledger where its host says, and nowhere else: it
-/// never falls back to the process's own state directory, which in a test
-/// would be the developer's. `opts.ledger` is the host's: the approved box is
-/// ledgered there. Negative control: with none, the loop has no ledger to
-/// write.
+/// The hosted loop ledgers where its host says (`opts.ledger`), never in the process's own
+/// state directory (in a test, the developer's); with none named, it has no ledger.
 #[test]
 fn a_hosted_loop_ledgers_where_its_host_says_and_nowhere_else() {
     let (dir, ledger) = ledger_file("hosted-ledger");
@@ -12008,17 +11736,11 @@ fn a_hosted_loop_ledgers_where_its_host_says_and_nowhere_else() {
     assert_eq!(s.approval_ledger(), None, "no ledger unless one is named");
 }
 
-/// TIER-1 for `SupervisorSurveyPress` (aterm-spec `supervisor_survey_press_model`): the real
-/// `Session` over the scripted server, one WORLD at a time, with every `key` request the loop
-/// makes projected onto the model at the state the server was in when it arrived
-/// ([`Mock::key_probes`]): a guarded `key … 0` is the model's `Press`, a `key backspace` its
-/// `Backspace` (or `BackspaceRefused`), and each must be ENABLED at the projected state — the
-/// card open and how old it is against the vendor's 300 ms mount window (test scale), a
-/// person's hand, a typed draft, a box up, and the `0` in the composer, PENDING while the
-/// vendor's debounce may still take it and STANDING after. The list this returns is the
-/// requests the model forbids: empty for the real loop in every world, and NOT empty for the
-/// mutant of each world that replays a flaw (the settle skipped, the person's grace ignored, a
-/// landing time shorter than the vendor's debounce) — so the passes are not vacuous.
+/// Tier-1 for `SupervisorSurveyPress` (aterm-spec `supervisor_survey_press_model`): the `key`
+/// requests ([`Mock::key_probes`]) the model forbids at the server's state when each arrived.
+/// A guarded `key … 0` is `Press`, `key backspace` is `Backspace`; the state is the card's age
+/// against the 300 ms mount window, a person's hand, a draft, a box, and the `0` (pending
+/// while the debounce may still take it). Empty for the real loop, not for each mutant.
 fn survey_press_violations(m: &Mock, hand: bool) -> Vec<String> {
     let model = aterm_spec::derive::supervisor_survey_press_model();
     let window = Duration::from_millis(300);
@@ -12077,7 +11799,7 @@ fn survey_backspaces(m: &Mock) -> usize {
 /// presses on a card that has shown 350 ms, unless a world says otherwise.
 const SURVEY_AGED: Duration = Duration::from_millis(350);
 
-/// A card that SITS (the one screen, so a wait on it blocks as the real server's does).
+/// A card that sits (one screen, so a wait on it blocks as the real server's does).
 fn survey_sitting(screen: Vec<String>, tweak: &dyn Fn(&mut Mock, &mut SuperviseOpts)) -> Mock {
     let mut m = Mock::new(true, vec![screen]);
     m.card_ignores_within = Some(Duration::from_millis(300));
@@ -12114,9 +11836,9 @@ fn survey_reactive(debounce_ms: u64, land: Duration, tweak: &dyn Fn(&mut Mock)) 
 // The worlds of the survey card's Tier-1 ([`survey_press_violations`]) run as tests of
 // their own: each waits in real time.
 
-/// WORLD 1, a card that has shown its settle and nobody about: one Press, at a state the
-/// model allows. WORLD 2, a YOUNG card (the vendor drops a digit inside 300 ms): skip the
-/// settle and the model forbids the press the vendor would have dropped.
+/// World 1, a settled card and nobody about: one press the model allows. World 2, a young
+/// card (the vendor drops a digit inside 300 ms): with the settle skipped, the model forbids
+/// the press.
 #[test]
 fn tier1_the_cards_0_goes_only_where_the_model_allows() {
     let m = survey_sitting(with_survey(idle_screen()), &|_, _| {});
@@ -12140,8 +11862,8 @@ fn tier1_the_cards_0_goes_only_where_the_model_allows() {
     );
 }
 
-/// WORLD 3, a person's hand (typed 0.5 s ago; the grace is 120 s): no press. The mutant
-/// ignores the grace (`human_grace_s = 0`), presses, and the model forbids it.
+/// World 3, a person typed 0.5 s ago (grace 120 s): no press. The mutant ignores the grace
+/// (`human_grace_s = 0`) and presses, which the model forbids.
 #[test]
 fn tier1_the_cards_0_waits_out_a_persons_hand() {
     let hand = |grace_s: u32| {
@@ -12157,8 +11879,7 @@ fn tier1_the_cards_0_waits_out_a_persons_hand() {
     assert_eq!(survey_press_violations(&ignored, true).len(), 1);
 }
 
-/// WORLD 4, a typed draft in the composer, and WORLD 5, a box up: nothing pressed for the
-/// card.
+/// Worlds 4 and 5, a typed draft in the composer and a box up: nothing pressed.
 #[test]
 fn tier1_the_cards_0_never_goes_over_a_draft_or_a_box() {
     let mut draft = with_survey(idle_screen());
@@ -12171,11 +11892,9 @@ fn tier1_the_cards_0_never_goes_over_a_draft_or_a_box() {
     assert_eq!(survey_presses(&m), 0, "{:#?}", m.requests);
 }
 
-/// WORLD 4b, a draft whose caret was moved HOME (←, Home, ctrl-a): the cursor sits at
-/// column 2 like the placeholder's, and only the cell there tells them apart — drawn
-/// plain, it is the person's text: nothing is pressed in front of it. NEGATIVE
-/// CONTROL: the same screen with the cell DIM is Claude's suggestion, and the card's
-/// `0` goes.
+/// World 4b, a draft with its caret moved home: the cursor sits at column 2 like the
+/// placeholder's, and only that cell tells them apart. Plain, it is the person's text (no
+/// press); dim, it is Claude's suggestion (the `0` goes).
 #[test]
 fn tier1_the_cards_0_tells_a_homed_draft_from_the_dim_suggestion() {
     let mut draft = with_survey(idle_screen());
@@ -12203,10 +11922,8 @@ fn tier1_the_cards_0_tells_a_homed_draft_from_the_dim_suggestion() {
     );
 }
 
-/// WORLD 6, a card that DROPS the digit (the hook was not armed): the `0` stands past the
-/// landing time and is backspaced — at a state where the model allows it. WORLD 8, a
-/// backspace the server REFUSES (`busy`): the `0` stays owed and is removed on the next
-/// try — every backspace at a state the model allows, and the loop asked again.
+/// World 6, a card that drops the digit: the `0` is backspaced past the landing time. World
+/// 8, a backspace the server refuses (`busy`): the `0` stays owed and goes on the next try.
 #[test]
 fn tier1_the_cards_dropped_0_is_backspaced_where_the_model_allows() {
     let m = survey_reactive(30, Duration::from_millis(100), &|m| {
@@ -12223,9 +11940,8 @@ fn tier1_the_cards_dropped_0_is_backspaced_where_the_model_allows() {
     assert_eq!(survey_press_violations(&m, false), Vec::<String>::new());
 }
 
-/// WORLD 7, a card that TAKES the digit 300 ms after it was written: with a landing time
-/// that outlasts the debounce the loop never backspaces; with one that does not the
-/// backspace comes at a state where the `0` is still pending, and the model forbids it.
+/// World 7, a card that takes the digit 300 ms after it is written: a landing time that
+/// outlasts the debounce never backspaces.
 #[test]
 fn tier1_the_cards_taken_0_is_never_backspaced_under_its_debounce() {
     let outlasting = survey_reactive(300, Duration::from_millis(400), &|_| {});
@@ -12242,8 +11958,8 @@ fn tier1_the_cards_taken_0_is_never_backspaced_under_its_debounce() {
     );
 }
 
-/// WORLD 7's mutant: a landing time shorter than the card's 300 ms debounce backspaces
-/// while the `0` is still pending, and the model forbids it.
+/// World 7's mutant: a landing time shorter than the 300 ms debounce backspaces a pending
+/// `0`, which the model forbids.
 #[test]
 fn tier1_the_cards_0_backspaced_under_its_debounce_is_forbidden() {
     let short = survey_reactive(300, Duration::from_millis(60), &|_| {});
@@ -12255,15 +11971,9 @@ fn tier1_the_cards_0_backspaced_under_its_debounce_is_forbidden() {
     );
 }
 
-/// THE PROBE'S GATE READS THE POINT AS IT WAS DECIDED (H6-HARNESS-1; the
-/// review of pass 4 reverted that read to a decision's, and no test
-/// failed): a lost login's words in an MCP result's second block, which the
-/// transcript refuses (it ends on the model's reply), is an ordinary idle
-/// point, the roster says the account's read is due there, and the probe
-/// runs — `/usage`, its panel, the Escape — its gate's reading of the point
-/// asking the transcript nothing: asked once, at the decision, by the time
-/// the probe is claimed (the point decided again after the panel asks
-/// again, as a decision does).
+/// The probe's gate reads the point as it was decided: a lost login's words in an MCP
+/// result, which the transcript refuses, are an ordinary idle point where the probe runs,
+/// and the transcript is asked once, at the decision, never by the gate.
 #[test]
 fn the_probes_gate_reads_a_refused_wall_as_it_was_decided() {
     use aterm_phase::prompt::fixtures as f;
@@ -12295,9 +12005,8 @@ fn the_probes_gate_reads_a_refused_wall_as_it_was_decided() {
     );
 }
 
-/// One hosted watch for the probe's Tier-1 walk: `m` (a [`probe_mock`]) under
-/// `host`, the person's grace as given, the probe's waits at a scripted
-/// server's scale, a ledger of the run's own.
+/// One hosted watch of the probe's Tier-1 walk: `m` (a [`probe_mock`]) under `host` with the
+/// person's grace `grace_s`, the probe's waits at test scale, and a ledger of its own.
 fn probe_walk(
     tag: &str,
     m: &mut Mock,
@@ -12323,30 +12032,17 @@ fn probe_walk(
     lines
 }
 
-/// The probe's waits at a scripted server's scale: 60 ms for a panel that never comes,
-/// 100 ms for one that does not leave, a read every 10 ms at the latest — and half a
-/// minute to read settled: a hang detector, no latency budget.
+/// The probe's waits at a scripted server's scale: 60 ms to open, 100 ms to close, a read
+/// every 10 ms, and half a minute to settle (a hang detector, not a latency budget).
 fn probe_walk_waits(s: &mut Session<'_, Mock>) {
     let ms = Duration::from_millis;
     s.set_probe_waits(ms(60), Duration::from_secs(30), ms(10), ms(100));
 }
 
-/// TIER-1 for `SupervisorUsageProbe` (aterm-spec `supervisor_usage_probe_model`): the real
-/// `Session` over the scripted server and the panel's world ([`PanelWorld`]: the measured
-/// 2.1.287 screens), one WORLD at a time. Every `send … /usage`, every `key … esc` and every
-/// sample handed to the host is projected onto the model at the state the world was in when
-/// it arrived ([`usage_probe_violations`]) and must be enabled there: `Type` only with a
-/// claim granted, no panel open or owed, nobody's hand on the session and no turn running;
-/// the Escape only with the panel on the grid, the host already told, nobody's hand and no
-/// turn; a sample only from a settled panel the step read with nobody's key between.
-///
-/// The list is EMPTY for the real loop in every world, and NOT empty for each MUTANT, so the
-/// passes are not vacuous. Two mutants are the real loop under a knob (the person's grace
-/// ignored: `human_grace_s = 0` against a world whose grace stands). Five are requests no
-/// knob makes the loop send — the open wait's timeout that presses, an Escape before the
-/// host is told, a second `/usage` over the open panel, a sample from an unsettled one, an
-/// Escape at the panel while a turn runs under it — and are written here by hand against
-/// the same world: the projection must name each.
+/// Tier-1 for `SupervisorUsageProbe` (aterm-spec `supervisor_usage_probe_model`): every
+/// `/usage`, Escape and sample of the real loop over the panel's world ([`PanelWorld`]) is
+/// projected onto the model ([`usage_probe_violations`]) and must be enabled there. Each
+/// mutant (two knobs, five by hand) is caught.
 #[test]
 fn tier1_the_probes_writes_go_only_where_the_model_allows() {
     use aterm_phase::prompt::fixtures as f;
@@ -12362,8 +12058,7 @@ fn tier1_the_probes_writes_go_only_where_the_model_allows() {
         );
     };
 
-    // WORLD 1, the panel opens and settles: one `/usage`, one sample, one Escape, each at a
-    // state the model allows.
+    // World 1, the panel opens and settles: one `/usage`, one sample, one Escape.
     let host = ProbeHost::probing(true);
     let mut m = probe_mock(live(), &settled, &host);
     let lines = probe_walk("t1-probe-settled", &mut m, &host, 120, &none);
@@ -12371,8 +12066,7 @@ fn tier1_the_probes_writes_go_only_where_the_model_allows() {
     assert_eq!(host.samples.lock().unwrap().len(), 1);
     clean(&m, &host, &lines);
 
-    // WORLD 2, the panel never opens: the `/usage` alone — the model's `GiveUpNotOpened`,
-    // no key.
+    // World 2, the panel never opens: the `/usage` alone (`GiveUpNotOpened`), no key.
     let host = ProbeHost::probing(true);
     let mut m = probe_mock(live(), &settled, &host);
     world(&mut m).opens = false;
@@ -12380,9 +12074,8 @@ fn tier1_the_probes_writes_go_only_where_the_model_allows() {
     assert_eq!(probe_writes(&m), ["/usage"], "{lines:#?}");
     clean(&m, &host, &lines);
 
-    // WORLD 3, a person keys while the panel is read (their grace a second, the loop's and
-    // the world's alike): no sample, and the Escape only once their hand is off. THE MUTANT
-    // ignores the grace and presses under the hand.
+    // World 3, a person keys while the panel is read (a one-second grace): no sample, and
+    // the Escape only once their hand is off. The mutant ignores the grace.
     let reading = |grace_s: u32| {
         let host = ProbeHost::probing(true);
         let mut m = probe_mock(live(), &settled, &host);
@@ -12401,9 +12094,8 @@ fn tier1_the_probes_writes_go_only_where_the_model_allows() {
         "{bad:#?}"
     );
 
-    // WORLD 4, a person typed half a second before the point (the world's grace: 120 s):
-    // nothing is written. THE MUTANT ignores the grace, and its `/usage` is the model's
-    // `Type` under a hand.
+    // World 4, a person typed half a second before the point (grace 120 s): nothing is
+    // written. The mutant ignores the grace: its `/usage` is `Type` under a hand.
     let typed = |grace_s: u32| {
         let host = ProbeHost::probing(true);
         let mut m = probe_mock(live(), &settled, &host);
@@ -12422,9 +12114,8 @@ fn tier1_the_probes_writes_go_only_where_the_model_allows() {
         "{bad:#?}"
     );
 
-    // WORLD 5, the loop before this one died mid-probe: the panel is on the screen and the
-    // ledger says the harness typed for it (the model's `LoopRestarts`: `ph` stays 2, `own`
-    // 0). One Escape, after a grace in this loop's own sight, and no sample.
+    // World 5, the previous loop died mid-probe (`LoopRestarts`: `ph` 2, `own` 0): the panel
+    // up, one Escape after a grace in this loop's own sight, no sample.
     let host = ProbeHost::probing(true);
     let mut m = probe_mock(
         vec![f::screen(f::USAGE_SETTLED)],
@@ -12447,8 +12138,8 @@ fn tier1_the_probes_writes_go_only_where_the_model_allows() {
     assert!(host.said("probe").is_empty());
     clean(&m, &host, &lines);
 
-    // WORLD 6, an Escape the panel does not take, twice: three Escapes, each allowed (the
-    // model's `EscFails`, then `EscCloses`), and the host told the panel is stuck.
+    // World 6, an Escape the panel does not take, twice: three Escapes, each allowed
+    // (`EscFails`, then `EscCloses`), and the host told the panel is stuck.
     let host = ProbeHost::probing(true);
     let mut m = probe_mock(live(), &settled, &host);
     world(&mut m).esc_fails = 2;
@@ -12472,7 +12163,7 @@ fn tier1_the_probes_writes_go_only_where_the_model_allows() {
     assert_eq!(host.said("inform").len(), 1);
     clean(&m, &host, &lines);
 
-    // THE MUTANTS NO KNOB MAKES: the same server, the requests written by hand.
+    // Mutants no knob makes, written by hand against the same server.
     let by_hand = |opens: bool| {
         let host = ProbeHost::probing(true);
         let mut m = probe_mock(vec![idle_screen()], &[f::USAGE_REFRESHING], &host);
@@ -12525,8 +12216,8 @@ fn tier1_the_probes_writes_go_only_where_the_model_allows() {
         bad[0].starts_with("Sample at ") && bad[0].contains("(\"pan\", 1)"),
         "{bad:#?}"
     );
-    // An Escape at the panel while a turn runs under it (the frame composed, never
-    // observed: `panel_under_a_turn`): the model's `NoEscapeIntoARunningTurn`.
+    // An Escape at the panel while a turn runs under it (the composed `panel_under_a_turn`):
+    // `NoEscapeIntoARunningTurn`.
     let host = ProbeHost::probing(true);
     let mut m = probe_mock(vec![idle_screen()], &[f::USAGE_SETTLED], &host);
     world(&mut m).frames = vec![panel_under_a_turn()];
@@ -12544,29 +12235,10 @@ fn tier1_the_probes_writes_go_only_where_the_model_allows() {
     );
 }
 
-/// TIER-1 for `SupervisorLimitReset` (aterm-spec `supervisor_limit_reset_model`): the real
-/// `Session` over the scripted server and the reset's world ([`ResetWorld`] — COMPOSED from
-/// the 2.1.287 bundle, never seen: a dialog that reacts to what is written), one WORLD at a
-/// time. Every key the server wrote, and the host's own two steps, are projected onto the
-/// model at the state the world was in when each arrived ([`reset_violations`]) and must be
-/// enabled there: the grant row's keys only on a claim just made for it, with nobody's hand
-/// on the session; Enter only at the exact confirmation of a row this loop took, past the
-/// vendor's guard, on its yes, the claim in flight; Escape only at a confirmation of a step
-/// that is owed, past the guard, or at `Checking…`; the wait row only with no step owed; and
-/// the host's last word only with no dialog of the step left on the screen. Every `send`,
-/// `turn` and `paste` that types the vendor's reset command is the model's
-/// `TypesTheCommand`.
-///
-/// The list is EMPTY for the real loop in every world — checked before anything else of the
-/// world, so a defect seeded in the real loop fails here by its name first — and NOT empty
-/// for each MUTANT, each caught BY NAME: the projection names the defect of the model that
-/// is the step with its guard dropped, and the invariant that defect breaks. Two mutants are
-/// the real loop under a knob: the person's grace ignored (`human_grace_s = 0` against a
-/// world whose grace stands), and the box settle dropped against a guard that stands. Five
-/// are requests no knob makes the loop write — the Enter on the early-use confirmation, the
-/// row taken by its place where the weekly reset's row stands in the slot, an Enter by a
-/// loop that did not take the row, the row's arrow with no person fence after a person
-/// keyed, the reset command typed — and are written here by hand against the same world.
+/// Tier-1 for `SupervisorLimitReset` (aterm-spec `supervisor_limit_reset_model`): every key
+/// the real loop writes over a composed reset dialog ([`ResetWorld`]), and each host step, is
+/// projected onto the model ([`reset_violations`]) and must be enabled there; typing the
+/// reset command is `TypesTheCommand`. Each mutant (two knobs, five by hand) is caught by name.
 #[test]
 fn tier1_the_resets_keys_go_only_where_the_model_allows() {
     use aterm_phase::prompt::fixtures::screen;
@@ -12585,8 +12257,8 @@ fn tier1_the_resets_keys_go_only_where_the_model_allows() {
         assert!(bad.iter().any(|b| b.contains(&name)), "{name}: {bad:#?}");
     };
 
-    // WORLD 1, the whole path: the row's two keys (`TakeRow`), the Enter, and the host's
-    // `Claim` and `ReadLine`, each where the model allows it.
+    // World 1, the whole path: the row's two keys (`TakeRow`), the Enter, and the host's
+    // `Claim` and `ReadLine`.
     let host = ResetHost::reading(ResetOutcome::Spent {
         asks: false,
         left: Some(1),
@@ -12614,8 +12286,7 @@ fn tier1_the_resets_keys_go_only_where_the_model_allows() {
         .collect();
     assert_eq!(steps, ["Claim", "ReadLine"]);
 
-    // WORLD 2, the early-use confirmation (the model's `dlg = 5`): the real loop Escapes it.
-    // THE MUTANT enters it.
+    // World 2, the early-use confirmation (`dlg = 5`): the loop Escapes it; the mutant enters.
     let early = |host: &Arc<ResetHost>| {
         let mut m = reset_mock(vec![], &RESET_ROWS, 0, host);
         reset_world(&mut m).confirm = screen(f::CONFIRM_EARLY);
@@ -12667,9 +12338,8 @@ fn tier1_the_resets_keys_go_only_where_the_model_allows() {
         "EnterOnlyOnTheExactConfirmation",
     );
 
-    // WORLD 3, the weekly session reset's row in the grant row's slot (`dlg = 2`): the real
-    // loop asks its host for nothing and presses the wait row (`PressWait`). THE MUTANT takes
-    // the slot's row on a claim, by its place — and the weekly reset is claimed.
+    // World 3, the weekly reset's row in the grant row's slot (`dlg = 2`): the loop asks the
+    // host nothing and presses the wait row. The mutant takes the slot's row by its place.
     const WEEKLY_ROW: &str = "Reset your session limit now";
     let weekly = [RESET_STOP, WEEKLY_ROW, RESET_WAIT, RESET_CREDITS];
     let host = ResetHost::reading(ResetOutcome::Kept);
@@ -12697,9 +12367,8 @@ fn tier1_the_resets_keys_go_only_where_the_model_allows() {
     assert!(bad.iter().all(|b| b.starts_with("TakeRow at ")), "{bad:#?}");
     named(&bad, "TakeRowByItsPlace", "NeverTheWeeklyRow");
 
-    // WORLD 4, a person typed half a second before the dialog was judged (the world's grace:
-    // 120 s): nothing is written. THE MUTANT ignores the grace, and its keys are the model's
-    // under a hand.
+    // World 4, a person typed half a second before the dialog was judged (grace 120 s):
+    // nothing is written. The mutant ignores the grace.
     let typed = |grace_s: u32| {
         let host = ResetHost::reading(ResetOutcome::Kept);
         let mut m = reset_mock(vec![], &RESET_ROWS, 0, &host);
@@ -12723,9 +12392,8 @@ fn tier1_the_resets_keys_go_only_where_the_model_allows() {
     named(&bad, "TakeRowUnderAHand", "NothingKeyedUnderAHand");
     named(&bad, "EnterUnderAHand", "NothingKeyedUnderAHand");
 
-    // WORLD 5, the vendor's guard on the confirmation: the loop's settle keeps every key past
-    // it. THE MUTANT has no settle, against a guard that outlasts its run: its Enter is
-    // written inside the guard.
+    // World 5, the vendor's guard on the confirmation: the loop's settle keeps every key past
+    // it. The mutant, against a guard that outlasts its settle, enters inside the guard.
     let host = ResetHost::reading(ResetOutcome::Kept);
     let mut m = reset_mock(vec![], &RESET_ROWS, 0, &host);
     reset_world(&mut m).guard = Duration::from_millis(30);
@@ -12758,9 +12426,8 @@ fn tier1_the_resets_keys_go_only_where_the_model_allows() {
     );
     named(&bad, "EnterInsideTheGuard", "EnterOnlyPastTheGuardOnYes");
 
-    // WORLD 6, the loop before this one died after the row (the model's `LoopRestarts`: `ph`
-    // stays 1, `own` 0): one Escape, after a grace in this loop's own sight. THE MUTANT, by
-    // hand, enters as a successor.
+    // World 6, the previous loop died after the row (`LoopRestarts`: `ph` stays 1, `own` 0):
+    // one Escape, after a grace in this loop's own sight. The mutant enters as a successor.
     let taken = |ledger: &Path| {
         let row = approvals::Row {
             rule_id: "limit-reset@v1",
@@ -12802,7 +12469,7 @@ fn tier1_the_resets_keys_go_only_where_the_model_allows() {
     assert_eq!(bad.len(), 1, "{bad:#?}");
     named(&bad, "EnterAsASuccessor", "EnterOnlyPastTheGuardOnYes");
 
-    // WORLD 7, the Enter dropped once and an Escape dropped twice, each written again where
+    // World 7, the Enter dropped once and an Escape dropped twice, each written again where
     // the model allows it (`EnterDropped` then `Enter`; `EscapeDropped` then `Escape`).
     let host = ResetHost::reading(ResetOutcome::Kept);
     let mut m = reset_mock(vec![], &RESET_ROWS, 0, &host);
@@ -12828,11 +12495,9 @@ fn tier1_the_resets_keys_go_only_where_the_model_allows() {
     );
     clean(&m, &host, &run);
 
-    // WORLD 8, a person keys AFTER the dialog was judged — past its read and its `status`,
-    // in the round trip in which the host is asked for the claim: the row's first key is
-    // fenced on the judged read's person count and the server skips it; the row is taken
-    // once their grace has passed. THE MUTANT, by hand, writes the row's arrow with no
-    // person fence: the model's `TakeRow` under a hand.
+    // World 8, a person keys after the dialog was judged (in the claim's round trip): the
+    // row's first key, fenced on the judged read's person count, is skipped, and the row is
+    // taken once their grace has passed. The mutant writes the arrow with no person fence.
     let keyed = |host: &Arc<ResetHost>| {
         let mut m = reset_mock(vec![], &RESET_ROWS, 0, host);
         reset_world(&mut m).person_at_row_key = 1;
@@ -12867,10 +12532,8 @@ fn tier1_the_resets_keys_go_only_where_the_model_allows() {
     assert!(bad[0].starts_with("TakeRow at "), "{bad:#?}");
     named(&bad, "TakeRowUnderAHand", "NothingKeyedUnderAHand");
 
-    // NOTHING OF A RESET IS EVER TYPED, in any world above (each was clean, and the
-    // projection reads every `send`, `turn` and `paste`). THE MUTANT, by hand, types the
-    // vendor's command at a composer with no dialog up — where it falls through to the
-    // weekly session reset with no confirmation at all.
+    // The mutant: the command typed at a composer with no dialog up, where it falls through
+    // to the weekly reset unconfirmed.
     let host = ResetHost::reading(ResetOutcome::Kept);
     let mut m = reset_mock(vec![idle_screen()], &RESET_ROWS, 0, &host);
     assert!(m.call(&["text", "--json"]).expect("served").ok());
@@ -12884,13 +12547,9 @@ fn tier1_the_resets_keys_go_only_where_the_model_allows() {
     named(&bad, "TypesTheCommand", "NeverTheTypedCommand");
 }
 
-/// A model bucket's fallback relaunch the host keeps answering `wait:…` — its last look
-/// finds the agent's own background work running, and the relaunch would end it — is
-/// ASKED AGAIN (the last pause of [`TurnEndTiming::restart_backoff`] for ever) and
-/// NOTHING IS TYPED BLIND meanwhile, at a wall (`requires usage credits`) that names no
-/// reset and that a `keep going` cannot lift: the fallback is the answer, as soon as
-/// the jobs end. NEGATIVE CONTROL: the memory banner's restart, whose only remedy the
-/// relaunch is, is asked as often.
+/// A model fallback the host keeps deferring (`wait:…`) at a wall that names no reset and a
+/// `keep going` cannot lift is asked again on the last pause of
+/// [`TurnEndTiming::restart_backoff`], nothing typed meanwhile.
 #[test]
 fn a_model_fallback_the_host_keeps_deferring_is_asked_again_and_nothing_is_typed_blind() {
     use aterm_phase::prompt::fixtures::{MEMORY_BANNER_IDLE, screen};
@@ -12952,7 +12611,7 @@ fn a_model_fallback_the_host_keeps_deferring_is_asked_again_and_nothing_is_typed
         0,
         "{requests:#?}"
     );
-    // NEGATIVE CONTROL: the memory banner keeps asking as well.
+    // The memory banner's restart is asked as often.
     let (lines, asked, _) = run(screen(MEMORY_BANNER_IDLE));
     assert!(
         asked.len() >= 12 && asked.iter().all(|w| *w == "memory"),
@@ -12960,13 +12619,9 @@ fn a_model_fallback_the_host_keeps_deferring_is_asked_again_and_nothing_is_typed
     );
 }
 
-/// The same deferred fallback at a bucket that NAMES its reset: asked again until the
-/// reset, then the continuation goes first — the wall may have lifted, and sitting past
-/// a reset for a relaunch the host will not make was the stall — while the host is
-/// still answering `wait:changed`. If the wall answers, the fallback is asked for
-/// again. The reset is 4 s off and the run stops at the journaled continuation (a
-/// minute's backstop): the assertions are about ORDER (asked more than once, then the
-/// continuation).
+/// The same deferred fallback at a bucket that names its reset: asked again until the
+/// reset, then the continuation goes first (the wall may have lifted) while the host still
+/// answers `wait:changed`.
 #[test]
 fn a_fallback_the_host_keeps_deferring_gives_way_to_the_continuation_at_the_reset() {
     const FABLE: &str = include_str!(
@@ -13032,16 +12687,10 @@ fn a_fallback_the_host_keeps_deferring_gives_way_to_the_continuation_at_the_rese
     );
 }
 
-/// THE RESTART'S CUT CARRIES THE SESSION'S SHARE OF THE RESET TOO. A fallback
-/// the host defers is asked again on the back-off, cut short at the bucket's
-/// reset, where the continuation is tried first; that continuation waits for
-/// the reset, the grace AND the session's share of the herd's spread
-/// ([`TurnEndTiming::reset_jitter`]), so the cut is there, not before it (or
-/// the retry lands in the share, is met by the same wait, and asks a back-off
-/// later: the continuation goes an hour late). The reset is 3 hours off on a
-/// fixed clock, the back-off 10 hours: the retry is due at the reset, the
-/// grace and the share, exactly. NEGATIVE CONTROL: a session with no share is
-/// due at the grace.
+/// A deferred fallback's retry is due at the reset plus the grace plus the session's share
+/// of the spread ([`TurnEndTiming::reset_jitter`]), where its continuation goes: cut earlier,
+/// the retry would meet that same wait and be put off a whole back-off. Negative control: with
+/// no share, at the grace.
 #[test]
 fn a_deferred_fallback_is_retried_at_the_reset_the_grace_and_the_sessions_share() {
     use super::super::turn_end_loop::resume_jitter;
@@ -13094,10 +12743,8 @@ fn a_deferred_fallback_is_retried_at_the_reset_the_grace_and_the_sessions_share(
             rule_id: RULE_MODEL_FALLBACK,
             otherwise: Box::new(TurnEndAction::Nothing),
         };
-        // The due is placed from a read of the monotonic clock inside the
-        // call, so it lies between `began` and `began + took` past the
-        // reset's offset: the call's own measured time is the slack, never a
-        // guess at the machine's load.
+        // The due is read off the monotonic clock inside the call, so it lies within the
+        // call's own measured time past the reset's offset.
         let began = Instant::now();
         s.turn_end_execute(&point, action, &opts, &[], &mut Alone)
             .expect("the restart is deferred, not failed");
@@ -13127,14 +12774,9 @@ fn a_deferred_fallback_is_retried_at_the_reset_the_grace_and_the_sessions_share(
     );
 }
 
-/// The RETURN to the bucket's model the host keeps deferring (`wait:changed`: the
-/// agent's own background work runs, and the relaunch would end it) never holds the
-/// point back: the continuation is typed, the switch stays open, and the return is
-/// asked again at the next idle point. A replay: an expired switch seeded from the
-/// ledger, a host that always answers `wait:changed` — 69 asks in 1.5 s and no
-/// continuation, at any point, of a tab that always has a job running. NEGATIVE
-/// CONTROL: a return the host makes (`adopted`) types nothing of the loop's own — the
-/// host's carry-on is the turn.
+/// A return to the bucket's model the host keeps deferring (`wait:changed`) never holds the
+/// point: the continuation is typed and the return is asked again at the next idle point.
+/// Negative control: a return the host makes (`adopted`) types nothing of the loop's own.
 #[test]
 fn a_return_to_the_bucket_model_the_host_defers_never_holds_the_continuation() {
     let run = |answers: Vec<Option<&'static str>>| {
@@ -13143,9 +12785,7 @@ fn a_return_to_the_bucket_model_the_host_defers_never_holds_the_continuation() {
         super::turn_end::seed_switch(&ledger, Some("s-1"), unix_now - 60, false, false);
         let host = Arc::new(TestHost::default());
         *host.restarts.lock().unwrap() = answers.into();
-        // A turn of three minutes' work has ended (the done row's own measure),
-        // so the policy's continuation is due at once, not after the back-off
-        // a short turn earns.
+        // A three-minute turn: continued at once, not after a short turn's back-off.
         let mut ended = rows(&["⏺ Done.", "", "✻ Worked for 3m 2s · done 4:24 PM", ""]);
         ended.extend(composer("  ⏵⏵ bypass permissions on (shift+tab to cycle)"));
         let mut m = Mock::new(true, vec![busy_screen(), ended]);
@@ -13198,12 +12838,8 @@ fn a_return_to_the_bucket_model_the_host_defers_never_holds_the_continuation() {
     );
 }
 
-/// A loop that starts at a wall its predecessor already continued past — a new window,
-/// a seamless update, a fault: a new loop every one to ten hours on tab 1 — is on the
-/// back-off from THAT act, and types nothing the moment it attaches. The approval
-/// ledger says the act went three minutes ago: the next try is ten minutes after it, so
-/// 3 s (past the `1s` reset) type nothing. NEGATIVE CONTROL: no such row, the loop
-/// continues at once (stopped at its journaled continuation).
+/// A loop starting at a wall its predecessor already continued past (the ledger's `typed`
+/// row) waits out the back-off from that act. Negative control: no such row, continued at once.
 #[test]
 fn a_restarted_loop_at_a_wall_its_predecessor_continued_past_waits_out_the_back_off() {
     let run = |seed: bool| {
@@ -13267,15 +12903,9 @@ fn a_restarted_loop_at_a_wall_its_predecessor_continued_past_waits_out_the_back_
 
 // ---- the person fence at the write (`key|send if-human=<n>`) ------------
 
-/// Under `recommended` (the default priority) the loop's decisions, keys and
-/// request strings are the recommended path's, byte for byte. The four-tab
-/// dialog is answered on a host whose reads carry the person count and whose
-/// `help send` names its generation fence, and on a host whose reads carry no
-/// count: every key is `key [if-human=<the read's count>] if-gen=… if=<the
-/// focused row> enter` (the person fence where the read has a count), and
-/// neither run sends a `send` or asks `help send`. The two request lists match
-/// once the `if-human=0` tokens are taken out. Only a text word writes into
-/// the free-text row (`run_question_text_tests.rs`).
+/// Under `recommended` (the default priority) every key is `key [if-human=<n>] if-gen=… if=…
+/// enter` and nothing is sent or asked of `help send`, with or without the person count;
+/// only a text word types (`run_question_text_tests.rs`).
 #[test]
 fn the_recommended_path_types_nothing_and_asks_no_help_send() {
     use aterm_phase::prompt::fixtures as f;
@@ -13336,17 +12966,12 @@ fn the_recommended_path_types_nothing_and_asks_no_help_send() {
     );
 }
 
-/// A person at the write, under a text word: every read the loop decided on
-/// said no person had keyed, and the server's person fence says one just did
-/// (between the loop's last read and its key). The key is `OK skipped
-/// reason=person`, nothing written: the loop yields ([`Press::Yielded`],
-/// ledgered, never escalated), reads again, waits out the person's quiet, and
-/// only then keys once, fenced on the new read's count, and the dialog is
-/// answered. (This host's `send` names no generation fence, so the long-term
-/// word answers with the recommended option, its keys carrying the person
-/// fence as every question key does.) Without the verdict read as the
-/// person's, the same skip would read as a guard that matched no row on the
-/// very screen parsed, and hand the dialog over.
+/// A person who keys between the loop's last read and its key gets the question first: the
+/// fenced key is `OK skipped reason=person` ([`Press::Yielded`], ledgered, never escalated),
+/// and the loop keys again once they are quiet, fenced on the new read's count. This host's
+/// `send` names no generation fence, so `long-term` answers with the recommended option. Not
+/// read as the person's, the skip would look like a guard that missed on the parsed screen and
+/// hand the dialog over.
 #[test]
 fn a_person_the_server_sees_at_the_write_gets_the_question_first() {
     use crate::supervise::policy::QuestionPriority;

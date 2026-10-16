@@ -117,6 +117,11 @@ pub(crate) struct SessionRecord {
     /// and for the same inspection-only reason as the five above.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub questions: Option<String>,
+    /// The `meta set autopilot` word (2026-10-15; additive, absent tolerated,
+    /// not written when unset): in lockstep with the leaf carrier's field of
+    /// the same name, and for the same inspection-only reason as `questions`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autopilot: Option<String>,
     /// CONTROL CARRY (additive, absent tolerated; round 10): `"<len>
     /// <sha256hex>"` of this session's `seamless-<pid>-<nonce>.s<id>.ctl`
     /// sidecar — the turn ledger and the tail of the alt-screen archive
@@ -237,15 +242,16 @@ pub(crate) struct SessionRecord {
     pub history_lost: u64,
     /// THE STANDING HALT (additive, absent ⇒ none; the round-four plan, item
     /// 3): `"<origin> <reason>"` (`fabric::render_hold`) of this session's
-    /// `hold`, either origin — `local` (the owner's) or `fleet` (the bridge's,
-    /// `fabric-lost` included).
+    /// first standing hold, either origin — `fleet` (the bridge's,
+    /// `fabric-lost` included) when it stands, else `local` (the owner's);
+    /// the other, when both stand, rides [`Self::more_holds`].
     ///
     /// A hold is the one piece of fabric state whose LOSS is unsafe rather
     /// than inconvenient: before this carry, every seamless update lifted
     /// every halt in the process, with nobody asking and nothing said — an
     /// automatic update could free a halted agent minutes after a human
     /// stopped it. The successor re-seeds it before the adopted session is
-    /// registered (`SessionFabric::seed_hold`), so no control verb ever
+    /// registered (`SessionFabric::seed_holds`), so no control verb ever
     /// reaches that session unhalted.
     ///
     /// Carried per record, like `topics`, so it survives every later handoff.
@@ -263,6 +269,26 @@ pub(crate) struct SessionRecord {
         deserialize_with = "lenient_hold"
     )]
     pub hold: Option<String>,
+    /// EVERY OTHER STANDING HALT (additive, absent ⇒ none): one
+    /// `"<origin> <reason>"` row per hold past [`Self::hold`], which carries
+    /// the first (`fabric::render_holds`, the fleet's first). A session holds a
+    /// set of origins — the fleet's halt beside the owner's own stop — and
+    /// before this field the fleet's hold landing on the owner's REPLACED it,
+    /// so the fleet's lift freed the session; carried apart, each comes back
+    /// in its own slot.
+    ///
+    /// Beside `hold` rather than in it, so a reader from before the two slots
+    /// (a rollback) reads the stronger halt exactly where it always read one
+    /// and reads past this key. Read FAIL-CLOSED like `hold`
+    /// ([`lenient_hold_rows`]): a member that is not a string is an
+    /// unreadable row, which halts; a value that is no list at all is one
+    /// such row. Never an error that fails the manifest.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "lenient_hold_rows"
+    )]
+    pub more_holds: Vec<String>,
     /// ANOTHER SUPERVISOR'S LEASE (additive, absent ⇒ none; the round-four
     /// plan, item 9): `"<holder> <remaining_ms>"` of a live `meta set
     /// supervisor <holder> ttl=` claim held by anyone but this process's own
@@ -387,6 +413,25 @@ pub(crate) struct SessionRecord {
     /// none ([`parse_journal_key`]); in neither proof digest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub journal_key: Option<String>,
+    /// THE SESSION LOG'S EPOCH AND NODE-ID COUNTERS (additive, absent ⇒ none;
+    /// the session log's slice 1, 2026-10-15): `"<ep> <run> <turn> <step>"`
+    /// (`session_log::LogCarry`), the outgoing log's epoch and its last run,
+    /// turn and step ids plus their overlap reserve
+    /// (`session_log::LOG_ID_RESERVE`). The successor's log starts at the next
+    /// epoch with `gap why=handoff` and continues the ids, so `t17` names one
+    /// turn for as long as the session lives; a process that issues past the
+    /// reserve refuses its Commit (`SessionTimeline::past_handoff_ceiling`).
+    /// No records ride here (slice 1 carries none). A plain string an older
+    /// reader skips like any unknown key; a value that does not read
+    /// ([`lenient_row`], `LogCarry::parse`) carries nothing, and the successor
+    /// starts at the first epoch, never failing the manifest. In neither proof
+    /// digest.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_row"
+    )]
+    pub log_ids: Option<String>,
 }
 
 /// The wire spelling of a crash journal key (`<pid>:<id>`,
@@ -425,6 +470,13 @@ pub(crate) fn parse_render_debt(row: &str) -> Option<(i32, i32)> {
 }
 
 impl SessionRecord {
+    /// Every hold row this record carries, the first one first: [`Self::hold`]
+    /// and then [`Self::more_holds`]. A record from before the two slots
+    /// carries at most the one, which reads as exactly that hold.
+    pub(crate) fn hold_rows(&self) -> Vec<String> {
+        self.hold.iter().chain(&self.more_holds).cloned().collect()
+    }
+
     /// Whether the successor's in-GUI host must hold off this adopted
     /// session for its ADOPTED-CLAIM GRACE (`harness_host::ADOPTED_CLAIM_GRACE`)
     /// before it claims it (the round-four plan, item 9): unless the producer
@@ -569,6 +621,41 @@ where
             Row::Unreadable(_) => String::new(),
         },
     ))
+}
+
+/// Read carried hold rows ([`SessionRecord::more_holds`]) FAIL-CLOSED: a
+/// member that is not a string is an UNREADABLE row (`""`, which
+/// `fabric::parse_hold` halts on) rather than dropped as [`lenient_rows`]
+/// drops one — dropping a hold row lifts a halt — and a value that is no
+/// list at all is one such row. Never an error, for [`lenient_hold`]'s reason.
+fn lenient_hold_rows<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum Row {
+        Text(String),
+        Unreadable(serde::de::IgnoredAny),
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum Rows {
+        List(Vec<Row>),
+        Unreadable(serde::de::IgnoredAny),
+    }
+    Ok(
+        match <Rows as serde::Deserialize>::deserialize(deserializer)? {
+            Rows::List(rows) => rows
+                .into_iter()
+                .map(|row| match row {
+                    Row::Text(text) => text,
+                    Row::Unreadable(_) => String::new(),
+                })
+                .collect(),
+            Rows::Unreadable(_) => vec![String::new()],
+        },
+    )
 }
 
 /// `skip_serializing_if` for a count whose absence reads as zero.
@@ -1413,6 +1500,20 @@ impl SessionHandoff {
                         attention_owners,
                         topics,
                     } = Drawn::of(&h.ctx, now_us, &own_holder);
+                    // The id the successor's timeline counts on from (the
+                    // newest one plus the overlap's reserve: round seven,
+                    // finding 50, and its review's item 2), and the session
+                    // log's epoch and node-id counters with theirs, under ONE
+                    // hold of the timeline's leaf lock. Taken here, not in the
+                    // literal: a guard made in a field's initializer lives
+                    // until the whole record is built, and a second one there
+                    // would wait on the first.
+                    let (timeline_id, log_ids) = {
+                        let mut tl = h.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+                        (tl.handoff_id(), tl.handoff_log_ids())
+                    };
+                    let mut hold_rows =
+                        crate::fabric::render_holds(&h.ctx.fabric.holds()).into_iter();
                     SessionRecord {
                         local_id: h.local_id,
                         sid: h.sid.as_str().to_string(),
@@ -1428,6 +1529,7 @@ impl SessionHandoff {
                         role: meta.role.clone(),
                         attention: meta.attention.clone(),
                         questions: meta.questions.clone(),
+                        autopilot: meta.autopilot.clone(),
                         // Attached by the seamless writer with its sidecar.
                         control: None,
                         // A shell this process itself adopted frozen goes on
@@ -1454,13 +1556,12 @@ impl SessionHandoff {
                         history_dropped: 0,
                         history_withheld: false,
                         history_lost: store.history_lost(h.local_id),
-                        // The standing halt, off the one live copy — the
-                        // fabric's leaf lock, the same read `status` takes.
-                        hold: h
-                            .ctx
-                            .fabric
-                            .hold()
-                            .map(|hold| crate::fabric::render_hold(&hold)),
+                        // The standing halts, off the one live copy — the
+                        // fabric's leaf lock, the same read `status` takes:
+                        // the first (the fleet's, when it stands) where every
+                        // reader looks, the other beside it.
+                        hold: hold_rows.next(),
+                        more_holds: hold_rows.collect(),
                         supervisor,
                         claim_known,
                         attention_owners,
@@ -1471,18 +1572,11 @@ impl SessionHandoff {
                         // The outbound mailbox and the id counters, under the
                         // fabric's leaf lock (round seven, findings 6/8/28).
                         fabric: h.ctx.fabric.handoff_carry(&mut post_budget),
-                        // The id the successor's timeline counts on from:
-                        // the newest one plus the overlap's reserve (round
-                        // seven, finding 50, and its review's item 2).
-                        timeline_id: h
-                            .ctx
-                            .timeline
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .handoff_id(),
+                        timeline_id,
                         // Stamped by the park from the crash journal's state
                         // (`app_update_handoff::stamp_journal_keys`).
                         journal_key: None,
+                        log_ids: Some(log_ids),
                     }
                 })
                 .collect(),
@@ -1851,6 +1945,15 @@ pub(crate) struct SessionStore {
     /// into the next handoff manifest, cleared by the deregister. The
     /// `frozen_path` side-table shape, for the same reason.
     history_lost: HashMap<u64, u64>,
+    /// THE WINDOW'S HARNESS POSTURE ([`crate::autopilot::HarnessPosture`]):
+    /// whether it has a host, its master switch, and the default Autopilot —
+    /// what a session's effective Autopilot is read under off the main thread
+    /// (the `sessions` roster's `autopilot=`). Published by the App at launch
+    /// and whenever the policy in force changes
+    /// (`App::publish_harness_posture`); unpublished it is `Unhosted`, so a
+    /// registry no window runs says nothing is supervised. Not per session,
+    /// and not carried: the successor publishes its own.
+    harness_posture: crate::autopilot::HarnessPosture,
 }
 
 /// Shared handle to the registry, cloned into the control thread alongside the
@@ -1871,12 +1974,18 @@ impl SessionStore {
     pub(crate) fn register(&mut self, handle: SessionHandle) {
         let first = !self.by_id.contains_key(&handle.sid);
         if first {
-            handle
+            let mut tl = handle
                 .ctx
                 .timeline
                 .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .record("spawned", format!("state={}", handle.state.as_str()));
+                .unwrap_or_else(|p| p.into_inner());
+            tl.record("spawned", format!("state={}", handle.state.as_str()));
+            // THE SESSION LOG's session node: `open - spawn|adopt|restore
+            // parent=<sid> epoch=<ep>` (an adopted session's log already
+            // opened with its handoff gap, `spawn::mark_handoff_gap`).
+            let at = tl.slog().now();
+            tl.slog_mut()
+                .open_session(handle.parent.as_ref().map(SessionId::as_str), at);
         }
         // JOURNAL the membership change under the SAME `&mut self` (== the same
         // write lock) that mutates the two indexes, so no reader can ever observe
@@ -2005,6 +2114,18 @@ impl SessionStore {
     #[must_use]
     pub(crate) fn has_frozen_path(&self, local_id: u64) -> bool {
         self.frozen_path.contains(&local_id)
+    }
+
+    /// The window's harness posture as the App last published it (see the
+    /// field).
+    #[must_use]
+    pub(crate) fn harness_posture(&self) -> crate::autopilot::HarnessPosture {
+        self.harness_posture
+    }
+
+    /// Publish the window's harness posture (see the field).
+    pub(crate) fn set_harness_posture(&mut self, posture: crate::autopilot::HarnessPosture) {
+        self.harness_posture = posture;
     }
 
     /// Mark the session with local id `local_id` as carrying the RE-KEY CHANNEL
@@ -2171,6 +2292,15 @@ impl SessionStore {
                 tl.record("closing", closing_payload(reason, &actor));
             }
             tl.record("state-change", "state=closed".to_string());
+            // THE SESSION LOG's close: `close - out=<reason> by=<actor>
+            // code=<n>`, everything still open closing under it.
+            let at = tl.slog().now();
+            tl.slog_mut().close_session(
+                crate::session_log::exit_out(reason),
+                crate::session_log::exit_actor(&actor),
+                exit_code,
+                at,
+            );
             reason
         });
         if let Some(reason) = resolved {
@@ -2483,9 +2613,11 @@ impl crate::App {
     /// nothing to reap yet. The ledger then looks once more, a few statements
     /// later in the SAME `Wake::Exit` dispatch (`ExitLook::Retry`), which in
     /// practice closes the window; a child still not reapable by then writes
-    /// `-` rather than blocking the UI thread. The one bounded wait on this
+    /// `-` rather than blocking the UI thread. On unix the reader posts the
+    /// exit only once the shell is collectable (bounded, on the reader's
+    /// thread), so neither look waits; elsewhere the one bounded wait on this
     /// path is the first look's, for a shell that may have failed at start
-    /// ([`crate::App::exit_status`]); its answer stands for the ledger too.
+    /// ([`crate::App::exit_status`]). Its answer stands for the ledger too.
     fn shell_exit_code(&self, session: u64) -> Option<i32> {
         use crate::app_tabs::ExitLook;
         use crate::session_status::{Outcome, Phase};
@@ -2575,6 +2707,7 @@ fn handle_alive(local_id: u64, parent: Option<SessionId>, master: i32) -> Sessio
         generation_look: Default::default(),
         reset_lane: Default::default(),
         update_parked: Default::default(),
+        fenced_writes: Default::default(),
     });
     SessionHandle {
         sid,
@@ -2751,7 +2884,7 @@ title = \"zsh\"
     /// projecting `None`, the first equality below fails.)
     #[test]
     fn session_handoff_carries_a_hold() {
-        use crate::fabric::{HOLD_DENIED, Hold, HoldIssuer, apply_hold_for_test, cmd_hold};
+        use crate::fabric::{HOLD_DENIED, Hold, HoldIssuer, Holds, apply_hold_for_test, cmd_hold};
         let local = Hold {
             reason: "stop%20driving".to_string(),
             origin: "local".to_string(),
@@ -2761,39 +2894,48 @@ title = \"zsh\"
             origin: "fleet".to_string(),
         };
         let mut store = SessionStore::default();
-        for (local_id, hold) in [(0, Some(&local)), (1, Some(&fleet)), (2, None)] {
+        // Session 3 holds BOTH: the owner's stop, and the fleet's halt over it.
+        let held: [&[&Hold]; 4] = [&[&local], &[&fleet], &[], &[&local, &fleet]];
+        let mut before: Vec<Holds> = Vec::new();
+        for (local_id, holds) in (0..).zip(held) {
             let h = handle(local_id, None);
-            if let Some(hold) = hold {
-                assert!(apply_hold_for_test(&h.ctx, Some(hold.clone())));
+            for hold in holds {
+                assert!(apply_hold_for_test(&h.ctx, Some((*hold).clone())));
             }
+            before.push(h.ctx.fabric.holds());
             store.register(h);
         }
         let manifest = SessionHandoff::from_store(&store);
-        let rows: Vec<Option<&str>> = manifest
+        let rows: Vec<(Option<&str>, &[String])> = manifest
             .sessions
             .iter()
-            .map(|r| r.hold.as_deref())
+            .map(|r| (r.hold.as_deref(), r.more_holds.as_slice()))
             .collect();
+        let both = ["local stop%20driving".to_string()];
         assert_eq!(
             rows,
             [
-                Some("local stop%20driving"),
-                Some("fleet fabric-lost"),
-                None
+                (Some("local stop%20driving"), &[][..]),
+                (Some("fleet fabric-lost"), &[][..]),
+                (None, &[][..]),
+                (Some("fleet fabric-lost"), &both[..]),
             ],
-            "every standing hold is drawn into its record, either origin"
+            "every standing hold is drawn into its record, either origin, the fleet's first"
         );
         let wire = manifest.to_toml().expect("serializes");
         assert_eq!(
-            wire.matches("hold = ").count(),
-            2,
-            "no key for no hold: {wire}"
+            (
+                wire.matches("hold = ").count(),
+                wire.matches("more_holds = ").count()
+            ),
+            (3, 1),
+            "no key for no hold, and the second only beside a first: {wire}"
         );
         assert!(manifest.roundtrips());
 
         let read = SessionHandoff::from_toml(&wire).expect("the successor reads it");
         let adopted_store: Store = new_store();
-        for (rec, before) in read.sessions.iter().zip([Some(&local), Some(&fleet), None]) {
+        for (rec, before) in read.sessions.iter().zip(&before) {
             // A FRESH session, as the successor builds one, seeded by the
             // spawn's own seam.
             let fresh = handle(rec.local_id, None);
@@ -2801,14 +2943,14 @@ title = \"zsh\"
                 &fresh.ctx.fabric,
                 &fresh.ctx.timeline,
                 &rec.topics,
-                rec.hold.as_deref(),
+                &rec.hold_rows(),
                 &rec.fabric,
             );
-            assert_eq!(fresh.ctx.fabric.hold().as_ref(), before, "{rec:?}");
+            assert_eq!(&fresh.ctx.fabric.holds(), before, "{rec:?}");
             let refused = crate::fabric::halt_refusal(&fresh.ctx, "send");
             assert_eq!(
                 refused.is_some(),
-                before.is_some(),
+                before.is_held(),
                 "the dispatch gate answers exactly as it did before the update"
             );
             let carried_rows = fresh
@@ -2819,10 +2961,10 @@ title = \"zsh\"
                 .since(None)
                 .filter(|e| e.kind == "hold" && e.payload.ends_with(" carried=1"))
                 .count();
-            assert_eq!(carried_rows, usize::from(before.is_some()), "{rec:?}");
+            assert_eq!(carried_rows, usize::from(before.is_held()), "{rec:?}");
             adopted_store.write().unwrap().register(fresh);
         }
-        // THE ORIGIN IS KEPT, so the fleet fence still stands: the owner may
+        // THE ORIGINS ARE KEPT, so the fleet fence still stands: the owner may
         // lift its own carried halt, never the fleet's.
         let sid_of = |local_id: u64| {
             adopted_store
@@ -2832,23 +2974,27 @@ title = \"zsh\"
                 .map(|h| h.sid.as_str().to_string())
                 .expect("registered")
         };
-        assert_eq!(
+        let owner_off = |local_id: u64| {
             cmd_hold(
                 &adopted_store,
-                &format!("{} off", sid_of(1)),
-                HoldIssuer::Owner
-            ),
+                &format!("{} off", sid_of(local_id)),
+                HoldIssuer::Owner,
+            )
+        };
+        assert_eq!(
+            owner_off(1),
             HOLD_DENIED,
             "a carried FLEET hold is not the owner's to lift"
         );
         assert_eq!(
-            cmd_hold(
-                &adopted_store,
-                &format!("{} off", sid_of(0)),
-                HoldIssuer::Owner
-            ),
+            owner_off(0),
             "OK hold=0\n",
             "a carried LOCAL hold is, as it was"
+        );
+        assert_eq!(
+            owner_off(3),
+            "OK hold=1\n",
+            "beside a carried fleet hold the owner lifts its own, and the fleet's stands"
         );
 
         // An older producer's record has no key: nothing is seeded.
@@ -2856,7 +3002,22 @@ title = \"zsh\"
             "schema = 1\n\n[[sessions]]\nlocal_id = 3\nsid = \"s-old\"\nstate = \"alive\"\ntitle = \"zsh\"\n",
         )
         .expect("an old manifest reads");
-        assert_eq!(old.sessions[0].hold, None);
+        assert_eq!(old.sessions[0].hold_rows(), Vec::<String>::new());
+        // …and a record from before the two slots, with ONE hold, is exactly
+        // that hold, of that origin.
+        let one = SessionHandoff::from_toml(
+            "schema = 1\n\n[[sessions]]\nlocal_id = 3\nsid = \"s-old\"\nstate = \"alive\"\ntitle = \"zsh\"\nhold = \"local stop%20driving\"\n",
+        )
+        .expect("a one-hold manifest reads");
+        let fresh = handle(3, None);
+        crate::spawn::seed_adopted_fabric(
+            &fresh.ctx.fabric,
+            &fresh.ctx.timeline,
+            &[],
+            &one.sessions[0].hold_rows(),
+            &one.sessions[0].fabric,
+        );
+        assert_eq!(fresh.ctx.fabric.holds(), before[0], "one hold, that origin");
     }
 
     /// A CARRIED HOLD THAT DOES NOT READ STILL HALTS (the round-four plan,
@@ -2907,6 +3068,19 @@ title = \"zsh\"
         .expect("a hold of the wrong type does not cost the manifest");
         assert_eq!(odd.sessions[0].hold.as_deref(), Some(""));
         assert_eq!(parse_hold(""), held(CARRIED_UNREADABLE, "local"));
+        // …and so is a `more_holds` member of the wrong type, or a value that
+        // is no list: never dropped, since dropping a row lifts a halt.
+        for (more, want) in [
+            ("[\"local mine\", 5]", vec!["local mine", ""]),
+            ("5", vec![""]),
+            ("[]", vec![]),
+        ] {
+            let odd = SessionHandoff::from_toml(&format!(
+                "schema = 1\n\n[[sessions]]\nlocal_id = 3\nsid = \"s-odd\"\nstate = \"alive\"\ntitle = \"zsh\"\nhold = \"fleet stop\"\nmore_holds = {more}\n",
+            ))
+            .expect("more_holds of the wrong type does not cost the manifest");
+            assert_eq!(odd.sessions[0].more_holds, want, "{more}");
+        }
     }
 
     /// ANOTHER SUPERVISOR'S LEASE AND EVERY KEYED ESCALATION CROSS THE

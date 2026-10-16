@@ -323,12 +323,19 @@ pub(crate) fn group_memory(pid: u32) -> Option<crate::GroupMemory> {
     })
 }
 
+fn hw_memsize() -> Option<u64> {
+    static MEMSIZE: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *MEMSIZE.get_or_init(|| sysctl_int(c"hw.memsize").and_then(|b| u64::try_from(b).ok()))
+}
+
+fn vm_pagesize() -> Option<u64> {
+    static PAGESIZE: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *PAGESIZE.get_or_init(|| sysctl_int(c"vm.pagesize").and_then(|b| u64::try_from(b).ok()))
+}
+
 /// [`crate::physical_memory_mib`] on macOS: `hw.memsize`.
 pub(crate) fn physical_memory_mib() -> Option<u64> {
-    sysctl_int(c"hw.memsize")
-        .and_then(|b| u64::try_from(b).ok())
-        .map(|b| b >> 20)
-        .filter(|mib| *mib > 0)
+    hw_memsize().map(|b| b >> 20).filter(|mib| *mib > 0)
 }
 
 /// [`crate::memory_pressure`] on macOS.
@@ -359,7 +366,7 @@ fn vm_statistics() -> Option<libc::vm_statistics64> {
 /// [`crate::machine_memory`] on macOS: one `HOST_VM_INFO64` read, sized by
 /// `vm.pagesize`.
 pub(crate) fn machine_memory() -> Option<crate::MachineMemory> {
-    let page_bytes = sysctl_int(c"vm.pagesize").and_then(|b| u64::try_from(b).ok())?;
+    let page_bytes = vm_pagesize()?;
     let vm = vm_statistics()?;
     let available_mib = crate::available_mib_of(
         u64::from(vm.free_count),
@@ -384,10 +391,7 @@ pub(crate) fn machine_memory() -> Option<crate::MachineMemory> {
 /// [`crate::swapped_kib`] on macOS: `HOST_VM_INFO64`'s swapins plus
 /// swapouts, in `vm.pagesize` pages, as KiB.
 pub(crate) fn swapped_kib() -> Option<u64> {
-    let page_kib = sysctl_int(c"vm.pagesize")
-        .and_then(|b| u64::try_from(b).ok())
-        .map(|b| b / 1024)
-        .filter(|k| *k > 0)?;
+    let page_kib = vm_pagesize().map(|b| b / 1024).filter(|k| *k > 0)?;
     let vm = vm_statistics()?;
     Some(
         vm.swapins
@@ -419,8 +423,8 @@ impl Mac {
         // SAFETY: `tb` is a writable `mach_timebase_info`.
         let ok = unsafe { libc::mach_timebase_info(&raw mut tb) } == 0 && tb.denom != 0;
         let (numer, denom) = if ok { (tb.numer, tb.denom) } else { (1, 1) };
-        let mem = sysctl_int(c"hw.memsize").and_then(|b| u64::try_from(b).ok());
-        let page = sysctl_int(c"vm.pagesize").and_then(|b| u32::try_from(b).ok());
+        let mem = hw_memsize();
+        let page = vm_pagesize().and_then(|b| u32::try_from(b).ok());
         Self {
             host: host_port(),
             numer,
@@ -519,7 +523,11 @@ impl Mac {
             if usage == Usage::Gone {
                 continue;
             }
-            if let Some(row) = row_of(upid, ident(pid), usage, self.our_uid) {
+            let ident = match usage {
+                Usage::Measured { .. } => ident(pid),
+                Usage::Refused | Usage::Gone => None,
+            };
+            if let Some(row) = row_of(upid, ident, usage, self.our_uid) {
                 rows.push(row);
             }
         }

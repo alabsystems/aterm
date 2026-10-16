@@ -20,7 +20,7 @@ aterm-cap = { workspace = true }
 
 [dev-dependencies]
 # The tests are their own trusted launcher: `launcher-mint` on the dev edge
-# only (aterm-cap's `mint_reachability` gate refuses it in production).
+# only: in production this crate receives `Cap`s and never mints.
 aterm-cap = { workspace = true, features = ["launcher-mint"] }
 # Tier-1 conformance: the derived models in `aterm_spec::derive`, checked
 # against the real `Surface`/`EventLog`.

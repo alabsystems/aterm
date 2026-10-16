@@ -724,12 +724,9 @@ pub(crate) fn spectrum_max_byte_rate() -> f32 {
 /// anchors sit verbatim at the indices [`SPECTRUM_ANCHOR_AT`] names; entries
 /// between them are the drawn path resampled at an even pace.
 ///
-/// Regenerate after any change to the anchors or interpolation rule:
-///
-/// ```text
-/// targo --unverified test -p aterm-effects --lib emit_spectrum_lut \
-///     -- --ignored --nocapture
-/// ```
+/// After any change to the anchors or interpolation rule,
+/// `spectrum_lut_is_byte_reproducible_from_its_generator` fails and prints the
+/// regenerated table to paste here.
 #[rustfmt::skip]
 pub const SPECTRUM_LUT: [u32; SPECTRUM_LUT_LEN] = [
     0x00FF_0000, 0x00FF_0300, 0x00FF_0500, 0x00FF_0800, 0x00FF_0B00, 0x00FF_0D00,
@@ -836,42 +833,34 @@ mod tests {
         0.2126 * chan(16) + 0.7152 * chan(8) + 0.0722 * chan(0)
     }
 
-    /// **THE GENERATOR, RUN.** Prints [`SPECTRUM_LUT`] ready to paste. Not a
-    /// test of anything — the authority that makes the committed table a
-    /// transcription rather than a decision.
-    ///
-    /// ```text
-    /// targo --unverified test -p aterm-effects --lib emit_spectrum_lut \
-    ///     -- --ignored --nocapture
-    /// ```
-    #[test]
-    #[ignore = "table generator; run explicitly to regenerate SPECTRUM_LUT"]
-    fn emit_spectrum_lut() {
+    /// The committed tables as the generator writes them, ready to paste.
+    fn regenerated_tables() -> String {
         let table = generate_spectrum_table();
         let (lut, anchor_at) = (table.lut, table.anchor_at);
-        println!("pub const SPECTRUM_ANCHOR_AT: [usize; SPECTRUM_STOPS] = {anchor_at:?};");
+        let mut out =
+            format!("pub const SPECTRUM_ANCHOR_AT: [usize; SPECTRUM_STOPS] = {anchor_at:?};\n");
         for row in lut.chunks(6) {
             let cells: Vec<String> = row
                 .iter()
                 .map(|c| format!("0x{:04X}_{:04X},", c >> 16, c & 0xffff))
                 .collect();
-            println!("    {}", cells.join(" "));
+            out.push_str(&format!("    {}\n", cells.join(" ")));
         }
+        out
     }
 
     /// **THE COMMITTED TABLE IS THE LAW'S OWN OUTPUT.** Byte-for-byte, no
     /// tolerance: the moment an anchor or interpolation rule moves, this fails and
-    /// the table has to be regenerated rather than nudged.
+    /// the table has to be regenerated rather than nudged — the failure prints the
+    /// regenerated tables to paste.
     #[test]
     fn spectrum_lut_is_byte_reproducible_from_its_generator() {
         let fresh = generate_spectrum_lut();
-        assert_eq!(fresh.len(), SPECTRUM_LUT.len());
-        for (i, (&committed, &generated)) in SPECTRUM_LUT.iter().zip(fresh.iter()).enumerate() {
-            assert_eq!(
-                committed, generated,
-                "entry {i} drifted: committed #{committed:06X}, generator says #{generated:06X}"
-            );
-        }
+        assert!(
+            fresh == SPECTRUM_LUT && generate_spectrum_table().anchor_at == SPECTRUM_ANCHOR_AT,
+            "SPECTRUM_LUT / SPECTRUM_ANCHOR_AT drifted from the generator; paste:\n{}",
+            regenerated_tables()
+        );
     }
 
     /// The anchors are the arc's own control points, bit for bit, stored rather

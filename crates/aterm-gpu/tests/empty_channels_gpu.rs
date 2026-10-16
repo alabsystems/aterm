@@ -1,16 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// Empty-channel no-op on the GPU, one row per effect channel: an empty channel
-// (as built, or an atlas with nothing drawn) renders the bare frame exactly; a
-// populated channel paints (so a dropped stream cannot look clean); and
-// `clear_overlays` (the `image plain` capture contract) restores the bare
-// frame. Rows with a `drain` also clear the channel's Vec on a renderer that
-// rendered the populated input and must land on the bare bytes, catching
-// residue in persistent per-frame instance streams.
-//
-// Each row keeps its own grid, text, backend pair and payload; the aurora and
-// nova rows also run every leg on the CPU. The CPU table is aterm-render's
+// Empty-channel no-op on the GPU, one row per effect channel: an empty channel (as built, or an
+// atlas with nothing drawn) renders the bare frame exactly; a populated channel paints (so a
+// dropped stream cannot look clean); `clear_overlays` (the `image plain` capture contract)
+// restores the bare frame. A row's `drain` clears the channel on a renderer that rendered the
+// populated input, which must then land on the bare bytes (no residue in persistent instance
+// streams). `cpu_too` rows also run every leg on the CPU; the CPU table is aterm-render's
 // `tests/empty_channels.rs`.
 //
 // No GPU or no font: no-op.
@@ -122,7 +118,7 @@ fn burn_patches(ch: usize, grid_w: usize, grid_h: usize) -> Vec<FirePatch> {
     out
 }
 
-/// An ADDITIVE glow quad (see `GlowQuad::alpha`).
+/// An additive glow quad (see `GlowQuad::alpha`).
 fn glow(row: usize, x: usize, y: usize, w: usize, h: usize, color: u32) -> GlowQuad {
     GlowQuad {
         row: row as u16,
@@ -236,8 +232,8 @@ const CHANNELS: &[Channel] = &[
         drain: Some(|i| i.cursor_glow_add.clear()),
         is_empty: |i| i.cursor_glow_add.is_empty(),
     },
-    // A glow_under-free frame opens NO extra passes: the fused base pass must
-    // reproduce the bare bytes.
+    // A glow_under-free frame opens no extra passes: the fused base pass must reproduce the
+    // bare bytes.
     Channel {
         name: "glow_under + char_fg",
         rows: 6,
@@ -373,12 +369,8 @@ fn legs(
 #[test]
 fn every_empty_channel_is_byte_identical_on_the_gpu_and_clear_overlays_restores_it() {
     let theme = Theme::default();
-    let Some(mut default) = backends(18.0, theme) else {
-        return;
-    };
-    let Some(mut fontdue) = backends_fontdue(18.0, theme) else {
-        return;
-    };
+    let mut default = backends(18.0, theme);
+    let mut fontdue = backends_fontdue(18.0, theme);
     for c in CHANNELS {
         let (cpu, gpu): (&mut Renderer, &mut aterm_gpu::GpuRenderer) = if c.fontdue {
             (&mut fontdue.0, &mut fontdue.1)
